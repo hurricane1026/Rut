@@ -63575,8 +63575,8 @@ static bool build_issue558_handwritten_source(u16 frontend_port,
         source.find("converter") != std::string::npos ||
         source.find("response_read_timeout: 60s") == std::string::npos ||
         source.find("response_buffering: \"complete_content_length\"") == std::string::npos ||
-        (retained && source.find("retained_header_value: \"trim_sp_preserve_htab\"") ==
-                         std::string::npos) ||
+        (retained &&
+         source.find("retained_header_value: \"trim_sp_preserve_htab\"") == std::string::npos) ||
         (!retained && source.find("retained_header_value") != std::string::npos)) {
         error = "#558 handwritten ordinary RUT source failed its bounded shape checks";
         return false;
@@ -63602,8 +63602,7 @@ static bool build_issue558_handwritten_source(u16 frontend_port,
 // Public #558 capability gate.  The positive ordinary source selects ID3 and
 // the legacy source selects ID1; both are run through the public CLI/JIT and
 // the same exact positive upstream comparator receives both observed wires.
-static bool run_rut_issue558_retained_header_public_gate(const char* rut_path,
-                                                         std::string& error) {
+static bool run_rut_issue558_retained_header_public_gate(const char* rut_path, std::string& error) {
     static constexpr char kDiagnostic[] = "#558 retained-header public gate";
     static constexpr char kRequest[] =
         "GET /ledger?q=raw HTTP/1.1\r\n"
@@ -63717,7 +63716,8 @@ static bool run_rut_issue558_retained_header_public_gate(const char* rut_path,
         std::vector<char> normalized = downstream;
         if (!normalize_date(normalized) || normalized.size() != sizeof(kExpectedResponse) - 1u ||
             memcmp(normalized.data(), kExpectedResponse, sizeof(kExpectedResponse) - 1u) != 0) {
-            error = std::string(kDiagnostic) + " exact Date-normalized downstream response mismatch";
+            error =
+                std::string(kDiagnostic) + " exact Date-normalized downstream response mismatch";
             dump_wire(kDiagnostic, downstream);
             return false;
         }
@@ -63725,8 +63725,7 @@ static bool run_rut_issue558_retained_header_public_gate(const char* rut_path,
         // Downstream EOF and origin retirement are independent witnesses. Keep
         // the client open while waiting for the Recorder's peer-close evidence;
         // closing it here would manufacture the retirement event.
-        const auto retirement_deadline = std::chrono::steady_clock::now() +
-                                         std::chrono::seconds(2);
+        const auto retirement_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
         while ((!origin.response_sent_open.load(std::memory_order_acquire) ||
                 !origin.response_send_succeeded.load(std::memory_order_acquire) ||
                 origin.response_send_all_calls.load(std::memory_order_acquire) != 1u ||
@@ -63767,7 +63766,8 @@ static bool run_rut_issue558_retained_header_public_gate(const char* rut_path,
             error = std::string(kDiagnostic) + " access did not record ASCII105+LF";
             return false;
         }
-        const auto stable_deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(175);
+        const auto stable_deadline =
+            std::chrono::steady_clock::now() + std::chrono::milliseconds(175);
         while (std::chrono::steady_clock::now() < stable_deadline) {
             if (!origin_live() || poll_child(runtime.child) ||
                 origin.accepted.load(std::memory_order_acquire) != 1u ||
@@ -63788,8 +63788,8 @@ static bool run_rut_issue558_retained_header_public_gate(const char* rut_path,
         origin.stop();
         const std::string expected_text =
             std::string("GET /ledger?q=raw HTTP/1.1\r\nHost: 127.0.0.1:") +
-            std::to_string(ports[1]) + (retained ? "\r\nX-Test: \t keep \t\r\n\r\n"
-                                                   : "\r\nX-Test: keep\r\n\r\n");
+            std::to_string(ports[1]) +
+            (retained ? "\r\nX-Test: \t keep \t\r\n\r\n" : "\r\nX-Test: keep\r\n\r\n");
         observed_upstream = origin.request;
         if (expected_upstream != nullptr)
             expected_upstream->assign(expected_text.begin(), expected_text.end());
@@ -63800,13 +63800,14 @@ static bool run_rut_issue558_retained_header_public_gate(const char* rut_path,
             origin.history[0] != std::vector<char>(expected_text.begin(), expected_text.end()) ||
             origin.request != origin.history[0] || origin.response_send_all_calls.load() != 1u ||
             !origin.response_send_succeeded.load() || !origin.response_peer_closed.load() ||
-            origin.response_peer_close_count.load() != 1u ||
-            origin.response_send_failed.load() || origin.response_peer_unexpected_data.load() ||
+            origin.response_peer_close_count.load() != 1u || origin.response_send_failed.load() ||
+            origin.response_peer_unexpected_data.load() ||
             origin.response_peer_observation_failed.load() ||
             !origin.response_clean_shutdown.load() || !origin.response_connection_closed.load() ||
             !read_request_length_access_file(temp.rut_access_log, access, error) ||
             access != "105\n") {
-            if (error.empty()) error = std::string(kDiagnostic) + " joined lifecycle/history mismatch";
+            if (error.empty())
+                error = std::string(kDiagnostic) + " joined lifecycle/history mismatch";
             return false;
         }
         if (observed_upstream.size() != (retained ? 70u : 66u)) {
@@ -63824,7 +63825,8 @@ static bool run_rut_issue558_retained_header_public_gate(const char* rut_path,
     const auto exact_positive_comparator = [&](const std::vector<char>& wire) {
         return wire == positive_expected && wire.size() == 70u;
     };
-    if (!exact_positive_comparator(positive_upstream) || exact_positive_comparator(legacy_upstream) ||
+    if (!exact_positive_comparator(positive_upstream) ||
+        exact_positive_comparator(legacy_upstream) ||
         std::string(legacy_upstream.begin(), legacy_upstream.end()).find("X-Test: keep\r\n") ==
             std::string::npos) {
         error = std::string(kDiagnostic) + " same-comparator negative rejected proof failed";
@@ -72574,9 +72576,10 @@ int main(int argc, char** argv) {
             return 1;
         }
         std::cerr << "PASS: #558 handwritten ordinary RUT retained-header ID3 public gate "
-                     "loaded through the public CLI/O2/JIT/config path on io_uring; exact 105B "
-                     "downstream_request=105B produced one exact 70B ID3 upstream wire and one "
-                     "Date-normalized response=118B with real EOF, one 105\\n access record, "
+                     "loaded through the public CLI/O2/JIT/config path on io_uring; "
+                     "downstream_request=105B,response=118B produced one exact 70B ID3 upstream "
+                     "wire and one "
+                     "Date-normalized downstream response with real EOF, one 105\\n access record, "
                      "175ms live no-retry evidence, and joined lifecycle/history teardown. "
                      "The actual legacy ID1 66B wire was rejected by the same 70B comparator.\n";
         return 0;
