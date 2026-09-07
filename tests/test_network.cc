@@ -45378,6 +45378,11 @@ TEST(response_read_deadline,
      exact_materialized_get_proof_mutations_fail_closed_before_downstream_send) {
     enum class ProofMutation : u8 {
         HandlerGeneration,
+        RawHeaderEndZero,
+        RawTotalLengthZero,
+        RewrittenHeaderEndZero,
+        RewrittenTotalLengthZero,
+        ExpectedUploadLengthZero,
         RawHeaderEnd,
         RawContentLength,
         RawTotalLength,
@@ -45392,6 +45397,11 @@ TEST(response_read_deadline,
         DownstreamClose
     };
     static constexpr ProofMutation kMutations[] = {ProofMutation::HandlerGeneration,
+                                                   ProofMutation::RawHeaderEndZero,
+                                                   ProofMutation::RawTotalLengthZero,
+                                                   ProofMutation::RewrittenHeaderEndZero,
+                                                   ProofMutation::RewrittenTotalLengthZero,
+                                                   ProofMutation::ExpectedUploadLengthZero,
                                                    ProofMutation::RawHeaderEnd,
                                                    ProofMutation::RawContentLength,
                                                    ProofMutation::RawTotalLength,
@@ -45410,6 +45420,21 @@ TEST(response_read_deadline,
         switch (mutation) {
             case ProofMutation::HandlerGeneration:
                 ++proof.handler_generation;
+                break;
+            case ProofMutation::RawHeaderEndZero:
+                proof.raw_header_end = 0;
+                break;
+            case ProofMutation::RawTotalLengthZero:
+                proof.raw_total_length = 0;
+                break;
+            case ProofMutation::RewrittenHeaderEndZero:
+                proof.rewritten_header_end = 0;
+                break;
+            case ProofMutation::RewrittenTotalLengthZero:
+                proof.rewritten_total_length = 0;
+                break;
+            case ProofMutation::ExpectedUploadLengthZero:
+                proof.expected_upload_length = 0;
                 break;
             case ProofMutation::RawHeaderEnd:
                 ++proof.raw_header_end;
@@ -45488,6 +45513,11 @@ TEST(response_read_deadline,
      exact_materialized_get_post_commit_proof_mutations_fail_closed_before_body_send) {
     enum class ProofMutation : u8 {
         HandlerGeneration,
+        RawHeaderEndZero,
+        RawTotalLengthZero,
+        RewrittenHeaderEndZero,
+        RewrittenTotalLengthZero,
+        ExpectedUploadLengthZero,
         RawHeaderEnd,
         RawContentLength,
         RawTotalLength,
@@ -45502,6 +45532,11 @@ TEST(response_read_deadline,
         DownstreamClose
     };
     static constexpr ProofMutation kMutations[] = {ProofMutation::HandlerGeneration,
+                                                   ProofMutation::RawHeaderEndZero,
+                                                   ProofMutation::RawTotalLengthZero,
+                                                   ProofMutation::RewrittenHeaderEndZero,
+                                                   ProofMutation::RewrittenTotalLengthZero,
+                                                   ProofMutation::ExpectedUploadLengthZero,
                                                    ProofMutation::RawHeaderEnd,
                                                    ProofMutation::RawContentLength,
                                                    ProofMutation::RawTotalLength,
@@ -45521,6 +45556,21 @@ TEST(response_read_deadline,
         switch (mutation) {
             case ProofMutation::HandlerGeneration:
                 ++proof.handler_generation;
+                break;
+            case ProofMutation::RawHeaderEndZero:
+                proof.raw_header_end = 0;
+                break;
+            case ProofMutation::RawTotalLengthZero:
+                proof.raw_total_length = 0;
+                break;
+            case ProofMutation::RewrittenHeaderEndZero:
+                proof.rewritten_header_end = 0;
+                break;
+            case ProofMutation::RewrittenTotalLengthZero:
+                proof.rewritten_total_length = 0;
+                break;
+            case ProofMutation::ExpectedUploadLengthZero:
+                proof.expected_upload_length = 0;
                 break;
             case ProofMutation::RawHeaderEnd:
                 ++proof.raw_header_end;
@@ -45602,6 +45652,66 @@ TEST(response_read_deadline,
             CHECK_EQ(recv(fixture.peer_fd, &byte, 1, MSG_DONTWAIT), 0);
             release_closed_response_read_fixture(fixture);
         }
+    }
+}
+
+TEST(response_read_deadline, exact_get_neutral_classifier_preserves_id1_and_rejects_id3) {
+    static constexpr u8 kResponse[] = "HTTP/1.1 200 OK\r\nContent-Length: 4\r\n\r\nabcd";
+
+    {
+        ScopedIoUringLoopForRetirement guard;
+        if (!guard.init()) SKIP("io_uring unavailable");
+        auto* loop = guard.loop;
+        RouteConfig config{};
+        PrebuiltD2Fixture fixture{};
+        REQUIRE(stage_live_precise_get(
+            loop, config, &fixture, false, false, RequestPolicyId::Http11FixedStrip));
+        Connection& conn = *fixture.conn;
+        conn.response_read_deadline_upload.clear_owner();
+        REQUIRE(response_read_deadline_owner_is_stable(
+            conn,
+            &on_upstream_response<IoUringEventLoop>,
+            ResponseReadDeadlineOwnerPhase::ActiveAfterCopy));
+        const u32 len = sizeof(kResponse) - 1u;
+        REQUIRE_EQ(conn.upstream_recv_buf.write(kResponse, len), len);
+        const IoEvent response = response_read_copy_event(conn, len, true, 0, len);
+        loop->dispatch_batch(&response, 1);
+        CHECK_GE(loop->conns[conn.id].fd, 0);
+        CHECK(loop->conns[conn.id].send_armed);
+        cleanup_prebuilt_d2(loop, fixture);
+    }
+
+    {
+        ScopedIoUringLoopForRetirement guard;
+        if (!guard.init()) SKIP("io_uring unavailable");
+        auto* loop = guard.loop;
+        RouteConfig config{};
+        PrebuiltD2Fixture fixture{};
+        REQUIRE(stage_live_precise_get(
+            loop, config, &fixture, false, true, RequestPolicyId::Http11FixedTrimSpPreserveHtab));
+        Connection& conn = *fixture.conn;
+        conn.pipeline_depth = 1;
+        CHECK_FALSE(response_read_deadline_owner_is_stable(
+            conn,
+            &on_upstream_response<IoUringEventLoop>,
+            ResponseReadDeadlineOwnerPhase::ActiveAfterCopy));
+        conn.pipeline_depth = 0;
+        conn.response_read_deadline_upload.clear_owner();
+        CHECK_FALSE(response_read_deadline_owner_is_stable(
+            conn,
+            &on_upstream_response<IoUringEventLoop>,
+            ResponseReadDeadlineOwnerPhase::ActiveAfterCopy));
+        const u32 id = conn.id;
+        const u32 len = sizeof(kResponse) - 1u;
+        REQUIRE_EQ(conn.upstream_recv_buf.write(kResponse, len), len);
+        const IoEvent response = response_read_copy_event(conn, len, true, 0, len);
+        loop->dispatch_batch(&response, 1);
+        CHECK_EQ(loop->conns[id].fd, -1);
+        CHECK_FALSE(loop->conns[id].send_armed);
+        CHECK_EQ(loop->backend.send_state[id].remaining, 0u);
+        u8 byte = 0;
+        CHECK_EQ(recv(fixture.peer_fd, &byte, 1, MSG_DONTWAIT), 0);
+        release_closed_response_read_fixture(fixture);
     }
 }
 
