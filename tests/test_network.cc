@@ -47235,7 +47235,7 @@ TEST(response_buffering_runtime,
 }
 
 TEST(response_buffering_runtime,
-     coherent_single_range_206_incomplete_expiry_fails_without_downstream_send) {
+     coherent_single_range_206_incomplete_expiry_sends_header_only_and_closes) {
     ScopedIoUringLoopForRetirement guard;
     if (!guard.init()) SKIP("io_uring unavailable");
     auto* loop = guard.loop;
@@ -47259,13 +47259,129 @@ TEST(response_buffering_runtime,
     const IoEvent timer =
         inert_response_read_timer_event(id, conn.response_read_timer_owner_generation);
     loop->dispatch_batch(&timer, 1);
+    REQUIRE_GE(loop->conns[id].fd, 0);
+    CHECK_EQ(loop->backend.send_state[id].remaining, conn.response_header_buf.len());
+    CHECK_EQ(conn.response_read_deadline_post_commit_send_body, 0u);
+    CHECK(conn.response_read_deadline_post_commit_close_after_drain);
+    CHECK_EQ(conn.response_read_deadline_post_commit_origin_received, 2u);
+    CHECK_EQ(conn.upstream_recv_buf.len(),
+             conn.response_read_deadline_post_commit_raw_header_end + 2u);
+    CHECK_EQ(conn.response_read_deadline_post_commit_downstream_submitted, 0u);
+    CHECK_EQ(conn.response_read_deadline_post_commit_downstream_completed, 0u);
+    CHECK_EQ(conn.response_read_deadline_post_commit_inflight_body, 0u);
+    CHECK_EQ(conn.resp_body_remaining, 0u);
+    CHECK_EQ(conn.resp_body_sent, conn.response_header_buf.len());
+    CHECK(response_read_deadline_post_commit_is_stable(conn));
+    CHECK(conn.upstream_abandoned);
+    CHECK_EQ(conn.upstream_fd, -1);
+    CHECK(conn.upstream_retiring_episode != 0u);
+    CHECK_FALSE(conn.response_read_deadline_owner_is_neutral());
+    const IoEvent header_sent = exact_response_deadline_send_event(loop, conn);
+    loop->dispatch_batch(&header_sent, 1);
     CHECK_EQ(loop->conns[id].fd, -1);
     CHECK_EQ(loop->backend.send_state[id].remaining, 0u);
-    CHECK_EQ(loop->conns[id].response_read_deadline_send_len, 0u);
     CHECK_FALSE(loop->conns[id].response_read_deadline_send_owner_active);
-    CHECK_EQ(loop->conns[id].response_header_buf.len(), 0u);
-    CHECK(loop->conns[id].response_read_deadline_owner_is_neutral());
     release_closed_response_read_fixture(fixture);
+}
+
+TEST(response_buffering_runtime,
+     coherent_single_range_206_incomplete_expiry_requires_active_due_timer_owner) {
+    enum class Forgery : u8 { MissingOwner, CopiedOwner, WrongResult };
+    for (const Forgery forgery :
+         {Forgery::MissingOwner, Forgery::CopiedOwner, Forgery::WrongResult}) {
+        ScopedIoUringLoopForRetirement guard;
+        if (!guard.init()) SKIP("io_uring unavailable");
+        auto* loop = guard.loop;
+        RouteConfig config{};
+        PrebuiltD2Fixture fixture{};
+        REQUIRE(stage_live_precise_get(loop, config, &fixture));
+        Connection& conn = *fixture.conn;
+        static constexpr u8 kIncomplete[] =
+            "HTTP/1.1 206 Partial Content\r\nContent-Range: bytes 0-4/12\r\n"
+            "Content-Length: 5\r\n\r\nhe";
+        REQUIRE_EQ(conn.upstream_recv_buf.write(kIncomplete, sizeof(kIncomplete) - 1u),
+                   sizeof(kIncomplete) - 1u);
+        const IoEvent response = response_read_copy_event(
+            conn, sizeof(kIncomplete) - 1u, true, 0, sizeof(kIncomplete) - 1u);
+        loop->dispatch_batch(&response, 1);
+        REQUIRE_EQ(conn.response_read_deadline_post_commit_phase,
+                   ResponseReadDeadlinePostCommitPhase::Buffering);
+        conn.response_read_timer_last_progress_ns = monotonic_ns() - 6'000'000'000ull;
+        const u32 generation = conn.response_read_timer_owner_generation;
+        IoEvent timer = inert_response_read_timer_event(conn.id, generation);
+        loop->prepare_response_read_deadline_batch(&timer, 1);
+        REQUIRE_EQ(loop->response_read_batch_owner_count, 1u);
+        auto& owner = loop->response_read_batch_owners[0];
+        REQUIRE(owner.valid);
+        if (forgery == Forgery::WrongResult) timer.result = 0;
+        loop->response_read_batch_event_index = 0;
+        loop->dispatch(timer);
+        if (forgery == Forgery::MissingOwner) {
+            CHECK_FALSE(loop->start_complete_content_length_send(
+                conn,
+                IoUringEventLoop::CompleteContentLengthTerminalDisposition::InactivityExpiry,
+                nullptr));
+        } else if (forgery == Forgery::CopiedOwner) {
+            const auto copied = owner;
+            CHECK_FALSE(loop->start_complete_content_length_send(
+                conn,
+                IoUringEventLoop::CompleteContentLengthTerminalDisposition::InactivityExpiry,
+                &copied));
+        } else {
+            CHECK_FALSE(loop->start_complete_content_length_send(
+                conn,
+                IoUringEventLoop::CompleteContentLengthTerminalDisposition::InactivityExpiry,
+                &owner));
+        }
+        CHECK_FALSE(conn.send_armed);
+        CHECK_EQ(loop->backend.send_state[conn.id].remaining, 0u);
+        loop->response_read_batch_owner_count = 0;
+        loop->response_read_batch_event_count = 0;
+        loop->response_read_batch_events = nullptr;
+        cleanup_prebuilt_d2(loop, fixture);
+    }
+}
+
+TEST(response_buffering_runtime,
+     coherent_single_range_206_selected_length_mutations_fail_in_both_directions) {
+    for (const bool expiry : {false, true}) {
+        ScopedIoUringLoopForRetirement guard;
+        if (!guard.init()) SKIP("io_uring unavailable");
+        auto* loop = guard.loop;
+        RouteConfig config{};
+        PrebuiltD2Fixture fixture{};
+        REQUIRE(stage_live_precise_get(loop, config, &fixture));
+        Connection& conn = *fixture.conn;
+        static constexpr u8 kIncomplete[] =
+            "HTTP/1.1 206 Partial Content\r\nContent-Range: bytes 0-4/12\r\n"
+            "Content-Length: 5\r\n\r\nhe";
+        REQUIRE_EQ(conn.upstream_recv_buf.write(kIncomplete, sizeof(kIncomplete) - 1u),
+                   sizeof(kIncomplete) - 1u);
+        const IoEvent response = response_read_copy_event(
+            conn, sizeof(kIncomplete) - 1u, true, 0, sizeof(kIncomplete) - 1u);
+        loop->dispatch_batch(&response, 1);
+        if (expiry) {
+            conn.response_read_timer_last_progress_ns = monotonic_ns() - 6'000'000'000ull;
+            const IoEvent timer =
+                inert_response_read_timer_event(conn.id, conn.response_read_timer_owner_generation);
+            loop->dispatch_batch(&timer, 1);
+            REQUIRE_EQ(conn.response_read_deadline_post_commit_send_body, 0u);
+            conn.response_read_deadline_post_commit_send_body = 2u;
+        } else {
+            const IoEvent eof{
+                conn.id, 0, 0, 0, IoEventType::UpstreamRecv, 0, 0, conn.upstream_episode};
+            loop->dispatch_batch(&eof, 1);
+            REQUIRE_EQ(conn.response_read_deadline_post_commit_send_body, 2u);
+            conn.response_read_deadline_post_commit_send_body = 0u;
+        }
+        CHECK_FALSE(response_read_deadline_post_commit_is_stable(conn));
+        const u32 id = conn.id;
+        const IoEvent header = exact_response_deadline_send_event(loop, conn);
+        loop->dispatch_batch(&header, 1);
+        CHECK_EQ(loop->conns[id].fd, -1);
+        CHECK_EQ(loop->backend.send_state[id].remaining, 0u);
+        release_closed_response_read_fixture(fixture);
+    }
 }
 
 TEST(response_buffering_runtime,

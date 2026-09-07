@@ -2686,6 +2686,19 @@ if(RUT_ENABLE_JIT)
         ENVIRONMENT "RUT_NGINX_DIFFERENTIAL_REQUIRED=1"
     )
     add_test(
+        NAME test_rut_issue554_default_buffering_206_range_incomplete_body_inactivity_expiry
+        COMMAND test_nginx_differential
+                --rut-default-buffering-206-range-incomplete-body-inactivity-expiry
+                $<TARGET_FILE:rut>
+    )
+    set_tests_properties(test_rut_issue554_default_buffering_206_range_incomplete_body_inactivity_expiry PROPERTIES
+        LABELS "integration;network;io_uring"
+        RUN_SERIAL TRUE
+        RESOURCE_LOCK nginx-differential
+        TIMEOUT 60
+        ENVIRONMENT "RUT_NGINX_DIFFERENTIAL_REQUIRED=1"
+    )
+    add_test(
         NAME test_rut_exact_ipv4_listener_production
         COMMAND test_nginx_differential --rut-exact-ipv4-listener-production
                 $<TARGET_FILE:rut>

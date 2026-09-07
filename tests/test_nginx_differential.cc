@@ -63189,6 +63189,315 @@ static bool run_pinned_nginx_default_buffering_206_range_incomplete_body_inactiv
 static constexpr char kIssue546WithheldNegativeResult[] =
     "#546 real withheld EOF authorization reached its bounded deadline and cleaned up";
 
+// Runtime-only #554 evidence.  This deliberately starts one ordinary source
+// through the public CLI and one held-open Recorder; nginx and the converter
+// are not execution prerequisites for this gate.
+static bool run_rut_default_buffering_206_range_incomplete_body_inactivity_expiry(
+    const char* rut_path, std::string& error) {
+    static constexpr char kDiagnostic[] = "#554 ordinary RUT 206 incomplete body inactivity expiry";
+    static constexpr char kExpectedResponseNormalized[] =
+        "HTTP/1.1 206 Partial Content\r\n"
+        "Server: nginx/1.29.7\r\n"
+        "Date: XXXXXXXXXXXXXXXXXXXXXXXXXXXXX\r\n"
+        "Content-Length: 5\r\n"
+        "Connection: keep-alive\r\n"
+        "Content-Range: bytes 0-4/12\r\n"
+        "\r\n";
+    static_assert(sizeof(kExpectedResponseNormalized) - 1u == 163u);
+    static_assert(sizeof(kDefaultBuffering206RangeRequest) - 1u == 78u);
+    static_assert(sizeof(kDefaultBuffering206RangeOrigin) - 1u == 144u);
+    static_assert((sizeof(kDefaultBuffering206RangeOrigin) - 1u) - 5u == 139u);
+
+    if (rut_path == nullptr || rut_path[0] != '/' || access(rut_path, X_OK) != 0) {
+        error = std::string(kDiagnostic) + " requires an executable absolute RUT path";
+        return false;
+    }
+    TempDir temp;
+    if (!temp.create()) {
+        error = std::string(kDiagnostic) + " could not create isolated resources";
+        return false;
+    }
+    HeldLoopbackPorts reservations;
+    u16 ports[2]{};
+    for (size_t index = 0; index < std::size(ports); ++index) {
+        if (!reservations.reserve_four_digit(index, ports[index])) {
+            error = std::string(kDiagnostic) + " could not reserve loopback ports";
+            return false;
+        }
+    }
+
+    // Use the existing source/compiler helper to prove the exact ordinary
+    // complete-content-length policy bundle, while executing only the public
+    // RUT binary below.
+    const std::string profile =
+        make_explicit_timeout_head_profile(ports[0], ports[1], temp.rut_access_log);
+    std::string source;
+    if (!build_explicit_timeout_head_generated_source(
+            profile, ports[0], ports[1], temp.rut_access_log, source, error) ||
+        !write_file(temp.source, source.data(), source.size())) {
+        if (error.empty()) error = std::string(kDiagnostic) + " could not persist ordinary source";
+        return false;
+    }
+
+    Recorder origin;
+    origin.wait_response_peer_close = true;
+    origin.observe_extra_requests_until_stop = true;
+    if (!handoff_held_loopback_port(&reservations.fds[1], ports[1], kDiagnostic, error) ||
+        !origin.setup(ports[1], 1u, kDefaultBuffering206RangeOrigin, 141u)) {
+        if (error.empty()) error = std::string(kDiagnostic) + " Recorder setup failed";
+        return false;
+    }
+    const auto origin_live = [&]() {
+        return origin.running.load(std::memory_order_acquire) &&
+               origin.thread_alive.load(std::memory_order_acquire) &&
+               !origin.listener_failed.load(std::memory_order_acquire);
+    };
+    const auto origin_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+    while (!origin_live() && std::chrono::steady_clock::now() < origin_deadline) usleep(1000);
+    if (!origin_live()) {
+        error = std::string(kDiagnostic) + " Recorder was not live before RUT start";
+        return false;
+    }
+
+    ChildGuard runtime;
+    if (!spawn_child({rut_path,
+                      temp.source,
+                      "--shards",
+                      "1",
+                      "--no-pin",
+                      "--drain",
+                      "0",
+                      "--access-log",
+                      temp.rut_access_log},
+                     temp.rut_log,
+                     runtime.child) ||
+        !wait_ready(ports[0], runtime.child, error)) {
+        if (error.empty()) error = std::string(kDiagnostic) + " public RUT did not start";
+        return false;
+    }
+    const std::string loaded_record = "Loaded program: " + temp.source + " (opt O2)\n";
+    const auto runtime_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+    while ((!log_contains(temp.rut_log, loaded_record.c_str()) ||
+            !log_contains(temp.rut_log, "Backend: io_uring\n")) &&
+           std::chrono::steady_clock::now() < runtime_deadline) {
+        if (poll_child(runtime.child)) {
+            error = std::string(kDiagnostic) + " public RUT exited before io_uring readiness";
+            return false;
+        }
+        usleep(1000);
+    }
+    if (!log_contains(temp.rut_log, loaded_record.c_str()) ||
+        !log_contains(temp.rut_log, "Backend: io_uring\n")) {
+        error = std::string(kDiagnostic) + " missing public source/O2/io_uring evidence";
+        return false;
+    }
+    static constexpr char kDestroyedSource[] = "destroyed-after-#554-public-load\n";
+    if (!write_file(temp.source, kDestroyedSource, sizeof(kDestroyedSource) - 1u)) {
+        error = std::string(kDiagnostic) + " could not destroy source after public load";
+        return false;
+    }
+
+    int client = connect_once(ports[0]);
+    if (client < 0) {
+        error = std::string(kDiagnostic) + " client connect failed";
+        return false;
+    }
+    const u64 request_ns = steady_now_ns();
+    if (!send_all(client,
+                  kDefaultBuffering206RangeRequest,
+                  sizeof(kDefaultBuffering206RangeRequest) - 1u)) {
+        close(client);
+        error = std::string(kDiagnostic) + " exact 78-byte request send failed";
+        return false;
+    }
+    const auto publication_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+    while (!origin.response_sent_open.load(std::memory_order_acquire)) {
+        if (!origin_live() || poll_child(runtime.child) ||
+            origin.response_send_failed.load(std::memory_order_acquire) ||
+            origin.response_peer_closed.load(std::memory_order_acquire) ||
+            origin.response_peer_unexpected_data.load(std::memory_order_acquire) ||
+            origin.accepted.load(std::memory_order_acquire) > 1u ||
+            origin.requests.load(std::memory_order_acquire) > 1u ||
+            std::chrono::steady_clock::now() >= publication_deadline) {
+            close(client);
+            error = std::string(kDiagnostic) + " one 141-byte origin publication failed";
+            return false;
+        }
+        usleep(1000);
+    }
+    const u64 w1_ns = origin.response_sent_ns.load(std::memory_order_acquire);
+    if (w1_ns < request_ns || origin.accepted.load(std::memory_order_acquire) != 1u ||
+        origin.requests.load(std::memory_order_acquire) != 1u ||
+        origin.response_send_all_calls.load(std::memory_order_acquire) != 1u ||
+        !origin.response_send_succeeded.load(std::memory_order_acquire) ||
+        origin.response_peer_closed.load(std::memory_order_acquire)) {
+        close(client);
+        error = std::string(kDiagnostic) + " origin publication ledger was incoherent";
+        return false;
+    }
+
+    u64 quiet_ns = 0u;
+    for (;;) {
+        std::string detail;
+        if (!observe_client_open_and_quiet_nonconsuming(client, 5, detail)) {
+            close(client);
+            error =
+                std::string(kDiagnostic) + " downstream was not quiet through W1+800ms: " + detail;
+            return false;
+        }
+        quiet_ns = steady_now_ns();
+        std::string access;
+        if (!origin_live() || poll_child(runtime.child) ||
+            origin.response_peer_closed.load(std::memory_order_acquire) ||
+            !read_request_length_access_file(temp.rut_access_log, access, error) ||
+            !access.empty()) {
+            close(client);
+            if (error.empty()) error = std::string(kDiagnostic) + " pre-expiry custody failed";
+            return false;
+        }
+        if (quiet_ns - w1_ns >= 800'000'000ull) break;
+    }
+
+    std::vector<char> response;
+    u64 first_ns = 0u;
+    u64 eof_ns = 0u;
+    while (eof_ns == 0u) {
+        if (!origin_live() || poll_child(runtime.child) ||
+            steady_now_ns() >= w1_ns + 2'000'000'000ull) {
+            close(client);
+            error = std::string(kDiagnostic) + " response/EOF missed W1+2s";
+            return false;
+        }
+        pollfd state{client, POLLIN | POLLHUP | POLLERR, 0};
+        const int ready = poll(&state, 1, 5);
+        if (ready < 0) {
+            if (errno == EINTR) continue;
+            close(client);
+            error = std::string(kDiagnostic) + " downstream poll failed";
+            return false;
+        }
+        if (ready == 0) continue;
+        char bytes[512];
+        const ssize_t count = recv(client, bytes, sizeof(bytes), 0);
+        const u64 observed_ns = steady_now_ns();
+        if (count > 0) {
+            if (first_ns == 0u) first_ns = observed_ns;
+            response.insert(response.end(), bytes, bytes + count);
+            if (response.size() > sizeof(kExpectedResponseNormalized) - 1u) {
+                close(client);
+                error = std::string(kDiagnostic) + " downstream leaked body/trailing bytes";
+                return false;
+            }
+        } else if (count == 0) {
+            eof_ns = observed_ns;
+        } else if (errno != EINTR && errno != EAGAIN && errno != EWOULDBLOCK) {
+            close(client);
+            error = std::string(kDiagnostic) + " downstream recv failed";
+            return false;
+        }
+    }
+    const auto peer_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(1);
+    while (!origin.response_peer_closed.load(std::memory_order_acquire)) {
+        if (!origin_live() || poll_child(runtime.child) ||
+            std::chrono::steady_clock::now() >= peer_deadline) {
+            close(client);
+            error = std::string(kDiagnostic) + " origin was not naturally retired";
+            return false;
+        }
+        usleep(1000);
+    }
+    const u64 peer_ns = origin.response_peer_closed_ns.load(std::memory_order_acquire);
+    std::vector<char> normalized = response;
+    const std::vector<char> expected(
+        kExpectedResponseNormalized,
+        kExpectedResponseNormalized + sizeof(kExpectedResponseNormalized) - 1u);
+    if (first_ns < w1_ns || eof_ns < w1_ns || peer_ns < w1_ns ||
+        quiet_ns - w1_ns < 800'000'000ull || first_ns - w1_ns < 750'000'000ull ||
+        first_ns - w1_ns >= 1'700'000'000ull || eof_ns - w1_ns < 750'000'000ull ||
+        eof_ns - w1_ns >= 2'000'000'000ull || peer_ns - w1_ns < 750'000'000ull ||
+        peer_ns - w1_ns >= 2'000'000'000ull || !normalize_date(normalized) ||
+        normalized != expected || header_end(normalized) != normalized.size()) {
+        close(client);
+        error = std::string(kDiagnostic) + " exact 163-byte timing/wire mismatch";
+        dump_wire(kDiagnostic, response);
+        return false;
+    }
+    const std::string response_text(normalized.begin(), normalized.end());
+    if (response_text.find("he") != std::string::npos ||
+        response_text.find("hello") != std::string::npos ||
+        response_text.find("502") != std::string::npos ||
+        response_text.find("504") != std::string::npos) {
+        close(client);
+        error = std::string(kDiagnostic) + " response leaked private body/failure bytes";
+        return false;
+    }
+    static constexpr char kExpectedAccess[] = "78\n";
+    const auto access_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+    std::string access;
+    while (access != kExpectedAccess && std::chrono::steady_clock::now() < access_deadline) {
+        if (!read_request_length_access_file(temp.rut_access_log, access, error)) {
+            close(client);
+            return false;
+        }
+        if (access.empty()) usleep(5000);
+    }
+    if (access != kExpectedAccess) {
+        close(client);
+        error = std::string(kDiagnostic) + " access was not exactly ASCII78+LF";
+        return false;
+    }
+    const auto stable_deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(175);
+    while (std::chrono::steady_clock::now() < stable_deadline) {
+        if (!origin_live() || poll_child(runtime.child) ||
+            origin.accepted.load(std::memory_order_acquire) != 1u ||
+            origin.requests.load(std::memory_order_acquire) != 1u ||
+            origin.response_send_all_calls.load(std::memory_order_acquire) != 1u ||
+            origin.response_peer_close_count.load(std::memory_order_acquire) != 1u ||
+            origin.response_send_failed.load(std::memory_order_acquire) ||
+            origin.response_peer_unexpected_data.load(std::memory_order_acquire) ||
+            !read_request_length_access_file(temp.rut_access_log, access, error) ||
+            access != kExpectedAccess) {
+            close(client);
+            if (error.empty()) error = std::string(kDiagnostic) + " no-retry stability failed";
+            return false;
+        }
+        poll(nullptr, 0, 5);
+    }
+    close(client);
+    client = -1;
+    const std::string expected_upstream_text =
+        "GET /buffered-timeout?q=1 HTTP/1.1\r\nHost: 127.0.0.1:" + std::to_string(ports[1]) +
+        "\r\nRange: bytes=0-4\r\n\r\n";
+    const std::vector<char> expected_upstream(expected_upstream_text.begin(),
+                                              expected_upstream_text.end());
+    origin.stop();
+    if (origin.thread_alive.load(std::memory_order_acquire) || origin.listen_fd >= 0 ||
+        origin.accepted.load(std::memory_order_acquire) != 1u ||
+        origin.requests.load(std::memory_order_acquire) != 1u || origin.history.size() != 1u ||
+        origin.history[0] != expected_upstream || origin.request != expected_upstream ||
+        !origin.response_sent_open.load(std::memory_order_acquire) ||
+        origin.response_send_all_calls.load(std::memory_order_acquire) != 1u ||
+        !origin.response_peer_closed.load(std::memory_order_acquire) ||
+        origin.response_peer_close_count.load(std::memory_order_acquire) != 1u ||
+        origin.response_send_failed.load(std::memory_order_acquire) ||
+        origin.response_peer_unexpected_data.load(std::memory_order_acquire)) {
+        error = std::string(kDiagnostic) + " exact upstream/retirement ledger mismatch";
+        return false;
+    }
+    if (!stop_child(runtime.child) || reservations.fds[0] >= 0 || reservations.fds[1] >= 0 ||
+        !read_request_length_access_file(temp.rut_access_log, access, error) ||
+        access != kExpectedAccess) {
+        if (error.empty()) error = std::string(kDiagnostic) + " final cleanup/access mismatch";
+        return false;
+    }
+    std::cerr << "PASS evidence: " << kDiagnostic
+              << " W1-to-first/EOF/retire(ms)=" << (first_ns - w1_ns) / 1'000'000ull << "/"
+              << (eof_ns - w1_ns) / 1'000'000ull << "/" << (peer_ns - w1_ns) / 1'000'000ull
+              << " upstream=78 publication=141"
+              << " access=78\\n retry=0\n";
+    return true;
+}
+
 static bool run_converter_default_buffering_206_range_incomplete_clean_eof_differential_impl(
     const char* rut_path,
     const std::string& container_name,
@@ -70037,6 +70346,9 @@ int main(int argc, char** argv) {
         argc == 3 && strcmp(argv[1], "--slash-normalized-exact-rut-production") == 0;
     const bool no_content204_rut_production =
         argc == 3 && strcmp(argv[1], "--no-content204-rut-production") == 0;
+    const bool rut_default_buffering_206_range_incomplete_body_inactivity_expiry =
+        argc == 3 &&
+        strcmp(argv[1], "--rut-default-buffering-206-range-incomplete-body-inactivity-expiry") == 0;
     const bool rut_exact_ipv4_listener_production =
         argc == 3 && strcmp(argv[1], "--rut-exact-ipv4-listener-production") == 0;
     const bool converter_coalesced_successor_differential =
@@ -70155,6 +70467,7 @@ int main(int argc, char** argv) {
          !converter_exact_absolute_redirect_302_differential &&
          !converter_exact_local_differential && !exact_strict_route_differential &&
          !slash_normalized_exact_rut_production && !no_content204_rut_production &&
+         !rut_default_buffering_206_range_incomplete_body_inactivity_expiry &&
          !rut_exact_ipv4_listener_production && !converter_coalesced_successor_differential &&
          !rut_iouring_gate_spike && !rut_iouring_gate_identity_negative &&
          !rut_iouring_gate_ready_mutation_negative && !rut_iouring_gate_owner_death_negative &&
@@ -70172,6 +70485,7 @@ int main(int argc, char** argv) {
           fixed_upload_head_incomplete_progress_timeout_differential ||
           fixed_upload_head_two_incomplete_header_fragments_timeout_differential) &&
          argv[2][0] != '/') ||
+        (rut_default_buffering_206_range_incomplete_body_inactivity_expiry && argv[2][0] != '/') ||
         (converter_proxy_hide_header_differential && argv[2][0] != '/') ||
         ((converter_default_buffering_positive_get_differential ||
           converter_default_buffering_incomplete_clean_eof_differential ||
@@ -71335,6 +71649,21 @@ int main(int argc, char** argv) {
                      "upstream history, and fallback produced one byte-exact upstream episode with "
                      "no second; access logs retained all three raw spellings (generic RUT #323 "
                      "evidence only; no nginx/converter claim)\n";
+        return 0;
+    }
+    if (rut_default_buffering_206_range_incomplete_body_inactivity_expiry) {
+        std::string production_error;
+        if (!run_rut_default_buffering_206_range_incomplete_body_inactivity_expiry(
+                argv[2], production_error)) {
+            std::cerr << "FAIL [#554 ordinary-RUT io_uring exact vector]: " << production_error
+                      << "\n";
+            return 1;
+        }
+        std::cerr << "PASS: #554 ordinary RUT public CLI/io_uring exact incomplete coherent-206 "
+                     "inactivity expiry emitted the Date-normalized 163-byte header only, "
+                     "real EOF, one 78-byte upstream request/publication, one ASCII78+LF access "
+                     "record, natural origin retirement, and no retry; no nginx/converter "
+                     "execution was required\n";
         return 0;
     }
     if (slash_normalized_exact_rut_production) {
