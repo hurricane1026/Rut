@@ -47286,9 +47286,9 @@ TEST(response_buffering_runtime,
 
 TEST(response_buffering_runtime,
      coherent_single_range_206_incomplete_expiry_requires_active_due_timer_owner) {
-    enum class Forgery : u8 { MissingOwner, CopiedOwner, WrongResult };
+    enum class Forgery : u8 { MissingOwner, CopiedOwner, WrongResult, NotDue };
     for (const Forgery forgery :
-         {Forgery::MissingOwner, Forgery::CopiedOwner, Forgery::WrongResult}) {
+         {Forgery::MissingOwner, Forgery::CopiedOwner, Forgery::WrongResult, Forgery::NotDue}) {
         ScopedIoUringLoopForRetirement guard;
         if (!guard.init()) SKIP("io_uring unavailable");
         auto* loop = guard.loop;
@@ -47313,9 +47313,12 @@ TEST(response_buffering_runtime,
         REQUIRE_EQ(loop->response_read_batch_owner_count, 1u);
         auto& owner = loop->response_read_batch_owners[0];
         REQUIRE(owner.valid);
-        if (forgery == Forgery::WrongResult) timer.result = 0;
-        loop->response_read_batch_event_index = 0;
         loop->dispatch(timer);
+        REQUIRE(conn.consume_response_read_timer_completion(timer.non_upstream_generation));
+        REQUIRE(conn.response_read_timer_owner_is_neutral());
+        REQUIRE(loop->complete_content_length_expiry_owner_is_valid(conn, owner));
+        if (forgery == Forgery::WrongResult) timer.result = 0;
+        if (forgery == Forgery::NotDue) conn.response_read_timer_last_progress_ns = monotonic_ns();
         if (forgery == Forgery::MissingOwner) {
             CHECK_FALSE(loop->start_complete_content_length_send(
                 conn,
@@ -47339,6 +47342,100 @@ TEST(response_buffering_runtime,
         loop->response_read_batch_event_count = 0;
         loop->response_read_batch_events = nullptr;
         cleanup_prebuilt_d2(loop, fixture);
+    }
+}
+
+TEST(response_buffering_runtime, coherent_single_range_206_expiry_rejects_mutated_raw_range_tuple) {
+    ScopedIoUringLoopForRetirement guard;
+    if (!guard.init()) SKIP("io_uring unavailable");
+    auto* loop = guard.loop;
+    RouteConfig config{};
+    PrebuiltD2Fixture fixture{};
+    REQUIRE(stage_live_precise_get(loop, config, &fixture));
+    Connection& conn = *fixture.conn;
+    static constexpr u8 kIncomplete[] =
+        "HTTP/1.1 206 Partial Content\r\nContent-Range: bytes 0-4/12\r\n"
+        "Content-Length: 5\r\n\r\nhe";
+    REQUIRE_EQ(conn.upstream_recv_buf.write(kIncomplete, sizeof(kIncomplete) - 1u),
+               sizeof(kIncomplete) - 1u);
+    const IoEvent response =
+        response_read_copy_event(conn, sizeof(kIncomplete) - 1u, true, 0, sizeof(kIncomplete) - 1u);
+    loop->dispatch_batch(&response, 1);
+    REQUIRE_EQ(conn.response_read_deadline_post_commit_phase,
+               ResponseReadDeadlinePostCommitPhase::Buffering);
+    const std::string wire(reinterpret_cast<const char*>(conn.upstream_recv_buf.data()),
+                           conn.upstream_recv_buf.len());
+    const size_t range = wire.find("bytes 0-4/12");
+    REQUIRE_NE(range, std::string::npos);
+    conn.upstream_recv_slice[range + sizeof("bytes 0-4/") - 1u] = static_cast<u8>('3');
+    conn.response_read_timer_last_progress_ns = monotonic_ns() - 6'000'000'000ull;
+    const IoEvent timer =
+        inert_response_read_timer_event(conn.id, conn.response_read_timer_owner_generation);
+    loop->dispatch_batch(&timer, 1);
+    CHECK_EQ(loop->conns[conn.id].fd, -1);
+    CHECK_EQ(loop->backend.send_state[conn.id].remaining, 0u);
+    CHECK_EQ(loop->conns[conn.id].response_read_deadline_send_len, 0u);
+    release_closed_response_read_fixture(fixture);
+}
+
+TEST(response_buffering_runtime,
+     coherent_single_range_206_expiry_rejects_zero_prefix_and_handles_fragmented_header) {
+    for (const bool fragmented : {false, true}) {
+        ScopedIoUringLoopForRetirement guard;
+        if (!guard.init()) SKIP("io_uring unavailable");
+        auto* loop = guard.loop;
+        RouteConfig config{};
+        PrebuiltD2Fixture fixture{};
+        REQUIRE(stage_live_precise_get(loop, config, &fixture));
+        Connection& conn = *fixture.conn;
+        static constexpr u8 kHeader[] =
+            "HTTP/1.1 206 Partial Content\r\nContent-Range: bytes 0-4/12\r\n"
+            "Content-Length: 5\r\n\r\n";
+        static constexpr u8 kPrefix[] = {'h', 'e'};
+        if (!fragmented) {
+            REQUIRE_EQ(conn.upstream_recv_buf.write(kHeader, sizeof(kHeader) - 1u),
+                       sizeof(kHeader) - 1u);
+            const IoEvent response =
+                response_read_copy_event(conn, sizeof(kHeader) - 1u, true, 0, sizeof(kHeader) - 1u);
+            loop->dispatch_batch(&response, 1);
+            REQUIRE_EQ(conn.response_read_deadline_post_commit_phase,
+                       ResponseReadDeadlinePostCommitPhase::Buffering);
+            REQUIRE_EQ(conn.response_read_deadline_post_commit_origin_received, 0u);
+        } else {
+            constexpr u32 split = 20u;
+            REQUIRE_LT(split, sizeof(kHeader) - 1u);
+            REQUIRE_EQ(conn.upstream_recv_buf.write(kHeader, split), split);
+            const IoEvent first = response_read_copy_event(conn, split, true, 0, split);
+            loop->dispatch_batch(&first, 1);
+            REQUIRE_EQ(conn.response_read_deadline_post_commit_phase,
+                       ResponseReadDeadlinePostCommitPhase::None);
+            REQUIRE_EQ(conn.response_read_deadline_progress_bytes, split);
+            REQUIRE_EQ(conn.upstream_recv_buf.write(kHeader + split, sizeof(kHeader) - 1u - split),
+                       sizeof(kHeader) - 1u - split);
+            REQUIRE_EQ(conn.upstream_recv_buf.write(kPrefix, sizeof(kPrefix)), sizeof(kPrefix));
+            const u32 tail = sizeof(kHeader) - 1u - split + sizeof(kPrefix);
+            const IoEvent finish = response_read_copy_event(conn, tail, true, split, split + tail);
+            loop->dispatch_batch(&finish, 1);
+            REQUIRE_EQ(conn.response_read_deadline_post_commit_phase,
+                       ResponseReadDeadlinePostCommitPhase::Buffering);
+            REQUIRE_EQ(conn.response_read_deadline_post_commit_origin_received, 2u);
+        }
+        const u32 id = conn.id;
+        conn.response_read_timer_last_progress_ns = monotonic_ns() - 6'000'000'000ull;
+        const IoEvent timer =
+            inert_response_read_timer_event(id, conn.response_read_timer_owner_generation);
+        loop->dispatch_batch(&timer, 1);
+        if (!fragmented) {
+            CHECK_EQ(loop->conns[id].fd, -1);
+            CHECK_EQ(loop->backend.send_state[id].remaining, 0u);
+            CHECK_EQ(loop->conns[id].response_read_deadline_send_len, 0u);
+            release_closed_response_read_fixture(fixture);
+        } else {
+            REQUIRE_GE(conn.fd, 0);
+            CHECK_EQ(conn.response_read_deadline_post_commit_send_body, 0u);
+            CHECK(conn.response_read_deadline_post_commit_close_after_drain);
+            cleanup_prebuilt_d2(loop, fixture);
+        }
     }
 }
 

@@ -3480,6 +3480,49 @@ public:
             !response_read_deadline_uses_precise_timer(c))
             return false;
 
+        const u32 header = c.response_read_deadline_post_commit_raw_header_end;
+        const u32 received = c.response_read_deadline_post_commit_origin_received;
+        if (header == 0 || header > 0xFFFFFFFFu - received ||
+            header + received != c.upstream_recv_buf.len())
+            return false;
+        CompleteContentLengthResponseClassification raw_classification{};
+        if (!complete_content_length_raw_origin_matches_pinned(
+                c, header, c.response_read_deadline_post_commit_declared_body, &raw_classification))
+            return false;
+        const CompleteContentLengthResponseClassification saved{
+            c.response_read_deadline_post_commit_response_class,
+            c.response_read_deadline_post_commit_range_first,
+            c.response_read_deadline_post_commit_range_last,
+            c.response_read_deadline_post_commit_range_total};
+        if (!complete_content_length_response_classification_equal(raw_classification, saved))
+            return false;
+        if (c.response_read_deadline_progress_generation != owner.deadline_generation ||
+            c.response_read_deadline_progress_episode != owner.upstream_episode ||
+            c.response_read_deadline_progress_bytes != received || owner.saw_positive) {
+            if (!owner.saw_positive ||
+                owner.first_copy_begin > 0xFFFFFFFFu - owner.positive_bytes ||
+                owner.first_copy_begin + owner.positive_bytes != owner.expected_copy_end ||
+                owner.expected_copy_end != c.upstream_recv_buf.len())
+                return false;
+        }
+        if (owner.post_commit_at_start &&
+            (!owner.saw_positive && (owner.positive_bytes != 0 || owner.first_copy_begin != 0 ||
+                                     owner.expected_copy_end != 0) ||
+             owner.saw_positive &&
+                 (owner.first_copy_begin != header + received - owner.positive_bytes ||
+                  owner.expected_copy_end != header + received)))
+            return false;
+        if (!owner.post_commit_at_start &&
+            (!owner.saw_positive || owner.first_copy_begin > header ||
+             owner.first_copy_begin + owner.positive_bytes != header + received))
+            return false;
+        if (c.response_read_timer_last_progress_ns == 0 ||
+            response_read_timer_remaining_ms(
+                c.response_read_timer_last_progress_ns,
+                static_cast<u64>(c.response_read_deadline_seconds) * 1'000'000'000ull,
+                monotonic_ns()) != 0)
+            return false;
+
         bool saw_due_target = false;
         for (u32 ei = 0; ei < response_read_batch_event_count; ++ei) {
             const IoEvent& timer_ev = response_read_batch_events[ei];

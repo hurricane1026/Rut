@@ -63189,6 +63189,60 @@ static bool run_pinned_nginx_default_buffering_206_range_incomplete_body_inactiv
 static constexpr char kIssue546WithheldNegativeResult[] =
     "#546 real withheld EOF authorization reached its bounded deadline and cleaned up";
 
+static bool build_issue554_handwritten_source(u16 frontend_port,
+                                              u16 backend_port,
+                                              const std::string& access_path,
+                                              std::string& source,
+                                              std::string& error) {
+    source = "accessLog { path: \"" + access_path +
+             "\", format: downstreamRequestBytes, publication: live }\n";
+    source += "listen 127.0.0.1:" + std::to_string(frontend_port) + "\n";
+    source += "upstream backend at \"127.0.0.1:" + std::to_string(backend_port) + "\"\n";
+    source += R"rut(route GET "/" {
+  return forward(backend,
+    request_policy: { version: "HTTP/1.1", host: "upstream", connection: "omit",
+      strip_headers: ["Connection", "Keep-Alive", "TE", "Expect", "Upgrade"] },
+    response_policy: { version: "HTTP/1.1", framing: "content_length",
+      connection: "request", server: "nginx/1.29.7", date: "current",
+      hide_headers: ["Date", "Server", "X-Pad"] },
+    failure_policy: { version: "HTTP/1.1", status: 502, reason: "Bad Gateway",
+      content_type: "text/html", server: "nginx/1.29.7", date: "current",
+      connection: "request", head_mode: "reject",
+      body: b"<html>\r\n<head><title>502 Bad Gateway</title></head>\r\n<body>\r\n<center><h1>502 Bad Gateway</h1></center>\r\n<hr><center>nginx/1.29.7</center>\r\n</body>\r\n</html>\r\n" },
+    timeout_failure_policy: { version: "HTTP/1.1", status: 504,
+      reason: "Gateway Time-out", content_type: "text/html",
+      server: "nginx/1.29.7", date: "current", connection: "request",
+      head_mode: "reject",
+      body: b"<html>\r\n<head><title>504 Gateway Time-out</title></head>\r\n<body>\r\n<center><h1>504 Gateway Time-out</h1></center>\r\n<hr><center>nginx/1.29.7</center>\r\n</body>\r\n</html>\r\n" },
+    response_read_timeout: 1s,
+    response_buffering: "complete_content_length")
+}
+)rut";
+    if (frontend_port == 0u || backend_port == 0u || frontend_port == backend_port ||
+        access_path.empty() || source.find("nginx::") != std::string::npos ||
+        source.find("converter") != std::string::npos) {
+        error = "#554 handwritten ordinary RUT source failed its bounded shape checks";
+        return false;
+    }
+    const auto lexed = rut::lex({source.data(), static_cast<u32>(source.size())});
+    if (!lexed) {
+        error = "#554 handwritten ordinary RUT source did not lex";
+        return false;
+    }
+    const auto parsed = rut::parse_file(lexed.value());
+    if (!parsed) {
+        error = "#554 handwritten ordinary RUT source did not parse";
+        return false;
+    }
+    std::unique_ptr<rut::AstFile> ast(parsed.value());
+    if (ast->items.len == 0u || source.find("response_read_timeout: 1s") == std::string::npos ||
+        source.find("response_buffering: \"complete_content_length\"") == std::string::npos) {
+        error = "#554 handwritten ordinary RUT source lost the timeout/buffering contract";
+        return false;
+    }
+    return true;
+}
+
 // Runtime-only #554 evidence.  This deliberately starts one ordinary source
 // through the public CLI and one held-open Recorder; nginx and the converter
 // are not execution prerequisites for this gate.
@@ -63226,14 +63280,9 @@ static bool run_rut_default_buffering_206_range_incomplete_body_inactivity_expir
         }
     }
 
-    // Use the existing source/compiler helper to prove the exact ordinary
-    // complete-content-length policy bundle, while executing only the public
-    // RUT binary below.
-    const std::string profile =
-        make_explicit_timeout_head_profile(ports[0], ports[1], temp.rut_access_log);
     std::string source;
-    if (!build_explicit_timeout_head_generated_source(
-            profile, ports[0], ports[1], temp.rut_access_log, source, error) ||
+    if (!build_issue554_handwritten_source(
+            ports[0], ports[1], temp.rut_access_log, source, error) ||
         !write_file(temp.source, source.data(), source.size())) {
         if (error.empty()) error = std::string(kDiagnostic) + " could not persist ordinary source";
         return false;
