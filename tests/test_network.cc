@@ -47396,6 +47396,74 @@ TEST(response_buffering_runtime, coherent_single_range_206_expiry_rejects_mutate
 }
 
 TEST(response_buffering_runtime,
+     coherent_single_range_206_expiry_rejects_positive_owner_progress_mutations) {
+    enum class Forgery : u8 { Generation, Episode, Bytes };
+    for (const Forgery forgery : {Forgery::Generation, Forgery::Episode, Forgery::Bytes}) {
+        ScopedIoUringLoopForRetirement guard;
+        if (!guard.init()) SKIP("io_uring unavailable");
+        auto* loop = guard.loop;
+        RouteConfig config{};
+        PrebuiltD2Fixture fixture{};
+        REQUIRE(stage_live_precise_get(loop, config, &fixture));
+        Connection& conn = *fixture.conn;
+        static constexpr u8 kIncomplete[] =
+            "HTTP/1.1 206 Partial Content\r\nContent-Range: bytes 0-4/12\r\n"
+            "Content-Length: 5\r\n\r\nhe";
+        static constexpr u8 kAdditional[] = {'l', 'l'};
+        REQUIRE_EQ(conn.upstream_recv_buf.write(kIncomplete, sizeof(kIncomplete) - 1u),
+                   sizeof(kIncomplete) - 1u);
+        const IoEvent response = response_read_copy_event(
+            conn, sizeof(kIncomplete) - 1u, true, 0, sizeof(kIncomplete) - 1u);
+        loop->dispatch_batch(&response, 1);
+        REQUIRE_EQ(conn.response_read_deadline_post_commit_phase,
+                   ResponseReadDeadlinePostCommitPhase::Buffering);
+        const u32 copy_begin = conn.upstream_recv_buf.len();
+        REQUIRE_EQ(conn.upstream_recv_buf.write(kAdditional, sizeof(kAdditional)),
+                   sizeof(kAdditional));
+        conn.response_read_timer_last_progress_ns = monotonic_ns() - 6'000'000'000ull;
+        const IoEvent timer =
+            inert_response_read_timer_event(conn.id, conn.response_read_timer_owner_generation);
+        const IoEvent progress = response_read_copy_event(
+            conn, sizeof(kAdditional), true, copy_begin, copy_begin + sizeof(kAdditional));
+        const IoEvent batch[2] = {timer, progress};
+        loop->prepare_response_read_deadline_batch(batch, 2);
+        REQUIRE_EQ(loop->response_read_batch_owner_count, 1u);
+        auto& owner = loop->response_read_batch_owners[0];
+        REQUIRE(owner.valid);
+        REQUIRE(owner.saw_positive);
+        REQUIRE_EQ(owner.positive_bytes, sizeof(kAdditional));
+        loop->response_read_batch_event_index = 0;
+        loop->dispatch(timer);
+        loop->response_read_batch_event_index = 1;
+        loop->dispatch(progress);
+        REQUIRE(conn.consume_response_read_timer_completion(timer.non_upstream_generation));
+        REQUIRE(conn.response_read_timer_owner_is_neutral());
+        // Model the authenticated settlement of this positive Full-copy owner
+        // without running the full settle path: settlement would refresh the
+        // precise timer and erase the genuinely-due witness under test.
+        conn.response_read_deadline_post_commit_origin_received += owner.positive_bytes;
+        conn.response_read_deadline_progress_generation = owner.deadline_generation;
+        conn.response_read_deadline_progress_episode = owner.upstream_episode;
+        conn.response_read_deadline_progress_bytes =
+            conn.response_read_deadline_post_commit_origin_received;
+        REQUIRE(loop->complete_content_length_expiry_owner_is_valid(conn, owner));
+        if (forgery == Forgery::Generation) conn.response_read_deadline_progress_generation ^= 1u;
+        if (forgery == Forgery::Episode) conn.response_read_deadline_progress_episode ^= 1u;
+        if (forgery == Forgery::Bytes) conn.response_read_deadline_progress_bytes++;
+        CHECK_FALSE(loop->start_complete_content_length_send(
+            conn,
+            IoUringEventLoop::CompleteContentLengthTerminalDisposition::InactivityExpiry,
+            &owner));
+        CHECK_FALSE(conn.send_armed);
+        CHECK_EQ(loop->backend.send_state[conn.id].remaining, 0u);
+        loop->response_read_batch_owner_count = 0;
+        loop->response_read_batch_event_count = 0;
+        loop->response_read_batch_events = nullptr;
+        cleanup_prebuilt_d2(loop, fixture);
+    }
+}
+
+TEST(response_buffering_runtime,
      coherent_single_range_206_expiry_rejects_zero_prefix_and_handles_fragmented_header) {
     for (const bool fragmented : {false, true}) {
         ScopedIoUringLoopForRetirement guard;
