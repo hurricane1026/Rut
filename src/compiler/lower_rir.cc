@@ -13,6 +13,12 @@ static bool response_read_deadline_request_policy_is_admitted_for_term(const Mir
                                                                        const MirTerminator& term) {
     if (response_read_deadline_request_policy_is_admitted(term.forward_request_policy_id))
         return true;
+    if (route_method == kRouteMethodGet &&
+        term.forward_request_policy_id ==
+            static_cast<u16>(RequestPolicyId::Http11FixedTrimSpPreserveHtab) &&
+        term.forward_response_buffering == ForwardResponseBufferingMode::CompleteContentLength &&
+        response_read_timeout_seconds_valid(term.forward_response_read_timeout_seconds))
+        return true;
     return term.forward_response_buffering == ForwardResponseBufferingMode::None &&
            fixed_upload_head_route_method_is_admitted(route_method) &&
            fixed_upload_head_request_policy_is_admitted(term.forward_request_policy_id) &&
@@ -28,8 +34,8 @@ static bool response_read_deadline_request_policy_is_admitted_for_term(const Mir
                module.failure_policies[term.forward_timeout_failure_policy_id - 1]);
 }
 
-static bool complete_content_length_request_policy_is_admitted_for_term(
-    u8 route_method, const MirTerminator& term) {
+static bool complete_content_length_request_policy_is_admitted_for_term(u8 route_method,
+                                                                        const MirTerminator& term) {
     return complete_content_length_request_policy_is_admitted(term.forward_request_policy_id) ||
            (route_method == kRouteMethodGet &&
             term.forward_request_policy_id ==
@@ -3133,8 +3139,8 @@ static FrontendResult<void> emit_term(const MirTerminator& term,
             if (term.forward_response_buffering !=
                     ForwardResponseBufferingMode::CompleteContentLength ||
                 term.forward_response_read_timeout_seconds == 0 ||
-                !complete_content_length_request_policy_is_admitted_for_term(
-                    fn->http_method, term) ||
+                !complete_content_length_request_policy_is_admitted_for_term(fn->http_method,
+                                                                             term) ||
                 term.forward_response_policy_id == 0 || term.forward_failure_policy_id == 0 ||
                 term.forward_timeout_failure_policy_id == 0 ||
                 term.forward_response_policy_id > b.mod->response_policy_count ||

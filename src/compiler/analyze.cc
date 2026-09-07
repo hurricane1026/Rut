@@ -9809,10 +9809,10 @@ static FrontendResult<HirTerminator> analyze_term(const AstStatement& stmt, cons
             static_cast<u16>(RequestPolicyId::Http11FixedTrimSpPreserveHtab) &&
         (!stmt.has_forward_response_read_timeout ||
          stmt.forward_response_buffering != ForwardResponseBufferingMode::CompleteContentLength))
-        return frontend_error(
-            FrontendError::UnsupportedSyntax,
-            stmt.span,
-            lit_str("retained_header_value requires complete response buffering and a response read timeout"));
+        return frontend_error(FrontendError::UnsupportedSyntax,
+                              stmt.span,
+                              lit_str("retained_header_value requires complete response buffering "
+                                      "and a response read timeout"));
     if (has_response_buffering &&
         (!stmt.has_forward_response_read_timeout || response_policy == nullptr ||
          failure_policy == nullptr || timeout_failure_policy == nullptr ||
@@ -19262,6 +19262,13 @@ static FrontendResult<HirModule*> analyze_file_internal(
             auto timeout_request_policy_is_admitted = [&](const HirTerminator& term) {
                 if (response_read_deadline_request_policy_is_admitted(
                         term.forward_request_policy_id))
+                    return true;
+                if (route.method == kRouteMethodGet &&
+                    term.forward_request_policy_id ==
+                        static_cast<u16>(RequestPolicyId::Http11FixedTrimSpPreserveHtab) &&
+                    term.forward_response_buffering ==
+                        ForwardResponseBufferingMode::CompleteContentLength &&
+                    response_read_timeout_seconds_valid(term.forward_response_read_timeout_seconds))
                     return true;
                 return term.forward_response_buffering == ForwardResponseBufferingMode::None &&
                        fixed_upload_head_route_method_is_admitted(route.method) &&

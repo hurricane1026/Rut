@@ -3027,6 +3027,29 @@ TEST(target_transform, h1_transform_precedes_request_policy_materialization) {
     loop.free_conn(*conn);
 }
 
+TEST(response_read_deadline, bodyless_complete_owner_preserves_transparent_id0) {
+    Connection conn{};
+    conn.response_read_deadline_profile =
+        ResponseReadDeadlineProfile::BodylessNonHeadContentLengthZero;
+    conn.response_read_deadline_buffering = ForwardResponseBufferingMode::CompleteContentLength;
+    conn.req_method = static_cast<u8>(LogHttpMethod::Get);
+    conn.response_read_deadline_route_method = kRouteMethodGet;
+    conn.request_policy_id = 0;
+    conn.response_read_deadline_upload.request_policy_id = 0;
+    CHECK(complete_content_length_request_policy_owner_is_stable(
+        conn, conn.response_read_deadline_upload));
+
+    conn.request_policy_id = static_cast<u16>(RequestPolicyId::Http11FixedTrimSpPreserveHtab);
+    conn.response_read_deadline_upload.request_policy_id = conn.request_policy_id;
+    CHECK(complete_content_length_request_policy_owner_is_stable(
+        conn, conn.response_read_deadline_upload));
+    conn.request_policy_id =
+        static_cast<u16>(RequestPolicyId::Http11FixedStripContentLengthAfterHost);
+    conn.response_read_deadline_upload.request_policy_id = conn.request_policy_id;
+    CHECK_FALSE(complete_content_length_request_policy_owner_is_stable(
+        conn, conn.response_read_deadline_upload));
+}
+
 TEST(request_policy, content_length_after_host_exact_wire_and_fail_closed_boundaries) {
     static constexpr u16 kLegacy = static_cast<u16>(RequestPolicyId::Http11FixedStrip);
     static constexpr u16 kAfterHost =

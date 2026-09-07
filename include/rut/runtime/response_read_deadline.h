@@ -902,8 +902,9 @@ inline bool complete_content_length_request_policy_owner_is_stable(
             ResponseReadDeadlineProfile::BodylessNonHeadContentLengthZero &&
         c.req_method == static_cast<u8>(LogHttpMethod::Get) &&
         c.response_read_deadline_route_method == kRouteMethodGet)
-        return bodyless_get_complete_content_length_request_policy_is_admitted(
-                   c.request_policy_id) &&
+        return (complete_content_length_request_policy_is_admitted(c.request_policy_id) ||
+                c.request_policy_id ==
+                    static_cast<u16>(RequestPolicyId::Http11FixedTrimSpPreserveHtab)) &&
                proof.request_policy_id == c.request_policy_id;
     return complete_content_length_request_policy_is_admitted(c.request_policy_id) &&
            proof.request_policy_id == c.request_policy_id;
@@ -1848,8 +1849,7 @@ inline bool bodyless_get_keep_alive_precise_arm_is_stable(
         c.http1_pipeline_request_generation != 0 || c.pipeline_stash_len != 0 ||
         c.response_read_deadline_post_commit_phase != ResponseReadDeadlinePostCommitPhase::None ||
         c.response_mutations_snapshotted || c.retry_req_send_len != 0 ||
-        !bodyless_get_complete_content_length_request_policy_is_admitted(
-            c.request_policy_id) ||
+        !bodyless_get_complete_content_length_request_policy_is_admitted(c.request_policy_id) ||
         proof.request_policy_id != c.request_policy_id || proof.handler_generation == 0 ||
         proof.handler_generation != c.handler_gen || proof.route_index >= config->route_count ||
         proof.route_fn == nullptr || proof.upstream_id >= config->upstream_count ||
@@ -2179,8 +2179,7 @@ inline bool bodyless_get_complete_content_length_precise_buffering_is_stable(con
            c.response_read_deadline_route_method == kRouteMethodGet &&
            c.req_method == static_cast<u8>(LogHttpMethod::Get) && c.pipeline_depth == 0 &&
            c.http1_pipeline_request_generation == 0 && c.pipeline_stash_len == 0 &&
-           bodyless_get_complete_content_length_request_policy_is_admitted(
-               c.request_policy_id) &&
+           bodyless_get_complete_content_length_request_policy_is_admitted(c.request_policy_id) &&
            c.response_read_deadline_upload.request_policy_id == c.request_policy_id &&
            c.on_upstream_recv == nullptr && c.on_upstream_send == nullptr &&
            response_read_deadline_default_persistence_is_stable(c) &&
