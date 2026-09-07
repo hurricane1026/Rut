@@ -63788,7 +63788,8 @@ static bool run_converter_default_buffering_206_range_incomplete_body_inactivity
         while (!origin.response_sent_open.load(std::memory_order_acquire)) {
             if (abort.load(std::memory_order_acquire) || !side_frontend_live() || !origins_live() ||
                 origin.response_send_failed.load(std::memory_order_acquire) ||
-                origin.response_peer_closed.load(std::memory_order_acquire) ||
+                ((!asymmetric_negative || side == 0u) &&
+                 origin.response_peer_closed.load(std::memory_order_acquire)) ||
                 origin.accepted.load(std::memory_order_acquire) > 1u ||
                 origin.requests.load(std::memory_order_acquire) > 1u ||
                 std::chrono::steady_clock::now() >= publication_deadline)
@@ -63801,7 +63802,8 @@ static bool run_converter_default_buffering_206_range_incomplete_body_inactivity
             origin.requests.load(std::memory_order_acquire) != 1u ||
             origin.response_send_all_calls.load(std::memory_order_acquire) != 1u ||
             !origin.response_send_succeeded.load(std::memory_order_acquire) ||
-            origin.response_peer_closed.load(std::memory_order_acquire))
+            ((!asymmetric_negative || side == 0u) &&
+             origin.response_peer_closed.load(std::memory_order_acquire)))
             return fail("one open origin publication ledger was incoherent");
 
         if (!asymmetric_negative || side == 0u) {
@@ -63938,6 +63940,9 @@ static bool run_converter_default_buffering_206_range_incomplete_body_inactivity
             std::chrono::steady_clock::now() + std::chrono::milliseconds(175);
         while (std::chrono::steady_clock::now() < stable_deadline) {
             std::string stable_access;
+            if (asymmetric_negative && side == 1u &&
+                !observe_client_open_and_quiet_nonconsuming(clients.fds[side], 5, detail))
+                return fail("complete negative RUT lost keep-alive/zero-byte stability: " + detail);
             if (!side_frontend_live() || !origins_live() ||
                 origin.accepted.load(std::memory_order_acquire) != 1u ||
                 origin.requests.load(std::memory_order_acquire) != 1u ||
@@ -63967,6 +63972,15 @@ static bool run_converter_default_buffering_206_range_incomplete_body_inactivity
         return false;
     }
 
+    if (asymmetric_negative) {
+        std::string detail;
+        if (!observe_client_open_and_quiet_nonconsuming(clients.fds[1], 20, detail)) {
+            error = std::string(kDiagnostic) +
+                    " complete negative RUT final open/zero-byte probe failed: " + detail;
+            return false;
+        }
+    }
+
     std::vector<char> normalized[2] = {evidence[0].response, evidence[1].response};
     if (!normalize_date(normalized[0]) || !normalize_date(normalized[1])) {
         error = std::string(kDiagnostic) + " Date normalization failed";
@@ -63988,15 +64002,21 @@ static bool run_converter_default_buffering_206_range_incomplete_body_inactivity
                count_text(text, "Content-Range: bytes 0-4/12\r\n") == 1u &&
                text.find("502") == std::string::npos && text.find("504") == std::string::npos;
     };
-    const bool exact_positive =
-        normalized[0] == expected_header && normalized[1] == expected_header;
-    if (!valid_response(normalized[0]) || !valid_response(normalized[1]) ||
-        (asymmetric_negative ? (normalized[0] != expected_header ||
-                                normalized[1] != expected_bodyful || normalized[0] == normalized[1])
-                             : (!exact_positive || normalized[0] != normalized[1]))) {
-        error = std::string(kDiagnostic) + (asymmetric_negative
-                                                ? " real asymmetric comparator failed to reject"
-                                                : " exact normalized 163-byte equality failed");
+    const auto positive_equivalence = [&](const std::vector<char>& nginx_wire,
+                                          const std::vector<char>& rut_wire) {
+        return valid_response(nginx_wire) && valid_response(rut_wire) &&
+               nginx_wire == expected_header && rut_wire == expected_header &&
+               nginx_wire == rut_wire;
+    };
+    const bool positive_equivalence_passed = positive_equivalence(normalized[0], normalized[1]);
+    const bool negative_contract = normalized[0] == expected_header &&
+                                   normalized[1] == expected_bodyful &&
+                                   normalized[0] != normalized[1];
+    if (asymmetric_negative ? (positive_equivalence_passed || !negative_contract)
+                            : !positive_equivalence_passed) {
+        error = std::string(kDiagnostic) +
+                (asymmetric_negative ? " real asymmetric contract/comparator assertion failed"
+                                     : " exact normalized 163-byte positive equivalence failed");
         dump_wire("#554 nginx normalized", normalized[0]);
         dump_wire("#554 RUT normalized", normalized[1]);
         return false;
