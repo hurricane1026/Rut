@@ -2098,7 +2098,7 @@ inline bool response_read_deadline_post_commit_is_stable(const Connection& c) {
     // but the body pump must never be able to change one into the other by
     // mutating only the terminal selector.  Keep these checks active after
     // raw-header consumption as well as at HeaderSend.
-    if (!collecting) {
+    if (!collecting && complete_buffering) {
         const u32 selected = c.response_read_deadline_post_commit_send_body;
         const u32 submitted = c.response_read_deadline_post_commit_downstream_submitted;
         const u32 completed = c.response_read_deadline_post_commit_downstream_completed;
