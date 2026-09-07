@@ -1788,6 +1788,18 @@ if(RUT_ENABLE_JIT)
         ENVIRONMENT "RUT_NGINX_DIFFERENTIAL_REQUIRED=1"
     )
     add_test(
+        NAME test_nginx_issue252_retained_header_whitespace_oracle
+        COMMAND test_nginx_differential --pinned-nginx-retained-header-whitespace-oracle
+    )
+    set_tests_properties(test_nginx_issue252_retained_header_whitespace_oracle PROPERTIES
+        LABELS "integration;nginx;docker;network"
+        RUN_SERIAL TRUE
+        RESOURCE_LOCK nginx-differential
+        TIMEOUT 90
+        SKIP_RETURN_CODE 77
+        ENVIRONMENT "RUT_NGINX_DIFFERENTIAL_REQUIRED=1"
+    )
+    add_test(
         NAME test_nginx_issue370_request_length_split_header_oracle
         COMMAND test_nginx_differential --pinned-nginx-request-length-split-header-oracle
     )
