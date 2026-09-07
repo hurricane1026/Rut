@@ -2111,14 +2111,15 @@ inline bool response_read_deadline_post_commit_is_stable(const Connection& c) {
             c.resp_body_remaining != selected - submitted)
             return false;
         if (selected == 0) {
-            if (c.response_read_deadline_post_commit_response_class !=
-                    CompleteContentLengthResponseClass::CoherentSingleRange206 ||
-                c.response_read_deadline_post_commit_origin_received == 0 ||
-                c.response_read_deadline_post_commit_origin_received >=
-                    c.response_read_deadline_post_commit_declared_body ||
-                !c.response_read_deadline_post_commit_close_after_drain || submitted != 0 ||
-                completed != 0 || inflight != 0 || c.resp_body_sent != header_len ||
-                c.resp_body_remaining != 0)
+            if (submitted != 0 || completed != 0 || inflight != 0 ||
+                c.resp_body_sent != header_len || c.resp_body_remaining != 0)
+                return false;
+            if (c.response_read_deadline_post_commit_response_class ==
+                    CompleteContentLengthResponseClass::CoherentSingleRange206 &&
+                (c.response_read_deadline_post_commit_origin_received == 0 ||
+                 c.response_read_deadline_post_commit_origin_received >=
+                     c.response_read_deadline_post_commit_declared_body ||
+                 !c.response_read_deadline_post_commit_close_after_drain))
                 return false;
         }
     }

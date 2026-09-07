@@ -3532,11 +3532,15 @@ public:
                 body_to_send = received;
                 break;
             case CompleteContentLengthTerminalDisposition::InactivityExpiry:
-                if (terminal_owner == nullptr || received == 0 || received >= declared ||
-                    c.response_read_deadline_post_commit_response_class !=
-                        CompleteContentLengthResponseClass::CoherentSingleRange206 ||
-                    !complete_content_length_expiry_owner_is_valid(c, *terminal_owner))
+                if (received >= declared) return false;
+                if (c.response_read_deadline_post_commit_response_class ==
+                    CompleteContentLengthResponseClass::CoherentSingleRange206) {
+                    if (terminal_owner == nullptr || received == 0 ||
+                        !complete_content_length_expiry_owner_is_valid(c, *terminal_owner))
+                        return false;
+                } else if (terminal_owner != nullptr) {
                     return false;
+                }
                 break;
             default:
                 return false;
