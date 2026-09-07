@@ -45232,7 +45232,8 @@ TEST(response_read_deadline,
             REQUIRE(stage_live_precise_get(loop, config, &fixture, false, true, request_policy));
             Connection& conn = *fixture.conn;
             const auto proof = conn.response_read_deadline_upload;
-            REQUIRE_NE(conn.handler_gen, 0u);
+            const u32 original_handler_generation = conn.handler_gen;
+            REQUIRE_NE(original_handler_generation, 0u);
             REQUIRE(valid_upstream_episode(conn.upstream_episode));
             REQUIRE_NE(proof.handler_generation, 0u);
             REQUIRE_EQ(proof.handler_generation, conn.handler_gen);
@@ -45264,19 +45265,39 @@ TEST(response_read_deadline,
             auto forged_proof = conn.response_read_deadline_upload;
             ++forged_proof.handler_generation;
             conn.response_read_deadline_upload = forged_proof;
-            CHECK_FALSE(response_read_deadline_owner_is_stable(
+            CHECK_FALSE(bodyless_get_keep_alive_precise_arm_is_stable(
                 conn,
-                &on_upstream_response<IoUringEventLoop>,
-                ResponseReadDeadlineOwnerPhase::ActiveAfterCopy));
+                conn.response_read_deadline_upload,
+                &config,
+                conn.response_read_deadline_bundle_id,
+                ResponseReadDeadlineOwnerPhase::ActiveAfterCopy,
+                &on_upstream_response<IoUringEventLoop>));
             conn.response_read_deadline_upload = proof;
+            CHECK(bodyless_get_keep_alive_precise_arm_is_stable(
+                conn,
+                conn.response_read_deadline_upload,
+                &config,
+                conn.response_read_deadline_bundle_id,
+                ResponseReadDeadlineOwnerPhase::ActiveAfterCopy,
+                &on_upstream_response<IoUringEventLoop>));
             forged_proof = proof;
             forged_proof.upload_episode = proof.upload_episode == 1u ? 2u : 1u;
             conn.response_read_deadline_upload = forged_proof;
-            CHECK_FALSE(response_read_deadline_owner_is_stable(
+            CHECK_FALSE(bodyless_get_keep_alive_precise_arm_is_stable(
                 conn,
-                &on_upstream_response<IoUringEventLoop>,
-                ResponseReadDeadlineOwnerPhase::ActiveAfterCopy));
+                conn.response_read_deadline_upload,
+                &config,
+                conn.response_read_deadline_bundle_id,
+                ResponseReadDeadlineOwnerPhase::ActiveAfterCopy,
+                &on_upstream_response<IoUringEventLoop>));
             conn.response_read_deadline_upload = proof;
+            CHECK(bodyless_get_keep_alive_precise_arm_is_stable(
+                conn,
+                conn.response_read_deadline_upload,
+                &config,
+                conn.response_read_deadline_bundle_id,
+                ResponseReadDeadlineOwnerPhase::ActiveAfterCopy,
+                &on_upstream_response<IoUringEventLoop>));
 
             conn.pipeline_depth = 1;
             CHECK_FALSE(loop->response_read_deadline_uses_precise_timer(conn));
@@ -45325,7 +45346,7 @@ TEST(response_read_deadline,
                 // With retirement already drained, the final body completion
                 // takes the explicit-close callback path directly.
                 REQUIRE_EQ(loop->conns[conn.id].fd, -1);
-                CHECK_EQ(loop->conns[conn.id].handler_gen, 0u);
+                CHECK_EQ(loop->conns[conn.id].handler_gen, original_handler_generation);
                 CHECK_EQ(loop->conns[conn.id].pending_ops, 0u);
                 CHECK_FALSE(loop->conns[conn.id].upstream_retirement_active);
                 CHECK_EQ(loop->conns[conn.id].upstream_retirement_target_owned, 0u);
@@ -45340,7 +45361,7 @@ TEST(response_read_deadline,
             REQUIRE(conn.http1_boundary_ready);
             loop->resume_deferred_http1_boundaries();
             REQUIRE_EQ(loop->conns[conn.id].fd, -1);
-            CHECK_EQ(loop->conns[conn.id].handler_gen, 0u);
+            CHECK_EQ(loop->conns[conn.id].handler_gen, original_handler_generation);
             CHECK_EQ(loop->conns[conn.id].pending_ops, 0u);
             CHECK_FALSE(loop->conns[conn.id].upstream_retirement_active);
             CHECK_EQ(loop->conns[conn.id].upstream_retirement_target_owned, 0u);
@@ -45348,6 +45369,237 @@ TEST(response_read_deadline,
             CHECK_FALSE(loop->conns[conn.id].http1_boundary_deferred);
             CHECK_FALSE(loop->conns[conn.id].http1_boundary_ready);
             CHECK_EQ(conn.pipeline_depth, 0u);
+            release_closed_response_read_fixture(fixture);
+        }
+    }
+}
+
+TEST(response_read_deadline,
+     exact_materialized_get_proof_mutations_fail_closed_before_downstream_send) {
+    enum class ProofMutation : u8 {
+        HandlerGeneration,
+        RawHeaderEnd,
+        RawContentLength,
+        RawTotalLength,
+        RewrittenHeaderEnd,
+        RewrittenTotalLength,
+        UploadEpisode,
+        ExpectedUploadLength,
+        RouteIndex,
+        UpstreamId,
+        RequestPolicy,
+        RouteFunction,
+        DownstreamClose
+    };
+    static constexpr ProofMutation kMutations[] = {ProofMutation::HandlerGeneration,
+                                                   ProofMutation::RawHeaderEnd,
+                                                   ProofMutation::RawContentLength,
+                                                   ProofMutation::RawTotalLength,
+                                                   ProofMutation::RewrittenHeaderEnd,
+                                                   ProofMutation::RewrittenTotalLength,
+                                                   ProofMutation::UploadEpisode,
+                                                   ProofMutation::ExpectedUploadLength,
+                                                   ProofMutation::RouteIndex,
+                                                   ProofMutation::UpstreamId,
+                                                   ProofMutation::RequestPolicy,
+                                                   ProofMutation::RouteFunction,
+                                                   ProofMutation::DownstreamClose};
+    static constexpr u8 kResponse[] = "HTTP/1.1 200 OK\r\nContent-Length: 4\r\n\r\nabcd";
+
+    const auto mutate = [](ResponseReadDeadlineUploadProof& proof, ProofMutation mutation) {
+        switch (mutation) {
+            case ProofMutation::HandlerGeneration:
+                ++proof.handler_generation;
+                break;
+            case ProofMutation::RawHeaderEnd:
+                ++proof.raw_header_end;
+                break;
+            case ProofMutation::RawContentLength:
+                ++proof.raw_content_length;
+                break;
+            case ProofMutation::RawTotalLength:
+                ++proof.raw_total_length;
+                break;
+            case ProofMutation::RewrittenHeaderEnd:
+                ++proof.rewritten_header_end;
+                break;
+            case ProofMutation::RewrittenTotalLength:
+                ++proof.rewritten_total_length;
+                break;
+            case ProofMutation::UploadEpisode:
+                proof.upload_episode = proof.upload_episode == 1u ? 2u : 1u;
+                break;
+            case ProofMutation::ExpectedUploadLength:
+                ++proof.expected_upload_length;
+                break;
+            case ProofMutation::RouteIndex:
+                proof.route_index = 1u;
+                break;
+            case ProofMutation::UpstreamId:
+                proof.upstream_id = 1u;
+                break;
+            case ProofMutation::RequestPolicy:
+                proof.request_policy_id =
+                    proof.request_policy_id == static_cast<u16>(RequestPolicyId::Http11FixedStrip)
+                        ? static_cast<u16>(RequestPolicyId::Http11FixedTrimSpPreserveHtab)
+                        : static_cast<u16>(RequestPolicyId::Http11FixedStrip);
+                break;
+            case ProofMutation::RouteFunction:
+                proof.route_fn = nullptr;
+                break;
+            case ProofMutation::DownstreamClose:
+                proof.downstream_close = !proof.downstream_close;
+                break;
+        }
+    };
+
+    for (const RequestPolicyId request_policy :
+         {RequestPolicyId::Http11FixedStrip, RequestPolicyId::Http11FixedTrimSpPreserveHtab}) {
+        for (const ProofMutation mutation : kMutations) {
+            ScopedIoUringLoopForRetirement guard;
+            if (!guard.init()) SKIP("io_uring unavailable");
+            auto* loop = guard.loop;
+            RouteConfig config{};
+            PrebuiltD2Fixture fixture{};
+            REQUIRE(stage_live_precise_get(loop, config, &fixture, false, true, request_policy));
+            Connection& conn = *fixture.conn;
+            const u32 id = conn.id;
+            mutate(conn.response_read_deadline_upload, mutation);
+            const u32 len = sizeof(kResponse) - 1u;
+            REQUIRE_EQ(conn.upstream_recv_buf.write(kResponse, len), len);
+            const IoEvent response = response_read_copy_event(conn, len, true, 0, len);
+            loop->dispatch_batch(&response, 1);
+
+            CHECK_EQ(loop->conns[id].fd, -1);
+            CHECK_FALSE(loop->conns[id].send_armed);
+            CHECK_FALSE(loop->conns[id].upstream_send_armed);
+            CHECK_EQ(loop->conns[id].response_header_buf.len(), 0u);
+            CHECK_EQ(loop->backend.send_state[id].remaining, 0u);
+            CHECK_EQ(loop->backend.upstream_send_state[id].remaining, 0u);
+            CHECK_EQ(loop->conns[id].retry_req_send_len, 0u);
+            u8 byte = 0;
+            CHECK_EQ(recv(fixture.peer_fd, &byte, 1, MSG_DONTWAIT), 0);
+            release_closed_response_read_fixture(fixture);
+        }
+    }
+}
+
+TEST(response_read_deadline,
+     exact_materialized_get_post_commit_proof_mutations_fail_closed_before_body_send) {
+    enum class ProofMutation : u8 {
+        HandlerGeneration,
+        RawHeaderEnd,
+        RawContentLength,
+        RawTotalLength,
+        RewrittenHeaderEnd,
+        RewrittenTotalLength,
+        UploadEpisode,
+        ExpectedUploadLength,
+        RouteIndex,
+        UpstreamId,
+        RequestPolicy,
+        RouteFunction,
+        DownstreamClose
+    };
+    static constexpr ProofMutation kMutations[] = {ProofMutation::HandlerGeneration,
+                                                   ProofMutation::RawHeaderEnd,
+                                                   ProofMutation::RawContentLength,
+                                                   ProofMutation::RawTotalLength,
+                                                   ProofMutation::RewrittenHeaderEnd,
+                                                   ProofMutation::RewrittenTotalLength,
+                                                   ProofMutation::UploadEpisode,
+                                                   ProofMutation::ExpectedUploadLength,
+                                                   ProofMutation::RouteIndex,
+                                                   ProofMutation::UpstreamId,
+                                                   ProofMutation::RequestPolicy,
+                                                   ProofMutation::RouteFunction,
+                                                   ProofMutation::DownstreamClose};
+    static constexpr u8 kPartial[] = "HTTP/1.1 200 OK\r\nContent-Length: 4\r\n\r\nab";
+    static constexpr u8 kLast[] = {'c', 'd'};
+
+    const auto mutate = [](ResponseReadDeadlineUploadProof& proof, ProofMutation mutation) {
+        switch (mutation) {
+            case ProofMutation::HandlerGeneration:
+                ++proof.handler_generation;
+                break;
+            case ProofMutation::RawHeaderEnd:
+                ++proof.raw_header_end;
+                break;
+            case ProofMutation::RawContentLength:
+                ++proof.raw_content_length;
+                break;
+            case ProofMutation::RawTotalLength:
+                ++proof.raw_total_length;
+                break;
+            case ProofMutation::RewrittenHeaderEnd:
+                ++proof.rewritten_header_end;
+                break;
+            case ProofMutation::RewrittenTotalLength:
+                ++proof.rewritten_total_length;
+                break;
+            case ProofMutation::UploadEpisode:
+                proof.upload_episode = proof.upload_episode == 1u ? 2u : 1u;
+                break;
+            case ProofMutation::ExpectedUploadLength:
+                ++proof.expected_upload_length;
+                break;
+            case ProofMutation::RouteIndex:
+                proof.route_index = 1u;
+                break;
+            case ProofMutation::UpstreamId:
+                proof.upstream_id = 1u;
+                break;
+            case ProofMutation::RequestPolicy:
+                proof.request_policy_id =
+                    proof.request_policy_id == static_cast<u16>(RequestPolicyId::Http11FixedStrip)
+                        ? static_cast<u16>(RequestPolicyId::Http11FixedTrimSpPreserveHtab)
+                        : static_cast<u16>(RequestPolicyId::Http11FixedStrip);
+                break;
+            case ProofMutation::RouteFunction:
+                proof.route_fn = nullptr;
+                break;
+            case ProofMutation::DownstreamClose:
+                proof.downstream_close = !proof.downstream_close;
+                break;
+        }
+    };
+
+    for (const RequestPolicyId request_policy :
+         {RequestPolicyId::Http11FixedStrip, RequestPolicyId::Http11FixedTrimSpPreserveHtab}) {
+        for (const ProofMutation mutation : kMutations) {
+            ScopedIoUringLoopForRetirement guard;
+            if (!guard.init()) SKIP("io_uring unavailable");
+            auto* loop = guard.loop;
+            RouteConfig config{};
+            PrebuiltD2Fixture fixture{};
+            REQUIRE(stage_live_precise_get(loop, config, &fixture, false, true, request_policy));
+            Connection& conn = *fixture.conn;
+            const u32 id = conn.id;
+            const u32 partial_len = sizeof(kPartial) - 1u;
+            REQUIRE_EQ(conn.upstream_recv_buf.write(kPartial, partial_len), partial_len);
+            const IoEvent partial =
+                response_read_copy_event(conn, partial_len, true, 0, partial_len);
+            loop->dispatch_batch(&partial, 1);
+            REQUIRE_EQ(conn.response_read_deadline_post_commit_phase,
+                       ResponseReadDeadlinePostCommitPhase::Buffering);
+            REQUIRE(response_read_deadline_post_commit_is_stable(conn));
+
+            mutate(conn.response_read_deadline_upload, mutation);
+            const u32 begin = conn.upstream_recv_buf.len();
+            REQUIRE_EQ(conn.upstream_recv_buf.write(kLast, sizeof(kLast)), sizeof(kLast));
+            const IoEvent terminal = response_read_copy_event(
+                conn, sizeof(kLast), true, begin, conn.upstream_recv_buf.len());
+            loop->dispatch_batch(&terminal, 1);
+
+            CHECK_EQ(loop->conns[id].fd, -1);
+            CHECK_FALSE(loop->conns[id].send_armed);
+            CHECK_FALSE(loop->conns[id].upstream_send_armed);
+            CHECK_EQ(loop->conns[id].response_header_buf.len(), 0u);
+            CHECK_EQ(loop->backend.send_state[id].remaining, 0u);
+            CHECK_EQ(loop->backend.upstream_send_state[id].remaining, 0u);
+            CHECK_EQ(loop->conns[id].retry_req_send_len, 0u);
+            u8 byte = 0;
+            CHECK_EQ(recv(fixture.peer_fd, &byte, 1, MSG_DONTWAIT), 0);
             release_closed_response_read_fixture(fixture);
         }
     }

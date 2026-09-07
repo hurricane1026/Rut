@@ -1610,6 +1610,25 @@ inline bool response_read_deadline_owner_is_stable(const Connection& c,
         return false;
     if (!complete_content_length_request_policy_owner_is_stable(c, c.response_read_deadline_upload))
         return false;
+    const bool exact_materialized_get =
+        c.response_read_deadline_profile ==
+            ResponseReadDeadlineProfile::BodylessNonHeadContentLengthZero &&
+        c.response_read_deadline_buffering == ForwardResponseBufferingMode::CompleteContentLength &&
+        c.req_method == static_cast<u8>(LogHttpMethod::Get) &&
+        c.response_read_deadline_method == static_cast<u8>(LogHttpMethod::Get) &&
+        c.response_read_deadline_route_method == kRouteMethodGet &&
+        bodyless_get_complete_content_length_request_policy_is_admitted(c.request_policy_id);
+    if (exact_materialized_get && !response_read_deadline_coalesced_get_phase1_proof_is_stable(
+                                      c,
+                                      c.response_read_deadline_upload,
+                                      /*allow_retired_episode=*/false,
+                                      /*require_upload_episode=*/true,
+                                      c.response_read_deadline_profile,
+                                      c.response_read_deadline_buffering,
+                                      c.response_read_deadline_bundle_id,
+                                      c.response_read_deadline_method,
+                                      c.response_read_deadline_route_method))
+        return false;
     const auto& response = cfg->response_policies[bundle.response_policy_id - 1];
     const auto& failure = cfg->failure_policies[bundle.failure_policy_id - 1];
     const auto& timeout = cfg->failure_policies[bundle.timeout_failure_policy_id - 1];
@@ -2072,6 +2091,24 @@ inline bool response_read_deadline_post_commit_is_stable(const Connection& c) {
                                          c, c.response_read_deadline_upload, retired_buffered_send))
         return false;
     if (!complete_content_length_request_policy_owner_is_stable(c, c.response_read_deadline_upload))
+        return false;
+    const bool exact_materialized_get =
+        c.response_read_deadline_profile ==
+            ResponseReadDeadlineProfile::BodylessNonHeadContentLengthZero &&
+        complete_buffering && c.req_method == static_cast<u8>(LogHttpMethod::Get) &&
+        c.response_read_deadline_method == static_cast<u8>(LogHttpMethod::Get) &&
+        c.response_read_deadline_route_method == kRouteMethodGet &&
+        bodyless_get_complete_content_length_request_policy_is_admitted(c.request_policy_id);
+    if (exact_materialized_get && !response_read_deadline_coalesced_get_phase1_proof_is_stable(
+                                      c,
+                                      c.response_read_deadline_upload,
+                                      retired_buffered_send,
+                                      /*require_upload_episode=*/true,
+                                      c.response_read_deadline_profile,
+                                      c.response_read_deadline_buffering,
+                                      c.response_read_deadline_bundle_id,
+                                      c.response_read_deadline_method,
+                                      c.response_read_deadline_route_method))
         return false;
     const auto& bundle = cfg->policy_bundles[bundle_id - 1];
     const bool collecting = c.response_read_deadline_post_commit_phase ==
