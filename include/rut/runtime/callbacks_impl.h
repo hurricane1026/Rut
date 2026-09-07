@@ -5346,6 +5346,7 @@ inline bool apply_request_policy(Connection& conn, const sockaddr_in& endpoint, 
     const u8* path_ptr = reinterpret_cast<const u8*>(req.path.ptr);
     if (line_end + 1 >= end || path_ptr < data || path_ptr + req.path.len > line_end) return false;
     const bool trim_sp_preserve_htab = request_policy_trims_sp_preserves_htab(policy_id);
+    u64 measured_id3_length = 0;
 
     // ID3 is measured completely before scratch is touched.  This proves the
     // parser-owned raw boundaries and both destination capacities up front;
@@ -5368,8 +5369,11 @@ inline bool apply_request_policy(Connection& conn, const sockaddr_in& endpoint, 
                               static_cast<u8>(ip >> 8),
                               static_cast<u8>(ip)};
         u64 measured = static_cast<u64>(path_ptr - data) + req.path.len + 1u + 8u + 2u;
-        measured += 6u + 4u + 2u;
-        for (u8 octet : octets) measured += decimal_len(octet);
+        measured += 6u + 2u;
+        for (u8 oi = 0; oi < 4; ++oi) {
+            if (oi != 0) ++measured;
+            measured += decimal_len(octets[oi]);
+        }
         const u16 port = ntohs(endpoint.sin_port);
         if (port != 80) measured += 1u + decimal_len(port);
         const u8* measured_hs = line_end + 2;
@@ -5419,6 +5423,7 @@ inline bool apply_request_policy(Connection& conn, const sockaddr_in& endpoint, 
         if (measured_index != req.header_count || measured > conn.send_buf.capacity() ||
             measured > conn.recv_buf.capacity() || measured > 0xffffffffu)
             return false;
+        measured_id3_length = measured;
     }
 
     auto append = [&](const u8* p, u32 n) {
@@ -5542,6 +5547,8 @@ inline bool apply_request_policy(Connection& conn, const sockaddr_in& endpoint, 
     }
     if (!append_lit("\r\n", 2)) return false;
     const u32 new_header_len = conn.send_buf.len();
+    if (trim_sp_preserve_htab && measured_id3_length != static_cast<u64>(new_header_len) + body_len)
+        return false;
     const u32 body_start = parser.header_end;
     const u64 request_end64 = static_cast<u64>(body_start) + body_len;
     if (request_end64 > len) return false;

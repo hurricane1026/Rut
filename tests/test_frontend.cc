@@ -33226,6 +33226,19 @@ TEST(frontend, retained_header_value_trim_sp_preserve_htab_is_get_timeout_only) 
              static_cast<i32>(RequestPolicyId::Http11FixedTrimSpPreserveHtab));
     rir.destroy();
 
+    // The capability requires a valid response timeout; 60s is the public
+    // acceptance gate, not a compiler-only special value.
+    std::string one_second = source;
+    const auto public_timeout = one_second.find("response_read_timeout: 60s");
+    REQUIRE_NE(public_timeout, std::string::npos);
+    one_second.replace(
+        public_timeout, sizeof("response_read_timeout: 60s") - 1, "response_read_timeout: 1s");
+    auto one_second_lexed = lex({one_second.data(), static_cast<u32>(one_second.size())});
+    REQUIRE(one_second_lexed);
+    auto one_second_ast = parse_file_heap(one_second_lexed.value());
+    REQUIRE(one_second_ast);
+    REQUIRE(analyze_file_heap(one_second_ast.value()));
+
     const auto expect_rejected = [&](std::string bad) {
         auto bad_lexed = lex({bad.data(), static_cast<u32>(bad.size())});
         REQUIRE(bad_lexed);

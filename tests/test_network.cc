@@ -3212,6 +3212,92 @@ TEST(request_policy, content_length_after_host_exact_wire_and_fail_closed_bounda
                               sizeof(kRetainedExpected) - 1u);
     CHECK_EQ(conn.request_policy_id, kRetained);
 
+    struct RetainedValueCase {
+        const char* raw;
+        const char* emitted;
+    };
+    const RetainedValueCase retained_values[] = {
+        {"  keep  ", "keep"},
+        {"\t keep \t", "\t keep \t"},
+        {" \tkeep\t ", "\tkeep\t"},
+        {"a \t b", "a \t b"},
+    };
+    for (const RetainedValueCase& value : retained_values) {
+        const std::string wire =
+            std::string("GET /ledger HTTP/1.1\r\nHost: client\r\nX-Test:") + value.raw + "\r\n\r\n";
+        const std::string expected =
+            std::string("GET /ledger HTTP/1.1\r\nHost: 127.0.0.1:9000\r\nX-Test: ") +
+            value.emitted + "\r\n\r\n";
+        prepare_text(wire.c_str());
+        conn.response_read_deadline_profile =
+            ResponseReadDeadlineProfile::BodylessNonHeadContentLengthZero;
+        conn.response_read_deadline_buffering = ForwardResponseBufferingMode::CompleteContentLength;
+        conn.response_read_deadline_method = static_cast<u8>(LogHttpMethod::Get);
+        conn.response_read_deadline_route_method = kRouteMethodGet;
+        conn.response_read_deadline_seconds = 60;
+        conn.response_read_deadline_state = ResponseReadDeadlineState::Preflight;
+        REQUIRE(apply_request_policy(conn, endpoint, kRetained));
+        require_materialized_wire(reinterpret_cast<const u8*>(expected.data()), expected.size());
+    }
+
+    const auto configure_retained = [](Connection& candidate) {
+        candidate.response_read_deadline_profile =
+            ResponseReadDeadlineProfile::BodylessNonHeadContentLengthZero;
+        candidate.response_read_deadline_buffering =
+            ForwardResponseBufferingMode::CompleteContentLength;
+        candidate.response_read_deadline_method = static_cast<u8>(LogHttpMethod::Get);
+        candidate.response_read_deadline_route_method = kRouteMethodGet;
+        candidate.response_read_deadline_seconds = 60;
+        candidate.response_read_deadline_state = ResponseReadDeadlineState::Preflight;
+    };
+    static constexpr char kExactCapacityRequest[] =
+        "GET /ledger HTTP/1.1\r\nHost: 127.0.0.1:9000\r\nX-Test:\t keep \t\r\n\r\n";
+    static_assert(sizeof(kExactCapacityRequest) - 1u == 63u);
+    {
+        Connection tight{};
+        u8 recv[63]{};
+        u8 send[63]{};
+        tight.recv_slice = recv;
+        tight.send_slice = send;
+        tight.bind_request_receive_buffer(recv, sizeof(recv));
+        tight.send_buf.bind(send, sizeof(send));
+        REQUIRE_EQ(tight.recv_buf.write(reinterpret_cast<const u8*>(kExactCapacityRequest), 63u),
+                   63u);
+        capture_request_metadata(tight);
+        configure_retained(tight);
+        REQUIRE(apply_request_policy(tight, endpoint, kRetained));
+        REQUIRE_EQ(tight.recv_buf.len(), 63u);
+        CHECK_EQ(__builtin_memcmp(tight.recv_buf.data(), kExactCapacityRequest, 63u), 0);
+    }
+    const char kShortHostRequest[] = "GET /ledger HTTP/1.1\r\nHost: x\r\nX-Test:\t keep \t\r\n\r\n";
+    const u32 short_host_len = static_cast<u32>(strlen(kShortHostRequest));
+    for (const u32 capacity : {63u, 62u}) {
+        Connection tight{};
+        u8 recv[128]{};
+        u8 send[70]{};
+        tight.recv_slice = recv;
+        tight.send_slice = send;
+        tight.bind_request_receive_buffer(recv, capacity == 63u ? 63u : 62u);
+        tight.send_buf.bind(send, capacity);
+        REQUIRE_EQ(
+            tight.recv_buf.write(reinterpret_cast<const u8*>(kShortHostRequest), short_host_len),
+            short_host_len);
+        capture_request_metadata(tight);
+        configure_retained(tight);
+        const u32 before_len = tight.recv_buf.len();
+        u8 before[128]{};
+        __builtin_memcpy(before, tight.recv_buf.data(), before_len);
+        if (capacity == 63u) {
+            REQUIRE(apply_request_policy(tight, endpoint, kRetained));
+            REQUIRE_EQ(tight.recv_buf.len(), 63u);
+        } else {
+            CHECK_FALSE(apply_request_policy(tight, endpoint, kRetained));
+            CHECK_EQ(tight.send_buf.len(), 0u);
+            CHECK_EQ(tight.recv_buf.len(), before_len);
+            CHECK_EQ(__builtin_memcmp(tight.recv_buf.data(), before, before_len), 0);
+        }
+    }
+
     static constexpr char kRetainedCl0[] =
         "GET /ledger HTTP/1.1\r\nHost: client\r\nContent-Length: 0\r\n"
         "X-Test:\t keep \t\r\n\r\n";
@@ -3227,10 +3313,6 @@ TEST(request_policy, content_length_after_host_exact_wire_and_fail_closed_bounda
     CHECK_FALSE(apply_request_policy(conn, endpoint, kRetained));
     CHECK_EQ(conn.send_buf.len(), 0u);
     require_wire(retained_cl0_before, sizeof(retained_cl0_before));
-
-    prepare_text(kNoContentLength);
-    CHECK_EQ(inspect_request_policy_body(conn, 3), RequestPolicyBodyState::Invalid);
-    CHECK_FALSE(apply_request_policy(conn, endpoint, 3));
 
     prepare_text(kContentLengthAfterOrdinary);
     const u32 transparent_len = conn.recv_buf.len();

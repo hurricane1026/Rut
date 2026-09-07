@@ -1172,6 +1172,12 @@ inline bool response_read_deadline_coalesced_get_phase1_proof_is_stable(
     if (identity_method == 0xffu) identity_method = c.response_read_deadline_method;
     if (identity_route_method == 0xffu)
         identity_route_method = c.response_read_deadline_route_method;
+    const bool exact_explicit_close = proof.downstream_close && c.pipeline_depth == 0 &&
+                                      c.http1_pipeline_request_generation == 0 &&
+                                      c.pipeline_stash_len == 0 && c.req_header_end != 0 &&
+                                      c.req_initial_send_len == c.req_header_end &&
+                                      complete_content_length_explicit_close_request_is_stable(
+                                          c, proof, identity_buffering, identity_profile);
     if (cfg == nullptr ||
         identity_profile != ResponseReadDeadlineProfile::BodylessNonHeadContentLengthZero ||
         identity_buffering != ForwardResponseBufferingMode::CompleteContentLength ||
@@ -1191,7 +1197,7 @@ inline bool response_read_deadline_coalesced_get_phase1_proof_is_stable(
         proof.upstream_id >= cfg->upstream_count || proof.upstream_id != c.upstream_idx ||
         (require_upload_episode ? !valid_upstream_episode(proof.upload_episode)
                                 : proof.upload_episode != 0) ||
-        proof.downstream_close)
+        (proof.downstream_close && !exact_explicit_close))
         return false;
     const RouteEntry& route = cfg->routes[proof.route_index];
     const UpstreamTarget& target = cfg->upstreams[proof.upstream_id];
