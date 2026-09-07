@@ -33226,33 +33226,32 @@ TEST(frontend, retained_header_value_trim_sp_preserve_htab_is_get_timeout_only) 
              static_cast<i32>(RequestPolicyId::Http11FixedTrimSpPreserveHtab));
     rir.destroy();
 
-    const char* rejected[] = {
-        "upstream b\nroute POST \"/\" { return forward(b, request_policy: { "
-        "version: \"HTTP/1.1\", host: \"upstream\", connection: \"omit\", "
-        "strip_headers: [\"Connection\", \"Keep-Alive\", \"TE\", \"Expect\", \"Upgrade\"], "
-        "retained_header_value: \"trim_sp_preserve_htab\" }, response_read_timeout: 60s, "
-        "response_buffering: \"complete_content_length\") }\n",
-        "upstream b\nroute GET \"/\" { return forward(b, request_policy: { "
-        "version: \"HTTP/1.1\", host: \"upstream\", connection: \"omit\", "
-        "strip_headers: [\"Connection\", \"Keep-Alive\", \"TE\", \"Expect\", \"Upgrade\"], "
-        "retained_header_value: \"trim_sp_preserve_htab\" }, response_read_timeout: 60s) }\n",
-        "upstream b\nroute GET \"/\" { return forward(b, request_policy: { "
-        "version: \"HTTP/1.1\", host: \"upstream\", connection: \"omit\", "
-        "strip_headers: [\"Connection\", \"Keep-Alive\", \"TE\", \"Expect\", \"Upgrade\"], "
-        "retained_header_value: \"trim_sp_preserve_htab\", "
-        "content_length_position: \"after_host\" }) }\n",
-        "upstream b\nroute GET \"/\" { return forward(b, request_policy: { "
-        "version: \"HTTP/1.1\", host: \"upstream\", connection: \"omit\", "
-        "strip_headers: [\"Connection\", \"Keep-Alive\", \"TE\", \"Expect\", \"Upgrade\"], "
-        "retained_header_value: \"unknown\" }) }\n",
-    };
-    for (const char* bad : rejected) {
-        auto bad_lexed = lex(lit(bad));
+    const auto expect_rejected = [&](std::string bad) {
+        auto bad_lexed = lex({bad.data(), static_cast<u32>(bad.size())});
         REQUIRE(bad_lexed);
         auto bad_ast = parse_file_heap(bad_lexed.value());
-        if (!bad_ast) continue;
-        CHECK_FALSE(analyze_file_heap(bad_ast.value()).has_value());
-    }
+        if (bad_ast) CHECK_FALSE(analyze_file_heap(bad_ast.value()).has_value());
+    };
+    std::string bad_method = source;
+    bad_method.replace(bad_method.find("route GET"), 9, "route POST");
+    expect_rejected(bad_method);
+    std::string missing_buffering = source;
+    const auto buffering =
+        missing_buffering.find("response_buffering: \"complete_content_length\"");
+    REQUIRE_NE(buffering, std::string::npos);
+    missing_buffering.erase(buffering,
+                            sizeof("response_buffering: \"complete_content_length\"") - 1);
+    expect_rejected(missing_buffering);
+    std::string after_host = source;
+    const auto retained = after_host.find("retained_header_value: \"trim_sp_preserve_htab\"");
+    REQUIRE_NE(retained, std::string::npos);
+    after_host.insert(retained, "content_length_position: \"after_host\", ");
+    expect_rejected(after_host);
+    std::string unknown = source;
+    const auto value_pos = unknown.find("trim_sp_preserve_htab");
+    REQUIRE_NE(value_pos, std::string::npos);
+    unknown.replace(value_pos, sizeof("trim_sp_preserve_htab") - 1, "unknown");
+    expect_rejected(unknown);
 }
 
 TEST(frontend, request_policy_after_host_admits_only_fixed_upload_head_timeout_profile) {
