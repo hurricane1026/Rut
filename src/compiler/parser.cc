@@ -2032,6 +2032,8 @@ struct Parser {
                         bool have_connection = false;
                         bool have_strip_headers = false;
                         bool have_content_length_position = false;
+                        bool have_retained_header_value = false;
+                        bool retained_header_value_trim_sp_preserve_htab = false;
                         while (true) {
                             auto field = expect(TokenType::Ident);
                             if (!field) return core::make_unexpected(field.error());
@@ -2075,6 +2077,16 @@ struct Parser {
                                     return frontend_error(FrontendError::UnsupportedSyntax,
                                                           span_from(*value.value()),
                                                           v);
+                            } else if (field_name.eq({"retained_header_value", 21})) {
+                                seen = &have_retained_header_value;
+                                auto value = expect(TokenType::StringLit);
+                                if (!value) return core::make_unexpected(value.error());
+                                const Str v = value.value()->text;
+                                if (!v.eq({"trim_sp_preserve_htab", 21}))
+                                    return frontend_error(FrontendError::UnsupportedSyntax,
+                                                          span_from(*value.value()),
+                                                          v);
+                                retained_header_value_trim_sp_preserve_htab = true;
                             } else if (field_name.eq({"strip_headers", 13})) {
                                 seen = &have_strip_headers;
                                 auto lbracket = expect(TokenType::LBracket);
@@ -2135,8 +2147,14 @@ struct Parser {
                             return frontend_error(FrontendError::UnsupportedSyntax,
                                                   span_from(*rbrace.value()),
                                                   kw_text);
+                        if (have_content_length_position && have_retained_header_value)
+                            return frontend_error(FrontendError::UnsupportedSyntax,
+                                                  span_from(*rbrace.value()),
+                                                  kw_text);
                         stmt.forward_request_policy_id = static_cast<u16>(
-                            have_content_length_position
+                            retained_header_value_trim_sp_preserve_htab
+                                ? RequestPolicyId::Http11FixedTrimSpPreserveHtab
+                                : have_content_length_position
                                 ? RequestPolicyId::Http11FixedStripContentLengthAfterHost
                                 : RequestPolicyId::Http11FixedStrip);
                         stmt.has_forward_request_policy = true;

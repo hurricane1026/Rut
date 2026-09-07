@@ -28,6 +28,14 @@ static bool response_read_deadline_request_policy_is_admitted_for_term(const Mir
                module.failure_policies[term.forward_timeout_failure_policy_id - 1]);
 }
 
+static bool complete_content_length_request_policy_is_admitted_for_term(
+    u8 route_method, const MirTerminator& term) {
+    return complete_content_length_request_policy_is_admitted(term.forward_request_policy_id) ||
+           (route_method == kRouteMethodGet &&
+            term.forward_request_policy_id ==
+                static_cast<u16>(RequestPolicyId::Http11FixedTrimSpPreserveHtab));
+}
+
 static u8 yield_kind_abi(WaitEventKind kind) {
     switch (kind) {
         case WaitEventKind::Timer:
@@ -3125,8 +3133,8 @@ static FrontendResult<void> emit_term(const MirTerminator& term,
             if (term.forward_response_buffering !=
                     ForwardResponseBufferingMode::CompleteContentLength ||
                 term.forward_response_read_timeout_seconds == 0 ||
-                !complete_content_length_request_policy_is_admitted(
-                    term.forward_request_policy_id) ||
+                !complete_content_length_request_policy_is_admitted_for_term(
+                    fn->http_method, term) ||
                 term.forward_response_policy_id == 0 || term.forward_failure_policy_id == 0 ||
                 term.forward_timeout_failure_policy_id == 0 ||
                 term.forward_response_policy_id > b.mod->response_policy_count ||
@@ -3353,8 +3361,8 @@ static bool mir_forward_preflight_lowering_shape_valid(const MirModule& module,
                !timeout_term->has_forward_target_transform &&
                !timeout_term->commit_response_mutations &&
                (!complete || (complete_content_length_route_method_is_admitted(function.method) &&
-                              complete_content_length_request_policy_is_admitted(
-                                  timeout_term->forward_request_policy_id)));
+                              complete_content_length_request_policy_is_admitted_for_term(
+                                  function.method, *timeout_term)));
     }
     if (framing_selection) {
         if (!common || function.method != kRouteMethodHead || function.blocks.len != 3 ||
@@ -3462,7 +3470,7 @@ static bool mir_forward_preflight_lowering_shape_valid(const MirModule& module,
            response_read_timeout_seconds_valid(forward.forward_response_read_timeout_seconds) &&
            forward.forward_response_buffering ==
                ForwardResponseBufferingMode::CompleteContentLength &&
-           complete_content_length_request_policy_is_admitted(forward.forward_request_policy_id) &&
+           complete_content_length_request_policy_is_admitted_for_term(function.method, forward) &&
            policy_bundle_valid;
 }
 

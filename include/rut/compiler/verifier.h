@@ -1223,8 +1223,11 @@ inline VerifyResult verify_module_impl(const Module& mod,
                     (buffering != ForwardResponseBufferingMode::CompleteContentLength ||
                      !complete_content_length_route_method_is_admitted(fn.http_method) ||
                      request_policy < 0 || request_policy > 0xffff ||
-                     !complete_content_length_request_policy_is_admitted(
-                         static_cast<u16>(request_policy))))
+                     !(complete_content_length_request_policy_is_admitted(
+                           static_cast<u16>(request_policy)) ||
+                       (fn.http_method == kRouteMethodGet &&
+                        static_cast<u16>(request_policy) ==
+                            static_cast<u16>(RequestPolicyId::Http11FixedTrimSpPreserveHtab))))
                     return verify_fail(
                         summary, VerifyIssueCode::InvalidForwardPreflight, fi, bi, ii);
                 if (!has_preflight || bundle_id != preflight_id ||
@@ -1390,8 +1393,11 @@ inline VerifyResult verify_module_impl(const Module& mod,
                 request_policy.op == Opcode::ConstI32 && request_policy.operand_count == 0 &&
                 exact_result(request_policy, 2, 1) && request_policy.imm.i32_val >= 0 &&
                 request_policy.imm.i32_val <= 0xffff &&
-                complete_content_length_request_policy_is_admitted(
-                    static_cast<u16>(request_policy.imm.i32_val)) &&
+                (complete_content_length_request_policy_is_admitted(
+                     static_cast<u16>(request_policy.imm.i32_val)) ||
+                 (fn.http_method == kRouteMethodGet &&
+                  static_cast<u16>(request_policy.imm.i32_val) ==
+                      static_cast<u16>(RequestPolicyId::Http11FixedTrimSpPreserveHtab))) &&
                 bundle.op == Opcode::ConstI32 && bundle.operand_count == 0 &&
                 exact_result(bundle, 2, 2) && bundle.imm.i32_val == preflight_id &&
                 forward.op == Opcode::RetForwardBundle && forward.result == kNoValue &&
