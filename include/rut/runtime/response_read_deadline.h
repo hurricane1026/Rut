@@ -1844,14 +1844,21 @@ inline bool bodyless_get_keep_alive_precise_arm_is_stable(
     u16 bundle_id,
     ResponseReadDeadlineOwnerPhase phase,
     Connection::Callback expected_upstream_recv) {
+    // An exact bodyless GET with CompleteContentLength may legally close the
+    // downstream connection after upload.  Keep this exception local to the
+    // precise arm predicate; coalesced/pipelined layouts remain rejected by
+    // the exact-close proof and the existing depth/stash/generation checks.
+    const bool explicit_close = complete_content_length_explicit_close_request_is_stable(
+        c, proof, c.response_read_deadline_buffering, c.response_read_deadline_profile);
     if (config == nullptr || config != c.request_config ||
         c.response_read_deadline_profile !=
             ResponseReadDeadlineProfile::BodylessNonHeadContentLengthZero ||
         c.response_read_deadline_buffering != ForwardResponseBufferingMode::CompleteContentLength ||
         c.response_read_deadline_method != static_cast<u8>(LogHttpMethod::Get) ||
         c.response_read_deadline_route_method != kRouteMethodGet ||
-        c.req_method != c.response_read_deadline_method || proof.downstream_close ||
-        !response_read_deadline_default_persistence_is_stable(c) || c.pipeline_depth != 0 ||
+        c.req_method != c.response_read_deadline_method ||
+        (proof.downstream_close && !explicit_close) ||
+        (!response_read_deadline_default_persistence_is_stable(c) && !explicit_close) ||
         c.http1_pipeline_request_generation != 0 || c.pipeline_stash_len != 0 ||
         c.response_read_deadline_post_commit_phase != ResponseReadDeadlinePostCommitPhase::None ||
         c.response_mutations_snapshotted || c.retry_req_send_len != 0 ||
@@ -2068,6 +2075,11 @@ inline bool response_read_deadline_post_commit_is_stable(const Connection& c) {
     const auto& bundle = cfg->policy_bundles[bundle_id - 1];
     const bool collecting = c.response_read_deadline_post_commit_phase ==
                             ResponseReadDeadlinePostCommitPhase::Buffering;
+    const bool explicit_close =
+        complete_content_length_explicit_close_request_is_stable(c,
+                                                                 c.response_read_deadline_upload,
+                                                                 c.response_read_deadline_buffering,
+                                                                 c.response_read_deadline_profile);
     const bool incomplete_coherent_range_selection =
         complete_buffering && !collecting &&
         c.response_read_deadline_post_commit_response_class ==
@@ -2098,11 +2110,11 @@ inline bool response_read_deadline_post_commit_is_stable(const Connection& c) {
              c.response_read_deadline_route_method != kRouteMethodGet ||
              c.req_method != static_cast<u8>(LogHttpMethod::Get) || c.pipeline_depth != 0 ||
              c.http1_pipeline_request_generation != 0 || c.pipeline_stash_len != 0 ||
-             c.response_read_deadline_upload.downstream_close ||
+             (c.response_read_deadline_upload.downstream_close && !explicit_close) ||
              !bodyless_get_complete_content_length_request_policy_is_admitted(
                  c.request_policy_id) ||
              c.response_read_deadline_upload.request_policy_id != c.request_policy_id ||
-             !response_read_deadline_default_persistence_is_stable(c) ||
+             (!response_read_deadline_default_persistence_is_stable(c) && !explicit_close) ||
              (c.response_read_deadline_post_commit_send_body != 0 &&
               c.response_read_deadline_post_commit_send_body !=
                   c.response_read_deadline_post_commit_origin_received)))
@@ -2174,6 +2186,11 @@ inline bool bodyless_get_complete_content_length_precise_buffering_is_stable(con
         c.response_read_deadline_state == ResponseReadDeadlineState::BatchPending ||
         c.response_read_deadline_state == ResponseReadDeadlineState::RefreshPending ||
         c.response_read_deadline_state == ResponseReadDeadlineState::BodyComplete;
+    const bool explicit_close =
+        complete_content_length_explicit_close_request_is_stable(c,
+                                                                 c.response_read_deadline_upload,
+                                                                 c.response_read_deadline_buffering,
+                                                                 c.response_read_deadline_profile);
     return state_admitted &&
            c.response_read_deadline_post_commit_phase ==
                ResponseReadDeadlinePostCommitPhase::Buffering &&
@@ -2188,7 +2205,7 @@ inline bool bodyless_get_complete_content_length_precise_buffering_is_stable(con
            bodyless_get_complete_content_length_request_policy_is_admitted(c.request_policy_id) &&
            c.response_read_deadline_upload.request_policy_id == c.request_policy_id &&
            c.on_upstream_recv == nullptr && c.on_upstream_send == nullptr &&
-           response_read_deadline_default_persistence_is_stable(c) &&
+           (response_read_deadline_default_persistence_is_stable(c) || explicit_close) &&
            response_read_deadline_post_commit_is_stable(c);
 }
 
