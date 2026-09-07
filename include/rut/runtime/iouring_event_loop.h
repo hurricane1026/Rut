@@ -635,12 +635,11 @@ private:
                 ResponseReadDeadlineProfile::BodylessNonHeadContentLengthZero &&
             c.http1_prebuilt_deadline_method == static_cast<u8>(LogHttpMethod::Get) &&
             c.http1_prebuilt_deadline_route_method == kRouteMethodGet &&
-            bodyless_get_complete_content_length_request_policy_is_admitted(
-                c.request_policy_id);
+            bodyless_get_complete_content_length_request_policy_is_admitted(c.request_policy_id);
         if (!response_read_timeout_seconds_valid(bundle.response_read_timeout_seconds) ||
             (bundle.response_buffering == ForwardResponseBufferingMode::CompleteContentLength &&
              (!complete_content_length_request_policy_is_admitted(c.request_policy_id) &&
-              !bodyless_get_retained_policy ||
+                  !bodyless_get_retained_policy ||
               !complete_content_length_route_method_is_admitted(
                   c.http1_prebuilt_deadline_route_method) ||
               c.http1_prebuilt_deadline_upload.request_policy_id != c.request_policy_id ||

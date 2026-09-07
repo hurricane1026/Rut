@@ -2154,7 +2154,7 @@ struct Parser {
                         stmt.forward_request_policy_id = static_cast<u16>(
                             retained_header_value_trim_sp_preserve_htab
                                 ? RequestPolicyId::Http11FixedTrimSpPreserveHtab
-                                : have_content_length_position
+                            : have_content_length_position
                                 ? RequestPolicyId::Http11FixedStripContentLengthAfterHost
                                 : RequestPolicyId::Http11FixedStrip);
                         stmt.has_forward_request_policy = true;
