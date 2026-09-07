@@ -63258,17 +63258,11 @@ static bool run_rut_default_buffering_206_range_incomplete_body_inactivity_expir
         error = std::string(kDiagnostic) + " Recorder was not live before RUT start";
         return false;
     }
+    if (!handoff_held_loopback_port(&reservations.fds[0], ports[0], kDiagnostic, error))
+        return false;
 
     ChildGuard runtime;
-    if (!spawn_child({rut_path,
-                      temp.source,
-                      "--shards",
-                      "1",
-                      "--no-pin",
-                      "--drain",
-                      "0",
-                      "--access-log",
-                      temp.rut_access_log},
+    if (!spawn_child({rut_path, temp.source, "--shards", "1", "--no-pin", "--drain", "0"},
                      temp.rut_log,
                      runtime.child) ||
         !wait_ready(ports[0], runtime.child, error)) {
