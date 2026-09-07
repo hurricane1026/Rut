@@ -1266,7 +1266,9 @@ inline VerifyResult verify_module_impl(const Module& mod,
                 return verify_fail(summary, VerifyIssueCode::InvalidForwardPreflight, fi);
         }
         if (framing_preflight) {
-            if (timeout_ret_count != 2 || fn.is_timer || fn.http_method != kRouteMethodHead ||
+            const bool head_framing = fn.http_method == kRouteMethodHead;
+            const bool get_framing = fn.http_method == kRouteMethodGet;
+            if (timeout_ret_count != 2 || fn.is_timer || (!head_framing && !get_framing) ||
                 fn.block_count != 3 || fn.blocks == nullptr || fn.values == nullptr ||
                 fn.block_cap < fn.block_count || fn.value_count != 7 ||
                 fn.value_cap < fn.value_count || fn.yield_count != 0 ||
@@ -1302,7 +1304,9 @@ inline VerifyResult verify_module_impl(const Module& mod,
                 branch.operand(0).id == has_content_length.result.id &&
                 branch.imm.block_targets[0].id == 1 && branch.imm.block_targets[1].id == 2 &&
                 exact_primitive_result(has_content_length, 0, 0, TypeKind::Bool);
-            auto exact_forward = [&](const Block& block, RequestPolicyId expected_policy) {
+            auto exact_forward = [&](const Block& block,
+                                     RequestPolicyId expected_policy,
+                                     ForwardResponseBufferingMode expected_buffering) {
                 const Instruction& upstream = block.insts[0];
                 const Instruction& request_policy = block.insts[1];
                 const Instruction& bundle = block.insts[2];
@@ -1320,15 +1324,45 @@ inline VerifyResult verify_module_impl(const Module& mod,
                        forward.op == Opcode::RetForwardBundle && forward.result == kNoValue &&
                        forward.operand_count == 3 && forward.operand(0).id == upstream.result.id &&
                        forward.operand(1).id == request_policy.result.id &&
-                       forward.operand(2).id == bundle.result.id;
+                       forward.operand(2).id == bundle.result.id &&
+                       mod.policy_bundles[preflight_id - 1].response_buffering ==
+                           expected_buffering &&
+                       (expected_buffering == ForwardResponseBufferingMode::None ||
+                        (get_framing &&
+                         mod.policy_bundles[preflight_id - 1].response_policy_id != 0 &&
+                         mod.policy_bundles[preflight_id - 1].failure_policy_id != 0 &&
+                         mod.policy_bundles[preflight_id - 1].timeout_failure_policy_id != 0 &&
+                         complete_content_length_buffering_policies_valid(
+                             mod.response_policies
+                                 [mod.policy_bundles[preflight_id - 1].response_policy_id - 1],
+                             mod.failure_policies
+                                 [mod.policy_bundles[preflight_id - 1].failure_policy_id - 1],
+                             mod.failure_policies[mod.policy_bundles[preflight_id - 1]
+                                                      .timeout_failure_policy_id -
+                                                  1])));
             };
-            if (!entry_shape ||
-                !exact_forward(then_block,
-                               RequestPolicyId::Http11FixedStripContentLengthAfterHost) ||
-                !exact_forward(else_block, RequestPolicyId::Http11FixedStrip) ||
+            const bool exact_head =
+                head_framing &&
+                exact_forward(then_block,
+                              RequestPolicyId::Http11FixedStripContentLengthAfterHost,
+                              ForwardResponseBufferingMode::None) &&
+                exact_forward(else_block,
+                              RequestPolicyId::Http11FixedStrip,
+                              ForwardResponseBufferingMode::None);
+            const bool exact_get =
+                get_framing &&
+                exact_forward(then_block,
+                              RequestPolicyId::Http11FixedStrip,
+                              ForwardResponseBufferingMode::CompleteContentLength) &&
+                exact_forward(else_block,
+                              RequestPolicyId::Http11FixedTrimSpPreserveHtab,
+                              ForwardResponseBufferingMode::CompleteContentLength);
+            if (!entry_shape || (!exact_head && !exact_get) ||
                 then_block.insts[0].imm.i32_val != else_block.insts[0].imm.i32_val ||
-                mod.policy_bundles[preflight_id - 1].response_buffering !=
-                    ForwardResponseBufferingMode::None)
+                (get_framing && mod.policy_bundles[preflight_id - 1].response_buffering !=
+                                    ForwardResponseBufferingMode::CompleteContentLength) ||
+                (head_framing && mod.policy_bundles[preflight_id - 1].response_buffering !=
+                                     ForwardResponseBufferingMode::None))
                 return verify_fail(summary, VerifyIssueCode::InvalidForwardPreflight, fi);
         }
         if (deferred_preflight) {

@@ -5269,6 +5269,163 @@ TEST(serve_loader, verified_request_framing_selection_publishes_only_through_pub
     program.destroy();
 }
 
+TEST(serve_loader, verified_get_framing_selection_owns_complete_buffering_after_source_destroy) {
+    const std::string path = write_file("/tmp/rut_serve_loader_get_framing_selection",
+                                        "app.rut",
+                                        kCompleteContentLengthFramingSelectionSource);
+    LoadedProgram program;
+    LoadError err;
+    REQUIRE(load_rut_program(path.c_str(), program, err));
+    REQUIRE_EQ(program.rir.module.func_count, 1u);
+    REQUIRE_EQ(program.config.route_count, 1u);
+    REQUIRE_EQ(program.config.policy_bundle_count, 1u);
+    const auto& function = program.rir.module.functions[0];
+    const auto& route = program.config.routes[0];
+    CHECK_EQ(function.forward_preflight_mode, ForwardPreflightMode::AfterRequestFramingSelection);
+    CHECK_EQ(function.preflight_forward_policy_bundle_id, 1u);
+    CHECK_EQ(route.forward_preflight_mode, ForwardPreflightMode::AfterRequestFramingSelection);
+    CHECK_EQ(route.preflight_forward_policy_bundle_id, 1u);
+    CHECK_EQ(route.method, kRouteMethodGet);
+    REQUIRE(route.fn != nullptr);
+    CHECK_EQ(program.config.policy_bundles[0].response_read_timeout_seconds, 60u);
+    CHECK_EQ(program.config.policy_bundles[0].response_buffering,
+             ForwardResponseBufferingMode::CompleteContentLength);
+
+    static constexpr char kNoClRequest[] =
+        "GET /one?q=1 HTTP/1.1\r\nHost: client.example\r\n"
+        "X-Test:\t keep \t\r\n\r\n";
+    static constexpr char kNoClWire[] =
+        "GET /one?q=1 HTTP/1.1\r\nHost: 127.0.0.1:9000\r\n"
+        "X-Test: \t keep \t\r\n\r\n";
+    static constexpr char kPositivePrefix[] =
+        "GET /one?q=1 HTTP/1.1\r\nHost: client.example\r\n"
+        "Content-Length: 4\r\nX-Test: keep\r\n\r\nab";
+    static constexpr char kPositiveWire[] =
+        "GET /one?q=1 HTTP/1.1\r\nHost: 127.0.0.1:9000\r\n"
+        "Content-Length: 4\r\nX-Test: keep\r\n\r\nabcd";
+    static_assert(sizeof(kNoClWire) - 1u == 65u);
+
+    // The RIR owner is no longer needed by the public RouteConfig. Exercise
+    // the published JIT route after destroying it, through the real io_uring
+    // request path rather than a forged native RouteConfig.
+    program.rir.destroy();
+    REQUIRE(std::filesystem::remove(path));
+    const auto run_runtime_case = [&](const char* prefix,
+                                      u32 prefix_len,
+                                      const char* expected_wire,
+                                      u32 expected_wire_len,
+                                      bool positive_body) {
+        ScopedPublicIoUringLoop guard;
+        if (!guard.init()) SKIP("io_uring unavailable");
+        auto* loop = guard.loop;
+        const RouteConfig* active = &program.config;
+        loop->config_ptr = &active;
+        Connection* conn = loop->alloc_conn();
+        REQUIRE(conn != nullptr);
+        i32 downstream[2] = {-1, -1};
+        REQUIRE_EQ(socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, downstream), 0);
+        conn->fd = downstream[0];
+        REQUIRE_EQ(conn->recv_buf.write(reinterpret_cast<const u8*>(prefix), prefix_len),
+                   prefix_len);
+        const u32 free_top_before = loop->free_top;
+        const u32 sq_tail_before = __atomic_load_n(loop->backend.sq_tail, __ATOMIC_ACQUIRE);
+        const u32 pending_before = loop->backend.pending;
+        const auto restore_ring = [&]() {
+            __atomic_store_n(loop->backend.sq_tail, sq_tail_before, __ATOMIC_RELEASE);
+            loop->backend.pending = pending_before;
+        };
+        on_header_received<IoUringEventLoop>(
+            loop, *conn, {conn->id, static_cast<i32>(prefix_len), 0, 0, IoEventType::Recv, 1});
+        REQUIRE_EQ(
+            conn->request_policy_id,
+            static_cast<u16>(positive_body ? RequestPolicyId::Http11FixedStrip
+                                           : RequestPolicyId::Http11FixedTrimSpPreserveHtab));
+        REQUIRE_EQ(conn->response_read_deadline_upload.request_policy_id, conn->request_policy_id);
+        if (positive_body) {
+            REQUIRE(conn->request_policy_body_pending);
+            REQUIRE_EQ(conn->req_body_remaining, 2u);
+            REQUIRE_FALSE(conn->upstream_connect_armed);
+            REQUIRE_FALSE(conn->upstream_send_armed);
+            REQUIRE_EQ(conn->upstream_fd, -1);
+            REQUIRE_EQ(conn->recv_buf.write(reinterpret_cast<const u8*>("cd"), 2u), 2u);
+            restore_ring();
+            loop->dispatch({conn->id, 2, 0, 0, IoEventType::Recv, 0, 0, 0});
+        }
+        REQUIRE_FALSE(conn->request_policy_body_pending);
+        REQUIRE(conn->upstream_connect_armed);
+        REQUIRE_EQ(conn->response_read_deadline_state, ResponseReadDeadlineState::Validated);
+        const u32 episode = conn->upstream_episode;
+        restore_ring();
+        loop->dispatch({conn->id, 0, 0, 0, IoEventType::UpstreamConnect, 0, 0, episode});
+        REQUIRE(conn->upstream_send_armed);
+        auto& send = loop->backend.upstream_send_state[conn->id];
+        REQUIRE_EQ(send.remaining, expected_wire_len);
+        REQUIRE_EQ(send.src, conn->recv_buf.data());
+        CHECK_EQ(__builtin_memcmp(send.src, expected_wire, expected_wire_len), 0);
+        send.offset = send.remaining;
+        send.remaining = 0;
+        restore_ring();
+        loop->dispatch({conn->id,
+                        static_cast<i32>(expected_wire_len),
+                        0,
+                        0,
+                        IoEventType::UpstreamSend,
+                        0,
+                        0,
+                        episode});
+        REQUIRE(conn->request_upload_complete);
+        REQUIRE(conn->upstream_recv_armed);
+        REQUIRE_EQ(conn->response_read_deadline_state, ResponseReadDeadlineState::Armed);
+
+        const u32 conn_id = conn->id;
+        const bool recv_armed = conn->recv_armed;
+        const bool timer_armed = conn->response_read_timer_phase == ResponseReadTimerPhase::Armed;
+        const u32 timer_generation = conn->response_read_timer_owner_generation;
+        loop->close_conn(*conn);
+        restore_ring();
+        loop->dispatch({conn_id, -ECANCELED, 0, 0, IoEventType::UpstreamRecv, 0, 0, episode});
+        loop->dispatch({conn_id,
+                        -ECANCELED,
+                        0,
+                        0,
+                        IoEventType::UpstreamRecv,
+                        0,
+                        kUpstreamCloseCancelAux,
+                        episode});
+        if (recv_armed) {
+            loop->dispatch({conn_id, -ECANCELED, 0, 0, IoEventType::Recv, 0, 0, 0});
+            loop->dispatch({conn_id, -ENOENT, 0, 0, IoEventType::Recv, 0, 0, 0});
+        }
+        if (timer_armed) {
+            IoEvent timer_target{};
+            timer_target.conn_id = conn_id;
+            timer_target.result = -ECANCELED;
+            timer_target.type = IoEventType::ResponseReadTimer;
+            timer_target.non_upstream_generation = timer_generation;
+            IoEvent timer_cancel = timer_target;
+            timer_cancel.result = 0;
+            timer_cancel.non_upstream_generation = timer_generation | kResponseReadTimerCancelBit;
+            const IoEvent timer_events[2] = {timer_target, timer_cancel};
+            loop->dispatch_batch(timer_events, 2);
+        }
+        REQUIRE_EQ(loop->conns[conn_id].pending_ops, 0u);
+        REQUIRE_EQ(loop->free_top, free_top_before + 1u);
+        close(downstream[1]);
+    };
+    run_runtime_case(
+        kNoClRequest, sizeof(kNoClRequest) - 1u, kNoClWire, sizeof(kNoClWire) - 1u, false);
+    run_runtime_case(kPositivePrefix,
+                     sizeof(kPositivePrefix) - 1u,
+                     kPositiveWire,
+                     sizeof(kPositiveWire) - 1u,
+                     true);
+
+    CHECK_EQ(program.config.routes[0].forward_preflight_mode,
+             ForwardPreflightMode::AfterRequestFramingSelection);
+    CHECK_EQ(program.config.routes[0].preflight_forward_policy_bundle_id, 1u);
+    program.destroy();
+}
+
 TEST(serve_loader, fixed_302_source_deletion_preserves_owned_policy_and_jit_route) {
     const char source[] = R"rut(
 route GET "/old" { return redirect({scheme: "http", authority: "static",
