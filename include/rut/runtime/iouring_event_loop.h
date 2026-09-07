@@ -3509,11 +3509,13 @@ public:
             (!owner.saw_positive && (owner.positive_bytes != 0 || owner.first_copy_begin != 0 ||
                                      owner.expected_copy_end != 0) ||
              owner.saw_positive &&
-                 (owner.first_copy_begin != header + received - owner.positive_bytes ||
+                 (owner.positive_bytes > received ||
+                  owner.first_copy_begin != header + received - owner.positive_bytes ||
                   owner.expected_copy_end != header + received)))
             return false;
         if (!owner.post_commit_at_start &&
             (!owner.saw_positive || owner.first_copy_begin > header ||
+             owner.first_copy_begin > 0xFFFFFFFFu - owner.positive_bytes ||
              owner.first_copy_begin + owner.positive_bytes != header + received))
             return false;
         if (c.response_read_timer_last_progress_ns == 0 ||
