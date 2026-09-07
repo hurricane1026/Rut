@@ -751,6 +751,107 @@ TEST(serve_loader, nginx_http_profile_lowering_loads_owned_access_log_and_proxy_
     std::filesystem::remove_all(dir);
 }
 
+TEST(serve_loader, nginx_retained_header_lowering_executes_owned_framing_selection) {
+    const std::string dir = "/tmp/rut_serve_loader_nginx_retained_header_selection";
+    std::filesystem::remove_all(dir);
+    const std::string path = dir + "/app.rut";
+    std::string generated;
+    {
+        std::string nginx_source =
+            "server { listen 127.0.0.1:8080; location / { proxy_pass "
+            "http://127.0.0.1:9000; } }";
+        const auto parsed =
+            nginx::parse({nginx_source.data(), static_cast<u32>(nginx_source.size())});
+        REQUIRE(parsed);
+        const auto lowered = nginx::lower_to_rut(parsed.value());
+        REQUIRE(lowered);
+        generated.assign(lowered.value().data, lowered.value().len);
+        write_file(dir, "app.rut", generated.c_str());
+        std::fill(nginx_source.begin(), nginx_source.end(), 'x');
+    }
+    std::fill(generated.begin(), generated.end(), 'y');
+
+    LoadedProgram program;
+    LoadError error;
+    REQUIRE(load_rut_program(path.c_str(), program, error));
+    REQUIRE(program.jit_inited);
+    REQUIRE_EQ(program.config.upstream_count, 1u);
+    CHECK_EQ(program.config.upstreams[0].addr_count, 1u);
+    CHECK_EQ(ntohl(program.config.upstreams[0].addrs[0].sin_addr.s_addr), 0x7f000001u);
+    CHECK_EQ(ntohs(program.config.upstreams[0].addrs[0].sin_port), 9000u);
+
+    static constexpr u8 kRoot[] = {'/'};
+    const RouteEntry* get = program.config.match(kRoot, 1u, kRouteMethodGet);
+    REQUIRE(get != nullptr);
+    REQUIRE_EQ(get->action, RouteAction::JitHandler);
+    REQUIRE_EQ(get->upstream_id, 0u);
+    REQUIRE(get->fn != nullptr);
+    CHECK_EQ(get->forward_preflight_mode, ForwardPreflightMode::AfterRequestFramingSelection);
+    REQUIRE(program.config.policy_bundle_id_is_valid(get->preflight_forward_policy_bundle_id));
+    const u16 bundle_id = get->preflight_forward_policy_bundle_id;
+    const auto& bundle = program.config.policy_bundles[bundle_id - 1u];
+    CHECK_EQ(bundle.response_read_timeout_seconds, 60u);
+    CHECK_EQ(bundle.response_buffering, ForwardResponseBufferingMode::CompleteContentLength);
+    REQUIRE(program.config.response_policy_id_is_valid(bundle.response_policy_id));
+    REQUIRE(program.config.failure_policy_id_is_valid(bundle.failure_policy_id));
+    REQUIRE(program.config.timeout_failure_policy_id_is_valid(bundle.timeout_failure_policy_id));
+
+    const auto& response = program.config.response_policies[bundle.response_policy_id - 1u];
+    CHECK(response_policy_spec_valid(response));
+    CHECK_EQ(response.version, ResponsePolicyVersion::Http11);
+    CHECK_EQ(response.framing, ResponsePolicyFraming::ContentLength);
+    CHECK_EQ(response.connection, ResponsePolicyConnection::Request);
+    CHECK_EQ(response.date, ResponsePolicyDate::Current);
+    CHECK_EQ(response.head_mode, ResponsePolicyHeadMode::Reject);
+    CHECK(response.server.eq({"nginx/1.29.7", 12u}));
+    CHECK_EQ(response.hide_header_count, 3u);
+    CHECK(response_policy_hides_header(response, {"Date", 4u}));
+    CHECK(response_policy_hides_header(response, {"Server", 6u}));
+    CHECK(response_policy_hides_header(response, {"X-Pad", 5u}));
+
+    const auto& failure = program.config.failure_policies[bundle.failure_policy_id - 1u];
+    const auto& timeout = program.config.failure_policies[bundle.timeout_failure_policy_id - 1u];
+    CHECK(forward_failure_policy_spec_valid(failure));
+    CHECK(forward_timeout_failure_policy_spec_valid(timeout));
+    CHECK_EQ(failure.status_code, 502u);
+    CHECK_EQ(timeout.status_code, 504u);
+    CHECK(failure.reason.eq({"Bad Gateway", 11u}));
+    CHECK(timeout.reason.eq({"Gateway Time-out", 16u}));
+    CHECK(failure.server.eq({"nginx/1.29.7", 12u}));
+    CHECK(timeout.server.eq({"nginx/1.29.7", 12u}));
+    CHECK_GT(failure.body.len, 0u);
+    CHECK_GT(timeout.body.len, 0u);
+
+    // RIR, mapped source, and the converter/parser owners can all disappear
+    // after publication; the JIT function and copied RouteConfig remain live.
+    program.rir.destroy();
+    REQUIRE(program.src_map != nullptr);
+    REQUIRE_EQ(munmap(program.src_map, program.src_map_len), 0);
+    program.src_map = nullptr;
+    program.src_map_len = 0u;
+    REQUIRE(std::filesystem::remove(path));
+
+    const auto invoke = [&](const char* request, RequestPolicyId expected_policy) {
+        const u32 request_len = static_cast<u32>(strlen(request));
+        const u64 packed =
+            get->fn(nullptr, nullptr, reinterpret_cast<const u8*>(request), request_len, nullptr);
+        const auto result = jit::HandlerResult::unpack(packed);
+        REQUIRE_EQ(result.action, jit::HandlerAction::ForwardBundle);
+        CHECK_EQ(result.status_code, static_cast<u16>(expected_policy));
+        CHECK_EQ(result.upstream_id, 0u);
+        CHECK_EQ(result.next_state, bundle_id);
+    };
+    invoke("GET / HTTP/1.1\r\nHost: client.example\r\n\r\n",
+           RequestPolicyId::Http11FixedTrimSpPreserveHtab);
+    invoke("GET / HTTP/1.1\r\nHost: client.example\r\nContent-Length: 0\r\n\r\n",
+           RequestPolicyId::Http11FixedStrip);
+    invoke("GET / HTTP/1.1\r\nHost: client.example\r\nContent-Length: 4\r\n\r\nbody",
+           RequestPolicyId::Http11FixedStrip);
+
+    program.destroy();
+    std::filesystem::remove_all(dir);
+}
+
 TEST(serve_loader, failed_access_log_frontend_clears_poisoned_owned_metadata) {
     const std::string dir = "/tmp/rut_serve_loader_access_log_failed";
     std::filesystem::remove_all(dir);
