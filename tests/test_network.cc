@@ -29832,9 +29832,9 @@ bool stage_live_precise_head(IoUringEventLoop* loop,
 bool stage_live_precise_get(IoUringEventLoop* loop,
                             RouteConfig& config,
                             PrebuiltD2Fixture* out,
+                            bool force_initial_timer_sq_full = false,
                             bool downstream_close = false,
-                            RequestPolicyId request_policy = RequestPolicyId::Http11FixedStrip,
-                            bool force_initial_timer_sq_full = false) {
+                            RequestPolicyId request_policy = RequestPolicyId::Http11FixedStrip) {
     return stage_live_precise_request(
         loop, config, out, true, downstream_close, force_initial_timer_sq_full, request_policy);
 }
@@ -45160,7 +45160,7 @@ TEST(response_read_deadline,
             auto* loop = guard.loop;
             RouteConfig config{};
             PrebuiltD2Fixture fixture{};
-            REQUIRE(stage_live_precise_get(loop, config, &fixture, true, request_policy));
+            REQUIRE(stage_live_precise_get(loop, config, &fixture, false, true, request_policy));
             Connection& conn = *fixture.conn;
             const auto proof = conn.response_read_deadline_upload;
             REQUIRE_NE(conn.handler_gen, 0u);
@@ -45182,6 +45182,21 @@ TEST(response_read_deadline,
                 conn,
                 &on_upstream_response<IoUringEventLoop>,
                 ResponseReadDeadlineOwnerPhase::ActiveAfterCopy));
+            const u32 stale_pending_before = conn.pending_ops;
+            const u32 stale_episode = proof.upload_episode == 1u ? 2u : 1u;
+            loop->dispatch({conn.id, 7, 0, 0, IoEventType::UpstreamRecv, 1, 0, stale_episode});
+            CHECK_EQ(conn.upstream_episode, proof.upload_episode);
+            CHECK_EQ(conn.response_read_deadline_state, ResponseReadDeadlineState::Armed);
+            CHECK_EQ(conn.response_read_deadline_upload.upload_episode, proof.upload_episode);
+            CHECK_EQ(conn.response_read_deadline_upload.handler_generation,
+                     proof.handler_generation);
+            CHECK_EQ(conn.response_read_deadline_post_commit_phase,
+                     ResponseReadDeadlinePostCommitPhase::None);
+            CHECK_FALSE(conn.upstream_retirement_active);
+            CHECK_EQ(conn.retry_req_send_len, 0u);
+            CHECK_EQ(conn.response_header_buf.len(), 0u);
+            CHECK_EQ(conn.pipeline_stash_len, 0u);
+            CHECK_LE(conn.pending_ops, stale_pending_before);
             auto forged_proof = conn.response_read_deadline_upload;
             ++forged_proof.handler_generation;
             conn.response_read_deadline_upload = forged_proof;
@@ -45230,6 +45245,10 @@ TEST(response_read_deadline,
                        ResponseReadDeadlinePostCommitPhase::HeaderSend);
             REQUIRE(response_read_deadline_post_commit_is_stable(conn));
             REQUIRE(conn.upstream_retirement_active);
+            REQUIRE(buf_has(conn.response_header_buf.data(),
+                            conn.response_header_buf.len(),
+                            "Connection: close\r\n"));
+            CHECK_EQ(conn.pipeline_stash_len, 0u);
 
             if (retirement_first) drain_prebuilt_d2_retirement(loop, conn, kUpstreamOpRecv, false);
             const IoEvent header = exact_response_deadline_send_event(loop, conn);
@@ -45242,10 +45261,18 @@ TEST(response_read_deadline,
                 REQUIRE(conn.http1_boundary_deferred);
                 drain_prebuilt_d2_retirement(loop, conn, kUpstreamOpRecv, false);
             }
-            if (conn.http1_boundary_ready) loop->resume_deferred_http1_boundaries();
-            REQUIRE_EQ(conn.state, ConnState::ReadingHeader);
+            REQUIRE(conn.http1_boundary_ready);
+            loop->resume_deferred_http1_boundaries();
+            REQUIRE_EQ(loop->conns[conn.id].fd, -1);
+            CHECK_EQ(loop->conns[conn.id].handler_gen, 0u);
+            CHECK_EQ(loop->conns[conn.id].pending_ops, 0u);
+            CHECK_FALSE(loop->conns[conn.id].upstream_retirement_active);
+            CHECK_EQ(loop->conns[conn.id].upstream_retirement_target_owned, 0u);
+            CHECK_EQ(loop->conns[conn.id].upstream_retirement_cancel_owned, 0u);
+            CHECK_FALSE(loop->conns[conn.id].http1_boundary_deferred);
+            CHECK_FALSE(loop->conns[conn.id].http1_boundary_ready);
             CHECK_EQ(conn.pipeline_depth, 0u);
-            cleanup_prebuilt_d2(loop, fixture);
+            release_closed_response_read_fixture(fixture);
         }
     }
 }
