@@ -29689,12 +29689,14 @@ bool add_bodyless_non_head_response_read_deadline_bundle(RouteConfig& config,
                                                          u8 seconds,
                                                          ForwardResponseBufferingMode buffering);
 
-bool stage_live_precise_request(IoUringEventLoop* loop,
-                                RouteConfig& config,
-                                PrebuiltD2Fixture* out,
-                                bool bodyless_get,
-                                bool downstream_close,
-                                bool force_initial_timer_sq_full) {
+bool stage_live_precise_request(
+    IoUringEventLoop* loop,
+    RouteConfig& config,
+    PrebuiltD2Fixture* out,
+    bool bodyless_get,
+    bool downstream_close,
+    bool force_initial_timer_sq_full,
+    RequestPolicyId request_policy = RequestPolicyId::Http11FixedStrip) {
     if (loop == nullptr || out == nullptr ||
         !config.add_upstream("backend", 0x7F000001, 9000).has_value() ||
         !(bodyless_get ? add_bodyless_non_head_response_read_deadline_bundle(
@@ -29742,11 +29744,17 @@ bool stage_live_precise_request(IoUringEventLoop* loop,
         "HEAD /one?q=1 HTTP/1.1\r\nHost: client.example\r\nConnection: close\r\n\r\n";
     static constexpr u8 kKeepAliveRequest[] =
         "HEAD /one?q=1 HTTP/1.1\r\nHost: client.example\r\n\r\n";
-    static constexpr u8 kGetRequest[] = "GET /one?q=1 HTTP/1.1\r\nHost: client.example\r\n\r\n";
-    const u8* request = bodyless_get       ? kGetRequest
+    static constexpr u8 kGetKeepAliveRequest[] =
+        "GET /one?q=1 HTTP/1.1\r\nHost: client.example\r\n"
+        "X-Test:\t keep \t\r\n\r\n";
+    static constexpr u8 kGetCloseRequest[] =
+        "GET /one?q=1 HTTP/1.1\r\nHost: client.example\r\n"
+        "Connection: close\r\nX-Test:\t keep \t\r\n\r\n";
+    const u8* request = bodyless_get ? (downstream_close ? kGetCloseRequest : kGetKeepAliveRequest)
                         : downstream_close ? kCloseRequest
                                            : kKeepAliveRequest;
-    const u32 request_len = bodyless_get       ? sizeof(kGetRequest) - 1u
+    const u32 request_len = bodyless_get       ? (downstream_close ? sizeof(kGetCloseRequest) - 1u
+                                                                   : sizeof(kGetKeepAliveRequest) - 1u)
                             : downstream_close ? sizeof(kCloseRequest) - 1u
                                                : sizeof(kKeepAliveRequest) - 1u;
     if (conn->recv_buf.write(request, request_len) != request_len) return fail();
@@ -29764,7 +29772,7 @@ bool stage_live_precise_request(IoUringEventLoop* loop,
     JitDispatchOutcome outcome{};
     outcome.kind = JitDispatchOutcome::Kind::Forward;
     outcome.upstream_id = 0;
-    outcome.request_policy_id = static_cast<u16>(RequestPolicyId::Http11FixedStrip);
+    outcome.request_policy_id = static_cast<u16>(request_policy);
     outcome.policy_bundle_id = 2;
     handle_jit_outcome<IoUringEventLoop>(
         loop, *conn, outcome, &response_read_deadline_handler, false);
@@ -29824,8 +29832,11 @@ bool stage_live_precise_head(IoUringEventLoop* loop,
 bool stage_live_precise_get(IoUringEventLoop* loop,
                             RouteConfig& config,
                             PrebuiltD2Fixture* out,
+                            bool downstream_close = false,
+                            RequestPolicyId request_policy = RequestPolicyId::Http11FixedStrip,
                             bool force_initial_timer_sq_full = false) {
-    return stage_live_precise_request(loop, config, out, true, false, force_initial_timer_sq_full);
+    return stage_live_precise_request(
+        loop, config, out, true, downstream_close, force_initial_timer_sq_full, request_policy);
 }
 
 void neutralize_staged_precise_timer(IoUringEventLoop* loop, PrebuiltD2Fixture& fixture) {
@@ -45135,6 +45146,106 @@ TEST(response_read_deadline_fixed_upload,
                 cleanup_prebuilt_d2(loop, fixture);
             else
                 release_closed_response_read_fixture(fixture);
+        }
+    }
+}
+
+TEST(response_read_deadline,
+     retained_get_real_materialization_response_and_retirement_for_id1_and_id3) {
+    for (const RequestPolicyId request_policy :
+         {RequestPolicyId::Http11FixedStrip, RequestPolicyId::Http11FixedTrimSpPreserveHtab}) {
+        for (const bool retirement_first : {false, true}) {
+            ScopedIoUringLoopForRetirement guard;
+            if (!guard.init()) SKIP("io_uring unavailable");
+            auto* loop = guard.loop;
+            RouteConfig config{};
+            PrebuiltD2Fixture fixture{};
+            REQUIRE(stage_live_precise_get(loop, config, &fixture, true, request_policy));
+            Connection& conn = *fixture.conn;
+            const auto proof = conn.response_read_deadline_upload;
+            REQUIRE_NE(conn.handler_gen, 0u);
+            REQUIRE(valid_upstream_episode(conn.upstream_episode));
+            REQUIRE_NE(proof.handler_generation, 0u);
+            REQUIRE_EQ(proof.handler_generation, conn.handler_gen);
+            REQUIRE_EQ(proof.upload_episode, conn.upstream_episode);
+            REQUIRE_EQ(proof.request_policy_id, static_cast<u16>(request_policy));
+            REQUIRE(proof.raw_header_end != 0);
+            REQUIRE_EQ(proof.raw_total_length, proof.raw_header_end);
+            REQUIRE_EQ(conn.response_read_deadline_state, ResponseReadDeadlineState::Armed);
+            REQUIRE(loop->response_read_deadline_uses_precise_timer(conn));
+            const char* expected_value =
+                request_policy == RequestPolicyId::Http11FixedTrimSpPreserveHtab
+                    ? "X-Test: \t keep \t\r\n"
+                    : "X-Test: keep\r\n";
+            REQUIRE(buf_has(conn.recv_buf.data(), conn.recv_buf.len(), expected_value));
+            REQUIRE(response_read_deadline_owner_is_stable(
+                conn,
+                &on_upstream_response<IoUringEventLoop>,
+                ResponseReadDeadlineOwnerPhase::ActiveAfterCopy));
+            auto forged_proof = conn.response_read_deadline_upload;
+            ++forged_proof.handler_generation;
+            conn.response_read_deadline_upload = forged_proof;
+            CHECK_FALSE(response_read_deadline_owner_is_stable(
+                conn,
+                &on_upstream_response<IoUringEventLoop>,
+                ResponseReadDeadlineOwnerPhase::ActiveAfterCopy));
+            conn.response_read_deadline_upload = proof;
+            forged_proof = proof;
+            forged_proof.upload_episode = proof.upload_episode == 1u ? 2u : 1u;
+            conn.response_read_deadline_upload = forged_proof;
+            CHECK_FALSE(response_read_deadline_owner_is_stable(
+                conn,
+                &on_upstream_response<IoUringEventLoop>,
+                ResponseReadDeadlineOwnerPhase::ActiveAfterCopy));
+            conn.response_read_deadline_upload = proof;
+
+            conn.pipeline_depth = 1;
+            CHECK_FALSE(loop->response_read_deadline_uses_precise_timer(conn));
+            conn.pipeline_depth = 0;
+            conn.http1_pipeline_request_generation = 1;
+            CHECK_FALSE(loop->response_read_deadline_uses_precise_timer(conn));
+            conn.http1_pipeline_request_generation = 0;
+            conn.pipeline_stash_len = 1;
+            CHECK_FALSE(loop->response_read_deadline_uses_precise_timer(conn));
+            conn.pipeline_stash_len = 0;
+            REQUIRE(loop->response_read_deadline_uses_precise_timer(conn));
+
+            static constexpr u8 kPartial[] = "HTTP/1.1 200 OK\r\nContent-Length: 4\r\n\r\nab";
+            REQUIRE_EQ(conn.upstream_recv_buf.write(kPartial, sizeof(kPartial) - 1u),
+                       sizeof(kPartial) - 1u);
+            const IoEvent partial = response_read_copy_event(
+                conn, sizeof(kPartial) - 1u, true, 0, sizeof(kPartial) - 1u);
+            loop->dispatch_batch(&partial, 1);
+            REQUIRE_EQ(conn.response_read_deadline_post_commit_phase,
+                       ResponseReadDeadlinePostCommitPhase::Buffering);
+            REQUIRE(response_read_deadline_post_commit_is_stable(conn));
+
+            static constexpr u8 kLast[] = {'c', 'd'};
+            const u32 begin = conn.upstream_recv_buf.len();
+            REQUIRE_EQ(conn.upstream_recv_buf.write(kLast, sizeof(kLast)), sizeof(kLast));
+            const IoEvent last = response_read_copy_event(
+                conn, sizeof(kLast), true, begin, conn.upstream_recv_buf.len());
+            loop->dispatch_batch(&last, 1);
+            REQUIRE_EQ(conn.response_read_deadline_post_commit_phase,
+                       ResponseReadDeadlinePostCommitPhase::HeaderSend);
+            REQUIRE(response_read_deadline_post_commit_is_stable(conn));
+            REQUIRE(conn.upstream_retirement_active);
+
+            if (retirement_first) drain_prebuilt_d2_retirement(loop, conn, kUpstreamOpRecv, false);
+            const IoEvent header = exact_response_deadline_send_event(loop, conn);
+            loop->dispatch_batch(&header, 1);
+            REQUIRE_EQ(conn.response_read_deadline_post_commit_phase,
+                       ResponseReadDeadlinePostCommitPhase::BodySend);
+            const IoEvent body = exact_response_deadline_send_event(loop, conn);
+            loop->dispatch_batch(&body, 1);
+            if (!retirement_first) {
+                REQUIRE(conn.http1_boundary_deferred);
+                drain_prebuilt_d2_retirement(loop, conn, kUpstreamOpRecv, false);
+            }
+            if (conn.http1_boundary_ready) loop->resume_deferred_http1_boundaries();
+            REQUIRE_EQ(conn.state, ConnState::ReadingHeader);
+            CHECK_EQ(conn.pipeline_depth, 0u);
+            cleanup_prebuilt_d2(loop, fixture);
         }
     }
 }

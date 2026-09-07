@@ -1859,7 +1859,8 @@ inline bool bodyless_get_keep_alive_precise_arm_is_stable(
         c.req_method != c.response_read_deadline_method ||
         (proof.downstream_close && !explicit_close) ||
         (!response_read_deadline_default_persistence_is_stable(c) && !explicit_close) ||
-        c.http1_pipeline_request_generation != 0 || c.pipeline_stash_len != 0 ||
+        c.pipeline_depth != 0 || c.http1_pipeline_request_generation != 0 ||
+        c.pipeline_stash_len != 0 ||
         c.response_read_deadline_post_commit_phase != ResponseReadDeadlinePostCommitPhase::None ||
         c.response_mutations_snapshotted || c.retry_req_send_len != 0 ||
         !bodyless_get_complete_content_length_request_policy_is_admitted(c.request_policy_id) ||
