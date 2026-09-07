@@ -1576,6 +1576,22 @@ if(RUT_ENABLE_JIT)
         ENVIRONMENT "RUT_NGINX_DIFFERENTIAL_REQUIRED=1"
     )
     add_test(
+        NAME test_nginx_issue554_converter_default_buffering_206_range_incomplete_body_inactivity_expiry_differential
+        COMMAND test_nginx_differential
+                --converter-default-buffering-206-range-incomplete-body-inactivity-expiry-differential
+                $<TARGET_FILE:rut>
+    )
+    set_tests_properties(
+        test_nginx_issue554_converter_default_buffering_206_range_incomplete_body_inactivity_expiry_differential
+        PROPERTIES
+        LABELS "integration;nginx;docker;io_uring;network;differential"
+        RUN_SERIAL TRUE
+        RESOURCE_LOCK nginx-differential
+        TIMEOUT 180
+        SKIP_RETURN_CODE 77
+        ENVIRONMENT "RUT_NGINX_DIFFERENTIAL_REQUIRED=1"
+    )
+    add_test(
         NAME test_nginx_issue529_converter_default_buffering_304_content_length_metadata_differential
         COMMAND test_nginx_differential
                 --converter-default-buffering-304-content-length-metadata-differential
