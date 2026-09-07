@@ -62850,6 +62850,342 @@ static bool run_pinned_nginx_default_buffering_206_range_incomplete_clean_eof_or
     return true;
 }
 
+// This is deliberately a separate oracle from the clean-EOF vector above.  In
+// this schedule the sole origin write is complete at the application layer,
+// but the origin remains open and nginx must retire it on proxy_read_timeout.
+static bool run_pinned_nginx_default_buffering_206_range_incomplete_body_inactivity_expiry_oracle(
+    TempDir& temp, const std::string& container_name, std::string& error) {
+    static constexpr char kDiagnostic[] = "#253 206 incomplete body inactivity expiry oracle";
+    static constexpr char kExpectedResponseNormalized[] =
+        "HTTP/1.1 206 Partial Content\r\n"
+        "Server: nginx/1.29.7\r\n"
+        "Date: XXXXXXXXXXXXXXXXXXXXXXXXXXXXX\r\n"
+        "Content-Length: 5\r\n"
+        "Connection: keep-alive\r\n"
+        "Content-Range: bytes 0-4/12\r\n"
+        "\r\n";
+    static_assert(sizeof(kDefaultBuffering206RangeRequest) - 1u == 78u);
+    static_assert(sizeof(kDefaultBuffering206RangeOrigin) - 1u == 144u);
+    static_assert((sizeof(kDefaultBuffering206RangeOrigin) - 1u) - 5u == 139u);
+    static_assert(kDefaultBuffering206RangeOrigin[139] == 'h');
+    static_assert(kDefaultBuffering206RangeOrigin[140] == 'e');
+    static_assert(sizeof(kExpectedResponseNormalized) - 1u == 163u);
+
+    HeldLoopbackPorts reservations;
+    u16 ports[2]{};
+    for (size_t index = 0u; index < std::size(ports); index++) {
+        if (!reservations.reserve_four_digit(index, ports[index])) {
+            error = std::string(kDiagnostic) + " could not hold two distinct four-digit ports";
+            return false;
+        }
+    }
+    const std::string profile =
+        make_explicit_timeout_head_profile(ports[0], ports[1], temp.nginx_access_log);
+    const std::string nginx_config = "events {}\n" + profile;
+    if (!validate_explicit_timeout_head_profile(
+            profile, ports[0], ports[1], temp.nginx_access_log, error) ||
+        count_text(nginx_config, "events {}\n") != 1u ||
+        nginx_config.rfind("events {}\nhttp {\n", 0u) != 0u ||
+        !write_file(temp.nginx_config, nginx_config.data(), nginx_config.size())) {
+        if (error.empty()) error = std::string(kDiagnostic) + " nginx input was not exact";
+        return false;
+    }
+
+    Recorder origin;
+    origin.wait_response_peer_close = true;
+    origin.observe_extra_requests_until_stop = true;
+    if (!handoff_held_loopback_port(&reservations.fds[1], ports[1], kDiagnostic, error) ||
+        !origin.setup(ports[1], 1u, kDefaultBuffering206RangeOrigin, 141u)) {
+        if (error.empty()) error = std::string(kDiagnostic) + " origin setup failed";
+        return false;
+    }
+    const auto origin_live = [&]() {
+        return origin.running.load(std::memory_order_acquire) &&
+               origin.thread_alive.load(std::memory_order_acquire) &&
+               !origin.listener_failed.load(std::memory_order_acquire);
+    };
+    const auto origin_ready_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+    while (!origin_live() && std::chrono::steady_clock::now() < origin_ready_deadline) usleep(1000);
+    if (!origin_live()) {
+        error = std::string(kDiagnostic) + " origin was not live before nginx handoff";
+        return false;
+    }
+
+    DockerGuard docker(container_name);
+    ChildGuard nginx;
+    if (!handoff_held_loopback_port(&reservations.fds[0], ports[0], kDiagnostic, error) ||
+        !spawn_child({"docker",
+                      "run",
+                      "--pull=never",
+                      "--network",
+                      "host",
+                      "--name",
+                      container_name,
+                      "-v",
+                      std::string(temp.path) + ":" + temp.path,
+                      kNginxImage,
+                      "nginx",
+                      "-c",
+                      temp.nginx_config,
+                      "-g",
+                      "daemon off;"},
+                     temp.nginx_log,
+                     nginx.child)) {
+        error = std::string(kDiagnostic) + " could not spawn pinned nginx";
+        return false;
+    }
+    if (!wait_ready(ports[0], nginx.child, error)) {
+        error = std::string(kDiagnostic) + " pinned nginx readiness failed: " + error;
+        return false;
+    }
+    const auto frontend_live = [&]() { return !poll_child(nginx.child); };
+
+    struct ClientGuard {
+        int fd = -1;
+        ~ClientGuard() {
+            if (fd >= 0) close(fd);
+        }
+    } client;
+    std::string access;
+    if (!read_request_length_access_file(temp.nginx_access_log, access, error) || !access.empty()) {
+        if (error.empty())
+            error = std::string(kDiagnostic) + " access was not empty before request";
+        return false;
+    }
+    client.fd = connect_once(ports[0]);
+    const u64 request_sent_ns = steady_now_ns();
+    if (client.fd < 0 || !send_all(client.fd,
+                                   kDefaultBuffering206RangeRequest,
+                                   sizeof(kDefaultBuffering206RangeRequest) - 1u)) {
+        error = std::string(kDiagnostic) + " could not send the exact 78-byte request";
+        return false;
+    }
+
+    const auto publication_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+    while (!origin.response_sent_open.load(std::memory_order_acquire)) {
+        if (!frontend_live() || !origin_live() ||
+            origin.response_send_failed.load(std::memory_order_acquire) ||
+            origin.response_peer_closed.load(std::memory_order_acquire) ||
+            origin.response_peer_unexpected_data.load(std::memory_order_acquire) ||
+            origin.response_peer_observation_failed.load(std::memory_order_acquire) ||
+            origin.accepted.load(std::memory_order_acquire) > 1u ||
+            origin.requests.load(std::memory_order_acquire) > 1u ||
+            std::chrono::steady_clock::now() >= publication_deadline) {
+            error = std::string(kDiagnostic) + " origin failed before its one open publication";
+            return false;
+        }
+        usleep(1000);
+    }
+    const u64 origin_sent_ns = origin.response_sent_ns.load(std::memory_order_acquire);
+    if (origin_sent_ns < request_sent_ns || origin.accepted.load(std::memory_order_acquire) != 1u ||
+        origin.requests.load(std::memory_order_acquire) != 1u ||
+        origin.response_send_all_calls.load(std::memory_order_acquire) != 1u ||
+        !origin.response_send_succeeded.load(std::memory_order_acquire) ||
+        origin.response_peer_closed.load(std::memory_order_acquire)) {
+        error = std::string(kDiagnostic) + " one 141-byte open publication was incoherent";
+        return false;
+    }
+
+    // No EOF permit, client close, or cleanup is authorized during this gate.
+    u64 quiet_ns = 0u;
+    for (;;) {
+        std::string detail;
+        if (!observe_client_open_and_quiet_nonconsuming(client.fd, 5, detail)) {
+            error = std::string(kDiagnostic) + " downstream changed before W1+800ms: " + detail;
+            return false;
+        }
+        quiet_ns = steady_now_ns();
+        if (!frontend_live() || !origin_live() ||
+            origin.accepted.load(std::memory_order_acquire) != 1u ||
+            origin.requests.load(std::memory_order_acquire) != 1u ||
+            origin.response_send_all_calls.load(std::memory_order_acquire) != 1u ||
+            origin.response_peer_closed.load(std::memory_order_acquire) ||
+            origin.response_peer_unexpected_data.load(std::memory_order_acquire) ||
+            origin.response_peer_observation_failed.load(std::memory_order_acquire) ||
+            !read_request_length_access_file(temp.nginx_access_log, access, error) ||
+            !access.empty()) {
+            if (error.empty()) error = std::string(kDiagnostic) + " pre-terminal custody failed";
+            return false;
+        }
+        if (quiet_ns - origin_sent_ns >= 800'000'000ull) break;
+    }
+
+    std::vector<char> response;
+    u64 first_downstream_ns = 0u;
+    u64 downstream_eof_ns = 0u;
+    const u64 terminal_deadline_ns = origin_sent_ns + 2'000'000'000ull;
+    while (downstream_eof_ns == 0u) {
+        if (!frontend_live() || !origin_live() || steady_now_ns() >= terminal_deadline_ns) {
+            error = std::string(kDiagnostic) + " response/EOF missed the W1+2s budget";
+            dump_wire(kDiagnostic, response);
+            return false;
+        }
+        pollfd state{client.fd, POLLIN | POLLHUP | POLLERR, 0};
+        const int ready = poll(&state, 1, 5);
+        if (ready < 0) {
+            if (errno == EINTR) continue;
+            error = std::string(kDiagnostic) + " downstream poll failed";
+            return false;
+        }
+        if (ready == 0) continue;
+        char bytes[1024];
+        const ssize_t count = recv(client.fd, bytes, sizeof(bytes), 0);
+        const u64 observed_ns = steady_now_ns();
+        if (count > 0) {
+            if (first_downstream_ns == 0u) first_downstream_ns = observed_ns;
+            response.insert(response.end(), bytes, bytes + count);
+            if (response.size() > sizeof(kExpectedResponseNormalized) - 1u) {
+                error = std::string(kDiagnostic) + " downstream included body or trailing bytes";
+                return false;
+            }
+        } else if (count == 0) {
+            downstream_eof_ns = observed_ns;
+        } else if (errno != EINTR && errno != EAGAIN && errno != EWOULDBLOCK) {
+            error = std::string(kDiagnostic) + " downstream recv failed";
+            return false;
+        }
+    }
+
+    // Observe nginx's natural upstream retirement before any origin/frontend
+    // teardown.  This is the terminal peer event, not cleanup-induced EOF.
+    const auto peer_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(1);
+    while (!origin.response_peer_closed.load(std::memory_order_acquire)) {
+        if (!frontend_live() || !origin_live() ||
+            origin.response_peer_unexpected_data.load(std::memory_order_acquire) ||
+            origin.response_peer_observation_failed.load(std::memory_order_acquire) ||
+            std::chrono::steady_clock::now() >= peer_deadline) {
+            error = std::string(kDiagnostic) + " origin peer was not naturally retired";
+            return false;
+        }
+        usleep(1000);
+    }
+    const u64 peer_close_ns = origin.response_peer_closed_ns.load(std::memory_order_acquire);
+
+    const auto fail_observation = [&](const std::string& message) {
+        error = message;
+        dump_wire(kDiagnostic, response);
+        std::cerr << kDiagnostic
+                  << " timestamps request/W1/quiet/first/EOF/peer(ns): " << request_sent_ns << "/"
+                  << origin_sent_ns << "/" << quiet_ns << "/" << first_downstream_ns << "/"
+                  << downstream_eof_ns << "/" << peer_close_ns << "\n";
+        return false;
+    };
+    if (first_downstream_ns < origin_sent_ns || downstream_eof_ns < origin_sent_ns ||
+        peer_close_ns < origin_sent_ns) {
+        return fail_observation(std::string(kDiagnostic) + " terminal timestamp ordering invalid");
+    }
+    const u64 first_elapsed = first_downstream_ns - origin_sent_ns;
+    const u64 eof_elapsed = downstream_eof_ns - origin_sent_ns;
+    const u64 peer_elapsed = peer_close_ns - origin_sent_ns;
+    if (quiet_ns - origin_sent_ns < 800'000'000ull || first_elapsed < 750'000'000ull ||
+        first_elapsed >= 1'700'000'000ull || eof_elapsed < 750'000'000ull ||
+        eof_elapsed >= 2'000'000'000ull || peer_elapsed < 750'000'000ull ||
+        peer_elapsed >= 2'000'000'000ull) {
+        return fail_observation(std::string(kDiagnostic) +
+                                " terminal timing missed strict windows");
+    }
+    std::vector<char> normalized = response;
+    const std::vector<char> expected_response(
+        kExpectedResponseNormalized,
+        kExpectedResponseNormalized + sizeof(kExpectedResponseNormalized) - 1u);
+    if (!normalize_date(normalized) || normalized != expected_response ||
+        header_end(normalized) != normalized.size()) {
+        return fail_observation(std::string(kDiagnostic) +
+                                " exact normalized 163-byte response mismatch");
+    }
+    const std::string response_text(normalized.begin(), normalized.end());
+    if (count_text(response_text, "HTTP/1.1 206 Partial Content\r\n") != 1u ||
+        count_text(response_text, "Content-Length: 5\r\n") != 1u ||
+        count_text(response_text, "Content-Range: bytes 0-4/12\r\n") != 1u ||
+        response_text.find("he") != std::string::npos ||
+        response_text.find("hello") != std::string::npos ||
+        response_text.find("502") != std::string::npos ||
+        response_text.find("504") != std::string::npos ||
+        response_text.find("Gateway Time-out") != std::string::npos) {
+        return fail_observation(std::string(kDiagnostic) +
+                                " response metadata/body exclusion failed");
+    }
+    static constexpr char kExpectedAccess[] = "78\n";
+    const auto access_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+    for (;;) {
+        if (!read_request_length_access_file(temp.nginx_access_log, access, error)) return false;
+        if (access == kExpectedAccess) break;
+        if ((!access.empty() && access != kExpectedAccess) || !frontend_live() ||
+            std::chrono::steady_clock::now() >= access_deadline) {
+            if (error.empty()) error = std::string(kDiagnostic) + " access was not exact `78\\n`";
+            return false;
+        }
+        usleep(5000);
+    }
+    const auto stability_deadline =
+        std::chrono::steady_clock::now() + std::chrono::milliseconds(175);
+    while (std::chrono::steady_clock::now() < stability_deadline) {
+        if (!frontend_live() || !origin_live() ||
+            origin.accepted.load(std::memory_order_acquire) != 1u ||
+            origin.requests.load(std::memory_order_acquire) != 1u ||
+            origin.response_send_all_calls.load(std::memory_order_acquire) != 1u ||
+            origin.response_peer_close_count.load(std::memory_order_acquire) != 1u ||
+            origin.response_send_failed.load(std::memory_order_acquire) ||
+            origin.response_peer_unexpected_data.load(std::memory_order_acquire) ||
+            origin.response_peer_observation_failed.load(std::memory_order_acquire) ||
+            !read_request_length_access_file(temp.nginx_access_log, access, error) ||
+            access != kExpectedAccess) {
+            if (error.empty()) error = std::string(kDiagnostic) + " live no-retry stability failed";
+            return false;
+        }
+        poll(nullptr, 0, 5);
+    }
+    close(client.fd);
+    client.fd = -1;
+    if (!read_request_length_access_file(temp.nginx_access_log, access, error) ||
+        access != kExpectedAccess) {
+        if (error.empty()) error = std::string(kDiagnostic) + " access changed after client close";
+        return false;
+    }
+    const std::string expected_upstream_text =
+        "GET /buffered-timeout?q=1 HTTP/1.1\r\nHost: 127.0.0.1:" + std::to_string(ports[1]) +
+        "\r\nRange: bytes=0-4\r\n\r\n";
+    const std::vector<char> expected_upstream(expected_upstream_text.begin(),
+                                              expected_upstream_text.end());
+    const bool origin_live_before_stop = origin_live();
+    origin.stop();
+    if (!origin_live_before_stop || origin.thread_alive.load(std::memory_order_acquire) ||
+        origin.listen_fd >= 0 || origin.listener_failed.load(std::memory_order_acquire) ||
+        origin.accepted.load(std::memory_order_acquire) != 1u ||
+        origin.requests.load(std::memory_order_acquire) != 1u || origin.history.size() != 1u ||
+        origin.history[0] != expected_upstream || origin.request != expected_upstream ||
+        origin.response_send_all_calls.load(std::memory_order_acquire) != 1u ||
+        !origin.response_send_succeeded.load(std::memory_order_acquire) ||
+        !origin.response_sent_open.load(std::memory_order_acquire) ||
+        !origin.response_peer_closed.load(std::memory_order_acquire) ||
+        origin.response_peer_close_count.load(std::memory_order_acquire) != 1u ||
+        origin.response_send_failed.load(std::memory_order_acquire) ||
+        origin.response_peer_unexpected_data.load(std::memory_order_acquire) ||
+        origin.response_peer_observation_failed.load(std::memory_order_acquire) ||
+        !origin.response_clean_shutdown.load(std::memory_order_acquire) ||
+        !origin.response_connection_closed.load(std::memory_order_acquire)) {
+        error = std::string(kDiagnostic) + " exact upstream/origin lifecycle evidence failed";
+        dump_wire("206 inactivity expected upstream", expected_upstream);
+        dump_wire("206 inactivity observed upstream", origin.request);
+        return false;
+    }
+    const bool nginx_stopped = stop_child(nginx.child);
+    const bool container_removed = docker.remove();
+    if (!nginx_stopped || !container_removed || reservations.fds[0] >= 0 ||
+        reservations.fds[1] >= 0 ||
+        !read_request_length_access_file(temp.nginx_access_log, access, error) ||
+        access != kExpectedAccess) {
+        if (error.empty()) error = std::string(kDiagnostic) + " final cleanup/access failed";
+        return false;
+    }
+    std::cerr << "PASS evidence: " << kDiagnostic
+              << " W1-to-first/EOF/peer-close seconds=" << static_cast<double>(first_elapsed) / 1e9
+              << "/" << static_cast<double>(eof_elapsed) / 1e9 << "/"
+              << static_cast<double>(peer_elapsed) / 1e9
+              << " accepted=1 requests=1 publications=1 access=ASCII78+LF retry=0\n";
+    return true;
+}
+
 static constexpr char kIssue546WithheldNegativeResult[] =
     "#546 real withheld EOF authorization reached its bounded deadline and cleaned up";
 
@@ -69533,6 +69869,10 @@ int main(int argc, char** argv) {
         argc == 2 &&
         strcmp(argv[1], "--pinned-nginx-default-buffering-206-range-incomplete-clean-eof-oracle") ==
             0;
+    const bool pinned_nginx_default_buffering_206_range_incomplete_body_inactivity_expiry_oracle =
+        argc == 2 && strcmp(argv[1],
+                            "--pinned-nginx-default-buffering-206-range-incomplete-body-inactivity-"
+                            "expiry-oracle") == 0;
     const bool pinned_positive_cl_options_default_buffering_oracle =
         argc == 2 &&
         strcmp(argv[1], "--pinned-nginx-positive-cl-options-default-buffering-oracle") == 0;
@@ -69760,6 +70100,7 @@ int main(int argc, char** argv) {
          !pinned_nginx_default_buffering_206_range_delayed_completion_oracle &&
          !pinned_nginx_default_buffering_206_range_three_publication_completion_oracle &&
          !pinned_nginx_default_buffering_206_range_incomplete_clean_eof_oracle &&
+         !pinned_nginx_default_buffering_206_range_incomplete_body_inactivity_expiry_oracle &&
          !wildcard_listen_oracle && !asterisk_wildcard_listen_oracle &&
          !exact_loopback_listen_oracle && !request_length_oracle &&
          !request_length_split_header_oracle && !rut_initial_header_split_public &&
@@ -71756,6 +72097,35 @@ int main(int argc, char** argv) {
                "SHUT_WR/FIN and no retry are proven. This is nginx-only evidence; it makes no "
                "generated-RUT, converter equivalence, timeout-expiry, other incomplete-206, "
                "general Range, retry/reuse/pipeline, TLS/H2/epoll, or broad #253/#271 claim.\n";
+        return 0;
+    }
+    if (pinned_nginx_default_buffering_206_range_incomplete_body_inactivity_expiry_oracle) {
+        const std::string container_name = "rut-nginx-253-206-incomplete-expiry-oracle-" +
+                                           std::to_string(getpid()) + "-" +
+                                           (suffix ? suffix + 1 : "tmp");
+        std::string oracle_error;
+        if (!run_pinned_nginx_default_buffering_206_range_incomplete_body_inactivity_expiry_oracle(
+                temp, container_name, oracle_error)) {
+            std::cerr << "FAIL [#253 pinned nginx default-buffering 206 range incomplete "
+                         "body-inactivity-expiry oracle]: "
+                      << oracle_error << "\n";
+            dump_log(temp.nginx_config, "#253 206 incomplete expiry nginx config");
+            dump_log(temp.nginx_access_log, "#253 206 incomplete expiry nginx access log");
+            dump_log(temp.nginx_log, "#253 206 incomplete expiry nginx process log");
+            return 1;
+        }
+        std::cerr
+            << "PASS: #253 pinned nginx 1.29.7 nginx-only oracle proves one exact coherent "
+               "single-range 206/CL5 response whose origin publishes one 141-byte "
+               "header-plus-he application write and remains open. Downstream stays open and "
+               "byte-quiet through W1+800ms; nginx naturally expires the location-scoped "
+               "proxy_read_timeout and emits the exact Date-normalized 163-byte header-only "
+               "response plus actual recv-zero EOF, while retiring the origin peer in the "
+               "strict W1-relative bounds. Exact 78-byte upstream Range preservation, `78\\n` "
+               "access, one origin episode/publication, no retry and live 175ms stability are "
+               "proven. This pins nginx semantics only; it makes no generated-RUT, converter "
+               "equivalence, runtime-capability, clean-EOF, other incomplete-206, general "
+               "Range, retry/reuse/pipeline, TLS/H2/epoll, or broad #253/#271 claim.\n";
         return 0;
     }
     if (pinned_nginx_default_buffering_304_content_length_metadata_oracle) {

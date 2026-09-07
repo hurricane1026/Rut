@@ -1545,6 +1545,21 @@ if(RUT_ENABLE_JIT)
         ENVIRONMENT "RUT_NGINX_DIFFERENTIAL_REQUIRED=1"
     )
     add_test(
+        NAME test_nginx_issue253_pinned_default_buffering_206_range_incomplete_body_inactivity_expiry_oracle
+        COMMAND test_nginx_differential
+                --pinned-nginx-default-buffering-206-range-incomplete-body-inactivity-expiry-oracle
+    )
+    set_tests_properties(
+        test_nginx_issue253_pinned_default_buffering_206_range_incomplete_body_inactivity_expiry_oracle
+        PROPERTIES
+        LABELS "integration;nginx;docker;network;differential"
+        RUN_SERIAL TRUE
+        RESOURCE_LOCK nginx-differential
+        TIMEOUT 120
+        SKIP_RETURN_CODE 77
+        ENVIRONMENT "RUT_NGINX_DIFFERENTIAL_REQUIRED=1"
+    )
+    add_test(
         NAME test_nginx_issue546_converter_default_buffering_206_range_incomplete_clean_eof_differential
         COMMAND test_nginx_differential
                 --converter-default-buffering-206-range-incomplete-clean-eof-differential
