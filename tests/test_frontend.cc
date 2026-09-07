@@ -33174,7 +33174,122 @@ route POST "/" {
         static_cast<u16>(RequestPolicyId::Http11FixedStripContentLengthAfterHost)));
     CHECK_FALSE(response_read_deadline_request_policy_is_admitted(
         static_cast<u16>(RequestPolicyId::Http11FixedStripContentLengthAfterHost)));
-    CHECK_FALSE(request_policy_is_supported(3));
+    CHECK(request_policy_is_supported(3));
+}
+
+TEST(frontend, retained_header_value_trim_sp_preserve_htab_is_get_timeout_only) {
+    static constexpr const char kPolicies[] = R"rut(
+        response_policy: { version: "HTTP/1.1", framing: "content_length",
+            connection: "request", server: "s", date: "current", hide_headers: [] },
+        failure_policy: { version: "HTTP/1.1", status: 502, reason: "Bad Gateway",
+            content_type: "text/plain", server: "s", date: "current",
+            connection: "request", body: b"bad" },
+        timeout_failure_policy: { version: "HTTP/1.1", status: 504,
+            reason: "Gateway Time-out", content_type: "text/plain", server: "s",
+            date: "current", connection: "request", body: b"slow" },
+        response_read_timeout: 60s, response_buffering: "complete_content_length")
+    )rut";
+    const std::string source = std::string("upstream b at \"127.0.0.1:9000\"\n") +
+                               "route GET \"/ok\" { return forward(b, "
+                               "request_policy: { version: \"HTTP/1.1\", host: \"upstream\", "
+                               "connection: \"omit\", strip_headers: [\"Connection\", "
+                               "\"Keep-Alive\", \"TE\", \"Expect\", \"Upgrade\"], "
+                               "retained_header_value: \"trim_sp_preserve_htab\" }, " +
+                               kPolicies + "}\n";
+    auto lexed = lex({source.data(), static_cast<u32>(source.size())});
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    REQUIRE_EQ(ast->items[1].route.statements[0]->forward_request_policy_id,
+               static_cast<u16>(RequestPolicyId::Http11FixedTrimSpPreserveHtab));
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    CHECK_EQ(hir->routes[0].method, kRouteMethodGet);
+    CHECK_EQ(hir->routes[0].control.direct_term.forward_request_policy_id,
+             static_cast<u16>(RequestPolicyId::Http11FixedTrimSpPreserveHtab));
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    CHECK_EQ(mir->functions[0].blocks[0].term.forward_request_policy_id,
+             static_cast<u16>(RequestPolicyId::Http11FixedTrimSpPreserveHtab));
+    FrontendRirModule rir{};
+    REQUIRE(lower_to_rir(mir.value(), rir));
+    REQUIRE(rir::verify_module(rir.module).ok);
+    REQUIRE_EQ(rir.module.policy_bundle_count, 1u);
+    CHECK_EQ(rir.module.policy_bundles[0].response_read_timeout_seconds, 60u);
+    CHECK_EQ(rir.module.policy_bundles[0].response_buffering,
+             ForwardResponseBufferingMode::CompleteContentLength);
+    const auto* ret = find_first_op(rir.module.functions[0], rir::Opcode::RetForwardBundle);
+    REQUIRE(ret != nullptr);
+    REQUIRE_EQ(ret->operand_count, 3u);
+    const auto policy = ret->operand(1);
+    const auto& value = rir.module.functions[0].values[policy.id];
+    auto& constant = rir.module.functions[0].blocks[value.def_block.id].insts[value.def_inst];
+    REQUIRE_EQ(constant.op, rir::Opcode::ConstI32);
+    CHECK_EQ(constant.imm.i32_val,
+             static_cast<i32>(RequestPolicyId::Http11FixedTrimSpPreserveHtab));
+    const auto bundle = ret->operand(2);
+    REQUIRE_LT(bundle.id, rir.module.functions[0].value_count);
+    const auto& bundle_value = rir.module.functions[0].values[bundle.id];
+    const auto& bundle_constant =
+        rir.module.functions[0].blocks[bundle_value.def_block.id].insts[bundle_value.def_inst];
+    REQUIRE_EQ(bundle_constant.op, rir::Opcode::ConstI32);
+    REQUIRE(bundle_constant.imm.i32_val > 0);
+    REQUIRE_LE(static_cast<u32>(bundle_constant.imm.i32_val), rir.module.policy_bundle_count);
+    CHECK_EQ(bundle_constant.imm.i32_val, 1);
+    const u32 bundle_index = static_cast<u32>(bundle_constant.imm.i32_val - 1);
+    u32 matching_bundle_count = 0;
+    u32 matching_bundle_index = 0;
+    for (u32 i = 0; i < rir.module.policy_bundle_count; ++i) {
+        const auto& candidate = rir.module.policy_bundles[i];
+        if (candidate.response_read_timeout_seconds != 60u ||
+            candidate.response_buffering != ForwardResponseBufferingMode::CompleteContentLength)
+            continue;
+        matching_bundle_index = i;
+        ++matching_bundle_count;
+    }
+    REQUIRE_EQ(matching_bundle_count, 1u);
+    CHECK_EQ(bundle_index, matching_bundle_index);
+    rir.destroy();
+
+    // The capability requires a valid response timeout; 60s is the public
+    // acceptance gate, not a compiler-only special value.
+    std::string one_second = source;
+    const auto public_timeout = one_second.find("response_read_timeout: 60s");
+    REQUIRE_NE(public_timeout, std::string::npos);
+    one_second.replace(
+        public_timeout, sizeof("response_read_timeout: 60s") - 1, "response_read_timeout: 1s");
+    auto one_second_lexed = lex({one_second.data(), static_cast<u32>(one_second.size())});
+    REQUIRE(one_second_lexed);
+    auto one_second_ast = parse_file_heap(one_second_lexed.value());
+    REQUIRE(one_second_ast);
+    REQUIRE(analyze_file_heap(one_second_ast.value()));
+
+    const auto expect_rejected = [&](std::string bad) {
+        auto bad_lexed = lex({bad.data(), static_cast<u32>(bad.size())});
+        REQUIRE(bad_lexed);
+        auto bad_ast = parse_file_heap(bad_lexed.value());
+        if (bad_ast) CHECK_FALSE(analyze_file_heap(bad_ast.value()).has_value());
+    };
+    std::string bad_method = source;
+    bad_method.replace(bad_method.find("route GET"), 9, "route POST");
+    expect_rejected(bad_method);
+    std::string missing_buffering = source;
+    const auto buffering =
+        missing_buffering.find("response_buffering: \"complete_content_length\"");
+    REQUIRE_NE(buffering, std::string::npos);
+    missing_buffering.erase(buffering,
+                            sizeof("response_buffering: \"complete_content_length\"") - 1);
+    expect_rejected(missing_buffering);
+    std::string after_host = source;
+    const auto retained = after_host.find("retained_header_value: \"trim_sp_preserve_htab\"");
+    REQUIRE_NE(retained, std::string::npos);
+    after_host.insert(retained, "content_length_position: \"after_host\", ");
+    expect_rejected(after_host);
+    std::string unknown = source;
+    const auto value_pos = unknown.find("trim_sp_preserve_htab");
+    REQUIRE_NE(value_pos, std::string::npos);
+    unknown.replace(value_pos, sizeof("trim_sp_preserve_htab") - 1, "unknown");
+    expect_rejected(unknown);
 }
 
 TEST(frontend, request_policy_after_host_admits_only_fixed_upload_head_timeout_profile) {

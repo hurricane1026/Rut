@@ -11,13 +11,27 @@ enum class RequestPolicyId : u16 {
     None = 0,
     Http11FixedStrip = 1,
     Http11FixedStripContentLengthAfterHost = 2,
+    Http11FixedTrimSpPreserveHtab = 3,
     // Reserved in the 16-bit forward-result slot for invalid direct-RIR values.
     Invalid = 0xffffu,
 };
 
 inline bool request_policy_is_supported(u16 id) {
     return id == static_cast<u16>(RequestPolicyId::Http11FixedStrip) ||
-           id == static_cast<u16>(RequestPolicyId::Http11FixedStripContentLengthAfterHost);
+           id == static_cast<u16>(RequestPolicyId::Http11FixedStripContentLengthAfterHost) ||
+           id == static_cast<u16>(RequestPolicyId::Http11FixedTrimSpPreserveHtab);
+}
+
+inline bool request_policy_trims_sp_preserves_htab(u16 id) {
+    return id == static_cast<u16>(RequestPolicyId::Http11FixedTrimSpPreserveHtab);
+}
+
+// ID3 is intentionally admitted only by the closed bodyless GET + complete
+// response-buffering profile.  The ordinary complete-buffering predicate below
+// remains unchanged so adding this policy cannot widen other routes.
+inline bool bodyless_get_complete_content_length_request_policy_is_admitted(u16 id) {
+    return id == static_cast<u16>(RequestPolicyId::Http11FixedStrip) ||
+           id == static_cast<u16>(RequestPolicyId::Http11FixedTrimSpPreserveHtab);
 }
 
 inline bool request_policy_places_content_length_after_host(u16 id) {

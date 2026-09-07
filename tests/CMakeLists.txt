@@ -2715,6 +2715,18 @@ if(RUT_ENABLE_JIT)
         ENVIRONMENT "RUT_NGINX_DIFFERENTIAL_REQUIRED=1"
     )
     add_test(
+        NAME test_rut_issue558_retained_header_public_gate
+        COMMAND test_nginx_differential --rut-issue558-retained-header-public-gate
+                $<TARGET_FILE:rut>
+    )
+    set_tests_properties(test_rut_issue558_retained_header_public_gate PROPERTIES
+        LABELS "integration;network;io_uring"
+        RUN_SERIAL TRUE
+        RESOURCE_LOCK nginx-differential
+        TIMEOUT 90
+        ENVIRONMENT "RUT_NGINX_DIFFERENTIAL_REQUIRED=1"
+    )
+    add_test(
         NAME test_rut_exact_ipv4_listener_production
         COMMAND test_nginx_differential --rut-exact-ipv4-listener-production
                 $<TARGET_FILE:rut>

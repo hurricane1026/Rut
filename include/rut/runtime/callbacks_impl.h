@@ -1237,7 +1237,8 @@ bool prepare_response_read_deadline_preflight_for_mode(Loop* loop,
             conn.req_method == static_cast<u8>(LogHttpMethod::Get) &&
             route->method == kRouteMethodGet && !conn.req_client_has_content_length &&
             conn.req_client_content_length_count == 0 &&
-            response_read_deadline_default_persistence_is_stable(conn) &&
+            (response_read_deadline_default_persistence_is_stable(conn) ||
+             preflight_downstream_close) &&
             conn.pipeline_depth == 0 && conn.http1_pipeline_request_generation == 0 &&
             conn.recv_buf.len() == conn.req_initial_send_len;
         const bool pipeline_generation_stable =
@@ -3581,11 +3582,13 @@ void handle_jit_outcome(Loop* loop,
                     conn.response_read_deadline_route_method == kRouteMethodGet &&
                     !conn.req_client_has_content_length &&
                     conn.req_client_content_length_count == 0 &&
-                    response_read_deadline_default_persistence_is_stable(conn) &&
+                    (response_read_deadline_default_persistence_is_stable(conn) ||
+                     complete_content_length_explicit_close_request_is_stable(
+                         conn, deadline_proof, forward_response_buffering, outcome_profile)) &&
                     conn.pipeline_depth == 0 && conn.http1_pipeline_request_generation == 0 &&
                     conn.recv_buf.len() == conn.req_initial_send_len &&
-                    outcome.request_policy_id ==
-                        static_cast<u16>(RequestPolicyId::Http11FixedStrip) &&
+                    bodyless_get_complete_content_length_request_policy_is_admitted(
+                        outcome.request_policy_id) &&
                     fn != nullptr && deadline_proof.route_fn == fn &&
                     deadline_proof.handler_generation == conn.handler_gen &&
                     deadline_proof.route_index < config->route_count &&
@@ -3629,8 +3632,14 @@ void handle_jit_outcome(Loop* loop,
                                      static_cast<u16>(RequestPolicyId::Http11FixedStrip)) &&
                               request_body_state != RequestPolicyBodyState::Invalid
                     : complete_content_length_buffering
-                        ? complete_content_length_request_policy_is_admitted(
-                              outcome.request_policy_id) &&
+                        ? (complete_content_length_request_policy_is_admitted(
+                               outcome.request_policy_id) ||
+                           (outcome_profile ==
+                                ResponseReadDeadlineProfile::BodylessNonHeadContentLengthZero &&
+                            conn.req_method == static_cast<u8>(LogHttpMethod::Get) &&
+                            conn.response_read_deadline_route_method == kRouteMethodGet &&
+                            bodyless_get_complete_content_length_request_policy_is_admitted(
+                                outcome.request_policy_id))) &&
                               request_body_state == RequestPolicyBodyState::Complete
                         : outcome.request_policy_id == 0 ||
                               (response_read_deadline_request_policy_is_admitted(
@@ -3946,10 +3955,20 @@ void handle_jit_outcome(Loop* loop,
             // multi-endpoint targets before allocating slots or selecting an
             // endpoint; never emit a Host for an endpoint that may differ on
             // retry.
+            const bool bodyless_get_retained_policy_admitted =
+                complete_content_length_buffering && outcome.response_read_timeout_seconds != 0 &&
+                conn.response_read_deadline_profile ==
+                    ResponseReadDeadlineProfile::BodylessNonHeadContentLengthZero &&
+                conn.req_method == static_cast<u8>(LogHttpMethod::Get) &&
+                conn.response_read_deadline_route_method == kRouteMethodGet &&
+                !strict_pipeline_successor &&
+                bodyless_get_complete_content_length_request_policy_is_admitted(
+                    outcome.request_policy_id);
             if (outcome.request_policy_id != 0 &&
                 (!(complete_content_length_buffering
-                       ? complete_content_length_request_policy_is_admitted(
-                             outcome.request_policy_id)
+                       ? (complete_content_length_request_policy_is_admitted(
+                              outcome.request_policy_id) ||
+                          bodyless_get_retained_policy_admitted)
                        : request_policy_is_supported(outcome.request_policy_id)) ||
                  target.addr_count != 1 || conn.resp_header_mutation_count != 0 ||
                  conn.resp_header_mutation_pending_count != 0 ||
@@ -4028,8 +4047,16 @@ void handle_jit_outcome(Loop* loop,
                     ParsedRequest rewritten_request;
                     rewritten_parser.reset();
                     rewritten_request.reset();
-                    if (conn.request_policy_id !=
-                            static_cast<u16>(RequestPolicyId::Http11FixedStrip) ||
+                    const bool retained_bodyless_policy =
+                        conn.response_read_deadline_buffering ==
+                            ForwardResponseBufferingMode::CompleteContentLength &&
+                        conn.response_read_deadline_route_method == kRouteMethodGet &&
+                        conn.request_policy_id ==
+                            static_cast<u16>(RequestPolicyId::Http11FixedTrimSpPreserveHtab);
+                    if (!(conn.request_policy_id ==
+                              static_cast<u16>(RequestPolicyId::Http11FixedStrip) ||
+                          (retained_bodyless_policy && conn.response_read_deadline_method ==
+                                                           static_cast<u8>(LogHttpMethod::Get))) ||
                         conn.req_initial_send_len == 0 ||
                         conn.req_initial_send_len != conn.req_header_end ||
                         conn.req_initial_send_len > conn.recv_buf.len() ||
@@ -5213,6 +5240,13 @@ inline RequestPolicyBodyState inspect_request_policy_body(const Connection& conn
     if (parser.parse(data, len, &req) != ParseStatus::Complete || req.path.ptr == nullptr ||
         req.path.len == 0 || req.path.ptr[0] != '/')
         return RequestPolicyBodyState::Invalid;
+    // ID3 is a retained ordinary-header serializer for the single bounded
+    // bodyless GET profile.  Explicit Content-Length (including zero), other
+    // methods, and upload/body states remain closed.
+    if (request_policy_trims_sp_preserves_htab(policy_id) &&
+        (req.method != HttpMethod::GET || req.has_content_length || req.chunked ||
+         conn.req_body_mode != BodyMode::None || conn.req_body_remaining != 0))
+        return RequestPolicyBodyState::Invalid;
 
     const u8* end = data + parser.header_end;
     const u8* line_end = data;
@@ -5270,6 +5304,26 @@ inline bool apply_request_policy(Connection& conn, const sockaddr_in& endpoint, 
     if (inspect_request_policy_body(conn, policy_id) != RequestPolicyBodyState::Complete)
         return false;
 
+    if (request_policy_trims_sp_preserves_htab(policy_id) &&
+        (conn.response_read_deadline_profile !=
+             ResponseReadDeadlineProfile::BodylessNonHeadContentLengthZero ||
+         conn.response_read_deadline_buffering !=
+             ForwardResponseBufferingMode::CompleteContentLength ||
+         conn.response_read_deadline_state == ResponseReadDeadlineState::None ||
+         !response_read_timeout_seconds_valid(conn.response_read_deadline_seconds) ||
+         conn.req_method != static_cast<u8>(LogHttpMethod::Get) ||
+         conn.response_read_deadline_route_method != kRouteMethodGet || conn.pipeline_depth != 0 ||
+         conn.pipeline_stash_len != 0))
+        return false;
+
+    struct ScratchResetGuard {
+        Connection& conn;
+        bool committed = false;
+        ~ScratchResetGuard() {
+            if (!committed) conn.send_buf.reset();
+        }
+    } scratch_guard{conn};
+
     const u8* data = conn.recv_buf.data();
     const u32 len = conn.recv_buf.len();
     const bool coalesced_phase1 =
@@ -5291,6 +5345,86 @@ inline bool apply_request_policy(Connection& conn, const sockaddr_in& endpoint, 
     while (line_end + 1 < end && !(line_end[0] == '\r' && line_end[1] == '\n')) line_end++;
     const u8* path_ptr = reinterpret_cast<const u8*>(req.path.ptr);
     if (line_end + 1 >= end || path_ptr < data || path_ptr + req.path.len > line_end) return false;
+    const bool trim_sp_preserve_htab = request_policy_trims_sp_preserves_htab(policy_id);
+    u64 measured_id3_length = 0;
+
+    // ID3 is measured completely before scratch is touched.  This proves the
+    // parser-owned raw boundaries and both destination capacities up front;
+    // its exact profile also forbids a successor/read-ahead suffix.
+    if (trim_sp_preserve_htab) {
+        if (len != parser.header_end || req.header_count > kMaxHeaders || req.has_content_length ||
+            req.chunked || req.method != HttpMethod::GET || body_len != 0)
+            return false;
+        auto decimal_len = [](u32 value) {
+            u32 n = 1;
+            while (value >= 10) {
+                value /= 10;
+                ++n;
+            }
+            return n;
+        };
+        const u32 ip = ntohl(endpoint.sin_addr.s_addr);
+        const u8 octets[4] = {static_cast<u8>(ip >> 24),
+                              static_cast<u8>(ip >> 16),
+                              static_cast<u8>(ip >> 8),
+                              static_cast<u8>(ip)};
+        u64 measured = static_cast<u64>(path_ptr - data) + req.path.len + 1u + 8u + 2u;
+        measured += 6u + 2u;
+        for (u8 oi = 0; oi < 4; ++oi) {
+            if (oi != 0) ++measured;
+            measured += decimal_len(octets[oi]);
+        }
+        const u16 port = ntohs(endpoint.sin_port);
+        if (port != 80) measured += 1u + decimal_len(port);
+        const u8* measured_hs = line_end + 2;
+        const u8* measured_header_end = end - 2;
+        u32 measured_index = 0;
+        while (measured_hs < measured_header_end) {
+            const u8* measured_le = measured_hs;
+            while (measured_le + 1 < end && !(measured_le[0] == '\r' && measured_le[1] == '\n'))
+                ++measured_le;
+            if (measured_le + 1 >= end || measured_index >= req.header_count) return false;
+            const u8* colon = measured_hs;
+            while (colon < measured_le && *colon != ':') ++colon;
+            const u32 name_len = static_cast<u32>(colon - measured_hs);
+            const Header& parsed_header = req.headers[measured_index++];
+            const uintptr_t data_addr = reinterpret_cast<uintptr_t>(data);
+            const uintptr_t data_end = data_addr + len;
+            const uintptr_t name_addr = reinterpret_cast<uintptr_t>(parsed_header.name.ptr);
+            const uintptr_t raw_addr = reinterpret_cast<uintptr_t>(parsed_header.raw_value.ptr);
+            if (colon == measured_hs || colon == measured_le ||
+                parsed_header.name.len != name_len ||
+                name_addr != reinterpret_cast<uintptr_t>(measured_hs) || raw_addr < data_addr ||
+                raw_addr > data_end || parsed_header.raw_value.len > data_end - raw_addr ||
+                parsed_header.raw_value.ptr != reinterpret_cast<const char*>(colon + 1) ||
+                parsed_header.raw_value.len != static_cast<u32>(measured_le - colon - 1))
+                return false;
+            const bool drop =
+                request_policy_name_eq(measured_hs, name_len, "content-length", 14) ||
+                request_policy_name_eq(measured_hs, name_len, "host", 4) ||
+                request_policy_name_eq(measured_hs, name_len, "connection", 10) ||
+                request_policy_name_eq(measured_hs, name_len, "keep-alive", 10) ||
+                request_policy_name_eq(measured_hs, name_len, "te", 2) ||
+                request_policy_name_eq(measured_hs, name_len, "expect", 6) ||
+                request_policy_name_eq(measured_hs, name_len, "upgrade", 7) ||
+                request_policy_name_eq(measured_hs, name_len, "transfer-encoding", 17);
+            if (!drop) {
+                u32 value_start = 0;
+                u32 value_end = parsed_header.raw_value.len;
+                while (value_start < value_end && parsed_header.raw_value.ptr[value_start] == ' ')
+                    ++value_start;
+                while (value_end > value_start && parsed_header.raw_value.ptr[value_end - 1] == ' ')
+                    --value_end;
+                measured += static_cast<u64>(name_len) + 2u + (value_end - value_start) + 2u;
+            }
+            measured_hs = measured_le + 2;
+        }
+        measured += 2u;
+        if (measured_index != req.header_count || measured > conn.send_buf.capacity() ||
+            measured > conn.recv_buf.capacity() || measured > 0xffffffffu)
+            return false;
+        measured_id3_length = measured;
+    }
 
     auto append = [&](const u8* p, u32 n) {
         return n <= conn.send_buf.capacity() - conn.send_buf.len() &&
@@ -5358,6 +5492,7 @@ inline bool apply_request_policy(Connection& conn, const sockaddr_in& endpoint, 
 
     const u8* hs = line_end + 2;
     const u8* header_end = end - 2;
+    u32 parsed_header_index = 0;
     while (hs < header_end) {
         const u8* le = hs;
         while (le + 1 < end && !(le[0] == '\r' && le[1] == '\n')) le++;
@@ -5378,23 +5513,47 @@ inline bool apply_request_policy(Connection& conn, const sockaddr_in& endpoint, 
                 return false;
         } else if (!drop) {
             const u8* value_start = colon + 1;
-            while (value_start < le && (*value_start == ' ' || *value_start == '\t')) value_start++;
             const u8* value_end = le;
-            while (value_end > value_start && (value_end[-1] == ' ' || value_end[-1] == '\t'))
-                value_end--;
+            if (trim_sp_preserve_htab) {
+                if (parsed_header_index >= req.header_count) return false;
+                const Header& parsed_header = req.headers[parsed_header_index];
+                const uintptr_t data_addr = reinterpret_cast<uintptr_t>(data);
+                const uintptr_t data_end = data_addr + len;
+                const uintptr_t name_addr = reinterpret_cast<uintptr_t>(parsed_header.name.ptr);
+                const uintptr_t raw_addr = reinterpret_cast<uintptr_t>(parsed_header.raw_value.ptr);
+                if (parsed_header.name.len != name_len ||
+                    name_addr != reinterpret_cast<uintptr_t>(hs) || raw_addr < data_addr ||
+                    raw_addr > data_end || parsed_header.raw_value.len > data_end - raw_addr ||
+                    parsed_header.raw_value.ptr != reinterpret_cast<const char*>(colon + 1) ||
+                    parsed_header.raw_value.len != static_cast<u32>(le - colon - 1))
+                    return false;
+                value_start = reinterpret_cast<const u8*>(parsed_header.raw_value.ptr);
+                value_end = value_start + parsed_header.raw_value.len;
+                while (value_start < value_end && *value_start == ' ') value_start++;
+                while (value_end > value_start && value_end[-1] == ' ') value_end--;
+            } else {
+                while (value_start < le && (*value_start == ' ' || *value_start == '\t'))
+                    value_start++;
+                while (value_end > value_start && (value_end[-1] == ' ' || value_end[-1] == '\t'))
+                    value_end--;
+            }
             if (!append(hs, name_len) || !append_lit(": ", 2) ||
                 !append(value_start, static_cast<u32>(value_end - value_start)) ||
                 !append_lit("\r\n", 2))
                 return false;
         }
         hs = le + 2;
+        parsed_header_index++;
     }
     if (!append_lit("\r\n", 2)) return false;
     const u32 new_header_len = conn.send_buf.len();
+    if (trim_sp_preserve_htab && measured_id3_length != static_cast<u64>(new_header_len) + body_len)
+        return false;
     const u32 body_start = parser.header_end;
     const u64 request_end64 = static_cast<u64>(body_start) + body_len;
     if (request_end64 > len) return false;
     const u32 request_end = static_cast<u32>(request_end64);
+    if (request_policy_trims_sp_preserves_htab(policy_id) && len != request_end) return false;
     if (!append(data + body_start, body_len) || !append(data + request_end, len - request_end))
         return false;
     if (coalesced_phase1 &&
@@ -5418,6 +5577,7 @@ inline bool apply_request_policy(Connection& conn, const sockaddr_in& endpoint, 
     // send buffer was only materialization scratch; retry snapshots, response
     // mutation snapshots, and pipeline stashes establish their own explicit
     // ownership later and must not inherit these obsolete bytes.
+    scratch_guard.committed = true;
     conn.send_buf.reset();
     return true;
 }
@@ -10296,7 +10456,12 @@ void on_upstream_response(void* lp, Connection& conn, IoEvent ev) {
                 explicit_buffering &&
             (explicit_buffering != ForwardResponseBufferingMode::CompleteContentLength ||
              (complete_content_length_route_method_is_admitted(explicit_route_method) &&
-              complete_content_length_request_policy_is_admitted(conn.request_policy_id) &&
+              (complete_content_length_request_policy_is_admitted(conn.request_policy_id) ||
+               (explicit_profile == ResponseReadDeadlineProfile::BodylessNonHeadContentLengthZero &&
+                explicit_method == static_cast<u8>(LogHttpMethod::Get) &&
+                explicit_route_method == kRouteMethodGet &&
+                conn.request_policy_id ==
+                    static_cast<u16>(RequestPolicyId::Http11FixedTrimSpPreserveHtab))) &&
               explicit_upload.request_policy_id == conn.request_policy_id)) &&
             response_read_timeout_seconds_valid(
                 config->policy_bundles[explicit_bundle_id - 1].response_read_timeout_seconds) &&

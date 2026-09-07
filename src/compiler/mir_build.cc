@@ -52,6 +52,12 @@ static bool response_read_deadline_request_policy_is_admitted_for_term(const Mir
                                                                        const MirTerminator& term) {
     if (response_read_deadline_request_policy_is_admitted(term.forward_request_policy_id))
         return true;
+    if (function.method == kRouteMethodGet &&
+        term.forward_request_policy_id ==
+            static_cast<u16>(RequestPolicyId::Http11FixedTrimSpPreserveHtab) &&
+        term.forward_response_buffering == ForwardResponseBufferingMode::CompleteContentLength &&
+        response_read_timeout_seconds_valid(term.forward_response_read_timeout_seconds))
+        return true;
     return term.forward_response_buffering == ForwardResponseBufferingMode::None &&
            fixed_upload_head_route_method_is_admitted(function.method) &&
            fixed_upload_head_request_policy_is_admitted(term.forward_request_policy_id) &&
@@ -65,6 +71,14 @@ static bool response_read_deadline_request_policy_is_admitted_for_term(const Mir
                module.response_policies[term.forward_response_policy_id - 1],
                module.failure_policies[term.forward_failure_policy_id - 1],
                module.failure_policies[term.forward_timeout_failure_policy_id - 1]);
+}
+
+static bool complete_content_length_request_policy_is_admitted_for_term(const MirFunction& function,
+                                                                        const MirTerminator& term) {
+    return complete_content_length_request_policy_is_admitted(term.forward_request_policy_id) ||
+           (function.method == kRouteMethodGet &&
+            term.forward_request_policy_id ==
+                static_cast<u16>(RequestPolicyId::Http11FixedTrimSpPreserveHtab));
 }
 
 // HIR -> MIR trust boundary. Inspect the fully built MIR rather than trusting
@@ -108,8 +122,8 @@ static bool forward_preflight_metadata_valid(const MirModule& module, const MirF
                !preflight_term->commit_response_mutations &&
                (!complete_buffering ||
                 (complete_content_length_route_method_is_admitted(function.method) &&
-                 complete_content_length_request_policy_is_admitted(
-                     preflight_term->forward_request_policy_id)));
+                 complete_content_length_request_policy_is_admitted_for_term(function,
+                                                                             *preflight_term)));
     }
     if (framing_selection) {
         if (!common || function.method != kRouteMethodHead || function.blocks.len != 3 ||
@@ -226,7 +240,7 @@ static bool forward_preflight_metadata_valid(const MirModule& module, const MirF
         forward.forward_set_headers.len == 0 && !forward.has_forward_target_transform &&
         response_read_timeout_seconds_valid(forward.forward_response_read_timeout_seconds) &&
         forward.forward_response_buffering == ForwardResponseBufferingMode::CompleteContentLength &&
-        complete_content_length_request_policy_is_admitted(forward.forward_request_policy_id) &&
+        complete_content_length_request_policy_is_admitted_for_term(function, forward) &&
         policy_bundle_valid;
     return redirect_valid && forward_valid;
 }

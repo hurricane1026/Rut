@@ -392,7 +392,8 @@ inline bool complete_content_length_explicit_close_request_is_stable(
         !c.req_client_connection_close_exact || c.req_client_connection_count != 1)
         return false;
     if (proof.request_policy_id == 0) return !c.req_keep_alive;
-    return proof.request_policy_id == static_cast<u16>(RequestPolicyId::Http11FixedStrip) &&
+    return bodyless_get_complete_content_length_request_policy_is_admitted(
+               proof.request_policy_id) &&
            c.req_keep_alive;
 }
 
@@ -885,6 +886,32 @@ inline bool response_read_deadline_persistence_owner_is_stable(
     return response_read_deadline_default_persistence_is_stable(c);
 }
 
+// Exact materialized GETs are the ordinary, non-pipelined layout.  Keep this
+// classifier independent of the proof so every admission phase applies the
+// same shape boundary before deciding whether a proof is required.
+inline bool response_read_deadline_exact_get_layout_is_stable(const Connection& c) {
+    return c.pipeline_depth == 0 && c.http1_pipeline_request_generation == 0 &&
+           c.pipeline_stash_len == 0 &&
+           c.response_read_deadline_profile ==
+               ResponseReadDeadlineProfile::BodylessNonHeadContentLengthZero &&
+           c.response_read_deadline_buffering ==
+               ForwardResponseBufferingMode::CompleteContentLength &&
+           c.req_method == static_cast<u8>(LogHttpMethod::Get) &&
+           c.response_read_deadline_method == static_cast<u8>(LogHttpMethod::Get) &&
+           c.response_read_deadline_route_method == kRouteMethodGet;
+}
+
+inline bool response_read_deadline_exact_get_id1_legacy_proof_is_neutral(
+    const Connection& c, const ResponseReadDeadlineUploadProof& proof) {
+    if (!response_read_deadline_exact_get_layout_is_stable(c) ||
+        c.request_policy_id != static_cast<u16>(RequestPolicyId::Http11FixedStrip))
+        return false;
+    ResponseReadDeadlineUploadProof neutral_probe = proof;
+    neutral_probe.request_policy_id = 0;
+    neutral_probe.downstream_close = false;
+    return neutral_probe.owner_is_neutral();
+}
+
 inline bool complete_content_length_request_policy_owner_is_stable(
     const Connection& c, const ResponseReadDeadlineUploadProof& proof) {
     if (response_read_deadline_profile_is_fixed_upload(c.response_read_deadline_profile)) {
@@ -897,6 +924,14 @@ inline bool complete_content_length_request_policy_owner_is_stable(
     }
     if (c.response_read_deadline_buffering != ForwardResponseBufferingMode::CompleteContentLength)
         return true;
+    if (c.response_read_deadline_profile ==
+            ResponseReadDeadlineProfile::BodylessNonHeadContentLengthZero &&
+        c.req_method == static_cast<u8>(LogHttpMethod::Get) &&
+        c.response_read_deadline_route_method == kRouteMethodGet)
+        return (complete_content_length_request_policy_is_admitted(c.request_policy_id) ||
+                c.request_policy_id ==
+                    static_cast<u16>(RequestPolicyId::Http11FixedTrimSpPreserveHtab)) &&
+               proof.request_policy_id == c.request_policy_id;
     return complete_content_length_request_policy_is_admitted(c.request_policy_id) &&
            proof.request_policy_id == c.request_policy_id;
 }
@@ -1163,13 +1198,22 @@ inline bool response_read_deadline_coalesced_get_phase1_proof_is_stable(
     if (identity_method == 0xffu) identity_method = c.response_read_deadline_method;
     if (identity_route_method == 0xffu)
         identity_route_method = c.response_read_deadline_route_method;
+    const bool exact_explicit_close = proof.downstream_close && c.pipeline_depth == 0 &&
+                                      c.http1_pipeline_request_generation == 0 &&
+                                      c.pipeline_stash_len == 0 && c.req_header_end != 0 &&
+                                      c.req_initial_send_len == c.req_header_end &&
+                                      complete_content_length_explicit_close_request_is_stable(
+                                          c, proof, identity_buffering, identity_profile);
     if (cfg == nullptr ||
         identity_profile != ResponseReadDeadlineProfile::BodylessNonHeadContentLengthZero ||
         identity_buffering != ForwardResponseBufferingMode::CompleteContentLength ||
         c.req_method != static_cast<u8>(LogHttpMethod::Get) ||
         identity_method != static_cast<u8>(LogHttpMethod::Get) ||
         identity_route_method != kRouteMethodGet ||
-        c.request_policy_id != static_cast<u16>(RequestPolicyId::Http11FixedStrip) ||
+        !(c.request_policy_id == static_cast<u16>(RequestPolicyId::Http11FixedStrip) ||
+          (c.pipeline_stash_len == 0 &&
+           c.request_policy_id ==
+               static_cast<u16>(RequestPolicyId::Http11FixedTrimSpPreserveHtab))) ||
         proof.request_policy_id != c.request_policy_id || proof.handler_generation == 0 ||
         proof.handler_generation != c.handler_gen || proof.route_index >= cfg->route_count ||
         proof.route_fn == nullptr || proof.raw_header_end == 0 || proof.raw_content_length != 0 ||
@@ -1179,7 +1223,7 @@ inline bool response_read_deadline_coalesced_get_phase1_proof_is_stable(
         proof.upstream_id >= cfg->upstream_count || proof.upstream_id != c.upstream_idx ||
         (require_upload_episode ? !valid_upstream_episode(proof.upload_episode)
                                 : proof.upload_episode != 0) ||
-        proof.downstream_close)
+        (proof.downstream_close && !exact_explicit_close))
         return false;
     const RouteEntry& route = cfg->routes[proof.route_index];
     const UpstreamTarget& target = cfg->upstreams[proof.upstream_id];
@@ -1592,6 +1636,25 @@ inline bool response_read_deadline_owner_is_stable(const Connection& c,
         return false;
     if (!complete_content_length_request_policy_owner_is_stable(c, c.response_read_deadline_upload))
         return false;
+    const bool exact_get = response_read_deadline_exact_get_layout_is_stable(c);
+    const bool id3 =
+        c.request_policy_id == static_cast<u16>(RequestPolicyId::Http11FixedTrimSpPreserveHtab);
+    if (id3 && !exact_get) return false;
+    const bool id1_materialized =
+        exact_get && c.request_policy_id == static_cast<u16>(RequestPolicyId::Http11FixedStrip) &&
+        !response_read_deadline_exact_get_id1_legacy_proof_is_neutral(
+            c, c.response_read_deadline_upload);
+    if ((id3 || id1_materialized) && !response_read_deadline_coalesced_get_phase1_proof_is_stable(
+                                         c,
+                                         c.response_read_deadline_upload,
+                                         /*allow_retired_episode=*/false,
+                                         /*require_upload_episode=*/true,
+                                         c.response_read_deadline_profile,
+                                         c.response_read_deadline_buffering,
+                                         c.response_read_deadline_bundle_id,
+                                         c.response_read_deadline_method,
+                                         c.response_read_deadline_route_method))
+        return false;
     const auto& response = cfg->response_policies[bundle.response_policy_id - 1];
     const auto& failure = cfg->failure_policies[bundle.failure_policy_id - 1];
     const auto& timeout = cfg->failure_policies[bundle.timeout_failure_policy_id - 1];
@@ -1826,18 +1889,26 @@ inline bool bodyless_get_keep_alive_precise_arm_is_stable(
     u16 bundle_id,
     ResponseReadDeadlineOwnerPhase phase,
     Connection::Callback expected_upstream_recv) {
+    // An exact bodyless GET with CompleteContentLength may legally close the
+    // downstream connection after upload.  Keep this exception local to the
+    // precise arm predicate; coalesced/pipelined layouts remain rejected by
+    // the exact-close proof and the existing depth/stash/generation checks.
+    const bool explicit_close = complete_content_length_explicit_close_request_is_stable(
+        c, proof, c.response_read_deadline_buffering, c.response_read_deadline_profile);
     if (config == nullptr || config != c.request_config ||
         c.response_read_deadline_profile !=
             ResponseReadDeadlineProfile::BodylessNonHeadContentLengthZero ||
         c.response_read_deadline_buffering != ForwardResponseBufferingMode::CompleteContentLength ||
         c.response_read_deadline_method != static_cast<u8>(LogHttpMethod::Get) ||
         c.response_read_deadline_route_method != kRouteMethodGet ||
-        c.req_method != c.response_read_deadline_method || proof.downstream_close ||
-        !response_read_deadline_default_persistence_is_stable(c) || c.pipeline_depth != 0 ||
-        c.http1_pipeline_request_generation != 0 || c.pipeline_stash_len != 0 ||
+        c.req_method != c.response_read_deadline_method ||
+        (proof.downstream_close && !explicit_close) ||
+        (!response_read_deadline_default_persistence_is_stable(c) && !explicit_close) ||
+        c.pipeline_depth != 0 || c.http1_pipeline_request_generation != 0 ||
+        c.pipeline_stash_len != 0 ||
         c.response_read_deadline_post_commit_phase != ResponseReadDeadlinePostCommitPhase::None ||
         c.response_mutations_snapshotted || c.retry_req_send_len != 0 ||
-        c.request_policy_id != static_cast<u16>(RequestPolicyId::Http11FixedStrip) ||
+        !bodyless_get_complete_content_length_request_policy_is_admitted(c.request_policy_id) ||
         proof.request_policy_id != c.request_policy_id || proof.handler_generation == 0 ||
         proof.handler_generation != c.handler_gen || proof.route_index >= config->route_count ||
         proof.route_fn == nullptr || proof.upstream_id >= config->upstream_count ||
@@ -2042,14 +2113,38 @@ inline bool response_read_deadline_post_commit_is_stable(const Connection& c) {
         c.upstream_reused || c.upstream_attempts != 1 || !c.request_upload_complete ||
         c.upstream_request_incomplete)
         return false;
+    const bool exact_get = response_read_deadline_exact_get_layout_is_stable(c);
+    const bool id3 =
+        c.request_policy_id == static_cast<u16>(RequestPolicyId::Http11FixedTrimSpPreserveHtab);
+    if (id3 && !exact_get) return false;
     if (c.pipeline_stash_len != 0 && !response_read_deadline_coalesced_get_phase1_stash_is_stable(
                                          c, c.response_read_deadline_upload, retired_buffered_send))
         return false;
     if (!complete_content_length_request_policy_owner_is_stable(c, c.response_read_deadline_upload))
         return false;
+    const bool id1_materialized =
+        exact_get && c.request_policy_id == static_cast<u16>(RequestPolicyId::Http11FixedStrip) &&
+        !response_read_deadline_exact_get_id1_legacy_proof_is_neutral(
+            c, c.response_read_deadline_upload);
+    if ((id3 || id1_materialized) && !response_read_deadline_coalesced_get_phase1_proof_is_stable(
+                                         c,
+                                         c.response_read_deadline_upload,
+                                         retired_buffered_send,
+                                         /*require_upload_episode=*/true,
+                                         c.response_read_deadline_profile,
+                                         c.response_read_deadline_buffering,
+                                         c.response_read_deadline_bundle_id,
+                                         c.response_read_deadline_method,
+                                         c.response_read_deadline_route_method))
+        return false;
     const auto& bundle = cfg->policy_bundles[bundle_id - 1];
     const bool collecting = c.response_read_deadline_post_commit_phase ==
                             ResponseReadDeadlinePostCommitPhase::Buffering;
+    const bool explicit_close =
+        complete_content_length_explicit_close_request_is_stable(c,
+                                                                 c.response_read_deadline_upload,
+                                                                 c.response_read_deadline_buffering,
+                                                                 c.response_read_deadline_profile);
     const bool incomplete_coherent_range_selection =
         complete_buffering && !collecting &&
         c.response_read_deadline_post_commit_response_class ==
@@ -2080,10 +2175,11 @@ inline bool response_read_deadline_post_commit_is_stable(const Connection& c) {
              c.response_read_deadline_route_method != kRouteMethodGet ||
              c.req_method != static_cast<u8>(LogHttpMethod::Get) || c.pipeline_depth != 0 ||
              c.http1_pipeline_request_generation != 0 || c.pipeline_stash_len != 0 ||
-             c.response_read_deadline_upload.downstream_close ||
-             c.request_policy_id != static_cast<u16>(RequestPolicyId::Http11FixedStrip) ||
+             (c.response_read_deadline_upload.downstream_close && !explicit_close) ||
+             !bodyless_get_complete_content_length_request_policy_is_admitted(
+                 c.request_policy_id) ||
              c.response_read_deadline_upload.request_policy_id != c.request_policy_id ||
-             !response_read_deadline_default_persistence_is_stable(c) ||
+             (!response_read_deadline_default_persistence_is_stable(c) && !explicit_close) ||
              (c.response_read_deadline_post_commit_send_body != 0 &&
               c.response_read_deadline_post_commit_send_body !=
                   c.response_read_deadline_post_commit_origin_received)))
@@ -2155,6 +2251,11 @@ inline bool bodyless_get_complete_content_length_precise_buffering_is_stable(con
         c.response_read_deadline_state == ResponseReadDeadlineState::BatchPending ||
         c.response_read_deadline_state == ResponseReadDeadlineState::RefreshPending ||
         c.response_read_deadline_state == ResponseReadDeadlineState::BodyComplete;
+    const bool explicit_close =
+        complete_content_length_explicit_close_request_is_stable(c,
+                                                                 c.response_read_deadline_upload,
+                                                                 c.response_read_deadline_buffering,
+                                                                 c.response_read_deadline_profile);
     return state_admitted &&
            c.response_read_deadline_post_commit_phase ==
                ResponseReadDeadlinePostCommitPhase::Buffering &&
@@ -2166,10 +2267,10 @@ inline bool bodyless_get_complete_content_length_precise_buffering_is_stable(con
            c.response_read_deadline_route_method == kRouteMethodGet &&
            c.req_method == static_cast<u8>(LogHttpMethod::Get) && c.pipeline_depth == 0 &&
            c.http1_pipeline_request_generation == 0 && c.pipeline_stash_len == 0 &&
-           c.request_policy_id == static_cast<u16>(RequestPolicyId::Http11FixedStrip) &&
+           bodyless_get_complete_content_length_request_policy_is_admitted(c.request_policy_id) &&
            c.response_read_deadline_upload.request_policy_id == c.request_policy_id &&
            c.on_upstream_recv == nullptr && c.on_upstream_send == nullptr &&
-           response_read_deadline_default_persistence_is_stable(c) &&
+           (response_read_deadline_default_persistence_is_stable(c) || explicit_close) &&
            response_read_deadline_post_commit_is_stable(c);
 }
 
