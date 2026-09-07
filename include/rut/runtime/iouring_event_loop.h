@@ -3725,9 +3725,8 @@ public:
                 // to the connection-only expiry scan would lose the genuine
                 // -ETIME witness and allow ExpiryPending alone to authorize
                 // publication.
-                const bool coherent206 =
-                    c.response_read_deadline_post_commit_response_class ==
-                    CompleteContentLengthResponseClass::CoherentSingleRange206;
+                const bool coherent206 = c.response_read_deadline_post_commit_response_class ==
+                                         CompleteContentLengthResponseClass::CoherentSingleRange206;
                 return start_complete_content_length_send(
                     c,
                     CompleteContentLengthTerminalDisposition::InactivityExpiry,
