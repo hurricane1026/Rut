@@ -47472,9 +47472,25 @@ TEST(response_buffering_runtime,
             conn.response_read_deadline_post_commit_send_body = 0u;
         }
         CHECK_FALSE(response_read_deadline_post_commit_is_stable(conn));
+        if (expiry) conn.response_read_deadline_post_commit_send_body = 0u;
         const u32 id = conn.id;
         const IoEvent header = exact_response_deadline_send_event(loop, conn);
-        loop->dispatch_batch(&header, 1);
+        if (expiry) {
+            // Consume the real HeaderSend CQE before changing the terminal
+            // selector.  The deferred body pump must still reject a 0↔2
+            // mutation after raw-header consumption, just as it does at
+            // HeaderSend.
+            loop->dispatch(header);
+            REQUIRE_EQ(conn.response_read_deadline_post_commit_phase,
+                       ResponseReadDeadlinePostCommitPhase::WaitingBody);
+            CHECK(response_read_deadline_post_commit_is_stable(conn));
+            conn.response_read_deadline_post_commit_send_body = 2u;
+            CHECK_FALSE(response_read_deadline_post_commit_is_stable(conn));
+            conn.response_read_deadline_post_commit_send_body = 0u;
+            loop->pump_response_read_deadline_bodies();
+        } else {
+            loop->dispatch_batch(&header, 1);
+        }
         CHECK_EQ(loop->conns[id].fd, -1);
         CHECK_EQ(loop->backend.send_state[id].remaining, 0u);
         release_closed_response_read_fixture(fixture);
