@@ -33227,6 +33227,28 @@ TEST(frontend, retained_header_value_trim_sp_preserve_htab_is_get_timeout_only) 
     REQUIRE_EQ(constant.op, rir::Opcode::ConstI32);
     CHECK_EQ(constant.imm.i32_val,
              static_cast<i32>(RequestPolicyId::Http11FixedTrimSpPreserveHtab));
+    const auto bundle = ret->operand(2);
+    REQUIRE_LT(bundle.id, rir.module.functions[0].value_count);
+    const auto& bundle_value = rir.module.functions[0].values[bundle.id];
+    const auto& bundle_constant =
+        rir.module.functions[0].blocks[bundle_value.def_block.id].insts[bundle_value.def_inst];
+    REQUIRE_EQ(bundle_constant.op, rir::Opcode::ConstI32);
+    REQUIRE(bundle_constant.imm.i32_val > 0);
+    REQUIRE_LE(static_cast<u32>(bundle_constant.imm.i32_val), rir.module.policy_bundle_count);
+    CHECK_EQ(bundle_constant.imm.i32_val, 1);
+    const u32 bundle_index = static_cast<u32>(bundle_constant.imm.i32_val - 1);
+    u32 matching_bundle_count = 0;
+    u32 matching_bundle_index = 0;
+    for (u32 i = 0; i < rir.module.policy_bundle_count; ++i) {
+        const auto& candidate = rir.module.policy_bundles[i];
+        if (candidate.response_read_timeout_seconds != 60u ||
+            candidate.response_buffering != ForwardResponseBufferingMode::CompleteContentLength)
+            continue;
+        matching_bundle_index = i;
+        ++matching_bundle_count;
+    }
+    REQUIRE_EQ(matching_bundle_count, 1u);
+    CHECK_EQ(bundle_index, matching_bundle_index);
     rir.destroy();
 
     // The capability requires a valid response timeout; 60s is the public

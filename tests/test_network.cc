@@ -15,6 +15,7 @@
 #include "rut/runtime/upstream_pool.h"
 #include "test.h"
 #include "test_helpers.h"
+#include <iostream>
 #include <memory>
 #include <string>
 #include <type_traits>
@@ -29801,8 +29802,10 @@ bool stage_live_precise_request(
         "GET /one?q=1 HTTP/1.1\r\nHost: 127.0.0.1:9000\r\nX-Test: keep\r\n\r\n";
     static constexpr char kRetainedExpected[] =
         "GET /one?q=1 HTTP/1.1\r\nHost: 127.0.0.1:9000\r\nX-Test: \t keep \t\r\n\r\n";
-    static_assert(sizeof(kLegacyExpected) - 1u == 66u);
-    static_assert(sizeof(kRetainedExpected) - 1u == 70u);
+    // This focused /one fixture is 61B/65B; the public /ledger gate separately
+    // asserts its 66B legacy and 70B retained upstream wires.
+    static_assert(sizeof(kLegacyExpected) - 1u == 61u);
+    static_assert(sizeof(kRetainedExpected) - 1u == 65u);
     const auto saved_proof = conn->response_read_deadline_upload;
     const u32 sent_len = send.remaining;
     const char* expected_wire = request_policy == RequestPolicyId::Http11FixedTrimSpPreserveHtab
