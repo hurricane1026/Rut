@@ -9563,6 +9563,158 @@ TEST(nginx_converter, lowers_parsed_proxy_read_timeout) {
     CHECK_EQ(count_text(output, "content_length_position: \"after_host\""), 1u);
 }
 
+TEST(nginx_converter_issue252,
+     exact_loopback_default_root_get_selects_retained_header_policy_through_rir) {
+    static constexpr const char* const kSources[] = {
+        "server { listen 127.0.0.1:8081; location / { proxy_pass http://127.0.0.1:9001; } }",
+        "server { listen 127.0.0.1:8182; location / { proxy_pass http://127.0.0.1:9102; } }",
+    };
+    const u16 expected_ports[][2] = {{8081u, 9001u}, {8182u, 9102u}};
+
+    for (u32 vector = 0; vector < 2u; vector++) {
+        char nginx_source[256]{};
+        const size_t source_len = strlen(kSources[vector]);
+        REQUIRE_LT(source_len, sizeof(nginx_source));
+        memcpy(nginx_source, kSources[vector], source_len);
+        const auto parsed = nginx::parse({nginx_source, static_cast<u32>(source_len)});
+        REQUIRE(parsed);
+        auto lowered = nginx::lower_to_rut(parsed.value());
+        REQUIRE(lowered);
+        const std::string output(lowered.value().data, lowered.value().len);
+        CHECK_EQ(output.rfind("listen 127.0.0.1:" + std::to_string(expected_ports[vector][0]) +
+                                  "\n",
+                              0u),
+                 0u);
+        CHECK_EQ(count_text(output,
+                            "upstream nginx_upstream at \"127.0.0.1:" +
+                                std::to_string(expected_ports[vector][1]) + "\"\n"),
+                 1u);
+        CHECK_EQ(count_text(output, "if req.hasContentLength"), 1u);
+        CHECK_EQ(count_text(output, "retained_header_value: \"trim_sp_preserve_htab\""), 1u);
+        CHECK_EQ(count_text(output, "content_length_position: \"after_host\""), 0u);
+        CHECK_EQ(count_text(output, "response_read_timeout: 60s"), 2u);
+        CHECK_EQ(count_text(output, "response_buffering: \"complete_content_length\""), 2u);
+        CHECK_LT(lowered.value().len, nginx::RutSource::kCapacity);
+
+        auto lexed = lex(lowered.value().view());
+        REQUIRE(lexed);
+        CHECK_GT(lexed->tokens.len, 0u);
+        auto ast = parse_file(lexed.value());
+        REQUIRE(ast);
+        std::unique_ptr<AstFile> ast_owned(ast.value());
+        REQUIRE_EQ(ast_owned->items.len, 9u);
+        const AstRouteDecl& get_ast = ast_owned->items[7].route;
+        CHECK_EQ(get_ast.method, kRouteMethodGet);
+        REQUIRE_EQ(get_ast.statements.len, 1u);
+        REQUIRE(get_ast.statements[0]->kind == AstStmtKind::If);
+        CHECK(get_ast.statements[0]->then_stmt != nullptr);
+        CHECK(get_ast.statements[0]->else_stmt != nullptr);
+
+        auto hir = analyze_file(*ast_owned);
+        REQUIRE(hir);
+        std::unique_ptr<HirModule> hir_owned(hir.value());
+        REQUIRE_EQ(hir_owned->routes.len, 3u);
+        REQUIRE_EQ(hir_owned->routes[1].method, kRouteMethodGet);
+        const auto& get_hir = hir_owned->routes[1];
+        CHECK_EQ(get_hir.forward_preflight_mode, ForwardPreflightMode::AfterRequestFramingSelection);
+        REQUIRE(get_hir.control.kind == HirControlKind::If);
+        CHECK_EQ(get_hir.control.cond.kind, HirExprKind::ReqHasContentLength);
+        const auto& id1 = get_hir.control.then_term;
+        const auto& id3 = get_hir.control.else_term;
+        CHECK_EQ(id1.kind, HirTerminatorKind::ForwardUpstream);
+        CHECK_EQ(id3.kind, HirTerminatorKind::ForwardUpstream);
+        CHECK_EQ(id1.forward_request_policy_id,
+                 static_cast<u16>(RequestPolicyId::Http11FixedStrip));
+        CHECK_EQ(id3.forward_request_policy_id,
+                 static_cast<u16>(RequestPolicyId::Http11FixedTrimSpPreserveHtab));
+        CHECK_EQ(id1.forward_response_policy_id, id3.forward_response_policy_id);
+        CHECK_EQ(id1.forward_failure_policy_id, id3.forward_failure_policy_id);
+        CHECK_EQ(id1.forward_timeout_failure_policy_id, id3.forward_timeout_failure_policy_id);
+        CHECK_EQ(id1.forward_response_read_timeout_seconds,
+                 id3.forward_response_read_timeout_seconds);
+        CHECK_EQ(id1.forward_response_buffering, ForwardResponseBufferingMode::CompleteContentLength);
+        CHECK_EQ(id3.forward_response_buffering, ForwardResponseBufferingMode::CompleteContentLength);
+
+        auto mir = build_mir(*hir_owned);
+        REQUIRE(mir);
+        std::unique_ptr<MirModule> mir_owned(mir.value());
+        REQUIRE_EQ(mir_owned->functions.len, 3u);
+        REQUIRE_EQ(mir_owned->functions[1].method, kRouteMethodGet);
+        REQUIRE_EQ(mir_owned->functions[1].blocks.len, 3u);
+        CHECK_EQ(mir_owned->functions[1].blocks[0].term.cond.kind,
+                 MirValueKind::ReqHasContentLength);
+        CHECK_EQ(mir_owned->functions[1].blocks[1].term.forward_request_policy_id,
+                 static_cast<u16>(RequestPolicyId::Http11FixedStrip));
+        CHECK_EQ(mir_owned->functions[1].blocks[2].term.forward_request_policy_id,
+                 static_cast<u16>(RequestPolicyId::Http11FixedTrimSpPreserveHtab));
+        CHECK_EQ(mir_owned->functions[1].blocks[1].term.forward_response_buffering,
+                 ForwardResponseBufferingMode::CompleteContentLength);
+        CHECK_EQ(mir_owned->functions[1].blocks[2].term.forward_response_buffering,
+                 ForwardResponseBufferingMode::CompleteContentLength);
+
+        FrontendRirModule rir{};
+        RirGuard rir_guard{rir};
+        REQUIRE(lower_to_rir(*mir_owned, rir));
+        REQUIRE(rir::verify_module(rir.module).ok);
+        REQUIRE_EQ(rir.module.func_count, 3u);
+        const auto& get_function = rir.module.functions[1];
+        REQUIRE_EQ(get_function.block_count, 3u);
+        CHECK_EQ(get_function.blocks[0].insts[0].op, rir::Opcode::ReqHasContentLength);
+        i32 branch_policy[2] = {-1, -1};
+        i32 branch_bundle[2] = {-1, -1};
+        for (u32 branch = 0; branch < 2u; branch++) {
+            const auto& block = get_function.blocks[branch + 1u];
+            REQUIRE_EQ(block.insts[block.inst_count - 1u].op, rir::Opcode::RetForwardBundle);
+            const auto& ret = block.insts[block.inst_count - 1u];
+            REQUIRE_EQ(ret.operand_count, 3u);
+            REQUIRE(find_const_i32(get_function, ret.operand(1), branch_policy[branch]));
+            REQUIRE(find_const_i32(get_function, ret.operand(2), branch_bundle[branch]));
+        }
+        CHECK_EQ(branch_policy[0], static_cast<i32>(RequestPolicyId::Http11FixedStrip));
+        CHECK_EQ(branch_policy[1],
+                 static_cast<i32>(RequestPolicyId::Http11FixedTrimSpPreserveHtab));
+        CHECK_EQ(branch_bundle[0], branch_bundle[1]);
+        REQUIRE_GT(branch_bundle[0], 0);
+        REQUIRE_LE(static_cast<u32>(branch_bundle[0]), rir.module.policy_bundle_count);
+        const auto& bundle = rir.module.policy_bundles[branch_bundle[0] - 1];
+        CHECK_EQ(bundle.response_read_timeout_seconds, 60u);
+        CHECK_EQ(bundle.response_buffering, ForwardResponseBufferingMode::CompleteContentLength);
+
+        auto populated = std::make_unique<RouteConfig>();
+        REQUIRE(populate_route_config(*populated, rir.module));
+        CHECK_EQ(populated->policy_bundle_count, 1u);
+        CHECK_EQ(populated->policy_bundles[0].response_read_timeout_seconds, 60u);
+        CHECK_EQ(populated->policy_bundles[0].response_buffering,
+                 ForwardResponseBufferingMode::CompleteContentLength);
+        memset(nginx_source, 'x', source_len);
+        memset(lowered.value().data, 'y', lowered.value().len);
+        CHECK(populated->strict_local_response_table_is_valid());
+    }
+
+    static constexpr char kWildcard[] =
+        "server { listen 8081; location / { proxy_pass http://127.0.0.1:9001; } }";
+    const auto wildcard = nginx::parse({kWildcard, sizeof(kWildcard) - 1u});
+    REQUIRE(wildcard);
+    const auto wildcard_lowered = nginx::lower_to_rut(wildcard.value());
+    REQUIRE(wildcard_lowered);
+    const std::string wildcard_output(wildcard_lowered.value().data, wildcard_lowered.value().len);
+    CHECK_EQ(count_text(wildcard_output, "if req.hasContentLength"), 0u);
+    CHECK_EQ(count_text(wildcard_output, "retained_header_value: \"trim_sp_preserve_htab\""),
+             0u);
+
+    static constexpr char kTimeout[] =
+        "server { listen 127.0.0.1:8081; location / { proxy_read_timeout 1s; "
+        "proxy_pass http://127.0.0.1:9001; } }";
+    const auto timeout = nginx::parse({kTimeout, sizeof(kTimeout) - 1u});
+    REQUIRE(timeout);
+    const auto timeout_lowered = nginx::lower_to_rut(timeout.value());
+    REQUIRE(timeout_lowered);
+    const std::string timeout_output(timeout_lowered.value().data, timeout_lowered.value().len);
+    CHECK_EQ(count_text(timeout_output, "retained_header_value: \"trim_sp_preserve_htab\""),
+             0u);
+    CHECK_EQ(count_text(timeout_output, "content_length_position: \"after_host\""), 1u);
+}
+
 TEST(nginx_converter_issue468,
      timeout_root_head_selects_after_host_policy_by_runtime_content_length) {
     static constexpr char kSource[] =
@@ -16982,10 +17134,6 @@ TEST(nginx_converter, exact_loopback_listen_has_bounded_ordinary_rut_golden_and_
     REQUIRE_EQ(generated[0], generated[1]);
     REQUIRE_EQ(generated[2], generated[3]);
     REQUIRE_NE(generated[0], generated[2]);
-    std::string expected_exact = generated[2];
-    REQUIRE_EQ(expected_exact.rfind("listen :8080\n", 0u), 0u);
-    expected_exact.replace(0u, strlen("listen :8080"), "listen 127.0.0.1:8080");
-    REQUIRE_EQ(generated[0], expected_exact);
     const std::string& canonical = generated[0];
 
     const auto listener_inventory_is_canonical = [](const std::string& candidate) {
@@ -17036,6 +17184,9 @@ TEST(nginx_converter, exact_loopback_listen_has_bounded_ordinary_rut_golden_and_
     REQUIRE(route_inventory_is_canonical(canonical));
     REQUIRE(has_no_nginx_hook_or_address_workaround(canonical));
     REQUIRE(source_is_canonical(canonical));
+    REQUIRE_EQ(count_text(canonical, "if req.hasContentLength"), 1u);
+    REQUIRE_EQ(count_text(canonical, "retained_header_value: \"trim_sp_preserve_htab\""), 1u);
+    REQUIRE_EQ(count_text(canonical, "content_length_position: \"after_host\""), 0u);
 
     std::string wrong_listener = canonical;
     REQUIRE_EQ(count_text(wrong_listener, "listen 127.0.0.1:8080\n"), 1u);
