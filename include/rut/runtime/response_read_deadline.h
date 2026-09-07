@@ -2073,10 +2073,7 @@ inline bool response_read_deadline_post_commit_is_stable(const Connection& c) {
                   c.response_read_deadline_post_commit_declared_body)))
             return false;
         if (incomplete_coherent_range_selection &&
-            (c.response_read_deadline_post_commit_send_body == 0 ||
-             c.response_read_deadline_post_commit_send_body !=
-                 c.response_read_deadline_post_commit_origin_received ||
-             !c.response_read_deadline_post_commit_close_after_drain ||
+            (!c.response_read_deadline_post_commit_close_after_drain ||
              c.response_read_deadline_profile !=
                  ResponseReadDeadlineProfile::BodylessNonHeadContentLengthZero ||
              c.response_read_deadline_method != static_cast<u8>(LogHttpMethod::Get) ||
@@ -2086,11 +2083,44 @@ inline bool response_read_deadline_post_commit_is_stable(const Connection& c) {
              c.response_read_deadline_upload.downstream_close ||
              c.request_policy_id != static_cast<u16>(RequestPolicyId::Http11FixedStrip) ||
              c.response_read_deadline_upload.request_policy_id != c.request_policy_id ||
-             !response_read_deadline_default_persistence_is_stable(c)))
+             !response_read_deadline_default_persistence_is_stable(c) ||
+             (c.response_read_deadline_post_commit_send_body != 0 &&
+              c.response_read_deadline_post_commit_send_body !=
+                  c.response_read_deadline_post_commit_origin_received)))
             return false;
     } else if (c.response_read_deadline_post_commit_send_body != 0 ||
                c.response_read_deadline_post_commit_close_after_drain) {
         return false;
+    }
+    // The selected body length is independent framing/accounting state.  In
+    // particular, a coherent incomplete 206 may select either its retained
+    // positive prefix (clean EOF) or zero (authenticated inactivity expiry),
+    // but the body pump must never be able to change one into the other by
+    // mutating only the terminal selector.  Keep these checks active after
+    // raw-header consumption as well as at HeaderSend.
+    if (!collecting) {
+        const u32 selected = c.response_read_deadline_post_commit_send_body;
+        const u32 submitted = c.response_read_deadline_post_commit_downstream_submitted;
+        const u32 completed = c.response_read_deadline_post_commit_downstream_completed;
+        const u32 inflight = c.response_read_deadline_post_commit_inflight_body;
+        const u32 header_len = c.response_header_buf.len();
+        if (submitted > selected || completed > submitted || inflight > submitted - completed ||
+            selected > c.response_read_deadline_post_commit_origin_received ||
+            c.resp_body_mode != BodyMode::ContentLength || c.resp_body_sent < header_len ||
+            c.resp_body_sent - header_len != submitted ||
+            c.resp_body_remaining != selected - submitted)
+            return false;
+        if (selected == 0) {
+            if (c.response_read_deadline_post_commit_response_class !=
+                    CompleteContentLengthResponseClass::CoherentSingleRange206 ||
+                c.response_read_deadline_post_commit_origin_received == 0 ||
+                c.response_read_deadline_post_commit_origin_received >=
+                    c.response_read_deadline_post_commit_declared_body ||
+                !c.response_read_deadline_post_commit_close_after_drain || submitted != 0 ||
+                completed != 0 || inflight != 0 || c.resp_body_sent != header_len ||
+                c.resp_body_remaining != 0)
+                return false;
+        }
     }
     if (complete_buffering &&
         (!cfg->response_policy_id_is_valid(bundle.response_policy_id) ||

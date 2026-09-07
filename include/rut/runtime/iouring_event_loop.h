@@ -3456,10 +3456,52 @@ public:
                owner.expected_copy_end == header + received;
     }
 
+    [[nodiscard]] bool complete_content_length_expiry_owner_is_valid(
+        const Connection& c, const ResponseReadBatchOwner& owner) const {
+        bool current_batch_member = false;
+        if (response_read_batch_events != nullptr && response_read_batch_event_count != 0 &&
+            response_read_batch_event_count <= kMaxEventsPerWait &&
+            response_read_batch_owner_count != 0 &&
+            response_read_batch_owner_count <= kMaxEventsPerWait) {
+            for (u32 i = 0; i < response_read_batch_owner_count; ++i)
+                current_batch_member =
+                    current_batch_member || &response_read_batch_owners[i] == &owner;
+        }
+        if (!current_batch_member || !owner.valid || !owner.saw_precise_timer ||
+            !owner.precise_timer_valid || !owner.precise_timer_semantic ||
+            !owner.precise_timer_target_seen || owner.precise_timer_cancel_seen ||
+            owner.conn_id != c.id || owner.deadline_generation == 0 ||
+            owner.deadline_generation != c.response_read_deadline_generation ||
+            owner.upstream_episode != c.upstream_episode ||
+            owner.profile != c.response_read_deadline_profile ||
+            owner.method != c.response_read_deadline_method || owner.clean_eof ||
+            owner.terminal_error || !c.response_read_timer_owner_is_neutral() ||
+            c.response_read_timer_generation != owner.precise_timer_generation ||
+            !response_read_deadline_uses_precise_timer(c))
+            return false;
+
+        bool saw_due_target = false;
+        for (u32 ei = 0; ei < response_read_batch_event_count; ++ei) {
+            const IoEvent& timer_ev = response_read_batch_events[ei];
+            if (timer_ev.type != IoEventType::ResponseReadTimer ||
+                timer_ev.conn_id != owner.conn_id)
+                continue;
+            const u32 generation =
+                timer_ev.non_upstream_generation & kResponseReadTimerGenerationMask;
+            if ((timer_ev.non_upstream_generation & kResponseReadTimerCancelBit) != 0 ||
+                !valid_response_read_timer_transport_event(timer_ev) ||
+                generation != owner.precise_timer_generation || timer_ev.result != -ETIME)
+                continue;
+            if (saw_due_target) return false;
+            saw_due_target = true;
+        }
+        return saw_due_target;
+    }
+
     [[nodiscard]] bool start_complete_content_length_send(
         Connection& c,
         CompleteContentLengthTerminalDisposition disposition,
-        const ResponseReadBatchOwner* clean_eof_owner = nullptr) {
+        const ResponseReadBatchOwner* terminal_owner = nullptr) {
         if (c.response_read_deadline_buffering !=
                 ForwardResponseBufferingMode::CompleteContentLength ||
             c.response_read_deadline_post_commit_phase !=
@@ -3476,23 +3518,24 @@ public:
         bool close_after_drain = true;
         switch (disposition) {
             case CompleteContentLengthTerminalDisposition::CompleteBody:
-                if (clean_eof_owner != nullptr || received != declared) return false;
+                if (terminal_owner != nullptr || received != declared) return false;
                 body_to_send = declared;
                 close_after_drain = c.response_read_deadline_upload.downstream_close;
                 break;
             case CompleteContentLengthTerminalDisposition::CleanUpstreamEof:
-                if (clean_eof_owner == nullptr || received >= declared ||
+                if (terminal_owner == nullptr || received >= declared ||
                     (received == 0 &&
                      c.response_read_deadline_post_commit_response_class ==
                          CompleteContentLengthResponseClass::CoherentSingleRange206) ||
-                    !complete_content_length_clean_eof_owner_is_valid(c, *clean_eof_owner))
+                    !complete_content_length_clean_eof_owner_is_valid(c, *terminal_owner))
                     return false;
                 body_to_send = received;
                 break;
             case CompleteContentLengthTerminalDisposition::InactivityExpiry:
-                if (clean_eof_owner != nullptr || received >= declared ||
-                    c.response_read_deadline_post_commit_response_class ==
-                        CompleteContentLengthResponseClass::CoherentSingleRange206)
+                if (terminal_owner == nullptr || received == 0 || received >= declared ||
+                    c.response_read_deadline_post_commit_response_class !=
+                        CompleteContentLengthResponseClass::CoherentSingleRange206 ||
+                    !complete_content_length_expiry_owner_is_valid(c, *terminal_owner))
                     return false;
                 break;
             default:
@@ -3673,8 +3716,13 @@ public:
             if (response_read_timer_remaining_ms(
                     c.response_read_timer_last_progress_ns, timeout_ns, now_ns) == 0) {
                 c.response_read_deadline_state = ResponseReadDeadlineState::ExpiryPending;
-                response_read_deadline_expiry_pending = true;
-                return true;
+                // Keep the authenticated active-batch owner in scope while
+                // selecting the generic expiry disposition.  Deferring this
+                // to the connection-only expiry scan would lose the genuine
+                // -ETIME witness and allow ExpiryPending alone to authorize
+                // publication.
+                return start_complete_content_length_send(
+                    c, CompleteContentLengthTerminalDisposition::InactivityExpiry, &owner);
             }
             if (!rearm_precise_response_read_timer(c, now_ns)) return false;
         }
