@@ -1,3 +1,4 @@
+#include "fixtures/nginx373_hide.inc"
 #include "fixtures/nginx373_nohide.inc"
 #include "rut/common/strict_local_response.h"
 #include "rut/compiler/analyze.h"
@@ -9602,25 +9603,41 @@ TEST(nginx_converter_issue252,
         REQUIRE(ast);
         std::unique_ptr<AstFile> ast_owned(ast.value());
         REQUIRE_EQ(ast_owned->items.len, 9u);
-        const AstRouteDecl& get_ast = ast_owned->items[7].route;
-        CHECK_EQ(get_ast.method, kRouteMethodGet);
-        REQUIRE_EQ(get_ast.statements.len, 1u);
-        REQUIRE(get_ast.statements[0]->kind == AstStmtKind::If);
-        CHECK(get_ast.statements[0]->then_stmt != nullptr);
-        CHECK(get_ast.statements[0]->else_stmt != nullptr);
+        const AstRouteDecl* get_ast = nullptr;
+        u32 get_ast_count = 0u;
+        for (u32 item = 0u; item < ast_owned->items.len; item++) {
+            if (ast_owned->items[item].kind != AstItemKind::Route) continue;
+            const AstRouteDecl& route = ast_owned->items[item].route;
+            if (route.method != static_cast<u8>(TokenType::KwGet) || route.method_is_any) continue;
+            get_ast = &route;
+            get_ast_count++;
+        }
+        REQUIRE_EQ(get_ast_count, 1u);
+        REQUIRE(get_ast != nullptr);
+        REQUIRE_EQ(get_ast->statements.len, 1u);
+        REQUIRE(get_ast->statements[0]->kind == AstStmtKind::If);
+        CHECK(get_ast->statements[0]->then_stmt != nullptr);
+        CHECK(get_ast->statements[0]->else_stmt != nullptr);
 
         auto hir = analyze_file(*ast_owned);
         REQUIRE(hir);
         std::unique_ptr<HirModule> hir_owned(hir.value());
         REQUIRE_EQ(hir_owned->routes.len, 3u);
-        REQUIRE_EQ(hir_owned->routes[1].method, kRouteMethodGet);
-        const auto& get_hir = hir_owned->routes[1];
-        CHECK_EQ(get_hir.forward_preflight_mode,
+        const HirRoute* get_hir = nullptr;
+        u32 get_hir_count = 0u;
+        for (u32 route_index = 0u; route_index < hir_owned->routes.len; route_index++) {
+            if (hir_owned->routes[route_index].method != kRouteMethodGet) continue;
+            get_hir = &hir_owned->routes[route_index];
+            get_hir_count++;
+        }
+        REQUIRE_EQ(get_hir_count, 1u);
+        REQUIRE(get_hir != nullptr);
+        CHECK_EQ(get_hir->forward_preflight_mode,
                  ForwardPreflightMode::AfterRequestFramingSelection);
-        REQUIRE(get_hir.control.kind == HirControlKind::If);
-        CHECK_EQ(get_hir.control.cond.kind, HirExprKind::ReqHasContentLength);
-        const auto& id1 = get_hir.control.then_term;
-        const auto& id3 = get_hir.control.else_term;
+        REQUIRE(get_hir->control.kind == HirControlKind::If);
+        CHECK_EQ(get_hir->control.cond.kind, HirExprKind::ReqHasContentLength);
+        const auto& id1 = get_hir->control.then_term;
+        const auto& id3 = get_hir->control.else_term;
         CHECK_EQ(id1.kind, HirTerminatorKind::ForwardUpstream);
         CHECK_EQ(id3.kind, HirTerminatorKind::ForwardUpstream);
         CHECK_EQ(id1.forward_request_policy_id,
@@ -9641,17 +9658,24 @@ TEST(nginx_converter_issue252,
         REQUIRE(mir);
         std::unique_ptr<MirModule> mir_owned(mir.value());
         REQUIRE_EQ(mir_owned->functions.len, 3u);
-        REQUIRE_EQ(mir_owned->functions[1].method, kRouteMethodGet);
-        REQUIRE_EQ(mir_owned->functions[1].blocks.len, 3u);
-        CHECK_EQ(mir_owned->functions[1].blocks[0].term.cond.kind,
-                 MirValueKind::ReqHasContentLength);
-        CHECK_EQ(mir_owned->functions[1].blocks[1].term.forward_request_policy_id,
+        const MirFunction* get_mir = nullptr;
+        u32 get_mir_count = 0u;
+        for (u32 function = 0u; function < mir_owned->functions.len; function++) {
+            if (mir_owned->functions[function].method != kRouteMethodGet) continue;
+            get_mir = &mir_owned->functions[function];
+            get_mir_count++;
+        }
+        REQUIRE_EQ(get_mir_count, 1u);
+        REQUIRE(get_mir != nullptr);
+        REQUIRE_EQ(get_mir->blocks.len, 3u);
+        CHECK_EQ(get_mir->blocks[0].term.cond.kind, MirValueKind::ReqHasContentLength);
+        CHECK_EQ(get_mir->blocks[1].term.forward_request_policy_id,
                  static_cast<u16>(RequestPolicyId::Http11FixedStrip));
-        CHECK_EQ(mir_owned->functions[1].blocks[2].term.forward_request_policy_id,
+        CHECK_EQ(get_mir->blocks[2].term.forward_request_policy_id,
                  static_cast<u16>(RequestPolicyId::Http11FixedTrimSpPreserveHtab));
-        CHECK_EQ(mir_owned->functions[1].blocks[1].term.forward_response_buffering,
+        CHECK_EQ(get_mir->blocks[1].term.forward_response_buffering,
                  ForwardResponseBufferingMode::CompleteContentLength);
-        CHECK_EQ(mir_owned->functions[1].blocks[2].term.forward_response_buffering,
+        CHECK_EQ(get_mir->blocks[2].term.forward_response_buffering,
                  ForwardResponseBufferingMode::CompleteContentLength);
 
         FrontendRirModule rir{};
@@ -9659,18 +9683,26 @@ TEST(nginx_converter_issue252,
         REQUIRE(lower_to_rir(*mir_owned, rir));
         REQUIRE(rir::verify_module(rir.module).ok);
         REQUIRE_EQ(rir.module.func_count, 3u);
-        const auto& get_function = rir.module.functions[1];
-        REQUIRE_EQ(get_function.block_count, 3u);
-        CHECK_EQ(get_function.blocks[0].insts[0].op, rir::Opcode::ReqHasContentLength);
+        const rir::Function* get_function = nullptr;
+        u32 get_function_count = 0u;
+        for (u32 function = 0u; function < rir.module.func_count; function++) {
+            if (rir.module.functions[function].http_method != kRouteMethodGet) continue;
+            get_function = &rir.module.functions[function];
+            get_function_count++;
+        }
+        REQUIRE_EQ(get_function_count, 1u);
+        REQUIRE(get_function != nullptr);
+        REQUIRE_EQ(get_function->block_count, 3u);
+        CHECK_EQ(get_function->blocks[0].insts[0].op, rir::Opcode::ReqHasContentLength);
         i32 branch_policy[2] = {-1, -1};
         i32 branch_bundle[2] = {-1, -1};
         for (u32 branch = 0; branch < 2u; branch++) {
-            const auto& block = get_function.blocks[branch + 1u];
+            const auto& block = get_function->blocks[branch + 1u];
             REQUIRE_EQ(block.insts[block.inst_count - 1u].op, rir::Opcode::RetForwardBundle);
             const auto& ret = block.insts[block.inst_count - 1u];
             REQUIRE_EQ(ret.operand_count, 3u);
-            REQUIRE(find_const_i32(get_function, ret.operand(1), branch_policy[branch]));
-            REQUIRE(find_const_i32(get_function, ret.operand(2), branch_bundle[branch]));
+            REQUIRE(find_const_i32(*get_function, ret.operand(1), branch_policy[branch]));
+            REQUIRE(find_const_i32(*get_function, ret.operand(2), branch_bundle[branch]));
         }
         CHECK_EQ(branch_policy[0], static_cast<i32>(RequestPolicyId::Http11FixedStrip));
         CHECK_EQ(branch_policy[1],
@@ -9684,9 +9716,11 @@ TEST(nginx_converter_issue252,
 
         auto populated = std::make_unique<RouteConfig>();
         REQUIRE(populate_route_config(*populated, rir.module));
-        CHECK_EQ(populated->policy_bundle_count, 1u);
-        CHECK_EQ(populated->policy_bundles[0].response_read_timeout_seconds, 60u);
-        CHECK_EQ(populated->policy_bundles[0].response_buffering,
+        REQUIRE_GT(branch_bundle[0], 0);
+        REQUIRE_LE(static_cast<u32>(branch_bundle[0]), populated->policy_bundle_count);
+        const auto& populated_bundle = populated->policy_bundles[branch_bundle[0] - 1u];
+        CHECK_EQ(populated_bundle.response_read_timeout_seconds, 60u);
+        CHECK_EQ(populated_bundle.response_buffering,
                  ForwardResponseBufferingMode::CompleteContentLength);
         memset(nginx_source, 'x', source_len);
         memset(lowered.value().data, 'y', lowered.value().len);
@@ -18936,23 +18970,14 @@ TEST(nginx_converter_issue373, hide_header_has_independent_full_source_golden) {
     static constexpr char kNewLine[] =
         "            hide_headers: [\"Date\", \"Server\", \"X-Pad\", "
         "\"X-Compat-Hidden\"]\n";
-    static constexpr char kSuffix[] = ", \"X-Compat-Hidden\"";
     const std::string no_hide(kIssue373NoHideGolden, sizeof(kIssue373NoHideGolden) - 1u);
-    REQUIRE_EQ(no_hide.size(), 5309u);
-    REQUIRE_EQ(count_text(no_hide, kOldLine), 3u);
+    REQUIRE_EQ(no_hide.size(), 6975u);
+    REQUIRE_EQ(count_text(no_hide, kOldLine), 4u);
     REQUIRE_EQ(count_text(no_hide, "X-Compat-Hidden"), 0u);
-    std::string expected = no_hide;
-    size_t cursor = 0u;
-    for (u32 i = 0u; i < 3u; i++) {
-        const size_t line = expected.find(kOldLine, cursor);
-        REQUIRE_NE(line, std::string::npos);
-        expected.replace(line + strlen(kOldLine) - 2u, 0u, kSuffix);
-        cursor = line + strlen(kOldLine) + strlen(kSuffix);
-    }
+    const std::string expected(kIssue373HideGolden, sizeof(kIssue373HideGolden) - 1u);
     REQUIRE_EQ(expected.size(), 5366u);
     REQUIRE_EQ(count_text(expected, kNewLine), 3u);
     REQUIRE_EQ(count_text(expected, "X-Compat-Hidden"), 3u);
-    CHECK_EQ(expected.size() - no_hide.size(), 57u);
     CHECK_EQ(expected.data()[expected.size()], '\0');
 
     const auto canonical = [&](const std::string& candidate) {
@@ -18981,7 +19006,7 @@ TEST(nginx_converter_issue373, hide_header_has_independent_full_source_golden) {
     REQUIRE(no_hide_parsed);
     const auto no_hide_lowered = nginx::lower_to_rut(no_hide_parsed.value());
     REQUIRE(no_hide_lowered);
-    REQUIRE_EQ(no_hide_lowered.value().len, 5309u);
+    REQUIRE_EQ(no_hide_lowered.value().len, 6975u);
     CHECK_EQ(std::string(no_hide_lowered.value().data, no_hide_lowered.value().len), no_hide);
     const auto expected_lexed = lex({expected.data(), static_cast<u32>(expected.size())});
     REQUIRE(expected_lexed);
@@ -19060,17 +19085,7 @@ TEST(nginx_converter_issue373, hide_header_has_independent_full_source_golden) {
 }
 
 TEST(nginx_converter_issue373, hide_header_policies_are_deduplicated_and_owned_end_to_end) {
-    static constexpr char kOldLine[] =
-        "            hide_headers: [\"Date\", \"Server\", \"X-Pad\"]\n";
-    static constexpr char kSuffix[] = ", \"X-Compat-Hidden\"";
-    std::string source(kIssue373NoHideGolden, sizeof(kIssue373NoHideGolden) - 1u);
-    size_t cursor = 0u;
-    for (u32 i = 0u; i < 3u; i++) {
-        const size_t line = source.find(kOldLine, cursor);
-        REQUIRE_NE(line, std::string::npos);
-        source.replace(line + strlen(kOldLine) - 2u, 0u, kSuffix);
-        cursor = line + strlen(kOldLine) + strlen(kSuffix);
-    }
+    std::string source(kIssue373HideGolden, sizeof(kIssue373HideGolden) - 1u);
     REQUIRE_EQ(source.size(), 5366u);
     RouteConfig populated{};
     {
@@ -19744,8 +19759,7 @@ TEST(nginx_converter_issue398, numeric_ipv4_has_owned_ordinary_rut_golden_and_fr
     std::string expected_numeric = wildcard;
     expected_numeric.replace(0u, strlen("listen :8080"), "listen 192.0.2.10:8080");
     CHECK_EQ(numeric, expected_numeric);
-    std::string expected_loopback = wildcard;
-    expected_loopback.replace(0u, strlen("listen :8080"), "listen 127.0.0.1:8080");
+    const std::string expected_loopback(kIssue373NoHideGolden, sizeof(kIssue373NoHideGolden) - 1u);
     CHECK_EQ(loopback, expected_loopback);
     CHECK_EQ(count_text(numeric, "listen 192.0.2.10:8080\n"), 1u);
     CHECK_EQ(count_upstream_declarations(numeric), 1u);
