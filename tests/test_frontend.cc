@@ -33216,8 +33216,11 @@ TEST(frontend, retained_header_value_trim_sp_preserve_htab_is_get_timeout_only) 
     REQUIRE(rir::verify_module(rir.module).ok);
     REQUIRE_EQ(rir.module.policy_bundle_count, 1u);
     CHECK_EQ(rir.module.policy_bundles[0].response_read_timeout_seconds, 60u);
-    const auto* ret = find_first_op(rir.module.functions[0], rir::Opcode::RetForward);
+    CHECK_EQ(rir.module.policy_bundles[0].response_buffering,
+             ForwardResponseBufferingMode::CompleteContentLength);
+    const auto* ret = find_first_op(rir.module.functions[0], rir::Opcode::RetForwardBundle);
     REQUIRE(ret != nullptr);
+    REQUIRE_EQ(ret->operand_count, 3u);
     const auto policy = ret->operand(1);
     const auto& value = rir.module.functions[0].values[policy.id];
     auto& constant = rir.module.functions[0].blocks[value.def_block.id].insts[value.def_inst];
