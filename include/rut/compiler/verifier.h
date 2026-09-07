@@ -1219,15 +1219,17 @@ inline VerifyResult verify_module_impl(const Module& mod,
                     return verify_fail(
                         summary, VerifyIssueCode::InvalidForwardPreflight, fi, bi, ii);
                 const auto buffering = policy_bundle.response_buffering;
+                const bool complete_policy =
+                    complete_content_length_request_policy_is_admitted(
+                        static_cast<u16>(request_policy)) ||
+                    (fn.http_method == kRouteMethodGet &&
+                     static_cast<u16>(request_policy) ==
+                         static_cast<u16>(RequestPolicyId::Http11FixedTrimSpPreserveHtab));
                 if (buffering != ForwardResponseBufferingMode::None &&
                     (buffering != ForwardResponseBufferingMode::CompleteContentLength ||
                      !complete_content_length_route_method_is_admitted(fn.http_method) ||
                      request_policy < 0 || request_policy > 0xffff ||
-                     !(complete_content_length_request_policy_is_admitted(
-                           static_cast<u16>(request_policy)) ||
-                       (fn.http_method == kRouteMethodGet &&
-                        static_cast<u16>(request_policy) ==
-                            static_cast<u16>(RequestPolicyId::Http11FixedTrimSpPreserveHtab))))
+                     !complete_policy))
                     return verify_fail(
                         summary, VerifyIssueCode::InvalidForwardPreflight, fi, bi, ii);
                 if (!has_preflight || bundle_id != preflight_id ||

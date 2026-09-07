@@ -392,7 +392,8 @@ inline bool complete_content_length_explicit_close_request_is_stable(
         !c.req_client_connection_close_exact || c.req_client_connection_count != 1)
         return false;
     if (proof.request_policy_id == 0) return !c.req_keep_alive;
-    return proof.request_policy_id == static_cast<u16>(RequestPolicyId::Http11FixedStrip) &&
+    return bodyless_get_complete_content_length_request_policy_is_admitted(
+               proof.request_policy_id) &&
            c.req_keep_alive;
 }
 

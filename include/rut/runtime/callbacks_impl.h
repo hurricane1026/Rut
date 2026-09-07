@@ -1237,7 +1237,8 @@ bool prepare_response_read_deadline_preflight_for_mode(Loop* loop,
             conn.req_method == static_cast<u8>(LogHttpMethod::Get) &&
             route->method == kRouteMethodGet && !conn.req_client_has_content_length &&
             conn.req_client_content_length_count == 0 &&
-            response_read_deadline_default_persistence_is_stable(conn) &&
+            (response_read_deadline_default_persistence_is_stable(conn) ||
+             preflight_downstream_close) &&
             conn.pipeline_depth == 0 && conn.http1_pipeline_request_generation == 0 &&
             conn.recv_buf.len() == conn.req_initial_send_len;
         const bool pipeline_generation_stable =
@@ -3581,7 +3582,12 @@ void handle_jit_outcome(Loop* loop,
                     conn.response_read_deadline_route_method == kRouteMethodGet &&
                     !conn.req_client_has_content_length &&
                     conn.req_client_content_length_count == 0 &&
-                    response_read_deadline_default_persistence_is_stable(conn) &&
+                    (response_read_deadline_default_persistence_is_stable(conn) ||
+                     complete_content_length_explicit_close_request_is_stable(
+                         conn,
+                         deadline_proof,
+                         forward_response_buffering,
+                         outcome_profile)) &&
                     conn.pipeline_depth == 0 && conn.http1_pipeline_request_generation == 0 &&
                     conn.recv_buf.len() == conn.req_initial_send_len &&
                     bodyless_get_complete_content_length_request_policy_is_admitted(
@@ -5299,6 +5305,7 @@ inline bool apply_request_policy(Connection& conn, const sockaddr_in& endpoint, 
         (conn.response_read_deadline_profile !=
              ResponseReadDeadlineProfile::BodylessNonHeadContentLengthZero ||
          conn.response_read_deadline_buffering != ForwardResponseBufferingMode::CompleteContentLength ||
+         !response_read_timeout_seconds_valid(conn.response_read_deadline_seconds) ||
          conn.req_method != static_cast<u8>(LogHttpMethod::Get) ||
          conn.response_read_deadline_route_method != kRouteMethodGet ||
          conn.pipeline_depth != 0 || conn.pipeline_stash_len != 0))

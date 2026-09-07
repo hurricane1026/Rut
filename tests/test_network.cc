@@ -3031,6 +3031,8 @@ TEST(request_policy, content_length_after_host_exact_wire_and_fail_closed_bounda
     static constexpr u16 kLegacy = static_cast<u16>(RequestPolicyId::Http11FixedStrip);
     static constexpr u16 kAfterHost =
         static_cast<u16>(RequestPolicyId::Http11FixedStripContentLengthAfterHost);
+    static constexpr u16 kRetained =
+        static_cast<u16>(RequestPolicyId::Http11FixedTrimSpPreserveHtab);
     Connection conn{};
     u8 recv[1024]{};
     u8 send[1024]{};
@@ -3164,6 +3166,45 @@ TEST(request_policy, content_length_after_host_exact_wire_and_fail_closed_bounda
         CHECK_EQ(conn.send_buf.len(), 0u);
         require_wire(before, before_len);
     }
+
+    static constexpr char kRetainedRequest[] =
+        "GET /ledger?q=raw HTTP/1.1\r\nHost: client.example.with.a.long.name\r\n"
+        "Connection: close\r\nX-Test:\t keep \t\r\n\r\n";
+    static constexpr char kRetainedExpected[] =
+        "GET /ledger?q=raw HTTP/1.1\r\nHost: 127.0.0.1:9000\r\n"
+        "X-Test: \t keep \t\r\n\r\n";
+    static_assert(sizeof(kRetainedExpected) - 1u == 70u);
+    prepare_text(kRetainedRequest);
+    conn.response_read_deadline_profile =
+        ResponseReadDeadlineProfile::BodylessNonHeadContentLengthZero;
+    conn.response_read_deadline_buffering = ForwardResponseBufferingMode::CompleteContentLength;
+    conn.response_read_deadline_method = static_cast<u8>(LogHttpMethod::Get);
+    conn.response_read_deadline_route_method = kRouteMethodGet;
+    conn.response_read_deadline_seconds = 60;
+    conn.response_read_deadline_state = ResponseReadDeadlineState::Preflight;
+    conn.response_read_deadline_upload.downstream_close = true;
+    REQUIRE_EQ(inspect_request_policy_body(conn, kRetained), RequestPolicyBodyState::Complete);
+    REQUIRE(apply_request_policy(conn, endpoint, kRetained));
+    require_materialized_wire(reinterpret_cast<const u8*>(kRetainedExpected),
+                              sizeof(kRetainedExpected) - 1u);
+    CHECK_EQ(conn.request_policy_id, kRetained);
+
+    static constexpr char kRetainedCl0[] =
+        "GET /ledger HTTP/1.1\r\nHost: client\r\nContent-Length: 0\r\n"
+        "X-Test:\t keep \t\r\n\r\n";
+    prepare_text(kRetainedCl0);
+    conn.response_read_deadline_profile =
+        ResponseReadDeadlineProfile::BodylessNonHeadContentLengthZero;
+    conn.response_read_deadline_buffering = ForwardResponseBufferingMode::CompleteContentLength;
+    conn.response_read_deadline_method = static_cast<u8>(LogHttpMethod::Get);
+    conn.response_read_deadline_route_method = kRouteMethodGet;
+    u8 retained_cl0_before[sizeof(kRetainedCl0) - 1u]{};
+    __builtin_memcpy(retained_cl0_before, conn.recv_buf.data(), conn.recv_buf.len());
+    CHECK_EQ(inspect_request_policy_body(conn, kRetained), RequestPolicyBodyState::Invalid);
+    CHECK_FALSE(apply_request_policy(conn, endpoint, kRetained));
+    CHECK_EQ(conn.send_buf.len(), 0u);
+    require_wire(retained_cl0_before, sizeof(retained_cl0_before));
+
     prepare_text(kNoContentLength);
     CHECK_EQ(inspect_request_policy_body(conn, 3), RequestPolicyBodyState::Invalid);
     CHECK_FALSE(apply_request_policy(conn, endpoint, 3));

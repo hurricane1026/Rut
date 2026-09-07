@@ -33174,7 +33174,85 @@ route POST "/" {
         static_cast<u16>(RequestPolicyId::Http11FixedStripContentLengthAfterHost)));
     CHECK_FALSE(response_read_deadline_request_policy_is_admitted(
         static_cast<u16>(RequestPolicyId::Http11FixedStripContentLengthAfterHost)));
-    CHECK_FALSE(request_policy_is_supported(3));
+    CHECK(request_policy_is_supported(3));
+}
+
+TEST(frontend, retained_header_value_trim_sp_preserve_htab_is_get_timeout_only) {
+    static constexpr const char kPolicies[] = R"rut(
+        response_policy: { version: "HTTP/1.1", framing: "content_length",
+            connection: "request", server: "s", date: "current", hide_headers: [] },
+        failure_policy: { version: "HTTP/1.1", status: 502, reason: "Bad Gateway",
+            content_type: "text/plain", server: "s", date: "current",
+            connection: "request", body: b"bad" },
+        timeout_failure_policy: { version: "HTTP/1.1", status: 504,
+            reason: "Gateway Time-out", content_type: "text/plain", server: "s",
+            date: "current", connection: "request", body: b"slow" },
+        response_read_timeout: 60s, response_buffering: "complete_content_length")
+    )rut";
+    const std::string source = std::string("upstream b at \"127.0.0.1:9000\"\n") +
+                               "route GET \"/ok\" { return forward(b, "
+                               "request_policy: { version: \"HTTP/1.1\", host: \"upstream\", "
+                               "connection: \"omit\", strip_headers: [\"Connection\", "
+                               "\"Keep-Alive\", \"TE\", \"Expect\", \"Upgrade\"], "
+                               "retained_header_value: \"trim_sp_preserve_htab\" }, " +
+                               kPolicies + "}\n";
+    auto lexed = lex({source.data(), static_cast<u32>(source.size())});
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    REQUIRE_EQ(ast->items[1].route.statements[0]->forward_request_policy_id,
+               static_cast<u16>(RequestPolicyId::Http11FixedTrimSpPreserveHtab));
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    CHECK_EQ(hir->routes[0].method, kRouteMethodGet);
+    CHECK_EQ(hir->routes[0].control.direct_term.forward_request_policy_id,
+             static_cast<u16>(RequestPolicyId::Http11FixedTrimSpPreserveHtab));
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    CHECK_EQ(mir->functions[0].blocks[0].term.forward_request_policy_id,
+             static_cast<u16>(RequestPolicyId::Http11FixedTrimSpPreserveHtab));
+    FrontendRirModule rir{};
+    REQUIRE(lower_to_rir(mir.value(), rir));
+    REQUIRE(rir::verify_module(rir.module).ok);
+    REQUIRE_EQ(rir.module.policy_bundle_count, 1u);
+    CHECK_EQ(rir.module.policy_bundles[0].response_read_timeout_seconds, 60u);
+    const auto* ret = find_first_op(rir.module.functions[0], rir::Opcode::RetForward);
+    REQUIRE(ret != nullptr);
+    const auto policy = ret->operand(1);
+    const auto& value = rir.module.functions[0].values[policy.id];
+    auto& constant = rir.module.functions[0].blocks[value.def_block.id].insts[value.def_inst];
+    REQUIRE_EQ(constant.op, rir::Opcode::ConstI32);
+    CHECK_EQ(constant.imm.i32_val,
+             static_cast<i32>(RequestPolicyId::Http11FixedTrimSpPreserveHtab));
+    rir.destroy();
+
+    const char* rejected[] = {
+        "upstream b\nroute POST \"/\" { return forward(b, request_policy: { "
+        "version: \"HTTP/1.1\", host: \"upstream\", connection: \"omit\", "
+        "strip_headers: [\"Connection\", \"Keep-Alive\", \"TE\", \"Expect\", \"Upgrade\"], "
+        "retained_header_value: \"trim_sp_preserve_htab\" }, response_read_timeout: 60s, "
+        "response_buffering: \"complete_content_length\") }\n",
+        "upstream b\nroute GET \"/\" { return forward(b, request_policy: { "
+        "version: \"HTTP/1.1\", host: \"upstream\", connection: \"omit\", "
+        "strip_headers: [\"Connection\", \"Keep-Alive\", \"TE\", \"Expect\", \"Upgrade\"], "
+        "retained_header_value: \"trim_sp_preserve_htab\" }, response_read_timeout: 60s) }\n",
+        "upstream b\nroute GET \"/\" { return forward(b, request_policy: { "
+        "version: \"HTTP/1.1\", host: \"upstream\", connection: \"omit\", "
+        "strip_headers: [\"Connection\", \"Keep-Alive\", \"TE\", \"Expect\", \"Upgrade\"], "
+        "retained_header_value: \"trim_sp_preserve_htab\", "
+        "content_length_position: \"after_host\" }) }\n",
+        "upstream b\nroute GET \"/\" { return forward(b, request_policy: { "
+        "version: \"HTTP/1.1\", host: \"upstream\", connection: \"omit\", "
+        "strip_headers: [\"Connection\", \"Keep-Alive\", \"TE\", \"Expect\", \"Upgrade\"], "
+        "retained_header_value: \"unknown\" }) }\n",
+    };
+    for (const char* bad : rejected) {
+        auto bad_lexed = lex(lit(bad));
+        REQUIRE(bad_lexed);
+        auto bad_ast = parse_file_heap(bad_lexed.value());
+        if (!bad_ast) continue;
+        CHECK_FALSE(analyze_file_heap(bad_ast.value()).has_value());
+    }
 }
 
 TEST(frontend, request_policy_after_host_admits_only_fixed_upload_head_timeout_profile) {
