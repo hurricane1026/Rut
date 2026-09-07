@@ -45664,10 +45664,23 @@ TEST(response_read_deadline, exact_get_neutral_classifier_preserves_id1_and_reje
         auto* loop = guard.loop;
         RouteConfig config{};
         PrebuiltD2Fixture fixture{};
-        REQUIRE(stage_live_precise_get(
-            loop, config, &fixture, false, false, RequestPolicyId::Http11FixedStrip));
+        REQUIRE(config.add_upstream("backend", 0x7F000001, 9000).has_value());
+        REQUIRE(add_bodyless_non_head_response_read_deadline_bundle(
+            config, 5, ForwardResponseBufferingMode::CompleteContentLength));
+        REQUIRE(stage_strict_read_timeout_method(
+            loop, &config, nullptr, 0, &fixture, LogHttpMethod::Get));
         Connection& conn = *fixture.conn;
-        conn.response_read_deadline_upload.clear_owner();
+        conn.request_policy_id = static_cast<u16>(RequestPolicyId::Http11FixedStrip);
+        conn.response_read_deadline_upload.request_policy_id =
+            static_cast<u16>(RequestPolicyId::Http11FixedStrip);
+        REQUIRE(arm_staged_response_read_deadline(loop, fixture));
+        const u16 saved_policy = conn.request_policy_id;
+        conn.request_policy_id = 0;
+        CHECK_FALSE(response_read_deadline_owner_is_stable(
+            conn,
+            &on_upstream_response<IoUringEventLoop>,
+            ResponseReadDeadlineOwnerPhase::ActiveAfterCopy));
+        conn.request_policy_id = saved_policy;
         REQUIRE(response_read_deadline_owner_is_stable(
             conn,
             &on_upstream_response<IoUringEventLoop>,
@@ -45676,8 +45689,14 @@ TEST(response_read_deadline, exact_get_neutral_classifier_preserves_id1_and_reje
         REQUIRE_EQ(conn.upstream_recv_buf.write(kResponse, len), len);
         const IoEvent response = response_read_copy_event(conn, len, true, 0, len);
         loop->dispatch_batch(&response, 1);
-        CHECK_GE(loop->conns[conn.id].fd, 0);
-        CHECK(loop->conns[conn.id].send_armed);
+        REQUIRE_EQ(conn.response_read_deadline_post_commit_phase,
+                   ResponseReadDeadlinePostCommitPhase::HeaderSend);
+        REQUIRE_GT(loop->backend.send_state[conn.id].remaining, 0u);
+        const IoEvent header = exact_response_deadline_send_event(loop, conn);
+        loop->dispatch_batch(&header, 1);
+        REQUIRE_EQ(conn.response_read_deadline_post_commit_phase,
+                   ResponseReadDeadlinePostCommitPhase::BodySend);
+        REQUIRE_GT(conn.response_read_deadline_send_len, 0u);
         cleanup_prebuilt_d2(loop, fixture);
     }
 
@@ -45687,16 +45706,22 @@ TEST(response_read_deadline, exact_get_neutral_classifier_preserves_id1_and_reje
         auto* loop = guard.loop;
         RouteConfig config{};
         PrebuiltD2Fixture fixture{};
-        REQUIRE(stage_live_precise_get(
-            loop, config, &fixture, false, true, RequestPolicyId::Http11FixedTrimSpPreserveHtab));
+        REQUIRE(config.add_upstream("backend", 0x7F000001, 9000).has_value());
+        REQUIRE(add_bodyless_non_head_response_read_deadline_bundle(
+            config, 5, ForwardResponseBufferingMode::CompleteContentLength));
+        REQUIRE(stage_strict_read_timeout_method(
+            loop, &config, nullptr, 0, &fixture, LogHttpMethod::Get));
         Connection& conn = *fixture.conn;
+        conn.request_policy_id = static_cast<u16>(RequestPolicyId::Http11FixedTrimSpPreserveHtab);
+        conn.response_read_deadline_upload.request_policy_id =
+            static_cast<u16>(RequestPolicyId::Http11FixedTrimSpPreserveHtab);
+        REQUIRE(arm_staged_response_read_deadline(loop, fixture));
         conn.pipeline_depth = 1;
         CHECK_FALSE(response_read_deadline_owner_is_stable(
             conn,
             &on_upstream_response<IoUringEventLoop>,
             ResponseReadDeadlineOwnerPhase::ActiveAfterCopy));
         conn.pipeline_depth = 0;
-        conn.response_read_deadline_upload.clear_owner();
         CHECK_FALSE(response_read_deadline_owner_is_stable(
             conn,
             &on_upstream_response<IoUringEventLoop>,

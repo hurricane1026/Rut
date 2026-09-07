@@ -928,11 +928,10 @@ inline bool complete_content_length_request_policy_owner_is_stable(
             ResponseReadDeadlineProfile::BodylessNonHeadContentLengthZero &&
         c.req_method == static_cast<u8>(LogHttpMethod::Get) &&
         c.response_read_deadline_route_method == kRouteMethodGet)
-        return (response_read_deadline_exact_get_id1_legacy_proof_is_neutral(c, proof) ||
-                ((complete_content_length_request_policy_is_admitted(c.request_policy_id) ||
-                  c.request_policy_id ==
-                      static_cast<u16>(RequestPolicyId::Http11FixedTrimSpPreserveHtab)) &&
-                 proof.request_policy_id == c.request_policy_id));
+        return (complete_content_length_request_policy_is_admitted(c.request_policy_id) ||
+                c.request_policy_id ==
+                    static_cast<u16>(RequestPolicyId::Http11FixedTrimSpPreserveHtab)) &&
+               proof.request_policy_id == c.request_policy_id;
     return complete_content_length_request_policy_is_admitted(c.request_policy_id) &&
            proof.request_policy_id == c.request_policy_id;
 }
