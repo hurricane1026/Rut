@@ -1585,9 +1585,8 @@ bool put_request_policy(Writer& writer, RequestPolicyPlacement placement) {
            writer.put_cstr(
                "            strip_headers: [\"Connection\", \"Keep-Alive\", \"TE\", \"Expect\", "
                "\"Upgrade\"]") &&
-           (placement == RequestPolicyPlacement::RetainedHeaderValue
-                ? writer.put_cstr(",\n")
-                : writer.put_cstr("\n")) &&
+           (placement == RequestPolicyPlacement::RetainedHeaderValue ? writer.put_cstr(",\n")
+                                                                     : writer.put_cstr("\n")) &&
            (placement != RequestPolicyPlacement::RetainedHeaderValue ||
             writer.put_cstr("            retained_header_value: \"trim_sp_preserve_htab\"\n")) &&
            writer.put_cstr("        },\n");

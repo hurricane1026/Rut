@@ -9581,9 +9581,8 @@ TEST(nginx_converter_issue252,
         auto lowered = nginx::lower_to_rut(parsed.value());
         REQUIRE(lowered);
         const std::string output(lowered.value().data, lowered.value().len);
-        CHECK_EQ(output.rfind("listen 127.0.0.1:" + std::to_string(expected_ports[vector][0]) +
-                                  "\n",
-                              0u),
+        CHECK_EQ(output.rfind(
+                     "listen 127.0.0.1:" + std::to_string(expected_ports[vector][0]) + "\n", 0u),
                  0u);
         CHECK_EQ(count_text(output,
                             "upstream nginx_upstream at \"127.0.0.1:" +
@@ -9616,7 +9615,8 @@ TEST(nginx_converter_issue252,
         REQUIRE_EQ(hir_owned->routes.len, 3u);
         REQUIRE_EQ(hir_owned->routes[1].method, kRouteMethodGet);
         const auto& get_hir = hir_owned->routes[1];
-        CHECK_EQ(get_hir.forward_preflight_mode, ForwardPreflightMode::AfterRequestFramingSelection);
+        CHECK_EQ(get_hir.forward_preflight_mode,
+                 ForwardPreflightMode::AfterRequestFramingSelection);
         REQUIRE(get_hir.control.kind == HirControlKind::If);
         CHECK_EQ(get_hir.control.cond.kind, HirExprKind::ReqHasContentLength);
         const auto& id1 = get_hir.control.then_term;
@@ -9632,8 +9632,10 @@ TEST(nginx_converter_issue252,
         CHECK_EQ(id1.forward_timeout_failure_policy_id, id3.forward_timeout_failure_policy_id);
         CHECK_EQ(id1.forward_response_read_timeout_seconds,
                  id3.forward_response_read_timeout_seconds);
-        CHECK_EQ(id1.forward_response_buffering, ForwardResponseBufferingMode::CompleteContentLength);
-        CHECK_EQ(id3.forward_response_buffering, ForwardResponseBufferingMode::CompleteContentLength);
+        CHECK_EQ(id1.forward_response_buffering,
+                 ForwardResponseBufferingMode::CompleteContentLength);
+        CHECK_EQ(id3.forward_response_buffering,
+                 ForwardResponseBufferingMode::CompleteContentLength);
 
         auto mir = build_mir(*hir_owned);
         REQUIRE(mir);
@@ -9699,8 +9701,7 @@ TEST(nginx_converter_issue252,
     REQUIRE(wildcard_lowered);
     const std::string wildcard_output(wildcard_lowered.value().data, wildcard_lowered.value().len);
     CHECK_EQ(count_text(wildcard_output, "if req.hasContentLength"), 0u);
-    CHECK_EQ(count_text(wildcard_output, "retained_header_value: \"trim_sp_preserve_htab\""),
-             0u);
+    CHECK_EQ(count_text(wildcard_output, "retained_header_value: \"trim_sp_preserve_htab\""), 0u);
 
     static constexpr char kTimeout[] =
         "server { listen 127.0.0.1:8081; location / { proxy_read_timeout 1s; "
@@ -9710,8 +9711,7 @@ TEST(nginx_converter_issue252,
     const auto timeout_lowered = nginx::lower_to_rut(timeout.value());
     REQUIRE(timeout_lowered);
     const std::string timeout_output(timeout_lowered.value().data, timeout_lowered.value().len);
-    CHECK_EQ(count_text(timeout_output, "retained_header_value: \"trim_sp_preserve_htab\""),
-             0u);
+    CHECK_EQ(count_text(timeout_output, "retained_header_value: \"trim_sp_preserve_htab\""), 0u);
     CHECK_EQ(count_text(timeout_output, "content_length_position: \"after_host\""), 1u);
 }
 
