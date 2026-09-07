@@ -5309,6 +5309,7 @@ inline bool apply_request_policy(Connection& conn, const sockaddr_in& endpoint, 
              ResponseReadDeadlineProfile::BodylessNonHeadContentLengthZero ||
          conn.response_read_deadline_buffering !=
              ForwardResponseBufferingMode::CompleteContentLength ||
+         conn.response_read_deadline_state == ResponseReadDeadlineState::None ||
          !response_read_timeout_seconds_valid(conn.response_read_deadline_seconds) ||
          conn.req_method != static_cast<u8>(LogHttpMethod::Get) ||
          conn.response_read_deadline_route_method != kRouteMethodGet || conn.pipeline_depth != 0 ||
