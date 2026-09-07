@@ -63541,6 +63541,533 @@ static bool run_rut_default_buffering_206_range_incomplete_body_inactivity_expir
     return true;
 }
 
+// #554 is the paired version of the pinned inactivity oracle.  Each invocation
+// owns fresh nginx/RUT/origin/client resources; the negative invocation uses
+// a real complete origin on the generated-RUT side, so comparator rejection is
+// exercised by two transactions rather than by mutating an observed vector.
+static bool run_converter_default_buffering_206_range_incomplete_body_inactivity_expiry_case(
+    const char* rut_path,
+    const std::string& container_name,
+    bool asymmetric_negative,
+    std::string& error) {
+    static constexpr char kDiagnostic[] = "#554 paired 206 incomplete body inactivity expiry";
+    static constexpr char kExpectedHeader[] =
+        "HTTP/1.1 206 Partial Content\r\n"
+        "Server: nginx/1.29.7\r\n"
+        "Date: XXXXXXXXXXXXXXXXXXXXXXXXXXXXX\r\n"
+        "Content-Length: 5\r\n"
+        "Connection: keep-alive\r\n"
+        "Content-Range: bytes 0-4/12\r\n"
+        "\r\n";
+    static_assert(sizeof(kDefaultBuffering206RangeRequest) - 1u == 78u);
+    static_assert(sizeof(kDefaultBuffering206RangeOrigin) - 1u == 144u);
+    static_assert((sizeof(kDefaultBuffering206RangeOrigin) - 1u) - 5u == 139u);
+    static_assert(sizeof(kExpectedHeader) - 1u == 163u);
+
+    if (rut_path == nullptr || rut_path[0] != '/' || access(rut_path, X_OK) != 0) {
+        error = std::string(kDiagnostic) + " requires an executable absolute RUT path";
+        return false;
+    }
+    TempDir temps[2];
+    if (!temps[0].create() || !temps[1].create() || strcmp(temps[0].path, temps[1].path) == 0 ||
+        temps[0].nginx_config == temps[1].source ||
+        temps[0].nginx_access_log == temps[1].rut_access_log ||
+        temps[0].nginx_log == temps[1].rut_log) {
+        error = std::string(kDiagnostic) + " could not isolate the two side resources";
+        return false;
+    }
+    HeldLoopbackPorts reservations;
+    u16 ports[4]{};
+    for (size_t index = 0u; index < std::size(ports); ++index) {
+        if (!reservations.reserve_four_digit(index, ports[index])) {
+            error = std::string(kDiagnostic) + " could not hold four distinct ports";
+            return false;
+        }
+    }
+    std::string profiles[2] = {
+        make_explicit_timeout_head_profile(ports[0], ports[1], temps[0].nginx_access_log),
+        make_explicit_timeout_head_profile(ports[2], ports[3], temps[1].rut_access_log),
+    };
+    const std::string nginx_config = "events {}\n" + profiles[0];
+    if (!validate_explicit_timeout_head_profile(
+            profiles[0], ports[0], ports[1], temps[0].nginx_access_log, error) ||
+        !validate_explicit_timeout_head_profile(
+            profiles[1], ports[2], ports[3], temps[1].rut_access_log, error) ||
+        nginx_config.rfind("events {}\nhttp {\n", 0u) != 0u ||
+        count_text(nginx_config, "events {}\n") != 1u) {
+        if (error.empty())
+            error = std::string(kDiagnostic) + " exact nginx profile validation failed";
+        return false;
+    }
+    std::string generated_source;
+    if (!build_explicit_timeout_head_generated_source(
+            profiles[1], ports[2], ports[3], temps[1].rut_access_log, generated_source, error) ||
+        !validate_explicit_timeout_get_generated_provenance(
+            generated_source, ports[2], ports[3], temps[1].rut_access_log, error)) {
+        if (error.empty()) error = std::string(kDiagnostic) + " converter provenance failed";
+        return false;
+    }
+    std::fill(profiles[1].begin(), profiles[1].end(), 'x');
+    static constexpr const char* kForbiddenGeneratedMarkers[] = {
+        "nginx.conf",
+        "nginx::",
+        "nginx_compat",
+        "proxy_pass",
+        "workaround",
+        "issue554",
+        "status: 206",
+        "Partial Content",
+        "Content-Range",
+        "Range: bytes=0-4",
+    };
+    for (const char* marker : kForbiddenGeneratedMarkers) {
+        if (generated_source.find(marker) != std::string::npos) {
+            error = std::string(kDiagnostic) + " generated source retained forbidden marker `" +
+                    marker + "`";
+            return false;
+        }
+    }
+    if (!write_file(temps[0].nginx_config, nginx_config.data(), nginx_config.size()) ||
+        !write_file(temps[1].source, generated_source.data(), generated_source.size())) {
+        error = std::string(kDiagnostic) + " could not persist independent inputs";
+        return false;
+    }
+
+    Recorder origins[2];
+    const u32 response_lengths[2] = {141u, asymmetric_negative ? 144u : 141u};
+    for (size_t side = 0u; side < 2u; ++side) {
+        origins[side].wait_response_peer_close = true;
+        origins[side].observe_extra_requests_until_stop = true;
+        if (!handoff_held_loopback_port(
+                &reservations.fds[side * 2u + 1u], ports[side * 2u + 1u], kDiagnostic, error) ||
+            !origins[side].setup(ports[side * 2u + 1u],
+                                 1u,
+                                 kDefaultBuffering206RangeOrigin,
+                                 response_lengths[side])) {
+            if (error.empty()) error = std::string(kDiagnostic) + " origin setup failed";
+            return false;
+        }
+    }
+    const auto origins_live = [&]() {
+        for (const auto& origin : origins) {
+            if (!origin.running.load(std::memory_order_acquire) ||
+                !origin.thread_alive.load(std::memory_order_acquire) ||
+                origin.listener_failed.load(std::memory_order_acquire))
+                return false;
+        }
+        return true;
+    };
+    const auto origin_ready_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+    while (!origins_live() && std::chrono::steady_clock::now() < origin_ready_deadline)
+        usleep(1000);
+    if (!origins_live()) {
+        error = std::string(kDiagnostic) + " origins were not live before frontend handoff";
+        return false;
+    }
+
+    DockerGuard docker(container_name);
+    ChildGuard frontends[2];
+    if (!handoff_held_loopback_port(&reservations.fds[0], ports[0], kDiagnostic, error) ||
+        !spawn_child({"docker",
+                      "run",
+                      "--pull=never",
+                      "--network",
+                      "host",
+                      "--name",
+                      container_name,
+                      "-v",
+                      std::string(temps[0].path) + ":" + temps[0].path,
+                      kNginxImage,
+                      "nginx",
+                      "-c",
+                      temps[0].nginx_config,
+                      "-g",
+                      "daemon off;"},
+                     temps[0].nginx_log,
+                     frontends[0].child) ||
+        !wait_ready(ports[0], frontends[0].child, error)) {
+        error = std::string(kDiagnostic) + " pinned nginx did not become ready";
+        return false;
+    }
+    if (!handoff_held_loopback_port(&reservations.fds[2], ports[2], kDiagnostic, error) ||
+        !spawn_child({rut_path, temps[1].source, "--shards", "1", "--no-pin", "--drain", "0"},
+                     temps[1].rut_log,
+                     frontends[1].child) ||
+        !wait_ready(ports[2], frontends[1].child, error)) {
+        error = std::string(kDiagnostic) + " generated ordinary RUT did not become ready";
+        return false;
+    }
+    const auto frontends_live = [&]() {
+        return !poll_child(frontends[0].child) && !poll_child(frontends[1].child);
+    };
+    const auto runtime_ready_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+    const std::string loaded_record = "Loaded program: " + temps[1].source + " (opt O2)\n";
+    while ((!log_contains(temps[1].rut_log, loaded_record.c_str()) ||
+            !log_contains(temps[1].rut_log, "Backend: io_uring\n")) &&
+           std::chrono::steady_clock::now() < runtime_ready_deadline) {
+        if (poll_child(frontends[1].child)) {
+            error = std::string(kDiagnostic) + " generated RUT exited before io_uring readiness";
+            return false;
+        }
+        usleep(1000);
+    }
+    if (!frontends_live() || !log_contains(temps[1].rut_log, loaded_record.c_str()) ||
+        !log_contains(temps[1].rut_log, "Backend: io_uring\n")) {
+        error = std::string(kDiagnostic) + " missing public CLI/source/O2/io_uring evidence";
+        return false;
+    }
+    static constexpr char kPoisonedSource[] = "destroyed-after-#554-load\n";
+    if (!write_file(temps[1].source, kPoisonedSource, sizeof(kPoisonedSource) - 1u)) {
+        error = std::string(kDiagnostic) + " could not poison source after public load";
+        return false;
+    }
+    const int poisoned_fd = open(temps[1].source.c_str(), O_RDONLY | O_CLOEXEC);
+    char poisoned_bytes[sizeof(kPoisonedSource)]{};
+    const ssize_t poisoned_count =
+        poisoned_fd < 0 ? -1 : read(poisoned_fd, poisoned_bytes, sizeof(poisoned_bytes));
+    if (poisoned_fd >= 0) close(poisoned_fd);
+    if (poisoned_count != static_cast<ssize_t>(sizeof(kPoisonedSource) - 1u) ||
+        memcmp(poisoned_bytes, kPoisonedSource, sizeof(kPoisonedSource) - 1u) != 0) {
+        error = std::string(kDiagnostic) + " poisoned source was not observed after load";
+        return false;
+    }
+
+    struct ClientGuard {
+        int fds[2] = {-1, -1};
+        ~ClientGuard() {
+            for (int fd : fds)
+                if (fd >= 0) close(fd);
+        }
+    } clients;
+    for (size_t side = 0u; side < 2u; ++side) {
+        clients.fds[side] = connect_once(ports[side * 2u]);
+        if (clients.fds[side] < 0) {
+            error = std::string(kDiagnostic) + " could not connect both clients";
+            return false;
+        }
+    }
+    std::string access;
+    if (!read_request_length_access_file(temps[0].nginx_access_log, access, error) ||
+        !access.empty() ||
+        !read_request_length_access_file(temps[1].rut_access_log, access, error) ||
+        !access.empty()) {
+        if (error.empty()) error = std::string(kDiagnostic) + " pre-request access was not empty";
+        return false;
+    }
+
+    struct SideEvidence {
+        u64 request_ns = 0u;
+        u64 w1_ns = 0u;
+        u64 quiet_ns = 0u;
+        u64 first_ns = 0u;
+        u64 eof_ns = 0u;
+        u64 peer_ns = 0u;
+        std::vector<char> response;
+    } evidence[2];
+    std::atomic<bool> abort{false};
+    std::string side_errors[2];
+    const auto run_side = [&](size_t side) {
+        auto& origin = origins[side];
+        auto& observed = evidence[side];
+        const std::string& access_path =
+            side == 0u ? temps[0].nginx_access_log : temps[1].rut_access_log;
+        std::string detail;
+        const auto side_frontend_live = [&]() { return !poll_child(frontends[side].child); };
+        auto fail = [&](const std::string& detail) {
+            side_errors[side] = std::string(side == 0u ? "nginx: " : "RUT: ") + detail;
+            abort.store(true, std::memory_order_release);
+            return false;
+        };
+        observed.request_ns = steady_now_ns();
+        if (!send_all(clients.fds[side],
+                      kDefaultBuffering206RangeRequest,
+                      sizeof(kDefaultBuffering206RangeRequest) - 1u))
+            return fail("could not send exact 78-byte request");
+        const auto publication_deadline =
+            std::chrono::steady_clock::now() + std::chrono::seconds(2);
+        while (!origin.response_sent_open.load(std::memory_order_acquire)) {
+            if (abort.load(std::memory_order_acquire) || !side_frontend_live() || !origins_live() ||
+                origin.response_send_failed.load(std::memory_order_acquire) ||
+                origin.response_peer_closed.load(std::memory_order_acquire) ||
+                origin.accepted.load(std::memory_order_acquire) > 1u ||
+                origin.requests.load(std::memory_order_acquire) > 1u ||
+                std::chrono::steady_clock::now() >= publication_deadline)
+                return fail("origin did not publish exactly one open response");
+            usleep(1000);
+        }
+        observed.w1_ns = origin.response_sent_ns.load(std::memory_order_acquire);
+        if (observed.w1_ns < observed.request_ns ||
+            origin.accepted.load(std::memory_order_acquire) != 1u ||
+            origin.requests.load(std::memory_order_acquire) != 1u ||
+            origin.response_send_all_calls.load(std::memory_order_acquire) != 1u ||
+            !origin.response_send_succeeded.load(std::memory_order_acquire) ||
+            origin.response_peer_closed.load(std::memory_order_acquire))
+            return fail("one open origin publication ledger was incoherent");
+
+        if (!asymmetric_negative || side == 0u) {
+            for (;;) {
+                std::string detail;
+                if (!observe_client_open_and_quiet_nonconsuming(clients.fds[side], 5, detail))
+                    return fail("downstream was not quiet before expiry: " + detail);
+                observed.quiet_ns = steady_now_ns();
+                std::string live_access;
+                if (!side_frontend_live() || !origins_live() ||
+                    origin.accepted.load(std::memory_order_acquire) != 1u ||
+                    origin.requests.load(std::memory_order_acquire) != 1u ||
+                    origin.response_peer_closed.load(std::memory_order_acquire) ||
+                    !read_request_length_access_file(access_path, live_access, detail) ||
+                    !live_access.empty())
+                    return fail("pre-expiry custody failed: " + detail);
+                if (observed.quiet_ns - observed.w1_ns >= 800'000'000ull) break;
+            }
+        } else {
+            observed.quiet_ns = steady_now_ns();
+        }
+
+        const u64 terminal_deadline_ns = observed.w1_ns + 3'000'000'000ull;
+        if (asymmetric_negative && side == 1u) {
+            // The real negative RUT transaction is complete: require all 168
+            // bytes promptly, then prove keep-alive rather than manufacturing
+            // an EOF/retirement obligation for this intentionally mismatched
+            // side.
+            while (observed.response.size() < 168u) {
+                if (abort.load(std::memory_order_acquire) || !side_frontend_live() ||
+                    !origins_live() || steady_now_ns() >= observed.w1_ns + 1'000'000'000ull)
+                    return fail("complete negative RUT response missed prompt 168-byte delivery");
+                pollfd state{clients.fds[side], POLLIN | POLLHUP | POLLERR, 0};
+                const int ready = poll(&state, 1, 5);
+                if (ready < 0) {
+                    if (errno == EINTR) continue;
+                    return fail("complete negative RUT poll failed");
+                }
+                if (ready == 0) continue;
+                char bytes[512];
+                const ssize_t count = recv(clients.fds[side], bytes, sizeof(bytes), 0);
+                if (count > 0) {
+                    if (observed.first_ns == 0u) observed.first_ns = steady_now_ns();
+                    observed.response.insert(observed.response.end(), bytes, bytes + count);
+                    if (observed.response.size() > 168u)
+                        return fail("complete negative RUT response had trailing bytes");
+                } else if (count == 0) {
+                    return fail("complete negative RUT response closed before 168 bytes");
+                } else if (errno != EINTR && errno != EAGAIN && errno != EWOULDBLOCK) {
+                    return fail("complete negative RUT response recv failed");
+                }
+            }
+            if (!observe_client_open_and_quiet_nonconsuming(clients.fds[side], 20, detail))
+                return fail("complete negative RUT response was not keep-alive: " + detail);
+            const auto complete_peer_deadline =
+                std::chrono::steady_clock::now() + std::chrono::milliseconds(750);
+            while (!origin.response_peer_closed.load(std::memory_order_acquire)) {
+                if (!side_frontend_live() || !origins_live() ||
+                    origin.response_peer_unexpected_data.load(std::memory_order_acquire) ||
+                    origin.response_peer_observation_failed.load(std::memory_order_acquire) ||
+                    std::chrono::steady_clock::now() >= complete_peer_deadline)
+                    return fail("complete negative RUT origin was not naturally retired promptly");
+                usleep(1000);
+            }
+            observed.peer_ns = origin.response_peer_closed_ns.load(std::memory_order_acquire);
+            if (observed.peer_ns < observed.w1_ns ||
+                observed.peer_ns - observed.w1_ns >= 750'000'000ull)
+                return fail("complete negative RUT peer retirement exceeded 750ms");
+        } else {
+            while (observed.eof_ns == 0u) {
+                if (abort.load(std::memory_order_acquire) || !side_frontend_live() ||
+                    !origins_live() || steady_now_ns() >= terminal_deadline_ns)
+                    return fail("downstream recv-zero missed the bounded terminal deadline");
+                pollfd state{clients.fds[side], POLLIN | POLLHUP | POLLERR, 0};
+                const int ready = poll(&state, 1, 5);
+                if (ready < 0) {
+                    if (errno == EINTR) continue;
+                    return fail("downstream poll failed");
+                }
+                if (ready == 0) continue;
+                char bytes[512];
+                const ssize_t count = recv(clients.fds[side], bytes, sizeof(bytes), 0);
+                const u64 now = steady_now_ns();
+                if (count > 0) {
+                    if (observed.first_ns == 0u) observed.first_ns = now;
+                    observed.response.insert(observed.response.end(), bytes, bytes + count);
+                    if (observed.response.size() > 512u)
+                        return fail("response exceeded bounded capture");
+                } else if (count == 0) {
+                    observed.eof_ns = now;
+                } else if (errno != EINTR && errno != EAGAIN && errno != EWOULDBLOCK) {
+                    return fail(errno == ECONNRESET ? "downstream reset instead of recv-zero EOF"
+                                                    : "downstream recv failed");
+                }
+            }
+        }
+        if (!asymmetric_negative || side == 0u) {
+            const auto peer_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(1);
+            while (!origin.response_peer_closed.load(std::memory_order_acquire)) {
+                if (!side_frontend_live() || !origins_live() ||
+                    origin.response_peer_unexpected_data.load(std::memory_order_acquire) ||
+                    origin.response_peer_observation_failed.load(std::memory_order_acquire) ||
+                    std::chrono::steady_clock::now() >= peer_deadline)
+                    return fail("origin was not naturally retired");
+                usleep(1000);
+            }
+            observed.peer_ns = origin.response_peer_closed_ns.load(std::memory_order_acquire);
+        }
+        if (!asymmetric_negative || side == 0u) {
+            const u64 first_elapsed = observed.first_ns - observed.w1_ns;
+            const u64 eof_elapsed = observed.eof_ns - observed.w1_ns;
+            const u64 peer_elapsed = observed.peer_ns - observed.w1_ns;
+            if (observed.first_ns < observed.w1_ns || observed.eof_ns < observed.w1_ns ||
+                observed.peer_ns < observed.w1_ns ||
+                observed.quiet_ns - observed.w1_ns < 800'000'000ull ||
+                first_elapsed < 750'000'000ull || first_elapsed >= 1'700'000'000ull ||
+                eof_elapsed < 750'000'000ull || eof_elapsed >= 2'000'000'000ull ||
+                peer_elapsed < 750'000'000ull || peer_elapsed >= 2'000'000'000ull)
+                return fail("expiry timing/quiet window was outside the frozen bounds");
+        }
+        static constexpr char kExpectedAccess[] = "78\n";
+        const auto access_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+        for (;;) {
+            std::string live_access;
+            if (!read_request_length_access_file(access_path, live_access, detail))
+                return fail("could not read access ledger: " + detail);
+            if (live_access == kExpectedAccess) break;
+            if ((!live_access.empty() && live_access != kExpectedAccess) ||
+                std::chrono::steady_clock::now() >= access_deadline)
+                return fail("access ledger was not exactly ASCII78+LF");
+            usleep(5000);
+        }
+        const auto stable_deadline =
+            std::chrono::steady_clock::now() + std::chrono::milliseconds(175);
+        while (std::chrono::steady_clock::now() < stable_deadline) {
+            std::string stable_access;
+            if (!side_frontend_live() || !origins_live() ||
+                origin.accepted.load(std::memory_order_acquire) != 1u ||
+                origin.requests.load(std::memory_order_acquire) != 1u ||
+                origin.response_send_all_calls.load(std::memory_order_acquire) != 1u ||
+                origin.response_peer_close_count.load(std::memory_order_acquire) != 1u ||
+                origin.response_send_failed.load(std::memory_order_acquire) ||
+                origin.response_peer_unexpected_data.load(std::memory_order_acquire) ||
+                origin.response_peer_observation_failed.load(std::memory_order_acquire) ||
+                !read_request_length_access_file(access_path, stable_access, detail) ||
+                stable_access != kExpectedAccess)
+                return fail("175ms post-terminal no-retry stability failed");
+            poll(nullptr, 0, 5);
+        }
+        return true;
+    };
+
+    bool side_ok[2] = {false, false};
+    std::thread workers[2] = {std::thread([&]() { side_ok[0] = run_side(0u); }),
+                              std::thread([&]() { side_ok[1] = run_side(1u); })};
+    workers[0].join();
+    workers[1].join();
+    if (!side_ok[0] || !side_ok[1]) {
+        error = std::string(kDiagnostic) + " " +
+                (!side_errors[0].empty() ? side_errors[0] : side_errors[1]);
+        dump_wire("#554 nginx downstream", evidence[0].response);
+        dump_wire("#554 RUT downstream", evidence[1].response);
+        return false;
+    }
+
+    std::vector<char> normalized[2] = {evidence[0].response, evidence[1].response};
+    if (!normalize_date(normalized[0]) || !normalize_date(normalized[1])) {
+        error = std::string(kDiagnostic) + " Date normalization failed";
+        return false;
+    }
+    const std::vector<char> expected_header(kExpectedHeader,
+                                            kExpectedHeader + sizeof(kExpectedHeader) - 1u);
+    const std::vector<char> expected_bodyful = [&]() {
+        std::vector<char> value = expected_header;
+        value.insert(value.end(), {'h', 'e', 'l', 'l', 'o'});
+        return value;
+    }();
+    const auto valid_response = [&](const std::vector<char>& wire) {
+        const std::string text(wire.begin(), wire.end());
+        return wire.size() >= expected_header.size() &&
+               header_end(wire) == expected_header.size() &&
+               count_text(text, "HTTP/1.1 206 Partial Content\r\n") == 1u &&
+               count_text(text, "Content-Length: 5\r\n") == 1u &&
+               count_text(text, "Content-Range: bytes 0-4/12\r\n") == 1u &&
+               text.find("502") == std::string::npos && text.find("504") == std::string::npos;
+    };
+    const bool exact_positive =
+        normalized[0] == expected_header && normalized[1] == expected_header;
+    if (!valid_response(normalized[0]) || !valid_response(normalized[1]) ||
+        (asymmetric_negative ? (normalized[0] != expected_header ||
+                                normalized[1] != expected_bodyful || normalized[0] == normalized[1])
+                             : (!exact_positive || normalized[0] != normalized[1]))) {
+        error = std::string(kDiagnostic) + (asymmetric_negative
+                                                ? " real asymmetric comparator failed to reject"
+                                                : " exact normalized 163-byte equality failed");
+        dump_wire("#554 nginx normalized", normalized[0]);
+        dump_wire("#554 RUT normalized", normalized[1]);
+        return false;
+    }
+
+    for (int fd : clients.fds) {
+        if (fd >= 0) close(fd);
+    }
+    clients.fds[0] = clients.fds[1] = -1;
+    const bool origins_live_before_stop = origins_live();
+    origins[0].stop();
+    origins[1].stop();
+    bool exact_histories = origins_live_before_stop;
+    for (size_t side = 0u; side < 2u; ++side) {
+        const std::string expected_text = "GET /buffered-timeout?q=1 HTTP/1.1\r\nHost: 127.0.0.1:" +
+                                          std::to_string(ports[side * 2u + 1u]) +
+                                          "\r\nRange: bytes=0-4\r\n\r\n";
+        const std::vector<char> expected_request(expected_text.begin(), expected_text.end());
+        const auto& origin = origins[side];
+        exact_histories =
+            exact_histories && expected_request.size() == 78u &&
+            !origin.thread_alive.load(std::memory_order_acquire) && origin.listen_fd < 0 &&
+            !origin.listener_failed.load(std::memory_order_acquire) &&
+            origin.accepted.load(std::memory_order_acquire) == 1u &&
+            origin.requests.load(std::memory_order_acquire) == 1u && origin.history.size() == 1u &&
+            origin.history[0] == expected_request && origin.request == expected_request &&
+            origin.response_send_all_calls.load(std::memory_order_acquire) == 1u &&
+            origin.response_send_succeeded.load(std::memory_order_acquire) &&
+            origin.response_sent_open.load(std::memory_order_acquire) &&
+            origin.response_peer_closed.load(std::memory_order_acquire) &&
+            origin.response_peer_close_count.load(std::memory_order_acquire) == 1u &&
+            !origin.response_send_failed.load(std::memory_order_acquire) &&
+            !origin.response_peer_unexpected_data.load(std::memory_order_acquire) &&
+            !origin.response_peer_observation_failed.load(std::memory_order_acquire) &&
+            origin.response_connection_closed.load(std::memory_order_acquire);
+    }
+    const bool nginx_stopped = stop_child(frontends[0].child);
+    const bool rut_stopped = stop_child(frontends[1].child);
+    const bool container_removed = docker.remove();
+    std::string final_access[2];
+    if (!nginx_stopped || !rut_stopped || !container_removed || !exact_histories ||
+        reservations.fds[0] >= 0 || reservations.fds[1] >= 0 || reservations.fds[2] >= 0 ||
+        reservations.fds[3] >= 0 ||
+        !read_request_length_access_file(temps[0].nginx_access_log, final_access[0], error) ||
+        !read_request_length_access_file(temps[1].rut_access_log, final_access[1], error) ||
+        final_access[0] != "78\n" || final_access[1] != "78\n") {
+        if (error.empty())
+            error = std::string(kDiagnostic) + " final cleanup/history/access failed";
+        return false;
+    }
+    std::cerr << "PASS evidence: " << kDiagnostic
+              << (asymmetric_negative ? " negative" : " positive") << " W1-to-first/EOF/peer(ms)="
+              << (evidence[0].first_ns - evidence[0].w1_ns) / 1'000'000ull << "/"
+              << (evidence[0].eof_ns - evidence[0].w1_ns) / 1'000'000ull << "/"
+              << (evidence[0].peer_ns - evidence[0].w1_ns) / 1'000'000ull
+              << " upstream=78/78 access=78\\n retry=0\n";
+    return true;
+}
+
+static bool
+run_converter_default_buffering_206_range_incomplete_body_inactivity_expiry_differential(
+    const char* rut_path, const std::string& container_name, std::string& error) {
+    if (!run_converter_default_buffering_206_range_incomplete_body_inactivity_expiry_case(
+            rut_path, container_name + "-negative", true, error))
+        return false;
+    if (!run_converter_default_buffering_206_range_incomplete_body_inactivity_expiry_case(
+            rut_path, container_name + "-positive", false, error))
+        return false;
+    return true;
+}
+
 static bool run_converter_default_buffering_206_range_incomplete_clean_eof_differential_impl(
     const char* rut_path,
     const std::string& container_name,
@@ -70172,6 +70699,12 @@ int main(int argc, char** argv) {
         argc == 3 && strcmp(argv[1],
                             "--converter-default-buffering-206-range-incomplete-clean-eof-"
                             "differential") == 0;
+    const bool
+        converter_default_buffering_206_range_incomplete_body_inactivity_expiry_differential =
+            argc == 3 &&
+            strcmp(argv[1],
+                   "--converter-default-buffering-206-range-incomplete-body-inactivity-expiry-"
+                   "differential") == 0;
     const bool converter_default_buffering_second_body_progress_refresh_differential =
         argc == 3 && strcmp(argv[1],
                             "--converter-default-buffering-second-body-progress-refresh-"
@@ -70443,6 +70976,7 @@ int main(int argc, char** argv) {
          !converter_default_buffering_206_range_delayed_completion_differential &&
          !converter_default_buffering_206_range_three_publication_completion_differential &&
          !converter_default_buffering_206_range_incomplete_clean_eof_differential &&
+         !converter_default_buffering_206_range_incomplete_body_inactivity_expiry_differential &&
          !converter_default_buffering_second_body_progress_refresh_differential &&
          !converter_default_buffering_three_publication_completion_differential &&
          !converter_default_buffering_third_body_progress_expiry_differential &&
@@ -70539,6 +71073,7 @@ int main(int argc, char** argv) {
           converter_default_buffering_206_range_delayed_completion_differential ||
           converter_default_buffering_206_range_three_publication_completion_differential ||
           converter_default_buffering_206_range_incomplete_clean_eof_differential ||
+          converter_default_buffering_206_range_incomplete_body_inactivity_expiry_differential ||
           converter_default_buffering_second_body_progress_refresh_differential ||
           converter_default_buffering_three_publication_completion_differential ||
           converter_default_buffering_third_body_progress_expiry_differential) &&
@@ -72342,6 +72877,34 @@ int main(int argc, char** argv) {
                "observations, not TCP/read/CQE boundaries. This claims no timeout-expiry, other "
                "incomplete-206/Range/status schedule, retry/reuse/pipeline, TLS/H2/epoll, or "
                "broad #253/#271 support.\n";
+        return 0;
+    }
+    if (converter_default_buffering_206_range_incomplete_body_inactivity_expiry_differential) {
+        const std::string container_name = "rut-nginx-554-206-incomplete-expiry-diff-" +
+                                           std::to_string(getpid()) + "-" +
+                                           (suffix ? suffix + 1 : "tmp");
+        std::string differential_error;
+        if (!run_converter_default_buffering_206_range_incomplete_body_inactivity_expiry_differential(
+                argv[2], container_name, differential_error)) {
+            std::cerr << "FAIL [#554 converter default-buffering 206 range incomplete body-"
+                         "inactivity-expiry differential]: "
+                      << differential_error << "\n";
+            return 1;
+        }
+        std::cerr
+            << "PASS: #554 pinned nginx 1.29.7 and independently converter-generated ordinary "
+               "RUT matched the incomplete coherent 206 body-inactivity expiry on fresh paired "
+               "resources. Each positive side sent the exact 78-byte Range request, published "
+               "only the exact 141-byte header-plus-he origin prefix, stayed open and byte-quiet "
+               "through W1+800ms, then emitted the equal Date-normalized 163-byte header-only "
+               "response and actual recv-zero EOF within the frozen expiry windows. Natural "
+               "origin retirement, exact 78-byte upstream ledgers, ASCII78+LF access, 175ms "
+               "no-retry stability, post-join histories, converter provenance, owned-source "
+               "custody and public io_uring execution were checked. A separate fresh real "
+               "asymmetric transaction (nginx 141-byte incomplete versus RUT 144-byte complete) "
+               "was rejected by the comparator before the fresh positive transaction. This "
+               "claims no other Range/status/framing schedule, retry/reuse/pipeline, TLS/H2/"
+               "epoll, or broad #253/#271 support.\n";
         return 0;
     }
     if (pinned_nginx_default_buffering_206_range_completion_oracle) {
