@@ -3498,13 +3498,13 @@ public:
             return false;
         if (c.response_read_deadline_progress_generation != owner.deadline_generation ||
             c.response_read_deadline_progress_episode != owner.upstream_episode ||
-            c.response_read_deadline_progress_bytes != received || owner.saw_positive) {
-            if (!owner.saw_positive ||
-                owner.first_copy_begin > 0xFFFFFFFFu - owner.positive_bytes ||
-                owner.first_copy_begin + owner.positive_bytes != owner.expected_copy_end ||
-                owner.expected_copy_end != c.upstream_recv_buf.len())
-                return false;
-        }
+            c.response_read_deadline_progress_bytes != received)
+            return false;
+        if (owner.saw_positive &&
+            (owner.first_copy_begin > 0xFFFFFFFFu - owner.positive_bytes ||
+             owner.first_copy_begin + owner.positive_bytes != owner.expected_copy_end ||
+             owner.expected_copy_end != c.upstream_recv_buf.len()))
+            return false;
         if (owner.post_commit_at_start &&
             (!owner.saw_positive && (owner.positive_bytes != 0 || owner.first_copy_begin != 0 ||
                                      owner.expected_copy_end != 0) ||

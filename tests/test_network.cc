@@ -47286,9 +47286,22 @@ TEST(response_buffering_runtime,
 
 TEST(response_buffering_runtime,
      coherent_single_range_206_incomplete_expiry_requires_active_due_timer_owner) {
-    enum class Forgery : u8 { MissingOwner, CopiedOwner, WrongResult, NotDue };
-    for (const Forgery forgery :
-         {Forgery::MissingOwner, Forgery::CopiedOwner, Forgery::WrongResult, Forgery::NotDue}) {
+    enum class Forgery : u8 {
+        MissingOwner,
+        CopiedOwner,
+        WrongResult,
+        NotDue,
+        ProgressGeneration,
+        ProgressEpisode,
+        ProgressBytes
+    };
+    for (const Forgery forgery : {Forgery::MissingOwner,
+                                  Forgery::CopiedOwner,
+                                  Forgery::WrongResult,
+                                  Forgery::NotDue,
+                                  Forgery::ProgressGeneration,
+                                  Forgery::ProgressEpisode,
+                                  Forgery::ProgressBytes}) {
         ScopedIoUringLoopForRetirement guard;
         if (!guard.init()) SKIP("io_uring unavailable");
         auto* loop = guard.loop;
@@ -47319,6 +47332,10 @@ TEST(response_buffering_runtime,
         REQUIRE(loop->complete_content_length_expiry_owner_is_valid(conn, owner));
         if (forgery == Forgery::WrongResult) timer.result = 0;
         if (forgery == Forgery::NotDue) conn.response_read_timer_last_progress_ns = monotonic_ns();
+        if (forgery == Forgery::ProgressGeneration)
+            conn.response_read_deadline_progress_generation ^= 1u;
+        if (forgery == Forgery::ProgressEpisode) conn.response_read_deadline_progress_episode ^= 1u;
+        if (forgery == Forgery::ProgressBytes) conn.response_read_deadline_progress_bytes++;
         if (forgery == Forgery::MissingOwner) {
             CHECK_FALSE(loop->start_complete_content_length_send(
                 conn,
@@ -47486,7 +47503,6 @@ TEST(response_buffering_runtime,
             CHECK(response_read_deadline_post_commit_is_stable(conn));
             conn.response_read_deadline_post_commit_send_body = 2u;
             CHECK_FALSE(response_read_deadline_post_commit_is_stable(conn));
-            conn.response_read_deadline_post_commit_send_body = 0u;
             loop->pump_response_read_deadline_bodies();
         } else {
             loop->dispatch_batch(&header, 1);
