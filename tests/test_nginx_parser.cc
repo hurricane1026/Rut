@@ -1203,8 +1203,7 @@ TEST(nginx_converter, lowers_access_log_off_to_owned_server_only_output) {
         "    listen 127.0.0.1:65535;\n"
         "    location / { proxy_read_timeout 63s; proxy_pass http://255.255.255.255:65535; }\n"
         "    location = /old { return 301 http://redirect.example/new; }\n";
-    const std::string source =
-        "http {\n  access_log off;\n  server {\n" + server_content + "  }\n}\n";
+    std::string source = "http {\n  access_log off;\n  server {\n" + server_content + "  }\n}\n";
     const auto profile =
         nginx::parse_http_profile({source.data(), static_cast<u32>(source.size())});
     REQUIRE(profile);
@@ -1245,8 +1244,11 @@ TEST(nginx_converter, lowers_access_log_off_to_owned_server_only_output) {
 
 TEST(nginx_converter, authenticates_access_log_off_and_complete_envelope) {
     const std::string source =
-        "http { access_log off; server { listen 127.0.0.1:8080; location / { "
-        "proxy_pass http://127.0.0.1:9000; } } }";
+        "http {\n  access_log off;\n  server {\n"
+        "    listen 127.0.0.1:65535;\n"
+        "    location / { proxy_read_timeout 63s; proxy_pass http://255.255.255.255:65535; }\n"
+        "    location = /old { return 301 http://redirect.example/new; }\n"
+        "  }\n}\n";
     const auto profile =
         nginx::parse_http_profile({source.data(), static_cast<u32>(source.size())});
     REQUIRE(profile);
@@ -1274,6 +1276,23 @@ TEST(nginx_converter, authenticates_access_log_off_and_complete_envelope) {
     rejected = nginx::lower_to_rut(forged);
     REQUIRE_FALSE(rejected);
     CHECK(rejected.error().detail.eq(lit_str("http profile metadata does not match its source")));
+
+    forged = profile.value();
+    forged.access_log.path.len++;
+    rejected = nginx::lower_to_rut(forged);
+    REQUIRE_FALSE(rejected);
+    forged = profile.value();
+    forged.access_log.format_name.ptr = reinterpret_cast<const char*>(static_cast<uintptr_t>(1));
+    rejected = nginx::lower_to_rut(forged);
+    REQUIRE_FALSE(rejected);
+    forged = profile.value();
+    forged.access_log.format_name_span.start++;
+    rejected = nginx::lower_to_rut(forged);
+    REQUIRE_FALSE(rejected);
+    forged = profile.value();
+    forged.access_log.span.start++;
+    rejected = nginx::lower_to_rut(forged);
+    REQUIRE_FALSE(rejected);
 
     forged = profile.value();
     forged.log_format.value_span.start++;
@@ -1304,6 +1323,21 @@ TEST(nginx_converter, authenticates_access_log_off_and_complete_envelope) {
     rejected = nginx::lower_to_rut(forged);
     REQUIRE_FALSE(rejected);
 
+    forged = profile.value();
+    forged.server.listen.port++;
+    rejected = nginx::lower_to_rut(forged);
+    REQUIRE_FALSE(rejected);
+
+    forged = profile.value();
+    forged.source = {};
+    rejected = nginx::lower_to_rut(forged);
+    REQUIRE_FALSE(rejected);
+    forged = profile.value();
+    forged.source.ptr = reinterpret_cast<const char*>(UINTPTR_MAX - 7u);
+    forged.source.len = UINT32_MAX;
+    rejected = nginx::lower_to_rut(forged);
+    REQUIRE_FALSE(rejected);
+
     std::string complete = "events {}\n" + source;
     const auto config =
         nginx::parse_nginx_http_config({complete.data(), static_cast<u32>(complete.size())});
@@ -1311,6 +1345,8 @@ TEST(nginx_converter, authenticates_access_log_off_and_complete_envelope) {
     const auto complete_lowered = nginx::lower_to_rut(config.value());
     REQUIRE(complete_lowered);
     CHECK(complete_lowered.value().view().eq(direct_server.value().view()));
+    const std::string complete_owned(complete_lowered.value().data, complete_lowered.value().len);
+    CHECK_EQ(complete_lowered.value().data[complete_lowered.value().len], '\0');
     auto forged_config = config.value();
     forged_config.http.access_log.path_span.start++;
     const auto config_rejected = nginx::lower_to_rut(forged_config);
@@ -1319,10 +1355,69 @@ TEST(nginx_converter, authenticates_access_log_off_and_complete_envelope) {
     CHECK_EQ(config_rejected.error().span.end, config.value().http_span.end);
     CHECK_EQ(config_rejected.error().span.line, config.value().http_span.line);
     CHECK_EQ(config_rejected.error().span.col, config.value().http_span.col);
+    forged_config = config.value();
+    forged_config.span.start++;
+    REQUIRE_FALSE(nginx::lower_to_rut(forged_config));
+    forged_config = config.value();
+    forged_config.events_span.end--;
+    REQUIRE_FALSE(nginx::lower_to_rut(forged_config));
+
+    std::fill(complete.begin(), complete.end(), 'x');
+    CHECK_EQ(std::string(complete_lowered.value().data, complete_lowered.value().len),
+             complete_owned);
 
     source[source.find("off")] = 'x';
     const auto source_changed = nginx::lower_to_rut(profile.value());
     REQUIRE_FALSE(source_changed);
+}
+
+TEST(nginx_complete_converter, access_log_off_preserves_unsupported_server_diagnostics) {
+    const std::string same_line =
+        "http { access_log off; server { listen 127.0.0.1:8080; location / { "
+        "proxy_buffering on; proxy_pass http://127.0.0.1:9000; } } }";
+    const auto parsed =
+        nginx::parse_http_profile({same_line.data(), static_cast<u32>(same_line.size())});
+    REQUIRE(parsed);
+    const auto lowered = nginx::lower_to_rut(parsed.value());
+    REQUIRE_FALSE(lowered);
+    CHECK_EQ(lowered.error().code, FrontendError::UnsupportedSyntax);
+    CHECK(lowered.error().detail.eq(
+        lit_str("proxy_buffering on requires the bounded timeout proxy profile")));
+    const size_t same_offset = same_line.find("proxy_buffering");
+    CHECK_EQ(lowered.error().span.start, static_cast<u32>(same_offset));
+    CHECK_EQ(lowered.error().span.line, 1u);
+
+    const std::string multiline =
+        "http {\n"
+        "  access_log off;\n"
+        "  server {\n"
+        "    listen 127.0.0.1:8080;\n"
+        "    location / {\n"
+        "      proxy_buffering on;\n"
+        "      proxy_pass http://127.0.0.1:9000;\n"
+        "    }\n"
+        "  }\n"
+        "}\n";
+    const auto multiline_parsed =
+        nginx::parse_http_profile({multiline.data(), static_cast<u32>(multiline.size())});
+    REQUIRE(multiline_parsed);
+    const auto multiline_lowered = nginx::lower_to_rut(multiline_parsed.value());
+    REQUIRE_FALSE(multiline_lowered);
+    CHECK_EQ(multiline_lowered.error().code, FrontendError::UnsupportedSyntax);
+    CHECK_EQ(multiline_lowered.error().span.start,
+             static_cast<u32>(multiline.find("proxy_buffering")));
+    CHECK_EQ(multiline_lowered.error().span.line, 6u);
+
+    const std::string complete = "events {}\n" + multiline;
+    const auto config =
+        nginx::parse_nginx_http_config({complete.data(), static_cast<u32>(complete.size())});
+    REQUIRE(config);
+    const auto complete_lowered = nginx::lower_to_rut(config.value());
+    REQUIRE_FALSE(complete_lowered);
+    CHECK_EQ(complete_lowered.error().code, FrontendError::UnsupportedSyntax);
+    CHECK_EQ(complete_lowered.error().span.start,
+             static_cast<u32>(complete.find("proxy_buffering")));
+    CHECK_EQ(complete_lowered.error().span.line, 7u);
 }
 
 TEST(nginx_http_profile_parser,

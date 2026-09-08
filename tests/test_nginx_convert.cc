@@ -7,6 +7,8 @@
 #include <cstdlib>
 #include <cstring>
 #include <string>
+#include <utility>
+#include <vector>
 
 #include <fcntl.h>
 #include <signal.h>
@@ -287,6 +289,36 @@ TEST(nginx_convert, access_log_off_cli_matches_server_output_without_log_declara
         CHECK(result.err.empty());
         CHECK_EQ(result.out, expected);
         CHECK_EQ(result.out.find("accessLog {"), std::string::npos);
+    }
+}
+
+TEST(nginx_convert, access_log_off_cli_rejects_unsupported_forms_without_stdout) {
+    const std::string directory = make_temp_dir();
+    REQUIRE_FALSE(directory.empty());
+    const std::string server =
+        "server { listen 127.0.0.1:8080; location / { proxy_pass http://127.0.0.1:9000; } }";
+    const std::vector<std::pair<std::string, std::string>> cases = {
+        {"mixed", "http { log_format compat \"$request_length\"; access_log off; " + server + " }"},
+        {"options", "http { access_log off buffer=32k; " + server + " }"},
+        {"nested",
+         "http { access_log off; server { access_log off; listen 127.0.0.1:8080; "
+         "location / { proxy_pass http://127.0.0.1:9000; } } }"},
+    };
+    for (const auto& test_case : cases) {
+        const std::string http_path = directory + "/" + test_case.first + ".conf";
+        const std::string complete_path = directory + "/" + test_case.first + "-complete.conf";
+        const std::string complete = "events {}\n" + test_case.second;
+        REQUIRE(write_file(http_path, test_case.second));
+        REQUIRE(write_file(complete_path, complete));
+        for (const auto& invocation : {std::pair<const char*, std::string>{"http", http_path},
+                                       {"nginx-http", complete_path}}) {
+            const RunResult result =
+                run_converter(g_executable, invocation.first, invocation.second, invocation.second);
+            REQUIRE(WIFEXITED(result.status));
+            CHECK_EQ(WEXITSTATUS(result.status), 1);
+            CHECK(result.out.empty());
+            CHECK(result.err.find(invocation.second + ":") == 0u);
+        }
     }
 }
 
