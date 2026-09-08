@@ -52813,28 +52813,53 @@ static bool run_converter_request_length_rut_side(TempDir& temp,
                 }
                 return owned(policy.server);
             };
-            if (loaded.value->config.response_policy_count != 3u) {
-                error = "#600 loaded custom-hide RUT response-policy count was not HEAD/GET/Any";
+            if (loaded.value->config.response_policy_count != 2u) {
+                error = "#600 loaded custom-hide RUT response-policy interning was not exact";
                 return false;
             }
+            u16 head_policy_id = 0u;
+            u16 ordinary_policy_id = 0u;
             for (u32 index = 0u; index < loaded.value->config.response_policy_count; index++) {
-                if (!exact_policy(loaded.value->config.response_policies[index])) {
+                const auto& policy = loaded.value->config.response_policies[index];
+                if (!exact_policy(policy)) {
                     error = "#600 loaded custom-hide response policy was not exact/owned";
                     return false;
                 }
+                if (policy.head_mode == rut::ResponsePolicyHeadMode::SuppressBody)
+                    head_policy_id = static_cast<u16>(index + 1u);
+                else if (policy.head_mode == rut::ResponsePolicyHeadMode::Reject)
+                    ordinary_policy_id = static_cast<u16>(index + 1u);
+                else {
+                    error = "#600 loaded custom-hide response policy had an invalid head mode";
+                    return false;
+                }
             }
-            bool bound_get = false;
-            bool bound_head = false;
-            bool bound_any = false;
+            if (head_policy_id == 0u || ordinary_policy_id == 0u) {
+                error = "#600 loaded custom-hide response policies lacked HEAD/ordinary pair";
+                return false;
+            }
+            u32 root_route_count = 0u;
+            u32 bound_get = 0u;
+            u32 bound_head = 0u;
+            u32 bound_any = 0u;
             for (u32 index = 0u; index < loaded.value->config.route_count; index++) {
                 const rut::RouteEntry& route = loaded.value->config.routes[index];
                 if (route.path_len != 1u || route.path[0] != '/' ||
-                    route.preflight_forward_policy_bundle_id == 0u)
-                    continue;
+                    route.preflight_forward_policy_bundle_id == 0u ||
+                    route.action != rut::RouteAction::Proxy) {
+                    error = "#600 loaded custom-hide RUT contained an unexpected route";
+                    return false;
+                }
+                root_route_count++;
                 const auto method = route.method;
-                if (method == rut::kRouteMethodGet) bound_get = true;
-                if (method == rut::kRouteMethodHead) bound_head = true;
-                if (method == rut::kRouteMethodAny) bound_any = true;
+                if (method == rut::kRouteMethodGet) bound_get++;
+                if (method == rut::kRouteMethodHead) bound_head++;
+                if (method == rut::kRouteMethodAny) bound_any++;
+                if (method != rut::kRouteMethodGet && method != rut::kRouteMethodHead &&
+                    method != rut::kRouteMethodAny) {
+                    error = "#600 loaded custom-hide RUT contained an unexpected method";
+                    return false;
+                }
                 const u16 bundle_id = route.preflight_forward_policy_bundle_id;
                 if (bundle_id > loaded.value->config.policy_bundle_count) {
                     error = "#600 loaded custom-hide route binding was out of range";
@@ -52842,7 +52867,9 @@ static bool run_converter_request_length_rut_side(TempDir& temp,
                 }
                 const rut::ForwardPolicyBundle& bundle =
                     loaded.value->config.policy_bundles[bundle_id - 1u];
-                if (bundle.response_policy_id == 0u ||
+                const u16 expected_policy_id =
+                    method == rut::kRouteMethodHead ? head_policy_id : ordinary_policy_id;
+                if (bundle.response_policy_id != expected_policy_id ||
                     bundle.response_policy_id > loaded.value->config.response_policy_count ||
                     !exact_policy(
                         loaded.value->config.response_policies[bundle.response_policy_id - 1u])) {
@@ -52850,8 +52877,8 @@ static bool run_converter_request_length_rut_side(TempDir& temp,
                     return false;
                 }
             }
-            if (!bound_get || !bound_head || !bound_any) {
-                error = "#600 loaded custom-hide RUT lacked HEAD/GET/Any bindings";
+            if (root_route_count != 3u || bound_get != 1u || bound_head != 1u || bound_any != 1u) {
+                error = "#600 loaded custom-hide RUT lacked exact HEAD/GET/Any bindings";
                 return false;
             }
         }
