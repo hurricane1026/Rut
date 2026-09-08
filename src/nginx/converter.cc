@@ -311,8 +311,8 @@ FrontendResult<bool> validate_proxy_buffering(const Server& server) {
             fresh.value_span.end - fresh.value_span.start ||
         buffering.span.start - server.span.start != fresh.span.start ||
         buffering.value_span.start - server.span.start != fresh.value_span.start ||
-        !span_position_is_coherent(source_base, server.span, buffering.span) ||
-        !span_position_is_coherent(source_base, server.span, buffering.value_span))
+        !source_position_is_coherent(source_base, server.span, buffering.span) ||
+        !source_position_is_coherent(source_base, server.span, buffering.value_span))
         return unsupported(is_valid_span(buffering.span) ? buffering.span : location.span,
                            lit_str("proxy_buffering metadata does not match its source"));
     if (!span_position_is_coherent(location.span, buffering.span) ||
