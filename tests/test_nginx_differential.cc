@@ -24762,28 +24762,58 @@ static bool run_recv_owner_diagnostic_self_check(std::string& error) {
         return false;
     }
     const auto reap_bounded = [](pid_t child, int* status) {
-        const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
-        while (std::chrono::steady_clock::now() < deadline) {
-            const pid_t result = waitpid(child, status, WNOHANG);
-            if (result == child) return true;
-            if (result < 0 && errno != EINTR) return false;
-            poll(nullptr, 0, 1);
-        }
-        (void)kill(child, SIGKILL);
-        while (waitpid(child, status, 0) < 0 && errno == EINTR) {
-        }
+        const auto reap_until = [&](std::chrono::steady_clock::time_point deadline) {
+            while (std::chrono::steady_clock::now() < deadline) {
+                const pid_t result = waitpid(child, status, WNOHANG);
+                if (result == child) return true;
+                if (result < 0 && errno != EINTR) return false;
+                poll(nullptr, 0, 1);
+            }
+            return false;
+        };
+        if (reap_until(std::chrono::steady_clock::now() + std::chrono::seconds(2))) return true;
+        if (kill(child, SIGKILL) != 0 && errno != ESRCH) return false;
+        if (reap_until(std::chrono::steady_clock::now() + std::chrono::seconds(2))) return true;
         return false;
     };
+    struct MappingGuard {
+        rut_iouring_gate* gate = nullptr;
+        bool mutex_initialized = false;
+        ~MappingGuard() {
+            if (gate == nullptr) return;
+            if (mutex_initialized) {
+                (void)pthread_mutex_destroy(&gate->identity_mutex);
+            }
+            (void)munmap(gate, sizeof(*gate));
+        }
+    };
+    struct MutexGuard {
+        pthread_mutex_t* mutex = nullptr;
+        bool initialized = false;
+        ~MutexGuard() {
+            if (initialized) (void)pthread_mutex_destroy(mutex);
+        }
+    };
+    const auto init_shared_robust_mutex = [](pthread_mutex_t* mutex) {
+        pthread_mutexattr_t attributes;
+        if (pthread_mutexattr_init(&attributes) != 0) return false;
+        const bool attributes_ok =
+            pthread_mutexattr_setpshared(&attributes, PTHREAD_PROCESS_SHARED) == 0 &&
+            pthread_mutexattr_setrobust(&attributes, PTHREAD_MUTEX_ROBUST) == 0;
+        const int init_result = attributes_ok ? pthread_mutex_init(mutex, &attributes) : -1;
+        const int destroy_result = pthread_mutexattr_destroy(&attributes);
+        if (!attributes_ok || init_result != 0 || destroy_result != 0) {
+            if (init_result == 0) (void)pthread_mutex_destroy(mutex);
+            return false;
+        }
+        return true;
+    };
     rut_iouring_gate gate{};
-    pthread_mutexattr_t attributes;
-    if (pthread_mutexattr_init(&attributes) != 0 ||
-        pthread_mutexattr_setpshared(&attributes, PTHREAD_PROCESS_SHARED) != 0 ||
-        pthread_mutexattr_setrobust(&attributes, PTHREAD_MUTEX_ROBUST) != 0 ||
-        pthread_mutex_init(&gate.identity_mutex, &attributes) != 0) {
+    if (!init_shared_robust_mutex(&gate.identity_mutex)) {
         error = "recv-owner diagnostic self-check mutex initialization failed";
         return false;
     }
-    (void)pthread_mutexattr_destroy(&attributes);
+    MutexGuard gate_mutex{&gate.identity_mutex, true};
     rut_downstream_gate_store(&gate.identity_mutex_initialized, 1);
     rut_downstream_gate_store(&gate.state, RUT_DOWNSTREAM_GATE_ARMED);
     gate.mode = RUT_IOURING_GATE_MODE_LATE_SUCCESSOR;
@@ -24890,36 +24920,37 @@ static bool run_recv_owner_diagnostic_self_check(std::string& error) {
         error = "recv-owner complete owner-death shared mapping failed";
         return false;
     }
+    MappingGuard complete_mapping{complete_gate};
     memset(complete_gate, 0, sizeof(*complete_gate));
-    pthread_mutexattr_t complete_attributes;
-    if (pthread_mutexattr_init(&complete_attributes) != 0 ||
-        pthread_mutexattr_setpshared(&complete_attributes, PTHREAD_PROCESS_SHARED) != 0 ||
-        pthread_mutexattr_setrobust(&complete_attributes, PTHREAD_MUTEX_ROBUST) != 0 ||
-        pthread_mutex_init(&complete_gate->identity_mutex, &complete_attributes) != 0) {
+    if (!init_shared_robust_mutex(&complete_gate->identity_mutex)) {
         error = "recv-owner complete owner-death shared mutex failed";
         return false;
     }
-    (void)pthread_mutexattr_destroy(&complete_attributes);
+    complete_mapping.mutex_initialized = true;
     rut_downstream_gate_store(&complete_gate->identity_mutex_initialized, 1);
     rut_downstream_gate_store(&complete_gate->state, RUT_DOWNSTREAM_GATE_FAILED);
     rut_downstream_gate_store(&complete_gate->error_code, RUT_IOURING_GATE_ERROR_RECV_OWNER);
+    complete_gate->ring_fd = 17;
+    complete_gate->intercepted_fd = 18;
+    complete_gate->ring_ready = 1;
     complete_gate->recv_owner_failure = candidate;
     __atomic_store_n(&complete_gate->recv_owner_failure.valid, 1u, __ATOMIC_RELEASE);
     const pid_t complete_owner_death = fork();
     if (complete_owner_death == 0) {
-        (void)pthread_mutex_lock(&complete_gate->identity_mutex);
-        _exit(0);
+        _exit(pthread_mutex_lock(&complete_gate->identity_mutex) == 0 ? 0 : 111);
     }
     int complete_status = 0;
     if (complete_owner_death < 0 || !reap_bounded(complete_owner_death, &complete_status) ||
+        !WIFEXITED(complete_status) || WEXITSTATUS(complete_status) != 0 ||
         !rut_iouring_gate_lock_identity(complete_gate, 2000) ||
-        __atomic_load_n(&complete_gate->recv_owner_failure.valid, __ATOMIC_ACQUIRE) != 1u) {
+        __atomic_load_n(&complete_gate->recv_owner_failure.valid, __ATOMIC_ACQUIRE) != 1u ||
+        rut_downstream_gate_load(&complete_gate->state) != RUT_DOWNSTREAM_GATE_FAILED ||
+        complete_gate->ring_fd != -1 || complete_gate->intercepted_fd != -1 ||
+        rut_downstream_gate_load(&complete_gate->ring_ready) != 0u) {
         error = "recv-owner owner-death recovery discarded complete evidence";
         return false;
     }
     rut_iouring_gate_unlock_identity(complete_gate);
-    (void)pthread_mutex_destroy(&complete_gate->identity_mutex);
-    (void)munmap(complete_gate, sizeof(*complete_gate));
 
     auto* partial = static_cast<rut_iouring_gate*>(mmap(nullptr,
                                                         sizeof(rut_iouring_gate),
@@ -24931,37 +24962,37 @@ static bool run_recv_owner_diagnostic_self_check(std::string& error) {
         error = "recv-owner partial-publication shared mapping failed";
         return false;
     }
+    MappingGuard partial_mapping{partial};
     memset(partial, 0, sizeof(*partial));
-    pthread_mutexattr_t partial_attributes;
-    if (pthread_mutexattr_init(&partial_attributes) != 0 ||
-        pthread_mutexattr_setpshared(&partial_attributes, PTHREAD_PROCESS_SHARED) != 0 ||
-        pthread_mutexattr_setrobust(&partial_attributes, PTHREAD_MUTEX_ROBUST) != 0 ||
-        pthread_mutex_init(&partial->identity_mutex, &partial_attributes) != 0) {
+    if (!init_shared_robust_mutex(&partial->identity_mutex)) {
         error = "recv-owner partial-publication mutex initialization failed";
         return false;
     }
-    (void)pthread_mutexattr_destroy(&partial_attributes);
+    partial_mapping.mutex_initialized = true;
     rut_downstream_gate_store(&partial->identity_mutex_initialized, 1);
     rut_downstream_gate_store(&partial->state, RUT_DOWNSTREAM_GATE_ARMED);
     partial->error_code = RUT_IOURING_GATE_ERROR_RECV_OWNER;
     partial->recv_owner_failure.reason = RUT_IOURING_GATE_RECV_OWNER_REASON_RECV_ID_CHANGED;
+    partial->ring_fd = 23;
+    partial->intercepted_fd = 24;
+    partial->ring_ready = 1;
     __atomic_store_n(&partial->recv_owner_failure.valid, 0u, __ATOMIC_RELEASE);
     const pid_t child = fork();
     if (child == 0) {
-        (void)pthread_mutex_lock(&partial->identity_mutex);
-        _exit(0);
+        _exit(pthread_mutex_lock(&partial->identity_mutex) == 0 ? 0 : 111);
     }
     int child_status = 0;
-    if (child < 0 || !reap_bounded(child, &child_status) ||
-        !rut_iouring_gate_lock_identity(partial, 2000) ||
-        __atomic_load_n(&partial->recv_owner_failure.valid, __ATOMIC_ACQUIRE) != 0u) {
+    if (child < 0 || !reap_bounded(child, &child_status) || !WIFEXITED(child_status) ||
+        WEXITSTATUS(child_status) != 0 || !rut_iouring_gate_lock_identity(partial, 2000) ||
+        __atomic_load_n(&partial->recv_owner_failure.valid, __ATOMIC_ACQUIRE) != 0u ||
+        rut_downstream_gate_load(&partial->state) != RUT_DOWNSTREAM_GATE_FAILED ||
+        partial->ring_fd != -1 || partial->intercepted_fd != -1 ||
+        rut_downstream_gate_load(&partial->ring_ready) != 0u ||
+        partial->recv_owner_failure.reason != RUT_IOURING_GATE_RECV_OWNER_REASON_NONE) {
         error = "recv-owner owner-death recovery exposed partial evidence";
         return false;
     }
     rut_iouring_gate_unlock_identity(partial);
-    (void)pthread_mutex_destroy(&partial->identity_mutex);
-    (void)munmap(partial, sizeof(*partial));
-    (void)pthread_mutex_destroy(&gate.identity_mutex);
     return true;
 }
 
