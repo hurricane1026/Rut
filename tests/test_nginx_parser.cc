@@ -2519,6 +2519,112 @@ TEST(nginx_parser, rejects_proxy_read_timeout_outside_exact_root_location_contex
         lit_str("location path is outside the bounded clean proxy profile")));
 }
 
+TEST(nginx_parser, recognizes_root_proxy_buffering_on_with_complete_spans) {
+    const char* const sources[] = {
+        "server { listen 8080; location / { proxy_buffering on; proxy_pass "
+        "http://127.0.0.1:9000; } }",
+        "server { listen 127.0.0.1:8080; location / { proxy_pass "
+        "http://127.0.0.1:9000; # ordinary comment\n proxy_buffering on; } }",
+    };
+    for (const char* source : sources) {
+        const auto parsed = nginx::parse({source, static_cast<u32>(strlen(source))});
+        REQUIRE(parsed);
+        const auto& buffering = parsed.value().location.proxy_buffering;
+        REQUIRE(buffering.present);
+        CHECK_EQ(buffering.span.start,
+                 static_cast<u32>(strstr(source, "proxy_buffering") - source));
+        CHECK_EQ(buffering.value_span.start, static_cast<u32>(strstr(source, "on;") - source));
+        CHECK_EQ(buffering.value_span.end - buffering.value_span.start, 2u);
+        CHECK_EQ(buffering.span.end - buffering.span.start,
+                 static_cast<u32>(strchr(source + buffering.span.start, ';') + 1 -
+                                  (source + buffering.span.start)));
+    }
+}
+
+TEST(nginx_parser, rejects_proxy_buffering_unsupported_grammar_and_contexts) {
+    const char* const sources[] = {
+        "server { listen 8080; proxy_buffering on; location / { proxy_pass "
+        "http://127.0.0.1:9000; } }",
+        "server { listen 8080; location /api/ { proxy_buffering on; proxy_pass "
+        "http://127.0.0.1:9000/; } }",
+        "server { listen 8080; location / { proxy_buffering off; proxy_pass "
+        "http://127.0.0.1:9000; } }",
+        "server { listen 8080; location / { proxy_buffering $buffering; proxy_pass "
+        "http://127.0.0.1:9000; } }",
+        "server { listen 8080; location / { proxy_buffering \"on\"; proxy_pass "
+        "http://127.0.0.1:9000; } }",
+        "server { listen 8080; location / { proxy_buffering on extra; proxy_pass "
+        "http://127.0.0.1:9000; } }",
+        "server { listen 8080; location / { proxy_buffering on; proxy_buffering on; "
+        "proxy_pass http://127.0.0.1:9000; } }",
+    };
+    for (const char* source : sources) {
+        const auto parsed = nginx::parse({source, static_cast<u32>(strlen(source))});
+        CHECK_FALSE(parsed);
+        CHECK_EQ(parsed.error().code, FrontendError::UnsupportedSyntax);
+    }
+}
+
+TEST(nginx_converter, rejects_explicit_proxy_buffering_on_before_lowering) {
+    const char source[] =
+        "server { listen 127.0.0.1:8080; location / { proxy_buffering on; "
+        "proxy_read_timeout 1s; proxy_pass http://127.0.0.1:9000; } }";
+    const auto parsed = nginx::parse({source, sizeof(source) - 1u});
+    REQUIRE(parsed);
+    const auto rejected = nginx::lower_to_rut(parsed.value());
+    REQUIRE_FALSE(rejected);
+    CHECK_EQ(rejected.error().code, FrontendError::UnsupportedSyntax);
+    CHECK(rejected.error().detail.eq(lit_str("proxy_buffering on is recognized but unsupported")));
+
+    auto erased = parsed.value();
+    erased.location.proxy_buffering = {};
+    const auto erased_result = nginx::lower_to_rut(erased);
+    REQUIRE_FALSE(erased_result);
+    CHECK(rejected.error().detail.eq(lit_str("proxy_buffering on is recognized but unsupported")) ||
+          erased_result.error().detail.eq(lit_str("proxy_buffering metadata was erased")));
+
+    char wildcard_source[] =
+        "server { listen 8080; location / { proxy_pass http://127.0.0.1:9000; "
+        "proxy_buffering on; } }";
+    const auto wildcard = nginx::parse({wildcard_source, sizeof(wildcard_source) - 1u});
+    REQUIRE(wildcard);
+    auto wildcard_erased = wildcard.value();
+    wildcard_erased.location.proxy_buffering = {};
+    const auto wildcard_result = nginx::lower_to_rut(wildcard_erased);
+    REQUIRE_FALSE(wildcard_result);
+    CHECK(wildcard_result.error().detail.eq(lit_str("proxy_buffering metadata was erased")));
+
+    char corrupted_source[] =
+        "server { listen 127.0.0.1:8080; location / { proxy_buffering on; "
+        "proxy_pass http://127.0.0.1:9000; } }";
+    const auto corrupted = nginx::parse({corrupted_source, sizeof(corrupted_source) - 1u});
+    REQUIRE(corrupted);
+    const u32 buffering_start = corrupted.value().location.proxy_buffering.span.start;
+    corrupted_source[buffering_start] = 'X';
+    const auto corrupted_result = nginx::lower_to_rut(corrupted.value());
+    REQUIRE_FALSE(corrupted_result);
+    CHECK(corrupted_result.error().detail.eq(lit_str("invalid proxy_buffering source syntax")));
+}
+
+TEST(nginx_converter, http_profile_compares_proxy_buffering_metadata_before_lowering) {
+    const std::string source = make_request_length_http_profile(
+        "/tmp/compat.log",
+        "    listen 127.0.0.1:8080;\n"
+        "    location / { proxy_buffering on; proxy_pass http://127.0.0.1:9000; }\n");
+    const auto parsed = nginx::parse_http_profile({source.data(), static_cast<u32>(source.size())});
+    REQUIRE(parsed);
+    const auto rejected = nginx::lower_to_rut(parsed.value());
+    REQUIRE_FALSE(rejected);
+    CHECK(rejected.error().detail.eq(lit_str("proxy_buffering on is recognized but unsupported")) ||
+          rejected.error().detail.eq(lit_str("http profile metadata does not match its source")));
+    auto erased = parsed.value();
+    erased.server.location.proxy_buffering = {};
+    const auto erased_result = nginx::lower_to_rut(erased);
+    REQUIRE_FALSE(erased_result);
+    CHECK(erased_result.error().detail.eq(
+        lit_str("http profile metadata does not match its source")));
+}
+
 TEST(nginx_parser, parses_api_location_and_proxy_uri_with_spans) {
     const char source[] =
         "server {\n"

@@ -654,6 +654,16 @@ private:
                 if (!timeout) return core::make_unexpected(timeout.error());
                 result.proxy_read_timeout = timeout.value();
                 have_proxy_read_timeout = true;
+            } else if (eq(cur_.text, "proxy_buffering", 15)) {
+                if (!eq(path.text, "/", 1))
+                    return unsupported(
+                        cur_.span,
+                        lit_str("proxy_buffering is unsupported in transformed locations"));
+                if (result.proxy_buffering.present)
+                    return unsupported(cur_.span, lit_str("duplicate proxy_buffering"));
+                auto buffering = parse_proxy_buffering();
+                if (!buffering) return core::make_unexpected(buffering.error());
+                result.proxy_buffering = buffering.value();
             } else if (eq(cur_.text, "proxy_hide_header", 17)) {
                 if (have_proxy_hide_header)
                     return unsupported(cur_.span, lit_str("duplicate proxy_hide_header"));
@@ -749,6 +759,9 @@ private:
             } else if (eq(cur_.text, "proxy_hide_header", 17)) {
                 return unsupported(cur_.span,
                                    lit_str("proxy_hide_header is unsupported in exact locations"));
+            } else if (eq(cur_.text, "proxy_buffering", 15)) {
+                return unsupported(cur_.span,
+                                   lit_str("proxy_buffering is unsupported in exact locations"));
             } else if (eq(cur_.text, "location", 8)) {
                 return unsupported(cur_.span, lit_str("nested locations are unsupported"));
             } else {
@@ -950,6 +963,30 @@ private:
         advance();
         return ProxyReadTimeout{
             true, seconds * 1000u, Span{start.start, end.end, start.line, start.col}, value.span};
+    }
+
+    FrontendResult<ProxyBuffering> parse_proxy_buffering() {
+        const Span start = cur_.span;
+        advance();
+        if (cur_.kind == TokenKind::End)
+            return missing(cur_.span, lit_str("proxy_buffering requires a value"));
+        if (cur_.kind != TokenKind::Word)
+            return invalid(cur_.span, lit_str("proxy_buffering requires a value"));
+        const Token value = cur_;
+        if (!eq(value.text, "on", 2))
+            return unsupported(value.span,
+                               lit_str("only literal proxy_buffering on is recognized"));
+        advance();
+        if (cur_.kind == TokenKind::End)
+            return missing(cur_.span, lit_str("expected ';' after proxy_buffering"));
+        if (cur_.kind != TokenKind::Semicolon) {
+            if (cur_.kind == TokenKind::Word)
+                return unsupported(cur_.span, lit_str("proxy_buffering accepts exactly one value"));
+            return invalid(cur_.span, lit_str("expected ';' after proxy_buffering"));
+        }
+        const Span end = cur_.span;
+        advance();
+        return ProxyBuffering{true, Span{start.start, end.end, start.line, start.col}, value.span};
     }
 
     FrontendResult<ProxyHideHeader> parse_proxy_hide_header() {
