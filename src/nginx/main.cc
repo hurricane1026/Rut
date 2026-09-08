@@ -12,7 +12,7 @@
 
 namespace {
 
-constexpr size_t kMaxInputBytes = 1024u * 1024u;
+constexpr size_t kMaxInputBytes = size_t{1024u} * size_t{1024u};
 
 bool write_all(int fd, const char* data, size_t length) {
     size_t offset = 0u;
@@ -135,7 +135,7 @@ bool read_input(const char* filename, char** output, size_t* length, const char*
     return true;
 }
 
-enum class Format { Server, Http };
+enum class Format : std::uint8_t { Server, Http };
 
 int usage(const char* program) {
     write_cstr(STDERR_FILENO, "usage: ");
