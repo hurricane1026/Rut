@@ -54919,7 +54919,8 @@ static bool validate_explicit_timeout_head_profile(const std::string& profile,
         count_text(profile, "access_log " + access_path + " compat;") != 1u ||
         count_text(profile, listener) != 1u || count_text(profile, upstream) != 1u ||
         count_text(profile, "proxy_read_timeout 1s;") != 1u ||
-        count_text(profile, "proxy_buffering on;") != (explicit_buffering_on ? 1u : 0u) ||
+        count_text(profile, "proxy_buffering") != (explicit_buffering_on ? 1u : 0u) ||
+        (explicit_buffering_on && count_text(profile, "proxy_buffering on;") != 1u) ||
         profile.find("proxy_request_buffering") != std::string::npos ||
         profile.find("proxy_http_version") != std::string::npos ||
         profile.find("proxy_set_header") != std::string::npos ||
@@ -55680,6 +55681,29 @@ static bool run_converter_explicit_timeout_head_source_self_checks(std::string& 
         make_explicit_timeout_head_profile(frontend_port, backend_port, access_path);
     if (!validate_explicit_timeout_head_profile(
             profile, frontend_port, backend_port, access_path, error))
+        return false;
+    const auto require_rejected_profile = [&](std::string candidate, const char* label) {
+        std::string ignored;
+        if (validate_explicit_timeout_head_profile(
+                candidate, frontend_port, backend_port, access_path, ignored, true)) {
+            error = std::string("#572 profile validator accepted ") + label;
+            return false;
+        }
+        return true;
+    };
+    std::string off = profile;
+    off.replace(off.find("proxy_buffering on;"),
+                sizeof("proxy_buffering on;") - 1u,
+                "proxy_buffering off;");
+    if (!require_rejected_profile(std::move(off), "proxy_buffering off")) return false;
+    std::string duplicate = profile;
+    duplicate.insert(duplicate.find("proxy_pass"), "proxy_buffering on;\n      ");
+    if (!require_rejected_profile(std::move(duplicate), "duplicate proxy_buffering")) return false;
+    std::string noncanonical = profile;
+    noncanonical.replace(noncanonical.find("proxy_buffering on;"),
+                         sizeof("proxy_buffering on;") - 1u,
+                         "proxy_buffering ON;");
+    if (!require_rejected_profile(std::move(noncanonical), "noncanonical proxy_buffering"))
         return false;
     std::string generated;
     if (!build_explicit_timeout_head_generated_source(

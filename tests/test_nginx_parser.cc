@@ -2623,8 +2623,8 @@ TEST(nginx_converter, admits_authenticated_explicit_proxy_buffering_on_timeout_f
         const auto candidate_lowered = nginx::lower_to_rut(candidate.value());
         REQUIRE(candidate_lowered);
         const std::string expected_source =
-            "server { listen 127.0.0.1:8080; location / { proxy_read_timeout " + timeouts[index] +
-            "s; proxy_pass http://127.0.0.1:9000; } }";
+            std::string("server { listen 127.0.0.1:8080; location / { proxy_read_timeout ") +
+            timeouts[index] + "s; proxy_pass http://127.0.0.1:9000; } }";
         const auto expected =
             nginx::parse({expected_source.data(), static_cast<u32>(expected_source.size())});
         REQUIRE(expected);
@@ -2642,6 +2642,27 @@ TEST(nginx_converter, admits_authenticated_explicit_proxy_buffering_on_timeout_f
     REQUIRE_FALSE(no_timeout_result);
     CHECK(no_timeout_result.error().detail.eq(
         lit_str("proxy_buffering on requires the bounded timeout proxy profile")));
+
+    const char* const rejected_profiles[] = {
+        "server { listen 8080; location / { proxy_buffering on; proxy_read_timeout 1s; "
+        "proxy_pass http://127.0.0.1:9000; } }",
+        "server { listen 192.0.2.10:8080; location / { proxy_buffering on; "
+        "proxy_read_timeout 1s; proxy_pass http://127.0.0.1:9000; } }",
+        "server { listen 127.0.0.1:8080; location / { proxy_buffering on; "
+        "proxy_read_timeout 1s; proxy_hide_header X-Compat-Hidden; proxy_pass "
+        "http://127.0.0.1:9000; } }",
+        "server { listen 127.0.0.1:8080; location / { proxy_buffering on; "
+        "proxy_read_timeout 1s; proxy_pass http://127.0.0.1:9000; } "
+        "location = /old { return 302 http://redirect.example/new; } }",
+    };
+    for (const char* rejected_source : rejected_profiles) {
+        const auto rejected_model =
+            nginx::parse({rejected_source, static_cast<u32>(strlen(rejected_source))});
+        REQUIRE(rejected_model);
+        const auto rejected_lowering = nginx::lower_to_rut(rejected_model.value());
+        REQUIRE_FALSE(rejected_lowering);
+        CHECK_EQ(rejected_lowering.error().code, FrontendError::UnsupportedSyntax);
+    }
 
     auto erased = parsed.value();
     erased.location.proxy_buffering = {};

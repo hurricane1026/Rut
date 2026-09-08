@@ -380,32 +380,16 @@ FrontendResult<ProxyLocationProfile> validate_prefix_without_uri(const Server& s
         header.present && is_valid_span(header.span) && span_contains(location.span, header.span) &&
         header.span.end < location.span.end &&
         !(header.span.start < proxy.span.end && proxy.span.start < header.span.end);
-    const ProxyBuffering& buffering = location.proxy_buffering;
-    const bool coherent_buffering_span =
-        buffering.present && is_valid_span(buffering.span) &&
-        span_contains(location.span, buffering.span) && buffering.span.end < location.span.end &&
-        !(buffering.span.start < proxy.span.end && proxy.span.start < buffering.span.end);
-    u32 first_directive_start = proxy.span.start;
-    if (coherent_hide_span && header.span.start < first_directive_start)
-        first_directive_start = header.span.start;
-    if (coherent_buffering_span && buffering.span.start < first_directive_start)
-        first_directive_start = buffering.span.start;
+    const u32 first_directive_start = coherent_hide_span && header.span.start < proxy.span.start
+                                          ? header.span.start
+                                          : proxy.span.start;
     u32 cursor = location.path_span.end;
     if (!advance_trusted_source_gap(
             source_base, cursor, hide_inventory ? location.span.end - 1u : first_directive_start) ||
         cursor >= location.span.end - 1u || *trusted_source_at(source_base, cursor) != '{' ||
         (!hide_inventory &&
          (!trusted_source_gap_is_exact(source_base, cursor + 1u, first_directive_start) ||
-          (coherent_buffering_span && buffering.span.start < proxy.span.start
-               ? !trusted_source_gap_is_exact(source_base, buffering.span.end, proxy.span.start)
-               : (coherent_buffering_span &&
-                  !trusted_source_gap_is_exact(
-                      source_base, proxy.span.end, buffering.span.start))) ||
-          !trusted_source_gap_is_exact(
-              source_base,
-              coherent_buffering_span && buffering.span.end > proxy.span.end ? buffering.span.end
-                                                                             : proxy.span.end,
-              location.span.end - 1u))))
+          !trusted_source_gap_is_exact(source_base, proxy.span.end, location.span.end - 1u))))
         return unsupported(location.span, lit_str("invalid proxy location source syntax"));
     if (proxy.span.end - proxy.span.start < 13u ||
         !eq({trusted_source_at(source_base, proxy.span.start), 10u}, "proxy_pass", 10u) ||
