@@ -1569,7 +1569,11 @@ bool put_pre_route_trace(Writer& writer, ImplicitPreRouteProfile profile) {
            writer.put_lit(kTraceBody, sizeof(kTraceBody) - 1u) && writer.put_cstr("\"\n}) }\n");
 }
 
-enum class RequestPolicyPlacement : u8 { Legacy, ContentLengthAfterHost };
+enum class RequestPolicyPlacement : u8 {
+    Legacy,
+    ContentLengthAfterHost,
+    RetainedHeaderValue,
+};
 
 bool put_request_policy(Writer& writer, RequestPolicyPlacement placement) {
     return writer.put_cstr("request_policy: {\n") &&
@@ -1580,7 +1584,11 @@ bool put_request_policy(Writer& writer, RequestPolicyPlacement placement) {
             writer.put_cstr("            content_length_position: \"after_host\",\n")) &&
            writer.put_cstr(
                "            strip_headers: [\"Connection\", \"Keep-Alive\", \"TE\", \"Expect\", "
-               "\"Upgrade\"]\n") &&
+               "\"Upgrade\"]") &&
+           (placement == RequestPolicyPlacement::RetainedHeaderValue ? writer.put_cstr(",\n")
+                                                                     : writer.put_cstr("\n")) &&
+           (placement != RequestPolicyPlacement::RetainedHeaderValue ||
+            writer.put_cstr("            retained_header_value: \"trim_sp_preserve_htab\"\n")) &&
            writer.put_cstr("        },\n");
 }
 
@@ -1699,6 +1707,29 @@ bool put_root_timeout_head_forward(Writer& writer, bool hide_compat_header, u8 t
                                    hide_compat_header,
                                    true,
                                    timeout_seconds,
+                                   lit_str("        ")) &&
+           writer.put_cstr("    }\n}\n");
+}
+
+bool put_root_get_retained_header_forward(Writer& writer, bool hide_compat_header) {
+    return writer.put_cstr("route GET \"/\" {\n") &&
+           writer.put_cstr("    if req.hasContentLength {\n") &&
+           put_root_forward_action(writer,
+                                   RequestPolicyPlacement::Legacy,
+                                   false,
+                                   true,
+                                   hide_compat_header,
+                                   false,
+                                   60u,
+                                   lit_str("        ")) &&
+           writer.put_cstr("    } else {\n") &&
+           put_root_forward_action(writer,
+                                   RequestPolicyPlacement::RetainedHeaderValue,
+                                   false,
+                                   true,
+                                   hide_compat_header,
+                                   false,
+                                   60u,
                                    lit_str("        ")) &&
            writer.put_cstr("    }\n}\n");
 }
@@ -2034,6 +2065,12 @@ FrontendResult<RutSource> lower_to_rut(const Server& server) {
         return invalid_integer(server.location.proxy_pass.span,
                                lit_str("invalid model upstream port"));
     const bool is_root = proxy_location.value() == ProxyLocationProfile::RootWithoutUri;
+    const bool has_sibling_action = exact_local_return.value() || exact_no_content_return.value() ||
+                                    exact_absolute_redirect.value();
+    const bool retained_header_get_shape =
+        is_root && exact_listener && server.listen.address == ListenerAddress::IPv4Exact &&
+        server.listen.ipv4_host == 0x7f000001u && !timeout_present && !hide_compat_header &&
+        !has_sibling_action;
     auto pre_route_trace = validate_pre_route_trace(server);
     if (!pre_route_trace) return core::make_unexpected(pre_route_trace.error());
     if (exact_local_return.value() && !is_root)
@@ -2114,15 +2151,17 @@ FrontendResult<RutSource> lower_to_rut(const Server& server) {
                                                 server.exact_absolute_redirect.response.path,
                                                 timeout_present,
                                                 timeout_seconds)
-                 : !put_root_forward(writer,
-                                     "GET",
-                                     3,
-                                     RequestPolicyPlacement::Legacy,
-                                     false,
-                                     true,
-                                     hide_compat_header,
-                                     timeout_present,
-                                     timeout_seconds)) ||
+                 : (retained_header_get_shape
+                        ? !put_root_get_retained_header_forward(writer, hide_compat_header)
+                        : !put_root_forward(writer,
+                                            "GET",
+                                            3,
+                                            RequestPolicyPlacement::Legacy,
+                                            false,
+                                            true,
+                                            hide_compat_header,
+                                            timeout_present,
+                                            timeout_seconds))) ||
             !put_root_forward(writer,
                               "",
                               0,

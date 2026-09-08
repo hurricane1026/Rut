@@ -751,6 +751,107 @@ TEST(serve_loader, nginx_http_profile_lowering_loads_owned_access_log_and_proxy_
     std::filesystem::remove_all(dir);
 }
 
+TEST(serve_loader, nginx_retained_header_lowering_executes_owned_framing_selection) {
+    const std::string dir = "/tmp/rut_serve_loader_nginx_retained_header_selection";
+    std::filesystem::remove_all(dir);
+    const std::string path = dir + "/app.rut";
+    std::string generated;
+    {
+        std::string nginx_source =
+            "server { listen 127.0.0.1:8080; location / { proxy_pass "
+            "http://127.0.0.1:9000; } }";
+        const auto parsed =
+            nginx::parse({nginx_source.data(), static_cast<u32>(nginx_source.size())});
+        REQUIRE(parsed);
+        const auto lowered = nginx::lower_to_rut(parsed.value());
+        REQUIRE(lowered);
+        generated.assign(lowered.value().data, lowered.value().len);
+        write_file(dir, "app.rut", generated.c_str());
+        std::fill(nginx_source.begin(), nginx_source.end(), 'x');
+    }
+    std::fill(generated.begin(), generated.end(), 'y');
+
+    LoadedProgram program;
+    LoadError error;
+    REQUIRE(load_rut_program(path.c_str(), program, error));
+    REQUIRE(program.jit_inited);
+    REQUIRE_EQ(program.config.upstream_count, 1u);
+    CHECK_EQ(program.config.upstreams[0].addr_count, 1u);
+    CHECK_EQ(ntohl(program.config.upstreams[0].addrs[0].sin_addr.s_addr), 0x7f000001u);
+    CHECK_EQ(ntohs(program.config.upstreams[0].addrs[0].sin_port), 9000u);
+
+    static constexpr u8 kRoot[] = {'/'};
+    const RouteEntry* get = program.config.match(kRoot, 1u, kRouteMethodGet);
+    REQUIRE(get != nullptr);
+    REQUIRE_EQ(get->action, RouteAction::JitHandler);
+    REQUIRE_EQ(get->upstream_id, 0u);
+    REQUIRE(get->fn != nullptr);
+    CHECK_EQ(get->forward_preflight_mode, ForwardPreflightMode::AfterRequestFramingSelection);
+    REQUIRE(program.config.policy_bundle_id_is_valid(get->preflight_forward_policy_bundle_id));
+    const u16 bundle_id = get->preflight_forward_policy_bundle_id;
+    const auto& bundle = program.config.policy_bundles[bundle_id - 1u];
+    CHECK_EQ(bundle.response_read_timeout_seconds, 60u);
+    CHECK_EQ(bundle.response_buffering, ForwardResponseBufferingMode::CompleteContentLength);
+    REQUIRE(program.config.response_policy_id_is_valid(bundle.response_policy_id));
+    REQUIRE(program.config.failure_policy_id_is_valid(bundle.failure_policy_id));
+    REQUIRE(program.config.timeout_failure_policy_id_is_valid(bundle.timeout_failure_policy_id));
+
+    const auto& response = program.config.response_policies[bundle.response_policy_id - 1u];
+    CHECK(response_policy_spec_valid(response));
+    CHECK_EQ(response.version, ResponsePolicyVersion::Http11);
+    CHECK_EQ(response.framing, ResponsePolicyFraming::ContentLength);
+    CHECK_EQ(response.connection, ResponsePolicyConnection::Request);
+    CHECK_EQ(response.date, ResponsePolicyDate::Current);
+    CHECK_EQ(response.head_mode, ResponsePolicyHeadMode::Reject);
+    CHECK(response.server.eq({"nginx/1.29.7", 12u}));
+    CHECK_EQ(response.hide_header_count, 3u);
+    CHECK(response_policy_hides_header(response, {"Date", 4u}));
+    CHECK(response_policy_hides_header(response, {"Server", 6u}));
+    CHECK(response_policy_hides_header(response, {"X-Pad", 5u}));
+
+    const auto& failure = program.config.failure_policies[bundle.failure_policy_id - 1u];
+    const auto& timeout = program.config.failure_policies[bundle.timeout_failure_policy_id - 1u];
+    CHECK(forward_failure_policy_spec_valid(failure));
+    CHECK(forward_timeout_failure_policy_spec_valid(timeout));
+    CHECK_EQ(failure.status_code, 502u);
+    CHECK_EQ(timeout.status_code, 504u);
+    CHECK(failure.reason.eq({"Bad Gateway", 11u}));
+    CHECK(timeout.reason.eq({"Gateway Time-out", 16u}));
+    CHECK(failure.server.eq({"nginx/1.29.7", 12u}));
+    CHECK(timeout.server.eq({"nginx/1.29.7", 12u}));
+    CHECK_GT(failure.body.len, 0u);
+    CHECK_GT(timeout.body.len, 0u);
+
+    // RIR, mapped source, and the converter/parser owners can all disappear
+    // after publication; the JIT function and copied RouteConfig remain live.
+    program.rir.destroy();
+    REQUIRE(program.src_map != nullptr);
+    REQUIRE_EQ(munmap(program.src_map, program.src_map_len), 0);
+    program.src_map = nullptr;
+    program.src_map_len = 0u;
+    REQUIRE(std::filesystem::remove(path));
+
+    const auto invoke = [&](const char* request, RequestPolicyId expected_policy) {
+        const u32 request_len = static_cast<u32>(strlen(request));
+        const u64 packed =
+            get->fn(nullptr, nullptr, reinterpret_cast<const u8*>(request), request_len, nullptr);
+        const auto result = jit::HandlerResult::unpack(packed);
+        REQUIRE_EQ(result.action, jit::HandlerAction::ForwardBundle);
+        CHECK_EQ(result.status_code, static_cast<u16>(expected_policy));
+        CHECK_EQ(result.upstream_id, 0u);
+        CHECK_EQ(result.next_state, bundle_id);
+    };
+    invoke("GET / HTTP/1.1\r\nHost: client.example\r\n\r\n",
+           RequestPolicyId::Http11FixedTrimSpPreserveHtab);
+    invoke("GET / HTTP/1.1\r\nHost: client.example\r\nContent-Length: 0\r\n\r\n",
+           RequestPolicyId::Http11FixedStrip);
+    invoke("GET / HTTP/1.1\r\nHost: client.example\r\nContent-Length: 4\r\n\r\nbody",
+           RequestPolicyId::Http11FixedStrip);
+
+    program.destroy();
+    std::filesystem::remove_all(dir);
+}
+
 TEST(serve_loader, failed_access_log_frontend_clears_poisoned_owned_metadata) {
     const std::string dir = "/tmp/rut_serve_loader_access_log_failed";
     std::filesystem::remove_all(dir);
@@ -2356,42 +2457,82 @@ TEST(serve_loader, issue373_hide_headers_are_owned_and_same_owner_reload_clears_
             }
         }
     };
-    const auto check_root_mapping = [&]() {
+    const auto check_root_mapping = [&](bool conditional_get) {
         REQUIRE_EQ(program.rir.module.func_count, 3u);
-        for (u32 function = 0u; function < 3u; function++) {
-            const auto& rir_function = program.rir.module.functions[function];
+        struct MethodMapping {
+            u32 functions = 0u;
             u32 forwards = 0u;
-            i32 bundle_id = -1;
+            struct ForwardIds {
+                i32 request = -1;
+                i32 bundle = -1;
+            } ids[2]{};
+        } methods[3]{};
+        for (u32 function_index = 0u; function_index < program.rir.module.func_count;
+             function_index++) {
+            const auto& rir_function = program.rir.module.functions[function_index];
+            MethodMapping* mapping = nullptr;
+            if (rir_function.http_method == kRouteMethodHead) mapping = &methods[0];
+            if (rir_function.http_method == kRouteMethodGet) mapping = &methods[1];
+            if (rir_function.http_method == kRouteMethodAny) mapping = &methods[2];
+            REQUIRE(mapping != nullptr);
+            REQUIRE(rir_function.route_pattern.eq(lit_str("/")));
+            mapping->functions++;
             for (u32 block = 0u; block < rir_function.block_count; block++) {
                 const auto& rir_block = rir_function.blocks[block];
                 for (u32 instruction = 0u; instruction < rir_block.inst_count; instruction++) {
                     const auto& inst = rir_block.insts[instruction];
                     if (inst.op != rir::Opcode::RetForwardBundle) continue;
-                    forwards++;
+                    REQUIRE_LT(mapping->forwards, 2u);
+                    const u32 forward_index = mapping->forwards++;
                     REQUIRE_EQ(inst.operand_count, 3u);
                     for (u32 scan_block = 0u; scan_block < rir_function.block_count; scan_block++) {
                         const auto& constants = rir_function.blocks[scan_block];
                         for (u32 scan = 0u; scan < constants.inst_count; scan++) {
                             const auto& candidate = constants.insts[scan];
-                            if (candidate.op == rir::Opcode::ConstI32 &&
-                                candidate.result == inst.operand(2))
-                                bundle_id = candidate.imm.i32_val;
+                            if (candidate.op != rir::Opcode::ConstI32) continue;
+                            if (candidate.result == inst.operand(1))
+                                mapping->ids[forward_index].request = candidate.imm.i32_val;
+                            if (candidate.result == inst.operand(2))
+                                mapping->ids[forward_index].bundle = candidate.imm.i32_val;
                         }
                     }
                 }
             }
-            REQUIRE_EQ(forwards, 1u);
-            CHECK_EQ(bundle_id, function == 0u ? 1 : function == 1u ? 2 : 3);
         }
-        CHECK_EQ(program.config.policy_bundles[0].response_policy_id, 1u);
-        CHECK_EQ(program.config.policy_bundles[1].response_policy_id, 2u);
-        CHECK_EQ(program.config.policy_bundles[2].response_policy_id, 2u);
+        CHECK_EQ(methods[0].functions, 1u);
+        CHECK_EQ(methods[1].functions, 1u);
+        CHECK_EQ(methods[2].functions, 1u);
+        const u32 expected_get_forwards = conditional_get ? 2u : 1u;
+        CHECK_EQ(methods[0].forwards, 1u);
+        CHECK_EQ(methods[1].forwards, expected_get_forwards);
+        CHECK_EQ(methods[2].forwards, 1u);
+        CHECK_EQ(methods[0].ids[0].request, static_cast<i32>(RequestPolicyId::Http11FixedStrip));
+        CHECK_EQ(methods[2].ids[0].request, static_cast<i32>(RequestPolicyId::Http11FixedStrip));
+        CHECK_EQ(methods[1].ids[0].request, static_cast<i32>(RequestPolicyId::Http11FixedStrip));
+        if (conditional_get) {
+            CHECK_EQ(methods[1].ids[1].request,
+                     static_cast<i32>(RequestPolicyId::Http11FixedTrimSpPreserveHtab));
+            CHECK_EQ(methods[1].ids[0].bundle, methods[1].ids[1].bundle);
+        }
+        for (const MethodMapping& mapping : methods) {
+            REQUIRE_GT(mapping.ids[0].bundle, 0);
+            CHECK(
+                program.config.policy_bundle_id_is_valid(static_cast<u16>(mapping.ids[0].bundle)));
+        }
+        CHECK_NE(methods[0].ids[0].bundle, methods[1].ids[0].bundle);
+        CHECK_NE(methods[0].ids[0].bundle, methods[2].ids[0].bundle);
+        CHECK_NE(methods[1].ids[0].bundle, methods[2].ids[0].bundle);
+        const auto& head_bundle = program.config.policy_bundles[methods[0].ids[0].bundle - 1];
+        const auto& get_bundle = program.config.policy_bundles[methods[1].ids[0].bundle - 1];
+        const auto& any_bundle = program.config.policy_bundles[methods[2].ids[0].bundle - 1];
+        CHECK_NE(head_bundle.response_policy_id, get_bundle.response_policy_id);
+        CHECK_EQ(get_bundle.response_policy_id, any_bundle.response_policy_id);
     };
     check_owned_response_policies(4u, 84u);
     CHECK(
         std::string(program.config.response_policy_bytes, program.config.response_policy_bytes_used)
             .find("X-Compat-Hidden") != std::string::npos);
-    check_root_mapping();
+    check_root_mapping(false);
 
     program.engine.shutdown();
     program.jit_inited = false;
@@ -2411,7 +2552,7 @@ TEST(serve_loader, issue373_hide_headers_are_owned_and_same_owner_reload_clears_
         REQUIRE(parsed);
         const auto lowered = nginx::lower_to_rut(parsed.value());
         REQUIRE(lowered);
-        REQUIRE_EQ(lowered.value().len, 5309u);
+        REQUIRE_EQ(lowered.value().len, 6975u);
         generated.assign(lowered.value().data, lowered.value().len);
         memset(source, 'z', sizeof(source) - 1u);
     }
@@ -2422,7 +2563,7 @@ TEST(serve_loader, issue373_hide_headers_are_owned_and_same_owner_reload_clears_
     CHECK(
         std::string(program.config.response_policy_bytes, program.config.response_policy_bytes_used)
             .find("X-Compat-Hidden") == std::string::npos);
-    check_root_mapping();
+    check_root_mapping(true);
     program.engine.shutdown();
     program.jit_inited = false;
     program.rir.destroy();
@@ -3840,11 +3981,13 @@ TEST(serve_loader, nginx_issue357_wildcard_p63_no_uri_output_is_owned_and_reuses
     u16 root_head_bundle = 0u;
     u16 root_get_bundle = 0u;
     u16 root_any_bundle = 0u;
-    u16 root_request_policy = 0u;
+    u32 root_get_forwards = 0u;
+    i32 root_get_request_ids[2] = {-1, -1};
+    i32 root_get_bundle_ids[2] = {-1, -1};
     for (u32 function_index = 0u; function_index < program.rir.module.func_count;
          function_index++) {
         const auto& function = program.rir.module.functions[function_index];
-        CHECK(function.route_pattern.eq(lit_str("/")));
+        REQUIRE(function.route_pattern.eq(lit_str("/")));
         if (function.http_method == kRouteMethodHead) root_head_functions++;
         if (function.http_method == kRouteMethodGet) root_get_functions++;
         if (function.http_method == kRouteMethodAny) root_any_functions++;
@@ -3878,31 +4021,40 @@ TEST(serve_loader, nginx_issue357_wildcard_p63_no_uri_output_is_owned_and_reuses
                 REQUIRE(find_root_const(inst.operand(1), request));
                 REQUIRE(find_root_const(inst.operand(2), root_bundle));
                 CHECK_EQ(upstream, 0);
-                CHECK_EQ(request, static_cast<i32>(RequestPolicyId::Http11FixedStrip));
                 REQUIRE_GT(root_bundle, 0);
                 CHECK(program.config.policy_bundle_id_is_valid(static_cast<u16>(root_bundle)));
-                if (root_request_policy == 0u)
-                    root_request_policy = static_cast<u16>(request);
-                else
-                    CHECK_EQ(request, root_request_policy);
-                u16* selected_bundle = nullptr;
-                if (function.http_method == kRouteMethodHead) selected_bundle = &root_head_bundle;
-                if (function.http_method == kRouteMethodGet) selected_bundle = &root_get_bundle;
-                if (function.http_method == kRouteMethodAny) selected_bundle = &root_any_bundle;
-                REQUIRE(selected_bundle != nullptr);
-                REQUIRE_EQ(*selected_bundle, 0u);
-                *selected_bundle = static_cast<u16>(root_bundle);
+                if (function.http_method == kRouteMethodHead) {
+                    CHECK_EQ(request, static_cast<i32>(RequestPolicyId::Http11FixedStrip));
+                    REQUIRE_EQ(root_head_bundle, 0u);
+                    root_head_bundle = static_cast<u16>(root_bundle);
+                } else if (function.http_method == kRouteMethodGet) {
+                    REQUIRE_LT(root_get_forwards, 2u);
+                    root_get_request_ids[root_get_forwards] = request;
+                    root_get_bundle_ids[root_get_forwards] = root_bundle;
+                    root_get_forwards++;
+                } else if (function.http_method == kRouteMethodAny) {
+                    CHECK_EQ(request, static_cast<i32>(RequestPolicyId::Http11FixedStrip));
+                    REQUIRE_EQ(root_any_bundle, 0u);
+                    root_any_bundle = static_cast<u16>(root_bundle);
+                } else {
+                    CHECK(false);
+                }
             }
         }
     }
     CHECK_EQ(root_redirect_count, 0u);
-    CHECK_EQ(root_forward_count, 3u);
+    CHECK_EQ(root_forward_count, 4u);
     CHECK_EQ(root_head_functions, 1u);
     CHECK_EQ(root_get_functions, 1u);
     CHECK_EQ(root_any_functions, 1u);
-    REQUIRE_NE(root_request_policy, 0u);
+    CHECK_EQ(root_get_forwards, 2u);
+    CHECK_EQ(root_get_request_ids[0], static_cast<i32>(RequestPolicyId::Http11FixedStrip));
+    CHECK_EQ(root_get_request_ids[1],
+             static_cast<i32>(RequestPolicyId::Http11FixedTrimSpPreserveHtab));
+    CHECK_EQ(root_get_bundle_ids[0], root_get_bundle_ids[1]);
+    REQUIRE_NE(root_get_bundle_ids[0], 0);
+    root_get_bundle = static_cast<u16>(root_get_bundle_ids[0]);
     REQUIRE_NE(root_head_bundle, 0u);
-    REQUIRE_NE(root_get_bundle, 0u);
     REQUIRE_NE(root_any_bundle, 0u);
     CHECK_NE(root_head_bundle, root_get_bundle);
     CHECK_NE(root_head_bundle, root_any_bundle);
@@ -3912,8 +4064,7 @@ TEST(serve_loader, nginx_issue357_wildcard_p63_no_uri_output_is_owned_and_reuses
     REQUIRE_EQ(program.config.policy_bundle_count, 3u);
 
     const auto check_root_bundle = [&](u16 root_bundle_id, bool suppress_body, bool buffered) {
-        CHECK_EQ(root_request_policy, static_cast<u16>(RequestPolicyId::Http11FixedStrip));
-        CHECK(request_policy_is_supported(root_request_policy));
+        CHECK(request_policy_is_supported(static_cast<u16>(RequestPolicyId::Http11FixedStrip)));
         REQUIRE(program.config.policy_bundle_id_is_valid(root_bundle_id));
         const auto& root_bundle = program.config.policy_bundles[root_bundle_id - 1u];
         REQUIRE(program.config.response_policy_id_is_valid(root_bundle.response_policy_id));

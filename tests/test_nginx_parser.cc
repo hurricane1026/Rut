@@ -1,3 +1,4 @@
+#include "fixtures/nginx373_hide.inc"
 #include "fixtures/nginx373_nohide.inc"
 #include "rut/common/strict_local_response.h"
 #include "rut/compiler/analyze.h"
@@ -9563,6 +9564,191 @@ TEST(nginx_converter, lowers_parsed_proxy_read_timeout) {
     CHECK_EQ(count_text(output, "content_length_position: \"after_host\""), 1u);
 }
 
+TEST(nginx_converter_issue252,
+     exact_loopback_default_root_get_selects_retained_header_policy_through_rir) {
+    static constexpr const char* const kSources[] = {
+        "server { listen 127.0.0.1:8081; location / { proxy_pass http://127.0.0.1:9001; } }",
+        "server { listen 127.0.0.1:8182; location / { proxy_pass http://127.0.0.1:9102; } }",
+    };
+    const u16 expected_ports[][2] = {{8081u, 9001u}, {8182u, 9102u}};
+
+    for (u32 vector = 0; vector < 2u; vector++) {
+        char nginx_source[256]{};
+        const size_t source_len = strlen(kSources[vector]);
+        REQUIRE_LT(source_len, sizeof(nginx_source));
+        memcpy(nginx_source, kSources[vector], source_len);
+        const auto parsed = nginx::parse({nginx_source, static_cast<u32>(source_len)});
+        REQUIRE(parsed);
+        auto lowered = nginx::lower_to_rut(parsed.value());
+        REQUIRE(lowered);
+        const std::string output(lowered.value().data, lowered.value().len);
+        CHECK_EQ(output.rfind(
+                     "listen 127.0.0.1:" + std::to_string(expected_ports[vector][0]) + "\n", 0u),
+                 0u);
+        CHECK_EQ(count_text(output,
+                            "upstream nginx_upstream at \"127.0.0.1:" +
+                                std::to_string(expected_ports[vector][1]) + "\"\n"),
+                 1u);
+        CHECK_EQ(count_text(output, "if req.hasContentLength"), 1u);
+        CHECK_EQ(count_text(output, "retained_header_value: \"trim_sp_preserve_htab\""), 1u);
+        CHECK_EQ(count_text(output, "content_length_position: \"after_host\""), 0u);
+        CHECK_EQ(count_text(output, "response_read_timeout: 60s"), 2u);
+        CHECK_EQ(count_text(output, "response_buffering: \"complete_content_length\""), 2u);
+        CHECK_LT(lowered.value().len, nginx::RutSource::kCapacity);
+
+        auto lexed = lex(lowered.value().view());
+        REQUIRE(lexed);
+        CHECK_GT(lexed->tokens.len, 0u);
+        auto ast = parse_file(lexed.value());
+        REQUIRE(ast);
+        std::unique_ptr<AstFile> ast_owned(ast.value());
+        REQUIRE_EQ(ast_owned->items.len, 9u);
+        const AstRouteDecl* get_ast = nullptr;
+        u32 get_ast_count = 0u;
+        for (u32 item = 0u; item < ast_owned->items.len; item++) {
+            if (ast_owned->items[item].kind != AstItemKind::Route) continue;
+            const AstRouteDecl& route = ast_owned->items[item].route;
+            if (route.method != static_cast<u8>(TokenType::KwGet) || route.method_is_any) continue;
+            get_ast = &route;
+            get_ast_count++;
+        }
+        REQUIRE_EQ(get_ast_count, 1u);
+        REQUIRE(get_ast != nullptr);
+        REQUIRE_EQ(get_ast->statements.len, 1u);
+        REQUIRE(get_ast->statements[0]->kind == AstStmtKind::If);
+        CHECK(get_ast->statements[0]->then_stmt != nullptr);
+        CHECK(get_ast->statements[0]->else_stmt != nullptr);
+
+        auto hir = analyze_file(*ast_owned);
+        REQUIRE(hir);
+        std::unique_ptr<HirModule> hir_owned(hir.value());
+        REQUIRE_EQ(hir_owned->routes.len, 3u);
+        const HirRoute* get_hir = nullptr;
+        u32 get_hir_count = 0u;
+        for (u32 route_index = 0u; route_index < hir_owned->routes.len; route_index++) {
+            if (hir_owned->routes[route_index].method != kRouteMethodGet) continue;
+            get_hir = &hir_owned->routes[route_index];
+            get_hir_count++;
+        }
+        REQUIRE_EQ(get_hir_count, 1u);
+        REQUIRE(get_hir != nullptr);
+        CHECK_EQ(get_hir->forward_preflight_mode,
+                 ForwardPreflightMode::AfterRequestFramingSelection);
+        REQUIRE(get_hir->control.kind == HirControlKind::If);
+        CHECK_EQ(get_hir->control.cond.kind, HirExprKind::ReqHasContentLength);
+        const auto& id1 = get_hir->control.then_term;
+        const auto& id3 = get_hir->control.else_term;
+        CHECK_EQ(id1.kind, HirTerminatorKind::ForwardUpstream);
+        CHECK_EQ(id3.kind, HirTerminatorKind::ForwardUpstream);
+        CHECK_EQ(id1.forward_request_policy_id,
+                 static_cast<u16>(RequestPolicyId::Http11FixedStrip));
+        CHECK_EQ(id3.forward_request_policy_id,
+                 static_cast<u16>(RequestPolicyId::Http11FixedTrimSpPreserveHtab));
+        CHECK_EQ(id1.forward_response_policy_id, id3.forward_response_policy_id);
+        CHECK_EQ(id1.forward_failure_policy_id, id3.forward_failure_policy_id);
+        CHECK_EQ(id1.forward_timeout_failure_policy_id, id3.forward_timeout_failure_policy_id);
+        CHECK_EQ(id1.forward_response_read_timeout_seconds,
+                 id3.forward_response_read_timeout_seconds);
+        CHECK_EQ(id1.forward_response_buffering,
+                 ForwardResponseBufferingMode::CompleteContentLength);
+        CHECK_EQ(id3.forward_response_buffering,
+                 ForwardResponseBufferingMode::CompleteContentLength);
+
+        auto mir = build_mir(*hir_owned);
+        REQUIRE(mir);
+        std::unique_ptr<MirModule> mir_owned(mir.value());
+        REQUIRE_EQ(mir_owned->functions.len, 3u);
+        const MirFunction* get_mir = nullptr;
+        u32 get_mir_count = 0u;
+        for (u32 function = 0u; function < mir_owned->functions.len; function++) {
+            if (mir_owned->functions[function].method != kRouteMethodGet) continue;
+            get_mir = &mir_owned->functions[function];
+            get_mir_count++;
+        }
+        REQUIRE_EQ(get_mir_count, 1u);
+        REQUIRE(get_mir != nullptr);
+        REQUIRE_EQ(get_mir->blocks.len, 3u);
+        CHECK_EQ(get_mir->blocks[0].term.cond.kind, MirValueKind::ReqHasContentLength);
+        CHECK_EQ(get_mir->blocks[1].term.forward_request_policy_id,
+                 static_cast<u16>(RequestPolicyId::Http11FixedStrip));
+        CHECK_EQ(get_mir->blocks[2].term.forward_request_policy_id,
+                 static_cast<u16>(RequestPolicyId::Http11FixedTrimSpPreserveHtab));
+        CHECK_EQ(get_mir->blocks[1].term.forward_response_buffering,
+                 ForwardResponseBufferingMode::CompleteContentLength);
+        CHECK_EQ(get_mir->blocks[2].term.forward_response_buffering,
+                 ForwardResponseBufferingMode::CompleteContentLength);
+
+        FrontendRirModule rir{};
+        RirGuard rir_guard{rir};
+        REQUIRE(lower_to_rir(*mir_owned, rir));
+        REQUIRE(rir::verify_module(rir.module).ok);
+        REQUIRE_EQ(rir.module.func_count, 3u);
+        const rir::Function* get_function = nullptr;
+        u32 get_function_count = 0u;
+        for (u32 function = 0u; function < rir.module.func_count; function++) {
+            if (rir.module.functions[function].http_method != kRouteMethodGet) continue;
+            get_function = &rir.module.functions[function];
+            get_function_count++;
+        }
+        REQUIRE_EQ(get_function_count, 1u);
+        REQUIRE(get_function != nullptr);
+        REQUIRE_EQ(get_function->block_count, 3u);
+        CHECK_EQ(get_function->blocks[0].insts[0].op, rir::Opcode::ReqHasContentLength);
+        i32 branch_policy[2] = {-1, -1};
+        i32 branch_bundle[2] = {-1, -1};
+        for (u32 branch = 0; branch < 2u; branch++) {
+            const auto& block = get_function->blocks[branch + 1u];
+            REQUIRE_EQ(block.insts[block.inst_count - 1u].op, rir::Opcode::RetForwardBundle);
+            const auto& ret = block.insts[block.inst_count - 1u];
+            REQUIRE_EQ(ret.operand_count, 3u);
+            REQUIRE(find_const_i32(*get_function, ret.operand(1), branch_policy[branch]));
+            REQUIRE(find_const_i32(*get_function, ret.operand(2), branch_bundle[branch]));
+        }
+        CHECK_EQ(branch_policy[0], static_cast<i32>(RequestPolicyId::Http11FixedStrip));
+        CHECK_EQ(branch_policy[1],
+                 static_cast<i32>(RequestPolicyId::Http11FixedTrimSpPreserveHtab));
+        CHECK_EQ(branch_bundle[0], branch_bundle[1]);
+        REQUIRE_GT(branch_bundle[0], 0);
+        REQUIRE_LE(static_cast<u32>(branch_bundle[0]), rir.module.policy_bundle_count);
+        const auto& bundle = rir.module.policy_bundles[branch_bundle[0] - 1];
+        CHECK_EQ(bundle.response_read_timeout_seconds, 60u);
+        CHECK_EQ(bundle.response_buffering, ForwardResponseBufferingMode::CompleteContentLength);
+
+        auto populated = std::make_unique<RouteConfig>();
+        REQUIRE(populate_route_config(*populated, rir.module));
+        REQUIRE_GT(branch_bundle[0], 0);
+        REQUIRE_LE(static_cast<u32>(branch_bundle[0]), populated->policy_bundle_count);
+        const auto& populated_bundle = populated->policy_bundles[branch_bundle[0] - 1u];
+        CHECK_EQ(populated_bundle.response_read_timeout_seconds, 60u);
+        CHECK_EQ(populated_bundle.response_buffering,
+                 ForwardResponseBufferingMode::CompleteContentLength);
+        memset(nginx_source, 'x', source_len);
+        memset(lowered.value().data, 'y', lowered.value().len);
+        CHECK(populated->strict_local_response_table_is_valid());
+    }
+
+    static constexpr char kWildcard[] =
+        "server { listen 8081; location / { proxy_pass http://127.0.0.1:9001; } }";
+    const auto wildcard = nginx::parse({kWildcard, sizeof(kWildcard) - 1u});
+    REQUIRE(wildcard);
+    const auto wildcard_lowered = nginx::lower_to_rut(wildcard.value());
+    REQUIRE(wildcard_lowered);
+    const std::string wildcard_output(wildcard_lowered.value().data, wildcard_lowered.value().len);
+    CHECK_EQ(count_text(wildcard_output, "if req.hasContentLength"), 0u);
+    CHECK_EQ(count_text(wildcard_output, "retained_header_value: \"trim_sp_preserve_htab\""), 0u);
+
+    static constexpr char kTimeout[] =
+        "server { listen 127.0.0.1:8081; location / { proxy_read_timeout 1s; "
+        "proxy_pass http://127.0.0.1:9001; } }";
+    const auto timeout = nginx::parse({kTimeout, sizeof(kTimeout) - 1u});
+    REQUIRE(timeout);
+    const auto timeout_lowered = nginx::lower_to_rut(timeout.value());
+    REQUIRE(timeout_lowered);
+    const std::string timeout_output(timeout_lowered.value().data, timeout_lowered.value().len);
+    CHECK_EQ(count_text(timeout_output, "retained_header_value: \"trim_sp_preserve_htab\""), 0u);
+    CHECK_EQ(count_text(timeout_output, "content_length_position: \"after_host\""), 1u);
+}
+
 TEST(nginx_converter_issue468,
      timeout_root_head_selects_after_host_policy_by_runtime_content_length) {
     static constexpr char kSource[] =
@@ -16982,11 +17168,167 @@ TEST(nginx_converter, exact_loopback_listen_has_bounded_ordinary_rut_golden_and_
     REQUIRE_EQ(generated[0], generated[1]);
     REQUIRE_EQ(generated[2], generated[3]);
     REQUIRE_NE(generated[0], generated[2]);
-    std::string expected_exact = generated[2];
-    REQUIRE_EQ(expected_exact.rfind("listen :8080\n", 0u), 0u);
-    expected_exact.replace(0u, strlen("listen :8080"), "listen 127.0.0.1:8080");
-    REQUIRE_EQ(generated[0], expected_exact);
     const std::string& canonical = generated[0];
+    static constexpr char kExpectedExact[] = R"RUT(listen 127.0.0.1:8080
+upstream nginx_upstream at "127.0.0.1:9000"
+pre_route TRACE { return local_response({
+  version: "HTTP/1.1", status: 405, reason: "Not Allowed", server: "nginx/1.29.7",
+  date: "current", content_type: "text/html", connection: "request",
+  head_mode: "reject", body: b"<html>\r\n<head><title>405 Not Allowed</title></head>\r\n<body>\r\n<center><h1>405 Not Allowed</h1></center>\r\n<hr><center>nginx/1.29.7</center>\r\n</body>\r\n</html>\r\n"
+}) }
+unmatched OPTIONS { return local_response({
+  version: "HTTP/1.1", status: 400, reason: "Bad Request", server: "nginx/1.29.7",
+  date: "current", content_type: "text/html", connection: "request",
+  head_mode: "reject", body: b"<html>\r\n<head><title>400 Bad Request</title></head>\r\n<body>\r\n<center><h1>400 Bad Request</h1></center>\r\n<hr><center>nginx/1.29.7</center>\r\n</body>\r\n</html>\r\n"
+}) }
+unmatched CONNECT { return local_response({
+  version: "HTTP/1.1", status: 405, reason: "Not Allowed", server: "nginx/1.29.7",
+  date: "current", content_type: "text/html", connection: "request",
+  head_mode: "reject", body: b"<html>\r\n<head><title>405 Not Allowed</title></head>\r\n<body>\r\n<center><h1>405 Not Allowed</h1></center>\r\n<hr><center>nginx/1.29.7</center>\r\n</body>\r\n</html>\r\n"
+}) }
+unmatched { return local_response({
+  version: "HTTP/1.1", status: 400, reason: "Bad Request", server: "nginx/1.29.7",
+  date: "current", content_type: "text/html", connection: "request",
+  head_mode: "suppress_body", body: b"<html>\r\n<head><title>400 Bad Request</title></head>\r\n<body>\r\n<center><h1>400 Bad Request</h1></center>\r\n<hr><center>nginx/1.29.7</center>\r\n</body>\r\n</html>\r\n"
+}) }
+route HEAD "/" {
+    return forward(nginx_upstream, request_policy: {
+            version: "HTTP/1.1",
+            host: "upstream",
+            connection: "omit",
+            strip_headers: ["Connection", "Keep-Alive", "TE", "Expect", "Upgrade"]
+        },
+        response_policy: {
+            version: "HTTP/1.1",
+            framing: "content_length",
+            connection: "request",
+            head_mode: "suppress_body",
+            server: "nginx/1.29.7",
+            date: "current",
+            hide_headers: ["Date", "Server", "X-Pad"]
+        },
+        failure_policy: {
+            version: "HTTP/1.1",
+            status: 502,
+            reason: "Bad Gateway",
+            content_type: "text/html",
+            server: "nginx/1.29.7",
+            date: "current",
+            connection: "request",
+            head_mode: "suppress_body",
+            body: b"<html>\r\n<head><title>502 Bad Gateway</title></head>\r\n<body>\r\n<center><h1>502 Bad Gateway</h1></center>\r\n<hr><center>nginx/1.29.7</center>\r\n</body>\r\n</html>\r\n"
+        }
+    )
+}
+route GET "/" {
+    if req.hasContentLength {
+        return forward(nginx_upstream, request_policy: {
+            version: "HTTP/1.1",
+            host: "upstream",
+            connection: "omit",
+            strip_headers: ["Connection", "Keep-Alive", "TE", "Expect", "Upgrade"]
+        },
+        response_policy: {
+            version: "HTTP/1.1",
+            framing: "content_length",
+            connection: "request",
+            server: "nginx/1.29.7",
+            date: "current",
+            hide_headers: ["Date", "Server", "X-Pad"]
+        },
+        failure_policy: {
+            version: "HTTP/1.1",
+            status: 502,
+            reason: "Bad Gateway",
+            content_type: "text/html",
+            server: "nginx/1.29.7",
+            date: "current",
+            connection: "request",
+            body: b"<html>\r\n<head><title>502 Bad Gateway</title></head>\r\n<body>\r\n<center><h1>502 Bad Gateway</h1></center>\r\n<hr><center>nginx/1.29.7</center>\r\n</body>\r\n</html>\r\n"
+        },
+        timeout_failure_policy: {
+            version: "HTTP/1.1",
+            status: 504,
+            reason: "Gateway Time-out",
+            content_type: "text/html",
+            server: "nginx/1.29.7",
+            date: "current",
+            connection: "request",
+            body: b"<html>\r\n<head><title>504 Gateway Time-out</title></head>\r\n<body>\r\n<center><h1>504 Gateway Time-out</h1></center>\r\n<hr><center>nginx/1.29.7</center>\r\n</body>\r\n</html>\r\n"
+        },
+        response_read_timeout: 60s,
+        response_buffering: "complete_content_length"
+    )
+    } else {
+        return forward(nginx_upstream, request_policy: {
+            version: "HTTP/1.1",
+            host: "upstream",
+            connection: "omit",
+            strip_headers: ["Connection", "Keep-Alive", "TE", "Expect", "Upgrade"],
+            retained_header_value: "trim_sp_preserve_htab"
+        },
+        response_policy: {
+            version: "HTTP/1.1",
+            framing: "content_length",
+            connection: "request",
+            server: "nginx/1.29.7",
+            date: "current",
+            hide_headers: ["Date", "Server", "X-Pad"]
+        },
+        failure_policy: {
+            version: "HTTP/1.1",
+            status: 502,
+            reason: "Bad Gateway",
+            content_type: "text/html",
+            server: "nginx/1.29.7",
+            date: "current",
+            connection: "request",
+            body: b"<html>\r\n<head><title>502 Bad Gateway</title></head>\r\n<body>\r\n<center><h1>502 Bad Gateway</h1></center>\r\n<hr><center>nginx/1.29.7</center>\r\n</body>\r\n</html>\r\n"
+        },
+        timeout_failure_policy: {
+            version: "HTTP/1.1",
+            status: 504,
+            reason: "Gateway Time-out",
+            content_type: "text/html",
+            server: "nginx/1.29.7",
+            date: "current",
+            connection: "request",
+            body: b"<html>\r\n<head><title>504 Gateway Time-out</title></head>\r\n<body>\r\n<center><h1>504 Gateway Time-out</h1></center>\r\n<hr><center>nginx/1.29.7</center>\r\n</body>\r\n</html>\r\n"
+        },
+        response_read_timeout: 60s,
+        response_buffering: "complete_content_length"
+    )
+    }
+}
+route "/" {
+    return forward(nginx_upstream, request_policy: {
+            version: "HTTP/1.1",
+            host: "upstream",
+            connection: "omit",
+            strip_headers: ["Connection", "Keep-Alive", "TE", "Expect", "Upgrade"]
+        },
+        response_policy: {
+            version: "HTTP/1.1",
+            framing: "content_length",
+            connection: "request",
+            server: "nginx/1.29.7",
+            date: "current",
+            hide_headers: ["Date", "Server", "X-Pad"]
+        },
+        failure_policy: {
+            version: "HTTP/1.1",
+            status: 502,
+            reason: "Bad Gateway",
+            content_type: "text/html",
+            server: "nginx/1.29.7",
+            date: "current",
+            connection: "request",
+            body: b"<html>\r\n<head><title>502 Bad Gateway</title></head>\r\n<body>\r\n<center><h1>502 Bad Gateway</h1></center>\r\n<hr><center>nginx/1.29.7</center>\r\n</body>\r\n</html>\r\n"
+        }
+    )
+}
+)RUT";
+    REQUIRE_EQ(canonical, std::string(kExpectedExact, sizeof(kExpectedExact) - 1u));
 
     const auto listener_inventory_is_canonical = [](const std::string& candidate) {
         return candidate.rfind("listen 127.0.0.1:8080\n", 0u) == 0u &&
@@ -17036,6 +17378,9 @@ TEST(nginx_converter, exact_loopback_listen_has_bounded_ordinary_rut_golden_and_
     REQUIRE(route_inventory_is_canonical(canonical));
     REQUIRE(has_no_nginx_hook_or_address_workaround(canonical));
     REQUIRE(source_is_canonical(canonical));
+    REQUIRE_EQ(count_text(canonical, "if req.hasContentLength"), 1u);
+    REQUIRE_EQ(count_text(canonical, "retained_header_value: \"trim_sp_preserve_htab\""), 1u);
+    REQUIRE_EQ(count_text(canonical, "content_length_position: \"after_host\""), 0u);
 
     std::string wrong_listener = canonical;
     REQUIRE_EQ(count_text(wrong_listener, "listen 127.0.0.1:8080\n"), 1u);
@@ -18625,23 +18970,14 @@ TEST(nginx_converter_issue373, hide_header_has_independent_full_source_golden) {
     static constexpr char kNewLine[] =
         "            hide_headers: [\"Date\", \"Server\", \"X-Pad\", "
         "\"X-Compat-Hidden\"]\n";
-    static constexpr char kSuffix[] = ", \"X-Compat-Hidden\"";
     const std::string no_hide(kIssue373NoHideGolden, sizeof(kIssue373NoHideGolden) - 1u);
-    REQUIRE_EQ(no_hide.size(), 5309u);
-    REQUIRE_EQ(count_text(no_hide, kOldLine), 3u);
+    REQUIRE_EQ(no_hide.size(), 6975u);
+    REQUIRE_EQ(count_text(no_hide, kOldLine), 4u);
     REQUIRE_EQ(count_text(no_hide, "X-Compat-Hidden"), 0u);
-    std::string expected = no_hide;
-    size_t cursor = 0u;
-    for (u32 i = 0u; i < 3u; i++) {
-        const size_t line = expected.find(kOldLine, cursor);
-        REQUIRE_NE(line, std::string::npos);
-        expected.replace(line + strlen(kOldLine) - 2u, 0u, kSuffix);
-        cursor = line + strlen(kOldLine) + strlen(kSuffix);
-    }
+    const std::string expected(kIssue373HideGolden, sizeof(kIssue373HideGolden) - 1u);
     REQUIRE_EQ(expected.size(), 5366u);
     REQUIRE_EQ(count_text(expected, kNewLine), 3u);
     REQUIRE_EQ(count_text(expected, "X-Compat-Hidden"), 3u);
-    CHECK_EQ(expected.size() - no_hide.size(), 57u);
     CHECK_EQ(expected.data()[expected.size()], '\0');
 
     const auto canonical = [&](const std::string& candidate) {
@@ -18670,7 +19006,7 @@ TEST(nginx_converter_issue373, hide_header_has_independent_full_source_golden) {
     REQUIRE(no_hide_parsed);
     const auto no_hide_lowered = nginx::lower_to_rut(no_hide_parsed.value());
     REQUIRE(no_hide_lowered);
-    REQUIRE_EQ(no_hide_lowered.value().len, 5309u);
+    REQUIRE_EQ(no_hide_lowered.value().len, 6975u);
     CHECK_EQ(std::string(no_hide_lowered.value().data, no_hide_lowered.value().len), no_hide);
     const auto expected_lexed = lex({expected.data(), static_cast<u32>(expected.size())});
     REQUIRE(expected_lexed);
@@ -18749,17 +19085,7 @@ TEST(nginx_converter_issue373, hide_header_has_independent_full_source_golden) {
 }
 
 TEST(nginx_converter_issue373, hide_header_policies_are_deduplicated_and_owned_end_to_end) {
-    static constexpr char kOldLine[] =
-        "            hide_headers: [\"Date\", \"Server\", \"X-Pad\"]\n";
-    static constexpr char kSuffix[] = ", \"X-Compat-Hidden\"";
-    std::string source(kIssue373NoHideGolden, sizeof(kIssue373NoHideGolden) - 1u);
-    size_t cursor = 0u;
-    for (u32 i = 0u; i < 3u; i++) {
-        const size_t line = source.find(kOldLine, cursor);
-        REQUIRE_NE(line, std::string::npos);
-        source.replace(line + strlen(kOldLine) - 2u, 0u, kSuffix);
-        cursor = line + strlen(kOldLine) + strlen(kSuffix);
-    }
+    std::string source(kIssue373HideGolden, sizeof(kIssue373HideGolden) - 1u);
     REQUIRE_EQ(source.size(), 5366u);
     RouteConfig populated{};
     {
@@ -19433,8 +19759,7 @@ TEST(nginx_converter_issue398, numeric_ipv4_has_owned_ordinary_rut_golden_and_fr
     std::string expected_numeric = wildcard;
     expected_numeric.replace(0u, strlen("listen :8080"), "listen 192.0.2.10:8080");
     CHECK_EQ(numeric, expected_numeric);
-    std::string expected_loopback = wildcard;
-    expected_loopback.replace(0u, strlen("listen :8080"), "listen 127.0.0.1:8080");
+    const std::string expected_loopback(kIssue373NoHideGolden, sizeof(kIssue373NoHideGolden) - 1u);
     CHECK_EQ(loopback, expected_loopback);
     CHECK_EQ(count_text(numeric, "listen 192.0.2.10:8080\n"), 1u);
     CHECK_EQ(count_upstream_declarations(numeric), 1u);
