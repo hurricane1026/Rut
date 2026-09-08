@@ -52769,7 +52769,7 @@ static bool run_converter_request_length_rut_side(TempDir& temp,
                 if (route.path_len != 1u || route.path[0] != '/' ||
                     route.preflight_forward_policy_bundle_id == 0u)
                     continue;
-                const u8 method = route.method;
+                const auto method = route.method;
                 if (method == rut::kRouteMethodGet) bound_get = true;
                 if (method == rut::kRouteMethodHead) bound_head = true;
                 if (method == rut::kRouteMethodAny) bound_any = true;
@@ -53239,7 +53239,8 @@ static bool run_converter_retained_header_whitespace_differential(
     const char* converter_path = nullptr,
     bool complete_file = false,
     const char* proxy_hide_header_name = nullptr,
-    std::string* generated_source_out = nullptr) {
+    std::string* generated_source_out = nullptr,
+    RetainedHeaderObservation* generated_observation_out = nullptr) {
     HeldLoopbackPorts rut_reservations;
     u16 rut_frontend_port = 0u;
     u16 rut_backend_port = 0u;
@@ -53315,6 +53316,7 @@ static bool run_converter_retained_header_whitespace_differential(
                                               proxy_hide_header_name == nullptr ? 70u : 66u))
         return false;
     if (generated_source_out != nullptr) *generated_source_out = generated_source;
+    if (generated_observation_out != nullptr) *generated_observation_out = generated_observation;
     return true;
 }
 
@@ -53336,8 +53338,15 @@ static bool run_converter_proxy_hide_header_name_differential(const char* rut_pa
     RetainedHeaderObservation generated_observation;
     std::string generated_source;
     const std::string container_name = "rut-nginx-600-custom-hide-" + std::to_string(getpid());
-    if (!run_converter_retained_header_whitespace_differential(
-            temp, container_name, rut_path, error, converter_path, true, kName, &generated_source))
+    if (!run_converter_retained_header_whitespace_differential(temp,
+                                                               container_name,
+                                                               rut_path,
+                                                               error,
+                                                               converter_path,
+                                                               true,
+                                                               kName,
+                                                               &generated_source,
+                                                               &generated_observation))
         return false;
     if (generated_source.empty()) {
         error = "#600 generated custom-hide source was not captured before source poisoning";
@@ -53385,9 +53394,10 @@ static bool run_converter_proxy_hide_header_name_differential(const char* rut_pa
     const std::string connection = "Connection: close\r\n";
     const size_t content_at =
         std::string(changed.response.begin(), changed.response.end()).find(content_length);
-    const size_t connection_at =
-        std::string(changed.response.begin(), changed.response.end()).find(connection);
-    if (content_at == std::string::npos || connection_at == std::string::npos) {
+    const std::string baseline_response(changed.response.begin(), changed.response.end());
+    const size_t connection_at = baseline_response.find(connection);
+    if (content_at == std::string::npos || connection_at == std::string::npos ||
+        connection_at != content_at + content_length.size()) {
         error = "#600 custom-hide response mutation fixture lacked ordered headers";
         return false;
     }
