@@ -32746,6 +32746,31 @@ static_assert(sizeof(kProxyHideHeaderClientRequest) - 1u == 85u);
 static_assert(sizeof(kProxyHideHeaderOriginResponse) - 1u == 219u);
 static_assert(sizeof(kProxyHideHeaderResponseNormalized) - 1u == 176u);
 
+static constexpr char kProxyHideHeaderNameOracleOriginResponse[] =
+    "HTTP/1.1 200 OK\r\n"
+    "Date: Wed, 26 Aug 2026 23:57:18 GMT\r\n"
+    "Server: origin\r\n"
+    "X-Powered-By: first\r\n"
+    "x-powered-by: second\r\n"
+    "X-Unrelated: retained\r\n"
+    "Content-Length: 2\r\n"
+    "Connection: close\r\n"
+    "\r\n"
+    "OK";
+
+static constexpr char kProxyHideHeaderNameOracleResponseNormalized[] =
+    "HTTP/1.1 200 OK\r\n"
+    "Server: nginx/1.29.7\r\n"
+    "Date: XXXXXXXXXXXXXXXXXXXXXXXXXXXXX\r\n"
+    "Content-Length: 2\r\n"
+    "Connection: close\r\n"
+    "X-Unrelated: retained\r\n"
+    "\r\n"
+    "OK";
+
+static_assert(sizeof(kProxyHideHeaderNameOracleOriginResponse) - 1u == 178u);
+static_assert(sizeof(kProxyHideHeaderNameOracleResponseNormalized) - 1u == 141u);
+
 static bool read_proxy_hide_header_access(const std::string& path,
                                           std::string& contents,
                                           std::string& error) {
@@ -32895,6 +32920,8 @@ struct StaticQueryProxyOracleProfile {
     const char* normalized_response = kSuccessResponseNormalized;
     size_t normalized_response_size = sizeof(kSuccessResponseNormalized) - 1u;
     bool proxy_hide_header_profile = false;
+    const char* proxy_hide_header_name = "X-Compat-Hidden";
+    bool proxy_hide_header_name_profile = false;
 };
 
 static constexpr StaticQueryProxyOracleProfile kStaticQueryProxyOracleProfile{
@@ -32978,6 +33005,38 @@ static constexpr StaticQueryProxyOracleProfile kProxyHideHeaderOracleProfile{
     sizeof(kProxyHideHeaderOriginResponse) - 1u,
     kProxyHideHeaderResponseNormalized,
     sizeof(kProxyHideHeaderResponseNormalized) - 1u,
+    true,
+    "X-Compat-Hidden",
+    false};
+static constexpr StaticQueryProxyOracleProfile kProxyHideHeaderNameOracleProfile{
+    "#600",
+    "600",
+    "",
+    kProxyHideHeaderClientTargets,
+    kProxyHideHeaderUpstreamTargets,
+    nullptr,
+    1u,
+    1u,
+    true,
+    true,
+    true,
+    true,
+    kProxyHideHeaderClientRequestSizes,
+    kProxyHideHeaderUpstreamRequestSizes,
+    false,
+    0u,
+    0u,
+    false,
+    false,
+    true,
+    "hidden.example",
+    "/",
+    kProxyHideHeaderNameOracleOriginResponse,
+    sizeof(kProxyHideHeaderNameOracleOriginResponse) - 1u,
+    kProxyHideHeaderNameOracleResponseNormalized,
+    sizeof(kProxyHideHeaderNameOracleResponseNormalized) - 1u,
+    true,
+    "X-Powered-By",
     true};
 
 static std::string static_query_proxy_request(
@@ -33045,7 +33104,8 @@ static std::string make_static_query_proxy_fragment(
                                std::to_string(frontend_port) + ";\n";
     const std::string proxy = "    proxy_pass http://127.0.0.1:" + std::to_string(backend_port) +
                               profile.configured_uri + ";\n";
-    const std::string hide = "    proxy_hide_header X-Compat-Hidden;\n";
+    const std::string hide =
+        "    proxy_hide_header " + std::string(profile.proxy_hide_header_name) + ";\n";
     const std::string location =
         "  location " + std::string(profile.location_path) + " {\n" +
         (profile.proxy_hide_header_profile && listen_first ? hide : "") + proxy +
@@ -33077,11 +33137,12 @@ static bool validate_static_query_proxy_observation(
                 " static-query observation lost its exact side/order/vector inventory";
         return false;
     }
+    const std::string expected_source_poison =
+        "destroyed-after-" + std::string(profile.scope_id) + "-nginx-load\n";
     if (profile.proxy_hide_header_profile &&
         (observation.original_config.empty() || !observation.source_poisoned ||
-         observation.source_poison != "destroyed-after-373-nginx-load\n" ||
-         observation.access_scope.empty() || observation.origin_peer_close_count != 1u ||
-         observation.origin_response_sent_ns == 0u ||
+         observation.source_poison != expected_source_poison || observation.access_scope.empty() ||
+         observation.origin_peer_close_count != 1u || observation.origin_response_sent_ns == 0u ||
          observation.origin_peer_closed_ns < observation.origin_response_sent_ns ||
          observation.origin_peer_closed_ns - observation.origin_response_sent_ns >
              2'000'000'000ull)) {
@@ -33104,8 +33165,12 @@ static bool validate_static_query_proxy_observation(
         if (profile.proxy_hide_header_profile) {
             const std::string raw_response(observation.wires[i].begin(),
                                            observation.wires[i].end());
-            if (raw_response.find("X-Compat-Hidden:") != std::string::npos ||
-                raw_response.find("x-compat-hidden:") != std::string::npos ||
+            if (raw_response.find(std::string(profile.proxy_hide_header_name) + ":") !=
+                    std::string::npos ||
+                (profile.proxy_hide_header_name_profile &&
+                 raw_response.find("x-powered-by:") != std::string::npos) ||
+                (!profile.proxy_hide_header_name_profile &&
+                 raw_response.find("x-compat-hidden:") != std::string::npos) ||
                 raw_response.find("Server: origin\r\n") != std::string::npos ||
                 raw_response.find("Date: Wed, 26 Aug 2026 23:57:18 GMT\r\n") != std::string::npos) {
                 error = "#373 raw response leaked hidden, origin Server, or origin Date bytes";
@@ -33126,13 +33191,22 @@ static bool validate_static_query_proxy_observation(
         }
         if (profile.proxy_hide_header_profile) {
             const std::string response(normalized.begin(), normalized.end());
-            if (response.size() != 176u ||
-                count_text(response, "X-Compat-Visible: keep\r\n") != 1u ||
-                count_text(response, "Set-Cookie: a=1\r\n") != 1u ||
-                count_text(response, "Set-Cookie: b=2\r\n") != 1u ||
-                response.find("Set-Cookie: a=1\r\nSet-Cookie: b=2\r\n") == std::string::npos ||
-                response.find("X-Compat-Hidden:") != std::string::npos ||
-                response.find("x-compat-hidden:") != std::string::npos ||
+            const bool custom_inventory =
+                profile.proxy_hide_header_name_profile &&
+                (response.size() != profile.normalized_response_size ||
+                 count_text(response, "X-Unrelated: retained\r\n") != 1u ||
+                 response.find("X-Powered-By:") != std::string::npos ||
+                 response.find("x-powered-by:") != std::string::npos);
+            const bool legacy_inventory =
+                !profile.proxy_hide_header_name_profile &&
+                (response.size() != 176u ||
+                 count_text(response, "X-Compat-Visible: keep\r\n") != 1u ||
+                 count_text(response, "Set-Cookie: a=1\r\n") != 1u ||
+                 count_text(response, "Set-Cookie: b=2\r\n") != 1u ||
+                 response.find("Set-Cookie: a=1\r\nSet-Cookie: b=2\r\n") == std::string::npos ||
+                 response.find("X-Compat-Hidden:") != std::string::npos ||
+                 response.find("x-compat-hidden:") != std::string::npos);
+            if (custom_inventory || legacy_inventory ||
                 response.find("Server: origin\r\n") != std::string::npos ||
                 response.find("Wed, 26 Aug 2026 23:57:18 GMT") != std::string::npos) {
                 error =
@@ -33157,7 +33231,7 @@ static bool validate_static_query_proxy_observation(
             if (profile.proxy_hide_header_profile) {
                 const std::string upstream(observation.forward_history[i].begin(),
                                            observation.forward_history[i].end());
-                if (upstream.size() != 66u ||
+                if (upstream.size() != profile.upstream_request_sizes[i] ||
                     count_text(upstream,
                                "Host: 127.0.0.1:" + std::to_string(backend_port) + "\r\n") != 1u ||
                     count_text(upstream, "X-Dupe: one\r\n") != 1u ||
@@ -33364,7 +33438,7 @@ static StaticQueryProxyOracleObservation make_static_query_proxy_self_check(
     if (profile.proxy_hide_header_profile) {
         value.original_config =
             make_static_query_proxy_fragment(frontend_port, backend_port, listen_first, profile);
-        value.source_poison = "destroyed-after-373-nginx-load\n";
+        value.source_poison = "destroyed-after-" + std::string(profile.scope_id) + "-nginx-load\n";
         value.source_poisoned = true;
         value.origin_peer_close_count = 1u;
         value.origin_response_sent_ns = 10u;
@@ -34120,17 +34194,19 @@ static bool run_root_empty_query_proxy_oracle_self_checks(std::string& error) {
     return true;
 }
 
-static bool validate_proxy_hide_header_fragment(const std::string& fragment,
-                                                u16 frontend_port,
-                                                u16 backend_port,
-                                                bool listen_first,
-                                                std::string& error) {
-    const auto& profile = kProxyHideHeaderOracleProfile;
+static bool validate_proxy_hide_header_fragment(
+    const std::string& fragment,
+    u16 frontend_port,
+    u16 backend_port,
+    bool listen_first,
+    std::string& error,
+    const StaticQueryProxyOracleProfile& profile = kProxyHideHeaderOracleProfile) {
     const std::string expected =
         make_static_query_proxy_fragment(frontend_port, backend_port, listen_first, profile);
     const std::string listen = "listen 127.0.0.1:" + std::to_string(frontend_port) + ";";
     const std::string proxy = "proxy_pass http://127.0.0.1:" + std::to_string(backend_port) + ";";
-    const std::string hide = "proxy_hide_header X-Compat-Hidden;";
+    const std::string hide =
+        "proxy_hide_header " + std::string(profile.proxy_hide_header_name) + ";";
     const size_t hide_at = fragment.find(hide);
     const size_t proxy_at = fragment.find(proxy);
     if (backend_port < 1024u || backend_port > 9999u || frontend_port == 0u ||
@@ -34263,6 +34339,207 @@ static bool run_proxy_hide_header_oracle_self_checks(std::string& error) {
     return true;
 }
 
+static bool run_proxy_hide_header_name_self_checks(std::string& error) {
+    static constexpr u16 kPorts[4] = {15580u, 9002u, 15581u, 9003u};
+    const auto& profile = kProxyHideHeaderNameOracleProfile;
+    if (static_query_proxy_request("/", profile) != kProxyHideHeaderClientRequest ||
+        static_query_expected_upstream("/", kPorts[1], profile).size() != 66u ||
+        profile.origin_response_size != 178u || profile.normalized_response_size != 141u) {
+        error = "#600 fixed request/response byte arithmetic self-check failed";
+        return false;
+    }
+    const std::string fragments[2] = {
+        make_static_query_proxy_fragment(kPorts[0], kPorts[1], true, profile),
+        make_static_query_proxy_fragment(kPorts[2], kPorts[3], false, profile)};
+    if (!validate_proxy_hide_header_fragment(
+            fragments[0], kPorts[0], kPorts[1], true, error, profile) ||
+        !validate_proxy_hide_header_fragment(
+            fragments[1], kPorts[2], kPorts[3], false, error, profile))
+        return false;
+    const auto rejects_fragment =
+        [&](const std::string& needle, const std::string& replacement, const char* name) {
+            std::string changed = fragments[0];
+            const size_t at = changed.find(needle);
+            if (at == std::string::npos ||
+                changed.find(needle, at + needle.size()) != std::string::npos) {
+                error = std::string("#600 config mutation target was absent or ambiguous: ") + name;
+                return false;
+            }
+            changed.replace(at, needle.size(), replacement);
+            std::string detail;
+            if (!validate_proxy_hide_header_fragment(
+                    changed, kPorts[0], kPorts[1], true, detail, profile))
+                return true;
+            error = std::string("#600 config validator accepted mutation: ") + name;
+            return false;
+        };
+    if (!rejects_fragment("X-Powered-By", "x-powered-by", "case-spelling") ||
+        !rejects_fragment("proxy_hide_header X-Powered-By;",
+                          "proxy_hide_header X-Powered-By;\n    proxy_hide_header X-Powered-By;",
+                          "duplicate-hide") ||
+        !rejects_fragment("proxy_hide_header X-Powered-By;",
+                          "proxy_hide_header X-Powered-By",
+                          "missing-semicolon"))
+        return false;
+    std::string reordered = fragments[0];
+    const std::string hide_line = "    proxy_hide_header X-Powered-By;\n";
+    const std::string proxy_line = "    proxy_pass http://127.0.0.1:9002;\n";
+    const size_t hide_at = reordered.find(hide_line);
+    const size_t proxy_at = reordered.find(proxy_line);
+    if (hide_at == std::string::npos || proxy_at == std::string::npos || hide_at > proxy_at) {
+        error = "#600 config order mutation fixture was malformed";
+        return false;
+    }
+    reordered.replace(hide_at, hide_line.size() + proxy_line.size(), proxy_line + hide_line);
+    std::string detail;
+    if (validate_proxy_hide_header_fragment(
+            reordered, kPorts[0], kPorts[1], true, detail, profile)) {
+        error = "#600 config validator accepted swapped hide/proxy order";
+        return false;
+    }
+
+    StaticQueryProxyOracleObservation valid[2] = {
+        make_static_query_proxy_self_check(kPorts[0], kPorts[1], true, profile),
+        make_static_query_proxy_self_check(kPorts[2], kPorts[3], false, profile)};
+    if (!validate_static_query_proxy_pair(valid, kPorts, error, profile)) return false;
+    const auto rejects_pair = [&](StaticQueryProxyOracleObservation changed[2], const char* name) {
+        std::string mutation_error;
+        if (!validate_static_query_proxy_pair(changed, kPorts, mutation_error, profile))
+            return true;
+        error = std::string("#600 observation mutation accepted: ") + name;
+        return false;
+    };
+    StaticQueryProxyOracleObservation changed[2] = {valid[0], valid[1]};
+    std::string leaked(changed[1].wires[0].begin(), changed[1].wires[0].end());
+    leaked.insert(leaked.find("X-Unrelated:"), "X-Powered-By: leaked\r\n");
+    changed[1].wires[0].assign(leaked.begin(), leaked.end());
+    if (!rejects_pair(changed, "hidden-header-leak")) return false;
+    changed[0] = valid[0];
+    changed[1] = valid[1];
+    std::string unrelated(changed[1].wires[0].begin(), changed[1].wires[0].end());
+    const size_t unrelated_at = unrelated.find("X-Unrelated: retained\r\n");
+    if (unrelated_at == std::string::npos) {
+        error = "#600 visible-header mutation fixture was malformed";
+        return false;
+    }
+    unrelated.erase(unrelated_at, strlen("X-Unrelated: retained\r\n"));
+    changed[1].wires[0].assign(unrelated.begin(), unrelated.end());
+    if (!rejects_pair(changed, "unrelated-header-loss")) return false;
+    changed[0] = valid[0];
+    changed[1] = valid[1];
+    std::string body(changed[1].wires[0].begin(), changed[1].wires[0].end());
+    const size_t body_at = body.rfind("OK");
+    if (body_at == std::string::npos) {
+        error = "#600 body mutation fixture was malformed";
+        return false;
+    }
+    body.replace(body_at, 2u, "NO");
+    changed[1].wires[0].assign(body.begin(), body.end());
+    if (!rejects_pair(changed, "body-mutation")) return false;
+    changed[0] = valid[0];
+    changed[1] = valid[1];
+    changed[1].forward_history[0].pop_back();
+    if (!rejects_pair(changed, "upstream-wire")) return false;
+    changed[0] = valid[0];
+    changed[1] = valid[1];
+    changed[1].origin_peer_close_count = 0u;
+    if (!rejects_pair(changed, "missing-origin-fin")) return false;
+
+    const std::string access =
+        static_query_proxy_access_fixture(valid[0], valid[0].access_scope, kPorts[1], profile);
+    if (!parse_static_query_proxy_access(
+            access, valid[0].access_scope, valid[0], kPorts[1], error, profile))
+        return false;
+    std::string wrong_size = access;
+    const size_t response_size = wrong_size.find("response_size=141");
+    if (response_size == std::string::npos ||
+        wrong_size.find("response_size=141", response_size + 1u) != std::string::npos) {
+        error = "#600 access mutation fixture was not unique";
+        return false;
+    }
+    wrong_size.replace(response_size, strlen("response_size=141"), "response_size=140");
+    if (parse_static_query_proxy_access(
+            wrong_size, valid[0].access_scope, valid[0], kPorts[1], detail, profile)) {
+        error = "#600 access validator accepted wrong response size";
+        return false;
+    }
+    return true;
+}
+
+static bool run_proxy_hide_header_name_config_preflight(std::string& error) {
+    TempDir temp;
+    if (!temp.create()) {
+        error = "#600 could not create config preflight directory";
+        return false;
+    }
+    const auto run_case = [&](const std::string& name, bool expected_ok) {
+        const std::string config =
+            "events {}\nhttp {\n  server {\n    listen 127.0.0.1:8080;\n    location / {\n"
+            "      proxy_pass http://127.0.0.1:9000;\n      proxy_hide_header " +
+            name + ";\n    }\n  }\n}\n";
+        if (!write_file(temp.nginx_config, config.data(), config.size())) {
+            error = "#600 failed to write boundary config";
+            return false;
+        }
+        static std::atomic<unsigned> serial{0u};
+        const std::string container_name =
+            "rut-nginx-600-config-" + std::to_string(getpid()) + "-" +
+            std::to_string(serial.fetch_add(1u, std::memory_order_relaxed));
+        PreloadContainerGuard docker(container_name);
+        ChildGuard child;
+        if (!spawn_child({"docker",
+                          "run",
+                          "--pull=never",
+                          "--network",
+                          "none",
+                          "--name",
+                          container_name,
+                          "-v",
+                          temp.nginx_config + ":/etc/nginx/nginx.conf:ro",
+                          "--entrypoint",
+                          "/usr/sbin/nginx",
+                          kNginxImage,
+                          "-t",
+                          "-c",
+                          "/etc/nginx/nginx.conf"},
+                         temp.nginx_log,
+                         child.child)) {
+            error = "#600 failed to start pinned nginx config preflight";
+            return false;
+        }
+        if (!wait_child(child.child, 10'000)) {
+            (void)stop_child(child.child);
+            (void)docker.remove();
+            error = "#600 pinned nginx config preflight timed out";
+            return false;
+        }
+        const bool actual_ok = child.child.status_valid && WIFEXITED(child.child.status) &&
+                               WEXITSTATUS(child.child.status) == 0;
+        const bool expected_failure_status = child.child.status_valid &&
+                                             WIFEXITED(child.child.status) &&
+                                             WEXITSTATUS(child.child.status) == 1;
+        std::string output;
+        if (!docker.remove() || !read_bounded_file(temp.nginx_log, output, error)) return false;
+        const bool expected_success_output = output.find("syntax is ok") != std::string::npos &&
+                                             output.find("test is successful") != std::string::npos;
+        const bool expected_failure_output =
+            output.find("could not build proxy_headers_hash") != std::string::npos &&
+            output.find("proxy_headers_hash_bucket_size: 64") != std::string::npos;
+        if ((expected_ok ? actual_ok : expected_failure_status) == false ||
+            (expected_ok && !expected_success_output) ||
+            (!expected_ok && !expected_failure_output)) {
+            error = "#600 pinned nginx boundary result/diagnostic mismatch for name length " +
+                    std::to_string(name.size()) + ": " + output;
+            return false;
+        }
+        return true;
+    };
+    if (!run_case("X-Powered-By", true) || !run_case("X-" + std::string(44u, 'A'), true) ||
+        !run_case("X-" + std::string(45u, 'A'), false))
+        return false;
+    return true;
+}
+
 static bool capture_static_query_proxy_oracle_side(
     u16 frontend_port,
     u16 backend_port,
@@ -34346,7 +34623,9 @@ static bool capture_static_query_proxy_oracle_side(
         count_text(config, "server {") != 1u || count_text(config, "listen ") != 1u ||
         count_text(config, exact_listen) != 1u ||
         (profile.proxy_hide_header_profile &&
-         (count_text(config, "proxy_hide_header X-Compat-Hidden;") != 1u ||
+         (count_text(config,
+                     "proxy_hide_header " + std::string(profile.proxy_hide_header_name) + ";") !=
+              1u ||
           count_text(config, "proxy_hide_header ") != 1u)) ||
         !write_file(temp.nginx_config, config.data(), config.size())) {
         error = std::string(profile.issue) +
@@ -73727,6 +74006,8 @@ int main(int argc, char** argv) {
         argc == 2 && strcmp(argv[1], "--pinned-nginx-root-empty-query-proxy-uri-oracle") == 0;
     const bool proxy_hide_header_oracle =
         argc == 2 && strcmp(argv[1], "--pinned-nginx-proxy-hide-header-oracle") == 0;
+    const bool proxy_hide_header_name_oracle =
+        argc == 2 && strcmp(argv[1], "--pinned-nginx-proxy-hide-header-name-oracle") == 0;
     const bool proxy_hide_header_source_self_check =
         argc == 2 && strcmp(argv[1], "--converter-proxy-hide-header-source-self-check") == 0;
     const bool explicit_timeout_head_source_self_check =
@@ -74081,9 +74362,10 @@ int main(int argc, char** argv) {
          !converter_wildcard_service_no_uri_differential && !static_query_proxy_uri_oracle &&
          !zero_suffix_static_query_proxy_uri_oracle && !empty_query_proxy_uri_oracle &&
          !root_empty_query_proxy_uri_oracle && !proxy_hide_header_oracle &&
-         !proxy_hide_header_source_self_check && !proxy_hide_header_generated_side_self_check &&
-         !explicit_timeout_head_source_self_check && !explicit_timeout_head_generated_episode &&
-         !explicit_timeout_head_phase_differential && !keepalive_timeout_head_differential &&
+         !proxy_hide_header_name_oracle && !proxy_hide_header_source_self_check &&
+         !proxy_hide_header_generated_side_self_check && !explicit_timeout_head_source_self_check &&
+         !explicit_timeout_head_generated_episode && !explicit_timeout_head_phase_differential &&
+         !keepalive_timeout_head_differential &&
          !keepalive_timeout_get_initial_deadline_differential &&
          !fixed_upload_head_success_differential &&
          !fixed_upload_head_zero_response_timeout_differential &&
@@ -75111,6 +75393,15 @@ int main(int argc, char** argv) {
         std::string self_check_error;
         if (!run_proxy_hide_header_oracle_self_checks(self_check_error)) {
             std::cerr << "FAIL [#373 proxy-hide-header oracle self-check]: " << self_check_error
+                      << "\n";
+            return 1;
+        }
+    }
+    if (proxy_hide_header_name_oracle) {
+        std::string self_check_error;
+        if (!run_proxy_hide_header_name_self_checks(self_check_error) ||
+            !run_proxy_hide_header_name_config_preflight(self_check_error)) {
+            std::cerr << "FAIL [#600 proxy-hide-header-name self-check]: " << self_check_error
                       << "\n";
             return 1;
         }
@@ -78464,6 +78755,40 @@ int main(int argc, char** argv) {
                "no parser, converter, generated-RUT, generic capability, behavior-equivalence, "
                "inheritance, proxy_pass_header, control-header, body/reuse/protocol, or broad "
                "#253 compatibility claim.\n";
+        return 0;
+    }
+
+    if (proxy_hide_header_name_oracle) {
+        const char* source_suffix = strrchr(temp.path, '/');
+        source_suffix = source_suffix ? source_suffix + 1 : temp.path;
+        const std::string container_prefix = "rut-nginx-600-proxy-hide-header-name-" +
+                                             std::to_string(getpid()) + "-" + source_suffix;
+        StaticQueryProxyOracleObservation listen_first;
+        StaticQueryProxyOracleObservation location_first;
+        std::string oracle_error;
+        if (!run_pinned_static_query_proxy_oracle(container_prefix,
+                                                  listen_first,
+                                                  location_first,
+                                                  oracle_error,
+                                                  kProxyHideHeaderNameOracleProfile)) {
+            std::cerr << "FAIL [#600 pinned nginx-only proxy_hide_header name oracle]: "
+                      << oracle_error << "\n";
+            dump_static_query_proxy_oracle_observation(listen_first,
+                                                       kProxyHideHeaderNameOracleProfile);
+            dump_static_query_proxy_oracle_observation(location_first,
+                                                       kProxyHideHeaderNameOracleProfile);
+            return 1;
+        }
+        std::cerr
+            << "PASS: #600 pinned nginx 1.29.7 Stage 1 nginx-only oracle proves one literal "
+               "proxy_hide_header X-Powered-By on the exact-loopback root proxy removes both "
+               "case variants while retaining X-Unrelated: retained. Listen-first and "
+               "location-first sides each observed the exact 85-byte bodyless request, 66-byte "
+               "Host-rebuilt upstream, 178-byte origin response, 141-byte normalized response, "
+               "EOF, one clean episode, source poison/readback and no warn-or-higher diagnostics. "
+               "The separate default-hash 46/47 config controls passed; this is pinned-nginx-only "
+               "test evidence, not parser/converter/support promotion or a portable 64-byte "
+               "claim.\n";
         return 0;
     }
 

@@ -1223,7 +1223,6 @@ if(RUT_ENABLE_JIT)
         RUN_SERIAL TRUE
         RESOURCE_LOCK nginx-differential
         TIMEOUT 120
-        SKIP_RETURN_CODE 77
         ENVIRONMENT "RUT_NGINX_DIFFERENTIAL_REQUIRED=1"
     )
     add_test(
@@ -1248,6 +1247,17 @@ if(RUT_ENABLE_JIT)
         RESOURCE_LOCK nginx-differential
         TIMEOUT 90
         SKIP_RETURN_CODE 77
+        ENVIRONMENT "RUT_NGINX_DIFFERENTIAL_REQUIRED=1"
+    )
+    add_test(
+        NAME test_nginx_issue600_proxy_hide_header_name_oracle
+        COMMAND test_nginx_differential --pinned-nginx-proxy-hide-header-name-oracle
+    )
+    set_tests_properties(test_nginx_issue600_proxy_hide_header_name_oracle PROPERTIES
+        LABELS "integration;nginx;docker"
+        RUN_SERIAL TRUE
+        RESOURCE_LOCK nginx-differential
+        TIMEOUT 120
         ENVIRONMENT "RUT_NGINX_DIFFERENTIAL_REQUIRED=1"
     )
     add_test(
