@@ -24751,6 +24751,15 @@ static void append_recv_owner_failure_evidence(rut_iouring_gate& gate, std::stri
 }
 
 static bool run_recv_owner_diagnostic_self_check(std::string& error) {
+    if (!rut_iouring_gate_recv_shape_matches(
+            2u, 1u, 7u, 4096u, UINT64_C(0x1201), 2u, 1u, 7u, 4096u, 1u) ||
+        rut_iouring_gate_recv_shape_matches(
+            0u, 1u, 7u, 4096u, UINT64_C(0x1201), 2u, 1u, 7u, 4096u, 1u) ||
+        !rut_iouring_gate_send_owner_matches(UINT64_C(0x1201), UINT64_C(0x1202), 2u) ||
+        rut_iouring_gate_send_owner_matches(UINT64_C(0x1201), UINT64_C(0x1302), 2u)) {
+        error = "recv-owner shared predicate self-check failed";
+        return false;
+    }
     rut_iouring_gate gate{};
     pthread_mutexattr_t attributes;
     if (pthread_mutexattr_init(&attributes) != 0 ||
