@@ -50529,6 +50529,15 @@ struct RetainedHeaderObservation {
     u16 backend_port = 0u;
 };
 
+static std::vector<char> normalize_retained_response_date(const std::vector<char>& response) {
+    std::string text(response.begin(), response.end());
+    const size_t date = text.find("Date: ");
+    const size_t end = date == std::string::npos ? std::string::npos : text.find("\r\n", date);
+    if (date != std::string::npos && end != std::string::npos)
+        text.replace(date + 6u, end - (date + 6u), 29u, 'X');
+    return std::vector<char>(text.begin(), text.end());
+}
+
 static bool compare_retained_header_observations(const RetainedHeaderObservation& nginx,
                                                  const RetainedHeaderObservation& generated,
                                                  std::string& error) {
@@ -50548,6 +50557,26 @@ static bool compare_retained_header_observations(const RetainedHeaderObservation
         error = "#252 nginx/generated retained-header observations differed";
         return false;
     }
+    return true;
+}
+
+static bool retained_header_comparator_self_check(std::string& error) {
+    RetainedHeaderObservation a;
+    a.response = {'r'};
+    a.access = "105\n";
+    const std::string wire =
+        "GET /ledger?q=raw HTTP/1.1\r\nHost: 127.0.0.1:9000\r\nX-Test: \t keep \t\r\n\r\n";
+    a.upstream.assign(wire.begin(), wire.end());
+    RetainedHeaderObservation b = a;
+    if (!compare_retained_header_observations(a, b, error)) return false;
+    b.response[0] = 'R';
+    if (compare_retained_header_observations(a, b, error)) return false;
+    b = a;
+    b.access = "102\n";
+    if (compare_retained_header_observations(a, b, error)) return false;
+    b = a;
+    b.upstream[0] = 'U';
+    if (compare_retained_header_observations(a, b, error)) return false;
     return true;
 }
 
@@ -50772,7 +50801,7 @@ static bool run_pinned_retained_header_whitespace_oracle(TempDir& temp,
         return false;
     }
     if (observation != nullptr) {
-        observation->response.assign(downstream.begin(), downstream.end());
+        observation->response = normalize_retained_response_date(downstream);
         observation->access = access;
         observation->upstream = origin.request;
         observation->backend_port = backend_port;
@@ -51816,7 +51845,7 @@ static bool run_converter_request_length_rut_side(TempDir& temp,
         client.fd = -1;
     }
     if (retained_header_whitespace && observation != nullptr) {
-        observation->response = response;
+        observation->response = normalize_retained_response_date(response);
         observation->access = final_access;
         observation->upstream = backend.history[0];
         observation->backend_port = backend_port;
@@ -51885,20 +51914,22 @@ static bool run_converter_retained_header_whitespace_differential(TempDir& temp,
         error = "#252 could not pre-hold isolated generated-RUT frontend/backend ports";
         return false;
     }
+    if (!retained_header_comparator_self_check(error)) return false;
     RetainedHeaderObservation nginx_observation;
     RetainedHeaderObservation generated_observation;
     if (!run_pinned_retained_header_whitespace_oracle(
             temp, container_name, &nginx_observation, error))
         return false;
-    return run_converter_request_length_rut_side(temp,
-                                                 rut_path,
-                                                 rut_reservations,
-                                                 rut_frontend_port,
-                                                 rut_backend_port,
-                                                 false,
-                                                 true,
-                                                 &generated_observation,
-                                                 error);
+    if (!run_converter_request_length_rut_side(temp,
+                                               rut_path,
+                                               rut_reservations,
+                                               rut_frontend_port,
+                                               rut_backend_port,
+                                               false,
+                                               true,
+                                               &generated_observation,
+                                               error))
+        return false;
     if (!compare_retained_header_observations(nginx_observation, generated_observation, error))
         return false;
     return true;
