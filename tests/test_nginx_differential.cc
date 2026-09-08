@@ -51149,10 +51149,11 @@ static bool read_monitored_access_file(const std::string& path,
 
 static bool validate_default_access_record(const std::string& contents, std::string& error) {
     const std::string prefix = "127.0.0.1 - - [";
-    const std::string request = "] \"GET /ledger?q=raw HTTP/1.1\" 200 2 ";
+    const std::string suffix = "] \"GET /ledger?q=raw HTTP/1.1\" 200 2 \"-\" \"-\"\n";
+    const size_t date_end = contents.find("] \"GET /ledger?q=raw HTTP/1.1\"", prefix.size());
     if (contents.empty() || contents.back() != '\n' || count_text(contents, "\n") != 1u ||
-        contents.rfind(prefix, 0u) != 0u ||
-        contents.find(request, prefix.size()) == std::string::npos) {
+        contents.rfind(prefix, 0u) != 0u || date_end == std::string::npos ||
+        date_end <= prefix.size() || contents.compare(date_end, suffix.size(), suffix) != 0) {
         error = "#591 positive default access record did not identify request/status/body bytes";
         return false;
     }
