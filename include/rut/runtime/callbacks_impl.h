@@ -4064,8 +4064,8 @@ void handle_jit_outcome(Loop* loop,
                             conn.response_read_deadline_buffering,
                             conn.response_read_deadline_method,
                             conn.response_read_deadline_route_method) ||
-                        conn.request_policy_id !=
-                            static_cast<u16>(RequestPolicyId::Http11FixedStrip) ||
+                        !bodyless_get_complete_content_length_request_policy_is_admitted(
+                            conn.request_policy_id) ||
                         proof.handler_generation != conn.http1_pipeline_request_generation ||
                         proof.raw_header_end != 0 || proof.raw_content_length != 0 ||
                         proof.raw_total_length != 0 || proof.rewritten_header_end != 0 ||
@@ -5345,17 +5345,21 @@ inline bool apply_request_policy(Connection& conn, const sockaddr_in& endpoint, 
     if (inspect_request_policy_body(conn, policy_id) != RequestPolicyBodyState::Complete)
         return false;
 
-    if (request_policy_trims_sp_preserves_htab(policy_id) &&
-        (conn.response_read_deadline_profile !=
-             ResponseReadDeadlineProfile::BodylessNonHeadContentLengthZero ||
-         conn.response_read_deadline_buffering !=
-             ForwardResponseBufferingMode::CompleteContentLength ||
-         conn.response_read_deadline_state == ResponseReadDeadlineState::None ||
-         !response_read_timeout_seconds_valid(conn.response_read_deadline_seconds) ||
-         conn.req_method != static_cast<u8>(LogHttpMethod::Get) ||
-         conn.response_read_deadline_route_method != kRouteMethodGet || conn.pipeline_depth != 0 ||
-         conn.pipeline_stash_len != 0))
-        return false;
+    if (request_policy_trims_sp_preserves_htab(policy_id)) {
+        if (!http1_pipeline_request_is_legacy(conn) &&
+            !http1_pipeline_successor_materialization_is_stable(conn, policy_id))
+            return false;
+        if (conn.response_read_deadline_profile !=
+                ResponseReadDeadlineProfile::BodylessNonHeadContentLengthZero ||
+            conn.response_read_deadline_buffering !=
+                ForwardResponseBufferingMode::CompleteContentLength ||
+            conn.response_read_deadline_state == ResponseReadDeadlineState::None ||
+            !response_read_timeout_seconds_valid(conn.response_read_deadline_seconds) ||
+            conn.req_method != static_cast<u8>(LogHttpMethod::Get) ||
+            conn.response_read_deadline_route_method != kRouteMethodGet ||
+            (http1_pipeline_request_is_legacy(conn) && conn.pipeline_stash_len != 0))
+            return false;
+    }
 
     struct ScratchResetGuard {
         Connection& conn;
