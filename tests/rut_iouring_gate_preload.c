@@ -645,7 +645,7 @@ static int inspect_submission(uint32_t to_submit) {
         fail(RUT_IOURING_GATE_ERROR_RING);
         return 0;
     }
-    const char expected[] = "HTTP/1.1 502 ";
+    const char* expected = "HTTP/1.1 502 ";
     char* sq = (char*)ring_view.sq_ring;
     uint32_t* head = (uint32_t*)(sq + ring_view.params.sq_off.head);
     uint32_t* tail = (uint32_t*)(sq + ring_view.params.sq_off.tail);
@@ -654,6 +654,8 @@ static int inspect_submission(uint32_t to_submit) {
     const uint32_t first = __atomic_load_n(head, __ATOMIC_ACQUIRE);
     const uint32_t last = __atomic_load_n(tail, __ATOMIC_ACQUIRE);
     const uint32_t mode = rut_downstream_gate_load(&gate->mode);
+    if (mode == RUT_IOURING_GATE_MODE_LATE_SUCCESSOR_200) expected = "HTTP/1.1 200 ";
+    const size_t expected_length = 12u;
     const int coalesced_ingress =
         mode == RUT_IOURING_GATE_MODE_COALESCED_INGRESS &&
         rut_downstream_gate_load(&gate->state) == RUT_DOWNSTREAM_GATE_ARMED;
@@ -698,7 +700,8 @@ static int inspect_submission(uint32_t to_submit) {
         if (sqe->opcode == IORING_OP_RECV && target_peer(sqe->fd)) {
             if (rut_downstream_gate_load(&gate->state) == RUT_DOWNSTREAM_GATE_ARMED &&
                 mode != RUT_IOURING_GATE_MODE_LATE_SUCCESSOR &&
-                mode != RUT_IOURING_GATE_MODE_COALESCED_INGRESS) {
+                mode != RUT_IOURING_GATE_MODE_COALESCED_INGRESS &&
+                mode != RUT_IOURING_GATE_MODE_LATE_SUCCESSOR_200) {
                 fail(RUT_IOURING_GATE_ERROR_PROTOCOL);
                 return 0;
             }
@@ -722,8 +725,8 @@ static int inspect_submission(uint32_t to_submit) {
         if (coalesced_ingress && sqe->opcode == IORING_OP_SEND && target_peer(sqe->fd))
             ingress_send_count++;
         if (sqe->opcode != IORING_OP_SEND || !target_peer(sqe->fd) ||
-            sqe->len < sizeof(expected) - 1 || sqe->addr == 0 ||
-            memcmp((const void*)(uintptr_t)sqe->addr, expected, sizeof(expected) - 1) != 0)
+            sqe->len < expected_length || sqe->addr == 0 ||
+            memcmp((const void*)(uintptr_t)sqe->addr, expected, expected_length) != 0)
             continue;
         if (mode == RUT_IOURING_GATE_MODE_COALESCED_INGRESS) {
             if (rut_downstream_gate_load(&gate->state) == RUT_DOWNSTREAM_GATE_ARMED) {
@@ -732,7 +735,8 @@ static int inspect_submission(uint32_t to_submit) {
             }
             continue;
         }
-        if (mode != RUT_IOURING_GATE_MODE_LATE_SUCCESSOR) {
+        if (mode != RUT_IOURING_GATE_MODE_LATE_SUCCESSOR &&
+            mode != RUT_IOURING_GATE_MODE_LATE_SUCCESSOR_200) {
             if (rut_downstream_gate_load(&gate->state) == RUT_DOWNSTREAM_GATE_ARMED) {
                 fail(RUT_IOURING_GATE_ERROR_PROTOCOL);
                 return 0;
@@ -768,8 +772,8 @@ static int inspect_submission(uint32_t to_submit) {
         gate->recv_user_data = ring_view.target_recv_user_data;
         gate->sq_head_at_hit = first;
         gate->sq_tail_at_hit = last;
-        gate->intercepted_prefix_length = sizeof(expected) - 1;
-        memcpy(gate->intercepted_prefix, expected, sizeof(expected) - 1);
+        gate->intercepted_prefix_length = expected_length;
+        memcpy(gate->intercepted_prefix, expected, expected_length);
         char* cq = (char*)ring_view.cq_ring;
         uint32_t* cq_head = (uint32_t*)(cq + ring_view.params.cq_off.head);
         gate->cq_head_at_hit = __atomic_load_n(cq_head, __ATOMIC_ACQUIRE);

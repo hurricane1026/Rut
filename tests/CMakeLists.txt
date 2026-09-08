@@ -2767,6 +2767,17 @@ if(RUT_ENABLE_JIT)
             COMMAND test_nginx_differential --rut-issue566-id3-successor-public-gate
                     $<TARGET_FILE:rut> $<TARGET_FILE:test_rut_iouring_gate_preload>
         )
+        add_test(
+            NAME test_rut_issue566_id3_successor_live200_public_gate
+            COMMAND test_nginx_differential --rut-issue566-id3-successor-live200-public-gate
+                    $<TARGET_FILE:rut> $<TARGET_FILE:test_rut_iouring_gate_preload>
+        )
+        set_tests_properties(test_rut_issue566_id3_successor_live200_public_gate PROPERTIES
+            LABELS "integration;nginx"
+            RUN_SERIAL TRUE
+            RESOURCE_LOCK nginx-differential
+            TIMEOUT 30
+        )
         set_tests_properties(test_rut_issue566_id3_successor_public_gate PROPERTIES
             LABELS "integration;nginx"
             RUN_SERIAL TRUE

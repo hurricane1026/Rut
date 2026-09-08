@@ -24470,6 +24470,7 @@ struct RutIoUringGateFixture {
     size_t request_two_length = 0;
     const char* response_one = nullptr;
     const char* response_two = nullptr;
+    Recorder* live_recorder = nullptr;
 };
 
 static void dump_late_successor_observation(const char* side,
@@ -25287,11 +25288,12 @@ static bool run_rut_iouring_gate_spike(u16 frontend_port,
         return false;
     }
     DeadPort owned_dead;
-    if (shared_dead == nullptr && !owned_dead.reserve(backend_port)) {
+    const bool live200 = fixture != nullptr && fixture->live_recorder != nullptr;
+    if (!live200 && shared_dead == nullptr && !owned_dead.reserve(backend_port)) {
         error = "failed to reserve RUT io_uring gate dead upstream";
         return false;
     }
-    if (shared_dead != nullptr && shared_dead->fd < 0) {
+    if (!live200 && shared_dead != nullptr && shared_dead->fd < 0) {
         error = "shared RUT dead upstream reservation is not live";
         return false;
     }
@@ -25614,7 +25616,9 @@ static bool run_rut_iouring_gate_spike(u16 frontend_port,
     mapping.gate->target_peer_port_be = local.sin_port;
     mapping.gate->target_upstream_ipv4_be = htonl(INADDR_LOOPBACK);
     mapping.gate->target_upstream_port_be = htons(backend_port);
-    rut_downstream_gate_store(&mapping.gate->mode, RUT_IOURING_GATE_MODE_LATE_SUCCESSOR);
+    rut_downstream_gate_store(&mapping.gate->mode,
+                              live200 ? RUT_IOURING_GATE_MODE_LATE_SUCCESSOR_200
+                                      : RUT_IOURING_GATE_MODE_LATE_SUCCESSOR);
     mapping.gate->request_two_length = static_cast<u32>(request_two_length);
     memcpy(mapping.gate->request_two, request_two, mapping.gate->request_two_length);
     if (!rut_downstream_gate_cas(
@@ -25652,14 +25656,14 @@ static bool run_rut_iouring_gate_spike(u16 frontend_port,
                 std::to_string(rut_downstream_gate_load(&mapping.gate->error_code));
         return false;
     }
-    static constexpr unsigned char kExpectedPrefix[] = "HTTP/1.1 502 ";
+    static constexpr unsigned char kExpectedPrefix502[] = "HTTP/1.1 502 ";
+    static constexpr unsigned char kExpectedPrefix200[] = "HTTP/1.1 200 ";
+    const unsigned char* expected_prefix = live200 ? kExpectedPrefix200 : kExpectedPrefix502;
     if (mapping.gate->target_pid != static_cast<u32>(rut_process.child.pid) ||
         mapping.gate->ring_fd < 0 || mapping.gate->intercepted_fd < 0 ||
         mapping.gate->intercepted_opcode != IORING_OP_SEND ||
-        mapping.gate->intercepted_length < sizeof(kExpectedPrefix) - 1u ||
-        mapping.gate->intercepted_prefix_length != sizeof(kExpectedPrefix) - 1u ||
-        memcmp(mapping.gate->intercepted_prefix, kExpectedPrefix, sizeof(kExpectedPrefix) - 1u) !=
-            0 ||
+        mapping.gate->intercepted_length < 12u || mapping.gate->intercepted_prefix_length != 12u ||
+        memcmp(mapping.gate->intercepted_prefix, expected_prefix, 12u) != 0 ||
         mapping.gate->recv_user_data == 0 ||
         (mapping.gate->recv_user_data & 0xffu) != static_cast<rut::u8>(rut::IoEventType::Recv) ||
         (mapping.gate->intercepted_user_data & 0xffu) !=
@@ -25667,7 +25671,15 @@ static bool run_rut_iouring_gate_spike(u16 frontend_port,
         ((mapping.gate->recv_user_data >> 8) & 0xffffffu) !=
             ((mapping.gate->intercepted_user_data >> 8) & 0xffffffu) ||
         mapping.gate->sq_tail_at_hit <= mapping.gate->sq_head_at_hit) {
-        error = "RUT io_uring HIT metadata did not prove target 502 Send/Recv ownership";
+        error = live200 ? "RUT io_uring HIT metadata did not prove target 200 Send/Recv ownership"
+                        : "RUT io_uring HIT metadata did not prove target 502 Send/Recv ownership";
+        return false;
+    }
+    if (live200 &&
+        (fixture->live_recorder->accepted.load(std::memory_order_acquire) != 1u ||
+         fixture->live_recorder->requests.load(std::memory_order_acquire) != 1u ||
+         fixture->live_recorder->response_send_all_calls.load(std::memory_order_acquire) != 1u)) {
+        error = "live200 origin did not publish exactly one accepted/requested/sent episode at HIT";
         return false;
     }
     if (!downstream_has_no_readable_byte(client.fd, error)) return false;
@@ -25704,6 +25716,13 @@ static bool run_rut_iouring_gate_spike(u16 frontend_port,
             static_cast<rut::u8>(rut::IoEventType::UpstreamConnect) ||
         ((mapping.gate->connect_attempts[0].user_data >> 32) & 0xffffffu) == 0) {
         error = "RUT gate did not prove exactly one clean upstream Connect before release";
+        return false;
+    }
+    if (live200 &&
+        (fixture->live_recorder->accepted.load(std::memory_order_acquire) != 1u ||
+         fixture->live_recorder->requests.load(std::memory_order_acquire) != 1u ||
+         fixture->live_recorder->response_send_all_calls.load(std::memory_order_acquire) != 1u)) {
+        error = "live200 origin changed before R2_ARRIVED";
         return false;
     }
     if (!rut_downstream_gate_cas(
@@ -64032,6 +64051,100 @@ static bool run_rut_issue566_id3_successor_public_gate(const char* rut_path,
     return ok;
 }
 
+// Live successor sibling: the held first response is a real origin 200, and
+// retirement must force a second TCP episode rather than reusing the first.
+static bool run_rut_issue566_id3_successor_live200_public_gate(const char* rut_path,
+                                                               const char* preload_path,
+                                                               std::string& error) {
+    static constexpr char kDiagnostic[] = "#566/#567 handwritten ID3 live200 successor gate";
+    static constexpr char kRequest1[] =
+        "GET /missing?q=1 HTTP/1.1\r\nHost: client.example\r\nX-Test:\t keep \t\r\n\r\n";
+    static constexpr char kRequest2[] =
+        "GET /missing?q=2 HTTP/1.1\r\nHost: client.example\r\nX-Test:\t keep \t\r\n"
+        "Connection: close\r\n\r\n";
+    static constexpr char kResponse1[] =
+        "HTTP/1.1 200 OK\r\nServer: nginx/1.29.7\r\n"
+        "Date: XXXXXXXXXXXXXXXXXXXXXXXXXXXXX\r\nContent-Length: 0\r\n"
+        "Connection: keep-alive\r\n\r\n";
+    static constexpr char kResponse2[] =
+        "HTTP/1.1 200 OK\r\nServer: nginx/1.29.7\r\n"
+        "Date: XXXXXXXXXXXXXXXXXXXXXXXXXXXXX\r\nContent-Length: 0\r\n"
+        "Connection: close\r\n\r\n";
+    if (rut_path == nullptr || preload_path == nullptr || rut_path[0] != '/' ||
+        preload_path[0] != '/' || access(rut_path, X_OK) != 0 || access(preload_path, R_OK) != 0) {
+        error = std::string(kDiagnostic) + " requires executable RUT and readable preload paths";
+        return false;
+    }
+    HeldLoopbackPorts reservations;
+    u16 frontend_port = 0, backend_port = 0;
+    if (!reservations.reserve_reusable(0u, frontend_port) || !reservations.reserve(1u, backend_port)) {
+        error = std::string(kDiagnostic) + " dynamic port reservation failed";
+        return false;
+    }
+    TempDir temp;
+    if (!temp.create()) {
+        error = std::string(kDiagnostic) + " temporary directory setup failed";
+        return false;
+    }
+    std::string source;
+    if (!build_issue558_handwritten_source(
+            frontend_port, backend_port, temp.rut_access_log, true, source, error))
+        return false;
+    if (!handoff_held_loopback_port(&reservations.fds[1], backend_port, kDiagnostic, error))
+        return false;
+    Recorder origin;
+    origin.wait_response_peer_close = true;
+    origin.observe_extra_requests_until_stop = true;
+    if (!origin.setup(backend_port, 2u, "HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n", 38u)) {
+        error = std::string(kDiagnostic) + " live origin setup failed";
+        return false;
+    }
+    RutIoUringGateFixture fixture;
+    fixture.source = &source;
+    fixture.request_one = kRequest1;
+    fixture.request_one_length = sizeof(kRequest1) - 1u;
+    fixture.request_two = kRequest2;
+    fixture.request_two_length = sizeof(kRequest2) - 1u;
+    fixture.response_one = kResponse1;
+    fixture.response_two = kResponse2;
+    fixture.live_recorder = &origin;
+    if (!run_rut_iouring_gate_spike(frontend_port, backend_port, temp, rut_path, preload_path,
+                                    false, false, false, false, error, nullptr, nullptr, nullptr,
+                                    &reservations.fds[0], &fixture))
+        return false;
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+    while ((origin.accepted.load(std::memory_order_acquire) != 2u ||
+            origin.requests.load(std::memory_order_acquire) != 2u ||
+            origin.response_send_all_calls.load(std::memory_order_acquire) != 2u ||
+            origin.response_peer_close_count.load(std::memory_order_acquire) != 2u) &&
+           std::chrono::steady_clock::now() < deadline)
+        usleep(1000);
+    origin.stop();
+    const std::string expected1 = std::string("GET /missing?q=1 HTTP/1.1\r\nHost: 127.0.0.1:") +
+                                  std::to_string(backend_port) + "\r\nX-Test: \t keep \t\r\n\r\n";
+    const std::string expected2 = std::string("GET /missing?q=2 HTTP/1.1\r\nHost: 127.0.0.1:") +
+                                  std::to_string(backend_port) +
+                                  "\r\nX-Test: \t keep \t\r\n\r\n";
+    if (origin.accepted.load() != 2u || origin.requests.load() != 2u ||
+        origin.response_send_all_calls.load() != 2u || origin.response_peer_close_count.load() != 2u ||
+        origin.history.size() != 2u || origin.history[0] != std::vector<char>(expected1.begin(), expected1.end()) ||
+        origin.history[1] != std::vector<char>(expected2.begin(), expected2.end())) {
+        error = std::string(kDiagnostic) + " origin did not prove two exact distinct episodes " +
+                "accepted=" + std::to_string(origin.accepted.load()) +
+                " requests=" + std::to_string(origin.requests.load()) +
+                " writes=" + std::to_string(origin.response_send_all_calls.load()) +
+                " closes=" + std::to_string(origin.response_peer_close_count.load()) +
+                " history=" + std::to_string(origin.history.size());
+        for (size_t i = 0; i < origin.history.size(); ++i)
+            dump_wire((std::string(kDiagnostic) + " origin history " + std::to_string(i)).c_str(),
+                      origin.history[i]);
+        return false;
+    }
+    std::cerr << "PASS evidence: " << kDiagnostic
+              << " mode=3 response=200/CL0 upstream_episodes=2 accepts=2 requests=2 writes=2 closes=2\n";
+    return true;
+}
+
 // Public #558 capability gate.  The positive ordinary source selects ID3 and
 // the legacy source selects ID1; both are run through the public CLI/JIT and
 // the same exact positive upstream comparator receives both observed wires.
@@ -71684,6 +71797,8 @@ int main(int argc, char** argv) {
         argc == 3 && strcmp(argv[1], "--rut-issue558-retained-header-public-gate") == 0;
     const bool rut_issue566_id3_successor_public_gate =
         argc == 4 && strcmp(argv[1], "--rut-issue566-id3-successor-public-gate") == 0;
+    const bool rut_issue566_id3_successor_live200_public_gate =
+        argc == 4 && strcmp(argv[1], "--rut-issue566-id3-successor-live200-public-gate") == 0;
     const bool rut_exact_ipv4_listener_production =
         argc == 3 && strcmp(argv[1], "--rut-exact-ipv4-listener-production") == 0;
     const bool converter_coalesced_successor_differential =
@@ -71806,6 +71921,7 @@ int main(int argc, char** argv) {
          !slash_normalized_exact_rut_production && !no_content204_rut_production &&
          !rut_default_buffering_206_range_incomplete_body_inactivity_expiry &&
          !rut_exact_ipv4_listener_production && !rut_issue566_id3_successor_public_gate &&
+         !rut_issue566_id3_successor_live200_public_gate &&
          !converter_coalesced_successor_differential &&
          !rut_iouring_gate_spike && !rut_iouring_gate_identity_negative &&
          !rut_iouring_gate_ready_mutation_negative && !rut_iouring_gate_owner_death_negative &&
@@ -71826,7 +71942,7 @@ int main(int argc, char** argv) {
         ((rut_default_buffering_206_range_incomplete_body_inactivity_expiry ||
           rut_issue558_retained_header_public_gate) &&
          argv[2][0] != '/') ||
-        (rut_issue566_id3_successor_public_gate &&
+        ((rut_issue566_id3_successor_public_gate || rut_issue566_id3_successor_live200_public_gate) &&
          (argv[2][0] != '/' || argv[3][0] != '/')) ||
         (converter_proxy_hide_header_differential && argv[2][0] != '/') ||
         ((converter_default_buffering_positive_get_differential ||
@@ -73038,6 +73154,18 @@ int main(int argc, char** argv) {
                      "the public CLI/O2/io_uring path; two exact X-Test HTAB requests crossed one "
                      "held 502 Send, produced normalized source-body 502s, and settled with two "
                      "distinct dead-upstream Connect episodes and no tail\n";
+        return 0;
+    }
+    if (rut_issue566_id3_successor_live200_public_gate) {
+        std::string production_error;
+        if (!run_rut_issue566_id3_successor_live200_public_gate(argv[2], argv[3], production_error)) {
+            std::cerr << "FAIL [#566/#567 handwritten ID3 live200 successor gate]: "
+                      << production_error << "\n";
+            return 1;
+        }
+        std::cerr << "PASS: #566/#567 handwritten ordinary-RUT ID3 live200 successor gate; "
+                     "two exact source requests crossed a held 200 Send and proved two upstream "
+                     "TCP episodes with no downstream pre-release bytes or tail\n";
         return 0;
     }
     if (slash_normalized_exact_rut_production) {
