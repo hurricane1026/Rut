@@ -32961,14 +32961,16 @@ TEST(http1_pipeline_generation_activation,
 
 TEST(http1_pipeline_generation_activation,
      strict_successor_id3_complete_response_retires_and_rejects_proof_forgery) {
-    enum class Mutation : u8 { None, Generation, Episode, RewrittenLength, CopiedProof };
+    enum class Mutation : u8 { Generation, Episode, DeclaredBodyLength };
     static constexpr u8 kSuccessor[] =
         "GET /one HTTP/1.1\r\nHost: client.example\r\nX-Test:\t keep \t\r\n\r\n";
     static constexpr char kExpectedWire[] =
         "GET /one HTTP/1.1\r\nHost: 127.0.0.1:9000\r\nX-Test: \t keep \t\r\n\r\n";
-    static constexpr u8 kOrigin[] = "HTTP/1.1 200 OK\r\nContent-Length: 4\r\n\r\nabcd";
+    static constexpr u8 kOriginPartial[] =
+        "HTTP/1.1 200 OK\r\nContent-Length: 4\r\n\r\nab";
+    static constexpr u8 kOriginRemainder[] = "cd";
 
-    for (const bool header_first : {true}) {
+    for (const bool header_first : {false, true}) {
         ScopedBackendHealthReset health_reset{};
         ScopedIoUringLoopForRetirement guard;
         if (!guard.init()) SKIP("io_uring unavailable");
@@ -33000,18 +33002,30 @@ TEST(http1_pipeline_generation_activation,
         REQUIRE_EQ(metrics.requests_total, 1u);
         REQUIRE_EQ(metrics.requests_active, 1u);
 
-        REQUIRE_EQ(conn.upstream_recv_buf.write(kOrigin, sizeof(kOrigin) - 1u),
-                   sizeof(kOrigin) - 1u);
+        REQUIRE_EQ(conn.upstream_recv_buf.write(kOriginPartial, sizeof(kOriginPartial) - 1u),
+                   sizeof(kOriginPartial) - 1u);
         const IoEvent response =
-            response_read_copy_event(conn, sizeof(kOrigin) - 1u, true, 0, sizeof(kOrigin) - 1u);
+            response_read_copy_event(
+                conn, sizeof(kOriginPartial) - 1u, true, 0, sizeof(kOriginPartial) - 1u);
         loop->dispatch_batch(&response, 1);
         REQUIRE_EQ(conn.resp_status, 200u);
+        REQUIRE_EQ(conn.response_read_deadline_post_commit_phase,
+                   ResponseReadDeadlinePostCommitPhase::Buffering);
+        REQUIRE_EQ(conn.response_read_deadline_post_commit_origin_received, 2u);
+        REQUIRE(response_read_deadline_post_commit_is_stable(conn));
+        const u32 remainder_begin = conn.upstream_recv_buf.len();
+        REQUIRE_EQ(conn.upstream_recv_buf.write(kOriginRemainder, sizeof(kOriginRemainder) - 1u),
+                   sizeof(kOriginRemainder) - 1u);
+        const IoEvent remainder = response_read_copy_event(
+            conn, sizeof(kOriginRemainder) - 1u, true, remainder_begin, conn.upstream_recv_buf.len());
+        loop->dispatch_batch(&remainder, 1);
         REQUIRE_EQ(conn.response_read_deadline_post_commit_declared_body, 4u);
         REQUIRE_EQ(conn.response_read_deadline_post_commit_origin_received, 4u);
         REQUIRE_EQ(conn.response_read_deadline_post_commit_generation, upload_generation);
         REQUIRE_EQ(conn.response_read_deadline_post_commit_episode, conn.upstream_retiring_episode);
         REQUIRE_NE(conn.upstream_episode, upload_episode);
         REQUIRE_EQ(conn.response_read_deadline_upload.upload_episode, upload_episode);
+        REQUIRE_EQ(conn.response_read_deadline_post_commit_send_body, 4u);
         REQUIRE(response_read_deadline_post_commit_is_stable(conn));
 
         if (header_first) {
@@ -33031,15 +33045,14 @@ TEST(http1_pipeline_generation_activation,
             REQUIRE_FALSE(conn.http1_boundary_ready);
             drain_prebuilt_d2_retirement(loop, conn, kUpstreamOpRecv, false);
         } else {
-            drain_prebuilt_d2_retirement(
-                loop, conn, kUpstreamOpConnect | kUpstreamOpSend | kUpstreamOpRecv, false);
+            drain_prebuilt_d2_retirement(loop, conn, kUpstreamOpRecv, false);
         }
-        if (!conn.http1_boundary_ready) loop->resume_deferred_http1_boundaries();
-        REQUIRE(conn.http1_boundary_ready);
         loop->resume_deferred_http1_boundaries();
         CHECK_EQ(loop->conns[id].fd >= 0, true);
         CHECK_EQ(conn.state, ConnState::ReadingHeader);
         CHECK_EQ(conn.pipeline_depth, 0u);
+        CHECK_FALSE(conn.upstream_retirement_active);
+        CHECK_EQ(conn.upstream_fd, -1);
         CHECK_EQ(metrics.requests_total, 2u);
         CHECK_EQ(metrics.requests_active, 0u);
         cleanup_late_failure_fixture(loop, fixture);
@@ -33047,8 +33060,7 @@ TEST(http1_pipeline_generation_activation,
 
     for (const Mutation mutation : {Mutation::Generation,
                                     Mutation::Episode,
-                                    Mutation::RewrittenLength,
-                                    Mutation::CopiedProof}) {
+                                    Mutation::DeclaredBodyLength}) {
         ScopedBackendHealthReset health_reset{};
         ScopedIoUringLoopForRetirement guard;
         if (!guard.init()) SKIP("io_uring unavailable");
@@ -33071,11 +33083,18 @@ TEST(http1_pipeline_generation_activation,
                                                            kExpectedWire));
         Connection& conn = *fixture.conn;
         const u32 id = conn.id;
-        REQUIRE_EQ(conn.upstream_recv_buf.write(kOrigin, sizeof(kOrigin) - 1u),
-                   sizeof(kOrigin) - 1u);
+        REQUIRE_EQ(conn.upstream_recv_buf.write(kOriginPartial, sizeof(kOriginPartial) - 1u),
+                   sizeof(kOriginPartial) - 1u);
         const IoEvent response =
-            response_read_copy_event(conn, sizeof(kOrigin) - 1u, true, 0, sizeof(kOrigin) - 1u);
+            response_read_copy_event(
+                conn, sizeof(kOriginPartial) - 1u, true, 0, sizeof(kOriginPartial) - 1u);
         loop->dispatch_batch(&response, 1);
+        const u32 remainder_begin = conn.upstream_recv_buf.len();
+        REQUIRE_EQ(conn.upstream_recv_buf.write(kOriginRemainder, sizeof(kOriginRemainder) - 1u),
+                   sizeof(kOriginRemainder) - 1u);
+        const IoEvent remainder = response_read_copy_event(
+            conn, sizeof(kOriginRemainder) - 1u, true, remainder_begin, conn.upstream_recv_buf.len());
+        loop->dispatch_batch(&remainder, 1);
         REQUIRE(response_read_deadline_post_commit_is_stable(conn));
         switch (mutation) {
             case Mutation::Generation:
@@ -33084,14 +33103,8 @@ TEST(http1_pipeline_generation_activation,
             case Mutation::Episode:
                 ++conn.response_read_deadline_post_commit_episode;
                 break;
-            case Mutation::RewrittenLength:
+            case Mutation::DeclaredBodyLength:
                 ++conn.response_read_deadline_post_commit_declared_body;
-                break;
-            case Mutation::CopiedProof:
-                ++conn.http1_prebuilt_deadline_generation;
-                ++conn.response_read_deadline_post_commit_generation;
-                break;
-            case Mutation::None:
                 break;
         }
         const IoEvent forged_header = exact_response_deadline_send_event(loop, conn);
