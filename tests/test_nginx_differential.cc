@@ -3262,8 +3262,21 @@ static bool run_gated_fragment_peer_probe_self_check(std::string& error) {
                                           u32 post_count,
                                           bool thread_alive,
                                           int listen_fd,
-                                          u32 ack,
-                                          u64 probe_ns) {
+                                          u32 pre_fragments,
+                                          bool pre_send_succeeded,
+                                          bool pre_sent_open,
+                                          u32 pre_ack,
+                                          u64 pre_probe_ns,
+                                          GatedFragmentPeerProbeResult pre_result,
+                                          bool pre_eof_neutral,
+                                          u32 post_fragments,
+                                          bool post_send_succeeded,
+                                          bool post_sent_open,
+                                          u32 post_ack,
+                                          u64 post_probe_ns,
+                                          GatedFragmentPeerProbeResult post_result,
+                                          bool post_eof_neutral,
+                                          u64 expected_probe_ns) {
         return std::string(label) + " predicates: completed=" + std::to_string(completed) +
                " closed=" + std::to_string(closed) +
                " pre_peer_closed=" + std::to_string(pre_flag) +
@@ -3271,8 +3284,22 @@ static bool run_gated_fragment_peer_probe_self_check(std::string& error) {
                " post_peer_closed=" + std::to_string(post_flag) +
                " post_peer_close_count=" + std::to_string(post_count) +
                " thread_alive=" + std::to_string(thread_alive) +
-               " listen_fd=" + std::to_string(listen_fd) + " probe_ack=" + std::to_string(ack) +
-               " probe_ns=" + std::to_string(probe_ns);
+               " listen_fd=" + std::to_string(listen_fd) +
+               " pre_response_fragments_sent=" + std::to_string(pre_fragments) +
+               " pre_response_send_succeeded=" + std::to_string(pre_send_succeeded) +
+               " pre_response_sent_open=" + std::to_string(pre_sent_open) +
+               " pre_probe_ack=" + std::to_string(pre_ack) +
+               " pre_probe_ns=" + std::to_string(pre_probe_ns) +
+               " pre_probe_result=" + std::to_string(static_cast<u32>(pre_result)) +
+               " pre_write_eof_evidence_is_neutral=" + std::to_string(pre_eof_neutral) +
+               " post_response_fragments_sent=" + std::to_string(post_fragments) +
+               " post_response_send_succeeded=" + std::to_string(post_send_succeeded) +
+               " post_response_sent_open=" + std::to_string(post_sent_open) +
+               " post_probe_ack=" + std::to_string(post_ack) +
+               " post_probe_ns=" + std::to_string(post_probe_ns) +
+               " post_probe_result=" + std::to_string(static_cast<u32>(post_result)) +
+               " post_write_eof_evidence_is_neutral=" + std::to_string(post_eof_neutral) +
+               " expected_probe_ns=" + std::to_string(expected_probe_ns);
     };
     struct PublicationObservation {
         std::atomic<bool>* flag;
@@ -3666,6 +3693,18 @@ static bool run_gated_fragment_peer_probe_self_check(std::string& error) {
             recorder.gated_fragment_probe_result.load(std::memory_order_relaxed) ==
                 GatedFragmentPeerProbeResult::Open &&
             write_eof_evidence_is_neutral(recorder);
+        // Diagnostic-only snapshots; the completion predicate above retains its timing.
+        const u32 pre_response_fragments_sent =
+            recorder.response_fragments_sent.load(std::memory_order_acquire);
+        const bool pre_response_send_succeeded =
+            recorder.response_send_succeeded.load(std::memory_order_acquire);
+        const bool pre_response_sent_open =
+            recorder.response_sent_open.load(std::memory_order_acquire);
+        const u32 pre_probe_ack = recorder.gated_fragment_probe_ack.load(std::memory_order_acquire);
+        const u64 pre_probe_ns = recorder.gated_fragment_probe_ns.load(std::memory_order_relaxed);
+        const GatedFragmentPeerProbeResult pre_probe_result =
+            recorder.gated_fragment_probe_result.load(std::memory_order_relaxed);
+        const bool pre_write_eof_neutral = write_eof_evidence_is_neutral(recorder);
         (void)shutdown(client, SHUT_RDWR);
         close(client);
         const auto close_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(1);
@@ -3686,9 +3725,18 @@ static bool run_gated_fragment_peer_probe_self_check(std::string& error) {
             recorder.response_peer_close_count.load(std::memory_order_acquire);
         const bool thread_alive = recorder.thread_alive.load(std::memory_order_acquire);
         const int listen_fd = recorder.listen_fd;
+        const u32 post_response_fragments_sent =
+            recorder.response_fragments_sent.load(std::memory_order_acquire);
+        const bool post_response_send_succeeded =
+            recorder.response_send_succeeded.load(std::memory_order_acquire);
+        const bool post_response_sent_open =
+            recorder.response_sent_open.load(std::memory_order_acquire);
         const u32 postjoin_ack = recorder.gated_fragment_probe_ack.load(std::memory_order_acquire);
         const u64 postjoin_probe_ns =
             recorder.gated_fragment_probe_ns.load(std::memory_order_relaxed);
+        const GatedFragmentPeerProbeResult post_probe_result =
+            recorder.gated_fragment_probe_result.load(std::memory_order_relaxed);
+        const bool post_write_eof_neutral = write_eof_evidence_is_neutral(recorder);
         if (!completed || !closed || thread_alive || listen_fd >= 0 || postjoin_ack != 2u ||
             postjoin_probe_ns != probe_ns) {
             error = describe_open_failure(
@@ -3701,8 +3749,21 @@ static bool run_gated_fragment_peer_probe_self_check(std::string& error) {
                 postjoin_peer_close_count,
                 thread_alive,
                 listen_fd,
+                pre_response_fragments_sent,
+                pre_response_send_succeeded,
+                pre_response_sent_open,
+                pre_probe_ack,
+                pre_probe_ns,
+                pre_probe_result,
+                pre_write_eof_neutral,
+                post_response_fragments_sent,
+                post_response_send_succeeded,
+                post_response_sent_open,
                 postjoin_ack,
-                postjoin_probe_ns);
+                postjoin_probe_ns,
+                post_probe_result,
+                post_write_eof_neutral,
+                probe_ns);
             return false;
         }
         return true;
@@ -3932,6 +3993,18 @@ static bool run_gated_fragment_peer_probe_self_check(std::string& error) {
             recorder.gated_fragment_probe_result.load(std::memory_order_relaxed) ==
                 GatedFragmentPeerProbeResult::Open &&
             write_eof_evidence_is_neutral(recorder);
+        // Diagnostic-only snapshots; the completion predicate above retains its timing.
+        const u32 pre_response_fragments_sent =
+            recorder.response_fragments_sent.load(std::memory_order_acquire);
+        const bool pre_response_send_succeeded =
+            recorder.response_send_succeeded.load(std::memory_order_acquire);
+        const bool pre_response_sent_open =
+            recorder.response_sent_open.load(std::memory_order_acquire);
+        const u32 pre_probe_ack = recorder.gated_fragment_probe_ack.load(std::memory_order_acquire);
+        const u64 pre_probe_ns = recorder.gated_fragment_probe_ns.load(std::memory_order_relaxed);
+        const GatedFragmentPeerProbeResult pre_probe_result =
+            recorder.gated_fragment_probe_result.load(std::memory_order_relaxed);
+        const bool pre_write_eof_neutral = write_eof_evidence_is_neutral(recorder);
         (void)shutdown(client, SHUT_RDWR);
         close(client);
         const auto close_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(1);
@@ -3952,9 +4025,18 @@ static bool run_gated_fragment_peer_probe_self_check(std::string& error) {
             recorder.response_peer_close_count.load(std::memory_order_acquire);
         const bool thread_alive = recorder.thread_alive.load(std::memory_order_acquire);
         const int listen_fd = recorder.listen_fd;
+        const u32 post_response_fragments_sent =
+            recorder.response_fragments_sent.load(std::memory_order_acquire);
+        const bool post_response_send_succeeded =
+            recorder.response_send_succeeded.load(std::memory_order_acquire);
+        const bool post_response_sent_open =
+            recorder.response_sent_open.load(std::memory_order_acquire);
         const u32 postjoin_ack = recorder.gated_fragment_probe_ack.load(std::memory_order_acquire);
         const u64 postjoin_probe_ns =
             recorder.gated_fragment_probe_ns.load(std::memory_order_relaxed);
+        const GatedFragmentPeerProbeResult post_probe_result =
+            recorder.gated_fragment_probe_result.load(std::memory_order_relaxed);
+        const bool post_write_eof_neutral = write_eof_evidence_is_neutral(recorder);
         if (!completed || !closed || thread_alive || listen_fd >= 0 || postjoin_ack != 3u ||
             postjoin_probe_ns != probe_ns) {
             error = describe_open_failure(
@@ -3967,8 +4049,21 @@ static bool run_gated_fragment_peer_probe_self_check(std::string& error) {
                 postjoin_peer_close_count,
                 thread_alive,
                 listen_fd,
+                pre_response_fragments_sent,
+                pre_response_send_succeeded,
+                pre_response_sent_open,
+                pre_probe_ack,
+                pre_probe_ns,
+                pre_probe_result,
+                pre_write_eof_neutral,
+                post_response_fragments_sent,
+                post_response_send_succeeded,
+                post_response_sent_open,
                 postjoin_ack,
-                postjoin_probe_ns);
+                postjoin_probe_ns,
+                post_probe_result,
+                post_write_eof_neutral,
+                probe_ns);
             return false;
         }
         return true;
