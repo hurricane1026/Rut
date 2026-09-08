@@ -24459,6 +24459,19 @@ struct LateSuccessorObservation {
     std::string gate_evidence;
 };
 
+// Optional fixture for the public ordinary-RUT gate.  The default runner
+// remains converter-backed; this narrow override supplies only the source and
+// exact two-request/response vector needed by a handwritten policy test.
+struct RutIoUringGateFixture {
+    const std::string* source = nullptr;
+    const char* request_one = nullptr;
+    size_t request_one_length = 0;
+    const char* request_two = nullptr;
+    size_t request_two_length = 0;
+    const char* response_one = nullptr;
+    const char* response_two = nullptr;
+};
+
 static void dump_late_successor_observation(const char* side,
                                             const LateSuccessorObservation& observation) {
     const std::string prefix(side);
@@ -25258,7 +25271,8 @@ static bool run_rut_iouring_gate_spike(u16 frontend_port,
                                        DeadPort* shared_dead = nullptr,
                                        const std::string* shared_fragment = nullptr,
                                        LateSuccessorObservation* observation = nullptr,
-                                       int* reusable_frontend_reservation = nullptr) {
+                                       int* reusable_frontend_reservation = nullptr,
+                                       const RutIoUringGateFixture* fixture = nullptr) {
     if (rut_path == nullptr || rut_path[0] != '/' || access(rut_path, X_OK) != 0) {
         error = "RUT executable path is not absolute and executable";
         return false;
@@ -25295,16 +25309,41 @@ static bool run_rut_iouring_gate_spike(u16 frontend_port,
         ";\n  location / {\n    proxy_pass http://127.0.0.1:" + std::to_string(backend_port) +
         ";\n  }\n}\n";
     const std::string& fragment = shared_fragment == nullptr ? local_fragment : *shared_fragment;
-    auto parsed = rut::nginx::parse({fragment.data(), static_cast<rut::u32>(fragment.size())});
-    if (!parsed) {
-        error = "RUT io_uring gate nginx fragment parse failed";
-        return false;
+    if (fixture != nullptr && fixture->source != nullptr) {
+        if (!write_file(temp.source, fixture->source->data(), fixture->source->size())) {
+            error = "RUT io_uring gate handwritten source write failed";
+            return false;
+        }
+    } else {
+        auto parsed = rut::nginx::parse({fragment.data(), static_cast<rut::u32>(fragment.size())});
+        if (!parsed) {
+            error = "RUT io_uring gate nginx fragment parse failed";
+            return false;
+        }
+        auto lowered = rut::nginx::lower_to_rut(parsed.value());
+        if (!lowered || !write_file(temp.source, lowered.value().data, lowered.value().len)) {
+            error = "RUT io_uring gate converter output failed";
+            return false;
+        }
     }
-    auto lowered = rut::nginx::lower_to_rut(parsed.value());
-    if (!lowered || !write_file(temp.source, lowered.value().data, lowered.value().len)) {
-        error = "RUT io_uring gate converter output failed";
-        return false;
-    }
+    const char* request_one = fixture != nullptr && fixture->request_one != nullptr
+                                  ? fixture->request_one
+                                  : kGatewayKeepAliveRequest1;
+    const size_t request_one_length = fixture != nullptr && fixture->request_one != nullptr
+                                          ? fixture->request_one_length
+                                          : sizeof(kGatewayKeepAliveRequest1) - 1u;
+    const char* request_two = fixture != nullptr && fixture->request_two != nullptr
+                                  ? fixture->request_two
+                                  : kGatewayCloseRequest2;
+    const size_t request_two_length = fixture != nullptr && fixture->request_two != nullptr
+                                          ? fixture->request_two_length
+                                          : sizeof(kGatewayCloseRequest2) - 1u;
+    const char* response_one = fixture != nullptr && fixture->response_one != nullptr
+                                   ? fixture->response_one
+                                   : kGatewayKeepAliveResponseNormalized;
+    const char* response_two = fixture != nullptr && fixture->response_two != nullptr
+                                   ? fixture->response_two
+                                   : kGatewayResponseNormalized;
 
     RutIoUringGateProcessMapping process_mapping;
     ChildGuard& rut_process = process_mapping.child_guard;
@@ -25565,15 +25604,15 @@ static bool run_rut_iouring_gate_spike(u16 frontend_port,
     mapping.gate->target_upstream_ipv4_be = htonl(INADDR_LOOPBACK);
     mapping.gate->target_upstream_port_be = htons(backend_port);
     rut_downstream_gate_store(&mapping.gate->mode, RUT_IOURING_GATE_MODE_LATE_SUCCESSOR);
-    mapping.gate->request_two_length = sizeof(kGatewayCloseRequest2) - 1u;
-    memcpy(mapping.gate->request_two, kGatewayCloseRequest2, mapping.gate->request_two_length);
+    mapping.gate->request_two_length = static_cast<u32>(request_two_length);
+    memcpy(mapping.gate->request_two, request_two, mapping.gate->request_two_length);
     if (!rut_downstream_gate_cas(
             &mapping.gate->state, RUT_DOWNSTREAM_GATE_DISARMED, RUT_DOWNSTREAM_GATE_ARMED)) {
         error = "failed to arm RUT io_uring gate";
         return false;
     }
     rut_downstream_gate_wake(&mapping.gate->state);
-    if (!send_all(client.fd, kGatewayKeepAliveRequest1, sizeof(kGatewayKeepAliveRequest1) - 1u)) {
+    if (!send_all(client.fd, request_one, request_one_length)) {
         error = "failed to send RUT io_uring request 1";
         return false;
     }
@@ -25621,7 +25660,7 @@ static bool run_rut_iouring_gate_spike(u16 frontend_port,
         return false;
     }
     if (!downstream_has_no_readable_byte(client.fd, error)) return false;
-    if (!send_all(client.fd, kGatewayCloseRequest2, sizeof(kGatewayCloseRequest2) - 1u)) {
+    if (!send_all(client.fd, request_two, request_two_length)) {
         error = "failed to send exact RUT request 2 while enter was gated";
         return false;
     }
@@ -25636,13 +25675,26 @@ static bool run_rut_iouring_gate_spike(u16 frontend_port,
                 std::to_string(rut_downstream_gate_load(&mapping.gate->error_code));
         return false;
     }
-    if (mapping.gate->witness_length != sizeof(kGatewayCloseRequest2) - 1u ||
+    if (mapping.gate->witness_length != request_two_length ||
         mapping.gate->witness_fragments == 0 ||
         mapping.gate->cq_tail_at_arrival <= mapping.gate->cq_head_at_hit) {
         error = "RUT raw-CQ witness metadata was incomplete";
         return false;
     }
     if (!downstream_has_no_readable_byte(client.fd, error)) return false;
+    if (mapping.gate->connect_attempt_count != 1 ||
+        mapping.gate->connect_journal_overflow != 0 ||
+        mapping.gate->connect_journal_duplicate != 0 ||
+        mapping.gate->connect_attempts[0].fd < 0 ||
+        mapping.gate->connect_attempts[0].ipv4_be != htonl(INADDR_LOOPBACK) ||
+        mapping.gate->connect_attempts[0].port_be != htons(backend_port) ||
+        mapping.gate->connect_attempts[0].address_length != sizeof(sockaddr_in) ||
+        (mapping.gate->connect_attempts[0].user_data & 0xffu) !=
+            static_cast<rut::u8>(rut::IoEventType::UpstreamConnect) ||
+        ((mapping.gate->connect_attempts[0].user_data >> 32) & 0xffffffu) == 0) {
+        error = "RUT gate did not prove exactly one clean upstream Connect before release";
+        return false;
+    }
     if (!rut_downstream_gate_cas(
             &mapping.gate->state, RUT_DOWNSTREAM_GATE_R2_ARRIVED, RUT_DOWNSTREAM_GATE_RELEASED)) {
         error = "failed RUT gate R2_ARRIVED to RELEASED transition";
@@ -25664,11 +25716,11 @@ static bool run_rut_iouring_gate_spike(u16 frontend_port,
     }
     if (!read_ok) return false;
     std::string detail;
-    if (!validate_exact_normalized_response(first, kGatewayKeepAliveResponseNormalized, detail)) {
+    if (!validate_exact_normalized_response(first, response_one, detail)) {
         error = "gated RUT response 1 mismatch: " + detail;
         return false;
     }
-    if (!validate_exact_normalized_response(second, kGatewayResponseNormalized, detail)) {
+    if (!validate_exact_normalized_response(second, response_two, detail)) {
         error = "gated RUT response 2 mismatch: " + detail;
         return false;
     }
@@ -63883,6 +63935,95 @@ static bool build_issue558_handwritten_source(u16 frontend_port,
     return true;
 }
 
+// Public #566/#567 gate: handwritten ordinary RUT ID3 retained-header policy
+// with two downstream requests crossing one held first-502 Send.
+static bool run_rut_issue566_id3_successor_public_gate(const char* rut_path,
+                                                       const char* preload_path,
+                                                       std::string& error) {
+    static constexpr char kDiagnostic[] = "#566/#567 handwritten ID3 successor public gate";
+    static constexpr char kRequest1[] =
+        "GET /missing?q=1 HTTP/1.1\r\n"
+        "Host: client.example\r\n"
+        "X-Test:\t keep \t\r\n\r\n";
+    static constexpr char kRequest2[] =
+        "GET /missing?q=2 HTTP/1.1\r\n"
+        "Host: client.example\r\n"
+        "X-Test:\t keep \t\r\n"
+        "Connection: close\r\n\r\n";
+    static constexpr char kResponse1[] =
+        "HTTP/1.1 502 Bad Gateway\r\n"
+        "Server: nginx/1.29.7\r\n"
+        "Date: XXXXXXXXXXXXXXXXXXXXXXXXXXXXX\r\n"
+        "Content-Type: text/html\r\n"
+        "Content-Length: 12\r\n"
+        "Connection: keep-alive\r\n\r\n"
+        "bad gateway\n";
+    static constexpr char kResponse2[] =
+        "HTTP/1.1 502 Bad Gateway\r\n"
+        "Server: nginx/1.29.7\r\n"
+        "Date: XXXXXXXXXXXXXXXXXXXXXXXXXXXXX\r\n"
+        "Content-Type: text/html\r\n"
+        "Content-Length: 12\r\n"
+        "Connection: close\r\n\r\n"
+        "bad gateway\n";
+    if (rut_path == nullptr || rut_path[0] != '/' || access(rut_path, X_OK) != 0) {
+        error = std::string(kDiagnostic) + " requires an executable absolute RUT path";
+        return false;
+    }
+    HeldLoopbackPorts reservations;
+    u16 frontend_port = 0;
+    u16 backend_port = 0;
+    if (!reservations.reserve_reusable(0u, frontend_port) ||
+        !reservations.reserve(1u, backend_port) || frontend_port == backend_port) {
+        error = std::string(kDiagnostic) + " dynamic port reservation failed";
+        return false;
+    }
+    TempDir temp;
+    if (!temp.create()) {
+        error = std::string(kDiagnostic) + " temporary directory setup failed";
+        return false;
+    }
+    std::string source;
+    if (!build_issue558_handwritten_source(
+            frontend_port, backend_port, temp.rut_access_log, true, source, error))
+        return false;
+    DeadPort dead;
+    if (!dead.adopt_held_loopback_port(
+            &reservations.fds[1], backend_port, kDiagnostic, error))
+        return false;
+    if (!handoff_held_loopback_port(
+            &reservations.fds[0], frontend_port, kDiagnostic, error))
+        return false;
+    RutIoUringGateFixture fixture;
+    fixture.source = &source;
+    fixture.request_one = kRequest1;
+    fixture.request_one_length = sizeof(kRequest1) - 1u;
+    fixture.request_two = kRequest2;
+    fixture.request_two_length = sizeof(kRequest2) - 1u;
+    fixture.response_one = kResponse1;
+    fixture.response_two = kResponse2;
+    if (preload_path == nullptr || preload_path[0] != '/' || access(preload_path, R_OK) != 0) {
+        error = std::string(kDiagnostic) + " requires an absolute readable preload helper";
+        return false;
+    }
+    const bool ok = run_rut_iouring_gate_spike(frontend_port,
+                                               backend_port,
+                                               temp,
+                                               rut_path,
+                                               preload_path,
+                                               false,
+                                               false,
+                                               false,
+                                               false,
+                                               error,
+                                               &dead,
+                                               nullptr,
+                                               nullptr,
+                                               &reservations.fds[0],
+                                               &fixture);
+    return ok;
+}
+
 // Public #558 capability gate.  The positive ordinary source selects ID3 and
 // the legacy source selects ID1; both are run through the public CLI/JIT and
 // the same exact positive upstream comparator receives both observed wires.
@@ -71533,6 +71674,8 @@ int main(int argc, char** argv) {
         strcmp(argv[1], "--rut-default-buffering-206-range-incomplete-body-inactivity-expiry") == 0;
     const bool rut_issue558_retained_header_public_gate =
         argc == 3 && strcmp(argv[1], "--rut-issue558-retained-header-public-gate") == 0;
+    const bool rut_issue566_id3_successor_public_gate =
+        argc == 4 && strcmp(argv[1], "--rut-issue566-id3-successor-public-gate") == 0;
     const bool rut_exact_ipv4_listener_production =
         argc == 3 && strcmp(argv[1], "--rut-exact-ipv4-listener-production") == 0;
     const bool converter_coalesced_successor_differential =
@@ -71654,7 +71797,8 @@ int main(int argc, char** argv) {
          !converter_exact_local_differential && !exact_strict_route_differential &&
          !slash_normalized_exact_rut_production && !no_content204_rut_production &&
          !rut_default_buffering_206_range_incomplete_body_inactivity_expiry &&
-         !rut_exact_ipv4_listener_production && !converter_coalesced_successor_differential &&
+         !rut_exact_ipv4_listener_production && !rut_issue566_id3_successor_public_gate &&
+         !converter_coalesced_successor_differential &&
          !rut_iouring_gate_spike && !rut_iouring_gate_identity_negative &&
          !rut_iouring_gate_ready_mutation_negative && !rut_iouring_gate_owner_death_negative &&
          !rut_iouring_gate_connect_journal_negative && !rut_iouring_coalesced_ingress_gate &&
@@ -71674,6 +71818,8 @@ int main(int argc, char** argv) {
         ((rut_default_buffering_206_range_incomplete_body_inactivity_expiry ||
           rut_issue558_retained_header_public_gate) &&
          argv[2][0] != '/') ||
+        (rut_issue566_id3_successor_public_gate &&
+         (argv[2][0] != '/' || argv[3][0] != '/')) ||
         (converter_proxy_hide_header_differential && argv[2][0] != '/') ||
         ((converter_default_buffering_positive_get_differential ||
           converter_default_buffering_incomplete_clean_eof_differential ||
@@ -72032,6 +72178,8 @@ int main(int argc, char** argv) {
                "<absolute-rut-executable>\n"
                "   or: test_nginx_differential --rut-exact-ipv4-listener-production "
                "<absolute-rut-executable>\n"
+               "   or: test_nginx_differential --rut-issue566-id3-successor-public-gate "
+               "<absolute-rut-executable> <absolute-preload-helper>\n"
                "   or: test_nginx_differential --converter-coalesced-successor-differential "
                "<absolute-rut-executable> <absolute-nginx-preload-helper> "
                "<absolute-rut-preload-helper>\n"
@@ -72868,6 +73016,20 @@ int main(int argc, char** argv) {
                      "Date-normalized downstream response with real EOF, one 105\\n access record, "
                      "175ms live no-retry evidence, and joined lifecycle/history teardown. "
                      "The actual legacy ID1 66B wire was rejected by the same 70B comparator.\n";
+        return 0;
+    }
+    if (rut_issue566_id3_successor_public_gate) {
+        std::string production_error;
+        if (!run_rut_issue566_id3_successor_public_gate(
+                argv[2], argv[3], production_error)) {
+            std::cerr << "FAIL [#566/#567 handwritten ID3 successor public gate]: "
+                      << production_error << "\n";
+            return 1;
+        }
+        std::cerr << "PASS: #566/#567 handwritten ordinary-RUT ID3 successor gate loaded through "
+                     "the public CLI/O2/io_uring path; two exact X-Test HTAB requests crossed one "
+                     "held 502 Send, produced normalized source-body 502s, and settled with two "
+                     "distinct dead-upstream Connect episodes and no tail\n";
         return 0;
     }
     if (slash_normalized_exact_rut_production) {
