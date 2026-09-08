@@ -24720,11 +24720,10 @@ static const char* recv_owner_reason_name(uint32_t reason) {
 }
 
 static void append_recv_owner_failure_evidence(rut_iouring_gate& gate, std::string& evidence) {
-    if (rut_downstream_gate_load(&gate.error_code) != RUT_IOURING_GATE_ERROR_RECV_OWNER ||
-        !rut_iouring_gate_lock_identity(&gate, 2000))
-        return;
+    if (!rut_iouring_gate_lock_identity(&gate, 2000)) return;
     rut_iouring_gate_recv_owner_failure failure{};
-    if (__atomic_load_n(&gate.recv_owner_failure.valid, __ATOMIC_ACQUIRE) != 1u) {
+    if (rut_downstream_gate_load(&gate.error_code) != RUT_IOURING_GATE_ERROR_RECV_OWNER ||
+        __atomic_load_n(&gate.recv_owner_failure.valid, __ATOMIC_ACQUIRE) != 1u) {
         rut_iouring_gate_unlock_identity(&gate);
         return;
     }
@@ -24749,6 +24748,143 @@ static void append_recv_owner_failure_evidence(rut_iouring_gate& gate, std::stri
         " sq_tail=" + std::to_string(failure.sq_tail) +
         " sq_cursor=" + std::to_string(failure.sq_cursor) +
         " to_submit=" + std::to_string(failure.to_submit);
+}
+
+static bool run_recv_owner_diagnostic_self_check(std::string& error) {
+    rut_iouring_gate gate{};
+    pthread_mutexattr_t attributes;
+    if (pthread_mutexattr_init(&attributes) != 0 ||
+        pthread_mutexattr_setpshared(&attributes, PTHREAD_PROCESS_SHARED) != 0 ||
+        pthread_mutexattr_setrobust(&attributes, PTHREAD_MUTEX_ROBUST) != 0 ||
+        pthread_mutex_init(&gate.identity_mutex, &attributes) != 0) {
+        error = "recv-owner diagnostic self-check mutex initialization failed";
+        return false;
+    }
+    (void)pthread_mutexattr_destroy(&attributes);
+    rut_downstream_gate_store(&gate.identity_mutex_initialized, 1);
+    rut_downstream_gate_store(&gate.state, RUT_DOWNSTREAM_GATE_ARMED);
+    gate.mode = RUT_IOURING_GATE_MODE_LATE_SUCCESSOR;
+    gate.error_code = RUT_IOURING_GATE_ERROR_NONE;
+    rut_iouring_gate_recv_owner_failure candidate{};
+    candidate.reason = RUT_IOURING_GATE_RECV_OWNER_REASON_RECV_SHAPE;
+    candidate.ring_fd = 17;
+    candidate.peer_fd = 19;
+    candidate.peer_ipv4_be = 0x0100007fU;
+    candidate.peer_port_be = 8080;
+    candidate.captured_recv_user_data = UINT64_C(0x1201);
+    candidate.current_sqe_user_data = UINT64_C(0x1201);
+    candidate.current_sqe_opcode = 27;
+    candidate.current_sqe_fd = 19;
+    candidate.sq_head = 4;
+    candidate.sq_tail = 8;
+    candidate.sq_cursor = 6;
+    candidate.to_submit = 2;
+    if (pthread_mutex_lock(&gate.identity_mutex) != 0 ||
+        !rut_iouring_gate_publish_recv_owner_failure_locked(&gate, &candidate)) {
+        error = "recv-owner diagnostic publisher did not accept first failure";
+        return false;
+    }
+    rut_downstream_gate_store(&gate.state, RUT_DOWNSTREAM_GATE_FAILED);
+    (void)pthread_mutex_unlock(&gate.identity_mutex);
+    rut_iouring_gate_recv_owner_failure second = candidate;
+    second.reason = RUT_IOURING_GATE_RECV_OWNER_REASON_SEND_OWNER_MISMATCH;
+    if (pthread_mutex_lock(&gate.identity_mutex) != 0 ||
+        rut_iouring_gate_publish_recv_owner_failure_locked(&gate, &second) ||
+        gate.recv_owner_failure.reason != RUT_IOURING_GATE_RECV_OWNER_REASON_RECV_SHAPE) {
+        error = "recv-owner diagnostic publisher did not preserve first failure";
+        return false;
+    }
+    (void)pthread_mutex_unlock(&gate.identity_mutex);
+    std::string evidence;
+    append_recv_owner_failure_evidence(gate, evidence);
+    if (evidence.find("reason=RECV_SHAPE") == std::string::npos ||
+        evidence.find("peer_ipv4_be=") == std::string::npos ||
+        evidence.find("current_sqe_fd=19") == std::string::npos ||
+        evidence.find("sq_cursor=6") == std::string::npos) {
+        error = "recv-owner diagnostic formatter omitted labeled first-failure fields";
+        return false;
+    }
+
+    for (uint32_t reason = RUT_IOURING_GATE_RECV_OWNER_REASON_RECV_SHAPE;
+         reason <= RUT_IOURING_GATE_RECV_OWNER_REASON_INGRESS_CONTRACT;
+         ++reason) {
+        rut_downstream_gate_store(&gate.state, RUT_DOWNSTREAM_GATE_ARMED);
+        rut_downstream_gate_store(&gate.error_code, RUT_IOURING_GATE_ERROR_NONE);
+        __atomic_store_n(&gate.recv_owner_failure.valid, 0u, __ATOMIC_RELEASE);
+        candidate.reason = reason;
+        if (pthread_mutex_lock(&gate.identity_mutex) != 0 ||
+            !rut_iouring_gate_publish_recv_owner_failure_locked(&gate, &candidate)) {
+            error = "recv-owner diagnostic publisher rejected a discriminant reason";
+            return false;
+        }
+        rut_downstream_gate_store(&gate.state, RUT_DOWNSTREAM_GATE_FAILED);
+        (void)pthread_mutex_unlock(&gate.identity_mutex);
+        if (gate.recv_owner_failure.reason != reason) {
+            error = "recv-owner diagnostic publisher stored the wrong reason";
+            return false;
+        }
+    }
+    rut_downstream_gate_store(&gate.error_code, RUT_IOURING_GATE_ERROR_RING);
+    __atomic_store_n(&gate.recv_owner_failure.valid, 0u, __ATOMIC_RELEASE);
+    if (pthread_mutex_lock(&gate.identity_mutex) != 0 ||
+        rut_iouring_gate_publish_recv_owner_failure_locked(&gate, &candidate)) {
+        error = "recv-owner diagnostic publisher overwrote a non-Recv failure";
+        return false;
+    }
+    (void)pthread_mutex_unlock(&gate.identity_mutex);
+    if (RUT_IOURING_GATE_VERSION != 6u || sizeof(rut_iouring_gate) != 1448u) {
+        error = "recv-owner diagnostic ABI version or size drifted";
+        return false;
+    }
+
+    rut_downstream_gate_store(&gate.error_code, RUT_IOURING_GATE_ERROR_RECV_OWNER);
+    __atomic_store_n(&gate.recv_owner_failure.valid, 1u, __ATOMIC_RELEASE);
+    const pid_t complete_owner_death = fork();
+    if (complete_owner_death == 0) {
+        (void)pthread_mutex_lock(&gate.identity_mutex);
+        _exit(0);
+    }
+    int complete_status = 0;
+    if (complete_owner_death < 0 ||
+        waitpid(complete_owner_death, &complete_status, 0) != complete_owner_death ||
+        !rut_iouring_gate_lock_identity(&gate, 2000) ||
+        __atomic_load_n(&gate.recv_owner_failure.valid, __ATOMIC_ACQUIRE) != 1u) {
+        error = "recv-owner owner-death recovery discarded complete evidence";
+        return false;
+    }
+    rut_iouring_gate_unlock_identity(&gate);
+
+    rut_iouring_gate partial{};
+    pthread_mutexattr_t partial_attributes;
+    if (pthread_mutexattr_init(&partial_attributes) != 0 ||
+        pthread_mutexattr_setpshared(&partial_attributes, PTHREAD_PROCESS_SHARED) != 0 ||
+        pthread_mutexattr_setrobust(&partial_attributes, PTHREAD_MUTEX_ROBUST) != 0 ||
+        pthread_mutex_init(&partial.identity_mutex, &partial_attributes) != 0) {
+        error = "recv-owner partial-publication mutex initialization failed";
+        return false;
+    }
+    (void)pthread_mutexattr_destroy(&partial_attributes);
+    rut_downstream_gate_store(&partial.identity_mutex_initialized, 1);
+    rut_downstream_gate_store(&partial.state, RUT_DOWNSTREAM_GATE_ARMED);
+    partial.error_code = RUT_IOURING_GATE_ERROR_RECV_OWNER;
+    partial.recv_owner_failure.reason = RUT_IOURING_GATE_RECV_OWNER_REASON_RECV_ID_CHANGED;
+    __atomic_store_n(&partial.recv_owner_failure.valid, 0u, __ATOMIC_RELEASE);
+    const pid_t child = fork();
+    if (child == 0) {
+        (void)pthread_mutex_lock(&partial.identity_mutex);
+        _exit(0);
+    }
+    int child_status = 0;
+    if (child < 0 || waitpid(child, &child_status, 0) != child ||
+        !rut_iouring_gate_lock_identity(&partial, 2000) ||
+        __atomic_load_n(&partial.recv_owner_failure.valid, __ATOMIC_ACQUIRE) != 0u) {
+        error = "recv-owner owner-death recovery exposed partial evidence";
+        return false;
+    }
+    rut_iouring_gate_unlock_identity(&partial);
+    (void)pthread_mutex_destroy(&partial.identity_mutex);
+    (void)pthread_mutex_destroy(&gate.identity_mutex);
+    return true;
 }
 
 struct RutIoUringGateRelease {
@@ -73724,22 +73860,24 @@ int main(int argc, char** argv) {
         argc == 4 && strcmp(argv[1], "--rut-iouring-gate-owner-death-negative") == 0;
     const bool rut_iouring_gate_connect_journal_negative =
         argc == 4 && strcmp(argv[1], "--rut-iouring-gate-connect-journal-negative") == 0;
+    const bool rut_iouring_gate_recv_owner_diagnostics_self_check =
+        argc == 2 && strcmp(argv[1], "--rut-iouring-gate-recv-owner-diagnostics-self-check") == 0;
     const bool rut_iouring_coalesced_ingress_gate =
         argc == 4 && strcmp(argv[1], "--rut-iouring-coalesced-ingress-gate") == 0;
     const bool normal_differential =
         (argc == 2 && argv[1][0] == '/') ||
         (argc == 4 && argv[1][0] == '/' && argv[2][0] == '/' && argv[3][0] == '/');
     if ((!nginx_preload_loader_preflight && !nginx_gate_spike && !nginx_coalesced_ingress_gate &&
-         !exact_local_return_baseline && !root_proxy_trace_oracle && !api_proxy_trace_oracle &&
-         !exact_absolute_redirect_oracle && !exact_absolute_redirect_302_oracle &&
-         !api_non_root_proxy_uri_oracle && !service_root_proxy_uri_oracle &&
-         !wildcard_service_no_uri_oracle && !converter_wildcard_service_no_uri_differential &&
-         !static_query_proxy_uri_oracle && !zero_suffix_static_query_proxy_uri_oracle &&
-         !empty_query_proxy_uri_oracle && !root_empty_query_proxy_uri_oracle &&
-         !proxy_hide_header_oracle && !proxy_hide_header_source_self_check &&
-         !proxy_hide_header_generated_side_self_check && !explicit_timeout_head_source_self_check &&
-         !explicit_timeout_head_generated_episode && !explicit_timeout_head_phase_differential &&
-         !keepalive_timeout_head_differential &&
+         !rut_iouring_gate_recv_owner_diagnostics_self_check && !exact_local_return_baseline &&
+         !root_proxy_trace_oracle && !api_proxy_trace_oracle && !exact_absolute_redirect_oracle &&
+         !exact_absolute_redirect_302_oracle && !api_non_root_proxy_uri_oracle &&
+         !service_root_proxy_uri_oracle && !wildcard_service_no_uri_oracle &&
+         !converter_wildcard_service_no_uri_differential && !static_query_proxy_uri_oracle &&
+         !zero_suffix_static_query_proxy_uri_oracle && !empty_query_proxy_uri_oracle &&
+         !root_empty_query_proxy_uri_oracle && !proxy_hide_header_oracle &&
+         !proxy_hide_header_source_self_check && !proxy_hide_header_generated_side_self_check &&
+         !explicit_timeout_head_source_self_check && !explicit_timeout_head_generated_episode &&
+         !explicit_timeout_head_phase_differential && !keepalive_timeout_head_differential &&
          !keepalive_timeout_get_initial_deadline_differential &&
          !fixed_upload_head_success_differential &&
          !fixed_upload_head_zero_response_timeout_differential &&
@@ -79355,6 +79493,17 @@ int main(int argc, char** argv) {
                "reuse/pipeline, proxy TRACE, other targets or methods, TLS/H2, malformed input, "
                "and direct nginx.conf runtime support)\n";
         if (converter_exact_local_differential) return 0;
+    }
+
+    if (rut_iouring_gate_recv_owner_diagnostics_self_check) {
+        std::string diagnostic_error;
+        if (!run_recv_owner_diagnostic_self_check(diagnostic_error)) {
+            std::cerr << "FAIL [RUT io_uring recv-owner diagnostics]: " << diagnostic_error << "\n";
+            return 1;
+        }
+        std::cerr << "PASS: recv-owner first-failure, precedence, formatter, and owner-death "
+                     "diagnostics self-check\n";
+        return 0;
     }
 
     if (nginx_gate_spike) {

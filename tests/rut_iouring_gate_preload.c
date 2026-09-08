@@ -224,42 +224,30 @@ static void fail_recv_owner_locked(uint32_t reason,
                                    uint32_t sq_tail,
                                    uint32_t sq_cursor,
                                    uint32_t to_submit) {
-    uint32_t expected_error = RUT_IOURING_GATE_ERROR_NONE;
-    if (!__atomic_compare_exchange_n(&gate->error_code,
-                                     &expected_error,
-                                     RUT_IOURING_GATE_ERROR_RECV_OWNER,
-                                     0,
-                                     __ATOMIC_ACQ_REL,
-                                     __ATOMIC_ACQUIRE))
-        return;
-    struct rut_iouring_gate_recv_owner_failure* failure = &gate->recv_owner_failure;
-    memset(failure, 0, sizeof(*failure));
-    failure->reason = reason;
-    failure->ring_fd = ring_view.fd;
-    failure->peer_fd = peer_fd;
-    failure->peer_ipv4_be = gate->target_peer_ipv4_be;
-    failure->peer_port_be = gate->target_peer_port_be;
-    failure->state = rut_downstream_gate_load(&gate->state);
-    failure->mode = rut_downstream_gate_load(&gate->mode);
-    failure->captured_recv_user_data = ring_view.target_recv_user_data;
+    struct rut_iouring_gate_recv_owner_failure failure = {0};
+    failure.reason = reason;
+    failure.ring_fd = ring_view.fd;
+    failure.peer_fd = peer_fd;
+    failure.peer_ipv4_be = gate->target_peer_ipv4_be;
+    failure.peer_port_be = gate->target_peer_port_be;
+    failure.state = rut_downstream_gate_load(&gate->state);
+    failure.mode = rut_downstream_gate_load(&gate->mode);
+    failure.captured_recv_user_data = ring_view.target_recv_user_data;
     if (sqe != 0) {
-        failure->current_sqe_user_data = sqe->user_data;
-        failure->current_sqe_opcode = sqe->opcode;
-        failure->current_sqe_flags = sqe->flags;
-        failure->current_sqe_ioprio = sqe->ioprio;
-        failure->current_sqe_buf_group = sqe->buf_group;
-        failure->current_sqe_len = sqe->len;
-        failure->current_sqe_fd = sqe->fd;
+        failure.current_sqe_user_data = sqe->user_data;
+        failure.current_sqe_opcode = sqe->opcode;
+        failure.current_sqe_flags = sqe->flags;
+        failure.current_sqe_ioprio = sqe->ioprio;
+        failure.current_sqe_buf_group = sqe->buf_group;
+        failure.current_sqe_len = sqe->len;
+        failure.current_sqe_fd = sqe->fd;
     }
-    failure->sq_head = sq_head;
-    failure->sq_tail = sq_tail;
-    failure->sq_cursor = sq_cursor;
-    failure->to_submit = to_submit;
-    __atomic_store_n(&failure->valid, 1u, __ATOMIC_RELEASE);
-    gate->ring_fd = -1;
-    gate->intercepted_fd = -1;
-    rut_downstream_gate_store(&gate->ring_ready, 0);
-    rut_downstream_gate_store(&gate->state, RUT_DOWNSTREAM_GATE_FAILED);
+    failure.sq_head = sq_head;
+    failure.sq_tail = sq_tail;
+    failure.sq_cursor = sq_cursor;
+    failure.to_submit = to_submit;
+    if (!rut_iouring_gate_publish_recv_owner_failure_locked(gate, &failure)) return;
+    fail_locked(RUT_IOURING_GATE_ERROR_RECV_OWNER);
 }
 
 static void fail_locked(uint32_t error) {

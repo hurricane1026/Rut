@@ -155,6 +155,23 @@ struct rut_iouring_gate {
     unsigned char witness_wire[RUT_DOWNSTREAM_GATE_REQUEST_CAPACITY];
 };
 
+static inline int rut_iouring_gate_publish_recv_owner_failure_locked(
+    struct rut_iouring_gate* gate, const struct rut_iouring_gate_recv_owner_failure* candidate) {
+    uint32_t expected_error = RUT_IOURING_GATE_ERROR_NONE;
+    if (!__atomic_compare_exchange_n(&gate->error_code,
+                                     &expected_error,
+                                     RUT_IOURING_GATE_ERROR_RECV_OWNER,
+                                     0,
+                                     __ATOMIC_ACQ_REL,
+                                     __ATOMIC_ACQUIRE))
+        return 0;
+    struct rut_iouring_gate_recv_owner_failure copy = *candidate;
+    copy.valid = 0;
+    memcpy(&gate->recv_owner_failure, &copy, sizeof(copy));
+    __atomic_store_n(&gate->recv_owner_failure.valid, 1u, __ATOMIC_RELEASE);
+    return 1;
+}
+
 static inline void rut_iouring_gate_recover_owner_death_locked(struct rut_iouring_gate* gate) {
     uint32_t expected = RUT_IOURING_GATE_ERROR_NONE;
     (void)__atomic_compare_exchange_n(&gate->error_code,
@@ -182,7 +199,8 @@ static inline void rut_iouring_gate_recover_owner_death_locked(struct rut_iourin
     gate->connect_attempt_count = 0;
     gate->connect_journal_overflow = 0;
     gate->connect_journal_duplicate = 0;
-    memset(&gate->recv_owner_failure, 0, sizeof(gate->recv_owner_failure));
+    if (__atomic_load_n(&gate->recv_owner_failure.valid, __ATOMIC_ACQUIRE) != 1u)
+        memset(&gate->recv_owner_failure, 0, sizeof(gate->recv_owner_failure));
     memset(gate->connect_attempts, 0, sizeof(gate->connect_attempts));
     memset(gate->intercepted_prefix, 0, sizeof(gate->intercepted_prefix));
     memset(gate->witness_wire, 0, sizeof(gate->witness_wire));
