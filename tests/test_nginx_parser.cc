@@ -2642,7 +2642,7 @@ TEST(nginx_converter, rejects_explicit_proxy_buffering_on_before_lowering) {
     CHECK(wildcard_result.error().detail.eq(lit_str("proxy_buffering metadata was erased")));
 
     const char hide_source[] =
-        "server { listen 8080; location / { proxy_hide_header X-Compat-Hidden; proxy_pass "
+        "server { listen 8080; location /api/ { proxy_hide_header X-Compat-Hidden; proxy_pass "
         "http://127.0.0.1:9000; } }";
     const auto hide_parsed = nginx::parse({hide_source, sizeof(hide_source) - 1u});
     REQUIRE(hide_parsed);
