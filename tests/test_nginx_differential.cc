@@ -24942,15 +24942,20 @@ static bool run_recv_owner_diagnostic_self_check(std::string& error) {
     int complete_status = 0;
     if (complete_owner_death < 0 || !reap_bounded(complete_owner_death, &complete_status) ||
         !WIFEXITED(complete_status) || WEXITSTATUS(complete_status) != 0 ||
-        !rut_iouring_gate_lock_identity(complete_gate, 2000) ||
-        __atomic_load_n(&complete_gate->recv_owner_failure.valid, __ATOMIC_ACQUIRE) != 1u ||
-        rut_downstream_gate_load(&complete_gate->state) != RUT_DOWNSTREAM_GATE_FAILED ||
-        complete_gate->ring_fd != -1 || complete_gate->intercepted_fd != -1 ||
-        rut_downstream_gate_load(&complete_gate->ring_ready) != 0u) {
+        !rut_iouring_gate_lock_identity(complete_gate, 2000)) {
         error = "recv-owner owner-death recovery discarded complete evidence";
         return false;
     }
+    const bool complete_recovery_valid =
+        __atomic_load_n(&complete_gate->recv_owner_failure.valid, __ATOMIC_ACQUIRE) == 1u &&
+        rut_downstream_gate_load(&complete_gate->state) == RUT_DOWNSTREAM_GATE_FAILED &&
+        complete_gate->ring_fd == -1 && complete_gate->intercepted_fd == -1 &&
+        rut_downstream_gate_load(&complete_gate->ring_ready) == 0u;
     rut_iouring_gate_unlock_identity(complete_gate);
+    if (!complete_recovery_valid) {
+        error = "recv-owner owner-death recovery discarded complete evidence";
+        return false;
+    }
 
     auto* partial = static_cast<rut_iouring_gate*>(mmap(nullptr,
                                                         sizeof(rut_iouring_gate),
@@ -24983,16 +24988,21 @@ static bool run_recv_owner_diagnostic_self_check(std::string& error) {
     }
     int child_status = 0;
     if (child < 0 || !reap_bounded(child, &child_status) || !WIFEXITED(child_status) ||
-        WEXITSTATUS(child_status) != 0 || !rut_iouring_gate_lock_identity(partial, 2000) ||
-        __atomic_load_n(&partial->recv_owner_failure.valid, __ATOMIC_ACQUIRE) != 0u ||
-        rut_downstream_gate_load(&partial->state) != RUT_DOWNSTREAM_GATE_FAILED ||
-        partial->ring_fd != -1 || partial->intercepted_fd != -1 ||
-        rut_downstream_gate_load(&partial->ring_ready) != 0u ||
-        partial->recv_owner_failure.reason != RUT_IOURING_GATE_RECV_OWNER_REASON_NONE) {
+        WEXITSTATUS(child_status) != 0 || !rut_iouring_gate_lock_identity(partial, 2000)) {
         error = "recv-owner owner-death recovery exposed partial evidence";
         return false;
     }
+    const bool partial_recovery_valid =
+        __atomic_load_n(&partial->recv_owner_failure.valid, __ATOMIC_ACQUIRE) == 0u &&
+        rut_downstream_gate_load(&partial->state) == RUT_DOWNSTREAM_GATE_FAILED &&
+        partial->ring_fd == -1 && partial->intercepted_fd == -1 &&
+        rut_downstream_gate_load(&partial->ring_ready) == 0u &&
+        partial->recv_owner_failure.reason == RUT_IOURING_GATE_RECV_OWNER_REASON_NONE;
     rut_iouring_gate_unlock_identity(partial);
+    if (!partial_recovery_valid) {
+        error = "recv-owner owner-death recovery exposed partial evidence";
+        return false;
+    }
     return true;
 }
 
