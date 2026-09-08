@@ -2763,6 +2763,17 @@ if(RUT_ENABLE_JIT)
             TIMEOUT 30
         )
         add_test(
+            NAME test_rut_issue566_id3_successor_public_gate
+            COMMAND test_nginx_differential --rut-issue566-id3-successor-public-gate
+                    $<TARGET_FILE:rut> $<TARGET_FILE:test_rut_iouring_gate_preload>
+        )
+        set_tests_properties(test_rut_issue566_id3_successor_public_gate PROPERTIES
+            LABELS "integration;nginx"
+            RUN_SERIAL TRUE
+            RESOURCE_LOCK nginx-differential
+            TIMEOUT 30
+        )
+        add_test(
             NAME test_rut_iouring_gate_identity_negative
             COMMAND test_nginx_differential --rut-iouring-gate-identity-negative
                     $<TARGET_FILE:rut> $<TARGET_FILE:test_rut_iouring_gate_preload>

@@ -25344,6 +25344,17 @@ static bool run_rut_iouring_gate_spike(u16 frontend_port,
     const char* response_two = fixture != nullptr && fixture->response_two != nullptr
                                    ? fixture->response_two
                                    : kGatewayResponseNormalized;
+    if (request_one == nullptr || request_one_length == 0 || request_two == nullptr ||
+        request_two_length == 0 || request_two_length > RUT_DOWNSTREAM_GATE_REQUEST_CAPACITY ||
+        response_one == nullptr || response_two == nullptr ||
+        (fixture != nullptr &&
+         (fixture->source == nullptr ||
+          (fixture->request_one == nullptr) != (fixture->request_one_length == 0) ||
+          (fixture->request_two == nullptr) != (fixture->request_two_length == 0) ||
+          (fixture->response_one == nullptr) != (fixture->response_two == nullptr)))) {
+        error = "RUT io_uring gate fixture has incoherent request/response pointers or lengths";
+        return false;
+    }
 
     RutIoUringGateProcessMapping process_mapping;
     ChildGuard& rut_process = process_mapping.child_guard;
@@ -63990,9 +64001,6 @@ static bool run_rut_issue566_id3_successor_public_gate(const char* rut_path,
     DeadPort dead;
     if (!dead.adopt_held_loopback_port(
             &reservations.fds[1], backend_port, kDiagnostic, error))
-        return false;
-    if (!handoff_held_loopback_port(
-            &reservations.fds[0], frontend_port, kDiagnostic, error))
         return false;
     RutIoUringGateFixture fixture;
     fixture.source = &source;
