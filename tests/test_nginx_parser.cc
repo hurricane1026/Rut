@@ -20648,25 +20648,25 @@ TEST(nginx_parser_issue373, rejects_bad_arity_name_duplicates_and_contexts) {
          FrontendError::UnexpectedToken,
          lit_str("proxy_hide_header accepts exactly one name"),
          "extra"},
-        {"server { listen 8080; location / { proxy_hide_header x-compat-hidden; proxy_pass "
+        {"server { listen 8080; location / { proxy_hide_header Compat-Hidden; proxy_pass "
          "http://127.0.0.1:9000; } }",
          FrontendError::UnsupportedSyntax,
-         lit_str("only literal proxy_hide_header X-Compat-Hidden is modeled"),
-         "x-compat-hidden"},
+         lit_str("proxy_hide_header name is outside the bounded header-name profile"),
+         "Compat-Hidden"},
         {"server { listen 8080; location / { proxy_hide_header \"X-Compat-Hidden\"; "
          "proxy_pass http://127.0.0.1:9000; } }",
          FrontendError::UnsupportedSyntax,
-         lit_str("only literal proxy_hide_header X-Compat-Hidden is modeled"),
+         lit_str("proxy_hide_header name is outside the bounded header-name profile"),
          "\"X-Compat-Hidden\""},
         {"server { listen 8080; location / { proxy_hide_header $hidden; proxy_pass "
          "http://127.0.0.1:9000; } }",
          FrontendError::UnsupportedSyntax,
-         lit_str("only literal proxy_hide_header X-Compat-Hidden is modeled"),
+         lit_str("proxy_hide_header name is outside the bounded header-name profile"),
          "$hidden"},
         {"server { listen 8080; location / { proxy_hide_header X-Compat\\-Hidden; proxy_pass "
          "http://127.0.0.1:9000; } }",
          FrontendError::UnsupportedSyntax,
-         lit_str("only literal proxy_hide_header X-Compat-Hidden is modeled"),
+         lit_str("proxy_hide_header name is outside the bounded header-name profile"),
          "X-Compat\\-Hidden"},
         {"server { listen 8080; location / { proxy_hide_header X-Compat-Hidden } }",
          FrontendError::UnexpectedToken,
@@ -20699,6 +20699,68 @@ TEST(nginx_parser_issue373, rejects_bad_arity_name_duplicates_and_contexts) {
         CHECK_EQ(parsed.error().code, vector.code);
         CHECK(parsed.error().detail.eq(vector.detail));
         CHECK_NE(strstr(vector.source, vector.token), nullptr);
+    }
+}
+
+TEST(nginx_parser_issue600, bounded_custom_names_preserve_spelling_and_lowering_rejects) {
+    const std::string names[] = {
+        "X-A",
+        "x-powered_by-9",
+        "X-" + std::string(44u, 'A'),
+    };
+    for (const std::string& name : names) {
+        const std::string source =
+            "server { listen 127.0.0.1:8080; location / { proxy_hide_header " + name +
+            "; proxy_pass http://127.0.0.1:9000; } }";
+        const auto parsed = nginx::parse({source.data(), static_cast<u32>(source.size())});
+        REQUIRE(parsed);
+        const auto& header = parsed.value().location.proxy_hide_header;
+        REQUIRE(header.present);
+        CHECK(header.name.eq({name.data(), static_cast<u32>(name.size())}));
+        const size_t name_at = source.find(name);
+        const size_t directive_at = source.find("proxy_hide_header");
+        REQUIRE(name_at != std::string::npos);
+        REQUIRE(directive_at != std::string::npos);
+        CHECK_EQ(header.name.ptr, source.data() + name_at);
+        CHECK_EQ(header.name_span.start, static_cast<u32>(name_at));
+        CHECK_EQ(header.name_span.end, static_cast<u32>(name_at + name.size()));
+        CHECK_EQ(header.span.start, static_cast<u32>(directive_at));
+        CHECK_EQ(header.span.end, static_cast<u32>(source.find(';', name_at) + 1u));
+        const auto lowered = nginx::lower_to_rut(parsed.value());
+        REQUIRE_FALSE(lowered);
+        CHECK_EQ(lowered.error().code, FrontendError::UnsupportedSyntax);
+        CHECK(lowered.error().detail.eq(lit_str("invalid proxy_hide_header source syntax")));
+        CHECK_EQ(lowered.error().span.start, header.span.start);
+    }
+}
+
+TEST(nginx_parser_issue600, rejects_name_boundaries_reserved_prefixes_and_nonwords) {
+    const std::string name47 = "X-" + std::string(45u, 'A');
+    const std::string name65 = "X-" + std::string(63u, 'A');
+    const std::string sources[] = {
+        "server { listen 8080; location / { proxy_hide_header " + name47 +
+            "; proxy_pass http://127.0.0.1:9000; } }",
+        "server { listen 8080; location / { proxy_hide_header " + name65 +
+            "; proxy_pass http://127.0.0.1:9000; } }",
+        "server { listen 8080; location / { proxy_hide_header X-Pad; proxy_pass "
+        "http://127.0.0.1:9000; } }",
+        "server { listen 8080; location / { proxy_hide_header x-pad; proxy_pass "
+        "http://127.0.0.1:9000; } }",
+        "server { listen 8080; location / { proxy_hide_header X-Accel-Redirect; proxy_pass "
+        "http://127.0.0.1:9000; } }",
+        "server { listen 8080; location / { proxy_hide_header X-Accel-Redirect-2; proxy_pass "
+        "http://127.0.0.1:9000; } }",
+        "server { listen 8080; location / { proxy_hide_header X-Ä; proxy_pass "
+        "http://127.0.0.1:9000; } }",
+        "server { listen 8080; location / { proxy_hide_header X-; proxy_pass "
+        "http://127.0.0.1:9000; } }",
+    };
+    for (const std::string& source : sources) {
+        const auto parsed = nginx::parse({source.data(), static_cast<u32>(source.size())});
+        REQUIRE_FALSE(parsed);
+        CHECK_EQ(parsed.error().code, FrontendError::UnsupportedSyntax);
+        CHECK(parsed.error().detail.eq(
+            lit_str("proxy_hide_header name is outside the bounded header-name profile")));
     }
 }
 
