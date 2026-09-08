@@ -24702,6 +24702,55 @@ struct RutIoUringGateProcessMapping {
     RutIoUringGateProcessMapping() { mapping.child = &child_guard.child; }
 };
 
+static const char* recv_owner_reason_name(uint32_t reason) {
+    switch (reason) {
+        case RUT_IOURING_GATE_RECV_OWNER_REASON_RECV_SHAPE:
+            return "RECV_SHAPE";
+        case RUT_IOURING_GATE_RECV_OWNER_REASON_RECV_ID_CHANGED:
+            return "RECV_ID_CHANGED";
+        case RUT_IOURING_GATE_RECV_OWNER_REASON_RECV_MISSING_AT_SEND:
+            return "RECV_MISSING_AT_SEND";
+        case RUT_IOURING_GATE_RECV_OWNER_REASON_SEND_OWNER_MISMATCH:
+            return "SEND_OWNER_MISMATCH";
+        case RUT_IOURING_GATE_RECV_OWNER_REASON_INGRESS_CONTRACT:
+            return "INGRESS_CONTRACT";
+        default:
+            return "UNKNOWN";
+    }
+}
+
+static void append_recv_owner_failure_evidence(rut_iouring_gate& gate, std::string& evidence) {
+    if (rut_downstream_gate_load(&gate.error_code) != RUT_IOURING_GATE_ERROR_RECV_OWNER ||
+        !rut_iouring_gate_lock_identity(&gate, 2000))
+        return;
+    rut_iouring_gate_recv_owner_failure failure{};
+    if (__atomic_load_n(&gate.recv_owner_failure.valid, __ATOMIC_ACQUIRE) != 1u) {
+        rut_iouring_gate_unlock_identity(&gate);
+        return;
+    }
+    memcpy(&failure, &gate.recv_owner_failure, sizeof(failure));
+    rut_iouring_gate_unlock_identity(&gate);
+    evidence +=
+        " recv_owner_failure reason=" + std::string(recv_owner_reason_name(failure.reason)) +
+        " ring_fd=" + std::to_string(failure.ring_fd) +
+        " peer_ipv4_be=" + std::to_string(failure.peer_ipv4_be) +
+        " peer_port_be=" + std::to_string(failure.peer_port_be) +
+        " state=" + std::to_string(failure.state) + " mode=" + std::to_string(failure.mode) +
+        " peer_fd=" + std::to_string(failure.peer_fd) +
+        " captured_recv_user_data=" + std::to_string(failure.captured_recv_user_data) +
+        " current_sqe_user_data=" + std::to_string(failure.current_sqe_user_data) +
+        " current_sqe_opcode=" + std::to_string(failure.current_sqe_opcode) +
+        " current_sqe_flags=" + std::to_string(failure.current_sqe_flags) +
+        " current_sqe_ioprio=" + std::to_string(failure.current_sqe_ioprio) +
+        " current_sqe_buf_group=" + std::to_string(failure.current_sqe_buf_group) +
+        " current_sqe_len=" + std::to_string(failure.current_sqe_len) +
+        " current_sqe_fd=" + std::to_string(failure.current_sqe_fd) +
+        " sq_head=" + std::to_string(failure.sq_head) +
+        " sq_tail=" + std::to_string(failure.sq_tail) +
+        " sq_cursor=" + std::to_string(failure.sq_cursor) +
+        " to_submit=" + std::to_string(failure.to_submit);
+}
+
 struct RutIoUringGateRelease {
     rut_iouring_gate* gate = nullptr;
 
@@ -25835,6 +25884,7 @@ static bool run_rut_iouring_gate_spike(u16 frontend_port,
                             " user_data=" + std::to_string(gate->connect_attempts[i].user_data) +
                             "]";
             }
+            append_recv_owner_failure_evidence(*gate, evidence);
             if (observation != nullptr) observation->gate_evidence = evidence;
             if (error != nullptr && !error->empty()) *error += "; settled gate " + evidence;
         }
@@ -26338,7 +26388,7 @@ static bool run_rut_coalesced_ingress_gate_evidence(u16 frontend_port,
                     "cleanup failure: RUT helper may still be live; ingress metadata suppressed";
                 return;
             }
-            observation->gate_evidence =
+            std::string evidence =
                 std::string(*cleanup_clean ? "cleanup=clean " : "cleanup=failed-but-reaped ") +
                 "state=" + std::to_string(rut_downstream_gate_load(&gate->state)) +
                 " error=" + std::to_string(rut_downstream_gate_load(&gate->error_code)) +
@@ -26348,6 +26398,8 @@ static bool run_rut_coalesced_ingress_gate_evidence(u16 frontend_port,
                 " fragments=" + std::to_string(gate->witness_fragments) +
                 " witness=" + std::to_string(gate->witness_length) +
                 " attempts=" + std::to_string(gate->connect_attempt_count);
+            append_recv_owner_failure_evidence(*gate, evidence);
+            observation->gate_evidence = evidence;
         }
     } evidence_capture{
         mapping.gate, &rut_process.child, &child_settled, &cleanup_clean, &observation};

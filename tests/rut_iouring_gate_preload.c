@@ -215,6 +215,53 @@ static int failed_locked(void) {
     return rut_downstream_gate_load(&gate->state) == RUT_DOWNSTREAM_GATE_FAILED;
 }
 
+static void fail_locked(uint32_t error);
+
+static void fail_recv_owner_locked(uint32_t reason,
+                                   const struct io_uring_sqe* sqe,
+                                   int peer_fd,
+                                   uint32_t sq_head,
+                                   uint32_t sq_tail,
+                                   uint32_t sq_cursor,
+                                   uint32_t to_submit) {
+    uint32_t expected_error = RUT_IOURING_GATE_ERROR_NONE;
+    if (!__atomic_compare_exchange_n(&gate->error_code,
+                                     &expected_error,
+                                     RUT_IOURING_GATE_ERROR_RECV_OWNER,
+                                     0,
+                                     __ATOMIC_ACQ_REL,
+                                     __ATOMIC_ACQUIRE))
+        return;
+    struct rut_iouring_gate_recv_owner_failure* failure = &gate->recv_owner_failure;
+    memset(failure, 0, sizeof(*failure));
+    failure->reason = reason;
+    failure->ring_fd = ring_view.fd;
+    failure->peer_fd = peer_fd;
+    failure->peer_ipv4_be = gate->target_peer_ipv4_be;
+    failure->peer_port_be = gate->target_peer_port_be;
+    failure->state = rut_downstream_gate_load(&gate->state);
+    failure->mode = rut_downstream_gate_load(&gate->mode);
+    failure->captured_recv_user_data = ring_view.target_recv_user_data;
+    if (sqe != 0) {
+        failure->current_sqe_user_data = sqe->user_data;
+        failure->current_sqe_opcode = sqe->opcode;
+        failure->current_sqe_flags = sqe->flags;
+        failure->current_sqe_ioprio = sqe->ioprio;
+        failure->current_sqe_buf_group = sqe->buf_group;
+        failure->current_sqe_len = sqe->len;
+        failure->current_sqe_fd = sqe->fd;
+    }
+    failure->sq_head = sq_head;
+    failure->sq_tail = sq_tail;
+    failure->sq_cursor = sq_cursor;
+    failure->to_submit = to_submit;
+    __atomic_store_n(&failure->valid, 1u, __ATOMIC_RELEASE);
+    gate->ring_fd = -1;
+    gate->intercepted_fd = -1;
+    rut_downstream_gate_store(&gate->ring_ready, 0);
+    rut_downstream_gate_store(&gate->state, RUT_DOWNSTREAM_GATE_FAILED);
+}
+
 static void fail_locked(uint32_t error) {
     uint32_t expected = RUT_IOURING_GATE_ERROR_NONE;
     (void)__atomic_compare_exchange_n(
@@ -705,15 +752,40 @@ static int inspect_submission(uint32_t to_submit) {
                 fail(RUT_IOURING_GATE_ERROR_PROTOCOL);
                 return 0;
             }
-            if (sqe->flags != IOSQE_BUFFER_SELECT || sqe->ioprio != IORING_RECV_MULTISHOT ||
-                sqe->buf_group != RUT_GATE_BUFFER_GROUP || sqe->len != RUT_GATE_BUFFER_SIZE ||
-                (sqe->user_data & 0xffU) != RUT_GATE_RECV_EVENT) {
-                fail(RUT_IOURING_GATE_ERROR_RECV_OWNER);
+            if (!rut_iouring_gate_recv_shape_matches(sqe->flags,
+                                                     sqe->ioprio,
+                                                     sqe->buf_group,
+                                                     sqe->len,
+                                                     sqe->user_data,
+                                                     IOSQE_BUFFER_SELECT,
+                                                     IORING_RECV_MULTISHOT,
+                                                     RUT_GATE_BUFFER_GROUP,
+                                                     RUT_GATE_BUFFER_SIZE,
+                                                     RUT_GATE_RECV_EVENT)) {
+                lock_identity();
+                fail_recv_owner_locked(RUT_IOURING_GATE_RECV_OWNER_REASON_RECV_SHAPE,
+                                       sqe,
+                                       sqe->fd,
+                                       first,
+                                       last,
+                                       cursor,
+                                       to_submit);
+                unlock_identity();
+                rut_downstream_gate_wake(&gate->state);
                 return 0;
             }
             if (ring_view.target_recv_user_data != 0 &&
                 ring_view.target_recv_user_data != sqe->user_data) {
-                fail(RUT_IOURING_GATE_ERROR_RECV_OWNER);
+                lock_identity();
+                fail_recv_owner_locked(RUT_IOURING_GATE_RECV_OWNER_REASON_RECV_ID_CHANGED,
+                                       sqe,
+                                       sqe->fd,
+                                       first,
+                                       last,
+                                       cursor,
+                                       to_submit);
+                unlock_identity();
+                rut_downstream_gate_wake(&gate->state);
                 return 0;
             }
             ring_view.target_recv_user_data = sqe->user_data;
@@ -724,8 +796,8 @@ static int inspect_submission(uint32_t to_submit) {
         }
         if (coalesced_ingress && sqe->opcode == IORING_OP_SEND && target_peer(sqe->fd))
             ingress_send_count++;
-        if (sqe->opcode != IORING_OP_SEND || !target_peer(sqe->fd) ||
-            sqe->len < expected_length || sqe->addr == 0 ||
+        if (sqe->opcode != IORING_OP_SEND || !target_peer(sqe->fd) || sqe->len < expected_length ||
+            sqe->addr == 0 ||
             memcmp((const void*)(uintptr_t)sqe->addr, expected, expected_length) != 0)
             continue;
         if (mode == RUT_IOURING_GATE_MODE_COALESCED_INGRESS) {
@@ -750,16 +822,26 @@ static int inspect_submission(uint32_t to_submit) {
             continue;
         }
         if (ring_view.target_recv_user_data == 0) {
-            fail_locked(RUT_IOURING_GATE_ERROR_RECV_OWNER);
+            fail_recv_owner_locked(RUT_IOURING_GATE_RECV_OWNER_REASON_RECV_MISSING_AT_SEND,
+                                   sqe,
+                                   sqe->fd,
+                                   first,
+                                   last,
+                                   cursor,
+                                   to_submit);
             unlock_identity();
             rut_downstream_gate_wake(&gate->state);
             return 0;
         }
-        const uint32_t recv_conn_id =
-            (uint32_t)((ring_view.target_recv_user_data >> 8) & 0xffffffU);
-        const uint32_t send_conn_id = (uint32_t)((sqe->user_data >> 8) & 0xffffffU);
-        if ((sqe->user_data & 0xffU) != RUT_GATE_SEND_EVENT || recv_conn_id != send_conn_id) {
-            fail_locked(RUT_IOURING_GATE_ERROR_RECV_OWNER);
+        if (!rut_iouring_gate_send_owner_matches(
+                ring_view.target_recv_user_data, sqe->user_data, RUT_GATE_SEND_EVENT)) {
+            fail_recv_owner_locked(RUT_IOURING_GATE_RECV_OWNER_REASON_SEND_OWNER_MISMATCH,
+                                   sqe,
+                                   sqe->fd,
+                                   first,
+                                   last,
+                                   cursor,
+                                   to_submit);
             unlock_identity();
             rut_downstream_gate_wake(&gate->state);
             return 0;
@@ -807,8 +889,16 @@ static int inspect_submission(uint32_t to_submit) {
             ((ingress_recv->user_data >> 8) & 0xffffffU) >= RUT_GATE_TIMER_CONN_ID ||
             gate->request_two_length == 0 ||
             gate->request_two_length > RUT_DOWNSTREAM_GATE_REQUEST_CAPACITY) {
-            fail_locked(ingress_send_count != 0 ? RUT_IOURING_GATE_ERROR_SQ
-                                                : RUT_IOURING_GATE_ERROR_RECV_OWNER);
+            if (ingress_send_count != 0)
+                fail_locked(RUT_IOURING_GATE_ERROR_SQ);
+            else
+                fail_recv_owner_locked(RUT_IOURING_GATE_RECV_OWNER_REASON_INGRESS_CONTRACT,
+                                       ingress_recv,
+                                       ingress_recv == 0 ? -1 : ingress_recv->fd,
+                                       first,
+                                       last,
+                                       first + to_submit - 1u,
+                                       to_submit);
             unlock_identity();
             rut_downstream_gate_wake(&gate->state);
             return 0;
