@@ -32925,6 +32925,41 @@ TEST(http1_pipeline_generation_activation,
 }
 
 TEST(http1_pipeline_generation_activation,
+     strict_successor_id3_retained_wire_reaches_live_origin_response_path) {
+    static constexpr u8 kSuccessor[] =
+        "GET /one HTTP/1.1\r\nHost: client.example\r\nX-Test:\t keep \t\r\n\r\n";
+    static constexpr char kExpectedWire[] =
+        "GET /one HTTP/1.1\r\nHost: 127.0.0.1:9000\r\nX-Test: \t keep \t\r\n\r\n";
+    static constexpr u8 kOrigin[] = "HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n";
+    ScopedBackendHealthReset health_reset{};
+    ScopedIoUringLoopForRetirement guard;
+    if (!guard.init()) SKIP("io_uring unavailable");
+    auto* loop = guard.loop;
+    RouteConfig config{};
+    PreconnectConnectSubmitFixture fixture{};
+    strict_id3_successor_handler_calls = 0;
+    REQUIRE(stage_pipeline_generation_successor_upload(loop,
+                                                       config,
+                                                       &fixture,
+                                                       false,
+                                                       kSuccessor,
+                                                       sizeof(kSuccessor) - 1u,
+                                                       &strict_id3_successor_handler,
+                                                       kExpectedWire));
+    Connection& conn = *fixture.conn;
+    REQUIRE_EQ(conn.response_read_deadline_upload.request_policy_id,
+               static_cast<u16>(RequestPolicyId::Http11FixedTrimSpPreserveHtab));
+    REQUIRE_EQ(conn.upstream_recv_buf.write(kOrigin, sizeof(kOrigin) - 1u), sizeof(kOrigin) - 1u);
+    const IoEvent response =
+        response_read_copy_event(conn, sizeof(kOrigin) - 1u, true, 0, sizeof(kOrigin) - 1u);
+    loop->dispatch_batch(&response, 1);
+    REQUIRE_EQ(conn.resp_status, 200u);
+    REQUIRE_EQ(conn.http1_prebuilt_response_purpose,
+               Http1PrebuiltResponsePurpose::StrictNonHeadCl0Success);
+    cleanup_late_failure_fixture(loop, fixture);
+}
+
+TEST(http1_pipeline_generation_activation,
      prebuilt_layout_shortcuts_reject_request_two_before_transport_commit) {
     for (const Http1PrebuiltResponseLayout forged_layout :
          {Http1PrebuiltResponseLayout::None, Http1PrebuiltResponseLayout::HeaderOnlyHead}) {
