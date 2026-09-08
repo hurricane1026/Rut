@@ -1243,7 +1243,7 @@ TEST(nginx_converter, lowers_access_log_off_to_owned_server_only_output) {
 }
 
 TEST(nginx_converter, authenticates_access_log_off_and_complete_envelope) {
-    const std::string source =
+    std::string source =
         "http {\n  access_log off;\n  server {\n"
         "    listen 127.0.0.1:65535;\n"
         "    location / { proxy_read_timeout 63s; proxy_pass http://255.255.255.255:65535; }\n"
@@ -1295,10 +1295,38 @@ TEST(nginx_converter, authenticates_access_log_off_and_complete_envelope) {
     REQUIRE_FALSE(rejected);
 
     forged = profile.value();
+    forged.log_format.name.ptr = reinterpret_cast<const char*>(static_cast<uintptr_t>(1));
+    rejected = nginx::lower_to_rut(forged);
+    REQUIRE_FALSE(rejected);
+    forged = profile.value();
+    forged.log_format.name.len++;
+    rejected = nginx::lower_to_rut(forged);
+    REQUIRE_FALSE(rejected);
+    forged = profile.value();
+    forged.log_format.name_span.start++;
+    rejected = nginx::lower_to_rut(forged);
+    REQUIRE_FALSE(rejected);
+    forged = profile.value();
+    forged.log_format.value.ptr = reinterpret_cast<const char*>(static_cast<uintptr_t>(1));
+    rejected = nginx::lower_to_rut(forged);
+    REQUIRE_FALSE(rejected);
+    forged = profile.value();
+    forged.log_format.value.len++;
+    rejected = nginx::lower_to_rut(forged);
+    REQUIRE_FALSE(rejected);
+    forged = profile.value();
     forged.log_format.value_span.start++;
     rejected = nginx::lower_to_rut(forged);
     REQUIRE_FALSE(rejected);
     CHECK(rejected.error().detail.eq(lit_str("http profile metadata does not match its source")));
+    forged = profile.value();
+    forged.log_format.token_span.end++;
+    rejected = nginx::lower_to_rut(forged);
+    REQUIRE_FALSE(rejected);
+    forged = profile.value();
+    forged.log_format.span.start++;
+    rejected = nginx::lower_to_rut(forged);
+    REQUIRE_FALSE(rejected);
 
     forged = profile.value();
     forged.access_log = {};
@@ -1325,6 +1353,10 @@ TEST(nginx_converter, authenticates_access_log_off_and_complete_envelope) {
 
     forged = profile.value();
     forged.server.listen.port++;
+    rejected = nginx::lower_to_rut(forged);
+    REQUIRE_FALSE(rejected);
+    forged = profile.value();
+    forged.server.location.path.ptr = reinterpret_cast<const char*>(static_cast<uintptr_t>(1));
     rejected = nginx::lower_to_rut(forged);
     REQUIRE_FALSE(rejected);
 
@@ -1361,6 +1393,21 @@ TEST(nginx_converter, authenticates_access_log_off_and_complete_envelope) {
     forged_config = config.value();
     forged_config.events_span.end--;
     REQUIRE_FALSE(nginx::lower_to_rut(forged_config));
+    forged_config = config.value();
+    forged_config.http_span.start++;
+    REQUIRE_FALSE(nginx::lower_to_rut(forged_config));
+    forged_config = config.value();
+    forged_config.http.source.ptr = reinterpret_cast<const char*>(static_cast<uintptr_t>(1));
+    REQUIRE_FALSE(nginx::lower_to_rut(forged_config));
+    forged_config = config.value();
+    forged_config.http.source.len++;
+    REQUIRE_FALSE(nginx::lower_to_rut(forged_config));
+    forged_config = config.value();
+    forged_config.source.ptr = reinterpret_cast<const char*>(static_cast<uintptr_t>(1));
+    REQUIRE_FALSE(nginx::lower_to_rut(forged_config));
+    forged_config = config.value();
+    forged_config.source.len++;
+    REQUIRE_FALSE(nginx::lower_to_rut(forged_config));
 
     std::fill(complete.begin(), complete.end(), 'x');
     CHECK_EQ(std::string(complete_lowered.value().data, complete_lowered.value().len),
@@ -1369,6 +1416,24 @@ TEST(nginx_converter, authenticates_access_log_off_and_complete_envelope) {
     source[source.find("off")] = 'x';
     const auto source_changed = nginx::lower_to_rut(profile.value());
     REQUIRE_FALSE(source_changed);
+
+    nginx::HttpProfileRutSource retained_complete;
+    std::string retained_complete_expected;
+    {
+        std::string ephemeral =
+            "events {}\nhttp { access_log off; server { listen 127.0.0.1:8080; "
+            "location / { proxy_pass http://127.0.0.1:9000; } } }";
+        const auto ephemeral_config =
+            nginx::parse_nginx_http_config({ephemeral.data(), static_cast<u32>(ephemeral.size())});
+        REQUIRE(ephemeral_config);
+        const auto ephemeral_lowered = nginx::lower_to_rut(ephemeral_config.value());
+        REQUIRE(ephemeral_lowered);
+        retained_complete = ephemeral_lowered.value();
+        retained_complete_expected.assign(retained_complete.data, retained_complete.len);
+    }
+    CHECK_EQ(std::string(retained_complete.data, retained_complete.len),
+             retained_complete_expected);
+    CHECK_EQ(retained_complete.data[retained_complete.len], '\0');
 }
 
 TEST(nginx_complete_converter, access_log_off_preserves_unsupported_server_diagnostics) {
@@ -1767,6 +1832,32 @@ TEST(nginx_converter, http_profile_exact_maximum_payload_owns_terminal_capacity_
     CHECK_EQ(std::string(lowered.value().data, declaration.size()), declaration);
     CHECK_EQ(std::string(lowered.value().data + declaration.size(), server.value().len),
              std::string(server.value().data, server.value().len));
+
+    const std::string off_source = "http { access_log off; server {\n" + server_content + "} }\n";
+    const auto off_profile =
+        nginx::parse_http_profile({off_source.data(), static_cast<u32>(off_source.size())});
+    REQUIRE(off_profile);
+    const auto off_server = nginx::lower_to_rut(off_profile.value().server);
+    REQUIRE(off_server);
+    REQUIRE_EQ(off_server.value().len, 5945u);
+    CHECK_LT(off_server.value().len, nginx::RutSource::kCapacity);
+    const auto off_lowered = nginx::lower_to_rut(off_profile.value());
+    REQUIRE(off_lowered);
+    CHECK_EQ(off_lowered.value().len, off_server.value().len);
+    CHECK_LT(off_lowered.value().len, nginx::HttpProfileRutSource::kCapacity);
+    CHECK_EQ(std::string(off_lowered.value().data, off_lowered.value().len),
+             std::string(off_server.value().data, off_server.value().len));
+    CHECK_EQ(off_lowered.value().data[off_lowered.value().len], '\0');
+
+    const std::string off_complete_source = "events {}\n" + off_source;
+    const auto off_config = nginx::parse_nginx_http_config(
+        {off_complete_source.data(), static_cast<u32>(off_complete_source.size())});
+    REQUIRE(off_config);
+    const auto off_complete_lowered = nginx::lower_to_rut(off_config.value());
+    REQUIRE(off_complete_lowered);
+    CHECK_EQ(std::string(off_complete_lowered.value().data, off_complete_lowered.value().len),
+             std::string(off_server.value().data, off_server.value().len));
+    CHECK_EQ(off_complete_lowered.value().data[off_complete_lowered.value().len], '\0');
 }
 
 TEST(nginx_converter, issue373_http_profile_hide_exact_maximum_fits_and_is_owned) {
