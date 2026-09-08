@@ -750,27 +750,37 @@ static int inspect_submission(uint32_t to_submit) {
                                                      RUT_GATE_BUFFER_SIZE,
                                                      RUT_GATE_RECV_EVENT)) {
                 lock_identity();
-                fail_recv_owner_locked(RUT_IOURING_GATE_RECV_OWNER_REASON_RECV_SHAPE,
-                                       sqe,
-                                       sqe->fd,
-                                       first,
-                                       last,
-                                       cursor,
-                                       to_submit);
+                fail_recv_owner_locked(
+                    rut_iouring_gate_recv_owner_reason(0,
+                                                       ring_view.target_recv_user_data,
+                                                       sqe->user_data,
+                                                       sqe->user_data,
+                                                       RUT_GATE_SEND_EVENT),
+                    sqe,
+                    sqe->fd,
+                    first,
+                    last,
+                    cursor,
+                    to_submit);
                 unlock_identity();
                 rut_downstream_gate_wake(&gate->state);
                 return 0;
             }
-            if (ring_view.target_recv_user_data != 0 &&
-                ring_view.target_recv_user_data != sqe->user_data) {
+            if (rut_iouring_gate_recv_user_data_changed(ring_view.target_recv_user_data,
+                                                        sqe->user_data)) {
                 lock_identity();
-                fail_recv_owner_locked(RUT_IOURING_GATE_RECV_OWNER_REASON_RECV_ID_CHANGED,
-                                       sqe,
-                                       sqe->fd,
-                                       first,
-                                       last,
-                                       cursor,
-                                       to_submit);
+                fail_recv_owner_locked(
+                    rut_iouring_gate_recv_owner_reason(1,
+                                                       ring_view.target_recv_user_data,
+                                                       sqe->user_data,
+                                                       sqe->user_data,
+                                                       RUT_GATE_SEND_EVENT),
+                    sqe,
+                    sqe->fd,
+                    first,
+                    last,
+                    cursor,
+                    to_submit);
                 unlock_identity();
                 rut_downstream_gate_wake(&gate->state);
                 return 0;
@@ -808,27 +818,38 @@ static int inspect_submission(uint32_t to_submit) {
             unlock_identity();
             continue;
         }
-        if (ring_view.target_recv_user_data == 0) {
-            fail_recv_owner_locked(RUT_IOURING_GATE_RECV_OWNER_REASON_RECV_MISSING_AT_SEND,
-                                   sqe,
-                                   sqe->fd,
-                                   first,
-                                   last,
-                                   cursor,
-                                   to_submit);
+        if (!rut_iouring_gate_recv_capture_present(ring_view.target_recv_user_data)) {
+            fail_recv_owner_locked(
+                rut_iouring_gate_recv_owner_reason(1,
+                                                   ring_view.target_recv_user_data,
+                                                   ring_view.target_recv_user_data,
+                                                   sqe->user_data,
+                                                   RUT_GATE_SEND_EVENT),
+                sqe,
+                sqe->fd,
+                first,
+                last,
+                cursor,
+                to_submit);
             unlock_identity();
             rut_downstream_gate_wake(&gate->state);
             return 0;
         }
-        if (!rut_iouring_gate_send_owner_matches(
-                ring_view.target_recv_user_data, sqe->user_data, RUT_GATE_SEND_EVENT)) {
-            fail_recv_owner_locked(RUT_IOURING_GATE_RECV_OWNER_REASON_SEND_OWNER_MISMATCH,
-                                   sqe,
-                                   sqe->fd,
-                                   first,
-                                   last,
-                                   cursor,
-                                   to_submit);
+        if (!rut_iouring_gate_send_event_matches(sqe->user_data, RUT_GATE_SEND_EVENT) ||
+            !rut_iouring_gate_send_connection_matches(ring_view.target_recv_user_data,
+                                                      sqe->user_data)) {
+            fail_recv_owner_locked(
+                rut_iouring_gate_recv_owner_reason(1,
+                                                   ring_view.target_recv_user_data,
+                                                   ring_view.target_recv_user_data,
+                                                   sqe->user_data,
+                                                   RUT_GATE_SEND_EVENT),
+                sqe,
+                sqe->fd,
+                first,
+                last,
+                cursor,
+                to_submit);
             unlock_identity();
             rut_downstream_gate_wake(&gate->state);
             return 0;

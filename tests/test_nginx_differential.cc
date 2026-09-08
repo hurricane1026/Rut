@@ -24752,13 +24752,82 @@ static void append_recv_owner_failure_evidence(rut_iouring_gate& gate, std::stri
 }
 
 static bool run_recv_owner_diagnostic_self_check(std::string& error) {
-    if (!rut_iouring_gate_recv_shape_matches(
-            2u, 1u, 7u, 4096u, UINT64_C(0x1201), 2u, 1u, 7u, 4096u, 1u) ||
-        rut_iouring_gate_recv_shape_matches(
-            0u, 1u, 7u, 4096u, UINT64_C(0x1201), 2u, 1u, 7u, 4096u, 1u) ||
-        !rut_iouring_gate_send_owner_matches(UINT64_C(0x1201), UINT64_C(0x1202), 2u) ||
-        rut_iouring_gate_send_owner_matches(UINT64_C(0x1201), UINT64_C(0x1302), 2u)) {
-        error = "recv-owner shared predicate self-check failed";
+    constexpr uint32_t kFlags = 2u;
+    constexpr uint32_t kIoprio = 1u;
+    constexpr uint32_t kBufferGroup = 7u;
+    constexpr uint32_t kLength = 4096u;
+    constexpr uint64_t kRecvUserData = UINT64_C(0x1201);
+    constexpr uint64_t kSendUserData = UINT64_C(0x1202);
+    if (!rut_iouring_gate_recv_shape_matches(kFlags,
+                                             kIoprio,
+                                             kBufferGroup,
+                                             kLength,
+                                             kRecvUserData,
+                                             kFlags,
+                                             kIoprio,
+                                             kBufferGroup,
+                                             kLength,
+                                             1u)) {
+        error = "recv-owner valid Recv shape was rejected";
+        return false;
+    }
+    const struct {
+        uint32_t flags;
+        uint32_t ioprio;
+        uint32_t buffer_group;
+        uint32_t length;
+        uint64_t user_data;
+        const char* label;
+    } invalid_shapes[] = {
+        {0u, kIoprio, kBufferGroup, kLength, kRecvUserData, "flags"},
+        {kFlags, 0u, kBufferGroup, kLength, kRecvUserData, "ioprio"},
+        {kFlags, kIoprio, 0u, kLength, kRecvUserData, "buffer-group"},
+        {kFlags, kIoprio, kBufferGroup, 0u, kRecvUserData, "length"},
+        {kFlags, kIoprio, kBufferGroup, kLength, UINT64_C(0x1202), "event"},
+    };
+    for (const auto& shape : invalid_shapes) {
+        if (rut_iouring_gate_recv_shape_matches(shape.flags,
+                                                shape.ioprio,
+                                                shape.buffer_group,
+                                                shape.length,
+                                                shape.user_data,
+                                                kFlags,
+                                                kIoprio,
+                                                kBufferGroup,
+                                                kLength,
+                                                1u)) {
+            error = std::string("recv-owner invalid Recv ") + shape.label + " was accepted";
+            return false;
+        }
+    }
+    if (!rut_iouring_gate_recv_user_data_matches(kRecvUserData, kRecvUserData) ||
+        rut_iouring_gate_recv_user_data_changed(kRecvUserData, kRecvUserData) ||
+        !rut_iouring_gate_recv_user_data_changed(kRecvUserData, UINT64_C(0x1301)) ||
+        rut_iouring_gate_recv_user_data_changed(0u, UINT64_C(0x1301))) {
+        error = "recv-owner captured Recv identity predicates were incorrect";
+        return false;
+    }
+    if (!rut_iouring_gate_send_event_matches(kSendUserData, 2u) ||
+        rut_iouring_gate_send_event_matches(UINT64_C(0x1203), 2u) ||
+        !rut_iouring_gate_send_connection_matches(kRecvUserData, kSendUserData) ||
+        rut_iouring_gate_send_connection_matches(kRecvUserData, UINT64_C(0x1302)) ||
+        rut_iouring_gate_send_owner_matches(kRecvUserData, UINT64_C(0x1302), 2u) ||
+        rut_iouring_gate_send_owner_matches(0u, kSendUserData, 2u)) {
+        error = "recv-owner Send event/connection predicates were incorrect";
+        return false;
+    }
+    if (rut_iouring_gate_recv_owner_reason(0, kRecvUserData, UINT64_C(0x1301), kSendUserData, 2u) !=
+            RUT_IOURING_GATE_RECV_OWNER_REASON_RECV_SHAPE ||
+        rut_iouring_gate_recv_owner_reason(1, kRecvUserData, UINT64_C(0x1301), kSendUserData, 2u) !=
+            RUT_IOURING_GATE_RECV_OWNER_REASON_RECV_ID_CHANGED) {
+        error = "recv-owner shape-before-identity control was malformed";
+        return false;
+    }
+    if (rut_iouring_gate_recv_owner_reason(1, 0u, 0u, UINT64_C(0x1203), 2u) !=
+            RUT_IOURING_GATE_RECV_OWNER_REASON_RECV_MISSING_AT_SEND ||
+        rut_iouring_gate_recv_owner_reason(1, kRecvUserData, kRecvUserData, UINT64_C(0x1203), 2u) !=
+            RUT_IOURING_GATE_RECV_OWNER_REASON_SEND_OWNER_MISMATCH) {
+        error = "recv-owner missing-Recv-before-Send-event control was malformed";
         return false;
     }
     const auto reap_bounded = [](pid_t child, int* status) {

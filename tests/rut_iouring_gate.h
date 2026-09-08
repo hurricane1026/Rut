@@ -87,12 +87,55 @@ static inline int rut_iouring_gate_recv_shape_matches(uint32_t flags,
            (user_data & UINT64_C(0xff)) == expected_event;
 }
 
+static inline int rut_iouring_gate_recv_user_data_matches(uint64_t captured_recv_user_data,
+                                                          uint64_t current_recv_user_data) {
+    return captured_recv_user_data != 0 && captured_recv_user_data == current_recv_user_data;
+}
+
+static inline int rut_iouring_gate_recv_user_data_changed(uint64_t captured_recv_user_data,
+                                                          uint64_t current_recv_user_data) {
+    return captured_recv_user_data != 0 && !rut_iouring_gate_recv_user_data_matches(
+                                               captured_recv_user_data, current_recv_user_data);
+}
+
+static inline int rut_iouring_gate_recv_capture_present(uint64_t captured_recv_user_data) {
+    return captured_recv_user_data != 0;
+}
+
+static inline int rut_iouring_gate_send_event_matches(uint64_t current_send_user_data,
+                                                      uint32_t expected_event) {
+    return (current_send_user_data & UINT64_C(0xff)) == expected_event;
+}
+
+static inline int rut_iouring_gate_send_connection_matches(uint64_t captured_recv_user_data,
+                                                           uint64_t current_send_user_data) {
+    return rut_iouring_gate_recv_capture_present(captured_recv_user_data) &&
+           ((captured_recv_user_data >> 8) & UINT64_C(0xffffff)) ==
+               ((current_send_user_data >> 8) & UINT64_C(0xffffff));
+}
+
 static inline int rut_iouring_gate_send_owner_matches(uint64_t captured_recv_user_data,
                                                       uint64_t current_send_user_data,
                                                       uint32_t expected_event) {
-    return (current_send_user_data & UINT64_C(0xff)) == expected_event &&
-           ((captured_recv_user_data >> 8) & UINT64_C(0xffffff)) ==
-               ((current_send_user_data >> 8) & UINT64_C(0xffffff));
+    return rut_iouring_gate_send_event_matches(current_send_user_data, expected_event) &&
+           rut_iouring_gate_send_connection_matches(captured_recv_user_data,
+                                                    current_send_user_data);
+}
+
+static inline uint32_t rut_iouring_gate_recv_owner_reason(int recv_shape_matches,
+                                                          uint64_t captured_recv_user_data,
+                                                          uint64_t current_recv_user_data,
+                                                          uint64_t current_send_user_data,
+                                                          uint32_t expected_send_event) {
+    if (!recv_shape_matches) return RUT_IOURING_GATE_RECV_OWNER_REASON_RECV_SHAPE;
+    if (rut_iouring_gate_recv_user_data_changed(captured_recv_user_data, current_recv_user_data))
+        return RUT_IOURING_GATE_RECV_OWNER_REASON_RECV_ID_CHANGED;
+    if (!rut_iouring_gate_recv_capture_present(captured_recv_user_data))
+        return RUT_IOURING_GATE_RECV_OWNER_REASON_RECV_MISSING_AT_SEND;
+    if (!rut_iouring_gate_send_owner_matches(
+            captured_recv_user_data, current_send_user_data, expected_send_event))
+        return RUT_IOURING_GATE_RECV_OWNER_REASON_SEND_OWNER_MISMATCH;
+    return RUT_IOURING_GATE_RECV_OWNER_REASON_NONE;
 }
 
 struct rut_iouring_gate_connect_attempt {
