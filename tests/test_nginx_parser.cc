@@ -2601,7 +2601,7 @@ TEST(nginx_converter, rejects_explicit_proxy_buffering_on_before_lowering) {
     REQUIRE_FALSE(erased_result);
     CHECK(erased_result.error().detail.eq(lit_str("proxy_buffering metadata was erased")));
 
-    const auto expect_rejected = [](nginx::Server candidate) {
+    const auto expect_rejected = [&](nginx::Server candidate) {
         const auto result = nginx::lower_to_rut(candidate);
         REQUIRE_FALSE(result);
     };
@@ -2641,6 +2641,17 @@ TEST(nginx_converter, rejects_explicit_proxy_buffering_on_before_lowering) {
     REQUIRE_FALSE(wildcard_result);
     CHECK(wildcard_result.error().detail.eq(lit_str("proxy_buffering metadata was erased")));
 
+    const char hide_source[] =
+        "server { listen 8080; location / { proxy_hide_header X-Compat-Hidden; proxy_pass "
+        "http://127.0.0.1:9000; } }";
+    const auto hide_parsed = nginx::parse({hide_source, sizeof(hide_source) - 1u});
+    REQUIRE(hide_parsed);
+    auto hide_erased = hide_parsed.value();
+    hide_erased.location.proxy_hide_header = {};
+    const auto hide_result = nginx::lower_to_rut(hide_erased);
+    REQUIRE_FALSE(hide_result);
+    CHECK(hide_result.error().detail.eq(lit_str("invalid proxy location source syntax")));
+
     char corrupted_source[] =
         "server { listen 127.0.0.1:8080; location / { proxy_buffering on; "
         "proxy_pass http://127.0.0.1:9000; } }";
@@ -2662,13 +2673,18 @@ TEST(nginx_converter, http_profile_compares_proxy_buffering_metadata_before_lowe
     REQUIRE(parsed);
     const auto rejected = nginx::lower_to_rut(parsed.value());
     REQUIRE_FALSE(rejected);
-    CHECK(rejected.error().detail.eq(lit_str("proxy_buffering on is recognized but unsupported")) ||
-          rejected.error().detail.eq(lit_str("http profile metadata does not match its source")));
+    CHECK(rejected.error().detail.eq(lit_str("proxy_buffering on is recognized but unsupported")));
     auto erased = parsed.value();
     erased.server.location.proxy_buffering = {};
     const auto erased_result = nginx::lower_to_rut(erased);
     REQUIRE_FALSE(erased_result);
     CHECK(erased_result.error().detail.eq(
+        lit_str("http profile metadata does not match its source")));
+    auto shifted = parsed.value();
+    shifted.server.location.proxy_buffering.span.start++;
+    const auto shifted_result = nginx::lower_to_rut(shifted);
+    REQUIRE_FALSE(shifted_result);
+    CHECK(shifted_result.error().detail.eq(
         lit_str("http profile metadata does not match its source")));
 }
 

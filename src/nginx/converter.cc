@@ -376,21 +376,20 @@ FrontendResult<ProxyLocationProfile> validate_prefix_without_uri(const Server& s
         return unsupported(location.span, lit_str("invalid proxy location source syntax"));
     const ProxyHideHeader& header = location.proxy_hide_header;
     const bool hide_inventory = proxy_hide_header_has_inventory(header);
-    const bool buffering_inventory = proxy_buffering_has_inventory(location.proxy_buffering);
     const bool coherent_hide_span =
         header.present && is_valid_span(header.span) && span_contains(location.span, header.span) &&
         header.span.end < location.span.end &&
         !(header.span.start < proxy.span.end && proxy.span.start < header.span.end);
-    u32 first_directive_start = proxy.span.start;
-    if (coherent_hide_span && header.span.start < first_directive_start)
-        first_directive_start = header.span.start;
-    if (buffering_inventory && is_valid_span(location.proxy_buffering.span) &&
-        location.proxy_buffering.span.start < first_directive_start)
-        first_directive_start = location.proxy_buffering.span.start;
+    const u32 first_directive_start = coherent_hide_span && header.span.start < proxy.span.start
+                                          ? header.span.start
+                                          : proxy.span.start;
     u32 cursor = location.path_span.end;
     if (!advance_trusted_source_gap(
             source_base, cursor, hide_inventory ? location.span.end - 1u : first_directive_start) ||
-        cursor >= location.span.end - 1u || *trusted_source_at(source_base, cursor) != '{')
+        cursor >= location.span.end - 1u || *trusted_source_at(source_base, cursor) != '{' ||
+        (!hide_inventory &&
+         (!trusted_source_gap_is_exact(source_base, cursor + 1u, first_directive_start) ||
+          !trusted_source_gap_is_exact(source_base, proxy.span.end, location.span.end - 1u))))
         return unsupported(location.span, lit_str("invalid proxy location source syntax"));
     if (proxy.span.end - proxy.span.start < 13u ||
         !eq({trusted_source_at(source_base, proxy.span.start), 10u}, "proxy_pass", 10u) ||
