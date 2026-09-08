@@ -54881,7 +54881,8 @@ static bool validate_positive_get_default_profile(const std::string& profile,
 
 static std::string make_explicit_timeout_head_profile(u16 frontend_port,
                                                       u16 backend_port,
-                                                      const std::string& access_path) {
+                                                      const std::string& access_path,
+                                                      bool explicit_buffering_on = false) {
     return "http {\n"
            "  log_format compat \"$request_length\";\n"
            "  access_log " +
@@ -54891,9 +54892,9 @@ static std::string make_explicit_timeout_head_profile(u16 frontend_port,
            "    listen 127.0.0.1:" +
            std::to_string(frontend_port) +
            ";\n"
-           "    location / {\n"
-           "      proxy_pass http://127.0.0.1:" +
-           std::to_string(backend_port) +
+           "    location / {\n" +
+           (explicit_buffering_on ? "      proxy_buffering on;\n" : "") +
+           "      proxy_pass http://127.0.0.1:" + std::to_string(backend_port) +
            ";\n"
            "      proxy_read_timeout 1s;\n"
            "    }\n"
@@ -54905,7 +54906,8 @@ static bool validate_explicit_timeout_head_profile(const std::string& profile,
                                                    u16 frontend_port,
                                                    u16 backend_port,
                                                    const std::string& access_path,
-                                                   std::string& error) {
+                                                   std::string& error,
+                                                   bool explicit_buffering_on = false) {
     const std::string listener = "listen 127.0.0.1:" + std::to_string(frontend_port) + ";";
     const std::string upstream =
         "proxy_pass http://127.0.0.1:" + std::to_string(backend_port) + ";";
@@ -54917,7 +54919,7 @@ static bool validate_explicit_timeout_head_profile(const std::string& profile,
         count_text(profile, "access_log " + access_path + " compat;") != 1u ||
         count_text(profile, listener) != 1u || count_text(profile, upstream) != 1u ||
         count_text(profile, "proxy_read_timeout 1s;") != 1u ||
-        profile.find("proxy_buffering") != std::string::npos ||
+        count_text(profile, "proxy_buffering on;") != (explicit_buffering_on ? 1u : 0u) ||
         profile.find("proxy_request_buffering") != std::string::npos ||
         profile.find("proxy_http_version") != std::string::npos ||
         profile.find("proxy_set_header") != std::string::npos ||
@@ -55641,7 +55643,8 @@ static bool build_explicit_timeout_head_generated_source(const std::string& prof
                                                          u16 backend_port,
                                                          const std::string& access_path,
                                                          std::string& source,
-                                                         std::string& error) {
+                                                         std::string& error,
+                                                         bool explicit_buffering_on = false) {
     std::string owned_profile = profile;
     const auto parsed = rut::nginx::parse_http_profile(
         {owned_profile.data(), static_cast<rut::u32>(owned_profile.size())});
@@ -55651,7 +55654,8 @@ static bool build_explicit_timeout_head_generated_source(const std::string& prof
         parsed.value().server.location.proxy_pass.port != backend_port ||
         parsed.value().server.location.proxy_pass.has_uri ||
         !parsed.value().server.location.proxy_read_timeout.present ||
-        parsed.value().server.location.proxy_read_timeout.milliseconds != 1000u) {
+        parsed.value().server.location.proxy_read_timeout.milliseconds != 1000u ||
+        parsed.value().server.location.proxy_buffering.present != explicit_buffering_on) {
         error = "#270 explicit-timeout HEAD profile did not retain its semantic model";
         return false;
     }
@@ -59654,7 +59658,10 @@ static bool run_converter_default_buffering_incomplete_clean_eof_differential(
 }
 
 static bool run_converter_default_buffering_incomplete_body_inactivity_expiry_differential(
-    const char* rut_path, const std::string& container_name, std::string& error) {
+    const char* rut_path,
+    const std::string& container_name,
+    std::string& error,
+    bool explicit_buffering_on = false) {
     if (rut_path == nullptr || rut_path[0] != '/' || access(rut_path, X_OK) != 0) {
         error = "#271 inactivity differential requires an executable absolute RUT path";
         return false;
@@ -59676,28 +59683,58 @@ static bool run_converter_default_buffering_incomplete_body_inactivity_expiry_di
     }
 
     const std::string profiles[2] = {
-        make_explicit_timeout_head_profile(ports[0], ports[1], temps[0].nginx_access_log),
-        make_explicit_timeout_head_profile(ports[2], ports[3], temps[1].rut_access_log),
+        make_explicit_timeout_head_profile(
+            ports[0], ports[1], temps[0].nginx_access_log, explicit_buffering_on),
+        make_explicit_timeout_head_profile(
+            ports[2], ports[3], temps[1].rut_access_log, explicit_buffering_on),
     };
     const std::string nginx_config = "events {}\n" + profiles[0];
-    if (!validate_explicit_timeout_head_profile(
-            profiles[0], ports[0], ports[1], temps[0].nginx_access_log, error) ||
-        !validate_explicit_timeout_head_profile(
-            profiles[1], ports[2], ports[3], temps[1].rut_access_log, error) ||
+    if (!validate_explicit_timeout_head_profile(profiles[0],
+                                                ports[0],
+                                                ports[1],
+                                                temps[0].nginx_access_log,
+                                                error,
+                                                explicit_buffering_on) ||
+        !validate_explicit_timeout_head_profile(profiles[1],
+                                                ports[2],
+                                                ports[3],
+                                                temps[1].rut_access_log,
+                                                error,
+                                                explicit_buffering_on) ||
         count_text(nginx_config, "events {}\n") != 1u ||
         nginx_config.rfind("events {}\nhttp {\n", 0u) != 0u) {
         if (error.empty()) error = "#271 inactivity pinned nginx wrapper lost its one events block";
         return false;
     }
     std::string generated_source;
-    if (!build_explicit_timeout_head_generated_source(
-            profiles[1], ports[2], ports[3], temps[1].rut_access_log, generated_source, error) ||
+    if (!build_explicit_timeout_head_generated_source(profiles[1],
+                                                      ports[2],
+                                                      ports[3],
+                                                      temps[1].rut_access_log,
+                                                      generated_source,
+                                                      error,
+                                                      explicit_buffering_on) ||
         !validate_explicit_timeout_get_generated_provenance(
             generated_source, ports[2], ports[3], temps[1].rut_access_log, error) ||
         !write_file(temps[0].nginx_config, nginx_config.data(), nginx_config.size()) ||
         !write_file(temps[1].source, generated_source.data(), generated_source.size())) {
         if (error.empty()) error = "#271 inactivity differential could not persist exact inputs";
         return false;
+    }
+    if (explicit_buffering_on) {
+        const std::string omitted_profile =
+            make_explicit_timeout_head_profile(ports[2], ports[3], temps[1].rut_access_log);
+        std::string omitted_source;
+        if (!build_explicit_timeout_head_generated_source(omitted_profile,
+                                                          ports[2],
+                                                          ports[3],
+                                                          temps[1].rut_access_log,
+                                                          omitted_source,
+                                                          error) ||
+            generated_source != omitted_source) {
+            if (error.empty()) error = "#572 explicit-on generated source differed from omitted";
+            return false;
+        }
     }
 
     Recorder origins[2];
@@ -72281,6 +72318,12 @@ int main(int argc, char** argv) {
         argc == 3 &&
         strcmp(argv[1],
                "--converter-default-buffering-incomplete-body-inactivity-expiry-differential") == 0;
+    const bool converter_explicit_buffering_on_incomplete_body_inactivity_expiry_differential =
+        argc == 3 &&
+        strcmp(
+            argv[1],
+            "--converter-explicit-buffering-on-incomplete-body-inactivity-expiry-differential") ==
+            0;
     const bool converter_default_buffering_201_incomplete_body_inactivity_expiry_differential =
         argc == 3 &&
         strcmp(
@@ -72594,6 +72637,7 @@ int main(int argc, char** argv) {
          !converter_default_buffering_positive_get_differential &&
          !converter_default_buffering_incomplete_clean_eof_differential &&
          !converter_default_buffering_incomplete_body_inactivity_expiry_differential &&
+         !converter_explicit_buffering_on_incomplete_body_inactivity_expiry_differential &&
          !converter_default_buffering_201_incomplete_body_inactivity_expiry_differential &&
          !converter_default_buffering_202_incomplete_body_inactivity_expiry_differential &&
          !converter_default_buffering_304_content_length_metadata_differential &&
@@ -72702,6 +72746,7 @@ int main(int argc, char** argv) {
         ((converter_default_buffering_positive_get_differential ||
           converter_default_buffering_incomplete_clean_eof_differential ||
           converter_default_buffering_incomplete_body_inactivity_expiry_differential ||
+          converter_explicit_buffering_on_incomplete_body_inactivity_expiry_differential ||
           converter_default_buffering_201_incomplete_body_inactivity_expiry_differential ||
           converter_default_buffering_304_content_length_metadata_differential ||
           converter_default_buffering_206_range_completion_differential ||
@@ -74346,6 +74391,22 @@ int main(int argc, char** argv) {
                "custody for ID1/1s/CompleteContentLength and its 200/502/504 policy bundle. This "
                "does not claim body-progress refresh, other schedules/framing/status/methods, "
                "complete buffering, reset/error, retry/reuse, TLS, H2, or broad #271 support.\n";
+        return 0;
+    }
+    if (converter_explicit_buffering_on_incomplete_body_inactivity_expiry_differential) {
+        const std::string container_name = "rut-nginx-572-explicit-on-inactivity-" +
+                                           std::to_string(getpid()) + "-" +
+                                           (suffix ? suffix + 1 : "tmp");
+        std::string differential_error;
+        if (!run_converter_default_buffering_incomplete_body_inactivity_expiry_differential(
+                argv[2], container_name, differential_error, true)) {
+            std::cerr << "FAIL [#572 explicit proxy_buffering on incomplete-body inactivity "
+                         "expiry differential]: "
+                      << differential_error << "\n";
+            return 1;
+        }
+        std::cerr << "PASS: #572 authenticated explicit proxy_buffering on and omitted buffering "
+                     "generated equal ordinary RUT and matched pinned nginx inactivity expiry\n";
         return 0;
     }
     if (converter_default_buffering_201_incomplete_body_inactivity_expiry_differential) {

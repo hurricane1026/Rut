@@ -323,7 +323,7 @@ FrontendResult<bool> validate_proxy_buffering(const Server& server) {
         buffering.span.end >= location.span.end)
         return unsupported(is_valid_span(buffering.span) ? buffering.span : location.span,
                            lit_str("invalid proxy_buffering model"));
-    return unsupported(buffering.span, lit_str("proxy_buffering on is recognized but unsupported"));
+    return true;
 }
 
 FrontendResult<ProxyLocationProfile> validate_prefix_without_uri(const Server& server) {
@@ -380,16 +380,32 @@ FrontendResult<ProxyLocationProfile> validate_prefix_without_uri(const Server& s
         header.present && is_valid_span(header.span) && span_contains(location.span, header.span) &&
         header.span.end < location.span.end &&
         !(header.span.start < proxy.span.end && proxy.span.start < header.span.end);
-    const u32 first_directive_start = coherent_hide_span && header.span.start < proxy.span.start
-                                          ? header.span.start
-                                          : proxy.span.start;
+    const ProxyBuffering& buffering = location.proxy_buffering;
+    const bool coherent_buffering_span =
+        buffering.present && is_valid_span(buffering.span) &&
+        span_contains(location.span, buffering.span) && buffering.span.end < location.span.end &&
+        !(buffering.span.start < proxy.span.end && proxy.span.start < buffering.span.end);
+    u32 first_directive_start = proxy.span.start;
+    if (coherent_hide_span && header.span.start < first_directive_start)
+        first_directive_start = header.span.start;
+    if (coherent_buffering_span && buffering.span.start < first_directive_start)
+        first_directive_start = buffering.span.start;
     u32 cursor = location.path_span.end;
     if (!advance_trusted_source_gap(
             source_base, cursor, hide_inventory ? location.span.end - 1u : first_directive_start) ||
         cursor >= location.span.end - 1u || *trusted_source_at(source_base, cursor) != '{' ||
         (!hide_inventory &&
          (!trusted_source_gap_is_exact(source_base, cursor + 1u, first_directive_start) ||
-          !trusted_source_gap_is_exact(source_base, proxy.span.end, location.span.end - 1u))))
+          (coherent_buffering_span && buffering.span.start < proxy.span.start
+               ? !trusted_source_gap_is_exact(source_base, buffering.span.end, proxy.span.start)
+               : (coherent_buffering_span &&
+                  !trusted_source_gap_is_exact(
+                      source_base, proxy.span.end, buffering.span.start))) ||
+          !trusted_source_gap_is_exact(
+              source_base,
+              coherent_buffering_span && buffering.span.end > proxy.span.end ? buffering.span.end
+                                                                             : proxy.span.end,
+              location.span.end - 1u))))
         return unsupported(location.span, lit_str("invalid proxy location source syntax"));
     if (proxy.span.end - proxy.span.start < 13u ||
         !eq({trusted_source_at(source_base, proxy.span.start), 10u}, "proxy_pass", 10u) ||
@@ -2160,6 +2176,16 @@ FrontendResult<RutSource> lower_to_rut(const Server& server) {
                            lit_str("exact no-content return requires location / fallback"));
     auto proxy_buffering = validate_proxy_buffering(server);
     if (!proxy_buffering) return core::make_unexpected(proxy_buffering.error());
+    const bool explicit_buffering_on = proxy_buffering.value();
+    if (explicit_buffering_on &&
+        !(is_root && exact_listener && server.listen.address == ListenerAddress::IPv4Exact &&
+          server.listen.ipv4_host == 0x7f000001u && timeout_present &&
+          server.location.proxy_read_timeout.milliseconds >= 1000u &&
+          server.location.proxy_read_timeout.milliseconds <= 63000u && !hide_compat_header &&
+          !has_sibling_action))
+        return unsupported(
+            server.location.proxy_buffering.span,
+            lit_str("proxy_buffering on requires the bounded timeout proxy profile"));
     RutSource output{};
     Writer writer(output);
     auto put = [&](const char* text) {
