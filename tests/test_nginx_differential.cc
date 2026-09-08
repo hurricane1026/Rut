@@ -51715,6 +51715,8 @@ static bool run_converter_request_length_rut_side(TempDir& temp,
     if (require_peer_retirement &&
         (!live_with_counts(1u) || response_sent_ns == 0u ||
          !backend.response_peer_closed.load(std::memory_order_acquire) ||
+         (retained_header_whitespace &&
+          backend.response_peer_close_count.load(std::memory_order_acquire) != 1u) ||
          response_peer_closed_ns < response_sent_ns ||
          response_peer_closed_ns - response_sent_ns > 2'000'000'000ull ||
          backend.response_peer_unexpected_data.load(std::memory_order_acquire) ||
@@ -51756,6 +51758,8 @@ static bool run_converter_request_length_rut_side(TempDir& temp,
             (require_peer_retirement &&
              (stable_sent_ns != response_sent_ns || stable_closed_ns != response_peer_closed_ns ||
               !backend.response_peer_closed.load(std::memory_order_acquire) ||
+              (retained_header_whitespace &&
+               backend.response_peer_close_count.load(std::memory_order_acquire) != 1u) ||
               backend.response_peer_unexpected_data.load(std::memory_order_acquire) ||
               backend.response_peer_observation_failed.load(std::memory_order_acquire))) ||
             !read_request_length_access_file(temp.rut_access_log, access_bytes, error) ||
