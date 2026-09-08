@@ -795,6 +795,83 @@ TEST(nginx_complete_parser, rebases_http_errors_and_rejects_envelope_shapes) {
     CHECK(old_parse.error().detail.eq(lit_str("http/events wrappers are unsupported")));
 }
 
+TEST(nginx_complete_converter, authenticates_complete_source_before_lowering) {
+    nginx::NginxHttpConfig empty{};
+    REQUIRE_FALSE(nginx::lower_to_rut(empty));
+    empty.source = {reinterpret_cast<const char*>(UINTPTR_MAX), 1u};
+    REQUIRE_FALSE(nginx::lower_to_rut(empty));
+
+    std::string source =
+        "# leading\n"
+        "events {}\n"
+        "http {\n"
+        "  log_format compat \"$request_length\";\n"
+        "  access_log /tmp/rut-complete-lowering.log compat;\n"
+        "  server {\n"
+        "    listen 127.0.0.1:8080;\n"
+        "    location / {\n"
+        "      proxy_pass http://127.0.0.1:9000;\n"
+        "      proxy_read_timeout 1s;\n"
+        "      proxy_buffering on;\n"
+        "    }\n"
+        "  }\n"
+        "}\n";
+    auto parsed = nginx::parse_nginx_http_config({source.data(), static_cast<u32>(source.size())});
+    REQUIRE(parsed);
+    auto lowered = nginx::lower_to_rut(parsed.value());
+    REQUIRE(lowered);
+    const auto suffix_lowered = nginx::lower_to_rut(parsed.value().http);
+    REQUIRE(suffix_lowered);
+    const std::string owned(lowered.value().data, lowered.value().len);
+    CHECK_EQ(owned, std::string(suffix_lowered.value().data, suffix_lowered.value().len));
+    CHECK_EQ(owned.size(), lowered.value().len);
+
+    const std::string original = source;
+    std::fill(source.begin(), source.end(), 'x');
+    CHECK_EQ(std::string(lowered.value().data, lowered.value().len), owned);
+    source = original;
+
+    auto forged = parsed.value();
+    forged.span.end--;
+    auto rejected = nginx::lower_to_rut(forged);
+    REQUIRE_FALSE(rejected);
+    CHECK(rejected.error().detail.eq(lit_str("nginx config metadata does not match its source")));
+    forged = parsed.value();
+    forged.events_span.start++;
+    rejected = nginx::lower_to_rut(forged);
+    REQUIRE_FALSE(rejected);
+    forged = parsed.value();
+    forged.http_span.start++;
+    rejected = nginx::lower_to_rut(forged);
+    REQUIRE_FALSE(rejected);
+    forged = parsed.value();
+    forged.http.server.location.path.ptr = reinterpret_cast<const char*>(static_cast<uintptr_t>(1));
+    rejected = nginx::lower_to_rut(forged);
+    REQUIRE_FALSE(rejected);
+    CHECK(rejected.error().detail.eq(lit_str("http profile metadata does not match its source")));
+}
+
+TEST(nginx_complete_converter, rebases_lowering_diagnostics_to_complete_source) {
+    const std::string source =
+        "events {}\n"
+        "http {\n"
+        "  log_format compat \"$request_length\";\n"
+        "  access_log /tmp/rut-complete-lowering.log compat;\n"
+        "  server { listen 127.0.0.1:8080; location / { proxy_pass http://127.0.0.1:9000; "
+        "proxy_read_timeout 64s; proxy_buffering on; } }\n"
+        "}\n";
+    const auto parsed =
+        nginx::parse_nginx_http_config({source.data(), static_cast<u32>(source.size())});
+    REQUIRE(parsed);
+    const auto rejected = nginx::lower_to_rut(parsed.value());
+    REQUIRE_FALSE(rejected);
+    CHECK_EQ(rejected.error().code, FrontendError::UnsupportedSyntax);
+    CHECK(rejected.error().span.start >= parsed.value().http_span.start);
+    CHECK(rejected.error().span.end <= parsed.value().http_span.end);
+    CHECK(rejected.error().detail.eq(
+        lit_str("proxy_buffering on requires the bounded timeout proxy profile")));
+}
+
 TEST(nginx_http_profile_parser,
      accepts_allowed_gaps_server_orders_and_retains_only_borrowed_lifetime_metadata) {
     const std::string listen_first =
