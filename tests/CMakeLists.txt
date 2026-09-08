@@ -690,6 +690,7 @@ target_include_directories(test_nginx_convert PRIVATE
     ${PROJECT_SOURCE_DIR}/include
     ${PROJECT_SOURCE_DIR}/testing
 )
+add_dependencies(test_nginx_convert rut-nginx-convert)
 add_test(NAME test_nginx_convert COMMAND test_nginx_convert $<TARGET_FILE:rut-nginx-convert>)
 set_tests_properties(test_nginx_convert PROPERTIES LABELS "unit;nginx;converter")
 
@@ -886,7 +887,11 @@ if(RUT_ENABLE_JIT)
     target_compile_definitions(test_nginx_differential PRIVATE
         "RUT_PINNED_NGINX_IMAGE=\"${_RUT_PINNED_NGINX_IMAGE}\""
     )
-    add_dependencies(test_nginx_differential rut test_nginx_downstream_gate_preload)
+    add_dependencies(test_nginx_differential
+        rut
+        rut-nginx-convert
+        test_nginx_downstream_gate_preload
+    )
     if(TARGET test_rut_iouring_gate_preload)
         add_dependencies(test_nginx_differential test_rut_iouring_gate_preload)
     endif()

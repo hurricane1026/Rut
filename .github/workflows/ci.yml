@@ -184,7 +184,7 @@ jobs:
             -DLLVM_DIR=/usr/lib/llvm-21/lib/cmake/llvm
 
       - name: Build nginx differential targets
-        run: ninja -C build test_nginx_parser test_nginx_differential
+        run: ninja -C build test_nginx_parser test_nginx_convert test_nginx_differential
 
       - name: Test required nginx differentials
         run: |
