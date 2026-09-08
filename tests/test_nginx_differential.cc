@@ -1104,6 +1104,39 @@ static bool read_bounded_file(const std::string& path, std::string& contents, st
     return true;
 }
 
+static bool remove_preload_container_bounded(const std::string& name) {
+    for (unsigned attempt = 0u; attempt < 2u; attempt++) {
+        ChildGuard remover;
+        if (!spawn_child({"docker", "rm", "-f", name}, "/dev/null", remover.child)) return false;
+        if (!wait_child(remover.child, 10'000)) {
+            (void)stop_child(remover.child);
+            continue;
+        }
+        const bool removed = remover.child.status_valid && WIFEXITED(remover.child.status) &&
+                             WEXITSTATUS(remover.child.status) == 0;
+        remover.child.pid = -1;
+        if (removed) return true;
+    }
+    return false;
+}
+
+struct PreloadContainerGuard {
+    explicit PreloadContainerGuard(std::string name) : name(std::move(name)) {}
+    std::string name;
+    bool active = true;
+
+    bool remove() {
+        if (!active) return true;
+        const bool removed = remove_preload_container_bounded(name);
+        active = false;
+        return removed;
+    }
+
+    ~PreloadContainerGuard() {
+        if (active) (void)remove_preload_container_bounded(name);
+    }
+};
+
 static bool run_pinned_nginx_preload_loader(const std::string& preload_path,
                                             const std::string& log_path,
                                             bool expect_success,
@@ -1119,7 +1152,7 @@ static bool run_pinned_nginx_preload_loader(const std::string& preload_path,
     const std::string container_name =
         "rut-nginx-574-preflight-" + std::to_string(getpid()) + "-" +
         std::to_string(serial.fetch_add(1u, std::memory_order_relaxed));
-    DockerGuard docker(container_name);
+    PreloadContainerGuard docker(container_name);
     Child child;
     if (!spawn_child({"docker",
                       "run",
