@@ -2358,9 +2358,19 @@ FrontendResult<HttpProfileRutSource> lower_to_rut(const HttpProfile& profile) {
         return unsupported(comparison.mismatch,
                            lit_str("http profile metadata does not match its source"));
 
-    if (!access_log_sink_path_valid(fresh.access_log.path))
-        return unsupported(fresh.access_log.path_span,
-                           lit_str("invalid access log sink path model"));
+    switch (fresh.access_log.destination_profile) {
+        case AccessLogDestinationProfile::FilePath:
+            if (!access_log_sink_path_valid(fresh.access_log.path))
+                return unsupported(fresh.access_log.path_span,
+                                   lit_str("invalid access log sink path model"));
+            break;
+        case AccessLogDestinationProfile::Off:
+            break;
+        case AccessLogDestinationProfile::None:
+        default:
+            return unsupported(fresh.access_log.span,
+                               lit_str("invalid access log destination model"));
+    }
 
     auto server_source = lower_to_rut(fresh.server);
     if (!server_source) return core::make_unexpected(server_source.error());
@@ -2382,8 +2392,9 @@ FrontendResult<HttpProfileRutSource> lower_to_rut(const HttpProfile& profile) {
         output.len += text.len;
         return true;
     };
-    if (!put({kAccessLogPrefix, sizeof(kAccessLogPrefix) - 1u}) || !put(fresh.access_log.path) ||
-        !put({kAccessLogSuffix, sizeof(kAccessLogSuffix) - 1u}) ||
+    if ((fresh.access_log.destination_profile == AccessLogDestinationProfile::FilePath &&
+         (!put({kAccessLogPrefix, sizeof(kAccessLogPrefix) - 1u}) || !put(fresh.access_log.path) ||
+          !put({kAccessLogSuffix, sizeof(kAccessLogSuffix) - 1u}))) ||
         !put(server_source.value().view()))
         return out_of_memory(fresh.span, lit_str("generated RUT http profile source is too large"));
     output.data[output.len] = '\0';

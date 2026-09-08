@@ -39,6 +39,10 @@ nginx.conf parser. It exists so http-context logging declarations and their
 server can share one source/provenance root. Parsing this profile does not imply
 lowering support beyond the bounded access-log profile; the closed #363
 publication capability is used only for this exact model.
+The explicit literal `access_log off;` profile now converts to the same owned
+ordinary server source without an `accessLog` declaration. This is conversion
+admission only: logging-absence behavior has not been demonstrated against
+nginx, and runtime logging overrides remain outside the contract.
 
 ## Standalone conversion command
 
@@ -52,7 +56,8 @@ rut-nginx-convert --format nginx-http <input-file>
 ```
 
 `server` accepts one bare server fragment and `http` accepts one bounded
-`http {}` profile with the existing `log_format`/`access_log` declarations.
+`http {}` profile with the existing `log_format`/`access_log` declarations or
+the explicit literal `access_log off;` form.
 `nginx-http` accepts exactly one empty `events {}` block followed by that same
 bounded logged HTTP profile. This is complete-file envelope admission, not a
 claim that an empty events block is semantically inert or that arbitrary

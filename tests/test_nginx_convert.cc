@@ -7,6 +7,8 @@
 #include <cstdlib>
 #include <cstring>
 #include <string>
+#include <utility>
+#include <vector>
 
 #include <fcntl.h>
 #include <signal.h>
@@ -253,6 +255,71 @@ TEST(nginx_convert, server_and_http_outputs_match_api_without_opening_access_log
     CHECK(http_run.err.empty());
     CHECK(http_run.out == std::string(http_lowered.value().data, http_lowered.value().len));
     CHECK(access(access_path.c_str(), F_OK) != 0);
+}
+
+TEST(nginx_convert, access_log_off_cli_matches_server_output_without_log_declaration) {
+    const std::string directory = make_temp_dir();
+    REQUIRE_FALSE(directory.empty());
+    const std::string server_source =
+        "server { listen 127.0.0.1:8080; location / { proxy_pass http://127.0.0.1:9000; } }\n";
+    const std::string http_source =
+        "http { access_log off; server { listen 127.0.0.1:8080; location / { "
+        "proxy_pass http://127.0.0.1:9000; } } }\n";
+    const std::string complete_source = "events {}\n" + http_source;
+    const std::string server_path = directory + "/server.conf";
+    const std::string http_path = directory + "/off-http.conf";
+    const std::string complete_path = directory + "/off-complete.conf";
+    REQUIRE(write_file(server_path, server_source));
+    REQUIRE(write_file(http_path, http_source));
+    REQUIRE(write_file(complete_path, complete_source));
+
+    const auto server_parsed =
+        rut::nginx::parse({server_source.data(), static_cast<rut::u32>(server_source.size())});
+    REQUIRE(server_parsed);
+    const auto server_lowered = rut::nginx::lower_to_rut(server_parsed.value());
+    REQUIRE(server_lowered);
+    const std::string expected(server_lowered.value().data, server_lowered.value().len);
+
+    for (const auto& invocation :
+         {std::pair<const char*, std::string>{"http", http_path}, {"nginx-http", complete_path}}) {
+        const RunResult result =
+            run_converter(g_executable, invocation.first, invocation.second, invocation.second);
+        REQUIRE(WIFEXITED(result.status));
+        CHECK_EQ(WEXITSTATUS(result.status), 0);
+        CHECK(result.err.empty());
+        CHECK_EQ(result.out, expected);
+        CHECK_EQ(result.out.find("accessLog {"), std::string::npos);
+    }
+}
+
+TEST(nginx_convert, access_log_off_cli_rejects_unsupported_forms_without_stdout) {
+    const std::string directory = make_temp_dir();
+    REQUIRE_FALSE(directory.empty());
+    const std::string server =
+        "server { listen 127.0.0.1:8080; location / { proxy_pass http://127.0.0.1:9000; } }";
+    const std::vector<std::pair<std::string, std::string>> cases = {
+        {"mixed", "http { log_format compat \"$request_length\"; access_log off; " + server + " }"},
+        {"options", "http { access_log off buffer=32k; " + server + " }"},
+        {"nested",
+         "http { access_log off; server { access_log off; listen 127.0.0.1:8080; "
+         "location / { proxy_pass http://127.0.0.1:9000; } } }"},
+    };
+    for (const auto& test_case : cases) {
+        const std::string http_path = directory + "/" + test_case.first + ".conf";
+        const std::string complete_path = directory + "/" + test_case.first + "-complete.conf";
+        const std::string complete = "events {}\n" + test_case.second;
+        REQUIRE(write_file(http_path, test_case.second));
+        REQUIRE(write_file(complete_path, complete));
+        for (const auto& invocation : {std::pair<const char*, std::string>{"http", http_path},
+                                       {"nginx-http", complete_path}}) {
+            const RunResult result =
+                run_converter(g_executable, invocation.first, invocation.second, invocation.second);
+            REQUIRE(WIFEXITED(result.status));
+            CHECK_EQ(WEXITSTATUS(result.status), 1);
+            CHECK(result.out.empty());
+            CHECK(result.err.find(invocation.second + ":") == 0u);
+        }
+    }
 }
 
 TEST(nginx_convert, nginx_http_output_matches_complete_api_and_rejects_unsupported_envelopes) {
