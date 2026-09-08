@@ -44,6 +44,10 @@ using rut::u64;
 #error "RUT_PINNED_NGINX_IMAGE must be provided by the build system"
 #endif
 
+static bool read_request_length_access_file(const std::string& path,
+                                            std::string& contents,
+                                            std::string& error);
+
 namespace {
 
 static constexpr const char* kNginxImage = RUT_PINNED_NGINX_IMAGE;
@@ -5646,24 +5650,31 @@ static bool capture_nginx_default_buffering_timeout(u16 frontend_port,
                                                     u32 request_len,
                                                     const char* expected_response_normalized,
                                                     DefaultBufferingTimeoutObservation& observation,
-                                                    std::string& error) {
+                                                    std::string& error,
+                                                    const std::string* access_path = nullptr,
+                                                    const std::string* access_mount_dir = nullptr,
+                                                    int* held_frontend_fd = nullptr) {
     DockerGuard docker(container_name);
     ChildGuard nginx;
-    if (!spawn_child({"docker",
-                      "run",
-                      "--pull=never",
-                      "--network",
-                      "host",
-                      "--name",
-                      container_name,
-                      "-v",
-                      nginx_config_path + ":/etc/nginx/nginx.conf:ro",
-                      kNginxImage,
-                      "nginx",
-                      "-g",
-                      "daemon off;"},
-                     nginx_log_path,
-                     nginx.child)) {
+    if (held_frontend_fd != nullptr &&
+        !handoff_held_loopback_port(
+            held_frontend_fd, frontend_port, "default-buffering timeout nginx bind", error))
+        return false;
+    std::vector<std::string> docker_args = {"docker",
+                                            "run",
+                                            "--pull=never",
+                                            "--network",
+                                            "host",
+                                            "--name",
+                                            container_name,
+                                            "-v",
+                                            nginx_config_path + ":/etc/nginx/nginx.conf:ro"};
+    if (access_mount_dir != nullptr) {
+        docker_args.push_back("-v");
+        docker_args.push_back(*access_mount_dir + ":" + *access_mount_dir);
+    }
+    docker_args.insert(docker_args.end(), {kNginxImage, "nginx", "-g", "daemon off;"});
+    if (!spawn_child(docker_args, nginx_log_path, nginx.child)) {
         error = "failed to start pinned nginx for default-buffering timeout baseline";
         return false;
     }
@@ -5807,6 +5818,29 @@ static bool capture_nginx_default_buffering_timeout(u16 frontend_port,
         recorder.response_peer_observation_failed.load(std::memory_order_acquire)) {
         error = "default-buffering timeout saw retry or incomplete origin evidence";
         return false;
+    }
+
+    if (access_path != nullptr) {
+        std::string access;
+        if (poll_child(nginx.child) || !recorder.running.load(std::memory_order_acquire) ||
+            !recorder.thread_alive.load(std::memory_order_acquire) ||
+            recorder.listener_failed.load(std::memory_order_acquire) ||
+            recorder.accepted.load(std::memory_order_acquire) != 1u ||
+            recorder.requests.load(std::memory_order_acquire) != 1u ||
+            recorder.response_send_all_calls.load(std::memory_order_acquire) != 1u ||
+            !recorder.response_send_succeeded.load(std::memory_order_acquire) ||
+            !recorder.response_peer_closed.load(std::memory_order_acquire) ||
+            recorder.response_peer_close_count.load(std::memory_order_acquire) != 1u ||
+            recorder.response_send_failed.load(std::memory_order_acquire) ||
+            recorder.response_peer_unexpected_data.load(std::memory_order_acquire) ||
+            recorder.response_peer_observation_failed.load(std::memory_order_acquire) ||
+            !recorder.response_clean_shutdown.load(std::memory_order_acquire) ||
+            !recorder.response_connection_closed.load(std::memory_order_acquire) ||
+            !read_request_length_access_file(*access_path, access, error) || access != "60\n") {
+            if (error.empty())
+                error = "default-buffering exact pre-teardown access/liveness evidence failed";
+            return false;
+        }
     }
 
     const bool nginx_stopped = stop_child(nginx.child);
@@ -61055,6 +61089,205 @@ static bool run_pinned_nginx_default_buffering_201_incomplete_body_inactivity_ex
     return true;
 }
 
+static bool run_pinned_nginx_explicit_buffering_on_baseline_oracle(
+    TempDir& temp, const std::string& container_name, std::string& error) {
+    HeldLoopbackPorts reservations;
+    u16 ports[4]{};
+    for (size_t index = 0u; index < std::size(ports); index++) {
+        if (!reservations.reserve_four_digit(index, ports[index])) {
+            error = "#271 explicit proxy_buffering on baseline could not reserve four ports";
+            return false;
+        }
+    }
+    const std::string omitted_config_path = std::string(temp.path) + "/omitted-buffering.conf";
+    const std::string explicit_config_path = std::string(temp.path) + "/explicit-buffering-on.conf";
+    const std::string omitted_log_path = std::string(temp.path) + "/omitted-buffering.log";
+    const std::string explicit_log_path = std::string(temp.path) + "/explicit-buffering-on.log";
+    const std::string omitted_access_path = std::string(temp.path) + "/omitted-buffering.access";
+    const std::string explicit_access_path =
+        std::string(temp.path) + "/explicit-buffering-on.access";
+    const auto make_config =
+        [&](u16 frontend_port, u16 backend_port, const std::string& access_path, bool explicit_on) {
+            return "events {}\nhttp {\n  log_format compat \"$request_length\";\n  access_log " +
+                   access_path +
+                   " compat;\n  server {\n    listen 127.0.0.1:" + std::to_string(frontend_port) +
+                   ";\n    location / {\n      proxy_pass http://127.0.0.1:" +
+                   std::to_string(backend_port) + ";\n      proxy_read_timeout 1s;\n" +
+                   (explicit_on ? "      proxy_buffering on;\n" : "") + "    }\n  }\n}\n";
+        };
+    const std::string omitted_config = make_config(ports[0], ports[1], omitted_access_path, false);
+    const std::string explicit_config = make_config(ports[2], ports[3], explicit_access_path, true);
+    const auto validate_config = [&](const std::string& config,
+                                     u16 frontend_port,
+                                     u16 backend_port,
+                                     const std::string& access_path,
+                                     bool explicit_on) {
+        const std::string expected =
+            make_config(frontend_port, backend_port, access_path, explicit_on);
+        const std::string listener = "listen 127.0.0.1:" + std::to_string(frontend_port) + ";";
+        const std::string upstream =
+            "proxy_pass http://127.0.0.1:" + std::to_string(backend_port) + ";";
+        return config == expected && count_text(config, "events {}\n") == 1u &&
+               config.rfind("events {}\nhttp {\n", 0u) == 0u &&
+               count_text(config, "http {") == 1u && count_text(config, "server {") == 1u &&
+               count_text(config, "location / {") == 1u && count_text(config, listener) == 1u &&
+               count_text(config, upstream) == 1u &&
+               count_text(config, "proxy_read_timeout 1s;") == 1u &&
+               count_text(config, "access_log " + access_path + " compat;") == 1u &&
+               count_text(config, "proxy_buffering on;") == (explicit_on ? 1u : 0u) &&
+               (!explicit_on || config.find("proxy_buffering off") == std::string::npos) &&
+               config.find("proxy_request_buffering") == std::string::npos &&
+               config.find("proxy_http_version") == std::string::npos &&
+               config.find("proxy_set_header") == std::string::npos &&
+               config.find("include ") == std::string::npos;
+    };
+    if (!validate_config(omitted_config, ports[0], ports[1], omitted_access_path, false) ||
+        !validate_config(explicit_config, ports[2], ports[3], explicit_access_path, true) ||
+        !write_file(omitted_config_path, omitted_config.data(), omitted_config.size()) ||
+        !write_file(explicit_config_path, explicit_config.data(), explicit_config.size())) {
+        error = "#271 explicit proxy_buffering on baseline config mutation/shape guard failed";
+        return false;
+    }
+    const auto require_rejected = [&](const std::string& candidate,
+                                      u16 frontend_port,
+                                      u16 backend_port,
+                                      const std::string& access_path,
+                                      bool explicit_on) {
+        return !validate_config(candidate, frontend_port, backend_port, access_path, explicit_on);
+    };
+    std::string omitted_to_off = omitted_config;
+    const size_t omitted_offset = omitted_to_off.find("proxy_read_timeout 1s;\n");
+    if (omitted_offset == std::string::npos) {
+        error = "#271 explicit proxy_buffering on baseline omitted mutant anchor missing";
+        return false;
+    }
+    omitted_to_off.insert(omitted_offset + strlen("proxy_read_timeout 1s;\n"),
+                          "      proxy_buffering off;\n");
+    std::string explicit_on_to_off = explicit_config;
+    const size_t on_offset = explicit_on_to_off.find("proxy_buffering on;");
+    if (on_offset == std::string::npos) {
+        error = "#271 explicit proxy_buffering on baseline explicit mutant anchor missing";
+        return false;
+    }
+    explicit_on_to_off.replace(on_offset, strlen("proxy_buffering on;"), "proxy_buffering off;");
+    std::string duplicate_on = explicit_config;
+    const size_t duplicate_offset = duplicate_on.find("proxy_buffering on;\n");
+    if (duplicate_offset == std::string::npos) {
+        error = "#271 explicit proxy_buffering on baseline duplicate mutant anchor missing";
+        return false;
+    }
+    duplicate_on.insert(duplicate_offset + strlen("proxy_buffering on;\n"),
+                        "      proxy_buffering on;\n");
+    std::string extra_directive = explicit_config;
+    const size_t extra_offset = extra_directive.find("proxy_buffering on;\n");
+    if (extra_offset == std::string::npos) {
+        error = "#271 explicit proxy_buffering on baseline extra mutant anchor missing";
+        return false;
+    }
+    extra_directive.insert(extra_offset + strlen("proxy_buffering on;\n"),
+                           "      proxy_http_version 1.1;\n");
+    if (!require_rejected(omitted_to_off, ports[0], ports[1], omitted_access_path, false) ||
+        !require_rejected(explicit_on_to_off, ports[2], ports[3], explicit_access_path, true) ||
+        !require_rejected(duplicate_on, ports[2], ports[3], explicit_access_path, true) ||
+        !require_rejected(extra_directive, ports[2], ports[3], explicit_access_path, true)) {
+        error = "#271 explicit proxy_buffering on baseline accepted a rejected config mutant";
+        return false;
+    }
+    Recorder origins[2];
+    for (size_t side = 0u; side < 2u; side++) {
+        origins[side].wait_response_peer_close = true;
+        origins[side].observe_extra_requests_until_stop = true;
+        const size_t backend_index = side * 2u + 1u;
+        if (!handoff_held_loopback_port(&reservations.fds[backend_index],
+                                        ports[backend_index],
+                                        "#271 explicit proxy_buffering on origin bind",
+                                        error) ||
+            !origins[side].setup(ports[backend_index],
+                                 1u,
+                                 kDefaultBufferingTimeoutOrigin,
+                                 sizeof(kDefaultBufferingTimeoutOrigin) - 1u)) {
+            if (error.empty()) error = "#271 explicit proxy_buffering on origin setup failed";
+            return false;
+        }
+    }
+    for (size_t side = 0u; side < 2u; side++) {
+        const auto live_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+        while ((!origins[side].running.load(std::memory_order_acquire) ||
+                !origins[side].thread_alive.load(std::memory_order_acquire)) &&
+               std::chrono::steady_clock::now() < live_deadline)
+            usleep(1000);
+        if (!origins[side].running.load(std::memory_order_acquire) ||
+            !origins[side].thread_alive.load(std::memory_order_acquire)) {
+            error = "#271 explicit proxy_buffering on origin was not live";
+            return false;
+        }
+    }
+    const std::string configs[2] = {omitted_config_path, explicit_config_path};
+    const std::string logs[2] = {omitted_log_path, explicit_log_path};
+    const char* labels[2] = {"omitted", "explicit-on"};
+    for (size_t side = 0u; side < 2u; side++) {
+        DefaultBufferingTimeoutObservation observation;
+        const std::string& access_path = side == 0u ? omitted_access_path : explicit_access_path;
+        const std::string access_mount_dir(temp.path);
+        if (!capture_nginx_default_buffering_timeout(ports[side * 2u],
+                                                     configs[side],
+                                                     logs[side],
+                                                     container_name + "-" + labels[side],
+                                                     origins[side],
+                                                     kDefaultBufferingTimeoutRequest,
+                                                     sizeof(kDefaultBufferingTimeoutRequest) - 1u,
+                                                     kDefaultBufferingTimeoutResponseNormalized,
+                                                     observation,
+                                                     error,
+                                                     &access_path,
+                                                     &access_mount_dir,
+                                                     &reservations.fds[side * 2u])) {
+            error = std::string("#271 explicit proxy_buffering on ") + labels[side] +
+                    " baseline failed: " + error;
+            return false;
+        }
+        origins[side].stop();
+        std::string access;
+        if (!read_request_length_access_file(access_path, access, error) || access != "60\n") {
+            error = std::string("#271 explicit proxy_buffering on ") + labels[side] +
+                    " access ledger was not exactly 60\\n";
+            return false;
+        }
+        const std::string expected_upstream =
+            "GET /buffered-timeout?q=1 HTTP/1.1\r\nHost: 127.0.0.1:" +
+            std::to_string(ports[side * 2u + 1u]) + "\r\n\r\n";
+        const std::vector<char> expected_wire(expected_upstream.begin(), expected_upstream.end());
+        if (origins[side].history.size() != 1u || origins[side].history[0] != expected_wire ||
+            origins[side].request != expected_wire ||
+            origins[side].accepted.load(std::memory_order_acquire) != 1u ||
+            origins[side].requests.load(std::memory_order_acquire) != 1u ||
+            origins[side].response_send_all_calls.load(std::memory_order_acquire) != 1u ||
+            !origins[side].response_send_succeeded.load(std::memory_order_acquire) ||
+            !origins[side].response_peer_closed.load(std::memory_order_acquire) ||
+            origins[side].response_peer_close_count.load(std::memory_order_acquire) != 1u ||
+            origins[side].response_send_failed.load(std::memory_order_acquire) ||
+            origins[side].response_peer_unexpected_data.load(std::memory_order_acquire) ||
+            origins[side].response_peer_observation_failed.load(std::memory_order_acquire) ||
+            !origins[side].response_clean_shutdown.load(std::memory_order_acquire) ||
+            !origins[side].response_connection_closed.load(std::memory_order_acquire)) {
+            error = std::string("#271 explicit proxy_buffering on ") + labels[side] +
+                    " upstream request/attempt evidence differed";
+            return false;
+        }
+    }
+    unlink(omitted_config_path.c_str());
+    unlink(explicit_config_path.c_str());
+    unlink(omitted_log_path.c_str());
+    unlink(explicit_log_path.c_str());
+    unlink(omitted_access_path.c_str());
+    unlink(explicit_access_path.c_str());
+    std::cerr << "PASS: #271 pinned nginx omitted proxy_buffering and explicit proxy_buffering on "
+                 "matched the same 60-byte request/backend 103-byte open 200/CL12+hello schedule, "
+                 "quiet pre-timeout interval, normalized header-only 200/EOF, one 60\\n access "
+                 "record, one origin retirement and no retry; this is a baseline only.\n";
+    return true;
+}
+
 static bool run_pinned_nginx_default_buffering_202_incomplete_body_inactivity_expiry_oracle(
     TempDir& temp, const std::string& container_name, std::string& error) {
     HeldLoopbackPorts reservations;
@@ -72105,6 +72338,8 @@ int main(int argc, char** argv) {
         argc == 2 && strcmp(argv[1],
                             "--pinned-nginx-default-buffering-third-body-progress-expiry-"
                             "oracle") == 0;
+    const bool pinned_nginx_explicit_buffering_on_baseline_oracle =
+        argc == 2 && strcmp(argv[1], "--pinned-nginx-explicit-buffering-on-baseline-oracle") == 0;
     const bool pinned_nginx_default_buffering_201_incomplete_body_inactivity_expiry_oracle =
         argc == 2 &&
         strcmp(argv[1],
@@ -72373,6 +72608,7 @@ int main(int argc, char** argv) {
          !converter_default_buffering_third_body_progress_expiry_differential &&
          !pinned_nginx_default_buffering_three_publication_completion_oracle &&
          !pinned_nginx_default_buffering_third_body_progress_expiry_oracle &&
+         !pinned_nginx_explicit_buffering_on_baseline_oracle &&
          !pinned_nginx_default_buffering_201_incomplete_body_inactivity_expiry_oracle &&
          !pinned_nginx_default_buffering_202_incomplete_body_inactivity_expiry_oracle &&
          !pinned_nginx_default_buffering_304_content_length_metadata_oracle &&
@@ -72633,6 +72869,8 @@ int main(int argc, char** argv) {
                "--pinned-nginx-default-buffering-three-publication-completion-oracle\n"
                "   or: test_nginx_differential "
                "--pinned-nginx-default-buffering-third-body-progress-expiry-oracle\n"
+               "   or: test_nginx_differential "
+               "--pinned-nginx-explicit-buffering-on-baseline-oracle\n"
                "   or: test_nginx_differential "
                "--pinned-nginx-default-buffering-201-incomplete-body-inactivity-expiry-oracle\n"
                "   or: test_nginx_differential "
@@ -74571,6 +74809,20 @@ int main(int argc, char** argv) {
                "application-publication timestamp is not a TCP/read/CQE boundary. This pins "
                "nginx semantics only; it makes no generated-RUT, converter-equivalence, other "
                "status/schedule/framing, retry/reuse, TLS/H2, or broad #271 claim.\n";
+        return 0;
+    }
+    if (pinned_nginx_explicit_buffering_on_baseline_oracle) {
+        const std::string container_name = "rut-nginx-271-explicit-buffering-on-baseline-" +
+                                           std::to_string(getpid()) + "-" +
+                                           (suffix ? suffix + 1 : "tmp");
+        std::string oracle_error;
+        if (!run_pinned_nginx_explicit_buffering_on_baseline_oracle(
+                temp, container_name, oracle_error)) {
+            std::cerr << "FAIL [#271 pinned nginx explicit proxy_buffering on baseline]: "
+                      << oracle_error << "\n";
+            dump_log(temp.nginx_log, "#271 explicit proxy_buffering on baseline nginx log");
+            return 1;
+        }
         return 0;
     }
     if (pinned_nginx_default_buffering_201_incomplete_body_inactivity_expiry_oracle) {
