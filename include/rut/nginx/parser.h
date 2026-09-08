@@ -50,8 +50,8 @@ struct ProxyReadTimeout {
     Span value_span{};
 };
 
-// Explicit proxy buffering is recognized only to preserve provenance for the
-// rejection-only converter boundary. No lowering or runtime support exists.
+// Explicit proxy buffering retains provenance for the bounded verified lowering
+// profile; broader buffering modes and runtime semantics remain unsupported.
 struct ProxyBuffering {
     bool present = false;
     Span span{};
@@ -238,6 +238,18 @@ struct HttpProfile {
     Server server{};
 };
 
+// One complete-file envelope accepted by the staged nginx frontend. `source`
+// borrows the complete caller buffer; the outer spans use complete-file
+// coordinates, while `http` retains its existing suffix-local source/span
+// contract over the original source beginning at the `h` in `http`.
+struct NginxHttpConfig {
+    Str source{};
+    Span span{};
+    Span events_span{};
+    Span http_span{};
+    HttpProfile http{};
+};
+
 // Parse exactly one minimal nginx server fragment. The returned model borrows
 // strings from source; the caller owns the source storage for its lifetime.
 FrontendResult<Server> parse(Str source);
@@ -245,5 +257,9 @@ FrontendResult<Server> parse(Str source);
 // Parse only the explicitly bounded request-length http profile documented by
 // HttpProfile. This is not a general nginx.conf grammar.
 FrontendResult<HttpProfile> parse_http_profile(Str source);
+
+// Parse exactly one empty events block followed by one bounded logged HTTP
+// profile. This is not general nginx.conf support.
+FrontendResult<NginxHttpConfig> parse_nginx_http_config(Str source);
 
 }  // namespace rut::nginx

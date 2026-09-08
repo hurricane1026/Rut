@@ -365,6 +365,74 @@ public:
         return result;
     }
 
+    FrontendResult<NginxHttpConfig> run_nginx_http_config() {
+        if (cur_.kind == TokenKind::End)
+            return missing(cur_.span, lit_str("nginx configuration is empty"));
+        if (cur_.kind != TokenKind::Word || !eq(cur_.text, "events", 6))
+            return unsupported(cur_.span, lit_str("expected leading events block"));
+        const Span events_start = cur_.span;
+        advance();
+        if (!expect(TokenKind::LBrace, lit_str("expected '{' after events")))
+            return core::make_unexpected(error_);
+        if (cur_.kind == TokenKind::End)
+            return missing(cur_.span, lit_str("missing '}' for events block"));
+        if (cur_.kind != TokenKind::RBrace)
+            return unsupported(cur_.span, lit_str("events directives are unsupported"));
+        const Span events_end = cur_.span;
+        advance();
+
+        if (cur_.kind == TokenKind::End)
+            return missing(cur_.span, lit_str("missing http profile after events"));
+        if (cur_.kind != TokenKind::Word || !eq(cur_.text, "http", 4))
+            return unsupported(cur_.span, lit_str("expected one http profile after events"));
+        const Span http_origin = cur_.span;
+        if (http_origin.start > source_.len)
+            return invalid(http_origin, lit_str("http source origin is out of bounds"));
+        const Str http_source = source_.slice(http_origin.start, source_.len);
+        Parser http_parser(http_source);
+        auto parsed = http_parser.run_http_profile();
+        if (!parsed) {
+            Diagnostic diagnostic = parsed.error();
+            if (diagnostic.span.start > http_source.len || diagnostic.span.end > http_source.len ||
+                diagnostic.span.start > diagnostic.span.end || diagnostic.span.line == 0 ||
+                diagnostic.span.col == 0)
+                return invalid(http_origin, lit_str("http diagnostic span is out of bounds"));
+            if (http_origin.start > (~static_cast<u32>(0)) - diagnostic.span.start ||
+                http_origin.start > (~static_cast<u32>(0)) - diagnostic.span.end)
+                return invalid(http_origin, lit_str("http diagnostic offset overflow"));
+            diagnostic.span.start += http_origin.start;
+            diagnostic.span.end += http_origin.start;
+            if (diagnostic.span.line == 1) {
+                if (http_origin.line == 0 || http_origin.col == 0 ||
+                    http_origin.col > (~static_cast<u32>(0)) - (diagnostic.span.col - 1u))
+                    return invalid(http_origin, lit_str("http diagnostic column overflow"));
+                diagnostic.span.line = http_origin.line;
+                diagnostic.span.col += http_origin.col - 1u;
+            } else {
+                if (http_origin.line == 0 ||
+                    http_origin.line > (~static_cast<u32>(0)) - (diagnostic.span.line - 1u))
+                    return invalid(http_origin, lit_str("http diagnostic line overflow"));
+                diagnostic.span.line += http_origin.line - 1u;
+            }
+            return core::make_unexpected(diagnostic);
+        }
+
+        const HttpProfile http = parsed.value();
+        if (http.span.start > http_source.len || http.span.end > http_source.len ||
+            http.span.start > http.span.end ||
+            http_origin.start > (~static_cast<u32>(0)) - http.span.end)
+            return invalid(http_origin, lit_str("http span is out of bounds"));
+        const u32 http_end = http_origin.start + http.span.end;
+        NginxHttpConfig result{};
+        result.source = source_;
+        result.span = Span{events_start.start, http_end, events_start.line, events_start.col};
+        result.events_span =
+            Span{events_start.start, events_end.end, events_start.line, events_start.col};
+        result.http_span = Span{http_origin.start, http_end, http_origin.line, http_origin.col};
+        result.http = http;
+        return result;
+    }
+
 private:
     FrontendResult<Server> parse_server() {
         const Span start = cur_.span;
@@ -1166,6 +1234,10 @@ FrontendResult<Server> parse(Str source) {
 
 FrontendResult<HttpProfile> parse_http_profile(Str source) {
     return Parser(source).run_http_profile();
+}
+
+FrontendResult<NginxHttpConfig> parse_nginx_http_config(Str source) {
+    return Parser(source).run_nginx_http_config();
 }
 
 }  // namespace rut::nginx

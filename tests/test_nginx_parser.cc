@@ -226,6 +226,160 @@ struct RirGuard {
     ~RirGuard() { module.destroy(); }
 };
 
+static void check_span_equal(rut::test::TestCase* _tc, Span actual, Span expected) {
+    CHECK_EQ(actual.start, expected.start);
+    CHECK_EQ(actual.end, expected.end);
+    CHECK_EQ(actual.line, expected.line);
+    CHECK_EQ(actual.col, expected.col);
+}
+
+static void check_str_equal(rut::test::TestCase* _tc, Str actual, Str expected) {
+    CHECK_EQ(actual.ptr, expected.ptr);
+    CHECK_EQ(actual.len, expected.len);
+    CHECK(actual.eq(expected));
+}
+
+static void check_server_equal(rut::test::TestCase* _tc,
+                               const nginx::Server& actual,
+                               const nginx::Server& expected) {
+    check_span_equal(_tc, actual.span, expected.span);
+    CHECK_EQ(actual.listen.port, expected.listen.port);
+    CHECK(actual.listen.address == expected.listen.address);
+    CHECK_EQ(actual.listen.ipv4_host, expected.listen.ipv4_host);
+    check_str_equal(_tc, actual.listen.value, expected.listen.value);
+    check_span_equal(_tc, actual.listen.value_span, expected.listen.value_span);
+    check_span_equal(_tc, actual.listen.span, expected.listen.span);
+
+    check_str_equal(_tc, actual.location.path, expected.location.path);
+    check_span_equal(_tc, actual.location.path_span, expected.location.path_span);
+    check_span_equal(_tc, actual.location.span, expected.location.span);
+    CHECK_EQ(actual.location.proxy_pass.address[0], expected.location.proxy_pass.address[0]);
+    CHECK_EQ(actual.location.proxy_pass.address[1], expected.location.proxy_pass.address[1]);
+    CHECK_EQ(actual.location.proxy_pass.address[2], expected.location.proxy_pass.address[2]);
+    CHECK_EQ(actual.location.proxy_pass.address[3], expected.location.proxy_pass.address[3]);
+    CHECK_EQ(actual.location.proxy_pass.port, expected.location.proxy_pass.port);
+    CHECK_EQ(actual.location.proxy_pass.has_uri, expected.location.proxy_pass.has_uri);
+    check_str_equal(_tc, actual.location.proxy_pass.uri, expected.location.proxy_pass.uri);
+    check_span_equal(
+        _tc, actual.location.proxy_pass.uri_span, expected.location.proxy_pass.uri_span);
+    check_span_equal(_tc, actual.location.proxy_pass.span, expected.location.proxy_pass.span);
+    CHECK_EQ(actual.location.proxy_read_timeout.present,
+             expected.location.proxy_read_timeout.present);
+    CHECK_EQ(actual.location.proxy_read_timeout.milliseconds,
+             expected.location.proxy_read_timeout.milliseconds);
+    check_span_equal(
+        _tc, actual.location.proxy_read_timeout.span, expected.location.proxy_read_timeout.span);
+    check_span_equal(_tc,
+                     actual.location.proxy_read_timeout.value_span,
+                     expected.location.proxy_read_timeout.value_span);
+    CHECK_EQ(actual.location.proxy_buffering.present, expected.location.proxy_buffering.present);
+    check_span_equal(
+        _tc, actual.location.proxy_buffering.span, expected.location.proxy_buffering.span);
+    check_span_equal(_tc,
+                     actual.location.proxy_buffering.value_span,
+                     expected.location.proxy_buffering.value_span);
+    CHECK_EQ(actual.location.proxy_hide_header.present,
+             expected.location.proxy_hide_header.present);
+    check_str_equal(
+        _tc, actual.location.proxy_hide_header.name, expected.location.proxy_hide_header.name);
+    check_span_equal(_tc,
+                     actual.location.proxy_hide_header.name_span,
+                     expected.location.proxy_hide_header.name_span);
+    check_span_equal(
+        _tc, actual.location.proxy_hide_header.span, expected.location.proxy_hide_header.span);
+
+    CHECK_EQ(actual.exact_local_return.present, expected.exact_local_return.present);
+    check_str_equal(_tc, actual.exact_local_return.path, expected.exact_local_return.path);
+    check_span_equal(
+        _tc, actual.exact_local_return.path_span, expected.exact_local_return.path_span);
+    check_span_equal(_tc, actual.exact_local_return.span, expected.exact_local_return.span);
+    CHECK_EQ(actual.exact_local_return.response.status,
+             expected.exact_local_return.response.status);
+    check_str_equal(
+        _tc, actual.exact_local_return.response.body, expected.exact_local_return.response.body);
+    check_span_equal(_tc,
+                     actual.exact_local_return.response.body_span,
+                     expected.exact_local_return.response.body_span);
+    check_span_equal(
+        _tc, actual.exact_local_return.response.span, expected.exact_local_return.response.span);
+
+    CHECK_EQ(actual.exact_no_content_return.present, expected.exact_no_content_return.present);
+    check_str_equal(
+        _tc, actual.exact_no_content_return.path, expected.exact_no_content_return.path);
+    check_span_equal(
+        _tc, actual.exact_no_content_return.path_span, expected.exact_no_content_return.path_span);
+    check_span_equal(
+        _tc, actual.exact_no_content_return.span, expected.exact_no_content_return.span);
+    CHECK_EQ(actual.exact_no_content_return.response.status,
+             expected.exact_no_content_return.response.status);
+    check_span_equal(_tc,
+                     actual.exact_no_content_return.response.status_span,
+                     expected.exact_no_content_return.response.status_span);
+    check_span_equal(_tc,
+                     actual.exact_no_content_return.response.span,
+                     expected.exact_no_content_return.response.span);
+
+    CHECK_EQ(actual.exact_absolute_redirect.present, expected.exact_absolute_redirect.present);
+    check_str_equal(
+        _tc, actual.exact_absolute_redirect.path, expected.exact_absolute_redirect.path);
+    check_span_equal(
+        _tc, actual.exact_absolute_redirect.path_span, expected.exact_absolute_redirect.path_span);
+    check_span_equal(
+        _tc, actual.exact_absolute_redirect.span, expected.exact_absolute_redirect.span);
+    CHECK_EQ(actual.exact_absolute_redirect.response.status,
+             expected.exact_absolute_redirect.response.status);
+    check_str_equal(_tc,
+                    actual.exact_absolute_redirect.response.status_lexeme,
+                    expected.exact_absolute_redirect.response.status_lexeme);
+    check_span_equal(_tc,
+                     actual.exact_absolute_redirect.response.status_span,
+                     expected.exact_absolute_redirect.response.status_span);
+    check_str_equal(_tc,
+                    actual.exact_absolute_redirect.response.target,
+                    expected.exact_absolute_redirect.response.target);
+    check_span_equal(_tc,
+                     actual.exact_absolute_redirect.response.target_span,
+                     expected.exact_absolute_redirect.response.target_span);
+    check_str_equal(_tc,
+                    actual.exact_absolute_redirect.response.authority,
+                    expected.exact_absolute_redirect.response.authority);
+    check_span_equal(_tc,
+                     actual.exact_absolute_redirect.response.authority_span,
+                     expected.exact_absolute_redirect.response.authority_span);
+    check_str_equal(_tc,
+                    actual.exact_absolute_redirect.response.path,
+                    expected.exact_absolute_redirect.response.path);
+    check_span_equal(_tc,
+                     actual.exact_absolute_redirect.response.path_span,
+                     expected.exact_absolute_redirect.response.path_span);
+    check_span_equal(_tc,
+                     actual.exact_absolute_redirect.response.span,
+                     expected.exact_absolute_redirect.response.span);
+    CHECK(actual.pre_route_trace.profile == expected.pre_route_trace.profile);
+    check_span_equal(_tc, actual.pre_route_trace.span, expected.pre_route_trace.span);
+}
+
+static void check_http_profile_equal(rut::test::TestCase* _tc,
+                                     const nginx::HttpProfile& actual,
+                                     const nginx::HttpProfile& expected) {
+    check_span_equal(_tc, actual.span, expected.span);
+    check_str_equal(_tc, actual.source, expected.source);
+    CHECK(actual.log_format.profile == expected.log_format.profile);
+    check_str_equal(_tc, actual.log_format.name, expected.log_format.name);
+    check_span_equal(_tc, actual.log_format.name_span, expected.log_format.name_span);
+    check_str_equal(_tc, actual.log_format.value, expected.log_format.value);
+    check_span_equal(_tc, actual.log_format.value_span, expected.log_format.value_span);
+    check_span_equal(_tc, actual.log_format.token_span, expected.log_format.token_span);
+    check_span_equal(_tc, actual.log_format.span, expected.log_format.span);
+    CHECK(actual.access_log.destination_profile == expected.access_log.destination_profile);
+    check_str_equal(_tc, actual.access_log.path, expected.access_log.path);
+    check_span_equal(_tc, actual.access_log.path_span, expected.access_log.path_span);
+    check_str_equal(_tc, actual.access_log.format_name, expected.access_log.format_name);
+    check_span_equal(_tc, actual.access_log.format_name_span, expected.access_log.format_name_span);
+    check_span_equal(_tc, actual.access_log.span, expected.access_log.span);
+    check_server_equal(_tc, actual.server, expected.server);
+}
+
 }  // namespace
 
 TEST(nginx_parser, parses_minimal_server_and_spans) {
@@ -397,6 +551,248 @@ TEST(nginx_http_profile_parser, models_exact_request_length_inventory_and_absolu
     CHECK_EQ(reinterpret_cast<uintptr_t>(profile.server.location.path.ptr) -
                  profile.server.location.path_span.start,
              base);
+}
+
+TEST(nginx_complete_parser, accepts_empty_events_and_preserves_suffix_local_http_model) {
+    const char source[] =
+        "  events {}  http { log_format compat \"$request_length\"; access_log /tmp/a compat; "
+        "server { listen 127.0.0.1:8080; location / { proxy_pass http://127.0.0.1:9000; } } }\n";
+    const u32 http_start = 13u;
+    const auto parsed =
+        nginx::parse_nginx_http_config({source, static_cast<u32>(sizeof(source) - 1u)});
+    REQUIRE(parsed);
+    const auto direct = nginx::parse_http_profile(
+        {source + http_start, static_cast<u32>(sizeof(source) - 1u) - http_start});
+    REQUIRE(direct);
+    const auto& config = parsed.value();
+    const auto& embedded = config.http;
+    const auto& expected = direct.value();
+    CHECK_EQ(config.source.ptr, source);
+    CHECK_EQ(config.source.len, sizeof(source) - 1u);
+    CHECK_EQ(config.span.start, 2u);
+    CHECK_EQ(config.span.end, 167u);
+    CHECK_EQ(config.span.line, 1u);
+    CHECK_EQ(config.span.col, 3u);
+    CHECK_EQ(config.events_span.start, 2u);
+    CHECK_EQ(config.events_span.end, 11u);
+    CHECK_EQ(config.http_span.start, 13u);
+    CHECK_EQ(config.http_span.end, 167u);
+    CHECK_EQ(embedded.source.ptr, source + http_start);
+    CHECK_EQ(embedded.source.len, sizeof(source) - 1u - http_start);
+    CHECK_EQ(embedded.span.start, expected.span.start);
+    CHECK_EQ(embedded.span.end, expected.span.end);
+    CHECK_EQ(embedded.span.line, 1u);
+    CHECK_EQ(embedded.span.col, 1u);
+    CHECK(embedded.log_format.name.eq(expected.log_format.name));
+    CHECK(embedded.log_format.value.eq(expected.log_format.value));
+    CHECK(embedded.access_log.path.eq(expected.access_log.path));
+    CHECK_EQ(embedded.server.listen.port, expected.server.listen.port);
+    CHECK(embedded.server.location.path.eq(expected.server.location.path));
+    CHECK_EQ(embedded.server.location.proxy_pass.port, expected.server.location.proxy_pass.port);
+    CHECK_EQ(embedded.server.location.proxy_pass.span.start,
+             expected.server.location.proxy_pass.span.start);
+    CHECK_EQ(
+        reinterpret_cast<uintptr_t>(embedded.access_log.path.ptr),
+        reinterpret_cast<uintptr_t>(source + http_start) + expected.access_log.path_span.start);
+}
+
+TEST(nginx_complete_parser, accepts_multiline_comments_and_trailing_trivia) {
+    const char source[] =
+        "\n# leading { comment }\n"
+        "  events {\n"
+        "    # empty }\n"
+        "  }\n\n"
+        "  http {\n"
+        "    log_format compat \"$request_length\";\n"
+        "    access_log /tmp/a compat;\n"
+        "    server {\n"
+        "      listen 127.0.0.1:8080;\n"
+        "      location / {\n"
+        "        proxy_pass http://127.0.0.1:9000;\n"
+        "      }\n"
+        "    }\n"
+        "  }\n"
+        "  # trailing { }\n";
+    const u32 http_start = 55u;
+    const auto parsed =
+        nginx::parse_nginx_http_config({source, static_cast<u32>(sizeof(source) - 1u)});
+    REQUIRE(parsed);
+    const auto direct = nginx::parse_http_profile(
+        {source + http_start, static_cast<u32>(sizeof(source) - 1u) - http_start});
+    REQUIRE(direct);
+    const auto& config = parsed.value();
+    CHECK_EQ(config.source.ptr, source);
+    CHECK_EQ(config.span.start, 25u);
+    CHECK_EQ(config.span.end, 253u);
+    CHECK_EQ(config.events_span.start, 25u);
+    CHECK_EQ(config.events_span.end, 51u);
+    CHECK_EQ(config.events_span.line, 3u);
+    CHECK_EQ(config.events_span.col, 3u);
+    CHECK_EQ(config.http_span.start, 55u);
+    CHECK_EQ(config.http_span.end, 253u);
+    CHECK_EQ(config.http_span.line, 7u);
+    CHECK_EQ(config.http_span.col, 3u);
+    CHECK_EQ(config.http.source.ptr, source + http_start);
+    CHECK_EQ(config.http.source.len, 216u);
+    CHECK_EQ(config.http.span.start, direct.value().span.start);
+    CHECK_EQ(config.http.span.end, direct.value().span.end);
+    CHECK_EQ(config.http.server.location.proxy_pass.port, 9000u);
+}
+
+TEST(nginx_complete_parser, compares_all_embedded_fields_for_nondefault_http_profile) {
+    const std::string source =
+        "events {}\n"
+        "http {\n"
+        "  log_format compat \"$request_length\";\n"
+        "  access_log /tmp/a compat;\n"
+        "  server {\n"
+        "    listen 127.0.0.1:8080;\n"
+        "    location / {\n"
+        "      proxy_pass http://127.0.0.1:9000;\n"
+        "      proxy_read_timeout 2s;\n"
+        "      proxy_buffering on;\n"
+        "      proxy_hide_header X-Compat-Hidden;\n"
+        "    }\n"
+        "    location = /health { return 200 \"ok\"; }\n"
+        "  }\n"
+        "}\n";
+    const u32 http_start = static_cast<u32>(source.find("http"));
+    const auto parsed =
+        nginx::parse_nginx_http_config({source.data(), static_cast<u32>(source.size())});
+    REQUIRE(parsed);
+    const auto direct = nginx::parse_http_profile(
+        {source.data() + http_start, static_cast<u32>(source.size()) - http_start});
+    REQUIRE(direct);
+    check_http_profile_equal(_tc, parsed.value().http, direct.value());
+    CHECK(parsed.value().http.server.location.proxy_read_timeout.present);
+    CHECK(parsed.value().http.server.location.proxy_buffering.present);
+    CHECK(parsed.value().http.server.location.proxy_hide_header.present);
+    CHECK(parsed.value().http.server.exact_local_return.present);
+    CHECK_EQ(parsed.value().http.server.exact_local_return.response.status, 200u);
+}
+
+TEST(nginx_complete_parser, rebases_http_errors_and_rejects_envelope_shapes) {
+    const auto empty = nginx::parse_nginx_http_config({nullptr, 0u});
+    REQUIRE_FALSE(empty);
+    CHECK(empty.error().code == FrontendError::UnexpectedEof);
+    CHECK(empty.error().detail.eq(lit_str("nginx configuration is empty")));
+
+    const char missing_events_brace[] = "events ";
+    const auto missing_events = nginx::parse_nginx_http_config(
+        {missing_events_brace, static_cast<u32>(sizeof(missing_events_brace) - 1u)});
+    REQUIRE_FALSE(missing_events);
+    CHECK(missing_events.error().code == FrontendError::UnexpectedEof);
+    CHECK(missing_events.error().detail.eq(lit_str("expected '{' after events")));
+
+    const char missing_http[] = "events {}";
+    const auto missing_http_result =
+        nginx::parse_nginx_http_config({missing_http, static_cast<u32>(sizeof(missing_http) - 1u)});
+    REQUIRE_FALSE(missing_http_result);
+    CHECK(missing_http_result.error().code == FrontendError::UnexpectedEof);
+    CHECK(missing_http_result.error().detail.eq(lit_str("missing http profile after events")));
+
+    const char nonempty_events[] = "events { worker_connections 64; } http {}";
+    const auto rejected_events = nginx::parse_nginx_http_config(
+        {nonempty_events, static_cast<u32>(sizeof(nonempty_events) - 1u)});
+    REQUIRE_FALSE(rejected_events);
+    CHECK(rejected_events.error().code == FrontendError::UnsupportedSyntax);
+    CHECK(rejected_events.error().detail.eq(lit_str("events directives are unsupported")));
+    CHECK_EQ(rejected_events.error().span.start, 9u);
+
+    const char main_before[] = "daemon off; events {} http {}";
+    const auto rejected_main_before =
+        nginx::parse_nginx_http_config({main_before, static_cast<u32>(sizeof(main_before) - 1u)});
+    REQUIRE_FALSE(rejected_main_before);
+    CHECK(rejected_main_before.error().code == FrontendError::UnsupportedSyntax);
+    CHECK(rejected_main_before.error().detail.eq(lit_str("expected leading events block")));
+
+    const char main_between[] = "events {} daemon off; http {}";
+    const auto rejected_main_between =
+        nginx::parse_nginx_http_config({main_between, static_cast<u32>(sizeof(main_between) - 1u)});
+    REQUIRE_FALSE(rejected_main_between);
+    CHECK(rejected_main_between.error().code == FrontendError::UnsupportedSyntax);
+    CHECK(
+        rejected_main_between.error().detail.eq(lit_str("expected one http profile after events")));
+
+    const char duplicate_events[] = "events {} events {} http {}";
+    const auto rejected_duplicate_events = nginx::parse_nginx_http_config(
+        {duplicate_events, static_cast<u32>(sizeof(duplicate_events) - 1u)});
+    REQUIRE_FALSE(rejected_duplicate_events);
+    CHECK(rejected_duplicate_events.error().code == FrontendError::UnsupportedSyntax);
+    CHECK(rejected_duplicate_events.error().detail.eq(
+        lit_str("expected one http profile after events")));
+
+    const char valid[] =
+        "events {} http { log_format compat \"$request_length\"; access_log /tmp/a compat; "
+        "server { listen 127.0.0.1:8080; location / { proxy_pass http://127.0.0.1:9000; } } }\n";
+    const std::string http_with_trivia = std::string("# leading trivia\n") + (valid + 10);
+    const auto direct_with_trivia = nginx::parse_http_profile(
+        {http_with_trivia.data(), static_cast<u32>(http_with_trivia.size())});
+    REQUIRE(direct_with_trivia);
+    const std::string duplicate_http = std::string(valid) + "http {}";
+    const auto rejected_duplicate_http = nginx::parse_nginx_http_config(
+        {duplicate_http.data(), static_cast<u32>(duplicate_http.size())});
+    REQUIRE_FALSE(rejected_duplicate_http);
+    CHECK(rejected_duplicate_http.error().code == FrontendError::UnexpectedToken);
+    CHECK(rejected_duplicate_http.error().detail.eq(
+        lit_str("trailing unexpected tokens after http profile")));
+
+    const std::string trailing = std::string(valid) + "daemon off;";
+    const auto rejected_trailing =
+        nginx::parse_nginx_http_config({trailing.data(), static_cast<u32>(trailing.size())});
+    REQUIRE_FALSE(rejected_trailing);
+    CHECK(rejected_trailing.error().code == FrontendError::UnexpectedToken);
+    CHECK(rejected_trailing.error().detail.eq(
+        lit_str("trailing unexpected tokens after http profile")));
+
+    std::string missing_http_close = valid;
+    missing_http_close.pop_back();
+    missing_http_close.pop_back();
+    const auto rejected_missing_http_close = nginx::parse_nginx_http_config(
+        {missing_http_close.data(), static_cast<u32>(missing_http_close.size())});
+    REQUIRE_FALSE(rejected_missing_http_close);
+    CHECK(rejected_missing_http_close.error().code == FrontendError::UnexpectedEof);
+    CHECK(rejected_missing_http_close.error().detail.eq(lit_str("missing '}' for http profile")));
+
+    const char same_line[] =
+        "  events {}  http { log_format compat \"$request_length\"; access_log /tmp/a compat; "
+        "bogus; server { listen 127.0.0.1:8080; location / { proxy_pass http://127.0.0.1:9000; } } "
+        "}\n";
+    const auto error =
+        nginx::parse_nginx_http_config({same_line, static_cast<u32>(sizeof(same_line) - 1u)});
+    REQUIRE_FALSE(error);
+    CHECK(error.error().code == FrontendError::UnsupportedSyntax);
+    CHECK_EQ(error.error().span.start, 83u);
+    CHECK_EQ(error.error().span.end, 88u);
+    CHECK_EQ(error.error().span.line, 1u);
+    CHECK_EQ(error.error().span.col, 84u);
+
+    const char multiline[] =
+        "\n# lead\n events {}\n\n http {\n  bogus;\n"
+        "  log_format compat \"$request_length\";\n"
+        "  access_log /tmp/a compat;\n"
+        "  server { listen 127.0.0.1:8080; location / { proxy_pass http://127.0.0.1:9000; } } }\n";
+    const auto later_error =
+        nginx::parse_nginx_http_config({multiline, static_cast<u32>(sizeof(multiline) - 1u)});
+    REQUIRE_FALSE(later_error);
+    CHECK(later_error.error().code == FrontendError::UnsupportedSyntax);
+    CHECK_EQ(later_error.error().span.start, 30u);
+    CHECK_EQ(later_error.error().span.end, 35u);
+    CHECK_EQ(later_error.error().span.line, 6u);
+    CHECK_EQ(later_error.error().span.col, 3u);
+
+    const char reordered[] = "http {} events {}";
+    const auto rejected_order =
+        nginx::parse_nginx_http_config({reordered, static_cast<u32>(sizeof(reordered) - 1u)});
+    REQUIRE_FALSE(rejected_order);
+    CHECK(rejected_order.error().code == FrontendError::UnsupportedSyntax);
+    CHECK_EQ(rejected_order.error().span.start, 0u);
+
+    const char old_wrapper[] = "http {}";
+    const auto old_parse = nginx::parse({old_wrapper, static_cast<u32>(sizeof(old_wrapper) - 1u)});
+    REQUIRE_FALSE(old_parse);
+    CHECK(old_parse.error().code == FrontendError::UnsupportedSyntax);
+    CHECK(old_parse.error().detail.eq(lit_str("http/events wrappers are unsupported")));
 }
 
 TEST(nginx_http_profile_parser,
