@@ -2475,7 +2475,7 @@ TEST(serve_loader, issue373_hide_headers_are_owned_and_same_owner_reload_clears_
             if (rir_function.http_method == kRouteMethodGet) mapping = &methods[1];
             if (rir_function.http_method == kRouteMethodAny) mapping = &methods[2];
             REQUIRE(mapping != nullptr);
-            CHECK(rir_function.route_pattern.eq(lit_str("/")));
+            REQUIRE(rir_function.route_pattern.eq(lit_str("/")));
             mapping->functions++;
             for (u32 block = 0u; block < rir_function.block_count; block++) {
                 const auto& rir_block = rir_function.blocks[block];
@@ -2506,12 +2506,9 @@ TEST(serve_loader, issue373_hide_headers_are_owned_and_same_owner_reload_clears_
         CHECK_EQ(methods[0].forwards, 1u);
         CHECK_EQ(methods[1].forwards, expected_get_forwards);
         CHECK_EQ(methods[2].forwards, 1u);
-        CHECK_EQ(methods[0].ids[0].request,
-                 static_cast<i32>(RequestPolicyId::Http11FixedStrip));
-        CHECK_EQ(methods[2].ids[0].request,
-                 static_cast<i32>(RequestPolicyId::Http11FixedStrip));
-        CHECK_EQ(methods[1].ids[0].request,
-                 static_cast<i32>(RequestPolicyId::Http11FixedStrip));
+        CHECK_EQ(methods[0].ids[0].request, static_cast<i32>(RequestPolicyId::Http11FixedStrip));
+        CHECK_EQ(methods[2].ids[0].request, static_cast<i32>(RequestPolicyId::Http11FixedStrip));
+        CHECK_EQ(methods[1].ids[0].request, static_cast<i32>(RequestPolicyId::Http11FixedStrip));
         if (conditional_get) {
             CHECK_EQ(methods[1].ids[1].request,
                      static_cast<i32>(RequestPolicyId::Http11FixedTrimSpPreserveHtab));
@@ -2519,18 +2516,15 @@ TEST(serve_loader, issue373_hide_headers_are_owned_and_same_owner_reload_clears_
         }
         for (const MethodMapping& mapping : methods) {
             REQUIRE_GT(mapping.ids[0].bundle, 0);
-            CHECK(program.config.policy_bundle_id_is_valid(
-                static_cast<u16>(mapping.ids[0].bundle)));
+            CHECK(
+                program.config.policy_bundle_id_is_valid(static_cast<u16>(mapping.ids[0].bundle)));
         }
         CHECK_NE(methods[0].ids[0].bundle, methods[1].ids[0].bundle);
         CHECK_NE(methods[0].ids[0].bundle, methods[2].ids[0].bundle);
         CHECK_NE(methods[1].ids[0].bundle, methods[2].ids[0].bundle);
-        const auto& head_bundle =
-            program.config.policy_bundles[methods[0].ids[0].bundle - 1];
-        const auto& get_bundle =
-            program.config.policy_bundles[methods[1].ids[0].bundle - 1];
-        const auto& any_bundle =
-            program.config.policy_bundles[methods[2].ids[0].bundle - 1];
+        const auto& head_bundle = program.config.policy_bundles[methods[0].ids[0].bundle - 1];
+        const auto& get_bundle = program.config.policy_bundles[methods[1].ids[0].bundle - 1];
+        const auto& any_bundle = program.config.policy_bundles[methods[2].ids[0].bundle - 1];
         CHECK_NE(head_bundle.response_policy_id, get_bundle.response_policy_id);
         CHECK_EQ(get_bundle.response_policy_id, any_bundle.response_policy_id);
     };
@@ -3993,7 +3987,7 @@ TEST(serve_loader, nginx_issue357_wildcard_p63_no_uri_output_is_owned_and_reuses
     for (u32 function_index = 0u; function_index < program.rir.module.func_count;
          function_index++) {
         const auto& function = program.rir.module.functions[function_index];
-        CHECK(function.route_pattern.eq(lit_str("/")));
+        REQUIRE(function.route_pattern.eq(lit_str("/")));
         if (function.http_method == kRouteMethodHead) root_head_functions++;
         if (function.http_method == kRouteMethodGet) root_get_functions++;
         if (function.http_method == kRouteMethodAny) root_any_functions++;
@@ -4070,8 +4064,7 @@ TEST(serve_loader, nginx_issue357_wildcard_p63_no_uri_output_is_owned_and_reuses
     REQUIRE_EQ(program.config.policy_bundle_count, 3u);
 
     const auto check_root_bundle = [&](u16 root_bundle_id, bool suppress_body, bool buffered) {
-        CHECK(request_policy_is_supported(
-            static_cast<u16>(RequestPolicyId::Http11FixedStrip)));
+        CHECK(request_policy_is_supported(static_cast<u16>(RequestPolicyId::Http11FixedStrip)));
         REQUIRE(program.config.policy_bundle_id_is_valid(root_bundle_id));
         const auto& root_bundle = program.config.policy_bundles[root_bundle_id - 1u];
         REQUIRE(program.config.response_policy_id_is_valid(root_bundle.response_policy_id));

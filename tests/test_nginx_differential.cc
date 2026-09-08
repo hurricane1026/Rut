@@ -46502,6 +46502,230 @@ static bool validate_exact_loopback_bodyful_generated_observation(
     return true;
 }
 
+// Exact loopback/root lowering has one framing selector only for GET.  Keep this
+// validator structural: the source inventories below catch ownership/count
+// regressions, while this catches a branch that merely happens to have the
+// right global counts.
+static bool validate_exact_loopback_conditional_get_structure(const std::string& source,
+                                                              std::string& error,
+                                                              const char* issue) {
+    const auto lexed = rut::lex({source.data(), static_cast<u32>(source.size())});
+    if (!lexed) {
+        error = std::string(issue) + " generated ordinary RUT did not lex";
+        return false;
+    }
+    const auto parsed = rut::parse_file(lexed.value());
+    if (!parsed) {
+        error = std::string(issue) + " generated ordinary RUT did not parse";
+        return false;
+    }
+    std::unique_ptr<rut::AstFile> ast(parsed.value());
+    const rut::AstRouteDecl* ast_head = nullptr;
+    const rut::AstRouteDecl* ast_get = nullptr;
+    const rut::AstRouteDecl* ast_any = nullptr;
+    for (u32 index = 0u; index < ast->items.len; index++) {
+        const auto& item = ast->items[index];
+        if (item.kind != rut::AstItemKind::Route || !item.route.path.eq({"/", 1u})) continue;
+        if (item.route.method_is_any) {
+            if (ast_any != nullptr) {
+                error = std::string(issue) + " duplicated exact Any root route";
+                return false;
+            }
+            ast_any = &item.route;
+        } else if (item.route.method == static_cast<rut::u8>(rut::TokenType::KwHead)) {
+            if (ast_head != nullptr) {
+                error = std::string(issue) + " duplicated exact HEAD root route";
+                return false;
+            }
+            ast_head = &item.route;
+        } else if (item.route.method == static_cast<rut::u8>(rut::TokenType::KwGet)) {
+            if (ast_get != nullptr) {
+                error = std::string(issue) + " duplicated exact GET root route";
+                return false;
+            }
+            ast_get = &item.route;
+        }
+    }
+    if (ast_head == nullptr || ast_get == nullptr || ast_any == nullptr ||
+        ast_head->statements.len != 1u || ast_get->statements.len != 1u ||
+        ast_any->statements.len != 1u || ast_head->statements[0] == nullptr ||
+        ast_get->statements[0] == nullptr || ast_any->statements[0] == nullptr) {
+        error = std::string(issue) + " missing exact HEAD/GET/Any root statements";
+        return false;
+    }
+    const auto& head = *ast_head->statements[0];
+    const auto& get = *ast_get->statements[0];
+    const auto& any = *ast_any->statements[0];
+    const auto direct_id1 = [&](const rut::AstStatement& statement, bool require_timeout) {
+        return statement.kind == rut::AstStmtKind::ForwardUpstream &&
+               statement.has_forward_request_policy && statement.forward_request_policy_id == 1u &&
+               statement.has_forward_response_policy && statement.has_forward_failure_policy &&
+               (!require_timeout || (statement.has_forward_response_read_timeout &&
+                                     statement.has_forward_timeout_failure_policy &&
+                                     statement.forward_response_read_timeout_seconds == 60u &&
+                                     statement.has_forward_response_buffering &&
+                                     statement.forward_response_buffering ==
+                                         rut::ForwardResponseBufferingMode::CompleteContentLength));
+    };
+    if (!direct_id1(head, false) || !direct_id1(any, false) || get.kind != rut::AstStmtKind::If ||
+        get.then_stmt == nullptr || get.else_stmt == nullptr || !direct_id1(*get.then_stmt, true) ||
+        get.else_stmt->kind != rut::AstStmtKind::ForwardUpstream ||
+        !get.else_stmt->has_forward_request_policy ||
+        get.else_stmt->forward_request_policy_id != 3u ||
+        !get.else_stmt->has_forward_response_policy || !get.else_stmt->has_forward_failure_policy ||
+        !get.else_stmt->has_forward_timeout_failure_policy ||
+        !get.else_stmt->has_forward_response_read_timeout ||
+        get.else_stmt->forward_response_read_timeout_seconds != 60u ||
+        !get.else_stmt->has_forward_response_buffering ||
+        get.else_stmt->forward_response_buffering !=
+            rut::ForwardResponseBufferingMode::CompleteContentLength) {
+        error = std::string(issue) +
+                " exact root AST did not contain HEAD/Any ID1 and GET then-ID1/else-ID3";
+        return false;
+    }
+    const auto hir_result = rut::analyze_file(*ast);
+    if (!hir_result) {
+        error = std::string(issue) + " generated ordinary RUT did not analyze";
+        return false;
+    }
+    std::unique_ptr<rut::HirModule> hir(hir_result.value());
+    const rut::HirRoute* hir_head = nullptr;
+    const rut::HirRoute* hir_get = nullptr;
+    const rut::HirRoute* hir_any = nullptr;
+    for (u32 index = 0u; index < hir->routes.len; index++) {
+        const auto& route = hir->routes[index];
+        if (!route.path.eq({"/", 1u})) continue;
+        const rut::HirRoute** target = nullptr;
+        if (route.method == rut::kRouteMethodHead) target = &hir_head;
+        if (route.method == rut::kRouteMethodGet) target = &hir_get;
+        if (route.method == rut::kRouteMethodAny) target = &hir_any;
+        if (target == nullptr) continue;
+        if (*target != nullptr) {
+            error = std::string(issue) + " duplicated exact root HIR route";
+            return false;
+        }
+        *target = &route;
+    }
+    if (hir_head == nullptr || hir_get == nullptr || hir_any == nullptr ||
+        hir_head->control.kind != rut::HirControlKind::Direct ||
+        hir_any->control.kind != rut::HirControlKind::Direct ||
+        hir_get->control.kind != rut::HirControlKind::If ||
+        hir_get->control.cond.kind != rut::HirExprKind::ReqHasContentLength) {
+        error = std::string(issue) + " exact root HIR lost the GET content-length selector";
+        return false;
+    }
+    const auto& head_term = hir_head->control.direct_term;
+    const auto& get_true = hir_get->control.then_term;
+    const auto& get_false = hir_get->control.else_term;
+    const auto& any_term = hir_any->control.direct_term;
+    const auto valid_bundle_term =
+        [&](const rut::HirTerminator& term, u16 request_id, bool require_timeout) {
+            return term.kind == rut::HirTerminatorKind::ForwardUpstream &&
+                   term.forward_request_policy_id == request_id &&
+                   term.forward_response_policy_id != 0u &&
+                   term.forward_response_policy_id <= ast->response_policies.len &&
+                   term.forward_failure_policy_id != 0u &&
+                   term.forward_failure_policy_id <= ast->failure_policies.len &&
+                   (!require_timeout ||
+                    (term.forward_timeout_failure_policy_id != 0u &&
+                     term.forward_timeout_failure_policy_id <= ast->failure_policies.len)) &&
+                   (!require_timeout ||
+                    (term.forward_response_read_timeout_seconds == 60u &&
+                     term.forward_response_buffering ==
+                         rut::ForwardResponseBufferingMode::CompleteContentLength)) &&
+                   (!require_timeout ||
+                    rut::complete_content_length_buffering_policies_valid(
+                        ast->response_policies[term.forward_response_policy_id - 1u],
+                        ast->failure_policies[term.forward_failure_policy_id - 1u],
+                        ast->failure_policies[term.forward_timeout_failure_policy_id - 1u]));
+        };
+    if (!valid_bundle_term(head_term, 1u, false) || !valid_bundle_term(get_true, 1u, true) ||
+        !valid_bundle_term(get_false, 3u, true) || !valid_bundle_term(any_term, 1u, false) ||
+        get_true.upstream_index != get_false.upstream_index ||
+        get_true.forward_response_policy_id != get_false.forward_response_policy_id ||
+        get_true.forward_failure_policy_id != get_false.forward_failure_policy_id ||
+        get_true.forward_timeout_failure_policy_id != get_false.forward_timeout_failure_policy_id ||
+        get_true.forward_response_read_timeout_seconds !=
+            get_false.forward_response_read_timeout_seconds ||
+        get_true.forward_response_buffering != get_false.forward_response_buffering ||
+        head_term.upstream_index != get_true.upstream_index ||
+        any_term.upstream_index != get_true.upstream_index) {
+        error = std::string(issue) +
+                " exact root HIR lost request-policy IDs or shared 60s/CompleteCL bundle";
+        return false;
+    }
+    return true;
+}
+
+static bool run_exact_loopback_conditional_get_mutation_self_checks(const std::string& source,
+                                                                    std::string& error,
+                                                                    const char* issue) {
+    static constexpr char kFixed[] =
+        "return forward(nginx_upstream, request_policy: {\n"
+        "            version: \"HTTP/1.1\",\n"
+        "            host: \"upstream\",\n"
+        "            connection: \"omit\",\n"
+        "            strip_headers: [\"Connection\", \"Keep-Alive\", \"TE\", \"Expect\", "
+        "\"Upgrade\"]\n"
+        "        },\n";
+    static constexpr char kRetained[] =
+        "return forward(nginx_upstream, request_policy: {\n"
+        "            version: \"HTTP/1.1\",\n"
+        "            host: \"upstream\",\n"
+        "            connection: \"omit\",\n"
+        "            strip_headers: [\"Connection\", \"Keep-Alive\", \"TE\", \"Expect\", "
+        "\"Upgrade\"],\n"
+        "            retained_header_value: \"trim_sp_preserve_htab\"\n"
+        "        },\n";
+    const size_t get_start = source.find("route GET \"/\" {\n");
+    const size_t get_end = get_start == std::string::npos ? std::string::npos
+                                                          : source.find("\nroute ", get_start + 1u);
+    if (get_start == std::string::npos || get_end == std::string::npos) {
+        error = std::string(issue) + " mutation self-check could not isolate exact GET route";
+        return false;
+    }
+    const auto mutate_get = [&](const std::string& from, const std::string& to) {
+        std::string changed = source;
+        const size_t at = changed.find(from, get_start);
+        if (at == std::string::npos || at >= get_end) return std::string{};
+        changed.replace(at, from.size(), to);
+        return changed;
+    };
+    std::string swapped = source;
+    const size_t fixed_at = swapped.find(kFixed, get_start);
+    const size_t retained_at = swapped.find(kRetained, get_start);
+    if (fixed_at == std::string::npos || retained_at == std::string::npos || fixed_at >= get_end ||
+        retained_at >= get_end) {
+        error = std::string(issue) + " mutation self-check could not find both GET branches";
+        return false;
+    }
+    swapped.replace(retained_at, strlen(kRetained), "__RUT_RETAINED_BRANCH__");
+    swapped.replace(fixed_at, strlen(kFixed), kRetained);
+    const size_t placeholder =
+        swapped.find("__RUT_RETAINED_BRANCH__", fixed_at + strlen(kRetained));
+    if (placeholder == std::string::npos || placeholder >= get_end) {
+        error = std::string(issue) + " mutation self-check could not swap GET branches";
+        return false;
+    }
+    swapped.replace(placeholder, strlen("__RUT_RETAINED_BRANCH__"), kFixed);
+    const std::vector<std::string> mutations = {
+        swapped,
+        mutate_get(kRetained, kFixed),
+        mutate_get("response_read_timeout: 60s", "response_read_timeout: 61s"),
+        mutate_get("response_buffering: \"complete_content_length\"",
+                   "response_buffering: \"none\"")};
+    for (const std::string& mutation : mutations) {
+        std::string detail;
+        if (mutation.empty() ||
+            validate_exact_loopback_conditional_get_structure(mutation, detail, issue)) {
+            error = std::string(issue) +
+                    " conditional-GET mutation self-check accepted an invalid branch/bundle";
+            return false;
+        }
+    }
+    return true;
+}
+
 static bool validate_wildcard_listen_generated_source(
     const std::string& source,
     u16 frontend_port,
@@ -46574,6 +46798,10 @@ static bool validate_wildcard_listen_generated_source(
                 "inventory for its request-policy shape";
         return false;
     }
+    if (conditional_get &&
+        (!validate_exact_loopback_conditional_get_structure(source, error, profile.issue) ||
+         !run_exact_loopback_conditional_get_mutation_self_checks(source, error, profile.issue)))
+        return false;
     return true;
 }
 
@@ -51004,6 +51232,9 @@ static bool validate_converter_request_length_source(const std::string& source,
         error = "#362 converter-generated ordinary RUT inventory was not exact";
         return false;
     }
+    if (!validate_exact_loopback_conditional_get_structure(source, error, "#362") ||
+        !run_exact_loopback_conditional_get_mutation_self_checks(source, error, "#362"))
+        return false;
     return true;
 }
 
@@ -51474,6 +51705,9 @@ static bool validate_converter_request_length_fixed_body_source(const std::strin
             "accessLog/listen/upstream/HEAD/GET/Any";
         return false;
     }
+    if (!validate_exact_loopback_conditional_get_structure(source, error, "#367") ||
+        !run_exact_loopback_conditional_get_mutation_self_checks(source, error, "#367"))
+        return false;
     return true;
 }
 
@@ -54426,18 +54660,8 @@ static bool validate_positive_get_default_generated_source(const std::string& so
         error = "#271 generated source lost exact GET/fixed/60s/complete-buffering custody";
         return false;
     }
-    const auto lexed = rut::lex({source.data(), static_cast<u32>(source.size())});
-    if (!lexed) {
-        error = "#271 generated ordinary RUT source did not lex";
-        return false;
-    }
-    const auto parsed = rut::parse_file(lexed.value());
-    if (!parsed) {
-        error = "#271 generated ordinary RUT source did not parse";
-        return false;
-    }
-    std::unique_ptr<rut::AstFile> ast(parsed.value());
-    return true;
+    return validate_exact_loopback_conditional_get_structure(source, error, "#271") &&
+           run_exact_loopback_conditional_get_mutation_self_checks(source, error, "#271");
 }
 
 static bool build_positive_get_default_generated_source(const std::string& profile,
