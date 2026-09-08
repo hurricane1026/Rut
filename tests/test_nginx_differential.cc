@@ -25754,6 +25754,42 @@ static bool run_rut_iouring_gate_spike(u16 frontend_port,
         error = "gated RUT response 2 mismatch: " + detail;
         return false;
     }
+    if (live200) {
+        const auto live_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+        while ((fixture->live_recorder->accepted.load(std::memory_order_acquire) != 2u ||
+                fixture->live_recorder->requests.load(std::memory_order_acquire) != 2u ||
+                fixture->live_recorder->response_send_all_calls.load(std::memory_order_acquire) !=
+                    2u ||
+                fixture->live_recorder->response_peer_close_count.load(std::memory_order_acquire) !=
+                    2u) &&
+               std::chrono::steady_clock::now() < live_deadline) {
+            if (!fixture->live_recorder->running.load(std::memory_order_acquire) ||
+                !fixture->live_recorder->thread_alive.load(std::memory_order_acquire) ||
+                fixture->live_recorder->listener_failed.load(std::memory_order_acquire) ||
+                fixture->live_recorder->response_send_failed.load(std::memory_order_acquire) ||
+                fixture->live_recorder->response_peer_unexpected_data.load(std::memory_order_acquire) ||
+                fixture->live_recorder->response_peer_observation_failed.load(
+                    std::memory_order_acquire)) {
+                error = "live200 Recorder/RUT retirement evidence failed before teardown";
+                return false;
+            }
+            usleep(1000);
+        }
+        if (!fixture->live_recorder->running.load(std::memory_order_acquire) ||
+            !fixture->live_recorder->thread_alive.load(std::memory_order_acquire) ||
+            fixture->live_recorder->listener_failed.load(std::memory_order_acquire) ||
+            fixture->live_recorder->accepted.load(std::memory_order_acquire) != 2u ||
+            fixture->live_recorder->requests.load(std::memory_order_acquire) != 2u ||
+            fixture->live_recorder->response_send_all_calls.load(std::memory_order_acquire) != 2u ||
+            fixture->live_recorder->response_peer_close_count.load(std::memory_order_acquire) != 2u ||
+            fixture->live_recorder->response_send_failed.load(std::memory_order_acquire) ||
+            fixture->live_recorder->response_peer_unexpected_data.load(std::memory_order_acquire) ||
+            fixture->live_recorder->response_peer_observation_failed.load(
+                std::memory_order_acquire)) {
+            error = "live200 Recorder did not settle exact two-episode evidence before teardown";
+            return false;
+        }
+    }
     if (poll_child(rut_process.child)) {
         error = "RUT exited after gated two-response exchange";
         return false;
