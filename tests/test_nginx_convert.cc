@@ -8,8 +8,10 @@
 #include <string>
 
 #include <fcntl.h>
+#include <signal.h>
 #include <sys/stat.h>
 #include <sys/wait.h>
+#include <time.h>
 #include <unistd.h>
 
 namespace {
@@ -39,8 +41,9 @@ bool write_file(const std::string& path, const std::string& contents) {
     return close(fd) == 0;
 }
 
-std::string read_pipe(int fd) {
+std::string read_fd(int fd) {
     std::string result;
+    lseek(fd, 0, SEEK_SET);
     char buffer[4096];
     for (;;) {
         const ssize_t count = read(fd, buffer, sizeof(buffer));
@@ -55,35 +58,68 @@ std::string read_pipe(int fd) {
     return result;
 }
 
+bool wait_bounded(pid_t child, int* status) {
+    timespec started{};
+    clock_gettime(CLOCK_MONOTONIC, &started);
+    for (;;) {
+        const pid_t waited = waitpid(child, status, WNOHANG);
+        if (waited == child) return true;
+        if (waited < 0 && errno == EINTR) continue;
+        if (waited < 0) return false;
+        timespec now{};
+        clock_gettime(CLOCK_MONOTONIC, &now);
+        const time_t elapsed_seconds = now.tv_sec - started.tv_sec;
+        const long elapsed_nanoseconds = now.tv_nsec - started.tv_nsec;
+        if (elapsed_seconds > 5 || (elapsed_seconds == 5 && elapsed_nanoseconds >= 0)) {
+            kill(child, SIGKILL);
+            while (waitpid(child, status, 0) < 0 && errno == EINTR) {
+            }
+            return false;
+        }
+        usleep(1000);
+    }
+}
+
+bool make_capture_files(int fds[2]) {
+    char output_template[] = "/tmp/rut-nginx-convert-out-XXXXXX";
+    char error_template[] = "/tmp/rut-nginx-convert-err-XXXXXX";
+    fds[0] = mkstemp(output_template);
+    fds[1] = mkstemp(error_template);
+    if (fds[0] < 0 || fds[1] < 0) {
+        unlink(output_template);
+        unlink(error_template);
+        if (fds[0] >= 0) close(fds[0]);
+        if (fds[1] >= 0) close(fds[1]);
+        return false;
+    }
+    unlink(output_template);
+    unlink(error_template);
+    return true;
+}
+
 RunResult run_converter(const char* executable,
                         const char* format,
                         const std::string& input,
                         const std::string& path) {
     RunResult result;
-    int output_pipe[2]{};
-    int error_pipe[2]{};
-    if (pipe(output_pipe) != 0 || pipe(error_pipe) != 0) return result;
+    int capture[2]{};
+    if (!make_capture_files(capture)) return result;
     const pid_t child = fork();
     if (child == 0) {
-        dup2(output_pipe[1], STDOUT_FILENO);
-        dup2(error_pipe[1], STDERR_FILENO);
-        close(output_pipe[0]);
-        close(output_pipe[1]);
-        close(error_pipe[0]);
-        close(error_pipe[1]);
+        if (dup2(capture[0], STDOUT_FILENO) < 0 || dup2(capture[1], STDERR_FILENO) < 0) _exit(126);
+        close(capture[0]);
+        close(capture[1]);
         execl(executable, executable, "--format", format, input.c_str(), nullptr);
         _exit(127);
     }
-    close(output_pipe[1]);
-    close(error_pipe[1]);
     if (child < 0) {
-        close(output_pipe[0]);
-        close(error_pipe[0]);
+        close(capture[0]);
+        close(capture[1]);
         return result;
     }
-    result.out = read_pipe(output_pipe[0]);
-    result.err = read_pipe(error_pipe[0]);
-    waitpid(child, &result.status, 0);
+    wait_bounded(child, &result.status);
+    result.out = read_fd(capture[0]);
+    result.err = read_fd(capture[1]);
     (void)path;
     return result;
 }
@@ -98,12 +134,11 @@ RunResult run_converter_to_file(const char* executable,
     const pid_t child = fork();
     if (child == 0) {
         const int output = open(output_path.c_str(), O_WRONLY);
-        if (output >= 0) dup2(output, STDOUT_FILENO);
-        dup2(error_pipe[1], STDERR_FILENO);
+        if (output < 0 || dup2(output, STDOUT_FILENO) < 0 || dup2(error_pipe[1], STDERR_FILENO) < 0)
+            _exit(126);
         if (output >= 0) close(output);
         close(error_pipe[0]);
         close(error_pipe[1]);
-        if (output < 0) _exit(126);
         execl(executable, executable, "--format", format, input.c_str(), nullptr);
         _exit(127);
     }
@@ -112,8 +147,8 @@ RunResult run_converter_to_file(const char* executable,
         close(error_pipe[0]);
         return result;
     }
-    result.err = read_pipe(error_pipe[0]);
-    waitpid(child, &result.status, 0);
+    wait_bounded(child, &result.status);
+    result.err = read_fd(error_pipe[0]);
     return result;
 }
 
@@ -126,8 +161,8 @@ RunResult run_converter_to_broken_pipe(const char* executable,
     if (pipe(output_pipe) != 0 || pipe(error_pipe) != 0) return result;
     const pid_t child = fork();
     if (child == 0) {
-        dup2(output_pipe[1], STDOUT_FILENO);
-        dup2(error_pipe[1], STDERR_FILENO);
+        if (dup2(output_pipe[1], STDOUT_FILENO) < 0 || dup2(error_pipe[1], STDERR_FILENO) < 0)
+            _exit(126);
         close(output_pipe[0]);
         close(output_pipe[1]);
         close(error_pipe[0]);
@@ -142,8 +177,31 @@ RunResult run_converter_to_broken_pipe(const char* executable,
         close(error_pipe[0]);
         return result;
     }
-    result.err = read_pipe(error_pipe[0]);
-    waitpid(child, &result.status, 0);
+    wait_bounded(child, &result.status);
+    result.err = read_fd(error_pipe[0]);
+    return result;
+}
+
+RunResult run_converter_wrong_argc(const char* executable) {
+    RunResult result;
+    int capture[2]{};
+    if (!make_capture_files(capture)) return result;
+    const pid_t child = fork();
+    if (child == 0) {
+        if (dup2(capture[0], STDOUT_FILENO) < 0 || dup2(capture[1], STDERR_FILENO) < 0) _exit(126);
+        close(capture[0]);
+        close(capture[1]);
+        execl(executable, executable, "--format", "server", nullptr);
+        _exit(127);
+    }
+    if (child < 0) {
+        close(capture[0]);
+        close(capture[1]);
+        return result;
+    }
+    wait_bounded(child, &result.status);
+    result.out = read_fd(capture[0]);
+    result.err = read_fd(capture[1]);
     return result;
 }
 
@@ -215,11 +273,51 @@ TEST(nginx_convert, rejects_usage_missing_malformed_and_special_inputs_without_s
     CHECK(wrong_format.out.empty());
     CHECK(wrong_format.err.find("usage:") == 0u);
 
-    const RunResult missing =
-        run_converter(g_executable, "server", std::string{}, directory + "/missing.conf");
+    const RunResult missing = run_converter(
+        g_executable, "server", directory + "/missing.conf", directory + "/missing.conf");
     REQUIRE(WIFEXITED(missing.status));
     CHECK_EQ(WEXITSTATUS(missing.status), 1);
     CHECK(missing.out.empty());
+
+    const std::string empty_path = directory + "/empty.conf";
+    REQUIRE(write_file(empty_path, std::string{}));
+    const RunResult empty = run_converter(g_executable, "server", empty_path, empty_path);
+    REQUIRE(WIFEXITED(empty.status));
+    CHECK_EQ(WEXITSTATUS(empty.status), 1);
+    CHECK(empty.out.empty());
+
+    const std::string wrapper_path = directory + "/wrapper.conf";
+    REQUIRE(write_file(wrapper_path, "events {}\nserver {}\n"));
+    const RunResult wrapper = run_converter(g_executable, "server", wrapper_path, wrapper_path);
+    REQUIRE(WIFEXITED(wrapper.status));
+    CHECK_EQ(WEXITSTATUS(wrapper.status), 1);
+    CHECK(wrapper.out.empty());
+
+    const std::string unsupported_path = directory + "/unsupported.conf";
+    REQUIRE(write_file(unsupported_path,
+                       "server { listen 8080; location / { add_header X-Test yes; "
+                       "proxy_pass http://127.0.0.1:9000; } }\n"));
+    const RunResult unsupported =
+        run_converter(g_executable, "server", unsupported_path, unsupported_path);
+    REQUIRE(WIFEXITED(unsupported.status));
+    CHECK_EQ(WEXITSTATUS(unsupported.status), 1);
+    CHECK(unsupported.out.empty());
+
+    const std::string wrong_grammar_path = directory + "/wrong-grammar.conf";
+    REQUIRE(write_file(wrong_grammar_path,
+                       "server { listen 8080; location / { proxy_pass "
+                       "http://127.0.0.1:9000; }\n"));
+    const RunResult wrong_grammar =
+        run_converter(g_executable, "server", wrong_grammar_path, wrong_grammar_path);
+    REQUIRE(WIFEXITED(wrong_grammar.status));
+    CHECK_EQ(WEXITSTATUS(wrong_grammar.status), 1);
+    CHECK(wrong_grammar.out.empty());
+
+    const RunResult wrong_argc = run_converter_wrong_argc(g_executable);
+    REQUIRE(WIFEXITED(wrong_argc.status));
+    CHECK_EQ(WEXITSTATUS(wrong_argc.status), 2);
+    CHECK(wrong_argc.out.empty());
+    CHECK(wrong_argc.err.find("usage:") == 0u);
 
     const std::string fifo_path = directory + "/input.fifo";
     REQUIRE_EQ(mkfifo(fifo_path.c_str(), 0600), 0);
