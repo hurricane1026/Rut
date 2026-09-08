@@ -1407,7 +1407,8 @@ TEST(nginx_converter, authenticates_access_log_off_and_complete_envelope) {
     forged_config.http.source.len++;
     REQUIRE_FALSE(nginx::lower_to_rut(forged_config));
     forged_config = config.value();
-    forged_config.source.ptr = reinterpret_cast<const char*>(static_cast<uintptr_t>(1));
+    forged_config.source.ptr = reinterpret_cast<const char*>(UINTPTR_MAX - 7u);
+    forged_config.source.len = UINT32_MAX;
     REQUIRE_FALSE(nginx::lower_to_rut(forged_config));
     forged_config = config.value();
     forged_config.source.len++;
