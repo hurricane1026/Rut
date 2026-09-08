@@ -52377,6 +52377,11 @@ static bool validate_converter_request_length_source(const std::string& source,
         "\"Upgrade\"],\n"
         "            retained_header_value: \"trim_sp_preserve_htab\"\n"
         "        },\n";
+    const bool custom_hide_header = proxy_hide_header_name != nullptr;
+    const u32 expected_forward_count = custom_hide_header ? 3u : 4u;
+    const u32 expected_retained_policy_count = custom_hide_header ? 0u : 1u;
+    const u32 expected_content_length_branch_count = custom_hide_header ? 0u : 1u;
+    const u32 expected_timeout_count = custom_hide_header ? 1u : 2u;
     if (frontend_port == 0u || backend_port < 1024u || backend_port > 9999u ||
         frontend_port == backend_port || (require_access_log && access_path.empty()) ||
         (require_access_log && source.rfind(declaration, 0u) != 0u) ||
@@ -52386,12 +52391,14 @@ static bool validate_converter_request_length_source(const std::string& source,
         count_text(source, listener) != 1u || count_text(source, upstream) != 1u ||
         count_text(source, "route GET \"/\"") != 1u ||
         count_text(source, kFixedRequestPolicy) != 3u ||
-        count_text(source, kRetainedRequestPolicy) != 1u ||
-        count_text(source, "    if req.hasContentLength {\n") != 1u ||
-        count_text(source, "return forward(nginx_upstream,") != 4u ||
-        count_text(source, "        response_read_timeout: 60s,\n") != 2u ||
-        count_text(source, "        response_buffering: \"complete_content_length\"\n") != 2u ||
-        count_text(source, "        timeout_failure_policy: {\n") != 2u ||
+        count_text(source, kRetainedRequestPolicy) != expected_retained_policy_count ||
+        count_text(source, "    if req.hasContentLength {\n") !=
+            expected_content_length_branch_count ||
+        count_text(source, "return forward(nginx_upstream,") != expected_forward_count ||
+        count_text(source, "        response_read_timeout: 60s,\n") != expected_timeout_count ||
+        count_text(source, "        response_buffering: \"complete_content_length\"\n") !=
+            expected_timeout_count ||
+        count_text(source, "        timeout_failure_policy: {\n") != expected_timeout_count ||
         (require_access_log && count_text(source, "format: downstreamRequestBytes") != 1u) ||
         (require_access_log && count_text(source, "publication: live") != 1u) ||
         (proxy_hide_header_name != nullptr &&
@@ -52409,10 +52416,60 @@ static bool validate_converter_request_length_source(const std::string& source,
         error = "#362 converter-generated ordinary RUT inventory was not exact";
         return false;
     }
-    if (!validate_exact_loopback_conditional_get_structure(source, error, "#362") ||
-        (require_access_log &&
-         !run_exact_loopback_conditional_get_mutation_self_checks(source, error, "#362")))
-        return false;
+    if (!custom_hide_header) {
+        if (!validate_exact_loopback_conditional_get_structure(source, error, "#362") ||
+            (require_access_log &&
+             !run_exact_loopback_conditional_get_mutation_self_checks(source, error, "#362")))
+            return false;
+    } else {
+        const auto lexed = rut::lex({source.data(), static_cast<u32>(source.size())});
+        if (!lexed) {
+            error = "#600 custom-hide generated ordinary RUT did not lex";
+            return false;
+        }
+        const auto parsed = rut::parse_file(lexed.value());
+        if (!parsed) {
+            error = "#600 custom-hide generated ordinary RUT did not parse";
+            return false;
+        }
+        std::unique_ptr<rut::AstFile> ast(parsed.value());
+        bool head = false;
+        bool get = false;
+        bool any = false;
+        for (u32 index = 0u; index < ast->items.len; index++) {
+            const auto& item = ast->items[index];
+            if (item.kind != rut::AstItemKind::Route || !item.route.path.eq({"/", 1u}) ||
+                item.route.statements.len != 1u || item.route.statements[0] == nullptr ||
+                item.route.statements[0]->kind != rut::AstStmtKind::ForwardUpstream ||
+                !item.route.statements[0]->has_forward_request_policy ||
+                !item.route.statements[0]->has_forward_response_policy ||
+                !item.route.statements[0]->has_forward_failure_policy)
+                continue;
+            if (item.route.method_is_any) {
+                if (any) {
+                    error = "#600 custom-hide generated ordinary RUT duplicated Any route";
+                    return false;
+                }
+                any = true;
+            } else if (item.route.method == static_cast<rut::u8>(rut::TokenType::KwHead)) {
+                if (head) {
+                    error = "#600 custom-hide generated ordinary RUT duplicated HEAD route";
+                    return false;
+                }
+                head = true;
+            } else if (item.route.method == static_cast<rut::u8>(rut::TokenType::KwGet)) {
+                if (get) {
+                    error = "#600 custom-hide generated ordinary RUT duplicated GET route";
+                    return false;
+                }
+                get = true;
+            }
+        }
+        if (!head || !get || !any) {
+            error = "#600 custom-hide generated ordinary RUT lacked exact HEAD/GET/Any routes";
+            return false;
+        }
+    }
     return true;
 }
 
