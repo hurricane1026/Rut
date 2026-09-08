@@ -2440,6 +2440,17 @@ enum class GatedResponseWriteEofPeerTerminal : unsigned char {
     Error,
 };
 
+using PeerClosePublicationCallback = void (*)(void*);
+
+static void publish_peer_close(std::atomic<bool>& flag,
+                               std::atomic<u32>& count,
+                               PeerClosePublicationCallback callback = nullptr,
+                               void* context = nullptr) {
+    count.fetch_add(1u, std::memory_order_release);
+    if (callback != nullptr) callback(context);
+    flag.store(true, std::memory_order_release);
+}
+
 struct Recorder {
     int listen_fd = -1;
     u16 port = 0;
@@ -2696,10 +2707,8 @@ struct Recorder {
                                     .count());
                             self->zero_response_stall_peer_closed_ns.store(
                                 closed_ns, std::memory_order_relaxed);
-                            self->zero_response_stall_peer_closed.store(true,
-                                                                        std::memory_order_release);
-                            self->zero_response_stall_peer_close_count.fetch_add(
-                                1u, std::memory_order_release);
+                            publish_peer_close(self->zero_response_stall_peer_closed,
+                                               self->zero_response_stall_peer_close_count);
                         } else if (n > 0) {
                             self->zero_response_stall_unexpected_data.store(
                                 true, std::memory_order_release);
@@ -2967,10 +2976,9 @@ struct Recorder {
                                                         GatedResponseWriteEofPeerTerminal::Reset) {
                                                     self->response_peer_closed_ns.store(
                                                         terminal_ns, std::memory_order_relaxed);
-                                                    self->response_peer_closed.store(
-                                                        true, std::memory_order_release);
-                                                    self->response_peer_close_count.fetch_add(
-                                                        1u, std::memory_order_release);
+                                                    publish_peer_close(
+                                                        self->response_peer_closed,
+                                                        self->response_peer_close_count);
                                                 }
                                                 self->response_write_eof_peer_terminal_ns.store(
                                                     terminal_ns, std::memory_order_relaxed);
@@ -3060,9 +3068,8 @@ struct Recorder {
                                     .count());
                             self->response_peer_closed_ns.store(closed_ns,
                                                                 std::memory_order_relaxed);
-                            self->response_peer_closed.store(true, std::memory_order_release);
-                            self->response_peer_close_count.fetch_add(1u,
-                                                                      std::memory_order_release);
+                            publish_peer_close(self->response_peer_closed,
+                                               self->response_peer_close_count);
                         } else if (n > 0) {
                             self->response_peer_unexpected_data.store(true,
                                                                       std::memory_order_release);
@@ -3246,6 +3253,41 @@ struct Recorder {
 };
 
 static bool run_gated_fragment_peer_probe_self_check(std::string& error) {
+    struct PublicationObservation {
+        std::atomic<bool>* flag;
+        std::atomic<u32>* count;
+        bool flag_seen = false;
+        u32 count_seen = 0u;
+    } observation{nullptr, nullptr};
+    const auto observe_publication = [](void* opaque) {
+        auto& state = *static_cast<PublicationObservation*>(opaque);
+        state.flag_seen = state.flag->load(std::memory_order_acquire);
+        state.count_seen = state.count->load(std::memory_order_acquire);
+    };
+    std::atomic<bool> published{false};
+    std::atomic<u32> publication_count{0u};
+    observation.flag = &published;
+    observation.count = &publication_count;
+    publish_peer_close(published, publication_count, observe_publication, &observation);
+    if (observation.flag_seen || observation.count_seen != 1u ||
+        !published.load(std::memory_order_acquire) ||
+        publication_count.load(std::memory_order_acquire) != 1u) {
+        error = "gated-fragment peer-close publication did not expose count before flag";
+        return false;
+    }
+    published.store(false, std::memory_order_relaxed);
+    publication_count.store(0u, std::memory_order_relaxed);
+    observation.flag_seen = false;
+    observation.count_seen = 0u;
+    published.store(true, std::memory_order_release);
+    observe_publication(&observation);
+    publication_count.fetch_add(1u, std::memory_order_release);
+    if (!observation.flag_seen || observation.count_seen != 0u ||
+        publication_count.load(std::memory_order_acquire) != 1u) {
+        error = "gated-fragment peer-close old-order control did not expose true/0";
+        return false;
+    }
+
     static constexpr char kRequest[] =
         "GET /gated-fragment-probe HTTP/1.1\r\n"
         "Host: fixture.example\r\n\r\n";
@@ -4376,8 +4418,7 @@ struct TimeoutHeadPhaseRecorder {
                     char unexpected[64];
                     const ssize_t n = recv(client, unexpected, sizeof(unexpected), 0);
                     if (n == 0 || (n < 0 && errno == ECONNRESET)) {
-                        self->peer_closed.store(true, std::memory_order_release);
-                        self->peer_close_count.fetch_add(1u, std::memory_order_release);
+                        publish_peer_close(self->peer_closed, self->peer_close_count);
                     } else if (n > 0) {
                         self->peer_unexpected_data.store(true, std::memory_order_release);
                     } else if (errno != EINTR && errno != EAGAIN && errno != EWOULDBLOCK) {
