@@ -2566,16 +2566,20 @@ TEST(nginx_parser, rejects_proxy_buffering_unsupported_grammar_and_contexts) {
         "http://127.0.0.1:9000; } }",
         "server { listen 8080; location / { location /nested { proxy_buffering on; } "
         "proxy_pass http://127.0.0.1:9000; } }",
-        "server { listen 8080; location / { proxy_buffering; proxy_pass "
-        "http://127.0.0.1:9000; } }",
         "server { listen 8080; location / { proxy_buffering on proxy_pass "
         "http://127.0.0.1:9000; } }",
     };
     for (const char* source : sources) {
         const auto parsed = nginx::parse({source, static_cast<u32>(strlen(source))});
-        CHECK_FALSE(parsed);
+        REQUIRE_FALSE(parsed);
         CHECK_EQ(parsed.error().code, FrontendError::UnsupportedSyntax);
     }
+    const char missing_value[] =
+        "server { listen 8080; location / { proxy_buffering; proxy_pass "
+        "http://127.0.0.1:9000; } }";
+    const auto missing_value_result = nginx::parse({missing_value, sizeof(missing_value) - 1u});
+    REQUIRE_FALSE(missing_value_result);
+    CHECK_EQ(missing_value_result.error().code, FrontendError::UnexpectedToken);
     const char comment_only[] =
         "server { listen 8080; location / { # proxy_buffering off\n proxy_pass "
         "http://127.0.0.1:9000; } }";
