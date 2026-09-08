@@ -54,8 +54,12 @@ rut-nginx-convert --format nginx-http <input-file>
 `server` accepts one bare server fragment and `http` accepts one bounded
 `http {}` profile with the existing `log_format`/`access_log` declarations.
 `nginx-http` accepts exactly one empty `events {}` block followed by that same
-bounded logged HTTP profile; it is not general nginx.conf support and does not
-claim that an empty events block is semantically inert.
+bounded logged HTTP profile. This is complete-file envelope admission, not a
+claim that an empty events block is semantically inert or that arbitrary
+nginx.conf files are supported. The retained-header behavior evidence covers
+only the separately documented omitted-default runtime vector; parser
+admission does not promote arbitrary directives or configurations to that
+behavioral claim.
 The input must be one regular file no larger than 1 MiB; the complete file is
 kept alive through parsing and lowering. The command does not read stdin,
 expand includes, execute generated RUT, open configured listeners or log
