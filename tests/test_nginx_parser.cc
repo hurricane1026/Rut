@@ -651,7 +651,7 @@ TEST(nginx_complete_parser, compares_all_embedded_fields_for_nondefault_http_pro
         "      proxy_pass http://127.0.0.1:9000;\n"
         "      proxy_read_timeout 2s;\n"
         "      proxy_buffering on;\n"
-        "      proxy_hide_header X-Test;\n"
+        "      proxy_hide_header X-Compat-Hidden;\n"
         "    }\n"
         "    location = /health { return 200 \"ok\"; }\n"
         "  }\n"
@@ -667,8 +667,8 @@ TEST(nginx_complete_parser, compares_all_embedded_fields_for_nondefault_http_pro
     CHECK(parsed.value().http.server.location.proxy_read_timeout.present);
     CHECK(parsed.value().http.server.location.proxy_buffering.present);
     CHECK(parsed.value().http.server.location.proxy_hide_header.present);
-    CHECK(parsed.value().http.exact_local_return.present);
-    CHECK_EQ(parsed.value().http.exact_local_return.response.status, 200u);
+    CHECK(parsed.value().http.server.exact_local_return.present);
+    CHECK_EQ(parsed.value().http.server.exact_local_return.response.status, 200u);
 }
 
 TEST(nginx_complete_parser, rebases_http_errors_and_rejects_envelope_shapes) {
