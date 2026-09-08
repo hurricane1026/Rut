@@ -74356,16 +74356,16 @@ int main(int argc, char** argv) {
         (argc == 4 && argv[1][0] == '/' && argv[2][0] == '/' && argv[3][0] == '/');
     if ((!nginx_preload_loader_preflight && !nginx_gate_spike && !nginx_coalesced_ingress_gate &&
          !rut_iouring_gate_recv_owner_diagnostics_self_check && !exact_local_return_baseline &&
-         !root_proxy_trace_oracle && !api_proxy_trace_oracle &&
-         !exact_absolute_redirect_oracle && !exact_absolute_redirect_302_oracle &&
-         !api_non_root_proxy_uri_oracle && !service_root_proxy_uri_oracle &&
-         !wildcard_service_no_uri_oracle && !converter_wildcard_service_no_uri_differential &&
-         !static_query_proxy_uri_oracle && !zero_suffix_static_query_proxy_uri_oracle &&
-         !empty_query_proxy_uri_oracle && !root_empty_query_proxy_uri_oracle &&
-         !proxy_hide_header_oracle && !proxy_hide_header_name_oracle &&
-         !proxy_hide_header_source_self_check && !proxy_hide_header_generated_side_self_check &&
-         !explicit_timeout_head_source_self_check && !explicit_timeout_head_generated_episode &&
-         !explicit_timeout_head_phase_differential && !keepalive_timeout_head_differential &&
+         !root_proxy_trace_oracle && !api_proxy_trace_oracle && !exact_absolute_redirect_oracle &&
+         !exact_absolute_redirect_302_oracle && !api_non_root_proxy_uri_oracle &&
+         !service_root_proxy_uri_oracle && !wildcard_service_no_uri_oracle &&
+         !converter_wildcard_service_no_uri_differential && !static_query_proxy_uri_oracle &&
+         !zero_suffix_static_query_proxy_uri_oracle && !empty_query_proxy_uri_oracle &&
+         !root_empty_query_proxy_uri_oracle && !proxy_hide_header_oracle &&
+         !proxy_hide_header_name_oracle && !proxy_hide_header_source_self_check &&
+         !proxy_hide_header_generated_side_self_check && !explicit_timeout_head_source_self_check &&
+         !explicit_timeout_head_generated_episode && !explicit_timeout_head_phase_differential &&
+         !keepalive_timeout_head_differential &&
          !keepalive_timeout_get_initial_deadline_differential &&
          !fixed_upload_head_success_differential &&
          !fixed_upload_head_zero_response_timeout_differential &&
