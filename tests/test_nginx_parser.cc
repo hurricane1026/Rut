@@ -1383,10 +1383,14 @@ TEST(nginx_converter, authenticates_access_log_off_and_complete_envelope) {
     forged_config.http.access_log.path_span.start++;
     const auto config_rejected = nginx::lower_to_rut(forged_config);
     REQUIRE_FALSE(config_rejected);
-    CHECK_EQ(config_rejected.error().span.start, config.value().http_span.start);
-    CHECK_EQ(config_rejected.error().span.end, config.value().http_span.end);
-    CHECK_EQ(config_rejected.error().span.line, config.value().http_span.line);
-    CHECK_EQ(config_rejected.error().span.col, config.value().http_span.col);
+    const size_t access_offset = complete.find("access_log");
+    REQUIRE(access_offset != std::string::npos);
+    const size_t access_end = complete.find(';', access_offset);
+    REQUIRE(access_end != std::string::npos);
+    CHECK_EQ(config_rejected.error().span.start, static_cast<u32>(access_offset));
+    CHECK_EQ(config_rejected.error().span.end, static_cast<u32>(access_end + 1u));
+    CHECK_EQ(config_rejected.error().span.line, 3u);
+    CHECK_EQ(config_rejected.error().span.col, 3u);
     forged_config = config.value();
     forged_config.span.start++;
     REQUIRE_FALSE(nginx::lower_to_rut(forged_config));
