@@ -4002,14 +4002,14 @@ void handle_jit_outcome(Loop* loop,
                     ResponseReadDeadlineProfile::BodylessNonHeadContentLengthZero &&
                 conn.req_method == static_cast<u8>(LogHttpMethod::Get) &&
                 conn.response_read_deadline_route_method == kRouteMethodGet &&
-                ((!strict_pipeline_successor &&
+                ((!strict_pipeline_successor && http1_pipeline_request_is_legacy(conn) &&
                   bodyless_get_complete_content_length_request_policy_is_admitted(
                       outcome.request_policy_id)) ||
                  (strict_pipeline_successor &&
                   outcome.request_policy_id ==
                       static_cast<u16>(RequestPolicyId::Http11FixedTrimSpPreserveHtab) &&
-                  http1_pipeline_successor_materialization_is_stable(
-                      conn, outcome.request_policy_id)));
+                  http1_pipeline_successor_materialization_is_stable(conn,
+                                                                     outcome.request_policy_id)));
             if (outcome.request_policy_id != 0 &&
                 (!(complete_content_length_buffering
                        ? (complete_content_length_request_policy_is_admitted(

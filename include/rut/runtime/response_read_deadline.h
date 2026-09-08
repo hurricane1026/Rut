@@ -1424,8 +1424,8 @@ inline bool http1_pipeline_request_generation_jit_candidate_is_stable(
 // validator at the request-policy boundary: apply_request_policy() must be
 // able to reject a forged successor before it resets scratch/recv storage or
 // any upstream slot/connect/send state is acquired.
-inline bool http1_pipeline_successor_materialization_is_stable(
-    const Connection& c, u16 candidate_request_policy_id) {
+inline bool http1_pipeline_successor_materialization_is_stable(const Connection& c,
+                                                               u16 candidate_request_policy_id) {
     if (!request_policy_trims_sp_preserves_htab(candidate_request_policy_id) ||
         http1_pipeline_request_is_legacy(c) ||
         c.response_read_deadline_state != ResponseReadDeadlineState::Validated ||
@@ -1433,13 +1433,14 @@ inline bool http1_pipeline_successor_materialization_is_stable(
             ResponseReadDeadlineProfile::BodylessNonHeadContentLengthZero ||
         c.response_read_deadline_buffering != ForwardResponseBufferingMode::CompleteContentLength ||
         c.response_read_deadline_method != static_cast<u8>(LogHttpMethod::Get) ||
-        c.response_read_deadline_route_method != kRouteMethodGet || c.req_method !=
-            static_cast<u8>(LogHttpMethod::Get) || c.response_read_deadline_owner_generation == 0 ||
+        c.response_read_deadline_route_method != kRouteMethodGet ||
+        c.req_method != static_cast<u8>(LogHttpMethod::Get) ||
+        c.response_read_deadline_owner_generation == 0 ||
         c.response_read_deadline_owner_generation != c.response_read_deadline_generation ||
         c.response_read_deadline_bundle_id == 0 || c.request_config == nullptr ||
         !c.request_config->policy_bundle_id_is_valid(c.response_read_deadline_bundle_id) ||
-        c.request_config->policy_bundles[c.response_read_deadline_bundle_id - 1].response_buffering !=
-            ForwardResponseBufferingMode::CompleteContentLength ||
+        c.request_config->policy_bundles[c.response_read_deadline_bundle_id - 1]
+                .response_buffering != ForwardResponseBufferingMode::CompleteContentLength ||
         c.pipeline_stash_len != 0 || c.recv_buf.data() == nullptr || c.req_header_end == 0 ||
         c.req_header_end != c.req_initial_send_len || c.req_initial_send_len != c.recv_buf.len() ||
         c.req_client_has_content_length || c.req_client_content_length_count != 0 ||
@@ -1686,15 +1687,15 @@ inline bool response_read_deadline_owner_is_stable(const Connection& c,
             c, c.response_read_deadline_upload);
     if ((depth0_id3 || id1_materialized) &&
         !response_read_deadline_coalesced_get_phase1_proof_is_stable(
-                                         c,
-                                         c.response_read_deadline_upload,
-                                         /*allow_retired_episode=*/false,
-                                         /*require_upload_episode=*/true,
-                                         c.response_read_deadline_profile,
-                                         c.response_read_deadline_buffering,
-                                         c.response_read_deadline_bundle_id,
-                                         c.response_read_deadline_method,
-                                         c.response_read_deadline_route_method))
+            c,
+            c.response_read_deadline_upload,
+            /*allow_retired_episode=*/false,
+            /*require_upload_episode=*/true,
+            c.response_read_deadline_profile,
+            c.response_read_deadline_buffering,
+            c.response_read_deadline_bundle_id,
+            c.response_read_deadline_method,
+            c.response_read_deadline_route_method))
         return false;
     const auto& response = cfg->response_policies[bundle.response_policy_id - 1];
     const auto& failure = cfg->failure_policies[bundle.failure_policy_id - 1];
@@ -2171,15 +2172,15 @@ inline bool response_read_deadline_post_commit_is_stable(const Connection& c) {
             c, c.response_read_deadline_upload);
     if ((depth0_id3 || id1_materialized) &&
         !response_read_deadline_coalesced_get_phase1_proof_is_stable(
-                                         c,
-                                         c.response_read_deadline_upload,
-                                         retired_buffered_send,
-                                         /*require_upload_episode=*/true,
-                                         c.response_read_deadline_profile,
-                                         c.response_read_deadline_buffering,
-                                         c.response_read_deadline_bundle_id,
-                                         c.response_read_deadline_method,
-                                         c.response_read_deadline_route_method))
+            c,
+            c.response_read_deadline_upload,
+            retired_buffered_send,
+            /*require_upload_episode=*/true,
+            c.response_read_deadline_profile,
+            c.response_read_deadline_buffering,
+            c.response_read_deadline_bundle_id,
+            c.response_read_deadline_method,
+            c.response_read_deadline_route_method))
         return false;
     const auto& bundle = cfg->policy_bundles[bundle_id - 1];
     const bool collecting = c.response_read_deadline_post_commit_phase ==

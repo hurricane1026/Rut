@@ -608,6 +608,17 @@ static u64 response_buffering_request_policy_runtime_handler(
         .pack();
 }
 
+static u32 strict_id3_successor_handler_calls = 0;
+static u16 strict_id3_successor_second_policy =
+    static_cast<u16>(RequestPolicyId::Http11FixedTrimSpPreserveHtab);
+static u64 strict_id3_successor_handler(void*, jit::HandlerCtx*, const u8*, u32, void*) {
+    ++strict_id3_successor_handler_calls;
+    const u16 policy = strict_id3_successor_handler_calls == 1
+                           ? static_cast<u16>(RequestPolicyId::Http11FixedStrip)
+                           : strict_id3_successor_second_policy;
+    return jit::HandlerResult::make_forward_with_bundle(0, policy, 2).pack();
+}
+
 static u32 response_coalesced_phase1_handler_calls = 0;
 static u32 response_coalesced_phase1_handler_len = 0;
 static bool response_coalesced_phase1_handler_saw_successor = false;
@@ -31698,12 +31709,15 @@ void cleanup_late_failure_fixture(IoUringEventLoop* loop, PreconnectConnectSubmi
     fixture.conn = nullptr;
 }
 
-bool stage_pipeline_generation_successor_upload(IoUringEventLoop* loop,
-                                                RouteConfig& config,
-                                                PreconnectConnectSubmitFixture* out,
-                                                bool terminal_downstream_recv = false,
-                                                const u8* successor = nullptr,
-                                                u32 successor_len = 0) {
+bool stage_pipeline_generation_successor_upload(
+    IoUringEventLoop* loop,
+    RouteConfig& config,
+    PreconnectConnectSubmitFixture* out,
+    bool terminal_downstream_recv = false,
+    const u8* successor = nullptr,
+    u32 successor_len = 0,
+    jit::HandlerFn handler = &response_buffering_request_policy_runtime_handler,
+    const char* expected_upstream_wire = nullptr) {
     static constexpr u8 kDefaultSuccessor[] = "GET /one HTTP/1.1\r\nHost: client.example\r\n\r\n";
     if (loop == nullptr || out == nullptr) return false;
     if (successor == nullptr) {
@@ -31717,7 +31731,7 @@ bool stage_pipeline_generation_successor_upload(IoUringEventLoop* loop,
                                      AsyncConnectFailureProfile::BodylessGet,
                                      out,
                                      &ignored_episode,
-                                     &response_buffering_request_policy_runtime_handler))
+                                     handler))
         return false;
     Connection& conn = *out->conn;
     if (conn.recv_buf.write(successor, successor_len) != successor_len) return false;
@@ -31756,6 +31770,15 @@ bool stage_pipeline_generation_successor_upload(IoUringEventLoop* loop,
     const u32 upload_len = loop->backend.upstream_send_state[conn.id].remaining;
     if (upload_len == 0 || upload_len != conn.response_read_deadline_upload.expected_upload_length)
         return false;
+    if (expected_upstream_wire != nullptr) {
+        const u32 expected_len = static_cast<u32>(__builtin_strlen(expected_upstream_wire));
+        if (loop->backend.upstream_send_state[conn.id].src == nullptr ||
+            upload_len != expected_len ||
+            __builtin_memcmp(loop->backend.upstream_send_state[conn.id].src,
+                             expected_upstream_wire,
+                             expected_len) != 0)
+            return false;
+    }
     __atomic_store_n(loop->backend.sq_tail, ring_tail, __ATOMIC_RELEASE);
     loop->backend.pending = backend_pending;
     loop->backend.upstream_send_state[conn.id].offset = upload_len;
@@ -32803,6 +32826,101 @@ TEST(http1_pipeline_generation_activation,
                 cleanup_late_failure_fixture(loop, fixture);
             }
         }
+    }
+}
+
+TEST(http1_pipeline_generation_activation,
+     strict_successor_id3_retains_htab_before_upstream_send_and_keeps_id1_control) {
+    static constexpr u8 kSuccessor[] =
+        "GET /one HTTP/1.1\r\nHost: client.example\r\nX-Test:\t keep \t\r\n\r\n";
+    static constexpr char kExpectedWire[] =
+        "GET /one HTTP/1.1\r\nHost: 127.0.0.1:9000\r\nX-Test: \t keep \t\r\n\r\n";
+    ScopedBackendHealthReset health_reset{};
+    ScopedIoUringLoopForRetirement guard;
+    if (!guard.init()) SKIP("io_uring unavailable");
+    auto* loop = guard.loop;
+    RouteConfig config{};
+    PreconnectConnectSubmitFixture fixture{};
+    strict_id3_successor_handler_calls = 0;
+    REQUIRE(stage_pipeline_generation_successor_upload(loop,
+                                                       config,
+                                                       &fixture,
+                                                       false,
+                                                       kSuccessor,
+                                                       sizeof(kSuccessor) - 1u,
+                                                       &strict_id3_successor_handler,
+                                                       kExpectedWire));
+    Connection& conn = *fixture.conn;
+    REQUIRE_EQ(strict_id3_successor_handler_calls, 2u);
+    REQUIRE_EQ(conn.request_policy_id,
+               static_cast<u16>(RequestPolicyId::Http11FixedTrimSpPreserveHtab));
+    REQUIRE_EQ(conn.response_read_deadline_upload.request_policy_id, conn.request_policy_id);
+    REQUIRE_EQ(conn.response_read_deadline_upload.raw_header_end, 0u);
+    REQUIRE_EQ(conn.response_read_deadline_upload.raw_content_length, 0u);
+    REQUIRE_EQ(conn.response_read_deadline_upload.raw_total_length, 0u);
+    REQUIRE_EQ(conn.response_read_deadline_upload.rewritten_header_end,
+               conn.response_read_deadline_upload.rewritten_total_length);
+    REQUIRE_EQ(conn.response_read_deadline_upload.expected_upload_length,
+               conn.response_read_deadline_upload.rewritten_total_length);
+    REQUIRE(http1_pipeline_request_generation_upload_active_is_stable(
+        conn,
+        conn.response_read_deadline_upload,
+        conn.response_read_deadline_profile,
+        conn.response_read_deadline_buffering,
+        conn.response_read_deadline_method,
+        conn.response_read_deadline_route_method));
+    cleanup_late_failure_fixture(loop, fixture);
+}
+
+TEST(http1_pipeline_generation_activation,
+     strict_successor_id3_rejects_adversarial_callback_inputs_before_transport) {
+    enum class Forgery : u8 { WrongPolicy, ContentLengthZero, WrongDepth, TrailingThirdRequest };
+    static constexpr u8 kSuccessor[] =
+        "GET /one HTTP/1.1\r\nHost: client.example\r\nX-Test:\t keep \t\r\n\r\n";
+    static constexpr u8 kContentLengthZero[] =
+        "GET /one HTTP/1.1\r\nHost: client.example\r\nContent-Length: 0\r\n\r\n";
+    for (const Forgery forgery : {Forgery::WrongPolicy,
+                                  Forgery::ContentLengthZero,
+                                  Forgery::WrongDepth,
+                                  Forgery::TrailingThirdRequest}) {
+        ScopedBackendHealthReset health_reset{};
+        ScopedIoUringLoopForRetirement guard;
+        if (!guard.init()) SKIP("io_uring unavailable");
+        auto* loop = guard.loop;
+        RouteConfig config{};
+        PreconnectConnectSubmitFixture fixture{};
+        strict_id3_successor_handler_calls = 0;
+        strict_id3_successor_second_policy =
+            forgery == Forgery::WrongPolicy
+                ? static_cast<u16>(RequestPolicyId::Http11FixedStripContentLengthAfterHost)
+                : static_cast<u16>(RequestPolicyId::Http11FixedTrimSpPreserveHtab);
+        REQUIRE(stage_late_failure_response(loop,
+                                            config,
+                                            LateFailureSite::ConnectCompletion,
+                                            AsyncConnectFailureProfile::BodylessGet,
+                                            &fixture,
+                                            nullptr,
+                                            &strict_id3_successor_handler));
+        Connection& conn = *fixture.conn;
+        const u32 id = conn.id;
+        const u32 response_len = conn.response_header_buf.len();
+        const u8* request = forgery == Forgery::ContentLengthZero ? kContentLengthZero : kSuccessor;
+        const u32 request_len = forgery == Forgery::ContentLengthZero
+                                    ? sizeof(kContentLengthZero) - 1u
+                                    : sizeof(kSuccessor) - 1u;
+        REQUIRE_EQ(conn.recv_buf.write(request, request_len), request_len);
+        if (forgery == Forgery::TrailingThirdRequest)
+            REQUIRE_EQ(conn.recv_buf.write(kSuccessor, sizeof(kSuccessor) - 1u),
+                       sizeof(kSuccessor) - 1u);
+        if (forgery == Forgery::WrongDepth) conn.pipeline_depth = 2;
+        loop->backend.send_state[id].remaining = 0;
+        loop->dispatch({id, static_cast<i32>(response_len), 0, 0, IoEventType::Send, 0});
+        CHECK_EQ(loop->conns[id].fd, -1);
+        CHECK_EQ(loop->conns[id].upstream_fd, -1);
+        CHECK_FALSE(loop->conns[id].upstream_connect_armed);
+        CHECK_FALSE(loop->conns[id].upstream_send_armed);
+        CHECK_EQ(loop->backend.upstream_send_state[id].remaining, 0u);
+        cleanup_late_failure_fixture(loop, fixture);
     }
 }
 
