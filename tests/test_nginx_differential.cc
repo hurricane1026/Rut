@@ -75911,9 +75911,16 @@ int main(int argc, char** argv) {
         const bool write_only_file_created = write_file(write_only_monitor, "x", 1u);
         const int write_only_fd =
             write_only_file_created ? open(write_only_monitor.c_str(), O_WRONLY | O_CLOEXEC) : -1;
+        struct stat write_only_stat{};
+        const bool write_only_is_regular = write_only_fd >= 0 &&
+                                           fstat(write_only_fd, &write_only_stat) == 0 &&
+                                           S_ISREG(write_only_stat.st_mode);
+        negative_error.clear();
         const bool write_only_rejected =
-            write_only_fd >= 0 &&
+            write_only_is_regular &&
             !read_monitored_access_fd(write_only_fd, negative_contents, negative_error);
+        const bool write_only_reports_ebadf =
+            negative_error.find("errno=" + std::to_string(EBADF)) != std::string::npos;
         const bool write_only_closed = write_only_fd < 0 || close(write_only_fd) == 0;
         const bool fifo_created = mkfifo(fifo_monitor.c_str(), 0600) == 0;
         const bool fifo_rejected =
@@ -75927,7 +75934,7 @@ int main(int argc, char** argv) {
                 positive_temp.retained_config_snapshot ||
             !off_absent(off_observation.access) || off_absent(positive_observation.access) ||
             !missing_rejected || !directory_rejected || !write_only_rejected ||
-            !write_only_closed || !fifo_rejected ||
+            !write_only_reports_ebadf || !write_only_closed || !fifo_rejected ||
             !validate_default_access_record(positive_observation.access, oracle_error)) {
             std::cerr << "FAIL [#591 Off/default access oracle]: phase/config comparison failed\n";
             return 1;
