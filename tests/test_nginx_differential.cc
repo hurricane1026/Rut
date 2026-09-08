@@ -1010,6 +1010,7 @@ struct TempDir {
     std::string nginx_log;
     std::string nginx_access_log;
     std::string nginx_default_access_log;
+    std::string nginx_default_error_log;
     std::string nginx_access_snapshot;
     std::string retained_config_snapshot;
     std::string rut_log;
@@ -1028,6 +1029,7 @@ struct TempDir {
         nginx_log = std::string(path) + "/nginx.log";
         nginx_access_log = std::string(path) + "/nginx-access.log";
         nginx_default_access_log = std::string(path) + "/access.log";
+        nginx_default_error_log = std::string(path) + "/error.log";
         nginx_access_snapshot = std::string(path) + "/nginx-access.snapshot";
         rut_log = std::string(path) + "/rut.log";
         rut_access_log = std::string(path) + "/rut-access.log";
@@ -1044,6 +1046,7 @@ struct TempDir {
             unlink(nginx_log.c_str());
             unlink(nginx_access_log.c_str());
             unlink(nginx_default_access_log.c_str());
+            unlink(nginx_default_error_log.c_str());
             unlink(nginx_access_snapshot.c_str());
             unlink(rut_log.c_str());
             unlink((rut_log + ".converter").c_str());
@@ -51114,6 +51117,10 @@ static bool read_monitored_access_file(const std::string& path,
         error = "#591 monitored access path is missing or non-regular";
         return false;
     }
+    if ((file_stat.st_mode & (S_IRUSR | S_IRGRP | S_IROTH)) == 0) {
+        error = "#591 monitored access file is not readable";
+        return false;
+    }
     const int fd = open(path.c_str(), O_RDONLY);
     if (fd < 0) {
         error = "#591 monitored access file could not be opened";
@@ -51166,8 +51173,12 @@ static bool run_pinned_retained_header_whitespace_oracle(TempDir& temp,
                                                          std::string& error,
                                                          bool explicit_cleanup = false,
                                                          bool access_log_off = false,
-                                                         bool default_log = false) {
-    static constexpr char kDiagnostic[] = "#252 pinned retained-header whitespace oracle";
+                                                         bool default_log = false,
+                                                         u16 fixed_frontend_port = 0u,
+                                                         u16 fixed_backend_port = 0u) {
+    const char* kDiagnostic = (access_log_off || default_log)
+                                  ? "#591 pinned nginx Off/default access oracle"
+                                  : "#252 pinned retained-header whitespace oracle";
     static constexpr char kExpectedDownstream[] =
         "HTTP/1.1 200 OK\r\n"
         "Server: nginx/1.29.7\r\n"
@@ -51179,8 +51190,19 @@ static bool run_pinned_retained_header_whitespace_oracle(TempDir& temp,
     HeldLoopbackPorts reservations;
     u16 frontend_port = 0u;
     u16 backend_port = 0u;
-    if (!reservations.reserve_four_digit(0u, frontend_port) ||
-        !reservations.reserve_four_digit(1u, backend_port) || frontend_port == backend_port ||
+    const bool fixed_ports = fixed_frontend_port != 0u || fixed_backend_port != 0u;
+    bool reservations_ok = false;
+    if (fixed_ports) {
+        frontend_port = fixed_frontend_port;
+        backend_port = fixed_backend_port;
+        reservations_ok = fixed_frontend_port != 0u && fixed_backend_port != 0u &&
+                          reservations.reserve_specific(0u, fixed_frontend_port) &&
+                          reservations.reserve_specific(1u, fixed_backend_port);
+    } else {
+        reservations_ok = reservations.reserve_four_digit(0u, frontend_port) &&
+                          reservations.reserve_four_digit(1u, backend_port);
+    }
+    if (!reservations_ok || frontend_port == backend_port ||
         !validate_held_loopback_port(
             reservations.fds[0], frontend_port, "#252 frontend handoff", error) ||
         !validate_held_loopback_port(
@@ -51193,14 +51215,25 @@ static bool run_pinned_retained_header_whitespace_oracle(TempDir& temp,
 
     const std::string monitored_access_path =
         (access_log_off || default_log) ? temp.nginx_default_access_log : temp.nginx_access_log;
-    if (!write_file(monitored_access_path, "", 0u)) {
-        error = std::string(kDiagnostic) + " could not precreate monitored access file";
-        return false;
-    }
-    struct stat access_stat{};
-    if (stat(monitored_access_path.c_str(), &access_stat) != 0 || !S_ISREG(access_stat.st_mode)) {
-        error = std::string(kDiagnostic) + " monitored access path is not a regular file";
-        return false;
+    const bool special_monitor = access_log_off || default_log;
+    if (special_monitor) {
+        if (!write_file(monitored_access_path, "", 0u)) {
+            error = std::string(kDiagnostic) + " could not precreate monitored access file";
+            return false;
+        }
+        struct stat access_stat{};
+        if (stat(monitored_access_path.c_str(), &access_stat) != 0 ||
+            !S_ISREG(access_stat.st_mode)) {
+            error = std::string(kDiagnostic) + " monitored access path is not a regular file";
+            return false;
+        }
+        std::string initial_access;
+        if (!read_monitored_access_file(monitored_access_path, initial_access, error) ||
+            !initial_access.empty()) {
+            if (error.empty())
+                error = std::string(kDiagnostic) + " monitored access file was not initially empty";
+            return false;
+        }
     }
 
     const std::string config = make_retained_header_whitespace_oracle_config(
@@ -51250,26 +51283,24 @@ static bool run_pinned_retained_header_whitespace_oracle(TempDir& temp,
     PreloadContainerGuard bounded_docker(container_name);
     docker.active = !explicit_cleanup;
     bounded_docker.active = explicit_cleanup;
+    std::vector<std::string> docker_args = {"docker",
+                                            "run",
+                                            "--pull=never",
+                                            "--network",
+                                            "host",
+                                            "--name",
+                                            container_name,
+                                            "-v",
+                                            temp.nginx_config + ":/etc/nginx/nginx.conf:ro",
+                                            "-v",
+                                            std::string(temp.path) + ":" + temp.path};
+    if (special_monitor) {
+        docker_args.emplace_back("-v");
+        docker_args.emplace_back(std::string(temp.path) + ":/var/log/nginx");
+    }
+    docker_args.insert(docker_args.end(), {kNginxImage, "nginx", "-g", "daemon off;"});
     if (!handoff_held_loopback_port(&reservations.fds[0], frontend_port, kDiagnostic, error) ||
-        !spawn_child({"docker",
-                      "run",
-                      "--pull=never",
-                      "--network",
-                      "host",
-                      "--name",
-                      container_name,
-                      "-v",
-                      temp.nginx_config + ":/etc/nginx/nginx.conf:ro",
-                      "-v",
-                      std::string(temp.path) + ":" + temp.path,
-                      "-v",
-                      std::string(temp.path) + ":/var/log/nginx",
-                      kNginxImage,
-                      "nginx",
-                      "-g",
-                      "daemon off;"},
-                     temp.nginx_log,
-                     nginx.child) ||
+        !spawn_child(docker_args, temp.nginx_log, nginx.child) ||
         !wait_ready(frontend_port, nginx.child, error)) {
         if (error.empty()) error = std::string(kDiagnostic) + " pinned nginx failed readiness";
         return false;
@@ -51328,6 +51359,9 @@ static bool run_pinned_retained_header_whitespace_oracle(TempDir& temp,
 
     std::string access;
     const auto access_is_valid = [&]() {
+        if (!special_monitor)
+            return read_request_length_access_file(temp.nginx_access_log, access, error) &&
+                   access == "105\n";
         if (!read_monitored_access_file(monitored_access_path, access, error)) return false;
         if (access_log_off) return access.empty();
         if (default_log) {
@@ -73386,9 +73420,10 @@ int main(int argc, char** argv) {
          !pinned_nginx_default_buffering_206_range_incomplete_body_inactivity_expiry_oracle &&
          !wildcard_listen_oracle && !asterisk_wildcard_listen_oracle &&
          !exact_loopback_listen_oracle && !request_length_oracle &&
-         !retained_header_whitespace_oracle && !request_length_split_header_oracle &&
-         !rut_initial_header_split_public && !request_length_fixed_body_oracle &&
-         !request_length_split_fixed_body_oracle && !converter_request_length_differential &&
+         !retained_header_whitespace_oracle && !retained_header_whitespace_off_oracle &&
+         !request_length_split_header_oracle && !rut_initial_header_split_public &&
+         !request_length_fixed_body_oracle && !request_length_split_fixed_body_oracle &&
+         !converter_request_length_differential &&
          !converter_request_length_split_header_differential &&
          !converter_retained_header_whitespace_differential &&
          !converter_complete_file_retained_differential &&
@@ -75846,18 +75881,43 @@ int main(int argc, char** argv) {
                                                           oracle_error,
                                                           true,
                                                           false,
-                                                          true)) {
+                                                          true,
+                                                          off_temp.retained_frontend_port,
+                                                          off_temp.retained_backend_port)) {
             std::cerr << "FAIL [#591 Off/default access oracle]: " << oracle_error << "\n";
             return 1;
         }
         const std::string off_config = off_temp.retained_config_snapshot;
         const std::string expected_off_removed = "  access_log off;\n";
         const size_t off_at = off_config.find(expected_off_removed);
+        const auto off_absent = [](const std::string& contents) { return contents.empty(); };
+        std::string negative_error;
+        std::string negative_contents;
+        const std::string missing_monitor = off_temp.path + "/missing-access.log";
+        const std::string fifo_monitor = off_temp.path + "/fifo-access.log";
+        const std::string unreadable_monitor = off_temp.path + "/unreadable-access.log";
+        const bool missing_rejected =
+            !read_monitored_access_file(missing_monitor, negative_contents, negative_error);
+        const bool directory_rejected =
+            !read_monitored_access_file(off_temp.path, negative_contents, negative_error);
+        const bool unreadable_file_created = write_file(unreadable_monitor, "x", 1u);
+        const bool unreadable_mode_set =
+            unreadable_file_created && chmod(unreadable_monitor.c_str(), 0000) == 0;
+        const bool unreadable_rejected =
+            unreadable_mode_set &&
+            !read_monitored_access_file(unreadable_monitor, negative_contents, negative_error);
+        const bool fifo_created = mkfifo(fifo_monitor.c_str(), 0600) == 0;
+        const bool fifo_rejected =
+            fifo_created &&
+            !read_monitored_access_file(fifo_monitor, negative_contents, negative_error);
+        if (fifo_created) unlink(fifo_monitor.c_str());
+        if (unreadable_file_created) unlink(unreadable_monitor.c_str());
         if (off_at == std::string::npos ||
             off_config.substr(0u, off_at) +
                     off_config.substr(off_at + expected_off_removed.size()) !=
                 positive_temp.retained_config_snapshot ||
-            !off_observation.access.empty() || positive_observation.access.empty() ||
+            !off_absent(off_observation.access) || off_absent(positive_observation.access) ||
+            !missing_rejected || !directory_rejected || !unreadable_rejected || !fifo_rejected ||
             !validate_default_access_record(positive_observation.access, oracle_error)) {
             std::cerr << "FAIL [#591 Off/default access oracle]: phase/config comparison failed\n";
             return 1;
