@@ -684,6 +684,16 @@ target_include_directories(test_nginx_parser PRIVATE
 add_test(NAME test_nginx_parser COMMAND test_nginx_parser)
 set_tests_properties(test_nginx_parser PROPERTIES LABELS "unit;nginx;compiler")
 
+add_executable(test_nginx_convert test_nginx_convert.cc ${PROJECT_SOURCE_DIR}/src/placement_new.cc)
+target_link_libraries(test_nginx_convert rut_nginx)
+target_include_directories(test_nginx_convert PRIVATE
+    ${PROJECT_SOURCE_DIR}/include
+    ${PROJECT_SOURCE_DIR}/testing
+)
+add_dependencies(test_nginx_convert rut-nginx-convert)
+add_test(NAME test_nginx_convert COMMAND test_nginx_convert $<TARGET_FILE:rut-nginx-convert>)
+set_tests_properties(test_nginx_convert PROPERTIES LABELS "unit;nginx;converter")
+
 add_executable(test_drain test_drain.cc)
 target_link_libraries(test_drain rut_runtime)
 target_include_directories(test_drain PRIVATE
@@ -861,7 +871,11 @@ if(RUT_ENABLE_JIT)
     target_compile_definitions(test_nginx_differential PRIVATE
         "RUT_PINNED_NGINX_IMAGE=\"${_RUT_PINNED_NGINX_IMAGE}\""
     )
-    add_dependencies(test_nginx_differential rut test_nginx_downstream_gate_preload)
+    add_dependencies(test_nginx_differential
+        rut
+        rut-nginx-convert
+        test_nginx_downstream_gate_preload
+    )
     if(TARGET test_rut_iouring_gate_preload)
         add_dependencies(test_nginx_differential test_rut_iouring_gate_preload)
     endif()
@@ -1835,6 +1849,20 @@ if(RUT_ENABLE_JIT)
     )
     set_tests_properties(test_nginx_issue252_converter_retained_header_whitespace_differential PROPERTIES
         LABELS "integration;nginx;docker;io_uring;network"
+        RUN_SERIAL TRUE
+        RESOURCE_LOCK nginx-differential
+        TIMEOUT 120
+        SKIP_RETURN_CODE 77
+        ENVIRONMENT "RUT_NGINX_DIFFERENTIAL_REQUIRED=1"
+    )
+    add_test(
+        NAME test_nginx_issue577_converter_cli_retained_header_whitespace_differential
+        COMMAND test_nginx_differential --converter-retained-header-whitespace-differential
+                $<TARGET_FILE:rut> $<TARGET_FILE:rut-nginx-convert>
+    )
+    set_tests_properties(test_nginx_issue577_converter_cli_retained_header_whitespace_differential
+        PROPERTIES
+        LABELS "integration;nginx;docker;io_uring;network;converter"
         RUN_SERIAL TRUE
         RESOURCE_LOCK nginx-differential
         TIMEOUT 120
