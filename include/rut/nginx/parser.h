@@ -215,6 +215,8 @@ struct LogFormat {
 enum class AccessLogDestinationProfile : u8 {
     None,
     FilePath,
+    // The exact unquoted `off` token is borrowed through AccessLog::path.
+    Off,
 };
 
 struct AccessLog {
