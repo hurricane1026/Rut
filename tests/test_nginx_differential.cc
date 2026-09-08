@@ -24832,12 +24832,17 @@ static bool run_recv_owner_diagnostic_self_check(std::string& error) {
     candidate.sq_tail = 8;
     candidate.sq_cursor = 6;
     candidate.to_submit = 2;
-    if (pthread_mutex_lock(&gate.identity_mutex) != 0 ||
-        !rut_iouring_gate_publish_recv_owner_failure_locked(&gate, &candidate)) {
+    if (pthread_mutex_lock(&gate.identity_mutex) != 0) {
         error = "recv-owner diagnostic publisher did not accept first failure";
         return false;
     }
+    const bool first_published =
+        rut_iouring_gate_publish_recv_owner_failure_locked(&gate, &candidate);
     (void)pthread_mutex_unlock(&gate.identity_mutex);
+    if (!first_published) {
+        error = "recv-owner diagnostic publisher did not accept first failure";
+        return false;
+    }
     std::string premature_evidence;
     append_recv_owner_failure_evidence(gate, premature_evidence);
     if (!premature_evidence.empty()) {
@@ -24847,13 +24852,19 @@ static bool run_recv_owner_diagnostic_self_check(std::string& error) {
     rut_downstream_gate_store(&gate.state, RUT_DOWNSTREAM_GATE_FAILED);
     rut_iouring_gate_recv_owner_failure second = candidate;
     second.reason = RUT_IOURING_GATE_RECV_OWNER_REASON_SEND_OWNER_MISMATCH;
-    if (pthread_mutex_lock(&gate.identity_mutex) != 0 ||
-        rut_iouring_gate_publish_recv_owner_failure_locked(&gate, &second) ||
-        gate.recv_owner_failure.reason != RUT_IOURING_GATE_RECV_OWNER_REASON_RECV_SHAPE) {
+    if (pthread_mutex_lock(&gate.identity_mutex) != 0) {
         error = "recv-owner diagnostic publisher did not preserve first failure";
         return false;
     }
+    const bool second_published =
+        rut_iouring_gate_publish_recv_owner_failure_locked(&gate, &second);
+    const bool first_reason_preserved =
+        gate.recv_owner_failure.reason == RUT_IOURING_GATE_RECV_OWNER_REASON_RECV_SHAPE;
     (void)pthread_mutex_unlock(&gate.identity_mutex);
+    if (second_published || !first_reason_preserved) {
+        error = "recv-owner diagnostic publisher did not preserve first failure";
+        return false;
+    }
     std::string evidence;
     append_recv_owner_failure_evidence(gate, evidence);
     if (evidence.find("reason=RECV_SHAPE") == std::string::npos ||
@@ -24871,26 +24882,33 @@ static bool run_recv_owner_diagnostic_self_check(std::string& error) {
         rut_downstream_gate_store(&gate.error_code, RUT_IOURING_GATE_ERROR_NONE);
         __atomic_store_n(&gate.recv_owner_failure.valid, 0u, __ATOMIC_RELEASE);
         candidate.reason = reason;
-        if (pthread_mutex_lock(&gate.identity_mutex) != 0 ||
-            !rut_iouring_gate_publish_recv_owner_failure_locked(&gate, &candidate)) {
+        if (pthread_mutex_lock(&gate.identity_mutex) != 0) {
             error = "recv-owner diagnostic publisher rejected a discriminant reason";
             return false;
         }
+        const bool published =
+            rut_iouring_gate_publish_recv_owner_failure_locked(&gate, &candidate);
         rut_downstream_gate_store(&gate.state, RUT_DOWNSTREAM_GATE_FAILED);
+        const bool stored_reason = gate.recv_owner_failure.reason == reason;
         (void)pthread_mutex_unlock(&gate.identity_mutex);
-        if (gate.recv_owner_failure.reason != reason) {
+        if (!published || !stored_reason) {
             error = "recv-owner diagnostic publisher stored the wrong reason";
             return false;
         }
     }
     rut_downstream_gate_store(&gate.error_code, RUT_IOURING_GATE_ERROR_RING);
     __atomic_store_n(&gate.recv_owner_failure.valid, 0u, __ATOMIC_RELEASE);
-    if (pthread_mutex_lock(&gate.identity_mutex) != 0 ||
-        rut_iouring_gate_publish_recv_owner_failure_locked(&gate, &candidate)) {
+    if (pthread_mutex_lock(&gate.identity_mutex) != 0) {
         error = "recv-owner diagnostic publisher overwrote a non-Recv failure";
         return false;
     }
+    const bool overwrote_non_recv =
+        rut_iouring_gate_publish_recv_owner_failure_locked(&gate, &candidate);
     (void)pthread_mutex_unlock(&gate.identity_mutex);
+    if (overwrote_non_recv) {
+        error = "recv-owner diagnostic publisher overwrote a non-Recv failure";
+        return false;
+    }
     gate.magic = RUT_IOURING_GATE_MAGIC;
     gate.version = RUT_IOURING_GATE_VERSION;
     gate.layout_size = sizeof(gate);
