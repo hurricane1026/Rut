@@ -1,6 +1,7 @@
 #include "rut/nginx/converter.h"
 #include "rut/nginx/parser.h"
 #include "test.h"
+#include <algorithm>
 #include <cerrno>
 #include <cstdio>
 #include <cstdlib>
@@ -252,6 +253,89 @@ TEST(nginx_convert, server_and_http_outputs_match_api_without_opening_access_log
     CHECK(http_run.err.empty());
     CHECK(http_run.out == std::string(http_lowered.value().data, http_lowered.value().len));
     CHECK(access(access_path.c_str(), F_OK) != 0);
+}
+
+TEST(nginx_convert, nginx_http_output_matches_complete_api_and_rejects_unsupported_envelopes) {
+    const std::string directory = make_temp_dir();
+    REQUIRE_FALSE(directory.empty());
+    const std::string access_path = directory + "/must-not-be-created.log";
+    const std::string source =
+        "events {}\n"
+        "http { log_format compat \"$request_length\"; access_log " +
+        access_path +
+        " compat; server { listen 127.0.0.1:8080; location / { proxy_read_timeout 1s; "
+        "proxy_buffering on; proxy_pass http://127.0.0.1:9000; } } }\n";
+    const std::string path = directory + "/complete.conf";
+    REQUIRE(write_file(path, source));
+    const auto diagnostic_prefix = [](const std::string& filename,
+                                      const std::string& input,
+                                      const std::string& token) {
+        const size_t offset = input.find(token);
+        if (offset == std::string::npos) return std::string{};
+        const size_t line_start =
+            input.rfind('\n', offset) == std::string::npos ? 0u : input.rfind('\n', offset) + 1u;
+        const unsigned line = static_cast<unsigned>(
+            std::count(input.begin(), input.begin() + static_cast<ptrdiff_t>(offset), '\n') + 1u);
+        const unsigned col = static_cast<unsigned>(offset - line_start + 1u);
+        return filename + ":" + std::to_string(line) + ":" + std::to_string(col) + ": ";
+    };
+    const auto parsed =
+        rut::nginx::parse_nginx_http_config({source.data(), static_cast<rut::u32>(source.size())});
+    REQUIRE(parsed);
+    const auto lowered = rut::nginx::lower_to_rut(parsed.value());
+    REQUIRE(lowered);
+    const RunResult converted = run_converter(g_executable, "nginx-http", path, path);
+    REQUIRE(WIFEXITED(converted.status));
+    CHECK_EQ(WEXITSTATUS(converted.status), 0);
+    CHECK(converted.err.empty());
+    CHECK(converted.out == std::string(lowered.value().data, lowered.value().len));
+    CHECK(access(access_path.c_str(), F_OK) != 0);
+
+    const RunResult old_http = run_converter(g_executable, "http", path, path);
+    REQUIRE(WIFEXITED(old_http.status));
+    CHECK_EQ(WEXITSTATUS(old_http.status), 1);
+    CHECK(old_http.out.empty());
+    CHECK(old_http.err.find(diagnostic_prefix(path, source, "events")) == 0u);
+    CHECK(old_http.err.find("expected bounded http profile") != std::string::npos);
+
+    const std::string unsupported_source =
+        "events { worker_connections 64; }\n" + source.substr(source.find("http"));
+    const std::string unsupported_path = directory + "/unsupported-complete.conf";
+    REQUIRE(write_file(unsupported_path, unsupported_source));
+    const RunResult unsupported =
+        run_converter(g_executable, "nginx-http", unsupported_path, unsupported_path);
+    REQUIRE(WIFEXITED(unsupported.status));
+    CHECK_EQ(WEXITSTATUS(unsupported.status), 1);
+    CHECK(unsupported.out.empty());
+    CHECK(unsupported.err.find(
+              diagnostic_prefix(unsupported_path, unsupported_source, "worker_connections")) == 0u);
+    CHECK(unsupported.err.find("events directives are unsupported") != std::string::npos);
+
+    const std::string unsupported_global_source = "worker_processes 1;\n" + source;
+    const std::string unsupported_global_path = directory + "/unsupported-global.conf";
+    REQUIRE(write_file(unsupported_global_path, unsupported_global_source));
+    const RunResult unsupported_global =
+        run_converter(g_executable, "nginx-http", unsupported_global_path, unsupported_global_path);
+    REQUIRE(WIFEXITED(unsupported_global.status));
+    CHECK_EQ(WEXITSTATUS(unsupported_global.status), 1);
+    CHECK(unsupported_global.out.empty());
+    CHECK(unsupported_global.err.find(diagnostic_prefix(
+              unsupported_global_path, unsupported_global_source, "worker_processes")) == 0u);
+    CHECK(unsupported_global.err.find("expected leading events block") != std::string::npos);
+
+    const std::string unsupported_nested_source =
+        "events {}\nhttp { log_format compat \"$request_length\"; access_log " + access_path +
+        " compat; server { listen 127.0.0.1:8080; location / { add_header X-Test yes; } } }\n";
+    const std::string unsupported_nested_path = directory + "/unsupported-nested.conf";
+    REQUIRE(write_file(unsupported_nested_path, unsupported_nested_source));
+    const RunResult unsupported_nested =
+        run_converter(g_executable, "nginx-http", unsupported_nested_path, unsupported_nested_path);
+    REQUIRE(WIFEXITED(unsupported_nested.status));
+    CHECK_EQ(WEXITSTATUS(unsupported_nested.status), 1);
+    CHECK(unsupported_nested.out.empty());
+    CHECK(unsupported_nested.err.find(diagnostic_prefix(
+              unsupported_nested_path, unsupported_nested_source, "add_header")) == 0u);
+    CHECK(unsupported_nested.err.find("unknown location directive") != std::string::npos);
 }
 
 TEST(nginx_convert, rejects_usage_missing_malformed_and_special_inputs_without_stdout) {

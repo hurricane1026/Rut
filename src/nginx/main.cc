@@ -135,12 +135,12 @@ bool read_input(const char* filename, char** output, size_t* length, const char*
     return true;
 }
 
-enum class Format : std::uint8_t { Server, Http };
+enum class Format : std::uint8_t { Server, Http, NginxHttp };
 
 int usage(const char* program) {
     write_cstr(STDERR_FILENO, "usage: ");
     write_cstr(STDERR_FILENO, program);
-    write_cstr(STDERR_FILENO, " --format server|http <input-file>\n");
+    write_cstr(STDERR_FILENO, " --format server|http|nginx-http <input-file>\n");
     return 2;
 }
 
@@ -161,6 +161,8 @@ int main(int argc, char** argv) {
         format = Format::Server;
     else if (strcmp(argv[2], "http") == 0)
         format = Format::Http;
+    else if (strcmp(argv[2], "nginx-http") == 0)
+        format = Format::NginxHttp;
     else
         return usage(argv[0]);
 
@@ -191,8 +193,24 @@ int main(int argc, char** argv) {
         server_output = lowered.value();
         output = server_output.view();
         converted = true;
-    } else {
+    } else if (format == Format::Http) {
         const auto parsed = rut::nginx::parse_http_profile(source);
+        if (!parsed) {
+            report(argv[3], parsed.error().span, parsed.error().detail, "conversion failed");
+            free(input);
+            return 1;
+        }
+        const auto lowered = rut::nginx::lower_to_rut(parsed.value());
+        if (!lowered) {
+            report(argv[3], lowered.error().span, lowered.error().detail, "conversion failed");
+            free(input);
+            return 1;
+        }
+        http_output = lowered.value();
+        output = http_output.view();
+        converted = true;
+    } else {
+        const auto parsed = rut::nginx::parse_nginx_http_config(source);
         if (!parsed) {
             report(argv[3], parsed.error().span, parsed.error().detail, "conversion failed");
             free(input);

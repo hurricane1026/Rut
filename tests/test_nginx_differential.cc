@@ -1009,11 +1009,15 @@ struct TempDir {
     std::string nginx_config;
     std::string nginx_log;
     std::string nginx_access_log;
+    std::string nginx_access_snapshot;
+    std::string retained_config_snapshot;
     std::string rut_log;
     std::string rut_access_log;
     std::string preflight_log;
     std::string gate_control;
     std::string rut_iouring_gate_control;
+    u16 retained_frontend_port = 0u;
+    u16 retained_backend_port = 0u;
 
     bool create() {
         if (!mkdtemp(path)) return false;
@@ -1022,6 +1026,7 @@ struct TempDir {
         nginx_config = std::string(path) + "/nginx.conf";
         nginx_log = std::string(path) + "/nginx.log";
         nginx_access_log = std::string(path) + "/nginx-access.log";
+        nginx_access_snapshot = std::string(path) + "/nginx-access.snapshot";
         rut_log = std::string(path) + "/rut.log";
         rut_access_log = std::string(path) + "/rut-access.log";
         preflight_log = std::string(path) + "/preflight.log";
@@ -1036,6 +1041,7 @@ struct TempDir {
             unlink(nginx_config.c_str());
             unlink(nginx_log.c_str());
             unlink(nginx_access_log.c_str());
+            unlink(nginx_access_snapshot.c_str());
             unlink(rut_log.c_str());
             unlink((rut_log + ".converter").c_str());
             unlink(rut_access_log.c_str());
@@ -1327,6 +1333,28 @@ struct HeldLoopbackPorts {
             close(fd);
         }
         return false;
+    }
+
+    bool reserve_specific(size_t index, u16 port) {
+        if (index >= std::size(fds) || fds[index] >= 0 || port < 1024u || port > 9999u)
+            return false;
+        const int fd = socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0);
+        if (fd < 0) return false;
+        int one = 1;
+        if (setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one)) != 0) {
+            close(fd);
+            return false;
+        }
+        sockaddr_in address{};
+        address.sin_family = AF_INET;
+        address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+        address.sin_port = htons(port);
+        if (bind(fd, reinterpret_cast<sockaddr*>(&address), sizeof(address)) != 0) {
+            close(fd);
+            return false;
+        }
+        fds[index] = fd;
+        return true;
     }
 };
 
@@ -50737,7 +50765,8 @@ static std::vector<char> normalize_retained_response_date(const std::vector<char
 
 static bool compare_retained_header_observations(const RetainedHeaderObservation& nginx,
                                                  const RetainedHeaderObservation& generated,
-                                                 std::string& error) {
+                                                 std::string& error,
+                                                 bool require_exact_upstream_port = false) {
     const auto normalize_upstream = [](const std::vector<char>& wire) {
         std::string text(wire.begin(), wire.end());
         const size_t at = text.find("Host: 127.0.0.1:");
@@ -50748,9 +50777,14 @@ static bool compare_retained_header_observations(const RetainedHeaderObservation
         text.replace(port, end - port, "<port>");
         return text;
     };
+    const bool upstream_equal =
+        require_exact_upstream_port
+            ? nginx.upstream == generated.upstream
+            : normalize_upstream(nginx.upstream) == normalize_upstream(generated.upstream);
     if (nginx.response != generated.response || nginx.access != generated.access ||
         nginx.upstream.size() != generated.upstream.size() || nginx.upstream.size() != 70u ||
-        normalize_upstream(nginx.upstream) != normalize_upstream(generated.upstream)) {
+        (require_exact_upstream_port && nginx.backend_port != generated.backend_port) ||
+        !upstream_equal) {
         error = "#252 nginx/generated retained-header observations differed";
         return false;
     }
@@ -50774,6 +50808,13 @@ static bool retained_header_comparator_self_check(std::string& error) {
     b = a;
     b.upstream[0] = 'U';
     if (compare_retained_header_observations(a, b, error)) return false;
+    b = a;
+    const size_t port = std::string(b.upstream.begin(), b.upstream.end()).find("9000");
+    if (port == std::string::npos) return false;
+    b.upstream[port + 3u] = '1';
+    if (!compare_retained_header_observations(a, b, error) ||
+        compare_retained_header_observations(a, b, error, true))
+        return false;
     return true;
 }
 
@@ -50809,7 +50850,8 @@ static bool validate_retained_header_whitespace_oracle_config(const std::string&
 static bool run_pinned_retained_header_whitespace_oracle(TempDir& temp,
                                                          const std::string& container_name,
                                                          RetainedHeaderObservation* observation,
-                                                         std::string& error) {
+                                                         std::string& error,
+                                                         bool explicit_cleanup = false) {
     static constexpr char kDiagnostic[] = "#252 pinned retained-header whitespace oracle";
     static constexpr char kExpectedDownstream[] =
         "HTTP/1.1 200 OK\r\n"
@@ -50831,6 +50873,8 @@ static bool run_pinned_retained_header_whitespace_oracle(TempDir& temp,
         if (error.empty()) error = std::string(kDiagnostic) + " could not hold four-digit ports";
         return false;
     }
+    temp.retained_frontend_port = frontend_port;
+    temp.retained_backend_port = backend_port;
 
     const std::string config = make_retained_header_whitespace_oracle_config(
         frontend_port, backend_port, temp.nginx_access_log);
@@ -50838,6 +50882,14 @@ static bool run_pinned_retained_header_whitespace_oracle(TempDir& temp,
             config, frontend_port, backend_port, temp.nginx_access_log, error) ||
         !write_file(temp.nginx_config, config.data(), config.size())) {
         if (error.empty()) error = std::string(kDiagnostic) + " could not persist exact config";
+        return false;
+    }
+    if (!read_exact_return204_log(temp.nginx_config,
+                                  "#583 frozen nginx input before pinned nginx",
+                                  temp.retained_config_snapshot,
+                                  error) ||
+        temp.retained_config_snapshot != config) {
+        error = std::string(kDiagnostic) + " could not freeze exact input before nginx";
         return false;
     }
 
@@ -50863,6 +50915,9 @@ static bool run_pinned_retained_header_whitespace_oracle(TempDir& temp,
 
     ChildGuard nginx;
     DockerGuard docker(container_name);
+    PreloadContainerGuard bounded_docker(container_name);
+    docker.active = !explicit_cleanup;
+    bounded_docker.active = explicit_cleanup;
     if (!handoff_held_loopback_port(&reservations.fds[0], frontend_port, kDiagnostic, error) ||
         !spawn_child({"docker",
                       "run",
@@ -50972,8 +51027,16 @@ static bool run_pinned_retained_header_whitespace_oracle(TempDir& temp,
         "\r\nX-Test: \t keep \t\r\n\r\n";
     const std::vector<char> expected_upstream(expected_upstream_text.begin(),
                                               expected_upstream_text.end());
-    if (!stop_child(nginx.child) || reservations.fds[0] >= 0 || reservations.fds[1] >= 0 ||
-        origin.thread_alive.load(std::memory_order_acquire) || origin.listen_fd >= 0 ||
+    const bool nginx_stopped = stop_child(nginx.child);
+    bool container_removed = true;
+    if (explicit_cleanup) {
+        container_removed = bounded_docker.remove();
+        if (!container_removed) bounded_docker.active = true;
+    }
+    if (!nginx_stopped || !container_removed || (explicit_cleanup && nginx.child.pid != -1) ||
+        reservations.fds[0] >= 0 || reservations.fds[1] >= 0 ||
+        origin.thread_alive.load(std::memory_order_acquire) ||
+        (explicit_cleanup && origin.thread_started) || origin.listen_fd >= 0 ||
         origin.accepted.load(std::memory_order_acquire) != 1u ||
         origin.requests.load(std::memory_order_acquire) != 1u || origin.history.size() != 1u ||
         origin.request != expected_upstream || origin.history[0] != expected_upstream ||
@@ -51688,7 +51751,12 @@ static bool run_converter_request_length_rut_side(TempDir& temp,
                                                   bool retained_header_whitespace,
                                                   RetainedHeaderObservation* observation,
                                                   std::string& error,
-                                                  const char* converter_path = nullptr) {
+                                                  const char* converter_path = nullptr,
+                                                  bool complete_file = false) {
+    if (complete_file && (converter_path == nullptr || !retained_header_whitespace)) {
+        error = "#583 complete-file mode requires the standalone nginx-http CLI and retained slice";
+        return false;
+    }
     const bool require_peer_retirement = split_header_delivery || retained_header_whitespace;
     if (rut_path == nullptr || rut_path[0] != '/' || access(rut_path, X_OK) != 0) {
         error = "#362 converter differential requires an executable absolute RUT path";
@@ -51705,9 +51773,19 @@ static bool run_converter_request_length_rut_side(TempDir& temp,
 
     std::string generated;
     if (converter_path != nullptr) {
+        if (complete_file) {
+            std::string actual;
+            if (!read_exact_return204_log(
+                    temp.nginx_config, "#583 frozen nginx input", actual, error) ||
+                actual != temp.retained_config_snapshot) {
+                error = "#583 complete nginx input changed before CLI conversion";
+                return false;
+            }
+            temp.rut_access_log = temp.nginx_access_log;
+        }
         const std::string profile =
             make_converter_request_length_profile(frontend_port, backend_port, temp.rut_access_log);
-        if (!write_file(temp.nginx_config, profile.data(), profile.size())) {
+        if (!complete_file && !write_file(temp.nginx_config, profile.data(), profile.size())) {
             error = "#577 could not persist CLI converter input";
             return false;
         }
@@ -51729,7 +51807,7 @@ static bool run_converter_request_length_rut_side(TempDir& temp,
             execl(converter_path,
                   converter_path,
                   "--format",
-                  "http",
+                  complete_file ? "nginx-http" : "http",
                   temp.nginx_config.c_str(),
                   nullptr);
             _exit(127);
@@ -52098,6 +52176,15 @@ static bool run_converter_request_length_rut_side(TempDir& temp,
         observation->upstream = backend.history[0];
         observation->backend_port = backend_port;
     }
+    if (complete_file) {
+        std::string actual;
+        if (!read_exact_return204_log(
+                temp.nginx_config, "#583 frozen nginx input after RUT", actual, error) ||
+            actual != temp.retained_config_snapshot) {
+            error = "#583 complete nginx input changed after CLI/RUT consumption";
+            return false;
+        }
+    }
     return true;
 }
 
@@ -52154,13 +52241,14 @@ static bool run_converter_retained_header_whitespace_differential(
     const std::string& container_name,
     const char* rut_path,
     std::string& error,
-    const char* converter_path = nullptr) {
+    const char* converter_path = nullptr,
+    bool complete_file = false) {
     HeldLoopbackPorts rut_reservations;
     u16 rut_frontend_port = 0u;
     u16 rut_backend_port = 0u;
-    if (!rut_reservations.reserve(0u, rut_frontend_port) ||
-        !rut_reservations.reserve_four_digit(1u, rut_backend_port) ||
-        rut_frontend_port == rut_backend_port) {
+    if (!complete_file && (!rut_reservations.reserve(0u, rut_frontend_port) ||
+                           !rut_reservations.reserve_four_digit(1u, rut_backend_port) ||
+                           rut_frontend_port == rut_backend_port)) {
         error = "#252 could not pre-hold isolated generated-RUT frontend/backend ports";
         return false;
     }
@@ -52168,8 +52256,35 @@ static bool run_converter_retained_header_whitespace_differential(
     RetainedHeaderObservation nginx_observation;
     RetainedHeaderObservation generated_observation;
     if (!run_pinned_retained_header_whitespace_oracle(
-            temp, container_name, &nginx_observation, error))
+            temp, container_name, &nginx_observation, error, complete_file))
         return false;
+    if (complete_file) {
+        rut_frontend_port = temp.retained_frontend_port;
+        rut_backend_port = temp.retained_backend_port;
+        temp.rut_access_log = temp.nginx_access_log;
+        if (rename(temp.nginx_access_log.c_str(), temp.nginx_access_snapshot.c_str()) != 0) {
+            error = "#583 could not preserve the stopped nginx access snapshot";
+            return false;
+        }
+        std::string snapshot;
+        if (!read_exact_return204_log(temp.nginx_access_snapshot,
+                                      "#583 stopped nginx access snapshot",
+                                      snapshot,
+                                      error) ||
+            snapshot != "105\n") {
+            error = "#583 stopped nginx access snapshot was not exactly 105+LF";
+            return false;
+        }
+        if (!rut_reservations.reserve_specific(0u, rut_frontend_port) ||
+            !rut_reservations.reserve_specific(1u, rut_backend_port) ||
+            !validate_held_loopback_port(
+                rut_reservations.fds[0], rut_frontend_port, "#583 exact frontend reuse", error) ||
+            !validate_held_loopback_port(
+                rut_reservations.fds[1], rut_backend_port, "#583 exact backend reuse", error)) {
+            error = "#583 could not reacquire the exact retained ports";
+            return false;
+        }
+    }
     if (!run_converter_request_length_rut_side(temp,
                                                rut_path,
                                                rut_reservations,
@@ -52179,9 +52294,11 @@ static bool run_converter_retained_header_whitespace_differential(
                                                true,
                                                &generated_observation,
                                                error,
-                                               converter_path))
+                                               converter_path,
+                                               complete_file))
         return false;
-    if (!compare_retained_header_observations(nginx_observation, generated_observation, error))
+    if (!compare_retained_header_observations(
+            nginx_observation, generated_observation, error, complete_file))
         return false;
     return true;
 }
@@ -72708,6 +72825,8 @@ int main(int argc, char** argv) {
     const bool converter_retained_header_whitespace_differential =
         (argc == 3 || argc == 4) &&
         strcmp(argv[1], "--converter-retained-header-whitespace-differential") == 0;
+    const bool converter_complete_file_retained_differential =
+        argc == 4 && strcmp(argv[1], "--converter-complete-file-retained-differential") == 0;
     const bool converter_request_length_fixed_body_differential =
         argc == 3 && strcmp(argv[1], "--converter-request-length-fixed-body-differential") == 0;
     const bool converter_request_length_split_fixed_body_differential =
@@ -72925,6 +73044,7 @@ int main(int argc, char** argv) {
          !request_length_split_fixed_body_oracle && !converter_request_length_differential &&
          !converter_request_length_split_header_differential &&
          !converter_retained_header_whitespace_differential &&
+         !converter_complete_file_retained_differential &&
          !converter_request_length_fixed_body_differential &&
          !converter_request_length_split_fixed_body_differential &&
          !exact_loopback_return204_oracle && !exact_loopback_bodyful_return_oracle &&
@@ -73018,7 +73138,8 @@ int main(int argc, char** argv) {
          argv[2][0] != '/') ||
         (converter_request_length_differential && argv[2][0] != '/') ||
         (converter_request_length_split_header_differential && argv[2][0] != '/') ||
-        (converter_retained_header_whitespace_differential &&
+        ((converter_retained_header_whitespace_differential ||
+          converter_complete_file_retained_differential) &&
          (argv[2][0] != '/' || (argc == 4 && argv[3][0] != '/'))) ||
         (converter_request_length_fixed_body_differential && argv[2][0] != '/') ||
         (converter_request_length_split_fixed_body_differential && argv[2][0] != '/') ||
@@ -73645,7 +73766,8 @@ int main(int argc, char** argv) {
     if (request_length_oracle || request_length_split_header_oracle ||
         converter_request_length_differential ||
         converter_request_length_split_header_differential ||
-        converter_retained_header_whitespace_differential) {
+        converter_retained_header_whitespace_differential ||
+        converter_complete_file_retained_differential) {
         std::string self_check_error;
         if (!run_request_length_oracle_self_checks(self_check_error)) {
             std::cerr << "FAIL [#362 request-length oracle self-check]: " << self_check_error
@@ -73661,7 +73783,8 @@ int main(int argc, char** argv) {
         }
         if ((converter_request_length_differential ||
              converter_request_length_split_header_differential ||
-             converter_retained_header_whitespace_differential) &&
+             (converter_retained_header_whitespace_differential ||
+              converter_complete_file_retained_differential)) &&
             !run_converter_request_length_self_checks(self_check_error)) {
             std::cerr << "FAIL [#362 converter request-length self-check]: " << self_check_error
                       << "\n";
@@ -75538,6 +75661,24 @@ int main(int argc, char** argv) {
                "origin FIN with no retry or late bytes, and publish exactly `102\\n` live and "
                "after clean shutdown (converter-generated ordinary-RUT exact application-send "
                "slice only; no TCP/read/CQE or general fragmentation claim)\n";
+        return 0;
+    }
+    if (converter_complete_file_retained_differential) {
+        const char* source_suffix = strrchr(temp.path, '/');
+        source_suffix = source_suffix ? source_suffix + 1 : temp.path;
+        const std::string container_name = "rut-nginx-583-complete-retained-diff-" +
+                                           std::to_string(getpid()) + "-" + source_suffix;
+        std::string differential_error;
+        if (!run_converter_retained_header_whitespace_differential(
+                temp, container_name, argv[2], differential_error, argv[3], true)) {
+            std::cerr << "FAIL [#583 complete-file CLI retained differential]: "
+                      << differential_error << "\n";
+            return 1;
+        }
+        std::cerr << "PASS: #583 one frozen complete events/http file reached pinned nginx and "
+                     "the explicit nginx-http CLI; exact 105-byte/70-byte/118-byte retained-"
+                     "header wire, 105\\n access record, EOF, one origin retirement, no retry, "
+                     "and 175ms stability matched on reacquired numeric ports\n";
         return 0;
     }
     if (converter_retained_header_whitespace_differential) {
