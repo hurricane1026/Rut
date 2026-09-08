@@ -51491,6 +51491,7 @@ static bool run_converter_request_length_rut_side(TempDir& temp,
                                                   bool retained_header_whitespace,
                                                   RetainedHeaderObservation* observation,
                                                   std::string& error) {
+    const bool require_peer_retirement = split_header_delivery || retained_header_whitespace;
     if (rut_path == nullptr || rut_path[0] != '/' || access(rut_path, X_OK) != 0) {
         error = "#362 converter differential requires an executable absolute RUT path";
         return false;
@@ -51528,7 +51529,7 @@ static bool run_converter_request_length_rut_side(TempDir& temp,
     };
     Recorder backend;
     RecorderGuard backend_guard{&backend};
-    backend.wait_response_peer_close = split_header_delivery || retained_header_whitespace;
+    backend.wait_response_peer_close = require_peer_retirement;
     backend.observe_extra_requests_until_stop = true;
     if (!handoff_held_loopback_port(
             &reservations.fds[1], backend_port, "#362 generated RUT Recorder bind", error) ||
@@ -51711,7 +51712,7 @@ static bool run_converter_request_length_rut_side(TempDir& temp,
     const u64 response_sent_ns = backend.response_sent_ns.load(std::memory_order_acquire);
     const u64 response_peer_closed_ns =
         backend.response_peer_closed_ns.load(std::memory_order_acquire);
-    if (split_header_delivery &&
+    if (require_peer_retirement &&
         (!live_with_counts(1u) || response_sent_ns == 0u ||
          !backend.response_peer_closed.load(std::memory_order_acquire) ||
          response_peer_closed_ns < response_sent_ns ||
@@ -51752,7 +51753,7 @@ static bool run_converter_request_length_rut_side(TempDir& temp,
         const u64 stable_closed_ns =
             backend.response_peer_closed_ns.load(std::memory_order_acquire);
         if (!live_with_counts(1u) ||
-            (split_header_delivery &&
+            (require_peer_retirement &&
              (stable_sent_ns != response_sent_ns || stable_closed_ns != response_peer_closed_ns ||
               !backend.response_peer_closed.load(std::memory_order_acquire) ||
               backend.response_peer_unexpected_data.load(std::memory_order_acquire) ||
@@ -51819,7 +51820,7 @@ static bool run_converter_request_length_rut_side(TempDir& temp,
         actual.find("Connection:") != std::string::npos ||
         (!retained_header_whitespace && actual.find('\t') != std::string::npos) ||
         !retained_comparator_ok ||
-        (split_header_delivery &&
+        (require_peer_retirement &&
          (!backend.response_peer_closed.load(std::memory_order_acquire) ||
           backend.response_peer_unexpected_data.load(std::memory_order_acquire) ||
           backend.response_peer_observation_failed.load(std::memory_order_acquire))) ||
