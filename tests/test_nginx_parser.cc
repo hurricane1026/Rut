@@ -2525,6 +2525,11 @@ TEST(nginx_parser, recognizes_root_proxy_buffering_on_with_complete_spans) {
         "http://127.0.0.1:9000; } }",
         "server { listen 127.0.0.1:8080; location / { proxy_pass "
         "http://127.0.0.1:9000; # ordinary comment\n proxy_buffering on; } }",
+        "server { listen 127.0.0.1:8080; location / { proxy_read_timeout 1s; "
+        "proxy_buffering on; proxy_hide_header X-Compat-Hidden; proxy_pass "
+        "http://127.0.0.1:9000; } }",
+        "server { listen 127.0.0.1:8080; location / { proxy_hide_header X-Compat-Hidden; "
+        "proxy_buffering on; proxy_pass http://127.0.0.1:9000; } }",
     };
     for (const char* source : sources) {
         const auto parsed = nginx::parse({source, static_cast<u32>(strlen(source))});
@@ -2557,12 +2562,26 @@ TEST(nginx_parser, rejects_proxy_buffering_unsupported_grammar_and_contexts) {
         "http://127.0.0.1:9000; } }",
         "server { listen 8080; location / { proxy_buffering on; proxy_buffering on; "
         "proxy_pass http://127.0.0.1:9000; } }",
+        "server { listen 8080; location = / { proxy_buffering on; proxy_pass "
+        "http://127.0.0.1:9000; } }",
+        "server { listen 8080; location / { location /nested { proxy_buffering on; } "
+        "proxy_pass http://127.0.0.1:9000; } }",
+        "server { listen 8080; location / { proxy_buffering; proxy_pass "
+        "http://127.0.0.1:9000; } }",
+        "server { listen 8080; location / { proxy_buffering on proxy_pass "
+        "http://127.0.0.1:9000; } }",
     };
     for (const char* source : sources) {
         const auto parsed = nginx::parse({source, static_cast<u32>(strlen(source))});
         CHECK_FALSE(parsed);
         CHECK_EQ(parsed.error().code, FrontendError::UnsupportedSyntax);
     }
+    const char comment_only[] =
+        "server { listen 8080; location / { # proxy_buffering off\n proxy_pass "
+        "http://127.0.0.1:9000; } }";
+    const auto comment_parsed = nginx::parse({comment_only, sizeof(comment_only) - 1u});
+    REQUIRE(comment_parsed);
+    CHECK_FALSE(comment_parsed.value().location.proxy_buffering.present);
 }
 
 TEST(nginx_converter, rejects_explicit_proxy_buffering_on_before_lowering) {
@@ -2580,8 +2599,36 @@ TEST(nginx_converter, rejects_explicit_proxy_buffering_on_before_lowering) {
     erased.location.proxy_buffering = {};
     const auto erased_result = nginx::lower_to_rut(erased);
     REQUIRE_FALSE(erased_result);
-    CHECK(rejected.error().detail.eq(lit_str("proxy_buffering on is recognized but unsupported")) ||
-          erased_result.error().detail.eq(lit_str("proxy_buffering metadata was erased")));
+    CHECK(erased_result.error().detail.eq(lit_str("proxy_buffering metadata was erased")));
+
+    const auto expect_rejected = [](nginx::Server candidate) {
+        const auto result = nginx::lower_to_rut(candidate);
+        REQUIRE_FALSE(result);
+    };
+    auto mutated = parsed.value();
+    mutated.location.proxy_buffering.span.start++;
+    expect_rejected(mutated);
+    mutated = parsed.value();
+    mutated.location.proxy_buffering.span.end--;
+    expect_rejected(mutated);
+    mutated = parsed.value();
+    mutated.location.proxy_buffering.value_span.start++;
+    expect_rejected(mutated);
+    mutated = parsed.value();
+    mutated.location.proxy_buffering.value_span.end--;
+    expect_rejected(mutated);
+    mutated = parsed.value();
+    mutated.location.proxy_buffering.span.line++;
+    expect_rejected(mutated);
+    mutated = parsed.value();
+    mutated.location.proxy_buffering.span.col++;
+    expect_rejected(mutated);
+    mutated = parsed.value();
+    mutated.location.proxy_buffering.value_span.line++;
+    expect_rejected(mutated);
+    mutated = parsed.value();
+    mutated.location.proxy_buffering.value_span.col++;
+    expect_rejected(mutated);
 
     char wildcard_source[] =
         "server { listen 8080; location / { proxy_pass http://127.0.0.1:9000; "
@@ -2603,7 +2650,7 @@ TEST(nginx_converter, rejects_explicit_proxy_buffering_on_before_lowering) {
     corrupted_source[buffering_start] = 'X';
     const auto corrupted_result = nginx::lower_to_rut(corrupted.value());
     REQUIRE_FALSE(corrupted_result);
-    CHECK(corrupted_result.error().detail.eq(lit_str("invalid proxy_buffering source syntax")));
+    CHECK(corrupted_result.error().code == FrontendError::UnsupportedSyntax);
 }
 
 TEST(nginx_converter, http_profile_compares_proxy_buffering_metadata_before_lowering) {

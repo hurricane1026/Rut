@@ -283,6 +283,10 @@ FrontendResult<bool> validate_proxy_buffering(const Server& server) {
                            lit_str("invalid proxy_buffering source provenance"));
     const uintptr_t source_base = listener_address - listener.value_span.start;
     const Location& location = server.location;
+    if (server.span.end < server.span.start || !span_contains(server.span, location.span) ||
+        (metadata && (!span_contains(server.span, buffering.span) ||
+                      !span_contains(server.span, buffering.value_span))))
+        return unsupported(model_span(server), lit_str("invalid proxy_buffering source bounds"));
     if (source_base > UINTPTR_MAX - server.span.end ||
         !source_borrow_is_coherent(listener.value, listener.value_span, source_base) ||
         !source_borrow_is_coherent(location.path, location.path_span, source_base) ||
@@ -290,8 +294,6 @@ FrontendResult<bool> validate_proxy_buffering(const Server& server) {
         !span_position_is_coherent(server.span, location.path_span))
         return unsupported(model_span(server), lit_str("invalid proxy_buffering source bounds"));
 
-    if (server.span.end < server.span.start)
-        return unsupported(server.span, lit_str("invalid proxy_buffering source bounds"));
     const u32 source_len = server.span.end - server.span.start;
     const Str server_source{trusted_source_at(source_base, server.span.start), source_len};
     auto reparsed = parse(server_source);
@@ -2111,16 +2113,15 @@ FrontendResult<RutSource> lower_to_rut(const Server& server) {
     if (!exact_local_return) return core::make_unexpected(exact_local_return.error());
     auto proxy_location = validate_proxy_location(server);
     if (!proxy_location) return core::make_unexpected(proxy_location.error());
-    auto listener =
-        validate_listener(server, proxy_location.value(), exact_absolute_redirect.value());
-    if (!listener) return core::make_unexpected(listener.error());
-    auto proxy_buffering = validate_proxy_buffering(server);
-    if (!proxy_buffering) return core::make_unexpected(proxy_buffering.error());
     bool hide_compat_header = false;
-    const bool exact_listener = listener.value();
+    bool exact_listener = false;
     const bool timeout_present = server.location.proxy_read_timeout.present;
     u8 timeout_seconds = timeout_present ? 0u : 60u;
     if (proxy_hide_header_has_inventory(server.location.proxy_hide_header)) {
+        auto listener =
+            validate_listener(server, proxy_location.value(), exact_absolute_redirect.value());
+        if (!listener) return core::make_unexpected(listener.error());
+        exact_listener = listener.value();
         auto header = validate_proxy_hide_header(server, listener.value());
         if (!header) return core::make_unexpected(header.error());
         hide_compat_header = true;
@@ -2131,6 +2132,10 @@ FrontendResult<RutSource> lower_to_rut(const Server& server) {
             timeout_present
                 ? static_cast<u8>(server.location.proxy_read_timeout.milliseconds / 1000u)
                 : 60u;
+        auto listener =
+            validate_listener(server, proxy_location.value(), exact_absolute_redirect.value());
+        if (!listener) return core::make_unexpected(listener.error());
+        exact_listener = listener.value();
     }
     const ProxyPass& proxy = server.location.proxy_pass;
     if (proxy.port == 0)
@@ -2154,6 +2159,8 @@ FrontendResult<RutSource> lower_to_rut(const Server& server) {
     if (exact_no_content_return.value() && !is_root)
         return unsupported(server.exact_no_content_return.span,
                            lit_str("exact no-content return requires location / fallback"));
+    auto proxy_buffering = validate_proxy_buffering(server);
+    if (!proxy_buffering) return core::make_unexpected(proxy_buffering.error());
     RutSource output{};
     Writer writer(output);
     auto put = [&](const char* text) {
