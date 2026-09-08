@@ -1922,6 +1922,19 @@ if(RUT_ENABLE_JIT)
         ENVIRONMENT "RUT_NGINX_DIFFERENTIAL_REQUIRED=1"
     )
     add_test(
+        NAME test_nginx_issue591_converter_retained_access_log_off_four_phase
+        COMMAND test_nginx_differential --converter-retained-access-log-off-four-phase
+                $<TARGET_FILE:rut> $<TARGET_FILE:rut-nginx-convert>
+    )
+    set_tests_properties(test_nginx_issue591_converter_retained_access_log_off_four_phase
+        PROPERTIES
+        LABELS "integration;nginx;docker;io_uring;network;converter"
+        RUN_SERIAL TRUE
+        RESOURCE_LOCK nginx-differential
+        TIMEOUT 240
+        ENVIRONMENT "RUT_NGINX_DIFFERENTIAL_REQUIRED=1"
+    )
+    add_test(
         NAME test_nginx_issue370_request_length_split_header_oracle
         COMMAND test_nginx_differential --pinned-nginx-request-length-split-header-oracle
     )

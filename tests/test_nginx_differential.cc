@@ -52128,6 +52128,26 @@ static bool run_converter_request_length_self_checks(std::string& error) {
     return true;
 }
 
+static bool validate_converter_retained_off_source(const std::string& source,
+                                                   u16 frontend_port,
+                                                   u16 backend_port,
+                                                   std::string& error) {
+    if (!validate_exact_loopback_conditional_get_structure(source, error, "#591") ||
+        source.find("accessLog") != std::string::npos ||
+        source.find("access_log") != std::string::npos ||
+        source.find("--access-log") != std::string::npos) {
+        if (error.empty()) error = "#591 generated Off RUT contained an access sink";
+        return false;
+    }
+    const std::string listener = "listen 127.0.0.1:" + std::to_string(frontend_port);
+    const std::string upstream = "127.0.0.1:" + std::to_string(backend_port);
+    if (source.find(listener) == std::string::npos || source.find(upstream) == std::string::npos) {
+        error = "#591 generated Off RUT lost the authenticated loopback endpoints";
+        return false;
+    }
+    return true;
+}
+
 static bool run_converter_request_length_rut_side(TempDir& temp,
                                                   const char* rut_path,
                                                   HeldLoopbackPorts& reservations,
@@ -52138,9 +52158,15 @@ static bool run_converter_request_length_rut_side(TempDir& temp,
                                                   RetainedHeaderObservation* observation,
                                                   std::string& error,
                                                   const char* converter_path = nullptr,
-                                                  bool complete_file = false) {
+                                                  bool complete_file = false,
+                                                  bool access_log_off = false) {
     if (complete_file && (converter_path == nullptr || !retained_header_whitespace)) {
         error = "#583 complete-file mode requires the standalone nginx-http CLI and retained slice";
+        return false;
+    }
+    if (access_log_off && (!complete_file || converter_path == nullptr ||
+                           !retained_header_whitespace)) {
+        error = "#591 Off mode requires the retained complete-file CLI path";
         return false;
     }
     const bool require_peer_retirement = split_header_delivery || retained_header_whitespace;
@@ -52167,7 +52193,8 @@ static bool run_converter_request_length_rut_side(TempDir& temp,
                 error = "#583 complete nginx input changed before CLI conversion";
                 return false;
             }
-            temp.rut_access_log = temp.nginx_access_log;
+            temp.rut_access_log = access_log_off ? temp.nginx_default_access_log
+                                                  : temp.nginx_access_log;
         }
         const std::string profile =
             make_converter_request_length_profile(frontend_port, backend_port, temp.rut_access_log);
@@ -52212,6 +52239,14 @@ static bool run_converter_request_length_rut_side(TempDir& temp,
             error = "#577 standalone converter failed or produced no source";
             return false;
         }
+        if (access_log_off) {
+            std::string converter_diagnostics;
+            if (!read_bounded_file(converter_error, converter_diagnostics, error) ||
+                !converter_diagnostics.empty()) {
+                error = "#591 Off CLI emitted unexpected converter diagnostics";
+                return false;
+            }
+        }
         converter_guard.child.pid = -1;
     } else if (!build_owned_converter_request_length_source(
                    frontend_port, backend_port, temp.rut_access_log, generated, error) ||
@@ -52222,8 +52257,10 @@ static bool run_converter_request_length_rut_side(TempDir& temp,
     std::fill(generated.begin(), generated.end(), 'G');
     std::string persisted;
     if (!read_exact_return204_log(temp.source, "#362 persisted generated RUT", persisted, error) ||
-        !validate_converter_request_length_source(
-            persisted, frontend_port, backend_port, temp.rut_access_log, error))
+        !(access_log_off
+              ? validate_converter_retained_off_source(persisted, frontend_port, backend_port, error)
+              : validate_converter_request_length_source(
+                    persisted, frontend_port, backend_port, temp.rut_access_log, error)))
         return false;
     persisted.clear();
     persisted.shrink_to_fit();
@@ -52288,8 +52325,20 @@ static bool run_converter_request_length_rut_side(TempDir& temp,
                backend.requests.load(std::memory_order_acquire) == expected &&
                backend.response_send_all_calls.load(std::memory_order_acquire) == expected;
     };
-    const std::string expected_access = retained_header_whitespace ? "105\n" : "102\n";
+    const std::string expected_access = access_log_off ? "" :
+                                         (retained_header_whitespace ? "105\n" : "102\n");
+    const auto read_access = [&](std::string& bytes, std::string& detail) {
+        return access_log_off ? read_monitored_access_file(temp.rut_access_log, bytes, detail)
+                              : read_request_length_access_file(temp.rut_access_log, bytes, detail);
+    };
     const auto validate_access = [&](const std::string& bytes, std::string& detail) {
+        if (access_log_off) {
+            if (!bytes.empty()) {
+                detail = "#591 Off RUT access sink was not empty";
+                return false;
+            }
+            return true;
+        }
         if (retained_header_whitespace) {
             if (bytes != expected_access) {
                 detail = "#252 generated-RUT access file was not exactly 105 plus newline";
@@ -52303,7 +52352,7 @@ static bool run_converter_request_length_rut_side(TempDir& temp,
     while (std::chrono::steady_clock::now() < quiet_deadline) {
         std::string access_bytes;
         if (!live_with_counts(0u) ||
-            !read_request_length_access_file(temp.rut_access_log, access_bytes, error) ||
+            !read_access(access_bytes, error) ||
             !access_bytes.empty()) {
             if (error.empty()) error = "#362 generated-RUT pre-request state was not quiet";
             return false;
@@ -52334,7 +52383,7 @@ static bool run_converter_request_length_rut_side(TempDir& temp,
         for (;;) {
             std::string access_bytes;
             if (!live_with_counts(0u) ||
-                !read_request_length_access_file(temp.rut_access_log, access_bytes, error) ||
+                !read_access(access_bytes, error) ||
                 !access_bytes.empty() ||
                 !observe_client_open_and_quiet_nonconsuming(client.fd, 25, error)) {
                 if (error.empty())
@@ -52349,7 +52398,7 @@ static bool run_converter_request_length_rut_side(TempDir& temp,
         // immediately after validating these actual observations.
         std::string final_quiet_access;
         const bool final_access_quiet =
-            read_request_length_access_file(temp.rut_access_log, final_quiet_access, error) &&
+            read_access(final_quiet_access, error) &&
             final_quiet_access.empty();
         const bool final_client_quiet =
             observe_client_open_and_quiet_nonconsuming(client.fd, 0, error);
@@ -52436,7 +52485,7 @@ static bool run_converter_request_length_rut_side(TempDir& temp,
     for (;;) {
         std::string access_bytes;
         if (!live_with_counts(1u) ||
-            !read_request_length_access_file(temp.rut_access_log, access_bytes, error)) {
+            !read_access(access_bytes, error)) {
             if (error.empty()) error = "#362 generated RUT failed while awaiting live access";
             return false;
         }
@@ -52469,7 +52518,7 @@ static bool run_converter_request_length_rut_side(TempDir& temp,
                backend.response_peer_close_count.load(std::memory_order_acquire) != 1u) ||
               backend.response_peer_unexpected_data.load(std::memory_order_acquire) ||
               backend.response_peer_observation_failed.load(std::memory_order_acquire))) ||
-            !read_request_length_access_file(temp.rut_access_log, access_bytes, error) ||
+            !read_access(access_bytes, error) ||
             !validate_access(access_bytes, error)) {
             if (error.empty())
                 error = split_header_delivery ? "#370 generated-RUT live evidence was not stable"
@@ -52535,7 +52584,7 @@ static bool run_converter_request_length_rut_side(TempDir& temp,
          (!backend.response_peer_closed.load(std::memory_order_acquire) ||
           backend.response_peer_unexpected_data.load(std::memory_order_acquire) ||
           backend.response_peer_observation_failed.load(std::memory_order_acquire))) ||
-        !read_request_length_access_file(temp.rut_access_log, final_access, error) ||
+        !read_access(final_access, error) ||
         !validate_access(final_access, error) ||
         !read_exact_return204_log(
             temp.rut_log, "#362 generated RUT runtime log", runtime_log, error) ||
@@ -52561,6 +52610,8 @@ static bool run_converter_request_length_rut_side(TempDir& temp,
         observation->access = final_access;
         observation->upstream = backend.history[0];
         observation->backend_port = backend_port;
+        observation->config = temp.retained_config_snapshot;
+        observation->frontend_port = frontend_port;
     }
     if (complete_file) {
         std::string actual;
@@ -52686,6 +52737,131 @@ static bool run_converter_retained_header_whitespace_differential(
     if (!compare_retained_header_observations(
             nginx_observation, generated_observation, error, complete_file))
         return false;
+    return true;
+}
+
+static bool run_converter_retained_access_log_off_four_phase(const char* rut_path,
+                                                             const char* converter_path,
+                                                             std::string& error) {
+    if (rut_path == nullptr || converter_path == nullptr) {
+        error = "#591 four-phase differential requires RUT and converter executables";
+        return false;
+    }
+    TempDir off_temp;
+    TempDir default_temp;
+    TempDir logged_temp;
+    if (!off_temp.create() || !default_temp.create() || !logged_temp.create()) {
+        error = "#591 four-phase differential could not create temporary directories";
+        return false;
+    }
+    const std::string suffix = std::to_string(getpid());
+    RetainedHeaderObservation off_nginx;
+    RetainedHeaderObservation default_nginx;
+    if (!run_pinned_retained_header_whitespace_oracle(
+            off_temp, "rut-nginx-591-four-off-" + suffix, &off_nginx, error, true, true))
+        return false;
+    if (off_nginx.access != "" || off_nginx.frontend_port == 0u || off_nginx.backend_port == 0u) {
+        error = "#591 Off nginx phase did not authenticate an empty access sink";
+        return false;
+    }
+    if (!run_pinned_retained_header_whitespace_oracle(default_temp,
+                                                      "rut-nginx-591-four-default-" + suffix,
+                                                      &default_nginx,
+                                                      error,
+                                                      true,
+                                                      false,
+                                                      true,
+                                                      off_nginx.frontend_port,
+                                                      off_nginx.backend_port))
+        return false;
+    const std::string removed = "  access_log off;\n";
+    const size_t removed_at = off_nginx.config.find(removed);
+    std::string expected_default = off_nginx.config;
+    if (removed_at == std::string::npos) {
+        error = "#591 Off nginx phase did not retain its exact directive inventory";
+        return false;
+    }
+    expected_default.erase(removed_at, removed.size());
+    if (default_nginx.config != expected_default || default_nginx.access.empty()) {
+        error = "#591 nginx omission phase was not the same frozen file without Off";
+        return false;
+    }
+    if (!validate_default_access_record(default_nginx.access, error)) return false;
+    std::string off_before_rut;
+    if (!read_exact_return204_log(off_temp.nginx_config,
+                                  "#591 Off frozen input before RUT",
+                                  off_before_rut,
+                                  error) ||
+        off_before_rut != off_nginx.config) {
+        error = "#591 Off frozen input was changed between nginx and RUT phases";
+        return false;
+    }
+
+    HeldLoopbackPorts off_reservations;
+    if (!off_reservations.reserve_specific(0u, off_nginx.frontend_port) ||
+        !off_reservations.reserve_specific(1u, off_nginx.backend_port)) {
+        error = "#591 could not reacquire the exact Off nginx ports";
+        return false;
+    }
+    RetainedHeaderObservation off_rut;
+    if (!run_converter_request_length_rut_side(off_temp,
+                                               rut_path,
+                                               off_reservations,
+                                               off_nginx.frontend_port,
+                                               off_nginx.backend_port,
+                                               false,
+                                               true,
+                                               &off_rut,
+                                               error,
+                                               converter_path,
+                                               true,
+                                               true))
+        return false;
+    if (off_rut.access != "" || off_rut.response != off_nginx.response ||
+        off_rut.upstream != off_nginx.upstream) {
+        error = "#591 generated Off RUT did not match nginx wire evidence or absence";
+        return false;
+    }
+
+    logged_temp.rut_access_log = off_temp.nginx_default_access_log;
+    HeldLoopbackPorts logged_reservations;
+    if (!logged_reservations.reserve_specific(0u, off_nginx.frontend_port) ||
+        !logged_reservations.reserve_specific(1u, off_nginx.backend_port)) {
+        error = "#591 could not reacquire exact ports for the logged positive control";
+        return false;
+    }
+    RetainedHeaderObservation logged_rut;
+    if (!run_converter_request_length_rut_side(logged_temp,
+                                               rut_path,
+                                               logged_reservations,
+                                               off_nginx.frontend_port,
+                                               off_nginx.backend_port,
+                                               false,
+                                               true,
+                                               &logged_rut,
+                                               error))
+        return false;
+    if (logged_rut.access != "105\n" || logged_rut.response != off_nginx.response ||
+        logged_rut.upstream != off_nginx.upstream) {
+        error = "#591 logged RUT positive control did not match the retained wire";
+        return false;
+    }
+    std::string final_logged_access;
+    if (!read_monitored_access_file(
+            off_temp.nginx_default_access_log, final_logged_access, error) ||
+        final_logged_access != "105\n") {
+        error = "#591 shared owned monitor did not retain the exact logged positive record";
+        return false;
+    }
+    std::string off_after_rut;
+    if (!read_exact_return204_log(off_temp.nginx_config,
+                                  "#591 Off frozen input after RUT",
+                                  off_after_rut,
+                                  error) ||
+        off_after_rut != off_nginx.config) {
+        error = "#591 complete Off input changed after generated RUT consumption";
+        return false;
+    }
     return true;
 }
 
@@ -73215,6 +73391,8 @@ int main(int argc, char** argv) {
         strcmp(argv[1], "--converter-retained-header-whitespace-differential") == 0;
     const bool converter_complete_file_retained_differential =
         argc == 4 && strcmp(argv[1], "--converter-complete-file-retained-differential") == 0;
+    const bool converter_retained_access_log_off_four_phase =
+        argc == 4 && strcmp(argv[1], "--converter-retained-access-log-off-four-phase") == 0;
     const bool converter_request_length_fixed_body_differential =
         argc == 3 && strcmp(argv[1], "--converter-request-length-fixed-body-differential") == 0;
     const bool converter_request_length_split_fixed_body_differential =
@@ -73434,6 +73612,7 @@ int main(int argc, char** argv) {
          !converter_request_length_split_header_differential &&
          !converter_retained_header_whitespace_differential &&
          !converter_complete_file_retained_differential &&
+         !converter_retained_access_log_off_four_phase &&
          !converter_request_length_fixed_body_differential &&
          !converter_request_length_split_fixed_body_differential &&
          !exact_loopback_return204_oracle && !exact_loopback_bodyful_return_oracle &&
@@ -74156,7 +74335,8 @@ int main(int argc, char** argv) {
         converter_request_length_differential ||
         converter_request_length_split_header_differential ||
         converter_retained_header_whitespace_differential ||
-        converter_complete_file_retained_differential) {
+        converter_complete_file_retained_differential ||
+        converter_retained_access_log_off_four_phase) {
         std::string self_check_error;
         if (!run_request_length_oracle_self_checks(self_check_error)) {
             std::cerr << "FAIL [#362 request-length oracle self-check]: " << self_check_error
@@ -74173,7 +74353,8 @@ int main(int argc, char** argv) {
         if ((converter_request_length_differential ||
              converter_request_length_split_header_differential ||
              (converter_retained_header_whitespace_differential ||
-              converter_complete_file_retained_differential)) &&
+              converter_complete_file_retained_differential ||
+              converter_retained_access_log_off_four_phase)) &&
             !run_converter_request_length_self_checks(self_check_error)) {
             std::cerr << "FAIL [#362 converter request-length self-check]: " << self_check_error
                       << "\n";
@@ -76147,6 +76328,22 @@ int main(int argc, char** argv) {
                      "the explicit nginx-http CLI; exact 105-byte/70-byte/118-byte retained-"
                      "header wire, 105\\n access record, EOF, one origin retirement, no retry, "
                      "and 175ms stability matched on reacquired numeric ports\n";
+        return 0;
+    }
+    if (converter_retained_access_log_off_four_phase) {
+        std::string differential_error;
+        if (!run_converter_retained_access_log_off_four_phase(
+                argv[2], argv[3], differential_error)) {
+            std::cerr << "FAIL [#591 generated Off/logged four-phase differential]: "
+                      << differential_error << "\n";
+            return 1;
+        }
+        std::cerr
+            << "PASS: #591 pinned nginx Off, nginx omission, CLI-generated Off RUT and "
+               "logged-RUT phases preserved the immutable complete file, exact 105-byte/70-byte/"
+               "118-byte retained wire and EOF, one origin retirement, no retry, 175ms stability, "
+               "authenticated Off sink absence, and the same owned monitor's exact 105\\n positive "
+               "record\n";
         return 0;
     }
     if (converter_retained_header_whitespace_differential) {
