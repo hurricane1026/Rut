@@ -323,7 +323,7 @@ FrontendResult<bool> validate_proxy_buffering(const Server& server) {
         buffering.span.end >= location.span.end)
         return unsupported(is_valid_span(buffering.span) ? buffering.span : location.span,
                            lit_str("invalid proxy_buffering model"));
-    return unsupported(buffering.span, lit_str("proxy_buffering on is recognized but unsupported"));
+    return true;
 }
 
 FrontendResult<ProxyLocationProfile> validate_prefix_without_uri(const Server& server) {
@@ -2160,6 +2160,16 @@ FrontendResult<RutSource> lower_to_rut(const Server& server) {
                            lit_str("exact no-content return requires location / fallback"));
     auto proxy_buffering = validate_proxy_buffering(server);
     if (!proxy_buffering) return core::make_unexpected(proxy_buffering.error());
+    const bool explicit_buffering_on = proxy_buffering.value();
+    if (explicit_buffering_on &&
+        !(is_root && exact_listener && server.listen.address == ListenerAddress::IPv4Exact &&
+          server.listen.ipv4_host == 0x7f000001u && timeout_present &&
+          server.location.proxy_read_timeout.milliseconds >= 1000u &&
+          server.location.proxy_read_timeout.milliseconds <= 63000u && !hide_compat_header &&
+          !has_sibling_action))
+        return unsupported(
+            server.location.proxy_buffering.span,
+            lit_str("proxy_buffering on requires the bounded timeout proxy profile"));
     RutSource output{};
     Writer writer(output);
     auto put = [&](const char* text) {

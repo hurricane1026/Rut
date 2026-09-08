@@ -2588,16 +2588,81 @@ TEST(nginx_parser, rejects_proxy_buffering_unsupported_grammar_and_contexts) {
     CHECK_FALSE(comment_parsed.value().location.proxy_buffering.present);
 }
 
-TEST(nginx_converter, rejects_explicit_proxy_buffering_on_before_lowering) {
+TEST(nginx_converter, admits_authenticated_explicit_proxy_buffering_on_timeout_family) {
     const char source[] =
         "server { listen 127.0.0.1:8080; location / { proxy_buffering on; "
         "proxy_read_timeout 1s; proxy_pass http://127.0.0.1:9000; } }";
     const auto parsed = nginx::parse({source, sizeof(source) - 1u});
     REQUIRE(parsed);
-    const auto rejected = nginx::lower_to_rut(parsed.value());
-    REQUIRE_FALSE(rejected);
-    CHECK_EQ(rejected.error().code, FrontendError::UnsupportedSyntax);
-    CHECK(rejected.error().detail.eq(lit_str("proxy_buffering on is recognized but unsupported")));
+    const auto lowered = nginx::lower_to_rut(parsed.value());
+    REQUIRE(lowered);
+    const char omitted_source[] =
+        "server { listen 127.0.0.1:8080; location / { "
+        "proxy_read_timeout 1s; proxy_pass http://127.0.0.1:9000; } }";
+    const auto omitted = nginx::parse({omitted_source, sizeof(omitted_source) - 1u});
+    REQUIRE(omitted);
+    const auto omitted_lowered = nginx::lower_to_rut(omitted.value());
+    REQUIRE(omitted_lowered);
+    CHECK(lowered.value().view().eq(omitted_lowered.value().view()));
+
+    const char* variants[] = {
+        "server { listen 127.0.0.1:8080; location / { proxy_buffering on; "
+        "proxy_read_timeout 1s; proxy_pass http://127.0.0.1:9000; } }",
+        "server { listen 127.0.0.1:8080; location / { proxy_read_timeout 1s; "
+        "proxy_pass http://127.0.0.1:9000; proxy_buffering on; } }",
+        "server { listen 127.0.0.1:8080; location / { proxy_buffering on; "
+        "proxy_read_timeout 63s; proxy_pass http://127.0.0.1:9000; } }",
+        "server { listen 127.0.0.1:8080; location / { proxy_read_timeout 63s; "
+        "proxy_pass http://127.0.0.1:9000; proxy_buffering on; } }",
+    };
+    const char* timeouts[] = {"1", "1", "63", "63"};
+    for (u32 index = 0u; index < 4u; index++) {
+        const char* variant = variants[index];
+        const auto candidate = nginx::parse({variant, static_cast<u32>(strlen(variant))});
+        REQUIRE(candidate);
+        const auto candidate_lowered = nginx::lower_to_rut(candidate.value());
+        REQUIRE(candidate_lowered);
+        const std::string expected_source =
+            std::string("server { listen 127.0.0.1:8080; location / { proxy_read_timeout ") +
+            timeouts[index] + "s; proxy_pass http://127.0.0.1:9000; } }";
+        const auto expected =
+            nginx::parse({expected_source.data(), static_cast<u32>(expected_source.size())});
+        REQUIRE(expected);
+        const auto expected_lowered = nginx::lower_to_rut(expected.value());
+        REQUIRE(expected_lowered);
+        CHECK(candidate_lowered.value().view().eq(expected_lowered.value().view()));
+    }
+
+    const char no_timeout_source[] =
+        "server { listen 127.0.0.1:8080; location / { proxy_buffering on; "
+        "proxy_pass http://127.0.0.1:9000; } }";
+    const auto no_timeout = nginx::parse({no_timeout_source, sizeof(no_timeout_source) - 1u});
+    REQUIRE(no_timeout);
+    const auto no_timeout_result = nginx::lower_to_rut(no_timeout.value());
+    REQUIRE_FALSE(no_timeout_result);
+    CHECK(no_timeout_result.error().detail.eq(
+        lit_str("proxy_buffering on requires the bounded timeout proxy profile")));
+
+    const char* const rejected_profiles[] = {
+        "server { listen 8080; location / { proxy_buffering on; proxy_read_timeout 1s; "
+        "proxy_pass http://127.0.0.1:9000; } }",
+        "server { listen 192.0.2.10:8080; location / { proxy_buffering on; "
+        "proxy_read_timeout 1s; proxy_pass http://127.0.0.1:9000; } }",
+        "server { listen 127.0.0.1:8080; location / { proxy_buffering on; "
+        "proxy_read_timeout 1s; proxy_hide_header X-Compat-Hidden; proxy_pass "
+        "http://127.0.0.1:9000; } }",
+        "server { listen 127.0.0.1:8080; location / { proxy_buffering on; "
+        "proxy_read_timeout 1s; proxy_pass http://127.0.0.1:9000; } "
+        "location = /old { return 302 http://redirect.example/new; } }",
+    };
+    for (const char* rejected_source : rejected_profiles) {
+        const auto rejected_model =
+            nginx::parse({rejected_source, static_cast<u32>(strlen(rejected_source))});
+        REQUIRE(rejected_model);
+        const auto rejected_lowering = nginx::lower_to_rut(rejected_model.value());
+        REQUIRE_FALSE(rejected_lowering);
+        CHECK_EQ(rejected_lowering.error().code, FrontendError::UnsupportedSyntax);
+    }
 
     auto erased = parsed.value();
     erased.location.proxy_buffering = {};
@@ -2672,12 +2737,22 @@ TEST(nginx_converter, http_profile_compares_proxy_buffering_metadata_before_lowe
     const std::string source = make_request_length_http_profile(
         "/tmp/compat.log",
         "    listen 127.0.0.1:8080;\n"
-        "    location / { proxy_buffering on; proxy_pass http://127.0.0.1:9000; }\n");
+        "    location / { proxy_buffering on; proxy_read_timeout 1s; "
+        "proxy_pass http://127.0.0.1:9000; }\n");
     const auto parsed = nginx::parse_http_profile({source.data(), static_cast<u32>(source.size())});
     REQUIRE(parsed);
-    const auto rejected = nginx::lower_to_rut(parsed.value());
-    REQUIRE_FALSE(rejected);
-    CHECK(rejected.error().detail.eq(lit_str("proxy_buffering on is recognized but unsupported")));
+    const auto lowered = nginx::lower_to_rut(parsed.value());
+    REQUIRE(lowered);
+    const std::string omitted_source = make_request_length_http_profile(
+        "/tmp/compat.log",
+        "    listen 127.0.0.1:8080;\n"
+        "    location / { proxy_read_timeout 1s; proxy_pass http://127.0.0.1:9000; }\n");
+    const auto omitted =
+        nginx::parse_http_profile({omitted_source.data(), static_cast<u32>(omitted_source.size())});
+    REQUIRE(omitted);
+    const auto omitted_lowered = nginx::lower_to_rut(omitted.value());
+    REQUIRE(omitted_lowered);
+    CHECK(lowered.value().view().eq(omitted_lowered.value().view()));
     auto erased = parsed.value();
     erased.server.location.proxy_buffering = {};
     const auto erased_result = nginx::lower_to_rut(erased);
