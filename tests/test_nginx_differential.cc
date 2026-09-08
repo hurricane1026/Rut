@@ -52170,11 +52170,10 @@ static bool validate_converter_retained_off_source(const std::string& source,
             }
         } else if (item.kind == rut::AstItemKind::Upstream) {
             upstream_count++;
-            if (!item.upstream.name.eq({"nginx_upstream", 14u}) ||
-                !item.upstream.has_address || item.upstream.port_is_set ||
-                item.upstream.backend_count != 0u ||
-                !item.upstream.host_lit.eq({expected_host.data(),
-                                             static_cast<u32>(expected_host.size())})) {
+            if (!item.upstream.name.eq({"nginx_upstream", 14u}) || !item.upstream.has_address ||
+                item.upstream.port_is_set || item.upstream.backend_count != 0u ||
+                !item.upstream.host_lit.eq(
+                    {expected_host.data(), static_cast<u32>(expected_host.size())})) {
                 error = "#591 generated Off RUT parsed an alternate upstream";
                 return false;
             }
@@ -52188,9 +52187,9 @@ static bool validate_converter_retained_off_source(const std::string& source,
 }
 
 static bool run_converter_retained_off_source_self_checks(const std::string& source,
-                                                           u16 frontend_port,
-                                                           u16 backend_port,
-                                                           std::string& error) {
+                                                          u16 frontend_port,
+                                                          u16 backend_port,
+                                                          std::string& error) {
     const auto replace_once = [&](const std::string& from, const std::string& to) {
         std::string changed = source;
         const size_t at = changed.find(from);
@@ -52200,20 +52199,22 @@ static bool run_converter_retained_off_source_self_checks(const std::string& sou
         return changed;
     };
     const std::string listener = "listen 127.0.0.1:" + std::to_string(frontend_port);
-    const std::string upstream = "upstream nginx_upstream at \"127.0.0.1:" +
-                                 std::to_string(backend_port) + "\"";
+    const std::string upstream =
+        "upstream nginx_upstream at \"127.0.0.1:" + std::to_string(backend_port) + "\"";
     const std::string duplicate_listener =
         "listen 127.0.0.1:" + std::to_string(frontend_port) + "\n";
     const std::string duplicate_upstream =
         "upstream nginx_upstream at \"127.0.0.1:" + std::to_string(backend_port) + "\"\n";
     const std::vector<std::string> mutations = {
         replace_once(listener, "listen 127.0.0.1:" + std::to_string(frontend_port + 1u)),
-        replace_once(upstream, "upstream nginx_upstream at \"127.0.0.1:" +
-                                  std::to_string(backend_port + 1u) + "\""),
+        replace_once(
+            upstream,
+            "upstream nginx_upstream at \"127.0.0.1:" + std::to_string(backend_port + 1u) + "\""),
         source + duplicate_listener,
         source + duplicate_upstream,
-        source + "\naccessLog { path: \"/tmp/forbidden\", format: downstreamRequestBytes, "
-                "publication: live }\n",
+        source +
+            "\naccessLog { path: \"/tmp/forbidden\", format: downstreamRequestBytes, "
+            "publication: live }\n",
     };
     for (const std::string& mutation : mutations) {
         std::string detail;
@@ -52242,8 +52243,8 @@ static bool run_converter_request_length_rut_side(TempDir& temp,
         error = "#583 complete-file mode requires the standalone nginx-http CLI and retained slice";
         return false;
     }
-    if (access_log_off && (!complete_file || converter_path == nullptr ||
-                           !retained_header_whitespace)) {
+    if (access_log_off &&
+        (!complete_file || converter_path == nullptr || !retained_header_whitespace)) {
         error = "#591 Off mode requires the retained complete-file CLI path";
         return false;
     }
@@ -52271,8 +52272,8 @@ static bool run_converter_request_length_rut_side(TempDir& temp,
                 error = "#583 complete nginx input changed before CLI conversion";
                 return false;
             }
-            temp.rut_access_log = access_log_off ? temp.nginx_default_access_log
-                                                  : temp.nginx_access_log;
+            temp.rut_access_log =
+                access_log_off ? temp.nginx_default_access_log : temp.nginx_access_log;
         }
         const std::string profile =
             make_converter_request_length_profile(frontend_port, backend_port, temp.rut_access_log);
@@ -52335,10 +52336,10 @@ static bool run_converter_request_length_rut_side(TempDir& temp,
     std::fill(generated.begin(), generated.end(), 'G');
     std::string persisted;
     if (!read_exact_return204_log(temp.source, "#362 persisted generated RUT", persisted, error) ||
-        !(access_log_off
-              ? validate_converter_retained_off_source(persisted, frontend_port, backend_port, error)
-              : validate_converter_request_length_source(
-                    persisted, frontend_port, backend_port, temp.rut_access_log, error)))
+        !(access_log_off ? validate_converter_retained_off_source(
+                               persisted, frontend_port, backend_port, error)
+                         : validate_converter_request_length_source(
+                               persisted, frontend_port, backend_port, temp.rut_access_log, error)))
         return false;
     if (access_log_off) {
         struct LoadedProgramGuard {
@@ -52348,12 +52349,11 @@ static bool run_converter_request_length_rut_side(TempDir& temp,
             }
         } loaded;
         rut::LoadError load_error;
-        if (!rut::load_rut_program(
-                temp.source.c_str(),
-                *loaded.value,
-                load_error,
-                rut::jit::OptLevel::O2,
-                static_cast<u64>(persisted.size())) ||
+        if (!rut::load_rut_program(temp.source.c_str(),
+                                   *loaded.value,
+                                   load_error,
+                                   rut::jit::OptLevel::O2,
+                                   static_cast<u64>(persisted.size())) ||
             loaded.value->access_log.present) {
             error = "#591 loaded Off RUT unexpectedly exposed an access-log sink";
             return false;
@@ -52425,8 +52425,8 @@ static bool run_converter_request_length_rut_side(TempDir& temp,
                backend.requests.load(std::memory_order_acquire) == expected &&
                backend.response_send_all_calls.load(std::memory_order_acquire) == expected;
     };
-    const std::string expected_access = access_log_off ? "" :
-                                         (retained_header_whitespace ? "105\n" : "102\n");
+    const std::string expected_access =
+        access_log_off ? "" : (retained_header_whitespace ? "105\n" : "102\n");
     const auto read_access = [&](std::string& bytes, std::string& detail) {
         return access_log_off ? read_monitored_access_file(temp.rut_access_log, bytes, detail)
                               : read_request_length_access_file(temp.rut_access_log, bytes, detail);
@@ -52451,9 +52451,7 @@ static bool run_converter_request_length_rut_side(TempDir& temp,
     const auto quiet_deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(150);
     while (std::chrono::steady_clock::now() < quiet_deadline) {
         std::string access_bytes;
-        if (!live_with_counts(0u) ||
-            !read_access(access_bytes, error) ||
-            !access_bytes.empty()) {
+        if (!live_with_counts(0u) || !read_access(access_bytes, error) || !access_bytes.empty()) {
             if (error.empty()) error = "#362 generated-RUT pre-request state was not quiet";
             return false;
         }
@@ -52482,8 +52480,7 @@ static bool run_converter_request_length_rut_side(TempDir& temp,
         const auto split_quiet_deadline = split_quiet_started + std::chrono::milliseconds(500);
         for (;;) {
             std::string access_bytes;
-            if (!live_with_counts(0u) ||
-                !read_access(access_bytes, error) ||
+            if (!live_with_counts(0u) || !read_access(access_bytes, error) ||
                 !access_bytes.empty() ||
                 !observe_client_open_and_quiet_nonconsuming(client.fd, 25, error)) {
                 if (error.empty())
@@ -52498,8 +52495,7 @@ static bool run_converter_request_length_rut_side(TempDir& temp,
         // immediately after validating these actual observations.
         std::string final_quiet_access;
         const bool final_access_quiet =
-            read_access(final_quiet_access, error) &&
-            final_quiet_access.empty();
+            read_access(final_quiet_access, error) && final_quiet_access.empty();
         const bool final_client_quiet =
             observe_client_open_and_quiet_nonconsuming(client.fd, 0, error);
         const bool final_child_live = !poll_child(runtime.child);
@@ -52584,8 +52580,7 @@ static bool run_converter_request_length_rut_side(TempDir& temp,
     const auto access_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
     for (;;) {
         std::string access_bytes;
-        if (!live_with_counts(1u) ||
-            !read_access(access_bytes, error)) {
+        if (!live_with_counts(1u) || !read_access(access_bytes, error)) {
             if (error.empty()) error = "#362 generated RUT failed while awaiting live access";
             return false;
         }
@@ -52618,8 +52613,7 @@ static bool run_converter_request_length_rut_side(TempDir& temp,
                backend.response_peer_close_count.load(std::memory_order_acquire) != 1u) ||
               backend.response_peer_unexpected_data.load(std::memory_order_acquire) ||
               backend.response_peer_observation_failed.load(std::memory_order_acquire))) ||
-            !read_access(access_bytes, error) ||
-            !validate_access(access_bytes, error)) {
+            !read_access(access_bytes, error) || !validate_access(access_bytes, error)) {
             if (error.empty())
                 error = split_header_delivery ? "#370 generated-RUT live evidence was not stable"
                                               : "#362 generated-RUT live evidence was not stable";
@@ -52684,8 +52678,7 @@ static bool run_converter_request_length_rut_side(TempDir& temp,
          (!backend.response_peer_closed.load(std::memory_order_acquire) ||
           backend.response_peer_unexpected_data.load(std::memory_order_acquire) ||
           backend.response_peer_observation_failed.load(std::memory_order_acquire))) ||
-        !read_access(final_access, error) ||
-        !validate_access(final_access, error) ||
+        !read_access(final_access, error) || !validate_access(final_access, error) ||
         !read_exact_return204_log(
             temp.rut_log, "#362 generated RUT runtime log", runtime_log, error) ||
         !validate_rut_exact_ipv4_runtime_log(runtime_log, temp.source, frontend_port, error)) {
@@ -52888,10 +52881,8 @@ static bool run_converter_retained_access_log_off_four_phase(const char* rut_pat
     }
     if (!validate_default_access_record(default_nginx.access, error)) return false;
     std::string off_before_rut;
-    if (!read_exact_return204_log(off_temp.nginx_config,
-                                  "#591 Off frozen input before RUT",
-                                  off_before_rut,
-                                  error) ||
+    if (!read_exact_return204_log(
+            off_temp.nginx_config, "#591 Off frozen input before RUT", off_before_rut, error) ||
         off_before_rut != off_nginx.config) {
         error = "#591 Off frozen input was changed between nginx and RUT phases";
         return false;
@@ -52987,10 +52978,8 @@ static bool run_converter_retained_access_log_off_four_phase(const char* rut_pat
         return false;
     }
     std::string off_after_rut;
-    if (!read_exact_return204_log(off_temp.nginx_config,
-                                  "#591 Off frozen input after RUT",
-                                  off_after_rut,
-                                  error) ||
+    if (!read_exact_return204_log(
+            off_temp.nginx_config, "#591 Off frozen input after RUT", off_after_rut, error) ||
         off_after_rut != off_nginx.config) {
         error = "#591 complete Off input changed after generated RUT consumption";
         return false;
