@@ -1052,7 +1052,6 @@ if(RUT_ENABLE_JIT)
         RUN_SERIAL TRUE
         RESOURCE_LOCK nginx-differential
         TIMEOUT 60
-        SKIP_RETURN_CODE 77
         ENVIRONMENT "RUT_NGINX_DIFFERENTIAL_REQUIRED=1"
     )
     add_test(
