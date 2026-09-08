@@ -961,6 +961,19 @@ TEST(nginx_complete_converter, authenticates_complete_source_before_lowering) {
     forged.http.server.listen.port++;
     rejected = nginx::lower_to_rut(forged);
     REQUIRE_FALSE(rejected);
+    std::string alternate_http(parsed.value().http.source.ptr, parsed.value().http.source.len);
+    forged = parsed.value();
+    forged.http.source.ptr = alternate_http.data();
+    rejected = nginx::lower_to_rut(forged);
+    REQUIRE_FALSE(rejected);
+    forged = parsed.value();
+    forged.http.source.ptr = reinterpret_cast<const char*>(static_cast<uintptr_t>(1));
+    rejected = nginx::lower_to_rut(forged);
+    REQUIRE_FALSE(rejected);
+    forged = parsed.value();
+    forged.http.source.len--;
+    rejected = nginx::lower_to_rut(forged);
+    REQUIRE_FALSE(rejected);
 }
 
 TEST(nginx_complete_converter, rebases_lowering_diagnostics_to_complete_source) {
@@ -1020,10 +1033,10 @@ TEST(nginx_complete_converter, rebases_lowering_diagnostics_to_complete_source) 
 
 TEST(nginx_complete_converter, authenticates_redirect_response_span_without_child_reads) {
     const std::string source =
-        "events {}\n"
-        "http { log_format compat \"$request_length\"; access_log /tmp/a compat; server { "
+        "events {} http { log_format compat \"$request_length\"; access_log /tmp/a compat; server "
+        "{ "
         "listen 127.0.0.1:8080; location / { proxy_pass http://127.0.0.1:9000; } "
-        "location = /old { return 301 http://redirect.example/new; } } }\n";
+        "location = /old { return 301 http://redirect.example/new; } } }";
     const auto parsed =
         nginx::parse_nginx_http_config({source.data(), static_cast<u32>(source.size())});
     REQUIRE(parsed);
@@ -1032,14 +1045,13 @@ TEST(nginx_complete_converter, authenticates_redirect_response_span_without_chil
     const auto rejected = nginx::lower_to_rut(forged);
     REQUIRE_FALSE(rejected);
     CHECK(rejected.error().detail.eq(lit_str("http profile metadata does not match its source")));
-    const Span local_response = parsed.value().http.server.exact_absolute_redirect.response.span;
-    const u32 expected_start = parsed.value().http_span.start + local_response.start;
-    const u32 expected_end = parsed.value().http_span.start + local_response.end;
+    const Span local_location = parsed.value().http.server.exact_absolute_redirect.span;
+    const u32 expected_start = parsed.value().http_span.start + local_location.start;
+    const u32 expected_end = parsed.value().http_span.start + local_location.end;
     CHECK_EQ(rejected.error().span.start, expected_start);
     CHECK_EQ(rejected.error().span.end, expected_end);
-    CHECK_EQ(rejected.error().span.line, 2u);
-    CHECK_EQ(rejected.error().span.col,
-             static_cast<u32>(source.find("return 301") - source.rfind('\n', expected_start)));
+    CHECK_EQ(rejected.error().span.line, 1u);
+    CHECK_EQ(rejected.error().span.col, expected_start + 1u);
 }
 
 TEST(nginx_http_profile_parser,
