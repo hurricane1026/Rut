@@ -29,6 +29,7 @@ enum rut_iouring_gate_mode {
     RUT_IOURING_GATE_MODE_NONE = 0,
     RUT_IOURING_GATE_MODE_LATE_SUCCESSOR = 1,
     RUT_IOURING_GATE_MODE_COALESCED_INGRESS = 2,
+    RUT_IOURING_GATE_MODE_LATE_SUCCESSOR_200 = 3,
 };
 
 enum rut_iouring_gate_ingress_state {
