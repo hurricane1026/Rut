@@ -1443,7 +1443,7 @@ inline bool http1_pipeline_successor_materialization_is_stable(
         c.pipeline_stash_len != 0 || c.recv_buf.data() == nullptr || c.req_header_end == 0 ||
         c.req_header_end != c.req_initial_send_len || c.req_initial_send_len != c.recv_buf.len() ||
         c.req_client_has_content_length || c.req_client_content_length_count != 0 ||
-        c.upstream_attempts != 0 || !http1_pipeline_successor_upstream_owners_are_neutral(c))
+        !http1_pipeline_successor_upstream_owners_are_neutral(c))
         return false;
     return http1_pipeline_request_generation_jit_candidate_is_stable(
         c,
