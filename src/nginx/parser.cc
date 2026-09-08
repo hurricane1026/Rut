@@ -311,22 +311,32 @@ public:
         if (!expect(TokenKind::LBrace, lit_str("expected '{' after http")))
             return core::make_unexpected(error_);
 
-        if (cur_.kind == TokenKind::End)
-            return missing(cur_.span, lit_str("missing log_format in http profile"));
-        if (cur_.kind != TokenKind::Word || !eq(cur_.text, "log_format", 10))
-            return unsupported(cur_.span, lit_str("expected one log_format before access_log"));
-        auto format = parse_log_format();
-        if (!format) return core::make_unexpected(format.error());
+        LogFormat format{};
+        AccessLog access{};
+        if (cur_.kind == TokenKind::Word && eq(cur_.text, "access_log", 10)) {
+            auto parsed_access = parse_access_log_off();
+            if (!parsed_access) return core::make_unexpected(parsed_access.error());
+            access = parsed_access.value();
+        } else {
+            if (cur_.kind == TokenKind::End)
+                return missing(cur_.span, lit_str("missing log_format in http profile"));
+            if (cur_.kind != TokenKind::Word || !eq(cur_.text, "log_format", 10))
+                return unsupported(cur_.span, lit_str("expected one log_format before access_log"));
+            auto parsed_format = parse_log_format();
+            if (!parsed_format) return core::make_unexpected(parsed_format.error());
+            format = parsed_format.value();
 
-        if (cur_.kind == TokenKind::End)
-            return missing(cur_.span, lit_str("missing access_log in http profile"));
-        if (cur_.kind != TokenKind::Word || !eq(cur_.text, "access_log", 10)) {
-            if (cur_.kind == TokenKind::Word && eq(cur_.text, "log_format", 10))
-                return unsupported(cur_.span, lit_str("duplicate log_format is unsupported"));
-            return unsupported(cur_.span, lit_str("expected one access_log after log_format"));
+            if (cur_.kind == TokenKind::End)
+                return missing(cur_.span, lit_str("missing access_log in http profile"));
+            if (cur_.kind != TokenKind::Word || !eq(cur_.text, "access_log", 10)) {
+                if (cur_.kind == TokenKind::Word && eq(cur_.text, "log_format", 10))
+                    return unsupported(cur_.span, lit_str("duplicate log_format is unsupported"));
+                return unsupported(cur_.span, lit_str("expected one access_log after log_format"));
+            }
+            auto parsed_access = parse_access_log();
+            if (!parsed_access) return core::make_unexpected(parsed_access.error());
+            access = parsed_access.value();
         }
-        auto access = parse_access_log();
-        if (!access) return core::make_unexpected(access.error());
 
         if (cur_.kind == TokenKind::End)
             return missing(cur_.span, lit_str("missing server in http profile"));
@@ -359,8 +369,8 @@ public:
         HttpProfile result{};
         result.source = source_;
         result.span = Span{start.start, end.end, start.line, start.col};
-        result.log_format = format.value();
-        result.access_log = access.value();
+        result.log_format = format;
+        result.access_log = access;
         result.server = server.value();
         return result;
     }
@@ -608,6 +618,39 @@ private:
                          path.span,
                          reference.text,
                          reference.span,
+                         Span{start.start, end.end, start.line, start.col}};
+    }
+
+    FrontendResult<AccessLog> parse_access_log_off() {
+        const Span start = cur_.span;
+        advance();
+        if (cur_.kind == TokenKind::End)
+            return missing(cur_.span, lit_str("access_log off requires a semicolon"));
+        if (cur_.kind != TokenKind::Word || !eq(cur_.text, "off", 3)) {
+            // Preserve the original diagnostic for a file-path access_log that
+            // appears before log_format. The dedicated off spelling is the only
+            // new leading form; all existing path diagnostics remain anchored at
+            // the access_log directive.
+            if (cur_.kind == TokenKind::Word && cur_.text.len > 0u && cur_.text.ptr[0] == '/')
+                return unsupported(start, lit_str("expected one log_format before access_log"));
+            return unsupported(cur_.span, lit_str("access_log off requires literal off"));
+        }
+        const Token off = cur_;
+        advance();
+        if (cur_.kind == TokenKind::End)
+            return missing(cur_.span, lit_str("expected ';' after access_log off"));
+        if (cur_.kind != TokenKind::Semicolon) {
+            if (cur_.kind == TokenKind::Word)
+                return unsupported(cur_.span, lit_str("access_log off options are unsupported"));
+            return invalid(cur_.span, lit_str("expected ';' after access_log off"));
+        }
+        const Span end = cur_.span;
+        advance();
+        return AccessLog{AccessLogDestinationProfile::Off,
+                         off.text,
+                         off.span,
+                         {},
+                         {},
                          Span{start.start, end.end, start.line, start.col}};
     }
 
