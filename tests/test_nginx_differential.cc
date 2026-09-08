@@ -52846,7 +52846,7 @@ static bool run_converter_request_length_rut_side(TempDir& temp,
                 const rut::RouteEntry& route = loaded.value->config.routes[index];
                 if (route.path_len != 1u || route.path[0] != '/' ||
                     route.preflight_forward_policy_bundle_id == 0u ||
-                    route.action != rut::RouteAction::Proxy) {
+                    route.action != rut::RouteAction::JitHandler) {
                     error = "#600 loaded custom-hide RUT contained an unexpected route";
                     return false;
                 }
