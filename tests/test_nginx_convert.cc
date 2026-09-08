@@ -341,6 +341,39 @@ TEST(nginx_convert, custom_proxy_hide_header_cli_matches_owned_server_output) {
     CHECK_EQ(result.out, std::string(lowered.value().data, lowered.value().len));
     CHECK_NE(result.out.find("x-Powered_by-9"), std::string::npos);
 
+    const std::string access_path = directory + "/custom-access.log";
+    const std::string http_source =
+        "http { log_format compat \"$request_length\"; access_log " + access_path +
+        " compat; server { listen 127.0.0.1:8080; location / { proxy_hide_header "
+        "x-Powered_by-9; proxy_pass http://127.0.0.1:9000; } } }\n";
+    const std::string http_path = directory + "/custom-http.conf";
+    const std::string complete_path = directory + "/custom-complete.conf";
+    const std::string complete_source = "events {}\n" + http_source;
+    REQUIRE(write_file(http_path, http_source));
+    REQUIRE(write_file(complete_path, complete_source));
+    const auto http_parsed = rut::nginx::parse_http_profile(
+        {http_source.data(), static_cast<rut::u32>(http_source.size())});
+    REQUIRE(http_parsed);
+    const auto http_lowered = rut::nginx::lower_to_rut(http_parsed.value());
+    REQUIRE(http_lowered);
+    const std::string http_expected(http_lowered.value().data, http_lowered.value().len);
+    const auto complete_parsed = rut::nginx::parse_nginx_http_config(
+        {complete_source.data(), static_cast<rut::u32>(complete_source.size())});
+    REQUIRE(complete_parsed);
+    const auto complete_lowered = rut::nginx::lower_to_rut(complete_parsed.value());
+    REQUIRE(complete_lowered);
+    CHECK_EQ(std::string(complete_lowered.value().data, complete_lowered.value().len),
+             http_expected);
+    for (const auto& invocation :
+         {std::pair<const char*, std::string>{"http", http_path}, {"nginx-http", complete_path}}) {
+        const RunResult wrapped =
+            run_converter(g_executable, invocation.first, invocation.second, invocation.second);
+        REQUIRE(WIFEXITED(wrapped.status));
+        CHECK_EQ(WEXITSTATUS(wrapped.status), 0);
+        CHECK(wrapped.err.empty());
+        CHECK_EQ(wrapped.out, http_expected);
+    }
+
     const std::string rejected_source =
         "server { listen 127.0.0.1:8080; location / { proxy_hide_header X-!; "
         "proxy_pass http://127.0.0.1:9000; } }\n";
