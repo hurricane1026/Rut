@@ -55677,10 +55677,15 @@ static bool run_converter_explicit_timeout_head_source_self_checks(std::string& 
     constexpr u16 frontend_port = 18080u;
     constexpr u16 backend_port = 18081u;
     const std::string access_path = "/tmp/rut-explicit-timeout-head-access.log";
-    std::string profile =
+    const std::string omitted_profile =
         make_explicit_timeout_head_profile(frontend_port, backend_port, access_path);
     if (!validate_explicit_timeout_head_profile(
-            profile, frontend_port, backend_port, access_path, error))
+            omitted_profile, frontend_port, backend_port, access_path, error))
+        return false;
+    std::string profile =
+        make_explicit_timeout_head_profile(frontend_port, backend_port, access_path, true);
+    if (!validate_explicit_timeout_head_profile(
+            profile, frontend_port, backend_port, access_path, error, true))
         return false;
     const auto require_rejected_profile = [&](std::string candidate, const char* label) {
         std::string ignored;
@@ -55692,22 +55697,34 @@ static bool run_converter_explicit_timeout_head_source_self_checks(std::string& 
         return true;
     };
     std::string off = profile;
-    off.replace(off.find("proxy_buffering on;"),
-                sizeof("proxy_buffering on;") - 1u,
-                "proxy_buffering off;");
+    const size_t on_offset = off.find("proxy_buffering on;");
+    if (on_offset == std::string::npos) {
+        error = "#572 explicit profile lost its canonical proxy_buffering anchor";
+        return false;
+    }
+    off.replace(on_offset, sizeof("proxy_buffering on;") - 1u, "proxy_buffering off;");
     if (!require_rejected_profile(std::move(off), "proxy_buffering off")) return false;
     std::string duplicate = profile;
-    duplicate.insert(duplicate.find("proxy_pass"), "proxy_buffering on;\n      ");
+    const size_t proxy_offset = duplicate.find("proxy_pass");
+    if (proxy_offset == std::string::npos) {
+        error = "#572 explicit profile lost its proxy_pass anchor";
+        return false;
+    }
+    duplicate.insert(proxy_offset, "proxy_buffering on;\n      ");
     if (!require_rejected_profile(std::move(duplicate), "duplicate proxy_buffering")) return false;
     std::string noncanonical = profile;
-    noncanonical.replace(noncanonical.find("proxy_buffering on;"),
-                         sizeof("proxy_buffering on;") - 1u,
-                         "proxy_buffering ON;");
+    const size_t noncanonical_offset = noncanonical.find("proxy_buffering on;");
+    if (noncanonical_offset == std::string::npos) {
+        error = "#572 explicit profile lost its noncanonical mutation anchor";
+        return false;
+    }
+    noncanonical.replace(
+        noncanonical_offset, sizeof("proxy_buffering on;") - 1u, "proxy_buffering ON;");
     if (!require_rejected_profile(std::move(noncanonical), "noncanonical proxy_buffering"))
         return false;
     std::string generated;
     if (!build_explicit_timeout_head_generated_source(
-            profile, frontend_port, backend_port, access_path, generated, error))
+            profile, frontend_port, backend_port, access_path, generated, error, true))
         return false;
     std::fill(profile.begin(), profile.end(), 'p');
     return validate_explicit_timeout_head_generated_source(
@@ -74418,6 +74435,11 @@ int main(int argc, char** argv) {
         return 0;
     }
     if (converter_explicit_buffering_on_incomplete_body_inactivity_expiry_differential) {
+        std::string source_error;
+        if (!run_converter_explicit_timeout_head_source_self_checks(source_error)) {
+            std::cerr << "FAIL [#572 explicit-on source preflight]: " << source_error << "\n";
+            return 1;
+        }
         const std::string container_name = "rut-nginx-572-explicit-on-inactivity-" +
                                            std::to_string(getpid()) + "-" +
                                            (suffix ? suffix + 1 : "tmp");
