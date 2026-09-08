@@ -1009,6 +1009,7 @@ struct TempDir {
     std::string nginx_config;
     std::string nginx_log;
     std::string nginx_access_log;
+    std::string nginx_default_access_log;
     std::string nginx_access_snapshot;
     std::string retained_config_snapshot;
     std::string rut_log;
@@ -1026,6 +1027,7 @@ struct TempDir {
         nginx_config = std::string(path) + "/nginx.conf";
         nginx_log = std::string(path) + "/nginx.log";
         nginx_access_log = std::string(path) + "/nginx-access.log";
+        nginx_default_access_log = std::string(path) + "/access.log";
         nginx_access_snapshot = std::string(path) + "/nginx-access.snapshot";
         rut_log = std::string(path) + "/rut.log";
         rut_access_log = std::string(path) + "/rut-access.log";
@@ -1041,6 +1043,7 @@ struct TempDir {
             unlink(nginx_config.c_str());
             unlink(nginx_log.c_str());
             unlink(nginx_access_log.c_str());
+            unlink(nginx_default_access_log.c_str());
             unlink(nginx_access_snapshot.c_str());
             unlink(rut_log.c_str());
             unlink((rut_log + ".converter").c_str());
@@ -50943,15 +50946,47 @@ static std::string make_converter_request_length_profile(u16 frontend_port,
 
 static std::string make_retained_header_whitespace_oracle_config(u16 frontend_port,
                                                                  u16 backend_port,
-                                                                 const std::string& access_path) {
-    return "events {}\n" +
-           make_converter_request_length_profile(frontend_port, backend_port, access_path);
+                                                                 const std::string& access_path,
+                                                                 bool access_log_off = false,
+                                                                 bool default_log = false) {
+    if (!access_log_off)
+        if (default_log)
+            return "events {}\nhttp {\n"
+                   "  server {\n"
+                   "    listen 127.0.0.1:" +
+                   std::to_string(frontend_port) +
+                   ";\n"
+                   "    location / {\n"
+                   "      proxy_pass http://127.0.0.1:" +
+                   std::to_string(backend_port) +
+                   ";\n"
+                   "    }\n"
+                   "  }\n"
+                   "}\n";
+    if (!access_log_off)
+        return "events {}\n" +
+               make_converter_request_length_profile(frontend_port, backend_port, access_path);
+    return "events {}\nhttp {\n"
+           "  access_log off;\n"
+           "  server {\n"
+           "    listen 127.0.0.1:" +
+           std::to_string(frontend_port) +
+           ";\n"
+           "    location / {\n"
+           "      proxy_pass http://127.0.0.1:" +
+           std::to_string(backend_port) +
+           ";\n"
+           "    }\n"
+           "  }\n"
+           "}\n";
 }
 
 struct RetainedHeaderObservation {
     std::vector<char> response;
     std::string access;
     std::vector<char> upstream;
+    std::string config;
+    u16 frontend_port = 0u;
     u16 backend_port = 0u;
 };
 
@@ -51023,7 +51058,30 @@ static bool validate_retained_header_whitespace_oracle_config(const std::string&
                                                               u16 frontend_port,
                                                               u16 backend_port,
                                                               const std::string& access_path,
-                                                              std::string& error) {
+                                                              std::string& error,
+                                                              bool access_log_off = false,
+                                                              bool default_log = false) {
+    if (access_log_off) {
+        const std::string expected = make_retained_header_whitespace_oracle_config(
+            frontend_port, backend_port, access_path, true);
+        if (config != expected || count_text(config, "access_log off;\n") != 1u ||
+            config.find("log_format") != std::string::npos ||
+            config.find("access_log /") != std::string::npos) {
+            error = "#591 Off config escaped the exact no-access-log inventory";
+            return false;
+        }
+        return true;
+    }
+    if (default_log) {
+        const std::string expected = make_retained_header_whitespace_oracle_config(
+            frontend_port, backend_port, access_path, false, true);
+        if (config != expected || config.find("log_format") != std::string::npos ||
+            config.find("access_log") != std::string::npos) {
+            error = "#591 default-log config escaped the exact omission inventory";
+            return false;
+        }
+        return true;
+    }
     const std::string expected =
         make_retained_header_whitespace_oracle_config(frontend_port, backend_port, access_path);
     if (frontend_port < 1024u || frontend_port > 9999u || backend_port < 1024u ||
@@ -51048,11 +51106,66 @@ static bool validate_retained_header_whitespace_oracle_config(const std::string&
     return true;
 }
 
+static bool read_monitored_access_file(const std::string& path,
+                                       std::string& contents,
+                                       std::string& error) {
+    struct stat file_stat{};
+    if (stat(path.c_str(), &file_stat) != 0 || !S_ISREG(file_stat.st_mode)) {
+        error = "#591 monitored access path is missing or non-regular";
+        return false;
+    }
+    const int fd = open(path.c_str(), O_RDONLY);
+    if (fd < 0) {
+        error = "#591 monitored access file could not be opened";
+        return false;
+    }
+    contents.clear();
+    char buffer[1024];
+    for (;;) {
+        const ssize_t count = read(fd, buffer, sizeof(buffer));
+        if (count > 0) {
+            contents.append(buffer, static_cast<size_t>(count));
+            if (contents.size() > 8192u) {
+                close(fd);
+                error = "#591 monitored access file exceeded bounded size";
+                return false;
+            }
+            continue;
+        }
+        if (count < 0 && errno == EINTR) continue;
+        if (count < 0) {
+            close(fd);
+            error = "#591 monitored access file read failed";
+            return false;
+        }
+        break;
+    }
+    if (close(fd) != 0) {
+        error = "#591 monitored access file close failed";
+        return false;
+    }
+    return true;
+}
+
+static bool validate_default_access_record(const std::string& contents, std::string& error) {
+    const std::string prefix = "127.0.0.1 - - [";
+    const std::string request = "] \"GET /ledger?q=raw HTTP/1.1\" 200 2 ";
+    if (contents.empty() || contents.back() != '\n' || count_text(contents, "\n") != 1u ||
+        contents.rfind(prefix, 0u) != 0u ||
+        contents.find(request, prefix.size()) == std::string::npos) {
+        error = "#591 positive default access record did not identify request/status/body bytes";
+        return false;
+    }
+    return true;
+}
+
 static bool run_pinned_retained_header_whitespace_oracle(TempDir& temp,
                                                          const std::string& container_name,
                                                          RetainedHeaderObservation* observation,
                                                          std::string& error,
-                                                         bool explicit_cleanup = false) {
+                                                         bool explicit_cleanup = false,
+                                                         bool access_log_off = false,
+                                                         bool default_log = false) {
     static constexpr char kDiagnostic[] = "#252 pinned retained-header whitespace oracle";
     static constexpr char kExpectedDownstream[] =
         "HTTP/1.1 200 OK\r\n"
@@ -51077,10 +51190,27 @@ static bool run_pinned_retained_header_whitespace_oracle(TempDir& temp,
     temp.retained_frontend_port = frontend_port;
     temp.retained_backend_port = backend_port;
 
+    const std::string monitored_access_path =
+        (access_log_off || default_log) ? temp.nginx_default_access_log : temp.nginx_access_log;
+    if (!write_file(monitored_access_path, "", 0u)) {
+        error = std::string(kDiagnostic) + " could not precreate monitored access file";
+        return false;
+    }
+    struct stat access_stat{};
+    if (stat(monitored_access_path.c_str(), &access_stat) != 0 || !S_ISREG(access_stat.st_mode)) {
+        error = std::string(kDiagnostic) + " monitored access path is not a regular file";
+        return false;
+    }
+
     const std::string config = make_retained_header_whitespace_oracle_config(
-        frontend_port, backend_port, temp.nginx_access_log);
-    if (!validate_retained_header_whitespace_oracle_config(
-            config, frontend_port, backend_port, temp.nginx_access_log, error) ||
+        frontend_port, backend_port, temp.nginx_access_log, access_log_off, default_log);
+    if (!validate_retained_header_whitespace_oracle_config(config,
+                                                           frontend_port,
+                                                           backend_port,
+                                                           temp.nginx_access_log,
+                                                           error,
+                                                           access_log_off,
+                                                           default_log) ||
         !write_file(temp.nginx_config, config.data(), config.size())) {
         if (error.empty()) error = std::string(kDiagnostic) + " could not persist exact config";
         return false;
@@ -51131,6 +51261,8 @@ static bool run_pinned_retained_header_whitespace_oracle(TempDir& temp,
                       temp.nginx_config + ":/etc/nginx/nginx.conf:ro",
                       "-v",
                       std::string(temp.path) + ":" + temp.path,
+                      "-v",
+                      std::string(temp.path) + ":/var/log/nginx",
                       kNginxImage,
                       "nginx",
                       "-g",
@@ -51194,13 +51326,25 @@ static bool run_pinned_retained_header_whitespace_oracle(TempDir& temp,
     }
 
     std::string access;
+    const auto access_is_valid = [&]() {
+        if (!read_monitored_access_file(monitored_access_path, access, error)) return false;
+        if (access_log_off) return access.empty();
+        if (default_log) {
+            std::string record_error;
+            const bool valid = validate_default_access_record(access, record_error);
+            if (!valid) error.clear();
+            return valid;
+        }
+        return access == "105\n";
+    };
     const auto access_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
-    while (access != "105\n" && std::chrono::steady_clock::now() < access_deadline) {
-        if (!read_request_length_access_file(temp.nginx_access_log, access, error)) return false;
-        if (access.empty()) usleep(5000);
+    while (!access_is_valid() && std::chrono::steady_clock::now() < access_deadline) {
+        if (!error.empty()) return false;
+        usleep(5000);
     }
-    if (access != "105\n") {
-        error = std::string(kDiagnostic) + " access was not exactly ASCII105+LF";
+    if (!access_is_valid()) {
+        if (error.empty())
+            error = std::string(kDiagnostic) + " monitored access did not settle to expected state";
         return false;
     }
 
@@ -51214,8 +51358,7 @@ static bool run_pinned_retained_header_whitespace_oracle(TempDir& temp,
             origin.response_send_failed.load(std::memory_order_acquire) ||
             origin.response_peer_unexpected_data.load(std::memory_order_acquire) ||
             origin.response_peer_observation_failed.load(std::memory_order_acquire) ||
-            !read_request_length_access_file(temp.nginx_access_log, access, error) ||
-            access != "105\n") {
+            !access_is_valid()) {
             if (error.empty()) error = std::string(kDiagnostic) + " 175ms stability failed";
             return false;
         }
@@ -51249,9 +51392,7 @@ static bool run_pinned_retained_header_whitespace_oracle(TempDir& temp,
         origin.response_peer_unexpected_data.load(std::memory_order_acquire) ||
         origin.response_peer_observation_failed.load(std::memory_order_acquire) ||
         !origin.response_clean_shutdown.load(std::memory_order_acquire) ||
-        !origin.response_connection_closed.load(std::memory_order_acquire) ||
-        !read_request_length_access_file(temp.nginx_access_log, access, error) ||
-        access != "105\n") {
+        !origin.response_connection_closed.load(std::memory_order_acquire) || !access_is_valid()) {
         if (error.empty()) error = std::string(kDiagnostic) + " joined lifecycle/history mismatch";
         dump_wire("#252 expected retained upstream", expected_upstream);
         dump_wire("#252 actual retained upstream", origin.request);
@@ -51265,6 +51406,8 @@ static bool run_pinned_retained_header_whitespace_oracle(TempDir& temp,
         observation->response = normalize_retained_response_date(downstream);
         observation->access = access;
         observation->upstream = origin.request;
+        observation->config = temp.retained_config_snapshot;
+        observation->frontend_port = frontend_port;
         observation->backend_port = backend_port;
     }
 
@@ -73011,6 +73154,8 @@ int main(int argc, char** argv) {
         argc == 2 && strcmp(argv[1], "--pinned-nginx-request-length-oracle") == 0;
     const bool retained_header_whitespace_oracle =
         argc == 2 && strcmp(argv[1], "--pinned-nginx-retained-header-whitespace-oracle") == 0;
+    const bool retained_header_whitespace_off_oracle =
+        argc == 2 && strcmp(argv[1], "--pinned-nginx-retained-header-whitespace-off-oracle") == 0;
     const bool request_length_split_header_oracle =
         argc == 2 && strcmp(argv[1], "--pinned-nginx-request-length-split-header-oracle") == 0;
     const bool rut_initial_header_split_public =
@@ -75677,6 +75822,50 @@ int main(int argc, char** argv) {
                      "ordinary source passed GET AST/HIR/MIR/RIR/O2/config custody and ran through "
                      "the public io_uring CLI. This proves only this three-publication completion "
                      "schedule; broader #271 remains unsupported.\n";
+        return 0;
+    }
+    if (retained_header_whitespace_off_oracle) {
+        TempDir off_temp;
+        TempDir positive_temp;
+        if (!off_temp.create() || !positive_temp.create()) {
+            std::cerr
+                << "FAIL [#591 Off/default access oracle]: temporary directory creation failed\n";
+            return 1;
+        }
+        const std::string off_name = "rut-nginx-591-off-" + std::to_string(getpid());
+        const std::string positive_name = "rut-nginx-591-default-" + std::to_string(getpid());
+        RetainedHeaderObservation off_observation;
+        RetainedHeaderObservation positive_observation;
+        std::string oracle_error;
+        if (!run_pinned_retained_header_whitespace_oracle(
+                off_temp, off_name, &off_observation, oracle_error, true, true) ||
+            !run_pinned_retained_header_whitespace_oracle(positive_temp,
+                                                          positive_name,
+                                                          &positive_observation,
+                                                          oracle_error,
+                                                          true,
+                                                          false,
+                                                          true)) {
+            std::cerr << "FAIL [#591 Off/default access oracle]: " << oracle_error << "\n";
+            return 1;
+        }
+        const std::string off_config = off_temp.retained_config_snapshot;
+        const std::string expected_off_removed = "  access_log off;\n";
+        const size_t off_at = off_config.find(expected_off_removed);
+        if (off_at == std::string::npos ||
+            off_config.substr(0u, off_at) +
+                    off_config.substr(off_at + expected_off_removed.size()) !=
+                positive_temp.retained_config_snapshot ||
+            !off_observation.access.empty() || positive_observation.access.empty() ||
+            !validate_default_access_record(positive_observation.access, oracle_error)) {
+            std::cerr << "FAIL [#591 Off/default access oracle]: phase/config comparison failed\n";
+            return 1;
+        }
+        std::cerr << "PASS: #591 pinned nginx 1.29.7 Off/default pair proved identical exact "
+                     "105-byte client, 70-byte upstream, Date-normalized 118-byte response/EOF, "
+                     "one origin publication/retirement, no retry and 175ms live stability; Off "
+                     "left its owned regular monitor empty while omission produced exactly one "
+                     "default-format request/status/body-size record (no converter/RUT claim)\n";
         return 0;
     }
     if (retained_header_whitespace_oracle) {
