@@ -1404,7 +1404,8 @@ inline bool http1_pipeline_request_generation_jit_candidate_is_stable(
                candidate_method,
                candidate_route_method,
                preflight_proof.downstream_close) &&
-           candidate_request_policy_id == static_cast<u16>(RequestPolicyId::Http11FixedStrip) &&
+           bodyless_get_complete_content_length_request_policy_is_admitted(
+               candidate_request_policy_id) &&
            c.request_policy_id == 0 &&
            response_read_deadline_upload_proof_equal(c.response_read_deadline_upload,
                                                      preflight_proof) &&
@@ -1416,6 +1417,43 @@ inline bool http1_pipeline_request_generation_jit_candidate_is_stable(
            preflight_proof.expected_upload_length == 0 && preflight_proof.route_index == 0xffffu &&
            preflight_proof.upstream_id == 0xffffu && preflight_proof.request_policy_id == 0 &&
            preflight_proof.route_fn == nullptr;
+}
+
+// ID3 is allowed to materialize a depth-1 successor only from the same
+// generation-only proof that admits the successor JIT candidate.  Keep this
+// validator at the request-policy boundary: apply_request_policy() must be
+// able to reject a forged successor before it resets scratch/recv storage or
+// any upstream slot/connect/send state is acquired.
+inline bool http1_pipeline_successor_materialization_is_stable(const Connection& c,
+                                                               u16 candidate_request_policy_id) {
+    if (!request_policy_trims_sp_preserves_htab(candidate_request_policy_id) ||
+        http1_pipeline_request_is_legacy(c) ||
+        c.response_read_deadline_state != ResponseReadDeadlineState::Validated ||
+        c.response_read_deadline_profile !=
+            ResponseReadDeadlineProfile::BodylessNonHeadContentLengthZero ||
+        c.response_read_deadline_buffering != ForwardResponseBufferingMode::CompleteContentLength ||
+        c.response_read_deadline_method != static_cast<u8>(LogHttpMethod::Get) ||
+        c.response_read_deadline_route_method != kRouteMethodGet ||
+        c.req_method != static_cast<u8>(LogHttpMethod::Get) ||
+        c.response_read_deadline_owner_generation == 0 ||
+        c.response_read_deadline_owner_generation != c.response_read_deadline_generation ||
+        c.response_read_deadline_bundle_id == 0 || c.request_config == nullptr ||
+        !c.request_config->policy_bundle_id_is_valid(c.response_read_deadline_bundle_id) ||
+        c.request_config->policy_bundles[c.response_read_deadline_bundle_id - 1]
+                .response_buffering != ForwardResponseBufferingMode::CompleteContentLength ||
+        c.pipeline_stash_len != 0 || c.recv_buf.data() == nullptr || c.req_header_end == 0 ||
+        c.req_header_end != c.req_initial_send_len || c.req_initial_send_len != c.recv_buf.len() ||
+        c.req_client_has_content_length || c.req_client_content_length_count != 0 ||
+        !http1_pipeline_successor_upstream_owners_are_neutral(c))
+        return false;
+    return http1_pipeline_request_generation_jit_candidate_is_stable(
+        c,
+        c.response_read_deadline_upload,
+        c.response_read_deadline_profile,
+        c.response_read_deadline_buffering,
+        c.response_read_deadline_method,
+        c.response_read_deadline_route_method,
+        candidate_request_policy_id);
 }
 
 inline bool http1_pipeline_successor_selected_identity_is_stable(
@@ -1436,7 +1474,7 @@ inline bool http1_pipeline_successor_selected_identity_is_stable(
         c.response_read_deadline_buffering != buffering ||
         c.response_read_deadline_method != method ||
         c.response_read_deadline_route_method != route_method ||
-        c.request_policy_id != static_cast<u16>(RequestPolicyId::Http11FixedStrip) ||
+        !bodyless_get_complete_content_length_request_policy_is_admitted(c.request_policy_id) ||
         proof.request_policy_id != c.request_policy_id ||
         proof.handler_generation != c.handler_gen ||
         proof.handler_generation != c.http1_pipeline_request_generation ||
@@ -1585,7 +1623,8 @@ inline bool http1_pipeline_request_generation_prebuilt_is_stable(
         copied_proof.rewritten_total_length != c.req_initial_send_len ||
         copied_proof.rewritten_total_length != copied_proof.rewritten_header_end ||
         copied_proof.expected_upload_length != copied_proof.rewritten_total_length ||
-        copied_proof.request_policy_id != static_cast<u16>(RequestPolicyId::Http11FixedStrip) ||
+        !bodyless_get_complete_content_length_request_policy_is_admitted(
+            copied_proof.request_policy_id) ||
         copied_proof.request_policy_id != c.request_policy_id ||
         copied_proof.upstream_id >= copied_config->upstream_count ||
         copied_proof.upstream_id != c.upstream_idx || c.http1_prebuilt_deadline_generation == 0 ||
@@ -1639,21 +1678,24 @@ inline bool response_read_deadline_owner_is_stable(const Connection& c,
     const bool exact_get = response_read_deadline_exact_get_layout_is_stable(c);
     const bool id3 =
         c.request_policy_id == static_cast<u16>(RequestPolicyId::Http11FixedTrimSpPreserveHtab);
-    if (id3 && !exact_get) return false;
+    const bool current_successor = http1_pipeline_request_is_current_successor(c);
+    const bool depth0_id3 = id3 && !current_successor && exact_get;
+    if (id3 && !depth0_id3 && !current_successor) return false;
     const bool id1_materialized =
         exact_get && c.request_policy_id == static_cast<u16>(RequestPolicyId::Http11FixedStrip) &&
         !response_read_deadline_exact_get_id1_legacy_proof_is_neutral(
             c, c.response_read_deadline_upload);
-    if ((id3 || id1_materialized) && !response_read_deadline_coalesced_get_phase1_proof_is_stable(
-                                         c,
-                                         c.response_read_deadline_upload,
-                                         /*allow_retired_episode=*/false,
-                                         /*require_upload_episode=*/true,
-                                         c.response_read_deadline_profile,
-                                         c.response_read_deadline_buffering,
-                                         c.response_read_deadline_bundle_id,
-                                         c.response_read_deadline_method,
-                                         c.response_read_deadline_route_method))
+    if ((depth0_id3 || id1_materialized) &&
+        !response_read_deadline_coalesced_get_phase1_proof_is_stable(
+            c,
+            c.response_read_deadline_upload,
+            /*allow_retired_episode=*/false,
+            /*require_upload_episode=*/true,
+            c.response_read_deadline_profile,
+            c.response_read_deadline_buffering,
+            c.response_read_deadline_bundle_id,
+            c.response_read_deadline_method,
+            c.response_read_deadline_route_method))
         return false;
     const auto& response = cfg->response_policies[bundle.response_policy_id - 1];
     const auto& failure = cfg->failure_policies[bundle.failure_policy_id - 1];
@@ -2116,7 +2158,9 @@ inline bool response_read_deadline_post_commit_is_stable(const Connection& c) {
     const bool exact_get = response_read_deadline_exact_get_layout_is_stable(c);
     const bool id3 =
         c.request_policy_id == static_cast<u16>(RequestPolicyId::Http11FixedTrimSpPreserveHtab);
-    if (id3 && !exact_get) return false;
+    const bool current_successor = http1_pipeline_request_is_current_successor(c);
+    const bool depth0_id3 = id3 && !current_successor && exact_get;
+    if (id3 && !depth0_id3 && !current_successor) return false;
     if (c.pipeline_stash_len != 0 && !response_read_deadline_coalesced_get_phase1_stash_is_stable(
                                          c, c.response_read_deadline_upload, retired_buffered_send))
         return false;
@@ -2126,16 +2170,17 @@ inline bool response_read_deadline_post_commit_is_stable(const Connection& c) {
         exact_get && c.request_policy_id == static_cast<u16>(RequestPolicyId::Http11FixedStrip) &&
         !response_read_deadline_exact_get_id1_legacy_proof_is_neutral(
             c, c.response_read_deadline_upload);
-    if ((id3 || id1_materialized) && !response_read_deadline_coalesced_get_phase1_proof_is_stable(
-                                         c,
-                                         c.response_read_deadline_upload,
-                                         retired_buffered_send,
-                                         /*require_upload_episode=*/true,
-                                         c.response_read_deadline_profile,
-                                         c.response_read_deadline_buffering,
-                                         c.response_read_deadline_bundle_id,
-                                         c.response_read_deadline_method,
-                                         c.response_read_deadline_route_method))
+    if ((depth0_id3 || id1_materialized) &&
+        !response_read_deadline_coalesced_get_phase1_proof_is_stable(
+            c,
+            c.response_read_deadline_upload,
+            retired_buffered_send,
+            /*require_upload_episode=*/true,
+            c.response_read_deadline_profile,
+            c.response_read_deadline_buffering,
+            c.response_read_deadline_bundle_id,
+            c.response_read_deadline_method,
+            c.response_read_deadline_route_method))
         return false;
     const auto& bundle = cfg->policy_bundles[bundle_id - 1];
     const bool collecting = c.response_read_deadline_post_commit_phase ==

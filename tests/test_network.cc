@@ -608,6 +608,17 @@ static u64 response_buffering_request_policy_runtime_handler(
         .pack();
 }
 
+static u32 strict_id3_successor_handler_calls = 0;
+static u16 strict_id3_successor_second_policy =
+    static_cast<u16>(RequestPolicyId::Http11FixedTrimSpPreserveHtab);
+static u64 strict_id3_successor_handler(void*, jit::HandlerCtx*, const u8*, u32, void*) {
+    ++strict_id3_successor_handler_calls;
+    const u16 policy = strict_id3_successor_handler_calls == 1
+                           ? static_cast<u16>(RequestPolicyId::Http11FixedStrip)
+                           : strict_id3_successor_second_policy;
+    return jit::HandlerResult::make_forward_with_bundle(0, policy, 2).pack();
+}
+
 static u32 response_coalesced_phase1_handler_calls = 0;
 static u32 response_coalesced_phase1_handler_len = 0;
 static bool response_coalesced_phase1_handler_saw_successor = false;
@@ -31698,12 +31709,15 @@ void cleanup_late_failure_fixture(IoUringEventLoop* loop, PreconnectConnectSubmi
     fixture.conn = nullptr;
 }
 
-bool stage_pipeline_generation_successor_upload(IoUringEventLoop* loop,
-                                                RouteConfig& config,
-                                                PreconnectConnectSubmitFixture* out,
-                                                bool terminal_downstream_recv = false,
-                                                const u8* successor = nullptr,
-                                                u32 successor_len = 0) {
+bool stage_pipeline_generation_successor_upload(
+    IoUringEventLoop* loop,
+    RouteConfig& config,
+    PreconnectConnectSubmitFixture* out,
+    bool terminal_downstream_recv = false,
+    const u8* successor = nullptr,
+    u32 successor_len = 0,
+    jit::HandlerFn handler = &response_buffering_request_policy_runtime_handler,
+    const char* expected_upstream_wire = nullptr) {
     static constexpr u8 kDefaultSuccessor[] = "GET /one HTTP/1.1\r\nHost: client.example\r\n\r\n";
     if (loop == nullptr || out == nullptr) return false;
     if (successor == nullptr) {
@@ -31717,7 +31731,7 @@ bool stage_pipeline_generation_successor_upload(IoUringEventLoop* loop,
                                      AsyncConnectFailureProfile::BodylessGet,
                                      out,
                                      &ignored_episode,
-                                     &response_buffering_request_policy_runtime_handler))
+                                     handler))
         return false;
     Connection& conn = *out->conn;
     if (conn.recv_buf.write(successor, successor_len) != successor_len) return false;
@@ -31756,6 +31770,15 @@ bool stage_pipeline_generation_successor_upload(IoUringEventLoop* loop,
     const u32 upload_len = loop->backend.upstream_send_state[conn.id].remaining;
     if (upload_len == 0 || upload_len != conn.response_read_deadline_upload.expected_upload_length)
         return false;
+    if (expected_upstream_wire != nullptr) {
+        const u32 expected_len = static_cast<u32>(__builtin_strlen(expected_upstream_wire));
+        if (loop->backend.upstream_send_state[conn.id].src == nullptr ||
+            upload_len != expected_len ||
+            __builtin_memcmp(loop->backend.upstream_send_state[conn.id].src,
+                             expected_upstream_wire,
+                             expected_len) != 0)
+            return false;
+    }
     __atomic_store_n(loop->backend.sq_tail, ring_tail, __ATOMIC_RELEASE);
     loop->backend.pending = backend_pending;
     loop->backend.upstream_send_state[conn.id].offset = upload_len;
@@ -32807,6 +32830,470 @@ TEST(http1_pipeline_generation_activation,
 }
 
 TEST(http1_pipeline_generation_activation,
+     strict_successor_id3_retains_htab_before_upstream_send_and_keeps_id1_control) {
+    static constexpr u8 kSuccessor[] =
+        "GET /one HTTP/1.1\r\nHost: client.example\r\nX-Test:\t keep \t\r\n\r\n";
+    static constexpr char kExpectedWire[] =
+        "GET /one HTTP/1.1\r\nHost: 127.0.0.1:9000\r\nX-Test: \t keep \t\r\n\r\n";
+    ScopedBackendHealthReset health_reset{};
+    ScopedIoUringLoopForRetirement guard;
+    if (!guard.init()) SKIP("io_uring unavailable");
+    auto* loop = guard.loop;
+    RouteConfig config{};
+    PreconnectConnectSubmitFixture fixture{};
+    strict_id3_successor_handler_calls = 0;
+    REQUIRE(stage_pipeline_generation_successor_upload(loop,
+                                                       config,
+                                                       &fixture,
+                                                       false,
+                                                       kSuccessor,
+                                                       sizeof(kSuccessor) - 1u,
+                                                       &strict_id3_successor_handler,
+                                                       kExpectedWire));
+    Connection& conn = *fixture.conn;
+    REQUIRE_EQ(strict_id3_successor_handler_calls, 2u);
+    REQUIRE_EQ(conn.request_policy_id,
+               static_cast<u16>(RequestPolicyId::Http11FixedTrimSpPreserveHtab));
+    REQUIRE_EQ(conn.response_read_deadline_upload.request_policy_id, conn.request_policy_id);
+    REQUIRE_EQ(conn.response_read_deadline_upload.raw_header_end, 0u);
+    REQUIRE_EQ(conn.response_read_deadline_upload.raw_content_length, 0u);
+    REQUIRE_EQ(conn.response_read_deadline_upload.raw_total_length, 0u);
+    REQUIRE_EQ(conn.response_read_deadline_upload.rewritten_header_end,
+               conn.response_read_deadline_upload.rewritten_total_length);
+    REQUIRE_EQ(conn.response_read_deadline_upload.expected_upload_length,
+               conn.response_read_deadline_upload.rewritten_total_length);
+    REQUIRE(http1_pipeline_request_generation_upload_active_is_stable(
+        conn,
+        conn.response_read_deadline_upload,
+        conn.response_read_deadline_profile,
+        conn.response_read_deadline_buffering,
+        conn.response_read_deadline_method,
+        conn.response_read_deadline_route_method));
+    cleanup_late_failure_fixture(loop, fixture);
+}
+
+TEST(http1_pipeline_generation_activation,
+     strict_successor_id3_rejects_adversarial_callback_inputs_before_transport) {
+    enum class Forgery : u8 { WrongPolicy, ContentLengthZero, WrongDepth, TrailingThirdRequest };
+    static constexpr u8 kSuccessor[] =
+        "GET /one HTTP/1.1\r\nHost: client.example\r\nX-Test:\t keep \t\r\n\r\n";
+    static constexpr u8 kContentLengthZero[] =
+        "GET /one HTTP/1.1\r\nHost: client.example\r\nContent-Length: 0\r\n\r\n";
+    for (const Forgery forgery : {Forgery::WrongPolicy,
+                                  Forgery::ContentLengthZero,
+                                  Forgery::WrongDepth,
+                                  Forgery::TrailingThirdRequest}) {
+        ScopedBackendHealthReset health_reset{};
+        ScopedIoUringLoopForRetirement guard;
+        if (!guard.init()) SKIP("io_uring unavailable");
+        auto* loop = guard.loop;
+        RouteConfig config{};
+        PreconnectConnectSubmitFixture fixture{};
+        strict_id3_successor_handler_calls = 0;
+        strict_id3_successor_second_policy =
+            forgery == Forgery::WrongPolicy
+                ? static_cast<u16>(RequestPolicyId::Http11FixedStripContentLengthAfterHost)
+                : static_cast<u16>(RequestPolicyId::Http11FixedTrimSpPreserveHtab);
+        REQUIRE(stage_late_failure_response(loop,
+                                            config,
+                                            LateFailureSite::ConnectCompletion,
+                                            AsyncConnectFailureProfile::BodylessGet,
+                                            &fixture,
+                                            nullptr,
+                                            &strict_id3_successor_handler));
+        Connection& conn = *fixture.conn;
+        const u32 id = conn.id;
+        const u32 response_len = conn.response_header_buf.len();
+        const u8* request = forgery == Forgery::ContentLengthZero ? kContentLengthZero : kSuccessor;
+        const u32 request_len = forgery == Forgery::ContentLengthZero
+                                    ? sizeof(kContentLengthZero) - 1u
+                                    : sizeof(kSuccessor) - 1u;
+        REQUIRE_EQ(conn.recv_buf.write(request, request_len), request_len);
+        if (forgery == Forgery::TrailingThirdRequest)
+            REQUIRE_EQ(conn.recv_buf.write(kSuccessor, sizeof(kSuccessor) - 1u),
+                       sizeof(kSuccessor) - 1u);
+        if (forgery == Forgery::WrongDepth) conn.pipeline_depth = 2;
+        loop->backend.send_state[id].remaining = 0;
+        loop->dispatch({id, static_cast<i32>(response_len), 0, 0, IoEventType::Send, 0});
+        CHECK_EQ(loop->conns[id].fd, -1);
+        CHECK_EQ(loop->conns[id].upstream_fd, -1);
+        CHECK_FALSE(loop->conns[id].upstream_connect_armed);
+        CHECK_FALSE(loop->conns[id].upstream_send_armed);
+        CHECK_EQ(loop->backend.upstream_send_state[id].remaining, 0u);
+        cleanup_late_failure_fixture(loop, fixture);
+    }
+}
+
+TEST(http1_pipeline_generation_activation,
+     strict_successor_id3_materialization_rejects_owner_generation_before_effects) {
+    static constexpr u16 kId3 = static_cast<u16>(RequestPolicyId::Http11FixedTrimSpPreserveHtab);
+    static constexpr char kRequest[] =
+        "GET /one HTTP/1.1\r\nHost: client.example\r\nX-Test:\t keep \t\r\n\r\n";
+    static constexpr char kExpected[] =
+        "GET /one HTTP/1.1\r\nHost: 127.0.0.1:9000\r\nX-Test: \t keep \t\r\n\r\n";
+    const auto prepare = [&](PipelineGenerationFoundationFixture& fixture) {
+        REQUIRE(fixture.setup());
+        Connection& conn = fixture.loop.conns[0];
+        conn.recv_buf.reset();
+        REQUIRE_EQ(
+            conn.recv_buf.write(reinterpret_cast<const u8*>(kRequest), sizeof(kRequest) - 1u),
+            sizeof(kRequest) - 1u);
+        capture_request_metadata(conn);
+        conn.request_config = &fixture.config;
+        conn.pipeline_depth = 1;
+        conn.http1_pipeline_request_generation = conn.handler_gen;
+        conn.request_policy_id = 0;
+        conn.response_read_deadline_state = ResponseReadDeadlineState::Validated;
+        conn.response_read_deadline_generation = 1;
+        conn.response_read_deadline_owner_generation = 1;
+        conn.response_read_deadline_profile =
+            ResponseReadDeadlineProfile::BodylessNonHeadContentLengthZero;
+        conn.response_read_deadline_buffering = ForwardResponseBufferingMode::CompleteContentLength;
+        conn.response_read_deadline_method = static_cast<u8>(LogHttpMethod::Get);
+        conn.response_read_deadline_route_method = kRouteMethodGet;
+        conn.response_read_deadline_bundle_id = 2;
+        conn.response_read_deadline_seconds = 5;
+        conn.response_read_deadline_upload = {};
+        conn.response_read_deadline_upload.handler_generation = conn.handler_gen;
+    };
+
+    sockaddr_in endpoint{};
+    endpoint.sin_family = AF_INET;
+    endpoint.sin_addr.s_addr = htonl(0x7f000001u);
+    endpoint.sin_port = htons(9000);
+
+    PipelineGenerationFoundationFixture baseline;
+    prepare(baseline);
+    Connection* accepted = &baseline.loop.conns[0];
+    REQUIRE(apply_request_policy(*accepted, endpoint, kId3));
+    CHECK_EQ(accepted->recv_buf.len(), sizeof(kExpected) - 1u);
+    CHECK_EQ(__builtin_memcmp(accepted->recv_buf.data(), kExpected, sizeof(kExpected) - 1u), 0);
+
+    PipelineGenerationFoundationFixture forged;
+    prepare(forged);
+    Connection* rejected = &forged.loop.conns[0];
+    const u32 recv_len = rejected->recv_buf.len();
+    u8 before[sizeof(kRequest) - 1u]{};
+    __builtin_memcpy(before, rejected->recv_buf.data(), recv_len);
+    const i32 fd = rejected->fd;
+    const i32 upstream_fd = rejected->upstream_fd;
+    const u32 pending = rejected->pending_ops;
+    ++rejected->response_read_deadline_owner_generation;
+    CHECK_FALSE(apply_request_policy(*rejected, endpoint, kId3));
+    CHECK_EQ(rejected->fd, fd);
+    CHECK_EQ(rejected->upstream_fd, upstream_fd);
+    CHECK_EQ(rejected->pending_ops, pending);
+    CHECK_FALSE(rejected->upstream_connect_armed);
+    CHECK_FALSE(rejected->upstream_send_armed);
+    CHECK_EQ(rejected->send_buf.len(), 0u);
+    CHECK_EQ(rejected->recv_buf.len(), recv_len);
+    CHECK_EQ(__builtin_memcmp(rejected->recv_buf.data(), before, recv_len), 0);
+}
+
+TEST(http1_pipeline_generation_activation,
+     strict_successor_id3_retained_wire_reaches_synthetic_origin_response_path) {
+    static constexpr u8 kSuccessor[] =
+        "GET /one HTTP/1.1\r\nHost: client.example\r\nX-Test:\t keep \t\r\n\r\n";
+    static constexpr char kExpectedWire[] =
+        "GET /one HTTP/1.1\r\nHost: 127.0.0.1:9000\r\nX-Test: \t keep \t\r\n\r\n";
+    static constexpr u8 kOrigin[] = "HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n";
+    ScopedBackendHealthReset health_reset{};
+    ScopedIoUringLoopForRetirement guard;
+    if (!guard.init()) SKIP("io_uring unavailable");
+    auto* loop = guard.loop;
+    RouteConfig config{};
+    PreconnectConnectSubmitFixture fixture{};
+    strict_id3_successor_handler_calls = 0;
+    REQUIRE(stage_pipeline_generation_successor_upload(loop,
+                                                       config,
+                                                       &fixture,
+                                                       false,
+                                                       kSuccessor,
+                                                       sizeof(kSuccessor) - 1u,
+                                                       &strict_id3_successor_handler,
+                                                       kExpectedWire));
+    Connection& conn = *fixture.conn;
+    REQUIRE_EQ(conn.response_read_deadline_upload.request_policy_id,
+               static_cast<u16>(RequestPolicyId::Http11FixedTrimSpPreserveHtab));
+    REQUIRE_EQ(conn.upstream_recv_buf.write(kOrigin, sizeof(kOrigin) - 1u), sizeof(kOrigin) - 1u);
+    const IoEvent response =
+        response_read_copy_event(conn, sizeof(kOrigin) - 1u, true, 0, sizeof(kOrigin) - 1u);
+    loop->dispatch_batch(&response, 1);
+    REQUIRE_EQ(conn.resp_status, 200u);
+    REQUIRE_EQ(conn.http1_prebuilt_response_purpose,
+               Http1PrebuiltResponsePurpose::StrictNonHeadCl0Success);
+    cleanup_late_failure_fixture(loop, fixture);
+}
+
+TEST(http1_pipeline_generation_activation,
+     strict_successor_id3_cl0_completes_both_retirement_orders_to_reading_header) {
+    static constexpr u8 kSuccessor[] =
+        "GET /one HTTP/1.1\r\nHost: client.example\r\nX-Test:\t keep \t\r\n\r\n";
+    static constexpr char kExpectedWire[] =
+        "GET /one HTTP/1.1\r\nHost: 127.0.0.1:9000\r\nX-Test: \t keep \t\r\n\r\n";
+    static constexpr u8 kOrigin[] = "HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n";
+
+    for (const bool header_first : {false, true}) {
+        ScopedBackendHealthReset health_reset{};
+        ScopedIoUringLoopForRetirement guard;
+        if (!guard.init()) SKIP("io_uring unavailable");
+        auto* loop = guard.loop;
+        ShardMetrics metrics{};
+        metrics.init();
+        loop->metrics = &metrics;
+        RouteConfig config{};
+        PreconnectConnectSubmitFixture fixture{};
+        strict_id3_successor_handler_calls = 0;
+        strict_id3_successor_second_policy =
+            static_cast<u16>(RequestPolicyId::Http11FixedTrimSpPreserveHtab);
+        REQUIRE(stage_pipeline_generation_successor_upload(loop,
+                                                           config,
+                                                           &fixture,
+                                                           false,
+                                                           kSuccessor,
+                                                           sizeof(kSuccessor) - 1u,
+                                                           &strict_id3_successor_handler,
+                                                           kExpectedWire));
+        Connection& conn = *fixture.conn;
+        const u32 id = conn.id;
+        REQUIRE_EQ(metrics.requests_total, 1u);
+        REQUIRE_EQ(metrics.requests_active, 1u);
+        REQUIRE_EQ(conn.upstream_recv_buf.write(kOrigin, sizeof(kOrigin) - 1u),
+                   sizeof(kOrigin) - 1u);
+        const IoEvent response =
+            response_read_copy_event(conn, sizeof(kOrigin) - 1u, true, 0, sizeof(kOrigin) - 1u);
+        loop->dispatch_batch(&response, 1);
+        REQUIRE_EQ(conn.http1_prebuilt_response_purpose,
+                   Http1PrebuiltResponsePurpose::StrictNonHeadCl0Success);
+        REQUIRE(conn.upstream_retirement_active);
+        REQUIRE(conn.send_armed);
+        REQUIRE_EQ(conn.http1_prebuilt_wait, kHttp1WaitHeaderSend | kHttp1WaitUpstreamRetirement);
+
+        if (header_first) {
+            complete_prebuilt_d2_header(loop, conn);
+            CHECK_FALSE(conn.http1_boundary_ready);
+            drain_prebuilt_d2_retirement(loop, conn, kUpstreamOpRecv, false);
+        } else {
+            drain_prebuilt_d2_retirement(loop, conn, kUpstreamOpRecv, false);
+            CHECK_FALSE(conn.http1_boundary_ready);
+            complete_prebuilt_d2_header(loop, conn);
+        }
+        REQUIRE(conn.http1_boundary_ready);
+        loop->resume_deferred_http1_boundaries();
+        CHECK_EQ(loop->conns[id].fd >= 0, true);
+        CHECK_EQ(conn.state, ConnState::ReadingHeader);
+        CHECK_EQ(conn.pipeline_depth, 0u);
+        CHECK_FALSE(conn.upstream_retirement_active);
+        CHECK_EQ(conn.upstream_fd, -1);
+        CHECK_EQ(metrics.requests_total, 2u);
+        CHECK_EQ(metrics.requests_active, 0u);
+        cleanup_late_failure_fixture(loop, fixture);
+    }
+}
+
+TEST(http1_pipeline_generation_activation,
+     strict_successor_id3_selected_policy_mismatch_rejects_origin_before_send) {
+    static constexpr u8 kSuccessor[] =
+        "GET /one HTTP/1.1\r\nHost: client.example\r\nX-Test:\t keep \t\r\n\r\n";
+    static constexpr char kExpectedWire[] =
+        "GET /one HTTP/1.1\r\nHost: 127.0.0.1:9000\r\nX-Test: \t keep \t\r\n\r\n";
+    static constexpr u8 kOrigin[] = "HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n";
+    ScopedBackendHealthReset health_reset{};
+    ScopedIoUringLoopForRetirement guard;
+    if (!guard.init()) SKIP("io_uring unavailable");
+    auto* loop = guard.loop;
+    ShardMetrics metrics{};
+    metrics.init();
+    loop->metrics = &metrics;
+    RouteConfig config{};
+    PreconnectConnectSubmitFixture fixture{};
+    strict_id3_successor_handler_calls = 0;
+    REQUIRE(stage_pipeline_generation_successor_upload(loop,
+                                                       config,
+                                                       &fixture,
+                                                       false,
+                                                       kSuccessor,
+                                                       sizeof(kSuccessor) - 1u,
+                                                       &strict_id3_successor_handler,
+                                                       kExpectedWire));
+    Connection& conn = *fixture.conn;
+    const u32 id = conn.id;
+    REQUIRE_EQ(conn.response_read_deadline_upload.request_policy_id,
+               static_cast<u16>(RequestPolicyId::Http11FixedTrimSpPreserveHtab));
+    conn.request_policy_id = static_cast<u16>(RequestPolicyId::Http11FixedStrip);
+    REQUIRE_EQ(conn.upstream_recv_buf.write(kOrigin, sizeof(kOrigin) - 1u), sizeof(kOrigin) - 1u);
+    const IoEvent response =
+        response_read_copy_event(conn, sizeof(kOrigin) - 1u, true, 0, sizeof(kOrigin) - 1u);
+    loop->dispatch_batch(&response, 1);
+    CHECK_EQ(loop->conns[id].fd, -1);
+    CHECK_EQ(loop->backend.send_state[id].remaining, 0u);
+    CHECK_EQ(metrics.requests_total, 1u);
+    cleanup_late_failure_fixture(loop, fixture);
+}
+
+TEST(http1_pipeline_generation_activation,
+     strict_successor_id3_complete_response_retires_and_rejects_proof_forgery) {
+    enum class Mutation : u8 { Generation, Episode, DeclaredBodyLength };
+    static constexpr u8 kSuccessor[] =
+        "GET /one HTTP/1.1\r\nHost: client.example\r\nX-Test:\t keep \t\r\n\r\n";
+    static constexpr char kExpectedWire[] =
+        "GET /one HTTP/1.1\r\nHost: 127.0.0.1:9000\r\nX-Test: \t keep \t\r\n\r\n";
+    static constexpr u8 kOriginPartial[] = "HTTP/1.1 200 OK\r\nContent-Length: 4\r\n\r\nab";
+    static constexpr u8 kOriginRemainder[] = "cd";
+
+    for (const bool header_first : {false, true}) {
+        ScopedBackendHealthReset health_reset{};
+        ScopedIoUringLoopForRetirement guard;
+        if (!guard.init()) SKIP("io_uring unavailable");
+        auto* loop = guard.loop;
+        ShardMetrics metrics{};
+        metrics.init();
+        loop->metrics = &metrics;
+        RouteConfig config{};
+        PreconnectConnectSubmitFixture fixture{};
+        strict_id3_successor_handler_calls = 0;
+        strict_id3_successor_second_policy =
+            static_cast<u16>(RequestPolicyId::Http11FixedTrimSpPreserveHtab);
+        REQUIRE(stage_pipeline_generation_successor_upload(loop,
+                                                           config,
+                                                           &fixture,
+                                                           false,
+                                                           kSuccessor,
+                                                           sizeof(kSuccessor) - 1u,
+                                                           &strict_id3_successor_handler,
+                                                           kExpectedWire));
+        Connection& conn = *fixture.conn;
+        const u32 id = conn.id;
+        const u32 upload_generation = conn.response_read_deadline_generation;
+        const u32 upload_episode = conn.response_read_deadline_upload.upload_episode;
+        REQUIRE_EQ(strict_id3_successor_handler_calls, 2u);
+        REQUIRE_EQ(conn.response_read_deadline_upload.request_policy_id,
+                   static_cast<u16>(RequestPolicyId::Http11FixedTrimSpPreserveHtab));
+        REQUIRE_EQ(conn.upstream_episode, upload_episode);
+        REQUIRE_EQ(metrics.requests_total, 1u);
+        REQUIRE_EQ(metrics.requests_active, 1u);
+
+        REQUIRE_EQ(conn.upstream_recv_buf.write(kOriginPartial, sizeof(kOriginPartial) - 1u),
+                   sizeof(kOriginPartial) - 1u);
+        const IoEvent response = response_read_copy_event(
+            conn, sizeof(kOriginPartial) - 1u, true, 0, sizeof(kOriginPartial) - 1u);
+        loop->dispatch_batch(&response, 1);
+        REQUIRE_EQ(conn.resp_status, 200u);
+        REQUIRE_EQ(conn.response_read_deadline_post_commit_phase,
+                   ResponseReadDeadlinePostCommitPhase::Buffering);
+        REQUIRE_EQ(conn.response_read_deadline_post_commit_origin_received, 2u);
+        REQUIRE(response_read_deadline_post_commit_is_stable(conn));
+        const u32 remainder_begin = conn.upstream_recv_buf.len();
+        REQUIRE_EQ(conn.upstream_recv_buf.write(kOriginRemainder, sizeof(kOriginRemainder) - 1u),
+                   sizeof(kOriginRemainder) - 1u);
+        const IoEvent remainder = response_read_copy_event(conn,
+                                                           sizeof(kOriginRemainder) - 1u,
+                                                           true,
+                                                           remainder_begin,
+                                                           conn.upstream_recv_buf.len());
+        loop->dispatch_batch(&remainder, 1);
+        REQUIRE_EQ(conn.response_read_deadline_post_commit_declared_body, 4u);
+        REQUIRE_EQ(conn.response_read_deadline_post_commit_origin_received, 4u);
+        REQUIRE_EQ(conn.response_read_deadline_post_commit_generation, upload_generation);
+        REQUIRE_EQ(conn.response_read_deadline_post_commit_episode, conn.upstream_retiring_episode);
+        REQUIRE_NE(conn.upstream_episode, upload_episode);
+        REQUIRE_EQ(conn.response_read_deadline_upload.upload_episode, upload_episode);
+        REQUIRE_EQ(conn.response_read_deadline_post_commit_send_body, 4u);
+        REQUIRE(response_read_deadline_post_commit_is_stable(conn));
+
+        if (header_first) {
+            const IoEvent header = exact_response_deadline_send_event(loop, conn);
+            loop->dispatch_batch(&header, 1);
+        } else {
+            drain_prebuilt_d2_retirement(loop, conn, kUpstreamOpRecv, false);
+            const IoEvent header = exact_response_deadline_send_event(loop, conn);
+            loop->dispatch_batch(&header, 1);
+        }
+        REQUIRE_EQ(conn.response_read_deadline_post_commit_phase,
+                   ResponseReadDeadlinePostCommitPhase::BodySend);
+        const IoEvent body = exact_response_deadline_send_event(loop, conn);
+        loop->dispatch_batch(&body, 1);
+        if (header_first) {
+            REQUIRE(conn.http1_boundary_deferred);
+            REQUIRE_FALSE(conn.http1_boundary_ready);
+            drain_prebuilt_d2_retirement(loop, conn, kUpstreamOpRecv, false);
+        } else {
+            drain_prebuilt_d2_retirement(loop, conn, kUpstreamOpRecv, false);
+        }
+        loop->resume_deferred_http1_boundaries();
+        CHECK_EQ(loop->conns[id].fd >= 0, true);
+        CHECK_EQ(conn.state, ConnState::ReadingHeader);
+        CHECK_EQ(conn.pipeline_depth, 0u);
+        CHECK_FALSE(conn.upstream_retirement_active);
+        CHECK_EQ(conn.upstream_fd, -1);
+        CHECK_EQ(metrics.requests_total, 2u);
+        CHECK_EQ(metrics.requests_active, 0u);
+        cleanup_late_failure_fixture(loop, fixture);
+    }
+
+    for (const Mutation mutation :
+         {Mutation::Generation, Mutation::Episode, Mutation::DeclaredBodyLength}) {
+        ScopedBackendHealthReset health_reset{};
+        ScopedIoUringLoopForRetirement guard;
+        if (!guard.init()) SKIP("io_uring unavailable");
+        auto* loop = guard.loop;
+        ShardMetrics metrics{};
+        metrics.init();
+        loop->metrics = &metrics;
+        RouteConfig config{};
+        PreconnectConnectSubmitFixture fixture{};
+        strict_id3_successor_handler_calls = 0;
+        strict_id3_successor_second_policy =
+            static_cast<u16>(RequestPolicyId::Http11FixedTrimSpPreserveHtab);
+        REQUIRE(stage_pipeline_generation_successor_upload(loop,
+                                                           config,
+                                                           &fixture,
+                                                           false,
+                                                           kSuccessor,
+                                                           sizeof(kSuccessor) - 1u,
+                                                           &strict_id3_successor_handler,
+                                                           kExpectedWire));
+        Connection& conn = *fixture.conn;
+        const u32 id = conn.id;
+        REQUIRE_EQ(conn.upstream_recv_buf.write(kOriginPartial, sizeof(kOriginPartial) - 1u),
+                   sizeof(kOriginPartial) - 1u);
+        const IoEvent response = response_read_copy_event(
+            conn, sizeof(kOriginPartial) - 1u, true, 0, sizeof(kOriginPartial) - 1u);
+        loop->dispatch_batch(&response, 1);
+        const u32 remainder_begin = conn.upstream_recv_buf.len();
+        REQUIRE_EQ(conn.upstream_recv_buf.write(kOriginRemainder, sizeof(kOriginRemainder) - 1u),
+                   sizeof(kOriginRemainder) - 1u);
+        const IoEvent remainder = response_read_copy_event(conn,
+                                                           sizeof(kOriginRemainder) - 1u,
+                                                           true,
+                                                           remainder_begin,
+                                                           conn.upstream_recv_buf.len());
+        loop->dispatch_batch(&remainder, 1);
+        REQUIRE(response_read_deadline_post_commit_is_stable(conn));
+        switch (mutation) {
+            case Mutation::Generation:
+                ++conn.response_read_deadline_post_commit_generation;
+                break;
+            case Mutation::Episode:
+                ++conn.response_read_deadline_post_commit_episode;
+                break;
+            case Mutation::DeclaredBodyLength:
+                ++conn.response_read_deadline_post_commit_declared_body;
+                break;
+        }
+        const IoEvent forged_header = exact_response_deadline_send_event(loop, conn);
+        loop->dispatch_batch(&forged_header, 1);
+        if (loop->conns[id].fd >= 0) {
+            const IoEvent forged_body = exact_response_deadline_send_event(loop, conn);
+            loop->dispatch_batch(&forged_body, 1);
+        }
+        CHECK_EQ(loop->conns[id].fd, -1);
+        CHECK_EQ(metrics.requests_total, 1u);
+        cleanup_late_failure_fixture(loop, fixture);
+    }
+}
+
+TEST(http1_pipeline_generation_activation,
      prebuilt_layout_shortcuts_reject_request_two_before_transport_commit) {
     for (const Http1PrebuiltResponseLayout forged_layout :
          {Http1PrebuiltResponseLayout::None, Http1PrebuiltResponseLayout::HeaderOnlyHead}) {
@@ -32962,6 +33449,51 @@ TEST(http1_pipeline_generation_activation,
             cleanup_late_failure_fixture(loop, fixture);
         }
     }
+}
+
+TEST(http1_pipeline_generation_activation,
+     strict_successor_id3_copied_prebuilt_policy_mismatch_rejects_header) {
+    static constexpr u8 kSuccessor[] =
+        "GET /one HTTP/1.1\r\nHost: client.example\r\nX-Test:\t keep \t\r\n\r\n";
+    static constexpr char kExpectedWire[] =
+        "GET /one HTTP/1.1\r\nHost: 127.0.0.1:9000\r\nX-Test: \t keep \t\r\n\r\n";
+    static constexpr u8 kOrigin[] = "HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n";
+    ScopedBackendHealthReset health_reset{};
+    ScopedIoUringLoopForRetirement guard;
+    if (!guard.init()) SKIP("io_uring unavailable");
+    auto* loop = guard.loop;
+    ShardMetrics metrics{};
+    metrics.init();
+    loop->metrics = &metrics;
+    RouteConfig config{};
+    PreconnectConnectSubmitFixture fixture{};
+    strict_id3_successor_handler_calls = 0;
+    REQUIRE(stage_pipeline_generation_successor_upload(loop,
+                                                       config,
+                                                       &fixture,
+                                                       false,
+                                                       kSuccessor,
+                                                       sizeof(kSuccessor) - 1u,
+                                                       &strict_id3_successor_handler,
+                                                       kExpectedWire));
+    Connection& conn = *fixture.conn;
+    const u32 id = conn.id;
+    REQUIRE_EQ(conn.upstream_recv_buf.write(kOrigin, sizeof(kOrigin) - 1u), sizeof(kOrigin) - 1u);
+    const IoEvent response =
+        response_read_copy_event(conn, sizeof(kOrigin) - 1u, true, 0, sizeof(kOrigin) - 1u);
+    loop->dispatch_batch(&response, 1);
+    REQUIRE_GE(conn.fd, 0);
+    REQUIRE(conn.upstream_retirement_active);
+    REQUIRE(conn.send_armed);
+    conn.http1_prebuilt_deadline_upload.request_policy_id =
+        static_cast<u16>(RequestPolicyId::Http11FixedStrip);
+    const u32 requests_before = metrics.requests_total;
+    const IoEvent header = exact_response_deadline_send_event(loop, conn);
+    loop->dispatch_batch(&header, 1);
+    CHECK_EQ(loop->conns[id].fd, -1);
+    CHECK_EQ(loop->backend.send_state[id].remaining, 0u);
+    CHECK_EQ(metrics.requests_total, requests_before);
+    cleanup_late_failure_fixture(loop, fixture);
 }
 
 TEST(http1_pipeline_generation_activation,
