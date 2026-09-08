@@ -296,7 +296,7 @@ TEST(nginx_convert, nginx_http_output_matches_complete_api_and_rejects_unsupport
     CHECK_EQ(WEXITSTATUS(old_http.status), 1);
     CHECK(old_http.out.empty());
     CHECK(old_http.err.find(diagnostic_prefix(path, source, "events")) == 0u);
-    CHECK(old_http.err.find("http/events wrappers are unsupported") != std::string::npos);
+    CHECK(old_http.err.find("expected bounded http profile") != std::string::npos);
 
     const std::string unsupported_source =
         "events { worker_connections 64; }\n" + source.substr(source.find("http"));
