@@ -1872,6 +1872,17 @@ if(RUT_ENABLE_JIT)
         ENVIRONMENT "RUT_NGINX_DIFFERENTIAL_REQUIRED=1"
     )
     add_test(
+        NAME test_nginx_issue591_pinned_access_log_off_default_oracle
+        COMMAND test_nginx_differential --pinned-nginx-retained-header-whitespace-off-oracle
+    )
+    set_tests_properties(test_nginx_issue591_pinned_access_log_off_default_oracle PROPERTIES
+        LABELS "integration;nginx;docker;network"
+        RUN_SERIAL TRUE
+        RESOURCE_LOCK nginx-differential
+        TIMEOUT 180
+        ENVIRONMENT "RUT_NGINX_DIFFERENTIAL_REQUIRED=1"
+    )
+    add_test(
         NAME test_nginx_issue252_converter_retained_header_whitespace_differential
         COMMAND test_nginx_differential --converter-retained-header-whitespace-differential $<TARGET_FILE:rut>
     )
