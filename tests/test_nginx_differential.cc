@@ -51558,10 +51558,10 @@ static bool run_converter_request_length_rut_side(TempDir& temp,
             error = "#577 could not open CLI converter output files";
             return false;
         }
+        ChildGuard converter_guard;
         const pid_t child = fork();
         if (child == 0) {
-            dup2(output_fd, STDOUT_FILENO);
-            dup2(error_fd, STDERR_FILENO);
+            if (dup2(output_fd, STDOUT_FILENO) < 0 || dup2(error_fd, STDERR_FILENO) < 0) _exit(127);
             close(output_fd);
             close(error_fd);
             execl(converter_path,
@@ -51574,13 +51574,19 @@ static bool run_converter_request_length_rut_side(TempDir& temp,
         }
         close(output_fd);
         close(error_fd);
-        int status = 0;
-        if (child < 0 || waitpid(child, &status, 0) != child || !WIFEXITED(status) ||
-            WEXITSTATUS(status) != 0 ||
+        if (child < 0) {
+            error = "#577 could not fork standalone converter";
+            return false;
+        }
+        converter_guard.child.pid = child;
+        if (!wait_child(converter_guard.child, 10'000) || !converter_guard.child.status_valid ||
+            !WIFEXITED(converter_guard.child.status) ||
+            WEXITSTATUS(converter_guard.child.status) != 0 ||
             !read_exact_return204_log(temp.source, "#577 CLI generated source", generated, error)) {
             error = "#577 standalone converter failed or produced no source";
             return false;
         }
+        converter_guard.child.pid = -1;
     } else if (!build_owned_converter_request_length_source(
                    frontend_port, backend_port, temp.rut_access_log, generated, error) ||
                !write_file(temp.source, generated.data(), generated.size())) {

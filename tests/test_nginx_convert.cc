@@ -287,7 +287,9 @@ TEST(nginx_convert, rejects_usage_missing_malformed_and_special_inputs_without_s
     CHECK(empty.out.empty());
 
     const std::string wrapper_path = directory + "/wrapper.conf";
-    REQUIRE(write_file(wrapper_path, "events {}\nserver {}\n"));
+    REQUIRE(write_file(wrapper_path,
+                       "events {}\nhttp { server { listen 127.0.0.1:8080; location / { "
+                       "proxy_pass http://127.0.0.1:9000; } } }\n"));
     const RunResult wrapper = run_converter(g_executable, "server", wrapper_path, wrapper_path);
     REQUIRE(WIFEXITED(wrapper.status));
     CHECK_EQ(WEXITSTATUS(wrapper.status), 1);
@@ -305,10 +307,10 @@ TEST(nginx_convert, rejects_usage_missing_malformed_and_special_inputs_without_s
 
     const std::string wrong_grammar_path = directory + "/wrong-grammar.conf";
     REQUIRE(write_file(wrong_grammar_path,
-                       "server { listen 8080; location / { proxy_pass "
-                       "http://127.0.0.1:9000; }\n"));
+                       "server { listen 127.0.0.1:8080; location / { proxy_pass "
+                       "http://127.0.0.1:9000; } }\n"));
     const RunResult wrong_grammar =
-        run_converter(g_executable, "server", wrong_grammar_path, wrong_grammar_path);
+        run_converter(g_executable, "http", wrong_grammar_path, wrong_grammar_path);
     REQUIRE(WIFEXITED(wrong_grammar.status));
     CHECK_EQ(WEXITSTATUS(wrong_grammar.status), 1);
     CHECK(wrong_grammar.out.empty());
