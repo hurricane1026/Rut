@@ -33,14 +33,19 @@ bool write_cstr(int fd, const char* text) {
 }
 
 void report(const char* filename, rut::Span span, rut::Str detail, const char* fallback) {
-    char prefix[256];
-    const int length = snprintf(prefix,
-                                sizeof(prefix),
-                                "%s:%u:%u: ",
-                                filename,
+    write_cstr(STDERR_FILENO, filename);
+    char coordinates[96];
+    const int length = snprintf(coordinates,
+                                sizeof(coordinates),
+                                ":%u:%u: ",
                                 span.line == 0u ? 1u : span.line,
                                 span.col == 0u ? 1u : span.col);
-    if (length > 0) write_all(STDERR_FILENO, prefix, static_cast<size_t>(length));
+    if (length > 0) {
+        const size_t bounded = static_cast<size_t>(length) < sizeof(coordinates)
+                                   ? static_cast<size_t>(length)
+                                   : sizeof(coordinates) - 1u;
+        write_all(STDERR_FILENO, coordinates, bounded);
+    }
     if (detail.ptr != nullptr && detail.len != 0u)
         write_all(STDERR_FILENO, detail.ptr, detail.len);
     else
@@ -145,7 +150,10 @@ int main(int argc, char** argv) {
     struct sigaction ignore{};
     ignore.sa_handler = SIG_IGN;
     sigemptyset(&ignore.sa_mask);
-    sigaction(SIGPIPE, &ignore, nullptr);
+    if (sigaction(SIGPIPE, &ignore, nullptr) != 0) {
+        return input_error(argc > 0 && argv[0] != nullptr ? argv[0] : "rut-nginx-convert",
+                           "could not ignore SIGPIPE");
+    }
 
     if (argc != 4 || strcmp(argv[1], "--format") != 0) return usage(argv[0]);
     Format format;
@@ -201,9 +209,15 @@ int main(int argc, char** argv) {
         converted = true;
     }
     const bool wrote = converted && write_all(STDOUT_FILENO, output.ptr, output.len);
+    const int output_errno = wrote ? 0 : errno;
     free(input);
     if (!wrote) {
-        report(argv[3], {}, {}, "output write failed");
+        char output_error[128];
+        snprintf(output_error,
+                 sizeof(output_error),
+                 "output write failed: %s",
+                 output_errno == 0 ? "unknown error" : strerror(output_errno));
+        report("stdout", {}, {}, output_error);
         return 1;
     }
     return 0;

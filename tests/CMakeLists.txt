@@ -684,7 +684,7 @@ target_include_directories(test_nginx_parser PRIVATE
 add_test(NAME test_nginx_parser COMMAND test_nginx_parser)
 set_tests_properties(test_nginx_parser PROPERTIES LABELS "unit;nginx;compiler")
 
-add_executable(test_nginx_convert test_nginx_convert.cc)
+add_executable(test_nginx_convert test_nginx_convert.cc ${PROJECT_SOURCE_DIR}/src/placement_new.cc)
 target_link_libraries(test_nginx_convert rut_nginx)
 target_include_directories(test_nginx_convert PRIVATE
     ${PROJECT_SOURCE_DIR}/include

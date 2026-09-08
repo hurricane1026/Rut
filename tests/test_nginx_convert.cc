@@ -88,6 +88,65 @@ RunResult run_converter(const char* executable,
     return result;
 }
 
+RunResult run_converter_to_file(const char* executable,
+                                const char* format,
+                                const std::string& input,
+                                const std::string& output_path) {
+    RunResult result;
+    int error_pipe[2]{};
+    if (pipe(error_pipe) != 0) return result;
+    const pid_t child = fork();
+    if (child == 0) {
+        const int output = open(output_path.c_str(), O_WRONLY);
+        if (output >= 0) dup2(output, STDOUT_FILENO);
+        dup2(error_pipe[1], STDERR_FILENO);
+        if (output >= 0) close(output);
+        close(error_pipe[0]);
+        close(error_pipe[1]);
+        if (output < 0) _exit(126);
+        execl(executable, executable, "--format", format, input.c_str(), nullptr);
+        _exit(127);
+    }
+    close(error_pipe[1]);
+    if (child < 0) {
+        close(error_pipe[0]);
+        return result;
+    }
+    result.err = read_pipe(error_pipe[0]);
+    waitpid(child, &result.status, 0);
+    return result;
+}
+
+RunResult run_converter_to_broken_pipe(const char* executable,
+                                       const char* format,
+                                       const std::string& input) {
+    RunResult result;
+    int output_pipe[2]{};
+    int error_pipe[2]{};
+    if (pipe(output_pipe) != 0 || pipe(error_pipe) != 0) return result;
+    const pid_t child = fork();
+    if (child == 0) {
+        dup2(output_pipe[1], STDOUT_FILENO);
+        dup2(error_pipe[1], STDERR_FILENO);
+        close(output_pipe[0]);
+        close(output_pipe[1]);
+        close(error_pipe[0]);
+        close(error_pipe[1]);
+        execl(executable, executable, "--format", format, input.c_str(), nullptr);
+        _exit(127);
+    }
+    close(output_pipe[0]);
+    close(output_pipe[1]);
+    close(error_pipe[1]);
+    if (child < 0) {
+        close(error_pipe[0]);
+        return result;
+    }
+    result.err = read_pipe(error_pipe[0]);
+    waitpid(child, &result.status, 0);
+    return result;
+}
+
 std::string make_temp_dir() {
     char pattern[] = "/tmp/rut-nginx-convert-XXXXXX";
     char* path = mkdtemp(pattern);
@@ -182,6 +241,82 @@ TEST(nginx_convert, rejects_oversized_input_before_conversion) {
     CHECK_EQ(WEXITSTATUS(result.status), 1);
     CHECK(result.out.empty());
     CHECK(result.err.find("1 MiB") != std::string::npos);
+}
+
+TEST(nginx_convert, accepts_exact_one_mib_regular_input_with_valid_prefix) {
+    const std::string directory = make_temp_dir();
+    REQUIRE_FALSE(directory.empty());
+    const std::string path = directory + "/boundary.conf";
+    const std::string prefix =
+        "server { listen 127.0.0.1:8080; location / { proxy_pass "
+        "http://127.0.0.1:9000; } }\n";
+    REQUIRE_LT(prefix.size(), 1024u * 1024u);
+    std::string boundary = prefix;
+    boundary.append(1024u * 1024u - boundary.size(), ' ');
+    REQUIRE_EQ(boundary.size(), 1024u * 1024u);
+    REQUIRE(write_file(path, boundary));
+    const RunResult result = run_converter(g_executable, "server", path, path);
+    REQUIRE(WIFEXITED(result.status));
+    CHECK_EQ(WEXITSTATUS(result.status), 0);
+    CHECK(result.err.empty());
+    CHECK_FALSE(result.out.empty());
+}
+
+TEST(nginx_convert, rejects_embedded_nul_after_valid_prefix) {
+    const std::string directory = make_temp_dir();
+    REQUIRE_FALSE(directory.empty());
+    const std::string path = directory + "/nul.conf";
+    std::string source =
+        "server { listen 127.0.0.1:8080; location / { proxy_pass "
+        "http://127.0.0.1:9000; } }\n";
+    source.push_back('\0');
+    source += "server { listen 127.0.0.1:1; }\n";
+    REQUIRE(write_file(path, source));
+    const RunResult result = run_converter(g_executable, "server", path, path);
+    REQUIRE(WIFEXITED(result.status));
+    CHECK_EQ(WEXITSTATUS(result.status), 1);
+    CHECK(result.out.empty());
+    CHECK(result.err.find(path + ":") == 0u);
+}
+
+TEST(nginx_convert, rejects_directory_and_reports_long_filename_without_overread) {
+    const std::string directory = make_temp_dir();
+    REQUIRE_FALSE(directory.empty());
+    const RunResult directory_result = run_converter(g_executable, "server", directory, directory);
+    REQUIRE(WIFEXITED(directory_result.status));
+    CHECK_EQ(WEXITSTATUS(directory_result.status), 1);
+    CHECK(directory_result.out.empty());
+    std::string nested = directory;
+    while (nested.size() <= 300u) {
+        nested += "/nested";
+        REQUIRE_EQ(mkdir(nested.c_str(), 0700), 0);
+    }
+    const std::string long_path = nested + "/bad.conf";
+    REQUIRE(write_file(long_path, "server {"));
+    const RunResult long_result = run_converter(g_executable, "server", long_path, long_path);
+    REQUIRE(WIFEXITED(long_result.status));
+    CHECK_EQ(WEXITSTATUS(long_result.status), 1);
+    CHECK(long_result.out.empty());
+    CHECK(long_result.err.find(long_path + ":") == 0u);
+}
+
+TEST(nginx_convert, output_failures_are_reported_without_sigpipe_termination) {
+    const std::string directory = make_temp_dir();
+    REQUIRE_FALSE(directory.empty());
+    const std::string path = directory + "/valid.conf";
+    const std::string source =
+        "server { listen 127.0.0.1:8080; location / { proxy_pass "
+        "http://127.0.0.1:9000; } }\n";
+    REQUIRE(write_file(path, source));
+    const RunResult full = run_converter_to_file(g_executable, "server", path, "/dev/full");
+    REQUIRE(WIFEXITED(full.status));
+    CHECK_EQ(WEXITSTATUS(full.status), 1);
+    CHECK(full.out.empty());
+    CHECK(full.err.find("stdout:1:1: output write failed") == 0u);
+    const RunResult broken = run_converter_to_broken_pipe(g_executable, "server", path);
+    REQUIRE(WIFEXITED(broken.status));
+    CHECK_EQ(WEXITSTATUS(broken.status), 1);
+    CHECK(broken.err.find("stdout:1:1: output write failed") == 0u);
 }
 
 int main(int argc, char** argv) {
