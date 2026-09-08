@@ -1198,26 +1198,131 @@ TEST(nginx_http_profile_parser, rejects_access_log_off_variants_and_mixtures) {
     }
 }
 
-TEST(nginx_converter, rejects_fresh_access_log_off_without_emitting_source) {
+TEST(nginx_converter, lowers_access_log_off_to_owned_server_only_output) {
+    const std::string server_content =
+        "    listen 127.0.0.1:65535;\n"
+        "    location / { proxy_read_timeout 63s; proxy_pass http://255.255.255.255:65535; }\n"
+        "    location = /old { return 301 http://redirect.example/new; }\n";
+    const std::string source =
+        "http {\n  access_log off;\n  server {\n" + server_content + "  }\n}\n";
+    const auto profile =
+        nginx::parse_http_profile({source.data(), static_cast<u32>(source.size())});
+    REQUIRE(profile);
+    CHECK(profile.value().access_log.destination_profile ==
+          nginx::AccessLogDestinationProfile::Off);
+    const auto server = nginx::lower_to_rut(profile.value().server);
+    REQUIRE(server);
+    const auto lowered = nginx::lower_to_rut(profile.value());
+    REQUIRE(lowered);
+    CHECK_EQ(lowered.value().len, server.value().len);
+    CHECK_EQ(lowered.value().view().ptr != nullptr, true);
+    CHECK(lowered.value().view().eq(server.value().view()));
+    CHECK_EQ(lowered.value().data[lowered.value().len], '\0');
+    CHECK_EQ(count_text(std::string(lowered.value().data, lowered.value().len), "accessLog {"), 0u);
+
+    std::fill(source.begin(), source.end(), 'x');
+    CHECK(lowered.value().view().eq(server.value().view()));
+
+    nginx::HttpProfileRutSource retained;
+    std::string retained_expected;
+    {
+        std::string ephemeral =
+            "http { access_log off; server { listen 127.0.0.1:8080; location / { "
+            "proxy_pass http://127.0.0.1:9000; } } }";
+        const auto parsed =
+            nginx::parse_http_profile({ephemeral.data(), static_cast<u32>(ephemeral.size())});
+        REQUIRE(parsed);
+        const auto owned = nginx::lower_to_rut(parsed.value());
+        REQUIRE(owned);
+        retained = owned.value();
+        const auto expected_server = nginx::lower_to_rut(parsed.value().server);
+        REQUIRE(expected_server);
+        retained_expected.assign(expected_server.value().data, expected_server.value().len);
+    }
+    CHECK_EQ(std::string(retained.data, retained.len), retained_expected);
+    CHECK_EQ(retained.data[retained.len], '\0');
+}
+
+TEST(nginx_converter, authenticates_access_log_off_and_complete_envelope) {
     const std::string source =
         "http { access_log off; server { listen 127.0.0.1:8080; location / { "
         "proxy_pass http://127.0.0.1:9000; } } }";
     const auto profile =
         nginx::parse_http_profile({source.data(), static_cast<u32>(source.size())});
     REQUIRE(profile);
-    CHECK(profile.value().access_log.destination_profile ==
-          nginx::AccessLogDestinationProfile::Off);
-    const auto lowered = nginx::lower_to_rut(profile.value());
-    REQUIRE_FALSE(lowered);
+    const auto direct_server = nginx::lower_to_rut(profile.value().server);
+    REQUIRE(direct_server);
+    const auto direct = nginx::lower_to_rut(profile.value());
+    REQUIRE(direct);
+    CHECK(direct.value().view().eq(direct_server.value().view()));
 
-    const std::string complete = "events {} " + source;
+    auto forged = profile.value();
+    forged.access_log.destination_profile = nginx::AccessLogDestinationProfile::None;
+    forged.access_log.path.ptr = reinterpret_cast<const char*>(static_cast<uintptr_t>(1));
+    auto rejected = nginx::lower_to_rut(forged);
+    REQUIRE_FALSE(rejected);
+    CHECK(rejected.error().detail.eq(lit_str("http profile metadata does not match its source")));
+
+    forged = profile.value();
+    forged.access_log.path.ptr = reinterpret_cast<const char*>(static_cast<uintptr_t>(1));
+    rejected = nginx::lower_to_rut(forged);
+    REQUIRE_FALSE(rejected);
+    CHECK(rejected.error().detail.eq(lit_str("http profile metadata does not match its source")));
+
+    forged = profile.value();
+    forged.access_log.path_span.start++;
+    rejected = nginx::lower_to_rut(forged);
+    REQUIRE_FALSE(rejected);
+    CHECK(rejected.error().detail.eq(lit_str("http profile metadata does not match its source")));
+
+    forged = profile.value();
+    forged.log_format.value_span.start++;
+    rejected = nginx::lower_to_rut(forged);
+    REQUIRE_FALSE(rejected);
+    CHECK(rejected.error().detail.eq(lit_str("http profile metadata does not match its source")));
+
+    forged = profile.value();
+    forged.access_log = {};
+    rejected = nginx::lower_to_rut(forged);
+    REQUIRE_FALSE(rejected);
+    forged = profile.value();
+    forged.access_log.destination_profile = static_cast<nginx::AccessLogDestinationProfile>(255u);
+    rejected = nginx::lower_to_rut(forged);
+    REQUIRE_FALSE(rejected);
+
+    forged = profile.value();
+    forged.log_format.token_span.start++;
+    rejected = nginx::lower_to_rut(forged);
+    REQUIRE_FALSE(rejected);
+
+    std::string independent = source;
+    const auto other =
+        nginx::parse_http_profile({independent.data(), static_cast<u32>(independent.size())});
+    REQUIRE(other);
+    forged = profile.value();
+    forged.access_log.path = other.value().access_log.path;
+    rejected = nginx::lower_to_rut(forged);
+    REQUIRE_FALSE(rejected);
+
+    std::string complete = "events {}\n" + source;
     const auto config =
         nginx::parse_nginx_http_config({complete.data(), static_cast<u32>(complete.size())});
     REQUIRE(config);
-    CHECK(config.value().http.access_log.destination_profile ==
-          nginx::AccessLogDestinationProfile::Off);
     const auto complete_lowered = nginx::lower_to_rut(config.value());
-    REQUIRE_FALSE(complete_lowered);
+    REQUIRE(complete_lowered);
+    CHECK(complete_lowered.value().view().eq(direct_server.value().view()));
+    auto forged_config = config.value();
+    forged_config.http.access_log.path_span.start++;
+    const auto config_rejected = nginx::lower_to_rut(forged_config);
+    REQUIRE_FALSE(config_rejected);
+    CHECK_EQ(config_rejected.error().span.start, config.value().http_span.start);
+    CHECK_EQ(config_rejected.error().span.end, config.value().http_span.end);
+    CHECK_EQ(config_rejected.error().span.line, config.value().http_span.line);
+    CHECK_EQ(config_rejected.error().span.col, config.value().http_span.col);
+
+    source[source.find("off")] = 'x';
+    const auto source_changed = nginx::lower_to_rut(profile.value());
+    REQUIRE_FALSE(source_changed);
 }
 
 TEST(nginx_http_profile_parser,
