@@ -48,10 +48,14 @@ file conversion workflow:
 ```text
 rut-nginx-convert --format server <input-file>
 rut-nginx-convert --format http <input-file>
+rut-nginx-convert --format nginx-http <input-file>
 ```
 
 `server` accepts one bare server fragment and `http` accepts one bounded
 `http {}` profile with the existing `log_format`/`access_log` declarations.
+`nginx-http` accepts exactly one empty `events {}` block followed by that same
+bounded logged HTTP profile; it is not general nginx.conf support and does not
+claim that an empty events block is semantically inert.
 The input must be one regular file no larger than 1 MiB; the complete file is
 kept alive through parsing and lowering. The command does not read stdin,
 expand includes, execute generated RUT, open configured listeners or log
