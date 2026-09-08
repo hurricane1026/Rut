@@ -20702,7 +20702,7 @@ TEST(nginx_parser_issue373, rejects_bad_arity_name_duplicates_and_contexts) {
     }
 }
 
-TEST(nginx_parser_issue600, bounded_custom_names_preserve_spelling_and_lowering_rejects) {
+TEST(nginx_converter_issue600, bounded_custom_names_preserve_spelling_and_lowering) {
     const std::string names[] = {
         "X-A",
         "X-Powered-By",
@@ -20740,13 +20740,11 @@ TEST(nginx_parser_issue600, bounded_custom_names_preserve_spelling_and_lowering_
         CHECK_EQ(header.span.start, static_cast<u32>(directive_at));
         CHECK_EQ(header.span.end, static_cast<u32>(source.find(';', name_at) + 1u));
         const auto lowered = nginx::lower_to_rut(parsed.value());
-        REQUIRE_FALSE(lowered);
-        CHECK_EQ(lowered.error().code, FrontendError::UnsupportedSyntax);
-        const Str expected_detail = name.size() == 15u
-                                        ? lit_str("invalid proxy_hide_header source syntax")
-                                        : lit_str("invalid proxy_hide_header name model");
-        CHECK(lowered.error().detail.eq(expected_detail));
-        CHECK_EQ(lowered.error().span.start, header.span.start);
+        REQUIRE(lowered);
+        const std::string output(lowered.value().data, lowered.value().len);
+        CHECK_EQ(count_text(output, "hide_headers: [\"Date\", \"Server\", \"X-Pad\", \""), 3u);
+        CHECK_NE(output.find(name + "\"]"), std::string::npos);
+        CHECK_LT(lowered.value().len, nginx::RutSource::kCapacity);
     }
 }
 
@@ -20811,6 +20809,40 @@ TEST(nginx_parser_issue600, custom_name_keeps_context_order_and_duplicate_reject
         CHECK_EQ(parsed.error().code, FrontendError::UnsupportedSyntax);
         CHECK(parsed.error().detail.eq({vector.detail, static_cast<u32>(strlen(vector.detail))}));
     }
+}
+
+TEST(nginx_converter_issue600, custom_name_http_profile_output_is_owned_and_authenticated) {
+    std::string source = make_request_length_http_profile(
+        "/tmp/rut-600-access.log",
+        "    listen 127.0.0.1:8080;\n"
+        "    location / { proxy_hide_header x-Powered_by-9; proxy_pass "
+        "http://127.0.0.1:9000; }\n");
+    const auto parsed = nginx::parse_http_profile({source.data(), static_cast<u32>(source.size())});
+    REQUIRE(parsed);
+    const auto lowered = nginx::lower_to_rut(parsed.value());
+    REQUIRE(lowered);
+    const std::string owned(lowered.value().data, lowered.value().len);
+    CHECK_NE(owned.find("hide_headers: [\"Date\", \"Server\", \"X-Pad\", \"x-Powered_by-9\"]"),
+             std::string::npos);
+    CHECK_LT(lowered.value().len, nginx::HttpProfileRutSource::kCapacity);
+
+    const std::string complete_source = "events {}\n" + source;
+    const auto complete = nginx::parse_nginx_http_config(
+        {complete_source.data(), static_cast<u32>(complete_source.size())});
+    REQUIRE(complete);
+    const auto complete_lowered = nginx::lower_to_rut(complete.value());
+    REQUIRE(complete_lowered);
+    CHECK_EQ(std::string(complete_lowered.value().data, complete_lowered.value().len), owned);
+
+    std::fill(source.begin(), source.end(), 'x');
+    CHECK_EQ(std::string(lowered.value().data, lowered.value().len), owned);
+
+    auto forged = parsed.value();
+    forged.server.location.proxy_hide_header.name.ptr =
+        reinterpret_cast<const char*>(static_cast<uintptr_t>(1));
+    const auto rejected = nginx::lower_to_rut(forged);
+    REQUIRE_FALSE(rejected);
+    CHECK(rejected.error().detail.eq(lit_str("http profile metadata does not match its source")));
 }
 
 TEST(nginx_parser_issue373, retained_profiles_have_fully_default_absent_hide_inventory) {

@@ -107,34 +107,6 @@ constexpr bool eq(Str a, const char* b, u32 n) {
     return true;
 }
 
-constexpr char ascii_lower(char c) {
-    return c >= 'A' && c <= 'Z' ? static_cast<char>(c + ('a' - 'A')) : c;
-}
-
-constexpr bool eq_fold(Str a, const char* b, u32 n) {
-    if (a.len != n) return false;
-    for (u32 i = 0; i < n; i++) {
-        if (ascii_lower(a.ptr[i]) != ascii_lower(b[i])) return false;
-    }
-    return true;
-}
-
-bool valid_proxy_hide_header_name(Str name) {
-    if (name.ptr == nullptr || name.len < 3u || name.len > 46u || ascii_lower(name.ptr[0]) != 'x' ||
-        name.ptr[1] != '-')
-        return false;
-    if (eq_fold(name, "X-Pad", 5u) ||
-        (name.len >= 8u && eq_fold(name.slice(0u, 8u), "X-Accel-", 8u)))
-        return false;
-    for (u32 i = 2u; i < name.len; i++) {
-        const char c = name.ptr[i];
-        const bool alpha = (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z');
-        const bool digit = c >= '0' && c <= '9';
-        if (!alpha && !digit && c != '_' && c != '-') return false;
-    }
-    return true;
-}
-
 constexpr bool contains(Str a, char needle) {
     for (u32 i = 0; i < a.len; i++) {
         if (a.ptr[i] == needle) return true;

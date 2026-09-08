@@ -322,6 +322,39 @@ TEST(nginx_convert, access_log_off_cli_rejects_unsupported_forms_without_stdout)
     }
 }
 
+TEST(nginx_convert, custom_proxy_hide_header_cli_matches_owned_server_output) {
+    const std::string directory = make_temp_dir();
+    REQUIRE_FALSE(directory.empty());
+    const std::string source =
+        "server { listen 127.0.0.1:8080; location / { proxy_hide_header x-Powered_by-9; "
+        "proxy_pass http://127.0.0.1:9000; } }\n";
+    const std::string path = directory + "/custom-hide.conf";
+    REQUIRE(write_file(path, source));
+    const auto parsed = rut::nginx::parse({source.data(), static_cast<rut::u32>(source.size())});
+    REQUIRE(parsed);
+    const auto lowered = rut::nginx::lower_to_rut(parsed.value());
+    REQUIRE(lowered);
+    const RunResult result = run_converter(g_executable, "server", path, path);
+    REQUIRE(WIFEXITED(result.status));
+    CHECK_EQ(WEXITSTATUS(result.status), 0);
+    CHECK(result.err.empty());
+    CHECK_EQ(result.out, std::string(lowered.value().data, lowered.value().len));
+    CHECK_NE(result.out.find("x-Powered_by-9"), std::string::npos);
+
+    const std::string rejected_source =
+        "server { listen 127.0.0.1:8080; location / { proxy_hide_header X-!; "
+        "proxy_pass http://127.0.0.1:9000; } }\n";
+    const std::string rejected_path = directory + "/rejected-hide.conf";
+    REQUIRE(write_file(rejected_path, rejected_source));
+    const RunResult rejected = run_converter(g_executable, "server", rejected_path, rejected_path);
+    REQUIRE(WIFEXITED(rejected.status));
+    CHECK_EQ(WEXITSTATUS(rejected.status), 1);
+    CHECK(rejected.out.empty());
+    CHECK(rejected.err.find(rejected_path + ":") == 0u);
+    CHECK(rejected.err.find("proxy_hide_header name is outside the bounded header-name profile") !=
+          std::string::npos);
+}
+
 TEST(nginx_convert, nginx_http_output_matches_complete_api_and_rejects_unsupported_envelopes) {
     const std::string directory = make_temp_dir();
     REQUIRE_FALSE(directory.empty());
