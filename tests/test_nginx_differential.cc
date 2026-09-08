@@ -3253,6 +3253,27 @@ struct Recorder {
 };
 
 static bool run_gated_fragment_peer_probe_self_check(std::string& error) {
+    const auto describe_open_failure = [](const char* label,
+                                          bool completed,
+                                          bool closed,
+                                          bool pre_flag,
+                                          u32 pre_count,
+                                          bool post_flag,
+                                          u32 post_count,
+                                          bool thread_alive,
+                                          int listen_fd,
+                                          u32 ack,
+                                          u64 probe_ns) {
+        return std::string(label) + " predicates: completed=" + std::to_string(completed) +
+               " closed=" + std::to_string(closed) +
+               " pre_peer_closed=" + std::to_string(pre_flag) +
+               " pre_peer_close_count=" + std::to_string(pre_count) +
+               " post_peer_closed=" + std::to_string(post_flag) +
+               " post_peer_close_count=" + std::to_string(post_count) +
+               " thread_alive=" + std::to_string(thread_alive) +
+               " listen_fd=" + std::to_string(listen_fd) + " probe_ack=" + std::to_string(ack) +
+               " probe_ns=" + std::to_string(probe_ns);
+    };
     struct PublicationObservation {
         std::atomic<bool>* flag;
         std::atomic<u32>* count;
@@ -3654,12 +3675,34 @@ static bool run_gated_fragment_peer_probe_self_check(std::string& error) {
         const bool closed =
             recorder.response_peer_closed.load(std::memory_order_acquire) &&
             recorder.response_peer_close_count.load(std::memory_order_acquire) == 1u;
+        const bool prejoin_peer_closed =
+            recorder.response_peer_closed.load(std::memory_order_acquire);
+        const u32 prejoin_peer_close_count =
+            recorder.response_peer_close_count.load(std::memory_order_acquire);
         recorder.stop();
-        if (!completed || !closed || recorder.thread_alive.load(std::memory_order_acquire) ||
-            recorder.listen_fd >= 0 ||
-            recorder.gated_fragment_probe_ack.load(std::memory_order_acquire) != 2u ||
-            recorder.gated_fragment_probe_ns.load(std::memory_order_relaxed) != probe_ns) {
-            error = "gated-fragment peer probe open control lost completion/custody evidence";
+        const bool postjoin_peer_closed =
+            recorder.response_peer_closed.load(std::memory_order_acquire);
+        const u32 postjoin_peer_close_count =
+            recorder.response_peer_close_count.load(std::memory_order_acquire);
+        const bool thread_alive = recorder.thread_alive.load(std::memory_order_acquire);
+        const int listen_fd = recorder.listen_fd;
+        const u32 postjoin_ack = recorder.gated_fragment_probe_ack.load(std::memory_order_acquire);
+        const u64 postjoin_probe_ns =
+            recorder.gated_fragment_probe_ns.load(std::memory_order_relaxed);
+        if (!completed || !closed || thread_alive || listen_fd >= 0 || postjoin_ack != 2u ||
+            postjoin_probe_ns != probe_ns) {
+            error = describe_open_failure(
+                "gated-fragment peer probe open control lost completion/custody evidence",
+                completed,
+                closed,
+                prejoin_peer_closed,
+                prejoin_peer_close_count,
+                postjoin_peer_closed,
+                postjoin_peer_close_count,
+                thread_alive,
+                listen_fd,
+                postjoin_ack,
+                postjoin_probe_ns);
             return false;
         }
         return true;
@@ -3898,12 +3941,34 @@ static bool run_gated_fragment_peer_probe_self_check(std::string& error) {
         const bool closed =
             recorder.response_peer_closed.load(std::memory_order_acquire) &&
             recorder.response_peer_close_count.load(std::memory_order_acquire) == 1u;
+        const bool prejoin_peer_closed =
+            recorder.response_peer_closed.load(std::memory_order_acquire);
+        const u32 prejoin_peer_close_count =
+            recorder.response_peer_close_count.load(std::memory_order_acquire);
         recorder.stop();
-        if (!completed || !closed || recorder.thread_alive.load(std::memory_order_acquire) ||
-            recorder.listen_fd >= 0 ||
-            recorder.gated_fragment_probe_ack.load(std::memory_order_acquire) != 3u ||
-            recorder.gated_fragment_probe_ns.load(std::memory_order_relaxed) != probe_ns) {
-            error = "gated-fragment ordinal-3 open control lost completion/custody evidence";
+        const bool postjoin_peer_closed =
+            recorder.response_peer_closed.load(std::memory_order_acquire);
+        const u32 postjoin_peer_close_count =
+            recorder.response_peer_close_count.load(std::memory_order_acquire);
+        const bool thread_alive = recorder.thread_alive.load(std::memory_order_acquire);
+        const int listen_fd = recorder.listen_fd;
+        const u32 postjoin_ack = recorder.gated_fragment_probe_ack.load(std::memory_order_acquire);
+        const u64 postjoin_probe_ns =
+            recorder.gated_fragment_probe_ns.load(std::memory_order_relaxed);
+        if (!completed || !closed || thread_alive || listen_fd >= 0 || postjoin_ack != 3u ||
+            postjoin_probe_ns != probe_ns) {
+            error = describe_open_failure(
+                "gated-fragment ordinal-3 open control lost completion/custody evidence",
+                completed,
+                closed,
+                prejoin_peer_closed,
+                prejoin_peer_close_count,
+                postjoin_peer_closed,
+                postjoin_peer_close_count,
+                thread_alive,
+                listen_fd,
+                postjoin_ack,
+                postjoin_probe_ns);
             return false;
         }
         return true;
