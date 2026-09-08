@@ -32926,8 +32926,7 @@ TEST(http1_pipeline_generation_activation,
 
 TEST(http1_pipeline_generation_activation,
      strict_successor_id3_materialization_rejects_owner_generation_before_effects) {
-    static constexpr u16 kId3 =
-        static_cast<u16>(RequestPolicyId::Http11FixedTrimSpPreserveHtab);
+    static constexpr u16 kId3 = static_cast<u16>(RequestPolicyId::Http11FixedTrimSpPreserveHtab);
     static constexpr char kRequest[] =
         "GET /one HTTP/1.1\r\nHost: client.example\r\nX-Test:\t keep \t\r\n\r\n";
     static constexpr char kExpected[] =
@@ -32936,8 +32935,9 @@ TEST(http1_pipeline_generation_activation,
         REQUIRE(fixture.setup());
         Connection& conn = fixture.loop.conns[0];
         conn.recv_buf.reset();
-        REQUIRE_EQ(conn.recv_buf.write(reinterpret_cast<const u8*>(kRequest), sizeof(kRequest) - 1u),
-                   sizeof(kRequest) - 1u);
+        REQUIRE_EQ(
+            conn.recv_buf.write(reinterpret_cast<const u8*>(kRequest), sizeof(kRequest) - 1u),
+            sizeof(kRequest) - 1u);
         capture_request_metadata(conn);
         conn.request_config = &fixture.config;
         conn.pipeline_depth = 1;
@@ -33067,8 +33067,7 @@ TEST(http1_pipeline_generation_activation,
                    Http1PrebuiltResponsePurpose::StrictNonHeadCl0Success);
         REQUIRE(conn.upstream_retirement_active);
         REQUIRE(conn.send_armed);
-        REQUIRE_EQ(conn.http1_prebuilt_wait,
-                   kHttp1WaitHeaderSend | kHttp1WaitUpstreamRetirement);
+        REQUIRE_EQ(conn.http1_prebuilt_wait, kHttp1WaitHeaderSend | kHttp1WaitUpstreamRetirement);
 
         if (header_first) {
             complete_prebuilt_d2_header(loop, conn);
@@ -33139,8 +33138,7 @@ TEST(http1_pipeline_generation_activation,
         "GET /one HTTP/1.1\r\nHost: client.example\r\nX-Test:\t keep \t\r\n\r\n";
     static constexpr char kExpectedWire[] =
         "GET /one HTTP/1.1\r\nHost: 127.0.0.1:9000\r\nX-Test: \t keep \t\r\n\r\n";
-    static constexpr u8 kOriginPartial[] =
-        "HTTP/1.1 200 OK\r\nContent-Length: 4\r\n\r\nab";
+    static constexpr u8 kOriginPartial[] = "HTTP/1.1 200 OK\r\nContent-Length: 4\r\n\r\nab";
     static constexpr u8 kOriginRemainder[] = "cd";
 
     for (const bool header_first : {false, true}) {
@@ -33177,9 +33175,8 @@ TEST(http1_pipeline_generation_activation,
 
         REQUIRE_EQ(conn.upstream_recv_buf.write(kOriginPartial, sizeof(kOriginPartial) - 1u),
                    sizeof(kOriginPartial) - 1u);
-        const IoEvent response =
-            response_read_copy_event(
-                conn, sizeof(kOriginPartial) - 1u, true, 0, sizeof(kOriginPartial) - 1u);
+        const IoEvent response = response_read_copy_event(
+            conn, sizeof(kOriginPartial) - 1u, true, 0, sizeof(kOriginPartial) - 1u);
         loop->dispatch_batch(&response, 1);
         REQUIRE_EQ(conn.resp_status, 200u);
         REQUIRE_EQ(conn.response_read_deadline_post_commit_phase,
@@ -33189,8 +33186,11 @@ TEST(http1_pipeline_generation_activation,
         const u32 remainder_begin = conn.upstream_recv_buf.len();
         REQUIRE_EQ(conn.upstream_recv_buf.write(kOriginRemainder, sizeof(kOriginRemainder) - 1u),
                    sizeof(kOriginRemainder) - 1u);
-        const IoEvent remainder = response_read_copy_event(
-            conn, sizeof(kOriginRemainder) - 1u, true, remainder_begin, conn.upstream_recv_buf.len());
+        const IoEvent remainder = response_read_copy_event(conn,
+                                                           sizeof(kOriginRemainder) - 1u,
+                                                           true,
+                                                           remainder_begin,
+                                                           conn.upstream_recv_buf.len());
         loop->dispatch_batch(&remainder, 1);
         REQUIRE_EQ(conn.response_read_deadline_post_commit_declared_body, 4u);
         REQUIRE_EQ(conn.response_read_deadline_post_commit_origin_received, 4u);
@@ -33231,9 +33231,8 @@ TEST(http1_pipeline_generation_activation,
         cleanup_late_failure_fixture(loop, fixture);
     }
 
-    for (const Mutation mutation : {Mutation::Generation,
-                                    Mutation::Episode,
-                                    Mutation::DeclaredBodyLength}) {
+    for (const Mutation mutation :
+         {Mutation::Generation, Mutation::Episode, Mutation::DeclaredBodyLength}) {
         ScopedBackendHealthReset health_reset{};
         ScopedIoUringLoopForRetirement guard;
         if (!guard.init()) SKIP("io_uring unavailable");
@@ -33258,15 +33257,17 @@ TEST(http1_pipeline_generation_activation,
         const u32 id = conn.id;
         REQUIRE_EQ(conn.upstream_recv_buf.write(kOriginPartial, sizeof(kOriginPartial) - 1u),
                    sizeof(kOriginPartial) - 1u);
-        const IoEvent response =
-            response_read_copy_event(
-                conn, sizeof(kOriginPartial) - 1u, true, 0, sizeof(kOriginPartial) - 1u);
+        const IoEvent response = response_read_copy_event(
+            conn, sizeof(kOriginPartial) - 1u, true, 0, sizeof(kOriginPartial) - 1u);
         loop->dispatch_batch(&response, 1);
         const u32 remainder_begin = conn.upstream_recv_buf.len();
         REQUIRE_EQ(conn.upstream_recv_buf.write(kOriginRemainder, sizeof(kOriginRemainder) - 1u),
                    sizeof(kOriginRemainder) - 1u);
-        const IoEvent remainder = response_read_copy_event(
-            conn, sizeof(kOriginRemainder) - 1u, true, remainder_begin, conn.upstream_recv_buf.len());
+        const IoEvent remainder = response_read_copy_event(conn,
+                                                           sizeof(kOriginRemainder) - 1u,
+                                                           true,
+                                                           remainder_begin,
+                                                           conn.upstream_recv_buf.len());
         loop->dispatch_batch(&remainder, 1);
         REQUIRE(response_read_deadline_post_commit_is_stable(conn));
         switch (mutation) {
