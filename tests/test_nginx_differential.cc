@@ -44,6 +44,10 @@ using rut::u64;
 #error "RUT_PINNED_NGINX_IMAGE must be provided by the build system"
 #endif
 
+static bool read_request_length_access_file(const std::string& path,
+                                            std::string& contents,
+                                            std::string& error);
+
 namespace {
 
 static constexpr const char* kNginxImage = RUT_PINNED_NGINX_IMAGE;
@@ -5630,10 +5634,6 @@ struct DefaultBufferingEofObservation {
     u64 first_downstream_byte_ns = 0;
     u64 downstream_eof_ns = 0;
 };
-
-static bool read_request_length_access_file(const std::string& path,
-                                            std::string& contents,
-                                            std::string& error);
 
 static u64 steady_now_ns() {
     return static_cast<u64>(std::chrono::duration_cast<std::chrono::nanoseconds>(
