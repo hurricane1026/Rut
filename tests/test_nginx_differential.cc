@@ -74686,6 +74686,16 @@ int main(int argc, char** argv) {
     }
     return missing_prerequisite("pinned nginx differential requires Linux host networking");
 #else
+    if (rut_iouring_gate_recv_owner_diagnostics_self_check) {
+        std::string diagnostic_error;
+        if (!run_recv_owner_diagnostic_self_check(diagnostic_error)) {
+            std::cerr << "FAIL [RUT io_uring recv-owner diagnostics]: " << diagnostic_error << "\n";
+            return 1;
+        }
+        std::cerr << "PASS: recv-owner first-failure, precedence, formatter, and owner-death "
+                     "diagnostics self-check\n";
+        return 0;
+    }
     if (zero_response_stall_self_check) {
         std::string stall_error;
         if (!run_zero_response_stall_self_check(stall_error)) {
@@ -79699,17 +79709,6 @@ int main(int argc, char** argv) {
                "reuse/pipeline, proxy TRACE, other targets or methods, TLS/H2, malformed input, "
                "and direct nginx.conf runtime support)\n";
         if (converter_exact_local_differential) return 0;
-    }
-
-    if (rut_iouring_gate_recv_owner_diagnostics_self_check) {
-        std::string diagnostic_error;
-        if (!run_recv_owner_diagnostic_self_check(diagnostic_error)) {
-            std::cerr << "FAIL [RUT io_uring recv-owner diagnostics]: " << diagnostic_error << "\n";
-            return 1;
-        }
-        std::cerr << "PASS: recv-owner first-failure, precedence, formatter, and owner-death "
-                     "diagnostics self-check\n";
-        return 0;
     }
 
     if (nginx_gate_spike) {
