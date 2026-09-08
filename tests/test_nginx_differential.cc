@@ -1040,6 +1040,9 @@ struct TempDir {
             unlink((rut_log + ".converter").c_str());
             unlink(rut_access_log.c_str());
             unlink(preflight_log.c_str());
+            unlink((std::string(path) + "/preload-loader-valid.log").c_str());
+            unlink((std::string(path) + "/preload-loader-invalid.so").c_str());
+            unlink((std::string(path) + "/preload-loader-invalid.log").c_str());
             unlink(gate_control.c_str());
             unlink(rut_iouring_gate_control.c_str());
             rmdir(path);
@@ -1062,6 +1065,165 @@ static bool write_file(const std::string& path, const char* data, size_t len) {
         return false;
     }
     return close(fd) == 0;
+}
+
+static bool log_contains(const std::string& path, const char* needle);
+
+static bool read_bounded_file(const std::string& path, std::string& contents, std::string& error) {
+    constexpr size_t kMaxDiagnosticBytes = 8192u;
+    const int fd = open(path.c_str(), O_RDONLY | O_CLOEXEC);
+    if (fd < 0) {
+        error = "could not read diagnostic file errno=" + std::to_string(errno);
+        return false;
+    }
+    contents.clear();
+    char buffer[1024];
+    for (;;) {
+        const ssize_t count = read(fd, buffer, sizeof(buffer));
+        if (count > 0) {
+            if (contents.size() > kMaxDiagnosticBytes - static_cast<size_t>(count)) {
+                close(fd);
+                error = "diagnostic output exceeded bounded capture";
+                return false;
+            }
+            contents.append(buffer, static_cast<size_t>(count));
+            continue;
+        }
+        if (count < 0 && errno == EINTR) continue;
+        if (count < 0) {
+            error = "could not read diagnostic file errno=" + std::to_string(errno);
+            close(fd);
+            return false;
+        }
+        break;
+    }
+    if (close(fd) != 0) {
+        error = "could not close diagnostic file errno=" + std::to_string(errno);
+        return false;
+    }
+    return true;
+}
+
+static bool remove_preload_container_bounded(const std::string& name) {
+    for (unsigned attempt = 0u; attempt < 2u; attempt++) {
+        ChildGuard remover;
+        if (!spawn_child({"docker", "rm", "-f", name}, "/dev/null", remover.child)) return false;
+        if (!wait_child(remover.child, 10'000)) {
+            (void)stop_child(remover.child);
+            continue;
+        }
+        const bool removed = remover.child.status_valid && WIFEXITED(remover.child.status) &&
+                             WEXITSTATUS(remover.child.status) == 0;
+        remover.child.pid = -1;
+        if (removed) return true;
+    }
+    return false;
+}
+
+struct PreloadContainerGuard {
+    explicit PreloadContainerGuard(std::string name) : name(std::move(name)) {}
+    std::string name;
+    bool active = true;
+
+    bool remove() {
+        if (!active) return true;
+        const bool removed = remove_preload_container_bounded(name);
+        active = false;
+        return removed;
+    }
+
+    ~PreloadContainerGuard() {
+        if (active) (void)remove_preload_container_bounded(name);
+    }
+};
+
+static bool run_pinned_nginx_preload_loader(const std::string& preload_path,
+                                            const std::string& log_path,
+                                            bool expect_success,
+                                            std::string& error) {
+    struct stat preload_stat{};
+    if (preload_path.empty() || preload_path[0] != '/' ||
+        stat(preload_path.c_str(), &preload_stat) != 0 || !S_ISREG(preload_stat.st_mode) ||
+        access(preload_path.c_str(), R_OK) != 0) {
+        error = "#574 preload path must be an absolute readable regular file";
+        return false;
+    }
+    static std::atomic<unsigned> serial{0u};
+    const std::string container_name =
+        "rut-nginx-574-preflight-" + std::to_string(getpid()) + "-" +
+        std::to_string(serial.fetch_add(1u, std::memory_order_relaxed));
+    PreloadContainerGuard docker(container_name);
+    Child child;
+    if (!spawn_child({"docker",
+                      "run",
+                      "--pull=never",
+                      "--network",
+                      "none",
+                      "--name",
+                      container_name,
+                      "-v",
+                      preload_path + ":/rut-gate/preload.so:ro",
+                      "-e",
+                      "LD_PRELOAD=/rut-gate/preload.so",
+                      "--entrypoint",
+                      "/usr/sbin/nginx",
+                      kNginxImage,
+                      "-v"},
+                     log_path,
+                     child)) {
+        error = "#574 failed to start pinned-container preload loader";
+        return false;
+    }
+    if (!wait_child(child, 10'000)) {
+        (void)stop_child(child);
+        if (!docker.remove())
+            error = "#574 timed-out preload container could not be removed";
+        else
+            error = "#574 pinned-container preload loader timed out";
+        return false;
+    }
+    const bool exited_zero =
+        child.status_valid && WIFEXITED(child.status) && WEXITSTATUS(child.status) == 0;
+    const bool container_removed = docker.remove();
+    std::string output;
+    if (!read_bounded_file(log_path, output, error)) return false;
+    static constexpr char kExpectedVersion[] = "nginx version: nginx/1.29.7\n";
+    const bool expected_version = output == kExpectedVersion;
+    const bool specific_loader_warning = output.find("/rut-gate/preload.so") != std::string::npos &&
+                                         output.find("cannot be preloaded") != std::string::npos &&
+                                         output.find("ignored") != std::string::npos;
+    if (!container_removed) {
+        error = "#574 pinned-container preload loader removal failed";
+        return false;
+    }
+    if (expect_success) {
+        if (!exited_zero || !expected_version) {
+            error = "#574 valid preload failed pinned-container loader/version preflight";
+            return false;
+        }
+    } else if (!exited_zero || output.find("nginx version: nginx/1.29.7") == std::string::npos ||
+               !specific_loader_warning) {
+        error = "#574 invalid preload did not produce the expected bounded loader warning";
+        return false;
+    }
+    return true;
+}
+
+static bool run_pinned_nginx_preload_loader_preflight(const std::string& preload_path,
+                                                      const std::string& temporary_directory,
+                                                      std::string& error) {
+    const std::string valid_log = temporary_directory + "/preload-loader-valid.log";
+    if (!run_pinned_nginx_preload_loader(preload_path, valid_log, true, error)) return false;
+    const std::string invalid_path = temporary_directory + "/preload-loader-invalid.so";
+    static constexpr char kTruncatedElf[] =
+        "\x7f"
+        "ELF\x02\x01\x01\0";
+    if (!write_file(invalid_path, kTruncatedElf, sizeof(kTruncatedElf) - 1u)) {
+        error = "#574 could not create owned truncated-ELF preload fixture";
+        return false;
+    }
+    const std::string invalid_log = temporary_directory + "/preload-loader-invalid.log";
+    return run_pinned_nginx_preload_loader(invalid_path, invalid_log, false, error);
 }
 
 static bool allocate_port(u16& port) {
@@ -72336,6 +72498,8 @@ static bool run_pinned_positive_cl_head_default_buffering_oracle(
 }
 
 int main(int argc, char** argv) {
+    const bool nginx_preload_loader_preflight =
+        argc == 3 && strcmp(argv[1], "--nginx-preload-loader-preflight") == 0;
     const bool nginx_gate_spike = argc == 3 && strcmp(argv[1], "--nginx-gate-spike") == 0;
     const bool nginx_coalesced_ingress_gate =
         argc == 3 && strcmp(argv[1], "--nginx-coalesced-ingress-gate") == 0;
@@ -72706,16 +72870,17 @@ int main(int argc, char** argv) {
     const bool normal_differential =
         (argc == 2 && argv[1][0] == '/') ||
         (argc == 4 && argv[1][0] == '/' && argv[2][0] == '/' && argv[3][0] == '/');
-    if ((!nginx_gate_spike && !nginx_coalesced_ingress_gate && !exact_local_return_baseline &&
-         !root_proxy_trace_oracle && !api_proxy_trace_oracle && !exact_absolute_redirect_oracle &&
-         !exact_absolute_redirect_302_oracle && !api_non_root_proxy_uri_oracle &&
-         !service_root_proxy_uri_oracle && !wildcard_service_no_uri_oracle &&
-         !converter_wildcard_service_no_uri_differential && !static_query_proxy_uri_oracle &&
-         !zero_suffix_static_query_proxy_uri_oracle && !empty_query_proxy_uri_oracle &&
-         !root_empty_query_proxy_uri_oracle && !proxy_hide_header_oracle &&
-         !proxy_hide_header_source_self_check && !proxy_hide_header_generated_side_self_check &&
-         !explicit_timeout_head_source_self_check && !explicit_timeout_head_generated_episode &&
-         !explicit_timeout_head_phase_differential && !keepalive_timeout_head_differential &&
+    if ((!nginx_preload_loader_preflight && !nginx_gate_spike && !nginx_coalesced_ingress_gate &&
+         !exact_local_return_baseline && !root_proxy_trace_oracle && !api_proxy_trace_oracle &&
+         !exact_absolute_redirect_oracle && !exact_absolute_redirect_302_oracle &&
+         !api_non_root_proxy_uri_oracle && !service_root_proxy_uri_oracle &&
+         !wildcard_service_no_uri_oracle && !converter_wildcard_service_no_uri_differential &&
+         !static_query_proxy_uri_oracle && !zero_suffix_static_query_proxy_uri_oracle &&
+         !empty_query_proxy_uri_oracle && !root_empty_query_proxy_uri_oracle &&
+         !proxy_hide_header_oracle && !proxy_hide_header_source_self_check &&
+         !proxy_hide_header_generated_side_self_check && !explicit_timeout_head_source_self_check &&
+         !explicit_timeout_head_generated_episode && !explicit_timeout_head_phase_differential &&
+         !keepalive_timeout_head_differential &&
          !keepalive_timeout_get_initial_deadline_differential &&
          !fixed_upload_head_success_differential &&
          !fixed_upload_head_zero_response_timeout_differential &&
@@ -72816,6 +72981,7 @@ int main(int argc, char** argv) {
          !rut_iouring_gate_owner_death_negative && !rut_iouring_gate_connect_journal_negative &&
          !rut_iouring_coalesced_ingress_gate && !late_successor_differential &&
          !normal_differential) ||
+        (nginx_preload_loader_preflight && argv[2][0] != '/') ||
         (nginx_gate_spike && argv[2][0] != '/') ||
         (nginx_coalesced_ingress_gate && argv[2][0] != '/') ||
         (rut_initial_header_split_public && argv[2][0] != '/') ||
@@ -72911,6 +73077,8 @@ int main(int argc, char** argv) {
             << "usage: test_nginx_differential <absolute-rut-executable> "
                "<absolute-nginx-preload-helper> <absolute-rut-preload-helper>\n"
                "   or: test_nginx_differential --nginx-gate-spike "
+               "<absolute-preload-helper>\n"
+               "   or: test_nginx_differential --nginx-preload-loader-preflight "
                "<absolute-preload-helper>\n"
                "   or: test_nginx_differential --nginx-coalesced-ingress-gate "
                "<absolute-preload-helper>\n"
@@ -74244,6 +74412,43 @@ int main(int argc, char** argv) {
         std::cerr << "FAIL [preflight]: exact pinned nginx image inspection failed\n";
         dump_log(temp.preflight_log, "Docker preflight log");
         return 1;
+    }
+
+    const char* nginx_preload_path = nullptr;
+    if (nginx_gate_spike || nginx_coalesced_ingress_gate) {
+        nginx_preload_path = argv[2];
+    } else if (converter_coalesced_successor_differential || late_successor_differential) {
+        nginx_preload_path = argv[3];
+    } else if (normal_differential && argc == 4) {
+        nginx_preload_path = argv[2];
+    }
+    if (nginx_preload_loader_preflight) {
+        std::string loader_error;
+        if (!run_pinned_nginx_preload_loader_preflight(argv[2], temp.path, loader_error)) {
+            std::cerr << "FAIL [#574 pinned-container preload loader preflight]: " << loader_error
+                      << "\n";
+            dump_log(temp.path + std::string("/preload-loader-valid.log"),
+                     "#574 valid preload loader log");
+            dump_log(temp.path + std::string("/preload-loader-invalid.log"),
+                     "#574 invalid preload loader log");
+            return 1;
+        }
+        std::cerr << "PASS: #574 built nginx preload loaded in the pinned container and the "
+                     "owned truncated-ELF loader negative was rejected\n";
+        return 0;
+    }
+    if (nginx_preload_path != nullptr) {
+        std::string loader_error;
+        if (!run_pinned_nginx_preload_loader_preflight(
+                nginx_preload_path, temp.path, loader_error)) {
+            std::cerr << "FAIL [#574 pinned-container preload loader preflight]: " << loader_error
+                      << "\n";
+            dump_log(temp.path + std::string("/preload-loader-valid.log"),
+                     "#574 valid preload loader log");
+            dump_log(temp.path + std::string("/preload-loader-invalid.log"),
+                     "#574 invalid preload loader log");
+            return 1;
+        }
     }
 
     // This is a real host-network startup probe. Once daemon and image

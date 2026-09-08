@@ -853,6 +853,22 @@ if(RUT_ENABLE_JIT)
         ${CMAKE_CURRENT_SOURCE_DIR}
     )
     target_link_libraries(test_nginx_downstream_gate_preload PRIVATE dl)
+    if(CMAKE_SYSTEM_NAME STREQUAL "Linux" AND
+       CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|AMD64)$" AND
+       CMAKE_C_COMPILER_ID STREQUAL "GNU")
+        include(CheckCCompilerFlag)
+        check_c_compiler_flag("-mtls-dialect=gnu" RUT_NGINX_PRELOAD_TLS_GNU_SUPPORTED)
+        if(RUT_NGINX_PRELOAD_TLS_GNU_SUPPORTED)
+            target_compile_options(test_nginx_downstream_gate_preload PRIVATE
+                -mtls-dialect=gnu
+            )
+        else()
+            message(WARNING
+                "test_nginx_downstream_gate_preload: compiler does not support -mtls-dialect=gnu; "
+                "pinned-container loader compatibility cannot be guaranteed"
+            )
+        endif()
+    endif()
 
     if(CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|AMD64)$")
         add_library(test_rut_iouring_gate_preload SHARED rut_iouring_gate_preload.c)
@@ -1030,6 +1046,18 @@ if(RUT_ENABLE_JIT)
         RESOURCE_LOCK nginx-differential
         TIMEOUT 60
         SKIP_RETURN_CODE 77
+    )
+    add_test(
+        NAME test_nginx_downstream_gate_preload_loader_preflight
+        COMMAND test_nginx_differential --nginx-preload-loader-preflight
+                $<TARGET_FILE:test_nginx_downstream_gate_preload>
+    )
+    set_tests_properties(test_nginx_downstream_gate_preload_loader_preflight PROPERTIES
+        LABELS "integration;nginx;docker;negative"
+        RUN_SERIAL TRUE
+        RESOURCE_LOCK nginx-differential
+        TIMEOUT 60
+        ENVIRONMENT "RUT_NGINX_DIFFERENTIAL_REQUIRED=1"
     )
     add_test(
         NAME test_nginx_coalesced_ingress_gate
