@@ -1054,6 +1054,172 @@ TEST(nginx_complete_converter, authenticates_redirect_response_span_without_chil
     CHECK_EQ(rejected.error().span.col, expected_start + 1u);
 }
 
+TEST(nginx_http_profile_parser, models_borrowed_http_access_log_off_and_complete_envelope) {
+    const std::string suffix =
+        "# leading\n"
+        "http # wrapper\n"
+        "{\n"
+        "  # logging is intentionally disabled\n"
+        "  access_log off;\n"
+        "  server {\n"
+        "    listen 127.0.0.1:8080;\n"
+        "    location / { proxy_pass http://127.0.0.1:9000; }\n"
+        "  }\n"
+        "}\n"
+        "# trailing\n";
+    const auto parsed = nginx::parse_http_profile({suffix.data(), static_cast<u32>(suffix.size())});
+    REQUIRE(parsed);
+    const auto& profile = parsed.value();
+    const size_t off_pos = suffix.find("off");
+    const size_t access_pos = suffix.find("access_log");
+    REQUIRE(off_pos != std::string::npos);
+    REQUIRE(access_pos != std::string::npos);
+    CHECK(profile.log_format.profile == nginx::LogFormatProfile::None);
+    CHECK_EQ(profile.log_format.name.ptr, nullptr);
+    CHECK_EQ(profile.log_format.name.len, 0u);
+    CHECK_EQ(profile.log_format.name_span.start, 0u);
+    CHECK_EQ(profile.log_format.name_span.end, 0u);
+    CHECK_EQ(profile.log_format.name_span.line, 1u);
+    CHECK_EQ(profile.log_format.name_span.col, 1u);
+    CHECK_EQ(profile.log_format.value.ptr, nullptr);
+    CHECK_EQ(profile.log_format.value.len, 0u);
+    CHECK_EQ(profile.log_format.value_span.start, 0u);
+    CHECK_EQ(profile.log_format.value_span.end, 0u);
+    CHECK_EQ(profile.log_format.value_span.line, 1u);
+    CHECK_EQ(profile.log_format.value_span.col, 1u);
+    CHECK_EQ(profile.log_format.token_span.start, 0u);
+    CHECK_EQ(profile.log_format.token_span.end, 0u);
+    CHECK_EQ(profile.log_format.token_span.line, 1u);
+    CHECK_EQ(profile.log_format.token_span.col, 1u);
+    CHECK_EQ(profile.log_format.span.start, 0u);
+    CHECK_EQ(profile.log_format.span.end, 0u);
+    CHECK_EQ(profile.log_format.span.line, 1u);
+    CHECK_EQ(profile.log_format.span.col, 1u);
+    CHECK(profile.access_log.destination_profile == nginx::AccessLogDestinationProfile::Off);
+    CHECK(profile.access_log.path.eq(lit_str("off")));
+    CHECK_EQ(profile.access_log.path.ptr, suffix.data() + off_pos);
+    CHECK_EQ(profile.access_log.path_span.start, static_cast<u32>(off_pos));
+    CHECK_EQ(profile.access_log.path_span.end, static_cast<u32>(off_pos + 3u));
+    CHECK_EQ(profile.access_log.format_name.ptr, nullptr);
+    CHECK_EQ(profile.access_log.format_name.len, 0u);
+    CHECK_EQ(profile.access_log.format_name_span.start, 0u);
+    CHECK_EQ(profile.access_log.format_name_span.end, 0u);
+    CHECK_EQ(profile.access_log.format_name_span.line, 1u);
+    CHECK_EQ(profile.access_log.format_name_span.col, 1u);
+    CHECK_EQ(profile.access_log.span.start, static_cast<u32>(access_pos));
+    CHECK_EQ(profile.access_log.span.end, static_cast<u32>(suffix.find(';', access_pos) + 1u));
+    CHECK_EQ(profile.access_log.span.line, 5u);
+    CHECK_EQ(profile.access_log.span.col, 3u);
+
+    const std::string complete = "events { # empty\n}\n" + suffix;
+    const auto envelope =
+        nginx::parse_nginx_http_config({complete.data(), static_cast<u32>(complete.size())});
+    REQUIRE(envelope);
+    CHECK(envelope.value().http.access_log.destination_profile ==
+          nginx::AccessLogDestinationProfile::Off);
+    CHECK_EQ(envelope.value().http.access_log.path.ptr, complete.data() + complete.find("off"));
+    CHECK_EQ(envelope.value().http.source.ptr, complete.data() + envelope.value().http_span.start);
+}
+
+TEST(nginx_http_profile_parser, rejects_access_log_off_variants_and_mixtures) {
+    const std::string server =
+        "server { listen 127.0.0.1:8080; location / { proxy_pass http://127.0.0.1:9000; } }";
+    for (const char* access_literal :
+         {"access_log \"off\";", "access_log OFF;", "access_log $off;", "access_log off extra;"}) {
+        const std::string access = access_literal;
+        const std::string source = "http { " + access + " " + server + " }";
+        const auto rejected =
+            nginx::parse_http_profile({source.data(), static_cast<u32>(source.size())});
+        REQUIRE_FALSE(rejected);
+        CHECK(rejected.error().code == FrontendError::UnsupportedSyntax);
+        const std::string expected_token =
+            access == "access_log off extra;" ? "extra" : access.substr(strlen("access_log "));
+        const size_t token_start = source.find(expected_token);
+        REQUIRE(token_start != std::string::npos);
+        CHECK_EQ(rejected.error().span.start, static_cast<u32>(token_start));
+        if (access == "access_log off extra;")
+            CHECK_EQ(rejected.error().span.end,
+                     static_cast<u32>(token_start + expected_token.size()));
+    }
+    const std::vector<std::string> rejected_sources = {
+        "http { access_log off; access_log off; " + server + " }",
+        "http { log_format compat \"$request_length\"; access_log off; " + server + " }",
+        "http { access_log off; log_format compat \"$request_length\"; " + server + " }",
+        "http { access_log off; " + server + " access_log off; }",
+        "http { access_log off " + server + " }",
+        "http { access_log off; }",
+        "http { log_format compat \"$request_length\"; " + server + " }",
+        "http { access_log off; server { access_log off; listen 127.0.0.1:8080; "
+        "location / { proxy_pass http://127.0.0.1:9000; } } }",
+        "http { access_log off; server { listen 127.0.0.1:8080; location / { "
+        "access_log off; proxy_pass http://127.0.0.1:9000; } } }",
+    };
+    for (const std::string& source : rejected_sources) {
+        const auto rejected =
+            nginx::parse_http_profile({source.data(), static_cast<u32>(source.size())});
+        REQUIRE_FALSE(rejected);
+        CHECK(rejected.error().code == FrontendError::UnsupportedSyntax);
+    }
+
+    const std::string missing_semicolon = "http { access_log off";
+    const auto missing_semicolon_rejected = nginx::parse_http_profile(
+        {missing_semicolon.data(), static_cast<u32>(missing_semicolon.size())});
+    REQUIRE_FALSE(missing_semicolon_rejected);
+    CHECK(missing_semicolon_rejected.error().code == FrontendError::UnexpectedEof);
+
+    const std::string leading_path = "http { access_log /logs/access.log compat; " + server + " }";
+    const auto leading_path_rejected =
+        nginx::parse_http_profile({leading_path.data(), static_cast<u32>(leading_path.size())});
+    REQUIRE_FALSE(leading_path_rejected);
+    CHECK(leading_path_rejected.error().code == FrontendError::UnsupportedSyntax);
+    CHECK_EQ(leading_path_rejected.error().span.start,
+             static_cast<u32>(leading_path.find("access_log")));
+    CHECK(leading_path_rejected.error().detail.eq(
+        lit_str("expected one log_format before access_log")));
+
+    const std::string complete_bad = "events {} http { access_log \"off\"; " + server + " }";
+    const auto complete_rejected = nginx::parse_nginx_http_config(
+        {complete_bad.data(), static_cast<u32>(complete_bad.size())});
+    REQUIRE_FALSE(complete_rejected);
+    CHECK(complete_rejected.error().code == FrontendError::UnsupportedSyntax);
+    CHECK_EQ(complete_rejected.error().span.start, static_cast<u32>(complete_bad.find("\"off\"")));
+    CHECK_EQ(complete_rejected.error().span.line, 1u);
+
+    for (const std::string& source : {
+             "events {} http { access_log off extra; " + server + " }",
+             "events {} http { access_log off; log_format compat \"$request_length\"; " + server +
+                 " }",
+             "events {} http { access_log /logs/access.log compat; " + server + " }",
+         }) {
+        const auto rejected =
+            nginx::parse_nginx_http_config({source.data(), static_cast<u32>(source.size())});
+        REQUIRE_FALSE(rejected);
+        CHECK(rejected.error().code == FrontendError::UnsupportedSyntax);
+    }
+}
+
+TEST(nginx_converter, rejects_fresh_access_log_off_without_emitting_source) {
+    const std::string source =
+        "http { access_log off; server { listen 127.0.0.1:8080; location / { "
+        "proxy_pass http://127.0.0.1:9000; } } }";
+    const auto profile =
+        nginx::parse_http_profile({source.data(), static_cast<u32>(source.size())});
+    REQUIRE(profile);
+    CHECK(profile.value().access_log.destination_profile ==
+          nginx::AccessLogDestinationProfile::Off);
+    const auto lowered = nginx::lower_to_rut(profile.value());
+    REQUIRE_FALSE(lowered);
+
+    const std::string complete = "events {} " + source;
+    const auto config =
+        nginx::parse_nginx_http_config({complete.data(), static_cast<u32>(complete.size())});
+    REQUIRE(config);
+    CHECK(config.value().http.access_log.destination_profile ==
+          nginx::AccessLogDestinationProfile::Off);
+    const auto complete_lowered = nginx::lower_to_rut(config.value());
+    REQUIRE_FALSE(complete_lowered);
+}
+
 TEST(nginx_http_profile_parser,
      accepts_allowed_gaps_server_orders_and_retains_only_borrowed_lifetime_metadata) {
     const std::string listen_first =
