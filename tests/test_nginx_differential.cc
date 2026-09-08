@@ -51109,21 +51109,15 @@ static bool validate_retained_header_whitespace_oracle_config(const std::string&
     return true;
 }
 
-static bool read_monitored_access_file(const std::string& path,
-                                       std::string& contents,
-                                       std::string& error) {
+static bool read_monitored_access_fd(int fd, std::string& contents, std::string& error) {
     struct stat file_stat{};
-    if (stat(path.c_str(), &file_stat) != 0 || !S_ISREG(file_stat.st_mode)) {
+    if (fstat(fd, &file_stat) != 0) {
+        error = "#591 monitored access descriptor fstat failed errno=" + std::to_string(errno) +
+                " " + strerror(errno);
+        return false;
+    }
+    if (!S_ISREG(file_stat.st_mode)) {
         error = "#591 monitored access path is missing or non-regular";
-        return false;
-    }
-    if ((file_stat.st_mode & (S_IRUSR | S_IRGRP | S_IROTH)) == 0) {
-        error = "#591 monitored access file is not readable";
-        return false;
-    }
-    const int fd = open(path.c_str(), O_RDONLY);
-    if (fd < 0) {
-        error = "#591 monitored access file could not be opened";
         return false;
     }
     contents.clear();
@@ -51133,7 +51127,6 @@ static bool read_monitored_access_file(const std::string& path,
         if (count > 0) {
             contents.append(buffer, static_cast<size_t>(count));
             if (contents.size() > 8192u) {
-                close(fd);
                 error = "#591 monitored access file exceeded bounded size";
                 return false;
             }
@@ -51141,17 +51134,31 @@ static bool read_monitored_access_file(const std::string& path,
         }
         if (count < 0 && errno == EINTR) continue;
         if (count < 0) {
-            close(fd);
-            error = "#591 monitored access file read failed";
+            error = "#591 monitored access file read failed errno=" + std::to_string(errno) + " " +
+                    strerror(errno);
             return false;
         }
         break;
     }
-    if (close(fd) != 0) {
-        error = "#591 monitored access file close failed";
+    return true;
+}
+
+static bool read_monitored_access_file(const std::string& path,
+                                       std::string& contents,
+                                       std::string& error) {
+    const int fd = open(path.c_str(), O_RDONLY | O_CLOEXEC | O_NONBLOCK);
+    if (fd < 0) {
+        error = "#591 monitored access file could not be opened errno=" + std::to_string(errno) +
+                " " + strerror(errno);
         return false;
     }
-    return true;
+    const bool read_ok = read_monitored_access_fd(fd, contents, error);
+    if (close(fd) != 0) {
+        error = "#591 monitored access file close failed errno=" + std::to_string(errno) + " " +
+                strerror(errno);
+        return false;
+    }
+    return read_ok;
 }
 
 static bool validate_default_access_record(const std::string& contents, std::string& error) {
@@ -75893,31 +75900,34 @@ int main(int argc, char** argv) {
         const auto off_absent = [](const std::string& contents) { return contents.empty(); };
         std::string negative_error;
         std::string negative_contents;
-        const std::string missing_monitor = off_temp.path + "/missing-access.log";
-        const std::string fifo_monitor = off_temp.path + "/fifo-access.log";
-        const std::string unreadable_monitor = off_temp.path + "/unreadable-access.log";
+        const std::string missing_monitor = std::string(off_temp.path) + "/missing-access.log";
+        const std::string fifo_monitor = std::string(off_temp.path) + "/fifo-access.log";
+        const std::string write_only_monitor =
+            std::string(off_temp.path) + "/write-only-access.log";
         const bool missing_rejected =
             !read_monitored_access_file(missing_monitor, negative_contents, negative_error);
         const bool directory_rejected =
             !read_monitored_access_file(off_temp.path, negative_contents, negative_error);
-        const bool unreadable_file_created = write_file(unreadable_monitor, "x", 1u);
-        const bool unreadable_mode_set =
-            unreadable_file_created && chmod(unreadable_monitor.c_str(), 0000) == 0;
-        const bool unreadable_rejected =
-            unreadable_mode_set &&
-            !read_monitored_access_file(unreadable_monitor, negative_contents, negative_error);
+        const bool write_only_file_created = write_file(write_only_monitor, "x", 1u);
+        const int write_only_fd =
+            write_only_file_created ? open(write_only_monitor.c_str(), O_WRONLY | O_CLOEXEC) : -1;
+        const bool write_only_rejected =
+            write_only_fd >= 0 &&
+            !read_monitored_access_fd(write_only_fd, negative_contents, negative_error);
+        const bool write_only_closed = write_only_fd < 0 || close(write_only_fd) == 0;
         const bool fifo_created = mkfifo(fifo_monitor.c_str(), 0600) == 0;
         const bool fifo_rejected =
             fifo_created &&
             !read_monitored_access_file(fifo_monitor, negative_contents, negative_error);
         if (fifo_created) unlink(fifo_monitor.c_str());
-        if (unreadable_file_created) unlink(unreadable_monitor.c_str());
+        if (write_only_file_created) unlink(write_only_monitor.c_str());
         if (off_at == std::string::npos ||
             off_config.substr(0u, off_at) +
                     off_config.substr(off_at + expected_off_removed.size()) !=
                 positive_temp.retained_config_snapshot ||
             !off_absent(off_observation.access) || off_absent(positive_observation.access) ||
-            !missing_rejected || !directory_rejected || !unreadable_rejected || !fifo_rejected ||
+            !missing_rejected || !directory_rejected || !write_only_rejected ||
+            !write_only_closed || !fifo_rejected ||
             !validate_default_access_record(positive_observation.access, oracle_error)) {
             std::cerr << "FAIL [#591 Off/default access oracle]: phase/config comparison failed\n";
             return 1;
