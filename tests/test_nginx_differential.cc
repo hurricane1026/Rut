@@ -52004,7 +52004,8 @@ static bool validate_converter_request_length_source(const std::string& source,
                                                      u16 frontend_port,
                                                      u16 backend_port,
                                                      const std::string& access_path,
-                                                     std::string& error) {
+                                                     std::string& error,
+                                                     bool require_access_log = true) {
     const std::string declaration = "accessLog { path: \"" + access_path +
                                     "\", format: downstreamRequestBytes, publication: live }\n";
     const std::string listener = "listen 127.0.0.1:" + std::to_string(frontend_port) + "\n";
@@ -52028,9 +52029,11 @@ static bool validate_converter_request_length_source(const std::string& source,
         "            retained_header_value: \"trim_sp_preserve_htab\"\n"
         "        },\n";
     if (frontend_port == 0u || backend_port < 1024u || backend_port > 9999u ||
-        frontend_port == backend_port || access_path.empty() ||
-        source.rfind(declaration, 0u) != 0u || count_text(source, "accessLog {") != 1u ||
-        count_text(source, declaration) != 1u || count_text(source, access_path) != 1u ||
+        frontend_port == backend_port || (require_access_log && access_path.empty()) ||
+        (require_access_log && source.rfind(declaration, 0u) != 0u) ||
+        (require_access_log && count_text(source, "accessLog {") != 1u) ||
+        (require_access_log && count_text(source, declaration) != 1u) ||
+        (require_access_log && count_text(source, access_path) != 1u) ||
         count_text(source, listener) != 1u || count_text(source, upstream) != 1u ||
         count_text(source, "route GET \"/\"") != 1u ||
         count_text(source, kFixedRequestPolicy) != 3u ||
@@ -52040,8 +52043,8 @@ static bool validate_converter_request_length_source(const std::string& source,
         count_text(source, "        response_read_timeout: 60s,\n") != 2u ||
         count_text(source, "        response_buffering: \"complete_content_length\"\n") != 2u ||
         count_text(source, "        timeout_failure_policy: {\n") != 2u ||
-        count_text(source, "format: downstreamRequestBytes") != 1u ||
-        count_text(source, "publication: live") != 1u ||
+        (require_access_log && count_text(source, "format: downstreamRequestBytes") != 1u) ||
+        (require_access_log && count_text(source, "publication: live") != 1u) ||
         source.find("$request_length") != std::string::npos ||
         source.find("log_format") != std::string::npos ||
         source.find("access_log") != std::string::npos ||
@@ -52051,7 +52054,8 @@ static bool validate_converter_request_length_source(const std::string& source,
         return false;
     }
     if (!validate_exact_loopback_conditional_get_structure(source, error, "#362") ||
-        !run_exact_loopback_conditional_get_mutation_self_checks(source, error, "#362"))
+        (require_access_log &&
+         !run_exact_loopback_conditional_get_mutation_self_checks(source, error, "#362")))
         return false;
     return true;
 }
@@ -52132,18 +52136,60 @@ static bool validate_converter_retained_off_source(const std::string& source,
                                                    u16 frontend_port,
                                                    u16 backend_port,
                                                    std::string& error) {
-    if (!validate_exact_loopback_conditional_get_structure(source, error, "#591") ||
-        source.find("accessLog") != std::string::npos ||
-        source.find("access_log") != std::string::npos ||
-        source.find("--access-log") != std::string::npos) {
-        if (error.empty()) error = "#591 generated Off RUT contained an access sink";
+    if (!validate_converter_request_length_source(
+            source, frontend_port, backend_port, std::string{}, error, false)) {
+        if (error.empty()) error = "#591 generated Off RUT inventory was not exact";
         return false;
     }
-    const std::string listener = "listen 127.0.0.1:" + std::to_string(frontend_port);
-    const std::string upstream = "127.0.0.1:" + std::to_string(backend_port);
-    if (source.find(listener) == std::string::npos || source.find(upstream) == std::string::npos) {
-        error = "#591 generated Off RUT lost the authenticated loopback endpoints";
+    const auto lexed = rut::lex({source.data(), static_cast<u32>(source.size())});
+    if (!lexed) {
+        error = "#591 generated Off RUT could not be lexed for sink authentication";
         return false;
+    }
+    const auto parsed = rut::parse_file(lexed.value());
+    if (!parsed) {
+        error = "#591 generated Off RUT could not be parsed for sink authentication";
+        return false;
+    }
+    std::unique_ptr<rut::AstFile> ast(parsed.value());
+    for (u32 index = 0u; index < ast->items.len; index++) {
+        if (ast->items[index].kind == rut::AstItemKind::AccessLog) {
+            error = "#591 generated Off RUT parsed an access-log sink";
+            return false;
+        }
+    }
+    return true;
+}
+
+static bool run_converter_retained_off_source_self_checks(const std::string& source,
+                                                           u16 frontend_port,
+                                                           u16 backend_port,
+                                                           std::string& error) {
+    const auto replace_once = [&](const std::string& from, const std::string& to) {
+        std::string changed = source;
+        const size_t at = changed.find(from);
+        if (at == std::string::npos || changed.find(from, at + from.size()) != std::string::npos)
+            return std::string{};
+        changed.replace(at, from.size(), to);
+        return changed;
+    };
+    const std::string listener = "listen 127.0.0.1:" + std::to_string(frontend_port);
+    const std::string upstream = "upstream nginx_upstream at \"127.0.0.1:" +
+                                 std::to_string(backend_port) + "\"";
+    const std::vector<std::string> mutations = {
+        replace_once(listener, "listen 127.0.0.1:" + std::to_string(frontend_port + 1u)),
+        replace_once(upstream, "upstream nginx_upstream at \"127.0.0.1:" +
+                                  std::to_string(backend_port + 1u) + "\""),
+        source + "\naccessLog { path: \"/tmp/forbidden\", format: downstreamRequestBytes, "
+                "publication: live }\n",
+    };
+    for (const std::string& mutation : mutations) {
+        std::string detail;
+        if (mutation.empty() ||
+            validate_converter_retained_off_source(mutation, frontend_port, backend_port, detail)) {
+            error = "#591 Off source self-check accepted an endpoint or sink mutation";
+            return false;
+        }
     }
     return true;
 }
@@ -52262,6 +52308,21 @@ static bool run_converter_request_length_rut_side(TempDir& temp,
               : validate_converter_request_length_source(
                     persisted, frontend_port, backend_port, temp.rut_access_log, error)))
         return false;
+    if (access_log_off) {
+        rut::LoadedProgram loaded;
+        rut::LoadError load_error;
+        if (!rut::load_rut_program(
+                temp.source.c_str(), loaded, load_error, rut::jit::OptLevel::O2) ||
+            loaded.access_log.present) {
+            loaded.destroy();
+            error = "#591 loaded Off RUT unexpectedly exposed an access-log sink";
+            return false;
+        }
+        loaded.destroy();
+        if (!run_converter_retained_off_source_self_checks(
+                persisted, frontend_port, backend_port, error))
+            return false;
+    }
     persisted.clear();
     persisted.shrink_to_fit();
 
@@ -52817,9 +52878,41 @@ static bool run_converter_retained_access_log_off_four_phase(const char* rut_pat
                                                true,
                                                true))
         return false;
-    if (off_rut.access != "" || off_rut.response != off_nginx.response ||
-        off_rut.upstream != off_nginx.upstream) {
+    const auto off_observations_equal = [&](const RetainedHeaderObservation& left,
+                                            const RetainedHeaderObservation& right) {
+        std::string compare_error;
+        return left.frontend_port == right.frontend_port &&
+               left.backend_port == right.backend_port && left.config == right.config &&
+               compare_retained_header_observations(left, right, compare_error, true);
+    };
+    if (off_rut.access != "" || !off_observations_equal(off_nginx, off_rut)) {
         error = "#591 generated Off RUT did not match nginx wire evidence or absence";
+        return false;
+    }
+    if (default_nginx.frontend_port != off_nginx.frontend_port ||
+        default_nginx.backend_port != off_nginx.backend_port ||
+        default_nginx.response != off_nginx.response ||
+        default_nginx.upstream != off_nginx.upstream) {
+        error = "#591 nginx Off/default phases did not retain exact ports and wire evidence";
+        return false;
+    }
+    RetainedHeaderObservation changed = off_nginx;
+    changed.response[0] ^= 1;
+    std::string changed_error;
+    if (compare_retained_header_observations(changed, off_rut, changed_error, true)) {
+        error = "#591 Off observation self-check accepted a response mutation";
+        return false;
+    }
+    changed = off_nginx;
+    changed.upstream[0] ^= 1;
+    if (compare_retained_header_observations(changed, off_rut, changed_error, true)) {
+        error = "#591 Off observation self-check accepted an upstream mutation";
+        return false;
+    }
+    changed = off_nginx;
+    changed.frontend_port = static_cast<u16>(changed.frontend_port + 1u);
+    if (off_observations_equal(changed, off_rut)) {
+        error = "#591 Off observation self-check accepted a frontend-port mutation";
         return false;
     }
 
@@ -52841,8 +52934,9 @@ static bool run_converter_retained_access_log_off_four_phase(const char* rut_pat
                                                &logged_rut,
                                                error))
         return false;
-    if (logged_rut.access != "105\n" || logged_rut.response != off_nginx.response ||
-        logged_rut.upstream != off_nginx.upstream) {
+    if (logged_rut.access != "105\n" || logged_rut.frontend_port != off_nginx.frontend_port ||
+        logged_rut.backend_port != off_nginx.backend_port ||
+        logged_rut.response != off_nginx.response || logged_rut.upstream != off_nginx.upstream) {
         error = "#591 logged RUT positive control did not match the retained wire";
         return false;
     }
