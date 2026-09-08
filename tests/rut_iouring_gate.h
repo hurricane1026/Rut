@@ -155,6 +155,11 @@ struct rut_iouring_gate {
     unsigned char witness_wire[RUT_DOWNSTREAM_GATE_REQUEST_CAPACITY];
 };
 
+static inline int rut_iouring_gate_abi_valid(const struct rut_iouring_gate* gate) {
+    return gate != 0 && gate->magic == RUT_IOURING_GATE_MAGIC &&
+           gate->version == RUT_IOURING_GATE_VERSION && gate->layout_size == sizeof(*gate);
+}
+
 static inline int rut_iouring_gate_publish_recv_owner_failure_locked(
     struct rut_iouring_gate* gate, const struct rut_iouring_gate_recv_owner_failure* candidate) {
     uint32_t expected_error = RUT_IOURING_GATE_ERROR_NONE;
@@ -259,7 +264,7 @@ static inline int rut_iouring_gate_wait_until(struct rut_iouring_gate* gate,
 }
 
 #if defined(__cplusplus) && defined(__x86_64__)
-static_assert(sizeof(struct rut_iouring_gate) == 1448);
+static_assert(sizeof(struct rut_iouring_gate) == 1456);
 #elif defined(__x86_64__)
-_Static_assert(sizeof(struct rut_iouring_gate) == 1448, "RUT io_uring gate layout drift");
+_Static_assert(sizeof(struct rut_iouring_gate) == 1456, "RUT io_uring gate layout drift");
 #endif

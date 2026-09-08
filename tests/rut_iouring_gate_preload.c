@@ -197,8 +197,7 @@ static long libc_result(long result) {
 }
 
 static int protocol_valid(void) {
-    return gate != 0 && gate->magic == RUT_IOURING_GATE_MAGIC &&
-           gate->version == RUT_IOURING_GATE_VERSION && gate->layout_size == sizeof(*gate) &&
+    return rut_iouring_gate_abi_valid(gate) &&
            rut_downstream_gate_load(&gate->identity_mutex_initialized) == 1;
 }
 
