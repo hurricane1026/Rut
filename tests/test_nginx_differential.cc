@@ -33044,7 +33044,7 @@ static StaticQueryProxyOracleObservation make_static_query_proxy_self_check(
     if (profile.proxy_hide_header_profile) {
         value.original_config =
             make_static_query_proxy_fragment(frontend_port, backend_port, listen_first, profile);
-        value.source_poison = "destroyed-after-373-nginx-load\n";
+        value.source_poison = "destroyed-after-" + std::string(profile.scope_id) + "-nginx-load\n";
         value.source_poisoned = true;
         value.origin_peer_close_count = 1u;
         value.origin_response_sent_ns = 10u;
