@@ -1124,8 +1124,9 @@ TEST(nginx_http_profile_parser, models_borrowed_http_access_log_off_and_complete
 TEST(nginx_http_profile_parser, rejects_access_log_off_variants_and_mixtures) {
     const std::string server =
         "server { listen 127.0.0.1:8080; location / { proxy_pass http://127.0.0.1:9000; } }";
-    for (const std::string& access :
+    for (const char* access_literal :
          {"access_log \"off\";", "access_log OFF;", "access_log $off;", "access_log off extra;"}) {
+        const std::string access = access_literal;
         const std::string source = "http { " + access + " " + server + " }";
         const auto rejected =
             nginx::parse_http_profile({source.data(), static_cast<u32>(source.size())});
@@ -1140,19 +1141,20 @@ TEST(nginx_http_profile_parser, rejects_access_log_off_variants_and_mixtures) {
             CHECK_EQ(rejected.error().span.end,
                      static_cast<u32>(token_start + expected_token.size()));
     }
-    for (const std::string& source : {
-             "http { access_log off; access_log off; " + server + " }",
-             "http { log_format compat \"$request_length\"; access_log off; " + server + " }",
-             "http { access_log off; log_format compat \"$request_length\"; " + server + " }",
-             "http { access_log off; " + server + " access_log off; }",
-             "http { access_log off " + server + " }",
-             "http { access_log off; }",
-             "http { log_format compat \"$request_length\"; " + server + " }",
-             "http { access_log off; server { access_log off; listen 127.0.0.1:8080; "
-             "location / { proxy_pass http://127.0.0.1:9000; } } }",
-             "http { access_log off; server { listen 127.0.0.1:8080; location / { "
-             "access_log off; proxy_pass http://127.0.0.1:9000; } } }",
-         }) {
+    const std::vector<std::string> rejected_sources = {
+        "http { access_log off; access_log off; " + server + " }",
+        "http { log_format compat \"$request_length\"; access_log off; " + server + " }",
+        "http { access_log off; log_format compat \"$request_length\"; " + server + " }",
+        "http { access_log off; " + server + " access_log off; }",
+        "http { access_log off " + server + " }",
+        "http { access_log off; }",
+        "http { log_format compat \"$request_length\"; " + server + " }",
+        "http { access_log off; server { access_log off; listen 127.0.0.1:8080; "
+        "location / { proxy_pass http://127.0.0.1:9000; } } }",
+        "http { access_log off; server { listen 127.0.0.1:8080; location / { "
+        "access_log off; proxy_pass http://127.0.0.1:9000; } } }",
+    };
+    for (const std::string& source : rejected_sources) {
         const auto rejected =
             nginx::parse_http_profile({source.data(), static_cast<u32>(source.size())});
         REQUIRE_FALSE(rejected);
