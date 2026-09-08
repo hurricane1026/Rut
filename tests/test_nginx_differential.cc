@@ -52152,11 +52152,37 @@ static bool validate_converter_retained_off_source(const std::string& source,
         return false;
     }
     std::unique_ptr<rut::AstFile> ast(parsed.value());
+    u32 listener_count = 0u;
+    u32 upstream_count = 0u;
+    const std::string expected_host = "127.0.0.1:" + std::to_string(backend_port);
     for (u32 index = 0u; index < ast->items.len; index++) {
-        if (ast->items[index].kind == rut::AstItemKind::AccessLog) {
+        const rut::AstItem& item = ast->items[index];
+        if (item.kind == rut::AstItemKind::AccessLog) {
             error = "#591 generated Off RUT parsed an access-log sink";
             return false;
         }
+        if (item.kind == rut::AstItemKind::Listen) {
+            listener_count++;
+            if (item.listen.address != rut::ListenerAddress::IPv4Exact ||
+                item.listen.ipv4_host != 0x7f000001u || item.listen.port != frontend_port) {
+                error = "#591 generated Off RUT parsed an alternate listener";
+                return false;
+            }
+        } else if (item.kind == rut::AstItemKind::Upstream) {
+            upstream_count++;
+            if (!item.upstream.name.eq({"nginx_upstream", 14u}) ||
+                !item.upstream.has_address || item.upstream.port_is_set ||
+                item.upstream.backend_count != 0u ||
+                !item.upstream.host_lit.eq({expected_host.data(),
+                                             static_cast<u32>(expected_host.size())})) {
+                error = "#591 generated Off RUT parsed an alternate upstream";
+                return false;
+            }
+        }
+    }
+    if (listener_count != 1u || upstream_count != 1u) {
+        error = "#591 generated Off RUT did not contain exactly one listener and upstream";
+        return false;
     }
     return true;
 }
@@ -52176,10 +52202,16 @@ static bool run_converter_retained_off_source_self_checks(const std::string& sou
     const std::string listener = "listen 127.0.0.1:" + std::to_string(frontend_port);
     const std::string upstream = "upstream nginx_upstream at \"127.0.0.1:" +
                                  std::to_string(backend_port) + "\"";
+    const std::string duplicate_listener =
+        "listen 127.0.0.1:" + std::to_string(frontend_port) + "\n";
+    const std::string duplicate_upstream =
+        "upstream nginx_upstream at \"127.0.0.1:" + std::to_string(backend_port) + "\"\n";
     const std::vector<std::string> mutations = {
         replace_once(listener, "listen 127.0.0.1:" + std::to_string(frontend_port + 1u)),
         replace_once(upstream, "upstream nginx_upstream at \"127.0.0.1:" +
                                   std::to_string(backend_port + 1u) + "\""),
+        source + duplicate_listener,
+        source + duplicate_upstream,
         source + "\naccessLog { path: \"/tmp/forbidden\", format: downstreamRequestBytes, "
                 "publication: live }\n",
     };
@@ -52309,16 +52341,23 @@ static bool run_converter_request_length_rut_side(TempDir& temp,
                     persisted, frontend_port, backend_port, temp.rut_access_log, error)))
         return false;
     if (access_log_off) {
-        rut::LoadedProgram loaded;
+        struct LoadedProgramGuard {
+            std::unique_ptr<rut::LoadedProgram> value = std::make_unique<rut::LoadedProgram>();
+            ~LoadedProgramGuard() {
+                if (value != nullptr) value->destroy();
+            }
+        } loaded;
         rut::LoadError load_error;
         if (!rut::load_rut_program(
-                temp.source.c_str(), loaded, load_error, rut::jit::OptLevel::O2) ||
-            loaded.access_log.present) {
-            loaded.destroy();
+                temp.source.c_str(),
+                *loaded.value,
+                load_error,
+                rut::jit::OptLevel::O2,
+                static_cast<u64>(persisted.size())) ||
+            loaded.value->access_log.present) {
             error = "#591 loaded Off RUT unexpectedly exposed an access-log sink";
             return false;
         }
-        loaded.destroy();
         if (!run_converter_retained_off_source_self_checks(
                 persisted, frontend_port, backend_port, error))
             return false;
