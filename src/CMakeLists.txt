@@ -201,6 +201,12 @@ target_include_directories(rut_nginx PUBLIC
     ${PROJECT_SOURCE_DIR}/include
 )
 
+# Standalone bounded nginx-to-RUT conversion command. This deliberately links
+# only the nginx frontend so it cannot execute generated programs or open any
+# configured runtime resources.
+add_executable(rut-nginx-convert nginx/main.cc)
+target_link_libraries(rut-nginx-convert rut_nginx)
+
 # SIMD source needs to find simd.h and char_tables.h via "simd.h" include
 target_include_directories(rut_runtime PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}

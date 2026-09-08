@@ -1037,6 +1037,7 @@ struct TempDir {
             unlink(nginx_log.c_str());
             unlink(nginx_access_log.c_str());
             unlink(rut_log.c_str());
+            unlink((rut_log + ".converter").c_str());
             unlink(rut_access_log.c_str());
             unlink(preflight_log.c_str());
             unlink(gate_control.c_str());
@@ -51524,7 +51525,8 @@ static bool run_converter_request_length_rut_side(TempDir& temp,
                                                   bool split_header_delivery,
                                                   bool retained_header_whitespace,
                                                   RetainedHeaderObservation* observation,
-                                                  std::string& error) {
+                                                  std::string& error,
+                                                  const char* converter_path = nullptr) {
     const bool require_peer_retirement = split_header_delivery || retained_header_whitespace;
     if (rut_path == nullptr || rut_path[0] != '/' || access(rut_path, X_OK) != 0) {
         error = "#362 converter differential requires an executable absolute RUT path";
@@ -51540,9 +51542,48 @@ static bool run_converter_request_length_rut_side(TempDir& temp,
     }
 
     std::string generated;
-    if (!build_owned_converter_request_length_source(
-            frontend_port, backend_port, temp.rut_access_log, generated, error) ||
-        !write_file(temp.source, generated.data(), generated.size())) {
+    if (converter_path != nullptr) {
+        const std::string profile =
+            make_converter_request_length_profile(frontend_port, backend_port, temp.rut_access_log);
+        if (!write_file(temp.nginx_config, profile.data(), profile.size())) {
+            error = "#577 could not persist CLI converter input";
+            return false;
+        }
+        const std::string converter_error = temp.rut_log + ".converter";
+        const int output_fd = open(temp.source.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0600);
+        const int error_fd = open(converter_error.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0600);
+        if (output_fd < 0 || error_fd < 0) {
+            if (output_fd >= 0) close(output_fd);
+            if (error_fd >= 0) close(error_fd);
+            error = "#577 could not open CLI converter output files";
+            return false;
+        }
+        const pid_t child = fork();
+        if (child == 0) {
+            dup2(output_fd, STDOUT_FILENO);
+            dup2(error_fd, STDERR_FILENO);
+            close(output_fd);
+            close(error_fd);
+            execl(converter_path,
+                  converter_path,
+                  "--format",
+                  "http",
+                  temp.nginx_config.c_str(),
+                  nullptr);
+            _exit(127);
+        }
+        close(output_fd);
+        close(error_fd);
+        int status = 0;
+        if (child < 0 || waitpid(child, &status, 0) != child || !WIFEXITED(status) ||
+            WEXITSTATUS(status) != 0 ||
+            !read_exact_return204_log(temp.source, "#577 CLI generated source", generated, error)) {
+            error = "#577 standalone converter failed or produced no source";
+            return false;
+        }
+    } else if (!build_owned_converter_request_length_source(
+                   frontend_port, backend_port, temp.rut_access_log, generated, error) ||
+               !write_file(temp.source, generated.data(), generated.size())) {
         if (error.empty()) error = "#362 could not persist converter-generated ordinary RUT";
         return false;
     }
@@ -51940,10 +51981,12 @@ static bool run_converter_request_length_split_header_differential(
                                                  error);
 }
 
-static bool run_converter_retained_header_whitespace_differential(TempDir& temp,
-                                                                  const std::string& container_name,
-                                                                  const char* rut_path,
-                                                                  std::string& error) {
+static bool run_converter_retained_header_whitespace_differential(
+    TempDir& temp,
+    const std::string& container_name,
+    const char* rut_path,
+    std::string& error,
+    const char* converter_path = nullptr) {
     HeldLoopbackPorts rut_reservations;
     u16 rut_frontend_port = 0u;
     u16 rut_backend_port = 0u;
@@ -51967,7 +52010,8 @@ static bool run_converter_retained_header_whitespace_differential(TempDir& temp,
                                                false,
                                                true,
                                                &generated_observation,
-                                               error))
+                                               error,
+                                               converter_path))
         return false;
     if (!compare_retained_header_observations(nginx_observation, generated_observation, error))
         return false;
@@ -72492,7 +72536,8 @@ int main(int argc, char** argv) {
     const bool converter_request_length_split_header_differential =
         argc == 3 && strcmp(argv[1], "--converter-request-length-split-header-differential") == 0;
     const bool converter_retained_header_whitespace_differential =
-        argc == 3 && strcmp(argv[1], "--converter-retained-header-whitespace-differential") == 0;
+        (argc == 3 || argc == 4) &&
+        strcmp(argv[1], "--converter-retained-header-whitespace-differential") == 0;
     const bool converter_request_length_fixed_body_differential =
         argc == 3 && strcmp(argv[1], "--converter-request-length-fixed-body-differential") == 0;
     const bool converter_request_length_split_fixed_body_differential =
@@ -72801,7 +72846,8 @@ int main(int argc, char** argv) {
          argv[2][0] != '/') ||
         (converter_request_length_differential && argv[2][0] != '/') ||
         (converter_request_length_split_header_differential && argv[2][0] != '/') ||
-        (converter_retained_header_whitespace_differential && argv[2][0] != '/') ||
+        (converter_retained_header_whitespace_differential &&
+         (argv[2][0] != '/' || (argc == 4 && argv[3][0] != '/'))) ||
         (converter_request_length_fixed_body_differential && argv[2][0] != '/') ||
         (converter_request_length_split_fixed_body_differential && argv[2][0] != '/') ||
         (strict_local_response_differential && argv[2][0] != '/') ||
@@ -75290,7 +75336,7 @@ int main(int argc, char** argv) {
                                            std::to_string(getpid()) + "-" + source_suffix;
         std::string differential_error;
         if (!run_converter_retained_header_whitespace_differential(
-                temp, container_name, argv[2], differential_error)) {
+                temp, container_name, argv[2], differential_error, argc == 4 ? argv[3] : nullptr)) {
             std::cerr << "FAIL [#252 converter retained-header whitespace differential]: "
                       << differential_error << "\n";
             dump_log(temp.nginx_config, "#252 pinned nginx config");
