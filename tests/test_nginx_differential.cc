@@ -24702,6 +24702,397 @@ struct RutIoUringGateProcessMapping {
     RutIoUringGateProcessMapping() { mapping.child = &child_guard.child; }
 };
 
+static const char* recv_owner_reason_name(uint32_t reason) {
+    switch (reason) {
+        case RUT_IOURING_GATE_RECV_OWNER_REASON_RECV_SHAPE:
+            return "RECV_SHAPE";
+        case RUT_IOURING_GATE_RECV_OWNER_REASON_RECV_ID_CHANGED:
+            return "RECV_ID_CHANGED";
+        case RUT_IOURING_GATE_RECV_OWNER_REASON_RECV_MISSING_AT_SEND:
+            return "RECV_MISSING_AT_SEND";
+        case RUT_IOURING_GATE_RECV_OWNER_REASON_SEND_OWNER_MISMATCH:
+            return "SEND_OWNER_MISMATCH";
+        case RUT_IOURING_GATE_RECV_OWNER_REASON_INGRESS_CONTRACT:
+            return "INGRESS_CONTRACT";
+        default:
+            return "UNKNOWN";
+    }
+}
+
+static void append_recv_owner_failure_evidence(rut_iouring_gate& gate, std::string& evidence) {
+    if (!rut_iouring_gate_lock_identity(&gate, 2000)) return;
+    rut_iouring_gate_recv_owner_failure failure{};
+    if (rut_downstream_gate_load(&gate.state) != RUT_DOWNSTREAM_GATE_FAILED ||
+        rut_downstream_gate_load(&gate.error_code) != RUT_IOURING_GATE_ERROR_RECV_OWNER ||
+        __atomic_load_n(&gate.recv_owner_failure.valid, __ATOMIC_ACQUIRE) != 1u) {
+        rut_iouring_gate_unlock_identity(&gate);
+        return;
+    }
+    memcpy(&failure, &gate.recv_owner_failure, sizeof(failure));
+    rut_iouring_gate_unlock_identity(&gate);
+    evidence +=
+        " recv_owner_failure reason=" + std::string(recv_owner_reason_name(failure.reason)) +
+        " ring_fd=" + std::to_string(failure.ring_fd) +
+        " peer_ipv4_be=" + std::to_string(failure.peer_ipv4_be) +
+        " peer_port_be=" + std::to_string(failure.peer_port_be) +
+        " state=" + std::to_string(failure.state) + " mode=" + std::to_string(failure.mode) +
+        " peer_fd=" + std::to_string(failure.peer_fd) +
+        " captured_recv_user_data=" + std::to_string(failure.captured_recv_user_data) +
+        " current_sqe_user_data=" + std::to_string(failure.current_sqe_user_data) +
+        " current_sqe_opcode=" + std::to_string(failure.current_sqe_opcode) +
+        " current_sqe_flags=" + std::to_string(failure.current_sqe_flags) +
+        " current_sqe_ioprio=" + std::to_string(failure.current_sqe_ioprio) +
+        " current_sqe_buf_group=" + std::to_string(failure.current_sqe_buf_group) +
+        " current_sqe_len=" + std::to_string(failure.current_sqe_len) +
+        " current_sqe_fd=" + std::to_string(failure.current_sqe_fd) +
+        " sq_head=" + std::to_string(failure.sq_head) +
+        " sq_tail=" + std::to_string(failure.sq_tail) +
+        " sq_cursor=" + std::to_string(failure.sq_cursor) +
+        " to_submit=" + std::to_string(failure.to_submit);
+}
+
+static bool run_recv_owner_diagnostic_self_check(std::string& error) {
+    constexpr uint32_t kFlags = 2u;
+    constexpr uint32_t kIoprio = 1u;
+    constexpr uint32_t kBufferGroup = 7u;
+    constexpr uint32_t kLength = 4096u;
+    constexpr uint64_t kRecvUserData = UINT64_C(0x1201);
+    constexpr uint64_t kSendUserData = UINT64_C(0x1202);
+    if (!rut_iouring_gate_recv_shape_matches(kFlags,
+                                             kIoprio,
+                                             kBufferGroup,
+                                             kLength,
+                                             kRecvUserData,
+                                             kFlags,
+                                             kIoprio,
+                                             kBufferGroup,
+                                             kLength,
+                                             1u)) {
+        error = "recv-owner valid Recv shape was rejected";
+        return false;
+    }
+    const struct {
+        uint32_t flags;
+        uint32_t ioprio;
+        uint32_t buffer_group;
+        uint32_t length;
+        uint64_t user_data;
+        const char* label;
+    } invalid_shapes[] = {
+        {0u, kIoprio, kBufferGroup, kLength, kRecvUserData, "flags"},
+        {kFlags, 0u, kBufferGroup, kLength, kRecvUserData, "ioprio"},
+        {kFlags, kIoprio, 0u, kLength, kRecvUserData, "buffer-group"},
+        {kFlags, kIoprio, kBufferGroup, 0u, kRecvUserData, "length"},
+        {kFlags, kIoprio, kBufferGroup, kLength, UINT64_C(0x1202), "event"},
+    };
+    for (const auto& shape : invalid_shapes) {
+        if (rut_iouring_gate_recv_shape_matches(shape.flags,
+                                                shape.ioprio,
+                                                shape.buffer_group,
+                                                shape.length,
+                                                shape.user_data,
+                                                kFlags,
+                                                kIoprio,
+                                                kBufferGroup,
+                                                kLength,
+                                                1u)) {
+            error = std::string("recv-owner invalid Recv ") + shape.label + " was accepted";
+            return false;
+        }
+    }
+    if (!rut_iouring_gate_recv_user_data_matches(kRecvUserData, kRecvUserData) ||
+        rut_iouring_gate_recv_user_data_changed(kRecvUserData, kRecvUserData) ||
+        !rut_iouring_gate_recv_user_data_changed(kRecvUserData, UINT64_C(0x1301)) ||
+        rut_iouring_gate_recv_user_data_changed(0u, UINT64_C(0x1301))) {
+        error = "recv-owner captured Recv identity predicates were incorrect";
+        return false;
+    }
+    if (!rut_iouring_gate_send_event_matches(kSendUserData, 2u) ||
+        rut_iouring_gate_send_event_matches(UINT64_C(0x1203), 2u) ||
+        !rut_iouring_gate_send_connection_matches(kRecvUserData, kSendUserData) ||
+        rut_iouring_gate_send_connection_matches(kRecvUserData, UINT64_C(0x1302)) ||
+        rut_iouring_gate_send_owner_matches(kRecvUserData, UINT64_C(0x1302), 2u) ||
+        rut_iouring_gate_send_owner_matches(0u, kSendUserData, 2u)) {
+        error = "recv-owner Send event/connection predicates were incorrect";
+        return false;
+    }
+    if (rut_iouring_gate_recv_owner_reason(0, kRecvUserData, UINT64_C(0x1301), kSendUserData, 2u) !=
+            RUT_IOURING_GATE_RECV_OWNER_REASON_RECV_SHAPE ||
+        rut_iouring_gate_recv_owner_reason(1, kRecvUserData, UINT64_C(0x1301), kSendUserData, 2u) !=
+            RUT_IOURING_GATE_RECV_OWNER_REASON_RECV_ID_CHANGED) {
+        error = "recv-owner shape-before-identity control was malformed";
+        return false;
+    }
+    if (rut_iouring_gate_recv_owner_reason(1, 0u, 0u, UINT64_C(0x1203), 2u) !=
+            RUT_IOURING_GATE_RECV_OWNER_REASON_RECV_MISSING_AT_SEND ||
+        rut_iouring_gate_recv_owner_reason(1, kRecvUserData, kRecvUserData, UINT64_C(0x1203), 2u) !=
+            RUT_IOURING_GATE_RECV_OWNER_REASON_SEND_OWNER_MISMATCH) {
+        error = "recv-owner missing-Recv-before-Send-event control was malformed";
+        return false;
+    }
+    const auto reap_bounded = [](pid_t child, int* status) {
+        const auto reap_until = [&](std::chrono::steady_clock::time_point deadline) {
+            while (std::chrono::steady_clock::now() < deadline) {
+                const pid_t result = waitpid(child, status, WNOHANG);
+                if (result == child) return true;
+                if (result < 0 && errno != EINTR) return false;
+                poll(nullptr, 0, 1);
+            }
+            return false;
+        };
+        if (reap_until(std::chrono::steady_clock::now() + std::chrono::seconds(2))) return true;
+        if (kill(child, SIGKILL) != 0 && errno != ESRCH) return false;
+        if (reap_until(std::chrono::steady_clock::now() + std::chrono::seconds(2))) return true;
+        return false;
+    };
+    struct MappingGuard {
+        rut_iouring_gate* gate = nullptr;
+        bool mutex_initialized = false;
+        ~MappingGuard() {
+            if (gate == nullptr) return;
+            if (mutex_initialized) {
+                (void)pthread_mutex_destroy(&gate->identity_mutex);
+            }
+            (void)munmap(gate, sizeof(*gate));
+        }
+    };
+    struct MutexGuard {
+        pthread_mutex_t* mutex = nullptr;
+        bool initialized = false;
+        ~MutexGuard() {
+            if (initialized) (void)pthread_mutex_destroy(mutex);
+        }
+    };
+    const auto init_shared_robust_mutex = [](pthread_mutex_t* mutex) {
+        pthread_mutexattr_t attributes;
+        if (pthread_mutexattr_init(&attributes) != 0) return false;
+        const bool attributes_ok =
+            pthread_mutexattr_setpshared(&attributes, PTHREAD_PROCESS_SHARED) == 0 &&
+            pthread_mutexattr_setrobust(&attributes, PTHREAD_MUTEX_ROBUST) == 0;
+        const int init_result = attributes_ok ? pthread_mutex_init(mutex, &attributes) : -1;
+        const int destroy_result = pthread_mutexattr_destroy(&attributes);
+        if (!attributes_ok || init_result != 0 || destroy_result != 0) {
+            if (init_result == 0) (void)pthread_mutex_destroy(mutex);
+            return false;
+        }
+        return true;
+    };
+    rut_iouring_gate gate{};
+    if (!init_shared_robust_mutex(&gate.identity_mutex)) {
+        error = "recv-owner diagnostic self-check mutex initialization failed";
+        return false;
+    }
+    MutexGuard gate_mutex{&gate.identity_mutex, true};
+    rut_downstream_gate_store(&gate.identity_mutex_initialized, 1);
+    rut_downstream_gate_store(&gate.state, RUT_DOWNSTREAM_GATE_ARMED);
+    gate.mode = RUT_IOURING_GATE_MODE_LATE_SUCCESSOR;
+    gate.error_code = RUT_IOURING_GATE_ERROR_NONE;
+    rut_iouring_gate_recv_owner_failure candidate{};
+    candidate.reason = RUT_IOURING_GATE_RECV_OWNER_REASON_RECV_SHAPE;
+    candidate.ring_fd = 17;
+    candidate.peer_fd = 19;
+    candidate.peer_ipv4_be = 0x0100007fU;
+    candidate.peer_port_be = 8080;
+    candidate.captured_recv_user_data = UINT64_C(0x1201);
+    candidate.current_sqe_user_data = UINT64_C(0x1201);
+    candidate.current_sqe_opcode = 27;
+    candidate.current_sqe_fd = 19;
+    candidate.sq_head = 4;
+    candidate.sq_tail = 8;
+    candidate.sq_cursor = 6;
+    candidate.to_submit = 2;
+    if (pthread_mutex_lock(&gate.identity_mutex) != 0) {
+        error = "recv-owner diagnostic publisher did not accept first failure";
+        return false;
+    }
+    const bool first_published =
+        rut_iouring_gate_publish_recv_owner_failure_locked(&gate, &candidate);
+    (void)pthread_mutex_unlock(&gate.identity_mutex);
+    if (!first_published) {
+        error = "recv-owner diagnostic publisher did not accept first failure";
+        return false;
+    }
+    std::string premature_evidence;
+    append_recv_owner_failure_evidence(gate, premature_evidence);
+    if (!premature_evidence.empty()) {
+        error = "recv-owner formatter exposed evidence before FAILED publication";
+        return false;
+    }
+    rut_downstream_gate_store(&gate.state, RUT_DOWNSTREAM_GATE_FAILED);
+    rut_iouring_gate_recv_owner_failure second = candidate;
+    second.reason = RUT_IOURING_GATE_RECV_OWNER_REASON_SEND_OWNER_MISMATCH;
+    if (pthread_mutex_lock(&gate.identity_mutex) != 0) {
+        error = "recv-owner diagnostic publisher did not preserve first failure";
+        return false;
+    }
+    const bool second_published =
+        rut_iouring_gate_publish_recv_owner_failure_locked(&gate, &second);
+    const bool first_reason_preserved =
+        gate.recv_owner_failure.reason == RUT_IOURING_GATE_RECV_OWNER_REASON_RECV_SHAPE;
+    (void)pthread_mutex_unlock(&gate.identity_mutex);
+    if (second_published || !first_reason_preserved) {
+        error = "recv-owner diagnostic publisher did not preserve first failure";
+        return false;
+    }
+    std::string evidence;
+    append_recv_owner_failure_evidence(gate, evidence);
+    if (evidence.find("reason=RECV_SHAPE") == std::string::npos ||
+        evidence.find("peer_ipv4_be=") == std::string::npos ||
+        evidence.find("current_sqe_fd=19") == std::string::npos ||
+        evidence.find("sq_cursor=6") == std::string::npos) {
+        error = "recv-owner diagnostic formatter omitted labeled first-failure fields";
+        return false;
+    }
+
+    for (uint32_t reason = RUT_IOURING_GATE_RECV_OWNER_REASON_RECV_SHAPE;
+         reason <= RUT_IOURING_GATE_RECV_OWNER_REASON_INGRESS_CONTRACT;
+         ++reason) {
+        rut_downstream_gate_store(&gate.state, RUT_DOWNSTREAM_GATE_ARMED);
+        rut_downstream_gate_store(&gate.error_code, RUT_IOURING_GATE_ERROR_NONE);
+        __atomic_store_n(&gate.recv_owner_failure.valid, 0u, __ATOMIC_RELEASE);
+        candidate.reason = reason;
+        if (pthread_mutex_lock(&gate.identity_mutex) != 0) {
+            error = "recv-owner diagnostic publisher rejected a discriminant reason";
+            return false;
+        }
+        const bool published =
+            rut_iouring_gate_publish_recv_owner_failure_locked(&gate, &candidate);
+        rut_downstream_gate_store(&gate.state, RUT_DOWNSTREAM_GATE_FAILED);
+        const bool stored_reason = gate.recv_owner_failure.reason == reason;
+        (void)pthread_mutex_unlock(&gate.identity_mutex);
+        if (!published || !stored_reason) {
+            error = "recv-owner diagnostic publisher stored the wrong reason";
+            return false;
+        }
+    }
+    rut_downstream_gate_store(&gate.error_code, RUT_IOURING_GATE_ERROR_RING);
+    __atomic_store_n(&gate.recv_owner_failure.valid, 0u, __ATOMIC_RELEASE);
+    if (pthread_mutex_lock(&gate.identity_mutex) != 0) {
+        error = "recv-owner diagnostic publisher overwrote a non-Recv failure";
+        return false;
+    }
+    const bool overwrote_non_recv =
+        rut_iouring_gate_publish_recv_owner_failure_locked(&gate, &candidate);
+    (void)pthread_mutex_unlock(&gate.identity_mutex);
+    if (overwrote_non_recv) {
+        error = "recv-owner diagnostic publisher overwrote a non-Recv failure";
+        return false;
+    }
+    gate.magic = RUT_IOURING_GATE_MAGIC;
+    gate.version = RUT_IOURING_GATE_VERSION;
+    gate.layout_size = sizeof(gate);
+    if (!rut_iouring_gate_abi_valid(&gate)) {
+        error = "recv-owner diagnostic ABI version or size drifted";
+        return false;
+    }
+    gate.version--;
+    if (rut_iouring_gate_abi_valid(&gate)) {
+        error = "recv-owner diagnostic ABI version mutation was accepted";
+        return false;
+    }
+    gate.version = RUT_IOURING_GATE_VERSION;
+    gate.layout_size--;
+    if (rut_iouring_gate_abi_valid(&gate)) {
+        error = "recv-owner diagnostic ABI size mutation was accepted";
+        return false;
+    }
+
+    auto* complete_gate = static_cast<rut_iouring_gate*>(mmap(nullptr,
+                                                              sizeof(rut_iouring_gate),
+                                                              PROT_READ | PROT_WRITE,
+                                                              MAP_SHARED | MAP_ANONYMOUS,
+                                                              -1,
+                                                              0));
+    if (complete_gate == MAP_FAILED) {
+        error = "recv-owner complete owner-death shared mapping failed";
+        return false;
+    }
+    MappingGuard complete_mapping{complete_gate};
+    memset(complete_gate, 0, sizeof(*complete_gate));
+    if (!init_shared_robust_mutex(&complete_gate->identity_mutex)) {
+        error = "recv-owner complete owner-death shared mutex failed";
+        return false;
+    }
+    complete_mapping.mutex_initialized = true;
+    rut_downstream_gate_store(&complete_gate->identity_mutex_initialized, 1);
+    rut_downstream_gate_store(&complete_gate->state, RUT_DOWNSTREAM_GATE_FAILED);
+    rut_downstream_gate_store(&complete_gate->error_code, RUT_IOURING_GATE_ERROR_RECV_OWNER);
+    complete_gate->ring_fd = 17;
+    complete_gate->intercepted_fd = 18;
+    complete_gate->ring_ready = 1;
+    complete_gate->recv_owner_failure = candidate;
+    __atomic_store_n(&complete_gate->recv_owner_failure.valid, 1u, __ATOMIC_RELEASE);
+    const pid_t complete_owner_death = fork();
+    if (complete_owner_death == 0) {
+        _exit(pthread_mutex_lock(&complete_gate->identity_mutex) == 0 ? 0 : 111);
+    }
+    int complete_status = 0;
+    if (complete_owner_death < 0 || !reap_bounded(complete_owner_death, &complete_status) ||
+        !WIFEXITED(complete_status) || WEXITSTATUS(complete_status) != 0 ||
+        !rut_iouring_gate_lock_identity(complete_gate, 2000)) {
+        error = "recv-owner owner-death recovery discarded complete evidence";
+        return false;
+    }
+    const bool complete_recovery_valid =
+        __atomic_load_n(&complete_gate->recv_owner_failure.valid, __ATOMIC_ACQUIRE) == 1u &&
+        rut_downstream_gate_load(&complete_gate->state) == RUT_DOWNSTREAM_GATE_FAILED &&
+        complete_gate->ring_fd == -1 && complete_gate->intercepted_fd == -1 &&
+        rut_downstream_gate_load(&complete_gate->ring_ready) == 0u;
+    rut_iouring_gate_unlock_identity(complete_gate);
+    if (!complete_recovery_valid) {
+        error = "recv-owner owner-death recovery discarded complete evidence";
+        return false;
+    }
+
+    auto* partial = static_cast<rut_iouring_gate*>(mmap(nullptr,
+                                                        sizeof(rut_iouring_gate),
+                                                        PROT_READ | PROT_WRITE,
+                                                        MAP_SHARED | MAP_ANONYMOUS,
+                                                        -1,
+                                                        0));
+    if (partial == MAP_FAILED) {
+        error = "recv-owner partial-publication shared mapping failed";
+        return false;
+    }
+    MappingGuard partial_mapping{partial};
+    memset(partial, 0, sizeof(*partial));
+    if (!init_shared_robust_mutex(&partial->identity_mutex)) {
+        error = "recv-owner partial-publication mutex initialization failed";
+        return false;
+    }
+    partial_mapping.mutex_initialized = true;
+    rut_downstream_gate_store(&partial->identity_mutex_initialized, 1);
+    rut_downstream_gate_store(&partial->state, RUT_DOWNSTREAM_GATE_ARMED);
+    partial->error_code = RUT_IOURING_GATE_ERROR_RECV_OWNER;
+    partial->recv_owner_failure.reason = RUT_IOURING_GATE_RECV_OWNER_REASON_RECV_ID_CHANGED;
+    partial->ring_fd = 23;
+    partial->intercepted_fd = 24;
+    partial->ring_ready = 1;
+    __atomic_store_n(&partial->recv_owner_failure.valid, 0u, __ATOMIC_RELEASE);
+    const pid_t child = fork();
+    if (child == 0) {
+        _exit(pthread_mutex_lock(&partial->identity_mutex) == 0 ? 0 : 111);
+    }
+    int child_status = 0;
+    if (child < 0 || !reap_bounded(child, &child_status) || !WIFEXITED(child_status) ||
+        WEXITSTATUS(child_status) != 0 || !rut_iouring_gate_lock_identity(partial, 2000)) {
+        error = "recv-owner owner-death recovery exposed partial evidence";
+        return false;
+    }
+    const bool partial_recovery_valid =
+        __atomic_load_n(&partial->recv_owner_failure.valid, __ATOMIC_ACQUIRE) == 0u &&
+        rut_downstream_gate_load(&partial->state) == RUT_DOWNSTREAM_GATE_FAILED &&
+        partial->ring_fd == -1 && partial->intercepted_fd == -1 &&
+        rut_downstream_gate_load(&partial->ring_ready) == 0u &&
+        partial->recv_owner_failure.reason == RUT_IOURING_GATE_RECV_OWNER_REASON_NONE;
+    rut_iouring_gate_unlock_identity(partial);
+    if (!partial_recovery_valid) {
+        error = "recv-owner owner-death recovery exposed partial evidence";
+        return false;
+    }
+    return true;
+}
+
 struct RutIoUringGateRelease {
     rut_iouring_gate* gate = nullptr;
 
@@ -25835,6 +26226,7 @@ static bool run_rut_iouring_gate_spike(u16 frontend_port,
                             " user_data=" + std::to_string(gate->connect_attempts[i].user_data) +
                             "]";
             }
+            append_recv_owner_failure_evidence(*gate, evidence);
             if (observation != nullptr) observation->gate_evidence = evidence;
             if (error != nullptr && !error->empty()) *error += "; settled gate " + evidence;
         }
@@ -26338,7 +26730,7 @@ static bool run_rut_coalesced_ingress_gate_evidence(u16 frontend_port,
                     "cleanup failure: RUT helper may still be live; ingress metadata suppressed";
                 return;
             }
-            observation->gate_evidence =
+            std::string evidence =
                 std::string(*cleanup_clean ? "cleanup=clean " : "cleanup=failed-but-reaped ") +
                 "state=" + std::to_string(rut_downstream_gate_load(&gate->state)) +
                 " error=" + std::to_string(rut_downstream_gate_load(&gate->error_code)) +
@@ -26348,6 +26740,8 @@ static bool run_rut_coalesced_ingress_gate_evidence(u16 frontend_port,
                 " fragments=" + std::to_string(gate->witness_fragments) +
                 " witness=" + std::to_string(gate->witness_length) +
                 " attempts=" + std::to_string(gate->connect_attempt_count);
+            append_recv_owner_failure_evidence(*gate, evidence);
+            observation->gate_evidence = evidence;
         }
     } evidence_capture{
         mapping.gate, &rut_process.child, &child_settled, &cleanup_clean, &observation};
@@ -73953,13 +74347,16 @@ int main(int argc, char** argv) {
         argc == 4 && strcmp(argv[1], "--rut-iouring-gate-owner-death-negative") == 0;
     const bool rut_iouring_gate_connect_journal_negative =
         argc == 4 && strcmp(argv[1], "--rut-iouring-gate-connect-journal-negative") == 0;
+    const bool rut_iouring_gate_recv_owner_diagnostics_self_check =
+        argc == 2 && strcmp(argv[1], "--rut-iouring-gate-recv-owner-diagnostics-self-check") == 0;
     const bool rut_iouring_coalesced_ingress_gate =
         argc == 4 && strcmp(argv[1], "--rut-iouring-coalesced-ingress-gate") == 0;
     const bool normal_differential =
         (argc == 2 && argv[1][0] == '/') ||
         (argc == 4 && argv[1][0] == '/' && argv[2][0] == '/' && argv[3][0] == '/');
     if ((!nginx_preload_loader_preflight && !nginx_gate_spike && !nginx_coalesced_ingress_gate &&
-         !exact_local_return_baseline && !root_proxy_trace_oracle && !api_proxy_trace_oracle &&
+         !rut_iouring_gate_recv_owner_diagnostics_self_check && !exact_local_return_baseline &&
+         !root_proxy_trace_oracle && !api_proxy_trace_oracle &&
          !exact_absolute_redirect_oracle && !exact_absolute_redirect_302_oracle &&
          !api_non_root_proxy_uri_oracle && !service_root_proxy_uri_oracle &&
          !wildcard_service_no_uri_oracle && !converter_wildcard_service_no_uri_differential &&
@@ -74571,6 +74968,16 @@ int main(int argc, char** argv) {
     }
     return missing_prerequisite("pinned nginx differential requires Linux host networking");
 #else
+    if (rut_iouring_gate_recv_owner_diagnostics_self_check) {
+        std::string diagnostic_error;
+        if (!run_recv_owner_diagnostic_self_check(diagnostic_error)) {
+            std::cerr << "FAIL [RUT io_uring recv-owner diagnostics]: " << diagnostic_error << "\n";
+            return 1;
+        }
+        std::cerr << "PASS: recv-owner first-failure, precedence, formatter, and owner-death "
+                     "diagnostics self-check\n";
+        return 0;
+    }
     if (zero_response_stall_self_check) {
         std::string stall_error;
         if (!run_zero_response_stall_self_check(stall_error)) {
