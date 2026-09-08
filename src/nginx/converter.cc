@@ -2101,6 +2101,33 @@ bool compare_http_profile(const HttpProfile& supplied,
            compare_server(supplied.server, fresh.server, comparison);
 }
 
+bool rebase_http_diagnostic(const Diagnostic& local,
+                            u32 source_len,
+                            const Span& origin,
+                            Diagnostic& rebased) {
+    const Span& span = local.span;
+    if (span.start > source_len || span.end > source_len || span.start > span.end ||
+        span.line == 0 || span.col == 0)
+        return false;
+    if (!is_valid_span(origin) || origin.start > ~static_cast<u32>(0) - span.start ||
+        origin.start > ~static_cast<u32>(0) - span.end)
+        return false;
+    rebased = local;
+    rebased.span.start += origin.start;
+    rebased.span.end += origin.start;
+    if (span.line == 1) {
+        if (origin.line == 0 || origin.col == 0 ||
+            origin.col > ~static_cast<u32>(0) - (span.col - 1u))
+            return false;
+        rebased.span.line = origin.line;
+        rebased.span.col += origin.col - 1u;
+    } else {
+        if (origin.line == 0 || origin.line > ~static_cast<u32>(0) - (span.line - 1u)) return false;
+        rebased.span.line += origin.line - 1u;
+    }
+    return true;
+}
+
 }  // namespace
 
 FrontendResult<RutSource> lower_to_rut(const Server& server) {
@@ -2361,6 +2388,46 @@ FrontendResult<HttpProfileRutSource> lower_to_rut(const HttpProfile& profile) {
         return out_of_memory(fresh.span, lit_str("generated RUT http profile source is too large"));
     output.data[output.len] = '\0';
     return output;
+}
+
+FrontendResult<HttpProfileRutSource> lower_to_rut(const NginxHttpConfig& config) {
+    const uintptr_t source_address = reinterpret_cast<uintptr_t>(config.source.ptr);
+    if (config.source.ptr == nullptr || config.source.len == 0u ||
+        source_address > UINTPTR_MAX - config.source.len)
+        return unsupported(config.span, lit_str("invalid readable nginx config source"));
+
+    auto reparsed = parse_nginx_http_config(config.source);
+    if (!reparsed) return core::make_unexpected(reparsed.error());
+    const NginxHttpConfig& fresh = reparsed.value();
+    if (!spans_equal(config.span, fresh.span))
+        return unsupported(fresh.span, lit_str("nginx config metadata does not match its source"));
+    if (!spans_equal(config.events_span, fresh.events_span))
+        return unsupported(fresh.events_span,
+                           lit_str("nginx config metadata does not match its source"));
+    if (!spans_equal(config.http_span, fresh.http_span))
+        return unsupported(fresh.http_span,
+                           lit_str("nginx config metadata does not match its source"));
+
+    HttpProfileComparison comparison{};
+    if (!compare_http_profile(config.http, fresh.http, comparison)) {
+        const Diagnostic local{FrontendError::UnsupportedSyntax,
+                               comparison.mismatch,
+                               lit_str("http profile metadata does not match its source")};
+        Diagnostic rebased{};
+        if (!rebase_http_diagnostic(local, fresh.http.source.len, fresh.http_span, rebased))
+            return unsupported(fresh.http_span, lit_str("invalid http metadata diagnostic span"));
+        return core::make_unexpected(rebased);
+    }
+
+    auto lowered = lower_to_rut(fresh.http);
+    if (!lowered) {
+        Diagnostic rebased{};
+        if (!rebase_http_diagnostic(
+                lowered.error(), fresh.http.source.len, fresh.http_span, rebased))
+            return unsupported(fresh.http_span, lit_str("invalid http lowering diagnostic span"));
+        return core::make_unexpected(rebased);
+    }
+    return lowered;
 }
 
 }  // namespace rut::nginx
