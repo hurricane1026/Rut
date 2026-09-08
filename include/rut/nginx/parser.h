@@ -50,6 +50,14 @@ struct ProxyReadTimeout {
     Span value_span{};
 };
 
+// Explicit proxy buffering is recognized only to preserve provenance for the
+// rejection-only converter boundary. No lowering or runtime support exists.
+struct ProxyBuffering {
+    bool present = false;
+    Span span{};
+    Span value_span{};
+};
+
 // One bounded response-header suppression directive. `name` borrows the exact
 // unquoted source token; spans retain the complete directive and name token.
 // Lowering support is intentionally separate from parser/model admission.
@@ -76,6 +84,7 @@ struct Location {
     Span span{};
     ProxyPass proxy_pass{};
     ProxyReadTimeout proxy_read_timeout{};
+    ProxyBuffering proxy_buffering{};
     ProxyHideHeader proxy_hide_header{};
 };
 
