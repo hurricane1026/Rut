@@ -53567,15 +53567,28 @@ static bool run_converter_proxy_hide_header_name_differential(
     };
     if (!compare_retained_header_observations(baseline, baseline, error, true, 66u)) return false;
     RetainedHeaderObservation changed = baseline;
-    std::string leaked(changed.response.begin(), changed.response.end());
-    const size_t unrelated_at = leaked.find("X-Unrelated: retained");
+    const std::string baseline_response(baseline.response.begin(), baseline.response.end());
+    const size_t unrelated_at = baseline_response.find("X-Unrelated: retained");
     if (unrelated_at == std::string::npos) {
         error = "#600 custom-hide response mutation fixture lacked X-Unrelated";
         return false;
     }
-    leaked.insert(unrelated_at, std::string(kName) + ": leaked\r\n");
-    changed.response.assign(leaked.begin(), leaked.end());
-    if (!rejects_observation(changed, "hidden-header-leak")) return false;
+    std::string lower_name(kName);
+    std::string upper_name(kName);
+    for (char& byte : lower_name) {
+        if (byte >= 'A' && byte <= 'Z') byte = static_cast<char>(byte - 'A' + 'a');
+    }
+    for (char& byte : upper_name) {
+        if (byte >= 'a' && byte <= 'z') byte = static_cast<char>(byte - 'a' + 'A');
+    }
+    const std::string leak_names[] = {lower_name, upper_name};
+    for (const std::string& leak_name : leak_names) {
+        changed = baseline;
+        std::string leaked = baseline_response;
+        leaked.insert(unrelated_at, leak_name + ": leaked\r\n");
+        changed.response.assign(leaked.begin(), leaked.end());
+        if (!rejects_observation(changed, "hidden-header-case-leak")) return false;
+    }
     changed = baseline;
     std::string unrelated(changed.response.begin(), changed.response.end());
     unrelated.erase(unrelated_at, strlen("X-Unrelated: retained"));
@@ -53596,8 +53609,8 @@ static bool run_converter_proxy_hide_header_name_differential(
     const std::string connection = "Connection: close\r\n";
     const size_t content_at =
         std::string(changed.response.begin(), changed.response.end()).find(content_length);
-    const std::string baseline_response(changed.response.begin(), changed.response.end());
-    const size_t connection_at = baseline_response.find(connection);
+    const std::string ordered_baseline_response(changed.response.begin(), changed.response.end());
+    const size_t connection_at = ordered_baseline_response.find(connection);
     if (content_at == std::string::npos || connection_at == std::string::npos ||
         connection_at != content_at + content_length.size()) {
         error = "#600 custom-hide response mutation fixture lacked ordered headers";
@@ -53679,8 +53692,17 @@ static bool run_converter_proxy_hide_header_boundary_differential(const char* ru
         error = "#600 boundary CLI rejection could not create a temporary directory";
         return false;
     }
-    const std::string invalid_names[] = {"X-" + std::string(45u, 'A'), "X-Pad", "X-Accel-Redirect"};
-    for (const std::string& name : invalid_names) {
+    struct InvalidBoundaryName {
+        std::string name;
+        const char* detail;
+    };
+    const InvalidBoundaryName invalid_names[] = {
+        {"X-" + std::string(45u, 'A'),
+         "proxy_hide_header name is outside the bounded header-name profile"},
+        {"X-Pad", "proxy_hide_header name is outside the bounded header-name profile"},
+        {"X-Accel-Redirect", "proxy_hide_header name is outside the bounded header-name profile"}};
+    for (const InvalidBoundaryName& invalid : invalid_names) {
+        const std::string& name = invalid.name;
         const std::string config =
             "events {}\n" + make_converter_request_length_profile(
                                 8080u, 9000u, temp.nginx_access_log, name.c_str());
@@ -53725,7 +53747,8 @@ static bool run_converter_proxy_hide_header_boundary_differential(const char* ru
             !read_exact_return204_log(temp.source, "#600 boundary CLI stdout", output, error) ||
             !output.empty() || !read_bounded_file(diagnostics_path, diagnostics, error) ||
             diagnostics.find(temp.nginx_config + ":") == std::string::npos ||
-            diagnostics.find(":9:") == std::string::npos) {
+            diagnostics.find(":9:") == std::string::npos ||
+            diagnostics.find(invalid.detail) == std::string::npos) {
             error =
                 "#600 boundary CLI rejection did not produce exit 1, empty stdout, and a "
                 "file:line:column diagnostic";
