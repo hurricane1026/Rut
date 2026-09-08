@@ -46516,6 +46516,10 @@ static bool validate_wildcard_listen_generated_source(
         std::to_string(frontend_port) + "\n";
     const std::string upstream =
         "upstream nginx_upstream at \"127.0.0.1:" + std::to_string(backend_port) + "\"\n";
+    const bool conditional_get = profile.exact_loopback_address;
+    const u32 expected_forward_count = conditional_get ? 4u : 3u;
+    const u32 expected_response_policy_count = conditional_get ? 4u : 3u;
+    const u32 expected_timeout_count = conditional_get ? 2u : 1u;
     const u32 routes = wildcard_listen_source_declarations(source, "route");
     const u32 pre_routes = wildcard_listen_source_declarations(source, "pre_route");
     const u32 upstreams = wildcard_listen_source_declarations(source, "upstream");
@@ -46527,17 +46531,25 @@ static bool validate_wildcard_listen_generated_source(
         count_text(source, "route HEAD \"/\" {\n") != 1u ||
         count_text(source, "route GET \"/\" {\n") != 1u ||
         count_text(source, "\nroute \"/\" {\n") != 1u ||
-        count_text(source, "return forward(nginx_upstream, request_policy: {\n") != 3u ||
-        count_text(source, "            host: \"upstream\",\n") != 3u ||
-        count_text(source, "            connection: \"omit\",\n") != 3u ||
+        count_text(source, "return forward(nginx_upstream, request_policy: {\n") !=
+            expected_forward_count ||
+        count_text(source, "            host: \"upstream\",\n") != expected_forward_count ||
+        count_text(source, "            connection: \"omit\",\n") != expected_forward_count ||
         count_text(source,
                    "            strip_headers: [\"Connection\", \"Keep-Alive\", \"TE\", "
                    "\"Expect\", \"Upgrade\"]\n") != 3u ||
-        count_text(source, "        response_policy: {\n") != 3u ||
-        count_text(source, "        failure_policy: {\n") != 3u ||
-        count_text(source, "        timeout_failure_policy: {\n") != 1u ||
-        count_text(source, "        response_read_timeout: 60s,\n") != 1u ||
-        count_text(source, "        response_buffering: \"complete_content_length\"\n") != 1u ||
+        count_text(source, "        response_policy: {\n") != expected_response_policy_count ||
+        count_text(source, "        failure_policy: {\n") != expected_response_policy_count ||
+        count_text(source, "        timeout_failure_policy: {\n") != expected_timeout_count ||
+        count_text(source, "        response_read_timeout: 60s,\n") != expected_timeout_count ||
+        count_text(source, "        response_buffering: \"complete_content_length\"\n") !=
+            expected_timeout_count ||
+        (conditional_get &&
+         (count_text(source, "    if req.hasContentLength {\n") != 1u ||
+          count_text(source, "retained_header_value: \"trim_sp_preserve_htab\"\n") != 1u)) ||
+        (!conditional_get &&
+         (count_text(source, "    if req.hasContentLength {\n") != 0u ||
+          count_text(source, "retained_header_value: \"trim_sp_preserve_htab\"\n") != 0u)) ||
         wildcard_listen_source_declarations(source, "unmatched") != 3u ||
         count_text(source, "unmatched OPTIONS {") != 1u ||
         count_text(source, "unmatched CONNECT {") != 1u ||
@@ -46558,8 +46570,8 @@ static bool validate_wildcard_listen_generated_source(
         source.find("req.host") != std::string::npos ||
         source.find("req.headers") != std::string::npos) {
         error = std::string(profile.issue) +
-                " generated source was not exactly the canonical ordinary listener, "
-                "one upstream, TRACE pre-route and three root forward routes";
+                " generated source did not retain the exact listener/upstream/root-forward "
+                "inventory for its request-policy shape";
         return false;
     }
     return true;
@@ -50952,13 +50964,36 @@ static bool validate_converter_request_length_source(const std::string& source,
     const std::string listener = "listen 127.0.0.1:" + std::to_string(frontend_port) + "\n";
     const std::string upstream =
         "upstream nginx_upstream at \"127.0.0.1:" + std::to_string(backend_port) + "\"\n";
+    static constexpr char kFixedRequestPolicy[] =
+        "return forward(nginx_upstream, request_policy: {\n"
+        "            version: \"HTTP/1.1\",\n"
+        "            host: \"upstream\",\n"
+        "            connection: \"omit\",\n"
+        "            strip_headers: [\"Connection\", \"Keep-Alive\", \"TE\", \"Expect\", "
+        "\"Upgrade\"]\n"
+        "        },\n";
+    static constexpr char kRetainedRequestPolicy[] =
+        "return forward(nginx_upstream, request_policy: {\n"
+        "            version: \"HTTP/1.1\",\n"
+        "            host: \"upstream\",\n"
+        "            connection: \"omit\",\n"
+        "            strip_headers: [\"Connection\", \"Keep-Alive\", \"TE\", \"Expect\", "
+        "\"Upgrade\"],\n"
+        "            retained_header_value: \"trim_sp_preserve_htab\"\n"
+        "        },\n";
     if (frontend_port == 0u || backend_port < 1024u || backend_port > 9999u ||
         frontend_port == backend_port || access_path.empty() ||
         source.rfind(declaration, 0u) != 0u || count_text(source, "accessLog {") != 1u ||
         count_text(source, declaration) != 1u || count_text(source, access_path) != 1u ||
         count_text(source, listener) != 1u || count_text(source, upstream) != 1u ||
         count_text(source, "route GET \"/\"") != 1u ||
-        count_text(source, "return forward(nginx_upstream,") != 3u ||
+        count_text(source, kFixedRequestPolicy) != 3u ||
+        count_text(source, kRetainedRequestPolicy) != 1u ||
+        count_text(source, "    if req.hasContentLength {\n") != 1u ||
+        count_text(source, "return forward(nginx_upstream,") != 4u ||
+        count_text(source, "        response_read_timeout: 60s,\n") != 2u ||
+        count_text(source, "        response_buffering: \"complete_content_length\"\n") != 2u ||
+        count_text(source, "        timeout_failure_policy: {\n") != 2u ||
         count_text(source, "format: downstreamRequestBytes") != 1u ||
         count_text(source, "publication: live") != 1u ||
         source.find("$request_length") != std::string::npos ||
@@ -51394,6 +51429,23 @@ static bool validate_converter_request_length_fixed_body_source(const std::strin
     const std::string listener = "listen 127.0.0.1:" + std::to_string(frontend_port) + "\n";
     const std::string upstream =
         "upstream nginx_upstream at \"127.0.0.1:" + std::to_string(backend_port) + "\"\n";
+    static constexpr char kFixedRequestPolicy[] =
+        "return forward(nginx_upstream, request_policy: {\n"
+        "            version: \"HTTP/1.1\",\n"
+        "            host: \"upstream\",\n"
+        "            connection: \"omit\",\n"
+        "            strip_headers: [\"Connection\", \"Keep-Alive\", \"TE\", \"Expect\", "
+        "\"Upgrade\"]\n"
+        "        },\n";
+    static constexpr char kRetainedRequestPolicy[] =
+        "return forward(nginx_upstream, request_policy: {\n"
+        "            version: \"HTTP/1.1\",\n"
+        "            host: \"upstream\",\n"
+        "            connection: \"omit\",\n"
+        "            strip_headers: [\"Connection\", \"Keep-Alive\", \"TE\", \"Expect\", "
+        "\"Upgrade\"],\n"
+        "            retained_header_value: \"trim_sp_preserve_htab\"\n"
+        "        },\n";
     if (frontend_port == 0u || backend_port < 1024u || backend_port > 9999u ||
         frontend_port == backend_port || access_path.empty() ||
         source.rfind(declaration, 0u) != 0u || count_text(source, declaration) != 1u ||
@@ -51402,7 +51454,13 @@ static bool validate_converter_request_length_fixed_body_source(const std::strin
         count_text(source, "\nroute ") != 3u || count_text(source, "route HEAD \"/\" {") != 1u ||
         count_text(source, "route GET \"/\" {") != 1u ||
         count_text(source, "\nroute \"/\" {") != 1u ||
-        count_text(source, "return forward(nginx_upstream,") != 3u ||
+        count_text(source, kFixedRequestPolicy) != 3u ||
+        count_text(source, kRetainedRequestPolicy) != 1u ||
+        count_text(source, "    if req.hasContentLength {\n") != 1u ||
+        count_text(source, "return forward(nginx_upstream,") != 4u ||
+        count_text(source, "        response_read_timeout: 60s,\n") != 2u ||
+        count_text(source, "        response_buffering: \"complete_content_length\"\n") != 2u ||
+        count_text(source, "        timeout_failure_policy: {\n") != 2u ||
         count_text(source, "format: downstreamRequestBytes") != 1u ||
         count_text(source, "publication: live") != 1u ||
         source.find("route POST ") != std::string::npos ||
@@ -54333,18 +54391,29 @@ static bool validate_positive_get_default_generated_source(const std::string& so
         "            strip_headers: [\"Connection\", \"Keep-Alive\", \"TE\", \"Expect\", "
         "\"Upgrade\"]\n"
         "        },\n";
+    static constexpr char kRetainedRequestPolicy[] =
+        "return forward(nginx_upstream, request_policy: {\n"
+        "            version: \"HTTP/1.1\",\n"
+        "            host: \"upstream\",\n"
+        "            connection: \"omit\",\n"
+        "            strip_headers: [\"Connection\", \"Keep-Alive\", \"TE\", \"Expect\", "
+        "\"Upgrade\"],\n"
+        "            retained_header_value: \"trim_sp_preserve_htab\"\n"
+        "        },\n";
     if (source.rfind(access, 0u) != 0u || count_text(source, access) != 1u ||
         count_text(source, listener) != 1u || count_text(source, upstream) != 1u ||
-        count_text(source, kCanonicalGeneratedNginxRootGetForward) != 1u ||
+        count_text(source, kCanonicalGeneratedNginxRootGetForward) != 0u ||
         count_text(source, kFixedRequestPolicy) != 3u ||
+        count_text(source, kRetainedRequestPolicy) != 1u ||
+        count_text(source, "    if req.hasContentLength {\n") != 1u ||
         count_text(source, "route HEAD \"/\" {") != 1u ||
         count_text(source, "route GET \"/\" {") != 1u ||
         count_text(source, "\nroute \"/\" {") != 1u ||
         wildcard_listen_source_declarations(source, "route") != 3u ||
-        count_text(source, "return forward(nginx_upstream,") != 3u ||
-        count_text(source, "        response_read_timeout: 60s,\n") != 1u ||
-        count_text(source, "        response_buffering: \"complete_content_length\"\n") != 1u ||
-        count_text(source, "        timeout_failure_policy: {\n") != 1u ||
+        count_text(source, "return forward(nginx_upstream,") != 4u ||
+        count_text(source, "        response_read_timeout: 60s,\n") != 2u ||
+        count_text(source, "        response_buffering: \"complete_content_length\"\n") != 2u ||
+        count_text(source, "        timeout_failure_policy: {\n") != 2u ||
         source.find("route POST ") != std::string::npos ||
         source.find("proxy_read_timeout") != std::string::npos ||
         source.find("proxy_buffering") != std::string::npos ||

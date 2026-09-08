@@ -2457,32 +2457,54 @@ TEST(serve_loader, issue373_hide_headers_are_owned_and_same_owner_reload_clears_
             }
         }
     };
-    const auto check_root_mapping = [&]() {
+    const auto check_root_mapping = [&](bool conditional_get) {
         REQUIRE_EQ(program.rir.module.func_count, 3u);
         for (u32 function = 0u; function < 3u; function++) {
             const auto& rir_function = program.rir.module.functions[function];
             u32 forwards = 0u;
-            i32 bundle_id = -1;
+            struct ForwardIds {
+                i32 request = -1;
+                i32 bundle = -1;
+            } ids[2];
             for (u32 block = 0u; block < rir_function.block_count; block++) {
                 const auto& rir_block = rir_function.blocks[block];
                 for (u32 instruction = 0u; instruction < rir_block.inst_count; instruction++) {
                     const auto& inst = rir_block.insts[instruction];
                     if (inst.op != rir::Opcode::RetForwardBundle) continue;
+                    REQUIRE_LT(forwards, 2u);
+                    const u32 forward_index = forwards;
                     forwards++;
                     REQUIRE_EQ(inst.operand_count, 3u);
                     for (u32 scan_block = 0u; scan_block < rir_function.block_count; scan_block++) {
                         const auto& constants = rir_function.blocks[scan_block];
                         for (u32 scan = 0u; scan < constants.inst_count; scan++) {
                             const auto& candidate = constants.insts[scan];
-                            if (candidate.op == rir::Opcode::ConstI32 &&
-                                candidate.result == inst.operand(2))
-                                bundle_id = candidate.imm.i32_val;
+                            if (candidate.op != rir::Opcode::ConstI32) continue;
+                            if (candidate.result == inst.operand(1))
+                                ids[forward_index].request = candidate.imm.i32_val;
+                            if (candidate.result == inst.operand(2))
+                                ids[forward_index].bundle = candidate.imm.i32_val;
                         }
                     }
                 }
             }
-            REQUIRE_EQ(forwards, 1u);
-            CHECK_EQ(bundle_id, function == 0u ? 1 : function == 1u ? 2 : 3);
+            const u32 expected_forwards = conditional_get && function == 1u ? 2u : 1u;
+            REQUIRE_EQ(forwards, expected_forwards);
+            if (function == 0u) {
+                CHECK_EQ(ids[0].request, static_cast<i32>(RequestPolicyId::Http11FixedStrip));
+                CHECK_EQ(ids[0].bundle, 1);
+            } else if (function == 1u) {
+                CHECK_EQ(ids[0].request, static_cast<i32>(RequestPolicyId::Http11FixedStrip));
+                CHECK_EQ(ids[0].bundle, 2);
+                if (conditional_get) {
+                    CHECK_EQ(ids[1].request,
+                             static_cast<i32>(RequestPolicyId::Http11FixedTrimSpPreserveHtab));
+                    CHECK_EQ(ids[1].bundle, 2);
+                }
+            } else {
+                CHECK_EQ(ids[0].request, static_cast<i32>(RequestPolicyId::Http11FixedStrip));
+                CHECK_EQ(ids[0].bundle, 3);
+            }
         }
         CHECK_EQ(program.config.policy_bundles[0].response_policy_id, 1u);
         CHECK_EQ(program.config.policy_bundles[1].response_policy_id, 2u);
@@ -2492,7 +2514,7 @@ TEST(serve_loader, issue373_hide_headers_are_owned_and_same_owner_reload_clears_
     CHECK(
         std::string(program.config.response_policy_bytes, program.config.response_policy_bytes_used)
             .find("X-Compat-Hidden") != std::string::npos);
-    check_root_mapping();
+    check_root_mapping(false);
 
     program.engine.shutdown();
     program.jit_inited = false;
@@ -2512,7 +2534,7 @@ TEST(serve_loader, issue373_hide_headers_are_owned_and_same_owner_reload_clears_
         REQUIRE(parsed);
         const auto lowered = nginx::lower_to_rut(parsed.value());
         REQUIRE(lowered);
-        REQUIRE_EQ(lowered.value().len, 5309u);
+        REQUIRE_EQ(lowered.value().len, 6975u);
         generated.assign(lowered.value().data, lowered.value().len);
         memset(source, 'z', sizeof(source) - 1u);
     }
@@ -2523,7 +2545,7 @@ TEST(serve_loader, issue373_hide_headers_are_owned_and_same_owner_reload_clears_
     CHECK(
         std::string(program.config.response_policy_bytes, program.config.response_policy_bytes_used)
             .find("X-Compat-Hidden") == std::string::npos);
-    check_root_mapping();
+    check_root_mapping(true);
     program.engine.shutdown();
     program.jit_inited = false;
     program.rir.destroy();
