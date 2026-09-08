@@ -52838,6 +52838,22 @@ static bool run_converter_request_length_rut_side(TempDir& temp,
                 error = "#600 loaded custom-hide response policies lacked HEAD/ordinary pair";
                 return false;
             }
+            const auto result_matches_route = [&](const rut::RouteEntry& route,
+                                                  const rut::jit::HandlerResult& result,
+                                                  u16 expected_response_policy_id) {
+                if (route.fn == nullptr ||
+                    result.action != rut::jit::HandlerAction::ForwardBundle ||
+                    result.status_code !=
+                        static_cast<u16>(rut::RequestPolicyId::Http11FixedStrip) ||
+                    result.upstream_id != 0u || result.next_state == 0u ||
+                    result.next_state > loaded.value->config.policy_bundle_count)
+                    return false;
+                const auto& bundle = loaded.value->config.policy_bundles[result.next_state - 1u];
+                return bundle.response_policy_id == expected_response_policy_id &&
+                       bundle.response_policy_id <= loaded.value->config.response_policy_count &&
+                       exact_policy(
+                           loaded.value->config.response_policies[bundle.response_policy_id - 1u]);
+            };
             u32 root_route_count = 0u;
             u32 bound_get = 0u;
             u32 bound_head = 0u;
@@ -52845,8 +52861,7 @@ static bool run_converter_request_length_rut_side(TempDir& temp,
             for (u32 index = 0u; index < loaded.value->config.route_count; index++) {
                 const rut::RouteEntry& route = loaded.value->config.routes[index];
                 if (route.path_len != 1u || route.path[0] != '/' ||
-                    route.preflight_forward_policy_bundle_id == 0u ||
-                    route.action != rut::RouteAction::JitHandler) {
+                    route.action != rut::RouteAction::JitHandler || route.fn == nullptr) {
                     error = "#600 loaded custom-hide RUT contained an unexpected route";
                     return false;
                 }
@@ -52860,20 +52875,53 @@ static bool run_converter_request_length_rut_side(TempDir& temp,
                     error = "#600 loaded custom-hide RUT contained an unexpected method";
                     return false;
                 }
-                const u16 bundle_id = route.preflight_forward_policy_bundle_id;
-                if (bundle_id > loaded.value->config.policy_bundle_count) {
-                    error = "#600 loaded custom-hide route binding was out of range";
-                    return false;
-                }
-                const rut::ForwardPolicyBundle& bundle =
-                    loaded.value->config.policy_bundles[bundle_id - 1u];
                 const u16 expected_policy_id =
                     method == rut::kRouteMethodHead ? head_policy_id : ordinary_policy_id;
-                if (bundle.response_policy_id != expected_policy_id ||
-                    bundle.response_policy_id > loaded.value->config.response_policy_count ||
-                    !exact_policy(
-                        loaded.value->config.response_policies[bundle.response_policy_id - 1u])) {
-                    error = "#600 loaded custom-hide route binding lacked exact policy";
+                const char* request =
+                    method == rut::kRouteMethodHead  ? "HEAD / HTTP/1.1\r\nHost: test\r\n\r\n"
+                    : method == rut::kRouteMethodGet ? "GET / HTTP/1.1\r\nHost: test\r\n\r\n"
+                                                     : "POST / HTTP/1.1\r\nHost: test\r\n\r\n";
+                const u32 request_len = static_cast<u32>(strlen(request));
+                const rut::jit::HandlerResult result = rut::jit::HandlerResult::unpack(
+                    route.fn(nullptr,
+                             nullptr,
+                             reinterpret_cast<const rut::u8*>(request),
+                             request_len,
+                             nullptr));
+                if (!result_matches_route(route, result, expected_policy_id)) {
+                    error = "#600 loaded custom-hide JIT result lacked exact route policy";
+                    return false;
+                }
+                const auto rejects_result_mutation = [&](rut::jit::HandlerResult mutated,
+                                                         const char* label) {
+                    if (result_matches_route(route, mutated, expected_policy_id)) {
+                        error =
+                            std::string("#600 loaded custom-hide JIT accepted mutation: ") + label;
+                        return false;
+                    }
+                    return true;
+                };
+                rut::jit::HandlerResult mutated = result;
+                mutated.action = rut::jit::HandlerAction::ReturnStatus;
+                if (!rejects_result_mutation(mutated, "wrong-action")) return false;
+                mutated = result;
+                mutated.next_state = 0u;
+                if (!rejects_result_mutation(mutated, "zero-bundle")) return false;
+                mutated = result;
+                mutated.next_state =
+                    static_cast<u16>(loaded.value->config.policy_bundle_count + 1u);
+                if (!rejects_result_mutation(mutated, "out-of-range-bundle")) return false;
+                mutated = result;
+                mutated.upstream_id = 1u;
+                if (!rejects_result_mutation(mutated, "wrong-upstream")) return false;
+                mutated = result;
+                mutated.status_code = 2u;
+                if (!rejects_result_mutation(mutated, "wrong-request-policy")) return false;
+                if (result_matches_route(route,
+                                         result,
+                                         expected_policy_id == head_policy_id ? ordinary_policy_id
+                                                                              : head_policy_id)) {
+                    error = "#600 loaded custom-hide JIT accepted HEAD/ordinary policy mismatch";
                     return false;
                 }
             }
