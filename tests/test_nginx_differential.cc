@@ -52436,15 +52436,20 @@ static bool validate_converter_request_length_source(const std::string& source,
         bool head = false;
         bool get = false;
         bool any = false;
+        u32 route_count = 0u;
         for (u32 index = 0u; index < ast->items.len; index++) {
             const auto& item = ast->items[index];
-            if (item.kind != rut::AstItemKind::Route || !item.route.path.eq({"/", 1u}) ||
-                item.route.statements.len != 1u || item.route.statements[0] == nullptr ||
+            if (item.kind != rut::AstItemKind::Route) continue;
+            route_count++;
+            if (!item.route.path.eq({"/", 1u}) || item.route.statements.len != 1u ||
+                item.route.statements[0] == nullptr ||
                 item.route.statements[0]->kind != rut::AstStmtKind::ForwardUpstream ||
                 !item.route.statements[0]->has_forward_request_policy ||
                 !item.route.statements[0]->has_forward_response_policy ||
-                !item.route.statements[0]->has_forward_failure_policy)
-                continue;
+                !item.route.statements[0]->has_forward_failure_policy) {
+                error = "#600 custom-hide generated ordinary RUT contained an unexpected route";
+                return false;
+            }
             if (item.route.method_is_any) {
                 if (any) {
                     error = "#600 custom-hide generated ordinary RUT duplicated Any route";
@@ -52465,7 +52470,7 @@ static bool validate_converter_request_length_source(const std::string& source,
                 get = true;
             }
         }
-        if (!head || !get || !any) {
+        if (route_count != 3u || !head || !get || !any) {
             error = "#600 custom-hide generated ordinary RUT lacked exact HEAD/GET/Any routes";
             return false;
         }
@@ -53513,7 +53518,9 @@ static bool run_converter_proxy_hide_header_name_differential(const char* rut_pa
     candidate.replace(upstream_at,
                       upstream.size(),
                       "127.0.0.1:" + std::to_string(temp.retained_backend_port + 1u));
-    return rejects(candidate, "alternate-upstream");
+    if (!rejects(candidate, "alternate-upstream")) return false;
+    candidate = generated_source + "\nroute POST \"/\" { return 204 }\n";
+    return rejects(candidate, "unexpected-local-response-route");
 }
 
 static bool run_converter_retained_access_log_off_four_phase(const char* rut_path,
