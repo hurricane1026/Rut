@@ -15,6 +15,7 @@
 #include "rut/runtime/connection_base.h"
 #include "rut/runtime/listener.h"
 #include "test.h"
+#include <algorithm>
 #include <array>
 #include <cstddef>
 #include <iostream>
