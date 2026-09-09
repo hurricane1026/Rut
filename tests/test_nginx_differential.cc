@@ -51616,15 +51616,19 @@ static bool run_pinned_request_length_split_header_oracle(TempDir& temp,
     return true;
 }
 
-static std::string make_converter_request_length_profile(u16 frontend_port,
-                                                         u16 backend_port,
-                                                         const std::string& access_path);
+static std::string make_converter_request_length_profile(
+    u16 frontend_port,
+    u16 backend_port,
+    const std::string& access_path,
+    const char* proxy_hide_header_name = nullptr);
 
-static std::string make_retained_header_whitespace_oracle_config(u16 frontend_port,
-                                                                 u16 backend_port,
-                                                                 const std::string& access_path,
-                                                                 bool access_log_off = false,
-                                                                 bool default_log = false) {
+static std::string make_retained_header_whitespace_oracle_config(
+    u16 frontend_port,
+    u16 backend_port,
+    const std::string& access_path,
+    bool access_log_off = false,
+    bool default_log = false,
+    const char* proxy_hide_header_name = nullptr) {
     if (!access_log_off)
         if (default_log)
             return "events {}\nhttp {\n"
@@ -51641,7 +51645,8 @@ static std::string make_retained_header_whitespace_oracle_config(u16 frontend_po
                    "}\n";
     if (!access_log_off)
         return "events {}\n" +
-               make_converter_request_length_profile(frontend_port, backend_port, access_path);
+               make_converter_request_length_profile(
+                   frontend_port, backend_port, access_path, proxy_hide_header_name);
     return "events {}\nhttp {\n"
            "  access_log off;\n"
            "  server {\n"
@@ -51678,7 +51683,8 @@ static std::vector<char> normalize_retained_response_date(const std::vector<char
 static bool compare_retained_header_observations(const RetainedHeaderObservation& nginx,
                                                  const RetainedHeaderObservation& generated,
                                                  std::string& error,
-                                                 bool require_exact_upstream_port = false) {
+                                                 bool require_exact_upstream_port = false,
+                                                 size_t expected_upstream_size = 70u) {
     const auto normalize_upstream = [](const std::vector<char>& wire) {
         std::string text(wire.begin(), wire.end());
         const size_t at = text.find("Host: 127.0.0.1:");
@@ -51694,7 +51700,8 @@ static bool compare_retained_header_observations(const RetainedHeaderObservation
             ? nginx.upstream == generated.upstream
             : normalize_upstream(nginx.upstream) == normalize_upstream(generated.upstream);
     if (nginx.response != generated.response || nginx.access != generated.access ||
-        nginx.upstream.size() != generated.upstream.size() || nginx.upstream.size() != 70u ||
+        nginx.upstream.size() != generated.upstream.size() ||
+        nginx.upstream.size() != expected_upstream_size ||
         (require_exact_upstream_port && nginx.backend_port != generated.backend_port) ||
         !upstream_equal) {
         error = "#252 nginx/generated retained-header observations differed";
@@ -51730,16 +51737,18 @@ static bool retained_header_comparator_self_check(std::string& error) {
     return true;
 }
 
-static bool validate_retained_header_whitespace_oracle_config(const std::string& config,
-                                                              u16 frontend_port,
-                                                              u16 backend_port,
-                                                              const std::string& access_path,
-                                                              std::string& error,
-                                                              bool access_log_off = false,
-                                                              bool default_log = false) {
+static bool validate_retained_header_whitespace_oracle_config(
+    const std::string& config,
+    u16 frontend_port,
+    u16 backend_port,
+    const std::string& access_path,
+    std::string& error,
+    bool access_log_off = false,
+    bool default_log = false,
+    const char* proxy_hide_header_name = nullptr) {
     if (access_log_off) {
         const std::string expected = make_retained_header_whitespace_oracle_config(
-            frontend_port, backend_port, access_path, true);
+            frontend_port, backend_port, access_path, true, false, proxy_hide_header_name);
         if (config != expected || count_text(config, "access_log off;\n") != 1u ||
             config.find("log_format") != std::string::npos ||
             config.find("access_log /") != std::string::npos) {
@@ -51758,8 +51767,8 @@ static bool validate_retained_header_whitespace_oracle_config(const std::string&
         }
         return true;
     }
-    const std::string expected =
-        make_retained_header_whitespace_oracle_config(frontend_port, backend_port, access_path);
+    const std::string expected = make_retained_header_whitespace_oracle_config(
+        frontend_port, backend_port, access_path, false, false, proxy_hide_header_name);
     if (frontend_port < 1024u || frontend_port > 9999u || backend_port < 1024u ||
         backend_port > 9999u || frontend_port == backend_port || access_path.empty() ||
         config != expected || count_text(config, "events {}\n") != 1u ||
@@ -51769,12 +51778,17 @@ static bool validate_retained_header_whitespace_oracle_config(const std::string&
         count_text(config, "listen 127.0.0.1:" + std::to_string(frontend_port) + ";") != 1u ||
         count_text(config, "proxy_pass http://127.0.0.1:" + std::to_string(backend_port) + ";") !=
             1u ||
+        (proxy_hide_header_name != nullptr &&
+         (count_text(config, "proxy_hide_header " + std::string(proxy_hide_header_name) + ";") !=
+              1u ||
+          count_text(config, "proxy_hide_header ") != 1u)) ||
+        (proxy_hide_header_name == nullptr &&
+         config.find("proxy_hide_header") != std::string::npos) ||
         count_text(config, "location / {") != 1u || count_text(config, "server {") != 1u ||
         config.find("proxy_read_timeout") != std::string::npos ||
         config.find("proxy_buffering") != std::string::npos ||
         config.find("proxy_http_version") != std::string::npos ||
         config.find("proxy_set_header") != std::string::npos ||
-        config.find("proxy_hide_header") != std::string::npos ||
         config.find("include ") != std::string::npos) {
         error = "#252 config escaped the exact retained-header whitespace inventory";
         return false;
@@ -51847,18 +51861,21 @@ static bool validate_default_access_record(const std::string& contents, std::str
     return true;
 }
 
-static bool run_pinned_retained_header_whitespace_oracle(TempDir& temp,
-                                                         const std::string& container_name,
-                                                         RetainedHeaderObservation* observation,
-                                                         std::string& error,
-                                                         bool explicit_cleanup = false,
-                                                         bool access_log_off = false,
-                                                         bool default_log = false,
-                                                         u16 fixed_frontend_port = 0u,
-                                                         u16 fixed_backend_port = 0u) {
+static bool run_pinned_retained_header_whitespace_oracle(
+    TempDir& temp,
+    const std::string& container_name,
+    RetainedHeaderObservation* observation,
+    std::string& error,
+    bool explicit_cleanup = false,
+    bool access_log_off = false,
+    bool default_log = false,
+    u16 fixed_frontend_port = 0u,
+    u16 fixed_backend_port = 0u,
+    const char* proxy_hide_header_name = nullptr) {
     const char* kDiagnostic = (access_log_off || default_log)
                                   ? "#591 pinned nginx Off/default access oracle"
                                   : "#252 pinned retained-header whitespace oracle";
+    const bool custom_hide_header = proxy_hide_header_name != nullptr;
     static constexpr char kExpectedDownstream[] =
         "HTTP/1.1 200 OK\r\n"
         "Server: nginx/1.29.7\r\n"
@@ -51866,6 +51883,13 @@ static bool run_pinned_retained_header_whitespace_oracle(TempDir& temp,
         "Content-Length: 2\r\n"
         "Connection: close\r\n\r\n"
         "ok";
+    const char* expected_downstream = proxy_hide_header_name == nullptr
+                                          ? kExpectedDownstream
+                                          : kProxyHideHeaderNameOracleResponseNormalized;
+    const size_t expected_downstream_size =
+        proxy_hide_header_name == nullptr
+            ? sizeof(kExpectedDownstream) - 1u
+            : sizeof(kProxyHideHeaderNameOracleResponseNormalized) - 1u;
 
     HeldLoopbackPorts reservations;
     u16 frontend_port = 0u;
@@ -51916,15 +51940,21 @@ static bool run_pinned_retained_header_whitespace_oracle(TempDir& temp,
         }
     }
 
-    const std::string config = make_retained_header_whitespace_oracle_config(
-        frontend_port, backend_port, temp.nginx_access_log, access_log_off, default_log);
+    const std::string config =
+        make_retained_header_whitespace_oracle_config(frontend_port,
+                                                      backend_port,
+                                                      temp.nginx_access_log,
+                                                      access_log_off,
+                                                      default_log,
+                                                      proxy_hide_header_name);
     if (!validate_retained_header_whitespace_oracle_config(config,
                                                            frontend_port,
                                                            backend_port,
                                                            temp.nginx_access_log,
                                                            error,
                                                            access_log_off,
-                                                           default_log) ||
+                                                           default_log,
+                                                           proxy_hide_header_name) ||
         !write_file(temp.nginx_config, config.data(), config.size())) {
         if (error.empty()) error = std::string(kDiagnostic) + " could not persist exact config";
         return false;
@@ -51942,7 +51972,13 @@ static bool run_pinned_retained_header_whitespace_oracle(TempDir& temp,
     origin.wait_response_peer_close = true;
     origin.observe_extra_requests_until_stop = true;
     if (!handoff_held_loopback_port(&reservations.fds[1], backend_port, kDiagnostic, error) ||
-        !origin.setup(backend_port, 1u, kBackendResponse, sizeof(kBackendResponse) - 1u)) {
+        !origin.setup(backend_port,
+                      1u,
+                      proxy_hide_header_name == nullptr ? kBackendResponse
+                                                        : kProxyHideHeaderNameOracleOriginResponse,
+                      proxy_hide_header_name == nullptr
+                          ? sizeof(kBackendResponse) - 1u
+                          : sizeof(kProxyHideHeaderNameOracleOriginResponse) - 1u)) {
         if (error.empty()) error = std::string(kDiagnostic) + " origin setup failed";
         return false;
     }
@@ -51992,17 +52028,20 @@ static bool run_pinned_retained_header_whitespace_oracle(TempDir& temp,
             if (fd >= 0) close(fd);
         }
     } client{connect_once(frontend_port)};
-    if (client.fd < 0 || !send_all(client.fd,
-                                   kRetainedHeaderWhitespaceOracleClientRequest,
-                                   sizeof(kRetainedHeaderWhitespaceOracleClientRequest) - 1u)) {
+    const char* client_request = custom_hide_header ? kProxyHideHeaderClientRequest
+                                                    : kRetainedHeaderWhitespaceOracleClientRequest;
+    const size_t client_request_size =
+        custom_hide_header ? sizeof(kProxyHideHeaderClientRequest) - 1u
+                           : sizeof(kRetainedHeaderWhitespaceOracleClientRequest) - 1u;
+    if (client.fd < 0 || !send_all(client.fd, client_request, client_request_size)) {
         error = std::string(kDiagnostic) + " exact 105-byte request failed";
         return false;
     }
 
     std::vector<char> downstream;
     if (!read_response(client.fd, downstream, error) || !read_eof(client.fd, error) ||
-        downstream.size() != sizeof(kExpectedDownstream) - 1u ||
-        !validate_exact_normalized_response(downstream, kExpectedDownstream, error)) {
+        downstream.size() != expected_downstream_size ||
+        !validate_exact_normalized_response(downstream, expected_downstream, error)) {
         if (error.empty()) error = std::string(kDiagnostic) + " downstream response/EOF mismatch";
         dump_wire(kDiagnostic, downstream);
         return false;
@@ -52041,7 +52080,7 @@ static bool run_pinned_retained_header_whitespace_oracle(TempDir& temp,
     const auto access_is_valid = [&]() {
         if (!special_monitor)
             return read_request_length_access_file(temp.nginx_access_log, access, error) &&
-                   access == "105\n";
+                   access == (custom_hide_header ? "85\n" : "105\n");
         if (!read_monitored_access_file(monitored_access_path, access, error)) return false;
         if (access_log_off) return access.empty();
         if (default_log) {
@@ -52050,7 +52089,7 @@ static bool run_pinned_retained_header_whitespace_oracle(TempDir& temp,
             if (!valid) error.clear();
             return valid;
         }
-        return access == "105\n";
+        return access == (custom_hide_header ? "85\n" : "105\n");
     };
     const auto access_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
     while (!access_is_valid() && std::chrono::steady_clock::now() < access_deadline) {
@@ -52082,8 +52121,11 @@ static bool run_pinned_retained_header_whitespace_oracle(TempDir& temp,
 
     origin.stop();
     const std::string expected_upstream_text =
-        "GET /ledger?q=raw HTTP/1.1\r\nHost: 127.0.0.1:" + std::to_string(backend_port) +
-        "\r\nX-Test: \t keep \t\r\n\r\n";
+        custom_hide_header
+            ? "GET / HTTP/1.1\r\nHost: 127.0.0.1:" + std::to_string(backend_port) +
+                  "\r\nX-Dupe: one\r\nX-Dupe: two\r\n\r\n"
+            : "GET /ledger?q=raw HTTP/1.1\r\nHost: 127.0.0.1:" + std::to_string(backend_port) +
+                  "\r\nX-Test: \t keep \t\r\n\r\n";
     const std::vector<char> expected_upstream(expected_upstream_text.begin(),
                                               expected_upstream_text.end());
     const bool nginx_stopped = stop_child(nginx.child);
@@ -52113,7 +52155,9 @@ static bool run_pinned_retained_header_whitespace_oracle(TempDir& temp,
         dump_wire("#252 actual retained upstream", origin.request);
         return false;
     }
-    if (expected_upstream.size() != 70u || origin.request.size() != 70u) {
+    const size_t expected_upstream_size = custom_hide_header ? 66u : 70u;
+    if (expected_upstream.size() != expected_upstream_size ||
+        origin.request.size() != expected_upstream_size) {
         error = std::string(kDiagnostic) + " exact retained upstream was not 70 bytes";
         return false;
     }
@@ -52129,10 +52173,32 @@ static bool run_pinned_retained_header_whitespace_oracle(TempDir& temp,
     const auto exact_comparator = [&](const std::vector<char>& wire) {
         return wire.size() == expected_upstream.size() && wire == expected_upstream;
     };
+    if (custom_hide_header) {
+        if (!exact_comparator(origin.request)) {
+            error = std::string(kDiagnostic) + " custom 66-byte upstream wire was not exact";
+            return false;
+        }
+    }
     std::vector<char> legacy(expected_upstream.begin(), expected_upstream.end());
     const std::string legacy_suffix = "X-Test: keep\r\n\r\n";
     const std::string expected_suffix = "X-Test: \t keep \t\r\n\r\n";
     const size_t suffix_offset = expected_upstream_text.find(expected_suffix);
+    if (custom_hide_header) {
+        close(client.fd);
+        client.fd = -1;
+        if (observation != nullptr) {
+            observation->response = normalize_retained_response_date(downstream);
+            observation->access = access;
+            observation->upstream = origin.request;
+            observation->config = temp.retained_config_snapshot;
+            observation->frontend_port = frontend_port;
+            observation->backend_port = backend_port;
+        }
+        std::cerr << "PASS evidence: " << kDiagnostic
+                  << " downstream_request=85B,response=141B upstream=66B access=85\\n "
+                     "publication=1 retirement=1 retry=0 live=175ms\n";
+        return true;
+    }
     if (suffix_offset == std::string::npos || legacy_suffix.size() > expected_suffix.size()) {
         error = std::string(kDiagnostic) + " comparator fixture construction failed";
         return false;
@@ -52654,7 +52720,8 @@ static bool run_pinned_request_length_split_fixed_body_oracle(TempDir& temp,
 
 static std::string make_converter_request_length_profile(u16 frontend_port,
                                                          u16 backend_port,
-                                                         const std::string& access_path) {
+                                                         const std::string& access_path,
+                                                         const char* proxy_hide_header_name) {
     return "http {\n"
            "  log_format compat \"$request_length\";\n"
            "  access_log " +
@@ -52666,8 +52733,10 @@ static std::string make_converter_request_length_profile(u16 frontend_port,
            ";\n"
            "    location / {\n"
            "      proxy_pass http://127.0.0.1:" +
-           std::to_string(backend_port) +
-           ";\n"
+           std::to_string(backend_port) + ";\n" +
+           (proxy_hide_header_name == nullptr
+                ? std::string{}
+                : "      proxy_hide_header " + std::string(proxy_hide_header_name) + ";\n") +
            "    }\n"
            "  }\n"
            "}\n";
@@ -52678,7 +52747,8 @@ static bool validate_converter_request_length_source(const std::string& source,
                                                      u16 backend_port,
                                                      const std::string& access_path,
                                                      std::string& error,
-                                                     bool require_access_log = true) {
+                                                     bool require_access_log = true,
+                                                     const char* proxy_hide_header_name = nullptr) {
     const std::string declaration = "accessLog { path: \"" + access_path +
                                     "\", format: downstreamRequestBytes, publication: live }\n";
     const std::string listener = "listen 127.0.0.1:" + std::to_string(frontend_port) + "\n";
@@ -52701,6 +52771,11 @@ static bool validate_converter_request_length_source(const std::string& source,
         "\"Upgrade\"],\n"
         "            retained_header_value: \"trim_sp_preserve_htab\"\n"
         "        },\n";
+    const bool custom_hide_header = proxy_hide_header_name != nullptr;
+    const u32 expected_forward_count = custom_hide_header ? 3u : 4u;
+    const u32 expected_retained_policy_count = custom_hide_header ? 0u : 1u;
+    const u32 expected_content_length_branch_count = custom_hide_header ? 0u : 1u;
+    const u32 expected_timeout_count = custom_hide_header ? 1u : 2u;
     if (frontend_port == 0u || backend_port < 1024u || backend_port > 9999u ||
         frontend_port == backend_port || (require_access_log && access_path.empty()) ||
         (require_access_log && source.rfind(declaration, 0u) != 0u) ||
@@ -52710,14 +52785,23 @@ static bool validate_converter_request_length_source(const std::string& source,
         count_text(source, listener) != 1u || count_text(source, upstream) != 1u ||
         count_text(source, "route GET \"/\"") != 1u ||
         count_text(source, kFixedRequestPolicy) != 3u ||
-        count_text(source, kRetainedRequestPolicy) != 1u ||
-        count_text(source, "    if req.hasContentLength {\n") != 1u ||
-        count_text(source, "return forward(nginx_upstream,") != 4u ||
-        count_text(source, "        response_read_timeout: 60s,\n") != 2u ||
-        count_text(source, "        response_buffering: \"complete_content_length\"\n") != 2u ||
-        count_text(source, "        timeout_failure_policy: {\n") != 2u ||
+        count_text(source, kRetainedRequestPolicy) != expected_retained_policy_count ||
+        count_text(source, "    if req.hasContentLength {\n") !=
+            expected_content_length_branch_count ||
+        count_text(source, "return forward(nginx_upstream,") != expected_forward_count ||
+        count_text(source, "        response_read_timeout: 60s,\n") != expected_timeout_count ||
+        count_text(source, "        response_buffering: \"complete_content_length\"\n") !=
+            expected_timeout_count ||
+        count_text(source, "        timeout_failure_policy: {\n") != expected_timeout_count ||
         (require_access_log && count_text(source, "format: downstreamRequestBytes") != 1u) ||
         (require_access_log && count_text(source, "publication: live") != 1u) ||
+        (proxy_hide_header_name != nullptr &&
+         (count_text(source,
+                     "hide_headers: [\"Date\", \"Server\", \"X-Pad\", \"" +
+                         std::string(proxy_hide_header_name) + "\"]") != 3u ||
+          count_text(source, std::string(proxy_hide_header_name)) != 3u)) ||
+        (proxy_hide_header_name == nullptr &&
+         source.find("hide_headers: [\"Date\", \"Server\", \"X-Pad\", \"") != std::string::npos) ||
         source.find("$request_length") != std::string::npos ||
         source.find("log_format") != std::string::npos ||
         source.find("access_log") != std::string::npos ||
@@ -52726,10 +52810,65 @@ static bool validate_converter_request_length_source(const std::string& source,
         error = "#362 converter-generated ordinary RUT inventory was not exact";
         return false;
     }
-    if (!validate_exact_loopback_conditional_get_structure(source, error, "#362") ||
-        (require_access_log &&
-         !run_exact_loopback_conditional_get_mutation_self_checks(source, error, "#362")))
-        return false;
+    if (!custom_hide_header) {
+        if (!validate_exact_loopback_conditional_get_structure(source, error, "#362") ||
+            (require_access_log &&
+             !run_exact_loopback_conditional_get_mutation_self_checks(source, error, "#362")))
+            return false;
+    } else {
+        const auto lexed = rut::lex({source.data(), static_cast<u32>(source.size())});
+        if (!lexed) {
+            error = "#600 custom-hide generated ordinary RUT did not lex";
+            return false;
+        }
+        const auto parsed = rut::parse_file(lexed.value());
+        if (!parsed) {
+            error = "#600 custom-hide generated ordinary RUT did not parse";
+            return false;
+        }
+        std::unique_ptr<rut::AstFile> ast(parsed.value());
+        bool head = false;
+        bool get = false;
+        bool any = false;
+        u32 route_count = 0u;
+        for (u32 index = 0u; index < ast->items.len; index++) {
+            const auto& item = ast->items[index];
+            if (item.kind != rut::AstItemKind::Route) continue;
+            route_count++;
+            if (!item.route.path.eq({"/", 1u}) || item.route.statements.len != 1u ||
+                item.route.statements[0] == nullptr ||
+                item.route.statements[0]->kind != rut::AstStmtKind::ForwardUpstream ||
+                !item.route.statements[0]->has_forward_request_policy ||
+                !item.route.statements[0]->has_forward_response_policy ||
+                !item.route.statements[0]->has_forward_failure_policy) {
+                error = "#600 custom-hide generated ordinary RUT contained an unexpected route";
+                return false;
+            }
+            if (item.route.method_is_any) {
+                if (any) {
+                    error = "#600 custom-hide generated ordinary RUT duplicated Any route";
+                    return false;
+                }
+                any = true;
+            } else if (item.route.method == static_cast<rut::u8>(rut::TokenType::KwHead)) {
+                if (head) {
+                    error = "#600 custom-hide generated ordinary RUT duplicated HEAD route";
+                    return false;
+                }
+                head = true;
+            } else if (item.route.method == static_cast<rut::u8>(rut::TokenType::KwGet)) {
+                if (get) {
+                    error = "#600 custom-hide generated ordinary RUT duplicated GET route";
+                    return false;
+                }
+                get = true;
+            }
+        }
+        if (route_count != 3u || !head || !get || !any) {
+            error = "#600 custom-hide generated ordinary RUT lacked exact HEAD/GET/Any routes";
+            return false;
+        }
+    }
     return true;
 }
 
@@ -52911,7 +53050,10 @@ static bool run_converter_request_length_rut_side(TempDir& temp,
                                                   std::string& error,
                                                   const char* converter_path = nullptr,
                                                   bool complete_file = false,
-                                                  bool access_log_off = false) {
+                                                  bool access_log_off = false,
+                                                  const char* proxy_hide_header_name = nullptr,
+                                                  std::string* generated_source = nullptr) {
+    const bool custom_hide_header = proxy_hide_header_name != nullptr;
     if (complete_file && (converter_path == nullptr || !retained_header_whitespace)) {
         error = "#583 complete-file mode requires the standalone nginx-http CLI and retained slice";
         return false;
@@ -52948,8 +53090,8 @@ static bool run_converter_request_length_rut_side(TempDir& temp,
             temp.rut_access_log =
                 access_log_off ? temp.nginx_default_access_log : temp.nginx_access_log;
         }
-        const std::string profile =
-            make_converter_request_length_profile(frontend_port, backend_port, temp.rut_access_log);
+        const std::string profile = make_converter_request_length_profile(
+            frontend_port, backend_port, temp.rut_access_log, proxy_hide_header_name);
         if (!complete_file && !write_file(temp.nginx_config, profile.data(), profile.size())) {
             error = "#577 could not persist CLI converter input";
             return false;
@@ -52991,11 +53133,12 @@ static bool run_converter_request_length_rut_side(TempDir& temp,
             error = "#577 standalone converter failed or produced no source";
             return false;
         }
-        if (access_log_off) {
+        if (access_log_off || custom_hide_header) {
             std::string converter_diagnostics;
             if (!read_bounded_file(converter_error, converter_diagnostics, error) ||
                 !converter_diagnostics.empty()) {
-                error = "#591 Off CLI emitted unexpected converter diagnostics";
+                error = access_log_off ? "#591 Off CLI emitted unexpected converter diagnostics"
+                                       : "#600 custom-hide CLI emitted unexpected diagnostics";
                 return false;
             }
         }
@@ -53011,10 +53154,15 @@ static bool run_converter_request_length_rut_side(TempDir& temp,
     if (!read_exact_return204_log(temp.source, "#362 persisted generated RUT", persisted, error) ||
         !(access_log_off ? validate_converter_retained_off_source(
                                persisted, frontend_port, backend_port, error)
-                         : validate_converter_request_length_source(
-                               persisted, frontend_port, backend_port, temp.rut_access_log, error)))
+                         : validate_converter_request_length_source(persisted,
+                                                                    frontend_port,
+                                                                    backend_port,
+                                                                    temp.rut_access_log,
+                                                                    error,
+                                                                    true,
+                                                                    proxy_hide_header_name)))
         return false;
-    if (access_log_off) {
+    if (access_log_off || custom_hide_header) {
         struct LoadedProgramGuard {
             std::unique_ptr<rut::LoadedProgram> value = std::make_unique<rut::LoadedProgram>();
             ~LoadedProgramGuard() {
@@ -53027,14 +53175,157 @@ static bool run_converter_request_length_rut_side(TempDir& temp,
                                    load_error,
                                    rut::jit::OptLevel::O2,
                                    static_cast<u64>(persisted.size())) ||
-            loaded.value->access_log.present) {
-            error = "#591 loaded Off RUT unexpectedly exposed an access-log sink";
+            (access_log_off && loaded.value->access_log.present) ||
+            (custom_hide_header && !loaded.value->access_log.present)) {
+            error = access_log_off ? "#591 loaded Off RUT unexpectedly exposed an access-log sink"
+                                   : "#600 loaded custom-hide RUT lost its access-log sink";
             return false;
         }
-        if (!run_converter_retained_off_source_self_checks(
-                persisted, frontend_port, backend_port, error))
-            return false;
+        if (access_log_off) {
+            if (!run_converter_retained_off_source_self_checks(
+                    persisted, frontend_port, backend_port, error))
+                return false;
+        } else {
+            const rut::Str expected_names[] = {
+                rut::lit_str("Date"),
+                rut::lit_str("Server"),
+                rut::lit_str("X-Pad"),
+                {proxy_hide_header_name, static_cast<rut::u32>(strlen(proxy_hide_header_name))}};
+            const auto owned = [&](rut::Str value) {
+                const uintptr_t begin =
+                    reinterpret_cast<uintptr_t>(loaded.value->config.response_policy_bytes);
+                const uintptr_t end = begin + loaded.value->config.response_policy_bytes_used;
+                const uintptr_t ptr = reinterpret_cast<uintptr_t>(value.ptr);
+                return value.ptr != nullptr && ptr >= begin && ptr <= end && value.len <= end - ptr;
+            };
+            const auto exact_policy = [&](const rut::ForwardResponsePolicySpec& policy) {
+                if (policy.hide_header_count != 4u) return false;
+                for (u32 hidden = 0u; hidden < 4u; hidden++) {
+                    if (!owned(policy.hide_headers[hidden]) ||
+                        !policy.hide_headers[hidden].eq(expected_names[hidden]))
+                        return false;
+                }
+                return owned(policy.server);
+            };
+            if (loaded.value->config.response_policy_count != 2u) {
+                error = "#600 loaded custom-hide RUT response-policy interning was not exact";
+                return false;
+            }
+            u16 head_policy_id = 0u;
+            u16 ordinary_policy_id = 0u;
+            for (u32 index = 0u; index < loaded.value->config.response_policy_count; index++) {
+                const auto& policy = loaded.value->config.response_policies[index];
+                if (!exact_policy(policy)) {
+                    error = "#600 loaded custom-hide response policy was not exact/owned";
+                    return false;
+                }
+                if (policy.head_mode == rut::ResponsePolicyHeadMode::SuppressBody)
+                    head_policy_id = static_cast<u16>(index + 1u);
+                else if (policy.head_mode == rut::ResponsePolicyHeadMode::Reject)
+                    ordinary_policy_id = static_cast<u16>(index + 1u);
+                else {
+                    error = "#600 loaded custom-hide response policy had an invalid head mode";
+                    return false;
+                }
+            }
+            if (head_policy_id == 0u || ordinary_policy_id == 0u) {
+                error = "#600 loaded custom-hide response policies lacked HEAD/ordinary pair";
+                return false;
+            }
+            const auto result_matches_route = [&](const rut::RouteEntry& route,
+                                                  const rut::jit::HandlerResult& result,
+                                                  u16 expected_response_policy_id) {
+                if (route.fn == nullptr ||
+                    result.action != rut::jit::HandlerAction::ForwardBundle ||
+                    result.status_code !=
+                        static_cast<u16>(rut::RequestPolicyId::Http11FixedStrip) ||
+                    result.upstream_id != 0u || result.next_state == 0u ||
+                    result.next_state > loaded.value->config.policy_bundle_count)
+                    return false;
+                const auto& bundle = loaded.value->config.policy_bundles[result.next_state - 1u];
+                return bundle.response_policy_id == expected_response_policy_id &&
+                       bundle.response_policy_id <= loaded.value->config.response_policy_count &&
+                       exact_policy(
+                           loaded.value->config.response_policies[bundle.response_policy_id - 1u]);
+            };
+            u32 root_route_count = 0u;
+            u32 bound_get = 0u;
+            u32 bound_head = 0u;
+            u32 bound_any = 0u;
+            for (u32 index = 0u; index < loaded.value->config.route_count; index++) {
+                const rut::RouteEntry& route = loaded.value->config.routes[index];
+                if (route.path_len != 1u || route.path[0] != '/' ||
+                    route.action != rut::RouteAction::JitHandler || route.fn == nullptr) {
+                    error = "#600 loaded custom-hide RUT contained an unexpected route";
+                    return false;
+                }
+                root_route_count++;
+                const auto method = route.method;
+                if (method == rut::kRouteMethodGet) bound_get++;
+                if (method == rut::kRouteMethodHead) bound_head++;
+                if (method == rut::kRouteMethodAny) bound_any++;
+                if (method != rut::kRouteMethodGet && method != rut::kRouteMethodHead &&
+                    method != rut::kRouteMethodAny) {
+                    error = "#600 loaded custom-hide RUT contained an unexpected method";
+                    return false;
+                }
+                const u16 expected_policy_id =
+                    method == rut::kRouteMethodHead ? head_policy_id : ordinary_policy_id;
+                const char* request =
+                    method == rut::kRouteMethodHead  ? "HEAD / HTTP/1.1\r\nHost: test\r\n\r\n"
+                    : method == rut::kRouteMethodGet ? "GET / HTTP/1.1\r\nHost: test\r\n\r\n"
+                                                     : "POST / HTTP/1.1\r\nHost: test\r\n\r\n";
+                const u32 request_len = static_cast<u32>(strlen(request));
+                const rut::jit::HandlerResult result = rut::jit::HandlerResult::unpack(
+                    route.fn(nullptr,
+                             nullptr,
+                             reinterpret_cast<const rut::u8*>(request),
+                             request_len,
+                             nullptr));
+                if (!result_matches_route(route, result, expected_policy_id)) {
+                    error = "#600 loaded custom-hide JIT result lacked exact route policy";
+                    return false;
+                }
+                const auto rejects_result_mutation = [&](rut::jit::HandlerResult mutated,
+                                                         const char* label) {
+                    if (result_matches_route(route, mutated, expected_policy_id)) {
+                        error =
+                            std::string("#600 loaded custom-hide JIT accepted mutation: ") + label;
+                        return false;
+                    }
+                    return true;
+                };
+                rut::jit::HandlerResult mutated = result;
+                mutated.action = rut::jit::HandlerAction::ReturnStatus;
+                if (!rejects_result_mutation(mutated, "wrong-action")) return false;
+                mutated = result;
+                mutated.next_state = 0u;
+                if (!rejects_result_mutation(mutated, "zero-bundle")) return false;
+                mutated = result;
+                mutated.next_state =
+                    static_cast<u16>(loaded.value->config.policy_bundle_count + 1u);
+                if (!rejects_result_mutation(mutated, "out-of-range-bundle")) return false;
+                mutated = result;
+                mutated.upstream_id = 1u;
+                if (!rejects_result_mutation(mutated, "wrong-upstream")) return false;
+                mutated = result;
+                mutated.status_code = 2u;
+                if (!rejects_result_mutation(mutated, "wrong-request-policy")) return false;
+                if (result_matches_route(route,
+                                         result,
+                                         expected_policy_id == head_policy_id ? ordinary_policy_id
+                                                                              : head_policy_id)) {
+                    error = "#600 loaded custom-hide JIT accepted HEAD/ordinary policy mismatch";
+                    return false;
+                }
+            }
+            if (root_route_count != 3u || bound_get != 1u || bound_head != 1u || bound_any != 1u) {
+                error = "#600 loaded custom-hide RUT lacked exact HEAD/GET/Any bindings";
+                return false;
+            }
+        }
     }
+    if (generated_source != nullptr) *generated_source = persisted;
     persisted.clear();
     persisted.shrink_to_fit();
 
@@ -53048,9 +53339,22 @@ static bool run_converter_request_length_rut_side(TempDir& temp,
     RecorderGuard backend_guard{&backend};
     backend.wait_response_peer_close = require_peer_retirement;
     backend.observe_extra_requests_until_stop = true;
+    const char* expected_origin = proxy_hide_header_name == nullptr
+                                      ? kBackendResponse
+                                      : kProxyHideHeaderNameOracleOriginResponse;
+    const size_t expected_origin_size = proxy_hide_header_name == nullptr
+                                            ? sizeof(kBackendResponse) - 1u
+                                            : sizeof(kProxyHideHeaderNameOracleOriginResponse) - 1u;
+    const char* expected_normalized = proxy_hide_header_name == nullptr
+                                          ? kSuccessResponseNormalized
+                                          : kProxyHideHeaderNameOracleResponseNormalized;
+    const size_t expected_normalized_size =
+        proxy_hide_header_name == nullptr
+            ? sizeof(kSuccessResponseNormalized) - 1u
+            : sizeof(kProxyHideHeaderNameOracleResponseNormalized) - 1u;
     if (!handoff_held_loopback_port(
             &reservations.fds[1], backend_port, "#362 generated RUT Recorder bind", error) ||
-        !backend.setup(backend_port, 1u, kBackendResponse, sizeof(kBackendResponse) - 1u)) {
+        !backend.setup(backend_port, 1u, expected_origin, expected_origin_size)) {
         if (error.empty()) error = "#362 generated-RUT Recorder could not bind held backend";
         return false;
     }
@@ -53099,7 +53403,9 @@ static bool run_converter_request_length_rut_side(TempDir& temp,
                backend.response_send_all_calls.load(std::memory_order_acquire) == expected;
     };
     const std::string expected_access =
-        access_log_off ? "" : (retained_header_whitespace ? "105\n" : "102\n");
+        access_log_off
+            ? ""
+            : (custom_hide_header ? "85\n" : (retained_header_whitespace ? "105\n" : "102\n"));
     const auto read_access = [&](std::string& bytes, std::string& detail) {
         return access_log_off ? read_monitored_access_file(temp.rut_access_log, bytes, detail)
                               : read_request_length_access_file(temp.rut_access_log, bytes, detail);
@@ -53114,7 +53420,9 @@ static bool run_converter_request_length_rut_side(TempDir& temp,
         }
         if (retained_header_whitespace) {
             if (bytes != expected_access) {
-                detail = "#252 generated-RUT access file was not exactly 105 plus newline";
+                detail = custom_hide_header
+                             ? "#600 generated-RUT access file was not exactly 85 plus newline"
+                             : "#252 generated-RUT access file was not exactly 105 plus newline";
                 return false;
             }
             return true;
@@ -53199,11 +53507,15 @@ static bool run_converter_request_length_rut_side(TempDir& temp,
             return false;
         }
     } else if (!send_all(client.fd,
-                         retained_header_whitespace ? kRetainedHeaderWhitespaceOracleClientRequest
-                                                    : kRequestLengthOracleClientRequest,
-                         retained_header_whitespace
-                             ? sizeof(kRetainedHeaderWhitespaceOracleClientRequest) - 1u
-                             : sizeof(kRequestLengthOracleClientRequest) - 1u)) {
+                         custom_hide_header ? kProxyHideHeaderClientRequest
+                                            : (retained_header_whitespace
+                                                   ? kRetainedHeaderWhitespaceOracleClientRequest
+                                                   : kRequestLengthOracleClientRequest),
+                         custom_hide_header
+                             ? sizeof(kProxyHideHeaderClientRequest) - 1u
+                             : (retained_header_whitespace
+                                    ? sizeof(kRetainedHeaderWhitespaceOracleClientRequest) - 1u
+                                    : sizeof(kRequestLengthOracleClientRequest) - 1u))) {
         error = retained_header_whitespace
                     ? "#252 generated RUT exact 105-byte application send failed"
                     : "#362 generated RUT exact 102-byte application send failed";
@@ -53211,7 +53523,8 @@ static bool run_converter_request_length_rut_side(TempDir& temp,
     }
     std::vector<char> response;
     if (!read_response(client.fd, response, error) || !read_eof(client.fd, error) ||
-        !validate_exact_normalized_response(response, kSuccessResponseNormalized, error)) {
+        response.size() != expected_normalized_size ||
+        !validate_exact_normalized_response(response, expected_normalized, error)) {
         if (error.empty())
             error = split_header_delivery
                         ? "#370 generated-RUT split request/response episode failed"
@@ -53230,9 +53543,12 @@ static bool run_converter_request_length_rut_side(TempDir& temp,
         return false;
 
     const std::string expected_upstream =
-        "GET /ledger?q=raw HTTP/1.1\r\nHost: 127.0.0.1:" + std::to_string(backend_port) +
-        (retained_header_whitespace ? "\r\nX-Test: \t keep \t\r\n\r\n"
-                                    : "\r\nX-Test: keep\r\n\r\n");
+        custom_hide_header
+            ? "GET / HTTP/1.1\r\nHost: 127.0.0.1:" + std::to_string(backend_port) +
+                  "\r\nX-Dupe: one\r\nX-Dupe: two\r\n\r\n"
+            : "GET /ledger?q=raw HTTP/1.1\r\nHost: 127.0.0.1:" + std::to_string(backend_port) +
+                  (retained_header_whitespace ? "\r\nX-Test: \t keep \t\r\n\r\n"
+                                              : "\r\nX-Test: keep\r\n\r\n");
     const std::vector<char> expected_wire(expected_upstream.begin(), expected_upstream.end());
     const u64 response_sent_ns = backend.response_sent_ns.load(std::memory_order_acquire);
     const u64 response_peer_closed_ns =
@@ -53308,7 +53624,7 @@ static bool run_converter_request_length_rut_side(TempDir& temp,
     std::string final_access;
     std::string runtime_log;
     bool retained_comparator_ok = true;
-    if (retained_header_whitespace) {
+    if (retained_header_whitespace && !custom_hide_header) {
         const auto exact_comparator = [&](const std::vector<char>& wire) {
             return wire == expected_wire;
         };
@@ -53335,14 +53651,21 @@ static bool run_converter_request_length_rut_side(TempDir& temp,
         backend.listener_failed.load(std::memory_order_acquire) ||
         !complete_origin_episode_is_exact(backend) || backend.history.size() != 1u ||
         backend.request != expected_wire || backend.history[0] != expected_wire ||
-        (retained_header_whitespace ? expected_upstream.size() != 70u
-                                    : expected_upstream.size() != 66u) ||
-        (retained_header_whitespace
-             ? sizeof(kRetainedHeaderWhitespaceOracleClientRequest) - 1u != 105u
-             : sizeof(kRequestLengthOracleClientRequest) - 1u == expected_upstream.size()) ||
+        (custom_hide_header ? expected_upstream.size() != 66u
+                            : (retained_header_whitespace ? expected_upstream.size() != 70u
+                                                          : expected_upstream.size() != 66u)) ||
+        (custom_hide_header
+             ? sizeof(kProxyHideHeaderClientRequest) - 1u != 85u
+             : (retained_header_whitespace
+                    ? sizeof(kRetainedHeaderWhitespaceOracleClientRequest) - 1u != 105u
+                    : sizeof(kRequestLengthOracleClientRequest) - 1u ==
+                          expected_upstream.size())) ||
         count_text(actual, "Host: 127.0.0.1:") != 1u ||
-        (retained_header_whitespace ? count_text(actual, "X-Test: \t keep \t\r\n") != 1u
-                                    : count_text(actual, "X-Test: keep\r\n") != 1u) ||
+        (custom_hide_header
+             ? (count_text(actual, "X-Dupe: one\r\n") != 1u ||
+                count_text(actual, "X-Dupe: two\r\n") != 1u)
+             : (retained_header_whitespace ? count_text(actual, "X-Test: \t keep \t\r\n") != 1u
+                                           : count_text(actual, "X-Test: keep\r\n") != 1u)) ||
         actual.find("client.example") != std::string::npos ||
         actual.find("Connection:") != std::string::npos ||
         (!retained_header_whitespace && actual.find('\t') != std::string::npos) ||
@@ -53445,7 +53768,10 @@ static bool run_converter_retained_header_whitespace_differential(
     const char* rut_path,
     std::string& error,
     const char* converter_path = nullptr,
-    bool complete_file = false) {
+    bool complete_file = false,
+    const char* proxy_hide_header_name = nullptr,
+    std::string* generated_source_out = nullptr,
+    RetainedHeaderObservation* generated_observation_out = nullptr) {
     HeldLoopbackPorts rut_reservations;
     u16 rut_frontend_port = 0u;
     u16 rut_backend_port = 0u;
@@ -53458,8 +53784,17 @@ static bool run_converter_retained_header_whitespace_differential(
     if (!retained_header_comparator_self_check(error)) return false;
     RetainedHeaderObservation nginx_observation;
     RetainedHeaderObservation generated_observation;
-    if (!run_pinned_retained_header_whitespace_oracle(
-            temp, container_name, &nginx_observation, error, complete_file))
+    std::string generated_source;
+    if (!run_pinned_retained_header_whitespace_oracle(temp,
+                                                      container_name,
+                                                      &nginx_observation,
+                                                      error,
+                                                      complete_file,
+                                                      false,
+                                                      false,
+                                                      0u,
+                                                      0u,
+                                                      proxy_hide_header_name))
         return false;
     if (complete_file) {
         rut_frontend_port = temp.retained_frontend_port;
@@ -53474,8 +53809,10 @@ static bool run_converter_retained_header_whitespace_differential(
                                       "#583 stopped nginx access snapshot",
                                       snapshot,
                                       error) ||
-            snapshot != "105\n") {
-            error = "#583 stopped nginx access snapshot was not exactly 105+LF";
+            snapshot != (proxy_hide_header_name == nullptr ? "105\n" : "85\n")) {
+            error = proxy_hide_header_name == nullptr
+                        ? "#583 stopped nginx access snapshot was not exactly 105+LF"
+                        : "#600 stopped nginx access snapshot was not exactly 85+LF";
             return false;
         }
         if (!rut_reservations.reserve_specific(0u, rut_frontend_port) ||
@@ -53498,12 +53835,161 @@ static bool run_converter_retained_header_whitespace_differential(
                                                &generated_observation,
                                                error,
                                                converter_path,
-                                               complete_file))
+                                               complete_file,
+                                               false,
+                                               proxy_hide_header_name,
+                                               &generated_source))
         return false;
-    if (!compare_retained_header_observations(
-            nginx_observation, generated_observation, error, complete_file))
+    if (!compare_retained_header_observations(nginx_observation,
+                                              generated_observation,
+                                              error,
+                                              complete_file,
+                                              proxy_hide_header_name == nullptr ? 70u : 66u))
         return false;
+    if (generated_source_out != nullptr) *generated_source_out = generated_source;
+    if (generated_observation_out != nullptr) *generated_observation_out = generated_observation;
     return true;
+}
+
+static bool run_converter_proxy_hide_header_name_differential(const char* rut_path,
+                                                              const char* converter_path,
+                                                              std::string& error) {
+    static constexpr char kName[] = "X-Powered-By";
+    if (rut_path == nullptr || converter_path == nullptr) {
+        error = "#600 custom proxy_hide_header differential requires RUT and converter executables";
+        return false;
+    }
+    TempDir temp;
+    if (!temp.create()) {
+        error = "#600 custom proxy_hide_header differential could not create a temporary directory";
+        return false;
+    }
+    if (!retained_header_comparator_self_check(error)) return false;
+    RetainedHeaderObservation nginx_observation;
+    RetainedHeaderObservation generated_observation;
+    std::string generated_source;
+    const std::string container_name = "rut-nginx-600-custom-hide-" + std::to_string(getpid());
+    if (!run_converter_retained_header_whitespace_differential(temp,
+                                                               container_name,
+                                                               rut_path,
+                                                               error,
+                                                               converter_path,
+                                                               true,
+                                                               kName,
+                                                               &generated_source,
+                                                               &generated_observation))
+        return false;
+    if (generated_source.empty()) {
+        error = "#600 generated custom-hide source was not captured before source poisoning";
+        return false;
+    }
+
+    const RetainedHeaderObservation baseline = generated_observation;
+    const auto rejects_observation = [&](const RetainedHeaderObservation& candidate,
+                                         const char* label) {
+        std::string detail;
+        if (compare_retained_header_observations(baseline, candidate, detail, true, 66u)) {
+            error = std::string("#600 custom-hide response validator accepted: ") + label;
+            return false;
+        }
+        return true;
+    };
+    if (!compare_retained_header_observations(baseline, baseline, error, true, 66u)) return false;
+    RetainedHeaderObservation changed = baseline;
+    std::string leaked(changed.response.begin(), changed.response.end());
+    const size_t unrelated_at = leaked.find("X-Unrelated: retained");
+    if (unrelated_at == std::string::npos) {
+        error = "#600 custom-hide response mutation fixture lacked X-Unrelated";
+        return false;
+    }
+    leaked.insert(unrelated_at, "X-Powered-By: leaked\r\n");
+    changed.response.assign(leaked.begin(), leaked.end());
+    if (!rejects_observation(changed, "hidden-header-leak")) return false;
+    changed = baseline;
+    std::string unrelated(changed.response.begin(), changed.response.end());
+    unrelated.erase(unrelated_at, strlen("X-Unrelated: retained"));
+    changed.response.assign(unrelated.begin(), unrelated.end());
+    if (!rejects_observation(changed, "unrelated-header-loss")) return false;
+    changed = baseline;
+    std::string body(changed.response.begin(), changed.response.end());
+    const size_t body_at = body.rfind("OK");
+    if (body_at == std::string::npos) {
+        error = "#600 custom-hide response mutation fixture lacked body";
+        return false;
+    }
+    body.replace(body_at, 2u, "NO");
+    changed.response.assign(body.begin(), body.end());
+    if (!rejects_observation(changed, "body-change")) return false;
+    changed = baseline;
+    const std::string content_length = "Content-Length: 2\r\n";
+    const std::string connection = "Connection: close\r\n";
+    const size_t content_at =
+        std::string(changed.response.begin(), changed.response.end()).find(content_length);
+    const std::string baseline_response(changed.response.begin(), changed.response.end());
+    const size_t connection_at = baseline_response.find(connection);
+    if (content_at == std::string::npos || connection_at == std::string::npos ||
+        connection_at != content_at + content_length.size()) {
+        error = "#600 custom-hide response mutation fixture lacked ordered headers";
+        return false;
+    }
+    std::string reordered(changed.response.begin(), changed.response.end());
+    reordered.replace(
+        content_at, content_length.size() + connection.size(), connection + content_length);
+    changed.response.assign(reordered.begin(), reordered.end());
+    if (!rejects_observation(changed, "header-order-change")) return false;
+
+    const auto rejects = [&](const std::string& candidate, const char* label) {
+        std::string detail;
+        if (validate_converter_request_length_source(candidate,
+                                                     temp.retained_frontend_port,
+                                                     temp.retained_backend_port,
+                                                     temp.nginx_access_log,
+                                                     detail,
+                                                     true,
+                                                     kName)) {
+            error = std::string("#600 generated-source mutation accepted: ") + label;
+            return false;
+        }
+        return true;
+    };
+    std::string candidate = generated_source;
+    const std::string hide =
+        "hide_headers: [\"Date\", \"Server\", \"X-Pad\", \"" + std::string(kName) + "\"]";
+    const size_t hide_at = candidate.find(hide);
+    if (hide_at == std::string::npos) {
+        error = "#600 generated source lacked the authenticated custom hide list";
+        return false;
+    }
+    candidate.replace(
+        hide_at, hide.size(), "hide_headers: [\"Date\", \"Server\", \"X-Pad\", \"X-Unrelated\"]");
+    if (!rejects(candidate, "unrelated-header-substitution")) return false;
+    candidate = generated_source;
+    candidate += generated_source;
+    if (!rejects(candidate, "duplicate-generated-program")) return false;
+    candidate = generated_source;
+    const std::string listener = "listen 127.0.0.1:" + std::to_string(temp.retained_frontend_port);
+    const size_t listener_at = candidate.find(listener);
+    if (listener_at == std::string::npos) {
+        error = "#600 generated source lacked the exact listener";
+        return false;
+    }
+    candidate.replace(listener_at,
+                      listener.size(),
+                      "listen 127.0.0.1:" + std::to_string(temp.retained_frontend_port + 1u));
+    if (!rejects(candidate, "alternate-listener")) return false;
+    candidate = generated_source;
+    const std::string upstream = "127.0.0.1:" + std::to_string(temp.retained_backend_port);
+    const size_t upstream_at = candidate.find(upstream);
+    if (upstream_at == std::string::npos) {
+        error = "#600 generated source lacked the exact upstream";
+        return false;
+    }
+    candidate.replace(upstream_at,
+                      upstream.size(),
+                      "127.0.0.1:" + std::to_string(temp.retained_backend_port + 1u));
+    if (!rejects(candidate, "alternate-upstream")) return false;
+    candidate = generated_source + "\nroute POST \"/\" { return 204 }\n";
+    return rejects(candidate, "unexpected-local-response-route");
 }
 
 static bool run_converter_retained_access_log_off_four_phase(const char* rut_path,
@@ -74190,6 +74676,8 @@ int main(int argc, char** argv) {
         argc == 4 && strcmp(argv[1], "--converter-complete-file-retained-differential") == 0;
     const bool converter_retained_access_log_off_four_phase =
         argc == 4 && strcmp(argv[1], "--converter-retained-access-log-off-four-phase") == 0;
+    const bool converter_proxy_hide_header_name_differential =
+        argc == 4 && strcmp(argv[1], "--converter-proxy-hide-header-name-differential") == 0;
     const bool converter_request_length_fixed_body_differential =
         argc == 3 && strcmp(argv[1], "--converter-request-length-fixed-body-differential") == 0;
     const bool converter_request_length_split_fixed_body_differential =
@@ -74413,6 +74901,7 @@ int main(int argc, char** argv) {
          !converter_retained_header_whitespace_differential &&
          !converter_complete_file_retained_differential &&
          !converter_retained_access_log_off_four_phase &&
+         !converter_proxy_hide_header_name_differential &&
          !converter_request_length_fixed_body_differential &&
          !converter_request_length_split_fixed_body_differential &&
          !exact_loopback_return204_oracle && !exact_loopback_bodyful_return_oracle &&
@@ -74507,7 +74996,8 @@ int main(int argc, char** argv) {
         (converter_request_length_differential && argv[2][0] != '/') ||
         (converter_request_length_split_header_differential && argv[2][0] != '/') ||
         ((converter_retained_header_whitespace_differential ||
-          converter_complete_file_retained_differential) &&
+          converter_complete_file_retained_differential ||
+          converter_proxy_hide_header_name_differential) &&
          (argv[2][0] != '/' || (argc == 4 && argv[3][0] != '/'))) ||
         (converter_request_length_fixed_body_differential && argv[2][0] != '/') ||
         (converter_request_length_split_fixed_body_differential && argv[2][0] != '/') ||
@@ -75146,7 +75636,8 @@ int main(int argc, char** argv) {
         converter_request_length_split_header_differential ||
         converter_retained_header_whitespace_differential ||
         converter_complete_file_retained_differential ||
-        converter_retained_access_log_off_four_phase) {
+        converter_retained_access_log_off_four_phase ||
+        converter_proxy_hide_header_name_differential) {
         std::string self_check_error;
         if (!run_request_length_oracle_self_checks(self_check_error)) {
             std::cerr << "FAIL [#362 request-length oracle self-check]: " << self_check_error
@@ -75402,6 +75893,15 @@ int main(int argc, char** argv) {
         if (!run_proxy_hide_header_name_self_checks(self_check_error) ||
             !run_proxy_hide_header_name_config_preflight(self_check_error)) {
             std::cerr << "FAIL [#600 proxy-hide-header-name self-check]: " << self_check_error
+                      << "\n";
+            return 1;
+        }
+    }
+    if (converter_proxy_hide_header_name_differential) {
+        std::string self_check_error;
+        if (!run_proxy_hide_header_name_self_checks(self_check_error) ||
+            !run_proxy_hide_header_name_config_preflight(self_check_error)) {
+            std::cerr << "FAIL [#600 custom proxy-hide-header self-check]: " << self_check_error
                       << "\n";
             return 1;
         }
@@ -77163,6 +77663,20 @@ int main(int argc, char** argv) {
                "118-byte retained wire and EOF, one origin retirement, no retry, 175ms stability, "
                "authenticated Off sink absence, and the same owned monitor's exact 105\\n positive "
                "record\n";
+        return 0;
+    }
+    if (converter_proxy_hide_header_name_differential) {
+        std::string differential_error;
+        if (!run_converter_proxy_hide_header_name_differential(
+                argv[2], argv[3], differential_error)) {
+            std::cerr << "FAIL [#600 custom proxy_hide_header CLI differential]: "
+                      << differential_error << "\n";
+            return 1;
+        }
+        std::cerr << "PASS: #600 one immutable complete nginx-http file reached pinned nginx and "
+                     "the CLI-generated ordinary RUT; exact 85-byte/66-byte/141-byte custom-"
+                     "hide wire, X-Unrelated retention, 85\\n access, EOF, one origin retirement, "
+                     "no retry, 175ms stability, and source mutations were authenticated\n";
         return 0;
     }
     if (converter_retained_header_whitespace_differential) {

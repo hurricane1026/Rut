@@ -1945,6 +1945,19 @@ if(RUT_ENABLE_JIT)
         ENVIRONMENT "RUT_NGINX_DIFFERENTIAL_REQUIRED=1"
     )
     add_test(
+        NAME test_nginx_issue600_converter_proxy_hide_header_name_differential
+        COMMAND test_nginx_differential --converter-proxy-hide-header-name-differential
+                $<TARGET_FILE:rut> $<TARGET_FILE:rut-nginx-convert>
+    )
+    set_tests_properties(test_nginx_issue600_converter_proxy_hide_header_name_differential
+        PROPERTIES
+        LABELS "integration;nginx;docker;io_uring;network;converter"
+        RUN_SERIAL TRUE
+        RESOURCE_LOCK nginx-differential
+        TIMEOUT 240
+        ENVIRONMENT "RUT_NGINX_DIFFERENTIAL_REQUIRED=1"
+    )
+    add_test(
         NAME test_nginx_issue370_request_length_split_header_oracle
         COMMAND test_nginx_differential --pinned-nginx-request-length-split-header-oracle
     )
