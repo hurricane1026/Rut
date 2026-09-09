@@ -12,9 +12,14 @@ name witnesses. #620 merged at `9034ca51` after CI `34316694133` passed 15/15
 jobs and required nginx 154/154. #622 merged at `233a0321` after CI
 `34318669602` passed 15/15 and required nginx 155/155; it adds nginx-only
 omitted/explicit-on buffering equivalence for that fixture, not generated-RUT
-support for the explicit-on composition. Positive admission remains #621.
+support for the explicit-on composition. Positive admission remains #621;
+reviewed lowering `41487c0f` passes Release and no-JIT component tests but awaits
+final CI/integration and the explicit-on generated-RUT network witness. This
+component evidence does not promote the composition to `SUPPORTED`.
 #623 tracks a reproduced source-backed Server-model hide-metadata erasure gap;
-its reviewed component fix awaits final integration. Broad #270 remains
+its fix merged through #624 at `2bba609a` after CI `34320265023` passed all
+15 jobs and required nginx 155/155. This strengthens model authentication only.
+Broad #270 remains
 `PARTIAL` and #271 remains `BLOCKED_BY_RUT`.
 
 | nginx feature | parser | converter | RUT capability | behavior test | status |

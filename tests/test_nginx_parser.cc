@@ -15,6 +15,8 @@
 #include "rut/runtime/connection_base.h"
 #include "rut/runtime/listener.h"
 #include "test.h"
+#include <algorithm>
+#include <array>
 #include <cstddef>
 #include <iostream>
 #include <memory>
@@ -3760,15 +3762,22 @@ TEST(nginx_converter, admits_authenticated_explicit_proxy_buffering_on_timeout_f
     REQUIRE_FALSE(no_timeout_result);
     CHECK(no_timeout_result.error().detail.eq(
         lit_str("proxy_buffering on requires the bounded timeout proxy profile")));
+    const char no_timeout_hide_source[] =
+        "server { listen 127.0.0.1:8080; location / { proxy_buffering on; "
+        "proxy_hide_header X-A; proxy_pass http://127.0.0.1:9000; } }";
+    const auto no_timeout_hide =
+        nginx::parse({no_timeout_hide_source, sizeof(no_timeout_hide_source) - 1u});
+    REQUIRE(no_timeout_hide);
+    const auto no_timeout_hide_result = nginx::lower_to_rut(no_timeout_hide.value());
+    REQUIRE_FALSE(no_timeout_hide_result);
+    CHECK(no_timeout_hide_result.error().detail.eq(
+        lit_str("proxy_buffering on requires the bounded timeout proxy profile")));
 
     const char* const rejected_profiles[] = {
         "server { listen 8080; location / { proxy_buffering on; proxy_read_timeout 1s; "
         "proxy_pass http://127.0.0.1:9000; } }",
         "server { listen 192.0.2.10:8080; location / { proxy_buffering on; "
         "proxy_read_timeout 1s; proxy_pass http://127.0.0.1:9000; } }",
-        "server { listen 127.0.0.1:8080; location / { proxy_buffering on; "
-        "proxy_read_timeout 1s; proxy_hide_header X-Compat-Hidden; proxy_pass "
-        "http://127.0.0.1:9000; } }",
         "server { listen 127.0.0.1:8080; location / { proxy_buffering on; "
         "proxy_read_timeout 1s; proxy_pass http://127.0.0.1:9000; } "
         "location = /old { return 302 http://redirect.example/new; } }",
@@ -3787,6 +3796,34 @@ TEST(nginx_converter, admits_authenticated_explicit_proxy_buffering_on_timeout_f
     const auto erased_result = nginx::lower_to_rut(erased);
     REQUIRE_FALSE(erased_result);
     CHECK(erased_result.error().detail.eq(lit_str("proxy_buffering metadata was erased")));
+
+    const char combined_source[] =
+        "server { listen 127.0.0.1:8080; location / { proxy_buffering on; "
+        "proxy_read_timeout 1s; proxy_hide_header X-A; proxy_pass http://127.0.0.1:9000; } }";
+    const auto combined = nginx::parse({combined_source, sizeof(combined_source) - 1u});
+    REQUIRE(combined);
+    auto combined_erased_hide = combined.value();
+    combined_erased_hide.location.proxy_hide_header = {};
+    const auto combined_erased_hide_result = nginx::lower_to_rut(combined_erased_hide);
+    REQUIRE_FALSE(combined_erased_hide_result);
+    CHECK(combined_erased_hide_result.error().detail.eq(
+        lit_str("proxy_hide_header metadata was erased")));
+    auto combined_shifted_hide = combined.value();
+    combined_shifted_hide.location.proxy_hide_header.span.start++;
+    const auto combined_shifted_hide_result = nginx::lower_to_rut(combined_shifted_hide);
+    REQUIRE_FALSE(combined_shifted_hide_result);
+    auto combined_overlapping = combined.value();
+    combined_overlapping.location.proxy_hide_header.span.start =
+        combined_overlapping.location.proxy_buffering.span.start;
+    const auto combined_overlapping_result = nginx::lower_to_rut(combined_overlapping);
+    REQUIRE_FALSE(combined_overlapping_result);
+    auto combined_hide_precedence = combined.value();
+    combined_hide_precedence.location.proxy_hide_header.name.ptr = nullptr;
+    combined_hide_precedence.location.proxy_buffering.span.start++;
+    const auto combined_hide_precedence_result = nginx::lower_to_rut(combined_hide_precedence);
+    REQUIRE_FALSE(combined_hide_precedence_result);
+    CHECK(combined_hide_precedence_result.error().detail.eq(
+        lit_str("invalid proxy_hide_header name model")));
 
     const auto expect_rejected = [&](nginx::Server candidate) {
         const auto result = nginx::lower_to_rut(candidate);
@@ -3945,11 +3982,33 @@ TEST(nginx_converter, http_profile_compares_proxy_buffering_metadata_before_lowe
     const auto explicit_hide = nginx::parse_http_profile(
         {explicit_hide_source.data(), static_cast<u32>(explicit_hide_source.size())});
     REQUIRE(explicit_hide);
+    const auto explicit_hide_lowered = nginx::lower_to_rut(explicit_hide.value());
+    REQUIRE(explicit_hide_lowered);
     auto explicit_hide_erased = explicit_hide.value();
     explicit_hide_erased.server.location.proxy_hide_header = {};
     const auto explicit_hide_result = nginx::lower_to_rut(explicit_hide_erased);
     REQUIRE_FALSE(explicit_hide_result);
     CHECK(explicit_hide_result.error().detail.eq(
+        lit_str("http profile metadata does not match its source")));
+    auto explicit_hide_shifted_buffering = explicit_hide.value();
+    explicit_hide_shifted_buffering.server.location.proxy_buffering.span.start++;
+    const auto explicit_hide_shifted_buffering_result =
+        nginx::lower_to_rut(explicit_hide_shifted_buffering);
+    REQUIRE_FALSE(explicit_hide_shifted_buffering_result);
+    CHECK(explicit_hide_shifted_buffering_result.error().detail.eq(
+        lit_str("http profile metadata does not match its source")));
+    auto explicit_hide_shifted_hide = explicit_hide.value();
+    explicit_hide_shifted_hide.server.location.proxy_hide_header.span.start++;
+    const auto explicit_hide_shifted_hide_result = nginx::lower_to_rut(explicit_hide_shifted_hide);
+    REQUIRE_FALSE(explicit_hide_shifted_hide_result);
+    CHECK(explicit_hide_shifted_hide_result.error().detail.eq(
+        lit_str("http profile metadata does not match its source")));
+    auto explicit_hide_overlapping = explicit_hide.value();
+    explicit_hide_overlapping.server.location.proxy_hide_header.span.start =
+        explicit_hide_overlapping.server.location.proxy_buffering.span.start;
+    const auto explicit_hide_overlapping_result = nginx::lower_to_rut(explicit_hide_overlapping);
+    REQUIRE_FALSE(explicit_hide_overlapping_result);
+    CHECK(explicit_hide_overlapping_result.error().detail.eq(
         lit_str("http profile metadata does not match its source")));
 
     const std::string omitted_hide_source = make_request_length_http_profile(
@@ -3960,6 +4019,24 @@ TEST(nginx_converter, http_profile_compares_proxy_buffering_metadata_before_lowe
     const auto omitted_hide = nginx::parse_http_profile(
         {omitted_hide_source.data(), static_cast<u32>(omitted_hide_source.size())});
     REQUIRE(omitted_hide);
+    const auto omitted_hide_lowered = nginx::lower_to_rut(omitted_hide.value());
+    REQUIRE(omitted_hide_lowered);
+    CHECK(explicit_hide_lowered.value().view().eq(omitted_hide_lowered.value().view()));
+    const auto profile_lexed = lex(explicit_hide_lowered.value().view());
+    REQUIRE(profile_lexed);
+    const auto profile_ast = parse_file(profile_lexed.value());
+    REQUIRE(profile_ast);
+    std::unique_ptr<AstFile> profile_ast_owned(profile_ast.value());
+    const auto profile_hir = analyze_file(*profile_ast_owned);
+    REQUIRE(profile_hir);
+    std::unique_ptr<HirModule> profile_hir_owned(profile_hir.value());
+    const auto profile_mir = build_mir(*profile_hir_owned);
+    REQUIRE(profile_mir);
+    std::unique_ptr<MirModule> profile_mir_owned(profile_mir.value());
+    FrontendRirModule profile_rir{};
+    RirGuard profile_rir_guard{profile_rir};
+    REQUIRE(lower_to_rir(*profile_mir_owned, profile_rir));
+    REQUIRE(rir::verify_module(profile_rir.module).ok);
     auto omitted_hide_erased = omitted_hide.value();
     omitted_hide_erased.server.location.proxy_hide_header = {};
     const auto omitted_hide_result = nginx::lower_to_rut(omitted_hide_erased);
@@ -21250,6 +21327,69 @@ TEST(nginx_converter_issue270, exact_redirect_keeps_timeout_on_get_fallback_forw
     CHECK_EQ(count_text(output, "if req.hasContentLength"), 1u);
     CHECK_EQ(count_text(output, "content_length_position: \"after_host\""), 1u);
     CHECK_EQ(count_text(output, "return redirect({"), 1u);
+}
+
+TEST(nginx_converter_issue621, explicit_buffering_custom_hide_timeout_is_byte_identical) {
+    const char* names[] = {"X-A", "X-Ab9_-Ab9_-Ab9_-Ab9_-Ab9_-Ab9_-Ab9_-Ab9_-Cd0E"};
+    for (const char* name : names) {
+        for (const char* timeout : {"1s", "63s"}) {
+            const std::string omitted =
+                std::string("server { listen 127.0.0.1:8080; location / { ") +
+                "proxy_read_timeout " + timeout + "; proxy_hide_header " + name +
+                "; proxy_pass http://127.0.0.1:9000; } }";
+            const auto omitted_model =
+                nginx::parse({omitted.data(), static_cast<u32>(omitted.size())});
+            REQUIRE(omitted_model);
+            const auto omitted_lowered = nginx::lower_to_rut(omitted_model.value());
+            REQUIRE(omitted_lowered);
+            const std::array<std::string, 4> directives = {
+                "proxy_buffering on; ",
+                "proxy_read_timeout " + std::string(timeout) + "; ",
+                "proxy_hide_header " + std::string(name) + "; ",
+                "proxy_pass http://127.0.0.1:9000; "};
+            std::array<size_t, 4> permutation = {0u, 1u, 2u, 3u};
+            do {
+                std::string order;
+                for (const size_t index : permutation) order += directives[index];
+                const std::string explicit_on =
+                    "server { listen 127.0.0.1:8080; location / { " + order + "} }";
+                const auto explicit_model =
+                    nginx::parse({explicit_on.data(), static_cast<u32>(explicit_on.size())});
+                REQUIRE(explicit_model);
+                const auto explicit_lowered = nginx::lower_to_rut(explicit_model.value());
+                REQUIRE(explicit_lowered);
+                CHECK(explicit_lowered.value().view().eq(omitted_lowered.value().view()));
+            } while (std::next_permutation(permutation.begin(), permutation.end()));
+        }
+    }
+    const std::string ir_source =
+        "server { listen 127.0.0.1:8080; location / { proxy_buffering on; "
+        "proxy_read_timeout 1s; proxy_hide_header X-A; proxy_pass http://127.0.0.1:9000; } }";
+    const auto ir_model = nginx::parse({ir_source.data(), static_cast<u32>(ir_source.size())});
+    REQUIRE(ir_model);
+    const auto ir_lowered = nginx::lower_to_rut(ir_model.value());
+    REQUIRE(ir_lowered);
+    const auto ir_lexed = lex(ir_lowered.value().view());
+    REQUIRE(ir_lexed);
+    const auto ir_ast = parse_file(ir_lexed.value());
+    REQUIRE(ir_ast);
+    std::unique_ptr<AstFile> ir_ast_owned(ir_ast.value());
+    const auto ir_hir = analyze_file(*ir_ast_owned);
+    REQUIRE(ir_hir);
+    std::unique_ptr<HirModule> ir_hir_owned(ir_hir.value());
+    const auto ir_mir = build_mir(*ir_hir_owned);
+    REQUIRE(ir_mir);
+    std::unique_ptr<MirModule> ir_mir_owned(ir_mir.value());
+    FrontendRirModule ir_rir{};
+    RirGuard ir_rir_guard{ir_rir};
+    REQUIRE(lower_to_rir(*ir_mir_owned, ir_rir));
+    REQUIRE(rir::verify_module(ir_rir.module).ok);
+    auto forged = ir_model.value();
+    forged.location.proxy_buffering.span.start++;
+    REQUIRE_FALSE(nginx::lower_to_rut(forged));
+    forged = ir_model.value();
+    forged.location.proxy_hide_header.span.start = forged.location.proxy_buffering.span.start;
+    REQUIRE_FALSE(nginx::lower_to_rut(forged));
 }
 
 TEST(nginx_converter_issue270, custom_hide_header_and_timeout_lower_together) {

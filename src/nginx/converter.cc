@@ -1273,7 +1273,12 @@ FrontendResult<bool> validate_proxy_read_timeout(const Server& server) {
     return true;
 }
 
-enum class ProxyLocationDirectiveKind : u8 { ProxyPass, ProxyReadTimeout, ProxyHideHeader };
+enum class ProxyLocationDirectiveKind : u8 {
+    ProxyPass,
+    ProxyReadTimeout,
+    ProxyHideHeader,
+    ProxyBuffering
+};
 
 struct ProxyLocationDirective {
     Span span{};
@@ -1330,7 +1335,10 @@ bool proxy_read_timeout_source_is_coherent(uintptr_t source_base, const ProxyRea
     return seconds != 0u && seconds <= 63u && timeout.milliseconds == seconds * 1000u;
 }
 
-FrontendResult<bool> validate_proxy_hide_header(const Server& server, bool exact_listener) {
+FrontendResult<bool> validate_proxy_hide_header(const Server& server,
+                                                bool exact_listener,
+                                                bool* buffering_authenticated) {
+    *buffering_authenticated = false;
     const ProxyHideHeader& header = server.location.proxy_hide_header;
     const Span fallback = is_valid_span(header.span)        ? header.span
                           : is_valid_span(header.name_span) ? header.name_span
@@ -1346,6 +1354,7 @@ FrontendResult<bool> validate_proxy_hide_header(const Server& server, bool exact
     const Location& location = server.location;
     const ProxyPass& proxy = location.proxy_pass;
     const ProxyReadTimeout& timeout = location.proxy_read_timeout;
+    const ProxyBuffering& buffering = location.proxy_buffering;
     if (!is_valid_span(location.span) || !is_valid_span(location.path_span) ||
         !is_valid_span(proxy.span) || !span_position_is_coherent(server.span, location.span) ||
         !span_position_is_coherent(location.span, location.path_span) ||
@@ -1364,6 +1373,13 @@ FrontendResult<bool> validate_proxy_hide_header(const Server& server, bool exact
          (header.span.start < proxy.span.end && proxy.span.start < header.span.end)) ||
         (timeout.present &&
          (header.span.start < timeout.span.end && timeout.span.start < header.span.end)))
+        return unsupported(fallback, lit_str("invalid proxy_hide_header spans"));
+    if (buffering.present &&
+        (!is_valid_span(buffering.span) || !is_valid_span(buffering.value_span) ||
+         !span_position_is_coherent(location.span, buffering.span) ||
+         !span_position_is_coherent(buffering.span, buffering.value_span) ||
+         buffering.span.end >= location.span.end ||
+         (header.span.start < buffering.span.end && buffering.span.start < header.span.end)))
         return unsupported(fallback, lit_str("invalid proxy_hide_header spans"));
     if (proxy.has_uri) {
         if (!is_valid_span(proxy.uri_span) ||
@@ -1411,15 +1427,27 @@ FrontendResult<bool> validate_proxy_hide_header(const Server& server, bool exact
         !source_position_is_coherent(source_base, server.span, header.name_span))
         return unsupported(fallback, lit_str("invalid proxy_hide_header source positions"));
 
+    if (buffering.present) {
+        auto buffering_result = validate_proxy_buffering(server);
+        if (!buffering_result) return core::make_unexpected(buffering_result.error());
+        if (!buffering_result.value())
+            return unsupported(fallback, lit_str("invalid proxy_buffering model"));
+        *buffering_authenticated = true;
+    }
+
     // All bytes below are in the already-proven common source. Sort the complete
     // modeled location inventory so every byte between the braces is accounted
     // for independently of nginx directive order.
-    ProxyLocationDirective directives[3] = {
-        {proxy.span, ProxyLocationDirectiveKind::ProxyPass},
-        {header.span, ProxyLocationDirectiveKind::ProxyHideHeader},
-        {timeout.span, ProxyLocationDirectiveKind::ProxyReadTimeout},
-    };
-    const u32 directive_count = timeout.present ? 3u : 2u;
+    ProxyLocationDirective directives[4]{};
+    u32 directive_count = 0u;
+    directives[directive_count++] = {proxy.span, ProxyLocationDirectiveKind::ProxyPass};
+    directives[directive_count++] = {header.span, ProxyLocationDirectiveKind::ProxyHideHeader};
+    if (timeout.present)
+        directives[directive_count++] = {timeout.span,
+                                         ProxyLocationDirectiveKind::ProxyReadTimeout};
+    if (buffering.present)
+        directives[directive_count++] = {buffering.span,
+                                         ProxyLocationDirectiveKind::ProxyBuffering};
     for (u32 i = 1u; i < directive_count; i++) {
         const ProxyLocationDirective value = directives[i];
         u32 pos = i;
@@ -2151,6 +2179,7 @@ FrontendResult<RutSource> lower_to_rut(const Server& server) {
     bool hide_compat_header = false;
     Str hide_header_name{};
     bool exact_listener = false;
+    bool buffering_authenticated = false;
     const bool timeout_present = server.location.proxy_read_timeout.present;
     u8 timeout_seconds = timeout_present ? 0u : 60u;
     if (proxy_hide_header_has_inventory(server.location.proxy_hide_header)) {
@@ -2158,7 +2187,8 @@ FrontendResult<RutSource> lower_to_rut(const Server& server) {
             validate_listener(server, proxy_location.value(), exact_absolute_redirect.value());
         if (!listener) return core::make_unexpected(listener.error());
         exact_listener = listener.value();
-        auto header = validate_proxy_hide_header(server, listener.value());
+        auto header =
+            validate_proxy_hide_header(server, listener.value(), &buffering_authenticated);
         if (!header) return core::make_unexpected(header.error());
         hide_compat_header = true;
         hide_header_name = server.location.proxy_hide_header.name;
@@ -2202,15 +2232,19 @@ FrontendResult<RutSource> lower_to_rut(const Server& server) {
     if (exact_no_content_return.value() && !is_root)
         return unsupported(server.exact_no_content_return.span,
                            lit_str("exact no-content return requires location / fallback"));
-    auto proxy_buffering = validate_proxy_buffering(server);
-    if (!proxy_buffering) return core::make_unexpected(proxy_buffering.error());
-    const bool explicit_buffering_on = proxy_buffering.value();
+    bool explicit_buffering_on = false;
+    if (buffering_authenticated) {
+        explicit_buffering_on = true;
+    } else {
+        auto proxy_buffering = validate_proxy_buffering(server);
+        if (!proxy_buffering) return core::make_unexpected(proxy_buffering.error());
+        explicit_buffering_on = proxy_buffering.value();
+    }
     if (explicit_buffering_on &&
         !(is_root && exact_listener && server.listen.address == ListenerAddress::IPv4Exact &&
           server.listen.ipv4_host == 0x7f000001u && timeout_present &&
           server.location.proxy_read_timeout.milliseconds >= 1000u &&
-          server.location.proxy_read_timeout.milliseconds <= 63000u && !hide_compat_header &&
-          !has_sibling_action))
+          server.location.proxy_read_timeout.milliseconds <= 63000u && !has_sibling_action))
         return unsupported(
             server.location.proxy_buffering.span,
             lit_str("proxy_buffering on requires the bounded timeout proxy profile"));

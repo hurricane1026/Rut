@@ -7,6 +7,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <string>
+#include <tuple>
 #include <utility>
 #include <vector>
 
@@ -469,6 +470,100 @@ TEST(nginx_convert, nginx_http_output_matches_complete_api_and_rejects_unsupport
     CHECK(unsupported_nested.err.find(diagnostic_prefix(
               unsupported_nested_path, unsupported_nested_source, "add_header")) == 0u);
     CHECK(unsupported_nested.err.find("unknown location directive") != std::string::npos);
+}
+
+TEST(nginx_convert_issue621, converts_explicit_buffering_custom_hide_timeout_cli_profile) {
+    const std::string directory = make_temp_dir();
+    REQUIRE_FALSE(directory.empty());
+    const std::string access_path = directory + "/access.log";
+    const std::string explicit_source =
+        "events {}\nhttp { log_format compat \"$request_length\"; access_log " + access_path +
+        " compat; server { listen 127.0.0.1:8080; location / { proxy_hide_header X-A; "
+        "proxy_buffering on; proxy_read_timeout 1s; proxy_pass http://127.0.0.1:9000; } } }\n";
+    const std::string omitted_source =
+        "events {}\nhttp { log_format compat \"$request_length\"; access_log " + access_path +
+        " compat; server { listen 127.0.0.1:8080; location / { proxy_hide_header X-A; "
+        "proxy_read_timeout 1s; proxy_pass http://127.0.0.1:9000; } } }\n";
+    const std::string explicit_path = directory + "/explicit.conf";
+    const std::string omitted_path = directory + "/omitted.conf";
+    REQUIRE(write_file(explicit_path, explicit_source));
+    REQUIRE(write_file(omitted_path, omitted_source));
+    const RunResult explicit_run =
+        run_converter(g_executable, "nginx-http", explicit_path, explicit_path);
+    const RunResult omitted_run =
+        run_converter(g_executable, "nginx-http", omitted_path, omitted_path);
+    REQUIRE(WIFEXITED(explicit_run.status));
+    REQUIRE(WIFEXITED(omitted_run.status));
+    CHECK_EQ(WEXITSTATUS(explicit_run.status), 0);
+    CHECK_EQ(WEXITSTATUS(omitted_run.status), 0);
+    CHECK(explicit_run.err.empty());
+    CHECK(omitted_run.err.empty());
+    CHECK_EQ(explicit_run.out, omitted_run.out);
+    CHECK(explicit_run.out.find("hide_headers: [\"Date\", \"Server\", \"X-Pad\", \"X-A\"]") !=
+          std::string::npos);
+
+    const auto diagnostic_prefix = [](const std::string& filename,
+                                      const std::string& input,
+                                      const std::string& token,
+                                      size_t occurrence = 0u) {
+        size_t offset = std::string::npos;
+        size_t search = 0u;
+        for (size_t index = 0u; index <= occurrence; index++) {
+            offset = input.find(token, search);
+            if (offset == std::string::npos) return std::string{};
+            search = offset + token.size();
+        }
+        const size_t line_start =
+            input.rfind('\n', offset) == std::string::npos ? 0u : input.rfind('\n', offset) + 1u;
+        const unsigned line = static_cast<unsigned>(
+            std::count(input.begin(), input.begin() + static_cast<ptrdiff_t>(offset), '\n') + 1u);
+        const unsigned col = static_cast<unsigned>(offset - line_start + 1u);
+        return filename + ":" + std::to_string(line) + ":" + std::to_string(col) + ": ";
+    };
+    const std::string negative_prefix =
+        "events {}\nhttp { log_format compat \"$request_length\"; access_log " + access_path +
+        " compat; server { listen 127.0.0.1:8080; location / { proxy_hide_header X-A; ";
+    const std::vector<std::tuple<std::string, std::string, std::string, size_t, std::string>>
+        negative_cases = {
+            {"off",
+             "proxy_buffering off; proxy_read_timeout 1s; proxy_pass "
+             "http://127.0.0.1:9000; } } }\n",
+             "off",
+             0u,
+             "only literal proxy_buffering on is recognized"},
+            {"duplicate",
+             "proxy_buffering on; proxy_buffering on; proxy_read_timeout 1s; proxy_pass "
+             "http://127.0.0.1:9000; } } }\n",
+             "proxy_buffering",
+             1u,
+             "duplicate proxy_buffering"},
+            {"literal",
+             "proxy_buffering $buffering; proxy_read_timeout 1s; proxy_pass "
+             "http://127.0.0.1:9000; } } }\n",
+             "$buffering",
+             0u,
+             "only literal proxy_buffering on is recognized"},
+            {"no-timeout",
+             "proxy_buffering on; proxy_pass http://127.0.0.1:9000; } } }\n",
+             "proxy_buffering",
+             0u,
+             "proxy_buffering on requires the bounded timeout proxy profile"}};
+    for (const auto& negative_case : negative_cases) {
+        const std::string& name = std::get<0>(negative_case);
+        const std::string negative_source = negative_prefix + std::get<1>(negative_case);
+        const std::string negative_path = directory + "/negative-" + name + ".conf";
+        REQUIRE(write_file(negative_path, negative_source));
+        const RunResult negative_run =
+            run_converter(g_executable, "nginx-http", negative_path, negative_path);
+        REQUIRE(WIFEXITED(negative_run.status));
+        CHECK_EQ(WEXITSTATUS(negative_run.status), 1);
+        CHECK(negative_run.out.empty());
+        const std::string& token = std::get<2>(negative_case);
+        const size_t occurrence = std::get<3>(negative_case);
+        CHECK(negative_run.err.find(
+                  diagnostic_prefix(negative_path, negative_source, token, occurrence)) == 0u);
+        CHECK(negative_run.err.find(std::get<4>(negative_case)) != std::string::npos);
+    }
 }
 
 TEST(nginx_convert, rejects_usage_missing_malformed_and_special_inputs_without_stdout) {
