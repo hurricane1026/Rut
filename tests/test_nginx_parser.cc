@@ -21404,7 +21404,7 @@ TEST(nginx_converter_issue270, custom_hide_header_and_timeout_lower_together) {
     forged.location.proxy_read_timeout = {};
     const auto erased_timeout = nginx::lower_to_rut(forged);
     REQUIRE_FALSE(erased_timeout);
-    CHECK(erased_timeout.error().detail.eq(lit_str("invalid proxy_hide_header spans")));
+    CHECK(erased_timeout.error().detail.eq(lit_str("invalid proxy location source syntax")));
     forged = profile.value().server;
     forged.location.proxy_read_timeout = {};
     forged.location.proxy_read_timeout.span =
