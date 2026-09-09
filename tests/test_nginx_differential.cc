@@ -72360,7 +72360,9 @@ static bool run_pinned_nginx_custom_hide_timeout_probe(const std::string& contai
             return accepts(response) && !accepts(leaked) && !accepts(missing) && !accepts(body);
         }();
         const u64 peer_deadline = third_ns + 2'000'000'000ull;
-        while (!origin.response_peer_closed.load(std::memory_order_acquire) &&
+        while ((!origin.response_peer_closed.load(std::memory_order_acquire) ||
+                !origin.response_clean_shutdown.load(std::memory_order_acquire) ||
+                !origin.response_connection_closed.load(std::memory_order_acquire)) &&
                steady_now_ns() < peer_deadline) {
             if (!origin_live() || poll_child(nginx.child) ||
                 origin.response_peer_unexpected_data.load(std::memory_order_acquire) ||
@@ -72368,10 +72370,13 @@ static bool run_pinned_nginx_custom_hide_timeout_probe(const std::string& contai
                 break;
             usleep(1000);
         }
+        const u64 retired_ns = origin.response_peer_closed_ns.load(std::memory_order_acquire);
         const bool origin_retired =
             origin.response_peer_closed.load(std::memory_order_acquire) &&
-            origin.response_peer_close_count.load(std::memory_order_acquire) == 1u;
-        const u64 retired_ns = origin.response_peer_closed_ns.load(std::memory_order_acquire);
+            origin.response_peer_close_count.load(std::memory_order_acquire) == 1u &&
+            retired_ns >= third_ns &&
+            origin.response_clean_shutdown.load(std::memory_order_acquire) &&
+            origin.response_connection_closed.load(std::memory_order_acquire);
         const u64 stability_start = steady_now_ns();
         bool stable = origin_retired && stability_start >= retired_ns;
         const u64 stability_deadline = stability_start + 175'000'000ull;
@@ -72386,6 +72391,8 @@ static bool run_pinned_nginx_custom_hide_timeout_probe(const std::string& contai
                 !origin.response_sent_open.load(std::memory_order_acquire) ||
                 !origin.response_peer_closed.load(std::memory_order_acquire) ||
                 origin.response_peer_close_count.load(std::memory_order_acquire) != 1u ||
+                !origin.response_clean_shutdown.load(std::memory_order_acquire) ||
+                !origin.response_connection_closed.load(std::memory_order_acquire) ||
                 origin.gated_fragment_probe_request.load(std::memory_order_acquire) != 3u ||
                 origin.gated_fragment_probe_ack.load(std::memory_order_acquire) != 3u ||
                 origin.gated_fragment_probe_result.load(std::memory_order_acquire) !=
