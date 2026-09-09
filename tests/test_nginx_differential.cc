@@ -73189,10 +73189,8 @@ static bool run_pinned_nginx_custom_hide_timeout_probe(
         std::to_string(backend_port) +
         ";\n"
         "      proxy_hide_header " +
-        std::string(custom_hide_name) +
-        ";\n      proxy_read_timeout 1s;\n" +
-        (explicit_buffering_on ? "      proxy_buffering on;\n" : "") +
-        "    }\n  }\n}\n";
+        std::string(custom_hide_name) + ";\n      proxy_read_timeout 1s;\n" +
+        (explicit_buffering_on ? "      proxy_buffering on;\n" : "") + "    }\n  }\n}\n";
     if (count_text(config, "events {}\n") != 1u ||
         count_text(config, "proxy_hide_header " + std::string(custom_hide_name) + ";\n") != 1u ||
         count_text(config, "proxy_read_timeout 1s;\n") != 1u ||
@@ -74306,7 +74304,9 @@ static bool run_pinned_nginx_custom_hide_timeout_explicit_buffering_oracle(std::
             omitted_pair.config.find("proxy_buffering") != std::string::npos ||
             explicit_pair.config.find("proxy_buffering") == std::string::npos ||
             !equal(omitted, explicit_on)) {
-            error = "#621 pinned nginx omitted/explicit proxy_buffering observations or configs differed";
+            error =
+                "#621 pinned nginx omitted/explicit proxy_buffering observations or configs "
+                "differed";
             return false;
         }
     }
@@ -77332,7 +77332,8 @@ int main(int argc, char** argv) {
     const bool pinned_nginx_explicit_buffering_on_baseline_oracle =
         argc == 2 && strcmp(argv[1], "--pinned-nginx-explicit-buffering-on-baseline-oracle") == 0;
     const bool pinned_nginx_custom_hide_timeout_explicit_buffering_oracle =
-        argc == 2 && strcmp(argv[1], "--pinned-nginx-custom-hide-timeout-explicit-buffering-oracle") == 0;
+        argc == 2 &&
+        strcmp(argv[1], "--pinned-nginx-custom-hide-timeout-explicit-buffering-oracle") == 0;
     const bool pinned_nginx_default_buffering_201_incomplete_body_inactivity_expiry_oracle =
         argc == 2 &&
         strcmp(argv[1],
