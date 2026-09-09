@@ -1,3 +1,4 @@
+#include "fixtures/nginx270_hide_timeout.inc"
 #include "fixtures/nginx373_hide.inc"
 #include "fixtures/nginx373_nohide.inc"
 #include "rut/common/strict_local_response.h"
@@ -20553,10 +20554,10 @@ TEST(nginx_parser_issue373, accepts_lexer_gaps_comments_and_bounded_compositions
         REQUIRE(parsed.value().location.proxy_read_timeout.present);
         REQUIRE(parsed.value().location.proxy_hide_header.present);
         const auto lowered = nginx::lower_to_rut(parsed.value());
-        REQUIRE_FALSE(lowered);
-        CHECK(lowered.error().detail.eq(
-            lit_str("proxy_hide_header requires the minimal exact-loopback root proxy profile")));
-        CHECK_EQ(lowered.error().span.start, parsed.value().location.proxy_hide_header.span.start);
+        REQUIRE(lowered);
+        const std::string output(lowered.value().data, lowered.value().len);
+        CHECK_EQ(count_text(output, "X-Compat-Hidden"), 4u);
+        CHECK_EQ(count_text(output, "response_read_timeout: 1s"), 4u);
     }
 
     const char* excluded_profiles[] = {
@@ -20624,10 +20625,12 @@ TEST(nginx_parser_issue373, accepts_end_exclusive_adjacent_directive_spans) {
     CHECK_EQ(third.value().location.proxy_read_timeout.span.end,
              third.value().location.proxy_pass.span.start);
     lowered = nginx::lower_to_rut(third.value());
-    REQUIRE_FALSE(lowered);
-    CHECK(lowered.error().detail.eq(
-        lit_str("proxy_hide_header requires the minimal exact-loopback root proxy profile")));
-    CHECK_EQ(lowered.error().span.start, third.value().location.proxy_hide_header.span.start);
+    REQUIRE(lowered);
+    CHECK_EQ(count_text(std::string(lowered.value().data, lowered.value().len), "X-Compat-Hidden"),
+             4u);
+    CHECK_EQ(count_text(std::string(lowered.value().data, lowered.value().len),
+                        "response_read_timeout: 1s"),
+             4u);
 }
 
 TEST(nginx_parser_issue373, rejects_bad_arity_name_duplicates_and_contexts) {
@@ -21164,6 +21167,367 @@ TEST(nginx_converter_issue270, exact_redirect_keeps_timeout_on_get_fallback_forw
     CHECK_EQ(count_text(output, "if req.hasContentLength"), 1u);
     CHECK_EQ(count_text(output, "content_length_position: \"after_host\""), 1u);
     CHECK_EQ(count_text(output, "return redirect({"), 1u);
+}
+
+TEST(nginx_converter_issue270, custom_hide_header_and_timeout_lower_together) {
+    const std::string name = "X-Ab9_-Ab9_-Ab9_-Ab9_-Ab9_-Ab9_-Ab9_-Ab9_-Cd0E";
+    REQUIRE_EQ(name.size(), 46u);
+    std::string order_outputs[2];
+    std::string one_second_output;
+    for (const auto timeout : {1u, 9u, 10u, 63u}) {
+        u32 order = 0u;
+        for (const char* directives :
+             {"proxy_hide_header X-Ab9_-Ab9_-Ab9_-Ab9_-Ab9_-Ab9_-Ab9_-Ab9_-Cd0E; "
+              "proxy_read_timeout 1s;",
+              "proxy_read_timeout 63s; proxy_hide_header "
+              "X-Ab9_-Ab9_-Ab9_-Ab9_-Ab9_-Ab9_-Ab9_-Ab9_-Cd0E;"}) {
+            std::string source = "server { listen 127.0.0.1:8080; location / { ";
+            source += directives;
+            if (timeout != 1u && strstr(directives, "proxy_read_timeout 1s") != nullptr)
+                source.replace(source.find("1s"), 2u, std::to_string(timeout) + "s");
+            if (timeout != 63u && strstr(directives, "proxy_read_timeout 63s") != nullptr)
+                source.replace(source.find("63s"), 3u, std::to_string(timeout) + "s");
+            source += " proxy_pass http://127.0.0.1:9000; } }";
+            const auto parsed = nginx::parse({source.data(), static_cast<u32>(source.size())});
+            REQUIRE(parsed);
+            REQUIRE(parsed.value().location.proxy_hide_header.present);
+            REQUIRE(parsed.value().location.proxy_read_timeout.present);
+            CHECK_EQ(parsed.value().location.proxy_read_timeout.milliseconds, timeout * 1000u);
+            const auto lowered = nginx::lower_to_rut(parsed.value());
+            REQUIRE(lowered);
+            const std::string output(lowered.value().data, lowered.value().len);
+            CHECK_EQ(count_text(output, name), 4u);
+            CHECK_EQ(count_text(output, "response_read_timeout: " + std::to_string(timeout) + "s"),
+                     4u);
+            CHECK_NE(output.find("hide_headers: [\"Date\", \"Server\", \"X-Pad\", \"" + name),
+                     std::string::npos);
+            CHECK_EQ(lowered.value().data[lowered.value().len], '\0');
+            if (timeout == 1u && order == 0u) one_second_output = output;
+            if (timeout == 63u) order_outputs[order] = output;
+            ++order;
+        }
+    }
+    CHECK_EQ(order_outputs[0], order_outputs[1]);
+    CHECK_EQ(one_second_output,
+             std::string(kIssue270HideTimeoutGolden, sizeof(kIssue270HideTimeoutGolden) - 1u));
+    const auto inspect_rut = [&](const std::string& output, u8 seconds) {
+        const auto lexed = lex({output.data(), static_cast<u32>(output.size())});
+        REQUIRE(lexed);
+        const auto ast = parse_file(lexed.value());
+        REQUIRE(ast);
+        std::unique_ptr<AstFile> ast_owned(ast.value());
+        const auto hir = analyze_file(*ast_owned);
+        REQUIRE(hir);
+        std::unique_ptr<HirModule> hir_owned(hir.value());
+        const auto mir = build_mir(*hir_owned);
+        REQUIRE(mir);
+        std::unique_ptr<MirModule> mir_owned(mir.value());
+        FrontendRirModule rir{};
+        RirGuard guard{rir};
+        REQUIRE(lower_to_rir(*mir_owned, rir));
+        REQUIRE(rir::verify_module(rir.module).ok);
+        REQUIRE_EQ(rir.module.func_count, 3u);
+        RouteConfig config{};
+        REQUIRE(populate_route_config(config, rir.module));
+        const auto check_forward = [&](const rir::Function& function,
+                                       const rir::Block& block,
+                                       i32 expected_request_policy_id,
+                                       bool head,
+                                       bool buffered,
+                                       i32* observed_bundle_id = nullptr) {
+            u32 forwards = 0u;
+            const rir::Instruction* forward = nullptr;
+            for (u32 inst = 0u; inst < block.inst_count; inst++) {
+                if (block.insts[inst].op != rir::Opcode::RetForwardBundle) continue;
+                ++forwards;
+                forward = &block.insts[inst];
+            }
+            REQUIRE_EQ(forwards, 1u);
+            REQUIRE(forward != nullptr);
+            REQUIRE_EQ(forward->operand_count, 3u);
+            i32 upstream_id = -1;
+            i32 request_policy_id = -1;
+            i32 bundle_id = -1;
+            REQUIRE(find_const_i32(function, forward->operand(0), upstream_id));
+            REQUIRE(find_const_i32(function, forward->operand(1), request_policy_id));
+            REQUIRE(find_const_i32(function, forward->operand(2), bundle_id));
+            CHECK_EQ(upstream_id, 0);
+            CHECK_EQ(request_policy_id, expected_request_policy_id);
+            REQUIRE_GT(bundle_id, 0);
+            REQUIRE_LE(static_cast<u32>(bundle_id), config.policy_bundle_count);
+            if (observed_bundle_id != nullptr) *observed_bundle_id = bundle_id;
+            const auto& bundle = config.policy_bundles[bundle_id - 1];
+            CHECK_EQ(bundle.response_read_timeout_seconds, seconds);
+            CHECK_EQ(bundle.response_buffering,
+                     buffered ? ForwardResponseBufferingMode::CompleteContentLength
+                              : ForwardResponseBufferingMode::None);
+            REQUIRE(config.response_policy_id_is_valid(bundle.response_policy_id));
+            REQUIRE(config.failure_policy_id_is_valid(bundle.failure_policy_id));
+            REQUIRE(config.timeout_failure_policy_id_is_valid(bundle.timeout_failure_policy_id));
+            const auto& response = config.response_policies[bundle.response_policy_id - 1];
+            CHECK_EQ(response.head_mode,
+                     head ? ResponsePolicyHeadMode::SuppressBody : ResponsePolicyHeadMode::Reject);
+            REQUIRE_EQ(response.hide_header_count, 4u);
+            for (u32 header = 0; header < response.hide_header_count; header++)
+                REQUIRE(str_is_in_owned_pool(response.hide_headers[header],
+                                             config.response_policy_bytes,
+                                             config.response_policy_bytes_used));
+            CHECK(response.hide_headers[0].eq(lit_str("Date")));
+            CHECK(response.hide_headers[1].eq(lit_str("Server")));
+            CHECK(response.hide_headers[2].eq(lit_str("X-Pad")));
+            CHECK(response.hide_headers[3].eq({name.data(), static_cast<u32>(name.size())}));
+            const auto& failure = config.failure_policies[bundle.failure_policy_id - 1];
+            const auto& timeout_failure =
+                config.failure_policies[bundle.timeout_failure_policy_id - 1];
+            CHECK_EQ(failure.status_code, 502u);
+            CHECK_EQ(timeout_failure.status_code, 504u);
+            CHECK_EQ(failure.head_mode,
+                     head ? FailurePolicyHeadMode::SuppressBody : FailurePolicyHeadMode::Reject);
+            CHECK_EQ(timeout_failure.head_mode,
+                     head ? FailurePolicyHeadMode::SuppressBody : FailurePolicyHeadMode::Reject);
+        };
+        const auto& head = rir.module.functions[0];
+        const auto& get = rir.module.functions[1];
+        const auto& any = rir.module.functions[2];
+        CHECK_EQ(head.http_method, kRouteMethodHead);
+        CHECK_EQ(get.http_method, kRouteMethodGet);
+        CHECK_EQ(any.http_method, kRouteMethodAny);
+        REQUIRE_EQ(head.block_count, 3u);
+        const auto& entry = head.blocks[0];
+        const rir::Instruction* has_content_length = nullptr;
+        for (u32 inst = 0; inst < entry.inst_count; inst++) {
+            if (entry.insts[inst].op != rir::Opcode::ReqHasContentLength) continue;
+            REQUIRE(has_content_length == nullptr);
+            has_content_length = &entry.insts[inst];
+        }
+        REQUIRE(has_content_length != nullptr);
+        const rir::Instruction* branch = entry.terminator();
+        REQUIRE(branch != nullptr);
+        REQUIRE_EQ(branch->op, rir::Opcode::Br);
+        REQUIRE_EQ(branch->operand_count, 1u);
+        CHECK_EQ(branch->operand(0), has_content_length->result);
+        REQUIRE_LT(branch->imm.block_targets[0].id, head.block_count);
+        REQUIRE_LT(branch->imm.block_targets[1].id, head.block_count);
+        const auto& true_block = head.blocks[branch->imm.block_targets[0].id];
+        const auto& false_block = head.blocks[branch->imm.block_targets[1].id];
+        u32 head_forwards = 0u;
+        for (u32 block = 0; block < head.block_count; block++)
+            for (u32 inst = 0; inst < head.blocks[block].inst_count; inst++)
+                head_forwards += head.blocks[block].insts[inst].op == rir::Opcode::RetForwardBundle;
+        CHECK_EQ(head_forwards, 2u);
+        i32 true_bundle = -1;
+        i32 false_bundle = -1;
+        check_forward(head,
+                      true_block,
+                      static_cast<i32>(RequestPolicyId::Http11FixedStripContentLengthAfterHost),
+                      true,
+                      false,
+                      &true_bundle);
+        check_forward(head,
+                      false_block,
+                      static_cast<i32>(RequestPolicyId::Http11FixedStrip),
+                      true,
+                      false,
+                      &false_bundle);
+        CHECK_EQ(true_bundle, false_bundle);
+        REQUIRE_EQ(get.block_count, 1u);
+        check_forward(
+            get, get.blocks[0], static_cast<i32>(RequestPolicyId::Http11FixedStrip), false, true);
+        REQUIRE_EQ(any.block_count, 1u);
+        check_forward(
+            any, any.blocks[0], static_cast<i32>(RequestPolicyId::Http11FixedStrip), false, false);
+        REQUIRE(config.policy_bundle_count > 0u);
+        u32 complete_content_length = 0u;
+        u32 no_buffering = 0u;
+        for (u32 bundle_id = 0u; bundle_id < config.policy_bundle_count; bundle_id++) {
+            CHECK_EQ(config.policy_bundles[bundle_id].response_read_timeout_seconds, seconds);
+            if (config.policy_bundles[bundle_id].response_buffering ==
+                ForwardResponseBufferingMode::CompleteContentLength)
+                ++complete_content_length;
+            if (config.policy_bundles[bundle_id].response_buffering ==
+                ForwardResponseBufferingMode::None)
+                ++no_buffering;
+        }
+        CHECK_EQ(complete_content_length, 1u);
+        CHECK_EQ(no_buffering, 2u);
+    };
+    inspect_rut(one_second_output, 1u);
+    inspect_rut(order_outputs[0], 63u);
+    const std::string server_content =
+        "    listen 127.0.0.1:8080;\n"
+        "    location / { proxy_hide_header " +
+        name + "; proxy_read_timeout 63s; proxy_pass http://127.0.0.1:9000; }\n";
+    std::string profile_source =
+        make_request_length_http_profile("/logs/access.log", server_content);
+    const auto profile =
+        nginx::parse_http_profile({profile_source.data(), static_cast<u32>(profile_source.size())});
+    REQUIRE(profile);
+    const auto profile_lowered = nginx::lower_to_rut(profile.value());
+    REQUIRE(profile_lowered);
+    const std::string profile_output(profile_lowered.value().data, profile_lowered.value().len);
+    CHECK_EQ(count_text(profile_output, name), 4u);
+    CHECK_EQ(count_text(profile_output, "response_read_timeout: 63s"), 4u);
+    const std::string direct_source = "server {" + server_content + "}";
+    const auto direct =
+        nginx::parse({direct_source.data(), static_cast<u32>(direct_source.size())});
+    REQUIRE(direct);
+    const auto direct_lowered = nginx::lower_to_rut(direct.value());
+    REQUIRE(direct_lowered);
+    const size_t profile_server_start = profile_output.find("listen ");
+    REQUIRE(profile_server_start != std::string::npos);
+    inspect_rut(profile_output, 63u);
+    CHECK_EQ(profile_output.substr(profile_server_start),
+             std::string(direct_lowered.value().data, direct_lowered.value().len));
+    auto forged = profile.value().server;
+    forged.location.proxy_hide_header.name_span.start++;
+    const auto forged_name = nginx::lower_to_rut(forged);
+    REQUIRE_FALSE(forged_name);
+    CHECK(forged_name.error().detail.eq(lit_str("invalid proxy_hide_header spans")));
+    forged = profile.value().server;
+    forged.location.proxy_read_timeout.milliseconds = 2000u;
+    const auto forged_timeout = nginx::lower_to_rut(forged);
+    REQUIRE_FALSE(forged_timeout);
+    CHECK(forged_timeout.error().detail.eq(lit_str("invalid proxy_read_timeout source syntax")));
+    for (const u32 milliseconds : {1500u, 2000u}) {
+        forged = profile.value().server;
+        forged.location.proxy_read_timeout.milliseconds = milliseconds;
+        const auto rejected = nginx::lower_to_rut(forged);
+        REQUIRE_FALSE(rejected);
+        CHECK(rejected.error().detail.eq(lit_str("invalid proxy_read_timeout source syntax")));
+    }
+    forged = profile.value().server;
+    forged.location.proxy_read_timeout.present = false;
+    const auto absent_timeout = nginx::lower_to_rut(forged);
+    REQUIRE_FALSE(absent_timeout);
+    CHECK(absent_timeout.error().detail.eq(lit_str("invalid proxy_hide_header spans")));
+    forged = profile.value().server;
+    forged.location.proxy_read_timeout = {};
+    const auto erased_timeout = nginx::lower_to_rut(forged);
+    REQUIRE_FALSE(erased_timeout);
+    CHECK(erased_timeout.error().detail.eq(lit_str("invalid proxy location source syntax")));
+    forged = profile.value().server;
+    forged.location.proxy_read_timeout = {};
+    forged.location.proxy_read_timeout.span =
+        profile.value().server.location.proxy_hide_header.span;
+    forged.location.proxy_read_timeout.value_span =
+        profile.value().server.location.proxy_hide_header.name_span;
+    const auto redirected_timeout = nginx::lower_to_rut(forged);
+    REQUIRE_FALSE(redirected_timeout);
+    CHECK(redirected_timeout.error().detail.eq(lit_str("invalid proxy_hide_header spans")));
+    std::string sibling_source = direct_source;
+    const auto sibling =
+        nginx::parse({sibling_source.data(), static_cast<u32>(sibling_source.size())});
+    REQUIRE(sibling);
+    forged = direct.value();
+    forged.location.proxy_hide_header.name.ptr =
+        sibling.value().location.proxy_hide_header.name.ptr;
+    const auto cross_source_name = nginx::lower_to_rut(forged);
+    REQUIRE_FALSE(cross_source_name);
+    CHECK(cross_source_name.error().detail.eq(
+        lit_str("invalid proxy_hide_header source provenance")));
+    std::string sibling_profile_source = profile_source;
+    const auto sibling_profile = nginx::parse_http_profile(
+        {sibling_profile_source.data(), static_cast<u32>(sibling_profile_source.size())});
+    REQUIRE(sibling_profile);
+    auto forged_profile = profile.value();
+    forged_profile.server.location.proxy_hide_header.name.ptr =
+        sibling_profile.value().server.location.proxy_hide_header.name.ptr;
+    const auto cross_profile_name = nginx::lower_to_rut(forged_profile);
+    REQUIRE_FALSE(cross_profile_name);
+    CHECK(cross_profile_name.error().detail.eq(
+        lit_str("http profile metadata does not match its source")));
+    const std::string complete_source = "events {} " + profile_source;
+    const auto complete_model = nginx::parse_nginx_http_config(
+        {complete_source.data(), static_cast<u32>(complete_source.size())});
+    REQUIRE(complete_model);
+    auto forged_complete = complete_model.value();
+    forged_complete.http.server.location.proxy_read_timeout = {};
+    forged_complete.http.server.location.proxy_read_timeout.span =
+        forged_complete.http.server.location.proxy_hide_header.span;
+    const auto redirected_complete = nginx::lower_to_rut(forged_complete);
+    REQUIRE_FALSE(redirected_complete);
+    const std::string profile_owned = profile_output;
+    std::fill(profile_source.begin(), profile_source.end(), 'x');
+    CHECK_EQ(std::string(profile_lowered.value().data, profile_lowered.value().len), profile_owned);
+    profile_source = make_request_length_http_profile("/logs/access.log", server_content);
+    nginx::RutSource server_owned;
+    {
+        std::string scoped_source = direct_source;
+        const auto scoped =
+            nginx::parse({scoped_source.data(), static_cast<u32>(scoped_source.size())});
+        REQUIRE(scoped);
+        const auto lowered = nginx::lower_to_rut(scoped.value());
+        REQUIRE(lowered);
+        server_owned = lowered.value();
+    }
+    CHECK_EQ(std::string(server_owned.data, server_owned.len),
+             std::string(direct_lowered.value().data, direct_lowered.value().len));
+    CHECK_EQ(server_owned.data[server_owned.len], '\0');
+    nginx::HttpProfileRutSource http_owned;
+    {
+        std::string scoped_source = profile_source;
+        const auto scoped = nginx::parse_http_profile(
+            {scoped_source.data(), static_cast<u32>(scoped_source.size())});
+        REQUIRE(scoped);
+        const auto lowered = nginx::lower_to_rut(scoped.value());
+        REQUIRE(lowered);
+        http_owned = lowered.value();
+    }
+    CHECK_EQ(std::string(http_owned.data, http_owned.len), profile_owned);
+    CHECK_EQ(http_owned.data[http_owned.len], '\0');
+    nginx::HttpProfileRutSource fullfile_owned;
+    {
+        std::string scoped_source = "events {} " + profile_source;
+        const auto scoped = nginx::parse_nginx_http_config(
+            {scoped_source.data(), static_cast<u32>(scoped_source.size())});
+        REQUIRE(scoped);
+        const auto lowered = nginx::lower_to_rut(scoped.value());
+        REQUIRE(lowered);
+        fullfile_owned = lowered.value();
+    }
+    CHECK_EQ(std::string(fullfile_owned.data, fullfile_owned.len), profile_owned);
+    CHECK_EQ(fullfile_owned.data[fullfile_owned.len], '\0');
+    const std::string maximum_source =
+        "server { listen 127.0.0.1:65535; location / { proxy_hide_header " + name +
+        "; proxy_read_timeout 63s; proxy_pass http://255.255.255.255:65535; } }";
+    const auto maximum =
+        nginx::parse({maximum_source.data(), static_cast<u32>(maximum_source.size())});
+    REQUIRE(maximum);
+    const auto maximum_lowered = nginx::lower_to_rut(maximum.value());
+    REQUIRE(maximum_lowered);
+    CHECK_EQ(maximum_lowered.value().len, 8321u);
+    CHECK_LT(maximum_lowered.value().len, nginx::RutSource::kCapacity);
+    CHECK_EQ(maximum_lowered.value().data[maximum_lowered.value().len], '\0');
+    const std::string maximum_profile_source = make_request_length_http_profile(
+        "/" + std::string(nginx::kMaxAccessLogPathLen - 1u, 'p'),
+        "    listen 127.0.0.1:65535;\n    location / { proxy_hide_header " + name +
+            "; proxy_read_timeout 63s; proxy_pass http://255.255.255.255:65535; }\n");
+    const auto maximum_profile = nginx::parse_http_profile(
+        {maximum_profile_source.data(), static_cast<u32>(maximum_profile_source.size())});
+    REQUIRE(maximum_profile);
+    const auto maximum_profile_lowered = nginx::lower_to_rut(maximum_profile.value());
+    REQUIRE(maximum_profile_lowered);
+    CHECK_EQ(maximum_profile_lowered.value().len, 8650u);
+    CHECK_LT(maximum_profile_lowered.value().len, nginx::HttpProfileRutSource::kCapacity);
+    CHECK_EQ(maximum_profile_lowered.value().data[maximum_profile_lowered.value().len], '\0');
+    const std::string maximum_complete_source = "events {} " + maximum_profile_source;
+    const auto maximum_complete = nginx::parse_nginx_http_config(
+        {maximum_complete_source.data(), static_cast<u32>(maximum_complete_source.size())});
+    REQUIRE(maximum_complete);
+    const auto maximum_complete_lowered = nginx::lower_to_rut(maximum_complete.value());
+    REQUIRE(maximum_complete_lowered);
+    CHECK_EQ(maximum_complete_lowered.value().len, 8650u);
+    CHECK_LT(maximum_complete_lowered.value().len, nginx::HttpProfileRutSource::kCapacity);
+    CHECK_EQ(maximum_complete_lowered.value().data[maximum_complete_lowered.value().len], '\0');
+    const char no_timeout[] =
+        "server { listen 127.0.0.1:8080; location / { proxy_hide_header X-Compat-Hidden; "
+        "proxy_pass http://127.0.0.1:9000; } }";
+    const auto legacy = nginx::parse({no_timeout, sizeof(no_timeout) - 1u});
+    REQUIRE(legacy);
+    const auto legacy_lowered = nginx::lower_to_rut(legacy.value());
+    REQUIRE(legacy_lowered);
+    const std::string legacy_output(legacy_lowered.value().data, legacy_lowered.value().len);
+    CHECK_EQ(legacy_output, std::string(kIssue373HideGolden, sizeof(kIssue373HideGolden) - 1u));
 }
 
 TEST(nginx_converter_issue270, explicit_timeout_capacity_boundaries) {
