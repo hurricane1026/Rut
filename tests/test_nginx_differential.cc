@@ -72094,28 +72094,64 @@ static bool run_converter_default_buffering_206_range_three_publication_completi
 // Exploratory #270 composition probe.  This deliberately reports the expiry
 // wire instead of hard-coding it; the follow-up oracle can freeze only bytes
 // observed from the pinned nginx image.
-static bool run_pinned_nginx_custom_hide_timeout_probe(const std::string& container_name,
-                                                       std::string& error,
-                                                       bool complete_after_w3 = false,
-                                                       const char* rut_path = nullptr,
-                                                       const char* converter_path = nullptr) {
+struct CustomHideTimeoutObservation {
+    std::vector<char> downstream;
+    std::vector<char> upstream;
+    std::string access;
+    bool eof = false;
+    bool retired = false;
+    bool stable = false;
+    u32 accepted = 0u;
+    u32 requests = 0u;
+    u32 peer_close_count = 0u;
+};
+
+struct CustomHideTimeoutPairContext {
+    TempDir temp;
+    u16 frontend_port = 0u;
+    u16 backend_port = 0u;
+    std::string config;
+    std::string config_snapshot;
+    std::string access_snapshot;
+    bool initialized = false;
+};
+
+static bool run_pinned_nginx_custom_hide_timeout_probe(
+    const std::string& container_name,
+    std::string& error,
+    bool complete_after_w3 = false,
+    const char* rut_path = nullptr,
+    const char* converter_path = nullptr,
+    CustomHideTimeoutPairContext* pair = nullptr,
+    CustomHideTimeoutObservation* observation = nullptr) {
     const bool generated_rut = rut_path != nullptr || converter_path != nullptr;
-    if (generated_rut &&
-        (rut_path == nullptr || converter_path == nullptr || rut_path[0] != '/' ||
-         converter_path[0] != '/' || access(rut_path, X_OK) != 0 || access(converter_path, X_OK) != 0)) {
-        error = "#270 custom-hide CLI differential requires executable absolute RUT/converter paths";
+    if (generated_rut && (rut_path == nullptr || converter_path == nullptr || rut_path[0] != '/' ||
+                          converter_path[0] != '/' || access(rut_path, X_OK) != 0 ||
+                          access(converter_path, X_OK) != 0)) {
+        error =
+            "#270 custom-hide CLI differential requires executable absolute RUT/converter paths";
         return false;
     }
-    TempDir temp;
-    if (!temp.create()) {
+    TempDir owned_temp;
+    TempDir& temp = pair == nullptr ? owned_temp : pair->temp;
+    if (!temp.created && !temp.create()) {
         error = "#270 custom-hide timeout probe could not create temporary resources";
         return false;
     }
     HeldLoopbackPorts reservations;
     u16 frontend_port = 0u;
     u16 backend_port = 0u;
-    if (!reservations.reserve_four_digit(0u, frontend_port) ||
-        !reservations.reserve_four_digit(1u, backend_port) || frontend_port == backend_port) {
+    if (pair != nullptr && pair->initialized) {
+        frontend_port = pair->frontend_port;
+        backend_port = pair->backend_port;
+        if (!reservations.reserve_specific(0u, frontend_port) ||
+            !reservations.reserve_specific(1u, backend_port)) {
+            error = "#270 custom-hide pair could not reacquire exact ports";
+            return false;
+        }
+    } else if (!reservations.reserve_four_digit(0u, frontend_port) ||
+               !reservations.reserve_four_digit(1u, backend_port) ||
+               frontend_port == backend_port) {
         error = "#270 custom-hide timeout probe could not hold distinct ports";
         return false;
     }
@@ -72137,12 +72173,26 @@ static bool run_pinned_nginx_custom_hide_timeout_probe(const std::string& contai
         count_text(config, "proxy_hide_header X-Powered-By;\n") != 1u ||
         count_text(config, "proxy_read_timeout 1s;\n") != 1u ||
         count_text(config, "proxy_buffering") != 0u ||
-        !write_file(temp.nginx_config, config.data(), config.size()) ||
-        !read_exact_return204_log(
-            temp.nginx_config, "#270 frozen probe config", temp.retained_config_snapshot, error) ||
+        (pair != nullptr && pair->initialized
+             ? !read_exact_return204_log(temp.nginx_config,
+                                         "#270 pair config before RUT",
+                                         temp.retained_config_snapshot,
+                                         error)
+             : !write_file(temp.nginx_config, config.data(), config.size()) ||
+                   !read_exact_return204_log(temp.nginx_config,
+                                             "#270 frozen probe config",
+                                             temp.retained_config_snapshot,
+                                             error)) ||
         temp.retained_config_snapshot != config) {
         error = "#270 custom-hide timeout probe config was not frozen exactly";
         return false;
+    }
+    if (pair != nullptr && !pair->initialized) {
+        pair->frontend_port = frontend_port;
+        pair->backend_port = backend_port;
+        pair->config = config;
+        pair->config_snapshot = temp.retained_config_snapshot;
+        pair->initialized = true;
     }
 
     static constexpr char kOrigin[] =
@@ -72242,7 +72292,12 @@ static bool run_pinned_nginx_custom_hide_timeout_probe(const std::string& contai
             if (dup2(output_fd, STDOUT_FILENO) < 0 || dup2(error_fd, STDERR_FILENO) < 0) _exit(127);
             close(output_fd);
             close(error_fd);
-            execl(converter_path, converter_path, "--format", "nginx-http", temp.nginx_config.c_str(), nullptr);
+            execl(converter_path,
+                  converter_path,
+                  "--format",
+                  "nginx-http",
+                  temp.nginx_config.c_str(),
+                  nullptr);
             _exit(127);
         }
         close(output_fd);
@@ -72258,7 +72313,8 @@ static bool run_pinned_nginx_custom_hide_timeout_probe(const std::string& contai
             WEXITSTATUS(converter_guard.child.status) != 0 ||
             !read_exact_rut_source(
                 temp.source, "#270 CLI generated source", generated_source, error)) {
-            if (error.empty()) error = "#270 custom-hide CLI converter failed or produced no source";
+            if (error.empty())
+                error = "#270 custom-hide CLI converter failed or produced no source";
             return false;
         }
         if (generated_source.empty()) {
@@ -72297,12 +72353,18 @@ static bool run_pinned_nginx_custom_hide_timeout_probe(const std::string& contai
             return false;
         }
         static constexpr char kPoison[] = "destroyed-after-270-custom-hide-load\n";
-        if (!write_file(temp.source, kPoison, sizeof(kPoison) - 1u) || poll_child(nginx.child)) {
+        std::string poison_readback;
+        if (!write_file(temp.source, kPoison, sizeof(kPoison) - 1u) ||
+            !read_exact_rut_source(
+                temp.source, "#270 poisoned custom-hide source", poison_readback, error) ||
+            poison_readback != kPoison || poll_child(nginx.child)) {
             error = "#270 custom-hide generated source poison did not preserve live child";
             return false;
         }
-    } else if (!handoff_held_loopback_port(
-                   &reservations.fds[0], frontend_port, "#270 custom-hide timeout probe nginx", error) ||
+    } else if (!handoff_held_loopback_port(&reservations.fds[0],
+                                           frontend_port,
+                                           "#270 custom-hide timeout probe nginx",
+                                           error) ||
                !spawn_child(docker_args, temp.nginx_log, nginx.child) ||
                !wait_ready(frontend_port, nginx.child, error)) {
         if (error.empty()) error = "#270 custom-hide timeout probe nginx failed readiness";
@@ -72647,6 +72709,22 @@ static bool run_pinned_nginx_custom_hide_timeout_probe(const std::string& contai
                 "#270 custom-hide completion episode exact response/lifecycle validation failed";
             return false;
         }
+        if (pair != nullptr) {
+            observation->downstream = response;
+            if (!normalize_date(observation->downstream)) {
+                error = "#270 custom-hide completion observation Date normalization failed";
+                return false;
+            }
+            observation->upstream = origin.history[0];
+            observation->access = final_access;
+            observation->eof = true;
+            observation->retired = origin_retired;
+            observation->stable = stable;
+            observation->accepted = origin.accepted.load(std::memory_order_acquire);
+            observation->requests = origin.requests.load(std::memory_order_acquire);
+            observation->peer_close_count =
+                origin.response_peer_close_count.load(std::memory_order_acquire);
+        }
         std::cerr << "PASS: #270 custom-hide completion W1/W2/W3 and full response wire observed\n";
         return true;
     }
@@ -72844,6 +72922,22 @@ static bool run_pinned_nginx_custom_hide_timeout_probe(const std::string& contai
         if (error.empty()) error = "#270 custom-hide timeout probe cleanup/history was not exact";
         return false;
     }
+    if (pair != nullptr) {
+        observation->downstream = response;
+        if (!normalize_date(observation->downstream)) {
+            error = "#270 custom-hide expiry observation Date normalization failed";
+            return false;
+        }
+        observation->upstream = origin.history[0];
+        observation->access = final_access;
+        observation->eof = actual_eof;
+        observation->retired = origin_retired;
+        observation->stable = post_retirement_stable;
+        observation->accepted = origin.accepted.load(std::memory_order_acquire);
+        observation->requests = origin.requests.load(std::memory_order_acquire);
+        observation->peer_close_count =
+            origin.response_peer_close_count.load(std::memory_order_acquire);
+    }
     return error.empty();
 }
 
@@ -72855,29 +72949,69 @@ static bool run_pinned_nginx_custom_hide_timeout_cli_differential(const char* ru
         return false;
     }
     if (!check_exact_rut_source_capture(error)) return false;
-    // Each invocation owns its complete TempDir/config/origin lifecycle.  The
-    // runner performs the accepted nginx expiry/completion contract and then
-    // repeats that exact contract through ordinary RUT after CLI lowering.
     const std::string suffix = std::to_string(getpid());
-    if (!run_pinned_nginx_custom_hide_timeout_probe(
-            "rut-nginx-270-custom-hide-cli-expiry-" + suffix, error, false))
-        return false;
-    if (!run_pinned_nginx_custom_hide_timeout_probe(
-            "rut-nginx-270-custom-hide-cli-completion-" + suffix, error, true))
-        return false;
-    if (!run_pinned_nginx_custom_hide_timeout_probe(
-            "rut-nginx-270-custom-hide-cli-rut-expiry-" + suffix,
-            error,
-            false,
-            rut_path,
-            converter_path))
-        return false;
-    return run_pinned_nginx_custom_hide_timeout_probe(
-        "rut-nginx-270-custom-hide-cli-rut-completion-" + suffix,
-        error,
-        true,
-        rut_path,
-        converter_path);
+    const auto run_pair = [&](bool completion, const std::string& name) {
+        CustomHideTimeoutPairContext pair;
+        CustomHideTimeoutObservation nginx_observation;
+        CustomHideTimeoutObservation rut_observation;
+        if (!pair.temp.create()) {
+            error = "#270 custom-hide pair could not create resources";
+            return false;
+        }
+        if (!run_pinned_nginx_custom_hide_timeout_probe(
+                name + "-nginx", error, completion, nullptr, nullptr, &pair, &nginx_observation))
+            return false;
+        if (!read_exact_return204_log(pair.temp.nginx_config,
+                                      "#270 pair config after nginx",
+                                      pair.config_snapshot,
+                                      error) ||
+            pair.config_snapshot != pair.config) {
+            error = "#270 pair config changed after nginx settlement";
+            return false;
+        }
+        if (!read_request_length_access_file(
+                pair.temp.nginx_access_log, pair.access_snapshot, error) ||
+            pair.access_snapshot != "60\n" || !write_file(pair.temp.nginx_access_log, "", 0u)) {
+            error = "#270 pair access snapshot/reset failed";
+            return false;
+        }
+        std::string cleared;
+        if (!read_request_length_access_file(pair.temp.nginx_access_log, cleared, error) ||
+            !cleared.empty()) {
+            error = "#270 pair access log was not empty before RUT";
+            return false;
+        }
+        if (!run_pinned_nginx_custom_hide_timeout_probe(name + "-rut",
+                                                        error,
+                                                        completion,
+                                                        rut_path,
+                                                        converter_path,
+                                                        &pair,
+                                                        &rut_observation))
+            return false;
+        std::string after_rut_config;
+        if (!read_exact_return204_log(
+                pair.temp.nginx_config, "#270 pair config after RUT", after_rut_config, error) ||
+            after_rut_config != pair.config) {
+            error = "#270 pair config changed after RUT settlement";
+            return false;
+        }
+        if (nginx_observation.downstream != rut_observation.downstream ||
+            nginx_observation.upstream != rut_observation.upstream ||
+            nginx_observation.access != rut_observation.access ||
+            nginx_observation.eof != rut_observation.eof ||
+            nginx_observation.retired != rut_observation.retired ||
+            nginx_observation.stable != rut_observation.stable ||
+            nginx_observation.accepted != rut_observation.accepted ||
+            nginx_observation.requests != rut_observation.requests ||
+            nginx_observation.peer_close_count != rut_observation.peer_close_count) {
+            error = "#270 paired nginx/RUT accepted observations differed";
+            return false;
+        }
+        return true;
+    };
+    return run_pair(false, "rut-nginx-270-custom-hide-cli-expiry-" + suffix) &&
+           run_pair(true, "rut-nginx-270-custom-hide-cli-completion-" + suffix);
 }
 
 static bool run_pinned_nginx_default_buffering_three_publication_oracle_impl(
