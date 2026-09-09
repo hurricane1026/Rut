@@ -1,5 +1,6 @@
 #include "fixtures/nginx373_hide.inc"
 #include "fixtures/nginx373_nohide.inc"
+#include "fixtures/nginx270_hide_timeout.inc"
 #include "rut/common/strict_local_response.h"
 #include "rut/compiler/analyze.h"
 #include "rut/compiler/lexer.h"
@@ -21207,27 +21208,8 @@ TEST(nginx_converter_issue270, custom_hide_header_and_timeout_lower_together) {
         }
     }
     CHECK_EQ(order_outputs[0], order_outputs[1]);
-    static constexpr char kExpectedOneSecondHide[] =
-        "hide_headers: [\"Date\", \"Server\", \"X-Pad\", "
-        "\"X-Ab9_-Ab9_-Ab9_-Ab9_-Ab9_-Ab9_-Ab9_-Ab9_-Cd0E\"]\n";
-    static constexpr char kExpectedOneSecondTimeout[] = "response_read_timeout: 1s\n";
-    CHECK_EQ(count_text(one_second_output, kExpectedOneSecondHide), 3u);
-    CHECK_EQ(count_text(one_second_output, kExpectedOneSecondTimeout), 4u);
-    // This is a whole-program expected fixture derived from the independently
-    // checked hide-header golden; only the independently specified name and
-    // timeout semantics differ. It is never obtained from the candidate output.
-    std::string expected_one_second(kIssue373HideGolden, sizeof(kIssue373HideGolden) - 1u);
-    size_t name_pos = 0u;
-    while ((name_pos = expected_one_second.find("X-Compat-Hidden", name_pos)) !=
-           std::string::npos) {
-        expected_one_second.replace(name_pos, strlen("X-Compat-Hidden"), name);
-        name_pos += name.size();
-    }
-    const size_t timeout_pos = expected_one_second.find("response_read_timeout: 60s");
-    REQUIRE(timeout_pos != std::string::npos);
-    expected_one_second.replace(
-        timeout_pos, strlen("response_read_timeout: 60s"), "response_read_timeout: 1s");
-    CHECK_EQ(one_second_output, expected_one_second);
+    CHECK_EQ(one_second_output,
+             std::string(kIssue270HideTimeoutGolden, sizeof(kIssue270HideTimeoutGolden) - 1u));
     const auto inspect_rut = [&](const std::string& output, u8 seconds) {
         const auto lexed = lex({output.data(), static_cast<u32>(output.size())});
         REQUIRE(lexed);
