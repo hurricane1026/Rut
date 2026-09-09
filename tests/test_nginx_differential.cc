@@ -802,6 +802,28 @@ struct Child {
     bool status_valid = false;
 };
 
+enum class DockerInfoOutcome { SpawnFailed, WaitFailed, TimedOut, Exited, Signaled };
+enum class DockerSnapshotState { Missing, Empty, NonEmpty, ReadError, Overflow };
+
+struct DockerInfoResult {
+    DockerInfoOutcome outcome = DockerInfoOutcome::SpawnFailed;
+    Child child;
+    bool kill_attempted = false;
+    bool kill_failed = false;
+    bool reap_failed = false;
+    bool ownership_unresolved = false;
+    bool no_waitable_child = false;
+    int error_number = 0;
+    int wait_error_number = 0;
+    int cleanup_wait_error_number = 0;
+    u64 probe_elapsed_ns = 0;
+    u64 cleanup_elapsed_ns = 0;
+    int configured_timeout_ms = 10'000;
+    std::string snapshot;
+    std::string snapshot_error;
+    DockerSnapshotState snapshot_state = DockerSnapshotState::Missing;
+};
+
 static bool poll_child(Child& child) {
     if (child.pid < 0) return child.reaped;
     if (child.reaped) return true;
@@ -868,6 +890,115 @@ static bool spawn_child(const std::vector<std::string>& args,
     child.reaped = false;
     child.status_valid = false;
     return true;
+}
+
+static bool reap_child_bounded(Child& child, int timeout_ms, int& wait_error) {
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(timeout_ms);
+    for (;;) {
+        int status = 0;
+        const pid_t rc = waitpid(child.pid, &status, WNOHANG);
+        if (rc == child.pid) {
+            child.status = status;
+            child.status_valid = true;
+            child.reaped = true;
+            return true;
+        }
+        if (rc < 0) {
+            if (errno == EINTR) {
+                if (std::chrono::steady_clock::now() >= deadline) break;
+                continue;
+            }
+            wait_error = errno;
+            return false;
+        }
+        if (std::chrono::steady_clock::now() >= deadline) break;
+        usleep(5'000);
+    }
+    return false;
+}
+
+static DockerInfoResult run_docker_info_runner(const std::vector<std::string>& args,
+                                               const std::string& log_path,
+                                               int timeout_ms = 10'000) {
+    DockerInfoResult result;
+    result.configured_timeout_ms = timeout_ms;
+    const auto started = std::chrono::steady_clock::now();
+    if (!spawn_child(args, log_path, result.child)) {
+        result.error_number = errno;
+        result.outcome = DockerInfoOutcome::SpawnFailed;
+        result.probe_elapsed_ns =
+            static_cast<u64>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                 std::chrono::steady_clock::now() - started)
+                                 .count());
+        return result;
+    }
+    const auto deadline = started + std::chrono::milliseconds(timeout_ms);
+    int wait_error = 0;
+    for (;;) {
+        int status = 0;
+        const pid_t rc = waitpid(result.child.pid, &status, WNOHANG);
+        if (rc == result.child.pid) {
+            result.child.status = status;
+            result.child.status_valid = true;
+            result.child.reaped = true;
+            if (WIFEXITED(status))
+                result.outcome = DockerInfoOutcome::Exited;
+            else if (WIFSIGNALED(status))
+                result.outcome = DockerInfoOutcome::Signaled;
+            else
+                result.outcome = DockerInfoOutcome::WaitFailed;
+            break;
+        }
+        if (rc < 0) {
+            if (errno == EINTR && std::chrono::steady_clock::now() < deadline) continue;
+            const bool deadline_eintr = errno == EINTR;
+            result.wait_error_number = errno;
+            result.outcome =
+                deadline_eintr ? DockerInfoOutcome::TimedOut : DockerInfoOutcome::WaitFailed;
+            if (errno == ECHILD) {
+                result.no_waitable_child = true;
+                result.child.status_valid = false;
+            } else {
+                result.kill_attempted = true;
+                if (kill(result.child.pid, SIGKILL) != 0 && errno != ESRCH) {
+                    result.kill_failed = true;
+                    result.error_number = errno;
+                }
+                const auto cleanup_started = std::chrono::steady_clock::now();
+                result.reap_failed =
+                    !reap_child_bounded(result.child, 2'000, result.cleanup_wait_error_number);
+                result.cleanup_elapsed_ns =
+                    static_cast<u64>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                         std::chrono::steady_clock::now() - cleanup_started)
+                                         .count());
+                result.ownership_unresolved = !result.child.reaped;
+            }
+            break;
+        }
+        if (std::chrono::steady_clock::now() >= deadline) {
+            result.outcome = DockerInfoOutcome::TimedOut;
+            result.kill_attempted = true;
+            if (kill(result.child.pid, SIGKILL) != 0 && errno != ESRCH) {
+                result.kill_failed = true;
+                result.error_number = errno;
+            }
+            const auto cleanup_started = std::chrono::steady_clock::now();
+            result.reap_failed =
+                !reap_child_bounded(result.child, 2'000, result.cleanup_wait_error_number);
+            result.cleanup_elapsed_ns =
+                static_cast<u64>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                     std::chrono::steady_clock::now() - cleanup_started)
+                                     .count());
+            result.ownership_unresolved = !result.child.reaped;
+            break;
+        }
+        usleep(5'000);
+    }
+    result.probe_elapsed_ns = static_cast<u64>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                                   std::chrono::steady_clock::now() - started)
+                                                   .count()) -
+                              result.cleanup_elapsed_ns;
+    return result;
 }
 
 static bool stop_child(Child& child) {
@@ -1080,6 +1211,289 @@ static bool write_file(const std::string& path, const char* data, size_t len) {
 }
 
 static bool log_contains(const std::string& path, const char* needle);
+static std::string child_status_description(const Child& child);
+static bool write_file(const std::string& path, const char* data, size_t len);
+
+static bool read_docker_snapshot(const std::string& path,
+                                 std::string& contents,
+                                 std::string& error,
+                                 DockerSnapshotState& state) {
+    constexpr size_t kMaxDiagnosticBytes = 8192u;
+    contents.clear();
+    error.clear();
+    state = DockerSnapshotState::Missing;
+    const int fd = open(path.c_str(), O_RDONLY | O_CLOEXEC);
+    if (fd < 0) {
+        error = "open errno=" + std::to_string(errno);
+        if (errno != ENOENT) state = DockerSnapshotState::ReadError;
+        return false;
+    }
+    char buffer[1024];
+    while (contents.size() < kMaxDiagnosticBytes) {
+        const size_t remaining = kMaxDiagnosticBytes - contents.size();
+        const size_t request = std::min(sizeof(buffer), remaining);
+        const ssize_t count = read(fd, buffer, request);
+        if (count > 0) {
+            contents.append(buffer, static_cast<size_t>(count));
+            continue;
+        }
+        if (count < 0 && errno == EINTR) continue;
+        if (count < 0) {
+            error = "read errno=" + std::to_string(errno);
+            state = DockerSnapshotState::ReadError;
+            close(fd);
+            return false;
+        }
+        break;
+    }
+    if (contents.size() == kMaxDiagnosticBytes) {
+        char extra = 0;
+        ssize_t extra_count;
+        do {
+            extra_count = read(fd, &extra, 1);
+        } while (extra_count < 0 && errno == EINTR);
+        if (extra_count > 0) {
+            state = DockerSnapshotState::Overflow;
+            error = "output exceeded 8192-byte snapshot";
+            close(fd);
+            return false;
+        }
+        if (extra_count < 0) {
+            state = DockerSnapshotState::ReadError;
+            error = "read errno=" + std::to_string(errno);
+            close(fd);
+            return false;
+        }
+    }
+    if (close(fd) != 0 && error.empty()) error = "close errno=" + std::to_string(errno);
+    if (!error.empty()) {
+        state = DockerSnapshotState::ReadError;
+        return false;
+    }
+    state = contents.empty() ? DockerSnapshotState::Empty : DockerSnapshotState::NonEmpty;
+    return true;
+}
+
+static bool docker_daemon_text(const std::string& text) {
+    return text.find("Cannot connect to the Docker daemon") != std::string::npos ||
+           text.find("Is the docker daemon running") != std::string::npos;
+}
+
+enum class DockerInfoDecision { Success, MissingPrerequisite, Failure };
+
+static DockerInfoDecision docker_info_decision(const DockerInfoResult& result) {
+    if (result.outcome == DockerInfoOutcome::Exited && result.child.status_valid &&
+        WIFEXITED(result.child.status) && WEXITSTATUS(result.child.status) == 0)
+        return DockerInfoDecision::Success;
+    if (result.outcome == DockerInfoOutcome::Exited && result.child.status_valid &&
+        WIFEXITED(result.child.status) && WEXITSTATUS(result.child.status) != 0 &&
+        (result.snapshot_state == DockerSnapshotState::Missing ||
+         result.snapshot_state == DockerSnapshotState::Empty ||
+         docker_daemon_text(result.snapshot)))
+        return DockerInfoDecision::MissingPrerequisite;
+    return DockerInfoDecision::Failure;
+}
+
+static int docker_info_return_code(DockerInfoDecision decision, bool required) {
+    if (decision == DockerInfoDecision::Success) return 0;
+    if (decision == DockerInfoDecision::MissingPrerequisite && !required) return 77;
+    return 1;
+}
+
+static bool docker_info_missing_prerequisite(const DockerInfoResult& result);
+
+static bool run_docker_info_preflight_self_check(std::string& error) {
+    char fixture_path[] = "/tmp/rut-docker-info-selfcheck-XXXXXX";
+    if (mkdtemp(fixture_path) == nullptr) {
+        error = "could not create self-check fixture directory";
+        return false;
+    }
+    const std::string fixture(fixture_path);
+    const std::string log = fixture + "/docker-info.log";
+    const auto cleanup = [&]() {
+        unlink(log.c_str());
+        rmdir(fixture.c_str());
+    };
+    auto check = [&](const std::vector<std::string>& args,
+                     int timeout_ms,
+                     DockerInfoOutcome expected,
+                     int expected_exit = -1) {
+        DockerInfoResult result = run_docker_info_runner(args, log, timeout_ms);
+        unlink(log.c_str());
+        if (result.outcome != expected ||
+            (expected == DockerInfoOutcome::Exited && expected_exit >= 0 &&
+             (!result.child.status_valid || !WIFEXITED(result.child.status) ||
+              WEXITSTATUS(result.child.status) != expected_exit)) ||
+            (expected == DockerInfoOutcome::Signaled &&
+             (!result.child.status_valid || !WIFSIGNALED(result.child.status) ||
+              WTERMSIG(result.child.status) != SIGTERM)) ||
+            (expected == DockerInfoOutcome::TimedOut &&
+             (!result.kill_attempted || result.kill_failed || result.reap_failed ||
+              result.ownership_unresolved || !result.child.reaped || !result.child.status_valid ||
+              !WIFSIGNALED(result.child.status) || WTERMSIG(result.child.status) != SIGKILL))) {
+            error = "unexpected docker-info outcome";
+            return false;
+        }
+        return true;
+    };
+    if (!check({"/definitely/missing/docker-info"}, 100, DockerInfoOutcome::Exited, 127) ||
+        !check({"sh", "-c", "exit 0"}, 100, DockerInfoOutcome::Exited, 0) ||
+        !check({"sh", "-c", "kill -TERM $$"}, 100, DockerInfoOutcome::Signaled) ||
+        !check({"sh", "-c", "exec sleep 1"}, 50, DockerInfoOutcome::TimedOut)) {
+        cleanup();
+        return false;
+    }
+    DockerInfoResult daemon_text = run_docker_info_runner(
+        {"sh", "-c", "printf 'Cannot connect to the Docker daemon\\n' >&2; exit 1"}, log, 100);
+    (void)read_docker_snapshot(
+        log, daemon_text.snapshot, daemon_text.snapshot_error, daemon_text.snapshot_state);
+    unlink(log.c_str());
+    if (daemon_text.outcome != DockerInfoOutcome::Exited || !daemon_text.child.status_valid ||
+        WEXITSTATUS(daemon_text.child.status) != 1 ||
+        !docker_info_missing_prerequisite(daemon_text)) {
+        error = "daemon-text prerequisite classifier control failed";
+        cleanup();
+        return false;
+    }
+    DockerInfoResult success = run_docker_info_runner({"sh", "-c", "exit 0"}, log, 100);
+    unlink(log.c_str());
+    if (mkdir(log.c_str(), 0700) != 0 ||
+        read_docker_snapshot(
+            log, success.snapshot, success.snapshot_error, success.snapshot_state) ||
+        success.outcome != DockerInfoOutcome::Exited ||
+        success.snapshot_state != DockerSnapshotState::ReadError) {
+        error = "exit-0 snapshot read-error control failed";
+        cleanup();
+        return false;
+    }
+    rmdir(log.c_str());
+    DockerInfoResult missing;
+    missing.outcome = DockerInfoOutcome::Exited;
+    missing.child.status_valid = true;
+    missing.child.status = (1 << 8);
+    missing.snapshot_state = DockerSnapshotState::Missing;
+    DockerInfoResult empty = missing;
+    empty.snapshot_state = DockerSnapshotState::Empty;
+    DockerInfoResult read_error = missing;
+    read_error.snapshot_state = DockerSnapshotState::ReadError;
+    DockerInfoResult spawn_failed;
+    DockerInfoResult wait_failed;
+    wait_failed.outcome = DockerInfoOutcome::WaitFailed;
+    DockerInfoResult invalid_status;
+    invalid_status.outcome = DockerInfoOutcome::WaitFailed;
+    invalid_status.child.status_valid = true;
+    invalid_status.child.status = 0x7f;
+    DockerInfoResult timeout_text = wait_failed;
+    timeout_text.outcome = DockerInfoOutcome::TimedOut;
+    timeout_text.snapshot = "Cannot connect to the Docker daemon\n";
+    timeout_text.snapshot_state = DockerSnapshotState::NonEmpty;
+    DockerInfoResult timeout_empty = timeout_text;
+    timeout_empty.snapshot.clear();
+    timeout_empty.snapshot_state = DockerSnapshotState::Empty;
+    DockerInfoResult timeout_missing = timeout_text;
+    timeout_missing.snapshot.clear();
+    timeout_missing.snapshot_state = DockerSnapshotState::Missing;
+    const DockerInfoResult* controls[] = {&missing,
+                                          &empty,
+                                          &read_error,
+                                          &spawn_failed,
+                                          &wait_failed,
+                                          &invalid_status,
+                                          &timeout_text,
+                                          &timeout_empty,
+                                          &timeout_missing};
+    for (const DockerInfoResult* control : controls) {
+        const DockerInfoDecision decision = docker_info_decision(*control);
+        const int required_rc = docker_info_return_code(decision, true);
+        const int optional_rc = docker_info_return_code(decision, false);
+        const bool missing_control = control == &missing || control == &empty;
+        if ((missing_control && (required_rc != 1 || optional_rc != 77)) ||
+            (!missing_control && (required_rc != 1 || optional_rc != 1))) {
+            error = "missing/empty/read-error classifier controls failed";
+            cleanup();
+            return false;
+        }
+    }
+    if (!success.child.status_valid || !WIFEXITED(success.child.status) ||
+        WEXITSTATUS(success.child.status) != 0 ||
+        docker_info_return_code(docker_info_decision(success), true) != 0 ||
+        docker_info_return_code(docker_info_decision(success), false) != 0) {
+        error = "missing/empty/read-error classifier controls failed";
+        cleanup();
+        return false;
+    }
+    unlink(log.c_str());
+    if (read_docker_snapshot(
+            log, missing.snapshot, missing.snapshot_error, missing.snapshot_state) ||
+        missing.snapshot_state != DockerSnapshotState::Missing || !write_file(log, "", 0) ||
+        !read_docker_snapshot(log, empty.snapshot, empty.snapshot_error, empty.snapshot_state) ||
+        empty.snapshot_state != DockerSnapshotState::Empty) {
+        error = "missing/empty snapshot controls failed";
+        cleanup();
+        return false;
+    }
+    std::string snapshot_error;
+    DockerSnapshotState snapshot_state = DockerSnapshotState::Missing;
+    std::string exact(8192u, 'x');
+    if (!write_file(log, exact.data(), exact.size()) ||
+        !read_docker_snapshot(log, exact, snapshot_error, snapshot_state) ||
+        snapshot_state != DockerSnapshotState::NonEmpty || exact.size() != 8192u) {
+        error = "8192-byte snapshot control failed";
+        cleanup();
+        return false;
+    }
+    exact.push_back('x');
+    if (!write_file(log, exact.data(), exact.size()) ||
+        read_docker_snapshot(log, exact, snapshot_error, snapshot_state) ||
+        snapshot_state != DockerSnapshotState::Overflow) {
+        error = "8193-byte snapshot control failed";
+        cleanup();
+        return false;
+    }
+    cleanup();
+    return true;
+}
+
+static bool docker_info_missing_prerequisite(const DockerInfoResult& result) {
+    return docker_info_decision(result) == DockerInfoDecision::MissingPrerequisite;
+}
+
+static void print_docker_info_result(const DockerInfoResult& result) {
+    const char* outcome = "spawn_failed";
+    switch (result.outcome) {
+        case DockerInfoOutcome::WaitFailed:
+            outcome = "wait_failed";
+            break;
+        case DockerInfoOutcome::TimedOut:
+            outcome = "timed_out";
+            break;
+        case DockerInfoOutcome::Exited:
+            outcome = "exited";
+            break;
+        case DockerInfoOutcome::Signaled:
+            outcome = "signaled";
+            break;
+        default:
+            break;
+    }
+    std::cerr << "Docker info outcome=" << outcome << " pid=" << result.child.pid
+              << " status=" << child_status_description(result.child)
+              << " status_valid=" << (result.child.status_valid ? 1 : 0)
+              << " reaped=" << (result.child.reaped ? 1 : 0)
+              << " no_waitable_child=" << (result.no_waitable_child ? 1 : 0)
+              << " wait_error=" << result.wait_error_number << " errno=" << result.error_number
+              << " cleanup_wait_error=" << result.cleanup_wait_error_number
+              << " probe_elapsed_ns=" << result.probe_elapsed_ns
+              << " cleanup_elapsed_ns=" << result.cleanup_elapsed_ns
+              << " configured_timeout_ms=" << result.configured_timeout_ms
+              << " kill_attempted=" << (result.kill_attempted ? 1 : 0)
+              << " kill_failed=" << (result.kill_failed ? 1 : 0)
+              << " reap_failed=" << (result.reap_failed ? 1 : 0)
+              << " ownership_unresolved=" << (result.ownership_unresolved ? 1 : 0) << "\n";
+    if (!result.snapshot.empty()) std::cerr << "Docker info snapshot:\n" << result.snapshot;
+    if (!result.snapshot_error.empty())
+        std::cerr << "Docker info snapshot error: " << result.snapshot_error << "\n";
+}
 
 static bool read_bounded_file(const std::string& path, std::string& contents, std::string& error) {
     constexpr size_t kMaxDiagnosticBytes = 8192u;
@@ -9694,6 +10108,126 @@ static bool read_exact_return204_log(const std::string& path,
     }
     close(fd);
     return bounded_log_reached_eof(contents.size(), kExactReturn204LogLimit, saw_eof, label, error);
+}
+
+// The standalone converter's stdout is an owned ordinary-RUT source, whose
+// contract is larger than the bounded diagnostic/log files above. Keep this
+// cap local to source capture; do not broaden generic log limits.
+static bool read_exact_rut_source(const std::string& path,
+                                  const char* label,
+                                  std::string& contents,
+                                  std::string& error) {
+    constexpr size_t kSourceLimit = rut::nginx::HttpProfileRutSource::kCapacity - 1u;
+    const int fd = open(path.c_str(), O_RDONLY | O_CLOEXEC);
+    if (fd < 0) {
+        error = std::string(label) + " was unreadable";
+        return false;
+    }
+    contents.clear();
+    char buffer[1024];
+    for (;;) {
+        const size_t remaining = kSourceLimit - contents.size();
+        const size_t want = std::min(sizeof(buffer), remaining);
+        const ssize_t n = read(fd, buffer, want);
+        if (n > 0) {
+            contents.append(buffer, static_cast<size_t>(n));
+            if (contents.size() == kSourceLimit) {
+                char probe = 0;
+                ssize_t extra = 0;
+                do {
+                    extra = read(fd, &probe, 1u);
+                } while (extra < 0 && errno == EINTR);
+                if (extra > 0) {
+                    close(fd);
+                    error = std::string(label) + " exceeded owned source capacity";
+                    return false;
+                }
+                if (extra < 0) {
+                    close(fd);
+                    error = std::string(label) + " EOF probe failed";
+                    return false;
+                }
+                if (close(fd) != 0) {
+                    error = std::string(label) + " close failed";
+                    return false;
+                }
+                return true;
+            }
+            continue;
+        }
+        if (n < 0 && errno == EINTR) continue;
+        if (n < 0) {
+            close(fd);
+            error = std::string(label) + " read failed";
+            return false;
+        }
+        if (close(fd) != 0) {
+            error = std::string(label) + " close failed";
+            return false;
+        }
+        if (contents.empty()) {
+            error = std::string(label) + " produced empty source";
+            return false;
+        }
+        return true;
+    }
+}
+
+static bool check_exact_rut_source_capture(std::string& error) {
+    constexpr size_t kLimit = rut::nginx::HttpProfileRutSource::kCapacity - 1u;
+    TempDir temp;
+    if (!temp.create()) {
+        error = "#616 source capture self-check could not create temp directory";
+        return false;
+    }
+    const auto payload = [](size_t size) {
+        std::string value(size, 'r');
+        if (!value.empty()) value.back() = '\n';
+        return value;
+    };
+    std::string captured;
+    std::string diagnostic;
+    if (!write_file(temp.source, payload(kLimit).data(), kLimit)) {
+        error = "#616 exact source limit write failed";
+        return false;
+    }
+    if (!read_exact_rut_source(temp.source, "#616 exact source limit", captured, diagnostic)) {
+        error = diagnostic;
+        return false;
+    }
+    if (captured != payload(kLimit)) {
+        error = "#616 exact source limit capture mismatch";
+        return false;
+    }
+    diagnostic.clear();
+    if (!write_file(temp.source, payload(kLimit + 1u).data(), kLimit + 1u)) {
+        error = "#616 over-limit source write failed";
+        return false;
+    }
+    if (read_exact_rut_source(temp.source, "#616 over-limit source", captured, diagnostic) ||
+        diagnostic.find("exceeded owned source capacity") == std::string::npos) {
+        error = "#616 over-limit source was not rejected as expected";
+        return false;
+    }
+    diagnostic.clear();
+    if (!write_file(temp.source, "", 0u)) {
+        error = "#616 empty source write failed";
+        return false;
+    }
+    if (read_exact_rut_source(temp.source, "#616 empty source", captured, diagnostic) ||
+        diagnostic.find("empty source") == std::string::npos) {
+        error = "#616 empty source was not rejected as expected";
+        return false;
+    }
+    diagnostic.clear();
+    if (!write_file(temp.source, payload(8298u).data(), 8298u) ||
+        !read_exact_rut_source(temp.source, "#616 over-log-limit source", captured, diagnostic) ||
+        captured != payload(8298u)) {
+        error = diagnostic.empty() ? "#616 over-log-limit source capture mismatch" : diagnostic;
+        return false;
+    }
+    error.clear();
+    return true;
 }
 
 static bool split_exact_complete_log(const std::string& contents,
@@ -26424,18 +26958,34 @@ static bool run_rut_iouring_gate_spike(u16 frontend_port,
         return false;
     }
 
-    client.fd = connect_once(frontend_port);
+    client.fd = socket(AF_INET, SOCK_STREAM, 0);
     if (client.fd < 0) {
-        error = "failed to connect RUT io_uring target downstream";
+        error = "failed to create RUT io_uring target downstream client";
         return false;
     }
     sockaddr_in local{};
-    socklen_t local_length = sizeof(local);
-    if (getsockname(client.fd, reinterpret_cast<sockaddr*>(&local), &local_length) != 0 ||
-        local_length < sizeof(local) || local.sin_family != AF_INET) {
-        error = "failed to resolve RUT target peer identity";
+    local.sin_family = AF_INET;
+    local.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    local.sin_port = 0;
+    if (bind(client.fd, reinterpret_cast<sockaddr*>(&local), sizeof(local)) != 0) {
+        error = "failed to bind RUT io_uring target downstream client";
         return false;
     }
+    socklen_t local_length = sizeof(local);
+    if (getsockname(client.fd, reinterpret_cast<sockaddr*>(&local), &local_length) != 0 ||
+        local_length < sizeof(local) || local.sin_family != AF_INET ||
+        local.sin_addr.s_addr != htonl(INADDR_LOOPBACK) || local.sin_port == 0) {
+        error = "failed to resolve bound RUT target peer identity";
+        return false;
+    }
+    timeval timeout{2, 0};
+    if (setsockopt(client.fd, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout)) != 0 ||
+        setsockopt(client.fd, SOL_SOCKET, SO_SNDTIMEO, &timeout, sizeof(timeout)) != 0) {
+        error = "failed to configure RUT io_uring target client timeouts";
+        return false;
+    }
+    // Publish and arm the complete target identity before connect so accept's
+    // first Recv cannot race ahead of the target tuple publication.
     mapping.gate->target_peer_ipv4_be = local.sin_addr.s_addr;
     mapping.gate->target_peer_port_be = local.sin_port;
     mapping.gate->target_upstream_ipv4_be = htonl(INADDR_LOOPBACK);
@@ -26451,6 +27001,14 @@ static bool run_rut_iouring_gate_spike(u16 frontend_port,
         return false;
     }
     rut_downstream_gate_wake(&mapping.gate->state);
+    sockaddr_in frontend{};
+    frontend.sin_family = AF_INET;
+    frontend.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    frontend.sin_port = htons(frontend_port);
+    if (connect(client.fd, reinterpret_cast<sockaddr*>(&frontend), sizeof(frontend)) != 0) {
+        error = "failed to connect RUT io_uring target downstream";
+        return false;
+    }
     if (!send_all(client.fd, request_one, request_one_length)) {
         error = "failed to send RUT io_uring request 1";
         return false;
@@ -53095,6 +53653,387 @@ static bool run_converter_retained_off_source_self_checks(const std::string& sou
     return true;
 }
 
+static bool validate_custom_hide_timeout_loaded_program(const std::string& source_path,
+                                                        const std::string& captured_stdout,
+                                                        u16 frontend_port,
+                                                        u16 backend_port,
+                                                        const std::string& access_path,
+                                                        const char* custom_name,
+                                                        std::string& error) {
+    if (source_path.empty() || captured_stdout.empty() || custom_name == nullptr ||
+        custom_name[0] == '\0' || frontend_port == 0u || backend_port == 0u ||
+        frontend_port == backend_port || access_path.empty()) {
+        error = "#616 loaded custom-hide timeout helper received incomplete artifacts";
+        return false;
+    }
+    std::string persisted;
+    if (!read_exact_rut_source(source_path, "#616 captured CLI stdout", persisted, error) ||
+        persisted != captured_stdout) {
+        error = "#616 persisted source did not authenticate captured CLI stdout";
+        return false;
+    }
+    auto program = std::make_unique<rut::LoadedProgram>();
+    struct Guard {
+        std::unique_ptr<rut::LoadedProgram>& program;
+        ~Guard() { program->destroy(); }
+    } guard{program};
+    rut::LoadError load_error{};
+    if (!rut::load_rut_program(source_path.c_str(),
+                               *program,
+                               load_error,
+                               rut::jit::OptLevel::O2,
+                               static_cast<u64>(captured_stdout.size())) ||
+        !rut::access_log_sink_spec_valid(program->access_log) || !program->access_log.present ||
+        program->config.route_count != 3u || program->config.upstream_count != 1u ||
+        program->config.upstreams[0].addr_count != 1u ||
+        ntohl(program->config.upstreams[0].addrs[0].sin_addr.s_addr) != 0x7f000001u ||
+        ntohs(program->config.upstreams[0].addrs[0].sin_port) != backend_port ||
+        program->access_log.path_len != access_path.size() ||
+        memcmp(program->access_log.path, access_path.data(), access_path.size()) != 0) {
+        error = "#616 loaded custom-hide timeout program lost listener/upstream/access-log state";
+        return false;
+    }
+    if (!program->has_listener || program->listener.port != frontend_port ||
+        program->listener.address != rut::ListenerAddress::IPv4Exact ||
+        program->listener.ipv4_host != 0x7f000001u) {
+        error = "#616 loaded custom-hide timeout listener was not exact loopback";
+        return false;
+    }
+    const auto owned = [&](rut::Str value, const char* pool, u32 used) {
+        if (value.ptr == nullptr || value.len == 0u || value.len > used) return false;
+        const uintptr_t begin = reinterpret_cast<uintptr_t>(pool);
+        const uintptr_t ptr = reinterpret_cast<uintptr_t>(value.ptr);
+        return ptr >= begin && ptr - begin <= used - value.len;
+    };
+    const auto policy_ok = [&](const rut::RouteConfig& config,
+                               const rut::ForwardResponsePolicySpec& policy,
+                               rut::ResponsePolicyHeadMode head,
+                               const char* expected_custom_name) {
+        const rut::Str names[] = {
+            rut::lit_str("Date"),
+            rut::lit_str("Server"),
+            rut::lit_str("X-Pad"),
+            {expected_custom_name, static_cast<rut::u32>(strlen(expected_custom_name))}};
+        if (policy.head_mode != head || policy.hide_header_count != 4u ||
+            !owned(policy.server, config.response_policy_bytes, config.response_policy_bytes_used))
+            return false;
+        for (u32 i = 0u; i < 4u; i++)
+            if (!owned(policy.hide_headers[i],
+                       config.response_policy_bytes,
+                       config.response_policy_bytes_used) ||
+                !policy.hide_headers[i].eq(names[i]))
+                return false;
+        return true;
+    };
+    const auto failure_ok = [&](const rut::ForwardFailurePolicySpec& failure,
+                                u16 status,
+                                rut::FailurePolicyHeadMode head,
+                                const char* reason) {
+        static constexpr char k502[] =
+            "<html>\r\n<head><title>502 Bad Gateway</title></head>\r\n<body>\r\n"
+            "<center><h1>502 Bad Gateway</h1></center>\r\n<hr><center>nginx/1.29.7</center>\r\n"
+            "</body>\r\n</html>\r\n";
+        static constexpr char k504[] =
+            "<html>\r\n<head><title>504 Gateway Time-out</title></head>\r\n<body>\r\n"
+            "<center><h1>504 Gateway "
+            "Time-out</h1></center>\r\n<hr><center>nginx/1.29.7</center>\r\n"
+            "</body>\r\n</html>\r\n";
+        const char* body = status == 502u ? k502 : k504;
+        return owned(failure.reason,
+                     program->config.failure_policy_bytes,
+                     program->config.failure_policy_bytes_used) &&
+               owned(failure.server,
+                     program->config.failure_policy_bytes,
+                     program->config.failure_policy_bytes_used) &&
+               owned(failure.body,
+                     program->config.failure_policy_bytes,
+                     program->config.failure_policy_bytes_used) &&
+               failure.status_code == status && failure.head_mode == head &&
+               failure.reason.eq({reason, static_cast<rut::u32>(strlen(reason))}) &&
+               failure.server.eq(rut::lit_str("nginx/1.29.7")) &&
+               failure.body.eq({body, static_cast<rut::u32>(strlen(body))});
+    };
+    const auto predicate = [&](const rut::RouteEntry& route,
+                               const rut::jit::HandlerResult& result,
+                               u16 expected_request_policy,
+                               u16 expected_head,
+                               rut::ForwardResponseBufferingMode buffering) {
+        if (route.fn == nullptr || result.action != rut::jit::HandlerAction::ForwardBundle ||
+            result.status_code != expected_request_policy || result.upstream_id != 0u ||
+            result.next_state == 0u || result.next_state > program->config.policy_bundle_count)
+            return false;
+        const auto& bundle = program->config.policy_bundles[result.next_state - 1u];
+        if (bundle.response_read_timeout_seconds != 1u || bundle.response_buffering != buffering ||
+            !program->config.response_policy_id_is_valid(bundle.response_policy_id) ||
+            !program->config.failure_policy_id_is_valid(bundle.failure_policy_id) ||
+            !program->config.timeout_failure_policy_id_is_valid(bundle.timeout_failure_policy_id) ||
+            !policy_ok(program->config,
+                       program->config.response_policies[bundle.response_policy_id - 1u],
+                       static_cast<rut::ResponsePolicyHeadMode>(expected_head),
+                       custom_name))
+            return false;
+        const auto& failure = program->config.failure_policies[bundle.failure_policy_id - 1u];
+        const auto& timeout =
+            program->config.failure_policies[bundle.timeout_failure_policy_id - 1u];
+        const auto failure_head =
+            expected_head == static_cast<u16>(rut::ResponsePolicyHeadMode::SuppressBody)
+                ? rut::FailurePolicyHeadMode::SuppressBody
+                : rut::FailurePolicyHeadMode::Reject;
+        return failure_ok(failure, 502u, failure_head, "Bad Gateway") &&
+               failure_ok(timeout, 504u, failure_head, "Gateway Time-out");
+    };
+    const auto invoke = [&](const rut::RouteEntry& route, const char* request, u32 length) {
+        return rut::jit::HandlerResult::unpack(
+            route.fn(nullptr, nullptr, reinterpret_cast<const rut::u8*>(request), length, nullptr));
+    };
+    const rut::RouteEntry* head = nullptr;
+    const rut::RouteEntry* get = nullptr;
+    const rut::RouteEntry* any = nullptr;
+    for (u32 i = 0u; i < program->config.route_count; i++) {
+        const auto& route = program->config.routes[i];
+        if (route.path_len != 1u || route.path[0] != '/' ||
+            route.action != rut::RouteAction::JitHandler || route.fn == nullptr)
+            return error = "#616 loaded custom-hide timeout route inventory was not exact", false;
+        if (route.method == rut::kRouteMethodHead)
+            head = &route;
+        else if (route.method == rut::kRouteMethodGet)
+            get = &route;
+        else if (route.method == rut::kRouteMethodAny)
+            any = &route;
+        else
+            return error = "#616 loaded custom-hide timeout had an unexpected method", false;
+    }
+    if (head == nullptr || get == nullptr || any == nullptr)
+        return error = "#616 loaded custom-hide timeout lacked HEAD/GET/Any routes", false;
+    const char* h0 = "HEAD / HTTP/1.1\r\nHost: test\r\n\r\n";
+    const char* h1 = "HEAD / HTTP/1.1\r\nHost: test\r\nContent-Length: 1\r\n\r\nx";
+    const char* g = "GET / HTTP/1.1\r\nHost: test\r\n\r\n";
+    const char* p = "POST / HTTP/1.1\r\nHost: test\r\n\r\n";
+    const auto r0 = invoke(*head, h0, static_cast<u32>(strlen(h0)));
+    const auto r1 = invoke(*head, h1, static_cast<u32>(strlen(h1)));
+    const auto rg = invoke(*get, g, static_cast<u32>(strlen(g)));
+    const auto ra = invoke(*any, p, static_cast<u32>(strlen(p)));
+    const bool head0_ok = predicate(*head,
+                                    r0,
+                                    static_cast<u16>(rut::RequestPolicyId::Http11FixedStrip),
+                                    static_cast<u16>(rut::ResponsePolicyHeadMode::SuppressBody),
+                                    rut::ForwardResponseBufferingMode::None);
+    const bool head1_ok =
+        predicate(*head,
+                  r1,
+                  static_cast<u16>(rut::RequestPolicyId::Http11FixedStripContentLengthAfterHost),
+                  static_cast<u16>(rut::ResponsePolicyHeadMode::SuppressBody),
+                  rut::ForwardResponseBufferingMode::None);
+    const bool get_ok = predicate(*get,
+                                  rg,
+                                  static_cast<u16>(rut::RequestPolicyId::Http11FixedStrip),
+                                  static_cast<u16>(rut::ResponsePolicyHeadMode::Reject),
+                                  rut::ForwardResponseBufferingMode::CompleteContentLength);
+    const bool any_ok = predicate(*any,
+                                  ra,
+                                  static_cast<u16>(rut::RequestPolicyId::Http11FixedStrip),
+                                  static_cast<u16>(rut::ResponsePolicyHeadMode::Reject),
+                                  rut::ForwardResponseBufferingMode::None);
+    const bool distinct_ok = r0.next_state == r1.next_state && rg.next_state != r0.next_state &&
+                             ra.next_state != rg.next_state &&
+                             program->config.policy_bundle_count == 3u;
+    if (!head0_ok || !head1_ok || !get_ok || !any_ok || !distinct_ok) {
+        const auto result_text = [](const rut::jit::HandlerResult& result) {
+            return "action=" + std::to_string(static_cast<u32>(result.action)) +
+                   ",request=" + std::to_string(result.status_code) +
+                   ",upstream=" + std::to_string(result.upstream_id) +
+                   ",bundle=" + std::to_string(result.next_state);
+        };
+        error = "#616 loaded custom-hide timeout JIT bundle mismatch: HEAD0[" + result_text(r0) +
+                ",ok=" + std::to_string(head0_ok) + "] HEAD1[" + result_text(r1) +
+                ",ok=" + std::to_string(head1_ok) + "] GET[" + result_text(rg) +
+                ",ok=" + std::to_string(get_ok) + "] ANY[" + result_text(ra) +
+                ",ok=" + std::to_string(any_ok) +
+                "] bundles=" + std::to_string(program->config.policy_bundle_count) +
+                " distinct=" + std::to_string(distinct_ok);
+        return false;
+    }
+    const auto rejects = [&](rut::jit::HandlerResult bad, const char* label) {
+        if (predicate(*get,
+                      bad,
+                      static_cast<u16>(rut::RequestPolicyId::Http11FixedStrip),
+                      static_cast<u16>(rut::ResponsePolicyHeadMode::Reject),
+                      rut::ForwardResponseBufferingMode::CompleteContentLength)) {
+            error = std::string("#616 loaded JIT accepted mutation: ") + label;
+            return false;
+        }
+        return true;
+    };
+    rut::jit::HandlerResult bad = rg;
+    bad.action = rut::jit::HandlerAction::ReturnStatus;
+    if (!rejects(bad, "wrong-action")) return false;
+    bad = rg;
+    bad.next_state = 0u;
+    if (!rejects(bad, "zero-bundle")) return false;
+    bad = rg;
+    bad.next_state = static_cast<u16>(program->config.policy_bundle_count + 1u);
+    if (!rejects(bad, "out-of-range-bundle")) return false;
+    bad = rg;
+    bad.upstream_id = 1u;
+    if (!rejects(bad, "wrong-upstream")) return false;
+    bad = rg;
+    bad.status_code = 2u;
+    if (!rejects(bad, "wrong-request-policy")) return false;
+    bad = r0;
+    if (!rejects(bad, "valid-wrong-route-bundle")) return false;
+    std::string mutant_source = captured_stdout;
+    const std::string emitted_hide =
+        "hide_headers: [\"Date\", \"Server\", \"X-Pad\", \"" + std::string(custom_name) + "\"]";
+    const std::string mutant_name = std::string(custom_name, strlen(custom_name) - 1u) +
+                                    (custom_name[strlen(custom_name) - 1u] == '0' ? '1' : '0');
+    size_t replacement_count = 0u;
+    for (size_t at = mutant_source.find(emitted_hide); at != std::string::npos;
+         at = mutant_source.find(emitted_hide, at + emitted_hide.size())) {
+        mutant_source.replace(
+            at + emitted_hide.find(custom_name), strlen(custom_name), mutant_name);
+        replacement_count++;
+    }
+    if (replacement_count == 0u) {
+        error = "#616 loaded custom-hide timeout source lacked emitted hide lists";
+        return false;
+    }
+    if (mutant_source.size() != captured_stdout.size()) {
+        error = "#616 same-length custom-name mutant changed source size";
+        return false;
+    }
+    TempDir mutant_temp;
+    if (!mutant_temp.create() ||
+        !write_file(mutant_temp.source, mutant_source.data(), mutant_source.size())) {
+        error = "#616 same-length custom-name mutant could not be persisted";
+        return false;
+    }
+    auto mutant = std::make_unique<rut::LoadedProgram>();
+    struct MutantGuard {
+        std::unique_ptr<rut::LoadedProgram>& value;
+        ~MutantGuard() { value->destroy(); }
+    } mutant_guard{mutant};
+    rut::LoadError mutant_error{};
+    if (!rut::load_rut_program(mutant_temp.source.c_str(),
+                               *mutant,
+                               mutant_error,
+                               rut::jit::OptLevel::O2,
+                               static_cast<u64>(mutant_source.size()))) {
+        error = "#616 same-length custom-name mutant did not load successfully (stage=" +
+                std::to_string(static_cast<u32>(mutant_error.stage));
+        if (mutant_error.diag.detail.ptr != nullptr)
+            error += ", detail=" +
+                     std::string(mutant_error.diag.detail.ptr, mutant_error.diag.detail.len);
+        error += ")";
+        return false;
+    }
+    const rut::RouteEntry* mutant_get = nullptr;
+    u32 mutant_get_count = 0u;
+    for (u32 i = 0u; i < mutant->config.route_count; i++) {
+        const auto& route = mutant->config.routes[i];
+        if (route.method == rut::kRouteMethodGet && route.path_len == 1u && route.path[0] == '/' &&
+            route.fn != nullptr && route.action == rut::RouteAction::JitHandler) {
+            mutant_get = &route;
+            mutant_get_count++;
+        }
+    }
+    if (mutant_get == nullptr || mutant_get_count != 1u) {
+        error = "#616 same-length custom-name mutant lacked a valid GET route";
+        return false;
+    }
+    const auto mutant_result = invoke(*mutant_get, g, static_cast<u32>(strlen(g)));
+    if (mutant_result.action != rut::jit::HandlerAction::ForwardBundle ||
+        mutant_result.status_code != static_cast<u16>(rut::RequestPolicyId::Http11FixedStrip) ||
+        mutant_result.upstream_id != 0u || mutant_result.next_state == 0u ||
+        mutant_result.next_state > mutant->config.policy_bundle_count) {
+        error = "#616 same-length custom-name mutant GET result was not a valid forward bundle";
+        return false;
+    }
+    const auto& mutant_bundle = mutant->config.policy_bundles[mutant_result.next_state - 1u];
+    if (!mutant->config.response_policy_id_is_valid(mutant_bundle.response_policy_id)) {
+        error = "#616 same-length custom-name mutant GET response policy was out of range";
+        return false;
+    }
+    if (!policy_ok(mutant->config,
+                   mutant->config.response_policies[mutant_bundle.response_policy_id - 1u],
+                   rut::ResponsePolicyHeadMode::Reject,
+                   mutant_name.c_str())) {
+        error = "#616 same-length custom-name mutant did not retain its changed name";
+        return false;
+    }
+    if (policy_ok(mutant->config,
+                  mutant->config.response_policies[mutant_bundle.response_policy_id - 1u],
+                  rut::ResponsePolicyHeadMode::Reject,
+                  custom_name)) {
+        error = "#616 same-length custom-name mutant retained the original semantic name";
+        return false;
+    }
+    const u16 saved_response =
+        program->config.policy_bundles[rg.next_state - 1u].response_policy_id;
+    const u16 saved_failure = program->config.policy_bundles[rg.next_state - 1u].failure_policy_id;
+    const u16 saved_timeout_failure =
+        program->config.policy_bundles[rg.next_state - 1u].timeout_failure_policy_id;
+    const u16 saved_states[] = {r0.next_state, r1.next_state, rg.next_state, ra.next_state};
+    program->engine.shutdown();
+    program->jit_inited = false;
+    program->rir.destroy();
+    if (program->src_map == nullptr || program->src_map_len == 0u ||
+        munmap(program->src_map, program->src_map_len) != 0) {
+        error = "#616 loaded custom-hide timeout teardown failed";
+        return false;
+    }
+    program->src_map = nullptr;
+    program->src_map_len = 0u;
+    for (u16 state : saved_states) {
+        if (!program->config.policy_bundle_id_is_valid(state)) {
+            error = "#616 loaded custom-hide timeout returned bundle did not survive teardown";
+            return false;
+        }
+        const auto& bundle = program->config.policy_bundles[state - 1u];
+        const bool suppress = state == r0.next_state;
+        const auto response_head = suppress ? rut::ResponsePolicyHeadMode::SuppressBody
+                                            : rut::ResponsePolicyHeadMode::Reject;
+        const auto failure_head = suppress ? rut::FailurePolicyHeadMode::SuppressBody
+                                           : rut::FailurePolicyHeadMode::Reject;
+        if (!program->config.response_policy_id_is_valid(bundle.response_policy_id) ||
+            !program->config.failure_policy_id_is_valid(bundle.failure_policy_id) ||
+            !program->config.timeout_failure_policy_id_is_valid(bundle.timeout_failure_policy_id) ||
+            !policy_ok(program->config,
+                       program->config.response_policies[bundle.response_policy_id - 1u],
+                       response_head,
+                       custom_name) ||
+            !failure_ok(program->config.failure_policies[bundle.failure_policy_id - 1u],
+                        502u,
+                        failure_head,
+                        "Bad Gateway") ||
+            !failure_ok(program->config.failure_policies[bundle.timeout_failure_policy_id - 1u],
+                        504u,
+                        failure_head,
+                        "Gateway Time-out")) {
+            error = "#616 loaded custom-hide timeout policy strings did not survive teardown";
+            return false;
+        }
+    }
+    if (!program->config.response_policy_id_is_valid(saved_response) ||
+        !program->config.failure_policy_id_is_valid(saved_failure) ||
+        !program->config.timeout_failure_policy_id_is_valid(saved_timeout_failure) ||
+        !policy_ok(program->config,
+                   program->config.response_policies[saved_response - 1u],
+                   rut::ResponsePolicyHeadMode::Reject,
+                   custom_name) ||
+        !failure_ok(program->config.failure_policies[saved_failure - 1u],
+                    502u,
+                    rut::FailurePolicyHeadMode::Reject,
+                    "Bad Gateway") ||
+        !failure_ok(program->config.failure_policies[saved_timeout_failure - 1u],
+                    504u,
+                    rut::FailurePolicyHeadMode::Reject,
+                    "Gateway Time-out")) {
+        error = "#616 loaded custom-hide timeout policies did not survive teardown";
+        return false;
+    }
+    return true;
+}
+
 static bool run_converter_request_length_rut_side(
     TempDir& temp,
     const char* rut_path,
@@ -71974,19 +72913,260 @@ static bool run_converter_default_buffering_206_range_three_publication_completi
 // Exploratory #270 composition probe.  This deliberately reports the expiry
 // wire instead of hard-coding it; the follow-up oracle can freeze only bytes
 // observed from the pinned nginx image.
-static bool run_pinned_nginx_custom_hide_timeout_probe(const std::string& container_name,
-                                                       std::string& error,
-                                                       bool complete_after_w3 = false) {
+struct CustomHideTimeoutObservation {
+    std::vector<char> downstream;
+    std::vector<char> upstream;
+    std::string access;
+    bool eof = false;
+    bool retired = false;
+    bool stable = false;
+    u32 accepted = 0u;
+    u32 requests = 0u;
+    u32 peer_close_count = 0u;
+};
+
+struct CustomHideTimeoutPairContext {
     TempDir temp;
-    if (!temp.create()) {
+    u16 frontend_port = 0u;
+    u16 backend_port = 0u;
+    std::string config;
+    std::string config_snapshot;
+    std::string access_snapshot;
+    bool initialized = false;
+};
+
+// The access file is published by an independent writer; EOF itself is not an
+// access-publication acknowledgement. Keep
+// this small observer independent of wall-clock sleeps so the live acceptance
+// rule is also exercised by the deterministic self-check below.
+struct LiveAccessLedgerObserver {
+    enum class Phase { Pending, Accepted, Stabilizing, Complete, Failed };
+
+    Phase phase = Phase::Pending;
+    u64 eof_ns = 0u;
+    u64 deadline_ns = 0u;
+    u64 accepted_ns = 0u;
+    u64 stability_start_ns = 0u;
+    u64 stability_deadline_ns = 0u;
+
+    void freeze_eof(u64 now_ns) {
+        if (eof_ns == 0u) {
+            eof_ns = now_ns;
+            deadline_ns = now_ns + 250'000'000ull;
+        }
+    }
+
+    bool sample(u64 now_ns,
+                const std::string& candidate,
+                bool read_ok,
+                bool child_live,
+                bool origin_live,
+                bool protocol_clean,
+                bool custody_clean = true) {
+        // This check intentionally precedes all sample acceptance, including
+        // samples whose read completed after the deadline.
+        if (eof_ns == 0u || now_ns < eof_ns || now_ns >= deadline_ns || phase != Phase::Pending ||
+            !read_ok || !child_live || !origin_live || !protocol_clean || !custody_clean ||
+            (candidate != "" && candidate != "6" && candidate != "60" && candidate != "60\n")) {
+            phase = Phase::Failed;
+            return false;
+        }
+        if (candidate == "60\n") {
+            phase = Phase::Accepted;
+            accepted_ns = now_ns;
+        }
+        return true;
+    }
+
+    bool begin_stability(u64 now_ns) {
+        if (phase == Phase::Accepted && now_ns >= accepted_ns) {
+            phase = Phase::Stabilizing;
+            stability_start_ns = now_ns;
+            stability_deadline_ns = now_ns + 175'000'000ull;
+            return true;
+        }
+        phase = Phase::Failed;
+        return false;
+    }
+
+    bool stable_sample(u64 now_ns,
+                       const std::string& candidate,
+                       bool read_ok,
+                       bool child_live,
+                       bool origin_live,
+                       bool protocol_clean,
+                       bool custody_clean = true) {
+        if ((phase != Phase::Stabilizing && phase != Phase::Complete) || candidate != "60\n" ||
+            !read_ok || !child_live || !origin_live || !protocol_clean) {
+            phase = Phase::Failed;
+            return false;
+        }
+        if (!custody_clean || now_ns < stability_start_ns) {
+            phase = Phase::Failed;
+            return false;
+        }
+        if (now_ns >= stability_deadline_ns) phase = Phase::Complete;
+        return true;
+    }
+
+    bool accepted_before_deadline() const {
+        return phase != Phase::Pending && phase != Phase::Failed && accepted_ns < deadline_ns;
+    }
+};
+
+static bool run_live_access_ledger_observer_self_check(std::string& error) {
+    const auto expect_pending = [&](u64 now_ns,
+                                    const std::string& value,
+                                    bool read_ok = true,
+                                    bool child_live = true,
+                                    bool origin_live = true,
+                                    bool protocol_clean = true) {
+        LiveAccessLedgerObserver observer;
+        observer.freeze_eof(1'000'000'000ull);
+        return observer.sample(now_ns, value, read_ok, child_live, origin_live, protocol_clean) &&
+               observer.phase == LiveAccessLedgerObserver::Phase::Pending;
+    };
+    const auto expect_fail = [&](u64 now_ns,
+                                 const std::string& value,
+                                 bool read_ok = true,
+                                 bool child_live = true,
+                                 bool origin_live = true,
+                                 bool protocol_clean = true) {
+        LiveAccessLedgerObserver observer;
+        observer.freeze_eof(1'000'000'000ull);
+        const bool accepted =
+            observer.sample(now_ns, value, read_ok, child_live, origin_live, protocol_clean);
+        return !accepted && observer.phase == LiveAccessLedgerObserver::Phase::Failed;
+    };
+    LiveAccessLedgerObserver timely;
+    timely.freeze_eof(1'000'000'000ull);
+    const bool delayed_timely = timely.sample(1'100'000'000ull, "", true, true, true, true) &&
+                                timely.sample(1'200'000'000ull, "6", true, true, true, true) &&
+                                timely.sample(1'249'999'999ull, "60\n", true, true, true, true) &&
+                                timely.accepted_before_deadline();
+    LiveAccessLedgerObserver stable;
+    stable.freeze_eof(1'000'000'000ull);
+    const bool stability_controls =
+        stable.sample(1'100'000'000ull, "60\n", true, true, true, true) &&
+        stable.accepted_before_deadline() &&
+        (stable.begin_stability(1'100'000'000ull),
+         stable.stable_sample(1'150'000'000ull, "60\n", true, true, true, true) &&
+             stable.stable_sample(1'275'000'000ull, "60\n", true, true, true, true) &&
+             stable.stable_sample(1'276'000'000ull, "60\n", true, true, true, true) &&
+             stable.phase == LiveAccessLedgerObserver::Phase::Complete);
+    LiveAccessLedgerObserver duplicate;
+    duplicate.freeze_eof(1'000'000'000ull);
+    const bool duplicate_rejected =
+        duplicate.sample(1'100'000'000ull, "60\n", true, true, true, true) &&
+        (duplicate.begin_stability(1'100'000'000ull),
+         !duplicate.stable_sample(1'101'000'000ull, "60\n60\n", true, true, true, true));
+    LiveAccessLedgerObserver phase_guard;
+    phase_guard.freeze_eof(1'000'000'000ull);
+    const bool phase_guards =
+        phase_guard.sample(1'100'000'000ull, "60\n", true, true, true, true) &&
+        !phase_guard.begin_stability(1'099'999'999ull);
+    LiveAccessLedgerObserver shutdown;
+    shutdown.freeze_eof(1'000'000'000ull);
+    const bool shutdown_sticky = !shutdown.sample(1'100'000'000ull, "", true, false, true, true) &&
+                                 !shutdown.sample(1'101'000'000ull, "60\n", true, true, true, true);
+    LiveAccessLedgerObserver initial_wrong;
+    initial_wrong.freeze_eof(1'000'000'000ull);
+    const bool initial_wrong_sticky =
+        !initial_wrong.sample(1'100'000'000ull, "61\n", true, true, true, true) &&
+        !initial_wrong.sample(1'101'000'000ull, "60\n", true, true, true, true);
+    LiveAccessLedgerObserver initial_read_error;
+    initial_read_error.freeze_eof(1'000'000'000ull);
+    const bool initial_read_error_sticky =
+        !initial_read_error.sample(1'100'000'000ull, "", false, true, true, true) &&
+        !initial_read_error.sample(1'101'000'000ull, "60\n", true, true, true, true);
+    LiveAccessLedgerObserver stable_read_failure;
+    stable_read_failure.freeze_eof(1'000'000'000ull);
+    const bool stable_read_failure_sticky =
+        stable_read_failure.sample(1'100'000'000ull, "60\n", true, true, true, true) &&
+        stable_read_failure.begin_stability(1'100'000'000ull) &&
+        !stable_read_failure.stable_sample(1'101'000'000ull, "60\n", false, true, true, true) &&
+        !stable_read_failure.stable_sample(1'102'000'000ull, "60\n", true, true, true, true);
+    LiveAccessLedgerObserver stable_child_loss;
+    stable_child_loss.freeze_eof(1'000'000'000ull);
+    const bool stable_child_loss_sticky =
+        stable_child_loss.sample(1'100'000'000ull, "60\n", true, true, true, true) &&
+        stable_child_loss.begin_stability(1'100'000'000ull) &&
+        !stable_child_loss.stable_sample(1'101'000'000ull, "60\n", true, false, true, true) &&
+        !stable_child_loss.stable_sample(1'102'000'000ull, "60\n", true, true, true, true);
+    LiveAccessLedgerObserver pending_custody_loss;
+    pending_custody_loss.freeze_eof(1'000'000'000ull);
+    const bool pending_custody_loss_sticky =
+        !pending_custody_loss.sample(1'100'000'000ull, "6", true, true, true, true, false) &&
+        !pending_custody_loss.sample(1'101'000'000ull, "60\n", true, true, true, true, true);
+    LiveAccessLedgerObserver stable_custody_loss;
+    stable_custody_loss.freeze_eof(1'000'000'000ull);
+    const bool stable_custody_loss_sticky =
+        stable_custody_loss.sample(1'100'000'000ull, "60\n", true, true, true, true) &&
+        stable_custody_loss.begin_stability(1'100'000'000ull) &&
+        !stable_custody_loss.stable_sample(
+            1'101'000'000ull, "60\n", true, true, true, true, false) &&
+        !stable_custody_loss.stable_sample(1'102'000'000ull, "60\n", true, true, true, true);
+    const bool controls =
+        delayed_timely && expect_pending(1'100'000'000ull, "") &&
+        expect_pending(1'100'000'001ull, "6") && expect_pending(1'100'000'002ull, "60") &&
+        expect_fail(1'250'000'000ull, "60\n") && expect_fail(1'250'000'001ull, "60\n") &&
+        expect_fail(1'249'999'999ull, "61\n") && expect_fail(1'100'000'000ull, "", false) &&
+        expect_fail(999'999'999ull, "60\n") &&
+        expect_fail(1'100'000'000ull, "60\n", true, false, true, true) &&
+        expect_fail(1'100'000'000ull, "60\n", true, true, false, true) &&
+        expect_fail(1'100'000'000ull, "60\n", true, true, true, false) && duplicate_rejected &&
+        phase_guards && shutdown_sticky && initial_wrong_sticky && initial_read_error_sticky &&
+        stable_read_failure_sticky && stable_child_loss_sticky && pending_custody_loss_sticky &&
+        stable_custody_loss_sticky;
+    const bool all_controls = controls && stability_controls;
+    if (!all_controls) {
+        error = "#618 live access-ledger observer self-check rejected a required control";
+        return false;
+    }
+    std::cerr << "PASS: #618 live access-ledger observer self-check\n";
+    return true;
+}
+
+static bool run_pinned_nginx_custom_hide_timeout_probe(
+    const std::string& container_name,
+    std::string& error,
+    bool complete_after_w3 = false,
+    const char* rut_path = nullptr,
+    const char* converter_path = nullptr,
+    CustomHideTimeoutPairContext* pair = nullptr,
+    CustomHideTimeoutObservation* observation = nullptr) {
+    const bool generated_rut = rut_path != nullptr || converter_path != nullptr;
+    if (pair != nullptr && observation == nullptr) {
+        error = "#270 custom-hide pair requires an observation output";
+        return false;
+    }
+    if (generated_rut && (rut_path == nullptr || converter_path == nullptr || rut_path[0] != '/' ||
+                          converter_path[0] != '/' || access(rut_path, X_OK) != 0 ||
+                          access(converter_path, X_OK) != 0)) {
+        error =
+            "#270 custom-hide CLI differential requires executable absolute RUT/converter paths";
+        return false;
+    }
+    TempDir owned_temp;
+    TempDir& temp = pair == nullptr ? owned_temp : pair->temp;
+    if (!temp.created && !temp.create()) {
         error = "#270 custom-hide timeout probe could not create temporary resources";
         return false;
     }
     HeldLoopbackPorts reservations;
     u16 frontend_port = 0u;
     u16 backend_port = 0u;
-    if (!reservations.reserve_four_digit(0u, frontend_port) ||
-        !reservations.reserve_four_digit(1u, backend_port) || frontend_port == backend_port) {
+    if (pair != nullptr && pair->initialized) {
+        frontend_port = pair->frontend_port;
+        backend_port = pair->backend_port;
+        if (!reservations.reserve_specific(0u, frontend_port) ||
+            !reservations.reserve_specific(1u, backend_port)) {
+            error = "#270 custom-hide pair could not reacquire exact ports";
+            return false;
+        }
+    } else if (!reservations.reserve_four_digit(0u, frontend_port) ||
+               !reservations.reserve_four_digit(1u, backend_port) ||
+               frontend_port == backend_port) {
         error = "#270 custom-hide timeout probe could not hold distinct ports";
         return false;
     }
@@ -72008,12 +73188,26 @@ static bool run_pinned_nginx_custom_hide_timeout_probe(const std::string& contai
         count_text(config, "proxy_hide_header X-Powered-By;\n") != 1u ||
         count_text(config, "proxy_read_timeout 1s;\n") != 1u ||
         count_text(config, "proxy_buffering") != 0u ||
-        !write_file(temp.nginx_config, config.data(), config.size()) ||
-        !read_exact_return204_log(
-            temp.nginx_config, "#270 frozen probe config", temp.retained_config_snapshot, error) ||
+        (pair != nullptr && pair->initialized
+             ? !read_exact_return204_log(temp.nginx_config,
+                                         "#270 pair config before RUT",
+                                         temp.retained_config_snapshot,
+                                         error)
+             : !write_file(temp.nginx_config, config.data(), config.size()) ||
+                   !read_exact_return204_log(temp.nginx_config,
+                                             "#270 frozen probe config",
+                                             temp.retained_config_snapshot,
+                                             error)) ||
         temp.retained_config_snapshot != config) {
         error = "#270 custom-hide timeout probe config was not frozen exactly";
         return false;
+    }
+    if (pair != nullptr && !pair->initialized) {
+        pair->frontend_port = frontend_port;
+        pair->backend_port = backend_port;
+        pair->config = config;
+        pair->config_snapshot = temp.retained_config_snapshot;
+        pair->initialized = true;
     }
 
     static constexpr char kOrigin[] =
@@ -72080,6 +73274,7 @@ static bool run_pinned_nginx_custom_hide_timeout_probe(const std::string& contai
     }
 
     DockerGuard docker(container_name);
+    if (generated_rut) docker.active = false;
     ChildGuard nginx;
     const std::vector<std::string> docker_args = {"docker",
                                                   "run",
@@ -72096,10 +73291,105 @@ static bool run_pinned_nginx_custom_hide_timeout_probe(const std::string& contai
                                                   temp.nginx_config,
                                                   "-g",
                                                   "daemon off;"};
-    if (!handoff_held_loopback_port(
-            &reservations.fds[0], frontend_port, "#270 custom-hide timeout probe nginx", error) ||
-        !spawn_child(docker_args, temp.nginx_log, nginx.child) ||
-        !wait_ready(frontend_port, nginx.child, error)) {
+    if (generated_rut) {
+        const std::string converter_error = temp.rut_log + ".converter";
+        const int output_fd = open(temp.source.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0600);
+        const int error_fd = open(converter_error.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0600);
+        if (output_fd < 0 || error_fd < 0) {
+            if (output_fd >= 0) close(output_fd);
+            if (error_fd >= 0) close(error_fd);
+            error = "#270 custom-hide CLI could not open converter output";
+            return false;
+        }
+        ChildGuard converter_guard;
+        const pid_t pid = fork();
+        if (pid == 0) {
+            if (dup2(output_fd, STDOUT_FILENO) < 0 || dup2(error_fd, STDERR_FILENO) < 0) _exit(127);
+            close(output_fd);
+            close(error_fd);
+            execl(converter_path,
+                  converter_path,
+                  "--format",
+                  "nginx-http",
+                  temp.nginx_config.c_str(),
+                  nullptr);
+            _exit(127);
+        }
+        close(output_fd);
+        close(error_fd);
+        if (pid < 0) {
+            error = "#270 custom-hide CLI could not fork converter";
+            return false;
+        }
+        converter_guard.child.pid = pid;
+        std::string generated_source;
+        if (!wait_child(converter_guard.child, 10'000) || !converter_guard.child.status_valid ||
+            !WIFEXITED(converter_guard.child.status) ||
+            WEXITSTATUS(converter_guard.child.status) != 0 ||
+            !read_exact_rut_source(
+                temp.source, "#270 CLI generated source", generated_source, error)) {
+            if (error.empty())
+                error = "#270 custom-hide CLI converter failed or produced no source";
+            return false;
+        }
+        if (generated_source.empty()) {
+            error = "#270 custom-hide CLI converter produced empty source";
+            return false;
+        }
+        std::string diagnostics;
+        if (!read_bounded_file(converter_error, diagnostics, error) || !diagnostics.empty()) {
+            error = "#270 custom-hide CLI converter emitted diagnostics";
+            return false;
+        }
+        if (!validate_custom_hide_timeout_loaded_program(temp.source,
+                                                         generated_source,
+                                                         frontend_port,
+                                                         backend_port,
+                                                         temp.nginx_access_log,
+                                                         "X-Powered-By",
+                                                         error))
+            return false;
+        if (!handoff_held_loopback_port(
+                &reservations.fds[0], frontend_port, "#270 custom-hide generated RUT", error) ||
+            !spawn_child({rut_path, temp.source, "--shards", "1", "--no-pin", "--drain", "0"},
+                         temp.rut_log,
+                         nginx.child) ||
+            !wait_ready(frontend_port, nginx.child, error)) {
+            if (error.empty()) error = "#270 custom-hide generated RUT failed readiness";
+            return false;
+        }
+        const auto ready_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+        const std::string listener =
+            "Listening on port " + std::to_string(frontend_port) + " with 1 shard(s)\n";
+        while ((!log_contains(temp.rut_log, "Backend: io_uring\n") ||
+                !log_contains(temp.rut_log, listener.c_str())) &&
+               std::chrono::steady_clock::now() < ready_deadline) {
+            if (poll_child(nginx.child)) {
+                error = "#270 custom-hide generated RUT exited before readiness";
+                return false;
+            }
+            usleep(1000);
+        }
+        if (!log_contains(temp.rut_log, "Backend: io_uring\n") ||
+            !log_contains(temp.rut_log, listener.c_str())) {
+            error = "#270 custom-hide generated RUT lacked io_uring readiness";
+            return false;
+        }
+        static constexpr char kPoison[] = "destroyed-after-270-custom-hide-load\n";
+        std::string poison_readback;
+        if (!write_file(temp.source, kPoison, sizeof(kPoison) - 1u) ||
+            !read_exact_rut_source(
+                temp.source, "#270 poisoned custom-hide source", poison_readback, error) ||
+            poison_readback != kPoison || poll_child(nginx.child)) {
+            error = "#270 custom-hide generated source poison did not preserve live child";
+            return false;
+        }
+    } else if (!handoff_held_loopback_port(&reservations.fds[0],
+                                           frontend_port,
+                                           "#270 custom-hide timeout probe nginx",
+                                           error) ||
+               !spawn_child(docker_args, temp.nginx_log, nginx.child) ||
+               !wait_ready(frontend_port, nginx.child, error)) {
         if (error.empty()) error = "#270 custom-hide timeout probe nginx failed readiness";
         return false;
     }
@@ -72442,6 +73732,22 @@ static bool run_pinned_nginx_custom_hide_timeout_probe(const std::string& contai
                 "#270 custom-hide completion episode exact response/lifecycle validation failed";
             return false;
         }
+        if (pair != nullptr) {
+            observation->downstream = response;
+            if (!normalize_date(observation->downstream)) {
+                error = "#270 custom-hide completion observation Date normalization failed";
+                return false;
+            }
+            observation->upstream = origin.history[0];
+            observation->access = final_access;
+            observation->eof = !no_eof_and_quiet;
+            observation->retired = origin_retired;
+            observation->stable = stable;
+            observation->accepted = origin.accepted.load(std::memory_order_acquire);
+            observation->requests = origin.requests.load(std::memory_order_acquire);
+            observation->peer_close_count =
+                origin.response_peer_close_count.load(std::memory_order_acquire);
+        }
         std::cerr << "PASS: #270 custom-hide completion W1/W2/W3 and full response wire observed\n";
         return true;
     }
@@ -72478,6 +73784,7 @@ static bool run_pinned_nginx_custom_hide_timeout_probe(const std::string& contai
     std::vector<char> response;
     bool actual_eof = false;
     bool response_read_error = false;
+    u64 eof_ns = 0u;
     const auto response_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(3);
     while (std::chrono::steady_clock::now() < response_deadline) {
         pollfd state{client, POLLIN | POLLHUP | POLLERR, 0};
@@ -72494,6 +73801,7 @@ static bool run_pinned_nginx_custom_hide_timeout_probe(const std::string& contai
         if (count > 0)
             response.insert(response.end(), bytes, bytes + count);
         else if (count == 0) {
+            eof_ns = steady_now_ns();
             actual_eof = true;
             break;
         } else if (errno != EINTR && errno != EAGAIN && errno != EWOULDBLOCK) {
@@ -72501,7 +73809,11 @@ static bool run_pinned_nginx_custom_hide_timeout_probe(const std::string& contai
             break;
         }
     }
-    const u64 observed_ns = steady_now_ns();
+    // Freeze the observation boundary at the actual recv()==0 event.  Any
+    // later file read is publication latency, not downstream EOF timing.
+    const u64 observed_ns = eof_ns;
+    LiveAccessLedgerObserver live_observer;
+    live_observer.freeze_eof(eof_ns);
     const auto expiry_timing_tuple_valid = [](u64 first_ns, u64 second_ns, u64 terminal_ns) {
         return second_ns > first_ns && terminal_ns > second_ns &&
                second_ns - first_ns >= 550'000'000ull && second_ns - first_ns < 750'000'000ull &&
@@ -72513,7 +73825,9 @@ static bool run_pinned_nginx_custom_hide_timeout_probe(const std::string& contai
         !expiry_timing_tuple_valid(first_ns, second_ns, first_ns + 1'000'000'000ull);
     std::string access;
     const bool access_read = read_request_length_access_file(temp.nginx_access_log, access, error);
-    const u64 expiry_elapsed_ns = observed_ns - second_ns;
+    u64 initial_access_sample_ns = 0u;
+    const u64 expiry_elapsed_ns =
+        actual_eof && observed_ns > second_ns ? observed_ns - second_ns : 0u;
     std::vector<char> normalized_response = response;
     const std::vector<char> expected_response(
         kExpectedExpiryResponseNormalized,
@@ -72562,14 +73876,80 @@ static bool run_pinned_nginx_custom_hide_timeout_probe(const std::string& contai
         origin.response_peer_closed_ns.load(std::memory_order_acquire) >= second_ns &&
         !origin.response_peer_unexpected_data.load(std::memory_order_acquire) &&
         !origin.response_peer_observation_failed.load(std::memory_order_acquire);
+    const auto full_live_custody =
+        [&](bool child_live, bool origin_is_live, bool protocol_clean, bool downstream_quiet) {
+            return child_live && origin_is_live && protocol_clean && downstream_quiet &&
+                   origin.accepted.load(std::memory_order_acquire) == 1u &&
+                   origin.requests.load(std::memory_order_acquire) == 1u &&
+                   origin.response_fragments_sent.load(std::memory_order_acquire) == 2u &&
+                   origin.response_peer_closed.load(std::memory_order_acquire) &&
+                   origin.response_peer_close_count.load(std::memory_order_acquire) == 1u &&
+                   origin.gated_fragment_probe_request.load(std::memory_order_acquire) == 2u &&
+                   origin.gated_fragment_probe_ack.load(std::memory_order_acquire) == 2u &&
+                   origin.gated_fragment_probe_result.load(std::memory_order_acquire) ==
+                       GatedFragmentPeerProbeResult::Open &&
+                   origin.response_send_succeeded.load(std::memory_order_acquire) &&
+                   origin.response_sent_open.load(std::memory_order_acquire) &&
+                   // Peer-close publication precedes the recorder's later
+                   // shutdown/connection-close stores; do not impose that
+                   // unrelated store ordering on this live predicate.
+                   !origin.response_send_failed.load(std::memory_order_acquire) && origin_retired;
+        };
+    const auto downstream_eof_quiet = [&]() {
+        pollfd state{client, POLLIN | POLLHUP | POLLERR, 0};
+        const int ready = poll(&state, 1, 5);
+        if (ready < 0) return errno == EINTR;
+        if (ready == 0) return true;
+        char late_bytes[64];
+        const ssize_t count = recv(client, late_bytes, sizeof(late_bytes), MSG_PEEK | MSG_DONTWAIT);
+        return count <= 0 &&
+               (count == 0 || errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK);
+    };
+    const bool initial_downstream_quiet = downstream_eof_quiet();
+    const bool initial_protocol_clean =
+        !origin.response_peer_unexpected_data.load(std::memory_order_acquire) &&
+        !origin.response_peer_observation_failed.load(std::memory_order_acquire);
+    const bool initial_custody = full_live_custody(
+        !poll_child(nginx.child), origin_live(), initial_protocol_clean, initial_downstream_quiet);
+    initial_access_sample_ns = steady_now_ns();
+    live_observer.sample(initial_access_sample_ns,
+                         access,
+                         access_read,
+                         !poll_child(nginx.child),
+                         origin_live(),
+                         initial_protocol_clean,
+                         initial_custody);
     const u64 peer_closed_ns = origin.response_peer_closed_ns.load(std::memory_order_acquire);
-    const u64 stability_start_ns = steady_now_ns();
-    bool post_retirement_stable = origin_retired && stability_start_ns >= peer_closed_ns;
-    const u64 stability_deadline_ns = stability_start_ns + 175'000'000ull;
+    u64 stability_start_ns = 0u;
+    bool post_retirement_stable = false;
+    u64 stability_deadline_ns = 0u;
     const auto post_retirement_snapshot_valid = [&]() {
         std::string stable_access;
-        if (!origin_live() || poll_child(nginx.child) ||
-            !read_request_length_access_file(temp.nginx_access_log, stable_access, error) ||
+        std::string stable_read_error;
+        const bool stable_read_ok = read_request_length_access_file(
+            temp.nginx_access_log, stable_access, stable_read_error);
+        const bool stable_origin = origin_live();
+        const bool stable_child = !poll_child(nginx.child);
+        if (!stable_read_ok) {
+            live_observer.stable_sample(
+                steady_now_ns(), stable_access, false, stable_child, stable_origin, false, false);
+            if (error.empty()) error = stable_read_error;
+            return false;
+        }
+        if (!live_observer.stable_sample(
+                steady_now_ns(),
+                stable_access,
+                stable_read_ok,
+                stable_child,
+                stable_origin,
+                !origin.response_peer_unexpected_data.load(std::memory_order_acquire) &&
+                    !origin.response_peer_observation_failed.load(std::memory_order_acquire),
+                full_live_custody(
+                    stable_child,
+                    stable_origin,
+                    !origin.response_peer_unexpected_data.load(std::memory_order_acquire) &&
+                        !origin.response_peer_observation_failed.load(std::memory_order_acquire),
+                    true)) ||
             stable_access != "60\n" || origin.accepted.load(std::memory_order_acquire) != 1u ||
             origin.requests.load(std::memory_order_acquire) != 1u ||
             origin.response_fragments_sent.load(std::memory_order_acquire) != 2u ||
@@ -72588,33 +73968,192 @@ static bool run_pinned_nginx_custom_hide_timeout_probe(const std::string& contai
         if (ready < 0) return errno == EINTR;
         if (ready == 0) return true;
         char late_bytes[64];
-        const ssize_t count = recv(client, late_bytes, sizeof(late_bytes), MSG_DONTWAIT);
+        const ssize_t count = recv(client, late_bytes, sizeof(late_bytes), MSG_PEEK | MSG_DONTWAIT);
         return count <= 0 &&
                (count == 0 || errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK);
     };
-    while (post_retirement_stable && steady_now_ns() < stability_deadline_ns) {
-        post_retirement_stable = post_retirement_snapshot_valid();
-    }
-    if (post_retirement_stable) {
-        if (steady_now_ns() < stability_deadline_ns)
-            post_retirement_stable = false;
-        else
-            post_retirement_stable = post_retirement_snapshot_valid();
-    }
-    std::cerr << "PROBE #270 custom-hide W2-to-observation-ns=" << (observed_ns - second_ns)
+    std::cerr << "PROBE #270 custom-hide W2-to-observation-ns="
+              << (actual_eof && observed_ns > second_ns ? observed_ns - second_ns : 0u)
               << " response-bytes=" << response.size() << " actual-eof=" << actual_eof
               << " read-error=" << response_read_error << " access-bytes=" << access.size()
               << " origin-write-ns=" << first_ns << "," << second_ns
               << " peer-close-ns=" << peer_closed_ns << " retired-before-cleanup=" << origin_retired
               << " exact-upstream=deferred-until-origin-join\n";
     dump_wire("#270 custom-hide timeout probe observed downstream", response);
-    if (!actual_eof || response.empty() || response_read_error || !access_read ||
-        access != "60\n" || !exact_normalized_response || !response_mutants_rejected ||
-        !timing_mutants_rejected || !expiry_timing_is_valid(expiry_elapsed_ns) || !origin_retired ||
-        !post_retirement_stable) {
+    bool expiry_gate_failed = !actual_eof || response.empty() || response_read_error ||
+                              !exact_normalized_response || !response_mutants_rejected ||
+                              !timing_mutants_rejected ||
+                              !expiry_timing_is_valid(expiry_elapsed_ns) || !origin_retired;
+    if (expiry_gate_failed) {
         error =
             "#270 custom-hide timeout probe was inconclusive: exact expiry EOF/response/timing/"
             "retirement/access/upstream evidence was not observed before cleanup";
+    }
+    bool live_access_read = access_read;
+    std::string live_access = access;
+    bool live_access_changed = false;
+    bool live_exact_access_seen = access == "60\n";
+    u64 live_access_changed_ns = 0u;
+    u64 live_exact_access_ns = live_exact_access_seen ? observed_ns : 0u;
+    const u64 live_observation_deadline = live_observer.deadline_ns;
+    const char* live_stop_reason = expiry_gate_failed ? "deadline" : "acceptance-passed";
+    u32 live_accepted = origin.accepted.load(std::memory_order_acquire);
+    u32 live_requests = origin.requests.load(std::memory_order_acquire);
+    u32 live_peer_closes = origin.response_peer_close_count.load(std::memory_order_acquire);
+    bool live_origin = origin_live();
+    bool live_child = !poll_child(nginx.child);
+    bool live_protocol_clean =
+        !origin.response_peer_unexpected_data.load(std::memory_order_acquire) &&
+        !origin.response_peer_observation_failed.load(std::memory_order_acquire);
+    const auto refresh_live_state = [&]() {
+        live_accepted = origin.accepted.load(std::memory_order_acquire);
+        live_requests = origin.requests.load(std::memory_order_acquire);
+        live_peer_closes = origin.response_peer_close_count.load(std::memory_order_acquire);
+        live_origin = origin_live();
+        live_child = !poll_child(nginx.child);
+        live_protocol_clean =
+            !origin.response_peer_unexpected_data.load(std::memory_order_acquire) &&
+            !origin.response_peer_observation_failed.load(std::memory_order_acquire);
+    };
+    if (expiry_gate_failed || live_observer.phase == LiveAccessLedgerObserver::Phase::Pending) {
+        while (steady_now_ns() < live_observation_deadline &&
+               live_observer.phase == LiveAccessLedgerObserver::Phase::Pending) {
+            refresh_live_state();
+            if (!live_child) {
+                live_stop_reason = "frontend-exited";
+                break;
+            }
+            if (!live_origin) {
+                live_stop_reason = "origin-not-live";
+                break;
+            }
+            if (!live_protocol_clean) {
+                live_stop_reason = "origin-protocol-failure";
+                break;
+            }
+            std::string candidate;
+            std::string diagnostic_read_error;
+            if (!read_request_length_access_file(
+                    temp.nginx_access_log, candidate, diagnostic_read_error)) {
+                live_access_read = false;
+                refresh_live_state();
+                live_observer.sample(steady_now_ns(),
+                                     candidate,
+                                     false,
+                                     live_child,
+                                     live_origin,
+                                     live_protocol_clean);
+                live_stop_reason = "access-read-error";
+                break;
+            }
+            if (candidate != live_access) {
+                live_access_changed = true;
+                if (live_access_changed_ns == 0u) live_access_changed_ns = steady_now_ns();
+                live_access = candidate;
+            }
+            refresh_live_state();
+            const bool downstream_quiet = downstream_eof_quiet();
+            const bool custody_clean =
+                full_live_custody(live_child, live_origin, live_protocol_clean, downstream_quiet);
+            if (!custody_clean) {
+                live_observer.sample(steady_now_ns(),
+                                     candidate,
+                                     true,
+                                     live_child,
+                                     live_origin,
+                                     live_protocol_clean,
+                                     false);
+                live_stop_reason = !live_child            ? "frontend-exited-after-read"
+                                   : !live_origin         ? "origin-not-live-after-read"
+                                   : !live_protocol_clean ? "origin-protocol-failure-after-read"
+                                                          : "custody-lost-after-read";
+                break;
+            }
+            const u64 sample_ns = steady_now_ns();
+            if (!live_observer.sample(sample_ns,
+                                      candidate,
+                                      true,
+                                      live_child,
+                                      live_origin,
+                                      live_protocol_clean,
+                                      custody_clean)) {
+                live_stop_reason = sample_ns >= live_observation_deadline ? "deadline-after-read"
+                                   : candidate != "" && candidate != "6" && candidate != "60" &&
+                                           candidate != "60\n"
+                                       ? "wrong-access-ledger"
+                                   : !live_child          ? "frontend-exited-after-read"
+                                   : !live_origin         ? "origin-not-live-after-read"
+                                   : !live_protocol_clean ? "origin-protocol-failure-after-read"
+                                                          : "duplicate-access-ledger";
+                break;
+            }
+            if (live_observer.phase == LiveAccessLedgerObserver::Phase::Accepted) {
+                live_exact_access_seen = true;
+                live_exact_access_ns = live_observer.accepted_ns;
+                live_stop_reason = "exact-access-seen";
+                break;
+            }
+            usleep(1000);
+        }
+        if (live_observer.phase == LiveAccessLedgerObserver::Phase::Pending) {
+            live_observer.sample(live_observation_deadline,
+                                 live_access,
+                                 true,
+                                 live_child,
+                                 live_origin,
+                                 live_protocol_clean);
+            if (live_observer.phase == LiveAccessLedgerObserver::Phase::Failed)
+                live_stop_reason = "deadline";
+        }
+        refresh_live_state();
+    }
+    refresh_live_state();
+    stability_start_ns = steady_now_ns();
+    stability_deadline_ns = stability_start_ns + 175'000'000ull;
+    if (origin_retired && live_observer.phase == LiveAccessLedgerObserver::Phase::Accepted) {
+        live_observer.begin_stability(stability_start_ns);
+        post_retirement_stable = true;
+        while (post_retirement_stable && steady_now_ns() < stability_deadline_ns)
+            post_retirement_stable = post_retirement_snapshot_valid();
+        if (post_retirement_stable) {
+            post_retirement_stable =
+                steady_now_ns() >= stability_deadline_ns && post_retirement_snapshot_valid() &&
+                live_observer.phase == LiveAccessLedgerObserver::Phase::Complete;
+        }
+    }
+    expiry_gate_failed =
+        expiry_gate_failed || !live_observer.accepted_before_deadline() || !post_retirement_stable;
+    if (!actual_eof) live_stop_reason = "no-eof";
+    if (expiry_gate_failed && error.empty()) {
+        error =
+            "#270 custom-hide timeout probe was inconclusive: exact expiry EOF/response/timing/"
+            "retirement/live access-ledger/stability evidence was not observed before cleanup";
+    }
+    const std::string expiry_failure_error = error;
+    if (expiry_gate_failed) {
+        std::cerr << "DIAGNOSTIC #270 live-expiry-access frontend="
+                  << (generated_rut ? "RUT" : "nginx") << " initial-read=" << access_read
+                  << " initial-bytes=" << access.size() << " live-read=" << live_access_read
+                  << " live-bytes=" << live_access.size() << " live-changed=" << live_access_changed
+                  << " live-exact-60=" << live_exact_access_seen << " no-eof=" << !actual_eof
+                  << " live-stop=" << live_stop_reason << " eof-to-live-ms="
+                  << (actual_eof ? static_cast<double>(steady_now_ns() - observed_ns) / 1e6 : -1.0)
+                  << " changed-after-ms="
+                  << (live_access_changed_ns == 0u
+                          ? -1.0
+                          : static_cast<double>(live_access_changed_ns - observed_ns) / 1e6)
+                  << " exact-after-ms="
+                  << (live_exact_access_ns == 0u
+                          ? -1.0
+                          : static_cast<double>(live_exact_access_ns - observed_ns) / 1e6)
+                  << " live-origin=" << live_origin << " live-child=" << live_child
+                  << " accepted=" << live_accepted << " requests=" << live_requests
+                  << " peer-closes=" << live_peer_closes
+                  << " protocol-clean=" << live_protocol_clean << "\n";
+        dump_wire("DIAGNOSTIC #270 initial-expiry-ledger",
+                  std::vector<char>(access.begin(), access.end()));
+        dump_wire("DIAGNOSTIC #270 live-expiry-ledger",
+                  std::vector<char>(live_access.begin(), live_access.end()));
     }
     close(client);
     origin.stop();
@@ -72628,18 +74167,174 @@ static bool run_pinned_nginx_custom_hide_timeout_probe(const std::string& contai
     const bool nginx_stopped = stop_child(nginx.child);
     const bool removed = docker.remove();
     std::string final_access;
+    std::string cleanup_access_error;
+    const bool final_access_read =
+        read_request_length_access_file(temp.nginx_access_log, final_access, cleanup_access_error);
+    if (expiry_gate_failed) {
+        std::cerr << "DIAGNOSTIC #270 post-cleanup-expiry-access frontend="
+                  << (generated_rut ? "RUT" : "nginx") << " read=" << final_access_read
+                  << " bytes=" << final_access.size() << " exact-60=" << (final_access == "60\n")
+                  << " cleanup-read-error=" << cleanup_access_error << "\n";
+        dump_wire("DIAGNOSTIC #270 post-cleanup-expiry-ledger",
+                  std::vector<char>(final_access.begin(), final_access.end()));
+    }
     if (!nginx_stopped || !removed || reservations.fds[0] >= 0 || reservations.fds[1] >= 0 ||
         origin.thread_alive.load(std::memory_order_acquire) || origin.listen_fd >= 0 ||
         origin.accepted.load(std::memory_order_acquire) != 1u ||
         origin.requests.load(std::memory_order_acquire) != 1u || origin.history.size() != 1u ||
         origin.response_fragments_sent.load(std::memory_order_acquire) != 2u ||
-        expected_upstream_bytes.size() != 60u ||
-        !read_request_length_access_file(temp.nginx_access_log, final_access, error) ||
-        final_access != "60\n") {
-        if (error.empty()) error = "#270 custom-hide timeout probe cleanup/history was not exact";
+        expected_upstream_bytes.size() != 60u || !final_access_read || final_access != "60\n") {
+        if (expiry_gate_failed) {
+            error = expiry_failure_error;
+        } else if (error.empty()) {
+            error = cleanup_access_error.empty()
+                        ? "#270 custom-hide timeout probe cleanup/history was not exact"
+                        : cleanup_access_error;
+        }
         return false;
     }
+    if (pair != nullptr) {
+        observation->downstream = response;
+        if (!normalize_date(observation->downstream)) {
+            error = "#270 custom-hide expiry observation Date normalization failed";
+            return false;
+        }
+        observation->upstream = origin.history[0];
+        observation->access = final_access;
+        observation->eof = actual_eof;
+        observation->retired = origin_retired;
+        observation->stable = post_retirement_stable;
+        observation->accepted = origin.accepted.load(std::memory_order_acquire);
+        observation->requests = origin.requests.load(std::memory_order_acquire);
+        observation->peer_close_count =
+            origin.response_peer_close_count.load(std::memory_order_acquire);
+    }
     return error.empty();
+}
+
+static bool run_pinned_nginx_custom_hide_timeout_cli_differential(const char* rut_path,
+                                                                  const char* converter_path,
+                                                                  std::string& error) {
+    if (rut_path == nullptr || converter_path == nullptr) {
+        error = "#270 custom-hide CLI differential requires RUT and converter executables";
+        return false;
+    }
+    if (!check_exact_rut_source_capture(error)) return false;
+    const std::string suffix = std::to_string(getpid());
+    const auto run_pair = [&](bool completion, const std::string& name) {
+        CustomHideTimeoutPairContext pair;
+        CustomHideTimeoutObservation nginx_observation;
+        CustomHideTimeoutObservation rut_observation;
+        if (!pair.temp.create()) {
+            error = "#270 custom-hide pair could not create resources";
+            return false;
+        }
+        if (!run_pinned_nginx_custom_hide_timeout_probe(
+                name + "-nginx", error, completion, nullptr, nullptr, &pair, &nginx_observation))
+            return false;
+        if (!read_exact_return204_log(pair.temp.nginx_config,
+                                      "#270 pair config after nginx",
+                                      pair.config_snapshot,
+                                      error) ||
+            pair.config_snapshot != pair.config) {
+            error = "#270 pair config changed after nginx settlement";
+            return false;
+        }
+        if (rename(pair.temp.nginx_access_log.c_str(), pair.temp.nginx_access_snapshot.c_str()) !=
+            0) {
+            error =
+                "#270 pair could not preserve nginx access snapshot errno=" + std::to_string(errno);
+            return false;
+        }
+        if (!read_exact_return204_log(pair.temp.nginx_access_snapshot,
+                                      "#270 stopped nginx access snapshot",
+                                      pair.access_snapshot,
+                                      error) ||
+            pair.access_snapshot != "60\n") {
+            error = "#270 pair nginx access snapshot was not exactly 60+LF";
+            return false;
+        }
+        if (write_file(pair.temp.nginx_access_log, "", 0u) &&
+            access(pair.temp.nginx_access_log.c_str(), F_OK) == 0) {
+            // The fresh same-path sink is intentionally created only after the
+            // owned nginx snapshot has been preserved and validated.
+        } else {
+            error = "#270 pair could not create fresh shared access sink errno=" +
+                    std::to_string(errno);
+            return false;
+        }
+        std::string cleared;
+        if (!read_request_length_access_file(pair.temp.nginx_access_log, cleared, error) ||
+            !cleared.empty()) {
+            error = "#270 pair access log was not empty before RUT";
+            return false;
+        }
+        if (!run_pinned_nginx_custom_hide_timeout_probe(name + "-rut",
+                                                        error,
+                                                        completion,
+                                                        rut_path,
+                                                        converter_path,
+                                                        &pair,
+                                                        &rut_observation))
+            return false;
+        std::string after_rut_config;
+        if (!read_exact_return204_log(
+                pair.temp.nginx_config, "#270 pair config after RUT", after_rut_config, error) ||
+            after_rut_config != pair.config) {
+            error = "#270 pair config changed after RUT settlement";
+            return false;
+        }
+        const auto observations_equal = [](const CustomHideTimeoutObservation& lhs,
+                                           const CustomHideTimeoutObservation& rhs) {
+            return lhs.downstream == rhs.downstream && lhs.upstream == rhs.upstream &&
+                   lhs.access == rhs.access && lhs.eof == rhs.eof && lhs.retired == rhs.retired &&
+                   lhs.stable == rhs.stable && lhs.accepted == rhs.accepted &&
+                   lhs.requests == rhs.requests && lhs.peer_close_count == rhs.peer_close_count;
+        };
+        if (!observations_equal(nginx_observation, rut_observation)) {
+            error = "#270 paired nginx/RUT accepted observations differed";
+            return false;
+        }
+        auto mutant = rut_observation;
+        mutant.downstream.insert(mutant.downstream.begin(),
+                                 {'X', '-', 'P', 'o', 'w', 'e', 'r', 'e', 'd',  '-',
+                                  'B', 'y', ':', ' ', 'l', 'e', 'a', 'k', '\r', '\n'});
+        if (observations_equal(nginx_observation, mutant)) {
+            error = "#270 pair comparator accepted a hidden-header mutation";
+            return false;
+        }
+        mutant = rut_observation;
+        mutant.downstream.push_back('x');
+        if (observations_equal(nginx_observation, mutant)) {
+            error = "#270 pair comparator accepted a downstream-body mutation";
+            return false;
+        }
+        mutant = rut_observation;
+        if (mutant.upstream.empty()) {
+            error = "#270 pair comparator lacked upstream bytes for mutation control";
+            return false;
+        }
+        mutant.upstream[0] ^= 1;
+        if (observations_equal(nginx_observation, mutant)) {
+            error = "#270 pair comparator accepted an upstream mutation";
+            return false;
+        }
+        mutant = rut_observation;
+        mutant.access = "61\n";
+        if (observations_equal(nginx_observation, mutant)) {
+            error = "#270 pair comparator accepted an access mutation";
+            return false;
+        }
+        mutant = rut_observation;
+        mutant.eof = !mutant.eof;
+        if (observations_equal(nginx_observation, mutant)) {
+            error = "#270 pair comparator accepted an EOF mutation";
+            return false;
+        }
+        return true;
+    };
+    return run_pair(false, "rut-nginx-270-custom-hide-cli-expiry-" + suffix) &&
+           run_pair(true, "rut-nginx-270-custom-hide-cli-completion-" + suffix);
 }
 
 static bool run_pinned_nginx_default_buffering_three_publication_oracle_impl(
@@ -75472,14 +77167,20 @@ int main(int argc, char** argv) {
         strcmp(argv[1], "--pinned-nginx-positive-cl-head-default-buffering-oracle") == 0;
     const bool pinned_nginx_lifecycle_self_check =
         argc == 2 && strcmp(argv[1], "--pinned-nginx-lifecycle-self-check") == 0;
+    const bool docker_info_preflight_self_check =
+        argc == 2 && strcmp(argv[1], "--docker-info-preflight-self-check") == 0;
     const bool zero_response_stall_self_check =
         argc == 2 && strcmp(argv[1], "--zero-response-stall-self-check") == 0;
     const bool gated_fragment_peer_probe_self_check =
         argc == 2 && strcmp(argv[1], "--gated-fragment-peer-probe-self-check") == 0;
+    const bool live_access_ledger_observer_self_check =
+        argc == 2 && strcmp(argv[1], "--live-access-ledger-observer-self-check") == 0;
     const bool pinned_nginx_custom_hide_timeout_probe =
         argc == 2 && strcmp(argv[1], "--pinned-nginx-custom-hide-timeout-probe") == 0;
     const bool pinned_nginx_custom_hide_timeout_completion =
         argc == 2 && strcmp(argv[1], "--pinned-nginx-custom-hide-timeout-completion") == 0;
+    const bool converter_custom_hide_timeout_cli_differential =
+        argc == 4 && strcmp(argv[1], "--converter-custom-hide-timeout-cli-differential") == 0;
     const bool wildcard_listen_oracle =
         argc == 2 && strcmp(argv[1], "--pinned-nginx-wildcard-listen-oracle") == 0;
     const bool asterisk_wildcard_listen_oracle =
@@ -75680,17 +77381,17 @@ int main(int argc, char** argv) {
         (argc == 2 && argv[1][0] == '/') ||
         (argc == 4 && argv[1][0] == '/' && argv[2][0] == '/' && argv[3][0] == '/');
     if ((!nginx_preload_loader_preflight && !nginx_gate_spike && !nginx_coalesced_ingress_gate &&
-         !rut_iouring_gate_recv_owner_diagnostics_self_check && !exact_local_return_baseline &&
-         !root_proxy_trace_oracle && !api_proxy_trace_oracle && !exact_absolute_redirect_oracle &&
-         !exact_absolute_redirect_302_oracle && !api_non_root_proxy_uri_oracle &&
-         !service_root_proxy_uri_oracle && !wildcard_service_no_uri_oracle &&
-         !converter_wildcard_service_no_uri_differential && !static_query_proxy_uri_oracle &&
-         !zero_suffix_static_query_proxy_uri_oracle && !empty_query_proxy_uri_oracle &&
-         !root_empty_query_proxy_uri_oracle && !proxy_hide_header_oracle &&
-         !proxy_hide_header_name_oracle && !proxy_hide_header_source_self_check &&
-         !proxy_hide_header_generated_side_self_check && !explicit_timeout_head_source_self_check &&
-         !explicit_timeout_head_generated_episode && !explicit_timeout_head_phase_differential &&
-         !keepalive_timeout_head_differential &&
+         !docker_info_preflight_self_check && !rut_iouring_gate_recv_owner_diagnostics_self_check &&
+         !exact_local_return_baseline && !root_proxy_trace_oracle && !api_proxy_trace_oracle &&
+         !exact_absolute_redirect_oracle && !exact_absolute_redirect_302_oracle &&
+         !api_non_root_proxy_uri_oracle && !service_root_proxy_uri_oracle &&
+         !wildcard_service_no_uri_oracle && !converter_wildcard_service_no_uri_differential &&
+         !static_query_proxy_uri_oracle && !zero_suffix_static_query_proxy_uri_oracle &&
+         !empty_query_proxy_uri_oracle && !root_empty_query_proxy_uri_oracle &&
+         !proxy_hide_header_oracle && !proxy_hide_header_name_oracle &&
+         !proxy_hide_header_source_self_check && !proxy_hide_header_generated_side_self_check &&
+         !explicit_timeout_head_source_self_check && !explicit_timeout_head_generated_episode &&
+         !explicit_timeout_head_phase_differential && !keepalive_timeout_head_differential &&
          !keepalive_timeout_get_initial_deadline_differential &&
          !fixed_upload_head_success_differential &&
          !fixed_upload_head_zero_response_timeout_differential &&
@@ -75701,7 +77402,9 @@ int main(int argc, char** argv) {
          !pinned_positive_cl_options_default_buffering_oracle &&
          !pinned_positive_cl_head_default_buffering_oracle && !pinned_nginx_lifecycle_self_check &&
          !zero_response_stall_self_check && !gated_fragment_peer_probe_self_check &&
-         !pinned_nginx_custom_hide_timeout_probe && !pinned_nginx_custom_hide_timeout_completion &&
+         !live_access_ledger_observer_self_check && !pinned_nginx_custom_hide_timeout_probe &&
+         !pinned_nginx_custom_hide_timeout_completion &&
+         !converter_custom_hide_timeout_cli_differential &&
          !converter_default_buffering_positive_get_differential &&
          !converter_default_buffering_incomplete_clean_eof_differential &&
          !converter_default_buffering_incomplete_body_inactivity_expiry_differential &&
@@ -75817,6 +77520,8 @@ int main(int argc, char** argv) {
           rut_issue566_id3_successor_live200_public_gate) &&
          (argv[2][0] != '/' || argv[3][0] != '/')) ||
         (converter_proxy_hide_header_differential && argv[2][0] != '/') ||
+        (converter_custom_hide_timeout_cli_differential &&
+         (argv[2][0] != '/' || argv[3][0] != '/')) ||
         ((converter_default_buffering_positive_get_differential ||
           converter_default_buffering_incomplete_clean_eof_differential ||
           converter_default_buffering_incomplete_body_inactivity_expiry_differential ||
@@ -76234,6 +77939,18 @@ int main(int argc, char** argv) {
         return 0;
     }
 
+    if (docker_info_preflight_self_check) {
+        std::string preflight_error;
+        if (!run_docker_info_preflight_self_check(preflight_error)) {
+            std::cerr << "FAIL [#619 Docker-info preflight self-check]: " << preflight_error
+                      << "\n";
+            return 1;
+        }
+        std::cerr << "PASS: #619 Docker-info runner distinguishes bounded spawn/wait/timeout/"
+                     "exit/signal outcomes and exact 8192/8193-byte snapshots\n";
+        return 0;
+    }
+
     if (explicit_timeout_head_source_self_check) {
         std::string source_error;
         if (!run_converter_explicit_timeout_head_source_self_checks(source_error)) {
@@ -76300,6 +78017,15 @@ int main(int argc, char** argv) {
     }
     return missing_prerequisite("pinned nginx differential requires Linux host networking");
 #else
+    if (live_access_ledger_observer_self_check) {
+        std::string observer_error;
+        if (!run_live_access_ledger_observer_self_check(observer_error)) {
+            std::cerr << "FAIL [#618 live access-ledger observer self-check]: " << observer_error
+                      << "\n";
+            return 1;
+        }
+        return 0;
+    }
     if (rut_iouring_gate_recv_owner_diagnostics_self_check) {
         std::string diagnostic_error;
         if (!run_recv_owner_diagnostic_self_check(diagnostic_error)) {
@@ -76358,6 +78084,19 @@ int main(int argc, char** argv) {
             return 1;
         }
         std::cerr << "PASS: #270 custom-hide timeout completion observed W1/W2/W3 and full wire\n";
+        return 0;
+    }
+    if (converter_custom_hide_timeout_cli_differential) {
+        std::string differential_error;
+        if (!run_pinned_nginx_custom_hide_timeout_cli_differential(
+                argv[2], argv[3], differential_error)) {
+            std::cerr << "FAIL [#270 custom-hide timeout CLI differential]: " << differential_error
+                      << "\n";
+            return 1;
+        }
+        std::cerr << "PASS: #270 same-file custom-hide/1s timeout expiry and completion pairs "
+                     "matched pinned nginx and converter-generated ordinary RUT; this remains "
+                     "a bounded compatibility claim, not full support\n";
         return 0;
     }
     if (explicit_timeout_head_generated_episode) {
@@ -77298,14 +79037,26 @@ int main(int argc, char** argv) {
     const char* suffix = strrchr(temp.path, '/');
     const std::string probe_name =
         "rut-nginx-probe-" + std::to_string(getpid()) + "-" + (suffix ? suffix + 1 : "tmp");
-    if (!command_ok({"docker", "info"}, temp.preflight_log)) {
-        if (log_contains(temp.preflight_log, "Cannot connect to the Docker daemon") ||
-            log_contains(temp.preflight_log, "Is the docker daemon running") ||
-            log_empty(temp.preflight_log) || access(temp.preflight_log.c_str(), F_OK) != 0)
-            return missing_prerequisite("Docker daemon unavailable");
-        std::cerr << "FAIL [preflight]: Docker daemon probe failed\n";
-        dump_log(temp.preflight_log, "Docker preflight log");
-        return 1;
+    DockerInfoResult docker_info = run_docker_info_runner({"docker", "info"}, temp.preflight_log);
+    if (docker_info_decision(docker_info) == DockerInfoDecision::Success) {
+        (void)read_docker_snapshot(temp.preflight_log,
+                                   docker_info.snapshot,
+                                   docker_info.snapshot_error,
+                                   docker_info.snapshot_state);
+    } else {
+        (void)read_docker_snapshot(temp.preflight_log,
+                                   docker_info.snapshot,
+                                   docker_info.snapshot_error,
+                                   docker_info.snapshot_state);
+        print_docker_info_result(docker_info);
+        if (docker_info_decision(docker_info) == DockerInfoDecision::MissingPrerequisite) {
+            std::cerr << "SKIP: Docker daemon unavailable\n";
+            const char* required = getenv("RUT_NGINX_DIFFERENTIAL_REQUIRED");
+            return docker_info_return_code(DockerInfoDecision::MissingPrerequisite,
+                                           required && strcmp(required, "1") == 0);
+        }
+        std::cerr << "FAIL [preflight]: Docker info probe failed\n";
+        return docker_info_return_code(DockerInfoDecision::Failure, true);
     }
     if (!command_ok({"docker", "image", "inspect", kNginxImage}, temp.preflight_log)) {
         if (log_contains(temp.preflight_log, "No such image") ||

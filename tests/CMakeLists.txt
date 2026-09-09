@@ -1283,6 +1283,18 @@ if(RUT_ENABLE_JIT)
         ENVIRONMENT "RUT_NGINX_DIFFERENTIAL_REQUIRED=1"
     )
     add_test(
+        NAME test_nginx_issue270_custom_hide_timeout_cli_differential
+        COMMAND test_nginx_differential --converter-custom-hide-timeout-cli-differential
+                $<TARGET_FILE:rut> $<TARGET_FILE:rut-nginx-convert>
+    )
+    set_tests_properties(test_nginx_issue270_custom_hide_timeout_cli_differential PROPERTIES
+        LABELS "integration;nginx;docker"
+        RUN_SERIAL TRUE
+        RESOURCE_LOCK nginx-differential
+        TIMEOUT 300
+        ENVIRONMENT "RUT_NGINX_DIFFERENTIAL_REQUIRED=1"
+    )
+    add_test(
         NAME test_nginx_issue439_pinned_lifecycle_self_check
         COMMAND test_nginx_differential --pinned-nginx-lifecycle-self-check
     )
@@ -1308,6 +1320,16 @@ if(RUT_ENABLE_JIT)
     )
     set_tests_properties(test_nginx_issue253_gated_fragment_peer_probe_self_check PROPERTIES
         LABELS "network"
+        RUN_SERIAL TRUE
+        RESOURCE_LOCK nginx-differential
+        TIMEOUT 30
+    )
+    add_test(
+        NAME test_nginx_issue618_live_access_ledger_observer_self_check
+        COMMAND test_nginx_differential --live-access-ledger-observer-self-check
+    )
+    set_tests_properties(test_nginx_issue618_live_access_ledger_observer_self_check PROPERTIES
+        LABELS "nginx"
         RUN_SERIAL TRUE
         RESOURCE_LOCK nginx-differential
         TIMEOUT 30
@@ -3092,6 +3114,16 @@ if(RUT_ENABLE_JIT)
         RESOURCE_LOCK nginx-differential
         TIMEOUT 120
         SKIP_RETURN_CODE 77
+    )
+
+    add_test(
+        NAME test_nginx_docker_info_preflight_self_check
+        COMMAND test_nginx_differential --docker-info-preflight-self-check
+    )
+    set_tests_properties(test_nginx_docker_info_preflight_self_check PROPERTIES
+        LABELS "unit"
+        RUN_SERIAL TRUE
+        TIMEOUT 30
     )
 
     add_executable(test_jit test_jit.cc ${PROJECT_SOURCE_DIR}/src/placement_new.cc)
