@@ -62,15 +62,14 @@ route HEAD "/" {
             head_mode: "suppress_body",
             body: b"<html>\r\n<head><title>504 Gateway Time-out</title></head>\r\n<body>\r\n<center><h1>504 Gateway Time-out</h1></center>\r\n<hr><center>nginx/1.29.7</center>\r\n</body>\r\n</html>\r\n"
         },
-        response_read_timeout: 1s,
+        response_read_timeout: 1s
     )
     } else {
         return forward(nginx_upstream, request_policy: {
             version: "HTTP/1.1",
             host: "upstream",
             connection: "omit",
-            strip_headers: ["Connection", "Keep-Alive", "TE", "Expect", "Upgrade"],
-            retained_header_value: "trim_sp_preserve_htab"
+            strip_headers: ["Connection", "Keep-Alive", "TE", "Expect", "Upgrade"]
         },
         response_policy: {
             version: "HTTP/1.1",
@@ -103,7 +102,7 @@ route HEAD "/" {
             head_mode: "suppress_body",
             body: b"<html>\r\n<head><title>504 Gateway Time-out</title></head>\r\n<body>\r\n<center><h1>504 Gateway Time-out</h1></center>\r\n<hr><center>nginx/1.29.7</center>\r\n</body>\r\n</html>\r\n"
         },
-        response_read_timeout: 1s,
+        response_read_timeout: 1s
     )
     }
 }
@@ -145,7 +144,7 @@ route GET "/" {
         response_read_timeout: 1s,
         response_buffering: "complete_content_length"
     )
-    }
+}
 route "/" {
     return forward(nginx_upstream, request_policy: {
             version: "HTTP/1.1",

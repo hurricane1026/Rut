@@ -21269,9 +21269,9 @@ TEST(nginx_converter_issue270, custom_hide_header_and_timeout_lower_together) {
                      head ? ResponsePolicyHeadMode::SuppressBody : ResponsePolicyHeadMode::Reject);
             REQUIRE_EQ(response.hide_header_count, 4u);
             for (u32 header = 0; header < response.hide_header_count; header++)
-                CHECK(str_is_in_owned_pool(response.hide_headers[header],
-                                           config.response_policy_bytes,
-                                           config.response_policy_bytes_used));
+                REQUIRE(str_is_in_owned_pool(response.hide_headers[header],
+                                             config.response_policy_bytes,
+                                             config.response_policy_bytes_used));
             CHECK(response.hide_headers[0].eq(lit_str("Date")));
             CHECK(response.hide_headers[1].eq(lit_str("Server")));
             CHECK(response.hide_headers[2].eq(lit_str("X-Pad")));
