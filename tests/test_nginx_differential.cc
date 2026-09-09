@@ -1219,13 +1219,15 @@ static bool read_docker_snapshot(const std::string& path,
                                  std::string& error,
                                  DockerSnapshotState& state) {
     constexpr size_t kMaxDiagnosticBytes = 8192u;
+    contents.clear();
+    error.clear();
     state = DockerSnapshotState::Missing;
     const int fd = open(path.c_str(), O_RDONLY | O_CLOEXEC);
     if (fd < 0) {
         error = "open errno=" + std::to_string(errno);
+        if (errno != ENOENT) state = DockerSnapshotState::ReadError;
         return false;
     }
-    contents.clear();
     char buffer[1024];
     for (;;) {
         const ssize_t count = read(fd, buffer, sizeof(buffer));
@@ -1250,6 +1252,25 @@ static bool read_docker_snapshot(const std::string& path,
         }
         break;
     }
+    if (contents.size() == kMaxDiagnosticBytes) {
+        char extra = 0;
+        ssize_t extra_count;
+        do {
+            extra_count = read(fd, &extra, 1);
+        } while (extra_count < 0 && errno == EINTR);
+        if (extra_count > 0) {
+            state = DockerSnapshotState::Overflow;
+            error = "output exceeded 8192-byte snapshot";
+            close(fd);
+            return false;
+        }
+        if (extra_count < 0) {
+            state = DockerSnapshotState::ReadError;
+            error = "read errno=" + std::to_string(errno);
+            close(fd);
+            return false;
+        }
+    }
     if (close(fd) != 0 && error.empty()) error = "close errno=" + std::to_string(errno);
     if (!error.empty()) {
         state = DockerSnapshotState::ReadError;
@@ -1262,6 +1283,21 @@ static bool read_docker_snapshot(const std::string& path,
 static bool docker_daemon_text(const std::string& text) {
     return text.find("Cannot connect to the Docker daemon") != std::string::npos ||
            text.find("Is the docker daemon running") != std::string::npos;
+}
+
+enum class DockerInfoDecision { Success, MissingPrerequisite, Failure };
+
+static DockerInfoDecision docker_info_decision(const DockerInfoResult& result) {
+    if (result.outcome == DockerInfoOutcome::Exited && result.child.status_valid &&
+        WIFEXITED(result.child.status) && WEXITSTATUS(result.child.status) == 0)
+        return DockerInfoDecision::Success;
+    if (result.outcome == DockerInfoOutcome::Exited && result.child.status_valid &&
+        WIFEXITED(result.child.status) && WEXITSTATUS(result.child.status) != 0 &&
+        (result.snapshot_state == DockerSnapshotState::Missing ||
+         result.snapshot_state == DockerSnapshotState::Empty ||
+         docker_daemon_text(result.snapshot)))
+        return DockerInfoDecision::MissingPrerequisite;
+    return DockerInfoDecision::Failure;
 }
 
 static bool docker_info_missing_prerequisite(const DockerInfoResult& result);
@@ -1334,13 +1370,25 @@ static bool run_docker_info_preflight_self_check(std::string& error) {
     DockerInfoResult missing;
     missing.outcome = DockerInfoOutcome::Exited;
     missing.child.status_valid = true;
+    missing.child.status = (1 << 8);
     missing.snapshot_state = DockerSnapshotState::Missing;
     DockerInfoResult empty = missing;
     empty.snapshot_state = DockerSnapshotState::Empty;
     DockerInfoResult read_error = missing;
     read_error.snapshot_state = DockerSnapshotState::ReadError;
-    if (!docker_info_missing_prerequisite(missing) || !docker_info_missing_prerequisite(empty) ||
-        docker_info_missing_prerequisite(read_error)) {
+    DockerInfoResult spawn_failed;
+    DockerInfoResult wait_failed;
+    wait_failed.outcome = DockerInfoOutcome::WaitFailed;
+    DockerInfoResult invalid_status;
+    invalid_status.outcome = DockerInfoOutcome::WaitFailed;
+    invalid_status.child.status_valid = true;
+    invalid_status.child.status = 0x7f;
+    if (docker_info_decision(missing) != DockerInfoDecision::MissingPrerequisite ||
+        docker_info_decision(empty) != DockerInfoDecision::MissingPrerequisite ||
+        docker_info_decision(read_error) == DockerInfoDecision::MissingPrerequisite ||
+        docker_info_decision(spawn_failed) != DockerInfoDecision::Failure ||
+        docker_info_decision(wait_failed) != DockerInfoDecision::Failure ||
+        docker_info_decision(invalid_status) != DockerInfoDecision::Failure) {
         error = "missing/empty/read-error classifier controls failed";
         cleanup();
         return false;
@@ -1378,10 +1426,7 @@ static bool run_docker_info_preflight_self_check(std::string& error) {
 }
 
 static bool docker_info_missing_prerequisite(const DockerInfoResult& result) {
-    return result.outcome == DockerInfoOutcome::Exited && result.child.status_valid &&
-           (result.snapshot_state == DockerSnapshotState::Missing ||
-            result.snapshot_state == DockerSnapshotState::Empty ||
-            docker_daemon_text(result.snapshot));
+    return docker_info_decision(result) == DockerInfoDecision::MissingPrerequisite;
 }
 
 static void print_docker_info_result(const DockerInfoResult& result) {
@@ -77307,17 +77352,17 @@ int main(int argc, char** argv) {
         (argc == 2 && argv[1][0] == '/') ||
         (argc == 4 && argv[1][0] == '/' && argv[2][0] == '/' && argv[3][0] == '/');
     if ((!nginx_preload_loader_preflight && !nginx_gate_spike && !nginx_coalesced_ingress_gate &&
-         !rut_iouring_gate_recv_owner_diagnostics_self_check && !exact_local_return_baseline &&
-         !root_proxy_trace_oracle && !api_proxy_trace_oracle && !exact_absolute_redirect_oracle &&
-         !exact_absolute_redirect_302_oracle && !api_non_root_proxy_uri_oracle &&
-         !service_root_proxy_uri_oracle && !wildcard_service_no_uri_oracle &&
-         !converter_wildcard_service_no_uri_differential && !static_query_proxy_uri_oracle &&
-         !zero_suffix_static_query_proxy_uri_oracle && !empty_query_proxy_uri_oracle &&
-         !root_empty_query_proxy_uri_oracle && !proxy_hide_header_oracle &&
-         !proxy_hide_header_name_oracle && !proxy_hide_header_source_self_check &&
-         !proxy_hide_header_generated_side_self_check && !explicit_timeout_head_source_self_check &&
-         !explicit_timeout_head_generated_episode && !explicit_timeout_head_phase_differential &&
-         !keepalive_timeout_head_differential &&
+         !docker_info_preflight_self_check && !rut_iouring_gate_recv_owner_diagnostics_self_check &&
+         !exact_local_return_baseline && !root_proxy_trace_oracle && !api_proxy_trace_oracle &&
+         !exact_absolute_redirect_oracle && !exact_absolute_redirect_302_oracle &&
+         !api_non_root_proxy_uri_oracle && !service_root_proxy_uri_oracle &&
+         !wildcard_service_no_uri_oracle && !converter_wildcard_service_no_uri_differential &&
+         !static_query_proxy_uri_oracle && !zero_suffix_static_query_proxy_uri_oracle &&
+         !empty_query_proxy_uri_oracle && !root_empty_query_proxy_uri_oracle &&
+         !proxy_hide_header_oracle && !proxy_hide_header_name_oracle &&
+         !proxy_hide_header_source_self_check && !proxy_hide_header_generated_side_self_check &&
+         !explicit_timeout_head_source_self_check && !explicit_timeout_head_generated_episode &&
+         !explicit_timeout_head_phase_differential && !keepalive_timeout_head_differential &&
          !keepalive_timeout_get_initial_deadline_differential &&
          !fixed_upload_head_success_differential &&
          !fixed_upload_head_zero_response_timeout_differential &&
@@ -78964,8 +79009,7 @@ int main(int argc, char** argv) {
     const std::string probe_name =
         "rut-nginx-probe-" + std::to_string(getpid()) + "-" + (suffix ? suffix + 1 : "tmp");
     DockerInfoResult docker_info = run_docker_info_runner({"docker", "info"}, temp.preflight_log);
-    if (docker_info.outcome == DockerInfoOutcome::Exited && docker_info.child.status_valid &&
-        WIFEXITED(docker_info.child.status) && WEXITSTATUS(docker_info.child.status) == 0) {
+    if (docker_info_decision(docker_info) == DockerInfoDecision::Success) {
         (void)read_docker_snapshot(temp.preflight_log,
                                    docker_info.snapshot,
                                    docker_info.snapshot_error,
@@ -78976,7 +79020,7 @@ int main(int argc, char** argv) {
                                    docker_info.snapshot_error,
                                    docker_info.snapshot_state);
         print_docker_info_result(docker_info);
-        if (docker_info_missing_prerequisite(docker_info))
+        if (docker_info_decision(docker_info) == DockerInfoDecision::MissingPrerequisite)
             return missing_prerequisite("Docker daemon unavailable");
         std::cerr << "FAIL [preflight]: Docker info probe failed\n";
         return 1;
