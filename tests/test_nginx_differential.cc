@@ -71975,7 +71975,8 @@ static bool run_converter_default_buffering_206_range_three_publication_completi
 // wire instead of hard-coding it; the follow-up oracle can freeze only bytes
 // observed from the pinned nginx image.
 static bool run_pinned_nginx_custom_hide_timeout_probe(const std::string& container_name,
-                                                       std::string& error) {
+                                                       std::string& error,
+                                                       bool complete_after_w3 = false) {
     TempDir temp;
     if (!temp.create()) {
         error = "#270 custom-hide timeout probe could not create temporary resources";
@@ -72028,6 +72029,7 @@ static bool run_pinned_nginx_custom_hide_timeout_probe(const std::string& contai
         "hello";
     static_assert(sizeof(kOrigin) - 1u == 187u);
     static constexpr char kSecond[] = "!";
+    static constexpr char kThird[] = "world!";
     static constexpr char kExpectedExpiryResponseNormalized[] =
         "HTTP/1.1 200 OK\r\n"
         "Server: nginx/1.29.7\r\n"
@@ -72037,16 +72039,28 @@ static bool run_pinned_nginx_custom_hide_timeout_probe(const std::string& contai
         "X-Unrelated: retained\r\n"
         "\r\n";
     static_assert(sizeof(kExpectedExpiryResponseNormalized) - 1u == 145u);
+    static constexpr char kExpectedCompleteResponseNormalized[] =
+        "HTTP/1.1 200 OK\r\n"
+        "Server: nginx/1.29.7\r\n"
+        "Date: XXXXXXXXXXXXXXXXXXXXXXXXXXXXX\r\n"
+        "Content-Length: 12\r\n"
+        "Connection: keep-alive\r\n"
+        "X-Unrelated: retained\r\n"
+        "\r\n"
+        "hello!world!";
+    static_assert(sizeof(kExpectedCompleteResponseNormalized) - 1u == 157u);
 
     Recorder origin;
     origin.observe_extra_requests_until_stop = true;
     origin.permit_gated_incomplete_first_response = true;
     origin.probe_before_gated_fragment = true;
-    origin.incomplete_first_response_fragment_count = 2u;
+    origin.incomplete_first_response_fragment_count = complete_after_w3 ? 3u : 2u;
     origin.response_fragment_bytes[0] = kOrigin;
     origin.response_fragment_lengths[0] = sizeof(kOrigin) - 1u;
     origin.response_fragment_bytes[1] = kSecond;
     origin.response_fragment_lengths[1] = sizeof(kSecond) - 1u;
+    origin.response_fragment_bytes[2] = kThird;
+    origin.response_fragment_lengths[2] = sizeof(kThird) - 1u;
     if (!handoff_held_loopback_port(
             &reservations.fds[1], backend_port, "#270 custom-hide timeout probe origin", error) ||
         !origin.setup(backend_port, 1u, kOrigin, sizeof(kOrigin) - 1u)) {
@@ -72202,15 +72216,227 @@ static bool run_pinned_nginx_custom_hide_timeout_probe(const std::string& contai
     }
     const u64 w2_elapsed_ns = second_ns - first_ns;
     if (w2_elapsed_ns < 550'000'000ull || w2_elapsed_ns >= 750'000'000ull ||
-        !origin.response_send_succeeded.load(std::memory_order_acquire) ||
-        !origin.response_sent_open.load(std::memory_order_acquire) ||
         origin.response_send_failed.load(std::memory_order_acquire) ||
         origin.response_peer_closed.load(std::memory_order_acquire) ||
         origin.response_peer_unexpected_data.load(std::memory_order_acquire) ||
-        origin.response_peer_observation_failed.load(std::memory_order_acquire)) {
+        origin.response_peer_observation_failed.load(std::memory_order_acquire) ||
+        (!complete_after_w3 && (!origin.response_send_succeeded.load(std::memory_order_acquire) ||
+                                !origin.response_sent_open.load(std::memory_order_acquire)))) {
         close(client);
         error = "#270 custom-hide timeout probe W1/W2 timing or origin-open evidence failed";
         return false;
+    }
+    if (complete_after_w3) {
+        const u64 quiet_horizon_ns =
+            std::max(first_ns + 1'100'000'000ull, second_ns + 600'000'000ull);
+        while (steady_now_ns() < quiet_horizon_ns) {
+            std::string quiet_access;
+            if (!origin_live() || poll_child(nginx.child) ||
+                !observe_client_open_and_quiet_nonconsuming(client, 5, error) ||
+                !read_request_length_access_file(temp.nginx_access_log, quiet_access, error) ||
+                !quiet_access.empty() || origin.accepted.load(std::memory_order_acquire) != 1u ||
+                origin.requests.load(std::memory_order_acquire) != 1u ||
+                origin.response_fragments_sent.load(std::memory_order_acquire) != 2u ||
+                origin.response_peer_closed.load(std::memory_order_acquire) ||
+                origin.response_send_failed.load(std::memory_order_acquire) ||
+                origin.response_peer_unexpected_data.load(std::memory_order_acquire) ||
+                origin.response_peer_observation_failed.load(std::memory_order_acquire)) {
+                close(client);
+                if (error.empty()) error = "#270 custom-hide completion pre-W3 custody failed";
+                return false;
+            }
+            usleep(1000);
+        }
+        origin.gated_fragment_probe_request.store(3u, std::memory_order_release);
+        const u64 third_probe_deadline_ns = second_ns + 750'000'000ull;
+        while (origin.gated_fragment_probe_ack.load(std::memory_order_acquire) != 3u) {
+            if (!origin_live() || poll_child(nginx.child) ||
+                origin.response_fragment_permit.load(std::memory_order_acquire) != 2u ||
+                origin.response_fragments_sent.load(std::memory_order_acquire) != 2u ||
+                origin.response_send_failed.load(std::memory_order_acquire) ||
+                steady_now_ns() >= third_probe_deadline_ns) {
+                close(client);
+                error = "#270 custom-hide completion W3 peer-open ack failed";
+                return false;
+            }
+            usleep(1000);
+        }
+        const u64 third_probe_ns = origin.gated_fragment_probe_ns.load(std::memory_order_acquire);
+        if (origin.gated_fragment_probe_result.load(std::memory_order_acquire) !=
+                GatedFragmentPeerProbeResult::Open ||
+            origin.gated_fragment_probe_request.load(std::memory_order_acquire) != 3u ||
+            third_probe_ns < second_ns + 600'000'000ull ||
+            third_probe_ns >= third_probe_deadline_ns ||
+            !observe_client_open_and_quiet_nonconsuming(client, 5, error)) {
+            close(client);
+            error = "#270 custom-hide completion W3 peer-open custody failed";
+            return false;
+        }
+        std::string pre_w3_access;
+        if (!read_request_length_access_file(temp.nginx_access_log, pre_w3_access, error) ||
+            !pre_w3_access.empty() || !origin_live() || poll_child(nginx.child) ||
+            origin.response_peer_closed.load(std::memory_order_acquire)) {
+            close(client);
+            if (error.empty()) error = "#270 custom-hide completion W3 pre-permit access failed";
+            return false;
+        }
+        origin.response_fragment_permit.store(3u, std::memory_order_release);
+        const auto third_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(1);
+        while (origin.response_fragments_sent.load(std::memory_order_acquire) < 3u &&
+               std::chrono::steady_clock::now() < third_deadline) {
+            if (!origin_live() || poll_child(nginx.child)) {
+                close(client);
+                error = "#270 custom-hide completion lost liveness during W3";
+                return false;
+            }
+            usleep(1000);
+        }
+        const u64 third_ns = origin.response_fragment_sent_ns[2].load(std::memory_order_acquire);
+        const auto completion_timing_valid = [](u64 first, u64 second, u64 third) {
+            return second > first && third > second && second - first >= 550'000'000ull &&
+                   second - first < 750'000'000ull && third - second >= 550'000'000ull &&
+                   third - second < 750'000'000ull;
+        };
+        const bool completion_timing_positive =
+            completion_timing_valid(first_ns, second_ns, third_ns);
+        const bool completion_timing_mutants_rejected =
+            !completion_timing_valid(first_ns, second_ns, second_ns + 400'000'000ull) &&
+            !completion_timing_valid(first_ns, second_ns, second_ns + 2'000'000'000ull);
+        if (origin.response_fragments_sent.load(std::memory_order_acquire) != 3u ||
+            !completion_timing_positive || !completion_timing_mutants_rejected ||
+            !origin.response_send_succeeded.load(std::memory_order_acquire) ||
+            !origin.response_sent_open.load(std::memory_order_acquire) ||
+            origin.response_send_failed.load(std::memory_order_acquire)) {
+            close(client);
+            error = "#270 custom-hide completion W3 timing/publication failed";
+            return false;
+        }
+        std::vector<char> response;
+        const size_t expected_response_size = sizeof(kExpectedCompleteResponseNormalized) - 1u;
+        const auto response_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+        while (response.size() < expected_response_size &&
+               std::chrono::steady_clock::now() < response_deadline) {
+            pollfd state{client, POLLIN | POLLHUP | POLLERR, 0};
+            const int ready = poll(&state, 1, 10);
+            if (ready < 0 && errno == EINTR) continue;
+            if (ready < 0) break;
+            if (ready == 0) continue;
+            char bytes[1024];
+            const ssize_t count = recv(client, bytes, sizeof(bytes), 0);
+            if (count > 0)
+                response.insert(response.end(), bytes, bytes + count);
+            else if (count == 0 ||
+                     (count < 0 && errno != EINTR && errno != EAGAIN && errno != EWOULDBLOCK))
+                break;
+        }
+        std::vector<char> normalized = response;
+        const std::vector<char> expected(
+            kExpectedCompleteResponseNormalized,
+            kExpectedCompleteResponseNormalized + expected_response_size);
+        const bool exact_response = normalize_date(normalized) && normalized == expected;
+        const bool no_eof_and_quiet =
+            observe_client_open_and_quiet_nonconsuming(client, 200, error);
+        std::string access;
+        const bool access_read =
+            read_request_length_access_file(temp.nginx_access_log, access, error);
+        const bool response_mutants_rejected = [&]() {
+            std::vector<char> leaked = response;
+            const size_t end = header_end(leaked);
+            if (end < 2u) return false;
+            leaked.insert(leaked.begin() + static_cast<std::ptrdiff_t>(end - 2u),
+                          {'X', '-', 'P', 'o', 'w', 'e', 'r', 'e', 'd',  '-',
+                           'B', 'y', ':', ' ', 'l', 'e', 'a', 'k', '\r', '\n'});
+            std::vector<char> missing = response;
+            const std::string line = "X-Unrelated: retained\r\n";
+            const auto at = std::search(missing.begin(), missing.end(), line.begin(), line.end());
+            if (at == missing.end()) return false;
+            missing.erase(at, at + line.size());
+            std::vector<char> body = response;
+            body.push_back('x');
+            const auto accepts = [&](const std::vector<char>& candidate) {
+                std::vector<char> copy = candidate;
+                return normalize_date(copy) && copy == expected;
+            };
+            return accepts(response) && !accepts(leaked) && !accepts(missing) && !accepts(body);
+        }();
+        const u64 peer_deadline = third_ns + 2'000'000'000ull;
+        while (!origin.response_peer_closed.load(std::memory_order_acquire) &&
+               steady_now_ns() < peer_deadline) {
+            if (!origin_live() || poll_child(nginx.child) ||
+                origin.response_peer_unexpected_data.load(std::memory_order_acquire) ||
+                origin.response_peer_observation_failed.load(std::memory_order_acquire))
+                break;
+            usleep(1000);
+        }
+        const bool origin_retired =
+            origin.response_peer_closed.load(std::memory_order_acquire) &&
+            origin.response_peer_close_count.load(std::memory_order_acquire) == 1u;
+        const u64 retired_ns = origin.response_peer_closed_ns.load(std::memory_order_acquire);
+        const u64 stability_start = steady_now_ns();
+        bool stable = origin_retired && stability_start >= retired_ns;
+        const u64 stability_deadline = stability_start + 175'000'000ull;
+        const auto success_snapshot_valid = [&]() {
+            std::string stable_access;
+            if (!origin_live() || poll_child(nginx.child) ||
+                !read_request_length_access_file(temp.nginx_access_log, stable_access, error) ||
+                stable_access != "60\n" || origin.accepted.load(std::memory_order_acquire) != 1u ||
+                origin.requests.load(std::memory_order_acquire) != 1u ||
+                origin.response_fragments_sent.load(std::memory_order_acquire) != 3u ||
+                !origin.response_send_succeeded.load(std::memory_order_acquire) ||
+                !origin.response_sent_open.load(std::memory_order_acquire) ||
+                !origin.response_peer_closed.load(std::memory_order_acquire) ||
+                origin.response_peer_close_count.load(std::memory_order_acquire) != 1u ||
+                origin.gated_fragment_probe_request.load(std::memory_order_acquire) != 3u ||
+                origin.gated_fragment_probe_ack.load(std::memory_order_acquire) != 3u ||
+                origin.gated_fragment_probe_result.load(std::memory_order_acquire) !=
+                    GatedFragmentPeerProbeResult::Open ||
+                origin.response_send_failed.load(std::memory_order_acquire) ||
+                origin.response_peer_unexpected_data.load(std::memory_order_acquire) ||
+                origin.response_peer_observation_failed.load(std::memory_order_acquire))
+                return false;
+            pollfd state{client, POLLIN | POLLHUP | POLLERR, 0};
+            const int ready = poll(&state, 1, 5);
+            if (ready < 0) return errno == EINTR;
+            if (ready == 0) return true;
+            char late_bytes[64];
+            const ssize_t count = recv(client, late_bytes, sizeof(late_bytes), MSG_DONTWAIT);
+            return count < 0 && (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK);
+        };
+        while (stable && steady_now_ns() < stability_deadline) {
+            stable = success_snapshot_valid();
+            usleep(1000);
+        }
+        if (stable && steady_now_ns() >= stability_deadline) {
+            stable = success_snapshot_valid();
+        } else {
+            stable = false;
+        }
+        close(client);
+        origin.stop();
+        const std::string expected_upstream =
+            "GET /buffered-timeout?q=1 HTTP/1.1\r\nHost: 127.0.0.1:" +
+            std::to_string(backend_port) + "\r\n\r\n";
+        const std::vector<char> expected_upstream_bytes(expected_upstream.begin(),
+                                                        expected_upstream.end());
+        const bool exact_upstream =
+            origin.history.size() == 1u && origin.history[0] == expected_upstream_bytes;
+        const bool nginx_stopped = stop_child(nginx.child);
+        const bool removed = docker.remove();
+        std::string final_access;
+        const bool cleanup =
+            nginx_stopped && removed && reservations.fds[0] < 0 && reservations.fds[1] < 0 &&
+            origin.thread_alive.load(std::memory_order_acquire) == false && origin.listen_fd < 0 &&
+            exact_upstream &&
+            read_request_length_access_file(temp.nginx_access_log, final_access, error) &&
+            final_access == "60\n";
+        if (!exact_response || !no_eof_and_quiet || !access_read || access != "60\n" ||
+            !response_mutants_rejected || !origin_retired || !stable || !cleanup) {
+            error =
+                "#270 custom-hide completion episode exact response/lifecycle validation failed";
+            return false;
+        }
+        std::cerr << "PASS: #270 custom-hide completion W1/W2/W3 and full response wire observed\n";
+        return true;
     }
     const auto expiry_timing_is_valid = [](u64 elapsed_ns) {
         return elapsed_ns >= 750'000'000ull && elapsed_ns < 2'000'000'000ull;
@@ -75245,6 +75471,8 @@ int main(int argc, char** argv) {
         argc == 2 && strcmp(argv[1], "--gated-fragment-peer-probe-self-check") == 0;
     const bool pinned_nginx_custom_hide_timeout_probe =
         argc == 2 && strcmp(argv[1], "--pinned-nginx-custom-hide-timeout-probe") == 0;
+    const bool pinned_nginx_custom_hide_timeout_completion =
+        argc == 2 && strcmp(argv[1], "--pinned-nginx-custom-hide-timeout-completion") == 0;
     const bool wildcard_listen_oracle =
         argc == 2 && strcmp(argv[1], "--pinned-nginx-wildcard-listen-oracle") == 0;
     const bool asterisk_wildcard_listen_oracle =
@@ -75466,7 +75694,7 @@ int main(int argc, char** argv) {
          !pinned_positive_cl_options_default_buffering_oracle &&
          !pinned_positive_cl_head_default_buffering_oracle && !pinned_nginx_lifecycle_self_check &&
          !zero_response_stall_self_check && !gated_fragment_peer_probe_self_check &&
-         !pinned_nginx_custom_hide_timeout_probe &&
+         !pinned_nginx_custom_hide_timeout_probe && !pinned_nginx_custom_hide_timeout_completion &&
          !converter_default_buffering_positive_get_differential &&
          !converter_default_buffering_incomplete_clean_eof_differential &&
          !converter_default_buffering_incomplete_body_inactivity_expiry_differential &&
@@ -75686,6 +75914,8 @@ int main(int argc, char** argv) {
                "   or: test_nginx_differential "
                "--pinned-nginx-root-empty-query-proxy-uri-oracle\n"
                "   or: test_nginx_differential --pinned-nginx-proxy-hide-header-oracle\n"
+               "   or: test_nginx_differential --pinned-nginx-custom-hide-timeout-probe\n"
+               "   or: test_nginx_differential --pinned-nginx-custom-hide-timeout-completion\n"
                "   or: test_nginx_differential "
                "--converter-explicit-timeout-head-source-self-check\n"
                "   or: test_nginx_differential "
@@ -76108,8 +76338,19 @@ int main(int argc, char** argv) {
             std::cerr << "FAIL [#270 custom-hide timeout probe]: " << probe_error << "\n";
             return 1;
         }
-        std::cerr << "PASS: #270 custom-hide timeout probe captured the pinned nginx expiry wire; "
-                     "freeze its observed response/timing before adding the strict oracle\n";
+        std::cerr
+            << "PASS: #270 custom-hide timeout expiry oracle observed the exact pinned wire\n";
+        return 0;
+    }
+    if (pinned_nginx_custom_hide_timeout_completion) {
+        std::string completion_error;
+        const std::string container_name =
+            "rut-nginx-270-custom-hide-completion-" + std::to_string(getpid());
+        if (!run_pinned_nginx_custom_hide_timeout_probe(container_name, completion_error, true)) {
+            std::cerr << "FAIL [#270 custom-hide timeout completion]: " << completion_error << "\n";
+            return 1;
+        }
+        std::cerr << "PASS: #270 custom-hide timeout completion observed W1/W2/W3 and full wire\n";
         return 0;
     }
     if (explicit_timeout_head_generated_episode) {
