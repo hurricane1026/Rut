@@ -73294,6 +73294,7 @@ static bool run_pinned_nginx_custom_hide_timeout_probe(
             "#270 custom-hide timeout probe was inconclusive: exact expiry EOF/response/timing/"
             "retirement/access/upstream evidence was not observed before cleanup";
     }
+    const std::string expiry_failure_error = error;
     bool live_access_read = access_read;
     std::string live_access = access;
     bool live_access_changed = false;
@@ -73310,8 +73311,19 @@ static bool run_pinned_nginx_custom_hide_timeout_probe(
     bool live_protocol_clean =
         !origin.response_peer_unexpected_data.load(std::memory_order_acquire) &&
         !origin.response_peer_observation_failed.load(std::memory_order_acquire);
+    const auto refresh_live_state = [&]() {
+        live_accepted = origin.accepted.load(std::memory_order_acquire);
+        live_requests = origin.requests.load(std::memory_order_acquire);
+        live_peer_closes = origin.response_peer_close_count.load(std::memory_order_acquire);
+        live_origin = origin_live();
+        live_child = !poll_child(nginx.child);
+        live_protocol_clean =
+            !origin.response_peer_unexpected_data.load(std::memory_order_acquire) &&
+            !origin.response_peer_observation_failed.load(std::memory_order_acquire);
+    };
     if (expiry_gate_failed) {
         while (steady_now_ns() < live_observation_deadline) {
+            refresh_live_state();
             if (!live_child) {
                 live_stop_reason = "frontend-exited";
                 break;
@@ -73329,6 +73341,7 @@ static bool run_pinned_nginx_custom_hide_timeout_probe(
             if (!read_request_length_access_file(
                     temp.nginx_access_log, candidate, diagnostic_read_error)) {
                 live_access_read = false;
+                refresh_live_state();
                 live_stop_reason = "access-read-error";
                 break;
             }
@@ -73336,6 +73349,13 @@ static bool run_pinned_nginx_custom_hide_timeout_probe(
                 live_access_changed = true;
                 if (live_access_changed_ns == 0u) live_access_changed_ns = steady_now_ns();
                 live_access = candidate;
+            }
+            refresh_live_state();
+            if (!live_child || !live_origin || !live_protocol_clean) {
+                live_stop_reason = !live_child    ? "frontend-exited-after-read"
+                                   : !live_origin ? "origin-not-live-after-read"
+                                                  : "origin-protocol-failure-after-read";
+                break;
             }
             if (candidate == "60\n") {
                 live_exact_access_seen = true;
@@ -73347,16 +73367,9 @@ static bool run_pinned_nginx_custom_hide_timeout_probe(
                 live_stop_reason = "wrong-access-ledger";
                 break;
             }
-            live_accepted = origin.accepted.load(std::memory_order_acquire);
-            live_requests = origin.requests.load(std::memory_order_acquire);
-            live_peer_closes = origin.response_peer_close_count.load(std::memory_order_acquire);
-            live_origin = origin_live();
-            live_child = !poll_child(nginx.child);
-            live_protocol_clean =
-                !origin.response_peer_unexpected_data.load(std::memory_order_acquire) &&
-                !origin.response_peer_observation_failed.load(std::memory_order_acquire);
             usleep(1000);
         }
+        refresh_live_state();
     }
     if (expiry_gate_failed) {
         std::cerr << "DIAGNOSTIC #270 live-expiry-access frontend="
@@ -73378,6 +73391,10 @@ static bool run_pinned_nginx_custom_hide_timeout_probe(
                   << " accepted=" << live_accepted << " requests=" << live_requests
                   << " peer-closes=" << live_peer_closes
                   << " protocol-clean=" << live_protocol_clean << "\n";
+        dump_wire("DIAGNOSTIC #270 initial-expiry-ledger",
+                  std::vector<char>(access.begin(), access.end()));
+        dump_wire("DIAGNOSTIC #270 live-expiry-ledger",
+                  std::vector<char>(live_access.begin(), live_access.end()));
     }
     close(client);
     origin.stop();
@@ -73391,13 +73408,16 @@ static bool run_pinned_nginx_custom_hide_timeout_probe(
     const bool nginx_stopped = stop_child(nginx.child);
     const bool removed = docker.remove();
     std::string final_access;
+    std::string cleanup_access_error;
     const bool final_access_read =
-        read_request_length_access_file(temp.nginx_access_log, final_access, error);
+        read_request_length_access_file(temp.nginx_access_log, final_access, cleanup_access_error);
     if (expiry_gate_failed) {
         std::cerr << "DIAGNOSTIC #270 post-cleanup-expiry-access frontend="
                   << (generated_rut ? "RUT" : "nginx") << " read=" << final_access_read
                   << " bytes=" << final_access.size() << " exact-60=" << (final_access == "60\n")
-                  << "\n";
+                  << " cleanup-read-error=" << cleanup_access_error << "\n";
+        dump_wire("DIAGNOSTIC #270 post-cleanup-expiry-ledger",
+                  std::vector<char>(final_access.begin(), final_access.end()));
     }
     if (!nginx_stopped || !removed || reservations.fds[0] >= 0 || reservations.fds[1] >= 0 ||
         origin.thread_alive.load(std::memory_order_acquire) || origin.listen_fd >= 0 ||
@@ -73405,7 +73425,13 @@ static bool run_pinned_nginx_custom_hide_timeout_probe(
         origin.requests.load(std::memory_order_acquire) != 1u || origin.history.size() != 1u ||
         origin.response_fragments_sent.load(std::memory_order_acquire) != 2u ||
         expected_upstream_bytes.size() != 60u || !final_access_read || final_access != "60\n") {
-        if (error.empty()) error = "#270 custom-hide timeout probe cleanup/history was not exact";
+        if (expiry_gate_failed) {
+            error = expiry_failure_error;
+        } else if (error.empty()) {
+            error = cleanup_access_error.empty()
+                        ? "#270 custom-hide timeout probe cleanup/history was not exact"
+                        : cleanup_access_error;
+        }
         return false;
     }
     if (pair != nullptr) {
