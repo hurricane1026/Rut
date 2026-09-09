@@ -21388,9 +21388,75 @@ TEST(nginx_converter_issue270, custom_hide_header_and_timeout_lower_together) {
     const auto forged_timeout = nginx::lower_to_rut(forged);
     REQUIRE_FALSE(forged_timeout);
     CHECK(forged_timeout.error().detail.eq(lit_str("invalid proxy_read_timeout source syntax")));
+    for (const u32 milliseconds : {1500u, 2000u}) {
+        forged = profile.value().server;
+        forged.location.proxy_read_timeout.milliseconds = milliseconds;
+        const auto rejected = nginx::lower_to_rut(forged);
+        REQUIRE_FALSE(rejected);
+        CHECK(rejected.error().detail.eq(lit_str("invalid proxy_read_timeout source syntax")));
+    }
+    forged = profile.value().server;
+    forged.location.proxy_read_timeout.present = false;
+    const auto absent_timeout = nginx::lower_to_rut(forged);
+    REQUIRE_FALSE(absent_timeout);
+    CHECK(absent_timeout.error().detail.eq(lit_str("invalid absent proxy_read_timeout model")));
+    forged = profile.value().server;
+    forged.location.proxy_read_timeout = {};
+    forged.location.proxy_read_timeout.span =
+        profile.value().server.location.proxy_hide_header.span;
+    forged.location.proxy_read_timeout.value_span =
+        profile.value().server.location.proxy_hide_header.name_span;
+    const auto redirected_timeout = nginx::lower_to_rut(forged);
+    REQUIRE_FALSE(redirected_timeout);
+    CHECK(redirected_timeout.error().detail.eq(lit_str("invalid absent proxy_read_timeout model")));
+    std::string sibling_source = direct_source;
+    const auto sibling =
+        nginx::parse({sibling_source.data(), static_cast<u32>(sibling_source.size())});
+    REQUIRE(sibling);
+    forged = direct.value();
+    forged.location.proxy_hide_header.name.ptr =
+        sibling.value().location.proxy_hide_header.name.ptr;
+    const auto cross_source_name = nginx::lower_to_rut(forged);
+    REQUIRE_FALSE(cross_source_name);
+    CHECK(cross_source_name.error().detail.eq(
+        lit_str("invalid proxy_hide_header source provenance")));
     const std::string profile_owned = profile_output;
     std::fill(profile_source.begin(), profile_source.end(), 'x');
     CHECK_EQ(std::string(profile_lowered.value().data, profile_lowered.value().len), profile_owned);
+    profile_source = make_request_length_http_profile("/logs/access.log", server_content);
+    std::string server_owned;
+    {
+        std::string scoped_source = direct_source;
+        const auto scoped =
+            nginx::parse({scoped_source.data(), static_cast<u32>(scoped_source.size())});
+        REQUIRE(scoped);
+        const auto lowered = nginx::lower_to_rut(scoped.value());
+        REQUIRE(lowered);
+        server_owned.assign(lowered.value().data, lowered.value().len);
+    }
+    CHECK_EQ(server_owned, std::string(direct_lowered.value().data, direct_lowered.value().len));
+    std::string http_owned;
+    {
+        std::string scoped_source = profile_source;
+        const auto scoped = nginx::parse_http_profile(
+            {scoped_source.data(), static_cast<u32>(scoped_source.size())});
+        REQUIRE(scoped);
+        const auto lowered = nginx::lower_to_rut(scoped.value());
+        REQUIRE(lowered);
+        http_owned.assign(lowered.value().data, lowered.value().len);
+    }
+    CHECK_EQ(http_owned, profile_owned);
+    std::string fullfile_owned;
+    {
+        std::string scoped_source = "events {} " + profile_source;
+        const auto scoped = nginx::parse_nginx_http_config(
+            {scoped_source.data(), static_cast<u32>(scoped_source.size())});
+        REQUIRE(scoped);
+        const auto lowered = nginx::lower_to_rut(scoped.value());
+        REQUIRE(lowered);
+        fullfile_owned.assign(lowered.value().data, lowered.value().len);
+    }
+    CHECK_EQ(fullfile_owned, profile_owned);
     const std::string maximum_source =
         "server { listen 127.0.0.1:65535; location / { proxy_hide_header " + name +
         "; proxy_read_timeout 63s; proxy_pass http://255.255.255.255:65535; } }";
@@ -21411,6 +21477,7 @@ TEST(nginx_converter_issue270, custom_hide_header_and_timeout_lower_together) {
     const auto maximum_profile_lowered = nginx::lower_to_rut(maximum_profile.value());
     REQUIRE(maximum_profile_lowered);
     CHECK_LT(maximum_profile_lowered.value().len, nginx::HttpProfileRutSource::kCapacity);
+    CHECK_EQ(maximum_profile_lowered.value().data[maximum_profile_lowered.value().len], '\0');
     const char no_timeout[] =
         "server { listen 127.0.0.1:8080; location / { proxy_hide_header X-Compat-Hidden; "
         "proxy_pass http://127.0.0.1:9000; } }";
