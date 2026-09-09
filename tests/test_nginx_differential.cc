@@ -25883,7 +25883,8 @@ static bool run_nginx_coalesced_ingress_gate_evidence(u16 frontend_port,
     }
     socklen_t local_length = sizeof(local);
     if (getsockname(client.fd, reinterpret_cast<sockaddr*>(&local), &local_length) != 0 ||
-        local_length < sizeof(local) || local.sin_family != AF_INET || local.sin_port == 0) {
+        local_length < sizeof(local) || local.sin_family != AF_INET ||
+        local.sin_addr.s_addr != htonl(INADDR_LOOPBACK) || local.sin_port == 0) {
         error = "failed to publish the pre-connect coalesced-ingress peer identity";
         return false;
     }
@@ -26544,16 +26545,29 @@ static bool run_rut_iouring_gate_spike(u16 frontend_port,
         return false;
     }
 
-    client.fd = connect_once(frontend_port);
+    client.fd = socket(AF_INET, SOCK_STREAM, 0);
     if (client.fd < 0) {
-        error = "failed to connect RUT io_uring target downstream";
+        error = "failed to create RUT io_uring target downstream client";
         return false;
     }
     sockaddr_in local{};
+    local.sin_family = AF_INET;
+    local.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    local.sin_port = 0;
+    if (bind(client.fd, reinterpret_cast<sockaddr*>(&local), sizeof(local)) != 0) {
+        error = "failed to bind RUT io_uring target downstream client";
+        return false;
+    }
     socklen_t local_length = sizeof(local);
     if (getsockname(client.fd, reinterpret_cast<sockaddr*>(&local), &local_length) != 0 ||
-        local_length < sizeof(local) || local.sin_family != AF_INET) {
-        error = "failed to resolve RUT target peer identity";
+        local_length < sizeof(local) || local.sin_family != AF_INET || local.sin_port == 0) {
+        error = "failed to resolve bound RUT target peer identity";
+        return false;
+    }
+    timeval timeout{2, 0};
+    if (setsockopt(client.fd, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout)) != 0 ||
+        setsockopt(client.fd, SOL_SOCKET, SO_SNDTIMEO, &timeout, sizeof(timeout)) != 0) {
+        error = "failed to configure RUT io_uring target client timeouts";
         return false;
     }
     mapping.gate->target_peer_ipv4_be = local.sin_addr.s_addr;
@@ -26571,6 +26585,14 @@ static bool run_rut_iouring_gate_spike(u16 frontend_port,
         return false;
     }
     rut_downstream_gate_wake(&mapping.gate->state);
+    sockaddr_in frontend{};
+    frontend.sin_family = AF_INET;
+    frontend.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    frontend.sin_port = htons(frontend_port);
+    if (connect(client.fd, reinterpret_cast<sockaddr*>(&frontend), sizeof(frontend)) != 0) {
+        error = "failed to connect RUT io_uring target downstream";
+        return false;
+    }
     if (!send_all(client.fd, request_one, request_one_length)) {
         error = "failed to send RUT io_uring request 1";
         return false;
