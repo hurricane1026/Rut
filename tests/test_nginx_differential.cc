@@ -73135,7 +73135,8 @@ static bool run_pinned_nginx_custom_hide_timeout_probe(
     const char* converter_path = nullptr,
     CustomHideTimeoutPairContext* pair = nullptr,
     CustomHideTimeoutObservation* observation = nullptr,
-    const char* custom_hide_name = "X-Powered-By") {
+    const char* custom_hide_name = "X-Powered-By",
+    bool explicit_buffering_on = false) {
     const bool generated_rut = rut_path != nullptr || converter_path != nullptr;
     if (pair != nullptr && observation == nullptr) {
         error = "#270 custom-hide pair requires an observation output";
@@ -73189,12 +73190,13 @@ static bool run_pinned_nginx_custom_hide_timeout_probe(
         ";\n"
         "      proxy_hide_header " +
         std::string(custom_hide_name) +
-        ";\n      proxy_read_timeout 1s;\n"
+        ";\n      proxy_read_timeout 1s;\n" +
+        (explicit_buffering_on ? "      proxy_buffering on;\n" : "") +
         "    }\n  }\n}\n";
     if (count_text(config, "events {}\n") != 1u ||
         count_text(config, "proxy_hide_header " + std::string(custom_hide_name) + ";\n") != 1u ||
         count_text(config, "proxy_read_timeout 1s;\n") != 1u ||
-        count_text(config, "proxy_buffering") != 0u ||
+        count_text(config, "proxy_buffering") != (explicit_buffering_on ? 1u : 0u) ||
         (pair != nullptr && pair->initialized
              ? !read_exact_return204_log(temp.nginx_config,
                                          "#270 pair config before RUT",
@@ -74226,6 +74228,89 @@ static bool run_pinned_nginx_custom_hide_timeout_probe(
             origin.response_peer_close_count.load(std::memory_order_acquire);
     }
     return error.empty();
+}
+
+static bool run_pinned_nginx_custom_hide_timeout_explicit_buffering_oracle(std::string& error) {
+    const auto equal = [](const CustomHideTimeoutObservation& lhs,
+                          const CustomHideTimeoutObservation& rhs) {
+        return lhs.downstream == rhs.downstream && lhs.upstream == rhs.upstream &&
+               lhs.access == rhs.access && lhs.eof == rhs.eof && lhs.retired == rhs.retired &&
+               lhs.stable == rhs.stable && lhs.accepted == rhs.accepted &&
+               lhs.requests == rhs.requests && lhs.peer_close_count == rhs.peer_close_count;
+    };
+    for (bool completion : {false, true}) {
+        CustomHideTimeoutPairContext omitted_pair;
+        CustomHideTimeoutPairContext explicit_pair;
+        CustomHideTimeoutObservation omitted;
+        CustomHideTimeoutObservation explicit_on;
+        if (!omitted_pair.temp.create() || !explicit_pair.temp.create() ||
+            !run_pinned_nginx_custom_hide_timeout_probe(
+                "rut-nginx-621-omitted-" + std::to_string(getpid()),
+                error,
+                completion,
+                nullptr,
+                nullptr,
+                &omitted_pair,
+                &omitted))
+            return false;
+        explicit_pair.frontend_port = omitted_pair.frontend_port;
+        explicit_pair.backend_port = omitted_pair.backend_port;
+        explicit_pair.config = omitted_pair.config;
+        const size_t access_at = explicit_pair.config.find(omitted_pair.temp.nginx_access_log);
+        if (access_at == std::string::npos) {
+            error = "#621 omitted oracle config lacked its owned access path";
+            return false;
+        }
+        explicit_pair.config.replace(access_at,
+                                     omitted_pair.temp.nginx_access_log.size(),
+                                     explicit_pair.temp.nginx_access_log);
+        const size_t close_at = explicit_pair.config.rfind("    }\n  }\n}\n");
+        if (close_at == std::string::npos) {
+            error = "#621 omitted oracle config lacked its frozen location terminator";
+            return false;
+        }
+        explicit_pair.config.insert(close_at, "      proxy_buffering on;\n");
+        explicit_pair.config_snapshot = explicit_pair.config;
+        explicit_pair.initialized = true;
+        if (!write_file(explicit_pair.temp.nginx_config,
+                        explicit_pair.config.data(),
+                        explicit_pair.config.size())) {
+            error = "#621 explicit oracle config could not be frozen";
+            return false;
+        }
+        if (!run_pinned_nginx_custom_hide_timeout_probe(
+                "rut-nginx-621-explicit-on-" + std::to_string(getpid()),
+                error,
+                completion,
+                nullptr,
+                nullptr,
+                &explicit_pair,
+                &explicit_on,
+                "X-Powered-By",
+                true))
+            return false;
+        const std::string expected_difference = "      proxy_buffering on;\n";
+        std::string explicit_without_directive = explicit_pair.config;
+        const size_t directive_at = explicit_without_directive.find(expected_difference);
+        if (directive_at != std::string::npos)
+            explicit_without_directive.erase(directive_at, expected_difference.size());
+        const size_t explicit_access_at =
+            explicit_without_directive.find(explicit_pair.temp.nginx_access_log);
+        if (explicit_access_at != std::string::npos)
+            explicit_without_directive.replace(explicit_access_at,
+                                               explicit_pair.temp.nginx_access_log.size(),
+                                               omitted_pair.temp.nginx_access_log);
+        if (omitted_pair.config == explicit_pair.config ||
+            explicit_without_directive != omitted_pair.config ||
+            explicit_pair.config.find(expected_difference) == std::string::npos ||
+            omitted_pair.config.find("proxy_buffering") != std::string::npos ||
+            explicit_pair.config.find("proxy_buffering") == std::string::npos ||
+            !equal(omitted, explicit_on)) {
+            error = "#621 pinned nginx omitted/explicit proxy_buffering observations or configs differed";
+            return false;
+        }
+    }
+    return true;
 }
 
 static bool run_pinned_nginx_custom_hide_timeout_cli_differential(const char* rut_path,
@@ -77246,6 +77331,8 @@ int main(int argc, char** argv) {
                             "oracle") == 0;
     const bool pinned_nginx_explicit_buffering_on_baseline_oracle =
         argc == 2 && strcmp(argv[1], "--pinned-nginx-explicit-buffering-on-baseline-oracle") == 0;
+    const bool pinned_nginx_custom_hide_timeout_explicit_buffering_oracle =
+        argc == 2 && strcmp(argv[1], "--pinned-nginx-custom-hide-timeout-explicit-buffering-oracle") == 0;
     const bool pinned_nginx_default_buffering_201_incomplete_body_inactivity_expiry_oracle =
         argc == 2 &&
         strcmp(argv[1],
@@ -77548,6 +77635,7 @@ int main(int argc, char** argv) {
          !pinned_nginx_default_buffering_three_publication_completion_oracle &&
          !pinned_nginx_default_buffering_third_body_progress_expiry_oracle &&
          !pinned_nginx_explicit_buffering_on_baseline_oracle &&
+         !pinned_nginx_custom_hide_timeout_explicit_buffering_oracle &&
          !pinned_nginx_default_buffering_201_incomplete_body_inactivity_expiry_oracle &&
          !pinned_nginx_default_buffering_202_incomplete_body_inactivity_expiry_oracle &&
          !pinned_nginx_default_buffering_304_content_length_metadata_oracle &&
@@ -78210,6 +78298,17 @@ int main(int argc, char** argv) {
             return 1;
         }
         std::cerr << "PASS: #270 custom-hide timeout completion observed W1/W2/W3 and full wire\n";
+        return 0;
+    }
+    if (pinned_nginx_custom_hide_timeout_explicit_buffering_oracle) {
+        std::string oracle_error;
+        if (!run_pinned_nginx_custom_hide_timeout_explicit_buffering_oracle(oracle_error)) {
+            std::cerr << "FAIL [#621 pinned nginx explicit proxy_buffering oracle]: "
+                      << oracle_error << "\n";
+            return 1;
+        }
+        std::cerr << "PASS: #621 pinned nginx omitted and explicit proxy_buffering on "
+                     "custom-hide timeout expiry/completion matched\n";
         return 0;
     }
     if (converter_custom_hide_timeout_cli_differential) {
