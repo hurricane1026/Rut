@@ -32771,6 +32771,63 @@ static constexpr char kProxyHideHeaderNameOracleResponseNormalized[] =
 static_assert(sizeof(kProxyHideHeaderNameOracleOriginResponse) - 1u == 178u);
 static_assert(sizeof(kProxyHideHeaderNameOracleResponseNormalized) - 1u == 141u);
 
+struct ProxyHideHeaderWire {
+    const char* name;
+    const char* origin_response;
+    size_t origin_response_size;
+    const char* normalized_response;
+    size_t normalized_response_size;
+};
+
+static constexpr char kProxyHideHeaderBoundary3Name[] = "X-A";
+static constexpr char kProxyHideHeaderBoundary3Origin[] =
+    "HTTP/1.1 200 OK\r\n"
+    "Date: Wed, 26 Aug 2026 23:57:18 GMT\r\n"
+    "Server: origin\r\n"
+    "X-A: first\r\n"
+    "x-a: second\r\n"
+    "X-Unrelated: retained\r\n"
+    "Content-Length: 2\r\n"
+    "Connection: close\r\n"
+    "\r\n"
+    "OK";
+static constexpr char kProxyHideHeaderBoundary46Name[] =
+    "x-Ab9_-Ab9_-Ab9_-Ab9_-Ab9_-Ab9_-Ab9_-Ab9_-Cd0E";
+static constexpr char kProxyHideHeaderBoundary46Origin[] =
+    "HTTP/1.1 200 OK\r\n"
+    "Date: Wed, 26 Aug 2026 23:57:18 GMT\r\n"
+    "Server: origin\r\n"
+    "x-Ab9_-Ab9_-Ab9_-Ab9_-Ab9_-Ab9_-Ab9_-Ab9_-Cd0E: first\r\n"
+    "x-ab9_-ab9_-ab9_-ab9_-ab9_-ab9_-ab9_-ab9_-cd0e: second\r\n"
+    "X-Unrelated: retained\r\n"
+    "Content-Length: 2\r\n"
+    "Connection: close\r\n"
+    "\r\n"
+    "OK";
+static_assert(sizeof(kProxyHideHeaderBoundary3Name) - 1u == 3u);
+static_assert(sizeof(kProxyHideHeaderBoundary46Name) - 1u == 46u);
+static_assert(sizeof(kProxyHideHeaderBoundary3Origin) - 1u == 160u);
+static_assert(sizeof(kProxyHideHeaderBoundary46Origin) - 1u == 246u);
+
+static constexpr ProxyHideHeaderWire kProxyHideHeaderNameOracleWire{
+    "X-Powered-By",
+    kProxyHideHeaderNameOracleOriginResponse,
+    sizeof(kProxyHideHeaderNameOracleOriginResponse) - 1u,
+    kProxyHideHeaderNameOracleResponseNormalized,
+    sizeof(kProxyHideHeaderNameOracleResponseNormalized) - 1u};
+static constexpr ProxyHideHeaderWire kProxyHideHeaderBoundary3Wire{
+    kProxyHideHeaderBoundary3Name,
+    kProxyHideHeaderBoundary3Origin,
+    sizeof(kProxyHideHeaderBoundary3Origin) - 1u,
+    kProxyHideHeaderNameOracleResponseNormalized,
+    sizeof(kProxyHideHeaderNameOracleResponseNormalized) - 1u};
+static constexpr ProxyHideHeaderWire kProxyHideHeaderBoundary46Wire{
+    kProxyHideHeaderBoundary46Name,
+    kProxyHideHeaderBoundary46Origin,
+    sizeof(kProxyHideHeaderBoundary46Origin) - 1u,
+    kProxyHideHeaderNameOracleResponseNormalized,
+    sizeof(kProxyHideHeaderNameOracleResponseNormalized) - 1u};
+
 static bool read_proxy_hide_header_access(const std::string& path,
                                           std::string& contents,
                                           std::string& error) {
@@ -51871,7 +51928,8 @@ static bool run_pinned_retained_header_whitespace_oracle(
     bool default_log = false,
     u16 fixed_frontend_port = 0u,
     u16 fixed_backend_port = 0u,
-    const char* proxy_hide_header_name = nullptr) {
+    const char* proxy_hide_header_name = nullptr,
+    const ProxyHideHeaderWire* custom_wire = nullptr) {
     const char* kDiagnostic = (access_log_off || default_log)
                                   ? "#591 pinned nginx Off/default access oracle"
                                   : "#252 pinned retained-header whitespace oracle";
@@ -51883,13 +51941,13 @@ static bool run_pinned_retained_header_whitespace_oracle(
         "Content-Length: 2\r\n"
         "Connection: close\r\n\r\n"
         "ok";
-    const char* expected_downstream = proxy_hide_header_name == nullptr
-                                          ? kExpectedDownstream
-                                          : kProxyHideHeaderNameOracleResponseNormalized;
-    const size_t expected_downstream_size =
-        proxy_hide_header_name == nullptr
-            ? sizeof(kExpectedDownstream) - 1u
-            : sizeof(kProxyHideHeaderNameOracleResponseNormalized) - 1u;
+    const ProxyHideHeaderWire& wire =
+        custom_wire == nullptr ? kProxyHideHeaderNameOracleWire : *custom_wire;
+    const char* expected_downstream =
+        proxy_hide_header_name == nullptr ? kExpectedDownstream : wire.normalized_response;
+    const size_t expected_downstream_size = proxy_hide_header_name == nullptr
+                                                ? sizeof(kExpectedDownstream) - 1u
+                                                : wire.normalized_response_size;
 
     HeldLoopbackPorts reservations;
     u16 frontend_port = 0u;
@@ -51974,11 +52032,9 @@ static bool run_pinned_retained_header_whitespace_oracle(
     if (!handoff_held_loopback_port(&reservations.fds[1], backend_port, kDiagnostic, error) ||
         !origin.setup(backend_port,
                       1u,
-                      proxy_hide_header_name == nullptr ? kBackendResponse
-                                                        : kProxyHideHeaderNameOracleOriginResponse,
-                      proxy_hide_header_name == nullptr
-                          ? sizeof(kBackendResponse) - 1u
-                          : sizeof(kProxyHideHeaderNameOracleOriginResponse) - 1u)) {
+                      proxy_hide_header_name == nullptr ? kBackendResponse : wire.origin_response,
+                      proxy_hide_header_name == nullptr ? sizeof(kBackendResponse) - 1u
+                                                        : wire.origin_response_size)) {
         if (error.empty()) error = std::string(kDiagnostic) + " origin setup failed";
         return false;
     }
@@ -53039,20 +53095,22 @@ static bool run_converter_retained_off_source_self_checks(const std::string& sou
     return true;
 }
 
-static bool run_converter_request_length_rut_side(TempDir& temp,
-                                                  const char* rut_path,
-                                                  HeldLoopbackPorts& reservations,
-                                                  u16 frontend_port,
-                                                  u16 backend_port,
-                                                  bool split_header_delivery,
-                                                  bool retained_header_whitespace,
-                                                  RetainedHeaderObservation* observation,
-                                                  std::string& error,
-                                                  const char* converter_path = nullptr,
-                                                  bool complete_file = false,
-                                                  bool access_log_off = false,
-                                                  const char* proxy_hide_header_name = nullptr,
-                                                  std::string* generated_source = nullptr) {
+static bool run_converter_request_length_rut_side(
+    TempDir& temp,
+    const char* rut_path,
+    HeldLoopbackPorts& reservations,
+    u16 frontend_port,
+    u16 backend_port,
+    bool split_header_delivery,
+    bool retained_header_whitespace,
+    RetainedHeaderObservation* observation,
+    std::string& error,
+    const char* converter_path = nullptr,
+    bool complete_file = false,
+    bool access_log_off = false,
+    const char* proxy_hide_header_name = nullptr,
+    std::string* generated_source = nullptr,
+    const ProxyHideHeaderWire* custom_wire = nullptr) {
     const bool custom_hide_header = proxy_hide_header_name != nullptr;
     if (complete_file && (converter_path == nullptr || !retained_header_whitespace)) {
         error = "#583 complete-file mode requires the standalone nginx-http CLI and retained slice";
@@ -53339,19 +53397,18 @@ static bool run_converter_request_length_rut_side(TempDir& temp,
     RecorderGuard backend_guard{&backend};
     backend.wait_response_peer_close = require_peer_retirement;
     backend.observe_extra_requests_until_stop = true;
-    const char* expected_origin = proxy_hide_header_name == nullptr
-                                      ? kBackendResponse
-                                      : kProxyHideHeaderNameOracleOriginResponse;
+    const ProxyHideHeaderWire& wire =
+        custom_wire == nullptr ? kProxyHideHeaderNameOracleWire : *custom_wire;
+    const char* expected_origin =
+        proxy_hide_header_name == nullptr ? kBackendResponse : wire.origin_response;
     const size_t expected_origin_size = proxy_hide_header_name == nullptr
                                             ? sizeof(kBackendResponse) - 1u
-                                            : sizeof(kProxyHideHeaderNameOracleOriginResponse) - 1u;
-    const char* expected_normalized = proxy_hide_header_name == nullptr
-                                          ? kSuccessResponseNormalized
-                                          : kProxyHideHeaderNameOracleResponseNormalized;
-    const size_t expected_normalized_size =
-        proxy_hide_header_name == nullptr
-            ? sizeof(kSuccessResponseNormalized) - 1u
-            : sizeof(kProxyHideHeaderNameOracleResponseNormalized) - 1u;
+                                            : wire.origin_response_size;
+    const char* expected_normalized =
+        proxy_hide_header_name == nullptr ? kSuccessResponseNormalized : wire.normalized_response;
+    const size_t expected_normalized_size = proxy_hide_header_name == nullptr
+                                                ? sizeof(kSuccessResponseNormalized) - 1u
+                                                : wire.normalized_response_size;
     if (!handoff_held_loopback_port(
             &reservations.fds[1], backend_port, "#362 generated RUT Recorder bind", error) ||
         !backend.setup(backend_port, 1u, expected_origin, expected_origin_size)) {
@@ -53771,7 +53828,8 @@ static bool run_converter_retained_header_whitespace_differential(
     bool complete_file = false,
     const char* proxy_hide_header_name = nullptr,
     std::string* generated_source_out = nullptr,
-    RetainedHeaderObservation* generated_observation_out = nullptr) {
+    RetainedHeaderObservation* generated_observation_out = nullptr,
+    const ProxyHideHeaderWire* custom_wire = nullptr) {
     HeldLoopbackPorts rut_reservations;
     u16 rut_frontend_port = 0u;
     u16 rut_backend_port = 0u;
@@ -53794,7 +53852,8 @@ static bool run_converter_retained_header_whitespace_differential(
                                                       false,
                                                       0u,
                                                       0u,
-                                                      proxy_hide_header_name))
+                                                      proxy_hide_header_name,
+                                                      custom_wire))
         return false;
     if (complete_file) {
         rut_frontend_port = temp.retained_frontend_port;
@@ -53838,7 +53897,8 @@ static bool run_converter_retained_header_whitespace_differential(
                                                complete_file,
                                                false,
                                                proxy_hide_header_name,
-                                               &generated_source))
+                                               &generated_source,
+                                               custom_wire))
         return false;
     if (!compare_retained_header_observations(nginx_observation,
                                               generated_observation,
@@ -53851,10 +53911,14 @@ static bool run_converter_retained_header_whitespace_differential(
     return true;
 }
 
-static bool run_converter_proxy_hide_header_name_differential(const char* rut_path,
-                                                              const char* converter_path,
-                                                              std::string& error) {
-    static constexpr char kName[] = "X-Powered-By";
+static bool run_converter_proxy_hide_header_name_differential(
+    const char* rut_path,
+    const char* converter_path,
+    std::string& error,
+    const char* custom_name = nullptr,
+    const ProxyHideHeaderWire* custom_wire = nullptr) {
+    static constexpr char kDefaultName[] = "X-Powered-By";
+    const char* kName = custom_name == nullptr ? kDefaultName : custom_name;
     if (rut_path == nullptr || converter_path == nullptr) {
         error = "#600 custom proxy_hide_header differential requires RUT and converter executables";
         return false;
@@ -53877,7 +53941,8 @@ static bool run_converter_proxy_hide_header_name_differential(const char* rut_pa
                                                                true,
                                                                kName,
                                                                &generated_source,
-                                                               &generated_observation))
+                                                               &generated_observation,
+                                                               custom_wire))
         return false;
     if (generated_source.empty()) {
         error = "#600 generated custom-hide source was not captured before source poisoning";
@@ -53896,15 +53961,28 @@ static bool run_converter_proxy_hide_header_name_differential(const char* rut_pa
     };
     if (!compare_retained_header_observations(baseline, baseline, error, true, 66u)) return false;
     RetainedHeaderObservation changed = baseline;
-    std::string leaked(changed.response.begin(), changed.response.end());
-    const size_t unrelated_at = leaked.find("X-Unrelated: retained");
+    const std::string baseline_response(baseline.response.begin(), baseline.response.end());
+    const size_t unrelated_at = baseline_response.find("X-Unrelated: retained");
     if (unrelated_at == std::string::npos) {
         error = "#600 custom-hide response mutation fixture lacked X-Unrelated";
         return false;
     }
-    leaked.insert(unrelated_at, "X-Powered-By: leaked\r\n");
-    changed.response.assign(leaked.begin(), leaked.end());
-    if (!rejects_observation(changed, "hidden-header-leak")) return false;
+    std::string lower_name(kName);
+    std::string upper_name(kName);
+    for (char& byte : lower_name) {
+        if (byte >= 'A' && byte <= 'Z') byte = static_cast<char>(byte - 'A' + 'a');
+    }
+    for (char& byte : upper_name) {
+        if (byte >= 'a' && byte <= 'z') byte = static_cast<char>(byte - 'a' + 'A');
+    }
+    const std::string leak_names[] = {lower_name, upper_name};
+    for (const std::string& leak_name : leak_names) {
+        changed = baseline;
+        std::string leaked = baseline_response;
+        leaked.insert(unrelated_at, leak_name + ": leaked\r\n");
+        changed.response.assign(leaked.begin(), leaked.end());
+        if (!rejects_observation(changed, "hidden-header-case-leak")) return false;
+    }
     changed = baseline;
     std::string unrelated(changed.response.begin(), changed.response.end());
     unrelated.erase(unrelated_at, strlen("X-Unrelated: retained"));
@@ -53925,8 +54003,8 @@ static bool run_converter_proxy_hide_header_name_differential(const char* rut_pa
     const std::string connection = "Connection: close\r\n";
     const size_t content_at =
         std::string(changed.response.begin(), changed.response.end()).find(content_length);
-    const std::string baseline_response(changed.response.begin(), changed.response.end());
-    const size_t connection_at = baseline_response.find(connection);
+    const std::string ordered_baseline_response(changed.response.begin(), changed.response.end());
+    const size_t connection_at = ordered_baseline_response.find(connection);
     if (content_at == std::string::npos || connection_at == std::string::npos ||
         connection_at != content_at + content_length.size()) {
         error = "#600 custom-hide response mutation fixture lacked ordered headers";
@@ -53990,6 +54068,88 @@ static bool run_converter_proxy_hide_header_name_differential(const char* rut_pa
     if (!rejects(candidate, "alternate-upstream")) return false;
     candidate = generated_source + "\nroute POST \"/\" { return 204 }\n";
     return rejects(candidate, "unexpected-local-response-route");
+}
+
+static bool run_converter_proxy_hide_header_boundary_differential(const char* rut_path,
+                                                                  const char* converter_path,
+                                                                  std::string& error) {
+    const ProxyHideHeaderWire wires[] = {kProxyHideHeaderBoundary3Wire,
+                                         kProxyHideHeaderBoundary46Wire};
+    for (const ProxyHideHeaderWire& wire : wires) {
+        if (!run_converter_proxy_hide_header_name_differential(
+                rut_path, converter_path, error, wire.name, &wire))
+            return false;
+    }
+
+    TempDir temp;
+    if (!temp.create()) {
+        error = "#600 boundary CLI rejection could not create a temporary directory";
+        return false;
+    }
+    struct InvalidBoundaryName {
+        std::string name;
+        const char* detail;
+    };
+    const InvalidBoundaryName invalid_names[] = {
+        {"X-" + std::string(45u, 'A'),
+         "proxy_hide_header name is outside the bounded header-name profile"},
+        {"X-Pad", "proxy_hide_header name is outside the bounded header-name profile"},
+        {"X-Accel-Redirect", "proxy_hide_header name is outside the bounded header-name profile"}};
+    for (const InvalidBoundaryName& invalid : invalid_names) {
+        const std::string& name = invalid.name;
+        const std::string config =
+            "events {}\n" + make_converter_request_length_profile(
+                                8080u, 9000u, temp.nginx_access_log, name.c_str());
+        if (!write_file(temp.nginx_config, config.data(), config.size())) {
+            error = "#600 boundary CLI rejection could not persist input";
+            return false;
+        }
+        const int output_fd = open(temp.source.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0600);
+        const std::string diagnostics_path = temp.rut_log + ".boundary-negative";
+        const int error_fd = open(diagnostics_path.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0600);
+        if (output_fd < 0 || error_fd < 0) {
+            if (output_fd >= 0) close(output_fd);
+            if (error_fd >= 0) close(error_fd);
+            error = "#600 boundary CLI rejection could not open output files";
+            return false;
+        }
+        ChildGuard child;
+        const pid_t pid = fork();
+        if (pid == 0) {
+            if (dup2(output_fd, STDOUT_FILENO) < 0 || dup2(error_fd, STDERR_FILENO) < 0) _exit(127);
+            close(output_fd);
+            close(error_fd);
+            execl(converter_path,
+                  converter_path,
+                  "--format",
+                  "nginx-http",
+                  temp.nginx_config.c_str(),
+                  nullptr);
+            _exit(127);
+        }
+        close(output_fd);
+        close(error_fd);
+        if (pid < 0) {
+            error = "#600 boundary CLI rejection could not fork converter";
+            return false;
+        }
+        child.child.pid = pid;
+        std::string output;
+        std::string diagnostics;
+        if (!wait_child(child.child, 10'000) || !child.child.status_valid ||
+            !WIFEXITED(child.child.status) || WEXITSTATUS(child.child.status) != 1 ||
+            !read_exact_return204_log(temp.source, "#600 boundary CLI stdout", output, error) ||
+            !output.empty() || !read_bounded_file(diagnostics_path, diagnostics, error) ||
+            diagnostics.find(temp.nginx_config + ":") == std::string::npos ||
+            diagnostics.find(":9:") == std::string::npos ||
+            diagnostics.find(invalid.detail) == std::string::npos) {
+            error =
+                "#600 boundary CLI rejection did not produce exit 1, empty stdout, and a "
+                "file:line:column diagnostic";
+            return false;
+        }
+    }
+    return true;
 }
 
 static bool run_converter_retained_access_log_off_four_phase(const char* rut_path,
@@ -74678,6 +74838,8 @@ int main(int argc, char** argv) {
         argc == 4 && strcmp(argv[1], "--converter-retained-access-log-off-four-phase") == 0;
     const bool converter_proxy_hide_header_name_differential =
         argc == 4 && strcmp(argv[1], "--converter-proxy-hide-header-name-differential") == 0;
+    const bool converter_proxy_hide_header_boundaries =
+        argc == 4 && strcmp(argv[1], "--converter-proxy-hide-header-boundaries") == 0;
     const bool converter_request_length_fixed_body_differential =
         argc == 3 && strcmp(argv[1], "--converter-request-length-fixed-body-differential") == 0;
     const bool converter_request_length_split_fixed_body_differential =
@@ -74902,6 +75064,7 @@ int main(int argc, char** argv) {
          !converter_complete_file_retained_differential &&
          !converter_retained_access_log_off_four_phase &&
          !converter_proxy_hide_header_name_differential &&
+         !converter_proxy_hide_header_boundaries &&
          !converter_request_length_fixed_body_differential &&
          !converter_request_length_split_fixed_body_differential &&
          !exact_loopback_return204_oracle && !exact_loopback_bodyful_return_oracle &&
@@ -74997,7 +75160,8 @@ int main(int argc, char** argv) {
         (converter_request_length_split_header_differential && argv[2][0] != '/') ||
         ((converter_retained_header_whitespace_differential ||
           converter_complete_file_retained_differential ||
-          converter_proxy_hide_header_name_differential) &&
+          converter_proxy_hide_header_name_differential ||
+          converter_proxy_hide_header_boundaries) &&
          (argv[2][0] != '/' || (argc == 4 && argv[3][0] != '/'))) ||
         (converter_request_length_fixed_body_differential && argv[2][0] != '/') ||
         (converter_request_length_split_fixed_body_differential && argv[2][0] != '/') ||
@@ -75637,7 +75801,7 @@ int main(int argc, char** argv) {
         converter_retained_header_whitespace_differential ||
         converter_complete_file_retained_differential ||
         converter_retained_access_log_off_four_phase ||
-        converter_proxy_hide_header_name_differential) {
+        converter_proxy_hide_header_name_differential || converter_proxy_hide_header_boundaries) {
         std::string self_check_error;
         if (!run_request_length_oracle_self_checks(self_check_error)) {
             std::cerr << "FAIL [#362 request-length oracle self-check]: " << self_check_error
@@ -75655,7 +75819,8 @@ int main(int argc, char** argv) {
              converter_request_length_split_header_differential ||
              (converter_retained_header_whitespace_differential ||
               converter_complete_file_retained_differential ||
-              converter_retained_access_log_off_four_phase)) &&
+              converter_retained_access_log_off_four_phase ||
+              converter_proxy_hide_header_boundaries)) &&
             !run_converter_request_length_self_checks(self_check_error)) {
             std::cerr << "FAIL [#362 converter request-length self-check]: " << self_check_error
                       << "\n";
@@ -75902,6 +76067,15 @@ int main(int argc, char** argv) {
         if (!run_proxy_hide_header_name_self_checks(self_check_error) ||
             !run_proxy_hide_header_name_config_preflight(self_check_error)) {
             std::cerr << "FAIL [#600 custom proxy-hide-header self-check]: " << self_check_error
+                      << "\n";
+            return 1;
+        }
+    }
+    if (converter_proxy_hide_header_boundaries) {
+        std::string self_check_error;
+        if (!run_proxy_hide_header_name_self_checks(self_check_error) ||
+            !run_proxy_hide_header_name_config_preflight(self_check_error)) {
+            std::cerr << "FAIL [#600 boundary proxy-hide-header self-check]: " << self_check_error
                       << "\n";
             return 1;
         }
@@ -76162,6 +76336,22 @@ int main(int argc, char** argv) {
                      "127.0.0.1 source survived source overwrite and produced one byte-exact "
                      "upstream episode, exact response/EOF and one strict access record with no "
                      "retry (generic RUT #345 capability only; no nginx/converter claim)\n";
+        return 0;
+    }
+    if (converter_proxy_hide_header_boundaries) {
+        std::string differential_error;
+        if (!run_converter_proxy_hide_header_boundary_differential(
+                argv[2], argv[3], differential_error)) {
+            std::cerr << "FAIL [#600 custom proxy-hide-header boundary differential]: "
+                      << differential_error << "\n";
+            return 1;
+        }
+        std::cerr << "PASS: #600 immutable complete nginx-http files for 3-byte X-A and the "
+                     "46-byte mixed-case/digit/underscore/hyphen name reached pinned nginx and "
+                     "the CLI-generated ordinary RUT; exact 85-byte/66-byte/141-byte custom-"
+                     "hide wire, X-Unrelated retention, 85\\n access, EOF, one origin retirement, "
+                     "no retry, 175ms stability, source mutations, and 47-byte/reserved-name "
+                     "CLI rejection were authenticated\n";
         return 0;
     }
     if (no_content204_rut_production) {
