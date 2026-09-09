@@ -802,6 +802,28 @@ struct Child {
     bool status_valid = false;
 };
 
+enum class DockerInfoOutcome { SpawnFailed, WaitFailed, TimedOut, Exited, Signaled };
+enum class DockerSnapshotState { Missing, Empty, NonEmpty, ReadError, Overflow };
+
+struct DockerInfoResult {
+    DockerInfoOutcome outcome = DockerInfoOutcome::SpawnFailed;
+    Child child;
+    bool kill_attempted = false;
+    bool kill_failed = false;
+    bool reap_failed = false;
+    bool ownership_unresolved = false;
+    bool no_waitable_child = false;
+    int error_number = 0;
+    int wait_error_number = 0;
+    int cleanup_wait_error_number = 0;
+    u64 probe_elapsed_ns = 0;
+    u64 cleanup_elapsed_ns = 0;
+    int configured_timeout_ms = 10'000;
+    std::string snapshot;
+    std::string snapshot_error;
+    DockerSnapshotState snapshot_state = DockerSnapshotState::Missing;
+};
+
 static bool poll_child(Child& child) {
     if (child.pid < 0) return child.reaped;
     if (child.reaped) return true;
@@ -868,6 +890,115 @@ static bool spawn_child(const std::vector<std::string>& args,
     child.reaped = false;
     child.status_valid = false;
     return true;
+}
+
+static bool reap_child_bounded(Child& child, int timeout_ms, int& wait_error) {
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(timeout_ms);
+    for (;;) {
+        int status = 0;
+        const pid_t rc = waitpid(child.pid, &status, WNOHANG);
+        if (rc == child.pid) {
+            child.status = status;
+            child.status_valid = true;
+            child.reaped = true;
+            return true;
+        }
+        if (rc < 0) {
+            if (errno == EINTR) {
+                if (std::chrono::steady_clock::now() >= deadline) break;
+                continue;
+            }
+            wait_error = errno;
+            return false;
+        }
+        if (std::chrono::steady_clock::now() >= deadline) break;
+        usleep(5'000);
+    }
+    return false;
+}
+
+static DockerInfoResult run_docker_info_runner(const std::vector<std::string>& args,
+                                               const std::string& log_path,
+                                               int timeout_ms = 10'000) {
+    DockerInfoResult result;
+    result.configured_timeout_ms = timeout_ms;
+    const auto started = std::chrono::steady_clock::now();
+    if (!spawn_child(args, log_path, result.child)) {
+        result.error_number = errno;
+        result.outcome = DockerInfoOutcome::SpawnFailed;
+        result.probe_elapsed_ns =
+            static_cast<u64>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                 std::chrono::steady_clock::now() - started)
+                                 .count());
+        return result;
+    }
+    const auto deadline = started + std::chrono::milliseconds(timeout_ms);
+    int wait_error = 0;
+    for (;;) {
+        int status = 0;
+        const pid_t rc = waitpid(result.child.pid, &status, WNOHANG);
+        if (rc == result.child.pid) {
+            result.child.status = status;
+            result.child.status_valid = true;
+            result.child.reaped = true;
+            if (WIFEXITED(status))
+                result.outcome = DockerInfoOutcome::Exited;
+            else if (WIFSIGNALED(status))
+                result.outcome = DockerInfoOutcome::Signaled;
+            else
+                result.outcome = DockerInfoOutcome::WaitFailed;
+            break;
+        }
+        if (rc < 0) {
+            if (errno == EINTR && std::chrono::steady_clock::now() < deadline) continue;
+            const bool deadline_eintr = errno == EINTR;
+            result.wait_error_number = errno;
+            result.outcome =
+                deadline_eintr ? DockerInfoOutcome::TimedOut : DockerInfoOutcome::WaitFailed;
+            if (errno == ECHILD) {
+                result.no_waitable_child = true;
+                result.child.status_valid = false;
+            } else {
+                result.kill_attempted = true;
+                if (kill(result.child.pid, SIGKILL) != 0 && errno != ESRCH) {
+                    result.kill_failed = true;
+                    result.error_number = errno;
+                }
+                const auto cleanup_started = std::chrono::steady_clock::now();
+                result.reap_failed =
+                    !reap_child_bounded(result.child, 2'000, result.cleanup_wait_error_number);
+                result.cleanup_elapsed_ns =
+                    static_cast<u64>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                         std::chrono::steady_clock::now() - cleanup_started)
+                                         .count());
+                result.ownership_unresolved = !result.child.reaped;
+            }
+            break;
+        }
+        if (std::chrono::steady_clock::now() >= deadline) {
+            result.outcome = DockerInfoOutcome::TimedOut;
+            result.kill_attempted = true;
+            if (kill(result.child.pid, SIGKILL) != 0 && errno != ESRCH) {
+                result.kill_failed = true;
+                result.error_number = errno;
+            }
+            const auto cleanup_started = std::chrono::steady_clock::now();
+            result.reap_failed =
+                !reap_child_bounded(result.child, 2'000, result.cleanup_wait_error_number);
+            result.cleanup_elapsed_ns =
+                static_cast<u64>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                     std::chrono::steady_clock::now() - cleanup_started)
+                                     .count());
+            result.ownership_unresolved = !result.child.reaped;
+            break;
+        }
+        usleep(5'000);
+    }
+    result.probe_elapsed_ns = static_cast<u64>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                                   std::chrono::steady_clock::now() - started)
+                                                   .count()) -
+                              result.cleanup_elapsed_ns;
+    return result;
 }
 
 static bool stop_child(Child& child) {
@@ -1080,6 +1211,215 @@ static bool write_file(const std::string& path, const char* data, size_t len) {
 }
 
 static bool log_contains(const std::string& path, const char* needle);
+static std::string child_status_description(const Child& child);
+static bool write_file(const std::string& path, const char* data, size_t len);
+
+static bool read_docker_snapshot(const std::string& path,
+                                 std::string& contents,
+                                 std::string& error,
+                                 DockerSnapshotState& state) {
+    constexpr size_t kMaxDiagnosticBytes = 8192u;
+    state = DockerSnapshotState::Missing;
+    const int fd = open(path.c_str(), O_RDONLY | O_CLOEXEC);
+    if (fd < 0) {
+        error = "open errno=" + std::to_string(errno);
+        return false;
+    }
+    contents.clear();
+    char buffer[1024];
+    for (;;) {
+        const ssize_t count = read(fd, buffer, sizeof(buffer));
+        if (count > 0) {
+            if (contents.size() + static_cast<size_t>(count) > kMaxDiagnosticBytes) {
+                const size_t keep = kMaxDiagnosticBytes - contents.size();
+                contents.append(buffer, keep);
+                state = DockerSnapshotState::Overflow;
+                error = "output exceeded 8192-byte snapshot";
+                close(fd);
+                return false;
+            }
+            contents.append(buffer, static_cast<size_t>(count));
+            continue;
+        }
+        if (count < 0 && errno == EINTR) continue;
+        if (count < 0) {
+            error = "read errno=" + std::to_string(errno);
+            state = DockerSnapshotState::ReadError;
+            close(fd);
+            return false;
+        }
+        break;
+    }
+    if (close(fd) != 0 && error.empty()) error = "close errno=" + std::to_string(errno);
+    if (!error.empty()) {
+        state = DockerSnapshotState::ReadError;
+        return false;
+    }
+    state = contents.empty() ? DockerSnapshotState::Empty : DockerSnapshotState::NonEmpty;
+    return true;
+}
+
+static bool docker_daemon_text(const std::string& text) {
+    return text.find("Cannot connect to the Docker daemon") != std::string::npos ||
+           text.find("Is the docker daemon running") != std::string::npos;
+}
+
+static bool docker_info_missing_prerequisite(const DockerInfoResult& result);
+
+static bool run_docker_info_preflight_self_check(std::string& error) {
+    char fixture_path[] = "/tmp/rut-docker-info-selfcheck-XXXXXX";
+    if (mkdtemp(fixture_path) == nullptr) {
+        error = "could not create self-check fixture directory";
+        return false;
+    }
+    const std::string fixture(fixture_path);
+    const std::string log = fixture + "/docker-info.log";
+    const auto cleanup = [&]() {
+        unlink(log.c_str());
+        rmdir(fixture.c_str());
+    };
+    auto check = [&](const std::vector<std::string>& args,
+                     int timeout_ms,
+                     DockerInfoOutcome expected,
+                     int expected_exit = -1) {
+        DockerInfoResult result = run_docker_info_runner(args, log, timeout_ms);
+        unlink(log.c_str());
+        if (result.outcome != expected ||
+            (expected == DockerInfoOutcome::Exited && expected_exit >= 0 &&
+             (!result.child.status_valid || !WIFEXITED(result.child.status) ||
+              WEXITSTATUS(result.child.status) != expected_exit)) ||
+            (expected == DockerInfoOutcome::Signaled &&
+             (!result.child.status_valid || !WIFSIGNALED(result.child.status) ||
+              WTERMSIG(result.child.status) != SIGTERM)) ||
+            (expected == DockerInfoOutcome::TimedOut &&
+             (!result.kill_attempted || result.kill_failed || result.reap_failed ||
+              result.ownership_unresolved || !result.child.reaped || !result.child.status_valid ||
+              !WIFSIGNALED(result.child.status) || WTERMSIG(result.child.status) != SIGKILL))) {
+            error = "unexpected docker-info outcome";
+            return false;
+        }
+        return true;
+    };
+    if (!check({"/definitely/missing/docker-info"}, 100, DockerInfoOutcome::Exited, 127) ||
+        !check({"sh", "-c", "exit 0"}, 100, DockerInfoOutcome::Exited, 0) ||
+        !check({"sh", "-c", "kill -TERM $$"}, 100, DockerInfoOutcome::Signaled) ||
+        !check({"sh", "-c", "exec sleep 1"}, 50, DockerInfoOutcome::TimedOut)) {
+        cleanup();
+        return false;
+    }
+    DockerInfoResult daemon_text = run_docker_info_runner(
+        {"sh", "-c", "printf 'Cannot connect to the Docker daemon\\n' >&2; exit 1"}, log, 100);
+    (void)read_docker_snapshot(
+        log, daemon_text.snapshot, daemon_text.snapshot_error, daemon_text.snapshot_state);
+    unlink(log.c_str());
+    if (daemon_text.outcome != DockerInfoOutcome::Exited || !daemon_text.child.status_valid ||
+        WEXITSTATUS(daemon_text.child.status) != 1 ||
+        !docker_info_missing_prerequisite(daemon_text)) {
+        error = "daemon-text prerequisite classifier control failed";
+        cleanup();
+        return false;
+    }
+    DockerInfoResult success = run_docker_info_runner({"sh", "-c", "exit 0"}, log, 100);
+    unlink(log.c_str());
+    if (mkdir(log.c_str(), 0700) != 0 ||
+        read_docker_snapshot(
+            log, success.snapshot, success.snapshot_error, success.snapshot_state) ||
+        success.outcome != DockerInfoOutcome::Exited ||
+        success.snapshot_state != DockerSnapshotState::ReadError) {
+        error = "exit-0 snapshot read-error control failed";
+        cleanup();
+        return false;
+    }
+    rmdir(log.c_str());
+    DockerInfoResult missing;
+    missing.outcome = DockerInfoOutcome::Exited;
+    missing.child.status_valid = true;
+    missing.snapshot_state = DockerSnapshotState::Missing;
+    DockerInfoResult empty = missing;
+    empty.snapshot_state = DockerSnapshotState::Empty;
+    DockerInfoResult read_error = missing;
+    read_error.snapshot_state = DockerSnapshotState::ReadError;
+    if (!docker_info_missing_prerequisite(missing) || !docker_info_missing_prerequisite(empty) ||
+        docker_info_missing_prerequisite(read_error)) {
+        error = "missing/empty/read-error classifier controls failed";
+        cleanup();
+        return false;
+    }
+    unlink(log.c_str());
+    if (read_docker_snapshot(
+            log, missing.snapshot, missing.snapshot_error, missing.snapshot_state) ||
+        missing.snapshot_state != DockerSnapshotState::Missing || !write_file(log, "", 0) ||
+        !read_docker_snapshot(log, empty.snapshot, empty.snapshot_error, empty.snapshot_state) ||
+        empty.snapshot_state != DockerSnapshotState::Empty) {
+        error = "missing/empty snapshot controls failed";
+        cleanup();
+        return false;
+    }
+    std::string snapshot_error;
+    DockerSnapshotState snapshot_state = DockerSnapshotState::Missing;
+    std::string exact(8192u, 'x');
+    if (!write_file(log, exact.data(), exact.size()) ||
+        !read_docker_snapshot(log, exact, snapshot_error, snapshot_state) ||
+        snapshot_state != DockerSnapshotState::NonEmpty || exact.size() != 8192u) {
+        error = "8192-byte snapshot control failed";
+        cleanup();
+        return false;
+    }
+    exact.push_back('x');
+    if (!write_file(log, exact.data(), exact.size()) ||
+        read_docker_snapshot(log, exact, snapshot_error, snapshot_state) ||
+        snapshot_state != DockerSnapshotState::Overflow) {
+        error = "8193-byte snapshot control failed";
+        cleanup();
+        return false;
+    }
+    cleanup();
+    return true;
+}
+
+static bool docker_info_missing_prerequisite(const DockerInfoResult& result) {
+    return result.outcome == DockerInfoOutcome::Exited && result.child.status_valid &&
+           (result.snapshot_state == DockerSnapshotState::Missing ||
+            result.snapshot_state == DockerSnapshotState::Empty ||
+            docker_daemon_text(result.snapshot));
+}
+
+static void print_docker_info_result(const DockerInfoResult& result) {
+    const char* outcome = "spawn_failed";
+    switch (result.outcome) {
+        case DockerInfoOutcome::WaitFailed:
+            outcome = "wait_failed";
+            break;
+        case DockerInfoOutcome::TimedOut:
+            outcome = "timed_out";
+            break;
+        case DockerInfoOutcome::Exited:
+            outcome = "exited";
+            break;
+        case DockerInfoOutcome::Signaled:
+            outcome = "signaled";
+            break;
+        default:
+            break;
+    }
+    std::cerr << "Docker info outcome=" << outcome << " pid=" << result.child.pid
+              << " status=" << child_status_description(result.child)
+              << " status_valid=" << (result.child.status_valid ? 1 : 0)
+              << " reaped=" << (result.child.reaped ? 1 : 0)
+              << " no_waitable_child=" << (result.no_waitable_child ? 1 : 0)
+              << " wait_error=" << result.wait_error_number << " errno=" << result.error_number
+              << " cleanup_wait_error=" << result.cleanup_wait_error_number
+              << " probe_elapsed_ns=" << result.probe_elapsed_ns
+              << " cleanup_elapsed_ns=" << result.cleanup_elapsed_ns
+              << " configured_timeout_ms=" << result.configured_timeout_ms
+              << " kill_attempted=" << (result.kill_attempted ? 1 : 0)
+              << " kill_failed=" << (result.kill_failed ? 1 : 0)
+              << " reap_failed=" << (result.reap_failed ? 1 : 0)
+              << " ownership_unresolved=" << (result.ownership_unresolved ? 1 : 0) << "\n";
+    if (!result.snapshot.empty()) std::cerr << "Docker info snapshot:\n" << result.snapshot;
+    if (!result.snapshot_error.empty())
+        std::cerr << "Docker info snapshot error: " << result.snapshot_error << "\n";
+}
 
 static bool read_bounded_file(const std::string& path, std::string& contents, std::string& error) {
     constexpr size_t kMaxDiagnosticBytes = 8192u;
@@ -76753,6 +77093,8 @@ int main(int argc, char** argv) {
         strcmp(argv[1], "--pinned-nginx-positive-cl-head-default-buffering-oracle") == 0;
     const bool pinned_nginx_lifecycle_self_check =
         argc == 2 && strcmp(argv[1], "--pinned-nginx-lifecycle-self-check") == 0;
+    const bool docker_info_preflight_self_check =
+        argc == 2 && strcmp(argv[1], "--docker-info-preflight-self-check") == 0;
     const bool zero_response_stall_self_check =
         argc == 2 && strcmp(argv[1], "--zero-response-stall-self-check") == 0;
     const bool gated_fragment_peer_probe_self_check =
@@ -77520,6 +77862,18 @@ int main(int argc, char** argv) {
         std::cerr << "PASS: #439 pinned nginx lifecycle transition checks reject early CLI "
                      "exit, readiness deadline, TERM timeout/forced cleanup and invalid wait "
                      "status while accepting delayed readiness and exact graceful TERM evidence\n";
+        return 0;
+    }
+
+    if (docker_info_preflight_self_check) {
+        std::string preflight_error;
+        if (!run_docker_info_preflight_self_check(preflight_error)) {
+            std::cerr << "FAIL [#619 Docker-info preflight self-check]: " << preflight_error
+                      << "\n";
+            return 1;
+        }
+        std::cerr << "PASS: #619 Docker-info runner distinguishes bounded spawn/wait/timeout/"
+                     "exit/signal outcomes and exact 8192/8193-byte snapshots\n";
         return 0;
     }
 
@@ -78609,13 +78963,22 @@ int main(int argc, char** argv) {
     const char* suffix = strrchr(temp.path, '/');
     const std::string probe_name =
         "rut-nginx-probe-" + std::to_string(getpid()) + "-" + (suffix ? suffix + 1 : "tmp");
-    if (!command_ok({"docker", "info"}, temp.preflight_log)) {
-        if (log_contains(temp.preflight_log, "Cannot connect to the Docker daemon") ||
-            log_contains(temp.preflight_log, "Is the docker daemon running") ||
-            log_empty(temp.preflight_log) || access(temp.preflight_log.c_str(), F_OK) != 0)
+    DockerInfoResult docker_info = run_docker_info_runner({"docker", "info"}, temp.preflight_log);
+    if (docker_info.outcome == DockerInfoOutcome::Exited && docker_info.child.status_valid &&
+        WIFEXITED(docker_info.child.status) && WEXITSTATUS(docker_info.child.status) == 0) {
+        (void)read_docker_snapshot(temp.preflight_log,
+                                   docker_info.snapshot,
+                                   docker_info.snapshot_error,
+                                   docker_info.snapshot_state);
+    } else {
+        (void)read_docker_snapshot(temp.preflight_log,
+                                   docker_info.snapshot,
+                                   docker_info.snapshot_error,
+                                   docker_info.snapshot_state);
+        print_docker_info_result(docker_info);
+        if (docker_info_missing_prerequisite(docker_info))
             return missing_prerequisite("Docker daemon unavailable");
-        std::cerr << "FAIL [preflight]: Docker daemon probe failed\n";
-        dump_log(temp.preflight_log, "Docker preflight log");
+        std::cerr << "FAIL [preflight]: Docker info probe failed\n";
         return 1;
     }
     if (!command_ok({"docker", "image", "inspect", kNginxImage}, temp.preflight_log)) {
