@@ -28,6 +28,90 @@ route HEAD "/" {
             version: "HTTP/1.1",
             host: "upstream",
             connection: "omit",
+            content_length_position: "after_host",
+            strip_headers: ["Connection", "Keep-Alive", "TE", "Expect", "Upgrade"]
+        },
+        response_policy: {
+            version: "HTTP/1.1",
+            framing: "content_length",
+            connection: "request",
+            head_mode: "suppress_body",
+            server: "nginx/1.29.7",
+            date: "current",
+            hide_headers: ["Date", "Server", "X-Pad", "X-Ab9_-Ab9_-Ab9_-Ab9_-Ab9_-Ab9_-Ab9_-Ab9_-Cd0E"]
+        },
+        failure_policy: {
+            version: "HTTP/1.1",
+            status: 502,
+            reason: "Bad Gateway",
+            content_type: "text/html",
+            server: "nginx/1.29.7",
+            date: "current",
+            connection: "request",
+            head_mode: "suppress_body",
+            body: b"<html>\r\n<head><title>502 Bad Gateway</title></head>\r\n<body>\r\n<center><h1>502 Bad Gateway</h1></center>\r\n<hr><center>nginx/1.29.7</center>\r\n</body>\r\n</html>\r\n"
+        },
+        timeout_failure_policy: {
+            version: "HTTP/1.1",
+            status: 504,
+            reason: "Gateway Time-out",
+            content_type: "text/html",
+            server: "nginx/1.29.7",
+            date: "current",
+            connection: "request",
+            head_mode: "suppress_body",
+            body: b"<html>\r\n<head><title>504 Gateway Time-out</title></head>\r\n<body>\r\n<center><h1>504 Gateway Time-out</h1></center>\r\n<hr><center>nginx/1.29.7</center>\r\n</body>\r\n</html>\r\n"
+        },
+        response_read_timeout: 1s,
+    )
+    } else {
+        return forward(nginx_upstream, request_policy: {
+            version: "HTTP/1.1",
+            host: "upstream",
+            connection: "omit",
+            strip_headers: ["Connection", "Keep-Alive", "TE", "Expect", "Upgrade"],
+            retained_header_value: "trim_sp_preserve_htab"
+        },
+        response_policy: {
+            version: "HTTP/1.1",
+            framing: "content_length",
+            connection: "request",
+            head_mode: "suppress_body",
+            server: "nginx/1.29.7",
+            date: "current",
+            hide_headers: ["Date", "Server", "X-Pad", "X-Ab9_-Ab9_-Ab9_-Ab9_-Ab9_-Ab9_-Ab9_-Ab9_-Cd0E"]
+        },
+        failure_policy: {
+            version: "HTTP/1.1",
+            status: 502,
+            reason: "Bad Gateway",
+            content_type: "text/html",
+            server: "nginx/1.29.7",
+            date: "current",
+            connection: "request",
+            head_mode: "suppress_body",
+            body: b"<html>\r\n<head><title>502 Bad Gateway</title></head>\r\n<body>\r\n<center><h1>502 Bad Gateway</h1></center>\r\n<hr><center>nginx/1.29.7</center>\r\n</body>\r\n</html>\r\n"
+        },
+        timeout_failure_policy: {
+            version: "HTTP/1.1",
+            status: 504,
+            reason: "Gateway Time-out",
+            content_type: "text/html",
+            server: "nginx/1.29.7",
+            date: "current",
+            connection: "request",
+            head_mode: "suppress_body",
+            body: b"<html>\r\n<head><title>504 Gateway Time-out</title></head>\r\n<body>\r\n<center><h1>504 Gateway Time-out</h1></center>\r\n<hr><center>nginx/1.29.7</center>\r\n</body>\r\n</html>\r\n"
+        },
+        response_read_timeout: 1s,
+    )
+    }
+}
+route GET "/" {
+    return forward(nginx_upstream, request_policy: {
+            version: "HTTP/1.1",
+            host: "upstream",
+            connection: "omit",
             strip_headers: ["Connection", "Keep-Alive", "TE", "Expect", "Upgrade"]
         },
         response_policy: {
@@ -59,86 +143,9 @@ route HEAD "/" {
             body: b"<html>\r\n<head><title>504 Gateway Time-out</title></head>\r\n<body>\r\n<center><h1>504 Gateway Time-out</h1></center>\r\n<hr><center>nginx/1.29.7</center>\r\n</body>\r\n</html>\r\n"
         },
         response_read_timeout: 1s,
-    )
-    } else {
-        return forward(nginx_upstream, request_policy: {
-            version: "HTTP/1.1",
-            host: "upstream",
-            connection: "omit",
-            strip_headers: ["Connection", "Keep-Alive", "TE", "Expect", "Upgrade"],
-            retained_header_value: "trim_sp_preserve_htab"
-        },
-        response_policy: {
-            version: "HTTP/1.1",
-            framing: "content_length",
-            connection: "request",
-            server: "nginx/1.29.7",
-            date: "current",
-            hide_headers: ["Date", "Server", "X-Pad", "X-Ab9_-Ab9_-Ab9_-Ab9_-Ab9_-Ab9_-Ab9_-Ab9_-Cd0E"]
-        },
-        failure_policy: {
-            version: "HTTP/1.1",
-            status: 502,
-            reason: "Bad Gateway",
-            content_type: "text/html",
-            server: "nginx/1.29.7",
-            date: "current",
-            connection: "request",
-            body: b"<html>\r\n<head><title>502 Bad Gateway</title></head>\r\n<body>\r\n<center><h1>502 Bad Gateway</h1></center>\r\n<hr><center>nginx/1.29.7</center>\r\n</body>\r\n</html>\r\n"
-        },
-        timeout_failure_policy: {
-            version: "HTTP/1.1",
-            status: 504,
-            reason: "Gateway Time-out",
-            content_type: "text/html",
-            server: "nginx/1.29.7",
-            date: "current",
-            connection: "request",
-            body: b"<html>\r\n<head><title>504 Gateway Time-out</title></head>\r\n<body>\r\n<center><h1>504 Gateway Time-out</h1></center>\r\n<hr><center>nginx/1.29.7</center>\r\n</body>\r\n</html>\r\n"
-        },
-        response_read_timeout: 1s,
+        response_buffering: "complete_content_length"
     )
     }
-}
-route GET "/" {
-    return forward(nginx_upstream, request_policy: {
-        version: "HTTP/1.1",
-        host: "upstream",
-        connection: "omit",
-        strip_headers: ["Connection", "Keep-Alive", "TE", "Expect", "Upgrade"]
-    },
-    response_policy: {
-        version: "HTTP/1.1",
-        framing: "content_length",
-        connection: "request",
-        server: "nginx/1.29.7",
-        date: "current",
-        hide_headers: ["Date", "Server", "X-Pad", "X-Ab9_-Ab9_-Ab9_-Ab9_-Ab9_-Ab9_-Ab9_-Ab9_-Cd0E"]
-    },
-    failure_policy: {
-        version: "HTTP/1.1",
-        status: 502,
-        reason: "Bad Gateway",
-        content_type: "text/html",
-        server: "nginx/1.29.7",
-        date: "current",
-        connection: "request",
-        body: b"<html>\r\n<head><title>502 Bad Gateway</title></head>\r\n<body>\r\n<center><h1>502 Bad Gateway</h1></center>\r\n<hr><center>nginx/1.29.7</center>\r\n</body>\r\n</html>\r\n"
-    },
-    timeout_failure_policy: {
-        version: "HTTP/1.1",
-        status: 504,
-        reason: "Gateway Time-out",
-        content_type: "text/html",
-        server: "nginx/1.29.7",
-        date: "current",
-        connection: "request",
-        body: b"<html>\r\n<head><title>504 Gateway Time-out</title></head>\r\n<body>\r\n<center><h1>504 Gateway Time-out</h1></center>\r\n<hr><center>nginx/1.29.7</center>\r\n</body>\r\n</html>\r\n"
-    },
-    response_read_timeout: 1s,
-    response_buffering: "complete_content_length"
-)
-}
 route "/" {
     return forward(nginx_upstream, request_policy: {
             version: "HTTP/1.1",
@@ -172,9 +179,9 @@ route "/" {
             server: "nginx/1.29.7",
             date: "current",
             connection: "request",
-            head_mode: "reject",
             body: b"<html>\r\n<head><title>504 Gateway Time-out</title></head>\r\n<body>\r\n<center><h1>504 Gateway Time-out</h1></center>\r\n<hr><center>nginx/1.29.7</center>\r\n</body>\r\n</html>\r\n"
-        }
+        },
+        response_read_timeout: 1s
     )
 }
 )rut";
