@@ -71976,7 +71976,16 @@ static bool run_converter_default_buffering_206_range_three_publication_completi
 // observed from the pinned nginx image.
 static bool run_pinned_nginx_custom_hide_timeout_probe(const std::string& container_name,
                                                        std::string& error,
-                                                       bool complete_after_w3 = false) {
+                                                       bool complete_after_w3 = false,
+                                                       const char* rut_path = nullptr,
+                                                       const char* converter_path = nullptr) {
+    const bool generated_rut = rut_path != nullptr || converter_path != nullptr;
+    if (generated_rut &&
+        (rut_path == nullptr || converter_path == nullptr || rut_path[0] != '/' ||
+         converter_path[0] != '/' || access(rut_path, X_OK) != 0 || access(converter_path, X_OK) != 0)) {
+        error = "#270 custom-hide CLI differential requires executable absolute RUT/converter paths";
+        return false;
+    }
     TempDir temp;
     if (!temp.create()) {
         error = "#270 custom-hide timeout probe could not create temporary resources";
@@ -72080,6 +72089,7 @@ static bool run_pinned_nginx_custom_hide_timeout_probe(const std::string& contai
     }
 
     DockerGuard docker(container_name);
+    if (generated_rut) docker.active = false;
     ChildGuard nginx;
     const std::vector<std::string> docker_args = {"docker",
                                                   "run",
@@ -72096,10 +72106,80 @@ static bool run_pinned_nginx_custom_hide_timeout_probe(const std::string& contai
                                                   temp.nginx_config,
                                                   "-g",
                                                   "daemon off;"};
-    if (!handoff_held_loopback_port(
-            &reservations.fds[0], frontend_port, "#270 custom-hide timeout probe nginx", error) ||
-        !spawn_child(docker_args, temp.nginx_log, nginx.child) ||
-        !wait_ready(frontend_port, nginx.child, error)) {
+    if (generated_rut) {
+        const std::string converter_error = temp.rut_log + ".converter";
+        const int output_fd = open(temp.source.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0600);
+        const int error_fd = open(converter_error.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0600);
+        if (output_fd < 0 || error_fd < 0) {
+            if (output_fd >= 0) close(output_fd);
+            if (error_fd >= 0) close(error_fd);
+            error = "#270 custom-hide CLI could not open converter output";
+            return false;
+        }
+        Child converter;
+        const pid_t pid = fork();
+        if (pid == 0) {
+            if (dup2(output_fd, STDOUT_FILENO) < 0 || dup2(error_fd, STDERR_FILENO) < 0) _exit(127);
+            close(output_fd);
+            close(error_fd);
+            execl(converter_path, converter_path, "--format", "nginx-http", temp.nginx_config.c_str(), nullptr);
+            _exit(127);
+        }
+        close(output_fd);
+        close(error_fd);
+        if (pid < 0) {
+            error = "#270 custom-hide CLI could not fork converter";
+            return false;
+        }
+        converter.pid = pid;
+        std::string generated_source;
+        if (!wait_child(converter, 10'000) || !converter.status_valid || !WIFEXITED(converter.status) ||
+            WEXITSTATUS(converter.status) != 0 ||
+            !read_exact_return204_log(
+                temp.source, "#270 CLI generated source", generated_source, error)) {
+            error = "#270 custom-hide CLI converter failed or produced no source";
+            return false;
+        }
+        std::string diagnostics;
+        if (!read_bounded_file(converter_error, diagnostics, error) || !diagnostics.empty()) {
+            error = "#270 custom-hide CLI converter emitted diagnostics";
+            return false;
+        }
+        if (!handoff_held_loopback_port(
+                &reservations.fds[0], frontend_port, "#270 custom-hide generated RUT", error) ||
+            !spawn_child({rut_path, temp.source, "--shards", "1", "--no-pin", "--drain", "0"},
+                         temp.rut_log,
+                         nginx.child) ||
+            !wait_ready(frontend_port, nginx.child, error)) {
+            if (error.empty()) error = "#270 custom-hide generated RUT failed readiness";
+            return false;
+        }
+        const auto ready_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+        const std::string listener =
+            "Listening on port " + std::to_string(frontend_port) + " with 1 shard(s)\n";
+        while ((!log_contains(temp.rut_log, "Backend: io_uring\n") ||
+                !log_contains(temp.rut_log, listener.c_str())) &&
+               std::chrono::steady_clock::now() < ready_deadline) {
+            if (poll_child(nginx.child)) {
+                error = "#270 custom-hide generated RUT exited before readiness";
+                return false;
+            }
+            usleep(1000);
+        }
+        if (!log_contains(temp.rut_log, "Backend: io_uring\n") ||
+            !log_contains(temp.rut_log, listener.c_str())) {
+            error = "#270 custom-hide generated RUT lacked io_uring readiness";
+            return false;
+        }
+        static constexpr char kPoison[] = "destroyed-after-270-custom-hide-load\n";
+        if (!write_file(temp.source, kPoison, sizeof(kPoison) - 1u) || poll_child(nginx.child)) {
+            error = "#270 custom-hide generated source poison did not preserve live child";
+            return false;
+        }
+    } else if (!handoff_held_loopback_port(
+                   &reservations.fds[0], frontend_port, "#270 custom-hide timeout probe nginx", error) ||
+               !spawn_child(docker_args, temp.nginx_log, nginx.child) ||
+               !wait_ready(frontend_port, nginx.child, error)) {
         if (error.empty()) error = "#270 custom-hide timeout probe nginx failed readiness";
         return false;
     }
@@ -72640,6 +72720,38 @@ static bool run_pinned_nginx_custom_hide_timeout_probe(const std::string& contai
         return false;
     }
     return error.empty();
+}
+
+static bool run_pinned_nginx_custom_hide_timeout_cli_differential(const char* rut_path,
+                                                                  const char* converter_path,
+                                                                  std::string& error) {
+    if (rut_path == nullptr || converter_path == nullptr) {
+        error = "#270 custom-hide CLI differential requires RUT and converter executables";
+        return false;
+    }
+    // Each invocation owns its complete TempDir/config/origin lifecycle.  The
+    // runner performs the accepted nginx expiry/completion contract and then
+    // repeats that exact contract through ordinary RUT after CLI lowering.
+    const std::string suffix = std::to_string(getpid());
+    if (!run_pinned_nginx_custom_hide_timeout_probe(
+            "rut-nginx-270-custom-hide-cli-expiry-" + suffix, error, false))
+        return false;
+    if (!run_pinned_nginx_custom_hide_timeout_probe(
+            "rut-nginx-270-custom-hide-cli-completion-" + suffix, error, true))
+        return false;
+    if (!run_pinned_nginx_custom_hide_timeout_probe(
+            "rut-nginx-270-custom-hide-cli-rut-expiry-" + suffix,
+            error,
+            false,
+            rut_path,
+            converter_path))
+        return false;
+    return run_pinned_nginx_custom_hide_timeout_probe(
+        "rut-nginx-270-custom-hide-cli-rut-completion-" + suffix,
+        error,
+        true,
+        rut_path,
+        converter_path);
 }
 
 static bool run_pinned_nginx_default_buffering_three_publication_oracle_impl(
@@ -75480,6 +75592,8 @@ int main(int argc, char** argv) {
         argc == 2 && strcmp(argv[1], "--pinned-nginx-custom-hide-timeout-probe") == 0;
     const bool pinned_nginx_custom_hide_timeout_completion =
         argc == 2 && strcmp(argv[1], "--pinned-nginx-custom-hide-timeout-completion") == 0;
+    const bool converter_custom_hide_timeout_cli_differential =
+        argc == 4 && strcmp(argv[1], "--converter-custom-hide-timeout-cli-differential") == 0;
     const bool wildcard_listen_oracle =
         argc == 2 && strcmp(argv[1], "--pinned-nginx-wildcard-listen-oracle") == 0;
     const bool asterisk_wildcard_listen_oracle =
@@ -76358,6 +76472,18 @@ int main(int argc, char** argv) {
             return 1;
         }
         std::cerr << "PASS: #270 custom-hide timeout completion observed W1/W2/W3 and full wire\n";
+        return 0;
+    }
+    if (converter_custom_hide_timeout_cli_differential) {
+        std::string differential_error;
+        if (!run_pinned_nginx_custom_hide_timeout_cli_differential(
+                argv[2], argv[3], differential_error)) {
+            std::cerr << "FAIL [#270 custom-hide timeout CLI differential]: "
+                      << differential_error << "\n";
+            return 1;
+        }
+        std::cerr << "PASS: #270 same-file custom-hide/1s timeout expiry and completion matched "
+                     "pinned nginx and converter-generated ordinary RUT\n";
         return 0;
     }
     if (explicit_timeout_head_generated_episode) {
