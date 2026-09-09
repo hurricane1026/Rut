@@ -53215,6 +53215,309 @@ static bool run_converter_retained_off_source_self_checks(const std::string& sou
     return true;
 }
 
+static bool validate_custom_hide_timeout_loaded_program(const std::string& source_path,
+                                                        const std::string& captured_stdout,
+                                                        u16 frontend_port,
+                                                        u16 backend_port,
+                                                        const std::string& access_path,
+                                                        const char* custom_name,
+                                                        std::string& error) {
+    if (source_path.empty() || captured_stdout.empty() || custom_name == nullptr ||
+        frontend_port == 0u || backend_port == 0u || frontend_port == backend_port ||
+        access_path.empty()) {
+        error = "#616 loaded custom-hide timeout helper received incomplete artifacts";
+        return false;
+    }
+    std::string persisted;
+    if (!read_exact_rut_source(source_path, "#616 captured CLI stdout", persisted, error) ||
+        persisted != captured_stdout) {
+        error = "#616 persisted source did not authenticate captured CLI stdout";
+        return false;
+    }
+    auto program = std::make_unique<rut::LoadedProgram>();
+    struct Guard {
+        std::unique_ptr<rut::LoadedProgram>& program;
+        ~Guard() { program->destroy(); }
+    } guard{program};
+    rut::LoadError load_error{};
+    if (!rut::load_rut_program(source_path.c_str(),
+                               *program,
+                               load_error,
+                               rut::jit::OptLevel::O2,
+                               static_cast<u64>(captured_stdout.size())) ||
+        !program->access_log.present || program->config.route_count != 3u ||
+        program->config.upstream_count != 1u || program->config.upstreams[0].addr_count != 1u ||
+        ntohs(program->config.upstreams[0].addrs[0].sin_port) != backend_port ||
+        program->config.access_log.path_len != access_path.size() ||
+        memcmp(program->config.access_log.path, access_path.data(), access_path.size()) != 0) {
+        error = "#616 loaded custom-hide timeout program lost listener/upstream/access-log state";
+        return false;
+    }
+    if (!program->has_listener || program->listener.port != frontend_port ||
+        program->listener.address != rut::ListenerAddress::IPv4Exact ||
+        program->listener.ipv4_host != 0x7f000001u) {
+        error = "#616 loaded custom-hide timeout listener was not exact loopback";
+        return false;
+    }
+    const auto owned = [&](rut::Str value, const char* pool, u32 used) {
+        if (value.ptr == nullptr || value.len == 0u || value.len > used) return false;
+        const uintptr_t begin = reinterpret_cast<uintptr_t>(pool);
+        const uintptr_t ptr = reinterpret_cast<uintptr_t>(value.ptr);
+        return ptr >= begin && ptr - begin <= used - value.len;
+    };
+    const rut::Str names[] = {rut::lit_str("Date"),
+                              rut::lit_str("Server"),
+                              rut::lit_str("X-Pad"),
+                              {custom_name, static_cast<rut::u32>(strlen(custom_name))}};
+    const auto policy_ok = [&](const rut::ForwardResponsePolicySpec& policy,
+                               rut::ResponsePolicyHeadMode head) {
+        if (policy.head_mode != head || policy.hide_header_count != 4u ||
+            !owned(policy.server,
+                   program->config.response_policy_bytes,
+                   program->config.response_policy_bytes_used))
+            return false;
+        for (u32 i = 0u; i < 4u; i++)
+            if (!policy.hide_headers[i].eq(names[i]) ||
+                !owned(policy.hide_headers[i],
+                       program->config.response_policy_bytes,
+                       program->config.response_policy_bytes_used))
+                return false;
+        return true;
+    };
+    const auto failure_ok = [&](const rut::ForwardFailurePolicySpec& failure,
+                                u16 status,
+                                rut::FailurePolicyHeadMode head,
+                                const char* reason) {
+        static constexpr char k502[] =
+            "<html>\r\n<head><title>502 Bad Gateway</title></head>\r\n<body>\r\n"
+            "<center><h1>502 Bad Gateway</h1></center>\r\n<hr><center>nginx/1.29.7</center>\r\n"
+            "</body>\r\n</html>\r\n";
+        static constexpr char k504[] =
+            "<html>\r\n<head><title>504 Gateway Time-out</title></head>\r\n<body>\r\n"
+            "<center><h1>504 Gateway "
+            "Time-out</h1></center>\r\n<hr><center>nginx/1.29.7</center>\r\n"
+            "</body>\r\n</html>\r\n";
+        const char* body = status == 502u ? k502 : k504;
+        return failure.status_code == status && failure.head_mode == head &&
+               failure.reason.eq({reason, static_cast<rut::u32>(strlen(reason))}) &&
+               failure.server.eq(rut::lit_str("nginx/1.29.7")) &&
+               failure.body.eq({body, static_cast<rut::u32>(strlen(body))}) &&
+               owned(failure.reason,
+                     program->config.failure_policy_bytes,
+                     program->config.failure_policy_bytes_used) &&
+               owned(failure.server,
+                     program->config.failure_policy_bytes,
+                     program->config.failure_policy_bytes_used) &&
+               owned(failure.body,
+                     program->config.failure_policy_bytes,
+                     program->config.failure_policy_bytes_used);
+    };
+    const auto predicate = [&](const rut::RouteEntry& route,
+                               const rut::jit::HandlerResult& result,
+                               u16 expected_request_policy,
+                               u16 expected_head,
+                               rut::ForwardResponseBufferingMode buffering) {
+        if (route.fn == nullptr || result.action != rut::jit::HandlerAction::ForwardBundle ||
+            result.status_code != expected_request_policy || result.upstream_id != 0u ||
+            result.next_state == 0u || result.next_state > program->config.policy_bundle_count)
+            return false;
+        const auto& bundle = program->config.policy_bundles[result.next_state - 1u];
+        if (bundle.response_read_timeout_seconds != 1u || bundle.response_buffering != buffering ||
+            !program->config.response_policy_id_is_valid(bundle.response_policy_id) ||
+            !program->config.failure_policy_id_is_valid(bundle.failure_policy_id) ||
+            !program->config.failure_policy_id_is_valid(bundle.timeout_failure_policy_id) ||
+            !policy_ok(program->config.response_policies[bundle.response_policy_id - 1u],
+                       static_cast<rut::ResponsePolicyHeadMode>(expected_head)))
+            return false;
+        const auto& failure = program->config.failure_policies[bundle.failure_policy_id - 1u];
+        const auto& timeout =
+            program->config.failure_policies[bundle.timeout_failure_policy_id - 1u];
+        const auto failure_head =
+            expected_head == static_cast<u16>(rut::ResponsePolicyHeadMode::SuppressBody)
+                ? rut::FailurePolicyHeadMode::SuppressBody
+                : rut::FailurePolicyHeadMode::Reject;
+        return failure_ok(failure, 502u, failure_head, "Bad Gateway") &&
+               failure_ok(timeout, 504u, failure_head, "Gateway Time-out");
+    };
+    const auto invoke = [&](const rut::RouteEntry& route, const char* request, u32 length) {
+        rut::jit::HandlerCtx context{};
+        return rut::jit::HandlerResult::unpack(route.fn(
+            nullptr, &context, reinterpret_cast<const rut::u8*>(request), length, nullptr));
+    };
+    const rut::RouteEntry* head = nullptr;
+    const rut::RouteEntry* get = nullptr;
+    const rut::RouteEntry* any = nullptr;
+    for (u32 i = 0u; i < program->config.route_count; i++) {
+        const auto& route = program->config.routes[i];
+        if (route.path_len != 1u || route.path[0] != '/' ||
+            route.action != rut::RouteAction::JitHandler)
+            return error = "#616 loaded custom-hide timeout route inventory was not exact", false;
+        if (route.method == rut::kRouteMethodHead)
+            head = &route;
+        else if (route.method == rut::kRouteMethodGet)
+            get = &route;
+        else if (route.method == rut::kRouteMethodAny)
+            any = &route;
+        else
+            return error = "#616 loaded custom-hide timeout had an unexpected method", false;
+    }
+    if (head == nullptr || get == nullptr || any == nullptr)
+        return error = "#616 loaded custom-hide timeout lacked HEAD/GET/Any routes", false;
+    const char* h0 = "HEAD / HTTP/1.1\r\nHost: test\r\n\r\n";
+    const char* h1 = "HEAD / HTTP/1.1\r\nHost: test\r\nContent-Length: 1\r\n\r\nx";
+    const char* g = "GET / HTTP/1.1\r\nHost: test\r\n\r\n";
+    const char* p = "POST / HTTP/1.1\r\nHost: test\r\n\r\n";
+    const auto r0 = invoke(*head, h0, static_cast<u32>(strlen(h0)));
+    const auto r1 = invoke(*head, h1, static_cast<u32>(strlen(h1)));
+    const auto rg = invoke(*get, g, static_cast<u32>(strlen(g)));
+    const auto ra = invoke(*any, p, static_cast<u32>(strlen(p)));
+    if (!predicate(*head,
+                   r0,
+                   static_cast<u16>(rut::RequestPolicyId::Http11FixedStrip),
+                   static_cast<u16>(rut::ResponsePolicyHeadMode::SuppressBody),
+                   rut::ForwardResponseBufferingMode::None) ||
+        !predicate(*head,
+                   r1,
+                   static_cast<u16>(rut::RequestPolicyId::Http11FixedStripContentLengthAfterHost),
+                   static_cast<u16>(rut::ResponsePolicyHeadMode::SuppressBody),
+                   rut::ForwardResponseBufferingMode::None) ||
+        !predicate(*get,
+                   rg,
+                   static_cast<u16>(rut::RequestPolicyId::Http11FixedStrip),
+                   static_cast<u16>(rut::ResponsePolicyHeadMode::Reject),
+                   rut::ForwardResponseBufferingMode::CompleteContentLength) ||
+        !predicate(*any,
+                   ra,
+                   static_cast<u16>(rut::RequestPolicyId::Http11FixedStrip),
+                   static_cast<u16>(rut::ResponsePolicyHeadMode::Reject),
+                   rut::ForwardResponseBufferingMode::None) ||
+        r0.next_state != r1.next_state || rg.next_state == r0.next_state ||
+        ra.next_state == rg.next_state || program->config.policy_bundle_count != 3u) {
+        error = "#616 loaded custom-hide timeout JIT bundles were not the exact three-way split";
+        return false;
+    }
+    const auto rejects = [&](rut::jit::HandlerResult bad, const char* label) {
+        if (predicate(*get,
+                      bad,
+                      static_cast<u16>(rut::RequestPolicyId::Http11FixedStrip),
+                      static_cast<u16>(rut::ResponsePolicyHeadMode::Reject),
+                      rut::ForwardResponseBufferingMode::CompleteContentLength)) {
+            error = std::string("#616 loaded JIT accepted mutation: ") + label;
+            return false;
+        }
+        return true;
+    };
+    rut::jit::HandlerResult bad = rg;
+    bad.action = rut::jit::HandlerAction::ReturnStatus;
+    if (!rejects(bad, "wrong-action")) return false;
+    bad = rg;
+    bad.next_state = 0u;
+    if (!rejects(bad, "zero-bundle")) return false;
+    bad = rg;
+    bad.next_state = static_cast<u16>(program->config.policy_bundle_count + 1u);
+    if (!rejects(bad, "out-of-range-bundle")) return false;
+    bad = rg;
+    bad.upstream_id = 1u;
+    if (!rejects(bad, "wrong-upstream")) return false;
+    bad = rg;
+    bad.status_code = 2u;
+    if (!rejects(bad, "wrong-request-policy")) return false;
+    bad = r0;
+    if (!rejects(bad, "valid-wrong-route-bundle")) return false;
+    std::string mutant_source = captured_stdout;
+    const size_t custom_at = mutant_source.find(custom_name);
+    if (custom_at == std::string::npos || custom_at + strlen(custom_name) > mutant_source.size()) {
+        error = "#616 loaded custom-hide timeout source lacked the custom header name";
+        return false;
+    }
+    std::string mutant_name(custom_name);
+    mutant_name.back() = mutant_name.back() == 'Y' ? 'Z' : 'Y';
+    mutant_source.replace(custom_at, strlen(custom_name), mutant_name);
+    TempDir mutant_temp;
+    if (!mutant_temp.create() ||
+        !write_file(mutant_temp.source, mutant_source.data(), mutant_source.size())) {
+        error = "#616 same-length custom-name mutant could not be persisted";
+        return false;
+    }
+    rut::LoadedProgram mutant{};
+    rut::LoadError mutant_error{};
+    if (!rut::load_rut_program(mutant_temp.source.c_str(),
+                               mutant,
+                               mutant_error,
+                               rut::jit::OptLevel::O2,
+                               static_cast<u64>(mutant_source.size()))) {
+        error = "#616 same-length custom-name mutant did not load successfully";
+        return false;
+    }
+    bool mutant_matches_original = false;
+    for (u32 i = 0u; i < mutant.config.response_policy_count; i++) {
+        const auto& policy = mutant.config.response_policies[i];
+        if (policy.hide_header_count != 4u) continue;
+        bool same = true;
+        for (u32 h = 0u; h < 4u; h++) same &= policy.hide_headers[h].eq(names[h]);
+        mutant_matches_original |= same;
+    }
+    mutant.destroy();
+    if (mutant_matches_original) {
+        error = "#616 same-length custom-name mutant retained the original semantic name";
+        return false;
+    }
+    const u16 saved_response =
+        program->config.policy_bundles[rg.next_state - 1u].response_policy_id;
+    const u16 saved_failure = program->config.policy_bundles[rg.next_state - 1u].failure_policy_id;
+    const u16 saved_states[] = {r0.next_state, r1.next_state, rg.next_state, ra.next_state};
+    program->engine.shutdown();
+    program->jit_inited = false;
+    program->rir.destroy();
+    if (program->src_map == nullptr || program->src_map_len == 0u ||
+        munmap(program->src_map, program->src_map_len) != 0) {
+        error = "#616 loaded custom-hide timeout teardown failed";
+        return false;
+    }
+    program->src_map = nullptr;
+    program->src_map_len = 0u;
+    for (u16 state : saved_states) {
+        if (!program->config.policy_bundle_id_is_valid(state)) {
+            error = "#616 loaded custom-hide timeout returned bundle did not survive teardown";
+            return false;
+        }
+        const auto& bundle = program->config.policy_bundles[state - 1u];
+        const bool suppress = state == r0.next_state;
+        const auto response_head = suppress ? rut::ResponsePolicyHeadMode::SuppressBody
+                                            : rut::ResponsePolicyHeadMode::Reject;
+        const auto failure_head = suppress ? rut::FailurePolicyHeadMode::SuppressBody
+                                           : rut::FailurePolicyHeadMode::Reject;
+        if (!program->config.response_policy_id_is_valid(bundle.response_policy_id) ||
+            !program->config.failure_policy_id_is_valid(bundle.failure_policy_id) ||
+            !program->config.failure_policy_id_is_valid(bundle.timeout_failure_policy_id) ||
+            !policy_ok(program->config.response_policies[bundle.response_policy_id - 1u],
+                       response_head) ||
+            !failure_ok(program->config.failure_policies[bundle.failure_policy_id - 1u],
+                        502u,
+                        failure_head,
+                        "Bad Gateway") ||
+            !failure_ok(program->config.failure_policies[bundle.timeout_failure_policy_id - 1u],
+                        504u,
+                        failure_head,
+                        "Gateway Time-out")) {
+            error = "#616 loaded custom-hide timeout policy strings did not survive teardown";
+            return false;
+        }
+    }
+    if (!program->config.response_policy_id_is_valid(saved_response) ||
+        !program->config.failure_policy_id_is_valid(saved_failure) ||
+        !policy_ok(program->config.response_policies[saved_response - 1u],
+                   rut::ResponsePolicyHeadMode::Reject) ||
+        !failure_ok(program->config.failure_policies[saved_failure - 1u],
+                    502u,
+                    rut::FailurePolicyHeadMode::Reject,
+                    "Bad Gateway")) {
+        error = "#616 loaded custom-hide timeout policies did not survive teardown";
+        return false;
+    }
+    return true;
+}
+
 static bool run_converter_request_length_rut_side(
     TempDir& temp,
     const char* rut_path,
@@ -72330,6 +72633,14 @@ static bool run_pinned_nginx_custom_hide_timeout_probe(
             error = "#270 custom-hide CLI converter emitted diagnostics";
             return false;
         }
+        if (!validate_custom_hide_timeout_loaded_program(temp.source,
+                                                         generated_source,
+                                                         frontend_port,
+                                                         backend_port,
+                                                         temp.nginx_access_log,
+                                                         "X-Powered-By",
+                                                         error))
+            return false;
         if (!handoff_held_loopback_port(
                 &reservations.fds[0], frontend_port, "#270 custom-hide generated RUT", error) ||
             !spawn_child({rut_path, temp.source, "--shards", "1", "--no-pin", "--drain", "0"},
