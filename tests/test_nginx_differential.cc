@@ -73195,6 +73195,7 @@ static bool run_pinned_nginx_custom_hide_timeout_probe(
         count_text(config, "proxy_hide_header " + std::string(custom_hide_name) + ";\n") != 1u ||
         count_text(config, "proxy_read_timeout 1s;\n") != 1u ||
         count_text(config, "proxy_buffering") != (explicit_buffering_on ? 1u : 0u) ||
+        count_text(config, "      proxy_buffering on;\n") != (explicit_buffering_on ? 1u : 0u) ||
         (pair != nullptr && pair->initialized
              ? !read_exact_return204_log(temp.nginx_config,
                                          "#270 pair config before RUT",
@@ -74313,10 +74314,12 @@ static bool run_pinned_nginx_custom_hide_timeout_explicit_buffering_oracle(std::
     return true;
 }
 
-static bool run_pinned_nginx_custom_hide_timeout_cli_differential(const char* rut_path,
-                                                                  const char* converter_path,
-                                                                  std::string& error,
-                                                                  bool boundary_names = false) {
+static bool run_pinned_nginx_custom_hide_timeout_cli_differential(
+    const char* rut_path,
+    const char* converter_path,
+    std::string& error,
+    bool boundary_names = false,
+    bool explicit_buffering_on = false) {
     if (rut_path == nullptr || converter_path == nullptr) {
         error = "#270 custom-hide CLI differential requires RUT and converter executables";
         return false;
@@ -74418,7 +74421,8 @@ static bool run_pinned_nginx_custom_hide_timeout_cli_differential(const char* ru
                                                         nullptr,
                                                         &pair,
                                                         &nginx_observation,
-                                                        hide_name))
+                                                        hide_name,
+                                                        explicit_buffering_on))
             return false;
         if (!read_exact_return204_log(pair.temp.nginx_config,
                                       "#270 pair config after nginx",
@@ -74464,7 +74468,8 @@ static bool run_pinned_nginx_custom_hide_timeout_cli_differential(const char* ru
                                                         converter_path,
                                                         &pair,
                                                         &rut_observation,
-                                                        hide_name))
+                                                        hide_name,
+                                                        explicit_buffering_on))
             return false;
         std::string after_rut_config;
         if (!read_exact_return204_log(
@@ -77389,6 +77394,9 @@ int main(int argc, char** argv) {
         argc == 2 && strcmp(argv[1], "--pinned-nginx-custom-hide-timeout-completion") == 0;
     const bool converter_custom_hide_timeout_cli_differential =
         argc == 4 && strcmp(argv[1], "--converter-custom-hide-timeout-cli-differential") == 0;
+    const bool converter_custom_hide_timeout_explicit_buffering_cli_differential =
+        argc == 4 &&
+        strcmp(argv[1], "--converter-custom-hide-timeout-explicit-buffering-cli-differential") == 0;
     const bool converter_custom_hide_timeout_boundary_cli_differential =
         argc == 4 &&
         strcmp(argv[1], "--converter-custom-hide-timeout-boundary-cli-differential") == 0;
@@ -78323,6 +78331,20 @@ int main(int argc, char** argv) {
         std::cerr << "PASS: #270 same-file custom-hide/1s timeout expiry and completion pairs "
                      "matched pinned nginx and converter-generated ordinary RUT; this remains "
                      "a bounded compatibility claim, not full support\n";
+        return 0;
+    }
+    if (converter_custom_hide_timeout_explicit_buffering_cli_differential) {
+        std::string differential_error;
+        if (!run_pinned_nginx_custom_hide_timeout_cli_differential(
+                argv[2], argv[3], differential_error, false, true)) {
+            std::cerr << "FAIL [#621 explicit proxy_buffering on custom-hide timeout CLI "
+                         "differential]: "
+                      << differential_error << "\n";
+            return 1;
+        }
+        std::cerr << "PASS: #621 same-file explicit proxy_buffering on custom-hide/1s timeout "
+                     "expiry and completion pairs matched pinned nginx and converter-generated "
+                     "ordinary RUT\n";
         return 0;
     }
     if (converter_custom_hide_timeout_boundary_cli_differential) {
