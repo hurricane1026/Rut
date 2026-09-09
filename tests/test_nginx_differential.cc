@@ -9696,6 +9696,65 @@ static bool read_exact_return204_log(const std::string& path,
     return bounded_log_reached_eof(contents.size(), kExactReturn204LogLimit, saw_eof, label, error);
 }
 
+// The standalone converter's stdout is an owned ordinary-RUT source, whose
+// contract is larger than the bounded diagnostic/log files above. Keep this
+// cap local to source capture; do not broaden generic log limits.
+static bool read_exact_rut_source(const std::string& path,
+                                  const char* label,
+                                  std::string& contents,
+                                  std::string& error) {
+    constexpr size_t kSourceLimit = rut::nginx::HttpProfileRutSource::kCapacity - 1u;
+    const int fd = open(path.c_str(), O_RDONLY | O_CLOEXEC);
+    if (fd < 0) {
+        error = std::string(label) + " was unreadable";
+        return false;
+    }
+    contents.clear();
+    char buffer[1024];
+    for (;;) {
+        const size_t remaining = kSourceLimit - contents.size();
+        const size_t want = std::min(sizeof(buffer), remaining);
+        const ssize_t n = read(fd, buffer, want);
+        if (n > 0) {
+            contents.append(buffer, static_cast<size_t>(n));
+            if (contents.size() == kSourceLimit) {
+                char probe = 0;
+                ssize_t extra = 0;
+                do {
+                    extra = read(fd, &probe, 1u);
+                } while (extra < 0 && errno == EINTR);
+                if (extra > 0) {
+                    close(fd);
+                    error = std::string(label) + " exceeded owned source capacity";
+                    return false;
+                }
+                if (extra < 0) {
+                    close(fd);
+                    error = std::string(label) + " EOF probe failed";
+                    return false;
+                }
+                if (close(fd) != 0) {
+                    error = std::string(label) + " close failed";
+                    return false;
+                }
+                return true;
+            }
+            continue;
+        }
+        if (n < 0 && errno == EINTR) continue;
+        if (n < 0) {
+            close(fd);
+            error = std::string(label) + " read failed";
+            return false;
+        }
+        if (close(fd) != 0) {
+            error = std::string(label) + " close failed";
+            return false;
+        }
+        return true;
+    }
+}
+
 static bool split_exact_complete_log(const std::string& contents,
                                      size_t expected_records,
                                      const char* label,
@@ -72136,9 +72195,13 @@ static bool run_pinned_nginx_custom_hide_timeout_probe(const std::string& contai
         if (!wait_child(converter_guard.child, 10'000) || !converter_guard.child.status_valid ||
             !WIFEXITED(converter_guard.child.status) ||
             WEXITSTATUS(converter_guard.child.status) != 0 ||
-            !read_exact_return204_log(
+            !read_exact_rut_source(
                 temp.source, "#270 CLI generated source", generated_source, error)) {
-            error = "#270 custom-hide CLI converter failed or produced no source";
+            if (error.empty()) error = "#270 custom-hide CLI converter failed or produced no source";
+            return false;
+        }
+        if (generated_source.empty()) {
+            error = "#270 custom-hide CLI converter produced empty source";
             return false;
         }
         std::string diagnostics;
