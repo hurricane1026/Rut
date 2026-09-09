@@ -53279,10 +53279,10 @@ static bool validate_custom_hide_timeout_loaded_program(const std::string& sourc
                    program->config.response_policy_bytes_used))
             return false;
         for (u32 i = 0u; i < 4u; i++)
-            if (!policy.hide_headers[i].eq(names[i]) ||
-                !owned(policy.hide_headers[i],
+            if (!owned(policy.hide_headers[i],
                        program->config.response_policy_bytes,
-                       program->config.response_policy_bytes_used))
+                       program->config.response_policy_bytes_used) ||
+                !policy.hide_headers[i].eq(names[i]))
                 return false;
         return true;
     };
@@ -53300,11 +53300,7 @@ static bool validate_custom_hide_timeout_loaded_program(const std::string& sourc
             "Time-out</h1></center>\r\n<hr><center>nginx/1.29.7</center>\r\n"
             "</body>\r\n</html>\r\n";
         const char* body = status == 502u ? k502 : k504;
-        return failure.status_code == status && failure.head_mode == head &&
-               failure.reason.eq({reason, static_cast<rut::u32>(strlen(reason))}) &&
-               failure.server.eq(rut::lit_str("nginx/1.29.7")) &&
-               failure.body.eq({body, static_cast<rut::u32>(strlen(body))}) &&
-               owned(failure.reason,
+        return owned(failure.reason,
                      program->config.failure_policy_bytes,
                      program->config.failure_policy_bytes_used) &&
                owned(failure.server,
@@ -53312,7 +53308,11 @@ static bool validate_custom_hide_timeout_loaded_program(const std::string& sourc
                      program->config.failure_policy_bytes_used) &&
                owned(failure.body,
                      program->config.failure_policy_bytes,
-                     program->config.failure_policy_bytes_used);
+                     program->config.failure_policy_bytes_used) &&
+               failure.status_code == status && failure.head_mode == head &&
+               failure.reason.eq({reason, static_cast<rut::u32>(strlen(reason))}) &&
+               failure.server.eq(rut::lit_str("nginx/1.29.7")) &&
+               failure.body.eq({body, static_cast<rut::u32>(strlen(body))});
     };
     const auto predicate = [&](const rut::RouteEntry& route,
                                const rut::jit::HandlerResult& result,
@@ -53327,7 +53327,7 @@ static bool validate_custom_hide_timeout_loaded_program(const std::string& sourc
         if (bundle.response_read_timeout_seconds != 1u || bundle.response_buffering != buffering ||
             !program->config.response_policy_id_is_valid(bundle.response_policy_id) ||
             !program->config.failure_policy_id_is_valid(bundle.failure_policy_id) ||
-            !program->config.failure_policy_id_is_valid(bundle.timeout_failure_policy_id) ||
+            !program->config.timeout_failure_policy_id_is_valid(bundle.timeout_failure_policy_id) ||
             !policy_ok(program->config.response_policies[bundle.response_policy_id - 1u],
                        static_cast<rut::ResponsePolicyHeadMode>(expected_head)))
             return false;
@@ -53484,6 +53484,8 @@ static bool validate_custom_hide_timeout_loaded_program(const std::string& sourc
     const u16 saved_response =
         program->config.policy_bundles[rg.next_state - 1u].response_policy_id;
     const u16 saved_failure = program->config.policy_bundles[rg.next_state - 1u].failure_policy_id;
+    const u16 saved_timeout_failure =
+        program->config.policy_bundles[rg.next_state - 1u].timeout_failure_policy_id;
     const u16 saved_states[] = {r0.next_state, r1.next_state, rg.next_state, ra.next_state};
     program->engine.shutdown();
     program->jit_inited = false;
@@ -53508,7 +53510,7 @@ static bool validate_custom_hide_timeout_loaded_program(const std::string& sourc
                                            : rut::FailurePolicyHeadMode::Reject;
         if (!program->config.response_policy_id_is_valid(bundle.response_policy_id) ||
             !program->config.failure_policy_id_is_valid(bundle.failure_policy_id) ||
-            !program->config.failure_policy_id_is_valid(bundle.timeout_failure_policy_id) ||
+            !program->config.timeout_failure_policy_id_is_valid(bundle.timeout_failure_policy_id) ||
             !policy_ok(program->config.response_policies[bundle.response_policy_id - 1u],
                        response_head) ||
             !failure_ok(program->config.failure_policies[bundle.failure_policy_id - 1u],
@@ -53525,12 +53527,17 @@ static bool validate_custom_hide_timeout_loaded_program(const std::string& sourc
     }
     if (!program->config.response_policy_id_is_valid(saved_response) ||
         !program->config.failure_policy_id_is_valid(saved_failure) ||
+        !program->config.timeout_failure_policy_id_is_valid(saved_timeout_failure) ||
         !policy_ok(program->config.response_policies[saved_response - 1u],
                    rut::ResponsePolicyHeadMode::Reject) ||
         !failure_ok(program->config.failure_policies[saved_failure - 1u],
                     502u,
                     rut::FailurePolicyHeadMode::Reject,
-                    "Bad Gateway")) {
+                    "Bad Gateway") ||
+        !failure_ok(program->config.failure_policies[saved_timeout_failure - 1u],
+                    504u,
+                    rut::FailurePolicyHeadMode::Reject,
+                    "Gateway Time-out")) {
         error = "#616 loaded custom-hide timeout policies did not survive teardown";
         return false;
     }
