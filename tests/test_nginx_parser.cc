@@ -21233,7 +21233,8 @@ TEST(nginx_converter_issue270, custom_hide_header_and_timeout_lower_together) {
                                        const rir::Block& block,
                                        i32 expected_request_policy_id,
                                        bool head,
-                                       bool buffered) {
+                                       bool buffered,
+                                       i32* observed_bundle_id = nullptr) {
             u32 forwards = 0u;
             const rir::Instruction* forward = nullptr;
             for (u32 inst = 0u; inst < block.inst_count; inst++) {
@@ -21254,6 +21255,7 @@ TEST(nginx_converter_issue270, custom_hide_header_and_timeout_lower_together) {
             CHECK_EQ(request_policy_id, expected_request_policy_id);
             REQUIRE_GT(bundle_id, 0);
             REQUIRE_LE(static_cast<u32>(bundle_id), config.policy_bundle_count);
+            if (observed_bundle_id != nullptr) *observed_bundle_id = bundle_id;
             const auto& bundle = config.policy_bundles[bundle_id - 1];
             CHECK_EQ(bundle.response_read_timeout_seconds, seconds);
             CHECK_EQ(bundle.response_buffering,
@@ -21266,6 +21268,10 @@ TEST(nginx_converter_issue270, custom_hide_header_and_timeout_lower_together) {
             CHECK_EQ(response.head_mode,
                      head ? ResponsePolicyHeadMode::SuppressBody : ResponsePolicyHeadMode::Reject);
             REQUIRE_EQ(response.hide_header_count, 4u);
+            for (u32 header = 0; header < response.hide_header_count; header++)
+                CHECK(str_is_in_owned_pool(response.hide_headers[header],
+                                           config.response_policy_bytes,
+                                           config.response_policy_bytes_used));
             CHECK(response.hide_headers[0].eq(lit_str("Date")));
             CHECK(response.hide_headers[1].eq(lit_str("Server")));
             CHECK(response.hide_headers[2].eq(lit_str("X-Pad")));
@@ -21287,13 +21293,43 @@ TEST(nginx_converter_issue270, custom_hide_header_and_timeout_lower_together) {
         CHECK_EQ(get.http_method, kRouteMethodGet);
         CHECK_EQ(any.http_method, kRouteMethodAny);
         REQUIRE_EQ(head.block_count, 3u);
+        const auto& entry = head.blocks[0];
+        const rir::Instruction* has_content_length = nullptr;
+        for (u32 inst = 0; inst < entry.inst_count; inst++) {
+            if (entry.insts[inst].op != rir::Opcode::ReqHasContentLength) continue;
+            REQUIRE(has_content_length == nullptr);
+            has_content_length = &entry.insts[inst];
+        }
+        REQUIRE(has_content_length != nullptr);
+        const rir::Instruction* branch = entry.terminator();
+        REQUIRE(branch != nullptr);
+        REQUIRE_EQ(branch->op, rir::Opcode::Br);
+        REQUIRE_EQ(branch->operand_count, 1u);
+        CHECK_EQ(branch->operand(0), has_content_length->result);
+        REQUIRE_LT(branch->imm.block_targets[0].id, head.block_count);
+        REQUIRE_LT(branch->imm.block_targets[1].id, head.block_count);
+        const auto& true_block = head.blocks[branch->imm.block_targets[0].id];
+        const auto& false_block = head.blocks[branch->imm.block_targets[1].id];
+        u32 head_forwards = 0u;
+        for (u32 block = 0; block < head.block_count; block++)
+            for (u32 inst = 0; inst < head.blocks[block].inst_count; inst++)
+                head_forwards += head.blocks[block].insts[inst].op == rir::Opcode::RetForwardBundle;
+        CHECK_EQ(head_forwards, 2u);
+        i32 true_bundle = -1;
+        i32 false_bundle = -1;
         check_forward(head,
-                      head.blocks[1],
+                      true_block,
                       static_cast<i32>(RequestPolicyId::Http11FixedStripContentLengthAfterHost),
                       true,
-                      false);
-        check_forward(
-            head, head.blocks[2], static_cast<i32>(RequestPolicyId::Http11FixedStrip), true, false);
+                      false,
+                      &true_bundle);
+        check_forward(head,
+                      false_block,
+                      static_cast<i32>(RequestPolicyId::Http11FixedStrip),
+                      true,
+                      false,
+                      &false_bundle);
+        CHECK_EQ(true_bundle, false_bundle);
         REQUIRE_EQ(get.block_count, 1u);
         check_forward(
             get, get.blocks[0], static_cast<i32>(RequestPolicyId::Http11FixedStrip), false, true);
