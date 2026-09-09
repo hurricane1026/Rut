@@ -1258,7 +1258,6 @@ if(RUT_ENABLE_JIT)
         RUN_SERIAL TRUE
         RESOURCE_LOCK nginx-differential
         TIMEOUT 120
-        SKIP_RETURN_CODE 77
         ENVIRONMENT "RUT_NGINX_DIFFERENTIAL_REQUIRED=1"
     )
     add_test(
@@ -2984,6 +2983,16 @@ if(RUT_ENABLE_JIT)
                     $<TARGET_FILE:rut> $<TARGET_FILE:test_rut_iouring_gate_preload>
         )
         set_tests_properties(test_rut_iouring_gate_owner_death_negative PROPERTIES
+            LABELS "integration;nginx;negative"
+            RUN_SERIAL TRUE
+            RESOURCE_LOCK nginx-differential
+            TIMEOUT 30
+        )
+        add_test(
+            NAME test_rut_iouring_gate_recv_owner_diagnostics_self_check
+            COMMAND test_nginx_differential --rut-iouring-gate-recv-owner-diagnostics-self-check
+        )
+        set_tests_properties(test_rut_iouring_gate_recv_owner_diagnostics_self_check PROPERTIES
             LABELS "integration;nginx;negative"
             RUN_SERIAL TRUE
             RESOURCE_LOCK nginx-differential

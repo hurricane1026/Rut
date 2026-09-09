@@ -29477,7 +29477,14 @@ TEST(iouring_downstream_recv_barrier, absolute_cq_positions_wrap_and_shutdown_cl
     fixture.guard.loop->backend.downstream_recv_terminal_window_count = 1;
     fixture.guard.loop->backend.downstream_recv_progress_head = 37;
     fixture.guard.loop->backend.downstream_recv_progress_valid = true;
-    REQUIRE(fixture.guard.loop->backend.init(0, -1).has_value());
+    const auto reinit_result = fixture.guard.loop->backend.init(0, -1);
+    if (!reinit_result) {
+        std::cerr << "FAIL test=iouring_downstream_recv_barrier.absolute_cq_positions_wrap_and_"
+                     "shutdown_clears_state phase=reinit error_source="
+                  << static_cast<unsigned>(reinit_result.error().source)
+                  << " error_code=" << reinit_result.error().code << "\n";
+    }
+    REQUIRE(reinit_result.has_value());
     CHECK_FALSE(fixture.guard.loop->backend.deferred_downstream_recv.active);
     CHECK_EQ(fixture.guard.loop->backend.downstream_recv_terminal_window_count, 0u);
     CHECK_FALSE(fixture.guard.loop->backend.downstream_recv_progress_valid);

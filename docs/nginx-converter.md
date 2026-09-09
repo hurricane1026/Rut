@@ -41,8 +41,10 @@ lowering support beyond the bounded access-log profile; the closed #363
 publication capability is used only for this exact model.
 The explicit literal `access_log off;` profile now converts to the same owned
 ordinary server source without an `accessLog` declaration. This is conversion
-admission only: logging-absence behavior has not been demonstrated against
-nginx, and runtime logging overrides remain outside the contract.
+admission plus one bounded behavior witness: merged #598/#599 demonstrate
+logging absence only for the exact pinned explicit-Off retained-header vector
+documented in the compatibility matrix. General nginx logging, inheritance,
+and runtime logging overrides remain outside the contract.
 
 ## Standalone conversion command
 
@@ -59,10 +61,10 @@ rut-nginx-convert --format nginx-http <input-file>
 `http {}` profile with the existing `log_format`/`access_log` declarations or
 the explicit literal `access_log off;` form.
 `nginx-http` accepts exactly one empty `events {}` block followed by that same
-bounded logged HTTP profile. This is complete-file envelope admission, not a
+bounded HTTP profile, either logged or explicit-Off. This is complete-file envelope admission, not a
 claim that an empty events block is semantically inert or that arbitrary
 nginx.conf files are supported. The retained-header behavior evidence covers
-only the separately documented omitted-default runtime vector; parser
+only the separately documented omitted-default and explicit-Off runtime vectors; parser
 admission does not promote arbitrary directives or configurations to that
 behavioral claim.
 The input must be one regular file no larger than 1 MiB; the complete file is
