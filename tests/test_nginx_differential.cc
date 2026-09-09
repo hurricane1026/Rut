@@ -73362,10 +73362,10 @@ static bool run_pinned_nginx_custom_hide_timeout_cli_differential(const char* ru
             error = "#270 pair config changed after nginx settlement";
             return false;
         }
-        if (rename(pair.temp.nginx_access_log.c_str(),
-                   pair.temp.nginx_access_snapshot.c_str()) != 0) {
-            error = "#270 pair could not preserve nginx access snapshot errno=" +
-                    std::to_string(errno);
+        if (rename(pair.temp.nginx_access_log.c_str(), pair.temp.nginx_access_snapshot.c_str()) !=
+            0) {
+            error =
+                "#270 pair could not preserve nginx access snapshot errno=" + std::to_string(errno);
             return false;
         }
         if (!read_exact_return204_log(pair.temp.nginx_access_snapshot,
