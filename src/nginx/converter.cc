@@ -1427,13 +1427,16 @@ FrontendResult<bool> validate_proxy_hide_header(const Server& server, bool exact
     // All bytes below are in the already-proven common source. Sort the complete
     // modeled location inventory so every byte between the braces is accounted
     // for independently of nginx directive order.
-    ProxyLocationDirective directives[4] = {
-        {proxy.span, ProxyLocationDirectiveKind::ProxyPass},
-        {header.span, ProxyLocationDirectiveKind::ProxyHideHeader},
-        {timeout.span, ProxyLocationDirectiveKind::ProxyReadTimeout},
-        {buffering.span, ProxyLocationDirectiveKind::ProxyBuffering},
-    };
-    const u32 directive_count = 2u + (timeout.present ? 1u : 0u) + (buffering.present ? 1u : 0u);
+    ProxyLocationDirective directives[4]{};
+    u32 directive_count = 0u;
+    directives[directive_count++] = {proxy.span, ProxyLocationDirectiveKind::ProxyPass};
+    directives[directive_count++] = {header.span, ProxyLocationDirectiveKind::ProxyHideHeader};
+    if (timeout.present)
+        directives[directive_count++] = {timeout.span,
+                                         ProxyLocationDirectiveKind::ProxyReadTimeout};
+    if (buffering.present)
+        directives[directive_count++] = {buffering.span,
+                                         ProxyLocationDirectiveKind::ProxyBuffering};
     for (u32 i = 1u; i < directive_count; i++) {
         const ProxyLocationDirective value = directives[i];
         u32 pos = i;
