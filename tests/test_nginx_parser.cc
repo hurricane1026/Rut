@@ -20702,7 +20702,7 @@ TEST(nginx_parser_issue373, rejects_bad_arity_name_duplicates_and_contexts) {
     }
 }
 
-TEST(nginx_parser_issue600, bounded_custom_names_preserve_spelling_and_lowering_rejects) {
+TEST(nginx_converter_issue600, bounded_custom_names_preserve_spelling_and_lowering) {
     const std::string names[] = {
         "X-A",
         "X-Powered-By",
@@ -20724,7 +20724,7 @@ TEST(nginx_parser_issue600, bounded_custom_names_preserve_spelling_and_lowering_
     };
     for (size_t index = 0u; index < std::size(names); index++) {
         const std::string& name = names[index];
-        const std::string source = make_source(name, index);
+        std::string source = make_source(name, index);
         const auto parsed = nginx::parse({source.data(), static_cast<u32>(source.size())});
         REQUIRE(parsed);
         const auto& header = parsed.value().location.proxy_hide_header;
@@ -20740,13 +20740,77 @@ TEST(nginx_parser_issue600, bounded_custom_names_preserve_spelling_and_lowering_
         CHECK_EQ(header.span.start, static_cast<u32>(directive_at));
         CHECK_EQ(header.span.end, static_cast<u32>(source.find(';', name_at) + 1u));
         const auto lowered = nginx::lower_to_rut(parsed.value());
-        REQUIRE_FALSE(lowered);
-        CHECK_EQ(lowered.error().code, FrontendError::UnsupportedSyntax);
-        const Str expected_detail = name.size() == 15u
-                                        ? lit_str("invalid proxy_hide_header source syntax")
-                                        : lit_str("invalid proxy_hide_header name model");
-        CHECK(lowered.error().detail.eq(expected_detail));
-        CHECK_EQ(lowered.error().span.start, header.span.start);
+        REQUIRE(lowered);
+        const std::string output(lowered.value().data, lowered.value().len);
+        CHECK_EQ(count_text(output, "hide_headers: [\"Date\", \"Server\", \"X-Pad\", \""), 3u);
+        CHECK_NE(output.find(name + "\"]"), std::string::npos);
+        CHECK_LT(lowered.value().len, nginx::RutSource::kCapacity);
+        const std::string owned(output);
+        std::fill(source.begin(), source.end(), 'x');
+        CHECK_EQ(std::string(lowered.value().data, lowered.value().len), owned);
+    }
+}
+
+TEST(nginx_converter_issue600, maximum_custom_name_preserves_legacy_output_at_maximum_endpoints) {
+    const std::string custom_name = "X-" + std::string(44u, 'A');
+    const std::string legacy_source =
+        "server { listen 127.0.0.1:65535; location / { proxy_hide_header X-Compat-Hidden; "
+        "proxy_pass http://255.255.255.255:65535; } }";
+    const std::string custom_source =
+        "server { listen 127.0.0.1:65535; location / { proxy_hide_header " + custom_name +
+        "; proxy_pass http://255.255.255.255:65535; } }";
+    const auto legacy =
+        nginx::parse({legacy_source.data(), static_cast<u32>(legacy_source.size())});
+    const auto custom =
+        nginx::parse({custom_source.data(), static_cast<u32>(custom_source.size())});
+    REQUIRE(legacy);
+    REQUIRE(custom);
+    const auto legacy_lowered = nginx::lower_to_rut(legacy.value());
+    const auto custom_lowered = nginx::lower_to_rut(custom.value());
+    REQUIRE(legacy_lowered);
+    REQUIRE(custom_lowered);
+    std::string expected(legacy_lowered.value().data, legacy_lowered.value().len);
+    size_t offset = 0u;
+    while ((offset = expected.find("X-Compat-Hidden", offset)) != std::string::npos) {
+        expected.replace(offset, 15u, custom_name);
+        offset += custom_name.size();
+    }
+    CHECK_EQ(std::string(custom_lowered.value().data, custom_lowered.value().len), expected);
+    CHECK_LT(custom_lowered.value().len, nginx::RutSource::kCapacity);
+    CHECK_EQ(custom_lowered.value().data[custom_lowered.value().len], '\0');
+    CHECK_EQ(memchr(custom_lowered.value().data, '\0', custom_lowered.value().len), nullptr);
+}
+
+TEST(nginx_converter_issue600, custom_name_server_provenance_rejects_forged_views_in_both_orders) {
+    const std::string name = "X-Powered-By";
+    for (size_t order = 0u; order != 2u; ++order) {
+        std::string source =
+            order == 0u
+                ? "server { listen 127.0.0.1:8080; location / { proxy_hide_header " + name +
+                      "; proxy_pass http://127.0.0.1:9000; } }"
+                : "server { location / { proxy_pass http://127.0.0.1:9000; proxy_hide_header " +
+                      name + "; } listen 127.0.0.1:8080; }";
+        const auto parsed = nginx::parse({source.data(), static_cast<u32>(source.size())});
+        REQUIRE(parsed);
+        const auto accepted = parsed.value();
+        const auto reject = [&](const nginx::Server& forged, Str detail) {
+            const auto result = nginx::lower_to_rut(forged);
+            REQUIRE_FALSE(result);
+            CHECK(result.error().detail.eq(detail));
+        };
+        auto forged = accepted;
+        forged.location.proxy_hide_header.name.ptr =
+            reinterpret_cast<const char*>(static_cast<uintptr_t>(1));
+        reject(forged, lit_str("invalid proxy_hide_header source provenance"));
+        forged = accepted;
+        forged.location.proxy_hide_header.name_span.start++;
+        reject(forged, lit_str("invalid proxy_hide_header spans"));
+        std::string detached(source);
+        forged = accepted;
+        const size_t name_offset = source.find(name);
+        REQUIRE(name_offset != std::string::npos);
+        forged.location.proxy_hide_header.name.ptr = detached.data() + name_offset;
+        reject(forged, lit_str("invalid proxy_hide_header source provenance"));
     }
 }
 
@@ -20813,6 +20877,40 @@ TEST(nginx_parser_issue600, custom_name_keeps_context_order_and_duplicate_reject
     }
 }
 
+TEST(nginx_converter_issue600, custom_name_http_profile_output_is_owned_and_authenticated) {
+    std::string source = make_request_length_http_profile(
+        "/tmp/rut-600-access.log",
+        "    listen 127.0.0.1:8080;\n"
+        "    location / { proxy_hide_header x-Powered_by-9; proxy_pass "
+        "http://127.0.0.1:9000; }\n");
+    const auto parsed = nginx::parse_http_profile({source.data(), static_cast<u32>(source.size())});
+    REQUIRE(parsed);
+    const auto lowered = nginx::lower_to_rut(parsed.value());
+    REQUIRE(lowered);
+    const std::string owned(lowered.value().data, lowered.value().len);
+    CHECK_NE(owned.find("hide_headers: [\"Date\", \"Server\", \"X-Pad\", \"x-Powered_by-9\"]"),
+             std::string::npos);
+    CHECK_LT(lowered.value().len, nginx::HttpProfileRutSource::kCapacity);
+
+    const std::string complete_source = "events {}\n" + source;
+    const auto complete = nginx::parse_nginx_http_config(
+        {complete_source.data(), static_cast<u32>(complete_source.size())});
+    REQUIRE(complete);
+    const auto complete_lowered = nginx::lower_to_rut(complete.value());
+    REQUIRE(complete_lowered);
+    CHECK_EQ(std::string(complete_lowered.value().data, complete_lowered.value().len), owned);
+
+    auto forged = parsed.value();
+    forged.server.location.proxy_hide_header.name.ptr =
+        reinterpret_cast<const char*>(static_cast<uintptr_t>(1));
+    const auto rejected = nginx::lower_to_rut(forged);
+    REQUIRE_FALSE(rejected);
+    CHECK(rejected.error().detail.eq(lit_str("http profile metadata does not match its source")));
+
+    std::fill(source.begin(), source.end(), 'x');
+    CHECK_EQ(std::string(lowered.value().data, lowered.value().len), owned);
+}
+
 TEST(nginx_parser_issue373, retained_profiles_have_fully_default_absent_hide_inventory) {
     const char* sources[] = {
         "server { listen 8080; location / { proxy_pass http://127.0.0.1:9000; } }",
@@ -20868,7 +20966,7 @@ TEST(nginx_converter_issue373, rejects_forged_hide_inventory_without_dynamic_rea
     for (const u32 len : {14u, 16u}) {
         forged = accepted;
         forged.location.proxy_hide_header.name.len = len;
-        reject(forged, lit_str("invalid proxy_hide_header name model"));
+        reject(forged, lit_str("invalid proxy_hide_header spans"));
     }
     forged = accepted;
     forged.location.proxy_hide_header.name.ptr = nullptr;
@@ -20914,7 +21012,7 @@ TEST(nginx_converter_issue373, rejects_forged_hide_inventory_without_dynamic_rea
     source[keyword] = saved_keyword;
     const u32 name = accepted.location.proxy_hide_header.name_span.start;
     const char saved_name = source[name];
-    source[name] = 'x';
+    source[name] = 'Q';
     reject(accepted, lit_str("invalid proxy_hide_header source syntax"));
     source[name] = saved_name;
     const char saved_semicolon = source[semicolon];
@@ -21203,6 +21301,51 @@ TEST(nginx_converter_issue373, http_profile_comparison_rejects_forged_hide_child
     rejected = nginx::lower_to_rut(forged);
     REQUIRE_FALSE(rejected);
     CHECK(rejected.error().detail.eq(lit_str("http profile metadata does not match its source")));
+}
+
+TEST(nginx_converter_issue600,
+     maximum_custom_name_logged_profile_and_complete_wrapper_fit_owned_capacity) {
+    const std::string name = "X-" + std::string(44u, 'A');
+    const std::string server =
+        "    listen 127.0.0.1:65535;\n"
+        "    location / { proxy_hide_header " +
+        name + "; proxy_pass http://255.255.255.255:65535; }\n";
+    const std::string source = make_request_length_http_profile(
+        "/" + std::string(nginx::kMaxAccessLogPathLen - 1u, 'p'), server);
+    const auto parsed = nginx::parse_http_profile({source.data(), static_cast<u32>(source.size())});
+    REQUIRE(parsed);
+    const auto lowered = nginx::lower_to_rut(parsed.value());
+    REQUIRE(lowered);
+    CHECK_LT(lowered.value().len, nginx::HttpProfileRutSource::kCapacity);
+    CHECK_EQ(lowered.value().data[lowered.value().len], '\0');
+    CHECK_EQ(memchr(lowered.value().data, '\0', lowered.value().len), nullptr);
+    CHECK_EQ(count_text(std::string(lowered.value().data, lowered.value().len), name), 3u);
+
+    const std::string complete_source = "events {}\n" + source;
+    const auto complete = nginx::parse_nginx_http_config(
+        {complete_source.data(), static_cast<u32>(complete_source.size())});
+    REQUIRE(complete);
+    const auto complete_lowered = nginx::lower_to_rut(complete.value());
+    REQUIRE(complete_lowered);
+    CHECK_EQ(std::string(complete_lowered.value().data, complete_lowered.value().len),
+             std::string(lowered.value().data, lowered.value().len));
+    CHECK_EQ(complete_lowered.value().data[complete_lowered.value().len], '\0');
+    CHECK_EQ(memchr(complete_lowered.value().data, '\0', complete_lowered.value().len), nullptr);
+
+    auto forged = parsed.value();
+    forged.server.location.proxy_hide_header.name_span.start++;
+    const auto rejected = nginx::lower_to_rut(forged);
+    REQUIRE_FALSE(rejected);
+    CHECK(rejected.error().detail.eq(lit_str("http profile metadata does not match its source")));
+    forged = parsed.value();
+    std::string detached(source);
+    const size_t name_offset = source.find(name);
+    REQUIRE(name_offset != std::string::npos);
+    forged.server.location.proxy_hide_header.name.ptr = detached.data() + name_offset;
+    const auto detached_rejected = nginx::lower_to_rut(forged);
+    REQUIRE_FALSE(detached_rejected);
+    CHECK(detached_rejected.error().detail.eq(
+        lit_str("http profile metadata does not match its source")));
 }
 
 TEST(nginx_converter_issue398, numeric_ipv4_has_owned_ordinary_rut_golden_and_frontend_lifetime) {

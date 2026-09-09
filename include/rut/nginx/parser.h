@@ -6,6 +6,30 @@
 
 namespace rut::nginx {
 
+// The shared bounded readable-view grammar for the one-name proxy_hide_header
+// slice. Callers must establish that the view is readable before invoking it.
+inline bool valid_proxy_hide_header_name(Str name) {
+    if (name.ptr == nullptr || name.len < 3u || name.len > 46u ||
+        (name.ptr[0] != 'X' && name.ptr[0] != 'x') || name.ptr[1] != '-')
+        return false;
+    const auto lower = [](char c) {
+        return c >= 'A' && c <= 'Z' ? static_cast<char>(c + ('a' - 'A')) : c;
+    };
+    if ((name.len == 5u && lower(name.ptr[2]) == 'p' && lower(name.ptr[3]) == 'a' &&
+         lower(name.ptr[4]) == 'd') ||
+        (name.len >= 8u && lower(name.ptr[2]) == 'a' && lower(name.ptr[3]) == 'c' &&
+         lower(name.ptr[4]) == 'c' && lower(name.ptr[5]) == 'e' && lower(name.ptr[6]) == 'l' &&
+         name.ptr[7] == '-'))
+        return false;
+    for (u32 i = 2u; i < name.len; i++) {
+        const char c = name.ptr[i];
+        const bool alpha = (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z');
+        const bool digit = c >= '0' && c <= '9';
+        if (!alpha && !digit && c != '_' && c != '-') return false;
+    }
+    return true;
+}
+
 struct Listen {
     u16 port = 0;
     Span span{};

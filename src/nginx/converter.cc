@@ -1335,7 +1335,7 @@ FrontendResult<bool> validate_proxy_hide_header(const Server& server, bool exact
 
     // Pointer/length/span/arithmetic gates precede every dynamic byte read.
     const uintptr_t name_address = reinterpret_cast<uintptr_t>(header.name.ptr);
-    if (header.name.ptr == nullptr || header.name.len != 15u ||
+    if (header.name.ptr == nullptr || header.name.len < 3u || header.name.len > 46u ||
         name_address > UINTPTR_MAX - header.name.len)
         return unsupported(fallback, lit_str("invalid proxy_hide_header name model"));
     const Location& location = server.location;
@@ -1350,7 +1350,7 @@ FrontendResult<bool> validate_proxy_hide_header(const Server& server, bool exact
         !is_valid_span(header.span) || !is_valid_span(header.name_span) ||
         !span_position_is_coherent(location.span, header.span) ||
         !span_position_is_coherent(header.span, header.name_span) ||
-        header.span.end - header.span.start < 34u ||
+        header.span.end - header.span.start < 19u + header.name.len ||
         header.name_span.end - header.name_span.start != header.name.len ||
         header.span.start <= location.path_span.end || header.span.end >= location.span.end ||
         header.name_span.start - header.span.start <= 17u ||
@@ -1452,12 +1452,13 @@ FrontendResult<bool> validate_proxy_hide_header(const Server& server, bool exact
         return unsupported(proxy.span, lit_str("invalid proxy_pass source syntax"));
     if (timeout.present && !proxy_read_timeout_source_is_coherent(source_base, timeout))
         return unsupported(timeout.span, lit_str("invalid proxy_read_timeout source syntax"));
+    const Str trusted_name{trusted_source_at(source_base, header.name_span.start), header.name.len};
     if (!eq({trusted_source_at(source_base, header.span.start), 17u}, "proxy_hide_header", 17u) ||
         *trusted_source_at(source_base, header.span.end - 1u) != ';' ||
         !trusted_source_gap_is_exact(
             source_base, header.span.start + 17u, header.name_span.start) ||
         !trusted_source_gap_is_exact(source_base, header.name_span.end, header.span.end - 1u) ||
-        !eq(header.name, "X-Compat-Hidden", 15u))
+        !valid_proxy_hide_header_name(trusted_name))
         return unsupported(fallback, lit_str("invalid proxy_hide_header source syntax"));
 
     const bool minimal_profile =
@@ -1656,7 +1657,7 @@ bool put_request_policy(Writer& writer, RequestPolicyPlacement placement) {
            writer.put_cstr("        },\n");
 }
 
-bool put_response_policy(Writer& writer, bool suppress_body, bool hide_compat_header) {
+bool put_response_policy(Writer& writer, bool suppress_body, Str hide_header_name) {
     return writer.put_cstr("        response_policy: {\n") &&
            writer.put_cstr("            version: \"HTTP/1.1\",\n") &&
            writer.put_cstr("            framing: \"content_length\",\n") &&
@@ -1664,10 +1665,12 @@ bool put_response_policy(Writer& writer, bool suppress_body, bool hide_compat_he
            (!suppress_body || writer.put_cstr("            head_mode: \"suppress_body\",\n")) &&
            writer.put_cstr("            server: \"nginx/1.29.7\",\n") &&
            writer.put_cstr("            date: \"current\",\n") &&
-           writer.put_cstr(hide_compat_header
-                               ? "            hide_headers: [\"Date\", \"Server\", \"X-Pad\", "
-                                 "\"X-Compat-Hidden\"]\n"
-                               : "            hide_headers: [\"Date\", \"Server\", \"X-Pad\"]\n") &&
+           writer.put_cstr("            hide_headers: [\"Date\", \"Server\", \"X-Pad\"") &&
+           (hide_header_name.len == 0u
+                ? writer.put_cstr("]\n")
+                : writer.put_cstr(", \"") &&
+                      writer.put_lit(hide_header_name.ptr, hide_header_name.len) &&
+                      writer.put_cstr("\"]\n")) &&
            writer.put_cstr("        },\n");
 }
 
@@ -1707,7 +1710,7 @@ bool put_root_forward(Writer& writer,
                       RequestPolicyPlacement request_policy_placement,
                       bool suppress_body,
                       bool buffered,
-                      bool hide_compat_header,
+                      Str hide_header_name,
                       bool timeout_present,
                       u8 timeout_seconds) {
     return writer.put_cstr("route ") &&
@@ -1716,7 +1719,7 @@ bool put_root_forward(Writer& writer,
                 : writer.put_lit(method, method_len) && writer.put_cstr(" \"/\" {\n")) &&
            writer.put_cstr("    return forward(nginx_upstream, ") &&
            put_request_policy(writer, request_policy_placement) &&
-           put_response_policy(writer, suppress_body, hide_compat_header) &&
+           put_response_policy(writer, suppress_body, hide_header_name) &&
            put_failure_policy(writer, suppress_body, buffered || timeout_present) &&
            ((buffered || timeout_present) ? put_timeout_failure_policy(writer, suppress_body)
                                           : true) &&
@@ -1733,13 +1736,13 @@ bool put_root_forward_action(Writer& writer,
                              RequestPolicyPlacement request_policy_placement,
                              bool suppress_body,
                              bool buffered,
-                             bool hide_compat_header,
+                             Str hide_header_name,
                              bool timeout_present,
                              u8 timeout_seconds,
                              Str indent) {
     return writer.put(indent) && writer.put_cstr("return forward(nginx_upstream, ") &&
            put_request_policy(writer, request_policy_placement) &&
-           put_response_policy(writer, suppress_body, hide_compat_header) &&
+           put_response_policy(writer, suppress_body, hide_header_name) &&
            put_failure_policy(writer, suppress_body, buffered || timeout_present) &&
            ((buffered || timeout_present) ? put_timeout_failure_policy(writer, suppress_body)
                                           : true) &&
@@ -1752,14 +1755,14 @@ bool put_root_forward_action(Writer& writer,
            writer.put_cstr("    )\n");
 }
 
-bool put_root_timeout_head_forward(Writer& writer, bool hide_compat_header, u8 timeout_seconds) {
+bool put_root_timeout_head_forward(Writer& writer, Str hide_header_name, u8 timeout_seconds) {
     return writer.put_cstr("route HEAD \"/\" {\n") &&
            writer.put_cstr("    if req.hasContentLength {\n") &&
            put_root_forward_action(writer,
                                    RequestPolicyPlacement::ContentLengthAfterHost,
                                    true,
                                    false,
-                                   hide_compat_header,
+                                   hide_header_name,
                                    true,
                                    timeout_seconds,
                                    lit_str("        ")) &&
@@ -1768,21 +1771,21 @@ bool put_root_timeout_head_forward(Writer& writer, bool hide_compat_header, u8 t
                                    RequestPolicyPlacement::Legacy,
                                    true,
                                    false,
-                                   hide_compat_header,
+                                   hide_header_name,
                                    true,
                                    timeout_seconds,
                                    lit_str("        ")) &&
            writer.put_cstr("    }\n}\n");
 }
 
-bool put_root_get_retained_header_forward(Writer& writer, bool hide_compat_header) {
+bool put_root_get_retained_header_forward(Writer& writer, Str hide_header_name) {
     return writer.put_cstr("route GET \"/\" {\n") &&
            writer.put_cstr("    if req.hasContentLength {\n") &&
            put_root_forward_action(writer,
                                    RequestPolicyPlacement::Legacy,
                                    false,
                                    true,
-                                   hide_compat_header,
+                                   hide_header_name,
                                    false,
                                    60u,
                                    lit_str("        ")) &&
@@ -1791,7 +1794,7 @@ bool put_root_get_retained_header_forward(Writer& writer, bool hide_compat_heade
                                    RequestPolicyPlacement::RetainedHeaderValue,
                                    false,
                                    true,
-                                   hide_compat_header,
+                                   hide_header_name,
                                    false,
                                    60u,
                                    lit_str("        ")) &&
@@ -1803,6 +1806,7 @@ bool put_exact_absolute_redirect(Writer& writer,
                                  u16 status,
                                  Str static_authority,
                                  Str target_path,
+                                 Str hide_header_name,
                                  bool timeout_present,
                                  u8 timeout_seconds) {
     const char* reason = nullptr;
@@ -1847,7 +1851,7 @@ bool put_exact_absolute_redirect(Writer& writer,
                                    RequestPolicyPlacement::Legacy,
                                    false,
                                    true,
-                                   false,
+                                   hide_header_name,
                                    timeout_present,
                                    timeout_seconds,
                                    lit_str("        ")) &&
@@ -2140,6 +2144,7 @@ FrontendResult<RutSource> lower_to_rut(const Server& server) {
     auto proxy_location = validate_proxy_location(server);
     if (!proxy_location) return core::make_unexpected(proxy_location.error());
     bool hide_compat_header = false;
+    Str hide_header_name{};
     bool exact_listener = false;
     const bool timeout_present = server.location.proxy_read_timeout.present;
     u8 timeout_seconds = timeout_present ? 0u : 60u;
@@ -2151,6 +2156,7 @@ FrontendResult<RutSource> lower_to_rut(const Server& server) {
         auto header = validate_proxy_hide_header(server, listener.value());
         if (!header) return core::make_unexpected(header.error());
         hide_compat_header = true;
+        hide_header_name = server.location.proxy_hide_header.name;
     } else {
         auto timeout = validate_proxy_read_timeout(server);
         if (!timeout) return core::make_unexpected(timeout.error());
@@ -2248,14 +2254,14 @@ FrontendResult<RutSource> lower_to_rut(const Server& server) {
 
     if (is_root) {
         if ((timeout_present
-                 ? !put_root_timeout_head_forward(writer, hide_compat_header, timeout_seconds)
+                 ? !put_root_timeout_head_forward(writer, hide_header_name, timeout_seconds)
                  : !put_root_forward(writer,
                                      "HEAD",
                                      4,
                                      RequestPolicyPlacement::Legacy,
                                      true,
                                      false,
-                                     hide_compat_header,
+                                     hide_header_name,
                                      false,
                                      timeout_seconds)) ||
             (exact_absolute_redirect.value()
@@ -2264,17 +2270,18 @@ FrontendResult<RutSource> lower_to_rut(const Server& server) {
                                                 server.exact_absolute_redirect.response.status,
                                                 server.exact_absolute_redirect.response.authority,
                                                 server.exact_absolute_redirect.response.path,
+                                                hide_header_name,
                                                 timeout_present,
                                                 timeout_seconds)
                  : (retained_header_get_shape
-                        ? !put_root_get_retained_header_forward(writer, hide_compat_header)
+                        ? !put_root_get_retained_header_forward(writer, hide_header_name)
                         : !put_root_forward(writer,
                                             "GET",
                                             3,
                                             RequestPolicyPlacement::Legacy,
                                             false,
                                             true,
-                                            hide_compat_header,
+                                            hide_header_name,
                                             timeout_present,
                                             timeout_seconds))) ||
             !put_root_forward(writer,
@@ -2283,7 +2290,7 @@ FrontendResult<RutSource> lower_to_rut(const Server& server) {
                               RequestPolicyPlacement::Legacy,
                               false,
                               false,
-                              hide_compat_header,
+                              hide_header_name,
                               timeout_present,
                               timeout_seconds) ||
             (exact_local_return.value() &&
