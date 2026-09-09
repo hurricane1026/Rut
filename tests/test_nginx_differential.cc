@@ -53372,29 +53372,44 @@ static bool validate_custom_hide_timeout_loaded_program(const std::string& sourc
     const auto r1 = invoke(*head, h1, static_cast<u32>(strlen(h1)));
     const auto rg = invoke(*get, g, static_cast<u32>(strlen(g)));
     const auto ra = invoke(*any, p, static_cast<u32>(strlen(p)));
-    if (!predicate(*head,
-                   r0,
-                   static_cast<u16>(rut::RequestPolicyId::Http11FixedStrip),
-                   static_cast<u16>(rut::ResponsePolicyHeadMode::SuppressBody),
-                   rut::ForwardResponseBufferingMode::None) ||
-        !predicate(*head,
-                   r1,
-                   static_cast<u16>(rut::RequestPolicyId::Http11FixedStripContentLengthAfterHost),
-                   static_cast<u16>(rut::ResponsePolicyHeadMode::SuppressBody),
-                   rut::ForwardResponseBufferingMode::None) ||
-        !predicate(*get,
-                   rg,
-                   static_cast<u16>(rut::RequestPolicyId::Http11FixedStrip),
-                   static_cast<u16>(rut::ResponsePolicyHeadMode::Reject),
-                   rut::ForwardResponseBufferingMode::CompleteContentLength) ||
-        !predicate(*any,
-                   ra,
-                   static_cast<u16>(rut::RequestPolicyId::Http11FixedStrip),
-                   static_cast<u16>(rut::ResponsePolicyHeadMode::Reject),
-                   rut::ForwardResponseBufferingMode::None) ||
-        r0.next_state != r1.next_state || rg.next_state == r0.next_state ||
-        ra.next_state == rg.next_state || program->config.policy_bundle_count != 3u) {
-        error = "#616 loaded custom-hide timeout JIT bundles were not the exact three-way split";
+    const bool head0_ok = predicate(*head,
+                                    r0,
+                                    static_cast<u16>(rut::RequestPolicyId::Http11FixedStrip),
+                                    static_cast<u16>(rut::ResponsePolicyHeadMode::SuppressBody),
+                                    rut::ForwardResponseBufferingMode::None);
+    const bool head1_ok =
+        predicate(*head,
+                  r1,
+                  static_cast<u16>(rut::RequestPolicyId::Http11FixedStripContentLengthAfterHost),
+                  static_cast<u16>(rut::ResponsePolicyHeadMode::SuppressBody),
+                  rut::ForwardResponseBufferingMode::None);
+    const bool get_ok = predicate(*get,
+                                  rg,
+                                  static_cast<u16>(rut::RequestPolicyId::Http11FixedStrip),
+                                  static_cast<u16>(rut::ResponsePolicyHeadMode::Reject),
+                                  rut::ForwardResponseBufferingMode::CompleteContentLength);
+    const bool any_ok = predicate(*any,
+                                  ra,
+                                  static_cast<u16>(rut::RequestPolicyId::Http11FixedStrip),
+                                  static_cast<u16>(rut::ResponsePolicyHeadMode::Reject),
+                                  rut::ForwardResponseBufferingMode::None);
+    const bool distinct_ok = r0.next_state == r1.next_state && rg.next_state != r0.next_state &&
+                             ra.next_state != rg.next_state &&
+                             program->config.policy_bundle_count == 3u;
+    if (!head0_ok || !head1_ok || !get_ok || !any_ok || !distinct_ok) {
+        const auto result_text = [](const rut::jit::HandlerResult& result) {
+            return "action=" + std::to_string(static_cast<u32>(result.action)) +
+                   ",request=" + std::to_string(result.status_code) +
+                   ",upstream=" + std::to_string(result.upstream_id) +
+                   ",bundle=" + std::to_string(result.next_state);
+        };
+        error = "#616 loaded custom-hide timeout JIT bundle mismatch: HEAD0[" + result_text(r0) +
+                ",ok=" + std::to_string(head0_ok) + "] HEAD1[" + result_text(r1) +
+                ",ok=" + std::to_string(head1_ok) + "] GET[" + result_text(rg) +
+                ",ok=" + std::to_string(get_ok) + "] ANY[" + result_text(ra) +
+                ",ok=" + std::to_string(any_ok) +
+                "] bundles=" + std::to_string(program->config.policy_bundle_count) +
+                " distinct=" + std::to_string(distinct_ok);
         return false;
     }
     const auto rejects = [&](rut::jit::HandlerResult bad, const char* label) {
