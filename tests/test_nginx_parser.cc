@@ -3767,9 +3767,6 @@ TEST(nginx_converter, admits_authenticated_explicit_proxy_buffering_on_timeout_f
         "server { listen 192.0.2.10:8080; location / { proxy_buffering on; "
         "proxy_read_timeout 1s; proxy_pass http://127.0.0.1:9000; } }",
         "server { listen 127.0.0.1:8080; location / { proxy_buffering on; "
-        "proxy_read_timeout 1s; proxy_hide_header X-Compat-Hidden; proxy_pass "
-        "http://127.0.0.1:9000; } }",
-        "server { listen 127.0.0.1:8080; location / { proxy_buffering on; "
         "proxy_read_timeout 1s; proxy_pass http://127.0.0.1:9000; } "
         "location = /old { return 302 http://redirect.example/new; } }",
     };
@@ -21250,6 +21247,33 @@ TEST(nginx_converter_issue270, exact_redirect_keeps_timeout_on_get_fallback_forw
     CHECK_EQ(count_text(output, "if req.hasContentLength"), 1u);
     CHECK_EQ(count_text(output, "content_length_position: \"after_host\""), 1u);
     CHECK_EQ(count_text(output, "return redirect({"), 1u);
+}
+
+TEST(nginx_converter_issue621, explicit_buffering_custom_hide_timeout_is_byte_identical) {
+    const char* names[] = {"X-A", "X-Ab9_-Ab9_-Ab9_-Ab9_-Ab9_-Ab9_-Ab9_-Ab9_-Cd0E"};
+    for (const char* name : names) {
+        for (const char* timeout : {"1s", "63s"}) {
+            const std::string omitted =
+                std::string("server { listen 127.0.0.1:8080; location / { ") +
+                "proxy_read_timeout " + timeout + "; proxy_hide_header " + name +
+                "; proxy_pass http://127.0.0.1:9000; } }";
+            const std::string explicit_on =
+                std::string("server { listen 127.0.0.1:8080; location / { ") +
+                "proxy_hide_header " + name + "; proxy_buffering on; proxy_read_timeout " +
+                timeout + "; proxy_pass http://127.0.0.1:9000; } }";
+            const auto omitted_model =
+                nginx::parse({omitted.data(), static_cast<u32>(omitted.size())});
+            const auto explicit_model =
+                nginx::parse({explicit_on.data(), static_cast<u32>(explicit_on.size())});
+            REQUIRE(omitted_model);
+            REQUIRE(explicit_model);
+            const auto omitted_lowered = nginx::lower_to_rut(omitted_model.value());
+            const auto explicit_lowered = nginx::lower_to_rut(explicit_model.value());
+            REQUIRE(omitted_lowered);
+            REQUIRE(explicit_lowered);
+            CHECK(explicit_lowered.value().view().eq(omitted_lowered.value().view()));
+        }
+    }
 }
 
 TEST(nginx_converter_issue270, custom_hide_header_and_timeout_lower_together) {

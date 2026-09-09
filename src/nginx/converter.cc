@@ -1273,7 +1273,12 @@ FrontendResult<bool> validate_proxy_read_timeout(const Server& server) {
     return true;
 }
 
-enum class ProxyLocationDirectiveKind : u8 { ProxyPass, ProxyReadTimeout, ProxyHideHeader };
+enum class ProxyLocationDirectiveKind : u8 {
+    ProxyPass,
+    ProxyReadTimeout,
+    ProxyHideHeader,
+    ProxyBuffering
+};
 
 struct ProxyLocationDirective {
     Span span{};
@@ -1346,6 +1351,7 @@ FrontendResult<bool> validate_proxy_hide_header(const Server& server, bool exact
     const Location& location = server.location;
     const ProxyPass& proxy = location.proxy_pass;
     const ProxyReadTimeout& timeout = location.proxy_read_timeout;
+    const ProxyBuffering& buffering = location.proxy_buffering;
     if (!is_valid_span(location.span) || !is_valid_span(location.path_span) ||
         !is_valid_span(proxy.span) || !span_position_is_coherent(server.span, location.span) ||
         !span_position_is_coherent(location.span, location.path_span) ||
@@ -1364,6 +1370,13 @@ FrontendResult<bool> validate_proxy_hide_header(const Server& server, bool exact
          (header.span.start < proxy.span.end && proxy.span.start < header.span.end)) ||
         (timeout.present &&
          (header.span.start < timeout.span.end && timeout.span.start < header.span.end)))
+        return unsupported(fallback, lit_str("invalid proxy_hide_header spans"));
+    if (buffering.present &&
+        (!is_valid_span(buffering.span) || !is_valid_span(buffering.value_span) ||
+         !span_position_is_coherent(location.span, buffering.span) ||
+         !span_position_is_coherent(buffering.span, buffering.value_span) ||
+         buffering.span.end >= location.span.end ||
+         (header.span.start < buffering.span.end && buffering.span.start < header.span.end)))
         return unsupported(fallback, lit_str("invalid proxy_hide_header spans"));
     if (proxy.has_uri) {
         if (!is_valid_span(proxy.uri_span) ||
@@ -1414,12 +1427,13 @@ FrontendResult<bool> validate_proxy_hide_header(const Server& server, bool exact
     // All bytes below are in the already-proven common source. Sort the complete
     // modeled location inventory so every byte between the braces is accounted
     // for independently of nginx directive order.
-    ProxyLocationDirective directives[3] = {
+    ProxyLocationDirective directives[4] = {
         {proxy.span, ProxyLocationDirectiveKind::ProxyPass},
         {header.span, ProxyLocationDirectiveKind::ProxyHideHeader},
         {timeout.span, ProxyLocationDirectiveKind::ProxyReadTimeout},
+        {buffering.span, ProxyLocationDirectiveKind::ProxyBuffering},
     };
-    const u32 directive_count = timeout.present ? 3u : 2u;
+    const u32 directive_count = 2u + (timeout.present ? 1u : 0u) + (buffering.present ? 1u : 0u);
     for (u32 i = 1u; i < directive_count; i++) {
         const ProxyLocationDirective value = directives[i];
         u32 pos = i;
@@ -2148,6 +2162,9 @@ FrontendResult<RutSource> lower_to_rut(const Server& server) {
     if (!exact_local_return) return core::make_unexpected(exact_local_return.error());
     auto proxy_location = validate_proxy_location(server);
     if (!proxy_location) return core::make_unexpected(proxy_location.error());
+    auto proxy_buffering = validate_proxy_buffering(server);
+    if (!proxy_buffering) return core::make_unexpected(proxy_buffering.error());
+    const bool explicit_buffering_on = proxy_buffering.value();
     bool hide_compat_header = false;
     Str hide_header_name{};
     bool exact_listener = false;
@@ -2202,15 +2219,11 @@ FrontendResult<RutSource> lower_to_rut(const Server& server) {
     if (exact_no_content_return.value() && !is_root)
         return unsupported(server.exact_no_content_return.span,
                            lit_str("exact no-content return requires location / fallback"));
-    auto proxy_buffering = validate_proxy_buffering(server);
-    if (!proxy_buffering) return core::make_unexpected(proxy_buffering.error());
-    const bool explicit_buffering_on = proxy_buffering.value();
     if (explicit_buffering_on &&
         !(is_root && exact_listener && server.listen.address == ListenerAddress::IPv4Exact &&
           server.listen.ipv4_host == 0x7f000001u && timeout_present &&
           server.location.proxy_read_timeout.milliseconds >= 1000u &&
-          server.location.proxy_read_timeout.milliseconds <= 63000u && !hide_compat_header &&
-          !has_sibling_action))
+          server.location.proxy_read_timeout.milliseconds <= 63000u && !has_sibling_action))
         return unsupported(
             server.location.proxy_buffering.span,
             lit_str("proxy_buffering on requires the bounded timeout proxy profile"));
