@@ -26570,6 +26570,8 @@ static bool run_rut_iouring_gate_spike(u16 frontend_port,
         error = "failed to configure RUT io_uring target client timeouts";
         return false;
     }
+    // Publish and arm the complete target identity before connect so accept's
+    // first Recv cannot race ahead of the target tuple publication.
     mapping.gate->target_peer_ipv4_be = local.sin_addr.s_addr;
     mapping.gate->target_peer_port_be = local.sin_port;
     mapping.gate->target_upstream_ipv4_be = htonl(INADDR_LOOPBACK);
