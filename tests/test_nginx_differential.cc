@@ -72269,6 +72269,15 @@ static bool run_pinned_nginx_custom_hide_timeout_probe(const std::string& contai
         }
     }
     const u64 observed_ns = steady_now_ns();
+    const auto expiry_timing_tuple_valid = [](u64 first_ns, u64 second_ns, u64 terminal_ns) {
+        return second_ns > first_ns && terminal_ns > second_ns &&
+               second_ns - first_ns >= 550'000'000ull && second_ns - first_ns < 750'000'000ull &&
+               terminal_ns - second_ns >= 750'000'000ull &&
+               terminal_ns - second_ns < 2'000'000'000ull;
+    };
+    const bool timing_tuple_positive = expiry_timing_tuple_valid(first_ns, second_ns, observed_ns);
+    const bool timing_tuple_mutant_rejected =
+        !expiry_timing_tuple_valid(first_ns, second_ns, first_ns + 1'000'000'000ull);
     std::string access;
     const bool access_read = read_request_length_access_file(temp.nginx_access_log, access, error);
     const u64 expiry_elapsed_ns = observed_ns - second_ns;
@@ -72305,7 +72314,8 @@ static bool run_pinned_nginx_custom_hide_timeout_probe(const std::string& contai
                                            !response_matches_expiry_contract(leaked_header) &&
                                            !response_matches_expiry_contract(missing_unrelated) &&
                                            !response_matches_expiry_contract(body_corruption);
-    const bool timing_mutants_rejected = !expiry_timing_is_valid(400'000'000ull) &&
+    const bool timing_mutants_rejected = timing_tuple_positive && timing_tuple_mutant_rejected &&
+                                         !expiry_timing_is_valid(400'000'000ull) &&
                                          !expiry_timing_is_valid(749'999'999ull) &&
                                          !expiry_timing_is_valid(2'000'000'000ull);
     const std::string expected_upstream =
@@ -72320,8 +72330,9 @@ static bool run_pinned_nginx_custom_hide_timeout_probe(const std::string& contai
         !origin.response_peer_unexpected_data.load(std::memory_order_acquire) &&
         !origin.response_peer_observation_failed.load(std::memory_order_acquire);
     const u64 peer_closed_ns = origin.response_peer_closed_ns.load(std::memory_order_acquire);
-    bool post_retirement_stable = origin_retired;
-    const u64 stability_deadline_ns = peer_closed_ns + 175'000'000ull;
+    const u64 stability_start_ns = steady_now_ns();
+    bool post_retirement_stable = origin_retired && stability_start_ns >= peer_closed_ns;
+    const u64 stability_deadline_ns = stability_start_ns + 175'000'000ull;
     while (post_retirement_stable && steady_now_ns() < stability_deadline_ns) {
         std::string stable_access;
         if (!origin_live() || poll_child(nginx.child) ||
