@@ -3816,6 +3816,13 @@ TEST(nginx_converter, admits_authenticated_explicit_proxy_buffering_on_timeout_f
         combined_overlapping.location.proxy_buffering.span.start;
     const auto combined_overlapping_result = nginx::lower_to_rut(combined_overlapping);
     REQUIRE_FALSE(combined_overlapping_result);
+    auto combined_hide_precedence = combined.value();
+    combined_hide_precedence.location.proxy_hide_header.name.ptr = nullptr;
+    combined_hide_precedence.location.proxy_buffering.span.start++;
+    const auto combined_hide_precedence_result = nginx::lower_to_rut(combined_hide_precedence);
+    REQUIRE_FALSE(combined_hide_precedence_result);
+    CHECK(combined_hide_precedence_result.error().detail.eq(
+        lit_str("invalid proxy_hide_header name model")));
 
     const auto expect_rejected = [&](nginx::Server candidate) {
         const auto result = nginx::lower_to_rut(candidate);

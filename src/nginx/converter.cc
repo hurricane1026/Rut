@@ -1335,7 +1335,10 @@ bool proxy_read_timeout_source_is_coherent(uintptr_t source_base, const ProxyRea
     return seconds != 0u && seconds <= 63u && timeout.milliseconds == seconds * 1000u;
 }
 
-FrontendResult<bool> validate_proxy_hide_header(const Server& server, bool exact_listener) {
+FrontendResult<bool> validate_proxy_hide_header(const Server& server,
+                                                bool exact_listener,
+                                                bool* buffering_authenticated) {
+    *buffering_authenticated = false;
     const ProxyHideHeader& header = server.location.proxy_hide_header;
     const Span fallback = is_valid_span(header.span)        ? header.span
                           : is_valid_span(header.name_span) ? header.name_span
@@ -1423,6 +1426,14 @@ FrontendResult<bool> validate_proxy_hide_header(const Server& server, bool exact
         !source_position_is_coherent(source_base, server.span, header.span) ||
         !source_position_is_coherent(source_base, server.span, header.name_span))
         return unsupported(fallback, lit_str("invalid proxy_hide_header source positions"));
+
+    if (buffering.present) {
+        auto buffering_result = validate_proxy_buffering(server);
+        if (!buffering_result) return core::make_unexpected(buffering_result.error());
+        if (!buffering_result.value())
+            return unsupported(fallback, lit_str("invalid proxy_buffering model"));
+        *buffering_authenticated = true;
+    }
 
     // All bytes below are in the already-proven common source. Sort the complete
     // modeled location inventory so every byte between the braces is accounted
@@ -2165,12 +2176,10 @@ FrontendResult<RutSource> lower_to_rut(const Server& server) {
     if (!exact_local_return) return core::make_unexpected(exact_local_return.error());
     auto proxy_location = validate_proxy_location(server);
     if (!proxy_location) return core::make_unexpected(proxy_location.error());
-    auto proxy_buffering = validate_proxy_buffering(server);
-    if (!proxy_buffering) return core::make_unexpected(proxy_buffering.error());
-    const bool explicit_buffering_on = proxy_buffering.value();
     bool hide_compat_header = false;
     Str hide_header_name{};
     bool exact_listener = false;
+    bool buffering_authenticated = false;
     const bool timeout_present = server.location.proxy_read_timeout.present;
     u8 timeout_seconds = timeout_present ? 0u : 60u;
     if (proxy_hide_header_has_inventory(server.location.proxy_hide_header)) {
@@ -2178,7 +2187,8 @@ FrontendResult<RutSource> lower_to_rut(const Server& server) {
             validate_listener(server, proxy_location.value(), exact_absolute_redirect.value());
         if (!listener) return core::make_unexpected(listener.error());
         exact_listener = listener.value();
-        auto header = validate_proxy_hide_header(server, listener.value());
+        auto header =
+            validate_proxy_hide_header(server, listener.value(), &buffering_authenticated);
         if (!header) return core::make_unexpected(header.error());
         hide_compat_header = true;
         hide_header_name = server.location.proxy_hide_header.name;
@@ -2222,6 +2232,14 @@ FrontendResult<RutSource> lower_to_rut(const Server& server) {
     if (exact_no_content_return.value() && !is_root)
         return unsupported(server.exact_no_content_return.span,
                            lit_str("exact no-content return requires location / fallback"));
+    bool explicit_buffering_on = false;
+    if (buffering_authenticated) {
+        explicit_buffering_on = true;
+    } else {
+        auto proxy_buffering = validate_proxy_buffering(server);
+        if (!proxy_buffering) return core::make_unexpected(proxy_buffering.error());
+        explicit_buffering_on = proxy_buffering.value();
+    }
     if (explicit_buffering_on &&
         !(is_root && exact_listener && server.listen.address == ListenerAddress::IPv4Exact &&
           server.listen.ipv4_host == 0x7f000001u && timeout_present &&
