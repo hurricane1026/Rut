@@ -299,6 +299,11 @@ FrontendResult<bool> validate_proxy_buffering(const Server& server) {
     auto reparsed = parse(server_source);
     if (!reparsed)
         return unsupported(server.span, lit_str("invalid proxy_buffering source inventory"));
+    const ProxyHideHeader& supplied_hide = server.location.proxy_hide_header;
+    const ProxyHideHeader& fresh_hide = reparsed.value().location.proxy_hide_header;
+    if (!proxy_hide_header_has_inventory(supplied_hide) &&
+        proxy_hide_header_has_inventory(fresh_hide))
+        return unsupported(location.span, lit_str("proxy_hide_header metadata was erased"));
     const ProxyBuffering& fresh = reparsed.value().location.proxy_buffering;
     const bool fresh_inventory = proxy_buffering_has_inventory(fresh);
     if (!metadata && !fresh_inventory) return false;

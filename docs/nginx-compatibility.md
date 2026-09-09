@@ -6,6 +6,17 @@ behavioral equivalence evidence. Golden output alone is insufficient.
 Allowed states are `SUPPORTED`, `PARTIAL`, `BLOCKED_BY_RUT`,
 `NOT_IMPLEMENTED`, and `NOT_PLANNED`.
 
+Recent evidence (no broad status promotion): #616/#620 prove the bounded
+custom-hide plus literal 1s GET expiry/completion CLI path, including 3-/46-byte
+name witnesses. #620 merged at `9034ca51` after CI `34316694133` passed 15/15
+jobs and required nginx 154/154. #622 merged at `233a0321` after CI
+`34318669602` passed 15/15 and required nginx 155/155; it adds nginx-only
+omitted/explicit-on buffering equivalence for that fixture, not generated-RUT
+support for the explicit-on composition. Positive admission remains #621.
+#623 tracks a reproduced source-backed Server-model hide-metadata erasure gap;
+its reviewed component fix awaits final integration. Broad #270 remains
+`PARTIAL` and #271 remains `BLOCKED_BY_RUT`.
+
 | nginx feature | parser | converter | RUT capability | behavior test | status |
 | --- | --- | --- | --- | --- | --- |
 | exact fixed-upload HEAD success boundary: root `proxy_read_timeout 1s`, default downstream keep-alive cleartext H1.1, one literal positive `Content-Length: 12` upload split 5+7, fresh single IPv4 origin, strict positive-CL 200 response, no retry/reuse | yes: the bounded root timeout and proxy model preserves the exact directive and request-independent route shape | yes: merged #475 selects request policy ID2 on `req.hasContentLength` and ID1 on absence with one identical timeout/response/failure bundle; CL0 still selects ID2 and fails closed, rather than entering this positive-length row | yes for this exact success boundary: verified JIT framing selection, positive fixed-upload HEAD admission, binary-safe complete materialization, buffering `None`, strict header-only response, retirement and request-local ownership are implemented. Zero-response timeout expiry and exactly-one-fragment incomplete-header timeout are supported only by the separate exact rows below; repeated or otherwise different progress, multi-fragment progress and broader responses remain excluded | PR #469 accepted head `9f01f9f3`, merge `f896924c`: pinned nginx 1.29.7 and converter-generated ordinary RUT both remain quiet until the 5+7 binary upload completes, emit exact Host → reconstructed Content-Length → retained headers → body upstream wire, return the normalized 187-byte header-only 200 with downstream keep-alive, and retire one origin without retry. Independent APPROVE; CI run `33952237545` passed 15/15 | SUPPORTED |
