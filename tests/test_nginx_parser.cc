@@ -15,6 +15,7 @@
 #include "rut/runtime/connection_base.h"
 #include "rut/runtime/listener.h"
 #include "test.h"
+#include <array>
 #include <cstddef>
 #include <iostream>
 #include <memory>
@@ -3795,6 +3796,22 @@ TEST(nginx_converter, admits_authenticated_explicit_proxy_buffering_on_timeout_f
     REQUIRE_FALSE(erased_result);
     CHECK(erased_result.error().detail.eq(lit_str("proxy_buffering metadata was erased")));
 
+    auto combined_erased_hide = parsed.value();
+    combined_erased_hide.location.proxy_hide_header = {};
+    const auto combined_erased_hide_result = nginx::lower_to_rut(combined_erased_hide);
+    REQUIRE_FALSE(combined_erased_hide_result);
+    CHECK(combined_erased_hide_result.error().detail.eq(
+        lit_str("proxy_hide_header metadata was erased")));
+    auto combined_shifted_hide = parsed.value();
+    combined_shifted_hide.location.proxy_hide_header.span.start++;
+    const auto combined_shifted_hide_result = nginx::lower_to_rut(combined_shifted_hide);
+    REQUIRE_FALSE(combined_shifted_hide_result);
+    auto combined_overlapping = parsed.value();
+    combined_overlapping.location.proxy_hide_header.span.start =
+        combined_overlapping.location.proxy_buffering.span.start;
+    const auto combined_overlapping_result = nginx::lower_to_rut(combined_overlapping);
+    REQUIRE_FALSE(combined_overlapping_result);
+
     const auto expect_rejected = [&](nginx::Server candidate) {
         const auto result = nginx::lower_to_rut(candidate);
         REQUIRE_FALSE(result);
@@ -3959,6 +3976,26 @@ TEST(nginx_converter, http_profile_compares_proxy_buffering_metadata_before_lowe
     const auto explicit_hide_result = nginx::lower_to_rut(explicit_hide_erased);
     REQUIRE_FALSE(explicit_hide_result);
     CHECK(explicit_hide_result.error().detail.eq(
+        lit_str("http profile metadata does not match its source")));
+    auto explicit_hide_shifted_buffering = explicit_hide.value();
+    explicit_hide_shifted_buffering.server.location.proxy_buffering.span.start++;
+    const auto explicit_hide_shifted_buffering_result =
+        nginx::lower_to_rut(explicit_hide_shifted_buffering);
+    REQUIRE_FALSE(explicit_hide_shifted_buffering_result);
+    CHECK(explicit_hide_shifted_buffering_result.error().detail.eq(
+        lit_str("http profile metadata does not match its source")));
+    auto explicit_hide_shifted_hide = explicit_hide.value();
+    explicit_hide_shifted_hide.server.location.proxy_hide_header.span.start++;
+    const auto explicit_hide_shifted_hide_result = nginx::lower_to_rut(explicit_hide_shifted_hide);
+    REQUIRE_FALSE(explicit_hide_shifted_hide_result);
+    CHECK(explicit_hide_shifted_hide_result.error().detail.eq(
+        lit_str("http profile metadata does not match its source")));
+    auto explicit_hide_overlapping = explicit_hide.value();
+    explicit_hide_overlapping.server.location.proxy_hide_header.span.start =
+        explicit_hide_overlapping.server.location.proxy_buffering.span.start;
+    const auto explicit_hide_overlapping_result = nginx::lower_to_rut(explicit_hide_overlapping);
+    REQUIRE_FALSE(explicit_hide_overlapping_result);
+    CHECK(explicit_hide_overlapping_result.error().detail.eq(
         lit_str("http profile metadata does not match its source")));
 
     const std::string omitted_hide_source = make_request_length_http_profile(
@@ -21274,29 +21311,24 @@ TEST(nginx_converter_issue621, explicit_buffering_custom_hide_timeout_is_byte_id
             REQUIRE(omitted_model);
             const auto omitted_lowered = nginx::lower_to_rut(omitted_model.value());
             REQUIRE(omitted_lowered);
-            const std::string orders[] = {
-                "proxy_hide_header " + std::string(name) +
-                    "; proxy_buffering on; proxy_read_timeout " + timeout + ";",
-                "proxy_hide_header " + std::string(name) + "; proxy_read_timeout " + timeout +
-                    "; proxy_buffering on;",
-                "proxy_buffering on; proxy_hide_header " + std::string(name) +
-                    "; proxy_read_timeout " + timeout + ";",
-                "proxy_buffering on; proxy_read_timeout " + timeout + "; proxy_hide_header " +
-                    name + ";",
-                "proxy_read_timeout " + timeout + "; proxy_hide_header " + name +
-                    "; proxy_buffering on;",
-                "proxy_read_timeout " + timeout + "; proxy_buffering on; proxy_hide_header " +
-                    name + ";"};
-            for (const std::string& order : orders) {
-                const std::string explicit_on = "server { listen 127.0.0.1:8080; location / { " +
-                                                order + " proxy_pass http://127.0.0.1:9000; } }";
+            const std::array<std::string, 4> directives = {
+                "proxy_buffering on; ",
+                "proxy_read_timeout " + std::string(timeout) + "s; ",
+                "proxy_hide_header " + std::string(name) + "; ",
+                "proxy_pass http://127.0.0.1:9000; "};
+            std::array<size_t, 4> permutation = {0u, 1u, 2u, 3u};
+            do {
+                std::string order;
+                for (const size_t index : permutation) order += directives[index];
+                const std::string explicit_on =
+                    "server { listen 127.0.0.1:8080; location / { " + order + "} }";
                 const auto explicit_model =
                     nginx::parse({explicit_on.data(), static_cast<u32>(explicit_on.size())});
                 REQUIRE(explicit_model);
                 const auto explicit_lowered = nginx::lower_to_rut(explicit_model.value());
                 REQUIRE(explicit_lowered);
                 CHECK(explicit_lowered.value().view().eq(omitted_lowered.value().view()));
-            }
+            } while (std::next_permutation(permutation.begin(), permutation.end()));
         }
     }
     const std::string ir_source =

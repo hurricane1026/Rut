@@ -7,6 +7,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <string>
+#include <tuple>
 #include <utility>
 #include <vector>
 
@@ -501,25 +502,67 @@ TEST(nginx_convert_issue621, converts_explicit_buffering_custom_hide_timeout_cli
     CHECK(explicit_run.out.find("hide_headers: [\"Date\", \"Server\", \"X-Pad\", \"X-A\"]") !=
           std::string::npos);
 
+    const auto diagnostic_prefix = [](const std::string& filename,
+                                      const std::string& input,
+                                      const std::string& token,
+                                      size_t occurrence = 0u) {
+        size_t offset = std::string::npos;
+        size_t search = 0u;
+        for (size_t index = 0u; index <= occurrence; index++) {
+            offset = input.find(token, search);
+            if (offset == std::string::npos) return std::string{};
+            search = offset + token.size();
+        }
+        const size_t line_start =
+            input.rfind('\n', offset) == std::string::npos ? 0u : input.rfind('\n', offset) + 1u;
+        const unsigned line = static_cast<unsigned>(
+            std::count(input.begin(), input.begin() + static_cast<ptrdiff_t>(offset), '\n') + 1u);
+        const unsigned col = static_cast<unsigned>(offset - line_start + 1u);
+        return filename + ":" + std::to_string(line) + ":" + std::to_string(col) + ": ";
+    };
     const std::string negative_prefix =
-        "events {}\nhttp { server { listen 127.0.0.1:8080; location / { proxy_hide_header X-A; ";
-    const std::vector<std::string> negative_sources = {
-        negative_prefix +
-            "proxy_buffering off; proxy_read_timeout 1s; proxy_pass http://127.0.0.1:9000; } } }\n",
-        negative_prefix +
-            "proxy_buffering on; proxy_buffering on; proxy_read_timeout 1s; proxy_pass "
-            "http://127.0.0.1:9000; } } }\n",
-        negative_prefix + "proxy_buffering on; proxy_pass http://127.0.0.1:9000; } } }\n"};
-    for (size_t index = 0u; index < negative_sources.size(); index++) {
-        const std::string negative_path =
-            directory + "/negative-" + std::to_string(index) + ".conf";
-        REQUIRE(write_file(negative_path, negative_sources[index]));
+        "events {}\nhttp { log_format compat \"$request_length\"; access_log " + access_path +
+        " compat; server { listen 127.0.0.1:8080; location / { proxy_hide_header X-A; ";
+    const std::vector<std::tuple<std::string, std::string, std::string, size_t, std::string>>
+        negative_cases = {
+            {"off",
+             "proxy_buffering off; proxy_read_timeout 1s; proxy_pass "
+             "http://127.0.0.1:9000; } } }\n",
+             "off",
+             0u,
+             "only literal proxy_buffering on is recognized"},
+            {"duplicate",
+             "proxy_buffering on; proxy_buffering on; proxy_read_timeout 1s; proxy_pass "
+             "http://127.0.0.1:9000; } } }\n",
+             "proxy_buffering",
+             1u,
+             "duplicate proxy_buffering"},
+            {"literal",
+             "proxy_buffering $buffering; proxy_read_timeout 1s; proxy_pass "
+             "http://127.0.0.1:9000; } } }\n",
+             "$buffering",
+             0u,
+             "only literal proxy_buffering on is recognized"},
+            {"no-timeout",
+             "proxy_buffering on; proxy_pass http://127.0.0.1:9000; } } }\n",
+             "proxy_buffering",
+             0u,
+             "proxy_buffering on requires the bounded timeout proxy profile"}};
+    for (const auto& negative_case : negative_cases) {
+        const std::string& name = std::get<0>(negative_case);
+        const std::string negative_source = negative_prefix + std::get<1>(negative_case);
+        const std::string negative_path = directory + "/negative-" + name + ".conf";
+        REQUIRE(write_file(negative_path, negative_source));
         const RunResult negative_run =
             run_converter(g_executable, "nginx-http", negative_path, negative_path);
         REQUIRE(WIFEXITED(negative_run.status));
         CHECK_EQ(WEXITSTATUS(negative_run.status), 1);
         CHECK(negative_run.out.empty());
-        CHECK(negative_run.err.find(negative_path + ":") == 0u);
+        const std::string& token = std::get<2>(negative_case);
+        const size_t occurrence = std::get<3>(negative_case);
+        CHECK(negative_run.err.find(
+                  diagnostic_prefix(negative_path, negative_source, token, occurrence)) == 0u);
+        CHECK(negative_run.err.find(std::get<4>(negative_case)) != std::string::npos);
     }
 }
 
