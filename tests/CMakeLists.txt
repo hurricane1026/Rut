@@ -1261,6 +1261,28 @@ if(RUT_ENABLE_JIT)
         ENVIRONMENT "RUT_NGINX_DIFFERENTIAL_REQUIRED=1"
     )
     add_test(
+        NAME test_nginx_issue270_custom_hide_timeout_expiry_oracle
+        COMMAND test_nginx_differential --pinned-nginx-custom-hide-timeout-probe
+    )
+    set_tests_properties(test_nginx_issue270_custom_hide_timeout_expiry_oracle PROPERTIES
+        LABELS "integration;nginx;docker"
+        RUN_SERIAL TRUE
+        RESOURCE_LOCK nginx-differential
+        TIMEOUT 120
+        ENVIRONMENT "RUT_NGINX_DIFFERENTIAL_REQUIRED=1"
+    )
+    add_test(
+        NAME test_nginx_issue270_custom_hide_timeout_completion_oracle
+        COMMAND test_nginx_differential --pinned-nginx-custom-hide-timeout-completion
+    )
+    set_tests_properties(test_nginx_issue270_custom_hide_timeout_completion_oracle PROPERTIES
+        LABELS "integration;nginx;docker"
+        RUN_SERIAL TRUE
+        RESOURCE_LOCK nginx-differential
+        TIMEOUT 120
+        ENVIRONMENT "RUT_NGINX_DIFFERENTIAL_REQUIRED=1"
+    )
+    add_test(
         NAME test_nginx_issue439_pinned_lifecycle_self_check
         COMMAND test_nginx_differential --pinned-nginx-lifecycle-self-check
     )
