@@ -3851,6 +3851,59 @@ TEST(nginx_converter, admits_authenticated_explicit_proxy_buffering_on_timeout_f
     CHECK(corrupted_result.error().code == FrontendError::UnsupportedSyntax);
 }
 
+TEST(nginx_converter, rejects_erased_proxy_hide_header_metadata_from_reparsed_source) {
+    const auto expect_erased_hide = [](const std::string& source, bool erase_buffering) {
+        const auto parsed = nginx::parse({source.data(), static_cast<u32>(source.size())});
+        REQUIRE(parsed);
+        auto forged = parsed.value();
+        forged.location.proxy_hide_header = {};
+        if (erase_buffering) forged.location.proxy_buffering = {};
+        const auto result = nginx::lower_to_rut(forged);
+        REQUIRE_FALSE(result);
+        CHECK(result.error().detail.eq(lit_str("proxy_hide_header metadata was erased")));
+        CHECK_EQ(result.error().span.start, parsed.value().location.span.start);
+    };
+
+    const std::string explicit_source =
+        "server { listen 127.0.0.1:8080; location / { proxy_buffering on; "
+        "proxy_read_timeout 1s; proxy_hide_header X-Compat-Hidden; "
+        "proxy_pass http://127.0.0.1:9000; } }";
+    const std::string omitted_buffering_source =
+        "server { listen 127.0.0.1:8080; location / { proxy_read_timeout 1s; "
+        "proxy_hide_header X-Compat-Hidden; proxy_pass http://127.0.0.1:9000; } }";
+    const std::string omitted_both_source =
+        "server { listen 127.0.0.1:8080; location / { proxy_hide_header X-Compat-Hidden; "
+        "proxy_pass http://127.0.0.1:9000; } }";
+    expect_erased_hide(explicit_source, false);
+    expect_erased_hide(omitted_buffering_source, false);
+    expect_erased_hide(omitted_both_source, false);
+    expect_erased_hide(explicit_source, true);
+
+    const std::string explicit_no_hide_source =
+        "server { listen 127.0.0.1:8080; location / { proxy_buffering on; "
+        "proxy_read_timeout 1s; proxy_pass http://127.0.0.1:9000; } }";
+    const auto explicit_no_hide = nginx::parse(
+        {explicit_no_hide_source.data(), static_cast<u32>(explicit_no_hide_source.size())});
+    REQUIRE(explicit_no_hide);
+    const auto explicit_no_hide_lowered = nginx::lower_to_rut(explicit_no_hide.value());
+    REQUIRE(explicit_no_hide_lowered);
+
+    const std::string multiline_source =
+        "# retained prefix\n\n  server {\n    listen 127.0.0.1:8080;\n    location / {\n"
+        "      proxy_read_timeout 1s;\n      proxy_hide_header X-Compat-Hidden;\n"
+        "      proxy_pass http://127.0.0.1:9000;\n    }\n  }\n";
+    const auto multiline =
+        nginx::parse({multiline_source.data(), static_cast<u32>(multiline_source.size())});
+    REQUIRE(multiline);
+    auto multiline_forged = multiline.value();
+    multiline_forged.location.proxy_hide_header = {};
+    const auto multiline_result = nginx::lower_to_rut(multiline_forged);
+    REQUIRE_FALSE(multiline_result);
+    CHECK(multiline_result.error().detail.eq(lit_str("proxy_hide_header metadata was erased")));
+    CHECK_EQ(multiline_result.error().span.start, multiline.value().location.span.start);
+    CHECK_GT(multiline.value().location.span.start, 0u);
+}
+
 TEST(nginx_converter, http_profile_compares_proxy_buffering_metadata_before_lowering) {
     const std::string source = make_request_length_http_profile(
         "/tmp/compat.log",
@@ -3882,6 +3935,36 @@ TEST(nginx_converter, http_profile_compares_proxy_buffering_metadata_before_lowe
     const auto shifted_result = nginx::lower_to_rut(shifted);
     REQUIRE_FALSE(shifted_result);
     CHECK(shifted_result.error().detail.eq(
+        lit_str("http profile metadata does not match its source")));
+
+    const std::string explicit_hide_source = make_request_length_http_profile(
+        "/tmp/compat.log",
+        "    listen 127.0.0.1:8080;\n"
+        "    location / { proxy_buffering on; proxy_read_timeout 1s; "
+        "proxy_hide_header X-Compat-Hidden; proxy_pass http://127.0.0.1:9000; }\n");
+    const auto explicit_hide = nginx::parse_http_profile(
+        {explicit_hide_source.data(), static_cast<u32>(explicit_hide_source.size())});
+    REQUIRE(explicit_hide);
+    auto explicit_hide_erased = explicit_hide.value();
+    explicit_hide_erased.server.location.proxy_hide_header = {};
+    const auto explicit_hide_result = nginx::lower_to_rut(explicit_hide_erased);
+    REQUIRE_FALSE(explicit_hide_result);
+    CHECK(explicit_hide_result.error().detail.eq(
+        lit_str("http profile metadata does not match its source")));
+
+    const std::string omitted_hide_source = make_request_length_http_profile(
+        "/tmp/compat.log",
+        "    listen 127.0.0.1:8080;\n"
+        "    location / { proxy_read_timeout 1s; proxy_hide_header X-Compat-Hidden; "
+        "proxy_pass http://127.0.0.1:9000; }\n");
+    const auto omitted_hide = nginx::parse_http_profile(
+        {omitted_hide_source.data(), static_cast<u32>(omitted_hide_source.size())});
+    REQUIRE(omitted_hide);
+    auto omitted_hide_erased = omitted_hide.value();
+    omitted_hide_erased.server.location.proxy_hide_header = {};
+    const auto omitted_hide_result = nginx::lower_to_rut(omitted_hide_erased);
+    REQUIRE_FALSE(omitted_hide_result);
+    CHECK(omitted_hide_result.error().detail.eq(
         lit_str("http profile metadata does not match its source")));
 }
 
