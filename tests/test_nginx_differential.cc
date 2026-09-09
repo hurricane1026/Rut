@@ -73134,7 +73134,8 @@ static bool run_pinned_nginx_custom_hide_timeout_probe(
     const char* rut_path = nullptr,
     const char* converter_path = nullptr,
     CustomHideTimeoutPairContext* pair = nullptr,
-    CustomHideTimeoutObservation* observation = nullptr) {
+    CustomHideTimeoutObservation* observation = nullptr,
+    const char* custom_hide_name = "X-Powered-By") {
     const bool generated_rut = rut_path != nullptr || converter_path != nullptr;
     if (pair != nullptr && observation == nullptr) {
         error = "#270 custom-hide pair requires an observation output";
@@ -73170,6 +73171,10 @@ static bool run_pinned_nginx_custom_hide_timeout_probe(
         error = "#270 custom-hide timeout probe could not hold distinct ports";
         return false;
     }
+    if (custom_hide_name == nullptr || custom_hide_name[0] == '\0') {
+        error = "#617 custom-hide timeout probe received an empty hide name";
+        return false;
+    }
     const std::string config =
         "events {}\nhttp {\n"
         "  log_format compat \"$request_length\";\n"
@@ -73182,10 +73187,12 @@ static bool run_pinned_nginx_custom_hide_timeout_probe(
         "    location / {\n      proxy_pass http://127.0.0.1:" +
         std::to_string(backend_port) +
         ";\n"
-        "      proxy_hide_header X-Powered-By;\n      proxy_read_timeout 1s;\n"
+        "      proxy_hide_header " +
+        std::string(custom_hide_name) +
+        ";\n      proxy_read_timeout 1s;\n"
         "    }\n  }\n}\n";
     if (count_text(config, "events {}\n") != 1u ||
-        count_text(config, "proxy_hide_header X-Powered-By;\n") != 1u ||
+        count_text(config, "proxy_hide_header " + std::string(custom_hide_name) + ";\n") != 1u ||
         count_text(config, "proxy_read_timeout 1s;\n") != 1u ||
         count_text(config, "proxy_buffering") != 0u ||
         (pair != nullptr && pair->initialized
@@ -73210,18 +73217,26 @@ static bool run_pinned_nginx_custom_hide_timeout_probe(
         pair->initialized = true;
     }
 
-    static constexpr char kOrigin[] =
+    std::string lower_hide_name(custom_hide_name);
+    for (char& byte : lower_hide_name)
+        if (byte >= 'A' && byte <= 'Z') byte = static_cast<char>(byte - 'A' + 'a');
+    const std::string origin_response =
         "HTTP/1.1 200 OK\r\n"
         "Date: Tue, 01 Jan 2030 00:00:00 GMT\r\n"
-        "Server: origin\r\n"
-        "X-Powered-By: first\r\n"
-        "x-powered-by: second\r\n"
+        "Server: origin\r\n" +
+        std::string(custom_hide_name) + ": first\r\n" + lower_hide_name +
+        ": second\r\n"
         "X-Unrelated: retained\r\n"
         "Content-Length: 12\r\n"
         "Connection: keep-alive\r\n"
         "\r\n"
         "hello";
-    static_assert(sizeof(kOrigin) - 1u == 187u);
+    const size_t expected_w1_size = 187u + 2u * (strlen(custom_hide_name) - strlen("X-Powered-By"));
+    if (origin_response.size() != expected_w1_size ||
+        (strcmp(custom_hide_name, "X-Powered-By") == 0 && origin_response.size() != 187u)) {
+        error = "#617 custom-hide timeout W1 length/authentication mismatch";
+        return false;
+    }
     static constexpr char kSecond[] = "!";
     static constexpr char kThird[] = "world!";
     static constexpr char kExpectedExpiryResponseNormalized[] =
@@ -73249,15 +73264,16 @@ static bool run_pinned_nginx_custom_hide_timeout_probe(
     origin.permit_gated_incomplete_first_response = true;
     origin.probe_before_gated_fragment = true;
     origin.incomplete_first_response_fragment_count = complete_after_w3 ? 3u : 2u;
-    origin.response_fragment_bytes[0] = kOrigin;
-    origin.response_fragment_lengths[0] = sizeof(kOrigin) - 1u;
+    origin.response_fragment_bytes[0] = origin_response.data();
+    origin.response_fragment_lengths[0] = origin_response.size();
     origin.response_fragment_bytes[1] = kSecond;
     origin.response_fragment_lengths[1] = sizeof(kSecond) - 1u;
     origin.response_fragment_bytes[2] = kThird;
     origin.response_fragment_lengths[2] = sizeof(kThird) - 1u;
     if (!handoff_held_loopback_port(
             &reservations.fds[1], backend_port, "#270 custom-hide timeout probe origin", error) ||
-        !origin.setup(backend_port, 1u, kOrigin, sizeof(kOrigin) - 1u)) {
+        !origin.setup(
+            backend_port, 1u, origin_response.data(), static_cast<u32>(origin_response.size()))) {
         if (error.empty()) error = "#270 custom-hide timeout probe origin setup failed";
         return false;
     }
@@ -73346,7 +73362,7 @@ static bool run_pinned_nginx_custom_hide_timeout_probe(
                                                          frontend_port,
                                                          backend_port,
                                                          temp.nginx_access_log,
-                                                         "X-Powered-By",
+                                                         custom_hide_name,
                                                          error))
             return false;
         if (!handoff_held_loopback_port(
@@ -74214,14 +74230,97 @@ static bool run_pinned_nginx_custom_hide_timeout_probe(
 
 static bool run_pinned_nginx_custom_hide_timeout_cli_differential(const char* rut_path,
                                                                   const char* converter_path,
-                                                                  std::string& error) {
+                                                                  std::string& error,
+                                                                  bool boundary_names = false) {
     if (rut_path == nullptr || converter_path == nullptr) {
         error = "#270 custom-hide CLI differential requires RUT and converter executables";
         return false;
     }
+    if (boundary_names) {
+        TempDir negative_temp;
+        if (!negative_temp.create()) {
+            error = "#617 timeout boundary CLI rejection could not create a temporary directory";
+            return false;
+        }
+        struct InvalidBoundaryName {
+            std::string name;
+            const char* detail;
+        };
+        const InvalidBoundaryName invalid_names[] = {
+            {"X-" + std::string(45u, 'A'),
+             "proxy_hide_header name is outside the bounded header-name profile"},
+            {"X-Pad", "proxy_hide_header name is outside the bounded header-name profile"},
+            {"X-Accel-Redirect",
+             "proxy_hide_header name is outside the bounded header-name profile"}};
+        for (const InvalidBoundaryName& invalid : invalid_names) {
+            std::string profile = make_converter_request_length_profile(
+                8080u, 9000u, negative_temp.nginx_access_log, invalid.name.c_str());
+            std::string config = "events {}\n" + profile;
+            const size_t hide_end = config.find(";\n", config.find("proxy_hide_header "));
+            if (hide_end == std::string::npos) {
+                error = "#617 timeout boundary rejection fixture lacked hide directive";
+                return false;
+            }
+            config.insert(hide_end + 2u, "      proxy_read_timeout 1s;\n");
+            if (!write_file(negative_temp.nginx_config, config.data(), config.size())) {
+                error = "#617 timeout boundary CLI rejection could not persist input";
+                return false;
+            }
+            const int output_fd =
+                open(negative_temp.source.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0600);
+            const std::string diagnostics_path =
+                negative_temp.rut_log + ".timeout-boundary-negative";
+            const int error_fd = open(diagnostics_path.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0600);
+            if (output_fd < 0 || error_fd < 0) {
+                if (output_fd >= 0) close(output_fd);
+                if (error_fd >= 0) close(error_fd);
+                error = "#617 timeout boundary CLI rejection could not open output files";
+                return false;
+            }
+            ChildGuard child;
+            const pid_t pid = fork();
+            if (pid == 0) {
+                if (dup2(output_fd, STDOUT_FILENO) < 0 || dup2(error_fd, STDERR_FILENO) < 0)
+                    _exit(127);
+                close(output_fd);
+                close(error_fd);
+                execl(converter_path,
+                      converter_path,
+                      "--format",
+                      "nginx-http",
+                      negative_temp.nginx_config.c_str(),
+                      nullptr);
+                _exit(127);
+            }
+            close(output_fd);
+            close(error_fd);
+            if (pid < 0) {
+                error = "#617 timeout boundary CLI rejection could not fork converter";
+                return false;
+            }
+            child.child.pid = pid;
+            std::string output;
+            std::string diagnostics;
+            if (!wait_child(child.child, 10'000) || !child.child.status_valid ||
+                !WIFEXITED(child.child.status) || WEXITSTATUS(child.child.status) != 1 ||
+                !read_exact_return204_log(
+                    negative_temp.source, "#617 timeout boundary stdout", output, error) ||
+                !output.empty() || !read_bounded_file(diagnostics_path, diagnostics, error) ||
+                diagnostics.find(negative_temp.nginx_config + ":") == std::string::npos ||
+                diagnostics.find(":9:") == std::string::npos ||
+                diagnostics.find(invalid.detail) == std::string::npos) {
+                error =
+                    "#617 timeout boundary rejection did not produce exit 1, empty stdout, and "
+                    "located diagnostics";
+                return false;
+            }
+        }
+    }
     if (!check_exact_rut_source_capture(error)) return false;
     const std::string suffix = std::to_string(getpid());
-    const auto run_pair = [&](bool completion, const std::string& name) {
+    const auto run_pair = [&](bool completion,
+                              const std::string& name,
+                              const char* hide_name = "X-Powered-By") {
         CustomHideTimeoutPairContext pair;
         CustomHideTimeoutObservation nginx_observation;
         CustomHideTimeoutObservation rut_observation;
@@ -74229,8 +74328,14 @@ static bool run_pinned_nginx_custom_hide_timeout_cli_differential(const char* ru
             error = "#270 custom-hide pair could not create resources";
             return false;
         }
-        if (!run_pinned_nginx_custom_hide_timeout_probe(
-                name + "-nginx", error, completion, nullptr, nullptr, &pair, &nginx_observation))
+        if (!run_pinned_nginx_custom_hide_timeout_probe(name + "-nginx",
+                                                        error,
+                                                        completion,
+                                                        nullptr,
+                                                        nullptr,
+                                                        &pair,
+                                                        &nginx_observation,
+                                                        hide_name))
             return false;
         if (!read_exact_return204_log(pair.temp.nginx_config,
                                       "#270 pair config after nginx",
@@ -74275,7 +74380,8 @@ static bool run_pinned_nginx_custom_hide_timeout_cli_differential(const char* ru
                                                         rut_path,
                                                         converter_path,
                                                         &pair,
-                                                        &rut_observation))
+                                                        &rut_observation,
+                                                        hide_name))
             return false;
         std::string after_rut_config;
         if (!read_exact_return204_log(
@@ -74333,8 +74439,25 @@ static bool run_pinned_nginx_custom_hide_timeout_cli_differential(const char* ru
         }
         return true;
     };
-    return run_pair(false, "rut-nginx-270-custom-hide-cli-expiry-" + suffix) &&
-           run_pair(true, "rut-nginx-270-custom-hide-cli-completion-" + suffix);
+    if (!boundary_names &&
+        (!run_pair(false, "rut-nginx-270-custom-hide-cli-expiry-" + suffix) ||
+         !run_pair(true, "rut-nginx-270-custom-hide-cli-completion-" + suffix)))
+        return false;
+    if (boundary_names) {
+        static constexpr const char* kBoundaryNames[] = {kProxyHideHeaderBoundary3Name,
+                                                         kProxyHideHeaderBoundary46Name};
+        for (const char* hide_name : kBoundaryNames) {
+            const std::string tag = std::string("-boundary-") + hide_name;
+            if (!run_pair(false,
+                          "rut-nginx-617-custom-hide-cli-expiry" + tag + "-" + suffix,
+                          hide_name) ||
+                !run_pair(true,
+                          "rut-nginx-617-custom-hide-cli-completion" + tag + "-" + suffix,
+                          hide_name))
+                return false;
+        }
+    }
+    return true;
 }
 
 static bool run_pinned_nginx_default_buffering_three_publication_oracle_impl(
@@ -77181,6 +77304,9 @@ int main(int argc, char** argv) {
         argc == 2 && strcmp(argv[1], "--pinned-nginx-custom-hide-timeout-completion") == 0;
     const bool converter_custom_hide_timeout_cli_differential =
         argc == 4 && strcmp(argv[1], "--converter-custom-hide-timeout-cli-differential") == 0;
+    const bool converter_custom_hide_timeout_boundary_cli_differential =
+        argc == 4 &&
+        strcmp(argv[1], "--converter-custom-hide-timeout-boundary-cli-differential") == 0;
     const bool wildcard_listen_oracle =
         argc == 2 && strcmp(argv[1], "--pinned-nginx-wildcard-listen-oracle") == 0;
     const bool asterisk_wildcard_listen_oracle =
@@ -77405,6 +77531,7 @@ int main(int argc, char** argv) {
          !live_access_ledger_observer_self_check && !pinned_nginx_custom_hide_timeout_probe &&
          !pinned_nginx_custom_hide_timeout_completion &&
          !converter_custom_hide_timeout_cli_differential &&
+         !converter_custom_hide_timeout_boundary_cli_differential &&
          !converter_default_buffering_positive_get_differential &&
          !converter_default_buffering_incomplete_clean_eof_differential &&
          !converter_default_buffering_incomplete_body_inactivity_expiry_differential &&
@@ -77521,6 +77648,8 @@ int main(int argc, char** argv) {
          (argv[2][0] != '/' || argv[3][0] != '/')) ||
         (converter_proxy_hide_header_differential && argv[2][0] != '/') ||
         (converter_custom_hide_timeout_cli_differential &&
+         (argv[2][0] != '/' || argv[3][0] != '/')) ||
+        (converter_custom_hide_timeout_boundary_cli_differential &&
          (argv[2][0] != '/' || argv[3][0] != '/')) ||
         ((converter_default_buffering_positive_get_differential ||
           converter_default_buffering_incomplete_clean_eof_differential ||
@@ -78097,6 +78226,18 @@ int main(int argc, char** argv) {
         std::cerr << "PASS: #270 same-file custom-hide/1s timeout expiry and completion pairs "
                      "matched pinned nginx and converter-generated ordinary RUT; this remains "
                      "a bounded compatibility claim, not full support\n";
+        return 0;
+    }
+    if (converter_custom_hide_timeout_boundary_cli_differential) {
+        std::string differential_error;
+        if (!run_pinned_nginx_custom_hide_timeout_cli_differential(
+                argv[2], argv[3], differential_error, true)) {
+            std::cerr << "FAIL [#617 custom-hide timeout boundary CLI differential]: "
+                      << differential_error << "\n";
+            return 1;
+        }
+        std::cerr << "PASS: #617 boundary custom-hide names composed with 1s timeout matched "
+                     "pinned nginx and converter-generated ordinary RUT\n";
         return 0;
     }
     if (explicit_timeout_head_generated_episode) {

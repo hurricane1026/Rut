@@ -1295,6 +1295,18 @@ if(RUT_ENABLE_JIT)
         ENVIRONMENT "RUT_NGINX_DIFFERENTIAL_REQUIRED=1"
     )
     add_test(
+        NAME test_nginx_issue617_custom_hide_timeout_boundary_cli_differential
+        COMMAND test_nginx_differential --converter-custom-hide-timeout-boundary-cli-differential
+                $<TARGET_FILE:rut> $<TARGET_FILE:rut-nginx-convert>
+    )
+    set_tests_properties(test_nginx_issue617_custom_hide_timeout_boundary_cli_differential PROPERTIES
+        LABELS "integration;nginx;docker"
+        RUN_SERIAL TRUE
+        RESOURCE_LOCK nginx-differential
+        TIMEOUT 420
+        ENVIRONMENT "RUT_NGINX_DIFFERENTIAL_REQUIRED=1"
+    )
+    add_test(
         NAME test_nginx_issue439_pinned_lifecycle_self_check
         COMMAND test_nginx_differential --pinned-nginx-lifecycle-self-check
     )
