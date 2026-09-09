@@ -21213,6 +21213,21 @@ TEST(nginx_converter_issue270, custom_hide_header_and_timeout_lower_together) {
     static constexpr char kExpectedOneSecondTimeout[] = "response_read_timeout: 1s\n";
     CHECK_EQ(count_text(one_second_output, kExpectedOneSecondHide), 3u);
     CHECK_EQ(count_text(one_second_output, kExpectedOneSecondTimeout), 4u);
+    // This is a whole-program expected fixture derived from the independently
+    // checked hide-header golden; only the independently specified name and
+    // timeout semantics differ. It is never obtained from the candidate output.
+    std::string expected_one_second(kIssue373HideGolden, sizeof(kIssue373HideGolden) - 1u);
+    size_t name_pos = 0u;
+    while ((name_pos = expected_one_second.find("X-Compat-Hidden", name_pos)) !=
+           std::string::npos) {
+        expected_one_second.replace(name_pos, strlen("X-Compat-Hidden"), name);
+        name_pos += name.size();
+    }
+    const size_t timeout_pos = expected_one_second.find("response_read_timeout: 60s");
+    REQUIRE(timeout_pos != std::string::npos);
+    expected_one_second.replace(
+        timeout_pos, strlen("response_read_timeout: 60s"), "response_read_timeout: 1s");
+    CHECK_EQ(one_second_output, expected_one_second);
     const auto inspect_rut = [&](const std::string& output, u8 seconds) {
         const auto lexed = lex({output.data(), static_cast<u32>(output.size())});
         REQUIRE(lexed);
@@ -21240,8 +21255,36 @@ TEST(nginx_converter_issue270, custom_hide_header_and_timeout_lower_together) {
             CHECK_EQ(function.http_method, methods[i]);
             u32 forwards = 0u;
             for (u32 b = 0u; b < function.block_count; b++)
-                for (u32 inst = 0u; inst < function.blocks[b].inst_count; inst++)
-                    forwards += function.blocks[b].insts[inst].op == rir::Opcode::RetForwardBundle;
+                for (u32 inst = 0u; inst < function.blocks[b].inst_count; inst++) {
+                    const auto& instruction = function.blocks[b].insts[inst];
+                    if (instruction.op != rir::Opcode::RetForwardBundle) continue;
+                    ++forwards;
+                    REQUIRE_EQ(instruction.operand_count, 3u);
+                    i32 upstream_id = -1;
+                    i32 request_policy_id = -1;
+                    i32 bundle_id = -1;
+                    REQUIRE(find_const_i32(function, instruction.operand(0), upstream_id));
+                    REQUIRE(find_const_i32(function, instruction.operand(1), request_policy_id));
+                    REQUIRE(find_const_i32(function, instruction.operand(2), bundle_id));
+                    CHECK_EQ(upstream_id, 0);
+                    CHECK_EQ(request_policy_id, 1);
+                    REQUIRE_GT(bundle_id, 0);
+                    REQUIRE_LE(static_cast<u32>(bundle_id), config.policy_bundle_count);
+                    const auto& bundle = config.policy_bundles[bundle_id - 1];
+                    CHECK_EQ(bundle.response_read_timeout_seconds, seconds);
+                    const bool head = function.http_method == kRouteMethodHead;
+                    const bool get = function.http_method == kRouteMethodGet;
+                    CHECK_EQ(bundle.response_buffering,
+                             get ? ForwardResponseBufferingMode::CompleteContentLength
+                                 : ForwardResponseBufferingMode::None);
+                    REQUIRE(config.response_policy_id_is_valid(bundle.response_policy_id));
+                    const auto& response = config.response_policies[bundle.response_policy_id - 1];
+                    CHECK_EQ(response.head_mode,
+                             head ? ResponsePolicyHeadMode::SuppressBody
+                                  : ResponsePolicyHeadMode::Reject);
+                    CHECK(response_policy_hides_header(
+                        response, {name.data(), static_cast<u32>(name.size())}));
+                }
             CHECK_EQ(forwards, expected_forwards);
             ++i;
         }
@@ -21284,7 +21327,7 @@ TEST(nginx_converter_issue270, custom_hide_header_and_timeout_lower_together) {
     REQUIRE(direct_lowered);
     const size_t profile_server_start = profile_output.find("listen ");
     REQUIRE(profile_server_start != std::string::npos);
-    inspect_rut(profile_output.substr(profile_server_start), 63u);
+    inspect_rut(profile_output, 63u);
     CHECK_EQ(profile_output.substr(profile_server_start),
              std::string(direct_lowered.value().data, direct_lowered.value().len));
     auto forged = profile.value().server;
@@ -21296,8 +21339,7 @@ TEST(nginx_converter_issue270, custom_hide_header_and_timeout_lower_together) {
     forged.location.proxy_read_timeout.milliseconds = 2000u;
     const auto forged_timeout = nginx::lower_to_rut(forged);
     REQUIRE_FALSE(forged_timeout);
-    CHECK(forged_timeout.error().detail.eq(
-        lit_str("http profile metadata does not match its source")));
+    CHECK(forged_timeout.error().detail.eq(lit_str("invalid proxy_read_timeout source syntax")));
     const std::string profile_owned = profile_output;
     std::fill(profile_source.begin(), profile_source.end(), 'x');
     CHECK_EQ(std::string(profile_lowered.value().data, profile_lowered.value().len), profile_owned);
@@ -21329,8 +21371,7 @@ TEST(nginx_converter_issue270, custom_hide_header_and_timeout_lower_together) {
     const auto legacy_lowered = nginx::lower_to_rut(legacy.value());
     REQUIRE(legacy_lowered);
     const std::string legacy_output(legacy_lowered.value().data, legacy_lowered.value().len);
-    CHECK_EQ(count_text(legacy_output, "response_read_timeout: 60s"), 4u);
-    CHECK_EQ(count_text(legacy_output, "response_read_timeout: 1s"), 0u);
+    CHECK_EQ(legacy_output, std::string(kIssue373HideGolden, sizeof(kIssue373HideGolden) - 1u));
 }
 
 TEST(nginx_converter_issue270, explicit_timeout_capacity_boundaries) {
