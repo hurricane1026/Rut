@@ -9751,8 +9751,44 @@ static bool read_exact_rut_source(const std::string& path,
             error = std::string(label) + " close failed";
             return false;
         }
+        if (contents.empty()) {
+            error = std::string(label) + " produced empty source";
+            return false;
+        }
         return true;
     }
+}
+
+static bool check_exact_rut_source_capture(std::string& error) {
+    constexpr size_t kLimit = rut::nginx::HttpProfileRutSource::kCapacity - 1u;
+    TempDir temp;
+    if (!temp.create()) {
+        error = "#616 source capture self-check could not create temp directory";
+        return false;
+    }
+    const auto payload = [](size_t size) {
+        std::string value(size, 'r');
+        if (!value.empty()) value.back() = '\n';
+        return value;
+    };
+    std::string captured;
+    if (!write_file(temp.source, payload(kLimit).data(), kLimit) ||
+        !read_exact_rut_source(temp.source, "#616 exact source limit", captured, error) ||
+        captured != payload(kLimit))
+        return false;
+    if (!write_file(temp.source, payload(kLimit + 1u).data(), kLimit + 1u) ||
+        read_exact_rut_source(temp.source, "#616 over-limit source", captured, error) ||
+        error.find("exceeded owned source capacity") == std::string::npos)
+        return false;
+    if (!write_file(temp.source, "", 0u) ||
+        read_exact_rut_source(temp.source, "#616 empty source", captured, error) ||
+        error.find("empty source") == std::string::npos)
+        return false;
+    if (!write_file(temp.source, payload(8298u).data(), 8298u) ||
+        !read_exact_rut_source(temp.source, "#616 over-log-limit source", captured, error) ||
+        captured != payload(8298u))
+        return false;
+    return true;
 }
 
 static bool split_exact_complete_log(const std::string& contents,
@@ -72793,6 +72829,7 @@ static bool run_pinned_nginx_custom_hide_timeout_cli_differential(const char* ru
         error = "#270 custom-hide CLI differential requires RUT and converter executables";
         return false;
     }
+    if (!check_exact_rut_source_capture(error)) return false;
     // Each invocation owns its complete TempDir/config/origin lifecycle.  The
     // runner performs the accepted nginx expiry/completion contract and then
     // repeats that exact contract through ordinary RUT after CLI lowering.
