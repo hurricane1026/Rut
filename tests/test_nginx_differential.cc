@@ -25883,8 +25883,7 @@ static bool run_nginx_coalesced_ingress_gate_evidence(u16 frontend_port,
     }
     socklen_t local_length = sizeof(local);
     if (getsockname(client.fd, reinterpret_cast<sockaddr*>(&local), &local_length) != 0 ||
-        local_length < sizeof(local) || local.sin_family != AF_INET ||
-        local.sin_addr.s_addr != htonl(INADDR_LOOPBACK) || local.sin_port == 0) {
+        local_length < sizeof(local) || local.sin_family != AF_INET || local.sin_port == 0) {
         error = "failed to publish the pre-connect coalesced-ingress peer identity";
         return false;
     }
@@ -26560,7 +26559,8 @@ static bool run_rut_iouring_gate_spike(u16 frontend_port,
     }
     socklen_t local_length = sizeof(local);
     if (getsockname(client.fd, reinterpret_cast<sockaddr*>(&local), &local_length) != 0 ||
-        local_length < sizeof(local) || local.sin_family != AF_INET || local.sin_port == 0) {
+        local_length < sizeof(local) || local.sin_family != AF_INET ||
+        local.sin_addr.s_addr != htonl(INADDR_LOOPBACK) || local.sin_port == 0) {
         error = "failed to resolve bound RUT target peer identity";
         return false;
     }
