@@ -1,6 +1,6 @@
 #pragma once
 
-+static constexpr char kIssue270HideTimeoutGolden[] = R"rut(listen 127.0.0.1:8080
+static constexpr char kIssue270HideTimeoutGolden[] = R"rut(listen 127.0.0.1:8080
 upstream nginx_upstream at "127.0.0.1:9000"
 pre_route TRACE { return local_response({
   version: "HTTP/1.1", status: 405, reason: "Not Allowed", server: "nginx/1.29.7",
