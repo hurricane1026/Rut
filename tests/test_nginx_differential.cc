@@ -51312,6 +51312,8 @@ static bool run_pinned_request_length_oracle(TempDir& temp,
     } client;
     client.fd = connect_once(frontend_port);
     std::vector<char> response;
+    bool actual_eof = false;
+    bool response_read_error = false;
     if (client.fd < 0 ||
         !send_all(client.fd,
                   kRequestLengthOracleClientRequest,
@@ -72169,23 +72171,46 @@ static bool run_pinned_nginx_custom_hide_timeout_probe(const std::string& contai
         const ssize_t count = recv(client, bytes, sizeof(bytes), 0);
         if (count > 0)
             response.insert(response.end(), bytes, bytes + count);
-        else if (count == 0)
+        else if (count == 0) {
+            actual_eof = true;
             break;
-        else if (errno != EINTR && errno != EAGAIN && errno != EWOULDBLOCK) {
-            close(client);
-            error = "#270 custom-hide timeout probe response read failed";
-            return false;
+        } else if (errno != EINTR && errno != EAGAIN && errno != EWOULDBLOCK) {
+            response_read_error = true;
+            break;
         }
     }
     const u64 observed_ns = steady_now_ns();
-    const bool eof = [&]() {
-        char byte = 0;
-        const ssize_t count = recv(client, &byte, 1, MSG_DONTWAIT);
-        return count == 0 || (count < 0 && (errno == EAGAIN || errno == EWOULDBLOCK));
-    }();
+    std::string access;
+    const bool access_read = read_request_length_access_file(temp.nginx_access_log, access, error);
+    const std::string expected_upstream =
+        "GET /buffered-timeout?q=1 HTTP/1.1\r\nHost: 127.0.0.1:" + std::to_string(backend_port) +
+        "\r\n\r\n";
+    const std::vector<char> expected_upstream_bytes(expected_upstream.begin(),
+                                                    expected_upstream.end());
+    const bool exact_upstream =
+        origin.history.size() == 1u && origin.history[0] == expected_upstream_bytes;
+    const bool origin_retired =
+        origin.response_peer_closed.load(std::memory_order_acquire) &&
+        origin.response_peer_close_count.load(std::memory_order_acquire) == 1u &&
+        origin.response_peer_closed_ns.load(std::memory_order_acquire) >= second_ns &&
+        !origin.response_peer_unexpected_data.load(std::memory_order_acquire) &&
+        !origin.response_peer_observation_failed.load(std::memory_order_acquire);
+    const u64 peer_closed_ns = origin.response_peer_closed_ns.load(std::memory_order_acquire);
     std::cerr << "PROBE #270 custom-hide W2-to-observation-ns=" << (observed_ns - second_ns)
-              << " response-bytes=" << response.size() << " eof-or-open=" << eof << "\n";
+              << " response-bytes=" << response.size() << " actual-eof=" << actual_eof
+              << " read-error=" << response_read_error << " access-bytes=" << access.size()
+              << " origin-write-ns=" << first_ns << "," << second_ns
+              << " peer-close-ns=" << peer_closed_ns << " retired-before-cleanup=" << origin_retired
+              << " exact-upstream=" << exact_upstream << "\n";
     dump_wire("#270 custom-hide timeout probe observed downstream", response);
+    if (!origin.history.empty())
+        dump_wire("#270 custom-hide timeout probe observed upstream", origin.history[0]);
+    if (!actual_eof || response.empty() || response_read_error || !access_read ||
+        access != "60\n" || !exact_upstream || !origin_retired) {
+        error =
+            "#270 custom-hide timeout probe was inconclusive: expiry EOF/retirement/access/"
+            "upstream evidence was not observed before cleanup";
+    }
     close(client);
     origin.stop();
     const bool nginx_stopped = stop_child(nginx.child);
@@ -72195,10 +72220,10 @@ static bool run_pinned_nginx_custom_hide_timeout_probe(const std::string& contai
         origin.accepted.load(std::memory_order_acquire) != 1u ||
         origin.requests.load(std::memory_order_acquire) != 1u || origin.history.size() != 1u ||
         origin.response_fragments_sent.load(std::memory_order_acquire) != 2u) {
-        error = "#270 custom-hide timeout probe cleanup/history was not exact";
+        if (error.empty()) error = "#270 custom-hide timeout probe cleanup/history was not exact";
         return false;
     }
-    return true;
+    return error.empty();
 }
 
 static bool run_pinned_nginx_default_buffering_three_publication_oracle_impl(
