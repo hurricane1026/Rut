@@ -3852,7 +3852,7 @@ TEST(nginx_converter, admits_authenticated_explicit_proxy_buffering_on_timeout_f
 }
 
 TEST(nginx_converter, rejects_erased_proxy_hide_header_metadata_from_reparsed_source) {
-    const auto expect_erased_hide = [](const std::string& source, bool erase_buffering) {
+    const auto expect_erased_hide = [_tc](const std::string& source, bool erase_buffering) {
         const auto parsed = nginx::parse({source.data(), static_cast<u32>(source.size())});
         REQUIRE(parsed);
         auto forged = parsed.value();
