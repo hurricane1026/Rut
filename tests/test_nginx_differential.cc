@@ -72125,6 +72125,10 @@ static bool run_pinned_nginx_custom_hide_timeout_probe(
     CustomHideTimeoutPairContext* pair = nullptr,
     CustomHideTimeoutObservation* observation = nullptr) {
     const bool generated_rut = rut_path != nullptr || converter_path != nullptr;
+    if (pair != nullptr && observation == nullptr) {
+        error = "#270 custom-hide pair requires an observation output";
+        return false;
+    }
     if (generated_rut && (rut_path == nullptr || converter_path == nullptr || rut_path[0] != '/' ||
                           converter_path[0] != '/' || access(rut_path, X_OK) != 0 ||
                           access(converter_path, X_OK) != 0)) {
@@ -72717,7 +72721,7 @@ static bool run_pinned_nginx_custom_hide_timeout_probe(
             }
             observation->upstream = origin.history[0];
             observation->access = final_access;
-            observation->eof = true;
+            observation->eof = !no_eof_and_quiet;
             observation->retired = origin_retired;
             observation->stable = stable;
             observation->accepted = origin.accepted.load(std::memory_order_acquire);
@@ -72969,10 +72973,27 @@ static bool run_pinned_nginx_custom_hide_timeout_cli_differential(const char* ru
             error = "#270 pair config changed after nginx settlement";
             return false;
         }
-        if (!read_request_length_access_file(
-                pair.temp.nginx_access_log, pair.access_snapshot, error) ||
-            pair.access_snapshot != "60\n" || !write_file(pair.temp.nginx_access_log, "", 0u)) {
-            error = "#270 pair access snapshot/reset failed";
+        if (rename(pair.temp.nginx_access_log.c_str(),
+                   pair.temp.nginx_access_snapshot.c_str()) != 0) {
+            error = "#270 pair could not preserve nginx access snapshot errno=" +
+                    std::to_string(errno);
+            return false;
+        }
+        if (!read_exact_return204_log(pair.temp.nginx_access_snapshot,
+                                      "#270 stopped nginx access snapshot",
+                                      pair.access_snapshot,
+                                      error) ||
+            pair.access_snapshot != "60\n") {
+            error = "#270 pair nginx access snapshot was not exactly 60+LF";
+            return false;
+        }
+        if (write_file(pair.temp.nginx_access_log, "", 0u) &&
+            access(pair.temp.nginx_access_log.c_str(), F_OK) == 0) {
+            // The fresh same-path sink is intentionally created only after the
+            // owned nginx snapshot has been preserved and validated.
+        } else {
+            error = "#270 pair could not create fresh shared access sink errno=" +
+                    std::to_string(errno);
             return false;
         }
         std::string cleared;
@@ -72996,16 +73017,51 @@ static bool run_pinned_nginx_custom_hide_timeout_cli_differential(const char* ru
             error = "#270 pair config changed after RUT settlement";
             return false;
         }
-        if (nginx_observation.downstream != rut_observation.downstream ||
-            nginx_observation.upstream != rut_observation.upstream ||
-            nginx_observation.access != rut_observation.access ||
-            nginx_observation.eof != rut_observation.eof ||
-            nginx_observation.retired != rut_observation.retired ||
-            nginx_observation.stable != rut_observation.stable ||
-            nginx_observation.accepted != rut_observation.accepted ||
-            nginx_observation.requests != rut_observation.requests ||
-            nginx_observation.peer_close_count != rut_observation.peer_close_count) {
+        const auto observations_equal = [](const CustomHideTimeoutObservation& lhs,
+                                           const CustomHideTimeoutObservation& rhs) {
+            return lhs.downstream == rhs.downstream && lhs.upstream == rhs.upstream &&
+                   lhs.access == rhs.access && lhs.eof == rhs.eof && lhs.retired == rhs.retired &&
+                   lhs.stable == rhs.stable && lhs.accepted == rhs.accepted &&
+                   lhs.requests == rhs.requests && lhs.peer_close_count == rhs.peer_close_count;
+        };
+        if (!observations_equal(nginx_observation, rut_observation)) {
             error = "#270 paired nginx/RUT accepted observations differed";
+            return false;
+        }
+        auto mutant = rut_observation;
+        mutant.downstream.insert(mutant.downstream.begin(),
+                                 {'X', '-', 'P', 'o', 'w', 'e', 'r', 'e', 'd',  '-',
+                                  'B', 'y', ':', ' ', 'l', 'e', 'a', 'k', '\r', '\n'});
+        if (observations_equal(nginx_observation, mutant)) {
+            error = "#270 pair comparator accepted a hidden-header mutation";
+            return false;
+        }
+        mutant = rut_observation;
+        mutant.downstream.push_back('x');
+        if (observations_equal(nginx_observation, mutant)) {
+            error = "#270 pair comparator accepted a downstream-body mutation";
+            return false;
+        }
+        mutant = rut_observation;
+        if (mutant.upstream.empty()) {
+            error = "#270 pair comparator lacked upstream bytes for mutation control";
+            return false;
+        }
+        mutant.upstream[0] ^= 1;
+        if (observations_equal(nginx_observation, mutant)) {
+            error = "#270 pair comparator accepted an upstream mutation";
+            return false;
+        }
+        mutant = rut_observation;
+        mutant.access = "61\n";
+        if (observations_equal(nginx_observation, mutant)) {
+            error = "#270 pair comparator accepted an access mutation";
+            return false;
+        }
+        mutant = rut_observation;
+        mutant.eof = !mutant.eof;
+        if (observations_equal(nginx_observation, mutant)) {
+            error = "#270 pair comparator accepted an EOF mutation";
             return false;
         }
         return true;
@@ -76741,13 +76797,13 @@ int main(int argc, char** argv) {
         std::string differential_error;
         if (!run_pinned_nginx_custom_hide_timeout_cli_differential(
                 argv[2], argv[3], differential_error)) {
-            std::cerr << "FAIL [#270 custom-hide timeout CLI differential]: "
-                      << differential_error << "\n";
+            std::cerr << "FAIL [#270 custom-hide timeout CLI differential]: " << differential_error
+                      << "\n";
             return 1;
         }
-        std::cerr << "PASS: #270 custom-hide/1s timeout expiry and completion independent oracle "
-                     "contracts passed for pinned nginx and converter-generated ordinary RUT "
-                     "(same-file cross-run comparison remains pending)\n";
+        std::cerr << "PASS: #270 same-file custom-hide/1s timeout expiry and completion pairs "
+                     "matched pinned nginx and converter-generated ordinary RUT; this remains "
+                     "a bounded compatibility claim, not full support\n";
         return 0;
     }
     if (explicit_timeout_head_generated_episode) {
