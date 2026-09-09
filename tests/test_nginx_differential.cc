@@ -77624,6 +77624,7 @@ int main(int argc, char** argv) {
          !live_access_ledger_observer_self_check && !pinned_nginx_custom_hide_timeout_probe &&
          !pinned_nginx_custom_hide_timeout_completion &&
          !converter_custom_hide_timeout_cli_differential &&
+         !converter_custom_hide_timeout_explicit_buffering_cli_differential &&
          !converter_custom_hide_timeout_boundary_cli_differential &&
          !converter_default_buffering_positive_get_differential &&
          !converter_default_buffering_incomplete_clean_eof_differential &&
@@ -77743,6 +77744,8 @@ int main(int argc, char** argv) {
         (converter_proxy_hide_header_differential && argv[2][0] != '/') ||
         (converter_custom_hide_timeout_cli_differential &&
          (argv[2][0] != '/' || argv[3][0] != '/')) ||
+        (converter_custom_hide_timeout_explicit_buffering_cli_differential &&
+         (argv[2][0] != '/' || argv[3][0] != '/')) ||
         (converter_custom_hide_timeout_boundary_cli_differential &&
          (argv[2][0] != '/' || argv[3][0] != '/')) ||
         ((converter_default_buffering_positive_get_differential ||
@@ -77851,6 +77854,9 @@ int main(int argc, char** argv) {
                "   or: test_nginx_differential --pinned-nginx-proxy-hide-header-oracle\n"
                "   or: test_nginx_differential --pinned-nginx-custom-hide-timeout-probe\n"
                "   or: test_nginx_differential --pinned-nginx-custom-hide-timeout-completion\n"
+               "   or: test_nginx_differential "
+               "--converter-custom-hide-timeout-explicit-buffering-cli-differential "
+               "<absolute-rut-executable> <absolute-converter-executable>\n"
                "   or: test_nginx_differential "
                "--converter-explicit-timeout-head-source-self-check\n"
                "   or: test_nginx_differential "
