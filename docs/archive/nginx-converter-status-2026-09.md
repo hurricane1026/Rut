@@ -2,6 +2,10 @@
 
 ## CURRENT
 
+- #615 combined hide-header/timeout authentication is under review: latest build
+  failed at `fa7860f1`; prior #263 debug and no-JIT gates passed 2/2, and the
+  adjacent #614 oracle plus #600 name/boundary gates passed 4/4 in 8.74s.
+  Remaining gates are exact-HEAD tests, CI, and combined behavior validation.
 - [#572](https://github.com/hurricane1026/Rut/issues/572) is closed by merged
   docs PR [#581](https://github.com/hurricane1026/Rut/pull/581), following the
   reviewed explicit-on lowering and its exact 1s runtime witness. The admitted
@@ -32,6 +36,7 @@
 
 ## BACKLOG
 
+- #614's proxy-hide-header oracle is merged; it is no longer the next oracle.
 - #583 adds a bounded complete-file envelope separately from the completed
   standalone command. Arbitrary wrappers/includes remain unproven; runtime
   `rut` must not start accepting nginx syntax.

@@ -21399,6 +21399,12 @@ TEST(nginx_converter_issue270, custom_hide_header_and_timeout_lower_together) {
     forged.location.proxy_read_timeout.present = false;
     const auto absent_timeout = nginx::lower_to_rut(forged);
     REQUIRE_FALSE(absent_timeout);
+    CHECK(absent_timeout.error().detail.eq(lit_str("invalid proxy_hide_header spans")));
+    forged = profile.value().server;
+    forged.location.proxy_read_timeout = {};
+    const auto erased_timeout = nginx::lower_to_rut(forged);
+    REQUIRE_FALSE(erased_timeout);
+    CHECK(erased_timeout.error().detail.eq(lit_str("invalid proxy_hide_header spans")));
     forged = profile.value().server;
     forged.location.proxy_read_timeout = {};
     forged.location.proxy_read_timeout.span =
@@ -21407,6 +21413,7 @@ TEST(nginx_converter_issue270, custom_hide_header_and_timeout_lower_together) {
         profile.value().server.location.proxy_hide_header.name_span;
     const auto redirected_timeout = nginx::lower_to_rut(forged);
     REQUIRE_FALSE(redirected_timeout);
+    CHECK(redirected_timeout.error().detail.eq(lit_str("invalid proxy_hide_header spans")));
     std::string sibling_source = direct_source;
     const auto sibling =
         nginx::parse({sibling_source.data(), static_cast<u32>(sibling_source.size())});
@@ -21443,38 +21450,41 @@ TEST(nginx_converter_issue270, custom_hide_header_and_timeout_lower_together) {
     std::fill(profile_source.begin(), profile_source.end(), 'x');
     CHECK_EQ(std::string(profile_lowered.value().data, profile_lowered.value().len), profile_owned);
     profile_source = make_request_length_http_profile("/logs/access.log", server_content);
-    const auto server_owned = [&]() {
+    nginx::RutSource server_owned;
+    {
         std::string scoped_source = direct_source;
         const auto scoped =
             nginx::parse({scoped_source.data(), static_cast<u32>(scoped_source.size())});
         REQUIRE(scoped);
         const auto lowered = nginx::lower_to_rut(scoped.value());
         REQUIRE(lowered);
-        return lowered.value();
-    }();
+        server_owned = lowered.value();
+    }
     CHECK_EQ(std::string(server_owned.data, server_owned.len),
              std::string(direct_lowered.value().data, direct_lowered.value().len));
     CHECK_EQ(server_owned.data[server_owned.len], '\0');
-    const auto http_owned = [&]() {
+    nginx::HttpProfileRutSource http_owned;
+    {
         std::string scoped_source = profile_source;
         const auto scoped = nginx::parse_http_profile(
             {scoped_source.data(), static_cast<u32>(scoped_source.size())});
         REQUIRE(scoped);
         const auto lowered = nginx::lower_to_rut(scoped.value());
         REQUIRE(lowered);
-        return lowered.value();
-    }();
+        http_owned = lowered.value();
+    }
     CHECK_EQ(std::string(http_owned.data, http_owned.len), profile_owned);
     CHECK_EQ(http_owned.data[http_owned.len], '\0');
-    const auto fullfile_owned = [&]() {
+    nginx::HttpProfileRutSource fullfile_owned;
+    {
         std::string scoped_source = "events {} " + profile_source;
         const auto scoped = nginx::parse_nginx_http_config(
             {scoped_source.data(), static_cast<u32>(scoped_source.size())});
         REQUIRE(scoped);
         const auto lowered = nginx::lower_to_rut(scoped.value());
         REQUIRE(lowered);
-        return lowered.value();
-    }();
+        fullfile_owned = lowered.value();
+    }
     CHECK_EQ(std::string(fullfile_owned.data, fullfile_owned.len), profile_owned);
     CHECK_EQ(fullfile_owned.data[fullfile_owned.len], '\0');
     const std::string maximum_source =
