@@ -21181,9 +21181,9 @@ TEST(nginx_converter_issue270, custom_hide_header_and_timeout_lower_together) {
               "X-Ab9_-Ab9_-Ab9_-Ab9_-Ab9_-Ab9_-Ab9_-Ab9_-Cd0E;"}) {
             std::string source = "server { listen 127.0.0.1:8080; location / { ";
             source += directives;
-            if (timeout != 1u && std::strstr(directives, "proxy_read_timeout 1s") != nullptr)
+            if (timeout != 1u && strstr(directives, "proxy_read_timeout 1s") != nullptr)
                 source.replace(source.find("1s"), 2u, std::to_string(timeout) + "s");
-            if (timeout != 63u && std::strstr(directives, "proxy_read_timeout 63s") != nullptr)
+            if (timeout != 63u && strstr(directives, "proxy_read_timeout 63s") != nullptr)
                 source.replace(source.find("63s"), 3u, std::to_string(timeout) + "s");
             source += " proxy_pass http://127.0.0.1:9000; } }";
             const auto parsed = nginx::parse({source.data(), static_cast<u32>(source.size())});
