@@ -53223,8 +53223,8 @@ static bool validate_custom_hide_timeout_loaded_program(const std::string& sourc
                                                         const char* custom_name,
                                                         std::string& error) {
     if (source_path.empty() || captured_stdout.empty() || custom_name == nullptr ||
-        frontend_port == 0u || backend_port == 0u || frontend_port == backend_port ||
-        access_path.empty()) {
+        custom_name[0] == '\0' || frontend_port == 0u || backend_port == 0u ||
+        frontend_port == backend_port || access_path.empty()) {
         error = "#616 loaded custom-hide timeout helper received incomplete artifacts";
         return false;
     }
@@ -53267,21 +53267,22 @@ static bool validate_custom_hide_timeout_loaded_program(const std::string& sourc
         const uintptr_t ptr = reinterpret_cast<uintptr_t>(value.ptr);
         return ptr >= begin && ptr - begin <= used - value.len;
     };
-    const rut::Str names[] = {rut::lit_str("Date"),
-                              rut::lit_str("Server"),
-                              rut::lit_str("X-Pad"),
-                              {custom_name, static_cast<rut::u32>(strlen(custom_name))}};
-    const auto policy_ok = [&](const rut::ForwardResponsePolicySpec& policy,
-                               rut::ResponsePolicyHeadMode head) {
+    const auto policy_ok = [&](const rut::RouteConfig& config,
+                               const rut::ForwardResponsePolicySpec& policy,
+                               rut::ResponsePolicyHeadMode head,
+                               const char* expected_custom_name) {
+        const rut::Str names[] = {
+            rut::lit_str("Date"),
+            rut::lit_str("Server"),
+            rut::lit_str("X-Pad"),
+            {expected_custom_name, static_cast<rut::u32>(strlen(expected_custom_name))}};
         if (policy.head_mode != head || policy.hide_header_count != 4u ||
-            !owned(policy.server,
-                   program->config.response_policy_bytes,
-                   program->config.response_policy_bytes_used))
+            !owned(policy.server, config.response_policy_bytes, config.response_policy_bytes_used))
             return false;
         for (u32 i = 0u; i < 4u; i++)
             if (!owned(policy.hide_headers[i],
-                       program->config.response_policy_bytes,
-                       program->config.response_policy_bytes_used) ||
+                       config.response_policy_bytes,
+                       config.response_policy_bytes_used) ||
                 !policy.hide_headers[i].eq(names[i]))
                 return false;
         return true;
@@ -53328,8 +53329,10 @@ static bool validate_custom_hide_timeout_loaded_program(const std::string& sourc
             !program->config.response_policy_id_is_valid(bundle.response_policy_id) ||
             !program->config.failure_policy_id_is_valid(bundle.failure_policy_id) ||
             !program->config.timeout_failure_policy_id_is_valid(bundle.timeout_failure_policy_id) ||
-            !policy_ok(program->config.response_policies[bundle.response_policy_id - 1u],
-                       static_cast<rut::ResponsePolicyHeadMode>(expected_head)))
+            !policy_ok(program->config,
+                       program->config.response_policies[bundle.response_policy_id - 1u],
+                       static_cast<rut::ResponsePolicyHeadMode>(expected_head),
+                       custom_name))
             return false;
         const auto& failure = program->config.failure_policies[bundle.failure_policy_id - 1u];
         const auto& timeout =
@@ -53441,14 +53444,25 @@ static bool validate_custom_hide_timeout_loaded_program(const std::string& sourc
     bad = r0;
     if (!rejects(bad, "valid-wrong-route-bundle")) return false;
     std::string mutant_source = captured_stdout;
-    const size_t custom_at = mutant_source.find(custom_name);
-    if (custom_at == std::string::npos || custom_at + strlen(custom_name) > mutant_source.size()) {
-        error = "#616 loaded custom-hide timeout source lacked the custom header name";
+    const std::string emitted_hide =
+        "hide_headers: [\"Date\", \"Server\", \"X-Pad\", \"" + std::string(custom_name) + "\"]";
+    const std::string mutant_name = std::string(custom_name, strlen(custom_name) - 1u) +
+                                    (custom_name[strlen(custom_name) - 1u] == '0' ? '1' : '0');
+    size_t replacement_count = 0u;
+    for (size_t at = mutant_source.find(emitted_hide); at != std::string::npos;
+         at = mutant_source.find(emitted_hide, at + emitted_hide.size())) {
+        mutant_source.replace(
+            at + emitted_hide.find(custom_name), strlen(custom_name), mutant_name);
+        replacement_count++;
+    }
+    if (replacement_count == 0u) {
+        error = "#616 loaded custom-hide timeout source lacked emitted hide lists";
         return false;
     }
-    std::string mutant_name(custom_name);
-    mutant_name.back() = mutant_name.back() == 'Y' ? 'Z' : 'Y';
-    mutant_source.replace(custom_at, strlen(custom_name), mutant_name);
+    if (mutant_source.size() != captured_stdout.size()) {
+        error = "#616 same-length custom-name mutant changed source size";
+        return false;
+    }
     TempDir mutant_temp;
     if (!mutant_temp.create() ||
         !write_file(mutant_temp.source, mutant_source.data(), mutant_source.size())) {
@@ -53466,18 +53480,52 @@ static bool validate_custom_hide_timeout_loaded_program(const std::string& sourc
                                mutant_error,
                                rut::jit::OptLevel::O2,
                                static_cast<u64>(mutant_source.size()))) {
-        error = "#616 same-length custom-name mutant did not load successfully";
+        error = "#616 same-length custom-name mutant did not load successfully (stage=" +
+                std::to_string(static_cast<u32>(mutant_error.stage));
+        if (mutant_error.diag.detail.ptr != nullptr)
+            error += ", detail=" +
+                     std::string(mutant_error.diag.detail.ptr, mutant_error.diag.detail.len);
+        error += ")";
         return false;
     }
-    bool mutant_matches_original = false;
-    for (u32 i = 0u; i < mutant->config.response_policy_count; i++) {
-        const auto& policy = mutant->config.response_policies[i];
-        if (policy.hide_header_count != 4u) continue;
-        bool same = true;
-        for (u32 h = 0u; h < 4u; h++) same &= policy.hide_headers[h].eq(names[h]);
-        mutant_matches_original |= same;
+    const rut::RouteEntry* mutant_get = nullptr;
+    u32 mutant_get_count = 0u;
+    for (u32 i = 0u; i < mutant->config.route_count; i++) {
+        const auto& route = mutant->config.routes[i];
+        if (route.method == rut::kRouteMethodGet && route.path_len == 1u && route.path[0] == '/' &&
+            route.fn != nullptr && route.action == rut::RouteAction::JitHandler) {
+            mutant_get = &route;
+            mutant_get_count++;
+        }
     }
-    if (mutant_matches_original) {
+    if (mutant_get == nullptr || mutant_get_count != 1u) {
+        error = "#616 same-length custom-name mutant lacked a valid GET route";
+        return false;
+    }
+    const auto mutant_result = invoke(*mutant_get, g, static_cast<u32>(strlen(g)));
+    if (mutant_result.action != rut::jit::HandlerAction::ForwardBundle ||
+        mutant_result.status_code != static_cast<u16>(rut::RequestPolicyId::Http11FixedStrip) ||
+        mutant_result.upstream_id != 0u || mutant_result.next_state == 0u ||
+        mutant_result.next_state > mutant->config.policy_bundle_count) {
+        error = "#616 same-length custom-name mutant GET result was not a valid forward bundle";
+        return false;
+    }
+    const auto& mutant_bundle = mutant->config.policy_bundles[mutant_result.next_state - 1u];
+    if (!mutant->config.response_policy_id_is_valid(mutant_bundle.response_policy_id)) {
+        error = "#616 same-length custom-name mutant GET response policy was out of range";
+        return false;
+    }
+    if (!policy_ok(mutant->config,
+                   mutant->config.response_policies[mutant_bundle.response_policy_id - 1u],
+                   rut::ResponsePolicyHeadMode::Reject,
+                   mutant_name.c_str())) {
+        error = "#616 same-length custom-name mutant did not retain its changed name";
+        return false;
+    }
+    if (policy_ok(mutant->config,
+                  mutant->config.response_policies[mutant_bundle.response_policy_id - 1u],
+                  rut::ResponsePolicyHeadMode::Reject,
+                  custom_name)) {
         error = "#616 same-length custom-name mutant retained the original semantic name";
         return false;
     }
@@ -53511,8 +53559,10 @@ static bool validate_custom_hide_timeout_loaded_program(const std::string& sourc
         if (!program->config.response_policy_id_is_valid(bundle.response_policy_id) ||
             !program->config.failure_policy_id_is_valid(bundle.failure_policy_id) ||
             !program->config.timeout_failure_policy_id_is_valid(bundle.timeout_failure_policy_id) ||
-            !policy_ok(program->config.response_policies[bundle.response_policy_id - 1u],
-                       response_head) ||
+            !policy_ok(program->config,
+                       program->config.response_policies[bundle.response_policy_id - 1u],
+                       response_head,
+                       custom_name) ||
             !failure_ok(program->config.failure_policies[bundle.failure_policy_id - 1u],
                         502u,
                         failure_head,
@@ -53528,8 +53578,10 @@ static bool validate_custom_hide_timeout_loaded_program(const std::string& sourc
     if (!program->config.response_policy_id_is_valid(saved_response) ||
         !program->config.failure_policy_id_is_valid(saved_failure) ||
         !program->config.timeout_failure_policy_id_is_valid(saved_timeout_failure) ||
-        !policy_ok(program->config.response_policies[saved_response - 1u],
-                   rut::ResponsePolicyHeadMode::Reject) ||
+        !policy_ok(program->config,
+                   program->config.response_policies[saved_response - 1u],
+                   rut::ResponsePolicyHeadMode::Reject,
+                   custom_name) ||
         !failure_ok(program->config.failure_policies[saved_failure - 1u],
                     502u,
                     rut::FailurePolicyHeadMode::Reject,
