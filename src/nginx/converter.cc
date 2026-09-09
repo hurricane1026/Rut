@@ -1465,8 +1465,8 @@ FrontendResult<bool> validate_proxy_hide_header(const Server& server, bool exact
         exact_listener && server.listen.address == ListenerAddress::IPv4Exact &&
         server.listen.ipv4_host == 0x7f000001u && eq(location.path, "/", 1u) && !proxy.has_uri &&
         proxy.uri.ptr == nullptr && proxy.uri.len == 0u && is_default_span(proxy.uri_span) &&
-        !timeout.present && !server.exact_local_return.present &&
-        !server.exact_no_content_return.present && !server.exact_absolute_redirect.present;
+        !server.exact_local_return.present && !server.exact_no_content_return.present &&
+        !server.exact_absolute_redirect.present;
     if (!minimal_profile)
         return unsupported(
             header.span,
@@ -2157,6 +2157,12 @@ FrontendResult<RutSource> lower_to_rut(const Server& server) {
         if (!header) return core::make_unexpected(header.error());
         hide_compat_header = true;
         hide_header_name = server.location.proxy_hide_header.name;
+        if (timeout_present) {
+            auto timeout = validate_proxy_read_timeout(server);
+            if (!timeout) return core::make_unexpected(timeout.error());
+            timeout_seconds =
+                static_cast<u8>(server.location.proxy_read_timeout.milliseconds / 1000u);
+        }
     } else {
         auto timeout = validate_proxy_read_timeout(server);
         if (!timeout) return core::make_unexpected(timeout.error());
