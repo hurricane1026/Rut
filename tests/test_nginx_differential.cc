@@ -72030,7 +72030,6 @@ static bool run_pinned_nginx_custom_hide_timeout_probe(const std::string& contai
     static constexpr char kSecond[] = "!";
 
     Recorder origin;
-    origin.wait_response_peer_close = true;
     origin.observe_extra_requests_until_stop = true;
     origin.permit_gated_incomplete_first_response = true;
     origin.incomplete_first_response_fragment_count = 2u;
