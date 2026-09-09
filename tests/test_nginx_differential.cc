@@ -1393,10 +1393,15 @@ static bool run_docker_info_preflight_self_check(std::string& error) {
     DockerInfoResult timeout_missing = timeout_text;
     timeout_missing.snapshot.clear();
     timeout_missing.snapshot_state = DockerSnapshotState::Missing;
-    const DockerInfoResult* controls[] = {
-        &missing,       &empty,          &read_error,    &spawn_failed,
-        &wait_failed,   &invalid_status, &timeout_text,  &timeout_empty,
-        &timeout_missing};
+    const DockerInfoResult* controls[] = {&missing,
+                                          &empty,
+                                          &read_error,
+                                          &spawn_failed,
+                                          &wait_failed,
+                                          &invalid_status,
+                                          &timeout_text,
+                                          &timeout_empty,
+                                          &timeout_missing};
     for (const DockerInfoResult* control : controls) {
         const DockerInfoDecision decision = docker_info_decision(*control);
         const int required_rc = docker_info_return_code(decision, true);
@@ -79047,8 +79052,8 @@ int main(int argc, char** argv) {
         if (docker_info_decision(docker_info) == DockerInfoDecision::MissingPrerequisite) {
             std::cerr << "SKIP: Docker daemon unavailable\n";
             const char* required = getenv("RUT_NGINX_DIFFERENTIAL_REQUIRED");
-            return docker_info_return_code(
-                DockerInfoDecision::MissingPrerequisite, required && strcmp(required, "1") == 0);
+            return docker_info_return_code(DockerInfoDecision::MissingPrerequisite,
+                                           required && strcmp(required, "1") == 0);
         }
         std::cerr << "FAIL [preflight]: Docker info probe failed\n";
         return docker_info_return_code(DockerInfoDecision::Failure, true);
