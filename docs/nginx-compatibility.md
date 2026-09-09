@@ -16,8 +16,10 @@ support for the explicit-on composition. Positive admission remains #621;
 reviewed lowering `41487c0f` passes Release and no-JIT component tests. PR #625
 merged at `6c127bb3` from final `810d15d4` after CI `34324359742` passed all
 15 jobs and required nginx 155/155 with zero skips (611.54s). The dedicated
-explicit-on generated-RUT network witness is now the next implementation. This
-component evidence does not promote the composition to `SUPPORTED`.
+explicit-on generated-RUT network witness at `1f547c57` passed independent review,
+root Release build and seven targeted tests with zero skips (47.39s; new CLI
+test 8.08s). It covers representative X-Powered-By/1s GET expiry and completion;
+final CI/integration is pending. No composition row is promoted yet.
 #623 tracks a reproduced source-backed Server-model hide-metadata erasure gap;
 its fix merged through #624 at `2bba609a` after CI `34320265023` passed all
 15 jobs and required nginx 155/155. This strengthens model authentication only.
