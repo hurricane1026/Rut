@@ -51312,8 +51312,6 @@ static bool run_pinned_request_length_oracle(TempDir& temp,
     } client;
     client.fd = connect_once(frontend_port);
     std::vector<char> response;
-    bool actual_eof = false;
-    bool response_read_error = false;
     if (client.fd < 0 ||
         !send_all(client.fd,
                   kRequestLengthOracleClientRequest,
@@ -72156,6 +72154,8 @@ static bool run_pinned_nginx_custom_hide_timeout_probe(const std::string& contai
         return false;
     }
     std::vector<char> response;
+    bool actual_eof = false;
+    bool response_read_error = false;
     const auto response_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(3);
     while (std::chrono::steady_clock::now() < response_deadline) {
         pollfd state{client, POLLIN | POLLHUP | POLLERR, 0};
@@ -72187,8 +72187,6 @@ static bool run_pinned_nginx_custom_hide_timeout_probe(const std::string& contai
         "\r\n\r\n";
     const std::vector<char> expected_upstream_bytes(expected_upstream.begin(),
                                                     expected_upstream.end());
-    const bool exact_upstream =
-        origin.history.size() == 1u && origin.history[0] == expected_upstream_bytes;
     const bool origin_retired =
         origin.response_peer_closed.load(std::memory_order_acquire) &&
         origin.response_peer_close_count.load(std::memory_order_acquire) == 1u &&
@@ -72201,18 +72199,23 @@ static bool run_pinned_nginx_custom_hide_timeout_probe(const std::string& contai
               << " read-error=" << response_read_error << " access-bytes=" << access.size()
               << " origin-write-ns=" << first_ns << "," << second_ns
               << " peer-close-ns=" << peer_closed_ns << " retired-before-cleanup=" << origin_retired
-              << " exact-upstream=" << exact_upstream << "\n";
+              << " exact-upstream=deferred-until-origin-join\n";
     dump_wire("#270 custom-hide timeout probe observed downstream", response);
-    if (!origin.history.empty())
-        dump_wire("#270 custom-hide timeout probe observed upstream", origin.history[0]);
     if (!actual_eof || response.empty() || response_read_error || !access_read ||
-        access != "60\n" || !exact_upstream || !origin_retired) {
+        access != "60\n" || !origin_retired) {
         error =
             "#270 custom-hide timeout probe was inconclusive: expiry EOF/retirement/access/"
             "upstream evidence was not observed before cleanup";
     }
     close(client);
     origin.stop();
+    const bool exact_upstream =
+        origin.history.size() == 1u && origin.history[0] == expected_upstream_bytes;
+    if (!exact_upstream) {
+        error = "#270 custom-hide timeout probe observed an unexpected upstream request";
+    }
+    if (!origin.history.empty())
+        dump_wire("#270 custom-hide timeout probe observed upstream", origin.history[0]);
     const bool nginx_stopped = stop_child(nginx.child);
     const bool removed = docker.remove();
     if (!nginx_stopped || !removed || reservations.fds[0] >= 0 || reservations.fds[1] >= 0 ||
