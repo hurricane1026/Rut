@@ -72028,6 +72028,15 @@ static bool run_pinned_nginx_custom_hide_timeout_probe(const std::string& contai
         "hello";
     static_assert(sizeof(kOrigin) - 1u == 187u);
     static constexpr char kSecond[] = "!";
+    static constexpr char kExpectedExpiryResponseNormalized[] =
+        "HTTP/1.1 200 OK\r\n"
+        "Server: nginx/1.29.7\r\n"
+        "Date: XXXXXXXXXXXXXXXXXXXXXXXXXXXXX\r\n"
+        "Content-Length: 12\r\n"
+        "Connection: keep-alive\r\n"
+        "X-Unrelated: retained\r\n"
+        "\r\n";
+    static_assert(sizeof(kExpectedExpiryResponseNormalized) - 1u == 145u);
 
     Recorder origin;
     origin.observe_extra_requests_until_stop = true;
@@ -72152,6 +72161,48 @@ static bool run_pinned_nginx_custom_hide_timeout_probe(const std::string& contai
         error = "#270 custom-hide timeout probe did not publish W2";
         return false;
     }
+    const u64 w2_elapsed_ns = second_ns - first_ns;
+    if (w2_elapsed_ns < 550'000'000ull || w2_elapsed_ns >= 750'000'000ull ||
+        !origin.response_send_succeeded.load(std::memory_order_acquire) ||
+        !origin.response_sent_open.load(std::memory_order_acquire) ||
+        origin.response_send_failed.load(std::memory_order_acquire) ||
+        origin.response_peer_closed.load(std::memory_order_acquire) ||
+        origin.response_peer_unexpected_data.load(std::memory_order_acquire) ||
+        origin.response_peer_observation_failed.load(std::memory_order_acquire)) {
+        close(client);
+        error = "#270 custom-hide timeout probe W1/W2 timing or origin-open evidence failed";
+        return false;
+    }
+    const auto expiry_timing_is_valid = [](u64 elapsed_ns) {
+        return elapsed_ns >= 750'000'000ull && elapsed_ns < 2'000'000'000ull;
+    };
+    if (!observe_client_open_and_quiet_nonconsuming(client, 200, error)) {
+        close(client);
+        error = "#270 custom-hide timeout probe lost downstream open state after W2";
+        return false;
+    }
+    const u64 quiet_horizon_ns = first_ns + 1'100'000'000ull;
+    while (steady_now_ns() < quiet_horizon_ns) {
+        std::string quiet_access;
+        if (!origin_live() || poll_child(nginx.child) ||
+            !observe_client_open_and_quiet_nonconsuming(client, 5, error) ||
+            !read_request_length_access_file(temp.nginx_access_log, quiet_access, error) ||
+            !quiet_access.empty() || origin.accepted.load(std::memory_order_acquire) != 1u ||
+            origin.requests.load(std::memory_order_acquire) != 1u ||
+            origin.response_fragments_sent.load(std::memory_order_acquire) != 2u ||
+            !origin.response_send_succeeded.load(std::memory_order_acquire) ||
+            !origin.response_sent_open.load(std::memory_order_acquire) ||
+            origin.response_send_failed.load(std::memory_order_acquire) ||
+            origin.response_peer_closed.load(std::memory_order_acquire) ||
+            origin.response_peer_close_count.load(std::memory_order_acquire) != 0u ||
+            origin.response_peer_unexpected_data.load(std::memory_order_acquire) ||
+            origin.response_peer_observation_failed.load(std::memory_order_acquire)) {
+            close(client);
+            if (error.empty()) error = "#270 custom-hide timeout probe W2+quiet/access gate failed";
+            return false;
+        }
+        usleep(1000);
+    }
     std::vector<char> response;
     bool actual_eof = false;
     bool response_read_error = false;
@@ -72181,6 +72232,43 @@ static bool run_pinned_nginx_custom_hide_timeout_probe(const std::string& contai
     const u64 observed_ns = steady_now_ns();
     std::string access;
     const bool access_read = read_request_length_access_file(temp.nginx_access_log, access, error);
+    const u64 expiry_elapsed_ns = observed_ns - second_ns;
+    std::vector<char> normalized_response = response;
+    const std::vector<char> expected_response(
+        kExpectedExpiryResponseNormalized,
+        kExpectedExpiryResponseNormalized + sizeof(kExpectedExpiryResponseNormalized) - 1u);
+    const bool exact_normalized_response =
+        normalize_date(normalized_response) && normalized_response == expected_response;
+    const auto response_matches_expiry_contract = [&](const std::vector<char>& candidate) {
+        std::vector<char> normalized = candidate;
+        return normalize_date(normalized) && normalized == expected_response;
+    };
+    const bool response_positive_control = response_matches_expiry_contract(response);
+    std::vector<char> leaked_header = response;
+    const size_t header_length = header_end(leaked_header);
+    const bool header_mutation_possible = header_length >= 2u;
+    if (header_mutation_possible)
+        leaked_header.insert(
+            leaked_header.begin() + static_cast<std::ptrdiff_t>(header_length - 2u),
+            {'X', '-', 'P', 'o', 'w', 'e', 'r', 'e', 'd',  '-',
+             'B', 'y', ':', ' ', 'l', 'e', 'a', 'k', '\r', '\n'});
+    std::vector<char> missing_unrelated = response;
+    const std::string unrelated_line = "X-Unrelated: retained\r\n";
+    const auto unrelated_at = std::search(missing_unrelated.begin(),
+                                          missing_unrelated.end(),
+                                          unrelated_line.begin(),
+                                          unrelated_line.end());
+    if (unrelated_at != missing_unrelated.end())
+        missing_unrelated.erase(unrelated_at, unrelated_at + unrelated_line.size());
+    std::vector<char> body_corruption = response;
+    body_corruption.push_back('x');
+    const bool response_mutants_rejected = response_positive_control && header_mutation_possible &&
+                                           !response_matches_expiry_contract(leaked_header) &&
+                                           !response_matches_expiry_contract(missing_unrelated) &&
+                                           !response_matches_expiry_contract(body_corruption);
+    const bool timing_mutants_rejected = !expiry_timing_is_valid(400'000'000ull) &&
+                                         !expiry_timing_is_valid(749'999'999ull) &&
+                                         !expiry_timing_is_valid(2'000'000'000ull);
     const std::string expected_upstream =
         "GET /buffered-timeout?q=1 HTTP/1.1\r\nHost: 127.0.0.1:" + std::to_string(backend_port) +
         "\r\n\r\n";
@@ -72201,10 +72289,11 @@ static bool run_pinned_nginx_custom_hide_timeout_probe(const std::string& contai
               << " exact-upstream=deferred-until-origin-join\n";
     dump_wire("#270 custom-hide timeout probe observed downstream", response);
     if (!actual_eof || response.empty() || response_read_error || !access_read ||
-        access != "60\n" || !origin_retired) {
+        access != "60\n" || !exact_normalized_response || !response_mutants_rejected ||
+        !timing_mutants_rejected || !expiry_timing_is_valid(expiry_elapsed_ns) || !origin_retired) {
         error =
-            "#270 custom-hide timeout probe was inconclusive: expiry EOF/retirement/access/"
-            "upstream evidence was not observed before cleanup";
+            "#270 custom-hide timeout probe was inconclusive: exact expiry EOF/response/timing/"
+            "retirement/access/upstream evidence was not observed before cleanup";
     }
     close(client);
     origin.stop();
@@ -72217,11 +72306,15 @@ static bool run_pinned_nginx_custom_hide_timeout_probe(const std::string& contai
         dump_wire("#270 custom-hide timeout probe observed upstream", origin.history[0]);
     const bool nginx_stopped = stop_child(nginx.child);
     const bool removed = docker.remove();
+    std::string final_access;
     if (!nginx_stopped || !removed || reservations.fds[0] >= 0 || reservations.fds[1] >= 0 ||
         origin.thread_alive.load(std::memory_order_acquire) || origin.listen_fd >= 0 ||
         origin.accepted.load(std::memory_order_acquire) != 1u ||
         origin.requests.load(std::memory_order_acquire) != 1u || origin.history.size() != 1u ||
-        origin.response_fragments_sent.load(std::memory_order_acquire) != 2u) {
+        origin.response_fragments_sent.load(std::memory_order_acquire) != 2u ||
+        expected_upstream_bytes.size() != 60u ||
+        !read_request_length_access_file(temp.nginx_access_log, final_access, error) ||
+        final_access != "60\n") {
         if (error.empty()) error = "#270 custom-hide timeout probe cleanup/history was not exact";
         return false;
     }
