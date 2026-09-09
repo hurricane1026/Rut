@@ -71971,6 +71971,236 @@ static bool run_converter_default_buffering_206_range_three_publication_completi
     return true;
 }
 
+// Exploratory #270 composition probe.  This deliberately reports the expiry
+// wire instead of hard-coding it; the follow-up oracle can freeze only bytes
+// observed from the pinned nginx image.
+static bool run_pinned_nginx_custom_hide_timeout_probe(const std::string& container_name,
+                                                       std::string& error) {
+    TempDir temp;
+    if (!temp.create()) {
+        error = "#270 custom-hide timeout probe could not create temporary resources";
+        return false;
+    }
+    HeldLoopbackPorts reservations;
+    u16 frontend_port = 0u;
+    u16 backend_port = 0u;
+    if (!reservations.reserve_four_digit(0u, frontend_port) ||
+        !reservations.reserve_four_digit(1u, backend_port) || frontend_port == backend_port) {
+        error = "#270 custom-hide timeout probe could not hold distinct ports";
+        return false;
+    }
+    const std::string config =
+        "events {}\nhttp {\n"
+        "  log_format compat \"$request_length\";\n"
+        "  access_log " +
+        std::string(temp.nginx_access_log) +
+        " compat;\n"
+        "  server {\n    listen 127.0.0.1:" +
+        std::to_string(frontend_port) +
+        ";\n"
+        "    location / {\n      proxy_pass http://127.0.0.1:" +
+        std::to_string(backend_port) +
+        ";\n"
+        "      proxy_hide_header X-Powered-By;\n      proxy_read_timeout 1s;\n"
+        "    }\n  }\n}\n";
+    if (count_text(config, "events {}\n") != 1u ||
+        count_text(config, "proxy_hide_header X-Powered-By;\n") != 1u ||
+        count_text(config, "proxy_read_timeout 1s;\n") != 1u ||
+        count_text(config, "proxy_buffering") != 0u ||
+        !write_file(temp.nginx_config, config.data(), config.size()) ||
+        !read_exact_return204_log(
+            temp.nginx_config, "#270 frozen probe config", temp.retained_config_snapshot, error) ||
+        temp.retained_config_snapshot != config) {
+        error = "#270 custom-hide timeout probe config was not frozen exactly";
+        return false;
+    }
+
+    static constexpr char kOrigin[] =
+        "HTTP/1.1 200 OK\r\n"
+        "Date: Tue, 01 Jan 2030 00:00:00 GMT\r\n"
+        "Server: origin\r\n"
+        "X-Powered-By: first\r\n"
+        "x-powered-by: second\r\n"
+        "X-Unrelated: retained\r\n"
+        "Content-Length: 12\r\n"
+        "Connection: keep-alive\r\n"
+        "\r\n"
+        "hello";
+    static_assert(sizeof(kOrigin) - 1u == 187u);
+    static constexpr char kSecond[] = "!";
+
+    Recorder origin;
+    origin.wait_response_peer_close = true;
+    origin.observe_extra_requests_until_stop = true;
+    origin.permit_gated_incomplete_first_response = true;
+    origin.incomplete_first_response_fragment_count = 2u;
+    origin.response_fragment_bytes[0] = kOrigin;
+    origin.response_fragment_lengths[0] = sizeof(kOrigin) - 1u;
+    origin.response_fragment_bytes[1] = kSecond;
+    origin.response_fragment_lengths[1] = sizeof(kSecond) - 1u;
+    if (!handoff_held_loopback_port(
+            &reservations.fds[1], backend_port, "#270 custom-hide timeout probe origin", error) ||
+        !origin.setup(backend_port, 1u, kOrigin, sizeof(kOrigin) - 1u)) {
+        if (error.empty()) error = "#270 custom-hide timeout probe origin setup failed";
+        return false;
+    }
+    const auto origin_live = [&]() {
+        return origin.running.load(std::memory_order_acquire) &&
+               origin.thread_alive.load(std::memory_order_acquire) &&
+               !origin.listener_failed.load(std::memory_order_acquire);
+    };
+    const auto ready_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+    while (!origin_live() && std::chrono::steady_clock::now() < ready_deadline) usleep(1000);
+    if (!origin_live()) {
+        error = "#270 custom-hide timeout probe origin was not live";
+        return false;
+    }
+
+    DockerGuard docker(container_name);
+    ChildGuard nginx;
+    const std::vector<std::string> docker_args = {"docker",
+                                                  "run",
+                                                  "--pull=never",
+                                                  "--network",
+                                                  "host",
+                                                  "--name",
+                                                  container_name,
+                                                  "-v",
+                                                  std::string(temp.path) + ":" + temp.path,
+                                                  kNginxImage,
+                                                  "nginx",
+                                                  "-c",
+                                                  temp.nginx_config,
+                                                  "-g",
+                                                  "daemon off;"};
+    if (!handoff_held_loopback_port(
+            &reservations.fds[0], frontend_port, "#270 custom-hide timeout probe nginx", error) ||
+        !spawn_child(docker_args, temp.nginx_log, nginx.child) ||
+        !wait_ready(frontend_port, nginx.child, error)) {
+        if (error.empty()) error = "#270 custom-hide timeout probe nginx failed readiness";
+        return false;
+    }
+    const int client = connect_once(frontend_port);
+    if (client < 0 || !send_all(client,
+                                kDefaultBufferingTimeoutRequest,
+                                sizeof(kDefaultBufferingTimeoutRequest) - 1u)) {
+        if (client >= 0) close(client);
+        error = "#270 custom-hide timeout probe request failed";
+        return false;
+    }
+    const auto requested_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+    while ((origin.accepted.load(std::memory_order_acquire) != 1u ||
+            origin.requests.load(std::memory_order_acquire) != 1u) &&
+           std::chrono::steady_clock::now() < requested_deadline) {
+        if (!origin_live() || poll_child(nginx.child)) {
+            close(client);
+            error = "#270 custom-hide timeout probe lost liveness before request";
+            return false;
+        }
+        usleep(1000);
+    }
+    if (origin.accepted.load(std::memory_order_acquire) != 1u ||
+        origin.requests.load(std::memory_order_acquire) != 1u) {
+        close(client);
+        error = "#270 custom-hide timeout probe did not observe one origin request";
+        return false;
+    }
+    origin.response_fragment_permit.store(1u, std::memory_order_release);
+    const auto first_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(1);
+    while (origin.response_fragments_sent.load(std::memory_order_acquire) < 1u &&
+           std::chrono::steady_clock::now() < first_deadline) {
+        if (!origin_live() || poll_child(nginx.child)) {
+            close(client);
+            error = "#270 custom-hide timeout probe lost liveness during W1";
+            return false;
+        }
+        usleep(1000);
+    }
+    const u64 first_ns = origin.response_fragment_sent_ns[0].load(std::memory_order_acquire);
+    if (origin.response_fragments_sent.load(std::memory_order_acquire) != 1u || first_ns == 0u) {
+        close(client);
+        error = "#270 custom-hide timeout probe did not publish W1";
+        return false;
+    }
+    while (steady_now_ns() < first_ns + 600'000'000ull) {
+        std::string detail;
+        std::string access;
+        if (!origin_live() || poll_child(nginx.child) ||
+            !observe_client_open_and_quiet_nonconsuming(client, 5, detail) ||
+            !read_request_length_access_file(temp.nginx_access_log, access, error) ||
+            !access.empty()) {
+            close(client);
+            error = "#270 custom-hide timeout probe W1 was not downstream-quiet/open";
+            return false;
+        }
+        usleep(1000);
+    }
+    origin.response_fragment_permit.store(2u, std::memory_order_release);
+    const auto second_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(1);
+    while (origin.response_fragments_sent.load(std::memory_order_acquire) < 2u &&
+           std::chrono::steady_clock::now() < second_deadline) {
+        if (!origin_live() || poll_child(nginx.child)) {
+            close(client);
+            error = "#270 custom-hide timeout probe lost liveness during W2";
+            return false;
+        }
+        usleep(1000);
+    }
+    const u64 second_ns = origin.response_fragment_sent_ns[1].load(std::memory_order_acquire);
+    if (origin.response_fragments_sent.load(std::memory_order_acquire) != 2u ||
+        second_ns <= first_ns) {
+        close(client);
+        error = "#270 custom-hide timeout probe did not publish W2";
+        return false;
+    }
+    std::vector<char> response;
+    const auto response_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(3);
+    while (std::chrono::steady_clock::now() < response_deadline) {
+        pollfd state{client, POLLIN | POLLHUP | POLLERR, 0};
+        const int ready = poll(&state, 1, 10);
+        if (ready < 0 && errno == EINTR) continue;
+        if (ready < 0) {
+            close(client);
+            error = "#270 custom-hide timeout probe response poll failed";
+            return false;
+        }
+        if (ready == 0) continue;
+        char bytes[1024];
+        const ssize_t count = recv(client, bytes, sizeof(bytes), 0);
+        if (count > 0)
+            response.insert(response.end(), bytes, bytes + count);
+        else if (count == 0)
+            break;
+        else if (errno != EINTR && errno != EAGAIN && errno != EWOULDBLOCK) {
+            close(client);
+            error = "#270 custom-hide timeout probe response read failed";
+            return false;
+        }
+    }
+    const u64 observed_ns = steady_now_ns();
+    const bool eof = [&]() {
+        char byte = 0;
+        const ssize_t count = recv(client, &byte, 1, MSG_DONTWAIT);
+        return count == 0 || (count < 0 && (errno == EAGAIN || errno == EWOULDBLOCK));
+    }();
+    std::cerr << "PROBE #270 custom-hide W2-to-observation-ns=" << (observed_ns - second_ns)
+              << " response-bytes=" << response.size() << " eof-or-open=" << eof << "\n";
+    dump_wire("#270 custom-hide timeout probe observed downstream", response);
+    close(client);
+    origin.stop();
+    const bool nginx_stopped = stop_child(nginx.child);
+    const bool removed = docker.remove();
+    if (!nginx_stopped || !removed || reservations.fds[0] >= 0 || reservations.fds[1] >= 0 ||
+        origin.thread_alive.load(std::memory_order_acquire) || origin.listen_fd >= 0 ||
+        origin.accepted.load(std::memory_order_acquire) != 1u ||
+        origin.requests.load(std::memory_order_acquire) != 1u || origin.history.size() != 1u ||
+        origin.response_fragments_sent.load(std::memory_order_acquire) != 2u) {
+        error = "#270 custom-hide timeout probe cleanup/history was not exact";
+        return false;
+    }
+    return true;
+}
+
 static bool run_pinned_nginx_default_buffering_three_publication_oracle_impl(
     TempDir& temp,
     const std::string& container_name,
@@ -74805,6 +75035,8 @@ int main(int argc, char** argv) {
         argc == 2 && strcmp(argv[1], "--zero-response-stall-self-check") == 0;
     const bool gated_fragment_peer_probe_self_check =
         argc == 2 && strcmp(argv[1], "--gated-fragment-peer-probe-self-check") == 0;
+    const bool pinned_nginx_custom_hide_timeout_probe =
+        argc == 2 && strcmp(argv[1], "--pinned-nginx-custom-hide-timeout-probe") == 0;
     const bool wildcard_listen_oracle =
         argc == 2 && strcmp(argv[1], "--pinned-nginx-wildcard-listen-oracle") == 0;
     const bool asterisk_wildcard_listen_oracle =
@@ -75026,6 +75258,7 @@ int main(int argc, char** argv) {
          !pinned_positive_cl_options_default_buffering_oracle &&
          !pinned_positive_cl_head_default_buffering_oracle && !pinned_nginx_lifecycle_self_check &&
          !zero_response_stall_self_check && !gated_fragment_peer_probe_self_check &&
+         !pinned_nginx_custom_hide_timeout_probe &&
          !converter_default_buffering_positive_get_differential &&
          !converter_default_buffering_incomplete_clean_eof_differential &&
          !converter_default_buffering_incomplete_body_inactivity_expiry_differential &&
@@ -75657,6 +75890,18 @@ int main(int argc, char** argv) {
                "without authorization or after stop, aborted both peer-close races without "
                "SHUT_WR, and on live authorization performed one SHUT_WR, exposed real "
                "zero-tail EOF, retained its read half, and classified the peer FIN\n";
+        return 0;
+    }
+    if (pinned_nginx_custom_hide_timeout_probe) {
+        std::string probe_error;
+        const std::string container_name =
+            "rut-nginx-270-custom-hide-probe-" + std::to_string(getpid());
+        if (!run_pinned_nginx_custom_hide_timeout_probe(container_name, probe_error)) {
+            std::cerr << "FAIL [#270 custom-hide timeout probe]: " << probe_error << "\n";
+            return 1;
+        }
+        std::cerr << "PASS: #270 custom-hide timeout probe captured the pinned nginx expiry wire; "
+                     "freeze its observed response/timing before adding the strict oracle\n";
         return 0;
     }
     if (explicit_timeout_head_generated_episode) {
