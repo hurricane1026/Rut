@@ -72116,7 +72116,7 @@ static bool run_pinned_nginx_custom_hide_timeout_probe(const std::string& contai
             error = "#270 custom-hide CLI could not open converter output";
             return false;
         }
-        Child converter;
+        ChildGuard converter_guard;
         const pid_t pid = fork();
         if (pid == 0) {
             if (dup2(output_fd, STDOUT_FILENO) < 0 || dup2(error_fd, STDERR_FILENO) < 0) _exit(127);
@@ -72131,10 +72131,11 @@ static bool run_pinned_nginx_custom_hide_timeout_probe(const std::string& contai
             error = "#270 custom-hide CLI could not fork converter";
             return false;
         }
-        converter.pid = pid;
+        converter_guard.child.pid = pid;
         std::string generated_source;
-        if (!wait_child(converter, 10'000) || !converter.status_valid || !WIFEXITED(converter.status) ||
-            WEXITSTATUS(converter.status) != 0 ||
+        if (!wait_child(converter_guard.child, 10'000) || !converter_guard.child.status_valid ||
+            !WIFEXITED(converter_guard.child.status) ||
+            WEXITSTATUS(converter_guard.child.status) != 0 ||
             !read_exact_return204_log(
                 temp.source, "#270 CLI generated source", generated_source, error)) {
             error = "#270 custom-hide CLI converter failed or produced no source";
@@ -75816,6 +75817,7 @@ int main(int argc, char** argv) {
          !pinned_positive_cl_head_default_buffering_oracle && !pinned_nginx_lifecycle_self_check &&
          !zero_response_stall_self_check && !gated_fragment_peer_probe_self_check &&
          !pinned_nginx_custom_hide_timeout_probe && !pinned_nginx_custom_hide_timeout_completion &&
+         !converter_custom_hide_timeout_cli_differential &&
          !converter_default_buffering_positive_get_differential &&
          !converter_default_buffering_incomplete_clean_eof_differential &&
          !converter_default_buffering_incomplete_body_inactivity_expiry_differential &&
@@ -75931,6 +75933,8 @@ int main(int argc, char** argv) {
           rut_issue566_id3_successor_live200_public_gate) &&
          (argv[2][0] != '/' || argv[3][0] != '/')) ||
         (converter_proxy_hide_header_differential && argv[2][0] != '/') ||
+        (converter_custom_hide_timeout_cli_differential &&
+         (argv[2][0] != '/' || argv[3][0] != '/')) ||
         ((converter_default_buffering_positive_get_differential ||
           converter_default_buffering_incomplete_clean_eof_differential ||
           converter_default_buffering_incomplete_body_inactivity_expiry_differential ||
@@ -76482,8 +76486,9 @@ int main(int argc, char** argv) {
                       << differential_error << "\n";
             return 1;
         }
-        std::cerr << "PASS: #270 same-file custom-hide/1s timeout expiry and completion matched "
-                     "pinned nginx and converter-generated ordinary RUT\n";
+        std::cerr << "PASS: #270 custom-hide/1s timeout expiry and completion independent oracle "
+                     "contracts passed for pinned nginx and converter-generated ordinary RUT "
+                     "(same-file cross-run comparison remains pending)\n";
         return 0;
     }
     if (explicit_timeout_head_generated_episode) {
