@@ -74268,8 +74268,7 @@ static bool run_pinned_nginx_custom_hide_timeout_cli_differential(const char* ru
             }
             const int output_fd =
                 open(negative_temp.source.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0600);
-            const std::string diagnostics_path =
-                negative_temp.rut_log + ".timeout-boundary-negative";
+            const std::string diagnostics_path = negative_temp.preflight_log;
             const int error_fd = open(diagnostics_path.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0600);
             if (output_fd < 0 || error_fd < 0) {
                 if (output_fd >= 0) close(output_fd);
@@ -74306,8 +74305,7 @@ static bool run_pinned_nginx_custom_hide_timeout_cli_differential(const char* ru
                 !read_exact_return204_log(
                     negative_temp.source, "#617 timeout boundary stdout", output, error) ||
                 !output.empty() || !read_bounded_file(diagnostics_path, diagnostics, error) ||
-                diagnostics.find(negative_temp.nginx_config + ":") == std::string::npos ||
-                diagnostics.find(":9:") == std::string::npos ||
+                diagnostics.find(negative_temp.nginx_config + ":9:") == std::string::npos ||
                 diagnostics.find(invalid.detail) == std::string::npos) {
                 error =
                     "#617 timeout boundary rejection did not produce exit 1, empty stdout, and "
@@ -74439,9 +74437,8 @@ static bool run_pinned_nginx_custom_hide_timeout_cli_differential(const char* ru
         }
         return true;
     };
-    if (!boundary_names &&
-        (!run_pair(false, "rut-nginx-270-custom-hide-cli-expiry-" + suffix) ||
-         !run_pair(true, "rut-nginx-270-custom-hide-cli-completion-" + suffix)))
+    if (!boundary_names && (!run_pair(false, "rut-nginx-270-custom-hide-cli-expiry-" + suffix) ||
+                            !run_pair(true, "rut-nginx-270-custom-hide-cli-completion-" + suffix)))
         return false;
     if (boundary_names) {
         static constexpr const char* kBoundaryNames[] = {kProxyHideHeaderBoundary3Name,
