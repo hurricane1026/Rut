@@ -73452,8 +73452,9 @@ static bool run_pinned_nginx_custom_hide_timeout_probe(
                        GatedFragmentPeerProbeResult::Open &&
                    origin.response_send_succeeded.load(std::memory_order_acquire) &&
                    origin.response_sent_open.load(std::memory_order_acquire) &&
-                   origin.response_clean_shutdown.load(std::memory_order_acquire) &&
-                   origin.response_connection_closed.load(std::memory_order_acquire) &&
+                   // Peer-close publication precedes the recorder's later
+                   // shutdown/connection-close stores; do not impose that
+                   // unrelated store ordering on this live predicate.
                    !origin.response_send_failed.load(std::memory_order_acquire) && origin_retired;
         };
     const auto downstream_eof_quiet = [&]() {
