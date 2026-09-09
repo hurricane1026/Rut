@@ -21229,47 +21229,77 @@ TEST(nginx_converter_issue270, custom_hide_header_and_timeout_lower_together) {
         REQUIRE_EQ(rir.module.func_count, 3u);
         RouteConfig config{};
         REQUIRE(populate_route_config(config, rir.module));
-        const u8 methods[] = {kRouteMethodHead, kRouteMethodGet, kRouteMethodAny};
-        u32 i = 0u;
-        const u32 expected_forward_counts[] = {2u, 1u, 1u};
-        for (const u32 expected_forwards : expected_forward_counts) {
-            const auto& function = rir.module.functions[i];
-            CHECK_EQ(function.http_method, methods[i]);
+        const auto check_forward = [&](const rir::Function& function,
+                                       const rir::Block& block,
+                                       i32 expected_request_policy_id,
+                                       bool head,
+                                       bool buffered) {
             u32 forwards = 0u;
-            for (u32 b = 0u; b < function.block_count; b++)
-                for (u32 inst = 0u; inst < function.blocks[b].inst_count; inst++) {
-                    const auto& instruction = function.blocks[b].insts[inst];
-                    if (instruction.op != rir::Opcode::RetForwardBundle) continue;
-                    ++forwards;
-                    REQUIRE_EQ(instruction.operand_count, 3u);
-                    i32 upstream_id = -1;
-                    i32 request_policy_id = -1;
-                    i32 bundle_id = -1;
-                    REQUIRE(find_const_i32(function, instruction.operand(0), upstream_id));
-                    REQUIRE(find_const_i32(function, instruction.operand(1), request_policy_id));
-                    REQUIRE(find_const_i32(function, instruction.operand(2), bundle_id));
-                    CHECK_EQ(upstream_id, 0);
-                    CHECK_EQ(request_policy_id, 1);
-                    REQUIRE_GT(bundle_id, 0);
-                    REQUIRE_LE(static_cast<u32>(bundle_id), config.policy_bundle_count);
-                    const auto& bundle = config.policy_bundles[bundle_id - 1];
-                    CHECK_EQ(bundle.response_read_timeout_seconds, seconds);
-                    const bool head = function.http_method == kRouteMethodHead;
-                    const bool get = function.http_method == kRouteMethodGet;
-                    CHECK_EQ(bundle.response_buffering,
-                             get ? ForwardResponseBufferingMode::CompleteContentLength
-                                 : ForwardResponseBufferingMode::None);
-                    REQUIRE(config.response_policy_id_is_valid(bundle.response_policy_id));
-                    const auto& response = config.response_policies[bundle.response_policy_id - 1];
-                    CHECK_EQ(response.head_mode,
-                             head ? ResponsePolicyHeadMode::SuppressBody
-                                  : ResponsePolicyHeadMode::Reject);
-                    CHECK(response_policy_hides_header(
-                        response, {name.data(), static_cast<u32>(name.size())}));
-                }
-            CHECK_EQ(forwards, expected_forwards);
-            ++i;
-        }
+            const rir::Instruction* forward = nullptr;
+            for (u32 inst = 0u; inst < block.inst_count; inst++) {
+                if (block.insts[inst].op != rir::Opcode::RetForwardBundle) continue;
+                ++forwards;
+                forward = &block.insts[inst];
+            }
+            REQUIRE_EQ(forwards, 1u);
+            REQUIRE(forward != nullptr);
+            REQUIRE_EQ(forward->operand_count, 3u);
+            i32 upstream_id = -1;
+            i32 request_policy_id = -1;
+            i32 bundle_id = -1;
+            REQUIRE(find_const_i32(function, forward->operand(0), upstream_id));
+            REQUIRE(find_const_i32(function, forward->operand(1), request_policy_id));
+            REQUIRE(find_const_i32(function, forward->operand(2), bundle_id));
+            CHECK_EQ(upstream_id, 0);
+            CHECK_EQ(request_policy_id, expected_request_policy_id);
+            REQUIRE_GT(bundle_id, 0);
+            REQUIRE_LE(static_cast<u32>(bundle_id), config.policy_bundle_count);
+            const auto& bundle = config.policy_bundles[bundle_id - 1];
+            CHECK_EQ(bundle.response_read_timeout_seconds, seconds);
+            CHECK_EQ(bundle.response_buffering,
+                     buffered ? ForwardResponseBufferingMode::CompleteContentLength
+                              : ForwardResponseBufferingMode::None);
+            REQUIRE(config.response_policy_id_is_valid(bundle.response_policy_id));
+            REQUIRE(config.failure_policy_id_is_valid(bundle.failure_policy_id));
+            REQUIRE(config.timeout_failure_policy_id_is_valid(bundle.timeout_failure_policy_id));
+            const auto& response = config.response_policies[bundle.response_policy_id - 1];
+            CHECK_EQ(response.head_mode,
+                     head ? ResponsePolicyHeadMode::SuppressBody : ResponsePolicyHeadMode::Reject);
+            REQUIRE_EQ(response.hide_header_count, 4u);
+            CHECK(response.hide_headers[0].eq(lit_str("Date")));
+            CHECK(response.hide_headers[1].eq(lit_str("Server")));
+            CHECK(response.hide_headers[2].eq(lit_str("X-Pad")));
+            CHECK(response.hide_headers[3].eq({name.data(), static_cast<u32>(name.size())}));
+            const auto& failure = config.failure_policies[bundle.failure_policy_id - 1];
+            const auto& timeout_failure =
+                config.failure_policies[bundle.timeout_failure_policy_id - 1];
+            CHECK_EQ(failure.status_code, 502u);
+            CHECK_EQ(timeout_failure.status_code, 504u);
+            CHECK_EQ(failure.head_mode,
+                     head ? FailurePolicyHeadMode::SuppressBody : FailurePolicyHeadMode::Reject);
+            CHECK_EQ(timeout_failure.head_mode,
+                     head ? FailurePolicyHeadMode::SuppressBody : FailurePolicyHeadMode::Reject);
+        };
+        const auto& head = rir.module.functions[0];
+        const auto& get = rir.module.functions[1];
+        const auto& any = rir.module.functions[2];
+        CHECK_EQ(head.http_method, kRouteMethodHead);
+        CHECK_EQ(get.http_method, kRouteMethodGet);
+        CHECK_EQ(any.http_method, kRouteMethodAny);
+        REQUIRE_EQ(head.block_count, 3u);
+        check_forward(head,
+                      head.blocks[1],
+                      static_cast<i32>(RequestPolicyId::Http11FixedStripContentLengthAfterHost),
+                      true,
+                      false);
+        check_forward(
+            head, head.blocks[2], static_cast<i32>(RequestPolicyId::Http11FixedStrip), true, false);
+        REQUIRE_EQ(get.block_count, 1u);
+        check_forward(
+            get, get.blocks[0], static_cast<i32>(RequestPolicyId::Http11FixedStrip), false, true);
+        REQUIRE_EQ(any.block_count, 1u);
+        check_forward(
+            any, any.blocks[0], static_cast<i32>(RequestPolicyId::Http11FixedStrip), false, false);
         REQUIRE(config.policy_bundle_count > 0u);
         u32 complete_content_length = 0u;
         u32 no_buffering = 0u;
