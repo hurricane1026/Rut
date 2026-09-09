@@ -73284,13 +73284,100 @@ static bool run_pinned_nginx_custom_hide_timeout_probe(
               << " peer-close-ns=" << peer_closed_ns << " retired-before-cleanup=" << origin_retired
               << " exact-upstream=deferred-until-origin-join\n";
     dump_wire("#270 custom-hide timeout probe observed downstream", response);
-    if (!actual_eof || response.empty() || response_read_error || !access_read ||
+    const bool expiry_gate_failed =
+        !actual_eof || response.empty() || response_read_error || !access_read ||
         access != "60\n" || !exact_normalized_response || !response_mutants_rejected ||
         !timing_mutants_rejected || !expiry_timing_is_valid(expiry_elapsed_ns) || !origin_retired ||
-        !post_retirement_stable) {
+        !post_retirement_stable;
+    if (expiry_gate_failed) {
         error =
             "#270 custom-hide timeout probe was inconclusive: exact expiry EOF/response/timing/"
             "retirement/access/upstream evidence was not observed before cleanup";
+    }
+    bool live_access_read = access_read;
+    std::string live_access = access;
+    bool live_access_changed = false;
+    bool live_exact_access_seen = access == "60\n";
+    u64 live_access_changed_ns = 0u;
+    u64 live_exact_access_ns = live_exact_access_seen ? observed_ns : 0u;
+    const u64 live_observation_deadline = steady_now_ns() + 250'000'000ull;
+    const char* live_stop_reason = expiry_gate_failed ? "deadline" : "acceptance-passed";
+    u32 live_accepted = origin.accepted.load(std::memory_order_acquire);
+    u32 live_requests = origin.requests.load(std::memory_order_acquire);
+    u32 live_peer_closes = origin.response_peer_close_count.load(std::memory_order_acquire);
+    bool live_origin = origin_live();
+    bool live_child = !poll_child(nginx.child);
+    bool live_protocol_clean =
+        !origin.response_peer_unexpected_data.load(std::memory_order_acquire) &&
+        !origin.response_peer_observation_failed.load(std::memory_order_acquire);
+    if (expiry_gate_failed) {
+        while (steady_now_ns() < live_observation_deadline) {
+            if (!live_child) {
+                live_stop_reason = "frontend-exited";
+                break;
+            }
+            if (!live_origin) {
+                live_stop_reason = "origin-not-live";
+                break;
+            }
+            if (!live_protocol_clean) {
+                live_stop_reason = "origin-protocol-failure";
+                break;
+            }
+            std::string candidate;
+            std::string diagnostic_read_error;
+            if (!read_request_length_access_file(
+                    temp.nginx_access_log, candidate, diagnostic_read_error)) {
+                live_access_read = false;
+                live_stop_reason = "access-read-error";
+                break;
+            }
+            if (candidate != live_access) {
+                live_access_changed = true;
+                if (live_access_changed_ns == 0u) live_access_changed_ns = steady_now_ns();
+                live_access = candidate;
+            }
+            if (candidate == "60\n") {
+                live_exact_access_seen = true;
+                live_exact_access_ns = steady_now_ns();
+                live_stop_reason = "exact-access-seen";
+                break;
+            }
+            if (!candidate.empty() && candidate != "6" && candidate != "60") {
+                live_stop_reason = "wrong-access-ledger";
+                break;
+            }
+            live_accepted = origin.accepted.load(std::memory_order_acquire);
+            live_requests = origin.requests.load(std::memory_order_acquire);
+            live_peer_closes = origin.response_peer_close_count.load(std::memory_order_acquire);
+            live_origin = origin_live();
+            live_child = !poll_child(nginx.child);
+            live_protocol_clean =
+                !origin.response_peer_unexpected_data.load(std::memory_order_acquire) &&
+                !origin.response_peer_observation_failed.load(std::memory_order_acquire);
+            usleep(1000);
+        }
+    }
+    if (expiry_gate_failed) {
+        std::cerr << "DIAGNOSTIC #270 live-expiry-access frontend="
+                  << (generated_rut ? "RUT" : "nginx") << " initial-read=" << access_read
+                  << " initial-bytes=" << access.size() << " live-read=" << live_access_read
+                  << " live-bytes=" << live_access.size() << " live-changed=" << live_access_changed
+                  << " live-exact-60=" << live_exact_access_seen
+                  << " live-stop=" << live_stop_reason
+                  << " eof-to-live-ms=" << static_cast<double>(steady_now_ns() - observed_ns) / 1e6
+                  << " changed-after-ms="
+                  << (live_access_changed_ns == 0u
+                          ? -1.0
+                          : static_cast<double>(live_access_changed_ns - observed_ns) / 1e6)
+                  << " exact-after-ms="
+                  << (live_exact_access_ns == 0u
+                          ? -1.0
+                          : static_cast<double>(live_exact_access_ns - observed_ns) / 1e6)
+                  << " live-origin=" << live_origin << " live-child=" << live_child
+                  << " accepted=" << live_accepted << " requests=" << live_requests
+                  << " peer-closes=" << live_peer_closes
+                  << " protocol-clean=" << live_protocol_clean << "\n";
     }
     close(client);
     origin.stop();
@@ -73304,14 +73391,20 @@ static bool run_pinned_nginx_custom_hide_timeout_probe(
     const bool nginx_stopped = stop_child(nginx.child);
     const bool removed = docker.remove();
     std::string final_access;
+    const bool final_access_read =
+        read_request_length_access_file(temp.nginx_access_log, final_access, error);
+    if (expiry_gate_failed) {
+        std::cerr << "DIAGNOSTIC #270 post-cleanup-expiry-access frontend="
+                  << (generated_rut ? "RUT" : "nginx") << " read=" << final_access_read
+                  << " bytes=" << final_access.size() << " exact-60=" << (final_access == "60\n")
+                  << "\n";
+    }
     if (!nginx_stopped || !removed || reservations.fds[0] >= 0 || reservations.fds[1] >= 0 ||
         origin.thread_alive.load(std::memory_order_acquire) || origin.listen_fd >= 0 ||
         origin.accepted.load(std::memory_order_acquire) != 1u ||
         origin.requests.load(std::memory_order_acquire) != 1u || origin.history.size() != 1u ||
         origin.response_fragments_sent.load(std::memory_order_acquire) != 2u ||
-        expected_upstream_bytes.size() != 60u ||
-        !read_request_length_access_file(temp.nginx_access_log, final_access, error) ||
-        final_access != "60\n") {
+        expected_upstream_bytes.size() != 60u || !final_access_read || final_access != "60\n") {
         if (error.empty()) error = "#270 custom-hide timeout probe cleanup/history was not exact";
         return false;
     }
