@@ -53245,11 +53245,13 @@ static bool validate_custom_hide_timeout_loaded_program(const std::string& sourc
                                load_error,
                                rut::jit::OptLevel::O2,
                                static_cast<u64>(captured_stdout.size())) ||
-        !program->access_log.present || program->config.route_count != 3u ||
-        program->config.upstream_count != 1u || program->config.upstreams[0].addr_count != 1u ||
+        !rut::access_log_sink_spec_valid(program->access_log) || !program->access_log.present ||
+        program->config.route_count != 3u || program->config.upstream_count != 1u ||
+        program->config.upstreams[0].addr_count != 1u ||
+        ntohl(program->config.upstreams[0].addrs[0].sin_addr.s_addr) != 0x7f000001u ||
         ntohs(program->config.upstreams[0].addrs[0].sin_port) != backend_port ||
-        program->config.access_log.path_len != access_path.size() ||
-        memcmp(program->config.access_log.path, access_path.data(), access_path.size()) != 0) {
+        program->access_log.path_len != access_path.size() ||
+        memcmp(program->access_log.path, access_path.data(), access_path.size()) != 0) {
         error = "#616 loaded custom-hide timeout program lost listener/upstream/access-log state";
         return false;
     }
@@ -53340,9 +53342,8 @@ static bool validate_custom_hide_timeout_loaded_program(const std::string& sourc
                failure_ok(timeout, 504u, failure_head, "Gateway Time-out");
     };
     const auto invoke = [&](const rut::RouteEntry& route, const char* request, u32 length) {
-        rut::jit::HandlerCtx context{};
-        return rut::jit::HandlerResult::unpack(route.fn(
-            nullptr, &context, reinterpret_cast<const rut::u8*>(request), length, nullptr));
+        return rut::jit::HandlerResult::unpack(
+            route.fn(nullptr, nullptr, reinterpret_cast<const rut::u8*>(request), length, nullptr));
     };
     const rut::RouteEntry* head = nullptr;
     const rut::RouteEntry* get = nullptr;
@@ -53350,7 +53351,7 @@ static bool validate_custom_hide_timeout_loaded_program(const std::string& sourc
     for (u32 i = 0u; i < program->config.route_count; i++) {
         const auto& route = program->config.routes[i];
         if (route.path_len != 1u || route.path[0] != '/' ||
-            route.action != rut::RouteAction::JitHandler)
+            route.action != rut::RouteAction::JitHandler || route.fn == nullptr)
             return error = "#616 loaded custom-hide timeout route inventory was not exact", false;
         if (route.method == rut::kRouteMethodHead)
             head = &route;
@@ -53439,10 +53440,14 @@ static bool validate_custom_hide_timeout_loaded_program(const std::string& sourc
         error = "#616 same-length custom-name mutant could not be persisted";
         return false;
     }
-    rut::LoadedProgram mutant{};
+    auto mutant = std::make_unique<rut::LoadedProgram>();
+    struct MutantGuard {
+        std::unique_ptr<rut::LoadedProgram>& value;
+        ~MutantGuard() { value->destroy(); }
+    } mutant_guard{mutant};
     rut::LoadError mutant_error{};
     if (!rut::load_rut_program(mutant_temp.source.c_str(),
-                               mutant,
+                               *mutant,
                                mutant_error,
                                rut::jit::OptLevel::O2,
                                static_cast<u64>(mutant_source.size()))) {
@@ -53450,14 +53455,13 @@ static bool validate_custom_hide_timeout_loaded_program(const std::string& sourc
         return false;
     }
     bool mutant_matches_original = false;
-    for (u32 i = 0u; i < mutant.config.response_policy_count; i++) {
-        const auto& policy = mutant.config.response_policies[i];
+    for (u32 i = 0u; i < mutant->config.response_policy_count; i++) {
+        const auto& policy = mutant->config.response_policies[i];
         if (policy.hide_header_count != 4u) continue;
         bool same = true;
         for (u32 h = 0u; h < 4u; h++) same &= policy.hide_headers[h].eq(names[h]);
         mutant_matches_original |= same;
     }
-    mutant.destroy();
     if (mutant_matches_original) {
         error = "#616 same-length custom-name mutant retained the original semantic name";
         return false;
