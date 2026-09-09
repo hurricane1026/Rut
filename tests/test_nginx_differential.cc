@@ -9772,22 +9772,47 @@ static bool check_exact_rut_source_capture(std::string& error) {
         return value;
     };
     std::string captured;
-    if (!write_file(temp.source, payload(kLimit).data(), kLimit) ||
-        !read_exact_rut_source(temp.source, "#616 exact source limit", captured, error) ||
-        captured != payload(kLimit))
+    std::string diagnostic;
+    if (!write_file(temp.source, payload(kLimit).data(), kLimit)) {
+        error = "#616 exact source limit write failed";
         return false;
-    if (!write_file(temp.source, payload(kLimit + 1u).data(), kLimit + 1u) ||
-        read_exact_rut_source(temp.source, "#616 over-limit source", captured, error) ||
-        error.find("exceeded owned source capacity") == std::string::npos)
+    }
+    if (!read_exact_rut_source(temp.source, "#616 exact source limit", captured, diagnostic)) {
+        error = diagnostic;
         return false;
-    if (!write_file(temp.source, "", 0u) ||
-        read_exact_rut_source(temp.source, "#616 empty source", captured, error) ||
-        error.find("empty source") == std::string::npos)
+    }
+    if (captured != payload(kLimit)) {
+        error = "#616 exact source limit capture mismatch";
         return false;
+    }
+    diagnostic.clear();
+    if (!write_file(temp.source, payload(kLimit + 1u).data(), kLimit + 1u)) {
+        error = "#616 over-limit source write failed";
+        return false;
+    }
+    if (read_exact_rut_source(temp.source, "#616 over-limit source", captured, diagnostic) ||
+        diagnostic.find("exceeded owned source capacity") == std::string::npos) {
+        error = "#616 over-limit source was not rejected as expected";
+        return false;
+    }
+    diagnostic.clear();
+    if (!write_file(temp.source, "", 0u)) {
+        error = "#616 empty source write failed";
+        return false;
+    }
+    if (read_exact_rut_source(temp.source, "#616 empty source", captured, diagnostic) ||
+        diagnostic.find("empty source") == std::string::npos) {
+        error = "#616 empty source was not rejected as expected";
+        return false;
+    }
+    diagnostic.clear();
     if (!write_file(temp.source, payload(8298u).data(), 8298u) ||
-        !read_exact_rut_source(temp.source, "#616 over-log-limit source", captured, error) ||
-        captured != payload(8298u))
+        !read_exact_rut_source(temp.source, "#616 over-log-limit source", captured, diagnostic) ||
+        captured != payload(8298u)) {
+        error = diagnostic.empty() ? "#616 over-log-limit source capture mismatch" : diagnostic;
         return false;
+    }
+    error.clear();
     return true;
 }
 
