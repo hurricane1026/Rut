@@ -72497,6 +72497,140 @@ struct CustomHideTimeoutPairContext {
     bool initialized = false;
 };
 
+// The access file is published by an independent writer; EOF itself is not an
+// access-publication acknowledgement.  Keep
+// this small observer independent of wall-clock sleeps so the live acceptance
+// rule is also exercised by the deterministic self-check below.
+struct LiveAccessLedgerObserver {
+    enum class Phase { Pending, Accepted, Stabilizing, Complete, Failed };
+
+    Phase phase = Phase::Pending;
+    u64 eof_ns = 0u;
+    u64 deadline_ns = 0u;
+    u64 accepted_ns = 0u;
+    u64 stability_deadline_ns = 0u;
+
+    void freeze_eof(u64 now_ns) {
+        if (eof_ns == 0u) {
+            eof_ns = now_ns;
+            deadline_ns = now_ns + 250'000'000ull;
+        }
+    }
+
+    bool sample(u64 now_ns,
+                const std::string& candidate,
+                bool read_ok,
+                bool child_live,
+                bool origin_live,
+                bool protocol_clean) {
+        // This check intentionally precedes all sample acceptance, including
+        // samples whose read completed after the deadline.
+        if (eof_ns == 0u || now_ns < eof_ns || now_ns >= deadline_ns ||
+            phase != Phase::Pending || !read_ok ||
+            !child_live || !origin_live || !protocol_clean ||
+            (candidate != "" && candidate != "6" && candidate != "60" && candidate != "60\n")) {
+            phase = Phase::Failed;
+            return false;
+        }
+        if (candidate == "60\n") {
+            phase = Phase::Accepted;
+            accepted_ns = now_ns;
+        }
+        return true;
+    }
+
+    void begin_stability(u64 now_ns) {
+        if (phase == Phase::Accepted) {
+            phase = Phase::Stabilizing;
+            stability_deadline_ns = now_ns + 175'000'000ull;
+        }
+    }
+
+    bool stable_sample(u64 now_ns,
+                       const std::string& candidate,
+                       bool read_ok,
+                       bool child_live,
+                       bool origin_live,
+                       bool protocol_clean) {
+        if ((phase != Phase::Stabilizing && phase != Phase::Complete) || candidate != "60\n" ||
+            !read_ok || !child_live || !origin_live || !protocol_clean) {
+            phase = Phase::Failed;
+            return false;
+        }
+        if (now_ns >= stability_deadline_ns) phase = Phase::Complete;
+        return true;
+    }
+
+    bool accepted_before_deadline() const {
+        return phase != Phase::Pending && phase != Phase::Failed && accepted_ns < deadline_ns;
+    }
+};
+
+static bool run_live_access_ledger_observer_self_check(std::string& error) {
+    const auto expect_pending = [&](u64 now_ns,
+                                    const std::string& value,
+                                    bool read_ok = true,
+                                    bool child_live = true,
+                                    bool origin_live = true,
+                                    bool protocol_clean = true) {
+        LiveAccessLedgerObserver observer;
+        observer.freeze_eof(1'000'000'000ull);
+        return observer.sample(now_ns, value, read_ok, child_live, origin_live, protocol_clean) &&
+               observer.phase == LiveAccessLedgerObserver::Phase::Pending;
+    };
+    const auto expect_fail = [&](u64 now_ns,
+                                 const std::string& value,
+                                 bool read_ok = true,
+                                 bool child_live = true,
+                                 bool origin_live = true,
+                                 bool protocol_clean = true) {
+        LiveAccessLedgerObserver observer;
+        observer.freeze_eof(1'000'000'000ull);
+        const bool accepted =
+            observer.sample(now_ns, value, read_ok, child_live, origin_live, protocol_clean);
+        return !accepted && observer.phase == LiveAccessLedgerObserver::Phase::Failed;
+    };
+    LiveAccessLedgerObserver timely;
+    timely.freeze_eof(1'000'000'000ull);
+    const bool delayed_timely = timely.sample(1'100'000'000ull, "", true, true, true, true) &&
+                                timely.sample(1'200'000'000ull, "6", true, true, true, true) &&
+                                timely.sample(1'249'999'999ull, "60\n", true, true, true, true) &&
+                                timely.accepted_before_deadline();
+    LiveAccessLedgerObserver stable;
+    stable.freeze_eof(1'000'000'000ull);
+    const bool stability_controls =
+        stable.sample(1'100'000'000ull, "60\n", true, true, true, true) &&
+        stable.accepted_before_deadline() &&
+        (stable.begin_stability(1'100'000'000ull),
+         stable.stable_sample(1'150'000'000ull, "60\n", true, true, true, true) &&
+         stable.stable_sample(1'275'000'000ull, "60\n", true, true, true, true) &&
+         stable.phase == LiveAccessLedgerObserver::Phase::Complete);
+    LiveAccessLedgerObserver duplicate;
+    duplicate.freeze_eof(1'000'000'000ull);
+    const bool duplicate_rejected =
+        duplicate.sample(1'100'000'000ull, "60\n", true, true, true, true) &&
+        (duplicate.begin_stability(1'100'000'000ull),
+         !duplicate.stable_sample(1'101'000'000ull, "60\n60\n", true, true, true, true));
+    const bool controls =
+        delayed_timely && expect_pending(1'100'000'000ull, "") &&
+        expect_pending(1'100'000'001ull, "6") &&
+        expect_pending(1'100'000'002ull, "60") &&
+        expect_fail(1'250'000'000ull, "60\n") &&
+        expect_fail(1'250'000'001ull, "60\n") && expect_fail(1'249'999'999ull, "61\n") &&
+        expect_fail(1'100'000'000ull, "", false) &&
+        expect_fail(999'999'999ull, "60\n") &&
+        expect_fail(1'100'000'000ull, "60\n", true, false, true, true) &&
+        expect_fail(1'100'000'000ull, "60\n", true, true, false, true) &&
+        expect_fail(1'100'000'000ull, "60\n", true, true, true, false) && duplicate_rejected;
+    const bool all_controls = controls && stability_controls;
+    if (!all_controls) {
+        error = "#618 live access-ledger observer self-check rejected a required control";
+        return false;
+    }
+    std::cerr << "PASS: #618 live access-ledger observer self-check\n";
+    return true;
+}
+
 static bool run_pinned_nginx_custom_hide_timeout_probe(
     const std::string& container_name,
     std::string& error,
@@ -73154,6 +73288,7 @@ static bool run_pinned_nginx_custom_hide_timeout_probe(
     std::vector<char> response;
     bool actual_eof = false;
     bool response_read_error = false;
+    u64 eof_ns = 0u;
     const auto response_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(3);
     while (std::chrono::steady_clock::now() < response_deadline) {
         pollfd state{client, POLLIN | POLLHUP | POLLERR, 0};
@@ -73170,6 +73305,7 @@ static bool run_pinned_nginx_custom_hide_timeout_probe(
         if (count > 0)
             response.insert(response.end(), bytes, bytes + count);
         else if (count == 0) {
+            eof_ns = steady_now_ns();
             actual_eof = true;
             break;
         } else if (errno != EINTR && errno != EAGAIN && errno != EWOULDBLOCK) {
@@ -73177,7 +73313,9 @@ static bool run_pinned_nginx_custom_hide_timeout_probe(
             break;
         }
     }
-    const u64 observed_ns = steady_now_ns();
+    // Freeze the observation boundary at the actual recv()==0 event.  Any
+    // later file read is publication latency, not downstream EOF timing.
+    const u64 observed_ns = eof_ns;
     const auto expiry_timing_tuple_valid = [](u64 first_ns, u64 second_ns, u64 terminal_ns) {
         return second_ns > first_ns && terminal_ns > second_ns &&
                second_ns - first_ns >= 550'000'000ull && second_ns - first_ns < 750'000'000ull &&
@@ -73238,14 +73376,26 @@ static bool run_pinned_nginx_custom_hide_timeout_probe(
         origin.response_peer_closed_ns.load(std::memory_order_acquire) >= second_ns &&
         !origin.response_peer_unexpected_data.load(std::memory_order_acquire) &&
         !origin.response_peer_observation_failed.load(std::memory_order_acquire);
+    LiveAccessLedgerObserver live_observer;
+    live_observer.freeze_eof(eof_ns);
     const u64 peer_closed_ns = origin.response_peer_closed_ns.load(std::memory_order_acquire);
-    const u64 stability_start_ns = steady_now_ns();
-    bool post_retirement_stable = origin_retired && stability_start_ns >= peer_closed_ns;
-    const u64 stability_deadline_ns = stability_start_ns + 175'000'000ull;
+    u64 stability_start_ns = 0u;
+    bool post_retirement_stable = false;
+    u64 stability_deadline_ns = 0u;
     const auto post_retirement_snapshot_valid = [&]() {
         std::string stable_access;
-        if (!origin_live() || poll_child(nginx.child) ||
-            !read_request_length_access_file(temp.nginx_access_log, stable_access, error) ||
+        const bool stable_origin = origin_live();
+        const bool stable_child = !poll_child(nginx.child);
+        if (!read_request_length_access_file(temp.nginx_access_log, stable_access, error) ||
+            !live_observer.stable_sample(steady_now_ns(),
+                                         stable_access,
+                                         true,
+                                         stable_child,
+                                         stable_origin,
+                                         !origin.response_peer_unexpected_data.load(
+                                             std::memory_order_acquire) &&
+                                             !origin.response_peer_observation_failed.load(
+                                                 std::memory_order_acquire)) ||
             stable_access != "60\n" || origin.accepted.load(std::memory_order_acquire) != 1u ||
             origin.requests.load(std::memory_order_acquire) != 1u ||
             origin.response_fragments_sent.load(std::memory_order_acquire) != 2u ||
@@ -73268,15 +73418,6 @@ static bool run_pinned_nginx_custom_hide_timeout_probe(
         return count <= 0 &&
                (count == 0 || errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK);
     };
-    while (post_retirement_stable && steady_now_ns() < stability_deadline_ns) {
-        post_retirement_stable = post_retirement_snapshot_valid();
-    }
-    if (post_retirement_stable) {
-        if (steady_now_ns() < stability_deadline_ns)
-            post_retirement_stable = false;
-        else
-            post_retirement_stable = post_retirement_snapshot_valid();
-    }
     std::cerr << "PROBE #270 custom-hide W2-to-observation-ns=" << (observed_ns - second_ns)
               << " response-bytes=" << response.size() << " actual-eof=" << actual_eof
               << " read-error=" << response_read_error << " access-bytes=" << access.size()
@@ -73284,24 +73425,22 @@ static bool run_pinned_nginx_custom_hide_timeout_probe(
               << " peer-close-ns=" << peer_closed_ns << " retired-before-cleanup=" << origin_retired
               << " exact-upstream=deferred-until-origin-join\n";
     dump_wire("#270 custom-hide timeout probe observed downstream", response);
-    const bool expiry_gate_failed =
-        !actual_eof || response.empty() || response_read_error || !access_read ||
-        access != "60\n" || !exact_normalized_response || !response_mutants_rejected ||
-        !timing_mutants_rejected || !expiry_timing_is_valid(expiry_elapsed_ns) || !origin_retired ||
-        !post_retirement_stable;
+    bool expiry_gate_failed =
+        !actual_eof || response.empty() || response_read_error ||
+        !exact_normalized_response || !response_mutants_rejected ||
+        !timing_mutants_rejected || !expiry_timing_is_valid(expiry_elapsed_ns) || !origin_retired;
     if (expiry_gate_failed) {
         error =
             "#270 custom-hide timeout probe was inconclusive: exact expiry EOF/response/timing/"
             "retirement/access/upstream evidence was not observed before cleanup";
     }
-    const std::string expiry_failure_error = error;
     bool live_access_read = access_read;
     std::string live_access = access;
     bool live_access_changed = false;
     bool live_exact_access_seen = access == "60\n";
     u64 live_access_changed_ns = 0u;
     u64 live_exact_access_ns = live_exact_access_seen ? observed_ns : 0u;
-    const u64 live_observation_deadline = steady_now_ns() + 250'000'000ull;
+    const u64 live_observation_deadline = live_observer.deadline_ns;
     const char* live_stop_reason = expiry_gate_failed ? "deadline" : "acceptance-passed";
     u32 live_accepted = origin.accepted.load(std::memory_order_acquire);
     u32 live_requests = origin.requests.load(std::memory_order_acquire);
@@ -73321,8 +73460,9 @@ static bool run_pinned_nginx_custom_hide_timeout_probe(
             !origin.response_peer_unexpected_data.load(std::memory_order_acquire) &&
             !origin.response_peer_observation_failed.load(std::memory_order_acquire);
     };
-    if (expiry_gate_failed) {
-        while (steady_now_ns() < live_observation_deadline) {
+    if (expiry_gate_failed || live_observer.phase == LiveAccessLedgerObserver::Phase::Pending) {
+        while (steady_now_ns() < live_observation_deadline &&
+               live_observer.phase == LiveAccessLedgerObserver::Phase::Pending) {
             refresh_live_state();
             if (!live_child) {
                 live_stop_reason = "frontend-exited";
@@ -73342,6 +73482,8 @@ static bool run_pinned_nginx_custom_hide_timeout_probe(
                     temp.nginx_access_log, candidate, diagnostic_read_error)) {
                 live_access_read = false;
                 refresh_live_state();
+                live_observer.sample(steady_now_ns(), candidate, false, live_child, live_origin,
+                                     live_protocol_clean);
                 live_stop_reason = "access-read-error";
                 break;
             }
@@ -73357,20 +73499,62 @@ static bool run_pinned_nginx_custom_hide_timeout_probe(
                                                   : "origin-protocol-failure-after-read";
                 break;
             }
-            if (candidate == "60\n") {
-                live_exact_access_seen = true;
-                live_exact_access_ns = steady_now_ns();
-                live_stop_reason = "exact-access-seen";
+            const u64 sample_ns = steady_now_ns();
+            if (!live_observer.sample(
+                    sample_ns, candidate, true, live_child, live_origin, live_protocol_clean)) {
+                live_stop_reason = sample_ns >= live_observation_deadline
+                                       ? "deadline-after-read"
+                                       : candidate != "" && candidate != "6" &&
+                                             candidate != "60" && candidate != "60\n"
+                                             ? "wrong-access-ledger"
+                                             : !live_child       ? "frontend-exited-after-read"
+                                             : !live_origin      ? "origin-not-live-after-read"
+                                             : !live_protocol_clean ? "origin-protocol-failure-after-read"
+                                                                     : "duplicate-access-ledger";
                 break;
             }
-            if (!candidate.empty() && candidate != "6" && candidate != "60") {
-                live_stop_reason = "wrong-access-ledger";
+            if (live_observer.phase == LiveAccessLedgerObserver::Phase::Accepted) {
+                live_exact_access_seen = true;
+                live_exact_access_ns = live_observer.accepted_ns;
+                live_stop_reason = "exact-access-seen";
                 break;
             }
             usleep(1000);
         }
+        if (live_observer.phase == LiveAccessLedgerObserver::Phase::Pending) {
+            live_observer.sample(live_observation_deadline,
+                                 live_access,
+                                 true,
+                                 live_child,
+                                 live_origin,
+                                 live_protocol_clean);
+            if (live_observer.phase == LiveAccessLedgerObserver::Phase::Failed)
+                live_stop_reason = "deadline";
+        }
         refresh_live_state();
     }
+    refresh_live_state();
+    stability_start_ns = steady_now_ns();
+    stability_deadline_ns = stability_start_ns + 175'000'000ull;
+    if (origin_retired && live_observer.phase == LiveAccessLedgerObserver::Phase::Accepted) {
+        live_observer.begin_stability(stability_start_ns);
+        post_retirement_stable = true;
+        while (post_retirement_stable && steady_now_ns() < stability_deadline_ns)
+            post_retirement_stable = post_retirement_snapshot_valid();
+        if (post_retirement_stable) {
+            post_retirement_stable = steady_now_ns() >= stability_deadline_ns &&
+                                     post_retirement_snapshot_valid() &&
+                                     live_observer.phase == LiveAccessLedgerObserver::Phase::Complete;
+        }
+    }
+    expiry_gate_failed = expiry_gate_failed || !live_observer.accepted_before_deadline() ||
+                         !post_retirement_stable;
+    if (expiry_gate_failed && error.empty()) {
+        error =
+            "#270 custom-hide timeout probe was inconclusive: exact expiry EOF/response/timing/"
+            "retirement/live access-ledger/stability evidence was not observed before cleanup";
+    }
+    const std::string expiry_failure_error = error;
     if (expiry_gate_failed) {
         std::cerr << "DIAGNOSTIC #270 live-expiry-access frontend="
                   << (generated_rut ? "RUT" : "nginx") << " initial-read=" << access_read
@@ -76412,6 +76596,8 @@ int main(int argc, char** argv) {
         argc == 2 && strcmp(argv[1], "--zero-response-stall-self-check") == 0;
     const bool gated_fragment_peer_probe_self_check =
         argc == 2 && strcmp(argv[1], "--gated-fragment-peer-probe-self-check") == 0;
+    const bool live_access_ledger_observer_self_check =
+        argc == 2 && strcmp(argv[1], "--live-access-ledger-observer-self-check") == 0;
     const bool pinned_nginx_custom_hide_timeout_probe =
         argc == 2 && strcmp(argv[1], "--pinned-nginx-custom-hide-timeout-probe") == 0;
     const bool pinned_nginx_custom_hide_timeout_completion =
@@ -76639,6 +76825,7 @@ int main(int argc, char** argv) {
          !pinned_positive_cl_options_default_buffering_oracle &&
          !pinned_positive_cl_head_default_buffering_oracle && !pinned_nginx_lifecycle_self_check &&
          !zero_response_stall_self_check && !gated_fragment_peer_probe_self_check &&
+         !live_access_ledger_observer_self_check &&
          !pinned_nginx_custom_hide_timeout_probe && !pinned_nginx_custom_hide_timeout_completion &&
          !converter_custom_hide_timeout_cli_differential &&
          !converter_default_buffering_positive_get_differential &&
@@ -77241,6 +77428,15 @@ int main(int argc, char** argv) {
     }
     return missing_prerequisite("pinned nginx differential requires Linux host networking");
 #else
+    if (live_access_ledger_observer_self_check) {
+        std::string observer_error;
+        if (!run_live_access_ledger_observer_self_check(observer_error)) {
+            std::cerr << "FAIL [#618 live access-ledger observer self-check]: "
+                      << observer_error << "\n";
+            return 1;
+        }
+        return 0;
+    }
     if (rut_iouring_gate_recv_owner_diagnostics_self_check) {
         std::string diagnostic_error;
         if (!run_recv_owner_diagnostic_self_check(diagnostic_error)) {
