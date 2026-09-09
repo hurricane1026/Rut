@@ -72655,6 +72655,19 @@ static bool run_live_access_ledger_observer_self_check(std::string& error) {
         stable_child_loss.begin_stability(1'100'000'000ull) &&
         !stable_child_loss.stable_sample(1'101'000'000ull, "60\n", true, false, true, true) &&
         !stable_child_loss.stable_sample(1'102'000'000ull, "60\n", true, true, true, true);
+    LiveAccessLedgerObserver pending_custody_loss;
+    pending_custody_loss.freeze_eof(1'000'000'000ull);
+    const bool pending_custody_loss_sticky =
+        !pending_custody_loss.sample(1'100'000'000ull, "6", true, true, true, true, false) &&
+        !pending_custody_loss.sample(1'101'000'000ull, "60\n", true, true, true, true, true);
+    LiveAccessLedgerObserver stable_custody_loss;
+    stable_custody_loss.freeze_eof(1'000'000'000ull);
+    const bool stable_custody_loss_sticky =
+        stable_custody_loss.sample(1'100'000'000ull, "60\n", true, true, true, true) &&
+        stable_custody_loss.begin_stability(1'100'000'000ull) &&
+        !stable_custody_loss.stable_sample(
+            1'101'000'000ull, "60\n", true, true, true, true, false) &&
+        !stable_custody_loss.stable_sample(1'102'000'000ull, "60\n", true, true, true, true);
     const bool controls =
         delayed_timely && expect_pending(1'100'000'000ull, "") &&
         expect_pending(1'100'000'001ull, "6") && expect_pending(1'100'000'002ull, "60") &&
@@ -72665,7 +72678,8 @@ static bool run_live_access_ledger_observer_self_check(std::string& error) {
         expect_fail(1'100'000'000ull, "60\n", true, true, false, true) &&
         expect_fail(1'100'000'000ull, "60\n", true, true, true, false) && duplicate_rejected &&
         phase_guards && shutdown_sticky && initial_wrong_sticky && initial_read_error_sticky &&
-        stable_read_failure_sticky && stable_child_loss_sticky;
+        stable_read_failure_sticky && stable_child_loss_sticky && pending_custody_loss_sticky &&
+        stable_custody_loss_sticky;
     const bool all_controls = controls && stability_controls;
     if (!all_controls) {
         error = "#618 live access-ledger observer self-check rejected a required control";
