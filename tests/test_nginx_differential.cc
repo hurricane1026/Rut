@@ -72041,6 +72041,7 @@ static bool run_pinned_nginx_custom_hide_timeout_probe(const std::string& contai
     Recorder origin;
     origin.observe_extra_requests_until_stop = true;
     origin.permit_gated_incomplete_first_response = true;
+    origin.probe_before_gated_fragment = true;
     origin.incomplete_first_response_fragment_count = 2u;
     origin.response_fragment_bytes[0] = kOrigin;
     origin.response_fragment_lengths[0] = sizeof(kOrigin) - 1u;
@@ -72142,6 +72143,44 @@ static bool run_pinned_nginx_custom_hide_timeout_probe(const std::string& contai
             return false;
         }
         usleep(1000);
+    }
+    origin.gated_fragment_probe_request.store(2u, std::memory_order_release);
+    const u64 probe_deadline_ns = first_ns + 750'000'000ull;
+    while (origin.gated_fragment_probe_ack.load(std::memory_order_acquire) != 2u) {
+        if (!origin_live() || poll_child(nginx.child) ||
+            origin.response_fragment_permit.load(std::memory_order_acquire) != 1u ||
+            origin.response_fragments_sent.load(std::memory_order_acquire) != 1u ||
+            origin.response_send_failed.load(std::memory_order_acquire) ||
+            steady_now_ns() >= probe_deadline_ns) {
+            close(client);
+            error = "#270 custom-hide timeout probe W2 peer-open ack failed";
+            return false;
+        }
+        usleep(1000);
+    }
+    const u64 probe_ns = origin.gated_fragment_probe_ns.load(std::memory_order_acquire);
+    if (origin.gated_fragment_probe_result.load(std::memory_order_acquire) !=
+            GatedFragmentPeerProbeResult::Open ||
+        origin.gated_fragment_probe_request.load(std::memory_order_acquire) != 2u ||
+        origin.gated_fragment_probe_ack.load(std::memory_order_acquire) != 2u ||
+        probe_ns < first_ns + 600'000'000ull || probe_ns >= probe_deadline_ns) {
+        close(client);
+        error = "#270 custom-hide timeout probe W2 peer-open result was invalid";
+        return false;
+    }
+    std::string pre_w2_access;
+    if (!observe_client_open_and_quiet_nonconsuming(client, 5, error) ||
+        !read_request_length_access_file(temp.nginx_access_log, pre_w2_access, error) ||
+        !pre_w2_access.empty() || !origin_live() || poll_child(nginx.child) ||
+        origin.gated_fragment_probe_request.load(std::memory_order_acquire) != 2u ||
+        origin.gated_fragment_probe_ack.load(std::memory_order_acquire) != 2u ||
+        origin.gated_fragment_probe_result.load(std::memory_order_acquire) !=
+            GatedFragmentPeerProbeResult::Open ||
+        origin.response_peer_closed.load(std::memory_order_acquire) ||
+        origin.response_peer_close_count.load(std::memory_order_acquire) != 0u) {
+        close(client);
+        if (error.empty()) error = "#270 custom-hide timeout probe W2 pre-permit custody failed";
+        return false;
     }
     origin.response_fragment_permit.store(2u, std::memory_order_release);
     const auto second_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(1);
@@ -72281,6 +72320,39 @@ static bool run_pinned_nginx_custom_hide_timeout_probe(const std::string& contai
         !origin.response_peer_unexpected_data.load(std::memory_order_acquire) &&
         !origin.response_peer_observation_failed.load(std::memory_order_acquire);
     const u64 peer_closed_ns = origin.response_peer_closed_ns.load(std::memory_order_acquire);
+    bool post_retirement_stable = origin_retired;
+    const u64 stability_deadline_ns = peer_closed_ns + 175'000'000ull;
+    while (post_retirement_stable && steady_now_ns() < stability_deadline_ns) {
+        std::string stable_access;
+        if (!origin_live() || poll_child(nginx.child) ||
+            !read_request_length_access_file(temp.nginx_access_log, stable_access, error) ||
+            stable_access != "60\n" || origin.accepted.load(std::memory_order_acquire) != 1u ||
+            origin.requests.load(std::memory_order_acquire) != 1u ||
+            origin.response_fragments_sent.load(std::memory_order_acquire) != 2u ||
+            origin.response_peer_close_count.load(std::memory_order_acquire) != 1u ||
+            origin.response_send_failed.load(std::memory_order_acquire) ||
+            origin.response_peer_unexpected_data.load(std::memory_order_acquire) ||
+            origin.response_peer_observation_failed.load(std::memory_order_acquire)) {
+            post_retirement_stable = false;
+            break;
+        }
+        pollfd peer_state{client, POLLIN | POLLHUP | POLLERR, 0};
+        const int ready = poll(&peer_state, 1, 5);
+        if (ready < 0) {
+            if (errno == EINTR) continue;
+            post_retirement_stable = false;
+            break;
+        }
+        if (ready > 0) {
+            char late_bytes[64];
+            const ssize_t count = recv(client, late_bytes, sizeof(late_bytes), MSG_DONTWAIT);
+            if (count > 0 ||
+                (count < 0 && errno != EINTR && errno != EAGAIN && errno != EWOULDBLOCK))
+                post_retirement_stable = false;
+        }
+    }
+    if (post_retirement_stable && steady_now_ns() < stability_deadline_ns)
+        post_retirement_stable = false;
     std::cerr << "PROBE #270 custom-hide W2-to-observation-ns=" << (observed_ns - second_ns)
               << " response-bytes=" << response.size() << " actual-eof=" << actual_eof
               << " read-error=" << response_read_error << " access-bytes=" << access.size()
@@ -72290,7 +72362,8 @@ static bool run_pinned_nginx_custom_hide_timeout_probe(const std::string& contai
     dump_wire("#270 custom-hide timeout probe observed downstream", response);
     if (!actual_eof || response.empty() || response_read_error || !access_read ||
         access != "60\n" || !exact_normalized_response || !response_mutants_rejected ||
-        !timing_mutants_rejected || !expiry_timing_is_valid(expiry_elapsed_ns) || !origin_retired) {
+        !timing_mutants_rejected || !expiry_timing_is_valid(expiry_elapsed_ns) || !origin_retired ||
+        !post_retirement_stable) {
         error =
             "#270 custom-hide timeout probe was inconclusive: exact expiry EOF/response/timing/"
             "retirement/access/upstream evidence was not observed before cleanup";
