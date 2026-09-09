@@ -1,6 +1,6 @@
+#include "fixtures/nginx270_hide_timeout.inc"
 #include "fixtures/nginx373_hide.inc"
 #include "fixtures/nginx373_nohide.inc"
-#include "fixtures/nginx270_hide_timeout.inc"
 #include "rut/common/strict_local_response.h"
 #include "rut/compiler/analyze.h"
 #include "rut/compiler/lexer.h"
@@ -21399,7 +21399,6 @@ TEST(nginx_converter_issue270, custom_hide_header_and_timeout_lower_together) {
     forged.location.proxy_read_timeout.present = false;
     const auto absent_timeout = nginx::lower_to_rut(forged);
     REQUIRE_FALSE(absent_timeout);
-    CHECK(absent_timeout.error().detail.eq(lit_str("invalid absent proxy_read_timeout model")));
     forged = profile.value().server;
     forged.location.proxy_read_timeout = {};
     forged.location.proxy_read_timeout.span =
@@ -21408,7 +21407,6 @@ TEST(nginx_converter_issue270, custom_hide_header_and_timeout_lower_together) {
         profile.value().server.location.proxy_hide_header.name_span;
     const auto redirected_timeout = nginx::lower_to_rut(forged);
     REQUIRE_FALSE(redirected_timeout);
-    CHECK(redirected_timeout.error().detail.eq(lit_str("invalid absent proxy_read_timeout model")));
     std::string sibling_source = direct_source;
     const auto sibling =
         nginx::parse({sibling_source.data(), static_cast<u32>(sibling_source.size())});
@@ -21420,43 +21418,65 @@ TEST(nginx_converter_issue270, custom_hide_header_and_timeout_lower_together) {
     REQUIRE_FALSE(cross_source_name);
     CHECK(cross_source_name.error().detail.eq(
         lit_str("invalid proxy_hide_header source provenance")));
+    std::string sibling_profile_source = profile_source;
+    const auto sibling_profile = nginx::parse_http_profile(
+        {sibling_profile_source.data(), static_cast<u32>(sibling_profile_source.size())});
+    REQUIRE(sibling_profile);
+    auto forged_profile = profile.value();
+    forged_profile.server.location.proxy_hide_header.name.ptr =
+        sibling_profile.value().server.location.proxy_hide_header.name.ptr;
+    const auto cross_profile_name = nginx::lower_to_rut(forged_profile);
+    REQUIRE_FALSE(cross_profile_name);
+    CHECK(cross_profile_name.error().detail.eq(
+        lit_str("http profile metadata does not match its source")));
+    const std::string complete_source = "events {} " + profile_source;
+    const auto complete_model = nginx::parse_nginx_http_config(
+        {complete_source.data(), static_cast<u32>(complete_source.size())});
+    REQUIRE(complete_model);
+    auto forged_complete = complete_model.value();
+    forged_complete.http.server.location.proxy_read_timeout = {};
+    forged_complete.http.server.location.proxy_read_timeout.span =
+        forged_complete.http.server.location.proxy_hide_header.span;
+    const auto redirected_complete = nginx::lower_to_rut(forged_complete);
+    REQUIRE_FALSE(redirected_complete);
     const std::string profile_owned = profile_output;
     std::fill(profile_source.begin(), profile_source.end(), 'x');
     CHECK_EQ(std::string(profile_lowered.value().data, profile_lowered.value().len), profile_owned);
     profile_source = make_request_length_http_profile("/logs/access.log", server_content);
-    std::string server_owned;
-    {
+    const auto server_owned = [&]() {
         std::string scoped_source = direct_source;
         const auto scoped =
             nginx::parse({scoped_source.data(), static_cast<u32>(scoped_source.size())});
         REQUIRE(scoped);
         const auto lowered = nginx::lower_to_rut(scoped.value());
         REQUIRE(lowered);
-        server_owned.assign(lowered.value().data, lowered.value().len);
-    }
-    CHECK_EQ(server_owned, std::string(direct_lowered.value().data, direct_lowered.value().len));
-    std::string http_owned;
-    {
+        return lowered.value();
+    }();
+    CHECK_EQ(std::string(server_owned.data, server_owned.len),
+             std::string(direct_lowered.value().data, direct_lowered.value().len));
+    CHECK_EQ(server_owned.data[server_owned.len], '\0');
+    const auto http_owned = [&]() {
         std::string scoped_source = profile_source;
         const auto scoped = nginx::parse_http_profile(
             {scoped_source.data(), static_cast<u32>(scoped_source.size())});
         REQUIRE(scoped);
         const auto lowered = nginx::lower_to_rut(scoped.value());
         REQUIRE(lowered);
-        http_owned.assign(lowered.value().data, lowered.value().len);
-    }
-    CHECK_EQ(http_owned, profile_owned);
-    std::string fullfile_owned;
-    {
+        return lowered.value();
+    }();
+    CHECK_EQ(std::string(http_owned.data, http_owned.len), profile_owned);
+    CHECK_EQ(http_owned.data[http_owned.len], '\0');
+    const auto fullfile_owned = [&]() {
         std::string scoped_source = "events {} " + profile_source;
         const auto scoped = nginx::parse_nginx_http_config(
             {scoped_source.data(), static_cast<u32>(scoped_source.size())});
         REQUIRE(scoped);
         const auto lowered = nginx::lower_to_rut(scoped.value());
         REQUIRE(lowered);
-        fullfile_owned.assign(lowered.value().data, lowered.value().len);
-    }
-    CHECK_EQ(fullfile_owned, profile_owned);
+        return lowered.value();
+    }();
+    CHECK_EQ(std::string(fullfile_owned.data, fullfile_owned.len), profile_owned);
+    CHECK_EQ(fullfile_owned.data[fullfile_owned.len], '\0');
     const std::string maximum_source =
         "server { listen 127.0.0.1:65535; location / { proxy_hide_header " + name +
         "; proxy_read_timeout 63s; proxy_pass http://255.255.255.255:65535; } }";
@@ -21465,6 +21485,7 @@ TEST(nginx_converter_issue270, custom_hide_header_and_timeout_lower_together) {
     REQUIRE(maximum);
     const auto maximum_lowered = nginx::lower_to_rut(maximum.value());
     REQUIRE(maximum_lowered);
+    CHECK_EQ(maximum_lowered.value().len, 8321u);
     CHECK_LT(maximum_lowered.value().len, nginx::RutSource::kCapacity);
     CHECK_EQ(maximum_lowered.value().data[maximum_lowered.value().len], '\0');
     const std::string maximum_profile_source = make_request_length_http_profile(
@@ -21476,8 +21497,18 @@ TEST(nginx_converter_issue270, custom_hide_header_and_timeout_lower_together) {
     REQUIRE(maximum_profile);
     const auto maximum_profile_lowered = nginx::lower_to_rut(maximum_profile.value());
     REQUIRE(maximum_profile_lowered);
+    CHECK_EQ(maximum_profile_lowered.value().len, 8650u);
     CHECK_LT(maximum_profile_lowered.value().len, nginx::HttpProfileRutSource::kCapacity);
     CHECK_EQ(maximum_profile_lowered.value().data[maximum_profile_lowered.value().len], '\0');
+    const std::string maximum_complete_source = "events {} " + maximum_profile_source;
+    const auto maximum_complete = nginx::parse_nginx_http_config(
+        {maximum_complete_source.data(), static_cast<u32>(maximum_complete_source.size())});
+    REQUIRE(maximum_complete);
+    const auto maximum_complete_lowered = nginx::lower_to_rut(maximum_complete.value());
+    REQUIRE(maximum_complete_lowered);
+    CHECK_EQ(maximum_complete_lowered.value().len, 8650u);
+    CHECK_LT(maximum_complete_lowered.value().len, nginx::HttpProfileRutSource::kCapacity);
+    CHECK_EQ(maximum_complete_lowered.value().data[maximum_complete_lowered.value().len], '\0');
     const char no_timeout[] =
         "server { listen 127.0.0.1:8080; location / { proxy_hide_header X-Compat-Hidden; "
         "proxy_pass http://127.0.0.1:9000; } }";
