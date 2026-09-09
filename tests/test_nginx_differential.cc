@@ -72333,37 +72333,41 @@ static bool run_pinned_nginx_custom_hide_timeout_probe(const std::string& contai
     const u64 stability_start_ns = steady_now_ns();
     bool post_retirement_stable = origin_retired && stability_start_ns >= peer_closed_ns;
     const u64 stability_deadline_ns = stability_start_ns + 175'000'000ull;
-    while (post_retirement_stable && steady_now_ns() < stability_deadline_ns) {
+    const auto post_retirement_snapshot_valid = [&]() {
         std::string stable_access;
         if (!origin_live() || poll_child(nginx.child) ||
             !read_request_length_access_file(temp.nginx_access_log, stable_access, error) ||
             stable_access != "60\n" || origin.accepted.load(std::memory_order_acquire) != 1u ||
             origin.requests.load(std::memory_order_acquire) != 1u ||
             origin.response_fragments_sent.load(std::memory_order_acquire) != 2u ||
+            !origin.response_peer_closed.load(std::memory_order_acquire) ||
             origin.response_peer_close_count.load(std::memory_order_acquire) != 1u ||
+            origin.gated_fragment_probe_request.load(std::memory_order_acquire) != 2u ||
+            origin.gated_fragment_probe_ack.load(std::memory_order_acquire) != 2u ||
+            origin.gated_fragment_probe_result.load(std::memory_order_acquire) !=
+                GatedFragmentPeerProbeResult::Open ||
             origin.response_send_failed.load(std::memory_order_acquire) ||
             origin.response_peer_unexpected_data.load(std::memory_order_acquire) ||
-            origin.response_peer_observation_failed.load(std::memory_order_acquire)) {
-            post_retirement_stable = false;
-            break;
-        }
+            origin.response_peer_observation_failed.load(std::memory_order_acquire))
+            return false;
         pollfd peer_state{client, POLLIN | POLLHUP | POLLERR, 0};
         const int ready = poll(&peer_state, 1, 5);
-        if (ready < 0) {
-            if (errno == EINTR) continue;
-            post_retirement_stable = false;
-            break;
-        }
-        if (ready > 0) {
-            char late_bytes[64];
-            const ssize_t count = recv(client, late_bytes, sizeof(late_bytes), MSG_DONTWAIT);
-            if (count > 0 ||
-                (count < 0 && errno != EINTR && errno != EAGAIN && errno != EWOULDBLOCK))
-                post_retirement_stable = false;
-        }
+        if (ready < 0) return errno == EINTR;
+        if (ready == 0) return true;
+        char late_bytes[64];
+        const ssize_t count = recv(client, late_bytes, sizeof(late_bytes), MSG_DONTWAIT);
+        return count <= 0 &&
+               (count == 0 || errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK);
+    };
+    while (post_retirement_stable && steady_now_ns() < stability_deadline_ns) {
+        post_retirement_stable = post_retirement_snapshot_valid();
     }
-    if (post_retirement_stable && steady_now_ns() < stability_deadline_ns)
-        post_retirement_stable = false;
+    if (post_retirement_stable) {
+        if (steady_now_ns() < stability_deadline_ns)
+            post_retirement_stable = false;
+        else
+            post_retirement_stable = post_retirement_snapshot_valid();
+    }
     std::cerr << "PROBE #270 custom-hide W2-to-observation-ns=" << (observed_ns - second_ns)
               << " response-bytes=" << response.size() << " actual-eof=" << actual_eof
               << " read-error=" << response_read_error << " access-bytes=" << access.size()
