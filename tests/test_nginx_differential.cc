@@ -54400,16 +54400,22 @@ static bool run_converter_retained_off_source_self_checks(const std::string& sou
     return true;
 }
 
-static bool validate_custom_hide_timeout_loaded_program(const std::string& source_path,
-                                                        const std::string& captured_stdout,
-                                                        u16 frontend_port,
-                                                        u16 backend_port,
-                                                        const std::string& access_path,
-                                                        const char* custom_name,
-                                                        std::string& error,
-                                                        unsigned expected_timeout_seconds = 1u) {
+static bool validate_custom_hide_timeout_loaded_program(
+    const std::string& source_path,
+    const std::string& captured_stdout,
+    u16 frontend_port,
+    u16 backend_port,
+    const std::string& access_path,
+    const char* custom_name,
+    std::string& error,
+    unsigned expected_timeout_seconds = 1u,
+    bool validate_selected_head_controls = false) {
     if (expected_timeout_seconds != 1u && expected_timeout_seconds != 2u) {
         error = "#627 loaded custom-hide timeout validator received an invalid expected timeout";
+        return false;
+    }
+    if (validate_selected_head_controls && expected_timeout_seconds != 2u) {
+        error = "#630 selected HEAD controls require the 2s timeout baseline";
         return false;
     }
     if (source_path.empty() || captured_stdout.empty() || custom_name == nullptr ||
@@ -54605,6 +54611,104 @@ static bool validate_custom_hide_timeout_loaded_program(const std::string& sourc
                 "] bundles=" + std::to_string(program->config.policy_bundle_count) +
                 " distinct=" + std::to_string(distinct_ok);
         return false;
+    }
+    if (validate_selected_head_controls) {
+        static constexpr char kSelectedHeadRequest[] =
+            "HEAD /buffered-timeout?q=1 HTTP/1.1\r\nHost: client.example\r\n\r\n";
+        static_assert(sizeof(kSelectedHeadRequest) - 1u == 61u);
+        const auto selected_head = invoke(
+            *head, kSelectedHeadRequest, static_cast<u32>(sizeof(kSelectedHeadRequest) - 1u));
+        const u16 selected_bundle_id = selected_head.next_state;
+        if (!predicate(*head,
+                       selected_head,
+                       static_cast<u16>(rut::RequestPolicyId::Http11FixedStrip),
+                       static_cast<u16>(rut::ResponsePolicyHeadMode::SuppressBody),
+                       rut::ForwardResponseBufferingMode::None) ||
+            selected_bundle_id == 0u || selected_bundle_id > program->config.policy_bundle_count) {
+            error = "#630 selected HEAD baseline did not resolve a valid bodyless bundle";
+            return false;
+        }
+        auto& selected_bundle = program->config.policy_bundles[selected_bundle_id - 1u];
+        if (!program->config.response_policy_id_is_valid(selected_bundle.response_policy_id)) {
+            error = "#630 selected HEAD bundle response policy id was invalid";
+            return false;
+        }
+        auto& selected_response_policy =
+            program->config.response_policies[selected_bundle.response_policy_id - 1u];
+        const auto same_result_identity = [&](const rut::jit::HandlerResult& result) {
+            return result.action == selected_head.action &&
+                   result.status_code == selected_head.status_code &&
+                   result.upstream_id == selected_head.upstream_id &&
+                   result.next_state == selected_head.next_state;
+        };
+        const u16 selected_response_policy_id = selected_bundle.response_policy_id;
+        const auto selected_timeout = selected_bundle.response_read_timeout_seconds;
+        const auto selected_head_mode = selected_response_policy.head_mode;
+        const auto selected_buffering = selected_bundle.response_buffering;
+        const auto validate_restored_head = [&](const char* label) {
+            const auto restored = invoke(
+                *head, kSelectedHeadRequest, static_cast<u32>(sizeof(kSelectedHeadRequest) - 1u));
+            if (!same_result_identity(restored) ||
+                !predicate(*head,
+                           restored,
+                           static_cast<u16>(rut::RequestPolicyId::Http11FixedStrip),
+                           static_cast<u16>(rut::ResponsePolicyHeadMode::SuppressBody),
+                           rut::ForwardResponseBufferingMode::None) ||
+                program->config.policy_bundles[restored.next_state - 1u].response_policy_id !=
+                    selected_response_policy_id) {
+                error = std::string("#630 selected HEAD restoration failed: ") + label;
+                return false;
+            }
+            return true;
+        };
+        selected_bundle.response_read_timeout_seconds = 1u;
+        const auto timeout_mutant = invoke(
+            *head, kSelectedHeadRequest, static_cast<u32>(sizeof(kSelectedHeadRequest) - 1u));
+        if (predicate(*head,
+                      timeout_mutant,
+                      static_cast<u16>(rut::RequestPolicyId::Http11FixedStrip),
+                      static_cast<u16>(rut::ResponsePolicyHeadMode::SuppressBody),
+                      rut::ForwardResponseBufferingMode::None) ||
+            !same_result_identity(timeout_mutant)) {
+            selected_bundle.response_read_timeout_seconds = selected_timeout;
+            error = "#630 selected HEAD timeout mutant was accepted";
+            return false;
+        }
+        selected_bundle.response_read_timeout_seconds = selected_timeout;
+        if (!validate_restored_head("response_read_timeout")) return false;
+
+        selected_response_policy.head_mode = rut::ResponsePolicyHeadMode::Reject;
+        const auto head_mode_mutant = invoke(
+            *head, kSelectedHeadRequest, static_cast<u32>(sizeof(kSelectedHeadRequest) - 1u));
+        if (predicate(*head,
+                      head_mode_mutant,
+                      static_cast<u16>(rut::RequestPolicyId::Http11FixedStrip),
+                      static_cast<u16>(rut::ResponsePolicyHeadMode::SuppressBody),
+                      rut::ForwardResponseBufferingMode::None) ||
+            !same_result_identity(head_mode_mutant)) {
+            selected_response_policy.head_mode = selected_head_mode;
+            error = "#630 selected HEAD response-policy head_mode mutant was accepted";
+            return false;
+        }
+        selected_response_policy.head_mode = selected_head_mode;
+        if (!validate_restored_head("response_policy.head_mode")) return false;
+
+        selected_bundle.response_buffering =
+            rut::ForwardResponseBufferingMode::CompleteContentLength;
+        const auto buffering_mutant = invoke(
+            *head, kSelectedHeadRequest, static_cast<u32>(sizeof(kSelectedHeadRequest) - 1u));
+        if (predicate(*head,
+                      buffering_mutant,
+                      static_cast<u16>(rut::RequestPolicyId::Http11FixedStrip),
+                      static_cast<u16>(rut::ResponsePolicyHeadMode::SuppressBody),
+                      rut::ForwardResponseBufferingMode::None) ||
+            !same_result_identity(buffering_mutant)) {
+            selected_bundle.response_buffering = selected_buffering;
+            error = "#630 selected HEAD response_buffering mutant was accepted";
+            return false;
+        }
+        selected_bundle.response_buffering = selected_buffering;
+        if (!validate_restored_head("response_buffering")) return false;
     }
     if (expected_timeout_seconds == 2u) {
         const u16 get_bundle_id = rg.next_state;
@@ -79028,7 +79132,8 @@ static bool run_issue630_head_same_file_pair(const char* rut_path,
                                                              temp.nginx_access_log,
                                                              "X-Powered-By",
                                                              error,
-                                                             2u))
+                                                             2u,
+                                                             true))
                 return false;
             if (!handoff_held_loopback_port(&ports.fds[0], frontend, "#630 pair RUT bind", error) ||
                 !spawn_child({rut_path, temp.source, "--shards", "1", "--no-pin", "--drain", "0"},
