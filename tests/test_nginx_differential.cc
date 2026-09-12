@@ -74570,7 +74570,7 @@ struct HeadAcceptanceObservation {
 };
 
 static bool validate_head_acceptance(const HeadAcceptanceObservation& o,
-                                     const std::vector<char>& expected,
+                                     const char* expected,
                                      std::string& detail) {
     if (o.origin_ns == 0u || o.publication_ns < o.origin_ns + 1'150'000'000ull ||
         o.publication_ns >= o.origin_ns + 1'400'000'000ull) {
@@ -74646,10 +74646,8 @@ static bool run_pinned_nginx_bodyless_head_delayed_completion_oracle(std::string
         "Date: XXXXXXXXXXXXXXXXXXXXXXXXXXXXX\r\nContent-Length: 12\r\n"
         "Connection: keep-alive\r\nX-Unrelated: retained\r\n\r\n";
     synthetic.wire.assign(kSyntheticWire, kSyntheticWire + sizeof(kSyntheticWire) - 1u);
-    const std::vector<char> synthetic_expected(
-        kSyntheticExpected, kSyntheticExpected + sizeof(kSyntheticExpected) - 1u);
     std::string control_detail;
-    if (!validate_head_acceptance(synthetic, synthetic_expected, control_detail)) {
+    if (!validate_head_acceptance(synthetic, kSyntheticExpected, control_detail)) {
         error = "#630 synthetic positive acceptance failed: " + control_detail;
         return false;
     }
@@ -74711,12 +74709,12 @@ static bool run_pinned_nginx_bodyless_head_delayed_completion_oracle(std::string
         HeadAcceptanceObservation negative = synthetic;
         mutation.apply(negative);
         control_detail.clear();
-        if (validate_head_acceptance(negative, synthetic_expected, control_detail)) {
+        if (validate_head_acceptance(negative, kSyntheticExpected, control_detail)) {
             error = std::string("#630 synthetic control accepted ") + mutation.name;
             return false;
         }
     }
-    if (!validate_head_acceptance(synthetic, synthetic_expected, control_detail)) {
+    if (!validate_head_acceptance(synthetic, kSyntheticExpected, control_detail)) {
         error = "#630 synthetic restored positive acceptance failed: " + control_detail;
         return false;
     }
@@ -74764,7 +74762,7 @@ static bool run_pinned_nginx_bodyless_head_delayed_completion_oracle(std::string
                       "--name",
                       docker.name,
                       "-v",
-                      temp.path + ":" + temp.path,
+                      std::string(temp.path) + ":" + temp.path,
                       "-v",
                       temp.nginx_config + ":/etc/nginx/nginx.conf:ro",
                       kNginxImage,
@@ -74998,10 +74996,7 @@ static bool run_pinned_nginx_bodyless_head_delayed_completion_oracle(std::string
     actual.observation_failed =
         origin.first_peer_observation_failed.load(std::memory_order_acquire);
     std::string acceptance_detail;
-    const bool ok =
-        validate_head_acceptance(actual,
-                                 std::vector<char>(kExpected, kExpected + sizeof(kExpected) - 1u),
-                                 acceptance_detail);
+    const bool ok = validate_head_acceptance(actual, kExpected, acceptance_detail);
     const bool live_snapshot_ok =
         final_quiet && final_ledger_ok && origin.thread_alive.load(std::memory_order_acquire) &&
         !origin.listener_failed.load(std::memory_order_acquire) && !poll_child(nginx.child);
