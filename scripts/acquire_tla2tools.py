@@ -7,8 +7,8 @@ import argparse
 import hashlib
 import os
 import subprocess
-import tempfile
 import sys
+import tempfile
 from pathlib import Path
 
 
@@ -105,7 +105,7 @@ def main() -> int:
         return 2
     except AcquisitionError as exc:
         print(f"tla2tools acquisition failed: {exc}", file=sys.stderr, flush=True)
-        return 1
+        return exc.returncode if exc.returncode is not None else 1
     return 0
 
 
