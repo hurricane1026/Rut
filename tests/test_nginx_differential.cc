@@ -74022,9 +74022,29 @@ static bool run_live_access_ledger_observer_self_check(std::string& error) {
                                                u64 now_ns,
                                                const std::string& ledger,
                                                const LiveRetirementSnapshot& snapshot) {
-        return observer.sample(now_ns, ledger, true, true, true, true, true,
+        return observer.sample(now_ns,
+                               ledger,
+                               true,
+                               true,
+                               true,
+                               true,
+                               true,
                                snapshot.state == LiveRetirementState::Ready,
                                snapshot.state != LiveRetirementState::Invalid);
+    };
+    const auto stable_snapshot_sample = [](LiveAccessLedgerObserver& observer,
+                                           u64 now_ns,
+                                           const std::string& ledger,
+                                           const LiveRetirementSnapshot& snapshot) {
+        return observer.stable_sample(now_ns,
+                                      ledger,
+                                      true,
+                                      true,
+                                      true,
+                                      true,
+                                      true,
+                                      snapshot.state == LiveRetirementState::Ready,
+                                      snapshot.state != LiveRetirementState::Invalid);
     };
     const auto actual_retirement_snapshot = [](bool published, u32 count, u64 timestamp_ns) {
         std::atomic<bool> flag{published};
@@ -74058,26 +74078,34 @@ static bool run_live_access_ledger_observer_self_check(std::string& error) {
         retirement_snapshot_sample(invalid_after_stability, 1'100'000'000ull, "60\n",
                                    ready_snapshot) &&
         invalid_after_stability.begin_stability(1'100'000'000ull) &&
-        !retirement_snapshot_sample(invalid_after_stability, 1'101'000'000ull, "60\n",
-                                    actual_retirement_snapshot(true, 2u, 1'101'000'000ull)) &&
-        !retirement_snapshot_sample(invalid_after_stability, 1'102'000'000ull, "60\n",
-                                    actual_retirement_snapshot(true, 1u, 1'102'000'000ull)) &&
-        !invalid_after_stability.stable_sample(1'276'000'000ull, "60\n", true, true, true,
-                                               true);
+        !stable_snapshot_sample(invalid_after_stability,
+                                1'101'000'000ull,
+                                "60\n",
+                                actual_retirement_snapshot(true, 2u, 1'101'000'000ull)) &&
+        !stable_snapshot_sample(invalid_after_stability,
+                                1'102'000'000ull,
+                                "60\n",
+                                actual_retirement_snapshot(true, 1u, 1'102'000'000ull)) &&
+        !invalid_after_stability.stable_sample(1'276'000'000ull, "60\n", true, true, true, true);
     LiveAccessLedgerObserver pending_after_stability;
     pending_after_stability.freeze_eof(1'000'000'000ull);
     const bool pending_snapshot_sticky_after_stability =
         retirement_snapshot_sample(pending_after_stability, 1'100'000'000ull, "60\n",
                                    ready_snapshot) &&
         pending_after_stability.begin_stability(1'100'000'000ull) &&
-        !retirement_snapshot_sample(pending_after_stability, 1'101'000'000ull, "60\n",
-                                    actual_retirement_snapshot(false, 0u, 0u)) &&
-        !retirement_snapshot_sample(pending_after_stability, 1'102'000'000ull, "60\n",
-                                    ready_snapshot);
+        !stable_snapshot_sample(pending_after_stability,
+                                1'101'000'000ull,
+                                "60\n",
+                                actual_retirement_snapshot(false, 0u, 0u)) &&
+        !stable_snapshot_sample(pending_after_stability, 1'102'000'000ull, "60\n", ready_snapshot);
     LiveAccessLedgerObserver exact_then_empty;
     exact_then_empty.freeze_eof(1'000'000'000ull);
     const bool exact_then_empty_regression_sticky =
-        exact_then_empty.sample(1'100'000'000ull, "60\n", true, true, true, true) &&
+        retirement_snapshot_sample(exact_then_empty,
+                                   1'100'000'000ull,
+                                   "60\n",
+                                   actual_retirement_snapshot(false, 0u, 0u)) &&
+        exact_then_empty.phase == LiveAccessLedgerObserver::Phase::Pending &&
         !exact_then_empty.sample(1'101'000'000ull, "", true, true, true, true) &&
         !exact_then_empty.sample(1'102'000'000ull, "60\n", true, true, true, true);
     const auto pending_retirement_failure_sticky =
