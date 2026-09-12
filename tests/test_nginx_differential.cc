@@ -296,6 +296,14 @@ static constexpr char kDefaultBufferingTimeoutResponseNormalized[] =
     "Content-Length: 12\r\n"
     "Connection: keep-alive\r\n\r\n";
 static_assert(sizeof(kDefaultBufferingTimeoutResponseNormalized) - 1u == 122u);
+static constexpr char kExplicitBufferingOffTimeoutResponseNormalized[] =
+    "HTTP/1.1 200 OK\r\n"
+    "Server: nginx/1.29.7\r\n"
+    "Date: XXXXXXXXXXXXXXXXXXXXXXXXXXXXX\r\n"
+    "Content-Length: 12\r\n"
+    "Connection: keep-alive\r\n\r\n"
+    "hello";
+static_assert(sizeof(kExplicitBufferingOffTimeoutResponseNormalized) - 1u == 127u);
 static constexpr char kDefaultBuffering201TimeoutResponseNormalized[] =
     "HTTP/1.1 201 Created\r\n"
     "Server: nginx/1.29.7\r\n"
@@ -65528,6 +65536,225 @@ static bool run_pinned_nginx_explicit_buffering_on_baseline_oracle(
     return true;
 }
 
+// #638 is deliberately an nginx-only oracle: proxy_buffering off must expose
+// the already-published response prefix before proxy_read_timeout expires.
+static bool run_pinned_nginx_explicit_buffering_off_oracle(TempDir& temp,
+                                                           const std::string& container_name,
+                                                           std::string& error) {
+    HeldLoopbackPorts reservations;
+    u16 ports[2]{};
+    for (size_t i = 0; i < std::size(ports); ++i) {
+        if (!reservations.reserve_four_digit(i, ports[i])) {
+            error = "#638 could not hold distinct four-digit ports";
+            return false;
+        }
+    }
+    const std::string config =
+        "events {}\nhttp {\n  log_format compat \"$request_length\";\n  access_log " +
+        std::string(temp.nginx_access_log) +
+        " compat;\n  server {\n    listen 127.0.0.1:" + std::to_string(ports[0]) +
+        ";\n    location / {\n      proxy_buffering off;\n      proxy_pass http://127.0.0.1:" +
+        std::to_string(ports[1]) + ";\n      proxy_read_timeout 1s;\n    }\n  }\n}\n";
+    if (count_text(config, "events {}\n") != 1u ||
+        count_text(config, "listen 127.0.0.1:" + std::to_string(ports[0]) + ";") != 1u ||
+        count_text(config, "location / {") != 1u ||
+        count_text(config, "proxy_buffering off;") != 1u ||
+        count_text(config, "proxy_pass http://127.0.0.1:" + std::to_string(ports[1]) + ";") != 1u ||
+        count_text(config, "proxy_read_timeout 1s;") != 1u ||
+        config.find("proxy_request_buffering") != std::string::npos ||
+        config.find("proxy_http_version") != std::string::npos ||
+        config.find("proxy_set_header") != std::string::npos ||
+        config.find("include ") != std::string::npos ||
+        !write_file(temp.nginx_config, config.data(), config.size())) {
+        error = "#638 config was not the exact single-prefix proxy_buffering off shape";
+        return false;
+    }
+
+    Recorder origin;
+    origin.wait_response_peer_close = true;
+    origin.observe_extra_requests_until_stop = true;
+    if (!handoff_held_loopback_port(&reservations.fds[1], ports[1], "#638 origin bind", error) ||
+        !origin.setup(ports[1],
+                      1u,
+                      kDefaultBufferingTimeoutOrigin,
+                      sizeof(kDefaultBufferingTimeoutOrigin) - 1u)) {
+        if (error.empty()) error = "#638 origin setup failed";
+        return false;
+    }
+    const auto origin_live = [&]() {
+        return origin.running.load(std::memory_order_acquire) &&
+               origin.thread_alive.load(std::memory_order_acquire) &&
+               !origin.listener_failed.load(std::memory_order_acquire);
+    };
+    const auto ready_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+    while (!origin_live() && std::chrono::steady_clock::now() < ready_deadline) usleep(1000);
+    if (!origin_live()) {
+        error = "#638 origin listener was not live before nginx handoff";
+        return false;
+    }
+
+    DockerGuard docker(container_name);
+    ChildGuard nginx;
+    if (!handoff_held_loopback_port(&reservations.fds[0], ports[0], "#638 nginx bind", error) ||
+        !spawn_child({"docker",
+                      "run",
+                      "--pull=never",
+                      "--network",
+                      "host",
+                      "--name",
+                      container_name,
+                      "-v",
+                      std::string(temp.path) + ":" + temp.path,
+                      kNginxImage,
+                      "nginx",
+                      "-c",
+                      temp.nginx_config,
+                      "-g",
+                      "daemon off;"},
+                     temp.nginx_log,
+                     nginx.child) ||
+        !wait_ready(ports[0], nginx.child, error)) {
+        if (error.empty()) error = "#638 pinned nginx failed to start";
+        return false;
+    }
+    struct ClientGuard {
+        int fd = -1;
+        ~ClientGuard() {
+            if (fd >= 0) close(fd);
+        }
+    } client{connect_once(ports[0])};
+    if (client.fd < 0 || !send_all(client.fd,
+                                   kDefaultBufferingTimeoutRequest,
+                                   sizeof(kDefaultBufferingTimeoutRequest) - 1u)) {
+        error = "#638 exact 60-byte client request failed";
+        return false;
+    }
+    const auto publication_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+    while (!origin.response_sent_open.load(std::memory_order_acquire) &&
+           std::chrono::steady_clock::now() < publication_deadline)
+        usleep(1000);
+    const u64 origin_sent_ns = origin.response_sent_ns.load(std::memory_order_acquire);
+    if (!origin.response_sent_open.load(std::memory_order_acquire) || origin_sent_ns == 0u ||
+        origin.accepted.load(std::memory_order_acquire) != 1u ||
+        origin.requests.load(std::memory_order_acquire) != 1u ||
+        origin.response_send_all_calls.load(std::memory_order_acquire) != 1u ||
+        !origin.response_send_succeeded.load(std::memory_order_acquire)) {
+        error = "#638 origin did not publish exactly one successful 103-byte response";
+        return false;
+    }
+
+    std::vector<char> response;
+    u64 first_ns = 0u;
+    u64 prefix_complete_ns = 0u;
+    u64 eof_ns = 0u;
+    const u64 early_deadline_ns = origin_sent_ns + 800'000'000ull;
+    while (response.size() < sizeof(kExplicitBufferingOffTimeoutResponseNormalized) - 1u &&
+           steady_now_ns() < early_deadline_ns) {
+        pollfd p{client.fd, POLLIN | POLLHUP | POLLERR, 0};
+        if (poll(&p, 1, 20) <= 0) continue;
+        char bytes[512];
+        const ssize_t n = recv(client.fd, bytes, sizeof(bytes), 0);
+        if (n > 0) {
+            if (first_ns == 0u) first_ns = steady_now_ns();
+            response.insert(response.end(), bytes, bytes + n);
+            if (response.size() == sizeof(kExplicitBufferingOffTimeoutResponseNormalized) - 1u)
+                prefix_complete_ns = steady_now_ns();
+        } else if (n < 0 && errno != EINTR && errno != EAGAIN && errno != EWOULDBLOCK) {
+            error = "#638 early downstream receive failed";
+            return false;
+        } else if (n == 0) {
+            error = "#638 downstream EOF preceded the early response prefix";
+            return false;
+        }
+    }
+    if (response.size() != sizeof(kExplicitBufferingOffTimeoutResponseNormalized) - 1u ||
+        first_ns == 0u || prefix_complete_ns == 0u ||
+        prefix_complete_ns - origin_sent_ns >= 800'000'000ull) {
+        error = "#638 proxy_buffering off did not expose the exact 127-byte prefix before timeout";
+        return false;
+    }
+    const auto eof_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+    while (eof_ns == 0u && std::chrono::steady_clock::now() < eof_deadline) {
+        pollfd p{client.fd, POLLIN | POLLHUP | POLLERR, 0};
+        if (poll(&p, 1, 20) <= 0) continue;
+        char bytes[512];
+        const ssize_t n = recv(client.fd, bytes, sizeof(bytes), 0);
+        if (n > 0)
+            response.insert(response.end(), bytes, bytes + n);
+        else if (n == 0)
+            eof_ns = steady_now_ns();
+        else if (errno != EINTR && errno != EAGAIN && errno != EWOULDBLOCK) {
+            error = "#638 downstream EOF receive failed";
+            return false;
+        }
+    }
+    std::string detail;
+    if (eof_ns == 0u ||
+        !validate_exact_normalized_response(
+            response, kExplicitBufferingOffTimeoutResponseNormalized, detail) ||
+        eof_ns - origin_sent_ns < 750'000'000ull || eof_ns - origin_sent_ns >= 2'000'000'000ull) {
+        error = "#638 downstream wire/one-second inactivity EOF was invalid: " + detail;
+        return false;
+    }
+    const auto peer_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(1);
+    while (!origin.response_peer_closed.load(std::memory_order_acquire) &&
+           std::chrono::steady_clock::now() < peer_deadline)
+        usleep(1000);
+    if (!origin.response_peer_closed.load(std::memory_order_acquire) ||
+        origin.response_peer_closed_ns.load(std::memory_order_acquire) == 0u ||
+        origin.response_peer_closed_ns.load(std::memory_order_acquire) - origin_sent_ns >=
+            2'000'000'000ull) {
+        error = "#638 origin was not naturally retired in the timeout window";
+        return false;
+    }
+    std::string access;
+    if (!read_request_length_access_file(temp.nginx_access_log, access, error) ||
+        access != "60\n") {
+        error = "#638 access ledger was not exactly 60\\n";
+        return false;
+    }
+    const u64 stability_deadline = steady_now_ns() + 175'000'000ull;
+    while (steady_now_ns() < stability_deadline) {
+        std::string stable_access;
+        if (poll_child(nginx.child) || !origin_live() ||
+            !read_request_length_access_file(temp.nginx_access_log, stable_access, error) ||
+            stable_access != "60\n" || origin.accepted.load(std::memory_order_acquire) != 1u ||
+            origin.requests.load(std::memory_order_acquire) != 1u ||
+            origin.response_peer_unexpected_data.load(std::memory_order_acquire) ||
+            origin.response_peer_observation_failed.load(std::memory_order_acquire)) {
+            error = "#638 live ledger/retirement evidence changed during 175ms stability";
+            return false;
+        }
+        usleep(5000);
+    }
+    const bool nginx_stopped = stop_child(nginx.child);
+    const bool container_removed = docker.remove();
+    if (!nginx_stopped || !container_removed || reservations.fds[0] >= 0 ||
+        reservations.fds[1] >= 0) {
+        error = "#638 owned nginx/container/fd cleanup was incomplete";
+        return false;
+    }
+    const std::string expected_upstream =
+        "GET /buffered-timeout?q=1 HTTP/1.1\r\nHost: 127.0.0.1:" + std::to_string(ports[1]) +
+        "\r\n\r\n";
+    const std::vector<char> expected_wire(expected_upstream.begin(), expected_upstream.end());
+    origin.stop();
+    if (origin.history.size() != 1u || origin.history[0] != expected_wire ||
+        origin.request != expected_wire || origin.accepted.load(std::memory_order_acquire) != 1u ||
+        origin.requests.load(std::memory_order_acquire) != 1u ||
+        origin.response_peer_close_count.load(std::memory_order_acquire) != 1u ||
+        origin.response_send_failed.load(std::memory_order_acquire) ||
+        origin.response_peer_unexpected_data.load(std::memory_order_acquire) ||
+        origin.response_peer_observation_failed.load(std::memory_order_acquire)) {
+        error = "#638 upstream ledger contained retry, mutation, or observer failure evidence";
+        return false;
+    }
+    std::cerr << "PASS: #638 pinned nginx explicit proxy_buffering off exposed one exact 127-byte "
+                 "200/CL12+hello prefix before the 1s inactivity EOF, retired one origin, and "
+                 "recorded exactly 60\\n with no retry; nginx-only oracle.\n";
+    return true;
+}
+
 static bool run_pinned_nginx_default_buffering_202_incomplete_body_inactivity_expiry_oracle(
     TempDir& temp, const std::string& container_name, std::string& error) {
     HeldLoopbackPorts reservations;
@@ -79359,6 +79586,8 @@ int main(int argc, char** argv) {
                             "oracle") == 0;
     const bool pinned_nginx_explicit_buffering_on_baseline_oracle =
         argc == 2 && strcmp(argv[1], "--pinned-nginx-explicit-buffering-on-baseline-oracle") == 0;
+    const bool pinned_nginx_explicit_buffering_off_oracle =
+        argc == 2 && strcmp(argv[1], "--pinned-nginx-explicit-buffering-off-oracle") == 0;
     const bool pinned_nginx_custom_hide_timeout_explicit_buffering_oracle =
         argc == 2 &&
         strcmp(argv[1], "--pinned-nginx-custom-hide-timeout-explicit-buffering-oracle") == 0;
@@ -79679,6 +79908,7 @@ int main(int argc, char** argv) {
          !pinned_nginx_default_buffering_three_publication_completion_oracle &&
          !pinned_nginx_default_buffering_third_body_progress_expiry_oracle &&
          !pinned_nginx_explicit_buffering_on_baseline_oracle &&
+         !pinned_nginx_explicit_buffering_off_oracle &&
          !pinned_nginx_custom_hide_timeout_explicit_buffering_oracle &&
          !pinned_nginx_custom_hide_timeout_two_second_oracle &&
          !pinned_nginx_bodyless_head_delayed_completion_oracle &&
@@ -79980,6 +80210,8 @@ int main(int argc, char** argv) {
                "--pinned-nginx-default-buffering-third-body-progress-expiry-oracle\n"
                "   or: test_nginx_differential "
                "--pinned-nginx-explicit-buffering-on-baseline-oracle\n"
+               "   or: test_nginx_differential "
+               "--pinned-nginx-explicit-buffering-off-oracle\n"
                "   or: test_nginx_differential "
                "--pinned-nginx-default-buffering-201-incomplete-body-inactivity-expiry-oracle\n"
                "   or: test_nginx_differential "
@@ -82205,6 +82437,21 @@ int main(int argc, char** argv) {
             std::cerr << "FAIL [#271 pinned nginx explicit proxy_buffering on baseline]: "
                       << oracle_error << "\n";
             dump_log(temp.nginx_log, "#271 explicit proxy_buffering on baseline nginx log");
+            return 1;
+        }
+        return 0;
+    }
+    if (pinned_nginx_explicit_buffering_off_oracle) {
+        const std::string container_name = "rut-nginx-638-explicit-buffering-off-oracle-" +
+                                           std::to_string(getpid()) + "-" +
+                                           (suffix ? suffix + 1 : "tmp");
+        std::string oracle_error;
+        if (!run_pinned_nginx_explicit_buffering_off_oracle(temp, container_name, oracle_error)) {
+            std::cerr << "FAIL [#638 pinned nginx explicit proxy_buffering off oracle]: "
+                      << oracle_error << "\n";
+            dump_log(temp.nginx_config, "#638 nginx config");
+            dump_log(temp.nginx_access_log, "#638 nginx access log");
+            dump_log(temp.nginx_log, "#638 nginx process log");
             return 1;
         }
         return 0;
