@@ -53659,7 +53659,12 @@ static bool validate_custom_hide_timeout_loaded_program(const std::string& sourc
                                                         u16 backend_port,
                                                         const std::string& access_path,
                                                         const char* custom_name,
-                                                        std::string& error) {
+                                                        std::string& error,
+                                                        unsigned expected_timeout_seconds = 1u) {
+    if (expected_timeout_seconds != 1u && expected_timeout_seconds != 2u) {
+        error = "#627 loaded custom-hide timeout validator received an invalid expected timeout";
+        return false;
+    }
     if (source_path.empty() || captured_stdout.empty() || custom_name == nullptr ||
         custom_name[0] == '\0' || frontend_port == 0u || backend_port == 0u ||
         frontend_port == backend_port || access_path.empty()) {
@@ -53763,7 +53768,8 @@ static bool validate_custom_hide_timeout_loaded_program(const std::string& sourc
             result.next_state == 0u || result.next_state > program->config.policy_bundle_count)
             return false;
         const auto& bundle = program->config.policy_bundles[result.next_state - 1u];
-        if (bundle.response_read_timeout_seconds != 1u || bundle.response_buffering != buffering ||
+        if (bundle.response_read_timeout_seconds != expected_timeout_seconds ||
+            bundle.response_buffering != buffering ||
             !program->config.response_policy_id_is_valid(bundle.response_policy_id) ||
             !program->config.failure_policy_id_is_valid(bundle.failure_policy_id) ||
             !program->config.timeout_failure_policy_id_is_valid(bundle.timeout_failure_policy_id) ||
@@ -53852,6 +53858,40 @@ static bool validate_custom_hide_timeout_loaded_program(const std::string& sourc
                 "] bundles=" + std::to_string(program->config.policy_bundle_count) +
                 " distinct=" + std::to_string(distinct_ok);
         return false;
+    }
+    if (expected_timeout_seconds == 2u) {
+        const u16 get_bundle_id = rg.next_state;
+        if (get_bundle_id == 0u || get_bundle_id > program->config.policy_bundle_count) {
+            error = "#627 loaded 2s timeout validator lacked selected GET bundle";
+            return false;
+        }
+        const auto original_timeout =
+            program->config.policy_bundles[get_bundle_id - 1u].response_read_timeout_seconds;
+        program->config.policy_bundles[get_bundle_id - 1u].response_read_timeout_seconds = 1u;
+        const auto mutated_get = invoke(*get, g, static_cast<u32>(strlen(g)));
+        const bool mutant_rejected =
+            !predicate(*get,
+                       mutated_get,
+                       static_cast<u16>(rut::RequestPolicyId::Http11FixedStrip),
+                       static_cast<u16>(rut::ResponsePolicyHeadMode::Reject),
+                       rut::ForwardResponseBufferingMode::CompleteContentLength);
+        const bool mutant_kept_route_result =
+            mutated_get.action == rg.action && mutated_get.status_code == rg.status_code &&
+            mutated_get.upstream_id == rg.upstream_id && mutated_get.next_state == rg.next_state;
+        program->config.policy_bundles[get_bundle_id - 1u].response_read_timeout_seconds =
+            original_timeout;
+        const auto restored_get = invoke(*get, g, static_cast<u32>(strlen(g)));
+        const bool restored_positive =
+            predicate(*get,
+                      restored_get,
+                      static_cast<u16>(rut::RequestPolicyId::Http11FixedStrip),
+                      static_cast<u16>(rut::ResponsePolicyHeadMode::Reject),
+                      rut::ForwardResponseBufferingMode::CompleteContentLength);
+        if (!mutant_rejected || !mutant_kept_route_result || !restored_positive ||
+            original_timeout != expected_timeout_seconds) {
+            error = "#627 loaded 2s selected GET bundle timeout mutant was not rejected";
+            return false;
+        }
     }
     const auto rejects = [&](rut::jit::HandlerResult bad, const char* label) {
         if (predicate(*get,
@@ -73429,7 +73469,8 @@ static bool run_pinned_nginx_custom_hide_timeout_probe(
                                                          backend_port,
                                                          temp.nginx_access_log,
                                                          custom_hide_name,
-                                                         error))
+                                                         error,
+                                                         timeout_seconds))
             return false;
         if (!handoff_held_loopback_port(
                 &reservations.fds[0], frontend_port, "#270 custom-hide generated RUT", error) ||
@@ -74426,9 +74467,14 @@ static bool run_pinned_nginx_custom_hide_timeout_cli_differential(
     const char* converter_path,
     std::string& error,
     bool boundary_names = false,
-    bool explicit_buffering_on = false) {
+    bool explicit_buffering_on = false,
+    unsigned timeout_seconds = 1u) {
     if (rut_path == nullptr || converter_path == nullptr) {
         error = "#270 custom-hide CLI differential requires RUT and converter executables";
+        return false;
+    }
+    if (timeout_seconds != 1u && timeout_seconds != 2u) {
+        error = "#627 custom-hide CLI differential requires a one- or two-second timeout";
         return false;
     }
     if (boundary_names) {
@@ -74529,7 +74575,8 @@ static bool run_pinned_nginx_custom_hide_timeout_cli_differential(
                                                         &pair,
                                                         &nginx_observation,
                                                         hide_name,
-                                                        explicit_buffering_on))
+                                                        explicit_buffering_on,
+                                                        timeout_seconds))
             return false;
         if (!read_exact_return204_log(pair.temp.nginx_config,
                                       "#270 pair config after nginx",
@@ -74576,7 +74623,8 @@ static bool run_pinned_nginx_custom_hide_timeout_cli_differential(
                                                         &pair,
                                                         &rut_observation,
                                                         hide_name,
-                                                        explicit_buffering_on))
+                                                        explicit_buffering_on,
+                                                        timeout_seconds))
             return false;
         std::string after_rut_config;
         if (!read_exact_return204_log(
@@ -77506,6 +77554,8 @@ int main(int argc, char** argv) {
     const bool converter_custom_hide_timeout_explicit_buffering_cli_differential =
         argc == 4 &&
         strcmp(argv[1], "--converter-custom-hide-timeout-explicit-buffering-cli-differential") == 0;
+    const bool converter_custom_hide_timeout_two_second_cli_differential =
+        argc == 4 && strcmp(argv[1], "--converter-custom-hide-timeout-2s-cli-differential") == 0;
     const bool converter_custom_hide_timeout_boundary_cli_differential =
         argc == 4 &&
         strcmp(argv[1], "--converter-custom-hide-timeout-boundary-cli-differential") == 0;
@@ -77734,6 +77784,7 @@ int main(int argc, char** argv) {
          !pinned_nginx_custom_hide_timeout_completion &&
          !converter_custom_hide_timeout_cli_differential &&
          !converter_custom_hide_timeout_explicit_buffering_cli_differential &&
+         !converter_custom_hide_timeout_two_second_cli_differential &&
          !converter_custom_hide_timeout_boundary_cli_differential &&
          !converter_default_buffering_positive_get_differential &&
          !converter_default_buffering_incomplete_clean_eof_differential &&
@@ -77856,6 +77907,8 @@ int main(int argc, char** argv) {
          (argv[2][0] != '/' || argv[3][0] != '/')) ||
         (converter_custom_hide_timeout_explicit_buffering_cli_differential &&
          (argv[2][0] != '/' || argv[3][0] != '/')) ||
+        (converter_custom_hide_timeout_two_second_cli_differential &&
+         (argv[2][0] != '/' || argv[3][0] != '/')) ||
         (converter_custom_hide_timeout_boundary_cli_differential &&
          (argv[2][0] != '/' || argv[3][0] != '/')) ||
         ((converter_default_buffering_positive_get_differential ||
@@ -77967,6 +78020,9 @@ int main(int argc, char** argv) {
                "   or: test_nginx_differential --pinned-nginx-custom-hide-timeout-2s-oracle\n"
                "   or: test_nginx_differential "
                "--converter-custom-hide-timeout-explicit-buffering-cli-differential "
+               "<absolute-rut-executable> <absolute-converter-executable>\n"
+               "   or: test_nginx_differential "
+               "--converter-custom-hide-timeout-2s-cli-differential "
                "<absolute-rut-executable> <absolute-converter-executable>\n"
                "   or: test_nginx_differential "
                "--converter-explicit-timeout-head-source-self-check\n"
@@ -78470,6 +78526,20 @@ int main(int argc, char** argv) {
             return 1;
         }
         std::cerr << "PASS: #621 same-file explicit proxy_buffering on custom-hide/1s timeout "
+                     "expiry and completion pairs matched pinned nginx and converter-generated "
+                     "ordinary RUT\n";
+        return 0;
+    }
+    if (converter_custom_hide_timeout_two_second_cli_differential) {
+        std::string differential_error;
+        if (!run_pinned_nginx_custom_hide_timeout_cli_differential(
+                argv[2], argv[3], differential_error, false, true, 2u)) {
+            std::cerr << "FAIL [#627 explicit proxy_buffering on custom-hide timeout 2s CLI "
+                         "differential]: "
+                      << differential_error << "\n";
+            return 1;
+        }
+        std::cerr << "PASS: #627 same-file explicit proxy_buffering on custom-hide/2s timeout "
                      "expiry and completion pairs matched pinned nginx and converter-generated "
                      "ordinary RUT\n";
         return 0;
