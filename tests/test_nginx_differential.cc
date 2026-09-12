@@ -54400,16 +54400,22 @@ static bool run_converter_retained_off_source_self_checks(const std::string& sou
     return true;
 }
 
-static bool validate_custom_hide_timeout_loaded_program(const std::string& source_path,
-                                                        const std::string& captured_stdout,
-                                                        u16 frontend_port,
-                                                        u16 backend_port,
-                                                        const std::string& access_path,
-                                                        const char* custom_name,
-                                                        std::string& error,
-                                                        unsigned expected_timeout_seconds = 1u) {
+static bool validate_custom_hide_timeout_loaded_program(
+    const std::string& source_path,
+    const std::string& captured_stdout,
+    u16 frontend_port,
+    u16 backend_port,
+    const std::string& access_path,
+    const char* custom_name,
+    std::string& error,
+    unsigned expected_timeout_seconds = 1u,
+    bool validate_selected_head_controls = false) {
     if (expected_timeout_seconds != 1u && expected_timeout_seconds != 2u) {
         error = "#627 loaded custom-hide timeout validator received an invalid expected timeout";
+        return false;
+    }
+    if (validate_selected_head_controls && expected_timeout_seconds != 2u) {
+        error = "#630 selected HEAD controls require the 2s timeout baseline";
         return false;
     }
     if (source_path.empty() || captured_stdout.empty() || custom_name == nullptr ||
@@ -54605,6 +54611,104 @@ static bool validate_custom_hide_timeout_loaded_program(const std::string& sourc
                 "] bundles=" + std::to_string(program->config.policy_bundle_count) +
                 " distinct=" + std::to_string(distinct_ok);
         return false;
+    }
+    if (validate_selected_head_controls) {
+        static constexpr char kSelectedHeadRequest[] =
+            "HEAD /buffered-timeout?q=1 HTTP/1.1\r\nHost: client.example\r\n\r\n";
+        static_assert(sizeof(kSelectedHeadRequest) - 1u == 61u);
+        const auto selected_head = invoke(
+            *head, kSelectedHeadRequest, static_cast<u32>(sizeof(kSelectedHeadRequest) - 1u));
+        const u16 selected_bundle_id = selected_head.next_state;
+        if (!predicate(*head,
+                       selected_head,
+                       static_cast<u16>(rut::RequestPolicyId::Http11FixedStrip),
+                       static_cast<u16>(rut::ResponsePolicyHeadMode::SuppressBody),
+                       rut::ForwardResponseBufferingMode::None) ||
+            selected_bundle_id == 0u || selected_bundle_id > program->config.policy_bundle_count) {
+            error = "#630 selected HEAD baseline did not resolve a valid bodyless bundle";
+            return false;
+        }
+        auto& selected_bundle = program->config.policy_bundles[selected_bundle_id - 1u];
+        if (!program->config.response_policy_id_is_valid(selected_bundle.response_policy_id)) {
+            error = "#630 selected HEAD bundle response policy id was invalid";
+            return false;
+        }
+        auto& selected_response_policy =
+            program->config.response_policies[selected_bundle.response_policy_id - 1u];
+        const auto same_result_identity = [&](const rut::jit::HandlerResult& result) {
+            return result.action == selected_head.action &&
+                   result.status_code == selected_head.status_code &&
+                   result.upstream_id == selected_head.upstream_id &&
+                   result.next_state == selected_head.next_state;
+        };
+        const u16 selected_response_policy_id = selected_bundle.response_policy_id;
+        const auto selected_timeout = selected_bundle.response_read_timeout_seconds;
+        const auto selected_head_mode = selected_response_policy.head_mode;
+        const auto selected_buffering = selected_bundle.response_buffering;
+        const auto validate_restored_head = [&](const char* label) {
+            const auto restored = invoke(
+                *head, kSelectedHeadRequest, static_cast<u32>(sizeof(kSelectedHeadRequest) - 1u));
+            if (!same_result_identity(restored) ||
+                !predicate(*head,
+                           restored,
+                           static_cast<u16>(rut::RequestPolicyId::Http11FixedStrip),
+                           static_cast<u16>(rut::ResponsePolicyHeadMode::SuppressBody),
+                           rut::ForwardResponseBufferingMode::None) ||
+                program->config.policy_bundles[restored.next_state - 1u].response_policy_id !=
+                    selected_response_policy_id) {
+                error = std::string("#630 selected HEAD restoration failed: ") + label;
+                return false;
+            }
+            return true;
+        };
+        selected_bundle.response_read_timeout_seconds = 1u;
+        const auto timeout_mutant = invoke(
+            *head, kSelectedHeadRequest, static_cast<u32>(sizeof(kSelectedHeadRequest) - 1u));
+        if (predicate(*head,
+                      timeout_mutant,
+                      static_cast<u16>(rut::RequestPolicyId::Http11FixedStrip),
+                      static_cast<u16>(rut::ResponsePolicyHeadMode::SuppressBody),
+                      rut::ForwardResponseBufferingMode::None) ||
+            !same_result_identity(timeout_mutant)) {
+            selected_bundle.response_read_timeout_seconds = selected_timeout;
+            error = "#630 selected HEAD timeout mutant was accepted";
+            return false;
+        }
+        selected_bundle.response_read_timeout_seconds = selected_timeout;
+        if (!validate_restored_head("response_read_timeout")) return false;
+
+        selected_response_policy.head_mode = rut::ResponsePolicyHeadMode::Reject;
+        const auto head_mode_mutant = invoke(
+            *head, kSelectedHeadRequest, static_cast<u32>(sizeof(kSelectedHeadRequest) - 1u));
+        if (predicate(*head,
+                      head_mode_mutant,
+                      static_cast<u16>(rut::RequestPolicyId::Http11FixedStrip),
+                      static_cast<u16>(rut::ResponsePolicyHeadMode::SuppressBody),
+                      rut::ForwardResponseBufferingMode::None) ||
+            !same_result_identity(head_mode_mutant)) {
+            selected_response_policy.head_mode = selected_head_mode;
+            error = "#630 selected HEAD response-policy head_mode mutant was accepted";
+            return false;
+        }
+        selected_response_policy.head_mode = selected_head_mode;
+        if (!validate_restored_head("response_policy.head_mode")) return false;
+
+        selected_bundle.response_buffering =
+            rut::ForwardResponseBufferingMode::CompleteContentLength;
+        const auto buffering_mutant = invoke(
+            *head, kSelectedHeadRequest, static_cast<u32>(sizeof(kSelectedHeadRequest) - 1u));
+        if (predicate(*head,
+                      buffering_mutant,
+                      static_cast<u16>(rut::RequestPolicyId::Http11FixedStrip),
+                      static_cast<u16>(rut::ResponsePolicyHeadMode::SuppressBody),
+                      rut::ForwardResponseBufferingMode::None) ||
+            !same_result_identity(buffering_mutant)) {
+            selected_bundle.response_buffering = selected_buffering;
+            error = "#630 selected HEAD response_buffering mutant was accepted";
+            return false;
+        }
+        selected_bundle.response_buffering = selected_buffering;
+        if (!validate_restored_head("response_buffering")) return false;
     }
     if (expected_timeout_seconds == 2u) {
         const u16 get_bundle_id = rg.next_state;
@@ -75606,6 +75710,270 @@ static bool validate_head_acceptance(const HeadAcceptanceObservation& o,
     return true;
 }
 
+static bool capture_issue630_head_episode(u16 frontend_port,
+                                          u16 backend_port,
+                                          const std::string& access_path,
+                                          Child& frontend,
+                                          KeepAlivePinnedRecorder& origin,
+                                          HeadAcceptanceObservation& accepted,
+                                          std::vector<char>& upstream_wire,
+                                          std::string& error) {
+    static constexpr char kRequest[] =
+        "HEAD /buffered-timeout?q=1 HTTP/1.1\r\nHost: client.example\r\n\r\n";
+    static constexpr char kExpected[] =
+        "HTTP/1.1 200 OK\r\nServer: nginx/1.29.7\r\n"
+        "Date: XXXXXXXXXXXXXXXXXXXXXXXXXXXXX\r\nContent-Length: 12\r\n"
+        "Connection: keep-alive\r\nX-Unrelated: retained\r\n\r\n";
+    static_assert(sizeof(kExpected) - 1u == 145u);
+    struct RecorderStopGuard {
+        KeepAlivePinnedRecorder& recorder;
+        ~RecorderStopGuard() { recorder.stop(); }
+    } recorder_stop{origin};
+    int client = connect_once(frontend_port);
+    if (client < 0 || !send_all(client, kRequest, sizeof(kRequest) - 1u)) {
+        error = "#630 HEAD request send failed";
+        if (client >= 0) close(client);
+        return false;
+    }
+    const auto request_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+    while (origin.requests.load(std::memory_order_acquire) != 1u &&
+           std::chrono::steady_clock::now() < request_deadline) {
+        bool eof = false;
+        if (!wait_keepalive_quiet_or_eof(client, 50, eof, error) || eof) {
+            error = eof ? "#630 downstream closed before header completion"
+                        : "#630 downstream was not quiet before 1s";
+            close(client);
+            return false;
+        }
+    }
+    if (origin.accepted.load(std::memory_order_acquire) != 1u ||
+        origin.requests.load(std::memory_order_acquire) != 1u) {
+        error = "#630 pre-permit origin did not observe one complete request";
+        close(client);
+        return false;
+    }
+    // This is the explicit custody/open ACK: only after the real quiet window,
+    // one accepted request, and an empty access ledger may the origin publish.
+    std::string prepermit_access;
+    if (!read_request_length_access_file(access_path, prepermit_access, error) ||
+        !prepermit_access.empty()) {
+        error = "#630 pre-permit access ledger was not empty";
+        close(client);
+        return false;
+    }
+    const u64 request_ns = origin.request_complete_ns[0].load(std::memory_order_acquire);
+    const u64 permit_target_ns = request_ns + 1'200'000'000ull;
+    while (steady_now_ns() < permit_target_ns) {
+        bool eof = false;
+        if (!wait_keepalive_quiet_or_eof(client, 50, eof, error) || eof) {
+            error = "#630 custody lost before near-permit ACK";
+            close(client);
+            return false;
+        }
+        std::string sample;
+        if (!read_request_length_access_file(access_path, sample, error) || !sample.empty() ||
+            origin.head_publication_ns.load(std::memory_order_acquire) != 0u ||
+            origin.requests.load(std::memory_order_acquire) != 1u) {
+            error = "#630 pre-permit custody/publication/ledger control failed";
+            close(client);
+            return false;
+        }
+    }
+    origin.head_probe_request.store(true, std::memory_order_release);
+    const auto ack_deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(100);
+    while (origin.head_probe_ack_ns.load(std::memory_order_acquire) == 0u &&
+           std::chrono::steady_clock::now() < ack_deadline) {
+        if (!observe_client_open_and_quiet_nonconsuming(client, 10, error)) {
+            error = "#630 near-permit ACK lost downstream open/quiet custody";
+            close(client);
+            return false;
+        }
+        std::string sample;
+        if (!read_request_length_access_file(access_path, sample, error) || !sample.empty() ||
+            origin.head_publication_ns.load(std::memory_order_acquire) != 0u ||
+            origin.accepted.load(std::memory_order_acquire) != 1u ||
+            origin.requests.load(std::memory_order_acquire) != 1u ||
+            origin.response_send_failed.load(std::memory_order_acquire) ||
+            origin.listener_failed.load(std::memory_order_acquire) ||
+            !origin.thread_alive.load(std::memory_order_acquire)) {
+            error = "#630 near-permit ACK custody/liveness control failed";
+            close(client);
+            return false;
+        }
+    }
+    const u64 ack_ns = origin.head_probe_ack_ns.load(std::memory_order_acquire);
+    if (ack_ns == 0u || ack_ns < permit_target_ns || ack_ns >= steady_now_ns()) {
+        error = "#630 near-permit origin peer-open probe ACK missing";
+        close(client);
+        return false;
+    }
+    // Do not let a fast ACK bypass the complete final custody check.
+    {
+        bool ack_quiet = false;
+        if (!wait_keepalive_quiet_or_eof(client, 1, ack_quiet, error) || ack_quiet) {
+            error = "#630 immediate post-ACK downstream custody failed";
+            close(client);
+            return false;
+        }
+        std::string sample;
+        if (!read_request_length_access_file(access_path, sample, error) || !sample.empty() ||
+            origin.head_publication_ns.load(std::memory_order_acquire) != 0u ||
+            origin.accepted.load(std::memory_order_acquire) != 1u ||
+            origin.requests.load(std::memory_order_acquire) != 1u ||
+            origin.response_send_failed.load(std::memory_order_acquire) ||
+            origin.listener_failed.load(std::memory_order_acquire) ||
+            origin.first_peer_unexpected_data.load(std::memory_order_acquire) ||
+            origin.first_peer_observation_failed.load(std::memory_order_acquire) ||
+            !origin.thread_alive.load(std::memory_order_acquire) || poll_child(frontend)) {
+            error = "#630 immediate post-ACK custody/liveness control failed";
+            close(client);
+            return false;
+        }
+    }
+    origin.head_publish_permit.store(true, std::memory_order_release);
+    const u64 publication_wait = steady_now_ns() + 2'000'000'000ull;
+    std::vector<char> response;
+    u64 header_complete_ns = 0u;
+    while (steady_now_ns() < publication_wait) {
+        pollfd p{client, POLLIN | POLLHUP | POLLERR, 0};
+        if (poll(&p, 1, 25) < 0 && errno == EINTR) continue;
+        char buf[1024];
+        const ssize_t n = recv(client, buf, sizeof(buf), MSG_DONTWAIT);
+        if (n > 0) {
+            response.insert(response.end(), buf, buf + n);
+            const size_t end = header_end(response);
+            if (end != 0u) {
+                header_complete_ns = steady_now_ns();
+                if (response.size() != end) {
+                    error = "#630 HEAD publication included representation bytes";
+                    close(client);
+                    return false;
+                }
+                break;
+            }
+        } else if (n < 0 && errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR)
+            break;
+    }
+    const u64 publication_ns = origin.head_publication_ns.load();
+    if (header_complete_ns == 0u || publication_ns == 0u || header_complete_ns < publication_ns ||
+        header_complete_ns - publication_ns >= 350'000'000ull ||
+        !validate_exact_normalized_response(response, kExpected, error)) {
+        if (error.empty()) error = "#630 delayed HEAD header publication mismatch/timing";
+        close(client);
+        return false;
+    }
+    const u64 ledger_deadline = header_complete_ns + 250'000'000ull;
+    std::string access;
+    u64 access_ns = 0u;
+    bool ledger_seen = false;
+    while (steady_now_ns() < ledger_deadline) {
+        std::string sample;
+        if (!read_request_length_access_file(access_path, sample, error)) {
+            close(client);
+            return false;
+        }
+        if (sample == "61\n") {
+            access = sample;
+            ledger_seen = true;
+            access_ns = steady_now_ns();
+            break;
+        }
+        if (!sample.empty()) {
+            error = "#630 access ledger published a non-exact value";
+            close(client);
+            return false;
+        }
+        usleep(1000);
+    }
+    if (!ledger_seen) {
+        error = "#630 access ledger missed the header-completion anchor window";
+        close(client);
+        return false;
+    }
+    const u64 stable_deadline = header_complete_ns + 2'250'000'000ull;
+    u64 quiet_until_ns = 0u;
+    while (steady_now_ns() < stable_deadline) {
+        if (!observe_client_open_and_quiet_nonconsuming(client, 50, error) ||
+            poll_child(frontend) || !origin.thread_alive.load(std::memory_order_acquire)) {
+            error = "#630 downstream emitted body/tail or closed during keep-alive observation";
+            close(client);
+            return false;
+        }
+        std::string sample;
+        if (!read_request_length_access_file(access_path, sample, error) || sample != "61\n") {
+            error = "#630 access ledger was not stably exact through the quiet window";
+            close(client);
+            return false;
+        }
+        if (origin.response_send_failed.load() || origin.listener_failed.load() ||
+            origin.first_peer_unexpected_data.load() ||
+            origin.first_peer_observation_failed.load()) {
+            error = "#630 origin reported send/listener/protocol custody failure";
+            close(client);
+            return false;
+        }
+        quiet_until_ns = steady_now_ns();
+    }
+    const std::string expected_upstream =
+        std::string("HEAD /buffered-timeout?q=1 HTTP/1.1\r\nHost: 127.0.0.1:") +
+        std::to_string(backend_port) + "\r\n\r\n";
+    const auto retire_deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(350);
+    while (!origin.first_peer_closed.load() && std::chrono::steady_clock::now() < retire_deadline)
+        usleep(1000);
+    const u64 retirement_ns = origin.first_peer_closed_ns.load();
+    std::string final_access;
+    std::string final_detail;
+    const bool final_quiet = observe_client_open_and_quiet_nonconsuming(client, 50, final_detail);
+    const u64 final_quiet_until_ns = final_quiet ? steady_now_ns() : quiet_until_ns;
+    const bool final_ledger_ok =
+        read_request_length_access_file(access_path, final_access, final_detail) &&
+        final_access == "61\n";
+    HeadAcceptanceObservation actual;
+    actual.origin_ns = origin.request_complete_ns[0].load(std::memory_order_acquire);
+    actual.publication_ns = publication_ns;
+    actual.header_ns = header_complete_ns;
+    actual.retirement_ns = retirement_ns;
+    actual.wire = response;
+    actual.access = final_access;
+    actual.access_ns = access_ns;
+    actual.quiet_until_ns = final_quiet_until_ns;
+    actual.accepted = origin.accepted.load(std::memory_order_acquire);
+    actual.requests = origin.requests.load(std::memory_order_acquire);
+    actual.publication_count = origin.head_publication_count.load(std::memory_order_acquire);
+    actual.retirement_count = origin.head_peer_close_count.load(std::memory_order_acquire);
+    actual.response_send_calls = origin.response_send_calls.load(std::memory_order_acquire);
+    actual.response_bytes_sent = origin.response_bytes_sent.load(std::memory_order_acquire);
+    actual.downstream_open = final_quiet;
+    actual.downstream_eof = false;
+    actual.response_send_failed = origin.response_send_failed.load(std::memory_order_acquire);
+    actual.listener_failed = origin.listener_failed.load(std::memory_order_acquire);
+    actual.unexpected_data = origin.first_peer_unexpected_data.load(std::memory_order_acquire);
+    actual.observation_failed =
+        origin.first_peer_observation_failed.load(std::memory_order_acquire);
+    std::string acceptance_detail;
+    const bool ok = validate_head_acceptance(actual, kExpected, acceptance_detail);
+    const bool live_snapshot_ok =
+        final_quiet && final_ledger_ok && origin.thread_alive.load(std::memory_order_acquire) &&
+        !origin.listener_failed.load(std::memory_order_acquire) && !poll_child(frontend);
+    if (!ok || !live_snapshot_ok) {
+        close(client);
+        if (error.empty())
+            error = "#630 origin retirement/request/access evidence mismatch: " + acceptance_detail;
+        return false;
+    }
+    accepted = actual;
+    close(client);
+    origin.stop();
+    if (origin.history.size() != 1u ||
+        std::string(origin.history[0].wire.begin(), origin.history[0].wire.end()) !=
+            expected_upstream ||
+        origin.history[0].wire.size() != 61u) {
+        error = "#630 upstream request wire mismatch";
+        return false;
+    }
+    upstream_wire = origin.history[0].wire;
+    return true;
+}
 // #630 pinned-only oracle: a fresh bodyless HEAD remains quiet until the
 // complete upstream header is published, then retires that origin promptly.
 static bool run_pinned_nginx_bodyless_head_delayed_completion_oracle(std::string& error) {
@@ -75702,13 +76070,6 @@ static bool run_pinned_nginx_bodyless_head_delayed_completion_oracle(std::string
         error = "#630 synthetic restored positive acceptance failed: " + control_detail;
         return false;
     }
-    static constexpr char kRequest[] =
-        "HEAD /buffered-timeout?q=1 HTTP/1.1\r\nHost: client.example\r\n\r\n";
-    static constexpr char kExpected[] =
-        "HTTP/1.1 200 OK\r\nServer: nginx/1.29.7\r\n"
-        "Date: XXXXXXXXXXXXXXXXXXXXXXXXXXXXX\r\nContent-Length: 12\r\n"
-        "Connection: keep-alive\r\nX-Unrelated: retained\r\n\r\n";
-    static_assert(sizeof(kExpected) - 1u == 145u);
     TempDir temp;
     HeldLoopbackPorts reservations;
     u16 frontend = 0u, backend = 0u;
@@ -75757,251 +76118,21 @@ static bool run_pinned_nginx_bodyless_head_delayed_completion_oracle(std::string
                      nginx.child) ||
         !wait_ready(frontend, nginx.child, error))
         return false;
-    int client = connect_once(frontend);
-    if (client < 0 || !send_all(client, kRequest, sizeof(kRequest) - 1u)) {
-        error = "#630 HEAD request send failed";
-        if (client >= 0) close(client);
+    HeadAcceptanceObservation accepted{};
+    std::vector<char> upstream_wire;
+    if (!capture_issue630_head_episode(frontend,
+                                       backend,
+                                       temp.nginx_access_log,
+                                       nginx.child,
+                                       origin,
+                                       accepted,
+                                       upstream_wire,
+                                       error))
         return false;
-    }
-    const auto request_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
-    while (origin.requests.load(std::memory_order_acquire) != 1u &&
-           std::chrono::steady_clock::now() < request_deadline) {
-        bool eof = false;
-        if (!wait_keepalive_quiet_or_eof(client, 50, eof, error) || eof) {
-            error = eof ? "#630 downstream closed before header completion"
-                        : "#630 downstream was not quiet before 1s";
-            close(client);
-            return false;
-        }
-    }
-    if (origin.accepted.load(std::memory_order_acquire) != 1u ||
-        origin.requests.load(std::memory_order_acquire) != 1u) {
-        error = "#630 pre-permit origin did not observe one complete request";
-        close(client);
-        return false;
-    }
-    // This is the explicit custody/open ACK: only after the real quiet window,
-    // one accepted request, and an empty access ledger may the origin publish.
-    std::string prepermit_access;
-    if (!read_request_length_access_file(temp.nginx_access_log, prepermit_access, error) ||
-        !prepermit_access.empty()) {
-        error = "#630 pre-permit access ledger was not empty";
-        close(client);
-        return false;
-    }
-    const u64 request_ns = origin.request_complete_ns[0].load(std::memory_order_acquire);
-    const u64 permit_target_ns = request_ns + 1'200'000'000ull;
-    while (steady_now_ns() < permit_target_ns) {
-        bool eof = false;
-        if (!wait_keepalive_quiet_or_eof(client, 50, eof, error) || eof) {
-            error = "#630 custody lost before near-permit ACK";
-            close(client);
-            return false;
-        }
-        std::string sample;
-        if (!read_request_length_access_file(temp.nginx_access_log, sample, error) ||
-            !sample.empty() || origin.head_publication_ns.load(std::memory_order_acquire) != 0u ||
-            origin.requests.load(std::memory_order_acquire) != 1u) {
-            error = "#630 pre-permit custody/publication/ledger control failed";
-            close(client);
-            return false;
-        }
-    }
-    origin.head_probe_request.store(true, std::memory_order_release);
-    const auto ack_deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(100);
-    while (origin.head_probe_ack_ns.load(std::memory_order_acquire) == 0u &&
-           std::chrono::steady_clock::now() < ack_deadline) {
-        if (!observe_client_open_and_quiet_nonconsuming(client, 10, error)) {
-            error = "#630 near-permit ACK lost downstream open/quiet custody";
-            close(client);
-            return false;
-        }
-        std::string sample;
-        if (!read_request_length_access_file(temp.nginx_access_log, sample, error) ||
-            !sample.empty() || origin.head_publication_ns.load(std::memory_order_acquire) != 0u ||
-            origin.accepted.load(std::memory_order_acquire) != 1u ||
-            origin.requests.load(std::memory_order_acquire) != 1u ||
-            origin.response_send_failed.load(std::memory_order_acquire) ||
-            origin.listener_failed.load(std::memory_order_acquire) ||
-            !origin.thread_alive.load(std::memory_order_acquire)) {
-            error = "#630 near-permit ACK custody/liveness control failed";
-            close(client);
-            return false;
-        }
-    }
-    const u64 ack_ns = origin.head_probe_ack_ns.load(std::memory_order_acquire);
-    if (ack_ns == 0u || ack_ns < permit_target_ns || ack_ns >= steady_now_ns()) {
-        error = "#630 near-permit origin peer-open probe ACK missing";
-        close(client);
-        return false;
-    }
-    // Do not let a fast ACK bypass the complete final custody check.
-    {
-        bool ack_quiet = false;
-        if (!wait_keepalive_quiet_or_eof(client, 1, ack_quiet, error) || ack_quiet) {
-            error = "#630 immediate post-ACK downstream custody failed";
-            close(client);
-            return false;
-        }
-        std::string sample;
-        if (!read_request_length_access_file(temp.nginx_access_log, sample, error) ||
-            !sample.empty() || origin.head_publication_ns.load(std::memory_order_acquire) != 0u ||
-            origin.accepted.load(std::memory_order_acquire) != 1u ||
-            origin.requests.load(std::memory_order_acquire) != 1u ||
-            origin.response_send_failed.load(std::memory_order_acquire) ||
-            origin.listener_failed.load(std::memory_order_acquire) ||
-            origin.first_peer_unexpected_data.load(std::memory_order_acquire) ||
-            origin.first_peer_observation_failed.load(std::memory_order_acquire) ||
-            !origin.thread_alive.load(std::memory_order_acquire) || poll_child(nginx.child)) {
-            error = "#630 immediate post-ACK custody/liveness control failed";
-            close(client);
-            return false;
-        }
-    }
-    origin.head_publish_permit.store(true, std::memory_order_release);
-    const u64 publication_wait = steady_now_ns() + 2'000'000'000ull;
-    std::vector<char> response;
-    u64 header_complete_ns = 0u;
-    while (steady_now_ns() < publication_wait) {
-        pollfd p{client, POLLIN | POLLHUP | POLLERR, 0};
-        if (poll(&p, 1, 25) < 0 && errno == EINTR) continue;
-        char buf[1024];
-        const ssize_t n = recv(client, buf, sizeof(buf), MSG_DONTWAIT);
-        if (n > 0) {
-            response.insert(response.end(), buf, buf + n);
-            const size_t end = header_end(response);
-            if (end != 0u) {
-                header_complete_ns = steady_now_ns();
-                if (response.size() != end) {
-                    error = "#630 HEAD publication included representation bytes";
-                    close(client);
-                    return false;
-                }
-                break;
-            }
-        } else if (n < 0 && errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR)
-            break;
-    }
-    const u64 publication_ns = origin.head_publication_ns.load();
-    if (header_complete_ns == 0u || publication_ns == 0u || header_complete_ns < publication_ns ||
-        header_complete_ns - publication_ns >= 350'000'000ull ||
-        !validate_exact_normalized_response(response, kExpected, error)) {
-        if (error.empty()) error = "#630 delayed HEAD header publication mismatch/timing";
-        close(client);
-        return false;
-    }
-    const u64 ledger_deadline = header_complete_ns + 250'000'000ull;
-    std::string access;
-    u64 access_ns = 0u;
-    bool ledger_seen = false;
-    while (steady_now_ns() < ledger_deadline) {
-        std::string sample;
-        if (!read_request_length_access_file(temp.nginx_access_log, sample, error)) {
-            close(client);
-            return false;
-        }
-        if (sample == "61\n") {
-            access = sample;
-            ledger_seen = true;
-            access_ns = steady_now_ns();
-            break;
-        }
-        if (!sample.empty()) {
-            error = "#630 access ledger published a non-exact value";
-            close(client);
-            return false;
-        }
-        usleep(1000);
-    }
-    if (!ledger_seen) {
-        error = "#630 access ledger missed the header-completion anchor window";
-        close(client);
-        return false;
-    }
-    const u64 stable_deadline = header_complete_ns + 2'250'000'000ull;
-    u64 quiet_until_ns = 0u;
-    while (steady_now_ns() < stable_deadline) {
-        if (!observe_client_open_and_quiet_nonconsuming(client, 50, error) ||
-            poll_child(nginx.child) || !origin.thread_alive.load(std::memory_order_acquire)) {
-            error = "#630 downstream emitted body/tail or closed during keep-alive observation";
-            close(client);
-            return false;
-        }
-        std::string sample;
-        if (!read_request_length_access_file(temp.nginx_access_log, sample, error) ||
-            sample != "61\n") {
-            error = "#630 access ledger was not stably exact through the quiet window";
-            close(client);
-            return false;
-        }
-        if (origin.response_send_failed.load() || origin.listener_failed.load() ||
-            origin.first_peer_unexpected_data.load() ||
-            origin.first_peer_observation_failed.load()) {
-            error = "#630 origin reported send/listener/protocol custody failure";
-            close(client);
-            return false;
-        }
-        quiet_until_ns = steady_now_ns();
-    }
-    const std::string expected_upstream =
-        std::string("HEAD /buffered-timeout?q=1 HTTP/1.1\r\nHost: 127.0.0.1:") +
-        std::to_string(backend) + "\r\n\r\n";
-    const auto retire_deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(350);
-    while (!origin.first_peer_closed.load() && std::chrono::steady_clock::now() < retire_deadline)
-        usleep(1000);
-    const u64 retirement_ns = origin.first_peer_closed_ns.load();
-    std::string final_access;
-    std::string final_detail;
-    const bool final_quiet = observe_client_open_and_quiet_nonconsuming(client, 50, final_detail);
-    const u64 final_quiet_until_ns = final_quiet ? steady_now_ns() : quiet_until_ns;
-    const bool final_ledger_ok =
-        read_request_length_access_file(temp.nginx_access_log, final_access, final_detail) &&
-        final_access == "61\n";
-    HeadAcceptanceObservation actual;
-    actual.origin_ns = origin.request_complete_ns[0].load(std::memory_order_acquire);
-    actual.publication_ns = publication_ns;
-    actual.header_ns = header_complete_ns;
-    actual.retirement_ns = retirement_ns;
-    actual.wire = response;
-    actual.access = final_access;
-    actual.access_ns = access_ns;
-    actual.quiet_until_ns = final_quiet_until_ns;
-    actual.accepted = origin.accepted.load(std::memory_order_acquire);
-    actual.requests = origin.requests.load(std::memory_order_acquire);
-    actual.publication_count = origin.head_publication_count.load(std::memory_order_acquire);
-    actual.retirement_count = origin.head_peer_close_count.load(std::memory_order_acquire);
-    actual.response_send_calls = origin.response_send_calls.load(std::memory_order_acquire);
-    actual.response_bytes_sent = origin.response_bytes_sent.load(std::memory_order_acquire);
-    actual.downstream_open = final_quiet;
-    actual.downstream_eof = false;
-    actual.response_send_failed = origin.response_send_failed.load(std::memory_order_acquire);
-    actual.listener_failed = origin.listener_failed.load(std::memory_order_acquire);
-    actual.unexpected_data = origin.first_peer_unexpected_data.load(std::memory_order_acquire);
-    actual.observation_failed =
-        origin.first_peer_observation_failed.load(std::memory_order_acquire);
-    std::string acceptance_detail;
-    const bool ok = validate_head_acceptance(actual, kExpected, acceptance_detail);
-    const bool live_snapshot_ok =
-        final_quiet && final_ledger_ok && origin.thread_alive.load(std::memory_order_acquire) &&
-        !origin.listener_failed.load(std::memory_order_acquire) && !poll_child(nginx.child);
-    close(client);
-    origin.stop();
-    if (origin.history.size() != 1u ||
-        std::string(origin.history[0].wire.begin(), origin.history[0].wire.end()) !=
-            expected_upstream ||
-        origin.history[0].wire.size() != 61u) {
-        error = "#630 upstream request wire mismatch";
-        return false;
-    }
     const bool cleanup_ok = stop_child(nginx.child) && docker.remove();
-    if (!ok || !live_snapshot_ok || !cleanup_ok) {
-        if (error.empty())
-            error = "#630 origin retirement/request/access evidence mismatch: " + acceptance_detail;
-        return false;
-    }
-    std::cerr << "PASS evidence: #630 HEAD header anchor/retirement ns=" << publication_ns << "/"
-              << header_complete_ns << "/" << origin.first_peer_closed_ns.load()
-              << " ledger=61\\n\n";
+    if (!cleanup_ok) return false;
+    std::cerr << "PASS evidence: #630 HEAD header anchor/retirement ns=" << accepted.publication_ns
+              << "/" << accepted.header_ns << "/" << accepted.retirement_ns << " ledger=61\\n\\n";
     return true;
 }
 
@@ -78891,6 +79022,198 @@ static bool run_pinned_positive_cl_head_default_buffering_oracle(
     return true;
 }
 
+static bool run_issue630_head_same_file_pair(const char* rut_path,
+                                             const char* converter_path,
+                                             std::string& error) {
+    if (rut_path == nullptr || converter_path == nullptr || rut_path[0] != '/' ||
+        converter_path[0] != '/' || access(rut_path, X_OK) != 0 ||
+        access(converter_path, X_OK) != 0) {
+        error = "#630 pair requires absolute executable RUT and converter paths";
+        return false;
+    }
+    TempDir temp;
+    HeldLoopbackPorts ports;
+    u16 frontend = 0u, backend = 0u;
+    if (!temp.create() || !ports.reserve_four_digit(0u, frontend) ||
+        !ports.reserve_four_digit(1u, backend) || frontend == backend) {
+        error = "#630 pair could not allocate isolated resources";
+        return false;
+    }
+    // Keep the exact oracle grammar/path, including no URI suffix and IPv4 loopback.
+    const std::string exact_config =
+        "events {}\nhttp {\n  log_format compat \"$request_length\";\n  access_log " +
+        temp.nginx_access_log +
+        " compat;\n  server {\n    listen 127.0.0.1:" + std::to_string(frontend) +
+        ";\n    location / {\n      proxy_pass http://127.0.0.1:" + std::to_string(backend) +
+        ";\n      proxy_buffering on;\n      proxy_hide_header X-Powered-By;\n      "
+        "proxy_read_timeout 2s;\n    }\n  }\n}\n";
+    if (!write_file(temp.nginx_config, exact_config.data(), exact_config.size())) {
+        error = "#630 pair could not persist immutable config";
+        return false;
+    }
+    auto run_episode = [&](bool nginx_side,
+                           HeadAcceptanceObservation& observation,
+                           std::vector<char>& wire) {
+        KeepAlivePinnedRecorder origin(
+            KeepAlivePinnedRecorder::FirstResponseMode::DelayedHeadComplete);
+        ChildGuard child;
+        DockerGuard docker("rut-nginx-630-head-pair-" + std::to_string(getpid()));
+        if (!nginx_side) docker.active = false;
+        if (!handoff_held_loopback_port(&ports.fds[1], backend, "#630 pair origin bind", error) ||
+            !origin.setup(backend))
+            return false;
+        if (nginx_side) {
+            if (!handoff_held_loopback_port(
+                    &ports.fds[0], frontend, "#630 pair nginx bind", error) ||
+                !spawn_child({"docker",
+                              "run",
+                              "--pull=never",
+                              "--network",
+                              "host",
+                              "--name",
+                              docker.name,
+                              "-v",
+                              std::string(temp.path) + ":" + temp.path,
+                              "-v",
+                              temp.nginx_config + ":/etc/nginx/nginx.conf:ro",
+                              kNginxImage,
+                              "nginx",
+                              "-g",
+                              "daemon off;"},
+                             temp.nginx_log,
+                             child.child) ||
+                !wait_ready(frontend, child.child, error))
+                return false;
+        } else {
+            int out = open(temp.source.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0600);
+            const std::string converter_diagnostics = temp.rut_log + ".converter";
+            int errfd = open(converter_diagnostics.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0600);
+            if (out < 0 || errfd < 0) {
+                if (out >= 0) close(out);
+                if (errfd >= 0) close(errfd);
+                error = "#630 converter output open failed";
+                return false;
+            }
+            pid_t pid = fork();
+            if (pid == 0) {
+                if (dup2(out, STDOUT_FILENO) < 0 || dup2(errfd, STDERR_FILENO) < 0) _exit(127);
+                close(out);
+                close(errfd);
+                execl(converter_path,
+                      converter_path,
+                      "--format",
+                      "nginx-http",
+                      temp.nginx_config.c_str(),
+                      nullptr);
+                _exit(127);
+            }
+            close(out);
+            close(errfd);
+            if (pid < 0) {
+                error = "#630 converter fork failed";
+                return false;
+            }
+            ChildGuard converter_guard;
+            converter_guard.child.pid = pid;
+            if (!wait_child(converter_guard.child, 10000) || !converter_guard.child.status_valid ||
+                !WIFEXITED(converter_guard.child.status) ||
+                WEXITSTATUS(converter_guard.child.status) != 0) {
+                error = "#630 converter failed";
+                return false;
+            }
+            std::string source, diagnostics;
+            if (!read_exact_rut_source(temp.source, "#630 generated source", source, error) ||
+                source.empty() || !read_bounded_file(converter_diagnostics, diagnostics, error) ||
+                !diagnostics.empty() ||
+                !validate_custom_hide_timeout_loaded_program(temp.source,
+                                                             source,
+                                                             frontend,
+                                                             backend,
+                                                             temp.nginx_access_log,
+                                                             "X-Powered-By",
+                                                             error,
+                                                             2u,
+                                                             true))
+                return false;
+            if (!handoff_held_loopback_port(&ports.fds[0], frontend, "#630 pair RUT bind", error) ||
+                !spawn_child({rut_path, temp.source, "--shards", "1", "--no-pin", "--drain", "0"},
+                             temp.rut_log,
+                             child.child) ||
+                !wait_ready(frontend, child.child, error))
+                return false;
+            const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+            const std::string listener =
+                "Listening on port " + std::to_string(frontend) + " with 1 shard(s)\n";
+            while ((!log_contains(temp.rut_log, "Backend: io_uring\n") ||
+                    !log_contains(temp.rut_log, listener.c_str())) &&
+                   std::chrono::steady_clock::now() < deadline) {
+                if (poll_child(child.child)) {
+                    error = "#630 RUT exited before readiness";
+                    return false;
+                }
+                usleep(1000);
+            }
+            if (!log_contains(temp.rut_log, "Backend: io_uring\n") ||
+                !log_contains(temp.rut_log, listener.c_str())) {
+                error = "#630 RUT lacked io_uring/listener readiness";
+                return false;
+            }
+        }
+        if (!capture_issue630_head_episode(frontend,
+                                           backend,
+                                           temp.nginx_access_log,
+                                           child.child,
+                                           origin,
+                                           observation,
+                                           wire,
+                                           error))
+            return false;
+        if (!stop_child(child.child)) return false;
+        if (nginx_side && !docker.remove()) return false;
+        return true;
+    };
+    HeadAcceptanceObservation nginx_obs{}, rut_obs{};
+    std::vector<char> nginx_wire, rut_wire;
+    if (!run_episode(true, nginx_obs, nginx_wire)) return false;
+    std::string frozen_config;
+    if (!read_exact_return204_log(temp.nginx_config, "#630 config", frozen_config, error) ||
+        frozen_config != exact_config ||
+        rename(temp.nginx_access_log.c_str(), temp.nginx_access_snapshot.c_str()) != 0 ||
+        !read_exact_return204_log(
+            temp.nginx_access_snapshot, "#630 ledger", frozen_config, error) ||
+        frozen_config != "61\n" || !write_file(temp.nginx_access_log, "", 0u)) {
+        error = "#630 nginx artifacts were not frozen exactly";
+        return false;
+    }
+    if (!ports.reserve_specific(0u, frontend) || !ports.reserve_specific(1u, backend)) {
+        error = "#630 pair could not renew the same ports";
+        return false;
+    }
+    if (!run_episode(false, rut_obs, rut_wire)) return false;
+    auto nginx_response = nginx_obs.wire;
+    auto rut_response = rut_obs.wire;
+    if (!normalize_date(nginx_response) || !normalize_date(rut_response) ||
+        nginx_response != rut_response || nginx_wire != rut_wire ||
+        nginx_obs.access != rut_obs.access || nginx_obs.accepted != rut_obs.accepted ||
+        nginx_obs.requests != rut_obs.requests ||
+        nginx_obs.publication_count != rut_obs.publication_count ||
+        nginx_obs.retirement_count != rut_obs.retirement_count) {
+        error = "#630 same-file nginx/RUT HEAD observations differed";
+        return false;
+    }
+    std::string archived_ledger;
+    if (!read_exact_return204_log(temp.nginx_config, "#630 final config", frozen_config, error) ||
+        frozen_config != exact_config ||
+        !read_exact_return204_log(
+            temp.nginx_access_snapshot, "#630 archived ledger", archived_ledger, error) ||
+        archived_ledger != "61\n") {
+        error = "#630 immutable nginx artifact changed after pair";
+        return false;
+    }
+    std::cerr << "PASS: #630 same-file nginx/generated-RUT delayed bodyless HEAD pair matched\n";
+    return true;
+}
+
 int main(int argc, char** argv) {
     const bool nginx_preload_loader_preflight =
         argc == 3 && strcmp(argv[1], "--nginx-preload-loader-preflight") == 0;
@@ -78934,6 +79257,8 @@ int main(int argc, char** argv) {
         argc == 2 && strcmp(argv[1], "--converter-explicit-timeout-head-source-self-check") == 0;
     const bool explicit_timeout_head_generated_episode =
         argc == 3 && strcmp(argv[1], "--converter-explicit-timeout-head-generated-episode") == 0;
+    const bool issue630_head_same_file_pair =
+        argc == 4 && strcmp(argv[1], "--converter-issue630-head-same-file-pair") == 0;
     const bool explicit_timeout_head_phase_differential =
         argc == 3 && strcmp(argv[1], "--explicit-timeout-head-phase-differential") == 0;
     const bool keepalive_timeout_head_differential =
@@ -79333,6 +79658,7 @@ int main(int argc, char** argv) {
          !converter_custom_hide_timeout_cli_differential &&
          !converter_custom_hide_timeout_explicit_buffering_cli_differential &&
          !converter_custom_hide_timeout_two_second_cli_differential &&
+         !issue630_head_same_file_pair &&
          !converter_custom_hide_timeout_boundary_cli_differential &&
          !converter_default_buffering_positive_get_differential &&
          !converter_default_buffering_incomplete_clean_eof_differential &&
@@ -79458,6 +79784,7 @@ int main(int argc, char** argv) {
          (argv[2][0] != '/' || argv[3][0] != '/')) ||
         (converter_custom_hide_timeout_two_second_cli_differential &&
          (argv[2][0] != '/' || argv[3][0] != '/')) ||
+        (issue630_head_same_file_pair && (argv[2][0] != '/' || argv[3][0] != '/')) ||
         (converter_custom_hide_timeout_boundary_cli_differential &&
          (argv[2][0] != '/' || argv[3][0] != '/')) ||
         ((converter_default_buffering_positive_get_differential ||
@@ -79575,6 +79902,8 @@ int main(int argc, char** argv) {
                "<absolute-rut-executable> <absolute-converter-executable>\n"
                "   or: test_nginx_differential "
                "--converter-custom-hide-timeout-2s-cli-differential "
+               "<absolute-rut-executable> <absolute-converter-executable>\n"
+               "   or: test_nginx_differential --converter-issue630-head-same-file-pair "
                "<absolute-rut-executable> <absolute-converter-executable>\n"
                "   or: test_nginx_differential "
                "--converter-explicit-timeout-head-source-self-check\n"
@@ -80053,6 +80382,14 @@ int main(int argc, char** argv) {
         }
         std::cerr << "PASS: #627 pinned nginx explicit-on custom-hide 2s expiry/completion "
                      "oracle observed the exact bodyless-GET wire and timing windows\n";
+        return 0;
+    }
+    if (issue630_head_same_file_pair) {
+        std::string pair_error;
+        if (!run_issue630_head_same_file_pair(argv[2], argv[3], pair_error)) {
+            std::cerr << "FAIL [#630 same-file HEAD pair]: " << pair_error << "\n";
+            return 1;
+        }
         return 0;
     }
     if (pinned_nginx_bodyless_head_delayed_completion_oracle) {
