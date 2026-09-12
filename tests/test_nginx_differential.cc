@@ -78950,6 +78950,7 @@ static bool run_issue630_head_same_file_pair(const char* rut_path,
         KeepAlivePinnedRecorder origin(KeepAlivePinnedRecorder::FirstResponseMode::DelayedHeadComplete);
         ChildGuard child;
         DockerGuard docker("rut-nginx-630-head-pair-" + std::to_string(getpid()));
+        if (!nginx_side) docker.active = false;
         if (!handoff_held_loopback_port(&ports.fds[1], backend, "#630 pair origin bind", error) ||
             !origin.setup(backend)) return false;
         if (nginx_side) {
