@@ -73867,6 +73867,26 @@ struct LiveAccessLedgerObserver {
     }
 };
 
+struct LiveRetirementLedgerTransition {
+    LiveRetirementSnapshotCapture* capture = nullptr;
+    LiveAccessLedgerObserver* observer = nullptr;
+};
+
+static void capture_live_retirement_ledger_transition(void* opaque) {
+    auto* transition = static_cast<LiveRetirementLedgerTransition*>(opaque);
+    capture_live_retirement_snapshot(transition->capture);
+    transition->observer->sample(1'100'000'000ull,
+                                 "60\n",
+                                 true,
+                                 true,
+                                 true,
+                                 true,
+                                 true,
+                                 transition->capture->snapshot.state == LiveRetirementState::Ready,
+                                 transition->capture->snapshot.state !=
+                                     LiveRetirementState::Invalid);
+}
+
 static bool run_live_access_ledger_observer_self_check(std::string& error) {
     const auto expect_pending = [&](u64 now_ns,
                                     const std::string& value,
@@ -74010,18 +74030,35 @@ static bool run_live_access_ledger_observer_self_check(std::string& error) {
     std::atomic<u64> callback_timestamp{1'000'000'000ull};
     LiveRetirementSnapshotCapture callback_capture{
         &callback_flag, &callback_count, &callback_timestamp, {}};
+    LiveAccessLedgerObserver callback_ledger;
+    callback_ledger.freeze_eof(1'000'000'000ull);
+    LiveRetirementLedgerTransition callback_transition{&callback_capture, &callback_ledger};
     publish_peer_close(callback_flag,
                        callback_count,
-                       capture_live_retirement_snapshot,
-                       &callback_capture);
+                       capture_live_retirement_ledger_transition,
+                       &callback_transition);
     const LiveRetirementSnapshot callback_committed =
         snapshot_live_retirement(callback_flag, callback_count, callback_timestamp,
                                  1'000'000'000ull);
+    const bool callback_ready_complete =
+        callback_ledger.sample(1'101'000'000ull,
+                               "60\n",
+                               true,
+                               true,
+                               true,
+                               true,
+                               true,
+                               callback_committed.state == LiveRetirementState::Ready,
+                               callback_committed.state != LiveRetirementState::Invalid) &&
+        callback_ledger.begin_stability(1'101'000'000ull) &&
+        callback_ledger.stable_sample(
+            1'276'000'000ull, "60\n", true, true, true, true, true, true, true) &&
+        callback_ledger.phase == LiveAccessLedgerObserver::Phase::Complete;
     const bool callback_between_count_and_flag_pending =
         callback_capture.snapshot.state == LiveRetirementState::Pending &&
         callback_capture.snapshot.count == 0u &&
         callback_committed.state == LiveRetirementState::Ready && callback_committed.count == 1u &&
-        callback_committed.timestamp_ns == 1'000'000'000ull;
+        callback_committed.timestamp_ns == 1'000'000'000ull && callback_ready_complete;
     LiveAccessLedgerObserver malformed_committed;
     malformed_committed.freeze_eof(1'000'000'000ull);
     const bool malformed_committed_sticky =
@@ -74950,6 +74987,8 @@ static bool run_pinned_nginx_custom_hide_timeout_probe(
             return false;
         }
         const LiveRetirementSnapshot stable_retirement = retirement_snapshot();
+        const u32 stable_accepted = origin.accepted.load(std::memory_order_acquire);
+        const u32 stable_requests = origin.requests.load(std::memory_order_acquire);
         if (!live_observer.stable_sample(
                 steady_now_ns(),
                 stable_access,
@@ -74966,8 +75005,7 @@ static bool run_pinned_nginx_custom_hide_timeout_probe(
                     true),
                 stable_retirement.state == LiveRetirementState::Ready,
                 stable_retirement.state != LiveRetirementState::Invalid) ||
-            stable_access != "60\n" || origin.accepted.load(std::memory_order_acquire) != 1u ||
-            origin.requests.load(std::memory_order_acquire) != 1u ||
+            stable_access != "60\n" || stable_accepted != 1u || stable_requests != 1u ||
             origin.response_fragments_sent.load(std::memory_order_acquire) != 2u ||
             !origin.response_peer_closed.load(std::memory_order_acquire) ||
             origin.response_peer_close_count.load(std::memory_order_acquire) != 1u ||
@@ -74981,8 +75019,8 @@ static bool run_pinned_nginx_custom_hide_timeout_probe(
             return false;
         final_stable_retirement = stable_retirement;
         final_stable_access = stable_access;
-        final_stable_accepted = origin.accepted.load(std::memory_order_acquire);
-        final_stable_requests = origin.requests.load(std::memory_order_acquire);
+        final_stable_accepted = stable_accepted;
+        final_stable_requests = stable_requests;
         final_stable_peer_closes = stable_retirement.count;
         pollfd peer_state{client, POLLIN | POLLHUP | POLLERR, 0};
         const int ready = poll(&peer_state, 1, 5);
@@ -74999,7 +75037,7 @@ static bool run_pinned_nginx_custom_hide_timeout_probe(
               << " read-error=" << response_read_error << " access-bytes=" << access.size()
               << " origin-write-ns=" << first_ns << "," << second_ns
               << " peer-close-ns=" << peer_closed_ns << " retired-before-cleanup="
-              << (retirement_snapshot().state == LiveRetirementState::Ready)
+              << (initial_retirement.state == LiveRetirementState::Ready)
               << " exact-upstream=deferred-until-origin-join\n";
     dump_wire("#270 custom-hide timeout probe observed downstream", response);
     bool expiry_gate_failed = !actual_eof || response.empty() || response_read_error ||
@@ -75016,7 +75054,7 @@ static bool run_pinned_nginx_custom_hide_timeout_probe(
     bool live_access_changed = false;
     bool live_exact_access_seen = access == "60\n";
     u64 live_access_changed_ns = 0u;
-    u64 live_exact_access_ns = live_exact_access_seen ? observed_ns : 0u;
+    u64 live_exact_access_ns = live_exact_access_seen ? initial_access_sample_ns : 0u;
     const u64 live_observation_deadline = live_observer.deadline_ns;
     const char* live_stop_reason = expiry_gate_failed ? "deadline" : "acceptance-passed";
     u32 live_accepted = origin.accepted.load(std::memory_order_acquire);
