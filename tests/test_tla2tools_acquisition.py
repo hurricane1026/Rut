@@ -166,7 +166,7 @@ class Loopback(unittest.TestCase):
     def test_stalled_transfer_has_short_bound_and_cleans_staging(self) -> None:
         Fixture.mode = "stall"
         started = time.monotonic()
-        with self.assertRaises(AcquisitionError):
+        with self.assertRaises(AcquisitionError) as failure:
             acquire(
                 self.url,
                 self.tmp / "tools.jar",
@@ -175,6 +175,7 @@ class Loopback(unittest.TestCase):
                 max_time=0.5,
                 retries=0,
             )
+        self.assertEqual(failure.exception.returncode, 28)
         self.assertLess(time.monotonic() - started, 2)
         self.assertEqual(Fixture.requests, 1)
         self.assertEqual(list(self.tmp.glob("*.part")), [])
