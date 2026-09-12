@@ -54407,7 +54407,8 @@ static bool validate_custom_hide_timeout_loaded_program(const std::string& sourc
                                                         const std::string& access_path,
                                                         const char* custom_name,
                                                         std::string& error,
-                                                        unsigned expected_timeout_seconds = 1u) {
+                                                        unsigned expected_timeout_seconds = 1u,
+                                                        bool validate_head_controls = false) {
     if (expected_timeout_seconds != 1u && expected_timeout_seconds != 2u) {
         error = "#627 loaded custom-hide timeout validator received an invalid expected timeout";
         return false;
@@ -54605,6 +54606,114 @@ static bool validate_custom_hide_timeout_loaded_program(const std::string& sourc
                 "] bundles=" + std::to_string(program->config.policy_bundle_count) +
                 " distinct=" + std::to_string(distinct_ok);
         return false;
+    }
+    // #630: validate the selected HEAD bundle as an independent semantic
+    // episode.  This is deliberately opt-in so every existing GET caller
+    // retains its original contract.
+    if (validate_head_controls) {
+        const rut::RouteEntry* selected_head = nullptr;
+        for (u32 i = 0u; i < program->config.route_count; i++) {
+            const auto& route = program->config.routes[i];
+            if (route.method == rut::kRouteMethodHead && route.fn != nullptr) {
+                if (selected_head != nullptr) {
+                    error = "#630 loaded program had duplicate buffered-timeout HEAD routes";
+                    return false;
+                }
+                selected_head = &route;
+            }
+        }
+        if (selected_head == nullptr) {
+            error = "#630 loaded program lacked the selected buffered-timeout HEAD route";
+            return false;
+        }
+        static constexpr char kHeadRequest[] =
+            "HEAD /buffered-timeout?q=1 HTTP/1.1\r\nHost: client.example\r\n\r\n";
+        const auto head_result = invoke(*selected_head, kHeadRequest, sizeof(kHeadRequest) - 1u);
+        if (!predicate(*selected_head,
+                       head_result,
+                       static_cast<u16>(rut::RequestPolicyId::Http11FixedStrip),
+                       static_cast<u16>(rut::ResponsePolicyHeadMode::SuppressBody),
+                       rut::ForwardResponseBufferingMode::None)) {
+            error = "#630 selected HEAD route did not resolve to SuppressBody/None";
+            return false;
+        }
+        const u16 selected_bundle = head_result.next_state;
+        auto& bundle = program->config.policy_bundles[selected_bundle - 1u];
+        const auto saved_timeout = bundle.response_read_timeout_seconds;
+        const auto saved_head =
+            program->config.response_policies[bundle.response_policy_id - 1u].head_mode;
+        const auto saved_buffering = bundle.response_buffering;
+        bundle.response_read_timeout_seconds = 1u;
+        const auto timeout_mutant = invoke(*selected_head, kHeadRequest, sizeof(kHeadRequest) - 1u);
+        const bool timeout_rejected =
+            !predicate(*selected_head,
+                       timeout_mutant,
+                       static_cast<u16>(rut::RequestPolicyId::Http11FixedStrip),
+                       static_cast<u16>(rut::ResponsePolicyHeadMode::SuppressBody),
+                       rut::ForwardResponseBufferingMode::None) &&
+            timeout_mutant.action == head_result.action &&
+            timeout_mutant.status_code == head_result.status_code &&
+            timeout_mutant.upstream_id == head_result.upstream_id &&
+            timeout_mutant.next_state == head_result.next_state;
+        bundle.response_read_timeout_seconds = saved_timeout;
+        const auto timeout_restored =
+            invoke(*selected_head, kHeadRequest, sizeof(kHeadRequest) - 1u);
+        const bool timeout_restore_ok =
+            predicate(*selected_head,
+                      timeout_restored,
+                      static_cast<u16>(rut::RequestPolicyId::Http11FixedStrip),
+                      static_cast<u16>(rut::ResponsePolicyHeadMode::SuppressBody),
+                      rut::ForwardResponseBufferingMode::None);
+        auto& response_policy = program->config.response_policies[bundle.response_policy_id - 1u];
+        response_policy.head_mode = rut::ResponsePolicyHeadMode::Reject;
+        const auto suppress_mutant =
+            invoke(*selected_head, kHeadRequest, sizeof(kHeadRequest) - 1u);
+        const bool suppress_rejected =
+            !predicate(*selected_head,
+                       suppress_mutant,
+                       static_cast<u16>(rut::RequestPolicyId::Http11FixedStrip),
+                       static_cast<u16>(rut::ResponsePolicyHeadMode::SuppressBody),
+                       rut::ForwardResponseBufferingMode::None) &&
+            suppress_mutant.action == head_result.action &&
+            suppress_mutant.status_code == head_result.status_code &&
+            suppress_mutant.upstream_id == head_result.upstream_id &&
+            suppress_mutant.next_state == head_result.next_state;
+        response_policy.head_mode = saved_head;
+        const auto suppress_restored =
+            invoke(*selected_head, kHeadRequest, sizeof(kHeadRequest) - 1u);
+        const bool suppress_restore_ok =
+            predicate(*selected_head,
+                      suppress_restored,
+                      static_cast<u16>(rut::RequestPolicyId::Http11FixedStrip),
+                      static_cast<u16>(rut::ResponsePolicyHeadMode::SuppressBody),
+                      rut::ForwardResponseBufferingMode::None);
+        bundle.response_buffering = rut::ForwardResponseBufferingMode::CompleteContentLength;
+        const auto buffering_mutant =
+            invoke(*selected_head, kHeadRequest, sizeof(kHeadRequest) - 1u);
+        const bool buffering_rejected =
+            !predicate(*selected_head,
+                       buffering_mutant,
+                       static_cast<u16>(rut::RequestPolicyId::Http11FixedStrip),
+                       static_cast<u16>(rut::ResponsePolicyHeadMode::SuppressBody),
+                       rut::ForwardResponseBufferingMode::None) &&
+            buffering_mutant.action == head_result.action &&
+            buffering_mutant.status_code == head_result.status_code &&
+            buffering_mutant.upstream_id == head_result.upstream_id &&
+            buffering_mutant.next_state == head_result.next_state;
+        bundle.response_buffering = saved_buffering;
+        const auto buffering_restored =
+            invoke(*selected_head, kHeadRequest, sizeof(kHeadRequest) - 1u);
+        const bool buffering_restore_ok =
+            predicate(*selected_head,
+                      buffering_restored,
+                      static_cast<u16>(rut::RequestPolicyId::Http11FixedStrip),
+                      static_cast<u16>(rut::ResponsePolicyHeadMode::SuppressBody),
+                      rut::ForwardResponseBufferingMode::None);
+        if (!timeout_rejected || !suppress_rejected || !buffering_rejected || !timeout_restore_ok ||
+            !suppress_restore_ok || !buffering_restore_ok) {
+            error = "#630 selected HEAD policy mutation was accepted or restore failed";
+            return false;
+        }
     }
     if (expected_timeout_seconds == 2u) {
         const u16 get_bundle_id = rg.next_state;
@@ -76245,6 +76354,95 @@ static bool run_pinned_nginx_custom_hide_timeout_cli_differential(
     return true;
 }
 
+// #630 CLI admission probe.  The pinned oracle remains an independent control;
+// this pair additionally authenticates a complete same-file converter output
+// and exercises the ordinary O2 loader's selected HEAD policy controls.
+static bool run_pinned_nginx_bodyless_head_cli_differential(const char* rut_path,
+                                                            const char* converter_path,
+                                                            std::string& error) {
+    if (rut_path == nullptr || converter_path == nullptr || rut_path[0] != '/' ||
+        converter_path[0] != '/' || access(rut_path, X_OK) != 0 ||
+        access(converter_path, X_OK) != 0) {
+        error = "#630 HEAD CLI differential requires absolute executable RUT/converter paths";
+        return false;
+    }
+    // Keep the already-proven nginx episode as a required control before the
+    // generated side is admitted.
+    if (!run_pinned_nginx_bodyless_head_delayed_completion_oracle(error)) return false;
+    TempDir temp;
+    HeldLoopbackPorts ports;
+    u16 frontend = 0u, backend = 0u;
+    if (!temp.create() || !ports.reserve_four_digit(0u, frontend) ||
+        !ports.reserve_four_digit(1u, backend) || frontend == backend) {
+        error = "#630 HEAD CLI differential could not allocate owned resources";
+        return false;
+    }
+    const std::string profile =
+        make_explicit_timeout_head_profile(frontend, backend, temp.rut_access_log, true);
+    std::string config = "events {}\n" + profile;
+    if (!write_file(temp.nginx_config, config.data(), config.size())) {
+        error = "#630 HEAD CLI differential could not persist immutable config";
+        return false;
+    }
+    const std::string diagnostics_path = temp.rut_log + ".converter";
+    const int output_fd = open(temp.source.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0600);
+    const int error_fd = open(diagnostics_path.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0600);
+    if (output_fd < 0 || error_fd < 0) {
+        if (output_fd >= 0) close(output_fd);
+        if (error_fd >= 0) close(error_fd);
+        error = "#630 HEAD CLI differential could not open converter captures";
+        return false;
+    }
+    ChildGuard converter;
+    const pid_t pid = fork();
+    if (pid == 0) {
+        if (dup2(output_fd, STDOUT_FILENO) < 0 || dup2(error_fd, STDERR_FILENO) < 0) _exit(127);
+        close(output_fd);
+        close(error_fd);
+        execl(converter_path,
+              converter_path,
+              "--format",
+              "nginx-http",
+              temp.nginx_config.c_str(),
+              nullptr);
+        _exit(127);
+    }
+    close(output_fd);
+    close(error_fd);
+    if (pid < 0) {
+        error = "#630 HEAD CLI differential could not fork converter";
+        return false;
+    }
+    converter.child.pid = pid;
+    std::string generated, diagnostics;
+    if (!wait_child(converter.child, 10'000) || !converter.child.status_valid ||
+        !WIFEXITED(converter.child.status) || WEXITSTATUS(converter.child.status) != 0 ||
+        !read_exact_rut_source(temp.source, "#630 generated source", generated, error) ||
+        generated.empty() || !read_bounded_file(diagnostics_path, diagnostics, error) ||
+        !diagnostics.empty()) {
+        if (error.empty()) error = "#630 converter did not produce authenticated source";
+        return false;
+    }
+    const std::string snapshot = generated;
+    if (!validate_custom_hide_timeout_loaded_program(temp.source,
+                                                     generated,
+                                                     frontend,
+                                                     backend,
+                                                     temp.rut_access_log,
+                                                     "X-Powered-By",
+                                                     error,
+                                                     1u,
+                                                     true))
+        return false;
+    if (!read_exact_rut_source(temp.source, "#630 source after O2 load", generated, error) ||
+        generated != snapshot) {
+        error = "#630 generated source changed during O2 admission";
+        return false;
+    }
+    std::cerr << "PASS evidence: #630 same-file converter/O2 HEAD policy admission\n";
+    return true;
+}
+
 static bool run_pinned_nginx_default_buffering_three_publication_oracle_impl(
     TempDir& temp,
     const std::string& container_name,
@@ -79106,6 +79304,8 @@ int main(int argc, char** argv) {
     const bool converter_custom_hide_timeout_boundary_cli_differential =
         argc == 4 &&
         strcmp(argv[1], "--converter-custom-hide-timeout-boundary-cli-differential") == 0;
+    const bool converter_bodyless_head_cli_differential =
+        argc == 4 && strcmp(argv[1], "--converter-bodyless-head-cli-differential") == 0;
     const bool wildcard_listen_oracle =
         argc == 2 && strcmp(argv[1], "--pinned-nginx-wildcard-listen-oracle") == 0;
     const bool asterisk_wildcard_listen_oracle =
@@ -79575,6 +79775,9 @@ int main(int argc, char** argv) {
                "<absolute-rut-executable> <absolute-converter-executable>\n"
                "   or: test_nginx_differential "
                "--converter-custom-hide-timeout-2s-cli-differential "
+               "<absolute-rut-executable> <absolute-converter-executable>\n"
+               "   or: test_nginx_differential "
+               "--converter-bodyless-head-cli-differential "
                "<absolute-rut-executable> <absolute-converter-executable>\n"
                "   or: test_nginx_differential "
                "--converter-explicit-timeout-head-source-self-check\n"
@@ -80063,6 +80266,17 @@ int main(int argc, char** argv) {
             return 1;
         }
         std::cerr << "PASS: #630 pinned nginx bodyless HEAD delayed completion oracle\n";
+        return 0;
+    }
+    if (converter_bodyless_head_cli_differential) {
+        std::string differential_error;
+        if (!run_pinned_nginx_bodyless_head_cli_differential(
+                argv[2], argv[3], differential_error)) {
+            std::cerr << "FAIL [#630 bodyless HEAD CLI differential]: " << differential_error
+                      << "\n";
+            return 1;
+        }
+        std::cerr << "PASS: #630 same-file bodyless HEAD CLI differential\n";
         return 0;
     }
     if (converter_custom_hide_timeout_cli_differential) {
