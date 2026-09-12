@@ -43,8 +43,12 @@ passed independent review, Release build and 9/9 targeted tests, zero skips
 (51.85s). Same-file nginx/generated-RUT wiring `2ef3f7c9` passed independent
 review, Release build and first behavioral validation 2/2 with zero skips
 (12.07s; new pair 7.71s). This is local paired evidence, not final #630
-acceptance: selected-HEAD policy discriminators and complete-candidate CI
-remain pending. No HEAD support is promoted.
+acceptance. Selected-HEAD policy discriminators at `cd690657` then passed
+independent review, Release build and 10/10 targeted tests with zero skips
+(61.66s), covering actual selected timeout 2s->1s, SuppressBody->Reject and
+None->CompleteContentLength mutations with restored positive invocation after
+each. Complete-candidate CI/integration remain pending. No HEAD support is
+promoted.
 #623 tracks a reproduced source-backed Server-model hide-metadata erasure gap;
 its fix merged through #624 at `2bba609a` after CI `34320265023` passed all
 15 jobs and required nginx 155/155. This strengthens model authentication only.
