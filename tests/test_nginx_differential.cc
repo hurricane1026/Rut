@@ -65694,6 +65694,463 @@ struct LiveAccessLedgerObserver {
     }
 };
 
+struct ExplicitOffObservation {
+    std::vector<char> prefix_wire;
+    std::vector<char> downstream_wire;
+    u64 publication_ns = 0u;
+    u64 first_prefix_ns = 0u;
+    u64 prefix_complete_ns = 0u;
+    u64 probe_authorized_ns = 0u;
+    u64 probe_ack_ns = 0u;
+    u64 probe_observed_ns = 0u;
+    u64 eof_ns = 0u;
+    LiveRetirementSnapshot retirement;
+    u64 freeze_ns = 0u;
+    u32 probe_ack = 0u;
+    GatedFragmentPeerProbeResult probe_result = GatedFragmentPeerProbeResult::None;
+    u32 accepted = 0u;
+    u32 requests = 0u;
+    u32 close_count = 0u;
+    u32 publication_count = 0u;
+    bool publication_succeeded = false;
+    bool exact_ledger_seen = false;
+    std::string ledger;
+    bool frontend_live = false;
+    bool origin_live = false;
+    bool send_failed = false;
+    bool unexpected_data = false;
+    bool observation_failed = false;
+    LiveAccessLedgerObserver::Phase ledger_phase = LiveAccessLedgerObserver::Phase::Failed;
+    u64 ledger_eof_ns = 0u;
+    u64 ledger_accepted_ns = 0u;
+    u64 stability_start_ns = 0u;
+    u64 stability_deadline_ns = 0u;
+};
+
+static bool validate_explicit_off_observation(const ExplicitOffObservation& observation,
+                                              std::string& error) {
+    const u64 publication = observation.publication_ns;
+    const auto ordered = [&](u64 later, u64 earlier) {
+        return later != 0u && earlier != 0u && later >= earlier;
+    };
+    if (!validate_exact_normalized_response(
+            observation.prefix_wire, kExplicitBufferingOffTimeoutResponseNormalized, error) ||
+        !validate_exact_normalized_response(
+            observation.downstream_wire, kExplicitBufferingOffTimeoutResponseNormalized, error) ||
+        observation.prefix_wire.size() != 127u || observation.downstream_wire.size() != 127u ||
+        publication == 0u || !ordered(observation.first_prefix_ns, publication) ||
+        !ordered(observation.prefix_complete_ns, observation.first_prefix_ns) ||
+        !ordered(observation.probe_authorized_ns, observation.prefix_complete_ns) ||
+        !ordered(observation.probe_ack_ns, observation.probe_authorized_ns) ||
+        !ordered(observation.eof_ns, observation.probe_ack_ns) ||
+        observation.eof_ns <= observation.probe_ack_ns ||
+        observation.prefix_complete_ns - publication >= 800'000'000ull ||
+        observation.probe_ack_ns - observation.probe_authorized_ns >= 100'000'000ull ||
+        observation.probe_ack != 1u || observation.probe_observed_ns != observation.probe_ack_ns ||
+        observation.probe_result != GatedFragmentPeerProbeResult::Open ||
+        observation.retirement.state != LiveRetirementState::Ready ||
+        observation.retirement.count != 1u || observation.retirement.timestamp_ns == 0u ||
+        observation.retirement.timestamp_ns <= observation.probe_ack_ns ||
+        observation.retirement.timestamp_ns - publication < 750'000'000ull ||
+        observation.retirement.timestamp_ns - publication >= 2'000'000'000ull ||
+        observation.eof_ns - publication < 750'000'000ull ||
+        observation.eof_ns - publication >= 2'000'000'000ull || observation.accepted != 1u ||
+        observation.requests != 1u || observation.close_count != 1u ||
+        observation.publication_count != 1u || !observation.publication_succeeded ||
+        !observation.exact_ledger_seen || observation.ledger != "60\n" ||
+        observation.retirement.timestamp_ns > observation.freeze_ns || !observation.frontend_live ||
+        !observation.origin_live || observation.send_failed || observation.unexpected_data ||
+        observation.observation_failed ||
+        observation.ledger_phase != LiveAccessLedgerObserver::Phase::Complete ||
+        observation.ledger_eof_ns != observation.eof_ns ||
+        !ordered(observation.ledger_accepted_ns, observation.eof_ns) ||
+        observation.ledger_accepted_ns - observation.eof_ns >= 250'000'000ull ||
+        observation.ledger_accepted_ns < observation.retirement.timestamp_ns ||
+        !ordered(observation.stability_start_ns, observation.ledger_accepted_ns) ||
+        observation.stability_deadline_ns < observation.stability_start_ns ||
+        observation.stability_deadline_ns - observation.stability_start_ns < 175'000'000ull ||
+        observation.freeze_ns < observation.stability_deadline_ns) {
+        if (error.empty()) error = "#638 explicit-off observation contract rejected evidence";
+        return false;
+    }
+    return true;
+}
+
+static ExplicitOffObservation make_explicit_off_observation_self_check() {
+    ExplicitOffObservation observation;
+    const std::string real_wire =
+        std::string(kExplicitBufferingOffTimeoutResponseNormalized)
+            .replace(std::string(kExplicitBufferingOffTimeoutResponseNormalized)
+                         .find("XXXXXXXXXXXXXXXXXXXXXXXXXXXXX"),
+                     29u,
+                     "Tue, 01 Jan 2030 00:00:00 GMT");
+    observation.prefix_wire.assign(real_wire.begin(), real_wire.end());
+    observation.downstream_wire = observation.prefix_wire;
+    observation.publication_ns = 1'000'000'000ull;
+    observation.first_prefix_ns = 1'010'000'000ull;
+    observation.prefix_complete_ns = 1'100'000'000ull;
+    observation.probe_authorized_ns = 1'110'000'000ull;
+    observation.probe_ack_ns = 1'120'000'000ull;
+    observation.probe_observed_ns = observation.probe_ack_ns;
+    observation.eof_ns = 1'800'000'000ull;
+    observation.retirement = {LiveRetirementState::Ready, 1u, 1'850'000'000ull};
+    observation.freeze_ns = 2'200'000'000ull;
+    observation.probe_ack = 1u;
+    observation.probe_result = GatedFragmentPeerProbeResult::Open;
+    observation.accepted = 1u;
+    observation.requests = 1u;
+    observation.close_count = 1u;
+    observation.publication_count = 1u;
+    observation.publication_succeeded = true;
+    observation.exact_ledger_seen = true;
+    observation.ledger = "60\n";
+    observation.frontend_live = true;
+    observation.origin_live = true;
+    LiveAccessLedgerObserver ledger;
+    ledger.freeze_eof(observation.eof_ns);
+    ledger.sample(1'900'000'000ull, "60\n", true, true, true, true, true, true, true);
+    ledger.begin_stability(1'910'000'000ull);
+    ledger.stable_sample(2'090'000'000ull, "60\n", true, true, true, true, true, true, true);
+    observation.ledger_phase = ledger.phase;
+    observation.ledger_eof_ns = ledger.eof_ns;
+    observation.ledger_accepted_ns = ledger.accepted_ns;
+    observation.stability_start_ns = ledger.stability_start_ns;
+    observation.stability_deadline_ns = ledger.stability_deadline_ns;
+    return observation;
+}
+
+static void retime_explicit_off_observation(ExplicitOffObservation& observation,
+                                            u64 prefix_complete_ns,
+                                            u64 probe_ack_ns,
+                                            u64 eof_ns,
+                                            u64 retirement_ns,
+                                            u64 stability_duration_ns) {
+    observation.prefix_complete_ns = prefix_complete_ns;
+    observation.probe_authorized_ns = prefix_complete_ns;
+    observation.probe_ack_ns = probe_ack_ns;
+    observation.probe_observed_ns = probe_ack_ns;
+    observation.eof_ns = eof_ns;
+    observation.retirement = {LiveRetirementState::Ready, 1u, retirement_ns};
+    const u64 accepted_ns = std::max(eof_ns, retirement_ns) + 1'000'000ull;
+    const u64 stability_start_ns = accepted_ns + 1'000'000ull;
+    observation.freeze_ns = stability_start_ns + stability_duration_ns + 1'000'000ull;
+    LiveAccessLedgerObserver ledger;
+    ledger.freeze_eof(eof_ns);
+    ledger.sample(accepted_ns, "60\n", true, true, true, true, true, true, true);
+    ledger.begin_stability(stability_start_ns);
+    ledger.stable_sample(stability_start_ns + stability_duration_ns,
+                         "60\n",
+                         true,
+                         true,
+                         true,
+                         true,
+                         true,
+                         true,
+                         true);
+    observation.ledger = "60\n";
+    observation.exact_ledger_seen = ledger.exact_ledger_seen;
+    observation.ledger_phase = ledger.phase;
+    observation.ledger_eof_ns = ledger.eof_ns;
+    observation.ledger_accepted_ns = ledger.accepted_ns;
+    observation.stability_start_ns = ledger.stability_start_ns;
+    observation.stability_deadline_ns = ledger.stability_deadline_ns;
+}
+
+static bool run_explicit_off_observation_self_check(std::string& error) {
+    const ExplicitOffObservation positive = make_explicit_off_observation_self_check();
+    if (!validate_explicit_off_observation(positive, error)) return false;
+    ExplicitOffObservation retirement_before_eof = positive;
+    retirement_before_eof.retirement.timestamp_ns = 1'790'000'000ull;
+    if (!validate_explicit_off_observation(retirement_before_eof, error)) return false;
+    ExplicitOffObservation lower_retirement = positive;
+    retime_explicit_off_observation(lower_retirement,
+                                    1'100'000'000ull,
+                                    1'120'000'000ull,
+                                    1'800'000'000ull,
+                                    1'750'000'000ull,
+                                    175'000'000ull);
+    if (!validate_explicit_off_observation(lower_retirement, error)) return false;
+    ExplicitOffObservation lower_eof = positive;
+    retime_explicit_off_observation(lower_eof,
+                                    1'100'000'000ull,
+                                    1'120'000'000ull,
+                                    1'750'000'000ull,
+                                    1'850'000'000ull,
+                                    175'000'000ull);
+    if (!validate_explicit_off_observation(lower_eof, error)) return false;
+    ExplicitOffObservation upper_minus_one_retirement = positive;
+    retime_explicit_off_observation(upper_minus_one_retirement,
+                                    1'799'999'999ull,
+                                    1'800'000'000ull,
+                                    2'900'000'000ull,
+                                    2'999'999'999ull,
+                                    175'000'000ull);
+    if (!validate_explicit_off_observation(upper_minus_one_retirement, error)) return false;
+    ExplicitOffObservation upper_minus_one_eof = positive;
+    retime_explicit_off_observation(upper_minus_one_eof,
+                                    1'100'000'000ull,
+                                    1'120'000'000ull,
+                                    2'999'999'999ull,
+                                    1'850'000'000ull,
+                                    175'000'000ull);
+    if (!validate_explicit_off_observation(upper_minus_one_eof, error)) return false;
+    ExplicitOffObservation prefix_upper_minus_one = positive;
+    retime_explicit_off_observation(prefix_upper_minus_one,
+                                    positive.publication_ns + 799'999'999ull,
+                                    positive.publication_ns + 899'999'998ull,
+                                    positive.publication_ns + 950'000'000ull,
+                                    positive.publication_ns + 910'000'000ull,
+                                    175'000'000ull);
+    if (!validate_explicit_off_observation(prefix_upper_minus_one, error)) return false;
+    ExplicitOffObservation ack_upper_minus_one = positive;
+    retime_explicit_off_observation(ack_upper_minus_one,
+                                    1'100'000'000ull,
+                                    1'199'999'999ull,
+                                    1'900'000'000ull,
+                                    1'850'000'000ull,
+                                    175'000'000ull);
+    if (!validate_explicit_off_observation(ack_upper_minus_one, error)) return false;
+    ExplicitOffObservation retirement_below_lower = positive;
+    retime_explicit_off_observation(retirement_below_lower,
+                                    1'100'000'000ull,
+                                    1'120'000'000ull,
+                                    1'800'000'000ull,
+                                    1'749'999'999ull,
+                                    175'000'000ull);
+    ExplicitOffObservation eof_below_lower = positive;
+    retime_explicit_off_observation(eof_below_lower,
+                                    1'100'000'000ull,
+                                    1'120'000'000ull,
+                                    1'749'999'999ull,
+                                    1'850'000'000ull,
+                                    175'000'000ull);
+    const auto rejected = [&](ExplicitOffObservation mutant) {
+        std::string detail;
+        return !validate_explicit_off_observation(mutant, detail);
+    };
+    ExplicitOffObservation malformed = positive;
+    malformed.downstream_wire.resize(122u);
+    ExplicitOffObservation missing = positive;
+    missing.downstream_wire.clear();
+    ExplicitOffObservation extra = positive;
+    extra.downstream_wire.push_back('x');
+    ExplicitOffObservation bad_prefix = positive;
+    bad_prefix.prefix_wire[0] ^= 1;
+    ExplicitOffObservation bad_final = positive;
+    bad_final.downstream_wire[0] ^= 1;
+    ExplicitOffObservation short_prefix = positive;
+    short_prefix.prefix_wire.resize(122u);
+    ExplicitOffObservation extra_prefix = positive;
+    extra_prefix.prefix_wire.push_back('x');
+    ExplicitOffObservation zero_timing = positive;
+    retime_explicit_off_observation(zero_timing,
+                                    1'700'000'000ull,
+                                    1'750'000'000ull,
+                                    1'750'000'000ull,
+                                    1'850'000'000ull,
+                                    175'000'000ull);
+    ExplicitOffObservation eof_equals_ack_upper = positive;
+    retime_explicit_off_observation(eof_equals_ack_upper,
+                                    1'700'000'000ull,
+                                    1'799'999'999ull,
+                                    1'799'999'999ull,
+                                    1'850'000'000ull,
+                                    175'000'000ull);
+    ExplicitOffObservation reverse = positive;
+    retime_explicit_off_observation(reverse,
+                                    1'700'000'000ull,
+                                    1'750'000'000ull,
+                                    1'800'000'000ull,
+                                    1'750'000'000ull,
+                                    175'000'000ull);
+    ExplicitOffObservation missing_ack = positive;
+    missing_ack.probe_ack = 0u;
+    ExplicitOffObservation invalid_ack = positive;
+    invalid_ack.probe_result = GatedFragmentPeerProbeResult::Closed;
+    ExplicitOffObservation invalid_ordinal = positive;
+    invalid_ordinal.probe_ack = 2u;
+    ExplicitOffObservation invalid_probe_timestamp = positive;
+    invalid_probe_timestamp.probe_observed_ns++;
+    ExplicitOffObservation pending_retirement = positive;
+    pending_retirement.retirement = {LiveRetirementState::Pending, 0u, 0u};
+    ExplicitOffObservation duplicate_retirement = positive;
+    duplicate_retirement.retirement = {LiveRetirementState::Invalid, 2u, 1'850'000'000ull};
+    ExplicitOffObservation sticky = positive;
+    sticky.send_failed = true;
+    ExplicitOffObservation lost_live = positive;
+    lost_live.origin_live = false;
+    ExplicitOffObservation child_death = positive;
+    child_death.frontend_live = false;
+    ExplicitOffObservation observation_error = positive;
+    observation_error.observation_failed = true;
+    ExplicitOffObservation bad_ledger = positive;
+    bad_ledger.ledger_phase = LiveAccessLedgerObserver::Phase::Failed;
+    ExplicitOffObservation wrong_ledger = positive;
+    wrong_ledger.ledger = "6\n";
+    ExplicitOffObservation duplicate_ledger = positive;
+    duplicate_ledger.ledger = "60\n60\n";
+    ExplicitOffObservation retry = positive;
+    retry.requests = 2u;
+    ExplicitOffObservation extra_publication = positive;
+    extra_publication.publication_count = 2u;
+    ExplicitOffObservation failed_publication = positive;
+    failed_publication.publication_succeeded = false;
+    ExplicitOffObservation prefix_deadline = positive;
+    retime_explicit_off_observation(prefix_deadline,
+                                    1'800'000'000ull,
+                                    1'810'000'000ull,
+                                    1'900'000'000ull,
+                                    1'850'000'000ull,
+                                    175'000'000ull);
+    ExplicitOffObservation ack_deadline = positive;
+    retime_explicit_off_observation(ack_deadline,
+                                    1'100'000'000ull,
+                                    1'200'000'000ull,
+                                    1'900'000'000ull,
+                                    1'850'000'000ull,
+                                    175'000'000ull);
+    ExplicitOffObservation retirement_deadline = positive;
+    retime_explicit_off_observation(retirement_deadline,
+                                    1'100'000'000ull,
+                                    1'120'000'000ull,
+                                    2'900'000'000ull,
+                                    3'000'000'000ull,
+                                    175'000'000ull);
+    ExplicitOffObservation eof_deadline = positive;
+    retime_explicit_off_observation(eof_deadline,
+                                    1'100'000'000ull,
+                                    1'120'000'000ull,
+                                    3'000'000'000ull,
+                                    1'850'000'000ull,
+                                    175'000'000ull);
+    ExplicitOffObservation ledger_deadline = positive;
+    ledger_deadline.ledger_accepted_ns = ledger_deadline.eof_ns + 250'000'000ull;
+    ledger_deadline.stability_start_ns = ledger_deadline.ledger_accepted_ns + 1'000'000ull;
+    ledger_deadline.stability_deadline_ns = ledger_deadline.stability_start_ns + 175'000'000ull;
+    ledger_deadline.freeze_ns = ledger_deadline.stability_deadline_ns + 1'000'000ull;
+    ExplicitOffObservation joint_before_deadline = ledger_deadline;
+    joint_before_deadline.ledger_accepted_ns--;
+    joint_before_deadline.stability_start_ns--;
+    joint_before_deadline.stability_deadline_ns--;
+    joint_before_deadline.freeze_ns--;
+    if (!validate_explicit_off_observation(joint_before_deadline, error)) {
+        error = "#638 rejected joint-249999999ns positive: " + error;
+        return false;
+    }
+    ExplicitOffObservation short_stability = positive;
+    short_stability.stability_deadline_ns = short_stability.stability_start_ns + 174'999'999ull;
+    ExplicitOffObservation missing_prefix = positive;
+    missing_prefix.prefix_wire.clear();
+    ExplicitOffObservation missing_publication_clock = positive;
+    missing_publication_clock.publication_ns = 0u;
+    ExplicitOffObservation missing_ack_clock = positive;
+    missing_ack_clock.probe_ack_ns = 0u;
+    missing_ack_clock.probe_observed_ns = 0u;
+    ExplicitOffObservation unexpected_data = positive;
+    unexpected_data.unexpected_data = true;
+    ExplicitOffObservation invalid_retirement = positive;
+    invalid_retirement.retirement.state = LiveRetirementState::Invalid;
+    ExplicitOffObservation duplicate_ready_retirement = positive;
+    duplicate_ready_retirement.retirement.count = 2u;
+    ExplicitOffObservation incomplete_freeze = positive;
+    incomplete_freeze.freeze_ns = incomplete_freeze.stability_deadline_ns - 1u;
+    const std::vector<std::pair<const char*, ExplicitOffObservation>> controls = {
+        {"missing-prefix", missing_prefix},
+        {"missing-publication-clock", missing_publication_clock},
+        {"missing-ack-clock", missing_ack_clock},
+        {"unexpected-data", unexpected_data},
+        {"invalid-retirement", invalid_retirement},
+        {"duplicate-ready-retirement", duplicate_ready_retirement},
+        {"incomplete-final-freeze", incomplete_freeze},
+        {"malformed-final", malformed},
+        {"missing-final", missing},
+        {"extra-final", extra},
+        {"bad-prefix", bad_prefix},
+        {"same-size-bad-final", bad_final},
+        {"short-prefix-122", short_prefix},
+        {"extra-prefix", extra_prefix},
+        {"eof-equals-ack", zero_timing},
+        {"eof-equals-ack-upper", eof_equals_ack_upper},
+        {"retirement-equals-ack", reverse},
+        {"missing-ack", missing_ack},
+        {"invalid-ack-result", invalid_ack},
+        {"invalid-ack-ordinal", invalid_ordinal},
+        {"probe-timestamp-identity", invalid_probe_timestamp},
+        {"pending-retirement", pending_retirement},
+        {"duplicate-retirement", duplicate_retirement},
+        {"sticky-error", sticky},
+        {"lost-live", lost_live},
+        {"child-death", child_death},
+        {"observation-error", observation_error},
+        {"bad-ledger", bad_ledger},
+        {"wrong-ledger", wrong_ledger},
+        {"duplicate-ledger", duplicate_ledger},
+        {"retry", retry},
+        {"extra-publication", extra_publication},
+        {"failed-publication", failed_publication},
+        {"prefix-800ms", prefix_deadline},
+        {"ack-100ms", ack_deadline},
+        {"retirement-2s", retirement_deadline},
+        {"eof-2s", eof_deadline},
+        {"joint-250ms", ledger_deadline},
+        {"stability-174999999ns", short_stability},
+        {"retirement-749999999ns", retirement_below_lower},
+        {"eof-749999999ns", eof_below_lower},
+    };
+    for (const auto& control : controls) {
+        if (!rejected(control.second)) {
+            error = std::string("#638 explicit-off validator accepted control: ") + control.first;
+            return false;
+        }
+    }
+    ExplicitOffObservation observer_negative = positive;
+    LiveAccessLedgerObserver ledger;
+    ledger.freeze_eof(observer_negative.eof_ns);
+    ledger.sample(1'850'000'000ull, "60\n", true, true, true, true, true, false, true);
+    ledger.sample(1'851'000'000ull, "60\n", true, true, true, true, false, true, true);
+    observer_negative.ledger_phase = ledger.phase;
+    if (!rejected(observer_negative)) {
+        error = "#638 explicit-off validator accepted an observer-generated sticky failure";
+        return false;
+    }
+    LiveAccessLedgerObserver readiness;
+    readiness.freeze_eof(positive.eof_ns);
+    const bool readiness_pending =
+        readiness.sample(1'850'000'000ull, "60\n", true, true, true, true, true, false, true) &&
+        readiness.phase == LiveAccessLedgerObserver::Phase::Pending &&
+        readiness.sample(1'900'000'000ull, "60\n", true, true, true, true, true, true, true);
+    LiveAccessLedgerObserver read_failure;
+    read_failure.freeze_eof(positive.eof_ns);
+    const bool read_failure_sticky =
+        !read_failure.sample(1'850'000'000ull, "", false, true, true, true) &&
+        !read_failure.sample(1'851'000'000ull, "60\n", true, true, true, true);
+    LiveAccessLedgerObserver stability_loss;
+    stability_loss.freeze_eof(positive.eof_ns);
+    const bool stability_failure_sticky =
+        stability_loss.sample(1'850'000'000ull, "60\n", true, true, true, true, true, true, true) &&
+        stability_loss.begin_stability(1'860'000'000ull) &&
+        !stability_loss.stable_sample(1'861'000'000ull, "60\n", true, true, true, true, false) &&
+        !stability_loss.stable_sample(2'100'000'000ull, "60\n", true, true, true, true, true);
+    const auto copy_observer = [&](const LiveAccessLedgerObserver& source) {
+        ExplicitOffObservation copied = positive;
+        copied.ledger_phase = source.phase;
+        copied.ledger_eof_ns = source.eof_ns;
+        copied.ledger_accepted_ns = source.accepted_ns;
+        copied.stability_start_ns = source.stability_start_ns;
+        copied.stability_deadline_ns = source.stability_deadline_ns;
+        copied.exact_ledger_seen = source.exact_ledger_seen;
+        return copied;
+    };
+    if (!readiness_pending || !read_failure_sticky || !stability_failure_sticky ||
+        !rejected(copy_observer(readiness)) || !rejected(copy_observer(read_failure)) ||
+        !rejected(copy_observer(stability_loss))) {
+        error = "#638 observer transitions did not preserve pending/sticky failure controls";
+        return false;
+    }
+    std::cerr << "PASS: #638 shared explicit-off validator and negative controls\n";
+    return true;
+}
+
 // #638 is deliberately an nginx-only oracle: proxy_buffering off must expose
 // the already-published response prefix before proxy_read_timeout expires.
 static bool run_pinned_nginx_explicit_buffering_off_oracle(TempDir& temp,
@@ -65835,6 +66292,7 @@ static bool run_pinned_nginx_explicit_buffering_off_oracle(TempDir& temp,
         error = "#638 proxy_buffering off did not expose the exact 127-byte prefix before timeout";
         return false;
     }
+    const std::vector<char> prefix_wire = response;
     // The prefix is now complete on the client.  Only this point authorizes
     // the recorder-owned one-request probe; its ACK is causal evidence, not
     // the response_sent_open latch by itself.
@@ -66027,6 +66485,10 @@ static bool run_pinned_nginx_explicit_buffering_off_oracle(TempDir& temp,
     const u32 frozen_accepted = origin.accepted.load(std::memory_order_acquire);
     const u32 frozen_requests = origin.requests.load(std::memory_order_acquire);
     const u32 frozen_close_count = origin.response_peer_close_count.load(std::memory_order_acquire);
+    const u32 frozen_probe_ack = origin.gated_fragment_probe_ack.load(std::memory_order_acquire);
+    const GatedFragmentPeerProbeResult frozen_probe_result =
+        origin.gated_fragment_probe_result.load(std::memory_order_acquire);
+    const u64 frozen_probe_ns = origin.gated_fragment_probe_ns.load(std::memory_order_acquire);
     const bool frozen_send_failed = origin.response_send_failed.load(std::memory_order_acquire);
     const bool frozen_unexpected =
         origin.response_peer_unexpected_data.load(std::memory_order_acquire);
@@ -66049,6 +66511,43 @@ static bool run_pinned_nginx_explicit_buffering_off_oracle(TempDir& temp,
                              true,
                              true,
                              retirement_timing_valid(frozen_retirement, true));
+    ExplicitOffObservation live_observation;
+    live_observation.prefix_wire = prefix_wire;
+    live_observation.downstream_wire = response;
+    live_observation.publication_ns = origin_sent_ns;
+    live_observation.first_prefix_ns = first_ns;
+    live_observation.prefix_complete_ns = prefix_complete_ns;
+    live_observation.probe_authorized_ns = prefix_authorized_ns;
+    live_observation.probe_ack_ns = open_ack_ns;
+    live_observation.eof_ns = eof_ns;
+    live_observation.retirement = frozen_retirement;
+    live_observation.freeze_ns = frozen_sample_ns;
+    live_observation.probe_ack = frozen_probe_ack;
+    live_observation.probe_result = frozen_probe_result;
+    live_observation.probe_observed_ns = frozen_probe_ns;
+    live_observation.accepted = frozen_accepted;
+    live_observation.requests = frozen_requests;
+    live_observation.close_count = frozen_close_count;
+    live_observation.publication_count =
+        origin.response_send_all_calls.load(std::memory_order_acquire);
+    live_observation.publication_succeeded =
+        origin.response_send_succeeded.load(std::memory_order_acquire);
+    live_observation.exact_ledger_seen = ledger.exact_ledger_seen;
+    live_observation.ledger = frozen_access;
+    live_observation.frontend_live = !poll_child(nginx.child);
+    live_observation.origin_live = origin_live();
+    live_observation.send_failed = frozen_send_failed;
+    live_observation.unexpected_data = frozen_unexpected;
+    live_observation.observation_failed = frozen_observation_failed;
+    live_observation.ledger_phase = ledger.phase;
+    live_observation.ledger_eof_ns = ledger.eof_ns;
+    live_observation.ledger_accepted_ns = ledger.accepted_ns;
+    live_observation.stability_start_ns = ledger.stability_start_ns;
+    live_observation.stability_deadline_ns = ledger.stability_deadline_ns;
+    if (!frozen_sampled || !validate_explicit_off_observation(live_observation, error)) {
+        if (error.empty()) error = "#638 live explicit-off observation was rejected";
+        return false;
+    }
     const bool client_closed = close(client.fd) == 0;
     client.fd = -1;
     if (!client_closed || !frozen_live) {
@@ -79887,6 +80386,8 @@ int main(int argc, char** argv) {
         argc == 2 && strcmp(argv[1], "--gated-fragment-peer-probe-self-check") == 0;
     const bool live_access_ledger_observer_self_check =
         argc == 2 && strcmp(argv[1], "--live-access-ledger-observer-self-check") == 0;
+    const bool explicit_off_observation_self_check =
+        argc == 2 && strcmp(argv[1], "--explicit-off-observation-self-check") == 0;
     const bool pinned_nginx_custom_hide_timeout_probe =
         argc == 2 && strcmp(argv[1], "--pinned-nginx-custom-hide-timeout-probe") == 0;
     const bool pinned_nginx_custom_hide_timeout_completion =
@@ -80123,8 +80624,8 @@ int main(int argc, char** argv) {
          !pinned_positive_cl_options_default_buffering_oracle &&
          !pinned_positive_cl_head_default_buffering_oracle && !pinned_nginx_lifecycle_self_check &&
          !zero_response_stall_self_check && !gated_fragment_peer_probe_self_check &&
-         !live_access_ledger_observer_self_check && !pinned_nginx_custom_hide_timeout_probe &&
-         !pinned_nginx_custom_hide_timeout_completion &&
+         !live_access_ledger_observer_self_check && !explicit_off_observation_self_check &&
+         !pinned_nginx_custom_hide_timeout_probe && !pinned_nginx_custom_hide_timeout_completion &&
          !converter_custom_hide_timeout_cli_differential &&
          !converter_custom_hide_timeout_explicit_buffering_cli_differential &&
          !converter_custom_hide_timeout_two_second_cli_differential &&
@@ -80472,6 +80973,7 @@ int main(int argc, char** argv) {
                "   or: test_nginx_differential --pinned-nginx-lifecycle-self-check\n"
                "   or: test_nginx_differential --zero-response-stall-self-check\n"
                "   or: test_nginx_differential --gated-fragment-peer-probe-self-check\n"
+               "   or: test_nginx_differential --explicit-off-observation-self-check\n"
                "   or: test_nginx_differential --pinned-nginx-wildcard-listen-oracle\n"
                "   or: test_nginx_differential "
                "--pinned-nginx-asterisk-wildcard-listen-oracle\n"
@@ -80767,6 +81269,15 @@ int main(int argc, char** argv) {
     }
     return missing_prerequisite("pinned nginx differential requires Linux host networking");
 #else
+    if (explicit_off_observation_self_check) {
+        std::string observation_error;
+        if (!run_explicit_off_observation_self_check(observation_error)) {
+            std::cerr << "FAIL [#638 explicit-off observation self-check]: " << observation_error
+                      << "\n";
+            return 1;
+        }
+        return 0;
+    }
     if (live_access_ledger_observer_self_check) {
         std::string observer_error;
         if (!run_live_access_ledger_observer_self_check(observer_error)) {
@@ -82683,6 +83194,12 @@ int main(int argc, char** argv) {
         return 0;
     }
     if (pinned_nginx_explicit_buffering_off_oracle) {
+        std::string validator_error;
+        if (!run_explicit_off_observation_self_check(validator_error)) {
+            std::cerr << "FAIL [#638 explicit-off validator self-check]: " << validator_error
+                      << "\n";
+            return 1;
+        }
         const std::string container_name = "rut-nginx-638-explicit-buffering-off-oracle-" +
                                            std::to_string(getpid()) + "-" +
                                            (suffix ? suffix + 1 : "tmp");
