@@ -75606,15 +75606,14 @@ static bool validate_head_acceptance(const HeadAcceptanceObservation& o,
     return true;
 }
 
-static bool capture_issue630_head_episode(
-    u16 frontend_port,
-    u16 backend_port,
-    const std::string& access_path,
-    Child& frontend,
-    KeepAlivePinnedRecorder& origin,
-    HeadAcceptanceObservation& accepted,
-    std::vector<char>& upstream_wire,
-    std::string& error) {
+static bool capture_issue630_head_episode(u16 frontend_port,
+                                          u16 backend_port,
+                                          const std::string& access_path,
+                                          Child& frontend,
+                                          KeepAlivePinnedRecorder& origin,
+                                          HeadAcceptanceObservation& accepted,
+                                          std::vector<char>& upstream_wire,
+                                          std::string& error) {
     static constexpr char kRequest[] =
         "HEAD /buffered-timeout?q=1 HTTP/1.1\r\nHost: client.example\r\n\r\n";
     static constexpr char kExpected[] =
@@ -75668,8 +75667,8 @@ static bool capture_issue630_head_episode(
             return false;
         }
         std::string sample;
-        if (!read_request_length_access_file(access_path, sample, error) ||
-            !sample.empty() || origin.head_publication_ns.load(std::memory_order_acquire) != 0u ||
+        if (!read_request_length_access_file(access_path, sample, error) || !sample.empty() ||
+            origin.head_publication_ns.load(std::memory_order_acquire) != 0u ||
             origin.requests.load(std::memory_order_acquire) != 1u) {
             error = "#630 pre-permit custody/publication/ledger control failed";
             close(client);
@@ -75686,8 +75685,8 @@ static bool capture_issue630_head_episode(
             return false;
         }
         std::string sample;
-        if (!read_request_length_access_file(access_path, sample, error) ||
-            !sample.empty() || origin.head_publication_ns.load(std::memory_order_acquire) != 0u ||
+        if (!read_request_length_access_file(access_path, sample, error) || !sample.empty() ||
+            origin.head_publication_ns.load(std::memory_order_acquire) != 0u ||
             origin.accepted.load(std::memory_order_acquire) != 1u ||
             origin.requests.load(std::memory_order_acquire) != 1u ||
             origin.response_send_failed.load(std::memory_order_acquire) ||
@@ -75713,8 +75712,8 @@ static bool capture_issue630_head_episode(
             return false;
         }
         std::string sample;
-        if (!read_request_length_access_file(access_path, sample, error) ||
-            !sample.empty() || origin.head_publication_ns.load(std::memory_order_acquire) != 0u ||
+        if (!read_request_length_access_file(access_path, sample, error) || !sample.empty() ||
+            origin.head_publication_ns.load(std::memory_order_acquire) != 0u ||
             origin.accepted.load(std::memory_order_acquire) != 1u ||
             origin.requests.load(std::memory_order_acquire) != 1u ||
             origin.response_send_failed.load(std::memory_order_acquire) ||
@@ -75797,8 +75796,7 @@ static bool capture_issue630_head_episode(
             return false;
         }
         std::string sample;
-        if (!read_request_length_access_file(access_path, sample, error) ||
-            sample != "61\n") {
+        if (!read_request_length_access_file(access_path, sample, error) || sample != "61\n") {
             error = "#630 access ledger was not stably exact through the quiet window";
             close(client);
             return false;
@@ -75854,6 +75852,7 @@ static bool capture_issue630_head_episode(
         final_quiet && final_ledger_ok && origin.thread_alive.load(std::memory_order_acquire) &&
         !origin.listener_failed.load(std::memory_order_acquire) && !poll_child(frontend);
     if (!ok || !live_snapshot_ok) {
+        close(client);
         if (error.empty())
             error = "#630 origin retirement/request/access evidence mismatch: " + acceptance_detail;
         return false;
@@ -76017,14 +76016,19 @@ static bool run_pinned_nginx_bodyless_head_delayed_completion_oracle(std::string
         return false;
     HeadAcceptanceObservation accepted{};
     std::vector<char> upstream_wire;
-    if (!capture_issue630_head_episode(frontend, backend, temp.nginx_access_log, nginx.child,
-                                       origin, accepted, upstream_wire, error))
+    if (!capture_issue630_head_episode(frontend,
+                                       backend,
+                                       temp.nginx_access_log,
+                                       nginx.child,
+                                       origin,
+                                       accepted,
+                                       upstream_wire,
+                                       error))
         return false;
     const bool cleanup_ok = stop_child(nginx.child) && docker.remove();
     if (!cleanup_ok) return false;
     std::cerr << "PASS evidence: #630 HEAD header anchor/retirement ns=" << accepted.publication_ns
-              << "/" << accepted.header_ns << "/" << accepted.retirement_ns
-              << " ledger=61\\n\\n";
+              << "/" << accepted.header_ns << "/" << accepted.retirement_ns << " ledger=61\\n\\n";
     return true;
 }
 
