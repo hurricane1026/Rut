@@ -5601,6 +5601,7 @@ struct KeepAlivePinnedRecorder {
                         "X-Unrelated: retained\r\n"
                         "Content-Length: 12\r\n"
                         "Connection: keep-alive\r\n\r\n";
+                    static_assert(sizeof(kHead) - 1u == 182u);
                     if (!send_all(item.fd, kHead, sizeof(kHead) - 1u)) {
                         self->response_send_failed.store(true, std::memory_order_release);
                         remove = true;
@@ -74684,36 +74685,58 @@ static bool run_pinned_nginx_bodyless_head_delayed_completion_oracle(std::string
         close(client);
         return false;
     }
-    bool eof = false;
-    if (!wait_keepalive_quiet_or_eof(client, 2250, eof, error) || eof) {
-        error = eof ? "#630 downstream EOF during keep-alive observation"
-                    : "#630 downstream emitted body/tail after HEAD header";
-        close(client);
-        return false;
+    const u64 stable_deadline = header_complete_ns + 2'250'000'000ull;
+    while (steady_now_ns() < stable_deadline) {
+        if (!observe_client_open_and_quiet_nonconsuming(client, 50, error)) {
+            error = "#630 downstream emitted body/tail or closed during keep-alive observation";
+            close(client);
+            return false;
+        }
+        std::string sample;
+        if (!read_request_length_access_file(temp.nginx_access_log, sample, error) ||
+            sample != "61\n") {
+            error = "#630 access ledger was not stably exact through the quiet window";
+            close(client);
+            return false;
+        }
+        if (origin.response_send_failed.load() || origin.listener_failed.load() ||
+            origin.first_peer_unexpected_data.load() ||
+            origin.first_peer_observation_failed.load()) {
+            error = "#630 origin reported send/listener/protocol custody failure";
+            close(client);
+            return false;
+        }
     }
     const std::string expected_upstream =
         std::string("HEAD /buffered-timeout?q=1 HTTP/1.1\r\nHost: 127.0.0.1:") +
         std::to_string(backend) + "\r\n\r\n";
-    if (origin.history.size() != 1u ||
-        std::string(origin.history[0].wire.begin(), origin.history[0].wire.end()) !=
-            expected_upstream) {
-        error = "#630 upstream request wire mismatch";
-        close(client);
-        return false;
-    }
-    close(client);
     const auto retire_deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(350);
     while (!origin.first_peer_closed.load() && std::chrono::steady_clock::now() < retire_deadline)
         usleep(1000);
-    const bool ok = origin.first_peer_closed.load() &&
-                    origin.first_peer_closed_ns.load() >= publication_ns &&
-                    origin.first_peer_closed_ns.load() - publication_ns < 350'000'000ull &&
-                    publication_ns >= origin.request_complete_ns[0].load() + 1'150'000'000ull &&
-                    publication_ns < origin.request_complete_ns[0].load() + 1'400'000'000ull &&
-                    origin.accepted.load() == 1u && origin.requests.load() == 1u &&
-                    origin.history.size() == 1u && origin.history[0].wire.size() == 61u &&
-                    access == "61\n" && stop_child(nginx.child) && docker.remove();
-    if (!ok) {
+    const u64 retirement_ns = origin.first_peer_closed_ns.load();
+    const auto timing_accept = [](u64 request_ns, u64 publication, u64 retirement) {
+        return publication >= request_ns + 1'150'000'000ull &&
+               publication < request_ns + 1'400'000'000ull && retirement >= publication &&
+               retirement - publication < 350'000'000ull;
+    };
+    const bool ok =
+        origin.first_peer_closed.load() &&
+        timing_accept(origin.request_complete_ns[0].load(), publication_ns, retirement_ns) &&
+        origin.accepted.load() == 1u && origin.requests.load() == 1u && access == "61\n" &&
+        origin.response_send_calls.load() == 1u && origin.response_bytes_sent.load() == 182u &&
+        !origin.response_send_failed.load() && !origin.listener_failed.load() &&
+        !origin.first_peer_unexpected_data.load() && !origin.first_peer_observation_failed.load();
+    close(client);
+    origin.stop();
+    if (origin.history.size() != 1u ||
+        std::string(origin.history[0].wire.begin(), origin.history[0].wire.end()) !=
+            expected_upstream ||
+        origin.history[0].wire.size() != 61u) {
+        error = "#630 upstream request wire mismatch";
+        return false;
+    }
+    const bool cleanup_ok = stop_child(nginx.child) && docker.remove();
+    if (!ok || !cleanup_ok) {
         if (error.empty()) error = "#630 origin retirement/request/access evidence mismatch";
         return false;
     }
