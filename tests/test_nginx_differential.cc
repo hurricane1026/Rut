@@ -3560,6 +3560,9 @@ struct Recorder {
     // open and silent until the proxy retires it. The listener stays live
     // until explicit test cleanup so retries remain observable.
     bool wait_response_peer_close = false;
+    // #638 opt-in mode: publish the response-open commit, then let the test
+    // request one worker-owned MSG_PEEK probe before waiting for retirement.
+    bool probe_after_response_open = false;
     bool observe_extra_requests_until_stop = false;
     // Default-off semantic-baseline mode: four distinct, permit-gated
     // application writes make progress timing observable without making any
@@ -4135,6 +4138,70 @@ struct Recorder {
                             self->response_closed_by_gate.store(true, std::memory_order_release);
                         } else {
                             self->response_close_failed.store(true, std::memory_order_release);
+                        }
+                    }
+                } else if (response_sent && self->probe_after_response_open) {
+                    bool probe_observed = false;
+                    while (self->running.load(std::memory_order_acquire)) {
+                        const u32 requested =
+                            self->gated_fragment_probe_request.load(std::memory_order_acquire);
+                        if (requested == 1u &&
+                            self->gated_fragment_probe_ack.load(std::memory_order_acquire) < 1u) {
+                            const GatedFragmentPeerProbeResult result =
+                                probe_gated_fragment_peer(client);
+                            const u64 probe_ns = static_cast<u64>(
+                                std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                    std::chrono::steady_clock::now().time_since_epoch())
+                                    .count());
+                            self->gated_fragment_probe_result.store(result,
+                                                                    std::memory_order_relaxed);
+                            self->gated_fragment_probe_ns.store(probe_ns,
+                                                                std::memory_order_relaxed);
+                            self->gated_fragment_probe_ack.store(1u, std::memory_order_release);
+                            if (result != GatedFragmentPeerProbeResult::Open) {
+                                self->response_peer_observation_failed.store(
+                                    true, std::memory_order_release);
+                                break;
+                            }
+                            probe_observed = true;
+                        }
+                        if (probe_observed) {
+                            pollfd peer_poll{client, POLLIN | POLLHUP | POLLERR, 0};
+                            const int peer_ready = poll(&peer_poll, 1, 50);
+                            if (peer_ready < 0 && errno != EINTR) {
+                                self->response_peer_observation_failed.store(
+                                    true, std::memory_order_release);
+                                break;
+                            }
+                            if (peer_ready > 0) {
+                                char unexpected[64];
+                                const ssize_t n = recv(client, unexpected, sizeof(unexpected), 0);
+                                if (n == 0 || (n < 0 && errno == ECONNRESET)) {
+                                    self->response_peer_closed_ns.store(
+                                        static_cast<u64>(
+                                            std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                                std::chrono::steady_clock::now().time_since_epoch())
+                                                .count()),
+                                        std::memory_order_relaxed);
+                                    publish_peer_close(self->response_peer_closed,
+                                                       self->response_peer_close_count);
+                                    break;
+                                }
+                                if (n > 0) {
+                                    self->response_peer_unexpected_data.store(
+                                        true, std::memory_order_release);
+                                    break;
+                                }
+                                if (n < 0 &&
+                                    (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK))
+                                    continue;
+                                if (n < 0)
+                                    self->response_peer_observation_failed.store(
+                                        true, std::memory_order_release);
+                                if (n < 0) break;
+                            }
+                        } else {
+                            usleep(1000);
                         }
                     }
                 } else if (response_sent && wait_complete_response_peer_close) {
@@ -65560,7 +65627,10 @@ static bool run_pinned_nginx_explicit_buffering_off_oracle(TempDir& temp,
         count_text(config, "location / {") != 1u ||
         count_text(config, "proxy_buffering off;") != 1u ||
         count_text(config, "proxy_pass http://127.0.0.1:" + std::to_string(ports[1]) + ";") != 1u ||
-        count_text(config, "proxy_read_timeout 1s;") != 1u ||
+        count_text(config, "proxy_read_timeout 1s;") != 1u || count_text(config, "http {") != 1u ||
+        count_text(config, "server {") != 1u || count_text(config, "proxy_pass ") != 1u ||
+        count_text(config, "proxy_read_timeout ") != 1u ||
+        count_text(config, "access_log ") != 1u ||
         config.find("proxy_request_buffering") != std::string::npos ||
         config.find("proxy_http_version") != std::string::npos ||
         config.find("proxy_set_header") != std::string::npos ||
@@ -65572,6 +65642,7 @@ static bool run_pinned_nginx_explicit_buffering_off_oracle(TempDir& temp,
 
     Recorder origin;
     origin.wait_response_peer_close = true;
+    origin.probe_after_response_open = true;
     origin.observe_extra_requests_until_stop = true;
     if (!handoff_held_loopback_port(&reservations.fds[1], ports[1], "#638 origin bind", error) ||
         !origin.setup(ports[1],
@@ -65673,6 +65744,45 @@ static bool run_pinned_nginx_explicit_buffering_off_oracle(TempDir& temp,
         error = "#638 proxy_buffering off did not expose the exact 127-byte prefix before timeout";
         return false;
     }
+    // The prefix is now complete on the client.  Only this point authorizes
+    // the recorder-owned one-request probe; its ACK is causal evidence, not
+    // the response_sent_open latch by itself.
+    const u64 prefix_authorized_ns = steady_now_ns();
+    origin.gated_fragment_probe_request.store(1u, std::memory_order_release);
+    const u64 ack_deadline_ns = prefix_authorized_ns + 100'000'000ull;
+    while (origin.gated_fragment_probe_ack.load(std::memory_order_acquire) != 1u &&
+           steady_now_ns() < ack_deadline_ns) {
+        if (!origin_live() || poll_child(nginx.child) ||
+            origin.response_peer_closed.load(std::memory_order_acquire) ||
+            origin.response_peer_unexpected_data.load(std::memory_order_acquire) ||
+            origin.response_peer_observation_failed.load(std::memory_order_acquire)) {
+            error = "#638 lost live custody while awaiting post-prefix origin probe ACK";
+            return false;
+        }
+        char downstream = 0;
+        const ssize_t downstream_probe = recv(client.fd, &downstream, 1, MSG_PEEK | MSG_DONTWAIT);
+        if (downstream_probe == 0 || downstream_probe > 0 ||
+            (downstream_probe < 0 && errno != EINTR && errno != EAGAIN && errno != EWOULDBLOCK)) {
+            error = "#638 downstream EOF/tail/error occurred while awaiting probe ACK";
+            return false;
+        }
+        usleep(1000);
+    }
+    const u32 open_ack = origin.gated_fragment_probe_ack.load(std::memory_order_acquire);
+    const u64 open_ack_ns = origin.gated_fragment_probe_ns.load(std::memory_order_acquire);
+    const GatedFragmentPeerProbeResult open_probe =
+        origin.gated_fragment_probe_result.load(std::memory_order_acquire);
+    char post_ack_downstream = 0;
+    const ssize_t post_ack_probe =
+        recv(client.fd, &post_ack_downstream, 1, MSG_PEEK | MSG_DONTWAIT);
+    if (open_ack != 1u || open_probe != GatedFragmentPeerProbeResult::Open ||
+        (post_ack_probe != -1 && post_ack_probe != 0) ||
+        (post_ack_probe < 0 && errno != EINTR && errno != EAGAIN && errno != EWOULDBLOCK) ||
+        post_ack_probe == 0 || open_ack_ns < prefix_authorized_ns ||
+        open_ack_ns >= ack_deadline_ns || prefix_complete_ns > open_ack_ns) {
+        error = "#638 post-prefix origin probe did not ACK Open within 100ms";
+        return false;
+    }
     const auto eof_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
     while (eof_ns == 0u && std::chrono::steady_clock::now() < eof_deadline) {
         pollfd p{client.fd, POLLIN | POLLHUP | POLLERR, 0};
@@ -65707,25 +65817,123 @@ static bool run_pinned_nginx_explicit_buffering_off_oracle(TempDir& temp,
         error = "#638 origin was not naturally retired in the timeout window";
         return false;
     }
-    std::string access;
-    if (!read_request_length_access_file(temp.nginx_access_log, access, error) ||
-        access != "60\n") {
-        error = "#638 access ledger was not exactly 60\\n";
+    const LiveRetirementSnapshot retirement_snapshot =
+        snapshot_live_retirement(origin.response_peer_closed,
+                                 origin.response_peer_close_count,
+                                 origin.response_peer_closed_ns,
+                                 1'000'000'000ull);
+    LiveAccessLedgerObserver ledger;
+    ledger.freeze_eof(eof_ns);
+    const u64 ledger_deadline = eof_ns + 250'000'000ull;
+    bool ledger_ready = false;
+    while (steady_now_ns() < ledger_deadline && !ledger_ready) {
+        std::string access;
+        const bool read_ok = read_request_length_access_file(temp.nginx_access_log, access, error);
+        const bool retirement_ready = retirement_snapshot.state == LiveRetirementState::Ready;
+        const bool sampled = ledger.sample(
+            steady_now_ns(),
+            access,
+            read_ok,
+            poll_child(nginx.child) == false,
+            origin_live(),
+            origin.gated_fragment_probe_result.load(std::memory_order_acquire) ==
+                    GatedFragmentPeerProbeResult::Open &&
+                !origin.response_peer_unexpected_data.load(std::memory_order_acquire) &&
+                !origin.response_peer_observation_failed.load(std::memory_order_acquire),
+            true,
+            retirement_ready,
+            retirement_snapshot.state != LiveRetirementState::Invalid);
+        if (!sampled) {
+            error = "#638 live access/retirement observation failed before EOF+250ms";
+            return false;
+        }
+        ledger_ready = ledger.phase == LiveAccessLedgerObserver::Phase::Accepted;
+        usleep(5000);
+    }
+    if (!ledger_ready || !ledger.accepted_before_deadline()) {
+        error = "#638 exact access ledger/retirement evidence was late or missing";
+        return false;
+    }
+    if (!ledger.begin_stability(steady_now_ns())) {
+        error = "#638 could not begin live ledger stability";
         return false;
     }
     const u64 stability_deadline = steady_now_ns() + 175'000'000ull;
     while (steady_now_ns() < stability_deadline) {
+        const u64 sample_ns = steady_now_ns();
         std::string stable_access;
-        if (poll_child(nginx.child) || !origin_live() ||
-            !read_request_length_access_file(temp.nginx_access_log, stable_access, error) ||
-            stable_access != "60\n" || origin.accepted.load(std::memory_order_acquire) != 1u ||
-            origin.requests.load(std::memory_order_acquire) != 1u ||
-            origin.response_peer_unexpected_data.load(std::memory_order_acquire) ||
-            origin.response_peer_observation_failed.load(std::memory_order_acquire)) {
+        const bool read_ok =
+            read_request_length_access_file(temp.nginx_access_log, stable_access, error);
+        if (!ledger.stable_sample(
+                sample_ns,
+                stable_access,
+                read_ok,
+                !poll_child(nginx.child),
+                origin_live(),
+                !origin.response_peer_unexpected_data.load(std::memory_order_acquire) &&
+                    !origin.response_peer_observation_failed.load(std::memory_order_acquire),
+                true,
+                true,
+                retirement_snapshot.state != LiveRetirementState::Invalid) ||
+            origin.accepted.load(std::memory_order_acquire) != 1u ||
+            origin.requests.load(std::memory_order_acquire) != 1u) {
             error = "#638 live ledger/retirement evidence changed during 175ms stability";
             return false;
         }
         usleep(5000);
+    }
+    if (ledger.phase != LiveAccessLedgerObserver::Phase::Complete) {
+        std::string stable_access;
+        const u64 final_sample_ns = steady_now_ns();
+        if (!read_request_length_access_file(temp.nginx_access_log, stable_access, error) ||
+            !ledger.stable_sample(
+                final_sample_ns,
+                stable_access,
+                true,
+                !poll_child(nginx.child),
+                origin_live(),
+                !origin.response_peer_unexpected_data.load(std::memory_order_acquire) &&
+                    !origin.response_peer_observation_failed.load(std::memory_order_acquire),
+                true,
+                true,
+                retirement_snapshot.state != LiveRetirementState::Invalid)) {
+            error = "#638 live ledger stability did not complete";
+            return false;
+        }
+    }
+    // Freeze every acceptance input before any cleanup can invalidate a live
+    // witness.  Cleanup status is checked only afterward and cannot create
+    // missing protocol, ledger, or retirement evidence.
+    std::string frozen_access;
+    if (!read_request_length_access_file(temp.nginx_access_log, frozen_access, error) ||
+        frozen_access != "60\n") {
+        error = "#638 could not freeze the exact live access ledger";
+        return false;
+    }
+    const std::string expected_upstream =
+        "GET /buffered-timeout?q=1 HTTP/1.1\r\nHost: 127.0.0.1:" + std::to_string(ports[1]) +
+        "\r\n\r\n";
+    const std::vector<char> frozen_wire(expected_upstream.begin(), expected_upstream.end());
+    const std::vector<std::vector<char>> frozen_history = origin.history;
+    const std::vector<char> frozen_request = origin.request;
+    const u32 frozen_accepted = origin.accepted.load(std::memory_order_acquire);
+    const u32 frozen_requests = origin.requests.load(std::memory_order_acquire);
+    const u32 frozen_close_count = origin.response_peer_close_count.load(std::memory_order_acquire);
+    const bool frozen_send_failed = origin.response_send_failed.load(std::memory_order_acquire);
+    const bool frozen_unexpected =
+        origin.response_peer_unexpected_data.load(std::memory_order_acquire);
+    const bool frozen_observation_failed =
+        origin.response_peer_observation_failed.load(std::memory_order_acquire);
+    const bool frozen_clean_shutdown =
+        origin.response_clean_shutdown.load(std::memory_order_acquire);
+    const bool frozen_connection_closed =
+        origin.response_connection_closed.load(std::memory_order_acquire);
+    const bool frozen_live = origin_live() && !poll_child(nginx.child);
+    const bool client_closed = close(client.fd) == 0;
+    client.fd = -1;
+    if (!client_closed || !frozen_live) {
+        error = "#638 could not freeze live evidence before cleanup";
+        return false;
     }
     const bool nginx_stopped = stop_child(nginx.child);
     const bool container_removed = docker.remove();
@@ -65734,18 +65942,13 @@ static bool run_pinned_nginx_explicit_buffering_off_oracle(TempDir& temp,
         error = "#638 owned nginx/container/fd cleanup was incomplete";
         return false;
     }
-    const std::string expected_upstream =
-        "GET /buffered-timeout?q=1 HTTP/1.1\r\nHost: 127.0.0.1:" + std::to_string(ports[1]) +
-        "\r\n\r\n";
-    const std::vector<char> expected_wire(expected_upstream.begin(), expected_upstream.end());
     origin.stop();
-    if (origin.history.size() != 1u || origin.history[0] != expected_wire ||
-        origin.request != expected_wire || origin.accepted.load(std::memory_order_acquire) != 1u ||
-        origin.requests.load(std::memory_order_acquire) != 1u ||
-        origin.response_peer_close_count.load(std::memory_order_acquire) != 1u ||
-        origin.response_send_failed.load(std::memory_order_acquire) ||
-        origin.response_peer_unexpected_data.load(std::memory_order_acquire) ||
-        origin.response_peer_observation_failed.load(std::memory_order_acquire)) {
+    if (frozen_history.size() != 1u || frozen_history[0] != frozen_wire ||
+        frozen_request != frozen_wire || frozen_accepted != 1u || frozen_requests != 1u ||
+        frozen_close_count != 1u || frozen_send_failed || frozen_unexpected ||
+        frozen_observation_failed || !frozen_clean_shutdown || !frozen_connection_closed ||
+        origin.thread_alive.load(std::memory_order_acquire) || origin.listen_fd >= 0 ||
+        frozen_access != "60\n") {
         error = "#638 upstream ledger contained retry, mutation, or observer failure evidence";
         return false;
     }
