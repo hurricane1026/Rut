@@ -36,8 +36,12 @@ PR #629 merged at `afe50e5b` from `04ae2bf7` after CI `34686463457` passed
 separate composition witness tracked by #630. Its nginx-only delayed-header
 oracle at `9640547d` passed independent review, root Release build and ten
 targeted tests with zero skips (67.61s; new HEAD oracle 3.81s). This establishes
-the real-nginx baseline only; same-file generated-RUT HEAD differential and
-exact-head PR/CI integration remain pending. No HEAD support is promoted.
+the real-nginx baseline only. PR #631 merged at `bc3c770b` from final
+`4c38c945` after CI `34695407252` passed all 15 ordinary jobs and required
+nginx 159/159 with zero skips (634.82s; HEAD oracle 3.76s). Reviewed #634/#635
+test-infrastructure corrections are integrated through #636/#633; historical
+failures remain recorded. The same-file generated-RUT HEAD differential is
+CURRENT under #630 and remains unproven. No HEAD support is promoted.
 #623 tracks a reproduced source-backed Server-model hide-metadata erasure gap;
 its fix merged through #624 at `2bba609a` after CI `34320265023` passed all
 15 jobs and required nginx 155/155. This strengthens model authentication only.
