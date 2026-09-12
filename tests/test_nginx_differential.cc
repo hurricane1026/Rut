@@ -59069,6 +59069,32 @@ static std::string make_explicit_timeout_head_profile(u16 frontend_port,
            "}\n";
 }
 
+// Issue 630's immutable fixture is deliberately independent of the older
+// one-second admission fixture: the live oracle uses this exact profile.
+static std::string make_issue630_head_profile(u16 frontend_port,
+                                              u16 backend_port,
+                                              const std::string& access_path) {
+    return "http {\n"
+           "  log_format compat \"$request_length\";\n"
+           "  access_log " +
+           access_path +
+           " compat;\n"
+           "  server {\n"
+           "    listen 127.0.0.1:" +
+           std::to_string(frontend_port) +
+           ";\n"
+           "    location / {\n"
+           "      proxy_pass http://127.0.0.1:" +
+           std::to_string(backend_port) +
+           ";\n"
+           "      proxy_buffering on;\n"
+           "      proxy_hide_header X-Powered-By;\n"
+           "      proxy_read_timeout 2s;\n"
+           "    }\n"
+           "  }\n"
+           "}\n";
+}
+
 static bool validate_explicit_timeout_head_profile(const std::string& profile,
                                                    u16 frontend_port,
                                                    u16 backend_port,
@@ -76377,8 +76403,7 @@ static bool run_pinned_nginx_bodyless_head_cli_differential(const char* rut_path
         error = "#630 HEAD CLI differential could not allocate owned resources";
         return false;
     }
-    const std::string profile =
-        make_explicit_timeout_head_profile(frontend, backend, temp.rut_access_log, true);
+    const std::string profile = make_issue630_head_profile(frontend, backend, temp.rut_access_log);
     std::string config = "events {}\n" + profile;
     if (!write_file(temp.nginx_config, config.data(), config.size())) {
         error = "#630 HEAD CLI differential could not persist immutable config";
@@ -76439,7 +76464,102 @@ static bool run_pinned_nginx_bodyless_head_cli_differential(const char* rut_path
         error = "#630 generated source changed during O2 admission";
         return false;
     }
-    std::cerr << "PASS evidence: #630 same-file converter/O2 HEAD policy admission\n";
+    // Prove the loaded program is the executable under test.  The source is
+    // poisoned only after loading and restored before process creation.
+    static constexpr char kPoison[] = "#630 destroyed after O2 load\n";
+    std::string poison_readback;
+    if (!write_file(temp.source, kPoison, sizeof(kPoison) - 1u) ||
+        !read_exact_rut_source(temp.source, "#630 source poison", poison_readback, error) ||
+        poison_readback != kPoison || !write_file(temp.source, snapshot.data(), snapshot.size())) {
+        error = "#630 generated source ownership proof failed";
+        return false;
+    }
+
+    KeepAlivePinnedRecorder origin(KeepAlivePinnedRecorder::FirstResponseMode::DelayedHeadComplete);
+    ChildGuard rut;
+    if (!handoff_held_loopback_port(&ports.fds[1], backend, "#630 generated origin bind", error) ||
+        !origin.setup(backend) ||
+        !handoff_held_loopback_port(&ports.fds[0], frontend, "#630 generated RUT bind", error) ||
+        !spawn_child({rut_path, temp.source, "--shards", "1", "--no-pin", "--drain", "0"},
+                     temp.rut_log,
+                     rut.child) ||
+        !wait_ready(frontend, rut.child, error)) {
+        if (error.empty()) error = "#630 generated RUT failed readiness";
+        return false;
+    }
+    static constexpr char kRequest[] =
+        "HEAD /buffered-timeout?q=1 HTTP/1.1\r\nHost: client.example\r\n\r\n";
+    static constexpr char kExpected[] =
+        "HTTP/1.1 200 OK\r\nServer: nginx/1.29.7\r\n"
+        "Date: XXXXXXXXXXXXXXXXXXXXXXXXXXXXX\r\nContent-Length: 12\r\n"
+        "Connection: keep-alive\r\nX-Unrelated: retained\r\n\r\n";
+    const std::string expected_upstream(kRequest, sizeof(kRequest) - 1u);
+    int client = connect_once(frontend);
+    if (client < 0 || !send_all(client, kRequest, sizeof(kRequest) - 1u)) {
+        if (client >= 0) close(client);
+        error = "#630 generated HEAD request send failed";
+        return false;
+    }
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+    while (origin.requests.load(std::memory_order_acquire) != 1u &&
+           std::chrono::steady_clock::now() < deadline)
+        usleep(1000);
+    if (origin.requests.load(std::memory_order_acquire) != 1u) {
+        close(client);
+        error = "#630 generated RUT did not forward one HEAD request";
+        return false;
+    }
+    origin.head_probe_request.store(true, std::memory_order_release);
+    const auto ack_deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(500);
+    while (origin.head_probe_ack_ns.load(std::memory_order_acquire) == 0u &&
+           std::chrono::steady_clock::now() < ack_deadline)
+        usleep(1000);
+    if (origin.head_probe_ack_ns.load(std::memory_order_acquire) == 0u) {
+        close(client);
+        error = "#630 generated origin peer-open ACK missing";
+        return false;
+    }
+    origin.head_publish_permit.store(true, std::memory_order_release);
+    std::vector<char> response;
+    u64 header_ns = 0u;
+    const auto response_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(3);
+    while (std::chrono::steady_clock::now() < response_deadline) {
+        char buf[1024];
+        const ssize_t n = recv(client, buf, sizeof(buf), MSG_DONTWAIT);
+        if (n > 0) {
+            response.insert(response.end(), buf, buf + n);
+            const size_t end = header_end(response);
+            if (end != 0u) {
+                header_ns = steady_now_ns();
+                if (response.size() != end) {
+                    close(client);
+                    error = "#630 generated HEAD emitted representation bytes";
+                    return false;
+                }
+                break;
+            }
+        } else if (n < 0 && errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR) break;
+        usleep(1000);
+    }
+    std::string access;
+    const bool wire_ok = header_ns != 0u &&
+                         validate_exact_normalized_response(response, kExpected, error);
+    const bool access_ok = read_request_length_access_file(temp.rut_access_log, access, error) &&
+                           access == "61\n";
+    const bool upstream_ok = origin.history.size() == 1u && origin.history[0].wire.size() == 61u &&
+                             std::string(origin.history[0].wire.begin(), origin.history[0].wire.end()) ==
+                                 expected_upstream;
+    const bool live_ok = observe_client_open_and_quiet_nonconsuming(client, 50, error) &&
+                         !origin.response_send_failed.load(std::memory_order_acquire) &&
+                         !origin.listener_failed.load(std::memory_order_acquire) && !poll_child(rut.child);
+    close(client);
+    origin.stop();
+    const bool cleanup_ok = stop_child(rut.child);
+    if (!wire_ok || !access_ok || !upstream_ok || !live_ok || !cleanup_ok) {
+        if (error.empty()) error = "#630 generated RUT HEAD episode differed from pinned acceptance";
+        return false;
+    }
+    std::cerr << "PASS evidence: #630 same-file nginx-http conversion and live RUT HEAD differential\n";
     return true;
 }
 
