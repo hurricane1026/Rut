@@ -841,6 +841,7 @@ struct DockerInfoResult {
     bool launch_channel_closed_before_cleanup = false;
     bool launch_integrity_error = false;
     bool launch_evidence_frozen = false;
+    bool status_pipe_closed = false;
 };
 
 // Fixture-local decoder for the child launch-status protocol.  Keeping the
@@ -1048,6 +1049,7 @@ static DockerInfoResult run_docker_info_runner(const std::vector<std::string>& a
     const auto launch_failure = [&]() {
         if (status_pipe[0] >= 0) close(status_pipe[0]);
         if (status_pipe[1] >= 0) close(status_pipe[1]);
+        result.status_pipe_closed = true;
         result.probe_elapsed_ns =
             static_cast<u64>(std::chrono::duration_cast<std::chrono::nanoseconds>(
                                  std::chrono::steady_clock::now() - started)
@@ -1262,6 +1264,7 @@ static DockerInfoResult run_docker_info_runner(const std::vector<std::string>& a
     status_pipe[0] = -1;
     if (status_pipe[0] >= 0) close(status_pipe[0]);
     if (status_pipe[1] >= 0) close(status_pipe[1]);
+    result.status_pipe_closed = true;
     result.probe_elapsed_ns = static_cast<u64>(std::chrono::duration_cast<std::chrono::nanoseconds>(
                                                    std::chrono::steady_clock::now() - started)
                                                    .count()) -
@@ -1589,7 +1592,7 @@ static bool run_docker_info_preflight_self_check(std::string& error) {
                      int expected_exit = -1) {
         DockerInfoResult result = run_docker_info_runner(args, log, timeout_ms);
         unlink(log.c_str());
-        if (result.outcome != expected ||
+        if (result.outcome != expected || !result.status_pipe_closed ||
             (expected == DockerInfoOutcome::Exited && expected_exit >= 0 &&
              (!result.child.status_valid || !WIFEXITED(result.child.status) ||
               WEXITSTATUS(result.child.status) != expected_exit)) ||
@@ -1609,6 +1612,35 @@ static bool run_docker_info_preflight_self_check(std::string& error) {
         !check({"sh", "-c", "exit 0"}, 100, DockerInfoOutcome::Exited, 0) ||
         !check({"sh", "-c", "kill -TERM $$"}, 100, DockerInfoOutcome::Signaled) ||
         !check({"sh", "-c", "exec sleep 1"}, 50, DockerInfoOutcome::TimedOut)) {
+        cleanup();
+        return false;
+    }
+    // An exec'd process inherits no launch records after CLOEXEC closes the
+    // status writer.  This is distinct from pre-exec FIFO blocking: EOF here
+    // is only launch-channel closure, never proof of successful exec.
+    DockerInfoResult silent_postexec =
+        run_docker_info_runner({"sh", "-c", "exec sleep 1"}, log, 50);
+    const size_t silent_records = silent_postexec.launch_observations.size();
+    std::string silent_snapshot;
+    std::string silent_snapshot_error;
+    DockerSnapshotState silent_snapshot_state = DockerSnapshotState::Missing;
+    const bool silent_snapshot_ok =
+        read_docker_snapshot(log, silent_snapshot, silent_snapshot_error, silent_snapshot_state);
+    unlink(log.c_str());
+    if (silent_postexec.outcome != DockerInfoOutcome::TimedOut ||
+        !silent_postexec.launch_channel_closed ||
+        !silent_postexec.launch_channel_closed_before_cleanup ||
+        !silent_postexec.launch_evidence_frozen || silent_records != 3 ||
+        silent_postexec.kill_attempted == false || silent_postexec.kill_failed ||
+        silent_postexec.reap_failed || silent_postexec.ownership_unresolved ||
+        !silent_postexec.child.reaped || !silent_postexec.child.status_valid ||
+        !WIFSIGNALED(silent_postexec.child.status) ||
+        WTERMSIG(silent_postexec.child.status) != SIGKILL || !silent_snapshot_ok ||
+        silent_snapshot_state != DockerSnapshotState::Empty ||
+        docker_info_return_code(docker_info_decision(silent_postexec), true) != 1 ||
+        docker_info_return_code(docker_info_decision(silent_postexec), false) != 1 ||
+        !silent_postexec.status_pipe_closed) {
+        error = "post-exec silent timeout lifecycle control failed";
         cleanup();
         return false;
     }
@@ -1767,12 +1799,39 @@ static bool run_docker_info_preflight_self_check(std::string& error) {
         return false;
     }
     DockerInfoResult fifo = run_docker_info_runner({"sh", "-c", "exit 0"}, log, 50);
+    const size_t fifo_records = fifo.launch_observations.size();
     unlink(log.c_str());
     if (fifo.outcome != DockerInfoOutcome::TimedOut || !fifo.kill_attempted || fifo.reap_failed ||
         fifo.ownership_unresolved || fifo.launch_observations.size() != 1 ||
         fifo.launch_observations[0].stage != DockerInfoResult::LaunchStage::BeforeLogOpen ||
-        fifo.launch_channel_closed) {
+        fifo.launch_channel_closed || fifo.launch_channel_closed_before_cleanup ||
+        !fifo.launch_evidence_frozen || fifo_records != fifo.launch_observations.size() ||
+        !fifo.status_pipe_closed ||
+        docker_info_return_code(docker_info_decision(fifo), true) != 1 ||
+        docker_info_return_code(docker_info_decision(fifo), false) != 1) {
         error = "FIFO before-log-open timeout control failed";
+        cleanup();
+        return false;
+    }
+    // Closing all conventional stdio descriptors in the child must not
+    // collide with the relocated status pipe (or suppress the owned exit
+    // status).  The runner's log redirection is established before exec.
+    DockerInfoResult stdio_collision =
+        run_docker_info_runner({"sh", "-c", "exec 0>&- 1>&- 2>&-; exit 0"}, log, 100);
+    std::string stdio_snapshot;
+    std::string stdio_snapshot_error;
+    DockerSnapshotState stdio_snapshot_state = DockerSnapshotState::Missing;
+    const bool stdio_snapshot_ok =
+        read_docker_snapshot(log, stdio_snapshot, stdio_snapshot_error, stdio_snapshot_state);
+    unlink(log.c_str());
+    if (stdio_collision.outcome != DockerInfoOutcome::Exited || !stdio_collision.child.reaped ||
+        !stdio_collision.child.status_valid || !WIFEXITED(stdio_collision.child.status) ||
+        WEXITSTATUS(stdio_collision.child.status) != 0 || stdio_collision.launch_integrity_error ||
+        stdio_collision.launch_observations.size() != 3 || !stdio_snapshot_ok ||
+        stdio_snapshot_state != DockerSnapshotState::Empty ||
+        docker_info_decision(stdio_collision) != DockerInfoDecision::Success ||
+        !stdio_collision.status_pipe_closed) {
+        error = "standard-fd collision launch control failed";
         cleanup();
         return false;
     }
