@@ -58,6 +58,15 @@ its fix merged through #624 at `2bba609a` after CI `34320265023` passed all
 Broad #270 remains
 `PARTIAL` and #271 remains `BLOCKED_BY_RUT`.
 
+#638 `d345e933` completes only the independently reviewed snapshots/ownership
+correction. A local Clang Release build and six focused tests passed (16.65s,
+zero skips), including the first explicit-off nginx-only run (1.65s): exact
+normalized 127-byte 200/CL12 plus `hello` prefix, inactivity EOF, natural origin
+retirement and stable `60\n` ledger. Shared real/synthetic acceptance and
+negative controls remain pending, as do complete-candidate CI, the separate
+ordinary-RUT capability witness and same-file converter differential. The
+converter still rejects `proxy_buffering off`; no compatibility row is promoted.
+
 | nginx feature | parser | converter | RUT capability | behavior test | status |
 | --- | --- | --- | --- | --- | --- |
 | Explicit-on/X-Powered-By/`proxy_read_timeout 2s`: exact-loopback root/no-URI fixed IPv4 upstream; fresh bodyless default-keepalive cleartext H1.1 HEAD `/buffered-timeout?q=1`; one delayed complete-header response, no representation body | yes, existing authenticated bounded model | yes, actual standalone converter stdout and ordinary O2 selected root HEAD bundle; timeout 2s->1s, SuppressBody->Reject and None->CompleteContentLength each reject with unchanged route identity, restoration passes | yes for this exact episode; existing SuppressBody/None response and timeout primitives, no nginx runtime mode | #631 pinned baseline and #637 same immutable config/path/endpoints through nginx and generated RUT; origin publishes 182 header bytes after [1.15s,1.40s), normalized 145-byte header-only response and retirement each within 350ms, exact 61-byte upstream request, live `61\n` ledger within header+250ms and stable quiet/open downstream through header+2.25s; one request/publication/retirement, no retry, acceptance frozen before cleanup and history checked after join. CI `34698186843`: 160/160, zero skips. Other schedules/methods/bodies/names/durations/expiry/reuse/TLS excluded | SUPPORTED |

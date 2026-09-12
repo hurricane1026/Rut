@@ -19,8 +19,10 @@ Keep CURRENT to one main task and NEXT to at most three clear tasks.
 The previous session repeatedly received `agent thread limit reached` both when
 spawning workers and when following up completed workers, including a Terra
 spawn attempt. No model switch or successful corrective assignment followed.
-A new session may help but is not proven to solve the error. First assign one
-Luna a useful read-only audit of this handoff and #638; do not fan out tasks.
+In this session the initial audit succeeded: Luna `handoff_audit` completed it,
+then implemented the bounded correction; a different Luna `snapshot_review` reviewed
+and approved the corrected patch. Spawn and follow-up both worked in this
+session. Continue the small relay; do not repeat the completed initial audit.
 
 The user authorized primary-agent implementation and explicitly labelled
 self-review as an in-session fallback, then reiterated the preferred Astra/Luna
@@ -32,10 +34,12 @@ exposed tools; the user selects the primary model in the client.
 
 - Assigned worktree: `/home/hurricane/private/code/Rut_issue627_two_second_oracle`.
 - Branch: `nginx-off-oracle`.
-- Before this documentation update, local HEAD and remote branch both verified
-  as `ef9a0935e78906b0e61af3cd9fe1268c50dbb81d`; worktree was clean.
-- Current #638 source candidate: `6d07bf42`, **REQUEST_CHANGES, unbuilt/untested**.
-  Subsequent commits through the verified HEAD only record handoff state.
+- This session started with clean worktree and local/remote HEAD both
+  `6942666557d9f9a4303d40de266b640f4920f217`.
+- Current #638 source candidate: `d345e933`, independently **APPROVED for the
+  snapshots/ownership increment only**. See current status for validation logs.
+  Historical `6d07bf42` remains rejected; the complete oracle still needs its
+  shared acceptance validator and negative controls.
 - Integration base: `agent/nginx-to-rut-converter`, not `main`.
 - Parent [PR #269](https://github.com/hurricane1026/Rut/pull/269) stays draft.
 - The main worktree `/home/hurricane/private/code/Rut` has unrelated user WIP in
@@ -49,7 +53,7 @@ exposed tools; the user selects the primary model in the client.
 
 1. Applicable `AGENTS.md` files, if present.
 2. This document and [current status](../.nginx-converter-status.md), especially
-   `Pending small handoff: #638 snapshots and ownership`.
+   the current shared-validator task and the completed snapshots/ownership evidence.
 3. [Compatibility matrix](nginx-compatibility.md).
 4. [Issue #638](https://github.com/hurricane1026/Rut/issues/638), including design,
    review and capacity-blocker comments. Detailed pending handoff is preserved
@@ -79,10 +83,14 @@ The minimal fixture uses one server/location, numeric loopback endpoints,
 `proxy_buffering off`, `proxy_read_timeout 1s`, and an owned access ledger.
 A fresh bodyless HTTP/1.1 GET has 60 request bytes. The origin publishes one
 103-byte response prefix with `Content-Length: 12` but only `hello`, then remains
-open and silent until natural peer retirement. The predicted normalized client
-prefix is 127 bytes; the oracle has not yet established this behavior.
+open and silent until natural peer retirement. The first local run of `d345e933` observed the exact normalized 127-byte client
+prefix, inactivity EOF, one natural retirement and stable `60\n` ledger. The
+Clang Release build and six focused tests passed with zero skips (16.65s, new
+oracle 1.65s); logs are `/tmp/rut-638-snapshots-build.log` and
+`/tmp/rut-638-snapshots-targeted.log`. This is local nginx-only evidence; the
+shared validator/negative controls and complete-candidate CI remain pending.
 
-### Next implementation: snapshots and ownership only
+### Completed implementation: snapshots and ownership only (`d345e933`)
 
 - Remove reads/copies of live recorder request/history vectors before join.
   Freeze owned observations and atomics while live; inspect vectors after join.
@@ -103,10 +111,13 @@ prefix is 127 bytes; the oracle has not yet established this behavior.
   control-flow inspection disputed this. Recheck the enclosing independent
   conditionals before changing branch selection. This is not a confirmed bug.
 
-Acceptance: a bounded diff addressing those ownership/observation defects,
-source review of synchronization and cleanup boundaries, targeted validation
-scheduled by the lead, and explicit reporting of remaining validator work.
-No parser/converter/runtime expansion in this increment.
+The bounded correction above is implemented and independently reviewed. The
+first review requested explicit EOF-after-ACK, full post-ACK custody and final
+ledger-read-before-retirement-snapshot ordering; these were fixed before commit.
+The shared ledger observer was also moved unchanged before its first use to
+correct the predecessor's declaration-order error. No parser/converter/runtime
+expansion occurred. Consult current status for lead-scheduled validation; this
+increment alone does not accept the complete oracle.
 
 ## NEXT
 
@@ -128,8 +139,8 @@ until the precise supported input scope has actual equivalence evidence.
 - Lead is sole heavy-test scheduler; only one full build/integration/differential
   run at a time. Use `-j1` for the existing build.
 - Existing build directory: `/home/hurricane/private/code/Rut_build627_clang`
-  (Clang Release, IPO off). Recheck its source/cache before reuse; it predates
-  the unvalidated #638 candidate.
+  (Clang Release, IPO off). It was rebuilt for `d345e933` in this session;
+  recheck its source/cache before later reuse.
 - Target: `test_nginx_differential`. New oracle mode:
   `--pinned-nginx-explicit-buffering-off-oracle`. Inspect registered CTest names
   and required environment before invoking tests.
@@ -152,8 +163,9 @@ Work in /home/hurricane/private/code/Rut_issue627_two_second_oracle.
 Read applicable AGENTS.md and docs/nginx-converter-session-handoff.md first,
 then .nginx-converter-status.md, docs/nginx-compatibility.md and issue #638.
 Verify git/GitHub state and preserve unrelated user WIP in the main worktree.
-First assign one Luna a read-only #638 handoff audit to verify multi-agent works.
-Then proceed with one small implementation → different-worker review →
+The initial read-only audit and snapshots/ownership increment are complete.
+Next implement the shared real/synthetic validator and negative controls.
+Proceed with one small implementation → different-worker review →
 lead-scheduled tests → status/issue update at a time. Do not claim off support
 from untested source or nginx-only evidence. Keep parent PR #269 draft and
 integrate only into agent/nginx-to-rut-converter, not main.
