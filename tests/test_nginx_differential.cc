@@ -818,6 +818,8 @@ struct DockerInfoResult {
     int error_number = 0;
     int wait_error_number = 0;
     int cleanup_wait_error_number = 0;
+    int status_pipe_close_error = 0;
+    int status_pipe_verify_error = 0;
     u64 probe_elapsed_ns = 0;
     u64 cleanup_elapsed_ns = 0;
     int configured_timeout_ms = 10'000;
@@ -1041,17 +1043,37 @@ static bool reap_child_bounded(Child& child, int timeout_ms, int& wait_error) {
 
 static DockerInfoResult run_docker_info_runner(const std::vector<std::string>& args,
                                                const std::string& log_path,
-                                               int timeout_ms = 10'000) {
+                                               int timeout_ms = 10'000,
+                                               bool protect_inner_parent = false) {
     DockerInfoResult result;
     result.configured_timeout_ms = timeout_ms;
     result.status_pipe_closed = true;
     const auto started = std::chrono::steady_clock::now();
     static_assert(sizeof(DockerLaunchRecord) < PIPE_BUF);
     int status_pipe[2] = {-1, -1};
+    const auto close_owned_fd = [&](int& fd) {
+        if (fd < 0) return true;
+        const int old_fd = fd;
+        const int close_rc = close(old_fd);
+        const int close_errno = errno;
+        fd = -1;
+        errno = 0;
+        const int verify_rc = fcntl(old_fd, F_GETFD);
+        const int verify_errno = errno;
+        if (close_rc != 0) {
+            if (result.status_pipe_close_error == 0) result.status_pipe_close_error = close_errno;
+        }
+        if (verify_rc != -1 || verify_errno != EBADF) {
+            if (result.status_pipe_verify_error == 0)
+                result.status_pipe_verify_error = verify_rc == -1 ? verify_errno : 0;
+        }
+        return close_rc == 0 && verify_rc == -1 && verify_errno == EBADF;
+    };
     const auto launch_failure = [&]() {
         bool closed = true;
-        if (status_pipe[0] >= 0 && close(status_pipe[0]) != 0) closed = false;
-        if (status_pipe[1] >= 0 && close(status_pipe[1]) != 0) closed = false;
+        const bool read_closed = close_owned_fd(status_pipe[0]);
+        const bool write_closed = close_owned_fd(status_pipe[1]);
+        closed = read_closed && write_closed;
         result.status_pipe_closed = result.status_pipe_closed && closed;
         result.probe_elapsed_ns =
             static_cast<u64>(std::chrono::duration_cast<std::chrono::nanoseconds>(
@@ -1068,12 +1090,13 @@ static DockerInfoResult run_docker_info_runner(const std::vector<std::string>& a
         const int moved = fcntl(status_pipe[i], F_DUPFD_CLOEXEC, 3);
         if (moved < 0) {
             result.error_number = errno;
-            result.status_pipe_closed = close(status_pipe[0]) == 0 && close(status_pipe[1]) == 0;
-            status_pipe[0] = status_pipe[1] = -1;
+            const bool read_closed = close_owned_fd(status_pipe[0]);
+            const bool write_closed = close_owned_fd(status_pipe[1]);
+            result.status_pipe_closed = result.status_pipe_closed && read_closed && write_closed;
             result.outcome = DockerInfoOutcome::SpawnFailed;
             return launch_failure();
         }
-        close(status_pipe[i]);
+        result.status_pipe_closed = close_owned_fd(status_pipe[i]) && result.status_pipe_closed;
         status_pipe[i] = moved;
     }
     {
@@ -1083,8 +1106,9 @@ static DockerInfoResult run_docker_info_runner(const std::vector<std::string>& a
             fcntl(status_pipe[0], F_SETFL, flags | O_NONBLOCK) != 0 ||
             fcntl(status_pipe[1], F_SETFL, write_flags | O_NONBLOCK) != 0) {
             result.error_number = errno;
-            result.status_pipe_closed = close(status_pipe[0]) == 0 && close(status_pipe[1]) == 0;
-            status_pipe[0] = status_pipe[1] = -1;
+            const bool read_closed = close_owned_fd(status_pipe[0]);
+            const bool write_closed = close_owned_fd(status_pipe[1]);
+            result.status_pipe_closed = result.status_pipe_closed && read_closed && write_closed;
             result.outcome = DockerInfoOutcome::SpawnFailed;
             return launch_failure();
         }
@@ -1097,8 +1121,9 @@ static DockerInfoResult run_docker_info_runner(const std::vector<std::string>& a
         const pid_t pid = fork();
         if (pid < 0) {
             result.error_number = errno;
-            result.status_pipe_closed = close(status_pipe[0]) == 0 && close(status_pipe[1]) == 0;
-            status_pipe[0] = status_pipe[1] = -1;
+            const bool read_closed = close_owned_fd(status_pipe[0]);
+            const bool write_closed = close_owned_fd(status_pipe[1]);
+            result.status_pipe_closed = result.status_pipe_closed && read_closed && write_closed;
             result.outcome = DockerInfoOutcome::SpawnFailed;
             return launch_failure();
         }
@@ -1118,6 +1143,13 @@ static DockerInfoResult run_docker_info_runner(const std::vector<std::string>& a
                     n = write(status_pipe[1], &record, sizeof(record));
                 } while (n < 0 && errno == EINTR);
             };
+            if (protect_inner_parent && prctl(PR_SET_PDEATHSIG, SIGKILL) != 0) {
+                announce(DockerInfoResult::LaunchStage::BeforeLogOpen);
+                announce(DockerInfoResult::LaunchStage::LaunchError,
+                         DockerInfoResult::LaunchStage::BeforeLogOpen,
+                         errno);
+                _exit(127);
+            }
             announce(DockerInfoResult::LaunchStage::BeforeLogOpen);
             const int fd = open(log_path.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0600);
             if (fd < 0) {
@@ -1260,11 +1292,9 @@ static DockerInfoResult run_docker_info_runner(const std::vector<std::string>& a
         return index < result.launch_observations.size() ? result.launch_observations[index].stage
                                                          : DockerInfoResult::LaunchStage::None;
     };
-    const bool read_pipe_closed = close(status_pipe[0]) == 0;
-    status_pipe[0] = -1;
-    const bool write_pipe_closed = status_pipe[1] < 0 || close(status_pipe[1]) == 0;
-    status_pipe[1] = -1;
-    result.status_pipe_closed = read_pipe_closed && write_pipe_closed;
+    const bool read_pipe_closed = close_owned_fd(status_pipe[0]);
+    const bool write_pipe_closed = close_owned_fd(status_pipe[1]);
+    result.status_pipe_closed = result.status_pipe_closed && read_pipe_closed && write_pipe_closed;
     result.probe_elapsed_ns = static_cast<u64>(std::chrono::duration_cast<std::chrono::nanoseconds>(
                                                    std::chrono::steady_clock::now() - started)
                                                    .count()) -
@@ -1838,12 +1868,11 @@ static bool run_docker_info_preflight_self_check(std::string& error) {
     const pid_t outer_pid = fork();
     if (outer_pid == 0) {
         close(collision_pipe[0]);
-        (void)prctl(PR_SET_PDEATHSIG, SIGKILL);
         close(STDIN_FILENO);
         close(STDOUT_FILENO);
         close(STDERR_FILENO);
-        const DockerInfoResult inner =
-            run_docker_info_runner({"sh", "-c", "printf 'stdio-collision'; exit 0"}, log, 100);
+        const DockerInfoResult inner = run_docker_info_runner(
+            {"sh", "-c", "printf 'stdio-collision'; exit 0"}, log, 100, true);
         const StdioCollisionReport report{kStdioCollisionMagic,
                                           static_cast<int32_t>(inner.outcome),
                                           inner.child.status_valid ? inner.child.status : -1,
@@ -1869,7 +1898,7 @@ static bool run_docker_info_preflight_self_check(std::string& error) {
     close(collision_pipe[1]);
     Child outer;
     outer.pid = outer_pid;
-    if (outer_pid < 0 || !wait_child(outer, 1'000)) {
+    if (outer_pid < 0 || !wait_child(outer, 3'500)) {
         if (outer_pid > 0) (void)kill(outer_pid, SIGKILL);
         int outer_wait_error = 0;
         if (outer_pid > 0) (void)reap_child_bounded(outer, 2'000, outer_wait_error);
@@ -1894,9 +1923,9 @@ static bool run_docker_info_preflight_self_check(std::string& error) {
         !WIFEXITED(collision_report.child_status) ||
         WEXITSTATUS(collision_report.child_status) != 0 || collision_report.integrity_error ||
         collision_report.records != 3 || !stdio_snapshot_ok ||
-        stdio_snapshot_state != DockerSnapshotState::Empty || stdio_snapshot != "stdio-collision" ||
-        !collision_report.status_pipe_closed || outer.status_valid == false ||
-        !WIFEXITED(outer.status) || WEXITSTATUS(outer.status) != 0) {
+        stdio_snapshot_state != DockerSnapshotState::NonEmpty ||
+        stdio_snapshot != "stdio-collision" || !collision_report.status_pipe_closed ||
+        outer.status_valid == false || !WIFEXITED(outer.status) || WEXITSTATUS(outer.status) != 0) {
         error = "standard-fd collision launch control failed";
         cleanup();
         return false;
