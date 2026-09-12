@@ -5345,6 +5345,8 @@ struct KeepAlivePinnedRecorder {
     std::atomic<u64> head_publication_ns{0};
     std::atomic<bool> head_publish_permit{false};
     std::atomic<bool> head_peer_open_ack{false};
+    std::atomic<bool> head_probe_request{false};
+    std::atomic<u64> head_probe_ack_ns{0};
     std::atomic<u32> response_send_calls{0};
     std::atomic<u32> response_bytes_sent{0};
     std::atomic<bool> response_send_failed{false};
@@ -5562,6 +5564,18 @@ struct KeepAlivePinnedRecorder {
             }
 
             const auto now = std::chrono::steady_clock::now();
+            if (self->first_response_mode == FirstResponseMode::DelayedHeadComplete &&
+                self->head_probe_request.exchange(false, std::memory_order_acq_rel)) {
+                for (auto& candidate : active) {
+                    if (candidate.wait_kind != ActiveWaitKind::DelayedHeadDue) continue;
+                    const PeerProbe probe = probe_peer_nonblocking(candidate.fd);
+                    if (probe == PeerProbe::Open)
+                        self->head_probe_ack_ns.store(steady_now_ns(), std::memory_order_release);
+                    else
+                        self->first_peer_observation_failed.store(true, std::memory_order_release);
+                    break;
+                }
+            }
             for (size_t index = polled_active_count; index > 0; index--) {
                 Active& item = active[index - 1];
                 const size_t poll_index = index;
@@ -5830,6 +5844,8 @@ struct KeepAlivePinnedRecorder {
         head_publication_ns.store(0, std::memory_order_relaxed);
         head_publish_permit.store(false, std::memory_order_relaxed);
         head_peer_open_ack.store(false, std::memory_order_relaxed);
+        head_probe_request.store(false, std::memory_order_relaxed);
+        head_probe_ack_ns.store(0, std::memory_order_relaxed);
         response_send_calls.store(0, std::memory_order_relaxed);
         response_bytes_sent.store(0, std::memory_order_relaxed);
         response_send_failed.store(false, std::memory_order_relaxed);
@@ -74527,13 +74543,19 @@ static bool run_pinned_nginx_custom_hide_timeout_two_second_oracle(std::string& 
 // #630 pinned-only oracle: a fresh bodyless HEAD remains quiet until the
 // complete upstream header is published, then retires that origin promptly.
 static bool run_pinned_nginx_bodyless_head_delayed_completion_oracle(std::string& error) {
-    const auto timing_control = [](u64 origin_ns, u64 header_ns, u64 retire_ns) {
-        return header_ns >= origin_ns && header_ns - origin_ns < 350'000'000ull &&
-               retire_ns >= origin_ns && retire_ns - origin_ns < 350'000'000ull;
-    };
-    if (timing_control(1'000'000'000ull, 1'200'000'000ull, 1'300'000'000ull) == false ||
-        timing_control(1'000'000'000ull, 1'400'000'000ull, 1'300'000'000ull) ||
-        timing_control(1'000'000'000ull, 1'200'000'000ull, 1'350'000'001ull)) {
+    const auto head_timing_acceptance =
+        [](u64 origin_ns, u64 publication_ns, u64 header_ns, u64 retire_ns) {
+            return publication_ns >= origin_ns + 1'150'000'000ull &&
+                   publication_ns < origin_ns + 1'400'000'000ull && header_ns >= publication_ns &&
+                   header_ns - publication_ns < 350'000'000ull && retire_ns >= publication_ns &&
+                   retire_ns - publication_ns < 350'000'000ull;
+        };
+    if (!head_timing_acceptance(
+            1'000'000'000ull, 2'200'000'000ull, 2'250'000'000ull, 2'300'000'000ull) ||
+        head_timing_acceptance(
+            1'000'000'000ull, 2'400'000'000ull, 2'450'000'000ull, 2'500'000'000ull) ||
+        head_timing_acceptance(
+            1'000'000'000ull, 2'200'000'000ull, 2'250'000'000ull, 2'550'000'001ull)) {
         error = "#630 synthetic timing acceptance control failed";
         return false;
     }
@@ -74596,8 +74618,9 @@ static bool run_pinned_nginx_bodyless_head_delayed_completion_oracle(std::string
         if (client >= 0) close(client);
         return false;
     }
-    const auto quiet_until = std::chrono::steady_clock::now() + std::chrono::seconds(1);
-    while (std::chrono::steady_clock::now() < quiet_until) {
+    const auto request_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+    while (origin.requests.load(std::memory_order_acquire) != 1u &&
+           std::chrono::steady_clock::now() < request_deadline) {
         bool eof = false;
         if (!wait_keepalive_quiet_or_eof(client, 50, eof, error) || eof) {
             error = eof ? "#630 downstream closed before header completion"
@@ -74605,16 +74628,10 @@ static bool run_pinned_nginx_bodyless_head_delayed_completion_oracle(std::string
             close(client);
             return false;
         }
-        if (origin.accepted.load() != 1u || origin.requests.load() > 1u) break;
     }
     if (origin.accepted.load(std::memory_order_acquire) != 1u ||
         origin.requests.load(std::memory_order_acquire) != 1u) {
         error = "#630 pre-permit origin did not observe one complete request";
-        close(client);
-        return false;
-    }
-    if (!origin.head_peer_open_ack.load(std::memory_order_acquire)) {
-        error = "#630 pre-permit origin peer was not open";
         close(client);
         return false;
     }
@@ -74624,6 +74641,34 @@ static bool run_pinned_nginx_bodyless_head_delayed_completion_oracle(std::string
     if (!read_request_length_access_file(temp.nginx_access_log, prepermit_access, error) ||
         !prepermit_access.empty()) {
         error = "#630 pre-permit access ledger was not empty";
+        close(client);
+        return false;
+    }
+    const u64 request_ns = origin.request_complete_ns[0].load(std::memory_order_acquire);
+    const u64 permit_target_ns = request_ns + 1'200'000'000ull;
+    while (steady_now_ns() < permit_target_ns) {
+        bool eof = false;
+        if (!wait_keepalive_quiet_or_eof(client, 50, eof, error) || eof) {
+            error = "#630 custody lost before near-permit ACK";
+            close(client);
+            return false;
+        }
+        std::string sample;
+        if (!read_request_length_access_file(temp.nginx_access_log, sample, error) ||
+            !sample.empty() || origin.head_publication_ns.load(std::memory_order_acquire) != 0u ||
+            origin.requests.load(std::memory_order_acquire) != 1u) {
+            error = "#630 pre-permit custody/publication/ledger control failed";
+            close(client);
+            return false;
+        }
+    }
+    origin.head_probe_request.store(true, std::memory_order_release);
+    const auto ack_deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(100);
+    while (origin.head_probe_ack_ns.load(std::memory_order_acquire) == 0u &&
+           std::chrono::steady_clock::now() < ack_deadline)
+        usleep(1000);
+    if (origin.head_probe_ack_ns.load(std::memory_order_acquire) == 0u) {
+        error = "#630 near-permit origin peer-open probe ACK missing";
         close(client);
         return false;
     }
@@ -74714,14 +74759,12 @@ static bool run_pinned_nginx_bodyless_head_delayed_completion_oracle(std::string
     while (!origin.first_peer_closed.load() && std::chrono::steady_clock::now() < retire_deadline)
         usleep(1000);
     const u64 retirement_ns = origin.first_peer_closed_ns.load();
-    const auto timing_accept = [](u64 request_ns, u64 publication, u64 retirement) {
-        return publication >= request_ns + 1'150'000'000ull &&
-               publication < request_ns + 1'400'000'000ull && retirement >= publication &&
-               retirement - publication < 350'000'000ull;
-    };
     const bool ok =
         origin.first_peer_closed.load() &&
-        timing_accept(origin.request_complete_ns[0].load(), publication_ns, retirement_ns) &&
+        head_timing_acceptance(origin.request_complete_ns[0].load(),
+                               publication_ns,
+                               header_complete_ns,
+                               retirement_ns) &&
         origin.accepted.load() == 1u && origin.requests.load() == 1u && access == "61\n" &&
         origin.response_send_calls.load() == 1u && origin.response_bytes_sent.load() == 182u &&
         !origin.response_send_failed.load() && !origin.listener_failed.load() &&
