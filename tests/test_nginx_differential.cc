@@ -72965,13 +72965,20 @@ static bool run_custom_hide_timeout_two_second_timing_self_check(std::string& er
     const bool positive = custom_hide_timeout_timing_tuple_valid(
         2u, 1'000'000'000ull, 2'200'000'000ull, 4'200'000'000ull);
     const bool hardcoded_one_second = !custom_hide_timeout_timing_tuple_valid(
-        2u, 1'000'000'000ull, 2'000'000'000ull, 4'000'000'000ull);
-    const bool missing_refresh = !custom_hide_timeout_timing_tuple_valid(
         2u, 1'000'000'000ull, 2'200'000'000ull, 3'200'000'000ull);
+    const bool missing_refresh = !custom_hide_timeout_timing_tuple_valid(
+        2u, 1'000'000'000ull, 2'200'000'000ull, 3'000'000'000ull);
     const bool late_expiry = !custom_hide_timeout_timing_tuple_valid(
         2u, 1'000'000'000ull, 2'200'000'000ull, 4'950'000'000ull);
-    const bool initial_deadline = !custom_hide_timeout_expiry_elapsed_valid(2u, 1'000'000'000ull);
-    if (!(positive && hardcoded_one_second && missing_refresh && late_expiry && initial_deadline)) {
+    const bool initial_deadline = !custom_hide_timeout_timing_tuple_valid(
+        2u, 1'000'000'000ull, 2'200'000'000ull, 3'000'000'000ull);
+    const bool fragment_bounds =
+        custom_hide_timeout_fragment_gap_valid(2u, 1'000'000'000ull, 2'200'000'000ull) &&
+        custom_hide_timeout_fragment_gap_valid(2u, 2'200'000'000ull, 3'400'000'000ull) &&
+        !custom_hide_timeout_fragment_gap_valid(2u, 1'000'000'000ull, 2'000'000'000ull) &&
+        !custom_hide_timeout_fragment_gap_valid(2u, 1'000'000'000ull, 2'400'000'000ull);
+    if (!(positive && hardcoded_one_second && missing_refresh && late_expiry && initial_deadline &&
+          fragment_bounds)) {
         error = "#627 2s timing predicate self-check accepted a synthetic timing mutant";
         return false;
     }
