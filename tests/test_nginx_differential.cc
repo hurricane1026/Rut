@@ -1060,7 +1060,9 @@ static DockerInfoResult run_docker_info_runner(const std::vector<std::string>& a
     size_t partial_size = 0;
     auto drain_launch_channel = [&]() {
         if (result.launch_evidence_frozen) return;
-        for (;;) {
+        constexpr size_t kMaxDrainReads = 5;
+        size_t drain_reads = 0;
+        for (; drain_reads < kMaxDrainReads; ++drain_reads) {
             char buffer[sizeof(LaunchRecord) * 4];
             const ssize_t n = read(status_pipe[0], buffer, sizeof(buffer));
             if (n > 0) {
@@ -1075,10 +1077,18 @@ static DockerInfoResult run_docker_info_runner(const std::vector<std::string>& a
                     LaunchRecord record;
                     memcpy(&record, partial.data(), sizeof(record));
                     partial_size = 0;
-                    if (record.magic != kLaunchMagic || record.stage < 1 || record.stage > 5 ||
-                        (record.stage != 5 && record.failed_stage != 0) ||
-                        (record.stage == 5 &&
-                         (record.failed_stage < 1 || record.failed_stage > 4))) {
+                    const uint8_t kBeforeLogOpen =
+                        static_cast<uint8_t>(DockerInfoResult::LaunchStage::BeforeLogOpen);
+                    const uint8_t kLaunchError =
+                        static_cast<uint8_t>(DockerInfoResult::LaunchStage::LaunchError);
+                    if (result.launch_observations.size() >= 4 || record.magic != kLaunchMagic ||
+                        record.stage < kBeforeLogOpen || record.stage > kLaunchError ||
+                        record.reserved != 0 ||
+                        (record.stage != kLaunchError &&
+                         (record.failed_stage != 0 || record.error_number != 0)) ||
+                        (record.stage == kLaunchError &&
+                         (record.failed_stage < kBeforeLogOpen ||
+                          record.failed_stage >= kLaunchError || record.error_number <= 0))) {
                         result.launch_integrity_error = true;
                         continue;
                     }
@@ -1111,6 +1121,7 @@ static DockerInfoResult run_docker_info_runner(const std::vector<std::string>& a
             }
             break;
         }
+        if (drain_reads == kMaxDrainReads) result.launch_integrity_error = true;
     };
     for (;;) {
         drain_launch_channel();
