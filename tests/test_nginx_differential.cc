@@ -16,6 +16,7 @@
 #include <atomic>
 #include <cerrno>
 #include <chrono>
+#include <cstdint>
 #include <cstdlib>
 #include <cstring>
 #include <iostream>
@@ -822,6 +823,24 @@ struct DockerInfoResult {
     std::string snapshot;
     std::string snapshot_error;
     DockerSnapshotState snapshot_state = DockerSnapshotState::Missing;
+    enum class LaunchStage : uint8_t {
+        None,
+        BeforeLogOpen,
+        RedirectsReady,
+        BeforeExec,
+        LaunchError
+    };
+    struct LaunchObservation {
+        LaunchStage stage = LaunchStage::None;
+        LaunchStage failed_stage = LaunchStage::None;
+        int error_number = 0;
+        u64 parent_elapsed_ns = 0;
+    };
+    std::vector<LaunchObservation> launch_observations;
+    bool launch_channel_closed = false;
+    bool launch_channel_closed_before_cleanup = false;
+    bool launch_integrity_error = false;
+    bool launch_evidence_frozen = false;
 };
 
 static bool poll_child(Child& child) {
@@ -923,18 +942,178 @@ static DockerInfoResult run_docker_info_runner(const std::vector<std::string>& a
     DockerInfoResult result;
     result.configured_timeout_ms = timeout_ms;
     const auto started = std::chrono::steady_clock::now();
-    if (!spawn_child(args, log_path, result.child)) {
-        result.error_number = errno;
-        result.outcome = DockerInfoOutcome::SpawnFailed;
+    struct LaunchRecord {
+        uint32_t magic;
+        uint8_t stage;
+        uint8_t failed_stage;
+        uint16_t reserved;
+        int32_t error_number;
+    };
+    static constexpr uint32_t kLaunchMagic = 0x52555436u;
+    static_assert(sizeof(LaunchRecord) <= PIPE_BUF);
+    int status_pipe[2] = {-1, -1};
+    const auto launch_failure = [&]() {
+        if (status_pipe[0] >= 0) close(status_pipe[0]);
+        if (status_pipe[1] >= 0) close(status_pipe[1]);
         result.probe_elapsed_ns =
             static_cast<u64>(std::chrono::duration_cast<std::chrono::nanoseconds>(
                                  std::chrono::steady_clock::now() - started)
                                  .count());
         return result;
+    };
+    if (pipe2(status_pipe, O_CLOEXEC) != 0) {
+        result.error_number = errno;
+        result.outcome = DockerInfoOutcome::SpawnFailed;
+        return launch_failure();
+    }
+    for (int i = 0; i != 2; ++i) {
+        const int moved = fcntl(status_pipe[i], F_DUPFD_CLOEXEC, 3);
+        if (moved < 0) {
+            result.error_number = errno;
+            close(status_pipe[0]);
+            close(status_pipe[1]);
+            status_pipe[0] = status_pipe[1] = -1;
+            result.outcome = DockerInfoOutcome::SpawnFailed;
+            return launch_failure();
+        }
+        close(status_pipe[i]);
+        status_pipe[i] = moved;
+    }
+    {
+        const int flags = fcntl(status_pipe[0], F_GETFL, 0);
+        const int write_flags = fcntl(status_pipe[1], F_GETFL, 0);
+        if (flags < 0 || write_flags < 0 ||
+            fcntl(status_pipe[0], F_SETFL, flags | O_NONBLOCK) != 0 ||
+            fcntl(status_pipe[1], F_SETFL, write_flags | O_NONBLOCK) != 0) {
+            result.error_number = errno;
+            close(status_pipe[0]);
+            close(status_pipe[1]);
+            status_pipe[0] = status_pipe[1] = -1;
+            result.outcome = DockerInfoOutcome::SpawnFailed;
+            return launch_failure();
+        }
+    }
+    std::vector<char*> argv;
+    argv.reserve(args.size() + 1);
+    for (const auto& arg : args) argv.push_back(const_cast<char*>(arg.c_str()));
+    argv.push_back(nullptr);
+    {
+        const pid_t pid = fork();
+        if (pid < 0) {
+            result.error_number = errno;
+            close(status_pipe[0]);
+            close(status_pipe[1]);
+            status_pipe[0] = status_pipe[1] = -1;
+            result.outcome = DockerInfoOutcome::SpawnFailed;
+            return launch_failure();
+        }
+        if (pid == 0) {
+            close(status_pipe[0]);
+            auto announce = [&](DockerInfoResult::LaunchStage stage,
+                                DockerInfoResult::LaunchStage failed_stage =
+                                    DockerInfoResult::LaunchStage::None,
+                                int error_number = 0) {
+                const LaunchRecord record{kLaunchMagic,
+                                          static_cast<uint8_t>(stage),
+                                          static_cast<uint8_t>(failed_stage),
+                                          0,
+                                          error_number};
+                ssize_t n;
+                do {
+                    n = write(status_pipe[1], &record, sizeof(record));
+                } while (n < 0 && errno == EINTR);
+            };
+            announce(DockerInfoResult::LaunchStage::BeforeLogOpen);
+            const int fd = open(log_path.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0600);
+            if (fd < 0) {
+                announce(DockerInfoResult::LaunchStage::LaunchError,
+                         DockerInfoResult::LaunchStage::BeforeLogOpen,
+                         errno);
+                _exit(127);
+            }
+            if (dup2(fd, STDOUT_FILENO) < 0 || dup2(fd, STDERR_FILENO) < 0) {
+                const int saved_errno = errno;
+                close(fd);
+                announce(DockerInfoResult::LaunchStage::LaunchError,
+                         DockerInfoResult::LaunchStage::BeforeLogOpen,
+                         saved_errno);
+                _exit(127);
+            }
+            if (fd != STDOUT_FILENO && fd != STDERR_FILENO) close(fd);
+            announce(DockerInfoResult::LaunchStage::RedirectsReady);
+            announce(DockerInfoResult::LaunchStage::BeforeExec);
+            execvp(argv[0], argv.data());
+            announce(DockerInfoResult::LaunchStage::LaunchError,
+                     DockerInfoResult::LaunchStage::BeforeExec,
+                     errno);
+            _exit(127);
+        }
+        close(status_pipe[1]);
+        status_pipe[1] = -1;
+        result.child.pid = pid;
+        result.child.log_path = log_path;
+        result.child.reaped = false;
+        result.child.status_valid = false;
     }
     const auto deadline = started + std::chrono::milliseconds(timeout_ms);
-    int wait_error = 0;
+    std::array<char, sizeof(LaunchRecord)> partial{};
+    size_t partial_size = 0;
+    auto drain_launch_channel = [&]() {
+        if (result.launch_evidence_frozen) return;
+        for (;;) {
+            char buffer[sizeof(LaunchRecord) * 4];
+            const ssize_t n = read(status_pipe[0], buffer, sizeof(buffer));
+            if (n > 0) {
+                size_t off = 0;
+                while (off < static_cast<size_t>(n)) {
+                    const size_t take =
+                        std::min(sizeof(LaunchRecord) - partial_size, static_cast<size_t>(n) - off);
+                    memcpy(partial.data() + partial_size, buffer + off, take);
+                    partial_size += take;
+                    off += take;
+                    if (partial_size != sizeof(LaunchRecord)) continue;
+                    LaunchRecord record;
+                    memcpy(&record, partial.data(), sizeof(record));
+                    partial_size = 0;
+                    if (record.magic != kLaunchMagic || record.stage < 1 || record.stage > 5 ||
+                        (record.stage != 5 && record.failed_stage != 0) ||
+                        (record.stage == 5 &&
+                         (record.failed_stage < 1 || record.failed_stage > 4))) {
+                        result.launch_integrity_error = true;
+                        continue;
+                    }
+                    const auto stage = static_cast<DockerInfoResult::LaunchStage>(record.stage);
+                    const auto failed =
+                        static_cast<DockerInfoResult::LaunchStage>(record.failed_stage);
+                    const auto order = [&](DockerInfoResult::LaunchStage s) {
+                        return static_cast<unsigned>(s);
+                    };
+                    if (stage != DockerInfoResult::LaunchStage::LaunchError &&
+                        !result.launch_observations.empty() &&
+                        order(stage) <= order(result.launch_observations.back().stage))
+                        result.launch_integrity_error = true;
+                    result.launch_observations.push_back(
+                        {stage,
+                         failed,
+                         record.error_number,
+                         static_cast<u64>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                              std::chrono::steady_clock::now() - started)
+                                              .count())});
+                }
+                continue;
+            }
+            if (n == 0) {
+                result.launch_channel_closed = true;
+                if (!result.child.reaped) result.launch_channel_closed_before_cleanup = true;
+                if (partial_size != 0) result.launch_integrity_error = true;
+            } else if (errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR) {
+                result.launch_integrity_error = true;
+            }
+            break;
+        }
+    };
     for (;;) {
+        drain_launch_channel();
         int status = 0;
         const pid_t rc = waitpid(result.child.pid, &status, WNOHANG);
         if (rc == result.child.pid) {
@@ -956,9 +1135,13 @@ static DockerInfoResult run_docker_info_runner(const std::vector<std::string>& a
             result.outcome =
                 deadline_eintr ? DockerInfoOutcome::TimedOut : DockerInfoOutcome::WaitFailed;
             if (errno == ECHILD) {
+                drain_launch_channel();
+                result.launch_evidence_frozen = true;
                 result.no_waitable_child = true;
                 result.child.status_valid = false;
             } else {
+                drain_launch_channel();
+                result.launch_evidence_frozen = true;
                 result.kill_attempted = true;
                 if (kill(result.child.pid, SIGKILL) != 0 && errno != ESRCH) {
                     result.kill_failed = true;
@@ -977,6 +1160,8 @@ static DockerInfoResult run_docker_info_runner(const std::vector<std::string>& a
         }
         if (std::chrono::steady_clock::now() >= deadline) {
             result.outcome = DockerInfoOutcome::TimedOut;
+            drain_launch_channel();
+            result.launch_evidence_frozen = true;
             result.kill_attempted = true;
             if (kill(result.child.pid, SIGKILL) != 0 && errno != ESRCH) {
                 result.kill_failed = true;
@@ -994,6 +1179,28 @@ static DockerInfoResult run_docker_info_runner(const std::vector<std::string>& a
         }
         usleep(5'000);
     }
+    if (!result.launch_evidence_frozen) drain_launch_channel();
+    const auto stage = [&](size_t index) {
+        return index < result.launch_observations.size() ? result.launch_observations[index].stage
+                                                         : DockerInfoResult::LaunchStage::None;
+    };
+    if (result.launch_channel_closed) {
+        const size_t count = result.launch_observations.size();
+        const bool prefix =
+            count >= 1 && count <= 4 && stage(0) == DockerInfoResult::LaunchStage::BeforeLogOpen &&
+            (count < 2 || stage(1) == DockerInfoResult::LaunchStage::RedirectsReady) &&
+            (count < 3 || stage(2) == DockerInfoResult::LaunchStage::BeforeExec);
+        const bool normal = count == 3;
+        const bool launch_error =
+            count >= 2 && stage(count - 1) == DockerInfoResult::LaunchStage::LaunchError &&
+            result.launch_observations.back().failed_stage == stage(count - 2);
+        if (!prefix || (!normal && !launch_error)) result.launch_integrity_error = true;
+    }
+    if (result.launch_observations.size() > 4) result.launch_integrity_error = true;
+    close(status_pipe[0]);
+    status_pipe[0] = -1;
+    if (status_pipe[0] >= 0) close(status_pipe[0]);
+    if (status_pipe[1] >= 0) close(status_pipe[1]);
     result.probe_elapsed_ns = static_cast<u64>(std::chrono::duration_cast<std::chrono::nanoseconds>(
                                                    std::chrono::steady_clock::now() - started)
                                                    .count()) -
@@ -1282,6 +1489,7 @@ static bool docker_daemon_text(const std::string& text) {
 enum class DockerInfoDecision { Success, MissingPrerequisite, Failure };
 
 static DockerInfoDecision docker_info_decision(const DockerInfoResult& result) {
+    if (result.launch_integrity_error) return DockerInfoDecision::Failure;
     if (result.outcome == DockerInfoOutcome::Exited && result.child.status_valid &&
         WIFEXITED(result.child.status) && WEXITSTATUS(result.child.status) == 0)
         return DockerInfoDecision::Success;
@@ -1340,6 +1548,62 @@ static bool run_docker_info_preflight_self_check(std::string& error) {
         !check({"sh", "-c", "exit 0"}, 100, DockerInfoOutcome::Exited, 0) ||
         !check({"sh", "-c", "kill -TERM $$"}, 100, DockerInfoOutcome::Signaled) ||
         !check({"sh", "-c", "exec sleep 1"}, 50, DockerInfoOutcome::TimedOut)) {
+        cleanup();
+        return false;
+    }
+    DockerInfoResult ordered = run_docker_info_runner({"sh", "-c", "exit 0"}, log, 100);
+    unlink(log.c_str());
+    if (ordered.launch_integrity_error || !ordered.launch_channel_closed ||
+        ordered.launch_observations.size() != 3 ||
+        ordered.launch_observations[0].stage != DockerInfoResult::LaunchStage::BeforeLogOpen ||
+        ordered.launch_observations[1].stage != DockerInfoResult::LaunchStage::RedirectsReady ||
+        ordered.launch_observations[2].stage != DockerInfoResult::LaunchStage::BeforeExec) {
+        error = "ordered launch-channel success control failed";
+        cleanup();
+        return false;
+    }
+    DockerInfoResult missing_exec =
+        run_docker_info_runner({"/definitely/missing/docker-info"}, log, 100);
+    unlink(log.c_str());
+    if (missing_exec.launch_integrity_error || missing_exec.launch_observations.size() != 4 ||
+        missing_exec.launch_observations.back().stage !=
+            DockerInfoResult::LaunchStage::LaunchError ||
+        missing_exec.launch_observations.back().failed_stage !=
+            DockerInfoResult::LaunchStage::BeforeExec ||
+        missing_exec.launch_observations.back().error_number != ENOENT) {
+        error = "missing-exec launch error control failed";
+        cleanup();
+        return false;
+    }
+    if (mkdir(log.c_str(), 0700) != 0) {
+        error = "could not create invalid-log control";
+        cleanup();
+        return false;
+    }
+    DockerInfoResult invalid_log = run_docker_info_runner({"sh", "-c", "exit 0"}, log, 100);
+    rmdir(log.c_str());
+    if (invalid_log.launch_integrity_error || invalid_log.launch_observations.size() != 2 ||
+        invalid_log.launch_observations.back().stage !=
+            DockerInfoResult::LaunchStage::LaunchError ||
+        invalid_log.launch_observations.back().failed_stage !=
+            DockerInfoResult::LaunchStage::BeforeLogOpen ||
+        invalid_log.launch_observations.back().error_number != EISDIR) {
+        error = "invalid-log launch error control failed";
+        cleanup();
+        return false;
+    }
+    if (mkfifo(log.c_str(), 0600) != 0) {
+        error = "could not create FIFO launch control";
+        cleanup();
+        return false;
+    }
+    DockerInfoResult fifo = run_docker_info_runner({"sh", "-c", "exit 0"}, log, 50);
+    unlink(log.c_str());
+    if (fifo.outcome != DockerInfoOutcome::TimedOut || !fifo.kill_attempted || fifo.reap_failed ||
+        fifo.ownership_unresolved || fifo.launch_observations.size() != 1 ||
+        fifo.launch_observations[0].stage != DockerInfoResult::LaunchStage::BeforeLogOpen ||
+        !fifo.launch_channel_closed_before_cleanup) {
+        error = "FIFO before-log-open timeout control failed";
         cleanup();
         return false;
     }
@@ -1490,6 +1754,32 @@ static void print_docker_info_result(const DockerInfoResult& result) {
               << " kill_failed=" << (result.kill_failed ? 1 : 0)
               << " reap_failed=" << (result.reap_failed ? 1 : 0)
               << " ownership_unresolved=" << (result.ownership_unresolved ? 1 : 0) << "\n";
+    std::cerr << "Docker info launch_channel_closed=" << (result.launch_channel_closed ? 1 : 0)
+              << " launch_channel_closed_before_cleanup="
+              << (result.launch_channel_closed_before_cleanup ? 1 : 0)
+              << " launch_integrity_error=" << (result.launch_integrity_error ? 1 : 0)
+              << " launch_records=" << result.launch_observations.size() << "\n";
+    for (const auto& observation : result.launch_observations) {
+        const auto stage_name = [](DockerInfoResult::LaunchStage stage) {
+            switch (stage) {
+                case DockerInfoResult::LaunchStage::BeforeLogOpen:
+                    return "BeforeLogOpen";
+                case DockerInfoResult::LaunchStage::RedirectsReady:
+                    return "RedirectsReady";
+                case DockerInfoResult::LaunchStage::BeforeExec:
+                    return "BeforeExec";
+                case DockerInfoResult::LaunchStage::LaunchError:
+                    return "LaunchError";
+                default:
+                    return "None";
+            }
+        };
+        std::cerr << "Docker info launch stage=" << stage_name(observation.stage);
+        if (observation.stage == DockerInfoResult::LaunchStage::LaunchError)
+            std::cerr << " failed_stage=" << stage_name(observation.failed_stage);
+        std::cerr << " errno=" << observation.error_number
+                  << " parent_elapsed_ns=" << observation.parent_elapsed_ns << "\n";
+    }
     if (!result.snapshot.empty()) std::cerr << "Docker info snapshot:\n" << result.snapshot;
     if (!result.snapshot_error.empty())
         std::cerr << "Docker info snapshot error: " << result.snapshot_error << "\n";
