@@ -5343,6 +5343,7 @@ struct KeepAlivePinnedRecorder {
     std::atomic<u64> first_peer_closed_ns{0};
     std::atomic<u64> second_complete_sent_ns{0};
     std::atomic<u64> head_publication_ns{0};
+    std::atomic<u32> head_publication_count{0};
     std::atomic<bool> head_publish_permit{false};
     std::atomic<bool> head_peer_open_ack{false};
     std::atomic<bool> head_probe_request{false};
@@ -5623,6 +5624,7 @@ struct KeepAlivePinnedRecorder {
                         self->response_send_calls.fetch_add(1u, std::memory_order_release);
                         self->response_bytes_sent.fetch_add(sizeof(kHead) - 1u,
                                                             std::memory_order_release);
+                        self->head_publication_count.fetch_add(1u, std::memory_order_release);
                         self->head_publication_ns.store(steady_now_ns(), std::memory_order_release);
                         item.wait_kind = ActiveWaitKind::DelayedHeadPeerClose;
                     }
@@ -74540,23 +74542,133 @@ static bool run_pinned_nginx_custom_hide_timeout_two_second_oracle(std::string& 
     return true;
 }
 
+struct HeadAcceptanceObservation {
+    u64 origin_ns = 0u;
+    u64 publication_ns = 0u;
+    u64 header_ns = 0u;
+    u64 retirement_ns = 0u;
+    std::vector<char> wire;
+    std::string access;
+    u32 accepted = 0u;
+    u32 requests = 0u;
+    u32 publication_count = 0u;
+    u32 retirement_count = 0u;
+    u32 response_send_calls = 0u;
+    u32 response_bytes_sent = 0u;
+    bool downstream_open = false;
+    bool downstream_eof = false;
+    bool response_send_failed = false;
+    bool listener_failed = false;
+    bool unexpected_data = false;
+    bool observation_failed = false;
+    bool cleanup_rescued = false;
+};
+
+static bool validate_head_acceptance(const HeadAcceptanceObservation& o,
+                                     const std::vector<char>& expected,
+                                     std::string& detail) {
+    if (o.origin_ns == 0u || o.publication_ns < o.origin_ns + 1'150'000'000ull ||
+        o.publication_ns >= o.origin_ns + 1'400'000'000ull) {
+        detail = "publication was premature or outside the 1.15..1.40s window";
+        return false;
+    }
+    if (o.header_ns < o.publication_ns || o.header_ns - o.publication_ns >= 350'000'000ull) {
+        detail = "header publication was late or preceded the origin publication";
+        return false;
+    }
+    if (o.retirement_ns < o.publication_ns ||
+        o.retirement_ns - o.publication_ns >= 350'000'000ull) {
+        detail = "origin retirement was late or preceded publication";
+        return false;
+    }
+    if (!validate_exact_normalized_response(o.wire, expected, detail)) {
+        detail = "wire/body validation failed: " + detail;
+        return false;
+    }
+    if (!o.downstream_open || o.downstream_eof) {
+        detail = "downstream was not open and quiet (EOF/body tail leaked)";
+        return false;
+    }
+    if (o.access != "61\n") {
+        detail = "access publication was not exactly 61\\n";
+        return false;
+    }
+    if (o.accepted != 1u || o.requests != 1u || o.publication_count != 1u ||
+        o.retirement_count != 1u) {
+        detail = "duplicate or missing accept/request/publication/retirement";
+        return false;
+    }
+    if (o.response_send_calls != 1u || o.response_bytes_sent != 182u) {
+        detail = "response send count/bytes were not exactly one/182";
+        return false;
+    }
+    if (o.response_send_failed || o.listener_failed || o.unexpected_data || o.observation_failed) {
+        detail = "recorder reported a failure flag";
+        return false;
+    }
+    if (o.cleanup_rescued) {
+        detail = "cleanup rescued an otherwise incomplete acceptance";
+        return false;
+    }
+    return true;
+}
+
 // #630 pinned-only oracle: a fresh bodyless HEAD remains quiet until the
 // complete upstream header is published, then retires that origin promptly.
 static bool run_pinned_nginx_bodyless_head_delayed_completion_oracle(std::string& error) {
-    const auto head_timing_acceptance =
-        [](u64 origin_ns, u64 publication_ns, u64 header_ns, u64 retire_ns) {
-            return publication_ns >= origin_ns + 1'150'000'000ull &&
-                   publication_ns < origin_ns + 1'400'000'000ull && header_ns >= publication_ns &&
-                   header_ns - publication_ns < 350'000'000ull && retire_ns >= publication_ns &&
-                   retire_ns - publication_ns < 350'000'000ull;
-        };
-    if (!head_timing_acceptance(
-            1'000'000'000ull, 2'200'000'000ull, 2'250'000'000ull, 2'300'000'000ull) ||
-        head_timing_acceptance(
-            1'000'000'000ull, 2'400'000'000ull, 2'450'000'000ull, 2'500'000'000ull) ||
-        head_timing_acceptance(
-            1'000'000'000ull, 2'200'000'000ull, 2'250'000'000ull, 2'550'000'001ull)) {
-        error = "#630 synthetic timing acceptance control failed";
+    HeadAcceptanceObservation synthetic{};
+    synthetic.origin_ns = 1'000'000'000ull;
+    synthetic.publication_ns = 2'200'000'000ull;
+    synthetic.header_ns = 2'250'000'000ull;
+    synthetic.retirement_ns = 2'300'000'000ull;
+    synthetic.access = "61\n";
+    synthetic.accepted = synthetic.requests = synthetic.publication_count =
+        synthetic.retirement_count = synthetic.response_send_calls = 1u;
+    synthetic.response_bytes_sent = 182u;
+    synthetic.downstream_open = true;
+    static constexpr char kSyntheticWire[] =
+        "HTTP/1.1 200 OK\r\nServer: nginx/1.29.7\r\n"
+        "Date: XXXXXXXXXXXXXXXXXXXXXXXXXXXXX\r\nContent-Length: 12\r\n"
+        "Connection: keep-alive\r\nX-Unrelated: retained\r\n\r\n";
+    synthetic.wire.assign(kSyntheticWire, kSyntheticWire + sizeof(kSyntheticWire) - 1u);
+    const std::vector<char> synthetic_expected(synthetic.wire);
+    std::string control_detail;
+    if (!validate_head_acceptance(synthetic, synthetic_expected, control_detail)) {
+        error = "#630 synthetic positive acceptance failed: " + control_detail;
+        return false;
+    }
+    struct Mutation {
+        const char* name;
+        void (*apply)(HeadAcceptanceObservation&);
+    };
+    const Mutation mutations[] = {
+        {"premature publication",
+         [](HeadAcceptanceObservation& x) { x.publication_ns = x.origin_ns + 1'149'999'999ull; }},
+        {"late header",
+         [](HeadAcceptanceObservation& x) { x.header_ns = x.publication_ns + 350'000'000ull; }},
+        {"late retirement",
+         [](HeadAcceptanceObservation& x) { x.retirement_ns = x.publication_ns + 350'000'000ull; }},
+        {"hidden header leak", [](HeadAcceptanceObservation& x) { x.wire.push_back('x'); }},
+        {"body/tail", [](HeadAcceptanceObservation& x) { x.downstream_eof = true; }},
+        {"duplicate accept", [](HeadAcceptanceObservation& x) { x.accepted = 2u; }},
+        {"duplicate request", [](HeadAcceptanceObservation& x) { x.requests = 2u; }},
+        {"duplicate retirement", [](HeadAcceptanceObservation& x) { x.retirement_count = 2u; }},
+        {"duplicate publication", [](HeadAcceptanceObservation& x) { x.publication_count = 2u; }},
+        {"access mutation", [](HeadAcceptanceObservation& x) { x.access = "61\n61\n"; }},
+        {"bad failure flag", [](HeadAcceptanceObservation& x) { x.response_send_failed = true; }},
+        {"cleanup rescue", [](HeadAcceptanceObservation& x) { x.cleanup_rescued = true; }},
+    };
+    for (const Mutation& mutation : mutations) {
+        HeadAcceptanceObservation negative = synthetic;
+        mutation.apply(negative);
+        control_detail.clear();
+        if (validate_head_acceptance(negative, synthetic_expected, control_detail)) {
+            error = std::string("#630 synthetic control accepted ") + mutation.name;
+            return false;
+        }
+    }
+    if (!validate_head_acceptance(synthetic, synthetic_expected, control_detail)) {
+        error = "#630 synthetic restored positive acceptance failed: " + control_detail;
         return false;
     }
     static constexpr char kRequest[] =
@@ -74602,6 +74714,8 @@ static bool run_pinned_nginx_bodyless_head_delayed_completion_oracle(std::string
                       "host",
                       "--name",
                       docker.name,
+                      "-v",
+                      temp.path + ":" + temp.path,
                       "-v",
                       temp.nginx_config + ":/etc/nginx/nginx.conf:ro",
                       kNginxImage,
@@ -74665,9 +74779,27 @@ static bool run_pinned_nginx_bodyless_head_delayed_completion_oracle(std::string
     origin.head_probe_request.store(true, std::memory_order_release);
     const auto ack_deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(100);
     while (origin.head_probe_ack_ns.load(std::memory_order_acquire) == 0u &&
-           std::chrono::steady_clock::now() < ack_deadline)
-        usleep(1000);
-    if (origin.head_probe_ack_ns.load(std::memory_order_acquire) == 0u) {
+           std::chrono::steady_clock::now() < ack_deadline) {
+        if (!observe_client_open_and_quiet_nonconsuming(client, 10, error)) {
+            error = "#630 near-permit ACK lost downstream open/quiet custody";
+            close(client);
+            return false;
+        }
+        std::string sample;
+        if (!read_request_length_access_file(temp.nginx_access_log, sample, error) ||
+            !sample.empty() || origin.head_publication_ns.load(std::memory_order_acquire) != 0u ||
+            origin.accepted.load(std::memory_order_acquire) != 1u ||
+            origin.requests.load(std::memory_order_acquire) != 1u ||
+            origin.response_send_failed.load(std::memory_order_acquire) ||
+            origin.listener_failed.load(std::memory_order_acquire) ||
+            !origin.thread_alive.load(std::memory_order_acquire)) {
+            error = "#630 near-permit ACK custody/liveness control failed";
+            close(client);
+            return false;
+        }
+    }
+    const u64 ack_ns = origin.head_probe_ack_ns.load(std::memory_order_acquire);
+    if (ack_ns == 0u || ack_ns < permit_target_ns || ack_ns >= steady_now_ns()) {
         error = "#630 near-permit origin peer-open probe ACK missing";
         close(client);
         return false;
@@ -74759,16 +74891,31 @@ static bool run_pinned_nginx_bodyless_head_delayed_completion_oracle(std::string
     while (!origin.first_peer_closed.load() && std::chrono::steady_clock::now() < retire_deadline)
         usleep(1000);
     const u64 retirement_ns = origin.first_peer_closed_ns.load();
+    HeadAcceptanceObservation actual;
+    actual.origin_ns = origin.request_complete_ns[0].load(std::memory_order_acquire);
+    actual.publication_ns = publication_ns;
+    actual.header_ns = header_complete_ns;
+    actual.retirement_ns = retirement_ns;
+    actual.wire = response;
+    actual.access = access;
+    actual.accepted = origin.accepted.load(std::memory_order_acquire);
+    actual.requests = origin.requests.load(std::memory_order_acquire);
+    actual.publication_count = origin.head_publication_count.load(std::memory_order_acquire);
+    actual.retirement_count = origin.first_peer_closed.load(std::memory_order_acquire) ? 1u : 0u;
+    actual.response_send_calls = origin.response_send_calls.load(std::memory_order_acquire);
+    actual.response_bytes_sent = origin.response_bytes_sent.load(std::memory_order_acquire);
+    actual.downstream_open = header_complete_ns != 0u;
+    actual.downstream_eof = false;
+    actual.response_send_failed = origin.response_send_failed.load(std::memory_order_acquire);
+    actual.listener_failed = origin.listener_failed.load(std::memory_order_acquire);
+    actual.unexpected_data = origin.first_peer_unexpected_data.load(std::memory_order_acquire);
+    actual.observation_failed =
+        origin.first_peer_observation_failed.load(std::memory_order_acquire);
+    std::string acceptance_detail;
     const bool ok =
-        origin.first_peer_closed.load() &&
-        head_timing_acceptance(origin.request_complete_ns[0].load(),
-                               publication_ns,
-                               header_complete_ns,
-                               retirement_ns) &&
-        origin.accepted.load() == 1u && origin.requests.load() == 1u && access == "61\n" &&
-        origin.response_send_calls.load() == 1u && origin.response_bytes_sent.load() == 182u &&
-        !origin.response_send_failed.load() && !origin.listener_failed.load() &&
-        !origin.first_peer_unexpected_data.load() && !origin.first_peer_observation_failed.load();
+        validate_head_acceptance(actual,
+                                 std::vector<char>(kExpected, kExpected + sizeof(kExpected) - 1u),
+                                 acceptance_detail);
     close(client);
     origin.stop();
     if (origin.history.size() != 1u ||
@@ -74778,9 +74925,15 @@ static bool run_pinned_nginx_bodyless_head_delayed_completion_oracle(std::string
         error = "#630 upstream request wire mismatch";
         return false;
     }
+    std::string final_access;
+    const bool final_ledger_ok =
+        read_request_length_access_file(temp.nginx_access_log, final_access, acceptance_detail) &&
+        final_access == "61\n";
+    actual.access = final_access;
     const bool cleanup_ok = stop_child(nginx.child) && docker.remove();
-    if (!ok || !cleanup_ok) {
-        if (error.empty()) error = "#630 origin retirement/request/access evidence mismatch";
+    if (!ok || !final_ledger_ok || !cleanup_ok) {
+        if (error.empty())
+            error = "#630 origin retirement/request/access evidence mismatch: " + acceptance_detail;
         return false;
     }
     std::cerr << "PASS evidence: #630 HEAD header anchor/retirement ns=" << publication_ns << "/"
