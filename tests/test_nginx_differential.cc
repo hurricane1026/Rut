@@ -75606,6 +75606,271 @@ static bool validate_head_acceptance(const HeadAcceptanceObservation& o,
     return true;
 }
 
+static bool capture_issue630_head_episode(
+    u16 frontend_port,
+    u16 backend_port,
+    const std::string& access_path,
+    Child& frontend,
+    KeepAlivePinnedRecorder& origin,
+    HeadAcceptanceObservation& accepted,
+    std::vector<char>& upstream_wire,
+    std::string& error) {
+    static constexpr char kRequest[] =
+        "HEAD /buffered-timeout?q=1 HTTP/1.1\r\nHost: client.example\r\n\r\n";
+    static constexpr char kExpected[] =
+        "HTTP/1.1 200 OK\r\nServer: nginx/1.29.7\r\n"
+        "Date: XXXXXXXXXXXXXXXXXXXXXXXXXXXXX\r\nContent-Length: 12\r\n"
+        "Connection: keep-alive\r\nX-Unrelated: retained\r\n\r\n";
+    static_assert(sizeof(kExpected) - 1u == 145u);
+    struct RecorderStopGuard {
+        KeepAlivePinnedRecorder& recorder;
+        ~RecorderStopGuard() { recorder.stop(); }
+    } recorder_stop{origin};
+    int client = connect_once(frontend_port);
+    if (client < 0 || !send_all(client, kRequest, sizeof(kRequest) - 1u)) {
+        error = "#630 HEAD request send failed";
+        if (client >= 0) close(client);
+        return false;
+    }
+    const auto request_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+    while (origin.requests.load(std::memory_order_acquire) != 1u &&
+           std::chrono::steady_clock::now() < request_deadline) {
+        bool eof = false;
+        if (!wait_keepalive_quiet_or_eof(client, 50, eof, error) || eof) {
+            error = eof ? "#630 downstream closed before header completion"
+                        : "#630 downstream was not quiet before 1s";
+            close(client);
+            return false;
+        }
+    }
+    if (origin.accepted.load(std::memory_order_acquire) != 1u ||
+        origin.requests.load(std::memory_order_acquire) != 1u) {
+        error = "#630 pre-permit origin did not observe one complete request";
+        close(client);
+        return false;
+    }
+    // This is the explicit custody/open ACK: only after the real quiet window,
+    // one accepted request, and an empty access ledger may the origin publish.
+    std::string prepermit_access;
+    if (!read_request_length_access_file(access_path, prepermit_access, error) ||
+        !prepermit_access.empty()) {
+        error = "#630 pre-permit access ledger was not empty";
+        close(client);
+        return false;
+    }
+    const u64 request_ns = origin.request_complete_ns[0].load(std::memory_order_acquire);
+    const u64 permit_target_ns = request_ns + 1'200'000'000ull;
+    while (steady_now_ns() < permit_target_ns) {
+        bool eof = false;
+        if (!wait_keepalive_quiet_or_eof(client, 50, eof, error) || eof) {
+            error = "#630 custody lost before near-permit ACK";
+            close(client);
+            return false;
+        }
+        std::string sample;
+        if (!read_request_length_access_file(access_path, sample, error) ||
+            !sample.empty() || origin.head_publication_ns.load(std::memory_order_acquire) != 0u ||
+            origin.requests.load(std::memory_order_acquire) != 1u) {
+            error = "#630 pre-permit custody/publication/ledger control failed";
+            close(client);
+            return false;
+        }
+    }
+    origin.head_probe_request.store(true, std::memory_order_release);
+    const auto ack_deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(100);
+    while (origin.head_probe_ack_ns.load(std::memory_order_acquire) == 0u &&
+           std::chrono::steady_clock::now() < ack_deadline) {
+        if (!observe_client_open_and_quiet_nonconsuming(client, 10, error)) {
+            error = "#630 near-permit ACK lost downstream open/quiet custody";
+            close(client);
+            return false;
+        }
+        std::string sample;
+        if (!read_request_length_access_file(access_path, sample, error) ||
+            !sample.empty() || origin.head_publication_ns.load(std::memory_order_acquire) != 0u ||
+            origin.accepted.load(std::memory_order_acquire) != 1u ||
+            origin.requests.load(std::memory_order_acquire) != 1u ||
+            origin.response_send_failed.load(std::memory_order_acquire) ||
+            origin.listener_failed.load(std::memory_order_acquire) ||
+            !origin.thread_alive.load(std::memory_order_acquire)) {
+            error = "#630 near-permit ACK custody/liveness control failed";
+            close(client);
+            return false;
+        }
+    }
+    const u64 ack_ns = origin.head_probe_ack_ns.load(std::memory_order_acquire);
+    if (ack_ns == 0u || ack_ns < permit_target_ns || ack_ns >= steady_now_ns()) {
+        error = "#630 near-permit origin peer-open probe ACK missing";
+        close(client);
+        return false;
+    }
+    // Do not let a fast ACK bypass the complete final custody check.
+    {
+        bool ack_quiet = false;
+        if (!wait_keepalive_quiet_or_eof(client, 1, ack_quiet, error) || ack_quiet) {
+            error = "#630 immediate post-ACK downstream custody failed";
+            close(client);
+            return false;
+        }
+        std::string sample;
+        if (!read_request_length_access_file(access_path, sample, error) ||
+            !sample.empty() || origin.head_publication_ns.load(std::memory_order_acquire) != 0u ||
+            origin.accepted.load(std::memory_order_acquire) != 1u ||
+            origin.requests.load(std::memory_order_acquire) != 1u ||
+            origin.response_send_failed.load(std::memory_order_acquire) ||
+            origin.listener_failed.load(std::memory_order_acquire) ||
+            origin.first_peer_unexpected_data.load(std::memory_order_acquire) ||
+            origin.first_peer_observation_failed.load(std::memory_order_acquire) ||
+            !origin.thread_alive.load(std::memory_order_acquire) || poll_child(frontend)) {
+            error = "#630 immediate post-ACK custody/liveness control failed";
+            close(client);
+            return false;
+        }
+    }
+    origin.head_publish_permit.store(true, std::memory_order_release);
+    const u64 publication_wait = steady_now_ns() + 2'000'000'000ull;
+    std::vector<char> response;
+    u64 header_complete_ns = 0u;
+    while (steady_now_ns() < publication_wait) {
+        pollfd p{client, POLLIN | POLLHUP | POLLERR, 0};
+        if (poll(&p, 1, 25) < 0 && errno == EINTR) continue;
+        char buf[1024];
+        const ssize_t n = recv(client, buf, sizeof(buf), MSG_DONTWAIT);
+        if (n > 0) {
+            response.insert(response.end(), buf, buf + n);
+            const size_t end = header_end(response);
+            if (end != 0u) {
+                header_complete_ns = steady_now_ns();
+                if (response.size() != end) {
+                    error = "#630 HEAD publication included representation bytes";
+                    close(client);
+                    return false;
+                }
+                break;
+            }
+        } else if (n < 0 && errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR)
+            break;
+    }
+    const u64 publication_ns = origin.head_publication_ns.load();
+    if (header_complete_ns == 0u || publication_ns == 0u || header_complete_ns < publication_ns ||
+        header_complete_ns - publication_ns >= 350'000'000ull ||
+        !validate_exact_normalized_response(response, kExpected, error)) {
+        if (error.empty()) error = "#630 delayed HEAD header publication mismatch/timing";
+        close(client);
+        return false;
+    }
+    const u64 ledger_deadline = header_complete_ns + 250'000'000ull;
+    std::string access;
+    u64 access_ns = 0u;
+    bool ledger_seen = false;
+    while (steady_now_ns() < ledger_deadline) {
+        std::string sample;
+        if (!read_request_length_access_file(access_path, sample, error)) {
+            close(client);
+            return false;
+        }
+        if (sample == "61\n") {
+            access = sample;
+            ledger_seen = true;
+            access_ns = steady_now_ns();
+            break;
+        }
+        if (!sample.empty()) {
+            error = "#630 access ledger published a non-exact value";
+            close(client);
+            return false;
+        }
+        usleep(1000);
+    }
+    if (!ledger_seen) {
+        error = "#630 access ledger missed the header-completion anchor window";
+        close(client);
+        return false;
+    }
+    const u64 stable_deadline = header_complete_ns + 2'250'000'000ull;
+    u64 quiet_until_ns = 0u;
+    while (steady_now_ns() < stable_deadline) {
+        if (!observe_client_open_and_quiet_nonconsuming(client, 50, error) ||
+            poll_child(frontend) || !origin.thread_alive.load(std::memory_order_acquire)) {
+            error = "#630 downstream emitted body/tail or closed during keep-alive observation";
+            close(client);
+            return false;
+        }
+        std::string sample;
+        if (!read_request_length_access_file(access_path, sample, error) ||
+            sample != "61\n") {
+            error = "#630 access ledger was not stably exact through the quiet window";
+            close(client);
+            return false;
+        }
+        if (origin.response_send_failed.load() || origin.listener_failed.load() ||
+            origin.first_peer_unexpected_data.load() ||
+            origin.first_peer_observation_failed.load()) {
+            error = "#630 origin reported send/listener/protocol custody failure";
+            close(client);
+            return false;
+        }
+        quiet_until_ns = steady_now_ns();
+    }
+    const std::string expected_upstream =
+        std::string("HEAD /buffered-timeout?q=1 HTTP/1.1\r\nHost: 127.0.0.1:") +
+        std::to_string(backend_port) + "\r\n\r\n";
+    const auto retire_deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(350);
+    while (!origin.first_peer_closed.load() && std::chrono::steady_clock::now() < retire_deadline)
+        usleep(1000);
+    const u64 retirement_ns = origin.first_peer_closed_ns.load();
+    std::string final_access;
+    std::string final_detail;
+    const bool final_quiet = observe_client_open_and_quiet_nonconsuming(client, 50, final_detail);
+    const u64 final_quiet_until_ns = final_quiet ? steady_now_ns() : quiet_until_ns;
+    const bool final_ledger_ok =
+        read_request_length_access_file(access_path, final_access, final_detail) &&
+        final_access == "61\n";
+    HeadAcceptanceObservation actual;
+    actual.origin_ns = origin.request_complete_ns[0].load(std::memory_order_acquire);
+    actual.publication_ns = publication_ns;
+    actual.header_ns = header_complete_ns;
+    actual.retirement_ns = retirement_ns;
+    actual.wire = response;
+    actual.access = final_access;
+    actual.access_ns = access_ns;
+    actual.quiet_until_ns = final_quiet_until_ns;
+    actual.accepted = origin.accepted.load(std::memory_order_acquire);
+    actual.requests = origin.requests.load(std::memory_order_acquire);
+    actual.publication_count = origin.head_publication_count.load(std::memory_order_acquire);
+    actual.retirement_count = origin.head_peer_close_count.load(std::memory_order_acquire);
+    actual.response_send_calls = origin.response_send_calls.load(std::memory_order_acquire);
+    actual.response_bytes_sent = origin.response_bytes_sent.load(std::memory_order_acquire);
+    actual.downstream_open = final_quiet;
+    actual.downstream_eof = false;
+    actual.response_send_failed = origin.response_send_failed.load(std::memory_order_acquire);
+    actual.listener_failed = origin.listener_failed.load(std::memory_order_acquire);
+    actual.unexpected_data = origin.first_peer_unexpected_data.load(std::memory_order_acquire);
+    actual.observation_failed =
+        origin.first_peer_observation_failed.load(std::memory_order_acquire);
+    std::string acceptance_detail;
+    const bool ok = validate_head_acceptance(actual, kExpected, acceptance_detail);
+    const bool live_snapshot_ok =
+        final_quiet && final_ledger_ok && origin.thread_alive.load(std::memory_order_acquire) &&
+        !origin.listener_failed.load(std::memory_order_acquire) && !poll_child(frontend);
+    if (!ok || !live_snapshot_ok) {
+        if (error.empty())
+            error = "#630 origin retirement/request/access evidence mismatch: " + acceptance_detail;
+        return false;
+    }
+    accepted = actual;
+    close(client);
+    origin.stop();
+    if (origin.history.size() != 1u ||
+        std::string(origin.history[0].wire.begin(), origin.history[0].wire.end()) !=
+            expected_upstream ||
+        origin.history[0].wire.size() != 61u) {
+        error = "#630 upstream request wire mismatch";
+        return false;
+    }
+    upstream_wire = origin.history[0].wire;
+    return true;
+}
 // #630 pinned-only oracle: a fresh bodyless HEAD remains quiet until the
 // complete upstream header is published, then retires that origin promptly.
 static bool run_pinned_nginx_bodyless_head_delayed_completion_oracle(std::string& error) {
@@ -75702,13 +75967,6 @@ static bool run_pinned_nginx_bodyless_head_delayed_completion_oracle(std::string
         error = "#630 synthetic restored positive acceptance failed: " + control_detail;
         return false;
     }
-    static constexpr char kRequest[] =
-        "HEAD /buffered-timeout?q=1 HTTP/1.1\r\nHost: client.example\r\n\r\n";
-    static constexpr char kExpected[] =
-        "HTTP/1.1 200 OK\r\nServer: nginx/1.29.7\r\n"
-        "Date: XXXXXXXXXXXXXXXXXXXXXXXXXXXXX\r\nContent-Length: 12\r\n"
-        "Connection: keep-alive\r\nX-Unrelated: retained\r\n\r\n";
-    static_assert(sizeof(kExpected) - 1u == 145u);
     TempDir temp;
     HeldLoopbackPorts reservations;
     u16 frontend = 0u, backend = 0u;
@@ -75757,251 +76015,16 @@ static bool run_pinned_nginx_bodyless_head_delayed_completion_oracle(std::string
                      nginx.child) ||
         !wait_ready(frontend, nginx.child, error))
         return false;
-    int client = connect_once(frontend);
-    if (client < 0 || !send_all(client, kRequest, sizeof(kRequest) - 1u)) {
-        error = "#630 HEAD request send failed";
-        if (client >= 0) close(client);
+    HeadAcceptanceObservation accepted{};
+    std::vector<char> upstream_wire;
+    if (!capture_issue630_head_episode(frontend, backend, temp.nginx_access_log, nginx.child,
+                                       origin, accepted, upstream_wire, error))
         return false;
-    }
-    const auto request_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
-    while (origin.requests.load(std::memory_order_acquire) != 1u &&
-           std::chrono::steady_clock::now() < request_deadline) {
-        bool eof = false;
-        if (!wait_keepalive_quiet_or_eof(client, 50, eof, error) || eof) {
-            error = eof ? "#630 downstream closed before header completion"
-                        : "#630 downstream was not quiet before 1s";
-            close(client);
-            return false;
-        }
-    }
-    if (origin.accepted.load(std::memory_order_acquire) != 1u ||
-        origin.requests.load(std::memory_order_acquire) != 1u) {
-        error = "#630 pre-permit origin did not observe one complete request";
-        close(client);
-        return false;
-    }
-    // This is the explicit custody/open ACK: only after the real quiet window,
-    // one accepted request, and an empty access ledger may the origin publish.
-    std::string prepermit_access;
-    if (!read_request_length_access_file(temp.nginx_access_log, prepermit_access, error) ||
-        !prepermit_access.empty()) {
-        error = "#630 pre-permit access ledger was not empty";
-        close(client);
-        return false;
-    }
-    const u64 request_ns = origin.request_complete_ns[0].load(std::memory_order_acquire);
-    const u64 permit_target_ns = request_ns + 1'200'000'000ull;
-    while (steady_now_ns() < permit_target_ns) {
-        bool eof = false;
-        if (!wait_keepalive_quiet_or_eof(client, 50, eof, error) || eof) {
-            error = "#630 custody lost before near-permit ACK";
-            close(client);
-            return false;
-        }
-        std::string sample;
-        if (!read_request_length_access_file(temp.nginx_access_log, sample, error) ||
-            !sample.empty() || origin.head_publication_ns.load(std::memory_order_acquire) != 0u ||
-            origin.requests.load(std::memory_order_acquire) != 1u) {
-            error = "#630 pre-permit custody/publication/ledger control failed";
-            close(client);
-            return false;
-        }
-    }
-    origin.head_probe_request.store(true, std::memory_order_release);
-    const auto ack_deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(100);
-    while (origin.head_probe_ack_ns.load(std::memory_order_acquire) == 0u &&
-           std::chrono::steady_clock::now() < ack_deadline) {
-        if (!observe_client_open_and_quiet_nonconsuming(client, 10, error)) {
-            error = "#630 near-permit ACK lost downstream open/quiet custody";
-            close(client);
-            return false;
-        }
-        std::string sample;
-        if (!read_request_length_access_file(temp.nginx_access_log, sample, error) ||
-            !sample.empty() || origin.head_publication_ns.load(std::memory_order_acquire) != 0u ||
-            origin.accepted.load(std::memory_order_acquire) != 1u ||
-            origin.requests.load(std::memory_order_acquire) != 1u ||
-            origin.response_send_failed.load(std::memory_order_acquire) ||
-            origin.listener_failed.load(std::memory_order_acquire) ||
-            !origin.thread_alive.load(std::memory_order_acquire)) {
-            error = "#630 near-permit ACK custody/liveness control failed";
-            close(client);
-            return false;
-        }
-    }
-    const u64 ack_ns = origin.head_probe_ack_ns.load(std::memory_order_acquire);
-    if (ack_ns == 0u || ack_ns < permit_target_ns || ack_ns >= steady_now_ns()) {
-        error = "#630 near-permit origin peer-open probe ACK missing";
-        close(client);
-        return false;
-    }
-    // Do not let a fast ACK bypass the complete final custody check.
-    {
-        bool ack_quiet = false;
-        if (!wait_keepalive_quiet_or_eof(client, 1, ack_quiet, error) || ack_quiet) {
-            error = "#630 immediate post-ACK downstream custody failed";
-            close(client);
-            return false;
-        }
-        std::string sample;
-        if (!read_request_length_access_file(temp.nginx_access_log, sample, error) ||
-            !sample.empty() || origin.head_publication_ns.load(std::memory_order_acquire) != 0u ||
-            origin.accepted.load(std::memory_order_acquire) != 1u ||
-            origin.requests.load(std::memory_order_acquire) != 1u ||
-            origin.response_send_failed.load(std::memory_order_acquire) ||
-            origin.listener_failed.load(std::memory_order_acquire) ||
-            origin.first_peer_unexpected_data.load(std::memory_order_acquire) ||
-            origin.first_peer_observation_failed.load(std::memory_order_acquire) ||
-            !origin.thread_alive.load(std::memory_order_acquire) || poll_child(nginx.child)) {
-            error = "#630 immediate post-ACK custody/liveness control failed";
-            close(client);
-            return false;
-        }
-    }
-    origin.head_publish_permit.store(true, std::memory_order_release);
-    const u64 publication_wait = steady_now_ns() + 2'000'000'000ull;
-    std::vector<char> response;
-    u64 header_complete_ns = 0u;
-    while (steady_now_ns() < publication_wait) {
-        pollfd p{client, POLLIN | POLLHUP | POLLERR, 0};
-        if (poll(&p, 1, 25) < 0 && errno == EINTR) continue;
-        char buf[1024];
-        const ssize_t n = recv(client, buf, sizeof(buf), MSG_DONTWAIT);
-        if (n > 0) {
-            response.insert(response.end(), buf, buf + n);
-            const size_t end = header_end(response);
-            if (end != 0u) {
-                header_complete_ns = steady_now_ns();
-                if (response.size() != end) {
-                    error = "#630 HEAD publication included representation bytes";
-                    close(client);
-                    return false;
-                }
-                break;
-            }
-        } else if (n < 0 && errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR)
-            break;
-    }
-    const u64 publication_ns = origin.head_publication_ns.load();
-    if (header_complete_ns == 0u || publication_ns == 0u || header_complete_ns < publication_ns ||
-        header_complete_ns - publication_ns >= 350'000'000ull ||
-        !validate_exact_normalized_response(response, kExpected, error)) {
-        if (error.empty()) error = "#630 delayed HEAD header publication mismatch/timing";
-        close(client);
-        return false;
-    }
-    const u64 ledger_deadline = header_complete_ns + 250'000'000ull;
-    std::string access;
-    u64 access_ns = 0u;
-    bool ledger_seen = false;
-    while (steady_now_ns() < ledger_deadline) {
-        std::string sample;
-        if (!read_request_length_access_file(temp.nginx_access_log, sample, error)) {
-            close(client);
-            return false;
-        }
-        if (sample == "61\n") {
-            access = sample;
-            ledger_seen = true;
-            access_ns = steady_now_ns();
-            break;
-        }
-        if (!sample.empty()) {
-            error = "#630 access ledger published a non-exact value";
-            close(client);
-            return false;
-        }
-        usleep(1000);
-    }
-    if (!ledger_seen) {
-        error = "#630 access ledger missed the header-completion anchor window";
-        close(client);
-        return false;
-    }
-    const u64 stable_deadline = header_complete_ns + 2'250'000'000ull;
-    u64 quiet_until_ns = 0u;
-    while (steady_now_ns() < stable_deadline) {
-        if (!observe_client_open_and_quiet_nonconsuming(client, 50, error) ||
-            poll_child(nginx.child) || !origin.thread_alive.load(std::memory_order_acquire)) {
-            error = "#630 downstream emitted body/tail or closed during keep-alive observation";
-            close(client);
-            return false;
-        }
-        std::string sample;
-        if (!read_request_length_access_file(temp.nginx_access_log, sample, error) ||
-            sample != "61\n") {
-            error = "#630 access ledger was not stably exact through the quiet window";
-            close(client);
-            return false;
-        }
-        if (origin.response_send_failed.load() || origin.listener_failed.load() ||
-            origin.first_peer_unexpected_data.load() ||
-            origin.first_peer_observation_failed.load()) {
-            error = "#630 origin reported send/listener/protocol custody failure";
-            close(client);
-            return false;
-        }
-        quiet_until_ns = steady_now_ns();
-    }
-    const std::string expected_upstream =
-        std::string("HEAD /buffered-timeout?q=1 HTTP/1.1\r\nHost: 127.0.0.1:") +
-        std::to_string(backend) + "\r\n\r\n";
-    const auto retire_deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(350);
-    while (!origin.first_peer_closed.load() && std::chrono::steady_clock::now() < retire_deadline)
-        usleep(1000);
-    const u64 retirement_ns = origin.first_peer_closed_ns.load();
-    std::string final_access;
-    std::string final_detail;
-    const bool final_quiet = observe_client_open_and_quiet_nonconsuming(client, 50, final_detail);
-    const u64 final_quiet_until_ns = final_quiet ? steady_now_ns() : quiet_until_ns;
-    const bool final_ledger_ok =
-        read_request_length_access_file(temp.nginx_access_log, final_access, final_detail) &&
-        final_access == "61\n";
-    HeadAcceptanceObservation actual;
-    actual.origin_ns = origin.request_complete_ns[0].load(std::memory_order_acquire);
-    actual.publication_ns = publication_ns;
-    actual.header_ns = header_complete_ns;
-    actual.retirement_ns = retirement_ns;
-    actual.wire = response;
-    actual.access = final_access;
-    actual.access_ns = access_ns;
-    actual.quiet_until_ns = final_quiet_until_ns;
-    actual.accepted = origin.accepted.load(std::memory_order_acquire);
-    actual.requests = origin.requests.load(std::memory_order_acquire);
-    actual.publication_count = origin.head_publication_count.load(std::memory_order_acquire);
-    actual.retirement_count = origin.head_peer_close_count.load(std::memory_order_acquire);
-    actual.response_send_calls = origin.response_send_calls.load(std::memory_order_acquire);
-    actual.response_bytes_sent = origin.response_bytes_sent.load(std::memory_order_acquire);
-    actual.downstream_open = final_quiet;
-    actual.downstream_eof = false;
-    actual.response_send_failed = origin.response_send_failed.load(std::memory_order_acquire);
-    actual.listener_failed = origin.listener_failed.load(std::memory_order_acquire);
-    actual.unexpected_data = origin.first_peer_unexpected_data.load(std::memory_order_acquire);
-    actual.observation_failed =
-        origin.first_peer_observation_failed.load(std::memory_order_acquire);
-    std::string acceptance_detail;
-    const bool ok = validate_head_acceptance(actual, kExpected, acceptance_detail);
-    const bool live_snapshot_ok =
-        final_quiet && final_ledger_ok && origin.thread_alive.load(std::memory_order_acquire) &&
-        !origin.listener_failed.load(std::memory_order_acquire) && !poll_child(nginx.child);
-    close(client);
-    origin.stop();
-    if (origin.history.size() != 1u ||
-        std::string(origin.history[0].wire.begin(), origin.history[0].wire.end()) !=
-            expected_upstream ||
-        origin.history[0].wire.size() != 61u) {
-        error = "#630 upstream request wire mismatch";
-        return false;
-    }
     const bool cleanup_ok = stop_child(nginx.child) && docker.remove();
-    if (!ok || !live_snapshot_ok || !cleanup_ok) {
-        if (error.empty())
-            error = "#630 origin retirement/request/access evidence mismatch: " + acceptance_detail;
-        return false;
-    }
-    std::cerr << "PASS evidence: #630 HEAD header anchor/retirement ns=" << publication_ns << "/"
-              << header_complete_ns << "/" << origin.first_peer_closed_ns.load()
-              << " ledger=61\\n\n";
+    if (!cleanup_ok) return false;
+    std::cerr << "PASS evidence: #630 HEAD header anchor/retirement ns=" << accepted.publication_ns
+              << "/" << accepted.header_ns << "/" << accepted.retirement_ns
+              << " ledger=61\\n\\n";
     return true;
 }
 
