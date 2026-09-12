@@ -16,6 +16,7 @@
 #include <atomic>
 #include <cerrno>
 #include <chrono>
+#include <cstdint>
 #include <cstdlib>
 #include <cstring>
 #include <iostream>
@@ -31,6 +32,7 @@
 #include <pthread.h>
 #include <signal.h>
 #include <sys/mman.h>
+#include <sys/prctl.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/wait.h>
@@ -816,12 +818,134 @@ struct DockerInfoResult {
     int error_number = 0;
     int wait_error_number = 0;
     int cleanup_wait_error_number = 0;
+    int status_pipe_close_error = 0;
+    int status_pipe_verify_error = 0;
     u64 probe_elapsed_ns = 0;
     u64 cleanup_elapsed_ns = 0;
     int configured_timeout_ms = 10'000;
     std::string snapshot;
     std::string snapshot_error;
     DockerSnapshotState snapshot_state = DockerSnapshotState::Missing;
+    enum class LaunchStage : uint8_t {
+        None,
+        BeforeLogOpen,
+        RedirectsReady,
+        BeforeExec,
+        LaunchError
+    };
+    struct LaunchObservation {
+        LaunchStage stage = LaunchStage::None;
+        LaunchStage failed_stage = LaunchStage::None;
+        int error_number = 0;
+        u64 parent_elapsed_ns = 0;
+    };
+    std::vector<LaunchObservation> launch_observations;
+    bool launch_channel_closed = false;
+    bool launch_channel_closed_before_cleanup = false;
+    bool launch_integrity_error = false;
+    bool launch_evidence_frozen = false;
+    bool status_pipe_closed = false;
+};
+
+// Fixture-local decoder for the child launch-status protocol.  Keeping the
+// byte framing and grammar here makes the production runner and self-check
+// controls exercise precisely the same validation path.
+struct DockerLaunchRecord {
+    uint32_t magic;
+    uint8_t stage;
+    uint8_t failed_stage;
+    uint16_t reserved;
+    int32_t error_number;
+};
+
+static constexpr uint32_t kDockerLaunchMagic = 0x52555436u;
+
+class DockerLaunchRecordDecoder {
+public:
+    using Stage = DockerInfoResult::LaunchStage;
+
+    void feed(const void* data, size_t length) {
+        if (closed_) return;
+        const auto* bytes = static_cast<const char*>(data);
+        while (length != 0) {
+            const size_t take = std::min(sizeof(record_) - partial_size_, length);
+            memcpy(reinterpret_cast<char*>(&record_) + partial_size_, bytes, take);
+            partial_size_ += take;
+            bytes += take;
+            length -= take;
+            if (partial_size_ != sizeof(record_)) continue;
+            partial_size_ = 0;
+            accept(record_);
+        }
+    }
+
+    void finalize_eof() {
+        if (closed_) {
+            integrity_error_ = true;
+            return;
+        }
+        closed_ = true;
+        if (partial_size_ != 0 || !terminal_sequence()) integrity_error_ = true;
+    }
+
+    const std::vector<DockerLaunchRecord>& records() const { return records_; }
+    bool integrity_error() const { return integrity_error_; }
+    bool closed() const { return closed_; }
+
+private:
+    static bool is_prefix(Stage stage, size_t count) {
+        if (count == 0 || count > 3) return false;
+        static constexpr Stage expected[] = {
+            Stage::BeforeLogOpen, Stage::RedirectsReady, Stage::BeforeExec};
+        return stage == expected[count - 1];
+    }
+
+    bool terminal_sequence() const {
+        if (records_.size() == 3 && is_prefix(static_cast<Stage>(records_[2].stage), 3))
+            return true;
+        if (records_.size() == 2 && records_[1].stage == static_cast<uint8_t>(Stage::LaunchError))
+            return records_[0].stage == static_cast<uint8_t>(Stage::BeforeLogOpen) &&
+                   records_[1].failed_stage == records_[0].stage && records_[1].error_number > 0;
+        if (records_.size() == 4 && records_[3].stage == static_cast<uint8_t>(Stage::LaunchError))
+            return records_[0].stage == static_cast<uint8_t>(Stage::BeforeLogOpen) &&
+                   records_[1].stage == static_cast<uint8_t>(Stage::RedirectsReady) &&
+                   records_[2].stage == static_cast<uint8_t>(Stage::BeforeExec) &&
+                   records_[3].failed_stage == records_[2].stage && records_[3].error_number > 0;
+        return false;
+    }
+
+    void accept(const DockerLaunchRecord& record) {
+        const uint8_t first = static_cast<uint8_t>(Stage::BeforeLogOpen);
+        const uint8_t terminal = static_cast<uint8_t>(Stage::LaunchError);
+        if (records_.size() >= 4 || record.magic != kDockerLaunchMagic || record.stage < first ||
+            record.stage > terminal || record.reserved != 0 ||
+            (record.stage != terminal && (record.failed_stage != 0 || record.error_number != 0)) ||
+            (record.stage == terminal &&
+             (record.failed_stage < first || record.failed_stage >= terminal ||
+              record.error_number <= 0))) {
+            integrity_error_ = true;
+            return;
+        }
+        if (closed_ || (records_.size() > 0 && records_.back().stage == terminal) ||
+            (record.stage != terminal &&
+             !is_prefix(static_cast<Stage>(record.stage), records_.size() + 1)) ||
+            (record.stage == terminal &&
+             !((records_.size() == 1 && records_[0].stage == first &&
+                record.failed_stage == first) ||
+               (records_.size() == 3 &&
+                records_[2].stage == static_cast<uint8_t>(Stage::BeforeExec) &&
+                record.failed_stage == static_cast<uint8_t>(Stage::BeforeExec))))) {
+            integrity_error_ = true;
+            return;
+        }
+        records_.push_back(record);
+    }
+
+    DockerLaunchRecord record_{};
+    size_t partial_size_ = 0;
+    std::vector<DockerLaunchRecord> records_;
+    bool closed_ = false;
+    bool integrity_error_ = false;
 };
 
 static bool poll_child(Child& child) {
@@ -919,22 +1043,192 @@ static bool reap_child_bounded(Child& child, int timeout_ms, int& wait_error) {
 
 static DockerInfoResult run_docker_info_runner(const std::vector<std::string>& args,
                                                const std::string& log_path,
-                                               int timeout_ms = 10'000) {
+                                               int timeout_ms = 10'000,
+                                               bool protect_inner_parent = false) {
     DockerInfoResult result;
     result.configured_timeout_ms = timeout_ms;
+    result.status_pipe_closed = true;
     const auto started = std::chrono::steady_clock::now();
-    if (!spawn_child(args, log_path, result.child)) {
-        result.error_number = errno;
-        result.outcome = DockerInfoOutcome::SpawnFailed;
+    static_assert(sizeof(DockerLaunchRecord) < PIPE_BUF);
+    int status_pipe[2] = {-1, -1};
+    const auto close_owned_fd = [&](int& fd) {
+        if (fd < 0) return true;
+        const int old_fd = fd;
+        const int close_rc = close(old_fd);
+        const int close_errno = errno;
+        fd = -1;
+        errno = 0;
+        const int verify_rc = fcntl(old_fd, F_GETFD);
+        const int verify_errno = errno;
+        if (close_rc != 0) {
+            if (result.status_pipe_close_error == 0) result.status_pipe_close_error = close_errno;
+        }
+        if (verify_rc != -1 || verify_errno != EBADF) {
+            if (result.status_pipe_verify_error == 0)
+                result.status_pipe_verify_error = verify_rc == -1 ? verify_errno : 0;
+        }
+        return close_rc == 0 && verify_rc == -1 && verify_errno == EBADF;
+    };
+    const auto launch_failure = [&]() {
+        bool closed = true;
+        const bool read_closed = close_owned_fd(status_pipe[0]);
+        const bool write_closed = close_owned_fd(status_pipe[1]);
+        closed = read_closed && write_closed;
+        result.status_pipe_closed = result.status_pipe_closed && closed;
         result.probe_elapsed_ns =
             static_cast<u64>(std::chrono::duration_cast<std::chrono::nanoseconds>(
                                  std::chrono::steady_clock::now() - started)
                                  .count());
         return result;
+    };
+    if (pipe2(status_pipe, O_CLOEXEC) != 0) {
+        result.error_number = errno;
+        result.outcome = DockerInfoOutcome::SpawnFailed;
+        return launch_failure();
+    }
+    for (int i = 0; i != 2; ++i) {
+        const int moved = fcntl(status_pipe[i], F_DUPFD_CLOEXEC, 3);
+        if (moved < 0) {
+            result.error_number = errno;
+            const bool read_closed = close_owned_fd(status_pipe[0]);
+            const bool write_closed = close_owned_fd(status_pipe[1]);
+            result.status_pipe_closed = result.status_pipe_closed && read_closed && write_closed;
+            result.outcome = DockerInfoOutcome::SpawnFailed;
+            return launch_failure();
+        }
+        result.status_pipe_closed = close_owned_fd(status_pipe[i]) && result.status_pipe_closed;
+        status_pipe[i] = moved;
+    }
+    {
+        const int flags = fcntl(status_pipe[0], F_GETFL, 0);
+        const int write_flags = fcntl(status_pipe[1], F_GETFL, 0);
+        if (flags < 0 || write_flags < 0 ||
+            fcntl(status_pipe[0], F_SETFL, flags | O_NONBLOCK) != 0 ||
+            fcntl(status_pipe[1], F_SETFL, write_flags | O_NONBLOCK) != 0) {
+            result.error_number = errno;
+            const bool read_closed = close_owned_fd(status_pipe[0]);
+            const bool write_closed = close_owned_fd(status_pipe[1]);
+            result.status_pipe_closed = result.status_pipe_closed && read_closed && write_closed;
+            result.outcome = DockerInfoOutcome::SpawnFailed;
+            return launch_failure();
+        }
+    }
+    std::vector<char*> argv;
+    argv.reserve(args.size() + 1);
+    for (const auto& arg : args) argv.push_back(const_cast<char*>(arg.c_str()));
+    argv.push_back(nullptr);
+    const pid_t expected_parent = getpid();
+    {
+        const pid_t pid = fork();
+        if (pid < 0) {
+            result.error_number = errno;
+            const bool read_closed = close_owned_fd(status_pipe[0]);
+            const bool write_closed = close_owned_fd(status_pipe[1]);
+            result.status_pipe_closed = result.status_pipe_closed && read_closed && write_closed;
+            result.outcome = DockerInfoOutcome::SpawnFailed;
+            return launch_failure();
+        }
+        if (pid == 0) {
+            close(status_pipe[0]);
+            auto announce = [&](DockerInfoResult::LaunchStage stage,
+                                DockerInfoResult::LaunchStage failed_stage =
+                                    DockerInfoResult::LaunchStage::None,
+                                int error_number = 0) {
+                const DockerLaunchRecord record{kDockerLaunchMagic,
+                                                static_cast<uint8_t>(stage),
+                                                static_cast<uint8_t>(failed_stage),
+                                                0,
+                                                error_number};
+                ssize_t n;
+                do {
+                    n = write(status_pipe[1], &record, sizeof(record));
+                } while (n < 0 && errno == EINTR);
+            };
+            if (protect_inner_parent && prctl(PR_SET_PDEATHSIG, SIGKILL) != 0) {
+                const int saved_errno = errno;
+                announce(DockerInfoResult::LaunchStage::BeforeLogOpen);
+                announce(DockerInfoResult::LaunchStage::LaunchError,
+                         DockerInfoResult::LaunchStage::BeforeLogOpen,
+                         saved_errno);
+                _exit(127);
+            }
+            if (protect_inner_parent && getppid() != expected_parent) {
+                announce(DockerInfoResult::LaunchStage::BeforeLogOpen);
+                announce(DockerInfoResult::LaunchStage::LaunchError,
+                         DockerInfoResult::LaunchStage::BeforeLogOpen,
+                         ECHILD);
+                _exit(127);
+            }
+            announce(DockerInfoResult::LaunchStage::BeforeLogOpen);
+            const int fd = open(log_path.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0600);
+            if (fd < 0) {
+                announce(DockerInfoResult::LaunchStage::LaunchError,
+                         DockerInfoResult::LaunchStage::BeforeLogOpen,
+                         errno);
+                _exit(127);
+            }
+            if (dup2(fd, STDOUT_FILENO) < 0 || dup2(fd, STDERR_FILENO) < 0) {
+                const int saved_errno = errno;
+                close(fd);
+                announce(DockerInfoResult::LaunchStage::LaunchError,
+                         DockerInfoResult::LaunchStage::BeforeLogOpen,
+                         saved_errno);
+                _exit(127);
+            }
+            if (fd != STDOUT_FILENO && fd != STDERR_FILENO) close(fd);
+            announce(DockerInfoResult::LaunchStage::RedirectsReady);
+            announce(DockerInfoResult::LaunchStage::BeforeExec);
+            execvp(argv[0], argv.data());
+            announce(DockerInfoResult::LaunchStage::LaunchError,
+                     DockerInfoResult::LaunchStage::BeforeExec,
+                     errno);
+            _exit(127);
+        }
+        const bool write_pipe_closed = close_owned_fd(status_pipe[1]);
+        result.status_pipe_closed = result.status_pipe_closed && write_pipe_closed;
+        result.child.pid = pid;
+        result.child.log_path = log_path;
+        result.child.reaped = false;
+        result.child.status_valid = false;
     }
     const auto deadline = started + std::chrono::milliseconds(timeout_ms);
-    int wait_error = 0;
+    DockerLaunchRecordDecoder decoder;
+    auto drain_launch_channel = [&]() {
+        if (result.launch_evidence_frozen) return;
+        constexpr size_t kMaxDrainReads = 5;
+        size_t drain_reads = 0;
+        for (; drain_reads < kMaxDrainReads; ++drain_reads) {
+            char buffer[sizeof(DockerLaunchRecord) * 4];
+            const ssize_t n = read(status_pipe[0], buffer, sizeof(buffer));
+            if (n > 0) {
+                const size_t before = decoder.records().size();
+                decoder.feed(buffer, static_cast<size_t>(n));
+                const u64 observed_ns =
+                    static_cast<u64>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                         std::chrono::steady_clock::now() - started)
+                                         .count());
+                for (size_t i = before; i < decoder.records().size(); ++i) {
+                    const DockerLaunchRecord& record = decoder.records()[i];
+                    result.launch_observations.push_back(
+                        {static_cast<DockerInfoResult::LaunchStage>(record.stage),
+                         static_cast<DockerInfoResult::LaunchStage>(record.failed_stage),
+                         record.error_number,
+                         observed_ns});
+                }
+                continue;
+            }
+            if (n == 0) {
+                result.launch_channel_closed = true;
+                if (!result.child.reaped) result.launch_channel_closed_before_cleanup = true;
+            } else if (errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR) {
+                result.launch_integrity_error = true;
+            }
+            break;
+        }
+        if (drain_reads == kMaxDrainReads) result.launch_integrity_error = true;
+    };
     for (;;) {
+        drain_launch_channel();
         int status = 0;
         const pid_t rc = waitpid(result.child.pid, &status, WNOHANG);
         if (rc == result.child.pid) {
@@ -956,9 +1250,13 @@ static DockerInfoResult run_docker_info_runner(const std::vector<std::string>& a
             result.outcome =
                 deadline_eintr ? DockerInfoOutcome::TimedOut : DockerInfoOutcome::WaitFailed;
             if (errno == ECHILD) {
+                drain_launch_channel();
+                result.launch_evidence_frozen = true;
                 result.no_waitable_child = true;
                 result.child.status_valid = false;
             } else {
+                drain_launch_channel();
+                result.launch_evidence_frozen = true;
                 result.kill_attempted = true;
                 if (kill(result.child.pid, SIGKILL) != 0 && errno != ESRCH) {
                     result.kill_failed = true;
@@ -977,6 +1275,8 @@ static DockerInfoResult run_docker_info_runner(const std::vector<std::string>& a
         }
         if (std::chrono::steady_clock::now() >= deadline) {
             result.outcome = DockerInfoOutcome::TimedOut;
+            drain_launch_channel();
+            result.launch_evidence_frozen = true;
             result.kill_attempted = true;
             if (kill(result.child.pid, SIGKILL) != 0 && errno != ESRCH) {
                 result.kill_failed = true;
@@ -994,6 +1294,16 @@ static DockerInfoResult run_docker_info_runner(const std::vector<std::string>& a
         }
         usleep(5'000);
     }
+    if (!result.launch_evidence_frozen) drain_launch_channel();
+    if (result.launch_channel_closed) decoder.finalize_eof();
+    result.launch_integrity_error = result.launch_integrity_error || decoder.integrity_error();
+    const auto stage = [&](size_t index) {
+        return index < result.launch_observations.size() ? result.launch_observations[index].stage
+                                                         : DockerInfoResult::LaunchStage::None;
+    };
+    const bool read_pipe_closed = close_owned_fd(status_pipe[0]);
+    const bool write_pipe_closed = close_owned_fd(status_pipe[1]);
+    result.status_pipe_closed = result.status_pipe_closed && read_pipe_closed && write_pipe_closed;
     result.probe_elapsed_ns = static_cast<u64>(std::chrono::duration_cast<std::chrono::nanoseconds>(
                                                    std::chrono::steady_clock::now() - started)
                                                    .count()) -
@@ -1282,6 +1592,7 @@ static bool docker_daemon_text(const std::string& text) {
 enum class DockerInfoDecision { Success, MissingPrerequisite, Failure };
 
 static DockerInfoDecision docker_info_decision(const DockerInfoResult& result) {
+    if (result.launch_integrity_error) return DockerInfoDecision::Failure;
     if (result.outcome == DockerInfoOutcome::Exited && result.child.status_valid &&
         WIFEXITED(result.child.status) && WEXITSTATUS(result.child.status) == 0)
         return DockerInfoDecision::Success;
@@ -1320,7 +1631,7 @@ static bool run_docker_info_preflight_self_check(std::string& error) {
                      int expected_exit = -1) {
         DockerInfoResult result = run_docker_info_runner(args, log, timeout_ms);
         unlink(log.c_str());
-        if (result.outcome != expected ||
+        if (result.outcome != expected || !result.status_pipe_closed ||
             (expected == DockerInfoOutcome::Exited && expected_exit >= 0 &&
              (!result.child.status_valid || !WIFEXITED(result.child.status) ||
               WEXITSTATUS(result.child.status) != expected_exit)) ||
@@ -1340,6 +1651,291 @@ static bool run_docker_info_preflight_self_check(std::string& error) {
         !check({"sh", "-c", "exit 0"}, 100, DockerInfoOutcome::Exited, 0) ||
         !check({"sh", "-c", "kill -TERM $$"}, 100, DockerInfoOutcome::Signaled) ||
         !check({"sh", "-c", "exec sleep 1"}, 50, DockerInfoOutcome::TimedOut)) {
+        cleanup();
+        return false;
+    }
+    // An exec'd process inherits no launch records after CLOEXEC closes the
+    // status writer.  This is distinct from pre-exec FIFO blocking: EOF here
+    // is only launch-channel closure, never proof of successful exec.
+    DockerInfoResult silent_postexec =
+        run_docker_info_runner({"sh", "-c", "exec sleep 1"}, log, 50);
+    const size_t silent_records = silent_postexec.launch_observations.size();
+    std::string silent_snapshot;
+    std::string silent_snapshot_error;
+    DockerSnapshotState silent_snapshot_state = DockerSnapshotState::Missing;
+    const bool silent_snapshot_ok =
+        read_docker_snapshot(log, silent_snapshot, silent_snapshot_error, silent_snapshot_state);
+    unlink(log.c_str());
+    if (silent_postexec.outcome != DockerInfoOutcome::TimedOut ||
+        !silent_postexec.launch_channel_closed ||
+        !silent_postexec.launch_channel_closed_before_cleanup ||
+        !silent_postexec.launch_evidence_frozen || silent_postexec.launch_integrity_error ||
+        silent_records != 3 ||
+        silent_postexec.launch_observations[0].stage !=
+            DockerInfoResult::LaunchStage::BeforeLogOpen ||
+        silent_postexec.launch_observations[1].stage !=
+            DockerInfoResult::LaunchStage::RedirectsReady ||
+        silent_postexec.launch_observations[2].stage != DockerInfoResult::LaunchStage::BeforeExec ||
+        silent_postexec.kill_attempted == false || silent_postexec.kill_failed ||
+        silent_postexec.reap_failed || silent_postexec.ownership_unresolved ||
+        !silent_postexec.child.reaped || !silent_postexec.child.status_valid ||
+        !WIFSIGNALED(silent_postexec.child.status) ||
+        WTERMSIG(silent_postexec.child.status) != SIGKILL || !silent_snapshot_ok ||
+        silent_snapshot_state != DockerSnapshotState::Empty ||
+        docker_info_return_code(docker_info_decision(silent_postexec), true) != 1 ||
+        docker_info_return_code(docker_info_decision(silent_postexec), false) != 1 ||
+        !silent_postexec.status_pipe_closed) {
+        error = "post-exec silent timeout lifecycle control failed";
+        cleanup();
+        return false;
+    }
+    DockerInfoResult ordered = run_docker_info_runner({"sh", "-c", "exit 0"}, log, 100);
+    unlink(log.c_str());
+    if (ordered.launch_integrity_error || !ordered.launch_channel_closed ||
+        ordered.launch_observations.size() != 3 ||
+        ordered.launch_observations[0].stage != DockerInfoResult::LaunchStage::BeforeLogOpen ||
+        ordered.launch_observations[1].stage != DockerInfoResult::LaunchStage::RedirectsReady ||
+        ordered.launch_observations[2].stage != DockerInfoResult::LaunchStage::BeforeExec) {
+        error = "ordered launch-channel success control failed";
+        cleanup();
+        return false;
+    }
+    const auto protocol_record = [](DockerInfoResult::LaunchStage stage,
+                                    DockerInfoResult::LaunchStage failed =
+                                        DockerInfoResult::LaunchStage::None,
+                                    int error_number = 0) {
+        return DockerLaunchRecord{kDockerLaunchMagic,
+                                  static_cast<uint8_t>(stage),
+                                  static_cast<uint8_t>(failed),
+                                  0,
+                                  error_number};
+    };
+    const auto protocol_check = [&](const std::vector<DockerLaunchRecord>& records,
+                                    bool valid,
+                                    size_t expected_count) {
+        DockerLaunchRecordDecoder decoder;
+        for (const DockerLaunchRecord& record : records) {
+            const char* bytes = reinterpret_cast<const char*>(&record);
+            for (size_t offset = 0; offset < sizeof(record); ++offset)
+                decoder.feed(bytes + offset, 1);
+        }
+        decoder.finalize_eof();
+        return decoder.integrity_error() == !valid && decoder.records().size() == expected_count;
+    };
+    const auto normal_records = std::vector<DockerLaunchRecord>{
+        protocol_record(DockerInfoResult::LaunchStage::BeforeLogOpen),
+        protocol_record(DockerInfoResult::LaunchStage::RedirectsReady),
+        protocol_record(DockerInfoResult::LaunchStage::BeforeExec)};
+    const auto log_error_records = std::vector<DockerLaunchRecord>{
+        protocol_record(DockerInfoResult::LaunchStage::BeforeLogOpen),
+        protocol_record(DockerInfoResult::LaunchStage::LaunchError,
+                        DockerInfoResult::LaunchStage::BeforeLogOpen,
+                        EISDIR)};
+    const auto exec_error_records =
+        std::vector<DockerLaunchRecord>{normal_records[0],
+                                        normal_records[1],
+                                        normal_records[2],
+                                        protocol_record(DockerInfoResult::LaunchStage::LaunchError,
+                                                        DockerInfoResult::LaunchStage::BeforeExec,
+                                                        ENOENT)};
+    DockerLaunchRecordDecoder open_prefix;
+    open_prefix.feed(&normal_records[0], sizeof(normal_records[0]));
+    if (!protocol_check(normal_records, true, 3) || !protocol_check(log_error_records, true, 2) ||
+        !protocol_check(exec_error_records, true, 4) || open_prefix.integrity_error() ||
+        open_prefix.records().size() != 1) {
+        error = "fixed launch-record positive/partial controls failed";
+        cleanup();
+        return false;
+    }
+    std::vector<DockerLaunchRecord> bad = normal_records;
+    bad[0].magic ^= 1u;
+    if (!protocol_check(bad, false, 0)) {
+        error = "bad-magic launch control failed";
+        cleanup();
+        return false;
+    }
+    const auto expect_reject = [&](std::vector<DockerLaunchRecord> candidate,
+                                   const char* label,
+                                   size_t expected_count = 0) {
+        DockerLaunchRecordDecoder decoder;
+        for (const DockerLaunchRecord& record : candidate) decoder.feed(&record, sizeof(record));
+        decoder.finalize_eof();
+        if (!decoder.integrity_error() || decoder.records().size() != expected_count) {
+            error = std::string(label) + " launch control failed";
+            cleanup();
+            return false;
+        }
+        return true;
+    };
+    bad = normal_records;
+    bad[0].stage = 9;
+    if (!expect_reject(bad, "unknown-stage") ||
+        !expect_reject({DockerLaunchRecord{kDockerLaunchMagic, 1, 0, 1, 0}}, "reserved") ||
+        !expect_reject({DockerLaunchRecord{kDockerLaunchMagic, 1, 0, 0, 1}}, "non-error-errno") ||
+        !expect_reject({DockerLaunchRecord{kDockerLaunchMagic, 1, 4, 0, 0}},
+                       "invalid-error-stage") ||
+        !expect_reject({DockerLaunchRecord{kDockerLaunchMagic, 1, 1, 0, 0}}, "missing-error") ||
+        !expect_reject({DockerLaunchRecord{kDockerLaunchMagic, 1, 0, 0, 0},
+                        protocol_record(DockerInfoResult::LaunchStage::LaunchError,
+                                        DockerInfoResult::LaunchStage::BeforeLogOpen,
+                                        0)},
+                       "invalid-error-errno",
+                       1) ||
+        !expect_reject({normal_records[0], normal_records[0]}, "repeated-stage", 1) ||
+        !expect_reject({normal_records[0], normal_records[2]}, "out-of-order-stage", 1)) {
+        return false;
+    }
+    DockerLaunchRecordDecoder truncated;
+    truncated.feed(&normal_records[0], sizeof(normal_records[0]) - 1);
+    truncated.finalize_eof();
+    if (!truncated.integrity_error() || !truncated.records().empty()) {
+        error = "truncated-eof launch control failed";
+        cleanup();
+        return false;
+    }
+    DockerLaunchRecordDecoder after_terminal;
+    after_terminal.feed(log_error_records.data(), sizeof(DockerLaunchRecord) * 2);
+    after_terminal.feed(&normal_records[1], sizeof(normal_records[1]));
+    if (!after_terminal.integrity_error() || after_terminal.records().size() != 2) {
+        error = "record-after-terminal launch control failed";
+        cleanup();
+        return false;
+    }
+    std::vector<DockerLaunchRecord> fifth = exec_error_records;
+    fifth.push_back(normal_records[0]);
+    if (!protocol_check(fifth, false, 4)) {
+        error = "fifth-record-overflow launch control failed";
+        cleanup();
+        return false;
+    }
+    DockerInfoResult missing_exec =
+        run_docker_info_runner({"/definitely/missing/docker-info"}, log, 100);
+    unlink(log.c_str());
+    if (missing_exec.launch_integrity_error || missing_exec.launch_observations.size() != 4 ||
+        missing_exec.launch_observations.back().stage !=
+            DockerInfoResult::LaunchStage::LaunchError ||
+        missing_exec.launch_observations.back().failed_stage !=
+            DockerInfoResult::LaunchStage::BeforeExec ||
+        missing_exec.launch_observations.back().error_number != ENOENT) {
+        error = "missing-exec launch error control failed";
+        cleanup();
+        return false;
+    }
+    if (mkdir(log.c_str(), 0700) != 0) {
+        error = "could not create invalid-log control";
+        cleanup();
+        return false;
+    }
+    DockerInfoResult invalid_log = run_docker_info_runner({"sh", "-c", "exit 0"}, log, 100);
+    rmdir(log.c_str());
+    if (invalid_log.launch_integrity_error || invalid_log.launch_observations.size() != 2 ||
+        invalid_log.launch_observations.back().stage !=
+            DockerInfoResult::LaunchStage::LaunchError ||
+        invalid_log.launch_observations.back().failed_stage !=
+            DockerInfoResult::LaunchStage::BeforeLogOpen ||
+        invalid_log.launch_observations.back().error_number != EISDIR) {
+        error = "invalid-log launch error control failed";
+        cleanup();
+        return false;
+    }
+    if (mkfifo(log.c_str(), 0600) != 0) {
+        error = "could not create FIFO launch control";
+        cleanup();
+        return false;
+    }
+    DockerInfoResult fifo = run_docker_info_runner({"sh", "-c", "exit 0"}, log, 50);
+    unlink(log.c_str());
+    if (fifo.outcome != DockerInfoOutcome::TimedOut || !fifo.kill_attempted || fifo.reap_failed ||
+        fifo.ownership_unresolved || fifo.launch_observations.size() != 1 ||
+        fifo.launch_observations[0].stage != DockerInfoResult::LaunchStage::BeforeLogOpen ||
+        fifo.launch_channel_closed || fifo.launch_channel_closed_before_cleanup ||
+        !fifo.launch_evidence_frozen || !fifo.status_pipe_closed ||
+        docker_info_return_code(docker_info_decision(fifo), true) != 1 ||
+        docker_info_return_code(docker_info_decision(fifo), false) != 1) {
+        error = "FIFO before-log-open timeout control failed";
+        cleanup();
+        return false;
+    }
+    // An isolated outer child closes conventional stdio before invoking the
+    // runner.  The runner's own child must still relocate its status pipe,
+    // establish log redirection, and report an owned exit status.
+    struct StdioCollisionReport {
+        uint32_t magic;
+        int32_t outcome;
+        int32_t child_status;
+        uint32_t records;
+        uint8_t integrity_error;
+        uint8_t status_pipe_closed;
+    };
+    static constexpr uint32_t kStdioCollisionMagic = 0x52555437u;
+    int collision_pipe[2] = {-1, -1};
+    if (pipe2(collision_pipe, O_CLOEXEC) != 0) {
+        error = "could not create stdio collision report pipe";
+        cleanup();
+        return false;
+    }
+    const pid_t outer_pid = fork();
+    if (outer_pid == 0) {
+        close(collision_pipe[0]);
+        close(STDIN_FILENO);
+        close(STDOUT_FILENO);
+        close(STDERR_FILENO);
+        const DockerInfoResult inner = run_docker_info_runner(
+            {"sh", "-c", "printf 'stdio-collision'; exit 0"}, log, 100, true);
+        const StdioCollisionReport report{kStdioCollisionMagic,
+                                          static_cast<int32_t>(inner.outcome),
+                                          inner.child.status_valid ? inner.child.status : -1,
+                                          static_cast<uint32_t>(inner.launch_observations.size()),
+                                          static_cast<uint8_t>(inner.launch_integrity_error),
+                                          static_cast<uint8_t>(inner.status_pipe_closed)};
+        const char* bytes = reinterpret_cast<const char*>(&report);
+        size_t left = sizeof(report);
+        while (left != 0) {
+            const ssize_t n = write(collision_pipe[1], bytes, left);
+            if (n > 0) {
+                bytes += n;
+                left -= static_cast<size_t>(n);
+            } else if (n < 0 && errno == EINTR) {
+                continue;
+            } else {
+                _exit(126);
+            }
+        }
+        close(collision_pipe[1]);
+        _exit(0);
+    }
+    close(collision_pipe[1]);
+    Child outer;
+    outer.pid = outer_pid;
+    if (outer_pid < 0 || !wait_child(outer, 3'500)) {
+        if (outer_pid > 0) (void)kill(outer_pid, SIGKILL);
+        int outer_wait_error = 0;
+        if (outer_pid > 0) (void)reap_child_bounded(outer, 2'000, outer_wait_error);
+        close(collision_pipe[0]);
+        error = "stdio collision outer child did not complete";
+        cleanup();
+        return false;
+    }
+    StdioCollisionReport collision_report{};
+    const ssize_t collision_read =
+        read(collision_pipe[0], &collision_report, sizeof(collision_report));
+    close(collision_pipe[0]);
+    std::string stdio_snapshot;
+    std::string stdio_snapshot_error;
+    DockerSnapshotState stdio_snapshot_state = DockerSnapshotState::Missing;
+    const bool stdio_snapshot_ok =
+        read_docker_snapshot(log, stdio_snapshot, stdio_snapshot_error, stdio_snapshot_state);
+    unlink(log.c_str());
+    if (collision_read != static_cast<ssize_t>(sizeof(collision_report)) ||
+        collision_report.magic != kStdioCollisionMagic ||
+        collision_report.outcome != static_cast<int32_t>(DockerInfoOutcome::Exited) ||
+        !WIFEXITED(collision_report.child_status) ||
+        WEXITSTATUS(collision_report.child_status) != 0 || collision_report.integrity_error ||
+        collision_report.records != 3 || !stdio_snapshot_ok ||
+        stdio_snapshot_state != DockerSnapshotState::NonEmpty ||
+        stdio_snapshot != "stdio-collision" || !collision_report.status_pipe_closed ||
+        outer.status_valid == false || !WIFEXITED(outer.status) || WEXITSTATUS(outer.status) != 0) {
+        error = "standard-fd collision launch control failed";
         cleanup();
         return false;
     }
@@ -1490,6 +2086,32 @@ static void print_docker_info_result(const DockerInfoResult& result) {
               << " kill_failed=" << (result.kill_failed ? 1 : 0)
               << " reap_failed=" << (result.reap_failed ? 1 : 0)
               << " ownership_unresolved=" << (result.ownership_unresolved ? 1 : 0) << "\n";
+    std::cerr << "Docker info launch_channel_closed=" << (result.launch_channel_closed ? 1 : 0)
+              << " launch_channel_closed_before_cleanup="
+              << (result.launch_channel_closed_before_cleanup ? 1 : 0)
+              << " launch_integrity_error=" << (result.launch_integrity_error ? 1 : 0)
+              << " launch_records=" << result.launch_observations.size() << "\n";
+    for (const auto& observation : result.launch_observations) {
+        const auto stage_name = [](DockerInfoResult::LaunchStage stage) {
+            switch (stage) {
+                case DockerInfoResult::LaunchStage::BeforeLogOpen:
+                    return "BeforeLogOpen";
+                case DockerInfoResult::LaunchStage::RedirectsReady:
+                    return "RedirectsReady";
+                case DockerInfoResult::LaunchStage::BeforeExec:
+                    return "BeforeExec";
+                case DockerInfoResult::LaunchStage::LaunchError:
+                    return "LaunchError";
+                default:
+                    return "None";
+            }
+        };
+        std::cerr << "Docker info launch stage=" << stage_name(observation.stage);
+        if (observation.stage == DockerInfoResult::LaunchStage::LaunchError)
+            std::cerr << " failed_stage=" << stage_name(observation.failed_stage);
+        std::cerr << " errno=" << observation.error_number
+                  << " parent_elapsed_ns=" << observation.parent_elapsed_ns << "\n";
+    }
     if (!result.snapshot.empty()) std::cerr << "Docker info snapshot:\n" << result.snapshot;
     if (!result.snapshot_error.empty())
         std::cerr << "Docker info snapshot error: " << result.snapshot_error << "\n";
@@ -2861,6 +3483,47 @@ enum class GatedResponseWriteEofPeerTerminal : unsigned char {
 };
 
 using PeerClosePublicationCallback = void (*)(void*);
+
+enum class LiveRetirementState { Pending, Ready, Invalid };
+
+struct LiveRetirementSnapshot {
+    LiveRetirementState state = LiveRetirementState::Pending;
+    u32 count = 0u;
+    u64 timestamp_ns = 0u;
+};
+
+// The flag is the publication commit point.  Keep its acquire load in its
+// own statement and only consume the payload after that commit is observed.
+static LiveRetirementSnapshot snapshot_live_retirement(const std::atomic<bool>& closure_published,
+                                                       const std::atomic<u32>& committed_count,
+                                                       const std::atomic<u64>& committed_timestamp,
+                                                       u64 minimum_ns) {
+    const bool committed = closure_published.load(std::memory_order_acquire);
+    u32 count = 0u;
+    u64 timestamp_ns = 0u;
+    if (committed) {
+        count = committed_count.load(std::memory_order_acquire);
+        timestamp_ns = committed_timestamp.load(std::memory_order_acquire);
+    }
+    const LiveRetirementState state =
+        !committed ? LiveRetirementState::Pending
+                   : (count != 1u || timestamp_ns < minimum_ns ? LiveRetirementState::Invalid
+                                                               : LiveRetirementState::Ready);
+    return {state, count, timestamp_ns};
+}
+
+struct LiveRetirementSnapshotCapture {
+    std::atomic<bool>* flag = nullptr;
+    std::atomic<u32>* count = nullptr;
+    std::atomic<u64>* timestamp_ns = nullptr;
+    LiveRetirementSnapshot snapshot;
+};
+
+static void capture_live_retirement_snapshot(void* opaque) {
+    auto* capture = static_cast<LiveRetirementSnapshotCapture*>(opaque);
+    capture->snapshot = snapshot_live_retirement(
+        *capture->flag, *capture->count, *capture->timestamp_ns, 1'000'000'000ull);
+}
 
 static void publish_peer_close(std::atomic<bool>& flag,
                                std::atomic<u32>& count,
@@ -5276,6 +5939,7 @@ struct KeepAlivePinnedRecorder {
         IncompleteWaitGate,
         DelayedIncompleteThenComplete,
         DelayedIncompleteGetThenCl0,
+        DelayedHeadComplete,
     };
     enum class ActiveWaitKind : uint8_t {
         None,
@@ -5284,6 +5948,8 @@ struct KeepAlivePinnedRecorder {
         IncompleteAbortHold,
         DelayedIncompleteDue,
         DelayedIncompletePeerClose,
+        DelayedHeadDue,
+        DelayedHeadPeerClose,
     };
     enum class IncompleteGateState : uint8_t {
         Idle,
@@ -5339,6 +6005,13 @@ struct KeepAlivePinnedRecorder {
     std::atomic<u64> first_partial_sent_ns{0};
     std::atomic<u64> first_peer_closed_ns{0};
     std::atomic<u64> second_complete_sent_ns{0};
+    std::atomic<u64> head_publication_ns{0};
+    std::atomic<u32> head_publication_count{0};
+    std::atomic<u32> head_peer_close_count{0};
+    std::atomic<bool> head_publish_permit{false};
+    std::atomic<bool> head_peer_open_ack{false};
+    std::atomic<bool> head_probe_request{false};
+    std::atomic<u64> head_probe_ack_ns{0};
     std::atomic<u32> response_send_calls{0};
     std::atomic<u32> response_bytes_sent{0};
     std::atomic<bool> response_send_failed{false};
@@ -5402,6 +6075,17 @@ struct KeepAlivePinnedRecorder {
             self.request_complete_ns[1].store(steady_now_ns(), std::memory_order_release);
         self.requests.fetch_add(1, std::memory_order_release);
         item.parsed = end;
+        if (self.first_response_mode == FirstResponseMode::DelayedHeadComplete) {
+            if (!first_request || item.wire.size() != end) {
+                self.first_peer_unexpected_data.store(true, std::memory_order_release);
+                return false;
+            }
+            if (probe_peer_nonblocking(item.fd) != PeerProbe::Open) return false;
+            self.head_peer_open_ack.store(true, std::memory_order_release);
+            item.wait_kind = ActiveWaitKind::DelayedHeadDue;
+            item.body_due = now + std::chrono::milliseconds(1200);
+            return true;
+        }
         if (self.first_response_mode == FirstResponseMode::DelayedIncompleteThenComplete ||
             self.first_response_mode == FirstResponseMode::DelayedIncompleteGetThenCl0) {
             if (item.wire.size() != end || (!first_request && !second_request)) {
@@ -5545,6 +6229,18 @@ struct KeepAlivePinnedRecorder {
             }
 
             const auto now = std::chrono::steady_clock::now();
+            if (self->first_response_mode == FirstResponseMode::DelayedHeadComplete &&
+                self->head_probe_request.exchange(false, std::memory_order_acq_rel)) {
+                for (auto& candidate : active) {
+                    if (candidate.wait_kind != ActiveWaitKind::DelayedHeadDue) continue;
+                    const PeerProbe probe = probe_peer_nonblocking(candidate.fd);
+                    if (probe == PeerProbe::Open)
+                        self->head_probe_ack_ns.store(steady_now_ns(), std::memory_order_release);
+                    else
+                        self->first_peer_observation_failed.store(true, std::memory_order_release);
+                    break;
+                }
+            }
             for (size_t index = polled_active_count; index > 0; index--) {
                 Active& item = active[index - 1];
                 const size_t poll_index = index;
@@ -5571,6 +6267,30 @@ struct KeepAlivePinnedRecorder {
                         self->first_partial_sent_ns.store(steady_now_ns(),
                                                           std::memory_order_release);
                         item.wait_kind = ActiveWaitKind::DelayedIncompletePeerClose;
+                    }
+                }
+                if (item.wait_kind == ActiveWaitKind::DelayedHeadDue && now >= item.body_due &&
+                    self->head_publish_permit.load(std::memory_order_acquire)) {
+                    static constexpr char kHead[] =
+                        "HTTP/1.1 200 OK\r\n"
+                        "Server: origin\r\n"
+                        "Date: Tue, 01 Jan 2030 00:00:00 GMT\r\n"
+                        "X-Powered-By: first\r\n"
+                        "x-powered-by: second\r\n"
+                        "X-Unrelated: retained\r\n"
+                        "Content-Length: 12\r\n"
+                        "Connection: keep-alive\r\n\r\n";
+                    static_assert(sizeof(kHead) - 1u == 182u);
+                    if (!send_all(item.fd, kHead, sizeof(kHead) - 1u)) {
+                        self->response_send_failed.store(true, std::memory_order_release);
+                        remove = true;
+                    } else {
+                        self->response_send_calls.fetch_add(1u, std::memory_order_release);
+                        self->response_bytes_sent.fetch_add(sizeof(kHead) - 1u,
+                                                            std::memory_order_release);
+                        self->head_publication_count.fetch_add(1u, std::memory_order_release);
+                        self->head_publication_ns.store(steady_now_ns(), std::memory_order_release);
+                        item.wait_kind = ActiveWaitKind::DelayedHeadPeerClose;
                     }
                 }
                 if (item.wait_kind == ActiveWaitKind::IncompleteGate) {
@@ -5661,6 +6381,26 @@ struct KeepAlivePinnedRecorder {
                         self->first_peer_closed_ns.store(steady_now_ns(),
                                                          std::memory_order_release);
                         self->first_peer_closed.store(true, std::memory_order_release);
+                        remove = true;
+                    } else if (n > 0) {
+                        self->first_peer_unexpected_data.store(true, std::memory_order_release);
+                        remove = true;
+                    } else if (errno != EINTR && errno != EAGAIN && errno != EWOULDBLOCK) {
+                        self->first_peer_observation_failed.store(true, std::memory_order_release);
+                        remove = true;
+                    }
+                }
+                if (!remove && item.wait_kind == ActiveWaitKind::DelayedHeadPeerClose &&
+                    (polls[poll_index].revents & (POLLIN | POLLERR | POLLHUP))) {
+                    char unexpected[256];
+                    const ssize_t n = recv(item.fd, unexpected, sizeof(unexpected), 0);
+                    if (n == 0 || (n < 0 && errno == ECONNRESET) ||
+                        (n < 0 && (polls[poll_index].revents & POLLHUP) != 0 &&
+                         (errno == EAGAIN || errno == EWOULDBLOCK))) {
+                        self->first_peer_closed_ns.store(steady_now_ns(),
+                                                         std::memory_order_release);
+                        self->first_peer_closed.store(true, std::memory_order_release);
+                        self->head_peer_close_count.fetch_add(1u, std::memory_order_release);
                         remove = true;
                     } else if (n > 0) {
                         self->first_peer_unexpected_data.store(true, std::memory_order_release);
@@ -5768,6 +6508,13 @@ struct KeepAlivePinnedRecorder {
         first_partial_sent_ns.store(0, std::memory_order_relaxed);
         first_peer_closed_ns.store(0, std::memory_order_relaxed);
         second_complete_sent_ns.store(0, std::memory_order_relaxed);
+        head_publication_ns.store(0, std::memory_order_relaxed);
+        head_publication_count.store(0, std::memory_order_relaxed);
+        head_peer_close_count.store(0, std::memory_order_relaxed);
+        head_publish_permit.store(false, std::memory_order_relaxed);
+        head_peer_open_ack.store(false, std::memory_order_relaxed);
+        head_probe_request.store(false, std::memory_order_relaxed);
+        head_probe_ack_ns.store(0, std::memory_order_relaxed);
         response_send_calls.store(0, std::memory_order_relaxed);
         response_bytes_sent.store(0, std::memory_order_relaxed);
         response_send_failed.store(false, std::memory_order_relaxed);
@@ -72963,6 +73710,7 @@ struct CustomHideTimeoutObservation {
     u32 accepted = 0u;
     u32 requests = 0u;
     u32 peer_close_count = 0u;
+    u64 retirement_ns = 0u;
 };
 
 struct CustomHideTimeoutPairContext {
@@ -73036,6 +73784,7 @@ struct LiveAccessLedgerObserver {
     u64 accepted_ns = 0u;
     u64 stability_start_ns = 0u;
     u64 stability_deadline_ns = 0u;
+    bool exact_ledger_seen = false;
 
     void freeze_eof(u64 now_ns) {
         if (eof_ns == 0u) {
@@ -73050,18 +73799,30 @@ struct LiveAccessLedgerObserver {
                 bool child_live,
                 bool origin_live,
                 bool protocol_clean,
-                bool custody_clean = true) {
+                bool custody_clean = true,
+                bool retirement_ready = true,
+                bool retirement_valid = true) {
         // This check intentionally precedes all sample acceptance, including
         // samples whose read completed after the deadline.
         if (eof_ns == 0u || now_ns < eof_ns || now_ns >= deadline_ns || phase != Phase::Pending ||
             !read_ok || !child_live || !origin_live || !protocol_clean || !custody_clean ||
+            !retirement_valid ||
             (candidate != "" && candidate != "6" && candidate != "60" && candidate != "60\n")) {
             phase = Phase::Failed;
             return false;
         }
+        // An exact ledger published before retirement is only pending. Once
+        // seen, a nonempty regression/corruption is irreversible evidence.
+        if (exact_ledger_seen && candidate != "60\n") {
+            phase = Phase::Failed;
+            return false;
+        }
         if (candidate == "60\n") {
-            phase = Phase::Accepted;
-            accepted_ns = now_ns;
+            exact_ledger_seen = true;
+            if (retirement_ready) {
+                phase = Phase::Accepted;
+                accepted_ns = now_ns;
+            }
         }
         return true;
     }
@@ -73083,9 +73844,12 @@ struct LiveAccessLedgerObserver {
                        bool child_live,
                        bool origin_live,
                        bool protocol_clean,
-                       bool custody_clean = true) {
+                       bool custody_clean = true,
+                       bool retirement_ready = true,
+                       bool retirement_valid = true) {
         if ((phase != Phase::Stabilizing && phase != Phase::Complete) || candidate != "60\n" ||
-            !read_ok || !child_live || !origin_live || !protocol_clean) {
+            !read_ok || !child_live || !origin_live || !protocol_clean || !retirement_ready ||
+            !retirement_valid) {
             phase = Phase::Failed;
             return false;
         }
@@ -73101,6 +73865,26 @@ struct LiveAccessLedgerObserver {
         return phase != Phase::Pending && phase != Phase::Failed && accepted_ns < deadline_ns;
     }
 };
+
+struct LiveRetirementLedgerTransition {
+    LiveRetirementSnapshotCapture* capture = nullptr;
+    LiveAccessLedgerObserver* observer = nullptr;
+};
+
+static void capture_live_retirement_ledger_transition(void* opaque) {
+    auto* transition = static_cast<LiveRetirementLedgerTransition*>(opaque);
+    capture_live_retirement_snapshot(transition->capture);
+    transition->observer->sample(
+        1'100'000'000ull,
+        "60\n",
+        true,
+        true,
+        true,
+        true,
+        true,
+        transition->capture->snapshot.state == LiveRetirementState::Ready,
+        transition->capture->snapshot.state != LiveRetirementState::Invalid);
+}
 
 static bool run_live_access_ledger_observer_self_check(std::string& error) {
     const auto expect_pending = [&](u64 now_ns,
@@ -73194,6 +73978,224 @@ static bool run_live_access_ledger_observer_self_check(std::string& error) {
         !stable_custody_loss.stable_sample(
             1'101'000'000ull, "60\n", true, true, true, true, false) &&
         !stable_custody_loss.stable_sample(1'102'000'000ull, "60\n", true, true, true, true);
+    LiveAccessLedgerObserver ledger_first;
+    ledger_first.freeze_eof(1'000'000'000ull);
+    const bool ledger_first_pending_then_retired =
+        ledger_first.sample(1'100'000'000ull, "60\n", true, true, true, true, true, false) &&
+        ledger_first.phase == LiveAccessLedgerObserver::Phase::Pending &&
+        ledger_first.sample(1'102'000'000ull, "60\n", true, true, true, true, true, true) &&
+        ledger_first.accepted_before_deadline();
+    LiveAccessLedgerObserver closure_first;
+    closure_first.freeze_eof(1'000'000'000ull);
+    const bool closure_first_ledger_later =
+        closure_first.sample(1'100'000'000ull, "", true, true, true, true, true, true) &&
+        closure_first.phase == LiveAccessLedgerObserver::Phase::Pending &&
+        closure_first.sample(1'101'000'000ull, "60\n", true, true, true, true, true, true) &&
+        closure_first.phase == LiveAccessLedgerObserver::Phase::Accepted;
+    LiveAccessLedgerObserver pending_publication;
+    pending_publication.freeze_eof(1'000'000'000ull);
+    const auto synthetic_retirement_snapshot =
+        [](bool published, u32 count, u64 timestamp_ns, u64 minimum_ns) {
+            std::atomic<bool> flag{published};
+            std::atomic<u32> committed_count{count};
+            std::atomic<u64> committed_timestamp{timestamp_ns};
+            return snapshot_live_retirement(flag, committed_count, committed_timestamp, minimum_ns);
+        };
+    const auto retirement_sample = [](LiveAccessLedgerObserver& observer,
+                                      u64 now_ns,
+                                      const std::string& ledger,
+                                      LiveRetirementState retirement) {
+        return observer.sample(now_ns,
+                               ledger,
+                               true,
+                               true,
+                               true,
+                               true,
+                               true,
+                               retirement == LiveRetirementState::Ready,
+                               retirement != LiveRetirementState::Invalid);
+    };
+    const auto retirement_snapshot_sample = [](LiveAccessLedgerObserver& observer,
+                                               u64 now_ns,
+                                               const std::string& ledger,
+                                               const LiveRetirementSnapshot& snapshot) {
+        return observer.sample(now_ns,
+                               ledger,
+                               true,
+                               true,
+                               true,
+                               true,
+                               true,
+                               snapshot.state == LiveRetirementState::Ready,
+                               snapshot.state != LiveRetirementState::Invalid);
+    };
+    const auto stable_snapshot_sample = [](LiveAccessLedgerObserver& observer,
+                                           u64 now_ns,
+                                           const std::string& ledger,
+                                           const LiveRetirementSnapshot& snapshot) {
+        return observer.stable_sample(now_ns,
+                                      ledger,
+                                      true,
+                                      true,
+                                      true,
+                                      true,
+                                      true,
+                                      snapshot.state == LiveRetirementState::Ready,
+                                      snapshot.state != LiveRetirementState::Invalid);
+    };
+    const auto actual_retirement_snapshot = [](bool published, u32 count, u64 timestamp_ns) {
+        std::atomic<bool> flag{published};
+        std::atomic<u32> committed_count{count};
+        std::atomic<u64> committed_timestamp{timestamp_ns};
+        return snapshot_live_retirement(
+            flag, committed_count, committed_timestamp, 1'000'000'000ull);
+    };
+    LiveAccessLedgerObserver exact_deadline_pending_retirement;
+    exact_deadline_pending_retirement.freeze_eof(1'000'000'000ull);
+    const bool exact_deadline_pending_retirement_rejected =
+        !retirement_snapshot_sample(exact_deadline_pending_retirement,
+                                    1'250'000'000ull,
+                                    "60\n",
+                                    actual_retirement_snapshot(false, 0u, 0u)) &&
+        exact_deadline_pending_retirement.phase == LiveAccessLedgerObserver::Phase::Failed;
+    LiveAccessLedgerObserver exact_deadline_ready;
+    exact_deadline_ready.freeze_eof(1'000'000'000ull);
+    LiveAccessLedgerObserver after_deadline_ready;
+    after_deadline_ready.freeze_eof(1'000'000'000ull);
+    const LiveRetirementSnapshot ready_snapshot =
+        actual_retirement_snapshot(true, 1u, 1'100'000'000ull);
+    const bool ready_at_or_after_deadline_rejected =
+        !retirement_snapshot_sample(
+            exact_deadline_ready, 1'250'000'000ull, "60\n", ready_snapshot) &&
+        exact_deadline_ready.phase == LiveAccessLedgerObserver::Phase::Failed &&
+        !retirement_snapshot_sample(
+            after_deadline_ready, 1'250'000'001ull, "60\n", ready_snapshot) &&
+        after_deadline_ready.phase == LiveAccessLedgerObserver::Phase::Failed;
+    LiveAccessLedgerObserver invalid_after_stability;
+    invalid_after_stability.freeze_eof(1'000'000'000ull);
+    const bool invalid_snapshot_sticky_after_acceptance =
+        retirement_snapshot_sample(
+            invalid_after_stability, 1'100'000'000ull, "60\n", ready_snapshot) &&
+        invalid_after_stability.begin_stability(1'100'000'000ull) &&
+        !stable_snapshot_sample(invalid_after_stability,
+                                1'101'000'000ull,
+                                "60\n",
+                                actual_retirement_snapshot(true, 2u, 1'101'000'000ull)) &&
+        !stable_snapshot_sample(invalid_after_stability,
+                                1'102'000'000ull,
+                                "60\n",
+                                actual_retirement_snapshot(true, 1u, 1'102'000'000ull)) &&
+        !invalid_after_stability.stable_sample(1'276'000'000ull, "60\n", true, true, true, true);
+    LiveAccessLedgerObserver pending_after_stability;
+    pending_after_stability.freeze_eof(1'000'000'000ull);
+    const bool pending_snapshot_sticky_after_stability =
+        retirement_snapshot_sample(
+            pending_after_stability, 1'100'000'000ull, "60\n", ready_snapshot) &&
+        pending_after_stability.begin_stability(1'100'000'000ull) &&
+        !stable_snapshot_sample(pending_after_stability,
+                                1'101'000'000ull,
+                                "60\n",
+                                actual_retirement_snapshot(false, 0u, 0u)) &&
+        !stable_snapshot_sample(pending_after_stability, 1'102'000'000ull, "60\n", ready_snapshot);
+    LiveAccessLedgerObserver exact_then_empty;
+    exact_then_empty.freeze_eof(1'000'000'000ull);
+    const bool exact_then_empty_regression_sticky =
+        retirement_snapshot_sample(exact_then_empty,
+                                   1'100'000'000ull,
+                                   "60\n",
+                                   actual_retirement_snapshot(false, 0u, 0u)) &&
+        exact_then_empty.phase == LiveAccessLedgerObserver::Phase::Pending &&
+        !exact_then_empty.sample(1'101'000'000ull, "", true, true, true, true) &&
+        !exact_then_empty.sample(1'102'000'000ull, "60\n", true, true, true, true);
+    const auto pending_retirement_failure_sticky =
+        [&](bool read_ok, bool protocol_clean, bool custody_clean) {
+            LiveAccessLedgerObserver observer;
+            observer.freeze_eof(1'000'000'000ull);
+            return !observer.sample(1'100'000'000ull,
+                                    "60\n",
+                                    read_ok,
+                                    true,
+                                    true,
+                                    protocol_clean,
+                                    custody_clean,
+                                    false,
+                                    true) &&
+                   !observer.sample(1'101'000'000ull, "60\n", true, true, true, true);
+        };
+    const bool pending_retirement_failures_sticky =
+        pending_retirement_failure_sticky(false, true, true) &&
+        pending_retirement_failure_sticky(true, false, true) &&
+        pending_retirement_failure_sticky(true, true, false);
+    LiveAccessLedgerObserver closure_first_complete;
+    closure_first_complete.freeze_eof(1'000'000'000ull);
+    const bool closure_first_ledger_later_complete =
+        closure_first_complete.sample(1'100'000'000ull, "", true, true, true, true) &&
+        closure_first_complete.sample(1'101'000'000ull, "60\n", true, true, true, true) &&
+        closure_first_complete.phase == LiveAccessLedgerObserver::Phase::Accepted &&
+        closure_first_complete.begin_stability(1'101'000'000ull) &&
+        closure_first_complete.stable_sample(1'276'000'000ull, "60\n", true, true, true, true) &&
+        closure_first_complete.phase == LiveAccessLedgerObserver::Phase::Complete;
+    const bool count_before_flag_pending =
+        retirement_sample(
+            pending_publication,
+            1'100'000'000ull,
+            "60\n",
+            synthetic_retirement_snapshot(false, 1u, 1'100'000'000ull, 1'000'000'000ull).state) &&
+        pending_publication.phase == LiveAccessLedgerObserver::Phase::Pending;
+    std::atomic<bool> callback_flag{false};
+    std::atomic<u32> callback_count{0u};
+    std::atomic<u64> callback_timestamp{1'000'000'000ull};
+    LiveRetirementSnapshotCapture callback_capture{
+        &callback_flag, &callback_count, &callback_timestamp, {}};
+    LiveAccessLedgerObserver callback_ledger;
+    callback_ledger.freeze_eof(1'000'000'000ull);
+    LiveRetirementLedgerTransition callback_transition{&callback_capture, &callback_ledger};
+    publish_peer_close(callback_flag,
+                       callback_count,
+                       capture_live_retirement_ledger_transition,
+                       &callback_transition);
+    const LiveRetirementSnapshot callback_committed = snapshot_live_retirement(
+        callback_flag, callback_count, callback_timestamp, 1'000'000'000ull);
+    const bool callback_ready_complete =
+        callback_ledger.sample(1'101'000'000ull,
+                               "60\n",
+                               true,
+                               true,
+                               true,
+                               true,
+                               true,
+                               callback_committed.state == LiveRetirementState::Ready,
+                               callback_committed.state != LiveRetirementState::Invalid) &&
+        callback_ledger.begin_stability(1'101'000'000ull) &&
+        callback_ledger.stable_sample(
+            1'276'000'000ull, "60\n", true, true, true, true, true, true, true) &&
+        callback_ledger.phase == LiveAccessLedgerObserver::Phase::Complete;
+    const bool callback_between_count_and_flag_pending =
+        callback_capture.snapshot.state == LiveRetirementState::Pending &&
+        callback_capture.snapshot.count == 0u &&
+        callback_committed.state == LiveRetirementState::Ready && callback_committed.count == 1u &&
+        callback_committed.timestamp_ns == 1'000'000'000ull && callback_ready_complete;
+    LiveAccessLedgerObserver malformed_committed;
+    malformed_committed.freeze_eof(1'000'000'000ull);
+    const bool malformed_committed_sticky =
+        !retirement_sample(
+            malformed_committed,
+            1'100'000'000ull,
+            "60\n",
+            synthetic_retirement_snapshot(true, 2u, 1'100'000'000ull, 1'000'000'000ull).state) &&
+        !malformed_committed.sample(1'101'000'000ull, "60\n", true, true, true, true);
+    LiveAccessLedgerObserver malformed_timestamp;
+    malformed_timestamp.freeze_eof(1'000'000'000ull);
+    const bool malformed_timestamp_sticky = !retirement_sample(
+        malformed_timestamp,
+        1'100'000'000ull,
+        "60\n",
+        synthetic_retirement_snapshot(true, 1u, 999'999'999ull, 1'000'000'000ull).state);
+    LiveAccessLedgerObserver ledger_regression;
+    ledger_regression.freeze_eof(1'000'000'000ull);
+    const bool pending_regression_sticky =
+        ledger_regression.sample(1'100'000'000ull, "60\n", true, true, true, true, true, false) &&
+        !ledger_regression.sample(1'101'000'000ull, "60", true, true, true, true, true, false);
     const bool controls =
         delayed_timely && expect_pending(1'100'000'000ull, "") &&
         expect_pending(1'100'000'001ull, "6") && expect_pending(1'100'000'002ull, "60") &&
@@ -73205,7 +74207,14 @@ static bool run_live_access_ledger_observer_self_check(std::string& error) {
         expect_fail(1'100'000'000ull, "60\n", true, true, true, false) && duplicate_rejected &&
         phase_guards && shutdown_sticky && initial_wrong_sticky && initial_read_error_sticky &&
         stable_read_failure_sticky && stable_child_loss_sticky && pending_custody_loss_sticky &&
-        stable_custody_loss_sticky;
+        stable_custody_loss_sticky && ledger_first_pending_then_retired &&
+        closure_first_ledger_later && count_before_flag_pending &&
+        callback_between_count_and_flag_pending && malformed_committed_sticky &&
+        malformed_timestamp_sticky && pending_regression_sticky &&
+        exact_deadline_pending_retirement_rejected && ready_at_or_after_deadline_rejected &&
+        invalid_snapshot_sticky_after_acceptance && pending_snapshot_sticky_after_stability &&
+        exact_then_empty_regression_sticky && pending_retirement_failures_sticky &&
+        closure_first_ledger_later_complete;
     const bool all_controls = controls && stability_controls;
     if (!all_controls) {
         error = "#618 live access-ledger observer self-check rejected a required control";
@@ -74015,30 +75024,28 @@ static bool run_pinned_nginx_custom_hide_timeout_probe(
         "\r\n\r\n";
     const std::vector<char> expected_upstream_bytes(expected_upstream.begin(),
                                                     expected_upstream.end());
-    const bool origin_retired =
-        origin.response_peer_closed.load(std::memory_order_acquire) &&
-        origin.response_peer_close_count.load(std::memory_order_acquire) == 1u &&
-        origin.response_peer_closed_ns.load(std::memory_order_acquire) >= second_ns &&
-        !origin.response_peer_unexpected_data.load(std::memory_order_acquire) &&
-        !origin.response_peer_observation_failed.load(std::memory_order_acquire);
+    // Acquire the closure publication first.  A count/timestamp observed
+    // without that flag is not committed retirement yet; once committed,
+    // malformed count/timestamp/cleanup evidence is a sticky custody failure.
+    const auto retirement_snapshot = [&]() {
+        return snapshot_live_retirement(origin.response_peer_closed,
+                                        origin.response_peer_close_count,
+                                        origin.response_peer_closed_ns,
+                                        second_ns);
+    };
     const auto full_live_custody =
         [&](bool child_live, bool origin_is_live, bool protocol_clean, bool downstream_quiet) {
             return child_live && origin_is_live && protocol_clean && downstream_quiet &&
                    origin.accepted.load(std::memory_order_acquire) == 1u &&
                    origin.requests.load(std::memory_order_acquire) == 1u &&
                    origin.response_fragments_sent.load(std::memory_order_acquire) == 2u &&
-                   origin.response_peer_closed.load(std::memory_order_acquire) &&
-                   origin.response_peer_close_count.load(std::memory_order_acquire) == 1u &&
                    origin.gated_fragment_probe_request.load(std::memory_order_acquire) == 2u &&
                    origin.gated_fragment_probe_ack.load(std::memory_order_acquire) == 2u &&
                    origin.gated_fragment_probe_result.load(std::memory_order_acquire) ==
                        GatedFragmentPeerProbeResult::Open &&
                    origin.response_send_succeeded.load(std::memory_order_acquire) &&
                    origin.response_sent_open.load(std::memory_order_acquire) &&
-                   // Peer-close publication precedes the recorder's later
-                   // shutdown/connection-close stores; do not impose that
-                   // unrelated store ordering on this live predicate.
-                   !origin.response_send_failed.load(std::memory_order_acquire) && origin_retired;
+                   !origin.response_send_failed.load(std::memory_order_acquire);
         };
     const auto downstream_eof_quiet = [&]() {
         pollfd state{client, POLLIN | POLLHUP | POLLERR, 0};
@@ -74057,17 +75064,25 @@ static bool run_pinned_nginx_custom_hide_timeout_probe(
     const bool initial_custody = full_live_custody(
         !poll_child(nginx.child), origin_live(), initial_protocol_clean, initial_downstream_quiet);
     initial_access_sample_ns = steady_now_ns();
+    const LiveRetirementSnapshot initial_retirement = retirement_snapshot();
     live_observer.sample(initial_access_sample_ns,
                          access,
                          access_read,
                          !poll_child(nginx.child),
                          origin_live(),
                          initial_protocol_clean,
-                         initial_custody);
-    const u64 peer_closed_ns = origin.response_peer_closed_ns.load(std::memory_order_acquire);
+                         initial_custody,
+                         initial_retirement.state == LiveRetirementState::Ready,
+                         initial_retirement.state != LiveRetirementState::Invalid);
+    const u64 peer_closed_ns = initial_retirement.timestamp_ns;
     u64 stability_start_ns = 0u;
     bool post_retirement_stable = false;
     u64 stability_deadline_ns = 0u;
+    LiveRetirementSnapshot final_stable_retirement;
+    std::string final_stable_access;
+    u32 final_stable_accepted = 0u;
+    u32 final_stable_requests = 0u;
+    u32 final_stable_peer_closes = 0u;
     const auto post_retirement_snapshot_valid = [&]() {
         std::string stable_access;
         std::string stable_read_error;
@@ -74076,11 +75091,23 @@ static bool run_pinned_nginx_custom_hide_timeout_probe(
         const bool stable_origin = origin_live();
         const bool stable_child = !poll_child(nginx.child);
         if (!stable_read_ok) {
+            const LiveRetirementSnapshot stable_read_failure_retirement = retirement_snapshot();
             live_observer.stable_sample(
-                steady_now_ns(), stable_access, false, stable_child, stable_origin, false, false);
+                steady_now_ns(),
+                stable_access,
+                false,
+                stable_child,
+                stable_origin,
+                false,
+                false,
+                stable_read_failure_retirement.state == LiveRetirementState::Ready,
+                stable_read_failure_retirement.state != LiveRetirementState::Invalid);
             if (error.empty()) error = stable_read_error;
             return false;
         }
+        const LiveRetirementSnapshot stable_retirement = retirement_snapshot();
+        const u32 stable_accepted = origin.accepted.load(std::memory_order_acquire);
+        const u32 stable_requests = origin.requests.load(std::memory_order_acquire);
         if (!live_observer.stable_sample(
                 steady_now_ns(),
                 stable_access,
@@ -74094,9 +75121,10 @@ static bool run_pinned_nginx_custom_hide_timeout_probe(
                     stable_origin,
                     !origin.response_peer_unexpected_data.load(std::memory_order_acquire) &&
                         !origin.response_peer_observation_failed.load(std::memory_order_acquire),
-                    true)) ||
-            stable_access != "60\n" || origin.accepted.load(std::memory_order_acquire) != 1u ||
-            origin.requests.load(std::memory_order_acquire) != 1u ||
+                    true),
+                stable_retirement.state == LiveRetirementState::Ready,
+                stable_retirement.state != LiveRetirementState::Invalid) ||
+            stable_access != "60\n" || stable_accepted != 1u || stable_requests != 1u ||
             origin.response_fragments_sent.load(std::memory_order_acquire) != 2u ||
             !origin.response_peer_closed.load(std::memory_order_acquire) ||
             origin.response_peer_close_count.load(std::memory_order_acquire) != 1u ||
@@ -74108,6 +75136,11 @@ static bool run_pinned_nginx_custom_hide_timeout_probe(
             origin.response_peer_unexpected_data.load(std::memory_order_acquire) ||
             origin.response_peer_observation_failed.load(std::memory_order_acquire))
             return false;
+        final_stable_retirement = stable_retirement;
+        final_stable_access = stable_access;
+        final_stable_accepted = stable_accepted;
+        final_stable_requests = stable_requests;
+        final_stable_peer_closes = stable_retirement.count;
         pollfd peer_state{client, POLLIN | POLLHUP | POLLERR, 0};
         const int ready = poll(&peer_state, 1, 5);
         if (ready < 0) return errno == EINTR;
@@ -74122,13 +75155,14 @@ static bool run_pinned_nginx_custom_hide_timeout_probe(
               << " response-bytes=" << response.size() << " actual-eof=" << actual_eof
               << " read-error=" << response_read_error << " access-bytes=" << access.size()
               << " origin-write-ns=" << first_ns << "," << second_ns
-              << " peer-close-ns=" << peer_closed_ns << " retired-before-cleanup=" << origin_retired
+              << " peer-close-ns=" << peer_closed_ns << " retired-before-cleanup="
+              << (initial_retirement.state == LiveRetirementState::Ready)
               << " exact-upstream=deferred-until-origin-join\n";
     dump_wire("#270 custom-hide timeout probe observed downstream", response);
     bool expiry_gate_failed = !actual_eof || response.empty() || response_read_error ||
                               !exact_normalized_response || !response_mutants_rejected ||
                               !timing_mutants_rejected ||
-                              !expiry_timing_is_valid(expiry_elapsed_ns) || !origin_retired;
+                              !expiry_timing_is_valid(expiry_elapsed_ns);
     if (expiry_gate_failed) {
         error =
             "#270 custom-hide timeout probe was inconclusive: exact expiry EOF/response/timing/"
@@ -74139,7 +75173,7 @@ static bool run_pinned_nginx_custom_hide_timeout_probe(
     bool live_access_changed = false;
     bool live_exact_access_seen = access == "60\n";
     u64 live_access_changed_ns = 0u;
-    u64 live_exact_access_ns = live_exact_access_seen ? observed_ns : 0u;
+    u64 live_exact_access_ns = live_exact_access_seen ? initial_access_sample_ns : 0u;
     const u64 live_observation_deadline = live_observer.deadline_ns;
     const char* live_stop_reason = expiry_gate_failed ? "deadline" : "acceptance-passed";
     u32 live_accepted = origin.accepted.load(std::memory_order_acquire);
@@ -74182,12 +75216,16 @@ static bool run_pinned_nginx_custom_hide_timeout_probe(
                     temp.nginx_access_log, candidate, diagnostic_read_error)) {
                 live_access_read = false;
                 refresh_live_state();
+                const LiveRetirementSnapshot read_failure_retirement = retirement_snapshot();
                 live_observer.sample(steady_now_ns(),
                                      candidate,
                                      false,
                                      live_child,
                                      live_origin,
-                                     live_protocol_clean);
+                                     live_protocol_clean,
+                                     true,
+                                     read_failure_retirement.state == LiveRetirementState::Ready,
+                                     read_failure_retirement.state != LiveRetirementState::Invalid);
                 live_stop_reason = "access-read-error";
                 break;
             }
@@ -74201,19 +75239,23 @@ static bool run_pinned_nginx_custom_hide_timeout_probe(
             const bool custody_clean =
                 full_live_custody(live_child, live_origin, live_protocol_clean, downstream_quiet);
             if (!custody_clean) {
+                const LiveRetirementSnapshot custody_retirement = retirement_snapshot();
                 live_observer.sample(steady_now_ns(),
                                      candidate,
                                      true,
                                      live_child,
                                      live_origin,
                                      live_protocol_clean,
-                                     false);
+                                     false,
+                                     custody_retirement.state == LiveRetirementState::Ready,
+                                     custody_retirement.state != LiveRetirementState::Invalid);
                 live_stop_reason = !live_child            ? "frontend-exited-after-read"
                                    : !live_origin         ? "origin-not-live-after-read"
                                    : !live_protocol_clean ? "origin-protocol-failure-after-read"
                                                           : "custody-lost-after-read";
                 break;
             }
+            const LiveRetirementSnapshot sample_retirement = retirement_snapshot();
             const u64 sample_ns = steady_now_ns();
             if (!live_observer.sample(sample_ns,
                                       candidate,
@@ -74221,7 +75263,9 @@ static bool run_pinned_nginx_custom_hide_timeout_probe(
                                       live_child,
                                       live_origin,
                                       live_protocol_clean,
-                                      custody_clean)) {
+                                      custody_clean,
+                                      sample_retirement.state == LiveRetirementState::Ready,
+                                      sample_retirement.state != LiveRetirementState::Invalid)) {
                 live_stop_reason = sample_ns >= live_observation_deadline ? "deadline-after-read"
                                    : candidate != "" && candidate != "6" && candidate != "60" &&
                                            candidate != "60\n"
@@ -74241,12 +75285,16 @@ static bool run_pinned_nginx_custom_hide_timeout_probe(
             usleep(1000);
         }
         if (live_observer.phase == LiveAccessLedgerObserver::Phase::Pending) {
+            const LiveRetirementSnapshot deadline_retirement = retirement_snapshot();
             live_observer.sample(live_observation_deadline,
                                  live_access,
                                  true,
                                  live_child,
                                  live_origin,
-                                 live_protocol_clean);
+                                 live_protocol_clean,
+                                 true,
+                                 deadline_retirement.state == LiveRetirementState::Ready,
+                                 deadline_retirement.state != LiveRetirementState::Invalid);
             if (live_observer.phase == LiveAccessLedgerObserver::Phase::Failed)
                 live_stop_reason = "deadline";
         }
@@ -74255,7 +75303,9 @@ static bool run_pinned_nginx_custom_hide_timeout_probe(
     refresh_live_state();
     stability_start_ns = steady_now_ns();
     stability_deadline_ns = stability_start_ns + 175'000'000ull;
-    if (origin_retired && live_observer.phase == LiveAccessLedgerObserver::Phase::Accepted) {
+    const LiveRetirementSnapshot pre_stability_retirement = retirement_snapshot();
+    if (pre_stability_retirement.state == LiveRetirementState::Ready &&
+        live_observer.phase == LiveAccessLedgerObserver::Phase::Accepted) {
         live_observer.begin_stability(stability_start_ns);
         post_retirement_stable = true;
         while (post_retirement_stable && steady_now_ns() < stability_deadline_ns)
@@ -74268,7 +75318,25 @@ static bool run_pinned_nginx_custom_hide_timeout_probe(
     }
     expiry_gate_failed =
         expiry_gate_failed || !live_observer.accepted_before_deadline() || !post_retirement_stable;
-    if (!actual_eof) live_stop_reason = "no-eof";
+    // Freeze all accepted retirement evidence before any cleanup can mutate
+    // the worker-owned atomics.
+    const LiveRetirementSnapshot final_retirement =
+        post_retirement_stable ? final_stable_retirement : retirement_snapshot();
+    const std::string frozen_access = post_retirement_stable ? final_stable_access : live_access;
+    const u32 frozen_accepted = post_retirement_stable ? final_stable_accepted : live_accepted;
+    const u32 frozen_requests = post_retirement_stable ? final_stable_requests : live_requests;
+    const u32 frozen_peer_closes =
+        post_retirement_stable ? final_stable_peer_closes : final_retirement.count;
+    if (!actual_eof)
+        live_stop_reason = "no-eof";
+    else if (final_retirement.state == LiveRetirementState::Invalid)
+        live_stop_reason = "retirement-custody-fail";
+    else if (live_observer.phase == LiveAccessLedgerObserver::Phase::Pending &&
+             final_retirement.state != LiveRetirementState::Ready)
+        live_stop_reason = "retirement-pending";
+    else if (live_observer.phase == LiveAccessLedgerObserver::Phase::Failed &&
+             steady_now_ns() >= live_observation_deadline)
+        live_stop_reason = "deadline-elapsed";
     if (expiry_gate_failed && error.empty()) {
         error =
             "#270 custom-hide timeout probe was inconclusive: exact expiry EOF/response/timing/"
@@ -74345,14 +75413,14 @@ static bool run_pinned_nginx_custom_hide_timeout_probe(
             return false;
         }
         observation->upstream = origin.history[0];
-        observation->access = final_access;
+        observation->access = frozen_access;
         observation->eof = actual_eof;
-        observation->retired = origin_retired;
+        observation->retired = final_retirement.state == LiveRetirementState::Ready;
         observation->stable = post_retirement_stable;
-        observation->accepted = origin.accepted.load(std::memory_order_acquire);
-        observation->requests = origin.requests.load(std::memory_order_acquire);
-        observation->peer_close_count =
-            origin.response_peer_close_count.load(std::memory_order_acquire);
+        observation->accepted = frozen_accepted;
+        observation->requests = frozen_requests;
+        observation->peer_close_count = frozen_peer_closes;
+        observation->retirement_ns = final_retirement.timestamp_ns;
     }
     return error.empty();
 }
@@ -74459,6 +75527,481 @@ static bool run_pinned_nginx_custom_hide_timeout_two_second_oracle(std::string& 
                 2u))
             return false;
     }
+    return true;
+}
+
+struct HeadAcceptanceObservation {
+    u64 origin_ns = 0u;
+    u64 publication_ns = 0u;
+    u64 header_ns = 0u;
+    u64 retirement_ns = 0u;
+    u64 access_ns = 0u;
+    u64 quiet_until_ns = 0u;
+    std::vector<char> wire;
+    std::string access;
+    u32 accepted = 0u;
+    u32 requests = 0u;
+    u32 publication_count = 0u;
+    u32 retirement_count = 0u;
+    u32 response_send_calls = 0u;
+    u32 response_bytes_sent = 0u;
+    bool downstream_open = false;
+    bool downstream_eof = false;
+    bool response_send_failed = false;
+    bool listener_failed = false;
+    bool unexpected_data = false;
+    bool observation_failed = false;
+};
+
+static bool validate_head_acceptance(const HeadAcceptanceObservation& o,
+                                     const char* expected,
+                                     std::string& detail) {
+    if (o.origin_ns == 0u || o.publication_ns < o.origin_ns + 1'150'000'000ull ||
+        o.publication_ns >= o.origin_ns + 1'400'000'000ull) {
+        detail = "publication was premature or outside the 1.15..1.40s window";
+        return false;
+    }
+    if (o.header_ns < o.publication_ns || o.header_ns - o.publication_ns >= 350'000'000ull) {
+        detail = "header publication was late or preceded the origin publication";
+        return false;
+    }
+    if (o.retirement_ns < o.publication_ns ||
+        o.retirement_ns - o.publication_ns >= 350'000'000ull) {
+        detail = "origin retirement was late or preceded publication";
+        return false;
+    }
+    if (o.access_ns < o.header_ns || o.access_ns >= o.header_ns + 250'000'000ull) {
+        detail = "access ledger was not first exact within the header anchor window";
+        return false;
+    }
+    if (o.quiet_until_ns < o.header_ns + 2'250'000'000ull) {
+        detail = "live quiet/open custody ended before the required 2.25s window";
+        return false;
+    }
+    if (!validate_exact_normalized_response(o.wire, expected, detail)) {
+        detail = "wire/body validation failed: " + detail;
+        return false;
+    }
+    if (!o.downstream_open || o.downstream_eof) {
+        detail = "downstream was not open and quiet (EOF/body tail leaked)";
+        return false;
+    }
+    if (o.access != "61\n") {
+        detail = "access publication was not exactly 61\\n";
+        return false;
+    }
+    if (o.accepted != 1u || o.requests != 1u || o.publication_count != 1u ||
+        o.retirement_count != 1u) {
+        detail = "duplicate or missing accept/request/publication/retirement";
+        return false;
+    }
+    if (o.response_send_calls != 1u || o.response_bytes_sent != 182u) {
+        detail = "response send count/bytes were not exactly one/182";
+        return false;
+    }
+    if (o.response_send_failed || o.listener_failed || o.unexpected_data || o.observation_failed) {
+        detail = "recorder reported a failure flag";
+        return false;
+    }
+    return true;
+}
+
+// #630 pinned-only oracle: a fresh bodyless HEAD remains quiet until the
+// complete upstream header is published, then retires that origin promptly.
+static bool run_pinned_nginx_bodyless_head_delayed_completion_oracle(std::string& error) {
+    HeadAcceptanceObservation synthetic{};
+    synthetic.origin_ns = 1'000'000'000ull;
+    synthetic.publication_ns = 2'200'000'000ull;
+    synthetic.header_ns = 2'250'000'000ull;
+    synthetic.retirement_ns = 2'300'000'000ull;
+    synthetic.access_ns = 2'300'000'000ull;
+    synthetic.quiet_until_ns = 4'500'000'000ull;
+    synthetic.access = "61\n";
+    synthetic.accepted = synthetic.requests = synthetic.publication_count =
+        synthetic.retirement_count = synthetic.response_send_calls = 1u;
+    synthetic.response_bytes_sent = 182u;
+    synthetic.downstream_open = true;
+    static constexpr char kSyntheticWire[] =
+        "HTTP/1.1 200 OK\r\nServer: nginx/1.29.7\r\n"
+        "Date: Tue, 01 Jan 2030 00:00:00 GMT\r\nContent-Length: 12\r\n"
+        "Connection: keep-alive\r\nX-Unrelated: retained\r\n\r\n";
+    static constexpr char kSyntheticExpected[] =
+        "HTTP/1.1 200 OK\r\nServer: nginx/1.29.7\r\n"
+        "Date: XXXXXXXXXXXXXXXXXXXXXXXXXXXXX\r\nContent-Length: 12\r\n"
+        "Connection: keep-alive\r\nX-Unrelated: retained\r\n\r\n";
+    synthetic.wire.assign(kSyntheticWire, kSyntheticWire + sizeof(kSyntheticWire) - 1u);
+    std::string control_detail;
+    if (!validate_head_acceptance(synthetic, kSyntheticExpected, control_detail)) {
+        error = "#630 synthetic positive acceptance failed: " + control_detail;
+        return false;
+    }
+    struct Mutation {
+        const char* name;
+        void (*apply)(HeadAcceptanceObservation&);
+    };
+    const Mutation mutations[] = {
+        {"premature publication",
+         [](HeadAcceptanceObservation& x) { x.publication_ns = x.origin_ns + 1'149'999'999ull; }},
+        {"late header",
+         [](HeadAcceptanceObservation& x) { x.header_ns = x.publication_ns + 350'000'000ull; }},
+        {"late retirement",
+         [](HeadAcceptanceObservation& x) { x.retirement_ns = x.publication_ns + 350'000'000ull; }},
+        {"hidden header leak",
+         [](HeadAcceptanceObservation& x) {
+             const std::string needle = "X-Unrelated: retained\r\n";
+             const auto at =
+                 std::search(x.wire.begin(), x.wire.end(), needle.begin(), needle.end());
+             if (at != x.wire.end())
+                 x.wire.insert(at, {'X', '-', 'P', 'o', 'w', 'e', 'r', 'e', 'd', '-',  'B',
+                                    'y', ':', ' ', 'l', 'e', 'a', 'k', 'e', 'd', '\r', '\n'});
+         }},
+        {"retained header erased",
+         [](HeadAcceptanceObservation& x) {
+             const std::string needle = "X-Unrelated: retained\r\n";
+             const auto at =
+                 std::search(x.wire.begin(), x.wire.end(), needle.begin(), needle.end());
+             if (at != x.wire.end()) x.wire.erase(at, at + needle.size());
+         }},
+        {"body/tail", [](HeadAcceptanceObservation& x) { x.wire.push_back('x'); }},
+        {"downstream EOF/open",
+         [](HeadAcceptanceObservation& x) {
+             x.downstream_open = false;
+             x.downstream_eof = true;
+         }},
+        {"early response",
+         [](HeadAcceptanceObservation& x) { x.header_ns = x.publication_ns - 1u; }},
+        {"hardcoded 1s/504",
+         [](HeadAcceptanceObservation& x) {
+             x.publication_ns = x.origin_ns + 1'000'000'000ull;
+             static constexpr char k504[] = "HTTP/1.1 504 Gateway Timeout\r\n\r\n";
+             x.wire.assign(k504, k504 + sizeof(k504) - 1u);
+         }},
+        {"late ledger",
+         [](HeadAcceptanceObservation& x) { x.access_ns = x.header_ns + 250'000'000ull; }},
+        {"short quiet",
+         [](HeadAcceptanceObservation& x) { x.quiet_until_ns = x.header_ns + 2'249'999'999ull; }},
+        {"full timing boundary",
+         [](HeadAcceptanceObservation& x) { x.publication_ns = x.origin_ns + 1'400'000'000ull; }},
+        {"duplicate accept", [](HeadAcceptanceObservation& x) { x.accepted = 2u; }},
+        {"duplicate request", [](HeadAcceptanceObservation& x) { x.requests = 2u; }},
+        {"duplicate retirement", [](HeadAcceptanceObservation& x) { x.retirement_count = 2u; }},
+        {"duplicate publication", [](HeadAcceptanceObservation& x) { x.publication_count = 2u; }},
+        {"access mutation", [](HeadAcceptanceObservation& x) { x.access = "61\n61\n"; }},
+        {"bad failure flag", [](HeadAcceptanceObservation& x) { x.response_send_failed = true; }},
+    };
+    for (const Mutation& mutation : mutations) {
+        HeadAcceptanceObservation negative = synthetic;
+        mutation.apply(negative);
+        control_detail.clear();
+        if (validate_head_acceptance(negative, kSyntheticExpected, control_detail)) {
+            error = std::string("#630 synthetic control accepted ") + mutation.name;
+            return false;
+        }
+    }
+    if (!validate_head_acceptance(synthetic, kSyntheticExpected, control_detail)) {
+        error = "#630 synthetic restored positive acceptance failed: " + control_detail;
+        return false;
+    }
+    static constexpr char kRequest[] =
+        "HEAD /buffered-timeout?q=1 HTTP/1.1\r\nHost: client.example\r\n\r\n";
+    static constexpr char kExpected[] =
+        "HTTP/1.1 200 OK\r\nServer: nginx/1.29.7\r\n"
+        "Date: XXXXXXXXXXXXXXXXXXXXXXXXXXXXX\r\nContent-Length: 12\r\n"
+        "Connection: keep-alive\r\nX-Unrelated: retained\r\n\r\n";
+    static_assert(sizeof(kExpected) - 1u == 145u);
+    TempDir temp;
+    HeldLoopbackPorts reservations;
+    u16 frontend = 0u, backend = 0u;
+    if (!temp.create() || !reservations.reserve_four_digit(0u, frontend) ||
+        !reservations.reserve_four_digit(1u, backend) || frontend == backend) {
+        error = "#630 could not allocate isolated resources";
+        return false;
+    }
+    const std::string config =
+        "events {}\nhttp {\n  log_format compat \"$request_length\";\n  access_log " +
+        temp.nginx_access_log +
+        " compat;\n  server {\n    listen 127.0.0.1:" + std::to_string(frontend) +
+        ";\n    location / {\n      proxy_pass http://127.0.0.1:" + std::to_string(backend) +
+        ";\n      proxy_buffering on;\n      proxy_hide_header X-Powered-By;\n      "
+        "proxy_read_timeout 2s;\n    }\n  }\n}\n";
+    if (!write_file(temp.nginx_config, config.data(), config.size())) {
+        error = "#630 could not persist immutable nginx config";
+        return false;
+    }
+    KeepAlivePinnedRecorder origin(KeepAlivePinnedRecorder::FirstResponseMode::DelayedHeadComplete);
+    if (!handoff_held_loopback_port(&reservations.fds[1], backend, "#630 origin bind", error) ||
+        !origin.setup(backend)) {
+        if (error.empty()) error = "#630 origin setup failed";
+        return false;
+    }
+    DockerGuard docker("rut-nginx-630-head-" + std::to_string(getpid()));
+    ChildGuard nginx;
+    if (!handoff_held_loopback_port(&reservations.fds[0], frontend, "#630 nginx bind", error))
+        return false;
+    if (!spawn_child({"docker",
+                      "run",
+                      "--pull=never",
+                      "--network",
+                      "host",
+                      "--name",
+                      docker.name,
+                      "-v",
+                      std::string(temp.path) + ":" + temp.path,
+                      "-v",
+                      temp.nginx_config + ":/etc/nginx/nginx.conf:ro",
+                      kNginxImage,
+                      "nginx",
+                      "-g",
+                      "daemon off;"},
+                     temp.nginx_log,
+                     nginx.child) ||
+        !wait_ready(frontend, nginx.child, error))
+        return false;
+    int client = connect_once(frontend);
+    if (client < 0 || !send_all(client, kRequest, sizeof(kRequest) - 1u)) {
+        error = "#630 HEAD request send failed";
+        if (client >= 0) close(client);
+        return false;
+    }
+    const auto request_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+    while (origin.requests.load(std::memory_order_acquire) != 1u &&
+           std::chrono::steady_clock::now() < request_deadline) {
+        bool eof = false;
+        if (!wait_keepalive_quiet_or_eof(client, 50, eof, error) || eof) {
+            error = eof ? "#630 downstream closed before header completion"
+                        : "#630 downstream was not quiet before 1s";
+            close(client);
+            return false;
+        }
+    }
+    if (origin.accepted.load(std::memory_order_acquire) != 1u ||
+        origin.requests.load(std::memory_order_acquire) != 1u) {
+        error = "#630 pre-permit origin did not observe one complete request";
+        close(client);
+        return false;
+    }
+    // This is the explicit custody/open ACK: only after the real quiet window,
+    // one accepted request, and an empty access ledger may the origin publish.
+    std::string prepermit_access;
+    if (!read_request_length_access_file(temp.nginx_access_log, prepermit_access, error) ||
+        !prepermit_access.empty()) {
+        error = "#630 pre-permit access ledger was not empty";
+        close(client);
+        return false;
+    }
+    const u64 request_ns = origin.request_complete_ns[0].load(std::memory_order_acquire);
+    const u64 permit_target_ns = request_ns + 1'200'000'000ull;
+    while (steady_now_ns() < permit_target_ns) {
+        bool eof = false;
+        if (!wait_keepalive_quiet_or_eof(client, 50, eof, error) || eof) {
+            error = "#630 custody lost before near-permit ACK";
+            close(client);
+            return false;
+        }
+        std::string sample;
+        if (!read_request_length_access_file(temp.nginx_access_log, sample, error) ||
+            !sample.empty() || origin.head_publication_ns.load(std::memory_order_acquire) != 0u ||
+            origin.requests.load(std::memory_order_acquire) != 1u) {
+            error = "#630 pre-permit custody/publication/ledger control failed";
+            close(client);
+            return false;
+        }
+    }
+    origin.head_probe_request.store(true, std::memory_order_release);
+    const auto ack_deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(100);
+    while (origin.head_probe_ack_ns.load(std::memory_order_acquire) == 0u &&
+           std::chrono::steady_clock::now() < ack_deadline) {
+        if (!observe_client_open_and_quiet_nonconsuming(client, 10, error)) {
+            error = "#630 near-permit ACK lost downstream open/quiet custody";
+            close(client);
+            return false;
+        }
+        std::string sample;
+        if (!read_request_length_access_file(temp.nginx_access_log, sample, error) ||
+            !sample.empty() || origin.head_publication_ns.load(std::memory_order_acquire) != 0u ||
+            origin.accepted.load(std::memory_order_acquire) != 1u ||
+            origin.requests.load(std::memory_order_acquire) != 1u ||
+            origin.response_send_failed.load(std::memory_order_acquire) ||
+            origin.listener_failed.load(std::memory_order_acquire) ||
+            !origin.thread_alive.load(std::memory_order_acquire)) {
+            error = "#630 near-permit ACK custody/liveness control failed";
+            close(client);
+            return false;
+        }
+    }
+    const u64 ack_ns = origin.head_probe_ack_ns.load(std::memory_order_acquire);
+    if (ack_ns == 0u || ack_ns < permit_target_ns || ack_ns >= steady_now_ns()) {
+        error = "#630 near-permit origin peer-open probe ACK missing";
+        close(client);
+        return false;
+    }
+    // Do not let a fast ACK bypass the complete final custody check.
+    {
+        bool ack_quiet = false;
+        if (!wait_keepalive_quiet_or_eof(client, 1, ack_quiet, error) || ack_quiet) {
+            error = "#630 immediate post-ACK downstream custody failed";
+            close(client);
+            return false;
+        }
+        std::string sample;
+        if (!read_request_length_access_file(temp.nginx_access_log, sample, error) ||
+            !sample.empty() || origin.head_publication_ns.load(std::memory_order_acquire) != 0u ||
+            origin.accepted.load(std::memory_order_acquire) != 1u ||
+            origin.requests.load(std::memory_order_acquire) != 1u ||
+            origin.response_send_failed.load(std::memory_order_acquire) ||
+            origin.listener_failed.load(std::memory_order_acquire) ||
+            origin.first_peer_unexpected_data.load(std::memory_order_acquire) ||
+            origin.first_peer_observation_failed.load(std::memory_order_acquire) ||
+            !origin.thread_alive.load(std::memory_order_acquire) || poll_child(nginx.child)) {
+            error = "#630 immediate post-ACK custody/liveness control failed";
+            close(client);
+            return false;
+        }
+    }
+    origin.head_publish_permit.store(true, std::memory_order_release);
+    const u64 publication_wait = steady_now_ns() + 2'000'000'000ull;
+    std::vector<char> response;
+    u64 header_complete_ns = 0u;
+    while (steady_now_ns() < publication_wait) {
+        pollfd p{client, POLLIN | POLLHUP | POLLERR, 0};
+        if (poll(&p, 1, 25) < 0 && errno == EINTR) continue;
+        char buf[1024];
+        const ssize_t n = recv(client, buf, sizeof(buf), MSG_DONTWAIT);
+        if (n > 0) {
+            response.insert(response.end(), buf, buf + n);
+            const size_t end = header_end(response);
+            if (end != 0u) {
+                header_complete_ns = steady_now_ns();
+                if (response.size() != end) {
+                    error = "#630 HEAD publication included representation bytes";
+                    close(client);
+                    return false;
+                }
+                break;
+            }
+        } else if (n < 0 && errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR)
+            break;
+    }
+    const u64 publication_ns = origin.head_publication_ns.load();
+    if (header_complete_ns == 0u || publication_ns == 0u || header_complete_ns < publication_ns ||
+        header_complete_ns - publication_ns >= 350'000'000ull ||
+        !validate_exact_normalized_response(response, kExpected, error)) {
+        if (error.empty()) error = "#630 delayed HEAD header publication mismatch/timing";
+        close(client);
+        return false;
+    }
+    const u64 ledger_deadline = header_complete_ns + 250'000'000ull;
+    std::string access;
+    u64 access_ns = 0u;
+    bool ledger_seen = false;
+    while (steady_now_ns() < ledger_deadline) {
+        std::string sample;
+        if (!read_request_length_access_file(temp.nginx_access_log, sample, error)) {
+            close(client);
+            return false;
+        }
+        if (sample == "61\n") {
+            access = sample;
+            ledger_seen = true;
+            access_ns = steady_now_ns();
+            break;
+        }
+        if (!sample.empty()) {
+            error = "#630 access ledger published a non-exact value";
+            close(client);
+            return false;
+        }
+        usleep(1000);
+    }
+    if (!ledger_seen) {
+        error = "#630 access ledger missed the header-completion anchor window";
+        close(client);
+        return false;
+    }
+    const u64 stable_deadline = header_complete_ns + 2'250'000'000ull;
+    u64 quiet_until_ns = 0u;
+    while (steady_now_ns() < stable_deadline) {
+        if (!observe_client_open_and_quiet_nonconsuming(client, 50, error) ||
+            poll_child(nginx.child) || !origin.thread_alive.load(std::memory_order_acquire)) {
+            error = "#630 downstream emitted body/tail or closed during keep-alive observation";
+            close(client);
+            return false;
+        }
+        std::string sample;
+        if (!read_request_length_access_file(temp.nginx_access_log, sample, error) ||
+            sample != "61\n") {
+            error = "#630 access ledger was not stably exact through the quiet window";
+            close(client);
+            return false;
+        }
+        if (origin.response_send_failed.load() || origin.listener_failed.load() ||
+            origin.first_peer_unexpected_data.load() ||
+            origin.first_peer_observation_failed.load()) {
+            error = "#630 origin reported send/listener/protocol custody failure";
+            close(client);
+            return false;
+        }
+        quiet_until_ns = steady_now_ns();
+    }
+    const std::string expected_upstream =
+        std::string("HEAD /buffered-timeout?q=1 HTTP/1.1\r\nHost: 127.0.0.1:") +
+        std::to_string(backend) + "\r\n\r\n";
+    const auto retire_deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(350);
+    while (!origin.first_peer_closed.load() && std::chrono::steady_clock::now() < retire_deadline)
+        usleep(1000);
+    const u64 retirement_ns = origin.first_peer_closed_ns.load();
+    std::string final_access;
+    std::string final_detail;
+    const bool final_quiet = observe_client_open_and_quiet_nonconsuming(client, 50, final_detail);
+    const u64 final_quiet_until_ns = final_quiet ? steady_now_ns() : quiet_until_ns;
+    const bool final_ledger_ok =
+        read_request_length_access_file(temp.nginx_access_log, final_access, final_detail) &&
+        final_access == "61\n";
+    HeadAcceptanceObservation actual;
+    actual.origin_ns = origin.request_complete_ns[0].load(std::memory_order_acquire);
+    actual.publication_ns = publication_ns;
+    actual.header_ns = header_complete_ns;
+    actual.retirement_ns = retirement_ns;
+    actual.wire = response;
+    actual.access = final_access;
+    actual.access_ns = access_ns;
+    actual.quiet_until_ns = final_quiet_until_ns;
+    actual.accepted = origin.accepted.load(std::memory_order_acquire);
+    actual.requests = origin.requests.load(std::memory_order_acquire);
+    actual.publication_count = origin.head_publication_count.load(std::memory_order_acquire);
+    actual.retirement_count = origin.head_peer_close_count.load(std::memory_order_acquire);
+    actual.response_send_calls = origin.response_send_calls.load(std::memory_order_acquire);
+    actual.response_bytes_sent = origin.response_bytes_sent.load(std::memory_order_acquire);
+    actual.downstream_open = final_quiet;
+    actual.downstream_eof = false;
+    actual.response_send_failed = origin.response_send_failed.load(std::memory_order_acquire);
+    actual.listener_failed = origin.listener_failed.load(std::memory_order_acquire);
+    actual.unexpected_data = origin.first_peer_unexpected_data.load(std::memory_order_acquire);
+    actual.observation_failed =
+        origin.first_peer_observation_failed.load(std::memory_order_acquire);
+    std::string acceptance_detail;
+    const bool ok = validate_head_acceptance(actual, kExpected, acceptance_detail);
+    const bool live_snapshot_ok =
+        final_quiet && final_ledger_ok && origin.thread_alive.load(std::memory_order_acquire) &&
+        !origin.listener_failed.load(std::memory_order_acquire) && !poll_child(nginx.child);
+    close(client);
+    origin.stop();
+    if (origin.history.size() != 1u ||
+        std::string(origin.history[0].wire.begin(), origin.history[0].wire.end()) !=
+            expected_upstream ||
+        origin.history[0].wire.size() != 61u) {
+        error = "#630 upstream request wire mismatch";
+        return false;
+    }
+    const bool cleanup_ok = stop_child(nginx.child) && docker.remove();
+    if (!ok || !live_snapshot_ok || !cleanup_ok) {
+        if (error.empty())
+            error = "#630 origin retirement/request/access evidence mismatch: " + acceptance_detail;
+        return false;
+    }
+    std::cerr << "PASS evidence: #630 HEAD header anchor/retirement ns=" << publication_ns << "/"
+              << header_complete_ns << "/" << origin.first_peer_closed_ns.load()
+              << " ledger=61\\n\n";
     return true;
 }
 
@@ -77496,6 +79039,8 @@ int main(int argc, char** argv) {
         strcmp(argv[1], "--pinned-nginx-custom-hide-timeout-explicit-buffering-oracle") == 0;
     const bool pinned_nginx_custom_hide_timeout_two_second_oracle =
         argc == 2 && strcmp(argv[1], "--pinned-nginx-custom-hide-timeout-2s-oracle") == 0;
+    const bool pinned_nginx_bodyless_head_delayed_completion_oracle =
+        argc == 2 && strcmp(argv[1], "--pinned-nginx-bodyless-head-delayed-completion-oracle") == 0;
     const bool pinned_nginx_default_buffering_201_incomplete_body_inactivity_expiry_oracle =
         argc == 2 &&
         strcmp(argv[1],
@@ -77539,6 +79084,8 @@ int main(int argc, char** argv) {
         argc == 2 && strcmp(argv[1], "--pinned-nginx-lifecycle-self-check") == 0;
     const bool docker_info_preflight_self_check =
         argc == 2 && strcmp(argv[1], "--docker-info-preflight-self-check") == 0;
+    const bool docker_info_launch_diagnostic =
+        argc == 2 && strcmp(argv[1], "--docker-info-launch-diagnostic") == 0;
     const bool zero_response_stall_self_check =
         argc == 2 && strcmp(argv[1], "--zero-response-stall-self-check") == 0;
     const bool gated_fragment_peer_probe_self_check =
@@ -77759,17 +79306,18 @@ int main(int argc, char** argv) {
         (argc == 2 && argv[1][0] == '/') ||
         (argc == 4 && argv[1][0] == '/' && argv[2][0] == '/' && argv[3][0] == '/');
     if ((!nginx_preload_loader_preflight && !nginx_gate_spike && !nginx_coalesced_ingress_gate &&
-         !docker_info_preflight_self_check && !rut_iouring_gate_recv_owner_diagnostics_self_check &&
-         !exact_local_return_baseline && !root_proxy_trace_oracle && !api_proxy_trace_oracle &&
-         !exact_absolute_redirect_oracle && !exact_absolute_redirect_302_oracle &&
-         !api_non_root_proxy_uri_oracle && !service_root_proxy_uri_oracle &&
-         !wildcard_service_no_uri_oracle && !converter_wildcard_service_no_uri_differential &&
-         !static_query_proxy_uri_oracle && !zero_suffix_static_query_proxy_uri_oracle &&
-         !empty_query_proxy_uri_oracle && !root_empty_query_proxy_uri_oracle &&
-         !proxy_hide_header_oracle && !proxy_hide_header_name_oracle &&
-         !proxy_hide_header_source_self_check && !proxy_hide_header_generated_side_self_check &&
-         !explicit_timeout_head_source_self_check && !explicit_timeout_head_generated_episode &&
-         !explicit_timeout_head_phase_differential && !keepalive_timeout_head_differential &&
+         !docker_info_preflight_self_check && !docker_info_launch_diagnostic &&
+         !rut_iouring_gate_recv_owner_diagnostics_self_check && !exact_local_return_baseline &&
+         !root_proxy_trace_oracle && !api_proxy_trace_oracle && !exact_absolute_redirect_oracle &&
+         !exact_absolute_redirect_302_oracle && !api_non_root_proxy_uri_oracle &&
+         !service_root_proxy_uri_oracle && !wildcard_service_no_uri_oracle &&
+         !converter_wildcard_service_no_uri_differential && !static_query_proxy_uri_oracle &&
+         !zero_suffix_static_query_proxy_uri_oracle && !empty_query_proxy_uri_oracle &&
+         !root_empty_query_proxy_uri_oracle && !proxy_hide_header_oracle &&
+         !proxy_hide_header_name_oracle && !proxy_hide_header_source_self_check &&
+         !proxy_hide_header_generated_side_self_check && !explicit_timeout_head_source_self_check &&
+         !explicit_timeout_head_generated_episode && !explicit_timeout_head_phase_differential &&
+         !keepalive_timeout_head_differential &&
          !keepalive_timeout_get_initial_deadline_differential &&
          !fixed_upload_head_success_differential &&
          !fixed_upload_head_zero_response_timeout_differential &&
@@ -77807,6 +79355,7 @@ int main(int argc, char** argv) {
          !pinned_nginx_explicit_buffering_on_baseline_oracle &&
          !pinned_nginx_custom_hide_timeout_explicit_buffering_oracle &&
          !pinned_nginx_custom_hide_timeout_two_second_oracle &&
+         !pinned_nginx_bodyless_head_delayed_completion_oracle &&
          !pinned_nginx_default_buffering_201_incomplete_body_inactivity_expiry_oracle &&
          !pinned_nginx_default_buffering_202_incomplete_body_inactivity_expiry_oracle &&
          !pinned_nginx_default_buffering_304_content_length_metadata_oracle &&
@@ -78018,6 +79567,9 @@ int main(int argc, char** argv) {
                "   or: test_nginx_differential --pinned-nginx-custom-hide-timeout-probe\n"
                "   or: test_nginx_differential --pinned-nginx-custom-hide-timeout-completion\n"
                "   or: test_nginx_differential --pinned-nginx-custom-hide-timeout-2s-oracle\n"
+               "   or: test_nginx_differential "
+               "--pinned-nginx-bodyless-head-delayed-completion-oracle\n"
+               "   or: test_nginx_differential --docker-info-launch-diagnostic\n"
                "   or: test_nginx_differential "
                "--converter-custom-hide-timeout-explicit-buffering-cli-differential "
                "<absolute-rut-executable> <absolute-converter-executable>\n"
@@ -78503,6 +80055,16 @@ int main(int argc, char** argv) {
                      "oracle observed the exact bodyless-GET wire and timing windows\n";
         return 0;
     }
+    if (pinned_nginx_bodyless_head_delayed_completion_oracle) {
+        std::string oracle_error;
+        if (!run_pinned_nginx_bodyless_head_delayed_completion_oracle(oracle_error)) {
+            std::cerr << "FAIL [#630 pinned nginx delayed bodyless HEAD oracle]: " << oracle_error
+                      << "\n";
+            return 1;
+        }
+        std::cerr << "PASS: #630 pinned nginx bodyless HEAD delayed completion oracle\n";
+        return 0;
+    }
     if (converter_custom_hide_timeout_cli_differential) {
         std::string differential_error;
         if (!run_pinned_nginx_custom_hide_timeout_cli_differential(
@@ -78572,6 +80134,16 @@ int main(int argc, char** argv) {
     if (!temp.create()) {
         std::cerr << "FAIL [preflight]: secure temporary directory creation failed\n";
         return 1;
+    }
+    if (docker_info_launch_diagnostic) {
+        std::cerr << "Docker launch diagnostic: NOT ACCEPTANCE (one bounded docker info launch)\n";
+        DockerInfoResult result =
+            run_docker_info_runner({"docker", "info"}, temp.preflight_log, 10'000);
+        (void)read_docker_snapshot(
+            temp.preflight_log, result.snapshot, result.snapshot_error, result.snapshot_state);
+        print_docker_info_result(result);
+        const DockerInfoDecision decision = docker_info_decision(result);
+        return docker_info_return_code(decision, true);
     }
     if (!run_normalize_date_self_checks()) return 1;
     if (!run_two_response_diagnostic_self_check()) return 1;
