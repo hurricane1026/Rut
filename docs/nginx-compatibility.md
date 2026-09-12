@@ -26,8 +26,11 @@ tracks the separate non-1s witness. Only the precise representative row below
 is promoted, not all component-admitted names/durations/methods.
 The #627 nginx-only 2s oracle at `1d4e536b` passed independent review, a fresh
 Release build and eight targeted tests (zero skips, 50.33s; new oracle 6.55s).
-Final CI/integration and the generated-RUT 2s witness remain pending; this adds
-no support promotion.
+PR #628 merged at `205aa878` from `ebff78d1` after CI `34685162795` passed
+15/15 jobs and required nginx 157/157 with zero skips (620.45s; new oracle 6.50s).
+The generated-RUT 2s witness at `ac4b1571` passed independent review, root
+Release build and nine targeted tests (zero skips, 63.79s; new CLI pairs 13.35s).
+It remains CURRENT pending exact-head CI/integration; no promotion yet.
 #623 tracks a reproduced source-backed Server-model hide-metadata erasure gap;
 its fix merged through #624 at `2bba609a` after CI `34320265023` passed all
 15 jobs and required nginx 155/155. This strengthens model authentication only.
