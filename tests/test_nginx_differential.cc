@@ -1602,7 +1602,7 @@ static bool run_docker_info_preflight_self_check(std::string& error) {
     if (fifo.outcome != DockerInfoOutcome::TimedOut || !fifo.kill_attempted || fifo.reap_failed ||
         fifo.ownership_unresolved || fifo.launch_observations.size() != 1 ||
         fifo.launch_observations[0].stage != DockerInfoResult::LaunchStage::BeforeLogOpen ||
-        !fifo.launch_channel_closed_before_cleanup) {
+        fifo.launch_channel_closed) {
         error = "FIFO before-log-open timeout control failed";
         cleanup();
         return false;
