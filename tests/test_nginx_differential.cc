@@ -78922,7 +78922,8 @@ static bool run_issue630_head_same_file_pair(const char* rut_path,
                                              const char* converter_path,
                                              std::string& error) {
     if (rut_path == nullptr || converter_path == nullptr || rut_path[0] != '/' ||
-        converter_path[0] != '/' || access(rut_path, X_OK) != 0 || access(converter_path, X_OK) != 0) {
+        converter_path[0] != '/' || access(rut_path, X_OK) != 0 ||
+        access(converter_path, X_OK) != 0) {
         error = "#630 pair requires absolute executable RUT and converter paths";
         return false;
     }
@@ -78937,63 +78938,131 @@ static bool run_issue630_head_same_file_pair(const char* rut_path,
     // Keep the exact oracle grammar/path, including no URI suffix and IPv4 loopback.
     const std::string exact_config =
         "events {}\nhttp {\n  log_format compat \"$request_length\";\n  access_log " +
-        temp.nginx_access_log + " compat;\n  server {\n    listen 127.0.0.1:" +
-        std::to_string(frontend) + ";\n    location / {\n      proxy_pass http://127.0.0.1:" +
-        std::to_string(backend) +
-        ";\n      proxy_buffering on;\n      proxy_hide_header X-Powered-By;\n      proxy_read_timeout 2s;\n    }\n  }\n}\n";
+        temp.nginx_access_log +
+        " compat;\n  server {\n    listen 127.0.0.1:" + std::to_string(frontend) +
+        ";\n    location / {\n      proxy_pass http://127.0.0.1:" + std::to_string(backend) +
+        ";\n      proxy_buffering on;\n      proxy_hide_header X-Powered-By;\n      "
+        "proxy_read_timeout 2s;\n    }\n  }\n}\n";
     if (!write_file(temp.nginx_config, exact_config.data(), exact_config.size())) {
         error = "#630 pair could not persist immutable config";
         return false;
     }
-    auto run_episode = [&](bool nginx_side, HeadAcceptanceObservation& observation,
+    auto run_episode = [&](bool nginx_side,
+                           HeadAcceptanceObservation& observation,
                            std::vector<char>& wire) {
-        KeepAlivePinnedRecorder origin(KeepAlivePinnedRecorder::FirstResponseMode::DelayedHeadComplete);
+        KeepAlivePinnedRecorder origin(
+            KeepAlivePinnedRecorder::FirstResponseMode::DelayedHeadComplete);
         ChildGuard child;
         DockerGuard docker("rut-nginx-630-head-pair-" + std::to_string(getpid()));
         if (!nginx_side) docker.active = false;
         if (!handoff_held_loopback_port(&ports.fds[1], backend, "#630 pair origin bind", error) ||
-            !origin.setup(backend)) return false;
+            !origin.setup(backend))
+            return false;
         if (nginx_side) {
-            if (!handoff_held_loopback_port(&ports.fds[0], frontend, "#630 pair nginx bind", error) ||
-                !spawn_child({"docker", "run", "--pull=never", "--network", "host", "--name",
-                              docker.name, "-v", std::string(temp.path) + ":" + temp.path,
-                              "-v", temp.nginx_config + ":/etc/nginx/nginx.conf:ro", kNginxImage,
-                              "nginx", "-g", "daemon off;"}, temp.nginx_log, child.child) ||
-                !wait_ready(frontend, child.child, error)) return false;
+            if (!handoff_held_loopback_port(
+                    &ports.fds[0], frontend, "#630 pair nginx bind", error) ||
+                !spawn_child({"docker",
+                              "run",
+                              "--pull=never",
+                              "--network",
+                              "host",
+                              "--name",
+                              docker.name,
+                              "-v",
+                              std::string(temp.path) + ":" + temp.path,
+                              "-v",
+                              temp.nginx_config + ":/etc/nginx/nginx.conf:ro",
+                              kNginxImage,
+                              "nginx",
+                              "-g",
+                              "daemon off;"},
+                             temp.nginx_log,
+                             child.child) ||
+                !wait_ready(frontend, child.child, error))
+                return false;
         } else {
             int out = open(temp.source.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0600);
             const std::string converter_diagnostics = temp.rut_log + ".converter";
             int errfd = open(converter_diagnostics.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0600);
-            if (out < 0 || errfd < 0) { if (out >= 0) close(out); if (errfd >= 0) close(errfd); error = "#630 converter output open failed"; return false; }
+            if (out < 0 || errfd < 0) {
+                if (out >= 0) close(out);
+                if (errfd >= 0) close(errfd);
+                error = "#630 converter output open failed";
+                return false;
+            }
             pid_t pid = fork();
             if (pid == 0) {
                 if (dup2(out, STDOUT_FILENO) < 0 || dup2(errfd, STDERR_FILENO) < 0) _exit(127);
-                close(out); close(errfd);
-                execl(converter_path, converter_path, "--format", "nginx-http", temp.nginx_config.c_str(), nullptr);
+                close(out);
+                close(errfd);
+                execl(converter_path,
+                      converter_path,
+                      "--format",
+                      "nginx-http",
+                      temp.nginx_config.c_str(),
+                      nullptr);
                 _exit(127);
             }
-            close(out); close(errfd);
-            if (pid < 0) { error = "#630 converter fork failed"; return false; }
+            close(out);
+            close(errfd);
+            if (pid < 0) {
+                error = "#630 converter fork failed";
+                return false;
+            }
             ChildGuard converter_guard;
             converter_guard.child.pid = pid;
-            if (!wait_child(converter_guard.child, 10000) || !converter_guard.child.status_valid || !WIFEXITED(converter_guard.child.status) || WEXITSTATUS(converter_guard.child.status) != 0) { error = "#630 converter failed"; return false; }
+            if (!wait_child(converter_guard.child, 10000) || !converter_guard.child.status_valid ||
+                !WIFEXITED(converter_guard.child.status) ||
+                WEXITSTATUS(converter_guard.child.status) != 0) {
+                error = "#630 converter failed";
+                return false;
+            }
             std::string source, diagnostics;
-            if (!read_exact_rut_source(temp.source, "#630 generated source", source, error) || source.empty() ||
-                !read_bounded_file(converter_diagnostics, diagnostics, error) || !diagnostics.empty() ||
-                !validate_custom_hide_timeout_loaded_program(temp.source, source, frontend, backend,
-                    temp.nginx_access_log, "X-Powered-By", error, 2u)) return false;
+            if (!read_exact_rut_source(temp.source, "#630 generated source", source, error) ||
+                source.empty() || !read_bounded_file(converter_diagnostics, diagnostics, error) ||
+                !diagnostics.empty() ||
+                !validate_custom_hide_timeout_loaded_program(temp.source,
+                                                             source,
+                                                             frontend,
+                                                             backend,
+                                                             temp.nginx_access_log,
+                                                             "X-Powered-By",
+                                                             error,
+                                                             2u))
+                return false;
             if (!handoff_held_loopback_port(&ports.fds[0], frontend, "#630 pair RUT bind", error) ||
-                !spawn_child({rut_path, temp.source, "--shards", "1", "--no-pin", "--drain", "0"}, temp.rut_log, child.child) ||
-                !wait_ready(frontend, child.child, error)) return false;
+                !spawn_child({rut_path, temp.source, "--shards", "1", "--no-pin", "--drain", "0"},
+                             temp.rut_log,
+                             child.child) ||
+                !wait_ready(frontend, child.child, error))
+                return false;
             const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
-            const std::string listener = "Listening on port " + std::to_string(frontend) + " with 1 shard(s)\n";
-            while ((!log_contains(temp.rut_log, "Backend: io_uring\n") || !log_contains(temp.rut_log, listener.c_str())) && std::chrono::steady_clock::now() < deadline) {
-                if (poll_child(child.child)) { error = "#630 RUT exited before readiness"; return false; }
+            const std::string listener =
+                "Listening on port " + std::to_string(frontend) + " with 1 shard(s)\n";
+            while ((!log_contains(temp.rut_log, "Backend: io_uring\n") ||
+                    !log_contains(temp.rut_log, listener.c_str())) &&
+                   std::chrono::steady_clock::now() < deadline) {
+                if (poll_child(child.child)) {
+                    error = "#630 RUT exited before readiness";
+                    return false;
+                }
                 usleep(1000);
             }
-            if (!log_contains(temp.rut_log, "Backend: io_uring\n") || !log_contains(temp.rut_log, listener.c_str())) { error = "#630 RUT lacked io_uring/listener readiness"; return false; }
+            if (!log_contains(temp.rut_log, "Backend: io_uring\n") ||
+                !log_contains(temp.rut_log, listener.c_str())) {
+                error = "#630 RUT lacked io_uring/listener readiness";
+                return false;
+            }
         }
-        if (!capture_issue630_head_episode(frontend, backend, temp.nginx_access_log, child.child, origin, observation, wire, error)) return false;
+        if (!capture_issue630_head_episode(frontend,
+                                           backend,
+                                           temp.nginx_access_log,
+                                           child.child,
+                                           origin,
+                                           observation,
+                                           wire,
+                                           error))
+            return false;
         if (!stop_child(child.child)) return false;
         if (nginx_side && !docker.remove()) return false;
         return true;
@@ -79002,23 +79071,40 @@ static bool run_issue630_head_same_file_pair(const char* rut_path,
     std::vector<char> nginx_wire, rut_wire;
     if (!run_episode(true, nginx_obs, nginx_wire)) return false;
     std::string frozen_config;
-    if (!read_exact_return204_log(temp.nginx_config, "#630 config", frozen_config, error) || frozen_config != exact_config ||
+    if (!read_exact_return204_log(temp.nginx_config, "#630 config", frozen_config, error) ||
+        frozen_config != exact_config ||
         rename(temp.nginx_access_log.c_str(), temp.nginx_access_snapshot.c_str()) != 0 ||
-        !read_exact_return204_log(temp.nginx_access_snapshot, "#630 ledger", frozen_config, error) || frozen_config != "61\n" ||
-        !write_file(temp.nginx_access_log, "", 0u)) { error = "#630 nginx artifacts were not frozen exactly"; return false; }
-    if (!ports.reserve_specific(0u, frontend) || !ports.reserve_specific(1u, backend)) { error = "#630 pair could not renew the same ports"; return false; }
+        !read_exact_return204_log(
+            temp.nginx_access_snapshot, "#630 ledger", frozen_config, error) ||
+        frozen_config != "61\n" || !write_file(temp.nginx_access_log, "", 0u)) {
+        error = "#630 nginx artifacts were not frozen exactly";
+        return false;
+    }
+    if (!ports.reserve_specific(0u, frontend) || !ports.reserve_specific(1u, backend)) {
+        error = "#630 pair could not renew the same ports";
+        return false;
+    }
     if (!run_episode(false, rut_obs, rut_wire)) return false;
-    auto normalized = [](std::vector<char> value) { return normalize_date(value) ? value : std::vector<char>{}; };
-    if (normalized(nginx_obs.wire) != normalized(rut_obs.wire) ||
-        normalized(nginx_wire) != normalized(rut_wire) || nginx_obs.access != rut_obs.access ||
-        nginx_obs.accepted != rut_obs.accepted || nginx_obs.requests != rut_obs.requests ||
-        nginx_obs.publication_count != rut_obs.publication_count || nginx_obs.retirement_count != rut_obs.retirement_count) {
+    auto nginx_response = nginx_obs.wire;
+    auto rut_response = rut_obs.wire;
+    if (!normalize_date(nginx_response) || !normalize_date(rut_response) ||
+        nginx_response != rut_response || nginx_wire != rut_wire ||
+        nginx_obs.access != rut_obs.access || nginx_obs.accepted != rut_obs.accepted ||
+        nginx_obs.requests != rut_obs.requests ||
+        nginx_obs.publication_count != rut_obs.publication_count ||
+        nginx_obs.retirement_count != rut_obs.retirement_count) {
         error = "#630 same-file nginx/RUT HEAD observations differed";
         return false;
     }
     std::string archived_ledger;
-    if (!read_exact_return204_log(temp.nginx_config, "#630 final config", frozen_config, error) || frozen_config != exact_config ||
-        !read_exact_return204_log(temp.nginx_access_snapshot, "#630 archived ledger", archived_ledger, error) || archived_ledger != "61\n") { error = "#630 immutable nginx artifact changed after pair"; return false; }
+    if (!read_exact_return204_log(temp.nginx_config, "#630 final config", frozen_config, error) ||
+        frozen_config != exact_config ||
+        !read_exact_return204_log(
+            temp.nginx_access_snapshot, "#630 archived ledger", archived_ledger, error) ||
+        archived_ledger != "61\n") {
+        error = "#630 immutable nginx artifact changed after pair";
+        return false;
+    }
     std::cerr << "PASS: #630 same-file nginx/generated-RUT delayed bodyless HEAD pair matched\n";
     return true;
 }
@@ -79593,8 +79679,7 @@ int main(int argc, char** argv) {
          (argv[2][0] != '/' || argv[3][0] != '/')) ||
         (converter_custom_hide_timeout_two_second_cli_differential &&
          (argv[2][0] != '/' || argv[3][0] != '/')) ||
-        (issue630_head_same_file_pair &&
-         (argv[2][0] != '/' || argv[3][0] != '/')) ||
+        (issue630_head_same_file_pair && (argv[2][0] != '/' || argv[3][0] != '/')) ||
         (converter_custom_hide_timeout_boundary_cli_differential &&
          (argv[2][0] != '/' || argv[3][0] != '/')) ||
         ((converter_default_buffering_positive_get_differential ||
