@@ -5276,6 +5276,7 @@ struct KeepAlivePinnedRecorder {
         IncompleteWaitGate,
         DelayedIncompleteThenComplete,
         DelayedIncompleteGetThenCl0,
+        DelayedHeadComplete,
     };
     enum class ActiveWaitKind : uint8_t {
         None,
@@ -5284,6 +5285,8 @@ struct KeepAlivePinnedRecorder {
         IncompleteAbortHold,
         DelayedIncompleteDue,
         DelayedIncompletePeerClose,
+        DelayedHeadDue,
+        DelayedHeadPeerClose,
     };
     enum class IncompleteGateState : uint8_t {
         Idle,
@@ -5339,6 +5342,9 @@ struct KeepAlivePinnedRecorder {
     std::atomic<u64> first_partial_sent_ns{0};
     std::atomic<u64> first_peer_closed_ns{0};
     std::atomic<u64> second_complete_sent_ns{0};
+    std::atomic<u64> head_publication_ns{0};
+    std::atomic<bool> head_publish_permit{false};
+    std::atomic<bool> head_peer_open_ack{false};
     std::atomic<u32> response_send_calls{0};
     std::atomic<u32> response_bytes_sent{0};
     std::atomic<bool> response_send_failed{false};
@@ -5402,6 +5408,17 @@ struct KeepAlivePinnedRecorder {
             self.request_complete_ns[1].store(steady_now_ns(), std::memory_order_release);
         self.requests.fetch_add(1, std::memory_order_release);
         item.parsed = end;
+        if (self.first_response_mode == FirstResponseMode::DelayedHeadComplete) {
+            if (!first_request || item.wire.size() != end) {
+                self.first_peer_unexpected_data.store(true, std::memory_order_release);
+                return false;
+            }
+            if (probe_peer_nonblocking(item.fd) != PeerProbe::Open) return false;
+            self.head_peer_open_ack.store(true, std::memory_order_release);
+            item.wait_kind = ActiveWaitKind::DelayedHeadDue;
+            item.body_due = now + std::chrono::milliseconds(1200);
+            return true;
+        }
         if (self.first_response_mode == FirstResponseMode::DelayedIncompleteThenComplete ||
             self.first_response_mode == FirstResponseMode::DelayedIncompleteGetThenCl0) {
             if (item.wire.size() != end || (!first_request && !second_request)) {
@@ -5573,6 +5590,28 @@ struct KeepAlivePinnedRecorder {
                         item.wait_kind = ActiveWaitKind::DelayedIncompletePeerClose;
                     }
                 }
+                if (item.wait_kind == ActiveWaitKind::DelayedHeadDue && now >= item.body_due &&
+                    self->head_publish_permit.load(std::memory_order_acquire)) {
+                    static constexpr char kHead[] =
+                        "HTTP/1.1 200 OK\r\n"
+                        "Server: origin\r\n"
+                        "Date: Tue, 01 Jan 2030 00:00:00 GMT\r\n"
+                        "X-Powered-By: first\r\n"
+                        "x-powered-by: second\r\n"
+                        "X-Unrelated: retained\r\n"
+                        "Content-Length: 12\r\n"
+                        "Connection: keep-alive\r\n\r\n";
+                    if (!send_all(item.fd, kHead, sizeof(kHead) - 1u)) {
+                        self->response_send_failed.store(true, std::memory_order_release);
+                        remove = true;
+                    } else {
+                        self->response_send_calls.fetch_add(1u, std::memory_order_release);
+                        self->response_bytes_sent.fetch_add(sizeof(kHead) - 1u,
+                                                            std::memory_order_release);
+                        self->head_publication_ns.store(steady_now_ns(), std::memory_order_release);
+                        item.wait_kind = ActiveWaitKind::DelayedHeadPeerClose;
+                    }
+                }
                 if (item.wait_kind == ActiveWaitKind::IncompleteGate) {
                     IncompleteGateCommand command =
                         self->incomplete_gate_command.load(std::memory_order_acquire);
@@ -5652,6 +5691,25 @@ struct KeepAlivePinnedRecorder {
                     }
                 }
                 if (!remove && item.wait_kind == ActiveWaitKind::DelayedIncompletePeerClose &&
+                    (polls[poll_index].revents & (POLLIN | POLLERR | POLLHUP))) {
+                    char unexpected[256];
+                    const ssize_t n = recv(item.fd, unexpected, sizeof(unexpected), 0);
+                    if (n == 0 || (n < 0 && errno == ECONNRESET) ||
+                        (n < 0 && (polls[poll_index].revents & POLLHUP) != 0 &&
+                         (errno == EAGAIN || errno == EWOULDBLOCK))) {
+                        self->first_peer_closed_ns.store(steady_now_ns(),
+                                                         std::memory_order_release);
+                        self->first_peer_closed.store(true, std::memory_order_release);
+                        remove = true;
+                    } else if (n > 0) {
+                        self->first_peer_unexpected_data.store(true, std::memory_order_release);
+                        remove = true;
+                    } else if (errno != EINTR && errno != EAGAIN && errno != EWOULDBLOCK) {
+                        self->first_peer_observation_failed.store(true, std::memory_order_release);
+                        remove = true;
+                    }
+                }
+                if (!remove && item.wait_kind == ActiveWaitKind::DelayedHeadPeerClose &&
                     (polls[poll_index].revents & (POLLIN | POLLERR | POLLHUP))) {
                     char unexpected[256];
                     const ssize_t n = recv(item.fd, unexpected, sizeof(unexpected), 0);
@@ -5768,6 +5826,9 @@ struct KeepAlivePinnedRecorder {
         first_partial_sent_ns.store(0, std::memory_order_relaxed);
         first_peer_closed_ns.store(0, std::memory_order_relaxed);
         second_complete_sent_ns.store(0, std::memory_order_relaxed);
+        head_publication_ns.store(0, std::memory_order_relaxed);
+        head_publish_permit.store(false, std::memory_order_relaxed);
+        head_peer_open_ack.store(false, std::memory_order_relaxed);
         response_send_calls.store(0, std::memory_order_relaxed);
         response_bytes_sent.store(0, std::memory_order_relaxed);
         response_send_failed.store(false, std::memory_order_relaxed);
@@ -74462,6 +74523,206 @@ static bool run_pinned_nginx_custom_hide_timeout_two_second_oracle(std::string& 
     return true;
 }
 
+// #630 pinned-only oracle: a fresh bodyless HEAD remains quiet until the
+// complete upstream header is published, then retires that origin promptly.
+static bool run_pinned_nginx_bodyless_head_delayed_completion_oracle(std::string& error) {
+    const auto timing_control = [](u64 origin_ns, u64 header_ns, u64 retire_ns) {
+        return header_ns >= origin_ns && header_ns - origin_ns < 350'000'000ull &&
+               retire_ns >= origin_ns && retire_ns - origin_ns < 350'000'000ull;
+    };
+    if (timing_control(1'000'000'000ull, 1'200'000'000ull, 1'300'000'000ull) == false ||
+        timing_control(1'000'000'000ull, 1'400'000'000ull, 1'300'000'000ull) ||
+        timing_control(1'000'000'000ull, 1'200'000'000ull, 1'350'000'001ull)) {
+        error = "#630 synthetic timing acceptance control failed";
+        return false;
+    }
+    static constexpr char kRequest[] =
+        "HEAD /buffered-timeout?q=1 HTTP/1.1\r\nHost: client.example\r\n\r\n";
+    static constexpr char kExpected[] =
+        "HTTP/1.1 200 OK\r\nServer: nginx/1.29.7\r\n"
+        "Date: XXXXXXXXXXXXXXXXXXXXXXXXXXXXX\r\nContent-Length: 12\r\n"
+        "Connection: keep-alive\r\nX-Unrelated: retained\r\n\r\n";
+    static_assert(sizeof(kExpected) - 1u == 145u);
+    TempDir temp;
+    HeldLoopbackPorts reservations;
+    u16 frontend = 0u, backend = 0u;
+    if (!temp.create() || !reservations.reserve_four_digit(0u, frontend) ||
+        !reservations.reserve_four_digit(1u, backend) || frontend == backend) {
+        error = "#630 could not allocate isolated resources";
+        return false;
+    }
+    const std::string config =
+        "events {}\nhttp {\n  log_format compat \"$request_length\";\n  access_log " +
+        temp.nginx_access_log +
+        " compat;\n  server {\n    listen 127.0.0.1:" + std::to_string(frontend) +
+        ";\n    location / {\n      proxy_pass http://127.0.0.1:" + std::to_string(backend) +
+        ";\n      proxy_buffering on;\n      proxy_hide_header X-Powered-By;\n      "
+        "proxy_read_timeout 2s;\n    }\n  }\n}\n";
+    if (!write_file(temp.nginx_config, config.data(), config.size())) {
+        error = "#630 could not persist immutable nginx config";
+        return false;
+    }
+    KeepAlivePinnedRecorder origin(KeepAlivePinnedRecorder::FirstResponseMode::DelayedHeadComplete);
+    if (!handoff_held_loopback_port(&reservations.fds[1], backend, "#630 origin bind", error) ||
+        !origin.setup(backend)) {
+        if (error.empty()) error = "#630 origin setup failed";
+        return false;
+    }
+    DockerGuard docker("rut-nginx-630-head-" + std::to_string(getpid()));
+    ChildGuard nginx;
+    if (!handoff_held_loopback_port(&reservations.fds[0], frontend, "#630 nginx bind", error))
+        return false;
+    if (!spawn_child({"docker",
+                      "run",
+                      "--pull=never",
+                      "--network",
+                      "host",
+                      "--name",
+                      docker.name,
+                      "-v",
+                      temp.nginx_config + ":/etc/nginx/nginx.conf:ro",
+                      kNginxImage,
+                      "nginx",
+                      "-g",
+                      "daemon off;"},
+                     temp.nginx_log,
+                     nginx.child) ||
+        !wait_ready(frontend, nginx.child, error))
+        return false;
+    int client = connect_once(frontend);
+    if (client < 0 || !send_all(client, kRequest, sizeof(kRequest) - 1u)) {
+        error = "#630 HEAD request send failed";
+        if (client >= 0) close(client);
+        return false;
+    }
+    const auto quiet_until = std::chrono::steady_clock::now() + std::chrono::seconds(1);
+    while (std::chrono::steady_clock::now() < quiet_until) {
+        bool eof = false;
+        if (!wait_keepalive_quiet_or_eof(client, 50, eof, error) || eof) {
+            error = eof ? "#630 downstream closed before header completion"
+                        : "#630 downstream was not quiet before 1s";
+            close(client);
+            return false;
+        }
+        if (origin.accepted.load() != 1u || origin.requests.load() > 1u) break;
+    }
+    if (origin.accepted.load(std::memory_order_acquire) != 1u ||
+        origin.requests.load(std::memory_order_acquire) != 1u) {
+        error = "#630 pre-permit origin did not observe one complete request";
+        close(client);
+        return false;
+    }
+    if (!origin.head_peer_open_ack.load(std::memory_order_acquire)) {
+        error = "#630 pre-permit origin peer was not open";
+        close(client);
+        return false;
+    }
+    // This is the explicit custody/open ACK: only after the real quiet window,
+    // one accepted request, and an empty access ledger may the origin publish.
+    std::string prepermit_access;
+    if (!read_request_length_access_file(temp.nginx_access_log, prepermit_access, error) ||
+        !prepermit_access.empty()) {
+        error = "#630 pre-permit access ledger was not empty";
+        close(client);
+        return false;
+    }
+    origin.head_publish_permit.store(true, std::memory_order_release);
+    const u64 publication_wait = steady_now_ns() + 2'000'000'000ull;
+    std::vector<char> response;
+    u64 header_complete_ns = 0u;
+    while (steady_now_ns() < publication_wait) {
+        pollfd p{client, POLLIN | POLLHUP | POLLERR, 0};
+        if (poll(&p, 1, 25) < 0 && errno == EINTR) continue;
+        char buf[1024];
+        const ssize_t n = recv(client, buf, sizeof(buf), MSG_DONTWAIT);
+        if (n > 0) {
+            response.insert(response.end(), buf, buf + n);
+            const size_t end = header_end(response);
+            if (end != 0u) {
+                header_complete_ns = steady_now_ns();
+                if (response.size() != end) {
+                    error = "#630 HEAD publication included representation bytes";
+                    close(client);
+                    return false;
+                }
+                break;
+            }
+        } else if (n < 0 && errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR)
+            break;
+    }
+    const u64 publication_ns = origin.head_publication_ns.load();
+    if (header_complete_ns == 0u || publication_ns == 0u || header_complete_ns < publication_ns ||
+        header_complete_ns - publication_ns >= 350'000'000ull ||
+        !validate_exact_normalized_response(response, kExpected, error)) {
+        if (error.empty()) error = "#630 delayed HEAD header publication mismatch/timing";
+        close(client);
+        return false;
+    }
+    const u64 ledger_deadline = header_complete_ns + 250'000'000ull;
+    std::string access;
+    bool ledger_seen = false;
+    while (steady_now_ns() < ledger_deadline) {
+        std::string sample;
+        if (!read_request_length_access_file(temp.nginx_access_log, sample, error)) {
+            close(client);
+            return false;
+        }
+        if (sample == "61\n") {
+            access = sample;
+            ledger_seen = true;
+            break;
+        }
+        if (!sample.empty()) {
+            error = "#630 access ledger published a non-exact value";
+            close(client);
+            return false;
+        }
+        usleep(1000);
+    }
+    if (!ledger_seen) {
+        error = "#630 access ledger missed the header-completion anchor window";
+        close(client);
+        return false;
+    }
+    bool eof = false;
+    if (!wait_keepalive_quiet_or_eof(client, 2250, eof, error) || eof) {
+        error = eof ? "#630 downstream EOF during keep-alive observation"
+                    : "#630 downstream emitted body/tail after HEAD header";
+        close(client);
+        return false;
+    }
+    const std::string expected_upstream =
+        std::string("HEAD /buffered-timeout?q=1 HTTP/1.1\r\nHost: 127.0.0.1:") +
+        std::to_string(backend) + "\r\n\r\n";
+    if (origin.history.size() != 1u ||
+        std::string(origin.history[0].wire.begin(), origin.history[0].wire.end()) !=
+            expected_upstream) {
+        error = "#630 upstream request wire mismatch";
+        close(client);
+        return false;
+    }
+    close(client);
+    const auto retire_deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(350);
+    while (!origin.first_peer_closed.load() && std::chrono::steady_clock::now() < retire_deadline)
+        usleep(1000);
+    const bool ok = origin.first_peer_closed.load() &&
+                    origin.first_peer_closed_ns.load() >= publication_ns &&
+                    origin.first_peer_closed_ns.load() - publication_ns < 350'000'000ull &&
+                    publication_ns >= origin.request_complete_ns[0].load() + 1'150'000'000ull &&
+                    publication_ns < origin.request_complete_ns[0].load() + 1'400'000'000ull &&
+                    origin.accepted.load() == 1u && origin.requests.load() == 1u &&
+                    origin.history.size() == 1u && origin.history[0].wire.size() == 61u &&
+                    access == "61\n" && stop_child(nginx.child) && docker.remove();
+    if (!ok) {
+        if (error.empty()) error = "#630 origin retirement/request/access evidence mismatch";
+        return false;
+    }
+    std::cerr << "PASS evidence: #630 HEAD header anchor/retirement ns=" << publication_ns << "/"
+              << header_complete_ns << "/" << origin.first_peer_closed_ns.load()
+              << " ledger=61\\n\n";
+    return true;
+}
+
 static bool run_pinned_nginx_custom_hide_timeout_cli_differential(
     const char* rut_path,
     const char* converter_path,
@@ -77496,6 +77757,8 @@ int main(int argc, char** argv) {
         strcmp(argv[1], "--pinned-nginx-custom-hide-timeout-explicit-buffering-oracle") == 0;
     const bool pinned_nginx_custom_hide_timeout_two_second_oracle =
         argc == 2 && strcmp(argv[1], "--pinned-nginx-custom-hide-timeout-2s-oracle") == 0;
+    const bool pinned_nginx_bodyless_head_delayed_completion_oracle =
+        argc == 2 && strcmp(argv[1], "--pinned-nginx-bodyless-head-delayed-completion-oracle") == 0;
     const bool pinned_nginx_default_buffering_201_incomplete_body_inactivity_expiry_oracle =
         argc == 2 &&
         strcmp(argv[1],
@@ -77807,6 +78070,7 @@ int main(int argc, char** argv) {
          !pinned_nginx_explicit_buffering_on_baseline_oracle &&
          !pinned_nginx_custom_hide_timeout_explicit_buffering_oracle &&
          !pinned_nginx_custom_hide_timeout_two_second_oracle &&
+         !pinned_nginx_bodyless_head_delayed_completion_oracle &&
          !pinned_nginx_default_buffering_201_incomplete_body_inactivity_expiry_oracle &&
          !pinned_nginx_default_buffering_202_incomplete_body_inactivity_expiry_oracle &&
          !pinned_nginx_default_buffering_304_content_length_metadata_oracle &&
@@ -78018,6 +78282,8 @@ int main(int argc, char** argv) {
                "   or: test_nginx_differential --pinned-nginx-custom-hide-timeout-probe\n"
                "   or: test_nginx_differential --pinned-nginx-custom-hide-timeout-completion\n"
                "   or: test_nginx_differential --pinned-nginx-custom-hide-timeout-2s-oracle\n"
+               "   or: test_nginx_differential "
+               "--pinned-nginx-bodyless-head-delayed-completion-oracle\n"
                "   or: test_nginx_differential "
                "--converter-custom-hide-timeout-explicit-buffering-cli-differential "
                "<absolute-rut-executable> <absolute-converter-executable>\n"
@@ -78501,6 +78767,16 @@ int main(int argc, char** argv) {
         }
         std::cerr << "PASS: #627 pinned nginx explicit-on custom-hide 2s expiry/completion "
                      "oracle observed the exact bodyless-GET wire and timing windows\n";
+        return 0;
+    }
+    if (pinned_nginx_bodyless_head_delayed_completion_oracle) {
+        std::string oracle_error;
+        if (!run_pinned_nginx_bodyless_head_delayed_completion_oracle(oracle_error)) {
+            std::cerr << "FAIL [#630 pinned nginx delayed bodyless HEAD oracle]: " << oracle_error
+                      << "\n";
+            return 1;
+        }
+        std::cerr << "PASS: #630 pinned nginx bodyless HEAD delayed completion oracle\n";
         return 0;
     }
     if (converter_custom_hide_timeout_cli_differential) {
