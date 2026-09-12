@@ -843,6 +843,107 @@ struct DockerInfoResult {
     bool launch_evidence_frozen = false;
 };
 
+// Fixture-local decoder for the child launch-status protocol.  Keeping the
+// byte framing and grammar here makes the production runner and self-check
+// controls exercise precisely the same validation path.
+struct DockerLaunchRecord {
+    uint32_t magic;
+    uint8_t stage;
+    uint8_t failed_stage;
+    uint16_t reserved;
+    int32_t error_number;
+};
+
+static constexpr uint32_t kDockerLaunchMagic = 0x52555436u;
+
+class DockerLaunchRecordDecoder {
+public:
+    using Stage = DockerInfoResult::LaunchStage;
+
+    void feed(const void* data, size_t length) {
+        if (closed_) return;
+        const auto* bytes = static_cast<const char*>(data);
+        while (length != 0) {
+            const size_t take = std::min(sizeof(record_), length - partial_size_);
+            memcpy(reinterpret_cast<char*>(&record_) + partial_size_, bytes, take);
+            partial_size_ += take;
+            bytes += take;
+            length -= take;
+            if (partial_size_ != sizeof(record_)) continue;
+            partial_size_ = 0;
+            accept(record_);
+        }
+    }
+
+    void finalize_eof() {
+        if (closed_) {
+            integrity_error_ = true;
+            return;
+        }
+        closed_ = true;
+        if (partial_size_ != 0 || !terminal_sequence()) integrity_error_ = true;
+    }
+
+    const std::vector<DockerLaunchRecord>& records() const { return records_; }
+    bool integrity_error() const { return integrity_error_; }
+    bool closed() const { return closed_; }
+
+private:
+    static bool is_prefix(Stage stage, size_t count) {
+        if (count == 0 || count > 3) return false;
+        static constexpr Stage expected[] = {
+            Stage::BeforeLogOpen, Stage::RedirectsReady, Stage::BeforeExec};
+        return stage == expected[count - 1];
+    }
+
+    bool terminal_sequence() const {
+        if (records_.size() == 3 && is_prefix(static_cast<Stage>(records_[2].stage), 3))
+            return true;
+        if (records_.size() == 2 && records_[1].stage == static_cast<uint8_t>(Stage::LaunchError))
+            return records_[0].stage == static_cast<uint8_t>(Stage::BeforeLogOpen) &&
+                   records_[1].failed_stage == records_[0].stage && records_[1].error_number > 0;
+        if (records_.size() == 4 && records_[3].stage == static_cast<uint8_t>(Stage::LaunchError))
+            return records_[0].stage == static_cast<uint8_t>(Stage::BeforeLogOpen) &&
+                   records_[1].stage == static_cast<uint8_t>(Stage::RedirectsReady) &&
+                   records_[2].stage == static_cast<uint8_t>(Stage::BeforeExec) &&
+                   records_[3].failed_stage == records_[2].stage && records_[3].error_number > 0;
+        return false;
+    }
+
+    void accept(const DockerLaunchRecord& record) {
+        const uint8_t first = static_cast<uint8_t>(Stage::BeforeLogOpen);
+        const uint8_t terminal = static_cast<uint8_t>(Stage::LaunchError);
+        if (records_.size() >= 4 || record.magic != kDockerLaunchMagic || record.stage < first ||
+            record.stage > terminal || record.reserved != 0 ||
+            (record.stage != terminal && (record.failed_stage != 0 || record.error_number != 0)) ||
+            (record.stage == terminal &&
+             (record.failed_stage < first || record.failed_stage >= terminal ||
+              record.error_number <= 0))) {
+            integrity_error_ = true;
+            return;
+        }
+        if (closed_ || (records_.size() > 0 && records_.back().stage == terminal) ||
+            (record.stage != terminal &&
+             !is_prefix(static_cast<Stage>(record.stage), records_.size() + 1)) ||
+            (record.stage == terminal &&
+             !((records_.size() == 1 && records_[0].stage == first &&
+                record.failed_stage == first) ||
+               (records_.size() == 3 &&
+                records_[2].stage == static_cast<uint8_t>(Stage::BeforeExec) &&
+                record.failed_stage == static_cast<uint8_t>(Stage::BeforeExec))))) {
+            integrity_error_ = true;
+            return;
+        }
+        records_.push_back(record);
+    }
+
+    DockerLaunchRecord record_{};
+    size_t partial_size_ = 0;
+    std::vector<DockerLaunchRecord> records_;
+    bool closed_ = false;
+    bool integrity_error_ = false;
+};
+
 static bool poll_child(Child& child) {
     if (child.pid < 0) return child.reaped;
     if (child.reaped) return true;
@@ -942,15 +1043,7 @@ static DockerInfoResult run_docker_info_runner(const std::vector<std::string>& a
     DockerInfoResult result;
     result.configured_timeout_ms = timeout_ms;
     const auto started = std::chrono::steady_clock::now();
-    struct LaunchRecord {
-        uint32_t magic;
-        uint8_t stage;
-        uint8_t failed_stage;
-        uint16_t reserved;
-        int32_t error_number;
-    };
-    static constexpr uint32_t kLaunchMagic = 0x52555436u;
-    static_assert(sizeof(LaunchRecord) < PIPE_BUF);
+    static_assert(sizeof(DockerLaunchRecord) < PIPE_BUF);
     int status_pipe[2] = {-1, -1};
     const auto launch_failure = [&]() {
         if (status_pipe[0] >= 0) close(status_pipe[0]);
@@ -1013,11 +1106,11 @@ static DockerInfoResult run_docker_info_runner(const std::vector<std::string>& a
                                 DockerInfoResult::LaunchStage failed_stage =
                                     DockerInfoResult::LaunchStage::None,
                                 int error_number = 0) {
-                const LaunchRecord record{kLaunchMagic,
-                                          static_cast<uint8_t>(stage),
-                                          static_cast<uint8_t>(failed_stage),
-                                          0,
-                                          error_number};
+                const DockerLaunchRecord record{kDockerLaunchMagic,
+                                                static_cast<uint8_t>(stage),
+                                                static_cast<uint8_t>(failed_stage),
+                                                0,
+                                                error_number};
                 ssize_t n;
                 do {
                     n = write(status_pipe[1], &record, sizeof(record));
@@ -1056,66 +1149,34 @@ static DockerInfoResult run_docker_info_runner(const std::vector<std::string>& a
         result.child.status_valid = false;
     }
     const auto deadline = started + std::chrono::milliseconds(timeout_ms);
-    std::array<char, sizeof(LaunchRecord)> partial{};
-    size_t partial_size = 0;
+    DockerLaunchRecordDecoder decoder;
     auto drain_launch_channel = [&]() {
         if (result.launch_evidence_frozen) return;
         constexpr size_t kMaxDrainReads = 5;
         size_t drain_reads = 0;
         for (; drain_reads < kMaxDrainReads; ++drain_reads) {
-            char buffer[sizeof(LaunchRecord) * 4];
+            char buffer[sizeof(DockerLaunchRecord) * 4];
             const ssize_t n = read(status_pipe[0], buffer, sizeof(buffer));
             if (n > 0) {
-                size_t off = 0;
-                while (off < static_cast<size_t>(n)) {
-                    const size_t take =
-                        std::min(sizeof(LaunchRecord) - partial_size, static_cast<size_t>(n) - off);
-                    memcpy(partial.data() + partial_size, buffer + off, take);
-                    partial_size += take;
-                    off += take;
-                    if (partial_size != sizeof(LaunchRecord)) continue;
-                    LaunchRecord record;
-                    memcpy(&record, partial.data(), sizeof(record));
-                    partial_size = 0;
-                    const uint8_t kBeforeLogOpen =
-                        static_cast<uint8_t>(DockerInfoResult::LaunchStage::BeforeLogOpen);
-                    const uint8_t kLaunchError =
-                        static_cast<uint8_t>(DockerInfoResult::LaunchStage::LaunchError);
-                    if (result.launch_observations.size() >= 4 || record.magic != kLaunchMagic ||
-                        record.stage < kBeforeLogOpen || record.stage > kLaunchError ||
-                        record.reserved != 0 ||
-                        (record.stage != kLaunchError &&
-                         (record.failed_stage != 0 || record.error_number != 0)) ||
-                        (record.stage == kLaunchError &&
-                         (record.failed_stage < kBeforeLogOpen ||
-                          record.failed_stage >= kLaunchError || record.error_number <= 0))) {
-                        result.launch_integrity_error = true;
-                        continue;
-                    }
-                    const auto stage = static_cast<DockerInfoResult::LaunchStage>(record.stage);
-                    const auto failed =
-                        static_cast<DockerInfoResult::LaunchStage>(record.failed_stage);
-                    const auto order = [&](DockerInfoResult::LaunchStage s) {
-                        return static_cast<unsigned>(s);
-                    };
-                    if (stage != DockerInfoResult::LaunchStage::LaunchError &&
-                        !result.launch_observations.empty() &&
-                        order(stage) <= order(result.launch_observations.back().stage))
-                        result.launch_integrity_error = true;
+                const size_t before = decoder.records().size();
+                decoder.feed(buffer, static_cast<size_t>(n));
+                const u64 observed_ns =
+                    static_cast<u64>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                         std::chrono::steady_clock::now() - started)
+                                         .count());
+                for (size_t i = before; i < decoder.records().size(); ++i) {
+                    const DockerLaunchRecord& record = decoder.records()[i];
                     result.launch_observations.push_back(
-                        {stage,
-                         failed,
+                        {static_cast<DockerInfoResult::LaunchStage>(record.stage),
+                         static_cast<DockerInfoResult::LaunchStage>(record.failed_stage),
                          record.error_number,
-                         static_cast<u64>(std::chrono::duration_cast<std::chrono::nanoseconds>(
-                                              std::chrono::steady_clock::now() - started)
-                                              .count())});
+                         observed_ns});
                 }
                 continue;
             }
             if (n == 0) {
                 result.launch_channel_closed = true;
                 if (!result.child.reaped) result.launch_channel_closed_before_cleanup = true;
-                if (partial_size != 0) result.launch_integrity_error = true;
             } else if (errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR) {
                 result.launch_integrity_error = true;
             }
@@ -1191,23 +1252,12 @@ static DockerInfoResult run_docker_info_runner(const std::vector<std::string>& a
         usleep(5'000);
     }
     if (!result.launch_evidence_frozen) drain_launch_channel();
+    if (result.launch_channel_closed) decoder.finalize_eof();
+    result.launch_integrity_error = result.launch_integrity_error || decoder.integrity_error();
     const auto stage = [&](size_t index) {
         return index < result.launch_observations.size() ? result.launch_observations[index].stage
                                                          : DockerInfoResult::LaunchStage::None;
     };
-    if (result.launch_channel_closed) {
-        const size_t count = result.launch_observations.size();
-        const bool prefix =
-            count >= 1 && count <= 4 && stage(0) == DockerInfoResult::LaunchStage::BeforeLogOpen &&
-            (count < 2 || stage(1) == DockerInfoResult::LaunchStage::RedirectsReady) &&
-            (count < 3 || stage(2) == DockerInfoResult::LaunchStage::BeforeExec);
-        const bool normal = count == 3;
-        const bool launch_error =
-            count >= 2 && stage(count - 1) == DockerInfoResult::LaunchStage::LaunchError &&
-            result.launch_observations.back().failed_stage == stage(count - 2);
-        if (!prefix || (!normal && !launch_error)) result.launch_integrity_error = true;
-    }
-    if (result.launch_observations.size() > 4) result.launch_integrity_error = true;
     close(status_pipe[0]);
     status_pipe[0] = -1;
     if (status_pipe[0] >= 0) close(status_pipe[0]);
@@ -1570,6 +1620,108 @@ static bool run_docker_info_preflight_self_check(std::string& error) {
         ordered.launch_observations[1].stage != DockerInfoResult::LaunchStage::RedirectsReady ||
         ordered.launch_observations[2].stage != DockerInfoResult::LaunchStage::BeforeExec) {
         error = "ordered launch-channel success control failed";
+        cleanup();
+        return false;
+    }
+    const auto protocol_record = [](DockerInfoResult::LaunchStage stage,
+                                    DockerInfoResult::LaunchStage failed =
+                                        DockerInfoResult::LaunchStage::None,
+                                    int error_number = 0) {
+        return DockerLaunchRecord{kDockerLaunchMagic,
+                                  static_cast<uint8_t>(stage),
+                                  static_cast<uint8_t>(failed),
+                                  0,
+                                  error_number};
+    };
+    const auto protocol_check = [&](const std::vector<DockerLaunchRecord>& records,
+                                    bool valid,
+                                    size_t expected_count) {
+        DockerLaunchRecordDecoder decoder;
+        for (const DockerLaunchRecord& record : records) {
+            const char* bytes = reinterpret_cast<const char*>(&record);
+            for (size_t offset = 0; offset < sizeof(record); ++offset)
+                decoder.feed(bytes + offset, 1);
+        }
+        decoder.finalize_eof();
+        return decoder.integrity_error() == !valid && decoder.records().size() == expected_count;
+    };
+    const auto normal_records = std::vector<DockerLaunchRecord>{
+        protocol_record(DockerInfoResult::LaunchStage::BeforeLogOpen),
+        protocol_record(DockerInfoResult::LaunchStage::RedirectsReady),
+        protocol_record(DockerInfoResult::LaunchStage::BeforeExec)};
+    const auto log_error_records = std::vector<DockerLaunchRecord>{
+        protocol_record(DockerInfoResult::LaunchStage::BeforeLogOpen),
+        protocol_record(DockerInfoResult::LaunchStage::LaunchError,
+                        DockerInfoResult::LaunchStage::BeforeLogOpen,
+                        EISDIR)};
+    const auto exec_error_records =
+        std::vector<DockerLaunchRecord>{normal_records[0],
+                                        normal_records[1],
+                                        normal_records[2],
+                                        protocol_record(DockerInfoResult::LaunchStage::LaunchError,
+                                                        DockerInfoResult::LaunchStage::BeforeExec,
+                                                        ENOENT)};
+    DockerLaunchRecordDecoder open_prefix;
+    open_prefix.feed(&normal_records[0], sizeof(normal_records[0]));
+    if (!protocol_check(normal_records, true, 3) || !protocol_check(log_error_records, true, 2) ||
+        !protocol_check(exec_error_records, true, 4) || open_prefix.integrity_error() ||
+        open_prefix.records().size() != 1) {
+        error = "fixed launch-record positive/partial controls failed";
+        cleanup();
+        return false;
+    }
+    std::vector<DockerLaunchRecord> bad = normal_records;
+    bad[0].magic ^= 1u;
+    if (!protocol_check(bad, false, 0)) {
+        error = "bad-magic launch control failed";
+        cleanup();
+        return false;
+    }
+    const auto expect_reject = [&](std::vector<DockerLaunchRecord> candidate, const char* label) {
+        if (!protocol_check(candidate, false, 0)) {
+            error = std::string(label) + " launch control failed";
+            cleanup();
+            return false;
+        }
+        return true;
+    };
+    bad = normal_records;
+    bad[0].stage = 9;
+    if (!expect_reject(bad, "unknown-stage") ||
+        !expect_reject({DockerLaunchRecord{kDockerLaunchMagic, 1, 0, 1, 0}}, "reserved") ||
+        !expect_reject({DockerLaunchRecord{kDockerLaunchMagic, 1, 0, 0, 1}}, "non-error-errno") ||
+        !expect_reject({DockerLaunchRecord{kDockerLaunchMagic, 1, 4, 0, 0}},
+                       "invalid-error-stage") ||
+        !expect_reject({DockerLaunchRecord{kDockerLaunchMagic, 1, 1, 0, 0}}, "missing-error") ||
+        !expect_reject({DockerLaunchRecord{kDockerLaunchMagic, 1, 0, 0, 0},
+                        protocol_record(DockerInfoResult::LaunchStage::LaunchError,
+                                        DockerInfoResult::LaunchStage::BeforeLogOpen,
+                                        0)},
+                       "invalid-error-errno") ||
+        !expect_reject({normal_records[0], normal_records[0]}, "repeated-stage") ||
+        !expect_reject({normal_records[0], normal_records[2]}, "out-of-order-stage")) {
+        return false;
+    }
+    DockerLaunchRecordDecoder truncated;
+    truncated.feed(&normal_records[0], sizeof(normal_records[0]) - 1);
+    truncated.finalize_eof();
+    if (!truncated.integrity_error() || !truncated.records().empty()) {
+        error = "truncated-eof launch control failed";
+        cleanup();
+        return false;
+    }
+    DockerLaunchRecordDecoder after_terminal;
+    after_terminal.feed(log_error_records.data(), sizeof(DockerLaunchRecord) * 2);
+    after_terminal.feed(&normal_records[1], sizeof(normal_records[1]));
+    if (!after_terminal.integrity_error() || after_terminal.records().size() != 2) {
+        error = "record-after-terminal launch control failed";
+        cleanup();
+        return false;
+    }
+    std::vector<DockerLaunchRecord> fifth = exec_error_records;
+    fifth.push_back(normal_records[0]);
+    if (!protocol_check(fifth, false, 4)) {
+        error = "fifth-record-overflow launch control failed";
         cleanup();
         return false;
     }
