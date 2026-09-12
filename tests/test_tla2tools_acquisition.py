@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import hashlib
 import http.server
+import os
 import pathlib
 import socketserver
 import subprocess
@@ -63,6 +64,13 @@ class Fixture(http.server.BaseHTTPRequestHandler):
 
 class Loopback(unittest.TestCase):
     def setUp(self) -> None:
+        self._proxy_environment = {
+            key: os.environ.get(key)
+            for key in ("NO_PROXY", "no_proxy")
+        }
+        self.addCleanup(self._restore_proxy_environment)
+        os.environ["NO_PROXY"] = "127.0.0.1,localhost"
+        os.environ["no_proxy"] = "127.0.0.1,localhost"
         Fixture.mode = "valid"
         Fixture.requests = 0
         Fixture.stall_release = threading.Event()
@@ -81,10 +89,18 @@ class Loopback(unittest.TestCase):
         self.assertFalse(self.thread.is_alive())
         self.tmp_handle.cleanup()
 
+    def _restore_proxy_environment(self) -> None:
+        for key, value in self._proxy_environment.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
+
     def test_valid_download_publishes_atomically(self) -> None:
         destination = self.tmp / "tools.jar"
         acquire(self.url, destination, hashlib.sha256(PAYLOAD).hexdigest())
         self.assertEqual(destination.read_bytes(), PAYLOAD)
+        self.assertEqual(Fixture.requests, 1)
         self.assertEqual(list(self.tmp.glob("*.part")), [])
 
     def test_wrong_hash_and_truncated_transfer_preserve_destination(self) -> None:
@@ -160,6 +176,7 @@ class Loopback(unittest.TestCase):
                 retries=0,
             )
         self.assertLess(time.monotonic() - started, 2)
+        self.assertEqual(Fixture.requests, 1)
         self.assertEqual(list(self.tmp.glob("*.part")), [])
 
     def test_cli_preserves_terminal_curl_status(self) -> None:
