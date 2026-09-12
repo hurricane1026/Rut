@@ -5846,6 +5846,8 @@ struct KeepAlivePinnedRecorder {
         first_peer_closed_ns.store(0, std::memory_order_relaxed);
         second_complete_sent_ns.store(0, std::memory_order_relaxed);
         head_publication_ns.store(0, std::memory_order_relaxed);
+        head_publication_count.store(0, std::memory_order_relaxed);
+        head_peer_close_count.store(0, std::memory_order_relaxed);
         head_publish_permit.store(false, std::memory_order_relaxed);
         head_peer_open_ack.store(false, std::memory_order_relaxed);
         head_probe_request.store(false, std::memory_order_relaxed);
@@ -74689,7 +74691,8 @@ static bool run_pinned_nginx_bodyless_head_delayed_completion_oracle(std::string
         {"hardcoded 1s/504",
          [](HeadAcceptanceObservation& x) {
              x.publication_ns = x.origin_ns + 1'000'000'000ull;
-             x.wire.assign("HTTP/1.1 504 Gateway Timeout\r\n\r\n");
+             static constexpr char k504[] = "HTTP/1.1 504 Gateway Timeout\r\n\r\n";
+             x.wire.assign(k504, k504 + sizeof(k504) - 1u);
          }},
         {"late ledger",
          [](HeadAcceptanceObservation& x) { x.access_ns = x.header_ns + 250'000'000ull; }},
@@ -74936,7 +74939,8 @@ static bool run_pinned_nginx_bodyless_head_delayed_completion_oracle(std::string
     const u64 stable_deadline = header_complete_ns + 2'250'000'000ull;
     u64 quiet_until_ns = 0u;
     while (steady_now_ns() < stable_deadline) {
-        if (!observe_client_open_and_quiet_nonconsuming(client, 50, error)) {
+        if (!observe_client_open_and_quiet_nonconsuming(client, 50, error) ||
+            poll_child(nginx.child) || !origin.thread_alive.load(std::memory_order_acquire)) {
             error = "#630 downstream emitted body/tail or closed during keep-alive observation";
             close(client);
             return false;
@@ -74998,9 +75002,9 @@ static bool run_pinned_nginx_bodyless_head_delayed_completion_oracle(std::string
         validate_head_acceptance(actual,
                                  std::vector<char>(kExpected, kExpected + sizeof(kExpected) - 1u),
                                  acceptance_detail);
-    const bool live_snapshot_ok = final_quiet && final_ledger_ok &&
-                                  origin.thread_alive.load(std::memory_order_acquire) &&
-                                  !origin.listener_failed.load(std::memory_order_acquire);
+    const bool live_snapshot_ok =
+        final_quiet && final_ledger_ok && origin.thread_alive.load(std::memory_order_acquire) &&
+        !origin.listener_failed.load(std::memory_order_acquire) && !poll_child(nginx.child);
     close(client);
     origin.stop();
     if (origin.history.size() != 1u ||
