@@ -72966,18 +72966,16 @@ static bool run_custom_hide_timeout_two_second_timing_self_check(std::string& er
         2u, 1'000'000'000ull, 2'200'000'000ull, 4'200'000'000ull);
     const bool hardcoded_one_second = !custom_hide_timeout_timing_tuple_valid(
         2u, 1'000'000'000ull, 2'200'000'000ull, 3'200'000'000ull);
-    const bool missing_refresh = !custom_hide_timeout_timing_tuple_valid(
+    const bool initial_deadline_without_refresh = !custom_hide_timeout_timing_tuple_valid(
         2u, 1'000'000'000ull, 2'200'000'000ull, 3'000'000'000ull);
     const bool late_expiry = !custom_hide_timeout_timing_tuple_valid(
         2u, 1'000'000'000ull, 2'200'000'000ull, 4'950'000'000ull);
-    const bool initial_deadline = !custom_hide_timeout_timing_tuple_valid(
-        2u, 1'000'000'000ull, 2'200'000'000ull, 3'000'000'000ull);
     const bool fragment_bounds =
         custom_hide_timeout_fragment_gap_valid(2u, 1'000'000'000ull, 2'200'000'000ull) &&
         custom_hide_timeout_fragment_gap_valid(2u, 2'200'000'000ull, 3'400'000'000ull) &&
         !custom_hide_timeout_fragment_gap_valid(2u, 1'000'000'000ull, 2'000'000'000ull) &&
         !custom_hide_timeout_fragment_gap_valid(2u, 1'000'000'000ull, 2'400'000'000ull);
-    if (!(positive && hardcoded_one_second && missing_refresh && late_expiry && initial_deadline &&
+    if (!(positive && hardcoded_one_second && initial_deadline_without_refresh && late_expiry &&
           fragment_bounds)) {
         error = "#627 2s timing predicate self-check accepted a synthetic timing mutant";
         return false;
@@ -73855,8 +73853,10 @@ static bool run_pinned_nginx_custom_hide_timeout_probe(
         error = "#270 custom-hide timeout probe lost downstream open state after W2";
         return false;
     }
-    const u64 quiet_horizon_ns =
-        std::max(first_ns + quiet_horizon_from_first_ns, second_ns + quiet_horizon_from_second_ns);
+    const u64 quiet_horizon_ns = timeout_seconds == 2u
+                                     ? std::max(first_ns + quiet_horizon_from_first_ns,
+                                                second_ns + quiet_horizon_from_second_ns)
+                                     : first_ns + 1'100'000'000ull;
     while (steady_now_ns() < quiet_horizon_ns) {
         std::string quiet_access;
         if (!origin_live() || poll_child(nginx.child) ||
@@ -73920,8 +73920,8 @@ static bool run_pinned_nginx_custom_hide_timeout_probe(
     const bool timing_tuple_mutant_rejected =
         !expiry_timing_tuple_valid(
             first_ns,
-            first_ns + (timeout_seconds == 2u ? 1'000'000'000ull : 400'000'000ull),
-            observed_ns) &&
+            second_ns,
+            timeout_seconds == 2u ? second_ns + 1'000'000'000ull : first_ns + 1'000'000'000ull) &&
         !expiry_timing_tuple_valid(first_ns, second_ns, second_ns + expiry_max_from_second_ns);
     std::string access;
     const bool access_read = read_request_length_access_file(temp.nginx_access_log, access, error);
@@ -73961,10 +73961,14 @@ static bool run_pinned_nginx_custom_hide_timeout_probe(
                                            !response_matches_expiry_contract(leaked_header) &&
                                            !response_matches_expiry_contract(missing_unrelated) &&
                                            !response_matches_expiry_contract(body_corruption);
-    const bool timing_mutants_rejected = timing_tuple_positive && timing_tuple_mutant_rejected &&
-                                         !expiry_timing_is_valid(cross_fragment_min_ns - 1u) &&
-                                         !expiry_timing_is_valid(expiry_min_from_second_ns - 1u) &&
-                                         !expiry_timing_is_valid(expiry_max_from_second_ns);
+    const bool timing_mutants_rejected =
+        timing_tuple_positive && timing_tuple_mutant_rejected &&
+        !expiry_timing_is_valid(timeout_seconds == 2u ? cross_fragment_min_ns - 1u
+                                                      : 400'000'000ull) &&
+        !expiry_timing_is_valid(timeout_seconds == 2u ? expiry_min_from_second_ns - 1u
+                                                      : 749'999'999ull) &&
+        !expiry_timing_is_valid(timeout_seconds == 2u ? expiry_max_from_second_ns
+                                                      : 2'000'000'000ull);
     const std::string expected_upstream =
         "GET /buffered-timeout?q=1 HTTP/1.1\r\nHost: 127.0.0.1:" + std::to_string(backend_port) +
         "\r\n\r\n";
