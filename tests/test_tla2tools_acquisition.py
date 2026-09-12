@@ -67,7 +67,8 @@ class Loopback(unittest.TestCase):
         Fixture.requests = 0
         Fixture.stall_release = threading.Event()
         self.server = socketserver.ThreadingTCPServer(("127.0.0.1", 0), Fixture)
-        self.server.daemon_threads = True
+        self.server.daemon_threads = False
+        self.server.block_on_close = False
         self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
         self.thread.start()
         self.url = f"http://127.0.0.1:{self.server.server_address[1]}/artifact"
@@ -80,6 +81,9 @@ class Loopback(unittest.TestCase):
         self.server.server_close()
         self.thread.join(timeout=2)
         self.assertFalse(self.thread.is_alive())
+        for request_thread in getattr(self.server, "_threads", ()):
+            request_thread.join(timeout=2)
+            self.assertFalse(request_thread.is_alive())
         self.tmp_handle.cleanup()
 
     def test_valid_download_publishes_atomically(self) -> None:
@@ -92,7 +96,7 @@ class Loopback(unittest.TestCase):
         destination = self.tmp / "tools.jar"
         destination.write_bytes(b"old artifact")
         with self.assertRaises(ChecksumError):
-            acquire(self.url, destination, "0" * 64, retries=0)
+            acquire(self.url, destination, "0" * 64)
         self.assertEqual(destination.read_bytes(), b"old artifact")
         self.assertEqual(Fixture.requests, 1)
         Fixture.requests = 0
@@ -123,25 +127,35 @@ class Loopback(unittest.TestCase):
 
     def test_retry_policy_exhausts_at_most_four_requests(self) -> None:
         tls_server = socketserver.ThreadingTCPServer(("127.0.0.1", 0), TLSReset)
-        tls_server.daemon_threads = True
+        tls_server.daemon_threads = False
+        tls_server.block_on_close = False
         tls_thread = threading.Thread(target=tls_server.serve_forever, daemon=True)
         tls_thread.start()
         tls_url = f"https://127.0.0.1:{tls_server.server_address[1]}/artifact"
-        old = subprocess.run(
-            ["curl", "--fail", "--location", "--retry", "3", "--output", "/dev/null", tls_url],
-            check=False,
-        )
-        self.assertEqual(old.returncode, 35)
-        self.assertEqual(TLSReset.requests, 1)
-        TLSReset.requests = 0
-        with self.assertRaises(AcquisitionError) as failure:
-            acquire(tls_url, self.tmp / "tools.jar", "0" * 64)
-        self.assertEqual(failure.exception.returncode, 35)
-        self.assertEqual(TLSReset.requests, 4)
-        tls_server.shutdown()
-        tls_server.server_close()
-        tls_thread.join(timeout=2)
-        self.assertFalse(tls_thread.is_alive())
+        try:
+            old = subprocess.run(
+                [
+                    "curl", "--fail", "--location", "--retry", "3",
+                    "--connect-timeout", "10", "--max-time", "30",
+                    "--output", "/dev/null", tls_url,
+                ],
+                check=False,
+            )
+            self.assertEqual(old.returncode, 35)
+            self.assertEqual(TLSReset.requests, 1)
+            TLSReset.requests = 0
+            with self.assertRaises(AcquisitionError) as failure:
+                acquire(tls_url, self.tmp / "tools.jar", "0" * 64)
+            self.assertEqual(failure.exception.returncode, 35)
+            self.assertEqual(TLSReset.requests, 4)
+        finally:
+            tls_server.shutdown()
+            tls_server.server_close()
+            tls_thread.join(timeout=2)
+            self.assertFalse(tls_thread.is_alive())
+            for request_thread in getattr(tls_server, "_threads", ()):
+                request_thread.join(timeout=2)
+                self.assertFalse(request_thread.is_alive())
 
     def test_stalled_transfer_has_short_bound_and_cleans_staging(self) -> None:
         Fixture.mode = "stall"
