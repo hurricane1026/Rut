@@ -78722,6 +78722,8 @@ int main(int argc, char** argv) {
         argc == 2 && strcmp(argv[1], "--pinned-nginx-lifecycle-self-check") == 0;
     const bool docker_info_preflight_self_check =
         argc == 2 && strcmp(argv[1], "--docker-info-preflight-self-check") == 0;
+    const bool docker_info_launch_diagnostic =
+        argc == 2 && strcmp(argv[1], "--docker-info-launch-diagnostic") == 0;
     const bool zero_response_stall_self_check =
         argc == 2 && strcmp(argv[1], "--zero-response-stall-self-check") == 0;
     const bool gated_fragment_peer_probe_self_check =
@@ -78942,17 +78944,18 @@ int main(int argc, char** argv) {
         (argc == 2 && argv[1][0] == '/') ||
         (argc == 4 && argv[1][0] == '/' && argv[2][0] == '/' && argv[3][0] == '/');
     if ((!nginx_preload_loader_preflight && !nginx_gate_spike && !nginx_coalesced_ingress_gate &&
-         !docker_info_preflight_self_check && !rut_iouring_gate_recv_owner_diagnostics_self_check &&
-         !exact_local_return_baseline && !root_proxy_trace_oracle && !api_proxy_trace_oracle &&
-         !exact_absolute_redirect_oracle && !exact_absolute_redirect_302_oracle &&
-         !api_non_root_proxy_uri_oracle && !service_root_proxy_uri_oracle &&
-         !wildcard_service_no_uri_oracle && !converter_wildcard_service_no_uri_differential &&
-         !static_query_proxy_uri_oracle && !zero_suffix_static_query_proxy_uri_oracle &&
-         !empty_query_proxy_uri_oracle && !root_empty_query_proxy_uri_oracle &&
-         !proxy_hide_header_oracle && !proxy_hide_header_name_oracle &&
-         !proxy_hide_header_source_self_check && !proxy_hide_header_generated_side_self_check &&
-         !explicit_timeout_head_source_self_check && !explicit_timeout_head_generated_episode &&
-         !explicit_timeout_head_phase_differential && !keepalive_timeout_head_differential &&
+         !docker_info_preflight_self_check && !docker_info_launch_diagnostic &&
+         !rut_iouring_gate_recv_owner_diagnostics_self_check && !exact_local_return_baseline &&
+         !root_proxy_trace_oracle && !api_proxy_trace_oracle && !exact_absolute_redirect_oracle &&
+         !exact_absolute_redirect_302_oracle && !api_non_root_proxy_uri_oracle &&
+         !service_root_proxy_uri_oracle && !wildcard_service_no_uri_oracle &&
+         !converter_wildcard_service_no_uri_differential && !static_query_proxy_uri_oracle &&
+         !zero_suffix_static_query_proxy_uri_oracle && !empty_query_proxy_uri_oracle &&
+         !root_empty_query_proxy_uri_oracle && !proxy_hide_header_oracle &&
+         !proxy_hide_header_name_oracle && !proxy_hide_header_source_self_check &&
+         !proxy_hide_header_generated_side_self_check && !explicit_timeout_head_source_self_check &&
+         !explicit_timeout_head_generated_episode && !explicit_timeout_head_phase_differential &&
+         !keepalive_timeout_head_differential &&
          !keepalive_timeout_get_initial_deadline_differential &&
          !fixed_upload_head_success_differential &&
          !fixed_upload_head_zero_response_timeout_differential &&
@@ -79204,6 +79207,7 @@ int main(int argc, char** argv) {
                "   or: test_nginx_differential --pinned-nginx-custom-hide-timeout-2s-oracle\n"
                "   or: test_nginx_differential "
                "--pinned-nginx-bodyless-head-delayed-completion-oracle\n"
+               "   or: test_nginx_differential --docker-info-launch-diagnostic\n"
                "   or: test_nginx_differential "
                "--converter-custom-hide-timeout-explicit-buffering-cli-differential "
                "<absolute-rut-executable> <absolute-converter-executable>\n"
@@ -79768,6 +79772,17 @@ int main(int argc, char** argv) {
     if (!temp.create()) {
         std::cerr << "FAIL [preflight]: secure temporary directory creation failed\n";
         return 1;
+    }
+    if (docker_info_launch_diagnostic) {
+        std::cerr << "Docker launch diagnostic: NOT ACCEPTANCE (one bounded docker info launch)\n";
+        DockerInfoResult result =
+            run_docker_info_runner({"docker", "info"}, temp.preflight_log, 10'000);
+        (void)read_docker_snapshot(
+            temp.preflight_log, result.snapshot, result.snapshot_error, result.snapshot_state);
+        print_docker_info_result(result);
+        const DockerInfoDecision decision = docker_info_decision(result);
+        const char* required = getenv("RUT_NGINX_DIFFERENTIAL_REQUIRED");
+        return docker_info_return_code(decision, required && strcmp(required, "1") == 0);
     }
     if (!run_normalize_date_self_checks()) return 1;
     if (!run_two_response_diagnostic_self_check()) return 1;
