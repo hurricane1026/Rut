@@ -8,10 +8,20 @@ on:
   # so this takes effect as soon as the branch carries this change.
   pull_request:
   workflow_dispatch:
+    inputs:
+      mode:
+        description: 'Manual run mode'
+        required: true
+        default: ci
+        type: choice
+        options:
+          - ci
+          - docker-launch-diagnostic
 
 jobs:
   format:
     name: clang-format
+    if: github.event_name != 'workflow_dispatch' || inputs.mode == 'ci'
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v6
@@ -35,6 +45,7 @@ jobs:
 
   lint:
     name: clang-tidy
+    if: github.event_name != 'workflow_dispatch' || inputs.mode == 'ci'
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v6
@@ -65,6 +76,7 @@ jobs:
 
   runtime-state-model:
     name: Runtime state model
+    if: github.event_name != 'workflow_dispatch' || inputs.mode == 'ci'
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v6
@@ -77,18 +89,15 @@ jobs:
 
       - name: Download TLA+ tools
         run: |
-          TLA2TOOLS_VERSION=v1.7.4
-          TLA2TOOLS_SHA256=936a262061c914694dfd669a543be24573c45d5aa0ff20a8b96b23d01e050e88
-          curl --fail --location --retry 3 \
-            --output /tmp/tla2tools.jar \
-            "https://github.com/tlaplus/tlaplus/releases/download/${TLA2TOOLS_VERSION}/tla2tools.jar"
-          printf '%s  %s\n' "$TLA2TOOLS_SHA256" /tmp/tla2tools.jar | sha256sum --check
+          python3 -m unittest tests/test_tla2tools_acquisition.py
+          python3 scripts/acquire_tla2tools.py /tmp/tla2tools.jar
 
       - name: Check runtime state model
         run: TLA2TOOLS_JAR=/tmp/tla2tools.jar python3 scripts/check_runtime_state_model.py
 
   test:
     name: Build & Test
+    if: github.event_name != 'workflow_dispatch' || inputs.mode == 'ci'
     runs-on: ubuntu-24.04
     strategy:
       matrix:
@@ -128,6 +137,7 @@ jobs:
 
   nginx-required:
     name: Required pinned nginx differentials
+    if: github.event_name != 'workflow_dispatch' || inputs.mode == 'ci'
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     steps:
@@ -191,8 +201,93 @@ jobs:
           RUT_NGINX_DIFFERENTIAL_REQUIRED=1 \
           ctest --test-dir build --output-on-failure --no-tests=error -j 1 --timeout 120 -L nginx
 
+  docker-launch-diagnostic:
+    name: Docker launch diagnostic — not acceptance
+    if: github.event_name == 'workflow_dispatch' && inputs.mode == 'docker-launch-diagnostic'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          submodules: recursive
+
+      - name: Install tools
+        run: |
+          wget -qO- https://apt.llvm.org/llvm-snapshot.gpg.key | sudo tee /etc/apt/trusted.gpg.d/llvm.asc > /dev/null
+          echo "deb https://apt.llvm.org/noble/ llvm-toolchain-noble-21 main" | \
+            sudo tee /etc/apt/sources.list.d/llvm.list
+          sudo apt-get update
+          sudo apt-get install -y cmake ninja-build llvm-21-dev libboost-dev ragel
+
+      - name: Provision exact pinned nginx image
+        run: |
+          set -euo pipefail
+          mapfile -t pinned_images < tests/pinned-nginx-image.txt
+          if (( ${#pinned_images[@]} != 1 )); then
+            echo "tests/pinned-nginx-image.txt must contain exactly one image reference" >&2
+            exit 1
+          fi
+          image=${pinned_images[0]}
+          if [[ ! "$image" =~ ^nginx@sha256:[0-9a-f]{64}$ ]]; then
+            echo "invalid pinned nginx image reference" >&2
+            exit 1
+          fi
+          for attempt in 1 2 3; do
+            if docker pull "$image"; then
+              break
+            fi
+            if (( attempt == 3 )); then
+              echo "failed to pull the pinned nginx image after ${attempt} attempts" >&2
+              exit 1
+            fi
+            sleep $((attempt * 5))
+          done
+          docker image inspect "$image" > /dev/null
+          docker image inspect --format '{{range .RepoDigests}}{{println .}}{{end}}' "$image" | \
+            grep -Fqx -- "$image"
+
+      - name: Configure
+        run: |
+          cmake -B build -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DRUT_ENABLE_JIT=ON \
+            -DLLVM_DIR=/usr/lib/llvm-21/lib/cmake/llvm
+
+      - name: Build nginx differential target
+        run: ninja -C build test_nginx_parser test_nginx_convert test_nginx_differential
+
+      - name: Run Docker launch diagnostic (not acceptance)
+        run: |
+          set -o pipefail
+          set +e
+          {
+            echo "git rev-parse HEAD: $(git rev-parse HEAD)"
+            echo "requested ref: ${{ github.ref }}"
+            ./build/tests/test_nginx_differential --docker-info-launch-diagnostic
+          } 2>&1 | tee docker-launch-diagnostic.log
+          pipeline_status=("${PIPESTATUS[@]}")
+          diagnostic_status=${pipeline_status[0]}
+          tee_status=${pipeline_status[1]}
+          report_status=0
+          echo "diagnostic exit status: ${diagnostic_status}" | tee -a docker-launch-diagnostic.log || report_status=$?
+          if (( tee_status != 0 || report_status != 0 )); then
+            echo "diagnostic evidence log write failed" >&2
+            exit 1
+          fi
+          exit "${diagnostic_status}"
+
+      - name: Upload Docker launch diagnostic evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: docker-launch-diagnostic
+          path: docker-launch-diagnostic.log
+          if-no-files-found: warn
+          retention-days: 7
+
   test-no-jit:
     name: Build & Test (no JIT)
+    if: github.event_name != 'workflow_dispatch' || inputs.mode == 'ci'
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v6
@@ -214,6 +309,7 @@ jobs:
 
   test-no-websocket:
     name: Build & Test (no WebSocket)
+    if: github.event_name != 'workflow_dispatch' || inputs.mode == 'ci'
     runs-on: ubuntu-24.04
     # RUT_ENABLE_WEBSOCKET=0 is a shipped config (minimal mesh sidecars that never
     # proxy WebSocket). Build it so the #if RUT_ENABLE_WEBSOCKET runtime paths compile
@@ -236,6 +332,7 @@ jobs:
 
   sanitizer:
     name: Sanitizer (ASan+UBSan)
+    if: github.event_name != 'workflow_dispatch' || inputs.mode == 'ci'
     runs-on: ubuntu-24.04
     # ubuntu-24.04 has a 6.x kernel, so the real-io_uring integration tests
     # (proxy-over-TLS keep-alive, watermark backpressure, recv re-arm) actually
@@ -264,6 +361,7 @@ jobs:
 
   bench-proxy:
     name: Proxy keep-alive bench (TLS, io_uring)
+    if: github.event_name != 'workflow_dispatch' || inputs.mode == 'ci'
     runs-on: ubuntu-24.04
     # Informational — proxy latency/throughput numbers go to the log so a change
     # off the per-byte path (e.g. cancel-by-fd) can be eyeballed against history.
@@ -292,6 +390,7 @@ jobs:
 
   bench-simd-x86:
     name: SIMD scan_uri bench (x86)
+    if: github.event_name != 'workflow_dispatch' || inputs.mode == 'ci'
     runs-on: ubuntu-24.04
     # Informational — perf numbers go to the log so reviewers can see
     # SIMD speedup across ISAs side-by-side. Doesn't fail on regression
@@ -405,6 +504,7 @@ jobs:
 
   bench-simd-arm:
     name: SIMD scan_uri bench (arm64)
+    if: github.event_name != 'workflow_dispatch' || inputs.mode == 'ci'
     runs-on: ubuntu-24.04-arm
     # GitHub-hosted ubuntu-24.04-arm runners are Cobalt 100 (Neoverse N2)
     # with NEON. SVE may or may not be exposed depending on the runner
@@ -508,6 +608,7 @@ jobs:
 
   coverage:
     name: Code Coverage
+    if: github.event_name != 'workflow_dispatch' || inputs.mode == 'ci'
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v6
