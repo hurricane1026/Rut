@@ -1117,6 +1117,7 @@ static DockerInfoResult run_docker_info_runner(const std::vector<std::string>& a
     argv.reserve(args.size() + 1);
     for (const auto& arg : args) argv.push_back(const_cast<char*>(arg.c_str()));
     argv.push_back(nullptr);
+    const pid_t expected_parent = getpid();
     {
         const pid_t pid = fork();
         if (pid < 0) {
@@ -1144,10 +1145,18 @@ static DockerInfoResult run_docker_info_runner(const std::vector<std::string>& a
                 } while (n < 0 && errno == EINTR);
             };
             if (protect_inner_parent && prctl(PR_SET_PDEATHSIG, SIGKILL) != 0) {
+                const int saved_errno = errno;
                 announce(DockerInfoResult::LaunchStage::BeforeLogOpen);
                 announce(DockerInfoResult::LaunchStage::LaunchError,
                          DockerInfoResult::LaunchStage::BeforeLogOpen,
-                         errno);
+                         saved_errno);
+                _exit(127);
+            }
+            if (protect_inner_parent && getppid() != expected_parent) {
+                announce(DockerInfoResult::LaunchStage::BeforeLogOpen);
+                announce(DockerInfoResult::LaunchStage::LaunchError,
+                         DockerInfoResult::LaunchStage::BeforeLogOpen,
+                         ECHILD);
                 _exit(127);
             }
             announce(DockerInfoResult::LaunchStage::BeforeLogOpen);
@@ -1175,8 +1184,8 @@ static DockerInfoResult run_docker_info_runner(const std::vector<std::string>& a
                      errno);
             _exit(127);
         }
-        close(status_pipe[1]);
-        status_pipe[1] = -1;
+        const bool write_pipe_closed = close_owned_fd(status_pipe[1]);
+        result.status_pipe_closed = result.status_pipe_closed && write_pipe_closed;
         result.child.pid = pid;
         result.child.log_path = log_path;
         result.child.reaped = false;
