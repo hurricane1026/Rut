@@ -258,7 +258,7 @@ jobs:
             -DLLVM_DIR=/usr/lib/llvm-21/lib/cmake/llvm
 
       - name: Build nginx differential target
-        run: ninja -C build test_nginx_differential
+        run: ninja -C build test_nginx_parser test_nginx_convert test_nginx_differential
 
       - name: Run Docker launch diagnostic (not acceptance)
         run: |
@@ -269,8 +269,15 @@ jobs:
             echo "requested ref: ${{ github.ref }}"
             ./build/tests/test_nginx_differential --docker-info-launch-diagnostic
           } 2>&1 | tee docker-launch-diagnostic.log
-          diagnostic_status=${PIPESTATUS[0]}
-          echo "diagnostic exit status: ${diagnostic_status}" | tee -a docker-launch-diagnostic.log
+          pipeline_status=("${PIPESTATUS[@]}")
+          diagnostic_status=${pipeline_status[0]}
+          tee_status=${pipeline_status[1]}
+          report_status=0
+          echo "diagnostic exit status: ${diagnostic_status}" | tee -a docker-launch-diagnostic.log || report_status=$?
+          if (( tee_status != 0 || report_status != 0 )); then
+            echo "diagnostic evidence log write failed" >&2
+            exit 1
+          fi
           exit "${diagnostic_status}"
 
       - name: Upload Docker launch diagnostic evidence

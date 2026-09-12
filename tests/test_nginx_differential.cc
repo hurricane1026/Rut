@@ -79781,8 +79781,7 @@ int main(int argc, char** argv) {
             temp.preflight_log, result.snapshot, result.snapshot_error, result.snapshot_state);
         print_docker_info_result(result);
         const DockerInfoDecision decision = docker_info_decision(result);
-        const char* required = getenv("RUT_NGINX_DIFFERENTIAL_REQUIRED");
-        return docker_info_return_code(decision, required && strcmp(required, "1") == 0);
+        return docker_info_return_code(decision, true);
     }
     if (!run_normalize_date_self_checks()) return 1;
     if (!run_two_response_diagnostic_self_check()) return 1;
