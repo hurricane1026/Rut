@@ -864,7 +864,7 @@ public:
         if (closed_) return;
         const auto* bytes = static_cast<const char*>(data);
         while (length != 0) {
-            const size_t take = std::min(sizeof(record_), length - partial_size_);
+            const size_t take = std::min(sizeof(record_) - partial_size_, length);
             memcpy(reinterpret_cast<char*>(&record_) + partial_size_, bytes, take);
             partial_size_ += take;
             bytes += take;
@@ -1677,8 +1677,13 @@ static bool run_docker_info_preflight_self_check(std::string& error) {
         cleanup();
         return false;
     }
-    const auto expect_reject = [&](std::vector<DockerLaunchRecord> candidate, const char* label) {
-        if (!protocol_check(candidate, false, 0)) {
+    const auto expect_reject = [&](std::vector<DockerLaunchRecord> candidate,
+                                   const char* label,
+                                   size_t expected_count = 0) {
+        DockerLaunchRecordDecoder decoder;
+        for (const DockerLaunchRecord& record : candidate) decoder.feed(&record, sizeof(record));
+        decoder.finalize_eof();
+        if (!decoder.integrity_error() || decoder.records().size() != expected_count) {
             error = std::string(label) + " launch control failed";
             cleanup();
             return false;
@@ -1697,9 +1702,10 @@ static bool run_docker_info_preflight_self_check(std::string& error) {
                         protocol_record(DockerInfoResult::LaunchStage::LaunchError,
                                         DockerInfoResult::LaunchStage::BeforeLogOpen,
                                         0)},
-                       "invalid-error-errno") ||
-        !expect_reject({normal_records[0], normal_records[0]}, "repeated-stage") ||
-        !expect_reject({normal_records[0], normal_records[2]}, "out-of-order-stage")) {
+                       "invalid-error-errno",
+                       1) ||
+        !expect_reject({normal_records[0], normal_records[0]}, "repeated-stage", 1) ||
+        !expect_reject({normal_records[0], normal_records[2]}, "out-of-order-stage", 1)) {
         return false;
     }
     DockerLaunchRecordDecoder truncated;
