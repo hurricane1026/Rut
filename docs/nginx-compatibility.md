@@ -24,6 +24,10 @@ passed 15/15 jobs and required nginx 156/156 with zero skips (619.28s; new
 explicit-on CLI test 7.73s). #621 is closed for its bounded acceptance; #627
 tracks the separate non-1s witness. Only the precise representative row below
 is promoted, not all component-admitted names/durations/methods.
+The #627 nginx-only 2s oracle at `1d4e536b` passed independent review, a fresh
+Release build and eight targeted tests (zero skips, 50.33s; new oracle 6.55s).
+Final CI/integration and the generated-RUT 2s witness remain pending; this adds
+no support promotion.
 #623 tracks a reproduced source-backed Server-model hide-metadata erasure gap;
 its fix merged through #624 at `2bba609a` after CI `34320265023` passed all
 15 jobs and required nginx 155/155. This strengthens model authentication only.
