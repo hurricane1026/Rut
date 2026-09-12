@@ -62,9 +62,12 @@ Broad #270 remains
 correction. A local Clang Release build and six focused tests passed (16.65s,
 zero skips), including the first explicit-off nginx-only run (1.65s): exact
 normalized 127-byte 200/CL12 plus `hello` prefix, inactivity EOF, natural origin
-retirement and stable `60\n` ledger. Shared real/synthetic acceptance and
-negative controls remain pending, as do complete-candidate CI, the separate
-ordinary-RUT capability witness and same-file converter differential. The
+retirement and stable `60\n` ledger. The subsequent `247338de` adds one shared
+real/synthetic acceptance validator and named negative controls, independently
+approved after lead corrections to Luna's control fixtures. The new standalone
+self-check passed (0.01s), as did six focused regressions (16.40s, zero skips;
+real off oracle 1.68s). Complete-candidate PR/normal CI, the separate ordinary-RUT
+capability witness and same-file converter differential remain pending. The
 converter still rejects `proxy_buffering off`; no compatibility row is promoted.
 
 | nginx feature | parser | converter | RUT capability | behavior test | status |

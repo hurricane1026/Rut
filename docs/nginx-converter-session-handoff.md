@@ -36,10 +36,12 @@ exposed tools; the user selects the primary model in the client.
 - Branch: `nginx-off-oracle`.
 - This session started with clean worktree and local/remote HEAD both
   `6942666557d9f9a4303d40de266b640f4920f217`.
-- Current #638 source candidate: `d345e933`, independently **APPROVED for the
-  snapshots/ownership increment only**. See current status for validation logs.
-  Historical `6d07bf42` remains rejected; the complete oracle still needs its
-  shared acceptance validator and negative controls.
+- Current #638 source candidate: `247338de`, independently **APPROVED for the
+  shared-validator/control increment**, following the accepted snapshots fix
+  `d345e933`. See current status for validation logs and the explicit primary
+  implementation fallback used for final control corrections. Historical
+  rejected candidates/reviews remain evidence. Complete-candidate PR/normal CI
+  remains the next task.
 - Integration base: `agent/nginx-to-rut-converter`, not `main`.
 - Parent [PR #269](https://github.com/hurricane1026/Rut/pull/269) stays draft.
 - The main worktree `/home/hurricane/private/code/Rut` has unrelated user WIP in
@@ -53,7 +55,7 @@ exposed tools; the user selects the primary model in the client.
 
 1. Applicable `AGENTS.md` files, if present.
 2. This document and [current status](../.nginx-converter-status.md), especially
-   the current shared-validator task and the completed snapshots/ownership evidence.
+   the current candidate-CI task and completed validator/snapshots evidence.
 3. [Compatibility matrix](nginx-compatibility.md).
 4. [Issue #638](https://github.com/hurricane1026/Rut/issues/638), including design,
    review and capacity-blocker comments. Detailed pending handoff is preserved
@@ -77,7 +79,7 @@ Broad #270 remains PARTIAL and #271 remains BLOCKED_BY_RUT. None of that proves
 the new explicit `proxy_buffering off` scope. Verify current issue/PR state if
 making new status claims; these are recorded prior-run results, not reruns.
 
-## CURRENT: #638 nginx-only explicit-off oracle correction
+## CURRENT: #638 complete nginx-only oracle candidate review/normal CI
 
 The minimal fixture uses one server/location, numeric loopback endpoints,
 `proxy_buffering off`, `proxy_read_timeout 1s`, and an owned access ledger.
@@ -88,7 +90,8 @@ prefix, inactivity EOF, one natural retirement and stable `60\n` ledger. The
 Clang Release build and six focused tests passed with zero skips (16.65s, new
 oracle 1.65s); logs are `/tmp/rut-638-snapshots-build.log` and
 `/tmp/rut-638-snapshots-targeted.log`. This is local nginx-only evidence; the
-shared validator/negative controls and complete-candidate CI remain pending.
+shared validator/negative controls are now implemented in `247338de`;
+complete-candidate CI remains pending.
 
 ### Completed implementation: snapshots and ownership only (`d345e933`)
 
@@ -119,12 +122,27 @@ correct the predecessor's declaration-order error. No parser/converter/runtime
 expansion occurred. Consult current status for lead-scheduled validation; this
 increment alone does not accept the complete oracle.
 
+### Completed shared validator/control increment (`247338de`)
+
+Owned early/final wire and frozen clocks/counts/custody/ledger state enter one
+`validate_explicit_off_observation` in both the real pre-cleanup path and the
+synthetic self-check. Named negative controls cover wire/ACK/retirement/ledger
+failures, exact timing boundaries and real observer failure/restoration. The
+standalone CTest `test_nginx_issue638_explicit_off_observation_self_check` needs
+no Docker; the real oracle runs the same controls before its episode. Luna
+implemented, the lead corrected remaining control arithmetic under the prior
+fallback authorization, and a different Luna independently approved the final
+diff. Clang Release build and seven focused tests passed, zero skips: standalone
+self-check 0.01s, six regressions 16.40s (new real oracle 1.68s). Logs are
+`/tmp/rut-638-validator-build.log`, `/tmp/rut-638-validator-self-check.log` and
+`/tmp/rut-638-validator-targeted.log`. This does not establish an ordinary-RUT
+capability or converter admission.
+
 ## NEXT
 
-1. Add one shared real/synthetic explicit-off acceptance validator and negative
-   controls. Cover malformed/missing/extra prefix, timing boundaries, missing or
-   invalid probe ACK, joint readiness failure, duplicate retirement, sticky
-   errors and lost stability; cleanup-only facts cannot create live success.
+1. Review and validate the complete nginx-only candidate through normal CI in
+   a PR targeting `agent/nginx-to-rut-converter`. Preserve rejected review
+   evidence and any failed run; do not promote compatibility from nginx alone.
 2. After review and nginx-only oracle validation, establish the exact behavior
    through a separate ordinary-RUT `None` buffering capability witness.
 3. Only after capability is proven, implement bounded off model/lowering and an
@@ -139,7 +157,7 @@ until the precise supported input scope has actual equivalence evidence.
 - Lead is sole heavy-test scheduler; only one full build/integration/differential
   run at a time. Use `-j1` for the existing build.
 - Existing build directory: `/home/hurricane/private/code/Rut_build627_clang`
-  (Clang Release, IPO off). It was rebuilt for `d345e933` in this session;
+  (Clang Release, IPO off). It was rebuilt for `247338de` in this session;
   recheck its source/cache before later reuse.
 - Target: `test_nginx_differential`. New oracle mode:
   `--pinned-nginx-explicit-buffering-off-oracle`. Inspect registered CTest names
@@ -163,8 +181,8 @@ Work in /home/hurricane/private/code/Rut_issue627_two_second_oracle.
 Read applicable AGENTS.md and docs/nginx-converter-session-handoff.md first,
 then .nginx-converter-status.md, docs/nginx-compatibility.md and issue #638.
 Verify git/GitHub state and preserve unrelated user WIP in the main worktree.
-The initial read-only audit and snapshots/ownership increment are complete.
-Next implement the shared real/synthetic validator and negative controls.
+The audit, snapshots/ownership and shared validator/controls are complete.
+Next review and validate the complete nginx-only candidate through normal CI.
 Proceed with one small implementation → different-worker review →
 lead-scheduled tests → status/issue update at a time. Do not claim off support
 from untested source or nginx-only evidence. Keep parent PR #269 draft and
