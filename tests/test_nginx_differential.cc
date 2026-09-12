@@ -74628,10 +74628,15 @@ static bool run_pinned_nginx_bodyless_head_delayed_completion_oracle(std::string
     synthetic.downstream_open = true;
     static constexpr char kSyntheticWire[] =
         "HTTP/1.1 200 OK\r\nServer: nginx/1.29.7\r\n"
+        "Date: Tue, 01 Jan 2030 00:00:00 GMT\r\nContent-Length: 12\r\n"
+        "Connection: keep-alive\r\nX-Unrelated: retained\r\n\r\n";
+    static constexpr char kSyntheticExpected[] =
+        "HTTP/1.1 200 OK\r\nServer: nginx/1.29.7\r\n"
         "Date: XXXXXXXXXXXXXXXXXXXXXXXXXXXXX\r\nContent-Length: 12\r\n"
         "Connection: keep-alive\r\nX-Unrelated: retained\r\n\r\n";
     synthetic.wire.assign(kSyntheticWire, kSyntheticWire + sizeof(kSyntheticWire) - 1u);
-    const std::vector<char> synthetic_expected(synthetic.wire);
+    const std::vector<char> synthetic_expected(
+        kSyntheticExpected, kSyntheticExpected + sizeof(kSyntheticExpected) - 1u);
     std::string control_detail;
     if (!validate_head_acceptance(synthetic, synthetic_expected, control_detail)) {
         error = "#630 synthetic positive acceptance failed: " + control_detail;
