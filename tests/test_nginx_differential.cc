@@ -5344,6 +5344,7 @@ struct KeepAlivePinnedRecorder {
     std::atomic<u64> second_complete_sent_ns{0};
     std::atomic<u64> head_publication_ns{0};
     std::atomic<u32> head_publication_count{0};
+    std::atomic<u32> head_peer_close_count{0};
     std::atomic<bool> head_publish_permit{false};
     std::atomic<bool> head_peer_open_ack{false};
     std::atomic<bool> head_probe_request{false};
@@ -5736,6 +5737,7 @@ struct KeepAlivePinnedRecorder {
                         self->first_peer_closed_ns.store(steady_now_ns(),
                                                          std::memory_order_release);
                         self->first_peer_closed.store(true, std::memory_order_release);
+                        self->head_peer_close_count.fetch_add(1u, std::memory_order_release);
                         remove = true;
                     } else if (n > 0) {
                         self->first_peer_unexpected_data.store(true, std::memory_order_release);
@@ -74547,6 +74549,8 @@ struct HeadAcceptanceObservation {
     u64 publication_ns = 0u;
     u64 header_ns = 0u;
     u64 retirement_ns = 0u;
+    u64 access_ns = 0u;
+    u64 quiet_until_ns = 0u;
     std::vector<char> wire;
     std::string access;
     u32 accepted = 0u;
@@ -74561,7 +74565,6 @@ struct HeadAcceptanceObservation {
     bool listener_failed = false;
     bool unexpected_data = false;
     bool observation_failed = false;
-    bool cleanup_rescued = false;
 };
 
 static bool validate_head_acceptance(const HeadAcceptanceObservation& o,
@@ -74579,6 +74582,14 @@ static bool validate_head_acceptance(const HeadAcceptanceObservation& o,
     if (o.retirement_ns < o.publication_ns ||
         o.retirement_ns - o.publication_ns >= 350'000'000ull) {
         detail = "origin retirement was late or preceded publication";
+        return false;
+    }
+    if (o.access_ns < o.header_ns || o.access_ns >= o.header_ns + 250'000'000ull) {
+        detail = "access ledger was not first exact within the header anchor window";
+        return false;
+    }
+    if (o.quiet_until_ns < o.header_ns + 2'250'000'000ull) {
+        detail = "live quiet/open custody ended before the required 2.25s window";
         return false;
     }
     if (!validate_exact_normalized_response(o.wire, expected, detail)) {
@@ -74606,10 +74617,6 @@ static bool validate_head_acceptance(const HeadAcceptanceObservation& o,
         detail = "recorder reported a failure flag";
         return false;
     }
-    if (o.cleanup_rescued) {
-        detail = "cleanup rescued an otherwise incomplete acceptance";
-        return false;
-    }
     return true;
 }
 
@@ -74621,6 +74628,8 @@ static bool run_pinned_nginx_bodyless_head_delayed_completion_oracle(std::string
     synthetic.publication_ns = 2'200'000'000ull;
     synthetic.header_ns = 2'250'000'000ull;
     synthetic.retirement_ns = 2'300'000'000ull;
+    synthetic.access_ns = 2'300'000'000ull;
+    synthetic.quiet_until_ns = 4'500'000'000ull;
     synthetic.access = "61\n";
     synthetic.accepted = synthetic.requests = synthetic.publication_count =
         synthetic.retirement_count = synthetic.response_send_calls = 1u;
@@ -74653,15 +74662,47 @@ static bool run_pinned_nginx_bodyless_head_delayed_completion_oracle(std::string
          [](HeadAcceptanceObservation& x) { x.header_ns = x.publication_ns + 350'000'000ull; }},
         {"late retirement",
          [](HeadAcceptanceObservation& x) { x.retirement_ns = x.publication_ns + 350'000'000ull; }},
-        {"hidden header leak", [](HeadAcceptanceObservation& x) { x.wire.push_back('x'); }},
-        {"body/tail", [](HeadAcceptanceObservation& x) { x.downstream_eof = true; }},
+        {"hidden header leak",
+         [](HeadAcceptanceObservation& x) {
+             const std::string needle = "X-Unrelated: retained\r\n";
+             const auto at =
+                 std::search(x.wire.begin(), x.wire.end(), needle.begin(), needle.end());
+             if (at != x.wire.end())
+                 x.wire.insert(at, {'X', '-', 'P', 'o', 'w', 'e', 'r', 'e', 'd', '-',  'B',
+                                    'y', ':', ' ', 'l', 'e', 'a', 'k', 'e', 'd', '\r', '\n'});
+         }},
+        {"retained header erased",
+         [](HeadAcceptanceObservation& x) {
+             const std::string needle = "X-Unrelated: retained\r\n";
+             const auto at =
+                 std::search(x.wire.begin(), x.wire.end(), needle.begin(), needle.end());
+             if (at != x.wire.end()) x.wire.erase(at, at + needle.size());
+         }},
+        {"body/tail", [](HeadAcceptanceObservation& x) { x.wire.push_back('x'); }},
+        {"downstream EOF/open",
+         [](HeadAcceptanceObservation& x) {
+             x.downstream_open = false;
+             x.downstream_eof = true;
+         }},
+        {"early response",
+         [](HeadAcceptanceObservation& x) { x.header_ns = x.publication_ns - 1u; }},
+        {"hardcoded 1s/504",
+         [](HeadAcceptanceObservation& x) {
+             x.publication_ns = x.origin_ns + 1'000'000'000ull;
+             x.wire.assign("HTTP/1.1 504 Gateway Timeout\r\n\r\n");
+         }},
+        {"late ledger",
+         [](HeadAcceptanceObservation& x) { x.access_ns = x.header_ns + 250'000'000ull; }},
+        {"short quiet",
+         [](HeadAcceptanceObservation& x) { x.quiet_until_ns = x.header_ns + 2'249'999'999ull; }},
+        {"full timing boundary",
+         [](HeadAcceptanceObservation& x) { x.publication_ns = x.origin_ns + 1'400'000'000ull; }},
         {"duplicate accept", [](HeadAcceptanceObservation& x) { x.accepted = 2u; }},
         {"duplicate request", [](HeadAcceptanceObservation& x) { x.requests = 2u; }},
         {"duplicate retirement", [](HeadAcceptanceObservation& x) { x.retirement_count = 2u; }},
         {"duplicate publication", [](HeadAcceptanceObservation& x) { x.publication_count = 2u; }},
         {"access mutation", [](HeadAcceptanceObservation& x) { x.access = "61\n61\n"; }},
         {"bad failure flag", [](HeadAcceptanceObservation& x) { x.response_send_failed = true; }},
-        {"cleanup rescue", [](HeadAcceptanceObservation& x) { x.cleanup_rescued = true; }},
     };
     for (const Mutation& mutation : mutations) {
         HeadAcceptanceObservation negative = synthetic;
@@ -74809,6 +74850,29 @@ static bool run_pinned_nginx_bodyless_head_delayed_completion_oracle(std::string
         close(client);
         return false;
     }
+    // Do not let a fast ACK bypass the complete final custody check.
+    {
+        bool ack_quiet = false;
+        if (!wait_keepalive_quiet_or_eof(client, 1, ack_quiet, error) || ack_quiet) {
+            error = "#630 immediate post-ACK downstream custody failed";
+            close(client);
+            return false;
+        }
+        std::string sample;
+        if (!read_request_length_access_file(temp.nginx_access_log, sample, error) ||
+            !sample.empty() || origin.head_publication_ns.load(std::memory_order_acquire) != 0u ||
+            origin.accepted.load(std::memory_order_acquire) != 1u ||
+            origin.requests.load(std::memory_order_acquire) != 1u ||
+            origin.response_send_failed.load(std::memory_order_acquire) ||
+            origin.listener_failed.load(std::memory_order_acquire) ||
+            origin.first_peer_unexpected_data.load(std::memory_order_acquire) ||
+            origin.first_peer_observation_failed.load(std::memory_order_acquire) ||
+            !origin.thread_alive.load(std::memory_order_acquire) || poll_child(nginx.child)) {
+            error = "#630 immediate post-ACK custody/liveness control failed";
+            close(client);
+            return false;
+        }
+    }
     origin.head_publish_permit.store(true, std::memory_order_release);
     const u64 publication_wait = steady_now_ns() + 2'000'000'000ull;
     std::vector<char> response;
@@ -74843,6 +74907,7 @@ static bool run_pinned_nginx_bodyless_head_delayed_completion_oracle(std::string
     }
     const u64 ledger_deadline = header_complete_ns + 250'000'000ull;
     std::string access;
+    u64 access_ns = 0u;
     bool ledger_seen = false;
     while (steady_now_ns() < ledger_deadline) {
         std::string sample;
@@ -74853,6 +74918,7 @@ static bool run_pinned_nginx_bodyless_head_delayed_completion_oracle(std::string
         if (sample == "61\n") {
             access = sample;
             ledger_seen = true;
+            access_ns = steady_now_ns();
             break;
         }
         if (!sample.empty()) {
@@ -74868,6 +74934,7 @@ static bool run_pinned_nginx_bodyless_head_delayed_completion_oracle(std::string
         return false;
     }
     const u64 stable_deadline = header_complete_ns + 2'250'000'000ull;
+    u64 quiet_until_ns = 0u;
     while (steady_now_ns() < stable_deadline) {
         if (!observe_client_open_and_quiet_nonconsuming(client, 50, error)) {
             error = "#630 downstream emitted body/tail or closed during keep-alive observation";
@@ -74888,6 +74955,7 @@ static bool run_pinned_nginx_bodyless_head_delayed_completion_oracle(std::string
             close(client);
             return false;
         }
+        quiet_until_ns = steady_now_ns();
     }
     const std::string expected_upstream =
         std::string("HEAD /buffered-timeout?q=1 HTTP/1.1\r\nHost: 127.0.0.1:") +
@@ -74896,20 +74964,29 @@ static bool run_pinned_nginx_bodyless_head_delayed_completion_oracle(std::string
     while (!origin.first_peer_closed.load() && std::chrono::steady_clock::now() < retire_deadline)
         usleep(1000);
     const u64 retirement_ns = origin.first_peer_closed_ns.load();
+    std::string final_access;
+    std::string final_detail;
+    const bool final_quiet = observe_client_open_and_quiet_nonconsuming(client, 50, final_detail);
+    const u64 final_quiet_until_ns = final_quiet ? steady_now_ns() : quiet_until_ns;
+    const bool final_ledger_ok =
+        read_request_length_access_file(temp.nginx_access_log, final_access, final_detail) &&
+        final_access == "61\n";
     HeadAcceptanceObservation actual;
     actual.origin_ns = origin.request_complete_ns[0].load(std::memory_order_acquire);
     actual.publication_ns = publication_ns;
     actual.header_ns = header_complete_ns;
     actual.retirement_ns = retirement_ns;
     actual.wire = response;
-    actual.access = access;
+    actual.access = final_access;
+    actual.access_ns = access_ns;
+    actual.quiet_until_ns = final_quiet_until_ns;
     actual.accepted = origin.accepted.load(std::memory_order_acquire);
     actual.requests = origin.requests.load(std::memory_order_acquire);
     actual.publication_count = origin.head_publication_count.load(std::memory_order_acquire);
-    actual.retirement_count = origin.first_peer_closed.load(std::memory_order_acquire) ? 1u : 0u;
+    actual.retirement_count = origin.head_peer_close_count.load(std::memory_order_acquire);
     actual.response_send_calls = origin.response_send_calls.load(std::memory_order_acquire);
     actual.response_bytes_sent = origin.response_bytes_sent.load(std::memory_order_acquire);
-    actual.downstream_open = header_complete_ns != 0u;
+    actual.downstream_open = final_quiet;
     actual.downstream_eof = false;
     actual.response_send_failed = origin.response_send_failed.load(std::memory_order_acquire);
     actual.listener_failed = origin.listener_failed.load(std::memory_order_acquire);
@@ -74921,6 +74998,9 @@ static bool run_pinned_nginx_bodyless_head_delayed_completion_oracle(std::string
         validate_head_acceptance(actual,
                                  std::vector<char>(kExpected, kExpected + sizeof(kExpected) - 1u),
                                  acceptance_detail);
+    const bool live_snapshot_ok = final_quiet && final_ledger_ok &&
+                                  origin.thread_alive.load(std::memory_order_acquire) &&
+                                  !origin.listener_failed.load(std::memory_order_acquire);
     close(client);
     origin.stop();
     if (origin.history.size() != 1u ||
@@ -74930,13 +75010,8 @@ static bool run_pinned_nginx_bodyless_head_delayed_completion_oracle(std::string
         error = "#630 upstream request wire mismatch";
         return false;
     }
-    std::string final_access;
-    const bool final_ledger_ok =
-        read_request_length_access_file(temp.nginx_access_log, final_access, acceptance_detail) &&
-        final_access == "61\n";
-    actual.access = final_access;
     const bool cleanup_ok = stop_child(nginx.child) && docker.remove();
-    if (!ok || !final_ledger_ok || !cleanup_ok) {
+    if (!ok || !live_snapshot_ok || !cleanup_ok) {
         if (error.empty())
             error = "#630 origin retirement/request/access evidence mismatch: " + acceptance_detail;
         return false;
