@@ -3494,11 +3494,10 @@ struct LiveRetirementSnapshot {
 
 // The flag is the publication commit point.  Keep its acquire load in its
 // own statement and only consume the payload after that commit is observed.
-static LiveRetirementSnapshot snapshot_live_retirement(
-    const std::atomic<bool>& closure_published,
-    const std::atomic<u32>& committed_count,
-    const std::atomic<u64>& committed_timestamp,
-    u64 minimum_ns) {
+static LiveRetirementSnapshot snapshot_live_retirement(const std::atomic<bool>& closure_published,
+                                                       const std::atomic<u32>& committed_count,
+                                                       const std::atomic<u64>& committed_timestamp,
+                                                       u64 minimum_ns) {
     const bool committed = closure_published.load(std::memory_order_acquire);
     u32 count = 0u;
     u64 timestamp_ns = 0u;
@@ -3509,7 +3508,7 @@ static LiveRetirementSnapshot snapshot_live_retirement(
     const LiveRetirementState state =
         !committed ? LiveRetirementState::Pending
                    : (count != 1u || timestamp_ns < minimum_ns ? LiveRetirementState::Invalid
-                                                                : LiveRetirementState::Ready);
+                                                               : LiveRetirementState::Ready);
     return {state, count, timestamp_ns};
 }
 
@@ -73875,16 +73874,16 @@ struct LiveRetirementLedgerTransition {
 static void capture_live_retirement_ledger_transition(void* opaque) {
     auto* transition = static_cast<LiveRetirementLedgerTransition*>(opaque);
     capture_live_retirement_snapshot(transition->capture);
-    transition->observer->sample(1'100'000'000ull,
-                                 "60\n",
-                                 true,
-                                 true,
-                                 true,
-                                 true,
-                                 true,
-                                 transition->capture->snapshot.state == LiveRetirementState::Ready,
-                                 transition->capture->snapshot.state !=
-                                     LiveRetirementState::Invalid);
+    transition->observer->sample(
+        1'100'000'000ull,
+        "60\n",
+        true,
+        true,
+        true,
+        true,
+        true,
+        transition->capture->snapshot.state == LiveRetirementState::Ready,
+        transition->capture->snapshot.state != LiveRetirementState::Invalid);
 }
 
 static bool run_live_access_ledger_observer_self_check(std::string& error) {
@@ -73995,19 +73994,17 @@ static bool run_live_access_ledger_observer_self_check(std::string& error) {
         closure_first.phase == LiveAccessLedgerObserver::Phase::Accepted;
     LiveAccessLedgerObserver pending_publication;
     pending_publication.freeze_eof(1'000'000'000ull);
-    const auto synthetic_retirement_snapshot = [](bool published,
-                                                  u32 count,
-                                                  u64 timestamp_ns,
-                                                  u64 minimum_ns) {
-        std::atomic<bool> flag{published};
-        std::atomic<u32> committed_count{count};
-        std::atomic<u64> committed_timestamp{timestamp_ns};
-        return snapshot_live_retirement(flag, committed_count, committed_timestamp, minimum_ns);
-    };
+    const auto synthetic_retirement_snapshot =
+        [](bool published, u32 count, u64 timestamp_ns, u64 minimum_ns) {
+            std::atomic<bool> flag{published};
+            std::atomic<u32> committed_count{count};
+            std::atomic<u64> committed_timestamp{timestamp_ns};
+            return snapshot_live_retirement(flag, committed_count, committed_timestamp, minimum_ns);
+        };
     const auto retirement_sample = [](LiveAccessLedgerObserver& observer,
-                                     u64 now_ns,
-                                     const std::string& ledger,
-                                     LiveRetirementState retirement) {
+                                      u64 now_ns,
+                                      const std::string& ledger,
+                                      LiveRetirementState retirement) {
         return observer.sample(now_ns,
                                ledger,
                                true,
@@ -74050,14 +74047,16 @@ static bool run_live_access_ledger_observer_self_check(std::string& error) {
         std::atomic<bool> flag{published};
         std::atomic<u32> committed_count{count};
         std::atomic<u64> committed_timestamp{timestamp_ns};
-        return snapshot_live_retirement(flag, committed_count, committed_timestamp,
-                                        1'000'000'000ull);
+        return snapshot_live_retirement(
+            flag, committed_count, committed_timestamp, 1'000'000'000ull);
     };
     LiveAccessLedgerObserver exact_deadline_pending_retirement;
     exact_deadline_pending_retirement.freeze_eof(1'000'000'000ull);
     const bool exact_deadline_pending_retirement_rejected =
-        !retirement_snapshot_sample(exact_deadline_pending_retirement, 1'250'000'000ull,
-                                    "60\n", actual_retirement_snapshot(false, 0u, 0u)) &&
+        !retirement_snapshot_sample(exact_deadline_pending_retirement,
+                                    1'250'000'000ull,
+                                    "60\n",
+                                    actual_retirement_snapshot(false, 0u, 0u)) &&
         exact_deadline_pending_retirement.phase == LiveAccessLedgerObserver::Phase::Failed;
     LiveAccessLedgerObserver exact_deadline_ready;
     exact_deadline_ready.freeze_eof(1'000'000'000ull);
@@ -74066,17 +74065,17 @@ static bool run_live_access_ledger_observer_self_check(std::string& error) {
     const LiveRetirementSnapshot ready_snapshot =
         actual_retirement_snapshot(true, 1u, 1'100'000'000ull);
     const bool ready_at_or_after_deadline_rejected =
-        !retirement_snapshot_sample(exact_deadline_ready, 1'250'000'000ull, "60\n",
-                                    ready_snapshot) &&
+        !retirement_snapshot_sample(
+            exact_deadline_ready, 1'250'000'000ull, "60\n", ready_snapshot) &&
         exact_deadline_ready.phase == LiveAccessLedgerObserver::Phase::Failed &&
-        !retirement_snapshot_sample(after_deadline_ready, 1'250'000'001ull, "60\n",
-                                    ready_snapshot) &&
+        !retirement_snapshot_sample(
+            after_deadline_ready, 1'250'000'001ull, "60\n", ready_snapshot) &&
         after_deadline_ready.phase == LiveAccessLedgerObserver::Phase::Failed;
     LiveAccessLedgerObserver invalid_after_stability;
     invalid_after_stability.freeze_eof(1'000'000'000ull);
     const bool invalid_snapshot_sticky_after_acceptance =
-        retirement_snapshot_sample(invalid_after_stability, 1'100'000'000ull, "60\n",
-                                   ready_snapshot) &&
+        retirement_snapshot_sample(
+            invalid_after_stability, 1'100'000'000ull, "60\n", ready_snapshot) &&
         invalid_after_stability.begin_stability(1'100'000'000ull) &&
         !stable_snapshot_sample(invalid_after_stability,
                                 1'101'000'000ull,
@@ -74090,8 +74089,8 @@ static bool run_live_access_ledger_observer_self_check(std::string& error) {
     LiveAccessLedgerObserver pending_after_stability;
     pending_after_stability.freeze_eof(1'000'000'000ull);
     const bool pending_snapshot_sticky_after_stability =
-        retirement_snapshot_sample(pending_after_stability, 1'100'000'000ull, "60\n",
-                                   ready_snapshot) &&
+        retirement_snapshot_sample(
+            pending_after_stability, 1'100'000'000ull, "60\n", ready_snapshot) &&
         pending_after_stability.begin_stability(1'100'000'000ull) &&
         !stable_snapshot_sample(pending_after_stability,
                                 1'101'000'000ull,
@@ -74112,8 +74111,15 @@ static bool run_live_access_ledger_observer_self_check(std::string& error) {
         [&](bool read_ok, bool protocol_clean, bool custody_clean) {
             LiveAccessLedgerObserver observer;
             observer.freeze_eof(1'000'000'000ull);
-            return !observer.sample(1'100'000'000ull, "60\n", read_ok, true, true,
-                                    protocol_clean, custody_clean, false, true) &&
+            return !observer.sample(1'100'000'000ull,
+                                    "60\n",
+                                    read_ok,
+                                    true,
+                                    true,
+                                    protocol_clean,
+                                    custody_clean,
+                                    false,
+                                    true) &&
                    !observer.sample(1'101'000'000ull, "60\n", true, true, true, true);
         };
     const bool pending_retirement_failures_sticky =
@@ -74127,15 +74133,14 @@ static bool run_live_access_ledger_observer_self_check(std::string& error) {
         closure_first_complete.sample(1'101'000'000ull, "60\n", true, true, true, true) &&
         closure_first_complete.phase == LiveAccessLedgerObserver::Phase::Accepted &&
         closure_first_complete.begin_stability(1'101'000'000ull) &&
-        closure_first_complete.stable_sample(1'276'000'000ull, "60\n", true, true, true,
-                                             true) &&
+        closure_first_complete.stable_sample(1'276'000'000ull, "60\n", true, true, true, true) &&
         closure_first_complete.phase == LiveAccessLedgerObserver::Phase::Complete;
     const bool count_before_flag_pending =
-        retirement_sample(pending_publication,
-                          1'100'000'000ull,
-                          "60\n",
-                          synthetic_retirement_snapshot(false, 1u, 1'100'000'000ull,
-                          1'000'000'000ull).state) &&
+        retirement_sample(
+            pending_publication,
+            1'100'000'000ull,
+            "60\n",
+            synthetic_retirement_snapshot(false, 1u, 1'100'000'000ull, 1'000'000'000ull).state) &&
         pending_publication.phase == LiveAccessLedgerObserver::Phase::Pending;
     std::atomic<bool> callback_flag{false};
     std::atomic<u32> callback_count{0u};
@@ -74149,9 +74154,8 @@ static bool run_live_access_ledger_observer_self_check(std::string& error) {
                        callback_count,
                        capture_live_retirement_ledger_transition,
                        &callback_transition);
-    const LiveRetirementSnapshot callback_committed =
-        snapshot_live_retirement(callback_flag, callback_count, callback_timestamp,
-                                 1'000'000'000ull);
+    const LiveRetirementSnapshot callback_committed = snapshot_live_retirement(
+        callback_flag, callback_count, callback_timestamp, 1'000'000'000ull);
     const bool callback_ready_complete =
         callback_ledger.sample(1'101'000'000ull,
                                "60\n",
@@ -74174,20 +74178,19 @@ static bool run_live_access_ledger_observer_self_check(std::string& error) {
     LiveAccessLedgerObserver malformed_committed;
     malformed_committed.freeze_eof(1'000'000'000ull);
     const bool malformed_committed_sticky =
-        !retirement_sample(malformed_committed,
-                           1'100'000'000ull,
-                           "60\n",
-                           synthetic_retirement_snapshot(true, 2u, 1'100'000'000ull,
-                                                        1'000'000'000ull).state) &&
+        !retirement_sample(
+            malformed_committed,
+            1'100'000'000ull,
+            "60\n",
+            synthetic_retirement_snapshot(true, 2u, 1'100'000'000ull, 1'000'000'000ull).state) &&
         !malformed_committed.sample(1'101'000'000ull, "60\n", true, true, true, true);
     LiveAccessLedgerObserver malformed_timestamp;
     malformed_timestamp.freeze_eof(1'000'000'000ull);
-    const bool malformed_timestamp_sticky =
-        !retirement_sample(malformed_timestamp,
-                           1'100'000'000ull,
-                           "60\n",
-                           synthetic_retirement_snapshot(true, 1u, 999'999'999ull,
-                                                        1'000'000'000ull).state);
+    const bool malformed_timestamp_sticky = !retirement_sample(
+        malformed_timestamp,
+        1'100'000'000ull,
+        "60\n",
+        synthetic_retirement_snapshot(true, 1u, 999'999'999ull, 1'000'000'000ull).state);
     LiveAccessLedgerObserver ledger_regression;
     ledger_regression.freeze_eof(1'000'000'000ull);
     const bool pending_regression_sticky =
@@ -75112,12 +75115,12 @@ static bool run_pinned_nginx_custom_hide_timeout_probe(
                 stable_child,
                 stable_origin,
                 !origin.response_peer_unexpected_data.load(std::memory_order_acquire) &&
-                !origin.response_peer_observation_failed.load(std::memory_order_acquire),
+                    !origin.response_peer_observation_failed.load(std::memory_order_acquire),
                 full_live_custody(
                     stable_child,
                     stable_origin,
                     !origin.response_peer_unexpected_data.load(std::memory_order_acquire) &&
-                    !origin.response_peer_observation_failed.load(std::memory_order_acquire),
+                        !origin.response_peer_observation_failed.load(std::memory_order_acquire),
                     true),
                 stable_retirement.state == LiveRetirementState::Ready,
                 stable_retirement.state != LiveRetirementState::Invalid) ||
@@ -75319,15 +75322,13 @@ static bool run_pinned_nginx_custom_hide_timeout_probe(
     // the worker-owned atomics.
     const LiveRetirementSnapshot final_retirement =
         post_retirement_stable ? final_stable_retirement : retirement_snapshot();
-    const std::string frozen_access =
-        post_retirement_stable ? final_stable_access : live_access;
-    const u32 frozen_accepted =
-        post_retirement_stable ? final_stable_accepted : live_accepted;
-    const u32 frozen_requests =
-        post_retirement_stable ? final_stable_requests : live_requests;
+    const std::string frozen_access = post_retirement_stable ? final_stable_access : live_access;
+    const u32 frozen_accepted = post_retirement_stable ? final_stable_accepted : live_accepted;
+    const u32 frozen_requests = post_retirement_stable ? final_stable_requests : live_requests;
     const u32 frozen_peer_closes =
         post_retirement_stable ? final_stable_peer_closes : final_retirement.count;
-    if (!actual_eof) live_stop_reason = "no-eof";
+    if (!actual_eof)
+        live_stop_reason = "no-eof";
     else if (final_retirement.state == LiveRetirementState::Invalid)
         live_stop_reason = "retirement-custody-fail";
     else if (live_observer.phase == LiveAccessLedgerObserver::Phase::Pending &&
