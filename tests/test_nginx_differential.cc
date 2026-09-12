@@ -72935,6 +72935,49 @@ struct CustomHideTimeoutPairContext {
     bool initialized = false;
 };
 
+static bool custom_hide_timeout_expiry_elapsed_valid(unsigned timeout_seconds, u64 elapsed_ns) {
+    const u64 minimum = timeout_seconds == 2u ? 1'750'000'000ull : 750'000'000ull;
+    const u64 maximum = timeout_seconds == 2u ? 2'750'000'000ull : 2'000'000'000ull;
+    return elapsed_ns >= minimum && elapsed_ns < maximum;
+}
+
+static bool custom_hide_timeout_timing_tuple_valid(unsigned timeout_seconds,
+                                                   u64 first_ns,
+                                                   u64 second_ns,
+                                                   u64 terminal_ns) {
+    const u64 minimum_gap = timeout_seconds == 2u ? 1'150'000'000ull : 550'000'000ull;
+    const u64 maximum_gap = timeout_seconds == 2u ? 1'400'000'000ull : 750'000'000ull;
+    return second_ns > first_ns && terminal_ns > second_ns && second_ns - first_ns >= minimum_gap &&
+           second_ns - first_ns < maximum_gap &&
+           custom_hide_timeout_expiry_elapsed_valid(timeout_seconds, terminal_ns - second_ns);
+}
+
+static bool custom_hide_timeout_fragment_gap_valid(unsigned timeout_seconds,
+                                                   u64 earlier_ns,
+                                                   u64 later_ns) {
+    const u64 minimum = timeout_seconds == 2u ? 1'150'000'000ull : 550'000'000ull;
+    const u64 maximum = timeout_seconds == 2u ? 1'400'000'000ull : 750'000'000ull;
+    return later_ns > earlier_ns && later_ns - earlier_ns >= minimum &&
+           later_ns - earlier_ns < maximum;
+}
+
+static bool run_custom_hide_timeout_two_second_timing_self_check(std::string& error) {
+    const bool positive = custom_hide_timeout_timing_tuple_valid(
+        2u, 1'000'000'000ull, 2'200'000'000ull, 4'200'000'000ull);
+    const bool hardcoded_one_second = !custom_hide_timeout_timing_tuple_valid(
+        2u, 1'000'000'000ull, 2'000'000'000ull, 4'000'000'000ull);
+    const bool missing_refresh = !custom_hide_timeout_timing_tuple_valid(
+        2u, 1'000'000'000ull, 2'200'000'000ull, 3'200'000'000ull);
+    const bool late_expiry = !custom_hide_timeout_timing_tuple_valid(
+        2u, 1'000'000'000ull, 2'200'000'000ull, 4'950'000'000ull);
+    const bool initial_deadline = !custom_hide_timeout_expiry_elapsed_valid(2u, 1'000'000'000ull);
+    if (!(positive && hardcoded_one_second && missing_refresh && late_expiry && initial_deadline)) {
+        error = "#627 2s timing predicate self-check accepted a synthetic timing mutant";
+        return false;
+    }
+    return true;
+}
+
 // The access file is published by an independent writer; EOF itself is not an
 // access-publication acknowledgement. Keep
 // this small observer independent of wall-clock sleeps so the live acceptance
@@ -73136,7 +73179,22 @@ static bool run_pinned_nginx_custom_hide_timeout_probe(
     CustomHideTimeoutPairContext* pair = nullptr,
     CustomHideTimeoutObservation* observation = nullptr,
     const char* custom_hide_name = "X-Powered-By",
-    bool explicit_buffering_on = false) {
+    bool explicit_buffering_on = false,
+    unsigned timeout_seconds = 1u) {
+    if (timeout_seconds != 1u && timeout_seconds != 2u) {
+        error = "#627 custom-hide timeout probe requires a one- or two-second timeout";
+        return false;
+    }
+    const u64 cross_fragment_min_ns = timeout_seconds == 2u ? 1'150'000'000ull : 550'000'000ull;
+    const u64 cross_fragment_max_ns = timeout_seconds == 2u ? 1'400'000'000ull : 750'000'000ull;
+    const u64 pre_fragment_probe_ns = timeout_seconds == 2u ? 1'000'000'000ull : 600'000'000ull;
+    const u64 quiet_horizon_from_first_ns =
+        timeout_seconds == 2u ? 2'150'000'000ull : 1'100'000'000ull;
+    const u64 quiet_horizon_from_second_ns =
+        timeout_seconds == 2u ? 1'150'000'000ull : 600'000'000ull;
+    const u64 expiry_min_from_second_ns = timeout_seconds == 2u ? 1'750'000'000ull : 750'000'000ull;
+    const u64 expiry_max_from_second_ns =
+        timeout_seconds == 2u ? 2'750'000'000ull : 2'000'000'000ull;
     const bool generated_rut = rut_path != nullptr || converter_path != nullptr;
     if (pair != nullptr && observation == nullptr) {
         error = "#270 custom-hide pair requires an observation output";
@@ -73189,11 +73247,13 @@ static bool run_pinned_nginx_custom_hide_timeout_probe(
         std::to_string(backend_port) +
         ";\n"
         "      proxy_hide_header " +
-        std::string(custom_hide_name) + ";\n      proxy_read_timeout 1s;\n" +
+        std::string(custom_hide_name) + ";\n      proxy_read_timeout " +
+        std::to_string(timeout_seconds) + "s;\n" +
         (explicit_buffering_on ? "      proxy_buffering on;\n" : "") + "    }\n  }\n}\n";
     if (count_text(config, "events {}\n") != 1u ||
         count_text(config, "proxy_hide_header " + std::string(custom_hide_name) + ";\n") != 1u ||
-        count_text(config, "proxy_read_timeout 1s;\n") != 1u ||
+        count_text(config, "proxy_read_timeout 1s;\n") != (timeout_seconds == 1u ? 1u : 0u) ||
+        count_text(config, "proxy_read_timeout 2s;\n") != (timeout_seconds == 2u ? 1u : 0u) ||
         count_text(config, "proxy_buffering") != (explicit_buffering_on ? 1u : 0u) ||
         count_text(config, "      proxy_buffering on;\n") != (explicit_buffering_on ? 1u : 0u) ||
         (pair != nullptr && pair->initialized
@@ -73436,7 +73496,8 @@ static bool run_pinned_nginx_custom_hide_timeout_probe(
         return false;
     }
     origin.response_fragment_permit.store(1u, std::memory_order_release);
-    const auto first_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(1);
+    const auto first_deadline =
+        std::chrono::steady_clock::now() + std::chrono::seconds(timeout_seconds);
     while (origin.response_fragments_sent.load(std::memory_order_acquire) < 1u &&
            std::chrono::steady_clock::now() < first_deadline) {
         if (!origin_live() || poll_child(nginx.child)) {
@@ -73452,7 +73513,7 @@ static bool run_pinned_nginx_custom_hide_timeout_probe(
         error = "#270 custom-hide timeout probe did not publish W1";
         return false;
     }
-    while (steady_now_ns() < first_ns + 600'000'000ull) {
+    while (steady_now_ns() < first_ns + pre_fragment_probe_ns) {
         std::string detail;
         std::string access;
         if (!origin_live() || poll_child(nginx.child) ||
@@ -73466,7 +73527,7 @@ static bool run_pinned_nginx_custom_hide_timeout_probe(
         usleep(1000);
     }
     origin.gated_fragment_probe_request.store(2u, std::memory_order_release);
-    const u64 probe_deadline_ns = first_ns + 750'000'000ull;
+    const u64 probe_deadline_ns = first_ns + cross_fragment_max_ns;
     while (origin.gated_fragment_probe_ack.load(std::memory_order_acquire) != 2u) {
         if (!origin_live() || poll_child(nginx.child) ||
             origin.response_fragment_permit.load(std::memory_order_acquire) != 1u ||
@@ -73484,7 +73545,7 @@ static bool run_pinned_nginx_custom_hide_timeout_probe(
             GatedFragmentPeerProbeResult::Open ||
         origin.gated_fragment_probe_request.load(std::memory_order_acquire) != 2u ||
         origin.gated_fragment_probe_ack.load(std::memory_order_acquire) != 2u ||
-        probe_ns < first_ns + 600'000'000ull || probe_ns >= probe_deadline_ns) {
+        probe_ns < first_ns + pre_fragment_probe_ns || probe_ns >= probe_deadline_ns) {
         close(client);
         error = "#270 custom-hide timeout probe W2 peer-open result was invalid";
         return false;
@@ -73503,8 +73564,18 @@ static bool run_pinned_nginx_custom_hide_timeout_probe(
         if (error.empty()) error = "#270 custom-hide timeout probe W2 pre-permit custody failed";
         return false;
     }
+    while (steady_now_ns() < first_ns + cross_fragment_min_ns) {
+        if (!origin_live() || poll_child(nginx.child) ||
+            !observe_client_open_and_quiet_nonconsuming(client, 5, error)) {
+            close(client);
+            error = "#627 custom-hide timeout probe W1-to-W2 quiet custody failed";
+            return false;
+        }
+        usleep(1000);
+    }
     origin.response_fragment_permit.store(2u, std::memory_order_release);
-    const auto second_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(1);
+    const auto second_deadline =
+        std::chrono::steady_clock::now() + std::chrono::seconds(timeout_seconds);
     while (origin.response_fragments_sent.load(std::memory_order_acquire) < 2u &&
            std::chrono::steady_clock::now() < second_deadline) {
         if (!origin_live() || poll_child(nginx.child)) {
@@ -73522,7 +73593,7 @@ static bool run_pinned_nginx_custom_hide_timeout_probe(
         return false;
     }
     const u64 w2_elapsed_ns = second_ns - first_ns;
-    if (w2_elapsed_ns < 550'000'000ull || w2_elapsed_ns >= 750'000'000ull ||
+    if (w2_elapsed_ns < cross_fragment_min_ns || w2_elapsed_ns >= cross_fragment_max_ns ||
         origin.response_send_failed.load(std::memory_order_acquire) ||
         origin.response_peer_closed.load(std::memory_order_acquire) ||
         origin.response_peer_unexpected_data.load(std::memory_order_acquire) ||
@@ -73534,8 +73605,8 @@ static bool run_pinned_nginx_custom_hide_timeout_probe(
         return false;
     }
     if (complete_after_w3) {
-        const u64 quiet_horizon_ns =
-            std::max(first_ns + 1'100'000'000ull, second_ns + 600'000'000ull);
+        const u64 quiet_horizon_ns = std::max(first_ns + quiet_horizon_from_first_ns,
+                                              second_ns + quiet_horizon_from_second_ns);
         while (steady_now_ns() < quiet_horizon_ns) {
             std::string quiet_access;
             if (!origin_live() || poll_child(nginx.child) ||
@@ -73555,7 +73626,7 @@ static bool run_pinned_nginx_custom_hide_timeout_probe(
             usleep(1000);
         }
         origin.gated_fragment_probe_request.store(3u, std::memory_order_release);
-        const u64 third_probe_deadline_ns = second_ns + 750'000'000ull;
+        const u64 third_probe_deadline_ns = second_ns + cross_fragment_max_ns;
         while (origin.gated_fragment_probe_ack.load(std::memory_order_acquire) != 3u) {
             if (!origin_live() || poll_child(nginx.child) ||
                 origin.response_fragment_permit.load(std::memory_order_acquire) != 2u ||
@@ -73572,7 +73643,8 @@ static bool run_pinned_nginx_custom_hide_timeout_probe(
         if (origin.gated_fragment_probe_result.load(std::memory_order_acquire) !=
                 GatedFragmentPeerProbeResult::Open ||
             origin.gated_fragment_probe_request.load(std::memory_order_acquire) != 3u ||
-            third_probe_ns < second_ns + 600'000'000ull ||
+            third_probe_ns < second_ns + (timeout_seconds == 2u ? cross_fragment_min_ns
+                                                                : pre_fragment_probe_ns) ||
             third_probe_ns >= third_probe_deadline_ns ||
             !observe_client_open_and_quiet_nonconsuming(client, 5, error)) {
             close(client);
@@ -73588,7 +73660,8 @@ static bool run_pinned_nginx_custom_hide_timeout_probe(
             return false;
         }
         origin.response_fragment_permit.store(3u, std::memory_order_release);
-        const auto third_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(1);
+        const auto third_deadline =
+            std::chrono::steady_clock::now() + std::chrono::seconds(timeout_seconds);
         while (origin.response_fragments_sent.load(std::memory_order_acquire) < 3u &&
                std::chrono::steady_clock::now() < third_deadline) {
             if (!origin_live() || poll_child(nginx.child)) {
@@ -73599,10 +73672,9 @@ static bool run_pinned_nginx_custom_hide_timeout_probe(
             usleep(1000);
         }
         const u64 third_ns = origin.response_fragment_sent_ns[2].load(std::memory_order_acquire);
-        const auto completion_timing_valid = [](u64 first, u64 second, u64 third) {
-            return second > first && third > second && second - first >= 550'000'000ull &&
-                   second - first < 750'000'000ull && third - second >= 550'000'000ull &&
-                   third - second < 750'000'000ull;
+        const auto completion_timing_valid = [&](u64 first, u64 second, u64 third) {
+            return custom_hide_timeout_fragment_gap_valid(timeout_seconds, first, second) &&
+                   custom_hide_timeout_fragment_gap_valid(timeout_seconds, second, third);
         };
         const bool completion_timing_positive =
             completion_timing_valid(first_ns, second_ns, third_ns);
@@ -73768,15 +73840,16 @@ static bool run_pinned_nginx_custom_hide_timeout_probe(
         std::cerr << "PASS: #270 custom-hide completion W1/W2/W3 and full response wire observed\n";
         return true;
     }
-    const auto expiry_timing_is_valid = [](u64 elapsed_ns) {
-        return elapsed_ns >= 750'000'000ull && elapsed_ns < 2'000'000'000ull;
+    const auto expiry_timing_is_valid = [&](u64 elapsed_ns) {
+        return custom_hide_timeout_expiry_elapsed_valid(timeout_seconds, elapsed_ns);
     };
     if (!observe_client_open_and_quiet_nonconsuming(client, 200, error)) {
         close(client);
         error = "#270 custom-hide timeout probe lost downstream open state after W2";
         return false;
     }
-    const u64 quiet_horizon_ns = first_ns + 1'100'000'000ull;
+    const u64 quiet_horizon_ns =
+        std::max(first_ns + quiet_horizon_from_first_ns, second_ns + quiet_horizon_from_second_ns);
     while (steady_now_ns() < quiet_horizon_ns) {
         std::string quiet_access;
         if (!origin_live() || poll_child(nginx.child) ||
@@ -73802,7 +73875,8 @@ static bool run_pinned_nginx_custom_hide_timeout_probe(
     bool actual_eof = false;
     bool response_read_error = false;
     u64 eof_ns = 0u;
-    const auto response_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(3);
+    const auto response_deadline =
+        std::chrono::steady_clock::now() + std::chrono::seconds(timeout_seconds + 2u);
     while (std::chrono::steady_clock::now() < response_deadline) {
         pollfd state{client, POLLIN | POLLHUP | POLLERR, 0};
         const int ready = poll(&state, 1, 10);
@@ -73831,15 +73905,17 @@ static bool run_pinned_nginx_custom_hide_timeout_probe(
     const u64 observed_ns = eof_ns;
     LiveAccessLedgerObserver live_observer;
     live_observer.freeze_eof(eof_ns);
-    const auto expiry_timing_tuple_valid = [](u64 first_ns, u64 second_ns, u64 terminal_ns) {
-        return second_ns > first_ns && terminal_ns > second_ns &&
-               second_ns - first_ns >= 550'000'000ull && second_ns - first_ns < 750'000'000ull &&
-               terminal_ns - second_ns >= 750'000'000ull &&
-               terminal_ns - second_ns < 2'000'000'000ull;
+    const auto expiry_timing_tuple_valid = [&](u64 first_ns, u64 second_ns, u64 terminal_ns) {
+        return custom_hide_timeout_timing_tuple_valid(
+            timeout_seconds, first_ns, second_ns, terminal_ns);
     };
     const bool timing_tuple_positive = expiry_timing_tuple_valid(first_ns, second_ns, observed_ns);
     const bool timing_tuple_mutant_rejected =
-        !expiry_timing_tuple_valid(first_ns, second_ns, first_ns + 1'000'000'000ull);
+        !expiry_timing_tuple_valid(
+            first_ns,
+            first_ns + (timeout_seconds == 2u ? 1'000'000'000ull : 400'000'000ull),
+            observed_ns) &&
+        !expiry_timing_tuple_valid(first_ns, second_ns, second_ns + expiry_max_from_second_ns);
     std::string access;
     const bool access_read = read_request_length_access_file(temp.nginx_access_log, access, error);
     u64 initial_access_sample_ns = 0u;
@@ -73879,9 +73955,9 @@ static bool run_pinned_nginx_custom_hide_timeout_probe(
                                            !response_matches_expiry_contract(missing_unrelated) &&
                                            !response_matches_expiry_contract(body_corruption);
     const bool timing_mutants_rejected = timing_tuple_positive && timing_tuple_mutant_rejected &&
-                                         !expiry_timing_is_valid(400'000'000ull) &&
-                                         !expiry_timing_is_valid(749'999'999ull) &&
-                                         !expiry_timing_is_valid(2'000'000'000ull);
+                                         !expiry_timing_is_valid(cross_fragment_min_ns - 1u) &&
+                                         !expiry_timing_is_valid(expiry_min_from_second_ns - 1u) &&
+                                         !expiry_timing_is_valid(expiry_max_from_second_ns);
     const std::string expected_upstream =
         "GET /buffered-timeout?q=1 HTTP/1.1\r\nHost: 127.0.0.1:" + std::to_string(backend_port) +
         "\r\n\r\n";
@@ -74310,6 +74386,26 @@ static bool run_pinned_nginx_custom_hide_timeout_explicit_buffering_oracle(std::
                 "differed";
             return false;
         }
+    }
+    return true;
+}
+
+static bool run_pinned_nginx_custom_hide_timeout_two_second_oracle(std::string& error) {
+    if (!run_custom_hide_timeout_two_second_timing_self_check(error)) return false;
+    for (bool completion : {false, true}) {
+        const std::string mode = completion ? "completion" : "expiry";
+        if (!run_pinned_nginx_custom_hide_timeout_probe(
+                "rut-nginx-627-custom-hide-2s-" + mode + "-" + std::to_string(getpid()),
+                error,
+                completion,
+                nullptr,
+                nullptr,
+                nullptr,
+                nullptr,
+                "X-Powered-By",
+                true,
+                2u))
+            return false;
     }
     return true;
 }
@@ -77339,6 +77435,8 @@ int main(int argc, char** argv) {
     const bool pinned_nginx_custom_hide_timeout_explicit_buffering_oracle =
         argc == 2 &&
         strcmp(argv[1], "--pinned-nginx-custom-hide-timeout-explicit-buffering-oracle") == 0;
+    const bool pinned_nginx_custom_hide_timeout_two_second_oracle =
+        argc == 2 && strcmp(argv[1], "--pinned-nginx-custom-hide-timeout-2s-oracle") == 0;
     const bool pinned_nginx_default_buffering_201_incomplete_body_inactivity_expiry_oracle =
         argc == 2 &&
         strcmp(argv[1],
@@ -77646,6 +77744,7 @@ int main(int argc, char** argv) {
          !pinned_nginx_default_buffering_third_body_progress_expiry_oracle &&
          !pinned_nginx_explicit_buffering_on_baseline_oracle &&
          !pinned_nginx_custom_hide_timeout_explicit_buffering_oracle &&
+         !pinned_nginx_custom_hide_timeout_two_second_oracle &&
          !pinned_nginx_default_buffering_201_incomplete_body_inactivity_expiry_oracle &&
          !pinned_nginx_default_buffering_202_incomplete_body_inactivity_expiry_oracle &&
          !pinned_nginx_default_buffering_304_content_length_metadata_oracle &&
@@ -77854,6 +77953,7 @@ int main(int argc, char** argv) {
                "   or: test_nginx_differential --pinned-nginx-proxy-hide-header-oracle\n"
                "   or: test_nginx_differential --pinned-nginx-custom-hide-timeout-probe\n"
                "   or: test_nginx_differential --pinned-nginx-custom-hide-timeout-completion\n"
+               "   or: test_nginx_differential --pinned-nginx-custom-hide-timeout-2s-oracle\n"
                "   or: test_nginx_differential "
                "--converter-custom-hide-timeout-explicit-buffering-cli-differential "
                "<absolute-rut-executable> <absolute-converter-executable>\n"
@@ -78324,6 +78424,16 @@ int main(int argc, char** argv) {
         }
         std::cerr << "PASS: #621 pinned nginx omitted and explicit proxy_buffering on "
                      "custom-hide timeout expiry/completion matched\n";
+        return 0;
+    }
+    if (pinned_nginx_custom_hide_timeout_two_second_oracle) {
+        std::string oracle_error;
+        if (!run_pinned_nginx_custom_hide_timeout_two_second_oracle(oracle_error)) {
+            std::cerr << "FAIL [#627 pinned nginx custom-hide 2s oracle]: " << oracle_error << "\n";
+            return 1;
+        }
+        std::cerr << "PASS: #627 pinned nginx explicit-on custom-hide 2s expiry/completion "
+                     "oracle observed the exact bodyless-GET wire and timing windows\n";
         return 0;
     }
     if (converter_custom_hide_timeout_cli_differential) {

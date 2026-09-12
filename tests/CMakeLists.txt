@@ -1294,6 +1294,17 @@ if(RUT_ENABLE_JIT)
         ENVIRONMENT "RUT_NGINX_DIFFERENTIAL_REQUIRED=1"
     )
     add_test(
+        NAME test_nginx_issue627_custom_hide_timeout_2s_oracle
+        COMMAND test_nginx_differential --pinned-nginx-custom-hide-timeout-2s-oracle
+    )
+    set_tests_properties(test_nginx_issue627_custom_hide_timeout_2s_oracle PROPERTIES
+        LABELS "integration;nginx;docker"
+        RUN_SERIAL TRUE
+        RESOURCE_LOCK nginx-differential
+        TIMEOUT 360
+        ENVIRONMENT "RUT_NGINX_DIFFERENTIAL_REQUIRED=1"
+    )
+    add_test(
         NAME test_nginx_issue270_custom_hide_timeout_cli_differential
         COMMAND test_nginx_differential --converter-custom-hide-timeout-cli-differential
                 $<TARGET_FILE:rut> $<TARGET_FILE:rut-nginx-convert>
