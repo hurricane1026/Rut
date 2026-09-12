@@ -950,7 +950,7 @@ static DockerInfoResult run_docker_info_runner(const std::vector<std::string>& a
         int32_t error_number;
     };
     static constexpr uint32_t kLaunchMagic = 0x52555436u;
-    static_assert(sizeof(LaunchRecord) <= PIPE_BUF);
+    static_assert(sizeof(LaunchRecord) < PIPE_BUF);
     int status_pipe[2] = {-1, -1};
     const auto launch_failure = [&]() {
         if (status_pipe[0] >= 0) close(status_pipe[0]);
