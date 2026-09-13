@@ -85,8 +85,10 @@ runtime tests / 920 checks. Capability PR #642 merged as `f08b85ba` from final
 head `da180b1c` after complete independent review and CI `34734172519`:
 all 14 ordinary jobs and required nginx 163/163, zero skips, 638.52s;
 public capability 1.32s. #640/#641 are closed with combined behavior/CI evidence.
-The bounded Off model/lowering and actual same-file converter differential
-remain pending before support promotion; no compatibility row is promoted.
+Bounded Off model/provenance/lowering `a2358195` is independently approved and
+passes Clang Release build, all 192 parser tests / 19991 checks and converter
+CLI checks. The actual same-file converter differential and complete CI remain
+pending before support promotion; no compatibility row is promoted.
 
 | nginx feature | parser | converter | RUT capability | behavior test | status |
 | --- | --- | --- | --- | --- | --- |

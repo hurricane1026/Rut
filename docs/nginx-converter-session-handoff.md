@@ -80,7 +80,25 @@ Broad #270 remains PARTIAL and #271 remains BLOCKED_BY_RUT. None of that proves
 the new explicit `proxy_buffering off` scope. Verify current issue/PR state if
 making new status claims; these are recorded prior-run results, not reruns.
 
-## CURRENT: bounded Off model/provenance/lowering
+## CURRENT: actual converter-stdout explicit-Off differential
+
+Model/provenance/lowering `a2358195` is independently APPROVED and locally
+validated: Clang Release `-j1` build, full parser 192 tests / 19991 checks
+(4.46s), converter CLI 0.05s, zero CTest skips. Logs:
+`/tmp/rut-638-off-model-build.log`, `/tmp/rut-638-off-model-tests.log`,
+`/tmp/rut-638-off-model-fixture-build.log`,
+`/tmp/rut-638-off-model-fixture-tests.log`. The first parser run failed a new
+sibling fixture's unsupported redirect URL; fixing it to the existing accepted
+literal reached the intended off-scope assertion and passed. Review continued
+APPROVE. Initial rejected patches remain `/tmp/rut-638-off-first-unaccepted.patch`
+and `/tmp/rut-638-off-second-unaccepted.patch`; primary fallback corrected
+remaining declaration-order/diagnostic issues and completed controls after
+Luna's implementation. Different Luna reviewed the complete final result.
+Luna is now implementing only differential/CMake changes; lead schedules tests.
+Bounded parser/lowering and CLI stdout are now available, but no actual off
+nginx/RUT pair is yet proven and no support row is promoted.
+
+### Accepted capability and next-stage design
 
 Capability #642 merged into converter integration as
 `f08b85ba208e8955c9fca3644eb966703651af8b`, reviewed final head `da180b1c`.
@@ -89,9 +107,8 @@ zero skips, 638.52s (ordinary capability 1.32s; off oracle 1.63s;
 shared self-check 0.01s). Log `/tmp/rut-642-da180-nginx-ci.log`.
 #640/#641 are closed with combined proof; #638 remains open. Parent #269
 was rechecked OPEN/draft. The new branch starts at the accepted merge.
-Luna is implementing only parser/model/provenance/lowering and focused tests;
-the lead owns documentation and later heavy tests. Different-worker review
-follows the frozen patch. Actual converter-stdout differential is still required.
+The parser/model/provenance/lowering increment is now accepted locally as
+recorded above. Actual converter-stdout differential is still required.
 
 Reviewed design is in #638 comment `5650540578`: exact root loopback
 listener/upstream, no URI/hide/siblings, literal `1s`; authenticate Off semantic
@@ -244,12 +261,12 @@ capability or converter admission.
 
 ## NEXT
 
-1. Independently review and validate bounded Off model/provenance/lowering.
-2. Implement the actual same-file converter-stdout nginx/RUT differential pair.
-3. Independently review/CI the complete candidate and update only the exact proven scope.
+1. Independently review and validate the actual same-file converter-stdout pair.
+2. Complete normal/required CI and integrate only into converter integration.
+3. Update only the exact proven scope and resolve #638.
 
-`proxy_buffering off` is still rejected by the converter. Candidate runtime
-paths from a source audit are not behavioral proof. Do not declare SUPPORTED
+The bounded `proxy_buffering off` model/lowering is locally validated.
+Parser and generated-source tests are not paired runtime behavioral proof. Do not declare SUPPORTED
 until the precise supported input scope has actual equivalence evidence.
 
 ## Testing and issue discipline
@@ -285,7 +302,8 @@ The audit, snapshots/ownership and shared validator/controls are complete.
 The nginx-only candidate passed complete CI and merged as ed0eec96.
 Shared capture d9e1733a passed independent review, Release build and 7/7 tests.
 The dedicated ordinary-RUT capability passed full CI and merged as f08b85ba.
-Next finish bounded Off model/provenance/lowering and the actual converter pair.
+Bounded Off model/provenance/lowering a2358195 passed independent review and
+parser/CLI validation. Next finish the actual converter-stdout pair.
 Proceed with one small implementation → different-worker review →
 lead-scheduled tests → status/issue update at a time. Do not claim off support
 from untested source or nginx-only evidence. Keep parent PR #269 draft and
