@@ -66476,6 +66476,164 @@ static bool capture_explicit_off_episode(Recorder& origin,
     return true;
 }
 
+static std::string make_handwritten_explicit_off_capability_source(u16 frontend_port,
+                                                                   u16 backend_port,
+                                                                   const std::string& access_path) {
+    return "accessLog {\n  path: \"" + access_path +
+           "\",\n  format: downstreamRequestBytes,\n  publication: live\n}\n"
+           "listen 127.0.0.1:" +
+           std::to_string(frontend_port) +
+           "\nupstream capability_backend at \"127.0.0.1:" + std::to_string(backend_port) +
+           "\"\n"
+           R"rut(route GET "/" {
+  return forward(capability_backend,
+    request_policy: { version: "HTTP/1.1", host: "upstream", connection: "omit",
+      strip_headers: ["Connection", "Keep-Alive", "TE", "Expect", "Upgrade"] },
+    response_policy: { version: "HTTP/1.1", framing: "content_length",
+      connection: "request", server: "nginx/1.29.7", date: "current",
+      hide_headers: ["Date", "Server", "X-Pad"] },
+    failure_policy: { version: "HTTP/1.1", status: 502, reason: "Bad Gateway",
+      content_type: "text/html", server: "nginx/1.29.7", date: "current",
+      connection: "request", head_mode: "reject",
+      body: b"<html>\r\n<head><title>502 Bad Gateway</title></head>\r\n<body>\r\n<center><h1>502 Bad Gateway</h1></center>\r\n<hr><center>nginx/1.29.7</center>\r\n</body>\r\n</html>\r\n" },
+    timeout_failure_policy: { version: "HTTP/1.1", status: 504,
+      reason: "Gateway Time-out", content_type: "text/html",
+      server: "nginx/1.29.7", date: "current", connection: "request",
+      head_mode: "reject",
+      body: b"<html>\r\n<head><title>504 Gateway Time-out</title></head>\r\n<body>\r\n<center><h1>504 Gateway Time-out</h1></center>\r\n<hr><center>nginx/1.29.7</center>\r\n</body>\r\n</html>\r\n" },
+    response_read_timeout: 1s,
+    response_buffering: "none")
+}
+)rut";
+}
+
+static bool run_handwritten_explicit_off_capability(TempDir& temp,
+                                                    const char* rut_path,
+                                                    std::string& error) {
+    if (rut_path == nullptr || rut_path[0] != '/' || access(rut_path, X_OK) != 0) {
+        error = "#638 handwritten capability requires an executable absolute RUT path";
+        return false;
+    }
+    HeldLoopbackPorts reservations;
+    u16 ports[2]{};
+    if (!reservations.reserve_four_digit(0u, ports[0]) ||
+        !reservations.reserve_four_digit(1u, ports[1]) || ports[0] == ports[1]) {
+        error = "#638 handwritten capability could not reserve distinct ports";
+        return false;
+    }
+    const std::string original_source =
+        make_handwritten_explicit_off_capability_source(ports[0], ports[1], temp.rut_access_log);
+    std::string source = original_source;
+    bool success = false;
+    struct Diagnostics {
+        const std::string& original_source;
+        const TempDir& temp;
+        const std::string& error;
+        bool& success;
+        ~Diagnostics() {
+            if (success) return;
+            std::cerr << "#638 handwritten capability source (pre-poison):\n" << original_source;
+            dump_log(temp.rut_log, "#638 handwritten capability RUT log");
+            dump_log(temp.rut_access_log, "#638 handwritten capability access log");
+            std::cerr << "#638 handwritten capability error: " << error << "\n";
+        }
+    } diagnostics{original_source, temp, error, success};
+    if (!write_file(temp.source, source.data(), source.size())) {
+        error = "#638 handwritten capability source write failed";
+        return false;
+    }
+
+    Recorder origin;
+    origin.wait_response_peer_close = true;
+    origin.probe_after_response_open = true;
+    origin.observe_extra_requests_until_stop = true;
+    if (!handoff_held_loopback_port(
+            &reservations.fds[1], ports[1], "#638 handwritten capability origin bind", error) ||
+        !origin.setup(ports[1],
+                      1u,
+                      kDefaultBufferingTimeoutOrigin,
+                      sizeof(kDefaultBufferingTimeoutOrigin) - 1u)) {
+        if (error.empty()) error = "#638 handwritten capability origin setup failed";
+        return false;
+    }
+    const auto origin_live = [&]() {
+        return origin.running.load(std::memory_order_acquire) &&
+               origin.thread_alive.load(std::memory_order_acquire) &&
+               !origin.listener_failed.load(std::memory_order_acquire);
+    };
+    const auto origin_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+    while (!origin_live() && std::chrono::steady_clock::now() < origin_deadline) usleep(1000);
+    if (!origin_live()) {
+        error = "#638 handwritten capability origin was not live before runtime handoff";
+        return false;
+    }
+    ChildGuard runtime;
+    if (!handoff_held_loopback_port(
+            &reservations.fds[0], ports[0], "#638 handwritten capability runtime bind", error) ||
+        !spawn_child(
+            {rut_path, temp.source, "--shards", "1", "--no-pin", "--drain", "0", "--opt", "2"},
+            temp.rut_log,
+            runtime.child) ||
+        !wait_ready(ports[0], runtime.child, error)) {
+        if (error.empty()) error = "#638 handwritten capability RUT failed to start";
+        return false;
+    }
+    const std::string loaded_record = "Loaded program: " + temp.source + " (opt O2)\n";
+    const std::string backend_record = "Backend: io_uring\n";
+    const auto loaded_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+    while ((!log_contains(temp.rut_log, loaded_record.c_str()) ||
+            !log_contains(temp.rut_log, backend_record.c_str())) &&
+           std::chrono::steady_clock::now() < loaded_deadline) {
+        if (poll_child(runtime.child)) {
+            error = "#638 handwritten capability RUT exited before exact O2/io_uring load";
+            return false;
+        }
+        usleep(1000);
+    }
+    if (!log_contains(temp.rut_log, loaded_record.c_str()) ||
+        !log_contains(temp.rut_log, backend_record.c_str())) {
+        error = "#638 handwritten capability lacked exact O2/io_uring load evidence";
+        return false;
+    }
+    std::fill(source.begin(), source.end(), 'P');
+    if (!write_file(temp.source, source.data(), source.size())) {
+        error = "#638 handwritten capability source poison failed after public load";
+        return false;
+    }
+    ExplicitOffObservation observation;
+    if (!capture_explicit_off_episode(
+            origin, runtime.child, ports[0], temp.rut_access_log, observation, error))
+        return false;
+    const std::string expected_upstream =
+        "GET /buffered-timeout?q=1 HTTP/1.1\r\nHost: 127.0.0.1:" + std::to_string(ports[1]) +
+        "\r\n\r\n";
+    const std::vector<char> expected_wire(expected_upstream.begin(), expected_upstream.end());
+    const bool runtime_stopped = stop_child(runtime.child);
+    origin.stop();
+    const bool lifecycle_ok = runtime_stopped && runtime.child.status_valid &&
+                              WIFEXITED(runtime.child.status) &&
+                              WEXITSTATUS(runtime.child.status) == 0;
+    const bool history_ok = origin.history.size() == 1u && origin.history[0] == expected_wire &&
+                            origin.request == expected_wire &&
+                            origin.response_peer_close_count.load(std::memory_order_acquire) ==
+                                observation.close_count &&
+                            origin.response_clean_shutdown.load(std::memory_order_acquire) &&
+                            origin.response_connection_closed.load(std::memory_order_acquire) &&
+                            !origin.thread_alive.load(std::memory_order_acquire) &&
+                            origin.listen_fd < 0;
+    std::string runtime_log;
+    if (!lifecycle_ok || !history_ok ||
+        !read_exact_return204_log(
+            temp.rut_log, "#638 handwritten capability runtime log", runtime_log, error) ||
+        !validate_rut_exact_ipv4_runtime_log(runtime_log, temp.source, ports[0], error)) {
+        if (error.empty()) error = "#638 handwritten capability lifecycle/history was not exact";
+        return false;
+    }
+    success = true;
+    std::cerr << "PASS: #638 handwritten ordinary-RUT response_buffering none capability\n";
+    return true;
+}
+
 // #638 is deliberately an nginx-only oracle: proxy_buffering off must expose
 // the already-published response prefix before proxy_read_timeout expires.
 static bool run_pinned_nginx_explicit_buffering_off_oracle(TempDir& temp,
@@ -80335,6 +80493,8 @@ int main(int argc, char** argv) {
         argc == 2 && strcmp(argv[1], "--pinned-nginx-explicit-buffering-on-baseline-oracle") == 0;
     const bool pinned_nginx_explicit_buffering_off_oracle =
         argc == 2 && strcmp(argv[1], "--pinned-nginx-explicit-buffering-off-oracle") == 0;
+    const bool rut_explicit_buffering_off_capability =
+        argc == 3 && strcmp(argv[1], "--rut-explicit-buffering-off-capability") == 0;
     const bool pinned_nginx_custom_hide_timeout_explicit_buffering_oracle =
         argc == 2 &&
         strcmp(argv[1], "--pinned-nginx-custom-hide-timeout-explicit-buffering-oracle") == 0;
@@ -80657,7 +80817,7 @@ int main(int argc, char** argv) {
          !pinned_nginx_default_buffering_three_publication_completion_oracle &&
          !pinned_nginx_default_buffering_third_body_progress_expiry_oracle &&
          !pinned_nginx_explicit_buffering_on_baseline_oracle &&
-         !pinned_nginx_explicit_buffering_off_oracle &&
+         !pinned_nginx_explicit_buffering_off_oracle && !rut_explicit_buffering_off_capability &&
          !pinned_nginx_custom_hide_timeout_explicit_buffering_oracle &&
          !pinned_nginx_custom_hide_timeout_two_second_oracle &&
          !pinned_nginx_bodyless_head_delayed_completion_oracle &&
@@ -80961,6 +81121,8 @@ int main(int argc, char** argv) {
                "--pinned-nginx-explicit-buffering-on-baseline-oracle\n"
                "   or: test_nginx_differential "
                "--pinned-nginx-explicit-buffering-off-oracle\n"
+               "   or: test_nginx_differential --rut-explicit-buffering-off-capability "
+               "<absolute-rut-executable>\n"
                "   or: test_nginx_differential "
                "--pinned-nginx-default-buffering-201-incomplete-body-inactivity-expiry-oracle\n"
                "   or: test_nginx_differential "
@@ -81462,6 +81624,16 @@ int main(int argc, char** argv) {
     if (!temp.create()) {
         std::cerr << "FAIL [preflight]: secure temporary directory creation failed\n";
         return 1;
+    }
+    if (rut_explicit_buffering_off_capability) {
+        std::string capability_error;
+        if (!run_explicit_off_observation_self_check(capability_error) ||
+            !run_handwritten_explicit_off_capability(temp, argv[2], capability_error)) {
+            std::cerr << "FAIL [#638 handwritten ordinary-RUT explicit-off capability]: "
+                      << capability_error << "\n";
+            return 1;
+        }
+        return 0;
     }
     if (docker_info_launch_diagnostic) {
         std::cerr << "Docker launch diagnostic: NOT ACCEPTANCE (one bounded docker info launch)\n";
