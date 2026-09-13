@@ -577,12 +577,18 @@ struct RouteConfig {
     // bounded the scan and admitted every enum value.
     bool has_slash_normalized_exact_strict_local_response_inventory() const {
         if (!strict_local_response_table_is_valid()) return false;
+        return has_slash_normalized_exact_strict_local_response_inventory_validated();
+    }
+
+private:
+    bool has_slash_normalized_exact_strict_local_response_inventory_validated() const {
         for (u32 i = 0; i < exact_strict_local_response_binding_count; i++)
             if (exact_strict_local_response_bindings[i].path_view == ExactPathView::SlashNormalized)
                 return true;
         return false;
     }
 
+public:
     bool has_strict_local_response_table_inventory() const {
         return has_strict_local_response_policy_inventory() || has_pre_route_metadata() ||
                has_unmatched_metadata() || has_exact_strict_local_response_inventory();
@@ -696,7 +702,8 @@ struct RouteConfig {
             return config_ ? config_->pre_route_policy_id_validated(method) : 0;
         }
         bool has_slash_normalized_exact_strict_local_response_inventory() const {
-            return config_ && config_->has_slash_normalized_exact_strict_local_response_inventory();
+            return config_ &&
+                   config_->has_slash_normalized_exact_strict_local_response_inventory_validated();
         }
         u16 match_exact_strict_local_response(Str target, u8 method) const {
             return config_ ? config_->match_exact_strict_local_response_validated(target, method)

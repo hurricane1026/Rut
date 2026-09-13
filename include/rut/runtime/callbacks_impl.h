@@ -2307,7 +2307,7 @@ void on_header_received(void* lp, Connection& conn, IoEvent ev) {
                 return;
             }
             const bool has_normalized_exact_inventory =
-                config->has_slash_normalized_exact_strict_local_response_inventory();
+                exact_view.has_slash_normalized_exact_strict_local_response_inventory();
             u16 exact_policy_id = 0;
             if (has_normalized_exact_inventory) {
                 const auto selection = select_slash_normalized_exact_strict_local_response(
