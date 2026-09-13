@@ -464,6 +464,13 @@ bool handle_configured_strict_local_response(Loop* loop,
                                              Connection& conn,
                                              const RouteConfig* config,
                                              u16 policy_id);
+template <typename Loop>
+bool handle_configured_strict_local_response_in_scope(
+    Loop* loop,
+    Connection& conn,
+    const RouteConfig* config,
+    u16 policy_id,
+    const RouteConfig::StrictLocalResponseView& view);
 u32 pipeline_leftover(const Connection& conn);
 PipelineTransitionResult pipeline_transition_status(const Connection& conn);
 PipelineTransitionResult pipeline_advance(Connection& conn);
@@ -588,8 +595,9 @@ struct SlashNormalizedExactSelectionResult {
 // never changes the recv/log/forward target. OutputOverflow is a proven miss
 // for the normalized view but still permits an exact match against the complete
 // Raw view.
+template <typename ConfigView>
 inline SlashNormalizedExactSelectionResult select_slash_normalized_exact_strict_local_response(
-    const Connection& conn, const RouteConfig& config, u8 method_key) {
+    const Connection& conn, const ConfigView& config, u8 method_key) {
     const SlashNormalizedExactSelectionResult invalid{
         SlashNormalizedExactSelectionState::InvalidInput, 0};
     if (!config.has_slash_normalized_exact_strict_local_response_inventory() ||
@@ -2194,11 +2202,21 @@ void on_header_received(void* lp, Connection& conn, IoEvent ev) {
     // accounting or any response publication.  An active exact table also
     // requires a complete origin-form HTTP/1.1 request and the full-target
     // fragment witness before either exact selection or canonical fallback.
-    if ((has_strict_inventory && !config->strict_local_response_table_is_valid()) ||
-        (has_exact_inventory && (!conn.req_strict_h1_complete ||
-                                 conn.req_http_version != static_cast<u8>(HttpVersion::Http11) ||
-                                 conn.req_path_canon.ptr == nullptr ||
-                                 conn.req_target_has_fragment || conn.req_malformed))) {
+    const u8 request_method_key = route_method_key(static_cast<LogHttpMethod>(conn.req_method));
+    u16 pre_route_policy_id = 0;
+    if (config != nullptr) {
+        const auto entry_view = config->strict_local_response_view();
+        if (has_strict_inventory && !entry_view.valid_for(config)) {
+            conn.req_start_us = 0;
+            loop->close_conn(conn);
+            return;
+        }
+        pre_route_policy_id = entry_view.pre_route_policy_id(request_method_key);
+    }
+    if (has_exact_inventory && (!conn.req_strict_h1_complete ||
+                                conn.req_http_version != static_cast<u8>(HttpVersion::Http11) ||
+                                conn.req_path_canon.ptr == nullptr ||
+                                conn.req_target_has_fragment || conn.req_malformed)) {
         // The request timestamp is provisionally captured before config pin,
         // but this fence deliberately precedes epoch/metrics acquisition.
         // Clear it so close_conn does not publish a matching epoch leave or
@@ -2207,9 +2225,6 @@ void on_header_received(void* lp, Connection& conn, IoEvent ev) {
         loop->close_conn(conn);
         return;
     }
-    const u8 request_method_key = route_method_key(static_cast<LogHttpMethod>(conn.req_method));
-    const u16 pre_route_policy_id =
-        config != nullptr ? config->pre_route_policy_id(request_method_key) : 0;
     if (pre_route_policy_id != 0 &&
         !pre_route_strict_local_response_request_is_admitted(conn, request_method_key)) {
         conn.req_start_us = 0;
@@ -2283,36 +2298,47 @@ void on_header_received(void* lp, Connection& conn, IoEvent ev) {
     RouteParam route_params[kMaxRouteParams]{};
     u32 route_param_count = 0;
     if (config) {
-        const bool has_normalized_exact_inventory =
-            has_exact_inventory &&
-            config->has_slash_normalized_exact_strict_local_response_inventory();
-        u16 exact_policy_id = 0;
-        if (has_normalized_exact_inventory) {
-            const auto selection = select_slash_normalized_exact_strict_local_response(
-                conn, *config, request_method_key);
-            if (selection.state == SlashNormalizedExactSelectionState::InvalidInput) {
+        if (has_exact_inventory) {
+            // Request accounting/firewall/metrics above may call out. Revalidate
+            // here; reuse only through synchronous exact selection and publication.
+            const auto exact_view = config->strict_local_response_view();
+            if (has_strict_inventory && !exact_view.valid_for(config)) {
                 loop->close_conn(conn);
                 return;
             }
-            if (selection.state == SlashNormalizedExactSelectionState::Match)
-                exact_policy_id = selection.policy_id;
-        } else if (has_exact_inventory) {
-            // Preserve the established Raw-only fast path byte-for-byte: it
-            // neither obtains the new witness nor invokes the normalizer.
-            u32 raw_target_len = 0;
-            while (raw_target_len < sizeof(conn.req_path) && conn.req_path[raw_target_len] != '\0')
-                raw_target_len++;
-            exact_policy_id = config->match_exact_strict_local_response(
-                Str{conn.req_path, raw_target_len}, request_method_key);
-        }
-        if (exact_policy_id != 0) {
-            if (!exact_strict_local_response_request_is_admitted(conn)) {
-                loop->close_conn(conn);
+            const bool has_normalized_exact_inventory =
+                has_exact_inventory &&
+                config->has_slash_normalized_exact_strict_local_response_inventory();
+            u16 exact_policy_id = 0;
+            if (has_normalized_exact_inventory) {
+                const auto selection = select_slash_normalized_exact_strict_local_response(
+                    conn, exact_view, request_method_key);
+                if (selection.state == SlashNormalizedExactSelectionState::InvalidInput) {
+                    loop->close_conn(conn);
+                    return;
+                }
+                if (selection.state == SlashNormalizedExactSelectionState::Match)
+                    exact_policy_id = selection.policy_id;
+            } else if (has_exact_inventory) {
+                // Preserve the established Raw-only fast path byte-for-byte: it
+                // neither obtains the new witness nor invokes the normalizer.
+                u32 raw_target_len = 0;
+                while (raw_target_len < sizeof(conn.req_path) &&
+                       conn.req_path[raw_target_len] != '\0')
+                    raw_target_len++;
+                exact_policy_id = exact_view.match_exact_strict_local_response(
+                    Str{conn.req_path, raw_target_len}, request_method_key);
+            }
+            if (exact_policy_id != 0) {
+                if (!exact_strict_local_response_request_is_admitted(conn)) {
+                    loop->close_conn(conn);
+                    return;
+                }
+                conn.http1_pipeline_boundary_owners_settled = false;
+                (void)handle_configured_strict_local_response_in_scope(
+                    loop, conn, config, exact_policy_id, exact_view);
                 return;
             }
-            conn.http1_pipeline_boundary_owners_settled = false;
-            (void)handle_configured_strict_local_response(loop, conn, config, exact_policy_id);
-            return;
         }
         // Use the parser-supplied canonical view (PR #50 round 7 path A)
         // to skip the redundant canon scan and the strlen-style scan
@@ -8749,12 +8775,26 @@ bool handle_configured_strict_local_response(Loop* loop,
                                              Connection& conn,
                                              const RouteConfig* config,
                                              u16 policy_id) {
+    if (config == nullptr) {
+        loop->close_conn(conn);
+        return true;
+    }
+    const auto view = config->strict_local_response_view();
+    return handle_configured_strict_local_response_in_scope(loop, conn, config, policy_id, view);
+}
+
+template <typename Loop>
+bool handle_configured_strict_local_response_in_scope(
+    Loop* loop,
+    Connection& conn,
+    const RouteConfig* config,
+    u16 policy_id,
+    const RouteConfig::StrictLocalResponseView& view) {
     auto fail_closed = [&]() {
         loop->close_conn(conn);
         return true;
     };
-    if (config == nullptr || !config->strict_local_response_table_is_valid() ||
-        !config->strict_local_response_policy_id_is_owned(policy_id) ||
+    if (!view.valid_for(config) || !config->strict_local_response_policy_id_is_owned(policy_id) ||
         !conn.req_strict_h1_complete ||
         conn.req_http_version != static_cast<u8>(HttpVersion::Http11) || conn.req_malformed ||
         conn.req_header_end == 0 || conn.req_header_end > conn.recv_buf.len())
