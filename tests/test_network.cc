@@ -11334,6 +11334,39 @@ TEST(exact_local_response, scoped_validation_rechecks_mutation_and_config_identi
     }
 }
 
+TEST(exact_local_response, scoped_normalized_inventory_rechecks_between_scopes) {
+    auto config = std::make_unique<RouteConfig>();
+    REQUIRE(install_representation200_exact(*config, "/static"));
+    {
+        const auto raw = config->strict_local_response_view();
+        REQUIRE(raw.valid_for(config.get()));
+        CHECK_FALSE(raw.has_slash_normalized_exact_strict_local_response_inventory());
+    }
+    config->exact_strict_local_response_bindings[0].path_view = ExactPathView::SlashNormalized;
+    REQUIRE(config->has_slash_normalized_exact_strict_local_response_inventory());
+    {
+        const auto normalized = config->strict_local_response_view();
+        REQUIRE(normalized.valid_for(config.get()));
+        CHECK(normalized.has_slash_normalized_exact_strict_local_response_inventory());
+        const auto match = normalized.match_exact_strict_local_response_views(
+            lit_str("//static"), lit_str("/static"), kRouteMethodGet);
+        CHECK_EQ(match.policy_id, 1u);
+    }
+    // Damage an unused slot: public calls and a new scope must reject the
+    // entire table even though the normalized binding itself remains valid.
+    config->exact_strict_local_response_bindings[1].policy_id = 1;
+    CHECK_FALSE(config->has_slash_normalized_exact_strict_local_response_inventory());
+    {
+        const auto invalid = config->strict_local_response_view();
+        CHECK_FALSE(invalid.valid_for(config.get()));
+        CHECK_FALSE(invalid.has_slash_normalized_exact_strict_local_response_inventory());
+    }
+    config->exact_strict_local_response_bindings[1] = {};
+    const auto restored = config->strict_local_response_view();
+    CHECK(restored.valid_for(config.get()));
+    CHECK(restored.has_slash_normalized_exact_strict_local_response_inventory());
+}
+
 static u32 unmatched_h2_outer_hit_calls = 0;
 static u64 unmatched_h2_outer_hit_handler(void*, jit::HandlerCtx*, const u8*, u32, void*) {
     unmatched_h2_outer_hit_calls++;
