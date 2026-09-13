@@ -1,0 +1,45 @@
+--- a/src/ssl.c
++++ b/src/ssl.c
+@@ -1,6 +1,8 @@
+ // Copyright (C) 2013 - Will Glozer.  All rights reserved.
+ 
+ #include <pthread.h>
++#include <stdio.h>
++#include <string.h>
+ 
+ #include <openssl/evp.h>
+ #include <openssl/err.h>
+@@ -19,7 +21,14 @@
+         SSL_CTX_set_verify(ctx, SSL_VERIFY_NONE, NULL);
+         SSL_CTX_set_verify_depth(ctx, 0);
+         SSL_CTX_set_mode(ctx, SSL_MODE_AUTO_RETRY);
+-        SSL_CTX_set_session_cache_mode(ctx, SSL_SESS_CACHE_CLIENT);
++        SSL_CTX_set_session_cache_mode(ctx, SSL_SESS_CACHE_OFF);
++        if (!SSL_CTX_set_min_proto_version(ctx, TLS1_3_VERSION) ||
++            !SSL_CTX_set_max_proto_version(ctx, TLS1_3_VERSION) ||
++            !SSL_CTX_set_ciphersuites(ctx, "TLS_AES_256_GCM_SHA384")) {
++            SSL_CTX_free(ctx);
++            return NULL;
++        }
++        puts("TLS_PROFILE TLSv1.3 TLS_AES_256_GCM_SHA384 full-handshake");
+     }
+ 
+     return ctx;
+@@ -36,12 +45,17 @@
+             default:                   return ERROR;
+         }
+     }
++    if (SSL_version(c->ssl) != TLS1_3_VERSION || SSL_session_reused(c->ssl) ||
++        strcmp(SSL_get_cipher_name(c->ssl), "TLS_AES_256_GCM_SHA384") != 0) {
++        return ERROR;
++    }
+     return OK;
+ }
+ 
+ status ssl_close(connection *c) {
+     SSL_shutdown(c->ssl);
+     SSL_clear(c->ssl);
++    SSL_set_session(c->ssl, NULL);
+     return OK;
+ }
+ 
