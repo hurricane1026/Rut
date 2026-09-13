@@ -19,8 +19,10 @@
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
+#include <iomanip>
 #include <iostream>
 #include <memory>
+#include <sstream>
 #include <string>
 #include <thread>
 #include <vector>
@@ -66302,6 +66304,48 @@ static bool capture_explicit_off_episode(Recorder& origin,
     LiveAccessLedgerObserver ledger;
     ledger.freeze_eof(eof_ns);
     const u64 ledger_deadline = eof_ns + 250'000'000ull;
+    std::string last_sample_access;
+    bool last_sample_read_ok = false;
+    LiveRetirementSnapshot last_sample_retirement;
+    u64 last_sample_ns = 0u;
+    const auto ledger_phase_name = [](LiveAccessLedgerObserver::Phase phase) {
+        switch (phase) {
+            case LiveAccessLedgerObserver::Phase::Pending:
+                return "Pending";
+            case LiveAccessLedgerObserver::Phase::Accepted:
+                return "Accepted";
+            case LiveAccessLedgerObserver::Phase::Stabilizing:
+                return "Stabilizing";
+            case LiveAccessLedgerObserver::Phase::Complete:
+                return "Complete";
+            case LiveAccessLedgerObserver::Phase::Failed:
+                return "Failed";
+        }
+        return "Unknown";
+    };
+    const auto retirement_state_name = [](LiveRetirementState state) {
+        switch (state) {
+            case LiveRetirementState::Pending:
+                return "Pending";
+            case LiveRetirementState::Ready:
+                return "Ready";
+            case LiveRetirementState::Invalid:
+                return "Invalid";
+        }
+        return "Unknown";
+    };
+    const auto add_live_observation_diagnostic = [&]() {
+        std::ostringstream detail;
+        detail << " [publication=" << origin_sent_ns << ", prefix=" << prefix_complete_ns
+               << ", ack=" << open_ack_ns << ", eof=" << eof_ns
+               << ", retirement=" << retirement_state_name(last_sample_retirement.state) << "/"
+               << last_sample_retirement.count << "/" << last_sample_retirement.timestamp_ns
+               << ", sample=" << last_sample_ns << ", ledger=" << ledger_phase_name(ledger.phase)
+               << ", read_ok=" << (last_sample_read_ok ? "true" : "false")
+               << ", access_bytes=" << last_sample_access.size()
+               << ", access=" << std::quoted(last_sample_access) << "]";
+        error += detail.str();
+    };
     const auto retirement_timing_valid = [&](const LiveRetirementSnapshot& snapshot,
                                              bool require_ready) {
         if (snapshot.state == LiveRetirementState::Invalid) return false;
@@ -66319,8 +66363,13 @@ static bool capture_explicit_off_episode(Recorder& origin,
                                      origin.response_peer_close_count,
                                      origin.response_peer_closed_ns,
                                      origin_sent_ns);
+        const u64 sample_ns = steady_now_ns();
+        last_sample_access = access;
+        last_sample_read_ok = read_ok;
+        last_sample_retirement = retirement_snapshot;
+        last_sample_ns = sample_ns;
         const bool retirement_ready = retirement_timing_valid(retirement_snapshot, true);
-        const bool sampled = ledger.sample(steady_now_ns(),
+        const bool sampled = ledger.sample(sample_ns,
                                            access,
                                            read_ok,
                                            poll_child(frontend) == false,
@@ -66331,6 +66380,7 @@ static bool capture_explicit_off_episode(Recorder& origin,
                                            retirement_timing_valid(retirement_snapshot, false));
         if (!sampled) {
             error = "#638 live access/retirement observation failed before EOF+250ms";
+            add_live_observation_diagnostic();
             return false;
         }
         ledger_ready = ledger.phase == LiveAccessLedgerObserver::Phase::Accepted;
@@ -66338,10 +66388,12 @@ static bool capture_explicit_off_episode(Recorder& origin,
     }
     if (!ledger_ready || !ledger.accepted_before_deadline()) {
         error = "#638 exact access ledger/retirement evidence was late or missing";
+        add_live_observation_diagnostic();
         return false;
     }
     if (!ledger.begin_stability(steady_now_ns())) {
         error = "#638 could not begin live ledger stability";
+        add_live_observation_diagnostic();
         return false;
     }
     const u64 stability_deadline = steady_now_ns() + 175'000'000ull;
@@ -66354,6 +66406,10 @@ static bool capture_explicit_off_episode(Recorder& origin,
                                      origin.response_peer_closed_ns,
                                      origin_sent_ns);
         const u64 sample_ns = steady_now_ns();
+        last_sample_access = stable_access;
+        last_sample_read_ok = read_ok;
+        last_sample_retirement = retirement_snapshot;
+        last_sample_ns = sample_ns;
         if (!ledger.stable_sample(sample_ns,
                                   stable_access,
                                   read_ok,
@@ -66366,6 +66422,7 @@ static bool capture_explicit_off_episode(Recorder& origin,
             origin.accepted.load(std::memory_order_acquire) != 1u ||
             origin.requests.load(std::memory_order_acquire) != 1u) {
             error = "#638 live ledger/retirement evidence changed during 175ms stability";
+            add_live_observation_diagnostic();
             return false;
         }
         usleep(5000);
@@ -66380,6 +66437,10 @@ static bool capture_explicit_off_episode(Recorder& origin,
                                      origin.response_peer_closed_ns,
                                      origin_sent_ns);
         const u64 final_sample_ns = steady_now_ns();
+        last_sample_access = stable_access;
+        last_sample_read_ok = final_read_ok;
+        last_sample_retirement = retirement_snapshot;
+        last_sample_ns = final_sample_ns;
         if (!final_read_ok ||
             !ledger.stable_sample(final_sample_ns,
                                   stable_access,
@@ -66391,6 +66452,7 @@ static bool capture_explicit_off_episode(Recorder& origin,
                                   true,
                                   retirement_timing_valid(retirement_snapshot, true))) {
             error = "#638 live ledger stability did not complete";
+            add_live_observation_diagnostic();
             return false;
         }
     }
@@ -66422,6 +66484,10 @@ static bool capture_explicit_off_episode(Recorder& origin,
                                  origin_sent_ns);
     const bool frozen_live = origin_live() && !poll_child(frontend);
     const u64 frozen_sample_ns = steady_now_ns();
+    last_sample_access = frozen_access;
+    last_sample_read_ok = true;
+    last_sample_retirement = frozen_retirement;
+    last_sample_ns = frozen_sample_ns;
     const bool frozen_sampled =
         ledger.stable_sample(frozen_sample_ns,
                              frozen_access,
@@ -66465,6 +66531,7 @@ static bool capture_explicit_off_episode(Recorder& origin,
     observation.stability_deadline_ns = ledger.stability_deadline_ns;
     if (!frozen_sampled || !validate_explicit_off_observation(observation, error)) {
         if (error.empty()) error = "#638 live explicit-off observation was rejected";
+        add_live_observation_diagnostic();
         return false;
     }
     const bool client_closed = close(client.fd) == 0;
