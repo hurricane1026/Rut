@@ -14384,6 +14384,42 @@ TEST(unmatched_local_response,
     CHECK_EQ(epoch.epoch.load(std::memory_order_acquire), 2u);
 }
 
+TEST(unmatched_local_response, large_binary_representation_copy_capacity_and_head) {
+    Connection conn{};
+    conn.req_method = static_cast<u8>(LogHttpMethod::Get);
+    auto policy = make_representation200_policy();
+    u8 body[kMaxStrictLocalResponseBodyLen];
+    for (u32 i = 0; i < sizeof(body); ++i) body[i] = static_cast<u8>(i * 37u);
+    policy.body = {reinterpret_cast<const char*>(body), sizeof(body)};
+    u8 output[8192];
+    memset(output, 0xa5, sizeof(output));
+    u32 length = 0;
+    REQUIRE(build_strict_local_response(conn, policy, false, output, sizeof(output), &length));
+    const std::string wire(reinterpret_cast<const char*>(output), length);
+    const auto end = wire.find("\r\n\r\n");
+    REQUIRE(end != std::string::npos);
+    const u32 header_length = static_cast<u32>(end) + 4u;
+    CHECK_EQ(length, header_length + sizeof(body));
+    CHECK(wire.find("Content-Length: 4096\r\n") != std::string::npos);
+    CHECK_EQ(memcmp(output + header_length, body, sizeof(body)), 0);
+    const u32 exact_capacity = length;
+    memset(output, 0xa5, sizeof(output));
+    REQUIRE(build_strict_local_response(conn, policy, false, output, exact_capacity, &length));
+    CHECK_EQ(length, exact_capacity);
+    CHECK_EQ(output[exact_capacity], 0xa5u);
+    CHECK_EQ(memcmp(output + header_length, body, sizeof(body)), 0);
+    memset(output, 0xa5, sizeof(output));
+    CHECK_FALSE(
+        build_strict_local_response(conn, policy, false, output, exact_capacity - 1u, &length));
+    CHECK_EQ(length, 0u);
+    CHECK_EQ(output[exact_capacity - 1u], 0xa5u);
+    conn.req_method = static_cast<u8>(LogHttpMethod::Head);
+    memset(output, 0xa5, sizeof(output));
+    REQUIRE(build_strict_local_response(conn, policy, true, output, header_length, &length));
+    CHECK_EQ(length, header_length);
+    CHECK_EQ(output[header_length], 0xa5u);
+}
+
 TEST(unmatched_local_response, generic_serializer_preserves_failure_policy_wire) {
     Connection conn{};
     u8 recv[64]{}, send[1024]{};
