@@ -22,29 +22,11 @@ enum class HttpHeaderValidation : u8 {
 // would serialize as ambiguous (e.g. "Content-Type " with a trailing
 // space won't match the default-suppression check).
 inline bool is_http_tchar(u8 c) {
-    if (c >= '0' && c <= '9') return true;
-    if (c >= 'A' && c <= 'Z') return true;
-    if (c >= 'a' && c <= 'z') return true;
-    switch (c) {
-        case '!':
-        case '#':
-        case '$':
-        case '%':
-        case '&':
-        case '\'':
-        case '*':
-        case '+':
-        case '-':
-        case '.':
-        case '^':
-        case '_':
-        case '`':
-        case '|':
-        case '~':
-            return true;
-        default:
-            return false;
-    }
+    // RFC token bytes as a 256-bit set. The high half is empty, so obs-text
+    // remains rejected without a separate range branch.
+    static constexpr u64 kTokenBits[4] = {
+        0x03ff6cfa00000000ULL, 0x57ffffffc7fffffeULL, 0x0000000000000000ULL, 0x0000000000000000ULL};
+    return ((kTokenBits[c >> 6] >> (c & 63)) & 1u) != 0;
 }
 
 // Case-insensitive ASCII compare — returns true iff the two byte
