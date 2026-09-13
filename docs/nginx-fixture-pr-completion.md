@@ -29,7 +29,7 @@ and CTest topology/broker/differential checks, and the final residue audit.
 The ready-for-review event started a redundant privileged run of the same
 already-tested head; that duplicate was canceled after merge.
 
-## #376: isolated live wildcard handoff candidate
+## #376: accepted isolated live wildcard handoff
 
 Source `04a5b1a8` replaces the rejected monolithic transaction with authenticated
 version/mode/Target-start and monotonically ordered phase/decision frames.
@@ -52,8 +52,13 @@ and cause checks after an incomplete worker draft; the earlier draft remains
 `/tmp/rut376-live-target.cc`, not accepted code. Local single-TU Clang Release
 build/link and both protocol/wait-strategy self-checks pass. The local ordinary
 run returns prerequisite skip 77 because passwordless sudo is unavailable;
-this is not live acceptance. Fresh full and required privileged CI must pass
-before #376 or #269 merge. No converter/runtime or compatibility expansion.
+this is not live acceptance. Corrected head `876f1c97` subsequently passed
+complete standard/pinned-nginx CI `34741574200` (164/164, zero skips, 651.02s)
+and required privileged CI `34741574170`: all six mutation/canonical pairs,
+focused broker CTest, generated differential direct/CTest and final
+`residual-count=0 audit-error=0`. Different-worker source and privileged-evidence
+reviews approve. #376 merged as `fe98a1b9`. No converter/runtime or compatibility
+expansion follows from these fixture checks.
 
 ### First current-head privileged failure (retained)
 
@@ -67,3 +72,12 @@ removing the guard prerequisite. The correction reports actual missing guard
 custody immediately, with the original exact listener still live. The parent
 requires that specific live state and no collision artifacts before accepting
 the negative control, then independently verifies cleanup and canonical recovery.
+
+## Final integration
+
+#269 retains the accepted source and test tree from #376. Its final workflow
+also removes `ready_for_review` from the fixture triggers: draft PR creation
+and code updates already execute the required job, so readiness alone should
+not repeat the same-head run. Opened/synchronize/reopened PR events, main
+pushes and manual dispatch remain. This change was independently reviewed;
+final integration-head CI is required before the authorized main merge.

@@ -8,8 +8,13 @@ any pending code is accepted. Recheck local and GitHub state before acting.
 The user explicitly authorized finishing and merging #374, #376, then #269.
 This replaces the older keep-#269-draft restriction below. #374 merged at
 `c966c023` after complete ordinary, pinned-nginx and privileged CI; #376's
-live wildcard handoff and six isolated mutation/canonical recovery pairs are
-under required CI. Complete that gate before the final #269 integration gate.
+live wildcard handoff and six isolated mutation/canonical recovery pairs merged
+as `fe98a1b9`, after head `876f1c97` passed standard/pinned-nginx CI
+`34741574200` (164/164, zero skips, 651.02s) and privileged CI `34741574170`
+(all direct/CTest cases and zero residue). The final #269 integration retains
+that accepted source/test tree and requires complete final-head CI before main
+merge. Check [#269](https://github.com/hurricane1026/Rut/pull/269) for its current
+state; if merged, this integration task is complete.
 
 Work occurs in isolated worktrees `Rut_pr374_completion`,
 `Rut_pr376_completion`, and `Rut_pr269_completion` under
@@ -337,10 +342,9 @@ capability or converter admission.
 
 ## NEXT
 
-No work remains for the exact #638 goal. Do not repeat its oracle, capability,
-converter pair or CI merely to restart a completed handoff. No subsequent
-compatibility increment has been selected. Broad #270/#271 remain unchanged;
-future work must define its own bounded scope and evidence.
+If #269 remains open, complete its final CI and authorized main merge. If it is
+merged, no work remains for the selected integration task. Do not restart #638;
+no further compatibility increment is selected. Broad #270/#271 remain unchanged.
 
 ## Testing and issue discipline
 
