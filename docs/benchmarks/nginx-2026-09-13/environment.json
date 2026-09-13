@@ -1,0 +1,32 @@
+{
+  "date": "2026-09-13T16:10:01+08:00",
+  "kernel": "Linux-7.2.4-200.fc44.x86_64-x86_64-with-glibc2.43",
+  "main_commit": "44d3cb0162707bd837533bc079d23aa3dc73ffab",
+  "build_source_commit": "a283731e38a311df0ac51437a36a97ea085485eb",
+  "production_diff": "",
+  "compiler": "clang version 22.1.8 (Fedora 22.1.8-4.fc44)\nTarget: x86_64-redhat-linux-gnu\nThread model: posix\nInstalledDir: /usr/bin\nConfiguration file: /etc/clang/x86_64-redhat-linux-gnu-clang++.cfg",
+  "wrk_commit": "a211dd5a7050b1f9e8a9870b95513060e72ac4a0",
+  "nginx_image": "[\"nginx@sha256:1854da86e82d5dfb49a8f3d78b099adcc7e36608b207146ed95cd47937938a40\"]",
+  "server_cpu": 2,
+  "origin_cpu": 3,
+  "client_cpus": [
+    4,
+    5
+  ],
+  "repeats": 3,
+  "duration_seconds": 8,
+  "warmup_seconds": 2,
+  "concurrency": [
+    1,
+    32,
+    128
+  ],
+  "tcp_tw_reuse": "2",
+  "sha256": {
+    "<workspace>/Rut_build627_clang/src/rut": "9cdcb3417fa8f45b50adc53ee750f171b163e27dc1254a71fb896c52bfabe72b",
+    "<workspace>/Rut_build627_clang/src/rut-nginx-convert": "1e5505b58f5392384070b9b8f64053573f51b8fbeaab1ba7b50ccef074e6c3bc",
+    "<workspace>/Rut_benchmark_20260913/wrk/wrk": "5033152ee3b16a55c7f3cb4331cb3459437596c6d79c64636cc7027ad01fb28b",
+    "<workspace>/Rut_benchmark_20260913/static.rut": "3c1bba41ad674aa5aef5bade99797c09a18b3bd5100c811986577de3c47a0929",
+    "<workspace>/Rut_benchmark_20260913/proxy.rut": "6bd58c6393e4468fe1177ee2766c3730f8f90ec8ba2118603a4d04bab08d1845"
+  }
+}

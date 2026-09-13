@@ -1,0 +1,13 @@
+--- a/src/wrk.c
++++ b/src/wrk.c
+@@ -445,2 +445,10 @@
+   error:
++    static _Thread_local unsigned diagnostic_count = 0;
++    if (diagnostic_count++ < 8) {
++        fprintf(stderr, "READ_DIAGNOSTIC n=%zd errno=%d parser_errno=%u state=%u\n", (ssize_t)n, (ssize_t)n < 0 ? errno : 0, c->parser.http_errno, c->parser.state);
++        if (n > 0 && n < sizeof(c->buf)) {
++            fwrite(c->buf, 1, n < 300 ? n : 300, stderr);
++            fprintf(stderr, "\nEND_DIAGNOSTIC\n");
++        }
++    }
+     c->thread->errors.read++;
