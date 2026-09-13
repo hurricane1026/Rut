@@ -66596,39 +66596,37 @@ static std::string make_handwritten_explicit_off_capability_source(u16 frontend_
 )rut";
 }
 
-static bool run_handwritten_explicit_off_capability(TempDir& temp,
-                                                    const char* rut_path,
-                                                    std::string& error) {
+static bool run_explicit_off_rut_episode(TempDir& temp,
+                                         const char* rut_path,
+                                         const std::string& original_source,
+                                         const u16* ports,
+                                         HeldLoopbackPorts& reservations,
+                                         const std::string& access_path,
+                                         ExplicitOffObservation& observation,
+                                         std::vector<std::vector<char>>& joined_history,
+                                         std::string& error) {
     if (rut_path == nullptr || rut_path[0] != '/' || access(rut_path, X_OK) != 0) {
-        error = "#638 handwritten capability requires an executable absolute RUT path";
+        error = "#638 ordinary-RUT off episode requires an executable absolute RUT path";
         return false;
     }
-    HeldLoopbackPorts reservations;
-    u16 ports[2]{};
-    if (!reservations.reserve_four_digit(0u, ports[0]) ||
-        !reservations.reserve_four_digit(1u, ports[1]) || ports[0] == ports[1]) {
-        error = "#638 handwritten capability could not reserve distinct ports";
-        return false;
-    }
-    const std::string original_source =
-        make_handwritten_explicit_off_capability_source(ports[0], ports[1], temp.rut_access_log);
     std::string source = original_source;
     bool success = false;
     struct Diagnostics {
         const std::string& original_source;
         const TempDir& temp;
+        const std::string& access_path;
         const std::string& error;
         bool& success;
         ~Diagnostics() {
             if (success) return;
-            std::cerr << "#638 handwritten capability source (pre-poison):\n" << original_source;
-            dump_log(temp.rut_log, "#638 handwritten capability RUT log");
-            dump_log(temp.rut_access_log, "#638 handwritten capability access log");
-            std::cerr << "#638 handwritten capability error: " << error << "\n";
+            std::cerr << "#638 ordinary-RUT off episode source (pre-poison):\n" << original_source;
+            dump_log(temp.rut_log, "#638 ordinary-RUT off episode RUT log");
+            dump_log(access_path, "#638 ordinary-RUT off episode access log");
+            std::cerr << "#638 ordinary-RUT off episode error: " << error << "\n";
         }
-    } diagnostics{original_source, temp, error, success};
+    } diagnostics{original_source, temp, access_path, error, success};
     if (!write_file(temp.source, source.data(), source.size())) {
-        error = "#638 handwritten capability source write failed";
+        error = "#638 ordinary-RUT off episode source write failed";
         return false;
     }
 
@@ -66637,12 +66635,12 @@ static bool run_handwritten_explicit_off_capability(TempDir& temp,
     origin.probe_after_response_open = true;
     origin.observe_extra_requests_until_stop = true;
     if (!handoff_held_loopback_port(
-            &reservations.fds[1], ports[1], "#638 handwritten capability origin bind", error) ||
+            &reservations.fds[1], ports[1], "#638 ordinary-RUT off episode origin bind", error) ||
         !origin.setup(ports[1],
                       1u,
                       kDefaultBufferingTimeoutOrigin,
                       sizeof(kDefaultBufferingTimeoutOrigin) - 1u)) {
-        if (error.empty()) error = "#638 handwritten capability origin setup failed";
+        if (error.empty()) error = "#638 ordinary-RUT off episode origin setup failed";
         return false;
     }
     const auto origin_live = [&]() {
@@ -66653,18 +66651,18 @@ static bool run_handwritten_explicit_off_capability(TempDir& temp,
     const auto origin_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
     while (!origin_live() && std::chrono::steady_clock::now() < origin_deadline) usleep(1000);
     if (!origin_live()) {
-        error = "#638 handwritten capability origin was not live before runtime handoff";
+        error = "#638 ordinary-RUT off episode origin was not live before runtime handoff";
         return false;
     }
     ChildGuard runtime;
     if (!handoff_held_loopback_port(
-            &reservations.fds[0], ports[0], "#638 handwritten capability runtime bind", error) ||
+            &reservations.fds[0], ports[0], "#638 ordinary-RUT off episode runtime bind", error) ||
         !spawn_child(
             {rut_path, temp.source, "--shards", "1", "--no-pin", "--drain", "0", "--opt", "2"},
             temp.rut_log,
             runtime.child) ||
         !wait_ready(ports[0], runtime.child, error)) {
-        if (error.empty()) error = "#638 handwritten capability RUT failed to start";
+        if (error.empty()) error = "#638 ordinary-RUT off episode RUT failed to start";
         return false;
     }
     const std::string loaded_record = "Loaded program: " + temp.source + " (opt O2)\n";
@@ -66674,24 +66672,30 @@ static bool run_handwritten_explicit_off_capability(TempDir& temp,
             !log_contains(temp.rut_log, backend_record.c_str())) &&
            std::chrono::steady_clock::now() < loaded_deadline) {
         if (poll_child(runtime.child)) {
-            error = "#638 handwritten capability RUT exited before exact O2/io_uring load";
+            error = "#638 ordinary-RUT off episode RUT exited before exact O2/io_uring load";
             return false;
         }
         usleep(1000);
     }
     if (!log_contains(temp.rut_log, loaded_record.c_str()) ||
         !log_contains(temp.rut_log, backend_record.c_str())) {
-        error = "#638 handwritten capability lacked exact O2/io_uring load evidence";
+        error = "#638 ordinary-RUT off episode lacked exact O2/io_uring load evidence";
         return false;
     }
     std::fill(source.begin(), source.end(), 'P');
     if (!write_file(temp.source, source.data(), source.size())) {
-        error = "#638 handwritten capability source poison failed after public load";
+        error = "#638 ordinary-RUT off episode source poison failed after public load";
         return false;
     }
-    ExplicitOffObservation observation;
+    std::string poisoned_source;
+    if (!read_exact_rut_source(
+            temp.source, "#638 source poison readback", poisoned_source, error) ||
+        poisoned_source != source) {
+        error = "#638 source poison did not persist exactly";
+        return false;
+    }
     if (!capture_explicit_off_episode(
-            origin, runtime.child, ports[0], temp.rut_access_log, observation, error))
+            origin, runtime.child, ports[0], access_path, observation, error))
         return false;
     const std::string expected_upstream =
         "GET /buffered-timeout?q=1 HTTP/1.1\r\nHost: 127.0.0.1:" + std::to_string(ports[1]) +
@@ -66713,14 +66717,44 @@ static bool run_handwritten_explicit_off_capability(TempDir& temp,
     std::string runtime_log;
     if (!lifecycle_ok || !history_ok ||
         !read_exact_return204_log(
-            temp.rut_log, "#638 handwritten capability runtime log", runtime_log, error) ||
+            temp.rut_log, "#638 ordinary-RUT off episode runtime log", runtime_log, error) ||
         !validate_rut_exact_ipv4_runtime_log(runtime_log, temp.source, ports[0], error)) {
-        if (error.empty()) error = "#638 handwritten capability lifecycle/history was not exact";
+        if (error.empty()) error = "#638 ordinary-RUT off episode lifecycle/history was not exact";
         return false;
     }
+    joined_history = origin.history;
     success = true;
-    std::cerr << "PASS: #638 handwritten ordinary-RUT response_buffering none capability\n";
+    std::cerr << "PASS: #638 ordinary-RUT response_buffering None episode\n";
     return true;
+}
+
+static bool run_handwritten_explicit_off_capability(TempDir& temp,
+                                                    const char* rut_path,
+                                                    std::string& error) {
+    if (rut_path == nullptr || rut_path[0] != '/' || access(rut_path, X_OK) != 0) {
+        error = "#638 handwritten capability requires an executable absolute RUT path";
+        return false;
+    }
+    HeldLoopbackPorts reservations;
+    u16 ports[2]{};
+    if (!reservations.reserve_four_digit(0u, ports[0]) ||
+        !reservations.reserve_four_digit(1u, ports[1]) || ports[0] == ports[1]) {
+        error = "#638 handwritten capability could not reserve distinct ports";
+        return false;
+    }
+    const std::string original_source =
+        make_handwritten_explicit_off_capability_source(ports[0], ports[1], temp.rut_access_log);
+    ExplicitOffObservation observation;
+    std::vector<std::vector<char>> joined_history;
+    return run_explicit_off_rut_episode(temp,
+                                        rut_path,
+                                        original_source,
+                                        ports,
+                                        reservations,
+                                        temp.rut_access_log,
+                                        observation,
+                                        joined_history,
+                                        error);
 }
 
 struct ExplicitOffPairContext {
@@ -66873,6 +66907,151 @@ static bool run_pinned_nginx_explicit_buffering_off_oracle(TempDir& temp,
     std::cerr << "PASS: #638 pinned nginx explicit proxy_buffering off exposed one exact 127-byte "
                  "200/CL12+hello prefix before the 1s inactivity EOF, retired one origin, and "
                  "recorded exactly 60\\n with no retry; nginx-only oracle.\n";
+    return true;
+}
+
+static bool run_explicit_off_converter_pair(TempDir& temp,
+                                            const std::string& container_name,
+                                            const char* rut_path,
+                                            const char* converter_path,
+                                            std::string& error) {
+    if (rut_path == nullptr || converter_path == nullptr || rut_path[0] != '/' ||
+        converter_path[0] != '/' || access(rut_path, X_OK) != 0 ||
+        access(converter_path, X_OK) != 0) {
+        error = "#638 pair requires absolute executable RUT and converter paths";
+        return false;
+    }
+    if (!run_explicit_off_observation_self_check(error) || !check_exact_rut_source_capture(error))
+        return false;
+    ExplicitOffPairContext nginx;
+    std::string captured_stdout;
+    bool success = false;
+    struct Diagnostics {
+        const TempDir& temp;
+        const ExplicitOffPairContext& nginx;
+        const std::string& captured_stdout;
+        bool& success;
+        ~Diagnostics() {
+            if (success) return;
+            std::cerr << "#638 immutable nginx config:\n"
+                      << nginx.immutable_config << "#638 actual converter stdout (pre-poison):\n"
+                      << captured_stdout;
+            dump_log(temp.nginx_log, "#638 pair nginx log");
+            dump_log(temp.rut_log, "#638 pair RUT log");
+            dump_log(temp.nginx_access_log, "#638 pair live access sink");
+            dump_log(temp.nginx_access_snapshot, "#638 pair nginx access snapshot");
+            dump_log(temp.preflight_log, "#638 pair converter diagnostics");
+        }
+    } diagnostics{temp, nginx, captured_stdout, success};
+    if (!run_pinned_nginx_explicit_buffering_off_oracle(temp, container_name, error, &nginx) ||
+        !nginx.captured)
+        return false;
+    const auto config_unchanged = [&]() {
+        std::string bytes;
+        if (!read_exact_return204_log(
+                temp.nginx_config, "#638 pair immutable config", bytes, error) ||
+            bytes != nginx.immutable_config) {
+            error = "#638 pair config changed between consumers";
+            return false;
+        }
+        return true;
+    };
+    if (!config_unchanged()) return false;
+    if (rename(temp.nginx_access_log.c_str(), temp.nginx_access_snapshot.c_str()) != 0) {
+        error = "#638 pair could not preserve the stopped nginx ledger";
+        return false;
+    }
+    std::string nginx_access;
+    if (!read_request_length_access_file(temp.nginx_access_snapshot, nginx_access, error) ||
+        nginx_access != "60\n" || !write_file(temp.nginx_access_log, "", 0u)) {
+        error = "#638 pair could not validate nginx ledger and create the same-path RUT sink";
+        return false;
+    }
+    std::string empty_sink;
+    if (!read_request_length_access_file(temp.nginx_access_log, empty_sink, error) ||
+        !empty_sink.empty()) {
+        error = "#638 pair RUT sink was not initially empty";
+        return false;
+    }
+    const int output_fd = open(temp.source.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0600);
+    const int diagnostics_fd = open(temp.preflight_log.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0600);
+    if (output_fd < 0 || diagnostics_fd < 0) {
+        if (output_fd >= 0) close(output_fd);
+        if (diagnostics_fd >= 0) close(diagnostics_fd);
+        error = "#638 pair could not open converter stdout/stderr artifacts";
+        return false;
+    }
+    ChildGuard converter;
+    const pid_t pid = fork();
+    if (pid == 0) {
+        if (dup2(output_fd, STDOUT_FILENO) < 0 || dup2(diagnostics_fd, STDERR_FILENO) < 0)
+            _exit(127);
+        close(output_fd);
+        close(diagnostics_fd);
+        execl(converter_path,
+              converter_path,
+              "--format",
+              "nginx-http",
+              temp.nginx_config.c_str(),
+              nullptr);
+        _exit(127);
+    }
+    close(output_fd);
+    close(diagnostics_fd);
+    if (pid < 0) {
+        error = "#638 pair could not fork converter";
+        return false;
+    }
+    converter.child.pid = pid;
+    std::string converter_stderr;
+    if (!wait_child(converter.child, 10'000) || !converter.child.status_valid ||
+        !WIFEXITED(converter.child.status) || WEXITSTATUS(converter.child.status) != 0 ||
+        !read_bounded_file(temp.preflight_log, converter_stderr, error) ||
+        !converter_stderr.empty() ||
+        !read_exact_rut_source(
+            temp.source, "#638 actual converter stdout", captured_stdout, error) ||
+        captured_stdout.empty() || !config_unchanged()) {
+        if (error.empty())
+            error = "#638 converter did not return exact nonempty stdout and empty stderr";
+        return false;
+    }
+    HeldLoopbackPorts reservations;
+    const u16 ports[] = {nginx.frontend_port, nginx.backend_port};
+    if (!reservations.reserve_specific(0u, ports[0]) ||
+        !reservations.reserve_specific(1u, ports[1])) {
+        error = "#638 pair could not reacquire its original exact endpoints";
+        return false;
+    }
+    ExplicitOffObservation rut;
+    std::vector<std::vector<char>> rut_history;
+    if (!run_explicit_off_rut_episode(temp,
+                                      rut_path,
+                                      captured_stdout,
+                                      ports,
+                                      reservations,
+                                      temp.nginx_access_log,
+                                      rut,
+                                      rut_history,
+                                      error) ||
+        !config_unchanged())
+        return false;
+    std::vector<char> nginx_prefix = nginx.observation.prefix_wire;
+    std::vector<char> nginx_wire = nginx.observation.downstream_wire;
+    std::vector<char> rut_prefix = rut.prefix_wire;
+    std::vector<char> rut_wire = rut.downstream_wire;
+    if (!normalize_date(nginx_prefix) || !normalize_date(nginx_wire) ||
+        !normalize_date(rut_prefix) || !normalize_date(rut_wire) || nginx_prefix != rut_prefix ||
+        nginx_wire != rut_wire || rut_history != nginx.joined_history || rut_history.size() != 1u ||
+        rut_history[0] != nginx.joined_request || rut.ledger != nginx.observation.ledger ||
+        rut.ledger != nginx_access || rut.accepted != nginx.observation.accepted ||
+        rut.requests != nginx.observation.requests ||
+        rut.close_count != nginx.observation.close_count ||
+        rut.publication_count != nginx.observation.publication_count) {
+        error = "#638 same-file converter pair observations differed";
+        return false;
+    }
+    success = true;
+    std::cerr << "PASS: #638 same-file converter stdout nginx/RUT explicit-Off transport pair\n";
     return true;
 }
 
@@ -80614,6 +80793,8 @@ int main(int argc, char** argv) {
         argc == 2 && strcmp(argv[1], "--pinned-nginx-explicit-buffering-on-baseline-oracle") == 0;
     const bool pinned_nginx_explicit_buffering_off_oracle =
         argc == 2 && strcmp(argv[1], "--pinned-nginx-explicit-buffering-off-oracle") == 0;
+    const bool converter_explicit_off_pair =
+        argc == 4 && strcmp(argv[1], "--converter-explicit-off-cli-differential") == 0;
     const bool rut_explicit_buffering_off_capability =
         argc == 3 && strcmp(argv[1], "--rut-explicit-buffering-off-capability") == 0;
     const bool pinned_nginx_custom_hide_timeout_explicit_buffering_oracle =
@@ -80939,6 +81120,7 @@ int main(int argc, char** argv) {
          !pinned_nginx_default_buffering_third_body_progress_expiry_oracle &&
          !pinned_nginx_explicit_buffering_on_baseline_oracle &&
          !pinned_nginx_explicit_buffering_off_oracle && !rut_explicit_buffering_off_capability &&
+         !converter_explicit_off_pair &&
          !pinned_nginx_custom_hide_timeout_explicit_buffering_oracle &&
          !pinned_nginx_custom_hide_timeout_two_second_oracle &&
          !pinned_nginx_bodyless_head_delayed_completion_oracle &&
@@ -83489,6 +83671,16 @@ int main(int argc, char** argv) {
             std::cerr << "FAIL [#271 pinned nginx explicit proxy_buffering on baseline]: "
                       << oracle_error << "\n";
             dump_log(temp.nginx_log, "#271 explicit proxy_buffering on baseline nginx log");
+            return 1;
+        }
+        return 0;
+    }
+    if (converter_explicit_off_pair) {
+        const std::string name = "rut-nginx-638-off-pair-" + std::to_string(getpid()) + "-" +
+                                 (suffix ? suffix + 1 : "tmp");
+        std::string error;
+        if (!run_explicit_off_converter_pair(temp, name, argv[2], argv[3], error)) {
+            std::cerr << "FAIL [#638 same-file converter off pair]: " << error << "\n";
             return 1;
         }
         return 0;
