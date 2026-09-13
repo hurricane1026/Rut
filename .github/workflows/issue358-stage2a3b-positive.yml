@@ -1,6 +1,8 @@
-name: "#358 Stage2a3b positive (WIP only)"
+name: "Required IPv4 fixture"
 
 on:
+  push:
+    branches: [main]
   pull_request:
     types: [opened, synchronize, reopened, ready_for_review]
   workflow_dispatch:
@@ -9,7 +11,7 @@ permissions:
   contents: read
 
 concurrency:
-  group: issue358-stage2a3b-positive-wip-only
+  group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: false
 
 jobs:
@@ -17,12 +19,9 @@ jobs:
     name: Required privileged broker
     if: >-
       (github.event_name == 'pull_request' &&
-       github.event.pull_request.number == 375 &&
-       github.event.pull_request.head.ref == 'wip/issue358-stage2a3b' &&
-       github.event.pull_request.base.ref == 'agent/nginx-to-rut-converter' &&
        github.event.pull_request.head.repo.full_name == github.repository) ||
-      (github.event_name == 'workflow_dispatch' &&
-       github.ref == 'refs/heads/wip/issue358-stage2a3b')
+      github.event_name == 'workflow_dispatch' ||
+      (github.event_name == 'push' && github.ref == 'refs/heads/main')
     runs-on: ubuntu-24.04
     timeout-minutes: 30
 
@@ -39,7 +38,7 @@ jobs:
             "$log_dir/generated-differential-ctest.log"
           : > "$log_dir/audit.log"
 
-      - name: Check out exact WIP head
+      - name: Check out exact head
         uses: actions/checkout@v6
         with:
           ref: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
