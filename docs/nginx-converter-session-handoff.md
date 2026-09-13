@@ -33,16 +33,17 @@ exposed tools; the user selects the primary model in the client.
 ## Workspace and preservation
 
 - Assigned worktree: `/home/hurricane/private/code/Rut_issue627_two_second_oracle`.
-- Branch: `nginx-explicit-off-converter`, based on accepted #642 merge `f08b85ba`.
+- Branch: `nginx-explicit-off-converter`, now including accepted #643 merge `228b01dd`.
 - This session started with clean worktree and local/remote HEAD both
   `6942666557d9f9a4303d40de266b640f4920f217`.
-- Current #638 source candidate: `247338de`, independently **APPROVED for the
+- Historical nginx-only source candidate: `247338de`, independently **APPROVED for the
   shared-validator/control increment**, following the accepted snapshots fix
   `d345e933`. See current status for validation logs and the explicit primary
   implementation fallback used for final control corrections. Historical
   rejected candidates/reviews remain evidence. Complete candidate #639 was independently reviewed, passed normal and
   required CI, and merged as `ed0eec96`; extraction for the next capability
-  witness was validated as `d9e1733a`; the ordinary-RUT wrapper is CURRENT.
+  witness was validated as `d9e1733a`. The later capability and converter pair
+  are now complete through #642/#643, as recorded below.
 - Integration base: `agent/nginx-to-rut-converter`, not `main`.
 - Parent [PR #269](https://github.com/hurricane1026/Rut/pull/269) stays draft.
 - The main worktree `/home/hurricane/private/code/Rut` has unrelated user WIP in
@@ -56,10 +57,10 @@ exposed tools; the user selects the primary model in the client.
 
 1. Applicable `AGENTS.md` files, if present.
 2. This document and [current status](../.nginx-converter-status.md), especially
-   the current candidate-CI task and completed validator/snapshots evidence.
+   the completed #638 evidence and preserved earlier failures.
 3. [Compatibility matrix](nginx-compatibility.md).
 4. [Issue #638](https://github.com/hurricane1026/Rut/issues/638), including design,
-   review and capacity-blocker comments. Detailed pending handoff is preserved
+   review and capacity-blocker comments. The detailed earlier handoff is preserved
    in comment `5646579364`; Astra design is in comment `5646534982`.
 5. Relevant source in `tests/test_nginx_differential.cc` and
    `tests/CMakeLists.txt`. Verify control flow rather than trusting old line numbers.
@@ -80,25 +81,39 @@ Broad #270 remains PARTIAL and #271 remains BLOCKED_BY_RUT. None of that proves
 the new explicit `proxy_buffering off` scope. Verify current issue/PR state if
 making new status claims; these are recorded prior-run results, not reruns.
 
-## CURRENT: complete converter candidate review / PR / CI
+## CURRENT: #638 bounded goal complete
 
-Source `607b3bdd` now passes the actual same-file converter-stdout nginx/RUT
-pair with selected GET ID1/None/1s bundle/policy ownership and mutation controls,
-shared observation comparator mutations/restoration, and final settled ledgers.
-The complete source/test candidate is independently APPROVED and frozen for
-normal/required CI.
-Final controls are independently APPROVED; Clang Release `-j1` build and four
-focused CTests pass 4/4, zero skips, 6.30s (actual pair 3.22s, oracle 1.68s,
-self-check 0.03s, handwritten capability 1.37s). Logs:
-`/tmp/rut-638-off-pair-controls-build.log` and
-`/tmp/rut-638-off-pair-controls-tests.log`. The unchanged model/CLI increment
-also passed the full 192 parser tests / 19991 checks and CLI tests.
+The exact #638 goal is COMPLETE. All three stages are independently reviewed,
+CI-validated and merged only into `agent/nginx-to-rut-converter`:
 
-Luna supplied initial model and loaded-validator draft/context extraction;
-the primary used the authorized fallback for remaining corrections and the
-transport/comparator implementation. Different Luna reviewed each increment;
-complete source/test candidate `f08b85ba..607b3bdd` is independently APPROVED.
-#638 stays open and no support row is promoted until full CI evidence.
+- nginx-only oracle #639: `ed0eec96`; CI `34730518730`, 14 ordinary jobs and
+  required nginx 162/162, zero skips.
+- separate ordinary-RUT None capability #642: `f08b85ba`; CI `34734172519`,
+  14 ordinary jobs and required nginx 163/163, zero skips. Reproduced capability
+  issues #640/#641 are closed with retained failure evidence.
+- bounded Off converter and actual same-file stdout pair #643: merge
+  `228b01ddd02fde51bbc5eb9cded37291952be71b`, final PR head
+  `56ee67611f9e9873190fddab3b40409f640da531`, source `607b3bdd`.
+  CI `34736490250` passed all 14 ordinary jobs and required nginx 164/164,
+  zero skips, 649.79s. Actual converter pair 3.05s, oracle 1.67s, ordinary
+  capability 1.32s. Log `/tmp/rut-643-56ee-nginx-ci.log`.
+
+#638 is CLOSED. The compatibility matrix now marks only its exact
+root/no-URI/exact-loopback/literal-1s, fresh bodyless GET, single-publication
+inactivity-expiry scope SUPPORTED. Selected O2 GET None/1s policy ownership and
+mutation/restoration, actual converter stdout, public runtime source poison,
+shared live capture/comparator controls, same endpoints/access path and joined
+history are all covered. Broad #270 stays PARTIAL and #271 BLOCKED_BY_RUT.
+No general off semantics, other methods/statuses/framing/schedules, uploads,
+retry/reuse/pipeline or TLS/H2 are implied. Runtime does not read nginx.conf.
+
+The lead scheduled all heavy tests with local `-j1`. Luna supplied initial
+model, context extraction and validator drafts; the primary used the authorized
+fallback for corrections and transport/comparator work. Different Luna approved
+each final increment, the complete source/test candidate and the exact matrix
+scope. Earlier rejected candidates and failed logs remain preserved below and
+in #638/#640/#641. Parent #269 stays OPEN/draft; no main integration or main
+worktree WIP changes occurred. No required work remains for this bounded goal.
 
 ### Earlier local implementation evidence (historical)
 
@@ -301,13 +316,10 @@ capability or converter admission.
 
 ## NEXT
 
-1. Complete normal/required CI for the independently approved source candidate.
-2. Integrate only into converter integration after evidence passes.
-3. Update only the exact proven scope and resolve #638.
-
-The bounded `proxy_buffering off` model/lowering is locally validated.
-Parser and generated-source tests are not paired runtime behavioral proof. Do not declare SUPPORTED
-until the precise supported input scope has actual equivalence evidence.
+No work remains for the exact #638 goal. Do not repeat its oracle, capability,
+converter pair or CI merely to restart a completed handoff. No subsequent
+compatibility increment has been selected. Broad #270/#271 remain unchanged;
+future work must define its own bounded scope and evidence.
 
 ## Testing and issue discipline
 
@@ -332,21 +344,16 @@ until the precise supported input scope has actual equivalence evidence.
 ## Paste into the new session
 
 ```text
-Use Astra as architect/lead and Luna workers for implementation.
-Continue nginx.conf → ordinary RUT source conversion, not runtime nginx.conf support.
-Work in /home/hurricane/private/code/Rut_issue627_two_second_oracle.
-Read applicable AGENTS.md and docs/nginx-converter-session-handoff.md first,
-then .nginx-converter-status.md, docs/nginx-compatibility.md and issue #638.
-Verify git/GitHub state and preserve unrelated user WIP in the main worktree.
-The audit, snapshots/ownership and shared validator/controls are complete.
-The nginx-only candidate passed complete CI and merged as ed0eec96.
-Shared capture d9e1733a passed independent review, Release build and 7/7 tests.
-The dedicated ordinary-RUT capability passed full CI and merged as f08b85ba.
-Bounded Off model/provenance/lowering a2358195 passed independent review and
-parser/CLI validation. Actual converter-stdout pair and controls 607b3bdd pass local validation.
-Next finish complete-candidate review/PR/normal and required CI.
-Proceed with one small implementation → different-worker review →
-lead-scheduled tests → status/issue update at a time. Do not claim off support
-from untested source or nginx-only evidence. Keep parent PR #269 draft and
-integrate only into agent/nginx-to-rut-converter, not main.
+Read this handoff and .nginx-converter-status.md before starting new work.
+The exact #638 explicit-Off single-prefix/1s goal is COMPLETE:
+#639 oracle, #642 ordinary-RUT capability and #643 actual same-file converter
+pair all passed independent review and complete CI and merged only into
+agent/nginx-to-rut-converter. Final source merge is 228b01dd; final CI
+34736490250 passed 14 ordinary jobs and required nginx 164/164, zero skips.
+#638/#640/#641 are closed. The exact matrix row is SUPPORTED; general off
+semantics and broad #270 PARTIAL/#271 BLOCKED_BY_RUT are unchanged.
+Parent #269 remains draft and the main-worktree user WIP remains protected.
+No next increment has been selected; do not infer one or rerun completed gates.
+Preserve the Astra design/acceptance, Luna implementation and different-worker
+review preference, with the explicitly recorded primary implementation fallback.
 ```

@@ -58,43 +58,21 @@ its fix merged through #624 at `2bba609a` after CI `34320265023` passed all
 Broad #270 remains
 `PARTIAL` and #271 remains `BLOCKED_BY_RUT`.
 
-#638 `d345e933` completes only the independently reviewed snapshots/ownership
-correction. A local Clang Release build and six focused tests passed (16.65s,
-zero skips), including the first explicit-off nginx-only run (1.65s): exact
-normalized 127-byte 200/CL12 plus `hello` prefix, inactivity EOF, natural origin
-retirement and stable `60\n` ledger. The subsequent `247338de` adds one shared
-real/synthetic acceptance validator and named negative controls, independently
-approved after lead corrections to Luna's control fixtures. The new standalone
-self-check passed (0.01s), as did six focused regressions (16.40s, zero skips;
-real off oracle 1.68s). Complete candidate #639 merged as `ed0eec96` from
-`f2b1adf3` after independent review and CI `34730518730`: all 14 ordinary jobs
-and required nginx 162/162, zero skips, 717.96s (new oracle 1.83s). The ordinary-RUT capability was subsequently accepted through #642 below;
-the same-file converter differential remains pending.
-The legal-default None witness `7721e5be` loaded through public O2/io_uring but
-failed its joint live ledger/retirement gate (empty access log, 2.42s); the full
-failure and preceding invalid-source spelling are preserved in
-[#640](https://github.com/hurricane1026/Rut/issues/640). No gate was relaxed.
-Reviewed generic completion `119d7088` passes eleven focused runtime tests / 568
-checks, but the public witness still fails with EOF+2000.190475ms; diagnostic
-`60\n` is not live stability proof because the joint gate was not reached.
-[#641](https://github.com/hurricane1026/Rut/issues/641) preserves the exact timing
-failure and tracks precise None-stream timer ownership.
-Independent review and local Clang validation of `f49f0885` now prove the
-handwritten ordinary-RUT episode (1.37s, shared gates unchanged) plus 15 focused
-runtime tests / 920 checks. Capability PR #642 merged as `f08b85ba` from final
-head `da180b1c` after complete independent review and CI `34734172519`:
-all 14 ordinary jobs and required nginx 163/163, zero skips, 638.52s;
-public capability 1.32s. #640/#641 are closed with combined behavior/CI evidence.
-Bounded Off model/provenance/lowering `a2358195` is independently approved and
-passes Clang Release build, all 192 parser tests / 19991 checks and converter
-CLI checks. The actual same-file converter differential `607b3bdd` now passes locally
-(3.22s) with selected GET None/1s bundle ownership/mutations and shared pair
-comparator controls. Four focused CTests pass 4/4, zero skips, 6.30s. Complete
-source/test candidate review is independently APPROVED; full CI remains pending
-and no compatibility row is promoted.
+#638 is complete for the exact explicit-Off row below. The nginx-only oracle
+#639 merged as `ed0eec96` after CI `34730518730` (14 ordinary jobs; required
+nginx 162/162, zero skips). Separate ordinary-RUT capability #642 merged as
+`f08b85ba` after CI `34734172519` (14 ordinary jobs; required nginx 163/163,
+zero skips), resolving the reproduced completion/timing gaps #640/#641.
+Bounded converter plus actual same-file stdout differential #643 merged as
+`228b01dd`, final PR head `56ee6761`, source `607b3bdd`, after complete independent
+review and CI `34736490250`: all 14 ordinary jobs and required nginx 164/164,
+zero skips, 649.79s (actual pair 3.05s). Earlier rejected patches and failures
+remain in the issue and handoff. This supports only the exact row; broad #270
+remains PARTIAL and #271 BLOCKED_BY_RUT.
 
 | nginx feature | parser | converter | RUT capability | behavior test | status |
 | --- | --- | --- | --- | --- | --- |
+| Explicit `proxy_buffering off` / literal `proxy_read_timeout 1s`: one root no-URI proxy, exact `127.0.0.1` listener/upstream with distinct four-digit ports and request-length access ledger; one fresh default-keepalive cleartext H1.1 bodyless 60-byte `GET /buffered-timeout?q=1`, Host `client.example`; origin publishes one 103-byte 200/CL12 header-plus-`hello` prefix and stays open/silent | yes: exact lowercase On/Off semantic model; complete fresh server inventory, literal bytes, relative spans, source positions and coherent borrows are authenticated; off compositions with URI, hide headers, sibling actions, nonloopback endpoints or other timeout values are rejected | yes for this bounded configuration: standalone converter reads the same immutable complete nginx file and its stdout is the sole ordinary RUT artifact; selected O2 GET ID1/upstream0 owns the ordinary response/502/504 policies with default None and 1s timeout; None→CompleteContentLength, 1s→2s and Reject→SuppressBody mutants reject with route/bundle identity retained and restoration passes | yes for this exact single-publication expiry episode; ordinary capability #642 separately established live completion and precise None-stream timing after #640/#641 fixes; public RUT loads O2/io_uring then its source is poisoned/read back before the client episode; runtime does not consume nginx.conf | #639 pinned oracle and #643 same-file actual-stdout pair: both emit the equal strictly Date-normalized 127-byte 200/CL12/keep-alive+hello prefix before publication+800ms; fresh Open-probe ACK within 100ms of authorization; real EOF and independently observed natural retirement each in [750ms,2000ms) from publication, both after ACK, without an EOF/retirement ordering claim. Each observes the exact live `60\n` ledger plus retirement before EOF+250ms, then 175ms stable custody, freezes before cleanup and checks one exact upstream request/history after join. Same ports and access path are reused only after nginx settlement; its preserved ledger and the RUT ledger remain exact after final settlement. Shared validator and eight pair-comparator mutants reject/restoration passes. Source `607b3bdd`, final PR head `56ee6761`, merge `228b01dd`, CI `34736490250`: `14 ordinary jobs and required nginx 164/164, zero skips, 649.79s; pair 3.05s`. Other methods/statuses/framing, uploads, response refresh schedules, retries, reuse/pipeline, TLS/H2 and general off semantics are excluded; broad #270 remains PARTIAL and #271 BLOCKED_BY_RUT | SUPPORTED |
 | Explicit-on/X-Powered-By/`proxy_read_timeout 2s`: exact-loopback root/no-URI fixed IPv4 upstream; fresh bodyless default-keepalive cleartext H1.1 HEAD `/buffered-timeout?q=1`; one delayed complete-header response, no representation body | yes, existing authenticated bounded model | yes, actual standalone converter stdout and ordinary O2 selected root HEAD bundle; timeout 2s->1s, SuppressBody->Reject and None->CompleteContentLength each reject with unchanged route identity, restoration passes | yes for this exact episode; existing SuppressBody/None response and timeout primitives, no nginx runtime mode | #631 pinned baseline and #637 same immutable config/path/endpoints through nginx and generated RUT; origin publishes 182 header bytes after [1.15s,1.40s), normalized 145-byte header-only response and retirement each within 350ms, exact 61-byte upstream request, live `61\n` ledger within header+250ms and stable quiet/open downstream through header+2.25s; one request/publication/retirement, no retry, acceptance frozen before cleanup and history checked after join. CI `34698186843`: 160/160, zero skips. Other schedules/methods/bodies/names/durations/expiry/reuse/TLS excluded | SUPPORTED |
 | Explicit-on/X-Powered-By/`proxy_read_timeout 2s`: exact-loopback root/no-URI fixed IPv4 upstream; bodyless cleartext H1.1 GET `/buffered-timeout?q=1`; tested expiry/completion episodes only | yes, existing authenticated bounded model | yes, actual standalone converter stdout, fixture-supplied duration checked in owned JIT-selected bundles; selected GET 2s→1s rejects with unchanged route result, restoration passes | yes for this exact episode; existing timeout/header/buffering primitives | #628 pinned oracle and #629 same immutable complete config through nginx and generated ordinary RUT; fragment gaps [1.15s,1.40s), EOF [1.75s,2.75s) after W2, initial-deadline/1s/late controls; origin W1 187 bytes, downstream 145-byte expiry with EOF or 157-byte completion/12-byte body with quiet-open connection, exact 60-byte upstream and stable `60\n` ledger, retirement/no retry. CI `34686463457`: 158/158, zero skips. Other durations/names/methods/schedules excluded | SUPPORTED |
 | Explicit `proxy_buffering on` + `proxy_hide_header X-Powered-By` + `proxy_read_timeout 1s`: exact-loopback root/no-URI fixed IPv4 upstream, cleartext H1.1 bodyless GET `/buffered-timeout?q=1`, tested incomplete-body expiry and completion schedules only | yes; directive-order and bounded metadata rejection tests in #625 | yes; authenticated composition emits ordinary RUT identical to omitted buffering; complete-profile CLI/IR tests | yes for this representative episode; existing owned selected bundles and buffering/timer/header primitives, no nginx-specific runtime mode | #622 real-nginx oracle plus #626 same immutable complete config through nginx and converter stdout → ordinary RUT loader/runtime; W1 187 bytes, W2 `!`, completion W3 `world!`; exact normalized 145-byte expiry response with EOF / 157-byte completion with 12-byte body and quiet-open downstream; 60-byte upstream request, stable `60\n` ledger, timing/retirement/no-retry and semantic controls. Final CI `34326645381`: 156/156, zero skips. Other names/durations/methods and schedules excluded | SUPPORTED |
