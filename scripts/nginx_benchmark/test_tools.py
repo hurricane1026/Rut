@@ -7,7 +7,14 @@ import unittest
 from pathlib import Path
 from types import SimpleNamespace
 
-from run import Harness, expected_body, response, response_head
+from run import (
+    Harness,
+    connection_header,
+    expected_body,
+    request_bytes,
+    response,
+    response_head,
+)
 from summarize import aggregate, render
 
 
@@ -23,6 +30,17 @@ class FakeSocket:
 
 
 class ToolsTest(unittest.TestCase):
+    def test_keepalive_wire_profiles_preserve_original_and_default_persistence(self):
+        explicit = request_bytes("proxy", False)
+        self.assertIn(b"Connection: keep-alive\r\n", explicit)
+        implicit = request_bytes("proxy", False, "implicit")
+        self.assertEqual(implicit, b"GET /proxy HTTP/1.1\r\nHost: client.example\r\n\r\n")
+        self.assertIsNone(connection_header(False, "implicit"))
+        self.assertEqual(
+            request_bytes("proxy", True, "implicit"),
+            request_bytes("proxy", True, "explicit"),
+        )
+
     def test_fragmented_body_and_normal_close(self):
         sock = FakeSocket(
             [

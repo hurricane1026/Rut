@@ -987,6 +987,29 @@ u32 IoUringBackend::wait(IoEvent* events, u32 max_events, Connection* conns, u32
         u32 upstream_episode = 0;
         decode_user_data(cqe->user_data, conn_id, type, aux, upstream_episode);
 
+        // Dispatch an already completed downstream send before copying
+        // or publishing a later receive for that same connection. A sequential
+        // client can receive the response and submit its next request before
+        // userspace dispatches the send CQE; eager copying must not turn that
+        // request into a pipelined successor of the still-live old request.
+        // The same boundary keeps a following FIN out of the old completed-body
+        // deadline batch. Tagged sends with an active deadline retain whole-batch
+        // arbitration; only BodyComplete no longer has an expiry to arbitrate.
+        // Prebuilt header/retirement rendezvous already owns late receive
+        // bytes explicitly and must retain its existing whole-batch settlement.
+        if (type == IoEventType::Recv && aux == 0 &&
+            (conns == nullptr || conn_id >= max_conns ||
+             conns[conn_id].http1_prebuilt_disposition == Http1RequestBufferDisposition::None)) {
+            bool prior_send = false;
+            for (u32 i = 0; i < count; ++i)
+                prior_send |= events[i].conn_id == conn_id && events[i].type == IoEventType::Send &&
+                              (events[i].non_upstream_generation == 0 ||
+                               (conns != nullptr && conn_id < max_conns &&
+                                conns[conn_id].response_read_deadline_state ==
+                                    ResponseReadDeadlineState::BodyComplete));
+            if (prior_send) break;
+        }
+
         // Cancel CQEs — silently consume, don't emit event
         if (conn_id == kCancelConnId) {
             head++;

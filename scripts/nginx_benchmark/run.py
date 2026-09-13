@@ -52,17 +52,22 @@ def response_head(head):
     return int(length), headers.get(b"connection", b"").lower() == b"close"
 
 
-def request_bytes(work, close):
-    mode = "close" if close else "keep-alive"
-    return f"GET /{work} HTTP/1.1\r\nHost: client.example\r\nConnection: {mode}\r\n\r\n".encode()
+def connection_header(close, keepalive_header="explicit"):
+    return "close" if close else ("keep-alive" if keepalive_header == "explicit" else None)
+
+
+def request_bytes(work, close, keepalive_header="explicit"):
+    mode = connection_header(close, keepalive_header)
+    header = f"Connection: {mode}\r\n" if mode else ""
+    return f"GET /{work} HTTP/1.1\r\nHost: client.example\r\n{header}\r\n".encode()
 
 
 def expected_body(work):
     return b"hello from nginx" if work == "static" else b"x" * 1024
 
 
-def response(sock, work, close):
-    sock.sendall(request_bytes(work, close))
+def response(sock, work, close, keepalive_header="explicit"):
+    sock.sendall(request_bytes(work, close, keepalive_header))
     data = b""
     while b"\r\n\r\n" not in data:
         chunk = sock.recv(4096)
@@ -317,7 +322,9 @@ class Harness:
                         sock = socket.create_connection(
                             ("127.0.0.1", self.args.front_port), timeout=3
                         )
-                    raw, server_close = response(sock, work, close)
+                    raw, server_close = response(
+                        sock, work, close, self.args.keepalive_header
+                    )
                     key = (work, close)
                     if key in self.references and self.references[key] != raw:
                         raise ValueError(f"response mismatch for {key}")
@@ -339,12 +346,16 @@ class Harness:
 
     def wrk(self, work, close, concurrency, duration, label):
         a = self.args
-        mode = "close" if close else "keep-alive"
+        mode = connection_header(close, a.keepalive_header)
         lua = self.out / (label + ".lua")
         lua.write_text(
             f'wrk.method="GET"\nwrk.path="/{work}"\nwrk.headers["Host"]="client.example"\n'
-            f'wrk.headers["Connection"]="{mode}"\n'
-            'done=function(s,l,r)\n print(string.format("METRICS %.0f %.0f %.0f %.0f %.0f %d %d %d %d %d",'
+            + (
+                f'wrk.headers["Connection"]="{mode}"\n'
+                if mode
+                else 'wrk.headers["Connection"]=nil\n'
+            )
+            + 'done=function(s,l,r)\n print(string.format("METRICS %.0f %.0f %.0f %.0f %.0f %d %d %d %d %d",'
             "s.requests,s.duration,l:percentile(50),l:percentile(95),l:percentile(99),"
             "s.errors.connect,s.errors.read,s.errors.write,s.errors.status,s.errors.timeout))\nend\n"
         )
@@ -469,7 +480,9 @@ class Harness:
                                 ),
                                 3,
                             )
-                        writer.write(request_bytes(work, close))
+                        writer.write(
+                            request_bytes(work, close, self.args.keepalive_header)
+                        )
                         await asyncio.wait_for(writer.drain(), 3)
                         head = await asyncio.wait_for(reader.readuntil(b"\r\n\r\n"), 3)
                         length, server_close = response_head(head)
@@ -561,6 +574,12 @@ def arguments():
         "--client-cpus",
         required=True,
         help="comma-separated CPU IDs on distinct physical cores",
+    )
+    parser.add_argument(
+        "--keepalive-header",
+        choices=("explicit", "implicit"),
+        default="explicit",
+        help="explicit preserves the original workload; implicit uses HTTP/1.1 default persistence",
     )
     parser.add_argument("--front-port", type=int, default=8087)
     parser.add_argument("--origin-port", type=int, default=9087)
