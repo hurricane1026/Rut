@@ -91,7 +91,7 @@ u8 parse_log_method_fallback(const u8* data, u32 len, u32* method_len) {
     return static_cast<u8>(LogHttpMethod::Other);
 }
 
-void capture_request_metadata(Connection& conn) {
+static void reset_request_metadata(Connection& conn) {
     conn.begin_request_metadata_episode();
     conn.req_strict_h1_complete = false;
     conn.req_target_has_fragment = false;
@@ -139,15 +139,18 @@ void capture_request_metadata(Connection& conn) {
     conn.req_header_end = 0;
     conn.req_initial_send_len = 0;
     conn.req_content_length = 0;
+}
 
+// Parsed views stay private to this translation unit and are consumed before
+// the receive buffer can change or any caller callback can run.
+static void capture_parsed_request_metadata(Connection& conn,
+                                            const HttpParser& parser,
+                                            const ParsedRequest& req,
+                                            ParseStatus parse_status) {
     const u8* data = conn.recv_buf.data();
     const u32 kLen = conn.recv_buf.len();
     if (!data || kLen == 0) return;
 
-    HttpParser parser;
-    ParsedRequest req;
-    parser.reset();
-    const ParseStatus parse_status = parser.parse(data, kLen, &req);
     conn.req_target_has_fragment = req.target_has_fragment;
     if (parse_status == ParseStatus::Complete) {
         u32 raw_target_offset = 0;
@@ -341,6 +344,33 @@ void capture_request_metadata(Connection& conn) {
     // request — matches the pre-round-7 behavior where the dispatch
     // site canonicalized conn.req_path on the fly.
     conn.req_path_canon = canonicalize_request(Str{conn.req_path, copy_len});
+}
+
+void capture_request_metadata(Connection& conn) {
+    reset_request_metadata(conn);
+    HttpParser parser;
+    ParsedRequest req;
+    parser.reset();
+    const ParseStatus status = conn.recv_buf.data() != nullptr && conn.recv_buf.len() != 0
+                                   ? parser.parse(conn.recv_buf.data(), conn.recv_buf.len(), &req)
+                                   : ParseStatus::Incomplete;
+    capture_parsed_request_metadata(conn, parser, req, status);
+}
+
+ParseStatus parse_and_capture_request_metadata(Connection& conn) {
+    HttpParser parser;
+    ParsedRequest req;
+    parser.reset();
+    const ParseStatus status = parser.parse(conn.recv_buf.data(), conn.recv_buf.len(), &req);
+    // Fragment admission must not clear the previous accounting or publish a
+    // metadata episode. Complete and malformed requests retain the established
+    // capture/fallback behavior using this exact parse, with no second scan.
+    if (status != ParseStatus::Incomplete) {
+        conn.clear_response_accounting();
+        reset_request_metadata(conn);
+        capture_parsed_request_metadata(conn, parser, req, status);
+    }
+    return status;
 }
 
 u32 pipeline_leftover(const Connection& conn) {

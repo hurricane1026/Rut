@@ -456,6 +456,9 @@ void on_probe_response(void* lp, Connection& conn, IoEvent ev) {
 u8 map_log_method(HttpMethod method);
 u8 parse_log_method_fallback(const u8* data, u32 len, u32* method_len);
 void capture_request_metadata(Connection& conn);
+// Incomplete leaves the connection untouched. Complete/Error clear response
+// accounting and publish exactly one metadata episode using the same parse.
+ParseStatus parse_and_capture_request_metadata(Connection& conn);
 
 template <typename Loop>
 bool handle_configured_unmatched_response(Loop* loop, Connection& conn, const RouteConfig* config);
@@ -2098,11 +2101,7 @@ void on_header_received(void* lp, Connection& conn, IoEvent ev) {
     // Admission is shared by initial and pipelined HTTP/1 requests. No request
     // metadata, accounting, generation, route, policy or handler effect may
     // occur until the accumulated receive buffer contains a complete header.
-    HttpParser pre_parser;
-    ParsedRequest pre_req;
-    pre_parser.reset();
-    const ParseStatus pre_status =
-        pre_parser.parse(conn.recv_buf.data(), conn.recv_buf.len(), &pre_req);
+    const ParseStatus pre_status = parse_and_capture_request_metadata(conn);
     if (pre_status == ParseStatus::Incomplete) {
         // Keep pipeline_depth unchanged so fragmented successors retain their
         // generation boundary. Initial requests likewise retain every byte.
@@ -2113,8 +2112,6 @@ void on_header_received(void* lp, Connection& conn, IoEvent ev) {
     }
     complete_pipeline_request = conn.pipeline_depth > 0 && pre_status == ParseStatus::Complete;
 
-    conn.clear_response_accounting();
-    capture_request_metadata(conn);
     if ((loop->access_log != nullptr) != (loop->live_access_log != nullptr))
         conn.capture_access_log_target_snapshot();
 
