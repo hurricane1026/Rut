@@ -42,6 +42,7 @@ struct IoUringBackend {
     // SQ ring mapped memory
     u32* sq_head = nullptr;
     u32* sq_tail = nullptr;
+    u32* sq_flags = nullptr;
     u32* sq_ring_mask = nullptr;
     u32* sq_array = nullptr;
     io_uring_sqe* sq_entries = nullptr;
