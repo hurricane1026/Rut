@@ -119,11 +119,11 @@ struct Location {
 };
 
 // This bounded local-response slice borrows one non-empty raw quoted body of at
-// most 4096 bytes from source. It accepts safe printable ASCII bytes plus any
+// most 4094 bytes from source. It accepts safe printable ASCII bytes plus any
 // number of internal ASCII spaces between non-space endpoints; escapes,
 // variables, controls, and broader nginx quoted-string semantics remain outside
-// the model.
-static constexpr u32 kMaxLocalReturnBodyLen = 4096;
+// the model. The two quote delimiters must also fit nginx's 4096-byte token buffer.
+static constexpr u32 kMaxLocalReturnBodyLen = 4094;
 
 struct LocalReturn {
     u16 status = 0;

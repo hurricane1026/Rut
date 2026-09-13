@@ -2,12 +2,13 @@
 
 ## Bounded local response bodies
 
-The exact `return 200` profile accepts 1..4096 raw quoted bytes, matching the
-runtime strict local-response body limit. Printable ASCII and internal spaces
+The exact `return 200` profile accepts 1..4094 raw quoted bytes. The two
+quote delimiters must also fit the pinned nginx configuration parser’s 4096-byte
+token buffer; the runtime strict local-response body limit is 4096 bytes. Printable ASCII and internal spaces
 are accepted; leading/trailing spaces, variables, escapes, control bytes and
 other previously excluded quoted-string syntax remain rejected. The converter
 borrows the input body while validating its spans, then emits it exactly once
-into owned RUT source. The source capacities reserve the full 4032-byte increase
+into owned RUT source. The source capacities reserve the full 4030-byte increase
 above the prior 64-byte bound for every supported server and HTTP-log profile.
 
 This enables the 1KiB static benchmark cells. The 64KiB and 1MiB cells still

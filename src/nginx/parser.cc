@@ -995,7 +995,7 @@ private:
             return unsupported(
                 body.span,
                 lit_str(
-                    "return body must match the bounded 1..4096-byte safe quoted ASCII grammar"));
+                    "return body must match the bounded 1..4094-byte safe quoted ASCII grammar"));
         advance();
         if (cur_.kind == TokenKind::End)
             return missing(cur_.span, lit_str("expected ';' after return"));

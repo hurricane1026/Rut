@@ -28,38 +28,38 @@
 using namespace rut;
 
 static_assert(nginx::kMaxExactLocalReturnPathLen == kMaxExactStrictLocalResponsePathLen);
-static_assert(nginx::kMaxLocalReturnBodyLen == kMaxStrictLocalResponseBodyLen);
+static_assert(nginx::kMaxLocalReturnBodyLen <= kMaxStrictLocalResponseBodyLen);
 static_assert(sizeof(void*) == 8u, "Rut's supported loader/compiler data model is 64-bit");
 static_assert(sizeof(u32) == 4u && alignof(u32) == 4u,
               "RutSource layout evidence requires the supported 32-bit u32 model");
 static_assert(std::is_standard_layout_v<nginx::RutSource>);
 static_assert(std::is_trivially_copyable_v<nginx::RutSource>);
 static_assert(alignof(nginx::RutSource) == alignof(u32));
-static_assert(offsetof(nginx::RutSource, len) == 12784u);
-static_assert(sizeof(nginx::RutSource) == 12788u);
+static_assert(offsetof(nginx::RutSource, len) == 12780u);
+static_assert(sizeof(nginx::RutSource) == 12784u);
 static_assert(std::is_standard_layout_v<nginx::HttpProfileRutSource>);
 static_assert(std::is_trivially_copyable_v<nginx::HttpProfileRutSource>);
 static_assert(nginx::HttpProfileRutSource::kMaxAccessLogDeclarationLen == 329u);
-static_assert(nginx::HttpProfileRutSource::kCapacity == 13111u);
+static_assert(nginx::HttpProfileRutSource::kCapacity == 13109u);
 static_assert(offsetof(nginx::HttpProfileRutSource, len) == 13112u);
 static_assert(sizeof(nginx::HttpProfileRutSource) == 13116u);
 
 TEST(nginx_converter, rut_source_capacity_layout_zero_reserve_and_copy_ownership) {
-    static_assert(nginx::RutSource::kCapacity == 12782u);
+    static_assert(nginx::RutSource::kCapacity == 12780u);
     nginx::RutSource original{};
     original.len = nginx::RutSource::kCapacity - 1u;
     memset(original.data, 'x', original.len);
     REQUIRE_EQ(original.data[original.len], '\0');
-    CHECK_EQ(original.view().len, 12781u);
+    CHECK_EQ(original.view().len, 12779u);
     CHECK_EQ(original.view().ptr, original.data);
     CHECK_LT(original.len, nginx::RutSource::kCapacity);
-    static constexpr u32 kInvalidPayloadLength = 12782u;
+    static constexpr u32 kInvalidPayloadLength = 12780u;
     CHECK_FALSE(kInvalidPayloadLength < nginx::RutSource::kCapacity);
 
     nginx::RutSource copied = original;
     memset(original.data, 'y', original.len);
     original.len = 0u;
-    CHECK_EQ(copied.len, 12781u);
+    CHECK_EQ(copied.len, 12779u);
     CHECK_EQ(copied.view().ptr, copied.data);
     CHECK_EQ(copied.data[0], 'x');
     CHECK_EQ(copied.data[copied.len - 1u], 'x');
@@ -1811,7 +1811,7 @@ TEST(nginx_converter,
         CHECK_EQ(std::string(copied.data, copied.len), canonical);
         CHECK_EQ(copied.data[copied.len], '\0');
     }
-    CHECK_EQ(nginx::RutSource::kCapacity, 12782u);
+    CHECK_EQ(nginx::RutSource::kCapacity, 12780u);
 }
 
 TEST(nginx_converter, http_profile_exact_maximum_payload_owns_terminal_capacity_byte) {
@@ -2686,7 +2686,7 @@ TEST(nginx_parser, bounds_one_internal_exact_local_body_space_at_maximum_raw_byt
     REQUIRE_FALSE(rejected);
     CHECK_EQ(rejected.error().code, FrontendError::UnsupportedSyntax);
     CHECK(rejected.error().detail.eq(
-        lit_str("return body must match the bounded 1..4096-byte safe quoted ASCII grammar")));
+        lit_str("return body must match the bounded 1..4094-byte safe quoted ASCII grammar")));
     const char* return_directive = strstr(rejected_source, "return 200");
     REQUIRE(return_directive != nullptr);
     const char* opening_quote = strchr(return_directive, '"');
@@ -2741,7 +2741,7 @@ TEST(nginx_parser, bounds_multiple_internal_exact_local_body_spaces_at_maximum_r
     REQUIRE_FALSE(rejected);
     CHECK_EQ(rejected.error().code, FrontendError::UnsupportedSyntax);
     CHECK(rejected.error().detail.eq(
-        lit_str("return body must match the bounded 1..4096-byte safe quoted ASCII grammar")));
+        lit_str("return body must match the bounded 1..4094-byte safe quoted ASCII grammar")));
     const char* return_directive = strstr(rejected_source, "return 200");
     REQUIRE(return_directive != nullptr);
     const char* opening_quote = strchr(return_directive, '"');
@@ -2803,7 +2803,7 @@ TEST(nginx_parser, rejects_excluded_contextual_exact_local_body_forms_at_complet
         REQUIRE_FALSE(rejected);
         CHECK_EQ(rejected.error().code, FrontendError::UnsupportedSyntax);
         CHECK(rejected.error().detail.eq(
-            lit_str("return body must match the bounded 1..4096-byte safe quoted ASCII grammar")));
+            lit_str("return body must match the bounded 1..4094-byte safe quoted ASCII grammar")));
         CHECK_EQ(rejected.error().span.start, opening_quote);
         CHECK_EQ(rejected.error().span.end, quoted_end);
         CHECK_EQ(rejected.error().span.line, 1u);
@@ -2822,7 +2822,7 @@ TEST(nginx_parser, rejects_excluded_contextual_exact_local_body_forms_at_complet
     REQUIRE_FALSE(missing_quote);
     CHECK_EQ(missing_quote.error().code, FrontendError::UnsupportedSyntax);
     CHECK(missing_quote.error().detail.eq(
-        lit_str("return body must match the bounded 1..4096-byte safe quoted ASCII grammar")));
+        lit_str("return body must match the bounded 1..4094-byte safe quoted ASCII grammar")));
     CHECK_EQ(missing_quote.error().span.start, unterminated_start);
     CHECK_EQ(missing_quote.error().span.end, unterminated_len);
 
@@ -2842,7 +2842,7 @@ TEST(nginx_parser, rejects_excluded_contextual_exact_local_body_forms_at_complet
     REQUIRE_FALSE(final_backslash_result);
     CHECK_EQ(final_backslash_result.error().code, FrontendError::UnsupportedSyntax);
     CHECK(final_backslash_result.error().detail.eq(
-        lit_str("return body must match the bounded 1..4096-byte safe quoted ASCII grammar")));
+        lit_str("return body must match the bounded 1..4094-byte safe quoted ASCII grammar")));
     CHECK_EQ(final_backslash_result.error().span.start, final_backslash_start);
     CHECK_EQ(final_backslash_result.error().span.end, final_backslash_len);
 
@@ -2866,7 +2866,7 @@ TEST(nginx_parser, rejects_excluded_contextual_exact_local_body_forms_at_complet
     REQUIRE_FALSE(escaped_quote_eof_result);
     CHECK_EQ(escaped_quote_eof_result.error().code, FrontendError::UnsupportedSyntax);
     CHECK(escaped_quote_eof_result.error().detail.eq(
-        lit_str("return body must match the bounded 1..4096-byte safe quoted ASCII grammar")));
+        lit_str("return body must match the bounded 1..4094-byte safe quoted ASCII grammar")));
     CHECK_EQ(escaped_quote_eof_result.error().span.start, escaped_quote_eof_start);
     CHECK_EQ(escaped_quote_eof_result.error().span.end, escaped_quote_eof_len);
 
@@ -2877,7 +2877,7 @@ TEST(nginx_parser, rejects_excluded_contextual_exact_local_body_forms_at_complet
     REQUIRE_FALSE(unquoted_result);
     CHECK_EQ(unquoted_result.error().code, FrontendError::UnsupportedSyntax);
     CHECK(unquoted_result.error().detail.eq(
-        lit_str("return body must match the bounded 1..4096-byte safe quoted ASCII grammar")));
+        lit_str("return body must match the bounded 1..4094-byte safe quoted ASCII grammar")));
     const char* unquoted_body = strstr(unquoted, "hello world");
     REQUIRE(unquoted_body != nullptr);
     CHECK_EQ(unquoted_result.error().span.start, static_cast<u32>(unquoted_body - unquoted));
@@ -5344,15 +5344,15 @@ TEST(nginx_parser, rejects_unsupported_exact_local_return_shapes) {
         {"server { listen 8080; location / { proxy_pass http://127.0.0.1:1; } location = "
          "/static { return 200 $body; } }",
          FrontendError::UnsupportedSyntax,
-         lit_str("return body must match the bounded 1..4096-byte safe quoted ASCII grammar")},
+         lit_str("return body must match the bounded 1..4094-byte safe quoted ASCII grammar")},
         {"server { listen 8080; location / { proxy_pass http://127.0.0.1:1; } location = "
          "/static { return 200 \"$body\"; } }",
          FrontendError::UnsupportedSyntax,
-         lit_str("return body must match the bounded 1..4096-byte safe quoted ASCII grammar")},
+         lit_str("return body must match the bounded 1..4094-byte safe quoted ASCII grammar")},
         {"server { listen 8080; location / { proxy_pass http://127.0.0.1:1; } location = "
          "/static { return 200 successor-static; } }",
          FrontendError::UnsupportedSyntax,
-         lit_str("return body must match the bounded 1..4096-byte safe quoted ASCII grammar")},
+         lit_str("return body must match the bounded 1..4094-byte safe quoted ASCII grammar")},
         {"server { listen 8080; location / { proxy_pass http://127.0.0.1:1; } location = "
          "/static { return 200 \"x\"; return 200 \"y\"; } }",
          FrontendError::UnsupportedSyntax,
@@ -5378,7 +5378,7 @@ TEST(nginx_parser, rejects_unsupported_exact_local_return_shapes) {
     REQUIRE_FALSE(too_long);
     CHECK_EQ(too_long.error().code, FrontendError::UnsupportedSyntax);
     CHECK(too_long.error().detail.eq(
-        lit_str("return body must match the bounded 1..4096-byte safe quoted ASCII grammar")));
+        lit_str("return body must match the bounded 1..4094-byte safe quoted ASCII grammar")));
 }
 
 TEST(nginx_parser, rejects_unbounded_or_malformed_exact_no_content_return_shapes) {
@@ -6688,8 +6688,8 @@ TEST(nginx_converter, exact_local_return_maximum_body_fits_bounded_source) {
     REQUIRE(parsed);
     const auto lowered = nginx::lower_to_rut(parsed.value());
     REQUIRE(lowered);
-    CHECK_EQ(lowered.value().len, 9658u);
-    CHECK_EQ(nginx::RutSource::kCapacity, 12782u);
+    CHECK_EQ(lowered.value().len, 9656u);
+    CHECK_EQ(nginx::RutSource::kCapacity, 12780u);
     CHECK_LT(lowered.value().len, nginx::RutSource::kCapacity);
     const auto lexed = lex(lowered.value().view());
     REQUIRE(lexed);
@@ -6715,7 +6715,7 @@ TEST(nginx_converter, exact_local_return_maximum_path_and_body_fit_bounded_sourc
     REQUIRE(parsed);
     const auto lowered = nginx::lower_to_rut(parsed.value());
     REQUIRE(lowered);
-    CHECK_EQ(lowered.value().len, 9713u);
+    CHECK_EQ(lowered.value().len, 9711u);
     CHECK_EQ(nginx::RutSource::kCapacity - lowered.value().len, 3069u);
     CHECK_LT(lowered.value().len, nginx::RutSource::kCapacity);
     const auto lexed = lex(lowered.value().view());
@@ -6747,7 +6747,7 @@ TEST(nginx_converter, normalized_exact_local_return_maximum_path_and_body_fit_bo
     REQUIRE_EQ(parsed.value().exact_local_return.path.len, nginx::kMaxExactLocalReturnPathLen);
     const auto lowered = nginx::lower_to_rut(parsed.value());
     REQUIRE(lowered);
-    CHECK_EQ(lowered.value().len, 9713u);
+    CHECK_EQ(lowered.value().len, 9711u);
     CHECK_EQ(nginx::RutSource::kCapacity - lowered.value().len, 3069u);
     CHECK_LT(lowered.value().len, nginx::RutSource::kCapacity);
     CHECK(strstr(lowered.value().data, "route exact slash_normalized \"") != nullptr);
@@ -6770,7 +6770,7 @@ TEST(nginx_converter, multiple_space_maximum_path_and_body_keep_exact_source_cap
         bool trailing_slash;
         u32 expected_len;
     };
-    const Vector vectors[] = {{false, 9713u}, {true, 9713u}};
+    const Vector vectors[] = {{false, 9711u}, {true, 9711u}};
     for (const auto& vector : vectors) {
         char path[nginx::kMaxExactLocalReturnPathLen + 1u]{};
         path[0] = '/';
@@ -6797,7 +6797,7 @@ TEST(nginx_converter, multiple_space_maximum_path_and_body_keep_exact_source_cap
         REQUIRE(lowered);
         CHECK_EQ(lowered.value().len, vector.expected_len);
         CHECK_LT(lowered.value().len, nginx::RutSource::kCapacity);
-        CHECK_EQ(nginx::RutSource::kCapacity, 12782u);
+        CHECK_EQ(nginx::RutSource::kCapacity, 12780u);
         const char* emitted_body = strstr(lowered.value().data, body);
         REQUIRE(emitted_body != nullptr);
         CHECK((Str{emitted_body, nginx::kMaxLocalReturnBodyLen}.eq(
@@ -8606,8 +8606,8 @@ TEST(nginx_converter, exact_no_content_maximum_ports_fit_existing_source_capacit
     REQUIRE(lowered);
     CHECK_EQ(lowered.value().len, 5564u);
     CHECK_LT(lowered.value().len, nginx::RutSource::kCapacity);
-    CHECK_EQ(nginx::RutSource::kCapacity, 12782u);
-    CHECK_EQ(nginx::RutSource::kCapacity - lowered.value().len, 7218u);
+    CHECK_EQ(nginx::RutSource::kCapacity, 12780u);
+    CHECK_EQ(nginx::RutSource::kCapacity - lowered.value().len, 7216u);
     const auto lexed = lex(lowered.value().view());
     REQUIRE(lexed);
     const auto ast = parse_file(lexed.value());
@@ -8617,7 +8617,7 @@ TEST(nginx_converter, exact_no_content_maximum_ports_fit_existing_source_capacit
 
 TEST(nginx_converter, bounded_exact_no_content_maximum_paths_fit_existing_source_capacity) {
     static_assert(nginx::kMaxExactLocalReturnPathLen == 62u);
-    static_assert(nginx::RutSource::kCapacity == 12782u);
+    static_assert(nginx::RutSource::kCapacity == 12780u);
     char paths[2][nginx::kMaxExactLocalReturnPathLen + 1u]{};
     paths[0][0] = '/';
     paths[1][0] = '/';
@@ -8626,7 +8626,7 @@ TEST(nginx_converter, bounded_exact_no_content_maximum_paths_fit_existing_source
         paths[1][i] = i + 1u == nginx::kMaxExactLocalReturnPathLen ? '/' : 'b';
     }
     const u32 expected_lengths[] = {5619u, 5619u};
-    const u32 expected_headroom[] = {7163u, 7163u};
+    const u32 expected_headroom[] = {7161u, 7161u};
     const char* expected_selectors[] = {"route exact slash_normalized GET \"/aaaa",
                                         "route exact slash_normalized GET \"/bbbb"};
     for (u32 vector = 0; vector < 2u; vector++) {
@@ -8671,7 +8671,7 @@ TEST(nginx_converter, exact_redirect_maximum_ports_fit_bounded_source_capacity) 
     const auto lowered = nginx::lower_to_rut(parsed.value());
     REQUIRE(lowered);
     CHECK_EQ(lowered.value().len, 5936u);
-    CHECK_EQ(nginx::RutSource::kCapacity - lowered.value().len, 6846u);
+    CHECK_EQ(nginx::RutSource::kCapacity - lowered.value().len, 6844u);
     CHECK_EQ(lowered.value().data[lowered.value().len], '\0');
     CHECK_LT(lowered.value().len, nginx::RutSource::kCapacity);
     const auto lexed = lex(lowered.value().view());
@@ -8689,7 +8689,7 @@ TEST(nginx_converter, exact_302_redirect_maximum_ports_fit_bounded_source_capaci
     CHECK_EQ(lowered.value().len, 5912u);
     CHECK_EQ(lowered.value().len + 1u, 5913u);
     CHECK_LT(lowered.value().len, nginx::RutSource::kCapacity);
-    CHECK_EQ(nginx::RutSource::kCapacity, 12782u);
+    CHECK_EQ(nginx::RutSource::kCapacity, 12780u);
     const auto lexed = lex(lowered.value().view());
     REQUIRE(lexed);
     const auto ast = parse_file(lexed.value());
@@ -8715,7 +8715,7 @@ TEST(nginx_converter, api_maximum_ports_fit_bounded_source_capacity) {
 
 TEST(nginx_converter, clean_proxy_uri_maximum_fits_strict_existing_source_capacity) {
     static_assert(nginx::kMaxProxyPassUriLen == 128u);
-    static_assert(nginx::RutSource::kCapacity == 12782u);
+    static_assert(nginx::RutSource::kCapacity == 12780u);
     char uri[nginx::kMaxProxyPassUriLen + 1u]{};
     uri[0] = '/';
     for (u32 i = 1; i + 1u < nginx::kMaxProxyPassUriLen; i++) uri[i] = 'a';
@@ -8737,7 +8737,7 @@ TEST(nginx_converter, clean_proxy_uri_maximum_fits_strict_existing_source_capaci
     REQUIRE(lowered);
     CHECK_EQ(lowered.value().len, 3468u);
     CHECK_LT(lowered.value().len, nginx::RutSource::kCapacity);
-    CHECK_EQ(nginx::RutSource::kCapacity, 12782u);
+    CHECK_EQ(nginx::RutSource::kCapacity, 12780u);
     const auto lexed = lex(lowered.value().view());
     REQUIRE(lexed);
     const auto ast = parse_file(lexed.value());
@@ -8748,7 +8748,7 @@ TEST(nginx_converter, clean_proxy_uri_maximum_fits_strict_existing_source_capaci
 TEST(nginx_converter, maximum_clean_location_and_uri_fit_strict_existing_source_capacity) {
     static_assert(nginx::kMaxProxyLocationPathLen == 63u);
     static_assert(nginx::kMaxProxyPassUriLen == 128u);
-    static_assert(nginx::RutSource::kCapacity == 12782u);
+    static_assert(nginx::RutSource::kCapacity == 12780u);
     char path[nginx::kMaxProxyLocationPathLen + 1u]{};
     path[0] = '/';
     for (u32 i = 1; i + 1u < nginx::kMaxProxyLocationPathLen; i++) path[i] = 'a';
@@ -8773,7 +8773,7 @@ TEST(nginx_converter, maximum_clean_location_and_uri_fit_strict_existing_source_
     REQUIRE(lowered);
     CHECK_EQ(lowered.value().len, 3700u);
     CHECK_LT(lowered.value().len, nginx::RutSource::kCapacity);
-    CHECK_EQ(nginx::RutSource::kCapacity, 12782u);
+    CHECK_EQ(nginx::RutSource::kCapacity, 12780u);
     const auto lexed = lex(lowered.value().view());
     REQUIRE(lexed);
     const auto ast = parse_file(lexed.value());
@@ -8784,7 +8784,7 @@ TEST(nginx_converter, maximum_clean_location_and_uri_fit_strict_existing_source_
 TEST(nginx_converter, maximum_static_query_uri_fits_strict_existing_source_capacity) {
     static_assert(nginx::kMaxProxyLocationPathLen == 63u);
     static_assert(nginx::kMaxProxyPassUriLen == 128u);
-    static_assert(nginx::RutSource::kCapacity == 12782u);
+    static_assert(nginx::RutSource::kCapacity == 12780u);
     char path[nginx::kMaxProxyLocationPathLen + 1u]{};
     path[0] = '/';
     for (u32 i = 1; i + 1u < nginx::kMaxProxyLocationPathLen; i++) path[i] = 'p';
@@ -12058,7 +12058,7 @@ TEST(nginx_converter, issue360_lowers_terminal_empty_query_to_exact_ordinary_rut
     CHECK_EQ(expected, canonical);
     CHECK_EQ(canonical_lowered.value().len, path_only_lowered.value().len + 1u);
     CHECK_EQ(canonical_lowered.value().len, 3337u);
-    CHECK_EQ(nginx::RutSource::kCapacity - canonical_lowered.value().len - 1u, 9444u);
+    CHECK_EQ(nginx::RutSource::kCapacity - canonical_lowered.value().len - 1u, 9442u);
     CHECK_EQ(canonical_lowered.value().data[canonical_lowered.value().len], '\0');
 
     // Declaration order changes neither model meaning nor any generated byte.
@@ -14071,7 +14071,7 @@ TEST(nginx_parser,
     static_assert(kWildcardListenPrefixLen == 8u);
     static_assert(kExactListenPrefixLen == 17u);
     static_assert(kExactListenerDelta == 9u);
-    static_assert(nginx::RutSource::kCapacity == 12782u);
+    static_assert(nginx::RutSource::kCapacity == 12780u);
 
     const auto check_wildcard_at_length = [&](Str source, u32 expected_length, u32& actual_length) {
         const auto parsed = nginx::parse(source);
@@ -14127,7 +14127,7 @@ TEST(nginx_parser,
     const u32 representative_exact_302 = representative_wildcard_302 + kExactListenerDelta;
     CHECK_EQ(representative_exact_302, 5913u);
     CHECK_LT(representative_exact_302, nginx::RutSource::kCapacity);
-    CHECK_EQ(nginx::RutSource::kCapacity - representative_exact_302, 6869u);
+    CHECK_EQ(nginx::RutSource::kCapacity - representative_exact_302, 6867u);
     check_exact_redirect({kRepresentativeExact302, sizeof(kRepresentativeExact302) - 1u},
                          302u,
                          8080u,
@@ -14148,7 +14148,7 @@ TEST(nginx_parser,
     const u32 maximum_exact_302 = maximum_wildcard_302 + kExactListenerDelta;
     CHECK_EQ(maximum_exact_302, 5921u);
     CHECK_LT(maximum_exact_302, nginx::RutSource::kCapacity);
-    CHECK_EQ(nginx::RutSource::kCapacity - maximum_exact_302, 6861u);
+    CHECK_EQ(nginx::RutSource::kCapacity - maximum_exact_302, 6859u);
     check_exact_redirect({kMaximumExact302, sizeof(kMaximumExact302) - 1u},
                          302u,
                          65535u,
@@ -14169,7 +14169,7 @@ TEST(nginx_parser,
     const u32 representative_exact_301 = representative_wildcard_301 + kExactListenerDelta;
     CHECK_EQ(representative_exact_301, 5937u);
     CHECK_LT(representative_exact_301, nginx::RutSource::kCapacity);
-    CHECK_EQ(nginx::RutSource::kCapacity - representative_exact_301, 6845u);
+    CHECK_EQ(nginx::RutSource::kCapacity - representative_exact_301, 6843u);
     check_exact_redirect({kRepresentativeExact301, sizeof(kRepresentativeExact301) - 1u},
                          301u,
                          8080u,
@@ -14692,7 +14692,7 @@ TEST(nginx_parser,
     static_assert(kWildcardListenPrefixLen == 8u);
     static_assert(kExactListenPrefixLen == 17u);
     static_assert(kExactListenerDelta == 9u);
-    static_assert(nginx::RutSource::kCapacity == 12782u);
+    static_assert(nginx::RutSource::kCapacity == 12780u);
 
     const auto check_wildcard = [&](Str source, u32 expected_length, u32& actual_length) {
         const auto parsed = nginx::parse(source);
@@ -14796,7 +14796,7 @@ TEST(nginx_parser,
     const u32 maximum_exact = maximum_wildcard + kExactListenerDelta;
     CHECK_EQ(maximum_exact, 3582u);
     CHECK_LT(maximum_exact, nginx::RutSource::kCapacity);
-    CHECK_EQ(nginx::RutSource::kCapacity - maximum_exact, 9200u);
+    CHECK_EQ(nginx::RutSource::kCapacity - maximum_exact, 9198u);
     check_exact({maximum_exact_source, static_cast<u32>(maximum_exact_source_len)},
                 65535u,
                 nginx::kMaxProxyLocationPathLen,
@@ -15330,7 +15330,7 @@ TEST(nginx_parser,
     static_assert(kWildcardListenPrefixLen == 8u);
     static_assert(kExactListenPrefixLen == 17u);
     static_assert(kExactListenerDelta == 9u);
-    static_assert(nginx::RutSource::kCapacity == 12782u);
+    static_assert(nginx::RutSource::kCapacity == 12780u);
 
     const auto check_wildcard = [&](Str source, u32 expected_length, u32& actual_length) {
         const auto parsed = nginx::parse(source);
@@ -15396,7 +15396,7 @@ TEST(nginx_parser,
     const u32 representative_exact_projection = representative_wildcard + kExactListenerDelta;
     CHECK_EQ(representative_exact_projection, 3345u);
     CHECK_LT(representative_exact_projection, nginx::RutSource::kCapacity);
-    CHECK_EQ(nginx::RutSource::kCapacity - representative_exact_projection, 9437u);
+    CHECK_EQ(nginx::RutSource::kCapacity - representative_exact_projection, 9435u);
     check_exact({kRepresentativeExact, sizeof(kRepresentativeExact) - 1u},
                 8080u,
                 0x7f000001u,
@@ -15414,7 +15414,7 @@ TEST(nginx_parser,
     const u32 maximum_exact_projection = maximum_wildcard + kExactListenerDelta;
     CHECK_EQ(maximum_exact_projection, 3353u);
     CHECK_LT(maximum_exact_projection, nginx::RutSource::kCapacity);
-    CHECK_EQ(nginx::RutSource::kCapacity - maximum_exact_projection, 9429u);
+    CHECK_EQ(nginx::RutSource::kCapacity - maximum_exact_projection, 9427u);
     check_exact({kMaximumExact, sizeof(kMaximumExact) - 1u}, 65535u, 0xffffffffu, 65535u, 3353u);
 
     // A coherent wildcard counterpart isolates the scalar port-zero contract; the exact listener
@@ -15815,7 +15815,7 @@ TEST(nginx_converter, issue355_exact_loopback_api_no_uri_has_canonical_no_transf
     REQUIRE(maximum);
     CHECK_EQ(maximum.value().len, 3252u);
     CHECK_LT(maximum.value().len, nginx::RutSource::kCapacity);
-    CHECK_EQ(nginx::RutSource::kCapacity - maximum.value().len, 9530u);
+    CHECK_EQ(nginx::RutSource::kCapacity - maximum.value().len, 9528u);
     CHECK_EQ(
         count_text(std::string(maximum.value().data, maximum.value().len), "target_transform:"),
         0u);
@@ -16459,7 +16459,7 @@ TEST(nginx_converter,
     REQUIRE(maximum);
     REQUIRE_EQ(maximum.value().len, 3426u);
     CHECK_LT(maximum.value().len, nginx::RutSource::kCapacity);
-    CHECK_EQ(nginx::RutSource::kCapacity - maximum.value().len, 9356u);
+    CHECK_EQ(nginx::RutSource::kCapacity - maximum.value().len, 9354u);
     CHECK_EQ(maximum.value().data[maximum.value().len], '\0');
     validate_shape(std::string(maximum.value().data, maximum.value().len),
                    p63,
@@ -16846,9 +16846,9 @@ TEST(nginx_converter, issue357_wildcard_complete_clean_no_uri_prefix_class_is_ca
 
     REQUIRE_FALSE(p63_canonical.empty());
     CHECK_EQ(p63_canonical.size(), 3409u);
-    CHECK_EQ(nginx::RutSource::kCapacity, 12782u);
-    CHECK_EQ(nginx::RutSource::kCapacity - 3417u, 9365u);
-    CHECK_EQ(nginx::RutSource::kCapacity - 1u - 3417u, 9364u);
+    CHECK_EQ(nginx::RutSource::kCapacity, 12780u);
+    CHECK_EQ(nginx::RutSource::kCapacity - 3417u, 9363u);
+    CHECK_EQ(nginx::RutSource::kCapacity - 1u - 3417u, 9362u);
     const auto replace_unique =
         [](std::string value, const std::string& from, const std::string& to) {
             const size_t offset = from.empty() ? std::string::npos : value.find(from);
@@ -17128,7 +17128,7 @@ TEST(nginx_converter,
     CHECK_EQ(maximum_exact.value().len, 3582u);
     CHECK_EQ(maximum_wildcard.value().len, 3573u);
     CHECK_LT(maximum_exact.value().len, nginx::RutSource::kCapacity);
-    CHECK_EQ(nginx::RutSource::kCapacity - maximum_exact.value().len, 9200u);
+    CHECK_EQ(nginx::RutSource::kCapacity - maximum_exact.value().len, 9198u);
     std::string maximum_expected(maximum_wildcard.value().data, maximum_wildcard.value().len);
     REQUIRE_EQ(maximum_expected.rfind("listen :65535\n", 0u), 0u);
     maximum_expected.replace(0u, strlen("listen :65535"), "listen 127.0.0.1:65535");
@@ -17410,7 +17410,7 @@ TEST(nginx_converter, issue354_exact_loopback_fixed_replacement_has_canonical_or
     CHECK_EQ(maximum_exact.value().len, 3353u);
     CHECK_EQ(maximum_wildcard.value().len, 3344u);
     CHECK_LT(maximum_exact.value().len, nginx::RutSource::kCapacity);
-    CHECK_EQ(nginx::RutSource::kCapacity - maximum_exact.value().len, 9429u);
+    CHECK_EQ(nginx::RutSource::kCapacity - maximum_exact.value().len, 9427u);
     std::string maximum_expected(maximum_wildcard.value().data, maximum_wildcard.value().len);
     REQUIRE_EQ(maximum_expected.rfind("listen :65535\n", 0u), 0u);
     maximum_expected.replace(0u, strlen("listen :65535"), "listen 127.0.0.1:65535");
@@ -17991,7 +17991,7 @@ TEST(nginx_converter, issue372_exact_loopback_root_empty_query_has_independent_c
     REQUIRE_EQ(maximum.value().len, 3351u);
     CHECK_EQ(std::string(maximum.value().data, maximum.value().len), maximum_expected);
     CHECK_EQ(maximum.value().data[maximum.value().len], '\0');
-    CHECK_EQ(nginx::RutSource::kCapacity - maximum.value().len, 9431u);
+    CHECK_EQ(nginx::RutSource::kCapacity - maximum.value().len, 9429u);
 
     static constexpr char kExactSlash[] =
         "server { listen 127.0.0.1:8080; location /api/ { proxy_pass "
@@ -19895,7 +19895,7 @@ TEST(nginx_converter, issue350_exact_loopback_302_has_canonical_ordinary_rut_gol
     CHECK_EQ(maximum_exact.value().len, 5921u);
     CHECK_EQ(maximum_wildcard.value().len, 5912u);
     CHECK_LT(maximum_exact.value().len, nginx::RutSource::kCapacity);
-    CHECK_EQ(nginx::RutSource::kCapacity - maximum_exact.value().len, 6861u);
+    CHECK_EQ(nginx::RutSource::kCapacity - maximum_exact.value().len, 6859u);
     std::string maximum_wildcard_as_exact(maximum_wildcard.value().data,
                                           maximum_wildcard.value().len);
     maximum_wildcard_as_exact.replace(0u, strlen("listen :65535"), "listen 127.0.0.1:65535");
@@ -22293,7 +22293,7 @@ int main(int argc, char** argv) {
 }
 
 TEST(nginx_converter, expanded_local_bodies_preserve_every_byte_and_reject_unsafe_tail) {
-    for (const u32 size : {64u, 65u, 1024u, 4096u}) {
+    for (const u32 size : {64u, 65u, 1024u, 4094u}) {
         std::string body(size, 'a');
         body[size / 2u] = ' ';
         const std::string prefix =

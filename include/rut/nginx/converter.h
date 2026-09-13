@@ -12,7 +12,7 @@ namespace rut::nginx {
 struct RutSource {
     // The previously accepted models require at most 8749 payload bytes.
     // An exact local action emits its body once without escaping. Reserving
-    // its growth from 64 to 4096 bytes therefore bounds every composition,
+    // its growth from 64 to 4094 bytes therefore bounds every composition,
     // including maximum listener, upstream, timeout and exact-path values.
     // Keep one byte for the NUL; writer completion remains len < kCapacity.
     static constexpr u32 kCapacity = 8750u + (kMaxLocalReturnBodyLen - 64u);
