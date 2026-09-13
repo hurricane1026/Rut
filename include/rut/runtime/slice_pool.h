@@ -12,12 +12,12 @@ namespace rut {
 //
 // Per-shard pool of 16KB slices for network I/O buffers. Connections borrow
 // slices on demand (recv/send), return them when done. Idle connections hold
-// 0 slices → zero memory overhead at C100K.
+// 0 slices; the pool retains only a bounded idle working set.
 //
 // Memory strategy: reserve full VA range upfront (PROT_NONE — no physical
 // pages), then mprotect slices to PROT_READ|PROT_WRITE on first use. This
 // gives O(1) alloc, stable base pointer (no mremap), and physical memory
-// proportional to active connections rather than max capacity.
+// proportional to active connections plus a bounded cache of returned slices.
 //
 // On Linux, PROT_NONE pages consume virtual address space but zero RSS and
 // don't count against overcommit. VA is abundant on 64-bit (256TB).
@@ -30,12 +30,17 @@ namespace rut {
 //   pool.destroy();
 
 struct SlicePool {
-    static constexpr u32 kSliceSize = 16384;  // 16KB per slice
+    static constexpr u32 kSliceSize = 16384;      // 16KB per slice
+    static constexpr u32 kMaxCachedSlices = 256;  // At most 4 MiB idle retention per pool.
 
     u8* base = nullptr;         // mmap'd region: max_count * kSliceSize bytes
     u32* free_stack = nullptr;  // mmap'd: free slice indices
     u8* in_use_map = nullptr;   // mmap'd: 1 byte per slice (0=free, 1=in-use)
     u32 free_top = 0;
+    // Cached indices occupy the top cached_count entries of free_stack.
+    // Untouched/discarded indices remain below them, so reuse prefers hot pages.
+    u32 cached_count = 0;
+    u32 cache_limit = 0;
     u32 count = 0;       // currently committed slices
     u32 max_count = 0;   // maximum slices (VA reserved at init)
     u64 base_size = 0;   // size of mmap'd base region
@@ -50,7 +55,11 @@ struct SlicePool {
     // Initialize pool with max capacity `n`. Reserves VA but only commits
     // `prealloc` slices upfront (0 = fully lazy). Free-stack and in-use
     // map (small: n * 4 + n bytes) are committed immediately.
-    core::Expected<void, Error> init(u32 n, u32 prealloc = 0) {
+    // cache_slices may lower/disable the cache; the hard bound is unchanged.
+    core::Expected<void, Error> init(u32 n, u32 prealloc = 0, u32 cache_slices = kMaxCachedSlices) {
+        cache_limit = cache_slices < kMaxCachedSlices ? cache_slices : kMaxCachedSlices;
+        if (cache_limit > n) cache_limit = n;
+        cached_count = 0;
         max_count = n;
         count = 0;
         free_top = 0;
@@ -109,13 +118,15 @@ struct SlicePool {
     u8* alloc() {
         if (free_top == 0 && !grow()) return nullptr;
         u32 idx = free_stack[--free_top];
+        u8* ptr = base + static_cast<u64>(idx) * kSliceSize;
+        if (cached_count != 0) --cached_count;
         if (in_use_map) in_use_map[idx] = 1;
-        return base + static_cast<u64>(idx) * kSliceSize;
+        return ptr;
     }
 
     // Free a slice back to the pool. ptr must have been returned by alloc().
-    // Uses MADV_DONTNEED to release physical pages — RSS drops after traffic
-    // spikes. Pages are faulted back (zero-filled) on next alloc.
+    // Retain a bounded working set; discard excess pages after traffic spikes.
+    // Only call once all asynchronous users of the slice have retired.
     void free(u8* ptr) {
         if (!ptr || !base || !free_stack || count == 0) return;
         if (ptr < base || ptr >= base + static_cast<u64>(count) * kSliceSize) return;
@@ -125,8 +136,22 @@ struct SlicePool {
         u32 idx = static_cast<u32>(offset / kSliceSize);
         if (in_use_map && !in_use_map[idx]) return;  // double-free detection
         if (in_use_map) in_use_map[idx] = 0;
-        madvise(ptr, kSliceSize, MADV_DONTNEED);
-        free_stack[free_top++] = idx;
+        if (cached_count < cache_limit) {
+            // Preserve zero-filled reuse and clear the previous owner's bytes
+            // even while the slice is idle, including bytes beyond buffer length.
+            __builtin_memset(ptr, 0, kSliceSize);
+            free_stack[free_top++] = idx;
+            ++cached_count;
+            return;
+        }
+        // A failed discard must not expose the previous owner's bytes either.
+        if (madvise(ptr, kSliceSize, MADV_DONTNEED) != 0) __builtin_memset(ptr, 0, kSliceSize);
+        // Insert below the cached suffix in O(1). Pushing discarded slices on
+        // top would strand the cache after a burst and keep faulting cold pages.
+        const u32 boundary = free_top - cached_count;
+        if (cached_count != 0) free_stack[free_top] = free_stack[boundary];
+        free_stack[boundary] = idx;
+        ++free_top;
     }
 
     // Number of available (free) slices.
@@ -150,6 +175,8 @@ struct SlicePool {
             base = nullptr;
         }
         free_top = 0;
+        cached_count = 0;
+        cache_limit = 0;
         count = 0;
         max_count = 0;
     }
