@@ -3,6 +3,20 @@
 Updated: 2026-09-13 (Asia/Shanghai). This is a handoff snapshot, not proof that
 any pending code is accepted. Recheck local and GitHub state before acting.
 
+## Current integration instruction (2026-09-13)
+
+The user explicitly authorized finishing and merging #374, #376, then #269.
+This replaces the older keep-#269-draft restriction below. #374 merged at
+`c966c023` after complete ordinary, pinned-nginx and privileged CI; #376's
+live wildcard handoff and six isolated mutation/canonical recovery pairs are
+under required CI. Complete that gate before the final #269 integration gate.
+
+Work occurs in isolated worktrees `Rut_pr374_completion`,
+`Rut_pr376_completion`, and `Rut_pr269_completion` under
+`/home/hurricane/private/code`. The original main-worktree WIP remains protected.
+Current evidence is in [fixture PR completion](nginx-fixture-pr-completion.md).
+The exact #638 goal remains complete; its historical evidence below is retained.
+
 ## Goal and roles
 
 Translate `nginx.conf` through a separate parser/semantic model/converter into
