@@ -94,6 +94,16 @@ rerun unchanged, weaken the ledger/timing gates, or begin converter admission.
 Local evidence: `/tmp/rut-638-capability-first.log`,
 `/tmp/rut-638-capability-none-first.log`, and
 `/tmp/rut-638-capability-none-build.log`. No runtime fix has been applied yet.
+Reviewed diagnostic `d6ff3bdd` built successfully, but its first run failed at
+the earlier EOF/wire gate (2.16s); `/tmp/rut-640-diagnostic-first.log` and full
+#640 comment `5650166323` preserve it. Reviewed `e9f78b52` adds EOF rejection clocks and built successfully. Its first
+run failed the joint gate with clear retirement Ready/count1, EOF at publication
++1999.722453ms, retirement +1999.762588ms, and zero access bytes in the last
+sample at EOF+247.512583ms (`/tmp/rut-640-eof-diagnostic-first.log`). Natural
+retirement is therefore present; missing completion publication is confirmed.
+None's coarse timer wheel is also at the upper timing boundary; resolve precision
+without relaxing gates. Next implement/review the generic completion fix and its
+ownership controls, then address timing before full capability acceptance.
 
 ### Accepted oracle and wrapper context
 
