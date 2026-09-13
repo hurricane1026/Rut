@@ -192,6 +192,15 @@ class Harness:
             "tcp_tw_reuse": Path("/proc/sys/net/ipv4/tcp_tw_reuse").read_text().strip(),
             "note": "Harness revision is not proof of binary source revision. Record build provenance separately.",
         }
+        if self.tls_context:
+            metadata["tls_profile"] = {
+                "certificate_sha256": sha256(a.tls_cert),
+                "protocol": "TLSv1.3",
+                "cipher": "TLS_AES_256_GCM_SHA384",
+                "reconnect": "full-handshake",
+                "key_exchange": "X25519 (enforced by load client)",
+                "listener_adaptation": "converter cleartext listener replaced by CLI TLS; wildcard IPv4 on both frontends",
+            }
         save_json(self.out / "environment.json", metadata)
         body_size = getattr(a, "body_size", None)
         if body_size is None:
@@ -200,7 +209,8 @@ class Harness:
             payloads = self.out / "payloads"
             payloads.mkdir()
             (payloads / "proxy").write_bytes(expected_body("proxy", body_size))
-            origin_location = "location / { root /benchmark-payloads; default_type text/plain; }"
+            origin_location = ('location / { root /benchmark-payloads; default_type text/plain; '
+                               'etag off; max_ranges 0; add_header Last-Modified ""; }')
         (self.out / "origin.conf").write_text(self.nginx_config(
             f"server {{ listen 127.0.0.1:{a.origin_port}; keepalive_timeout 0; {origin_location} }}"
         ))
@@ -226,7 +236,7 @@ class Harness:
                     f"listen {a.front_port} ssl; "
                     "ssl_certificate /benchmark-cert.pem; ssl_certificate_key /benchmark-key.pem; "
                     "ssl_protocols TLSv1.3; ssl_conf_command Ciphersuites TLS_AES_256_GCM_SHA384; "
-                    "ssl_session_cache off;",
+                    "ssl_ecdh_curve X25519; ssl_session_cache off;",
                 )
             (self.out / (work + "-nginx.conf")).write_text(self.nginx_config(nginx_fragment))
             converted = self.command([a.converter, "--format", "server", source])
@@ -432,7 +442,7 @@ class Harness:
         ]
         result = self.command(argv, timeout=duration + 15)
         (self.out / (label + ".log")).write_text(result.stdout + result.stderr)
-        if self.tls_context and "TLS_PROFILE TLSv1.3 TLS_AES_256_GCM_SHA384 full-handshake" not in result.stdout:
+        if self.tls_context and "TLS_PROFILE TLSv1.3 TLS_AES_256_GCM_SHA384 X25519 full-handshake" not in result.stdout:
             raise ValueError("HTTPS requires the checked wrk-tls-full-handshake.patch client")
         match = re.search(r"^METRICS (.+)$", result.stdout, re.MULTILINE)
         if not match:

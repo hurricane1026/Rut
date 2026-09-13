@@ -9,7 +9,7 @@
  
  #include <openssl/evp.h>
  #include <openssl/err.h>
-@@ -19,7 +21,14 @@
+@@ -19,7 +21,15 @@
          SSL_CTX_set_verify(ctx, SSL_VERIFY_NONE, NULL);
          SSL_CTX_set_verify_depth(ctx, 0);
          SSL_CTX_set_mode(ctx, SSL_MODE_AUTO_RETRY);
@@ -17,15 +17,16 @@
 +        SSL_CTX_set_session_cache_mode(ctx, SSL_SESS_CACHE_OFF);
 +        if (!SSL_CTX_set_min_proto_version(ctx, TLS1_3_VERSION) ||
 +            !SSL_CTX_set_max_proto_version(ctx, TLS1_3_VERSION) ||
-+            !SSL_CTX_set_ciphersuites(ctx, "TLS_AES_256_GCM_SHA384")) {
++            !SSL_CTX_set_ciphersuites(ctx, "TLS_AES_256_GCM_SHA384") ||
++            !SSL_CTX_set1_groups_list(ctx, "X25519")) {
 +            SSL_CTX_free(ctx);
 +            return NULL;
 +        }
-+        puts("TLS_PROFILE TLSv1.3 TLS_AES_256_GCM_SHA384 full-handshake");
++        puts("TLS_PROFILE TLSv1.3 TLS_AES_256_GCM_SHA384 X25519 full-handshake");
      }
  
      return ctx;
-@@ -36,12 +45,17 @@
+@@ -36,12 +46,17 @@
              default:                   return ERROR;
          }
      }

@@ -3,12 +3,13 @@
 import argparse
 import itertools
 import json
+import signal
 import statistics
 import subprocess
 import sys
 from pathlib import Path
 
-from run import SCENARIOS, positive, save_json
+from run import SCENARIOS, ERROR_NAMES, positive, save_json
 
 
 def assess(rows, scenario, transport, size, concurrency, repeats, duration):
@@ -17,12 +18,15 @@ def assess(rows, scenario, transport, size, concurrency, repeats, duration):
     engines = {}
     for engine in ("nginx", "rut"):
         samples = [r for r in selected if r.get("engine") == engine]
-        valid = len(samples) == repeats and {r.get("rep") for r in samples} == set(range(1, repeats + 1))
+        valid = len(selected) == 2 * repeats and len(samples) == repeats and {r.get("rep") for r in samples} == set(range(1, repeats + 1))
         valid = valid and all(
             r.get("valid") and r.get("workload") == work
             and r.get("connection") == connection and r.get("transport") == transport
             and r.get("body_size") == size and r.get("requests", 0) > 0
-            and r.get("rps", 0) > 0 and not any(r.get("errors", {"missing": 1}).values())
+            and r.get("rps", 0) > 0
+            and set(r.get("errors", {})) == set(ERROR_NAMES)
+            and set(r.get("warmup_errors", {})) == set(ERROR_NAMES)
+            and not any(r.get("errors", {"missing": 1}).values())
             and not any(r.get("warmup_errors", {"missing": 1}).values())
             for r in samples
         )
@@ -62,6 +66,9 @@ def main():
     report = {"complete": False, "target_met": False,
               "expected_cells": len(coordinates) * len(args.concurrency), "cells": []}
     save_json(args.output / "matrix.json", report)
+    def interrupt(_signum, _frame):
+        raise KeyboardInterrupt
+    signal.signal(signal.SIGTERM, interrupt)
     try:
         for transport, size, scenario in coordinates:
             folder = args.output / f"{transport}-{size}-{scenario}"
@@ -74,17 +81,27 @@ def main():
             with (args.output / (folder.name + ".log")).open("w") as log:
                 # Child harness owns cleanup; keep it in our process group so
                 # an interactive interrupt reaches both parent and child.
-                completed = subprocess.run(command, stdout=log, stderr=subprocess.STDOUT)
+                with subprocess.Popen(command, stdout=log, stderr=subprocess.STDOUT) as child:
+                    try:
+                        returncode = child.wait()
+                    except BaseException:
+                        child.terminate()
+                        try:
+                            child.wait(timeout=30)
+                        except subprocess.TimeoutExpired:
+                            child.kill()
+                            child.wait()
+                        raise
             rows_path = folder / "results.json"
             rows = json.loads(rows_path.read_text()) if rows_path.exists() else []
             for concurrency in args.concurrency:
                 cell = assess(rows, scenario, transport, size, concurrency, args.repeats, args.duration)
-                cell.update(exit_code=completed.returncode, evidence=str(folder), command=command)
-                if completed.returncode != 0:
+                cell.update(exit_code=returncode, evidence=str(folder), command=command)
+                if returncode != 0:
                     cell["measurement_valid"] = cell["target_met"] = False
                 report["cells"].append(cell)
             save_json(args.output / "matrix.json", report)
-            print(folder.name, "exit", completed.returncode, flush=True)
+            print(folder.name, "exit", returncode, flush=True)
         report["complete"] = len(report["cells"]) == report["expected_cells"]
         report["target_met"] = report["complete"] and all(c["target_met"] for c in report["cells"])
         return 0 if report["target_met"] else 2
