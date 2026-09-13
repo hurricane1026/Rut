@@ -80,7 +80,31 @@ Broad #270 remains PARTIAL and #271 remains BLOCKED_BY_RUT. None of that proves
 the new explicit `proxy_buffering off` scope. Verify current issue/PR state if
 making new status claims; these are recorded prior-run results, not reruns.
 
-## CURRENT: #641 precise None positive-CL inactivity timer
+## CURRENT: ordinary-RUT capability candidate review / PR / CI
+
+Source `f49f0885` now passes the unchanged handwritten public O2/io_uring
+capability witness (first run 1.37s, zero skips), including shared negative
+controls, exact prefix/probe/EOF/natural retirement/live ledger/stability and
+post-join checks. Log `/tmp/rut-641-capability-first.log`. This is local ordinary
+RUT evidence only; actual off converter admission/differential still remain.
+The precise timer increment is independently approved, Clang Release `-j1`
+built, and passes 15 focused positive-CL tests / 920 checks (1218 filtered out).
+Logs `/tmp/rut-641-candidate-build.log` and `/tmp/rut-641-focused-first.log`.
+Full network regression passes (1233 tests / 143522 checks, 40.95s), log
+`/tmp/rut-641-network-full.log`; nginx oracle/shared-validator pass 2/2, zero
+skips, 1.70s, log `/tmp/rut-641-nginx-oracle-regression.log`. Complete candidate
+`ed0eec96..f49f0885` is independently APPROVED; PR/CI is the next gate.
+
+Implementation provenance: Luna supplied the initial timer patch and tests;
+the primary agent used the user's authorized implementation fallback to fix
+remaining phase/send ownership and same-batch retained-body accounting and to
+add cancellation/SQ controls. Different Luna independently approved the frozen
+result. Both rejected patches are retained in `/tmp/rut-641-first-review-rejected.patch`
+and `/tmp/rut-641-second-review-rejected.patch`. Do not describe this as Luna-only
+implementation. Complete candidate range is `ed0eec96..f49f0885`; #640/#641 stay
+open until final evidence and CI. Parent #269 was rechecked OPEN/draft.
+
+### Earlier #641 implementation and failure evidence (historical)
 
 Completion increment `119d7088` is independently approved, Clang Release `-j1`
 built, and passes eleven focused positive-CL tests / 568 checks (1218 tests
@@ -198,12 +222,11 @@ capability or converter admission.
 
 ## NEXT
 
-1. Independently review/test #641 precise timer activation, progress arbitration
-   and stale/cancel ownership, then run the unchanged public capability witness.
-2. Complete capability candidate normal/required CI and integrate only into
-   `agent/nginx-to-rut-converter` after proof; #640/#641 remain open until then.
-3. Only after capability is proven, implement bounded off model/lowering and an
-   actual same-file nginx-versus-generated-RUT differential pair.
+1. Complete capability candidate normal/required CI and integrate only into
+   `agent/nginx-to-rut-converter`; close #640/#641 only after full evidence.
+2. Implement bounded off model/lowering and the actual same-file
+   nginx-versus-generated-RUT differential pair.
+3. Independently review/CI the pair and update only the exact proven scope.
 
 `proxy_buffering off` is still rejected by the converter. Candidate runtime
 paths from a source audit are not behavioral proof. Do not declare SUPPORTED
