@@ -28887,6 +28887,116 @@ struct RawDownstreamRecvBatch {
     }
 };
 
+// A client may send a new request (or FIN) immediately after observing the
+// response, while the server still has both completions waiting in its CQ.
+// Receive bytes must not be copied into the old request before Send dispatch.
+TEST(iouring_downstream_send_boundary, response_before_next_request_preserves_buffer) {
+    RawDownstreamRecvBatch fixture;
+    if (!fixture.init()) SKIP("io_uring unavailable");
+    Connection& conn = *fixture.conns[0];
+    const u8 previous[] = "old";
+    const u8 next[] = "GET /static HTTP/1.1\r\nHost: client.example\r\n\r\n";
+    REQUIRE_EQ(conn.recv_buf.write(previous, sizeof(previous) - 1), sizeof(previous) - 1);
+    fixture.append_send(conn, 16);
+    REQUIRE(fixture.append_recv(conn, next, sizeof(next) - 1, true));
+    const u32 head = fixture.head();
+    const u16 buffers = fixture.buffer_tail();
+    IoEvent events[8]{};
+    REQUIRE_EQ(fixture.wait(events), 1u);
+    CHECK_EQ(events[0].type, IoEventType::Send);
+    CHECK_EQ(fixture.head(), head + 1);
+    CHECK_EQ(fixture.buffer_tail(), buffers);
+    CHECK_EQ(conn.recv_buf.len(), sizeof(previous) - 1);
+    CHECK_EQ(memcmp(conn.recv_buf.data(), previous, sizeof(previous) - 1), 0);
+    // The send callback consumes the completed request before the next wait.
+    conn.reset_request_receive_buffer();
+    REQUIRE_EQ(fixture.wait(events), 1u);
+    CHECK_EQ(events[0].type, IoEventType::Recv);
+    CHECK_EQ(conn.recv_buf.len(), sizeof(next) - 1);
+    CHECK_EQ(memcmp(conn.recv_buf.data(), next, sizeof(next) - 1), 0);
+    CHECK_EQ(fixture.buffer_tail(), static_cast<u16>(buffers + 1));
+    CHECK_EQ(fixture.guard.loop->backend.failure_code(), 0);
+}
+
+TEST(iouring_downstream_send_boundary, response_before_fin_or_error_is_dispatched_first) {
+    for (const i32 terminal : {0, -ECONNRESET}) {
+        RawDownstreamRecvBatch fixture;
+        if (!fixture.init()) SKIP("io_uring unavailable");
+        Connection& conn = *fixture.conns[0];
+        fixture.append_send(conn, 1024);
+        fixture.append_terminal(conn, terminal);
+        IoEvent events[8]{};
+        REQUIRE_EQ(fixture.wait(events), 1u);
+        CHECK_EQ(events[0].type, IoEventType::Send);
+        REQUIRE_EQ(fixture.wait(events), 1u);
+        CHECK_EQ(events[0].type, IoEventType::Recv);
+        CHECK_EQ(events[0].result, terminal);
+        CHECK_EQ(fixture.guard.loop->backend.failure_code(), 0);
+    }
+}
+
+TEST(iouring_downstream_send_boundary, completed_body_tagged_send_precedes_fin) {
+    RawDownstreamRecvBatch fixture;
+    if (!fixture.init()) SKIP("io_uring unavailable");
+    Connection& conn = *fixture.conns[0];
+    conn.response_read_deadline_state = ResponseReadDeadlineState::BodyComplete;
+    fixture.append_send(conn, 1024);
+    auto& cqe = fixture.guard.loop->backend
+                    .cq_entries[fixture.head() & *fixture.guard.loop->backend.cq_ring_mask];
+    cqe.user_data = encode_non_upstream_user_data({conn.id, IoEventType::Send, 7});
+    fixture.append_terminal(conn, 0);
+    IoEvent events[8]{};
+    REQUIRE_EQ(fixture.wait(events), 1u);
+    CHECK_EQ(events[0].type, IoEventType::Send);
+    CHECK_EQ(events[0].non_upstream_generation, 7u);
+    // The real final-body callback disarms the deadline before the FIN arrives.
+    conn.response_read_deadline_state = ResponseReadDeadlineState::None;
+    REQUIRE_EQ(fixture.wait(events), 1u);
+    CHECK_EQ(events[0].type, IoEventType::Recv);
+    CHECK_EQ(events[0].result, 0);
+    CHECK_EQ(fixture.guard.loop->backend.failure_code(), 0);
+}
+
+TEST(iouring_downstream_send_boundary, unrelated_recv_and_tagged_timer_send_keep_batch_order) {
+    for (const bool tagged_send : {false, true}) {
+        RawDownstreamRecvBatch fixture;
+        if (!fixture.init(2)) SKIP("io_uring unavailable");
+        Connection& sending = *fixture.conns[0];
+        Connection& receiving = *fixture.conns[tagged_send ? 0 : 1];
+        const u8 byte[] = "r";
+        fixture.append_send(sending, 16);
+        if (tagged_send) {
+            sending.response_read_deadline_state = ResponseReadDeadlineState::Armed;
+            auto& cqe = fixture.guard.loop->backend
+                            .cq_entries[fixture.head() & *fixture.guard.loop->backend.cq_ring_mask];
+            cqe.user_data = encode_non_upstream_user_data({sending.id, IoEventType::Send, 7});
+        }
+        REQUIRE(fixture.append_recv(receiving, byte, 1, true));
+        IoEvent events[8]{};
+        REQUIRE_EQ(fixture.wait(events), 2u);
+        CHECK_EQ(events[0].type, IoEventType::Send);
+        CHECK_EQ(events[0].non_upstream_generation, tagged_send ? 7u : 0u);
+        CHECK_EQ(events[1].type, IoEventType::Recv);
+        CHECK_EQ(receiving.recv_buf.len(), 1u);
+        CHECK_EQ(fixture.guard.loop->backend.failure_code(), 0);
+    }
+}
+
+TEST(iouring_downstream_send_boundary, receive_before_response_remains_real_pipeline) {
+    RawDownstreamRecvBatch fixture;
+    if (!fixture.init()) SKIP("io_uring unavailable");
+    Connection& conn = *fixture.conns[0];
+    const u8 byte[] = "p";
+    REQUIRE(fixture.append_recv(conn, byte, 1, true));
+    fixture.append_send(conn, 16);
+    IoEvent events[8]{};
+    REQUIRE_EQ(fixture.wait(events), 2u);
+    CHECK_EQ(events[0].type, IoEventType::Recv);
+    CHECK_EQ(events[1].type, IoEventType::Send);
+    CHECK_EQ(conn.recv_buf.len(), 1u);
+    CHECK_EQ(fixture.guard.loop->backend.failure_code(), 0);
+}
+
 static constexpr u8 kSplitHeaderPrefix[] =
     "GET /ledger?q=raw HTTP/1.1\r\n"
     "Host: client.exam";
@@ -52894,7 +53004,23 @@ TEST(response_read_deadline_get_positive_cl,
         const u32 free_after = loop->free_top;
         loop->dispatch(cancel_first ? target : cancel);
         CHECK_EQ(loop->free_top, free_after);
+        REQUIRE_GT(loop->backend.send_state[id].remaining, 0u);
         release_closed_response_read_fixture(fixture);
+
+        // Reuse the drained slot, then exercise the same strict retirement
+        // gate used before publishing a buffered response. An old unfinished
+        // proactor must not be mistaken for a send on this new connection.
+        PrebuiltD2Fixture successor{};
+        successor.episode = loop->conns[id].upstream_episode + 1u;
+        REQUIRE(stage_strict_read_timeout(loop, &config, nullptr, 0, &successor, true));
+        REQUIRE_EQ(successor.conn->id, id);
+        Connection& next = *successor.conn;
+        REQUIRE(loop->begin_strict_upstream_retirement(next));
+        CHECK_EQ(next.upstream_retiring_episode, successor.episode);
+        CHECK_EQ(next.upstream_retirement_target_owned, kUpstreamOpRecv);
+        next.upstream_recv_armed = false;
+        drain_prebuilt_d2_retirement(loop, next, kUpstreamOpRecv, cancel_first);
+        cleanup_prebuilt_d2(loop, successor);
     }
 }
 

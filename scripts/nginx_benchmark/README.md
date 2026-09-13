@@ -3,7 +3,7 @@
 Run real pinned nginx and converter-generated RUT against the same requests on
 one physical core each, with separate cores for the client and origin. This is
 an opt-in local experiment, not a performance CI gate or an expansion of the
-nginx compatibility matrix. No production code is changed.
+nginx compatibility matrix. The harness does not modify production source.
 
 ## Requirements
 
@@ -39,6 +39,15 @@ measurement, three repeats, alternating nginx/RUT order. Each repeat starts
 one frontend per engine, then runs all concurrency levels in order on that
 same process. Higher levels include the earlier load history; this is not a
 cold-start-per-level capacity measurement. JIT startup is outside timing.
+
+The default `--keepalive-header explicit` preserves #644's original wire shape
+(`Connection: keep-alive`). The bounded converter proxy currently rejects that
+request shape, so the full default run can fail its proxy keepalive preflight.
+Use `--keepalive-header implicit` to test HTTP/1.1 default persistence with no
+Connection header. Preflight, wrk and the independent client all use the chosen
+shape, which is recorded in `environment.json`. Close cases always send
+`Connection: close`. Passing the implicit profile does **not** establish support
+for explicit keep-alive, nor erase the original failed results.
 
 Use `--duration 1 --warmup 1 --repeats 1 --concurrency 1 32` for a smoke test.
 Select cases with `--scenarios static-close proxy-keepalive`. Ports default to

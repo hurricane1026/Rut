@@ -2225,6 +2225,12 @@ public:
             return nullptr;
         }
         u32 id = free_stack[--free_top];
+        // A free slot has drained every target and cancel completion. Failed
+        // sends can leave unsent bytes in the backend proactor even after the
+        // connection's close ledger drains; those bytes belong to the old fd.
+        // Clear both proactors before the new connection can validate or send.
+        backend.send_state[id] = {};
+        backend.upstream_send_state[id] = {};
         conns[id].reset();
         conns[id].id = id;
         conns[id].shard_id = static_cast<u8>(shard_id);
