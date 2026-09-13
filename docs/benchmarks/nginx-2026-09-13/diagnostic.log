@@ -1,0 +1,4 @@
+diag-static-nginx {"counts": {"correct_responses": 144475}, "examples": []}
+diag-static-rut {"counts": {"correct_responses": 119656}, "examples": []}
+diag-proxy-nginx {"counts": {"correct_responses": 27049}, "examples": []}
+diag-proxy-rut {"counts": {"correct_responses": 23809, "IncompleteReadError": 3269}, "examples": ["IncompleteReadError('0 bytes read on a total of undefined expected bytes')", "IncompleteReadError('0 bytes read on a total of undefined expected bytes')", "IncompleteReadError('0 bytes read on a total of undefined expected bytes')", "IncompleteReadError('0 bytes read on a total of undefined expected bytes')", "IncompleteReadError('0 bytes read on a total of undefined expected bytes')"]}

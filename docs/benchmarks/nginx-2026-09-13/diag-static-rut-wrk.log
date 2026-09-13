@@ -1,0 +1,25 @@
+Running 3s test @ http://127.0.0.1:8087/static
+  2 threads and 32 connections
+  Thread Stats   Avg      Stdev     Max   +/- Stdev
+    Latency   563.36us  236.79us   7.39ms   91.77%
+    Req/Sec    17.99k   431.50    18.63k    75.81%
+  110885 requests in 3.10s, 17.34MB read
+  Socket errors: connect 0, read 92424, write 0, timeout 0
+Requests/sec:  35769.27
+Transfer/sec:      5.59MB
+READ_DIAGNOSTIC n=0 errno=115 parser_errno=0 state=4
+READ_DIAGNOSTIC n=0 errno=115 parser_errno=0 state=4
+READ_DIAGNOSTIC n=0 errno=115 parser_errno=0 state=4
+READ_DIAGNOSTIC n=0 errno=115 parser_errno=0 state=4
+READ_DIAGNOSTIC n=0 errno=115 parser_errno=0 state=4
+READ_DIAGNOSTIC n=0 errno=115 parser_errno=0 state=4
+READ_DIAGNOSTIC n=0 errno=115 parser_errno=0 state=4
+READ_DIAGNOSTIC n=0 errno=115 parser_errno=0 state=4
+READ_DIAGNOSTIC n=0 errno=115 parser_errno=0 state=4
+READ_DIAGNOSTIC n=0 errno=115 parser_errno=0 state=4
+READ_DIAGNOSTIC n=0 errno=115 parser_errno=0 state=4
+READ_DIAGNOSTIC n=0 errno=115 parser_errno=0 state=4
+READ_DIAGNOSTIC n=0 errno=115 parser_errno=0 state=4
+READ_DIAGNOSTIC n=0 errno=115 parser_errno=0 state=4
+READ_DIAGNOSTIC n=0 errno=115 parser_errno=0 state=4
+READ_DIAGNOSTIC n=0 errno=115 parser_errno=0 state=4

@@ -1,0 +1,24 @@
+name: nginx benchmark tools
+
+on:
+  pull_request:
+    paths:
+      - scripts/nginx_benchmark/**
+      - .github/workflows/nginx-benchmark-tools.yml
+  push:
+    branches: [main]
+    paths:
+      - scripts/nginx_benchmark/**
+      - .github/workflows/nginx-benchmark-tools.yml
+
+permissions:
+  contents: read
+
+jobs:
+  tooling:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v6
+      - name: Check local benchmark tooling (no load generation)
+        run: python3 -m unittest discover -s scripts/nginx_benchmark -p 'test_*.py' -v
