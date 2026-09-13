@@ -42,7 +42,7 @@ exposed tools; the user selects the primary model in the client.
   implementation fallback used for final control corrections. Historical
   rejected candidates/reviews remain evidence. Complete candidate #639 was independently reviewed, passed normal and
   required CI, and merged as `ed0eec96`; extraction for the next capability
-  witness is CURRENT.
+  witness was validated as `d9e1733a`; the ordinary-RUT wrapper is CURRENT.
 - Integration base: `agent/nginx-to-rut-converter`, not `main`.
 - Parent [PR #269](https://github.com/hurricane1026/Rut/pull/269) stays draft.
 - The main worktree `/home/hurricane/private/code/Rut` has unrelated user WIP in
@@ -80,7 +80,7 @@ Broad #270 remains PARTIAL and #271 remains BLOCKED_BY_RUT. None of that proves
 the new explicit `proxy_buffering off` scope. Verify current issue/PR state if
 making new status claims; these are recorded prior-run results, not reruns.
 
-## CURRENT: #638 frontend-neutral capture extraction for ordinary-RUT capability
+## CURRENT: #638 handwritten ordinary-RUT None capability wrapper
 
 The minimal fixture uses one server/location, numeric loopback endpoints,
 `proxy_buffering off`, `proxy_read_timeout 1s`, and an owned access ledger.
@@ -143,8 +143,9 @@ capability or converter admission.
 
 ## NEXT
 
-1. Extract the accepted live episode into a frontend-neutral capture with
-   unchanged gates; independently review and lead-validate the original oracle.
+1. Finish and independently review the dedicated handwritten ordinary-RUT None
+   wrapper using validated capture `d9e1733a`; preserve failures and prove the
+   exact bytes/timing/ownership through public CLI O2/io_uring.
 2. After review and nginx-only oracle validation, establish the exact behavior
    through a separate ordinary-RUT `None` buffering capability witness.
 3. Only after capability is proven, implement bounded off model/lowering and an
@@ -185,7 +186,8 @@ then .nginx-converter-status.md, docs/nginx-compatibility.md and issue #638.
 Verify git/GitHub state and preserve unrelated user WIP in the main worktree.
 The audit, snapshots/ownership and shared validator/controls are complete.
 The nginx-only candidate passed complete CI and merged as ed0eec96.
-Next extract its unchanged live capture, then add the ordinary-RUT witness.
+Shared capture d9e1733a passed independent review, Release build and 7/7 tests.
+Next finish the dedicated ordinary-RUT public capability witness.
 Proceed with one small implementation → different-worker review →
 lead-scheduled tests → status/issue update at a time. Do not claim off support
 from untested source or nginx-only evidence. Keep parent PR #269 draft and
