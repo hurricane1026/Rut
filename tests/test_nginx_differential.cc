@@ -66910,6 +66910,250 @@ static bool run_pinned_nginx_explicit_buffering_off_oracle(TempDir& temp,
     return true;
 }
 
+static bool validate_explicit_off_loaded_program(const std::string& source_path,
+                                                 const std::string& captured_stdout,
+                                                 u16 frontend_port,
+                                                 u16 backend_port,
+                                                 const std::string& access_path,
+                                                 std::string& error) {
+    if (source_path.empty() || captured_stdout.empty() || frontend_port == 0u ||
+        backend_port == 0u || frontend_port == backend_port || access_path.empty()) {
+        error = "#638 loaded explicit-off validator received incomplete artifacts";
+        return false;
+    }
+    std::string persisted;
+    if (!read_exact_rut_source(source_path, "#638 captured converter stdout", persisted, error) ||
+        persisted != captured_stdout) {
+        error = "#638 persisted generated source differs from converter stdout";
+        return false;
+    }
+
+    auto program = std::make_unique<rut::LoadedProgram>();
+    struct Guard {
+        std::unique_ptr<rut::LoadedProgram>& program;
+        ~Guard() { program->destroy(); }
+    } guard{program};
+    rut::LoadError load_error{};
+    if (!rut::load_rut_program(source_path.c_str(),
+                               *program,
+                               load_error,
+                               rut::jit::OptLevel::O2,
+                               static_cast<u64>(captured_stdout.size())) ||
+        !program->has_listener || program->listener.address != rut::ListenerAddress::IPv4Exact ||
+        program->listener.ipv4_host != 0x7f000001u || program->listener.port != frontend_port ||
+        !rut::access_log_sink_spec_valid(program->access_log) || !program->access_log.present ||
+        program->access_log.format != rut::AccessLogFormatProfile::DownstreamRequestBytesLine ||
+        program->access_log.publication != rut::AccessLogPublicationProfile::LiveEachRecord ||
+        program->config.route_count != 3u || program->access_log.path_len != access_path.size() ||
+        memcmp(program->access_log.path, access_path.data(), access_path.size()) != 0 ||
+        program->config.upstream_count != 1u || program->config.upstreams[0].addr_count != 1u ||
+        ntohl(program->config.upstreams[0].addrs[0].sin_addr.s_addr) != 0x7f000001u ||
+        ntohs(program->config.upstreams[0].addrs[0].sin_port) != backend_port) {
+        error =
+            "#638 loaded explicit-off source lost listener/upstream/access "
+            "ownership";
+        return false;
+    }
+    const auto owned = [](rut::Str value, const char* pool, u32 used) {
+        if (value.ptr == nullptr || value.len == 0u || value.len > used) return false;
+        const uintptr_t begin = reinterpret_cast<uintptr_t>(pool);
+        const uintptr_t ptr = reinterpret_cast<uintptr_t>(value.ptr);
+        return ptr >= begin && ptr - begin <= used - value.len;
+    };
+    const auto policy_ok = [&](const rut::ForwardResponsePolicySpec& policy) {
+        static constexpr rut::Str hidden[] = {
+            rut::lit_str("Date"), rut::lit_str("Server"), rut::lit_str("X-Pad")};
+        if (policy.version != rut::ResponsePolicyVersion::Http11 ||
+            policy.framing != rut::ResponsePolicyFraming::ContentLength ||
+            policy.connection != rut::ResponsePolicyConnection::Request ||
+            policy.date != rut::ResponsePolicyDate::Current ||
+            policy.head_mode != rut::ResponsePolicyHeadMode::Reject ||
+            policy.hide_header_count != 3u ||
+            !owned(policy.server,
+                   program->config.response_policy_bytes,
+                   program->config.response_policy_bytes_used) ||
+            !policy.server.eq(rut::lit_str("nginx/1.29.7")))
+            return false;
+        for (u32 i = 0; i < 3u; i++)
+            if (!owned(policy.hide_headers[i],
+                       program->config.response_policy_bytes,
+                       program->config.response_policy_bytes_used) ||
+                !policy.hide_headers[i].eq(hidden[i]))
+                return false;
+        return true;
+    };
+    const auto failure_ok =
+        [&](const rut::ForwardFailurePolicySpec& failure, u16 status, const char* reason) {
+            static constexpr char k502[] =
+                "<html>\r\n<head><title>502 Bad "
+                "Gateway</title></head>\r\n<body>\r\n<center><h1>502 Bad "
+                "Gateway</h1></center>\r\n<hr><center>nginx/1.29.7</center>\r\n</"
+                "body>\r\n</html>\r\n";
+            static constexpr char k504[] =
+                "<html>\r\n<head><title>504 Gateway "
+                "Time-out</title></head>\r\n<body>\r\n<center><h1>504 Gateway "
+                "Time-out</h1></center>\r\n<hr><center>nginx/1.29.7</center>\r\n</"
+                "body>\r\n</html>\r\n";
+            const char* body = status == 502u ? k502 : k504;
+            return failure.version == rut::ForwardFailurePolicyVersion::Http11 &&
+                   failure.date == rut::ForwardFailurePolicyDate::Current &&
+                   failure.connection == rut::ForwardFailurePolicyConnection::Request &&
+                   failure.status_code == status &&
+                   failure.head_mode == rut::FailurePolicyHeadMode::Reject &&
+                   owned(failure.reason,
+                         program->config.failure_policy_bytes,
+                         program->config.failure_policy_bytes_used) &&
+                   owned(failure.server,
+                         program->config.failure_policy_bytes,
+                         program->config.failure_policy_bytes_used) &&
+                   owned(failure.content_type,
+                         program->config.failure_policy_bytes,
+                         program->config.failure_policy_bytes_used) &&
+                   owned(failure.body,
+                         program->config.failure_policy_bytes,
+                         program->config.failure_policy_bytes_used) &&
+                   failure.reason.eq({reason, static_cast<u32>(strlen(reason))}) &&
+                   failure.server.eq(rut::lit_str("nginx/1.29.7")) &&
+                   failure.content_type.eq(rut::lit_str("text/html")) &&
+                   failure.body.eq({body, static_cast<u32>(strlen(body))});
+        };
+    const auto invoke = [](const rut::RouteEntry& route, const char* request, u32 length) {
+        return rut::jit::HandlerResult::unpack(
+            route.fn(nullptr, nullptr, reinterpret_cast<const rut::u8*>(request), length, nullptr));
+    };
+    const rut::RouteEntry* get = nullptr;
+    for (u32 i = 0; i < program->config.route_count; i++) {
+        const auto& route = program->config.routes[i];
+        if (route.method == rut::kRouteMethodGet && route.path_len == 1u && route.path[0] == '/' &&
+            route.action == rut::RouteAction::JitHandler && route.fn != nullptr) {
+            if (get != nullptr) return error = "#638 duplicated explicit-off GET route", false;
+            get = &route;
+        }
+    }
+    if (get == nullptr) return error = "#638 missing explicit-off root GET route", false;
+    static constexpr char kRequest[] =
+        "GET /buffered-timeout?q=1 HTTP/1.1\r\nHost: client.example\r\n\r\n";
+    static_assert(sizeof(kRequest) - 1u == 60u);
+    const u32 request_len = sizeof(kRequest) - 1u;
+    const auto result = invoke(*get, kRequest, request_len);
+    if (result.action != rut::jit::HandlerAction::ForwardBundle ||
+        result.status_code != static_cast<u16>(rut::RequestPolicyId::Http11FixedStrip) ||
+        result.upstream_id != 0u || result.next_state == 0u ||
+        result.next_state > program->config.policy_bundle_count)
+        return error = "#638 explicit-off GET did not select ForwardBundle upstream 0", false;
+    const auto& bundle = program->config.policy_bundles[result.next_state - 1u];
+    if (!program->config.response_policy_id_is_valid(bundle.response_policy_id) ||
+        !program->config.failure_policy_id_is_valid(bundle.failure_policy_id) ||
+        !program->config.timeout_failure_policy_id_is_valid(bundle.timeout_failure_policy_id)) {
+        error = "#638 selected GET bundle has invalid policy IDs";
+        return false;
+    }
+
+    const u16 baseline_state = result.next_state;
+    const auto baseline_fn = get->fn;
+    auto& selected_bundle = program->config.policy_bundles[baseline_state - 1u];
+    auto& selected_response =
+        program->config.response_policies[selected_bundle.response_policy_id - 1u];
+    const u16 baseline_response_id = selected_bundle.response_policy_id;
+    const u16 baseline_failure_id = selected_bundle.failure_policy_id;
+    const u16 baseline_timeout_failure_id = selected_bundle.timeout_failure_policy_id;
+    const auto invoke_and_check = [&](const char* label, bool expect_valid) {
+        const auto observed = invoke(*get, kRequest, request_len);
+        const bool identity =
+            observed.action == rut::jit::HandlerAction::ForwardBundle &&
+            observed.status_code == static_cast<u16>(rut::RequestPolicyId::Http11FixedStrip) &&
+            observed.upstream_id == 0u && observed.next_state == baseline_state &&
+            get->fn == baseline_fn && selected_bundle.response_policy_id == baseline_response_id &&
+            selected_bundle.failure_policy_id == baseline_failure_id &&
+            selected_bundle.timeout_failure_policy_id == baseline_timeout_failure_id;
+        if (!identity) {
+            error = "#638 loaded mutation changed GET route/bundle identity";
+            return false;
+        }
+        const bool shape =
+            selected_bundle.response_read_timeout_seconds == 1u &&
+            selected_response.version == rut::ResponsePolicyVersion::Http11 &&
+            selected_response.framing == rut::ResponsePolicyFraming::ContentLength &&
+            selected_response.connection == rut::ResponsePolicyConnection::Request &&
+            selected_response.date == rut::ResponsePolicyDate::Current &&
+            selected_response.head_mode == rut::ResponsePolicyHeadMode::Reject &&
+            selected_bundle.response_buffering == rut::ForwardResponseBufferingMode::None &&
+            policy_ok(selected_response) &&
+            failure_ok(program->config.failure_policies[selected_bundle.failure_policy_id - 1u],
+                       502u,
+                       "Bad Gateway") &&
+            failure_ok(
+                program->config.failure_policies[selected_bundle.timeout_failure_policy_id - 1u],
+                504u,
+                "Gateway Time-out");
+        if (shape != expect_valid) {
+            error = std::string("#638 loaded explicit-off ") + label +
+                    (expect_valid ? " baseline rejected" : " mutation accepted");
+            return false;
+        }
+        return true;
+    };
+    if (!invoke_and_check("GET", true)) return false;
+
+    const auto run_loaded_mutation = [&](const char* label, auto mutate, auto restore) {
+        mutate();
+        const bool rejected = invoke_and_check(label, false);
+        restore();
+        const bool recovered = rejected && invoke_and_check(label, true);
+        return recovered;
+    };
+    if (!run_loaded_mutation(
+            "buffering=complete_content_length",
+            [&] {
+                selected_bundle.response_buffering =
+                    rut::ForwardResponseBufferingMode::CompleteContentLength;
+            },
+            [&] {
+                selected_bundle.response_buffering = rut::ForwardResponseBufferingMode::None;
+            }) ||
+        !run_loaded_mutation(
+            "response_read_timeout=2s",
+            [&] { selected_bundle.response_read_timeout_seconds = 2u; },
+            [&] { selected_bundle.response_read_timeout_seconds = 1u; }) ||
+        !run_loaded_mutation(
+            "head_mode=suppress_body",
+            [&] { selected_response.head_mode = rut::ResponsePolicyHeadMode::SuppressBody; },
+            [&] { selected_response.head_mode = rut::ResponsePolicyHeadMode::Reject; }))
+        return false;
+    if (!read_exact_rut_source(
+            source_path, "#638 source after loaded mutations", persisted, error) ||
+        persisted != captured_stdout) {
+        error = "#638 loaded-bundle mutations changed persisted source";
+        return false;
+    }
+    return true;
+}
+
+static bool explicit_off_pair_observations_match(
+    const ExplicitOffObservation& nginx,
+    const std::vector<std::vector<char>>& nginx_history,
+    const ExplicitOffObservation& rut,
+    const std::vector<std::vector<char>>& rut_history,
+    std::string& error) {
+    if (!validate_explicit_off_observation(nginx, error) ||
+        !validate_explicit_off_observation(rut, error))
+        return false;
+    auto nginx_prefix = nginx.prefix_wire;
+    auto nginx_wire = nginx.downstream_wire;
+    auto rut_prefix = rut.prefix_wire;
+    auto rut_wire = rut.downstream_wire;
+    if (!normalize_date(nginx_prefix) || !normalize_date(nginx_wire) ||
+        !normalize_date(rut_prefix) || !normalize_date(rut_wire) || nginx_prefix != rut_prefix ||
+        nginx_wire != rut_wire || nginx_history.size() != 1u || nginx_history[0].empty() ||
+        rut_history != nginx_history || nginx.ledger != rut.ledger ||
+        nginx.accepted != rut.accepted || nginx.requests != rut.requests ||
+        nginx.close_count != rut.close_count || nginx.publication_count != rut.publication_count) {
+        error = "#638 same-file converter pair observations differed";
+        return false;
+    }
+    return true;
+}
+
 static bool run_explicit_off_converter_pair(TempDir& temp,
                                             const std::string& container_name,
                                             const char* rut_path,
@@ -67015,6 +67259,13 @@ static bool run_explicit_off_converter_pair(TempDir& temp,
             error = "#638 converter did not return exact nonempty stdout and empty stderr";
         return false;
     }
+    if (!validate_explicit_off_loaded_program(temp.source,
+                                              captured_stdout,
+                                              nginx.frontend_port,
+                                              nginx.backend_port,
+                                              temp.nginx_access_log,
+                                              error))
+        return false;
     HeldLoopbackPorts reservations;
     const u16 ports[] = {nginx.frontend_port, nginx.backend_port};
     if (!reservations.reserve_specific(0u, ports[0]) ||
@@ -67035,19 +67286,40 @@ static bool run_explicit_off_converter_pair(TempDir& temp,
                                       error) ||
         !config_unchanged())
         return false;
-    std::vector<char> nginx_prefix = nginx.observation.prefix_wire;
-    std::vector<char> nginx_wire = nginx.observation.downstream_wire;
-    std::vector<char> rut_prefix = rut.prefix_wire;
-    std::vector<char> rut_wire = rut.downstream_wire;
-    if (!normalize_date(nginx_prefix) || !normalize_date(nginx_wire) ||
-        !normalize_date(rut_prefix) || !normalize_date(rut_wire) || nginx_prefix != rut_prefix ||
-        nginx_wire != rut_wire || rut_history != nginx.joined_history || rut_history.size() != 1u ||
-        rut_history[0] != nginx.joined_request || rut.ledger != nginx.observation.ledger ||
-        rut.ledger != nginx_access || rut.accepted != nginx.observation.accepted ||
-        rut.requests != nginx.observation.requests ||
-        rut.close_count != nginx.observation.close_count ||
-        rut.publication_count != nginx.observation.publication_count) {
-        error = "#638 same-file converter pair observations differed";
+    if (!explicit_off_pair_observations_match(
+            nginx.observation, nginx.joined_history, rut, rut_history, error) ||
+        rut_history[0] != nginx.joined_request || rut.ledger != nginx_access)
+        return false;
+    const auto reject_mutant = [&](const char* label, const auto& mutate) {
+        auto observation = rut;
+        auto history = rut_history;
+        mutate(observation, history);
+        std::string rejected_error;
+        if (explicit_off_pair_observations_match(
+                nginx.observation, nginx.joined_history, observation, history, rejected_error)) {
+            error = std::string("#638 pair comparator accepted mutation: ") + label;
+            return false;
+        }
+        return explicit_off_pair_observations_match(
+            nginx.observation, nginx.joined_history, rut, rut_history, error);
+    };
+    if (!reject_mutant("prefix", [](auto& o, auto&) { o.prefix_wire.push_back('x'); }) ||
+        !reject_mutant("tail", [](auto& o, auto&) { o.downstream_wire.push_back('x'); }) ||
+        !reject_mutant("upstream", [](auto&, auto& h) { h[0][0] ^= 1; }) ||
+        !reject_mutant("ledger", [](auto& o, auto&) { o.ledger = "61\n"; }) ||
+        !reject_mutant("EOF", [](auto& o, auto&) { o.eof_ns = 0u; }) ||
+        !reject_mutant("publication", [](auto& o, auto&) { o.publication_count++; }) ||
+        !reject_mutant("retirement", [](auto& o, auto&) { o.retirement.count++; }) ||
+        !reject_mutant("late prefix", [](auto& o, auto&) {
+            o.prefix_complete_ns = o.publication_ns + 800'000'000ull;
+        }))
+        return false;
+    std::string final_nginx_access;
+    std::string final_rut_access;
+    if (!read_request_length_access_file(temp.nginx_access_snapshot, final_nginx_access, error) ||
+        !read_request_length_access_file(temp.nginx_access_log, final_rut_access, error) ||
+        final_nginx_access != nginx_access || final_rut_access != rut.ledger) {
+        error = "#638 paired ledgers changed during final settlement";
         return false;
     }
     success = true;
