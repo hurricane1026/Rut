@@ -80,7 +80,22 @@ Broad #270 remains PARTIAL and #271 remains BLOCKED_BY_RUT. None of that proves
 the new explicit `proxy_buffering off` scope. Verify current issue/PR state if
 making new status claims; these are recorded prior-run results, not reruns.
 
-## CURRENT: #638 handwritten ordinary-RUT None capability wrapper
+## CURRENT: #640 ordinary-RUT None inactivity finalization
+
+The handwritten wrapper `845b0c2a` first failed parsing the illegal explicit
+`response_buffering: "none"` value. Independently reviewed `7721e5be` uses the
+legal omission/default None. Clang Release build and formatting passed, but its
+public O2/io_uring run failed once in 2.42s at the joint ledger/retirement gate
+(access log empty). Exact prefix, Open probe and inactivity EOF passed the
+capture's earlier checks; this is not complete capability acceptance. Both full
+logs/source and reproduction are preserved in [#640](https://github.com/hurricane1026/Rut/issues/640),
+linked to #638/#271. Investigate ordinary runtime completion ownership; do not
+rerun unchanged, weaken the ledger/timing gates, or begin converter admission.
+Local evidence: `/tmp/rut-638-capability-first.log`,
+`/tmp/rut-638-capability-none-first.log`, and
+`/tmp/rut-638-capability-none-build.log`. No runtime fix has been applied yet.
+
+### Accepted oracle and wrapper context
 
 The minimal fixture uses one server/location, numeric loopback endpoints,
 `proxy_buffering off`, `proxy_read_timeout 1s`, and an owned access ledger.
@@ -143,11 +158,10 @@ capability or converter admission.
 
 ## NEXT
 
-1. Finish and independently review the dedicated handwritten ordinary-RUT None
-   wrapper using validated capture `d9e1733a`; preserve failures and prove the
-   exact bytes/timing/ownership through public CLI O2/io_uring.
-2. After review and nginx-only oracle validation, establish the exact behavior
-   through a separate ordinary-RUT `None` buffering capability witness.
+1. Implement and independently review the generic #640 completion fix with
+   meaningful ownership controls; lead-run the unchanged ordinary-RUT witness.
+2. Complete capability candidate normal/required CI and integrate only into
+   `agent/nginx-to-rut-converter` after proof.
 3. Only after capability is proven, implement bounded off model/lowering and an
    actual same-file nginx-versus-generated-RUT differential pair.
 
