@@ -33,15 +33,16 @@ exposed tools; the user selects the primary model in the client.
 ## Workspace and preservation
 
 - Assigned worktree: `/home/hurricane/private/code/Rut_issue627_two_second_oracle`.
-- Branch: `nginx-off-oracle`.
+- Branch: `nginx-off-capability`, based on accepted #639 merge `ed0eec96`.
 - This session started with clean worktree and local/remote HEAD both
   `6942666557d9f9a4303d40de266b640f4920f217`.
 - Current #638 source candidate: `247338de`, independently **APPROVED for the
   shared-validator/control increment**, following the accepted snapshots fix
   `d345e933`. See current status for validation logs and the explicit primary
   implementation fallback used for final control corrections. Historical
-  rejected candidates/reviews remain evidence. Complete-candidate PR/normal CI
-  remains the next task.
+  rejected candidates/reviews remain evidence. Complete candidate #639 was independently reviewed, passed normal and
+  required CI, and merged as `ed0eec96`; extraction for the next capability
+  witness is CURRENT.
 - Integration base: `agent/nginx-to-rut-converter`, not `main`.
 - Parent [PR #269](https://github.com/hurricane1026/Rut/pull/269) stays draft.
 - The main worktree `/home/hurricane/private/code/Rut` has unrelated user WIP in
@@ -79,7 +80,7 @@ Broad #270 remains PARTIAL and #271 remains BLOCKED_BY_RUT. None of that proves
 the new explicit `proxy_buffering off` scope. Verify current issue/PR state if
 making new status claims; these are recorded prior-run results, not reruns.
 
-## CURRENT: #638 complete nginx-only oracle candidate review/normal CI
+## CURRENT: #638 frontend-neutral capture extraction for ordinary-RUT capability
 
 The minimal fixture uses one server/location, numeric loopback endpoints,
 `proxy_buffering off`, `proxy_read_timeout 1s`, and an owned access ledger.
@@ -91,7 +92,9 @@ Clang Release build and six focused tests passed with zero skips (16.65s, new
 oracle 1.65s); logs are `/tmp/rut-638-snapshots-build.log` and
 `/tmp/rut-638-snapshots-targeted.log`. This is local nginx-only evidence; the
 shared validator/negative controls are now implemented in `247338de`;
-complete-candidate CI remains pending.
+complete-candidate CI passed: run `34730518730`, all 14 ordinary jobs and
+required nginx 162/162, zero skips, 717.96s. #639 merged as `ed0eec96`; log
+`/tmp/rut-639-f2b1-nginx-ci.log`. This completes only the nginx-only oracle.
 
 ### Completed implementation: snapshots and ownership only (`d345e933`)
 
@@ -140,9 +143,8 @@ capability or converter admission.
 
 ## NEXT
 
-1. Review and validate the complete nginx-only candidate through normal CI in
-   a PR targeting `agent/nginx-to-rut-converter`. Preserve rejected review
-   evidence and any failed run; do not promote compatibility from nginx alone.
+1. Extract the accepted live episode into a frontend-neutral capture with
+   unchanged gates; independently review and lead-validate the original oracle.
 2. After review and nginx-only oracle validation, establish the exact behavior
    through a separate ordinary-RUT `None` buffering capability witness.
 3. Only after capability is proven, implement bounded off model/lowering and an
@@ -182,7 +184,8 @@ Read applicable AGENTS.md and docs/nginx-converter-session-handoff.md first,
 then .nginx-converter-status.md, docs/nginx-compatibility.md and issue #638.
 Verify git/GitHub state and preserve unrelated user WIP in the main worktree.
 The audit, snapshots/ownership and shared validator/controls are complete.
-Next review and validate the complete nginx-only candidate through normal CI.
+The nginx-only candidate passed complete CI and merged as ed0eec96.
+Next extract its unchanged live capture, then add the ordinary-RUT witness.
 Proceed with one small implementation → different-worker review →
 lead-scheduled tests → status/issue update at a time. Do not claim off support
 from untested source or nginx-only evidence. Keep parent PR #269 draft and

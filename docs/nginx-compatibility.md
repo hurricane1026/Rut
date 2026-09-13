@@ -66,8 +66,10 @@ retirement and stable `60\n` ledger. The subsequent `247338de` adds one shared
 real/synthetic acceptance validator and named negative controls, independently
 approved after lead corrections to Luna's control fixtures. The new standalone
 self-check passed (0.01s), as did six focused regressions (16.40s, zero skips;
-real off oracle 1.68s). Complete-candidate PR/normal CI, the separate ordinary-RUT
-capability witness and same-file converter differential remain pending. The
+real off oracle 1.68s). Complete candidate #639 merged as `ed0eec96` from
+`f2b1adf3` after independent review and CI `34730518730`: all 14 ordinary jobs
+and required nginx 162/162, zero skips, 717.96s (new oracle 1.83s). The separate
+ordinary-RUT capability witness and same-file converter differential remain pending. The
 converter still rejects `proxy_buffering off`; no compatibility row is promoted.
 
 | nginx feature | parser | converter | RUT capability | behavior test | status |
