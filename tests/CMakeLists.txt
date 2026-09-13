@@ -1928,6 +1928,30 @@ if(RUT_ENABLE_JIT)
         ENVIRONMENT "RUT_NGINX_DIFFERENTIAL_REQUIRED=1"
     )
     add_test(
+        NAME test_nginx_issue638_pinned_explicit_buffering_off_oracle
+        COMMAND test_nginx_differential --pinned-nginx-explicit-buffering-off-oracle
+    )
+    set_tests_properties(
+        test_nginx_issue638_pinned_explicit_buffering_off_oracle PROPERTIES
+        LABELS "integration;nginx;docker;network;differential"
+        RUN_SERIAL TRUE
+        RESOURCE_LOCK nginx-differential
+        TIMEOUT 120
+        SKIP_RETURN_CODE 77
+        ENVIRONMENT "RUT_NGINX_DIFFERENTIAL_REQUIRED=1"
+    )
+    add_test(
+        NAME test_nginx_issue638_explicit_off_observation_self_check
+        COMMAND test_nginx_differential --explicit-off-observation-self-check
+    )
+    set_tests_properties(
+        test_nginx_issue638_explicit_off_observation_self_check PROPERTIES
+        LABELS "unit;negative;nginx"
+        RUN_SERIAL TRUE
+        RESOURCE_LOCK nginx-differential
+        TIMEOUT 30
+    )
+    add_test(
         NAME test_nginx_issue271_converter_default_buffering_third_body_progress_expiry_differential
         COMMAND test_nginx_differential
                 --converter-default-buffering-third-body-progress-expiry-differential
