@@ -913,7 +913,10 @@ if(RUT_ENABLE_JIT)
         LABELS "integration;docker;network"
         RUN_SERIAL TRUE
         RESOURCE_LOCK nginx-differential
-        TIMEOUT 120
+        # Match the required broker workflow budget. An explicit test timeout
+        # overrides ctest --timeout; 120s killed a passing 145s Docker sequence
+        # before its failure-atomic cleanup could complete.
+        TIMEOUT 180
         SKIP_RETURN_CODE 77
     )
     add_executable(test_fixture_privileged_broker
