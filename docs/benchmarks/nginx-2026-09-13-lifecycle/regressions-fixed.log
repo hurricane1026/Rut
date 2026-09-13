@@ -1,0 +1,19 @@
+=== iouring_downstream_send_boundary ===
+RUN: iouring_downstream_send_boundary.response_before_next_request_preserves_buffer
+  PASS: response_before_next_request_preserves_buffer
+RUN: iouring_downstream_send_boundary.response_before_fin_or_error_is_dispatched_first
+  PASS: response_before_fin_or_error_is_dispatched_first
+RUN: iouring_downstream_send_boundary.completed_body_tagged_send_precedes_fin
+  PASS: completed_body_tagged_send_precedes_fin
+RUN: iouring_downstream_send_boundary.unrelated_recv_and_tagged_timer_send_keep_batch_order
+  PASS: unrelated_recv_and_tagged_timer_send_keep_batch_order
+RUN: iouring_downstream_send_boundary.receive_before_response_remains_real_pipeline
+  PASS: receive_before_response_remains_real_pipeline
+=== iouring_prebuilt ===
+RUN: iouring_prebuilt.one_backend_batch_composes_header_retirement_and_late_recv
+  PASS: one_backend_batch_composes_header_retirement_and_late_recv
+=== response_read_deadline_get_positive_cl ===
+RUN: response_read_deadline_get_positive_cl.matching_generation_f_more_transfers_live_send_to_close_ledger
+  PASS: matching_generation_f_more_transfers_live_send_to_close_ledger
+
+7 passed, 0 failed, 137 checks, 0 failed checks, 1231 skipped

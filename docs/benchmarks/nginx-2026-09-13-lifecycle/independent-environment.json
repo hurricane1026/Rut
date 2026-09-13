@@ -1,0 +1,47 @@
+{
+  "harness_revision": "b9b817e2211fd496b7c422d727dd56b2886c087f",
+  "harness_dirty": false,
+  "started_at": "2026-09-13T11:17:21Z",
+  "arguments": {
+    "rut": "/home/hurricane/private/code/Rut_build_benchmark_lifecycle/src/rut",
+    "converter": "/home/hurricane/private/code/Rut_build_benchmark_lifecycle/src/rut-nginx-convert",
+    "wrk": "/home/hurricane/private/code/Rut_benchmark_20260913/wrk/wrk",
+    "output": "/tmp/rut-lifecycle-debug/accepted-independent",
+    "mode": "diagnose",
+    "server_cpu": 2,
+    "origin_cpu": 3,
+    "client_cpus": "4,5",
+    "keepalive_header": "implicit",
+    "front_port": 8087,
+    "origin_port": 9087,
+    "concurrency": [
+      32
+    ],
+    "duration": 5,
+    "warmup": 2,
+    "repeats": 3,
+    "scenarios": [
+      "static-close",
+      "static-keepalive",
+      "proxy-close",
+      "proxy-keepalive"
+    ]
+  },
+  "binaries_sha256": {
+    "/home/hurricane/private/code/Rut_build_benchmark_lifecycle/src/rut": "a573d345d16efe2343a499fd7800f48cda4b32b0d6dc185c8314027cfa0dd051",
+    "/home/hurricane/private/code/Rut_build_benchmark_lifecycle/src/rut-nginx-convert": "1e5505b58f5392384070b9b8f64053573f51b8fbeaab1ba7b50ccef074e6c3bc",
+    "/home/hurricane/private/code/Rut_benchmark_20260913/wrk/wrk": "5033152ee3b16a55c7f3cb4331cb3459437596c6d79c64636cc7027ad01fb28b"
+  },
+  "nginx_image": "nginx@sha256:1854da86e82d5dfb49a8f3d78b099adcc7e36608b207146ed95cd47937938a40",
+  "nginx_image_id": "sha256:a92877abc9efa32ce60500ddd02d78e2c582eb1e05e563973e7b13754beb1723",
+  "kernel": [
+    "Linux",
+    "leopard",
+    "7.2.4-200.fc44.x86_64",
+    "#1 SMP PREEMPT_DYNAMIC Mon Sep  7 19:10:19 UTC 2026",
+    "x86_64"
+  ],
+  "cpu_topology": "Architecture:                            x86_64\nCPU op-mode(s):                          32-bit, 64-bit\nAddress sizes:                           39 bits physical, 48 bits virtual\nByte Order:                              Little Endian\nCPU(s):                                  16\nOn-line CPU(s) list:                     0-15\nVendor ID:                               GenuineIntel\nModel name:                              Intel(R) Core(TM) i7-10700 CPU @ 2.90GHz\nCPU family:                              6\nModel:                                   165\nThread(s) per core:                      2\nCore(s) per socket:                      8\nSocket(s):                               1\nStepping:                                5\nCPU(s) scaling MHz:                      85%\nCPU max MHz:                             4800.0000\nCPU min MHz:                             800.0000\nBogoMIPS:                                5799.77\nFlags:                                   fpu vme de pse tsc msr pae mce cx8 apic sep mtrr pge mca cmov pat pse36 clflush dts acpi mmx fxsr sse sse2 ss ht tm pbe syscall nx pdpe1gb rdtscp lm constant_tsc art arch_perfmon pebs bts rep_good nopl xtopology nonstop_tsc cpuid aperfmperf pni pclmulqdq dtes64 monitor ds_cpl vmx smx est tm2 ssse3 sdbg fma cx16 xtpr pdcm pcid sse4_1 sse4_2 x2apic movbe popcnt tsc_deadline_timer aes xsave avx f16c rdrand lahf_lm abm 3dnowprefetch cpuid_fault epb ssbd ibrs ibpb stibp ibrs_enhanced tpr_shadow flexpriority ept vpid ept_ad fsgsbase tsc_adjust bmi1 avx2 smep bmi2 erms invpcid mpx rdseed adx smap clflushopt intel_pt xsaveopt xsavec xgetbv1 xsaves dtherm ida arat pln pts hwp hwp_notify hwp_act_window hwp_epp vnmi pku ospke md_clear flush_l1d arch_capabilities\nVirtualization:                          VT-x\nL1d cache:                               256 KiB (8 instances)\nL1i cache:                               256 KiB (8 instances)\nL2 cache:                                2 MiB (8 instances)\nL3 cache:                                16 MiB (1 instance)\nNUMA node(s):                            1\nNUMA node0 CPU(s):                       0-15\nVulnerability Gather data sampling:      Mitigation; Microcode\nVulnerability Ghostwrite:                Not affected\nVulnerability Indirect target selection: Mitigation; Aligned branch/return thunks\nVulnerability Itlb multihit:             KVM: Mitigation: Split huge pages\nVulnerability L1tf:                      Not affected\nVulnerability Mds:                       Not affected\nVulnerability Meltdown:                  Not affected\nVulnerability Mmio stale data:           Mitigation; Clear CPU buffers; SMT vulnerable\nVulnerability Old microcode:             Not affected\nVulnerability Reg file data sampling:    Not affected\nVulnerability Retbleed:                  Mitigation; Enhanced IBRS\nVulnerability Spec rstack overflow:      Not affected\nVulnerability Spec store bypass:         Mitigation; Speculative Store Bypass disabled via prctl\nVulnerability Spectre v1:                Mitigation; usercopy/swapgs barriers and __user pointer sanitization\nVulnerability Spectre v2:                Mitigation; Enhanced / Automatic IBRS; IBPB conditional; PBRSB-eIBRS SW sequence; BHI SW loop, KVM SW loop\nVulnerability Srbds:                     Mitigation; Microcode\nVulnerability Tsa:                       Not affected\nVulnerability Tsx async abort:           Not affected\nVulnerability Vmscape:                   Mitigation; IBPB before exit to userspace\n",
+  "tcp_tw_reuse": "2",
+  "note": "Harness revision is not proof of binary source revision. Record build provenance separately."
+}

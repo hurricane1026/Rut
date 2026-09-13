@@ -1,0 +1,18 @@
+{
+  "source_commit": "b9b817e2211fd496b7c422d727dd56b2886c087f",
+  "source_sha256": {
+    "include/rut/runtime/iouring_event_loop.h": "d9cf878131043efec2b1090fed4cf03bad37f14dc7689ab9688f65e95cae09af",
+    "src/runtime/io_uring_backend.cc": "bbc61f15c3f4aadd86ed8cbace7b2a86a7dc4135cc571172089664518ff003e3",
+    "tests/test_network.cc": "1351154462e75c7f3f9c2c6c718de1e75f54fe0e61dbccb7bea62d43c89dbe97"
+  },
+  "build_directory": "/home/hurricane/private/code/Rut_build_benchmark_lifecycle",
+  "build": "Clang 22, Release (-O2), RUT_ENABLE_JIT=ON, RUT_ENABLE_IPO=OFF; built before committing identical production and test sources",
+  "binaries_sha256": {
+    "src/rut": "a573d345d16efe2343a499fd7800f48cda4b32b0d6dc185c8314027cfa0dd051",
+    "src/rut-nginx-convert": "1e5505b58f5392384070b9b8f64053573f51b8fbeaab1ba7b50ccef074e6c3bc",
+    "tests/test_network": "691de03a1b4d8bc8dea02ece35f3f4b535b669611d0c10ee46502cffa9fbb8b2"
+  },
+  "network_summary": "1238 passed, 0 failed, 143587 checks, 0 failed checks",
+  "network_log_sha256": "cbf74a654459cff5025ebcfb471c1b36dd7e7187eed7889c561bacd8965b72e3",
+  "note": "matrix metadata was captured before the source commit; its harness HEAD is the parent, not the binary source revision. Use the source hashes and build provenance above. Results validate correctness only; other compilation was running on this host."
+}
