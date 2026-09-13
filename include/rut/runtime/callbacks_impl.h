@@ -2307,7 +2307,6 @@ void on_header_received(void* lp, Connection& conn, IoEvent ev) {
                 return;
             }
             const bool has_normalized_exact_inventory =
-                has_exact_inventory &&
                 config->has_slash_normalized_exact_strict_local_response_inventory();
             u16 exact_policy_id = 0;
             if (has_normalized_exact_inventory) {
@@ -2319,7 +2318,7 @@ void on_header_received(void* lp, Connection& conn, IoEvent ev) {
                 }
                 if (selection.state == SlashNormalizedExactSelectionState::Match)
                     exact_policy_id = selection.policy_id;
-            } else if (has_exact_inventory) {
+            } else {
                 // Preserve the established Raw-only fast path byte-for-byte: it
                 // neither obtains the new witness nor invokes the normalizer.
                 u32 raw_target_len = 0;
