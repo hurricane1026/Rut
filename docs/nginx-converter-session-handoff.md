@@ -80,7 +80,27 @@ Broad #270 remains PARTIAL and #271 remains BLOCKED_BY_RUT. None of that proves
 the new explicit `proxy_buffering off` scope. Verify current issue/PR state if
 making new status claims; these are recorded prior-run results, not reruns.
 
-## CURRENT: actual converter-stdout explicit-Off differential
+## CURRENT: complete converter candidate review / PR / CI
+
+Source `607b3bdd` now passes the actual same-file converter-stdout nginx/RUT
+pair with selected GET ID1/None/1s bundle/policy ownership and mutation controls,
+shared observation comparator mutations/restoration, and final settled ledgers.
+The complete source/test candidate is independently APPROVED and frozen for
+normal/required CI.
+Final controls are independently APPROVED; Clang Release `-j1` build and four
+focused CTests pass 4/4, zero skips, 6.30s (actual pair 3.22s, oracle 1.68s,
+self-check 0.03s, handwritten capability 1.37s). Logs:
+`/tmp/rut-638-off-pair-controls-build.log` and
+`/tmp/rut-638-off-pair-controls-tests.log`. The unchanged model/CLI increment
+also passed the full 192 parser tests / 19991 checks and CLI tests.
+
+Luna supplied initial model and loaded-validator draft/context extraction;
+the primary used the authorized fallback for remaining corrections and the
+transport/comparator implementation. Different Luna reviewed each increment;
+complete source/test candidate `f08b85ba..607b3bdd` is independently APPROVED.
+#638 stays open and no support row is promoted until full CI evidence.
+
+### Earlier local implementation evidence (historical)
 
 Transport pair `da521207` is independently APPROVED and passes its first real
 same-file converter-stdout nginx/RUT run (3.03s). Clang Release `-j1` build and
@@ -281,8 +301,8 @@ capability or converter admission.
 
 ## NEXT
 
-1. Independently review and validate the actual same-file converter-stdout pair.
-2. Complete normal/required CI and integrate only into converter integration.
+1. Complete normal/required CI for the independently approved source candidate.
+2. Integrate only into converter integration after evidence passes.
 3. Update only the exact proven scope and resolve #638.
 
 The bounded `proxy_buffering off` model/lowering is locally validated.
@@ -323,7 +343,8 @@ The nginx-only candidate passed complete CI and merged as ed0eec96.
 Shared capture d9e1733a passed independent review, Release build and 7/7 tests.
 The dedicated ordinary-RUT capability passed full CI and merged as f08b85ba.
 Bounded Off model/provenance/lowering a2358195 passed independent review and
-parser/CLI validation. Next finish the actual converter-stdout pair.
+parser/CLI validation. Actual converter-stdout pair and controls 607b3bdd pass local validation.
+Next finish complete-candidate review/PR/normal and required CI.
 Proceed with one small implementation → different-worker review →
 lead-scheduled tests → status/issue update at a time. Do not claim off support
 from untested source or nginx-only evidence. Keep parent PR #269 draft and

@@ -87,8 +87,11 @@ all 14 ordinary jobs and required nginx 163/163, zero skips, 638.52s;
 public capability 1.32s. #640/#641 are closed with combined behavior/CI evidence.
 Bounded Off model/provenance/lowering `a2358195` is independently approved and
 passes Clang Release build, all 192 parser tests / 19991 checks and converter
-CLI checks. The actual same-file converter differential and complete CI remain
-pending before support promotion; no compatibility row is promoted.
+CLI checks. The actual same-file converter differential `607b3bdd` now passes locally
+(3.22s) with selected GET None/1s bundle ownership/mutations and shared pair
+comparator controls. Four focused CTests pass 4/4, zero skips, 6.30s. Complete
+source/test candidate review is independently APPROVED; full CI remains pending
+and no compatibility row is promoted.
 
 | nginx feature | parser | converter | RUT capability | behavior test | status |
 | --- | --- | --- | --- | --- | --- |
