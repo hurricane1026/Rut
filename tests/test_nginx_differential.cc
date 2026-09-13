@@ -66293,12 +66293,33 @@ static bool capture_explicit_off_episode(Recorder& origin,
         }
     }
     std::string detail;
-    if (eof_ns == 0u ||
-        !validate_exact_normalized_response(
-            response, kExplicitBufferingOffTimeoutResponseNormalized, detail) ||
-        eof_ns <= open_ack_ns || eof_ns - origin_sent_ns < 750'000'000ull ||
-        eof_ns - origin_sent_ns >= 2'000'000'000ull) {
+    const bool eof_wire_valid = validate_exact_normalized_response(
+        response, kExplicitBufferingOffTimeoutResponseNormalized, detail);
+    const bool eof_timing_valid = eof_ns != 0u && eof_ns > open_ack_ns &&
+                                  eof_ns - origin_sent_ns >= 750'000'000ull &&
+                                  eof_ns - origin_sent_ns < 2'000'000'000ull;
+    if (!eof_wire_valid || !eof_timing_valid) {
+        const LiveRetirementSnapshot eof_failure_retirement =
+            snapshot_live_retirement(origin.response_peer_closed,
+                                     origin.response_peer_close_count,
+                                     origin.response_peer_closed_ns,
+                                     origin_sent_ns);
+        const char* retirement_state =
+            eof_failure_retirement.state == LiveRetirementState::Pending
+                ? "Pending"
+                : (eof_failure_retirement.state == LiveRetirementState::Ready ? "Ready"
+                                                                              : "Invalid");
+        std::ostringstream diagnostic;
+        diagnostic << " [publication=" << origin_sent_ns << ", first=" << first_ns
+                   << ", prefix=" << prefix_complete_ns << ", auth=" << prefix_authorized_ns
+                   << ", ack=" << open_ack_ns << ", eof=" << eof_ns
+                   << ", eof_zero=" << (eof_ns == 0u ? "true" : "false")
+                   << ", response_bytes=" << response.size()
+                   << ", normalized_detail=" << std::quoted(detail)
+                   << ", retirement=" << retirement_state << "/" << eof_failure_retirement.count
+                   << "/" << eof_failure_retirement.timestamp_ns << "]";
         error = "#638 downstream wire/one-second inactivity EOF was invalid: " + detail;
+        error += diagnostic.str();
         return false;
     }
     LiveAccessLedgerObserver ledger;
