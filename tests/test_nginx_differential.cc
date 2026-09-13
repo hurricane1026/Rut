@@ -66723,11 +66723,23 @@ static bool run_handwritten_explicit_off_capability(TempDir& temp,
     return true;
 }
 
+struct ExplicitOffPairContext {
+    u16 frontend_port = 0u;
+    u16 backend_port = 0u;
+    std::string immutable_config;
+    ExplicitOffObservation observation;
+    std::vector<std::vector<char>> joined_history;
+    std::vector<char> joined_request;
+    bool captured = false;
+};
+
 // #638 is deliberately an nginx-only oracle: proxy_buffering off must expose
 // the already-published response prefix before proxy_read_timeout expires.
 static bool run_pinned_nginx_explicit_buffering_off_oracle(TempDir& temp,
                                                            const std::string& container_name,
-                                                           std::string& error) {
+                                                           std::string& error,
+                                                           ExplicitOffPairContext* pair = nullptr) {
+    if (pair != nullptr) pair->captured = false;
     HeldLoopbackPorts reservations;
     u16 ports[2]{};
     for (size_t i = 0; i < std::size(ports); ++i) {
@@ -66758,6 +66770,11 @@ static bool run_pinned_nginx_explicit_buffering_off_oracle(TempDir& temp,
         !write_file(temp.nginx_config, config.data(), config.size())) {
         error = "#638 config was not the exact single-prefix proxy_buffering off shape";
         return false;
+    }
+    if (pair != nullptr) {
+        pair->frontend_port = ports[0];
+        pair->backend_port = ports[1];
+        pair->immutable_config = config;
     }
 
     Recorder origin;
@@ -66812,6 +66829,15 @@ static bool run_pinned_nginx_explicit_buffering_off_oracle(TempDir& temp,
     if (!capture_explicit_off_episode(
             origin, nginx.child, ports[0], temp.nginx_access_log, observation, error))
         return false;
+    if (pair != nullptr) {
+        std::string current_config;
+        if (!read_exact_return204_log(
+                temp.nginx_config, "#638 pair config after nginx", current_config, error) ||
+            current_config != pair->immutable_config) {
+            error = "#638 pair nginx input changed after capture";
+            return false;
+        }
+    }
     const std::string expected_upstream =
         "GET /buffered-timeout?q=1 HTTP/1.1\r\nHost: 127.0.0.1:" + std::to_string(ports[1]) +
         "\r\n\r\n";
@@ -66837,6 +66863,12 @@ static bool run_pinned_nginx_explicit_buffering_off_oracle(TempDir& temp,
         origin.thread_alive.load(std::memory_order_acquire) || origin.listen_fd >= 0) {
         error = "#638 upstream ledger contained retry, mutation, or cleanup failure evidence";
         return false;
+    }
+    if (pair != nullptr) {
+        pair->observation = observation;
+        pair->joined_history = joined_history;
+        pair->joined_request = joined_request;
+        pair->captured = true;
     }
     std::cerr << "PASS: #638 pinned nginx explicit proxy_buffering off exposed one exact 127-byte "
                  "200/CL12+hello prefix before the 1s inactivity EOF, retired one origin, and "
@@ -83472,7 +83504,14 @@ int main(int argc, char** argv) {
                                            std::to_string(getpid()) + "-" +
                                            (suffix ? suffix + 1 : "tmp");
         std::string oracle_error;
-        if (!run_pinned_nginx_explicit_buffering_off_oracle(temp, container_name, oracle_error)) {
+        ExplicitOffPairContext pair;
+        if (!run_pinned_nginx_explicit_buffering_off_oracle(
+                temp, container_name, oracle_error, &pair) ||
+            !pair.captured || pair.immutable_config.empty() || pair.frontend_port == 0u ||
+            pair.backend_port == 0u || pair.observation.downstream_wire.size() != 127u ||
+            pair.joined_history.size() != 1u || pair.joined_request.empty()) {
+            if (oracle_error.empty())
+                oracle_error = "#638 pair context did not publish complete nginx evidence";
             std::cerr << "FAIL [#638 pinned nginx explicit proxy_buffering off oracle]: "
                       << oracle_error << "\n";
             dump_log(temp.nginx_config, "#638 nginx config");
