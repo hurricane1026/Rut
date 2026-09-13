@@ -66476,6 +66476,8 @@ static bool capture_explicit_off_episode(Recorder& origin,
     return true;
 }
 
+// The source language has no "none" response_buffering token: omission is the
+// AST/HIR/MIR/RIR default ForwardResponseBufferingMode::None.
 static std::string make_handwritten_explicit_off_capability_source(u16 frontend_port,
                                                                    u16 backend_port,
                                                                    const std::string& access_path) {
@@ -66501,8 +66503,7 @@ static std::string make_handwritten_explicit_off_capability_source(u16 frontend_
       server: "nginx/1.29.7", date: "current", connection: "request",
       head_mode: "reject",
       body: b"<html>\r\n<head><title>504 Gateway Time-out</title></head>\r\n<body>\r\n<center><h1>504 Gateway Time-out</h1></center>\r\n<hr><center>nginx/1.29.7</center>\r\n</body>\r\n</html>\r\n" },
-    response_read_timeout: 1s,
-    response_buffering: "none")
+    response_read_timeout: 1s)
 }
 )rut";
 }
