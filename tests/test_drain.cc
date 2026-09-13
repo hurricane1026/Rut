@@ -49,6 +49,15 @@ static bool inject_custom_upstream_resp(SmallLoop& loop, Connection& c, const ch
     return true;
 }
 
+static bool dispatch_complete_test_request(SmallLoop& loop, Connection& c) {
+    static constexpr char kRequest[] = "GET / HTTP/1.1\r\nHost: x\r\n\r\n";
+    if (c.recv_buf.write(reinterpret_cast<const rut::u8*>(kRequest), sizeof(kRequest) - 1u) !=
+        sizeof(kRequest) - 1u)
+        return false;
+    loop.dispatch(make_ev(c.id, IoEventType::Recv, static_cast<rut::i32>(sizeof(kRequest) - 1u)));
+    return true;
+}
+
 // ============================================================
 // Fixture: SmallLoop wired for drain + proxy
 // ============================================================
@@ -71,14 +80,16 @@ struct DrainProxyF {
         c = loop.find_fd(42);
         if (!c) return false;
         cid = c->id;
-        loop.inject_and_dispatch(make_ev(cid, IoEventType::Recv, 100));
+        if (!dispatch_complete_test_request(loop, *c)) return false;
         c->upstream_fd = 99;
         c->on_upstream_send = &on_upstream_connected<SmallLoop>;
         loop.inject_and_dispatch(make_ev(cid, IoEventType::UpstreamConnect, 0));
+        if (c->on_upstream_send != &on_upstream_request_sent<SmallLoop>) return false;
         rut::u32 req_len = c->recv_buf.len();
         loop.inject_and_dispatch(
             make_ev(cid, IoEventType::UpstreamSend, static_cast<rut::i32>(req_len)));
-        return true;
+        return c->state == ConnState::Proxying &&
+               c->on_upstream_recv == &on_upstream_response<SmallLoop>;
     }
 };
 
@@ -202,7 +213,7 @@ TEST(drain_accept, drain_accept_full_cycle) {
     REQUIRE(c != nullptr);
     rut::u32 cid = c->id;
 
-    loop.inject_and_dispatch(make_ev(cid, IoEventType::Recv, 100));
+    REQUIRE(dispatch_complete_test_request(loop, *c));
     rut::u32 send_len = c->send_buf.len();
     loop.inject_and_dispatch(make_ev(cid, IoEventType::Send, static_cast<rut::i32>(send_len)));
 
@@ -224,7 +235,7 @@ TEST(drain_callback, response_has_connection_close) {
     REQUIRE(c != nullptr);
     loop.backend.clear_ops();
 
-    loop.inject_and_dispatch(make_ev(c->id, IoEventType::Recv, 100));
+    REQUIRE(dispatch_complete_test_request(loop, *c));
 
     CHECK(!c->keep_alive);
     CHECK_EQ(c->state, ConnState::Sending);
@@ -240,7 +251,10 @@ TEST(drain_callback, non_drain_response_has_keep_alive) {
     REQUIRE(c != nullptr);
     loop.backend.clear_ops();
 
-    loop.inject_and_dispatch(make_ev(c->id, IoEventType::Recv, 100));
+    static constexpr char kRequest[] = "GET / HTTP/1.1\r\nHost: x\r\n\r\n";
+    REQUIRE_EQ(c->recv_buf.write(reinterpret_cast<const u8*>(kRequest), sizeof(kRequest) - 1),
+               sizeof(kRequest) - 1);
+    loop.dispatch(make_ev(c->id, IoEventType::Recv, sizeof(kRequest) - 1));
 
     CHECK(c->keep_alive);
     CHECK(buf_contains(c->send_buf, "keep-alive"));
@@ -256,7 +270,7 @@ TEST(drain_callback, close_after_drain_response_sent) {
     auto* c = loop.find_fd(42);
     REQUIRE(c != nullptr);
     rut::u32 cid = c->id;
-    loop.inject_and_dispatch(make_ev(cid, IoEventType::Recv, 100));
+    REQUIRE(dispatch_complete_test_request(loop, *c));
 
     // Send response — since keep_alive=false, connection should be closed after send
     rut::u32 send_len = c->send_buf.len();
@@ -302,7 +316,7 @@ TEST(drain_proxy, upstream_status_parsed) {
     auto* c = loop.find_fd(42);
     REQUIRE(c != nullptr);
     rut::u32 cid = c->id;
-    loop.inject_and_dispatch(make_ev(cid, IoEventType::Recv, 100));
+    REQUIRE(dispatch_complete_test_request(loop, *c));
 
     c->upstream_fd = 99;
     c->on_upstream_send = &on_upstream_connected<SmallLoop>;
@@ -330,7 +344,7 @@ TEST(drain_pool, all_slices_returned_after_drain) {
         auto* c = loop.find_fd(static_cast<rut::i32>(100 + i));
         REQUIRE(c != nullptr);
         cids[i] = c->id;
-        loop.inject_and_dispatch(make_ev(cids[i], IoEventType::Recv, 50));
+        REQUIRE(dispatch_complete_test_request(loop, *c));
         rut::u32 send_len = loop.conns[cids[i]].send_buf.len();
         loop.inject_and_dispatch(
             make_ev(cids[i], IoEventType::Send, static_cast<rut::i32>(send_len)));

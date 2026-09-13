@@ -92,8 +92,12 @@ u8 parse_log_method_fallback(const u8* data, u32 len, u32* method_len) {
 }
 
 void capture_request_metadata(Connection& conn) {
+    conn.begin_request_metadata_episode();
+    conn.req_strict_h1_complete = false;
+    conn.req_target_has_fragment = false;
     conn.req_method = static_cast<u8>(LogHttpMethod::Other);
-    conn.req_size = conn.recv_buf.len();
+    conn.downstream_req_size = conn.recv_buf.len();
+    conn.req_size = conn.downstream_req_size;
     conn.req_path[0] = '/';
     conn.req_path[1] = '\0';
     // Default canonical view = "" pointing into req_path[] (the canon of
@@ -118,6 +122,18 @@ void capture_request_metadata(Connection& conn) {
     // keep-alive request flips this true. A request we can't strictly parse
     // (fallback path below) must never qualify its upstream fd for pooling.
     conn.req_keep_alive = false;
+    conn.req_client_keep_alive = false;
+    conn.req_client_connection_close = false;
+    conn.req_client_connection_close_exact = false;
+    conn.req_client_has_content_length = false;
+    conn.req_client_content_length_count = 0;
+    conn.req_client_transfer_encoding = RequestTransferEncoding::Unparsed;
+    conn.req_client_has_transfer_encoding = false;
+    conn.req_client_has_te = false;
+    conn.req_client_has_expect = false;
+    conn.req_client_has_upgrade_header = false;
+    conn.req_client_connection_count = 0;
+    conn.req_http_version = 255;
     conn.req_wants_upgrade = false;
     conn.req_upgrade_is_websocket = false;
     conn.req_header_end = 0;
@@ -131,8 +147,27 @@ void capture_request_metadata(Connection& conn) {
     HttpParser parser;
     ParsedRequest req;
     parser.reset();
-    if (parser.parse(data, kLen, &req) == ParseStatus::Complete) {
+    const ParseStatus parse_status = parser.parse(data, kLen, &req);
+    conn.req_target_has_fragment = req.target_has_fragment;
+    if (parse_status == ParseStatus::Complete) {
+        u32 raw_target_offset = 0;
+        u32 raw_target_length = 0;
+        const uintptr_t base_address = reinterpret_cast<uintptr_t>(data);
+        const uintptr_t target_address = reinterpret_cast<uintptr_t>(req.path.ptr);
+        const bool target_address_range_valid =
+            base_address >= 4096 && kLen <= UINTPTR_MAX - base_address &&
+            target_address >= base_address && target_address - base_address <= kLen;
+        if (target_address_range_valid) {
+            const u64 offset = target_address - base_address;
+            const u64 end = offset + req.path.len;
+            if (req.path.len != 0 && end > offset && end < parser.header_end && end <= kLen &&
+                data[offset] == '/' && req.path_canon.ptr != nullptr) {
+                raw_target_offset = static_cast<u32>(offset);
+                raw_target_length = req.path.len;
+            }
+        }
         conn.req_header_end = parser.header_end;
+        conn.req_http_version = static_cast<u8>(req.version);
         // Require BOTH Connection: upgrade and an Upgrade header — Connection is
         // hop-by-hop, so the token alone is not a valid client upgrade request.
         conn.req_wants_upgrade = req.upgrade && req.has_upgrade_header;
@@ -141,6 +176,36 @@ void capture_request_metadata(Connection& conn) {
         // "Connection: close" token (close → false). This is the verbatim-
         // forwarded request's keep-alive intent toward the origin.
         conn.req_keep_alive = req.keep_alive && !req.connection_close;
+        conn.req_client_keep_alive = conn.req_keep_alive;
+        conn.req_client_connection_close = req.connection_close;
+        conn.req_client_has_content_length = req.has_content_length;
+        conn.req_client_content_length_count = req.content_length_count;
+        conn.req_client_transfer_encoding = req.transfer_encoding;
+        for (u32 i = 0; i < req.header_count; i++) {
+            const Str name = req.headers[i].name;
+            conn.req_client_has_transfer_encoding |=
+                http_header_name_eq_ci(name.ptr, name.len, "transfer-encoding", 17);
+            conn.req_client_has_te |= http_header_name_eq_ci(name.ptr, name.len, "te", 2);
+            conn.req_client_has_expect |= http_header_name_eq_ci(name.ptr, name.len, "expect", 6);
+            conn.req_client_has_upgrade_header |=
+                http_header_name_eq_ci(name.ptr, name.len, "upgrade", 7);
+            if (http_header_name_eq_ci(
+                    req.headers[i].name.ptr, req.headers[i].name.len, "connection", 10)) {
+                if (conn.req_client_connection_count < 255) conn.req_client_connection_count++;
+            }
+        }
+        if (conn.req_client_connection_count == 1) {
+            for (u32 i = 0; i < req.header_count; i++) {
+                if (http_header_name_eq_ci(
+                        req.headers[i].name.ptr, req.headers[i].name.len, "connection", 10)) {
+                    conn.req_client_connection_close_exact =
+                        req.headers[i].value.len == 5 &&
+                        http_header_name_eq_ci(
+                            req.headers[i].value.ptr, req.headers[i].value.len, "close", 5);
+                    break;
+                }
+            }
+        }
         conn.req_method = map_log_method(req.method);
         u32 copy_len = req.path.len;
         if (copy_len >= sizeof(conn.req_path)) copy_len = sizeof(conn.req_path) - 1;
@@ -220,7 +285,23 @@ void capture_request_metadata(Connection& conn) {
             const u32 kBodyInInitial = conn.req_content_length - conn.req_body_remaining;
             conn.req_initial_send_len = parser.header_end + kBodyInInitial;
         }
-        if (conn.req_initial_send_len > 0) conn.req_size = conn.req_initial_send_len;
+        if (conn.req_initial_send_len > 0) {
+            conn.downstream_req_size = conn.req_initial_send_len;
+            conn.req_size = conn.req_initial_send_len;
+        }
+        conn.req_strict_h1_complete =
+            (req.version == HttpVersion::Http10 || req.version == HttpVersion::Http11) &&
+            conn.req_header_end != 0;
+        // The strict parser intentionally accepts fragment spelling as part of
+        // its historical origin-form-like target contract.  Capture it exactly
+        // here; consumers that disallow fragments continue to gate on
+        // req_target_has_fragment before using this witness.
+        if (conn.req_strict_h1_complete && !conn.req_malformed && raw_target_offset != 0 &&
+            raw_target_length != 0) {
+            conn.req_raw_target_episode = conn.req_metadata_episode;
+            conn.req_raw_target_offset = raw_target_offset;
+            conn.req_raw_target_length = raw_target_length;
+        }
         return;
     }
 
@@ -269,16 +350,32 @@ u32 pipeline_leftover(const Connection& conn) {
     return kBufLen - kReqEnd;
 }
 
-bool pipeline_shift(Connection& conn) {
+PipelineTransitionResult pipeline_transition_status(const Connection& conn) {
+    if (conn.pipeline_depth >= Connection::kMaxPipelineDepth)
+        return PipelineTransitionResult::LimitExceeded;
+    return PipelineTransitionResult::Advanced;
+}
+
+PipelineTransitionResult pipeline_advance(Connection& conn) {
+    const PipelineTransitionResult kTransition = pipeline_transition_status(conn);
+    if (kTransition != PipelineTransitionResult::Advanced) return kTransition;
+    conn.pipeline_depth++;
+    return PipelineTransitionResult::Advanced;
+}
+
+PipelineTransitionResult pipeline_shift(Connection& conn) {
     const u32 kLeftover = pipeline_leftover(conn);
-    if (kLeftover == 0) return false;
+    if (kLeftover == 0) return PipelineTransitionResult::NoSuccessor;
+    const PipelineTransitionResult kStatus = pipeline_transition_status(conn);
+    if (kStatus != PipelineTransitionResult::Advanced) return kStatus;
+    const PipelineTransitionResult kTransition = pipeline_advance(conn);
+    if (kTransition != PipelineTransitionResult::Advanced) return kTransition;
     const u8* src = conn.recv_buf.data() + conn.req_initial_send_len;
-    conn.recv_buf.reset();
+    conn.reset_request_receive_buffer();
     u8* dst = conn.recv_buf.write_ptr();
     __builtin_memmove(dst, src, kLeftover);
     conn.recv_buf.commit(kLeftover);
-    conn.pipeline_depth++;
-    return true;
+    return PipelineTransitionResult::Advanced;
 }
 
 bool pipeline_stash(Connection& conn) {
@@ -299,18 +396,28 @@ bool pipeline_stash(Connection& conn) {
     return true;
 }
 
-bool pipeline_recover(Connection& conn) {
+PipelineTransitionResult pipeline_recover(Connection& conn, bool count_transition) {
     const u16 kStashLen = conn.pipeline_stash_len;
-    conn.pipeline_stash_len = 0;
-    if (kStashLen == 0) return false;
+    if (kStashLen == 0) return PipelineTransitionResult::NoSuccessor;
+    if (count_transition) {
+        const PipelineTransitionResult kStatus = pipeline_transition_status(conn);
+        if (kStatus != PipelineTransitionResult::Advanced) return kStatus;
+    }
     const u32 kStashOff = conn.retry_req_send_len;
     const u8* src = conn.send_buf.data() + kStashOff;
-    conn.retry_req_send_len = 0;
     const u32 kExisting = conn.recv_buf.len();
+    if (static_cast<u32>(kStashLen) + kExisting > conn.recv_buf.capacity())
+        return PipelineTransitionResult::LimitExceeded;
+    if (count_transition) {
+        const PipelineTransitionResult kTransition = pipeline_advance(conn);
+        if (kTransition != PipelineTransitionResult::Advanced) return kTransition;
+    }
+    conn.pipeline_stash_len = 0;
+    conn.retry_req_send_len = 0;
     if (kExisting == 0) {
         // HTTP/1 pipeline path (and the common WS case): recv_buf is empty, just
         // restore the stash.
-        conn.recv_buf.reset();
+        conn.reset_request_receive_buffer();
         u8* dst = conn.recv_buf.write_ptr();
         __builtin_memmove(dst, src, kStashLen);
         conn.recv_buf.commit(kStashLen);
@@ -319,17 +426,14 @@ bool pipeline_recover(Connection& conn) {
         // tunnel install while an io_uring multishot recv stayed armed) came
         // AFTER the stash, so they must follow it — not be dropped. Shift them up
         // by kStashLen and prepend the stash. base == recv_buf.data().
-        if (static_cast<u32>(kStashLen) + kExisting > conn.recv_buf.capacity())
-            return false;  // can't hold both — signal failure so the caller closes
-                           // rather than forwarding a truncated (corrupt) stream
         u8* base = conn.recv_buf.write_ptr() - kExisting;
+        conn.clear_raw_request_target_witness();
         __builtin_memmove(base + kStashLen, base, kExisting);
         __builtin_memmove(base, src, kStashLen);
         conn.recv_buf.set_len(kStashLen + kExisting);
     }
     conn.send_buf.reset();
-    conn.pipeline_depth++;
-    return true;
+    return PipelineTransitionResult::Advanced;
 }
 
 extern const char kResponse200[] =
@@ -707,11 +811,11 @@ void prepare_early_response_state(Connection& conn) {
         (conn.req_body_mode == BodyMode::Chunked &&
          conn.req_chunk_parser.state != ChunkedParser::State::Complete);
     if (kHasRemainingBody) {
-        conn.recv_buf.reset();
+        conn.reset_request_receive_buffer();
         conn.keep_alive = false;
     } else {
         if (!pipeline_stash(conn)) conn.keep_alive = false;
-        conn.recv_buf.reset();
+        conn.reset_request_receive_buffer();
     }
     if (conn.upstream_start_us == 0) conn.upstream_start_us = monotonic_us();
 }
@@ -742,6 +846,7 @@ template void on_upstream_connected<EpollEventLoop>(void*, Connection&, IoEvent)
 template void on_upstream_request_sent<EpollEventLoop>(void*, Connection&, IoEvent);
 template void on_upstream_response<EpollEventLoop>(void*, Connection&, IoEvent);
 template void on_proxy_response_sent<EpollEventLoop>(void*, Connection&, IoEvent);
+template void continue_http1_request_boundary<EpollEventLoop>(EpollEventLoop*, Connection&);
 template void on_response_header_sent<EpollEventLoop>(void*, Connection&, IoEvent);
 template void on_response_body_recvd<EpollEventLoop>(void*, Connection&, IoEvent);
 template void on_response_body_sent<EpollEventLoop>(void*, Connection&, IoEvent);
@@ -799,9 +904,11 @@ template void on_upstream_connected<IoUringEventLoop>(void*, Connection&, IoEven
 template void on_upstream_request_sent<IoUringEventLoop>(void*, Connection&, IoEvent);
 template void on_upstream_response<IoUringEventLoop>(void*, Connection&, IoEvent);
 template void on_proxy_response_sent<IoUringEventLoop>(void*, Connection&, IoEvent);
+template void continue_http1_request_boundary<IoUringEventLoop>(IoUringEventLoop*, Connection&);
 template void on_response_header_sent<IoUringEventLoop>(void*, Connection&, IoEvent);
 template void on_response_body_recvd<IoUringEventLoop>(void*, Connection&, IoEvent);
 template void on_response_body_sent<IoUringEventLoop>(void*, Connection&, IoEvent);
+template void pump_response_read_deadline_body<IoUringEventLoop>(IoUringEventLoop*, Connection&);
 template void handle_early_upstream_recv<IoUringEventLoop>(IoUringEventLoop*,
                                                            Connection&,
                                                            IoEvent,

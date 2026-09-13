@@ -31,6 +31,23 @@
 
 namespace rut {
 
+// Optional integration-test observation points. Production links no
+// definitions, so these weak calls add no per-connection storage or config /
+// struct-layout change; the real-socket test supplies atomic observers to prove
+// that a response episode actually crossed both watermark transitions.
+void observe_iouring_tls_high_water_pause_for_test() __attribute__((weak));
+void observe_iouring_tls_low_water_resume_for_test() __attribute__((weak));
+
+inline void observe_iouring_tls_high_water_pause() {
+    if (observe_iouring_tls_high_water_pause_for_test)
+        observe_iouring_tls_high_water_pause_for_test();
+}
+
+inline void observe_iouring_tls_low_water_resume() {
+    if (observe_iouring_tls_low_water_resume_for_test)
+        observe_iouring_tls_low_water_resume_for_test();
+}
+
 // Defined in callbacks_impl.h — the HTTP recv entrypoint we hand plaintext to.
 template <class Self>
 void on_header_received(void* lp, Connection& conn, IoEvent ev);
@@ -160,6 +177,7 @@ void tls_on_out_drain(void* lp, Connection& c, IoEvent ev) {
         if (c.tls_recv_paused_hw && !c.resp_fully_buffered &&
             c.tls_out_buf.len() <= Self::kTlsOutLow) {
             c.tls_recv_paused_hw = false;
+            observe_iouring_tls_low_water_resume();
             // Re-check @throttle so the watermark resume doesn't bypass the byte
             // rate. If throttle pauses, its timer re-arms the read later — but it
             // can also fail closed (cancel SQE couldn't queue), so bail if it did.

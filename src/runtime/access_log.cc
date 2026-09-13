@@ -160,46 +160,104 @@ static u32 format_ipv4(char* buf, u32 addr) {
 }
 
 // Format: "2026-03-23T15:30:00.123Z GET /path 200 1234us 256 1024 10.0.0.5 s=3\n"
-// Compact, greppable, no quoting needed for simple paths.
+// Compact, greppable, no quoting needed for simple strict targets. Build the whole line in
+// private bounded storage so an invalid/undersized caller cannot observe a partial record.
 u32 format_access_log_text(const AccessLogEntry& entry, char* buf, u32 buf_size) {
-    if (buf_size < 256) return 0;
+    static constexpr char kOverLimitPrefix[] = "<request-target-over-limit:";
+    static constexpr char kUnavailable[] = "<request-target-unavailable>";
+    static constexpr char kInvalid[] = "<request-target-invalid>";
+    static constexpr u32 kWorstCaseLine = 24u + 1u + 7u + 1u + kAccessLogCompleteTargetMax + 1u +
+                                          5u + 1u + 10u + 3u + 10u + 1u + 10u + 1u + 15u + 1u +
+                                          24u + 1u + 10u + 2u + 3u + 3u + 1u;
+    static_assert(kWorstCaseLine <= kAccessLogTextLineCapacity);
+
+    char line[kAccessLogTextLineCapacity];
     u32 w = 0;
 
-    w += format_timestamp(buf + w, entry.timestamp_us);
-    buf[w++] = ' ';
-    w += copy_str(buf + w, method_str(entry.method));
-    buf[w++] = ' ';
+    w += format_timestamp(line + w, entry.timestamp_us);
+    line[w++] = ' ';
+    w += copy_str(line + w, method_str(entry.method));
+    line[w++] = ' ';
 
-    // Path (null-terminated, no escaping — truncate if needed)
-    u32 path_len = 0;
-    while (path_len < sizeof(entry.path) && entry.path[path_len]) path_len++;
-    for (u32 i = 0; i < path_len && w + 80 < buf_size; i++) buf[w++] = entry.path[i];
-    buf[w++] = ' ';
+    const auto invalid_target = [&] { w += copy_str(line + w, kInvalid); };
+    switch (entry.target_state) {
+        case AccessLogTargetState::LegacyNullTerminated: {
+            if (entry.target_length != 0u) {
+                invalid_target();
+                break;
+            }
+            u32 path_len = 0;
+            while (path_len < kAccessLogLegacyTargetWidth && entry.path[path_len]) path_len++;
+            for (u32 i = 0; i < path_len; i++) line[w++] = entry.path[i];
+            break;
+        }
+        case AccessLogTargetState::Complete:
+            if (entry.target_length == 0u || entry.target_length > kAccessLogCompleteTargetMax) {
+                invalid_target();
+                break;
+            }
+            for (u32 i = 0; i < entry.target_length; i++) line[w++] = entry.path[i];
+            break;
+        case AccessLogTargetState::OverLimit:
+            if (entry.target_length <= kAccessLogCompleteTargetMax ||
+                entry.target_length > kAccessLogObservedStrictH1TargetMax) {
+                invalid_target();
+                break;
+            }
+            w += copy_str(line + w, kOverLimitPrefix);
+            w += write_u64_dec(line + w, entry.target_length);
+            line[w++] = '>';
+            break;
+        case AccessLogTargetState::Unavailable:
+            if (entry.target_length != 0u)
+                invalid_target();
+            else
+                w += copy_str(line + w, kUnavailable);
+            break;
+        case AccessLogTargetState::Invalid:
+        default:
+            invalid_target();
+            break;
+    }
+    line[w++] = ' ';
 
-    w += write_u64_dec(buf + w, entry.status);
-    buf[w++] = ' ';
-    w += write_u64_dec(buf + w, entry.duration_us);
-    w += copy_str(buf + w, "us ");
-    w += write_u64_dec(buf + w, entry.req_size);
-    buf[w++] = ' ';
-    w += write_u64_dec(buf + w, entry.resp_size);
-    buf[w++] = ' ';
-    w += format_ipv4(buf + w, entry.addr);
+    w += write_u64_dec(line + w, entry.status);
+    line[w++] = ' ';
+    w += write_u64_dec(line + w, entry.duration_us);
+    w += copy_str(line + w, "us ");
+    w += write_u64_dec(line + w, entry.req_size);
+    line[w++] = ' ';
+    w += write_u64_dec(line + w, entry.resp_size);
+    line[w++] = ' ';
+    w += format_ipv4(line + w, entry.addr);
 
     // Upstream (if present)
     if (entry.upstream[0] != '\0') {
-        buf[w++] = ' ';
+        line[w++] = ' ';
         u32 up_len = 0;
         while (up_len < sizeof(entry.upstream) && entry.upstream[up_len]) up_len++;
-        for (u32 i = 0; i < up_len; i++) buf[w++] = entry.upstream[i];
-        buf[w++] = ' ';
-        w += write_u64_dec(buf + w, entry.upstream_us);
-        w += copy_str(buf + w, "us");
+        for (u32 i = 0; i < up_len; i++) line[w++] = entry.upstream[i];
+        line[w++] = ' ';
+        w += write_u64_dec(line + w, entry.upstream_us);
+        w += copy_str(line + w, "us");
     }
 
-    w += copy_str(buf + w, " s=");
-    w += write_u64_dec(buf + w, entry.shard_id);
-    buf[w++] = '\n';
+    w += copy_str(line + w, " s=");
+    w += write_u64_dec(line + w, entry.shard_id);
+    line[w++] = '\n';
+    if (w > sizeof(line) || buf == nullptr || buf_size < w) return 0;
+    for (u32 i = 0; i < w; i++) buf[i] = line[i];
+    return w;
+}
+
+u32 format_access_log_downstream_request_bytes_line(const AccessLogEntry& entry,
+                                                    char* buf,
+                                                    u32 buf_size) {
+    char line[kAccessLogDownstreamRequestBytesLineCapacity];
+    u32 w = write_u64_dec(line, entry.req_size);
+    line[w++] = '\n';
+    if (buf == nullptr || buf_size < w) return 0;
+    for (u32 i = 0; i < w; i++) buf[i] = line[i];
     return w;
 }
 
@@ -428,7 +486,7 @@ u32 AccessLogFlusher::flush_once() {
     u32 batch_len = 0;
     u32 total = 0;
     AccessLogEntry entry;
-    char line[512];
+    char line[kAccessLogTextLineCapacity];
 
     for (u32 i = 0; i < ring_count; i++) {
         while (rings[i]->pop(entry)) {

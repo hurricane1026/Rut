@@ -290,6 +290,7 @@ ScenarioResult drive_scenario(const ScenarioSpec& scenario, const HarnessSpec& h
         routing_method >= kRouteMethodGet && routing_method <= kRouteMethodTrace
             ? routing_method - 1
             : static_cast<u8>(LogHttpMethod::Other);
+    connection.connection.downstream_req_size = scenario.request_len;
     connection.connection.req_size = scenario.request_len;
     connection.connection.keep_alive = scenario.request_len == 0 || parsed_request.keep_alive;
     connection.connection.request_config = &scenario.target->program.config;

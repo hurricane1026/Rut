@@ -68,12 +68,13 @@ struct MockBackend {
         return true;
     }
 
-    bool add_recv_upstream(i32 fd, u32 conn_id) {
+    bool add_recv_upstream(i32 fd, u32 conn_id, u32 /*upstream_episode*/ = 1) {
         if (fail_upstream_recv) return false;
         return add_recv(fd, conn_id);
     }
 
-    bool add_send_upstream(i32 fd, u32 conn_id, const u8* buf, u32 len) {
+    bool add_send_upstream(
+        i32 fd, u32 conn_id, const u8* buf, u32 len, u32 /*upstream_episode*/ = 1) {
         if (fail_upstream_send) return false;
         return add_send(fd, conn_id, buf, len);
     }
@@ -86,7 +87,8 @@ struct MockBackend {
         return true;
     }
 
-    bool add_connect(i32 fd, u32 conn_id, const void* /*addr*/, u32 /*len*/) {
+    bool add_connect(
+        i32 fd, u32 conn_id, const void* /*addr*/, u32 /*len*/, u32 /*upstream_episode*/ = 1) {
         if (fail_connect) return false;
         if (op_count < kMaxOps) {
             ops[op_count++] = {MockOp::Connect, fd, conn_id, nullptr, 0};
@@ -100,7 +102,7 @@ struct MockBackend {
         }
     }
 
-    void pause_upstream_recv(u32 conn_id) {
+    void pause_upstream_recv(u32 conn_id, u32 /*upstream_episode*/ = 1) {
         if (op_count < kMaxOps) {
             ops[op_count++] = {MockOp::PauseUpstreamRecv, -1, conn_id, nullptr, 0};
         }
@@ -134,7 +136,10 @@ struct MockBackend {
     // conns/max_conns match backend concept but unused in mock (no real recv).
     u32 wait(IoEvent* events, u32 max, Connection* /*conns*/ = nullptr, u32 /*max_conns*/ = 0) {
         u32 n = pending_count < max ? pending_count : max;
-        for (u32 i = 0; i < n; i++) events[i] = pending[i];
+        for (u32 i = 0; i < n; i++) {
+            events[i] = {};
+            events[i] = pending[i];
+        }
         // Shift remaining
         for (u32 i = n; i < pending_count; i++) pending[i - n] = pending[i];
         pending_count -= n;

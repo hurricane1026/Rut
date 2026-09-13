@@ -1,0 +1,313 @@
+#pragma once
+
+#include "downstream_publication_gate.h"
+
+#include <pthread.h>
+#include <stdint.h>
+#include <string.h>
+
+#define RUT_IOURING_GATE_MAGIC UINT64_C(0x525554494F475431)
+#define RUT_IOURING_GATE_VERSION UINT32_C(6)
+#define RUT_IOURING_GATE_CONNECT_JOURNAL_CAPACITY UINT32_C(4)
+
+enum rut_iouring_gate_error {
+    RUT_IOURING_GATE_ERROR_NONE = 0,
+    RUT_IOURING_GATE_ERROR_PROTOCOL = 1,
+    RUT_IOURING_GATE_ERROR_TARGET = 2,
+    RUT_IOURING_GATE_ERROR_RING = 3,
+    RUT_IOURING_GATE_ERROR_SQ = 4,
+    RUT_IOURING_GATE_ERROR_RECV_OWNER = 5,
+    RUT_IOURING_GATE_ERROR_CQ = 6,
+    RUT_IOURING_GATE_ERROR_BUFFER = 7,
+    RUT_IOURING_GATE_ERROR_REQUEST_MISMATCH = 8,
+    RUT_IOURING_GATE_ERROR_TIMEOUT = 9,
+    RUT_IOURING_GATE_ERROR_TRANSITION = 10,
+    RUT_IOURING_GATE_ERROR_CONNECT_JOURNAL = 11,
+};
+
+enum rut_iouring_gate_mode {
+    RUT_IOURING_GATE_MODE_NONE = 0,
+    RUT_IOURING_GATE_MODE_LATE_SUCCESSOR = 1,
+    RUT_IOURING_GATE_MODE_COALESCED_INGRESS = 2,
+    RUT_IOURING_GATE_MODE_LATE_SUCCESSOR_200 = 3,
+};
+
+enum rut_iouring_gate_ingress_state {
+    RUT_IOURING_GATE_INGRESS_RECV_OWNED = 20,
+    RUT_IOURING_GATE_INGRESS_REQUEST_SENT = 21,
+    RUT_IOURING_GATE_INGRESS_HIT = 22,
+    RUT_IOURING_GATE_INGRESS_RELEASED = 23,
+};
+
+enum rut_iouring_gate_recv_owner_reason {
+    RUT_IOURING_GATE_RECV_OWNER_REASON_NONE = 0,
+    RUT_IOURING_GATE_RECV_OWNER_REASON_RECV_SHAPE = 1,
+    RUT_IOURING_GATE_RECV_OWNER_REASON_RECV_ID_CHANGED = 2,
+    RUT_IOURING_GATE_RECV_OWNER_REASON_RECV_MISSING_AT_SEND = 3,
+    RUT_IOURING_GATE_RECV_OWNER_REASON_SEND_OWNER_MISMATCH = 4,
+    RUT_IOURING_GATE_RECV_OWNER_REASON_INGRESS_CONTRACT = 5,
+};
+
+struct rut_iouring_gate_recv_owner_failure {
+    uint32_t valid;
+    uint32_t reason;
+    int32_t ring_fd;
+    int32_t peer_fd;
+    uint32_t peer_ipv4_be;
+    uint16_t peer_port_be;
+    uint16_t reserved0;
+    uint32_t state;
+    uint32_t mode;
+    uint64_t captured_recv_user_data;
+    uint64_t current_sqe_user_data;
+    uint32_t current_sqe_opcode;
+    uint32_t current_sqe_flags;
+    uint32_t current_sqe_ioprio;
+    uint32_t current_sqe_buf_group;
+    uint32_t current_sqe_len;
+    int32_t current_sqe_fd;
+    uint32_t sq_head;
+    uint32_t sq_tail;
+    uint32_t sq_cursor;
+    uint32_t to_submit;
+};
+
+static inline int rut_iouring_gate_recv_shape_matches(uint32_t flags,
+                                                      uint32_t ioprio,
+                                                      uint32_t buf_group,
+                                                      uint32_t length,
+                                                      uint64_t user_data,
+                                                      uint32_t expected_flags,
+                                                      uint32_t expected_ioprio,
+                                                      uint32_t expected_buf_group,
+                                                      uint32_t expected_length,
+                                                      uint32_t expected_event) {
+    return flags == expected_flags && ioprio == expected_ioprio &&
+           buf_group == expected_buf_group && length == expected_length &&
+           (user_data & UINT64_C(0xff)) == expected_event;
+}
+
+static inline int rut_iouring_gate_recv_user_data_matches(uint64_t captured_recv_user_data,
+                                                          uint64_t current_recv_user_data) {
+    return captured_recv_user_data != 0 && captured_recv_user_data == current_recv_user_data;
+}
+
+static inline int rut_iouring_gate_recv_user_data_changed(uint64_t captured_recv_user_data,
+                                                          uint64_t current_recv_user_data) {
+    return captured_recv_user_data != 0 && !rut_iouring_gate_recv_user_data_matches(
+                                               captured_recv_user_data, current_recv_user_data);
+}
+
+static inline int rut_iouring_gate_recv_capture_present(uint64_t captured_recv_user_data) {
+    return captured_recv_user_data != 0;
+}
+
+static inline int rut_iouring_gate_send_event_matches(uint64_t current_send_user_data,
+                                                      uint32_t expected_event) {
+    return (current_send_user_data & UINT64_C(0xff)) == expected_event;
+}
+
+static inline int rut_iouring_gate_send_connection_matches(uint64_t captured_recv_user_data,
+                                                           uint64_t current_send_user_data) {
+    return rut_iouring_gate_recv_capture_present(captured_recv_user_data) &&
+           ((captured_recv_user_data >> 8) & UINT64_C(0xffffff)) ==
+               ((current_send_user_data >> 8) & UINT64_C(0xffffff));
+}
+
+static inline int rut_iouring_gate_send_owner_matches(uint64_t captured_recv_user_data,
+                                                      uint64_t current_send_user_data,
+                                                      uint32_t expected_event) {
+    return rut_iouring_gate_send_event_matches(current_send_user_data, expected_event) &&
+           rut_iouring_gate_send_connection_matches(captured_recv_user_data,
+                                                    current_send_user_data);
+}
+
+static inline uint32_t rut_iouring_gate_recv_owner_reason(int recv_shape_matches,
+                                                          uint64_t captured_recv_user_data,
+                                                          uint64_t current_recv_user_data,
+                                                          uint64_t current_send_user_data,
+                                                          uint32_t expected_send_event) {
+    if (!recv_shape_matches) return RUT_IOURING_GATE_RECV_OWNER_REASON_RECV_SHAPE;
+    if (rut_iouring_gate_recv_user_data_changed(captured_recv_user_data, current_recv_user_data))
+        return RUT_IOURING_GATE_RECV_OWNER_REASON_RECV_ID_CHANGED;
+    if (!rut_iouring_gate_recv_capture_present(captured_recv_user_data))
+        return RUT_IOURING_GATE_RECV_OWNER_REASON_RECV_MISSING_AT_SEND;
+    if (!rut_iouring_gate_send_owner_matches(
+            captured_recv_user_data, current_send_user_data, expected_send_event))
+        return RUT_IOURING_GATE_RECV_OWNER_REASON_SEND_OWNER_MISMATCH;
+    return RUT_IOURING_GATE_RECV_OWNER_REASON_NONE;
+}
+
+struct rut_iouring_gate_connect_attempt {
+    int32_t fd;
+    uint32_t ipv4_be;
+    uint16_t port_be;
+    uint16_t address_length;
+    uint64_t user_data;
+};
+
+struct rut_iouring_gate {
+    uint64_t magic;
+    uint32_t version;
+    uint32_t layout_size;
+    uint32_t state;
+    uint32_t error_code;
+    uint32_t mode;
+    uint32_t hook_magic_ok;
+    uint32_t hook_version;
+    uint32_t hook_layout_size;
+    uint32_t target_pid;
+    uint32_t target_peer_ipv4_be;
+    uint16_t target_peer_port_be;
+    uint16_t reserved0;
+    uint32_t target_upstream_ipv4_be;
+    uint16_t target_upstream_port_be;
+    uint16_t reserved1;
+    int32_t ring_fd;
+    int32_t intercepted_fd;
+    uint32_t ring_ready;
+    uint32_t intercepted_opcode;
+    uint32_t intercepted_length;
+    uint32_t intercepted_prefix_length;
+    uint64_t intercepted_user_data;
+    uint64_t recv_user_data;
+    uint32_t sq_head_at_hit;
+    uint32_t sq_tail_at_hit;
+    uint32_t cq_head_at_hit;
+    uint32_t cq_tail_at_arrival;
+    uint32_t witness_fragments;
+    uint32_t witness_length;
+    uint32_t witness_wire_length;
+    uint32_t ingress_recv_sqe_count;
+    uint32_t ingress_send_sqe_count;
+    uint32_t request_two_length;
+    uint32_t connect_attempt_count;
+    uint32_t connect_journal_overflow;
+    uint32_t connect_journal_duplicate;
+    /* Persistent causal failure evidence: each reached phase publishes exactly once. */
+    uint32_t duplicate_sq_injection_count;
+    uint32_t ready_mask_mutation_count;
+    uint32_t ready_mask_restoration_count;
+    struct rut_iouring_gate_recv_owner_failure recv_owner_failure;
+    struct rut_iouring_gate_connect_attempt
+        connect_attempts[RUT_IOURING_GATE_CONNECT_JOURNAL_CAPACITY];
+    uint32_t identity_mutex_initialized;
+    pthread_mutex_t identity_mutex;
+    unsigned char intercepted_prefix[RUT_DOWNSTREAM_GATE_PREFIX_CAPACITY];
+    unsigned char request_two[RUT_DOWNSTREAM_GATE_REQUEST_CAPACITY];
+    unsigned char witness_wire[RUT_DOWNSTREAM_GATE_REQUEST_CAPACITY];
+};
+
+static inline int rut_iouring_gate_abi_valid(const struct rut_iouring_gate* gate) {
+    return gate != 0 && gate->magic == RUT_IOURING_GATE_MAGIC &&
+           gate->version == RUT_IOURING_GATE_VERSION && gate->layout_size == sizeof(*gate);
+}
+
+static inline int rut_iouring_gate_publish_recv_owner_failure_locked(
+    struct rut_iouring_gate* gate, const struct rut_iouring_gate_recv_owner_failure* candidate) {
+    uint32_t expected_error = RUT_IOURING_GATE_ERROR_NONE;
+    if (!__atomic_compare_exchange_n(&gate->error_code,
+                                     &expected_error,
+                                     RUT_IOURING_GATE_ERROR_RECV_OWNER,
+                                     0,
+                                     __ATOMIC_ACQ_REL,
+                                     __ATOMIC_ACQUIRE))
+        return 0;
+    struct rut_iouring_gate_recv_owner_failure copy = *candidate;
+    copy.valid = 0;
+    memcpy(&gate->recv_owner_failure, &copy, sizeof(copy));
+    __atomic_store_n(&gate->recv_owner_failure.valid, 1u, __ATOMIC_RELEASE);
+    return 1;
+}
+
+static inline void rut_iouring_gate_recover_owner_death_locked(struct rut_iouring_gate* gate) {
+    uint32_t expected = RUT_IOURING_GATE_ERROR_NONE;
+    (void)__atomic_compare_exchange_n(&gate->error_code,
+                                      &expected,
+                                      RUT_IOURING_GATE_ERROR_TRANSITION,
+                                      0,
+                                      __ATOMIC_ACQ_REL,
+                                      __ATOMIC_ACQUIRE);
+    gate->ring_fd = -1;
+    gate->intercepted_fd = -1;
+    gate->intercepted_opcode = 0;
+    gate->intercepted_length = 0;
+    gate->intercepted_prefix_length = 0;
+    gate->intercepted_user_data = 0;
+    gate->recv_user_data = 0;
+    gate->sq_head_at_hit = 0;
+    gate->sq_tail_at_hit = 0;
+    gate->cq_head_at_hit = 0;
+    gate->cq_tail_at_arrival = 0;
+    gate->witness_fragments = 0;
+    gate->witness_length = 0;
+    gate->witness_wire_length = 0;
+    gate->ingress_recv_sqe_count = 0;
+    gate->ingress_send_sqe_count = 0;
+    gate->connect_attempt_count = 0;
+    gate->connect_journal_overflow = 0;
+    gate->connect_journal_duplicate = 0;
+    if (__atomic_load_n(&gate->recv_owner_failure.valid, __ATOMIC_ACQUIRE) != 1u)
+        memset(&gate->recv_owner_failure, 0, sizeof(gate->recv_owner_failure));
+    memset(gate->connect_attempts, 0, sizeof(gate->connect_attempts));
+    memset(gate->intercepted_prefix, 0, sizeof(gate->intercepted_prefix));
+    memset(gate->witness_wire, 0, sizeof(gate->witness_wire));
+    rut_downstream_gate_store(&gate->ring_ready, 0);
+    rut_downstream_gate_store(&gate->state, RUT_DOWNSTREAM_GATE_FAILED);
+}
+
+static inline int rut_iouring_gate_lock_identity(struct rut_iouring_gate* gate, int timeout_ms) {
+    if (rut_downstream_gate_load(&gate->identity_mutex_initialized) != 1 || timeout_ms <= 0)
+        return 0;
+    struct timespec deadline;
+    if (clock_gettime(CLOCK_REALTIME, &deadline) != 0) return 0;
+    deadline.tv_sec += timeout_ms / 1000;
+    deadline.tv_nsec += (long)(timeout_ms % 1000) * 1000000L;
+    if (deadline.tv_nsec >= 1000000000L) {
+        deadline.tv_sec++;
+        deadline.tv_nsec -= 1000000000L;
+    }
+    const int result = pthread_mutex_timedlock(&gate->identity_mutex, &deadline);
+    if (result == 0) return 1;
+    if (result != EOWNERDEAD) return 0;
+    rut_iouring_gate_recover_owner_death_locked(gate);
+    if (pthread_mutex_consistent(&gate->identity_mutex) != 0) {
+        (void)pthread_mutex_unlock(&gate->identity_mutex);
+        return 0;
+    }
+    rut_downstream_gate_wake(&gate->state);
+    return 1;
+}
+
+static inline void rut_iouring_gate_unlock_identity(struct rut_iouring_gate* gate) {
+    (void)pthread_mutex_unlock(&gate->identity_mutex);
+}
+
+static inline int rut_iouring_gate_wait_until(struct rut_iouring_gate* gate,
+                                              uint32_t wanted,
+                                              int timeout_ms) {
+    const int64_t start = rut_downstream_gate_now_ms();
+    if (start < 0) return 0;
+    const int64_t deadline = start + timeout_ms;
+    for (;;) {
+        const uint32_t current = rut_downstream_gate_load(&gate->state);
+        if (current == wanted) return 1;
+        if (current == RUT_DOWNSTREAM_GATE_FAILED) return 0;
+        const int64_t now = rut_downstream_gate_now_ms();
+        if (now < 0 || now >= deadline) return 0;
+        const int64_t remaining = deadline - now;
+        struct timespec timeout;
+        timeout.tv_sec = remaining / 1000;
+        timeout.tv_nsec = (remaining % 1000) * 1000000;
+        const long rc = syscall(SYS_futex, &gate->state, FUTEX_WAIT, current, &timeout, 0, 0);
+        if (rc == 0 || errno == EAGAIN || errno == EINTR) continue;
+        if (errno == ETIMEDOUT) return 0;
+        return 0;
+    }
+}
+
+#if defined(__cplusplus) && defined(__x86_64__)
+static_assert(sizeof(struct rut_iouring_gate) == 1456);
+#elif defined(__x86_64__)
+_Static_assert(sizeof(struct rut_iouring_gate) == 1456, "RUT io_uring gate layout drift");
+#endif

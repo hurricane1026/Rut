@@ -14,6 +14,8 @@ namespace rut {
 //
 //   - ReturnStatus: send HTTP response with `status_code` and finish.
 //   - Forward:     proxy to upstream #`upstream_id`.
+//   - Redirect:    validated redirect-policy id; this foundation rejects it
+//                  locally because response serialization is not present.
 //   - TimerYield:  schedule a wake `timer_ms` from now and resume the
 //                   same handler with `ctx.state = next_state`. The
 //                   handler was paused at a `wait(ms)` (or later
@@ -31,12 +33,32 @@ struct JitDispatchOutcome {
         Forward,
         TimerYield,
         EventYield,
+        Redirect,
         Error,
     };
 
     Kind kind = Kind::Error;
     u16 status_code = 0;
     u16 upstream_id = 0;
+    // Compact immutable request-policy id carried in HandlerResult.status_code
+    // for Forward outcomes; zero preserves transparent forwarding.
+    u16 request_policy_id = 0;
+    // Compact immutable response-policy id carried in HandlerResult.next_state
+    // for Forward outcomes; zero preserves transparent forwarding.
+    u16 response_policy_id = 0;
+    // 1-based RouteConfig::policy_bundles index for ForwardBundle outcomes.
+    u16 policy_bundle_id = 0;
+    // 1-based RouteConfig::redirect_policies index for Redirect outcomes.
+    u16 redirect_policy_id = 0;
+    // Resolved failure-policy id retained across the fixed-body wait. This is
+    // runtime metadata, not an additional legacy HandlerResult ABI slot.
+    u16 failure_policy_id = 0;
+    // Resolved optional timeout-failure id from the same packed policy bundle.
+    u16 timeout_failure_policy_id = 0;
+    // Resolved exact per-forward response-read inactivity interval. The packed
+    // handler ABI still carries only policy_bundle_id; dispatch fills this from
+    // the pinned RouteConfig before any forwarding effect.
+    u8 response_read_timeout_seconds = 0;
     u16 next_state = 0;
     jit::YieldKind yield_kind = jit::YieldKind::Timer;
     u32 timer_ms = 0;  // raw ms payload; callers pick their own precision
@@ -116,6 +138,7 @@ inline jit::YieldKind yield_kind_from_event(IoEventType type) {
         case IoEventType::HandlerTimer:
             return jit::YieldKind::Timer;
         case IoEventType::Accept:
+        case IoEventType::ResponseReadTimer:
         case IoEventType::Count:
             return jit::YieldKind::HttpGet;
     }
@@ -158,8 +181,20 @@ inline JitDispatchOutcome invoke_jit_handler(jit::HandlerFn fn,
             out.response_headers_idx = r.next_state;
             return out;
         case jit::HandlerAction::Forward:
+        case jit::HandlerAction::ForwardBundle:
             out.kind = JitDispatchOutcome::Kind::Forward;
             out.upstream_id = r.upstream_id;
+            out.request_policy_id = r.status_code;
+            if (r.action == jit::HandlerAction::ForwardBundle) {
+                out.policy_bundle_id = r.next_state;
+            } else {
+                out.response_policy_id = r.next_state;
+            }
+            return out;
+        case jit::HandlerAction::Redirect:
+            if (!jit::HandlerResult::redirect_fields_valid(r)) return out;
+            out.kind = JitDispatchOutcome::Kind::Redirect;
+            out.redirect_policy_id = r.upstream_id;
             return out;
         case jit::HandlerAction::Yield:
             out.next_state = r.next_state;

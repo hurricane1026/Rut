@@ -16,6 +16,7 @@ FrontendResult<HirModule*> analyze_file(const AstFile& file, Str source_path);
 FrontendResult<HirModule*> analyze_file(const AstFile& file,
                                         Str source_path,
                                         SourceBudget* source_budget);
+FrontendResult<HirModule*> analyze_file_for_internal_propagation(const AstFile& file);
 void reset_import_analysis_counter();
 u32 get_import_analysis_counter();
 

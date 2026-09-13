@@ -1,12 +1,18 @@
 #pragma once
 
 #include "rut/common/buffer.h"
+#include "rut/common/failure_policy.h"
+#include "rut/common/forward_target_transform.h"
 #include "rut/common/http_header_validation.h"
+#include "rut/common/request_policy.h"
 #include "rut/common/types.h"
 #include "rut/common/wait_limits.h"
 #include "rut/jit/handler_abi.h"
+#include "rut/runtime/access_log.h"
 #include "rut/runtime/chunked_parser.h"
+#include "rut/runtime/http_parser.h"
 #include "rut/runtime/io_event.h"
+#include "rut/runtime/listener_context.h"
 #include "rut/runtime/tls_engine.h"
 #include "rut/runtime/ws_terminate.h"
 
@@ -40,6 +46,184 @@ enum class ConnState : u8 {
     Proxying,
     Sending,
     Count,
+};
+
+enum class ResponseReadDeadlineState : u8 {
+    None,
+    Preflight,
+    Validated,
+    Armed,
+    ExpiryPending,
+    BatchPending,
+    RefreshPending,
+    BodyComplete,
+};
+
+enum class ResponseReadDeadlinePostCommitPhase : u8 {
+    None,
+    // The strict response header is pinned, but no downstream byte has been
+    // published.  Positive Content-Length bytes remain behind the header in
+    // upstream_recv_buf until a terminal buffering disposition is selected.
+    Buffering,
+    HeaderSend,
+    BodySend,
+    WaitingBody,
+    OriginComplete,
+};
+
+enum class CompleteContentLengthResponseClass : u8 {
+    Unsupported,
+    BoundedPositiveBody,
+    CoherentSingleRange206,
+};
+
+enum class ResponseReadDeadlineSendKind : u8 {
+    None,
+    Header,
+    Body,
+};
+
+// Kernel ownership for the generic precise response-read timer. CancelPending
+// retains the immutable identity until both the timeout target and the cancel
+// SQE completions have been harvested, in either order.
+enum class ResponseReadTimerPhase : u8 {
+    None,
+    Armed,
+    CancelPending,
+};
+
+// Immutable request/response contract selected before the JIT handler runs.
+// The profile is part of every explicit-deadline ownership proof; method tests
+// outside the centralized classifier must never widen this domain.
+enum class ResponseReadDeadlineProfile : u8 {
+    None,
+    HeaderOnlyHead,
+    BodylessNonHeadContentLengthZero,
+    FixedContentLengthUploadNonHeadContentLengthZero,
+    FixedContentLengthUploadHeaderOnlyHead,
+};
+
+static_assert(sizeof(ResponseReadDeadlineProfile) == sizeof(u8));
+
+[[nodiscard]] constexpr bool response_read_deadline_profile_is_fixed_upload(
+    ResponseReadDeadlineProfile profile) {
+    switch (profile) {
+        case ResponseReadDeadlineProfile::FixedContentLengthUploadNonHeadContentLengthZero:
+        case ResponseReadDeadlineProfile::FixedContentLengthUploadHeaderOnlyHead:
+            return true;
+        case ResponseReadDeadlineProfile::None:
+        case ResponseReadDeadlineProfile::HeaderOnlyHead:
+        case ResponseReadDeadlineProfile::BodylessNonHeadContentLengthZero:
+            return false;
+    }
+    return false;
+}
+
+[[nodiscard]] constexpr bool response_read_deadline_profile_suppresses_head(
+    ResponseReadDeadlineProfile profile) {
+    switch (profile) {
+        case ResponseReadDeadlineProfile::HeaderOnlyHead:
+        case ResponseReadDeadlineProfile::FixedContentLengthUploadHeaderOnlyHead:
+            return true;
+        case ResponseReadDeadlineProfile::None:
+        case ResponseReadDeadlineProfile::BodylessNonHeadContentLengthZero:
+        case ResponseReadDeadlineProfile::FixedContentLengthUploadNonHeadContentLengthZero:
+            return false;
+    }
+    return false;
+}
+
+// Immutable request-upload identity for the bounded fixed-Content-Length
+// explicit-deadline profile. The active, first-response-batch, and D1/D2
+// copies are compared byte-for-byte by field so no transition can manufacture
+// a body/upload proof after the original request bytes have been released.
+struct ResponseReadDeadlineUploadProof {
+    u32 handler_generation = 0;
+    u32 raw_header_end = 0;
+    u32 raw_content_length = 0;
+    u32 raw_total_length = 0;
+    u32 rewritten_header_end = 0;
+    u32 rewritten_total_length = 0;
+    u32 upload_episode = 0;
+    u32 expected_upload_length = 0;
+    u16 route_index = 0xffffu;
+    u16 upstream_id = 0xffffu;
+    u16 request_policy_id = 0;
+    jit::HandlerFn route_fn = nullptr;
+    // Parser-proven downstream persistence intent. This is admitted only for
+    // the complete-Content-Length bodyless non-HEAD profile and remains part
+    // of the same immutable request-policy identity across every phase.
+    bool downstream_close = false;
+
+    template <typename Self, typename Visitor>
+    static void visit_owner_fields(Self& proof, Visitor&& visit) {
+        visit(proof.handler_generation, u32{0});
+        visit(proof.raw_header_end, u32{0});
+        visit(proof.raw_content_length, u32{0});
+        visit(proof.raw_total_length, u32{0});
+        visit(proof.rewritten_header_end, u32{0});
+        visit(proof.rewritten_total_length, u32{0});
+        visit(proof.upload_episode, u32{0});
+        visit(proof.expected_upload_length, u32{0});
+        visit(proof.route_index, u16{0xffffu});
+        visit(proof.upstream_id, u16{0xffffu});
+        visit(proof.request_policy_id, u16{0});
+        visit(proof.route_fn, static_cast<jit::HandlerFn>(nullptr));
+        visit(proof.downstream_close, false);
+    }
+
+    [[nodiscard]] bool owner_is_neutral() const {
+        bool neutral = true;
+        visit_owner_fields(*this, [&](const auto& value, const auto& reset_value) {
+            neutral = neutral && value == reset_value;
+        });
+        return neutral;
+    }
+
+    void clear_owner() {
+        visit_owner_fields(*this,
+                           [](auto& value, const auto& reset_value) { value = reset_value; });
+    }
+};
+
+enum class Http1PrebuiltResponseLayout : u8 {
+    None,
+    HeaderOnlyHead,
+    HeaderOnlyNoBodyStatus,
+    FullContentLengthNonHead,
+};
+
+enum class Http1PrebuiltResponsePurpose : u8 {
+    None,
+    StrictHeadHeaderOnly,
+    StrictNoBodyMetadataSuccess,
+    StrictNonHeadCl0Success,
+    ResponseReadTimeout,
+    ConfiguredForwardFailure,
+};
+
+// Request-buffer ownership captured by the internal HTTP/1 prebuilt-response
+// rendezvous.  The value describes where request 1 still lives while an old
+// upstream episode and the downstream header send drain independently.
+enum class Http1RequestBufferDisposition : u8 {
+    None,
+    PrefixInRecv,
+    RetrySendBuf,
+    ExistingPipeline,
+};
+
+static constexpr u8 kHttp1WaitHeaderSend = 1u << 0;
+static constexpr u8 kHttp1WaitUpstreamRetirement = 1u << 1;
+
+enum class RawRequestTargetWitnessState : u8 {
+    Neutral,
+    Invalid,
+    Valid,
+};
+
+struct RawRequestTargetWitnessResult {
+    RawRequestTargetWitnessState state;
+    Str target;
 };
 
 static_assert(static_cast<u8>(ConnState::Count) == 6u,
@@ -187,6 +371,11 @@ struct ConnectionBase {
     // line in recv_buf before forwarding. Reset per request.
     bool req_path_overridden;
     Str req_path_override;
+    // Foundation-only target-transform effect. The recorded flag distinguishes
+    // no effect from a forged zero/sentinel ID; every recorded effect is rejected
+    // before upstream selection until target materialization exists.
+    u16 target_transform_id;
+    bool target_transform_recorded;
     // forward(set_header:) request mutation: rut_helper_req_set_header records
     // (name, value) overrides (views into stable JIT constant memory);
     // on_upstream_connected injects/replaces those header lines in recv_buf before
@@ -421,12 +610,388 @@ struct ConnectionBase {
     // given slot is distinct (first use: 0 → 1; reuse: N → N+1; …).
     u32 handler_gen = 0;
 
+    // Reserved for upstream I/O episode fencing. Deliberately preserved by
+    // reset()/slot reuse; the transport slices will advance it before each
+    // upstream episode so stale completions cannot match a later episode.
+    u32 upstream_episode = 1;
+
+    // Fail-closed terminal state for an exhausted io_uring episode token. Like
+    // upstream_episode, this deliberately survives reset(): a quarantined slot
+    // must never return to the allocator or wrap back to an old kernel token.
+    bool upstream_episode_quarantined = false;
+
+    // Persistent generation plus current-owner metadata for the bounded
+    // explicit first-response deadline.  The generation deliberately survives
+    // reset()/slot reuse; active ownership does not.
+    u32 response_read_deadline_generation = 0;
+    u32 response_read_deadline_owner_generation;
+    u32 response_read_deadline_upstream_episode;
+    u16 response_read_deadline_bundle_id;
+    u8 response_read_deadline_seconds;
+    ForwardResponseBufferingMode response_read_deadline_buffering;
+    ResponseReadDeadlineProfile response_read_deadline_profile;
+    u8 response_read_deadline_method;
+    u8 response_read_deadline_route_method;
+    ResponseReadDeadlineState response_read_deadline_state;
+    bool response_read_deadline_first_batch;
+    ResponseReadDeadlineProfile response_read_deadline_first_batch_profile;
+    u8 response_read_deadline_first_batch_method;
+    u8 response_read_deadline_first_batch_route_method;
+    u32 response_read_deadline_first_batch_generation;
+    u16 response_read_deadline_first_batch_bundle_id;
+    ForwardResponseBufferingMode response_read_deadline_first_batch_buffering;
+    ResponseReadDeadlineUploadProof response_read_deadline_upload;
+    ResponseReadDeadlineUploadProof response_read_deadline_first_batch_upload;
+    // Exact cumulative positive-copy proof for the current deadline owner.
+    // Set only after whole-batch witness validation and preserved across
+    // incomplete-header re-arms; cleared with active deadline ownership.
+    u32 response_read_deadline_progress_generation;
+    u32 response_read_deadline_progress_episode;
+    u32 response_read_deadline_progress_bytes;
+    // Bounded positive-Content-Length response owner.  This is selected only
+    // after the strict GET response header is fully validated.  The counters
+    // are monotonic across recv-buffer compaction and downstream send gaps.
+    ResponseReadDeadlinePostCommitPhase response_read_deadline_post_commit_phase;
+    u32 response_read_deadline_post_commit_generation;
+    u32 response_read_deadline_post_commit_episode;
+    u32 response_read_deadline_post_commit_raw_header_end;
+    u32 response_read_deadline_post_commit_declared_body;
+    CompleteContentLengthResponseClass response_read_deadline_post_commit_response_class;
+    u64 response_read_deadline_post_commit_range_first;
+    u64 response_read_deadline_post_commit_range_last;
+    u64 response_read_deadline_post_commit_range_total;
+    u32 response_read_deadline_post_commit_origin_received;
+    u32 response_read_deadline_post_commit_downstream_submitted;
+    u32 response_read_deadline_post_commit_downstream_completed;
+    u32 response_read_deadline_post_commit_inflight_body;
+    // For the complete-Content-Length barrier this is the exact body prefix
+    // selected for publication.  It equals declared_body on success, zero on
+    // inactivity, and origin_received on a clean premature EOF.
+    u32 response_read_deadline_post_commit_send_body;
+    bool response_read_deadline_post_commit_close_after_drain;
+    bool response_read_deadline_post_commit_pump_pending;
+    // Exact downstream Send CQE ownership for the post-commit stream.  The
+    // monotonically increasing token is encoded in io_uring user_data; the
+    // tombstone survives retirement/request-boundary handoff so late CQEs
+    // cannot steal a successor request's accounting.
+    u32 response_read_deadline_send_generation = 0;
+    u32 response_read_deadline_send_owner_generation;
+    u32 response_read_deadline_send_tombstone_generation = 0;
+    u32 response_read_deadline_send_deadline_generation;
+    u32 response_read_deadline_send_upstream_episode;
+    const u8* response_read_deadline_send_src;
+    u32 response_read_deadline_send_len;
+    i32 response_read_deadline_send_fd;
+    ResponseReadDeadlineSendKind response_read_deadline_send_kind;
+    bool response_read_deadline_send_owner_active;
+    u32 response_read_deadline_send_close_generation = 0;
+    bool response_read_deadline_send_close_target_owned = false;
+    bool response_read_deadline_send_close_cancel_owned = false;
+
+    // Generic precise response-read transport timer. The timespec and active
+    // identity are kernel-owned storage: reset() must not mutate them before
+    // every owned CQE has been harvested. The generation counter survives
+    // ordinary reset/slot reuse and never wraps through the cancel-marker bit.
+    __kernel_timespec response_read_timer_timespec{};
+    u32 response_read_timer_generation = 0;
+    u32 response_read_timer_owner_generation = 0;
+    u32 response_read_timer_deadline_generation = 0;
+    u32 response_read_timer_upstream_episode = 0;
+    // Monotonic deadline origin for the narrow precise owner. Accepted progress
+    // is proved separately; a profile may retain this pinned origin without
+    // cancel/rearm churn.
+    u64 response_read_timer_last_progress_ns = 0;
+    ResponseReadTimerPhase response_read_timer_phase = ResponseReadTimerPhase::None;
+    bool response_read_timer_target_owned = false;
+    bool response_read_timer_cancel_owned = false;
+
+    template <typename Self, typename Visitor>
+    static void visit_response_read_timer_owner_fields(Self& c, Visitor&& visit) {
+        visit(c.response_read_timer_timespec.tv_sec,
+              static_cast<decltype(c.response_read_timer_timespec.tv_sec)>(0));
+        visit(c.response_read_timer_timespec.tv_nsec,
+              static_cast<decltype(c.response_read_timer_timespec.tv_nsec)>(0));
+        visit(c.response_read_timer_owner_generation, u32{0});
+        visit(c.response_read_timer_deadline_generation, u32{0});
+        visit(c.response_read_timer_upstream_episode, u32{0});
+        visit(c.response_read_timer_phase, ResponseReadTimerPhase::None);
+        visit(c.response_read_timer_target_owned, false);
+        visit(c.response_read_timer_cancel_owned, false);
+    }
+
+    [[nodiscard]] bool response_read_timer_owner_is_neutral() const {
+        bool neutral = true;
+        visit_response_read_timer_owner_fields(*this,
+                                               [&](const auto& value, const auto& reset_value) {
+                                                   neutral = neutral && value == reset_value;
+                                               });
+        return neutral;
+    }
+
+    [[nodiscard]] bool response_read_timer_owner_is_valid() const {
+        const bool keys_valid =
+            response_read_timer_owner_generation != 0 &&
+            response_read_timer_owner_generation <= kResponseReadTimerGenerationMask &&
+            response_read_timer_owner_generation == response_read_timer_generation &&
+            response_read_timer_deadline_generation != 0 &&
+            valid_upstream_episode(response_read_timer_upstream_episode);
+        const bool timespec_valid =
+            response_read_timer_timespec.tv_sec >= 0 && response_read_timer_timespec.tv_nsec >= 0 &&
+            response_read_timer_timespec.tv_nsec < 1'000'000'000LL &&
+            (response_read_timer_timespec.tv_sec != 0 || response_read_timer_timespec.tv_nsec != 0);
+        switch (response_read_timer_phase) {
+            case ResponseReadTimerPhase::None:
+                return response_read_timer_owner_is_neutral();
+            case ResponseReadTimerPhase::Armed:
+                return keys_valid && timespec_valid && response_read_timer_target_owned &&
+                       !response_read_timer_cancel_owned;
+            case ResponseReadTimerPhase::CancelPending:
+                return keys_valid && timespec_valid &&
+                       (response_read_timer_target_owned || response_read_timer_cancel_owned);
+        }
+        return false;
+    }
+
+    // Clear is legal only after every kernel owner has drained. This protects
+    // response_read_timer_timespec from reset/reuse while IORING_OP_TIMEOUT can
+    // still dereference it.
+    bool clear_response_read_timer_owner() {
+        if (response_read_timer_target_owned || response_read_timer_cancel_owned) return false;
+        visit_response_read_timer_owner_fields(
+            *this, [](auto& value, const auto& reset_value) { value = reset_value; });
+        return true;
+    }
+
+    bool next_response_read_timer_generation() {
+        if (!response_read_timer_owner_is_neutral() ||
+            response_read_timer_generation >= kResponseReadTimerGenerationMask)
+            return false;
+        ++response_read_timer_generation;
+        response_read_timer_owner_generation = response_read_timer_generation;
+        return true;
+    }
+
+    // Consume one exact target/cancel CQE. CancelPending owners drain
+    // independently; their keys remain unchanged until the second CQE arrives.
+    bool consume_response_read_timer_completion(u32 tagged_generation) {
+        if (!response_read_timer_owner_is_valid()) return false;
+        const bool cancel = (tagged_generation & kResponseReadTimerCancelBit) != 0;
+        const u32 generation = tagged_generation & kResponseReadTimerGenerationMask;
+        if (generation == 0 || generation != response_read_timer_owner_generation) return false;
+        if (response_read_timer_phase == ResponseReadTimerPhase::Armed) {
+            if (cancel || !response_read_timer_target_owned || response_read_timer_cancel_owned)
+                return false;
+            response_read_timer_target_owned = false;
+        } else if (response_read_timer_phase == ResponseReadTimerPhase::CancelPending) {
+            bool& owned =
+                cancel ? response_read_timer_cancel_owned : response_read_timer_target_owned;
+            if (!owned) return false;
+            owned = false;
+        } else {
+            return false;
+        }
+        if (!response_read_timer_target_owned && !response_read_timer_cancel_owned) {
+            const bool cleared = clear_response_read_timer_owner();
+            if (cleared && response_read_deadline_state == ResponseReadDeadlineState::None)
+                response_read_timer_last_progress_ns = 0;
+            return cleared;
+        }
+        return true;
+    }
+
+    bool next_response_read_deadline_send_generation() {
+        if (response_read_deadline_send_generation == kNonUpstreamSendGenerationMask) return false;
+        ++response_read_deadline_send_generation;
+        response_read_deadline_send_owner_generation = response_read_deadline_send_generation;
+        return true;
+    }
+
+    void clear_response_read_deadline_send_owner() {
+        visit_response_read_deadline_send_owner_fields(
+            *this, [](auto& value, const auto& reset_value) { value = reset_value; });
+    }
+
+    bool next_response_read_deadline_generation() {
+        if (response_read_deadline_generation == 0xFFFFFFFFu) return false;
+        ++response_read_deadline_generation;
+        response_read_deadline_owner_generation = response_read_deadline_generation;
+        return true;
+    }
+
+    // Canonical inventories of active response-read-deadline ownership and
+    // their neutral values. Reset, mode selection, and exhaustive tests consume
+    // these same inventories so a new owner cannot drift between those paths.
+    template <typename Self, typename Visitor>
+    static void visit_response_read_deadline_owner_fields(Self& c, Visitor&& visit) {
+        visit(c.response_read_deadline_owner_generation, u32{0});
+        visit(c.response_read_deadline_upstream_episode, u32{0});
+        visit(c.response_read_deadline_bundle_id, u16{0});
+        visit(c.response_read_deadline_seconds, u8{0});
+        visit(c.response_read_deadline_buffering, ForwardResponseBufferingMode::None);
+        visit(c.response_read_deadline_profile, ResponseReadDeadlineProfile::None);
+        visit(c.response_read_deadline_method, u8{0xffu});
+        visit(c.response_read_deadline_route_method, u8{0xffu});
+        visit(c.response_read_deadline_state, ResponseReadDeadlineState::None);
+        visit(c.response_read_deadline_progress_generation, u32{0});
+        visit(c.response_read_deadline_progress_episode, u32{0});
+        visit(c.response_read_deadline_progress_bytes, u32{0});
+        visit(c.response_read_deadline_post_commit_phase,
+              ResponseReadDeadlinePostCommitPhase::None);
+        visit(c.response_read_deadline_post_commit_generation, u32{0});
+        visit(c.response_read_deadline_post_commit_episode, u32{0});
+        visit(c.response_read_deadline_post_commit_raw_header_end, u32{0});
+        visit(c.response_read_deadline_post_commit_declared_body, u32{0});
+        visit(c.response_read_deadline_post_commit_response_class,
+              CompleteContentLengthResponseClass::Unsupported);
+        visit(c.response_read_deadline_post_commit_range_first, u64{0});
+        visit(c.response_read_deadline_post_commit_range_last, u64{0});
+        visit(c.response_read_deadline_post_commit_range_total, u64{0});
+        visit(c.response_read_deadline_post_commit_origin_received, u32{0});
+        visit(c.response_read_deadline_post_commit_downstream_submitted, u32{0});
+        visit(c.response_read_deadline_post_commit_downstream_completed, u32{0});
+        visit(c.response_read_deadline_post_commit_inflight_body, u32{0});
+        visit(c.response_read_deadline_post_commit_send_body, u32{0});
+        visit(c.response_read_deadline_post_commit_close_after_drain, false);
+        visit(c.response_read_deadline_post_commit_pump_pending, false);
+        visit(c.response_read_deadline_first_batch, false);
+        visit(c.response_read_deadline_first_batch_profile, ResponseReadDeadlineProfile::None);
+        visit(c.response_read_deadline_first_batch_method, u8{0xffu});
+        visit(c.response_read_deadline_first_batch_route_method, u8{0xffu});
+        visit(c.response_read_deadline_first_batch_generation, u32{0});
+        visit(c.response_read_deadline_first_batch_bundle_id, u16{0});
+        visit(c.response_read_deadline_first_batch_buffering, ForwardResponseBufferingMode::None);
+    }
+
+    template <typename Self, typename Visitor>
+    static void visit_response_read_deadline_send_owner_fields(Self& c, Visitor&& visit) {
+        visit(c.response_read_deadline_send_owner_generation, u32{0});
+        visit(c.response_read_deadline_send_deadline_generation, u32{0});
+        visit(c.response_read_deadline_send_upstream_episode, u32{0});
+        visit(c.response_read_deadline_send_src, static_cast<const u8*>(nullptr));
+        visit(c.response_read_deadline_send_len, u32{0});
+        visit(c.response_read_deadline_send_fd, i32{-1});
+        visit(c.response_read_deadline_send_kind, ResponseReadDeadlineSendKind::None);
+        visit(c.response_read_deadline_send_owner_active, false);
+    }
+
+    template <typename Self, typename Visitor>
+    static void visit_response_read_deadline_send_close_owner_fields(Self& c, Visitor&& visit) {
+        visit(c.response_read_deadline_send_close_generation, u32{0});
+        visit(c.response_read_deadline_send_close_target_owned, false);
+        visit(c.response_read_deadline_send_close_cancel_owned, false);
+    }
+
+    [[nodiscard]] bool response_read_deadline_owner_is_neutral() const {
+        bool neutral = response_read_deadline_upload.owner_is_neutral() &&
+                       response_read_deadline_first_batch_upload.owner_is_neutral();
+        const auto check = [&](const auto& value, const auto& reset_value) {
+            neutral = neutral && value == reset_value;
+        };
+        visit_response_read_deadline_owner_fields(*this, check);
+        visit_response_read_deadline_send_owner_fields(*this, check);
+        visit_response_read_deadline_send_close_owner_fields(*this, check);
+        return neutral;
+    }
+
+    [[nodiscard]] bool response_read_deadline_connected_auxiliary_owners_are_neutral() const {
+        bool neutral = response_read_deadline_first_batch_upload.owner_is_neutral();
+        const auto check = [&](const auto& value, const auto& reset_value) {
+            neutral = neutral && value == reset_value;
+        };
+        check(response_read_deadline_progress_generation, u32{0});
+        check(response_read_deadline_progress_episode, u32{0});
+        check(response_read_deadline_progress_bytes, u32{0});
+        check(response_read_deadline_post_commit_phase, ResponseReadDeadlinePostCommitPhase::None);
+        check(response_read_deadline_post_commit_generation, u32{0});
+        check(response_read_deadline_post_commit_episode, u32{0});
+        check(response_read_deadline_post_commit_raw_header_end, u32{0});
+        check(response_read_deadline_post_commit_declared_body, u32{0});
+        check(response_read_deadline_post_commit_response_class,
+              CompleteContentLengthResponseClass::Unsupported);
+        check(response_read_deadline_post_commit_range_first, u64{0});
+        check(response_read_deadline_post_commit_range_last, u64{0});
+        check(response_read_deadline_post_commit_range_total, u64{0});
+        check(response_read_deadline_post_commit_origin_received, u32{0});
+        check(response_read_deadline_post_commit_downstream_submitted, u32{0});
+        check(response_read_deadline_post_commit_downstream_completed, u32{0});
+        check(response_read_deadline_post_commit_inflight_body, u32{0});
+        check(response_read_deadline_post_commit_send_body, u32{0});
+        check(response_read_deadline_post_commit_close_after_drain, false);
+        check(response_read_deadline_post_commit_pump_pending, false);
+        check(response_read_deadline_first_batch, false);
+        check(response_read_deadline_first_batch_profile, ResponseReadDeadlineProfile::None);
+        check(response_read_deadline_first_batch_method, u8{0xffu});
+        check(response_read_deadline_first_batch_route_method, u8{0xffu});
+        check(response_read_deadline_first_batch_generation, u32{0});
+        check(response_read_deadline_first_batch_bundle_id, u16{0});
+        check(response_read_deadline_first_batch_buffering, ForwardResponseBufferingMode::None);
+        visit_response_read_deadline_send_owner_fields(*this, check);
+        visit_response_read_deadline_send_close_owner_fields(*this, check);
+        return neutral;
+    }
+
+    void clear_response_read_deadline() {
+        visit_response_read_deadline_owner_fields(
+            *this, [](auto& value, const auto& reset_value) { value = reset_value; });
+        clear_response_read_deadline_send_owner();
+        response_read_deadline_upload.clear_owner();
+        response_read_deadline_first_batch_upload.clear_owner();
+        if (response_read_timer_owner_is_neutral()) response_read_timer_last_progress_ns = 0;
+    }
+
+    template <typename Self, typename Visitor>
+    static void visit_http1_prebuilt_response_proof_fields(Self& c, Visitor&& visit) {
+        visit(c.http1_prebuilt_response_layout, Http1PrebuiltResponseLayout::None);
+        visit(c.http1_prebuilt_response_purpose, Http1PrebuiltResponsePurpose::None);
+        visit(c.http1_prebuilt_deadline_profile, ResponseReadDeadlineProfile::None);
+        visit(c.http1_prebuilt_deadline_method, u8{0xffu});
+        visit(c.http1_prebuilt_deadline_route_method, u8{0xffu});
+        visit(c.http1_prebuilt_deadline_generation, u32{0});
+        visit(c.http1_prebuilt_deadline_bundle_id, u16{0});
+        visit(c.http1_prebuilt_deadline_config, static_cast<const RouteConfig*>(nullptr));
+        visit(c.http1_prebuilt_header_end, u32{0});
+        visit(c.http1_prebuilt_total_len, u32{0});
+        visit(c.http1_prebuilt_body_len, u32{0});
+        visit(c.http1_prebuilt_status, u16{0});
+    }
+
+    [[nodiscard]] bool http1_prebuilt_response_proof_is_neutral() const {
+        bool neutral = http1_prebuilt_deadline_upload.owner_is_neutral();
+        const auto check = [&](const auto& value, const auto& reset_value) {
+            neutral = neutral && value == reset_value;
+        };
+        visit_http1_prebuilt_response_proof_fields(*this, check);
+        return neutral;
+    }
+
+    void clear_http1_prebuilt_response_proof() {
+        visit_http1_prebuilt_response_proof_fields(
+            *this, [](auto& value, const auto& reset_value) { value = reset_value; });
+        http1_prebuilt_deadline_upload = ResponseReadDeadlineUploadProof{};
+    }
+
+    // Advance the token without wrapping. Zero is the invalid sentinel and
+    // max is the final representable token; callers must quarantine the
+    // episode owner when this returns false rather than reusing an old token.
+    bool next_upstream_episode() {
+        if (!valid_upstream_episode(upstream_episode) ||
+            upstream_episode == kIoUserDataMaxUpstreamEpisode)
+            return false;
+        ++upstream_episode;
+        return true;
+    }
+
     // Route config pinned for the lifetime of the current request. Set
     // in on_header_received from the loop's config pointer; referenced
     // by handle_jit_outcome (e.g., Forward upstream resolution) so a
     // config hot-swap during wait(ms) can't resolve an upstream_id
     // against the post-swap config. Cleared by reset().
     const RouteConfig* request_config;
+
+    // Immutable process/listener identity copied at accept-time. Unlike
+    // request_config this survives keep-alive request boundaries and is
+    // cleared only when the connection slot is reset.
+    ListenerContext listener_context;
 
     // Per-connection timespec storage for IORING_OP_TIMEOUT yields. The
     // kernel reads this asynchronously after SQE submission, so it must
@@ -442,6 +1007,20 @@ struct ConnectionBase {
     // Active wire protocol. Defaults to Http11; set from the ALPN result once
     // the TLS handshake completes, or on detecting the cleartext h2c preface.
     ConnProtocol protocol;
+    // Number of successfully completed requests on the currently accepted
+    // downstream transport. This is transport identity, not request metadata:
+    // reset() clears it on slot allocation/reuse, while keep-alive request
+    // boundaries deliberately preserve it. Saturates instead of wrapping.
+    u32 downstream_completed_request_count;
+
+    void record_downstream_request_completion() {
+        if (downstream_completed_request_count != ~u32{0}) downstream_completed_request_count++;
+    }
+
+    void copy_downstream_transport_state_from(const ConnectionBase& source) {
+        downstream_completed_request_count = source.downstream_completed_request_count;
+    }
+
     // Per-connection HTTP/2 engine, lazily allocated from a per-shard pool when
     // the connection switches to Http2; returned to the pool on close. Null for
     // HTTP/1 connections (they pay nothing).
@@ -484,6 +1063,30 @@ struct ConnectionBase {
     // HTTP pipelining state
     u16 pipeline_depth;      // pipelined requests processed on this connection
     u16 pipeline_stash_len;  // bytes of next request stashed in send_buf (proxy)
+    // Non-zero only for one completely admitted depth-1 HTTP/1 successor.  The
+    // token is bound to handler_gen so later strict-owner predicates can reject
+    // stale or forged pipeline state without repurposing pipeline_depth (which
+    // remains the chain/reassembly counter).  Foundation only: existing runtime
+    // guards deliberately do not consume this token yet.
+    u32 http1_pipeline_request_generation;
+    // Snapshot taken at the synthetic request boundary before
+    // transition_to_reading_header replaces the previous callback slots. It is
+    // retained across fragmented depth-one reparses and consumed only by the
+    // bounded exact local-response successor predicate.
+    bool http1_pipeline_boundary_owners_settled;
+
+    void copy_http1_pipeline_state_from(const ConnectionBase& source) {
+        pipeline_depth = source.pipeline_depth;
+        pipeline_stash_len = source.pipeline_stash_len;
+        http1_pipeline_request_generation = source.http1_pipeline_request_generation;
+        http1_pipeline_boundary_owners_settled = source.http1_pipeline_boundary_owners_settled;
+        req_target_has_fragment = source.req_target_has_fragment;
+        // Unlike the fragment fact above, raw-target offsets are owned by one
+        // concrete recv_buf episode.  A metadata-only state copy cannot prove
+        // that ownership, so it deliberately leaves the destination neutral.
+        req_metadata_episode = 0;
+        clear_raw_request_target_witness();
+    }
 
     // Body streaming state (proxy large body support)
     u32 req_header_end;        // offset past request headers (\r\n\r\n)
@@ -507,6 +1110,221 @@ struct ConnectionBase {
     bool retry_req_snapshot_replayable;
     bool response_mutations_snapshotted;
     bool req_malformed;  // true if request body is malformed (reject)
+    // Non-zero when the explicit source request policy has rewritten recv_buf.
+    // This is reset at the request boundary and is deliberately separate from
+    // the route/config lifetime: the bytes are owned by this connection slice.
+    u16 request_policy_id;
+    // A policy Forward whose fixed Content-Length body has not arrived yet.
+    // The JIT handler is invoked once; these compact fields retain its immutable
+    // Forward outcome while the pinned request_config/epoch waits for the body.
+    bool request_policy_body_pending;
+    u16 pending_forward_upstream_id;
+    u16 pending_forward_request_policy_id;
+    u16 pending_forward_response_policy_id;
+    u16 pending_forward_failure_policy_id;
+    u16 pending_forward_timeout_failure_policy_id;
+    // Semantic request facts kept separate from the transport's counters:
+    // buffered means the complete fixed-CL request is staged, while upload
+    // complete is published only after the upstream send finishes.
+    bool request_body_fully_buffered;
+    bool request_upload_complete;
+    // Non-zero selects the strict H1 response serializer for this request.
+    u16 response_policy_id;
+    // Strict HEAD responses preserve the upstream representation length in the
+    // downstream headers but never forward representation bytes.
+    bool response_policy_suppress_body;
+    // Non-zero selects the bounded H1 failure serializer for connect failures.
+    u16 failure_policy_id;
+    // Optional cause-specific timeout response selected with this request.
+    // Foundation metadata only until #267 runtime wiring consumes it.
+    u16 timeout_failure_policy_id;
+    // Pinned per-request failure disposition.  This is deliberately separate
+    // from the policy table so later request rewrites or config swaps cannot
+    // change how an already selected connect failure is serialized.
+    bool failure_policy_suppress_body;
+    // Exact parsed request HTTP version (HttpVersion underlying value).
+    u8 req_http_version;  // HttpVersion::Http10/Http11, 255 when unknown.
+    // True only for the current request after the strict parser completed an
+    // HTTP/1.0 or HTTP/1.1 header block. Fallback method/path recovery never
+    // publishes it.
+    bool req_strict_h1_complete;
+    // A checked, connection-owned witness for the complete request-target.  The
+    // target itself remains in recv_buf; these fields never borrow a pointer and
+    // are neutral unless capture_request_metadata completed a strict origin-form
+    // parse for the current metadata episode.  The witness includes the query
+    // spelling and is independent of the bounded req_path logging copy.
+    u32 req_metadata_episode;
+    u32 req_raw_target_episode;
+    u32 req_raw_target_offset;
+    u32 req_raw_target_length;
+    // Full raw request-target fragment witness for the current request. This is
+    // deliberately independent of the bounded req_path copy and canonical view.
+    bool req_target_has_fragment;
+    // Access-log-only owned copy of the original strict-H1 target. It is
+    // populated only when access logging is enabled and remains valid after the
+    // borrowed recv_buf witness is cleared by rewrite/consume/reset paths.
+    AccessLogTargetSnapshot access_log_target_snapshot;
+
+    void clear_access_log_target_snapshot() {
+        access_log_target_snapshot.episode = 0;
+        access_log_target_snapshot.target_length = 0;
+        access_log_target_snapshot.target_state = AccessLogTargetState::LegacyNullTerminated;
+        access_log_target_snapshot.path[0] = '\0';
+    }
+
+    void clear_raw_request_target_witness() {
+        req_raw_target_episode = 0;
+        req_raw_target_offset = 0;
+        req_raw_target_length = 0;
+    }
+
+    void begin_request_metadata_episode() {
+        req_metadata_episode++;
+        if (req_metadata_episode == 0) req_metadata_episode = 1;
+        clear_raw_request_target_witness();
+        clear_access_log_target_snapshot();
+    }
+
+    // Reset/compaction paths must use this instead of resetting recv_buf
+    // directly.  It makes a previous request's offsets neutral before the
+    // backing storage can be repopulated with a successor request.
+    void reset_request_receive_buffer() {
+        clear_raw_request_target_witness();
+        recv_buf.reset();
+    }
+
+    void consume_request_receive_buffer(u32 count) {
+        clear_raw_request_target_witness();
+        recv_buf.consume(count);
+    }
+
+    RawRequestTargetWitnessResult checked_raw_request_target() const {
+        const RawRequestTargetWitnessResult neutral{RawRequestTargetWitnessState::Neutral,
+                                                    {nullptr, 0}};
+        const RawRequestTargetWitnessResult invalid{RawRequestTargetWitnessState::Invalid,
+                                                    {nullptr, 0}};
+        if (req_raw_target_episode == 0 && req_raw_target_offset == 0 && req_raw_target_length == 0)
+            return neutral;
+        if (req_raw_target_episode == 0 || req_raw_target_offset == 0 ||
+            req_raw_target_length == 0 || req_metadata_episode == 0 ||
+            req_raw_target_episode != req_metadata_episode || !req_strict_h1_complete ||
+            req_malformed || req_header_end == 0 || req_initial_send_len == 0 ||
+            req_header_end > req_initial_send_len || !recv_buf.valid() || recv_buf.is_released())
+            return invalid;
+
+        const u32 capacity = recv_buf.capacity();
+        const u32 count = recv_buf.len();
+        if (recv_slice == nullptr || recv_slice_capacity == 0 || capacity != recv_slice_capacity ||
+            count > capacity || req_header_end > count || req_initial_send_len > count ||
+            req_raw_target_offset >= req_header_end)
+            return invalid;
+        const u64 target_end64 = static_cast<u64>(req_raw_target_offset) + req_raw_target_length;
+        if (target_end64 >= req_header_end || target_end64 > count || target_end64 > capacity)
+            return invalid;
+
+        const u8* base = recv_buf.data();
+        const uintptr_t address = reinterpret_cast<uintptr_t>(base);
+        if (base != recv_slice || address < 4096 || capacity > UINTPTR_MAX - address)
+            return invalid;
+
+        const char* method = nullptr;
+        u32 method_length = 0;
+        switch (static_cast<LogHttpMethod>(req_method)) {
+            case LogHttpMethod::Get:
+                method = "GET";
+                method_length = 3;
+                break;
+            case LogHttpMethod::Post:
+                method = "POST";
+                method_length = 4;
+                break;
+            case LogHttpMethod::Put:
+                method = "PUT";
+                method_length = 3;
+                break;
+            case LogHttpMethod::Delete:
+                method = "DELETE";
+                method_length = 6;
+                break;
+            case LogHttpMethod::Patch:
+                method = "PATCH";
+                method_length = 5;
+                break;
+            case LogHttpMethod::Head:
+                method = "HEAD";
+                method_length = 4;
+                break;
+            case LogHttpMethod::Options:
+                method = "OPTIONS";
+                method_length = 7;
+                break;
+            case LogHttpMethod::Connect:
+                method = "CONNECT";
+                method_length = 7;
+                break;
+            case LogHttpMethod::Trace:
+                method = "TRACE";
+                method_length = 5;
+                break;
+            case LogHttpMethod::Other:
+                return invalid;
+        }
+        if (method == nullptr || req_raw_target_offset != method_length + 1u ||
+            method_length >= req_header_end || base[method_length] != ' ')
+            return invalid;
+        for (u32 i = 0; i < method_length; i++) {
+            if (base[i] != static_cast<u8>(method[i])) return invalid;
+        }
+
+        const u32 target_end = static_cast<u32>(target_end64);
+        // Bind the offsets to the strictly parsed request line, not merely an
+        // arbitrary slash-delimited substring elsewhere in the header block.
+        // Bounds above are proven before these bytes are examined.
+        const bool h10 = req_http_version == static_cast<u8>(HttpVersion::Http10);
+        const bool h11 = req_http_version == static_cast<u8>(HttpVersion::Http11);
+        if ((!h10 && !h11) || base[req_raw_target_offset - 1] != ' ' ||
+            base[req_raw_target_offset] != '/' || base[target_end] != ' ' ||
+            target_end64 + 11u > req_header_end || base[target_end + 1] != 'H' ||
+            base[target_end + 2] != 'T' || base[target_end + 3] != 'T' ||
+            base[target_end + 4] != 'P' || base[target_end + 5] != '/' ||
+            base[target_end + 6] != '1' || base[target_end + 7] != '.' ||
+            base[target_end + 8] != static_cast<u8>(h11 ? '1' : '0') ||
+            base[target_end + 9] != '\r' || base[target_end + 10] != '\n')
+            return invalid;
+        return {
+            RawRequestTargetWitnessState::Valid,
+            {reinterpret_cast<const char*>(base + req_raw_target_offset), req_raw_target_length}};
+    }
+
+    // Called exactly once at request start when the owning loop has access
+    // logging enabled. checked_raw_request_target() performs every provenance
+    // and range gate before any target byte is copied here.
+    void capture_access_log_target_snapshot() {
+        clear_access_log_target_snapshot();
+        const u32 episode = req_metadata_episode;
+        const RawRequestTargetWitnessResult witness = checked_raw_request_target();
+        if (witness.state == RawRequestTargetWitnessState::Valid) {
+            if (witness.target.len == 0 ||
+                witness.target.len > kAccessLogObservedStrictH1TargetMax) {
+                access_log_target_snapshot.target_state = AccessLogTargetState::Invalid;
+            } else if (witness.target.len > kAccessLogCompleteTargetMax) {
+                access_log_target_snapshot.target_length = static_cast<u16>(witness.target.len);
+                access_log_target_snapshot.target_state = AccessLogTargetState::OverLimit;
+            } else {
+                for (u32 i = 0; i < witness.target.len; i++)
+                    access_log_target_snapshot.path[i] = witness.target.ptr[i];
+                access_log_target_snapshot.target_length = static_cast<u16>(witness.target.len);
+                access_log_target_snapshot.target_state = AccessLogTargetState::Complete;
+            }
+        } else if (witness.state == RawRequestTargetWitnessState::Neutral) {
+            access_log_target_snapshot.target_state = AccessLogTargetState::Unavailable;
+        } else {
+            access_log_target_snapshot.target_state = AccessLogTargetState::Invalid;
+        }
+        // Publish the owner last. A zero episode can never be consumed as the
+        // current request and therefore remains fail-closed at completion.
+        access_log_target_snapshot.episode = episode;
+    }
     // Request-side keep-alive intent of the CURRENT request, as parsed from its
     // request line + Connection header (HTTP/1.1 default true, HTTP/1.0 default
     // false, "Connection: close" → false). The proxy forwards the client's
@@ -515,6 +1333,22 @@ struct ConnectionBase {
     // upstream idle-pooling on THIS, not on conn.keep_alive (which is derived from
     // drain state, not the request). Recorded by capture_request_metadata.
     bool req_keep_alive;
+    // Parsed downstream intent preserved across request-policy materialisation,
+    // which rewrites req_keep_alive for the upstream request.
+    bool req_client_keep_alive;
+    bool req_client_connection_close;
+    bool req_client_connection_close_exact;
+    bool req_client_has_content_length;
+    u8 req_client_content_length_count;
+    RequestTransferEncoding req_client_transfer_encoding;
+    // Original request framing/upgrade facts captured before any request-policy
+    // rewrite. SuppressBody HEAD admission must not lose these when rewritten
+    // requests strip hop-by-hop fields.
+    bool req_client_has_transfer_encoding;
+    bool req_client_has_te;
+    bool req_client_has_expect;
+    bool req_client_has_upgrade_header;
+    u8 req_client_connection_count;
     bool req_wants_upgrade;          // client sent Connection: upgrade (gates 101 tunnel)
     bool req_upgrade_is_websocket;   // the request Upgrade list offered "websocket"
     bool resp_upgrade_is_websocket;  // the backend 101 selected "websocket" (gates terminate)
@@ -538,6 +1372,7 @@ struct ConnectionBase {
     // an upstream recv CQE clearing the client's armed state.
     bool recv_armed;
     bool send_armed;
+    bool upstream_connect_armed;
     bool upstream_recv_armed;
     bool upstream_send_armed;
     bool recv_paused_for_send;
@@ -562,6 +1397,57 @@ struct ConnectionBase {
     // proxy_stream_complete clears resp_fully_buffered before that terminal drains, so
     // the live flag is unreliable. Cleared with upstream_recv_cancel_inflight.
     bool upstream_recv_terminal_stale;
+    // Bounded io_uring strict-abandonment retirement state. The latest retiring
+    // token remains as a tombstone after both owned finals drain and across
+    // ordinary reset()/slot reuse, so an old final cannot fall into generic
+    // stale-CQE accounting. A later proven retirement atomically replaces it
+    // with the then-current token; it is initialized exactly once
+    // here rather than being cleared by reset(). Active ownership/retry fields
+    // are still reset normally and preserved explicitly by io_uring's deferred-
+    // free path while kernel work pins the connection storage.
+    u32 upstream_retiring_episode = 0;
+    bool upstream_retirement_active;
+    u8 upstream_retirement_target_owned;
+    u8 upstream_retirement_cancel_owned;
+    u8 upstream_retirement_cancel_retry;
+    // A close may land after C2 admitted the successor episode while its
+    // connect/send/recv is still in flight. Preserve exact target/cancel
+    // ownership through reset so only matching successor CQEs drain accounting.
+    // The episode remains as a tombstone after the masks reach zero.
+    u32 upstream_close_episode;
+    u8 upstream_close_target_owned;
+    u8 upstream_close_cancel_owned;
+    bool upstream_close_pause_cancel_owned;
+    // Generic HTTP/1 request-boundary rendezvous used by io_uring while the
+    // strict upstream recv episode above drains. Request-completion bookkeeping
+    // has already run when deferred is set; buffered downstream bytes must not
+    // enter the next request until the loop consumes ready at batch end. The
+    // successor episode binds the marker to this exact live slot generation.
+    bool http1_boundary_deferred;
+    bool http1_boundary_ready;
+    u32 http1_boundary_successor_episode;
+    // Internal, policy-agnostic prebuilt-header rendezvous. HeaderSend and
+    // UpstreamRetirement are independently owned wait bits; request 2 is
+    // admitted only after both clear and the batch-end scan consumes readiness.
+    // A non-None disposition is the active marker even after the wait mask is
+    // zero. The exact prefix remains pinned until retirement and header send no
+    // longer reference recv/send slices.
+    u8 http1_prebuilt_wait;
+    Http1RequestBufferDisposition http1_prebuilt_disposition;
+    u32 http1_prebuilt_request_prefix_len;
+    Http1PrebuiltResponseLayout http1_prebuilt_response_layout;
+    Http1PrebuiltResponsePurpose http1_prebuilt_response_purpose;
+    ResponseReadDeadlineProfile http1_prebuilt_deadline_profile;
+    u8 http1_prebuilt_deadline_method;
+    u8 http1_prebuilt_deadline_route_method;
+    u32 http1_prebuilt_deadline_generation;
+    u16 http1_prebuilt_deadline_bundle_id;
+    const RouteConfig* http1_prebuilt_deadline_config;
+    ResponseReadDeadlineUploadProof http1_prebuilt_deadline_upload;
+    u32 http1_prebuilt_header_end;
+    u32 http1_prebuilt_total_len;
+    u32 http1_prebuilt_body_len;
+    u16 http1_prebuilt_status;
     // True when an idle-return stale upstream recv CQE carried bytes. The stale branch
     // rolls those bytes back out of upstream_recv_buf, so the deferred pool-return path
     // needs this separate marker to close rather than reuse a desynced fd.
@@ -579,6 +1465,10 @@ struct ConnectionBase {
 
     // Access-log metadata captured from the request/peer.
     u8 req_method;
+    // Raw HTTP/1 request bytes received downstream and assigned to this request boundary.
+    u32 downstream_req_size;
+    // Internal request/upstream-policy length bookkeeping; not the preserved downstream access
+    // size or actual partial-send telemetry.
     u32 req_size;
     u32 peer_addr;
     u16 peer_port;
@@ -604,10 +1494,11 @@ struct ConnectionBase {
     // Request timing (for access log)
     u64 req_start_us;
 
-    // An HTTP/2 async (wait/proxy) stream pins the RCU config epoch while parked.
-    // It uses this dedicated flag rather than req_start_us so close_conn leaves
-    // the epoch without also decrementing metrics requests_active (the h2 path
-    // doesn't call on_request_start).
+    // Ownership transferred from request timing after completion bookkeeping
+    // but before a deferred continuation releases the RCU config epoch. HTTP/2
+    // async streams use it while parked without h1-style request metrics; the
+    // internal HTTP/1 prebuilt-response rendezvous uses it after req_start_us is
+    // cleared and before batch-end request-boundary admission.
     bool epoch_held;
 
     // Outstanding I/O ops submitted to the backend. Incremented on
@@ -627,6 +1518,10 @@ struct ConnectionBase {
     // Slices are allocated in EventLoop::alloc_conn_impl() and freed in free_conn_impl().
     // Idle/free connections hold nullptr (zero buffer memory).
     u8* recv_slice;
+    // Capacity declared when recv_slice was installed by the owning loop.  Keep
+    // this independent of Buffer's mutable binding so checked request metadata
+    // can reject a rebound/shifted/recapped Buffer before reading through it.
+    u32 recv_slice_capacity;
     u8* send_slice;
     Buffer recv_buf;
     Buffer send_buf;
@@ -639,6 +1534,22 @@ struct ConnectionBase {
     // Lazy-allocated: only proxy connections pay the cost.
     u8* upstream_recv_slice;
     Buffer upstream_recv_buf;
+
+    void bind_request_receive_buffer(u8* slice, u32 capacity) {
+        clear_raw_request_target_witness();
+        recv_slice = slice;
+        recv_slice_capacity = capacity;
+        recv_buf.bind(slice, capacity);
+    }
+
+    void clear_response_accounting() {
+        resp_status = 0;
+        resp_body_mode = BodyMode::None;
+        resp_body_remaining = 0;
+        resp_chunk_parser.reset();
+        resp_body_sent = 0;
+        upstream_send_len = 0;
+    }
 
     void reset() {
         on_recv = nullptr;
@@ -672,6 +1583,8 @@ struct ConnectionBase {
         h2_proxy_synth_quarantined = false;
         req_path_overridden = false;
         req_path_override = {nullptr, 0};
+        target_transform_id = 0;
+        target_transform_recorded = false;
         req_header_override_count = 0;
         req_header_append_mask = 0;
         req_header_override_overflow = false;
@@ -725,7 +1638,20 @@ struct ConnectionBase {
         // reset() so a stale YieldHeap entry whose target slot was
         // recycled reliably fails the generation match. It's
         // initialized at accept-time via EventLoop::alloc_conn_impl.
+        // upstream_episode follows the same persistence rule for the future
+        // upstream-event token contract and is intentionally not reset here.
+        // response_read_deadline_generation follows that persistence rule too;
+        // only the live owner is cleared.
+        clear_response_read_deadline();
+        visit_response_read_deadline_send_close_owner_fields(
+            *this, [](auto& value, const auto& reset_value) { value = reset_value; });
+        // The precise response-read timer owns its on-connection timespec until
+        // both target/cancel CQEs drain. Preserve active ownership across reset;
+        // neutral storage may be hygienically cleared without touching its
+        // persistent generation counter.
+        if (response_read_timer_owner_is_neutral()) clear_response_read_timer_owner();
         request_config = nullptr;
+        listener_context = {};
         pending_handler_fn = nullptr;
         yield_timespec.tv_sec = 0;
         yield_timespec.tv_nsec = 0;
@@ -734,6 +1660,7 @@ struct ConnectionBase {
         tls_active = false;
         tls_handshake_complete = false;
         protocol = ConnProtocol::Http11;
+        downstream_completed_request_count = 0;
         h2 = nullptr;  // pool slot is released by free_conn_impl, not reset()
         tls = nullptr;
         // tls_engine.ssl is SSL_free'd by close_conn_impl before reset(); null
@@ -756,6 +1683,8 @@ struct ConnectionBase {
         tls_pending_on_send = nullptr;
         pipeline_depth = 0;
         pipeline_stash_len = 0;
+        http1_pipeline_request_generation = 0;
+        http1_pipeline_boundary_owners_settled = false;
         req_header_end = 0;
         req_content_length = 0;
         req_initial_send_len = 0;
@@ -763,7 +1692,40 @@ struct ConnectionBase {
         retry_req_snapshot_replayable = true;
         response_mutations_snapshotted = false;
         req_malformed = false;
+        request_policy_id = 0;
+        request_policy_body_pending = false;
+        pending_forward_upstream_id = 0;
+        pending_forward_request_policy_id = 0;
+        pending_forward_response_policy_id = 0;
+        pending_forward_failure_policy_id = 0;
+        pending_forward_timeout_failure_policy_id = 0;
+        request_body_fully_buffered = false;
+        request_upload_complete = false;
+        response_policy_id = 0;
+        response_policy_suppress_body = false;
+        failure_policy_id = 0;
+        timeout_failure_policy_id = 0;
+        failure_policy_suppress_body = false;
+        req_http_version = 255;
+        req_strict_h1_complete = false;
+        req_metadata_episode = 0;
+        req_raw_target_episode = 0;
+        req_raw_target_offset = 0;
+        req_raw_target_length = 0;
+        req_target_has_fragment = false;
+        clear_access_log_target_snapshot();
         req_keep_alive = false;
+        req_client_keep_alive = false;
+        req_client_connection_close = false;
+        req_client_connection_close_exact = false;
+        req_client_has_content_length = false;
+        req_client_content_length_count = 0;
+        req_client_transfer_encoding = RequestTransferEncoding::Unparsed;
+        req_client_has_transfer_encoding = false;
+        req_client_has_te = false;
+        req_client_has_expect = false;
+        req_client_has_upgrade_header = false;
+        req_client_connection_count = 0;
         req_wants_upgrade = false;
         req_upgrade_is_websocket = false;
         resp_upgrade_is_websocket = false;
@@ -771,13 +1733,10 @@ struct ConnectionBase {
         req_body_remaining = 0;
         req_chunk_parser.reset();
         req_body_streamed = false;
-        resp_body_mode = BodyMode::None;
-        resp_body_remaining = 0;
-        resp_chunk_parser.reset();
-        resp_body_sent = 0;
-        upstream_send_len = 0;
+        clear_response_accounting();
         recv_armed = false;
         send_armed = false;
+        upstream_connect_armed = false;
         upstream_recv_armed = false;
         upstream_send_armed = false;
         recv_paused_for_send = false;
@@ -788,11 +1747,28 @@ struct ConnectionBase {
         upstream_recv_pause_rearm_pending = false;
         upstream_recv_cancel_inflight = false;
         upstream_recv_terminal_stale = false;
+        // upstream_retiring_episode deliberately persists across reset()/reuse;
+        // see its declaration. Active ownership never does.
+        upstream_retirement_active = false;
+        upstream_retirement_target_owned = 0;
+        upstream_retirement_cancel_owned = 0;
+        upstream_retirement_cancel_retry = 0;
+        upstream_close_episode = 0;
+        upstream_close_target_owned = 0;
+        upstream_close_cancel_owned = 0;
+        upstream_close_pause_cancel_owned = false;
+        http1_boundary_deferred = false;
+        http1_boundary_ready = false;
+        http1_boundary_successor_episode = 0;
+        http1_prebuilt_wait = 0;
+        http1_prebuilt_disposition = Http1RequestBufferDisposition::None;
+        http1_prebuilt_request_prefix_len = 0;
+        clear_http1_prebuilt_response_proof();
         upstream_recv_idle_stale_bytes = false;
         yield_armed = false;
         yield_timeout_armed = false;
-        resp_status = 0;
         req_method = 0;
+        downstream_req_size = 0;
         req_size = 0;
         peer_addr = 0;
         peer_port = 0;
@@ -807,6 +1783,7 @@ struct ConnectionBase {
         epoch_held = false;
         pending_ops = 0;
         recv_slice = nullptr;
+        recv_slice_capacity = 0;
         send_slice = nullptr;
         recv_buf.bind(nullptr, 0);
         send_buf.bind(nullptr, 0);

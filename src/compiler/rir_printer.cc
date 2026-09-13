@@ -1,5 +1,7 @@
 #include "rut/compiler/rir_printer.h"
 
+#include "rut/runtime/route_method.h"
+
 #include <errno.h>
 #include <unistd.h>
 
@@ -223,6 +225,9 @@ void print_opcode(PrintBuf& buf, Opcode op) {
         case Opcode::ReqSetPath:
             buf.put_cstr("req.set_path");
             break;
+        case Opcode::ReqSetTargetTransform:
+            buf.put_cstr("req.set_target_transform");
+            break;
         case Opcode::CtxStoreSlotI32:
             buf.put_cstr("ctx.store_slot_i32");
             break;
@@ -376,6 +381,12 @@ void print_opcode(PrintBuf& buf, Opcode op) {
         case Opcode::RetForward:
             buf.put_cstr("ret.forward");
             break;
+        case Opcode::RetForwardBundle:
+            buf.put_cstr("ret.forward_bundle");
+            break;
+        case Opcode::RetRedirect:
+            buf.put_cstr("ret.redirect");
+            break;
         case Opcode::YieldTimer:
             buf.put_cstr("yield.timer");
             break;
@@ -508,6 +519,102 @@ static void print_quoted_str(PrintBuf& buf, Str s) {
     buf.put('"');
 }
 
+static void print_redirect_body(PrintBuf& buf, Str body) {
+    buf.put_cstr("b\"");
+    for (u32 i = 0; i < body.len; i++) {
+        const u8 c = static_cast<u8>(body.ptr[i]);
+        switch (c) {
+            case '\\':
+                buf.put_cstr("\\\\");
+                break;
+            case '"':
+                buf.put_cstr("\\\"");
+                break;
+            case '\n':
+                buf.put_cstr("\\n");
+                break;
+            case '\r':
+                buf.put_cstr("\\r");
+                break;
+            case '\t':
+                buf.put_cstr("\\t");
+                break;
+            default: {
+                const char hex[] = "0123456789ABCDEF";
+                if (c >= 0x20 && c <= 0x7e) {
+                    buf.put(static_cast<char>(c));
+                } else {
+                    buf.put_cstr("\\x");
+                    buf.put(hex[(c >> 4) & 0x0F]);
+                    buf.put(hex[c & 0x0F]);
+                }
+                break;
+            }
+        }
+    }
+    buf.put_cstr("\" (len=");
+    buf.put_u32(body.len);
+    buf.put(')');
+}
+
+static void print_redirect_scheme(PrintBuf& buf, RedirectPolicyScheme value) {
+    if (value == RedirectPolicyScheme::Http)
+        buf.put_cstr("http");
+    else
+        buf.put_cstr("invalid");
+}
+
+static void print_redirect_authority(PrintBuf& buf, RedirectPolicyAuthority value) {
+    if (value == RedirectPolicyAuthority::RequestHost)
+        buf.put_cstr("request_host");
+    else
+        buf.put_cstr("invalid");
+}
+
+static void print_redirect_port(PrintBuf& buf, RedirectPolicyPort value) {
+    if (value == RedirectPolicyPort::ActualListener)
+        buf.put_cstr("actual_listener");
+    else
+        buf.put_cstr("invalid");
+}
+
+static void print_redirect_path(PrintBuf& buf, RedirectPolicyPath value) {
+    if (value == RedirectPolicyPath::Static)
+        buf.put_cstr("static");
+    else
+        buf.put_cstr("invalid");
+}
+
+static void print_redirect_query(PrintBuf& buf, RedirectPolicyQuery value) {
+    if (value == RedirectPolicyQuery::PreserveRaw)
+        buf.put_cstr("preserve_raw");
+    else
+        buf.put_cstr("invalid");
+}
+
+static void print_redirect_date(PrintBuf& buf, RedirectPolicyDate value) {
+    if (value == RedirectPolicyDate::Current)
+        buf.put_cstr("current");
+    else
+        buf.put_cstr("invalid");
+}
+
+static void print_redirect_connection(PrintBuf& buf, RedirectPolicyConnection value) {
+    if (value == RedirectPolicyConnection::Close)
+        buf.put_cstr("close");
+    else
+        buf.put_cstr("invalid");
+}
+
+static void print_redirect_header_order(PrintBuf& buf, RedirectPolicyHeaderOrder value) {
+    if (value == RedirectPolicyHeaderOrder::LocationThenConnection)
+        buf.put_cstr("location_then_connection");
+    else if (value == RedirectPolicyHeaderOrder::ConnectionThenLocation)
+        buf.put_cstr("connection_then_location");
+    else
+        buf.put_cstr("invalid");
+}
+
 static void print_block_ref(PrintBuf& buf, BlockId bid, const Function& fn) {
     if (bid.id < fn.block_count) {
         buf.put_str(fn.blocks[bid.id].label);
@@ -605,6 +712,10 @@ void print_instruction(PrintBuf& buf, const Instruction& inst, const Function& f
         case Opcode::SextI64:
             buf.put(' ');
             print_value_ref(buf, inst.operands[0]);
+            break;
+        case Opcode::ReqSetTargetTransform:
+            buf.put(' ');
+            buf.put_i64(static_cast<i64>(inst.imm.i32_val));
             break;
         case Opcode::CtxStoreSlotI32:
             buf.put(' ');
@@ -751,8 +862,13 @@ void print_instruction(PrintBuf& buf, const Instruction& inst, const Function& f
             }
             break;
         case Opcode::RetForward:
+        case Opcode::RetForwardBundle:
             buf.put(' ');
             print_value_ref(buf, inst.operands[0]);
+            break;
+        case Opcode::RetRedirect:
+            buf.put(' ');
+            buf.put_i32(inst.imm.i32_val);
             break;
 
         // Yields
@@ -839,6 +955,32 @@ void print_function(PrintBuf& buf, const Function& fn) {
     buf.put_str(fn.route_pattern);
     buf.newline();
 
+    if (fn.forward_preflight_mode != ForwardPreflightMode::None ||
+        fn.preflight_forward_policy_bundle_id != 0) {
+        buf.indent(1);
+        buf.put_cstr("forward_preflight: ");
+        switch (fn.forward_preflight_mode) {
+            case ForwardPreflightMode::None:
+                buf.put_cstr("none");
+                break;
+            case ForwardPreflightMode::EagerDirect:
+                buf.put_cstr("eager_direct");
+                break;
+            case ForwardPreflightMode::AfterCanonicalSelection:
+                buf.put_cstr("after_canonical_selection");
+                break;
+            case ForwardPreflightMode::AfterRequestFramingSelection:
+                buf.put_cstr("after_request_framing_selection");
+                break;
+            default:
+                buf.put_cstr("invalid");
+                break;
+        }
+        buf.put_cstr(" bundle=");
+        buf.put_u32(fn.preflight_forward_policy_bundle_id);
+        buf.newline();
+    }
+
     buf.indent(1);
     buf.put_cstr("io_points: ");
     buf.put_u32(fn.yield_count);
@@ -875,12 +1017,255 @@ void print_function(PrintBuf& buf, const Function& fn) {
 
 // ── Module printing ─────────────────────────────────────────────────
 
-void print_module(PrintBuf& buf, const Module& mod) {
+static const char* response_policy_head_mode_name(ResponsePolicyHeadMode mode) {
+    switch (mode) {
+        case ResponsePolicyHeadMode::Reject:
+            return "reject";
+        case ResponsePolicyHeadMode::SuppressBody:
+            return "suppress_body";
+        case ResponsePolicyHeadMode::Invalid:
+            break;
+    }
+    return "invalid";
+}
+
+static const char* failure_policy_head_mode_name(FailurePolicyHeadMode mode) {
+    switch (mode) {
+        case FailurePolicyHeadMode::Reject:
+            return "reject";
+        case FailurePolicyHeadMode::SuppressBody:
+            return "suppress_body";
+        case FailurePolicyHeadMode::Invalid:
+            break;
+    }
+    return "invalid";
+}
+
+static const char* strict_local_response_head_mode_name(StrictLocalResponseHeadMode mode) {
+    switch (mode) {
+        case StrictLocalResponseHeadMode::Reject:
+            return "reject";
+        case StrictLocalResponseHeadMode::SuppressBody:
+            return "suppress_body";
+        case StrictLocalResponseHeadMode::Invalid:
+            break;
+    }
+    return "invalid";
+}
+
+static const char* strict_local_response_version_name(StrictLocalResponseVersion version) {
+    return version == StrictLocalResponseVersion::Http11 ? "HTTP/1.1" : "invalid";
+}
+
+static const char* strict_local_response_date_name(StrictLocalResponseDate date) {
+    return date == StrictLocalResponseDate::Current ? "current" : "invalid";
+}
+
+static const char* strict_local_response_connection_name(StrictLocalResponseConnection connection) {
+    return connection == StrictLocalResponseConnection::Request ? "request" : "invalid";
+}
+
+static const char* unmatched_method_name(u32 slot) {
+    static constexpr const char* names[kStrictLocalResponseMethodSlots] = {
+        "ANY", "GET", "POST", "PUT", "DELETE", "PATCH", "HEAD", "OPTIONS", "CONNECT", "TRACE"};
+    return slot < kStrictLocalResponseMethodSlots ? names[slot] : "INVALID";
+}
+
+static bool has_strict_local_response_metadata(const Module& mod) {
+    if (mod.strict_local_response_policy_count != 0) return true;
+    for (u32 slot = 0; slot < kStrictLocalResponseMethodSlots; slot++) {
+        if (mod.pre_route_policy_ids[slot] != 0) return true;
+        if (mod.unmatched_policy_ids[slot] != 0) return true;
+    }
+    return exact_strict_local_response_inventory_present(
+        mod.exact_strict_local_response_bindings, mod.exact_strict_local_response_binding_count);
+}
+
+static bool printable_strict_local_response_table(const Module& mod, bool internal_propagation) {
+    if (internal_propagation)
+        return strict_local_response_source_table_valid_for_internal_propagation(
+            mod.strict_local_response_policies,
+            mod.strict_local_response_policy_count,
+            mod.pre_route_policy_ids,
+            mod.unmatched_policy_ids,
+            mod.exact_strict_local_response_bindings,
+            mod.exact_strict_local_response_binding_count,
+            kMaxExactStrictLocalResponseBindings);
+    return strict_local_response_source_table_valid(mod.strict_local_response_policies,
+                                                    mod.strict_local_response_policy_count,
+                                                    mod.pre_route_policy_ids,
+                                                    mod.unmatched_policy_ids,
+                                                    mod.exact_strict_local_response_bindings,
+                                                    mod.exact_strict_local_response_binding_count,
+                                                    kMaxExactStrictLocalResponseBindings);
+}
+
+static void print_module_impl(PrintBuf& buf, const Module& mod, bool internal_propagation) {
+    const bool has_unmatched_metadata = has_strict_local_response_metadata(mod);
     for (u32 i = 0; i < mod.func_count; i++) {
         if (i > 0) buf.newline();
         print_function(buf, mod.functions[i]);
     }
+    if (mod.response_policy_count != 0) {
+        if (mod.func_count != 0) buf.newline();
+        buf.put_cstr("response_policies: ");
+        buf.put_u32(mod.response_policy_count);
+        buf.newline();
+        for (u32 i = 0; i < mod.response_policy_count; i++) {
+            const auto& policy = mod.response_policies[i];
+            buf.put_cstr("  response_policy#");
+            buf.put_u32(i + 1);
+            buf.put_cstr(": head_mode=");
+            buf.put_cstr(response_policy_head_mode_name(policy.head_mode));
+            buf.newline();
+        }
+    }
+    if (mod.failure_policy_count != 0) {
+        if (mod.func_count != 0 || mod.response_policy_count != 0) buf.newline();
+        buf.put_cstr("failure_policies: ");
+        buf.put_u32(mod.failure_policy_count);
+        buf.newline();
+        for (u32 i = 0; i < mod.failure_policy_count; i++) {
+            const auto& policy = mod.failure_policies[i];
+            buf.put_cstr("  failure_policy#");
+            buf.put_u32(i + 1);
+            buf.put_cstr(": head_mode=");
+            buf.put_cstr(failure_policy_head_mode_name(policy.head_mode));
+            buf.newline();
+        }
+    }
+    if (has_unmatched_metadata) {
+        if (mod.func_count != 0 || mod.response_policy_count != 0 || mod.failure_policy_count != 0)
+            buf.newline();
+        if (!printable_strict_local_response_table(mod, internal_propagation)) {
+            // Forged metadata must remain visible without using its count as an
+            // array bound or touching any possibly-null string storage.
+            buf.put_cstr("strict_local_response_table: <invalid>");
+            buf.newline();
+        } else {
+            buf.put_cstr("strict_local_response_policies: ");
+            buf.put_u32(mod.strict_local_response_policy_count);
+            buf.newline();
+            for (u32 i = 0; i < mod.strict_local_response_policy_count; i++) {
+                const auto& policy = mod.strict_local_response_policies[i];
+                buf.put_cstr("  local_response#");
+                buf.put_u32(i + 1);
+                buf.put_cstr(": version=");
+                buf.put_cstr(strict_local_response_version_name(policy.version));
+                buf.put_cstr(", status=");
+                buf.put_u32(policy.status_code);
+                buf.put_cstr(", reason=");
+                print_quoted_str(buf, policy.reason);
+                buf.put_cstr(", server=");
+                print_quoted_str(buf, policy.server);
+                buf.put_cstr(", content_type=");
+                print_quoted_str(buf, policy.content_type);
+                buf.put_cstr(", date=");
+                buf.put_cstr(strict_local_response_date_name(policy.date));
+                buf.put_cstr(", connection=");
+                buf.put_cstr(strict_local_response_connection_name(policy.connection));
+                buf.put_cstr(", head_mode=");
+                buf.put_cstr(strict_local_response_head_mode_name(policy.head_mode));
+                buf.put_cstr(", body=");
+                print_redirect_body(buf, policy.body);
+                buf.newline();
+            }
+            bool has_pre_route = false;
+            for (u32 slot = 1; slot < kStrictLocalResponseMethodSlots; slot++)
+                has_pre_route |= mod.pre_route_policy_ids[slot] != 0;
+            if (has_pre_route) {
+                buf.put_cstr("pre_route:");
+                buf.newline();
+                for (u32 slot = 1; slot < kStrictLocalResponseMethodSlots; slot++) {
+                    if (mod.pre_route_policy_ids[slot] == 0) continue;
+                    buf.put_cstr("  ");
+                    buf.put_cstr(unmatched_method_name(slot));
+                    buf.put_cstr(" -> local_response#");
+                    buf.put_u32(mod.pre_route_policy_ids[slot]);
+                    buf.newline();
+                }
+            }
+            buf.put_cstr("unmatched:");
+            buf.newline();
+            for (u32 slot = 0; slot < kStrictLocalResponseMethodSlots; slot++) {
+                if (mod.unmatched_policy_ids[slot] == 0) continue;
+                buf.put_cstr("  ");
+                buf.put_cstr(unmatched_method_name(slot));
+                buf.put_cstr(" -> local_response#");
+                buf.put_u32(mod.unmatched_policy_ids[slot]);
+                buf.newline();
+            }
+            if (mod.exact_strict_local_response_binding_count != 0) {
+                buf.put_cstr("exact:");
+                buf.newline();
+                for (u32 i = 0; i < mod.exact_strict_local_response_binding_count; i++) {
+                    const auto& binding = mod.exact_strict_local_response_bindings[i];
+                    buf.put_cstr("  ");
+                    buf.put_cstr(unmatched_method_name(binding.method));
+                    buf.put_cstr(" ");
+                    if (binding.path_view == ExactPathView::SlashNormalized)
+                        buf.put_cstr("slash_normalized ");
+                    print_quoted_str(buf, Str{binding.path, binding.path_len});
+                    buf.put_cstr(" -> local_response#");
+                    buf.put_u32(binding.policy_id);
+                    buf.newline();
+                }
+            }
+        }
+    }
+    if (mod.redirect_policy_count != 0) {
+        if (mod.func_count != 0 || mod.response_policy_count != 0 ||
+            mod.failure_policy_count != 0 || has_unmatched_metadata)
+            buf.newline();
+        buf.put_cstr("redirect_policies: ");
+        buf.put_u32(mod.redirect_policy_count);
+        buf.newline();
+        for (u32 i = 0; i < mod.redirect_policy_count; i++) {
+            const auto& policy = mod.redirect_policies[i];
+            buf.put_cstr("  redirect_policy#");
+            buf.put_u32(i + 1);
+            buf.put_cstr(": scheme=");
+            print_redirect_scheme(buf, policy.scheme);
+            buf.put_cstr(", authority=");
+            print_redirect_authority(buf, policy.authority);
+            buf.put_cstr(", port=");
+            print_redirect_port(buf, policy.port);
+            buf.put_cstr(", path=");
+            print_redirect_path(buf, policy.path);
+            buf.put_cstr(", query=");
+            print_redirect_query(buf, policy.query);
+            buf.put_cstr(", date=");
+            print_redirect_date(buf, policy.date);
+            buf.put_cstr(", connection=");
+            print_redirect_connection(buf, policy.connection);
+            buf.put_cstr(", header_order=");
+            print_redirect_header_order(buf, policy.header_order);
+            buf.put_cstr(", status=");
+            buf.put_u32(policy.status_code);
+            buf.put_cstr(", reason=");
+            print_quoted_str(buf, policy.reason);
+            buf.put_cstr(", server=");
+            print_quoted_str(buf, policy.server);
+            buf.put_cstr(", content_type=");
+            print_quoted_str(buf, policy.content_type);
+            buf.put_cstr(", static_authority=");
+            print_quoted_str(buf, policy.static_authority);
+            buf.put_cstr(", target_path=");
+            print_quoted_str(buf, policy.target_path);
+            buf.put_cstr(", body=");
+            print_redirect_body(buf, policy.body);
+            buf.newline();
+        }
+    }
     buf.flush();
+}
+
+void print_module(PrintBuf& buf, const Module& mod) {
+    print_module_impl(buf, mod, false);
+}
+
+void print_module_for_internal_propagation(PrintBuf& buf, const Module& mod) {
+    print_module_impl(buf, mod, true);
 }
 
 }  // namespace rir

@@ -42,8 +42,11 @@ struct SmallLoop : EventLoopCRTP<SmallLoop> {
     u32 keepalive_timeout = 60;
     bool draining = false;
     AccessLogRing* access_log = nullptr;
+    SourceLiveAccessLogProducer* live_access_log = nullptr;
     struct CaptureRing* capture_ring = nullptr;
     ShardMetrics* metrics = nullptr;
+    ShardMetrics* const* all_shard_metrics = nullptr;
+    u32 shard_metrics_count = 0;
 
     // Inline buffer storage for tests (no SlicePool dependency).
     u8 recv_storage[kMaxConns][kBufSize];
@@ -100,8 +103,11 @@ struct SmallLoop : EventLoopCRTP<SmallLoop> {
         running = true;
         draining = false;
         access_log = nullptr;
+        live_access_log = nullptr;
         capture_ring = nullptr;
         metrics = nullptr;
+        all_shard_metrics = nullptr;
+        shard_metrics_count = 0;
         config_ptr = nullptr;
         control = nullptr;
         epoch = nullptr;
@@ -140,9 +146,9 @@ struct SmallLoop : EventLoopCRTP<SmallLoop> {
         u32 id = free_stack[--free_top];
         conns[id].reset();
         conns[id].id = id;
-        conns[id].recv_slice = recv_storage[id];
+        conns[id].listener_context = this->listener_context;
+        conns[id].bind_request_receive_buffer(recv_storage[id], kBufSize);
         conns[id].send_slice = send_storage[id];
-        conns[id].recv_buf.bind(recv_storage[id], kBufSize);
         conns[id].send_buf.bind(send_storage[id], kBufSize);
         conns[id].response_header_slice = response_header_storage[id];
         conns[id].response_header_buf.bind(response_header_storage[id], kBufSize);
@@ -161,18 +167,20 @@ struct SmallLoop : EventLoopCRTP<SmallLoop> {
         return backend.add_send(c.fd, c.id, buf, len);
     }
     bool submit_send_upstream_impl(Connection& c, const u8* buf, u32 len) {
-        return backend.add_send_upstream(c.upstream_fd, c.id, buf, len);
+        return backend.add_send_upstream(c.upstream_fd, c.id, buf, len, c.upstream_episode);
     }
     bool submit_recv_upstream_impl(Connection& c) {
-        return backend.add_recv_upstream(c.upstream_fd, c.id);
+        return backend.add_recv_upstream(c.upstream_fd, c.id, c.upstream_episode);
     }
     bool pause_recv(Connection& c) {
         backend.pause_recv(c.id);
         return true;
     }
-    void pause_upstream_recv_impl(Connection& c) { backend.pause_upstream_recv(c.id); }
+    void pause_upstream_recv_impl(Connection& c) {
+        backend.pause_upstream_recv(c.id, c.upstream_episode);
+    }
     bool submit_connect_impl(Connection& c, const void* addr, u32 addr_len) {
-        return backend.add_connect(c.upstream_fd, c.id, addr, addr_len);
+        return backend.add_connect(c.upstream_fd, c.id, addr, addr_len, c.upstream_episode);
     }
     // Test shim: record the ms for assertions, fall back to 1s wheel so
     // pending_handler_fn is still re-entered when the test ticks.
@@ -302,6 +310,7 @@ struct SmallLoop : EventLoopCRTP<SmallLoop> {
                 }
                 break;
             case IoEventType::HandlerTimer:
+            case IoEventType::ResponseReadTimer:
             case IoEventType::Count:
                 break;
         }
@@ -363,7 +372,7 @@ struct AsyncMockBackend {
         return true;
     }
 
-    bool add_recv_upstream(i32 fd, u32 conn_id) {
+    bool add_recv_upstream(i32 fd, u32 conn_id, u32 /*upstream_episode*/ = 1) {
         if (fail_upstream_recv) return false;
         return add_recv(fd, conn_id);
     }
@@ -375,12 +384,14 @@ struct AsyncMockBackend {
         return true;
     }
 
-    bool add_send_upstream(i32 fd, u32 conn_id, const u8* buf, u32 len) {
+    bool add_send_upstream(
+        i32 fd, u32 conn_id, const u8* buf, u32 len, u32 /*upstream_episode*/ = 1) {
         if (fail_upstream_send) return false;
         return add_send(fd, conn_id, buf, len);
     }
 
-    bool add_connect(i32 fd, u32 conn_id, const void* /*addr*/, u32 /*len*/) {
+    bool add_connect(
+        i32 fd, u32 conn_id, const void* /*addr*/, u32 /*len*/, u32 /*upstream_episode*/ = 1) {
         if (fail_connect) return false;
         if (op_count < kMaxOps) {
             ops[op_count++] = {MockOp::Connect, fd, conn_id, nullptr, 0};
@@ -414,7 +425,10 @@ struct AsyncMockBackend {
 
     u32 wait(IoEvent* events, u32 max, Connection* /*conns*/ = nullptr, u32 /*max_conns*/ = 0) {
         u32 n = pending_count < max ? pending_count : max;
-        for (u32 i = 0; i < n; i++) events[i] = pending[i];
+        for (u32 i = 0; i < n; i++) {
+            events[i] = {};
+            events[i] = pending[i];
+        }
         for (u32 i = n; i < pending_count; i++) pending[i - n] = pending[i];
         pending_count -= n;
         return n;
@@ -441,7 +455,9 @@ struct AsyncMockBackend {
 // Async mock backend that fails add_recv (returns false).
 struct FailRecvAsyncMockBackend : AsyncMockBackend {
     bool add_recv(i32 /*fd*/, u32 /*conn_id*/) { return false; }
-    bool add_recv_upstream(i32 fd, u32 conn_id) { return add_recv(fd, conn_id); }
+    bool add_recv_upstream(i32 fd, u32 conn_id, u32 /*upstream_episode*/ = 1) {
+        return add_recv(fd, conn_id);
+    }
 };
 
 // ---- Async mock event loop (64 conns, io_uring-style deferred reclaim) ----
@@ -464,6 +480,7 @@ struct AsyncSmallLoop : EventLoopCRTP<AsyncSmallLoop> {
     u32 keepalive_timeout = 60;
     bool draining = false;
     AccessLogRing* access_log = nullptr;
+    SourceLiveAccessLogProducer* live_access_log = nullptr;
     struct CaptureRing* capture_ring = nullptr;
     ShardMetrics* metrics = nullptr;
 
@@ -514,6 +531,7 @@ struct AsyncSmallLoop : EventLoopCRTP<AsyncSmallLoop> {
         running = true;
         draining = false;
         access_log = nullptr;
+        live_access_log = nullptr;
         capture_ring = nullptr;
         metrics = nullptr;
         config_ptr = nullptr;
@@ -537,9 +555,8 @@ struct AsyncSmallLoop : EventLoopCRTP<AsyncSmallLoop> {
         u32 id = free_stack[--free_top];
         conns[id].reset();
         conns[id].id = id;
-        conns[id].recv_slice = recv_storage[id];
+        conns[id].bind_request_receive_buffer(recv_storage[id], kBufSize);
         conns[id].send_slice = send_storage[id];
-        conns[id].recv_buf.bind(recv_storage[id], kBufSize);
         conns[id].send_buf.bind(send_storage[id], kBufSize);
         conns[id].response_header_slice = response_header_storage[id];
         conns[id].response_header_buf.bind(response_header_storage[id], kBufSize);
@@ -561,6 +578,7 @@ struct AsyncSmallLoop : EventLoopCRTP<AsyncSmallLoop> {
             u32 ops = c.pending_ops;
             c.reset();
             conns[cid].recv_slice = rs;
+            conns[cid].recv_slice_capacity = rs != nullptr ? kBufSize : 0;
             conns[cid].send_slice = ss;
             conns[cid].upstream_recv_slice = us;
             conns[cid].pending_ops = ops;
@@ -586,7 +604,7 @@ struct AsyncSmallLoop : EventLoopCRTP<AsyncSmallLoop> {
         return false;
     }
     bool submit_send_upstream_impl(Connection& c, const u8* buf, u32 len) {
-        if (backend.add_send_upstream(c.upstream_fd, c.id, buf, len)) {
+        if (backend.add_send_upstream(c.upstream_fd, c.id, buf, len, c.upstream_episode)) {
             c.pending_ops++;
             c.upstream_send_armed = true;
             return true;
@@ -595,7 +613,7 @@ struct AsyncSmallLoop : EventLoopCRTP<AsyncSmallLoop> {
     }
     bool submit_recv_upstream_impl(Connection& c) {
         if (c.upstream_recv_armed) return true;
-        if (backend.add_recv_upstream(c.upstream_fd, c.id)) {
+        if (backend.add_recv_upstream(c.upstream_fd, c.id, c.upstream_episode)) {
             c.pending_ops++;
             c.upstream_recv_armed = true;
             return true;
@@ -603,7 +621,7 @@ struct AsyncSmallLoop : EventLoopCRTP<AsyncSmallLoop> {
         return false;
     }
     bool submit_connect_impl(Connection& c, const void* addr, u32 addr_len) {
-        if (backend.add_connect(c.upstream_fd, c.id, addr, addr_len)) {
+        if (backend.add_connect(c.upstream_fd, c.id, addr, addr_len, c.upstream_episode)) {
             c.pending_ops++;
             return true;
         }
@@ -768,6 +786,7 @@ struct AsyncSmallLoop : EventLoopCRTP<AsyncSmallLoop> {
                     }
                 }
                 break;
+            case IoEventType::ResponseReadTimer:
             case IoEventType::Count:
                 break;
         }
@@ -821,6 +840,7 @@ struct FailRecvAsyncSmallLoop : EventLoopCRTP<FailRecvAsyncSmallLoop> {
     u32 keepalive_timeout = 60;
     bool draining = false;
     AccessLogRing* access_log = nullptr;
+    SourceLiveAccessLogProducer* live_access_log = nullptr;
     struct CaptureRing* capture_ring = nullptr;
     ShardMetrics* metrics = nullptr;
 
@@ -869,6 +889,7 @@ struct FailRecvAsyncSmallLoop : EventLoopCRTP<FailRecvAsyncSmallLoop> {
         running = true;
         draining = false;
         access_log = nullptr;
+        live_access_log = nullptr;
         metrics = nullptr;
         config_ptr = nullptr;
         epoch = nullptr;
@@ -888,9 +909,8 @@ struct FailRecvAsyncSmallLoop : EventLoopCRTP<FailRecvAsyncSmallLoop> {
         u32 id = free_stack[--free_top];
         conns[id].reset();
         conns[id].id = id;
-        conns[id].recv_slice = recv_storage[id];
+        conns[id].bind_request_receive_buffer(recv_storage[id], kBufSize);
         conns[id].send_slice = send_storage[id];
-        conns[id].recv_buf.bind(recv_storage[id], kBufSize);
         conns[id].send_buf.bind(send_storage[id], kBufSize);
         conns[id].response_header_slice = response_header_storage[id];
         conns[id].response_header_buf.bind(response_header_storage[id], kBufSize);
@@ -921,7 +941,7 @@ struct FailRecvAsyncSmallLoop : EventLoopCRTP<FailRecvAsyncSmallLoop> {
         return false;
     }
     bool submit_send_upstream_impl(Connection& c, const u8* buf, u32 len) {
-        if (backend.add_send_upstream(c.upstream_fd, c.id, buf, len)) {
+        if (backend.add_send_upstream(c.upstream_fd, c.id, buf, len, c.upstream_episode)) {
             c.pending_ops++;
             return true;
         }
@@ -929,7 +949,7 @@ struct FailRecvAsyncSmallLoop : EventLoopCRTP<FailRecvAsyncSmallLoop> {
     }
     bool submit_recv_upstream_impl(Connection& c) {
         if (c.upstream_recv_armed) return true;
-        if (backend.add_recv_upstream(c.upstream_fd, c.id)) {
+        if (backend.add_recv_upstream(c.upstream_fd, c.id, c.upstream_episode)) {
             c.pending_ops++;
             c.upstream_recv_armed = true;
             return true;
@@ -937,7 +957,7 @@ struct FailRecvAsyncSmallLoop : EventLoopCRTP<FailRecvAsyncSmallLoop> {
         return false;
     }
     bool submit_connect_impl(Connection& c, const void* addr, u32 addr_len) {
-        if (backend.add_connect(c.upstream_fd, c.id, addr, addr_len)) {
+        if (backend.add_connect(c.upstream_fd, c.id, addr, addr_len, c.upstream_episode)) {
             c.pending_ops++;
             return true;
         }

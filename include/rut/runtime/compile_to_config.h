@@ -50,12 +50,45 @@
 
 #include "rut/compiler/hir.h"  // HirModule::kMaxTimers (frontend timer cap)
 #include "rut/compiler/rir.h"
+#include "rut/compiler/verifier.h"
 #include "rut/jit/codegen.h"
 #include "rut/jit/jit_engine.h"
 #include "rut/runtime/cache_table.h"
 #include "rut/runtime/route_table.h"
+#include <memory>
+#include <new>
+#include <type_traits>
 
 namespace rut {
+
+// Redirect IDs are embedded in RIR terminators, so validating only the
+// metadata table is insufficient: a forged instruction could otherwise reach
+// codegen or route registration with an out-of-range reference.  Keep this
+// narrow publication-boundary check shared by the loader and the config
+// population helper.
+inline bool redirect_references_valid(const rir::Module& mod) {
+    if (!redirect_policy_table_valid(mod.redirect_policies, mod.redirect_policy_count))
+        return false;
+    if (mod.func_count != 0 && mod.functions == nullptr) return false;
+    for (u32 fi = 0; fi < mod.func_count; fi++) {
+        const auto& fn = mod.functions[fi];
+        if (fn.block_count != 0 && fn.blocks == nullptr) return false;
+        for (u32 bi = 0; bi < fn.block_count; bi++) {
+            const auto& block = fn.blocks[bi];
+            if (block.inst_count != 0 && block.insts == nullptr) return false;
+            for (u32 ii = 0; ii < block.inst_count; ii++) {
+                const auto& inst = block.insts[ii];
+                if (inst.op != rir::Opcode::RetRedirect) continue;
+                const i64 id = inst.imm.i32_val;
+                if (inst.operand_count != 0 || id <= 0 ||
+                    static_cast<u64>(id) > mod.redirect_policy_count ||
+                    !redirect_policy_spec_valid(mod.redirect_policies[id - 1]))
+                    return false;
+            }
+        }
+    }
+    return true;
+}
 
 // The frontend (analyze.cc) caps declared timers at HirModule::kMaxTimers so a
 // surplus is a deterministic DSL error; that cap must fit the runtime table, or
@@ -100,13 +133,133 @@ inline bool configure_route_dispatch(RouteConfig& cfg, const rir::Module& mod) {
     return cfg.use_art();
 }
 
-inline bool register_jit_routes(RouteConfig& cfg, const rir::Module& mod, jit::JitEngine& engine) {
+inline bool module_has_strict_local_response_metadata(const rir::Module& mod) {
+    bool present = mod.strict_local_response_policy_count != 0 ||
+                   exact_strict_local_response_inventory_present(
+                       mod.exact_strict_local_response_bindings,
+                       mod.exact_strict_local_response_binding_count);
+    for (u32 slot = 0; slot < kStrictLocalResponseMethodSlots; slot++) {
+        present |= mod.pre_route_policy_ids[slot] != 0;
+        present |= mod.unmatched_policy_ids[slot] != 0;
+    }
+    return present;
+}
+
+// Activation must not silently drop verified source metadata when a caller
+// bypasses populate_route_config. Rebuild the source table through the same
+// owning/deduplicating transaction used by population, then compare its
+// complete remapped representation with the destination. The caller must
+// verify mod before entering this function: public counts are scanned here.
+namespace detail {
+
+inline bool strict_local_response_activation_matches_expected(const RouteConfig& cfg,
+                                                              const RouteConfig& expected) {
+    if (!cfg.strict_local_response_table_is_valid()) return false;
+    if (cfg.strict_local_response_policy_count != expected.strict_local_response_policy_count ||
+        cfg.exact_strict_local_response_binding_count !=
+            expected.exact_strict_local_response_binding_count)
+        return false;
+    // Policy IDs are representation-local. Compare policy semantics and then
+    // resolve every selector through its table's owned ID, so an independently
+    // built but correctly remapped destination is accepted.
+    for (u32 wanted = 0; wanted < expected.strict_local_response_policy_count; wanted++) {
+        bool found = false;
+        for (u32 actual = 0; actual < cfg.strict_local_response_policy_count; actual++)
+            found |= strict_local_response_policy_spec_equal(
+                cfg.strict_local_response_policies[actual],
+                expected.strict_local_response_policies[wanted]);
+        if (!found) return false;
+    }
+    auto mapped_policy_equal = [&](u16 actual_id, u16 wanted_id) {
+        if (actual_id == 0 || wanted_id == 0) return actual_id == wanted_id;
+        return strict_local_response_policy_spec_equal(
+            cfg.strict_local_response_policies[actual_id - 1],
+            expected.strict_local_response_policies[wanted_id - 1]);
+    };
+    for (u32 slot = 0; slot < kStrictLocalResponseMethodSlots; slot++) {
+        if (!mapped_policy_equal(cfg.pre_route_policy_ids[slot],
+                                 expected.pre_route_policy_ids[slot]) ||
+            !mapped_policy_equal(cfg.unmatched_policy_ids[slot],
+                                 expected.unmatched_policy_ids[slot]))
+            return false;
+    }
+    for (u32 i = 0; i < expected.exact_strict_local_response_binding_count; i++) {
+        const auto& wanted = expected.exact_strict_local_response_bindings[i];
+        bool found = false;
+        for (u32 j = 0; j < cfg.exact_strict_local_response_binding_count; j++) {
+            const auto& actual = cfg.exact_strict_local_response_bindings[j];
+            if (actual.path_len == wanted.path_len && actual.method == wanted.method &&
+                actual.path_view == wanted.path_view &&
+                __builtin_memcmp(actual.path, wanted.path, actual.path_len) == 0 &&
+                mapped_policy_equal(actual.policy_id, wanted.policy_id)) {
+                found = true;
+                break;
+            }
+        }
+        if (!found) return false;
+    }
+    return true;
+}
+
+}  // namespace detail
+
+inline bool strict_local_response_activation_matches(const RouteConfig& cfg,
+                                                     const rir::Module& mod) {
+    std::unique_ptr<RouteConfig> expected(new (std::nothrow) RouteConfig());
+    if (!expected) return false;
+    if (module_has_strict_local_response_metadata(mod) &&
+        !expected->install_strict_local_response_table_with_pre_route(
+            mod.strict_local_response_policies,
+            mod.strict_local_response_policy_count,
+            mod.pre_route_policy_ids,
+            mod.unmatched_policy_ids,
+            mod.exact_strict_local_response_bindings,
+            mod.exact_strict_local_response_binding_count))
+        return false;
+    return detail::strict_local_response_activation_matches_expected(cfg, *expected);
+}
+
+inline bool strict_local_response_activation_matches_for_internal_propagation(
+    const RouteConfig& cfg, const rir::Module& mod) {
+    std::unique_ptr<RouteConfig> expected(new (std::nothrow) RouteConfig());
+    if (!expected) return false;
+    if (module_has_strict_local_response_metadata(mod) &&
+        !expected->install_strict_local_response_table_with_pre_route_for_internal_propagation(
+            mod.strict_local_response_policies,
+            mod.strict_local_response_policy_count,
+            mod.pre_route_policy_ids,
+            mod.unmatched_policy_ids,
+            mod.exact_strict_local_response_bindings,
+            mod.exact_strict_local_response_binding_count))
+        return false;
+    return detail::strict_local_response_activation_matches_expected(cfg, *expected);
+}
+
+namespace detail {
+
+inline bool register_verified_jit_routes(RouteConfig& cfg,
+                                         const rir::Module& mod,
+                                         jit::JitEngine& engine) {
     // Guard on BOTH tables: a timer-only module never bumps route_count, so a
     // route_count-only precondition would let a second call re-append the same
     // timers (firing them twice per interval).
-    if (cfg.route_count != 0 || cfg.timer_count != 0) return false;
-    if (!configure_route_dispatch(cfg, mod)) return false;
+    if (cfg.route_count != 0 || cfg.timer_count != 0 ||
+        mod.func_count > RouteConfig::kMaxRoutes + RouteConfig::kMaxTimers)
+        return false;
+    if (cfg.policy_bundle_count != mod.policy_bundle_count) return false;
+    for (u32 i = 0; i < mod.policy_bundle_count; i++) {
+        const auto& expected = mod.policy_bundles[i];
+        const auto& actual = cfg.policy_bundles[i];
+        if (!cfg.policy_bundle_id_is_valid(static_cast<u16>(i + 1)) ||
+            expected.response_policy_id != actual.response_policy_id ||
+            expected.failure_policy_id != actual.failure_policy_id ||
+            expected.timeout_failure_policy_id != actual.timeout_failure_policy_id ||
+            expected.response_read_timeout_seconds != actual.response_read_timeout_seconds ||
+            expected.response_buffering != actual.response_buffering)
+            return false;
+    }
 
+    jit::HandlerFn handlers[RouteConfig::kMaxRoutes + RouteConfig::kMaxTimers]{};
     for (u32 i = 0; i < mod.func_count; i++) {
         const auto& fn = mod.functions[i];
         if (fn.route_pattern.len >= RouteEntry::kMaxPathLen) return false;
@@ -117,47 +270,110 @@ inline bool register_jit_routes(RouteConfig& cfg, const rir::Module& mod, jit::J
         jit::format_handler_symbol(fn.name, symbol, sizeof(symbol));
         auto* addr = engine.lookup(symbol);
         if (!addr) return false;
-        auto handler = reinterpret_cast<jit::HandlerFn>(addr);
-
-        // A timer compiles like a route but is fired on schedule, not matched
-        // against requests: register it into the timer table (route_pattern holds
-        // the timer name) and skip route registration.
-        if (fn.is_timer) {
-            if (!cfg.add_timer(fn.route_pattern.ptr,
-                               fn.route_pattern.len,
-                               fn.timer_interval_ms,
-                               handler,
-                               fn.timer_shard))
-                return false;
-            continue;
-        }
-
-        char path[RouteEntry::kMaxPathLen];
-        for (u32 j = 0; j < fn.route_pattern.len; j++) path[j] = fn.route_pattern.ptr[j];
-        path[fn.route_pattern.len] = '\0';
-
-        if (!cfg.add_jit_handler(path, fn.http_method, handler, rir_function_needs_req_body(fn)))
-            return false;
-        // @rateLimit decorators → stacked token-bucket rules, each with its own
-        // metering key (the route just added is at index route_count - 1).
-        if (fn.rate_limit.count > 0) {
-            const u32 kRouteIdx = cfg.route_count - 1;
-            for (u32 ri = 0; ri < fn.rate_limit.count; ri++) {
-                const RateLimitRule& rule = fn.rate_limit.rules[ri];
-                cfg.add_route_rate_limit_rule(
-                    kRouteIdx, rule.max, rule.window_sec, rule.scope, rule.burst);
-                for (u32 ki = 0; ki < rule.key.count; ki++) {
-                    const RateLimitKeyComponent& kc = rule.key.comps[ki];
-                    cfg.add_route_rate_limit_key(kRouteIdx, kc.kind, kc.name, kc.name_len);
-                }
-            }
-        }
-        if (fn.throttle_down_bps > 0) {
-            cfg.set_route_throttle(cfg.route_count - 1, fn.throttle_down_bps);
-        }
+        handlers[i] = reinterpret_cast<jit::HandlerFn>(addr);
     }
 
-    return true;
+    auto replay = [&](RouteConfig& target) {
+        if (!configure_route_dispatch(target, mod)) return false;
+        for (u32 i = 0; i < mod.func_count; i++) {
+            const auto& fn = mod.functions[i];
+            const auto handler = handlers[i];
+
+            // A timer compiles like a route but is fired on schedule, not matched
+            // against requests: register it into the timer table (route_pattern holds
+            // the timer name) and skip route registration.
+            if (fn.is_timer) {
+                if (!target.add_timer(fn.route_pattern.ptr,
+                                      fn.route_pattern.len,
+                                      fn.timer_interval_ms,
+                                      handler,
+                                      fn.timer_shard))
+                    return false;
+                continue;
+            }
+
+            char path[RouteEntry::kMaxPathLen];
+            for (u32 j = 0; j < fn.route_pattern.len; j++) path[j] = fn.route_pattern.ptr[j];
+            path[fn.route_pattern.len] = '\0';
+
+            if (!target.add_verified_jit_handler(path,
+                                                 fn.http_method,
+                                                 handler,
+                                                 rir_function_needs_req_body(fn),
+                                                 fn.forward_preflight_mode,
+                                                 fn.preflight_forward_policy_bundle_id))
+                return false;
+            // @rateLimit decorators → stacked token-bucket rules, each with its own
+            // metering key (the route just added is at index route_count - 1).
+            if (fn.rate_limit.count > 0) {
+                const u32 kRouteIdx = target.route_count - 1;
+                for (u32 ri = 0; ri < fn.rate_limit.count; ri++) {
+                    const RateLimitRule& rule = fn.rate_limit.rules[ri];
+                    if (!target.add_route_rate_limit_rule(
+                            kRouteIdx, rule.max, rule.window_sec, rule.scope, rule.burst))
+                        return false;
+                    for (u32 ki = 0; ki < rule.key.count; ki++) {
+                        const RateLimitKeyComponent& kc = rule.key.comps[ki];
+                        if (!target.add_route_rate_limit_key(
+                                kRouteIdx, kc.kind, kc.name, kc.name_len))
+                            return false;
+                    }
+                }
+            }
+            if (fn.throttle_down_bps > 0 &&
+                !target.set_route_throttle(target.route_count - 1, fn.throttle_down_bps))
+                return false;
+        }
+        return true;
+    };
+
+    RouteConfig* probe = new (std::nothrow) RouteConfig();
+    if (probe == nullptr) return false;
+    // The replay transaction validates typed route metadata against owned
+    // policy tables too. Rebuild only those tables through their public owning
+    // APIs: RouteConfig is intentionally non-copyable because its dispatch
+    // structures contain views into routes[].
+    bool probe_policies_valid = true;
+    for (u32 i = 0; probe_policies_valid && i < cfg.response_policy_count; i++)
+        probe_policies_valid =
+            probe->add_response_policy(cfg.response_policies[i]) == static_cast<u16>(i + 1);
+    for (u32 i = 0; probe_policies_valid && i < cfg.failure_policy_count; i++)
+        probe_policies_valid =
+            probe->add_failure_policy(cfg.failure_policies[i]) == static_cast<u16>(i + 1);
+    for (u32 i = 0; probe_policies_valid && i < cfg.policy_bundle_count; i++) {
+        const auto& bundle = cfg.policy_bundles[i];
+        probe_policies_valid =
+            probe->add_policy_bundle(bundle.response_policy_id,
+                                     bundle.failure_policy_id,
+                                     bundle.timeout_failure_policy_id,
+                                     bundle.response_read_timeout_seconds,
+                                     bundle.response_buffering) == static_cast<u16>(i + 1);
+    }
+    if (!probe_policies_valid) {
+        delete probe;
+        return false;
+    }
+    const bool staged = replay(*probe);
+    delete probe;
+    if (!staged) return false;
+    return replay(cfg);
+}
+
+}  // namespace detail
+
+inline bool register_jit_routes(RouteConfig& cfg, const rir::Module& mod, jit::JitEngine& engine) {
+    if (!rir::verify_module(mod).ok || !strict_local_response_activation_matches(cfg, mod))
+        return false;
+    return detail::register_verified_jit_routes(cfg, mod, engine);
+}
+
+inline bool register_jit_routes_for_internal_propagation(RouteConfig& cfg,
+                                                         const rir::Module& mod,
+                                                         jit::JitEngine& engine) {
+    if (!rir::verify_module_for_internal_propagation(mod).ok ||
+        !strict_local_response_activation_matches_for_internal_propagation(cfg, mod))
+        return false;
+    return detail::register_verified_jit_routes(cfg, mod, engine);
 }
 
 // Step 5 of the documented flow (file docstring): publish the config's Cache
@@ -178,14 +394,23 @@ inline void cache_registry_publish_config(const RouteConfig& cfg, const void* ow
     cache_registry_publish(caps, idents, n, owner);
 }
 
-inline bool populate_route_config(RouteConfig& cfg, const rir::Module& mod) {
+namespace detail {
+
+inline bool populate_verified_route_config(RouteConfig& cfg, const rir::Module& mod) {
     // Bodies / header sets / routes must always start empty — there's
     // no "merge" semantics for those tables, and a non-zero count
     // would break the compile-time body_idx / headers_idx invariants.
     if (cfg.route_count != 0 || cfg.response_body_count != 0 ||
-        cfg.response_header_set_count != 0) {
+        cfg.response_header_set_count != 0 || cfg.response_policy_count != 0 ||
+        cfg.failure_policy_count != 0 || cfg.policy_bundle_count != 0 ||
+        cfg.target_transform_count != 0 || cfg.target_transform_bytes_used != 0 ||
+        cfg.redirect_policy_count != 0 || cfg.redirect_policy_bytes_used != 0 ||
+        cfg.strict_local_response_policy_count != 0 || cfg.strict_local_response_bytes_used != 0 ||
+        cfg.has_strict_local_response_table_inventory()) {
         return false;
     }
+
+    if (!redirect_references_valid(mod)) return false;
 
     // Upstreams admit one of two shapes (see file docstring):
     //   - Fully empty: helper adds every upstream itself.
@@ -203,6 +428,68 @@ inline bool populate_route_config(RouteConfig& cfg, const rir::Module& mod) {
     if (mod.response_body_count > rir::Module::kMaxResponseBodies) return false;
     if (mod.header_set_count > rir::Module::kMaxHeaderSets) return false;
     if (mod.header_pool_used > rir::Module::kMaxHeaderPoolEntries) return false;
+    if (mod.response_policy_count > kMaxResponsePolicies) return false;
+    for (u32 i = 0; i < mod.response_policy_count; i++) {
+        if (!response_policy_spec_valid(mod.response_policies[i])) return false;
+    }
+    if (mod.failure_policy_count > kMaxForwardFailurePolicies ||
+        mod.policy_bundle_count > RouteConfig::kMaxForwardPolicyBundles ||
+        mod.target_transform_count > kMaxForwardTargetTransforms ||
+        mod.redirect_policy_count > kMaxRedirectPolicies)
+        return false;
+    for (u32 i = 0; i < mod.failure_policy_count; i++) {
+        if (!forward_failure_policy_table_spec_valid(mod.failure_policies[i])) return false;
+    }
+    // A failure policy can stand alone. A duration also makes a bundle
+    // meaningful without either response policy; an all-zero bundle is invalid.
+    for (u32 i = 0; i < mod.policy_bundle_count; i++) {
+        const auto& bundle = mod.policy_bundles[i];
+        if ((bundle.failure_policy_id != 0 &&
+             (bundle.failure_policy_id > mod.failure_policy_count ||
+              !forward_failure_policy_spec_valid(
+                  mod.failure_policies[bundle.failure_policy_id - 1]))) ||
+            (bundle.response_policy_id != 0 &&
+             (bundle.response_policy_id > mod.response_policy_count ||
+              !response_policy_spec_valid(mod.response_policies[bundle.response_policy_id - 1]))) ||
+            (bundle.response_read_timeout_seconds != 0 &&
+             !response_read_timeout_seconds_valid(bundle.response_read_timeout_seconds)) ||
+            !forward_response_buffering_mode_valid(bundle.response_buffering) ||
+            (bundle.response_read_timeout_seconds == 0 && bundle.failure_policy_id == 0))
+            return false;
+        if (bundle.response_buffering != ForwardResponseBufferingMode::None &&
+            (bundle.response_buffering != ForwardResponseBufferingMode::CompleteContentLength ||
+             !response_read_timeout_seconds_valid(bundle.response_read_timeout_seconds) ||
+             bundle.response_policy_id == 0 || bundle.failure_policy_id == 0 ||
+             bundle.timeout_failure_policy_id == 0 ||
+             bundle.timeout_failure_policy_id > mod.failure_policy_count ||
+             !complete_content_length_buffering_policies_valid(
+                 mod.response_policies[bundle.response_policy_id - 1],
+                 mod.failure_policies[bundle.failure_policy_id - 1],
+                 mod.failure_policies[bundle.timeout_failure_policy_id - 1])))
+            return false;
+        if (bundle.timeout_failure_policy_id != 0) {
+            if (bundle.response_policy_id == 0 || bundle.failure_policy_id == 0 ||
+                bundle.timeout_failure_policy_id > mod.failure_policy_count ||
+                !forward_timeout_failure_policy_spec_valid(
+                    mod.failure_policies[bundle.timeout_failure_policy_id - 1]))
+                return false;
+            const bool response_suppress =
+                mod.response_policies[bundle.response_policy_id - 1].head_mode ==
+                ResponsePolicyHeadMode::SuppressBody;
+            const bool failure_suppress =
+                mod.failure_policies[bundle.failure_policy_id - 1].head_mode ==
+                FailurePolicyHeadMode::SuppressBody;
+            const bool timeout_suppress =
+                mod.failure_policies[bundle.timeout_failure_policy_id - 1].head_mode ==
+                FailurePolicyHeadMode::SuppressBody;
+            if (response_suppress != failure_suppress || failure_suppress != timeout_suppress)
+                return false;
+        }
+    }
+    if (!forward_target_transform_table_valid(mod.target_transforms, mod.target_transform_count))
+        return false;
+    if (!redirect_policy_table_valid(mod.redirect_policies, mod.redirect_policy_count))
+        return false;
     for (u32 i = 0; i < mod.header_set_count; i++) {
         const auto& ref = mod.header_sets[i];
         if (static_cast<u32>(ref.offset) + ref.count > mod.header_pool_used) return false;
@@ -334,6 +621,25 @@ inline bool populate_route_config(RouteConfig& cfg, const rir::Module& mod) {
         if (idx != i + 1) return false;
     }
 
+    // Response policies (1-based IDs preserved). RouteConfig copies every
+    // string into its own pool before the RIR/compiler arena can be released.
+    for (u32 i = 0; i < mod.response_policy_count; i++) {
+        u16 idx = cfg.add_response_policy(mod.response_policies[i]);
+        if (idx == 0 || idx != i + 1) return false;
+    }
+    for (u32 i = 0; i < mod.failure_policy_count; i++) {
+        u16 idx = cfg.add_failure_policy(mod.failure_policies[i]);
+        if (idx == 0 || idx != i + 1) return false;
+    }
+    for (u32 i = 0; i < mod.policy_bundle_count; i++) {
+        const auto& bundle = mod.policy_bundles[i];
+        u16 idx = cfg.add_policy_bundle(bundle.response_policy_id,
+                                        bundle.failure_policy_id,
+                                        bundle.timeout_failure_policy_id,
+                                        bundle.response_read_timeout_seconds,
+                                        bundle.response_buffering);
+        if (idx == 0 || idx != i + 1) return false;
+    }
     // Cache instance descriptors — declaration order defines the instance
     // index compiled into CacheGet/CacheSet, so the copy must be exact and
     // the target table empty.
@@ -343,6 +649,86 @@ inline bool populate_route_config(RouteConfig& cfg, const rir::Module& mod) {
         const auto& ci = mod.cache_instances[i];
         if (ci.name.len > 0 && ci.name.ptr == nullptr) return false;
         if (!cfg.add_cache_instance(ci.name.ptr, ci.name.len, ci.capacity)) return false;
+    }
+
+    // Target-transform metadata is copied last.  Every operation above can
+    // still fail; keeping this final means a failed population never leaves
+    // partially published transform metadata in the destination config.
+    for (u32 i = 0; i < mod.target_transform_count; i++) {
+        u16 idx = cfg.add_target_transform(mod.target_transforms[i]);
+        if (idx == 0 || idx != i + 1) return false;
+    }
+    if (!cfg.add_redirect_policy_table(mod.redirect_policies, mod.redirect_policy_count))
+        return false;
+    return true;
+}
+
+}  // namespace detail
+
+inline bool populate_route_config(RouteConfig& cfg, const rir::Module& mod) {
+    if (!rir::verify_module(mod).ok) return false;
+    std::unique_ptr<RouteConfig> strict_local_response_probe;
+    if (module_has_strict_local_response_metadata(mod)) {
+        strict_local_response_probe.reset(new (std::nothrow) RouteConfig());
+        if (!strict_local_response_probe ||
+            !strict_local_response_probe->install_strict_local_response_table_with_pre_route(
+                mod.strict_local_response_policies,
+                mod.strict_local_response_policy_count,
+                mod.pre_route_policy_ids,
+                mod.unmatched_policy_ids,
+                mod.exact_strict_local_response_bindings,
+                mod.exact_strict_local_response_binding_count))
+            return false;
+    }
+    // Public compiler/config publication is one transaction: a later failure
+    // in any unrelated table cannot leave strict-local selectors half-active.
+    static_assert(std::is_trivially_copyable_v<RouteConfig>);
+    std::unique_ptr<u8[]> before(new (std::nothrow) u8[sizeof(RouteConfig)]);
+    if (!before) return false;
+    __builtin_memcpy(before.get(), static_cast<const void*>(&cfg), sizeof(RouteConfig));
+    const bool populated = detail::populate_verified_route_config(cfg, mod);
+    const bool strict_copied =
+        populated &&
+        (!strict_local_response_probe ||
+         cfg.copy_strict_local_response_table_from_owned(*strict_local_response_probe));
+    if (!strict_copied)
+        __builtin_memcpy(static_cast<void*>(&cfg), before.get(), sizeof(RouteConfig));
+    return strict_copied;
+}
+
+inline bool populate_route_config_for_internal_propagation(RouteConfig& cfg,
+                                                           const rir::Module& mod) {
+    if (!rir::verify_module_for_internal_propagation(mod).ok) return false;
+    std::unique_ptr<RouteConfig> strict_local_response_probe;
+    if (module_has_strict_local_response_metadata(mod)) {
+        strict_local_response_probe.reset(new (std::nothrow) RouteConfig());
+        if (!strict_local_response_probe ||
+            !strict_local_response_probe
+                 ->install_strict_local_response_table_with_pre_route_for_internal_propagation(
+                     mod.strict_local_response_policies,
+                     mod.strict_local_response_policy_count,
+                     mod.pre_route_policy_ids,
+                     mod.unmatched_policy_ids,
+                     mod.exact_strict_local_response_bindings,
+                     mod.exact_strict_local_response_binding_count))
+            return false;
+    }
+
+    // The internal compiler chain promises whole-operation atomicity. RouteConfig is
+    // intentionally non-copyable and large, so keep an object-representation snapshot
+    // on the heap and restore it on every later failure.
+    static_assert(std::is_trivially_copyable_v<RouteConfig>);
+    std::unique_ptr<u8[]> before(new (std::nothrow) u8[sizeof(RouteConfig)]);
+    if (!before) return false;
+    __builtin_memcpy(before.get(), static_cast<const void*>(&cfg), sizeof(RouteConfig));
+    const bool populated = detail::populate_verified_route_config(cfg, mod);
+    const bool strict_copied =
+        populated && (!strict_local_response_probe ||
+                      cfg.copy_strict_local_response_table_from_owned_for_internal_propagation(
+                          *strict_local_response_probe));
+    if (!strict_copied) {
+        __builtin_memcpy(static_cast<void*>(&cfg), before.get(), sizeof(RouteConfig));
+        return false;
     }
     return true;
 }

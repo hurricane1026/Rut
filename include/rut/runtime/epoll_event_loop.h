@@ -3,6 +3,7 @@
 #include "core/expected.h"
 #include "rut/common/types.h"
 #include "rut/runtime/access_log.h"
+#include "rut/runtime/access_log_live_producer.h"
 #include "rut/runtime/callbacks.h"
 #include "rut/runtime/connection.h"
 #include "rut/runtime/drain.h"
@@ -221,6 +222,7 @@ public:
     TlsServerContext* tls_server = nullptr;
 
     AccessLogRing* access_log = nullptr;
+    SourceLiveAccessLogProducer* live_access_log = nullptr;
 
     struct CaptureRing* capture_ring = nullptr;
     static constexpr u32 kCaptureSliceSize = 8192;
@@ -266,12 +268,14 @@ public:
     core::Expected<void, Error> init(u32 id, i32 lfd, u32 pool_prealloc = 0) {
         shard_id = id;
         listen_fd = lfd;
+        this->listener_context = {};
         running_.store(true, std::memory_order_relaxed);
         draining_.store(false, std::memory_order_relaxed);
         drain_start_.store(0, std::memory_order_relaxed);
         drain_period_.store(0, std::memory_order_relaxed);
         keepalive_timeout = kDefaultKeepaliveTimeout;
         upstream_timeout = kDefaultUpstreamTimeout;
+        live_access_log = nullptr;
         capture_ring = nullptr;
         capture_region_ = nullptr;
         config_ptr = nullptr;
@@ -432,6 +436,26 @@ public:
         if (conn_id < EpollBackend::kMaxFdMap) backend.upstream_fd_map[conn_id] = -1;
     }
 
+    // Epoll-owned upstream episode lifecycle boundary used by connect, reuse,
+    // health, retry, and terminal-close owners.
+    bool begin_upstream_episode(Connection& c) {
+        return backend.begin_upstream_episode(c.id, c.upstream_episode);
+    }
+
+    bool retire_upstream_episode_after_detach(Connection& c, u32 expected_episode) {
+        return backend.retire_upstream_episode_after_detach(c, expected_episode);
+    }
+
+    // Close/detach one logical upstream transport. A pool caller may request
+    // the descriptor back; it is exposed only after synchronous DEL, map/send
+    // cleanup, and strict episode retirement all succeed.
+    bool detach_upstream_close(Connection& c) { return backend.detach_upstream(c); }
+
+    bool detach_upstream_for_pool(Connection& c, i32& fd) {
+        fd = -1;
+        return backend.detach_upstream(c, &fd);
+    }
+
     // Drop any partial upstream-send bookkeeping for conn_id. Called before a
     // reused-fd retry re-connects on a fresh socket: a request send that parked
     // on EPOLLOUT leaves upstream_send_state[conn_id].remaining > 0, and the fresh
@@ -451,6 +475,11 @@ public:
         if (!upstream) return false;
         const i32 fd = upstream->take_idle(upstream_id, backend_idx);
         if (fd < 0) return false;
+        // Establish a new owner before publishing the borrowed fd in the map.
+        if (!backend.begin_upstream_episode(c.id, c.upstream_episode)) {
+            ::close(fd);
+            return false;
+        }
         c.upstream_fd = fd;
         if (c.id < EpollBackend::kMaxFdMap) backend.upstream_fd_map[c.id] = fd;
         return true;
@@ -461,16 +490,13 @@ public:
     // (EPOLL_CTL_DEL + clear send state + clear the fd↔conn map) so no stale event
     // can fire on it while it's parked. Closes the fd if the pool is full. The
     // caller has verified both sides are keep-alive and the response framed cleanly.
-    void return_idle_upstream(Connection& c, u16 upstream_id, u8 backend_idx) {
-        const i32 fd = c.upstream_fd;
-        if (fd < 0 || !upstream) return;                // no pool wired → caller closes the fd
-        backend.clear_send_state(c.id);                 // ensure no pending send
-        backend.quiesce_recv(c.id, /*upstream=*/true);  // EPOLL_CTL_DEL, keep the fd
-        clear_upstream_fd(c.id);                        // drop fd↔conn routing
-        c.upstream_fd = -1;
-        c.upstream_recv_armed = false;
-        c.upstream_send_armed = false;
-        if (!upstream->put_idle(fd, upstream_id, backend_idx, monotonic_secs())) ::close(fd);
+    bool return_idle_upstream(Connection& c, u16 upstream_id, u8 backend_idx) {
+        if (c.upstream_fd < 0 || !upstream) return false;
+        i32 fd = -1;
+        if (!detach_upstream_for_pool(c, fd)) return false;
+        if (fd >= 0 && !upstream->put_idle(fd, upstream_id, backend_idx, monotonic_secs()))
+            ::close(fd);
+        return true;
     }
 
     // Drop any partial/EAGAIN upstream request send still buffered for this
@@ -485,7 +511,7 @@ public:
     void discard_upstream_send(Connection& c) {
         if (c.id < EpollBackend::kMaxFdMap)
             backend.upstream_send_state[c.id] = {
-                nullptr, -1, 0, 0, IoEventType::UpstreamSend, false, 0};
+                nullptr, -1, 0, 0, IoEventType::UpstreamSend, false, 0, 0};
     }
 
     // Stop polling the upstream fd without closing it (close_conn still ::closes
@@ -495,7 +521,7 @@ public:
     // io_uring needs no equivalent (a cancelled recv does not re-fire), so this
     // method is epoll-only and the WS callback reaches it via a requires-guard.
     void ws_unpoll_upstream(Connection& c) {
-        if (c.upstream_fd >= 0) backend.quiesce_recv(c.id, /*upstream=*/true);
+        if (c.upstream_fd >= 0) backend.quiesce_recv(c.id, /*upstream=*/true, c.upstream_episode);
     }
 
     // Symmetric to ws_unpoll_upstream for the downstream (client) fd: stop epoll
@@ -503,7 +529,7 @@ public:
     // deferred behind a still-draining client→upstream send. close_conn ::closes
     // the fd later.
     void ws_unpoll_client(Connection& c) {
-        if (c.fd >= 0) backend.quiesce_recv(c.id, /*upstream=*/false);
+        if (c.fd >= 0) backend.quiesce_recv(c.id, /*upstream=*/false, 0);
     }
 
     bool alloc_upstream_buf(ConnectionBase& c) {
@@ -556,9 +582,9 @@ public:
         conns[id].reset();
         conns[id].id = id;
         conns[id].shard_id = static_cast<u8>(shard_id);
-        conns[id].recv_slice = rs;
+        conns[id].listener_context = this->listener_context;
+        conns[id].bind_request_receive_buffer(rs, SlicePool::kSliceSize);
         conns[id].send_slice = ss;
-        conns[id].recv_buf.bind(rs, SlicePool::kSliceSize);
         conns[id].send_buf.bind(ss, SlicePool::kSliceSize);
         if (capture_region_)
             conns[id].capture_buf = capture_region_ + static_cast<u64>(id) * kCaptureSliceSize;
@@ -584,6 +610,7 @@ public:
         if (c.ws_c2u_msg) pool.free(c.ws_c2u_msg);
         if (c.ws_u2c_msg) pool.free(c.ws_u2c_msg);
         if (c.h2) h2_pool.free(c.h2);
+        backend.quarantine_upstream_episode_on_slot_release(cid);
         c.reset();
         free_stack[free_top++] = cid;
     }
@@ -598,19 +625,20 @@ public:
     }
 
     bool submit_connect_impl(Connection& c, const void* addr, u32 addr_len) {
-        return backend.add_connect(c.upstream_fd, c.id, addr, addr_len);
+        if (!begin_upstream_episode(c)) return false;
+        return backend.add_connect(c.upstream_fd, c.id, addr, addr_len, c.upstream_episode);
     }
 
     bool submit_send_upstream_impl(Connection& c, const u8* buf, u32 len) {
-        return backend.add_send_upstream(c.upstream_fd, c.id, buf, len);
+        return backend.add_send_upstream(c.upstream_fd, c.id, buf, len, c.upstream_episode);
     }
 
     bool submit_recv_upstream_impl(Connection& c) {
-        return backend.add_recv_upstream(c.upstream_fd, c.id);
+        return backend.add_recv_upstream(c.upstream_fd, c.id, c.upstream_episode);
     }
 
     void pause_upstream_recv_impl(Connection& c) {
-        backend.pause_upstream_recv(c.id, c.ws_client_send_pending);
+        backend.pause_upstream_recv(c.id, c.upstream_episode, c.ws_client_send_pending);
     }
 
     // Minimal teardown for a health-probe Connection (fd == -1, no downstream).
@@ -619,18 +647,10 @@ public:
     // side-effects apply. Removes the probe socket from epoll, closes it, drops
     // the fd-map + send-state bookkeeping, and returns the slot to the free list.
     void free_health_probe(Connection& c) {
-        if (c.upstream_fd >= 0) {
-            backend.cancel(c.upstream_fd, c.id);  // EPOLL_CTL_DEL
-            ::close(c.upstream_fd);
-            c.upstream_fd = -1;
-        }
-        c.upstream_recv_armed = false;
-        c.upstream_send_armed = false;
+        (void)backend.detach_upstream(c);
         if (c.id < EpollBackend::kMaxFdMap) {
-            backend.upstream_fd_map[c.id] = -1;
             backend.downstream_fd_map[c.id] = -1;
         }
-        backend.clear_send_state(c.id);
         this->free_conn(c);  // timer.remove + free slices + return slot (no metrics)
     }
 
@@ -673,12 +693,8 @@ public:
             c.tls_active = false;
             c.tls_handshake_complete = false;
         }
-        if (c.upstream_fd >= 0) {
-            ::close(c.upstream_fd);
-            c.upstream_fd = -1;
-        }
-        // Clear upstream fd map to prevent stale fd matching after reuse.
-        if (c.id < EpollBackend::kMaxFdMap) backend.upstream_fd_map[c.id] = -1;
+        (void)backend.detach_upstream(c);
+        // Clear downstream fd map to prevent stale fd matching after reuse.
         if (c.id < EpollBackend::kMaxFdMap) backend.downstream_fd_map[c.id] = -1;
         // Drop any in-flight partial-send bookkeeping so a reused conn_id+fd
         // cannot resurrect a stale send (see EpollBackend::clear_send_state).
@@ -830,6 +846,15 @@ public:
     }
 
     void dispatch(const IoEvent& ev) {
+        // Reject tagged upstream completions before timer refresh, handler
+        // resume, callback dispatch, or armed-state changes. The generic
+        // dispatch_event() fence remains as defense in depth for callers that
+        // route directly through it.
+        if (io_event_is_upstream(ev.type) &&
+            (ev.conn_id >= kMaxConns || !valid_upstream_episode(ev.upstream_episode) ||
+             conns[ev.conn_id].upstream_episode != ev.upstream_episode ||
+             backend.active_upstream_episode[ev.conn_id] != ev.upstream_episode))
+            return;
         switch (ev.type) {
             case IoEventType::Accept:
                 on_accept(ev);
@@ -984,6 +1009,8 @@ public:
                     }
                 }
                 break;
+            // io_uring-only transport primitive; deliberately inert here.
+            case IoEventType::ResponseReadTimer:
             case IoEventType::Count:
                 break;
         }

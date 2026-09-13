@@ -29,8 +29,10 @@
 //   ./test_foo timer.refresh         # run suite "timer", test "refresh"
 //   ./test_foo -l                    # list all tests without running
 //   ./test_foo --filter=timer,math.addition # allow-list filter
+//   ./test_foo --shard-index=0 --shard-count=2
 //   ./test_foo --help                # show usage
 
+#include <stdint.h>
 #include <unistd.h>  // write
 
 namespace rut::test {
@@ -469,11 +471,59 @@ inline Filter merge_filter(const Filter& a, const Filter& b) {
     return merged;
 }
 
+// --- Deterministic sharding ---
+//
+// Hash the exact bytes of "suite.name" using 32-bit FNV-1a.  Each char is
+// treated as an unsigned byte and multiplication wraps modulo 2^32.
+
+inline uint32_t test_name_hash(const char* suite, const char* name) {
+    uint32_t hash = UINT32_C(2166136261);
+    const char* parts[] = {suite, ".", name};
+    for (const char* part : parts) {
+        for (int i = 0; part[i]; i++) {
+            hash ^= static_cast<unsigned char>(part[i]);
+            hash *= UINT32_C(16777619);
+        }
+    }
+    return hash;
+}
+
+struct Shard {
+    uint32_t index;
+    uint32_t count;
+    bool has_index;
+    bool has_count;
+
+    bool enabled() const { return has_index && has_count; }
+
+    bool matches(const TestCase* tc) const {
+        return !enabled() || test_name_hash(tc->suite, tc->name) % count == index;
+    }
+};
+
+inline bool parse_uint32(const char* value, uint32_t* result) {
+    if (!value || !value[0]) return false;
+    uint32_t parsed = 0;
+    for (int i = 0; value[i]; i++) {
+        if (value[i] < '0' || value[i] > '9') return false;
+        const uint32_t digit = static_cast<uint32_t>(value[i] - '0');
+        if (parsed > (UINT32_MAX - digit) / 10) return false;
+        parsed = parsed * 10 + digit;
+    }
+    *result = parsed;
+    return true;
+}
+
+inline bool selected(const TestCase* tc, const Filter& filter, const Shard& shard) {
+    return filter.matches(tc) && shard.matches(tc);
+}
+
 inline int run_all(int argc = 0, char** argv = nullptr) {
     // Parse args
     bool list_only = false;
     bool ask_help = false;
     Filter filter{};
+    Shard shard{0, 0, false, false};
 
     for (int i = 1; i < argc; i++) {
         if (str_eq(argv[i], "-l") || str_eq(argv[i], "--list")) {
@@ -482,9 +532,32 @@ inline int run_all(int argc = 0, char** argv = nullptr) {
             ask_help = true;
         } else if (str_starts_with(argv[i], "--filter=")) {
             filter = merge_filter(filter, parse_filter(argv[i] + 9));
+        } else if (str_starts_with(argv[i], "--shard-index")) {
+            if (shard.has_index || !str_starts_with(argv[i], "--shard-index=") ||
+                !parse_uint32(argv[i] + 14, &shard.index)) {
+                out("error: invalid --shard-index; expected --shard-index=N\n");
+                return 2;
+            }
+            shard.has_index = true;
+        } else if (str_starts_with(argv[i], "--shard-count")) {
+            if (shard.has_count || !str_starts_with(argv[i], "--shard-count=") ||
+                !parse_uint32(argv[i] + 14, &shard.count)) {
+                out("error: invalid --shard-count; expected --shard-count=N\n");
+                return 2;
+            }
+            shard.has_count = true;
         } else {
             filter = merge_filter(filter, parse_filter(argv[i]));
         }
+    }
+
+    if (shard.has_index != shard.has_count) {
+        out("error: --shard-index and --shard-count must be specified together\n");
+        return 2;
+    }
+    if (shard.enabled() && (shard.count == 0 || shard.index >= shard.count)) {
+        out("error: shard count must be positive and shard index must be less than count\n");
+        return 2;
     }
 
     if (ask_help) {
@@ -495,6 +568,8 @@ inline int run_all(int argc = 0, char** argv = nullptr) {
         out("  -l, --list           list matching tests and exit\n");
         out("  --filter=<expr>      allow-list filter by suite/name or suite.name\n");
         out("                       comma-separated, e.g. framework.aliases,math.*\n");
+        out("  --shard-index=N      zero-based deterministic shard index\n");
+        out("  --shard-count=N      positive deterministic shard count (paired with index)\n");
         out("  <expr>               filter by suite/name or suite.name\n");
         return 0;
     }
@@ -502,7 +577,7 @@ inline int run_all(int argc = 0, char** argv = nullptr) {
     // List mode
     if (list_only) {
         for (TestCase* tc = g_head; tc; tc = tc->next) {
-            if (filter.matches(tc)) {
+            if (selected(tc, filter, shard)) {
                 out(tc->suite);
                 out(".");
                 out(tc->name);
@@ -521,7 +596,7 @@ inline int run_all(int argc = 0, char** argv = nullptr) {
     const char* prev_suite = nullptr;
 
     for (TestCase* tc = g_head; tc; tc = tc->next) {
-        if (!filter.matches(tc)) {
+        if (!selected(tc, filter, shard)) {
             total_skip++;
             continue;
         }
@@ -548,7 +623,14 @@ inline int run_all(int argc = 0, char** argv = nullptr) {
         tc->fail_line = 0;
         if (!str_starts_with(tc->name, "DISABLED_")) tc->skip_reason = nullptr;
 
-        if (!tc->skipped) tc->fn(tc);
+        if (!tc->skipped) {
+            out("RUN: ");
+            out(tc->suite);
+            out(".");
+            out(tc->name);
+            out("\n");
+            tc->fn(tc);
+        }
         total_checks += tc->checks_passed;
         total_check_fail += tc->checks_failed;
         total_checks += tc->checks_failed;

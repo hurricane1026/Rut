@@ -3,6 +3,7 @@
 #include "rut/common/types.h"
 
 #include <stddef.h>
+#include <stdint.h>
 #include <time.h>
 
 namespace rut::test_fault {
@@ -16,6 +17,9 @@ struct FaultState {
     bool mprotect_fail = false;
 
     int fake_socket_fd = -1;
+    int socket_failures = 0;
+    int iouring_connect_submit_failures = 0;
+    int iouring_staged_send_submit_failures = 0;
 
     int recv_fd = -1;
     int recv_eintrs = 0;
@@ -142,6 +146,16 @@ public:
     explicit ScopedFakeSocket(int fd);
 };
 
+class ScopedSocketFailure : private ScopedFaultState {
+public:
+    explicit ScopedSocketFailure(int failures = 1);
+};
+
+class ScopedIoUringSubmitFailure : private ScopedFaultState {
+public:
+    ScopedIoUringSubmitFailure(int connect_failures, int staged_send_failures = 0);
+};
+
 class ScopedRecvData : private ScopedFaultState {
 public:
     ScopedRecvData(int fd, const char* data, size_t len, int eintrs = 0);
@@ -155,12 +169,52 @@ public:
     ~ScopedIoFault();
 
     int remaining_read_eintrs() const;
+    int remaining_write_eagains() const;
     int remaining_write_eintrs() const;
+    int remaining_write_fatals() const;
     int remaining_send_eagains() const;
     int remaining_connect_failures() const;
 
 private:
     IoFaultConfig previous_;
+};
+
+enum class HeldPositiveWriteError : uint8_t {
+    None,
+    InvalidTargetFd,
+    InvalidPrefixLength,
+    AlreadyOwned,
+    InvalidWriteLength,
+    PrefixWriteFailed,
+    DuplicateRelease,
+};
+
+// Process-wide, fd-specific test seam for a real positive short write followed
+// by one held matching write. The first target write reaches the kernel with
+// strict_prefix bytes. The second target write stops before the kernel until
+// release() is called. One owner is allowed; destruction releases and waits for
+// an in-flight hold so no global state or blocked thread survives the scope.
+class ScopedHeldPositiveWrite {
+public:
+    ScopedHeldPositiveWrite(int target_fd, size_t strict_prefix);
+    ScopedHeldPositiveWrite(const ScopedHeldPositiveWrite&) = delete;
+    ScopedHeldPositiveWrite& operator=(const ScopedHeldPositiveWrite&) = delete;
+    ~ScopedHeldPositiveWrite();
+
+    bool wait_until_held();
+    bool release();
+    bool wait_until_consumed();
+
+    bool owns_state() const;
+    bool prefix_consumed() const;
+    bool held() const;
+    bool released() const;
+    bool consumed() const;
+    bool failed_closed() const;
+    HeldPositiveWriteError error() const;
+
+private:
+    HeldPositiveWriteError local_error_ = HeldPositiveWriteError::None;
 };
 
 class ScopedSyscallFault {
@@ -172,6 +226,45 @@ public:
 
 private:
     SyscallFaultConfig previous_;
+};
+
+// Test-only userspace hold/replay seam for one raw epoll record.  The captured
+// record was produced by the real epoll_wait syscall; this scope merely keeps a
+// copy after harvesting it and can return that copy through a later wrapper
+// call.  It does not model a kernel event surviving EPOLL_CTL_DEL or close.
+enum class HeldEpollEventError : uint8_t {
+    None,
+    InvalidTargetFd,
+    AlreadyOwned,
+    DuplicateCaptureArm,
+    ReplayWithoutCapture,
+    DuplicateReplayArm,
+    WrongEpollFd,
+    InvalidWaitOutput,
+};
+
+class ScopedHeldEpollEvent {
+public:
+    explicit ScopedHeldEpollEvent(int target_epoll_fd);
+    ScopedHeldEpollEvent(const ScopedHeldEpollEvent&) = delete;
+    ScopedHeldEpollEvent& operator=(const ScopedHeldEpollEvent&) = delete;
+    ~ScopedHeldEpollEvent();
+
+    bool arm_capture_once();
+    bool replay_once();
+
+    bool owns_state() const;
+    bool capture_armed() const;
+    bool captured() const;
+    bool replay_armed() const;
+    bool replay_consumed() const;
+    bool failed_closed() const;
+    HeldEpollEventError error() const;
+    uint32_t captured_events() const;
+    uint64_t captured_data() const;
+
+private:
+    HeldEpollEventError local_error_ = HeldEpollEventError::None;
 };
 
 inline ScopedRecvData single_recv_eintr(int fd, const char* data, size_t len) {

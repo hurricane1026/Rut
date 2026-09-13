@@ -1,6 +1,9 @@
 #include "rut/runtime/http_parser.h"
 #include "rut/runtime/simd/simd.h"
 #include "test.h"
+#include <string>
+
+#include <string.h>
 
 using namespace rut;
 
@@ -1133,7 +1136,29 @@ TEST(ContentLength, Zero) {
 
     auto s = parse_one("POST / HTTP/1.1\r\nContent-Length: 0\r\n\r\n", &req, &parser);
     CHECK_EQ(static_cast<u8>(s), static_cast<u8>(ParseStatus::Complete));
+    CHECK(req.has_content_length);
+    CHECK_EQ(req.content_length_count, 1u);
     CHECK_EQ(req.content_length, 0u);
+    CHECK(request_content_length_identity_is_valid(req));
+}
+
+TEST(ContentLength, AbsentHasNeutralFieldIdentity) {
+    HttpParser parser;
+    ParsedRequest req;
+
+    const auto s = parse_one("POST / HTTP/1.1\r\nHost: x\r\n\r\n", &req, &parser);
+    CHECK_EQ(static_cast<u8>(s), static_cast<u8>(ParseStatus::Complete));
+    CHECK_FALSE(req.has_content_length);
+    CHECK_EQ(req.content_length_count, 0u);
+    CHECK_EQ(req.content_length, 0u);
+    CHECK(request_content_length_identity_is_valid(req));
+
+    CHECK_FALSE(request_content_length_identity_is_valid(false, 1, 0));
+    CHECK_FALSE(request_content_length_identity_is_valid(false, 0, 1));
+    CHECK_FALSE(request_content_length_identity_is_valid(true, 0, 0));
+    CHECK_FALSE(request_content_length_identity_is_valid(true, kMaxHeaders + 1, 0));
+    CHECK(request_content_length_identity_is_valid(true, 1, 0));
+    CHECK(request_content_length_identity_is_valid(true, 2, 5));
 }
 
 TEST(ContentLength, MaxU32) {
@@ -1380,12 +1405,22 @@ TEST(Reuse, AcrossRequests) {
     auto s1 = parse_one("GET /first HTTP/1.1\r\n\r\n", &req, &parser);
     CHECK_EQ(static_cast<u8>(s1), static_cast<u8>(ParseStatus::Complete));
     CHECK(req.path.eq(Str{"/first", 6}));
+    CHECK_FALSE(req.has_content_length);
+    CHECK_EQ(req.content_length_count, 0u);
 
     auto s2 = parse_one("POST /second HTTP/1.1\r\nContent-Length: 5\r\n\r\n", &req, &parser);
     CHECK_EQ(static_cast<u8>(s2), static_cast<u8>(ParseStatus::Complete));
     CHECK_EQ(static_cast<u8>(req.method), static_cast<u8>(HttpMethod::POST));
     CHECK(req.path.eq(Str{"/second", 7}));
+    CHECK(req.has_content_length);
+    CHECK_EQ(req.content_length_count, 1u);
     CHECK_EQ(req.content_length, 5u);
+
+    const auto s3 = parse_one("GET /third HTTP/1.1\r\n\r\n", &req, &parser);
+    CHECK_EQ(static_cast<u8>(s3), static_cast<u8>(ParseStatus::Complete));
+    CHECK_FALSE(req.has_content_length);
+    CHECK_EQ(req.content_length_count, 0u);
+    CHECK_EQ(req.content_length, 0u);
 }
 
 TEST(Reuse, AfterError) {
@@ -1990,7 +2025,10 @@ TEST(NginxHeaders, DuplicateContentLengthSameValue) {
         &req,
         &parser);
     CHECK_EQ(static_cast<u8>(s), static_cast<u8>(ParseStatus::Complete));
+    CHECK(req.has_content_length);
+    CHECK_EQ(req.content_length_count, 2u);
     CHECK_EQ(req.content_length, 5u);
+    CHECK(request_content_length_identity_is_valid(req));
 }
 
 TEST(NginxHeaders, ContentLengthAndTransferEncodingConflict) {
@@ -2022,7 +2060,10 @@ TEST(NginxHeaders, DuplicateContentLengthZeroZero) {
         &req,
         &parser);
     CHECK_EQ(static_cast<u8>(s), static_cast<u8>(ParseStatus::Complete));
+    CHECK(req.has_content_length);
+    CHECK_EQ(req.content_length_count, 2u);
     CHECK_EQ(req.content_length, 0u);
+    CHECK(request_content_length_identity_is_valid(req));
 }
 
 TEST(NginxHeaders, DuplicateContentLengthZeroNonzero) {
@@ -2052,7 +2093,29 @@ TEST(NginxHeaders, TripleDuplicateContentLength) {
         &req,
         &parser);
     CHECK_EQ(static_cast<u8>(s), static_cast<u8>(ParseStatus::Complete));
+    CHECK(req.has_content_length);
+    CHECK_EQ(req.content_length_count, 3u);
     CHECK_EQ(req.content_length, 42u);
+    CHECK(request_content_length_identity_is_valid(req));
+}
+
+TEST(NginxHeaders, MaximumHeaderCountBoundsContentLengthCount) {
+    std::string request = "POST / HTTP/1.1\r\n";
+    for (u32 i = 0; i < kMaxHeaders; i++) request += "Content-Length: 0\r\n";
+    request += "\r\n";
+
+    HttpParser parser;
+    ParsedRequest req;
+    const auto s = parse_raw(reinterpret_cast<const u8*>(request.data()),
+                             static_cast<u32>(request.size()),
+                             &req,
+                             &parser);
+    CHECK_EQ(static_cast<u8>(s), static_cast<u8>(ParseStatus::Complete));
+    CHECK_EQ(req.header_count, kMaxHeaders);
+    CHECK(req.has_content_length);
+    CHECK_EQ(req.content_length_count, kMaxHeaders);
+    CHECK_EQ(req.content_length, 0u);
+    CHECK(request_content_length_identity_is_valid(req));
 }
 
 TEST(NginxHeaders, TripleDuplicateContentLengthMismatch) {
@@ -3022,6 +3085,93 @@ TEST(TETokens, ChunkedExtSuffix) {
     CHECK(!req.chunked);
 }
 
+TEST(TEFraming, ConservativeOrderedClassificationAndReset) {
+    struct Case {
+        const char* raw;
+        ParseStatus status;
+        RequestTransferEncoding framing;
+        bool legacy_chunked;
+    };
+    const Case cases[] = {
+        {"GET / HTTP/1.1\r\nHost: x\r\n\r\n",
+         ParseStatus::Complete,
+         RequestTransferEncoding::None,
+         false},
+        {"GET / HTTP/1.1\r\nTE: trailers\r\n\r\n",
+         ParseStatus::Complete,
+         RequestTransferEncoding::None,
+         false},
+        {"POST / HTTP/1.1\r\nTransfer-Encoding: gzip, chunked\r\n\r\n",
+         ParseStatus::Complete,
+         RequestTransferEncoding::FinalChunked,
+         true},
+        {"POST / HTTP/1.1\r\nTransfer-Encoding: gzip\r\n\r\n",
+         ParseStatus::Complete,
+         RequestTransferEncoding::Unsupported,
+         false},
+        {"POST / HTTP/1.1\r\nTransfer-Encoding: chunked, gzip\r\n\r\n",
+         ParseStatus::Complete,
+         RequestTransferEncoding::Unsupported,
+         true},
+        {"POST / HTTP/1.1\r\nTransfer-Encoding: chunked, chunked\r\n\r\n",
+         ParseStatus::Complete,
+         RequestTransferEncoding::Unsupported,
+         true},
+        {"POST / HTTP/1.1\r\nTransfer-Encoding: chunked;foo=bar\r\n\r\n",
+         ParseStatus::Complete,
+         RequestTransferEncoding::Unsupported,
+         false},
+        {"POST / HTTP/1.1\r\nTransfer-Encoding:\r\n\r\n",
+         ParseStatus::Complete,
+         RequestTransferEncoding::Unsupported,
+         false},
+        {"POST / HTTP/1.1\r\nTransfer-Encoding: ,chunked\r\n\r\n",
+         ParseStatus::Complete,
+         RequestTransferEncoding::Unsupported,
+         true},
+        {"POST / HTTP/1.1\r\nTransfer-Encoding: chunked,\r\n\r\n",
+         ParseStatus::Complete,
+         RequestTransferEncoding::Unsupported,
+         true},
+        {"POST / HTTP/1.1\r\nTransfer-Encoding: gzip,,chunked\r\n\r\n",
+         ParseStatus::Complete,
+         RequestTransferEncoding::Unsupported,
+         true},
+        {"POST / HTTP/1.1\r\nTransfer-Encoding: bad/token\r\n\r\n",
+         ParseStatus::Complete,
+         RequestTransferEncoding::Unsupported,
+         false},
+        {"POST / HTTP/1.1\r\nTransfer-Encoding: gzip\r\nTransfer-Encoding: chunked\r\n\r\n",
+         ParseStatus::Complete,
+         RequestTransferEncoding::Unsupported,
+         true},
+        {"POST / HTTP/1.1\r\nContent-Length: 1\r\nTransfer-Encoding: gzip\r\n\r\nx",
+         ParseStatus::Complete,
+         RequestTransferEncoding::Unsupported,
+         false},
+        {"POST / HTTP/1.1\r\nContent-Length: 1\r\nTransfer-Encoding: chunked\r\n\r\n",
+         ParseStatus::Error,
+         RequestTransferEncoding::FinalChunked,
+         true},
+    };
+
+    HttpParser parser;
+    ParsedRequest req;
+    req.transfer_encoding = RequestTransferEncoding::FinalChunked;
+    for (const auto& tc : cases) {
+        const auto status = parse_one(tc.raw, &req, &parser);
+        CHECK_EQ(static_cast<u8>(status), static_cast<u8>(tc.status));
+        CHECK_EQ(static_cast<u8>(req.transfer_encoding), static_cast<u8>(tc.framing));
+        CHECK_EQ(req.chunked, tc.legacy_chunked);
+    }
+    req.reset();
+    CHECK_EQ(static_cast<u8>(req.transfer_encoding),
+             static_cast<u8>(RequestTransferEncoding::Unparsed));
+    CHECK(parse_raw(reinterpret_cast<const u8*>("G"), 1, &req, &parser) == ParseStatus::Incomplete);
+    CHECK_EQ(static_cast<u8>(req.transfer_encoding),
+             static_cast<u8>(RequestTransferEncoding::Unparsed));
+}
+
 // ============================================================================
 // TEST SUITE: obs-text (0x80-0xFF) in header values
 // ============================================================================
@@ -3558,6 +3708,26 @@ TEST(response_parser, basic_200) {
     CHECK_EQ(raw[parser.header_end], 'h');
 }
 
+TEST(response_parser, preserves_version_reason_raw_ows_and_cl_count) {
+    HttpResponseParser parser;
+    ParsedResponse resp;
+    auto s = parse_response(
+        "HTTP/1.1 200 Custom Reason\r\n"
+        "X-TrAcE:  one \t\r\n"
+        "Content-Length: 2\r\n"
+        "Content-Length: 2\r\n"
+        "\r\nok",
+        &resp,
+        &parser);
+    CHECK_EQ(static_cast<u8>(s), static_cast<u8>(ParseStatus::Complete));
+    CHECK_EQ(static_cast<u8>(resp.version), static_cast<u8>(HttpVersion::Http11));
+    CHECK_EQ(resp.reason.len, 13u);
+    CHECK(memcmp(resp.reason.ptr, "Custom Reason", 13) == 0);
+    CHECK_EQ(resp.content_length_count, 2u);
+    CHECK_EQ(resp.headers[0].raw_value.len, 7u);
+    CHECK(memcmp(resp.headers[0].raw_value.ptr, "  one \t", 7) == 0);
+}
+
 TEST(response_parser, 404) {
     HttpResponseParser parser;
     ParsedResponse resp;
@@ -3983,6 +4153,31 @@ TEST(PathCanon, non_origin_form_leaves_canon_null) {
     CHECK_EQ(static_cast<u8>(s3), static_cast<u8>(ParseStatus::Complete));
     CHECK(req.path_canon.ptr != nullptr);
     CHECK_EQ(req.path_canon.len, 0u);
+}
+
+TEST(request_parser, full_target_fragment_witness_survives_long_query_and_resets) {
+    HttpParser parser;
+    ParsedRequest req;
+    std::string raw = "GET /static?";
+    raw.append(96, 'x');
+    raw += "#fragment HTTP/1.1\r\nHost: x\r\n\r\n";
+    parser.reset();
+    REQUIRE_EQ(
+        parser.parse(reinterpret_cast<const u8*>(raw.data()), static_cast<u32>(raw.size()), &req),
+        ParseStatus::Complete);
+    CHECK(req.target_has_fragment);
+    CHECK(req.path_canon.eq({"static", 6}));
+
+    parser.reset();
+    REQUIRE_EQ(parse_one("GET /static?x=1 HTTP/1.1\r\nHost: x\r\n\r\n", &req, &parser),
+               ParseStatus::Complete);
+    CHECK_FALSE(req.target_has_fragment);
+
+    parser.reset();
+    const char malformed[] = "GET /static#fragment HTTP/1.1\r\nBroken\r\n\r\n";
+    CHECK_EQ(parser.parse(reinterpret_cast<const u8*>(malformed), sizeof(malformed) - 1, &req),
+             ParseStatus::Error);
+    CHECK(req.target_has_fragment);
 }
 
 // A response with exactly kMaxHeaders fields is fully stored and NOT flagged

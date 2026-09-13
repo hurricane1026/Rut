@@ -1,5 +1,14 @@
 #pragma once
 
+#include "rut/common/access_log_sink.h"
+#include "rut/common/failure_policy.h"
+#include "rut/common/forward_preflight.h"
+#include "rut/common/forward_target_transform.h"
+#include "rut/common/listener_address.h"
+#include "rut/common/redirect_policy.h"
+#include "rut/common/request_policy.h"
+#include "rut/common/response_policy.h"
+#include "rut/common/strict_local_response.h"
 #include "rut/common/types.h"
 #include "rut/common/wait_limits.h"
 #include "rut/compiler/ast.h"
@@ -45,6 +54,27 @@ struct HirUpstream {
     Str hc_path{};
     u32 hc_interval_ms = 0;
     u16 hc_expected_status = 200;
+};
+
+struct HirListener {
+    Span span{};
+    ListenerAddress address = ListenerAddress::IPv4Wildcard;
+    u16 port = 0;
+    u32 ipv4_host = 0;
+};
+
+struct HirAccessLogDecl {
+    Span span{};
+    Span path_field_span{};
+    Span path_token_span{};
+    Span path_span{};
+    Str path{};
+    Span format_field_span{};
+    Span format_value_span{};
+    AccessLogFormatProfile format = AccessLogFormatProfile::None;
+    Span publication_field_span{};
+    Span publication_value_span{};
+    AccessLogPublicationProfile publication = AccessLogPublicationProfile::None;
 };
 struct HirImport {
     Span span{};
@@ -743,6 +773,7 @@ struct HirLocal {
 enum class HirTerminatorKind : u8 {
     ReturnStatus,
     ForwardUpstream,
+    Redirect,
 };
 
 // Where the runtime status value comes from, when kind == ReturnStatus.
@@ -790,6 +821,18 @@ struct HirTerminator {
     // Request-header overrides for `forward(name, set_header: {...})`. len == 0
     // means none; lowering emits one ReqSetHeader per entry before RetForward.
     FixedVec<HirHeaderKV, kMaxHeaders> forward_set_headers;
+    u16 forward_request_policy_id = 0;
+    u16 forward_response_policy_id = 0;
+    u16 forward_failure_policy_id = 0;
+    u16 forward_timeout_failure_policy_id = 0;
+    u8 forward_response_read_timeout_seconds = 0;
+    ForwardResponseBufferingMode forward_response_buffering = ForwardResponseBufferingMode::None;
+    u16 redirect_policy_id = 0;
+    // Internal compiler-only target transform metadata. There is intentionally
+    // no parser/source syntax yet; presence is explicit so a forged partial
+    // descriptor is not mistaken for the no-transform case.
+    bool has_forward_target_transform = false;
+    ForwardTargetTransformSpec forward_target_transform{};
 };
 
 struct HirGuardBody {
@@ -1111,6 +1154,9 @@ struct HirRoute {
     HirControl control{};
     bool allow_respond_effects = false;
     u32 error_variant_index = 0xffffffffu;
+    // Compiler-derived response-read-deadline preflight timing. Deferred modes
+    // are reserved for their exact verifier-proven selector shapes.
+    ForwardPreflightMode forward_preflight_mode = ForwardPreflightMode::None;
     // @rateLimit decorators → stacked fixed-window rules (empty = no limit).
     // Flows to the RIR Function and on to RouteConfig rate-limit setup.
     RateLimitRuleSet rate_limit{};
@@ -1146,6 +1192,7 @@ struct HirRoute {
           control(other.control),
           allow_respond_effects(other.allow_respond_effects),
           error_variant_index(other.error_variant_index),
+          forward_preflight_mode(other.forward_preflight_mode),
           rate_limit(other.rate_limit),
           throttle_down_bps(other.throttle_down_bps),
           is_ws_terminate(other.is_ws_terminate),
@@ -1170,6 +1217,7 @@ struct HirRoute {
         control = other.control;
         allow_respond_effects = other.allow_respond_effects;
         error_variant_index = other.error_variant_index;
+        forward_preflight_mode = other.forward_preflight_mode;
         rate_limit = other.rate_limit;
         throttle_down_bps = other.throttle_down_bps;
         is_ws_terminate = other.is_ws_terminate;
@@ -1194,6 +1242,7 @@ struct HirRoute {
           control(other.control),
           allow_respond_effects(other.allow_respond_effects),
           error_variant_index(other.error_variant_index),
+          forward_preflight_mode(other.forward_preflight_mode),
           rate_limit(other.rate_limit),
           throttle_down_bps(other.throttle_down_bps),
           is_ws_terminate(other.is_ws_terminate),
@@ -1218,6 +1267,7 @@ struct HirRoute {
         control = other.control;
         allow_respond_effects = other.allow_respond_effects;
         error_variant_index = other.error_variant_index;
+        forward_preflight_mode = other.forward_preflight_mode;
         rate_limit = other.rate_limit;
         throttle_down_bps = other.throttle_down_bps;
         is_ws_terminate = other.is_ws_terminate;
@@ -1368,6 +1418,19 @@ struct HirModule {
     static constexpr u32 kMaxCaches = 8;
 
     FixedVec<HirUpstream, kMaxUpstreams> upstreams;
+    FixedVec<ForwardResponsePolicySpec, kMaxResponsePolicies> response_policies;
+    FixedVec<ForwardFailurePolicySpec, kMaxForwardFailurePolicies> failure_policies;
+    FixedVec<StrictLocalResponsePolicySpec, kMaxStrictLocalResponsePolicies>
+        strict_local_response_policies;
+    u16 pre_route_policy_ids[kStrictLocalResponseMethodSlots]{};
+    u16 unmatched_policy_ids[kStrictLocalResponseMethodSlots]{};
+    FixedVec<ExactStrictLocalResponseBinding, kMaxExactStrictLocalResponseBindings>
+        exact_strict_local_response_bindings;
+    FixedVec<RedirectPolicySpec, kMaxRedirectPolicies> redirect_policies;
+    bool has_listener = false;
+    HirListener listener{};
+    bool has_access_log = false;
+    HirAccessLogDecl access_log{};
     FixedVec<HirCacheDecl, kMaxCaches> caches;
     FixedVec<HirImport, kMaxImports> imports;
     FixedVec<HirAlias, kMaxAliases> aliases;
@@ -1391,6 +1454,15 @@ struct HirModule {
     HirModule() = default;
     HirModule(const HirModule& other)
         : upstreams(other.upstreams),
+          response_policies(other.response_policies),
+          failure_policies(other.failure_policies),
+          strict_local_response_policies(other.strict_local_response_policies),
+          exact_strict_local_response_bindings(other.exact_strict_local_response_bindings),
+          redirect_policies(other.redirect_policies),
+          has_listener(other.has_listener),
+          listener(other.listener),
+          has_access_log(other.has_access_log),
+          access_log(other.access_log),
           caches(other.caches),
           imports(other.imports),
           aliases(other.aliases),
@@ -1409,11 +1481,28 @@ struct HirModule {
           has_package_decl(other.has_package_decl),
           package_span(other.package_span),
           package_name(other.package_name) {
+        for (u32 i = 0; i < kStrictLocalResponseMethodSlots; i++) {
+            pre_route_policy_ids[i] = other.pre_route_policy_ids[i];
+            unmatched_policy_ids[i] = other.unmatched_policy_ids[i];
+        }
         rebase_type_alias_storage_ptrs(other);
     }
     HirModule& operator=(const HirModule& other) {
         if (this == &other) return *this;
         upstreams = other.upstreams;
+        response_policies = other.response_policies;
+        failure_policies = other.failure_policies;
+        strict_local_response_policies = other.strict_local_response_policies;
+        exact_strict_local_response_bindings = other.exact_strict_local_response_bindings;
+        for (u32 i = 0; i < kStrictLocalResponseMethodSlots; i++) {
+            pre_route_policy_ids[i] = other.pre_route_policy_ids[i];
+            unmatched_policy_ids[i] = other.unmatched_policy_ids[i];
+        }
+        redirect_policies = other.redirect_policies;
+        has_listener = other.has_listener;
+        listener = other.listener;
+        has_access_log = other.has_access_log;
+        access_log = other.access_log;
         caches = other.caches;
         imports = other.imports;
         aliases = other.aliases;

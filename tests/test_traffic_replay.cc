@@ -94,6 +94,41 @@ static u64 replay_matrix_forward_0_handler(void* /*conn*/,
     return rut::jit::HandlerResult::make_forward(0).pack();
 }
 
+struct ReplayWitnessLoop : SmallLoop {
+    bool prior_valid = false;
+    bool replay_reset_observed = false;
+    bool successor_valid = false;
+
+    void dispatch(const IoEvent& ev) {
+        if (ev.type == IoEventType::Recv && ev.conn_id < kMaxConns) {
+            replay_reset_observed = conns[ev.conn_id].checked_raw_request_target().state ==
+                                    RawRequestTargetWitnessState::Neutral;
+        }
+        SmallLoop::dispatch(ev);
+        if (ev.type == IoEventType::Accept && ev.result >= 0) {
+            for (u32 i = 0; i < kMaxConns; i++) {
+                Connection& conn = conns[i];
+                if (conn.fd != ev.result) continue;
+                static constexpr char kPrior[] =
+                    "GET /prior HTTP/1.1\r\nHost: before-replay\r\n\r\n";
+                if (conn.recv_buf.write(reinterpret_cast<const u8*>(kPrior), sizeof(kPrior) - 1u) !=
+                    sizeof(kPrior) - 1u)
+                    return;
+                capture_request_metadata(conn);
+                prior_valid = conn.checked_raw_request_target().state ==
+                                  RawRequestTargetWitnessState::Valid &&
+                              conn.checked_raw_request_target().target.eq({"/prior", 6});
+                return;
+            }
+        }
+        if (ev.type == IoEventType::Recv && ev.conn_id < kMaxConns) {
+            const auto witness = conns[ev.conn_id].checked_raw_request_target();
+            successor_valid = witness.state == RawRequestTargetWitnessState::Valid &&
+                              witness.target.eq({"/replayed", 9});
+        }
+    }
+};
+
 // === ReplayReader ===
 
 TEST(replay_reader, open_valid_file) {
@@ -204,6 +239,20 @@ TEST(replay_one, basic_200) {
     CHECK_EQ(result.expected_status, 200);
     CHECK_EQ(result.actual_status, 200);
     CHECK(result.status_match);
+}
+
+TEST(replay_one, production_reset_invalidates_prior_target_and_recaptures_replay) {
+    ReplayWitnessLoop loop;
+    loop.setup();
+    CaptureEntry entry =
+        make_captured_request("GET /replayed HTTP/1.1\r\nHost: example.com\r\n\r\n", 200);
+
+    const ReplayResult result = replay_one(loop, entry, 43);
+
+    CHECK(result.replayed);
+    CHECK(loop.prior_valid);
+    CHECK(loop.replay_reset_observed);
+    CHECK(loop.successor_valid);
 }
 
 TEST(replay_one, status_mismatch) {

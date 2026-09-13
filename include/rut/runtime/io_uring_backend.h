@@ -4,7 +4,9 @@
 #include "rut/common/types.h"
 #include "rut/runtime/error.h"
 #include "rut/runtime/io_backend.h"
+#include <atomic>
 
+#include <errno.h>
 #include <linux/io_uring.h>
 #include <sys/mman.h>
 #include <sys/syscall.h>
@@ -23,9 +25,10 @@ using Connection = ConnectionBase;  // alias (matches connection.h)
 //   [*] IORING_RECV_MULTISHOT     — one SQE continuously receives per connection
 //   [*] IOSQE_BUFFER_SELECT       — kernel picks buffer from provided ring
 //   [ ] IORING_SETUP_SQPOLL       — kernel-side SQ polling (needs CAP_SYS_NICE)
-//   [*] IORING_SETUP_SINGLE_ISSUER — single-thread optimization
 //   [ ] IORING_OP_SEND_ZC         — zero-copy send (future optimization)
 //   [*] IORING_SETUP_COOP_TASKRUN — cooperative task running
+// Ring setup runs before the shard thread starts, so SINGLE_ISSUER is intentionally
+// not used: submissions and enters may come from the spawned shard thread.
 //
 struct IoUringBackend {
     // io_uring is async: the kernel may still access user buffers between
@@ -81,12 +84,47 @@ struct IoUringBackend {
         u32 offset;
         u32 remaining;
         IoEventType type;
+        u32 upstream_episode;
+        u32 generation = 0;
     };
     SendState send_state[kMaxSendState];
     SendState upstream_send_state[kMaxSendState];
 
     // Pending SQE count (for submission)
     u32 pending = 0;
+
+    // Sticky fatal error from io_uring_enter. A zero-event wait is otherwise a
+    // legitimate result, so the event loop/control plane must inspect this
+    // separately. The worker writes it; the control thread polls it.
+    std::atomic<i32> fatal_error{0};
+
+    // A downstream multishot recv can publish more than one positive CQE before
+    // the event loop gets to dispatch the first one.  The backend must not copy
+    // the later payload into the connection buffer early: doing so would let the
+    // first callback observe bytes that are ordered after it.  Keep the exact
+    // unadvanced CQ head here so the next wait can validate and resume it.
+    struct DeferredDownstreamRecv {
+        u64 user_data = 0;
+        u32 head = 0;
+        u32 frozen_tail = 0;
+        bool active = false;
+        bool prior_terminal = false;
+    } deferred_downstream_recv;
+
+    // A terminal CQE may be followed in the already-observed CQ interval by
+    // stale positive selected-buffer records carrying the same generation-less
+    // downstream recv target token.  Tagged cancel bookkeeping remains visible
+    // to the event loop and owns an independent pending-op count.
+    // Dispatching the terminal can rearm or reuse the numeric connection slot,
+    // so only records strictly before the frozen tail are known to belong to
+    // the old owner.  The fixed inventory is bounded by one wait batch.
+    struct DownstreamRecvTerminalWindow {
+        u64 user_data = 0;
+        u32 tail_exclusive = 0;
+    } downstream_recv_terminal_windows[kMaxEventsPerWait];
+    u32 downstream_recv_terminal_window_count = 0;
+    u32 downstream_recv_progress_head = 0;
+    bool downstream_recv_progress_valid = false;
 
     // --- Interface methods ---
 
@@ -103,25 +141,66 @@ struct IoUringBackend {
 
     // Same as add_recv but encodes UpstreamRecv in user_data so dispatch
     // can distinguish upstream vs client recv CQEs.
-    bool add_recv_upstream(i32 fd, u32 conn_id);
+    bool add_recv_upstream(i32 fd, u32 conn_id, u32 upstream_episode = 1);
+    // One-shot counterpart used by the bounded downstream-TLS HTTP/1 proxy
+    // profile.  It retains provided-buffer selection and episode fencing but
+    // deliberately omits IORING_RECV_MULTISHOT so each CQE is consumed before
+    // another upstream buffer can be selected.
+    bool add_recv_upstream_once(i32 fd, u32 conn_id, u32 upstream_episode = 1);
+    // Dedicated single submission point for the bounded explicit
+    // first-response deadline.  It intentionally does not inherit the ordinary
+    // recv path's idempotent/deferred-rearm semantics.
+    bool add_first_response_recv(i32 fd, u32 conn_id, u32 upstream_episode);
 
     // Pause downstream recv while a send wait is pending.
     // Uses a silent cancel CQE so the event loop does not have to special-case it.
     bool pause_recv(i32 fd, u32 conn_id);
     // Cancel the multishot upstream recv by user_data (recv-only). The cancel's own
     // completion is tagged kPauseCancelAux so dispatch re-arms only once it drains.
-    bool pause_upstream_recv(i32 fd, u32 conn_id);
+    bool pause_upstream_recv(i32 fd, u32 conn_id, u32 upstream_episode = 1);
+    // Exact-token cancel used by bounded upstream-episode retirement. The
+    // cancel's own CQE retains the selected operation type and is tagged
+    // separately from pause/rearm cancellation. Returns true only after the
+    // cancel SQE has actually been queued.
+    bool cancel_retiring_upstream(u32 conn_id, IoEventType type, u32 upstream_episode);
+    bool cancel_retiring_upstream_recv(u32 conn_id, u32 upstream_episode) {
+        return cancel_retiring_upstream(conn_id, IoEventType::UpstreamRecv, upstream_episode);
+    }
 
     // Submit a send (or zero-copy send).
     // Returns false if SQ is full (no SQE submitted).
-    bool add_send(i32 fd, u32 conn_id, const u8* buf, u32 len);
+    bool add_send(i32 fd, u32 conn_id, const u8* buf, u32 len, u32 generation = 0);
+
+    // Submit the currently staged SQ entries without waiting for a completion.
+    // This is a bounded pressure-relief primitive: callers decide whether to
+    // retry their failed operation, and must not loop here.  A sticky backend
+    // error or an io_uring_enter failure is reported as false.
+    [[nodiscard]] bool flush_pending_nonblocking();
+
+#ifdef RUT_TESTING
+    // Deterministic syscall seam for flush_pending_nonblocking().  The caller
+    // supplies only the simulated io_uring_enter result; positive, in-range
+    // results also advance the synthetic kernel SQ head by the consumed count.
+    // All pending/error decisions remain in the production implementation.
+    template <typename EnterResult>
+    [[nodiscard]] bool test_flush_pending_nonblocking(EnterResult&& enter_result) {
+        return flush_pending_nonblocking_impl([&](i32, u32 to_submit, u32, u32) {
+            const i32 result = enter_result();
+            if (result > 0 && static_cast<u32>(result) <= to_submit) {
+                const u32 head = __atomic_load_n(sq_head, __ATOMIC_RELAXED);
+                __atomic_store_n(sq_head, head + static_cast<u32>(result), __ATOMIC_RELEASE);
+            }
+            return result;
+        });
+    }
+#endif
 
     // Same as add_send but encodes UpstreamSend in user_data.
-    bool add_send_upstream(i32 fd, u32 conn_id, const u8* buf, u32 len);
+    bool add_send_upstream(i32 fd, u32 conn_id, const u8* buf, u32 len, u32 upstream_episode = 1);
 
     // Submit a connect to upstream.
     // Returns false if SQ is full (no SQE submitted).
-    bool add_connect(i32 fd, u32 conn_id, const void* addr, u32 addr_len);
+    bool add_connect(i32 fd, u32 conn_id, const void* addr, u32 addr_len, u32 upstream_episode = 1);
 
     // Submit IORING_OP_TIMEOUT for a JIT handler yield. ms granularity —
     // the timespec storage lives on the Connection because the kernel
@@ -131,6 +210,15 @@ struct IoUringBackend {
     // the dispatcher can reject stale timeout CQEs.
     bool add_yield_timeout(u32 conn_id, Connection& conn, u32 ms);
 
+    // Submit/cancel the generic precise response-read timer. Ownership lives
+    // entirely on Connection and is intentionally not pending_ops accounting.
+    bool add_response_read_timer(u32 conn_id,
+                                 Connection& conn,
+                                 u32 milliseconds,
+                                 u32 deadline_generation,
+                                 u32 upstream_episode);
+    bool cancel_response_read_timer(u32 conn_id, Connection& conn);
+
     // Cancel outstanding operations for a connection (by user_data match).
     // Only submits cancel SQEs for op types actually in flight.
     // Returns the number of cancel SQEs submitted (for pending_ops tracking).
@@ -138,11 +226,15 @@ struct IoUringBackend {
                u32 conn_id,
                bool recv_armed,
                bool send_armed,
+               bool upstream_connect_armed,
                bool upstream_recv_armed,
                bool upstream_send_armed,
                bool has_upstream,
+               u32 upstream_episode = 1,
                bool yield_armed = false,
-               u32 yield_timer_gen = 0);
+               u32 yield_timer_gen = 0,
+               u8* upstream_cancel_mask = nullptr,
+               bool* send_cancel_owned = nullptr);
 
     bool cancel_yield_timeout(u32 conn_id, u32 yield_timer_gen);
 
@@ -155,6 +247,8 @@ struct IoUringBackend {
     // conns: connection table — recv completions using provided buffers are
     // copied into conns[conn_id].recv_buf. max_conns: table size for bounds checking.
     u32 wait(IoEvent* events, u32 max_events, Connection* conns, u32 max_conns);
+
+    i32 failure_code() const { return fatal_error.load(std::memory_order_acquire); }
 
     // Shutdown and unmap all resources.
     void shutdown();
@@ -171,15 +265,40 @@ private:
     // typed submit/cancel helpers.
     static u64 encode_user_data(u32 conn_id, IoEventType type);
     static u64 encode_user_data(u32 conn_id, IoEventType type, u32 aux);
+    static u64 encode_upstream_user_data(u32 conn_id,
+                                         IoEventType type,
+                                         u32 upstream_episode,
+                                         u8 aux = 0);
     static void decode_user_data(u64 data, u32& conn_id, IoEventType& type);
     static void decode_user_data(u64 data, u32& conn_id, IoEventType& type, u32& aux);
+    static void decode_user_data(
+        u64 data, u32& conn_id, IoEventType& type, u32& aux, u32& upstream_episode);
 
 private:
+    template <typename Enter>
+    [[nodiscard]] bool flush_pending_nonblocking_impl(Enter&& enter) {
+        if (failure_code() != 0) return false;
+        if (pending == 0) return true;
+
+        const i32 flushed = enter(ring_fd, pending, 0, IORING_ENTER_SQ_WAKEUP);
+        if (flushed < 0) {
+            record_enter_error(flushed);
+            return false;
+        }
+        if (static_cast<u32>(flushed) > pending) {
+            fatal_error.store(EPROTO, std::memory_order_release);
+            return false;
+        }
+        pending -= static_cast<u32>(flushed);
+        return true;
+    }
+
     // Submit a cancel SQE matching a specific user_data value.
     // conn_id/type/aux are encoded in the cancel CQE's user_data. Pass the real
     // conn_id for tracked close-path cancels, or kCancelConnId for fire-and-
     // forget cancels that should be consumed silently.
-    bool cancel_by_user_data(u64 target, u32 conn_id, IoEventType type, u32 aux = 0);
+    bool cancel_by_user_data(
+        u64 target, u32 conn_id, IoEventType type, u32 aux = 0, u32 upstream_episode = 0);
 
     // Get next available SQE. Returns nullptr if SQ is full.
     io_uring_sqe* get_sqe();
@@ -189,6 +308,18 @@ private:
 
     // Submit IORING_OP_READ on timer_fd to receive next tick.
     void submit_timer_read();
+
+    void record_enter_error(i32 result) {
+        if (result < 0 && result != -EINTR) fatal_error.store(-result, std::memory_order_release);
+    }
+
+    void reset_downstream_recv_wait_state() {
+        deferred_downstream_recv = {};
+        for (auto& window : downstream_recv_terminal_windows) window = {};
+        downstream_recv_terminal_window_count = 0;
+        downstream_recv_progress_head = 0;
+        downstream_recv_progress_valid = false;
+    }
 };
 
 }  // namespace rut

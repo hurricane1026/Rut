@@ -1,6 +1,9 @@
 #include "rut/common/shard_limits.h"
+#include "rut/runtime/access_log_startup.h"
 #include "rut/runtime/epoll_event_loop.h"
 #include "rut/runtime/iouring_event_loop.h"
+#include "rut/runtime/listener.h"
+#include "rut/runtime/listener_context.h"
 #include "rut/runtime/shard.h"
 #include "rut/runtime/socket.h"
 #include "rut/runtime/tls.h"
@@ -9,6 +12,7 @@
 #include "rut/serve_loader.h"
 #endif
 
+#include <errno.h>
 #include <fcntl.h>
 #include <linux/io_uring.h>
 #include <netinet/in.h>
@@ -16,6 +20,7 @@
 #include <string.h>
 #include <sys/socket.h>
 #include <sys/syscall.h>
+#include <time.h>
 #include <unistd.h>
 
 using namespace rut;
@@ -23,7 +28,6 @@ using namespace rut;
 // kMaxShards moved to rut/common/shard_limits.h (shared with the
 // compiler front-end, which validates `shard:` selectors against it).
 static constexpr u32 kDefaultDrainSecs = 30;
-static constexpr u16 kDefaultPort = 8080;
 
 // Status messages go to stderr to avoid mixing with structured JSON access logs on stdout.
 static void write_str(const char* s) {
@@ -66,6 +70,18 @@ static bool is_all_digits(const char* s) {
     return true;
 }
 
+static bool parse_cli_port(const char* s, u16& out) {
+    if (!is_all_digits(s)) return false;
+    u32 value = 0;
+    for (const char* p = s; *p; p++) {
+        const u32 digit = static_cast<u32>(*p - '0');
+        if (value > (65535u - digit) / 10u) return false;
+        value = value * 10u + digit;
+    }
+    out = static_cast<u16>(value);
+    return true;
+}
+
 static bool detect_io_uring() {
     struct io_uring_params params;
     memset(&params, 0, sizeof(params));
@@ -88,18 +104,107 @@ static void write_error(const char* prefix, const rut::Error& err) {
     write_str(")\n");
 }
 
+enum class RunShardsOutcomeKind : u8 {
+    Success,
+    Failure,
+    IoUringStartupFailure,
+};
+
+struct RunShardsOutcome {
+    RunShardsOutcomeKind kind = RunShardsOutcomeKind::Failure;
+
+    i32 exit_code() const { return kind == RunShardsOutcomeKind::Success ? 0 : 1; }
+};
+
+static const char* source_live_start_error_name(SourceLiveAccessLogStartErrorKind kind) {
+    switch (kind) {
+        case SourceLiveAccessLogStartErrorKind::InvalidLifecycle:
+            return "InvalidLifecycle";
+        case SourceLiveAccessLogStartErrorKind::InvalidOutput:
+            return "InvalidOutput";
+        case SourceLiveAccessLogStartErrorKind::InvalidRingCount:
+            return "InvalidRingCount";
+        case SourceLiveAccessLogStartErrorKind::NullRing:
+            return "NullRing";
+        case SourceLiveAccessLogStartErrorKind::DuplicateRing:
+            return "DuplicateRing";
+        case SourceLiveAccessLogStartErrorKind::InvalidRingState:
+            return "InvalidRingState";
+        case SourceLiveAccessLogStartErrorKind::NullLease:
+            return "NullLease";
+        case SourceLiveAccessLogStartErrorKind::DuplicateLease:
+            return "DuplicateLease";
+        case SourceLiveAccessLogStartErrorKind::LeaseConflict:
+            return "LeaseConflict";
+        case SourceLiveAccessLogStartErrorKind::DataEventCreate:
+            return "DataEventCreate";
+        case SourceLiveAccessLogStartErrorKind::StopEventCreate:
+            return "StopEventCreate";
+        case SourceLiveAccessLogStartErrorKind::ThreadCreate:
+            return "ThreadCreate";
+    }
+    return "Unknown";
+}
+
+static const char* source_live_fatal_name(SourceLiveAccessLogFatalKind kind) {
+    switch (kind) {
+        case SourceLiveAccessLogFatalKind::None:
+            return "None";
+        case SourceLiveAccessLogFatalKind::Notify:
+            return "Notify";
+        case SourceLiveAccessLogFatalKind::Poll:
+            return "Poll";
+        case SourceLiveAccessLogFatalKind::Write:
+            return "Write";
+        case SourceLiveAccessLogFatalKind::Protocol:
+            return "Protocol";
+        case SourceLiveAccessLogFatalKind::RingFull:
+            return "RingFull";
+    }
+    return "Unknown";
+}
+
+static void report_source_live_fatal(const SourceLiveAccessLogFatal& fatal) {
+    write_str("Fatal SourceLive access log failure (kind=");
+    write_str(source_live_fatal_name(fatal.kind));
+    write_str(", ring=");
+    if (fatal.ring_index == kSourceLiveAccessLogNoRing)
+        write_str("none");
+    else
+        write_u32(fatal.ring_index);
+    write_str(", errno=");
+    write_u32(static_cast<u32>(fatal.system_error));
+    write_str(")\n");
+}
+
+static void report_source_live_start_error(const SourceLiveAccessLogStartError& error) {
+    write_str("Failed to start SourceLive access log session (kind=");
+    write_str(source_live_start_error_name(error.kind));
+    write_str(", ring=");
+    if (error.ring_index == kSourceLiveAccessLogNoRing)
+        write_str("none");
+    else
+        write_u32(error.ring_index);
+    write_str(", errno=");
+    write_u32(static_cast<u32>(error.system_error));
+    write_str(")\n");
+}
+
 template <typename EventLoopType>
-static i32 run_shards(u16 port,
-                      u32 shard_count,
-                      bool pin_cpus,
-                      u32 drain_secs,
-                      u32 pool_prealloc,
-                      TlsServerContext* tls_server,
-                      const char* access_log_path,
-                      bool access_log_compress,
-                      i32 access_log_level,
-                      const RouteConfig* route_config,
-                      bool serve_metrics) {
+static RunShardsOutcome run_shards(ListenerSpec listener,
+                                   u32 shard_count,
+                                   bool pin_cpus,
+                                   u32 drain_secs,
+                                   u32 pool_prealloc,
+                                   TlsServerContext* tls_server,
+                                   const char* access_log_path,
+                                   bool access_log_compress,
+                                   i32 access_log_level,
+                                   SourceAccessLogFd* source_live_fd,
+                                   const RouteConfig* route_config,
+                                   bool serve_metrics) {
+    u16 port = listener.port;
+    ListenerContext bound_listener_context{};
     Shard<EventLoopType> shards[kMaxShards];
     // Cross-shard metrics registry for the built-in /metrics endpoint. Lives
     // for the whole serve duration (outlives the shard threads, which join
@@ -119,18 +224,9 @@ static i32 run_shards(u16 port,
     // If port==0 (ephemeral), create shard 0 first to get the assigned port,
     // then create remaining sockets on that concrete port.
     for (u32 i = 0; i < shard_count; i++) {
-        auto lfd_result = create_listen_socket(port);
-        // After shard 0, resolve ephemeral port so remaining shards bind the same port.
-        if (i == 0 && port == 0 && lfd_result) {
-            struct sockaddr_in a;
-            socklen_t al = sizeof(a);
-            if (getsockname(lfd_result.value(), reinterpret_cast<struct sockaddr*>(&a), &al) < 0) {
-                write_str("Failed to resolve ephemeral port\n");
-                close(lfd_result.value());
-                return 1;
-            }
-            port = __builtin_bswap16(a.sin_port);
-        }
+        ListenerContext derived_context{};
+        const ListenerContext* expected_context = i == 0 ? nullptr : &bound_listener_context;
+        auto lfd_result = bind_listener_shard(listener, port, expected_context, &derived_context);
         if (!lfd_result) {
             write_str("Failed to create listen socket for shard ");
             write_u32(i);
@@ -141,9 +237,13 @@ static i32 run_shards(u16 port,
                 shards[j].join();
                 shards[j].shutdown();
             }
-            return 1;
+            return {RunShardsOutcomeKind::Failure};
         }
         i32 lfd = lfd_result.value();
+        if (i == 0) {
+            bound_listener_context = derived_context;
+            port = bound_listener_context.port;
+        }
         shards[i].owns_listen_fd = true;
 
         auto rc = shards[i].init(i, lfd, pool_prealloc);
@@ -157,7 +257,10 @@ static i32 run_shards(u16 port,
                 shards[j].join();
                 shards[j].shutdown();
             }
-            return 1;
+            const RunShardsOutcomeKind outcome = rc.error().source == Error::Source::IoUring
+                                                     ? RunShardsOutcomeKind::IoUringStartupFailure
+                                                     : RunShardsOutcomeKind::Failure;
+            return {outcome};
         }
         if constexpr (requires { shards[i].loop->tls_server; }) {
             shards[i].loop->tls_server = tls_server;
@@ -170,6 +273,7 @@ static i32 run_shards(u16 port,
         if constexpr (requires { shards[i].loop->upstream_cc; }) {
             shards[i].loop->upstream_cc = &upstream_cc;
         }
+        shards[i].loop->listener_context = bound_listener_context;
 
         // Hand the compiled routes to the shard. Read-only and shared by
         // every shard (share-nothing applies to mutable per-request
@@ -193,16 +297,16 @@ static i32 run_shards(u16 port,
         write_str("Metrics: built-in GET /metrics enabled (reserved path — shadows user routes)\n");
     }
 
-    // Get actual port from first shard's socket
-    struct sockaddr_in bound_addr;
-    socklen_t addr_len = sizeof(bound_addr);
-    if (getsockname(
-            shards[0].listen_fd, reinterpret_cast<struct sockaddr*>(&bound_addr), &addr_len) < 0) {
-        write_str("Failed to get bound address\n");
+    if (access_log_path != nullptr && source_live_fd != nullptr) {
+        write_str("Conflicting legacy and SourceLive access log modes\n");
         for (u32 j = 0; j < shard_count; j++) shards[j].shutdown();
-        return 1;
+        return {RunShardsOutcomeKind::Failure};
     }
-    port = __builtin_bswap16(bound_addr.sin_port);
+    if (source_live_fd != nullptr && !*source_live_fd) {
+        write_str("Invalid SourceLive access log descriptor\n");
+        for (u32 j = 0; j < shard_count; j++) shards[j].shutdown();
+        return {RunShardsOutcomeKind::Failure};
+    }
 
     // Set up access log flusher if --access-log was specified.
     AccessLogFlusher log_flusher;
@@ -214,7 +318,7 @@ static i32 run_shards(u16 port,
             write_str(access_log_path);
             write_str("\n");
             for (u32 j = 0; j < shard_count; j++) shards[j].shutdown();
-            return 1;
+            return {RunShardsOutcomeKind::Failure};
         }
         // Allocate per-shard access log rings.
         for (u32 i = 0; i < shard_count; i++) {
@@ -225,7 +329,7 @@ static i32 run_shards(u16 port,
                 write_error("", rc.error());
                 close(access_log_fd);
                 for (u32 j = 0; j < shard_count; j++) shards[j].shutdown();
-                return 1;
+                return {RunShardsOutcomeKind::Failure};
             }
         }
         log_flusher.init(access_log_fd, access_log_compress, access_log_level);
@@ -234,11 +338,43 @@ static i32 run_shards(u16 port,
         }
     }
 
-    write_str("Listening on port ");
-    write_u32(port);
-    write_str(" with ");
-    write_u32(shard_count);
-    write_str(" shard(s)\n");
+    SourceLiveAccessLogSession source_live_session;
+    SourceLiveAccessLogRingBinding source_live_bindings[kMaxShards]{};
+    u32 source_live_ring_count = 0u;
+    bool source_live_started = false;
+    auto release_source_live_rings = [&]() {
+        bool success = true;
+        for (u32 i = 0; i < source_live_ring_count; i++) {
+            auto released = shards[i].release_live_access_log();
+            if (!released) {
+                write_str("Failed to release SourceLive access log ring for shard ");
+                write_u32(i);
+                write_str(" (reason=");
+                write_u32(static_cast<u32>(released.error()));
+                write_str(")\n");
+                success = false;
+            }
+        }
+        source_live_ring_count = 0u;
+        return success;
+    };
+    if (source_live_fd != nullptr) {
+        for (u32 i = 0; i < shard_count; i++) {
+            auto ring = shards[i].init_live_access_log_ring();
+            if (!ring) {
+                write_str("Failed to init SourceLive access log ring for shard ");
+                write_u32(i);
+                write_str(" (reason=");
+                write_u32(static_cast<u32>(ring.error()));
+                write_str(")\n");
+                (void)release_source_live_rings();
+                for (u32 j = 0; j < shard_count; j++) shards[j].shutdown();
+                return {RunShardsOutcomeKind::Failure};
+            }
+            source_live_bindings[i] = shards[i].live_access_log_binding();
+            source_live_ring_count++;
+        }
+    }
 
     // Block SIGINT/SIGTERM so sigwait() can catch them race-free.
     // Must block before spawning threads (threads inherit the mask).
@@ -247,6 +383,70 @@ static i32 run_shards(u16 port,
     sigaddset(&wait_set, SIGINT);
     sigaddset(&wait_set, SIGTERM);
     pthread_sigmask(SIG_BLOCK, &wait_set, nullptr);
+
+    if (source_live_fd != nullptr) {
+        auto started = source_live_session.start(static_cast<SourceAccessLogFd&&>(*source_live_fd),
+                                                 source_live_bindings,
+                                                 source_live_ring_count);
+        if (!started) {
+            report_source_live_start_error(started.error());
+            (void)release_source_live_rings();
+            for (u32 i = 0; i < shard_count; i++) shards[i].shutdown();
+            return {RunShardsOutcomeKind::Failure};
+        }
+        source_live_started = true;
+        for (u32 i = 0; i < shard_count; i++) {
+            auto attached = shards[i].attach_live_access_log(&source_live_session, i);
+            if (!attached) {
+                write_str("Failed to attach SourceLive access log producer for shard ");
+                write_u32(i);
+                write_str(" (reason=");
+                write_u32(static_cast<u32>(attached.error()));
+                write_str(")\n");
+                const SourceLiveAccessLogFinishResult finished = source_live_session.finish();
+                source_live_started = false;
+                if (finished.status == SourceLiveAccessLogFinishStatus::Fatal)
+                    report_source_live_fatal(finished.fatal);
+                (void)release_source_live_rings();
+                for (u32 j = 0; j < shard_count; j++) shards[j].shutdown();
+                return {RunShardsOutcomeKind::Failure};
+            }
+        }
+    }
+
+    bool source_live_fatal_reported = false;
+    auto finish_source_live = [&]() {
+        bool success = true;
+        if (source_live_started) {
+            const SourceLiveAccessLogFinishResult finished = source_live_session.finish();
+            source_live_started = false;
+            if (finished.status != SourceLiveAccessLogFinishStatus::Success) {
+                success = false;
+                if (finished.status == SourceLiveAccessLogFinishStatus::Fatal &&
+                    !source_live_fatal_reported) {
+                    report_source_live_fatal(finished.fatal);
+                    source_live_fatal_reported = true;
+                } else if (finished.status == SourceLiveAccessLogFinishStatus::InvalidLifecycle) {
+                    write_str(
+                        "Failed to finish SourceLive access log session (invalid lifecycle)\n");
+                }
+            }
+        }
+        if (!release_source_live_rings()) success = false;
+        return success;
+    };
+
+    auto finish_access_logs_and_shutdown = [&]() {
+        bool success = true;
+        if (access_log_fd >= 0) {
+            log_flusher.stop();
+            close(access_log_fd);
+            access_log_fd = -1;
+        }
+        if (!finish_source_live()) success = false;
+        for (u32 i = 0; i < shard_count; i++) shards[i].shutdown();
+        return success;
+    };
 
     // Spawn shard threads
     for (u32 i = 0; i < shard_count; i++) {
@@ -259,8 +459,8 @@ static i32 run_shards(u16 port,
             // Stop all already-spawned shards
             for (u32 j = 0; j < i; j++) shards[j].stop();
             for (u32 j = 0; j < i; j++) shards[j].join();
-            for (u32 j = 0; j < shard_count; j++) shards[j].shutdown();
-            return 1;
+            (void)finish_access_logs_and_shutdown();
+            return {RunShardsOutcomeKind::Failure};
         }
     }
 
@@ -271,15 +471,84 @@ static i32 run_shards(u16 port,
             write_error("Failed to start access log flusher", flusher_rc.error());
             for (u32 i = 0; i < shard_count; i++) shards[i].stop();
             for (u32 i = 0; i < shard_count; i++) shards[i].join();
-            for (u32 i = 0; i < shard_count; i++) shards[i].shutdown();
-            close(access_log_fd);
-            return 1;
+            (void)finish_access_logs_and_shutdown();
+            return {RunShardsOutcomeKind::Failure};
         }
     }
 
-    // Wait for SIGINT/SIGTERM — sigwait() is race-free (signal is blocked).
+    write_str("Listening on port ");
+    write_u32(port);
+    write_str(" with ");
+    write_u32(shard_count);
+    write_str(" shard(s)\n");
+
+    auto stop_all_shards = [&]() {
+        for (u32 i = 0; i < shard_count; i++) shards[i].stop();
+        for (u32 i = 0; i < shard_count; i++) shards[i].join();
+        return finish_access_logs_and_shutdown();
+    };
+
+    // Poll for SIGINT/SIGTERM — signals remain blocked and sigtimedwait() is
+    // race-free, while the bounded timeout lets the control thread observe a
+    // fatal backend error from a shard instead of waiting forever in sigwait().
     i32 sig = 0;
-    sigwait(&wait_set, &sig);
+    u32 failed_shard = shard_count;
+    i32 backend_error = 0;
+    SourceLiveAccessLogFatal source_live_fatal{};
+    auto observe_source_live_failure = [&]() {
+        if (source_live_fatal.kind != SourceLiveAccessLogFatalKind::None) return true;
+        if (!source_live_started) return false;
+        source_live_fatal = source_live_session.fatal();
+        return source_live_fatal.kind != SourceLiveAccessLogFatalKind::None;
+    };
+    auto observe_backend_failure = [&]() {
+        if (backend_error != 0) return true;
+        for (u32 i = 0; i < shard_count; i++) {
+            const i32 code = shards[i].backend_failure_code();
+            if (code != 0) {
+                failed_shard = i;
+                backend_error = code;
+                return true;
+            }
+        }
+        return false;
+    };
+    auto report_backend_failure = [&]() {
+        write_str("Fatal I/O backend failure on shard ");
+        write_u32(failed_shard);
+        write_str(" (errno=");
+        write_u32(static_cast<u32>(backend_error));
+        write_str(")\n");
+    };
+    auto report_runtime_failures = [&]() {
+        if (source_live_fatal.kind != SourceLiveAccessLogFatalKind::None &&
+            !source_live_fatal_reported) {
+            report_source_live_fatal(source_live_fatal);
+            source_live_fatal_reported = true;
+        }
+        if (backend_error != 0) report_backend_failure();
+    };
+    for (;;) {
+        struct timespec timeout = {0, 100'000'000};  // 100ms control-plane poll
+        sig = sigtimedwait(&wait_set, nullptr, &timeout);
+        // A fatal backend state takes precedence over a concurrently queued
+        // shutdown signal; otherwise the process could report a graceful exit.
+        const bool source_live_failed = observe_source_live_failure();
+        const bool backend_failed = observe_backend_failure();
+        if (source_live_failed || backend_failed) break;
+        if (sig == SIGINT || sig == SIGTERM) break;
+        if (sig < 0 && errno != EAGAIN && errno != EINTR) {
+            write_str("Failed to wait for shutdown signal\n");
+            (void)stop_all_shards();
+            return {RunShardsOutcomeKind::Failure};
+        }
+    }
+
+    if (source_live_fatal.kind != SourceLiveAccessLogFatalKind::None || backend_error != 0) {
+        report_runtime_failures();
+        (void)stop_all_shards();
+        return {RunShardsOutcomeKind::Failure};
+    }
 
     write_str("Draining connections (");
     write_u32(drain_secs);
@@ -293,22 +562,23 @@ static i32 run_shards(u16 port,
 
     // Wait for all shard threads to finish (they exit after drain completes).
     for (u32 i = 0; i < shard_count; i++) shards[i].join();
+    const bool source_live_failed_during_drain = observe_source_live_failure();
+    const bool backend_failed_during_drain = observe_backend_failure();
 
-    // Stop access log flusher (final flush of remaining entries).
-    if (access_log_fd >= 0) {
-        log_flusher.stop();
-        close(access_log_fd);
+    if (source_live_failed_during_drain || backend_failed_during_drain) report_runtime_failures();
+    const bool cleanup_succeeded = finish_access_logs_and_shutdown();
+
+    if (source_live_failed_during_drain || backend_failed_during_drain || !cleanup_succeeded) {
+        return {RunShardsOutcomeKind::Failure};
     }
 
-    // Release resources.
-    for (u32 i = 0; i < shard_count; i++) shards[i].shutdown();
-
     write_str("Shutdown complete.\n");
-    return 0;
+    return {RunShardsOutcomeKind::Success};
 }
 
 int main(int argc, char** argv) {
-    u16 port = kDefaultPort;
+    bool cli_port_present = false;
+    u16 cli_port = 0;
     u32 shard_count = 0;  // 0 = auto-detect
     bool pin_cpus = true;
     u32 drain_secs = kDefaultDrainSecs;
@@ -316,8 +586,14 @@ int main(int argc, char** argv) {
     const char* tls_cert_path = nullptr;
     const char* tls_key_path = nullptr;
     const char* config_path = nullptr;
+    ListenerSpec source_listener{};
+    bool source_listener_present = false;
+    AccessLogSinkSpec source_access_log{};
     const char* access_log_path = nullptr;
+    bool cli_access_log_path_present = false;
     bool access_log_compress = false;
+    bool cli_access_log_compress_present = false;
+    bool environment_access_log_compress_present = false;
     // Advertise HTTP/2 over ALPN. Opt-in for now: h2 serves static/return-status
     // routes; JIT-handler and proxy routes answer 503 over h2 (follow-up).
     bool offer_h2 = false;
@@ -325,6 +601,7 @@ int main(int argc, char** argv) {
     // listener. Opt-in (internal metrics shouldn't be public by default).
     bool serve_metrics = false;
     i32 access_log_level = AccessLogFlusher::kDefaultLevel;
+    bool cli_access_log_level_present = false;
     u32 opt_level = 2;  // JIT IR optimization level (0=low/fast-start .. 3=high)
 
     // Simple arg parsing: [port] [--shards N] [--no-pin] [--drain N]
@@ -337,9 +614,11 @@ int main(int argc, char** argv) {
     //   shadowing any user route on that path. Non-GET methods are unaffected.
     for (int i = 1; i < argc; i++) {
         if (is_all_digits(argv[i])) {
-            port = 0;
-            for (const char* p = argv[i]; *p >= '0' && *p <= '9'; p++)
-                port = port * 10 + static_cast<u16>(*p - '0');
+            if (!parse_cli_port(argv[i], cli_port)) {
+                write_str("CLI listen port must be between 0 and 65535\n");
+                return 1;
+            }
+            cli_port_present = true;
         } else if (argv[i][0] != '-') {
             // A bare positional that isn't a pure number is the .rut program
             // path (e.g. "404.rut"). Flag values are consumed via i++ in the
@@ -381,6 +660,7 @@ int main(int argc, char** argv) {
                 }
                 i++;
                 access_log_path = argv[i];
+                cli_access_log_path_present = true;
             } else if (str_eq(argv[i], "--tls-cert")) {
                 if (i + 1 >= argc || starts_with_dash_dash(argv[i + 1])) {
                     write_str("--tls-cert requires a path argument\n");
@@ -402,6 +682,7 @@ int main(int argc, char** argv) {
                 }
                 i++;
                 access_log_level = 0;
+                cli_access_log_level_present = true;
                 for (const char* p = argv[i]; *p >= '0' && *p <= '9'; p++)
                     access_log_level = access_log_level * 10 + static_cast<i32>(*p - '0');
             } else if (str_eq(argv[i], "--opt")) {
@@ -420,7 +701,10 @@ int main(int argc, char** argv) {
             }
         }
         if (str_eq(argv[i], "--no-pin")) pin_cpus = false;
-        if (str_eq(argv[i], "--access-log-compress")) access_log_compress = true;
+        if (str_eq(argv[i], "--access-log-compress")) {
+            access_log_compress = true;
+            cli_access_log_compress_present = true;
+        }
         if (str_eq(argv[i], "--h2")) offer_h2 = true;
         if (str_eq(argv[i], "--metrics")) serve_metrics = true;
         // Catch flags that require a value but appear as the last argument.
@@ -444,6 +728,7 @@ int main(int argc, char** argv) {
         for (char** e = environ; *e; e++) {
             if (str_eq(*e, kEnv)) {
                 access_log_compress = true;
+                environment_access_log_compress_present = true;
                 break;
             }
         }
@@ -508,11 +793,9 @@ int main(int argc, char** argv) {
             return 1;
         }
         route_config = &program.config;
-        // Loading is side-effect free with respect to live Cache state.
-        // This startup installation is the activation boundary (no shard
-        // exists yet); live reload must pair the same call with its config
-        // swap and RCU lifetime handoff.
-        activate_rut_program(program);
+        source_listener_present = program.has_listener;
+        if (source_listener_present) source_listener = program.listener;
+        source_access_log = program.access_log;
         write_str("Loaded program: ");
         write_str(config_path);
         write_str(" (opt O");
@@ -529,6 +812,122 @@ int main(int argc, char** argv) {
         write_str("\n");
         destroy_tls_server_context(tls_server);
         return 1;
+    }
+#endif
+
+    AccessLogStartupInputs access_log_inputs{};
+    access_log_inputs.source = source_access_log;
+    access_log_inputs.cli_path_present = cli_access_log_path_present;
+    access_log_inputs.cli_path = access_log_path;
+    access_log_inputs.cli_compression_present = cli_access_log_compress_present;
+    access_log_inputs.cli_compression = access_log_compress;
+    access_log_inputs.cli_level_present = cli_access_log_level_present;
+    access_log_inputs.cli_level = access_log_level;
+    access_log_inputs.environment_compression_present = environment_access_log_compress_present;
+    auto resolved_access_log = resolve_access_log_startup(access_log_inputs);
+    if (!resolved_access_log) {
+        switch (resolved_access_log.error()) {
+            case AccessLogStartupResolutionError::InvalidSourceSpec:
+                write_str("Invalid source accessLog metadata\n");
+                break;
+            case AccessLogStartupResolutionError::InvalidCliPath:
+                write_str("Invalid --access-log path metadata\n");
+                break;
+            case AccessLogStartupResolutionError::ConflictingCliPath:
+                write_str("Conflicting source accessLog and --access-log\n");
+                break;
+            case AccessLogStartupResolutionError::ConflictingCliCompression:
+                write_str("Conflicting source accessLog and --access-log-compress\n");
+                break;
+            case AccessLogStartupResolutionError::ConflictingCliLevel:
+                write_str("Conflicting source accessLog and --access-log-level\n");
+                break;
+            case AccessLogStartupResolutionError::ConflictingEnvironmentCompression:
+                write_str("Conflicting source accessLog and RUE_ACCESS_LOG_COMPRESS=1\n");
+                break;
+        }
+#ifdef RUT_ENABLE_JIT
+        program.destroy();
+#endif
+        destroy_tls_server_context(tls_server);
+        return 1;
+    }
+
+    SourceAccessLogFd source_live_fd;
+    if (resolved_access_log->mode == AccessLogStartupMode::SourceLive) {
+        auto source_fd = open_source_access_log(resolved_access_log->source_live);
+        if (!source_fd) {
+            write_str("Failed to open source accessLog: ");
+            write_str(resolved_access_log->source_live.path);
+            switch (source_fd.error().kind) {
+                case SourceAccessLogOpenErrorKind::InvalidSpec:
+                    write_str(" (invalid metadata)");
+                    break;
+                case SourceAccessLogOpenErrorKind::OpenFailed:
+                    write_str(" (open failed, errno=");
+                    write_u32(static_cast<u32>(source_fd.error().system_error));
+                    write_str(")");
+                    break;
+                case SourceAccessLogOpenErrorKind::StatFailed:
+                    write_str(" (fstat failed, errno=");
+                    write_u32(static_cast<u32>(source_fd.error().system_error));
+                    write_str(")");
+                    break;
+                case SourceAccessLogOpenErrorKind::NotRegularFile:
+                    write_str(" (target is not a regular file)");
+                    break;
+            }
+            write_str("\n");
+#ifdef RUT_ENABLE_JIT
+            program.destroy();
+#endif
+            destroy_tls_server_context(tls_server);
+            return 1;
+        }
+        source_live_fd = static_cast<SourceAccessLogFd&&>(source_fd.value());
+    }
+
+    access_log_path = resolved_access_log->mode == AccessLogStartupMode::LegacyCli
+                          ? resolved_access_log->legacy_path
+                          : nullptr;
+    if (resolved_access_log->mode == AccessLogStartupMode::LegacyCli) {
+        access_log_compress = resolved_access_log->legacy_compression;
+        access_log_level = resolved_access_log->legacy_level;
+    }
+
+    const ListenerTransport cli_transport =
+        tls_server != nullptr ? ListenerTransport::Tls : ListenerTransport::Cleartext;
+    auto resolved_listener = resolve_listener_spec(
+        source_listener_present, source_listener, cli_port_present, cli_port, cli_transport);
+    if (!resolved_listener) {
+        if (resolved_listener.error() == ListenerResolutionError::ConflictingTransport)
+            write_str("Conflicting source cleartext listener and CLI TLS\n");
+        else if (resolved_listener.error() == ListenerResolutionError::InvalidListenerSpec)
+            write_str("Invalid source or CLI listener metadata\n");
+        else
+            write_str("Conflicting source and CLI listen ports\n");
+#ifdef RUT_ENABLE_JIT
+        program.destroy();
+#endif
+        destroy_tls_server_context(tls_server);
+        return 1;
+    }
+    const ListenerSpec listener = resolved_listener.value();
+    if ((listener.transport == ListenerTransport::Tls) != (tls_server != nullptr)) {
+        write_str("Resolved listener transport does not match CLI TLS settings\n");
+#ifdef RUT_ENABLE_JIT
+        program.destroy();
+#endif
+        destroy_tls_server_context(tls_server);
+        return 1;
+    }
+#ifdef RUT_ENABLE_JIT
+    if (route_config != nullptr) {
+        // Loading is side-effect free with respect to live Cache state. This
+        // startup installation is the activation boundary (no shard exists
+        // yet); live reload must pair the same call with its config swap and
+        // RCU lifetime handoff.
+        activate_rut_program(program);
     }
 #endif
 
@@ -549,49 +948,54 @@ int main(int argc, char** argv) {
         }
     }
 
-    i32 rc = 0;
+    RunShardsOutcome outcome{};
+    SourceAccessLogFd* source_live_fd_ptr =
+        resolved_access_log->mode == AccessLogStartupMode::SourceLive ? &source_live_fd : nullptr;
     // io_uring now terminates TLS too (event-loop TlsEngine), so it is preferred
     // whenever available — TLS no longer forces the epoll fallback.
     if (detect_io_uring()) {
         write_str(tls_server ? "Backend: io_uring (TLS)\n" : "Backend: io_uring\n");
-        rc = run_shards<IoUringEventLoop>(port,
-                                          shard_count,
-                                          pin_cpus,
-                                          drain_secs,
-                                          pool_prealloc,
-                                          tls_server,
-                                          access_log_path,
-                                          access_log_compress,
-                                          access_log_level,
-                                          route_config,
-                                          serve_metrics);
-        if (rc != 0 && tls_server) {
+        outcome = run_shards<IoUringEventLoop>(listener,
+                                               shard_count,
+                                               pin_cpus,
+                                               drain_secs,
+                                               pool_prealloc,
+                                               tls_server,
+                                               access_log_path,
+                                               access_log_compress,
+                                               access_log_level,
+                                               source_live_fd_ptr,
+                                               route_config,
+                                               serve_metrics);
+        if (outcome.kind == RunShardsOutcomeKind::IoUringStartupFailure && tls_server) {
             write_str("Backend: io_uring TLS startup failed; falling back to epoll (TLS)\n");
-            rc = run_shards<EpollEventLoop>(port,
-                                            shard_count,
-                                            pin_cpus,
-                                            drain_secs,
-                                            pool_prealloc,
-                                            tls_server,
-                                            access_log_path,
-                                            access_log_compress,
-                                            access_log_level,
-                                            route_config,
-                                            serve_metrics);
+            outcome = run_shards<EpollEventLoop>(listener,
+                                                 shard_count,
+                                                 pin_cpus,
+                                                 drain_secs,
+                                                 pool_prealloc,
+                                                 tls_server,
+                                                 access_log_path,
+                                                 access_log_compress,
+                                                 access_log_level,
+                                                 source_live_fd_ptr,
+                                                 route_config,
+                                                 serve_metrics);
         }
     } else {
         write_str(tls_server ? "Backend: epoll (TLS)\n" : "Backend: epoll\n");
-        rc = run_shards<EpollEventLoop>(port,
-                                        shard_count,
-                                        pin_cpus,
-                                        drain_secs,
-                                        pool_prealloc,
-                                        tls_server,
-                                        access_log_path,
-                                        access_log_compress,
-                                        access_log_level,
-                                        route_config,
-                                        serve_metrics);
+        outcome = run_shards<EpollEventLoop>(listener,
+                                             shard_count,
+                                             pin_cpus,
+                                             drain_secs,
+                                             pool_prealloc,
+                                             tls_server,
+                                             access_log_path,
+                                             access_log_compress,
+                                             access_log_level,
+                                             source_live_fd_ptr,
+                                             route_config,
+                                             serve_metrics);
     }
     destroy_tls_server_context(tls_server);
 #ifdef RUT_ENABLE_JIT
@@ -599,5 +1003,5 @@ int main(int argc, char** argv) {
     // the RIR arena, and the source mapping.
     program.destroy();
 #endif
-    return rc;
+    return outcome.exit_code();
 }

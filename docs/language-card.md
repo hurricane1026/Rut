@@ -20,7 +20,7 @@ A `.rut` file is a flat list of top-level declarations (any order, no `main`):
 // PR #184 adds standalone examples; no tokenBucket helper is importable yet.
 import "middleware/auth.rut"                        // file stem = namespace: auth.jwtAuth
 
-listen :443                       // ⏳ ports (no top-level listen yet)
+listen :8080                      // one cleartext IPv4 wildcard listener
 tls "api.example.com", cert: env("CERT"), key: env("KEY")
 defaults { clientMaxBodySize: 10mb }
 
@@ -271,6 +271,7 @@ notify(ip) blacklist.add(ip)      // to owner shard by key hash (expr form;
 
 ```swift
 route GET "/health" { return 200 }
+route "/" { return 404 }                          // all methods (omit METHOD)
 route GET "/users/:id" {                         // capture: req.params.id
     return forward(userService)
 }
@@ -280,7 +281,9 @@ route POST "/form" { return 204 }                 // to this one route
 ```
 
 The shipped parser accepts repeated top-level `route METHOD "pattern"`
-declarations. The grouped `route { ... }` surface (middleware pattern
+declarations and the method-omitted form `route "pattern"`, which matches all
+HTTP methods. There is no `ANY` route keyword; write the omitted-method form.
+The grouped `route { ... }` surface (middleware pattern
 bindings, host/path groups, method unions, typed captures, expression entries,
 and `_` catch-all) is ⏳ target syntax and must not be emitted yet.
 
@@ -303,8 +306,59 @@ effects only. Full buffered body/status middleware remains ⏳.
 ## I/O
 
 ```swift
-// Proxy — the ONLY three forms
+// Proxy — the transparent forms plus the explicit header-only policy form
 return forward(users)                          // zero-copy, terminal
+return forward(users, request_policy: {
+    version: "HTTP/1.1", host: "upstream", connection: "omit",
+    strip_headers: ["Connection", "Keep-Alive", "TE", "Expect", "Upgrade"]
+})                                               // fixed header-only rebuild
+// Bounded response-policy serialization currently accepts only a cleartext
+// HTTP/1.1, origin-form, bodyless non-HEAD request and one final upstream
+// HTTP/1.1 response framed by exactly one Content-Length. Requests with a
+// body, TLS/H2, interim/Upgrade responses, chunking/trailers, close-delimited
+// framing, or unsupported status/header controls fail closed; transparent
+// forward(...) remains the default for all other routes.
+return forward(users, response_policy: {
+    version: "HTTP/1.1", framing: "content_length", connection: "request",
+    server: "nginx/1.29.7", date: "current", hide_headers: ["Date", "Server", "X-Pad"]
+})
+// Public HEAD suppression is an explicit paired source contract:
+return forward(users,
+    response_policy: {
+        version: "HTTP/1.1", framing: "content_length", connection: "request",
+        head_mode: "suppress_body", server: "nginx/1.29.7", date: "current",
+        hide_headers: ["Date", "Server", "X-Pad"]
+    },
+    failure_policy: {
+        version: "HTTP/1.1", status: 502, reason: "Bad Gateway",
+        content_type: "text/html", server: "nginx/1.29.7", date: "current",
+        connection: "request", head_mode: "suppress_body", body: b"<html>...</html>"
+    })
+// head_mode defaults to "reject". "suppress_body" is accepted in source only
+// when both policies select it; it remains bounded to cleartext H1.1, bodyless
+// HEAD with either no Connection field (the HTTP/1.1 default-keepalive shape)
+// or exactly one `Connection: close`, one IPv4 upstream, strict success, and
+// connect-establishment failure. While the broader failure rendezvous is not
+// part of this contract, timeout, malformed/incomplete/excess response, and
+// upload/send/recv failure close before emitting downstream bytes.
+// response_policy.connection: "keep_alive" requires a keep-alive downstream
+// request and emits keep-alive. "request" follows the parsed downstream
+// HTTP/1.1 intent, emitting keep-alive by default and close for
+// Connection: close. The strict response-domain limits above remain unchanged.
+// Valid downstream Upgrade requests are rejected by this policy; Upgrade
+// passthrough remains PARTIAL in the first slice.
+
+// Explicit request-derived redirects are fully specified (no defaults). The
+// first source slice accepts the generic Redirect terminator in the existing
+// terminal route/control forms; H1 cleartext serialization is bounded by the
+// policy/runtime domain above, while H2 and simulator execution remain
+// unsupported.
+return redirect({
+    scheme: "http", authority: "request_host", port: "actual_listener",
+    path: "static", query: "preserve_raw", date: "current", connection: "close",
+    status: 301, reason: "Moved Permanently", server: "nginx/1.29.7",
+    content_type: "text/html", target_path: "/api/", body: b"<p>moved</p>"
+})
 let resp = forward(users, buffered: true)      // buffered Response, then return resp
 return forward(users, streaming: true)         // large bodies, no buffering
 
@@ -445,7 +499,7 @@ admin:   stats() metrics() reload() upstream_status() config_dump() shard_stats(
 ## Minimal complete example
 
 ```swift
-listen :80                         // ⏳ (no top-level listen yet)
+listen :80                         // one cleartext IPv4 wildcard listener
 let users = upstream { "10.0.0.1:8080" }
 // A standalone Cache/GCRA implementation lives in examples/ratelimit.rut.
 // ⚠ Unmatched methods/paths currently use Rut's default 200 OK handler; there

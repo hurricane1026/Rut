@@ -24,14 +24,27 @@ enum class HttpVersion : u8 {
     Unknown = 255,
 };
 
+// Conservative request Transfer-Encoding framing classification.  This is
+// metadata only: proxy admission keeps its historical behaviour until #284.
+enum class RequestTransferEncoding : u8 {
+    Unparsed,
+    None,
+    FinalChunked,
+    Unsupported,
+};
+
 // A single HTTP header: name + value, both non-owning views into recv_buf.
 struct Header {
     Str name;
     Str value;
+    // Complete wire value after the colon, before semantic OWS trimming.
+    // `value` remains the historical trimmed semantic view.
+    Str raw_value;
 };
 
 // Maximum headers we store per request. Beyond this, parsing returns error.
 static constexpr u32 kMaxHeaders = 64;
+static_assert(kMaxHeaders < 255, "request Content-Length count must fit in u8");
 
 // Result of an incremental parse call.
 enum class ParseStatus : u8 {
@@ -54,16 +67,22 @@ struct ParsedRequest {
     Header headers[kMaxHeaders];
     u32 header_count;
 
-    u32 content_length;         // From Content-Length header, 0 if absent.
-    bool keep_alive;            // Derived from Connection header + HTTP version.
-    bool chunked;               // Transfer-Encoding: chunked
+    u32 content_length;  // From Content-Length header, 0 if absent.
+    bool keep_alive;     // Derived from Connection header + HTTP version.
+    bool chunked;        // Transfer-Encoding: chunked
+    RequestTransferEncoding transfer_encoding;
     bool has_content_length;    // True if Content-Length header was seen.
+    u8 content_length_count;    // Number of successfully parsed Content-Length fields.
     bool upgrade;               // Connection: upgrade token present
     bool has_upgrade_header;    // Upgrade: header present (both required for a
                                 // valid upgrade — Connection is hop-by-hop alone)
     bool upgrade_is_websocket;  // the Upgrade: token is specifically "websocket"
     bool connection_close;      // a Connection: close token was seen (sticky across
                                 // duplicate Connection fields — suppresses upgrade)
+    // Full raw request-target witness. Unlike path_canon and Connection::req_path,
+    // this is computed before any canonicalization or bounded copy, so a '#'
+    // after a long query remains visible to exact-route safety checks.
+    bool target_has_fragment;
 
     void reset() {
         method = HttpMethod::Unknown;
@@ -74,13 +93,28 @@ struct ParsedRequest {
         content_length = 0;
         keep_alive = false;
         chunked = false;
+        transfer_encoding = RequestTransferEncoding::Unparsed;
         has_content_length = false;
+        content_length_count = 0;
         upgrade = false;
         has_upgrade_header = false;
         upgrade_is_websocket = false;
         connection_close = false;
+        target_has_fragment = false;
     }
 };
+
+inline bool request_content_length_identity_is_valid(bool has_content_length,
+                                                     u8 content_length_count,
+                                                     u32 content_length) {
+    return has_content_length ? content_length_count != 0 && content_length_count <= kMaxHeaders
+                              : content_length_count == 0 && content_length == 0;
+}
+
+inline bool request_content_length_identity_is_valid(const ParsedRequest& request) {
+    return request_content_length_identity_is_valid(
+        request.has_content_length, request.content_length_count, request.content_length);
+}
 
 // Incremental HTTP/1.x request parser.
 //
@@ -109,11 +143,14 @@ struct HttpParser {
 // Parsed HTTP response — all Str fields point into the original recv buffer.
 // Zero-copy: no allocations, no memcpy for headers.
 struct ParsedResponse {
+    HttpVersion version;
+    Str reason;
     u16 status_code;  // 100-599
     u32 header_count;
     Header headers[kMaxHeaders];
     u32 content_length;
     bool has_content_length;
+    u8 content_length_count;
     bool chunked;
     bool keep_alive;        // HTTP/1.1 default true, HTTP/1.0 default false
     bool connection_close;  // explicit Connection: close
@@ -126,10 +163,13 @@ struct ParsedResponse {
     bool headers_truncated;
 
     void reset() {
+        version = HttpVersion::Unknown;
+        reason = {nullptr, 0};
         status_code = 0;
         header_count = 0;
         content_length = 0;
         has_content_length = false;
+        content_length_count = 0;
         chunked = false;
         keep_alive = true;  // HTTP/1.1 default
         connection_close = false;

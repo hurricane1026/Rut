@@ -147,6 +147,10 @@ add_library(rut_runtime STATIC
     runtime/ws_frame.cc
     runtime/ws_terminate.cc
     runtime/access_log.cc
+    runtime/access_log_live.cc
+    runtime/access_log_live_producer.cc
+    runtime/access_log_live_writer.cc
+    runtime/access_log_startup.cc
     runtime/traffic_capture.cc
     runtime/route_art.cc
     runtime/route_select.cc
@@ -185,6 +189,23 @@ add_library(rut_harness_core STATIC
 target_include_directories(rut_harness_core PUBLIC
     ${PROJECT_SOURCE_DIR}/include
 )
+
+# Standalone nginx compatibility frontend. It owns only nginx syntax and the
+# minimal semantic model; it deliberately does not depend on the Rut grammar or
+# runtime/lowering libraries.
+add_library(rut_nginx STATIC
+    nginx/parser.cc
+    nginx/converter.cc
+)
+target_include_directories(rut_nginx PUBLIC
+    ${PROJECT_SOURCE_DIR}/include
+)
+
+# Standalone bounded nginx-to-RUT conversion command. This deliberately links
+# only the nginx frontend so it cannot execute generated programs or open any
+# configured runtime resources.
+add_executable(rut-nginx-convert nginx/main.cc placement_new.cc)
+target_link_libraries(rut-nginx-convert rut_nginx)
 
 # SIMD source needs to find simd.h and char_tables.h via "simd.h" include
 target_include_directories(rut_runtime PRIVATE

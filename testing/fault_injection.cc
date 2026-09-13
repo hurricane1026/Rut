@@ -23,6 +23,46 @@ namespace {
 
 thread_local FaultState g_state{};
 
+struct HeldEpollEventState {
+    ScopedHeldEpollEvent* owner = nullptr;
+    int target_epoll_fd = -1;
+    bool capture_armed = false;
+    bool captured = false;
+    bool replay_armed = false;
+    bool replay_consumed = false;
+    HeldEpollEventError error = HeldEpollEventError::None;
+    struct epoll_event event{};
+};
+
+thread_local HeldEpollEventState g_held_epoll_event{};
+
+void poison_held_epoll_event(HeldEpollEventState& state, HeldEpollEventError error) {
+    state.capture_armed = false;
+    state.replay_armed = false;
+    state.error = error;
+}
+
+struct HeldPositiveWriteState {
+    pthread_mutex_t mutex = PTHREAD_MUTEX_INITIALIZER;
+    pthread_cond_t condition = PTHREAD_COND_INITIALIZER;
+    ScopedHeldPositiveWrite* owner = nullptr;
+    int target_fd = -1;
+    size_t strict_prefix = 0u;
+    bool prefix_consumed = false;
+    bool held = false;
+    bool released = false;
+    bool consumed = false;
+    HeldPositiveWriteError error = HeldPositiveWriteError::None;
+};
+
+HeldPositiveWriteState g_held_positive_write{};
+
+void poison_held_positive_write(HeldPositiveWriteState& state, HeldPositiveWriteError error) {
+    state.error = error;
+    state.released = true;
+    pthread_cond_broadcast(&state.condition);
+}
+
 using MmapFn = void* (*)(void*, size_t, int, int, int, off_t);
 using MprotectFn = int (*)(void*, size_t, int);
 using SocketFn = int (*)(int, int, int);
@@ -383,6 +423,16 @@ ScopedFakeSocket::ScopedFakeSocket(int fd) {
     g_state.fake_socket_fd = fd;
 }
 
+ScopedSocketFailure::ScopedSocketFailure(int failures) {
+    g_state.socket_failures = failures;
+}
+
+ScopedIoUringSubmitFailure::ScopedIoUringSubmitFailure(int connect_failures,
+                                                       int staged_send_failures) {
+    g_state.iouring_connect_submit_failures = connect_failures;
+    g_state.iouring_staged_send_submit_failures = staged_send_failures;
+}
+
 ScopedRecvData::ScopedRecvData(int fd, const char* data, size_t len, int eintrs) {
     g_state.recv_fd = fd;
     g_state.recv_eintrs = eintrs;
@@ -404,8 +454,16 @@ int ScopedIoFault::remaining_read_eintrs() const {
     return g_read_eintr_count.load(std::memory_order_relaxed);
 }
 
+int ScopedIoFault::remaining_write_eagains() const {
+    return g_write_eagain_count.load(std::memory_order_relaxed);
+}
+
 int ScopedIoFault::remaining_write_eintrs() const {
     return g_write_eintr_count.load(std::memory_order_relaxed);
+}
+
+int ScopedIoFault::remaining_write_fatals() const {
+    return g_write_fatal_count.load(std::memory_order_relaxed);
 }
 
 int ScopedIoFault::remaining_send_eagains() const {
@@ -414,6 +472,139 @@ int ScopedIoFault::remaining_send_eagains() const {
 
 int ScopedIoFault::remaining_connect_failures() const {
     return g_connect_fail_count.load(std::memory_order_relaxed);
+}
+
+ScopedHeldPositiveWrite::ScopedHeldPositiveWrite(int target_fd, size_t strict_prefix) {
+    auto& state = g_held_positive_write;
+    pthread_mutex_lock(&state.mutex);
+    if (target_fd < 0) {
+        local_error_ = HeldPositiveWriteError::InvalidTargetFd;
+    } else if (strict_prefix == 0u) {
+        local_error_ = HeldPositiveWriteError::InvalidPrefixLength;
+    } else if (state.owner != nullptr) {
+        local_error_ = HeldPositiveWriteError::AlreadyOwned;
+    } else {
+        state.owner = this;
+        state.target_fd = target_fd;
+        state.strict_prefix = strict_prefix;
+        state.prefix_consumed = false;
+        state.held = false;
+        state.released = false;
+        state.consumed = false;
+        state.error = HeldPositiveWriteError::None;
+    }
+    pthread_mutex_unlock(&state.mutex);
+}
+
+ScopedHeldPositiveWrite::~ScopedHeldPositiveWrite() {
+    auto& state = g_held_positive_write;
+    pthread_mutex_lock(&state.mutex);
+    if (state.owner == this) {
+        state.released = true;
+        pthread_cond_broadcast(&state.condition);
+        while (state.held && !state.consumed) pthread_cond_wait(&state.condition, &state.mutex);
+        state.owner = nullptr;
+        state.target_fd = -1;
+        state.strict_prefix = 0u;
+        state.prefix_consumed = false;
+        state.held = false;
+        state.released = false;
+        state.consumed = false;
+        state.error = HeldPositiveWriteError::None;
+    }
+    pthread_mutex_unlock(&state.mutex);
+}
+
+bool ScopedHeldPositiveWrite::wait_until_held() {
+    auto& state = g_held_positive_write;
+    pthread_mutex_lock(&state.mutex);
+    while (state.owner == this && !state.held && state.error == HeldPositiveWriteError::None)
+        pthread_cond_wait(&state.condition, &state.mutex);
+    const bool result =
+        state.owner == this && state.held && state.error == HeldPositiveWriteError::None;
+    pthread_mutex_unlock(&state.mutex);
+    return result;
+}
+
+bool ScopedHeldPositiveWrite::release() {
+    auto& state = g_held_positive_write;
+    pthread_mutex_lock(&state.mutex);
+    if (state.owner != this || state.error != HeldPositiveWriteError::None || !state.held) {
+        pthread_mutex_unlock(&state.mutex);
+        return false;
+    }
+    if (state.released) {
+        poison_held_positive_write(state, HeldPositiveWriteError::DuplicateRelease);
+        pthread_mutex_unlock(&state.mutex);
+        return false;
+    }
+    state.released = true;
+    pthread_cond_broadcast(&state.condition);
+    pthread_mutex_unlock(&state.mutex);
+    return true;
+}
+
+bool ScopedHeldPositiveWrite::wait_until_consumed() {
+    auto& state = g_held_positive_write;
+    pthread_mutex_lock(&state.mutex);
+    while (state.owner == this && !state.consumed && state.error == HeldPositiveWriteError::None)
+        pthread_cond_wait(&state.condition, &state.mutex);
+    const bool result =
+        state.owner == this && state.consumed && state.error == HeldPositiveWriteError::None;
+    pthread_mutex_unlock(&state.mutex);
+    return result;
+}
+
+bool ScopedHeldPositiveWrite::owns_state() const {
+    auto& state = g_held_positive_write;
+    pthread_mutex_lock(&state.mutex);
+    const bool result = state.owner == this;
+    pthread_mutex_unlock(&state.mutex);
+    return result;
+}
+
+bool ScopedHeldPositiveWrite::prefix_consumed() const {
+    auto& state = g_held_positive_write;
+    pthread_mutex_lock(&state.mutex);
+    const bool result = state.owner == this && state.prefix_consumed;
+    pthread_mutex_unlock(&state.mutex);
+    return result;
+}
+
+bool ScopedHeldPositiveWrite::held() const {
+    auto& state = g_held_positive_write;
+    pthread_mutex_lock(&state.mutex);
+    const bool result = state.owner == this && state.held;
+    pthread_mutex_unlock(&state.mutex);
+    return result;
+}
+
+bool ScopedHeldPositiveWrite::released() const {
+    auto& state = g_held_positive_write;
+    pthread_mutex_lock(&state.mutex);
+    const bool result = state.owner == this && state.released;
+    pthread_mutex_unlock(&state.mutex);
+    return result;
+}
+
+bool ScopedHeldPositiveWrite::consumed() const {
+    auto& state = g_held_positive_write;
+    pthread_mutex_lock(&state.mutex);
+    const bool result = state.owner == this && state.consumed;
+    pthread_mutex_unlock(&state.mutex);
+    return result;
+}
+
+bool ScopedHeldPositiveWrite::failed_closed() const {
+    return error() != HeldPositiveWriteError::None;
+}
+
+HeldPositiveWriteError ScopedHeldPositiveWrite::error() const {
+    auto& state = g_held_positive_write;
+    pthread_mutex_lock(&state.mutex);
+    const HeldPositiveWriteError result = state.owner == this ? state.error : local_error_;
+    pthread_mutex_unlock(&state.mutex);
+    return result;
 }
 
 ScopedSyscallFault::ScopedSyscallFault(const SyscallFaultConfig& config)
@@ -425,7 +616,103 @@ ScopedSyscallFault::~ScopedSyscallFault() {
     apply_syscall_fault_config(previous_);
 }
 
+ScopedHeldEpollEvent::ScopedHeldEpollEvent(int target_epoll_fd) {
+    if (target_epoll_fd < 0) {
+        local_error_ = HeldEpollEventError::InvalidTargetFd;
+        return;
+    }
+    if (g_held_epoll_event.owner != nullptr) {
+        local_error_ = HeldEpollEventError::AlreadyOwned;
+        return;
+    }
+    g_held_epoll_event = HeldEpollEventState{};
+    g_held_epoll_event.owner = this;
+    g_held_epoll_event.target_epoll_fd = target_epoll_fd;
+}
+
+ScopedHeldEpollEvent::~ScopedHeldEpollEvent() {
+    if (g_held_epoll_event.owner == this) g_held_epoll_event = HeldEpollEventState{};
+}
+
+bool ScopedHeldEpollEvent::arm_capture_once() {
+    if (g_held_epoll_event.owner != this) return false;
+    if (g_held_epoll_event.error != HeldEpollEventError::None) return false;
+    if (g_held_epoll_event.capture_armed || g_held_epoll_event.captured) {
+        poison_held_epoll_event(g_held_epoll_event, HeldEpollEventError::DuplicateCaptureArm);
+        return false;
+    }
+    g_held_epoll_event.capture_armed = true;
+    return true;
+}
+
+bool ScopedHeldEpollEvent::replay_once() {
+    if (g_held_epoll_event.owner != this) return false;
+    if (g_held_epoll_event.error != HeldEpollEventError::None) return false;
+    if (g_held_epoll_event.replay_armed || g_held_epoll_event.replay_consumed) {
+        poison_held_epoll_event(g_held_epoll_event, HeldEpollEventError::DuplicateReplayArm);
+        return false;
+    }
+    if (!g_held_epoll_event.captured) {
+        poison_held_epoll_event(g_held_epoll_event, HeldEpollEventError::ReplayWithoutCapture);
+        return false;
+    }
+    g_held_epoll_event.replay_armed = true;
+    return true;
+}
+
+bool ScopedHeldEpollEvent::owns_state() const {
+    return g_held_epoll_event.owner == this;
+}
+
+bool ScopedHeldEpollEvent::capture_armed() const {
+    return owns_state() && g_held_epoll_event.capture_armed;
+}
+
+bool ScopedHeldEpollEvent::captured() const {
+    return owns_state() && g_held_epoll_event.captured;
+}
+
+bool ScopedHeldEpollEvent::replay_armed() const {
+    return owns_state() && g_held_epoll_event.replay_armed;
+}
+
+bool ScopedHeldEpollEvent::replay_consumed() const {
+    return owns_state() && g_held_epoll_event.replay_consumed;
+}
+
+bool ScopedHeldEpollEvent::failed_closed() const {
+    return error() != HeldEpollEventError::None;
+}
+
+HeldEpollEventError ScopedHeldEpollEvent::error() const {
+    return owns_state() ? g_held_epoll_event.error : local_error_;
+}
+
+uint32_t ScopedHeldEpollEvent::captured_events() const {
+    return captured() ? g_held_epoll_event.event.events : 0;
+}
+
+uint64_t ScopedHeldEpollEvent::captured_data() const {
+    return captured() ? g_held_epoll_event.event.data.u64 : 0;
+}
+
 }  // namespace rut::test_fault
+
+namespace rut::detail {
+
+bool test_fail_iouring_submit(u8 operation) noexcept {
+    auto& fault = test_fault::state();
+    int* remaining = nullptr;
+    if (operation == 1)
+        remaining = &fault.iouring_connect_submit_failures;
+    else if (operation == 2)
+        remaining = &fault.iouring_staged_send_submit_failures;
+    if (remaining == nullptr || *remaining <= 0) return false;
+    --*remaining;
+    return true;
+}
+
+}  // namespace rut::detail
 
 extern "C" void* mmap(void* addr, size_t len, int prot, int flags, int fd, off_t offset) {
     pthread_once(&rut::test_fault::g_syscall_once, rut::test_fault::resolve_syscalls);
@@ -458,6 +745,11 @@ extern "C" int mprotect(void* addr, size_t len, int prot) {
 extern "C" int socket(int domain, int type, int protocol) {
     pthread_once(&rut::test_fault::g_syscall_once, rut::test_fault::resolve_syscalls);
     auto& state = rut::test_fault::state();
+    if (state.socket_failures > 0 && domain == AF_INET && (type & SOCK_STREAM) == SOCK_STREAM) {
+        --state.socket_failures;
+        errno = EMFILE;
+        return -1;
+    }
     if (state.fake_socket_fd >= 0 && domain == AF_INET && (type & SOCK_STREAM) == SOCK_STREAM) {
         int fd = state.fake_socket_fd;
         state.fake_socket_fd = -1;
@@ -541,6 +833,61 @@ extern "C" ssize_t read(int fd, void* buf, size_t count) {
 
 extern "C" ssize_t write(int fd, const void* buf, size_t count) {
     pthread_once(&rut::test_fault::g_syscall_once, rut::test_fault::resolve_syscalls);
+    auto& held = rut::test_fault::g_held_positive_write;
+    pthread_mutex_lock(&held.mutex);
+    const bool matches_held_write = held.owner != nullptr && fd == held.target_fd &&
+                                    held.error == rut::test_fault::HeldPositiveWriteError::None;
+    if (matches_held_write && !held.prefix_consumed) {
+        if (count <= held.strict_prefix) {
+            rut::test_fault::poison_held_positive_write(
+                held, rut::test_fault::HeldPositiveWriteError::InvalidWriteLength);
+            pthread_mutex_unlock(&held.mutex);
+            errno = EINVAL;
+            return -1;
+        }
+        const size_t prefix = held.strict_prefix;
+        pthread_mutex_unlock(&held.mutex);
+        const ssize_t result = rut::test_fault::g_real_write(fd, buf, prefix);
+        pthread_mutex_lock(&held.mutex);
+        if (held.owner != nullptr && fd == held.target_fd) {
+            if (result == static_cast<ssize_t>(prefix)) {
+                held.prefix_consumed = true;
+                pthread_cond_broadcast(&held.condition);
+            } else {
+                rut::test_fault::poison_held_positive_write(
+                    held, rut::test_fault::HeldPositiveWriteError::PrefixWriteFailed);
+            }
+        }
+        pthread_mutex_unlock(&held.mutex);
+        return result;
+    }
+    if (matches_held_write && held.prefix_consumed && !held.consumed) {
+        held.held = true;
+        pthread_cond_broadcast(&held.condition);
+        while (!held.released && held.error == rut::test_fault::HeldPositiveWriteError::None)
+            pthread_cond_wait(&held.condition, &held.mutex);
+        const bool proceed = held.error == rut::test_fault::HeldPositiveWriteError::None;
+        if (!proceed) {
+            held.held = false;
+            held.consumed = true;
+            pthread_cond_broadcast(&held.condition);
+        }
+        pthread_mutex_unlock(&held.mutex);
+        if (!proceed) {
+            errno = EIO;
+            return -1;
+        }
+        const ssize_t result = rut::test_fault::g_real_write(fd, buf, count);
+        pthread_mutex_lock(&held.mutex);
+        if (held.owner != nullptr && fd == held.target_fd) {
+            held.held = false;
+            held.consumed = true;
+            pthread_cond_broadcast(&held.condition);
+        }
+        pthread_mutex_unlock(&held.mutex);
+        return result;
+    }
+    pthread_mutex_unlock(&held.mutex);
     if (rut::test_fault::io_fd_matches(fd)) {
         if (rut::test_fault::consume_fault(rut::test_fault::g_write_eagain_count)) {
             errno = EAGAIN;
@@ -687,6 +1034,21 @@ extern "C" int epoll_ctl(int epfd, int op, int fd, struct epoll_event* event) {
 
 extern "C" int epoll_wait(int epfd, struct epoll_event* events, int maxevents, int timeout) {
     pthread_once(&rut::test_fault::g_syscall_once, rut::test_fault::resolve_syscalls);
+    auto& held = rut::test_fault::g_held_epoll_event;
+    const bool hold_operation_armed = held.error == rut::test_fault::HeldEpollEventError::None &&
+                                      (held.capture_armed || held.replay_armed);
+    if (held.owner != nullptr && hold_operation_armed) {
+        if (epfd != held.target_epoll_fd) {
+            rut::test_fault::poison_held_epoll_event(
+                held, rut::test_fault::HeldEpollEventError::WrongEpollFd);
+        } else if (rut::test_fault::is_null_ptr(events) || maxevents != 1) {
+            rut::test_fault::poison_held_epoll_event(
+                held, rut::test_fault::HeldEpollEventError::InvalidWaitOutput);
+        }
+    }
+    // Preserve the pre-existing fault-injection precedence: an injected wait
+    // result happens before either a legal replay or the real syscall and does
+    // not consume the armed one-shot operation.
     if (rut::test_fault::consume_fault(rut::test_fault::g_epoll_wait_eintr_count)) {
         errno = EINTR;
         return -1;
@@ -695,11 +1057,30 @@ extern "C" int epoll_wait(int epfd, struct epoll_event* events, int maxevents, i
         errno = rut::test_fault::fail_errno_or_default(rut::test_fault::g_epoll_wait_errno, EINVAL);
         return -1;
     }
+    if (held.owner != nullptr && held.error == rut::test_fault::HeldEpollEventError::None &&
+        held.replay_armed && epfd == held.target_epoll_fd &&
+        !rut::test_fault::is_null_ptr(events) && maxevents == 1) {
+        events[0] = held.event;
+        held.replay_armed = false;
+        held.replay_consumed = true;
+        return 1;
+    }
     if (!rut::test_fault::g_real_epoll_wait) {
         errno = ENOSYS;
         return -1;
     }
-    return rut::test_fault::g_real_epoll_wait(epfd, events, maxevents, timeout);
+    const int result = rut::test_fault::g_real_epoll_wait(epfd, events, maxevents, timeout);
+    // maxevents == 1 is a capture precondition, so a multi-record real result
+    // is impossible on this path. A zero result leaves capture armed for retry.
+    if (held.owner != nullptr && held.error == rut::test_fault::HeldEpollEventError::None &&
+        held.capture_armed && epfd == held.target_epoll_fd &&
+        !rut::test_fault::is_null_ptr(events) && maxevents == 1 && result == 1) {
+        held.event = events[0];
+        held.capture_armed = false;
+        held.captured = true;
+        return 0;
+    }
+    return result;
 }
 
 extern "C" int timerfd_create(int clockid, int flags) {

@@ -42,13 +42,25 @@ struct EpollBackend {
     i32 downstream_fd_map[kMaxFdMap];  // downstream (client) fd per conn_id
     i32 upstream_fd_map[kMaxFdMap];    // upstream (origin) fd per conn_id
 
-    // Pending synthetic completion events (from immediate sends). FIXED ring:
-    // queue_pending_completion drops past kPendingCap, so producers (incl. the
-    // health-probe sweep) must bound how many synchronous completions they emit
-    // per dispatch — see EventLoopCRTP::sweep_health_probes.
+    // Epoll-owned upstream episode ownership. Zero means no active episode;
+    // this table is deliberately independent from Connection::upstream_episode
+    // so the lifecycle foundation can be introduced before production owners
+    // start calling it. kUpstreamEpisodeExhausted is outside the 24-bit token
+    // domain and is never passed to an epoll registration.
+    static constexpr u32 kUpstreamEpisodeExhausted = kInvalidUpstreamEventEpisode;
+    u32 active_upstream_episode[kMaxFdMap];
+
+    // Pending synthetic completion events (from immediate sends). FIXED LIFO
+    // stack. Scoped producers preflight this capacity before their synchronous
+    // syscall; they are single-threaded and non-reentrant, so one entry check
+    // reserves the only completion slot that operation can need.
     static constexpr u32 kPendingCap = 64;
+    static constexpr u32 kPendingBurstQuota = 8;
     IoEvent pending_completions[kPendingCap];
     u32 pending_count = 0;
+    // Consecutive synthetic completions returned by wait(); once the quota is
+    // reached, wait() performs one nonblocking kernel probe before popping.
+    u32 pending_streak = 0;
 
     // Outstanding partial-send state per connection.
     // When add_send() can't complete immediately (partial write or EAGAIN),
@@ -64,6 +76,7 @@ struct EpollBackend {
         IoEventType type;
         bool tls;
         u32 tls_wait_events;
+        u32 upstream_episode;  // 0 for downstream; submission episode upstream
     };
     SendState send_state[kMaxFdMap];
     SendState upstream_send_state[kMaxFdMap];
@@ -78,7 +91,7 @@ struct EpollBackend {
 
     // Register fd for EPOLLIN — actual recv happens inside wait().
     bool add_recv(i32 fd, u32 conn_id);
-    bool add_recv_upstream(i32 fd, u32 conn_id);
+    bool add_recv_upstream(i32 fd, u32 conn_id, u32 upstream_episode);
 
     // Suspend EPOLLIN on the downstream fd for conn_id. Used when a JIT
     // handler yields so client bytes arriving mid-wait don't spin the
@@ -93,7 +106,9 @@ struct EpollBackend {
     // pending upstream data would otherwise keep firing UpstreamRecv and drive the
     // pipeline past the pause. submit_recv_upstream re-arms EPOLLIN on resume.
     // No-op if the conn_id has no registered upstream fd.
-    void pause_upstream_recv(u32 conn_id, bool preserve_send_interest = false);
+    void pause_upstream_recv(u32 conn_id,
+                             u32 upstream_episode,
+                             bool preserve_send_interest = false);
 
     // Stop polling a tunnel fd's READ side (drop EPOLLIN/EPOLLRDHUP so a
     // level-triggered half-close can't re-fire) while PRESERVING any in-flight
@@ -101,7 +116,7 @@ struct EpollBackend {
     // pending the fd is removed from the epoll set entirely. Used by the
     // nginx-style drain-then-close path. upstream selects the upstream fd /
     // upstream_send_state; otherwise the downstream fd / send_state.
-    void quiesce_recv(u32 conn_id, bool upstream);
+    void quiesce_recv(u32 conn_id, bool upstream, u32 upstream_episode);
 
     // Drop any partial-send bookkeeping for conn_id. MUST be called on close so
     // a leftover send_state entry (a partial send that was still in flight when
@@ -111,13 +126,34 @@ struct EpollBackend {
     // and send from the stale ss.src pointer into the new connection's fd.
     void clear_send_state(u32 conn_id);
 
+    // Strict epoll-owned lifecycle boundary. begin records ownership only
+    // when the fd map and upstream partial-send state are detached. retire
+    // requires the expected token to remain current and detached; on success
+    // it clears ownership and advances conn.upstream_episode. These helpers
+    // are invoked by the owning connect, retry, pool, health, and close paths;
+    // backend registration itself remains episode-neutral.
+    bool begin_upstream_episode(u32 conn_id, u32 episode);
+    bool retire_upstream_episode_after_detach(Connection& conn, u32 expected_episode);
+
+    // Detach the currently owned upstream transport and retire its episode.
+    // When detached_fd is supplied, ownership of the fd is returned only after
+    // a successful DEL (or already-detached ENOENT) and retire; any failure
+    // closes it instead.
+    bool detach_upstream(Connection& conn, i32* detached_fd = nullptr);
+
+    // Quarantine ownership when a live epoll connection slot is released.
+    // Inactive ownership remains zero; any live or malformed nonzero owner is
+    // permanently exhausted so a reused conn_id cannot accept an old token.
+    // Backend init/shutdown clear the whole table as part of backend rebuild.
+    void quarantine_upstream_episode_on_slot_release(u32 conn_id);
+
     // Try immediate send. If partial/EAGAIN, register EPOLLOUT.
     bool add_send(i32 fd, u32 conn_id, const u8* buf, u32 len);
-    bool add_send_upstream(i32 fd, u32 conn_id, const u8* buf, u32 len);
+    bool add_send_upstream(i32 fd, u32 conn_id, const u8* buf, u32 len, u32 upstream_episode);
     bool add_send_tls(Connection& c, const u8* buf, u32 len);
 
     // Register fd for connect completion (EPOLLOUT).
-    bool add_connect(i32 fd, u32 conn_id, const void* addr, u32 addr_len);
+    bool add_connect(i32 fd, u32 conn_id, const void* addr, u32 addr_len, u32 upstream_episode);
 
     // Remove fd from epoll.
     u32 cancel(i32 fd,
@@ -146,8 +182,8 @@ struct EpollBackend {
 
 private:
     // Encode conn_id + type into epoll_event.data.u64
-    static u64 encode_data(u32 conn_id, IoEventType type);
-    static void decode_data(u64 data, u32& conn_id, IoEventType& type);
+    static u64 encode_data(u32 conn_id, IoEventType type, u32 upstream_episode);
+    static bool decode_data(u64 data, u32& conn_id, IoEventType& type, u32& upstream_episode);
 };
 
 }  // namespace rut

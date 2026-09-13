@@ -3,6 +3,7 @@
 #include "core/expected.h"
 #include "rut/common/types.h"
 #include "rut/runtime/access_log.h"
+#include "rut/runtime/access_log_live_producer.h"
 #include "rut/runtime/callbacks.h"
 #include "rut/runtime/connection.h"
 #include "rut/runtime/drain.h"
@@ -10,6 +11,7 @@
 #include "rut/runtime/io_backend.h"
 #include "rut/runtime/io_event.h"
 #include "rut/runtime/jit_dispatch.h"  // jit::HandlerCtx for fire_due_timers
+#include "rut/runtime/listener_context.h"
 #include "rut/runtime/metrics.h"
 #include "rut/runtime/rate_limit.h"
 #include "rut/runtime/route_table.h"  // RouteConfig::kMaxTimers / timers[] for fire_due_timers
@@ -48,6 +50,10 @@ class EventLoopCRTP {
     Derived& self() { return static_cast<Derived&>(*this); }
 
 public:
+    // Set once after the kernel listener has been bound and before shard
+    // threads accept connections. It is copied into each allocated connection.
+    ListenerContext listener_context{};
+
     bool submit_recv(Connection& c) { return self().submit_recv_impl(c); }
     bool submit_send(Connection& c, const u8* buf, u32 len) {
         return self().submit_send_impl(c, buf, len);
@@ -101,6 +107,7 @@ public:
     // Called from each concrete EventLoop's dispatch() after timer refresh.
     // Centralizes all "unexpected event" handling in one place.
     void dispatch_event(Connection& conn, const IoEvent& ev) {
+        if (io_event_is_tagged_stale(ev, conn.upstream_episode)) return;
         switch (ev.type) {
             case IoEventType::Recv:
                 if (conn.on_recv) {
@@ -134,6 +141,7 @@ public:
             case IoEventType::Accept:
             case IoEventType::Timeout:
             case IoEventType::HandlerTimer:
+            case IoEventType::ResponseReadTimer:
             case IoEventType::Count:
                 break;
         }
@@ -143,7 +151,7 @@ public:
     // Centralizes drain/EOF/ENOBUFS logic — written once, correct everywhere.
     void handle_unhandled_recv(Connection& conn, const IoEvent& ev) {
         if (ev.result > 0) {
-            if (!conn.keep_alive) conn.recv_buf.reset();
+            if (!conn.keep_alive) conn.reset_request_receive_buffer();
             // Re-arm only when io_uring multishot terminated (!recv_armed).
             // On epoll, recv_armed is always false but EPOLLIN is already
             // armed via EPOLLIN|EPOLLOUT from add_send — calling submit_recv
@@ -426,6 +434,7 @@ public:
 
     // Per-shard access log ring. Set by Shard before run(). Null = no logging.
     AccessLogRing* access_log = nullptr;
+    SourceLiveAccessLogProducer* live_access_log = nullptr;
 
     // Per-shard traffic capture ring. Use set_capture() to change.
     struct CaptureRing* capture_ring = nullptr;
@@ -469,12 +478,14 @@ public:
     core::Expected<void, Error> init(u32 id, i32 lfd, u32 pool_prealloc = 0) {
         shard_id = id;
         listen_fd = lfd;
+        this->listener_context = {};
         running_.store(true, std::memory_order_relaxed);
         draining_.store(false, std::memory_order_relaxed);
         drain_start_.store(0, std::memory_order_relaxed);
         drain_period_.store(0, std::memory_order_relaxed);
         keepalive_timeout = kDefaultKeepaliveTimeout;
         upstream_timeout = kDefaultUpstreamTimeout;
+        live_access_log = nullptr;
         capture_ring = nullptr;
         capture_region_ = nullptr;
         config_ptr = nullptr;
@@ -591,9 +602,20 @@ public:
     // Called inline from dispatch() when a stale CQE completes reclamation,
     // so a later Accept in the same batch can reuse the slot immediately.
     void reclaim_slot(u32 cid) {
+        if (cid >= kMaxConns || !conns[cid].response_read_timer_owner_is_neutral()) return;
+        bool was_pending = false;
+        for (u32 i = 0; i < pending_free_count; i++) {
+            if (pending_free[i] == cid) {
+                pending_free[i] = pending_free[--pending_free_count];
+                was_pending = true;
+                break;
+            }
+        }
+        if (!was_pending) return;
         if (conns[cid].recv_slice) {
             pool.free(conns[cid].recv_slice);
             conns[cid].recv_slice = nullptr;
+            conns[cid].recv_slice_capacity = 0;
         }
         if (conns[cid].send_slice) {
             pool.free(conns[cid].send_slice);
@@ -608,27 +630,20 @@ public:
             conns[cid].response_header_slice = nullptr;
         }
         free_stack[free_top++] = cid;
-        // Remove from pending_free (swap with last element).
-        for (u32 i = 0; i < pending_free_count; i++) {
-            if (pending_free[i] == cid) {
-                pending_free[i] = pending_free[--pending_free_count];
-                break;
-            }
-        }
     }
 
     // CQE-driven reclamation: only reclaim slots whose in-flight I/O has
-    // fully completed (pending_ops == 0). Slots still waiting for CQEs
-    // remain in pending_free until a future dispatch() decrements their
-    // pending_ops to 0.
+    // fully completed and the precise response-read timer has no kernel owner.
+    // Slots still waiting for either class remain in pending_free.
     void reclaim_pending() {
         u32 remaining = 0;
         for (u32 i = 0; i < pending_free_count; i++) {
             u32 cid = pending_free[i];
-            if (conns[cid].pending_ops == 0) {
+            if (conns[cid].pending_ops == 0 && conns[cid].response_read_timer_owner_is_neutral()) {
                 if (conns[cid].recv_slice) {
                     pool.free(conns[cid].recv_slice);
                     conns[cid].recv_slice = nullptr;
+                    conns[cid].recv_slice_capacity = 0;
                 }
                 if (conns[cid].send_slice) {
                     pool.free(conns[cid].send_slice);
@@ -741,9 +756,9 @@ public:
         conns[id].reset();
         conns[id].id = id;
         conns[id].shard_id = static_cast<u8>(shard_id);
-        conns[id].recv_slice = rs;
+        conns[id].listener_context = this->listener_context;
+        conns[id].bind_request_receive_buffer(rs, SlicePool::kSliceSize);
         conns[id].send_slice = ss;
-        conns[id].recv_buf.bind(rs, SlicePool::kSliceSize);
         conns[id].send_buf.bind(ss, SlicePool::kSliceSize);
         if (capture_region_)
             conns[id].capture_buf = capture_region_ + static_cast<u64>(id) * kCaptureSliceSize;
@@ -764,11 +779,9 @@ public:
             c.ws_u2c_msg = nullptr;
         }
         if constexpr (Backend::kAsyncIo) {
-            // Async backend (io_uring): if no ops are in flight (the close
-            // was triggered by the final CQE), reclaim immediately — no
-            // need to defer. This avoids blocking alloc_conn at saturation
-            // when a close and accept arrive in the same dispatch batch.
-            if (c.pending_ops == 0) {
+            // Async backend (io_uring): reclaim immediately only when ordinary
+            // ops and the separately-accounted response-read timer are drained.
+            if (c.pending_ops == 0 && c.response_read_timer_owner_is_neutral()) {
                 if (c.recv_slice) pool.free(c.recv_slice);
                 if (c.send_slice) pool.free(c.send_slice);
                 if (c.upstream_recv_slice) pool.free(c.upstream_recv_slice);
@@ -777,8 +790,7 @@ public:
                 free_stack[free_top++] = cid;
                 return;
             }
-            // Ops still in flight: defer until CQEs arrive and pending_ops
-            // reaches 0 in reclaim_pending().
+            // Kernel ownership remains: defer until its CQEs drain.
             u8* rs = c.recv_slice;
             u8* ss = c.send_slice;
             u8* us = c.upstream_recv_slice;
@@ -786,6 +798,7 @@ public:
             u32 ops = c.pending_ops;
             c.reset();
             conns[cid].recv_slice = rs;
+            conns[cid].recv_slice_capacity = rs != nullptr ? SlicePool::kSliceSize : 0;
             conns[cid].send_slice = ss;
             conns[cid].upstream_recv_slice = us;
             conns[cid].response_header_slice = hs;
@@ -836,14 +849,34 @@ public:
         return false;
     }
     bool submit_connect_impl(Connection& c, const void* addr, u32 addr_len) {
-        if (backend.add_connect(c.upstream_fd, c.id, addr, addr_len)) {
+        const bool submitted = [&] {
+            if constexpr (requires {
+                              backend.add_connect(
+                                  c.upstream_fd, c.id, addr, addr_len, c.upstream_episode);
+                          }) {
+                return backend.add_connect(c.upstream_fd, c.id, addr, addr_len, c.upstream_episode);
+            } else {
+                return backend.add_connect(c.upstream_fd, c.id, addr, addr_len);
+            }
+        }();
+        if (submitted) {
             if constexpr (Backend::kAsyncIo) c.pending_ops++;
             return true;
         }
         return false;
     }
     bool submit_send_upstream_impl(Connection& c, const u8* buf, u32 len) {
-        if (backend.add_send_upstream(c.upstream_fd, c.id, buf, len)) {
+        const bool submitted = [&] {
+            if constexpr (requires {
+                              backend.add_send_upstream(
+                                  c.upstream_fd, c.id, buf, len, c.upstream_episode);
+                          }) {
+                return backend.add_send_upstream(c.upstream_fd, c.id, buf, len, c.upstream_episode);
+            } else {
+                return backend.add_send_upstream(c.upstream_fd, c.id, buf, len);
+            }
+        }();
+        if (submitted) {
             if constexpr (Backend::kAsyncIo) {
                 c.pending_ops++;
                 c.upstream_send_armed = true;
@@ -853,7 +886,11 @@ public:
         return false;
     }
     void pause_upstream_recv_impl(Connection& c) {
-        if constexpr (requires { backend.pause_upstream_recv(c.id); }) {
+        if constexpr (requires {
+                          backend.pause_upstream_recv(c.upstream_fd, c.id, c.upstream_episode);
+                      }) {
+            backend.pause_upstream_recv(c.upstream_fd, c.id, c.upstream_episode);
+        } else if constexpr (requires { backend.pause_upstream_recv(c.id); }) {
             backend.pause_upstream_recv(c.id);
         }
         if constexpr (Backend::kAsyncIo) c.upstream_recv_armed = false;
@@ -862,7 +899,16 @@ public:
         if constexpr (Backend::kAsyncIo) {
             if (c.upstream_recv_armed) return true;
         }
-        if (backend.add_recv_upstream(c.upstream_fd, c.id)) {
+        const bool submitted = [&] {
+            if constexpr (requires {
+                              backend.add_recv_upstream(c.upstream_fd, c.id, c.upstream_episode);
+                          }) {
+                return backend.add_recv_upstream(c.upstream_fd, c.id, c.upstream_episode);
+            } else {
+                return backend.add_recv_upstream(c.upstream_fd, c.id);
+            }
+        }();
+        if (submitted) {
             if constexpr (Backend::kAsyncIo) {
                 c.pending_ops++;
                 c.upstream_recv_armed = true;
@@ -887,18 +933,41 @@ public:
             c.upstream_slot_held = false;
         }
         if constexpr (Backend::kAsyncIo) {
-            // Only cancel when ops are in flight. If pending_ops == 0,
-            // the slot is freed immediately — no cancels needed.
+            // Only cancel ordinary pending_ops here. A response-read timer has
+            // separate ownership and independently blocks slot reuse.
             // Add cancel count to pending_ops so the slot isn't reclaimed
             // until all cancel CQEs have been processed.
             if (c.pending_ops > 0) {
-                c.pending_ops += backend.cancel(c.fd,
-                                                c.id,
-                                                c.recv_armed,
-                                                c.send_armed,
-                                                c.upstream_recv_armed,
-                                                c.upstream_send_armed,
-                                                c.upstream_fd >= 0);
+                const u32 cancelled = [&] {
+                    if constexpr (requires {
+                                      backend.cancel(c.fd,
+                                                     c.id,
+                                                     c.recv_armed,
+                                                     c.send_armed,
+                                                     c.upstream_recv_armed,
+                                                     c.upstream_send_armed,
+                                                     c.upstream_fd >= 0,
+                                                     c.upstream_episode);
+                                  }) {
+                        return backend.cancel(c.fd,
+                                              c.id,
+                                              c.recv_armed,
+                                              c.send_armed,
+                                              c.upstream_recv_armed,
+                                              c.upstream_send_armed,
+                                              c.upstream_fd >= 0,
+                                              c.upstream_episode);
+                    } else {
+                        return backend.cancel(c.fd,
+                                              c.id,
+                                              c.recv_armed,
+                                              c.send_armed,
+                                              c.upstream_recv_armed,
+                                              c.upstream_send_armed,
+                                              c.upstream_fd >= 0);
+                    }
+                }();
+                c.pending_ops += cancelled;
             }
         }
         if (c.fd >= 0) {
@@ -984,6 +1053,8 @@ public:
             case IoEventType::HandlerTimer:
                 if (ev.conn_id < kMaxConns) {
                     auto& conn = conns[ev.conn_id];
+                    const bool stale_tagged_upstream =
+                        io_event_is_tagged_stale(ev, conn.upstream_episode);
                     if constexpr (Backend::kAsyncIo) {
                         // Decrement pending_ops only on the final CQE for this op.
                         // Multishot recv (IORING_RECV_MULTISHOT) sets ev.more on
@@ -995,14 +1066,15 @@ public:
                             // event type (not state) to distinguish client vs upstream.
                             if (ev.type == IoEventType::Recv) conn.recv_armed = false;
                             if (ev.type == IoEventType::Send) conn.send_armed = false;
-                            if (ev.type == IoEventType::UpstreamSend)
+                            if (ev.type == IoEventType::UpstreamSend && !stale_tagged_upstream)
                                 conn.upstream_send_armed = false;
-                            if (ev.type == IoEventType::UpstreamRecv)
+                            if (ev.type == IoEventType::UpstreamRecv && !stale_tagged_upstream)
                                 conn.upstream_recv_armed = false;
                         }
                     }
-                    if (conn.on_recv || conn.on_send || conn.on_upstream_recv ||
-                        conn.on_upstream_send) {
+                    if (!stale_tagged_upstream &&
+                        (conn.on_recv || conn.on_send || conn.on_upstream_recv ||
+                         conn.on_upstream_send)) {
                         // See EpollEventLoop: don't let stray events bump a
                         // @throttle-paused connection's byte-rate-window timer back
                         // to the keepalive timeout.
@@ -1020,6 +1092,14 @@ public:
                             reclaim_slot(ev.conn_id);
                         }
                     }
+                }
+                break;
+            case IoEventType::ResponseReadTimer:
+                if (ev.conn_id < kMaxConns && valid_response_read_timer_transport_event(ev)) {
+                    auto& conn = conns[ev.conn_id];
+                    if (conn.consume_response_read_timer_completion(ev.non_upstream_generation) &&
+                        conn.response_read_timer_owner_is_neutral())
+                        reclaim_pending();
                 }
                 break;
             case IoEventType::Count:
