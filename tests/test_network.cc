@@ -53015,6 +53015,10 @@ TEST(response_read_deadline_get_positive_cl,
         REQUIRE(stage_strict_read_timeout(loop, &config, nullptr, 0, &successor, true));
         REQUIRE_EQ(successor.conn->id, id);
         Connection& next = *successor.conn;
+        CHECK_EQ(loop->backend.send_state[id].fd, -1);
+        CHECK_EQ(loop->backend.send_state[id].type, IoEventType::Send);
+        CHECK_EQ(loop->backend.upstream_send_state[id].fd, -1);
+        CHECK_EQ(loop->backend.upstream_send_state[id].type, IoEventType::UpstreamSend);
         REQUIRE(loop->begin_strict_upstream_retirement(next));
         CHECK_EQ(next.upstream_retiring_episode, successor.episode);
         CHECK_EQ(next.upstream_retirement_target_owned, kUpstreamOpRecv);

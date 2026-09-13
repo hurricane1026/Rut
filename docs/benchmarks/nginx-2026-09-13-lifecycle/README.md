@@ -5,6 +5,19 @@ comparison. The original 72-group record in `../nginx-2026-09-13/` remains
 unchanged: its timeout counters were zero, while RUT reported premature EOF /
 read failures. Do not label those failures as measured timeouts.
 
+## CI correction
+
+The records below identify initial runtime candidate `b9b817e2`; they are not
+proof that every integration invariant passed. CI on evidence head `cc051f6d`
+found two integration failures in GCC Debug and coverage ([run 34754154205](https://github.com/hurricane1026/Rut/actions/runs/34754154205)).
+`initial-ci-integration-failures.log` retains their assertions. The allocator
+reset used `{}`, which cleared unsent bytes but changed the backend's empty
+identity from fd=-1 / UpstreamSend to fd=0 / Accept. The correction restores
+exactly the same neutral records installed by `IoUringBackend::init`, and adds
+fd/type assertions to the reuse regression. The existing integration
+assertions are unchanged. Final corrected validation is recorded separately;
+do not treat the initial candidate's network-suite pass as integration acceptance.
+
 ## Fixes
 
 1. A sequential client's next request could arrive after the kernel sent the
@@ -58,7 +71,7 @@ explicit `Connection: close` header.
 
 ## Verification
 
-- `matrix-results.json`: final production code, 24/24 groups valid (two engines,
+- `matrix-results.json`: initial runtime candidate, 24/24 groups valid (two engines,
   four scenarios, concurrency 1/32/128); all warmup and measured connect/read/
   write/status/timeout counters zero. `matrix-status.json` confirms cleanup and
   completion. No throughput ratio is asserted; compilation also ran on this

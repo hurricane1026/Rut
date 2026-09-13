@@ -2229,8 +2229,8 @@ public:
         // sends can leave unsent bytes in the backend proactor even after the
         // connection's close ledger drains; those bytes belong to the old fd.
         // Clear both proactors before the new connection can validate or send.
-        backend.send_state[id] = {};
-        backend.upstream_send_state[id] = {};
+        backend.send_state[id] = {nullptr, -1, 0, 0, IoEventType::Send, 0, 0};
+        backend.upstream_send_state[id] = {nullptr, -1, 0, 0, IoEventType::UpstreamSend, 0, 0};
         conns[id].reset();
         conns[id].id = id;
         conns[id].shard_id = static_cast<u8>(shard_id);
