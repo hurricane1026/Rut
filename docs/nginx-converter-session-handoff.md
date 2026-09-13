@@ -16,6 +16,13 @@ Work occurs in isolated worktrees `Rut_pr374_completion`,
 `/home/hurricane/private/code`. The original main-worktree WIP remains protected.
 Current evidence is in [fixture PR completion](nginx-fixture-pr-completion.md).
 The exact #638 goal remains complete; its historical evidence below is retained.
+Historical #269 run `34737399775` at `a283731e` failed one Docker host-network
+startup preflight (and reported probe-container removal failure), before the
+#357 behavior test; 163/164 tests passed. The preserved log is
+`/tmp/rut269-a283-prior-nginx-failure.log`. This is distinct from proven
+Docker-info timeout evidence in open #632; no common cause is established.
+Later #374's full required suite passed, but that does not diagnose this earlier
+infrastructure failure. Final integration still requires current-head checks.
 
 ## Goal and roles
 
