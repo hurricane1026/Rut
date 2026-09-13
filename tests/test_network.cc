@@ -913,6 +913,39 @@ static u32 count_upstream_send_ops(const SmallLoop& loop, const Connection& conn
 
 // Replacing a header the client sent twice must replace the first AND drop the
 // rest, so the client's value can't survive past the override.
+TEST(header_validation, token_bitmap_matches_rfc_for_every_byte) {
+    constexpr char punctuation[] = "!#$%&'*+-.^_`|~";
+    for (u32 byte = 0; byte < 256; ++byte) {
+        bool expected = (byte >= '0' && byte <= '9') || (byte >= 'A' && byte <= 'Z') ||
+                        (byte >= 'a' && byte <= 'z');
+        for (const char c : punctuation)
+            if (c != '\0' && byte == static_cast<u8>(c)) expected = true;
+        CHECK_EQ(is_http_tchar(static_cast<u8>(byte)), expected);
+    }
+}
+
+TEST(header_validation, failure_content_type_preserves_stricter_value_validation) {
+    ForwardFailurePolicySpec policy{};
+    policy.version = ForwardFailurePolicyVersion::Http11;
+    policy.status_code = 502;
+    policy.date = ForwardFailurePolicyDate::Current;
+    policy.connection = ForwardFailurePolicyConnection::Request;
+    policy.reason = lit_str("Bad Gateway");
+    policy.server = lit_str("rut");
+    policy.body = lit_str("");
+    char value[] = "text/plain;x=x";
+    policy.content_type = {value, sizeof(value) - 1};
+    for (u32 byte = 0; byte < 256; ++byte) {
+        value[sizeof(value) - 2] = static_cast<char>(byte);
+        const bool old_result =
+            failure_policy_safe_text(policy.content_type, kMaxFailurePolicyContentTypeLen) &&
+            validate_response_header("Content-Type", 12, value, sizeof(value) - 1) ==
+                HttpHeaderValidation::Ok;
+        CHECK_EQ(forward_failure_policy_spec_shape_valid(policy), old_result);
+        CHECK_EQ(old_result, byte >= 0x20 && byte != 0x7f);
+    }
+}
+
 TEST(set_header, replaces_all_duplicate_client_fields) {
     SmallLoop loop;
     loop.setup();
