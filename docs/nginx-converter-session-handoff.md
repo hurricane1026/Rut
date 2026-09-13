@@ -33,15 +33,16 @@ exposed tools; the user selects the primary model in the client.
 ## Workspace and preservation
 
 - Assigned worktree: `/home/hurricane/private/code/Rut_issue627_two_second_oracle`.
-- Branch: `nginx-off-oracle`.
+- Branch: `nginx-off-capability`, based on accepted #639 merge `ed0eec96`.
 - This session started with clean worktree and local/remote HEAD both
   `6942666557d9f9a4303d40de266b640f4920f217`.
 - Current #638 source candidate: `247338de`, independently **APPROVED for the
   shared-validator/control increment**, following the accepted snapshots fix
   `d345e933`. See current status for validation logs and the explicit primary
   implementation fallback used for final control corrections. Historical
-  rejected candidates/reviews remain evidence. Complete-candidate PR/normal CI
-  remains the next task.
+  rejected candidates/reviews remain evidence. Complete candidate #639 was independently reviewed, passed normal and
+  required CI, and merged as `ed0eec96`; extraction for the next capability
+  witness was validated as `d9e1733a`; the ordinary-RUT wrapper is CURRENT.
 - Integration base: `agent/nginx-to-rut-converter`, not `main`.
 - Parent [PR #269](https://github.com/hurricane1026/Rut/pull/269) stays draft.
 - The main worktree `/home/hurricane/private/code/Rut` has unrelated user WIP in
@@ -79,7 +80,86 @@ Broad #270 remains PARTIAL and #271 remains BLOCKED_BY_RUT. None of that proves
 the new explicit `proxy_buffering off` scope. Verify current issue/PR state if
 making new status claims; these are recorded prior-run results, not reruns.
 
-## CURRENT: #638 complete nginx-only oracle candidate review/normal CI
+## CURRENT: ordinary-RUT capability candidate review / PR / CI
+
+Source `f49f0885` now passes the unchanged handwritten public O2/io_uring
+capability witness (first run 1.37s, zero skips), including shared negative
+controls, exact prefix/probe/EOF/natural retirement/live ledger/stability and
+post-join checks. Log `/tmp/rut-641-capability-first.log`. This is local ordinary
+RUT evidence only; actual off converter admission/differential still remain.
+The precise timer increment is independently approved, Clang Release `-j1`
+built, and passes 15 focused positive-CL tests / 920 checks (1218 filtered out).
+Logs `/tmp/rut-641-candidate-build.log` and `/tmp/rut-641-focused-first.log`.
+Full network regression passes (1233 tests / 143522 checks, 40.95s), log
+`/tmp/rut-641-network-full.log`; nginx oracle/shared-validator pass 2/2, zero
+skips, 1.70s, log `/tmp/rut-641-nginx-oracle-regression.log`. Complete candidate
+`ed0eec96..f49f0885` is independently APPROVED; PR/CI is the next gate.
+
+Implementation provenance: Luna supplied the initial timer patch and tests;
+the primary agent used the user's authorized implementation fallback to fix
+remaining phase/send ownership and same-batch retained-body accounting and to
+add cancellation/SQ controls. Different Luna independently approved the frozen
+result. Both rejected patches are retained in `/tmp/rut-641-first-review-rejected.patch`
+and `/tmp/rut-641-second-review-rejected.patch`. Do not describe this as Luna-only
+implementation. Complete candidate range is `ed0eec96..f49f0885`; #640/#641 stay
+open until final evidence and CI. Parent #269 was rechecked OPEN/draft.
+
+### Earlier #641 implementation and failure evidence (historical)
+
+Completion increment `119d7088` is independently approved, Clang Release `-j1`
+built, and passes eleven focused positive-CL tests / 568 checks (1218 tests
+filtered out), full formatting and runtime-state model checks. Another 64
+adjacent buffering/GET CL0 tests pass with 3682 checks (1165 filtered out), log
+`/tmp/rut-640-completion-adjacent.log`. The first build
+failed on a missing `on_request_complete` declaration; the correction adds the
+matching declaration for an existing explicit template instance. Logs:
+`/tmp/rut-640-completion-build.log`,
+`/tmp/rut-640-completion-revised-build.log`, and
+`/tmp/rut-640-completion-focused-first.log`.
+
+The first public capability run of that changed candidate still failed in
+2.17s: exact normalized 127 bytes, EOF at publication+2000.190475ms, violating
+the unchanged strict `<2000ms` gate. Access diagnostic contains `60\n`, but the
+joint live ledger/retirement gate was not reached and failure-time retirement
+was Pending. Full source/log are in [#641](https://github.com/hurricane1026/Rut/issues/641)
+and `/tmp/rut-640-completion-capability-first.log`. Do not retry unchanged or
+promote support. Luna is implementing precise timer activation only after
+validated incomplete positive-CL stream selection; preserve preheader/CL0 and
+all same-batch progress/timeout, cancellation, generation and episode rules.
+The first timer candidate remains unbuilt/unaccepted after source review:
+precise timer plus post-header body progress cannot reuse the incomplete-header
+HTTP parser commit. A separate authenticated body-copy commit, strict semantic
+phase/send proof, non-due rearm and deterministic new controls are under correction.
+Rejected diff `/tmp/rut-641-first-review-rejected.patch` is based on `51907777`.
+Independent review, unchanged public proof and full CI remain required.
+#640 remains open pending combined proof; no capability PR has been created.
+
+### Earlier completion investigation (historical)
+
+The handwritten wrapper `845b0c2a` first failed parsing the illegal explicit
+`response_buffering: "none"` value. Independently reviewed `7721e5be` uses the
+legal omission/default None. Clang Release build and formatting passed, but its
+public O2/io_uring run failed once in 2.42s at the joint ledger/retirement gate
+(access log empty). Exact prefix, Open probe and inactivity EOF passed the
+capture's earlier checks; this is not complete capability acceptance. Both full
+logs/source and reproduction are preserved in [#640](https://github.com/hurricane1026/Rut/issues/640),
+linked to #638/#271. Investigate ordinary runtime completion ownership; do not
+rerun unchanged, weaken the ledger/timing gates, or begin converter admission.
+Local evidence: `/tmp/rut-638-capability-first.log`,
+`/tmp/rut-638-capability-none-first.log`, and
+`/tmp/rut-638-capability-none-build.log`. No runtime fix has been applied yet.
+Reviewed diagnostic `d6ff3bdd` built successfully, but its first run failed at
+the earlier EOF/wire gate (2.16s); `/tmp/rut-640-diagnostic-first.log` and full
+#640 comment `5650166323` preserve it. Reviewed `e9f78b52` adds EOF rejection clocks and built successfully. Its first
+run failed the joint gate with clear retirement Ready/count1, EOF at publication
++1999.722453ms, retirement +1999.762588ms, and zero access bytes in the last
+sample at EOF+247.512583ms (`/tmp/rut-640-eof-diagnostic-first.log`). Natural
+retirement is therefore present; missing completion publication is confirmed.
+None's coarse timer wheel is also at the upper timing boundary; resolve precision
+without relaxing gates. Next implement/review the generic completion fix and its
+ownership controls, then address timing before full capability acceptance.
+
+### Accepted oracle and wrapper context
 
 The minimal fixture uses one server/location, numeric loopback endpoints,
 `proxy_buffering off`, `proxy_read_timeout 1s`, and an owned access ledger.
@@ -91,7 +171,9 @@ Clang Release build and six focused tests passed with zero skips (16.65s, new
 oracle 1.65s); logs are `/tmp/rut-638-snapshots-build.log` and
 `/tmp/rut-638-snapshots-targeted.log`. This is local nginx-only evidence; the
 shared validator/negative controls are now implemented in `247338de`;
-complete-candidate CI remains pending.
+complete-candidate CI passed: run `34730518730`, all 14 ordinary jobs and
+required nginx 162/162, zero skips, 717.96s. #639 merged as `ed0eec96`; log
+`/tmp/rut-639-f2b1-nginx-ci.log`. This completes only the nginx-only oracle.
 
 ### Completed implementation: snapshots and ownership only (`d345e933`)
 
@@ -140,13 +222,11 @@ capability or converter admission.
 
 ## NEXT
 
-1. Review and validate the complete nginx-only candidate through normal CI in
-   a PR targeting `agent/nginx-to-rut-converter`. Preserve rejected review
-   evidence and any failed run; do not promote compatibility from nginx alone.
-2. After review and nginx-only oracle validation, establish the exact behavior
-   through a separate ordinary-RUT `None` buffering capability witness.
-3. Only after capability is proven, implement bounded off model/lowering and an
-   actual same-file nginx-versus-generated-RUT differential pair.
+1. Complete capability candidate normal/required CI and integrate only into
+   `agent/nginx-to-rut-converter`; close #640/#641 only after full evidence.
+2. Implement bounded off model/lowering and the actual same-file
+   nginx-versus-generated-RUT differential pair.
+3. Independently review/CI the pair and update only the exact proven scope.
 
 `proxy_buffering off` is still rejected by the converter. Candidate runtime
 paths from a source audit are not behavioral proof. Do not declare SUPPORTED
@@ -182,7 +262,9 @@ Read applicable AGENTS.md and docs/nginx-converter-session-handoff.md first,
 then .nginx-converter-status.md, docs/nginx-compatibility.md and issue #638.
 Verify git/GitHub state and preserve unrelated user WIP in the main worktree.
 The audit, snapshots/ownership and shared validator/controls are complete.
-Next review and validate the complete nginx-only candidate through normal CI.
+The nginx-only candidate passed complete CI and merged as ed0eec96.
+Shared capture d9e1733a passed independent review, Release build and 7/7 tests.
+Next finish the dedicated ordinary-RUT public capability witness.
 Proceed with one small implementation → different-worker review →
 lead-scheduled tests → status/issue update at a time. Do not claim off support
 from untested source or nginx-only evidence. Keep parent PR #269 draft and

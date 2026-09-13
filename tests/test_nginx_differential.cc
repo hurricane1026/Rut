@@ -19,8 +19,10 @@
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
+#include <iomanip>
 #include <iostream>
 #include <memory>
+#include <sstream>
 #include <string>
 #include <thread>
 #include <vector>
@@ -66151,6 +66153,576 @@ static bool run_explicit_off_observation_self_check(std::string& error) {
     return true;
 }
 
+static bool capture_explicit_off_episode(Recorder& origin,
+                                         Child& frontend,
+                                         u16 frontend_port,
+                                         const std::string& access_path,
+                                         ExplicitOffObservation& observation,
+                                         std::string& error) {
+    const auto origin_live = [&]() {
+        return origin.running.load(std::memory_order_acquire) &&
+               origin.thread_alive.load(std::memory_order_acquire) &&
+               !origin.listener_failed.load(std::memory_order_acquire);
+    };
+    struct ClientGuard {
+        int fd = -1;
+        ~ClientGuard() {
+            if (fd >= 0) close(fd);
+        }
+    } client{connect_once(frontend_port)};
+    if (client.fd < 0 || !send_all(client.fd,
+                                   kDefaultBufferingTimeoutRequest,
+                                   sizeof(kDefaultBufferingTimeoutRequest) - 1u)) {
+        error = "#638 exact 60-byte client request failed";
+        return false;
+    }
+    const auto publication_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+    while (!origin.response_sent_open.load(std::memory_order_acquire) &&
+           std::chrono::steady_clock::now() < publication_deadline)
+        usleep(1000);
+    const u64 origin_sent_ns = origin.response_sent_ns.load(std::memory_order_acquire);
+    if (!origin.response_sent_open.load(std::memory_order_acquire) || origin_sent_ns == 0u ||
+        origin.accepted.load(std::memory_order_acquire) != 1u ||
+        origin.requests.load(std::memory_order_acquire) != 1u ||
+        origin.response_send_all_calls.load(std::memory_order_acquire) != 1u ||
+        !origin.response_send_succeeded.load(std::memory_order_acquire)) {
+        error = "#638 origin did not publish exactly one successful 103-byte response";
+        return false;
+    }
+
+    std::vector<char> response;
+    u64 first_ns = 0u;
+    u64 prefix_complete_ns = 0u;
+    u64 eof_ns = 0u;
+    const u64 early_deadline_ns = origin_sent_ns + 800'000'000ull;
+    while (response.size() < sizeof(kExplicitBufferingOffTimeoutResponseNormalized) - 1u &&
+           steady_now_ns() < early_deadline_ns) {
+        pollfd p{client.fd, POLLIN | POLLHUP | POLLERR, 0};
+        if (poll(&p, 1, 20) <= 0) continue;
+        char bytes[512];
+        const ssize_t n = recv(client.fd, bytes, sizeof(bytes), 0);
+        if (n > 0) {
+            if (first_ns == 0u) first_ns = steady_now_ns();
+            response.insert(response.end(), bytes, bytes + n);
+            if (response.size() == sizeof(kExplicitBufferingOffTimeoutResponseNormalized) - 1u)
+                prefix_complete_ns = steady_now_ns();
+        } else if (n < 0 && errno != EINTR && errno != EAGAIN && errno != EWOULDBLOCK) {
+            error = "#638 early downstream receive failed";
+            return false;
+        } else if (n == 0) {
+            error = "#638 downstream EOF preceded the early response prefix";
+            return false;
+        }
+    }
+    if (response.size() != sizeof(kExplicitBufferingOffTimeoutResponseNormalized) - 1u ||
+        first_ns == 0u || prefix_complete_ns == 0u ||
+        prefix_complete_ns - origin_sent_ns >= 800'000'000ull) {
+        error = "#638 proxy_buffering off did not expose the exact 127-byte prefix before timeout";
+        return false;
+    }
+    const std::vector<char> prefix_wire = response;
+    // The prefix is now complete on the client.  Only this point authorizes
+    // the recorder-owned one-request probe; its ACK is causal evidence, not
+    // the response_sent_open latch by itself.
+    const u64 prefix_authorized_ns = steady_now_ns();
+    origin.gated_fragment_probe_request.store(1u, std::memory_order_release);
+    const u64 ack_deadline_ns = prefix_authorized_ns + 100'000'000ull;
+    while (origin.gated_fragment_probe_ack.load(std::memory_order_acquire) != 1u &&
+           steady_now_ns() < ack_deadline_ns) {
+        if (!origin_live() || poll_child(frontend) ||
+            origin.response_peer_closed.load(std::memory_order_acquire) ||
+            origin.response_peer_unexpected_data.load(std::memory_order_acquire) ||
+            origin.response_peer_observation_failed.load(std::memory_order_acquire)) {
+            error = "#638 lost live custody while awaiting post-prefix origin probe ACK";
+            return false;
+        }
+        char downstream = 0;
+        const ssize_t downstream_probe = recv(client.fd, &downstream, 1, MSG_PEEK | MSG_DONTWAIT);
+        if (downstream_probe == 0 || downstream_probe > 0 ||
+            (downstream_probe < 0 && errno != EINTR && errno != EAGAIN && errno != EWOULDBLOCK)) {
+            error = "#638 downstream EOF/tail/error occurred while awaiting probe ACK";
+            return false;
+        }
+        usleep(1000);
+    }
+    const u32 open_ack = origin.gated_fragment_probe_ack.load(std::memory_order_acquire);
+    const u64 open_ack_ns = origin.gated_fragment_probe_ns.load(std::memory_order_acquire);
+    const GatedFragmentPeerProbeResult open_probe =
+        origin.gated_fragment_probe_result.load(std::memory_order_acquire);
+    char post_ack_downstream = 0;
+    const ssize_t post_ack_probe =
+        recv(client.fd, &post_ack_downstream, 1, MSG_PEEK | MSG_DONTWAIT);
+    if (open_ack != 1u || open_probe != GatedFragmentPeerProbeResult::Open ||
+        (post_ack_probe != -1 && post_ack_probe != 0) ||
+        (post_ack_probe < 0 && errno != EINTR && errno != EAGAIN && errno != EWOULDBLOCK) ||
+        post_ack_probe == 0 || open_ack_ns < prefix_authorized_ns ||
+        open_ack_ns >= ack_deadline_ns || prefix_complete_ns > open_ack_ns) {
+        error = "#638 post-prefix origin probe did not ACK Open within 100ms";
+        return false;
+    }
+    const auto probe_custody_clean = [&]() {
+        return origin.gated_fragment_probe_ack.load(std::memory_order_acquire) == 1u &&
+               origin.gated_fragment_probe_result.load(std::memory_order_acquire) ==
+                   GatedFragmentPeerProbeResult::Open &&
+               origin.gated_fragment_probe_ns.load(std::memory_order_acquire) == open_ack_ns &&
+               !origin.response_send_failed.load(std::memory_order_acquire) &&
+               !origin.response_peer_unexpected_data.load(std::memory_order_acquire) &&
+               !origin.response_peer_observation_failed.load(std::memory_order_acquire);
+    };
+    if (!probe_custody_clean() || !origin_live() || poll_child(frontend)) {
+        error = "#638 live custody was lost immediately after probe ACK";
+        return false;
+    }
+    const auto eof_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+    while (eof_ns == 0u && std::chrono::steady_clock::now() < eof_deadline) {
+        if (!probe_custody_clean() || !origin_live() || poll_child(frontend)) {
+            error = "#638 lost live custody while awaiting downstream EOF";
+            return false;
+        }
+        pollfd p{client.fd, POLLIN | POLLHUP | POLLERR, 0};
+        if (poll(&p, 1, 20) <= 0) continue;
+        char bytes[512];
+        const ssize_t n = recv(client.fd, bytes, sizeof(bytes), 0);
+        if (n > 0)
+            response.insert(response.end(), bytes, bytes + n);
+        else if (n == 0)
+            eof_ns = steady_now_ns();
+        else if (errno != EINTR && errno != EAGAIN && errno != EWOULDBLOCK) {
+            error = "#638 downstream EOF receive failed";
+            return false;
+        }
+    }
+    std::string detail;
+    const bool eof_wire_valid = validate_exact_normalized_response(
+        response, kExplicitBufferingOffTimeoutResponseNormalized, detail);
+    const bool eof_timing_valid = eof_ns != 0u && eof_ns > open_ack_ns &&
+                                  eof_ns - origin_sent_ns >= 750'000'000ull &&
+                                  eof_ns - origin_sent_ns < 2'000'000'000ull;
+    if (!eof_wire_valid || !eof_timing_valid) {
+        const LiveRetirementSnapshot eof_failure_retirement =
+            snapshot_live_retirement(origin.response_peer_closed,
+                                     origin.response_peer_close_count,
+                                     origin.response_peer_closed_ns,
+                                     origin_sent_ns);
+        const char* retirement_state =
+            eof_failure_retirement.state == LiveRetirementState::Pending
+                ? "Pending"
+                : (eof_failure_retirement.state == LiveRetirementState::Ready ? "Ready"
+                                                                              : "Invalid");
+        std::ostringstream diagnostic;
+        diagnostic << " [publication=" << origin_sent_ns << ", first=" << first_ns
+                   << ", prefix=" << prefix_complete_ns << ", auth=" << prefix_authorized_ns
+                   << ", ack=" << open_ack_ns << ", eof=" << eof_ns
+                   << ", eof_zero=" << (eof_ns == 0u ? "true" : "false")
+                   << ", response_bytes=" << response.size()
+                   << ", normalized_detail=" << std::quoted(detail)
+                   << ", retirement=" << retirement_state << "/" << eof_failure_retirement.count
+                   << "/" << eof_failure_retirement.timestamp_ns << "]";
+        error = "#638 downstream wire/one-second inactivity EOF was invalid: " + detail;
+        error += diagnostic.str();
+        return false;
+    }
+    LiveAccessLedgerObserver ledger;
+    ledger.freeze_eof(eof_ns);
+    const u64 ledger_deadline = eof_ns + 250'000'000ull;
+    std::string last_sample_access;
+    bool last_sample_read_ok = false;
+    LiveRetirementSnapshot last_sample_retirement;
+    u64 last_sample_ns = 0u;
+    const auto ledger_phase_name = [](LiveAccessLedgerObserver::Phase phase) {
+        switch (phase) {
+            case LiveAccessLedgerObserver::Phase::Pending:
+                return "Pending";
+            case LiveAccessLedgerObserver::Phase::Accepted:
+                return "Accepted";
+            case LiveAccessLedgerObserver::Phase::Stabilizing:
+                return "Stabilizing";
+            case LiveAccessLedgerObserver::Phase::Complete:
+                return "Complete";
+            case LiveAccessLedgerObserver::Phase::Failed:
+                return "Failed";
+        }
+        return "Unknown";
+    };
+    const auto retirement_state_name = [](LiveRetirementState state) {
+        switch (state) {
+            case LiveRetirementState::Pending:
+                return "Pending";
+            case LiveRetirementState::Ready:
+                return "Ready";
+            case LiveRetirementState::Invalid:
+                return "Invalid";
+        }
+        return "Unknown";
+    };
+    const auto add_live_observation_diagnostic = [&]() {
+        std::ostringstream detail;
+        detail << " [publication=" << origin_sent_ns << ", prefix=" << prefix_complete_ns
+               << ", ack=" << open_ack_ns << ", eof=" << eof_ns
+               << ", retirement=" << retirement_state_name(last_sample_retirement.state) << "/"
+               << last_sample_retirement.count << "/" << last_sample_retirement.timestamp_ns
+               << ", sample=" << last_sample_ns << ", ledger=" << ledger_phase_name(ledger.phase)
+               << ", read_ok=" << (last_sample_read_ok ? "true" : "false")
+               << ", access_bytes=" << last_sample_access.size()
+               << ", access=" << std::quoted(last_sample_access) << "]";
+        error += detail.str();
+    };
+    const auto retirement_timing_valid = [&](const LiveRetirementSnapshot& snapshot,
+                                             bool require_ready) {
+        if (snapshot.state == LiveRetirementState::Invalid) return false;
+        if (snapshot.state != LiveRetirementState::Ready) return !require_ready;
+        return snapshot.timestamp_ns > open_ack_ns &&
+               snapshot.timestamp_ns - origin_sent_ns >= 750'000'000ull &&
+               snapshot.timestamp_ns - origin_sent_ns < 2'000'000'000ull;
+    };
+    bool ledger_ready = false;
+    while (steady_now_ns() < ledger_deadline && !ledger_ready) {
+        std::string access;
+        const bool read_ok = read_request_length_access_file(access_path, access, error);
+        const LiveRetirementSnapshot retirement_snapshot =
+            snapshot_live_retirement(origin.response_peer_closed,
+                                     origin.response_peer_close_count,
+                                     origin.response_peer_closed_ns,
+                                     origin_sent_ns);
+        const u64 sample_ns = steady_now_ns();
+        last_sample_access = access;
+        last_sample_read_ok = read_ok;
+        last_sample_retirement = retirement_snapshot;
+        last_sample_ns = sample_ns;
+        const bool retirement_ready = retirement_timing_valid(retirement_snapshot, true);
+        const bool sampled = ledger.sample(sample_ns,
+                                           access,
+                                           read_ok,
+                                           poll_child(frontend) == false,
+                                           origin_live(),
+                                           probe_custody_clean(),
+                                           true,
+                                           retirement_ready,
+                                           retirement_timing_valid(retirement_snapshot, false));
+        if (!sampled) {
+            error = "#638 live access/retirement observation failed before EOF+250ms";
+            add_live_observation_diagnostic();
+            return false;
+        }
+        ledger_ready = ledger.phase == LiveAccessLedgerObserver::Phase::Accepted;
+        usleep(5000);
+    }
+    if (!ledger_ready || !ledger.accepted_before_deadline()) {
+        error = "#638 exact access ledger/retirement evidence was late or missing";
+        add_live_observation_diagnostic();
+        return false;
+    }
+    if (!ledger.begin_stability(steady_now_ns())) {
+        error = "#638 could not begin live ledger stability";
+        add_live_observation_diagnostic();
+        return false;
+    }
+    const u64 stability_deadline = steady_now_ns() + 175'000'000ull;
+    while (steady_now_ns() < stability_deadline) {
+        std::string stable_access;
+        const bool read_ok = read_request_length_access_file(access_path, stable_access, error);
+        const LiveRetirementSnapshot retirement_snapshot =
+            snapshot_live_retirement(origin.response_peer_closed,
+                                     origin.response_peer_close_count,
+                                     origin.response_peer_closed_ns,
+                                     origin_sent_ns);
+        const u64 sample_ns = steady_now_ns();
+        last_sample_access = stable_access;
+        last_sample_read_ok = read_ok;
+        last_sample_retirement = retirement_snapshot;
+        last_sample_ns = sample_ns;
+        if (!ledger.stable_sample(sample_ns,
+                                  stable_access,
+                                  read_ok,
+                                  !poll_child(frontend),
+                                  origin_live(),
+                                  probe_custody_clean(),
+                                  true,
+                                  true,
+                                  retirement_timing_valid(retirement_snapshot, true)) ||
+            origin.accepted.load(std::memory_order_acquire) != 1u ||
+            origin.requests.load(std::memory_order_acquire) != 1u) {
+            error = "#638 live ledger/retirement evidence changed during 175ms stability";
+            add_live_observation_diagnostic();
+            return false;
+        }
+        usleep(5000);
+    }
+    if (ledger.phase != LiveAccessLedgerObserver::Phase::Complete) {
+        std::string stable_access;
+        const bool final_read_ok =
+            read_request_length_access_file(access_path, stable_access, error);
+        const LiveRetirementSnapshot retirement_snapshot =
+            snapshot_live_retirement(origin.response_peer_closed,
+                                     origin.response_peer_close_count,
+                                     origin.response_peer_closed_ns,
+                                     origin_sent_ns);
+        const u64 final_sample_ns = steady_now_ns();
+        last_sample_access = stable_access;
+        last_sample_read_ok = final_read_ok;
+        last_sample_retirement = retirement_snapshot;
+        last_sample_ns = final_sample_ns;
+        if (!final_read_ok ||
+            !ledger.stable_sample(final_sample_ns,
+                                  stable_access,
+                                  final_read_ok,
+                                  !poll_child(frontend),
+                                  origin_live(),
+                                  probe_custody_clean(),
+                                  true,
+                                  true,
+                                  retirement_timing_valid(retirement_snapshot, true))) {
+            error = "#638 live ledger stability did not complete";
+            add_live_observation_diagnostic();
+            return false;
+        }
+    }
+    // Freeze every acceptance input before any cleanup can invalidate a live
+    // witness.  Cleanup status is checked only afterward and cannot create
+    // missing protocol, ledger, or retirement evidence.
+    std::string frozen_access;
+    if (!read_request_length_access_file(access_path, frozen_access, error) ||
+        frozen_access != "60\n") {
+        error = "#638 could not freeze the exact live access ledger";
+        return false;
+    }
+    const u32 frozen_accepted = origin.accepted.load(std::memory_order_acquire);
+    const u32 frozen_requests = origin.requests.load(std::memory_order_acquire);
+    const u32 frozen_close_count = origin.response_peer_close_count.load(std::memory_order_acquire);
+    const u32 frozen_probe_ack = origin.gated_fragment_probe_ack.load(std::memory_order_acquire);
+    const GatedFragmentPeerProbeResult frozen_probe_result =
+        origin.gated_fragment_probe_result.load(std::memory_order_acquire);
+    const u64 frozen_probe_ns = origin.gated_fragment_probe_ns.load(std::memory_order_acquire);
+    const bool frozen_send_failed = origin.response_send_failed.load(std::memory_order_acquire);
+    const bool frozen_unexpected =
+        origin.response_peer_unexpected_data.load(std::memory_order_acquire);
+    const bool frozen_observation_failed =
+        origin.response_peer_observation_failed.load(std::memory_order_acquire);
+    const LiveRetirementSnapshot frozen_retirement =
+        snapshot_live_retirement(origin.response_peer_closed,
+                                 origin.response_peer_close_count,
+                                 origin.response_peer_closed_ns,
+                                 origin_sent_ns);
+    const bool frozen_live = origin_live() && !poll_child(frontend);
+    const u64 frozen_sample_ns = steady_now_ns();
+    last_sample_access = frozen_access;
+    last_sample_read_ok = true;
+    last_sample_retirement = frozen_retirement;
+    last_sample_ns = frozen_sample_ns;
+    const bool frozen_sampled =
+        ledger.stable_sample(frozen_sample_ns,
+                             frozen_access,
+                             true,
+                             !poll_child(frontend),
+                             origin_live(),
+                             probe_custody_clean(),
+                             true,
+                             true,
+                             retirement_timing_valid(frozen_retirement, true));
+    observation.prefix_wire = prefix_wire;
+    observation.downstream_wire = response;
+    observation.publication_ns = origin_sent_ns;
+    observation.first_prefix_ns = first_ns;
+    observation.prefix_complete_ns = prefix_complete_ns;
+    observation.probe_authorized_ns = prefix_authorized_ns;
+    observation.probe_ack_ns = open_ack_ns;
+    observation.eof_ns = eof_ns;
+    observation.retirement = frozen_retirement;
+    observation.freeze_ns = frozen_sample_ns;
+    observation.probe_ack = frozen_probe_ack;
+    observation.probe_result = frozen_probe_result;
+    observation.probe_observed_ns = frozen_probe_ns;
+    observation.accepted = frozen_accepted;
+    observation.requests = frozen_requests;
+    observation.close_count = frozen_close_count;
+    observation.publication_count = origin.response_send_all_calls.load(std::memory_order_acquire);
+    observation.publication_succeeded =
+        origin.response_send_succeeded.load(std::memory_order_acquire);
+    observation.exact_ledger_seen = ledger.exact_ledger_seen;
+    observation.ledger = frozen_access;
+    observation.frontend_live = !poll_child(frontend);
+    observation.origin_live = origin_live();
+    observation.send_failed = frozen_send_failed;
+    observation.unexpected_data = frozen_unexpected;
+    observation.observation_failed = frozen_observation_failed;
+    observation.ledger_phase = ledger.phase;
+    observation.ledger_eof_ns = ledger.eof_ns;
+    observation.ledger_accepted_ns = ledger.accepted_ns;
+    observation.stability_start_ns = ledger.stability_start_ns;
+    observation.stability_deadline_ns = ledger.stability_deadline_ns;
+    if (!frozen_sampled || !validate_explicit_off_observation(observation, error)) {
+        if (error.empty()) error = "#638 live explicit-off observation was rejected";
+        add_live_observation_diagnostic();
+        return false;
+    }
+    const bool client_closed = close(client.fd) == 0;
+    client.fd = -1;
+    if (!client_closed || !frozen_live) {
+        error = "#638 could not freeze live evidence before cleanup";
+        return false;
+    }
+    return true;
+}
+
+// The source language has no "none" response_buffering token: omission is the
+// AST/HIR/MIR/RIR default ForwardResponseBufferingMode::None.
+static std::string make_handwritten_explicit_off_capability_source(u16 frontend_port,
+                                                                   u16 backend_port,
+                                                                   const std::string& access_path) {
+    return "accessLog {\n  path: \"" + access_path +
+           "\",\n  format: downstreamRequestBytes,\n  publication: live\n}\n"
+           "listen 127.0.0.1:" +
+           std::to_string(frontend_port) +
+           "\nupstream capability_backend at \"127.0.0.1:" + std::to_string(backend_port) +
+           "\"\n"
+           R"rut(route GET "/" {
+  return forward(capability_backend,
+    request_policy: { version: "HTTP/1.1", host: "upstream", connection: "omit",
+      strip_headers: ["Connection", "Keep-Alive", "TE", "Expect", "Upgrade"] },
+    response_policy: { version: "HTTP/1.1", framing: "content_length",
+      connection: "request", server: "nginx/1.29.7", date: "current",
+      hide_headers: ["Date", "Server", "X-Pad"] },
+    failure_policy: { version: "HTTP/1.1", status: 502, reason: "Bad Gateway",
+      content_type: "text/html", server: "nginx/1.29.7", date: "current",
+      connection: "request", head_mode: "reject",
+      body: b"<html>\r\n<head><title>502 Bad Gateway</title></head>\r\n<body>\r\n<center><h1>502 Bad Gateway</h1></center>\r\n<hr><center>nginx/1.29.7</center>\r\n</body>\r\n</html>\r\n" },
+    timeout_failure_policy: { version: "HTTP/1.1", status: 504,
+      reason: "Gateway Time-out", content_type: "text/html",
+      server: "nginx/1.29.7", date: "current", connection: "request",
+      head_mode: "reject",
+      body: b"<html>\r\n<head><title>504 Gateway Time-out</title></head>\r\n<body>\r\n<center><h1>504 Gateway Time-out</h1></center>\r\n<hr><center>nginx/1.29.7</center>\r\n</body>\r\n</html>\r\n" },
+    response_read_timeout: 1s)
+}
+)rut";
+}
+
+static bool run_handwritten_explicit_off_capability(TempDir& temp,
+                                                    const char* rut_path,
+                                                    std::string& error) {
+    if (rut_path == nullptr || rut_path[0] != '/' || access(rut_path, X_OK) != 0) {
+        error = "#638 handwritten capability requires an executable absolute RUT path";
+        return false;
+    }
+    HeldLoopbackPorts reservations;
+    u16 ports[2]{};
+    if (!reservations.reserve_four_digit(0u, ports[0]) ||
+        !reservations.reserve_four_digit(1u, ports[1]) || ports[0] == ports[1]) {
+        error = "#638 handwritten capability could not reserve distinct ports";
+        return false;
+    }
+    const std::string original_source =
+        make_handwritten_explicit_off_capability_source(ports[0], ports[1], temp.rut_access_log);
+    std::string source = original_source;
+    bool success = false;
+    struct Diagnostics {
+        const std::string& original_source;
+        const TempDir& temp;
+        const std::string& error;
+        bool& success;
+        ~Diagnostics() {
+            if (success) return;
+            std::cerr << "#638 handwritten capability source (pre-poison):\n" << original_source;
+            dump_log(temp.rut_log, "#638 handwritten capability RUT log");
+            dump_log(temp.rut_access_log, "#638 handwritten capability access log");
+            std::cerr << "#638 handwritten capability error: " << error << "\n";
+        }
+    } diagnostics{original_source, temp, error, success};
+    if (!write_file(temp.source, source.data(), source.size())) {
+        error = "#638 handwritten capability source write failed";
+        return false;
+    }
+
+    Recorder origin;
+    origin.wait_response_peer_close = true;
+    origin.probe_after_response_open = true;
+    origin.observe_extra_requests_until_stop = true;
+    if (!handoff_held_loopback_port(
+            &reservations.fds[1], ports[1], "#638 handwritten capability origin bind", error) ||
+        !origin.setup(ports[1],
+                      1u,
+                      kDefaultBufferingTimeoutOrigin,
+                      sizeof(kDefaultBufferingTimeoutOrigin) - 1u)) {
+        if (error.empty()) error = "#638 handwritten capability origin setup failed";
+        return false;
+    }
+    const auto origin_live = [&]() {
+        return origin.running.load(std::memory_order_acquire) &&
+               origin.thread_alive.load(std::memory_order_acquire) &&
+               !origin.listener_failed.load(std::memory_order_acquire);
+    };
+    const auto origin_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+    while (!origin_live() && std::chrono::steady_clock::now() < origin_deadline) usleep(1000);
+    if (!origin_live()) {
+        error = "#638 handwritten capability origin was not live before runtime handoff";
+        return false;
+    }
+    ChildGuard runtime;
+    if (!handoff_held_loopback_port(
+            &reservations.fds[0], ports[0], "#638 handwritten capability runtime bind", error) ||
+        !spawn_child(
+            {rut_path, temp.source, "--shards", "1", "--no-pin", "--drain", "0", "--opt", "2"},
+            temp.rut_log,
+            runtime.child) ||
+        !wait_ready(ports[0], runtime.child, error)) {
+        if (error.empty()) error = "#638 handwritten capability RUT failed to start";
+        return false;
+    }
+    const std::string loaded_record = "Loaded program: " + temp.source + " (opt O2)\n";
+    const std::string backend_record = "Backend: io_uring\n";
+    const auto loaded_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+    while ((!log_contains(temp.rut_log, loaded_record.c_str()) ||
+            !log_contains(temp.rut_log, backend_record.c_str())) &&
+           std::chrono::steady_clock::now() < loaded_deadline) {
+        if (poll_child(runtime.child)) {
+            error = "#638 handwritten capability RUT exited before exact O2/io_uring load";
+            return false;
+        }
+        usleep(1000);
+    }
+    if (!log_contains(temp.rut_log, loaded_record.c_str()) ||
+        !log_contains(temp.rut_log, backend_record.c_str())) {
+        error = "#638 handwritten capability lacked exact O2/io_uring load evidence";
+        return false;
+    }
+    std::fill(source.begin(), source.end(), 'P');
+    if (!write_file(temp.source, source.data(), source.size())) {
+        error = "#638 handwritten capability source poison failed after public load";
+        return false;
+    }
+    ExplicitOffObservation observation;
+    if (!capture_explicit_off_episode(
+            origin, runtime.child, ports[0], temp.rut_access_log, observation, error))
+        return false;
+    const std::string expected_upstream =
+        "GET /buffered-timeout?q=1 HTTP/1.1\r\nHost: 127.0.0.1:" + std::to_string(ports[1]) +
+        "\r\n\r\n";
+    const std::vector<char> expected_wire(expected_upstream.begin(), expected_upstream.end());
+    const bool runtime_stopped = stop_child(runtime.child);
+    origin.stop();
+    const bool lifecycle_ok = runtime_stopped && runtime.child.status_valid &&
+                              WIFEXITED(runtime.child.status) &&
+                              WEXITSTATUS(runtime.child.status) == 0;
+    const bool history_ok = origin.history.size() == 1u && origin.history[0] == expected_wire &&
+                            origin.request == expected_wire &&
+                            origin.response_peer_close_count.load(std::memory_order_acquire) ==
+                                observation.close_count &&
+                            origin.response_clean_shutdown.load(std::memory_order_acquire) &&
+                            origin.response_connection_closed.load(std::memory_order_acquire) &&
+                            !origin.thread_alive.load(std::memory_order_acquire) &&
+                            origin.listen_fd < 0;
+    std::string runtime_log;
+    if (!lifecycle_ok || !history_ok ||
+        !read_exact_return204_log(
+            temp.rut_log, "#638 handwritten capability runtime log", runtime_log, error) ||
+        !validate_rut_exact_ipv4_runtime_log(runtime_log, temp.source, ports[0], error)) {
+        if (error.empty()) error = "#638 handwritten capability lifecycle/history was not exact";
+        return false;
+    }
+    success = true;
+    std::cerr << "PASS: #638 handwritten ordinary-RUT response_buffering none capability\n";
+    return true;
+}
+
 // #638 is deliberately an nginx-only oracle: proxy_buffering off must expose
 // the already-published response prefix before proxy_read_timeout expires.
 static bool run_pinned_nginx_explicit_buffering_off_oracle(TempDir& temp,
@@ -66236,324 +66808,14 @@ static bool run_pinned_nginx_explicit_buffering_off_oracle(TempDir& temp,
         if (error.empty()) error = "#638 pinned nginx failed to start";
         return false;
     }
-    struct ClientGuard {
-        int fd = -1;
-        ~ClientGuard() {
-            if (fd >= 0) close(fd);
-        }
-    } client{connect_once(ports[0])};
-    if (client.fd < 0 || !send_all(client.fd,
-                                   kDefaultBufferingTimeoutRequest,
-                                   sizeof(kDefaultBufferingTimeoutRequest) - 1u)) {
-        error = "#638 exact 60-byte client request failed";
+    ExplicitOffObservation observation;
+    if (!capture_explicit_off_episode(
+            origin, nginx.child, ports[0], temp.nginx_access_log, observation, error))
         return false;
-    }
-    const auto publication_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
-    while (!origin.response_sent_open.load(std::memory_order_acquire) &&
-           std::chrono::steady_clock::now() < publication_deadline)
-        usleep(1000);
-    const u64 origin_sent_ns = origin.response_sent_ns.load(std::memory_order_acquire);
-    if (!origin.response_sent_open.load(std::memory_order_acquire) || origin_sent_ns == 0u ||
-        origin.accepted.load(std::memory_order_acquire) != 1u ||
-        origin.requests.load(std::memory_order_acquire) != 1u ||
-        origin.response_send_all_calls.load(std::memory_order_acquire) != 1u ||
-        !origin.response_send_succeeded.load(std::memory_order_acquire)) {
-        error = "#638 origin did not publish exactly one successful 103-byte response";
-        return false;
-    }
-
-    std::vector<char> response;
-    u64 first_ns = 0u;
-    u64 prefix_complete_ns = 0u;
-    u64 eof_ns = 0u;
-    const u64 early_deadline_ns = origin_sent_ns + 800'000'000ull;
-    while (response.size() < sizeof(kExplicitBufferingOffTimeoutResponseNormalized) - 1u &&
-           steady_now_ns() < early_deadline_ns) {
-        pollfd p{client.fd, POLLIN | POLLHUP | POLLERR, 0};
-        if (poll(&p, 1, 20) <= 0) continue;
-        char bytes[512];
-        const ssize_t n = recv(client.fd, bytes, sizeof(bytes), 0);
-        if (n > 0) {
-            if (first_ns == 0u) first_ns = steady_now_ns();
-            response.insert(response.end(), bytes, bytes + n);
-            if (response.size() == sizeof(kExplicitBufferingOffTimeoutResponseNormalized) - 1u)
-                prefix_complete_ns = steady_now_ns();
-        } else if (n < 0 && errno != EINTR && errno != EAGAIN && errno != EWOULDBLOCK) {
-            error = "#638 early downstream receive failed";
-            return false;
-        } else if (n == 0) {
-            error = "#638 downstream EOF preceded the early response prefix";
-            return false;
-        }
-    }
-    if (response.size() != sizeof(kExplicitBufferingOffTimeoutResponseNormalized) - 1u ||
-        first_ns == 0u || prefix_complete_ns == 0u ||
-        prefix_complete_ns - origin_sent_ns >= 800'000'000ull) {
-        error = "#638 proxy_buffering off did not expose the exact 127-byte prefix before timeout";
-        return false;
-    }
-    const std::vector<char> prefix_wire = response;
-    // The prefix is now complete on the client.  Only this point authorizes
-    // the recorder-owned one-request probe; its ACK is causal evidence, not
-    // the response_sent_open latch by itself.
-    const u64 prefix_authorized_ns = steady_now_ns();
-    origin.gated_fragment_probe_request.store(1u, std::memory_order_release);
-    const u64 ack_deadline_ns = prefix_authorized_ns + 100'000'000ull;
-    while (origin.gated_fragment_probe_ack.load(std::memory_order_acquire) != 1u &&
-           steady_now_ns() < ack_deadline_ns) {
-        if (!origin_live() || poll_child(nginx.child) ||
-            origin.response_peer_closed.load(std::memory_order_acquire) ||
-            origin.response_peer_unexpected_data.load(std::memory_order_acquire) ||
-            origin.response_peer_observation_failed.load(std::memory_order_acquire)) {
-            error = "#638 lost live custody while awaiting post-prefix origin probe ACK";
-            return false;
-        }
-        char downstream = 0;
-        const ssize_t downstream_probe = recv(client.fd, &downstream, 1, MSG_PEEK | MSG_DONTWAIT);
-        if (downstream_probe == 0 || downstream_probe > 0 ||
-            (downstream_probe < 0 && errno != EINTR && errno != EAGAIN && errno != EWOULDBLOCK)) {
-            error = "#638 downstream EOF/tail/error occurred while awaiting probe ACK";
-            return false;
-        }
-        usleep(1000);
-    }
-    const u32 open_ack = origin.gated_fragment_probe_ack.load(std::memory_order_acquire);
-    const u64 open_ack_ns = origin.gated_fragment_probe_ns.load(std::memory_order_acquire);
-    const GatedFragmentPeerProbeResult open_probe =
-        origin.gated_fragment_probe_result.load(std::memory_order_acquire);
-    char post_ack_downstream = 0;
-    const ssize_t post_ack_probe =
-        recv(client.fd, &post_ack_downstream, 1, MSG_PEEK | MSG_DONTWAIT);
-    if (open_ack != 1u || open_probe != GatedFragmentPeerProbeResult::Open ||
-        (post_ack_probe != -1 && post_ack_probe != 0) ||
-        (post_ack_probe < 0 && errno != EINTR && errno != EAGAIN && errno != EWOULDBLOCK) ||
-        post_ack_probe == 0 || open_ack_ns < prefix_authorized_ns ||
-        open_ack_ns >= ack_deadline_ns || prefix_complete_ns > open_ack_ns) {
-        error = "#638 post-prefix origin probe did not ACK Open within 100ms";
-        return false;
-    }
-    const auto probe_custody_clean = [&]() {
-        return origin.gated_fragment_probe_ack.load(std::memory_order_acquire) == 1u &&
-               origin.gated_fragment_probe_result.load(std::memory_order_acquire) ==
-                   GatedFragmentPeerProbeResult::Open &&
-               origin.gated_fragment_probe_ns.load(std::memory_order_acquire) == open_ack_ns &&
-               !origin.response_send_failed.load(std::memory_order_acquire) &&
-               !origin.response_peer_unexpected_data.load(std::memory_order_acquire) &&
-               !origin.response_peer_observation_failed.load(std::memory_order_acquire);
-    };
-    if (!probe_custody_clean() || !origin_live() || poll_child(nginx.child)) {
-        error = "#638 live custody was lost immediately after probe ACK";
-        return false;
-    }
-    const auto eof_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
-    while (eof_ns == 0u && std::chrono::steady_clock::now() < eof_deadline) {
-        if (!probe_custody_clean() || !origin_live() || poll_child(nginx.child)) {
-            error = "#638 lost live custody while awaiting downstream EOF";
-            return false;
-        }
-        pollfd p{client.fd, POLLIN | POLLHUP | POLLERR, 0};
-        if (poll(&p, 1, 20) <= 0) continue;
-        char bytes[512];
-        const ssize_t n = recv(client.fd, bytes, sizeof(bytes), 0);
-        if (n > 0)
-            response.insert(response.end(), bytes, bytes + n);
-        else if (n == 0)
-            eof_ns = steady_now_ns();
-        else if (errno != EINTR && errno != EAGAIN && errno != EWOULDBLOCK) {
-            error = "#638 downstream EOF receive failed";
-            return false;
-        }
-    }
-    std::string detail;
-    if (eof_ns == 0u ||
-        !validate_exact_normalized_response(
-            response, kExplicitBufferingOffTimeoutResponseNormalized, detail) ||
-        eof_ns <= open_ack_ns || eof_ns - origin_sent_ns < 750'000'000ull ||
-        eof_ns - origin_sent_ns >= 2'000'000'000ull) {
-        error = "#638 downstream wire/one-second inactivity EOF was invalid: " + detail;
-        return false;
-    }
-    LiveAccessLedgerObserver ledger;
-    ledger.freeze_eof(eof_ns);
-    const u64 ledger_deadline = eof_ns + 250'000'000ull;
-    const auto retirement_timing_valid = [&](const LiveRetirementSnapshot& snapshot,
-                                             bool require_ready) {
-        if (snapshot.state == LiveRetirementState::Invalid) return false;
-        if (snapshot.state != LiveRetirementState::Ready) return !require_ready;
-        return snapshot.timestamp_ns > open_ack_ns &&
-               snapshot.timestamp_ns - origin_sent_ns >= 750'000'000ull &&
-               snapshot.timestamp_ns - origin_sent_ns < 2'000'000'000ull;
-    };
-    bool ledger_ready = false;
-    while (steady_now_ns() < ledger_deadline && !ledger_ready) {
-        std::string access;
-        const bool read_ok = read_request_length_access_file(temp.nginx_access_log, access, error);
-        const LiveRetirementSnapshot retirement_snapshot =
-            snapshot_live_retirement(origin.response_peer_closed,
-                                     origin.response_peer_close_count,
-                                     origin.response_peer_closed_ns,
-                                     origin_sent_ns);
-        const bool retirement_ready = retirement_timing_valid(retirement_snapshot, true);
-        const bool sampled = ledger.sample(steady_now_ns(),
-                                           access,
-                                           read_ok,
-                                           poll_child(nginx.child) == false,
-                                           origin_live(),
-                                           probe_custody_clean(),
-                                           true,
-                                           retirement_ready,
-                                           retirement_timing_valid(retirement_snapshot, false));
-        if (!sampled) {
-            error = "#638 live access/retirement observation failed before EOF+250ms";
-            return false;
-        }
-        ledger_ready = ledger.phase == LiveAccessLedgerObserver::Phase::Accepted;
-        usleep(5000);
-    }
-    if (!ledger_ready || !ledger.accepted_before_deadline()) {
-        error = "#638 exact access ledger/retirement evidence was late or missing";
-        return false;
-    }
-    if (!ledger.begin_stability(steady_now_ns())) {
-        error = "#638 could not begin live ledger stability";
-        return false;
-    }
-    const u64 stability_deadline = steady_now_ns() + 175'000'000ull;
-    while (steady_now_ns() < stability_deadline) {
-        std::string stable_access;
-        const bool read_ok =
-            read_request_length_access_file(temp.nginx_access_log, stable_access, error);
-        const LiveRetirementSnapshot retirement_snapshot =
-            snapshot_live_retirement(origin.response_peer_closed,
-                                     origin.response_peer_close_count,
-                                     origin.response_peer_closed_ns,
-                                     origin_sent_ns);
-        const u64 sample_ns = steady_now_ns();
-        if (!ledger.stable_sample(sample_ns,
-                                  stable_access,
-                                  read_ok,
-                                  !poll_child(nginx.child),
-                                  origin_live(),
-                                  probe_custody_clean(),
-                                  true,
-                                  true,
-                                  retirement_timing_valid(retirement_snapshot, true)) ||
-            origin.accepted.load(std::memory_order_acquire) != 1u ||
-            origin.requests.load(std::memory_order_acquire) != 1u) {
-            error = "#638 live ledger/retirement evidence changed during 175ms stability";
-            return false;
-        }
-        usleep(5000);
-    }
-    if (ledger.phase != LiveAccessLedgerObserver::Phase::Complete) {
-        std::string stable_access;
-        const bool final_read_ok =
-            read_request_length_access_file(temp.nginx_access_log, stable_access, error);
-        const LiveRetirementSnapshot retirement_snapshot =
-            snapshot_live_retirement(origin.response_peer_closed,
-                                     origin.response_peer_close_count,
-                                     origin.response_peer_closed_ns,
-                                     origin_sent_ns);
-        const u64 final_sample_ns = steady_now_ns();
-        if (!final_read_ok ||
-            !ledger.stable_sample(final_sample_ns,
-                                  stable_access,
-                                  final_read_ok,
-                                  !poll_child(nginx.child),
-                                  origin_live(),
-                                  probe_custody_clean(),
-                                  true,
-                                  true,
-                                  retirement_timing_valid(retirement_snapshot, true))) {
-            error = "#638 live ledger stability did not complete";
-            return false;
-        }
-    }
-    // Freeze every acceptance input before any cleanup can invalidate a live
-    // witness.  Cleanup status is checked only afterward and cannot create
-    // missing protocol, ledger, or retirement evidence.
-    std::string frozen_access;
-    if (!read_request_length_access_file(temp.nginx_access_log, frozen_access, error) ||
-        frozen_access != "60\n") {
-        error = "#638 could not freeze the exact live access ledger";
-        return false;
-    }
     const std::string expected_upstream =
         "GET /buffered-timeout?q=1 HTTP/1.1\r\nHost: 127.0.0.1:" + std::to_string(ports[1]) +
         "\r\n\r\n";
-    const std::vector<char> frozen_wire(expected_upstream.begin(), expected_upstream.end());
-    const u32 frozen_accepted = origin.accepted.load(std::memory_order_acquire);
-    const u32 frozen_requests = origin.requests.load(std::memory_order_acquire);
-    const u32 frozen_close_count = origin.response_peer_close_count.load(std::memory_order_acquire);
-    const u32 frozen_probe_ack = origin.gated_fragment_probe_ack.load(std::memory_order_acquire);
-    const GatedFragmentPeerProbeResult frozen_probe_result =
-        origin.gated_fragment_probe_result.load(std::memory_order_acquire);
-    const u64 frozen_probe_ns = origin.gated_fragment_probe_ns.load(std::memory_order_acquire);
-    const bool frozen_send_failed = origin.response_send_failed.load(std::memory_order_acquire);
-    const bool frozen_unexpected =
-        origin.response_peer_unexpected_data.load(std::memory_order_acquire);
-    const bool frozen_observation_failed =
-        origin.response_peer_observation_failed.load(std::memory_order_acquire);
-    const LiveRetirementSnapshot frozen_retirement =
-        snapshot_live_retirement(origin.response_peer_closed,
-                                 origin.response_peer_close_count,
-                                 origin.response_peer_closed_ns,
-                                 origin_sent_ns);
-    const bool frozen_live = origin_live() && !poll_child(nginx.child);
-    const u64 frozen_sample_ns = steady_now_ns();
-    const bool frozen_sampled =
-        ledger.stable_sample(frozen_sample_ns,
-                             frozen_access,
-                             true,
-                             !poll_child(nginx.child),
-                             origin_live(),
-                             probe_custody_clean(),
-                             true,
-                             true,
-                             retirement_timing_valid(frozen_retirement, true));
-    ExplicitOffObservation live_observation;
-    live_observation.prefix_wire = prefix_wire;
-    live_observation.downstream_wire = response;
-    live_observation.publication_ns = origin_sent_ns;
-    live_observation.first_prefix_ns = first_ns;
-    live_observation.prefix_complete_ns = prefix_complete_ns;
-    live_observation.probe_authorized_ns = prefix_authorized_ns;
-    live_observation.probe_ack_ns = open_ack_ns;
-    live_observation.eof_ns = eof_ns;
-    live_observation.retirement = frozen_retirement;
-    live_observation.freeze_ns = frozen_sample_ns;
-    live_observation.probe_ack = frozen_probe_ack;
-    live_observation.probe_result = frozen_probe_result;
-    live_observation.probe_observed_ns = frozen_probe_ns;
-    live_observation.accepted = frozen_accepted;
-    live_observation.requests = frozen_requests;
-    live_observation.close_count = frozen_close_count;
-    live_observation.publication_count =
-        origin.response_send_all_calls.load(std::memory_order_acquire);
-    live_observation.publication_succeeded =
-        origin.response_send_succeeded.load(std::memory_order_acquire);
-    live_observation.exact_ledger_seen = ledger.exact_ledger_seen;
-    live_observation.ledger = frozen_access;
-    live_observation.frontend_live = !poll_child(nginx.child);
-    live_observation.origin_live = origin_live();
-    live_observation.send_failed = frozen_send_failed;
-    live_observation.unexpected_data = frozen_unexpected;
-    live_observation.observation_failed = frozen_observation_failed;
-    live_observation.ledger_phase = ledger.phase;
-    live_observation.ledger_eof_ns = ledger.eof_ns;
-    live_observation.ledger_accepted_ns = ledger.accepted_ns;
-    live_observation.stability_start_ns = ledger.stability_start_ns;
-    live_observation.stability_deadline_ns = ledger.stability_deadline_ns;
-    if (!frozen_sampled || !validate_explicit_off_observation(live_observation, error)) {
-        if (error.empty()) error = "#638 live explicit-off observation was rejected";
-        return false;
-    }
-    const bool client_closed = close(client.fd) == 0;
-    client.fd = -1;
-    if (!client_closed || !frozen_live) {
-        error = "#638 could not freeze live evidence before cleanup";
-        return false;
-    }
+    const std::vector<char> expected_wire(expected_upstream.begin(), expected_upstream.end());
     const bool nginx_stopped = stop_child(nginx.child);
     const bool container_removed = docker.remove();
     if (!nginx_stopped || !container_removed || reservations.fds[0] >= 0 ||
@@ -66569,19 +66831,11 @@ static bool run_pinned_nginx_explicit_buffering_off_oracle(TempDir& temp,
     const bool joined_connection_closed =
         origin.response_connection_closed.load(std::memory_order_acquire);
     const u32 joined_close_count = origin.response_peer_close_count.load(std::memory_order_acquire);
-    if (joined_history.size() != 1u || joined_history[0] != frozen_wire ||
-        joined_request != frozen_wire || frozen_accepted != 1u || frozen_requests != 1u ||
-        frozen_close_count != 1u || frozen_send_failed || frozen_unexpected ||
-        frozen_observation_failed || joined_close_count != frozen_close_count || !frozen_sampled ||
-        frozen_retirement.state != LiveRetirementState::Ready ||
-        frozen_retirement.count != frozen_close_count ||
-        frozen_retirement.timestamp_ns <= open_ack_ns ||
-        frozen_retirement.timestamp_ns - origin_sent_ns < 750'000'000ull ||
-        frozen_retirement.timestamp_ns - origin_sent_ns >= 2'000'000'000ull ||
+    if (joined_history.size() != 1u || joined_history[0] != expected_wire ||
+        joined_request != expected_wire || joined_close_count != observation.close_count ||
         !joined_clean_shutdown || !joined_connection_closed ||
-        origin.thread_alive.load(std::memory_order_acquire) || origin.listen_fd >= 0 ||
-        frozen_access != "60\n") {
-        error = "#638 upstream ledger contained retry, mutation, or observer failure evidence";
+        origin.thread_alive.load(std::memory_order_acquire) || origin.listen_fd >= 0) {
+        error = "#638 upstream ledger contained retry, mutation, or cleanup failure evidence";
         return false;
     }
     std::cerr << "PASS: #638 pinned nginx explicit proxy_buffering off exposed one exact 127-byte "
@@ -80328,6 +80582,8 @@ int main(int argc, char** argv) {
         argc == 2 && strcmp(argv[1], "--pinned-nginx-explicit-buffering-on-baseline-oracle") == 0;
     const bool pinned_nginx_explicit_buffering_off_oracle =
         argc == 2 && strcmp(argv[1], "--pinned-nginx-explicit-buffering-off-oracle") == 0;
+    const bool rut_explicit_buffering_off_capability =
+        argc == 3 && strcmp(argv[1], "--rut-explicit-buffering-off-capability") == 0;
     const bool pinned_nginx_custom_hide_timeout_explicit_buffering_oracle =
         argc == 2 &&
         strcmp(argv[1], "--pinned-nginx-custom-hide-timeout-explicit-buffering-oracle") == 0;
@@ -80650,7 +80906,7 @@ int main(int argc, char** argv) {
          !pinned_nginx_default_buffering_three_publication_completion_oracle &&
          !pinned_nginx_default_buffering_third_body_progress_expiry_oracle &&
          !pinned_nginx_explicit_buffering_on_baseline_oracle &&
-         !pinned_nginx_explicit_buffering_off_oracle &&
+         !pinned_nginx_explicit_buffering_off_oracle && !rut_explicit_buffering_off_capability &&
          !pinned_nginx_custom_hide_timeout_explicit_buffering_oracle &&
          !pinned_nginx_custom_hide_timeout_two_second_oracle &&
          !pinned_nginx_bodyless_head_delayed_completion_oracle &&
@@ -80954,6 +81210,8 @@ int main(int argc, char** argv) {
                "--pinned-nginx-explicit-buffering-on-baseline-oracle\n"
                "   or: test_nginx_differential "
                "--pinned-nginx-explicit-buffering-off-oracle\n"
+               "   or: test_nginx_differential --rut-explicit-buffering-off-capability "
+               "<absolute-rut-executable>\n"
                "   or: test_nginx_differential "
                "--pinned-nginx-default-buffering-201-incomplete-body-inactivity-expiry-oracle\n"
                "   or: test_nginx_differential "
@@ -81455,6 +81713,16 @@ int main(int argc, char** argv) {
     if (!temp.create()) {
         std::cerr << "FAIL [preflight]: secure temporary directory creation failed\n";
         return 1;
+    }
+    if (rut_explicit_buffering_off_capability) {
+        std::string capability_error;
+        if (!run_explicit_off_observation_self_check(capability_error) ||
+            !run_handwritten_explicit_off_capability(temp, argv[2], capability_error)) {
+            std::cerr << "FAIL [#638 handwritten ordinary-RUT explicit-off capability]: "
+                      << capability_error << "\n";
+            return 1;
+        }
+        return 0;
     }
     if (docker_info_launch_diagnostic) {
         std::cerr << "Docker launch diagnostic: NOT ACCEPTANCE (one bounded docker info launch)\n";

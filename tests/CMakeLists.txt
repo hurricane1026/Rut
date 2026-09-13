@@ -3075,6 +3075,18 @@ if(RUT_ENABLE_JIT)
         TIMEOUT 60
         ENVIRONMENT "RUT_NGINX_DIFFERENTIAL_REQUIRED=1"
     )
+    add_test(
+        NAME test_rut_explicit_buffering_off_capability
+        COMMAND test_nginx_differential --rut-explicit-buffering-off-capability
+                $<TARGET_FILE:rut>
+    )
+    set_tests_properties(test_rut_explicit_buffering_off_capability PROPERTIES
+        LABELS "integration;nginx;network;io_uring"
+        RUN_SERIAL TRUE
+        RESOURCE_LOCK nginx-differential
+        TIMEOUT 120
+        ENVIRONMENT "RUT_NGINX_DIFFERENTIAL_REQUIRED=1"
+    )
     if(TARGET test_rut_iouring_gate_preload)
         add_test(
             NAME test_rut_iouring_gate_spike

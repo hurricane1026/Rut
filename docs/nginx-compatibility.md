@@ -66,8 +66,23 @@ retirement and stable `60\n` ledger. The subsequent `247338de` adds one shared
 real/synthetic acceptance validator and named negative controls, independently
 approved after lead corrections to Luna's control fixtures. The new standalone
 self-check passed (0.01s), as did six focused regressions (16.40s, zero skips;
-real off oracle 1.68s). Complete-candidate PR/normal CI, the separate ordinary-RUT
-capability witness and same-file converter differential remain pending. The
+real off oracle 1.68s). Complete candidate #639 merged as `ed0eec96` from
+`f2b1adf3` after independent review and CI `34730518730`: all 14 ordinary jobs
+and required nginx 162/162, zero skips, 717.96s (new oracle 1.83s). The separate
+ordinary-RUT capability witness and same-file converter differential remain pending.
+The legal-default None witness `7721e5be` loaded through public O2/io_uring but
+failed its joint live ledger/retirement gate (empty access log, 2.42s); the full
+failure and preceding invalid-source spelling are preserved in
+[#640](https://github.com/hurricane1026/Rut/issues/640). No gate was relaxed.
+Reviewed generic completion `119d7088` passes eleven focused runtime tests / 568
+checks, but the public witness still fails with EOF+2000.190475ms; diagnostic
+`60\n` is not live stability proof because the joint gate was not reached.
+[#641](https://github.com/hurricane1026/Rut/issues/641) preserves the exact timing
+failure and tracks precise None-stream timer ownership.
+Independent review and local Clang validation of `f49f0885` now prove the
+handwritten ordinary-RUT episode (1.37s, shared gates unchanged) plus 15 focused
+runtime tests / 920 checks. Complete candidate CI and the actual same-file
+converter differential are still required before support promotion. The
 converter still rejects `proxy_buffering off`; no compatibility row is promoted.
 
 | nginx feature | parser | converter | RUT capability | behavior test | status |
