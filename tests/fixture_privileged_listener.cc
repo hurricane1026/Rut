@@ -223,6 +223,8 @@ bool parse_proc_net_tcp(const std::string& contents, ProcTcpTable& table, Diagno
             fail(diagnostic, DiagnosticPhase::ProcRow, table.count);
             return false;
         }
+        record.remote_ipv4 = remote_ipv4;
+        record.remote_port = remote_port;
         record.state = static_cast<std::uint8_t>(state);
         for (std::size_t i = 0u; i < table.count; ++i) {
             const ProcTcpRecord& prior = table.rows[i];

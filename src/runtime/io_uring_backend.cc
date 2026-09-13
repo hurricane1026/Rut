@@ -596,6 +596,95 @@ bool IoUringBackend::add_yield_timeout(u32 conn_id, Connection& conn, u32 ms) {
     return true;
 }
 
+bool IoUringBackend::add_response_read_timer(u32 conn_id,
+                                             Connection& conn,
+                                             u32 milliseconds,
+                                             u32 deadline_generation,
+                                             u32 upstream_episode) {
+    if (conn_id >= kMaxSendState || conn_id > kIoUserDataMaxConnId || conn.id != conn_id ||
+        milliseconds == 0 || deadline_generation == 0 ||
+        !valid_upstream_episode(upstream_episode) || !conn.response_read_timer_owner_is_neutral() ||
+        conn.response_read_timer_generation >= kResponseReadTimerGenerationMask)
+        return false;
+
+    io_uring_sqe* sqe = get_sqe();
+    if (!sqe) {
+        if (pending > 0) {
+            const i32 flushed = io_uring_enter(ring_fd, pending, 0, IORING_ENTER_SQ_WAKEUP);
+            if (flushed > 0)
+                pending -= static_cast<u32>(flushed);
+            else if (flushed < 0)
+                record_enter_error(flushed);
+        }
+        sqe = get_sqe();
+        if (!sqe) return false;
+    }
+
+    // Publish no owner until an SQE slot is secured. From this point onward
+    // every operation is infallible and the kernel-stable timespec remains
+    // immutable until the target CQE is harvested.
+    if (!conn.next_response_read_timer_generation()) return false;
+    conn.response_read_timer_timespec.tv_sec = milliseconds / 1000;
+    conn.response_read_timer_timespec.tv_nsec =
+        static_cast<long long>(milliseconds % 1000) * 1'000'000LL;
+    conn.response_read_timer_deadline_generation = deadline_generation;
+    conn.response_read_timer_upstream_episode = upstream_episode;
+    conn.response_read_timer_phase = ResponseReadTimerPhase::Armed;
+    conn.response_read_timer_target_owned = true;
+    conn.response_read_timer_cancel_owned = false;
+
+    memset(sqe, 0, sizeof(*sqe));
+    sqe->opcode = IORING_OP_TIMEOUT;
+    sqe->fd = -1;
+    sqe->addr = reinterpret_cast<u64>(&conn.response_read_timer_timespec);
+    sqe->len = 1;
+    sqe->off = 0;
+    sqe->user_data = encode_user_data(
+        conn_id, IoEventType::ResponseReadTimer, conn.response_read_timer_owner_generation);
+    sqe_advance_tail(sq_tail);
+    pending++;
+    return true;
+}
+
+bool IoUringBackend::cancel_response_read_timer(u32 conn_id, Connection& conn) {
+    if (conn_id >= kMaxSendState || conn_id > kIoUserDataMaxConnId || conn.id != conn_id ||
+        conn.response_read_timer_phase != ResponseReadTimerPhase::Armed ||
+        !conn.response_read_timer_owner_is_valid())
+        return false;
+
+    io_uring_sqe* sqe = get_sqe();
+    if (!sqe) {
+        if (pending > 0) {
+            const i32 flushed = io_uring_enter(ring_fd, pending, 0, IORING_ENTER_SQ_WAKEUP);
+            if (flushed > 0)
+                pending -= static_cast<u32>(flushed);
+            else if (flushed < 0)
+                record_enter_error(flushed);
+        }
+        sqe = get_sqe();
+        if (!sqe) return false;
+    }
+
+    const u32 generation = conn.response_read_timer_owner_generation;
+    memset(sqe, 0, sizeof(*sqe));
+    sqe->opcode = IORING_OP_ASYNC_CANCEL;
+    sqe->fd = -1;
+    sqe->addr = encode_user_data(conn_id, IoEventType::ResponseReadTimer, generation);
+    // The generation is unique within this connection/event domain, so an
+    // exact single-target cancel is sufficient and yields one cancel CQE.
+    sqe->cancel_flags = 0;
+    sqe->user_data = encode_user_data(
+        conn_id, IoEventType::ResponseReadTimer, generation | kResponseReadTimerCancelBit);
+
+    // Publish CancelPending only after its SQE is fully initialized. Neither
+    // immutable identity key changes while the two owners drain independently.
+    conn.response_read_timer_phase = ResponseReadTimerPhase::CancelPending;
+    conn.response_read_timer_cancel_owned = true;
+    sqe_advance_tail(sq_tail);
+    pending++;
+    return true;
+}
+
 void IoUringBackend::cancel_accept() {
     io_uring_sqe* sqe = get_sqe();
     if (!sqe) return;
@@ -902,6 +991,15 @@ u32 IoUringBackend::wait(IoEvent* events, u32 max_events, Connection* conns, u32
         if (conn_id == kCancelConnId) {
             head++;
             continue;
+        }
+
+        // A timeout/cancel completion never owns a provided buffer and is
+        // never multishot. Reject malformed flags before any generic recv
+        // handling can inspect, copy, or return a selected buffer.
+        if (type == IoEventType::ResponseReadTimer &&
+            (cqe->flags & (IORING_CQE_F_BUFFER | IORING_CQE_F_MORE)) != 0) {
+            protocol_failure();
+            break;
         }
 
         const bool downstream_recv_target = type == IoEventType::Recv && aux == 0;
@@ -1252,9 +1350,12 @@ u32 IoUringBackend::wait(IoEvent* events, u32 max_events, Connection* conns, u32
         events[count].more = (cqe->flags & IORING_CQE_F_MORE) ? 1 : 0;
         // Forward the decoded aux so dispatch can recognize a pause cancel's own
         // completion (UpstreamRecv + kPauseCancelAux); 0 for every normal op.
-        events[count].aux = type == IoEventType::Send ? 0 : static_cast<u8>(aux);
+        events[count].aux = (type == IoEventType::Send || type == IoEventType::ResponseReadTimer)
+                                ? 0
+                                : static_cast<u8>(aux);
         events[count].upstream_episode = upstream_episode;
-        events[count].non_upstream_generation = type == IoEventType::Send ? aux : 0;
+        events[count].non_upstream_generation =
+            (type == IoEventType::Send || type == IoEventType::ResponseReadTimer) ? aux : 0;
         if (type == IoEventType::UpstreamRecv && conns != nullptr && conn_id < max_conns &&
             conns[conn_id].response_read_deadline_state == ResponseReadDeadlineState::Armed &&
             conns[conn_id].response_read_deadline_owner_generation != 0 &&

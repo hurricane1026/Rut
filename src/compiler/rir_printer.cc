@@ -969,6 +969,9 @@ void print_function(PrintBuf& buf, const Function& fn) {
             case ForwardPreflightMode::AfterCanonicalSelection:
                 buf.put_cstr("after_canonical_selection");
                 break;
+            case ForwardPreflightMode::AfterRequestFramingSelection:
+                buf.put_cstr("after_request_framing_selection");
+                break;
             default:
                 buf.put_cstr("invalid");
                 break;

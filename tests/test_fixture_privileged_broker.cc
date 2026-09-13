@@ -4,20 +4,32 @@
 // refusal clients. The host parent retains read-only identity evidence only.
 
 #include "fixture_ancestry_bundle.h"
+#include "fixture_collision_release_evidence_protocol.h"
+#include "fixture_collision_release_evidence_transport.h"
+#include "fixture_collision_release_protocol.h"
 #include "fixture_direct_launch.h"
+#include "fixture_exact_tcp_reservation_lease.h"
+#include "fixture_executable_lease.h"
 #include "fixture_identity_bundle.h"
 #include "fixture_ipv4_topology.h"
+#include "fixture_private_directory_lease.h"
 #include "fixture_privileged_ancestry.h"
 #include "fixture_privileged_listener.h"
+#include "fixture_public_rut_session_attempt.h"
+#include "fixture_wildcard_source_lease.h"
 #include "fixture_worker_protocol.h"
+#include "rut/nginx/converter.h"
+#include "rut/nginx/parser.h"
 #include <algorithm>
 #include <array>
 #include <cerrno>
+#include <charconv>
 #include <chrono>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <ctime>
 #include <iostream>
 #include <limits>
 #include <optional>
@@ -52,6 +64,14 @@ namespace identity_bundle = rut::test::fixture_identity_bundle;
 namespace ancestry_bundle = rut::test::fixture_ancestry_bundle;
 namespace privileged_ancestry = rut::test::fixture_privileged_ancestry;
 namespace privileged_listener = rut::test::fixture_privileged_listener;
+namespace collision_control = rut::test::fixture_collision_release_protocol;
+namespace collision_evidence = rut::test::fixture_collision_release_evidence_protocol;
+namespace evidence_transport = rut::test::fixture_collision_release_evidence_transport;
+namespace exact_reservation = rut::test::fixture_exact_tcp_reservation_lease;
+namespace executable_lease = rut::test::fixture_executable_lease;
+namespace private_directory = rut::test::fixture_private_directory_lease;
+namespace public_attempt = rut::test::fixture_public_rut_session_attempt;
+namespace source_lease = rut::test::fixture_wildcard_source_lease;
 using privileged_ancestry::parse_retained_anchor_stat;
 using privileged_ancestry::parse_retained_anchor_status;
 using privileged_ancestry::prove_retained_sudo_wrapper;
@@ -71,6 +91,8 @@ using rut::test::fixture_direct_launch::StageDescriptor;
 using rut::test::fixture_direct_launch::validate_launcher_ancestry;
 using rut::test::ipv4_topology::HeldTopologyProbePolicy;
 using rut::test::ipv4_topology::HeldTopologySnapshot;
+
+namespace ipv4_topology = rut::test::ipv4_topology;
 
 constexpr u16 kBrokerRootHello = 20;
 constexpr u16 kCallerCredentials = 21;
@@ -99,12 +121,38 @@ constexpr u16 kExactRutCleanup = 43;
 constexpr u16 kExactRutCleaned = 44;
 constexpr u16 kExactRutFailure = 45;
 constexpr u16 kExactEscrowSettled = 46;
-constexpr u16 kWildcardHandoffRun = 47;
-constexpr u16 kWildcardHandoffWitness = 48;
-constexpr u16 kWildcardHandoffFinish = 49;
-constexpr u16 kWildcardHandoffFinished = 50;
+// Values 47--50 belong to the already reviewed listener protocol namespace and
+// remain reserved.  Wildcard-attempt Stage 1 deliberately starts after it.
+constexpr u16 kWildcardAttemptCommand = 51;
+constexpr u16 kWildcardAttemptPhase = 52;
+constexpr u16 kWildcardAttemptDecision = 53;
+constexpr u16 kWildcardAttemptSettlement = 54;
 constexpr int kBrokerDeadlineMs = 5000;
 constexpr int kListenerDeadlineMs = 15000;
+constexpr int kCanonicalTargetOperationMs = 90000;
+constexpr int kCanonicalTargetCleanupSlackMs = 10000;
+constexpr int kCanonicalTargetCleanupMs =
+    kCanonicalTargetOperationMs + kCanonicalTargetCleanupSlackMs;
+constexpr int kCanonicalParentProtocolMs = 110000;
+constexpr int kCanonicalParentDispatchSlackMs = 5000;
+constexpr int kCanonicalDroppedTargetWaitMs = 120000;
+constexpr int kCanonicalDroppedDispatchSlackMs = 10000;
+constexpr int kCanonicalRootDroppedWaitMs = 150000;
+constexpr int kCanonicalRootSetupSlackMs = 25000;
+constexpr int kCanonicalLauncherRootWaitMs = 165000;
+constexpr int kCanonicalLauncherAuthorizationSlackMs = 10000;
+constexpr int kPrivilegedBrokerCTestTimeoutMs = 360000;
+static_assert(kCanonicalTargetOperationMs < kCanonicalTargetCleanupMs);
+static_assert(kCanonicalTargetCleanupMs + kCanonicalParentDispatchSlackMs <
+              kCanonicalParentProtocolMs);
+static_assert(kCanonicalParentProtocolMs + kCanonicalDroppedDispatchSlackMs <=
+              kCanonicalDroppedTargetWaitMs);
+static_assert(kCanonicalDroppedTargetWaitMs + kCanonicalRootSetupSlackMs + 3 * kCleanupMs <
+              kCanonicalRootDroppedWaitMs);
+static_assert(kCanonicalRootDroppedWaitMs + kCanonicalLauncherAuthorizationSlackMs +
+                  3 * kCleanupMs <
+              kCanonicalLauncherRootWaitMs);
+static_assert(kCanonicalLauncherRootWaitMs < kPrivilegedBrokerCTestTimeoutMs);
 constexpr int kCredentialFd = 198;
 constexpr int kExactCustodyFd = 199;
 constexpr int kLauncherBundleFdBase = 220;
@@ -150,6 +198,15 @@ static bool safe_signal_target(const Report& report,
                                const ProcIdentity& expected,
                                int signal_number);
 static bool target_socket_inode(pid_t target, int fd, u64 expected_inode);
+static bool read_process_tcp_table(pid_t pid, privileged_listener::ProcTcpTable& table);
+static bool process_socket_inodes(pid_t pid, std::vector<u64>& inodes);
+static bool pidfd_link_matches(pid_t owner, int fd);
+static bool exact_pidfd_binding(int fd, pid_t expected_pid);
+static bool exact_log_ready(const std::string& log,
+                            const std::string& source_path,
+                            u16 port,
+                            u64& backend);
+static bool parse_canonical_ipv4(const std::string& text, u32& ipv4);
 static bool exact_listener_absent(const privileged_listener::ProcTcpTable& table,
                                   const privileged_listener::ListenerPlan& plan,
                                   u64 listener_inode);
@@ -176,15 +233,41 @@ static ExactLiveness observe_exact_liveness(const ProcIdentity& expected);
 static bool exact_liveness_self_check(std::string& error);
 static int remaining_deadline_ms(std::chrono::steady_clock::time_point deadline);
 static std::chrono::steady_clock::time_point new_exact_cleanup_deadline();
+static bool generated_proxy_scenario(const char* scenario);
+static bool generated_proxy_differential_scenario(const char* scenario);
 
 static bool listener_scenario_name(const char* scenario) {
     return strcmp(scenario, "listener-guard-reservation") == 0 ||
            strcmp(scenario, "listener-cleanup-observation-failure") == 0 ||
-           strcmp(scenario, "listener-wildcard-release-handoff") == 0;
+           strcmp(scenario, "listener-canonical-collision-release") == 0 ||
+           generated_proxy_scenario(scenario);
 }
 
-static bool listener_wildcard_handoff(const char* scenario) {
-    return strcmp(scenario, "listener-wildcard-release-handoff") == 0;
+static bool generated_proxy_scenario(const char* scenario) {
+    return strcmp(scenario, "listener-generated-proxy-502") == 0 ||
+           generated_proxy_differential_scenario(scenario);
+}
+
+static bool generated_proxy_differential_scenario(const char* scenario) {
+    return strcmp(scenario, "listener-generated-proxy-502-differential") == 0;
+}
+
+static bool canonical_collision_scenario(const char* scenario) {
+    return strcmp(scenario, "listener-canonical-collision-release") == 0;
+}
+
+enum class TargetWaitStrategy { OwnedWait, ListenerCustody };
+
+static TargetWaitStrategy target_wait_strategy(const char* scenario) {
+    if (strcmp(scenario, "listener-guard-reservation") == 0 ||
+        strcmp(scenario, "listener-cleanup-observation-failure") == 0 ||
+        generated_proxy_scenario(scenario))
+        return TargetWaitStrategy::ListenerCustody;
+    return TargetWaitStrategy::OwnedWait;
+}
+
+static bool target_wait_requires_custody(const char* scenario) {
+    return target_wait_strategy(scenario) == TargetWaitStrategy::ListenerCustody;
 }
 
 static bool listener_failure_integration(const char* scenario) {
@@ -194,11 +277,12 @@ static bool listener_failure_integration(const char* scenario) {
 static_assert(kListenerDeadlineMs <= std::numeric_limits<int>::max() / 4);
 constexpr int kListenerFailureLauncherWaitMs = kListenerDeadlineMs * 4;
 constexpr int kListenerFailureFrame45WaitMs = kListenerDeadlineMs * 2;
-constexpr int kWildcardHandoffLauncherWaitMs = kListenerDeadlineMs * 4;
+constexpr int kWildcardAttemptAggregateWaitMs = kListenerDeadlineMs * 6;
 
 static int launcher_broker_wait_ms(const char* scenario) {
-    if (listener_failure_integration(scenario)) return kListenerFailureLauncherWaitMs;
-    return listener_wildcard_handoff(scenario) ? kWildcardHandoffLauncherWaitMs : kBrokerDeadlineMs;
+    if (canonical_collision_scenario(scenario)) return kCanonicalLauncherRootWaitMs;
+    return listener_failure_integration(scenario) ? kListenerFailureLauncherWaitMs
+                                                  : kBrokerDeadlineMs;
 }
 
 static int cleanup_response_wait_ms(const char* scenario) {
@@ -206,19 +290,86 @@ static int cleanup_response_wait_ms(const char* scenario) {
                                                   : kListenerDeadlineMs;
 }
 
+static int scenario_aggregate_wait_ms(const char* scenario) {
+    if (canonical_collision_scenario(scenario)) return kCanonicalParentProtocolMs;
+    if (strcmp(scenario, "listener-wildcard-attempt") == 0) return kWildcardAttemptAggregateWaitMs;
+    if (listener_failure_integration(scenario)) return kListenerFailureLauncherWaitMs;
+    if (listener_scenario_name(scenario)) return kListenerDeadlineMs;
+    return kBrokerDeadlineMs;
+}
+
 static bool listener_failure_bound_self_check(std::string& error) {
-    if (launcher_broker_wait_ms("listener-cleanup-observation-failure") !=
+    if (generated_proxy_differential_scenario("listener-generated-proxy-502") ||
+        !generated_proxy_differential_scenario("listener-generated-proxy-502-differential") ||
+        generated_proxy_differential_scenario(
+            "listener-generated-proxy-502-differential-mutated") ||
+        launcher_broker_wait_ms("listener-cleanup-observation-failure") !=
             kListenerDeadlineMs * 4 ||
         cleanup_response_wait_ms("listener-cleanup-observation-failure") !=
             kListenerDeadlineMs * 2 ||
         launcher_broker_wait_ms("listener-guard-reservation") != kBrokerDeadlineMs ||
         cleanup_response_wait_ms("listener-guard-reservation") != kListenerDeadlineMs ||
-        launcher_broker_wait_ms("listener-wildcard-release-handoff") !=
-            kWildcardHandoffLauncherWaitMs ||
-        cleanup_response_wait_ms("listener-wildcard-release-handoff") != kListenerDeadlineMs ||
+        launcher_broker_wait_ms("listener-generated-proxy-502") != kBrokerDeadlineMs ||
+        cleanup_response_wait_ms("listener-generated-proxy-502") != kListenerDeadlineMs ||
+        launcher_broker_wait_ms("listener-generated-proxy-502-differential") != kBrokerDeadlineMs ||
+        cleanup_response_wait_ms("listener-generated-proxy-502-differential") !=
+            kListenerDeadlineMs ||
         launcher_broker_wait_ms("normal") != kBrokerDeadlineMs ||
-        cleanup_response_wait_ms("normal") != kListenerDeadlineMs) {
-        error = "listener failure extended deadline selection failed";
+        cleanup_response_wait_ms("normal") != kListenerDeadlineMs ||
+        scenario_aggregate_wait_ms("normal") != kBrokerDeadlineMs ||
+        scenario_aggregate_wait_ms("listener-guard-reservation") != kListenerDeadlineMs ||
+        scenario_aggregate_wait_ms("listener-generated-proxy-502") != kListenerDeadlineMs ||
+        scenario_aggregate_wait_ms("listener-generated-proxy-502-differential") !=
+            kListenerDeadlineMs ||
+        scenario_aggregate_wait_ms("listener-cleanup-observation-failure") !=
+            kListenerFailureLauncherWaitMs ||
+        scenario_aggregate_wait_ms("listener-wildcard-attempt") !=
+            kWildcardAttemptAggregateWaitMs ||
+        scenario_aggregate_wait_ms("listener-canonical-collision-release") !=
+            kCanonicalParentProtocolMs ||
+        launcher_broker_wait_ms("listener-canonical-collision-release") !=
+            kCanonicalLauncherRootWaitMs ||
+        target_wait_strategy("listener-canonical-collision-release") !=
+            TargetWaitStrategy::OwnedWait ||
+        target_wait_strategy("normal") != TargetWaitStrategy::OwnedWait ||
+        target_wait_strategy("ready-loss") != TargetWaitStrategy::OwnedWait ||
+        target_wait_strategy("no-ready") != TargetWaitStrategy::OwnedWait ||
+        target_wait_strategy("term-ignore") != TargetWaitStrategy::OwnedWait ||
+        target_wait_strategy("owned-wait-term-ignore") != TargetWaitStrategy::OwnedWait ||
+        target_wait_strategy("broker-early") != TargetWaitStrategy::OwnedWait ||
+        target_wait_strategy("broker-lease-loss") != TargetWaitStrategy::OwnedWait ||
+        target_wait_strategy("listener-wildcard-attempt") != TargetWaitStrategy::OwnedWait ||
+        target_wait_strategy("listener-guard-reservation") != TargetWaitStrategy::ListenerCustody ||
+        target_wait_strategy("listener-generated-proxy-502") !=
+            TargetWaitStrategy::ListenerCustody ||
+        target_wait_strategy("listener-generated-proxy-502-differential") !=
+            TargetWaitStrategy::ListenerCustody ||
+        target_wait_strategy("listener-cleanup-observation-failure") !=
+            TargetWaitStrategy::ListenerCustody ||
+        target_wait_requires_custody("listener-canonical-collision-release") ||
+        target_wait_requires_custody("normal") ||
+        !target_wait_requires_custody("listener-guard-reservation") ||
+        !target_wait_requires_custody("listener-generated-proxy-502") ||
+        !target_wait_requires_custody("listener-generated-proxy-502-differential") ||
+        !target_wait_requires_custody("listener-cleanup-observation-failure") ||
+        !(kCanonicalTargetOperationMs < kCanonicalTargetCleanupMs) ||
+        !(kCanonicalTargetCleanupMs + kCanonicalParentDispatchSlackMs <
+          kCanonicalParentProtocolMs) ||
+        !(kCanonicalParentProtocolMs + kCanonicalDroppedDispatchSlackMs <=
+          kCanonicalDroppedTargetWaitMs) ||
+        !(kCanonicalDroppedTargetWaitMs + kCanonicalRootSetupSlackMs + 3 * kCleanupMs <
+          kCanonicalRootDroppedWaitMs) ||
+        !(kCanonicalRootDroppedWaitMs + kCanonicalLauncherAuthorizationSlackMs + 3 * kCleanupMs <
+          kCanonicalLauncherRootWaitMs) ||
+        !(kCanonicalLauncherRootWaitMs < kPrivilegedBrokerCTestTimeoutMs) ||
+        kCanonicalTargetOperationMs != 90000 || kCanonicalTargetCleanupSlackMs != 10000 ||
+        kCanonicalTargetCleanupMs != 100000 || kCanonicalParentProtocolMs != 110000 ||
+        kCanonicalDroppedTargetWaitMs != 120000 || kCanonicalRootDroppedWaitMs != 150000 ||
+        kCanonicalLauncherRootWaitMs != 165000 || kPrivilegedBrokerCTestTimeoutMs != 360000 ||
+        kBrokerDeadlineMs != 5000 || kListenerDeadlineMs != 15000 ||
+        kListenerFailureFrame45WaitMs != 30000 || kListenerFailureLauncherWaitMs != 60000 ||
+        kWildcardAttemptAggregateWaitMs != 90000) {
+        error = "listener/canonical wait strategy or deadline selection failed";
         return false;
     }
     return true;
@@ -1082,8 +1233,10 @@ struct ExecutableLease {
     }
 };
 
-constexpr u64 kExactProtocolVersion = 1u;
-constexpr std::size_t kExactReportFields = 25u;
+constexpr u64 kExactProtocolVersion = 2u;
+constexpr std::size_t kExactReportFields = 32u;
+constexpr std::size_t kExactMaxRequestBytes = 128u;
+constexpr std::size_t kExactMaxResponseBytes = 4096u;
 struct ExactRutReport {
     u64 version = kExactProtocolVersion;
     u64 child_pid = 0u;
@@ -1110,6 +1263,41 @@ struct ExactRutReport {
     u64 guard_connect_error = 0u;
     u64 stable = 0u;
     u64 backend = 0u;
+    // Request/response observations are populated for every exact child.  The
+    // generated proxy slice additionally proves the unavailable-upstream
+    // refusal and its normalized 502 body/header contract.
+    u64 request_bytes = 0u;
+    u64 completed_send = 0u;
+    u64 upstream_absence_probe_refused = 0u;
+    u64 response_body_bytes = 0u;
+    u64 response_status = 0u;
+    u64 response_headers_exact = 0u;
+    u64 guard_before_connect_error = 0u;
+    std::string request_wire;
+    std::string response_wire;
+};
+
+struct GeneratedProxyObservation {
+    // The separate refusal probe proves endpoint absence only; RUT upstream
+    // connect-attempt count is intentionally unobserved in this fixture.
+    std::string request_wire;
+    std::string response_wire;
+    u64 upstream_absence_probe_refused = 0u;
+    u64 guard_before_connect_error = 0u;
+    u64 guard_after_connect_error = 0u;
+    u64 status = 0u;
+    u64 headers_exact = 0u;
+    u64 body_bytes = 0u;
+    u64 child_pid = 0u;
+    u64 child_start = 0u;
+    u64 listener_inode = 0u;
+    u64 positive_ipv4 = 0u;
+    u64 guard_ipv4 = 0u;
+    u64 port = 0u;
+    u64 upstream_ipv4 = 0u;
+    u64 upstream_port = 0u;
+    u64 eof = 0u;
+    u64 cleanup_complete = 0u;
 };
 
 constexpr std::size_t kExactCleanedFields = 11u;
@@ -1125,50 +1313,6 @@ struct ExactRutCleanedReport {
     u64 temps_absent = 0u;
     u64 target_fd_count = 0u;
     u64 guard_connect_error = 0u;
-};
-
-constexpr u64 kWildcardHandoffVersion = 1u;
-constexpr std::size_t kWildcardHandoffFields = 39u;
-struct WildcardHandoffReport {
-    u64 version = kWildcardHandoffVersion;
-    u64 collision_pid = 0u;
-    u64 collision_start = 0u;
-    u64 collision_exit_one = 0u;
-    u64 collision_pidfd_invalidated = 0u;
-    u64 collision_log_eaddrinuse = 0u;
-    u64 collision_no_wildcard = 0u;
-    u64 collision_exact_live = 0u;
-    u64 collision_guard_live = 0u;
-    u64 collision_source_absent = 0u;
-    u64 collision_log_absent = 0u;
-    u64 collision_response_bytes = 0u;
-    u64 exact_reaped = 0u;
-    u64 exact_listener_absent = 0u;
-    u64 exact_temps_absent = 0u;
-    u64 guard_invalidated = 0u;
-    u64 port_absent_before_retry = 0u;
-    u64 same_source = 0u;
-    u64 wildcard_pid = 0u;
-    u64 wildcard_start = 0u;
-    u64 wildcard_listener_inode = 0u;
-    u64 wildcard_kind = 0u;
-    u64 positive_response_bytes = 0u;
-    u64 positive_response_exact = 0u;
-    u64 positive_prompt_eof = 0u;
-    u64 guard_response_bytes = 0u;
-    u64 guard_response_exact = 0u;
-    u64 guard_prompt_eof = 0u;
-    u64 wildcard_stable = 0u;
-    u64 wildcard_clean_exit = 0u;
-    u64 wildcard_pidfd_invalidated = 0u;
-    u64 wildcard_child_absent = 0u;
-    u64 wildcard_listener_absent = 0u;
-    u64 wildcard_source_absent = 0u;
-    u64 wildcard_log_absent = 0u;
-    u64 target_fd_count = 0u;
-    u64 positive_ipv4 = 0u;
-    u64 guard_ipv4 = 0u;
-    u64 port = 0u;
 };
 
 enum class ExactFailurePhase : u64 {
@@ -1263,6 +1407,613 @@ static u64 read_u64(const unsigned char* value) {
     return result;
 }
 
+constexpr u64 kWildcardAttemptVersion = 1u;
+
+enum class WildcardAttemptMode : u64 {
+    Canonical = 1u,
+    MissingCollision = 2u,
+    PrematureGuardRelease = 3u,
+    WrongListenerKind = 4u,
+    WrongListenerAddress = 5u,
+    WrongListenerInode = 6u,
+    FalsePostReleaseSuccess = 7u,
+};
+
+enum class WildcardAttemptPhase : u64 {
+    GuardHeld = 1u,
+    ExactRutWitness = 2u,
+    CollisionPrepared = 3u,
+    CollisionRejected = 4u,
+    ExactCleanedGuardHeld = 5u,
+    GuardReleased = 6u,
+    WildcardLive = 7u,
+};
+
+enum class WildcardAttemptDecisionKind : u64 {
+    AuthorizeCollisionExec = 1u,
+    AuthorizeExactCleanup = 2u,
+    AuthorizeGuardRelease = 3u,
+    AuthorizeWildcardExec = 4u,
+    AuthorizeWildcardCleanup = 5u,
+    RejectAndCleanup = 6u,
+    Finish = 7u,
+};
+
+enum class WildcardAttemptSettlementKind : u64 {
+    AttemptSettled = 1u,
+    MutationSettled = 2u,
+};
+
+struct WildcardAttemptCommandV1 {
+    u64 version = kWildcardAttemptVersion;
+    u64 transaction_id = 0u;
+    WildcardAttemptMode mode = WildcardAttemptMode::Canonical;
+    u64 sequence = 0u;
+};
+
+struct WildcardAttemptPhaseV1 {
+    u64 version = kWildcardAttemptVersion;
+    u64 transaction_id = 0u;
+    WildcardAttemptMode mode = WildcardAttemptMode::Canonical;
+    WildcardAttemptPhase phase = WildcardAttemptPhase::GuardHeld;
+    u64 sequence = 0u;
+};
+
+struct WildcardAttemptDecisionV1 {
+    u64 version = kWildcardAttemptVersion;
+    u64 transaction_id = 0u;
+    WildcardAttemptMode mode = WildcardAttemptMode::Canonical;
+    WildcardAttemptDecisionKind decision = WildcardAttemptDecisionKind::AuthorizeCollisionExec;
+    WildcardAttemptPhase for_phase = WildcardAttemptPhase::CollisionPrepared;
+    u64 sequence = 0u;
+};
+
+struct WildcardAttemptSettlementV1 {
+    u64 version = kWildcardAttemptVersion;
+    u64 transaction_id = 0u;
+    WildcardAttemptMode mode = WildcardAttemptMode::Canonical;
+    WildcardAttemptSettlementKind settlement = WildcardAttemptSettlementKind::AttemptSettled;
+    WildcardAttemptPhase terminal_phase = WildcardAttemptPhase::WildcardLive;
+    u64 sequence = 0u;
+};
+
+static bool valid_wildcard_attempt_mode(WildcardAttemptMode mode) {
+    switch (mode) {
+        case WildcardAttemptMode::Canonical:
+        case WildcardAttemptMode::MissingCollision:
+        case WildcardAttemptMode::PrematureGuardRelease:
+        case WildcardAttemptMode::WrongListenerKind:
+        case WildcardAttemptMode::WrongListenerAddress:
+        case WildcardAttemptMode::WrongListenerInode:
+        case WildcardAttemptMode::FalsePostReleaseSuccess:
+            return true;
+    }
+    return false;
+}
+
+static bool valid_wildcard_attempt_phase(WildcardAttemptPhase phase) {
+    switch (phase) {
+        case WildcardAttemptPhase::GuardHeld:
+        case WildcardAttemptPhase::ExactRutWitness:
+        case WildcardAttemptPhase::CollisionPrepared:
+        case WildcardAttemptPhase::CollisionRejected:
+        case WildcardAttemptPhase::ExactCleanedGuardHeld:
+        case WildcardAttemptPhase::GuardReleased:
+        case WildcardAttemptPhase::WildcardLive:
+            return true;
+    }
+    return false;
+}
+
+static bool valid_wildcard_attempt_mode_value(u64 value) {
+    return value >= static_cast<u64>(WildcardAttemptMode::Canonical) &&
+           value <= static_cast<u64>(WildcardAttemptMode::FalsePostReleaseSuccess);
+}
+
+static bool valid_wildcard_attempt_phase_value(u64 value) {
+    return value >= static_cast<u64>(WildcardAttemptPhase::GuardHeld) &&
+           value <= static_cast<u64>(WildcardAttemptPhase::WildcardLive);
+}
+
+static bool valid_wildcard_attempt_decision_value(u64 value) {
+    return value >= static_cast<u64>(WildcardAttemptDecisionKind::AuthorizeCollisionExec) &&
+           value <= static_cast<u64>(WildcardAttemptDecisionKind::Finish);
+}
+
+static bool valid_wildcard_attempt_settlement_value(u64 value) {
+    return value >= static_cast<u64>(WildcardAttemptSettlementKind::AttemptSettled) &&
+           value <= static_cast<u64>(WildcardAttemptSettlementKind::MutationSettled);
+}
+
+static u64 wildcard_phase_sequence(WildcardAttemptPhase phase) {
+    switch (phase) {
+        case WildcardAttemptPhase::GuardHeld:
+            return 1u;
+        case WildcardAttemptPhase::ExactRutWitness:
+            return 2u;
+        case WildcardAttemptPhase::CollisionPrepared:
+            return 3u;
+        case WildcardAttemptPhase::CollisionRejected:
+            return 5u;
+        case WildcardAttemptPhase::ExactCleanedGuardHeld:
+            return 7u;
+        case WildcardAttemptPhase::GuardReleased:
+            return 9u;
+        case WildcardAttemptPhase::WildcardLive:
+            return 11u;
+    }
+    return 0u;
+}
+
+static u64 wildcard_phase_sequence_value(u64 phase) {
+    switch (phase) {
+        case static_cast<u64>(WildcardAttemptPhase::GuardHeld):
+            return 1u;
+        case static_cast<u64>(WildcardAttemptPhase::ExactRutWitness):
+            return 2u;
+        case static_cast<u64>(WildcardAttemptPhase::CollisionPrepared):
+            return 3u;
+        case static_cast<u64>(WildcardAttemptPhase::CollisionRejected):
+            return 5u;
+        case static_cast<u64>(WildcardAttemptPhase::ExactCleanedGuardHeld):
+            return 7u;
+        case static_cast<u64>(WildcardAttemptPhase::GuardReleased):
+            return 9u;
+        case static_cast<u64>(WildcardAttemptPhase::WildcardLive):
+            return 11u;
+    }
+    return 0u;
+}
+
+static u64 wildcard_rejection_checkpoint_value(u64 mode) {
+    switch (mode) {
+        case static_cast<u64>(WildcardAttemptMode::MissingCollision):
+        case static_cast<u64>(WildcardAttemptMode::PrematureGuardRelease):
+            return static_cast<u64>(WildcardAttemptPhase::CollisionRejected);
+        case static_cast<u64>(WildcardAttemptMode::WrongListenerKind):
+        case static_cast<u64>(WildcardAttemptMode::WrongListenerAddress):
+        case static_cast<u64>(WildcardAttemptMode::WrongListenerInode):
+        case static_cast<u64>(WildcardAttemptMode::FalsePostReleaseSuccess):
+            return static_cast<u64>(WildcardAttemptPhase::WildcardLive);
+        case static_cast<u64>(WildcardAttemptMode::Canonical):
+            return 0u;
+    }
+    return 0u;
+}
+
+static WildcardAttemptPhase wildcard_rejection_checkpoint(WildcardAttemptMode mode) {
+    switch (mode) {
+        case WildcardAttemptMode::MissingCollision:
+        case WildcardAttemptMode::PrematureGuardRelease:
+            return WildcardAttemptPhase::CollisionRejected;
+        case WildcardAttemptMode::WrongListenerKind:
+        case WildcardAttemptMode::WrongListenerAddress:
+        case WildcardAttemptMode::WrongListenerInode:
+        case WildcardAttemptMode::FalsePostReleaseSuccess:
+            return WildcardAttemptPhase::WildcardLive;
+        case WildcardAttemptMode::Canonical:
+            break;
+    }
+    return static_cast<WildcardAttemptPhase>(0u);
+}
+
+template <std::size_t Size>
+static bool decode_wildcard_fields(const std::vector<unsigned char>& payload,
+                                   std::array<u64, Size>& fields) {
+    if (payload.size() != Size * sizeof(u64)) return false;
+    for (std::size_t i = 0u; i != fields.size(); ++i)
+        fields[i] = read_u64(payload.data() + i * sizeof(u64));
+    return true;
+}
+
+template <std::size_t Size>
+static std::vector<unsigned char> encode_wildcard_fields(const std::array<u64, Size>& fields) {
+    std::vector<unsigned char> payload;
+    for (u64 field : fields) append_u64(payload, field);
+    return payload;
+}
+
+static bool valid_wildcard_command(const WildcardAttemptCommandV1& command) {
+    return command.version == kWildcardAttemptVersion && command.transaction_id != 0u &&
+           valid_wildcard_attempt_mode(command.mode) && command.sequence == 0u;
+}
+
+static std::vector<unsigned char> encode_wildcard_command(const WildcardAttemptCommandV1& command) {
+    return encode_wildcard_fields(std::array<u64, 4u>{
+        command.version, command.transaction_id, static_cast<u64>(command.mode), command.sequence});
+}
+
+static bool decode_wildcard_command(const std::vector<unsigned char>& payload,
+                                    WildcardAttemptCommandV1& command) {
+    std::array<u64, 4u> fields{};
+    if (!decode_wildcard_fields(payload, fields) || fields[0] != kWildcardAttemptVersion ||
+        fields[1] == 0u || !valid_wildcard_attempt_mode_value(fields[2]) || fields[3] != 0u)
+        return false;
+    const WildcardAttemptCommandV1 decoded{
+        fields[0], fields[1], static_cast<WildcardAttemptMode>(fields[2]), fields[3]};
+    command = decoded;
+    return true;
+}
+
+static bool valid_wildcard_phase(const WildcardAttemptPhaseV1& witness) {
+    return witness.version == kWildcardAttemptVersion && witness.transaction_id != 0u &&
+           valid_wildcard_attempt_mode(witness.mode) &&
+           valid_wildcard_attempt_phase(witness.phase) &&
+           witness.sequence == wildcard_phase_sequence(witness.phase);
+}
+
+static std::vector<unsigned char> encode_wildcard_phase(const WildcardAttemptPhaseV1& witness) {
+    return encode_wildcard_fields(std::array<u64, 5u>{witness.version,
+                                                      witness.transaction_id,
+                                                      static_cast<u64>(witness.mode),
+                                                      static_cast<u64>(witness.phase),
+                                                      witness.sequence});
+}
+
+static bool decode_wildcard_phase(const std::vector<unsigned char>& payload,
+                                  WildcardAttemptPhaseV1& witness) {
+    std::array<u64, 5u> fields{};
+    if (!decode_wildcard_fields(payload, fields) || fields[0] != kWildcardAttemptVersion ||
+        fields[1] == 0u || !valid_wildcard_attempt_mode_value(fields[2]) ||
+        !valid_wildcard_attempt_phase_value(fields[3]) ||
+        fields[4] != wildcard_phase_sequence_value(fields[3]))
+        return false;
+    const WildcardAttemptPhaseV1 decoded{fields[0],
+                                         fields[1],
+                                         static_cast<WildcardAttemptMode>(fields[2]),
+                                         static_cast<WildcardAttemptPhase>(fields[3]),
+                                         fields[4]};
+    witness = decoded;
+    return true;
+}
+
+static bool valid_wildcard_decision(const WildcardAttemptDecisionV1& decision) {
+    if (decision.version != kWildcardAttemptVersion || decision.transaction_id == 0u ||
+        !valid_wildcard_attempt_mode(decision.mode) ||
+        !valid_wildcard_attempt_phase(decision.for_phase))
+        return false;
+    switch (decision.decision) {
+        case WildcardAttemptDecisionKind::AuthorizeCollisionExec:
+            return decision.for_phase == WildcardAttemptPhase::CollisionPrepared &&
+                   decision.sequence == 4u;
+        case WildcardAttemptDecisionKind::AuthorizeExactCleanup:
+            return decision.for_phase == WildcardAttemptPhase::CollisionRejected &&
+                   decision.sequence == 6u;
+        case WildcardAttemptDecisionKind::AuthorizeGuardRelease:
+            return decision.for_phase == WildcardAttemptPhase::ExactCleanedGuardHeld &&
+                   decision.sequence == 8u;
+        case WildcardAttemptDecisionKind::AuthorizeWildcardExec:
+            return decision.for_phase == WildcardAttemptPhase::GuardReleased &&
+                   decision.sequence == 10u;
+        case WildcardAttemptDecisionKind::AuthorizeWildcardCleanup:
+            return decision.for_phase == WildcardAttemptPhase::WildcardLive &&
+                   decision.sequence == 12u;
+        case WildcardAttemptDecisionKind::RejectAndCleanup:
+            return decision.mode != WildcardAttemptMode::Canonical &&
+                   decision.for_phase == wildcard_rejection_checkpoint(decision.mode) &&
+                   decision.sequence == wildcard_phase_sequence(decision.for_phase);
+        case WildcardAttemptDecisionKind::Finish:
+            return decision.mode == WildcardAttemptMode::Canonical &&
+                   decision.for_phase == WildcardAttemptPhase::WildcardLive &&
+                   decision.sequence == 14u;
+    }
+    return false;
+}
+
+static std::vector<unsigned char> encode_wildcard_decision(
+    const WildcardAttemptDecisionV1& decision) {
+    return encode_wildcard_fields(std::array<u64, 6u>{decision.version,
+                                                      decision.transaction_id,
+                                                      static_cast<u64>(decision.mode),
+                                                      static_cast<u64>(decision.decision),
+                                                      static_cast<u64>(decision.for_phase),
+                                                      decision.sequence});
+}
+
+static bool decode_wildcard_decision(const std::vector<unsigned char>& payload,
+                                     WildcardAttemptDecisionV1& decision) {
+    std::array<u64, 6u> fields{};
+    if (!decode_wildcard_fields(payload, fields) || fields[0] != kWildcardAttemptVersion ||
+        fields[1] == 0u || !valid_wildcard_attempt_mode_value(fields[2]) ||
+        !valid_wildcard_attempt_decision_value(fields[3]) ||
+        !valid_wildcard_attempt_phase_value(fields[4]))
+        return false;
+    const u64 checkpoint = wildcard_rejection_checkpoint_value(fields[2]);
+    bool valid = false;
+    switch (fields[3]) {
+        case static_cast<u64>(WildcardAttemptDecisionKind::AuthorizeCollisionExec):
+            valid = fields[4] == static_cast<u64>(WildcardAttemptPhase::CollisionPrepared) &&
+                    fields[5] == 4u;
+            break;
+        case static_cast<u64>(WildcardAttemptDecisionKind::AuthorizeExactCleanup):
+            valid = fields[4] == static_cast<u64>(WildcardAttemptPhase::CollisionRejected) &&
+                    fields[5] == 6u;
+            break;
+        case static_cast<u64>(WildcardAttemptDecisionKind::AuthorizeGuardRelease):
+            valid = fields[4] == static_cast<u64>(WildcardAttemptPhase::ExactCleanedGuardHeld) &&
+                    fields[5] == 8u;
+            break;
+        case static_cast<u64>(WildcardAttemptDecisionKind::AuthorizeWildcardExec):
+            valid = fields[4] == static_cast<u64>(WildcardAttemptPhase::GuardReleased) &&
+                    fields[5] == 10u;
+            break;
+        case static_cast<u64>(WildcardAttemptDecisionKind::AuthorizeWildcardCleanup):
+            valid = fields[4] == static_cast<u64>(WildcardAttemptPhase::WildcardLive) &&
+                    fields[5] == 12u;
+            break;
+        case static_cast<u64>(WildcardAttemptDecisionKind::RejectAndCleanup):
+            valid = fields[2] != static_cast<u64>(WildcardAttemptMode::Canonical) &&
+                    fields[4] == checkpoint &&
+                    fields[5] == wildcard_phase_sequence_value(fields[4]);
+            break;
+        case static_cast<u64>(WildcardAttemptDecisionKind::Finish):
+            valid = fields[2] == static_cast<u64>(WildcardAttemptMode::Canonical) &&
+                    fields[4] == static_cast<u64>(WildcardAttemptPhase::WildcardLive) &&
+                    fields[5] == 14u;
+            break;
+    }
+    if (!valid) return false;
+    const WildcardAttemptDecisionV1 decoded{fields[0],
+                                            fields[1],
+                                            static_cast<WildcardAttemptMode>(fields[2]),
+                                            static_cast<WildcardAttemptDecisionKind>(fields[3]),
+                                            static_cast<WildcardAttemptPhase>(fields[4]),
+                                            fields[5]};
+    decision = decoded;
+    return true;
+}
+
+static bool valid_wildcard_settlement(const WildcardAttemptSettlementV1& settlement) {
+    if (settlement.version != kWildcardAttemptVersion || settlement.transaction_id == 0u ||
+        !valid_wildcard_attempt_mode(settlement.mode) ||
+        !valid_wildcard_attempt_phase(settlement.terminal_phase))
+        return false;
+    switch (settlement.settlement) {
+        case WildcardAttemptSettlementKind::AttemptSettled:
+            return settlement.mode == WildcardAttemptMode::Canonical &&
+                   settlement.terminal_phase == WildcardAttemptPhase::WildcardLive &&
+                   settlement.sequence == 13u;
+        case WildcardAttemptSettlementKind::MutationSettled:
+            return settlement.mode != WildcardAttemptMode::Canonical &&
+                   settlement.terminal_phase == wildcard_rejection_checkpoint(settlement.mode) &&
+                   settlement.sequence == wildcard_phase_sequence(settlement.terminal_phase) + 1u;
+    }
+    return false;
+}
+
+static std::vector<unsigned char> encode_wildcard_settlement(
+    const WildcardAttemptSettlementV1& settlement) {
+    return encode_wildcard_fields(std::array<u64, 6u>{settlement.version,
+                                                      settlement.transaction_id,
+                                                      static_cast<u64>(settlement.mode),
+                                                      static_cast<u64>(settlement.settlement),
+                                                      static_cast<u64>(settlement.terminal_phase),
+                                                      settlement.sequence});
+}
+
+static bool decode_wildcard_settlement(const std::vector<unsigned char>& payload,
+                                       WildcardAttemptSettlementV1& settlement) {
+    std::array<u64, 6u> fields{};
+    if (!decode_wildcard_fields(payload, fields) || fields[0] != kWildcardAttemptVersion ||
+        fields[1] == 0u || !valid_wildcard_attempt_mode_value(fields[2]) ||
+        !valid_wildcard_attempt_settlement_value(fields[3]) ||
+        !valid_wildcard_attempt_phase_value(fields[4]))
+        return false;
+    bool valid = false;
+    switch (fields[3]) {
+        case static_cast<u64>(WildcardAttemptSettlementKind::AttemptSettled):
+            valid = fields[2] == static_cast<u64>(WildcardAttemptMode::Canonical) &&
+                    fields[4] == static_cast<u64>(WildcardAttemptPhase::WildcardLive) &&
+                    fields[5] == 13u;
+            break;
+        case static_cast<u64>(WildcardAttemptSettlementKind::MutationSettled):
+            valid = fields[2] != static_cast<u64>(WildcardAttemptMode::Canonical) &&
+                    fields[4] == wildcard_rejection_checkpoint_value(fields[2]) &&
+                    fields[5] == wildcard_phase_sequence_value(fields[4]) + 1u;
+            break;
+    }
+    if (!valid) return false;
+    const WildcardAttemptSettlementV1 decoded{fields[0],
+                                              fields[1],
+                                              static_cast<WildcardAttemptMode>(fields[2]),
+                                              static_cast<WildcardAttemptSettlementKind>(fields[3]),
+                                              static_cast<WildcardAttemptPhase>(fields[4]),
+                                              fields[5]};
+    settlement = decoded;
+    return true;
+}
+
+class WildcardAttemptStateMachine {
+public:
+    bool begin(const WildcardAttemptCommandV1& command) {
+        if (state_ != State::Empty || !valid_wildcard_command(command)) return fail();
+        version_ = command.version;
+        transaction_id_ = command.transaction_id;
+        mode_ = command.mode;
+        state_ = State::AwaitGuardHeld;
+        return true;
+    }
+
+    bool observe(const WildcardAttemptPhaseV1& witness) {
+        if (!bound(witness.version, witness.transaction_id, witness.mode) ||
+            !valid_wildcard_phase(witness))
+            return fail();
+        switch (state_) {
+            case State::AwaitGuardHeld:
+                return accept_phase(
+                    witness, WildcardAttemptPhase::GuardHeld, State::AwaitExactRutWitness);
+            case State::AwaitExactRutWitness:
+                return accept_phase(
+                    witness, WildcardAttemptPhase::ExactRutWitness, State::AwaitCollisionPrepared);
+            case State::AwaitCollisionPrepared:
+                return accept_phase(witness,
+                                    WildcardAttemptPhase::CollisionPrepared,
+                                    State::AwaitCollisionAuthorization);
+            case State::AwaitCollisionRejected:
+                if (wildcard_rejection_checkpoint(mode_) == WildcardAttemptPhase::CollisionRejected)
+                    return fail();
+                return accept_phase(witness,
+                                    WildcardAttemptPhase::CollisionRejected,
+                                    State::AwaitExactCleanupAuthorization);
+            case State::AwaitExactCleanedGuardHeld:
+                return accept_phase(witness,
+                                    WildcardAttemptPhase::ExactCleanedGuardHeld,
+                                    State::AwaitGuardReleaseAuthorization);
+            case State::AwaitGuardReleased:
+                return accept_phase(witness,
+                                    WildcardAttemptPhase::GuardReleased,
+                                    State::AwaitWildcardAuthorization);
+            case State::AwaitWildcardLive:
+                if (mode_ != WildcardAttemptMode::Canonical) return fail();
+                return accept_phase(witness,
+                                    WildcardAttemptPhase::WildcardLive,
+                                    State::AwaitWildcardCleanupAuthorization);
+            case State::Empty:
+            case State::AwaitCollisionAuthorization:
+            case State::AwaitExactCleanupAuthorization:
+            case State::AwaitGuardReleaseAuthorization:
+            case State::AwaitWildcardAuthorization:
+            case State::AwaitWildcardCleanupAuthorization:
+            case State::AwaitAttemptSettlement:
+            case State::AwaitFinish:
+            case State::AwaitMutationSettlement:
+            case State::Complete:
+            case State::MutationRejected:
+            case State::Failed:
+                return fail();
+        }
+        return fail();
+    }
+
+    bool decide(const WildcardAttemptDecisionV1& decision) {
+        if (!bound(decision.version, decision.transaction_id, decision.mode) ||
+            !valid_wildcard_decision(decision))
+            return fail();
+        switch (state_) {
+            case State::AwaitCollisionAuthorization:
+                return accept_decision(decision,
+                                       WildcardAttemptDecisionKind::AuthorizeCollisionExec,
+                                       State::AwaitCollisionRejected);
+            case State::AwaitCollisionRejected:
+            case State::AwaitWildcardLive:
+                if (decision.decision != WildcardAttemptDecisionKind::RejectAndCleanup ||
+                    mode_ == WildcardAttemptMode::Canonical ||
+                    decision.for_phase != wildcard_rejection_checkpoint(mode_))
+                    return fail();
+                state_ = State::AwaitMutationSettlement;
+                return true;
+            case State::AwaitExactCleanupAuthorization:
+                return accept_decision(decision,
+                                       WildcardAttemptDecisionKind::AuthorizeExactCleanup,
+                                       State::AwaitExactCleanedGuardHeld);
+            case State::AwaitGuardReleaseAuthorization:
+                return accept_decision(decision,
+                                       WildcardAttemptDecisionKind::AuthorizeGuardRelease,
+                                       State::AwaitGuardReleased);
+            case State::AwaitWildcardAuthorization:
+                return accept_decision(decision,
+                                       WildcardAttemptDecisionKind::AuthorizeWildcardExec,
+                                       State::AwaitWildcardLive);
+            case State::AwaitWildcardCleanupAuthorization:
+                return accept_decision(decision,
+                                       WildcardAttemptDecisionKind::AuthorizeWildcardCleanup,
+                                       State::AwaitAttemptSettlement);
+            case State::AwaitFinish:
+                return accept_decision(
+                    decision, WildcardAttemptDecisionKind::Finish, State::Complete);
+            case State::Empty:
+            case State::AwaitGuardHeld:
+            case State::AwaitExactRutWitness:
+            case State::AwaitCollisionPrepared:
+            case State::AwaitExactCleanedGuardHeld:
+            case State::AwaitGuardReleased:
+            case State::AwaitAttemptSettlement:
+            case State::AwaitMutationSettlement:
+            case State::Complete:
+            case State::MutationRejected:
+            case State::Failed:
+                return fail();
+        }
+        return fail();
+    }
+
+    bool settle(const WildcardAttemptSettlementV1& settlement) {
+        if (!bound(settlement.version, settlement.transaction_id, settlement.mode) ||
+            !valid_wildcard_settlement(settlement))
+            return fail();
+        if (state_ == State::AwaitAttemptSettlement &&
+            settlement.settlement == WildcardAttemptSettlementKind::AttemptSettled) {
+            state_ = State::AwaitFinish;
+            return true;
+        }
+        if (state_ == State::AwaitMutationSettlement &&
+            settlement.settlement == WildcardAttemptSettlementKind::MutationSettled) {
+            state_ = State::MutationRejected;
+            return true;
+        }
+        return fail();
+    }
+
+    bool complete() const { return state_ == State::Complete; }
+    bool mutation_rejected() const { return state_ == State::MutationRejected; }
+    bool failed() const { return state_ == State::Failed; }
+
+private:
+    enum class State {
+        Empty,
+        AwaitGuardHeld,
+        AwaitExactRutWitness,
+        AwaitCollisionPrepared,
+        AwaitCollisionAuthorization,
+        AwaitCollisionRejected,
+        AwaitExactCleanupAuthorization,
+        AwaitExactCleanedGuardHeld,
+        AwaitGuardReleaseAuthorization,
+        AwaitGuardReleased,
+        AwaitWildcardAuthorization,
+        AwaitWildcardLive,
+        AwaitWildcardCleanupAuthorization,
+        AwaitAttemptSettlement,
+        AwaitFinish,
+        AwaitMutationSettlement,
+        Complete,
+        MutationRejected,
+        Failed,
+    };
+
+    bool bound(u64 version, u64 transaction_id, WildcardAttemptMode mode) const {
+        return state_ != State::Empty && state_ != State::Complete &&
+               state_ != State::MutationRejected && state_ != State::Failed &&
+               version == version_ && transaction_id == transaction_id_ && mode == mode_;
+    }
+
+    bool accept_phase(const WildcardAttemptPhaseV1& witness,
+                      WildcardAttemptPhase expected,
+                      State next) {
+        if (witness.phase != expected) return fail();
+        state_ = next;
+        return true;
+    }
+
+    bool accept_decision(const WildcardAttemptDecisionV1& decision,
+                         WildcardAttemptDecisionKind expected,
+                         State next) {
+        if (decision.decision != expected) return fail();
+        state_ = next;
+        return true;
+    }
+
+    bool fail() {
+        state_ = State::Failed;
+        return false;
+    }
+
+    State state_ = State::Empty;
+    u64 version_ = 0u;
+    u64 transaction_id_ = 0u;
+    WildcardAttemptMode mode_ = WildcardAttemptMode::Canonical;
+};
+
 static std::vector<unsigned char> executable_lease_payload(const ExecutableLease& lease) {
     std::vector<unsigned char> payload;
     payload.reserve(7u * sizeof(u64) + lease.path.size());
@@ -1334,16 +2085,31 @@ static std::vector<unsigned char> encode_exact_report(const ExactRutReport& repo
         report.guard_connect_error,
         report.stable,
         report.backend,
+        report.request_bytes,
+        report.completed_send,
+        report.upstream_absence_probe_refused,
+        report.response_body_bytes,
+        report.response_status,
+        report.response_headers_exact,
+        report.guard_before_connect_error,
     };
     std::vector<unsigned char> payload;
-    payload.reserve(fields.size() * sizeof(u64));
+    payload.reserve(fields.size() * sizeof(u64) + 2u * sizeof(u64) + report.request_wire.size() +
+                    report.response_wire.size());
     for (u64 field : fields) append_u64(payload, field);
+    append_u64(payload, report.request_wire.size());
+    payload.insert(payload.end(), report.request_wire.begin(), report.request_wire.end());
+    append_u64(payload, report.response_wire.size());
+    payload.insert(payload.end(), report.response_wire.begin(), report.response_wire.end());
     return payload;
 }
 
 static bool decode_exact_report(const std::vector<unsigned char>& payload, ExactRutReport& report) {
     report = {};
-    if (payload.size() != kExactReportFields * sizeof(u64)) return false;
+    if (payload.size() < kExactReportFields * sizeof(u64) + 2u * sizeof(u64) ||
+        payload.size() > kExactReportFields * sizeof(u64) + 2u * sizeof(u64) +
+                             kExactMaxRequestBytes + kExactMaxResponseBytes)
+        return false;
     std::array<u64, kExactReportFields> fields{};
     for (std::size_t i = 0u; i < kExactReportFields; ++i)
         fields[i] = read_u64(payload.data() + i * sizeof(u64));
@@ -1351,7 +2117,23 @@ static bool decode_exact_report(const std::vector<unsigned char>& payload, Exact
     report = {fields[0],  fields[1],  fields[2],  fields[3],  fields[4],  fields[5],  fields[6],
               fields[7],  fields[8],  fields[9],  fields[10], fields[11], fields[12], fields[13],
               fields[14], fields[15], fields[16], fields[17], fields[18], fields[19], fields[20],
-              fields[21], fields[22], fields[23], fields[24]};
+              fields[21], fields[22], fields[23], fields[24], fields[25], fields[26], fields[27],
+              fields[28], fields[29], fields[30], fields[31]};
+    std::size_t offset = kExactReportFields * sizeof(u64);
+    const u64 request_size = read_u64(payload.data() + offset);
+    offset += sizeof(u64);
+    if (request_size > kExactMaxRequestBytes || request_size > payload.size() - offset)
+        return false;
+    report.request_wire.assign(reinterpret_cast<const char*>(payload.data() + offset),
+                               request_size);
+    offset += request_size;
+    if (offset + sizeof(u64) > payload.size()) return false;
+    const u64 response_size = read_u64(payload.data() + offset);
+    offset += sizeof(u64);
+    if (response_size > kExactMaxResponseBytes || response_size != payload.size() - offset)
+        return false;
+    report.response_wire.assign(reinterpret_cast<const char*>(payload.data() + offset),
+                                response_size);
     return report.version == kExactProtocolVersion;
 }
 
@@ -1395,71 +2177,6 @@ static bool decode_exact_cleaned(const std::vector<unsigned char>& payload,
               fields[9],
               fields[10]};
     return report.version == kExactProtocolVersion;
-}
-
-static std::vector<unsigned char> encode_wildcard_handoff(const WildcardHandoffReport& report) {
-    const std::array<u64, kWildcardHandoffFields> fields{
-        report.version,
-        report.collision_pid,
-        report.collision_start,
-        report.collision_exit_one,
-        report.collision_pidfd_invalidated,
-        report.collision_log_eaddrinuse,
-        report.collision_no_wildcard,
-        report.collision_exact_live,
-        report.collision_guard_live,
-        report.collision_source_absent,
-        report.collision_log_absent,
-        report.collision_response_bytes,
-        report.exact_reaped,
-        report.exact_listener_absent,
-        report.exact_temps_absent,
-        report.guard_invalidated,
-        report.port_absent_before_retry,
-        report.same_source,
-        report.wildcard_pid,
-        report.wildcard_start,
-        report.wildcard_listener_inode,
-        report.wildcard_kind,
-        report.positive_response_bytes,
-        report.positive_response_exact,
-        report.positive_prompt_eof,
-        report.guard_response_bytes,
-        report.guard_response_exact,
-        report.guard_prompt_eof,
-        report.wildcard_stable,
-        report.wildcard_clean_exit,
-        report.wildcard_pidfd_invalidated,
-        report.wildcard_child_absent,
-        report.wildcard_listener_absent,
-        report.wildcard_source_absent,
-        report.wildcard_log_absent,
-        report.target_fd_count,
-        report.positive_ipv4,
-        report.guard_ipv4,
-        report.port,
-    };
-    std::vector<unsigned char> payload;
-    payload.reserve(fields.size() * sizeof(u64));
-    for (u64 field : fields) append_u64(payload, field);
-    return payload;
-}
-
-static bool decode_wildcard_handoff(const std::vector<unsigned char>& payload,
-                                    WildcardHandoffReport& report) {
-    report = {};
-    if (payload.size() != kWildcardHandoffFields * sizeof(u64)) return false;
-    std::array<u64, kWildcardHandoffFields> fields{};
-    for (std::size_t i = 0u; i < fields.size(); ++i)
-        fields[i] = read_u64(payload.data() + i * sizeof(u64));
-    if (fields[0] != kWildcardHandoffVersion) return false;
-    report = {fields[0],  fields[1],  fields[2],  fields[3],  fields[4],  fields[5],  fields[6],
-              fields[7],  fields[8],  fields[9],  fields[10], fields[11], fields[12], fields[13],
-              fields[14], fields[15], fields[16], fields[17], fields[18], fields[19], fields[20],
-              fields[21], fields[22], fields[23], fields[24], fields[25], fields[26], fields[27],
-              fields[28], fields[29], fields[30], fields[31], fields[32], fields[33], fields[34],
-              fields[35], fields[36], fields[37], fields[38]};
-    return report.version == kWildcardHandoffVersion;
 }
 
 static std::vector<unsigned char> exact_cleanup_payload() {
@@ -1937,6 +2654,2152 @@ static bool parse_guard_request(const std::vector<unsigned char>& payload,
     privileged_listener::ListenerPlanText text;
     privileged_listener::Diagnostic diagnostic;
     return privileged_listener::validate_listener_plan(plan, text, diagnostic);
+}
+
+// Canonical collision/release keeps the existing two-address guard request but
+// carries the already pinned RUT pathname in a bounded, length-delimited tail.
+// The Target reopens and pins this name itself; the parent never passes an FD.
+static std::vector<unsigned char> canonical_request_payload(u32 positive_ipv4,
+                                                            u32 guard_ipv4,
+                                                            const std::string& executable) {
+    std::vector<unsigned char> payload = guard_request_payload(positive_ipv4, guard_ipv4);
+    append_u64(payload, executable.size());
+    payload.insert(payload.end(), executable.begin(), executable.end());
+    return payload;
+}
+
+static bool parse_canonical_request(const std::vector<unsigned char>& payload,
+                                    u32& positive_ipv4,
+                                    u32& guard_ipv4,
+                                    std::string& executable) {
+    executable.clear();
+    if (payload.size() < 3u * sizeof(u64)) return false;
+    std::vector<unsigned char> guard_payload(payload.begin(), payload.begin() + 2u * sizeof(u64));
+    if (!parse_guard_request(guard_payload, positive_ipv4, guard_ipv4)) return false;
+    const u64 length = read_u64(payload.data() + 2u * sizeof(u64));
+    if (length == 0u || length > PATH_MAX || length != payload.size() - 3u * sizeof(u64) ||
+        length > collision_evidence::kMaxSourcePath)
+        return false;
+    executable.assign(reinterpret_cast<const char*>(payload.data() + 3u * sizeof(u64)),
+                      static_cast<std::size_t>(length));
+    return executable.front() == '/' && executable.find('\0') == std::string::npos;
+}
+
+static ssize_t canonical_source_pread(int fd, void* buffer, std::size_t size, off_t offset) {
+    return pread(fd, buffer, size, offset);
+}
+
+static collision_evidence::Proc13 canonical_proc13(const ProcIdentity& value) {
+    return {static_cast<u64>(value.pid),
+            static_cast<u64>(value.ppid),
+            static_cast<u64>(value.sid),
+            value.start,
+            static_cast<u64>(value.pgid),
+            static_cast<u64>(value.uid),
+            static_cast<u64>(value.gid),
+            static_cast<u64>(value.netns),
+            static_cast<u64>(value.exe_dev),
+            static_cast<u64>(value.exe_ino),
+            value.no_new_privs ? 1u : 0u,
+            value.capabilities_clear ? 1u : 0u,
+            static_cast<u64>(value.supplementary_groups)};
+}
+
+static collision_evidence::ProcPair canonical_proc_pair(
+    const public_attempt::PublicRutAttemptLease& attempt_lease, bool live) {
+    collision_evidence::ProcPair value;
+    if (!live) return value;
+    value.first_tag = 1u;
+    value.second_tag = 1u;
+    value.first = canonical_proc13(attempt_lease.exec_observation().first);
+    value.second = canonical_proc13(attempt_lease.exec_observation().second);
+    return value;
+}
+
+static collision_evidence::Settlement9 canonical_settlement(
+    const std::shared_ptr<const public_attempt::child::SettlementReceipt>& receipt) {
+    if (!receipt) return {};
+    return {static_cast<u64>(receipt->child_pid),
+            static_cast<u64>(receipt->identity.pid),
+            static_cast<u64>(receipt->identity.ppid),
+            receipt->identity.start,
+            static_cast<u64>(receipt->identity.netns),
+            receipt->terminal ? 1u : 0u,
+            receipt->reaped ? 1u : 0u,
+            static_cast<u64>(receipt->wait_status),
+            static_cast<u64>(receipt->error_number)};
+}
+
+static collision_evidence::Cleanup14 canonical_cleanup(
+    const std::shared_ptr<const public_attempt::CleanupState>& value) {
+    if (!value) return {};
+    return {value->destructor_attempted ? 1u : 0u,
+            value->destructor_reportable_success ? 1u : 0u,
+            value->child_attempted ? 1u : 0u,
+            value->child_settled ? 1u : 0u,
+            value->handoff_attempted ? 1u : 0u,
+            value->handoff_closed ? 1u : 0u,
+            value->null_attempted ? 1u : 0u,
+            value->null_closed ? 1u : 0u,
+            value->capture_settle_attempted ? 1u : 0u,
+            value->capture_settled ? 1u : 0u,
+            value->capture_close_attempted ? 1u : 0u,
+            value->capture_closed ? 1u : 0u,
+            static_cast<u64>(value->diagnostic.phase),
+            static_cast<u64>(value->diagnostic.error_number)};
+}
+
+static bool canonical_proc_link(int fd, std::string& link) {
+    link.clear();
+    if (fd < 0) return false;
+    std::array<char, collision_evidence::kMaxProcLink + 1u> buffer{};
+    const ssize_t length = readlink((std::string("/proc/self/fd/") + std::to_string(fd)).c_str(),
+                                    buffer.data(),
+                                    buffer.size() - 1u);
+    if (length <= 0 || static_cast<std::size_t>(length) >= buffer.size()) return false;
+    link.assign(buffer.data(), static_cast<std::size_t>(length));
+    return link.starts_with("socket:[") && link.back() == ']';
+}
+
+static bool canonical_socket_fields(int fd,
+                                    u64& g_fgetfd,
+                                    u64& g_fgetfl,
+                                    u64& mode,
+                                    u64& device,
+                                    u64& rdevice,
+                                    u64& domain,
+                                    u64& type,
+                                    u64& protocol,
+                                    u64& reuseaddr,
+                                    u64& reuseport,
+                                    u64& acceptconn,
+                                    u64& inode,
+                                    std::string& proc_link) {
+    struct stat status{};
+    const int fgetfd = fcntl(fd, F_GETFD);
+    const int fgetfl = fcntl(fd, F_GETFL);
+    int socket_domain = 0, socket_type = 0, socket_protocol = 0;
+    int socket_reuseaddr = 0, socket_reuseport = 0, socket_acceptconn = 0;
+    socklen_t size = sizeof(int);
+    if (fd < 0 || fgetfd < 0 || fgetfl < 0 || fstat(fd, &status) != 0 ||
+        getsockopt(fd, SOL_SOCKET, SO_DOMAIN, &socket_domain, &size) != 0)
+        return false;
+    size = sizeof(int);
+    if (getsockopt(fd, SOL_SOCKET, SO_TYPE, &socket_type, &size) != 0) return false;
+    size = sizeof(int);
+    if (getsockopt(fd, SOL_SOCKET, SO_PROTOCOL, &socket_protocol, &size) != 0) return false;
+    size = sizeof(int);
+    if (getsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &socket_reuseaddr, &size) != 0) return false;
+    size = sizeof(int);
+    if (getsockopt(fd, SOL_SOCKET, SO_REUSEPORT, &socket_reuseport, &size) != 0) return false;
+    size = sizeof(int);
+    if (getsockopt(fd, SOL_SOCKET, SO_ACCEPTCONN, &socket_acceptconn, &size) != 0) return false;
+    if (!canonical_proc_link(fd, proc_link)) return false;
+    g_fgetfd = static_cast<u64>(fgetfd);
+    g_fgetfl = static_cast<u64>(fgetfl);
+    mode = static_cast<u64>(status.st_mode);
+    device = static_cast<u64>(status.st_dev);
+    rdevice = static_cast<u64>(status.st_rdev);
+    domain = static_cast<u64>(socket_domain);
+    type = static_cast<u64>(socket_type);
+    protocol = static_cast<u64>(socket_protocol);
+    reuseaddr = static_cast<u64>(socket_reuseaddr);
+    reuseport = static_cast<u64>(socket_reuseport);
+    acceptconn = static_cast<u64>(socket_acceptconn);
+    inode = static_cast<u64>(status.st_ino);
+    return S_ISSOCK(status.st_mode) && inode != 0u &&
+           proc_link == "socket:[" + std::to_string(inode) + "]";
+}
+
+static bool canonical_reservation_source(
+    const exact_reservation::ExactTcpReservationLease& reservation,
+    const source_lease::WildcardAttemptSourceLease& source,
+    const private_directory::PrivateDirectoryLease& directory,
+    const std::string& source_bytes,
+    const ProcIdentity& target,
+    collision_evidence::ReservationSource& report) {
+    report = {};
+    struct stat source_status{};
+    if (!source.active() || source.state() != source_lease::State::Active ||
+        reservation.state() != exact_reservation::State::Held ||
+        fstat(source.descriptor(), &source_status) != 0 || !S_ISREG(source_status.st_mode) ||
+        source_status.st_nlink != 1 || source_status.st_size < 0 ||
+        static_cast<u64>(source_status.st_size) != source_bytes.size())
+        return false;
+    u64 g_fgetfd = 0u, g_fgetfl = 0u, mode = 0u, device = 0u, rdevice = 0u, domain = 0u, type = 0u;
+    u64 protocol = 0u, reuseaddr = 0u, reuseport = 0u, acceptconn = 0u, inode = 0u;
+    std::string proc_link;
+    source_lease::Diagnostic source_diagnostic;
+    if (!canonical_socket_fields(reservation.descriptor(),
+                                 g_fgetfd,
+                                 g_fgetfl,
+                                 mode,
+                                 device,
+                                 rdevice,
+                                 domain,
+                                 type,
+                                 protocol,
+                                 reuseaddr,
+                                 reuseport,
+                                 acceptconn,
+                                 inode,
+                                 proc_link))
+        return false;
+    if (!source_lease::read_exact_bytes_for_testing(
+            source.descriptor(), source_bytes, canonical_source_pread, source_diagnostic))
+        return false;
+    report.reservation_state = static_cast<u64>(collision_evidence::ReservationState::Held);
+    report.g_fd = static_cast<u64>(reservation.descriptor());
+    report.g_f_getfd = g_fgetfd;
+    report.g_f_getfl = g_fgetfl;
+    report.ipv4 = reservation.ipv4();
+    report.port = reservation.port();
+    report.dev = device;
+    report.ino = inode;
+    report.mode = mode;
+    report.rdev = rdevice;
+    report.socket_domain = domain;
+    report.socket_type = type;
+    report.socket_protocol = protocol;
+    report.reuseaddr = reuseaddr;
+    report.reuseport = reuseport;
+    report.acceptconn = acceptconn;
+    report.proc_link_len = proc_link.size();
+    report.proc_link = proc_link;
+    report.directory_dev = directory.identity().device;
+    report.directory_ino = directory.identity().inode;
+    report.directory_mode = directory.identity().mode;
+    report.directory_uid = directory.identity().uid;
+    report.directory_gid = directory.identity().gid;
+    report.source_state = static_cast<u64>(collision_evidence::SourceState::Active);
+    report.source_dev = static_cast<u64>(source_status.st_dev);
+    report.source_ino = static_cast<u64>(source_status.st_ino);
+    report.source_mode = static_cast<u64>(source_status.st_mode);
+    report.source_uid = static_cast<u64>(source_status.st_uid);
+    report.source_gid = static_cast<u64>(source_status.st_gid);
+    report.source_size = static_cast<u64>(source_status.st_size);
+    report.source_nlink = static_cast<u64>(source_status.st_nlink);
+    report.path_len = source.path().size();
+    report.bytes_len = source_bytes.size();
+    report.source_path = source.path();
+    report.source_bytes = source_bytes;
+    return report.g_fd != 0u && report.ino == inode && target.pid > 1 &&
+           report.path_len <= collision_evidence::kMaxSourcePath &&
+           report.bytes_len <= collision_evidence::kMaxSourceBytes &&
+           report.source_path.front() == '/';
+}
+
+static collision_evidence::Envelope canonical_envelope_from_frame(
+    const Frame& frame, collision_evidence::ReportKind expected_kind) {
+    collision_evidence::Envelope value;
+    if (frame.type != collision_evidence::kEvidenceFrameType ||
+        frame.payload.size() < collision_evidence::kEnvelopeBytes)
+        return value;
+    std::array<u64, 11u> fields{};
+    for (std::size_t index = 0u; index != fields.size(); ++index)
+        fields[index] = read_u64(frame.payload.data() + index * sizeof(u64));
+    value.version = fields[0];
+    value.transaction = fields[1];
+    value.domain = fields[2];
+    value.kind = static_cast<collision_evidence::ReportKind>(fields[3]);
+    value.binding = static_cast<collision_evidence::Binding>(fields[4]);
+    value.phase = static_cast<collision_evidence::Phase>(fields[5]);
+    value.sequence = fields[6];
+    value.target = {fields[7], fields[8], fields[9]};
+    if (value.kind != expected_kind ||
+        fields[10] != frame.payload.size() - collision_evidence::kEnvelopeBytes)
+        return {};
+    return value;
+}
+
+static collision_evidence::Envelope canonical_expected_envelope(
+    u64 transaction,
+    const collision_evidence::Target& target,
+    collision_evidence::ReportKind kind,
+    collision_evidence::Binding binding,
+    collision_evidence::Phase phase,
+    u64 sequence) {
+    collision_evidence::Envelope value;
+    value.transaction = transaction;
+    value.kind = kind;
+    value.binding = binding;
+    value.phase = phase;
+    value.sequence = sequence;
+    value.target = target;
+    return value;
+}
+
+static bool canonical_send_evidence(int fd,
+                                    const Token& token,
+                                    const Frame& frame,
+                                    std::size_t maximum,
+                                    std::chrono::steady_clock::time_point deadline) {
+    evidence_transport::Diagnostic diagnostic;
+    return evidence_transport::send_frame(fd, token, maximum, deadline, frame, diagnostic);
+}
+
+static bool canonical_receive_evidence(int fd,
+                                       const Token& token,
+                                       std::size_t maximum,
+                                       std::chrono::steady_clock::time_point deadline,
+                                       Frame& frame) {
+    evidence_transport::Diagnostic diagnostic;
+    return evidence_transport::receive_frame(fd, token, maximum, deadline, frame, diagnostic);
+}
+
+static bool canonical_random_transaction(u64& transaction) {
+    transaction = 0u;
+    for (;;) {
+        const ssize_t count = getrandom(&transaction, sizeof(transaction), GRND_NONBLOCK);
+        if (count == static_cast<ssize_t>(sizeof(transaction))) return transaction != 0u;
+        if (count < 0 && errno == EINTR) continue;
+        return false;
+    }
+}
+
+static bool canonical_empty_environment(pid_t pid) {
+    std::string environment;
+    return pid > 1 && read_file("/proc/" + std::to_string(pid) + "/environ", environment, 8192u) &&
+           environment.empty();
+}
+
+static bool canonical_pidfd_live(int pidfd) {
+    if (pidfd < 0) return false;
+    pollfd descriptor{pidfd, POLLIN | POLLERR | POLLHUP, 0};
+    int result;
+    do {
+        result = poll(&descriptor, 1, 0);
+    } while (result < 0 && errno == EINTR);
+    return result == 0 && descriptor.revents == 0;
+}
+
+static bool canonical_target_socket_evidence(
+    pid_t child, u32 positive_ipv4, u32 guard_ipv4, u16 port, u64& socket_inode) {
+    socket_inode = 0u;
+    privileged_listener::ProcTcpTable table;
+    std::vector<u64> inodes;
+    privileged_listener::Diagnostic diagnostic;
+    if (!read_process_tcp_table(child, table) || !process_socket_inodes(child, inodes))
+        return false;
+    const privileged_listener::ListenerPlan classified{positive_ipv4, guard_ipv4, port};
+    privileged_listener::ListenerEvidence evidence;
+    if (!privileged_listener::classify_listener_evidence(
+            table,
+            classified,
+            inodes,
+            privileged_listener::ListenerEvidenceKind::ExactPositive,
+            evidence,
+            diagnostic))
+        return false;
+    socket_inode = evidence.child_owned_inode;
+    return socket_inode != 0u;
+}
+
+static bool canonical_attempt_projection(
+    const public_attempt::PublicRutAttemptLease& attempt_lease,
+    const source_lease::WildcardAttemptSourceLease& source,
+    const exact_reservation::ExactTcpReservationLease& reservation,
+    const ProcIdentity& target,
+    const std::string& expected_cmdline,
+    const privileged_listener::CollisionLogEvidence& classifier,
+    bool live,
+    collision_evidence::CollisionAttempt& report) {
+    report = {};
+    const auto settlement = attempt_lease.settlement_receipt();
+    const auto cleanup = attempt_lease.cleanup_state();
+    if (!settlement || !cleanup || settlement->child_pid <= 1 || settlement->identity.start == 0u)
+        return false;
+    report.cross = {static_cast<u64>(reservation.descriptor()),
+                    reservation.socket_inode(),
+                    source.source_identity().device,
+                    source.source_identity().inode};
+    report.header = {live ? static_cast<u64>(collision_evidence::AttemptState::ExecObservedLive)
+                          : static_cast<u64>(collision_evidence::AttemptState::EarlyDeath),
+                     static_cast<u64>(collision_evidence::CollisionOutcome::NaturallyRejected),
+                     static_cast<u64>(EADDRINUSE),
+                     static_cast<u64>(settlement->child_pid),
+                     settlement->identity.start,
+                     live ? static_cast<u64>(collision_evidence::CmdlineProvenance::BracketedProc)
+                          : static_cast<u64>(collision_evidence::CmdlineProvenance::OwnedExpected),
+                     expected_cmdline.size()};
+    report.procs = canonical_proc_pair(attempt_lease, live);
+    report.settlement = canonical_settlement(settlement);
+    report.cleanup = canonical_cleanup(cleanup);
+    report.classifier = {classifier.backend == privileged_listener::CollisionBackend::Epoll
+                             ? static_cast<u64>(collision_evidence::ClassifierBackend::Epoll)
+                             : static_cast<u64>(collision_evidence::ClassifierBackend::IoUring),
+                         2u,
+                         static_cast<u64>(EADDRINUSE),
+                         4u,
+                         attempt_lease.sealed_capture_bytes().size()};
+    report.cmdline = expected_cmdline;
+    return target.pid > 1 && report.cross.g_inode == reservation.socket_inode() &&
+           report.header.child_pid == report.settlement.child_pid &&
+           report.classifier.capture_len <= collision_evidence::kMaxCapture;
+}
+
+static bool canonical_evidence_closed_projection(
+    const public_attempt::PublicRutAttemptLease& attempt_lease,
+    const source_lease::WildcardAttemptSourceLease& source,
+    const exact_reservation::ExactTcpReservationLease& reservation,
+    bool collision_live,
+    collision_evidence::EvidenceClosed& report) {
+    const auto settlement = attempt_lease.settlement_receipt();
+    if (!settlement || !attempt_lease.sealed_capture_bytes().size()) return false;
+    report = {static_cast<u64>(reservation.descriptor()),
+              reservation.socket_inode(),
+              source.source_identity().device,
+              source.source_identity().inode,
+              static_cast<u64>(settlement->child_pid),
+              settlement->identity.start,
+              collision_live ? static_cast<u64>(collision_evidence::AttemptState::ExecObservedLive)
+                             : static_cast<u64>(collision_evidence::AttemptState::EarlyDeath),
+              static_cast<u64>(collision_evidence::ReservationState::Held),
+              static_cast<u64>(collision_evidence::SourceState::Active),
+              attempt_lease.sealed_capture_bytes().size(),
+              canonical_cleanup(attempt_lease.cleanup_state())};
+    return report.g_fd != 0u && report.g_inode == reservation.socket_inode() &&
+           report.source_dev == source.source_identity().device &&
+           report.source_inode == source.source_identity().inode && report.attempt_state != 0u;
+}
+
+static bool canonical_release_projection(
+    const exact_reservation::ExactTcpReservationLease& reservation,
+    collision_evidence::Release& report) {
+    const auto receipt = reservation.release_receipt();
+    if (!receipt) return false;
+    const u64 invalid_fgetfd = std::numeric_limits<u64>::max();
+    report.g_fd = static_cast<u64>(reservation.descriptor());
+    report.ipv4 = reservation.ipv4();
+    report.port = reservation.port();
+    report.g_inode = reservation.socket_inode();
+    report.receipt = {receipt->attempted ? 1u : 0u,
+                      receipt->destructor ? 1u : 0u,
+                      receipt->real_close_attempts,
+                      static_cast<u64>(receipt->real_close_result),
+                      static_cast<u64>(receipt->real_close_error),
+                      static_cast<u64>(receipt->reported_close_error),
+                      receipt->immediate_ebadf ? invalid_fgetfd : 0u,
+                      static_cast<u64>(receipt->immediate_fgetfd_error),
+                      receipt->immediate_ebadf ? 1u : 0u,
+                      receipt->post_inventory_checked ? 1u : 0u,
+                      receipt->baseline_restored ? 1u : 0u,
+                      receipt->socket_inode_absent ? 1u : 0u,
+                      receipt->reportable_success ? 1u : 0u,
+                      static_cast<u64>(collision_evidence::ReleaseState::Released),
+                      static_cast<u64>(receipt->diagnostic.phase),
+                      static_cast<u64>(receipt->diagnostic.error_number)};
+    return report.receipt.attempted == 1u && report.receipt.destructor == 0u &&
+           report.receipt.real_close_attempts == 1u && report.receipt.real_close_result == 0u &&
+           report.receipt.immediate_ebadf == 1u && report.receipt.reportable_success == 1u;
+}
+
+static bool canonical_retry_live_projection(
+    const public_attempt::PublicRutAttemptLease& attempt_lease,
+    const source_lease::WildcardAttemptSourceLease& source,
+    const exact_reservation::ExactTcpReservationLease& reservation,
+    const std::string& expected_cmdline,
+    u64 backend,
+    const std::string& startup,
+    collision_evidence::RetryLive& report) {
+    const auto observation = attempt_lease.exec_observation();
+    report = {};
+    report.source_dev = source.source_identity().device;
+    report.source_inode = source.source_identity().inode;
+    report.source_size = source.source_identity().size;
+    report.source_path_len = source.path().size();
+    report.g_inode = reservation.socket_inode();
+    report.port = reservation.port();
+    report.header = {static_cast<u64>(collision_evidence::AttemptState::ExecObservedLive),
+                     static_cast<u64>(collision_evidence::CollisionOutcome::NaturallyRejected),
+                     static_cast<u64>(EADDRINUSE),
+                     static_cast<u64>(attempt_lease.child_pid()),
+                     observation.second.start,
+                     static_cast<u64>(collision_evidence::CmdlineProvenance::BracketedProc),
+                     expected_cmdline.size()};
+    report.procs = canonical_proc_pair(attempt_lease, true);
+    report.pidfd.pidfd_fd = static_cast<u64>(attempt_lease.observation_pidfd());
+    report.pidfd.poll_result = 0u;
+    report.pidfd.revents = 0u;
+    report.pidfd.fdinfo_pid = static_cast<u64>(attempt_lease.child_pid());
+    report.startup = {backend, 2u, reservation.port(), startup.size()};
+    report.source_path = source.path();
+    report.cmdline = expected_cmdline;
+    return report.source_path_len <= collision_evidence::kMaxSourcePath &&
+           report.startup.capture_len <= collision_evidence::kMaxCapture &&
+           canonical_pidfd_live(attempt_lease.observation_pidfd()) &&
+           exact_pidfd_binding(attempt_lease.observation_pidfd(), attempt_lease.child_pid());
+}
+
+static bool canonical_retry_settlement_projection(
+    const public_attempt::PublicRutAttemptLease& attempt_lease,
+    const source_lease::WildcardAttemptSourceLease& source,
+    collision_evidence::RetrySettlement& report) {
+    const auto receipt = attempt_lease.settlement_receipt();
+    if (!receipt) return false;
+    report = {source.source_identity().device,
+              source.source_identity().inode,
+              static_cast<u64>(attempt_lease.child_pid()),
+              receipt->identity.start,
+              static_cast<u64>(collision_evidence::AttemptState::ExecObservedLive),
+              canonical_settlement(receipt),
+              canonical_cleanup(attempt_lease.cleanup_state()),
+              attempt_lease.sealed_capture_bytes().size()};
+    return report.settlement.wait_status == 9u && report.settlement.terminal == 1u &&
+           report.settlement.reaped == 1u && report.final_capture_len != 0u;
+}
+
+static bool canonical_target_phase(int control,
+                                   const Token& token,
+                                   collision_control::StateMachine& machine,
+                                   u64 transaction,
+                                   collision_control::Phase phase,
+                                   std::chrono::steady_clock::time_point deadline) {
+    u64 sequence = 0u;
+    switch (phase) {
+        case collision_control::Phase::ReservationHeld:
+            sequence = 1u;
+            break;
+        case collision_control::Phase::CollisionNaturallyRejectedEvidenceOpen:
+            sequence = 3u;
+            break;
+        case collision_control::Phase::EvidenceClosedReservationHeld:
+            sequence = 5u;
+            break;
+        case collision_control::Phase::ReservationReleased:
+            sequence = 7u;
+            break;
+        case collision_control::Phase::RetryLive:
+            sequence = 9u;
+            break;
+    }
+    if (sequence == 0u) return false;
+    const collision_control::PhaseV2 value{collision_control::kProfileVersion,
+                                           transaction,
+                                           collision_control::Profile::Canonical,
+                                           phase,
+                                           sequence};
+    const Frame frame = collision_control::encode_phase(token, value);
+    return machine.observe(frame, token) &&
+           send_frame(control, frame, remaining_deadline_ms(deadline));
+}
+
+static bool canonical_target_decision(int control,
+                                      const Token& token,
+                                      collision_control::StateMachine& machine,
+                                      std::chrono::steady_clock::time_point deadline,
+                                      collision_control::DecisionKind expected) {
+    Frame frame;
+    collision_control::DecisionV2 decision;
+    return receive_frame_until(control, frame, deadline) &&
+           collision_control::decode_decision(frame, token, decision) &&
+           decision.decision == expected && machine.decide(frame, token);
+}
+
+static bool canonical_target_settlement(int control,
+                                        const Token& token,
+                                        collision_control::StateMachine& machine,
+                                        std::chrono::steady_clock::time_point deadline) {
+    Frame frame;
+    collision_control::SettlementV2 settlement;
+    return receive_frame_until(control, frame, deadline) &&
+           collision_control::decode_settlement(frame, token, settlement) &&
+           machine.settle(frame, token);
+}
+
+enum class CanonicalCleanupPhase : std::uint8_t {
+    None,
+    RetryAttempt,
+    CollisionAttempt,
+    UnsafeChild,
+    Reservation,
+    Source,
+    Directory,
+    Executable,
+};
+
+struct CanonicalCleanupResult {
+    CanonicalCleanupPhase first_failure = CanonicalCleanupPhase::None;
+    int error_number = 0;
+    bool retry_attempted = false;
+    bool collision_attempted = false;
+    bool children_terminal = false;
+    bool reservation_attempted = false;
+    bool reservation_settled = false;
+    bool source_attempted = false;
+    bool source_settled = false;
+    bool directory_attempted = false;
+    bool directory_settled = false;
+    bool executable_attempted = false;
+    bool executable_settled = false;
+    std::array<CanonicalCleanupPhase, 6u> order{};
+    std::size_t order_size = 0u;
+
+    bool success() const { return first_failure == CanonicalCleanupPhase::None; }
+};
+
+struct CanonicalCleanupOnce {
+    bool done = false;
+    std::size_t coordinator_calls = 0u;
+    CanonicalCleanupResult result;
+};
+
+static void canonical_record_cleanup_step(CanonicalCleanupResult& result,
+                                          CanonicalCleanupPhase phase) {
+    if (result.order_size < result.order.size()) result.order[result.order_size++] = phase;
+}
+
+static int canonical_nonzero_error(int error_number) {
+    return error_number == 0 ? EIO : error_number;
+}
+
+static void canonical_retain_cleanup_failure(CanonicalCleanupResult& result,
+                                             CanonicalCleanupPhase phase,
+                                             int error_number) {
+    if (result.first_failure != CanonicalCleanupPhase::None) return;
+    result.first_failure = phase;
+    result.error_number = canonical_nonzero_error(error_number);
+}
+
+static bool canonical_attempt_child_terminal(const public_attempt::PublicRutAttemptLease& attempt) {
+    const auto receipt = attempt.settlement_receipt();
+    if (!receipt) return attempt.child_pid() <= 0;
+    return receipt->terminal && receipt->reaped;
+}
+
+static bool canonical_source_requires_cleanup(
+    const source_lease::WildcardAttemptSourceLease& source) {
+    switch (source.state()) {
+        case source_lease::State::Fresh:
+        case source_lease::State::Removed:
+            return false;
+        case source_lease::State::Staged:
+        case source_lease::State::Active:
+        case source_lease::State::FinalizeFailed:
+            return true;
+    }
+    return false;
+}
+
+static bool canonical_source_is_settled(const source_lease::WildcardAttemptSourceLease& source) {
+    switch (source.state()) {
+        case source_lease::State::Fresh:
+        case source_lease::State::Removed:
+            return true;
+        case source_lease::State::Staged:
+        case source_lease::State::Active:
+        case source_lease::State::FinalizeFailed:
+            return false;
+    }
+    return false;
+}
+
+static bool canonical_directory_requires_cleanup(
+    const private_directory::PrivateDirectoryLease& directory) {
+    switch (directory.state()) {
+        case private_directory::State::Owned:
+        case private_directory::State::Quarantined:
+        case private_directory::State::Removed:
+            return true;
+        case private_directory::State::Empty:
+        case private_directory::State::PendingIdentity:
+        case private_directory::State::BindingLost:
+        case private_directory::State::RenamePendingValidation:
+        case private_directory::State::Unresolved:
+            return false;
+    }
+    return false;
+}
+
+static bool canonical_directory_is_settled(
+    const private_directory::PrivateDirectoryLease& directory) {
+    const auto receipt = directory.settlement_receipt();
+    if (directory.state() == private_directory::State::Empty) return true;
+    return directory.state() == private_directory::State::Removed && receipt &&
+           receipt->settlement_complete;
+}
+
+// One deterministic Target-owned epilogue. Both attempt cleanups always run
+// under the caller's single absolute deadline. Outer owners are touched only
+// after every acquired direct child is proven terminal and reaped.
+static CanonicalCleanupResult canonical_target_cleanup(
+    public_attempt::PublicRutAttemptLease& retry_attempt,
+    public_attempt::PublicRutAttemptLease& collision_attempt,
+    exact_reservation::ExactTcpReservationLease& reservation,
+    source_lease::WildcardAttemptSourceLease& source,
+    private_directory::PrivateDirectoryLease& directory,
+    executable_lease::ExecutableLease& executable,
+    std::chrono::steady_clock::time_point cleanup_deadline) {
+    CanonicalCleanupResult result;
+    public_attempt::Diagnostic retry_diagnostic;
+    result.retry_attempted = true;
+    canonical_record_cleanup_step(result, CanonicalCleanupPhase::RetryAttempt);
+    const bool retry_cleaned = retry_attempt.cleanup(cleanup_deadline, retry_diagnostic);
+    if (!retry_cleaned)
+        canonical_retain_cleanup_failure(
+            result, CanonicalCleanupPhase::RetryAttempt, retry_diagnostic.error_number);
+
+    public_attempt::Diagnostic collision_diagnostic;
+    result.collision_attempted = true;
+    canonical_record_cleanup_step(result, CanonicalCleanupPhase::CollisionAttempt);
+    const bool collision_cleaned =
+        collision_attempt.cleanup(cleanup_deadline, collision_diagnostic);
+    if (!collision_cleaned)
+        canonical_retain_cleanup_failure(
+            result, CanonicalCleanupPhase::CollisionAttempt, collision_diagnostic.error_number);
+
+    result.children_terminal = canonical_attempt_child_terminal(retry_attempt) &&
+                               canonical_attempt_child_terminal(collision_attempt);
+    if (!result.children_terminal) {
+        canonical_retain_cleanup_failure(result, CanonicalCleanupPhase::UnsafeChild, ECHILD);
+        return result;
+    }
+
+    exact_reservation::Diagnostic reservation_diagnostic;
+    if (reservation.state() == exact_reservation::State::Held) {
+        result.reservation_attempted = true;
+        canonical_record_cleanup_step(result, CanonicalCleanupPhase::Reservation);
+        const bool released = reservation.release(reservation_diagnostic);
+        if (!released)
+            canonical_retain_cleanup_failure(
+                result, CanonicalCleanupPhase::Reservation, reservation_diagnostic.error_number);
+    }
+    switch (reservation.state()) {
+        case exact_reservation::State::Fresh:
+        case exact_reservation::State::Released:
+            result.reservation_settled = true;
+            break;
+        case exact_reservation::State::Held:
+        case exact_reservation::State::BindingLost:
+        case exact_reservation::State::ReleaseUncertain:
+            result.reservation_settled = false;
+            canonical_retain_cleanup_failure(
+                result, CanonicalCleanupPhase::Reservation, reservation_diagnostic.error_number);
+            break;
+    }
+
+    source_lease::Diagnostic source_diagnostic;
+    if (canonical_source_requires_cleanup(source)) {
+        result.source_attempted = true;
+        canonical_record_cleanup_step(result, CanonicalCleanupPhase::Source);
+        const bool removed = source.remove(source_diagnostic);
+        if (!removed)
+            canonical_retain_cleanup_failure(
+                result, CanonicalCleanupPhase::Source, source_diagnostic.error_number);
+    }
+    result.source_settled = canonical_source_is_settled(source);
+    if (!result.source_settled)
+        canonical_retain_cleanup_failure(
+            result, CanonicalCleanupPhase::Source, source_diagnostic.error_number);
+
+    private_directory::Diagnostic directory_diagnostic;
+    if (result.source_settled && canonical_directory_requires_cleanup(directory)) {
+        result.directory_attempted = true;
+        canonical_record_cleanup_step(result, CanonicalCleanupPhase::Directory);
+        const bool settled = directory.settle(directory_diagnostic);
+        if (!settled)
+            canonical_retain_cleanup_failure(
+                result, CanonicalCleanupPhase::Directory, directory_diagnostic.error_number);
+    }
+    result.directory_settled = canonical_directory_is_settled(directory);
+    if (!result.directory_settled)
+        canonical_retain_cleanup_failure(
+            result, CanonicalCleanupPhase::Directory, directory_diagnostic.error_number);
+
+    executable_lease::Diagnostic executable_diagnostic;
+    if (executable.active()) {
+        result.executable_attempted = true;
+        canonical_record_cleanup_step(result, CanonicalCleanupPhase::Executable);
+        const bool closed = executable.close(executable_diagnostic);
+        if (!closed)
+            canonical_retain_cleanup_failure(
+                result, CanonicalCleanupPhase::Executable, executable_diagnostic.error_number);
+    }
+    result.executable_settled = !executable.active();
+    if (!result.executable_settled)
+        canonical_retain_cleanup_failure(
+            result, CanonicalCleanupPhase::Executable, executable_diagnostic.error_number);
+    return result;
+}
+
+static const CanonicalCleanupResult& canonical_target_cleanup_once(
+    CanonicalCleanupOnce& once,
+    public_attempt::PublicRutAttemptLease& retry_attempt,
+    public_attempt::PublicRutAttemptLease& collision_attempt,
+    exact_reservation::ExactTcpReservationLease& reservation,
+    source_lease::WildcardAttemptSourceLease& source,
+    private_directory::PrivateDirectoryLease& directory,
+    executable_lease::ExecutableLease& executable,
+    std::chrono::steady_clock::time_point cleanup_deadline) {
+    if (once.done) return once.result;
+    once.done = true;
+    ++once.coordinator_calls;
+    once.result = canonical_target_cleanup(retry_attempt,
+                                           collision_attempt,
+                                           reservation,
+                                           source,
+                                           directory,
+                                           executable,
+                                           cleanup_deadline);
+    return once.result;
+}
+
+static bool canonical_success_owners_settled(
+    const public_attempt::PublicRutAttemptLease& retry_attempt,
+    const public_attempt::PublicRutAttemptLease& collision_attempt,
+    const exact_reservation::ExactTcpReservationLease& reservation,
+    const source_lease::WildcardAttemptSourceLease& source,
+    const private_directory::PrivateDirectoryLease& directory,
+    const executable_lease::ExecutableLease& executable) {
+    const auto reservation_receipt = reservation.release_receipt();
+    const auto source_cleanup = source.cleanup_state();
+    const auto directory_receipt = directory.settlement_receipt();
+    const auto executable_cleanup = executable.cleanup_state();
+    const auto retry_cleanup = retry_attempt.cleanup_state();
+    const auto collision_cleanup = collision_attempt.cleanup_state();
+    return reservation.state() == exact_reservation::State::Released && reservation_receipt &&
+           reservation_receipt->reportable_success &&
+           source.state() == source_lease::State::Removed && source_cleanup &&
+           source_cleanup->succeeded && directory.state() == private_directory::State::Removed &&
+           directory_receipt && directory_receipt->settlement_complete && !executable.active() &&
+           executable_cleanup && executable_cleanup->reportable_success && retry_cleanup &&
+           retry_cleanup->explicit_cleanup_complete &&
+           retry_cleanup->explicit_cleanup_reportable_success && collision_cleanup &&
+           collision_cleanup->explicit_cleanup_complete &&
+           collision_cleanup->explicit_cleanup_reportable_success &&
+           canonical_attempt_child_terminal(retry_attempt) &&
+           canonical_attempt_child_terminal(collision_attempt);
+}
+
+static int canonical_target_flow(int control,
+                                 const Token& token,
+                                 const std::vector<unsigned char>& request,
+                                 const std::string& control_path) {
+    u32 positive_ipv4 = 0u, guard_ipv4 = 0u;
+    std::string executable_path;
+    if (!parse_canonical_request(request, positive_ipv4, guard_ipv4, executable_path)) return 60;
+    const auto transaction_start = std::chrono::steady_clock::now();
+    const auto transaction_deadline =
+        transaction_start + std::chrono::milliseconds(kCanonicalTargetOperationMs);
+    const auto cleanup_deadline =
+        transaction_start + std::chrono::milliseconds(kCanonicalTargetCleanupMs);
+    u64 transaction = 0u;
+    ProcIdentity target_identity;
+    if (!canonical_random_transaction(transaction) || !read_proc(getpid(), target_identity) ||
+        target_identity.uid != geteuid() || target_identity.gid != getegid() ||
+        target_identity.supplementary_groups != 0 || !target_identity.no_new_privs ||
+        !target_identity.capabilities_clear || target_identity.netns == 0)
+        return 61;
+
+    private_directory::PrivateDirectoryLease directory;
+    source_lease::WildcardAttemptSourceLease source;
+    executable_lease::ExecutableLease executable;
+    exact_reservation::ExactTcpReservationLease reservation;
+    public_attempt::PublicRutAttemptLease collision_attempt;
+    public_attempt::PublicRutAttemptLease retry_attempt;
+    private_directory::Diagnostic directory_diagnostic;
+    source_lease::Diagnostic source_diagnostic;
+    executable_lease::Diagnostic executable_diagnostic;
+    exact_reservation::Diagnostic reservation_diagnostic;
+    public_attempt::Diagnostic attempt_diagnostic;
+    CanonicalCleanupOnce cleanup_once;
+    auto fail = [&](int exit_code) {
+        const CanonicalCleanupResult& cleanup = canonical_target_cleanup_once(cleanup_once,
+                                                                              retry_attempt,
+                                                                              collision_attempt,
+                                                                              reservation,
+                                                                              source,
+                                                                              directory,
+                                                                              executable,
+                                                                              cleanup_deadline);
+        if (!cleanup.success())
+            std::fprintf(stderr,
+                         "FAIL [#377 canonical Target cleanup]: exit=%d phase=%u errno=%d\n",
+                         exit_code,
+                         static_cast<unsigned>(cleanup.first_failure),
+                         cleanup.error_number);
+        return exit_code;
+    };
+    if (!private_directory::PrivateDirectoryLease::create(directory, directory_diagnostic) ||
+        !source_lease::WildcardAttemptSourceLease::stage(directory.descriptor(),
+                                                         directory.path(),
+                                                         "canonical-listener.rut",
+                                                         source,
+                                                         source_diagnostic) ||
+        !executable_lease::ExecutableLease::create(
+            executable_path, executable, executable_diagnostic) ||
+        !exact_reservation::ExactTcpReservationLease::reserve(
+            guard_ipv4, reservation, reservation_diagnostic))
+        return fail(62);
+
+    const std::string dotted_guard = [&]() {
+        std::array<char, INET_ADDRSTRLEN> text{};
+        in_addr address{htonl(guard_ipv4)};
+        return inet_ntop(AF_INET, &address, text.data(), text.size()) == nullptr
+                   ? std::string{}
+                   : std::string(text.data());
+    }();
+    if (dotted_guard.empty() || reservation.port() == 0u ||
+        reservation.port() > std::numeric_limits<u16>::max())
+        return fail(63);
+    const std::string source_bytes = "listen " + dotted_guard + ":" +
+                                     std::to_string(reservation.port()) +
+                                     "\nroute GET \"/\" { return 204 }\n";
+    if (source_bytes.size() > collision_evidence::kMaxSourceBytes ||
+        !source.finalize_exact_bytes(source_bytes, source_diagnostic) ||
+        !reservation.revalidate(reservation_diagnostic))
+        return fail(64);
+
+    collision_evidence::ReservationSource source_report;
+    if (!canonical_reservation_source(
+            reservation, source, directory, source_bytes, target_identity, source_report))
+        return fail(65);
+    const collision_evidence::Target evidence_target{static_cast<u64>(target_identity.pid),
+                                                     target_identity.start,
+                                                     static_cast<u64>(target_identity.netns)};
+    const collision_evidence::Envelope source_envelope =
+        canonical_expected_envelope(transaction,
+                                    evidence_target,
+                                    collision_evidence::ReportKind::ReservationSource,
+                                    collision_evidence::Binding::Phase,
+                                    collision_evidence::Phase::ReservationHeld,
+                                    1u);
+    const Frame source_frame =
+        collision_evidence::encode_reservation_source(token, source_envelope, source_report);
+    if (!canonical_send_evidence(
+            control,
+            token,
+            source_frame,
+            collision_evidence::max_payload(collision_evidence::ReportKind::ReservationSource),
+            transaction_deadline))
+        return fail(66);
+
+    Frame command_frame;
+    collision_control::CommandV2 command;
+    collision_control::StateMachine machine;
+    if (!receive_frame_until(control, command_frame, transaction_deadline) ||
+        !collision_control::decode_command(command_frame, token, command) ||
+        command.transaction_id != transaction || !machine.begin(command_frame, token) ||
+        !canonical_target_phase(control,
+                                token,
+                                machine,
+                                transaction,
+                                collision_control::Phase::ReservationHeld,
+                                transaction_deadline) ||
+        !canonical_target_decision(control,
+                                   token,
+                                   machine,
+                                   transaction_deadline,
+                                   collision_control::DecisionKind::AuthorizeCollisionExec))
+        return fail(67);
+
+    const std::array<std::string_view, 9u> arguments = {executable.canonical_path(),
+                                                        source.path(),
+                                                        "--shards",
+                                                        "1",
+                                                        "--no-pin",
+                                                        "--drain",
+                                                        "0",
+                                                        "--opt",
+                                                        "2"};
+    const std::string expected_cmdline = [&]() {
+        std::string value;
+        for (const std::string_view argument : arguments) {
+            value.append(argument);
+            value.push_back('\0');
+        }
+        return value;
+    }();
+    if (expected_cmdline.size() > collision_evidence::kMaxCmdline ||
+        !collision_attempt.prepare(
+            source, executable, arguments, transaction_deadline, {}, attempt_diagnostic) ||
+        !collision_attempt.exec_and_observe(
+            source, executable, transaction_deadline, attempt_diagnostic) ||
+        (collision_attempt.state() != public_attempt::State::EarlyDeath &&
+         collision_attempt.state() != public_attempt::State::ExecObservedLive) ||
+        !collision_attempt.settle_natural(1, transaction_deadline, attempt_diagnostic))
+        return fail(68);
+    const bool collision_live = collision_attempt.exec_observation().outcome ==
+                                public_attempt::handoff::ExecOutcome::ExecObservedLive;
+    std::string collision_capture = collision_attempt.sealed_capture_bytes();
+    privileged_listener::CollisionLogEvidence collision_classifier;
+    privileged_listener::Diagnostic collision_diagnostic;
+    if (collision_capture.empty() ||
+        !privileged_listener::classify_collision_log(
+            collision_capture, source.path(), 2u, collision_classifier, collision_diagnostic) ||
+        collision_attempt.state() != public_attempt::State::NaturalReapedEvidenceOpen)
+        return fail(69);
+    collision_evidence::CollisionAttempt collision_report;
+    if (!canonical_attempt_projection(collision_attempt,
+                                      source,
+                                      reservation,
+                                      target_identity,
+                                      expected_cmdline,
+                                      collision_classifier,
+                                      collision_live,
+                                      collision_report))
+        return fail(70);
+    const collision_evidence::Envelope collision_envelope = canonical_expected_envelope(
+        transaction,
+        evidence_target,
+        collision_evidence::ReportKind::CollisionAttempt,
+        collision_evidence::Binding::Phase,
+        collision_evidence::Phase::CollisionNaturallyRejectedEvidenceOpen,
+        3u);
+    const Frame collision_frame =
+        collision_evidence::encode_collision_attempt(token, collision_envelope, collision_report);
+    const collision_evidence::CollisionCapture capture_report{
+        static_cast<u64>(collision_capture.size()), collision_capture};
+    const collision_evidence::Envelope collision_capture_envelope = canonical_expected_envelope(
+        transaction,
+        evidence_target,
+        collision_evidence::ReportKind::CollisionCapture,
+        collision_evidence::Binding::Phase,
+        collision_evidence::Phase::CollisionNaturallyRejectedEvidenceOpen,
+        3u);
+    const Frame capture_frame = collision_evidence::encode_collision_capture(
+        token, collision_capture_envelope, capture_report);
+    if (!canonical_target_phase(control,
+                                token,
+                                machine,
+                                transaction,
+                                collision_control::Phase::CollisionNaturallyRejectedEvidenceOpen,
+                                transaction_deadline) ||
+        !canonical_send_evidence(
+            control,
+            token,
+            collision_frame,
+            collision_evidence::max_payload(collision_evidence::ReportKind::CollisionAttempt),
+            transaction_deadline) ||
+        !canonical_send_evidence(
+            control,
+            token,
+            capture_frame,
+            collision_evidence::max_payload(collision_evidence::ReportKind::CollisionCapture),
+            transaction_deadline) ||
+        !canonical_target_decision(control,
+                                   token,
+                                   machine,
+                                   transaction_deadline,
+                                   collision_control::DecisionKind::AuthorizeEvidenceClose) ||
+        !collision_attempt.close_evidence(attempt_diagnostic) ||
+        !reservation.revalidate(reservation_diagnostic) || !source.revalidate(source_diagnostic))
+        return fail(71);
+
+    collision_evidence::EvidenceClosed closed_report;
+    closed_report.attempt_state = collision_report.header.attempt_state;
+    // Build the closed projection only after the capture FD is closed. The
+    // report helper reads only immutable source/G identities and cleanup state.
+    if (!canonical_evidence_closed_projection(
+            collision_attempt, source, reservation, collision_live, closed_report))
+        return fail(72);
+    const collision_evidence::Envelope closed_envelope =
+        canonical_expected_envelope(transaction,
+                                    evidence_target,
+                                    collision_evidence::ReportKind::EvidenceClosed,
+                                    collision_evidence::Binding::Phase,
+                                    collision_evidence::Phase::EvidenceClosedReservationHeld,
+                                    5u);
+    if (!canonical_target_phase(control,
+                                token,
+                                machine,
+                                transaction,
+                                collision_control::Phase::EvidenceClosedReservationHeld,
+                                transaction_deadline) ||
+        !canonical_send_evidence(
+            control,
+            token,
+            collision_evidence::encode_evidence_closed(token, closed_envelope, closed_report),
+            collision_evidence::max_payload(collision_evidence::ReportKind::EvidenceClosed),
+            transaction_deadline) ||
+        !canonical_target_decision(control,
+                                   token,
+                                   machine,
+                                   transaction_deadline,
+                                   collision_control::DecisionKind::AuthorizeReservationRelease))
+        return fail(73);
+
+    const int released_fd = reservation.descriptor();
+    const u64 released_inode = reservation.socket_inode();
+    if (released_fd < 0 || released_inode == 0u || !reservation.release(reservation_diagnostic))
+        return fail(74);
+    collision_evidence::Release release_report;
+    if (!canonical_release_projection(reservation, release_report)) return fail(75);
+    release_report.g_fd = static_cast<u64>(released_fd);
+    release_report.g_inode = released_inode;
+    const collision_evidence::Envelope release_envelope =
+        canonical_expected_envelope(transaction,
+                                    evidence_target,
+                                    collision_evidence::ReportKind::Release,
+                                    collision_evidence::Binding::Phase,
+                                    collision_evidence::Phase::ReservationReleased,
+                                    7u);
+    if (!canonical_target_phase(control,
+                                token,
+                                machine,
+                                transaction,
+                                collision_control::Phase::ReservationReleased,
+                                transaction_deadline) ||
+        !canonical_send_evidence(
+            control,
+            token,
+            collision_evidence::encode_release(token, release_envelope, release_report),
+            collision_evidence::max_payload(collision_evidence::ReportKind::Release),
+            transaction_deadline) ||
+        !canonical_target_decision(control,
+                                   token,
+                                   machine,
+                                   transaction_deadline,
+                                   collision_control::DecisionKind::AuthorizeRetryExec))
+        return fail(76);
+
+    if (!retry_attempt.prepare(
+            source, executable, arguments, transaction_deadline, {}, attempt_diagnostic) ||
+        !retry_attempt.exec_and_observe(
+            source, executable, transaction_deadline, attempt_diagnostic) ||
+        retry_attempt.state() != public_attempt::State::ExecObservedLive)
+        return fail(77);
+    std::string startup_capture;
+    u64 startup_backend = 0u;
+    bool retry_ready = false;
+    const privileged_listener::ListenerPlan retry_plan{
+        guard_ipv4, positive_ipv4, reservation.port()};
+    while (std::chrono::steady_clock::now() < transaction_deadline) {
+        std::string candidate;
+        ProcIdentity first, second;
+        privileged_listener::ProcTcpTable table;
+        std::vector<u64> sockets;
+        privileged_listener::ListenerEvidence listener;
+        privileged_listener::Diagnostic listener_diagnostic;
+        if (retry_attempt.snapshot_capture(candidate, attempt_diagnostic) &&
+            exact_log_ready(candidate, source.path(), reservation.port(), startup_backend) &&
+            read_proc(retry_attempt.child_pid(), first) &&
+            read_proc(retry_attempt.child_pid(), second) && same_process_identity(first, second) &&
+            first.pid == retry_attempt.child_pid() && first.ppid == getpid() &&
+            first.netns == target_identity.netns && canonical_empty_environment(first.pid) &&
+            source.revalidate(source_diagnostic) && executable.revalidate(executable_diagnostic) &&
+            canonical_pidfd_live(retry_attempt.observation_pidfd()) &&
+            exact_pidfd_binding(retry_attempt.observation_pidfd(), retry_attempt.child_pid()) &&
+            read_process_tcp_table(retry_attempt.child_pid(), table) &&
+            process_socket_inodes(retry_attempt.child_pid(), sockets) &&
+            privileged_listener::classify_listener_evidence(
+                table,
+                retry_plan,
+                sockets,
+                privileged_listener::ListenerEvidenceKind::ExactPositive,
+                listener,
+                listener_diagnostic) &&
+            listener.child_owned_inode != 0u) {
+            startup_capture = candidate;
+            retry_ready = true;
+            break;
+        }
+        (void)poll(nullptr, 0, 5);
+    }
+    if (!retry_ready) return fail(78);
+    collision_evidence::RetryLive retry_report;
+    if (!canonical_retry_live_projection(retry_attempt,
+                                         source,
+                                         reservation,
+                                         expected_cmdline,
+                                         startup_backend,
+                                         startup_capture,
+                                         retry_report))
+        return fail(79);
+    const collision_evidence::Envelope retry_envelope =
+        canonical_expected_envelope(transaction,
+                                    evidence_target,
+                                    collision_evidence::ReportKind::RetryLive,
+                                    collision_evidence::Binding::Phase,
+                                    collision_evidence::Phase::RetryLive,
+                                    9u);
+    const collision_evidence::RetryLiveCapture retry_capture_report{
+        static_cast<u64>(startup_capture.size()), startup_capture};
+    const collision_evidence::Envelope retry_capture_envelope =
+        canonical_expected_envelope(transaction,
+                                    evidence_target,
+                                    collision_evidence::ReportKind::RetryLiveCapture,
+                                    collision_evidence::Binding::Phase,
+                                    collision_evidence::Phase::RetryLive,
+                                    9u);
+    if (!canonical_target_phase(control,
+                                token,
+                                machine,
+                                transaction,
+                                collision_control::Phase::RetryLive,
+                                transaction_deadline) ||
+        !canonical_send_evidence(
+            control,
+            token,
+            collision_evidence::encode_retry_live(token, retry_envelope, retry_report),
+            collision_evidence::max_payload(collision_evidence::ReportKind::RetryLive),
+            transaction_deadline) ||
+        !canonical_send_evidence(
+            control,
+            token,
+            collision_evidence::encode_retry_live_capture(
+                token, retry_capture_envelope, retry_capture_report),
+            collision_evidence::max_payload(collision_evidence::ReportKind::RetryLiveCapture),
+            transaction_deadline) ||
+        !canonical_target_decision(control,
+                                   token,
+                                   machine,
+                                   transaction_deadline,
+                                   collision_control::DecisionKind::AuthorizeRetrySettlement) ||
+        !retry_attempt.settle_killed(SIGKILL, transaction_deadline, attempt_diagnostic))
+        return fail(80);
+
+    std::string final_capture;
+    if (!retry_attempt.snapshot_capture(final_capture, attempt_diagnostic) ||
+        final_capture.size() < startup_capture.size() ||
+        std::memcmp(final_capture.data(), startup_capture.data(), startup_capture.size()) != 0)
+        return fail(81);
+    collision_evidence::RetrySettlement settlement_report;
+    if (!canonical_retry_settlement_projection(retry_attempt, source, settlement_report))
+        return fail(82);
+    const collision_evidence::Envelope settlement_envelope =
+        canonical_expected_envelope(transaction,
+                                    evidence_target,
+                                    collision_evidence::ReportKind::RetrySettlement,
+                                    collision_evidence::Binding::Settlement,
+                                    collision_evidence::Phase::RetryLive,
+                                    11u);
+    if (!canonical_send_evidence(
+            control,
+            token,
+            collision_evidence::encode_retry_settlement(
+                token, settlement_envelope, settlement_report),
+            collision_evidence::max_payload(collision_evidence::ReportKind::RetrySettlement),
+            transaction_deadline))
+        return fail(83);
+    if (!retry_attempt.close_evidence(attempt_diagnostic)) return fail(83);
+    const CanonicalCleanupResult& normal_cleanup = canonical_target_cleanup_once(cleanup_once,
+                                                                                 retry_attempt,
+                                                                                 collision_attempt,
+                                                                                 reservation,
+                                                                                 source,
+                                                                                 directory,
+                                                                                 executable,
+                                                                                 cleanup_deadline);
+    if (!normal_cleanup.success()) {
+        std::fprintf(stderr,
+                     "FAIL [#377 canonical Target cleanup]: exit=83 phase=%u errno=%d\n",
+                     static_cast<unsigned>(normal_cleanup.first_failure),
+                     normal_cleanup.error_number);
+        return 83;
+    }
+    if (!canonical_success_owners_settled(
+            retry_attempt, collision_attempt, reservation, source, directory, executable))
+        return 83;
+    const collision_evidence::RetryFinalCapture final_report{static_cast<u64>(final_capture.size()),
+                                                             final_capture};
+    const collision_evidence::Envelope final_envelope =
+        canonical_expected_envelope(transaction,
+                                    evidence_target,
+                                    collision_evidence::ReportKind::RetryFinalCapture,
+                                    collision_evidence::Binding::Settlement,
+                                    collision_evidence::Phase::RetryLive,
+                                    11u);
+    if (!canonical_send_evidence(
+            control,
+            token,
+            collision_evidence::encode_retry_final_capture(token, final_envelope, final_report),
+            collision_evidence::max_payload(collision_evidence::ReportKind::RetryFinalCapture),
+            transaction_deadline) ||
+        !canonical_target_settlement(control, token, machine, transaction_deadline))
+        return fail(84);
+    if (!canonical_target_decision(control,
+                                   token,
+                                   machine,
+                                   transaction_deadline,
+                                   collision_control::DecisionKind::Finish) ||
+        machine.state() != collision_control::State::Complete)
+        return fail(85);
+    close(control);
+    (void)control_path;
+    return 0;
+}
+
+enum class CanonicalCleanupSelfCheckResult : std::uint8_t { Pass, Prerequisite, Fail };
+
+static bool canonical_cleanup_order(const CanonicalCleanupResult& result,
+                                    std::initializer_list<CanonicalCleanupPhase> expected) {
+    if (result.order_size != expected.size()) return false;
+    return std::equal(expected.begin(), expected.end(), result.order.begin());
+}
+
+static bool canonical_cleanup_setup(u32 ipv4,
+                                    const std::string& self,
+                                    private_directory::PrivateDirectoryLease& directory,
+                                    source_lease::WildcardAttemptSourceLease& source,
+                                    executable_lease::ExecutableLease& executable,
+                                    exact_reservation::ExactTcpReservationLease& reservation,
+                                    std::string& error) {
+    private_directory::Diagnostic directory_diagnostic;
+    source_lease::Diagnostic source_diagnostic;
+    executable_lease::Diagnostic executable_diagnostic;
+    exact_reservation::Diagnostic reservation_diagnostic;
+    if (!private_directory::PrivateDirectoryLease::create(directory, directory_diagnostic)) {
+        error = "canonical cleanup self-check directory acquisition failed";
+        return false;
+    }
+    if (!source_lease::WildcardAttemptSourceLease::stage(directory.descriptor(),
+                                                         directory.path(),
+                                                         "canonical-cleanup-self-check.rut",
+                                                         source,
+                                                         source_diagnostic)) {
+        error = "canonical cleanup self-check source acquisition failed";
+        return false;
+    }
+    if (!executable_lease::ExecutableLease::create(self, executable, executable_diagnostic)) {
+        error = "canonical cleanup self-check executable acquisition failed";
+        return false;
+    }
+    if (!exact_reservation::ExactTcpReservationLease::reserve(
+            ipv4, reservation, reservation_diagnostic)) {
+        error = "canonical cleanup self-check reservation acquisition failed";
+        return false;
+    }
+    if (!source.finalize_exact_bytes("route GET \"/\" { return 204 }\n", source_diagnostic)) {
+        error = "canonical cleanup self-check source finalization failed";
+        return false;
+    }
+    return true;
+}
+
+static CanonicalCleanupSelfCheckResult canonical_target_cleanup_self_check(
+    const char* executable_argument, std::string& error) {
+    std::array<char, PATH_MAX> resolved{};
+    if (realpath(executable_argument, resolved.data()) == nullptr || resolved.front() != '/') {
+        error = "canonical cleanup self-check executable was not canonical";
+        return CanonicalCleanupSelfCheckResult::Fail;
+    }
+    const std::string self(resolved.data());
+    std::vector<u32> addresses;
+    exact_reservation::Diagnostic discovery_diagnostic;
+    if (!exact_reservation::discover_eligible_ipv4(addresses, discovery_diagnostic) ||
+        addresses.empty()) {
+        error = "canonical cleanup self-check has no eligible nonloopback IPv4 address";
+        return CanonicalCleanupSelfCheckResult::Prerequisite;
+    }
+    const u32 ipv4 = addresses.front();
+    const auto cleanup_deadline = [] {
+        return std::chrono::steady_clock::now() + std::chrono::seconds(10);
+    };
+
+    // Acquisition failure after the first real owner must still terminalize
+    // both empty attempt wrappers and settle the acquired directory.
+    {
+        private_directory::PrivateDirectoryLease directory;
+        source_lease::WildcardAttemptSourceLease source;
+        executable_lease::ExecutableLease executable;
+        exact_reservation::ExactTcpReservationLease reservation;
+        public_attempt::PublicRutAttemptLease collision_attempt;
+        public_attempt::PublicRutAttemptLease retry_attempt;
+        private_directory::Diagnostic directory_diagnostic;
+        if (!private_directory::PrivateDirectoryLease::create(directory, directory_diagnostic)) {
+            error = "canonical acquisition-failure self-check setup failed";
+            return CanonicalCleanupSelfCheckResult::Fail;
+        }
+        const CanonicalCleanupResult result = canonical_target_cleanup(retry_attempt,
+                                                                       collision_attempt,
+                                                                       reservation,
+                                                                       source,
+                                                                       directory,
+                                                                       executable,
+                                                                       cleanup_deadline());
+        if (!result.success() || !result.children_terminal || result.reservation_attempted ||
+            result.source_attempted || !result.directory_attempted || result.executable_attempted ||
+            !canonical_cleanup_order(result,
+                                     {CanonicalCleanupPhase::RetryAttempt,
+                                      CanonicalCleanupPhase::CollisionAttempt,
+                                      CanonicalCleanupPhase::Directory}) ||
+            !canonical_directory_is_settled(directory)) {
+            error = "canonical acquisition-failure cleanup order/state was not exact";
+            return CanonicalCleanupSelfCheckResult::Fail;
+        }
+    }
+
+    // A collision-side partial prepare owns a real paused direct child while G
+    // is held. Cleanup must reap it before releasing G and the outer owners.
+    {
+        private_directory::PrivateDirectoryLease directory;
+        source_lease::WildcardAttemptSourceLease source;
+        executable_lease::ExecutableLease executable;
+        exact_reservation::ExactTcpReservationLease reservation;
+        public_attempt::PublicRutAttemptLease collision_attempt;
+        public_attempt::PublicRutAttemptLease retry_attempt;
+        if (!canonical_cleanup_setup(
+                ipv4, self, directory, source, executable, reservation, error)) {
+            (void)canonical_target_cleanup(retry_attempt,
+                                           collision_attempt,
+                                           reservation,
+                                           source,
+                                           directory,
+                                           executable,
+                                           cleanup_deadline());
+            return CanonicalCleanupSelfCheckResult::Fail;
+        }
+        const std::array<std::string_view, 3u> arguments = {
+            executable.canonical_path(), source.path(), "--canonical-cleanup-live-self-check"};
+        public_attempt::HooksForTesting hooks;
+        hooks.prepare_failure = public_attempt::PrepareFailurePoint::AfterChild;
+        public_attempt::Diagnostic attempt_diagnostic;
+        const bool prepared = collision_attempt.prepare(
+            source, executable, arguments, cleanup_deadline(), hooks, attempt_diagnostic);
+        const pid_t child = collision_attempt.child_pid();
+        const CanonicalCleanupResult result = canonical_target_cleanup(retry_attempt,
+                                                                       collision_attempt,
+                                                                       reservation,
+                                                                       source,
+                                                                       directory,
+                                                                       executable,
+                                                                       cleanup_deadline());
+        if (prepared || child <= 0 || !result.success() || !result.children_terminal ||
+            !canonical_cleanup_order(result,
+                                     {CanonicalCleanupPhase::RetryAttempt,
+                                      CanonicalCleanupPhase::CollisionAttempt,
+                                      CanonicalCleanupPhase::Reservation,
+                                      CanonicalCleanupPhase::Source,
+                                      CanonicalCleanupPhase::Directory,
+                                      CanonicalCleanupPhase::Executable}) ||
+            !canonical_success_owners_settled(
+                retry_attempt, collision_attempt, reservation, source, directory, executable)) {
+            error = "canonical G-held collision-partial cleanup was not exact";
+            return CanonicalCleanupSelfCheckResult::Fail;
+        }
+    }
+
+    // After G release, execute this same binary into a private live-child mode
+    // and model a transport failure. The epilogue must settle that exact child
+    // before removing source/directory/executable owners.
+    {
+        private_directory::PrivateDirectoryLease directory;
+        source_lease::WildcardAttemptSourceLease source;
+        executable_lease::ExecutableLease executable;
+        exact_reservation::ExactTcpReservationLease reservation;
+        public_attempt::PublicRutAttemptLease collision_attempt;
+        public_attempt::PublicRutAttemptLease retry_attempt;
+        if (!canonical_cleanup_setup(
+                ipv4, self, directory, source, executable, reservation, error)) {
+            (void)canonical_target_cleanup(retry_attempt,
+                                           collision_attempt,
+                                           reservation,
+                                           source,
+                                           directory,
+                                           executable,
+                                           cleanup_deadline());
+            return CanonicalCleanupSelfCheckResult::Fail;
+        }
+        exact_reservation::Diagnostic reservation_diagnostic;
+        if (!reservation.release(reservation_diagnostic)) {
+            (void)canonical_target_cleanup(retry_attempt,
+                                           collision_attempt,
+                                           reservation,
+                                           source,
+                                           directory,
+                                           executable,
+                                           cleanup_deadline());
+            error = "canonical retry-live self-check could not release G";
+            return CanonicalCleanupSelfCheckResult::Fail;
+        }
+        const std::array<std::string_view, 3u> arguments = {
+            executable.canonical_path(), source.path(), "--canonical-cleanup-live-self-check"};
+        public_attempt::Diagnostic attempt_diagnostic;
+        const bool prepared = retry_attempt.prepare(
+            source, executable, arguments, cleanup_deadline(), {}, attempt_diagnostic);
+        const bool live = prepared &&
+                          retry_attempt.exec_and_observe(
+                              source, executable, cleanup_deadline(), attempt_diagnostic) &&
+                          retry_attempt.state() == public_attempt::State::ExecObservedLive;
+        CanonicalCleanupOnce cleanup_once;
+        const CanonicalCleanupResult& result = canonical_target_cleanup_once(cleanup_once,
+                                                                             retry_attempt,
+                                                                             collision_attempt,
+                                                                             reservation,
+                                                                             source,
+                                                                             directory,
+                                                                             executable,
+                                                                             cleanup_deadline());
+        // Model a later report/control failure taking the same Target exit path.
+        // The real cleanup result must be returned without touching any owner again.
+        const CanonicalCleanupResult& after_transport_failure =
+            canonical_target_cleanup_once(cleanup_once,
+                                          retry_attempt,
+                                          collision_attempt,
+                                          reservation,
+                                          source,
+                                          directory,
+                                          executable,
+                                          cleanup_deadline());
+        if (!live || !cleanup_once.done || cleanup_once.coordinator_calls != 1u ||
+            &result != &after_transport_failure || !result.success() || !result.children_terminal ||
+            result.reservation_attempted ||
+            !canonical_cleanup_order(result,
+                                     {CanonicalCleanupPhase::RetryAttempt,
+                                      CanonicalCleanupPhase::CollisionAttempt,
+                                      CanonicalCleanupPhase::Source,
+                                      CanonicalCleanupPhase::Directory,
+                                      CanonicalCleanupPhase::Executable}) ||
+            !canonical_success_owners_settled(
+                retry_attempt, collision_attempt, reservation, source, directory, executable)) {
+            error = "canonical G-released retry-live cleanup was not exact";
+            return CanonicalCleanupSelfCheckResult::Fail;
+        }
+    }
+
+    // An expired attempt-cleanup deadline must leave every outer owner intact.
+    // A later explicit call is used only by this self-check to settle its real
+    // owned child and prove that the first call did not release anything.
+    {
+        private_directory::PrivateDirectoryLease directory;
+        source_lease::WildcardAttemptSourceLease source;
+        executable_lease::ExecutableLease executable;
+        exact_reservation::ExactTcpReservationLease reservation;
+        public_attempt::PublicRutAttemptLease collision_attempt;
+        public_attempt::PublicRutAttemptLease retry_attempt;
+        if (!canonical_cleanup_setup(
+                ipv4, self, directory, source, executable, reservation, error)) {
+            (void)canonical_target_cleanup(retry_attempt,
+                                           collision_attempt,
+                                           reservation,
+                                           source,
+                                           directory,
+                                           executable,
+                                           cleanup_deadline());
+            return CanonicalCleanupSelfCheckResult::Fail;
+        }
+        const std::array<std::string_view, 3u> arguments = {
+            executable.canonical_path(), source.path(), "--canonical-cleanup-live-self-check"};
+        public_attempt::Diagnostic attempt_diagnostic;
+        const bool prepared = retry_attempt.prepare(
+            source, executable, arguments, cleanup_deadline(), {}, attempt_diagnostic);
+        const CanonicalCleanupResult first =
+            canonical_target_cleanup(retry_attempt,
+                                     collision_attempt,
+                                     reservation,
+                                     source,
+                                     directory,
+                                     executable,
+                                     std::chrono::steady_clock::now());
+        const bool outer_preserved = reservation.state() == exact_reservation::State::Held &&
+                                     source.state() == source_lease::State::Active &&
+                                     directory.state() == private_directory::State::Owned &&
+                                     executable.active();
+        const CanonicalCleanupResult recovery = canonical_target_cleanup(retry_attempt,
+                                                                         collision_attempt,
+                                                                         reservation,
+                                                                         source,
+                                                                         directory,
+                                                                         executable,
+                                                                         cleanup_deadline());
+        if (!prepared || first.success() ||
+            first.first_failure != CanonicalCleanupPhase::RetryAttempt ||
+            first.error_number != ETIMEDOUT || first.children_terminal || !outer_preserved ||
+            first.order_size != 2u || first.order[0] != CanonicalCleanupPhase::RetryAttempt ||
+            first.order[1] != CanonicalCleanupPhase::CollisionAttempt || !recovery.success() ||
+            !canonical_success_owners_settled(
+                retry_attempt, collision_attempt, reservation, source, directory, executable)) {
+            error = "canonical cleanup failure did not preserve outer owners";
+            return CanonicalCleanupSelfCheckResult::Fail;
+        }
+    }
+    return CanonicalCleanupSelfCheckResult::Pass;
+}
+
+static bool canonical_parent_phase(int target_fd,
+                                   const Token& token,
+                                   collision_control::StateMachine& machine,
+                                   std::chrono::steady_clock::time_point deadline,
+                                   collision_control::Phase expected_phase) {
+    Frame frame;
+    collision_control::PhaseV2 phase;
+    return receive_frame_until(target_fd, frame, deadline) &&
+           collision_control::decode_phase(frame, token, phase) && phase.phase == expected_phase &&
+           machine.observe(frame, token);
+}
+
+static bool canonical_parent_g_evidence(const collision_evidence::ReservationSource& source,
+                                        const ProcIdentity& target,
+                                        u32 positive_ipv4,
+                                        u32 guard_ipv4) {
+    if (target.pid <= 1 || source.g_fd > static_cast<u64>(std::numeric_limits<int>::max()))
+        return false;
+    const int descriptor = static_cast<int>(source.g_fd);
+    std::array<char, collision_evidence::kMaxProcLink + 1u> link_buffer{};
+    const std::string link_path =
+        "/proc/" + std::to_string(target.pid) + "/fd/" + std::to_string(descriptor);
+    const ssize_t link_size = readlink(link_path.c_str(), link_buffer.data(), link_buffer.size());
+    if (link_size <= 0 || static_cast<std::size_t>(link_size) >= link_buffer.size()) return false;
+    const std::string link(link_buffer.data(), static_cast<std::size_t>(link_size));
+    if (link != source.proc_link) return false;
+
+    std::string fdinfo;
+    if (!read_file("/proc/" + std::to_string(target.pid) + "/fdinfo/" + std::to_string(descriptor),
+                   fdinfo,
+                   4096u))
+        return false;
+    std::istringstream lines(fdinfo);
+    std::string key, value;
+    u64 flags = 0u;
+    bool found_flags = false;
+    while (lines >> key) {
+        if (key == "flags:") {
+            if (found_flags || !(lines >> value) || value.empty()) return false;
+            u64 parsed = 0u;
+            const auto result =
+                std::from_chars(value.data(), value.data() + value.size(), parsed, 8);
+            if (result.ec != std::errc{} || result.ptr != value.data() + value.size()) return false;
+            flags = parsed;
+            found_flags = true;
+        }
+        std::string rest;
+        std::getline(lines, rest);
+    }
+    if (!found_flags || (flags & static_cast<u64>(O_CLOEXEC)) == 0u ||
+        (flags & ~static_cast<u64>(O_CLOEXEC)) != source.g_f_getfl)
+        return false;
+    privileged_listener::ProcTcpTable table;
+    privileged_listener::Diagnostic diagnostic;
+    privileged_listener::GuardReservationEvidence reservation;
+    const privileged_listener::ListenerPlan plan{positive_ipv4, guard_ipv4, source.port};
+    return read_process_tcp_table(target.pid, table) &&
+           privileged_listener::classify_guard_reservation(
+               table, plan, source.ino, reservation, diagnostic);
+}
+
+static bool canonical_parent_decision(int target_fd,
+                                      const Token& token,
+                                      collision_control::StateMachine& machine,
+                                      std::chrono::steady_clock::time_point deadline,
+                                      collision_control::DecisionKind decision) {
+    collision_control::Phase phase = collision_control::Phase::ReservationHeld;
+    u64 sequence = 2u;
+    switch (decision) {
+        case collision_control::DecisionKind::AuthorizeCollisionExec:
+            phase = collision_control::Phase::ReservationHeld;
+            sequence = 2u;
+            break;
+        case collision_control::DecisionKind::AuthorizeEvidenceClose:
+            phase = collision_control::Phase::CollisionNaturallyRejectedEvidenceOpen;
+            sequence = 4u;
+            break;
+        case collision_control::DecisionKind::AuthorizeReservationRelease:
+            phase = collision_control::Phase::EvidenceClosedReservationHeld;
+            sequence = 6u;
+            break;
+        case collision_control::DecisionKind::AuthorizeRetryExec:
+            phase = collision_control::Phase::ReservationReleased;
+            sequence = 8u;
+            break;
+        case collision_control::DecisionKind::AuthorizeRetrySettlement:
+        case collision_control::DecisionKind::Finish:
+            phase = collision_control::Phase::RetryLive;
+            sequence = decision == collision_control::DecisionKind::Finish ? 12u : 10u;
+            break;
+    }
+    const collision_control::DecisionV2 value{collision_control::kProfileVersion,
+                                              machine.transaction_id(),
+                                              collision_control::Profile::Canonical,
+                                              decision,
+                                              phase,
+                                              sequence};
+    const Frame frame = collision_control::encode_decision(token, value);
+    collision_control::DecisionV2 checked;
+    return collision_control::decode_decision(frame, token, checked) &&
+           checked.decision == decision && machine.decide(frame, token) &&
+           send_frame(target_fd, frame, remaining_deadline_ms(deadline));
+}
+
+static bool canonical_parent_validate_source(const collision_evidence::Envelope& envelope,
+                                             const collision_evidence::ReservationSource& source,
+                                             const ProcIdentity& target,
+                                             u32 positive_ipv4,
+                                             u32 guard_ipv4,
+                                             const std::string& executable,
+                                             std::string& error) {
+    std::array<char, INET_ADDRSTRLEN> dotted{};
+    in_addr address{htonl(guard_ipv4)};
+    if (inet_ntop(AF_INET, &address, dotted.data(), dotted.size()) == nullptr) {
+        error = "guard address formatting failed";
+        return false;
+    }
+    const std::string expected_bytes = "listen " + std::string(dotted.data()) + ":" +
+                                       std::to_string(source.port) +
+                                       "\nroute GET \"/\" { return 204 }\n";
+    const std::string prefix = "/tmp/rut377-private-";
+    const std::string suffix = "/canonical-listener.rut";
+    if (!collision_evidence::valid_envelope(envelope,
+                                            collision_evidence::ReportKind::ReservationSource) ||
+        envelope.binding != collision_evidence::Binding::Phase ||
+        envelope.phase != collision_evidence::Phase::ReservationHeld || envelope.sequence != 1u ||
+        envelope.target.pid != static_cast<u64>(target.pid) ||
+        envelope.target.start != target.start ||
+        envelope.target.netns != static_cast<u64>(target.netns) || positive_ipv4 == 0u ||
+        positive_ipv4 == guard_ipv4 ||
+        source.reservation_state != static_cast<u64>(collision_evidence::ReservationState::Held) ||
+        source.ipv4 != guard_ipv4 || source.port == 0u || source.port > 65535u ||
+        source.g_fd <= 2u || source.g_f_getfd != static_cast<u64>(FD_CLOEXEC) ||
+        (source.g_f_getfl & static_cast<u64>(O_ACCMODE)) != static_cast<u64>(O_RDWR) ||
+        (source.g_f_getfl & static_cast<u64>(O_NONBLOCK | O_APPEND | O_ASYNC)) != 0u ||
+        source.dev == 0u || source.ino == 0u || source.mode == 0u ||
+        (source.mode & static_cast<u64>(S_IFMT)) != static_cast<u64>(S_IFSOCK) ||
+        source.rdev != 0u || source.socket_domain != static_cast<u64>(AF_INET) ||
+        source.socket_type != static_cast<u64>(SOCK_STREAM) ||
+        source.socket_protocol != static_cast<u64>(IPPROTO_TCP) || source.reuseaddr != 0u ||
+        source.reuseport != 0u || source.acceptconn != 0u ||
+        source.proc_link != "socket:[" + std::to_string(source.ino) + "]" ||
+        source.proc_link_len != source.proc_link.size() || source.proc_link.size() > 29u ||
+        source.directory_dev == 0u || source.directory_ino == 0u ||
+        (source.directory_mode & 0777u) != 0700u || source.directory_uid != getuid() ||
+        source.directory_gid != getgid() ||
+        source.source_state != static_cast<u64>(collision_evidence::SourceState::Active) ||
+        source.source_dev == 0u || source.source_ino == 0u ||
+        (source.source_mode & static_cast<u64>(S_IFMT)) != static_cast<u64>(S_IFREG) ||
+        (source.source_mode & 0777u) != 0600u || source.source_uid != getuid() ||
+        source.source_gid != getgid() || source.source_size != source.bytes_len ||
+        source.source_nlink != 1u || source.path_len != source.source_path.size() ||
+        source.bytes_len != source.source_bytes.size() ||
+        source.bytes_len != expected_bytes.size() || source.source_bytes != expected_bytes ||
+        source.path_len > collision_evidence::kMaxSourcePath ||
+        source.bytes_len > collision_evidence::kMaxSourceBytes ||
+        source.source_path.rfind(prefix, 0u) != 0u ||
+        source.source_path.size() != prefix.size() + 32u + suffix.size() ||
+        source.source_path.compare(
+            source.source_path.size() - suffix.size(), suffix.size(), suffix) != 0 ||
+        source.source_path.find('\0') != std::string::npos || executable.empty() ||
+        !canonical_parent_g_evidence(source, target, positive_ipv4, guard_ipv4)) {
+        error = "reservation/source bootstrap projection was not exact";
+        return false;
+    }
+    const std::string random_name = source.source_path.substr(prefix.size(), 32u);
+    if (!std::all_of(random_name.begin(), random_name.end(), [](char value) {
+            return (value >= '0' && value <= '9') || (value >= 'a' && value <= 'f');
+        })) {
+        error = "random source path name was not canonical";
+        return false;
+    }
+    const std::string directory_path = source.source_path.substr(
+        0u, source.source_path.size() - std::string("/canonical-listener.rut").size());
+    struct stat directory_status{}, source_status{};
+    if (lstat(directory_path.c_str(), &directory_status) != 0 ||
+        !S_ISDIR(directory_status.st_mode) ||
+        static_cast<u64>(directory_status.st_dev) != source.directory_dev ||
+        static_cast<u64>(directory_status.st_ino) != source.directory_ino ||
+        lstat(source.source_path.c_str(), &source_status) != 0 ||
+        static_cast<u64>(source_status.st_dev) != source.source_dev ||
+        static_cast<u64>(source_status.st_ino) != source.source_ino ||
+        static_cast<u64>(source_status.st_size) != source.source_size ||
+        static_cast<u64>(source_status.st_mode) != source.source_mode ||
+        source_status.st_nlink != 1u || source_status.st_uid != getuid() ||
+        source_status.st_gid != getgid() ||
+        static_cast<u64>(directory_status.st_mode) != source.directory_mode ||
+        directory_status.st_uid != getuid() || directory_status.st_gid != getgid()) {
+        error = "random source path/stat identity was not independently observed";
+        return false;
+    }
+    std::string observed_bytes;
+    if (!read_file(source.source_path, observed_bytes, collision_evidence::kMaxSourceBytes) ||
+        observed_bytes != expected_bytes) {
+        error = "source bytes were not independently read at report1 bootstrap";
+        return false;
+    }
+    (void)positive_ipv4;
+    return true;
+}
+
+static bool canonical_parent_pidfd_info(pid_t target, int fd, pid_t child) {
+    if (target <= 1 || fd < 0 || child <= 1) return false;
+    std::string text;
+    if (!read_file(
+            "/proc/" + std::to_string(target) + "/fdinfo/" + std::to_string(fd), text, 4096u))
+        return false;
+    std::istringstream lines(text);
+    std::string key;
+    bool found = false;
+    while (lines >> key) {
+        if (key == "Pid:") {
+            long value = 0;
+            if (found || !(lines >> value) || value != child) return false;
+            found = true;
+        }
+        std::string rest;
+        std::getline(lines, rest);
+    }
+    return found;
+}
+
+static bool canonical_parent_retry_identity(const collision_evidence::RetryLive& report,
+                                            const ProcIdentity& target,
+                                            const std::string& executable,
+                                            const collision_evidence::Target& evidence_target,
+                                            u32 positive_ipv4,
+                                            u32 guard_ipv4,
+                                            u16 expected_port,
+                                            std::string& error) {
+    if (report.header.child_pid <= 1u ||
+        report.header.child_pid > static_cast<u64>(std::numeric_limits<pid_t>::max()) ||
+        report.header.child_pid == 0u || report.header.child_start == 0u ||
+        report.pidfd.pidfd_fd > static_cast<u64>(std::numeric_limits<int>::max()) ||
+        report.port != expected_port || report.startup.port != expected_port ||
+        report.procs.first_tag != 1u || report.procs.second_tag != 1u ||
+        report.procs.first != report.procs.second ||
+        report.procs.first.pid != report.header.child_pid ||
+        report.procs.first.start != report.header.child_start ||
+        report.procs.first.ppid != evidence_target.pid ||
+        report.procs.first.netns != evidence_target.netns)
+        return false;
+    const pid_t child = static_cast<pid_t>(report.header.child_pid);
+    ProcIdentity first, second;
+    const std::string expected_cmdline = report.cmdline;
+    if (!read_proc(child, first) || !read_proc(child, second) ||
+        !same_process_identity(first, second) || first.start != report.header.child_start ||
+        canonical_proc13(first) != report.procs.first ||
+        canonical_proc13(second) != report.procs.second || first.ppid != target.pid ||
+        first.uid != getuid() || first.gid != getgid() || first.netns != target.netns ||
+        first.exe != executable || first.cmdline != expected_cmdline ||
+        !canonical_empty_environment(child) ||
+        !pidfd_link_matches(target.pid, static_cast<int>(report.pidfd.pidfd_fd)) ||
+        !canonical_parent_pidfd_info(target.pid, static_cast<int>(report.pidfd.pidfd_fd), child) ||
+        [&]() {
+            u64 socket_inode = 0u;
+            return !canonical_target_socket_evidence(child,
+                                                     positive_ipv4,
+                                                     guard_ipv4,
+                                                     static_cast<u16>(report.port),
+                                                     socket_inode) ||
+                   socket_inode == 0u;
+        }()) {
+        error = "retry child/pidfd/socket identity was not independently observed";
+        return false;
+    }
+    return report.pidfd.poll_result == 0u && report.pidfd.revents == 0u;
+}
+
+static bool canonical_parent_cleanup_residue(const collision_evidence::ReservationSource& source,
+                                             const ProcIdentity& target,
+                                             const std::string& executable,
+                                             std::string& error) {
+    const std::string directory_path = source.source_path.substr(
+        0u, source.source_path.size() - std::string("/canonical-listener.rut").size());
+    struct stat ignored{};
+    errno = 0;
+    if (lstat(source.source_path.c_str(), &ignored) == 0 || errno != ENOENT) {
+        error = "source path remained after canonical cleanup";
+        return false;
+    }
+    errno = 0;
+    if (lstat(directory_path.c_str(), &ignored) == 0 || errno != ENOENT) {
+        error = "private directory remained after canonical cleanup";
+        return false;
+    }
+    privileged_listener::ProcTcpTable table;
+    std::vector<u64> sockets;
+    if (!read_process_tcp_table(target.pid, table) || !process_socket_inodes(target.pid, sockets)) {
+        error = "Target cleanup residue could not be independently observed";
+        return false;
+    }
+    for (std::size_t index = 0u; index != table.count; ++index)
+        if (table.rows[index].local_port == source.port) {
+            error = "selected B:P remained after canonical cleanup";
+            return false;
+        }
+    if (std::find(sockets.begin(), sockets.end(), source.ino) != sockets.end()) {
+        error = "released G socket inode remained in Target FD table";
+        return false;
+    }
+    const int directory_fd = open(("/proc/" + std::to_string(target.pid) + "/fd").c_str(),
+                                  O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    if (directory_fd < 0) {
+        error = "Target FD residue could not be independently enumerated";
+        return false;
+    }
+    DIR* directory = fdopendir(directory_fd);
+    if (directory == nullptr) {
+        close(directory_fd);
+        error = "Target FD residue directory could not be opened";
+        return false;
+    }
+    const std::string deleted_source = source.source_path + " (deleted)";
+    const std::string deleted_directory = directory_path + " (deleted)";
+    bool clean = true;
+    errno = 0;
+    while (dirent* entry = readdir(directory)) {
+        int descriptor = -1;
+        const char* const begin = entry->d_name;
+        const char* const end = begin + std::strlen(begin);
+        const auto parsed = std::from_chars(begin, end, descriptor, 10);
+        if (parsed.ec != std::errc{} || parsed.ptr != end || descriptor < 0) continue;
+        std::array<char, collision_evidence::kMaxCmdline + 1u> link_buffer{};
+        const ssize_t length =
+            readlinkat(directory_fd, entry->d_name, link_buffer.data(), link_buffer.size() - 1u);
+        if (length <= 0 || static_cast<std::size_t>(length) >= link_buffer.size()) {
+            clean = false;
+            break;
+        }
+        const std::string link(link_buffer.data(), static_cast<std::size_t>(length));
+        if (link == executable || link == source.source_path || link == deleted_source ||
+            link == directory_path || link == deleted_directory) {
+            clean = false;
+            break;
+        }
+    }
+    const int read_error = errno;
+    if (closedir(directory) != 0 || read_error != 0 || !clean) {
+        error = "Target retained executable/source/directory FD residue";
+        return false;
+    }
+    return true;
+}
+
+static bool run_canonical_collision_release_parent(int target_fd,
+                                                   const Token& token,
+                                                   const HeldTopologySnapshot& topology,
+                                                   const std::string& executable,
+                                                   const ProcIdentity& target_proc,
+                                                   std::string& error) {
+    u32 positive_ipv4 = 0u, guard_ipv4 = 0u;
+    if (!parse_canonical_ipv4(topology.positive_ip, positive_ipv4) ||
+        !parse_canonical_ipv4(topology.guard_ip, guard_ipv4)) {
+        error = "held topology addresses were not canonical IPv4";
+        return false;
+    }
+    const auto deadline =
+        std::chrono::steady_clock::now() + std::chrono::milliseconds(kCanonicalParentProtocolMs);
+    const std::vector<unsigned char> request =
+        canonical_request_payload(positive_ipv4, guard_ipv4, executable);
+    if (!send_frame(
+            target_fd, Frame{kGuardReserve, token, request}, remaining_deadline_ms(deadline))) {
+        error = "canonical reservation request transport failed";
+        return false;
+    }
+    Frame source_frame;
+    if (!canonical_receive_evidence(
+            target_fd,
+            token,
+            collision_evidence::max_payload(collision_evidence::ReportKind::ReservationSource),
+            deadline,
+            source_frame)) {
+        error = "canonical report1 transport failed";
+        return false;
+    }
+    const collision_evidence::Envelope source_envelope = canonical_envelope_from_frame(
+        source_frame, collision_evidence::ReportKind::ReservationSource);
+    collision_evidence::ReservationSource source;
+    if (!collision_evidence::decode_reservation_source(
+            source_frame, token, source_envelope, source) ||
+        !canonical_parent_validate_source(
+            source_envelope, source, target_proc, positive_ipv4, guard_ipv4, executable, error))
+        return false;
+    const collision_evidence::Target evidence_target{
+        source_envelope.target.pid, source_envelope.target.start, source_envelope.target.netns};
+    const std::array<std::string_view, 9u> arguments = {
+        executable, source.source_path, "--shards", "1", "--no-pin", "--drain", "0", "--opt", "2"};
+    std::string expected_cmdline;
+    for (const std::string_view argument : arguments) {
+        expected_cmdline.append(argument);
+        expected_cmdline.push_back('\0');
+    }
+    collision_evidence::ReceiverContext receiver_context{token,
+                                                         source_envelope.transaction,
+                                                         source_envelope.domain,
+                                                         evidence_target,
+                                                         source,
+                                                         expected_cmdline};
+    collision_evidence::Receiver receiver(receiver_context);
+    if (!receiver.observe(source_frame)) {
+        error = "report1 strict receiver replay failed";
+        return false;
+    }
+    collision_control::StateMachine machine;
+    const collision_control::CommandV2 command{collision_control::kProfileVersion,
+                                               source_envelope.transaction,
+                                               collision_control::Profile::Canonical,
+                                               0u};
+    const Frame command_frame = collision_control::encode_command(token, command);
+    if (!machine.begin(command_frame, token) ||
+        !send_frame(target_fd, command_frame, remaining_deadline_ms(deadline)) ||
+        !canonical_parent_phase(
+            target_fd, token, machine, deadline, collision_control::Phase::ReservationHeld) ||
+        !canonical_parent_decision(target_fd,
+                                   token,
+                                   machine,
+                                   deadline,
+                                   collision_control::DecisionKind::AuthorizeCollisionExec) ||
+        !canonical_parent_phase(target_fd,
+                                token,
+                                machine,
+                                deadline,
+                                collision_control::Phase::CollisionNaturallyRejectedEvidenceOpen)) {
+        error = "collision control reservation/exec barrier failed";
+        return false;
+    }
+    Frame collision_frame, capture_frame;
+    const auto collision_max =
+        collision_evidence::max_payload(collision_evidence::ReportKind::CollisionAttempt);
+    const auto capture_max =
+        collision_evidence::max_payload(collision_evidence::ReportKind::CollisionCapture);
+    if (!canonical_receive_evidence(target_fd, token, collision_max, deadline, collision_frame) ||
+        !canonical_receive_evidence(target_fd, token, capture_max, deadline, capture_frame) ||
+        !receiver.observe(collision_frame) || !receiver.observe(capture_frame)) {
+        error = "collision reports 2/3 were malformed or out of order";
+        return false;
+    }
+    if (!canonical_parent_decision(target_fd,
+                                   token,
+                                   machine,
+                                   deadline,
+                                   collision_control::DecisionKind::AuthorizeEvidenceClose) ||
+        !canonical_parent_phase(target_fd,
+                                token,
+                                machine,
+                                deadline,
+                                collision_control::Phase::EvidenceClosedReservationHeld)) {
+        error = "collision evidence-close barrier failed";
+        return false;
+    }
+    Frame closed_frame;
+    if (!canonical_receive_evidence(
+            target_fd,
+            token,
+            collision_evidence::max_payload(collision_evidence::ReportKind::EvidenceClosed),
+            deadline,
+            closed_frame) ||
+        !receiver.observe(closed_frame)) {
+        error = "report4 evidence-closed transport/replay failed";
+        return false;
+    }
+    if (!canonical_parent_decision(target_fd,
+                                   token,
+                                   machine,
+                                   deadline,
+                                   collision_control::DecisionKind::AuthorizeReservationRelease) ||
+        !canonical_parent_phase(
+            target_fd, token, machine, deadline, collision_control::Phase::ReservationReleased)) {
+        error = "one-shot reservation release barrier failed";
+        return false;
+    }
+    Frame release_frame;
+    if (!canonical_receive_evidence(
+            target_fd,
+            token,
+            collision_evidence::max_payload(collision_evidence::ReportKind::Release),
+            deadline,
+            release_frame) ||
+        !receiver.observe(release_frame)) {
+        error = "report5 release receipt transport/replay failed";
+        return false;
+    }
+    if (!canonical_parent_decision(target_fd,
+                                   token,
+                                   machine,
+                                   deadline,
+                                   collision_control::DecisionKind::AuthorizeRetryExec) ||
+        !canonical_parent_phase(
+            target_fd, token, machine, deadline, collision_control::Phase::RetryLive)) {
+        error = "retry execution barrier failed";
+        return false;
+    }
+    Frame retry_frame, retry_capture_frame;
+    if (!canonical_receive_evidence(
+            target_fd,
+            token,
+            collision_evidence::max_payload(collision_evidence::ReportKind::RetryLive),
+            deadline,
+            retry_frame)) {
+        error = "report6 retry-live transport failed";
+        return false;
+    }
+    const collision_evidence::Envelope retry_envelope =
+        canonical_envelope_from_frame(retry_frame, collision_evidence::ReportKind::RetryLive);
+    collision_evidence::RetryLive retry_live;
+    if (!collision_evidence::decode_retry_live(retry_frame, token, retry_envelope, retry_live) ||
+        !canonical_parent_retry_identity(retry_live,
+                                         target_proc,
+                                         executable,
+                                         evidence_target,
+                                         guard_ipv4,
+                                         positive_ipv4,
+                                         static_cast<u16>(source.port),
+                                         error))
+        return false;
+    if (!canonical_receive_evidence(
+            target_fd,
+            token,
+            collision_evidence::max_payload(collision_evidence::ReportKind::RetryLiveCapture),
+            deadline,
+            retry_capture_frame) ||
+        !receiver.observe(retry_frame) || !receiver.observe(retry_capture_frame)) {
+        error = "report7 live capture transport/replay failed";
+        return false;
+    }
+    collision_evidence::RetryLiveCapture retry_capture;
+    const collision_evidence::Envelope retry_capture_envelope = canonical_envelope_from_frame(
+        retry_capture_frame, collision_evidence::ReportKind::RetryLiveCapture);
+    if (!collision_evidence::decode_retry_live_capture(
+            retry_capture_frame, token, retry_capture_envelope, retry_capture) ||
+        !exact_log_ready(
+            retry_capture.capture, source.source_path, source.port, retry_live.startup.backend)) {
+        error = "retry startup capture was not exact";
+        return false;
+    }
+    if (!canonical_parent_decision(target_fd,
+                                   token,
+                                   machine,
+                                   deadline,
+                                   collision_control::DecisionKind::AuthorizeRetrySettlement)) {
+        error = "retry settlement barrier failed";
+        return false;
+    }
+    Frame settlement_frame, final_frame;
+    if (!canonical_receive_evidence(
+            target_fd,
+            token,
+            collision_evidence::max_payload(collision_evidence::ReportKind::RetrySettlement),
+            deadline,
+            settlement_frame) ||
+        !receiver.observe(settlement_frame) ||
+        !canonical_receive_evidence(
+            target_fd,
+            token,
+            collision_evidence::max_payload(collision_evidence::ReportKind::RetryFinalCapture),
+            deadline,
+            final_frame) ||
+        !receiver.observe(final_frame)) {
+        error = "reports 8/9 transport/replay failed";
+        return false;
+    }
+    collision_evidence::RetryFinalCapture final_capture;
+    const collision_evidence::Envelope final_envelope = canonical_envelope_from_frame(
+        final_frame, collision_evidence::ReportKind::RetryFinalCapture);
+    if (!collision_evidence::decode_retry_final_capture(
+            final_frame, token, final_envelope, final_capture) ||
+        final_capture.capture.size() < retry_capture.capture.size() ||
+        std::memcmp(final_capture.capture.data(),
+                    retry_capture.capture.data(),
+                    retry_capture.capture.size()) != 0 ||
+        receiver.state() != collision_evidence::State::AwaitFinish) {
+        error = "final capture prefix/evidence receiver completion failed";
+        return false;
+    }
+    if (!canonical_parent_cleanup_residue(source, target_proc, executable, error)) return false;
+    const collision_control::SettlementV2 settlement{
+        collision_control::kProfileVersion,
+        machine.transaction_id(),
+        collision_control::Profile::Canonical,
+        collision_control::SettlementKind::AttemptSettled,
+        collision_control::Phase::RetryLive,
+        11u};
+    const Frame settlement_control = collision_control::encode_settlement(token, settlement);
+    if (!machine.settle(settlement_control, token) ||
+        !send_frame(target_fd, settlement_control, remaining_deadline_ms(deadline)) ||
+        !canonical_parent_decision(
+            target_fd, token, machine, deadline, collision_control::DecisionKind::Finish) ||
+        machine.state() != collision_control::State::Complete || !receiver.finish()) {
+        error = "control settlement/finish ordering failed";
+        return false;
+    }
+    return true;
 }
 
 static std::vector<unsigned char> encode_guard_report(const GuardReport& report) {
@@ -2499,8 +5362,6 @@ struct ExactChildState {
     struct stat executable_status{};
     std::string executable;
     std::string argv;
-    std::string source_name;
-    std::string log_name;
     std::string source_path;
     std::string log_path;
     std::string directory_path;
@@ -2652,11 +5513,404 @@ static bool exact_log_ready(const std::string& log,
     return true;
 }
 
+static std::string assigned_proxy_server_fragment(const privileged_listener::ListenerPlan& plan) {
+    return "server {\n  listen " + std::to_string((plan.positive_ipv4 >> 24u) & 0xffu) + "." +
+           std::to_string((plan.positive_ipv4 >> 16u) & 0xffu) + "." +
+           std::to_string((plan.positive_ipv4 >> 8u) & 0xffu) + "." +
+           std::to_string(plan.positive_ipv4 & 0xffu) + ":" + std::to_string(plan.port) +
+           ";\n  location / { proxy_pass http://127.0.0.1:9000; }\n}";
+}
+
+struct GeneratedDifferentialBuilderContext {
+    std::string expected_bytes;
+    std::uint32_t calls = 0u;
+};
+
+static bool build_generated_differential_nginx_config(
+    const ipv4_topology::ExactInputTopologyBuildRequest& request,
+    ipv4_topology::ExactInputTopologyBuildSink& sink,
+    void* opaque) {
+    auto* context = static_cast<GeneratedDifferentialBuilderContext*>(opaque);
+    if (context == nullptr || request.port != ipv4_topology::kExactInputTopologyBuilderPort)
+        return false;
+    privileged_listener::ListenerPlan plan{};
+    if (!parse_canonical_ipv4(request.positive_ipv4.data(), plan.positive_ipv4) ||
+        !parse_canonical_ipv4(request.guard_ipv4.data(), plan.guard_ipv4))
+        return false;
+    plan.port = request.port;
+    const std::string fragment = assigned_proxy_server_fragment(plan);
+    context->expected_bytes = "events {}\nhttp { " + fragment + " }\n";
+    ++context->calls;
+    return sink.append(context->expected_bytes.data(), context->expected_bytes.size());
+}
+
+static bool build_generated_proxy_source(const privileged_listener::ListenerPlan& plan,
+                                         std::string& source,
+                                         std::string& diagnostic) {
+    source.clear();
+    diagnostic.clear();
+    if (plan.port == 0u || plan.port > 65535u || plan.positive_ipv4 == 0u) {
+        diagnostic = "invalid generated listener plan";
+        return false;
+    }
+    const std::string fragment = assigned_proxy_server_fragment(plan);
+    const auto parsed =
+        rut::nginx::parse({fragment.data(), static_cast<rut::u32>(fragment.size())});
+    if (!parsed) {
+        diagnostic = "topology-derived fragment was rejected by nginx parser";
+        return false;
+    }
+    const rut::nginx::Server& server = parsed.value();
+    const rut::nginx::ProxyPass& proxy = server.location.proxy_pass;
+    if (server.listen.address != rut::ListenerAddress::IPv4Exact ||
+        server.listen.ipv4_host != plan.positive_ipv4 || server.listen.port != plan.port ||
+        !server.location.path.eq(rut::lit_str("/")) || proxy.has_uri || proxy.uri.ptr != nullptr ||
+        proxy.uri.len != 0u || proxy.address[0] != 127u || proxy.address[1] != 0u ||
+        proxy.address[2] != 0u || proxy.address[3] != 1u || proxy.port != 9000u ||
+        server.exact_local_return.present || server.exact_no_content_return.present ||
+        server.exact_absolute_redirect.present || server.span.start != 0u ||
+        server.span.end != fragment.size() || server.listen.value.ptr == nullptr ||
+        server.listen.value.len == 0u || server.location.path.ptr == nullptr ||
+        server.location.proxy_pass.span.start <= server.location.path_span.end) {
+        diagnostic = "parsed generated proxy model lost assigned-listener/root/proxy provenance";
+        return false;
+    }
+    const auto lowered = rut::nginx::lower_to_rut(server);
+    if (!lowered) {
+        diagnostic = "converter rejected topology-derived proxy model";
+        return false;
+    }
+    const rut::Str generated = lowered.value().view();
+    if (generated.ptr == nullptr || generated.len == 0u ||
+        generated.len >= rut::nginx::RutSource::kCapacity ||
+        std::string(generated.ptr, generated.len)
+                .find("failure_policy: {\n            version: \"HTTP/1.1\",\n            status: "
+                      "502,") == std::string::npos) {
+        diagnostic = "converter output was not the ordinary generated 502 proxy program";
+        return false;
+    }
+    source.assign(generated.ptr, generated.len);
+    return !source.empty();
+}
+
+static bool valid_http_date(const std::string& value) {
+    if (value.size() != 29u) return false;
+    const auto is_digit = [](char c) { return c >= '0' && c <= '9'; };
+    const auto token_is_one_of =
+        [](const char* text, const char* const* tokens, std::size_t count) {
+            for (std::size_t i = 0u; i < count; ++i)
+                if (memcmp(text, tokens[i], 3u) == 0) return true;
+            return false;
+        };
+    static constexpr const char* weekdays[] = {"Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"};
+    static constexpr const char* months[] = {
+        "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"};
+    const char* date = value.data();
+    const auto two_digits = [&](std::size_t offset) {
+        return is_digit(date[offset]) && is_digit(date[offset + 1u])
+                   ? static_cast<unsigned>(date[offset] - '0') * 10u +
+                         static_cast<unsigned>(date[offset + 1u] - '0')
+                   : 100u;
+    };
+    if (!token_is_one_of(date, weekdays, 7u) || date[3] != ',' || date[4] != ' ' ||
+        date[7] != ' ' || !token_is_one_of(date + 8u, months, 12u) || date[11] != ' ' ||
+        date[16] != ' ' || date[19] != ':' || date[22] != ':' || date[25] != ' ' ||
+        memcmp(date + 26u, "GMT", 3u) != 0)
+        return false;
+    for (std::size_t i = 12u; i < 16u; ++i)
+        if (!is_digit(date[i])) return false;
+    return two_digits(5u) >= 1u && two_digits(5u) <= 31u && two_digits(17u) <= 23u &&
+           two_digits(20u) <= 59u && two_digits(23u) <= 59u;
+}
+
+static bool generated_response_wire_valid(const std::string& response) {
+    static constexpr char body[] =
+        "<html>\r\n<head><title>502 Bad Gateway</title></head>\r\n<body>\r\n"
+        "<center><h1>502 Bad Gateway</h1></center>\r\n<hr><center>nginx/1.29.7</center>\r\n"
+        "</body>\r\n</html>\r\n";
+    static constexpr char prefix[] = "HTTP/1.1 502 Bad Gateway\r\nServer: nginx/1.29.7\r\nDate: ";
+    static constexpr char suffix[] =
+        "\r\nContent-Type: text/html\r\nContent-Length: 157\r\nConnection: close\r\n\r\n";
+    const std::size_t date_start = sizeof(prefix) - 1u;
+    const std::size_t date_end = response.find("\r\n", date_start);
+    return date_end != std::string::npos &&
+           valid_http_date(response.substr(date_start, date_end - date_start)) &&
+           response == std::string(prefix) + response.substr(date_start, date_end - date_start) +
+                           std::string(suffix) + std::string(body);
+}
+
+static bool normalize_http_date_wire(const std::string& wire,
+                                     std::string& normalized,
+                                     rut::test::bounded_http_exchange::ParsedResponse& parsed,
+                                     std::string& error) {
+    if (!rut::test::bounded_http_exchange::parse_response(wire, parsed, error) ||
+        parsed.version != "1.1" || parsed.headers.size() != 5u) {
+        if (error.empty()) error = "HTTP wire did not parse as the bounded response";
+        return false;
+    }
+    std::size_t date_header_count = 0u;
+    for (const auto& header : parsed.headers) {
+        if (header.name == "Date") {
+            ++date_header_count;
+            if (!valid_http_date(header.value)) {
+                error = "HTTP Date header was not a valid 29-byte RFC1123 value";
+                return false;
+            }
+        }
+    }
+    if (date_header_count != 1u) {
+        error = "HTTP response did not contain exactly one Date header";
+        return false;
+    }
+    const std::string marker = "\r\nDate: ";
+    const std::size_t date_start = wire.find(marker);
+    if (date_start == std::string::npos ||
+        wire.find(marker, date_start + 1u) != std::string::npos) {
+        error = "HTTP Date wire framing was not unique";
+        return false;
+    }
+    const std::size_t value_start = date_start + marker.size();
+    const std::size_t value_end = wire.find("\r\n", value_start);
+    if (value_end == std::string::npos || value_end - value_start != 29u) {
+        error = "HTTP Date wire value was not exactly 29 bytes";
+        return false;
+    }
+    normalized = wire;
+    normalized.replace(value_start, 29u, "XXXXXXXXXXXXXXXXXXXXXXXXXXXXX");
+    return true;
+}
+
+static bool compare_generated_proxy_observation(
+    const ipv4_topology::ExactInputRotationLiveEvidence& evidence,
+    const GeneratedProxyObservation& generated,
+    std::string& error) {
+    static constexpr char request[] =
+        "GET / HTTP/1.1\r\nHost: client.example\r\nConnection: close\r\n\r\n";
+    const auto& nginx = evidence.old_nginx;
+    u32 expected_positive = 0u;
+    u32 expected_guard = 0u;
+    const std::string expected_listen =
+        "listen " + evidence.generation_receipt.new_generation.topology.positive_ip + ":" +
+        std::to_string(ipv4_topology::kExactInputTopologyBuilderPort);
+    if (!parse_canonical_ipv4(evidence.generation_receipt.new_generation.topology.positive_ip,
+                              expected_positive) ||
+        !parse_canonical_ipv4(evidence.generation_receipt.new_generation.topology.guard_ip,
+                              expected_guard) ||
+        expected_positive == 0u || (expected_positive >> 24u) == 127u ||
+        expected_positive == expected_guard ||
+        evidence.initial_source.bytes.find(expected_listen) == std::string::npos ||
+        evidence.fresh_source.bytes.find(expected_listen) == std::string::npos ||
+        evidence.initial_source.bytes.find("proxy_pass http://127.0.0.1:9000;") ==
+            std::string::npos ||
+        evidence.fresh_source.bytes.find("proxy_pass http://127.0.0.1:9000;") ==
+            std::string::npos ||
+        !evidence.old_terminal_tcp.attempted || !evidence.old_terminal_tcp.complete ||
+        evidence.old_terminal_tcp.local_ipv4 != expected_positive ||
+        evidence.old_terminal_tcp.local_port != ipv4_topology::kExactInputTopologyBuilderPort ||
+        generated.positive_ipv4 != expected_positive || generated.guard_ipv4 != expected_guard ||
+        generated.port != ipv4_topology::kExactInputTopologyBuilderPort ||
+        generated.upstream_ipv4 != 0x7f000001u || generated.upstream_port != 9000u ||
+        generated.cleanup_complete != 1u || generated.child_pid <= 1u ||
+        generated.child_start == 0u || generated.listener_inode == 0u ||
+        nginx.outcome != ipv4_topology::ExactInputNginxLifecycleOutcome::Complete ||
+        !nginx.http.attempted || !nginx.http.eof_observed || nginx.http.request != request ||
+        nginx.http.write_shutdown_started || nginx.http.write_shutdown_completed ||
+        !nginx.upstream_absence_before || !nginx.upstream_absence_after ||
+        generated.request_wire != request || generated.upstream_absence_probe_refused != 1u ||
+        generated.guard_before_connect_error != ECONNREFUSED ||
+        generated.guard_after_connect_error != ECONNREFUSED || generated.eof != 1u) {
+        error = "nginx/RUT request, refusal, EOF, or independent endpoint evidence differed";
+        return false;
+    }
+    rut::test::bounded_http_exchange::ParsedResponse nginx_response, generated_response;
+    std::string nginx_normalized, generated_normalized;
+    std::string parse_error;
+    if (!normalize_http_date_wire(
+            nginx.http.raw_response, nginx_normalized, nginx_response, parse_error) ||
+        !normalize_http_date_wire(
+            generated.response_wire, generated_normalized, generated_response, parse_error)) {
+        error = "nginx/RUT Date-normalized response parsing failed: " + parse_error;
+        return false;
+    }
+    if (nginx_response.version != generated_response.version || nginx_response.status != 502u ||
+        generated_response.status != 502u || nginx_response.reason != generated_response.reason ||
+        nginx_response.body.size() != 157u || generated_response.body.size() != 157u ||
+        nginx_response.body != generated_response.body || nginx_response.headers.size() != 5u ||
+        generated_response.headers.size() != 5u) {
+        error = "nginx/RUT status, reason, body, or header cardinality differed";
+        return false;
+    }
+    for (std::size_t i = 0u; i < nginx_response.headers.size(); ++i) {
+        const auto& left = nginx_response.headers[i];
+        const auto& right = generated_response.headers[i];
+        if (left.name != right.name || (left.name != "Date" && left.value != right.value)) {
+            error = "nginx/RUT ordered response headers differed";
+            return false;
+        }
+    }
+    if (nginx_normalized != generated_normalized || generated.status != 502u ||
+        generated.headers_exact != 1u || generated.body_bytes != generated_response.body.size() ||
+        generated.response_wire.size() != nginx.http.raw_response.size()) {
+        error = "nginx/RUT Date-normalized raw response framing differed";
+        return false;
+    }
+    return true;
+}
+
+static bool generated_differential_comparator_self_check(std::string& error) {
+    static constexpr char request[] =
+        "GET / HTTP/1.1\r\nHost: client.example\r\nConnection: close\r\n\r\n";
+    static constexpr char body[] =
+        "<html>\r\n<head><title>502 Bad Gateway</title></head>\r\n<body>\r\n"
+        "<center><h1>502 Bad Gateway</h1></center>\r\n<hr><center>nginx/1.29.7</center>\r\n"
+        "</body>\r\n</html>\r\n";
+    const std::string response =
+        std::string("HTTP/1.1 502 Bad Gateway\r\nServer: nginx/1.29.7\r\n") +
+        "Date: Tue, 01 Jan 2030 00:00:00 GMT\r\nContent-Type: text/html\r\n"
+        "Content-Length: 157\r\nConnection: close\r\n\r\n" +
+        body;
+    ipv4_topology::ExactInputNginxLifecycleObservation nginx;
+    nginx.outcome = ipv4_topology::ExactInputNginxLifecycleOutcome::Complete;
+    nginx.attempted = true;
+    nginx.terminal_frozen = true;
+    nginx.create_attempted = true;
+    nginx.created = true;
+    nginx.start_attempted = true;
+    nginx.started = true;
+    nginx.same_source_inode = true;
+    nginx.sibling_mount_independently_verified = true;
+    nginx.samples_at_least_250ms_apart = true;
+    nginx.quit_attempted = true;
+    nginx.quit_only = true;
+    nginx.stopped_exit_zero = true;
+    nginx.cgroup_empty_after_stop = true;
+    nginx.removed_nonforce = true;
+    nginx.exact_absence = true;
+    nginx.baseline_restored = true;
+    nginx.http.attempted = true;
+    nginx.http.terminal_frozen = true;
+    nginx.http.connect_started = true;
+    nginx.http.connect_completed = true;
+    nginx.http.send_started = true;
+    nginx.http.send_completed = true;
+    nginx.http.read_started = true;
+    nginx.http.eof_observed = true;
+    nginx.http.request = request;
+    nginx.http.raw_response = response;
+    nginx.upstream_absence_before = true;
+    nginx.upstream_absence_after = true;
+    ipv4_topology::ExactInputRotationLiveEvidence evidence;
+    evidence.old_nginx = nginx;
+    evidence.generation_receipt.new_generation.topology.positive_ip = "10.1.2.3";
+    evidence.generation_receipt.new_generation.topology.guard_ip = "10.1.2.4";
+    evidence.initial_source.bytes =
+        "events {}\nhttp { server {\n  listen 10.1.2.3:41857;\n  location / { "
+        "proxy_pass http://127.0.0.1:9000; }\n} }\n";
+    evidence.fresh_source.bytes = evidence.initial_source.bytes;
+    evidence.old_terminal_tcp.local_ipv4 = 0x0a010203u;
+    evidence.old_terminal_tcp.local_port = ipv4_topology::kExactInputTopologyBuilderPort;
+    evidence.old_terminal_tcp.attempted = true;
+    evidence.old_terminal_tcp.complete = true;
+    evidence.old_terminal_tcp.state = 0x06u;
+    evidence.old_terminal_tcp.remote_ipv4 = 0x0a010204u;
+    evidence.old_terminal_tcp.remote_port = 50000u;
+    evidence.old_and_fresh_authorities_separate = true;
+    evidence.fresh_clean_baseline = true;
+    GeneratedProxyObservation generated;
+    generated.request_wire = request;
+    generated.response_wire = response;
+    generated.upstream_absence_probe_refused = 1u;
+    generated.guard_before_connect_error = ECONNREFUSED;
+    generated.guard_after_connect_error = ECONNREFUSED;
+    generated.status = 502u;
+    generated.headers_exact = 1u;
+    generated.body_bytes = sizeof(body) - 1u;
+    generated.child_pid = 101u;
+    generated.child_start = 202u;
+    generated.listener_inode = 303u;
+    generated.positive_ipv4 = 0x0a010203u;
+    generated.guard_ipv4 = 0x0a010204u;
+    generated.port = ipv4_topology::kExactInputTopologyBuilderPort;
+    generated.upstream_ipv4 = 0x7f000001u;
+    generated.upstream_port = 9000u;
+    generated.eof = 1u;
+    generated.cleanup_complete = 1u;
+    if (!compare_generated_proxy_observation(evidence, generated, error)) return false;
+    const GeneratedProxyObservation canonical = generated;
+    const auto rejects = [&](const GeneratedProxyObservation& mutation, const char* label) {
+        std::string ignored;
+        if (compare_generated_proxy_observation(evidence, mutation, ignored)) {
+            error = std::string(label) +
+                    " mutation was accepted by the generated differential comparator";
+            return false;
+        }
+        return true;
+    };
+    generated.response_wire.replace(generated.response_wire.find("502"), 3u, "503");
+    if (!rejects(generated, "response")) return false;
+    generated = canonical;
+    generated.eof = 0u;
+    if (!rejects(generated, "EOF")) return false;
+    generated = canonical;
+    generated.request_wire.pop_back();
+    if (!rejects(generated, "request")) return false;
+    generated = canonical;
+    generated.response_wire.replace(
+        generated.response_wire.find("Date: ") + 6u, 29u, "Xxx, 99 Xxx 9999 99:99:99 GMT");
+    if (!rejects(generated, "Date")) return false;
+    generated = canonical;
+    generated.cleanup_complete = 0u;
+    if (!rejects(generated, "cleanup")) return false;
+    generated = canonical;
+    generated.child_start = 0u;
+    if (!rejects(generated, "identity")) return false;
+    generated = canonical;
+    generated.port++;
+    if (!rejects(generated, "endpoint")) return false;
+    generated = canonical;
+    generated.positive_ipv4++;
+    if (!rejects(generated, "positive-listener")) return false;
+    generated = canonical;
+    generated.guard_ipv4 = generated.positive_ipv4;
+    if (!rejects(generated, "guard-listener")) return false;
+    generated = canonical;
+    generated.upstream_port++;
+    if (!rejects(generated, "upstream-endpoint")) return false;
+    generated = canonical;
+    const std::size_t server_start = generated.response_wire.find("Server: ");
+    const std::size_t date_start = generated.response_wire.find("Date: ");
+    const std::size_t date_end = generated.response_wire.find("\r\n", date_start);
+    if (server_start == std::string::npos || date_start == std::string::npos ||
+        date_end == std::string::npos) {
+        error = "comparator self-check response headers were malformed";
+        return false;
+    }
+    const std::string server_line = generated.response_wire.substr(
+        server_start, generated.response_wire.find("\r\n", server_start) + 2u - server_start);
+    const std::string date_line =
+        generated.response_wire.substr(date_start, date_end + 2u - date_start);
+    generated.response_wire = generated.response_wire.substr(0u, server_start) + date_line +
+                              server_line + generated.response_wire.substr(date_end + 2u);
+    if (!rejects(generated, "ordered-header")) return false;
+    generated = canonical;
+    generated.response_wire.replace(
+        generated.response_wire.find("Bad Gateway"), std::strlen("Bad Gateway"), "Bad GateWay");
+    if (!rejects(generated, "body")) return false;
+    generated = canonical;
+    generated.response_wire.push_back('x');
+    if (!rejects(generated, "trailing-wire")) return false;
+    error.clear();
+    return true;
+}
+
 static bool exact_http_exchange(u32 ipv4,
                                 u16 port,
                                 std::chrono::steady_clock::time_point deadline,
-                                ExactRutReport& report) {
-    static constexpr char request[] =
+                                ExactRutReport& report,
+                                bool generated_proxy) {
+    static constexpr char generated_request[] =
+        "GET / HTTP/1.1\r\nHost: client.example\r\nConnection: close\r\n\r\n";
+    static constexpr char exact_request[] =
         "GET / HTTP/1.1\r\nHost: exact-listener.invalid\r\nConnection: close\r\n\r\n";
     static constexpr char expected[] =
         "HTTP/1.1 204 No Content\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
@@ -2684,14 +5938,16 @@ static bool exact_http_exchange(u32 ipv4,
         close(client);
         return false;
     }
+    const char* request = generated_proxy ? generated_request : exact_request;
+    const std::size_t request_size =
+        generated_proxy ? sizeof(generated_request) - 1u : sizeof(exact_request) - 1u;
     std::size_t sent = 0u;
-    while (sent < sizeof(request) - 1u) {
+    while (sent < request_size) {
         if (!wait_fd(client, POLLOUT, deadline)) {
             close(client);
             return false;
         }
-        const ssize_t count =
-            send(client, request + sent, sizeof(request) - 1u - sent, MSG_NOSIGNAL);
+        const ssize_t count = send(client, request + sent, request_size - sent, MSG_NOSIGNAL);
         if (count < 0 && (errno == EINTR || errno == EAGAIN)) continue;
         if (count <= 0) {
             close(client);
@@ -2699,20 +5955,29 @@ static bool exact_http_exchange(u32 ipv4,
         }
         sent += static_cast<std::size_t>(count);
     }
+    report.request_bytes = request_size;
+    report.completed_send = 1u;
+    if (generated_proxy) report.request_wire.assign(request, request_size);
     std::string response;
-    response.reserve(sizeof(expected));
+    response.reserve(512u);
     bool eof = false;
-    while (response.size() <= sizeof(expected) - 1u) {
+    bool overflow = false;
+    while (response.size() <= 4096u) {
         if (!wait_fd(client, POLLIN | POLLHUP, deadline)) break;
         std::array<char, 128> bytes{};
-        const ssize_t count = recv(client, bytes.data(), bytes.size(), 0);
+        const std::size_t remaining = kExactMaxResponseBytes - response.size();
+        const std::size_t read_size = std::min(bytes.size(), remaining + 1u);
+        const ssize_t count = recv(client, bytes.data(), read_size, 0);
         if (count < 0 && (errno == EINTR || errno == EAGAIN)) continue;
         if (count < 0) break;
         if (count == 0) {
             eof = true;
             break;
         }
-        response.append(bytes.data(), static_cast<std::size_t>(count));
+        const std::size_t received = static_cast<std::size_t>(count);
+        if (received > remaining) overflow = true;
+        response.append(bytes.data(), std::min(received, remaining));
+        if (overflow) break;
     }
     linger reset_after_eof{1, 0};
     const bool reset_configured =
@@ -2720,9 +5985,35 @@ static bool exact_http_exchange(u32 ipv4,
         setsockopt(client, SOL_SOCKET, SO_LINGER, &reset_after_eof, sizeof(reset_after_eof)) == 0;
     close(client);
     report.response_bytes = response.size();
-    report.response_exact = response == std::string(expected, sizeof(expected) - 1u) ? 1u : 0u;
+    if (generated_proxy) report.response_wire = response;
+    if (!generated_proxy) {
+        report.response_exact = response == std::string(expected, sizeof(expected) - 1u) ? 1u : 0u;
+    } else {
+        static constexpr char body[] =
+            "<html>\r\n<head><title>502 Bad Gateway</title></head>\r\n<body>\r\n"
+            "<center><h1>502 Bad Gateway</h1></center>\r\n<hr><center>nginx/1.29.7</center>\r\n"
+            "</body>\r\n</html>\r\n";
+        static_assert(sizeof(body) - 1u == 157u);
+        const std::string prefix = "HTTP/1.1 502 Bad Gateway\r\nServer: nginx/1.29.7\r\nDate: ";
+        const std::string suffix =
+            "\r\nContent-Type: text/html\r\nContent-Length: 157\r\nConnection: close\r\n\r\n";
+        const std::size_t date_start = prefix.size();
+        const std::size_t date_end = response.find("\r\n", date_start);
+        const bool date_ok = date_end != std::string::npos &&
+                             valid_http_date(response.substr(date_start, date_end - date_start));
+        const std::string date = date_end == std::string::npos
+                                     ? std::string()
+                                     : response.substr(date_start, date_end - date_start);
+        const std::string expected_response = prefix + date + suffix + body;
+        const bool headers_ok =
+            date_ok && date_end != std::string::npos && response == expected_response;
+        report.response_body_bytes = headers_ok ? sizeof(body) - 1u : 0u;
+        report.response_status = 502u;
+        report.response_headers_exact = headers_ok ? 1u : 0u;
+        report.response_exact = headers_ok ? 1u : 0u;
+    }
     report.prompt_eof = eof ? 1u : 0u;
-    return report.response_exact == 1u && report.prompt_eof == 1u && reset_configured;
+    return !overflow && report.response_exact == 1u && report.prompt_eof == 1u && reset_configured;
 }
 
 static bool connect_refused_until(u32 ipv4,
@@ -3365,10 +6656,10 @@ static bool cleanup_exact_child(ExactChildState& child,
                                  child.log_status.st_ino == 0u;
     const bool source_removed =
         reaped && (no_temp_custody ||
-                   remove_exact_temp(directory_fd, child.source_name.c_str(), child.source_status));
+                   remove_exact_temp(directory_fd, "exact-listener.rut", child.source_status));
     const bool log_removed =
         reaped && (no_temp_custody ||
-                   remove_exact_temp(directory_fd, child.log_name.c_str(), child.log_status));
+                   remove_exact_temp(directory_fd, "exact-listener.log", child.log_status));
     if (directory_fd >= 0) close(directory_fd);
     u64 fd_count = 0u;
     int guard_error = 0;
@@ -3412,6 +6703,7 @@ static bool cleanup_exact_child(ExactChildState& child,
 
 static bool start_exact_child(const Frame& command,
                               const char* control_path,
+                              const char* scenario,
                               int guard_fd,
                               const GuardReport& held,
                               ExactChildState& child,
@@ -3465,25 +6757,33 @@ static bool start_exact_child(const Frame& command,
     }
     child.directory_path = directory_path;
     child.directory_status = directory_status;
-    child.source_name = "exact-listener.rut";
-    child.log_name = "exact-listener.log";
-    child.source_path = directory_path + "/" + child.source_name;
-    child.log_path = directory_path + "/" + child.log_name;
+    child.source_path = directory_path + "/exact-listener.rut";
+    child.log_path = directory_path + "/exact-listener.log";
     failure.phase = ExactFailurePhase::Temp;
     std::string source;
     privileged_listener::Diagnostic source_diagnostic;
-    if (!privileged_listener::build_listener_source(
-            held.plan, privileged_listener::ListenerSourceKind::Exact, source, source_diagnostic)) {
+    if (generated_proxy_scenario(scenario)) {
+        std::string generated_diagnostic;
+        if (!build_generated_proxy_source(held.plan, source, generated_diagnostic)) {
+            close(directory_fd);
+            close(executable_fd);
+            return false;
+        }
+    } else if (!privileged_listener::build_listener_source(
+                   held.plan,
+                   privileged_listener::ListenerSourceKind::Exact,
+                   source,
+                   source_diagnostic)) {
         close(directory_fd);
         close(executable_fd);
         return false;
     }
     const int source_fd = openat(directory_fd,
-                                 child.source_name.c_str(),
+                                 "exact-listener.rut",
                                  O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC | O_NOFOLLOW,
                                  0600);
     const int log_fd = openat(directory_fd,
-                              child.log_name.c_str(),
+                              "exact-listener.log",
                               O_RDWR | O_CREAT | O_EXCL | O_CLOEXEC | O_NOFOLLOW,
                               0600);
     const bool source_identity = source_fd >= 0 && fstat(source_fd, &child.source_status) == 0;
@@ -3495,8 +6795,8 @@ static bool start_exact_child(const Frame& command,
         if (source_fd >= 0) close(source_fd);
         if (log_fd >= 0) close(log_fd);
         (void)unlink_regular_at_if_identity(
-            directory_fd, child.source_name.c_str(), child.source_status);
-        (void)unlink_regular_at_if_identity(directory_fd, child.log_name.c_str(), child.log_status);
+            directory_fd, "exact-listener.rut", child.source_status);
+        (void)unlink_regular_at_if_identity(directory_fd, "exact-listener.log", child.log_status);
         close(directory_fd);
         close(executable_fd);
         return false;
@@ -3545,8 +6845,8 @@ static bool start_exact_child(const Frame& command,
     close(log_fd);
     if (pid <= 1) {
         (void)unlink_regular_at_if_identity(
-            directory_fd, child.source_name.c_str(), child.source_status);
-        (void)unlink_regular_at_if_identity(directory_fd, child.log_name.c_str(), child.log_status);
+            directory_fd, "exact-listener.rut", child.source_status);
+        (void)unlink_regular_at_if_identity(directory_fd, "exact-listener.log", child.log_status);
         close(directory_fd);
         close(executable_fd);
         return false;
@@ -3621,13 +6921,42 @@ static bool start_exact_child(const Frame& command,
         if (!cleanup_after_failure()) failure.phase = ExactFailurePhase::Cleanup;
         return false;
     }
+    bool upstream_absence_probe_refused = false;
+    if (generated_proxy_scenario(scenario)) {
+        int guard_before_error = 0;
+        if (!connect_refused_until(held.plan.guard_ipv4,
+                                   static_cast<u16>(held.plan.port),
+                                   deadline,
+                                   guard_before_error)) {
+            failure.phase = ExactFailurePhase::GuardRefusal;
+            failure.error_number =
+                guard_before_error > 0 ? static_cast<u64>(guard_before_error) : 0u;
+            if (!cleanup_after_failure()) failure.phase = ExactFailurePhase::Cleanup;
+            return false;
+        }
+        report.guard_before_connect_error = ECONNREFUSED;
+        int upstream_error = 0;
+        upstream_absence_probe_refused =
+            connect_refused_until(0x7f000001u, 9000u, deadline, upstream_error);
+        if (!upstream_absence_probe_refused) {
+            failure.phase = ExactFailurePhase::HttpEof;
+            failure.error_number = upstream_error > 0 ? static_cast<u64>(upstream_error) : 0u;
+            if (!cleanup_after_failure()) failure.phase = ExactFailurePhase::Cleanup;
+            return false;
+        }
+    }
     failure.phase = ExactFailurePhase::HttpEof;
-    if (!exact_http_exchange(
-            held.plan.positive_ipv4, static_cast<u16>(held.plan.port), deadline, report)) {
+    if (!exact_http_exchange(held.plan.positive_ipv4,
+                             static_cast<u16>(held.plan.port),
+                             deadline,
+                             report,
+                             generated_proxy_scenario(scenario))) {
         failure.count = report.response_bytes;
         if (!cleanup_after_failure()) failure.phase = ExactFailurePhase::Cleanup;
         return false;
     }
+    if (generated_proxy_scenario(scenario))
+        report.upstream_absence_probe_refused = upstream_absence_probe_refused ? 1u : 0u;
     failure.phase = ExactFailurePhase::GuardRefusal;
     int guard_error = 0;
     if (!connect_refused_until(
@@ -3687,467 +7016,6 @@ static bool start_exact_child(const Frame& command,
     report.stable = 1u;
     report.backend = backend;
     return true;
-}
-
-static bool remove_listener_attempt_temps(ExactChildState& child) {
-    const int directory_fd = reopen_exact_directory(child);
-    if (directory_fd < 0) return false;
-    const bool source_removed =
-        remove_exact_temp(directory_fd, child.source_name.c_str(), child.source_status);
-    const bool log_removed =
-        remove_exact_temp(directory_fd, child.log_name.c_str(), child.log_status);
-    close(directory_fd);
-    return source_removed && log_removed;
-}
-
-static bool close_attempt_pidfd(ExactChildState& child) {
-    if (!child.pidfd_acquired || child.pidfd < 0) return false;
-    const int old = child.pidfd;
-    close(child.pidfd);
-    child.pidfd = -1;
-    errno = 0;
-    return fcntl(old, F_GETFD) < 0 && errno == EBADF;
-}
-
-static bool observe_selected_port_absent(const privileged_listener::ListenerPlan& plan,
-                                         std::chrono::steady_clock::time_point deadline) {
-    while (std::chrono::steady_clock::now() < deadline) {
-        privileged_listener::ProcTcpTable table;
-        privileged_listener::ListenerEvidence evidence;
-        privileged_listener::Diagnostic diagnostic;
-        if (read_process_tcp_table(getpid(), table) &&
-            privileged_listener::classify_listener_evidence(
-                table,
-                plan,
-                {},
-                privileged_listener::ListenerEvidenceKind::PortAbsent,
-                evidence,
-                diagnostic))
-            return true;
-        (void)poll(nullptr, 0, 10);
-    }
-    return false;
-}
-
-static bool prepare_wildcard_attempt(const ExactChildState& exact_owner,
-                                     const GuardReport& held,
-                                     const char* stem,
-                                     ExactChildState& child,
-                                     std::string& source_bytes) {
-    child = {};
-    source_bytes.clear();
-    if (stem == nullptr ||
-        (strcmp(stem, "wildcard-collision") != 0 && strcmp(stem, "wildcard-success") != 0))
-        return false;
-#ifdef O_PATH
-    const int executable_fd = open(exact_owner.executable.c_str(), O_PATH | O_CLOEXEC | O_NOFOLLOW);
-#else
-    const int executable_fd = -1;
-#endif
-    struct stat executable_status{}, path_status{};
-    if (executable_fd < 0 || fstat(executable_fd, &executable_status) != 0 ||
-        lstat(exact_owner.executable.c_str(), &path_status) != 0 ||
-        executable_status.st_dev != exact_owner.executable_status.st_dev ||
-        executable_status.st_ino != exact_owner.executable_status.st_ino ||
-        executable_status.st_mode != exact_owner.executable_status.st_mode ||
-        executable_status.st_uid != exact_owner.executable_status.st_uid ||
-        executable_status.st_gid != exact_owner.executable_status.st_gid ||
-        path_status.st_dev != executable_status.st_dev ||
-        path_status.st_ino != executable_status.st_ino) {
-        if (executable_fd >= 0) close(executable_fd);
-        return false;
-    }
-    const int directory_fd = reopen_exact_directory(exact_owner);
-    if (directory_fd < 0) {
-        close(executable_fd);
-        return false;
-    }
-    child.directory_path = exact_owner.directory_path;
-    child.directory_status = exact_owner.directory_status;
-    child.source_name = std::string(stem) + ".rut";
-    child.log_name = std::string(stem) + ".log";
-    child.source_path = child.directory_path + "/" + child.source_name;
-    child.log_path = child.directory_path + "/" + child.log_name;
-    privileged_listener::Diagnostic diagnostic;
-    if (!privileged_listener::build_listener_source(
-            held.plan,
-            privileged_listener::ListenerSourceKind::Wildcard,
-            source_bytes,
-            diagnostic)) {
-        close(directory_fd);
-        close(executable_fd);
-        return false;
-    }
-    const int source_fd = openat(directory_fd,
-                                 child.source_name.c_str(),
-                                 O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC | O_NOFOLLOW,
-                                 0600);
-    const int log_fd = openat(directory_fd,
-                              child.log_name.c_str(),
-                              O_RDWR | O_CREAT | O_EXCL | O_CLOEXEC | O_NOFOLLOW,
-                              0600);
-    const bool source_identity = source_fd >= 0 && fstat(source_fd, &child.source_status) == 0;
-    const bool log_identity = log_fd >= 0 && fstat(log_fd, &child.log_status) == 0;
-    if (!source_identity || !log_identity || !write_all_fd(source_fd, source_bytes) ||
-        fsync(source_fd) != 0 || !S_ISREG(child.source_status.st_mode) ||
-        !S_ISREG(child.log_status.st_mode) || (child.source_status.st_mode & 0777) != 0600 ||
-        (child.log_status.st_mode & 0777) != 0600) {
-        if (source_fd >= 0) close(source_fd);
-        if (log_fd >= 0) close(log_fd);
-        (void)unlink_regular_at_if_identity(
-            directory_fd, child.source_name.c_str(), child.source_status);
-        (void)unlink_regular_at_if_identity(directory_fd, child.log_name.c_str(), child.log_status);
-        close(directory_fd);
-        close(executable_fd);
-        return false;
-    }
-    close(source_fd);
-    int release_pipe[2] = {-1, -1};
-    if (pipe2(release_pipe, O_CLOEXEC) != 0) {
-        close(log_fd);
-        (void)remove_listener_attempt_temps(child);
-        close(directory_fd);
-        close(executable_fd);
-        return false;
-    }
-    const pid_t parent = getpid();
-    const pid_t pid = fork();
-    if (pid == 0) {
-        close(release_pipe[1]);
-        if (setpgid(0, 0) != 0 || prctl(PR_SET_PDEATHSIG, SIGKILL) != 0 || getppid() != parent ||
-            dup2(log_fd, STDOUT_FILENO) < 0 || dup2(log_fd, STDERR_FILENO) < 0)
-            _exit(125);
-        char release = 0;
-        ssize_t count;
-        do {
-            count = read(release_pipe[0], &release, 1);
-        } while (count < 0 && errno == EINTR);
-        if (count != 1 || release != 'R') _exit(125);
-        close(release_pipe[0]);
-        const int null_fd = open("/dev/null", O_RDONLY | O_CLOEXEC);
-        if (null_fd < 0 || dup2(null_fd, STDIN_FILENO) < 0) _exit(125);
-#ifdef SYS_close_range
-        if ((executable_fd > 3 &&
-             syscall(SYS_close_range, 3u, static_cast<unsigned>(executable_fd - 1), 0u) != 0) ||
-            syscall(SYS_close_range,
-                    static_cast<unsigned>(executable_fd + 1),
-                    std::numeric_limits<unsigned>::max(),
-                    0u) != 0)
-            _exit(125);
-#else
-        const long limit = sysconf(_SC_OPEN_MAX);
-        if (limit <= 0 || limit > std::numeric_limits<int>::max()) _exit(125);
-        for (int fd = 3; fd < limit; ++fd)
-            if (fd != executable_fd) close(fd);
-#endif
-        std::array<char*, 10> argv{
-            const_cast<char*>(exact_owner.executable.c_str()),
-            const_cast<char*>(child.source_path.c_str()),
-            const_cast<char*>("--shards"),
-            const_cast<char*>("1"),
-            const_cast<char*>("--no-pin"),
-            const_cast<char*>("--drain"),
-            const_cast<char*>("0"),
-            const_cast<char*>("--opt"),
-            const_cast<char*>("2"),
-            nullptr,
-        };
-#ifdef SYS_execveat
-        syscall(SYS_execveat, executable_fd, "", argv.data(), environ, AT_EMPTY_PATH);
-#endif
-        _exit(126);
-    }
-    close(release_pipe[0]);
-    close(log_fd);
-    close(directory_fd);
-    if (pid <= 1) {
-        close(release_pipe[1]);
-        close(executable_fd);
-        (void)remove_listener_attempt_temps(child);
-        return false;
-    }
-    child.forked = true;
-    child.pid = pid;
-    child.executable = exact_owner.executable;
-    child.executable_status = executable_status;
-    child.argv = exact_argv({child.executable,
-                             child.source_path,
-                             "--shards",
-                             "1",
-                             "--no-pin",
-                             "--drain",
-                             "0",
-                             "--opt",
-                             "2"});
-    (void)setpgid(pid, pid);
-#ifdef SYS_pidfd_open
-    child.pidfd = static_cast<int>(syscall(SYS_pidfd_open, pid, 0));
-#endif
-    child.pidfd_acquired = child.pidfd >= 0;
-    ProcIdentity pre_exec;
-    const bool identity_ok = child.pidfd >= 0 && (fcntl(child.pidfd, F_GETFD) & FD_CLOEXEC) != 0 &&
-                             exact_pidfd_binding(child.pidfd, pid) &&
-                             read_proc(pid, pre_exec, false) && pre_exec.pid == pid &&
-                             pre_exec.ppid == getpid() && pre_exec.pgid == pid &&
-                             pre_exec.uid == getuid() && pre_exec.gid == getgid() &&
-                             pre_exec.netns == held.netns && pre_exec.start != 0u;
-    child.identity = pre_exec;
-    const bool released = identity_ok && write(release_pipe[1], "R", 1) == 1;
-    close(release_pipe[1]);
-    close(executable_fd);
-    if (released) return true;
-    (void)reap_exact_owned_child(child, new_exact_cleanup_deadline());
-    if (child.reaped && child.pidfd >= 0) (void)close_attempt_pidfd(child);
-    if (child.reaped) (void)remove_listener_attempt_temps(child);
-    return false;
-}
-
-static bool run_wildcard_handoff(int guard_fd,
-                                 const GuardReport& held,
-                                 ExactChildState& exact_child,
-                                 WildcardHandoffReport& report) {
-    report = {};
-    report.positive_ipv4 = held.plan.positive_ipv4;
-    report.guard_ipv4 = held.plan.guard_ipv4;
-    report.port = held.plan.port;
-    ExactChildState collision;
-    std::string collision_source;
-    if (!prepare_wildcard_attempt(
-            exact_child, held, "wildcard-collision", collision, collision_source))
-        return false;
-    report.collision_pid = static_cast<u64>(collision.pid);
-    report.collision_start = collision.identity.start;
-    const auto collision_deadline =
-        std::chrono::steady_clock::now() + std::chrono::milliseconds(kListenerDeadlineMs);
-    while (!collision.reaped && std::chrono::steady_clock::now() < collision_deadline) {
-        (void)exact_direct_wait(collision);
-        if (!collision.reaped) (void)poll(nullptr, 0, 10);
-    }
-    if (!collision.reaped) {
-        if (!reap_exact_owned_child(collision, new_exact_cleanup_deadline()))
-            for (;;) (void)poll(nullptr, 0, kCleanupMs);
-        (void)close_attempt_pidfd(collision);
-        (void)remove_listener_attempt_temps(collision);
-        return false;
-    }
-    report.collision_exit_one =
-        WIFEXITED(collision.wait_status) && WEXITSTATUS(collision.wait_status) == 1 ? 1u : 0u;
-    report.collision_pidfd_invalidated = close_attempt_pidfd(collision) ? 1u : 0u;
-    std::string collision_log;
-    privileged_listener::CollisionLogEvidence collision_evidence;
-    privileged_listener::Diagnostic diagnostic;
-    report.collision_log_eaddrinuse =
-        read_file(collision.log_path, collision_log, privileged_listener::kMaxCollisionLogBytes) &&
-                privileged_listener::classify_collision_log(
-                    collision_log, collision.source_path, 2u, collision_evidence, diagnostic)
-            ? 1u
-            : 0u;
-    ProcIdentity exact_live;
-    privileged_listener::ProcTcpTable table;
-    std::vector<u64> exact_inodes;
-    privileged_listener::ListenerEvidence exact_evidence;
-    const bool exact_identity =
-        exact_child_identity(exact_child, exact_child.executable_status, held.netns, exact_live);
-    const bool exact_only = exact_identity &&
-                            same_process_identity(exact_live, exact_child.identity) &&
-                            read_process_tcp_table(getpid(), table) &&
-                            process_socket_inodes(exact_child.pid, exact_inodes) &&
-                            privileged_listener::classify_listener_evidence(
-                                table,
-                                held.plan,
-                                exact_inodes,
-                                privileged_listener::ListenerEvidenceKind::ExactPositive,
-                                exact_evidence,
-                                diagnostic) &&
-                            exact_evidence.child_owned_inode == exact_child.listener_inode;
-    report.collision_no_wildcard = exact_only ? 1u : 0u;
-    report.collision_exact_live = exact_identity ? 1u : 0u;
-    report.collision_guard_live =
-        target_socket_inode(getpid(), guard_fd, held.socket_inode) ? 1u : 0u;
-    const bool collision_temps = remove_listener_attempt_temps(collision);
-    errno = 0;
-    report.collision_source_absent =
-        collision_temps && access(collision.source_path.c_str(), F_OK) < 0 && errno == ENOENT ? 1u
-                                                                                              : 0u;
-    errno = 0;
-    report.collision_log_absent =
-        collision_temps && access(collision.log_path.c_str(), F_OK) < 0 && errno == ENOENT ? 1u
-                                                                                           : 0u;
-    if (report.collision_exit_one != 1u || report.collision_pidfd_invalidated != 1u ||
-        report.collision_log_eaddrinuse != 1u || report.collision_no_wildcard != 1u ||
-        report.collision_exact_live != 1u || report.collision_guard_live != 1u ||
-        report.collision_source_absent != 1u || report.collision_log_absent != 1u ||
-        report.collision_response_bytes != 0u)
-        return false;
-
-    ExactRutCleanedReport exact_cleaned;
-    ExactFailureReport exact_failure;
-    if (!cleanup_exact_child(exact_child,
-                             held,
-                             guard_fd,
-                             &exact_cleaned,
-                             true,
-                             new_exact_cleanup_deadline(),
-                             &exact_failure))
-        return false;
-    report.exact_reaped = exact_cleaned.clean_exit && exact_cleaned.child_absent;
-    report.exact_listener_absent = exact_cleaned.listener_absent;
-    report.exact_temps_absent = exact_cleaned.temps_absent;
-    if (report.exact_reaped != 1u || report.exact_listener_absent != 1u ||
-        report.exact_temps_absent != 1u || !exact_child.guard_release_safe ||
-        !target_socket_inode(getpid(), guard_fd, held.socket_inode))
-        return false;
-
-    const int old_guard = guard_fd;
-    close(guard_fd);
-    errno = 0;
-    report.guard_invalidated = fcntl(old_guard, F_GETFD) < 0 && errno == EBADF ? 1u : 0u;
-    report.port_absent_before_retry =
-        observe_selected_port_absent(held.plan, new_exact_cleanup_deadline()) ? 1u : 0u;
-    if (report.guard_invalidated != 1u || report.port_absent_before_retry != 1u) return false;
-
-    ExactChildState wildcard;
-    std::string success_source;
-    if (!prepare_wildcard_attempt(exact_child, held, "wildcard-success", wildcard, success_source))
-        return false;
-    report.same_source = success_source == collision_source ? 1u : 0u;
-    report.wildcard_pid = static_cast<u64>(wildcard.pid);
-    report.wildcard_start = wildcard.identity.start;
-    const auto ready_deadline =
-        std::chrono::steady_clock::now() + std::chrono::milliseconds(kListenerDeadlineMs);
-    u64 backend = 0u;
-    bool ready = false;
-    while (std::chrono::steady_clock::now() < ready_deadline) {
-        ProcIdentity identity;
-        privileged_listener::ProcTcpTable ready_table;
-        std::vector<u64> inodes;
-        privileged_listener::ListenerEvidence evidence;
-        std::string log;
-        if (exact_child_identity(wildcard, wildcard.executable_status, held.netns, identity)) {
-            wildcard.identity = identity;
-            wildcard.post_exec_identity = true;
-            if (read_process_tcp_table(getpid(), ready_table) &&
-                process_socket_inodes(wildcard.pid, inodes) &&
-                privileged_listener::classify_listener_evidence(
-                    ready_table,
-                    held.plan,
-                    inodes,
-                    privileged_listener::ListenerEvidenceKind::Wildcard,
-                    evidence,
-                    diagnostic) &&
-                read_file(wildcard.log_path, log, privileged_listener::kMaxCollisionLogBytes) &&
-                exact_log_ready(
-                    log, wildcard.source_path, static_cast<u16>(held.plan.port), backend)) {
-                wildcard.listener_inode = evidence.child_owned_inode;
-                ready = true;
-                break;
-            }
-        }
-        if (exact_direct_wait(wildcard)) break;
-        (void)poll(nullptr, 0, 10);
-    }
-    if (!ready || wildcard.listener_inode == 0u || report.same_source != 1u) {
-        if (!reap_exact_owned_child(wildcard, new_exact_cleanup_deadline()))
-            for (;;) (void)poll(nullptr, 0, kCleanupMs);
-        if (wildcard.pidfd >= 0) (void)close_attempt_pidfd(wildcard);
-        if (wildcard.reaped) (void)remove_listener_attempt_temps(wildcard);
-        return false;
-    }
-    const auto cleanup_failed_wildcard = [&]() {
-        if (!reap_exact_owned_child(wildcard, new_exact_cleanup_deadline()))
-            for (;;) (void)poll(nullptr, 0, kCleanupMs);
-        if (wildcard.pidfd >= 0 && !close_attempt_pidfd(wildcard))
-            for (;;) (void)poll(nullptr, 0, kCleanupMs);
-        if (!remove_listener_attempt_temps(wildcard) ||
-            !observe_selected_port_absent(held.plan, new_exact_cleanup_deadline()))
-            for (;;) (void)poll(nullptr, 0, kCleanupMs);
-    };
-    report.wildcard_start = wildcard.identity.start;
-    report.wildcard_listener_inode = wildcard.listener_inode;
-    report.wildcard_kind = 1u;
-    ExactRutReport positive_response;
-    ExactRutReport guard_response;
-    if (!exact_http_exchange(held.plan.positive_ipv4,
-                             static_cast<u16>(held.plan.port),
-                             ready_deadline,
-                             positive_response) ||
-        !exact_http_exchange(held.plan.guard_ipv4,
-                             static_cast<u16>(held.plan.port),
-                             ready_deadline,
-                             guard_response)) {
-        cleanup_failed_wildcard();
-        return false;
-    }
-    report.positive_response_bytes = positive_response.response_bytes;
-    report.positive_response_exact = positive_response.response_exact;
-    report.positive_prompt_eof = positive_response.prompt_eof;
-    report.guard_response_bytes = guard_response.response_bytes;
-    report.guard_response_exact = guard_response.response_exact;
-    report.guard_prompt_eof = guard_response.prompt_eof;
-    if (std::chrono::steady_clock::now() + std::chrono::milliseconds(500) > ready_deadline) {
-        cleanup_failed_wildcard();
-        return false;
-    }
-    (void)poll(nullptr, 0, 500);
-    ProcIdentity stable;
-    privileged_listener::ProcTcpTable stable_table;
-    std::vector<u64> stable_inodes;
-    privileged_listener::ListenerEvidence stable_evidence;
-    u64 live_fd_count = 0u;
-    report.wildcard_stable =
-        exact_child_identity(wildcard, wildcard.executable_status, held.netns, stable) &&
-                same_process_identity(stable, wildcard.identity) &&
-                read_process_tcp_table(getpid(), stable_table) &&
-                process_socket_inodes(wildcard.pid, stable_inodes) &&
-                privileged_listener::classify_listener_evidence(
-                    stable_table,
-                    held.plan,
-                    stable_inodes,
-                    privileged_listener::ListenerEvidenceKind::Wildcard,
-                    stable_evidence,
-                    diagnostic) &&
-                stable_evidence.child_owned_inode == wildcard.listener_inode &&
-                count_open_fds(live_fd_count) && live_fd_count == held.current_fd_count
-            ? 1u
-            : 0u;
-    if (report.wildcard_stable != 1u) {
-        cleanup_failed_wildcard();
-        return false;
-    }
-    const bool reaped = reap_exact_owned_child(wildcard, new_exact_cleanup_deadline());
-    if (!reaped)
-        for (;;) (void)poll(nullptr, 0, kCleanupMs);
-    report.wildcard_clean_exit =
-        reaped && WIFEXITED(wildcard.wait_status) && WEXITSTATUS(wildcard.wait_status) == 0 ? 1u
-                                                                                            : 0u;
-    report.wildcard_pidfd_invalidated = reaped && close_attempt_pidfd(wildcard) ? 1u : 0u;
-    report.wildcard_child_absent =
-        reaped && observe_exact_liveness(wildcard.identity) == ExactLiveness::ExitedOrReused ? 1u
-                                                                                             : 0u;
-    const bool wildcard_temps = reaped && remove_listener_attempt_temps(wildcard);
-    errno = 0;
-    report.wildcard_source_absent =
-        wildcard_temps && access(wildcard.source_path.c_str(), F_OK) < 0 && errno == ENOENT ? 1u
-                                                                                            : 0u;
-    errno = 0;
-    report.wildcard_log_absent =
-        wildcard_temps && access(wildcard.log_path.c_str(), F_OK) < 0 && errno == ENOENT ? 1u : 0u;
-    report.wildcard_listener_absent =
-        reaped && observe_selected_port_absent(held.plan, new_exact_cleanup_deadline()) ? 1u : 0u;
-    (void)count_open_fds(report.target_fd_count);
-    if (report.wildcard_pidfd_invalidated != 1u || report.wildcard_child_absent != 1u ||
-        report.wildcard_listener_absent != 1u || report.wildcard_source_absent != 1u ||
-        report.wildcard_log_absent != 1u || report.target_fd_count != held.baseline_fd_count)
-        for (;;) (void)poll(nullptr, 0, kCleanupMs);
-    return report.version == kWildcardHandoffVersion && report.same_source == 1u &&
-           report.wildcard_kind == 1u && report.positive_response_bytes == 65u &&
-           report.positive_response_exact == 1u && report.positive_prompt_eof == 1u &&
-           report.guard_response_bytes == 65u && report.guard_response_exact == 1u &&
-           report.guard_prompt_eof == 1u && report.wildcard_stable == 1u &&
-           report.wildcard_clean_exit == 1u && report.wildcard_pidfd_invalidated == 1u &&
-           report.wildcard_child_absent == 1u && report.wildcard_listener_absent == 1u &&
-           report.wildcard_source_absent == 1u && report.wildcard_log_absent == 1u &&
-           report.target_fd_count == held.baseline_fd_count;
 }
 
 static int finish_exact_failure(int control,
@@ -4218,7 +7086,7 @@ static int secured_target_main(const char* control_path,
     u64 broker = 0;
     if (!token_from_hex(token_string, token) || !parse_u64(broker_text, broker) || broker <= 1)
         return 40;
-    if (listener_scenario_name(scenario) &&
+    if (target_wait_requires_custody(scenario) &&
         !validate_exact_custody_endpoint(kExactCustodyFd, static_cast<pid_t>(broker)))
         return 39;
     const int control = connect_control(control_path);
@@ -4242,6 +7110,8 @@ static int secured_target_main(const char* control_path,
             close(control);
             return 0;
         }
+        if (canonical_collision_scenario(scenario) && command.type == kGuardReserve)
+            return canonical_target_flow(control, token, command.payload, control_path);
         if (command.type == kGuardReserve && listener_scenario_name(scenario)) {
             u32 positive_ipv4 = 0u, guard_ipv4 = 0u;
             ProcIdentity secured_identity;
@@ -4261,7 +7131,9 @@ static int secured_target_main(const char* control_path,
             }
             sockaddr_in endpoint{};
             endpoint.sin_family = AF_INET;
-            endpoint.sin_port = 0;
+            endpoint.sin_port = htons(generated_proxy_differential_scenario(scenario)
+                                          ? ipv4_topology::kExactInputTopologyBuilderPort
+                                          : 0u);
             endpoint.sin_addr.s_addr = htonl(guard_ipv4);
             socklen_t endpoint_size = sizeof(endpoint);
             if (bind(guard_fd, reinterpret_cast<sockaddr*>(&endpoint), sizeof(endpoint)) != 0 ||
@@ -4276,6 +7148,8 @@ static int secured_target_main(const char* control_path,
                 positive_ipv4, guard_ipv4, ntohs(endpoint.sin_port)};
             GuardReport held;
             if (plan.port == 0u || ntohl(endpoint.sin_addr.s_addr) != guard_ipv4 ||
+                (generated_proxy_differential_scenario(scenario) &&
+                 plan.port != ipv4_topology::kExactInputTopologyBuilderPort) ||
                 !fill_guard_socket_report(guard_fd, plan, baseline_fd_count, held) ||
                 !validate_guard_report(held, plan, secured_identity, false) ||
                 !send_frame(
@@ -4293,6 +7167,7 @@ static int secured_target_main(const char* control_path,
                                      token_equal(exact_run.token, token);
             const bool started = run_request && start_exact_child(exact_run,
                                                                   control_path,
+                                                                  scenario,
                                                                   guard_fd,
                                                                   held,
                                                                   exact_child,
@@ -4332,49 +7207,7 @@ static int secured_target_main(const char* control_path,
             ExactRutCleanedReport exact_cleaned;
             const bool cleanup_command =
                 receive_frame(control, exact_cleanup, kListenerDeadlineMs) &&
-                (exact_cleanup_request(exact_cleanup, token) ||
-                 (listener_wildcard_handoff(scenario) &&
-                  exact_request(exact_cleanup, kWildcardHandoffRun, token)));
-            if (cleanup_command && listener_wildcard_handoff(scenario)) {
-                WildcardHandoffReport wildcard_report;
-                if (!run_wildcard_handoff(guard_fd, held, exact_child, wildcard_report) ||
-                    !send_frame(control,
-                                Frame{kWildcardHandoffWitness,
-                                      token,
-                                      encode_wildcard_handoff(wildcard_report)},
-                                kHandshakeMs)) {
-                    exact_failure.phase = ExactFailurePhase::Cleanup;
-                    exact_failure.error_number = EPROTO;
-                    if (!exact_child.cleanup_complete) {
-                        const bool cleanup_ok = cleanup_exact_child(exact_child,
-                                                                    held,
-                                                                    guard_fd,
-                                                                    nullptr,
-                                                                    false,
-                                                                    new_exact_cleanup_deadline(),
-                                                                    &exact_failure);
-                        if (!cleanup_ok)
-                            return finish_exact_failure(
-                                control, token, held, guard_fd, exact_child, exact_failure, 56);
-                    }
-                    (void)send_frame(
-                        control,
-                        Frame{kExactRutFailure, token, encode_exact_failure(exact_failure)},
-                        kHandshakeMs);
-                    close(control);
-                    return 56;
-                }
-                Frame finish;
-                if (!receive_frame(control, finish, kBrokerDeadlineMs) ||
-                    !exact_request(finish, kWildcardHandoffFinish, token) ||
-                    !send_frame(
-                        control, Frame{kWildcardHandoffFinished, token, {}}, kHandshakeMs)) {
-                    close(control);
-                    return 56;
-                }
-                close(control);
-                return 0;
-            }
+                exact_cleanup_request(exact_cleanup, token);
             if (cleanup_command && listener_failure_integration(scenario)) {
                 ExactCleanupObservation injected;
                 const bool unexpectedly_absent =
@@ -4998,9 +7831,10 @@ static OwnedWaitResult wait_listener_target_bounded(pid_t target,
                                                     ino_t expected_netns,
                                                     uid_t expected_uid,
                                                     gid_t expected_gid,
+                                                    int target_wait_ms,
                                                     int& target_status) {
     const auto deadline =
-        std::chrono::steady_clock::now() + std::chrono::milliseconds(kListenerDeadlineMs * 2);
+        std::chrono::steady_clock::now() + std::chrono::milliseconds(target_wait_ms);
     bool custody_received = false;
     bool custody_peer_closed = false;
     bool root_loss_observed = false;
@@ -5358,10 +8192,11 @@ static int dropped_broker_main(const char* executable,
     int launch_pipe[2] = {-1, -1};
     int trace_pipe[2] = {-1, -1};
     if (pipe2(launch_pipe, O_CLOEXEC) != 0 || pipe2(trace_pipe, O_CLOEXEC) != 0) return 27;
-    const bool listener_scenario = listener_scenario_name(scenario);
+    const TargetWaitStrategy wait_strategy = target_wait_strategy(scenario);
+    const bool listener_custody = wait_strategy == TargetWaitStrategy::ListenerCustody;
     int custody_pair[2] = {-1, -1};
     const int pass_credentials = 1;
-    if (listener_scenario &&
+    if (listener_custody &&
         (prctl(PR_SET_CHILD_SUBREAPER, 1) != 0 ||
          socketpair(AF_UNIX, SOCK_SEQPACKET | SOCK_CLOEXEC, 0, custody_pair) != 0 ||
          setsockopt(custody_pair[0],
@@ -5376,7 +8211,7 @@ static int dropped_broker_main(const char* executable,
         const pid_t broker_parent = getppid();
         close(launch_pipe[1]);
         close(trace_pipe[0]);
-        if (listener_scenario) {
+        if (listener_custody) {
             close(custody_pair[0]);
             if (custody_pair[1] == kExactCustodyFd) {
                 const int flags = fcntl(kExactCustodyFd, F_GETFD);
@@ -5419,7 +8254,7 @@ static int dropped_broker_main(const char* executable,
     }
     close(launch_pipe[0]);
     close(trace_pipe[1]);
-    if (listener_scenario) {
+    if (listener_custody) {
         close(custody_pair[1]);
         custody_pair[1] = -1;
     }
@@ -5431,8 +8266,8 @@ static int dropped_broker_main(const char* executable,
     // EOF/PDEATHSIG and can exit without an unsafe signal from its parent.
     target_cleanup.add_downstream_fd(&launch_pipe[1]);
     target_cleanup.add_downstream_fd(&trace_pipe[0]);
-    if (listener_scenario) target_cleanup.add_downstream_fd(&custody_pair[0]);
-    if (listener_scenario) {
+    if (listener_custody) target_cleanup.add_downstream_fd(&custody_pair[0]);
+    if (listener_custody) {
         ProcIdentity spawned_target;
         if (!read_proc(target, spawned_target, false) || spawned_target.pid != target ||
             spawned_target.ppid != getpid() || spawned_target.start == 0u)
@@ -5440,7 +8275,7 @@ static int dropped_broker_main(const char* executable,
         listener_target_start = spawned_target.start;
     }
     if (!secure_as(caller_uid, caller_gid) || !arm_parent_death(root_broker) ||
-        (listener_scenario && (prctl(PR_SET_PDEATHSIG, 0) != 0 || getppid() != root_broker)))
+        (listener_custody && (prctl(PR_SET_PDEATHSIG, 0) != 0 || getppid() != root_broker)))
         return 29;
     control = connect_control(control_path);
     if (control < 0) return 30;
@@ -5504,34 +8339,44 @@ static int dropped_broker_main(const char* executable,
                                                 scenario});
     const int target_wait_ms =
         strcmp(scenario, "owned-wait-term-ignore") == 0 ? kCleanupMs : kBrokerDeadlineMs;
-    const OwnedWaitResult target_wait_result =
-        listener_scenario ? wait_listener_target_bounded(target,
-                                                         listener_target_start,
-                                                         executable,
-                                                         target_argv,
-                                                         root_broker,
-                                                         root_identity.start,
-                                                         kCredentialFd,
-                                                         custody_pair[0],
-                                                         listener_failure_integration(scenario),
-                                                         control,
-                                                         token,
-                                                         static_cast<ino_t>(expected_netns),
-                                                         caller_uid,
-                                                         caller_gid,
-                                                         target_status)
-                          : wait_owned_child_bounded(target,
-                                                     executable,
-                                                     target_argv,
-                                                     caller_uid,
-                                                     caller_gid,
-                                                     static_cast<ino_t>(expected_netns),
-                                                     target,
-                                                     true,
-                                                     target_wait_ms,
-                                                     target_status,
-                                                     kCredentialFd,
-                                                     &control);
+    OwnedWaitResult target_wait_result = OwnedWaitResult::Error;
+    switch (wait_strategy) {
+        case TargetWaitStrategy::ListenerCustody:
+            target_wait_result =
+                wait_listener_target_bounded(target,
+                                             listener_target_start,
+                                             executable,
+                                             target_argv,
+                                             root_broker,
+                                             root_identity.start,
+                                             kCredentialFd,
+                                             custody_pair[0],
+                                             listener_failure_integration(scenario),
+                                             control,
+                                             token,
+                                             static_cast<ino_t>(expected_netns),
+                                             caller_uid,
+                                             caller_gid,
+                                             kListenerDeadlineMs * 2,
+                                             target_status);
+            break;
+        case TargetWaitStrategy::OwnedWait:
+            target_wait_result = wait_owned_child_bounded(target,
+                                                          executable,
+                                                          target_argv,
+                                                          caller_uid,
+                                                          caller_gid,
+                                                          static_cast<ino_t>(expected_netns),
+                                                          target,
+                                                          true,
+                                                          canonical_collision_scenario(scenario)
+                                                              ? kCanonicalDroppedTargetWaitMs
+                                                              : target_wait_ms,
+                                                          target_status,
+                                                          kCredentialFd,
+                                                          &control);
+            break;
+    }
     if (target_wait_result != OwnedWaitResult::Exited) {
         if (target_wait_result == OwnedWaitResult::LeaseLost) target_cleanup.disarm();
         close(kCredentialFd);
@@ -5779,8 +8624,9 @@ static int root_broker_main(const char* executable,
         return abandoned == OwnedWaitResult::Exited ? 28 : 29;
     }
     int status = 0;
-    const int dropped_wait_ms =
-        listener_scenario_name(scenario) ? kListenerDeadlineMs * 3 : kBrokerDeadlineMs;
+    const int dropped_wait_ms = canonical_collision_scenario(scenario) ? kCanonicalRootDroppedWaitMs
+                                : listener_scenario_name(scenario)     ? kListenerDeadlineMs * 3
+                                                                       : kBrokerDeadlineMs;
     const OwnedWaitResult dropped_wait_result =
         wait_owned_child_bounded(dropped,
                                  executable,
@@ -9091,7 +11937,8 @@ static bool validate_exact_witness(const ExactRutReport& report,
                                    const ProcIdentity& target,
                                    const GuardReport& held,
                                    ProcIdentity& child_identity,
-                                   std::string& error) {
+                                   std::string& error,
+                                   bool generated_proxy = false) {
     const std::string source_path = endpoint.directory + "/exact-listener.rut";
     const std::string log_path = endpoint.directory + "/exact-listener.log";
     const std::string expected_argv = exact_argv(
@@ -9105,8 +11952,9 @@ static bool validate_exact_witness(const ExactRutReport& report,
         report.child_exe_ino != lease.status.st_ino ||
         report.pidfd > static_cast<u64>(std::numeric_limits<int>::max()) ||
         report.pidfd_cloexec != 1u || report.listener_inode == 0u ||
-        report.target_fd_count != held.current_fd_count + 1u || report.response_bytes != 65u ||
-        report.response_exact != 1u || report.prompt_eof != 1u ||
+        report.target_fd_count != held.current_fd_count + 1u ||
+        (!generated_proxy && (report.response_bytes != 65u || report.response_exact != 1u ||
+                              report.prompt_eof != 1u)) ||
         report.guard_connect_error != ECONNREFUSED || report.stable != 1u ||
         (report.backend != 1u && report.backend != 2u) || !executable_lease_unchanged(lease)) {
         error = "exact RUT witness scalar/executable evidence was invalid";
@@ -9147,19 +11995,54 @@ static bool validate_exact_witness(const ExactRutReport& report,
     privileged_listener::Diagnostic source_diagnostic;
     std::string expected_source;
     u64 target_fds = 0u;
+    std::string expected_generated_source;
+    std::string generated_diagnostic;
     if (!regular_temp_identity(source_path, report.source_dev, report.source_ino) ||
         !regular_temp_identity(log_path, report.log_dev, report.log_ino) ||
-        !read_file(source_path, source, 4096u) ||
-        !privileged_listener::build_listener_source(held.plan,
-                                                    privileged_listener::ListenerSourceKind::Exact,
-                                                    expected_source,
-                                                    source_diagnostic) ||
-        source != expected_source ||
-        !read_file(log_path, log, privileged_listener::kMaxCollisionLogBytes) ||
+        !read_file(source_path, source, 8192u)) {
+        error = generated_proxy ? "parent generated source/temp identity failed"
+                                : "parent exact source/temp identity failed";
+        return false;
+    }
+    const bool source_matches =
+        generated_proxy ? build_generated_proxy_source(
+                              held.plan, expected_generated_source, generated_diagnostic) &&
+                              source == expected_generated_source
+                        : privileged_listener::build_listener_source(
+                              held.plan,
+                              privileged_listener::ListenerSourceKind::Exact,
+                              expected_source,
+                              source_diagnostic) &&
+                              source == expected_source;
+    if (!source_matches || !read_file(log_path, log, privileged_listener::kMaxCollisionLogBytes) ||
         !exact_log_ready(log, source_path, static_cast<u16>(held.plan.port), backend) ||
         backend != report.backend || !count_target_fds(target.pid, target_fds) ||
         target_fds != report.target_fd_count) {
-        error = "parent exact source/log/backend/temp/FD evidence failed";
+        error = generated_proxy ? "parent generated source/log/backend/temp/FD evidence failed"
+                                : "parent exact source/log/backend/temp/FD evidence failed";
+        return false;
+    }
+    if (generated_proxy &&
+        (report.request_bytes != report.request_wire.size() || report.request_bytes != 59u ||
+         report.completed_send != 1u || report.upstream_absence_probe_refused != 1u ||
+         report.response_body_bytes != 157u || report.response_status != 502u ||
+         report.response_headers_exact != 1u || report.guard_before_connect_error != ECONNREFUSED ||
+         report.response_bytes != report.response_wire.size() || report.response_bytes == 0u ||
+         report.response_exact != 1u || report.prompt_eof != 1u ||
+         report.request_wire !=
+             "GET / HTTP/1.1\r\nHost: client.example\r\nConnection: close\r\n\r\n" ||
+         report.response_wire.size() > kExactMaxResponseBytes ||
+         !generated_response_wire_valid(report.response_wire))) {
+        error = "generated proxy 502 request/upstream/response observation was invalid";
+        return false;
+    }
+    if (!generated_proxy &&
+        (report.request_bytes != 67u || !report.request_wire.empty() ||
+         report.response_bytes != 65u || !report.response_wire.empty() ||
+         report.upstream_absence_probe_refused != 0u || report.guard_before_connect_error != 0u ||
+         report.response_body_bytes != 0u || report.response_status != 0u ||
+         report.response_headers_exact != 0u || report.completed_send != 1u)) {
+        error = "legacy exact 204 report carried generated-only observation fields";
         return false;
     }
     return true;
@@ -9203,149 +12086,23 @@ static bool validate_exact_cleaned_report(const ExactRutCleanedReport& report,
     return true;
 }
 
-static bool validate_wildcard_handoff_report(const WildcardHandoffReport& report,
-                                             const ExactRutReport& exact_live,
-                                             const ProcIdentity& exact_child,
-                                             const ExecutableLease& lease,
-                                             const ParentEndpoint& endpoint,
-                                             const ProcIdentity& target,
-                                             const GuardReport& held,
-                                             std::string& error) {
-    const bool scalar =
-        report.version == kWildcardHandoffVersion && report.collision_pid > 1u &&
-        report.collision_pid <= static_cast<u64>(std::numeric_limits<pid_t>::max()) &&
-        report.collision_start != 0u && report.collision_exit_one == 1u &&
-        report.collision_pidfd_invalidated == 1u && report.collision_log_eaddrinuse == 1u &&
-        report.collision_no_wildcard == 1u && report.collision_exact_live == 1u &&
-        report.collision_guard_live == 1u && report.collision_source_absent == 1u &&
-        report.collision_log_absent == 1u && report.collision_response_bytes == 0u &&
-        report.exact_reaped == 1u && report.exact_listener_absent == 1u &&
-        report.exact_temps_absent == 1u && report.guard_invalidated == 1u &&
-        report.port_absent_before_retry == 1u && report.same_source == 1u &&
-        report.wildcard_pid > 1u &&
-        report.wildcard_pid <= static_cast<u64>(std::numeric_limits<pid_t>::max()) &&
-        report.wildcard_start != 0u && report.wildcard_listener_inode != 0u &&
-        report.wildcard_kind == 1u && report.positive_response_bytes == 65u &&
-        report.positive_response_exact == 1u && report.positive_prompt_eof == 1u &&
-        report.guard_response_bytes == 65u && report.guard_response_exact == 1u &&
-        report.guard_prompt_eof == 1u && report.wildcard_stable == 1u &&
-        report.wildcard_clean_exit == 1u && report.wildcard_pidfd_invalidated == 1u &&
-        report.wildcard_child_absent == 1u && report.wildcard_listener_absent == 1u &&
-        report.wildcard_source_absent == 1u && report.wildcard_log_absent == 1u &&
-        report.target_fd_count == held.baseline_fd_count &&
-        report.positive_ipv4 == held.plan.positive_ipv4 &&
-        report.guard_ipv4 == held.plan.guard_ipv4 && report.port == held.plan.port &&
-        report.collision_pid != report.wildcard_pid &&
-        report.collision_pid != exact_live.child_pid &&
-        report.wildcard_pid != exact_live.child_pid &&
-        report.collision_pid != static_cast<u64>(target.pid) &&
-        report.wildcard_pid != static_cast<u64>(target.pid) && executable_lease_unchanged(lease) &&
-        endpoint_unchanged(endpoint);
-    if (!scalar) {
-        error = "wildcard handoff scalar/collision/response evidence was invalid";
-        return false;
-    }
-    ProcIdentity collision_identity;
-    collision_identity.pid = static_cast<pid_t>(report.collision_pid);
-    collision_identity.start = report.collision_start;
-    ProcIdentity wildcard_identity;
-    wildcard_identity.pid = static_cast<pid_t>(report.wildcard_pid);
-    wildcard_identity.start = report.wildcard_start;
-    u64 target_fds = 0u;
-    if (!target_gone_or_reused(exact_child) ||
-        observe_exact_liveness(collision_identity) != ExactLiveness::ExitedOrReused ||
-        observe_exact_liveness(wildcard_identity) != ExactLiveness::ExitedOrReused ||
-        !target_fd_absent(target.pid, static_cast<int>(exact_live.pidfd)) ||
-        !target_fd_absent(target.pid, static_cast<int>(held.guard_fd)) ||
-        !count_target_fds(target.pid, target_fds) || target_fds != held.baseline_fd_count) {
-        error = "wildcard handoff exact/collision/retry process or FD cleanup was invalid";
-        return false;
-    }
-    struct stat ignored{};
-    const auto absent = [&](const std::string& name) {
-        errno = 0;
-        return lstat((endpoint.directory + "/" + name).c_str(), &ignored) < 0 && errno == ENOENT;
-    };
-    privileged_listener::ProcTcpTable table;
-    privileged_listener::ListenerEvidence evidence;
-    privileged_listener::Diagnostic diagnostic;
-    if (!absent("exact-listener.rut") || !absent("exact-listener.log") ||
-        !absent("wildcard-collision.rut") || !absent("wildcard-collision.log") ||
-        !absent("wildcard-success.rut") || !absent("wildcard-success.log") ||
-        !read_target_tcp_table(target.pid, table, error) ||
-        !privileged_listener::classify_listener_evidence(
-            table,
-            held.plan,
-            {},
-            privileged_listener::ListenerEvidenceKind::PortAbsent,
-            evidence,
-            diagnostic)) {
-        if (error.empty()) error = "wildcard handoff port/temp absence evidence was invalid";
-        return false;
-    }
-    return true;
-}
-
-static bool wildcard_handoff_mutation_self_check(const WildcardHandoffReport& canonical,
-                                                 const ExactRutReport& exact_live,
-                                                 const ProcIdentity& exact_child,
-                                                 const ExecutableLease& lease,
-                                                 const ParentEndpoint& endpoint,
-                                                 const ProcIdentity& target,
-                                                 const GuardReport& held) {
-    const auto rejects = [&](WildcardHandoffReport mutation) {
-        std::string ignored_error;
-        return !validate_wildcard_handoff_report(
-            mutation, exact_live, exact_child, lease, endpoint, target, held, ignored_error);
-    };
-    WildcardHandoffReport mutation = canonical;
-    mutation.collision_exit_one = 0u;
-    if (!rejects(mutation)) return false;
-    mutation = canonical;
-    mutation.collision_log_eaddrinuse = 0u;
-    if (!rejects(mutation)) return false;
-    mutation = canonical;
-    mutation.collision_no_wildcard = 0u;
-    if (!rejects(mutation)) return false;
-    mutation = canonical;
-    mutation.collision_guard_live = 0u;
-    if (!rejects(mutation)) return false;
-    mutation = canonical;
-    mutation.wildcard_kind = 0u;
-    if (!rejects(mutation)) return false;
-    mutation = canonical;
-    mutation.positive_ipv4 = canonical.guard_ipv4;
-    if (!rejects(mutation)) return false;
-    mutation = canonical;
-    mutation.guard_ipv4 = canonical.positive_ipv4;
-    if (!rejects(mutation)) return false;
-    mutation = canonical;
-    mutation.wildcard_listener_inode = 0u;
-    if (!rejects(mutation)) return false;
-    mutation = canonical;
-    mutation.port_absent_before_retry = 0u;
-    if (!rejects(mutation)) return false;
-    mutation = canonical;
-    mutation.same_source = 0u;
-    if (!rejects(mutation)) return false;
-    mutation = canonical;
-    mutation.positive_response_exact = 0u;
-    if (!rejects(mutation)) return false;
-    mutation = canonical;
-    mutation.guard_prompt_eof = 0u;
-    return rejects(mutation);
-}
-
 static bool exact_witness_mutation_self_check(const ExactRutReport& canonical,
                                               const ExecutableLease& lease,
                                               const ParentEndpoint& endpoint,
                                               const ProcIdentity& target,
-                                              const GuardReport& held) {
+                                              const GuardReport& held,
+                                              bool generated_proxy = false) {
     const auto rejects = [&](ExactRutReport mutation) {
         ProcIdentity ignored_identity;
         std::string ignored_error;
-        return !validate_exact_witness(
-            mutation, lease, endpoint, target, held, ignored_identity, ignored_error);
+        return !validate_exact_witness(mutation,
+                                       lease,
+                                       endpoint,
+                                       target,
+                                       held,
+                                       ignored_identity,
+                                       ignored_error,
+                                       generated_proxy);
     };
     ExactRutReport mutation = canonical;
     mutation.version++;
@@ -9375,7 +12132,7 @@ static bool exact_witness_mutation_self_check(const ExactRutReport& canonical,
     mutation.log_ino++;
     if (!rejects(mutation)) return false;
     mutation = canonical;
-    mutation.response_bytes--;
+    mutation.response_bytes = generated_proxy ? 0u : mutation.response_bytes - 1u;
     if (!rejects(mutation)) return false;
     mutation = canonical;
     mutation.response_exact = 0u;
@@ -9391,7 +12148,59 @@ static bool exact_witness_mutation_self_check(const ExactRutReport& canonical,
     if (!rejects(mutation)) return false;
     mutation = canonical;
     mutation.backend = 0u;
-    return rejects(mutation);
+    if (!rejects(mutation)) return false;
+    if (generated_proxy) {
+        mutation = canonical;
+        mutation.request_bytes++;
+        if (!rejects(mutation)) return false;
+        mutation = canonical;
+        mutation.request_bytes--;
+        if (!rejects(mutation)) return false;
+        mutation = canonical;
+        mutation.completed_send++;
+        if (!rejects(mutation)) return false;
+        mutation = canonical;
+        mutation.upstream_absence_probe_refused = 0u;
+        if (!rejects(mutation)) return false;
+        mutation = canonical;
+        mutation.response_body_bytes++;
+        if (!rejects(mutation)) return false;
+        mutation = canonical;
+        mutation.response_bytes++;
+        if (!rejects(mutation)) return false;
+        mutation = canonical;
+        mutation.response_bytes--;
+        if (!rejects(mutation)) return false;
+        mutation = canonical;
+        mutation.response_status = 503u;
+        if (!rejects(mutation)) return false;
+        mutation = canonical;
+        mutation.response_headers_exact = 0u;
+        if (!rejects(mutation)) return false;
+    } else {
+        mutation = canonical;
+        mutation.request_bytes++;
+        if (!rejects(mutation)) return false;
+        mutation = canonical;
+        mutation.request_bytes--;
+        if (!rejects(mutation)) return false;
+        mutation = canonical;
+        mutation.response_status = 502u;
+        if (!rejects(mutation)) return false;
+        mutation = canonical;
+        mutation.completed_send = 0u;
+        if (!rejects(mutation)) return false;
+        mutation = canonical;
+        mutation.upstream_absence_probe_refused = 1u;
+        if (!rejects(mutation)) return false;
+        mutation = canonical;
+        mutation.response_body_bytes = 157u;
+        if (!rejects(mutation)) return false;
+        mutation = canonical;
+        mutation.response_headers_exact = 1u;
+        if (!rejects(mutation)) return false;
+    }
+    return true;
 }
 
 static bool exact_cleaned_mutation_self_check(const ExactRutCleanedReport& canonical,
@@ -9431,6 +12240,769 @@ static bool exact_cleaned_mutation_self_check(const ExactRutCleanedReport& canon
     return rejects(mutation);
 }
 
+static WildcardAttemptPhaseV1 wildcard_phase(WildcardAttemptMode mode,
+                                             WildcardAttemptPhase phase,
+                                             u64 transaction_id = 0x377u) {
+    return {kWildcardAttemptVersion, transaction_id, mode, phase, wildcard_phase_sequence(phase)};
+}
+
+static WildcardAttemptDecisionV1 wildcard_decision(WildcardAttemptMode mode,
+                                                   WildcardAttemptDecisionKind decision,
+                                                   WildcardAttemptPhase phase,
+                                                   u64 sequence,
+                                                   u64 transaction_id = 0x377u) {
+    return {kWildcardAttemptVersion, transaction_id, mode, decision, phase, sequence};
+}
+
+static WildcardAttemptSettlementV1 wildcard_settlement(WildcardAttemptMode mode,
+                                                       WildcardAttemptSettlementKind settlement,
+                                                       WildcardAttemptPhase phase,
+                                                       u64 sequence,
+                                                       u64 transaction_id = 0x377u) {
+    return {kWildcardAttemptVersion, transaction_id, mode, settlement, phase, sequence};
+}
+
+static bool wildcard_existing_frame_golden_self_check() {
+    if (kGuardReserve != 35u || kGuardHeld != 36u || kGuardRelease != 37u ||
+        kGuardReleased != 38u || kGuardFinish != 39u || kGuardFinished != 40u ||
+        kExactRutRun != 41u || kExactRutWitness != 42u || kExactRutCleanup != 43u ||
+        kExactRutCleaned != 44u || kExactRutFailure != 45u || kExactEscrowSettled != 46u ||
+        kWildcardAttemptCommand != 51u || kWildcardAttemptPhase != 52u ||
+        kWildcardAttemptDecision != 53u || kWildcardAttemptSettlement != 54u)
+        return false;
+    constexpr std::array<u16, 16u> existing_types{
+        35u,
+        36u,
+        37u,
+        38u,
+        39u,
+        40u,
+        41u,
+        42u,
+        43u,
+        44u,
+        45u,
+        46u,
+        47u,
+        48u,
+        49u,
+        50u,
+    };
+    Token token{};
+    for (u16 type : existing_types) {
+        const std::vector<unsigned char> wire = frame_bytes(Frame{type, token, {}});
+        std::array<unsigned char, kHeaderBytes> golden{};
+        golden[0] = 0x35u;
+        golden[1] = 0x33u;
+        golden[2] = 0x52u;
+        golden[3] = 0x31u;
+        golden[4] = 0x01u;
+        golden[6] = static_cast<unsigned char>(type);
+        golden[7] = static_cast<unsigned char>(type >> 8u);
+        if (wire.size() != golden.size() || !std::equal(wire.begin(), wire.end(), golden.begin()))
+            return false;
+    }
+    return true;
+}
+
+static bool same_wildcard_command(const WildcardAttemptCommandV1& left,
+                                  const WildcardAttemptCommandV1& right) {
+    return left.version == right.version && left.transaction_id == right.transaction_id &&
+           left.mode == right.mode && left.sequence == right.sequence;
+}
+
+static bool same_wildcard_phase(const WildcardAttemptPhaseV1& left,
+                                const WildcardAttemptPhaseV1& right) {
+    return left.version == right.version && left.transaction_id == right.transaction_id &&
+           left.mode == right.mode && left.phase == right.phase && left.sequence == right.sequence;
+}
+
+static bool same_wildcard_decision(const WildcardAttemptDecisionV1& left,
+                                   const WildcardAttemptDecisionV1& right) {
+    return left.version == right.version && left.transaction_id == right.transaction_id &&
+           left.mode == right.mode && left.decision == right.decision &&
+           left.for_phase == right.for_phase && left.sequence == right.sequence;
+}
+
+static bool same_wildcard_settlement(const WildcardAttemptSettlementV1& left,
+                                     const WildcardAttemptSettlementV1& right) {
+    return left.version == right.version && left.transaction_id == right.transaction_id &&
+           left.mode == right.mode && left.settlement == right.settlement &&
+           left.terminal_phase == right.terminal_phase && left.sequence == right.sequence;
+}
+
+template <typename Value, typename Decoder, typename Equal>
+static bool rejects_without_mutating(const std::vector<unsigned char>& payload,
+                                     const Value& sentinel,
+                                     Decoder decoder,
+                                     Equal equal) {
+    Value output = sentinel;
+    return !decoder(payload, output) && equal(output, sentinel);
+}
+
+constexpr WildcardAttemptCommandV1 kWildcardCommandDecodeSentinel{
+    kWildcardAttemptVersion, 0x3771u, WildcardAttemptMode::WrongListenerInode, 0u};
+constexpr WildcardAttemptPhaseV1 kWildcardPhaseDecodeSentinel{
+    kWildcardAttemptVersion,
+    0x3772u,
+    WildcardAttemptMode::WrongListenerAddress,
+    WildcardAttemptPhase::GuardReleased,
+    9u};
+constexpr WildcardAttemptDecisionV1 kWildcardDecisionDecodeSentinel{
+    kWildcardAttemptVersion,
+    0x3773u,
+    WildcardAttemptMode::WrongListenerInode,
+    WildcardAttemptDecisionKind::RejectAndCleanup,
+    WildcardAttemptPhase::WildcardLive,
+    11u};
+constexpr WildcardAttemptSettlementV1 kWildcardSettlementDecodeSentinel{
+    kWildcardAttemptVersion,
+    0x3774u,
+    WildcardAttemptMode::FalsePostReleaseSuccess,
+    WildcardAttemptSettlementKind::MutationSettled,
+    WildcardAttemptPhase::WildcardLive,
+    12u};
+
+static bool wildcard_decoder_atomic_failure_self_check(std::string& error) {
+    if (!valid_wildcard_command(kWildcardCommandDecodeSentinel) ||
+        !valid_wildcard_phase(kWildcardPhaseDecodeSentinel) ||
+        !valid_wildcard_decision(kWildcardDecisionDecodeSentinel) ||
+        !valid_wildcard_settlement(kWildcardSettlementDecodeSentinel)) {
+        error = "wildcard decoder atomic-failure sentinel is not valid";
+        return false;
+    }
+
+    const std::array<u64, 4u> command_fields{
+        kWildcardAttemptVersion, 0x377u, static_cast<u64>(WildcardAttemptMode::Canonical), 0u};
+    for (std::size_t field = 0u; field != command_fields.size(); ++field) {
+        std::array<u64, 4u> invalid = command_fields;
+        invalid[field] = field == 0u ? 2u : (field == 1u ? 0u : (field == 2u ? 8u : 1u));
+        if (!rejects_without_mutating(encode_wildcard_fields(invalid),
+                                      kWildcardCommandDecodeSentinel,
+                                      decode_wildcard_command,
+                                      same_wildcard_command)) {
+            error = "invalid raw wildcard command mutated decoder output";
+            return false;
+        }
+    }
+
+    const std::array<u64, 5u> phase_fields{kWildcardAttemptVersion,
+                                           0x377u,
+                                           static_cast<u64>(WildcardAttemptMode::Canonical),
+                                           static_cast<u64>(WildcardAttemptPhase::GuardHeld),
+                                           1u};
+    for (std::size_t field = 0u; field != phase_fields.size(); ++field) {
+        std::array<u64, 5u> invalid = phase_fields;
+        invalid[field] =
+            field == 0u ? 2u : (field == 1u ? 0u : (field == 2u ? 8u : (field == 3u ? 8u : 0u)));
+        if (!rejects_without_mutating(encode_wildcard_fields(invalid),
+                                      kWildcardPhaseDecodeSentinel,
+                                      decode_wildcard_phase,
+                                      same_wildcard_phase)) {
+            error = "invalid raw wildcard phase mutated decoder output";
+            return false;
+        }
+    }
+
+    const std::array<u64, 6u> decision_fields{
+        kWildcardAttemptVersion,
+        0x377u,
+        static_cast<u64>(WildcardAttemptMode::Canonical),
+        static_cast<u64>(WildcardAttemptDecisionKind::AuthorizeCollisionExec),
+        static_cast<u64>(WildcardAttemptPhase::CollisionPrepared),
+        4u};
+    for (std::size_t field = 0u; field != decision_fields.size(); ++field) {
+        std::array<u64, 6u> invalid = decision_fields;
+        invalid[field] =
+            field == 0u
+                ? 2u
+                : (field == 1u ? 0u
+                               : (field == 2u ? 8u : (field == 3u ? 8u : (field == 4u ? 8u : 0u))));
+        if (!rejects_without_mutating(encode_wildcard_fields(invalid),
+                                      kWildcardDecisionDecodeSentinel,
+                                      decode_wildcard_decision,
+                                      same_wildcard_decision)) {
+            error = "invalid raw wildcard decision mutated decoder output";
+            return false;
+        }
+    }
+
+    const std::array<u64, 6u> settlement_fields{
+        kWildcardAttemptVersion,
+        0x377u,
+        static_cast<u64>(WildcardAttemptMode::Canonical),
+        static_cast<u64>(WildcardAttemptSettlementKind::AttemptSettled),
+        static_cast<u64>(WildcardAttemptPhase::WildcardLive),
+        13u};
+    for (std::size_t field = 0u; field != settlement_fields.size(); ++field) {
+        std::array<u64, 6u> invalid = settlement_fields;
+        invalid[field] =
+            field == 0u
+                ? 2u
+                : (field == 1u ? 0u
+                               : (field == 2u ? 8u : (field == 3u ? 3u : (field == 4u ? 8u : 0u))));
+        if (!rejects_without_mutating(encode_wildcard_fields(invalid),
+                                      kWildcardSettlementDecodeSentinel,
+                                      decode_wildcard_settlement,
+                                      same_wildcard_settlement)) {
+            error = "invalid raw wildcard settlement mutated decoder output";
+            return false;
+        }
+    }
+    return true;
+}
+
+static bool wildcard_attempt_codec_self_check(std::string& error) {
+    constexpr std::array<WildcardAttemptMode, 7u> modes{
+        WildcardAttemptMode::Canonical,
+        WildcardAttemptMode::MissingCollision,
+        WildcardAttemptMode::PrematureGuardRelease,
+        WildcardAttemptMode::WrongListenerKind,
+        WildcardAttemptMode::WrongListenerAddress,
+        WildcardAttemptMode::WrongListenerInode,
+        WildcardAttemptMode::FalsePostReleaseSuccess,
+    };
+    constexpr std::array<WildcardAttemptPhase, 7u> phases{
+        WildcardAttemptPhase::GuardHeld,
+        WildcardAttemptPhase::ExactRutWitness,
+        WildcardAttemptPhase::CollisionPrepared,
+        WildcardAttemptPhase::CollisionRejected,
+        WildcardAttemptPhase::ExactCleanedGuardHeld,
+        WildcardAttemptPhase::GuardReleased,
+        WildcardAttemptPhase::WildcardLive,
+    };
+    if (!wildcard_existing_frame_golden_self_check()) {
+        error = "wildcard frame allocation changed an existing 35--50 wire header";
+        return false;
+    }
+    if (!wildcard_decoder_atomic_failure_self_check(error)) return false;
+    for (WildcardAttemptMode mode : modes) {
+        WildcardAttemptCommandV1 command{kWildcardAttemptVersion, 0x377u, mode, 0u};
+        WildcardAttemptCommandV1 decoded;
+        if (!decode_wildcard_command(encode_wildcard_command(command), decoded) ||
+            decoded.mode != mode || decoded.transaction_id != command.transaction_id) {
+            error = "wildcard command closed-mode round trip failed";
+            return false;
+        }
+    }
+    for (WildcardAttemptPhase phase : phases) {
+        const WildcardAttemptPhaseV1 witness =
+            wildcard_phase(WildcardAttemptMode::Canonical, phase);
+        WildcardAttemptPhaseV1 decoded;
+        if (!decode_wildcard_phase(encode_wildcard_phase(witness), decoded) ||
+            decoded.phase != phase || decoded.sequence != wildcard_phase_sequence(phase)) {
+            error = "wildcard phase round trip failed";
+            return false;
+        }
+    }
+    const std::array<WildcardAttemptDecisionV1, 6u> canonical_decisions{
+        wildcard_decision(WildcardAttemptMode::Canonical,
+                          WildcardAttemptDecisionKind::AuthorizeCollisionExec,
+                          WildcardAttemptPhase::CollisionPrepared,
+                          4u),
+        wildcard_decision(WildcardAttemptMode::Canonical,
+                          WildcardAttemptDecisionKind::AuthorizeExactCleanup,
+                          WildcardAttemptPhase::CollisionRejected,
+                          6u),
+        wildcard_decision(WildcardAttemptMode::Canonical,
+                          WildcardAttemptDecisionKind::AuthorizeGuardRelease,
+                          WildcardAttemptPhase::ExactCleanedGuardHeld,
+                          8u),
+        wildcard_decision(WildcardAttemptMode::Canonical,
+                          WildcardAttemptDecisionKind::AuthorizeWildcardExec,
+                          WildcardAttemptPhase::GuardReleased,
+                          10u),
+        wildcard_decision(WildcardAttemptMode::Canonical,
+                          WildcardAttemptDecisionKind::AuthorizeWildcardCleanup,
+                          WildcardAttemptPhase::WildcardLive,
+                          12u),
+        wildcard_decision(WildcardAttemptMode::Canonical,
+                          WildcardAttemptDecisionKind::Finish,
+                          WildcardAttemptPhase::WildcardLive,
+                          14u),
+    };
+    for (const auto& decision : canonical_decisions) {
+        WildcardAttemptDecisionV1 decoded;
+        if (!decode_wildcard_decision(encode_wildcard_decision(decision), decoded) ||
+            decoded.decision != decision.decision || decoded.for_phase != decision.for_phase) {
+            error = "wildcard authorization round trip failed";
+            return false;
+        }
+    }
+    for (WildcardAttemptMode mode : modes) {
+        if (mode == WildcardAttemptMode::Canonical) continue;
+        const WildcardAttemptPhase checkpoint = wildcard_rejection_checkpoint(mode);
+        const WildcardAttemptDecisionV1 rejection =
+            wildcard_decision(mode,
+                              WildcardAttemptDecisionKind::RejectAndCleanup,
+                              checkpoint,
+                              wildcard_phase_sequence(checkpoint));
+        WildcardAttemptDecisionV1 decoded_decision;
+        const WildcardAttemptSettlementV1 settlement =
+            wildcard_settlement(mode,
+                                WildcardAttemptSettlementKind::MutationSettled,
+                                checkpoint,
+                                wildcard_phase_sequence(checkpoint) + 1u);
+        WildcardAttemptSettlementV1 decoded_settlement;
+        if (!decode_wildcard_decision(encode_wildcard_decision(rejection), decoded_decision) ||
+            !decode_wildcard_settlement(encode_wildcard_settlement(settlement),
+                                        decoded_settlement) ||
+            decoded_decision.mode != mode || decoded_settlement.mode != mode) {
+            error = "wildcard mutation terminal round trip failed";
+            return false;
+        }
+    }
+    WildcardAttemptSettlementV1 canonical_settlement =
+        wildcard_settlement(WildcardAttemptMode::Canonical,
+                            WildcardAttemptSettlementKind::AttemptSettled,
+                            WildcardAttemptPhase::WildcardLive,
+                            13u);
+    WildcardAttemptSettlementV1 decoded_settlement;
+    if (!decode_wildcard_settlement(encode_wildcard_settlement(canonical_settlement),
+                                    decoded_settlement)) {
+        error = "wildcard canonical settlement round trip failed";
+        return false;
+    }
+
+    WildcardAttemptCommandV1 command{
+        kWildcardAttemptVersion, 0x377u, WildcardAttemptMode::Canonical, 0u};
+    std::vector<unsigned char> payload = encode_wildcard_command(command);
+    payload.pop_back();
+    if (!rejects_without_mutating(payload,
+                                  kWildcardCommandDecodeSentinel,
+                                  decode_wildcard_command,
+                                  same_wildcard_command)) {
+        error = "truncated wildcard command was accepted or mutated decoder output";
+        return false;
+    }
+    payload = encode_wildcard_command(command);
+    payload.push_back(0u);
+    if (!rejects_without_mutating(payload,
+                                  kWildcardCommandDecodeSentinel,
+                                  decode_wildcard_command,
+                                  same_wildcard_command)) {
+        error = "trailing wildcard command bytes were accepted or mutated decoder output";
+        return false;
+    }
+    for (unsigned mutation = 0u; mutation != 4u; ++mutation) {
+        WildcardAttemptCommandV1 invalid = command;
+        if (mutation == 0u)
+            invalid.version++;
+        else if (mutation == 1u)
+            invalid.transaction_id = 0u;
+        else if (mutation == 2u)
+            invalid.mode = static_cast<WildcardAttemptMode>(8u);
+        else
+            invalid.sequence = 1u;
+        if (!rejects_without_mutating(encode_wildcard_command(invalid),
+                                      kWildcardCommandDecodeSentinel,
+                                      decode_wildcard_command,
+                                      same_wildcard_command)) {
+            error = "invalid wildcard command was accepted or mutated decoder output";
+            return false;
+        }
+    }
+
+    WildcardAttemptPhaseV1 witness =
+        wildcard_phase(WildcardAttemptMode::Canonical, WildcardAttemptPhase::GuardHeld);
+    payload = encode_wildcard_phase(witness);
+    payload.pop_back();
+    if (!rejects_without_mutating(
+            payload, kWildcardPhaseDecodeSentinel, decode_wildcard_phase, same_wildcard_phase)) {
+        error = "truncated wildcard phase was accepted or mutated decoder output";
+        return false;
+    }
+    payload = encode_wildcard_phase(witness);
+    payload.push_back(0u);
+    if (!rejects_without_mutating(
+            payload, kWildcardPhaseDecodeSentinel, decode_wildcard_phase, same_wildcard_phase)) {
+        error = "trailing wildcard phase bytes were accepted or mutated decoder output";
+        return false;
+    }
+    for (unsigned mutation = 0u; mutation != 5u; ++mutation) {
+        WildcardAttemptPhaseV1 invalid = witness;
+        if (mutation == 0u)
+            invalid.version++;
+        else if (mutation == 1u)
+            invalid.transaction_id = 0u;
+        else if (mutation == 2u)
+            invalid.mode = static_cast<WildcardAttemptMode>(8u);
+        else if (mutation == 3u)
+            invalid.phase = static_cast<WildcardAttemptPhase>(8u);
+        else
+            invalid.sequence++;
+        if (!rejects_without_mutating(encode_wildcard_phase(invalid),
+                                      kWildcardPhaseDecodeSentinel,
+                                      decode_wildcard_phase,
+                                      same_wildcard_phase)) {
+            error = "invalid wildcard phase was accepted or mutated decoder output";
+            return false;
+        }
+    }
+
+    WildcardAttemptDecisionV1 decision = canonical_decisions.front();
+    payload = encode_wildcard_decision(decision);
+    payload.pop_back();
+    if (!rejects_without_mutating(payload,
+                                  kWildcardDecisionDecodeSentinel,
+                                  decode_wildcard_decision,
+                                  same_wildcard_decision)) {
+        error = "truncated wildcard decision was accepted or mutated decoder output";
+        return false;
+    }
+    payload = encode_wildcard_decision(decision);
+    payload.push_back(0u);
+    if (!rejects_without_mutating(payload,
+                                  kWildcardDecisionDecodeSentinel,
+                                  decode_wildcard_decision,
+                                  same_wildcard_decision)) {
+        error = "trailing wildcard decision bytes were accepted or mutated decoder output";
+        return false;
+    }
+    for (unsigned mutation = 0u; mutation != 7u; ++mutation) {
+        WildcardAttemptDecisionV1 invalid = decision;
+        if (mutation == 0u)
+            invalid.version++;
+        else if (mutation == 1u)
+            invalid.transaction_id = 0u;
+        else if (mutation == 2u)
+            invalid.mode = static_cast<WildcardAttemptMode>(8u);
+        else if (mutation == 3u)
+            invalid.decision = static_cast<WildcardAttemptDecisionKind>(8u);
+        else if (mutation == 4u)
+            invalid.for_phase = static_cast<WildcardAttemptPhase>(8u);
+        else if (mutation == 5u)
+            invalid.for_phase = WildcardAttemptPhase::GuardHeld;
+        else
+            invalid.sequence++;
+        if (!rejects_without_mutating(encode_wildcard_decision(invalid),
+                                      kWildcardDecisionDecodeSentinel,
+                                      decode_wildcard_decision,
+                                      same_wildcard_decision)) {
+            error = "invalid wildcard decision was accepted or mutated decoder output";
+            return false;
+        }
+    }
+
+    payload = encode_wildcard_settlement(canonical_settlement);
+    payload.pop_back();
+    if (!rejects_without_mutating(payload,
+                                  kWildcardSettlementDecodeSentinel,
+                                  decode_wildcard_settlement,
+                                  same_wildcard_settlement)) {
+        error = "truncated wildcard settlement was accepted or mutated decoder output";
+        return false;
+    }
+    payload = encode_wildcard_settlement(canonical_settlement);
+    payload.push_back(0u);
+    if (!rejects_without_mutating(payload,
+                                  kWildcardSettlementDecodeSentinel,
+                                  decode_wildcard_settlement,
+                                  same_wildcard_settlement)) {
+        error = "trailing wildcard settlement bytes were accepted or mutated decoder output";
+        return false;
+    }
+    for (unsigned mutation = 0u; mutation != 7u; ++mutation) {
+        WildcardAttemptSettlementV1 invalid = canonical_settlement;
+        if (mutation == 0u)
+            invalid.version++;
+        else if (mutation == 1u)
+            invalid.transaction_id = 0u;
+        else if (mutation == 2u)
+            invalid.mode = static_cast<WildcardAttemptMode>(8u);
+        else if (mutation == 3u)
+            invalid.settlement = static_cast<WildcardAttemptSettlementKind>(3u);
+        else if (mutation == 4u)
+            invalid.terminal_phase = static_cast<WildcardAttemptPhase>(8u);
+        else if (mutation == 5u)
+            invalid.terminal_phase = WildcardAttemptPhase::GuardReleased;
+        else
+            invalid.sequence++;
+        if (!rejects_without_mutating(encode_wildcard_settlement(invalid),
+                                      kWildcardSettlementDecodeSentinel,
+                                      decode_wildcard_settlement,
+                                      same_wildcard_settlement)) {
+            error = "invalid wildcard settlement was accepted or mutated decoder output";
+            return false;
+        }
+    }
+    return true;
+}
+
+static bool drive_wildcard_canonical(WildcardAttemptStateMachine& machine,
+                                     u64 transaction_id = 0x377u) {
+    const WildcardAttemptMode mode = WildcardAttemptMode::Canonical;
+    return machine.begin({kWildcardAttemptVersion, transaction_id, mode, 0u}) &&
+           machine.observe(wildcard_phase(mode, WildcardAttemptPhase::GuardHeld, transaction_id)) &&
+           machine.observe(
+               wildcard_phase(mode, WildcardAttemptPhase::ExactRutWitness, transaction_id)) &&
+           machine.observe(
+               wildcard_phase(mode, WildcardAttemptPhase::CollisionPrepared, transaction_id)) &&
+           machine.decide(wildcard_decision(mode,
+                                            WildcardAttemptDecisionKind::AuthorizeCollisionExec,
+                                            WildcardAttemptPhase::CollisionPrepared,
+                                            4u,
+                                            transaction_id)) &&
+           machine.observe(
+               wildcard_phase(mode, WildcardAttemptPhase::CollisionRejected, transaction_id)) &&
+           machine.decide(wildcard_decision(mode,
+                                            WildcardAttemptDecisionKind::AuthorizeExactCleanup,
+                                            WildcardAttemptPhase::CollisionRejected,
+                                            6u,
+                                            transaction_id)) &&
+           machine.observe(
+               wildcard_phase(mode, WildcardAttemptPhase::ExactCleanedGuardHeld, transaction_id)) &&
+           machine.decide(wildcard_decision(mode,
+                                            WildcardAttemptDecisionKind::AuthorizeGuardRelease,
+                                            WildcardAttemptPhase::ExactCleanedGuardHeld,
+                                            8u,
+                                            transaction_id)) &&
+           machine.observe(
+               wildcard_phase(mode, WildcardAttemptPhase::GuardReleased, transaction_id)) &&
+           machine.decide(wildcard_decision(mode,
+                                            WildcardAttemptDecisionKind::AuthorizeWildcardExec,
+                                            WildcardAttemptPhase::GuardReleased,
+                                            10u,
+                                            transaction_id)) &&
+           machine.observe(
+               wildcard_phase(mode, WildcardAttemptPhase::WildcardLive, transaction_id)) &&
+           machine.decide(wildcard_decision(mode,
+                                            WildcardAttemptDecisionKind::AuthorizeWildcardCleanup,
+                                            WildcardAttemptPhase::WildcardLive,
+                                            12u,
+                                            transaction_id)) &&
+           machine.settle(wildcard_settlement(mode,
+                                              WildcardAttemptSettlementKind::AttemptSettled,
+                                              WildcardAttemptPhase::WildcardLive,
+                                              13u,
+                                              transaction_id)) &&
+           machine.decide(wildcard_decision(mode,
+                                            WildcardAttemptDecisionKind::Finish,
+                                            WildcardAttemptPhase::WildcardLive,
+                                            14u,
+                                            transaction_id)) &&
+           machine.complete();
+}
+
+static bool drive_wildcard_mutation(WildcardAttemptStateMachine& machine,
+                                    WildcardAttemptMode mode,
+                                    u64 transaction_id = 0x377u) {
+    if (mode == WildcardAttemptMode::Canonical ||
+        !machine.begin({kWildcardAttemptVersion, transaction_id, mode, 0u}) ||
+        !machine.observe(wildcard_phase(mode, WildcardAttemptPhase::GuardHeld, transaction_id)) ||
+        !machine.observe(
+            wildcard_phase(mode, WildcardAttemptPhase::ExactRutWitness, transaction_id)) ||
+        !machine.observe(
+            wildcard_phase(mode, WildcardAttemptPhase::CollisionPrepared, transaction_id)) ||
+        !machine.decide(wildcard_decision(mode,
+                                          WildcardAttemptDecisionKind::AuthorizeCollisionExec,
+                                          WildcardAttemptPhase::CollisionPrepared,
+                                          4u,
+                                          transaction_id)))
+        return false;
+    const WildcardAttemptPhase checkpoint = wildcard_rejection_checkpoint(mode);
+    if (checkpoint == WildcardAttemptPhase::WildcardLive &&
+        (!machine.observe(
+             wildcard_phase(mode, WildcardAttemptPhase::CollisionRejected, transaction_id)) ||
+         !machine.decide(wildcard_decision(mode,
+                                           WildcardAttemptDecisionKind::AuthorizeExactCleanup,
+                                           WildcardAttemptPhase::CollisionRejected,
+                                           6u,
+                                           transaction_id)) ||
+         !machine.observe(
+             wildcard_phase(mode, WildcardAttemptPhase::ExactCleanedGuardHeld, transaction_id)) ||
+         !machine.decide(wildcard_decision(mode,
+                                           WildcardAttemptDecisionKind::AuthorizeGuardRelease,
+                                           WildcardAttemptPhase::ExactCleanedGuardHeld,
+                                           8u,
+                                           transaction_id)) ||
+         !machine.observe(
+             wildcard_phase(mode, WildcardAttemptPhase::GuardReleased, transaction_id)) ||
+         !machine.decide(wildcard_decision(mode,
+                                           WildcardAttemptDecisionKind::AuthorizeWildcardExec,
+                                           WildcardAttemptPhase::GuardReleased,
+                                           10u,
+                                           transaction_id))))
+        return false;
+    return machine.decide(wildcard_decision(mode,
+                                            WildcardAttemptDecisionKind::RejectAndCleanup,
+                                            checkpoint,
+                                            wildcard_phase_sequence(checkpoint),
+                                            transaction_id)) &&
+           machine.settle(wildcard_settlement(mode,
+                                              WildcardAttemptSettlementKind::MutationSettled,
+                                              checkpoint,
+                                              wildcard_phase_sequence(checkpoint) + 1u,
+                                              transaction_id)) &&
+           machine.mutation_rejected();
+}
+
+static bool wildcard_attempt_state_self_check(std::string& error) {
+    WildcardAttemptStateMachine canonical_replay;
+    if (!drive_wildcard_canonical(canonical_replay)) {
+        error = "canonical wildcard state sequence was rejected";
+        return false;
+    }
+    if (canonical_replay.observe(
+            wildcard_phase(WildcardAttemptMode::Canonical, WildcardAttemptPhase::GuardHeld)) ||
+        !canonical_replay.failed() || canonical_replay.complete() ||
+        canonical_replay.mutation_rejected()) {
+        error = "valid replay after canonical completion did not poison terminal state";
+        return false;
+    }
+    WildcardAttemptStateMachine canonical_wrong_binding;
+    if (!drive_wildcard_canonical(canonical_wrong_binding) ||
+        canonical_wrong_binding.observe(wildcard_phase(
+            WildcardAttemptMode::Canonical, WildcardAttemptPhase::GuardHeld, 0x378u)) ||
+        !canonical_wrong_binding.failed() || canonical_wrong_binding.complete() ||
+        canonical_wrong_binding.mutation_rejected()) {
+        error = "wrong-bound input after canonical completion did not poison terminal state";
+        return false;
+    }
+    for (WildcardAttemptMode mode : {WildcardAttemptMode::MissingCollision,
+                                     WildcardAttemptMode::PrematureGuardRelease,
+                                     WildcardAttemptMode::WrongListenerKind,
+                                     WildcardAttemptMode::WrongListenerAddress,
+                                     WildcardAttemptMode::WrongListenerInode,
+                                     WildcardAttemptMode::FalsePostReleaseSuccess}) {
+        WildcardAttemptStateMachine mutation;
+        if (!drive_wildcard_mutation(mutation, mode)) {
+            error = "intended wildcard mutation rejection sequence failed";
+            return false;
+        }
+        if (!mutation.mutation_rejected() || mutation.complete() || mutation.failed()) {
+            error = "wildcard mutation did not retain its initial rejection terminal state";
+            return false;
+        }
+    }
+    constexpr WildcardAttemptMode terminal_mutation_mode = WildcardAttemptMode::MissingCollision;
+    constexpr WildcardAttemptPhase terminal_mutation_phase =
+        WildcardAttemptPhase::CollisionRejected;
+    WildcardAttemptStateMachine mutation_replay;
+    if (!drive_wildcard_mutation(mutation_replay, terminal_mutation_mode) ||
+        mutation_replay.settle(
+            wildcard_settlement(terminal_mutation_mode,
+                                WildcardAttemptSettlementKind::MutationSettled,
+                                terminal_mutation_phase,
+                                wildcard_phase_sequence(terminal_mutation_phase) + 1u)) ||
+        !mutation_replay.failed() || mutation_replay.complete() ||
+        mutation_replay.mutation_rejected()) {
+        error = "valid replay after mutation rejection did not poison terminal state";
+        return false;
+    }
+    WildcardAttemptStateMachine mutation_wrong_binding;
+    if (!drive_wildcard_mutation(mutation_wrong_binding, terminal_mutation_mode) ||
+        mutation_wrong_binding.settle(
+            wildcard_settlement(terminal_mutation_mode,
+                                WildcardAttemptSettlementKind::MutationSettled,
+                                terminal_mutation_phase,
+                                wildcard_phase_sequence(terminal_mutation_phase) + 1u,
+                                0x378u)) ||
+        !mutation_wrong_binding.failed() || mutation_wrong_binding.complete() ||
+        mutation_wrong_binding.mutation_rejected()) {
+        error = "wrong-bound input after mutation rejection did not poison terminal state";
+        return false;
+    }
+
+    const auto new_machine_at_collision = [] {
+        WildcardAttemptStateMachine machine;
+        const WildcardAttemptMode mode = WildcardAttemptMode::MissingCollision;
+        (void)machine.begin({kWildcardAttemptVersion, 0x377u, mode, 0u});
+        (void)machine.observe(wildcard_phase(mode, WildcardAttemptPhase::GuardHeld));
+        (void)machine.observe(wildcard_phase(mode, WildcardAttemptPhase::ExactRutWitness));
+        (void)machine.observe(wildcard_phase(mode, WildcardAttemptPhase::CollisionPrepared));
+        (void)machine.decide(wildcard_decision(mode,
+                                               WildcardAttemptDecisionKind::AuthorizeCollisionExec,
+                                               WildcardAttemptPhase::CollisionPrepared,
+                                               4u));
+        return machine;
+    };
+    WildcardAttemptStateMachine duplicate;
+    if (!duplicate.begin({kWildcardAttemptVersion, 0x377u, WildcardAttemptMode::Canonical, 0u}) ||
+        !duplicate.observe(
+            wildcard_phase(WildcardAttemptMode::Canonical, WildcardAttemptPhase::GuardHeld)) ||
+        duplicate.observe(
+            wildcard_phase(WildcardAttemptMode::Canonical, WildcardAttemptPhase::GuardHeld)) ||
+        !duplicate.failed()) {
+        error = "duplicate wildcard phase did not fail closed";
+        return false;
+    }
+    WildcardAttemptStateMachine skipped;
+    if (!skipped.begin({kWildcardAttemptVersion, 0x377u, WildcardAttemptMode::Canonical, 0u}) ||
+        skipped.observe(wildcard_phase(WildcardAttemptMode::Canonical,
+                                       WildcardAttemptPhase::ExactRutWitness)) ||
+        !skipped.failed()) {
+        error = "skipped/out-of-order wildcard phase did not fail closed";
+        return false;
+    }
+    for (unsigned mutation = 0u; mutation != 4u; ++mutation) {
+        WildcardAttemptStateMachine bound;
+        const WildcardAttemptMode mode = WildcardAttemptMode::Canonical;
+        if (!bound.begin({kWildcardAttemptVersion, 0x377u, mode, 0u})) return false;
+        WildcardAttemptPhaseV1 witness = wildcard_phase(mode, WildcardAttemptPhase::GuardHeld);
+        if (mutation == 0u)
+            witness.version++;
+        else if (mutation == 1u)
+            witness.transaction_id++;
+        else if (mutation == 2u)
+            witness.mode = WildcardAttemptMode::WrongListenerInode;
+        else
+            witness.sequence++;
+        if (bound.observe(witness) || !bound.failed()) {
+            error = "unbound wildcard version/transaction/mode/sequence was accepted";
+            return false;
+        }
+    }
+    WildcardAttemptStateMachine replay = new_machine_at_collision();
+    if (replay.decide(wildcard_decision(WildcardAttemptMode::MissingCollision,
+                                        WildcardAttemptDecisionKind::AuthorizeCollisionExec,
+                                        WildcardAttemptPhase::CollisionPrepared,
+                                        4u)) ||
+        !replay.failed()) {
+        error = "replayed wildcard authorization did not fail closed";
+        return false;
+    }
+    WildcardAttemptStateMachine settle_before_reject = new_machine_at_collision();
+    if (settle_before_reject.settle(
+            wildcard_settlement(WildcardAttemptMode::MissingCollision,
+                                WildcardAttemptSettlementKind::MutationSettled,
+                                WildcardAttemptPhase::CollisionRejected,
+                                6u)) ||
+        !settle_before_reject.failed()) {
+        error = "wildcard mutation settlement before rejection was accepted";
+        return false;
+    }
+    WildcardAttemptStateMachine authorize_after_reject = new_machine_at_collision();
+    if (!authorize_after_reject.decide(
+            wildcard_decision(WildcardAttemptMode::MissingCollision,
+                              WildcardAttemptDecisionKind::RejectAndCleanup,
+                              WildcardAttemptPhase::CollisionRejected,
+                              5u)) ||
+        authorize_after_reject.decide(
+            wildcard_decision(WildcardAttemptMode::MissingCollision,
+                              WildcardAttemptDecisionKind::AuthorizeExactCleanup,
+                              WildcardAttemptPhase::CollisionRejected,
+                              6u)) ||
+        !authorize_after_reject.failed()) {
+        error = "authorization after wildcard rejection did not fail closed";
+        return false;
+    }
+    WildcardAttemptStateMachine duplicate_command;
+    WildcardAttemptCommandV1 command{
+        kWildcardAttemptVersion, 0x377u, WildcardAttemptMode::Canonical, 0u};
+    if (!duplicate_command.begin(command) || duplicate_command.begin(command) ||
+        !duplicate_command.failed()) {
+        error = "duplicate wildcard command did not fail closed";
+        return false;
+    }
+    return true;
+}
+
+static bool wildcard_attempt_protocol_self_check(std::string& error) {
+    return wildcard_attempt_codec_self_check(error) && wildcard_attempt_state_self_check(error) &&
+           listener_failure_bound_self_check(error);
+}
+
 static bool guard_protocol_self_check(std::string& error) {
     constexpr u32 positive = 0x0a010203u;
     constexpr u32 guard = 0x0a010204u;
@@ -9440,8 +13012,6 @@ static bool guard_protocol_self_check(std::string& error) {
         kGuardReleased != 38u || kGuardFinish != 39u || kGuardFinished != 40u ||
         kExactRutRun != 41u || kExactRutWitness != 42u || kExactRutCleanup != 43u ||
         kExactRutCleaned != 44u || kExactRutFailure != 45u || kExactEscrowSettled != 46u ||
-        kWildcardHandoffRun != 47u || kWildcardHandoffWitness != 48u ||
-        kWildcardHandoffFinish != 49u || kWildcardHandoffFinished != 50u ||
         !parse_guard_request(request, decoded_positive, decoded_guard) ||
         decoded_positive != positive || decoded_guard != guard) {
         error = "private guard frame/request codec self-check failed";
@@ -9561,7 +13131,8 @@ static bool guard_protocol_self_check(std::string& error) {
     if (!decode_exact_report(live_payload, live_decoded) ||
         live_decoded.child_pid != live.child_pid ||
         live_decoded.listener_inode != live.listener_inode || live_decoded.response_bytes != 65u ||
-        live_decoded.backend != 2u) {
+        live_decoded.backend != 2u || !live_decoded.request_wire.empty() ||
+        !live_decoded.response_wire.empty() || live_decoded.response_status != 0u) {
         error = "canonical exact witness codec failed";
         return false;
     }
@@ -9571,9 +13142,54 @@ static bool guard_protocol_self_check(std::string& error) {
         return false;
     }
     live_payload = encode_exact_report(live);
-    live_payload[0] = 2u;
+    live_payload[0] = 3u;
     if (decode_exact_report(live_payload, live_decoded)) {
         error = "unknown exact witness version was accepted";
+        return false;
+    }
+    ExactRutReport generated = live;
+    generated.request_bytes = 59u;
+    generated.completed_send = 1u;
+    generated.upstream_absence_probe_refused = 1u;
+    generated.response_body_bytes = 157u;
+    generated.response_status = 502u;
+    generated.response_headers_exact = 1u;
+    generated.guard_before_connect_error = ECONNREFUSED;
+    generated.request_wire = "GET / HTTP/1.1\r\nHost: client.example\r\nConnection: close\r\n\r\n";
+    generated.response_wire =
+        "HTTP/1.1 502 Bad Gateway\r\nServer: nginx/1.29.7\r\n"
+        "Date: Tue, 01 Jan 2030 00:00:00 GMT\r\nContent-Type: text/html\r\n"
+        "Content-Length: 157\r\nConnection: close\r\n\r\n"
+        "<html>\r\n<head><title>502 Bad Gateway</title></head>\r\n<body>\r\n"
+        "<center><h1>502 Bad Gateway</h1></center>\r\n<hr><center>nginx/1.29.7</center>\r\n"
+        "</body>\r\n</html>\r\n";
+    const std::vector<unsigned char> generated_payload = encode_exact_report(generated);
+    ExactRutReport generated_decoded;
+    if (!decode_exact_report(generated_payload, generated_decoded) ||
+        generated_decoded.request_wire != generated.request_wire ||
+        generated_decoded.response_wire != generated.response_wire ||
+        !generated_response_wire_valid(generated_decoded.response_wire)) {
+        error = "fully populated generated witness observation codec failed";
+        return false;
+    }
+    const ExactRutReport generated_canonical = generated_decoded;
+    for (std::vector<unsigned char> mutation :
+         {std::vector<unsigned char>(generated_payload.begin(), generated_payload.end() - 1u)}) {
+        if (decode_exact_report(mutation, generated_decoded)) {
+            error = "truncated generated witness observation was accepted";
+            return false;
+        }
+    }
+    std::vector<unsigned char> generated_oversize = generated_payload;
+    generated_oversize.push_back(0u);
+    if (decode_exact_report(generated_oversize, generated_decoded)) {
+        error = "oversized generated witness observation was accepted";
+        return false;
+    }
+    ExactRutReport changed = generated_canonical;
+    changed.response_wire.replace(changed.response_wire.find("502"), 3u, "503");
+    if (generated_response_wire_valid(changed.response_wire)) {
+        error = "mutated generated response observation was accepted";
         return false;
     }
     ExactRutCleanedReport cleaned;
@@ -9598,43 +13214,9 @@ static bool guard_protocol_self_check(std::string& error) {
         return false;
     }
     cleaned_payload = encode_exact_cleaned(cleaned);
-    cleaned_payload[0] = 2u;
+    cleaned_payload[0] = 3u;
     if (decode_exact_cleaned(cleaned_payload, cleaned_decoded)) {
         error = "unknown exact cleaned version was accepted";
-        return false;
-    }
-    WildcardHandoffReport wildcard;
-    wildcard.collision_pid = 401u;
-    wildcard.collision_start = 402u;
-    wildcard.collision_exit_one = 1u;
-    wildcard.collision_log_eaddrinuse = 1u;
-    wildcard.wildcard_pid = 501u;
-    wildcard.wildcard_start = 502u;
-    wildcard.wildcard_listener_inode = 503u;
-    wildcard.wildcard_kind = 1u;
-    wildcard.positive_response_bytes = 65u;
-    wildcard.guard_response_bytes = 65u;
-    wildcard.positive_ipv4 = positive;
-    wildcard.guard_ipv4 = guard;
-    wildcard.port = 8080u;
-    WildcardHandoffReport wildcard_decoded;
-    std::vector<unsigned char> wildcard_payload = encode_wildcard_handoff(wildcard);
-    if (!decode_wildcard_handoff(wildcard_payload, wildcard_decoded) ||
-        wildcard_decoded.collision_pid != wildcard.collision_pid ||
-        wildcard_decoded.wildcard_listener_inode != wildcard.wildcard_listener_inode ||
-        wildcard_decoded.positive_response_bytes != 65u || wildcard_decoded.port != 8080u) {
-        error = "canonical wildcard handoff codec failed";
-        return false;
-    }
-    wildcard_payload.pop_back();
-    if (decode_wildcard_handoff(wildcard_payload, wildcard_decoded)) {
-        error = "truncated wildcard handoff was accepted";
-        return false;
-    }
-    wildcard_payload = encode_wildcard_handoff(wildcard);
-    wildcard_payload[0] = 2u;
-    if (decode_wildcard_handoff(wildcard_payload, wildcard_decoded)) {
-        error = "unknown wildcard handoff version was accepted";
         return false;
     }
     Token exact_token{};
@@ -9649,7 +13231,7 @@ static bool guard_protocol_self_check(std::string& error) {
         return false;
     }
     cleanup.payload = exact_cleanup_payload();
-    cleanup.payload[0] = 2u;
+    cleanup.payload[0] = 3u;
     if (exact_cleanup_request(cleanup, exact_token)) {
         error = "unknown exact cleanup version was accepted";
         return false;
@@ -9936,7 +13518,9 @@ static bool run_session(const std::string& sudo_path,
                         const ExecutableLease& rut_executable,
                         const HeldTopologySnapshot& topology,
                         const char* scenario,
-                        std::string& error) {
+                        std::string& error,
+                        GeneratedProxyObservation* generated_observation = nullptr) {
+    if (generated_observation != nullptr) *generated_observation = {};
     ParentEndpoint endpoint;
     Token token;
     if (!new_token(token) || !create_parent_endpoint(endpoint, error)) return false;
@@ -9984,6 +13568,7 @@ static bool run_session(const std::string& sudo_path,
     ancestry_bundle::AncestryBundle final_ancestry;
     bool success = false;
     bool broker_lifecycle_complete = false;
+    GeneratedProxyObservation generated_observation_candidate;
     do {
         const bool root_hello_ok = await_root_hello(endpoint,
                                                     sudo_child,
@@ -10380,6 +13965,10 @@ static bool run_session(const std::string& sudo_path,
                 error = "target PING/PONG/release failed";
                 break;
             }
+        } else if (canonical_collision_scenario(scenario)) {
+            if (!run_canonical_collision_release_parent(
+                    target_fd, token, topology, rut_executable.path, target_proc, error))
+                break;
         } else if (listener_scenario_name(scenario)) {
             u32 positive_ipv4 = 0u, guard_ipv4 = 0u;
             if (!parse_canonical_ipv4(topology.positive_ip, positive_ipv4) ||
@@ -10438,184 +14027,162 @@ static bool run_session(const std::string& sudo_path,
                                         target_proc,
                                         held,
                                         exact_child,
-                                        error) ||
-                !exact_witness_mutation_self_check(
-                    exact_report, rut_executable, endpoint, target_proc, held)) {
+                                        error,
+                                        generated_proxy_scenario(scenario)) ||
+                !exact_witness_mutation_self_check(exact_report,
+                                                   rut_executable,
+                                                   endpoint,
+                                                   target_proc,
+                                                   held,
+                                                   generated_proxy_scenario(scenario))) {
                 if (error.empty()) error = "exact public-RUT run/witness evidence failed";
                 break;
             }
-            if (listener_wildcard_handoff(scenario)) {
-                Frame wildcard_frame;
-                WildcardHandoffReport wildcard_report;
-                if (!send_frame(target_fd, Frame{kWildcardHandoffRun, token, {}}, kHandshakeMs) ||
-                    !receive_frame(target_fd, wildcard_frame, kListenerDeadlineMs * 2)) {
-                    error = "wildcard collision/release handoff transport failed";
+            Frame exact_cleaned_frame;
+            ExactRutCleanedReport exact_cleaned;
+            if (!send_frame(target_fd,
+                            Frame{kExactRutCleanup, token, exact_cleanup_payload()},
+                            kHandshakeMs) ||
+                !receive_frame(
+                    target_fd, exact_cleaned_frame, cleanup_response_wait_ms(scenario))) {
+                error = "exact public-RUT cleanup transport failed";
+                break;
+            }
+            if (listener_failure_integration(scenario)) {
+                ExactFailureReport failure;
+                ExactFailureIntegrationStage integration_stage =
+                    ExactFailureIntegrationStage::Failure;
+                if (!advance_exact_failure_integration(integration_stage,
+                                                       exact_cleaned_frame.type) ||
+                    !token_equal(exact_cleaned_frame.token, token) ||
+                    !decode_exact_failure(exact_cleaned_frame.payload, failure) ||
+                    !exact_injected_cleanup_failure(failure, exact_report)) {
+                    error = "injected cleanup failure evidence was malformed or misbound";
                     break;
                 }
-                if (wildcard_frame.type == kExactRutFailure &&
-                    token_equal(wildcard_frame.token, token)) {
+                const auto target_eof_deadline = std::chrono::steady_clock::now() +
+                                                 std::chrono::milliseconds(kListenerDeadlineMs);
+                if (!wait_control_eof(target_fd, target_eof_deadline)) {
+                    error = "injected failure Target EOF was missing or out of order";
+                    break;
+                }
+                close(target_fd);
+                target_fd = -1;
+                if (observe_exact_liveness(root_proc) != ExactLiveness::Live) {
+                    error = "exact Root PID/start was not live before deliberate loss";
+                    break;
+                }
+                const auto pre_root_loss_deadline =
+                    std::chrono::steady_clock::now() + std::chrono::milliseconds(kCleanupMs);
+                if (!observe_quiet_broker_while_root_live(
+                        broker_fd, root_proc, pre_root_loss_deadline)) {
+                    error = "frame46/broker event preceded deliberate exact Root loss";
+                    break;
+                }
+                close(root_fd);
+                root_fd = -1;
+                const auto root_loss_deadline = std::chrono::steady_clock::now() +
+                                                std::chrono::milliseconds(kListenerDeadlineMs);
+                if (!wait_identity_gone_or_reused_until(root_proc, root_loss_deadline)) {
+                    error = "exact Root PID/start survived deliberate lease loss";
+                    break;
+                }
+                if (!receive_failed_target_lifecycle(broker_fd,
+                                                     token,
+                                                     target_proc.pid,
+                                                     failure,
+                                                     held.socket_inode,
+                                                     error,
+                                                     &integration_stage) ||
+                    integration_stage != ExactFailureIntegrationStage::Complete) {
+                    if (error.empty())
+                        error = "injected failure settlement/exit lifecycle was incomplete";
+                    break;
+                }
+                broker_lifecycle_complete = true;
+            } else {
+                if (exact_cleaned_frame.type == kExactRutFailure &&
+                    token_equal(exact_cleaned_frame.token, token)) {
                     ExactFailureReport failure;
-                    if (decode_exact_failure(wildcard_frame.payload, failure))
-                        error = "wildcard handoff failed at exact phase " +
+                    if (decode_exact_failure(exact_cleaned_frame.payload, failure))
+                        error = "exact public-RUT failed at phase " +
                                 std::string(exact_failure_phase_name(failure.phase)) +
-                                " errno=" + std::to_string(failure.error_number);
+                                " errno=" + std::to_string(failure.error_number) +
+                                " count=" + std::to_string(failure.count);
                     else
-                        error = "wildcard handoff returned malformed failure evidence";
+                        error = "exact public-RUT returned malformed cleanup failure evidence";
+                    (void)receive_failed_target_lifecycle(
+                        broker_fd, token, target_proc.pid, failure, held.socket_inode, error);
                     break;
                 }
-                if (wildcard_frame.type != kWildcardHandoffWitness ||
-                    !token_equal(wildcard_frame.token, token) ||
-                    !decode_wildcard_handoff(wildcard_frame.payload, wildcard_report) ||
-                    !validate_wildcard_handoff_report(wildcard_report,
-                                                      exact_report,
-                                                      exact_child,
-                                                      rut_executable,
-                                                      endpoint,
-                                                      target_proc,
-                                                      held,
-                                                      error) ||
-                    !wildcard_handoff_mutation_self_check(wildcard_report,
-                                                          exact_report,
-                                                          exact_child,
-                                                          rut_executable,
-                                                          endpoint,
-                                                          target_proc,
-                                                          held)) {
-                    if (error.empty()) error = "wildcard collision/release handoff evidence failed";
+                if (exact_cleaned_frame.type != kExactRutCleaned ||
+                    !token_equal(exact_cleaned_frame.token, token) ||
+                    !decode_exact_cleaned(exact_cleaned_frame.payload, exact_cleaned) ||
+                    !validate_exact_cleaned_report(exact_cleaned,
+                                                   exact_report,
+                                                   exact_child,
+                                                   endpoint,
+                                                   target_proc,
+                                                   held,
+                                                   error) ||
+                    !exact_cleaned_mutation_self_check(
+                        exact_cleaned, exact_report, exact_child, endpoint, target_proc, held) ||
+                    !observe_guard_held(target_proc, plan, held, error)) {
+                    if (error.empty())
+                        error = "exact public-RUT cleanup/guard-held evidence failed";
+                    break;
+                }
+                if (generated_proxy_scenario(scenario)) {
+                    generated_observation_candidate.request_wire = exact_report.request_wire;
+                    generated_observation_candidate.response_wire = exact_report.response_wire;
+                    generated_observation_candidate.upstream_absence_probe_refused =
+                        exact_report.upstream_absence_probe_refused;
+                    generated_observation_candidate.guard_before_connect_error =
+                        exact_report.guard_before_connect_error;
+                    generated_observation_candidate.guard_after_connect_error =
+                        exact_report.guard_connect_error;
+                    generated_observation_candidate.status = exact_report.response_status;
+                    generated_observation_candidate.headers_exact =
+                        exact_report.response_headers_exact;
+                    generated_observation_candidate.body_bytes = exact_report.response_body_bytes;
+                    generated_observation_candidate.child_pid = exact_report.child_pid;
+                    generated_observation_candidate.child_start = exact_report.child_start;
+                    generated_observation_candidate.listener_inode = exact_report.listener_inode;
+                    generated_observation_candidate.positive_ipv4 = held.plan.positive_ipv4;
+                    generated_observation_candidate.guard_ipv4 = held.plan.guard_ipv4;
+                    generated_observation_candidate.port = held.plan.port;
+                    generated_observation_candidate.upstream_ipv4 = 0x7f000001u;
+                    generated_observation_candidate.upstream_port = 9000u;
+                    generated_observation_candidate.eof = exact_report.prompt_eof;
+                    generated_observation_candidate.cleanup_complete =
+                        exact_cleaned.clean_exit && exact_cleaned.child_absent &&
+                                exact_cleaned.listener_absent && exact_cleaned.temps_absent
+                            ? 1u
+                            : 0u;
+                }
+                Frame released_frame;
+                GuardReport released;
+                if (!send_frame(target_fd, Frame{kGuardRelease, token, {}}, kHandshakeMs) ||
+                    !receive_frame(target_fd, released_frame, kBrokerDeadlineMs) ||
+                    released_frame.type != kGuardReleased ||
+                    !token_equal(released_frame.token, token) ||
+                    !decode_guard_report(released_frame.payload, released) ||
+                    !validate_guard_report(released, plan, target_proc, true) ||
+                    released.guard_fd != held.guard_fd ||
+                    released.socket_inode != held.socket_inode ||
+                    released.baseline_fd_count != held.baseline_fd_count ||
+                    released.owner_pid != held.owner_pid ||
+                    released.owner_start != held.owner_start || released.netns != held.netns ||
+                    !observe_guard_released(target_proc, plan, released, error)) {
+                    if (error.empty()) error = "released guard report/proc/FD evidence was invalid";
                     break;
                 }
                 Frame finished;
-                if (!send_frame(
-                        target_fd, Frame{kWildcardHandoffFinish, token, {}}, kHandshakeMs) ||
+                if (!send_frame(target_fd, Frame{kGuardFinish, token, {}}, kHandshakeMs) ||
                     !receive_frame(target_fd, finished, kHandshakeMs) ||
-                    !exact_request(finished, kWildcardHandoffFinished, token)) {
-                    error = "wildcard handoff final validated-release handshake failed";
+                    !exact_request(finished, kGuardFinished, token)) {
+                    error = "guard lifecycle final release handshake failed";
                     break;
-                }
-            } else {
-                Frame exact_cleaned_frame;
-                ExactRutCleanedReport exact_cleaned;
-                if (!send_frame(target_fd,
-                                Frame{kExactRutCleanup, token, exact_cleanup_payload()},
-                                kHandshakeMs) ||
-                    !receive_frame(
-                        target_fd, exact_cleaned_frame, cleanup_response_wait_ms(scenario))) {
-                    error = "exact public-RUT cleanup transport failed";
-                    break;
-                }
-                if (listener_failure_integration(scenario)) {
-                    ExactFailureReport failure;
-                    ExactFailureIntegrationStage integration_stage =
-                        ExactFailureIntegrationStage::Failure;
-                    if (!advance_exact_failure_integration(integration_stage,
-                                                           exact_cleaned_frame.type) ||
-                        !token_equal(exact_cleaned_frame.token, token) ||
-                        !decode_exact_failure(exact_cleaned_frame.payload, failure) ||
-                        !exact_injected_cleanup_failure(failure, exact_report)) {
-                        error = "injected cleanup failure evidence was malformed or misbound";
-                        break;
-                    }
-                    const auto target_eof_deadline = std::chrono::steady_clock::now() +
-                                                     std::chrono::milliseconds(kListenerDeadlineMs);
-                    if (!wait_control_eof(target_fd, target_eof_deadline)) {
-                        error = "injected failure Target EOF was missing or out of order";
-                        break;
-                    }
-                    close(target_fd);
-                    target_fd = -1;
-                    if (observe_exact_liveness(root_proc) != ExactLiveness::Live) {
-                        error = "exact Root PID/start was not live before deliberate loss";
-                        break;
-                    }
-                    const auto pre_root_loss_deadline =
-                        std::chrono::steady_clock::now() + std::chrono::milliseconds(kCleanupMs);
-                    if (!observe_quiet_broker_while_root_live(
-                            broker_fd, root_proc, pre_root_loss_deadline)) {
-                        error = "frame46/broker event preceded deliberate exact Root loss";
-                        break;
-                    }
-                    close(root_fd);
-                    root_fd = -1;
-                    const auto root_loss_deadline = std::chrono::steady_clock::now() +
-                                                    std::chrono::milliseconds(kListenerDeadlineMs);
-                    if (!wait_identity_gone_or_reused_until(root_proc, root_loss_deadline)) {
-                        error = "exact Root PID/start survived deliberate lease loss";
-                        break;
-                    }
-                    if (!receive_failed_target_lifecycle(broker_fd,
-                                                         token,
-                                                         target_proc.pid,
-                                                         failure,
-                                                         held.socket_inode,
-                                                         error,
-                                                         &integration_stage) ||
-                        integration_stage != ExactFailureIntegrationStage::Complete) {
-                        if (error.empty())
-                            error = "injected failure settlement/exit lifecycle was incomplete";
-                        break;
-                    }
-                    broker_lifecycle_complete = true;
-                } else {
-                    if (exact_cleaned_frame.type == kExactRutFailure &&
-                        token_equal(exact_cleaned_frame.token, token)) {
-                        ExactFailureReport failure;
-                        if (decode_exact_failure(exact_cleaned_frame.payload, failure))
-                            error = "exact public-RUT failed at phase " +
-                                    std::string(exact_failure_phase_name(failure.phase)) +
-                                    " errno=" + std::to_string(failure.error_number) +
-                                    " count=" + std::to_string(failure.count);
-                        else
-                            error = "exact public-RUT returned malformed cleanup failure evidence";
-                        (void)receive_failed_target_lifecycle(
-                            broker_fd, token, target_proc.pid, failure, held.socket_inode, error);
-                        break;
-                    }
-                    if (exact_cleaned_frame.type != kExactRutCleaned ||
-                        !token_equal(exact_cleaned_frame.token, token) ||
-                        !decode_exact_cleaned(exact_cleaned_frame.payload, exact_cleaned) ||
-                        !validate_exact_cleaned_report(exact_cleaned,
-                                                       exact_report,
-                                                       exact_child,
-                                                       endpoint,
-                                                       target_proc,
-                                                       held,
-                                                       error) ||
-                        !exact_cleaned_mutation_self_check(exact_cleaned,
-                                                           exact_report,
-                                                           exact_child,
-                                                           endpoint,
-                                                           target_proc,
-                                                           held) ||
-                        !observe_guard_held(target_proc, plan, held, error)) {
-                        if (error.empty())
-                            error = "exact public-RUT cleanup/guard-held evidence failed";
-                        break;
-                    }
-                    Frame released_frame;
-                    GuardReport released;
-                    if (!send_frame(target_fd, Frame{kGuardRelease, token, {}}, kHandshakeMs) ||
-                        !receive_frame(target_fd, released_frame, kBrokerDeadlineMs) ||
-                        released_frame.type != kGuardReleased ||
-                        !token_equal(released_frame.token, token) ||
-                        !decode_guard_report(released_frame.payload, released) ||
-                        !validate_guard_report(released, plan, target_proc, true) ||
-                        released.guard_fd != held.guard_fd ||
-                        released.socket_inode != held.socket_inode ||
-                        released.baseline_fd_count != held.baseline_fd_count ||
-                        released.owner_pid != held.owner_pid ||
-                        released.owner_start != held.owner_start || released.netns != held.netns ||
-                        !observe_guard_released(target_proc, plan, released, error)) {
-                        if (error.empty())
-                            error = "released guard report/proc/FD evidence was invalid";
-                        break;
-                    }
-                    Frame finished;
-                    if (!send_frame(target_fd, Frame{kGuardFinish, token, {}}, kHandshakeMs) ||
-                        !receive_frame(target_fd, finished, kHandshakeMs) ||
-                        !exact_request(finished, kGuardFinished, token)) {
-                        error = "guard lifecycle final release handshake failed";
-                        break;
-                    }
                 }
             }
         } else if (strcmp(scenario, "term-ignore") == 0) {
@@ -10769,7 +14336,63 @@ static bool run_session(const std::string& sudo_path,
         if (!error.empty()) error += "; ";
         error += endpoint_cleanup_error;
     }
+    if (success && generated_proxy_scenario(scenario) && generated_observation != nullptr) {
+        *generated_observation = std::move(generated_observation_candidate);
+    }
     return success;
+}
+
+static ipv4_topology::RunResult run_generated_nginx_differential(
+    const std::string& sudo_path,
+    const std::string& nsenter_path,
+    const std::string& executable,
+    const ExecutableLease& rut_executable) {
+    GeneratedDifferentialBuilderContext builder_context;
+    GeneratedProxyObservation generated_observation;
+    bool comparison_published = false;
+    ipv4_topology::ExactInputRotationTerminalReceipt terminal_receipt;
+    ipv4_topology::ExactInputRotationOptions options;
+    options.nginx_mode = ipv4_topology::ExactInputRotationNginxMode::Required;
+    options.nginx_config_builder = build_generated_differential_nginx_config;
+    options.nginx_config_builder_context = &builder_context;
+    auto result = ipv4_topology::run_with_exact_input_rotation(
+        "",
+        ipv4_topology::ExactInputRotationFailurePoint::None,
+        [&](const ipv4_topology::ExactInputRotationLiveEvidence& evidence, std::string& error) {
+            if (!ipv4_topology::validate_exact_input_rotation_live_evidence(evidence, error))
+                return false;
+            if (builder_context.calls != 1u || builder_context.expected_bytes.empty() ||
+                evidence.initial_source.bytes != builder_context.expected_bytes ||
+                evidence.fresh_source.bytes != builder_context.expected_bytes ||
+                !evidence.old_and_fresh_authorities_separate || !evidence.fresh_clean_baseline) {
+                error = "rotation published a source or generation authority different from nginx";
+                return false;
+            }
+            if (!run_session(sudo_path,
+                             nsenter_path,
+                             executable,
+                             rut_executable,
+                             evidence.generation_receipt.new_generation.topology,
+                             "listener-generated-proxy-502-differential",
+                             error,
+                             &generated_observation))
+                return false;
+            if (!compare_generated_proxy_observation(evidence, generated_observation, error))
+                return false;
+            comparison_published = true;
+            return true;
+        },
+        terminal_receipt,
+        options);
+    std::string terminal_error;
+    if (result.success &&
+        (!comparison_published || !ipv4_topology::validate_exact_input_rotation_terminal_receipt(
+                                      terminal_receipt, terminal_error))) {
+        result.success = false;
+        result.error =
+            terminal_error.empty() ? "generated differential was not published" : terminal_error;
+    }
+    return result;
 }
 
 static bool regular_root_owned_executable(const char* path) {
@@ -10907,7 +14530,8 @@ static bool run_positive(const std::string& sudo_path,
                          const ExecutableLease& rut_executable,
                          const HeldTopologySnapshot& topology,
                          bool required,
-                         std::string& error) {
+                         std::string& error,
+                         GeneratedProxyObservation& generated_observation) {
     ProcIdentity host;
     if (!read_proc(getpid(), host) || topology.holder_pid <= 1 || topology.holder_start == 0 ||
         topology.holder_netns == 0 || !process_alive(topology.holder_pid) ||
@@ -10920,6 +14544,7 @@ static bool run_positive(const std::string& sudo_path,
         error = "required ancestry access probe: " + error;
         return false;
     }
+    generated_observation = {};
     for (const char* scenario : {"normal",
                                  "ready-loss",
                                  "no-ready",
@@ -10947,6 +14572,17 @@ static bool run_positive(const std::string& sudo_path,
                      executable,
                      rut_executable,
                      topology,
+                     "listener-generated-proxy-502",
+                     error,
+                     &generated_observation)) {
+        error = "listener-generated-proxy-502: " + error;
+        return false;
+    }
+    if (!run_session(sudo_path,
+                     nsenter_path,
+                     executable,
+                     rut_executable,
+                     topology,
                      "listener-cleanup-observation-failure",
                      error)) {
         error = "listener-cleanup-observation-failure: " + error;
@@ -10957,9 +14593,20 @@ static bool run_positive(const std::string& sudo_path,
                      executable,
                      rut_executable,
                      topology,
-                     "listener-wildcard-release-handoff",
+                     "listener-canonical-collision-release",
                      error)) {
-        error = "listener-wildcard-release-handoff: " + error;
+        error = "listener-canonical-collision-release: " + error;
+        return false;
+    }
+    if (generated_observation.request_wire.empty() || generated_observation.response_wire.empty() ||
+        generated_observation.status != 502u || generated_observation.headers_exact != 1u ||
+        generated_observation.body_bytes != 157u || generated_observation.eof != 1u ||
+        generated_observation.cleanup_complete != 1u || generated_observation.child_pid <= 1u ||
+        generated_observation.child_start == 0u || generated_observation.listener_inode == 0u ||
+        generated_observation.upstream_absence_probe_refused != 1u ||
+        generated_observation.guard_before_connect_error != ECONNREFUSED ||
+        generated_observation.guard_after_connect_error != ECONNREFUSED) {
+        error = "generated proxy observation was not published after complete session cleanup";
         return false;
     }
     return true;
@@ -10968,6 +14615,44 @@ static bool run_positive(const std::string& sudo_path,
 }  // namespace
 
 int main(int argc, char** argv) {
+    if (argc == 3 && strcmp(argv[2], "--canonical-cleanup-live-self-check") == 0) {
+        for (;;) pause();
+    }
+    if (argc == 2 && strcmp(argv[1], "--canonical-wait-strategy-self-check") == 0) {
+        std::string error;
+        if (!listener_failure_bound_self_check(error)) {
+            std::cerr << "FAIL [#377 canonical wait strategy self-check]: " << error << "\n";
+            return 1;
+        }
+        std::cerr << "PASS: #377 canonical wait strategy self-check\n";
+        return 0;
+    }
+    if (argc == 2 && strcmp(argv[1], "--canonical-target-cleanup-self-check") == 0) {
+        std::string error;
+        const CanonicalCleanupSelfCheckResult result =
+            canonical_target_cleanup_self_check(argv[0], error);
+        switch (result) {
+            case CanonicalCleanupSelfCheckResult::Pass:
+                std::cerr << "PASS: #377 canonical Target cleanup self-check\n";
+                return 0;
+            case CanonicalCleanupSelfCheckResult::Prerequisite:
+                std::cerr << "SKIP [#377 canonical Target cleanup self-check]: " << error << "\n";
+                return 77;
+            case CanonicalCleanupSelfCheckResult::Fail:
+                std::cerr << "FAIL [#377 canonical Target cleanup self-check]: " << error << "\n";
+                return 1;
+        }
+        return 1;
+    }
+    if (argc == 2 && strcmp(argv[1], "--wildcard-attempt-protocol-self-check") == 0) {
+        std::string error;
+        if (!wildcard_attempt_protocol_self_check(error)) {
+            std::cerr << "FAIL [#377 wildcard-attempt protocol self-check]: " << error << "\n";
+            return 1;
+        }
+        std::cerr << "PASS: #377 wildcard-attempt protocol self-check\n";
+        return 0;
+    }
     if (argc == 6 && strcmp(argv[1], "--fixture-broker-launcher") == 0)
         return launcher_main(argv[0], argv[2], argv[3], argv[4], argv[5]);
     if (argc == 6 && strcmp(argv[1], "--fixture-privileged-broker") == 0)
@@ -10976,7 +14661,9 @@ int main(int argc, char** argv) {
         return dropped_broker_main(argv[0], argv[2], argv[3], argv[4], argv[5], argv[6]);
     if (argc == 6 && strcmp(argv[1], "--fixture-privileged-target") == 0)
         return secured_target_main(argv[2], argv[3], argv[4], argv[5]);
-    if (argc != 2) {
+    const bool generated_differential =
+        argc == 3 && strcmp(argv[2], "--generated-nginx-differential") == 0;
+    if (argc != 2 && !generated_differential) {
         std::cerr << "usage: test_fixture_privileged_broker /canonical/path/to/rut\n";
         return 2;
     }
@@ -10998,7 +14685,8 @@ int main(int argc, char** argv) {
         !ancestry_probe_validation_self_check(error) ||
         !formal_authorization_policy_self_check(error) || !guard_protocol_self_check(error) ||
         !exact_transaction_self_check(error) || !exact_custody_ancillary_self_check(error) ||
-        !exact_adoption_fault_self_check(error)) {
+        !exact_adoption_fault_self_check(error) ||
+        !generated_differential_comparator_self_check(error)) {
         std::cerr << "FAIL [#358 Stage 2a3b protocol self-check]: " << error << "\n";
         return 1;
     }
@@ -11007,6 +14695,23 @@ int main(int argc, char** argv) {
                   << "\n";
         return required ? 1 : 77;
     }
+    if (generated_differential) {
+        const auto result =
+            run_generated_nginx_differential(sudo_path, nsenter_path, self.data(), rut_executable);
+        if (result.prerequisite_failure) {
+            std::cerr << (required ? "FAIL" : "SKIP")
+                      << " [#358 generated nginx/RUT differential prerequisites]: " << result.error
+                      << "\n";
+            return required ? 1 : 77;
+        }
+        if (!result.success) {
+            std::cerr << "FAIL [#358 generated nginx/RUT differential]: " << result.error << "\n";
+            return 1;
+        }
+        std::cerr << "PASS: #358 generated nginx/RUT assigned-listener 502 differential\n";
+        return 0;
+    }
+    GeneratedProxyObservation generated_observation;
     const auto result = rut::test::ipv4_topology::run_with_held_topology(
         HeldTopologyProbePolicy::SocketlessHostParent,
         [&](const HeldTopologySnapshot& topology, std::string& callback_error) {
@@ -11021,7 +14726,8 @@ int main(int argc, char** argv) {
                                 rut_executable,
                                 topology,
                                 required,
-                                callback_error);
+                                callback_error,
+                                generated_observation);
         });
     if (result.prerequisite_failure) {
         std::cerr << (required ? "FAIL" : "SKIP") << " [#358 Stage 2a3b topology]: " << result.error
@@ -11032,6 +14738,22 @@ int main(int argc, char** argv) {
         std::cerr << "FAIL [#358 Stage 2a3b broker]: " << result.error << "\n";
         return 1;
     }
+    std::cerr << "RUT-GENERATED-PROXY-OBSERVATION-v1 request_bytes="
+              << generated_observation.request_wire.size()
+              << " response_bytes=" << generated_observation.response_wire.size()
+              << " upstream_attempt_count=unobserved"
+              << " status=" << generated_observation.status
+              << " headers_exact=" << generated_observation.headers_exact
+              << " body_bytes=" << generated_observation.body_bytes
+              << " eof=" << generated_observation.eof << " upstream_absence_probe_refused="
+              << generated_observation.upstream_absence_probe_refused
+              << " guard_before_connect_error=" << generated_observation.guard_before_connect_error
+              << " guard_after_connect_error=" << generated_observation.guard_after_connect_error
+              << " child_pid=" << generated_observation.child_pid
+              << " child_start=" << generated_observation.child_start
+              << " listener_inode=" << generated_observation.listener_inode
+              << " cleanup_complete=" << generated_observation.cleanup_complete << "\n"
+              << generated_observation.request_wire << generated_observation.response_wire;
     std::cerr << "PASS: #358 Stage 2a3b authenticated sudo/nsenter broker lifecycle\n";
     return 0;
 }

@@ -1,4 +1,5 @@
 #include "deferred_preflight_fixture.h"
+#include "framing_selection_preflight_fixture.h"
 #include "rut/compiler/analyze.h"
 #include "rut/compiler/lexer.h"
 #include "rut/compiler/lower_rir.h"
@@ -1075,7 +1076,7 @@ TEST(frontend, lex_token_capacity_boundaries_are_exact) {
         const std::string source = make_ident_stream(767);
         auto result = lex({source.data(), static_cast<u32>(source.size())});
         REQUIRE(result);
-        CHECK_EQ(result->tokens.len, 768u);  // 767 identifiers + EOF
+        CHECK_EQ(result->tokens.len, 768u);  // retained former-boundary regression
         CHECK(result->tokens[767].type == TokenType::Eof);
         CHECK_EQ(result->tokens[767].start, static_cast<u32>(source.size()));
         CHECK_EQ(result->tokens[767].end, static_cast<u32>(source.size()));
@@ -1084,7 +1085,19 @@ TEST(frontend, lex_token_capacity_boundaries_are_exact) {
     }
 
     {
-        const std::string source = make_ident_stream(768);
+        const std::string source = make_ident_stream(931);
+        auto result = lex({source.data(), static_cast<u32>(source.size())});
+        REQUIRE(result);
+        CHECK_EQ(result->tokens.len, 932u);  // 931 identifiers + EOF
+        CHECK(result->tokens[931].type == TokenType::Eof);
+        CHECK_EQ(result->tokens[931].start, static_cast<u32>(source.size()));
+        CHECK_EQ(result->tokens[931].end, static_cast<u32>(source.size()));
+        CHECK_EQ(result->tokens[931].line, 1u);
+        CHECK_EQ(result->tokens[931].col, static_cast<u32>(source.size() + 1u));
+    }
+
+    {
+        const std::string source = make_ident_stream(932);
         auto result = lex({source.data(), static_cast<u32>(source.size())});
         REQUIRE(!result);
         CHECK_FALSE(result.has_value());
@@ -1096,16 +1109,16 @@ TEST(frontend, lex_token_capacity_boundaries_are_exact) {
     }
 
     {
-        const std::string source = make_ident_stream(769);
+        const std::string source = make_ident_stream(933);
         auto result = lex({source.data(), static_cast<u32>(source.size())});
         REQUIRE(!result);
         CHECK_FALSE(result.has_value());
         CHECK(result.error().code == FrontendError::TooManyTokens);
-        // The 769th one-character identifier starts after 768 "a " pairs.
-        CHECK_EQ(result.error().span.start, 1536u);
-        CHECK_EQ(result.error().span.end, 1537u);
+        // The 933rd one-character identifier starts after 932 "a " pairs.
+        CHECK_EQ(result.error().span.start, 1864u);
+        CHECK_EQ(result.error().span.end, 1865u);
         CHECK_EQ(result.error().span.line, 1u);
-        CHECK_EQ(result.error().span.col, 1537u);
+        CHECK_EQ(result.error().span.col, 1865u);
     }
 }
 
@@ -33063,6 +33076,348 @@ route GET "/" {
     }
 }
 
+TEST(frontend, request_policy_content_length_position_selects_id_after_complete_object) {
+    const char source[] = R"rut(
+upstream backend at "127.0.0.1:9000"
+route POST "/legacy" {
+    return forward(backend, request_policy: {
+        version: "HTTP/1.1", host: "upstream", connection: "omit",
+        strip_headers: ["Connection", "Keep-Alive", "TE", "Expect", "Upgrade"]
+    })
+}
+route POST "/after" {
+    return forward(backend, request_policy: {
+        content_length_position: "after_host", strip_headers: ["Connection", "Keep-Alive",
+            "TE", "Expect", "Upgrade"], connection: "omit", host: "upstream",
+        version: "HTTP/1.1"
+    })
+}
+)rut";
+    auto lexed = lex(lit(source));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    REQUIRE_EQ(ast->items.len, 3u);
+    CHECK_EQ(ast->items[1].route.statements[0]->forward_request_policy_id,
+             static_cast<u16>(RequestPolicyId::Http11FixedStrip));
+    CHECK_EQ(ast->items[2].route.statements[0]->forward_request_policy_id,
+             static_cast<u16>(RequestPolicyId::Http11FixedStripContentLengthAfterHost));
+
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    CHECK_EQ(hir->routes[0].control.direct_term.forward_request_policy_id,
+             static_cast<u16>(RequestPolicyId::Http11FixedStrip));
+    CHECK_EQ(hir->routes[1].control.direct_term.forward_request_policy_id,
+             static_cast<u16>(RequestPolicyId::Http11FixedStripContentLengthAfterHost));
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    CHECK_EQ(mir->functions[0].blocks[0].term.forward_request_policy_id,
+             static_cast<u16>(RequestPolicyId::Http11FixedStrip));
+    CHECK_EQ(mir->functions[1].blocks[0].term.forward_request_policy_id,
+             static_cast<u16>(RequestPolicyId::Http11FixedStripContentLengthAfterHost));
+
+    FrontendRirModule rir{};
+    REQUIRE(lower_to_rir(mir.value(), rir));
+    REQUIRE(rir::verify_module(rir.module).ok);
+    for (u32 i = 0; i < 2; i++) {
+        const auto* ret = find_first_op(rir.module.functions[i], rir::Opcode::RetForward);
+        REQUIRE(ret != nullptr);
+        REQUIRE_EQ(ret->operand_count, 2u);
+        const auto policy = ret->operand(1);
+        const auto& value = rir.module.functions[i].values[policy.id];
+        auto& constant = rir.module.functions[i].blocks[value.def_block.id].insts[value.def_inst];
+        REQUIRE_EQ(constant.op, rir::Opcode::ConstI32);
+        CHECK_EQ(constant.imm.i32_val, static_cast<i32>(i + 1));
+    }
+    CHECK(rir::verify_module(rir.module).ok);
+    rir.destroy();
+
+    const char* invalid[] = {
+        "upstream b\nroute POST \"/\" { return forward(b, request_policy: { version: "
+        "\"HTTP/1.1\", host: \"upstream\", connection: \"omit\", strip_headers: "
+        "[\"Connection\", \"Keep-Alive\", \"TE\", \"Expect\", \"Upgrade\"], "
+        "content_length_position: \"before_host\" }) }\n",
+        "upstream b\nroute POST \"/\" { return forward(b, request_policy: { version: "
+        "\"HTTP/1.1\", host: \"upstream\", connection: \"omit\", strip_headers: "
+        "[\"Connection\", \"Keep-Alive\", \"TE\", \"Expect\", \"Upgrade\"], "
+        "content_length_position: \"after_host\", content_length_position: "
+        "\"after_host\" }) }\n",
+    };
+    for (const char* bad : invalid) {
+        lexed = lex(lit(bad));
+        REQUIRE(lexed);
+        auto rejected = parse_file_heap(lexed.value());
+        CHECK_FALSE(rejected.has_value());
+    }
+
+    const char timeout[] = R"rut(
+upstream b
+route POST "/" {
+    return forward(b, request_policy: { version: "HTTP/1.1", host: "upstream",
+        connection: "omit", content_length_position: "after_host",
+        strip_headers: ["Connection", "Keep-Alive", "TE", "Expect", "Upgrade"] },
+        response_read_timeout: 1s)
+}
+)rut";
+    lexed = lex(lit(timeout));
+    REQUIRE(lexed);
+    auto timeout_ast = parse_file_heap(lexed.value());
+    REQUIRE(timeout_ast);
+    auto timeout_hir = analyze_file_heap(timeout_ast.value());
+    REQUIRE_FALSE(timeout_hir.has_value());
+    CHECK(timeout_hir.error().detail.eq(
+        lit("request policy is not admitted to response read timeout")));
+
+    CHECK(request_policy_is_supported(
+        static_cast<u16>(RequestPolicyId::Http11FixedStripContentLengthAfterHost)));
+    CHECK_FALSE(complete_content_length_request_policy_is_admitted(
+        static_cast<u16>(RequestPolicyId::Http11FixedStripContentLengthAfterHost)));
+    CHECK_FALSE(response_read_deadline_request_policy_is_admitted(
+        static_cast<u16>(RequestPolicyId::Http11FixedStripContentLengthAfterHost)));
+    CHECK(request_policy_is_supported(3));
+}
+
+TEST(frontend, retained_header_value_trim_sp_preserve_htab_is_get_timeout_only) {
+    static constexpr const char kPolicies[] = R"rut(
+        response_policy: { version: "HTTP/1.1", framing: "content_length",
+            connection: "request", server: "s", date: "current", hide_headers: [] },
+        failure_policy: { version: "HTTP/1.1", status: 502, reason: "Bad Gateway",
+            content_type: "text/plain", server: "s", date: "current",
+            connection: "request", body: b"bad" },
+        timeout_failure_policy: { version: "HTTP/1.1", status: 504,
+            reason: "Gateway Time-out", content_type: "text/plain", server: "s",
+            date: "current", connection: "request", body: b"slow" },
+        response_read_timeout: 60s, response_buffering: "complete_content_length")
+    )rut";
+    const std::string source = std::string("upstream b at \"127.0.0.1:9000\"\n") +
+                               "route GET \"/ok\" { return forward(b, "
+                               "request_policy: { version: \"HTTP/1.1\", host: \"upstream\", "
+                               "connection: \"omit\", strip_headers: [\"Connection\", "
+                               "\"Keep-Alive\", \"TE\", \"Expect\", \"Upgrade\"], "
+                               "retained_header_value: \"trim_sp_preserve_htab\" }, " +
+                               kPolicies + "}\n";
+    auto lexed = lex({source.data(), static_cast<u32>(source.size())});
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    REQUIRE_EQ(ast->items[1].route.statements[0]->forward_request_policy_id,
+               static_cast<u16>(RequestPolicyId::Http11FixedTrimSpPreserveHtab));
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    CHECK_EQ(hir->routes[0].method, kRouteMethodGet);
+    CHECK_EQ(hir->routes[0].control.direct_term.forward_request_policy_id,
+             static_cast<u16>(RequestPolicyId::Http11FixedTrimSpPreserveHtab));
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    CHECK_EQ(mir->functions[0].blocks[0].term.forward_request_policy_id,
+             static_cast<u16>(RequestPolicyId::Http11FixedTrimSpPreserveHtab));
+    FrontendRirModule rir{};
+    REQUIRE(lower_to_rir(mir.value(), rir));
+    REQUIRE(rir::verify_module(rir.module).ok);
+    REQUIRE_EQ(rir.module.policy_bundle_count, 1u);
+    CHECK_EQ(rir.module.policy_bundles[0].response_read_timeout_seconds, 60u);
+    CHECK_EQ(rir.module.policy_bundles[0].response_buffering,
+             ForwardResponseBufferingMode::CompleteContentLength);
+    const auto* ret = find_first_op(rir.module.functions[0], rir::Opcode::RetForwardBundle);
+    REQUIRE(ret != nullptr);
+    REQUIRE_EQ(ret->operand_count, 3u);
+    const auto policy = ret->operand(1);
+    const auto& value = rir.module.functions[0].values[policy.id];
+    auto& constant = rir.module.functions[0].blocks[value.def_block.id].insts[value.def_inst];
+    REQUIRE_EQ(constant.op, rir::Opcode::ConstI32);
+    CHECK_EQ(constant.imm.i32_val,
+             static_cast<i32>(RequestPolicyId::Http11FixedTrimSpPreserveHtab));
+    const auto bundle = ret->operand(2);
+    REQUIRE_LT(bundle.id, rir.module.functions[0].value_count);
+    const auto& bundle_value = rir.module.functions[0].values[bundle.id];
+    const auto& bundle_constant =
+        rir.module.functions[0].blocks[bundle_value.def_block.id].insts[bundle_value.def_inst];
+    REQUIRE_EQ(bundle_constant.op, rir::Opcode::ConstI32);
+    REQUIRE(bundle_constant.imm.i32_val > 0);
+    REQUIRE_LE(static_cast<u32>(bundle_constant.imm.i32_val), rir.module.policy_bundle_count);
+    CHECK_EQ(bundle_constant.imm.i32_val, 1);
+    const u32 bundle_index = static_cast<u32>(bundle_constant.imm.i32_val - 1);
+    u32 matching_bundle_count = 0;
+    u32 matching_bundle_index = 0;
+    for (u32 i = 0; i < rir.module.policy_bundle_count; ++i) {
+        const auto& candidate = rir.module.policy_bundles[i];
+        if (candidate.response_read_timeout_seconds != 60u ||
+            candidate.response_buffering != ForwardResponseBufferingMode::CompleteContentLength)
+            continue;
+        matching_bundle_index = i;
+        ++matching_bundle_count;
+    }
+    REQUIRE_EQ(matching_bundle_count, 1u);
+    CHECK_EQ(bundle_index, matching_bundle_index);
+    rir.destroy();
+
+    // The capability requires a valid response timeout; 60s is the public
+    // acceptance gate, not a compiler-only special value.
+    std::string one_second = source;
+    const auto public_timeout = one_second.find("response_read_timeout: 60s");
+    REQUIRE_NE(public_timeout, std::string::npos);
+    one_second.replace(
+        public_timeout, sizeof("response_read_timeout: 60s") - 1, "response_read_timeout: 1s");
+    auto one_second_lexed = lex({one_second.data(), static_cast<u32>(one_second.size())});
+    REQUIRE(one_second_lexed);
+    auto one_second_ast = parse_file_heap(one_second_lexed.value());
+    REQUIRE(one_second_ast);
+    REQUIRE(analyze_file_heap(one_second_ast.value()));
+
+    const auto expect_rejected = [&](std::string bad) {
+        auto bad_lexed = lex({bad.data(), static_cast<u32>(bad.size())});
+        REQUIRE(bad_lexed);
+        auto bad_ast = parse_file_heap(bad_lexed.value());
+        if (bad_ast) CHECK_FALSE(analyze_file_heap(bad_ast.value()).has_value());
+    };
+    std::string bad_method = source;
+    bad_method.replace(bad_method.find("route GET"), 9, "route POST");
+    expect_rejected(bad_method);
+    std::string missing_buffering = source;
+    const auto buffering =
+        missing_buffering.find("response_buffering: \"complete_content_length\"");
+    REQUIRE_NE(buffering, std::string::npos);
+    missing_buffering.erase(buffering,
+                            sizeof("response_buffering: \"complete_content_length\"") - 1);
+    expect_rejected(missing_buffering);
+    std::string after_host = source;
+    const auto retained = after_host.find("retained_header_value: \"trim_sp_preserve_htab\"");
+    REQUIRE_NE(retained, std::string::npos);
+    after_host.insert(retained, "content_length_position: \"after_host\", ");
+    expect_rejected(after_host);
+    std::string unknown = source;
+    const auto value_pos = unknown.find("trim_sp_preserve_htab");
+    REQUIRE_NE(value_pos, std::string::npos);
+    unknown.replace(value_pos, sizeof("trim_sp_preserve_htab") - 1, "unknown");
+    expect_rejected(unknown);
+}
+
+TEST(frontend, request_policy_after_host_admits_only_fixed_upload_head_timeout_profile) {
+    const auto source_for = [](const char* route) {
+        return std::string("upstream backend at \"127.0.0.1:9000\"\n") + route + R"rut( {
+    return forward(backend,
+        request_policy: { version: "HTTP/1.1", host: "upstream", connection: "omit",
+            content_length_position: "after_host",
+            strip_headers: ["Connection", "Keep-Alive", "TE", "Expect", "Upgrade"] },
+        response_policy: { version: "HTTP/1.1", framing: "content_length",
+            connection: "request", server: "s", date: "current",
+            head_mode: "suppress_body", hide_headers: [] },
+        failure_policy: { version: "HTTP/1.1", status: 502, reason: "Bad Gateway",
+            content_type: "text/plain", server: "s", date: "current",
+            connection: "request", head_mode: "suppress_body", body: b"bad" },
+        timeout_failure_policy: { version: "HTTP/1.1", status: 504,
+            reason: "Gateway Time-out", content_type: "text/plain", server: "s",
+            date: "current", connection: "request", head_mode: "suppress_body", body: b"slow" },
+        response_read_timeout: 1s)
+}
+)rut";
+    };
+    constexpr auto kPolicy = RequestPolicyId::Http11FixedStripContentLengthAfterHost;
+
+    for (const auto& test : {
+             std::pair<const char*, u8>{"route HEAD \"/one\"", kRouteMethodHead},
+             std::pair<const char*, u8>{"route \"/one\"", kRouteMethodAny},
+         }) {
+        const std::string source = source_for(test.first);
+        auto lexed = lex({source.data(), static_cast<u32>(source.size())});
+        REQUIRE(lexed);
+        auto ast = parse_file_heap(lexed.value());
+        REQUIRE(ast);
+        auto hir = analyze_file_heap(ast.value());
+        REQUIRE(hir);
+        CHECK_EQ(hir->routes[0].method, test.second);
+        CHECK_EQ(hir->routes[0].forward_preflight_mode, ForwardPreflightMode::EagerDirect);
+        CHECK_EQ(hir->routes[0].control.direct_term.forward_request_policy_id,
+                 static_cast<u16>(kPolicy));
+        auto mir = build_mir_heap(hir.value());
+        REQUIRE(mir);
+        CHECK_EQ(mir->functions[0].method, test.second);
+        CHECK_EQ(mir->functions[0].forward_preflight_mode, ForwardPreflightMode::EagerDirect);
+        CHECK_EQ(mir->functions[0].blocks[0].term.forward_request_policy_id,
+                 static_cast<u16>(kPolicy));
+        FrontendRirModule rir{};
+        REQUIRE(lower_to_rir(mir.value(), rir));
+        REQUIRE(rir::verify_module(rir.module).ok);
+        CHECK_EQ(rir.module.functions[0].http_method, test.second);
+        CHECK_EQ(rir.module.functions[0].forward_preflight_mode, ForwardPreflightMode::EagerDirect);
+        CHECK_EQ(rir.module.policy_bundles[0].response_buffering,
+                 ForwardResponseBufferingMode::None);
+        rir.destroy();
+    }
+
+    for (const char* rejected_route : {"route POST \"/one\"", "route GET \"/one\""}) {
+        const std::string source = source_for(rejected_route);
+        auto lexed = lex({source.data(), static_cast<u32>(source.size())});
+        REQUIRE(lexed);
+        auto ast = parse_file_heap(lexed.value());
+        REQUIRE(ast);
+        CHECK_FALSE(analyze_file_heap(ast.value()).has_value());
+    }
+    {
+        std::string source = source_for("route HEAD \"/one\"");
+        const auto timeout = source.find("response_read_timeout: 1s");
+        REQUIRE_NE(timeout, std::string::npos);
+        source.insert(timeout, "response_buffering: \"complete_content_length\",\n        ");
+        auto lexed = lex({source.data(), static_cast<u32>(source.size())});
+        REQUIRE(lexed);
+        auto ast = parse_file_heap(lexed.value());
+        REQUIRE(ast);
+        CHECK_FALSE(analyze_file_heap(ast.value()).has_value());
+    }
+
+    const std::string source = source_for("route HEAD \"/one\"");
+    auto lexed = lex({source.data(), static_cast<u32>(source.size())});
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    hir->routes[0].method = kRouteMethodPost;
+    CHECK_FALSE(build_mir_heap(hir.value()).has_value());
+    hir->routes[0].method = kRouteMethodHead;
+    hir->response_policies[0].head_mode = ResponsePolicyHeadMode::Reject;
+    CHECK_FALSE(build_mir_heap(hir.value()).has_value());
+    hir->response_policies[0].head_mode = ResponsePolicyHeadMode::SuppressBody;
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    mir->functions[0].method = kRouteMethodPost;
+    FrontendRirModule rejected{};
+    CHECK_FALSE(lower_to_rir(mir.value(), rejected).has_value());
+    mir->functions[0].method = kRouteMethodHead;
+    mir->functions[0].blocks[0].term.forward_request_policy_id = 3;
+    CHECK_FALSE(lower_to_rir(mir.value(), rejected).has_value());
+    mir->functions[0].blocks[0].term.forward_request_policy_id = static_cast<u16>(kPolicy);
+    FrontendRirModule rir{};
+    REQUIRE(lower_to_rir(mir.value(), rir));
+    REQUIRE(rir::verify_module(rir.module).ok);
+    auto& fn = rir.module.functions[0];
+    auto* ret = find_first_op(fn, rir::Opcode::RetForwardBundle);
+    REQUIRE(ret != nullptr);
+    const auto request_policy_value = ret->operand(1);
+    const auto& request_policy_def = fn.values[request_policy_value.id];
+    auto& request_policy_const =
+        fn.blocks[request_policy_def.def_block.id].insts[request_policy_def.def_inst];
+    REQUIRE_EQ(request_policy_const.op, rir::Opcode::ConstI32);
+    fn.http_method = kRouteMethodPost;
+    CHECK_FALSE(rir::verify_module(rir.module).ok);
+    fn.http_method = kRouteMethodHead;
+    request_policy_const.imm.i32_val = 3;
+    CHECK_FALSE(rir::verify_module(rir.module).ok);
+    request_policy_const.imm.i32_val = static_cast<i32>(kPolicy);
+    rir.module.response_policies[0].head_mode = ResponsePolicyHeadMode::Reject;
+    CHECK_FALSE(rir::verify_module(rir.module).ok);
+    rir.module.response_policies[0].head_mode = ResponsePolicyHeadMode::SuppressBody;
+    CHECK(rir::verify_module(rir.module).ok);
+    rir.destroy();
+
+    CHECK(fixed_upload_head_request_policy_is_admitted(
+        static_cast<u16>(RequestPolicyId::Http11FixedStrip)));
+    CHECK(fixed_upload_head_request_policy_is_admitted(static_cast<u16>(kPolicy)));
+    CHECK_FALSE(fixed_upload_head_request_policy_is_admitted(0));
+    CHECK_FALSE(fixed_upload_head_request_policy_is_admitted(3));
+    CHECK_FALSE(response_read_deadline_request_policy_is_admitted(static_cast<u16>(kPolicy)));
+}
+
 TEST(frontend, request_policy_rejects_response_mutation_combination) {
     const char* src = R"rut(
 upstream backend at "127.0.0.1:9000"
@@ -34293,6 +34648,7 @@ TEST(frontend, response_read_timeout_rejects_forged_mir_and_rir_preflight_mismat
     for (const ForwardPreflightMode forged_mode : {
              ForwardPreflightMode::None,
              ForwardPreflightMode::AfterCanonicalSelection,
+             ForwardPreflightMode::AfterRequestFramingSelection,
              static_cast<ForwardPreflightMode>(0xff),
          }) {
         hir->routes[0].forward_preflight_mode = forged_mode;
@@ -34309,6 +34665,7 @@ TEST(frontend, response_read_timeout_rejects_forged_mir_and_rir_preflight_mismat
     for (const ForwardPreflightMode forged_mode : {
              ForwardPreflightMode::None,
              ForwardPreflightMode::AfterCanonicalSelection,
+             ForwardPreflightMode::AfterRequestFramingSelection,
              static_cast<ForwardPreflightMode>(0xff),
          }) {
         mir->functions[0].forward_preflight_mode = forged_mode;
@@ -34339,6 +34696,8 @@ TEST(frontend, response_read_timeout_rejects_forged_mir_and_rir_preflight_mismat
     CHECK_FALSE(rir::verify_module(rir.module).ok);
     fn.forward_preflight_mode = ForwardPreflightMode::AfterCanonicalSelection;
     fn.preflight_forward_policy_bundle_id = 1;
+    CHECK_FALSE(rir::verify_module(rir.module).ok);
+    fn.forward_preflight_mode = ForwardPreflightMode::AfterRequestFramingSelection;
     CHECK_FALSE(rir::verify_module(rir.module).ok);
     fn.forward_preflight_mode = static_cast<ForwardPreflightMode>(0xff);
     CHECK_FALSE(rir::verify_module(rir.module).ok);
@@ -37811,6 +38170,180 @@ TEST(frontend, deferred_forward_preflight_rejects_alternate_source_conditions) {
         REQUIRE_FALSE(hir.has_value());
         CHECK_EQ(hir.error().code, FrontendError::UnsupportedSyntax);
     }
+}
+
+TEST(frontend, request_framing_selection_preflight_is_exact_and_verified_at_each_boundary) {
+    for (const char* method : {"GET", "POST", ""}) {
+        std::string rejected_source(kFramingSelectionPreflightSource);
+        const auto pos = rejected_source.find("route HEAD");
+        REQUIRE_NE(pos, std::string::npos);
+        rejected_source.replace(pos, 10, std::string("route ") + method);
+        auto rejected_lexed =
+            lex({rejected_source.data(), static_cast<u32>(rejected_source.size())});
+        REQUIRE(rejected_lexed);
+        auto rejected_ast = parse_file_heap(rejected_lexed.value());
+        REQUIRE(rejected_ast);
+        CHECK_FALSE(analyze_file_heap(rejected_ast.value()).has_value());
+    }
+    auto lexed = lex(lit(kFramingSelectionPreflightSource));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    REQUIRE_EQ(hir->routes.len, 1u);
+    auto& route = hir->routes[0];
+    CHECK_EQ(route.method, kRouteMethodHead);
+    CHECK_EQ(route.forward_preflight_mode, ForwardPreflightMode::AfterRequestFramingSelection);
+    REQUIRE_EQ(route.control.kind, HirControlKind::If);
+    CHECK_EQ(route.control.cond.kind, HirExprKind::ReqHasContentLength);
+    CHECK_EQ(route.control.then_term.forward_request_policy_id,
+             static_cast<u16>(RequestPolicyId::Http11FixedStripContentLengthAfterHost));
+    CHECK_EQ(route.control.else_term.forward_request_policy_id,
+             static_cast<u16>(RequestPolicyId::Http11FixedStrip));
+
+    auto expect_hir_rejection = [&]() { CHECK_FALSE(build_mir_heap(hir.value()).has_value()); };
+    route.control.cond.kind = HirExprKind::ReqChunked;
+    expect_hir_rejection();
+    route.control.cond.kind = HirExprKind::ReqHasContentLength;
+    route.method = kRouteMethodAny;
+    expect_hir_rejection();
+    route.method = kRouteMethodHead;
+    route.control.then_term.forward_request_policy_id =
+        static_cast<u16>(RequestPolicyId::Http11FixedStrip);
+    expect_hir_rejection();
+    route.control.then_term.forward_request_policy_id =
+        static_cast<u16>(RequestPolicyId::Http11FixedStripContentLengthAfterHost);
+    route.control.else_term.upstream_index = 1;
+    expect_hir_rejection();
+    route.control.else_term.upstream_index = route.control.then_term.upstream_index;
+
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    auto& mf = mir->functions[0];
+    CHECK_EQ(mf.forward_preflight_mode, ForwardPreflightMode::AfterRequestFramingSelection);
+    REQUIRE_EQ(mf.blocks.len, 3u);
+    CHECK_EQ(mf.blocks[0].term.cond.kind, MirValueKind::ReqHasContentLength);
+    CHECK_EQ(mf.blocks[1].term.forward_request_policy_id,
+             static_cast<u16>(RequestPolicyId::Http11FixedStripContentLengthAfterHost));
+    CHECK_EQ(mf.blocks[2].term.forward_request_policy_id,
+             static_cast<u16>(RequestPolicyId::Http11FixedStrip));
+
+    auto expect_mir_rejection = [&]() {
+        FrontendRirModule rejected{};
+        CHECK_FALSE(lower_to_rir(mir.value(), rejected).has_value());
+    };
+    mf.blocks[0].term.then_block = 2;
+    expect_mir_rejection();
+    mf.blocks[0].term.then_block = 1;
+    mf.blocks[0].effects.len = 1;
+    expect_mir_rejection();
+    mf.blocks[0].effects.len = 0;
+    mf.blocks[2].term.forward_response_buffering =
+        ForwardResponseBufferingMode::CompleteContentLength;
+    expect_mir_rejection();
+    mf.blocks[2].term.forward_response_buffering = ForwardResponseBufferingMode::None;
+    mf.blocks[2].term.forward_response_read_timeout_seconds = 2;
+    expect_mir_rejection();
+    mf.blocks[2].term.forward_response_read_timeout_seconds = 1;
+
+    FrontendRirModule lowered{};
+    REQUIRE(lower_to_rir(mir.value(), lowered));
+    REQUIRE(rir::verify_module(lowered.module).ok);
+    auto& fn = lowered.module.functions[0];
+    CHECK_EQ(fn.forward_preflight_mode, ForwardPreflightMode::AfterRequestFramingSelection);
+    CHECK_EQ(fn.preflight_forward_policy_bundle_id, 1u);
+    REQUIRE_EQ(lowered.module.policy_bundle_count, 1u);
+    REQUIRE_EQ(fn.block_count, 3u);
+    CHECK_EQ(fn.blocks[0].insts[0].op, rir::Opcode::ReqHasContentLength);
+    CHECK_EQ(fn.blocks[0].insts[1].op, rir::Opcode::Br);
+    CHECK_EQ(fn.blocks[1].insts[3].op, rir::Opcode::RetForwardBundle);
+    CHECK_EQ(fn.blocks[2].insts[3].op, rir::Opcode::RetForwardBundle);
+
+    auto expect_rir_rejection = [&]() {
+        const auto verified = rir::verify_module(lowered.module);
+        CHECK_FALSE(verified.ok);
+        CHECK_EQ(verified.issue.code, rir::VerifyIssueCode::InvalidForwardPreflight);
+    };
+    fn.blocks[0].insts[1].imm.block_targets[0].id = 2;
+    expect_rir_rejection();
+    fn.blocks[0].insts[1].imm.block_targets[0].id = 1;
+    fn.blocks[0].insts[0].op = rir::Opcode::ReqChunked;
+    expect_rir_rejection();
+    fn.blocks[0].insts[0].op = rir::Opcode::ReqHasContentLength;
+    fn.http_method = kRouteMethodAny;
+    expect_rir_rejection();
+    fn.http_method = kRouteMethodHead;
+    fn.blocks[2].insts[2].imm.i32_val = 2;
+    expect_rir_rejection();
+    fn.blocks[2].insts[2].imm.i32_val = 1;
+    CHECK(rir::verify_module(lowered.module).ok);
+
+    char printed[4096]{};
+    rir::PrintBuf print_buf;
+    print_buf.init(printed, sizeof(printed), -1);
+    rir::print_module(print_buf, lowered.module);
+    CHECK_FALSE(print_buf.overflow);
+    CHECK(std::string(printed, print_buf.len)
+              .find("forward_preflight: after_request_framing_selection bundle=1") !=
+          std::string::npos);
+    lowered.destroy();
+}
+
+TEST(frontend, complete_content_length_request_framing_selection_is_get_id1_then_id3) {
+    auto lexed = lex(lit(kCompleteContentLengthFramingSelectionSource));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    REQUIRE_EQ(hir->routes.len, 1u);
+    auto& route = hir->routes[0];
+    CHECK_EQ(route.method, kRouteMethodGet);
+    CHECK_EQ(route.forward_preflight_mode, ForwardPreflightMode::AfterRequestFramingSelection);
+    CHECK_EQ(route.control.cond.kind, HirExprKind::ReqHasContentLength);
+    CHECK_EQ(route.control.then_term.forward_request_policy_id,
+             static_cast<u16>(RequestPolicyId::Http11FixedStrip));
+    CHECK_EQ(route.control.else_term.forward_request_policy_id,
+             static_cast<u16>(RequestPolicyId::Http11FixedTrimSpPreserveHtab));
+    CHECK_EQ(route.control.then_term.forward_response_buffering,
+             ForwardResponseBufferingMode::CompleteContentLength);
+    CHECK_EQ(route.control.else_term.forward_response_buffering,
+             ForwardResponseBufferingMode::CompleteContentLength);
+
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    REQUIRE_EQ(mir->functions[0].blocks.len, 3u);
+    CHECK_EQ(mir->functions[0].blocks[1].term.forward_request_policy_id,
+             static_cast<u16>(RequestPolicyId::Http11FixedStrip));
+    CHECK_EQ(mir->functions[0].blocks[2].term.forward_request_policy_id,
+             static_cast<u16>(RequestPolicyId::Http11FixedTrimSpPreserveHtab));
+
+    FrontendRirModule lowered{};
+    REQUIRE(lower_to_rir(mir.value(), lowered));
+    REQUIRE(rir::verify_module(lowered.module).ok);
+    const auto& fn = lowered.module.functions[0];
+    CHECK_EQ(fn.forward_preflight_mode, ForwardPreflightMode::AfterRequestFramingSelection);
+    CHECK_EQ(fn.preflight_forward_policy_bundle_id, 1u);
+    REQUIRE_EQ(fn.block_count, 3u);
+    CHECK_EQ(fn.blocks[0].insts[0].op, rir::Opcode::ReqHasContentLength);
+    CHECK_EQ(fn.blocks[1].insts[1].imm.i32_val,
+             static_cast<i32>(RequestPolicyId::Http11FixedStrip));
+    CHECK_EQ(fn.blocks[2].insts[1].imm.i32_val,
+             static_cast<i32>(RequestPolicyId::Http11FixedTrimSpPreserveHtab));
+    CHECK_EQ(lowered.module.policy_bundles[0].response_read_timeout_seconds, 60u);
+    CHECK_EQ(lowered.module.policy_bundles[0].response_buffering,
+             ForwardResponseBufferingMode::CompleteContentLength);
+
+    auto& forged = mir->functions[0];
+    const auto saved_policy = forged.blocks[2].term.forward_request_policy_id;
+    forged.blocks[2].term.forward_request_policy_id =
+        static_cast<u16>(RequestPolicyId::Http11FixedStrip);
+    FrontendRirModule rejected{};
+    CHECK_FALSE(lower_to_rir(mir.value(), rejected).has_value());
+    forged.blocks[2].term.forward_request_policy_id = saved_policy;
+    CHECK(rir::verify_module(lowered.module).ok);
+    lowered.destroy();
 }
 
 int main(int argc, char** argv) {

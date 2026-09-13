@@ -1142,7 +1142,9 @@ inline VerifyResult verify_module_impl(const Module& mod,
         const bool eager_preflight = preflight_mode == ForwardPreflightMode::EagerDirect;
         const bool deferred_preflight =
             preflight_mode == ForwardPreflightMode::AfterCanonicalSelection;
-        const bool has_preflight = eager_preflight || deferred_preflight;
+        const bool framing_preflight =
+            preflight_mode == ForwardPreflightMode::AfterRequestFramingSelection;
+        const bool has_preflight = eager_preflight || deferred_preflight || framing_preflight;
         if (has_preflight &&
             (preflight_id > mod.policy_bundle_count ||
              !response_read_timeout_seconds_valid(
@@ -1151,6 +1153,7 @@ inline VerifyResult verify_module_impl(const Module& mod,
 
         const Instruction* sole_timeout_ret = nullptr;
         u32 sole_timeout_block = 0;
+        u32 timeout_ret_count = 0;
         auto const_i32 = [&](ValueId id, i32* out) {
             if (out == nullptr || id == kNoValue || id.id >= fn.value_count || fn.values == nullptr)
                 return false;
@@ -1194,16 +1197,47 @@ inline VerifyResult verify_module_impl(const Module& mod,
                 const bool duration = response_read_timeout_seconds_valid(
                     mod.policy_bundles[bundle_id - 1].response_read_timeout_seconds);
                 if (!duration) continue;
-                const auto buffering = mod.policy_bundles[bundle_id - 1].response_buffering;
+                const auto& policy_bundle = mod.policy_bundles[bundle_id - 1];
+                const bool fixed_upload_head_policy =
+                    policy_bundle.response_buffering == ForwardResponseBufferingMode::None &&
+                    fixed_upload_head_route_method_is_admitted(fn.http_method) &&
+                    fixed_upload_head_request_policy_is_admitted(
+                        static_cast<u16>(request_policy)) &&
+                    policy_bundle.response_policy_id != 0 &&
+                    policy_bundle.response_policy_id <= mod.response_policy_count &&
+                    policy_bundle.failure_policy_id != 0 &&
+                    policy_bundle.failure_policy_id <= mod.failure_policy_count &&
+                    policy_bundle.timeout_failure_policy_id != 0 &&
+                    policy_bundle.timeout_failure_policy_id <= mod.failure_policy_count &&
+                    fixed_upload_head_timeout_policies_valid(
+                        mod.response_policies[policy_bundle.response_policy_id - 1],
+                        mod.failure_policies[policy_bundle.failure_policy_id - 1],
+                        mod.failure_policies[policy_bundle.timeout_failure_policy_id - 1]);
+                if (!response_read_deadline_request_policy_is_admitted(
+                        static_cast<u16>(request_policy)) &&
+                    !fixed_upload_head_policy &&
+                    !(policy_bundle.response_buffering ==
+                          ForwardResponseBufferingMode::CompleteContentLength &&
+                      fn.http_method == kRouteMethodGet &&
+                      static_cast<u16>(request_policy) ==
+                          static_cast<u16>(RequestPolicyId::Http11FixedTrimSpPreserveHtab)))
+                    return verify_fail(
+                        summary, VerifyIssueCode::InvalidForwardPreflight, fi, bi, ii);
+                const auto buffering = policy_bundle.response_buffering;
+                const bool complete_policy =
+                    complete_content_length_request_policy_is_admitted(
+                        static_cast<u16>(request_policy)) ||
+                    (fn.http_method == kRouteMethodGet &&
+                     static_cast<u16>(request_policy) ==
+                         static_cast<u16>(RequestPolicyId::Http11FixedTrimSpPreserveHtab));
                 if (buffering != ForwardResponseBufferingMode::None &&
                     (buffering != ForwardResponseBufferingMode::CompleteContentLength ||
                      !complete_content_length_route_method_is_admitted(fn.http_method) ||
-                     request_policy < 0 || request_policy > 0xffff ||
-                     !complete_content_length_request_policy_is_admitted(
-                         static_cast<u16>(request_policy))))
+                     request_policy < 0 || request_policy > 0xffff || !complete_policy))
                     return verify_fail(
                         summary, VerifyIssueCode::InvalidForwardPreflight, fi, bi, ii);
-                if (sole_timeout_ret != nullptr || !has_preflight || bundle_id != preflight_id)
+                if (!has_preflight || bundle_id != preflight_id ||
+                    (sole_timeout_ret != nullptr && !framing_preflight))
                     return verify_fail(summary,
                                        VerifyIssueCode::InvalidForwardPreflight,
                                        fi,
@@ -1212,12 +1246,13 @@ inline VerifyResult verify_module_impl(const Module& mod,
                                        static_cast<u32>(bundle_id));
                 sole_timeout_ret = &inst;
                 sole_timeout_block = bi;
+                timeout_ret_count++;
             }
         }
         if (eager_preflight) {
-            if (sole_timeout_ret == nullptr || fn.is_timer || fn.block_count != 1 ||
-                sole_timeout_block != 0 || fn.blocks == nullptr || fn.blocks[0].inst_count < 4 ||
-                fn.yield_count != 0 || fn.state_zero_enters_entry ||
+            if (sole_timeout_ret == nullptr || timeout_ret_count != 1 || fn.is_timer ||
+                fn.block_count != 1 || sole_timeout_block != 0 || fn.blocks == nullptr ||
+                fn.blocks[0].inst_count < 4 || fn.yield_count != 0 || fn.state_zero_enters_entry ||
                 fn.has_explicit_resume_blocks || fn.rate_limit.count != 0 ||
                 fn.throttle_down_bps != 0)
                 return verify_fail(summary, VerifyIssueCode::InvalidForwardPreflight, fi);
@@ -1230,8 +1265,109 @@ inline VerifyResult verify_module_impl(const Module& mod,
             if (&block.insts[block.inst_count - 1] != sole_timeout_ret)
                 return verify_fail(summary, VerifyIssueCode::InvalidForwardPreflight, fi);
         }
+        if (framing_preflight) {
+            const bool head_framing = fn.http_method == kRouteMethodHead;
+            const bool get_framing = fn.http_method == kRouteMethodGet;
+            if (timeout_ret_count != 2 || fn.is_timer || (!head_framing && !get_framing) ||
+                fn.block_count != 3 || fn.blocks == nullptr || fn.values == nullptr ||
+                fn.block_cap < fn.block_count || fn.value_count != 7 ||
+                fn.value_cap < fn.value_count || fn.yield_count != 0 ||
+                fn.state_zero_enters_entry || fn.has_explicit_resume_blocks ||
+                fn.rate_limit.count != 0 || fn.throttle_down_bps != 0)
+                return verify_fail(summary, VerifyIssueCode::InvalidForwardPreflight, fi);
+            const Block& entry = fn.blocks[0];
+            const Block& then_block = fn.blocks[1];
+            const Block& else_block = fn.blocks[2];
+            if (entry.id.id != 0 || then_block.id.id != 1 || else_block.id.id != 2 ||
+                entry.insts == nullptr || then_block.insts == nullptr ||
+                else_block.insts == nullptr || entry.inst_count != 2 ||
+                then_block.inst_count != 4 || else_block.inst_count != 4)
+                return verify_fail(summary, VerifyIssueCode::InvalidForwardPreflight, fi);
+            auto exact_result = [&](const Instruction& inst, u32 block_id, u32 inst_id) {
+                return inst.result != kNoValue && inst.result.id < fn.value_count &&
+                       fn.values[inst.result.id].def_block.id == block_id &&
+                       fn.values[inst.result.id].def_inst == inst_id;
+            };
+            auto exact_primitive_result =
+                [&](const Instruction& inst, u32 block_id, u32 inst_id, TypeKind kind) {
+                    if (!exact_result(inst, block_id, inst_id)) return false;
+                    const Type* type = fn.values[inst.result.id].type;
+                    return type != nullptr && type->kind == kind && type->inner == nullptr &&
+                           type->struct_def == nullptr;
+                };
+            const Instruction& has_content_length = entry.insts[0];
+            const Instruction& branch = entry.insts[1];
+            const bool entry_shape =
+                has_content_length.op == Opcode::ReqHasContentLength &&
+                has_content_length.operand_count == 0 && exact_result(has_content_length, 0, 0) &&
+                branch.op == Opcode::Br && branch.result == kNoValue && branch.operand_count == 1 &&
+                branch.operand(0).id == has_content_length.result.id &&
+                branch.imm.block_targets[0].id == 1 && branch.imm.block_targets[1].id == 2 &&
+                exact_primitive_result(has_content_length, 0, 0, TypeKind::Bool);
+            auto exact_forward = [&](const Block& block,
+                                     RequestPolicyId expected_policy,
+                                     ForwardResponseBufferingMode expected_buffering) {
+                const Instruction& upstream = block.insts[0];
+                const Instruction& request_policy = block.insts[1];
+                const Instruction& bundle = block.insts[2];
+                const Instruction& forward = block.insts[3];
+                return upstream.op == Opcode::ConstI32 && upstream.operand_count == 0 &&
+                       exact_primitive_result(upstream, block.id.id, 0, TypeKind::I32) &&
+                       upstream.imm.i32_val >= 0 &&
+                       static_cast<u64>(upstream.imm.i32_val) < mod.upstream_count &&
+                       request_policy.op == Opcode::ConstI32 && request_policy.operand_count == 0 &&
+                       exact_primitive_result(request_policy, block.id.id, 1, TypeKind::I32) &&
+                       request_policy.imm.i32_val == static_cast<i32>(expected_policy) &&
+                       bundle.op == Opcode::ConstI32 && bundle.operand_count == 0 &&
+                       exact_primitive_result(bundle, block.id.id, 2, TypeKind::I32) &&
+                       bundle.imm.i32_val == preflight_id &&
+                       forward.op == Opcode::RetForwardBundle && forward.result == kNoValue &&
+                       forward.operand_count == 3 && forward.operand(0).id == upstream.result.id &&
+                       forward.operand(1).id == request_policy.result.id &&
+                       forward.operand(2).id == bundle.result.id &&
+                       mod.policy_bundles[preflight_id - 1].response_buffering ==
+                           expected_buffering &&
+                       (expected_buffering == ForwardResponseBufferingMode::None ||
+                        (get_framing &&
+                         mod.policy_bundles[preflight_id - 1].response_policy_id != 0 &&
+                         mod.policy_bundles[preflight_id - 1].failure_policy_id != 0 &&
+                         mod.policy_bundles[preflight_id - 1].timeout_failure_policy_id != 0 &&
+                         complete_content_length_buffering_policies_valid(
+                             mod.response_policies
+                                 [mod.policy_bundles[preflight_id - 1].response_policy_id - 1],
+                             mod.failure_policies
+                                 [mod.policy_bundles[preflight_id - 1].failure_policy_id - 1],
+                             mod.failure_policies[mod.policy_bundles[preflight_id - 1]
+                                                      .timeout_failure_policy_id -
+                                                  1])));
+            };
+            const bool exact_head =
+                head_framing &&
+                exact_forward(then_block,
+                              RequestPolicyId::Http11FixedStripContentLengthAfterHost,
+                              ForwardResponseBufferingMode::None) &&
+                exact_forward(else_block,
+                              RequestPolicyId::Http11FixedStrip,
+                              ForwardResponseBufferingMode::None);
+            const bool exact_get =
+                get_framing &&
+                exact_forward(then_block,
+                              RequestPolicyId::Http11FixedStrip,
+                              ForwardResponseBufferingMode::CompleteContentLength) &&
+                exact_forward(else_block,
+                              RequestPolicyId::Http11FixedTrimSpPreserveHtab,
+                              ForwardResponseBufferingMode::CompleteContentLength);
+            if (!entry_shape || (!exact_head && !exact_get) ||
+                then_block.insts[0].imm.i32_val != else_block.insts[0].imm.i32_val ||
+                (get_framing && mod.policy_bundles[preflight_id - 1].response_buffering !=
+                                    ForwardResponseBufferingMode::CompleteContentLength) ||
+                (head_framing && mod.policy_bundles[preflight_id - 1].response_buffering !=
+                                     ForwardResponseBufferingMode::None))
+                return verify_fail(summary, VerifyIssueCode::InvalidForwardPreflight, fi);
+        }
         if (deferred_preflight) {
-            if (sole_timeout_ret == nullptr || fn.is_timer || fn.http_method == kRouteMethodAny ||
+            if (sole_timeout_ret == nullptr || timeout_ret_count != 1 || fn.is_timer ||
+                fn.http_method == kRouteMethodAny ||
                 !complete_content_length_route_method_is_admitted(fn.http_method) ||
                 fn.block_count != 3 || fn.blocks == nullptr || fn.values == nullptr ||
                 fn.block_cap < fn.block_count || fn.value_count != 6 ||
@@ -1297,8 +1433,11 @@ inline VerifyResult verify_module_impl(const Module& mod,
                 request_policy.op == Opcode::ConstI32 && request_policy.operand_count == 0 &&
                 exact_result(request_policy, 2, 1) && request_policy.imm.i32_val >= 0 &&
                 request_policy.imm.i32_val <= 0xffff &&
-                complete_content_length_request_policy_is_admitted(
-                    static_cast<u16>(request_policy.imm.i32_val)) &&
+                (complete_content_length_request_policy_is_admitted(
+                     static_cast<u16>(request_policy.imm.i32_val)) ||
+                 (fn.http_method == kRouteMethodGet &&
+                  static_cast<u16>(request_policy.imm.i32_val) ==
+                      static_cast<u16>(RequestPolicyId::Http11FixedTrimSpPreserveHtab))) &&
                 bundle.op == Opcode::ConstI32 && bundle.operand_count == 0 &&
                 exact_result(bundle, 2, 2) && bundle.imm.i32_val == preflight_id &&
                 forward.op == Opcode::RetForwardBundle && forward.result == kNoValue &&

@@ -262,6 +262,170 @@ bool proxy_hide_header_has_inventory(const ProxyHideHeader& header) {
            !is_default_span(header.name_span) || !is_default_span(header.span);
 }
 
+bool proxy_buffering_has_inventory(const ProxyBuffering& buffering) {
+    return buffering.present || !is_default_span(buffering.span) ||
+           !is_default_span(buffering.value_span) || buffering.value != ProxyBufferingValue::On;
+}
+
+FrontendResult<bool> validate_proxy_buffering(const Server& server) {
+    const ProxyBuffering& buffering = server.location.proxy_buffering;
+    const bool metadata = proxy_buffering_has_inventory(buffering);
+    const Listen& listener = server.listen;
+    if (is_default_span(listener.value_span)) {
+        if (metadata)
+            return unsupported(model_span(server),
+                               lit_str("invalid proxy_buffering source provenance"));
+        return false;
+    }
+    const uintptr_t listener_address = reinterpret_cast<uintptr_t>(listener.value.ptr);
+    if (listener.value.ptr == nullptr || listener_address < listener.value_span.start)
+        return unsupported(model_span(server),
+                           lit_str("invalid proxy_buffering source provenance"));
+    const uintptr_t source_base = listener_address - listener.value_span.start;
+    const Location& location = server.location;
+    if (server.span.end < server.span.start || !span_contains(server.span, location.span) ||
+        (metadata && (!span_contains(server.span, buffering.span) ||
+                      !span_contains(server.span, buffering.value_span))))
+        return unsupported(model_span(server), lit_str("invalid proxy_buffering source bounds"));
+    if (source_base > UINTPTR_MAX - server.span.end ||
+        !source_borrow_is_coherent(listener.value, listener.value_span, source_base) ||
+        !source_borrow_is_coherent(location.path, location.path_span, source_base) ||
+        !span_position_is_coherent(server.span, location.span) ||
+        !span_position_is_coherent(server.span, location.path_span))
+        return unsupported(model_span(server), lit_str("invalid proxy_buffering source bounds"));
+
+    const u32 source_len = server.span.end - server.span.start;
+    const Str server_source{trusted_source_at(source_base, server.span.start), source_len};
+    auto reparsed = parse(server_source);
+    if (!reparsed)
+        return unsupported(server.span, lit_str("invalid proxy_buffering source inventory"));
+    const Server& fresh_server = reparsed.value();
+    const ProxyHideHeader& supplied_hide = server.location.proxy_hide_header;
+    const ProxyHideHeader& fresh_hide = reparsed.value().location.proxy_hide_header;
+    if (!proxy_hide_header_has_inventory(supplied_hide) &&
+        proxy_hide_header_has_inventory(fresh_hide))
+        return unsupported(location.span, lit_str("proxy_hide_header metadata was erased"));
+    const ProxyBuffering& fresh = fresh_server.location.proxy_buffering;
+    const bool fresh_inventory = proxy_buffering_has_inventory(fresh);
+    if (!metadata && !fresh_inventory) return false;
+    if (!metadata && fresh_inventory)
+        return unsupported(location.span, lit_str("proxy_buffering metadata was erased"));
+    if (!fresh_inventory)
+        return unsupported(model_span(server), lit_str("invalid proxy_buffering model"));
+    if (!buffering.present || !is_valid_span(buffering.span) ||
+        !is_valid_span(buffering.value_span) ||
+        buffering.span.end - buffering.span.start != fresh.span.end - fresh.span.start ||
+        buffering.value_span.end - buffering.value_span.start !=
+            fresh.value_span.end - fresh.value_span.start ||
+        buffering.span.start - server.span.start != fresh.span.start ||
+        buffering.value_span.start - server.span.start != fresh.value_span.start ||
+        !source_position_is_coherent(source_base, server.span, buffering.span) ||
+        !source_position_is_coherent(source_base, server.span, buffering.value_span))
+        return unsupported(is_valid_span(buffering.span) ? buffering.span : location.span,
+                           lit_str("proxy_buffering metadata does not match its source"));
+    if (!span_position_is_coherent(location.span, buffering.span) ||
+        !span_position_is_coherent(buffering.span, buffering.value_span) ||
+        (buffering.value != ProxyBufferingValue::On &&
+         buffering.value != ProxyBufferingValue::Off) ||
+        buffering.span.end >= location.span.end)
+        return unsupported(is_valid_span(buffering.span) ? buffering.span : location.span,
+                           lit_str("invalid proxy_buffering model"));
+    if (buffering.value != fresh.value)
+        return unsupported(buffering.value_span, lit_str("proxy_buffering value model mismatch"));
+    const u32 value_len = buffering.value_span.end - buffering.value_span.start;
+    const char* value = trusted_source_at(source_base, buffering.value_span.start);
+    if ((buffering.value == ProxyBufferingValue::On &&
+         (value_len != 2u || value[0] != 'o' || value[1] != 'n')) ||
+        (buffering.value == ProxyBufferingValue::Off &&
+         (value_len != 3u || value[0] != 'o' || value[1] != 'f' || value[2] != 'f')))
+        return unsupported(buffering.value_span, lit_str("invalid proxy_buffering source value"));
+    if (buffering.value == ProxyBufferingValue::Off &&
+        (!eq(fresh_server.location.path, "/", 1u) || fresh_server.location.proxy_pass.has_uri ||
+         proxy_hide_header_has_inventory(fresh_server.location.proxy_hide_header) ||
+         fresh_server.exact_local_return.present || fresh_server.exact_no_content_return.present ||
+         fresh_server.exact_absolute_redirect.present ||
+         !fresh_server.location.proxy_read_timeout.present ||
+         fresh_server.location.proxy_read_timeout.milliseconds != 1000u ||
+         fresh_server.listen.address != ListenerAddress::IPv4Exact ||
+         fresh_server.listen.ipv4_host != 0x7f000001u ||
+         fresh_server.location.proxy_pass.address[0] != 127u ||
+         fresh_server.location.proxy_pass.address[1] != 0u ||
+         fresh_server.location.proxy_pass.address[2] != 0u ||
+         fresh_server.location.proxy_pass.address[3] != 1u))
+        return unsupported(buffering.span,
+                           lit_str("proxy_buffering off source is outside the bounded profile"));
+    if (buffering.value == ProxyBufferingValue::Off) {
+        const auto relative_span_equal = [&](Span supplied, Span fresh) {
+            if (!is_valid_span(supplied) || !is_valid_span(fresh) ||
+                !span_contains(server.span, supplied) || supplied.start < server.span.start ||
+                supplied.end < supplied.start || fresh.end < fresh.start)
+                return false;
+            return supplied.start - server.span.start == fresh.start &&
+                   supplied.end - server.span.start == fresh.end &&
+                   supplied.end - supplied.start == fresh.end - fresh.start;
+        };
+        const Listen& supplied_listen = server.listen;
+        const Listen& fresh_listen = fresh_server.listen;
+        const ProxyPass& supplied_proxy = server.location.proxy_pass;
+        const ProxyPass& fresh_proxy = fresh_server.location.proxy_pass;
+        const ProxyReadTimeout& supplied_timeout = server.location.proxy_read_timeout;
+        const ProxyReadTimeout& fresh_timeout = fresh_server.location.proxy_read_timeout;
+        if (!relative_span_equal(server.location.span, fresh_server.location.span) ||
+            !relative_span_equal(server.location.path_span, fresh_server.location.path_span) ||
+            !relative_span_equal(supplied_listen.span, fresh_listen.span) ||
+            !relative_span_equal(supplied_listen.value_span, fresh_listen.value_span) ||
+            !relative_span_equal(supplied_proxy.span, fresh_proxy.span) ||
+            !relative_span_equal(supplied_timeout.span, fresh_timeout.span) ||
+            !relative_span_equal(supplied_timeout.value_span, fresh_timeout.value_span) ||
+            !relative_span_equal(buffering.span, fresh.span) ||
+            !relative_span_equal(buffering.value_span, fresh.value_span) ||
+            !source_position_is_coherent(source_base, server.span, server.location.span) ||
+            !source_position_is_coherent(source_base, server.span, server.location.path_span) ||
+            !source_position_is_coherent(source_base, server.span, supplied_listen.span) ||
+            !source_position_is_coherent(source_base, server.span, supplied_listen.value_span) ||
+            !source_position_is_coherent(source_base, server.span, supplied_proxy.span) ||
+            !source_position_is_coherent(source_base, server.span, supplied_timeout.span) ||
+            !source_position_is_coherent(source_base, server.span, supplied_timeout.value_span) ||
+            !source_borrow_is_coherent(
+                server.location.path, server.location.path_span, source_base) ||
+            !source_borrow_is_coherent(
+                supplied_listen.value, supplied_listen.value_span, source_base) ||
+            supplied_listen.port != fresh_listen.port ||
+            supplied_listen.address != fresh_listen.address ||
+            supplied_listen.ipv4_host != fresh_listen.ipv4_host ||
+            supplied_listen.value.ptr != fresh_listen.value.ptr ||
+            supplied_listen.value.len != fresh_listen.value.len ||
+            (server.location.path.ptr != fresh_server.location.path.ptr ||
+             server.location.path.len != fresh_server.location.path.len) ||
+            supplied_proxy.port != fresh_proxy.port ||
+            supplied_proxy.has_uri != fresh_proxy.has_uri ||
+            supplied_proxy.uri.ptr != fresh_proxy.uri.ptr ||
+            supplied_proxy.uri.len != fresh_proxy.uri.len ||
+            (!is_default_span(supplied_proxy.uri_span) || !is_default_span(fresh_proxy.uri_span)) ||
+            supplied_proxy.address[0] != fresh_proxy.address[0] ||
+            supplied_proxy.address[1] != fresh_proxy.address[1] ||
+            supplied_proxy.address[2] != fresh_proxy.address[2] ||
+            supplied_proxy.address[3] != fresh_proxy.address[3] ||
+            supplied_timeout.present != fresh_timeout.present ||
+            supplied_timeout.milliseconds != fresh_timeout.milliseconds ||
+            proxy_hide_header_has_inventory(server.location.proxy_hide_header) !=
+                proxy_hide_header_has_inventory(fresh_server.location.proxy_hide_header))
+            return unsupported(buffering.span,
+                               lit_str("proxy_buffering off metadata does not match its source"));
+        const u64 fresh_timeout_value_start64 =
+            static_cast<u64>(server.span.start) + fresh_timeout.value_span.start;
+        if (fresh_timeout_value_start64 > UINT32_MAX ||
+            fresh_timeout.value_span.end - fresh_timeout.value_span.start != 2u ||
+            trusted_source_at(source_base, static_cast<u32>(fresh_timeout_value_start64))[0] !=
+                '1' ||
+            trusted_source_at(source_base, static_cast<u32>(fresh_timeout_value_start64))[1] != 's')
+            return unsupported(
+                fresh_timeout.value_span,
+                lit_str("proxy_buffering off requires literal proxy_read_timeout 1s"));
+    }
+    return buffering.value == ProxyBufferingValue::On;
+}
+
 FrontendResult<ProxyLocationProfile> validate_prefix_without_uri(const Server& server) {
     const Location& location = server.location;
     const ProxyPass& proxy = location.proxy_pass;
@@ -375,6 +539,47 @@ bool listener_endpoint_matches(uintptr_t source_base,
     return parsed_port != 0u && parsed_port == expected_port;
 }
 
+// Call only after the listener's complete source range and common-source
+// provenance have been established. Exact numeric addresses use their canonical
+// decimal spelling so the semantic address cannot drift from source provenance.
+bool exact_ipv4_listener_endpoint_matches(uintptr_t source_base,
+                                          const Span& value_span,
+                                          u32 expected_ipv4_host,
+                                          u16 expected_port) {
+    u32 pos = value_span.start;
+    u32 address = 0u;
+    for (u32 octet = 0u; octet < 4u; octet++) {
+        const u32 start = pos;
+        u32 value = 0u;
+        while (pos < value_span.end) {
+            const char byte = *trusted_source_at(source_base, pos);
+            if (byte < '0' || byte > '9') break;
+            if (pos - start == 3u) return false;
+            value = value * 10u + static_cast<u32>(byte - '0');
+            if (value > 255u) return false;
+            pos++;
+        }
+        const u32 digits = pos - start;
+        if (digits == 0u || (digits > 1u && *trusted_source_at(source_base, start) == '0'))
+            return false;
+        const char delimiter = octet == 3u ? ':' : '.';
+        if (pos >= value_span.end || *trusted_source_at(source_base, pos) != delimiter)
+            return false;
+        address = (address << 8u) | value;
+        pos++;
+    }
+    if (address != expected_ipv4_host || pos == value_span.end) return false;
+    u32 parsed_port = 0u;
+    for (; pos < value_span.end; pos++) {
+        const char byte = *trusted_source_at(source_base, pos);
+        if (byte < '0' || byte > '9') return false;
+        const u32 digit = static_cast<u32>(byte - '0');
+        if (parsed_port > (65535u - digit) / 10u) return false;
+        parsed_port = parsed_port * 10u + digit;
+    }
+    return parsed_port != 0u && parsed_port == expected_port;
+}
+
 // Call only after validate_proxy_location has established the complete common-source
 // provenance and source positions for both borrows.
 bool is_exact_api_root_empty_query_composition(const Location& location) {
@@ -411,8 +616,7 @@ FrontendResult<bool> validate_listener(const Server& server,
     const Listen& listener = server.listen;
     if (listener.port == 0)
         return invalid_integer(listener.span, lit_str("invalid model listen port"));
-    if (!listener_address_valid(listener.address, listener.ipv4_host) ||
-        (listener.address == ListenerAddress::IPv4Exact && listener.ipv4_host != 0x7f000001u))
+    if (!listener_address_valid(listener.address, listener.ipv4_host))
         return unsupported(listener.span, lit_str("invalid model listen address"));
     if (!span_position_is_coherent(server.span, listener.span))
         return unsupported(is_valid_span(listener.span) ? listener.span : server.span,
@@ -478,11 +682,15 @@ FrontendResult<bool> validate_listener(const Server& server,
         return false;
     }
 
-    if (!listener_endpoint_matches(source_base,
-                                   listener.value_span,
-                                   kExactLoopbackPrefix,
-                                   sizeof(kExactLoopbackPrefix) - 1u,
-                                   listener.port))
+    const bool exact_loopback = listener.ipv4_host == 0x7f000001u;
+    if (!(exact_loopback
+              ? listener_endpoint_matches(source_base,
+                                          listener.value_span,
+                                          kExactLoopbackPrefix,
+                                          sizeof(kExactLoopbackPrefix) - 1u,
+                                          listener.port)
+              : exact_ipv4_listener_endpoint_matches(
+                    source_base, listener.value_span, listener.ipv4_host, listener.port)))
         return unsupported(listener.value_span, lit_str("invalid exact listen endpoint model"));
     const ProxyPass& proxy = server.location.proxy_pass;
     const bool has_no_exact_action = !server.exact_local_return.present &&
@@ -502,6 +710,17 @@ FrontendResult<bool> validate_listener(const Server& server,
         proxy_profile == ProxyLocationProfile::RootWithoutUri &&
         (!has_exact_absolute_redirect || server.exact_absolute_redirect.response.status == 301u ||
          server.exact_absolute_redirect.response.status == 302u);
+    if (!exact_loopback) {
+        const bool minimal_numeric_profile =
+            proxy_profile == ProxyLocationProfile::RootWithoutUri && has_no_exact_action &&
+            !server.location.proxy_read_timeout.present &&
+            !proxy_hide_header_has_inventory(server.location.proxy_hide_header);
+        if (!minimal_numeric_profile)
+            return unsupported(
+                listener.span,
+                lit_str("numeric exact listen requires the minimal root proxy profile"));
+        return true;
+    }
     if (!exact_prefix_replacement && !exact_prefix_without_uri && !exact_root_profile)
         return unsupported(listener.span,
                            lit_str("exact listen requires the minimal root proxy profile"));
@@ -1146,10 +1365,15 @@ FrontendResult<bool> validate_proxy_read_timeout(const Server& server) {
         timeout.milliseconds % 1000 != 0) {
         return unsupported(timeout.value_span, lit_str("invalid proxy_read_timeout milliseconds"));
     }
-    return unsupported(timeout.span, lit_str("proxy_read_timeout lowering is not implemented"));
+    return true;
 }
 
-enum class ProxyLocationDirectiveKind : u8 { ProxyPass, ProxyReadTimeout, ProxyHideHeader };
+enum class ProxyLocationDirectiveKind : u8 {
+    ProxyPass,
+    ProxyReadTimeout,
+    ProxyHideHeader,
+    ProxyBuffering
+};
 
 struct ProxyLocationDirective {
     Span span{};
@@ -1206,7 +1430,10 @@ bool proxy_read_timeout_source_is_coherent(uintptr_t source_base, const ProxyRea
     return seconds != 0u && seconds <= 63u && timeout.milliseconds == seconds * 1000u;
 }
 
-FrontendResult<bool> validate_proxy_hide_header(const Server& server, bool exact_listener) {
+FrontendResult<bool> validate_proxy_hide_header(const Server& server,
+                                                bool exact_listener,
+                                                bool* buffering_authenticated) {
+    *buffering_authenticated = false;
     const ProxyHideHeader& header = server.location.proxy_hide_header;
     const Span fallback = is_valid_span(header.span)        ? header.span
                           : is_valid_span(header.name_span) ? header.name_span
@@ -1216,12 +1443,13 @@ FrontendResult<bool> validate_proxy_hide_header(const Server& server, bool exact
 
     // Pointer/length/span/arithmetic gates precede every dynamic byte read.
     const uintptr_t name_address = reinterpret_cast<uintptr_t>(header.name.ptr);
-    if (header.name.ptr == nullptr || header.name.len != 15u ||
+    if (header.name.ptr == nullptr || header.name.len < 3u || header.name.len > 46u ||
         name_address > UINTPTR_MAX - header.name.len)
         return unsupported(fallback, lit_str("invalid proxy_hide_header name model"));
     const Location& location = server.location;
     const ProxyPass& proxy = location.proxy_pass;
     const ProxyReadTimeout& timeout = location.proxy_read_timeout;
+    const ProxyBuffering& buffering = location.proxy_buffering;
     if (!is_valid_span(location.span) || !is_valid_span(location.path_span) ||
         !is_valid_span(proxy.span) || !span_position_is_coherent(server.span, location.span) ||
         !span_position_is_coherent(location.span, location.path_span) ||
@@ -1231,7 +1459,7 @@ FrontendResult<bool> validate_proxy_hide_header(const Server& server, bool exact
         !is_valid_span(header.span) || !is_valid_span(header.name_span) ||
         !span_position_is_coherent(location.span, header.span) ||
         !span_position_is_coherent(header.span, header.name_span) ||
-        header.span.end - header.span.start < 34u ||
+        header.span.end - header.span.start < 19u + header.name.len ||
         header.name_span.end - header.name_span.start != header.name.len ||
         header.span.start <= location.path_span.end || header.span.end >= location.span.end ||
         header.name_span.start - header.span.start <= 17u ||
@@ -1240,6 +1468,13 @@ FrontendResult<bool> validate_proxy_hide_header(const Server& server, bool exact
          (header.span.start < proxy.span.end && proxy.span.start < header.span.end)) ||
         (timeout.present &&
          (header.span.start < timeout.span.end && timeout.span.start < header.span.end)))
+        return unsupported(fallback, lit_str("invalid proxy_hide_header spans"));
+    if (buffering.present &&
+        (!is_valid_span(buffering.span) || !is_valid_span(buffering.value_span) ||
+         !span_position_is_coherent(location.span, buffering.span) ||
+         !span_position_is_coherent(buffering.span, buffering.value_span) ||
+         buffering.span.end >= location.span.end ||
+         (header.span.start < buffering.span.end && buffering.span.start < header.span.end)))
         return unsupported(fallback, lit_str("invalid proxy_hide_header spans"));
     if (proxy.has_uri) {
         if (!is_valid_span(proxy.uri_span) ||
@@ -1287,15 +1522,27 @@ FrontendResult<bool> validate_proxy_hide_header(const Server& server, bool exact
         !source_position_is_coherent(source_base, server.span, header.name_span))
         return unsupported(fallback, lit_str("invalid proxy_hide_header source positions"));
 
+    if (buffering.present) {
+        auto buffering_result = validate_proxy_buffering(server);
+        if (!buffering_result) return core::make_unexpected(buffering_result.error());
+        if (!buffering_result.value())
+            return unsupported(fallback, lit_str("invalid proxy_buffering model"));
+        *buffering_authenticated = true;
+    }
+
     // All bytes below are in the already-proven common source. Sort the complete
     // modeled location inventory so every byte between the braces is accounted
     // for independently of nginx directive order.
-    ProxyLocationDirective directives[3] = {
-        {proxy.span, ProxyLocationDirectiveKind::ProxyPass},
-        {header.span, ProxyLocationDirectiveKind::ProxyHideHeader},
-        {timeout.span, ProxyLocationDirectiveKind::ProxyReadTimeout},
-    };
-    const u32 directive_count = timeout.present ? 3u : 2u;
+    ProxyLocationDirective directives[4]{};
+    u32 directive_count = 0u;
+    directives[directive_count++] = {proxy.span, ProxyLocationDirectiveKind::ProxyPass};
+    directives[directive_count++] = {header.span, ProxyLocationDirectiveKind::ProxyHideHeader};
+    if (timeout.present)
+        directives[directive_count++] = {timeout.span,
+                                         ProxyLocationDirectiveKind::ProxyReadTimeout};
+    if (buffering.present)
+        directives[directive_count++] = {buffering.span,
+                                         ProxyLocationDirectiveKind::ProxyBuffering};
     for (u32 i = 1u; i < directive_count; i++) {
         const ProxyLocationDirective value = directives[i];
         u32 pos = i;
@@ -1333,20 +1580,21 @@ FrontendResult<bool> validate_proxy_hide_header(const Server& server, bool exact
         return unsupported(proxy.span, lit_str("invalid proxy_pass source syntax"));
     if (timeout.present && !proxy_read_timeout_source_is_coherent(source_base, timeout))
         return unsupported(timeout.span, lit_str("invalid proxy_read_timeout source syntax"));
+    const Str trusted_name{trusted_source_at(source_base, header.name_span.start), header.name.len};
     if (!eq({trusted_source_at(source_base, header.span.start), 17u}, "proxy_hide_header", 17u) ||
         *trusted_source_at(source_base, header.span.end - 1u) != ';' ||
         !trusted_source_gap_is_exact(
             source_base, header.span.start + 17u, header.name_span.start) ||
         !trusted_source_gap_is_exact(source_base, header.name_span.end, header.span.end - 1u) ||
-        !eq(header.name, "X-Compat-Hidden", 15u))
+        !valid_proxy_hide_header_name(trusted_name))
         return unsupported(fallback, lit_str("invalid proxy_hide_header source syntax"));
 
     const bool minimal_profile =
         exact_listener && server.listen.address == ListenerAddress::IPv4Exact &&
         server.listen.ipv4_host == 0x7f000001u && eq(location.path, "/", 1u) && !proxy.has_uri &&
         proxy.uri.ptr == nullptr && proxy.uri.len == 0u && is_default_span(proxy.uri_span) &&
-        !timeout.present && !server.exact_local_return.present &&
-        !server.exact_no_content_return.present && !server.exact_absolute_redirect.present;
+        !server.exact_local_return.present && !server.exact_no_content_return.present &&
+        !server.exact_absolute_redirect.present;
     if (!minimal_profile)
         return unsupported(
             header.span,
@@ -1390,6 +1638,16 @@ public:
             if (i != 3 && !put_lit(".", 1)) return false;
         }
         return true;
+    }
+
+    bool put_ipv4_host(u32 address) {
+        const u8 octets[4] = {
+            static_cast<u8>(address >> 24u),
+            static_cast<u8>(address >> 16u),
+            static_cast<u8>(address >> 8u),
+            static_cast<u8>(address),
+        };
+        return put_ipv4(octets);
     }
 
 private:
@@ -1504,18 +1762,30 @@ bool put_pre_route_trace(Writer& writer, ImplicitPreRouteProfile profile) {
            writer.put_lit(kTraceBody, sizeof(kTraceBody) - 1u) && writer.put_cstr("\"\n}) }\n");
 }
 
-bool put_request_policy(Writer& writer) {
+enum class RequestPolicyPlacement : u8 {
+    Legacy,
+    ContentLengthAfterHost,
+    RetainedHeaderValue,
+};
+
+bool put_request_policy(Writer& writer, RequestPolicyPlacement placement) {
     return writer.put_cstr("request_policy: {\n") &&
            writer.put_cstr("            version: \"HTTP/1.1\",\n") &&
            writer.put_cstr("            host: \"upstream\",\n") &&
            writer.put_cstr("            connection: \"omit\",\n") &&
+           (placement != RequestPolicyPlacement::ContentLengthAfterHost ||
+            writer.put_cstr("            content_length_position: \"after_host\",\n")) &&
            writer.put_cstr(
                "            strip_headers: [\"Connection\", \"Keep-Alive\", \"TE\", \"Expect\", "
-               "\"Upgrade\"]\n") &&
+               "\"Upgrade\"]") &&
+           (placement == RequestPolicyPlacement::RetainedHeaderValue ? writer.put_cstr(",\n")
+                                                                     : writer.put_cstr("\n")) &&
+           (placement != RequestPolicyPlacement::RetainedHeaderValue ||
+            writer.put_cstr("            retained_header_value: \"trim_sp_preserve_htab\"\n")) &&
            writer.put_cstr("        },\n");
 }
 
-bool put_response_policy(Writer& writer, bool suppress_body, bool hide_compat_header) {
+bool put_response_policy(Writer& writer, bool suppress_body, Str hide_header_name) {
     return writer.put_cstr("        response_policy: {\n") &&
            writer.put_cstr("            version: \"HTTP/1.1\",\n") &&
            writer.put_cstr("            framing: \"content_length\",\n") &&
@@ -1523,10 +1793,12 @@ bool put_response_policy(Writer& writer, bool suppress_body, bool hide_compat_he
            (!suppress_body || writer.put_cstr("            head_mode: \"suppress_body\",\n")) &&
            writer.put_cstr("            server: \"nginx/1.29.7\",\n") &&
            writer.put_cstr("            date: \"current\",\n") &&
-           writer.put_cstr(hide_compat_header
-                               ? "            hide_headers: [\"Date\", \"Server\", \"X-Pad\", "
-                                 "\"X-Compat-Hidden\"]\n"
-                               : "            hide_headers: [\"Date\", \"Server\", \"X-Pad\"]\n") &&
+           writer.put_cstr("            hide_headers: [\"Date\", \"Server\", \"X-Pad\"") &&
+           (hide_header_name.len == 0u
+                ? writer.put_cstr("]\n")
+                : writer.put_cstr(", \"") &&
+                      writer.put_lit(hide_header_name.ptr, hide_header_name.len) &&
+                      writer.put_cstr("\"]\n")) &&
            writer.put_cstr("        },\n");
 }
 
@@ -1545,7 +1817,7 @@ bool put_failure_policy(Writer& writer, bool suppress_body, bool buffered) {
            writer.put_cstr("\"\n") && writer.put_cstr(buffered ? "        },\n" : "        }\n");
 }
 
-bool put_timeout_failure_policy(Writer& writer) {
+bool put_timeout_failure_policy(Writer& writer, bool suppress_body) {
     return writer.put_cstr("        timeout_failure_policy: {\n") &&
            writer.put_cstr("            version: \"HTTP/1.1\",\n") &&
            writer.put_cstr("            status: 504,\n") &&
@@ -1554,6 +1826,7 @@ bool put_timeout_failure_policy(Writer& writer) {
            writer.put_cstr("            server: \"nginx/1.29.7\",\n") &&
            writer.put_cstr("            date: \"current\",\n") &&
            writer.put_cstr("            connection: \"request\",\n") &&
+           (!suppress_body || writer.put_cstr("            head_mode: \"suppress_body\",\n")) &&
            writer.put_cstr("            body: b\"") &&
            writer.put_lit(kGatewayTimeoutBody, sizeof(kGatewayTimeoutBody) - 1) &&
            writer.put_cstr("\"\n") && writer.put_cstr("        },\n");
@@ -1562,38 +1835,108 @@ bool put_timeout_failure_policy(Writer& writer) {
 bool put_root_forward(Writer& writer,
                       const char* method,
                       u32 method_len,
+                      RequestPolicyPlacement request_policy_placement,
                       bool suppress_body,
                       bool buffered,
-                      bool hide_compat_header) {
+                      Str hide_header_name,
+                      bool timeout_present,
+                      u8 timeout_seconds) {
     return writer.put_cstr("route ") &&
            (method_len == 0
                 ? writer.put_cstr("\"/\" {\n")
                 : writer.put_lit(method, method_len) && writer.put_cstr(" \"/\" {\n")) &&
-           writer.put_cstr("    return forward(nginx_upstream, ") && put_request_policy(writer) &&
-           put_response_policy(writer, suppress_body, hide_compat_header) &&
-           put_failure_policy(writer, suppress_body, buffered) &&
-           (buffered ? put_timeout_failure_policy(writer) : true) &&
-           (buffered ? writer.put_cstr("        response_read_timeout: 60s,\n") : true) &&
+           writer.put_cstr("    return forward(nginx_upstream, ") &&
+           put_request_policy(writer, request_policy_placement) &&
+           put_response_policy(writer, suppress_body, hide_header_name) &&
+           put_failure_policy(writer, suppress_body, buffered || timeout_present) &&
+           ((buffered || timeout_present) ? put_timeout_failure_policy(writer, suppress_body)
+                                          : true) &&
+           (buffered || timeout_present ? writer.put_cstr("        response_read_timeout: ")
+                                        : true) &&
+           (buffered || timeout_present ? writer.put_u16(timeout_seconds) : true) &&
+           (buffered || timeout_present ? writer.put_cstr(buffered ? "s,\n" : "s\n") : true) &&
            (buffered ? writer.put_cstr("        response_buffering: \"complete_content_length\"\n")
                      : true) &&
            writer.put_cstr("    )\n}\n");
 }
 
-bool put_root_forward_action(
-    Writer& writer, bool suppress_body, bool buffered, bool hide_compat_header, Str indent) {
+bool put_root_forward_action(Writer& writer,
+                             RequestPolicyPlacement request_policy_placement,
+                             bool suppress_body,
+                             bool buffered,
+                             Str hide_header_name,
+                             bool timeout_present,
+                             u8 timeout_seconds,
+                             Str indent) {
     return writer.put(indent) && writer.put_cstr("return forward(nginx_upstream, ") &&
-           put_request_policy(writer) &&
-           put_response_policy(writer, suppress_body, hide_compat_header) &&
-           put_failure_policy(writer, suppress_body, buffered) &&
-           (buffered ? put_timeout_failure_policy(writer) : true) &&
-           (buffered ? writer.put_cstr("        response_read_timeout: 60s,\n") : true) &&
+           put_request_policy(writer, request_policy_placement) &&
+           put_response_policy(writer, suppress_body, hide_header_name) &&
+           put_failure_policy(writer, suppress_body, buffered || timeout_present) &&
+           ((buffered || timeout_present) ? put_timeout_failure_policy(writer, suppress_body)
+                                          : true) &&
+           (buffered || timeout_present ? writer.put_cstr("        response_read_timeout: ")
+                                        : true) &&
+           (buffered || timeout_present ? writer.put_u16(timeout_seconds) : true) &&
+           (buffered || timeout_present ? writer.put_cstr(buffered ? "s,\n" : "s\n") : true) &&
            (buffered ? writer.put_cstr("        response_buffering: \"complete_content_length\"\n")
                      : true) &&
            writer.put_cstr("    )\n");
 }
 
-bool put_exact_absolute_redirect(
-    Writer& writer, Str location_path, u16 status, Str static_authority, Str target_path) {
+bool put_root_timeout_head_forward(Writer& writer, Str hide_header_name, u8 timeout_seconds) {
+    return writer.put_cstr("route HEAD \"/\" {\n") &&
+           writer.put_cstr("    if req.hasContentLength {\n") &&
+           put_root_forward_action(writer,
+                                   RequestPolicyPlacement::ContentLengthAfterHost,
+                                   true,
+                                   false,
+                                   hide_header_name,
+                                   true,
+                                   timeout_seconds,
+                                   lit_str("        ")) &&
+           writer.put_cstr("    } else {\n") &&
+           put_root_forward_action(writer,
+                                   RequestPolicyPlacement::Legacy,
+                                   true,
+                                   false,
+                                   hide_header_name,
+                                   true,
+                                   timeout_seconds,
+                                   lit_str("        ")) &&
+           writer.put_cstr("    }\n}\n");
+}
+
+bool put_root_get_retained_header_forward(Writer& writer, Str hide_header_name) {
+    return writer.put_cstr("route GET \"/\" {\n") &&
+           writer.put_cstr("    if req.hasContentLength {\n") &&
+           put_root_forward_action(writer,
+                                   RequestPolicyPlacement::Legacy,
+                                   false,
+                                   true,
+                                   hide_header_name,
+                                   false,
+                                   60u,
+                                   lit_str("        ")) &&
+           writer.put_cstr("    } else {\n") &&
+           put_root_forward_action(writer,
+                                   RequestPolicyPlacement::RetainedHeaderValue,
+                                   false,
+                                   true,
+                                   hide_header_name,
+                                   false,
+                                   60u,
+                                   lit_str("        ")) &&
+           writer.put_cstr("    }\n}\n");
+}
+
+bool put_exact_absolute_redirect(Writer& writer,
+                                 Str location_path,
+                                 u16 status,
+                                 Str static_authority,
+                                 Str target_path,
+                                 Str hide_header_name,
+                                 bool timeout_present,
+                                 u8 timeout_seconds) {
     const char* reason = nullptr;
     const char* body = nullptr;
     u32 reason_len = 0;
@@ -1632,7 +1975,14 @@ bool put_exact_absolute_redirect(
            writer.put(target_path) && writer.put_cstr("\", body: b\"") &&
            writer.put_lit(body, body_len) && writer.put_cstr("\"})\n") &&
            writer.put_cstr("    } else {\n") &&
-           put_root_forward_action(writer, false, true, false, lit_str("        ")) &&
+           put_root_forward_action(writer,
+                                   RequestPolicyPlacement::Legacy,
+                                   false,
+                                   true,
+                                   hide_header_name,
+                                   timeout_present,
+                                   timeout_seconds,
+                                   lit_str("        ")) &&
            writer.put_cstr("    }\n}\n");
 }
 
@@ -1719,6 +2069,17 @@ bool compare_proxy_read_timeout(const ProxyReadTimeout& supplied,
     return true;
 }
 
+bool compare_proxy_buffering(const ProxyBuffering& supplied,
+                             const ProxyBuffering& fresh,
+                             HttpProfileComparison& comparison,
+                             Span fallback) {
+    if (supplied.present != fresh.present || supplied.value != fresh.value ||
+        !spans_equal(supplied.span, fresh.span) ||
+        !spans_equal(supplied.value_span, fresh.value_span))
+        return comparison.reject(is_valid_span(fresh.span) ? fresh.span : fallback);
+    return true;
+}
+
 bool compare_proxy_hide_header(const ProxyHideHeader& supplied,
                                const ProxyHideHeader& fresh,
                                HttpProfileComparison& comparison,
@@ -1742,6 +2103,8 @@ bool compare_location(const Location& supplied,
     return compare_proxy_pass(supplied.proxy_pass, fresh.proxy_pass, comparison, safe) &&
            compare_proxy_read_timeout(
                supplied.proxy_read_timeout, fresh.proxy_read_timeout, comparison, safe) &&
+           compare_proxy_buffering(
+               supplied.proxy_buffering, fresh.proxy_buffering, comparison, safe) &&
            compare_proxy_hide_header(
                supplied.proxy_hide_header, fresh.proxy_hide_header, comparison, safe);
 }
@@ -1871,6 +2234,33 @@ bool compare_http_profile(const HttpProfile& supplied,
            compare_server(supplied.server, fresh.server, comparison);
 }
 
+bool rebase_http_diagnostic(const Diagnostic& local,
+                            u32 source_len,
+                            const Span& origin,
+                            Diagnostic& rebased) {
+    const Span& span = local.span;
+    if (span.start > source_len || span.end > source_len || span.start > span.end ||
+        span.line == 0 || span.col == 0)
+        return false;
+    if (!is_valid_span(origin) || origin.start > ~static_cast<u32>(0) - span.start ||
+        origin.start > ~static_cast<u32>(0) - span.end)
+        return false;
+    rebased = local;
+    rebased.span.start += origin.start;
+    rebased.span.end += origin.start;
+    if (span.line == 1) {
+        if (origin.line == 0 || origin.col == 0 ||
+            origin.col > ~static_cast<u32>(0) - (span.col - 1u))
+            return false;
+        rebased.span.line = origin.line;
+        rebased.span.col += origin.col - 1u;
+    } else {
+        if (origin.line == 0 || origin.line > ~static_cast<u32>(0) - (span.line - 1u)) return false;
+        rebased.span.line += origin.line - 1u;
+    }
+    return true;
+}
+
 }  // namespace
 
 FrontendResult<RutSource> lower_to_rut(const Server& server) {
@@ -1883,18 +2273,34 @@ FrontendResult<RutSource> lower_to_rut(const Server& server) {
     auto proxy_location = validate_proxy_location(server);
     if (!proxy_location) return core::make_unexpected(proxy_location.error());
     bool hide_compat_header = false;
+    Str hide_header_name{};
     bool exact_listener = false;
+    bool buffering_authenticated = false;
+    const bool timeout_present = server.location.proxy_read_timeout.present;
+    u8 timeout_seconds = timeout_present ? 0u : 60u;
     if (proxy_hide_header_has_inventory(server.location.proxy_hide_header)) {
         auto listener =
             validate_listener(server, proxy_location.value(), exact_absolute_redirect.value());
         if (!listener) return core::make_unexpected(listener.error());
-        auto header = validate_proxy_hide_header(server, listener.value());
-        if (!header) return core::make_unexpected(header.error());
         exact_listener = listener.value();
+        auto header =
+            validate_proxy_hide_header(server, listener.value(), &buffering_authenticated);
+        if (!header) return core::make_unexpected(header.error());
         hide_compat_header = true;
+        hide_header_name = server.location.proxy_hide_header.name;
+        if (timeout_present) {
+            auto timeout = validate_proxy_read_timeout(server);
+            if (!timeout) return core::make_unexpected(timeout.error());
+            timeout_seconds =
+                static_cast<u8>(server.location.proxy_read_timeout.milliseconds / 1000u);
+        }
     } else {
         auto timeout = validate_proxy_read_timeout(server);
         if (!timeout) return core::make_unexpected(timeout.error());
+        timeout_seconds =
+            timeout_present
+                ? static_cast<u8>(server.location.proxy_read_timeout.milliseconds / 1000u)
+                : 60u;
         auto listener =
             validate_listener(server, proxy_location.value(), exact_absolute_redirect.value());
         if (!listener) return core::make_unexpected(listener.error());
@@ -1905,6 +2311,12 @@ FrontendResult<RutSource> lower_to_rut(const Server& server) {
         return invalid_integer(server.location.proxy_pass.span,
                                lit_str("invalid model upstream port"));
     const bool is_root = proxy_location.value() == ProxyLocationProfile::RootWithoutUri;
+    const bool has_sibling_action = exact_local_return.value() || exact_no_content_return.value() ||
+                                    exact_absolute_redirect.value();
+    const bool retained_header_get_shape =
+        is_root && exact_listener && server.listen.address == ListenerAddress::IPv4Exact &&
+        server.listen.ipv4_host == 0x7f000001u && !timeout_present && !hide_compat_header &&
+        !has_sibling_action;
     auto pre_route_trace = validate_pre_route_trace(server);
     if (!pre_route_trace) return core::make_unexpected(pre_route_trace.error());
     if (exact_local_return.value() && !is_root)
@@ -1916,6 +2328,33 @@ FrontendResult<RutSource> lower_to_rut(const Server& server) {
     if (exact_no_content_return.value() && !is_root)
         return unsupported(server.exact_no_content_return.span,
                            lit_str("exact no-content return requires location / fallback"));
+    bool explicit_buffering_on = false;
+    const bool explicit_buffering_off =
+        server.location.proxy_buffering.present &&
+        server.location.proxy_buffering.value == ProxyBufferingValue::Off;
+    if (buffering_authenticated) {
+        explicit_buffering_on = true;
+    } else {
+        auto proxy_buffering = validate_proxy_buffering(server);
+        if (!proxy_buffering) return core::make_unexpected(proxy_buffering.error());
+        explicit_buffering_on = proxy_buffering.value();
+    }
+    if (explicit_buffering_off &&
+        !(is_root && exact_listener && server.listen.address == ListenerAddress::IPv4Exact &&
+          server.listen.ipv4_host == 0x7f000001u && proxy.address[0] == 127u &&
+          proxy.address[1] == 0u && proxy.address[2] == 0u && proxy.address[3] == 1u &&
+          !proxy.has_uri && !hide_compat_header && !has_sibling_action && timeout_present &&
+          server.location.proxy_read_timeout.milliseconds == 1000u))
+        return unsupported(server.location.proxy_buffering.span,
+                           lit_str("proxy_buffering off requires the bounded 1s loopback profile"));
+    if (explicit_buffering_on &&
+        !(is_root && exact_listener && server.listen.address == ListenerAddress::IPv4Exact &&
+          server.listen.ipv4_host == 0x7f000001u && timeout_present &&
+          server.location.proxy_read_timeout.milliseconds >= 1000u &&
+          server.location.proxy_read_timeout.milliseconds <= 63000u && !has_sibling_action))
+        return unsupported(
+            server.location.proxy_buffering.span,
+            lit_str("proxy_buffering on requires the bounded timeout proxy profile"));
     RutSource output{};
     Writer writer(output);
     auto put = [&](const char* text) {
@@ -1925,8 +2364,9 @@ FrontendResult<RutSource> lower_to_rut(const Server& server) {
         return out_of_memory(server.span, lit_str("generated RUT source is too large"));
     };
 
-    if (!(exact_listener ? put("listen 127.0.0.1:") : put("listen :")) ||
-        !writer.put_u16(server.listen.port) || !put("\n") ||
+    if (!(exact_listener ? put("listen ") : put("listen :")) ||
+        (exact_listener && !writer.put_ipv4_host(server.listen.ipv4_host)) ||
+        (exact_listener && !put(":")) || !writer.put_u16(server.listen.port) || !put("\n") ||
         !put("upstream nginx_upstream at \"") ||
         !writer.put_ipv4(server.location.proxy_pass.address) || !put(":") ||
         !writer.put_u16(proxy.port) || !put("\"\n"))
@@ -1965,15 +2405,46 @@ FrontendResult<RutSource> lower_to_rut(const Server& server) {
         return fail_overflow();
 
     if (is_root) {
-        if (!put_root_forward(writer, "HEAD", 4, true, false, hide_compat_header) ||
+        if ((timeout_present
+                 ? !put_root_timeout_head_forward(writer, hide_header_name, timeout_seconds)
+                 : !put_root_forward(writer,
+                                     "HEAD",
+                                     4,
+                                     RequestPolicyPlacement::Legacy,
+                                     true,
+                                     false,
+                                     hide_header_name,
+                                     false,
+                                     timeout_seconds)) ||
             (exact_absolute_redirect.value()
                  ? !put_exact_absolute_redirect(writer,
                                                 server.exact_absolute_redirect.path,
                                                 server.exact_absolute_redirect.response.status,
                                                 server.exact_absolute_redirect.response.authority,
-                                                server.exact_absolute_redirect.response.path)
-                 : !put_root_forward(writer, "GET", 3, false, true, hide_compat_header)) ||
-            !put_root_forward(writer, "", 0, false, false, hide_compat_header) ||
+                                                server.exact_absolute_redirect.response.path,
+                                                hide_header_name,
+                                                timeout_present,
+                                                timeout_seconds)
+                 : (retained_header_get_shape
+                        ? !put_root_get_retained_header_forward(writer, hide_header_name)
+                        : !put_root_forward(writer,
+                                            "GET",
+                                            3,
+                                            RequestPolicyPlacement::Legacy,
+                                            false,
+                                            !explicit_buffering_off,
+                                            hide_header_name,
+                                            timeout_present,
+                                            timeout_seconds))) ||
+            !put_root_forward(writer,
+                              "",
+                              0,
+                              RequestPolicyPlacement::Legacy,
+                              false,
+                              false,
+                              hide_header_name,
+                              timeout_present,
+                              timeout_seconds) ||
             (exact_local_return.value() &&
              !put_exact_local_return(writer,
                                      server.exact_local_return.path,
@@ -2046,9 +2517,19 @@ FrontendResult<HttpProfileRutSource> lower_to_rut(const HttpProfile& profile) {
         return unsupported(comparison.mismatch,
                            lit_str("http profile metadata does not match its source"));
 
-    if (!access_log_sink_path_valid(fresh.access_log.path))
-        return unsupported(fresh.access_log.path_span,
-                           lit_str("invalid access log sink path model"));
+    switch (fresh.access_log.destination_profile) {
+        case AccessLogDestinationProfile::FilePath:
+            if (!access_log_sink_path_valid(fresh.access_log.path))
+                return unsupported(fresh.access_log.path_span,
+                                   lit_str("invalid access log sink path model"));
+            break;
+        case AccessLogDestinationProfile::Off:
+            break;
+        case AccessLogDestinationProfile::None:
+        default:
+            return unsupported(fresh.access_log.span,
+                               lit_str("invalid access log destination model"));
+    }
 
     auto server_source = lower_to_rut(fresh.server);
     if (!server_source) return core::make_unexpected(server_source.error());
@@ -2070,12 +2551,53 @@ FrontendResult<HttpProfileRutSource> lower_to_rut(const HttpProfile& profile) {
         output.len += text.len;
         return true;
     };
-    if (!put({kAccessLogPrefix, sizeof(kAccessLogPrefix) - 1u}) || !put(fresh.access_log.path) ||
-        !put({kAccessLogSuffix, sizeof(kAccessLogSuffix) - 1u}) ||
+    if ((fresh.access_log.destination_profile == AccessLogDestinationProfile::FilePath &&
+         (!put({kAccessLogPrefix, sizeof(kAccessLogPrefix) - 1u}) || !put(fresh.access_log.path) ||
+          !put({kAccessLogSuffix, sizeof(kAccessLogSuffix) - 1u}))) ||
         !put(server_source.value().view()))
         return out_of_memory(fresh.span, lit_str("generated RUT http profile source is too large"));
     output.data[output.len] = '\0';
     return output;
+}
+
+FrontendResult<HttpProfileRutSource> lower_to_rut(const NginxHttpConfig& config) {
+    const uintptr_t source_address = reinterpret_cast<uintptr_t>(config.source.ptr);
+    if (config.source.ptr == nullptr || config.source.len == 0u ||
+        source_address > UINTPTR_MAX - config.source.len)
+        return unsupported(config.span, lit_str("invalid readable nginx config source"));
+
+    auto reparsed = parse_nginx_http_config(config.source);
+    if (!reparsed) return core::make_unexpected(reparsed.error());
+    const NginxHttpConfig& fresh = reparsed.value();
+    if (!spans_equal(config.span, fresh.span))
+        return unsupported(fresh.span, lit_str("nginx config metadata does not match its source"));
+    if (!spans_equal(config.events_span, fresh.events_span))
+        return unsupported(fresh.events_span,
+                           lit_str("nginx config metadata does not match its source"));
+    if (!spans_equal(config.http_span, fresh.http_span))
+        return unsupported(fresh.http_span,
+                           lit_str("nginx config metadata does not match its source"));
+
+    HttpProfileComparison comparison{};
+    if (!compare_http_profile(config.http, fresh.http, comparison)) {
+        const Diagnostic local{FrontendError::UnsupportedSyntax,
+                               comparison.mismatch,
+                               lit_str("http profile metadata does not match its source")};
+        Diagnostic rebased{};
+        if (!rebase_http_diagnostic(local, fresh.http.source.len, fresh.http_span, rebased))
+            return unsupported(fresh.http_span, lit_str("invalid http metadata diagnostic span"));
+        return core::make_unexpected(rebased);
+    }
+
+    auto lowered = lower_to_rut(fresh.http);
+    if (!lowered) {
+        Diagnostic rebased{};
+        if (!rebase_http_diagnostic(
+                lowered.error(), fresh.http.source.len, fresh.http_span, rebased))
+            return unsupported(fresh.http_span, lit_str("invalid http lowering diagnostic span"));
+        return core::make_unexpected(rebased);
+    }
+    return lowered;
 }
 
 }  // namespace rut::nginx

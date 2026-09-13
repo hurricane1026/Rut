@@ -71,10 +71,25 @@ enum class ResponseReadDeadlinePostCommitPhase : u8 {
     OriginComplete,
 };
 
+enum class CompleteContentLengthResponseClass : u8 {
+    Unsupported,
+    BoundedPositiveBody,
+    CoherentSingleRange206,
+};
+
 enum class ResponseReadDeadlineSendKind : u8 {
     None,
     Header,
     Body,
+};
+
+// Kernel ownership for the generic precise response-read timer. CancelPending
+// retains the immutable identity until both the timeout target and the cancel
+// SQE completions have been harvested, in either order.
+enum class ResponseReadTimerPhase : u8 {
+    None,
+    Armed,
+    CancelPending,
 };
 
 // Immutable request/response contract selected before the JIT handler runs.
@@ -85,7 +100,38 @@ enum class ResponseReadDeadlineProfile : u8 {
     HeaderOnlyHead,
     BodylessNonHeadContentLengthZero,
     FixedContentLengthUploadNonHeadContentLengthZero,
+    FixedContentLengthUploadHeaderOnlyHead,
 };
+
+static_assert(sizeof(ResponseReadDeadlineProfile) == sizeof(u8));
+
+[[nodiscard]] constexpr bool response_read_deadline_profile_is_fixed_upload(
+    ResponseReadDeadlineProfile profile) {
+    switch (profile) {
+        case ResponseReadDeadlineProfile::FixedContentLengthUploadNonHeadContentLengthZero:
+        case ResponseReadDeadlineProfile::FixedContentLengthUploadHeaderOnlyHead:
+            return true;
+        case ResponseReadDeadlineProfile::None:
+        case ResponseReadDeadlineProfile::HeaderOnlyHead:
+        case ResponseReadDeadlineProfile::BodylessNonHeadContentLengthZero:
+            return false;
+    }
+    return false;
+}
+
+[[nodiscard]] constexpr bool response_read_deadline_profile_suppresses_head(
+    ResponseReadDeadlineProfile profile) {
+    switch (profile) {
+        case ResponseReadDeadlineProfile::HeaderOnlyHead:
+        case ResponseReadDeadlineProfile::FixedContentLengthUploadHeaderOnlyHead:
+            return true;
+        case ResponseReadDeadlineProfile::None:
+        case ResponseReadDeadlineProfile::BodylessNonHeadContentLengthZero:
+        case ResponseReadDeadlineProfile::FixedContentLengthUploadNonHeadContentLengthZero:
+            return false;
+    }
+    return false;
+}
 
 // Immutable request-upload identity for the bounded fixed-Content-Length
 // explicit-deadline profile. The active, first-response-batch, and D1/D2
@@ -143,14 +189,17 @@ struct ResponseReadDeadlineUploadProof {
 enum class Http1PrebuiltResponseLayout : u8 {
     None,
     HeaderOnlyHead,
+    HeaderOnlyNoBodyStatus,
     FullContentLengthNonHead,
 };
 
 enum class Http1PrebuiltResponsePurpose : u8 {
     None,
     StrictHeadHeaderOnly,
+    StrictNoBodyMetadataSuccess,
     StrictNonHeadCl0Success,
     ResponseReadTimeout,
+    ConfiguredForwardFailure,
 };
 
 // Request-buffer ownership captured by the internal HTTP/1 prebuilt-response
@@ -607,6 +656,10 @@ struct ConnectionBase {
     u32 response_read_deadline_post_commit_episode;
     u32 response_read_deadline_post_commit_raw_header_end;
     u32 response_read_deadline_post_commit_declared_body;
+    CompleteContentLengthResponseClass response_read_deadline_post_commit_response_class;
+    u64 response_read_deadline_post_commit_range_first;
+    u64 response_read_deadline_post_commit_range_last;
+    u64 response_read_deadline_post_commit_range_total;
     u32 response_read_deadline_post_commit_origin_received;
     u32 response_read_deadline_post_commit_downstream_submitted;
     u32 response_read_deadline_post_commit_downstream_completed;
@@ -634,6 +687,117 @@ struct ConnectionBase {
     u32 response_read_deadline_send_close_generation = 0;
     bool response_read_deadline_send_close_target_owned = false;
     bool response_read_deadline_send_close_cancel_owned = false;
+
+    // Generic precise response-read transport timer. The timespec and active
+    // identity are kernel-owned storage: reset() must not mutate them before
+    // every owned CQE has been harvested. The generation counter survives
+    // ordinary reset/slot reuse and never wraps through the cancel-marker bit.
+    __kernel_timespec response_read_timer_timespec{};
+    u32 response_read_timer_generation = 0;
+    u32 response_read_timer_owner_generation = 0;
+    u32 response_read_timer_deadline_generation = 0;
+    u32 response_read_timer_upstream_episode = 0;
+    // Monotonic deadline origin for the narrow precise owner. Accepted progress
+    // is proved separately; a profile may retain this pinned origin without
+    // cancel/rearm churn.
+    u64 response_read_timer_last_progress_ns = 0;
+    ResponseReadTimerPhase response_read_timer_phase = ResponseReadTimerPhase::None;
+    bool response_read_timer_target_owned = false;
+    bool response_read_timer_cancel_owned = false;
+
+    template <typename Self, typename Visitor>
+    static void visit_response_read_timer_owner_fields(Self& c, Visitor&& visit) {
+        visit(c.response_read_timer_timespec.tv_sec,
+              static_cast<decltype(c.response_read_timer_timespec.tv_sec)>(0));
+        visit(c.response_read_timer_timespec.tv_nsec,
+              static_cast<decltype(c.response_read_timer_timespec.tv_nsec)>(0));
+        visit(c.response_read_timer_owner_generation, u32{0});
+        visit(c.response_read_timer_deadline_generation, u32{0});
+        visit(c.response_read_timer_upstream_episode, u32{0});
+        visit(c.response_read_timer_phase, ResponseReadTimerPhase::None);
+        visit(c.response_read_timer_target_owned, false);
+        visit(c.response_read_timer_cancel_owned, false);
+    }
+
+    [[nodiscard]] bool response_read_timer_owner_is_neutral() const {
+        bool neutral = true;
+        visit_response_read_timer_owner_fields(*this,
+                                               [&](const auto& value, const auto& reset_value) {
+                                                   neutral = neutral && value == reset_value;
+                                               });
+        return neutral;
+    }
+
+    [[nodiscard]] bool response_read_timer_owner_is_valid() const {
+        const bool keys_valid =
+            response_read_timer_owner_generation != 0 &&
+            response_read_timer_owner_generation <= kResponseReadTimerGenerationMask &&
+            response_read_timer_owner_generation == response_read_timer_generation &&
+            response_read_timer_deadline_generation != 0 &&
+            valid_upstream_episode(response_read_timer_upstream_episode);
+        const bool timespec_valid =
+            response_read_timer_timespec.tv_sec >= 0 && response_read_timer_timespec.tv_nsec >= 0 &&
+            response_read_timer_timespec.tv_nsec < 1'000'000'000LL &&
+            (response_read_timer_timespec.tv_sec != 0 || response_read_timer_timespec.tv_nsec != 0);
+        switch (response_read_timer_phase) {
+            case ResponseReadTimerPhase::None:
+                return response_read_timer_owner_is_neutral();
+            case ResponseReadTimerPhase::Armed:
+                return keys_valid && timespec_valid && response_read_timer_target_owned &&
+                       !response_read_timer_cancel_owned;
+            case ResponseReadTimerPhase::CancelPending:
+                return keys_valid && timespec_valid &&
+                       (response_read_timer_target_owned || response_read_timer_cancel_owned);
+        }
+        return false;
+    }
+
+    // Clear is legal only after every kernel owner has drained. This protects
+    // response_read_timer_timespec from reset/reuse while IORING_OP_TIMEOUT can
+    // still dereference it.
+    bool clear_response_read_timer_owner() {
+        if (response_read_timer_target_owned || response_read_timer_cancel_owned) return false;
+        visit_response_read_timer_owner_fields(
+            *this, [](auto& value, const auto& reset_value) { value = reset_value; });
+        return true;
+    }
+
+    bool next_response_read_timer_generation() {
+        if (!response_read_timer_owner_is_neutral() ||
+            response_read_timer_generation >= kResponseReadTimerGenerationMask)
+            return false;
+        ++response_read_timer_generation;
+        response_read_timer_owner_generation = response_read_timer_generation;
+        return true;
+    }
+
+    // Consume one exact target/cancel CQE. CancelPending owners drain
+    // independently; their keys remain unchanged until the second CQE arrives.
+    bool consume_response_read_timer_completion(u32 tagged_generation) {
+        if (!response_read_timer_owner_is_valid()) return false;
+        const bool cancel = (tagged_generation & kResponseReadTimerCancelBit) != 0;
+        const u32 generation = tagged_generation & kResponseReadTimerGenerationMask;
+        if (generation == 0 || generation != response_read_timer_owner_generation) return false;
+        if (response_read_timer_phase == ResponseReadTimerPhase::Armed) {
+            if (cancel || !response_read_timer_target_owned || response_read_timer_cancel_owned)
+                return false;
+            response_read_timer_target_owned = false;
+        } else if (response_read_timer_phase == ResponseReadTimerPhase::CancelPending) {
+            bool& owned =
+                cancel ? response_read_timer_cancel_owned : response_read_timer_target_owned;
+            if (!owned) return false;
+            owned = false;
+        } else {
+            return false;
+        }
+        if (!response_read_timer_target_owned && !response_read_timer_cancel_owned) {
+            const bool cleared = clear_response_read_timer_owner();
+            if (cleared && response_read_deadline_state == ResponseReadDeadlineState::None)
+                response_read_timer_last_progress_ns = 0;
+            return cleared;
+        }
+        return true;
+    }
 
     bool next_response_read_deadline_send_generation() {
         if (response_read_deadline_send_generation == kNonUpstreamSendGenerationMask) return false;
@@ -677,6 +841,11 @@ struct ConnectionBase {
         visit(c.response_read_deadline_post_commit_episode, u32{0});
         visit(c.response_read_deadline_post_commit_raw_header_end, u32{0});
         visit(c.response_read_deadline_post_commit_declared_body, u32{0});
+        visit(c.response_read_deadline_post_commit_response_class,
+              CompleteContentLengthResponseClass::Unsupported);
+        visit(c.response_read_deadline_post_commit_range_first, u64{0});
+        visit(c.response_read_deadline_post_commit_range_last, u64{0});
+        visit(c.response_read_deadline_post_commit_range_total, u64{0});
         visit(c.response_read_deadline_post_commit_origin_received, u32{0});
         visit(c.response_read_deadline_post_commit_downstream_submitted, u32{0});
         visit(c.response_read_deadline_post_commit_downstream_completed, u32{0});
@@ -737,6 +906,11 @@ struct ConnectionBase {
         check(response_read_deadline_post_commit_episode, u32{0});
         check(response_read_deadline_post_commit_raw_header_end, u32{0});
         check(response_read_deadline_post_commit_declared_body, u32{0});
+        check(response_read_deadline_post_commit_response_class,
+              CompleteContentLengthResponseClass::Unsupported);
+        check(response_read_deadline_post_commit_range_first, u64{0});
+        check(response_read_deadline_post_commit_range_last, u64{0});
+        check(response_read_deadline_post_commit_range_total, u64{0});
         check(response_read_deadline_post_commit_origin_received, u32{0});
         check(response_read_deadline_post_commit_downstream_submitted, u32{0});
         check(response_read_deadline_post_commit_downstream_completed, u32{0});
@@ -762,6 +936,7 @@ struct ConnectionBase {
         clear_response_read_deadline_send_owner();
         response_read_deadline_upload.clear_owner();
         response_read_deadline_first_batch_upload.clear_owner();
+        if (response_read_timer_owner_is_neutral()) response_read_timer_last_progress_ns = 0;
     }
 
     template <typename Self, typename Visitor>
@@ -1470,6 +1645,11 @@ struct ConnectionBase {
         clear_response_read_deadline();
         visit_response_read_deadline_send_close_owner_fields(
             *this, [](auto& value, const auto& reset_value) { value = reset_value; });
+        // The precise response-read timer owns its on-connection timespec until
+        // both target/cancel CQEs drain. Preserve active ownership across reset;
+        // neutral storage may be hygienically cleared without touching its
+        // persistent generation counter.
+        if (response_read_timer_owner_is_neutral()) clear_response_read_timer_owner();
         request_config = nullptr;
         listener_context = {};
         pending_handler_fn = nullptr;

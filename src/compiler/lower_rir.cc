@@ -8,6 +8,40 @@ namespace rut {
 
 namespace {
 
+static bool response_read_deadline_request_policy_is_admitted_for_term(const MirModule& module,
+                                                                       u8 route_method,
+                                                                       const MirTerminator& term) {
+    if (response_read_deadline_request_policy_is_admitted(term.forward_request_policy_id))
+        return true;
+    if (route_method == kRouteMethodGet &&
+        term.forward_request_policy_id ==
+            static_cast<u16>(RequestPolicyId::Http11FixedTrimSpPreserveHtab) &&
+        term.forward_response_buffering == ForwardResponseBufferingMode::CompleteContentLength &&
+        response_read_timeout_seconds_valid(term.forward_response_read_timeout_seconds))
+        return true;
+    return term.forward_response_buffering == ForwardResponseBufferingMode::None &&
+           fixed_upload_head_route_method_is_admitted(route_method) &&
+           fixed_upload_head_request_policy_is_admitted(term.forward_request_policy_id) &&
+           term.forward_response_policy_id != 0 &&
+           term.forward_response_policy_id <= module.response_policies.len &&
+           term.forward_failure_policy_id != 0 &&
+           term.forward_failure_policy_id <= module.failure_policies.len &&
+           term.forward_timeout_failure_policy_id != 0 &&
+           term.forward_timeout_failure_policy_id <= module.failure_policies.len &&
+           fixed_upload_head_timeout_policies_valid(
+               module.response_policies[term.forward_response_policy_id - 1],
+               module.failure_policies[term.forward_failure_policy_id - 1],
+               module.failure_policies[term.forward_timeout_failure_policy_id - 1]);
+}
+
+static bool complete_content_length_request_policy_is_admitted_for_term(u8 route_method,
+                                                                        const MirTerminator& term) {
+    return complete_content_length_request_policy_is_admitted(term.forward_request_policy_id) ||
+           (route_method == kRouteMethodGet &&
+            term.forward_request_policy_id ==
+                static_cast<u16>(RequestPolicyId::Http11FixedTrimSpPreserveHtab));
+}
+
 static u8 yield_kind_abi(WaitEventKind kind) {
     switch (kind) {
         case WaitEventKind::Timer:
@@ -3096,14 +3130,17 @@ static FrontendResult<void> emit_term(const MirTerminator& term,
         if (term.forward_response_read_timeout_seconds != 0 &&
             !response_read_timeout_seconds_valid(term.forward_response_read_timeout_seconds))
             return frontend_error(FrontendError::UnsupportedSyntax, term.span);
+        if (term.forward_response_read_timeout_seconds != 0 &&
+            !response_read_deadline_request_policy_is_admitted_for_term(mir, fn->http_method, term))
+            return frontend_error(FrontendError::UnsupportedSyntax, term.span);
         if (!forward_response_buffering_mode_valid(term.forward_response_buffering))
             return frontend_error(FrontendError::UnsupportedSyntax, term.span);
         if (term.forward_response_buffering != ForwardResponseBufferingMode::None) {
             if (term.forward_response_buffering !=
                     ForwardResponseBufferingMode::CompleteContentLength ||
                 term.forward_response_read_timeout_seconds == 0 ||
-                !complete_content_length_request_policy_is_admitted(
-                    term.forward_request_policy_id) ||
+                !complete_content_length_request_policy_is_admitted_for_term(fn->http_method,
+                                                                             term) ||
                 term.forward_response_policy_id == 0 || term.forward_failure_policy_id == 0 ||
                 term.forward_timeout_failure_policy_id == 0 ||
                 term.forward_response_policy_id > b.mod->response_policy_count ||
@@ -3207,7 +3244,10 @@ static FrontendResult<void> emit_term(const MirTerminator& term,
                 term.forward_response_buffering != ForwardResponseBufferingMode::None) {
                 if (fn == nullptr ||
                     !forward_preflight_mode_can_own_runtime_deadline(fn->forward_preflight_mode) ||
-                    fn->preflight_forward_policy_bundle_id != 0)
+                    (fn->preflight_forward_policy_bundle_id != 0 &&
+                     (fn->forward_preflight_mode !=
+                          ForwardPreflightMode::AfterRequestFramingSelection ||
+                      fn->preflight_forward_policy_bundle_id != bundle_id)))
                     return frontend_error(FrontendError::UnsupportedSyntax, term.span);
                 fn->preflight_forward_policy_bundle_id = bundle_id;
             }
@@ -3306,7 +3346,12 @@ static bool mir_forward_preflight_lowering_shape_valid(const MirModule& module,
     }
     if (timeout_term == nullptr)
         return function.forward_preflight_mode == ForwardPreflightMode::None;
-    if (timeout_count != 1) return false;
+    const bool framing_selection =
+        function.forward_preflight_mode == ForwardPreflightMode::AfterRequestFramingSelection;
+    if (timeout_count != (framing_selection ? 2u : 1u)) return false;
+    if (!response_read_deadline_request_policy_is_admitted_for_term(
+            module, function.method, *timeout_term))
+        return false;
     const bool common = function.locals.len == 0 && function.waits.len == 0 &&
                         !function.state_zero_enters_entry && !function.has_explicit_resume_blocks &&
                         function.rate_limit.count == 0 && function.throttle_down_bps == 0 &&
@@ -3322,8 +3367,76 @@ static bool mir_forward_preflight_lowering_shape_valid(const MirModule& module,
                !timeout_term->has_forward_target_transform &&
                !timeout_term->commit_response_mutations &&
                (!complete || (complete_content_length_route_method_is_admitted(function.method) &&
-                              complete_content_length_request_policy_is_admitted(
-                                  timeout_term->forward_request_policy_id)));
+                              complete_content_length_request_policy_is_admitted_for_term(
+                                  function.method, *timeout_term)));
+    }
+    if (framing_selection) {
+        const bool head_framing = function.method == kRouteMethodHead;
+        const bool get_framing = function.method == kRouteMethodGet;
+        if (!common || (!head_framing && !get_framing) || function.blocks.len != 3 ||
+            function.values.len != 0)
+            return false;
+        const auto& entry = function.blocks[0];
+        const auto& after_host = function.blocks[1].term;
+        const auto& legacy = function.blocks[2].term;
+        if (entry.effects.len != 0 || function.blocks[1].effects.len != 0 ||
+            function.blocks[2].effects.len != 0 || entry.term.kind != MirTerminatorKind::Branch ||
+            entry.term.then_block != 1 || entry.term.else_block != 2 ||
+            entry.term.cond.kind != MirValueKind::ReqHasContentLength ||
+            entry.term.cond.type != MirTypeKind::Bool || entry.term.cond.lhs != nullptr ||
+            entry.term.cond.rhs != nullptr)
+            return false;
+        auto exact_forward = [&](const MirTerminator& term,
+                                 RequestPolicyId policy,
+                                 ForwardResponseBufferingMode buffering) {
+            return term.kind == MirTerminatorKind::ForwardUpstream &&
+                   term.source_kind == MirTerminatorSourceKind::Literal &&
+                   term.local_ref_index == 0xffffffffu && term.status_code == 0 &&
+                   !term.commit_response_mutations && term.response_body.ptr == nullptr &&
+                   term.response_headers.len == 0 && term.redirect_policy_id == 0 &&
+                   term.upstream_index < module.upstreams.len &&
+                   term.forward_set_path.ptr == nullptr && term.forward_set_headers.len == 0 &&
+                   !term.has_forward_target_transform &&
+                   term.forward_request_policy_id == static_cast<u16>(policy) &&
+                   response_read_timeout_seconds_valid(
+                       term.forward_response_read_timeout_seconds) &&
+                   term.forward_response_buffering == buffering &&
+                   response_read_deadline_request_policy_is_admitted_for_term(
+                       module, function.method, term) &&
+                   (buffering == ForwardResponseBufferingMode::None ||
+                    (get_framing && term.forward_response_policy_id != 0 &&
+                     term.forward_response_policy_id <= module.response_policies.len &&
+                     term.forward_failure_policy_id != 0 &&
+                     term.forward_failure_policy_id <= module.failure_policies.len &&
+                     term.forward_timeout_failure_policy_id != 0 &&
+                     term.forward_timeout_failure_policy_id <= module.failure_policies.len &&
+                     complete_content_length_buffering_policies_valid(
+                         module.response_policies[term.forward_response_policy_id - 1],
+                         module.failure_policies[term.forward_failure_policy_id - 1],
+                         module.failure_policies[term.forward_timeout_failure_policy_id - 1])));
+        };
+        const bool exact_head =
+            head_framing &&
+            exact_forward(after_host,
+                          RequestPolicyId::Http11FixedStripContentLengthAfterHost,
+                          ForwardResponseBufferingMode::None) &&
+            exact_forward(
+                legacy, RequestPolicyId::Http11FixedStrip, ForwardResponseBufferingMode::None);
+        const bool exact_get = get_framing &&
+                               exact_forward(after_host,
+                                             RequestPolicyId::Http11FixedStrip,
+                                             ForwardResponseBufferingMode::CompleteContentLength) &&
+                               exact_forward(legacy,
+                                             RequestPolicyId::Http11FixedTrimSpPreserveHtab,
+                                             ForwardResponseBufferingMode::CompleteContentLength);
+        return (exact_head || exact_get) && after_host.upstream_index == legacy.upstream_index &&
+               after_host.forward_response_policy_id == legacy.forward_response_policy_id &&
+               after_host.forward_failure_policy_id == legacy.forward_failure_policy_id &&
+               after_host.forward_timeout_failure_policy_id ==
+                   legacy.forward_timeout_failure_policy_id &&
+               after_host.forward_response_read_timeout_seconds ==
+                   legacy.forward_response_read_timeout_seconds &&
+               after_host.forward_response_buffering == legacy.forward_response_buffering;
     }
     if (function.forward_preflight_mode != ForwardPreflightMode::AfterCanonicalSelection ||
         !common || function.method == kRouteMethodAny ||
@@ -3390,7 +3503,7 @@ static bool mir_forward_preflight_lowering_shape_valid(const MirModule& module,
            response_read_timeout_seconds_valid(forward.forward_response_read_timeout_seconds) &&
            forward.forward_response_buffering ==
                ForwardResponseBufferingMode::CompleteContentLength &&
-           complete_content_length_request_policy_is_admitted(forward.forward_request_policy_id) &&
+           complete_content_length_request_policy_is_admitted_for_term(function.method, forward) &&
            policy_bundle_valid;
 }
 
