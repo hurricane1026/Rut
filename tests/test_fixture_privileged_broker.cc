@@ -7488,7 +7488,9 @@ static bool run_wildcard_live_target(int control,
             if (close(descriptor) != 0) break;
         }
         std::string collision_source;
-        if (mode != 2u) {
+        // Early guard loss is reported immediately. Waiting for a collision
+        // child after destroying that collision prerequisite is not evidence.
+        if (mode != 2u && mode != 3u) {
             if (!prepare_wildcard_attempt(
                     exact_child, held, "wildcard-collision", collision, collision_source))
                 break;
@@ -12747,7 +12749,8 @@ static bool run_wildcard_live_parent(int control,
         if (!receive_frame_until(control, frame, deadline) || frame.type != kWildcardLivePhase ||
             !token_equal(frame.token, token) ||
             frame.payload.size() != (4u + kWildcardHandoffFields) * sizeof(u64)) {
-            error = "wildcard live phase transport failed";
+            error = "wildcard live phase transport failed while awaiting phase " +
+                    std::to_string(next_phase);
             return false;
         }
         const u64 phase = read_u64(frame.payload.data() + 3u * sizeof(u64));
@@ -12899,7 +12902,7 @@ static bool run_wildcard_live_parent(int control,
                            target_socket_inode(
                                target.pid, static_cast<int>(held.guard_fd), held.socket_inode);
                 return target_fd_absent(target.pid, static_cast<int>(held.guard_fd)) &&
-                       report.collision_exit_one == 1u && report.collision_log_eaddrinuse == 1u;
+                       report.collision_pid == 0u && absent_files("wildcard-collision");
             }
             if (mode == 4u || mode == 5u) {
                 auto wrong_plan = held.plan;

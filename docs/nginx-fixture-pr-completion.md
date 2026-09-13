@@ -54,3 +54,16 @@ build/link and both protocol/wait-strategy self-checks pass. The local ordinary
 run returns prerequisite skip 77 because passwordless sudo is unavailable;
 this is not live acceptance. Fresh full and required privileged CI must pass
 before #376 or #269 merge. No converter/runtime or compatibility expansion.
+
+### First current-head privileged failure (retained)
+
+Head `7d8cef33`, required run `34741038124`, passed topology direct/CTest and
+MissingCollision plus its fresh canonical wildcard recovery. PrematureGuardRelease
+then failed waiting for a live phase report; final audit was
+`residual-count=0 audit-error=0`. Full log:
+`/tmp/rut376-7d8f-privileged-first.log`. No acceptance or unchanged rerun follows.
+The early-release branch incorrectly waited for a collision terminal after
+removing the guard prerequisite. The correction reports actual missing guard
+custody immediately, with the original exact listener still live. The parent
+requires that specific live state and no collision artifacts before accepting
+the negative control, then independently verifies cleanup and canonical recovery.
