@@ -7054,6 +7054,99 @@ struct ScopedWatermarkTestResources {
 };
 }  // namespace
 
+TEST(tls_iouring, exact_local_response_normalized_fragmented_and_sequential) {
+    if (!iouring_socket_live()) SKIP("io_uring async socket ops unavailable");
+    auto config = std::make_unique<RouteConfig>();
+    char body[1024];
+    memset(body, 'x', sizeof(body));
+    StrictLocalResponsePolicySpec policy{};
+    policy.version = StrictLocalResponseVersion::Http11;
+    policy.status_code = 200;
+    policy.date = StrictLocalResponseDate::Current;
+    policy.connection = StrictLocalResponseConnection::Request;
+    policy.head_mode = StrictLocalResponseHeadMode::SuppressBody;
+    policy.reason = lit_str("OK");
+    policy.content_type = lit_str("text/plain");
+    policy.server = lit_str("rut");
+    policy.body = {body, sizeof(body)};
+    const u16 id = config->add_strict_local_response_policy(policy);
+    REQUIRE(id != 0);
+    ExactStrictLocalResponseBinding binding{};
+    memcpy(binding.path, "/assets/static", 14);
+    binding.path_len = 14;
+    binding.path_view = ExactPathView::SlashNormalized;
+    binding.method = kRouteMethodAny;
+    binding.policy_id = id;
+    REQUIRE(config->append_exact_strict_local_response_binding(binding, id));
+    REQUIRE(config->strict_local_response_table_is_valid());
+    const RouteConfig* active = config.get();
+    Shard<IoUringEventLoop> shard;
+    ScopedWatermarkTestResources resources;
+    resources.shard = &shard;
+    auto tls = create_tls_server_context(kTestCertPath, kTestKeyPath);
+    REQUIRE(tls.has_value());
+    resources.tls_server_ctx = tls.value();
+    resources.listen_fd = create_listen_socket(0).value_or(-1);
+    REQUIRE(resources.listen_fd >= 0);
+    const u16 port = get_port(resources.listen_fd);
+    auto initialized = shard.init(0, resources.listen_fd);
+    resources.shard_initialized = initialized.has_value();
+    REQUIRE(initialized.has_value());
+    shard.loop->tls_server = tls.value();
+    shard.loop->config_ptr = &active;
+    REQUIRE(shard.spawn(-1).has_value());
+    resources.client_ctx = create_test_client_ctx();
+    REQUIRE(resources.client_ctx != nullptr);
+    resources.client_fd = connect_to(port);
+    REQUIRE(resources.client_fd >= 0);
+    set_socket_timeouts(resources.client_fd, 3);
+    resources.client_ssl = SSL_new(resources.client_ctx);
+    REQUIRE(resources.client_ssl != nullptr);
+    REQUIRE_EQ(SSL_set_fd(resources.client_ssl, resources.client_fd), 1);
+    REQUIRE_EQ(SSL_connect(resources.client_ssl), 1);
+    for (u32 request = 0; request < 4; ++request) {
+        const char* wire =
+            request == 3   ? "GET /assets//static HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n"
+            : request == 1 ? "HEAD /assets//static HTTP/1.1\r\nHost: x\r\n\r\n"
+                           : "GET /assets//static HTTP/1.1\r\nHost: x\r\n\r\n";
+        REQUIRE(ssl_write_all(resources.client_ssl, wire, 12));
+        usleep(1000);
+        REQUIRE(
+            ssl_write_all(resources.client_ssl, wire + 12, static_cast<u32>(strlen(wire)) - 12));
+        const u32 expected_body = request == 1 ? 0u : sizeof(body);
+        char received[4096]{};
+        u32 total = 0;
+        char* end = nullptr;
+        while (total < sizeof(received) - 1) {
+            const int count = SSL_read(resources.client_ssl,
+                                       received + total,
+                                       static_cast<int>(sizeof(received) - 1 - total));
+            // A worker wakeup can interrupt the blocking BIO read. Retry the
+            // identical SSL operation only for EINTR; socket timeouts still fail.
+            if (count <= 0 && errno == EINTR &&
+                SSL_get_error(resources.client_ssl, count) == SSL_ERROR_WANT_READ)
+                continue;
+            REQUIRE(count > 0);
+            total += static_cast<u32>(count);
+            end = strstr(received, "\r\n\r\n");
+            if (end != nullptr && total >= static_cast<u32>(end + 4 - received) + expected_body)
+                break;
+        }
+        REQUIRE(end != nullptr);
+        CHECK_EQ(memcmp(received, "HTTP/1.1 200 OK\r\n", 17), 0);
+        CHECK(strstr(received, "Content-Length: 1024\r\n") != nullptr);
+        CHECK_EQ(total, static_cast<u32>(end + 4 - received) + expected_body);
+        CHECK_EQ(memcmp(end + 4, body, expected_body), 0);
+    }
+    char extra;
+    int closed;
+    do {
+        closed = SSL_read(resources.client_ssl, &extra, 1);
+    } while (closed < 0 && errno == EINTR &&
+             SSL_get_error(resources.client_ssl, closed) == SSL_ERROR_WANT_READ);
+    CHECK_EQ(closed, 0);
+}
+
 TEST(proxy_tls_iouring, watermark_observer_guard_scopes_callbacks_and_cleanup) {
     ScopedWatermarkTestResources resources;
     REQUIRE(resources.arm_observers());
