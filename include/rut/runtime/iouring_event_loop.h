@@ -4096,6 +4096,46 @@ public:
     void resolve_response_read_deadline_expiries() {
         if (!response_read_deadline_expiry_pending) return;
         response_read_deadline_expiry_pending = false;
+        const auto finalize_streaming_inactivity = [&](Connection& c) {
+            if (c.response_read_deadline_buffering != ForwardResponseBufferingMode::None ||
+                c.response_read_deadline_profile !=
+                    ResponseReadDeadlineProfile::BodylessNonHeadContentLengthZero ||
+                c.req_method != static_cast<u8>(LogHttpMethod::Get) ||
+                c.response_read_deadline_post_commit_phase !=
+                    ResponseReadDeadlinePostCommitPhase::WaitingBody ||
+                c.state != ConnState::Sending || c.req_start_us == 0 || c.epoch_held ||
+                !response_read_deadline_identity_is_stable(c) ||
+                !response_read_deadline_post_commit_is_stable(c) ||
+                c.response_read_deadline_post_commit_downstream_submitted !=
+                    c.response_read_deadline_post_commit_origin_received ||
+                c.response_read_deadline_post_commit_downstream_completed !=
+                    c.response_read_deadline_post_commit_origin_received ||
+                c.response_read_deadline_post_commit_origin_received >=
+                    c.response_read_deadline_post_commit_declared_body ||
+                c.response_read_deadline_post_commit_inflight_body != 0 ||
+                c.upstream_recv_buf.len() != 0 || c.send_armed ||
+                c.response_read_deadline_send_owner_active || c.send_progress != 0 ||
+                c.resp_body_mode != BodyMode::ContentLength ||
+                c.resp_body_remaining != c.response_read_deadline_post_commit_declared_body -
+                                             c.response_read_deadline_post_commit_origin_received ||
+                c.resp_body_sent != c.response_header_buf.len() +
+                                        c.response_read_deadline_post_commit_origin_received ||
+                c.on_send != &on_response_body_sent<Self>)
+                return false;
+            // ExpiryPending is the single timer-side entry point. Completion consumes
+            // req_start_us, clears every callback slot, and leaves the epoch once;
+            // close_conn then disarms the deadline and invalidates the fd. A duplicate
+            // expiry therefore cannot complete the request or leave the epoch twice.
+            c.clear_slots();
+            if (c.upstream_slot_held) {
+                upstream_release(c.upstream_slot_uid);
+                c.upstream_slot_held = false;
+            }
+            on_request_complete<Self>(this, c, c.resp_status, c.resp_body_sent);
+            epoch_leave();
+            close_conn(c);
+            return true;
+        };
         for (u32 id = 0; id < kMaxConns; id++) {
             Connection& c = conns[id];
             if (c.response_read_deadline_state != ResponseReadDeadlineState::ExpiryPending)
@@ -4109,6 +4149,10 @@ public:
                     close_conn(c);
                 continue;
             }
+            if (c.response_read_deadline_post_commit_phase ==
+                    ResponseReadDeadlinePostCommitPhase::WaitingBody &&
+                finalize_streaming_inactivity(c))
+                continue;
             if (c.response_read_deadline_post_commit_phase !=
                 ResponseReadDeadlinePostCommitPhase::None) {
                 close_conn(c);

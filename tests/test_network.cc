@@ -51976,10 +51976,109 @@ TEST(response_buffering_runtime,
 }
 
 TEST(response_read_deadline_get_positive_cl,
+     streaming_inactivity_completion_rejects_stale_or_incomplete_ownership) {
+    enum class Mutation {
+        None,
+        RequestReleased,
+        EpochHeld,
+        BodyIncomplete,
+        StaleGeneration,
+        StaleEpisode,
+        NonWaitingBody
+    };
+    for (const Mutation mutation : {Mutation::None,
+                                    Mutation::RequestReleased,
+                                    Mutation::EpochHeld,
+                                    Mutation::BodyIncomplete,
+                                    Mutation::StaleGeneration,
+                                    Mutation::StaleEpisode,
+                                    Mutation::NonWaitingBody}) {
+        ScopedIoUringLoopForRetirement guard;
+        if (!guard.init()) SKIP("io_uring unavailable");
+        auto* loop = guard.loop;
+        ShardMetrics metrics{};
+        metrics.init();
+        AccessLogRing access_log{};
+        access_log.init();
+        loop->metrics = &metrics;
+        loop->access_log = &access_log;
+        RouteConfig config{};
+        REQUIRE(config.add_upstream("backend", 0x7F000001, 9000).has_value());
+        REQUIRE(add_bodyless_non_head_response_read_deadline_bundle(config));
+        PrebuiltD2Fixture fixture{};
+        REQUIRE(stage_strict_read_timeout(loop, &config, nullptr, 0, &fixture, true));
+        REQUIRE(arm_staged_response_read_deadline(loop, fixture));
+        Connection& conn = *fixture.conn;
+        const u32 id = conn.id;
+        static constexpr u8 kResponse[] = "HTTP/1.1 200 OK\r\nContent-Length: 3\r\n\r\na";
+        REQUIRE_EQ(conn.upstream_recv_buf.write(kResponse, sizeof(kResponse) - 1u),
+                   sizeof(kResponse) - 1u);
+        const IoEvent response =
+            response_read_copy_event(conn, sizeof(kResponse) - 1u, true, 0, sizeof(kResponse) - 1u);
+        loop->dispatch_batch(&response, 1);
+        REQUIRE_GE(conn.fd, 0);
+        const IoEvent header = exact_response_deadline_send_event(loop, conn);
+        loop->dispatch_batch(&header, 1);
+        REQUIRE_EQ(conn.response_read_deadline_post_commit_phase,
+                   ResponseReadDeadlinePostCommitPhase::BodySend);
+        const IoEvent body = exact_response_deadline_send_event(loop, conn);
+        loop->dispatch_batch(&body, 1);
+        REQUIRE_EQ(conn.response_read_deadline_post_commit_phase,
+                   ResponseReadDeadlinePostCommitPhase::WaitingBody);
+        const u32 expected_response_size = conn.response_header_buf.len() + 1u;
+        if (mutation == Mutation::RequestReleased)
+            conn.req_start_us = 0;
+        else if (mutation == Mutation::EpochHeld)
+            conn.epoch_held = true;
+        else if (mutation == Mutation::BodyIncomplete)
+            conn.response_read_deadline_post_commit_downstream_completed = 0;
+        else if (mutation == Mutation::StaleGeneration)
+            conn.response_read_deadline_post_commit_generation++;
+        else if (mutation == Mutation::StaleEpisode)
+            conn.upstream_episode++;
+        else if (mutation == Mutation::NonWaitingBody)
+            conn.response_read_deadline_post_commit_phase =
+                ResponseReadDeadlinePostCommitPhase::BodySend;
+        loop->timer.remove(&conn);
+        loop->timer.add(&conn, 0);
+        const IoEvent timeout{0, 1, 0, 0, IoEventType::Timeout, 0};
+        loop->dispatch_batch(&timeout, 1);
+        CHECK_EQ(loop->conns[id].fd, -1);
+        CHECK_EQ(metrics.requests_total, mutation == Mutation::None ? 1u : 0u);
+        if (mutation == Mutation::None) {
+            AccessLogEntry access{};
+            REQUIRE(access_log.pop(access));
+            CHECK_EQ(access.status, 200u);
+            CHECK_EQ(access.method, static_cast<u8>(LogHttpMethod::Get));
+            CHECK_EQ(access.req_size, 40u);
+            CHECK_EQ(access.resp_size, expected_response_size);
+            AccessLogEntry extra{};
+            CHECK_FALSE(access_log.pop(extra));
+            loop->dispatch_batch(&timeout, 1);
+            loop->dispatch_batch(&body, 1);
+            CHECK_EQ(metrics.requests_total, 1u);
+            CHECK_EQ(metrics.requests_active, 0u);
+            AccessLogEntry after_duplicate{};
+            CHECK_FALSE(access_log.pop(after_duplicate));
+        } else {
+            AccessLogEntry access{};
+            CHECK_FALSE(access_log.pop(access));
+        }
+        release_closed_response_read_fixture(fixture);
+    }
+}
+
+TEST(response_read_deadline_get_positive_cl,
      coalesced_progress_commits_once_then_post_commit_stall_closes_without_504) {
     ScopedIoUringLoopForRetirement guard;
     if (!guard.init()) SKIP("io_uring unavailable");
     auto* loop = guard.loop;
+    ShardMetrics metrics{};
+    metrics.init();
+    AccessLogRing access_log{};
+    access_log.init();
+    loop->metrics = &metrics;
+    loop->access_log = &access_log;
     RouteConfig config{};
     REQUIRE(config.add_upstream("backend", 0x7F000001, 9000).has_value());
     REQUIRE(add_bodyless_non_head_response_read_deadline_bundle(config));
@@ -52036,6 +52135,14 @@ TEST(response_read_deadline_get_positive_cl,
     CHECK_EQ(loop->conns[id].fd, -1);
     CHECK_EQ(loop->backend.send_state[id].remaining, 0u);
     CHECK_EQ(loop->conns[id].http1_prebuilt_response_purpose, Http1PrebuiltResponsePurpose::None);
+    CHECK_EQ(metrics.requests_total, 1u);
+    CHECK_EQ(metrics.requests_active, 0u);
+    AccessLogEntry access{};
+    REQUIRE(access_log.pop(access));
+    CHECK_EQ(access.status, 200u);
+    CHECK_EQ(access.resp_size, header_len + 1u);
+    AccessLogEntry extra{};
+    CHECK_FALSE(access_log.pop(extra));
     release_closed_response_read_fixture(fixture);
 }
 
