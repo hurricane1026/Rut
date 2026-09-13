@@ -16,6 +16,7 @@ from run import (
     response_head,
 )
 from summarize import aggregate, render
+from matrix import assess
 
 
 class FakeSocket:
@@ -30,6 +31,42 @@ class FakeSocket:
 
 
 class ToolsTest(unittest.TestCase):
+    def test_large_body_preflight_is_exact_and_bounded(self):
+        size = 1048576
+        head = f"HTTP/1.1 200 OK\r\nContent-Length: {size}\r\n\r\n".encode()
+        chunks = [head] + [b"x" * 4096] * (size // 4096)
+        raw, closed = response(FakeSocket(chunks), "proxy", True, body_size=size)
+        self.assertTrue(raw.endswith(b"x" * size))
+        with self.assertRaises(ValueError):
+            response_head(head)
+        with self.assertRaises(ValueError):
+            response(FakeSocket(chunks[:-1]), "proxy", True, body_size=size)
+        with self.assertRaises(ValueError):
+            response(FakeSocket([head, b"y" * size]), "proxy", True, body_size=size)
+
+    def test_matrix_missing_wrong_shape_errors_and_smoke_never_pass(self):
+        import copy
+        rows = []
+        for engine, rps in (("nginx", 100), ("rut", 120)):
+            for rep in (1, 2, 3):
+                rows.append(dict(workload="proxy", connection="close", transport="https",
+                                 body_size=65536, concurrency=32, engine=engine, rep=rep,
+                                 requests=500, rps=rps, valid=True,
+                                 errors=dict(connect=0, read=0, write=0, status=0, timeout=0),
+                                 warmup_errors=dict(connect=0, read=0, write=0, status=0, timeout=0)))
+        def evaluate(data, duration=5):
+            return assess(data, "proxy-close", "https", 65536, 32, 3, duration)
+        self.assertTrue(evaluate(rows)["target_met"])
+        self.assertFalse(evaluate(rows[:-1])["target_met"])
+        self.assertFalse(evaluate(rows, duration=1)["target_met"])
+        for key, value in (("body_size", 16), ("transport", "http"), ("rep", 99),
+                           ("valid", False), ("errors", {"timeout": 1}), ("rps", 105)):
+            bad = copy.deepcopy(rows)
+            for row in bad:
+                if row["engine"] == "rut":
+                    row[key] = value
+            self.assertFalse(evaluate(bad)["target_met"], key)
+
     def test_keepalive_wire_profiles_preserve_original_and_default_persistence(self):
         explicit = request_bytes("proxy", False)
         self.assertIn(b"Connection: keep-alive\r\n", explicit)
