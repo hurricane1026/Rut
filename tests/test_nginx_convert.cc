@@ -502,6 +502,31 @@ TEST(nginx_convert_issue621, converts_explicit_buffering_custom_hide_timeout_cli
     CHECK(explicit_run.out.find("hide_headers: [\"Date\", \"Server\", \"X-Pad\", \"X-A\"]") !=
           std::string::npos);
 
+    const std::string off_source =
+        "events {}\nhttp { log_format compat \"$request_length\"; access_log " + access_path +
+        " compat; server { listen 127.0.0.1:8080; location / { proxy_buffering off; "
+        "proxy_read_timeout 1s; proxy_pass http://127.0.0.1:9000; } } }\n";
+    const std::string off_path = directory + "/off.conf";
+    REQUIRE(write_file(off_path, off_source));
+    const RunResult off_run = run_converter(g_executable, "nginx-http", off_path, off_path);
+    REQUIRE(WIFEXITED(off_run.status));
+    CHECK_EQ(WEXITSTATUS(off_run.status), 0);
+    CHECK(off_run.err.empty());
+    CHECK(off_run.out.find("response_read_timeout: 1s") != std::string::npos);
+    CHECK(off_run.out.find("response_buffering:") == std::string::npos);
+    const std::string off_reordered_source =
+        "events {}\nhttp { log_format compat \"$request_length\"; access_log " + access_path +
+        " compat; server { listen 127.0.0.1:8080; location / { proxy_pass "
+        "http://127.0.0.1:9000; proxy_read_timeout 1s; proxy_buffering off; } } }\n";
+    const std::string off_reordered_path = directory + "/off-reordered.conf";
+    REQUIRE(write_file(off_reordered_path, off_reordered_source));
+    const RunResult off_reordered_run =
+        run_converter(g_executable, "nginx-http", off_reordered_path, off_reordered_path);
+    REQUIRE(WIFEXITED(off_reordered_run.status));
+    CHECK_EQ(WEXITSTATUS(off_reordered_run.status), 0);
+    CHECK(off_reordered_run.err.empty());
+    CHECK_EQ(off_reordered_run.out, off_run.out);
+
     const auto diagnostic_prefix = [](const std::string& filename,
                                       const std::string& input,
                                       const std::string& token,
@@ -528,9 +553,9 @@ TEST(nginx_convert_issue621, converts_explicit_buffering_custom_hide_timeout_cli
             {"off",
              "proxy_buffering off; proxy_read_timeout 1s; proxy_pass "
              "http://127.0.0.1:9000; } } }\n",
-             "off",
+             "proxy_buffering",
              0u,
-             "only literal proxy_buffering on is recognized"},
+             "proxy_buffering off source is outside the bounded profile"},
             {"duplicate",
              "proxy_buffering on; proxy_buffering on; proxy_read_timeout 1s; proxy_pass "
              "http://127.0.0.1:9000; } } }\n",
@@ -542,7 +567,7 @@ TEST(nginx_convert_issue621, converts_explicit_buffering_custom_hide_timeout_cli
              "http://127.0.0.1:9000; } } }\n",
              "$buffering",
              0u,
-             "only literal proxy_buffering on is recognized"},
+             "only literal proxy_buffering on or off is recognized"},
             {"no-timeout",
              "proxy_buffering on; proxy_pass http://127.0.0.1:9000; } } }\n",
              "proxy_buffering",

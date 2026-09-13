@@ -68,8 +68,8 @@ approved after lead corrections to Luna's control fixtures. The new standalone
 self-check passed (0.01s), as did six focused regressions (16.40s, zero skips;
 real off oracle 1.68s). Complete candidate #639 merged as `ed0eec96` from
 `f2b1adf3` after independent review and CI `34730518730`: all 14 ordinary jobs
-and required nginx 162/162, zero skips, 717.96s (new oracle 1.83s). The separate
-ordinary-RUT capability witness and same-file converter differential remain pending.
+and required nginx 162/162, zero skips, 717.96s (new oracle 1.83s). The ordinary-RUT capability was subsequently accepted through #642 below;
+the same-file converter differential remains pending.
 The legal-default None witness `7721e5be` loaded through public O2/io_uring but
 failed its joint live ledger/retirement gate (empty access log, 2.42s); the full
 failure and preceding invalid-source spelling are preserved in
@@ -81,9 +81,17 @@ checks, but the public witness still fails with EOF+2000.190475ms; diagnostic
 failure and tracks precise None-stream timer ownership.
 Independent review and local Clang validation of `f49f0885` now prove the
 handwritten ordinary-RUT episode (1.37s, shared gates unchanged) plus 15 focused
-runtime tests / 920 checks. Complete candidate CI and the actual same-file
-converter differential are still required before support promotion. The
-converter still rejects `proxy_buffering off`; no compatibility row is promoted.
+runtime tests / 920 checks. Capability PR #642 merged as `f08b85ba` from final
+head `da180b1c` after complete independent review and CI `34734172519`:
+all 14 ordinary jobs and required nginx 163/163, zero skips, 638.52s;
+public capability 1.32s. #640/#641 are closed with combined behavior/CI evidence.
+Bounded Off model/provenance/lowering `a2358195` is independently approved and
+passes Clang Release build, all 192 parser tests / 19991 checks and converter
+CLI checks. The actual same-file converter differential `607b3bdd` now passes locally
+(3.22s) with selected GET None/1s bundle ownership/mutations and shared pair
+comparator controls. Four focused CTests pass 4/4, zero skips, 6.30s. Complete
+source/test candidate review is independently APPROVED; full CI remains pending
+and no compatibility row is promoted.
 
 | nginx feature | parser | converter | RUT capability | behavior test | status |
 | --- | --- | --- | --- | --- | --- |

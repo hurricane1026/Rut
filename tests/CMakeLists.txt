@@ -3076,6 +3076,18 @@ if(RUT_ENABLE_JIT)
         ENVIRONMENT "RUT_NGINX_DIFFERENTIAL_REQUIRED=1"
     )
     add_test(
+        NAME test_nginx_issue638_explicit_off_cli_differential
+        COMMAND test_nginx_differential --converter-explicit-off-cli-differential
+                $<TARGET_FILE:rut> $<TARGET_FILE:rut-nginx-convert>
+    )
+    set_tests_properties(test_nginx_issue638_explicit_off_cli_differential PROPERTIES
+        LABELS "integration;nginx;differential;docker;network;io_uring"
+        RUN_SERIAL TRUE
+        RESOURCE_LOCK nginx-differential
+        TIMEOUT 120
+        ENVIRONMENT "RUT_NGINX_DIFFERENTIAL_REQUIRED=1"
+    )
+    add_test(
         NAME test_rut_explicit_buffering_off_capability
         COMMAND test_nginx_differential --rut-explicit-buffering-off-capability
                 $<TARGET_FILE:rut>

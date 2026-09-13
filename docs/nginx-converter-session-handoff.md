@@ -33,7 +33,7 @@ exposed tools; the user selects the primary model in the client.
 ## Workspace and preservation
 
 - Assigned worktree: `/home/hurricane/private/code/Rut_issue627_two_second_oracle`.
-- Branch: `nginx-off-capability`, based on accepted #639 merge `ed0eec96`.
+- Branch: `nginx-explicit-off-converter`, based on accepted #642 merge `f08b85ba`.
 - This session started with clean worktree and local/remote HEAD both
   `6942666557d9f9a4303d40de266b640f4920f217`.
 - Current #638 source candidate: `247338de`, independently **APPROVED for the
@@ -80,7 +80,86 @@ Broad #270 remains PARTIAL and #271 remains BLOCKED_BY_RUT. None of that proves
 the new explicit `proxy_buffering off` scope. Verify current issue/PR state if
 making new status claims; these are recorded prior-run results, not reruns.
 
-## CURRENT: ordinary-RUT capability candidate review / PR / CI
+## CURRENT: complete converter candidate review / PR / CI
+
+Source `607b3bdd` now passes the actual same-file converter-stdout nginx/RUT
+pair with selected GET ID1/None/1s bundle/policy ownership and mutation controls,
+shared observation comparator mutations/restoration, and final settled ledgers.
+The complete source/test candidate is independently APPROVED and frozen for
+normal/required CI.
+Final controls are independently APPROVED; Clang Release `-j1` build and four
+focused CTests pass 4/4, zero skips, 6.30s (actual pair 3.22s, oracle 1.68s,
+self-check 0.03s, handwritten capability 1.37s). Logs:
+`/tmp/rut-638-off-pair-controls-build.log` and
+`/tmp/rut-638-off-pair-controls-tests.log`. The unchanged model/CLI increment
+also passed the full 192 parser tests / 19991 checks and CLI tests.
+
+Luna supplied initial model and loaded-validator draft/context extraction;
+the primary used the authorized fallback for remaining corrections and the
+transport/comparator implementation. Different Luna reviewed each increment;
+complete source/test candidate `f08b85ba..607b3bdd` is independently APPROVED.
+#638 stays open and no support row is promoted until full CI evidence.
+
+### Earlier local implementation evidence (historical)
+
+Transport pair `da521207` is independently APPROVED and passes its first real
+same-file converter-stdout nginx/RUT run (3.03s). Clang Release `-j1` build and
+four focused CTests pass 4/4, zero skips, 6.13s; logs:
+`/tmp/rut-638-off-pair-transport-build.log` and
+`/tmp/rut-638-off-pair-transport-tests.log`. The primary agent implemented this
+wrapper under the authorized fallback after the worker twice ended without
+code changes. This is transport evidence only: CURRENT is selected loaded GET
+bundle authentication and mutation/comparator controls, followed by independent
+complete-candidate review and CI. No support promotion yet.
+
+The nginx-side pair context extraction `176a1e96` is independently APPROVED.
+Clang Release `-j1` build and three focused CTests pass 3/3, zero skips,
+3.09s (nginx off oracle 1.71s, shared self-check 0.01s, ordinary-RUT
+capability 1.37s). Logs: `/tmp/rut-638-off-context-build.log` and
+`/tmp/rut-638-off-context-tests.log`. Context success is published only after
+all original capture/config/cleanup/join checks pass; the existing oracle mode
+exercises this path. This extraction is not a converter pair. CURRENT remains
+its actual same-file CLI wrapper; selected loaded GET bundle and mutation
+controls follow before complete candidate acceptance.
+
+Model/provenance/lowering `a2358195` is independently APPROVED and locally
+validated: Clang Release `-j1` build, full parser 192 tests / 19991 checks
+(4.46s), converter CLI 0.05s, zero CTest skips. Logs:
+`/tmp/rut-638-off-model-build.log`, `/tmp/rut-638-off-model-tests.log`,
+`/tmp/rut-638-off-model-fixture-build.log`,
+`/tmp/rut-638-off-model-fixture-tests.log`. The first parser run failed a new
+sibling fixture's unsupported redirect URL; fixing it to the existing accepted
+literal reached the intended off-scope assertion and passed. Review continued
+APPROVE. Initial rejected patches remain `/tmp/rut-638-off-first-unaccepted.patch`
+and `/tmp/rut-638-off-second-unaccepted.patch`; primary fallback corrected
+remaining declaration-order/diagnostic issues and completed controls after
+Luna's implementation. Different Luna reviewed the complete final result.
+Luna is now implementing only differential/CMake changes; lead schedules tests.
+Bounded parser/lowering and CLI stdout are now available, but no actual off
+nginx/RUT pair is yet proven and no support row is promoted.
+
+### Accepted capability and next-stage design
+
+Capability #642 merged into converter integration as
+`f08b85ba208e8955c9fca3644eb966703651af8b`, reviewed final head `da180b1c`.
+CI `34734172519` passed all 14 ordinary jobs and required nginx 163/163,
+zero skips, 638.52s (ordinary capability 1.32s; off oracle 1.63s;
+shared self-check 0.01s). Log `/tmp/rut-642-da180-nginx-ci.log`.
+#640/#641 are closed with combined proof; #638 remains open. Parent #269
+was rechecked OPEN/draft. The new branch starts at the accepted merge.
+The parser/model/provenance/lowering increment is now accepted locally as
+recorded above. Actual converter-stdout differential is still required.
+
+Reviewed design is in #638 comment `5650540578`: exact root loopback
+listener/upstream, no URI/hide/siblings, literal `1s`; authenticate Off semantic
+value and full fresh server inventory with supplied/fresh relative spans and
+coherent borrows. Reuse existing full parser consumption, not another gap
+scanner. Generated GET omits response_buffering for ordinary default None.
+The pair must sequentially reuse the same immutable config, ports and access
+path, snapshot nginx's ledger before creating RUT's empty sink, and consume
+actual standalone converter stdout. Shared #638 capture/gates remain unchanged.
+
+### Accepted capability local evidence (before final CI)
 
 Source `f49f0885` now passes the unchanged handwritten public O2/io_uring
 capability witness (first run 1.37s, zero skips), including shared negative
@@ -222,14 +301,12 @@ capability or converter admission.
 
 ## NEXT
 
-1. Complete capability candidate normal/required CI and integrate only into
-   `agent/nginx-to-rut-converter`; close #640/#641 only after full evidence.
-2. Implement bounded off model/lowering and the actual same-file
-   nginx-versus-generated-RUT differential pair.
-3. Independently review/CI the pair and update only the exact proven scope.
+1. Complete normal/required CI for the independently approved source candidate.
+2. Integrate only into converter integration after evidence passes.
+3. Update only the exact proven scope and resolve #638.
 
-`proxy_buffering off` is still rejected by the converter. Candidate runtime
-paths from a source audit are not behavioral proof. Do not declare SUPPORTED
+The bounded `proxy_buffering off` model/lowering is locally validated.
+Parser and generated-source tests are not paired runtime behavioral proof. Do not declare SUPPORTED
 until the precise supported input scope has actual equivalence evidence.
 
 ## Testing and issue discipline
@@ -264,7 +341,10 @@ Verify git/GitHub state and preserve unrelated user WIP in the main worktree.
 The audit, snapshots/ownership and shared validator/controls are complete.
 The nginx-only candidate passed complete CI and merged as ed0eec96.
 Shared capture d9e1733a passed independent review, Release build and 7/7 tests.
-Next finish the dedicated ordinary-RUT public capability witness.
+The dedicated ordinary-RUT capability passed full CI and merged as f08b85ba.
+Bounded Off model/provenance/lowering a2358195 passed independent review and
+parser/CLI validation. Actual converter-stdout pair and controls 607b3bdd pass local validation.
+Next finish complete-candidate review/PR/normal and required CI.
 Proceed with one small implementation → different-worker review →
 lead-scheduled tests → status/issue update at a time. Do not claim off support
 from untested source or nginx-only evidence. Keep parent PR #269 draft and

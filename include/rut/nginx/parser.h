@@ -74,12 +74,18 @@ struct ProxyReadTimeout {
     Span value_span{};
 };
 
+enum class ProxyBufferingValue : u8 {
+    On,
+    Off,
+};
+
 // Explicit proxy buffering retains provenance for the bounded verified lowering
 // profile; broader buffering modes and runtime semantics remain unsupported.
 struct ProxyBuffering {
     bool present = false;
     Span span{};
     Span value_span{};
+    ProxyBufferingValue value = ProxyBufferingValue::On;
 };
 
 // One bounded response-header suppression directive. `name` borrows the exact
