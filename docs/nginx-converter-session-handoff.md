@@ -102,6 +102,11 @@ and `/tmp/rut-640-completion-capability-first.log`. Do not retry unchanged or
 promote support. Luna is implementing precise timer activation only after
 validated incomplete positive-CL stream selection; preserve preheader/CL0 and
 all same-batch progress/timeout, cancellation, generation and episode rules.
+The first timer candidate remains unbuilt/unaccepted after source review:
+precise timer plus post-header body progress cannot reuse the incomplete-header
+HTTP parser commit. A separate authenticated body-copy commit, strict semantic
+phase/send proof, non-due rearm and deterministic new controls are under correction.
+Rejected diff `/tmp/rut-641-first-review-rejected.patch` is based on `51907777`.
 Independent review, unchanged public proof and full CI remain required.
 #640 remains open pending combined proof; no capability PR has been created.
 
