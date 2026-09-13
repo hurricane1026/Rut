@@ -11210,6 +11210,82 @@ static bool install_representation200_exact(RouteConfig& config, const char* pat
     return config.install_strict_local_response_table(&policy, 1, unmatched, exact, 1);
 }
 
+TEST(exact_local_response, scoped_validation_rechecks_mutation_and_config_identity) {
+    static_assert(!std::is_default_constructible_v<RouteConfig::StrictLocalResponseView>);
+    static_assert(!std::is_copy_constructible_v<RouteConfig::StrictLocalResponseView>);
+    static_assert(!std::is_move_constructible_v<RouteConfig::StrictLocalResponseView>);
+    auto config = std::make_unique<RouteConfig>();
+    auto other = std::make_unique<RouteConfig>();
+    REQUIRE(install_representation200_exact(*config, "/static"));
+    REQUIRE(install_representation200_exact(*other, "/other"));
+    {
+        const auto view = config->strict_local_response_view();
+        CHECK(view.valid_for(config.get()));
+        CHECK_FALSE(view.valid_for(other.get()));
+        CHECK_FALSE(view.valid_for(nullptr));
+        CHECK_EQ(view.match_exact_strict_local_response(lit_str("/static?x=1"), kRouteMethodGet),
+                 1u);
+        CHECK_EQ(view.match_exact_strict_local_response(lit_str("/static-more"), kRouteMethodGet),
+                 0u);
+    }
+    // Corrupt an unused binding, not just the selected policy. A fresh scope
+    // must repeat the full inventory check before it can expose any lookup.
+    config->exact_strict_local_response_bindings[1].policy_id = 1;
+    {
+        const auto invalid = config->strict_local_response_view();
+        CHECK_FALSE(invalid.valid_for(config.get()));
+        CHECK_EQ(invalid.match_exact_strict_local_response(lit_str("/static"), kRouteMethodGet),
+                 0u);
+        CHECK_EQ(invalid
+                     .match_exact_strict_local_response_views(
+                         lit_str("/static"), lit_str("/static"), kRouteMethodGet)
+                     .state,
+                 ExactStrictLocalResponseMatchState::InvalidInput);
+        CHECK_EQ(config->match_exact_strict_local_response(lit_str("/static"), kRouteMethodGet),
+                 0u);
+    }
+    config->exact_strict_local_response_bindings[1] = {};
+    {
+        const auto restored = config->strict_local_response_view();
+        CHECK(restored.valid_for(config.get()));
+        CHECK_EQ(restored.match_exact_strict_local_response(lit_str("/static"), kRouteMethodGet),
+                 1u);
+    }
+}
+
+TEST(exact_local_response, scoped_normalized_inventory_rechecks_between_scopes) {
+    auto config = std::make_unique<RouteConfig>();
+    REQUIRE(install_representation200_exact(*config, "/static"));
+    {
+        const auto raw = config->strict_local_response_view();
+        REQUIRE(raw.valid_for(config.get()));
+        CHECK_FALSE(raw.has_slash_normalized_exact_strict_local_response_inventory());
+    }
+    config->exact_strict_local_response_bindings[0].path_view = ExactPathView::SlashNormalized;
+    REQUIRE(config->has_slash_normalized_exact_strict_local_response_inventory());
+    {
+        const auto normalized = config->strict_local_response_view();
+        REQUIRE(normalized.valid_for(config.get()));
+        CHECK(normalized.has_slash_normalized_exact_strict_local_response_inventory());
+        const auto match = normalized.match_exact_strict_local_response_views(
+            lit_str("//static"), lit_str("/static"), kRouteMethodGet);
+        CHECK_EQ(match.policy_id, 1u);
+    }
+    // Damage an unused slot: public calls and a new scope must reject the
+    // entire table even though the normalized binding itself remains valid.
+    config->exact_strict_local_response_bindings[1].policy_id = 1;
+    CHECK_FALSE(config->has_slash_normalized_exact_strict_local_response_inventory());
+    {
+        const auto invalid = config->strict_local_response_view();
+        CHECK_FALSE(invalid.valid_for(config.get()));
+        CHECK_FALSE(invalid.has_slash_normalized_exact_strict_local_response_inventory());
+    }
+    config->exact_strict_local_response_bindings[1] = {};
+    const auto restored = config->strict_local_response_view();
+    CHECK(restored.valid_for(config.get()));
+    CHECK(restored.has_slash_normalized_exact_strict_local_response_inventory());
+}
+
 static u32 unmatched_h2_outer_hit_calls = 0;
 static u64 unmatched_h2_outer_hit_handler(void*, jit::HandlerCtx*, const u8*, u32, void*) {
     unmatched_h2_outer_hit_calls++;
