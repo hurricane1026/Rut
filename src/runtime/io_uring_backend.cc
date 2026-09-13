@@ -206,6 +206,7 @@ core::Expected<void, Error> IoUringBackend::init(u32 /*shard_id*/, i32 lfd) {
     auto* sq_base = static_cast<u8*>(sq_ring_ptr);
     sq_head = reinterpret_cast<u32*>(sq_base + params.sq_off.head);
     sq_tail = reinterpret_cast<u32*>(sq_base + params.sq_off.tail);
+    sq_flags = reinterpret_cast<u32*>(sq_base + params.sq_off.flags);
     sq_ring_mask = reinterpret_cast<u32*>(sq_base + params.sq_off.ring_mask);
     sq_array = reinterpret_cast<u32*>(sq_base + params.sq_off.array);
 
@@ -866,10 +867,16 @@ u32 IoUringBackend::wait(IoEvent* events, u32 max_events, Connection* conns, u32
     // Retry timer read if previous submit_timer_read() failed (SQ was full)
     if (timer_fd >= 0 && !timer_read_armed) submit_timer_read();
 
-    // Submit pending SQEs and wait for at least 1 CQE
+    // A previous submission (including close-path cancellation) may already
+    // have produced CQEs. Harvest them without another enter when there is no
+    // SQ work to flush. Never defer pending submissions behind a busy CQ.
+    const bool ready =
+        __atomic_load_n(cq_head, __ATOMIC_ACQUIRE) != __atomic_load_n(cq_tail, __ATOMIC_ACQUIRE);
+    const u32 kernel_flags = sq_flags ? __atomic_load_n(sq_flags, __ATOMIC_ACQUIRE) : 0;
+    const bool kernel_work = (kernel_flags & (IORING_SQ_CQ_OVERFLOW | IORING_SQ_TASKRUN)) != 0;
     u32 flags = IORING_ENTER_GETEVENTS;
     i32 ret;
-    for (;;) {
+    while (pending != 0 || !ready || kernel_work) {
         if (pending > 0) {
             ret = io_uring_enter(ring_fd, pending, 1, flags);
             if (ret >= 0) pending -= static_cast<u32>(ret);

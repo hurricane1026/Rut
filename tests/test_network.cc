@@ -29044,6 +29044,41 @@ struct RawDownstreamRecvBatch {
     }
 };
 
+TEST(iouring_wait, ready_cq_does_not_enter_but_pending_or_kernel_work_does) {
+    for (const u32 mode : {0u, 1u, 2u, 3u, 4u}) {
+        RawDownstreamRecvBatch fixture;
+        if (!fixture.init()) SKIP("io_uring unavailable");
+        auto& backend = fixture.guard.loop->backend;
+        if (mode != 4) fixture.append_send(*fixture.conns[0], 16);
+        const u32 head = fixture.head();
+        // An invalid enter fd makes any attempted syscall observably fail.
+        // Restore it before assertions/destruction so the real ring is closed.
+        const i32 fd = backend.ring_fd;
+        u32* flags = backend.sq_flags;
+        u32 simulated_flags = mode == 2 ? IORING_SQ_CQ_OVERFLOW : mode == 3 ? IORING_SQ_TASKRUN : 0;
+        backend.sq_flags = &simulated_flags;
+        backend.ring_fd = -1;
+        backend.pending = mode == 1 ? 1 : 0;
+        IoEvent events[8]{};
+        const u32 count =
+            backend.wait(events, 8, fixture.guard.loop->conns, IoUringEventLoop::kMaxConns);
+        backend.ring_fd = fd;
+        backend.sq_flags = flags;
+        if (mode == 0) {
+            CHECK_EQ(count, 1u);
+            CHECK_EQ(events[0].type, IoEventType::Send);
+            CHECK_EQ(events[0].result, 16);
+            CHECK_EQ(fixture.head(), head + 1);
+            CHECK_EQ(backend.failure_code(), 0);
+        } else {
+            CHECK_EQ(count, 0u);
+            CHECK_EQ(fixture.head(), head);
+            CHECK_EQ(backend.failure_code(), EBADF);
+            CHECK_EQ(backend.pending, mode == 1 ? 1u : 0u);
+        }
+    }
+}
+
 // A client may send a new request (or FIN) immediately after observing the
 // response, while the server still has both completions waiting in its CQ.
 // Receive bytes must not be copied into the old request before Send dispatch.
