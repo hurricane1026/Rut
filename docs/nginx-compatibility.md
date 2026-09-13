@@ -73,7 +73,12 @@ ordinary-RUT capability witness and same-file converter differential remain pend
 The legal-default None witness `7721e5be` loaded through public O2/io_uring but
 failed its joint live ledger/retirement gate (empty access log, 2.42s); the full
 failure and preceding invalid-source spelling are preserved in
-[#640](https://github.com/hurricane1026/Rut/issues/640). No gate was relaxed. The
+[#640](https://github.com/hurricane1026/Rut/issues/640). No gate was relaxed.
+Reviewed generic completion `119d7088` passes eleven focused runtime tests / 568
+checks, but the public witness still fails with EOF+2000.190475ms; diagnostic
+`60\n` is not live stability proof because the joint gate was not reached.
+[#641](https://github.com/hurricane1026/Rut/issues/641) preserves the exact timing
+failure and tracks precise None-stream timer ownership. The
 converter still rejects `proxy_buffering off`; no compatibility row is promoted.
 
 | nginx feature | parser | converter | RUT capability | behavior test | status |

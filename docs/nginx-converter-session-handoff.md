@@ -80,7 +80,32 @@ Broad #270 remains PARTIAL and #271 remains BLOCKED_BY_RUT. None of that proves
 the new explicit `proxy_buffering off` scope. Verify current issue/PR state if
 making new status claims; these are recorded prior-run results, not reruns.
 
-## CURRENT: #640 ordinary-RUT None inactivity finalization
+## CURRENT: #641 precise None positive-CL inactivity timer
+
+Completion increment `119d7088` is independently approved, Clang Release `-j1`
+built, and passes eleven focused positive-CL tests / 568 checks (1218 tests
+filtered out), full formatting and runtime-state model checks. Another 64
+adjacent buffering/GET CL0 tests pass with 3682 checks (1165 filtered out), log
+`/tmp/rut-640-completion-adjacent.log`. The first build
+failed on a missing `on_request_complete` declaration; the correction adds the
+matching declaration for an existing explicit template instance. Logs:
+`/tmp/rut-640-completion-build.log`,
+`/tmp/rut-640-completion-revised-build.log`, and
+`/tmp/rut-640-completion-focused-first.log`.
+
+The first public capability run of that changed candidate still failed in
+2.17s: exact normalized 127 bytes, EOF at publication+2000.190475ms, violating
+the unchanged strict `<2000ms` gate. Access diagnostic contains `60\n`, but the
+joint live ledger/retirement gate was not reached and failure-time retirement
+was Pending. Full source/log are in [#641](https://github.com/hurricane1026/Rut/issues/641)
+and `/tmp/rut-640-completion-capability-first.log`. Do not retry unchanged or
+promote support. Luna is implementing precise timer activation only after
+validated incomplete positive-CL stream selection; preserve preheader/CL0 and
+all same-batch progress/timeout, cancellation, generation and episode rules.
+Independent review, unchanged public proof and full CI remain required.
+#640 remains open pending combined proof; no capability PR has been created.
+
+### Earlier completion investigation (historical)
 
 The handwritten wrapper `845b0c2a` first failed parsing the illegal explicit
 `response_buffering: "none"` value. Independently reviewed `7721e5be` uses the
@@ -168,10 +193,10 @@ capability or converter admission.
 
 ## NEXT
 
-1. Implement and independently review the generic #640 completion fix with
-   meaningful ownership controls; lead-run the unchanged ordinary-RUT witness.
+1. Independently review/test #641 precise timer activation, progress arbitration
+   and stale/cancel ownership, then run the unchanged public capability witness.
 2. Complete capability candidate normal/required CI and integrate only into
-   `agent/nginx-to-rut-converter` after proof.
+   `agent/nginx-to-rut-converter` after proof; #640/#641 remain open until then.
 3. Only after capability is proven, implement bounded off model/lowering and an
    actual same-file nginx-versus-generated-RUT differential pair.
 
