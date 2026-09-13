@@ -264,7 +264,7 @@ bool proxy_hide_header_has_inventory(const ProxyHideHeader& header) {
 
 bool proxy_buffering_has_inventory(const ProxyBuffering& buffering) {
     return buffering.present || !is_default_span(buffering.span) ||
-           !is_default_span(buffering.value_span);
+           !is_default_span(buffering.value_span) || buffering.value != ProxyBufferingValue::On;
 }
 
 FrontendResult<bool> validate_proxy_buffering(const Server& server) {
@@ -299,12 +299,13 @@ FrontendResult<bool> validate_proxy_buffering(const Server& server) {
     auto reparsed = parse(server_source);
     if (!reparsed)
         return unsupported(server.span, lit_str("invalid proxy_buffering source inventory"));
+    const Server& fresh_server = reparsed.value();
     const ProxyHideHeader& supplied_hide = server.location.proxy_hide_header;
     const ProxyHideHeader& fresh_hide = reparsed.value().location.proxy_hide_header;
     if (!proxy_hide_header_has_inventory(supplied_hide) &&
         proxy_hide_header_has_inventory(fresh_hide))
         return unsupported(location.span, lit_str("proxy_hide_header metadata was erased"));
-    const ProxyBuffering& fresh = reparsed.value().location.proxy_buffering;
+    const ProxyBuffering& fresh = fresh_server.location.proxy_buffering;
     const bool fresh_inventory = proxy_buffering_has_inventory(fresh);
     if (!metadata && !fresh_inventory) return false;
     if (!metadata && fresh_inventory)
@@ -324,11 +325,105 @@ FrontendResult<bool> validate_proxy_buffering(const Server& server) {
                            lit_str("proxy_buffering metadata does not match its source"));
     if (!span_position_is_coherent(location.span, buffering.span) ||
         !span_position_is_coherent(buffering.span, buffering.value_span) ||
-        buffering.value_span.end - buffering.value_span.start != 2u ||
+        (buffering.value != ProxyBufferingValue::On &&
+         buffering.value != ProxyBufferingValue::Off) ||
         buffering.span.end >= location.span.end)
         return unsupported(is_valid_span(buffering.span) ? buffering.span : location.span,
                            lit_str("invalid proxy_buffering model"));
-    return true;
+    if (buffering.value != fresh.value)
+        return unsupported(buffering.value_span, lit_str("proxy_buffering value model mismatch"));
+    const u32 value_len = buffering.value_span.end - buffering.value_span.start;
+    const char* value = trusted_source_at(source_base, buffering.value_span.start);
+    if ((buffering.value == ProxyBufferingValue::On &&
+         (value_len != 2u || value[0] != 'o' || value[1] != 'n')) ||
+        (buffering.value == ProxyBufferingValue::Off &&
+         (value_len != 3u || value[0] != 'o' || value[1] != 'f' || value[2] != 'f')))
+        return unsupported(buffering.value_span, lit_str("invalid proxy_buffering source value"));
+    if (buffering.value == ProxyBufferingValue::Off &&
+        (!eq(fresh_server.location.path, "/", 1u) || fresh_server.location.proxy_pass.has_uri ||
+         proxy_hide_header_has_inventory(fresh_server.location.proxy_hide_header) ||
+         fresh_server.exact_local_return.present || fresh_server.exact_no_content_return.present ||
+         fresh_server.exact_absolute_redirect.present ||
+         !fresh_server.location.proxy_read_timeout.present ||
+         fresh_server.location.proxy_read_timeout.milliseconds != 1000u ||
+         fresh_server.listen.address != ListenerAddress::IPv4Exact ||
+         fresh_server.listen.ipv4_host != 0x7f000001u ||
+         fresh_server.location.proxy_pass.address[0] != 127u ||
+         fresh_server.location.proxy_pass.address[1] != 0u ||
+         fresh_server.location.proxy_pass.address[2] != 0u ||
+         fresh_server.location.proxy_pass.address[3] != 1u))
+        return unsupported(buffering.span,
+                           lit_str("proxy_buffering off source is outside the bounded profile"));
+    if (buffering.value == ProxyBufferingValue::Off) {
+        const auto relative_span_equal = [&](Span supplied, Span fresh) {
+            if (!is_valid_span(supplied) || !is_valid_span(fresh) ||
+                !span_contains(server.span, supplied) || supplied.start < server.span.start ||
+                supplied.end < supplied.start || fresh.end < fresh.start)
+                return false;
+            return supplied.start - server.span.start == fresh.start &&
+                   supplied.end - server.span.start == fresh.end &&
+                   supplied.end - supplied.start == fresh.end - fresh.start;
+        };
+        const Listen& supplied_listen = server.listen;
+        const Listen& fresh_listen = fresh_server.listen;
+        const ProxyPass& supplied_proxy = server.location.proxy_pass;
+        const ProxyPass& fresh_proxy = fresh_server.location.proxy_pass;
+        const ProxyReadTimeout& supplied_timeout = server.location.proxy_read_timeout;
+        const ProxyReadTimeout& fresh_timeout = fresh_server.location.proxy_read_timeout;
+        if (!relative_span_equal(server.location.span, fresh_server.location.span) ||
+            !relative_span_equal(server.location.path_span, fresh_server.location.path_span) ||
+            !relative_span_equal(supplied_listen.span, fresh_listen.span) ||
+            !relative_span_equal(supplied_listen.value_span, fresh_listen.value_span) ||
+            !relative_span_equal(supplied_proxy.span, fresh_proxy.span) ||
+            !relative_span_equal(supplied_timeout.span, fresh_timeout.span) ||
+            !relative_span_equal(supplied_timeout.value_span, fresh_timeout.value_span) ||
+            !relative_span_equal(buffering.span, fresh.span) ||
+            !relative_span_equal(buffering.value_span, fresh.value_span) ||
+            !source_position_is_coherent(source_base, server.span, server.location.span) ||
+            !source_position_is_coherent(source_base, server.span, server.location.path_span) ||
+            !source_position_is_coherent(source_base, server.span, supplied_listen.span) ||
+            !source_position_is_coherent(source_base, server.span, supplied_listen.value_span) ||
+            !source_position_is_coherent(source_base, server.span, supplied_proxy.span) ||
+            !source_position_is_coherent(source_base, server.span, supplied_timeout.span) ||
+            !source_position_is_coherent(source_base, server.span, supplied_timeout.value_span) ||
+            !source_borrow_is_coherent(
+                server.location.path, server.location.path_span, source_base) ||
+            !source_borrow_is_coherent(
+                supplied_listen.value, supplied_listen.value_span, source_base) ||
+            supplied_listen.port != fresh_listen.port ||
+            supplied_listen.address != fresh_listen.address ||
+            supplied_listen.ipv4_host != fresh_listen.ipv4_host ||
+            supplied_listen.value.ptr != fresh_listen.value.ptr ||
+            supplied_listen.value.len != fresh_listen.value.len ||
+            (server.location.path.ptr != fresh_server.location.path.ptr ||
+             server.location.path.len != fresh_server.location.path.len) ||
+            supplied_proxy.port != fresh_proxy.port ||
+            supplied_proxy.has_uri != fresh_proxy.has_uri ||
+            supplied_proxy.uri.ptr != fresh_proxy.uri.ptr ||
+            supplied_proxy.uri.len != fresh_proxy.uri.len ||
+            (!is_default_span(supplied_proxy.uri_span) || !is_default_span(fresh_proxy.uri_span)) ||
+            supplied_proxy.address[0] != fresh_proxy.address[0] ||
+            supplied_proxy.address[1] != fresh_proxy.address[1] ||
+            supplied_proxy.address[2] != fresh_proxy.address[2] ||
+            supplied_proxy.address[3] != fresh_proxy.address[3] ||
+            supplied_timeout.present != fresh_timeout.present ||
+            supplied_timeout.milliseconds != fresh_timeout.milliseconds ||
+            proxy_hide_header_has_inventory(server.location.proxy_hide_header) !=
+                proxy_hide_header_has_inventory(fresh_server.location.proxy_hide_header))
+            return unsupported(buffering.span,
+                               lit_str("proxy_buffering off metadata does not match its source"));
+        const u64 fresh_timeout_value_start64 =
+            static_cast<u64>(server.span.start) + fresh_timeout.value_span.start;
+        if (fresh_timeout_value_start64 > UINT32_MAX ||
+            fresh_timeout.value_span.end - fresh_timeout.value_span.start != 2u ||
+            trusted_source_at(source_base, static_cast<u32>(fresh_timeout_value_start64))[0] !=
+                '1' ||
+            trusted_source_at(source_base, static_cast<u32>(fresh_timeout_value_start64))[1] != 's')
+            return unsupported(
+                fresh_timeout.value_span,
+                lit_str("proxy_buffering off requires literal proxy_read_timeout 1s"));
+    }
+    return buffering.value == ProxyBufferingValue::On;
 }
 
 FrontendResult<ProxyLocationProfile> validate_prefix_without_uri(const Server& server) {
@@ -1978,7 +2073,8 @@ bool compare_proxy_buffering(const ProxyBuffering& supplied,
                              const ProxyBuffering& fresh,
                              HttpProfileComparison& comparison,
                              Span fallback) {
-    if (supplied.present != fresh.present || !spans_equal(supplied.span, fresh.span) ||
+    if (supplied.present != fresh.present || supplied.value != fresh.value ||
+        !spans_equal(supplied.span, fresh.span) ||
         !spans_equal(supplied.value_span, fresh.value_span))
         return comparison.reject(is_valid_span(fresh.span) ? fresh.span : fallback);
     return true;
@@ -2233,6 +2329,9 @@ FrontendResult<RutSource> lower_to_rut(const Server& server) {
         return unsupported(server.exact_no_content_return.span,
                            lit_str("exact no-content return requires location / fallback"));
     bool explicit_buffering_on = false;
+    const bool explicit_buffering_off =
+        server.location.proxy_buffering.present &&
+        server.location.proxy_buffering.value == ProxyBufferingValue::Off;
     if (buffering_authenticated) {
         explicit_buffering_on = true;
     } else {
@@ -2240,6 +2339,14 @@ FrontendResult<RutSource> lower_to_rut(const Server& server) {
         if (!proxy_buffering) return core::make_unexpected(proxy_buffering.error());
         explicit_buffering_on = proxy_buffering.value();
     }
+    if (explicit_buffering_off &&
+        !(is_root && exact_listener && server.listen.address == ListenerAddress::IPv4Exact &&
+          server.listen.ipv4_host == 0x7f000001u && proxy.address[0] == 127u &&
+          proxy.address[1] == 0u && proxy.address[2] == 0u && proxy.address[3] == 1u &&
+          !proxy.has_uri && !hide_compat_header && !has_sibling_action && timeout_present &&
+          server.location.proxy_read_timeout.milliseconds == 1000u))
+        return unsupported(server.location.proxy_buffering.span,
+                           lit_str("proxy_buffering off requires the bounded 1s loopback profile"));
     if (explicit_buffering_on &&
         !(is_root && exact_listener && server.listen.address == ListenerAddress::IPv4Exact &&
           server.listen.ipv4_host == 0x7f000001u && timeout_present &&
@@ -2325,7 +2432,7 @@ FrontendResult<RutSource> lower_to_rut(const Server& server) {
                                             3,
                                             RequestPolicyPlacement::Legacy,
                                             false,
-                                            true,
+                                            !explicit_buffering_off,
                                             hide_header_name,
                                             timeout_present,
                                             timeout_seconds))) ||

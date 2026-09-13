@@ -3672,9 +3672,9 @@ TEST(nginx_parser, rejects_proxy_buffering_unsupported_grammar_and_contexts) {
         "http://127.0.0.1:9000; } }",
         "server { listen 8080; location /api/ { proxy_buffering on; proxy_pass "
         "http://127.0.0.1:9000/; } }",
-        "server { listen 8080; location / { proxy_buffering off; proxy_pass "
-        "http://127.0.0.1:9000; } }",
         "server { listen 8080; location / { proxy_buffering $buffering; proxy_pass "
+        "http://127.0.0.1:9000; } }",
+        "server { listen 8080; location / { proxy_buffering OFF; proxy_pass "
         "http://127.0.0.1:9000; } }",
         "server { listen 8080; location / { proxy_buffering \"on\"; proxy_pass "
         "http://127.0.0.1:9000; } }",
@@ -3706,6 +3706,180 @@ TEST(nginx_parser, rejects_proxy_buffering_unsupported_grammar_and_contexts) {
     const auto comment_parsed = nginx::parse({comment_only, sizeof(comment_only) - 1u});
     REQUIRE(comment_parsed);
     CHECK_FALSE(comment_parsed.value().location.proxy_buffering.present);
+}
+
+TEST(nginx_parser, admits_bounded_explicit_proxy_buffering_off_timeout_profile) {
+    const char source[] =
+        "server { listen 127.0.0.1:8080; location / { proxy_buffering off; "
+        "proxy_read_timeout 1s; proxy_pass http://127.0.0.1:9000; } }";
+    const auto parsed = nginx::parse({source, sizeof(source) - 1u});
+    REQUIRE(parsed);
+    const auto& buffering = parsed.value().location.proxy_buffering;
+    REQUIRE(buffering.present);
+    CHECK(buffering.value == nginx::ProxyBufferingValue::Off);
+    const auto lowered = nginx::lower_to_rut(parsed.value());
+    REQUIRE(lowered);
+    const std::string output(lowered.value().data, lowered.value().len);
+    CHECK(output.find("response_read_timeout: 1s") != std::string::npos);
+    CHECK(output.find("response_buffering:") == std::string::npos);
+
+    auto forged_value = parsed.value();
+    forged_value.location.proxy_buffering.value = nginx::ProxyBufferingValue::On;
+    CHECK_FALSE(nginx::lower_to_rut(forged_value));
+    auto invalid_value = parsed.value();
+    invalid_value.location.proxy_buffering.value = static_cast<nginx::ProxyBufferingValue>(9u);
+    CHECK_FALSE(nginx::lower_to_rut(invalid_value));
+    auto erased = parsed.value();
+    erased.location.proxy_buffering = {};
+    CHECK_FALSE(nginx::lower_to_rut(erased));
+    auto shifted = parsed.value();
+    shifted.location.proxy_buffering.span.start++;
+    CHECK_FALSE(nginx::lower_to_rut(shifted));
+    auto shifted_timeout = parsed.value();
+    shifted_timeout.location.proxy_read_timeout.value_span.start++;
+    CHECK_FALSE(nginx::lower_to_rut(shifted_timeout));
+    auto changed_port = parsed.value();
+    changed_port.location.proxy_pass.port++;
+    CHECK_FALSE(nginx::lower_to_rut(changed_port));
+    auto changed_address = parsed.value();
+    changed_address.location.proxy_pass.address[3] = 2u;
+    CHECK_FALSE(nginx::lower_to_rut(changed_address));
+    std::string poisoned(source, sizeof(source) - 1u);
+    const auto poisoned_parsed = nginx::parse({poisoned.data(), static_cast<u32>(poisoned.size())});
+    REQUIRE(poisoned_parsed);
+    std::fill(poisoned.begin(), poisoned.end(), 'x');
+    CHECK_FALSE(nginx::lower_to_rut(poisoned_parsed.value()));
+
+    const char non_loopback[] =
+        "server { listen 127.0.0.1:8080; location / { proxy_buffering off; "
+        "proxy_read_timeout 1s; proxy_pass http://127.0.0.2:9000; } }";
+    const auto non_loopback_parsed = nginx::parse({non_loopback, sizeof(non_loopback) - 1u});
+    REQUIRE(non_loopback_parsed);
+    CHECK_FALSE(nginx::lower_to_rut(non_loopback_parsed.value()));
+
+    const char* const rejected_profiles[] = {
+        "server { listen 127.0.0.1:8080; location / { proxy_buffering off; "
+        "proxy_pass http://127.0.0.1:9000; } }",
+        "server { listen 127.0.0.1:8080; location / { proxy_buffering off; "
+        "proxy_read_timeout 2s; proxy_pass http://127.0.0.1:9000; } }",
+        "server { listen 127.0.0.1:8080; location / { proxy_buffering off; "
+        "proxy_read_timeout 1s; proxy_hide_header X-A; proxy_pass http://127.0.0.1:9000; } }",
+    };
+    for (const char* profile : rejected_profiles) {
+        const auto candidate = nginx::parse({profile, static_cast<u32>(strlen(profile))});
+        REQUIRE(candidate);
+        CHECK_FALSE(nginx::lower_to_rut(candidate.value()));
+    }
+}
+
+TEST(nginx_converter, authenticates_off_fragment_positions_borrows_and_wrapper_values) {
+    std::string server =
+        "server { listen 127.0.0.1:8080; location / { proxy_pass "
+        "http://127.0.0.1:9000; proxy_read_timeout 1s; proxy_buffering off; } }";
+    std::string profile =
+        "http { log_format compat \"$request_length\"; access_log /tmp/rut-off.log compat;\n  " +
+        server + "\n}";
+    const auto parsed =
+        nginx::parse_http_profile({profile.data(), static_cast<u32>(profile.size())});
+    REQUIRE(parsed);
+    REQUIRE(parsed.value().server.span.start > 0u);
+    const auto lowered = nginx::lower_to_rut(parsed.value());
+    REQUIRE(lowered);
+    const std::string owned(lowered.value().data, lowered.value().len);
+    CHECK(owned.find("response_buffering:") == std::string::npos);
+    auto mode_mutant = parsed.value();
+    mode_mutant.server.location.proxy_buffering.value = nginx::ProxyBufferingValue::On;
+    CHECK_FALSE(nginx::lower_to_rut(mode_mutant));
+    mode_mutant = parsed.value();
+    mode_mutant.server.location.proxy_buffering = {};
+    CHECK_FALSE(nginx::lower_to_rut(mode_mutant));
+    const auto reject = [&](const auto& mutate) {
+        auto candidate = parsed.value().server;
+        mutate(candidate);
+        CHECK_FALSE(nginx::lower_to_rut(candidate));
+    };
+    REQUIRE(nginx::lower_to_rut(parsed.value().server));
+    reject([](nginx::Server& s) { s.location.proxy_pass.span.start++; });
+    reject([](nginx::Server& s) { s.location.proxy_pass.span.line++; });
+    reject([](nginx::Server& s) { s.location.proxy_read_timeout.span.col++; });
+    reject([](nginx::Server& s) { s.location.proxy_buffering.value_span.line++; });
+    reject([](nginx::Server& s) { s.location.proxy_buffering.value_span.col++; });
+    reject([](nginx::Server& s) { s.location.path.ptr++; });
+    reject([](nginx::Server& s) { s.listen.value.ptr++; });
+    reject([](nginx::Server& s) { s.location.proxy_pass.uri_span.start = 1u; });
+    reject([](nginx::Server& s) { s.location.proxy_read_timeout.milliseconds = 2000u; });
+    std::string complete_source = "events {}\n" + profile;
+    const auto complete = nginx::parse_nginx_http_config(
+        {complete_source.data(), static_cast<u32>(complete_source.size())});
+    REQUIRE(complete);
+    const auto complete_lowered = nginx::lower_to_rut(complete.value());
+    REQUIRE(complete_lowered);
+    CHECK_EQ(std::string(complete_lowered.value().data, complete_lowered.value().len), owned);
+    auto complete_mutant = complete.value();
+    complete_mutant.http.server.location.proxy_buffering.value = nginx::ProxyBufferingValue::On;
+    CHECK_FALSE(nginx::lower_to_rut(complete_mutant));
+    complete_mutant = complete.value();
+    complete_mutant.http.server.location.proxy_buffering = {};
+    CHECK_FALSE(nginx::lower_to_rut(complete_mutant));
+    const size_t off = profile.find("off;");
+    REQUIRE(off != std::string::npos);
+    profile[off] = 'O';
+    CHECK_FALSE(nginx::lower_to_rut(parsed.value()));
+    CHECK_EQ(std::string(lowered.value().data, lowered.value().len), owned);
+    profile[off] = 'o';
+    REQUIRE(nginx::lower_to_rut(parsed.value()));
+}
+
+TEST(nginx_converter, rejects_off_scope_and_erased_source_inventory) {
+    const char* const profiles[] = {
+        "server { listen 8080; location / { proxy_buffering off; proxy_read_timeout 1s; "
+        "proxy_pass http://127.0.0.1:9000; } }",
+        "server { listen 192.0.2.1:8080; location / { proxy_buffering off; proxy_read_timeout 1s; "
+        "proxy_pass http://127.0.0.1:9000; } }",
+        "server { listen 127.0.0.1:8080; location / { proxy_buffering off; proxy_read_timeout 1s; "
+        "proxy_pass http://127.0.0.1:9000; } location = /old { return 302 "
+        "http://redirect.example/new; "
+        "} }",
+        "server { listen 127.0.0.1:8080; location / { proxy_buffering off; proxy_read_timeout 1s; "
+        "proxy_hide_header X-A; proxy_pass http://127.0.0.1:9000; } }",
+    };
+    for (const char* source : profiles) {
+        const auto parsed = nginx::parse({source, static_cast<u32>(strlen(source))});
+        REQUIRE(parsed);
+        CHECK_FALSE(nginx::lower_to_rut(parsed.value()));
+        auto erased = parsed.value();
+        erased.exact_absolute_redirect = {};
+        erased.location.proxy_hide_header = {};
+        CHECK_FALSE(nginx::lower_to_rut(erased));
+    }
+}
+
+TEST(nginx_parser, rejects_off_nonliteral_duplicate_and_unsupported_context) {
+    const char* const bodies[] = {
+        "proxy_buffering \"off\";",
+        "proxy_buffering off extra;",
+        "proxy_buffering off; proxy_buffering off;",
+        "proxy_buffering off",
+        "proxy_read_timeout 01s; proxy_buffering off;",
+        "proxy_read_timeout 1000ms; proxy_buffering off;",
+    };
+    for (const char* body : bodies) {
+        const std::string source = "server { listen 127.0.0.1:8080; location / { " +
+                                   std::string(body) + " proxy_pass http://127.0.0.1:9000; } }";
+        CHECK_FALSE(nginx::parse({source.data(), static_cast<u32>(source.size())}));
+    }
+    const char* const sources[] = {
+        "server { listen 8080; proxy_buffering off; location / { proxy_pass http://127.0.0.1:9000; "
+        "} }",
+        "server { listen 8080; location /api/ { proxy_buffering off; proxy_pass "
+        "http://127.0.0.1:9000/; } }",
+        "server { listen 8080; location / { proxy_buffering off; proxy_pass "
+        "http://127.0.0.1:9000/; } }",
+        "server { listen 8080; location = /api { proxy_buffering off; proxy_pass "
+        "http://127.0.0.1:9000; } }",
+    };
+    for (const char* source : sources)
+        CHECK_FALSE(nginx::parse({source, static_cast<u32>(strlen(source))}));
 }
 
 TEST(nginx_converter, admits_authenticated_explicit_proxy_buffering_on_timeout_family) {

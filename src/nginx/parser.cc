@@ -1084,9 +1084,9 @@ private:
         if (cur_.kind != TokenKind::Word)
             return invalid(cur_.span, lit_str("proxy_buffering requires a value"));
         const Token value = cur_;
-        if (!eq(value.text, "on", 2))
+        if (!eq(value.text, "on", 2) && !eq(value.text, "off", 3))
             return unsupported(value.span,
-                               lit_str("only literal proxy_buffering on is recognized"));
+                               lit_str("only literal proxy_buffering on or off is recognized"));
         advance();
         if (cur_.kind == TokenKind::End)
             return missing(cur_.span, lit_str("expected ';' after proxy_buffering"));
@@ -1097,7 +1097,10 @@ private:
         }
         const Span end = cur_.span;
         advance();
-        return ProxyBuffering{true, Span{start.start, end.end, start.line, start.col}, value.span};
+        ProxyBuffering result{true, Span{start.start, end.end, start.line, start.col}, value.span};
+        result.value =
+            eq(value.text, "off", 3) ? ProxyBufferingValue::Off : ProxyBufferingValue::On;
+        return result;
     }
 
     FrontendResult<ProxyHideHeader> parse_proxy_hide_header() {
