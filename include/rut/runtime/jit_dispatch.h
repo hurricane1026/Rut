@@ -138,6 +138,7 @@ inline jit::YieldKind yield_kind_from_event(IoEventType type) {
         case IoEventType::HandlerTimer:
             return jit::YieldKind::Timer;
         case IoEventType::Accept:
+        case IoEventType::ResponseReadTimer:
         case IoEventType::Count:
             return jit::YieldKind::HttpGet;
     }

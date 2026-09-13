@@ -114,6 +114,32 @@ constexpr bool contains(Str a, char needle) {
     return false;
 }
 
+bool parse_canonical_ipv4_endpoint(Str endpoint, u32* ipv4_host, Str* port) {
+    if (endpoint.ptr == nullptr || ipv4_host == nullptr || port == nullptr) return false;
+    u32 pos = 0u;
+    u32 address = 0u;
+    for (u32 octet = 0u; octet < 4u; octet++) {
+        const u32 start = pos;
+        u32 value = 0u;
+        while (pos < endpoint.len && endpoint.ptr[pos] >= '0' && endpoint.ptr[pos] <= '9') {
+            if (pos - start == 3u) return false;
+            value = value * 10u + static_cast<u32>(endpoint.ptr[pos] - '0');
+            if (value > 255u) return false;
+            pos++;
+        }
+        const u32 digits = pos - start;
+        if (digits == 0u || (digits > 1u && endpoint.ptr[start] == '0')) return false;
+        const char delimiter = octet == 3u ? ':' : '.';
+        if (pos >= endpoint.len || endpoint.ptr[pos] != delimiter) return false;
+        address = (address << 8u) | value;
+        pos++;
+    }
+    if (pos == endpoint.len) return false;
+    *ipv4_host = address;
+    *port = endpoint.slice(pos, endpoint.len);
+    return true;
+}
+
 static_assert(kMaxProxyPassUriLen == kMaxForwardTargetTransformPrefixLen);
 static_assert(kMaxProxyLocationPathLen <= kMaxForwardTargetTransformPrefixLen);
 static_assert(kMaxExactLocalReturnPathLen == kMaxExactStrictLocalResponsePathLen);
@@ -285,22 +311,32 @@ public:
         if (!expect(TokenKind::LBrace, lit_str("expected '{' after http")))
             return core::make_unexpected(error_);
 
-        if (cur_.kind == TokenKind::End)
-            return missing(cur_.span, lit_str("missing log_format in http profile"));
-        if (cur_.kind != TokenKind::Word || !eq(cur_.text, "log_format", 10))
-            return unsupported(cur_.span, lit_str("expected one log_format before access_log"));
-        auto format = parse_log_format();
-        if (!format) return core::make_unexpected(format.error());
+        LogFormat format{};
+        AccessLog access{};
+        if (cur_.kind == TokenKind::Word && eq(cur_.text, "access_log", 10)) {
+            auto parsed_access = parse_access_log_off();
+            if (!parsed_access) return core::make_unexpected(parsed_access.error());
+            access = parsed_access.value();
+        } else {
+            if (cur_.kind == TokenKind::End)
+                return missing(cur_.span, lit_str("missing log_format in http profile"));
+            if (cur_.kind != TokenKind::Word || !eq(cur_.text, "log_format", 10))
+                return unsupported(cur_.span, lit_str("expected one log_format before access_log"));
+            auto parsed_format = parse_log_format();
+            if (!parsed_format) return core::make_unexpected(parsed_format.error());
+            format = parsed_format.value();
 
-        if (cur_.kind == TokenKind::End)
-            return missing(cur_.span, lit_str("missing access_log in http profile"));
-        if (cur_.kind != TokenKind::Word || !eq(cur_.text, "access_log", 10)) {
-            if (cur_.kind == TokenKind::Word && eq(cur_.text, "log_format", 10))
-                return unsupported(cur_.span, lit_str("duplicate log_format is unsupported"));
-            return unsupported(cur_.span, lit_str("expected one access_log after log_format"));
+            if (cur_.kind == TokenKind::End)
+                return missing(cur_.span, lit_str("missing access_log in http profile"));
+            if (cur_.kind != TokenKind::Word || !eq(cur_.text, "access_log", 10)) {
+                if (cur_.kind == TokenKind::Word && eq(cur_.text, "log_format", 10))
+                    return unsupported(cur_.span, lit_str("duplicate log_format is unsupported"));
+                return unsupported(cur_.span, lit_str("expected one access_log after log_format"));
+            }
+            auto parsed_access = parse_access_log();
+            if (!parsed_access) return core::make_unexpected(parsed_access.error());
+            access = parsed_access.value();
         }
-        auto access = parse_access_log();
-        if (!access) return core::make_unexpected(access.error());
 
         if (cur_.kind == TokenKind::End)
             return missing(cur_.span, lit_str("missing server in http profile"));
@@ -333,9 +369,77 @@ public:
         HttpProfile result{};
         result.source = source_;
         result.span = Span{start.start, end.end, start.line, start.col};
-        result.log_format = format.value();
-        result.access_log = access.value();
+        result.log_format = format;
+        result.access_log = access;
         result.server = server.value();
+        return result;
+    }
+
+    FrontendResult<NginxHttpConfig> run_nginx_http_config() {
+        if (cur_.kind == TokenKind::End)
+            return missing(cur_.span, lit_str("nginx configuration is empty"));
+        if (cur_.kind != TokenKind::Word || !eq(cur_.text, "events", 6))
+            return unsupported(cur_.span, lit_str("expected leading events block"));
+        const Span events_start = cur_.span;
+        advance();
+        if (!expect(TokenKind::LBrace, lit_str("expected '{' after events")))
+            return core::make_unexpected(error_);
+        if (cur_.kind == TokenKind::End)
+            return missing(cur_.span, lit_str("missing '}' for events block"));
+        if (cur_.kind != TokenKind::RBrace)
+            return unsupported(cur_.span, lit_str("events directives are unsupported"));
+        const Span events_end = cur_.span;
+        advance();
+
+        if (cur_.kind == TokenKind::End)
+            return missing(cur_.span, lit_str("missing http profile after events"));
+        if (cur_.kind != TokenKind::Word || !eq(cur_.text, "http", 4))
+            return unsupported(cur_.span, lit_str("expected one http profile after events"));
+        const Span http_origin = cur_.span;
+        if (http_origin.start > source_.len)
+            return invalid(http_origin, lit_str("http source origin is out of bounds"));
+        const Str http_source = source_.slice(http_origin.start, source_.len);
+        Parser http_parser(http_source);
+        auto parsed = http_parser.run_http_profile();
+        if (!parsed) {
+            Diagnostic diagnostic = parsed.error();
+            if (diagnostic.span.start > http_source.len || diagnostic.span.end > http_source.len ||
+                diagnostic.span.start > diagnostic.span.end || diagnostic.span.line == 0 ||
+                diagnostic.span.col == 0)
+                return invalid(http_origin, lit_str("http diagnostic span is out of bounds"));
+            if (http_origin.start > (~static_cast<u32>(0)) - diagnostic.span.start ||
+                http_origin.start > (~static_cast<u32>(0)) - diagnostic.span.end)
+                return invalid(http_origin, lit_str("http diagnostic offset overflow"));
+            diagnostic.span.start += http_origin.start;
+            diagnostic.span.end += http_origin.start;
+            if (diagnostic.span.line == 1) {
+                if (http_origin.line == 0 || http_origin.col == 0 ||
+                    http_origin.col > (~static_cast<u32>(0)) - (diagnostic.span.col - 1u))
+                    return invalid(http_origin, lit_str("http diagnostic column overflow"));
+                diagnostic.span.line = http_origin.line;
+                diagnostic.span.col += http_origin.col - 1u;
+            } else {
+                if (http_origin.line == 0 ||
+                    http_origin.line > (~static_cast<u32>(0)) - (diagnostic.span.line - 1u))
+                    return invalid(http_origin, lit_str("http diagnostic line overflow"));
+                diagnostic.span.line += http_origin.line - 1u;
+            }
+            return core::make_unexpected(diagnostic);
+        }
+
+        const HttpProfile http = parsed.value();
+        if (http.span.start > http_source.len || http.span.end > http_source.len ||
+            http.span.start > http.span.end ||
+            http_origin.start > (~static_cast<u32>(0)) - http.span.end)
+            return invalid(http_origin, lit_str("http span is out of bounds"));
+        const u32 http_end = http_origin.start + http.span.end;
+        NginxHttpConfig result{};
+        result.source = source_;
+        result.span = Span{events_start.start, http_end, events_start.line, events_start.col};
+        result.events_span =
+            Span{events_start.start, events_end.end, events_start.line, events_start.col};
+        result.http_span = Span{http_origin.start, http_end, http_origin.line, http_origin.col};
+        result.http = http;
         return result;
     }
 
@@ -517,6 +621,39 @@ private:
                          Span{start.start, end.end, start.line, start.col}};
     }
 
+    FrontendResult<AccessLog> parse_access_log_off() {
+        const Span start = cur_.span;
+        advance();
+        if (cur_.kind == TokenKind::End)
+            return missing(cur_.span, lit_str("access_log off requires a semicolon"));
+        if (cur_.kind != TokenKind::Word || !eq(cur_.text, "off", 3)) {
+            // Preserve the original diagnostic for a file-path access_log that
+            // appears before log_format. The dedicated off spelling is the only
+            // new leading form; all existing path diagnostics remain anchored at
+            // the access_log directive.
+            if (cur_.kind == TokenKind::Word && cur_.text.len > 0u && cur_.text.ptr[0] == '/')
+                return unsupported(start, lit_str("expected one log_format before access_log"));
+            return unsupported(cur_.span, lit_str("access_log off requires literal off"));
+        }
+        const Token off = cur_;
+        advance();
+        if (cur_.kind == TokenKind::End)
+            return missing(cur_.span, lit_str("expected ';' after access_log off"));
+        if (cur_.kind != TokenKind::Semicolon) {
+            if (cur_.kind == TokenKind::Word)
+                return unsupported(cur_.span, lit_str("access_log off options are unsupported"));
+            return invalid(cur_.span, lit_str("expected ';' after access_log off"));
+        }
+        const Span end = cur_.span;
+        advance();
+        return AccessLog{AccessLogDestinationProfile::Off,
+                         off.text,
+                         off.span,
+                         {},
+                         {},
+                         Span{start.start, end.end, start.line, start.col}};
+    }
+
     FrontendResult<Listen> parse_listen() {
         const Span start = cur_.span;
         advance();
@@ -544,6 +681,15 @@ private:
             address = ListenerAddress::IPv4Exact;
             ipv4_host = 0x7f000001u;
             port_text = port_text.slice(sizeof(kExactLoopbackPrefix) - 1u, port_text.len);
+        } else {
+            u32 parsed_ipv4 = 0u;
+            Str parsed_port{};
+            if (parse_canonical_ipv4_endpoint(port_text, &parsed_ipv4, &parsed_port) &&
+                parsed_ipv4 != 0u) {
+                address = ListenerAddress::IPv4Exact;
+                ipv4_host = parsed_ipv4;
+                port_text = parsed_port;
+            }
         }
         u16 value = 0;
         if (!parse_port(port_text, &value))
@@ -619,6 +765,16 @@ private:
                 if (!timeout) return core::make_unexpected(timeout.error());
                 result.proxy_read_timeout = timeout.value();
                 have_proxy_read_timeout = true;
+            } else if (eq(cur_.text, "proxy_buffering", 15)) {
+                if (!eq(path.text, "/", 1))
+                    return unsupported(
+                        cur_.span,
+                        lit_str("proxy_buffering is unsupported in transformed locations"));
+                if (result.proxy_buffering.present)
+                    return unsupported(cur_.span, lit_str("duplicate proxy_buffering"));
+                auto buffering = parse_proxy_buffering();
+                if (!buffering) return core::make_unexpected(buffering.error());
+                result.proxy_buffering = buffering.value();
             } else if (eq(cur_.text, "proxy_hide_header", 17)) {
                 if (have_proxy_hide_header)
                     return unsupported(cur_.span, lit_str("duplicate proxy_hide_header"));
@@ -714,6 +870,9 @@ private:
             } else if (eq(cur_.text, "proxy_hide_header", 17)) {
                 return unsupported(cur_.span,
                                    lit_str("proxy_hide_header is unsupported in exact locations"));
+            } else if (eq(cur_.text, "proxy_buffering", 15)) {
+                return unsupported(cur_.span,
+                                   lit_str("proxy_buffering is unsupported in exact locations"));
             } else if (eq(cur_.text, "location", 8)) {
                 return unsupported(cur_.span, lit_str("nested locations are unsupported"));
             } else {
@@ -917,6 +1076,33 @@ private:
             true, seconds * 1000u, Span{start.start, end.end, start.line, start.col}, value.span};
     }
 
+    FrontendResult<ProxyBuffering> parse_proxy_buffering() {
+        const Span start = cur_.span;
+        advance();
+        if (cur_.kind == TokenKind::End)
+            return missing(cur_.span, lit_str("proxy_buffering requires a value"));
+        if (cur_.kind != TokenKind::Word)
+            return invalid(cur_.span, lit_str("proxy_buffering requires a value"));
+        const Token value = cur_;
+        if (!eq(value.text, "on", 2) && !eq(value.text, "off", 3))
+            return unsupported(value.span,
+                               lit_str("only literal proxy_buffering on or off is recognized"));
+        advance();
+        if (cur_.kind == TokenKind::End)
+            return missing(cur_.span, lit_str("expected ';' after proxy_buffering"));
+        if (cur_.kind != TokenKind::Semicolon) {
+            if (cur_.kind == TokenKind::Word)
+                return unsupported(cur_.span, lit_str("proxy_buffering accepts exactly one value"));
+            return invalid(cur_.span, lit_str("expected ';' after proxy_buffering"));
+        }
+        const Span end = cur_.span;
+        advance();
+        ProxyBuffering result{true, Span{start.start, end.end, start.line, start.col}, value.span};
+        result.value =
+            eq(value.text, "off", 3) ? ProxyBufferingValue::Off : ProxyBufferingValue::On;
+        return result;
+    }
+
     FrontendResult<ProxyHideHeader> parse_proxy_hide_header() {
         const Span start = cur_.span;
         advance();
@@ -929,9 +1115,10 @@ private:
             eq(cur_.text, "server", 6))
             return invalid(cur_.span, lit_str("proxy_hide_header requires a name"));
         const Token name = cur_;
-        if (!eq(name.text, "X-Compat-Hidden", 15))
-            return unsupported(
-                name.span, lit_str("only literal proxy_hide_header X-Compat-Hidden is modeled"));
+        if (!valid_proxy_hide_header_name(name.text))
+            return unsupported(name.span,
+                               lit_str("proxy_hide_header name is outside the bounded header-name "
+                                       "profile"));
         advance();
         if (cur_.kind == TokenKind::End)
             return missing(cur_.span, lit_str("expected ';' after proxy_hide_header"));
@@ -1094,6 +1281,10 @@ FrontendResult<Server> parse(Str source) {
 
 FrontendResult<HttpProfile> parse_http_profile(Str source) {
     return Parser(source).run_http_profile();
+}
+
+FrontendResult<NginxHttpConfig> parse_nginx_http_config(Str source) {
+    return Parser(source).run_nginx_http_config();
 }
 
 }  // namespace rut::nginx

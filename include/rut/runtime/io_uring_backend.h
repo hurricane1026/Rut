@@ -210,6 +210,15 @@ struct IoUringBackend {
     // the dispatcher can reject stale timeout CQEs.
     bool add_yield_timeout(u32 conn_id, Connection& conn, u32 ms);
 
+    // Submit/cancel the generic precise response-read timer. Ownership lives
+    // entirely on Connection and is intentionally not pending_ops accounting.
+    bool add_response_read_timer(u32 conn_id,
+                                 Connection& conn,
+                                 u32 milliseconds,
+                                 u32 deadline_generation,
+                                 u32 upstream_episode);
+    bool cancel_response_read_timer(u32 conn_id, Connection& conn);
+
     // Cancel outstanding operations for a connection (by user_data match).
     // Only submits cancel SQEs for op types actually in flight.
     // Returns the number of cancel SQEs submitted (for pending_ops tracking).

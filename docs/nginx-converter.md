@@ -37,9 +37,49 @@ http {
 This does not replace or broaden the bare-server entry and is not a general
 nginx.conf parser. It exists so http-context logging declarations and their
 server can share one source/provenance root. Parsing this profile does not imply
-lowering support: ordinary RUT access sink/format publication remains #363.
+lowering support beyond the bounded access-log profile; the closed #363
+publication capability is used only for this exact model.
+The explicit literal `access_log off;` profile now converts to the same owned
+ordinary server source without an `accessLog` declaration. This is conversion
+admission plus one bounded behavior witness: merged #598/#599 demonstrate
+logging absence only for the exact pinned explicit-Off retained-header vector
+documented in the compatibility matrix. General nginx logging, inheritance,
+and runtime logging overrides remain outside the contract.
 
-## Proposed pipeline
+## Standalone conversion command
+
+The built `rut-nginx-convert` command exposes the existing API as a bounded
+file conversion workflow:
+
+```text
+rut-nginx-convert --format server <input-file>
+rut-nginx-convert --format http <input-file>
+rut-nginx-convert --format nginx-http <input-file>
+```
+
+`server` accepts one bare server fragment and `http` accepts one bounded
+`http {}` profile with the existing `log_format`/`access_log` declarations or
+the explicit literal `access_log off;` form.
+`nginx-http` accepts exactly one empty `events {}` block followed by that same
+bounded HTTP profile, either logged or explicit-Off. This is complete-file envelope admission, not a
+claim that an empty events block is semantically inert or that arbitrary
+nginx.conf files are supported. The retained-header behavior evidence covers
+only the separately documented omitted-default and explicit-Off runtime vectors; parser
+admission does not promote arbitrary directives or configurations to that
+behavioral claim.
+The input must be one regular file no larger than 1 MiB; the complete file is
+kept alive through parsing and lowering. The command does not read stdin,
+expand includes, execute generated RUT, open configured listeners or log
+sinks, modify the input, or infer a format. Output is the owned ordinary RUT
+source on stdout without its terminating NUL. Diagnostics are written to
+stderr as `file:line:column: detail`.
+
+Exit status 0 means conversion and stdout writing succeeded; 2 means usage or
+format selection was invalid; 1 means input, allocation, parse, lowering, or
+output failure. A conversion failure writes no program bytes. An output failure
+may follow bytes already accepted by stdout, as stdout is not an atomic sink.
+
+## Implemented pipeline
 
 ```text
 nginx source
@@ -56,9 +96,9 @@ listeners, server selection, location selection, proxy URI policy, and inherited
 header policy. Lowering happens only after the whole accepted input has passed
 capability validation.
 
-The first implementation should emit auditable RUT source and retain source
-spans for diagnostics. It must not construct `RouteConfig` directly or bypass
-the existing compiler. If a semantic model value cannot be represented in RUT
+The converter emits auditable RUT source and retains source spans for
+diagnostics. It does not construct `RouteConfig` directly or bypass the
+existing compiler. If a semantic model value cannot be represented in RUT
 source/config, the feature is `BLOCKED_BY_RUT`; direct HIR construction is not a
 fallback for hiding a language/runtime gap.
 

@@ -42,6 +42,10 @@ inline bool complete_content_length_route_method_is_admitted(u8 method) {
     }
 }
 
+inline bool fixed_upload_head_route_method_is_admitted(u8 method) {
+    return method == kRouteMethodAny || method == kRouteMethodHead;
+}
+
 inline u8 route_method_key(HttpMethod method) {
     switch (method) {
         case HttpMethod::GET:

@@ -5,6 +5,390 @@ target_include_directories(test_framework PRIVATE
 )
 add_test(NAME test_framework COMMAND test_framework)
 set_tests_properties(test_framework PROPERTIES WILL_FAIL TRUE)
+add_test(NAME test_framework_sharding COMMAND test_framework --sharding-self-test)
+set_tests_properties(test_framework_sharding PROPERTIES LABELS "unit" TIMEOUT 30)
+
+# Pure #358 Stage 2a1 fixture-worker protocol self-check.  This deliberately
+# has no Docker/network label and runs in ordinary CI on an unprivileged host.
+add_library(fixture_worker_protocol STATIC fixture_worker_protocol.cc)
+target_include_directories(fixture_worker_protocol PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+
+add_executable(test_fixture_worker_protocol test_fixture_worker_protocol.cc)
+target_link_libraries(test_fixture_worker_protocol PRIVATE fixture_worker_protocol)
+add_test(NAME test_fixture_worker_protocol COMMAND test_fixture_worker_protocol)
+set_tests_properties(test_fixture_worker_protocol PROPERTIES
+    LABELS "unit"
+    RUN_SERIAL TRUE
+    TIMEOUT 30
+)
+
+# Pure bounded IPv4 HTTP exchange/parser self-check. No Docker, nginx, RUT,
+# converter, or runtime behavior is involved.
+add_executable(test_fixture_bounded_http_exchange
+    test_fixture_bounded_http_exchange.cc)
+add_library(fixture_bounded_http_exchange STATIC fixture_bounded_http_exchange.cc)
+target_compile_definitions(fixture_bounded_http_exchange PRIVATE
+    RUT_BOUNDED_HTTP_EXCHANGE_TEST_SEAM)
+target_compile_definitions(test_fixture_bounded_http_exchange PRIVATE
+    RUT_BOUNDED_HTTP_EXCHANGE_TEST_SEAM)
+target_include_directories(fixture_bounded_http_exchange PUBLIC
+    ${CMAKE_CURRENT_SOURCE_DIR})
+target_include_directories(test_fixture_bounded_http_exchange PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR})
+target_link_libraries(test_fixture_bounded_http_exchange PRIVATE fixture_bounded_http_exchange)
+if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+    target_compile_options(test_fixture_bounded_http_exchange PRIVATE -fexceptions)
+endif()
+add_test(NAME test_fixture_bounded_http_exchange
+    COMMAND test_fixture_bounded_http_exchange)
+set_tests_properties(test_fixture_bounded_http_exchange PROPERTIES
+    LABELS "unit"
+    RUN_SERIAL TRUE
+    TIMEOUT 30)
+
+# Pure #377 CollisionRelease v2 authenticated codec/state machine. The library
+# reuses common worker framing but owns no process, listener or runtime state.
+add_library(fixture_collision_release_protocol STATIC
+    fixture_collision_release_protocol.cc)
+target_include_directories(fixture_collision_release_protocol PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR})
+target_link_libraries(fixture_collision_release_protocol PUBLIC fixture_worker_protocol)
+
+add_executable(test_fixture_collision_release_protocol
+    test_fixture_collision_release_protocol.cc)
+target_link_libraries(test_fixture_collision_release_protocol PRIVATE
+    fixture_collision_release_protocol)
+add_test(NAME test_fixture_collision_release_protocol
+    COMMAND test_fixture_collision_release_protocol)
+set_tests_properties(test_fixture_collision_release_protocol PROPERTIES
+    LABELS "unit"
+    RUN_SERIAL TRUE
+    TIMEOUT 30)
+
+# Pure #377 type-59 Canonical collision/release scalar evidence codec and
+# nine-event receiver.  It reuses only the common v1 frame/token transport;
+# no broker, process, socket, or runtime target is linked.
+add_library(fixture_collision_release_evidence_protocol STATIC
+    fixture_collision_release_evidence_protocol.cc)
+target_include_directories(fixture_collision_release_evidence_protocol PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR})
+target_link_libraries(fixture_collision_release_evidence_protocol PUBLIC
+    fixture_worker_protocol)
+
+add_executable(test_fixture_collision_release_evidence_protocol
+    test_fixture_collision_release_evidence_protocol.cc)
+target_link_libraries(test_fixture_collision_release_evidence_protocol PRIVATE
+    fixture_collision_release_evidence_protocol)
+add_test(NAME test_fixture_collision_release_evidence_protocol
+    COMMAND test_fixture_collision_release_evidence_protocol)
+set_tests_properties(test_fixture_collision_release_evidence_protocol PROPERTIES
+    LABELS "unit"
+    RUN_SERIAL TRUE
+    TIMEOUT 30)
+
+# Tests-only authenticated absolute-deadline type-59 evidence transport. It
+# returns raw frames to the pure evidence codec and owns no broker, process,
+# listener, nginx, converter or runtime behavior.
+add_library(fixture_collision_release_evidence_transport STATIC
+    fixture_collision_release_evidence_transport.cc)
+target_include_directories(fixture_collision_release_evidence_transport PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR})
+target_link_libraries(fixture_collision_release_evidence_transport PUBLIC
+    fixture_collision_release_evidence_protocol)
+
+add_executable(test_fixture_collision_release_evidence_transport
+    test_fixture_collision_release_evidence_transport.cc)
+target_include_directories(test_fixture_collision_release_evidence_transport PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR})
+target_link_libraries(test_fixture_collision_release_evidence_transport PRIVATE
+    fixture_collision_release_evidence_transport)
+add_test(NAME test_fixture_collision_release_evidence_transport
+    COMMAND test_fixture_collision_release_evidence_transport)
+set_tests_properties(test_fixture_collision_release_evidence_transport PROPERTIES
+    LABELS "unit"
+    RUN_SERIAL TRUE
+    TIMEOUT 30)
+
+# Linux-only, tests-only exact raw TCP reservation custody for #377. This owns
+# one bound non-listening socket and performs no broker, runtime or RUT work.
+if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+    add_library(fixture_exact_tcp_reservation_lease STATIC
+        fixture_exact_tcp_reservation_lease.cc)
+    target_include_directories(fixture_exact_tcp_reservation_lease PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR})
+
+    add_executable(test_fixture_exact_tcp_reservation_lease
+        test_fixture_exact_tcp_reservation_lease.cc)
+    target_link_libraries(test_fixture_exact_tcp_reservation_lease PRIVATE
+        fixture_exact_tcp_reservation_lease)
+    add_test(NAME test_fixture_exact_tcp_reservation_lease
+        COMMAND test_fixture_exact_tcp_reservation_lease)
+    set_tests_properties(test_fixture_exact_tcp_reservation_lease PROPERTIES
+        LABELS "unit"
+        RUN_SERIAL TRUE
+        SKIP_RETURN_CODE 77
+        TIMEOUT 30)
+endif()
+
+# Tests-only identity-bound private /tmp directory custody for #377.
+add_library(fixture_private_directory_lease STATIC fixture_private_directory_lease.cc)
+target_include_directories(fixture_private_directory_lease PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+add_executable(test_fixture_private_directory_lease test_fixture_private_directory_lease.cc)
+target_link_libraries(test_fixture_private_directory_lease PRIVATE fixture_private_directory_lease)
+add_test(NAME test_fixture_private_directory_lease COMMAND test_fixture_private_directory_lease)
+set_tests_properties(test_fixture_private_directory_lease PROPERTIES
+    LABELS "unit" RUN_SERIAL TRUE TIMEOUT 30)
+
+add_library(fixture_exact_input_file_lease STATIC fixture_exact_input_file_lease.cc)
+target_include_directories(fixture_exact_input_file_lease PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+target_link_libraries(fixture_exact_input_file_lease PUBLIC fixture_private_directory_lease)
+add_executable(test_fixture_exact_input_file_lease test_fixture_exact_input_file_lease.cc)
+target_link_libraries(test_fixture_exact_input_file_lease PRIVATE fixture_exact_input_file_lease)
+add_test(NAME test_fixture_exact_input_file_lease COMMAND test_fixture_exact_input_file_lease)
+set_tests_properties(test_fixture_exact_input_file_lease PROPERTIES LABELS "unit" TIMEOUT 30)
+
+# Pure #377 paused direct-child lease. This owns only a forked readiness/release
+# barrier and pidfd authority; source, log, listener and runtime state remain
+# in separately reviewed fixtures.
+add_library(fixture_wildcard_paused_child_lease STATIC
+    fixture_wildcard_paused_child_lease.cc
+)
+
+target_link_libraries(fixture_wildcard_paused_child_lease PRIVATE fixture_worker_protocol)
+target_include_directories(fixture_wildcard_paused_child_lease PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+
+add_executable(test_fixture_wildcard_paused_child_lease
+    test_fixture_wildcard_paused_child_lease.cc
+)
+target_link_libraries(test_fixture_wildcard_paused_child_lease PRIVATE
+    fixture_wildcard_paused_child_lease
+)
+target_include_directories(test_fixture_wildcard_paused_child_lease PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+if(CMAKE_SYSTEM_NAME STREQUAL "Linux" AND CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+    target_compile_options(test_fixture_wildcard_paused_child_lease PRIVATE -fexceptions)
+endif()
+add_test(NAME test_fixture_wildcard_paused_child_lease
+         COMMAND test_fixture_wildcard_paused_child_lease)
+set_tests_properties(test_fixture_wildcard_paused_child_lease PROPERTIES
+    LABELS "unit"
+    RUN_SERIAL TRUE
+    TIMEOUT 30
+)
+
+# Tests-only fixed privileged identity bundle transport.  This is a pure
+# socketpair/SCM_RIGHTS self-check and is not connected to the broker runtime.
+add_library(fixture_identity_bundle STATIC fixture_identity_bundle.cc)
+target_include_directories(fixture_identity_bundle PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+
+add_executable(test_fixture_identity_bundle test_fixture_identity_bundle.cc)
+target_link_libraries(test_fixture_identity_bundle PRIVATE fixture_identity_bundle)
+add_test(NAME test_fixture_identity_bundle COMMAND test_fixture_identity_bundle)
+set_tests_properties(test_fixture_identity_bundle PROPERTIES
+    LABELS "unit"
+    RUN_SERIAL TRUE
+    TIMEOUT 30
+)
+
+# Manifest-free bounded ancestry FD transport.  This remains a pure
+# socketpair/procfs self-check and is not connected to the privileged broker.
+add_library(fixture_ancestry_bundle STATIC fixture_ancestry_bundle.cc)
+target_include_directories(fixture_ancestry_bundle PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+target_link_libraries(fixture_ancestry_bundle PUBLIC fixture_identity_bundle)
+
+add_executable(test_fixture_ancestry_bundle test_fixture_ancestry_bundle.cc)
+target_link_libraries(test_fixture_ancestry_bundle PRIVATE fixture_ancestry_bundle)
+add_test(NAME test_fixture_ancestry_bundle COMMAND test_fixture_ancestry_bundle)
+set_tests_properties(test_fixture_ancestry_bundle PROPERTIES LABELS "unit" RUN_SERIAL TRUE TIMEOUT 30)
+
+# Pure #358 Stage 2a3b sudo/nsenter/launcher causal state model.  This test
+# uses synthetic process identities and never invokes sudo or fakes a positive
+# privileged semantic run.
+add_library(fixture_direct_launch STATIC fixture_direct_launch.cc)
+target_include_directories(fixture_direct_launch PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+
+add_executable(test_fixture_direct_launch test_fixture_direct_launch.cc)
+target_link_libraries(test_fixture_direct_launch PRIVATE fixture_direct_launch)
+add_test(NAME test_fixture_direct_launch COMMAND test_fixture_direct_launch)
+set_tests_properties(test_fixture_direct_launch PROPERTIES LABELS "unit" TIMEOUT 30)
+
+# Tests-only retained-sudo ancestry collector and exact one-record binder.
+add_library(fixture_privileged_ancestry STATIC fixture_privileged_ancestry.cc)
+target_include_directories(fixture_privileged_ancestry PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+target_link_libraries(fixture_privileged_ancestry PUBLIC
+    fixture_ancestry_bundle fixture_direct_launch fixture_identity_bundle fixture_worker_protocol)
+
+add_executable(test_fixture_privileged_ancestry test_fixture_privileged_ancestry.cc)
+target_link_libraries(test_fixture_privileged_ancestry PRIVATE fixture_privileged_ancestry)
+add_test(NAME test_fixture_privileged_ancestry COMMAND test_fixture_privileged_ancestry)
+set_tests_properties(test_fixture_privileged_ancestry PROPERTIES LABELS "unit" RUN_SERIAL TRUE TIMEOUT 30)
+
+# Pure #358 listener plan/source/proc-table/collision-log evidence. The library
+# is shared with the privileged broker; this focused unit creates no sockets or
+# processes.
+add_library(fixture_privileged_listener STATIC fixture_privileged_listener.cc)
+target_include_directories(fixture_privileged_listener PRIVATE
+    ${PROJECT_SOURCE_DIR}/include
+    ${CMAKE_CURRENT_SOURCE_DIR}
+)
+
+add_executable(test_fixture_privileged_listener test_fixture_privileged_listener.cc)
+target_link_libraries(test_fixture_privileged_listener PRIVATE fixture_privileged_listener)
+add_test(NAME test_fixture_privileged_listener COMMAND test_fixture_privileged_listener)
+set_tests_properties(test_fixture_privileged_listener PROPERTIES LABELS "unit" TIMEOUT 30)
+
+# Pure #377 immutable wildcard-attempt source identity lease. This focused
+# self-check uses only private temporary files and starts no process or socket.
+add_library(fixture_wildcard_source_lease STATIC fixture_wildcard_source_lease.cc)
+target_include_directories(fixture_wildcard_source_lease PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+target_link_libraries(fixture_wildcard_source_lease PUBLIC fixture_privileged_listener)
+
+add_executable(test_fixture_wildcard_source_lease test_fixture_wildcard_source_lease.cc)
+target_link_libraries(test_fixture_wildcard_source_lease PRIVATE fixture_wildcard_source_lease)
+add_test(NAME test_fixture_wildcard_source_lease COMMAND test_fixture_wildcard_source_lease)
+set_tests_properties(test_fixture_wildcard_source_lease PROPERTIES LABELS "unit" TIMEOUT 30)
+
+if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+    add_executable(test_fixture_wildcard_source_reservation_sequence
+        test_fixture_wildcard_source_reservation_sequence.cc)
+    target_link_libraries(test_fixture_wildcard_source_reservation_sequence PRIVATE
+        fixture_wildcard_source_lease
+        fixture_exact_tcp_reservation_lease
+        fixture_private_directory_lease)
+    add_test(NAME test_fixture_wildcard_source_reservation_sequence
+        COMMAND test_fixture_wildcard_source_reservation_sequence)
+    set_tests_properties(test_fixture_wildcard_source_reservation_sequence PROPERTIES
+        LABELS "unit"
+        RUN_SERIAL TRUE
+        SKIP_RETURN_CODE 77
+        TIMEOUT 30)
+endif()
+
+# Pure #377 bounded anonymous stdout/stderr capture. This is an unprivileged
+# memfd/seals self-check and is not connected to a child, broker or runtime.
+add_library(fixture_anonymous_log_capture STATIC fixture_anonymous_log_capture.cc)
+target_include_directories(fixture_anonymous_log_capture PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+
+add_executable(test_fixture_anonymous_log_capture test_fixture_anonymous_log_capture.cc)
+target_link_libraries(test_fixture_anonymous_log_capture PRIVATE fixture_anonymous_log_capture)
+add_test(NAME test_fixture_anonymous_log_capture COMMAND test_fixture_anonymous_log_capture)
+set_tests_properties(test_fixture_anonymous_log_capture PROPERTIES LABELS "unit" TIMEOUT 30)
+
+# Pure #377 caller-owned executable descriptor/name-binding custody. This
+# fixture does not fork, exec, launch a session, open a listener or run RUT.
+add_library(fixture_executable_lease STATIC fixture_executable_lease.cc)
+target_include_directories(fixture_executable_lease PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+
+add_executable(test_fixture_executable_lease test_fixture_executable_lease.cc)
+target_link_libraries(test_fixture_executable_lease PRIVATE fixture_executable_lease)
+add_test(NAME test_fixture_executable_lease COMMAND test_fixture_executable_lease)
+set_tests_properties(test_fixture_executable_lease PROPERTIES
+    LABELS "unit"
+    RUN_SERIAL TRUE
+    TIMEOUT 30)
+
+# Pure #377 executable-OFD child handoff and bounded exec observation.  This
+# fixture launches no complete RUT session, listener, broker, or HTTP flow.
+add_library(fixture_executable_exec_handoff STATIC
+    fixture_executable_exec_handoff.cc)
+target_include_directories(fixture_executable_exec_handoff PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR})
+target_link_libraries(fixture_executable_exec_handoff PUBLIC
+    fixture_executable_lease
+    fixture_wildcard_paused_child_lease
+    fixture_worker_protocol)
+
+add_executable(test_fixture_executable_exec_handoff
+    test_fixture_executable_exec_handoff.cc)
+target_link_libraries(test_fixture_executable_exec_handoff PRIVATE
+    fixture_executable_exec_handoff)
+add_test(NAME test_fixture_executable_exec_handoff
+    COMMAND test_fixture_executable_exec_handoff)
+set_tests_properties(test_fixture_executable_exec_handoff PROPERTIES
+    LABELS "unit"
+    RUN_SERIAL TRUE
+    TIMEOUT 30)
+
+# Reusable tests-only ownership of exactly one public-RUT process attempt. It
+# composes lifecycle evidence only; listener/collision/HTTP behavior remains
+# outside this fixture.
+add_library(fixture_public_rut_session_attempt STATIC
+    fixture_public_rut_session_attempt.cc)
+target_include_directories(fixture_public_rut_session_attempt PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR})
+target_link_libraries(fixture_public_rut_session_attempt PUBLIC
+    fixture_anonymous_log_capture
+    fixture_executable_exec_handoff
+    fixture_executable_lease
+    fixture_wildcard_paused_child_lease
+    fixture_wildcard_source_lease
+    fixture_worker_protocol)
+
+add_executable(test_fixture_public_rut_session_attempt
+    test_fixture_public_rut_session_attempt.cc)
+target_link_libraries(test_fixture_public_rut_session_attempt PRIVATE
+    fixture_private_directory_lease
+    fixture_public_rut_session_attempt)
+add_test(NAME test_fixture_public_rut_session_attempt
+    COMMAND test_fixture_public_rut_session_attempt)
+set_tests_properties(test_fixture_public_rut_session_attempt PROPERTIES
+    LABELS "unit"
+    RUN_SERIAL TRUE
+    TIMEOUT 30)
+
+# #377 declaration-only paused-child descriptor preparation. This composes the
+# independently owned source, capture and child leases only for child dup2/FD
+# closure; release remains inert and no runtime/session is launched.
+add_executable(test_fixture_wildcard_lease_composition
+    test_fixture_wildcard_lease_composition.cc)
+target_link_libraries(test_fixture_wildcard_lease_composition PRIVATE
+    fixture_anonymous_log_capture
+    fixture_wildcard_paused_child_lease
+    fixture_wildcard_source_lease
+    fixture_worker_protocol)
+target_include_directories(test_fixture_wildcard_lease_composition PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR})
+add_test(NAME test_fixture_wildcard_lease_composition
+    COMMAND test_fixture_wildcard_lease_composition)
+set_tests_properties(test_fixture_wildcard_lease_composition PROPERTIES
+    LABELS "unit"
+    RUN_SERIAL TRUE
+    TIMEOUT 30)
+
+if(RUT_ENABLE_JIT)
+    # One fresh #377 public-RUT session composing the accepted immutable source,
+    # executable, capture, prepared-child and bounded-argv leases. This is a
+    # tests-only startup control-plane witness, not a listener/HTTP claim.
+    add_executable(test_fixture_wildcard_canonical_session
+        test_fixture_wildcard_canonical_session.cc)
+    target_link_libraries(test_fixture_wildcard_canonical_session PRIVATE
+        fixture_executable_lease
+        fixture_private_directory_lease
+        fixture_public_rut_session_attempt
+        fixture_wildcard_source_lease
+        fixture_worker_protocol)
+    target_compile_definitions(test_fixture_wildcard_canonical_session PRIVATE
+        RUT_SERVER_BINARY="$<TARGET_FILE:rut>")
+    add_dependencies(test_fixture_wildcard_canonical_session rut)
+    add_test(NAME test_fixture_wildcard_canonical_session
+        COMMAND test_fixture_wildcard_canonical_session)
+    set_tests_properties(test_fixture_wildcard_canonical_session PROPERTIES
+        LABELS "integration;jit;network"
+        RUN_SERIAL TRUE
+        TIMEOUT 30)
+
+    add_executable(test_fixture_privileged_listener_loader
+        test_fixture_privileged_listener_loader.cc)
+    target_link_libraries(test_fixture_privileged_listener_loader PRIVATE
+        fixture_privileged_listener rut_loader)
+    target_include_directories(test_fixture_privileged_listener_loader PRIVATE
+        ${LLVM_INCLUDE_DIRS})
+    target_compile_definitions(test_fixture_privileged_listener_loader PRIVATE
+        ${LLVM_DEFINITIONS} RUT_ENABLE_JIT=1)
+    add_test(NAME test_fixture_privileged_listener_loader
+        COMMAND test_fixture_privileged_listener_loader)
+    set_tests_properties(test_fixture_privileged_listener_loader PROPERTIES
+        LABELS "unit;jit" TIMEOUT 30)
+endif()
 
 add_executable(test_exact_path_view test_exact_path_view.cc)
 target_include_directories(test_exact_path_view PRIVATE
@@ -48,6 +432,7 @@ add_test(NAME test_redirect_policy COMMAND test_redirect_policy)
 set_tests_properties(test_redirect_policy PROPERTIES LABELS "unit")
 
 find_package(Threads REQUIRED)
+target_link_libraries(test_fixture_bounded_http_exchange PRIVATE Threads::Threads)
 find_package(Python3 REQUIRED COMPONENTS Interpreter)
 
 set(RUT_TLS_TESTDATA_DIR ${CMAKE_CURRENT_BINARY_DIR}/testdata)
@@ -95,8 +480,19 @@ else()
     target_compile_definitions(test_integration PRIVATE RUT_ENABLE_JIT_TESTS=0)
 endif()
 add_dependencies(test_integration test_tls_fixtures)
-add_test(NAME test_integration COMMAND test_integration)
-set_tests_properties(test_integration PROPERTIES LABELS "integration;network" TIMEOUT 300)
+add_test(
+    NAME test_integration.shard_0_of_2
+    COMMAND test_integration --shard-index=0 --shard-count=2)
+add_test(
+    NAME test_integration.shard_1_of_2
+    COMMAND test_integration --shard-index=1 --shard-count=2)
+set_tests_properties(
+    test_integration.shard_0_of_2
+    test_integration.shard_1_of_2
+    PROPERTIES
+        LABELS "integration;network"
+        RESOURCE_LOCK rut_integration
+        TIMEOUT 300)
 
 add_executable(test_arena
     test_arena.cc
@@ -288,6 +684,16 @@ target_include_directories(test_nginx_parser PRIVATE
 add_test(NAME test_nginx_parser COMMAND test_nginx_parser)
 set_tests_properties(test_nginx_parser PROPERTIES LABELS "unit;nginx;compiler")
 
+add_executable(test_nginx_convert test_nginx_convert.cc ${PROJECT_SOURCE_DIR}/src/placement_new.cc)
+target_link_libraries(test_nginx_convert rut_nginx)
+target_include_directories(test_nginx_convert PRIVATE
+    ${PROJECT_SOURCE_DIR}/include
+    ${PROJECT_SOURCE_DIR}/testing
+)
+add_dependencies(test_nginx_convert rut-nginx-convert)
+add_test(NAME test_nginx_convert COMMAND test_nginx_convert $<TARGET_FILE:rut-nginx-convert>)
+set_tests_properties(test_nginx_convert PROPERTIES LABELS "unit;nginx;converter")
+
 add_executable(test_drain test_drain.cc)
 target_link_libraries(test_drain rut_runtime)
 target_include_directories(test_drain PRIVATE
@@ -447,6 +853,22 @@ if(RUT_ENABLE_JIT)
         ${CMAKE_CURRENT_SOURCE_DIR}
     )
     target_link_libraries(test_nginx_downstream_gate_preload PRIVATE dl)
+    if(CMAKE_SYSTEM_NAME STREQUAL "Linux" AND
+       CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|AMD64)$" AND
+       CMAKE_C_COMPILER_ID STREQUAL "GNU")
+        include(CheckCCompilerFlag)
+        check_c_compiler_flag("-mtls-dialect=gnu" RUT_NGINX_PRELOAD_TLS_GNU_SUPPORTED)
+        if(RUT_NGINX_PRELOAD_TLS_GNU_SUPPORTED)
+            target_compile_options(test_nginx_downstream_gate_preload PRIVATE
+                -mtls-dialect=gnu
+            )
+        else()
+            message(WARNING
+                "test_nginx_downstream_gate_preload: compiler does not support -mtls-dialect=gnu; "
+                "pinned-container loader compatibility cannot be guaranteed"
+            )
+        endif()
+    endif()
 
     if(CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|AMD64)$")
         add_library(test_rut_iouring_gate_preload SHARED rut_iouring_gate_preload.c)
@@ -465,10 +887,154 @@ if(RUT_ENABLE_JIT)
     target_compile_definitions(test_nginx_differential PRIVATE
         "RUT_PINNED_NGINX_IMAGE=\"${_RUT_PINNED_NGINX_IMAGE}\""
     )
-    add_dependencies(test_nginx_differential rut test_nginx_downstream_gate_preload)
+    add_dependencies(test_nginx_differential
+        rut
+        rut-nginx-convert
+        test_nginx_downstream_gate_preload
+    )
     if(TARGET test_rut_iouring_gate_preload)
         add_dependencies(test_nginx_differential test_rut_iouring_gate_preload)
     endif()
+    add_executable(test_ipv4_fixture_topology
+        test_ipv4_fixture_topology.cc
+        fixture_ipv4_topology.cc
+    )
+    target_link_libraries(test_ipv4_fixture_topology PRIVATE
+        fixture_bounded_http_exchange
+        fixture_exact_input_file_lease
+        fixture_private_directory_lease
+        fixture_privileged_listener
+    )
+    target_compile_definitions(test_ipv4_fixture_topology PRIVATE
+        "RUT_PINNED_NGINX_IMAGE=\"${_RUT_PINNED_NGINX_IMAGE}\""
+    )
+    add_test(NAME test_ipv4_fixture_topology COMMAND test_ipv4_fixture_topology)
+    set_tests_properties(test_ipv4_fixture_topology PROPERTIES
+        LABELS "integration;docker;network"
+        RUN_SERIAL TRUE
+        RESOURCE_LOCK nginx-differential
+        TIMEOUT 120
+        SKIP_RETURN_CODE 77
+    )
+    add_executable(test_fixture_privileged_broker
+        test_fixture_privileged_broker.cc
+        fixture_ipv4_topology.cc
+        ${PROJECT_SOURCE_DIR}/src/placement_new.cc
+    )
+    target_link_libraries(test_fixture_privileged_broker PRIVATE
+        rut_nginx
+        fixture_bounded_http_exchange
+        fixture_ancestry_bundle
+        fixture_collision_release_evidence_protocol
+        fixture_collision_release_evidence_transport
+        fixture_collision_release_protocol
+        fixture_direct_launch
+        fixture_exact_tcp_reservation_lease
+        fixture_exact_input_file_lease
+        fixture_executable_exec_handoff
+        fixture_executable_lease
+        fixture_identity_bundle
+        fixture_private_directory_lease
+        fixture_privileged_ancestry
+        fixture_privileged_listener
+        fixture_public_rut_session_attempt
+        fixture_worker_protocol
+        fixture_wildcard_paused_child_lease
+        fixture_wildcard_source_lease
+    )
+    target_include_directories(test_fixture_privileged_broker PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}
+        ${PROJECT_SOURCE_DIR}/include
+    )
+    target_compile_definitions(test_fixture_privileged_broker PRIVATE
+        "RUT_PINNED_NGINX_IMAGE=\"${_RUT_PINNED_NGINX_IMAGE}\""
+    )
+    add_dependencies(test_fixture_privileged_broker rut)
+    add_test(NAME test_fixture_privileged_broker
+             COMMAND test_fixture_privileged_broker $<TARGET_FILE:rut>)
+    add_test(NAME test_fixture_generated_nginx_differential
+             COMMAND test_fixture_privileged_broker
+                     $<TARGET_FILE:rut>
+                     --generated-nginx-differential)
+
+    add_executable(test_fixture_exact_input_mount_owner
+        test_fixture_exact_input_mount_owner.cc
+        fixture_ipv4_topology.cc
+    )
+    target_link_libraries(test_fixture_exact_input_mount_owner PRIVATE
+        fixture_bounded_http_exchange
+        fixture_exact_input_file_lease
+        fixture_private_directory_lease
+        fixture_privileged_listener
+        Threads::Threads
+    )
+    target_compile_definitions(test_fixture_exact_input_mount_owner PRIVATE
+        "RUT_PINNED_NGINX_IMAGE=\"${_RUT_PINNED_NGINX_IMAGE}\""
+    )
+    if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+        # This shared tests-only source deliberately accepts throwing callbacks
+        # and catches them before they can escape into the fixture controller.
+        foreach(_target IN ITEMS
+                test_ipv4_fixture_topology
+                test_fixture_privileged_broker
+                test_fixture_exact_input_mount_owner)
+            target_compile_options(${_target} PRIVATE -fexceptions)
+        endforeach()
+    endif()
+    add_test(NAME test_fixture_exact_input_mount_owner
+             COMMAND test_fixture_exact_input_mount_owner)
+    set_tests_properties(test_fixture_exact_input_mount_owner PROPERTIES
+        LABELS "integration;docker;network"
+        RUN_SERIAL TRUE
+        RESOURCE_LOCK nginx-differential
+        TIMEOUT 360
+        SKIP_RETURN_CODE 77
+    )
+    add_test(NAME test_fixture_exact_input_read_runner
+             COMMAND test_fixture_exact_input_mount_owner
+                     --exact-input-read-runner-self-check)
+    set_tests_properties(test_fixture_exact_input_read_runner PROPERTIES
+        LABELS "unit"
+        TIMEOUT 30
+    )
+    set(_RUT_PRIVILEGED_BROKER_TIMEOUT_SECONDS 360)
+    set_tests_properties(test_fixture_privileged_broker PROPERTIES
+        LABELS "integration;docker;network"
+        RUN_SERIAL TRUE
+        RESOURCE_LOCK nginx-differential
+        TIMEOUT ${_RUT_PRIVILEGED_BROKER_TIMEOUT_SECONDS}
+        SKIP_RETURN_CODE 77
+    )
+    set_tests_properties(test_fixture_generated_nginx_differential PROPERTIES
+        LABELS "integration;docker;network;differential"
+        RUN_SERIAL TRUE
+        RESOURCE_LOCK nginx-differential
+        TIMEOUT ${_RUT_PRIVILEGED_BROKER_TIMEOUT_SECONDS}
+        SKIP_RETURN_CODE 77
+    )
+    add_test(NAME test_fixture_wildcard_attempt_protocol
+             COMMAND test_fixture_privileged_broker
+                     --wildcard-attempt-protocol-self-check)
+    set_tests_properties(test_fixture_wildcard_attempt_protocol PROPERTIES
+        LABELS "unit"
+    )
+    add_test(NAME test_fixture_canonical_wait_strategy
+             COMMAND test_fixture_privileged_broker
+                     --canonical-wait-strategy-self-check)
+    set_tests_properties(test_fixture_canonical_wait_strategy PROPERTIES
+        LABELS "unit"
+        TIMEOUT 30
+    )
+    add_test(NAME test_fixture_canonical_target_cleanup
+             COMMAND test_fixture_privileged_broker
+                     --canonical-target-cleanup-self-check)
+    set_tests_properties(test_fixture_canonical_target_cleanup PROPERTIES
+        LABELS "integration;network"
+        RUN_SERIAL TRUE
+        RESOURCE_LOCK nginx-differential
+        TIMEOUT 60
+        SKIP_RETURN_CODE 77
+    )
     add_test(
         NAME test_nginx_downstream_gate_spike
         COMMAND test_nginx_differential --nginx-gate-spike
@@ -482,15 +1048,16 @@ if(RUT_ENABLE_JIT)
         SKIP_RETURN_CODE 77
     )
     add_test(
-        NAME test_nginx_issue358_ipv4_listener_fixture_spike
-        COMMAND test_nginx_differential --ipv4-listener-fixture-spike
+        NAME test_nginx_downstream_gate_preload_loader_preflight
+        COMMAND test_nginx_differential --nginx-preload-loader-preflight
+                $<TARGET_FILE:test_nginx_downstream_gate_preload>
     )
-    set_tests_properties(test_nginx_issue358_ipv4_listener_fixture_spike PROPERTIES
-        LABELS "integration;docker;network"
+    set_tests_properties(test_nginx_downstream_gate_preload_loader_preflight PROPERTIES
+        LABELS "integration;nginx;docker;negative"
         RUN_SERIAL TRUE
         RESOURCE_LOCK nginx-differential
-        TIMEOUT 120
-        SKIP_RETURN_CODE 77
+        TIMEOUT 60
+        ENVIRONMENT "RUT_NGINX_DIFFERENTIAL_REQUIRED=1"
     )
     add_test(
         NAME test_nginx_coalesced_ingress_gate
@@ -656,7 +1223,6 @@ if(RUT_ENABLE_JIT)
         RUN_SERIAL TRUE
         RESOURCE_LOCK nginx-differential
         TIMEOUT 120
-        SKIP_RETURN_CODE 77
         ENVIRONMENT "RUT_NGINX_DIFFERENTIAL_REQUIRED=1"
     )
     add_test(
@@ -684,6 +1250,177 @@ if(RUT_ENABLE_JIT)
         ENVIRONMENT "RUT_NGINX_DIFFERENTIAL_REQUIRED=1"
     )
     add_test(
+        NAME test_nginx_issue600_proxy_hide_header_name_oracle
+        COMMAND test_nginx_differential --pinned-nginx-proxy-hide-header-name-oracle
+    )
+    set_tests_properties(test_nginx_issue600_proxy_hide_header_name_oracle PROPERTIES
+        LABELS "integration;nginx;docker"
+        RUN_SERIAL TRUE
+        RESOURCE_LOCK nginx-differential
+        TIMEOUT 120
+        ENVIRONMENT "RUT_NGINX_DIFFERENTIAL_REQUIRED=1"
+    )
+    add_test(
+        NAME test_nginx_issue270_custom_hide_timeout_expiry_oracle
+        COMMAND test_nginx_differential --pinned-nginx-custom-hide-timeout-probe
+    )
+    set_tests_properties(test_nginx_issue270_custom_hide_timeout_expiry_oracle PROPERTIES
+        LABELS "integration;nginx;docker"
+        RUN_SERIAL TRUE
+        RESOURCE_LOCK nginx-differential
+        TIMEOUT 120
+        ENVIRONMENT "RUT_NGINX_DIFFERENTIAL_REQUIRED=1"
+    )
+    add_test(
+        NAME test_nginx_issue270_custom_hide_timeout_completion_oracle
+        COMMAND test_nginx_differential --pinned-nginx-custom-hide-timeout-completion
+    )
+    set_tests_properties(test_nginx_issue270_custom_hide_timeout_completion_oracle PROPERTIES
+        LABELS "integration;nginx;docker"
+        RUN_SERIAL TRUE
+        RESOURCE_LOCK nginx-differential
+        TIMEOUT 120
+        ENVIRONMENT "RUT_NGINX_DIFFERENTIAL_REQUIRED=1"
+    )
+    add_test(
+        NAME test_nginx_issue621_custom_hide_timeout_explicit_buffering_oracle
+        COMMAND test_nginx_differential --pinned-nginx-custom-hide-timeout-explicit-buffering-oracle
+    )
+    set_tests_properties(test_nginx_issue621_custom_hide_timeout_explicit_buffering_oracle PROPERTIES
+        LABELS "integration;nginx;docker"
+        RUN_SERIAL TRUE
+        RESOURCE_LOCK nginx-differential
+        TIMEOUT 300
+        ENVIRONMENT "RUT_NGINX_DIFFERENTIAL_REQUIRED=1"
+    )
+    add_test(
+        NAME test_nginx_issue627_custom_hide_timeout_2s_oracle
+        COMMAND test_nginx_differential --pinned-nginx-custom-hide-timeout-2s-oracle
+    )
+    set_tests_properties(test_nginx_issue627_custom_hide_timeout_2s_oracle PROPERTIES
+        LABELS "integration;nginx;docker"
+        RUN_SERIAL TRUE
+        RESOURCE_LOCK nginx-differential
+        TIMEOUT 360
+        ENVIRONMENT "RUT_NGINX_DIFFERENTIAL_REQUIRED=1"
+    )
+    add_test(
+        NAME test_nginx_issue630_bodyless_head_delayed_completion_oracle
+        COMMAND test_nginx_differential --pinned-nginx-bodyless-head-delayed-completion-oracle
+    )
+    set_tests_properties(test_nginx_issue630_bodyless_head_delayed_completion_oracle PROPERTIES
+        LABELS "integration;nginx;docker"
+        RUN_SERIAL TRUE
+        RESOURCE_LOCK nginx-differential
+        TIMEOUT 180
+        SKIP_RETURN_CODE 77
+        ENVIRONMENT "RUT_NGINX_DIFFERENTIAL_REQUIRED=1"
+    )
+    add_test(
+        NAME test_nginx_issue630_head_same_file_pair
+        COMMAND test_nginx_differential --converter-issue630-head-same-file-pair
+                $<TARGET_FILE:rut> $<TARGET_FILE:rut-nginx-convert>
+    )
+    set_tests_properties(test_nginx_issue630_head_same_file_pair PROPERTIES
+        LABELS "integration;nginx;docker"
+        RUN_SERIAL TRUE
+        RESOURCE_LOCK nginx-differential
+        TIMEOUT 360
+        ENVIRONMENT "RUT_NGINX_DIFFERENTIAL_REQUIRED=1"
+    )
+    add_test(
+        NAME test_nginx_issue270_custom_hide_timeout_cli_differential
+        COMMAND test_nginx_differential --converter-custom-hide-timeout-cli-differential
+                $<TARGET_FILE:rut> $<TARGET_FILE:rut-nginx-convert>
+    )
+    set_tests_properties(test_nginx_issue270_custom_hide_timeout_cli_differential PROPERTIES
+        LABELS "integration;nginx;docker"
+        RUN_SERIAL TRUE
+        RESOURCE_LOCK nginx-differential
+        TIMEOUT 300
+        ENVIRONMENT "RUT_NGINX_DIFFERENTIAL_REQUIRED=1"
+    )
+    add_test(
+        NAME test_nginx_issue621_custom_hide_timeout_explicit_buffering_cli_differential
+        COMMAND test_nginx_differential
+                --converter-custom-hide-timeout-explicit-buffering-cli-differential
+                $<TARGET_FILE:rut> $<TARGET_FILE:rut-nginx-convert>
+    )
+    set_tests_properties(test_nginx_issue621_custom_hide_timeout_explicit_buffering_cli_differential
+        PROPERTIES
+        LABELS "integration;nginx;docker"
+        RUN_SERIAL TRUE
+        RESOURCE_LOCK nginx-differential
+        TIMEOUT 300
+        ENVIRONMENT "RUT_NGINX_DIFFERENTIAL_REQUIRED=1"
+    )
+    add_test(
+        NAME test_nginx_issue627_custom_hide_timeout_2s_cli_differential
+        COMMAND test_nginx_differential
+                --converter-custom-hide-timeout-2s-cli-differential
+                $<TARGET_FILE:rut> $<TARGET_FILE:rut-nginx-convert>
+    )
+    set_tests_properties(test_nginx_issue627_custom_hide_timeout_2s_cli_differential
+        PROPERTIES
+        LABELS "integration;nginx;docker"
+        RUN_SERIAL TRUE
+        RESOURCE_LOCK nginx-differential
+        TIMEOUT 420
+        ENVIRONMENT "RUT_NGINX_DIFFERENTIAL_REQUIRED=1"
+    )
+    add_test(
+        NAME test_nginx_issue617_custom_hide_timeout_boundary_cli_differential
+        COMMAND test_nginx_differential --converter-custom-hide-timeout-boundary-cli-differential
+                $<TARGET_FILE:rut> $<TARGET_FILE:rut-nginx-convert>
+    )
+    set_tests_properties(test_nginx_issue617_custom_hide_timeout_boundary_cli_differential PROPERTIES
+        LABELS "integration;nginx;docker"
+        RUN_SERIAL TRUE
+        RESOURCE_LOCK nginx-differential
+        TIMEOUT 420
+        ENVIRONMENT "RUT_NGINX_DIFFERENTIAL_REQUIRED=1"
+    )
+    add_test(
+        NAME test_nginx_issue439_pinned_lifecycle_self_check
+        COMMAND test_nginx_differential --pinned-nginx-lifecycle-self-check
+    )
+    set_tests_properties(test_nginx_issue439_pinned_lifecycle_self_check PROPERTIES
+        LABELS "nginx"
+        RUN_SERIAL TRUE
+        RESOURCE_LOCK nginx-differential
+        TIMEOUT 30
+    )
+    add_test(
+        NAME test_nginx_zero_response_stall_self_check
+        COMMAND test_nginx_differential --zero-response-stall-self-check
+    )
+    set_tests_properties(test_nginx_zero_response_stall_self_check PROPERTIES
+        LABELS "network"
+        RUN_SERIAL TRUE
+        RESOURCE_LOCK nginx-differential
+        TIMEOUT 30
+    )
+    add_test(
+        NAME test_nginx_issue253_gated_fragment_peer_probe_self_check
+        COMMAND test_nginx_differential --gated-fragment-peer-probe-self-check
+    )
+    set_tests_properties(test_nginx_issue253_gated_fragment_peer_probe_self_check PROPERTIES
+        LABELS "network"
+        RUN_SERIAL TRUE
+        RESOURCE_LOCK nginx-differential
+        TIMEOUT 30
+    )
+    add_test(
+        NAME test_nginx_issue618_live_access_ledger_observer_self_check
+        COMMAND test_nginx_differential --live-access-ledger-observer-self-check
+    )
+    set_tests_properties(test_nginx_issue618_live_access_ledger_observer_self_check PROPERTIES
+        LABELS "nginx"
+        RUN_SERIAL TRUE
+        RESOURCE_LOCK nginx-differential
+        TIMEOUT 30
+    )
+    add_test(
         NAME test_nginx_issue373_converter_proxy_hide_header_source_self_check
         COMMAND test_nginx_differential --converter-proxy-hide-header-source-self-check
     )
@@ -692,6 +1429,103 @@ if(RUT_ENABLE_JIT)
         RUN_SERIAL TRUE
         RESOURCE_LOCK nginx-differential
         TIMEOUT 30
+    )
+    add_test(
+        NAME test_nginx_issue270_converter_explicit_timeout_head_source_self_check
+        COMMAND test_nginx_differential --converter-explicit-timeout-head-source-self-check
+    )
+    set_tests_properties(test_nginx_issue270_converter_explicit_timeout_head_source_self_check PROPERTIES
+        LABELS "nginx"
+        RUN_SERIAL TRUE
+        RESOURCE_LOCK nginx-differential
+        TIMEOUT 30
+    )
+    add_test(
+        NAME test_nginx_issue270_converter_explicit_timeout_head_generated_episode
+        COMMAND test_nginx_differential --converter-explicit-timeout-head-generated-episode $<TARGET_FILE:rut>
+    )
+    set_tests_properties(test_nginx_issue270_converter_explicit_timeout_head_generated_episode PROPERTIES
+        LABELS "integration;io_uring;network"
+        RUN_SERIAL TRUE
+        RESOURCE_LOCK nginx-differential
+        TIMEOUT 30
+    )
+    add_test(
+        NAME test_nginx_issue268_explicit_timeout_head_phase_differential
+        COMMAND test_nginx_differential --explicit-timeout-head-phase-differential $<TARGET_FILE:rut>
+    )
+    set_tests_properties(test_nginx_issue268_explicit_timeout_head_phase_differential PROPERTIES
+        LABELS "integration;io_uring;network;nginx;docker"
+        RUN_SERIAL TRUE
+        RESOURCE_LOCK nginx-differential
+        TIMEOUT 180
+        ENVIRONMENT "RUT_NGINX_DIFFERENTIAL_REQUIRED=1"
+    )
+    add_test(
+        NAME test_nginx_issue270_keepalive_timeout_head_differential
+        COMMAND test_nginx_differential --keepalive-timeout-head-differential $<TARGET_FILE:rut>
+    )
+    set_tests_properties(test_nginx_issue270_keepalive_timeout_head_differential PROPERTIES
+        LABELS "integration;io_uring;network;nginx;docker;differential"
+        RUN_SERIAL TRUE
+        RESOURCE_LOCK nginx-differential
+        TIMEOUT 180
+        ENVIRONMENT "RUT_NGINX_DIFFERENTIAL_REQUIRED=1"
+    )
+    add_test(
+        NAME test_nginx_issue270_keepalive_timeout_get_initial_deadline_differential
+        COMMAND test_nginx_differential --keepalive-timeout-get-initial-deadline-differential $<TARGET_FILE:rut>
+    )
+    set_tests_properties(test_nginx_issue270_keepalive_timeout_get_initial_deadline_differential PROPERTIES
+        LABELS "integration;io_uring;network;nginx;docker;differential"
+        RUN_SERIAL TRUE
+        RESOURCE_LOCK nginx-differential
+        TIMEOUT 180
+        ENVIRONMENT "RUT_NGINX_DIFFERENTIAL_REQUIRED=1"
+    )
+    add_test(
+        NAME test_nginx_issue270_fixed_upload_head_success_differential
+        COMMAND test_nginx_differential --fixed-upload-head-success-differential $<TARGET_FILE:rut>
+    )
+    set_tests_properties(test_nginx_issue270_fixed_upload_head_success_differential PROPERTIES
+        LABELS "integration;io_uring;network;nginx;docker;differential"
+        RUN_SERIAL TRUE
+        RESOURCE_LOCK nginx-differential
+        TIMEOUT 180
+        ENVIRONMENT "RUT_NGINX_DIFFERENTIAL_REQUIRED=1"
+    )
+    add_test(
+        NAME test_nginx_issue270_fixed_upload_head_zero_response_timeout_differential
+        COMMAND test_nginx_differential --fixed-upload-head-zero-response-timeout-differential $<TARGET_FILE:rut>
+    )
+    set_tests_properties(test_nginx_issue270_fixed_upload_head_zero_response_timeout_differential PROPERTIES
+        LABELS "integration;io_uring;network;nginx;docker;differential"
+        RUN_SERIAL TRUE
+        RESOURCE_LOCK nginx-differential
+        TIMEOUT 180
+        ENVIRONMENT "RUT_NGINX_DIFFERENTIAL_REQUIRED=1"
+    )
+    add_test(
+        NAME test_nginx_issue270_fixed_upload_head_incomplete_progress_timeout_differential
+        COMMAND test_nginx_differential --fixed-upload-head-incomplete-progress-timeout-differential $<TARGET_FILE:rut>
+    )
+    set_tests_properties(test_nginx_issue270_fixed_upload_head_incomplete_progress_timeout_differential PROPERTIES
+        LABELS "integration;io_uring;network;nginx;docker;differential"
+        RUN_SERIAL TRUE
+        RESOURCE_LOCK nginx-differential
+        TIMEOUT 180
+        ENVIRONMENT "RUT_NGINX_DIFFERENTIAL_REQUIRED=1"
+    )
+    add_test(
+        NAME test_nginx_issue270_fixed_upload_head_two_incomplete_header_fragments_timeout_differential
+        COMMAND test_nginx_differential --fixed-upload-head-two-incomplete-header-fragments-timeout-differential $<TARGET_FILE:rut>
+    )
+    set_tests_properties(test_nginx_issue270_fixed_upload_head_two_incomplete_header_fragments_timeout_differential PROPERTIES
+        LABELS "integration;io_uring;network;nginx;docker;differential"
+        RUN_SERIAL TRUE
+        RESOURCE_LOCK nginx-differential
+        TIMEOUT 180
+        ENVIRONMENT "RUT_NGINX_DIFFERENTIAL_REQUIRED=1"
     )
     add_test(
         NAME test_nginx_issue373_converter_proxy_hide_header_generated_side_self_check
@@ -728,6 +1562,456 @@ if(RUT_ENABLE_JIT)
         ENVIRONMENT "RUT_NGINX_DIFFERENTIAL_REQUIRED=1"
     )
     add_test(
+        NAME test_nginx_issue271_converter_default_buffering_positive_get_differential
+        COMMAND test_nginx_differential
+                --converter-default-buffering-positive-get-differential $<TARGET_FILE:rut>
+    )
+    set_tests_properties(
+        test_nginx_issue271_converter_default_buffering_positive_get_differential PROPERTIES
+        LABELS "integration;nginx;docker;io_uring;network"
+        RUN_SERIAL TRUE
+        RESOURCE_LOCK nginx-differential
+        TIMEOUT 120
+        SKIP_RETURN_CODE 77
+        ENVIRONMENT "RUT_NGINX_DIFFERENTIAL_REQUIRED=1"
+    )
+    add_test(
+        NAME test_nginx_issue271_converter_default_buffering_incomplete_clean_eof_differential
+        COMMAND test_nginx_differential
+                --converter-default-buffering-incomplete-clean-eof-differential $<TARGET_FILE:rut>
+    )
+    set_tests_properties(
+        test_nginx_issue271_converter_default_buffering_incomplete_clean_eof_differential PROPERTIES
+        LABELS "integration;nginx;docker;io_uring;network;differential"
+        RUN_SERIAL TRUE
+        RESOURCE_LOCK nginx-differential
+        TIMEOUT 180
+        SKIP_RETURN_CODE 77
+        ENVIRONMENT "RUT_NGINX_DIFFERENTIAL_REQUIRED=1"
+    )
+    add_test(
+        NAME test_nginx_issue271_converter_default_buffering_incomplete_body_inactivity_expiry_differential
+        COMMAND test_nginx_differential
+                --converter-default-buffering-incomplete-body-inactivity-expiry-differential
+                $<TARGET_FILE:rut>
+    )
+    set_tests_properties(
+        test_nginx_issue271_converter_default_buffering_incomplete_body_inactivity_expiry_differential
+        PROPERTIES
+        LABELS "integration;nginx;docker;io_uring;network;differential"
+        RUN_SERIAL TRUE
+        RESOURCE_LOCK nginx-differential
+        TIMEOUT 180
+        SKIP_RETURN_CODE 77
+        ENVIRONMENT "RUT_NGINX_DIFFERENTIAL_REQUIRED=1"
+    )
+    add_test(
+        NAME test_nginx_issue572_converter_explicit_buffering_on_incomplete_body_inactivity_expiry_differential
+        COMMAND test_nginx_differential
+                --converter-explicit-buffering-on-incomplete-body-inactivity-expiry-differential
+                $<TARGET_FILE:rut>
+    )
+    set_tests_properties(
+        test_nginx_issue572_converter_explicit_buffering_on_incomplete_body_inactivity_expiry_differential
+        PROPERTIES
+        LABELS "integration;nginx;docker;io_uring;network;differential"
+        RUN_SERIAL TRUE
+        RESOURCE_LOCK nginx-differential
+        TIMEOUT 180
+        SKIP_RETURN_CODE 77
+        ENVIRONMENT "RUT_NGINX_DIFFERENTIAL_REQUIRED=1"
+    )
+    add_test(
+        NAME test_nginx_issue271_converter_default_buffering_second_body_progress_refresh_differential
+        COMMAND test_nginx_differential
+                --converter-default-buffering-second-body-progress-refresh-differential
+                $<TARGET_FILE:rut>
+    )
+    set_tests_properties(
+        test_nginx_issue271_converter_default_buffering_second_body_progress_refresh_differential
+        PROPERTIES
+        LABELS "integration;nginx;docker;io_uring;network;differential"
+        RUN_SERIAL TRUE
+        RESOURCE_LOCK nginx-differential
+        TIMEOUT 180
+        SKIP_RETURN_CODE 77
+        ENVIRONMENT "RUT_NGINX_DIFFERENTIAL_REQUIRED=1"
+    )
+    add_test(
+        NAME test_nginx_issue271_pinned_default_buffering_201_incomplete_body_inactivity_expiry_oracle
+        COMMAND test_nginx_differential
+                --pinned-nginx-default-buffering-201-incomplete-body-inactivity-expiry-oracle
+    )
+    set_tests_properties(
+        test_nginx_issue271_pinned_default_buffering_201_incomplete_body_inactivity_expiry_oracle
+        PROPERTIES
+        LABELS "integration;nginx;docker;network;differential"
+        RUN_SERIAL TRUE
+        RESOURCE_LOCK nginx-differential
+        TIMEOUT 120
+        SKIP_RETURN_CODE 77
+        ENVIRONMENT "RUT_NGINX_DIFFERENTIAL_REQUIRED=1"
+    )
+    add_test(
+        NAME test_nginx_issue271_pinned_default_buffering_202_incomplete_body_inactivity_expiry_oracle
+        COMMAND test_nginx_differential
+                --pinned-nginx-default-buffering-202-incomplete-body-inactivity-expiry-oracle
+    )
+    set_tests_properties(
+        test_nginx_issue271_pinned_default_buffering_202_incomplete_body_inactivity_expiry_oracle
+        PROPERTIES
+        LABELS "integration;nginx;docker;network;differential"
+        RUN_SERIAL TRUE
+        RESOURCE_LOCK nginx-differential
+        TIMEOUT 120
+        SKIP_RETURN_CODE 77
+        ENVIRONMENT "RUT_NGINX_DIFFERENTIAL_REQUIRED=1"
+    )
+    add_test(
+        NAME test_nginx_issue253_pinned_default_buffering_304_content_length_metadata_oracle
+        COMMAND test_nginx_differential
+                --pinned-nginx-default-buffering-304-content-length-metadata-oracle
+    )
+    set_tests_properties(
+        test_nginx_issue253_pinned_default_buffering_304_content_length_metadata_oracle
+        PROPERTIES
+        LABELS "integration;nginx;docker;network;differential"
+        RUN_SERIAL TRUE
+        RESOURCE_LOCK nginx-differential
+        TIMEOUT 120
+        SKIP_RETURN_CODE 77
+        ENVIRONMENT "RUT_NGINX_DIFFERENTIAL_REQUIRED=1"
+    )
+    add_test(
+        NAME test_nginx_issue253_pinned_default_buffering_206_range_completion_oracle
+        COMMAND test_nginx_differential
+                --pinned-nginx-default-buffering-206-range-completion-oracle
+    )
+    set_tests_properties(
+        test_nginx_issue253_pinned_default_buffering_206_range_completion_oracle
+        PROPERTIES
+        LABELS "integration;nginx;docker;network;differential"
+        RUN_SERIAL TRUE
+        RESOURCE_LOCK nginx-differential
+        TIMEOUT 120
+        SKIP_RETURN_CODE 77
+        ENVIRONMENT "RUT_NGINX_DIFFERENTIAL_REQUIRED=1"
+    )
+    add_test(
+        NAME test_nginx_issue253_pinned_default_buffering_206_range_delayed_completion_oracle
+        COMMAND test_nginx_differential
+                --pinned-nginx-default-buffering-206-range-delayed-completion-oracle
+    )
+    set_tests_properties(
+        test_nginx_issue253_pinned_default_buffering_206_range_delayed_completion_oracle
+        PROPERTIES
+        LABELS "integration;nginx;docker;network;differential"
+        RUN_SERIAL TRUE
+        RESOURCE_LOCK nginx-differential
+        TIMEOUT 120
+        SKIP_RETURN_CODE 77
+        ENVIRONMENT "RUT_NGINX_DIFFERENTIAL_REQUIRED=1"
+    )
+    add_test(
+        NAME test_nginx_issue253_pinned_default_buffering_206_range_three_publication_completion_oracle
+        COMMAND test_nginx_differential
+                --pinned-nginx-default-buffering-206-range-three-publication-completion-oracle
+    )
+    set_tests_properties(
+        test_nginx_issue253_pinned_default_buffering_206_range_three_publication_completion_oracle
+        PROPERTIES
+        LABELS "integration;nginx;docker;network;differential"
+        RUN_SERIAL TRUE
+        RESOURCE_LOCK nginx-differential
+        TIMEOUT 120
+        SKIP_RETURN_CODE 77
+        ENVIRONMENT "RUT_NGINX_DIFFERENTIAL_REQUIRED=1"
+    )
+    add_test(
+        NAME test_nginx_issue253_pinned_default_buffering_206_range_incomplete_clean_eof_oracle
+        COMMAND test_nginx_differential
+                --pinned-nginx-default-buffering-206-range-incomplete-clean-eof-oracle
+    )
+    set_tests_properties(
+        test_nginx_issue253_pinned_default_buffering_206_range_incomplete_clean_eof_oracle
+        PROPERTIES
+        LABELS "integration;nginx;docker;network;differential"
+        RUN_SERIAL TRUE
+        RESOURCE_LOCK nginx-differential
+        TIMEOUT 120
+        SKIP_RETURN_CODE 77
+        ENVIRONMENT "RUT_NGINX_DIFFERENTIAL_REQUIRED=1"
+    )
+    add_test(
+        NAME test_nginx_issue253_pinned_default_buffering_206_range_incomplete_body_inactivity_expiry_oracle
+        COMMAND test_nginx_differential
+                --pinned-nginx-default-buffering-206-range-incomplete-body-inactivity-expiry-oracle
+    )
+    set_tests_properties(
+        test_nginx_issue253_pinned_default_buffering_206_range_incomplete_body_inactivity_expiry_oracle
+        PROPERTIES
+        LABELS "integration;nginx;docker;network;differential"
+        RUN_SERIAL TRUE
+        RESOURCE_LOCK nginx-differential
+        TIMEOUT 120
+        SKIP_RETURN_CODE 77
+        ENVIRONMENT "RUT_NGINX_DIFFERENTIAL_REQUIRED=1"
+    )
+    add_test(
+        NAME test_nginx_issue546_converter_default_buffering_206_range_incomplete_clean_eof_differential
+        COMMAND test_nginx_differential
+                --converter-default-buffering-206-range-incomplete-clean-eof-differential
+                $<TARGET_FILE:rut>
+    )
+    set_tests_properties(
+        test_nginx_issue546_converter_default_buffering_206_range_incomplete_clean_eof_differential
+        PROPERTIES
+        LABELS "integration;nginx;docker;io_uring;network;differential"
+        RUN_SERIAL TRUE
+        RESOURCE_LOCK nginx-differential
+        TIMEOUT 180
+        SKIP_RETURN_CODE 77
+        ENVIRONMENT "RUT_NGINX_DIFFERENTIAL_REQUIRED=1"
+    )
+    add_test(
+        NAME test_nginx_issue554_converter_default_buffering_206_range_incomplete_body_inactivity_expiry_differential
+        COMMAND test_nginx_differential
+                --converter-default-buffering-206-range-incomplete-body-inactivity-expiry-differential
+                $<TARGET_FILE:rut>
+    )
+    set_tests_properties(
+        test_nginx_issue554_converter_default_buffering_206_range_incomplete_body_inactivity_expiry_differential
+        PROPERTIES
+        LABELS "integration;nginx;docker;io_uring;network;differential"
+        RUN_SERIAL TRUE
+        RESOURCE_LOCK nginx-differential
+        TIMEOUT 180
+        SKIP_RETURN_CODE 77
+        ENVIRONMENT "RUT_NGINX_DIFFERENTIAL_REQUIRED=1"
+    )
+    add_test(
+        NAME test_nginx_issue529_converter_default_buffering_304_content_length_metadata_differential
+        COMMAND test_nginx_differential
+                --converter-default-buffering-304-content-length-metadata-differential
+                $<TARGET_FILE:rut>
+    )
+    set_tests_properties(
+        test_nginx_issue529_converter_default_buffering_304_content_length_metadata_differential
+        PROPERTIES
+        LABELS "integration;nginx;docker;io_uring;network;differential"
+        RUN_SERIAL TRUE
+        RESOURCE_LOCK nginx-differential
+        TIMEOUT 180
+        SKIP_RETURN_CODE 77
+        ENVIRONMENT "RUT_NGINX_DIFFERENTIAL_REQUIRED=1"
+    )
+    add_test(
+        NAME test_nginx_issue534_converter_default_buffering_206_range_completion_differential
+        COMMAND test_nginx_differential
+                --converter-default-buffering-206-range-completion-differential
+                $<TARGET_FILE:rut>
+    )
+    set_tests_properties(
+        test_nginx_issue534_converter_default_buffering_206_range_completion_differential
+        PROPERTIES
+        LABELS "integration;nginx;docker;io_uring;network;differential"
+        RUN_SERIAL TRUE
+        RESOURCE_LOCK nginx-differential
+        TIMEOUT 180
+        SKIP_RETURN_CODE 77
+        ENVIRONMENT "RUT_NGINX_DIFFERENTIAL_REQUIRED=1"
+    )
+    add_test(
+        NAME test_nginx_issue534_converter_default_buffering_206_range_delayed_completion_differential
+        COMMAND test_nginx_differential
+                --converter-default-buffering-206-range-delayed-completion-differential
+                $<TARGET_FILE:rut>
+    )
+    set_tests_properties(
+        test_nginx_issue534_converter_default_buffering_206_range_delayed_completion_differential
+        PROPERTIES
+        LABELS "integration;nginx;docker;io_uring;network;differential"
+        RUN_SERIAL TRUE
+        RESOURCE_LOCK nginx-differential
+        TIMEOUT 180
+        SKIP_RETURN_CODE 77
+        ENVIRONMENT "RUT_NGINX_DIFFERENTIAL_REQUIRED=1"
+    )
+    add_test(
+        NAME test_nginx_issue253_converter_default_buffering_206_range_three_publication_completion_differential
+        COMMAND test_nginx_differential
+                --converter-default-buffering-206-range-three-publication-completion-differential
+                $<TARGET_FILE:rut>
+    )
+    set_tests_properties(
+        test_nginx_issue253_converter_default_buffering_206_range_three_publication_completion_differential
+        PROPERTIES
+        LABELS "integration;nginx;docker;io_uring;network;differential"
+        RUN_SERIAL TRUE
+        RESOURCE_LOCK nginx-differential
+        TIMEOUT 180
+        SKIP_RETURN_CODE 77
+        ENVIRONMENT "RUT_NGINX_DIFFERENTIAL_REQUIRED=1"
+    )
+    add_test(
+        NAME test_nginx_issue271_converter_default_buffering_201_incomplete_body_inactivity_expiry_differential
+        COMMAND test_nginx_differential
+                --converter-default-buffering-201-incomplete-body-inactivity-expiry-differential
+                $<TARGET_FILE:rut>
+    )
+    set_tests_properties(
+        test_nginx_issue271_converter_default_buffering_201_incomplete_body_inactivity_expiry_differential
+        PROPERTIES
+        LABELS "integration;nginx;docker;io_uring;network;differential"
+        RUN_SERIAL TRUE
+        RESOURCE_LOCK nginx-differential
+        TIMEOUT 180
+        SKIP_RETURN_CODE 77
+        ENVIRONMENT "RUT_NGINX_DIFFERENTIAL_REQUIRED=1"
+    )
+    add_test(
+        NAME test_nginx_issue523_converter_default_buffering_202_incomplete_body_inactivity_expiry_differential
+        COMMAND test_nginx_differential
+                --converter-default-buffering-202-incomplete-body-inactivity-expiry-differential
+                $<TARGET_FILE:rut>
+    )
+    set_tests_properties(
+        test_nginx_issue523_converter_default_buffering_202_incomplete_body_inactivity_expiry_differential
+        PROPERTIES
+        LABELS "integration;nginx;docker;io_uring;network;differential"
+        RUN_SERIAL TRUE
+        RESOURCE_LOCK nginx-differential
+        TIMEOUT 180
+        SKIP_RETURN_CODE 77
+        ENVIRONMENT "RUT_NGINX_DIFFERENTIAL_REQUIRED=1"
+    )
+    add_test(
+        NAME test_nginx_issue271_pinned_default_buffering_third_body_progress_expiry_oracle
+        COMMAND test_nginx_differential
+                --pinned-nginx-default-buffering-third-body-progress-expiry-oracle
+    )
+    set_tests_properties(
+        test_nginx_issue271_pinned_default_buffering_third_body_progress_expiry_oracle PROPERTIES
+        LABELS "integration;nginx;docker;network;differential"
+        RUN_SERIAL TRUE
+        RESOURCE_LOCK nginx-differential
+        TIMEOUT 120
+        SKIP_RETURN_CODE 77
+        ENVIRONMENT "RUT_NGINX_DIFFERENTIAL_REQUIRED=1"
+    )
+    add_test(
+        NAME test_nginx_issue271_pinned_default_buffering_three_publication_completion_oracle
+        COMMAND test_nginx_differential
+                --pinned-nginx-default-buffering-three-publication-completion-oracle
+    )
+    set_tests_properties(
+        test_nginx_issue271_pinned_default_buffering_three_publication_completion_oracle PROPERTIES
+        LABELS "integration;nginx;docker;network;differential"
+        RUN_SERIAL TRUE
+        RESOURCE_LOCK nginx-differential
+        TIMEOUT 120
+        SKIP_RETURN_CODE 77
+        ENVIRONMENT "RUT_NGINX_DIFFERENTIAL_REQUIRED=1"
+    )
+    add_test(
+        NAME test_nginx_issue271_pinned_explicit_buffering_on_baseline_oracle
+        COMMAND test_nginx_differential
+                --pinned-nginx-explicit-buffering-on-baseline-oracle
+    )
+    set_tests_properties(
+        test_nginx_issue271_pinned_explicit_buffering_on_baseline_oracle PROPERTIES
+        LABELS "integration;nginx;docker;network;differential"
+        RUN_SERIAL TRUE
+        RESOURCE_LOCK nginx-differential
+        TIMEOUT 180
+        SKIP_RETURN_CODE 77
+        ENVIRONMENT "RUT_NGINX_DIFFERENTIAL_REQUIRED=1"
+    )
+    add_test(
+        NAME test_nginx_issue638_pinned_explicit_buffering_off_oracle
+        COMMAND test_nginx_differential --pinned-nginx-explicit-buffering-off-oracle
+    )
+    set_tests_properties(
+        test_nginx_issue638_pinned_explicit_buffering_off_oracle PROPERTIES
+        LABELS "integration;nginx;docker;network;differential"
+        RUN_SERIAL TRUE
+        RESOURCE_LOCK nginx-differential
+        TIMEOUT 120
+        SKIP_RETURN_CODE 77
+        ENVIRONMENT "RUT_NGINX_DIFFERENTIAL_REQUIRED=1"
+    )
+    add_test(
+        NAME test_nginx_issue638_explicit_off_observation_self_check
+        COMMAND test_nginx_differential --explicit-off-observation-self-check
+    )
+    set_tests_properties(
+        test_nginx_issue638_explicit_off_observation_self_check PROPERTIES
+        LABELS "unit;negative;nginx"
+        RUN_SERIAL TRUE
+        RESOURCE_LOCK nginx-differential
+        TIMEOUT 30
+    )
+    add_test(
+        NAME test_nginx_issue271_converter_default_buffering_third_body_progress_expiry_differential
+        COMMAND test_nginx_differential
+                --converter-default-buffering-third-body-progress-expiry-differential
+                $<TARGET_FILE:rut>
+    )
+    set_tests_properties(
+        test_nginx_issue271_converter_default_buffering_third_body_progress_expiry_differential
+        PROPERTIES
+        LABELS "integration;nginx;docker;io_uring;network;differential"
+        RUN_SERIAL TRUE
+        RESOURCE_LOCK nginx-differential
+        TIMEOUT 180
+        SKIP_RETURN_CODE 77
+        ENVIRONMENT "RUT_NGINX_DIFFERENTIAL_REQUIRED=1"
+    )
+    add_test(
+        NAME test_nginx_issue271_converter_default_buffering_three_publication_completion_differential
+        COMMAND test_nginx_differential
+                --converter-default-buffering-three-publication-completion-differential
+                $<TARGET_FILE:rut>
+    )
+    set_tests_properties(
+        test_nginx_issue271_converter_default_buffering_three_publication_completion_differential
+        PROPERTIES
+        LABELS "integration;nginx;docker;io_uring;network;differential"
+        RUN_SERIAL TRUE
+        RESOURCE_LOCK nginx-differential
+        TIMEOUT 180
+        SKIP_RETURN_CODE 77
+        ENVIRONMENT "RUT_NGINX_DIFFERENTIAL_REQUIRED=1"
+    )
+    add_test(
+        NAME test_nginx_issue268_pinned_positive_cl_options_default_buffering_oracle
+        COMMAND test_nginx_differential
+                --pinned-nginx-positive-cl-options-default-buffering-oracle
+    )
+    set_tests_properties(
+        test_nginx_issue268_pinned_positive_cl_options_default_buffering_oracle PROPERTIES
+        LABELS "integration;nginx;docker;network"
+        RUN_SERIAL TRUE
+        RESOURCE_LOCK nginx-differential
+        TIMEOUT 90
+        SKIP_RETURN_CODE 77
+        ENVIRONMENT "RUT_NGINX_DIFFERENTIAL_REQUIRED=1"
+    )
+    add_test(
+        NAME test_nginx_issue268_pinned_positive_cl_head_default_buffering_oracle
+        COMMAND test_nginx_differential
+                --pinned-nginx-positive-cl-head-default-buffering-oracle
+    )
+    set_tests_properties(
+        test_nginx_issue268_pinned_positive_cl_head_default_buffering_oracle PROPERTIES
+        LABELS "integration;nginx;docker;network"
+        RUN_SERIAL TRUE
+        RESOURCE_LOCK nginx-differential
+        TIMEOUT 90
+        SKIP_RETURN_CODE 77
+        ENVIRONMENT "RUT_NGINX_DIFFERENTIAL_REQUIRED=1"
+    )
+    add_test(
         NAME test_nginx_issue362_request_length_oracle
         COMMAND test_nginx_differential --pinned-nginx-request-length-oracle
     )
@@ -737,6 +2021,107 @@ if(RUT_ENABLE_JIT)
         RESOURCE_LOCK nginx-differential
         TIMEOUT 90
         SKIP_RETURN_CODE 77
+        ENVIRONMENT "RUT_NGINX_DIFFERENTIAL_REQUIRED=1"
+    )
+    add_test(
+        NAME test_nginx_issue252_retained_header_whitespace_oracle
+        COMMAND test_nginx_differential --pinned-nginx-retained-header-whitespace-oracle
+    )
+    set_tests_properties(test_nginx_issue252_retained_header_whitespace_oracle PROPERTIES
+        LABELS "integration;nginx;docker;network"
+        RUN_SERIAL TRUE
+        RESOURCE_LOCK nginx-differential
+        TIMEOUT 90
+        SKIP_RETURN_CODE 77
+        ENVIRONMENT "RUT_NGINX_DIFFERENTIAL_REQUIRED=1"
+    )
+    add_test(
+        NAME test_nginx_issue591_pinned_access_log_off_default_oracle
+        COMMAND test_nginx_differential --pinned-nginx-retained-header-whitespace-off-oracle
+    )
+    set_tests_properties(test_nginx_issue591_pinned_access_log_off_default_oracle PROPERTIES
+        LABELS "integration;nginx;docker;network"
+        RUN_SERIAL TRUE
+        RESOURCE_LOCK nginx-differential
+        TIMEOUT 180
+        ENVIRONMENT "RUT_NGINX_DIFFERENTIAL_REQUIRED=1"
+    )
+    add_test(
+        NAME test_nginx_issue252_converter_retained_header_whitespace_differential
+        COMMAND test_nginx_differential --converter-retained-header-whitespace-differential $<TARGET_FILE:rut>
+    )
+    set_tests_properties(test_nginx_issue252_converter_retained_header_whitespace_differential PROPERTIES
+        LABELS "integration;nginx;docker;io_uring;network"
+        RUN_SERIAL TRUE
+        RESOURCE_LOCK nginx-differential
+        TIMEOUT 120
+        SKIP_RETURN_CODE 77
+        ENVIRONMENT "RUT_NGINX_DIFFERENTIAL_REQUIRED=1"
+    )
+    add_test(
+        NAME test_nginx_issue577_converter_cli_retained_header_whitespace_differential
+        COMMAND test_nginx_differential --converter-retained-header-whitespace-differential
+                $<TARGET_FILE:rut> $<TARGET_FILE:rut-nginx-convert>
+    )
+    set_tests_properties(test_nginx_issue577_converter_cli_retained_header_whitespace_differential
+        PROPERTIES
+        LABELS "integration;nginx;docker;io_uring;network;converter"
+        RUN_SERIAL TRUE
+        RESOURCE_LOCK nginx-differential
+        TIMEOUT 120
+        SKIP_RETURN_CODE 77
+        ENVIRONMENT "RUT_NGINX_DIFFERENTIAL_REQUIRED=1"
+    )
+    add_test(
+        NAME test_nginx_issue583_converter_cli_complete_file_retained_differential
+        COMMAND test_nginx_differential --converter-complete-file-retained-differential
+                $<TARGET_FILE:rut> $<TARGET_FILE:rut-nginx-convert>
+    )
+    set_tests_properties(test_nginx_issue583_converter_cli_complete_file_retained_differential
+        PROPERTIES
+        LABELS "integration;nginx;docker;io_uring;network;converter"
+        RUN_SERIAL TRUE
+        RESOURCE_LOCK nginx-differential
+        TIMEOUT 120
+        ENVIRONMENT "RUT_NGINX_DIFFERENTIAL_REQUIRED=1"
+    )
+    add_test(
+        NAME test_nginx_issue591_converter_retained_access_log_off_four_phase
+        COMMAND test_nginx_differential --converter-retained-access-log-off-four-phase
+                $<TARGET_FILE:rut> $<TARGET_FILE:rut-nginx-convert>
+    )
+    set_tests_properties(test_nginx_issue591_converter_retained_access_log_off_four_phase
+        PROPERTIES
+        LABELS "integration;nginx;docker;io_uring;network;converter"
+        RUN_SERIAL TRUE
+        RESOURCE_LOCK nginx-differential
+        TIMEOUT 240
+        ENVIRONMENT "RUT_NGINX_DIFFERENTIAL_REQUIRED=1"
+    )
+    add_test(
+        NAME test_nginx_issue600_converter_proxy_hide_header_name_differential
+        COMMAND test_nginx_differential --converter-proxy-hide-header-name-differential
+                $<TARGET_FILE:rut> $<TARGET_FILE:rut-nginx-convert>
+    )
+    set_tests_properties(test_nginx_issue600_converter_proxy_hide_header_name_differential
+        PROPERTIES
+        LABELS "integration;nginx;docker;io_uring;network;converter"
+        RUN_SERIAL TRUE
+        RESOURCE_LOCK nginx-differential
+        TIMEOUT 240
+        ENVIRONMENT "RUT_NGINX_DIFFERENTIAL_REQUIRED=1"
+    )
+    add_test(
+        NAME test_nginx_issue600_converter_proxy_hide_header_boundaries
+        COMMAND test_nginx_differential --converter-proxy-hide-header-boundaries
+                $<TARGET_FILE:rut> $<TARGET_FILE:rut-nginx-convert>
+    )
+    set_tests_properties(test_nginx_issue600_converter_proxy_hide_header_boundaries
+        PROPERTIES
+        LABELS "integration;nginx;docker;io_uring;network;converter"
+        RUN_SERIAL TRUE
+        RESOURCE_LOCK nginx-differential
+        TIMEOUT 300
         ENVIRONMENT "RUT_NGINX_DIFFERENTIAL_REQUIRED=1"
     )
     add_test(
@@ -1654,6 +3039,31 @@ if(RUT_ENABLE_JIT)
         ENVIRONMENT "RUT_NGINX_DIFFERENTIAL_REQUIRED=1"
     )
     add_test(
+        NAME test_rut_issue554_default_buffering_206_range_incomplete_body_inactivity_expiry
+        COMMAND test_nginx_differential
+                --rut-default-buffering-206-range-incomplete-body-inactivity-expiry
+                $<TARGET_FILE:rut>
+    )
+    set_tests_properties(test_rut_issue554_default_buffering_206_range_incomplete_body_inactivity_expiry PROPERTIES
+        LABELS "integration;network;io_uring"
+        RUN_SERIAL TRUE
+        RESOURCE_LOCK nginx-differential
+        TIMEOUT 60
+        ENVIRONMENT "RUT_NGINX_DIFFERENTIAL_REQUIRED=1"
+    )
+    add_test(
+        NAME test_rut_issue558_retained_header_public_gate
+        COMMAND test_nginx_differential --rut-issue558-retained-header-public-gate
+                $<TARGET_FILE:rut>
+    )
+    set_tests_properties(test_rut_issue558_retained_header_public_gate PROPERTIES
+        LABELS "integration;network;io_uring"
+        RUN_SERIAL TRUE
+        RESOURCE_LOCK nginx-differential
+        TIMEOUT 90
+        ENVIRONMENT "RUT_NGINX_DIFFERENTIAL_REQUIRED=1"
+    )
+    add_test(
         NAME test_rut_exact_ipv4_listener_production
         COMMAND test_nginx_differential --rut-exact-ipv4-listener-production
                 $<TARGET_FILE:rut>
@@ -1665,6 +3075,30 @@ if(RUT_ENABLE_JIT)
         TIMEOUT 60
         ENVIRONMENT "RUT_NGINX_DIFFERENTIAL_REQUIRED=1"
     )
+    add_test(
+        NAME test_nginx_issue638_explicit_off_cli_differential
+        COMMAND test_nginx_differential --converter-explicit-off-cli-differential
+                $<TARGET_FILE:rut> $<TARGET_FILE:rut-nginx-convert>
+    )
+    set_tests_properties(test_nginx_issue638_explicit_off_cli_differential PROPERTIES
+        LABELS "integration;nginx;differential;docker;network;io_uring"
+        RUN_SERIAL TRUE
+        RESOURCE_LOCK nginx-differential
+        TIMEOUT 120
+        ENVIRONMENT "RUT_NGINX_DIFFERENTIAL_REQUIRED=1"
+    )
+    add_test(
+        NAME test_rut_explicit_buffering_off_capability
+        COMMAND test_nginx_differential --rut-explicit-buffering-off-capability
+                $<TARGET_FILE:rut>
+    )
+    set_tests_properties(test_rut_explicit_buffering_off_capability PROPERTIES
+        LABELS "integration;nginx;network;io_uring"
+        RUN_SERIAL TRUE
+        RESOURCE_LOCK nginx-differential
+        TIMEOUT 120
+        ENVIRONMENT "RUT_NGINX_DIFFERENTIAL_REQUIRED=1"
+    )
     if(TARGET test_rut_iouring_gate_preload)
         add_test(
             NAME test_rut_iouring_gate_spike
@@ -1672,6 +3106,28 @@ if(RUT_ENABLE_JIT)
                     $<TARGET_FILE:rut> $<TARGET_FILE:test_rut_iouring_gate_preload>
         )
         set_tests_properties(test_rut_iouring_gate_spike PROPERTIES
+            LABELS "integration;nginx"
+            RUN_SERIAL TRUE
+            RESOURCE_LOCK nginx-differential
+            TIMEOUT 30
+        )
+        add_test(
+            NAME test_rut_issue566_id3_successor_public_gate
+            COMMAND test_nginx_differential --rut-issue566-id3-successor-public-gate
+                    $<TARGET_FILE:rut> $<TARGET_FILE:test_rut_iouring_gate_preload>
+        )
+        add_test(
+            NAME test_rut_issue566_id3_successor_live200_public_gate
+            COMMAND test_nginx_differential --rut-issue566-id3-successor-live200-public-gate
+                    $<TARGET_FILE:rut> $<TARGET_FILE:test_rut_iouring_gate_preload>
+        )
+        set_tests_properties(test_rut_issue566_id3_successor_live200_public_gate PROPERTIES
+            LABELS "integration;nginx"
+            RUN_SERIAL TRUE
+            RESOURCE_LOCK nginx-differential
+            TIMEOUT 30
+        )
+        set_tests_properties(test_rut_issue566_id3_successor_public_gate PROPERTIES
             LABELS "integration;nginx"
             RUN_SERIAL TRUE
             RESOURCE_LOCK nginx-differential
@@ -1705,6 +3161,16 @@ if(RUT_ENABLE_JIT)
                     $<TARGET_FILE:rut> $<TARGET_FILE:test_rut_iouring_gate_preload>
         )
         set_tests_properties(test_rut_iouring_gate_owner_death_negative PROPERTIES
+            LABELS "integration;nginx;negative"
+            RUN_SERIAL TRUE
+            RESOURCE_LOCK nginx-differential
+            TIMEOUT 30
+        )
+        add_test(
+            NAME test_rut_iouring_gate_recv_owner_diagnostics_self_check
+            COMMAND test_nginx_differential --rut-iouring-gate-recv-owner-diagnostics-self-check
+        )
+        set_tests_properties(test_rut_iouring_gate_recv_owner_diagnostics_self_check PROPERTIES
             LABELS "integration;nginx;negative"
             RUN_SERIAL TRUE
             RESOURCE_LOCK nginx-differential
@@ -1782,6 +3248,16 @@ if(RUT_ENABLE_JIT)
         RESOURCE_LOCK nginx-differential
         TIMEOUT 120
         SKIP_RETURN_CODE 77
+    )
+
+    add_test(
+        NAME test_nginx_docker_info_preflight_self_check
+        COMMAND test_nginx_differential --docker-info-preflight-self-check
+    )
+    set_tests_properties(test_nginx_docker_info_preflight_self_check PROPERTIES
+        LABELS "unit"
+        RUN_SERIAL TRUE
+        TIMEOUT 30
     )
 
     add_executable(test_jit test_jit.cc ${PROJECT_SOURCE_DIR}/src/placement_new.cc)

@@ -9782,16 +9782,43 @@ static FrontendResult<HirTerminator> analyze_term(const AstStatement& stmt, cons
          !response_read_timeout_seconds_valid(stmt.forward_response_read_timeout_seconds)))
         return frontend_error(
             FrontendError::UnsupportedSyntax, stmt.span, lit_str("invalid response read timeout"));
+    const bool fixed_upload_head_timeout_candidate =
+        stmt.forward_response_buffering == ForwardResponseBufferingMode::None &&
+        fixed_upload_head_request_policy_is_admitted(stmt.forward_request_policy_id) &&
+        response_policy != nullptr && failure_policy != nullptr &&
+        timeout_failure_policy != nullptr &&
+        fixed_upload_head_timeout_policies_valid(
+            *response_policy, *failure_policy, *timeout_failure_policy);
+    const bool retained_bodyless_buffering_candidate =
+        stmt.forward_request_policy_id ==
+            static_cast<u16>(RequestPolicyId::Http11FixedTrimSpPreserveHtab) &&
+        stmt.forward_response_buffering == ForwardResponseBufferingMode::CompleteContentLength;
+    if (stmt.has_forward_response_read_timeout &&
+        !response_read_deadline_request_policy_is_admitted(stmt.forward_request_policy_id) &&
+        !fixed_upload_head_timeout_candidate && !retained_bodyless_buffering_candidate)
+        return frontend_error(FrontendError::UnsupportedSyntax,
+                              stmt.span,
+                              lit_str("request policy is not admitted to response read timeout"));
     const bool has_response_buffering =
         stmt.forward_response_buffering != ForwardResponseBufferingMode::None;
     if (stmt.has_forward_response_buffering != has_response_buffering ||
         !forward_response_buffering_mode_valid(stmt.forward_response_buffering))
         return frontend_error(
             FrontendError::UnsupportedSyntax, stmt.span, lit_str("invalid response buffering"));
+    if (stmt.forward_request_policy_id ==
+            static_cast<u16>(RequestPolicyId::Http11FixedTrimSpPreserveHtab) &&
+        (!stmt.has_forward_response_read_timeout ||
+         stmt.forward_response_buffering != ForwardResponseBufferingMode::CompleteContentLength))
+        return frontend_error(FrontendError::UnsupportedSyntax,
+                              stmt.span,
+                              lit_str("retained_header_value requires complete response buffering "
+                                      "and a response read timeout"));
     if (has_response_buffering &&
         (!stmt.has_forward_response_read_timeout || response_policy == nullptr ||
          failure_policy == nullptr || timeout_failure_policy == nullptr ||
-         !complete_content_length_request_policy_is_admitted(stmt.forward_request_policy_id) ||
+         (!complete_content_length_request_policy_is_admitted(stmt.forward_request_policy_id) &&
+          stmt.forward_request_policy_id !=
+              static_cast<u16>(RequestPolicyId::Http11FixedTrimSpPreserveHtab)) ||
          !complete_content_length_buffering_policies_valid(
              *response_policy, *failure_policy, *timeout_failure_policy)))
         return frontend_error(
@@ -19232,6 +19259,32 @@ static FrontendResult<HirModule*> analyze_file_internal(
             const HirTerminator& direct = route.control.direct_term;
             const bool complete_buffering = timeout_term->forward_response_buffering ==
                                             ForwardResponseBufferingMode::CompleteContentLength;
+            auto timeout_request_policy_is_admitted = [&](const HirTerminator& term) {
+                if (response_read_deadline_request_policy_is_admitted(
+                        term.forward_request_policy_id))
+                    return true;
+                if (route.method == kRouteMethodGet &&
+                    term.forward_request_policy_id ==
+                        static_cast<u16>(RequestPolicyId::Http11FixedTrimSpPreserveHtab) &&
+                    term.forward_response_buffering ==
+                        ForwardResponseBufferingMode::CompleteContentLength &&
+                    response_read_timeout_seconds_valid(term.forward_response_read_timeout_seconds))
+                    return true;
+                return term.forward_response_buffering == ForwardResponseBufferingMode::None &&
+                       fixed_upload_head_route_method_is_admitted(route.method) &&
+                       fixed_upload_head_request_policy_is_admitted(
+                           term.forward_request_policy_id) &&
+                       term.forward_response_policy_id != 0 &&
+                       term.forward_response_policy_id <= mod.response_policies.len &&
+                       term.forward_failure_policy_id != 0 &&
+                       term.forward_failure_policy_id <= mod.failure_policies.len &&
+                       term.forward_timeout_failure_policy_id != 0 &&
+                       term.forward_timeout_failure_policy_id <= mod.failure_policies.len &&
+                       fixed_upload_head_timeout_policies_valid(
+                           mod.response_policies[term.forward_response_policy_id - 1],
+                           mod.failure_policies[term.forward_failure_policy_id - 1],
+                           mod.failure_policies[term.forward_timeout_failure_policy_id - 1]);
+            };
             auto canonical_forward = [&](const HirTerminator& term) {
                 return term.kind == HirTerminatorKind::ForwardUpstream &&
                        term.source_kind == HirTerminatorSourceKind::Literal &&
@@ -19245,8 +19298,11 @@ static FrontendResult<HirModule*> analyze_file_internal(
                            term.forward_response_read_timeout_seconds) &&
                        term.forward_response_buffering ==
                            ForwardResponseBufferingMode::CompleteContentLength &&
-                       complete_content_length_request_policy_is_admitted(
-                           term.forward_request_policy_id);
+                       (complete_content_length_request_policy_is_admitted(
+                            term.forward_request_policy_id) ||
+                        (route.method == kRouteMethodGet &&
+                         term.forward_request_policy_id ==
+                             static_cast<u16>(RequestPolicyId::Http11FixedTrimSpPreserveHtab)));
             };
             auto canonical_redirect = [&](const HirTerminator& term) {
                 return term.kind == HirTerminatorKind::Redirect &&
@@ -19265,20 +19321,25 @@ static FrontendResult<HirModule*> analyze_file_internal(
                        redirect_policy_spec_valid(
                            mod.redirect_policies[term.redirect_policy_id - 1]);
             };
-            const bool common = timeout_term_count == 1 && route.locals.len == 0 &&
-                                route.guards.len == 0 && route.waits.len == 0 &&
-                                route.for_loops.len == 0 && route_decl.chains.len == 0 &&
-                                route_decl.decorators.len == 0 && route.rate_limit.count == 0 &&
-                                route.throttle_down_bps == 0 && !route.is_timer;
+            const bool structural_common =
+                route.locals.len == 0 && route.guards.len == 0 && route.waits.len == 0 &&
+                route.for_loops.len == 0 && route_decl.chains.len == 0 &&
+                route_decl.decorators.len == 0 && route.rate_limit.count == 0 &&
+                route.throttle_down_bps == 0 && !route.is_timer;
             const bool direct_canonical =
-                common && route.control.kind == HirControlKind::Direct && timeout_term == &direct &&
+                structural_common && timeout_term_count == 1 &&
+                route.control.kind == HirControlKind::Direct && timeout_term == &direct &&
                 route.exprs.len == 0 && direct.kind == HirTerminatorKind::ForwardUpstream &&
                 direct.forward_set_path.ptr == nullptr && direct.forward_set_headers.len == 0 &&
                 !direct.has_forward_target_transform && !direct.commit_response_mutations &&
+                timeout_request_policy_is_admitted(direct) &&
                 (!complete_buffering ||
                  (complete_content_length_route_method_is_admitted(route.method) &&
-                  complete_content_length_request_policy_is_admitted(
-                      direct.forward_request_policy_id)));
+                  (complete_content_length_request_policy_is_admitted(
+                       direct.forward_request_policy_id) ||
+                   (route.method == kRouteMethodGet &&
+                    direct.forward_request_policy_id ==
+                        static_cast<u16>(RequestPolicyId::Http11FixedTrimSpPreserveHtab)))));
             const HirExpr& cond = route.control.cond;
             auto expression_is_owned = [&](const HirExpr* expression) {
                 if (expression == nullptr) return false;
@@ -19290,7 +19351,8 @@ static FrontendResult<HirModule*> analyze_file_internal(
             const bool cond_ptrs_owned = route.exprs.len == 2 && expression_is_owned(cond.lhs) &&
                                          expression_is_owned(cond.rhs) && cond.lhs != cond.rhs;
             const bool deferred_canonical =
-                common && route.control.kind == HirControlKind::If &&
+                structural_common && timeout_term_count == 1 &&
+                route.control.kind == HirControlKind::If &&
                 timeout_term == &route.control.else_term && route.method != kRouteMethodAny &&
                 complete_content_length_route_method_is_admitted(route.method) && cond_ptrs_owned &&
                 cond.kind == HirExprKind::Eq && cond.type == HirTypeKind::Bool &&
@@ -19299,7 +19361,73 @@ static FrontendResult<HirModule*> analyze_file_internal(
                 (cond.rhs->str_value.len == 0 || cond.rhs->str_value.ptr != nullptr) &&
                 canonical_redirect(route.control.then_term) &&
                 canonical_forward(route.control.else_term);
-            if (!direct_canonical && !deferred_canonical)
+            auto framing_forward = [&](const HirTerminator& term,
+                                       RequestPolicyId policy,
+                                       ForwardResponseBufferingMode buffering) {
+                return term.kind == HirTerminatorKind::ForwardUpstream &&
+                       term.source_kind == HirTerminatorSourceKind::Literal &&
+                       term.local_ref_index == 0xffffffffu && term.status_code == 0 &&
+                       term.response_body.ptr == nullptr && term.response_headers.len == 0 &&
+                       term.redirect_policy_id == 0 && term.forward_set_path.ptr == nullptr &&
+                       term.forward_set_headers.len == 0 && !term.has_forward_target_transform &&
+                       !term.commit_response_mutations &&
+                       term.forward_request_policy_id == static_cast<u16>(policy) &&
+                       term.forward_response_read_timeout_seconds != 0 &&
+                       response_read_timeout_seconds_valid(
+                           term.forward_response_read_timeout_seconds) &&
+                       term.forward_response_buffering == buffering &&
+                       (buffering == ForwardResponseBufferingMode::None
+                            ? timeout_request_policy_is_admitted(term)
+                            : route.method == kRouteMethodGet &&
+                                  (complete_content_length_request_policy_is_admitted(
+                                       term.forward_request_policy_id) ||
+                                   term.forward_request_policy_id ==
+                                       static_cast<u16>(
+                                           RequestPolicyId::Http11FixedTrimSpPreserveHtab)) &&
+                                  term.forward_response_policy_id != 0 &&
+                                  term.forward_response_policy_id <= mod.response_policies.len &&
+                                  term.forward_failure_policy_id != 0 &&
+                                  term.forward_failure_policy_id <= mod.failure_policies.len &&
+                                  term.forward_timeout_failure_policy_id != 0 &&
+                                  term.forward_timeout_failure_policy_id <=
+                                      mod.failure_policies.len &&
+                                  complete_content_length_buffering_policies_valid(
+                                      mod.response_policies[term.forward_response_policy_id - 1],
+                                      mod.failure_policies[term.forward_failure_policy_id - 1],
+                                      mod.failure_policies[term.forward_timeout_failure_policy_id -
+                                                           1]));
+            };
+            auto same_framing_bundle = [](const HirTerminator& lhs, const HirTerminator& rhs) {
+                return lhs.upstream_index == rhs.upstream_index &&
+                       lhs.forward_response_policy_id == rhs.forward_response_policy_id &&
+                       lhs.forward_failure_policy_id == rhs.forward_failure_policy_id &&
+                       lhs.forward_timeout_failure_policy_id ==
+                           rhs.forward_timeout_failure_policy_id &&
+                       lhs.forward_response_read_timeout_seconds ==
+                           rhs.forward_response_read_timeout_seconds &&
+                       lhs.forward_response_buffering == rhs.forward_response_buffering;
+            };
+            const bool deferred_framing =
+                structural_common && timeout_term_count == 2 &&
+                route.control.kind == HirControlKind::If && route.exprs.len == 0 &&
+                cond.kind == HirExprKind::ReqHasContentLength && cond.type == HirTypeKind::Bool &&
+                cond.lhs == nullptr && cond.rhs == nullptr &&
+                ((route.method == kRouteMethodHead &&
+                  framing_forward(route.control.then_term,
+                                  RequestPolicyId::Http11FixedStripContentLengthAfterHost,
+                                  ForwardResponseBufferingMode::None) &&
+                  framing_forward(route.control.else_term,
+                                  RequestPolicyId::Http11FixedStrip,
+                                  ForwardResponseBufferingMode::None)) ||
+                 (route.method == kRouteMethodGet &&
+                  framing_forward(route.control.then_term,
+                                  RequestPolicyId::Http11FixedStrip,
+                                  ForwardResponseBufferingMode::CompleteContentLength) &&
+                  framing_forward(route.control.else_term,
+                                  RequestPolicyId::Http11FixedTrimSpPreserveHtab,
+                                  ForwardResponseBufferingMode::CompleteContentLength))) &&
+                same_framing_bundle(route.control.then_term, route.control.else_term);
+            if (!direct_canonical && !deferred_canonical && !deferred_framing)
                 return frontend_error(
                     FrontendError::UnsupportedSyntax,
                     timeout_term->span,
@@ -19308,9 +19436,10 @@ static FrontendResult<HirModule*> analyze_file_internal(
                                   "admitted bodyless non-HEAD Forward route")
                         : lit_str("response_read_timeout currently requires an effect-free direct "
                                   "Forward route"));
-            route.forward_preflight_mode = direct_canonical
-                                               ? ForwardPreflightMode::EagerDirect
-                                               : ForwardPreflightMode::AfterCanonicalSelection;
+            route.forward_preflight_mode = direct_canonical ? ForwardPreflightMode::EagerDirect
+                                           : deferred_canonical
+                                               ? ForwardPreflightMode::AfterCanonicalSelection
+                                               : ForwardPreflightMode::AfterRequestFramingSelection;
         }
 
         // Wait-route backstop: the creation-time gates (kTimeWaitDetail /

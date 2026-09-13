@@ -6,6 +6,30 @@
 
 namespace rut::nginx {
 
+// The shared bounded readable-view grammar for the one-name proxy_hide_header
+// slice. Callers must establish that the view is readable before invoking it.
+inline bool valid_proxy_hide_header_name(Str name) {
+    if (name.ptr == nullptr || name.len < 3u || name.len > 46u ||
+        (name.ptr[0] != 'X' && name.ptr[0] != 'x') || name.ptr[1] != '-')
+        return false;
+    const auto lower = [](char c) {
+        return c >= 'A' && c <= 'Z' ? static_cast<char>(c + ('a' - 'A')) : c;
+    };
+    if ((name.len == 5u && lower(name.ptr[2]) == 'p' && lower(name.ptr[3]) == 'a' &&
+         lower(name.ptr[4]) == 'd') ||
+        (name.len >= 8u && lower(name.ptr[2]) == 'a' && lower(name.ptr[3]) == 'c' &&
+         lower(name.ptr[4]) == 'c' && lower(name.ptr[5]) == 'e' && lower(name.ptr[6]) == 'l' &&
+         name.ptr[7] == '-'))
+        return false;
+    for (u32 i = 2u; i < name.len; i++) {
+        const char c = name.ptr[i];
+        const bool alpha = (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z');
+        const bool digit = c >= '0' && c <= '9';
+        if (!alpha && !digit && c != '_' && c != '-') return false;
+    }
+    return true;
+}
+
 struct Listen {
     u16 port = 0;
     Span span{};
@@ -50,6 +74,20 @@ struct ProxyReadTimeout {
     Span value_span{};
 };
 
+enum class ProxyBufferingValue : u8 {
+    On,
+    Off,
+};
+
+// Explicit proxy buffering retains provenance for the bounded verified lowering
+// profile; broader buffering modes and runtime semantics remain unsupported.
+struct ProxyBuffering {
+    bool present = false;
+    Span span{};
+    Span value_span{};
+    ProxyBufferingValue value = ProxyBufferingValue::On;
+};
+
 // One bounded response-header suppression directive. `name` borrows the exact
 // unquoted source token; spans retain the complete directive and name token.
 // Lowering support is intentionally separate from parser/model admission.
@@ -76,6 +114,7 @@ struct Location {
     Span span{};
     ProxyPass proxy_pass{};
     ProxyReadTimeout proxy_read_timeout{};
+    ProxyBuffering proxy_buffering{};
     ProxyHideHeader proxy_hide_header{};
 };
 
@@ -206,6 +245,8 @@ struct LogFormat {
 enum class AccessLogDestinationProfile : u8 {
     None,
     FilePath,
+    // The exact unquoted `off` token is borrowed through AccessLog::path.
+    Off,
 };
 
 struct AccessLog {
@@ -229,6 +270,18 @@ struct HttpProfile {
     Server server{};
 };
 
+// One complete-file envelope accepted by the staged nginx frontend. `source`
+// borrows the complete caller buffer; the outer spans use complete-file
+// coordinates, while `http` retains its existing suffix-local source/span
+// contract over the original source beginning at the `h` in `http`.
+struct NginxHttpConfig {
+    Str source{};
+    Span span{};
+    Span events_span{};
+    Span http_span{};
+    HttpProfile http{};
+};
+
 // Parse exactly one minimal nginx server fragment. The returned model borrows
 // strings from source; the caller owns the source storage for its lifetime.
 FrontendResult<Server> parse(Str source);
@@ -236,5 +289,9 @@ FrontendResult<Server> parse(Str source);
 // Parse only the explicitly bounded request-length http profile documented by
 // HttpProfile. This is not a general nginx.conf grammar.
 FrontendResult<HttpProfile> parse_http_profile(Str source);
+
+// Parse exactly one empty events block followed by one bounded logged HTTP
+// profile. This is not general nginx.conf support.
+FrontendResult<NginxHttpConfig> parse_nginx_http_config(Str source);
 
 }  // namespace rut::nginx
