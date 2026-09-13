@@ -82,6 +82,16 @@ making new status claims; these are recorded prior-run results, not reruns.
 
 ## CURRENT: actual converter-stdout explicit-Off differential
 
+The nginx-side pair context extraction `176a1e96` is independently APPROVED.
+Clang Release `-j1` build and three focused CTests pass 3/3, zero skips,
+3.09s (nginx off oracle 1.71s, shared self-check 0.01s, ordinary-RUT
+capability 1.37s). Logs: `/tmp/rut-638-off-context-build.log` and
+`/tmp/rut-638-off-context-tests.log`. Context success is published only after
+all original capture/config/cleanup/join checks pass; the existing oracle mode
+exercises this path. This extraction is not a converter pair. CURRENT remains
+its actual same-file CLI wrapper; selected loaded GET bundle and mutation
+controls follow before complete candidate acceptance.
+
 Model/provenance/lowering `a2358195` is independently APPROVED and locally
 validated: Clang Release `-j1` build, full parser 192 tests / 19991 checks
 (4.46s), converter CLI 0.05s, zero CTest skips. Logs:
