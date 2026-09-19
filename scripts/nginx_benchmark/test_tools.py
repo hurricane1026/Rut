@@ -15,6 +15,7 @@ from types import SimpleNamespace
 from unittest import mock
 
 import run
+import matrix
 
 from run import (
     Harness,
@@ -40,6 +41,64 @@ class FakeSocket:
 
 
 class ToolsTest(unittest.TestCase):
+    def test_matrix_keeps_valid_groups_only_after_completed_child(self):
+        cases = (
+            # One failed concurrency must not erase its valid siblings.
+            (1, True, True, [True, True, False], 2),
+            (0, True, False, [True, True, True], 0),
+            # Setup errors, signals and missing/incomplete completion evidence
+            # invalidate all groups even if results.json already has good rows.
+            (2, True, False, [False, False, False], 2),
+            (-signal.SIGTERM, True, False, [False, False, False], 2),
+            (1, False, False, [False, False, False], 2),
+            (1, None, False, [False, False, False], 2),
+            (0, False, False, [False, False, False], 2),
+        )
+        for returncode, complete, bad_sample, expected, expected_exit in cases:
+            with self.subTest(returncode=returncode, complete=complete, bad_sample=bad_sample), \
+                    tempfile.TemporaryDirectory() as directory:
+                output = Path(directory) / "matrix"
+                argv = ["matrix.py", "--output", str(output),
+                        "--tls-cert", "unused.pem", "--tls-key", "unused.key",
+                        "--transports", "http", "--body-sizes", "16",
+                        "--scenarios", "static-close", "--concurrency", "1", "32", "128",
+                        "--duration", "5", "--repeats", "3"]
+
+                def child_run(command, _log):
+                    folder = Path(command[command.index("--output") + 1])
+                    folder.mkdir()
+                    rows = []
+                    for concurrency in (1, 32, 128):
+                        for engine, rps in (("nginx", 100), ("rut", 120)):
+                            for rep in (1, 2, 3):
+                                invalid = bad_sample and concurrency == 128 and engine == "rut" and rep == 1
+                                rows.append(dict(
+                                    workload="static", connection="close", transport="http",
+                                    body_size=16, concurrency=concurrency, engine=engine,
+                                    rep=rep, requests=500, rps=rps, valid=not invalid,
+                                    errors=dict(connect=0, read=int(invalid), write=0, status=0, timeout=0),
+                                    warmup_errors=dict(connect=0, read=0, write=0, status=0, timeout=0)))
+                    run.save_json(folder / "results.json", rows)
+                    if complete is not None:
+                        run.save_json(folder / "status.json",
+                                      {"complete": complete, "valid": not bad_sample})
+                    return returncode
+
+                previous_sigterm = signal.getsignal(signal.SIGTERM)
+                try:
+                    with mock.patch.object(sys, "argv", argv), \
+                            mock.patch.object(matrix, "run_cell", side_effect=child_run), \
+                            contextlib.redirect_stdout(io.StringIO()):
+                        self.assertEqual(matrix.main(), expected_exit)
+                finally:
+                    signal.signal(signal.SIGTERM, previous_sigterm)
+                report = json.loads((output / "matrix.json").read_text())
+                self.assertTrue(report["complete"])
+                self.assertEqual(report["target_met"], all(expected))
+                self.assertEqual([c["measurement_valid"] for c in report["cells"]], expected)
+                self.assertEqual([c["target_met"] for c in report["cells"]], expected)
+                self.assertTrue(all(c["exit_code"] == returncode for c in report["cells"]))
+
     def test_invalid_tls_certificate_retains_failed_status(self):
         with tempfile.TemporaryDirectory() as directory:
             out = Path(directory)

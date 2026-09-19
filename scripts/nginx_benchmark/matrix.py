@@ -106,10 +106,16 @@ def main():
                 returncode = run_cell(command, log)
             rows_path = folder / "results.json"
             rows = json.loads(rows_path.read_text()) if rows_path.exists() else []
+            status_path = folder / "status.json"
+            status = json.loads(status_path.read_text()) if status_path.exists() else {}
+            # Exit 1 means a completed run contains bad samples. Assess each
+            # concurrency independently; only incomplete/setup failures discard
+            # every group, including results written before cleanup failed.
+            completed = returncode in (0, 1) and status.get("complete") is True
             for concurrency in args.concurrency:
                 cell = assess(rows, scenario, transport, size, concurrency, args.repeats, args.duration)
                 cell.update(exit_code=returncode, evidence=str(folder), command=command)
-                if returncode != 0:
+                if not completed:
                     cell["measurement_valid"] = cell["target_met"] = False
                 report["cells"].append(cell)
             save_json(args.output / "matrix.json", report)

@@ -165,7 +165,10 @@ converter compatibility. Original HTTP output stays unmodified.
 `--tls-cert` / `--tls-key`. Defaults are all four scenarios, HTTP and HTTPS,
 16 B / 1 KiB / 64 KiB / 1 MiB, and concurrency 1 / 32 / 128: 96 cells. Each
 case has isolated retained evidence. Failed setup, unsupported capabilities,
-missing repetitions and response errors leave their cells unpassed. It keeps
+missing repetitions and response errors leave their cells unpassed. A completed
+child run with exit 1 preserves valid sibling-concurrency measurements while
+rejecting the groups with bad samples. Other nonzero exits or missing/incomplete
+`status.json` completion evidence invalidate every group from that child. It keeps
 running other cases to expose the complete gap. `matrix.json` records exact
 coordinates, commands, median ratios and validity. The overall target requires
 every cell to reach Rut/nginx >= 1.10; runs shorter than 5 seconds or fewer
