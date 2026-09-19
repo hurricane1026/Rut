@@ -554,7 +554,12 @@ inline bool ordinary_local_response_may_persist(Loop* loop,
 }
 
 inline bool exact_strict_local_response_base_request_shape_is_admitted(const Connection& conn) {
-    return conn.protocol == ConnProtocol::Http11 && !conn.tls_active && conn.h2 == nullptr &&
+    // io_uring TLS parses decrypted application bytes into the same receive
+    // buffer. Admit only an established engine; a forged tls_active flag or
+    // an unfinished handshake must not broaden the strict request domain.
+    const bool transport_ready =
+        !conn.tls_active || (conn.uses_iouring_tls() && conn.tls_handshake_complete);
+    return conn.protocol == ConnProtocol::Http11 && transport_ready && conn.h2 == nullptr &&
            conn.req_strict_h1_complete &&
            conn.req_http_version == static_cast<u8>(HttpVersion::Http11) &&
            conn.req_path_canon.ptr != nullptr && !conn.req_target_has_fragment &&
