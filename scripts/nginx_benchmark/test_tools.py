@@ -75,7 +75,7 @@ class ToolsTest(unittest.TestCase):
                                 rows.append(dict(
                                     workload="static", connection="close", transport="http",
                                     body_size=16, concurrency=concurrency, engine=engine,
-                                    rep=rep, requests=500, rps=rps, valid=not invalid,
+                                    rep=rep, requests=500, rps=rps, seconds=5, valid=not invalid,
                                     errors=dict(connect=0, read=int(invalid), write=0, status=0, timeout=0),
                                     warmup_errors=dict(connect=0, read=0, write=0, status=0, timeout=0)))
                     run.save_json(folder / "results.json", rows)
@@ -226,7 +226,7 @@ class ToolsTest(unittest.TestCase):
             for rep in (1, 2, 3):
                 rows.append(dict(workload="proxy", connection="close", transport="https",
                                  body_size=65536, concurrency=32, engine=engine, rep=rep,
-                                 requests=500, rps=rps, valid=True,
+                                 requests=500, rps=rps, seconds=5, valid=True,
                                  errors=dict(connect=0, read=0, write=0, status=0, timeout=0),
                                  warmup_errors=dict(connect=0, read=0, write=0, status=0, timeout=0)))
         def evaluate(data, duration=5):
@@ -241,6 +241,95 @@ class ToolsTest(unittest.TestCase):
                 if row["engine"] == "rut":
                     row[key] = value
             self.assertFalse(evaluate(bad)["target_met"], key)
+
+    def test_matrix_requires_actual_measurement_duration(self):
+        import copy
+        rows = [dict(workload="static", connection="close", transport="http",
+                     body_size=16, concurrency=1, engine=engine, rep=rep,
+                     requests=500, rps=rps, seconds=5, valid=True,
+                     errors=dict.fromkeys(run.ERROR_NAMES, 0),
+                     warmup_errors=dict.fromkeys(run.ERROR_NAMES, 0))
+                for engine, rps in (("nginx", 100), ("rut", 120)) for rep in (1, 2, 3)]
+        self.assertTrue(assess(rows, "static-close", "http", 16, 1, 3, 5)["target_met"])
+        for engine in ("nginx", "rut"):
+            for seconds in (4.999, 0, -1, None, "5", True, float("nan"), float("inf")):
+                with self.subTest(engine=engine, seconds=seconds):
+                    bad = copy.deepcopy(rows)
+                    next(r for r in bad if r["engine"] == engine)["seconds"] = seconds
+                    result = assess(bad, "static-close", "http", 16, 1, 3, 10)
+                    self.assertFalse(result["performance_eligible"])
+                    self.assertFalse(result["target_met"])
+                    if seconds == 4.999:
+                        self.assertTrue(result["measurement_valid"])
+        missing = copy.deepcopy(rows)
+        del missing[0]["seconds"]
+        self.assertFalse(assess(missing, "static-close", "http", 16, 1, 3, 10)["target_met"])
+
+    def test_matrix_continues_after_bad_evidence(self):
+        cases = (
+            ("results.json", b"[", "truncated rows"),
+            ("status.json", b"{", "truncated status"),
+            ("results.json", b"\xff", "invalid UTF-8"),
+            ("results.json", b"[" * 2000 + b"]" * 2000, "excessive JSON nesting"),
+            ("results.json", b"{}", "rows object"),
+            ("results.json", b"[null]", "non-object row"),
+            ("results.json", b"[{}]", "missing fields"),
+            ("status.json", b"[]", "status array"),
+            ("status.json", b'{"complete": "true", "valid": true}', "non-boolean completion"),
+            ("status.json", None, "missing status"),
+            ("results.json", None, "missing rows"),
+            ("results.json", b"DIRECTORY", "unreadable rows path"),
+        )
+        for filename, payload, label in cases:
+            with self.subTest(case=label), tempfile.TemporaryDirectory() as directory:
+                output = Path(directory) / "matrix"
+                argv = ["matrix.py", "--output", str(output),
+                        "--tls-cert", "unused.pem", "--tls-key", "unused.key",
+                        "--transports", "http", "--body-sizes", "16", "32",
+                        "--scenarios", "static-close", "--concurrency", "1",
+                        "--duration", "5", "--repeats", "3"]
+
+                def child_run(command, _log):
+                    folder = Path(command[command.index("--output") + 1])
+                    size = int(command[command.index("--body-size") + 1])
+                    folder.mkdir()
+                    rows = [dict(workload="static", connection="close", transport="http",
+                                 body_size=size, concurrency=1, engine=engine, rep=rep,
+                                 requests=500, rps=rps, seconds=5, valid=True,
+                                 errors=dict.fromkeys(run.ERROR_NAMES, 0),
+                                 warmup_errors=dict.fromkeys(run.ERROR_NAMES, 0))
+                            for engine, rps in (("nginx", 100), ("rut", 120)) for rep in (1, 2, 3)]
+                    run.save_json(folder / "results.json", rows)
+                    run.save_json(folder / "status.json", {"complete": True, "valid": True})
+                    if size == 16:
+                        artifact = folder / filename
+                        if payload is None:
+                            artifact.unlink()
+                        elif payload == b"DIRECTORY":
+                            artifact.unlink()
+                            artifact.mkdir()
+                        else:
+                            artifact.write_bytes(payload)
+                    return 0
+
+                previous_sigterm = signal.getsignal(signal.SIGTERM)
+                try:
+                    with mock.patch.object(sys, "argv", argv), \
+                            mock.patch.object(matrix, "run_cell", side_effect=child_run) as child, \
+                            contextlib.redirect_stdout(io.StringIO()):
+                        self.assertEqual(matrix.main(), 2)
+                        self.assertEqual(child.call_count, 2)
+                finally:
+                    signal.signal(signal.SIGTERM, previous_sigterm)
+                report = json.loads((output / "matrix.json").read_text())
+                self.assertTrue(report["complete"])
+                self.assertFalse(report["target_met"])
+                first, second = report["cells"]
+                self.assertFalse(first["measurement_valid"])
+                self.assertFalse(first["target_met"])
+                self.assertTrue(first["evidence_error"])
+                self.assertTrue(second["measurement_valid"])
+                self.assertTrue(second["target_met"])
 
     def test_keepalive_wire_profiles_preserve_original_and_default_persistence(self):
         explicit = request_bytes("proxy", False)

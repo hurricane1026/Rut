@@ -3,6 +3,7 @@
 import argparse
 import itertools
 import json
+import math
 import signal
 import statistics
 import subprocess
@@ -36,8 +37,51 @@ def run_cell(command, log):
             raise
 
 
+def finite_nonnegative(value):
+    if type(value) not in (int, float):
+        return False
+    try:
+        return math.isfinite(value) and value >= 0
+    except OverflowError:
+        return False
+
+
+def sample_shape_valid(row):
+    if not isinstance(row, dict) or type(row.get("valid")) is not bool:
+        return False
+    if not all(isinstance(row.get(key), str)
+               for key in ("workload", "connection", "transport", "engine")):
+        return False
+    if not all(type(row.get(key)) is int and row[key] >= 0
+               for key in ("body_size", "concurrency", "rep", "requests")):
+        return False
+    if not all(finite_nonnegative(row.get(key)) for key in ("rps", "seconds")):
+        return False
+    return all(isinstance(row.get(key), dict) and set(row[key]) == set(ERROR_NAMES)
+               and all(type(value) is int and value >= 0 for value in row[key].values())
+               for key in ("errors", "warmup_errors"))
+
+
+def load_evidence(folder):
+    try:
+        rows = json.loads((folder / "results.json").read_text())
+        status = json.loads((folder / "status.json").read_text())
+        if not isinstance(rows, list) or not all(sample_shape_valid(row) for row in rows):
+            raise ValueError("results.json must contain well-formed benchmark samples")
+        if not isinstance(status, dict) or any(type(status.get(key)) is not bool
+                                               for key in ("complete", "valid")):
+            raise ValueError("status.json must contain boolean complete and valid fields")
+        return rows, status, None
+    except (OSError, UnicodeError, ValueError, RecursionError) as error:
+        # Partial/missing artifacts belong to this coordinate, not the whole
+        # matrix. Keep the files and diagnosis, and continue later coordinates.
+        return [], {}, f"{type(error).__name__}: {error}"
+
+
 def assess(rows, scenario, transport, size, concurrency, repeats, duration):
     work, connection = scenario.split("-")
+    if not isinstance(rows, list) or not all(sample_shape_valid(row) for row in rows):
+        rows = []
     selected = [r for r in rows if r.get("concurrency") == concurrency]
     engines = {}
     for engine in ("nginx", "rut"):
@@ -47,7 +91,7 @@ def assess(rows, scenario, transport, size, concurrency, repeats, duration):
             r.get("valid") and r.get("workload") == work
             and r.get("connection") == connection and r.get("transport") == transport
             and r.get("body_size") == size and r.get("requests", 0) > 0
-            and r.get("rps", 0) > 0
+            and r.get("rps", 0) > 0 and r["seconds"] > 0
             and set(r.get("errors", {})) == set(ERROR_NAMES)
             and set(r.get("warmup_errors", {})) == set(ERROR_NAMES)
             and not any(r.get("errors", {"missing": 1}).values())
@@ -55,9 +99,14 @@ def assess(rows, scenario, transport, size, concurrency, repeats, duration):
             for r in samples
         )
         engines[engine] = statistics.median(r["rps"] for r in samples) if valid else None
+        if not finite_nonnegative(engines[engine]):
+            engines[engine] = None
     ratio = engines["rut"] / engines["nginx"] if all(engines.values()) else None
+    if not finite_nonnegative(ratio):
+        ratio = None
     # Short smoke runs establish functionality, never performance acceptance.
-    eligible = repeats >= 3 and duration >= 5
+    eligible = (repeats >= 3 and duration >= 5 and len(selected) == 2 * repeats
+                and all(r["seconds"] >= 5 for r in selected))
     return {"scenario": scenario, "transport": transport, "body_size": size,
             "concurrency": concurrency, "median_rps": engines, "rut_over_nginx": ratio,
             "measurement_valid": ratio is not None, "performance_eligible": eligible,
@@ -104,10 +153,7 @@ def main():
                 command += ["--tls-cert", str(args.tls_cert.resolve()), "--tls-key", str(args.tls_key.resolve())]
             with (args.output / (folder.name + ".log")).open("w") as log:
                 returncode = run_cell(command, log)
-            rows_path = folder / "results.json"
-            rows = json.loads(rows_path.read_text()) if rows_path.exists() else []
-            status_path = folder / "status.json"
-            status = json.loads(status_path.read_text()) if status_path.exists() else {}
+            rows, status, evidence_error = load_evidence(folder)
             # Exit 1 means a completed run contains bad samples. Assess each
             # concurrency independently; only incomplete/setup failures discard
             # every group, including results written before cleanup failed.
@@ -115,6 +161,8 @@ def main():
             for concurrency in args.concurrency:
                 cell = assess(rows, scenario, transport, size, concurrency, args.repeats, args.duration)
                 cell.update(exit_code=returncode, evidence=str(folder), command=command)
+                if evidence_error:
+                    cell["evidence_error"] = evidence_error
                 if not completed:
                     cell["measurement_valid"] = cell["target_met"] = False
                 report["cells"].append(cell)

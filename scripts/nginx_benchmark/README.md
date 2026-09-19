@@ -168,10 +168,14 @@ case has isolated retained evidence. Failed setup, unsupported capabilities,
 missing repetitions and response errors leave their cells unpassed. A completed
 child run with exit 1 preserves valid sibling-concurrency measurements while
 rejecting the groups with bad samples. Other nonzero exits or missing/incomplete
-`status.json` completion evidence invalidate every group from that child. It keeps
+`status.json` completion evidence invalidate every group from that child. Unreadable
+or malformed JSON and invalid sample shapes are recorded as `evidence_error` for
+that coordinate; later coordinates still run. It keeps
 running other cases to expose the complete gap. `matrix.json` records exact
 coordinates, commands, median ratios and validity. The overall target requires
-every cell to reach Rut/nginx >= 1.10; runs shorter than 5 seconds or fewer
-than three repeats never qualify for performance acceptance. Exit 2 includes
+every cell to reach Rut/nginx >= 1.10; both the requested duration and every
+sample's measured `seconds` must be at least 5, with at least three repeats.
+Short but otherwise valid measurements remain visible without qualifying for
+performance acceptance. Exit 2 includes
 valid measurements below target, not only execution errors. An interrupted
 matrix remains incomplete. This is a local goal check, not a performance CI gate.
