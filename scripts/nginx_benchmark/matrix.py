@@ -12,6 +12,30 @@ from pathlib import Path
 from run import SCENARIOS, ERROR_NAMES, positive, save_json
 
 
+def run_cell(command, log):
+    # The child owns its containers. Isolate terminal signals, then forward a
+    # single termination request so its cleanup cannot receive the signal twice.
+    with subprocess.Popen(command, stdout=log, stderr=subprocess.STDOUT,
+                          start_new_session=True) as child:
+        try:
+            return child.wait()
+        except BaseException:
+            previous = {sig: signal.signal(sig, signal.SIG_IGN)
+                        for sig in (signal.SIGINT, signal.SIGTERM)}
+            try:
+                if child.poll() is None:
+                    child.terminate()
+                try:
+                    child.wait(timeout=30)
+                except subprocess.TimeoutExpired:
+                    child.kill()
+                    child.wait()
+            finally:
+                for sig, handler in previous.items():
+                    signal.signal(sig, handler)
+            raise
+
+
 def assess(rows, scenario, transport, size, concurrency, repeats, duration):
     work, connection = scenario.split("-")
     selected = [r for r in rows if r.get("concurrency") == concurrency]
@@ -79,19 +103,7 @@ def main():
             if transport == "https":
                 command += ["--tls-cert", str(args.tls_cert.resolve()), "--tls-key", str(args.tls_key.resolve())]
             with (args.output / (folder.name + ".log")).open("w") as log:
-                # Child harness owns cleanup; keep it in our process group so
-                # an interactive interrupt reaches both parent and child.
-                with subprocess.Popen(command, stdout=log, stderr=subprocess.STDOUT) as child:
-                    try:
-                        returncode = child.wait()
-                    except BaseException:
-                        child.terminate()
-                        try:
-                            child.wait(timeout=30)
-                        except subprocess.TimeoutExpired:
-                            child.kill()
-                            child.wait()
-                        raise
+                returncode = run_cell(command, log)
             rows_path = folder / "results.json"
             rows = json.loads(rows_path.read_text()) if rows_path.exists() else []
             for concurrency in args.concurrency:
