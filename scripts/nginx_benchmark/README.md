@@ -138,9 +138,10 @@ original static/proxy payloads remain unchanged. Configurable proxy payloads
 are served from a read-only file mount by the origin. ETag, range advertisement
 and Last-Modified are disabled identically at that shared origin to preserve
 the controlled response-header shape; this is not a range/caching-header test. Static converter
-`local_response` currently supports at most 4096 bytes: larger static cases
-fail explicitly and do not count as passed. TLS local-response admission also
-remains a runtime capability to validate, not an assumed supported case.
+`local_response` currently supports at most 4094 quoted body bytes: larger static cases
+fail explicitly and do not count as passed. Established io_uring TLS supports
+exact local responses; strict proxy TLS and larger-body cells still require
+separate capability validation.
 
 HTTPS uses `--tls-cert cert.pem --tls-key key.pem`. Generate a throwaway RSA
 certificate with `openssl req -x509 -newkey rsa:2048 -nodes -days 7 -subj
