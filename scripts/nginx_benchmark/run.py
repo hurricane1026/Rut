@@ -22,6 +22,8 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[2]
 SCENARIOS = ("static-close", "static-keepalive", "proxy-close", "proxy-keepalive")
 ERROR_NAMES = ("connect", "read", "write", "status", "timeout")
+# Keep aligned with the converter's safe quoted return-body profile.
+STATIC_BODY_LIMIT = 4094
 
 
 def save_json(path, value):
@@ -160,6 +162,13 @@ class Harness:
 
     def prepare(self):
         a = self.args
+        body_size = getattr(a, "body_size", None)
+        if (body_size is not None and body_size > STATIC_BODY_LIMIT
+                and any(scenario.startswith("static-") for scenario in a.scenarios)):
+            raise ValueError(
+                f"unsupported static body: converter local_response is bounded to "
+                f"{STATIC_BODY_LIMIT} bytes; this matrix cell has NOT passed"
+            )
         context = self.command(["docker", "context", "inspect"]).stdout
         endpoint = (
             os.environ.get("DOCKER_HOST")
@@ -202,7 +211,6 @@ class Harness:
                 "listener_adaptation": "converter cleartext listener replaced by CLI TLS; wildcard IPv4 on both frontends",
             }
         save_json(self.out / "environment.json", metadata)
-        body_size = getattr(a, "body_size", None)
         if body_size is None:
             origin_location = 'location / { default_type text/plain; return 200 "' + "x" * 1024 + '"; }'
         else:
@@ -216,8 +224,6 @@ class Harness:
         ))
         works = sorted({scenario.split("-")[0] for scenario in a.scenarios})
         for work in works:
-            if work == "static" and body_size is not None and body_size > 4096:
-                raise ValueError("unsupported static body: converter local_response is bounded to 4096 bytes; this matrix cell has NOT passed")
             local = (
                 'location = /static { return 200 "' + expected_body("static", body_size).decode() + '"; }'
                 if work == "static"
@@ -728,14 +734,14 @@ def arguments():
 
 def main():
     args = arguments()
-    harness = Harness(args)
     status = {"complete": False, "valid": False}
 
     def interrupt(_signum, _frame):
         raise KeyboardInterrupt
 
-    signal.signal(signal.SIGTERM, interrupt)
+    previous_sigterm = signal.signal(signal.SIGTERM, interrupt)
     try:
+        harness = Harness(args)
         harness.prepare()
         with harness.nginx(
             "origin", "origin.conf", args.origin_cpu, args.origin_port
@@ -752,6 +758,7 @@ def main():
         print(repr(error), file=sys.stderr)
         return 2
     finally:
+        signal.signal(signal.SIGTERM, previous_sigterm)
         save_json(args.output / "status.json", status)
 
 

@@ -1,11 +1,20 @@
 """Checks for evidence gating and HTTP-close handling; no Docker required."""
 
+import contextlib
+import io
+import json
+import os
+import signal
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
+from unittest import mock
+
+import run
 
 from run import (
     Harness,
@@ -31,6 +40,113 @@ class FakeSocket:
 
 
 class ToolsTest(unittest.TestCase):
+    def test_invalid_tls_certificate_retains_failed_status(self):
+        with tempfile.TemporaryDirectory() as directory:
+            out = Path(directory)
+            cert = out / "invalid.pem"
+            cert.write_text("not a PEM certificate\n")
+            args = SimpleNamespace(output=out, tls_cert=cert)
+            with mock.patch.object(run, "arguments", return_value=args), \
+                    mock.patch.object(Harness, "prepare") as prepare, \
+                    contextlib.redirect_stderr(io.StringIO()):
+                self.assertEqual(run.main(), 2)
+            prepare.assert_not_called()
+            status = json.loads((out / "status.json").read_text())
+            self.assertFalse(status["complete"])
+            self.assertFalse(status["valid"])
+            self.assertIn("SSLError", status["error"])
+
+    def test_static_body_bound_rejected_before_external_commands(self):
+        with tempfile.TemporaryDirectory() as directory:
+            for scenario, size, rejected in (
+                ("static-close", run.STATIC_BODY_LIMIT, False),
+                ("static-keepalive", run.STATIC_BODY_LIMIT + 1, True),
+                ("static-close", 1048576, True),
+                ("static-close", None, False),
+                ("proxy-close", 1048576, False),
+            ):
+                with self.subTest(scenario=scenario, size=size):
+                    harness = Harness(SimpleNamespace(
+                        output=Path(directory), scenarios=[scenario], body_size=size))
+                    with mock.patch.object(harness, "command", side_effect=RuntimeError("external")) as command:
+                        if rejected:
+                            with self.assertRaisesRegex(ValueError, "this matrix cell has NOT passed"):
+                                harness.prepare()
+                            command.assert_not_called()
+                        else:
+                            with self.assertRaisesRegex(RuntimeError, "external"):
+                                harness.prepare()
+                            command.assert_called_once()
+
+    def test_matrix_interrupt_allows_child_cleanup_once(self):
+        tools_dir = Path(__file__).resolve().parent
+        for group_signal in (True, False):
+            with self.subTest(group_signal=group_signal), tempfile.TemporaryDirectory() as directory:
+                out = Path(directory)
+                child_script = out / "child.py"
+                child_script.write_text(
+                    "import os,signal,time\nfrom pathlib import Path\n"
+                    "def interrupt(sig,frame):\n"
+                    "    with Path('signals').open('a') as f: f.write(str(sig)+'\\n')\n"
+                    "    raise KeyboardInterrupt\n"
+                    "signal.signal(signal.SIGTERM,interrupt)\n"
+                    "signal.signal(signal.SIGINT,interrupt)\n"
+                    "Path('child.pid').write_text(str(os.getpid()))\n"
+                    "try:\n"
+                    "    Path('ready').touch()\n"
+                    "    time.sleep(20)\n"
+                    "except KeyboardInterrupt:\n"
+                    "    Path('cleaning').touch()\n"
+                    "    time.sleep(0.5)\n"
+                    "    Path('cleaned').touch()\n"
+                )
+                parent_code = (
+                    "import signal,sys\nfrom pathlib import Path\n"
+                    f"sys.path.insert(0,{str(tools_dir)!r})\n"
+                    "from matrix import run_cell\n"
+                    "def interrupt(sig,frame): raise KeyboardInterrupt\n"
+                    "signal.signal(signal.SIGTERM,interrupt)\n"
+                    "try:\n"
+                    "    with open('child.log','w') as log:\n"
+                    "        run_cell([sys.executable,'child.py'],log)\n"
+                    "except KeyboardInterrupt:\n"
+                    "    Path('interrupted').touch()\n"
+                )
+
+                def wait_for(name, parent):
+                    deadline = time.monotonic() + 5
+                    while not (out / name).exists():
+                        self.assertIsNone(parent.poll(), 'parent exited before ' + name)
+                        self.assertLess(time.monotonic(), deadline, 'timed out waiting for ' + name)
+                        time.sleep(0.01)
+
+                with (out / "parent.log").open("w") as log:
+                    parent = subprocess.Popen([sys.executable, "-c", parent_code],
+                                              cwd=out, stdout=log, stderr=log,
+                                              start_new_session=True)
+                    try:
+                        wait_for("ready", parent)
+                        if group_signal:
+                            os.killpg(parent.pid, signal.SIGINT)
+                        else:
+                            parent.terminate()
+                        wait_for("cleaning", parent)
+                        # A second terminal interruption must not interrupt the
+                        # child's resource cleanup while the parent waits.
+                        os.killpg(parent.pid, signal.SIGTERM)
+                        self.assertEqual(parent.wait(timeout=5), 0)
+                        self.assertTrue((out / "cleaned").exists())
+                        self.assertTrue((out / "interrupted").exists())
+                        self.assertEqual((out / "signals").read_text(), f"{signal.SIGTERM}\n")
+                    finally:
+                        if parent.poll() is None:
+                            parent.kill()
+                            parent.wait()
+                        child_pid_file = out / "child.pid"
+                        if child_pid_file.exists() and not (out / "cleaned").exists():
+                            with contextlib.suppress(ProcessLookupError):
+                                os.kill(int(child_pid_file.read_text()), signal.SIGKILL)
+
     def test_large_body_preflight_is_exact_and_bounded(self):
         size = 1048576
         head = f"HTTP/1.1 200 OK\r\nContent-Length: {size}\r\n\r\n".encode()
