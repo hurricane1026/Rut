@@ -11324,6 +11324,54 @@ static bool install_representation200_exact(RouteConfig& config, const char* pat
     return config.install_strict_local_response_table(&policy, 1, unmatched, exact, 1);
 }
 
+TEST(strict_local_response, exact_binding_neutral_classifier_checks_every_byte) {
+    static_assert(sizeof(ExactStrictLocalResponseBinding) == 72);
+    ExactStrictLocalResponseBinding binding{};
+    CHECK(exact_strict_local_response_binding_is_neutral(binding));
+
+    static constexpr u8 kNonzeroBytes[] = {0x01, 0x80, 0xff};
+    auto* bytes = reinterpret_cast<u8*>(&binding);
+    for (u32 i = 0; i < sizeof(binding); i++) {
+        for (const u8 value : kNonzeroBytes) {
+            bytes[i] = value;
+            CHECK_FALSE(exact_strict_local_response_binding_is_neutral(binding));
+            bytes[i] = 0;
+            CHECK(exact_strict_local_response_binding_is_neutral(binding));
+        }
+    }
+
+    ExactStrictLocalResponseBinding distinct_bindings[2]{};
+    CHECK(exact_strict_local_response_binding_is_neutral(distinct_bindings[0]));
+    CHECK(exact_strict_local_response_binding_is_neutral(distinct_bindings[1]));
+
+    struct GuardedBinding {
+        ExactStrictLocalResponseBinding binding{};
+        u8 canary[16]{};
+    } guarded{};
+    static_assert(offsetof(GuardedBinding, canary) == sizeof(ExactStrictLocalResponseBinding));
+    for (u8& byte : guarded.canary) byte = 0xa5;
+    CHECK(exact_strict_local_response_binding_is_neutral(guarded.binding));
+    for (const u8 byte : guarded.canary) CHECK_EQ(byte, 0xa5);
+}
+
+TEST(strict_local_response, exact_binding_unused_table_tail_checks_every_byte) {
+    RouteConfig config{};
+    REQUIRE(install_representation200_exact(config, "/static"));
+    REQUIRE(config.strict_local_response_table_is_valid());
+    REQUIRE_EQ(config.exact_strict_local_response_binding_count, 1u);
+
+    const u32 tail_slots[] = {1, kMaxExactStrictLocalResponseBindings - 1};
+    for (const u32 slot : tail_slots) {
+        auto* bytes = reinterpret_cast<u8*>(&config.exact_strict_local_response_bindings[slot]);
+        for (u32 i = 0; i < sizeof(ExactStrictLocalResponseBinding); i++) {
+            bytes[i] = 0xff;
+            CHECK_FALSE(config.strict_local_response_table_is_valid());
+            bytes[i] = 0;
+            CHECK(config.strict_local_response_table_is_valid());
+        }
+    }
+}
+
 TEST(exact_local_response, scoped_validation_rechecks_mutation_and_config_identity) {
     static_assert(!std::is_default_constructible_v<RouteConfig::StrictLocalResponseView>);
     static_assert(!std::is_copy_constructible_v<RouteConfig::StrictLocalResponseView>);

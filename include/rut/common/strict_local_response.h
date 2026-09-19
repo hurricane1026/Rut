@@ -42,11 +42,8 @@ static_assert(offsetof(ExactStrictLocalResponseBinding, reserved1) == 68);
 
 inline bool exact_strict_local_response_binding_is_neutral(
     const ExactStrictLocalResponseBinding& binding) {
-    for (u32 i = 0; i < sizeof(binding.path); i++)
-        if (binding.path[i] != 0) return false;
-    return binding.path_len == 0 && binding.method == 0 &&
-           binding.path_view == ExactPathView::Raw && binding.policy_id == 0 &&
-           binding.reserved1 == 0;
+    static constexpr ExactStrictLocalResponseBinding kNeutral{};
+    return __builtin_memcmp(&binding, &kNeutral, sizeof(kNeutral)) == 0;
 }
 
 inline bool exact_strict_local_response_path_byte_valid(char value) {
