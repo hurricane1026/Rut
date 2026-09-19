@@ -7487,6 +7487,87 @@ TEST(slice_pool, prealloc_and_invalid_free_guards) {
     pool.destroy();
 }
 
+TEST(slice_pool, cached_reuse_is_zeroed_and_duplicate_free_is_ignored) {
+    SlicePool pool;
+    REQUIRE(pool.init(4, 0, 2).has_value());
+    u8* first = pool.alloc();
+    u8* live = pool.alloc();
+    REQUIRE(first && live);
+    __builtin_memset(first, 0xa5, SlicePool::kSliceSize);
+    __builtin_memset(live, 0x5a, SlicePool::kSliceSize);
+    pool.free(first);
+    CHECK_EQ(pool.cached_count, 1u);
+    const u32 available = pool.available();
+    pool.free(first);
+    CHECK_EQ(pool.available(), available);
+    CHECK_EQ(pool.cached_count, 1u);
+    u8* reused = pool.alloc();
+    REQUIRE_EQ(reused, first);
+    CHECK_EQ(pool.cached_count, 0u);
+    for (u32 i = 0; i < SlicePool::kSliceSize; ++i) {
+        CHECK_EQ(reused[i], 0u);
+        CHECK_EQ(live[i], 0x5au);
+    }
+    pool.free(reused);
+    pool.free(live);
+    pool.destroy();
+    CHECK_EQ(pool.cached_count, 0u);
+    CHECK_EQ(pool.cache_limit, 0u);
+}
+
+TEST(slice_pool, burst_overflow_preserves_hot_priority_and_all_slice_ownership) {
+    SlicePool pool;
+    REQUIRE(pool.init(8, 0, 2).has_value());
+    u8* slices[8]{};
+    for (u32 i = 0; i < 8; ++i) {
+        slices[i] = pool.alloc();
+        REQUIRE(slices[i]);
+        __builtin_memset(slices[i], 0xa5, SlicePool::kSliceSize);
+    }
+    // A burst returns more slices than fit in the cache. Cold returns must not
+    // bury the two retained slices underneath the rest of the free stack.
+    for (u32 i = 0; i < 8; ++i) pool.free(slices[i]);
+    CHECK_EQ(pool.cached_count, 2u);
+    CHECK_EQ(pool.available(), 8u);
+    bool seen[8]{};
+    for (u32 i = 0; i < 8; ++i) {
+        u8* ptr = pool.alloc();
+        REQUIRE(ptr);
+        if (i < 2) CHECK(ptr == slices[0] || ptr == slices[1]);
+        u32 original = 0;
+        while (original < 8 && slices[original] != ptr) ++original;
+        REQUIRE(original < 8);
+        CHECK_FALSE(seen[original]);
+        seen[original] = true;
+        for (u32 byte = 0; byte < SlicePool::kSliceSize; ++byte) CHECK_EQ(ptr[byte], 0u);
+    }
+    CHECK_EQ(pool.cached_count, 0u);
+    CHECK_EQ(pool.available(), 0u);
+    CHECK_EQ(pool.alloc(), nullptr);
+    for (u32 i = 8; i != 0; --i) pool.free(slices[i - 1]);
+    CHECK_EQ(pool.cached_count, 2u);
+    CHECK_EQ(pool.in_use(), 0u);
+    pool.destroy();
+}
+
+TEST(slice_pool, cache_can_be_disabled_and_is_hard_bounded) {
+    SlicePool pool;
+    REQUIRE(pool.init(1, 0, 0).has_value());
+    u8* ptr = pool.alloc();
+    REQUIRE(ptr);
+    __builtin_memset(ptr, 0xa5, SlicePool::kSliceSize);
+    pool.free(ptr);
+    CHECK_EQ(pool.cached_count, 0u);
+    u8* reused = pool.alloc();
+    REQUIRE_EQ(reused, ptr);
+    for (u32 i = 0; i < SlicePool::kSliceSize; ++i) CHECK_EQ(reused[i], 0u);
+    pool.free(reused);
+    pool.destroy();
+    REQUIRE(pool.init(1024, 0, 1024).has_value());
+    CHECK_EQ(pool.cache_limit, SlicePool::kMaxCachedSlices);
+    pool.destroy();
+}
+
 TEST(slice_pool, init_base_mmap_failure) {
     ScopedMemoryFault fault(1);
     SlicePool pool;
