@@ -59,7 +59,7 @@ there is no resume that silently replaces warmed processes with fresh ones.
   proxy fallback required by the converter.
 - `proxy`: root proxy to a separate nginx origin returning 1024 bytes.
 - `close` / `keepalive`: downstream HTTP/1.1 connection behavior. Origin
-  keepalive is disabled identically for both engines. No TLS or pipelining.
+  keepalive is disabled identically for both engines. Default transport is HTTP; no pipelining.
 - nginx: one worker, Docker host network, access logging off. RUT: one shard,
   `--no-pin` with outer `taskset`, JIT O2, automatic I/O backend. Check the
   retained startup log for the actual backend (io_uring in the original run).
@@ -129,3 +129,53 @@ retained runtime failures are recorded in [VALIDATION.md](VALIDATION.md).
 preserves the original local findings. It was measured before this portable
 harness was extracted; the original numbers are not a rerun of this PR.
 EOF root-cause fixes and performance optimization are separate work.
+
+
+## TLS and response-size matrix
+
+`--body-size N` requests exactly N `x` bytes, up to 1 MiB. Without it, the
+original static/proxy payloads remain unchanged. Configurable proxy payloads
+are served from a read-only file mount by the origin. ETag, range advertisement
+and Last-Modified are disabled identically at that shared origin to preserve
+the controlled response-header shape; this is not a range/caching-header test. Static converter
+`local_response` currently supports at most 64 bytes: larger static cases
+fail explicitly and do not count as passed. TLS local-response admission also
+remains a runtime capability to validate, not an assumed supported case.
+
+HTTPS uses `--tls-cert cert.pem --tls-key key.pem`. Generate a throwaway RSA
+certificate with `openssl req -x509 -newkey rsa:2048 -nodes -days 7 -subj
+/CN=localhost -addext subjectAltName=DNS:localhost -keyout key.pem -out cert.pem`.
+Both frontends use the same certificate. The Python preflight verifies it and
+requires TLS 1.3 / TLS_AES_256_GCM_SHA384. Build the pinned wrk source with
+`wrk-tls-full-handshake.patch`, using the same OpenSSL and LuaJIT build options
+as the original client. The patch fixes protocol/cipher and X25519 key exchange, clears sessions on
+reconnect and rejects any resumed handshake. The harness rejects an HTTPS
+measurement lacking the patch's capability marker. Retain the client patch,
+build log and binary hash; a label alone is not external provenance proof.
+
+Short connections use full TLS handshakes; keepalive reuses established TLS
+connections. Ticket/resumption performance is a separate, unmeasured profile.
+TLS listener setup uses Rut's existing CLI: raw converter output is preserved
+as `.converted.rut`, its cleartext listener line is removed in the runnable
+file, and CLI port/certificate/key configure TLS. Both TLS frontends bind the
+same wildcard IPv4 port. This tests Rut TLS runtime performance, **not** TLS
+converter compatibility. Original HTTP output stays unmodified.
+
+`matrix.py` accepts the same binary/CPU arguments as `run.py`, plus required
+`--tls-cert` / `--tls-key`. Defaults are all four scenarios, HTTP and HTTPS,
+16 B / 1 KiB / 64 KiB / 1 MiB, and concurrency 1 / 32 / 128: 96 cells. Each
+case has isolated retained evidence. Failed setup, unsupported capabilities,
+missing repetitions and response errors leave their cells unpassed. A completed
+child run with exit 1 preserves valid sibling-concurrency measurements while
+rejecting the groups with bad samples. Other nonzero exits or missing/incomplete
+`status.json` completion evidence invalidate every group from that child. Unreadable
+or malformed JSON and invalid sample shapes are recorded as `evidence_error` for
+that coordinate; later coordinates still run. It keeps
+running other cases to expose the complete gap. `matrix.json` records exact
+coordinates, commands, median ratios and validity. The overall target requires
+every cell to reach Rut/nginx >= 1.10; both the requested duration and every
+sample's measured `seconds` must be at least 5, with at least three repeats.
+Short but otherwise valid measurements remain visible without qualifying for
+performance acceptance. Exit 2 includes
+valid measurements below target, not only execution errors. An interrupted
+matrix remains incomplete. This is a local goal check, not a performance CI gate.
