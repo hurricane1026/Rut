@@ -278,7 +278,7 @@ u32 KqueueBackend::pop_pending(IoEvent* event, Connection* conns, u32 max_conns)
 }
 
 bool KqueueBackend::arm_send(u32 id, SendState& state) {
-    const i16 filter = state.tls ? state.tls_wait_filter : EVFILT_WRITE;
+    const i16 filter = state.tls ? state.tls_wait_filter : static_cast<i16>(EVFILT_WRITE);
     if (change(kqueue_fd,
                state.fd,
                filter,

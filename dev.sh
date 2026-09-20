@@ -29,6 +29,8 @@ if [[ "$(uname -s)" == Darwin ]]; then
         exit 1
     fi
     export PATH="$RUT_LLVM_PREFIX/bin:$PATH"
+    # clang-tidy does not load Homebrew clang's SDK configuration file.
+    export SDKROOT="${SDKROOT:-$(xcrun --sdk macosx --show-sdk-path)}"
     RUT_CMAKE_ARGS=(
         -DCMAKE_C_COMPILER="${CC:-$RUT_LLVM_PREFIX/bin/clang}"
         -DCMAKE_CXX_COMPILER="${CXX:-$RUT_LLVM_PREFIX/bin/clang++}"
