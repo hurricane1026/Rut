@@ -49348,6 +49348,7 @@ TEST(response_buffering_runtime,
         PrebuiltD2Fixture fixture{};
         REQUIRE(stage_strict_read_timeout_method(
             loop, &config, nullptr, 0, &fixture, LogHttpMethod::Get));
+        REQUIRE(arm_staged_response_read_deadline(loop, fixture));
         Connection& conn = *fixture.conn;
         static constexpr u8 kResponse[] = "HTTP/1.1 200 OK\r\nContent-Length: 4\r\n\r\nabcd";
         const u32 response_len = sizeof(kResponse) - 1u;
