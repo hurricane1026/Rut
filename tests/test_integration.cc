@@ -30,13 +30,17 @@
 #include "test_helpers.h"
 #include <algorithm>  // std::sort in the proxy latency bench
 #include <atomic>
+#include <climits>
+#include <cstdint>
 #include <memory>
 #include <string>
 #include <vector>
 
 #include <errno.h>
+#include <fcntl.h>
 #include <openssl/err.h>
 #include <openssl/ssl.h>
+#include <poll.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -7728,6 +7732,344 @@ struct ScopedWatermarkTestResources {
 };
 }  // namespace
 
+struct BoundedTlsConnectResult {
+    enum class Phase : u8 { None, GetFlags, SetNonblocking, Connect, Poll, Timeout, RestoreFlags };
+
+    bool success = false;
+    Phase phase = Phase::None;
+    int result = 0;
+    int ssl_error = SSL_ERROR_NONE;
+    int system_error = 0;
+    int restore_error = 0;
+    uint32_t queued_error = 0;
+    const char* ssl_state = "<unknown>";
+    u64 elapsed_us = 0;
+};
+
+static const char* bounded_tls_connect_phase_name(BoundedTlsConnectResult::Phase phase) {
+    switch (phase) {
+        case BoundedTlsConnectResult::Phase::None:
+            return "complete";
+        case BoundedTlsConnectResult::Phase::GetFlags:
+            return "get_flags";
+        case BoundedTlsConnectResult::Phase::SetNonblocking:
+            return "set_nonblocking";
+        case BoundedTlsConnectResult::Phase::Connect:
+            return "SSL_connect";
+        case BoundedTlsConnectResult::Phase::Poll:
+            return "poll";
+        case BoundedTlsConnectResult::Phase::Timeout:
+            return "timeout";
+        case BoundedTlsConnectResult::Phase::RestoreFlags:
+            return "restore_flags";
+    }
+    return "unknown";
+}
+
+struct RealTlsConnectOps {
+    int get_flags(int fd) { return fcntl(fd, F_GETFL); }
+    int set_flags(int fd, int flags) { return fcntl(fd, F_SETFL, flags); }
+    int connect(SSL* ssl) { return SSL_connect(ssl); }
+    int get_error(SSL* ssl, int result) { return SSL_get_error(ssl, result); }
+    int wait(int fd, short events, int timeout_ms) {
+        pollfd descriptor{};
+        descriptor.fd = fd;
+        descriptor.events = events;
+        return poll(&descriptor, 1, timeout_ms);
+    }
+    u64 now_us() { return monotonic_us(); }
+    const char* state(SSL* ssl) { return SSL_state_string_long(ssl); }
+    uint32_t peek_error() { return ERR_peek_error(); }
+    void clear_error() { ERR_clear_error(); }
+};
+
+template <typename Ops>
+static BoundedTlsConnectResult ssl_connect_with_deadline(Ops& ops,
+                                                         SSL* ssl,
+                                                         int fd,
+                                                         u64 timeout_us) {
+    BoundedTlsConnectResult outcome{};
+    const int original_flags = ops.get_flags(fd);
+    if (original_flags < 0) {
+        outcome.phase = BoundedTlsConnectResult::Phase::GetFlags;
+        outcome.system_error = errno;
+        return outcome;
+    }
+
+    const bool changed_flags = (original_flags & O_NONBLOCK) == 0;
+    if (changed_flags && ops.set_flags(fd, original_flags | O_NONBLOCK) < 0) {
+        const int set_errno = errno;
+        outcome.phase = BoundedTlsConnectResult::Phase::SetNonblocking;
+        outcome.system_error = set_errno;
+        if (ops.set_flags(fd, original_flags) < 0) outcome.restore_error = errno;
+        return outcome;
+    }
+
+    const u64 start_us = ops.now_us();
+    const u64 deadline_us = timeout_us > UINT64_MAX - start_us ? UINT64_MAX : start_us + timeout_us;
+    for (;;) {
+        const u64 now_us = ops.now_us();
+        if (now_us >= deadline_us) {
+            outcome.phase = BoundedTlsConnectResult::Phase::Timeout;
+            outcome.system_error = ETIMEDOUT;
+            break;
+        }
+
+        ops.clear_error();
+        errno = 0;
+        outcome.result = ops.connect(ssl);
+        const int connect_errno = errno;
+        if (outcome.result == 1) {
+            const u64 completed_us = ops.now_us();
+            outcome.success = completed_us < deadline_us;
+            outcome.phase = outcome.success ? BoundedTlsConnectResult::Phase::None
+                                            : BoundedTlsConnectResult::Phase::Timeout;
+            outcome.ssl_error = SSL_ERROR_NONE;
+            outcome.system_error = connect_errno;
+            outcome.queued_error = ops.peek_error();
+            outcome.ssl_state = ops.state(ssl);
+            if (!outcome.success) outcome.system_error = ETIMEDOUT;
+            break;
+        }
+
+        // SSL_get_error must immediately follow the failed SSL operation, with
+        // its errno captured before any other call can overwrite it.
+        outcome.ssl_error = ops.get_error(ssl, outcome.result);
+        outcome.system_error = connect_errno;
+        outcome.queued_error = ops.peek_error();
+        outcome.ssl_state = ops.state(ssl);
+        if (outcome.ssl_error != SSL_ERROR_WANT_READ && outcome.ssl_error != SSL_ERROR_WANT_WRITE) {
+            outcome.phase = BoundedTlsConnectResult::Phase::Connect;
+            break;
+        }
+
+        const short wanted = outcome.ssl_error == SSL_ERROR_WANT_READ ? POLLIN : POLLOUT;
+        bool ready = false;
+        while (!ready) {
+            const u64 wait_now_us = ops.now_us();
+            if (wait_now_us >= deadline_us) {
+                outcome.phase = BoundedTlsConnectResult::Phase::Timeout;
+                outcome.system_error = ETIMEDOUT;
+                break;
+            }
+            const u64 remaining_us = deadline_us - wait_now_us;
+            const u64 rounded_ms = remaining_us / 1000u + (remaining_us % 1000u != 0);
+            const int timeout_ms =
+                static_cast<int>(rounded_ms > static_cast<u64>(INT_MAX) ? INT_MAX : rounded_ms);
+            const int wait_result = ops.wait(fd, wanted, timeout_ms);
+            if (wait_result > 0) {
+                ready = true;
+                break;
+            }
+            if (wait_result == 0) {
+                if (ops.now_us() >= deadline_us) {
+                    outcome.phase = BoundedTlsConnectResult::Phase::Timeout;
+                    outcome.system_error = ETIMEDOUT;
+                    break;
+                }
+                continue;
+            }
+            const int wait_errno = errno;
+            if (wait_errno == EINTR) continue;
+            outcome.phase = BoundedTlsConnectResult::Phase::Poll;
+            outcome.system_error = wait_errno;
+            break;
+        }
+        if (!ready) break;
+    }
+    const u64 finished_us = ops.now_us();
+    outcome.elapsed_us = finished_us >= start_us ? finished_us - start_us : 0;
+
+    if (changed_flags && ops.set_flags(fd, original_flags) < 0) {
+        outcome.restore_error = errno;
+        if (outcome.success) {
+            outcome.success = false;
+            outcome.phase = BoundedTlsConnectResult::Phase::RestoreFlags;
+            outcome.system_error = outcome.restore_error;
+        }
+    }
+    return outcome;
+}
+
+struct ScriptedTlsConnectOps {
+    struct ConnectStep {
+        int result;
+        int ssl_error;
+        int system_error;
+        u64 elapsed_us = 0;
+    };
+    struct WaitStep {
+        int result;
+        int system_error;
+        u64 elapsed_us;
+    };
+
+    std::vector<ConnectStep> connect_steps;
+    std::vector<WaitStep> wait_steps;
+    size_t connect_index = 0;
+    size_t wait_index = 0;
+    u64 clock_us = 1000;
+    int flags = 0;
+    std::vector<int> flag_writes;
+    std::vector<short> wait_events;
+    std::vector<int> wait_timeouts;
+    SSL* observed_ssl = nullptr;
+    u32 clear_error_calls = 0;
+    u32 get_error_calls = 0;
+    bool invalid_sequence = false;
+
+    int get_flags(int /*fd*/) { return flags; }
+    int set_flags(int /*fd*/, int next_flags) {
+        flags = next_flags;
+        flag_writes.push_back(next_flags);
+        return 0;
+    }
+    int connect(SSL* ssl) {
+        if (connect_index >= connect_steps.size()) {
+            invalid_sequence = true;
+            errno = EPROTO;
+            return -1;
+        }
+        if (connect_index == 0)
+            observed_ssl = ssl;
+        else if (observed_ssl != ssl)
+            invalid_sequence = true;
+        const ConnectStep step = connect_steps[connect_index++];
+        clock_us += step.elapsed_us;
+        errno = step.system_error;
+        return step.result;
+    }
+    int get_error(SSL* ssl, int result) {
+        if (ssl != observed_ssl || connect_index == 0 ||
+            result != connect_steps[connect_index - 1].result)
+            invalid_sequence = true;
+        get_error_calls++;
+        if (connect_index == 0) return SSL_ERROR_SSL;
+        return connect_steps[connect_index - 1].ssl_error;
+    }
+    int wait(int /*fd*/, short events, int timeout_ms) {
+        if (wait_index >= wait_steps.size()) {
+            invalid_sequence = true;
+            errno = EPROTO;
+            return -1;
+        }
+        wait_events.push_back(events);
+        wait_timeouts.push_back(timeout_ms);
+        const WaitStep step = wait_steps[wait_index++];
+        clock_us += step.elapsed_us;
+        errno = step.system_error;
+        return step.result;
+    }
+    u64 now_us() { return clock_us; }
+    const char* state(SSL* ssl) {
+        if (ssl != observed_ssl) invalid_sequence = true;
+        return "scripted-handshake-state";
+    }
+    uint32_t peek_error() { return 0x1234u; }
+    void clear_error() { clear_error_calls++; }
+};
+
+static SSL* scripted_ssl_handle() {
+    static int token = 0;
+    return reinterpret_cast<SSL*>(&token);
+}
+
+TEST(tls_handshake_driver, waits_through_eintr_with_one_ssl_and_restores_fd_flags) {
+    ScriptedTlsConnectOps ops;
+    ops.connect_steps = {
+        {-1, SSL_ERROR_WANT_READ, EINTR}, {-1, SSL_ERROR_WANT_WRITE, 0}, {1, SSL_ERROR_NONE, 0}};
+    ops.wait_steps = {{-1, EINTR, 250'000u}, {1, 0, 250'000u}, {1, 0, 250'000u}};
+    SSL* const ssl = scripted_ssl_handle();
+
+    const BoundedTlsConnectResult outcome = ssl_connect_with_deadline(ops, ssl, 17, 3'000'000u);
+
+    CHECK(outcome.success);
+    CHECK_EQ(outcome.phase, BoundedTlsConnectResult::Phase::None);
+    CHECK_EQ(outcome.result, 1);
+    CHECK_EQ(outcome.ssl_error, SSL_ERROR_NONE);
+    CHECK_EQ(ops.connect_index, 3u);
+    CHECK_EQ(ops.get_error_calls, 2u);
+    CHECK_EQ(ops.clear_error_calls, 3u);
+    CHECK(ops.observed_ssl == ssl);
+    CHECK_FALSE(ops.invalid_sequence);
+    REQUIRE_EQ(ops.wait_events.size(), 3u);
+    CHECK_EQ(ops.wait_events[0], POLLIN);
+    CHECK_EQ(ops.wait_events[1], POLLIN);  // poll EINTR retries the same read wait
+    CHECK_EQ(ops.wait_events[2], POLLOUT);
+    CHECK_EQ(ops.wait_timeouts[0], 3000);
+    CHECK_EQ(ops.wait_timeouts[1], 2750);
+    CHECK_EQ(ops.wait_timeouts[2], 2500);
+    CHECK_EQ(ops.flags, 0);
+    REQUIRE_EQ(ops.flag_writes.size(), 2u);
+    CHECK_EQ(ops.flag_writes[0], O_NONBLOCK);
+    CHECK_EQ(ops.flag_writes[1], 0);
+}
+
+TEST(tls_handshake_driver, success_returned_at_deadline_is_still_a_timeout) {
+    ScriptedTlsConnectOps ops;
+    ops.connect_steps = {{1, SSL_ERROR_NONE, 0, 3'000'000u}};
+    SSL* const ssl = scripted_ssl_handle();
+
+    const BoundedTlsConnectResult outcome = ssl_connect_with_deadline(ops, ssl, 17, 3'000'000u);
+
+    CHECK_FALSE(outcome.success);
+    CHECK_EQ(outcome.phase, BoundedTlsConnectResult::Phase::Timeout);
+    CHECK_EQ(outcome.system_error, ETIMEDOUT);
+    CHECK_EQ(outcome.result, 1);
+    CHECK_EQ(ops.connect_index, 1u);
+    CHECK_FALSE(ops.invalid_sequence);
+    CHECK_EQ(ops.flags, 0);
+    REQUIRE_EQ(ops.flag_writes.size(), 2u);
+    CHECK_EQ(ops.flag_writes[1], 0);
+}
+
+TEST(tls_handshake_driver, repeated_poll_eintr_expires_one_deadline_without_refresh) {
+    ScriptedTlsConnectOps ops;
+    ops.connect_steps = {{-1, SSL_ERROR_WANT_READ, EINTR}};
+    ops.wait_steps = {{-1, EINTR, 1'900'000u}, {-1, EINTR, 1'200'000u}};
+    SSL* const ssl = scripted_ssl_handle();
+
+    const BoundedTlsConnectResult outcome = ssl_connect_with_deadline(ops, ssl, 17, 3'000'000u);
+
+    CHECK_FALSE(outcome.success);
+    CHECK_EQ(outcome.phase, BoundedTlsConnectResult::Phase::Timeout);
+    CHECK_EQ(outcome.system_error, ETIMEDOUT);
+    CHECK_EQ(outcome.ssl_error, SSL_ERROR_WANT_READ);
+    CHECK_EQ(outcome.result, -1);
+    CHECK_EQ(outcome.elapsed_us, 3'100'000u);
+    CHECK_EQ(ops.connect_index, 1u);  // timeout never restarts SSL_connect
+    CHECK_EQ(ops.wait_index, 2u);
+    CHECK_FALSE(ops.invalid_sequence);
+    REQUIRE_EQ(ops.wait_timeouts.size(), 2u);
+    CHECK_EQ(ops.wait_timeouts[0], 3000);
+    CHECK_EQ(ops.wait_timeouts[1], 1100);
+    CHECK_EQ(ops.flags, 0);
+    REQUIRE_EQ(ops.flag_writes.size(), 2u);
+    CHECK_EQ(ops.flag_writes[1], 0);
+}
+
+TEST(tls_handshake_driver, fatal_ssl_error_is_not_retried_and_restores_fd_flags) {
+    ScriptedTlsConnectOps ops;
+    ops.connect_steps = {{-1, SSL_ERROR_SSL, EPROTO}};
+    SSL* const ssl = scripted_ssl_handle();
+
+    const BoundedTlsConnectResult outcome = ssl_connect_with_deadline(ops, ssl, 17, 3'000'000u);
+
+    CHECK_FALSE(outcome.success);
+    CHECK_EQ(outcome.phase, BoundedTlsConnectResult::Phase::Connect);
+    CHECK_EQ(outcome.result, -1);
+    CHECK_EQ(outcome.ssl_error, SSL_ERROR_SSL);
+    CHECK_EQ(outcome.system_error, EPROTO);
+    CHECK_EQ(outcome.queued_error, 0x1234u);
+    CHECK(ops.wait_events.empty());
+    CHECK_EQ(ops.connect_index, 1u);
+    CHECK_EQ(ops.get_error_calls, 1u);
+    CHECK_FALSE(ops.invalid_sequence);
+    CHECK_EQ(ops.flags, 0);
+    REQUIRE_EQ(ops.flag_writes.size(), 2u);
+    CHECK_EQ(ops.flag_writes[1], 0);
+}
+
 static void run_tls_iouring_exact_local_response_body(u32 body_size, rut::test::TestCase* _tc) {
     auto config = std::make_unique<RouteConfig>();
     std::vector<char> body(body_size, 'x');
@@ -7775,32 +8117,31 @@ static void run_tls_iouring_exact_local_response_body(u32 body_size, rut::test::
     resources.client_ssl = SSL_new(resources.client_ctx);
     REQUIRE(resources.client_ssl != nullptr);
     REQUIRE_EQ(SSL_set_fd(resources.client_ssl, resources.client_fd), 1);
-    ERR_clear_error();
-    errno = 0;
-    const int ssl_connect_result = SSL_connect(resources.client_ssl);
-    const int ssl_connect_errno = errno;
-    const int ssl_connect_error = ssl_connect_result == 1
-                                      ? SSL_ERROR_NONE
-                                      : SSL_get_error(resources.client_ssl, ssl_connect_result);
-    if (ssl_connect_result != 1) {
-        const uint32_t queued_error = ERR_peek_error();
+    RealTlsConnectOps handshake_ops;
+    const BoundedTlsConnectResult handshake = ssl_connect_with_deadline(
+        handshake_ops, resources.client_ssl, resources.client_fd, 3'000'000u);
+    if (!handshake.success) {
+        const uint32_t queued_error = handshake.queued_error;
         char error_text[256] = "none";
         if (queued_error != 0) ERR_error_string_n(queued_error, error_text, sizeof(error_text));
-        const char* const ssl_state = SSL_state_string_long(resources.client_ssl);
         fprintf(stderr,
-                "[tls-local-response] handshake failed body=%u port=%u result=%d ssl_error=%d "
-                "errno=%d (%s) state=%s error_queue=%u (%s)\n",
+                "[tls-local-response] handshake failed body=%u port=%u phase=%s result=%d "
+                "ssl_error=%d errno=%d (%s) restore_errno=%d elapsed_us=%llu state=%s "
+                "error_queue=%u (%s)\n",
                 body_size,
                 port,
-                ssl_connect_result,
-                ssl_connect_error,
-                ssl_connect_errno,
-                strerror(ssl_connect_errno),
-                ssl_state != nullptr ? ssl_state : "<unknown>",
+                bounded_tls_connect_phase_name(handshake.phase),
+                handshake.result,
+                handshake.ssl_error,
+                handshake.system_error,
+                strerror(handshake.system_error),
+                handshake.restore_error,
+                static_cast<unsigned long long>(handshake.elapsed_us),
+                handshake.ssl_state != nullptr ? handshake.ssl_state : "<unknown>",
                 queued_error,
                 error_text);
     }
-    REQUIRE_EQ(ssl_connect_result, 1);
+    REQUIRE(handshake.success);
     const std::string content_length = "Content-Length: " + std::to_string(body_size) + "\r\n";
     for (u32 request = 0; request < 4; ++request) {
         const char* wire =
@@ -7819,8 +8160,8 @@ static void run_tls_iouring_exact_local_response_body(u32 body_size, rut::test::
             const int count = SSL_read(resources.client_ssl,
                                        received.data() + total,
                                        static_cast<int>(received.size() - 1u - total));
-            // A worker wakeup can interrupt the blocking BIO read. Retry the
-            // identical SSL operation only for EINTR; socket timeouts still fail.
+            // Retry the identical SSL operation only for EINTR/WANT_READ;
+            // socket timeouts and all other SSL errors still fail.
             if (count <= 0 && errno == EINTR &&
                 SSL_get_error(resources.client_ssl, count) == SSL_ERROR_WANT_READ)
                 continue;
