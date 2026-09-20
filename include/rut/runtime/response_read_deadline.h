@@ -2077,6 +2077,50 @@ inline bool fixed_upload_head_after_host_precise_progress_is_stable(
            c.on_upstream_send == nullptr;
 }
 
+// The combined-send staging area lives beyond response_header_buf's logical
+// length. While the combined owner is live, these bytes must still match the
+// retained origin body; the Buffer length intentionally remains header-only.
+inline bool response_read_deadline_combined_send_frame_is_stable(const Connection& c) {
+    const u32 header_len = c.response_header_buf.len();
+    const u32 body_len = c.response_read_deadline_post_commit_declared_body;
+    const u32 raw_header_end = c.response_read_deadline_post_commit_raw_header_end;
+    if (c.response_read_deadline_post_commit_phase !=
+            ResponseReadDeadlinePostCommitPhase::CombinedSend ||
+        c.response_read_deadline_buffering != ForwardResponseBufferingMode::CompleteContentLength ||
+        c.response_read_deadline_state != ResponseReadDeadlineState::BodyComplete ||
+        c.response_read_deadline_post_commit_response_class !=
+            CompleteContentLengthResponseClass::BoundedPositiveBody ||
+        header_len == 0 || body_len == 0 || c.response_header_buf.data() == nullptr ||
+        c.upstream_recv_buf.data() == nullptr || header_len > c.response_header_buf.capacity() ||
+        body_len > c.response_header_buf.capacity() - header_len || raw_header_end == 0 ||
+        raw_header_end > c.upstream_recv_buf.capacity() ||
+        body_len > c.upstream_recv_buf.capacity() - raw_header_end)
+        return false;
+
+    const u32 send_len = header_len + body_len;
+    const u32 retained_len = raw_header_end + body_len;
+    return c.response_read_deadline_post_commit_origin_received == body_len &&
+           c.response_read_deadline_post_commit_send_body == body_len &&
+           c.response_read_deadline_post_commit_downstream_submitted == body_len &&
+           c.response_read_deadline_post_commit_downstream_completed == 0 &&
+           c.response_read_deadline_post_commit_inflight_body == body_len &&
+           c.resp_body_mode == BodyMode::ContentLength && c.resp_body_sent == send_len &&
+           c.resp_body_remaining == 0 && c.upstream_send_len == retained_len &&
+           c.upstream_recv_buf.len() == retained_len &&
+           c.response_read_deadline_send_kind == ResponseReadDeadlineSendKind::Combined &&
+           c.response_read_deadline_send_src == c.response_header_buf.data() &&
+           c.response_read_deadline_send_len == send_len && c.fd >= 0 &&
+           c.response_read_deadline_send_fd == c.fd &&
+           c.response_read_deadline_send_deadline_generation ==
+               c.response_read_deadline_generation &&
+           c.response_read_deadline_send_upstream_episode ==
+               c.response_read_deadline_post_commit_episode &&
+           c.response_read_deadline_send_owner_generation != 0 &&
+           __builtin_memcmp(c.response_header_buf.data() + header_len,
+                            c.upstream_recv_buf.data() + raw_header_end,
+                            body_len) == 0;
+}
+
 inline bool response_read_deadline_post_commit_is_stable(const Connection& c) {
     const RouteConfig* cfg = c.request_config;
     const u16 bundle_id = c.response_read_deadline_bundle_id;
@@ -2274,15 +2318,18 @@ inline bool response_read_deadline_post_commit_is_stable(const Connection& c) {
              cfg->failure_policies[bundle.failure_policy_id - 1],
              cfg->failure_policies[bundle.timeout_failure_policy_id - 1])))
         return false;
-    return response_read_timeout_seconds_valid(bundle.response_read_timeout_seconds) &&
-           bundle.response_read_timeout_seconds == c.response_read_deadline_seconds &&
-           bundle.response_buffering == c.response_read_deadline_buffering &&
-           bundle.response_policy_id == c.response_policy_id &&
-           bundle.failure_policy_id == c.failure_policy_id &&
-           bundle.timeout_failure_policy_id == c.timeout_failure_policy_id &&
-           cfg->response_policy_id_is_valid(bundle.response_policy_id) &&
-           cfg->failure_policy_id_is_valid(bundle.failure_policy_id) &&
-           cfg->timeout_failure_policy_id_is_valid(bundle.timeout_failure_policy_id);
+    const bool stable = response_read_timeout_seconds_valid(bundle.response_read_timeout_seconds) &&
+                        bundle.response_read_timeout_seconds == c.response_read_deadline_seconds &&
+                        bundle.response_buffering == c.response_read_deadline_buffering &&
+                        bundle.response_policy_id == c.response_policy_id &&
+                        bundle.failure_policy_id == c.failure_policy_id &&
+                        bundle.timeout_failure_policy_id == c.timeout_failure_policy_id &&
+                        cfg->response_policy_id_is_valid(bundle.response_policy_id) &&
+                        cfg->failure_policy_id_is_valid(bundle.failure_policy_id) &&
+                        cfg->timeout_failure_policy_id_is_valid(bundle.timeout_failure_policy_id);
+    return stable && (c.response_read_deadline_post_commit_phase !=
+                          ResponseReadDeadlinePostCommitPhase::CombinedSend ||
+                      response_read_deadline_combined_send_frame_is_stable(c));
 }
 
 // The currently admitted default-buffered GET keeps the same precise

@@ -101,6 +101,9 @@ template <typename Loop>
 void on_response_header_sent(void* lp, Connection& conn, IoEvent ev);
 
 template <typename Loop>
+void on_complete_response_sent(void* lp, Connection& conn, IoEvent ev);
+
+template <typename Loop>
 void on_response_body_recvd(void* lp, Connection& conn, IoEvent ev);
 
 template <typename Loop>
@@ -213,6 +216,7 @@ extern template void on_upstream_request_sent<IoUringEventLoop>(void*, Connectio
 extern template void on_upstream_response<IoUringEventLoop>(void*, Connection&, IoEvent);
 extern template void on_proxy_response_sent<IoUringEventLoop>(void*, Connection&, IoEvent);
 extern template void on_response_header_sent<IoUringEventLoop>(void*, Connection&, IoEvent);
+extern template void on_complete_response_sent<IoUringEventLoop>(void*, Connection&, IoEvent);
 extern template void on_response_body_recvd<IoUringEventLoop>(void*, Connection&, IoEvent);
 extern template void on_response_body_sent<IoUringEventLoop>(void*, Connection&, IoEvent);
 extern template void pump_response_read_deadline_body<IoUringEventLoop>(IoUringEventLoop*,

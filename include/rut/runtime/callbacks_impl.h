@@ -6753,6 +6753,66 @@ void on_response_header_sent(void* lp, Connection& conn, IoEvent ev) {
 }
 
 template <typename Loop>
+void on_complete_response_sent(void* lp, Connection& conn, IoEvent ev) {
+    auto* loop = static_cast<Loop*>(lp);
+    const bool send_owner_valid = [&]() {
+        if constexpr (requires(const Loop* candidate, const Connection& c, const IoEvent& event) {
+                          candidate->response_read_deadline_send_completion_is_valid(
+                              c, event, ResponseReadDeadlineSendKind::Combined);
+                      }) {
+            return loop->response_read_deadline_send_completion_is_valid(
+                conn, ev, ResponseReadDeadlineSendKind::Combined);
+        }
+        return false;
+    }();
+    if (!send_owner_valid || ev.result <= 0 ||
+        conn.response_read_deadline_post_commit_phase !=
+            ResponseReadDeadlinePostCommitPhase::CombinedSend ||
+        !response_read_deadline_post_commit_is_stable(conn)) {
+        loop->close_conn(conn);
+        return;
+    }
+
+    const u32 header_len = conn.response_header_buf.len();
+    const u32 body_len = conn.response_read_deadline_post_commit_declared_body;
+    const u32 raw_header_end = conn.response_read_deadline_post_commit_raw_header_end;
+    if (body_len > 0xFFFFFFFFu - header_len ||
+        static_cast<u32>(ev.result) != header_len + body_len ||
+        conn.response_read_deadline_post_commit_origin_received != body_len ||
+        conn.response_read_deadline_post_commit_send_body != body_len ||
+        conn.response_read_deadline_post_commit_downstream_submitted != body_len ||
+        conn.response_read_deadline_post_commit_downstream_completed != 0 ||
+        conn.response_read_deadline_post_commit_inflight_body != body_len ||
+        conn.resp_body_mode != BodyMode::ContentLength ||
+        conn.resp_body_sent != header_len + body_len || conn.resp_body_remaining != 0 ||
+        raw_header_end > 0xFFFFFFFFu - body_len ||
+        conn.upstream_send_len != raw_header_end + body_len ||
+        conn.upstream_recv_buf.len() != raw_header_end + body_len) {
+        loop->close_conn(conn);
+        return;
+    }
+
+    // The completion proves that the header and staged body both reached the
+    // client. Only now retire the original raw header+body prefix and let the
+    // existing post-batch pump perform normal origin/request completion.
+    conn.response_read_deadline_post_commit_downstream_completed = body_len;
+    conn.response_read_deadline_post_commit_inflight_body = 0;
+    if (consume_upstream_sent(conn) != 0 || conn.upstream_recv_buf.len() != 0) {
+        loop->close_conn(conn);
+        return;
+    }
+    conn.response_read_deadline_post_commit_phase =
+        ResponseReadDeadlinePostCommitPhase::WaitingBody;
+    if constexpr (requires(Loop* candidate, Connection& c) {
+                      candidate->defer_response_read_deadline_body_pump(c);
+                  }) {
+        loop->defer_response_read_deadline_body_pump(conn);
+    } else {
+        loop->close_conn(conn);
+    }
+}
+
+template <typename Loop>
 void pump_response_read_deadline_body(Loop* loop, Connection& conn) {
     if (!response_read_deadline_post_commit_is_stable(conn) ||
         conn.response_read_deadline_post_commit_phase !=
@@ -6777,6 +6837,44 @@ void pump_response_read_deadline_body(Loop* loop, Connection& conn) {
     }
     const u32 available = publish_body - completed;
     if (available == 0) {
+        const bool combined_send_marker =
+            conn.response_read_deadline_send_kind == ResponseReadDeadlineSendKind::Combined ||
+            conn.on_send == &on_complete_response_sent<Loop>;
+        const u32 combined_header_len = conn.response_header_buf.len();
+        const u32 combined_body_len = conn.response_read_deadline_post_commit_declared_body;
+        const bool combined_terminal_valid =
+            combined_body_len != 0 && combined_body_len <= 0xFFFFFFFFu - combined_header_len &&
+            complete_buffering && conn.state == ConnState::Sending && conn.req_start_us != 0 &&
+            !conn.epoch_held && conn.on_send == &on_complete_response_sent<Loop> &&
+            conn.response_read_deadline_send_kind == ResponseReadDeadlineSendKind::Combined &&
+            !conn.response_read_deadline_send_owner_active &&
+            conn.response_read_deadline_send_owner_generation != 0 &&
+            conn.response_read_deadline_send_tombstone_generation ==
+                conn.response_read_deadline_send_owner_generation &&
+            conn.response_read_deadline_send_deadline_generation ==
+                conn.response_read_deadline_post_commit_generation &&
+            conn.response_read_deadline_send_deadline_generation ==
+                conn.response_read_deadline_generation &&
+            conn.response_read_deadline_send_upstream_episode ==
+                conn.response_read_deadline_post_commit_episode &&
+            conn.response_read_deadline_post_commit_response_class ==
+                CompleteContentLengthResponseClass::BoundedPositiveBody &&
+            conn.response_read_deadline_post_commit_send_body == combined_body_len &&
+            conn.response_read_deadline_post_commit_origin_received == combined_body_len &&
+            conn.response_read_deadline_post_commit_downstream_submitted == combined_body_len &&
+            conn.response_read_deadline_post_commit_downstream_completed == combined_body_len &&
+            conn.response_read_deadline_post_commit_inflight_body == 0 &&
+            conn.response_read_deadline_post_commit_declared_body == combined_body_len &&
+            conn.response_read_deadline_send_src == conn.response_header_buf.data() &&
+            conn.response_read_deadline_send_len == combined_header_len + combined_body_len &&
+            conn.response_read_deadline_send_fd == conn.fd && conn.resp_body_remaining == 0 &&
+            conn.resp_body_sent == combined_header_len + combined_body_len &&
+            conn.upstream_send_len == 0 && conn.upstream_recv_buf.len() == 0 && !conn.send_armed &&
+            conn.send_progress == 0;
+        if (combined_send_marker && !combined_terminal_valid) {
+            loop->close_conn(conn);
+            return;
+        }
         if (complete_buffering && conn.response_read_deadline_post_commit_close_after_drain) {
             const ResponseReadDeadlineUploadProof close_proof = conn.response_read_deadline_upload;
             const bool explicit_close = close_proof.downstream_close;
@@ -6790,9 +6888,11 @@ void pump_response_read_deadline_body(Loop* loop, Connection& conn) {
                 !conn.response_read_deadline_send_owner_active && conn.send_progress == 0 &&
                 conn.resp_body_remaining == 0 &&
                 conn.resp_body_sent == conn.response_header_buf.len() + publish_body;
+            const bool combined_completion_valid = combined_terminal_valid;
             const bool completion_callback_valid =
-                publish_body == 0 ? conn.on_send == &on_response_header_sent<Loop>
-                                  : conn.on_send == &on_response_body_sent<Loop>;
+                publish_body == 0
+                    ? conn.on_send == &on_response_header_sent<Loop>
+                    : conn.on_send == &on_response_body_sent<Loop> || combined_completion_valid;
             const bool request_completion_owner_valid = conn.state == ConnState::Sending &&
                                                         completion_callback_valid &&
                                                         conn.req_start_us != 0 && !conn.epoch_held;
