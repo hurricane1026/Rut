@@ -31,9 +31,15 @@
 #include <algorithm>  // std::sort in the proxy latency bench
 #include <atomic>
 #include <memory>
+#include <string>
+#include <vector>
 
+#include <errno.h>
+#include <openssl/err.h>
 #include <openssl/ssl.h>
+#include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 
 namespace rut {
 
@@ -4943,9 +4949,49 @@ TEST(uring, malformed_response_read_timer_flags_fail_before_buffer_handling) {
             (static_cast<u32>(kBufId) << IORING_CQE_BUFFER_SHIFT),
     };
     for (const u32 flags : malformed_flags) {
-        IoUringBackend backend;
-        auto rc = backend.init(0, -1);
-        if (!rc) SKIP("io_uring unavailable");
+        // Feed a userspace ring snapshot to the real wait() path. A real init
+        // queues timerfd's initial read; wait() would submit it while harvesting
+        // this synthetic CQE, leaving an unrelated kernel operation at shutdown.
+        // The ready CQ, empty SQ, and disabled timer keep wait() away from
+        // io_uring_enter.
+        IoUringBackend backend{};
+        u32 sq_head = 0;
+        u32 sq_tail = 0;
+        u32 sq_flags = 0;
+        u32 sq_mask = 0;
+        u32 sq_array[1]{};
+        io_uring_sqe sqes[1]{};
+        u32 cq_head = 0;
+        u32 cq_tail = 0;
+        u32 cq_mask = 3;
+        io_uring_cqe cqes[4]{};
+        struct UserSpaceBufferRing {
+            io_uring_buf_ring ring{};
+            io_uring_buf entries[kProvidedBufCount]{};
+        } buf_ring_storage{};
+        static_assert(__builtin_offsetof(UserSpaceBufferRing, entries) ==
+                      sizeof(io_uring_buf_ring));
+        u8 buffer_storage[(kBufId + 1u) * kProvidedBufSize]{};
+
+        backend.ring_fd = -1;
+        backend.timer_fd = -1;
+        backend.timer_read_armed = false;
+        backend.pending = 0;
+        backend.sq_head = &sq_head;
+        backend.sq_tail = &sq_tail;
+        backend.sq_flags = &sq_flags;
+        backend.sq_ring_mask = &sq_mask;
+        backend.sq_array = sq_array;
+        backend.sq_entries = sqes;
+        backend.sq_ring_entries = 1;
+        backend.cq_head = &cq_head;
+        backend.cq_tail = &cq_tail;
+        backend.cq_ring_mask = &cq_mask;
+        backend.cq_entries = cqes;
+        backend.cq_ring_entries = 4;
+        backend.buf_ring = &buf_ring_storage.ring;
+        backend.buf_base = buffer_storage;
+        backend.buf_ring->tail = 23;
 
         TestConn tc;
         tc.init(0, -1);
@@ -4956,6 +5002,8 @@ TEST(uring, malformed_response_read_timer_flags_fail_before_buffer_handling) {
         __builtin_memset(upstream_storage, 0x5A, sizeof(upstream_storage));
         __builtin_memset(recv_expected, 0xA5, sizeof(recv_expected));
         __builtin_memset(upstream_expected, 0x5A, sizeof(upstream_expected));
+        u8 buffer_expected[4];
+        __builtin_memset(buffer_expected, 0xC3, sizeof(buffer_expected));
         tc.conn.upstream_recv_buf.bind(upstream_storage, sizeof(upstream_storage));
         __builtin_memset(backend.buf_base + static_cast<u64>(kBufId) * kProvidedBufSize, 0xC3, 4);
         const u16 buffer_tail_before = __atomic_load_n(&backend.buf_ring->tail, __ATOMIC_ACQUIRE);
@@ -4971,14 +5019,22 @@ TEST(uring, malformed_response_read_timer_flags_fail_before_buffer_handling) {
         CHECK_EQ(backend.wait(&event, 1, &tc.conn, 1), 0u);
         CHECK_EQ(backend.failure_code(), EPROTO);
         CHECK_EQ(__atomic_load_n(backend.cq_head, __ATOMIC_ACQUIRE), head_before);
+        CHECK_EQ(__atomic_load_n(backend.cq_tail, __ATOMIC_ACQUIRE), tail + 1u);
         CHECK_EQ(__atomic_load_n(&backend.buf_ring->tail, __ATOMIC_ACQUIRE), buffer_tail_before);
+        CHECK_EQ(sq_head, 0u);
+        CHECK_EQ(sq_tail, 0u);
+        CHECK_EQ(backend.pending, 0u);
+        CHECK(!backend.timer_read_armed);
+        CHECK_EQ(backend.ring_fd, -1);
+        CHECK_EQ(backend.timer_fd, -1);
         CHECK_EQ(tc.conn.recv_buf.len(), 0u);
         CHECK_EQ(tc.conn.upstream_recv_buf.len(), 0u);
         CHECK(__builtin_memcmp(tc.recv_storage, recv_expected, sizeof(recv_expected)) == 0);
         CHECK(__builtin_memcmp(upstream_storage, upstream_expected, sizeof(upstream_expected)) ==
               0);
-
-        backend.shutdown();
+        CHECK(__builtin_memcmp(backend.buf_base + static_cast<u64>(kBufId) * kProvidedBufSize,
+                               buffer_expected,
+                               sizeof(buffer_expected)) == 0);
     }
 }
 
@@ -5102,6 +5158,21 @@ TEST(uring, pause_upstream_recv_cancels_recv_spares_send) {
     IoUringBackend backend;
     auto init_rc = backend.init(0, -1);
     if (!init_rc) {
+        const Error& init_error = init_rc.error();
+        const char* source_name = init_error.source == Error::Source::IoUring   ? "IoUring"
+                                  : init_error.source == Error::Source::Mmap    ? "Mmap"
+                                  : init_error.source == Error::Source::Timerfd ? "Timerfd"
+                                                                                : "other";
+        fprintf(stderr,
+                "[pause_upstream_recv_cancels_recv_spares_send] init failed: "
+                "source=%s(%u) code/errno=%d (%s) ring_fd=%d timer_fd=%d capacity=%u\n",
+                source_name,
+                static_cast<unsigned>(init_error.source),
+                init_error.code,
+                strerror(init_error.code),
+                backend.ring_fd,
+                backend.timer_fd,
+                backend.connection_capacity);
         close(fds[0]);
         close(fds[1]);
         SKIP("io_uring init failed");
@@ -7657,108 +7728,137 @@ struct ScopedWatermarkTestResources {
 };
 }  // namespace
 
-TEST(tls_iouring, exact_local_response_normalized_fragmented_and_sequential) {
-    if (!iouring_socket_live()) SKIP("io_uring async socket ops unavailable");
-    for (const u32 body_len : {1024u, 4096u}) {
-        auto config = std::make_unique<RouteConfig>();
-        char body[4096];
-        memset(body, 'x', body_len);
-        StrictLocalResponsePolicySpec policy{};
-        policy.version = StrictLocalResponseVersion::Http11;
-        policy.status_code = 200;
-        policy.date = StrictLocalResponseDate::Current;
-        policy.connection = StrictLocalResponseConnection::Request;
-        policy.head_mode = StrictLocalResponseHeadMode::SuppressBody;
-        policy.reason = lit_str("OK");
-        policy.content_type = lit_str("text/plain");
-        policy.server = lit_str("rut");
-        policy.body = {body, body_len};
-        const u16 id = config->add_strict_local_response_policy(policy);
-        REQUIRE(id != 0);
-        ExactStrictLocalResponseBinding binding{};
-        memcpy(binding.path, "/assets/static", 14);
-        binding.path_len = 14;
-        binding.path_view = ExactPathView::SlashNormalized;
-        binding.method = kRouteMethodAny;
-        binding.policy_id = id;
-        REQUIRE(config->append_exact_strict_local_response_binding(binding, id));
-        REQUIRE(config->strict_local_response_table_is_valid());
-        const RouteConfig* active = config.get();
-        Shard<IoUringEventLoop> shard;
-        ScopedWatermarkTestResources resources;
-        resources.shard = &shard;
-        auto tls = create_tls_server_context(kTestCertPath, kTestKeyPath);
-        REQUIRE(tls.has_value());
-        resources.tls_server_ctx = tls.value();
-        resources.listen_fd = create_listen_socket(0).value_or(-1);
-        REQUIRE(resources.listen_fd >= 0);
-        const u16 port = get_port(resources.listen_fd);
-        auto initialized = shard.init(0, resources.listen_fd);
-        resources.shard_initialized = initialized.has_value();
-        REQUIRE(initialized.has_value());
-        shard.loop->tls_server = tls.value();
-        shard.loop->config_ptr = &active;
-        REQUIRE(shard.spawn(-1).has_value());
-        resources.client_ctx = create_test_client_ctx();
-        REQUIRE(resources.client_ctx != nullptr);
-        resources.client_fd = connect_to(port);
-        REQUIRE(resources.client_fd >= 0);
-        set_socket_timeouts(resources.client_fd, 3);
-        resources.client_ssl = SSL_new(resources.client_ctx);
-        REQUIRE(resources.client_ssl != nullptr);
-        REQUIRE_EQ(SSL_set_fd(resources.client_ssl, resources.client_fd), 1);
-        REQUIRE_EQ(SSL_connect(resources.client_ssl), 1);
-        char expected_content_length[64];
-        const int content_length_len = snprintf(expected_content_length,
-                                                sizeof(expected_content_length),
-                                                "Content-Length: %u\r\n",
-                                                body_len);
-        REQUIRE_GT(content_length_len, 0);
-        REQUIRE_LT(static_cast<u32>(content_length_len), sizeof(expected_content_length));
-
-        for (u32 request = 0; request < 3; ++request) {
-            const char* wire =
-                request == 2
-                    ? "GET /assets//static HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n"
-                : request == 1 ? "HEAD /assets//static HTTP/1.1\r\nHost: x\r\n\r\n"
-                               : "GET /assets//static HTTP/1.1\r\nHost: x\r\n\r\n";
-            REQUIRE(ssl_write_all(resources.client_ssl, wire, 12));
-            usleep(1000);
-            REQUIRE(ssl_write_all(
-                resources.client_ssl, wire + 12, static_cast<u32>(strlen(wire)) - 12));
-            const u32 expected_body = request == 1 ? 0u : body_len;
-            char received[8192]{};
-            u32 total = 0;
-            char* end = nullptr;
-            while (total < sizeof(received) - 1) {
-                const int count = SSL_read(resources.client_ssl,
-                                           received + total,
-                                           static_cast<int>(sizeof(received) - 1 - total));
-                // A worker wakeup can interrupt the blocking BIO read. Retry the
-                // identical SSL operation only for EINTR; socket timeouts still fail.
-                if (count <= 0 && errno == EINTR &&
-                    SSL_get_error(resources.client_ssl, count) == SSL_ERROR_WANT_READ)
-                    continue;
-                REQUIRE(count > 0);
-                total += static_cast<u32>(count);
-                end = strstr(received, "\r\n\r\n");
-                if (end != nullptr && total >= static_cast<u32>(end + 4 - received) + expected_body)
-                    break;
-            }
-            REQUIRE(end != nullptr);
-            CHECK_EQ(memcmp(received, "HTTP/1.1 200 OK\r\n", 17), 0);
-            CHECK(strstr(received, expected_content_length) != nullptr);
-            CHECK_EQ(total, static_cast<u32>(end + 4 - received) + expected_body);
-            CHECK_EQ(memcmp(end + 4, body, expected_body), 0);
-        }
-        char extra;
-        int closed;
-        do {
-            closed = SSL_read(resources.client_ssl, &extra, 1);
-        } while (closed < 0 && errno == EINTR &&
-                 SSL_get_error(resources.client_ssl, closed) == SSL_ERROR_WANT_READ);
-        CHECK_EQ(closed, 0);
+static void run_tls_iouring_exact_local_response_body(u32 body_size, rut::test::TestCase* _tc) {
+    auto config = std::make_unique<RouteConfig>();
+    std::vector<char> body(body_size, 'x');
+    StrictLocalResponsePolicySpec policy{};
+    policy.version = StrictLocalResponseVersion::Http11;
+    policy.status_code = 200;
+    policy.date = StrictLocalResponseDate::Current;
+    policy.connection = StrictLocalResponseConnection::Request;
+    policy.head_mode = StrictLocalResponseHeadMode::SuppressBody;
+    policy.reason = lit_str("OK");
+    policy.content_type = lit_str("text/plain");
+    policy.server = lit_str("rut");
+    policy.body = {body.data(), body_size};
+    const u16 id = config->add_strict_local_response_policy(policy);
+    REQUIRE(id != 0);
+    ExactStrictLocalResponseBinding binding{};
+    memcpy(binding.path, "/assets/static", 14);
+    binding.path_len = 14;
+    binding.path_view = ExactPathView::SlashNormalized;
+    binding.method = kRouteMethodAny;
+    binding.policy_id = id;
+    REQUIRE(config->append_exact_strict_local_response_binding(binding, id));
+    REQUIRE(config->strict_local_response_table_is_valid());
+    const RouteConfig* active = config.get();
+    Shard<IoUringEventLoop> shard;
+    ScopedWatermarkTestResources resources;
+    resources.shard = &shard;
+    auto tls = create_tls_server_context(kTestCertPath, kTestKeyPath);
+    REQUIRE(tls.has_value());
+    resources.tls_server_ctx = tls.value();
+    resources.listen_fd = create_listen_socket(0).value_or(-1);
+    REQUIRE(resources.listen_fd >= 0);
+    const u16 port = get_port(resources.listen_fd);
+    auto initialized = shard.init(0, resources.listen_fd);
+    resources.shard_initialized = initialized.has_value();
+    REQUIRE(initialized.has_value());
+    shard.loop->tls_server = tls.value();
+    shard.loop->config_ptr = &active;
+    REQUIRE(shard.spawn(-1).has_value());
+    resources.client_ctx = create_test_client_ctx();
+    REQUIRE(resources.client_ctx != nullptr);
+    resources.client_fd = connect_to(port);
+    REQUIRE(resources.client_fd >= 0);
+    set_socket_timeouts(resources.client_fd, 3);
+    resources.client_ssl = SSL_new(resources.client_ctx);
+    REQUIRE(resources.client_ssl != nullptr);
+    REQUIRE_EQ(SSL_set_fd(resources.client_ssl, resources.client_fd), 1);
+    ERR_clear_error();
+    errno = 0;
+    const int ssl_connect_result = SSL_connect(resources.client_ssl);
+    const int ssl_connect_errno = errno;
+    const int ssl_connect_error = ssl_connect_result == 1
+                                      ? SSL_ERROR_NONE
+                                      : SSL_get_error(resources.client_ssl, ssl_connect_result);
+    if (ssl_connect_result != 1) {
+        const uint32_t queued_error = ERR_peek_error();
+        char error_text[256] = "none";
+        if (queued_error != 0) ERR_error_string_n(queued_error, error_text, sizeof(error_text));
+        const char* const ssl_state = SSL_state_string_long(resources.client_ssl);
+        fprintf(stderr,
+                "[tls-local-response] handshake failed body=%u port=%u result=%d ssl_error=%d "
+                "errno=%d (%s) state=%s error_queue=%u (%s)\n",
+                body_size,
+                port,
+                ssl_connect_result,
+                ssl_connect_error,
+                ssl_connect_errno,
+                strerror(ssl_connect_errno),
+                ssl_state != nullptr ? ssl_state : "<unknown>",
+                queued_error,
+                error_text);
     }
+    REQUIRE_EQ(ssl_connect_result, 1);
+    const std::string content_length = "Content-Length: " + std::to_string(body_size) + "\r\n";
+    for (u32 request = 0; request < 4; ++request) {
+        const char* wire =
+            request == 3   ? "GET /assets//static HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n"
+            : request == 1 ? "HEAD /assets//static HTTP/1.1\r\nHost: x\r\n\r\n"
+                           : "GET /assets//static HTTP/1.1\r\nHost: x\r\n\r\n";
+        REQUIRE(ssl_write_all(resources.client_ssl, wire, 12));
+        usleep(1000);
+        REQUIRE(
+            ssl_write_all(resources.client_ssl, wire + 12, static_cast<u32>(strlen(wire)) - 12));
+        const u32 expected_body = request == 1 ? 0u : body_size;
+        std::vector<char> received(body_size + 512u, '\0');
+        u32 total = 0;
+        char* end = nullptr;
+        while (total < received.size() - 1u) {
+            const int count = SSL_read(resources.client_ssl,
+                                       received.data() + total,
+                                       static_cast<int>(received.size() - 1u - total));
+            // A worker wakeup can interrupt the blocking BIO read. Retry the
+            // identical SSL operation only for EINTR; socket timeouts still fail.
+            if (count <= 0 && errno == EINTR &&
+                SSL_get_error(resources.client_ssl, count) == SSL_ERROR_WANT_READ)
+                continue;
+            REQUIRE(count > 0);
+            total += static_cast<u32>(count);
+            end = strstr(received.data(), "\r\n\r\n");
+            if (end != nullptr &&
+                total >= static_cast<u32>(end + 4 - received.data()) + expected_body)
+                break;
+        }
+        REQUIRE(end != nullptr);
+        CHECK_EQ(memcmp(received.data(), "HTTP/1.1 200 OK\r\n", 17), 0);
+        CHECK(strstr(received.data(), content_length.c_str()) != nullptr);
+        CHECK_EQ(total, static_cast<u32>(end + 4 - received.data()) + expected_body);
+        CHECK_EQ(memcmp(end + 4, body.data(), expected_body), 0);
+    }
+    char extra;
+    int closed;
+    do {
+        closed = SSL_read(resources.client_ssl, &extra, 1);
+    } while (closed < 0 && errno == EINTR &&
+             SSL_get_error(resources.client_ssl, closed) == SSL_ERROR_WANT_READ);
+    CHECK_EQ(closed, 0);
+}
+
+TEST(tls_iouring, exact_local_response_1024_normalized_fragmented_and_sequential) {
+    if (!iouring_socket_live()) SKIP("io_uring async socket ops unavailable");
+    run_tls_iouring_exact_local_response_body(1024u, _tc);
+}
+
+TEST(tls_iouring, exact_local_response_4093_normalized_fragmented_and_sequential) {
+    if (!iouring_socket_live()) SKIP("io_uring async socket ops unavailable");
+    run_tls_iouring_exact_local_response_body(4093u, _tc);
+}
+
+TEST(tls_iouring, native_exact_local_response_4096_remains_supported) {
+    if (!iouring_socket_live()) SKIP("io_uring async socket ops unavailable");
+    run_tls_iouring_exact_local_response_body(4096u, _tc);
 }
 
 TEST(proxy_tls_iouring, watermark_observer_guard_scopes_callbacks_and_cleanup) {

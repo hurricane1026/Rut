@@ -13,13 +13,13 @@ struct RutSource {
     // The root model emits three method-keyed routes plus three bounded
     // unmatched policies and one bounded exact action. Every accepted root
     // model additionally emits the implicit pre-route TRACE policy. The
-    // accepted terminal shape is the exact-loopback root proxy with maximum
-    // listen/upstream values, explicit `proxy_read_timeout 63s`, and an exact
-    // 301 composition. It measures 8749 payload bytes; the final NUL therefore
-    // requires kCapacity == 8750. Other accepted local-return, no-content, and
-    // transformed-location shapes are smaller non-terminal subshapes. Writer
-    // completion remains strict (`len < kCapacity`).
-    static constexpr u32 kCapacity = 8750;
+    // largest previously measured shape is the exact-loopback root proxy with
+    // maximum listen/upstream values, explicit `proxy_read_timeout 63s`, and an
+    // exact 301 composition: 8749 payload bytes. One local-return literal can
+    // add at most 4093 - 64 bytes over that prior bound, so this conservative
+    // capacity includes that growth and the terminal NUL. Writer completion
+    // remains strict (`len < kCapacity`).
+    static constexpr u32 kCapacity = 12779;
     char data[kCapacity]{};
     u32 len = 0;
 
@@ -28,11 +28,13 @@ struct RutSource {
 
 // Owned output for the bounded request-length http profile. The accessLog
 // declaration contributes at most 329 bytes (19-byte prefix, 255-byte path,
-// 55-byte suffix). With the terminal Server shape this gives 9078 payload
-// bytes; one final NUL therefore requires kCapacity == 9079.
+// 55-byte suffix), so the conservative output capacity is
+// RutSource::kCapacity + 329 == 13108 bytes. The earlier 9078-byte
+// terminal-Server payload estimate does not prove this wrapper's capacity;
+// writers still reserve the final NUL.
 struct HttpProfileRutSource {
     static constexpr u32 kMaxAccessLogDeclarationLen = 329u;
-    static constexpr u32 kCapacity = 9079u;
+    static constexpr u32 kCapacity = 13108u;
     char data[kCapacity]{};
     u32 len = 0;
 
