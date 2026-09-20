@@ -2,6 +2,7 @@
 
 #include "rut/common/request_policy.h"
 #include "rut/runtime/connection.h"
+#include "rut/runtime/connection_capacity.h"
 #include "rut/runtime/http_parser.h"
 #include "rut/runtime/route_table.h"
 
@@ -1548,9 +1549,9 @@ inline bool http1_pipeline_request_generation_connected_is_stable(
                   }) {
         return false;
     } else {
-        if (loop == nullptr || expected_upstream_connect == nullptr || c.id >= Loop::kMaxConns ||
-            &loop->conns[c.id] != &c || c.fd < 0 || c.req_start_us == 0 ||
-            c.state != ConnState::Proxying || c.upstream_fd < 0 ||
+        if (loop == nullptr || expected_upstream_connect == nullptr ||
+            c.id >= connection_capacity_of(*loop) || &loop->conns[c.id] != &c || c.fd < 0 ||
+            c.req_start_us == 0 || c.state != ConnState::Proxying || c.upstream_fd < 0 ||
             c.on_upstream_send != expected_upstream_connect || c.on_upstream_recv != nullptr ||
             c.on_recv != nullptr || c.on_send != nullptr || c.upstream_connect_armed ||
             c.upstream_send_armed || c.upstream_recv_armed || c.upstream_slot_held ||

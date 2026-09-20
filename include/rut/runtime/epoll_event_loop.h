@@ -6,6 +6,7 @@
 #include "rut/runtime/access_log_live_producer.h"
 #include "rut/runtime/callbacks.h"
 #include "rut/runtime/connection.h"
+#include "rut/runtime/connection_capacity.h"
 #include "rut/runtime/drain.h"
 #include "rut/runtime/epoll_backend.h"
 #include "rut/runtime/error.h"
@@ -14,6 +15,7 @@
 #include "rut/runtime/io_backend.h"
 #include "rut/runtime/io_event.h"
 #include "rut/runtime/jit_dispatch.h"
+#include "rut/runtime/mapped_array.h"
 #include "rut/runtime/metrics.h"
 #include "rut/runtime/rate_limit.h"
 #include "rut/runtime/shard_control.h"
@@ -37,7 +39,7 @@ namespace epoll_yield {
 
 // Shared max-conn constant: both YieldHeap and EpollEventLoop derive
 // their sizes from this single source so they can't drift.
-static constexpr u32 kMaxConns = 16384;
+static constexpr u32 kMaxConns = kDefaultConnectionCapacity;
 
 inline u64 monotonic_ns() {
     struct timespec ts;
@@ -65,16 +67,37 @@ struct YieldHeap {
     // entries that linger briefly between close and their deadline.
     // Derived from the shared epoll_yield::kMaxConns so the heap and
     // EpollEventLoop always agree on capacity.
-    static constexpr u32 kCap = kMaxConns + 256;
-    Entry entries[kCap];
+    static constexpr u32 kCap = kMaxConns + 256;  // default compatibility bound
+    MappedArray<Entry> entries;
+    u32 capacity = 0;
     u32 size = 0;
+
+    core::Expected<void, Error> init(u32 connection_count) {
+        if (!validate_connection_capacity(connection_count))
+            return core::make_unexpected(Error::make(EINVAL, Error::Source::Mmap));
+        if (capacity != 0)
+            return capacity == connection_count
+                       ? core::Expected<void, Error>{}
+                       : core::make_unexpected(Error::make(EINVAL, Error::Source::Mmap));
+        auto result = entries.init(connection_count + 256);
+        if (!result) return core::make_unexpected(result.error());
+        capacity = connection_count;
+        size = 0;
+        return {};
+    }
+
+    void destroy() {
+        size = 0;
+        capacity = 0;
+        entries.destroy();
+    }
 
     void clear() { size = 0; }
     bool empty() const { return size == 0; }
     const Entry& top() const { return entries[0]; }
 
     bool push(u64 deadline_ns, u32 handler_gen, u32 conn_id) {
-        if (size >= kCap) return false;
+        if (capacity == 0 || size >= capacity + 256) return false;
         u32 i = size++;
         entries[i] = {deadline_ns, handler_gen, conn_id};
         sift_up(i);
@@ -185,7 +208,8 @@ private:
     bool health_sweep_after_batch_ = false;
 
 public:
-    static constexpr u32 kMaxConns = epoll_yield::kMaxConns;
+    static constexpr u32 kMaxConns = kDefaultConnectionCapacity;
+    u32 connection_capacity = 0;
     static constexpr u32 kDefaultKeepaliveTimeout = 60;
     // Deadline (seconds; coarse 1s timer-wheel resolution) for a connection in
     // the Proxying state. SCOPE: the post-connect phase only — from the upstream
@@ -208,9 +232,9 @@ public:
     // upgrades to h2. Bounded; over-cap upgrades fall back to closing the conn.
     static constexpr u32 kH2PoolCap = 2048;
     SlabPool<Http2Conn, kH2PoolCap> h2_pool;
-    Connection conns[kMaxConns];
-    u32 free_stack[kMaxConns];
-    u32 free_top;
+    MappedArray<Connection> conns;
+    MappedArray<u32> free_stack;
+    u32 free_top = 0;
 
     u32 keepalive_timeout = kDefaultKeepaliveTimeout;
     u32 upstream_timeout = kDefaultUpstreamTimeout;
@@ -228,12 +252,64 @@ public:
     static constexpr u32 kCaptureSliceSize = 8192;
     u8* capture_region_ = nullptr;
 
+    core::Expected<void, Error> init_slot_storage(u32 capacity, u32 id = 0) {
+        if (!validate_connection_capacity(capacity))
+            return core::make_unexpected(Error::make(EINVAL, Error::Source::Mmap));
+        if (connection_capacity != 0)
+            return connection_capacity == capacity
+                       ? core::Expected<void, Error>{}
+                       : core::make_unexpected(Error::make(EINVAL, Error::Source::Mmap));
+        auto c = conns.init(capacity);
+        if (!c) return core::make_unexpected(c.error());
+        auto f = free_stack.init(capacity);
+        if (!f) {
+            conns.destroy();
+            return core::make_unexpected(f.error());
+        }
+        auto y = yield_heap.init(capacity);
+        if (!y) {
+            free_stack.destroy();
+            conns.destroy();
+            return core::make_unexpected(y.error());
+        }
+        auto b = backend.init_state_storage(capacity);
+        if (!b) {
+            yield_heap.destroy();
+            free_stack.destroy();
+            conns.destroy();
+            return core::make_unexpected(b.error());
+        }
+        for (u32 i = 0; i < capacity; i++) {
+            conns[i].reset();
+            conns[i].id = i;
+            conns[i].shard_id = static_cast<u8>(id);
+            free_stack[i] = i;
+        }
+        free_top = capacity;
+        connection_capacity = capacity;
+        return {};
+    }
+
+    void destroy_slot_storage() {
+        connection_capacity = 0;
+        free_top = 0;
+        backend.destroy_state_storage();
+        yield_heap.destroy();
+        free_stack.destroy();
+        conns.destroy();
+    }
+
     bool set_capture(CaptureRing* ring) {
         capture_ring = ring;
         if (!ring) return true;
+        if (connection_capacity == 0 || static_cast<u64>(connection_capacity) >
+                                            static_cast<u64>(SIZE_MAX) / kCaptureSliceSize) {
+            capture_ring = nullptr;
+            return false;
+        }
         if (!capture_region_) {
             void* region = mmap(nullptr,
-                                static_cast<u64>(kMaxConns) * kCaptureSliceSize,
+                                static_cast<size_t>(connection_capacity) * kCaptureSliceSize,
                                 PROT_READ | PROT_WRITE,
                                 MAP_PRIVATE | MAP_ANONYMOUS,
                                 -1,
@@ -244,7 +320,7 @@ public:
             }
             capture_region_ = static_cast<u8*>(region);
         }
-        for (u32 i = 0; i < kMaxConns; i++) {
+        for (u32 i = 0; i < connection_capacity; i++) {
             if (conns[i].fd >= 0 && !conns[i].capture_buf)
                 conns[i].capture_buf = capture_region_ + static_cast<u64>(i) * kCaptureSliceSize;
         }
@@ -265,7 +341,14 @@ public:
     ShardEpoch* epoch = nullptr;
     void** jit_code_ptr = nullptr;
 
-    core::Expected<void, Error> init(u32 id, i32 lfd, u32 pool_prealloc = 0) {
+    core::Expected<void, Error> init(u32 id,
+                                     i32 lfd,
+                                     u32 pool_prealloc = 0,
+                                     u32 capacity = kDefaultConnectionCapacity) {
+        if (connection_capacity != 0)
+            return core::make_unexpected(Error::make(EINVAL, Error::Source::Mmap));
+        auto slots = init_slot_storage(capacity, id);
+        if (!slots) return core::make_unexpected(slots.error());
         shard_id = id;
         listen_fd = lfd;
         this->listener_context = {};
@@ -282,27 +365,28 @@ public:
         control = nullptr;
         epoch = nullptr;
         jit_code_ptr = nullptr;
-        free_top = kMaxConns;
         timer.init();
-        for (u32 i = 0; i < kMaxConns; i++) {
-            conns[i].reset();
-            conns[i].id = i;
-            conns[i].shard_id = static_cast<u8>(id);
-            free_stack[i] = i;
-        }
         // Up to 5 slices per connection (all lazy, VA-reserved): recv + send +
         // upstream_recv, plus the two WebSocket terminate-mode reassembly slices. Matches
         // the io_uring loop so a terminate tunnel can't fail to arm under load.
-        TRY_VOID(pool.init(kMaxConns * 6, pool_prealloc));
+        auto pooled = pool.init(connection_capacity * 6, pool_prealloc);
+        if (!pooled) {
+            backend.shutdown();
+            destroy_slot_storage();
+            return core::make_unexpected(pooled.error());
+        }
         auto h2p = h2_pool.init();
         if (!h2p) {
             pool.destroy();
+            backend.shutdown();
+            destroy_slot_storage();
             return core::make_unexpected(h2p.error());
         }
-        auto be = backend.init(id, lfd);
+        auto be = backend.init(id, lfd, connection_capacity);
         if (!be) {
             h2_pool.destroy();
             pool.destroy();
+            destroy_slot_storage();
             return core::make_unexpected(be.error());
         }
         return {};
@@ -320,7 +404,7 @@ public:
         IoEvent events[kMaxEventsPerWait];
 
         while (is_running()) {
-            u32 n = backend.wait(events, kMaxEventsPerWait, conns, kMaxConns);
+            u32 n = backend.wait(events, kMaxEventsPerWait, conns, connection_capacity);
             dispatch_batch(events, n);
             poll_command();
             // poll_command may have installed a new config (hot reload); re-arm
@@ -395,9 +479,10 @@ public:
         h2_pool.destroy();
         pool.destroy();
         if (capture_region_) {
-            munmap(capture_region_, static_cast<u64>(kMaxConns) * kCaptureSliceSize);
+            munmap(capture_region_, static_cast<u64>(connection_capacity) * kCaptureSliceSize);
             capture_region_ = nullptr;
         }
+        destroy_slot_storage();
     }
 
     void drain(u32 period_secs) {
@@ -421,7 +506,7 @@ public:
         }
     }
 
-    u32 active_count() const { return kMaxConns - free_top; }
+    u32 active_count() const { return connection_capacity - free_top; }
 
     // Allocatable Connection slots remaining. Used by start_health_probe to
     // keep a reserve for real client accepts (epoll frees slots synchronously,
@@ -433,7 +518,7 @@ public:
     // never pay the cost. Returns false if SlicePool is exhausted.
     // Clear upstream fd mapping (call when upstream_fd is closed on keep-alive).
     void clear_upstream_fd(u32 conn_id) {
-        if (conn_id < EpollBackend::kMaxFdMap) backend.upstream_fd_map[conn_id] = -1;
+        if (conn_id < connection_capacity) backend.upstream_fd_map[conn_id] = -1;
     }
 
     // Epoll-owned upstream episode lifecycle boundary used by connect, reuse,
@@ -481,7 +566,7 @@ public:
             return false;
         }
         c.upstream_fd = fd;
-        if (c.id < EpollBackend::kMaxFdMap) backend.upstream_fd_map[c.id] = fd;
+        if (c.id < connection_capacity) backend.upstream_fd_map[c.id] = fd;
         return true;
     }
 
@@ -509,7 +594,7 @@ public:
     // in-flight send is an SQE that pins pending_synth via h2_proxy_synth_quarantined
     // until the CQE drains, so this method is epoll-only (reached via requires-guard).
     void discard_upstream_send(Connection& c) {
-        if (c.id < EpollBackend::kMaxFdMap)
+        if (c.id < connection_capacity)
             backend.upstream_send_state[c.id] = {
                 nullptr, -1, 0, 0, IoEventType::UpstreamSend, false, 0, 0};
     }
@@ -648,7 +733,7 @@ public:
     // the fd-map + send-state bookkeeping, and returns the slot to the free list.
     void free_health_probe(Connection& c) {
         (void)backend.detach_upstream(c);
-        if (c.id < EpollBackend::kMaxFdMap) {
+        if (c.id < connection_capacity) {
             backend.downstream_fd_map[c.id] = -1;
         }
         this->free_conn(c);  // timer.remove + free slices + return slot (no metrics)
@@ -695,7 +780,7 @@ public:
         }
         (void)backend.detach_upstream(c);
         // Clear downstream fd map to prevent stale fd matching after reuse.
-        if (c.id < EpollBackend::kMaxFdMap) backend.downstream_fd_map[c.id] = -1;
+        if (c.id < connection_capacity) backend.downstream_fd_map[c.id] = -1;
         // Drop any in-flight partial-send bookkeeping so a reused conn_id+fd
         // cannot resurrect a stale send (see EpollBackend::clear_send_state).
         backend.clear_send_state(c.id);
@@ -804,7 +889,7 @@ public:
         while (!yield_heap.empty() && yield_heap.top().deadline_ns <= now) {
             auto entry = yield_heap.top();
             yield_heap.pop();
-            if (entry.conn_id >= kMaxConns) continue;
+            if (entry.conn_id >= connection_capacity) continue;
             auto& c = conns[entry.conn_id];
             if (c.handler_gen != entry.handler_gen) continue;  // stale
             if (c.throttle_paused) {
@@ -851,7 +936,7 @@ public:
         // dispatch_event() fence remains as defense in depth for callers that
         // route directly through it.
         if (io_event_is_upstream(ev.type) &&
-            (ev.conn_id >= kMaxConns || !valid_upstream_episode(ev.upstream_episode) ||
+            (ev.conn_id >= connection_capacity || !valid_upstream_episode(ev.upstream_episode) ||
              conns[ev.conn_id].upstream_episode != ev.upstream_episode ||
              backend.active_upstream_episode[ev.conn_id] != ev.upstream_episode))
             return;
@@ -951,7 +1036,7 @@ public:
                     u64 start = drain_start_.load(std::memory_order_relaxed);
                     u32 period = drain_period_.load(std::memory_order_relaxed);
                     u64 now = monotonic_secs();
-                    for (u32 i = 0; i < kMaxConns; i++) {
+                    for (u32 i = 0; i < connection_capacity; i++) {
                         if (conns[i].fd >= 0 && conns[i].state == ConnState::ReadingHeader &&
                             should_drain_close(i, start, now, period)) {
                             this->close_conn(conns[i]);
@@ -965,7 +1050,7 @@ public:
             case IoEventType::UpstreamConnect:
             case IoEventType::UpstreamRecv:
             case IoEventType::UpstreamSend:
-                if (ev.conn_id < kMaxConns) {
+                if (ev.conn_id < connection_capacity) {
                     auto& conn = conns[ev.conn_id];
                     if (conn.on_recv || conn.on_send || conn.on_upstream_recv ||
                         conn.on_upstream_send) {
@@ -1065,7 +1150,7 @@ private:
 
 public:
     void force_close_all() {
-        for (u32 i = 0; i < kMaxConns; i++) {
+        for (u32 i = 0; i < connection_capacity; i++) {
             // A health probe deliberately has fd == -1 with upstream_fd >= 0 (no
             // downstream socket), so the fd >= 0 guard alone would leak its
             // upstream socket + slot when graceful drain hits its deadline mid-

@@ -27743,6 +27743,7 @@ struct StagedLocalSendFixture {
                             0);
         if (loop_storage == MAP_FAILED) return false;
         loop = new (loop_storage) IoUringEventLoop();
+        if (!loop->init_slot_storage(1).has_value()) return false;
         loop->backend.sq_head = &sq_head;
         loop->backend.sq_tail = &sq_tail;
         loop->backend.sq_ring_mask = &sq_mask;
@@ -63101,6 +63102,155 @@ TEST(response_read_deadline, http_date_normalization_accepts_only_imf_fixdate_sh
         Str{kBadDigit, static_cast<u32>(sizeof(kBadDigit) - 1u)}));
     CHECK_FALSE(response_read_deadline_http_date_is_normalized(
         Str{kShort, static_cast<u32>(sizeof(kShort) - 1u)}));
+}
+
+TEST(connection_capacity, runtime_storage_bounds_and_backend_guards) {
+    static_assert(kDefaultConnectionCapacity == 16384);
+    static_assert(kMaxConnectionCapacity == 0xFFFFFD);
+    CHECK_FALSE(validate_connection_capacity(0));
+    CHECK(validate_connection_capacity(1));
+    CHECK(validate_connection_capacity(32768));
+    CHECK(validate_connection_capacity(kMaxConnectionCapacity));
+    CHECK_FALSE(validate_connection_capacity(kMaxConnectionCapacity + 1u));
+
+    MappedArray<u32> storage;
+    CHECK_FALSE(storage.initialized());
+    CHECK_FALSE(storage.init(0).has_value());
+    REQUIRE(storage.init(32768).has_value());
+    CHECK_EQ(storage.size(), 32768u);
+    storage[32767] = 0x12345678u;
+    CHECK_EQ(storage[32767], 0x12345678u);
+    REQUIRE(storage.init(32768).has_value());      // same-size init is idempotent
+    CHECK_FALSE(storage.init(32767).has_value());  // resize requires destroy
+    storage.destroy();
+    storage.destroy();
+    CHECK_FALSE(storage.initialized());
+
+    // The legacy template loop, both concrete loops, and backend-owned
+    // per-connection tables all allocate the requested capacity rather than
+    // falling back to the 16k compatibility constant.
+    {
+        EventLoop<MockBackend> legacy;
+        REQUIRE(legacy.init(0, -1, 0, 32768).has_value());
+        CHECK_EQ(legacy.connection_capacity, 32768u);
+        CHECK_EQ(legacy.conns.size(), 32768u);
+        CHECK_EQ(legacy.conns[32767].id, 32767u);
+        CHECK_EQ(legacy.free_top, 32768u);
+        legacy.shutdown();
+    }
+    {
+        IoUringEventLoop iouring;
+        REQUIRE(iouring.init_slot_storage(32768).has_value());
+        REQUIRE(iouring.pool.init(32768u * 6u, 0).has_value());
+        CHECK_EQ(iouring.connection_capacity, 32768u);
+        CHECK_EQ(iouring.backend.send_state.size(), 32768u);
+        CHECK_EQ(iouring.backend.upstream_send_state.size(), 32768u);
+        CHECK_EQ(iouring.conns[32767].fd, -1);
+        Connection* high = iouring.alloc_conn();
+        REQUIRE(high != nullptr);
+        CHECK_EQ(high->id, 32767u);
+        CHECK_EQ(high->fd, -1);
+        const u32 high_id = high->id;
+        iouring.free_conn(*high);
+        Connection* reused = iouring.alloc_conn();
+        REQUIRE(reused != nullptr);
+        CHECK_EQ(reused->id, high_id);
+        u32 sq_head = 0;
+        u32 sq_tail = 0;
+        u32 sq_mask = 3;
+        u32 sq_array[4]{};
+        io_uring_sqe sq_entries[4]{};
+        iouring.backend.sq_head = &sq_head;
+        iouring.backend.sq_tail = &sq_tail;
+        iouring.backend.sq_ring_mask = &sq_mask;
+        iouring.backend.sq_array = sq_array;
+        iouring.backend.sq_entries = sq_entries;
+        iouring.backend.sq_ring_entries = 4;
+        static constexpr u8 kPayload[] = {'x'};
+        CHECK(iouring.backend.add_send(-1, high_id, kPayload, sizeof(kPayload)));
+        CHECK_EQ(sq_tail, 1u);
+        CHECK_EQ(iouring.backend.send_state[high_id].remaining, 1u);
+        u32 submitted_id = 0;
+        IoEventType submitted_type = IoEventType::Count;
+        IoUringBackend::decode_user_data(sq_entries[0].user_data, submitted_id, submitted_type);
+        CHECK_EQ(submitted_id, high_id);
+        CHECK_EQ(submitted_type, IoEventType::Send);
+        iouring.backend.send_state[high_id] = {nullptr, -1, 0, 0, IoEventType::Send, 0, 0};
+        iouring.backend.pending = 0;
+        iouring.free_conn(*reused);
+        const u32 old_pending = iouring.backend.pending;
+        CHECK_FALSE(iouring.backend.add_recv(-1, 32768));
+        CHECK_FALSE(iouring.backend.add_send(-1, 32768, nullptr, 0));
+        CHECK_EQ(iouring.backend.pending, old_pending);
+        iouring.pool.destroy();
+        iouring.destroy_slot_storage();
+    }
+    {
+        EpollEventLoop epoll;
+        REQUIRE(epoll.init_slot_storage(32768).has_value());
+        REQUIRE(epoll.pool.init(32768u * 6u, 0).has_value());
+        CHECK_EQ(epoll.connection_capacity, 32768u);
+        CHECK_EQ(epoll.backend.downstream_fd_map.size(), 32768u);
+        CHECK_EQ(epoll.backend.upstream_fd_map.size(), 32768u);
+        CHECK_EQ(epoll.backend.send_state.size(), 32768u);
+        CHECK_EQ(epoll.yield_heap.entries.size(), 32768u + 256u);
+        CHECK_EQ(epoll.conns[32767].fd, -1);
+        CHECK_EQ(epoll.backend.downstream_fd_map[32767], -1);
+        Connection* high = epoll.alloc_conn();
+        REQUIRE(high != nullptr);
+        CHECK_EQ(high->id, 32767u);
+        CHECK_EQ(high->fd, -1);
+        const u32 high_id = high->id;
+        epoll.free_conn(*high);
+        Connection* reused = epoll.alloc_conn();
+        REQUIRE(reused != nullptr);
+        CHECK_EQ(reused->id, high_id);
+        epoll.free_conn(*reused);
+        REQUIRE(epoll.yield_heap.push(123, 7, high_id));
+        CHECK_EQ(epoll.yield_heap.top().conn_id, high_id);
+        epoll.yield_heap.pop();
+        const u32 old_pending_count = epoll.backend.pending_count;
+        CHECK_FALSE(epoll.backend.add_recv(-1, 32768));
+        CHECK_FALSE(epoll.backend.add_send(-1, 32768, nullptr, 0));
+        CHECK_EQ(epoll.backend.pending_count, old_pending_count);
+        CHECK_EQ(epoll.backend.downstream_fd_map[32767], -1);
+        epoll.pool.destroy();
+        epoll.destroy_slot_storage();
+    }
+
+    // An uninitialized backend has capacity zero and rejects live-connection
+    // operations before dereferencing storage or touching the kernel.
+    IoUringBackend empty_ring;
+    CHECK_FALSE(empty_ring.add_recv(-1, 0));
+    CHECK_FALSE(empty_ring.add_send(-1, 0, nullptr, 0));
+    CHECK_EQ(empty_ring.pending, 0u);
+    EpollBackend empty_epoll;
+    CHECK_FALSE(empty_epoll.add_recv(-1, 0));
+    CHECK_FALSE(empty_epoll.add_send(-1, 0, nullptr, 0));
+    CHECK_EQ(empty_epoll.pending_count, 0u);
+}
+
+TEST(connection_capacity, low_limit_exhaustion_and_reuse) {
+    EventLoop<MockBackend> loop;
+    REQUIRE(loop.init(0, -1, 0, 2).has_value());
+    CHECK_EQ(loop.connection_capacity, 2u);
+    Connection* first = loop.alloc_conn();
+    Connection* second = loop.alloc_conn();
+    REQUIRE(first != nullptr);
+    REQUIRE(second != nullptr);
+    CHECK_EQ(loop.active_count(), 2u);
+    CHECK(loop.alloc_conn() == nullptr);
+
+    const u32 freed_id = second->id;
+    loop.free_conn(*second);
+    CHECK_EQ(loop.active_count(), 1u);
+    Connection* reused = loop.alloc_conn();
+    REQUIRE(reused != nullptr);
+    CHECK_EQ(reused->id, freed_id);
+    loop.free_conn(*reused);
+    loop.free_conn(*first);
+    CHECK_EQ(loop.free_top, 2u);
+    loop.shutdown();
 }
 
 int main(int argc, char** argv) {

@@ -1,5 +1,6 @@
 #include "rut/common/shard_limits.h"
 #include "rut/runtime/access_log_startup.h"
+#include "rut/runtime/connection_capacity.h"
 #include "rut/runtime/epoll_event_loop.h"
 #include "rut/runtime/iouring_event_loop.h"
 #include "rut/runtime/listener.h"
@@ -196,6 +197,7 @@ static RunShardsOutcome run_shards(ListenerSpec listener,
                                    bool pin_cpus,
                                    u32 drain_secs,
                                    u32 pool_prealloc,
+                                   u32 connection_capacity,
                                    TlsServerContext* tls_server,
                                    const char* access_log_path,
                                    bool access_log_compress,
@@ -246,7 +248,7 @@ static RunShardsOutcome run_shards(ListenerSpec listener,
         }
         shards[i].owns_listen_fd = true;
 
-        auto rc = shards[i].init(i, lfd, pool_prealloc);
+        auto rc = shards[i].init(i, lfd, pool_prealloc, connection_capacity);
         if (!rc) {
             write_str("Failed to init shard ");
             write_u32(i);
@@ -583,6 +585,7 @@ int main(int argc, char** argv) {
     bool pin_cpus = true;
     u32 drain_secs = kDefaultDrainSecs;
     u32 pool_prealloc = 0;  // 0 = fully lazy
+    u32 connection_capacity = kDefaultConnectionCapacity;
     const char* tls_cert_path = nullptr;
     const char* tls_key_path = nullptr;
     const char* config_path = nullptr;
@@ -605,6 +608,7 @@ int main(int argc, char** argv) {
     u32 opt_level = 2;  // JIT IR optimization level (0=low/fast-start .. 3=high)
 
     // Simple arg parsing: [port] [--shards N] [--no-pin] [--drain N]
+    //                      [--max-connections-per-shard N]
     //                      [--tls-cert PATH] [--tls-key PATH]
     //                      [--access-log PATH] [--access-log-compress]
     //                      [--metrics]
@@ -653,6 +657,36 @@ int main(int argc, char** argv) {
                 pool_prealloc = 0;
                 for (const char* p = argv[i]; *p >= '0' && *p <= '9'; p++)
                     pool_prealloc = pool_prealloc * 10 + static_cast<u32>(*p - '0');
+            } else if (str_eq(argv[i], "--max-connections-per-shard")) {
+                if (i + 1 >= argc) {
+                    write_str("--max-connections-per-shard capacity requires an argument\n");
+                    return 1;
+                }
+                const char* value = argv[i + 1];
+                if (!is_all_digits(value)) {
+                    write_str(
+                        "--max-connections-per-shard capacity requires a non-negative decimal "
+                        "integer\n");
+                    return 1;
+                }
+                u32 parsed = 0;
+                bool overflow = false;
+                for (const char* p = value; *p; p++) {
+                    const u32 digit = static_cast<u32>(*p - '0');
+                    if (parsed > (kMaxConnectionCapacity - digit) / 10u) {
+                        overflow = true;
+                        break;
+                    }
+                    parsed = parsed * 10u + digit;
+                }
+                if (overflow || parsed == 0 || parsed > kMaxConnectionCapacity) {
+                    write_str("--max-connections-per-shard capacity must be between 1 and ");
+                    write_u32(kMaxConnectionCapacity);
+                    write_str("\n");
+                    return 1;
+                }
+                connection_capacity = parsed;
+                i++;
             } else if (str_eq(argv[i], "--access-log")) {
                 if (i + 1 >= argc || starts_with_dash_dash(argv[i + 1])) {
                     write_str("--access-log requires a path argument\n");
@@ -712,9 +746,14 @@ int main(int argc, char** argv) {
             if (str_eq(argv[i], "--shards") || str_eq(argv[i], "--drain") ||
                 str_eq(argv[i], "--pool-prealloc") || str_eq(argv[i], "--tls-cert") ||
                 str_eq(argv[i], "--tls-key") || str_eq(argv[i], "--access-log") ||
-                str_eq(argv[i], "--access-log-level") || str_eq(argv[i], "--opt")) {
-                write_str(argv[i]);
-                write_str(" requires an argument\n");
+                str_eq(argv[i], "--access-log-level") || str_eq(argv[i], "--opt") ||
+                str_eq(argv[i], "--max-connections-per-shard")) {
+                if (str_eq(argv[i], "--max-connections-per-shard"))
+                    write_str("--max-connections-per-shard capacity requires an argument\n");
+                else {
+                    write_str(argv[i]);
+                    write_str(" requires an argument\n");
+                }
                 return 1;
             }
         }
@@ -960,6 +999,7 @@ int main(int argc, char** argv) {
                                                pin_cpus,
                                                drain_secs,
                                                pool_prealloc,
+                                               connection_capacity,
                                                tls_server,
                                                access_log_path,
                                                access_log_compress,
@@ -974,6 +1014,7 @@ int main(int argc, char** argv) {
                                                  pin_cpus,
                                                  drain_secs,
                                                  pool_prealloc,
+                                                 connection_capacity,
                                                  tls_server,
                                                  access_log_path,
                                                  access_log_compress,
@@ -989,6 +1030,7 @@ int main(int argc, char** argv) {
                                              pin_cpus,
                                              drain_secs,
                                              pool_prealloc,
+                                             connection_capacity,
                                              tls_server,
                                              access_log_path,
                                              access_log_compress,
