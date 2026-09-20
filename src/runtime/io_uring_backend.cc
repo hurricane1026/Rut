@@ -1302,8 +1302,18 @@ u32 IoUringBackend::wait(IoEvent* events, u32 max_events, Connection* conns, u32
         // --- Send completion: enforce full-send proactor semantics ---
         // If IORING_OP_SEND returned partial, re-submit the remainder.
         // Only emit completion when all bytes sent (or error).
-        if ((type == IoEventType::Send || (type == IoEventType::UpstreamSend && aux == 0)) &&
-            conn_id < connection_capacity) {
+        // A downstream token authenticates the SendState whose byte counters
+        // the proactor is about to mutate. Stale/cancel tokens and multishot
+        // records reach the default emitter unchanged for dispatch to handle.
+        bool downstream_send_proactor = false;
+        if (type == IoEventType::Send && conn_id < connection_capacity) {
+            const u32 current_generation = send_state[conn_id].generation;
+            downstream_send_proactor = aux == current_generation &&
+                                       (aux & kNonUpstreamSendCancelBit) == 0 &&
+                                       (cqe->flags & IORING_CQE_F_MORE) == 0;
+        }
+        if ((type == IoEventType::Send && downstream_send_proactor) ||
+            (type == IoEventType::UpstreamSend && aux == 0 && conn_id < connection_capacity)) {
             auto& ss = (type == IoEventType::UpstreamSend) ? upstream_send_state[conn_id]
                                                            : send_state[conn_id];
             const bool live_upstream_send_owned =
