@@ -2309,20 +2309,20 @@ inline bool response_read_deadline_post_commit_is_stable(const Connection& c) {
                 return false;
         }
     }
-    const bool stable = response_read_timeout_seconds_valid(bundle.response_read_timeout_seconds) &&
-                        bundle.response_read_timeout_seconds == c.response_read_deadline_seconds &&
-                        bundle.response_buffering == c.response_read_deadline_buffering &&
-                        bundle.response_policy_id == c.response_policy_id &&
-                        bundle.failure_policy_id == c.failure_policy_id &&
-                        bundle.timeout_failure_policy_id == c.timeout_failure_policy_id &&
-                        // The successful same-call bundle validation above, together with
-                        // the buffering equality, already established the Complete role and
-                        // tuple contract. None still needs its strict post-commit role checks.
-                        (complete_buffering ||
-                         (cfg->response_policy_id_is_valid(bundle.response_policy_id) &&
-                          cfg->failure_policy_id_is_valid(bundle.failure_policy_id) &&
-                          cfg->timeout_failure_policy_id_is_valid(
-                              bundle.timeout_failure_policy_id)));
+    const bool stable =
+        response_read_timeout_seconds_valid(bundle.response_read_timeout_seconds) &&
+        bundle.response_read_timeout_seconds == c.response_read_deadline_seconds &&
+        bundle.response_buffering == c.response_read_deadline_buffering &&
+        bundle.response_policy_id == c.response_policy_id &&
+        bundle.failure_policy_id == c.failure_policy_id &&
+        bundle.timeout_failure_policy_id == c.timeout_failure_policy_id &&
+        // The successful same-call bundle validation above, together with
+        // the buffering equality, already established the Complete role and
+        // tuple contract. None still needs its strict post-commit role checks.
+        (complete_buffering ||
+         (cfg->response_policy_id_is_valid(bundle.response_policy_id) &&
+          cfg->failure_policy_id_is_valid(bundle.failure_policy_id) &&
+          cfg->timeout_failure_policy_id_is_valid(bundle.timeout_failure_policy_id)));
     return stable && (c.response_read_deadline_post_commit_phase !=
                           ResponseReadDeadlinePostCommitPhase::CombinedSend ||
                       response_read_deadline_combined_send_frame_is_stable(c));
