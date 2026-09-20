@@ -507,10 +507,13 @@ u32 KqueueBackend::wait(IoEvent* events, u32 max_events, Connection* conns, u32 
     }
     if (ready.filter == EVFILT_USER) return 0;  // control wake, not an elapsed timer tick
     if (ready.filter == EVFILT_TIMER) {
+        // Darwin counts elapsed intervals even for a relative EV_ONESHOT
+        // timer. Normalize handler expiration to one; periodic ticks retain
+        // their count so the timer wheel can catch up after a delayed wait.
+        const bool handler = ready.ident == kYieldTimer;
+        const i32 ticks = ready.data > INT_MAX ? INT_MAX : static_cast<i32>(ready.data);
         *events = completion(
-            0,
-            ready.ident == kYieldTimer ? IoEventType::HandlerTimer : IoEventType::Timeout,
-            ready.data > INT_MAX ? INT_MAX : static_cast<i32>(ready.data));
+            0, handler ? IoEventType::HandlerTimer : IoEventType::Timeout, handler ? 1 : ticks);
         return 1;
     }
     const u64 data = ready.udata;

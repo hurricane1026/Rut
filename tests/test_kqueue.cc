@@ -95,6 +95,10 @@ TEST(kqueue, periodic_ticks_precise_yield_and_wakeup) {
     IoEvent event;
     b.arm_yield_timer(now_ns() + 20'000'000);
     REQUIRE(ready(b));
+    // Model a busy event loop: Darwin can count multiple elapsed intervals
+    // even for EV_ONESHOT, but a handler timer must report one expiration.
+    const struct timespec delay{0, 60'000'000};
+    REQUIRE_EQ(nanosleep(&delay, nullptr), 0);
     REQUIRE_EQ(b.wait(&event, 1, nullptr, 0), 1u);
     CHECK_EQ(event.type, IoEventType::HandlerTimer);
     CHECK_EQ(event.result, 1);
