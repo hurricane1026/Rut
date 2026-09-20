@@ -6,6 +6,15 @@ behavioral equivalence evidence. Golden output alone is insufficient.
 Allowed states are `SUPPORTED`, `PARTIAL`, `BLOCKED_BY_RUT`,
 `NOT_IMPLEMENTED`, and `NOT_PLANNED`.
 
+The converter's safe quoted local-return parser accepts bodies up to 4094 bytes,
+but that admission does not promote every existing matrix row to that size.
+Rows below that state a 1..64-byte body remain deliberately bounded to the
+end-to-end differential evidence recorded for that class (including their
+existing source-length and headroom checks). The expanded parser bound is
+exercised by the 1 KiB static benchmark profile and 4094-byte smoke checks;
+broader local-return behavior remains outside those `SUPPORTED` rows until its
+own differential evidence is recorded.
+
 Recent evidence (no broad status promotion): #616/#620 prove the bounded
 custom-hide plus literal 1s GET expiry/completion CLI path, including 3-/46-byte
 name witnesses. #620 merged at `9034ca51` after CI `34316694133` passed 15/15

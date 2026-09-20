@@ -23,7 +23,7 @@ ROOT = Path(__file__).resolve().parents[2]
 SCENARIOS = ("static-close", "static-keepalive", "proxy-close", "proxy-keepalive")
 ERROR_NAMES = ("connect", "read", "write", "status", "timeout")
 # Keep aligned with the converter's safe quoted return-body profile.
-STATIC_BODY_LIMIT = 64
+STATIC_BODY_LIMIT = 4094
 
 
 def save_json(path, value):

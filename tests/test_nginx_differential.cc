@@ -24707,8 +24707,8 @@ static bool run_max_proxy_prefix_self_checks(std::string& error) {
     }
     const auto maximum_lowered = rut::nginx::lower_to_rut(maximum_parsed.value());
     if (!maximum_lowered || maximum_lowered.value().len != 3573u ||
-        rut::nginx::RutSource::kCapacity != 8750u) {
-        if (error.empty()) error = "#335 maximum generated source was not exactly 3573/8750 bytes";
+        rut::nginx::RutSource::kCapacity != 12780u) {
+        if (error.empty()) error = "#335 maximum generated source was not exactly 3573/12780 bytes";
         return false;
     }
     const rut::Str maximum_source_view = maximum_lowered.value().view();
@@ -25782,8 +25782,8 @@ static bool run_max_proxy_replacement_self_checks(std::string& error) {
     }
     const auto maximum_lowered = rut::nginx::lower_to_rut(maximum_parsed.value());
     if (!maximum_lowered || maximum_lowered.value().len != 3468u ||
-        rut::nginx::RutSource::kCapacity != 8750u) {
-        if (error.empty()) error = "#336 maximum generated source was not exactly 3468/8750 bytes";
+        rut::nginx::RutSource::kCapacity != 12780u) {
+        if (error.empty()) error = "#336 maximum generated source was not exactly 3468/12780 bytes";
         return false;
     }
     const rut::Str maximum_source_view = maximum_lowered.value().view();
@@ -34416,7 +34416,7 @@ static constexpr StaticQueryProxyOracleProfile kRootEmptyQueryProxyOracleProfile
     kRootEmptyQueryProxyUpstreamRequestSizes,
     true,
     3343u,
-    5406u,
+    9436u,
     true,
     true,
     true};
@@ -37613,7 +37613,7 @@ static bool run_empty_query_proxy_differential_self_checks(std::string& error) {
     std::string canonical[2];
     if (!lower(8080u, 9000u, true, canonical[0]) || !lower(8080u, 9000u, false, canonical[1]) ||
         canonical[0] != canonical[1] || canonical[0].size() != 3337u ||
-        rut::nginx::RutSource::kCapacity - canonical[0].size() - 1u != 5412u ||
+        rut::nginx::RutSource::kCapacity - canonical[0].size() - 1u != 9442u ||
         !validate_static_query_proxy_generated_source(canonical[0], 8080u, 9000u, error, profile) ||
         !validate_static_query_proxy_generated_source(canonical[1], 8080u, 9000u, error, profile)) {
         if (error.empty())
@@ -37806,7 +37806,7 @@ static bool run_root_empty_query_proxy_differential_self_checks(std::string& err
     std::string canonical[2];
     if (!lower(8080u, 9000u, true, canonical[0]) || !lower(8080u, 9000u, false, canonical[1]) ||
         canonical[0] != canonical[1] || canonical[0].size() != 3343u ||
-        rut::nginx::RutSource::kCapacity - canonical[0].size() - 1u != 5406u ||
+        rut::nginx::RutSource::kCapacity - canonical[0].size() - 1u != 9436u ||
         !validate_static_query_proxy_generated_source(canonical[0], 8080u, 9000u, error, profile) ||
         !validate_static_query_proxy_generated_source(canonical[1], 8080u, 9000u, error, profile)) {
         if (error.empty()) error = "#372 canonical source lost exact 3343/5406 evidence";
@@ -47680,7 +47680,7 @@ static bool run_exact_max_proxy_prefix_self_checks(
         maximum_ipv4_lowered.value().len != profile.maximum_exact_size ||
         profile.maximum_exact_size >= rut::nginx::RutSource::kCapacity ||
         rut::nginx::RutSource::kCapacity - profile.maximum_exact_size !=
-            (profile.uses_target_transform ? 5168u : 5324u) ||
+            (profile.uses_target_transform ? 9198u : 9354u) ||
         maximum_ipv4_lowered.value().data[maximum_ipv4_lowered.value().len] != '\0') {
         error = std::string(profile.issue) +
                 " P63 genuine maximum lowering lost its canonical size/capacity/NUL boundary";
@@ -48145,9 +48145,9 @@ static bool run_wildcard_max_no_uri_prefix_self_checks(std::string& error) {
     }
     const auto maximum_lowered = rut::nginx::lower_to_rut(maximum_parsed.value());
     if (!maximum_lowered || maximum_lowered.value().len != 3417u ||
-        rut::nginx::RutSource::kCapacity != 8750u ||
-        rut::nginx::RutSource::kCapacity - maximum_lowered.value().len != 5333u ||
-        rut::nginx::RutSource::kCapacity - 1u - maximum_lowered.value().len != 5332u ||
+        rut::nginx::RutSource::kCapacity != 12780u ||
+        rut::nginx::RutSource::kCapacity - maximum_lowered.value().len != 9363u ||
+        rut::nginx::RutSource::kCapacity - 1u - maximum_lowered.value().len != 9362u ||
         maximum_lowered.value().data[maximum_lowered.value().len] != '\0' ||
         !validate_max_proxy_prefix_generated_source(
             std::string(maximum_lowered.value().data, maximum_lowered.value().len),
@@ -48158,7 +48158,7 @@ static bool run_wildcard_max_no_uri_prefix_self_checks(std::string& error) {
             false,
             kWildcardMaxProxyPrefixNoUriProfile)) {
         if (error.empty())
-            error = "#357 genuine maximum wildcard endpoints lost 3417/8750/5333/5332 evidence";
+            error = "#357 genuine maximum wildcard endpoints lost 3417/12780/9363/9362 evidence";
         return false;
     }
 
@@ -57095,7 +57095,7 @@ static bool validate_proxy_hide_header_generated_source(const std::string& sourc
     const u32 forwards = count_text(source, "return forward(nginx_upstream");
     if (source.empty() || source.size() != 5366u || source.find('\0') != std::string::npos ||
         source.size() + 1u > rut::nginx::RutSource::kCapacity ||
-        rut::nginx::RutSource::kCapacity - source.size() - 1u != 3383u ||
+        rut::nginx::RutSource::kCapacity - source.size() - 1u != 7413u ||
         count_text(source, listener) != 1u || count_text(source, upstream) != 1u || routes != 3u ||
         forwards != 3u || count_text(source, "route HEAD \"/\" {") != 1u ||
         count_text(source, "route GET \"/\" {") != 1u ||
