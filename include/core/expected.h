@@ -13,10 +13,7 @@
 
 // Placement new — declaration only; definition lives in a single TU.
 // Guarded so mixed inclusion with <new> or arena.h won't conflict.
-#ifndef RUE_PLACEMENT_NEW_DECLARED
-#define RUE_PLACEMENT_NEW_DECLARED
-void* operator new(decltype(sizeof(0)), void* p) noexcept;
-#endif
+#include "core/placement_new.h"
 
 namespace core {
 

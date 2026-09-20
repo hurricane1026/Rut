@@ -1,0 +1,28 @@
+name: macOS development
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  kqueue:
+    runs-on: macos-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          submodules: recursive
+      - name: Install existing build dependencies
+        run: brew install cmake ninja llvm boost ragel
+      - name: Build and test native developer environment
+        run: ./dev.sh test
+      - name: Build and test without JIT
+        run: |
+          cmake -B build-nojit -G Ninja \
+            -DCMAKE_C_COMPILER="$(brew --prefix llvm)/bin/clang" \
+            -DCMAKE_CXX_COMPILER="$(brew --prefix llvm)/bin/clang++" \
+            -DRUT_ENABLE_JIT=OFF
+          cmake --build build-nojit
+          ctest --test-dir build-nojit --output-on-failure --no-tests=error

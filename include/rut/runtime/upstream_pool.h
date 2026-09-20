@@ -1,6 +1,7 @@
 #pragma once
 
 #include "rut/common/types.h"
+#include "rut/platform/socket.h"
 #include <atomic>
 
 #include <errno.h>
@@ -127,9 +128,7 @@ struct UpstreamPool {
     }
 
     // Create a non-blocking upstream socket. Returns fd on success, -1 on failure.
-    static i32 create_socket() {
-        return socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
-    }
+    static i32 create_socket() { return platform::stream_socket(); }
 
 private:
     void release_slot(u32 i) {

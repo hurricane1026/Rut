@@ -5,7 +5,11 @@
 #include "mock_backend.h"
 #include "rut/runtime/callbacks_impl.h"
 #include "rut/runtime/connection.h"
+#ifdef __APPLE__
+#include "rut/runtime/kqueue_event_loop.h"
+#else
 #include "rut/runtime/epoll_event_loop.h"
+#endif
 #include "rut/runtime/event_loop.h"
 #include "rut/runtime/io_event.h"
 #include "rut/runtime/route_table.h"
@@ -994,7 +998,11 @@ struct FailRecvAsyncSmallLoop : EventLoopCRTP<FailRecvAsyncSmallLoop> {
 
 // ---- Real socket helpers ----
 
+#ifdef __APPLE__
+using RealLoop = KqueueEventLoop;
+#else
 using RealLoop = EpollEventLoop;
+#endif
 
 inline RealLoop* create_real_loop() {
     void* p =

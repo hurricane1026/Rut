@@ -166,6 +166,8 @@ private:
     std::atomic<bool> writer_terminal_{false};
     std::atomic<bool> stop_requested_{false};
     SourceAccessLogFd output_{};
+    i32 data_signal_fd_ = -1;
+    i32 stop_signal_fd_ = -1;
     i32 data_event_fd_ = -1;
     i32 stop_event_fd_ = -1;
     pthread_t writer_{};

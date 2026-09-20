@@ -1,3 +1,4 @@
+#include "../testing/posix.h"
 // Standalone #358 Stage 2a1 protocol self-check.
 //
 // This test intentionally has no Docker, sudo, namespace, IP socket, or shell
@@ -21,14 +22,22 @@
 
 #include <fcntl.h>
 #include <grp.h>
+#ifdef __linux__
 #include <linux/capability.h>
+#endif
+#ifdef __linux__
 #include <linux/limits.h>
+#endif
 #include <poll.h>
 #include <signal.h>
+#ifdef __linux__
 #include <sys/prctl.h>
+#endif
 #include <sys/socket.h>
 #include <sys/stat.h>
+#ifdef __linux__
 #include <sys/syscall.h>
+#endif
 #include <sys/types.h>
 #include <sys/un.h>
 #include <sys/wait.h>
@@ -44,7 +53,7 @@ bool run_transport_tests(const Token& token, std::string& error) {
                         bool expect_success,
                         bool fragment) {
         int sockets[2] = {-1, -1};
-        if (socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, sockets) != 0) return false;
+        if (rut::test::stream_socketpair(sockets) != 0) return false;
         bool wrote = true;
         if (fragment) {
             for (size_t i = 0; i != bytes_to_write && wrote; ++i)
@@ -64,7 +73,7 @@ bool run_transport_tests(const Token& token, std::string& error) {
     const Frame fragmented_frame{kPing, token, {9, 8, 7, 6, 5}};
     const std::vector<unsigned char> fragmented_bytes = frame_bytes(fragmented_frame);
     int fragmented_sockets[2] = {-1, -1};
-    if (socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, fragmented_sockets) != 0) {
+    if (rut::test::stream_socketpair(fragmented_sockets) != 0) {
         error = "fragmented frame socketpair failed";
         return false;
     }
@@ -108,7 +117,7 @@ bool run_transport_tests(const Token& token, std::string& error) {
         return false;
     }
     int closed_peer[2] = {-1, -1};
-    if (socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, closed_peer) != 0) {
+    if (rut::test::stream_socketpair(closed_peer) != 0) {
         error = "closed-peer socketpair failed";
         return false;
     }
@@ -158,6 +167,7 @@ bool run_malformed_input_tests(std::string& error) {
     return true;
 }
 
+#ifdef __linux__
 int worker_main(const char* executable,
                 const char* path,
                 const char* token_text,
@@ -846,9 +856,12 @@ bool run_wrapper_early_death_case(const std::string& executable, std::string& er
            access(temp.socket.c_str(), F_OK) != 0 && access(temp.path.c_str(), F_OK) != 0;
 }
 
+#endif
+
 }  // namespace
 
 int main(int argc, char** argv) {
+#ifdef __linux__
     if (argc == 5 && strcmp(argv[1], "--fixture-worker") == 0)
         return worker_main(argv[0], argv[2], argv[3], argv[4]);
     if (argc == 5 && strcmp(argv[1], "--fixture-wrapper") == 0)
@@ -864,20 +877,32 @@ int main(int argc, char** argv) {
         return 1;
     }
     self[static_cast<size_t>(length)] = '\0';
+#else
+    (void)argc;
+    (void)argv;
+#endif
     std::string error;
     Token transport_token;
     for (size_t i = 0; i != transport_token.bytes.size(); ++i)
         transport_token.bytes[i] = static_cast<unsigned char>(i + 1);
-    if (!run_transport_tests(transport_token, error) || !run_malformed_input_tests(error) ||
-        !run_ready_case(self.data(), error) || !run_ready_case(self.data(), error, "term-ignore") ||
+    if (!run_transport_tests(transport_token, error) || !run_malformed_input_tests(error)
+#ifdef __linux__
+        || !run_ready_case(self.data(), error) ||
+        !run_ready_case(self.data(), error, "term-ignore") ||
         !run_no_ready_case(self.data(), error) ||
         !run_ready_lease_loss_case(self.data(), "ready", error) ||
         !run_ready_lease_loss_case(self.data(), "term-ignore", error) ||
-        !run_wrapper_early_death_case(self.data(), error)) {
+        !run_wrapper_early_death_case(self.data(), error)
+#endif
+    ) {
         std::cerr << "FAIL [#358 Stage 2a1 protocol self-check]: " << error << "\n";
         return 1;
     }
+#ifdef __linux__
     std::cerr << "PASS: #358 Stage 2a1 parent-owned authenticated fixture-worker protocol, "
                  "causal identity mutations, bounded cleanup, and failure artifact cleanup\n";
+#else
+    std::cerr << "PASS: authenticated worker framing, transport, and malformed inputs\n";
+#endif
     return 0;
 }

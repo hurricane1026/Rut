@@ -1,3 +1,4 @@
+#include "../testing/posix.h"
 #include "fixture_collision_release_protocol.h"
 #include <algorithm>
 #include <array>
@@ -546,7 +547,7 @@ bool send_fragments(int fd, const std::vector<unsigned char>& bytes) {
 
 bool common_transport_round_trip() {
     int sockets[2] = {-1, -1};
-    if (socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, sockets) != 0) return false;
+    if (rut::test::stream_socketpair(sockets) != 0) return false;
     const worker::Token expected_token = token();
     const protocol::DecisionV2 expected =
         decision(protocol::DecisionKind::AuthorizeReservationRelease);
@@ -563,7 +564,7 @@ bool common_transport_round_trip() {
 
 bool fragmented_same_deadline() {
     int sockets[2] = {-1, -1};
-    if (socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, sockets) != 0) return false;
+    if (rut::test::stream_socketpair(sockets) != 0) return false;
     const worker::Token expected_token = token();
     const std::vector<unsigned char> first =
         worker::frame_bytes(protocol::encode_command(expected_token, command()));
@@ -605,7 +606,7 @@ bool fragmented_same_deadline() {
 
 bool missing_payload_is_bounded() {
     int sockets[2] = {-1, -1};
-    if (socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, sockets) != 0) return false;
+    if (rut::test::stream_socketpair(sockets) != 0) return false;
     const worker::Token expected_token = token();
     const std::vector<unsigned char> wire = worker::frame_bytes(
         protocol::encode_phase(expected_token, phase(protocol::Phase::ReservationHeld)));

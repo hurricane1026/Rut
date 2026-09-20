@@ -19,6 +19,7 @@
 #include "rut/runtime/ws_terminate.h"
 #endif
 #include "test.h"
+#include <barrier>
 #include <filesystem>
 #include <fstream>
 #include <memory>
@@ -8145,8 +8146,8 @@ TEST(helpers, str_regex_scratch_cache_grows_and_reuses_entries) {
 
 struct RegexScratchPruneThreadState {
     void* db = nullptr;
-    pthread_barrier_t* warmed = nullptr;
-    pthread_barrier_t* pruned = nullptr;
+    std::barrier<>* warmed = nullptr;
+    std::barrier<>* pruned = nullptr;
     u32 warm_count = 0;
     u32 final_count = 0;
     u8 matched = 0;
@@ -8156,8 +8157,8 @@ static void* regex_scratch_prune_thread(void* arg) {
     auto* state = static_cast<RegexScratchPruneThreadState*>(arg);
     state->matched = rut_helper_str_regex_match("/worker", 7, state->db);
     state->warm_count = rut_helper_regex_scratch_cache_entry_count_for_test();
-    pthread_barrier_wait(state->warmed);
-    pthread_barrier_wait(state->pruned);
+    state->warmed->arrive_and_wait();
+    state->pruned->arrive_and_wait();
     state->final_count = rut_helper_regex_scratch_cache_entry_count_for_test();
     return nullptr;
 }
@@ -8168,10 +8169,8 @@ TEST(helpers, str_regex_free_prunes_other_thread_scratch_cache) {
     void* db = rut_helper_regex_compile("^/worker$", 9);
     REQUIRE(db != nullptr);
 
-    pthread_barrier_t warmed;
-    pthread_barrier_t pruned;
-    REQUIRE(pthread_barrier_init(&warmed, nullptr, 2) == 0);
-    REQUIRE(pthread_barrier_init(&pruned, nullptr, 2) == 0);
+    std::barrier<> warmed(2);
+    std::barrier<> pruned(2);
 
     RegexScratchPruneThreadState state{};
     state.db = db;
@@ -8180,18 +8179,15 @@ TEST(helpers, str_regex_free_prunes_other_thread_scratch_cache) {
 
     pthread_t thread{};
     REQUIRE(pthread_create(&thread, nullptr, regex_scratch_prune_thread, &state) == 0);
-    pthread_barrier_wait(&warmed);
+    warmed.arrive_and_wait();
 
     CHECK(state.matched == 1);
     CHECK(state.warm_count == 1);
     rut_helper_regex_free(db);
-    pthread_barrier_wait(&pruned);
+    pruned.arrive_and_wait();
 
     REQUIRE(pthread_join(thread, nullptr) == 0);
     CHECK(state.final_count == 0);
-
-    pthread_barrier_destroy(&pruned);
-    pthread_barrier_destroy(&warmed);
 }
 
 TEST(helpers, str_trim_prefix) {

@@ -1,5 +1,5 @@
 #!/bin/bash
-# dev.sh — build, test, lint, format for the Rue project.
+# dev.sh — build, test, lint, format for the Rut project.
 #
 # Usage:
 #   ./dev.sh              # build + test
@@ -19,13 +19,23 @@ SRC_FILES=$(find "$PROJECT_DIR/include" "$PROJECT_DIR/src" "$PROJECT_DIR/tests" 
     "$PROJECT_DIR/testing" "$PROJECT_DIR/bench" \
     -name '*.h' -o -name '*.cc' 2>/dev/null | grep -v third_party)
 
+# Homebrew LLVM is keg-only. On macOS use the installed toolchain consistently
+# (compiler, formatter and linter), while respecting explicit CC/CXX overrides.
+RUT_CMAKE_ARGS=(-DCMAKE_C_COMPILER="${CC:-clang}" -DCMAKE_CXX_COMPILER="${CXX:-clang++}")
+if [[ "$(uname -s)" == Darwin ]] && command -v brew >/dev/null 2>&1; then
+    RUT_LLVM_PREFIX=$(brew --prefix llvm 2>/dev/null || true)
+    if [[ -n "$RUT_LLVM_PREFIX" && -d "$RUT_LLVM_PREFIX/bin" ]]; then
+        export PATH="$RUT_LLVM_PREFIX/bin:$PATH"
+        RUT_CMAKE_ARGS+=("-DLLVM_DIR=$RUT_LLVM_PREFIX/lib/cmake/llvm")
+    fi
+fi
+
 # ---- Configure (if needed) ----
 configure() {
     if [ ! -f "$BUILD_DIR/build.ninja" ]; then
         echo "=== Configuring (clang, Ninja) ==="
         cmake -B "$BUILD_DIR" -G Ninja \
-            -DCMAKE_C_COMPILER=clang \
-            -DCMAKE_CXX_COMPILER=clang++ \
+            "${RUT_CMAKE_ARGS[@]}" \
             "$PROJECT_DIR"
     fi
 }
@@ -90,6 +100,11 @@ tidy() {
         ! -path '*/simd/neon.cc' \
         ! -path '*/simd/sve.cc' | \
         grep -v third_party)
+    if [[ "$(uname -s)" == Darwin ]]; then
+        src_cc=$(printf '%s\n' "$src_cc" | grep -v -E '/(epoll_backend|io_uring_backend)\.cc$')
+    else
+        src_cc=$(printf '%s\n' "$src_cc" | grep -v '/kqueue_backend\.cc$')
+    fi
     # Match CI exactly (ci.yml): bugprone-*/performance-* are hard errors and
     # the exit code must gate `./dev.sh all` — the old grep-only form let
     # CI-fatal findings pass silently on developer machines.

@@ -67,6 +67,7 @@ jobs:
           # Exclude all arch-specific SIMD backends — only lint scalar
           # and main parser code (arch-independent).
           find src -name '*.cc' \
+            ! -name 'kqueue_backend.cc' \
             ! -path '*/simd/sse2.cc' \
             ! -path '*/simd/avx2.cc' \
             ! -path '*/simd/avx512.cc' \

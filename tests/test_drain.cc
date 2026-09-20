@@ -175,7 +175,6 @@ TEST(event_loop_drain, initial_state_not_draining) {
 }
 
 TEST(event_loop_drain, active_count_empty) {
-    using rut::EpollBackend;
     using rut::EventLoop;
     // Use SmallLoop which tracks free_top
     SmallLoop loop;

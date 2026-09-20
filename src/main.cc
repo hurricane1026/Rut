@@ -1,7 +1,11 @@
 #include "rut/common/shard_limits.h"
 #include "rut/runtime/access_log_startup.h"
+#ifdef __linux__
 #include "rut/runtime/epoll_event_loop.h"
 #include "rut/runtime/iouring_event_loop.h"
+#else
+#include "rut/runtime/kqueue_event_loop.h"
+#endif
 #include "rut/runtime/listener.h"
 #include "rut/runtime/listener_context.h"
 #include "rut/runtime/shard.h"
@@ -14,12 +18,16 @@
 
 #include <errno.h>
 #include <fcntl.h>
+#ifdef __linux__
 #include <linux/io_uring.h>
+#endif
 #include <netinet/in.h>
 #include <signal.h>
 #include <string.h>
 #include <sys/socket.h>
+#ifdef __linux__
 #include <sys/syscall.h>
+#endif
 #include <time.h>
 #include <unistd.h>
 
@@ -82,6 +90,7 @@ static bool parse_cli_port(const char* s, u16& out) {
     return true;
 }
 
+#ifdef __linux__
 static bool detect_io_uring() {
     struct io_uring_params params;
     memset(&params, 0, sizeof(params));
@@ -92,6 +101,8 @@ static bool detect_io_uring() {
     }
     return false;
 }
+
+#endif
 
 // --- Signal handling for graceful shutdown ---
 
@@ -530,7 +541,25 @@ static RunShardsOutcome run_shards(ListenerSpec listener,
     };
     for (;;) {
         struct timespec timeout = {0, 100'000'000};  // 100ms control-plane poll
+#ifdef __APPLE__
+        // Darwin has sigwait but no sigtimedwait. Only consume blocked signals
+        // after observing one pending, so fatal backend/log errors remain polled.
+        sigset_t pending;
+        sig = -1;
+        if (sigpending(&pending) == 0 &&
+            (sigismember(&pending, SIGINT) || sigismember(&pending, SIGTERM))) {
+            const int error = sigwait(&wait_set, &sig);
+            if (error != 0) {
+                sig = -1;
+                errno = error;
+            }
+        } else {
+            nanosleep(&timeout, nullptr);
+            errno = EAGAIN;
+        }
+#else
         sig = sigtimedwait(&wait_set, nullptr, &timeout);
+#endif
         // A fatal backend state takes precedence over a concurrently queued
         // shutdown signal; otherwise the process could report a graceful exit.
         const bool source_live_failed = observe_source_live_failure();
@@ -734,7 +763,18 @@ int main(int argc, char** argv) {
         }
     }
 
+#ifdef __APPLE__
+    // A single shard keeps the local development footprint small. Darwin's
+    // SO_REUSEPORT does not provide Linux's listener load balancing contract.
+    if (shard_count == 0) shard_count = 1;
+    if (shard_count != 1) {
+        write_str("macOS development mode supports --shards 1 only\n");
+        return 1;
+    }
+    pin_cpus = false;
+#else
     if (shard_count == 0) shard_count = detect_cpu_count();
+#endif
     if (shard_count > kMaxShards) shard_count = kMaxShards;
 
     if ((tls_cert_path && !tls_key_path) || (!tls_cert_path && tls_key_path)) {
@@ -951,6 +991,22 @@ int main(int argc, char** argv) {
     RunShardsOutcome outcome{};
     SourceAccessLogFd* source_live_fd_ptr =
         resolved_access_log->mode == AccessLogStartupMode::SourceLive ? &source_live_fd : nullptr;
+#ifdef __APPLE__
+    write_str(tls_server ? "Backend: kqueue (TLS, macOS development)\n"
+                         : "Backend: kqueue (macOS development)\n");
+    outcome = run_shards<KqueueEventLoop>(listener,
+                                          shard_count,
+                                          pin_cpus,
+                                          drain_secs,
+                                          pool_prealloc,
+                                          tls_server,
+                                          access_log_path,
+                                          access_log_compress,
+                                          access_log_level,
+                                          source_live_fd_ptr,
+                                          route_config,
+                                          serve_metrics);
+#else
     // io_uring now terminates TLS too (event-loop TlsEngine), so it is preferred
     // whenever available — TLS no longer forces the epoll fallback.
     if (detect_io_uring()) {
@@ -997,6 +1053,7 @@ int main(int argc, char** argv) {
                                              route_config,
                                              serve_metrics);
     }
+#endif
     destroy_tls_server_context(tls_server);
 #ifdef RUT_ENABLE_JIT
     // Shards have joined inside run_shards; safe to release JIT code,

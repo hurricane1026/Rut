@@ -1,7 +1,6 @@
 // Simulation tests — uses real Shard + EpollBackend + loopback TCP.
 // Verifies that captured traffic replayed through production code path
 // produces identical routing results, and collects latency/resource metrics.
-#include "rut/runtime/epoll_event_loop.h"
 #include "rut/runtime/shard.h"
 #include "rut/runtime/sim_engine.h"
 #include "rut/runtime/traffic_capture.h"
@@ -14,7 +13,7 @@
 
 using namespace rut;
 
-using RealShard = Shard<EpollEventLoop>;
+using RealShard = Shard<RealLoop>;
 
 // Helper: set up a real Shard with a RouteConfig, return its listen port.
 struct SimServer {

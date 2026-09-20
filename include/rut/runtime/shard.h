@@ -16,7 +16,6 @@
 #include <pthread.h>
 #include <sched.h>
 #include <sys/mman.h>
-#include <sys/timerfd.h>
 #include <unistd.h>
 
 namespace rut {
@@ -320,6 +319,7 @@ struct Shard {
 
         // Pin to CPU if requested. Use sched_getaffinity to check allowed CPUs
         // (respects cpuset/cgroup restrictions). Fall back to unpinned on failure.
+#ifdef __linux__
         if (pin_cpu >= 0) {
             cpu_set_t allowed;
             CPU_ZERO(&allowed);
@@ -333,6 +333,9 @@ struct Shard {
             }
             // If CPU not in allowed set or getaffinity failed, spawn unpinned
         }
+#else
+        (void)pin_cpu;  // macOS development shards run without CPU affinity.
+#endif
 
         i32 rc = pthread_create(&thread, &attr, thread_entry, this);
         pthread_attr_destroy(&attr);

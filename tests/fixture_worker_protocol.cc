@@ -13,14 +13,22 @@
 
 #include <fcntl.h>
 #include <grp.h>
+#ifdef __linux__
 #include <linux/capability.h>
+#endif
+#ifdef __linux__
 #include <linux/limits.h>
+#endif
 #include <poll.h>
 #include <signal.h>
+#ifdef __linux__
 #include <sys/prctl.h>
+#endif
 #include <sys/socket.h>
 #include <sys/stat.h>
+#ifdef __linux__
 #include <sys/syscall.h>
+#endif
 #include <sys/un.h>
 #include <sys/wait.h>
 #include <unistd.h>
@@ -184,6 +192,7 @@ bool token_equal(const Token& a, const Token& b) {
     return a.bytes == b.bytes;
 }
 
+#ifdef __linux__
 bool read_proc(pid_t pid, ProcIdentity& result, bool require_capabilities_clear) {
     if (pid <= 0) return false;
     std::string stat_text;
@@ -367,6 +376,8 @@ bool child_security_setup(u64& groups_clear) {
            self.pgid == getpid() && self.no_new_privs && self.capabilities_clear;
 }
 
+#endif
+
 bool token_from_hex(const char* text, Token& token) {
     if (text == nullptr || strlen(text) != 2 * kTokenBytes) return false;
     for (size_t i = 0; i != kTokenBytes; ++i) {
@@ -494,6 +505,7 @@ bool identity_matches_report(const Report& report,
     return !require_wrapper_equal || report.wrapper_pid == report.target_pid;
 }
 
+#ifdef __linux__
 bool process_alive(pid_t pid) {
     if (pid <= 0) return false;
     if (kill(pid, 0) == 0) return true;
@@ -650,5 +662,7 @@ bool accept_bounded(int listener, int& fd) {
         if (errno != EINTR && errno != EAGAIN && errno != EWOULDBLOCK) return false;
     }
 }
+
+#endif
 
 }  // namespace rut::test::fixture_worker_protocol

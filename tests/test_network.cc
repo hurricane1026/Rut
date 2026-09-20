@@ -1,16 +1,21 @@
+#include "posix.h"
 // Mock tests — no real sockets. Ported from libuv/libevent scenarios.
 #include "fault_injection.h"
 #include "rut/runtime/arena.h"
 #include "rut/runtime/compile_to_config.h"
 #include "rut/runtime/error.h"
+#ifdef __linux__
 #include "rut/runtime/io_uring_backend.h"
 #include "rut/runtime/iouring_event_loop.h"
+#endif
 #include "rut/runtime/rate_limit.h"
 #include "rut/runtime/route_table.h"
 #include "rut/runtime/simd/simd.h"
 #include "rut/runtime/slab_pool.h"
 #include "rut/runtime/slice_pool.h"
+#ifdef __linux__
 #include "rut/runtime/tls_iouring.h"
+#endif
 #include "rut/runtime/upstream_concurrency.h"
 #include "rut/runtime/upstream_pool.h"
 #include "test.h"
@@ -41,7 +46,11 @@ using rut::test_fault::ScopedSyscallFault;
 using rut::test_fault::SyscallFaultConfig;
 
 static i32 count_open_fds() {
+#ifdef __APPLE__
+    DIR* directory = opendir("/dev/fd");
+#else
     DIR* directory = opendir("/proc/self/fd");
+#endif
     if (directory == nullptr) return -1;
     i32 count = 0;
     while (const dirent* entry = readdir(directory)) {
@@ -118,11 +127,13 @@ TEST(listener_context, resolves_ephemeral_and_explicit_bound_ports) {
     close(first_fd);
 }
 
+// Linux routes the entire 127/8 range through loopback without interface aliases.
+#ifdef __linux__
 TEST(listener_context, exact_ipv4_bind_is_address_scoped_and_connectable) {
     constexpr u32 kPositiveAddress = 0x7f000001u;
     constexpr u32 kGuardAddress = 0x7f000002u;
 
-    ScopedListenerTestFd guard(socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0));
+    ScopedListenerTestFd guard(rut::test::cloexec_socket(AF_INET, SOCK_STREAM, 0));
     REQUIRE_GE(guard.fd, 0);
     sockaddr_in guard_address = listener_test_ipv4(kGuardAddress, 0u);
     REQUIRE_EQ(bind(guard.fd, reinterpret_cast<sockaddr*>(&guard_address), sizeof(guard_address)),
@@ -191,21 +202,20 @@ TEST(listener_context, exact_ipv4_bind_is_address_scoped_and_connectable) {
     CHECK_EQ(ntohs(bound.sin_port), port);
     CHECK_EQ(ntohl(bound.sin_addr.s_addr), kPositiveAddress);
 
-    ScopedListenerTestFd positive_client(socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0));
+    ScopedListenerTestFd positive_client(rut::test::cloexec_socket(AF_INET, SOCK_STREAM, 0));
     REQUIRE_GE(positive_client.fd, 0);
     sockaddr_in positive_address = listener_test_ipv4(kPositiveAddress, port);
     REQUIRE_EQ(connect(positive_client.fd,
                        reinterpret_cast<sockaddr*>(&positive_address),
                        sizeof(positive_address)),
                0);
-    ScopedListenerTestFd accepted(
-        accept4(listener.fd, nullptr, nullptr, SOCK_NONBLOCK | SOCK_CLOEXEC));
+    ScopedListenerTestFd accepted(rut::platform::accept_nonblocking(listener.fd));
     REQUIRE_GE(accepted.fd, 0);
     const i32 accepted_descriptor_flags = fcntl(accepted.fd, F_GETFD);
     REQUIRE_GE(accepted_descriptor_flags, 0);
     CHECK_NE(accepted_descriptor_flags & FD_CLOEXEC, 0);
 
-    ScopedListenerTestFd negative_client(socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0));
+    ScopedListenerTestFd negative_client(rut::test::cloexec_socket(AF_INET, SOCK_STREAM, 0));
     REQUIRE_GE(negative_client.fd, 0);
     sockaddr_in negative_address = listener_test_ipv4(kGuardAddress, port);
     errno = 0;
@@ -221,6 +231,7 @@ TEST(listener_context, exact_ipv4_bind_is_address_scoped_and_connectable) {
                0);
     CHECK_EQ(guard_accepts, 0);
 }
+#endif
 
 TEST(listener_context, exact_ephemeral_shards_share_address_and_resolved_port) {
     constexpr u32 kExactAddress = 0x7f000001u;
@@ -296,7 +307,7 @@ TEST(listener_context, exact_expected_context_mismatches_close_new_socket) {
 }
 
 TEST(listener_context, invalid_metadata_fails_before_socket_creation) {
-    ScopedListenerTestFd occupied(socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0));
+    ScopedListenerTestFd occupied(rut::test::cloexec_socket(AF_INET, SOCK_STREAM, 0));
     REQUIRE_GE(occupied.fd, 0);
     sockaddr_in address = listener_test_ipv4(INADDR_ANY, 0u);
     REQUIRE_EQ(bind(occupied.fd, reinterpret_cast<sockaddr*>(&address), sizeof(address)), 0);
@@ -377,6 +388,7 @@ TEST(listener_context, invalid_metadata_fails_before_socket_creation) {
     CHECK_EQ(count_open_fds(), baseline_fds);
 }
 
+#ifdef __linux__
 TEST(listener_context, loop_allocators_copy_reset_and_preserve_context) {
     struct ListenerFdPair {
         i32 first = -1;
@@ -461,6 +473,7 @@ TEST(listener_context, loop_allocators_copy_reset_and_preserve_context) {
     capture_request_metadata(*conn);
     CHECK(conn->listener_context.equivalent(expected));
 }
+#endif
 
 // === Accept ===
 
@@ -5825,6 +5838,7 @@ TEST(tls_engine, accessor_helpers_track_ciphertext_offsets) {
     CHECK_EQ(tls_engine_output_len(engine), 7u);
 }
 
+#ifdef __linux__
 TEST(tls_iouring, drain_completion_invokes_saved_send_continuation) {
     Connection conn;
     u8 recv_storage[SmallLoop::kBufSize];
@@ -5889,6 +5903,7 @@ TEST(tls_iouring, ensure_draining_restores_hook_while_inflight) {
 TEST(tls_iouring, input_buffer_fits_full_ciphertext_record) {
     CHECK_GE(IoUringEventLoop::kTlsInputSize, SlicePool::kSliceSize + 1024);
 }
+#endif
 
 // Round-4 race fix #F: a TLS proxy-stream -ENOBUFS with NO parked tail must fail
 // closed. A wait() batch harvests the whole multishot CQE burst into the 16 KiB
@@ -7237,7 +7252,7 @@ TEST(upstream_pool, take_idle_empty_and_bad_fd) {
 }
 
 TEST(upstream_pool, create_socket) {
-    i32 fake_fd = dup(2);
+    i32 fake_fd = socket(AF_INET, SOCK_STREAM, 0);
     REQUIRE(fake_fd >= 0);
     ScopedFakeSocket fake_socket(fake_fd);
 
@@ -16934,6 +16949,7 @@ TEST(streaming, malformed_response_async_close_preserves_cancel_accounting) {
     CHECK_EQ(loop.pending_free_count, 1u);
 }
 
+#ifdef __linux__
 TEST(streaming, malformed_response_epoll_detaches_and_retires_episode) {
     auto* loop = create_real_loop();
     REQUIRE(loop != nullptr);
@@ -16952,8 +16968,8 @@ TEST(streaming, malformed_response_epoll_detaches_and_retires_episode) {
             if (fds[1] >= 0) close(fds[1]);
         }
     } client_guard{client_fds}, upstream_guard{upstream_fds};
-    REQUIRE_EQ(socketpair(AF_UNIX, SOCK_STREAM | SOCK_NONBLOCK, 0, client_fds), 0);
-    REQUIRE_EQ(socketpair(AF_UNIX, SOCK_STREAM | SOCK_NONBLOCK, 0, upstream_fds), 0);
+    REQUIRE_EQ(rut::test::nonblocking_socketpair(client_fds), 0);
+    REQUIRE_EQ(rut::test::nonblocking_socketpair(upstream_fds), 0);
     c->fd = client_fds[0];
     client_fds[0] = -1;
     c->upstream_fd = upstream_fds[0];
@@ -16986,6 +17002,7 @@ TEST(streaming, malformed_response_epoll_detaches_and_retires_episode) {
     loop->shutdown();
     destroy_real_loop(loop);
 }
+#endif
 
 TEST(streaming, upstream_response_eof_no_data_closes) {
     SmallLoop loop;
@@ -17425,7 +17442,7 @@ struct SourceLiveNetworkPipe {
 
     bool open_nonblocking() {
         i32 fds[2];
-        if (pipe2(fds, O_NONBLOCK | O_CLOEXEC) != 0) return false;
+        if (rut::test::nonblocking_pipe(fds) != 0) return false;
         read_fd = fds[0];
         write_fd = fds[1];
         return true;
@@ -18144,7 +18161,7 @@ TEST(access_request_size,
     loop.reuse_pool = &pool;
 
     i32 pooled_pair[2] = {-1, -1};
-    REQUIRE_EQ(socketpair(AF_UNIX, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0, pooled_pair), 0);
+    REQUIRE_EQ(rut::test::nonblocking_socketpair(pooled_pair), 0);
     const i32 pooled_fd = pooled_pair[0];
     REQUIRE(pool.put_idle(pooled_pair[0], 0, 0, monotonic_secs()));
     pooled_pair[0] = -1;
@@ -19166,6 +19183,7 @@ TEST(util, ascii_ci_eq_basic) {
 
 // === Coverage: epoll_event_loop init and helpers ===
 
+#ifdef __linux__
 TEST(epoll_loop, init_success) {
     auto* loop = create_real_loop();
     REQUIRE(loop != nullptr);
@@ -19336,6 +19354,7 @@ TEST(epoll_loop, ws_unpoll_upstream_deregisters_upstream_fd) {
     CHECK_EQ(loop->backend.active_upstream_episode[up_cid], 0u);
     CHECK_EQ(loop->backend.upstream_fd_map[up_cid], -1);
 }
+#endif
 
 // Re-arming a recv must preserve a pending opposite-direction send's EPOLLOUT on
 // the same fd (full-duplex tunnel backpressure). Drive the send to completion to
@@ -19343,6 +19362,7 @@ TEST(epoll_loop, ws_unpoll_upstream_deregisters_upstream_fd) {
 // Pre-tunnel backend EOF on the real epoll loop: records the deferred close and
 // deregisters the upstream fd (exercises ws_stop_upstream_poll's epoll branch).
 #if RUT_ENABLE_WEBSOCKET
+#ifdef __linux__
 TEST(epoll_loop, ws_pre_tunnel_backend_eof_defers_and_deregisters) {
     auto* loop = create_real_loop();
     REQUIRE(loop != nullptr);
@@ -19367,8 +19387,10 @@ TEST(epoll_loop, ws_pre_tunnel_backend_eof_defers_and_deregisters) {
     loop->shutdown();
     destroy_real_loop(loop);
 }
+#endif
 #endif  // RUT_ENABLE_WEBSOCKET
 
+#ifdef __linux__
 TEST(epoll_loop, add_recv_preserves_pending_send_epollout) {
     auto* loop = create_real_loop();
     REQUIRE(loop != nullptr);
@@ -19517,6 +19539,7 @@ TEST(epoll_loop, clear_upstream_fd_noop) {
     loop->shutdown();
     destroy_real_loop(loop);
 }
+#endif
 
 TEST(util, scan_uri_no_space_with_query_returns_end) {
     const u8 uri[] = "/hello/world?mode=fast";
@@ -19526,6 +19549,7 @@ TEST(util, scan_uri_no_space_with_query_returns_end) {
     CHECK_EQ(canon_end, 12u);
 }
 
+#ifdef __linux__
 TEST(epoll_loop, stop_and_is_running) {
     auto* loop = create_real_loop();
     REQUIRE(loop != nullptr);
@@ -19698,7 +19722,7 @@ TEST(epoll_episode_lifecycle, unexpected_del_failure_closes_and_is_not_reusable)
     EpollBackend backend{};
     REQUIRE(backend.init(0, -1).has_value());
     i32 fds[2] = {-1, -1};
-    REQUIRE_EQ(socketpair(AF_UNIX, SOCK_STREAM | SOCK_NONBLOCK, 0, fds), 0);
+    REQUIRE_EQ(rut::test::nonblocking_socketpair(fds), 0);
 
     Connection conn{};
     conn.reset();
@@ -19751,7 +19775,7 @@ TEST(epoll_episode_lifecycle, already_unregistered_del_is_reusable) {
     EpollBackend backend{};
     REQUIRE(backend.init(0, -1).has_value());
     i32 fds[2] = {-1, -1};
-    REQUIRE_EQ(socketpair(AF_UNIX, SOCK_STREAM | SOCK_NONBLOCK, 0, fds), 0);
+    REQUIRE_EQ(rut::test::nonblocking_socketpair(fds), 0);
 
     Connection conn{};
     conn.reset();
@@ -19783,7 +19807,7 @@ TEST(epoll_episode_lifecycle, unexpected_del_and_close_failure_quarantines_slot)
     REQUIRE(loop->init(0, -1, 0).has_value());
 
     i32 fds[2] = {-1, -1};
-    REQUIRE_EQ(socketpair(AF_UNIX, SOCK_STREAM | SOCK_NONBLOCK, 0, fds), 0);
+    REQUIRE_EQ(rut::test::nonblocking_socketpair(fds), 0);
     auto* conn = loop->alloc_conn();
     REQUIRE(conn != nullptr);
     const u32 cid = conn->id;
@@ -19941,7 +19965,7 @@ TEST(epoll_episode, stale_raw_recv_does_not_touch_buffer_and_current_token_recov
     EpollBackend backend{};
     REQUIRE(backend.init(0, -1).has_value());
     i32 fds[2] = {-1, -1};
-    REQUIRE_EQ(socketpair(AF_UNIX, SOCK_STREAM | SOCK_NONBLOCK, 0, fds), 0);
+    REQUIRE_EQ(rut::test::nonblocking_socketpair(fds), 0);
     Connection conns[1]{};
     conns[0].reset();
     conns[0].id = 0;
@@ -19972,7 +19996,7 @@ TEST(epoll_episode, current_recv_drops_stale_send_interest_without_mutating_stat
     EpollBackend backend{};
     REQUIRE(backend.init(0, -1).has_value());
     i32 fds[2] = {-1, -1};
-    REQUIRE_EQ(socketpair(AF_UNIX, SOCK_STREAM | SOCK_NONBLOCK, 0, fds), 0);
+    REQUIRE_EQ(rut::test::nonblocking_socketpair(fds), 0);
     Connection conns[1]{};
     conns[0].reset();
     conns[0].id = 0;
@@ -20004,7 +20028,7 @@ TEST(epoll_episode, stale_partial_send_does_not_touch_state_or_wire) {
     EpollBackend backend{};
     REQUIRE(backend.init(0, -1).has_value());
     i32 fds[2] = {-1, -1};
-    REQUIRE_EQ(socketpair(AF_UNIX, SOCK_STREAM | SOCK_NONBLOCK, 0, fds), 0);
+    REQUIRE_EQ(rut::test::nonblocking_socketpair(fds), 0);
     u32 filled = 0;
     u8 fill[4096] = {};
     for (;;) {
@@ -20044,7 +20068,7 @@ TEST(epoll_episode, synthetic_upstream_completion_preserves_episode_and_aux) {
     EpollBackend backend{};
     REQUIRE(backend.init(0, -1).has_value());
     i32 fds[2] = {-1, -1};
-    REQUIRE_EQ(socketpair(AF_UNIX, SOCK_STREAM | SOCK_NONBLOCK, 0, fds), 0);
+    REQUIRE_EQ(rut::test::nonblocking_socketpair(fds), 0);
     static const u8 payload[] = {'o', 'k'};
     Connection conns[1]{};
     conns[0].reset();
@@ -20074,11 +20098,13 @@ TEST(epoll_episode, synthetic_upstream_completion_preserves_episode_and_aux) {
     CHECK_EQ(events[0].aux, kLocalSubmitFailureAux);
     failure_backend.shutdown();
 }
+#endif
 
 namespace {
 bool g_epoll_episode_callback_called = false;
 u32 g_epoll_episode_callback_count = 0;
 
+#ifdef __linux__
 struct RealEpollEpisodeGuard {
     struct TrackedConnection {
         Connection* ptr = nullptr;
@@ -20210,6 +20236,7 @@ private:
         }
     }
 };
+#endif
 
 struct ScopedBackendHealthReset {
     ScopedBackendHealthReset() { reset_backend_health(); }
@@ -20218,6 +20245,7 @@ struct ScopedBackendHealthReset {
     ~ScopedBackendHealthReset() { reset_backend_health(); }
 };
 
+#ifdef __linux__
 struct EpollEpisodeSocketGuard {
     EpollBackend* backend;
     i32* fds;
@@ -20289,6 +20317,7 @@ Connection* track_single_health_probe(RealEpollEpisodeGuard& guard,
     }
     return match_count == 1 && all_tracked ? found : nullptr;
 }
+#endif
 
 bool recv_exact_from_real_peer(i32 fd, char* dst, u32 len) {
     u32 received = 0;
@@ -20305,10 +20334,11 @@ bool recv_exact_from_real_peer(i32 fd, char* dst, u32 len) {
 bool accept_real_upstream_peer(i32 listener_fd, i32& peer_fd) {
     struct pollfd ready{listener_fd, POLLIN, 0};
     if (poll(&ready, 1, 1000) <= 0) return false;
-    peer_fd = accept4(listener_fd, nullptr, nullptr, SOCK_NONBLOCK | SOCK_CLOEXEC);
+    peer_fd = rut::platform::accept_nonblocking(listener_fd);
     return peer_fd >= 0;
 }
 
+#ifdef __linux__
 bool connect_real_upstream(RealEpollEpisodeGuard& guard,
                            Connection& conn,
                            i32 listener_fd,
@@ -20327,6 +20357,7 @@ bool connect_real_upstream(RealEpollEpisodeGuard& guard,
     if (!accept_real_upstream_peer(listener_fd, peer_fd)) return false;
     return wait_for_real_upstream_completion(loop, completion);
 }
+#endif
 
 bool poll_ready_without_terminal(i32 fd, short expected, i32 timeout_ms, bool expect_ready) {
     static constexpr u32 kMaxInterruptedPolls = 8;
@@ -20438,6 +20469,7 @@ bool recv_exact_stream_to_eof(i32 peer, const u8* expected, u32 expected_len) {
 }
 }  // namespace
 
+#ifdef __linux__
 TEST(epoll_episode, dispatch_rejects_stale_tag_before_callback) {
     auto loop = std::make_unique<EpollEventLoop>();
     REQUIRE(loop->init(0, -1).has_value());
@@ -21941,7 +21973,7 @@ TEST(epoll_episode, stale_tls_send_cannot_rearm_or_hijack_current_recv) {
     EpollBackend backend{};
     REQUIRE(backend.init(0, -1).has_value());
     i32 fds[2] = {-1, -1};
-    REQUIRE_EQ(socketpair(AF_UNIX, SOCK_STREAM | SOCK_NONBLOCK, 0, fds), 0);
+    REQUIRE_EQ(rut::test::nonblocking_socketpair(fds), 0);
     EpollEpisodeSocketGuard guard{&backend, fds};
 
     Connection conns[1]{};
@@ -22024,6 +22056,7 @@ TEST(epoll_loop, callbacks_static_route_send_keepalive) {
     loop->shutdown();
     destroy_real_loop(loop);
 }
+#endif
 
 TEST(connection_lifecycle,
      downstream_completed_request_count_is_transport_owned_exact_once_and_saturating) {
@@ -22098,6 +22131,7 @@ TEST(connection_lifecycle,
     CHECK_EQ(saturating->downstream_completed_request_count, 0u);
 }
 
+#ifdef __linux__
 TEST(epoll_loop, callbacks_pipeline_incomplete_rearms_recv) {
     auto* loop = create_real_loop();
     REQUIRE(loop != nullptr);
@@ -22236,6 +22270,7 @@ TEST(epoll_loop, callbacks_upstream_connected_and_send_error_paths) {
     loop->shutdown();
     destroy_real_loop(loop);
 }
+#endif
 
 // === Coverage: drain inject with no-body response ===
 
@@ -24550,6 +24585,7 @@ TEST(legacy_loop, timeout_drain_closes_idle_connection) {
     loop->shutdown();
 }
 
+#ifdef __linux__
 TEST(legacy_loop, drain_wakes_valid_timerfd) {
     auto loop = std::make_unique<EventLoop<MockBackend>>();
     auto initialized = loop->init(0, -1);
@@ -24568,6 +24604,7 @@ TEST(legacy_loop, drain_wakes_valid_timerfd) {
     loop->backend.timer_fd = -1;
     loop->shutdown();
 }
+#endif
 
 TEST(legacy_loop, poll_command_updates_control_slots) {
     auto loop = std::make_unique<EventLoop<MockBackend>>();
@@ -26944,6 +26981,7 @@ TEST(state_invariant, jit_event_helpers_map_runtime_events) {
              static_cast<u8>(jit::YieldKind::HttpGet));
 }
 
+#ifdef __linux__
 TEST(state_invariant, iouring_user_data_preserves_full_timer_generation) {
     u32 conn_id = 0;
     IoEventType type = IoEventType::Accept;
@@ -27014,6 +27052,7 @@ TEST(state_invariant, response_read_timer_tokens_preserve_generation_and_cancel_
     cancel.result = -ECANCELED;
     CHECK_FALSE(valid_response_read_timer_transport_event(cancel));
 }
+#endif
 
 TEST(state_invariant, response_read_timer_owner_reset_and_exhaustion_are_strict) {
     ConnectionBase conn{};
@@ -27242,6 +27281,7 @@ TEST(state_invariant, response_accounting_clear_is_exact_and_reset_reuses_it) {
 }
 
 namespace {
+#ifdef __linux__
 struct ScopedIoUringLoopForRetirement {
     void* storage = MAP_FAILED;
     IoUringEventLoop* loop = nullptr;
@@ -27939,6 +27979,7 @@ TEST(iouring_staged_local_send, rejects_deadline_and_request_buffer_owners_witho
     rejected([](IoUringEventLoop&, Connection& c) { c.upstream_request_incomplete = true; });
     CHECK_EQ(cases, 15u);
 }
+#endif
 
 static u64 response_read_deadline_neutrality_test_handler(
     void*, jit::HandlerCtx*, const u8*, u32, void*) {
@@ -28030,6 +28071,7 @@ TEST(iouring_upstream_recv, response_deadline_neutrality_inventory_is_exhaustive
     CHECK(conn.response_read_deadline_owner_is_neutral());
 }
 
+#ifdef __linux__
 struct ScopedOneShotSelectorResources {
     IoUringEventLoop* loop = nullptr;
     Connection* conn = nullptr;
@@ -28082,7 +28124,7 @@ TEST(iouring_upstream_recv, one_shot_selector_is_narrow_and_episode_stable) {
     loop->config_ptr = &hot_ptr;
 
     i32 downstream[2] = {-1, -1};
-    REQUIRE_EQ(socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, downstream), 0);
+    REQUIRE_EQ(rut::test::stream_socketpair(downstream), 0);
     conn->fd = downstream[0];
     resources.peer_fd = downstream[1];
     conn->upstream_fd = dup(STDERR_FILENO);
@@ -28226,7 +28268,7 @@ struct OneShotRecvFixture {
         conn = loop->alloc_conn();
         if (conn == nullptr || !loop->alloc_upstream_buf(*conn)) return false;
         i32 downstream[2] = {-1, -1};
-        if (socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, downstream) != 0) return false;
+        if (rut::test::stream_socketpair(downstream) != 0) return false;
         conn->fd = downstream[0];
         peer_fd = downstream[1];
         conn->upstream_fd = dup(STDERR_FILENO);
@@ -28498,6 +28540,7 @@ TEST(iouring_upstream_recv, ring_full_closes_initial_incomplete_and_tls_low_wate
         }
     }
 }
+#endif
 
 void prepare_recv_only_retirement(Connection& conn, u32 episode) {
     conn.upstream_episode = episode;
@@ -28511,6 +28554,7 @@ void drain_strict_recv_retirement(IoUringEventLoop* loop,
                                   u32 episode,
                                   bool cancel_first);
 
+#ifdef __linux__
 TEST(iouring_retirement, strict_clean_success_callbacks_retire_live_recv_before_close) {
     for (const bool streaming : {false, true}) {
         ScopedIoUringLoopForRetirement guard;
@@ -28524,8 +28568,8 @@ TEST(iouring_retirement, strict_clean_success_callbacks_retire_live_recv_before_
         const u32 episode = streaming ? 503u : 501u;
         i32 downstream[2] = {-1, -1};
         i32 upstream[2] = {-1, -1};
-        REQUIRE_EQ(socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, downstream), 0);
-        REQUIRE_EQ(socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, upstream), 0);
+        REQUIRE_EQ(rut::test::stream_socketpair(downstream), 0);
+        REQUIRE_EQ(rut::test::stream_socketpair(upstream), 0);
         conn->fd = downstream[0];
         conn->upstream_fd = upstream[0];
         conn->upstream_episode = episode;
@@ -28720,7 +28764,7 @@ bool stage_http1_boundary_retirement(IoUringEventLoop* loop,
     Connection* conn = loop->alloc_conn();
     if (conn == nullptr || !loop->alloc_upstream_buf(*conn)) return false;
     i32 pair[2] = {-1, -1};
-    if (socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, pair) != 0) return false;
+    if (rut::test::stream_socketpair(pair) != 0) return false;
     conn->fd = pair[0];
     *peer_fd = pair[1];
     conn->upstream_fd = dup(STDERR_FILENO);
@@ -28886,6 +28930,7 @@ struct RawDownstreamRecvBatch {
             events, max_events, guard.loop->conns, IoUringEventLoop::kMaxConns);
     }
 };
+#endif
 
 static constexpr u8 kSplitHeaderPrefix[] =
     "GET /ledger?q=raw HTTP/1.1\r\n"
@@ -28898,6 +28943,7 @@ static constexpr u8 kSplitHeaderSuffix[] =
 static_assert(sizeof(kSplitHeaderPrefix) - 1u == 45u);
 static_assert(sizeof(kSplitHeaderSuffix) - 1u == 57u);
 
+#ifdef __linux__
 TEST(iouring_downstream_recv_barrier, split_positive_is_copied_one_per_wait) {
     for (const bool terminal_suffix : {false, true}) {
         RawDownstreamRecvBatch fixture;
@@ -29490,6 +29536,7 @@ TEST(iouring_downstream_recv_barrier, absolute_cq_positions_wrap_and_shutdown_cl
     CHECK_FALSE(fixture.guard.loop->backend.downstream_recv_progress_valid);
     fixture.guard.loop->backend.shutdown();
 }
+#endif
 
 u32 g_boundary_current_callback_count = 0;
 IoEvent g_boundary_current_event{};
@@ -29513,6 +29560,7 @@ void release_closed_response_read_fixture(PrebuiltD2Fixture& fixture);
 
 bool add_response_read_deadline_bundle(RouteConfig& config, u8 seconds);
 
+#ifdef __linux__
 bool stage_prebuilt_d2(IoUringEventLoop* loop,
                        const RouteConfig* request_config,
                        u8 targets,
@@ -29527,7 +29575,7 @@ bool stage_prebuilt_d2(IoUringEventLoop* loop,
         !loop->alloc_response_header_buf(*conn))
         return false;
     i32 pair[2] = {-1, -1};
-    if (socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, pair) != 0) return false;
+    if (rut::test::stream_socketpair(pair) != 0) return false;
     conn->fd = pair[0];
     out->peer_fd = pair[1];
     conn->upstream_fd = dup(STDERR_FILENO);
@@ -29713,6 +29761,7 @@ void cleanup_prebuilt_d2(IoUringEventLoop* loop, PrebuiltD2Fixture& fixture) {
     fixture.peer_fd = -1;
     fixture.conn = nullptr;
 }
+#endif
 
 // The live HEAD path deliberately stages its SQEs without submitting them in
 // these focused tests. Keep the original ring position so synthetic CQEs
@@ -29721,6 +29770,7 @@ bool add_bodyless_non_head_response_read_deadline_bundle(RouteConfig& config,
                                                          u8 seconds,
                                                          ForwardResponseBufferingMode buffering);
 
+#ifdef __linux__
 bool stage_live_precise_request(
     IoUringEventLoop* loop,
     RouteConfig& config,
@@ -29783,7 +29833,7 @@ bool stage_live_precise_request(
         return fail();
     };
     i32 downstream[2] = {-1, -1};
-    if (socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, downstream) != 0) return fail();
+    if (rut::test::stream_socketpair(downstream) != 0) return fail();
     conn->fd = downstream[0];
     out->peer_fd = downstream[1];
     static constexpr u8 kCloseRequest[] =
@@ -29799,8 +29849,8 @@ bool stage_live_precise_request(
     const u8* request = bodyless_get ? (downstream_close ? kGetCloseRequest : kGetKeepAliveRequest)
                         : downstream_close ? kCloseRequest
                                            : kKeepAliveRequest;
-    const u32 request_len = bodyless_get       ? (downstream_close ? sizeof(kGetCloseRequest) - 1u
-                                                                   : sizeof(kGetKeepAliveRequest) - 1u)
+    const u32 request_len = bodyless_get ? (downstream_close ? sizeof(kGetCloseRequest) - 1u
+                                                             : sizeof(kGetKeepAliveRequest) - 1u)
                             : downstream_close ? sizeof(kCloseRequest) - 1u
                                                : sizeof(kKeepAliveRequest) - 1u;
     if (conn->recv_buf.write(request, request_len) != request_len) return fail();
@@ -29950,6 +30000,7 @@ void neutralize_staged_precise_timer(IoUringEventLoop* loop, PrebuiltD2Fixture& 
     (void)conn.clear_response_read_timer_owner();
     conn.response_read_timer_last_progress_ns = 0;
 }
+#endif
 
 bool add_paired_head_failure_policies(RouteConfig& config) {
     ForwardResponsePolicySpec response{};
@@ -30112,6 +30163,7 @@ TEST(response_read_deadline_request_framing_selection,
         neutral, &config.routes[0], &config, config.routes[0].fn));
 }
 
+#ifdef __linux__
 TEST(response_read_deadline_request_framing_selection,
      get_complete_buffering_selects_id3_id1_and_waits_for_positive_body) {
     static constexpr u16 kId1 = static_cast<u16>(RequestPolicyId::Http11FixedStrip);
@@ -30158,7 +30210,7 @@ TEST(response_read_deadline_request_framing_selection,
         fixture.sq_tail_before = __atomic_load_n(loop->backend.sq_tail, __ATOMIC_ACQUIRE);
         fixture.backend_pending_before = loop->backend.pending;
         i32 downstream[2] = {-1, -1};
-        REQUIRE_EQ(socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, downstream), 0);
+        REQUIRE_EQ(rut::test::stream_socketpair(downstream), 0);
         conn->fd = downstream[0];
         fixture.peer_fd = downstream[1];
         REQUIRE_EQ(conn->recv_buf.write(reinterpret_cast<const u8*>(kNoClRequest),
@@ -30195,7 +30247,7 @@ TEST(response_read_deadline_request_framing_selection,
         REQUIRE(conn != nullptr);
         fixture.conn = conn;
         i32 downstream[2] = {-1, -1};
-        REQUIRE_EQ(socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, downstream), 0);
+        REQUIRE_EQ(rut::test::stream_socketpair(downstream), 0);
         conn->fd = downstream[0];
         fixture.peer_fd = downstream[1];
         static constexpr char kCl0Request[] =
@@ -30237,7 +30289,7 @@ TEST(response_read_deadline_request_framing_selection,
         fixture.sq_tail_before = __atomic_load_n(loop->backend.sq_tail, __ATOMIC_ACQUIRE);
         fixture.backend_pending_before = loop->backend.pending;
         i32 downstream[2] = {-1, -1};
-        REQUIRE_EQ(socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, downstream), 0);
+        REQUIRE_EQ(rut::test::stream_socketpair(downstream), 0);
         conn->fd = downstream[0];
         fixture.peer_fd = downstream[1];
         REQUIRE_EQ(conn->recv_buf.write(reinterpret_cast<const u8*>(kPositivePrefix),
@@ -30287,6 +30339,7 @@ TEST(response_read_deadline_request_framing_selection,
         cleanup_prebuilt_d2(loop, fixture);
     }
 }
+#endif
 
 TEST(response_read_deadline_request_framing_selection,
      completed_keepalive_boundary_starts_one_fresh_id1_episode_only_after_owner_settlement) {
@@ -30319,7 +30372,7 @@ TEST(response_read_deadline_request_framing_selection,
     REQUIRE(http1_pipeline_successor_upstream_owners_are_neutral(*conn));
     REQUIRE(conn->response_read_deadline_owner_is_neutral());
 
-    const i32 fake_upstream_fd = dup(2);
+    const i32 fake_upstream_fd = socket(AF_INET, SOCK_STREAM, 0);
     REQUIRE_GE(fake_upstream_fd, 0);
     ScopedFakeSocket fake_socket(fake_upstream_fd);
     response_read_deadline_framing_selection_handler_calls = 0;
@@ -30478,6 +30531,7 @@ struct CoalescedPhase1ArmedFixture {
 IoEvent response_read_copy_event(const Connection& conn, i32 result, bool more, u32 begin, u32 end);
 IoEvent exact_response_deadline_send_event(IoUringEventLoop* loop, Connection& conn);
 
+#ifdef __linux__
 bool stage_coalesced_phase1_armed(IoUringEventLoop* loop,
                                   RouteConfig& config,
                                   const u8* successor,
@@ -30497,7 +30551,7 @@ bool stage_coalesced_phase1_armed(IoUringEventLoop* loop,
     Connection* conn = loop->alloc_conn();
     if (conn == nullptr) return false;
     i32 downstream[2] = {-1, -1};
-    if (socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, downstream) != 0) return false;
+    if (rut::test::stream_socketpair(downstream) != 0) return false;
     conn->fd = downstream[0];
     if (conn->recv_buf.write(kRequest1, sizeof(kRequest1) - 1u) != sizeof(kRequest1) - 1u ||
         conn->recv_buf.write(successor, successor_len) != successor_len)
@@ -30558,7 +30612,7 @@ bool stage_coalesced_phase1_preconnect(IoUringEventLoop* loop,
     Connection* conn = loop->alloc_conn();
     if (conn == nullptr) return false;
     i32 downstream[2] = {-1, -1};
-    if (socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, downstream) != 0) return false;
+    if (rut::test::stream_socketpair(downstream) != 0) return false;
     conn->fd = downstream[0];
     if (conn->recv_buf.write(kRequest1, sizeof(kRequest1) - 1u) != sizeof(kRequest1) - 1u ||
         conn->recv_buf.write(successor, successor_len) != successor_len)
@@ -30770,7 +30824,7 @@ TEST(response_read_deadline_coalesced_get_phase1,
     Connection* conn = loop->alloc_conn();
     REQUIRE(conn != nullptr);
     i32 downstream[2] = {-1, -1};
-    REQUIRE_EQ(socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, downstream), 0);
+    REQUIRE_EQ(rut::test::stream_socketpair(downstream), 0);
     conn->fd = downstream[0];
     static constexpr u8 kRequest1[] =
         "GET /one HTTP/1.1\r\nHost: forged-successor.invalid\r\nX-One: a\r\n\r\n";
@@ -30868,7 +30922,7 @@ TEST(response_read_deadline_coalesced_get_phase1,
     Connection* conn = loop->alloc_conn();
     REQUIRE(conn != nullptr);
     i32 downstream[2] = {-1, -1};
-    REQUIRE_EQ(socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, downstream), 0);
+    REQUIRE_EQ(rut::test::stream_socketpair(downstream), 0);
     conn->fd = downstream[0];
     static constexpr u8 kRequest1[] = "GET /one HTTP/1.1\r\nHost: client.example\r\n\r\n";
     static constexpr u8 kSuccessor[] =
@@ -31260,7 +31314,7 @@ TEST(response_read_deadline_coalesced_get_phase1,
         REQUIRE(conn != nullptr);
         const u32 id = conn->id;
         i32 downstream[2] = {-1, -1};
-        REQUIRE_EQ(socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, downstream), 0);
+        REQUIRE_EQ(rut::test::stream_socketpair(downstream), 0);
         conn->fd = downstream[0];
         const char* request = "GET /one HTTP/1.1\r\nHost: client.example\r\n\r\n";
         if (shape == Shape::RequestCl0)
@@ -31360,7 +31414,7 @@ TEST(response_read_deadline_coalesced_get_phase1,
         Connection* conn = loop->alloc_conn();
         REQUIRE(conn != nullptr);
         i32 downstream[2] = {-1, -1};
-        REQUIRE_EQ(socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, downstream), 0);
+        REQUIRE_EQ(rut::test::stream_socketpair(downstream), 0);
         conn->fd = downstream[0];
         static constexpr u8 kRequests[] =
             "GET /one HTTP/1.1\r\nHost: client.example\r\n\r\n"
@@ -31539,6 +31593,7 @@ TEST(response_read_deadline_coalesced_get_phase1,
         cleanup_coalesced_phase1_fixture(loop, fixture);
     }
 }
+#endif
 
 struct PreconnectConnectSubmitFixture {
     Connection* conn = nullptr;
@@ -31548,6 +31603,7 @@ struct PreconnectConnectSubmitFixture {
     u32 backend_pending = 0;
 };
 
+#ifdef __linux__
 bool stage_preconnect_connect_submit(IoUringEventLoop* loop,
                                      RouteConfig& config,
                                      PreconnectConnectSubmitFixture* out) {
@@ -31561,7 +31617,7 @@ bool stage_preconnect_connect_submit(IoUringEventLoop* loop,
     Connection* conn = loop->alloc_conn();
     if (conn == nullptr) return false;
     i32 downstream[2] = {-1, -1};
-    if (socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, downstream) != 0) return false;
+    if (rut::test::stream_socketpair(downstream) != 0) return false;
     conn->fd = downstream[0];
     static constexpr u8 kRequest[] = "GET /one HTTP/1.1\r\nHost: client.example\r\n\r\n";
     if (conn->recv_buf.write(kRequest, sizeof(kRequest) - 1u) != sizeof(kRequest) - 1u)
@@ -31587,9 +31643,11 @@ bool stage_preconnect_connect_submit(IoUringEventLoop* loop,
     out->peer_fd = downstream[1];
     return true;
 }
+#endif
 
 enum class AsyncConnectFailureProfile : u8 { Head, BodylessGet, FixedUpload };
 
+#ifdef __linux__
 bool stage_async_connect_completion(
     IoUringEventLoop* loop,
     RouteConfig& config,
@@ -31615,7 +31673,7 @@ bool stage_async_connect_completion(
     Connection* conn = loop->alloc_conn();
     if (conn == nullptr) return false;
     i32 downstream[2] = {-1, -1};
-    if (socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, downstream) != 0) return false;
+    if (rut::test::stream_socketpair(downstream) != 0) return false;
     conn->fd = downstream[0];
     static constexpr u8 kHead[] = "HEAD /one HTTP/1.1\r\nHost: client.example\r\n\r\n";
     static constexpr u8 kGet[] = "GET /one HTTP/1.1\r\nHost: client.example\r\n\r\n";
@@ -31654,6 +31712,7 @@ bool stage_async_connect_completion(
     out->peer_fd = downstream[1];
     return true;
 }
+#endif
 
 IoEvent async_connect_failure_event(const Connection& conn, i32 result) {
     return {conn.id, result, 0, 0, IoEventType::UpstreamConnect, 0, 0, conn.upstream_episode};
@@ -31661,6 +31720,7 @@ IoEvent async_connect_failure_event(const Connection& conn, i32 result) {
 
 enum class LateFailureSite : u8 { SocketCreate, ConnectSubmit, ConnectCompletion };
 
+#ifdef __linux__
 bool stage_late_failure_response(
     IoUringEventLoop* loop,
     RouteConfig& config,
@@ -31813,9 +31873,11 @@ bool stage_pipeline_generation_successor_upload(
                conn.response_read_deadline_method,
                conn.response_read_deadline_route_method);
 }
+#endif
 
 void pipeline_generation_connect_callback(void*, Connection&, IoEvent) {}
 
+#ifdef __linux__
 struct PipelineGenerationFoundationLoop {
     static constexpr u32 kMaxConns = 1;
     struct BackendState {
@@ -35042,7 +35104,7 @@ TEST(iouring_preconnect_failure,
     Connection* conn = loop->alloc_conn();
     REQUIRE(conn != nullptr);
     i32 downstream[2] = {-1, -1};
-    REQUIRE_EQ(socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, downstream), 0);
+    REQUIRE_EQ(rut::test::stream_socketpair(downstream), 0);
     conn->fd = downstream[0];
     static constexpr u8 kRequest[] = "GET /one HTTP/1.1\r\nHost: client.example\r\n\r\n";
     REQUIRE_EQ(conn->recv_buf.write(kRequest, sizeof(kRequest) - 1u), sizeof(kRequest) - 1u);
@@ -35131,7 +35193,7 @@ TEST(iouring_preconnect_failure,
     Connection* conn = loop->alloc_conn();
     REQUIRE(conn != nullptr);
     i32 downstream[2] = {-1, -1};
-    REQUIRE_EQ(socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, downstream), 0);
+    REQUIRE_EQ(rut::test::stream_socketpair(downstream), 0);
     conn->fd = downstream[0];
     static constexpr u8 kRequest[] = "GET /one HTTP/1.1\r\nHost: client.example\r\n\r\n";
     REQUIRE_EQ(conn->recv_buf.write(kRequest, sizeof(kRequest) - 1u), sizeof(kRequest) - 1u);
@@ -35190,7 +35252,7 @@ TEST(iouring_preconnect_failure, head_socket_create_suppresses_body_and_keeps_al
     Connection* conn = loop->alloc_conn();
     REQUIRE(conn != nullptr);
     i32 downstream[2] = {-1, -1};
-    REQUIRE_EQ(socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, downstream), 0);
+    REQUIRE_EQ(rut::test::stream_socketpair(downstream), 0);
     conn->fd = downstream[0];
     static constexpr u8 kRequest[] = "HEAD /one HTTP/1.1\r\nHost: client.example\r\n\r\n";
     REQUIRE_EQ(conn->recv_buf.write(kRequest, sizeof(kRequest) - 1u), sizeof(kRequest) - 1u);
@@ -35241,7 +35303,7 @@ TEST(iouring_preconnect_failure, complete_buffered_get_socket_create_honors_expl
     REQUIRE(conn != nullptr);
     const u32 id = conn->id;
     i32 downstream[2] = {-1, -1};
-    REQUIRE_EQ(socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, downstream), 0);
+    REQUIRE_EQ(rut::test::stream_socketpair(downstream), 0);
     conn->fd = downstream[0];
     static constexpr u8 kRequest[] =
         "GET /one HTTP/1.1\r\nHost: client.example\r\nConnection: close\r\n\r\n";
@@ -35308,7 +35370,7 @@ TEST(iouring_preconnect_failure,
     Connection* conn = loop->alloc_conn();
     REQUIRE(conn != nullptr);
     i32 downstream[2] = {-1, -1};
-    REQUIRE_EQ(socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, downstream), 0);
+    REQUIRE_EQ(rut::test::stream_socketpair(downstream), 0);
     conn->fd = downstream[0];
     static constexpr u8 kPartial[] =
         "POST /one HTTP/1.1\r\nHost: client.example\r\nContent-Length: 3\r\n\r\na";
@@ -35383,7 +35445,7 @@ TEST(iouring_preconnect_failure,
     Connection* conn = loop->alloc_conn();
     REQUIRE(conn != nullptr);
     i32 downstream[2] = {-1, -1};
-    REQUIRE_EQ(socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, downstream), 0);
+    REQUIRE_EQ(rut::test::stream_socketpair(downstream), 0);
     conn->fd = downstream[0];
     static constexpr u8 kPartial[] =
         "POST /one HTTP/1.1\r\nHost: client.example\r\nContent-Length: 3\r\n\r\na";
@@ -35546,7 +35608,7 @@ TEST(iouring_preconnect_failure,
     Connection* conn = loop->alloc_conn();
     REQUIRE(conn != nullptr);
     i32 downstream[2] = {-1, -1};
-    REQUIRE_EQ(socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, downstream), 0);
+    REQUIRE_EQ(rut::test::stream_socketpair(downstream), 0);
     conn->fd = downstream[0];
     static constexpr u8 kRequest[] = "GET /one HTTP/1.1\r\nHost: client.example\r\n\r\n";
     REQUIRE_EQ(conn->recv_buf.write(kRequest, sizeof(kRequest) - 1u), sizeof(kRequest) - 1u);
@@ -35617,7 +35679,7 @@ TEST(iouring_preconnect_failure,
     REQUIRE(conn != nullptr);
     const u32 id = conn->id;
     i32 downstream[2] = {-1, -1};
-    REQUIRE_EQ(socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, downstream), 0);
+    REQUIRE_EQ(rut::test::stream_socketpair(downstream), 0);
     conn->fd = downstream[0];
     static constexpr u8 kRequest[] =
         "GET /one HTTP/1.1\r\nHost: client.example\r\nConnection: close\r\n\r\n";
@@ -35675,7 +35737,7 @@ TEST(iouring_preconnect_failure,
     Connection* conn = loop->alloc_conn();
     REQUIRE(conn != nullptr);
     i32 downstream[2] = {-1, -1};
-    REQUIRE_EQ(socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, downstream), 0);
+    REQUIRE_EQ(rut::test::stream_socketpair(downstream), 0);
     conn->fd = downstream[0];
     static constexpr u8 kPartial[] =
         "POST /one HTTP/1.1\r\nHost: client.example\r\nContent-Length: 3\r\n\r\na";
@@ -35730,7 +35792,7 @@ TEST(iouring_preconnect_failure,
     Connection* conn = loop->alloc_conn();
     REQUIRE(conn != nullptr);
     i32 downstream[2] = {-1, -1};
-    REQUIRE_EQ(socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, downstream), 0);
+    REQUIRE_EQ(rut::test::stream_socketpair(downstream), 0);
     conn->fd = downstream[0];
     static constexpr u8 kPartial[] =
         "POST /one HTTP/1.1\r\nHost: client.example\r\nContent-Length: 3\r\n\r\na";
@@ -36167,6 +36229,7 @@ TEST(iouring_preconnect_failure, staged_submit_false_after_flush_fails_closed_wi
     CHECK_EQ(loop->free_top, free_before);
     close(fixture.peer_fd);
 }
+#endif
 
 IoEvent response_read_copy_event(
     const Connection& conn, i32 result, bool more, u32 begin, u32 end) {
@@ -36187,6 +36250,7 @@ IoEvent response_read_copy_event(
     return event;
 }
 
+#ifdef __linux__
 IoEvent exact_response_deadline_send_event(IoUringEventLoop* loop, Connection& conn) {
     const u32 id = conn.id;
     const u32 len = conn.response_read_deadline_send_len;
@@ -36221,6 +36285,7 @@ bool arm_staged_response_read_deadline(IoUringEventLoop* loop,
     loop->timer.add(&conn, seconds);
     return true;
 }
+#endif
 
 void release_closed_response_read_fixture(PrebuiltD2Fixture& fixture) {
     if (fixture.peer_fd >= 0) close(fixture.peer_fd);
@@ -36228,6 +36293,7 @@ void release_closed_response_read_fixture(PrebuiltD2Fixture& fixture) {
     fixture.conn = nullptr;
 }
 
+#ifdef __linux__
 bool stage_strict_read_timeout_method(IoUringEventLoop* loop,
                                       const RouteConfig* request_config,
                                       const u8* late_downstream,
@@ -36243,8 +36309,8 @@ bool stage_strict_read_timeout_method(IoUringEventLoop* loop,
         return false;
     i32 downstream[2] = {-1, -1};
     i32 upstream[2] = {-1, -1};
-    if (socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, downstream) != 0 ||
-        socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, upstream) != 0)
+    if (rut::test::stream_socketpair(downstream) != 0 ||
+        rut::test::stream_socketpair(upstream) != 0)
         return false;
     conn->fd = downstream[0];
     out->peer_fd = downstream[1];
@@ -36488,6 +36554,7 @@ TEST(http1_pipeline_generation_activation,
         }
     }
 }
+#endif
 
 TEST(http1_pipeline_generation_foundation,
      copied_prebuilt_neutral_inventory_matches_canonical_clear) {
@@ -36522,6 +36589,7 @@ TEST(http1_pipeline_generation_foundation,
     rejected_while([&] { conn.http1_prebuilt_status = 200; });
 }
 
+#ifdef __linux__
 bool stage_complete_buffering_prebuilt_d2(
     IoUringEventLoop* loop,
     RouteConfig* config,
@@ -36600,7 +36668,7 @@ bool stage_fixed_upload_complete_buffering_armed(IoUringEventLoop* loop,
     Connection* conn = loop->alloc_conn();
     if (conn == nullptr) return false;
     i32 downstream[2] = {-1, -1};
-    if (socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, downstream) != 0) return false;
+    if (rut::test::stream_socketpair(downstream) != 0) return false;
     conn->fd = downstream[0];
     out->peer_fd = downstream[1];
     out->sq_tail_before = __atomic_load_n(loop->backend.sq_tail, __ATOMIC_ACQUIRE);
@@ -36708,7 +36776,7 @@ bool stage_strict_parse_failure(IoUringEventLoop* loop,
         !loop->alloc_response_header_buf(*conn))
         return false;
     i32 pair[2] = {-1, -1};
-    if (socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, pair) != 0) return false;
+    if (rut::test::stream_socketpair(pair) != 0) return false;
     conn->fd = pair[0];
     out->peer_fd = pair[1];
     conn->upstream_fd = dup(STDERR_FILENO);
@@ -36750,8 +36818,10 @@ bool stage_strict_parse_failure(IoUringEventLoop* loop,
     out->conn = conn;
     return true;
 }
+#endif
 }  // namespace
 
+#ifdef __linux__
 TEST(iouring_prebuilt, send_and_retirement_orderings_resume_only_at_batch_end) {
     static constexpr u8 kRequest2[] =
         "GET /two HTTP/1.1\r\nHost: new.example\r\nConnection: close\r\n\r\n";
@@ -37046,7 +37116,7 @@ TEST(iouring_prebuilt, zero_owner_advance_and_exhaustion_never_submit_header_at_
     REQUIRE(conn != nullptr);
     REQUIRE(loop->alloc_response_header_buf(*conn));
     i32 pair[2] = {-1, -1};
-    REQUIRE_EQ(socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, pair), 0);
+    REQUIRE_EQ(rut::test::stream_socketpair(pair), 0);
     conn->fd = pair[0];
     conn->upstream_fd = dup(STDERR_FILENO);
     REQUIRE_GE(conn->upstream_fd, 0);
@@ -37135,7 +37205,7 @@ TEST(iouring_prebuilt, invalid_body_layout_source_and_owner_are_transactional) {
     REQUIRE(conn != nullptr);
     REQUIRE(loop->alloc_response_header_buf(*conn));
     i32 pair[2] = {-1, -1};
-    REQUIRE_EQ(socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, pair), 0);
+    REQUIRE_EQ(rut::test::stream_socketpair(pair), 0);
     conn->fd = pair[0];
     conn->upstream_fd = dup(STDERR_FILENO);
     REQUIRE_GE(conn->upstream_fd, 0);
@@ -37682,6 +37752,7 @@ TEST(iouring_parse_failure, non_admissible_causes_and_upload_state_close_before_
         fixture.conn = nullptr;
     }
 }
+#endif
 
 TEST(iouring_timeout_policy, explicit_serializer_selects_timeout_without_mutating_ids) {
     RouteConfig config{};
@@ -37717,6 +37788,7 @@ TEST(iouring_timeout_policy, explicit_serializer_selects_timeout_without_mutatin
     CHECK_EQ(conn.timeout_failure_policy_id, 2u);
 }
 
+#ifdef __linux__
 TEST(response_read_deadline, preflight_pins_only_the_exact_cleartext_head_shape) {
     ScopedIoUringLoopForRetirement guard;
     if (!guard.init()) SKIP("io_uring unavailable");
@@ -37782,7 +37854,7 @@ TEST(response_read_deadline, header_only_head_explicit_close_admits_fixed_strip_
     Connection* conn = loop->alloc_conn();
     REQUIRE(conn != nullptr);
     i32 downstream[2] = {-1, -1};
-    REQUIRE_EQ(socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, downstream), 0);
+    REQUIRE_EQ(rut::test::stream_socketpair(downstream), 0);
     conn->fd = downstream[0];
     static constexpr u8 kRequest[] =
         "HEAD /one?q=1 HTTP/1.1\r\nHost: client.example\r\nConnection: close\r\n\r\n";
@@ -38066,11 +38138,13 @@ TEST(response_read_deadline, header_only_head_explicit_close_admits_fixed_strip_
     CHECK_FALSE(loop->backend.fatal_error.load(std::memory_order_acquire));
     close(downstream[1]);
 }
+#endif
 
 static u32 test_precise_remaining_ms(u64 elapsed_ns, u64 timeout_ns) {
     return response_read_timer_remaining_ms(100, timeout_ns, 100 + timeout_ns - elapsed_ns);
 }
 
+#ifdef __linux__
 TEST(iouring_response_read_timer, precise_arm_publishes_transport_owner_after_live_send) {
     ScopedIoUringLoopForRetirement guard;
     if (!guard.init()) SKIP("io_uring unavailable");
@@ -38109,12 +38183,14 @@ TEST(iouring_response_read_timer, precise_arm_publishes_transport_owner_after_li
     neutralize_staged_precise_timer(loop, fixture);
     cleanup_prebuilt_d2(loop, fixture);
 }
+#endif
 
 bool stage_live_precise_fixed_upload_head(IoUringEventLoop* loop,
                                           RouteConfig& config,
                                           PrebuiltD2Fixture* fixture,
                                           bool force_initial_timer_sq_full = false);
 
+#ifdef __linux__
 TEST(iouring_response_read_timer,
      precise_keep_alive_head_classifier_and_arm_are_exact_without_wheel) {
     ScopedIoUringLoopForRetirement guard;
@@ -39597,7 +39673,7 @@ TEST(response_read_deadline, timeout_header_only_head_live_proof_is_strict) {
     Connection* conn = loop->alloc_conn();
     REQUIRE(conn != nullptr);
     i32 downstream[2] = {-1, -1};
-    REQUIRE_EQ(socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, downstream), 0);
+    REQUIRE_EQ(rut::test::stream_socketpair(downstream), 0);
     conn->fd = downstream[0];
     static constexpr u8 kRequest[] =
         "HEAD /one?q=1 HTTP/1.1\r\nHost: client.example\r\nConnection: close\r\n\r\n";
@@ -39912,7 +39988,7 @@ TEST(response_read_deadline,
         Connection* conn = loop->alloc_conn();
         REQUIRE(conn != nullptr);
         i32 downstream[2] = {-1, -1};
-        REQUIRE_EQ(socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, downstream), 0);
+        REQUIRE_EQ(rut::test::stream_socketpair(downstream), 0);
         conn->fd = downstream[0];
         REQUIRE_EQ(conn->recv_buf.write(reinterpret_cast<const u8*>(request.data()),
                                         static_cast<u32>(request.size())),
@@ -39959,7 +40035,7 @@ TEST(response_read_deadline,
         Connection* conn = loop->alloc_conn();
         REQUIRE(conn != nullptr);
         i32 downstream[2] = {-1, -1};
-        REQUIRE_EQ(socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, downstream), 0);
+        REQUIRE_EQ(rut::test::stream_socketpair(downstream), 0);
         conn->fd = downstream[0];
         REQUIRE_EQ(conn->recv_buf.write(reinterpret_cast<const u8*>(request.data()),
                                         static_cast<u32>(request.size())),
@@ -41198,7 +41274,7 @@ TEST(response_read_deadline, invalid_batch_pin_blocks_same_batch_accept_reuse) {
     const u32 backend_pending_before = loop->backend.pending;
 
     i32 accepted[2] = {-1, -1};
-    REQUIRE_EQ(socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, accepted), 0);
+    REQUIRE_EQ(rut::test::stream_socketpair(accepted), 0);
     // Model an exhausted shard.  Without the batch pin, the four synthetic
     // close completions below would publish this exact id before Accept runs.
     loop->free_top = 0;
@@ -41256,7 +41332,7 @@ TEST(iouring_timeout_policy, production_jit_forward_reaches_recv_only_timer_admi
     Connection* conn = loop->alloc_conn();
     REQUIRE(conn != nullptr);
     i32 downstream[2] = {-1, -1};
-    REQUIRE_EQ(socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, downstream), 0);
+    REQUIRE_EQ(rut::test::stream_socketpair(downstream), 0);
     conn->fd = downstream[0];
     static constexpr u8 kRequest[] = "HEAD /one HTTP/1.1\r\nHost: old.example\r\n\r\n";
     REQUIRE_EQ(conn->recv_buf.write(kRequest, sizeof(kRequest) - 1u), sizeof(kRequest) - 1u);
@@ -41665,6 +41741,7 @@ TEST(response_read_deadline_non_head_cl0,
         CHECK_EQ(loop->free_top, IoUringEventLoop::kMaxConns);
     }
 }
+#endif
 
 TEST(response_read_deadline_profile_traits, current_values_and_invalid_values_are_exhaustive) {
     struct Expected {
@@ -41813,6 +41890,7 @@ TEST(response_read_deadline_fixed_upload_head_unreachable,
     }
 }
 
+#ifdef __linux__
 TEST(response_read_deadline_fixed_upload_head_activation,
      classifier_and_preflight_pin_partial_and_complete_uploads_without_effects) {
     static constexpr u8 kPrefix[] =
@@ -41833,7 +41911,7 @@ TEST(response_read_deadline_fixed_upload_head_activation,
             Connection* conn = loop->alloc_conn();
             REQUIRE(conn != nullptr);
             i32 downstream[2] = {-1, -1};
-            REQUIRE_EQ(socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, downstream), 0);
+            REQUIRE_EQ(rut::test::stream_socketpair(downstream), 0);
             conn->fd = downstream[0];
             REQUIRE_EQ(conn->recv_buf.write(kPrefix, sizeof(kPrefix) - 1u), sizeof(kPrefix) - 1u);
             REQUIRE_EQ(conn->recv_buf.write(kBody, body_len), body_len);
@@ -41917,7 +41995,7 @@ TEST(response_read_deadline_fixed_upload_head_activation,
             Connection* conn = loop->alloc_conn();
             REQUIRE(conn != nullptr);
             i32 downstream[2] = {-1, -1};
-            REQUIRE_EQ(socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, downstream), 0);
+            REQUIRE_EQ(rut::test::stream_socketpair(downstream), 0);
             conn->fd = downstream[0];
             REQUIRE_EQ(conn->recv_buf.write(kPrefix, sizeof(kPrefix) - 1u), sizeof(kPrefix) - 1u);
             REQUIRE_EQ(conn->recv_buf.write(kBody, initial_body_len), initial_body_len);
@@ -42283,7 +42361,7 @@ bool stage_unreachable_fixed_upload_head_wait(
     Connection* conn = loop->alloc_conn();
     if (conn == nullptr) return false;
     i32 downstream[2] = {-1, -1};
-    if (socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, downstream) != 0) return false;
+    if (rut::test::stream_socketpair(downstream) != 0) return false;
     conn->fd = downstream[0];
     out->peer_fd = downstream[1];
     out->sq_tail_before = __atomic_load_n(loop->backend.sq_tail, __ATOMIC_ACQUIRE);
@@ -42332,6 +42410,7 @@ bool stage_unreachable_fixed_upload_head_wait(
     out->conn = conn;
     return response_read_deadline_fixed_upload_route_stable(*conn, false);
 }
+#endif
 
 enum class FixedUploadHeadPreconnectFailureSite : u8 {
     SocketCreate,
@@ -42339,6 +42418,7 @@ enum class FixedUploadHeadPreconnectFailureSite : u8 {
     ConnectCompletion,
 };
 
+#ifdef __linux__
 bool complete_unreachable_fixed_upload_head_to_preconnect(IoUringEventLoop* loop,
                                                           PrebuiltD2Fixture& fixture) {
     static constexpr u8 kLast[] = {0x7f, 0x78, 0x00, 0x4e, 0x47, 0x49, 0x58};
@@ -44769,7 +44849,7 @@ TEST(response_read_deadline_fixed_upload,
             Connection* conn = loop->alloc_conn();
             REQUIRE(conn != nullptr);
             i32 downstream[2] = {-1, -1};
-            REQUIRE_EQ(socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, downstream), 0);
+            REQUIRE_EQ(rut::test::stream_socketpair(downstream), 0);
             conn->fd = downstream[0];
             static constexpr u8 kPostPartial[] =
                 "POST /one?q=1 HTTP/1.1\r\nHost: client.example\r\nContent-Length: 3\r\n\r\na";
@@ -44872,7 +44952,7 @@ TEST(response_read_deadline_fixed_upload,
             Connection* conn = loop->alloc_conn();
             REQUIRE(conn != nullptr);
             i32 downstream[2] = {-1, -1};
-            REQUIRE_EQ(socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, downstream), 0);
+            REQUIRE_EQ(rut::test::stream_socketpair(downstream), 0);
             conn->fd = downstream[0];
             static constexpr u8 kPostRequest[] =
                 "POST /one HTTP/1.1\r\nHost: client.example\r\nContent-Length: 2\r\n\r\nxy";
@@ -44932,7 +45012,7 @@ TEST(response_read_deadline_fixed_upload,
         Connection* conn = loop->alloc_conn();
         REQUIRE(conn != nullptr);
         i32 downstream[2] = {-1, -1};
-        REQUIRE_EQ(socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, downstream), 0);
+        REQUIRE_EQ(rut::test::stream_socketpair(downstream), 0);
         conn->fd = downstream[0];
         static constexpr u8 kPostPrefix[] =
             "POST /one HTTP/1.1\r\nHost: client.example\r\nContent-Length: 4\r\n\r\n";
@@ -45062,7 +45142,7 @@ TEST(response_read_deadline_fixed_upload,
             Connection* conn = loop->alloc_conn();
             REQUIRE(conn != nullptr);
             i32 downstream[2] = {-1, -1};
-            REQUIRE_EQ(socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, downstream), 0);
+            REQUIRE_EQ(rut::test::stream_socketpair(downstream), 0);
             conn->fd = downstream[0];
             REQUIRE_EQ(conn->recv_buf.write(test.prefix, test.prefix_len), test.prefix_len);
             REQUIRE_EQ(conn->recv_buf.write(kFirst, sizeof(kFirst)), sizeof(kFirst));
@@ -45261,7 +45341,7 @@ TEST(response_read_deadline_fixed_upload,
         Connection* conn = loop->alloc_conn();
         REQUIRE(conn != nullptr);
         i32 downstream[2] = {-1, -1};
-        REQUIRE_EQ(socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, downstream), 0);
+        REQUIRE_EQ(rut::test::stream_socketpair(downstream), 0);
         conn->fd = downstream[0];
         REQUIRE_EQ(conn->recv_buf.write(kPrefix, sizeof(kPrefix) - 1u), sizeof(kPrefix) - 1u);
         response_read_deadline_fixed_upload_handler_calls = 0;
@@ -45383,7 +45463,7 @@ TEST(response_read_deadline_fixed_upload,
         Connection* conn = loop->alloc_conn();
         REQUIRE(conn != nullptr);
         i32 downstream[2] = {-1, -1};
-        REQUIRE_EQ(socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, downstream), 0);
+        REQUIRE_EQ(rut::test::stream_socketpair(downstream), 0);
         conn->fd = downstream[0];
         REQUIRE_EQ(conn->recv_buf.write(kPartial, sizeof(kPartial) - 1u), sizeof(kPartial) - 1u);
         const u32 id = conn->id;
@@ -45453,7 +45533,7 @@ TEST(response_read_deadline_fixed_upload,
         Connection* conn = loop->alloc_conn();
         REQUIRE(conn != nullptr);
         i32 downstream[2] = {-1, -1};
-        REQUIRE_EQ(socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, downstream), 0);
+        REQUIRE_EQ(rut::test::stream_socketpair(downstream), 0);
         conn->fd = downstream[0];
         static constexpr u8 kRequest[] =
             "POST /one HTTP/1.1\r\nHost: x\r\nContent-Length: 2\r\n\r\nxy";
@@ -45559,7 +45639,7 @@ TEST(response_read_deadline_fixed_upload,
     Connection* conn = loop->alloc_conn();
     REQUIRE(conn != nullptr);
     i32 downstream[2] = {-1, -1};
-    REQUIRE_EQ(socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, downstream), 0);
+    REQUIRE_EQ(rut::test::stream_socketpair(downstream), 0);
     conn->fd = downstream[0];
     static constexpr u8 kRequest[] =
         "PUT /one HTTP/1.1\r\nHost: client.example\r\nContent-Length: 3\r\n\r\n"
@@ -45667,7 +45747,7 @@ TEST(response_read_deadline_fixed_upload,
     Connection* conn = loop->alloc_conn();
     REQUIRE(conn != nullptr);
     i32 downstream[2] = {-1, -1};
-    REQUIRE_EQ(socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, downstream), 0);
+    REQUIRE_EQ(rut::test::stream_socketpair(downstream), 0);
     conn->fd = downstream[0];
     static constexpr u8 kRequest[] =
         "PATCH /one HTTP/1.1\r\nHost: x\r\nContent-Length: 2\r\n\r\nxy";
@@ -45783,7 +45863,7 @@ TEST(response_read_deadline_fixed_upload,
             Connection* conn = loop->alloc_conn();
             REQUIRE(conn != nullptr);
             i32 downstream[2] = {-1, -1};
-            REQUIRE_EQ(socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, downstream), 0);
+            REQUIRE_EQ(rut::test::stream_socketpair(downstream), 0);
             conn->fd = downstream[0];
             static constexpr u8 kPostRequest[] =
                 "POST /one?q=1 HTTP/1.1\r\nHost: client.example\r\nContent-Length: "
@@ -46775,7 +46855,7 @@ TEST(response_read_deadline_fixed_upload,
     Connection* conn = loop->alloc_conn();
     REQUIRE(conn != nullptr);
     i32 downstream[2] = {-1, -1};
-    REQUIRE_EQ(socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, downstream), 0);
+    REQUIRE_EQ(rut::test::stream_socketpair(downstream), 0);
     conn->fd = downstream[0];
     conn->upstream_fd = dup(STDERR_FILENO);
     REQUIRE_GE(conn->upstream_fd, 0);
@@ -46830,7 +46910,7 @@ TEST(response_read_deadline_fixed_upload,
         Connection* conn = loop->alloc_conn();
         REQUIRE(conn != nullptr);
         i32 downstream[2] = {-1, -1};
-        REQUIRE_EQ(socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, downstream), 0);
+        REQUIRE_EQ(rut::test::stream_socketpair(downstream), 0);
         conn->fd = downstream[0];
         conn->upstream_fd = dup(STDERR_FILENO);
         REQUIRE_GE(conn->upstream_fd, 0);
@@ -47890,7 +47970,7 @@ TEST(response_buffering_runtime,
             Connection* conn = loop->alloc_conn();
             REQUIRE(conn != nullptr);
             i32 downstream[2] = {-1, -1};
-            REQUIRE_EQ(socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, downstream), 0);
+            REQUIRE_EQ(rut::test::stream_socketpair(downstream), 0);
             conn->fd = downstream[0];
             char request[256]{};
             const int request_len = snprintf(request,
@@ -47951,7 +48031,7 @@ TEST(response_buffering_runtime,
     Connection* conn = loop->alloc_conn();
     REQUIRE(conn != nullptr);
     i32 downstream[2] = {-1, -1};
-    REQUIRE_EQ(socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, downstream), 0);
+    REQUIRE_EQ(rut::test::stream_socketpair(downstream), 0);
     conn->fd = downstream[0];
     static constexpr u8 kTrace[] =
         "TRACE /buffered?q=1 HTTP/1.1\r\nHost: client.example\r\nX-Test: value\r\n\r\n";
@@ -48094,7 +48174,7 @@ TEST(response_buffering_runtime,
     REQUIRE(conn != nullptr);
     const u32 id = conn->id;
     i32 downstream[2] = {-1, -1};
-    REQUIRE_EQ(socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, downstream), 0);
+    REQUIRE_EQ(rut::test::stream_socketpair(downstream), 0);
     conn->fd = downstream[0];
     static constexpr u8 kRequest[] = "GET /buffered HTTP/1.1\r\nHost: client.example\r\n\r\n";
     REQUIRE_EQ(conn->recv_buf.write(kRequest, sizeof(kRequest) - 1u), sizeof(kRequest) - 1u);
@@ -48124,7 +48204,7 @@ TEST(response_buffering_runtime,
     REQUIRE(conn != nullptr);
     const u32 id = conn->id;
     i32 downstream[2] = {-1, -1};
-    REQUIRE_EQ(socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, downstream), 0);
+    REQUIRE_EQ(rut::test::stream_socketpair(downstream), 0);
     conn->fd = downstream[0];
     static constexpr u8 kRequest[] = "GET /buffered HTTP/1.1\r\nHost: client.example\r\n\r\n";
     REQUIRE_EQ(conn->recv_buf.write(kRequest, sizeof(kRequest) - 1u), sizeof(kRequest) - 1u);
@@ -48169,7 +48249,7 @@ TEST(response_buffering_runtime,
         Connection* conn = loop->alloc_conn();
         REQUIRE(conn != nullptr);
         i32 downstream[2] = {-1, -1};
-        REQUIRE_EQ(socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, downstream), 0);
+        REQUIRE_EQ(rut::test::stream_socketpair(downstream), 0);
         conn->fd = downstream[0];
         const u32 len = static_cast<u32>(strlen(request));
         REQUIRE_EQ(conn->recv_buf.write(reinterpret_cast<const u8*>(request), len), len);
@@ -48212,7 +48292,7 @@ TEST(response_buffering_runtime,
         Connection* conn = loop->alloc_conn();
         REQUIRE(conn != nullptr);
         i32 downstream[2] = {-1, -1};
-        REQUIRE_EQ(socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, downstream), 0);
+        REQUIRE_EQ(rut::test::stream_socketpair(downstream), 0);
         conn->fd = downstream[0];
         const u32 len = static_cast<u32>(strlen(vector.request));
         REQUIRE_EQ(conn->recv_buf.write(reinterpret_cast<const u8*>(vector.request), len), len);
@@ -48295,6 +48375,7 @@ TEST(response_buffering_runtime,
         release_closed_response_read_fixture(fixture);
     }
 }
+#endif
 
 TEST(response_buffering_runtime, complete_content_length_status_allowlist_is_exact) {
     for (const u16 status : {static_cast<u16>(200), static_cast<u16>(201), static_cast<u16>(202)})
@@ -48474,6 +48555,7 @@ TEST(response_buffering_runtime, coherent_single_range_206_raw_and_pinned_tuple_
     }
 }
 
+#ifdef __linux__
 TEST(response_buffering_runtime,
      coherent_single_range_206_post_header_compaction_revalidates_pinned_tuple) {
     ScopedIoUringLoopForRetirement guard;
@@ -49570,6 +49652,7 @@ TEST(response_buffering_runtime,
         cleanup_prebuilt_d2(loop, fixture);
     }
 }
+#endif
 
 static constexpr u8 kStrict304MetadataResponse[] =
     "HTTP/1.1 304 Not Modified\r\n"
@@ -49586,6 +49669,7 @@ static IoEvent stage_strict_304_metadata_response(Connection& conn) {
     return response_read_copy_event(conn, len, true, 0, len);
 }
 
+#ifdef __linux__
 static void drain_strict_304_timer_cancel(rut::test::TestCase* _tc,
                                           IoUringEventLoop* loop,
                                           Connection& conn,
@@ -49919,6 +50003,7 @@ TEST(response_read_deadline_get_304_metadata,
         }
     }
 }
+#endif
 
 TEST(response_read_deadline_get_304_metadata,
      default_serializer_rejects_304_and_dedicated_mode_is_exact) {
@@ -49957,6 +50042,7 @@ TEST(response_read_deadline_get_304_metadata,
         conn.response_header_buf.data(), conn.response_header_buf.len(), "ETag: \"v1\"\r\n"));
 }
 
+#ifdef __linux__
 TEST(response_read_deadline_get_304_metadata,
      d2_revalidates_layout_purpose_status_length_and_owner_proof) {
     enum class Forgery : u8 {
@@ -50949,6 +51035,7 @@ TEST(response_buffering_runtime,
         release_closed_response_read_fixture(fixture);
     }
 }
+#endif
 
 static bool normalize_strict_imf_fixdate_header(u8* data, u32 len);
 
@@ -51204,6 +51291,7 @@ TEST(response_buffering_runtime,
     }
 }
 
+#ifdef __linux__
 TEST(response_buffering_runtime,
      bounded_content_type_200_201_and_202_complete_and_fragmented_preserve_wire_and_access) {
     struct StatusVector {
@@ -51579,6 +51667,7 @@ TEST(response_buffering_runtime, complete_body_wins_clean_eof_in_either_batch_or
         cleanup_prebuilt_d2(loop, fixture);
     }
 }
+#endif
 
 // Validate the sole dynamic field before masking it for an otherwise byte-exact
 // response-wire comparison. The mutation happens only after the complete header
@@ -51690,6 +51779,7 @@ TEST(response_buffering_runtime, strict_date_normalizer_is_transactional_and_hea
         "Date: Tue, 01 Jan 2030 00:00:00 GMT");
 }
 
+#ifdef __linux__
 TEST(response_buffering_runtime,
      initial_complete_body_wins_clean_eof_and_due_timeout_in_every_batch_order) {
     enum EventIndex : u8 { Complete = 0, CleanEof = 1, DueTimeout = 2 };
@@ -54909,7 +54999,7 @@ TEST(iouring_retirement, downstream_close_during_second_retirement_reclaims_exac
     conn->upstream_recv_armed = false;
 
     i32 downstream[2] = {-1, -1};
-    REQUIRE_EQ(socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, downstream), 0);
+    REQUIRE_EQ(rut::test::stream_socketpair(downstream), 0);
     conn->fd = downstream[0];
     conn->upstream_fd = dup(STDERR_FILENO);
     REQUIRE_GE(conn->upstream_fd, 0);
@@ -54970,7 +55060,7 @@ TEST(iouring_retirement, latest_tombstone_composes_with_request_three_close_ledg
     REQUIRE_EQ(conn->upstream_episode, kThird);
 
     i32 downstream[2] = {-1, -1};
-    REQUIRE_EQ(socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, downstream), 0);
+    REQUIRE_EQ(rut::test::stream_socketpair(downstream), 0);
     conn->fd = downstream[0];
     conn->upstream_fd = dup(STDERR_FILENO);
     REQUIRE_GE(conn->upstream_fd, 0);
@@ -55531,7 +55621,7 @@ TEST(iouring_boundary, max_episode_without_retirement_owner_closes_before_reques
     const u32 id = conn->id;
     const u32 free_before = loop->free_top;
     i32 pair[2] = {-1, -1};
-    REQUIRE_EQ(socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, pair), 0);
+    REQUIRE_EQ(rut::test::stream_socketpair(pair), 0);
     conn->fd = pair[0];
     conn->upstream_fd = dup(STDERR_FILENO);
     REQUIRE_GE(conn->upstream_fd, 0);
@@ -56328,7 +56418,7 @@ TEST(iouring_retirement, production_callbacks_compose_two_boundaries_before_requ
     REQUIRE(conn != nullptr);
     const u32 id = conn->id;
     i32 downstream[2] = {-1, -1};
-    REQUIRE_EQ(socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, downstream), 0);
+    REQUIRE_EQ(rut::test::stream_socketpair(downstream), 0);
     conn->fd = downstream[0];
     conn->upstream_fd = dup(STDERR_FILENO);
     REQUIRE_GE(conn->upstream_fd, 0);
@@ -56616,6 +56706,7 @@ TEST(iouring_episode, current_partial_send_resubmits_with_current_episode) {
 
     backend.shutdown();
 }
+#endif
 
 TEST(iouring_episode, generic_async_dispatch_fences_stale_and_neutral_events) {
     auto loop = std::make_unique<EventLoop<AsyncMockBackend>>();
@@ -56693,6 +56784,7 @@ TEST(iouring_episode, generic_async_dispatch_reclaims_closed_stale_slot_once) {
     loop->shutdown();
 }
 
+#ifdef __linux__
 TEST(iouring_episode, stale_provided_recv_returns_buffer_without_copy) {
     IoUringBackend backend{};
     auto initialized = backend.init(0, -1);
@@ -56988,6 +57080,7 @@ TEST(iouring_episode, current_tagged_dispatch_updates_specialized_loop_state) {
     loop->~IoUringEventLoop();
     munmap(storage, sizeof(IoUringEventLoop));
 }
+#endif
 
 TEST(state_invariant, stale_handler_timer_keeps_active_yield_armed) {
     AsyncSmallLoop loop;
@@ -61229,6 +61322,7 @@ TEST(http2, new_request_reset_clears_connection_wide_mutations) {
 // tests use the same copied CQE ledger as the real wait/dispatch path; direct
 // callback calls would not prove admission because dispatch_batch is where the
 // first-batch owner is captured.
+#ifdef __linux__
 TEST(response_read_deadline_fixed_upload_head_configured_failure_live_unreachable,
      valid_status_witness_maps_parse_and_unsupported_inventory_to_exact_502) {
     struct Vector {
@@ -62681,6 +62775,7 @@ TEST(response_read_deadline_fixed_upload_head_terminal_unreachable,
         fixture.conn = nullptr;
     }
 }
+#endif
 
 TEST(response_read_deadline, http_date_normalization_accepts_only_imf_fixdate_shape) {
     static constexpr char kValid[] = "Tue, 01 Jan 2030 00:00:00 GMT";

@@ -9,7 +9,9 @@
 #include "rut/nginx/parser.h"
 #include "rut/runtime/cache_table.h"
 #include "rut/runtime/compile_to_config.h"
+#ifdef __linux__
 #include "rut/runtime/iouring_event_loop.h"
+#endif
 #include "rut/runtime/listener.h"
 #include "rut/runtime/route_method.h"
 #include "rut/serve_loader.h"
@@ -66,6 +68,7 @@ struct ScopedPublicSource {
     ~ScopedPublicSource() { unlink(path); }
 };
 
+#ifdef __linux__
 struct ScopedPublicIoUringLoop {
     void* storage = MAP_FAILED;
     IoUringEventLoop* loop = nullptr;
@@ -93,6 +96,7 @@ struct ScopedPublicIoUringLoop {
         if (storage != MAP_FAILED) munmap(storage, sizeof(IoUringEventLoop));
     }
 };
+#endif
 
 bool contains(const char* haystack, const char* needle) {
     return std::string(haystack).find(needle) != std::string::npos;
@@ -5271,6 +5275,7 @@ TEST(serve_loader, verified_request_framing_selection_publishes_only_through_pub
         "HEAD /one?q=1 HTTP/1.1\r\nHost: 127.0.0.1:9000\r\nContent-Length: 12\r\n"
         "Content-Type: application/octet-stream\r\n\r\n";
 
+#ifdef __linux__
     const auto run_runtime_case = [&](const u8* prefix,
                                       u32 prefix_len,
                                       const u8* body,
@@ -5417,6 +5422,7 @@ TEST(serve_loader, verified_request_framing_selection_publishes_only_through_pub
     program.rir.destroy();
     CHECK_EQ(program.config.routes[0].forward_preflight_mode,
              ForwardPreflightMode::AfterRequestFramingSelection);
+#endif
     program.destroy();
 }
 
@@ -5461,6 +5467,7 @@ TEST(serve_loader, verified_get_framing_selection_owns_complete_buffering_after_
     // request path rather than a forged native RouteConfig.
     program.rir.destroy();
     REQUIRE(std::filesystem::remove(path));
+#ifdef __linux__
     const auto run_runtime_case = [&](const char* prefix,
                                       u32 prefix_len,
                                       const char* expected_wire,
@@ -5574,6 +5581,7 @@ TEST(serve_loader, verified_get_framing_selection_owns_complete_buffering_after_
     CHECK_EQ(program.config.routes[0].forward_preflight_mode,
              ForwardPreflightMode::AfterRequestFramingSelection);
     CHECK_EQ(program.config.routes[0].preflight_forward_policy_bundle_id, 1u);
+#endif
     program.destroy();
 }
 
@@ -5735,6 +5743,7 @@ TEST(serve_loader, public_fixed_upload_head_jit_reaches_normal_dispatch) {
         }
         REQUIRE_EQ(request_policy, static_cast<i32>(test.request_policy_id));
 
+#ifdef __linux__
         for (const u32 initial_body_len : {5u, 12u}) {
             ScopedPublicIoUringLoop guard;
             if (!guard.init()) {
@@ -5895,6 +5904,7 @@ TEST(serve_loader, public_fixed_upload_head_jit_reaches_normal_dispatch) {
             REQUIRE_EQ(loop->free_top, free_top_before + 1u);
             close(downstream[1]);
         }
+#endif
         program.destroy();
     }
 }

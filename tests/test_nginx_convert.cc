@@ -13,6 +13,7 @@
 
 #include <fcntl.h>
 #include <signal.h>
+#include <sys/resource.h>
 #include <sys/stat.h>
 #include <sys/wait.h>
 #include <time.h>
@@ -131,12 +132,18 @@ RunResult run_converter(const char* executable,
 RunResult run_converter_to_file(const char* executable,
                                 const char* format,
                                 const std::string& input,
-                                const std::string& output_path) {
+                                const std::string& output_path,
+                                bool limit_output = false) {
     RunResult result;
     int error_pipe[2]{};
     if (pipe(error_pipe) != 0) return result;
     const pid_t child = fork();
     if (child == 0) {
+        if (limit_output) {
+            const struct rlimit limit{0, 0};
+            if (setrlimit(RLIMIT_FSIZE, &limit) != 0) _exit(126);
+            signal(SIGXFSZ, SIG_IGN);
+        }
         const int output = open(output_path.c_str(), O_WRONLY);
         if (output < 0 || dup2(output, STDOUT_FILENO) < 0 || dup2(error_pipe[1], STDERR_FILENO) < 0)
             _exit(126);
@@ -745,7 +752,9 @@ TEST(nginx_convert, output_failures_are_reported_without_sigpipe_termination) {
         "server { listen 127.0.0.1:8080; location / { proxy_pass "
         "http://127.0.0.1:9000; } }\n";
     REQUIRE(write_file(path, source));
-    const RunResult full = run_converter_to_file(g_executable, "server", path, "/dev/full");
+    const std::string full_path = directory + "/full.out";
+    REQUIRE(write_file(full_path, ""));
+    const RunResult full = run_converter_to_file(g_executable, "server", path, full_path, true);
     REQUIRE(WIFEXITED(full.status));
     CHECK_EQ(WEXITSTATUS(full.status), 1);
     CHECK(full.out.empty());

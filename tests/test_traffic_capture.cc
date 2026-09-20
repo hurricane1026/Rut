@@ -1,8 +1,10 @@
 // Tests for traffic capture: CaptureEntry, CaptureRing, file I/O, and
 // integration with the mock event loop (capture through callback pipeline).
 #include "fault_injection.h"
+#ifdef __linux__
 #include "rut/runtime/epoll_event_loop.h"
 #include "rut/runtime/iouring_event_loop.h"
+#endif
 #include "rut/runtime/traffic_capture.h"
 #include "test.h"
 #include "test_helpers.h"
@@ -32,8 +34,12 @@ void verify_capture_interface() {
 }
 // Force instantiation for all production + test loop types.
 [[maybe_unused]] void compile_time_capture_check() {
+#ifdef __linux__
     verify_capture_interface<EpollEventLoop>();
     verify_capture_interface<IoUringEventLoop>();
+#else
+    verify_capture_interface<KqueueEventLoop>();
+#endif
     verify_capture_interface<SmallLoop>();
     // EventLoop<EpollBackend> and EventLoop<IoUringBackend> covered
     // by the concrete loop types above.

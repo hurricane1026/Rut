@@ -6,7 +6,9 @@
 #include <fcntl.h>
 #include <poll.h>
 #include <pthread.h>
+#ifdef __linux__
 #include <sys/syscall.h>
+#endif
 #include <time.h>
 #include <unistd.h>
 #include <zstd.h>
@@ -17,7 +19,11 @@ namespace rut {
 
 static u64 raw_monotonic_us() {
     struct timespec ts;
+#ifdef __APPLE__
+    if (clock_gettime(CLOCK_MONOTONIC, &ts) != 0) return 1;
+#else
     if (syscall(SYS_clock_gettime, CLOCK_MONOTONIC, &ts) != 0) return 1;
+#endif
     u64 now = static_cast<u64>(ts.tv_sec) * 1000000ULL + static_cast<u64>(ts.tv_nsec) / 1000ULL;
     return now == 0 ? 1 : now;
 }

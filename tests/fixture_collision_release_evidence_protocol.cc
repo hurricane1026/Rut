@@ -226,7 +226,7 @@ Bytes envelope(const Envelope& value, std::size_t body_length) {
                             value.target.pid,
                             value.target.start,
                             value.target.netns,
-                            body_length})
+                            static_cast<u64>(body_length)})
         put(bytes, field);
     return bytes;
 }
