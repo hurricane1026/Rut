@@ -18,6 +18,7 @@
 #include "rut/runtime/route_select.h"  // path_has_param_segment
 #include "rut/runtime/route_trie.h"
 #include "rut/runtime/ws_terminate.h"  // WsMessageHandlerFn (terminate-mode routes)
+#include <new>  // Existing std::nothrow allocations during configuration staging.
 
 #include <errno.h>
 #include <netinet/in.h>

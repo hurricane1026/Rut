@@ -535,7 +535,12 @@ u32 KqueueBackend::wait(IoEvent* events, u32 max_events, Connection* conns, u32 
     }
     if (id == kListener) {
         const int fd = platform::accept_nonblocking(listen_fd);
-        if (fd < 0) return 0;
+        if (fd < 0) {
+            const int error = errno;
+            if (error != EAGAIN && error != EWOULDBLOCK && error != EINTR && error != ECONNABORTED)
+                fail(error);
+            return 0;
+        }
         *events = completion(0, IoEventType::Accept, fd);
         return 1;
     }

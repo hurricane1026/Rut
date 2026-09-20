@@ -1051,7 +1051,7 @@ private:
         c->on_recv = &on_header_received<Self>;
         timer.add(c, keepalive_timeout);
         if (metrics) metrics->on_accept();
-        this->submit_recv(*c);
+        if (!this->submit_recv(*c)) this->close_conn(*c);
     }
 
     void close_listen() {

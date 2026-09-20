@@ -32,7 +32,9 @@ core::Expected<i32, Error> create_listen_socket(const ListenerSpec& declared, u1
 
     i32 one = 1;
     setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
+#ifdef __linux__
     setsockopt(fd, SOL_SOCKET, SO_REUSEPORT, &one, sizeof(one));
+#endif
     setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
 
     struct sockaddr_in addr;

@@ -107,6 +107,7 @@ TEST(listener_context, resolves_ephemeral_and_explicit_bound_ports) {
     ListenerContext second_context{};
     auto second_fd_result =
         bind_listener_shard(declared, first_context.port, &first_context, &second_context);
+#ifdef __linux__
     CHECK(second_fd_result.has_value());
     if (!second_fd_result) {
         close(first_fd);
@@ -115,6 +116,16 @@ TEST(listener_context, resolves_ephemeral_and_explicit_bound_ports) {
     const i32 second_fd = second_fd_result.value();
     CHECK(second_context.valid());
     CHECK(second_context.equivalent(first_context));
+    close(second_fd);
+#else
+    // The macOS developer backend permits one shard and must reject a stale
+    // second server instead of sharing traffic through SO_REUSEPORT.
+    CHECK(!second_fd_result);
+    if (second_fd_result)
+        close(second_fd_result.value());
+    else
+        CHECK_EQ(second_fd_result.error().code, EADDRINUSE);
+#endif
 
     ListenerSpec bad_address = declared;
     bad_address.address = static_cast<ListenerAddress>(0xff);
@@ -123,7 +134,6 @@ TEST(listener_context, resolves_ephemeral_and_explicit_bound_ports) {
     bad_transport.transport = static_cast<ListenerTransport>(0xff);
     CHECK(!derive_listener_context(-1, bad_transport).has_value());
 
-    close(second_fd);
     close(first_fd);
 }
 
@@ -233,7 +243,7 @@ TEST(listener_context, exact_ipv4_bind_is_address_scoped_and_connectable) {
 }
 #endif
 
-TEST(listener_context, exact_ephemeral_shards_share_address_and_resolved_port) {
+TEST(listener_context, exact_ephemeral_listener_preserves_address_and_platform_sharing) {
     constexpr u32 kExactAddress = 0x7f000001u;
     ListenerSpec exact{ListenerAddress::IPv4Exact, ListenerTransport::Cleartext, 0u, kExactAddress};
 
@@ -249,11 +259,19 @@ TEST(listener_context, exact_ephemeral_shards_share_address_and_resolved_port) {
     ListenerContext second_context{};
     auto second_result =
         bind_listener_shard(exact, first_context.port, &first_context, &second_context);
+    ScopedListenerTestFd second;
+#ifdef __linux__
     REQUIRE(second_result);
-    ScopedListenerTestFd second(second_result.value());
+    second.fd = second_result.value();
     CHECK(second_context.equivalent(first_context));
+#else
+    if (second_result) second.fd = second_result.value();
+    REQUIRE_FALSE(second_result);
+    CHECK_EQ(second_result.error().code, EADDRINUSE);
+#endif
 
     for (const i32 fd : {first.fd, second.fd}) {
+        if (fd < 0) continue;
         sockaddr_in bound{};
         socklen_t bound_len = sizeof(bound);
         REQUIRE_EQ(getsockname(fd, reinterpret_cast<sockaddr*>(&bound), &bound_len), 0);
@@ -28549,12 +28567,12 @@ void prepare_recv_only_retirement(Connection& conn, u32 episode) {
     conn.pending_ops = 1;
 }
 
+#ifdef __linux__
 void drain_strict_recv_retirement(IoUringEventLoop* loop,
                                   Connection& conn,
                                   u32 episode,
                                   bool cancel_first);
 
-#ifdef __linux__
 TEST(iouring_retirement, strict_clean_success_callbacks_retire_live_recv_before_close) {
     for (const bool streaming : {false, true}) {
         ScopedIoUringLoopForRetirement guard;
@@ -30529,9 +30547,9 @@ struct CoalescedPhase1ArmedFixture {
 };
 
 IoEvent response_read_copy_event(const Connection& conn, i32 result, bool more, u32 begin, u32 end);
+#ifdef __linux__
 IoEvent exact_response_deadline_send_event(IoUringEventLoop* loop, Connection& conn);
 
-#ifdef __linux__
 bool stage_coalesced_phase1_armed(IoUringEventLoop* loop,
                                   RouteConfig& config,
                                   const u8* successor,
@@ -38185,12 +38203,12 @@ TEST(iouring_response_read_timer, precise_arm_publishes_transport_owner_after_li
 }
 #endif
 
+#ifdef __linux__
 bool stage_live_precise_fixed_upload_head(IoUringEventLoop* loop,
                                           RouteConfig& config,
                                           PrebuiltD2Fixture* fixture,
                                           bool force_initial_timer_sq_full = false);
 
-#ifdef __linux__
 TEST(iouring_response_read_timer,
      precise_keep_alive_head_classifier_and_arm_are_exact_without_wheel) {
     ScopedIoUringLoopForRetirement guard;
@@ -48391,10 +48409,12 @@ TEST(response_buffering_runtime, complete_content_length_status_allowlist_is_exa
         CHECK_FALSE(complete_content_length_response_status_is_admitted(status));
 }
 
+#ifdef __linux__
 static void drain_strict_304_timer_cancel(rut::test::TestCase* _tc,
                                           IoUringEventLoop* loop,
                                           Connection& conn,
                                           bool cancel_first);
+#endif
 
 TEST(response_buffering_runtime, coherent_single_range_206_classifier_is_exact) {
     const auto classify = [](const std::string& wire) {

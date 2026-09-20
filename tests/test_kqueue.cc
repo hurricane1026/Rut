@@ -1,12 +1,15 @@
 #include "fault_injection.h"
 #include "rut/platform/socket.h"
 #include "rut/runtime/kqueue_backend.h"
+#include "rut/runtime/kqueue_event_loop.h"
+#include "rut/runtime/socket.h"
 #include "test.h"
 
 #include <fcntl.h>
 #include <netinet/in.h>
 #include <poll.h>
 #include <sys/mman.h>
+#include <sys/resource.h>
 #include <sys/socket.h>
 #include <time.h>
 #include <unistd.h>
@@ -121,6 +124,92 @@ TEST(kqueue, closed_socket_does_not_raise_sigpipe) {
     pair.fd[1] = -1;
     CHECK_EQ(send(pair.fd[0], "x", 1, platform::kSendFlags), -1);
     CHECK_EQ(errno, EPIPE);
+}
+
+TEST(kqueue, listener_rejects_duplicate_address) {
+    ListenerSpec spec{ListenerAddress::IPv4Exact, ListenerTransport::Cleartext, 0, 0x7f000001u};
+    auto listener = create_listen_socket(spec, 0);
+    REQUIRE(listener);
+    Pair sockets;
+    sockets.fd[0] = listener.value();
+    sockaddr_in address{};
+    socklen_t size = sizeof(address);
+    REQUIRE_EQ(getsockname(sockets.fd[0], reinterpret_cast<sockaddr*>(&address), &size), 0);
+    spec.port = ntohs(address.sin_port);
+    auto duplicate = create_listen_socket(spec, spec.port);
+    if (duplicate) sockets.fd[1] = duplicate.value();
+    CHECK(!duplicate);
+    if (!duplicate) CHECK_EQ(duplicate.error().code, EADDRINUSE);
+}
+
+TEST(kqueue, accept_fd_exhaustion_stops_backend) {
+    Pair sockets;
+    auto listener = create_listen_socket(0);
+    REQUIRE(listener);
+    sockets.fd[0] = listener.value();
+    sockaddr_in address{};
+    socklen_t size = sizeof(address);
+    REQUIRE_EQ(getsockname(sockets.fd[0], reinterpret_cast<sockaddr*>(&address), &size), 0);
+    address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    sockets.fd[1] = socket(AF_INET, SOCK_STREAM, 0);
+    REQUIRE(sockets.fd[1] >= 0);
+    REQUIRE_EQ(connect(sockets.fd[1], reinterpret_cast<sockaddr*>(&address), size), 0);
+    Backend backend;
+    REQUIRE(backend.init());
+    auto& b = *backend.value;
+    b.listen_fd = sockets.fd[0];
+    b.add_accept();
+    REQUIRE(ready(b));
+    struct rlimit original;
+    REQUIRE_EQ(getrlimit(RLIMIT_NOFILE, &original), 0);
+    struct rlimit exhausted = original;
+    exhausted.rlim_cur = 0;
+    REQUIRE_EQ(setrlimit(RLIMIT_NOFILE, &exhausted), 0);
+    IoEvent event;
+    const u32 count = b.wait(&event, 1, nullptr, 0);
+    const int restored = setrlimit(RLIMIT_NOFILE, &original);
+    REQUIRE_EQ(restored, 0);
+    CHECK_EQ(count, 0u);
+    CHECK_EQ(b.failure_code(), EMFILE);
+    CHECK_EQ(b.wait(&event, 1, nullptr, 0), 0u);
+}
+
+TEST(kqueue, accepted_socket_registration_failure_reclaims_connection) {
+    void* storage = mmap(nullptr,
+                         sizeof(KqueueEventLoop),
+                         PROT_READ | PROT_WRITE,
+                         MAP_PRIVATE | MAP_ANONYMOUS,
+                         -1,
+                         0);
+    REQUIRE(storage != MAP_FAILED);
+    auto* loop = new (storage) KqueueEventLoop();
+    const bool initialized = loop->init(0, -1).has_value();
+    if (!initialized) {
+        loop->~KqueueEventLoop();
+        munmap(storage, sizeof(KqueueEventLoop));
+    }
+    REQUIRE(initialized);
+    Pair pair;
+    const bool connected = pair.init();
+    if (connected) {
+        const int fd = pair.fd[0];
+        const int queue = loop->backend.kqueue_fd;
+        loop->backend.kqueue_fd = -1;  // Force the initial EVFILT_READ registration to fail.
+        IoEvent event{};
+        event.type = IoEventType::Accept;
+        event.result = fd;
+        loop->dispatch(event);
+        loop->backend.kqueue_fd = queue;
+        CHECK_EQ(loop->free_top, KqueueEventLoop::kMaxConns);
+        CHECK_EQ(fcntl(fd, F_GETFD), -1);
+        CHECK_EQ(errno, EBADF);
+        pair.fd[0] = -1;  // Consumed by the accept path.
+    }
+    loop->force_close_all();
+    loop->shutdown();
+    loop->~KqueueEventLoop();
+    munmap(storage, sizeof(KqueueEventLoop));
+    REQUIRE(connected);
 }
 
 TEST(kqueue, registration_failure_and_cleanup) {
