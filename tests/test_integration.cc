@@ -31,9 +31,15 @@
 #include <algorithm>  // std::sort in the proxy latency bench
 #include <atomic>
 #include <memory>
+#include <string>
+#include <vector>
 
+#include <errno.h>
+#include <openssl/err.h>
 #include <openssl/ssl.h>
+#include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 
 namespace rut {
 
@@ -7054,11 +7060,9 @@ struct ScopedWatermarkTestResources {
 };
 }  // namespace
 
-TEST(tls_iouring, exact_local_response_normalized_fragmented_and_sequential) {
-    if (!iouring_socket_live()) SKIP("io_uring async socket ops unavailable");
+static void run_tls_iouring_exact_local_response_body(u32 body_size, rut::test::TestCase* _tc) {
     auto config = std::make_unique<RouteConfig>();
-    char body[1024];
-    memset(body, 'x', sizeof(body));
+    std::vector<char> body(body_size, 'x');
     StrictLocalResponsePolicySpec policy{};
     policy.version = StrictLocalResponseVersion::Http11;
     policy.status_code = 200;
@@ -7068,7 +7072,7 @@ TEST(tls_iouring, exact_local_response_normalized_fragmented_and_sequential) {
     policy.reason = lit_str("OK");
     policy.content_type = lit_str("text/plain");
     policy.server = lit_str("rut");
-    policy.body = {body, sizeof(body)};
+    policy.body = {body.data(), body_size};
     const u16 id = config->add_strict_local_response_policy(policy);
     REQUIRE(id != 0);
     ExactStrictLocalResponseBinding binding{};
@@ -7103,7 +7107,33 @@ TEST(tls_iouring, exact_local_response_normalized_fragmented_and_sequential) {
     resources.client_ssl = SSL_new(resources.client_ctx);
     REQUIRE(resources.client_ssl != nullptr);
     REQUIRE_EQ(SSL_set_fd(resources.client_ssl, resources.client_fd), 1);
-    REQUIRE_EQ(SSL_connect(resources.client_ssl), 1);
+    ERR_clear_error();
+    errno = 0;
+    const int ssl_connect_result = SSL_connect(resources.client_ssl);
+    const int ssl_connect_errno = errno;
+    const int ssl_connect_error = ssl_connect_result == 1
+                                      ? SSL_ERROR_NONE
+                                      : SSL_get_error(resources.client_ssl, ssl_connect_result);
+    if (ssl_connect_result != 1) {
+        const uint32_t queued_error = ERR_peek_error();
+        char error_text[256] = "none";
+        if (queued_error != 0) ERR_error_string_n(queued_error, error_text, sizeof(error_text));
+        const char* const ssl_state = SSL_state_string_long(resources.client_ssl);
+        fprintf(stderr,
+                "[tls-local-response] handshake failed body=%u port=%u result=%d ssl_error=%d "
+                "errno=%d (%s) state=%s error_queue=%u (%s)\n",
+                body_size,
+                port,
+                ssl_connect_result,
+                ssl_connect_error,
+                ssl_connect_errno,
+                strerror(ssl_connect_errno),
+                ssl_state != nullptr ? ssl_state : "<unknown>",
+                queued_error,
+                error_text);
+    }
+    REQUIRE_EQ(ssl_connect_result, 1);
+    const std::string content_length = "Content-Length: " + std::to_string(body_size) + "\r\n";
     for (u32 request = 0; request < 4; ++request) {
         const char* wire =
             request == 3   ? "GET /assets//static HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n"
@@ -7113,14 +7143,14 @@ TEST(tls_iouring, exact_local_response_normalized_fragmented_and_sequential) {
         usleep(1000);
         REQUIRE(
             ssl_write_all(resources.client_ssl, wire + 12, static_cast<u32>(strlen(wire)) - 12));
-        const u32 expected_body = request == 1 ? 0u : sizeof(body);
-        char received[4096]{};
+        const u32 expected_body = request == 1 ? 0u : body_size;
+        std::vector<char> received(body_size + 512u, '\0');
         u32 total = 0;
         char* end = nullptr;
-        while (total < sizeof(received) - 1) {
+        while (total < received.size() - 1u) {
             const int count = SSL_read(resources.client_ssl,
-                                       received + total,
-                                       static_cast<int>(sizeof(received) - 1 - total));
+                                       received.data() + total,
+                                       static_cast<int>(received.size() - 1u - total));
             // A worker wakeup can interrupt the blocking BIO read. Retry the
             // identical SSL operation only for EINTR; socket timeouts still fail.
             if (count <= 0 && errno == EINTR &&
@@ -7128,15 +7158,16 @@ TEST(tls_iouring, exact_local_response_normalized_fragmented_and_sequential) {
                 continue;
             REQUIRE(count > 0);
             total += static_cast<u32>(count);
-            end = strstr(received, "\r\n\r\n");
-            if (end != nullptr && total >= static_cast<u32>(end + 4 - received) + expected_body)
+            end = strstr(received.data(), "\r\n\r\n");
+            if (end != nullptr &&
+                total >= static_cast<u32>(end + 4 - received.data()) + expected_body)
                 break;
         }
         REQUIRE(end != nullptr);
-        CHECK_EQ(memcmp(received, "HTTP/1.1 200 OK\r\n", 17), 0);
-        CHECK(strstr(received, "Content-Length: 1024\r\n") != nullptr);
-        CHECK_EQ(total, static_cast<u32>(end + 4 - received) + expected_body);
-        CHECK_EQ(memcmp(end + 4, body, expected_body), 0);
+        CHECK_EQ(memcmp(received.data(), "HTTP/1.1 200 OK\r\n", 17), 0);
+        CHECK(strstr(received.data(), content_length.c_str()) != nullptr);
+        CHECK_EQ(total, static_cast<u32>(end + 4 - received.data()) + expected_body);
+        CHECK_EQ(memcmp(end + 4, body.data(), expected_body), 0);
     }
     char extra;
     int closed;
@@ -7145,6 +7176,21 @@ TEST(tls_iouring, exact_local_response_normalized_fragmented_and_sequential) {
     } while (closed < 0 && errno == EINTR &&
              SSL_get_error(resources.client_ssl, closed) == SSL_ERROR_WANT_READ);
     CHECK_EQ(closed, 0);
+}
+
+TEST(tls_iouring, exact_local_response_1024_normalized_fragmented_and_sequential) {
+    if (!iouring_socket_live()) SKIP("io_uring async socket ops unavailable");
+    run_tls_iouring_exact_local_response_body(1024u, _tc);
+}
+
+TEST(tls_iouring, exact_local_response_4093_normalized_fragmented_and_sequential) {
+    if (!iouring_socket_live()) SKIP("io_uring async socket ops unavailable");
+    run_tls_iouring_exact_local_response_body(4093u, _tc);
+}
+
+TEST(tls_iouring, native_exact_local_response_4096_remains_supported) {
+    if (!iouring_socket_live()) SKIP("io_uring async socket ops unavailable");
+    run_tls_iouring_exact_local_response_body(4096u, _tc);
 }
 
 TEST(proxy_tls_iouring, watermark_observer_guard_scopes_callbacks_and_cleanup) {
