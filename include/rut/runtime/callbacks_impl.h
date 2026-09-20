@@ -8658,7 +8658,9 @@ inline bool build_bounded_local_response_bytes(const Connection& conn,
     auto put = [&](const u8* data, u32 len) {
         if ((data == nullptr && len != 0) || len > out_cap - (pos <= out_cap ? pos : out_cap))
             return false;
-        for (u32 i = 0; i < len; i++) out[pos + i] = data[i];
+        // Preserve overlap safety for borrowed views while using the optimized
+        // bulk copy path for larger local and failure response bodies.
+        if (len != 0) __builtin_memmove(out + pos, data, len);
         pos += len;
         return true;
     };
