@@ -33,7 +33,9 @@
 #include <memory>
 
 #include <openssl/ssl.h>
+#include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 
 namespace rut {
 
@@ -4943,9 +4945,49 @@ TEST(uring, malformed_response_read_timer_flags_fail_before_buffer_handling) {
             (static_cast<u32>(kBufId) << IORING_CQE_BUFFER_SHIFT),
     };
     for (const u32 flags : malformed_flags) {
-        IoUringBackend backend;
-        auto rc = backend.init(0, -1);
-        if (!rc) SKIP("io_uring unavailable");
+        // Feed a userspace ring snapshot to the real wait() path. A real init
+        // queues timerfd's initial read; wait() would submit it while harvesting
+        // this synthetic CQE, leaving an unrelated kernel operation at shutdown.
+        // The ready CQ, empty SQ, and disabled timer keep wait() away from
+        // io_uring_enter.
+        IoUringBackend backend{};
+        u32 sq_head = 0;
+        u32 sq_tail = 0;
+        u32 sq_flags = 0;
+        u32 sq_mask = 0;
+        u32 sq_array[1]{};
+        io_uring_sqe sqes[1]{};
+        u32 cq_head = 0;
+        u32 cq_tail = 0;
+        u32 cq_mask = 3;
+        io_uring_cqe cqes[4]{};
+        struct UserSpaceBufferRing {
+            io_uring_buf_ring ring{};
+            io_uring_buf entries[kProvidedBufCount]{};
+        } buf_ring_storage{};
+        static_assert(__builtin_offsetof(UserSpaceBufferRing, entries) ==
+                      sizeof(io_uring_buf_ring));
+        u8 buffer_storage[(kBufId + 1u) * kProvidedBufSize]{};
+
+        backend.ring_fd = -1;
+        backend.timer_fd = -1;
+        backend.timer_read_armed = false;
+        backend.pending = 0;
+        backend.sq_head = &sq_head;
+        backend.sq_tail = &sq_tail;
+        backend.sq_flags = &sq_flags;
+        backend.sq_ring_mask = &sq_mask;
+        backend.sq_array = sq_array;
+        backend.sq_entries = sqes;
+        backend.sq_ring_entries = 1;
+        backend.cq_head = &cq_head;
+        backend.cq_tail = &cq_tail;
+        backend.cq_ring_mask = &cq_mask;
+        backend.cq_entries = cqes;
+        backend.cq_ring_entries = 4;
+        backend.buf_ring = &buf_ring_storage.ring;
+        backend.buf_base = buffer_storage;
+        backend.buf_ring->tail = 23;
 
         TestConn tc;
         tc.init(0, -1);
@@ -4956,6 +4998,8 @@ TEST(uring, malformed_response_read_timer_flags_fail_before_buffer_handling) {
         __builtin_memset(upstream_storage, 0x5A, sizeof(upstream_storage));
         __builtin_memset(recv_expected, 0xA5, sizeof(recv_expected));
         __builtin_memset(upstream_expected, 0x5A, sizeof(upstream_expected));
+        u8 buffer_expected[4];
+        __builtin_memset(buffer_expected, 0xC3, sizeof(buffer_expected));
         tc.conn.upstream_recv_buf.bind(upstream_storage, sizeof(upstream_storage));
         __builtin_memset(backend.buf_base + static_cast<u64>(kBufId) * kProvidedBufSize, 0xC3, 4);
         const u16 buffer_tail_before = __atomic_load_n(&backend.buf_ring->tail, __ATOMIC_ACQUIRE);
@@ -4971,14 +5015,22 @@ TEST(uring, malformed_response_read_timer_flags_fail_before_buffer_handling) {
         CHECK_EQ(backend.wait(&event, 1, &tc.conn, 1), 0u);
         CHECK_EQ(backend.failure_code(), EPROTO);
         CHECK_EQ(__atomic_load_n(backend.cq_head, __ATOMIC_ACQUIRE), head_before);
+        CHECK_EQ(__atomic_load_n(backend.cq_tail, __ATOMIC_ACQUIRE), tail + 1u);
         CHECK_EQ(__atomic_load_n(&backend.buf_ring->tail, __ATOMIC_ACQUIRE), buffer_tail_before);
+        CHECK_EQ(sq_head, 0u);
+        CHECK_EQ(sq_tail, 0u);
+        CHECK_EQ(backend.pending, 0u);
+        CHECK(!backend.timer_read_armed);
+        CHECK_EQ(backend.ring_fd, -1);
+        CHECK_EQ(backend.timer_fd, -1);
         CHECK_EQ(tc.conn.recv_buf.len(), 0u);
         CHECK_EQ(tc.conn.upstream_recv_buf.len(), 0u);
         CHECK(__builtin_memcmp(tc.recv_storage, recv_expected, sizeof(recv_expected)) == 0);
         CHECK(__builtin_memcmp(upstream_storage, upstream_expected, sizeof(upstream_expected)) ==
               0);
-
-        backend.shutdown();
+        CHECK(__builtin_memcmp(backend.buf_base + static_cast<u64>(kBufId) * kProvidedBufSize,
+                               buffer_expected,
+                               sizeof(buffer_expected)) == 0);
     }
 }
 
@@ -5102,6 +5154,21 @@ TEST(uring, pause_upstream_recv_cancels_recv_spares_send) {
     IoUringBackend backend;
     auto init_rc = backend.init(0, -1);
     if (!init_rc) {
+        const Error& init_error = init_rc.error();
+        const char* source_name = init_error.source == Error::Source::IoUring   ? "IoUring"
+                                  : init_error.source == Error::Source::Mmap    ? "Mmap"
+                                  : init_error.source == Error::Source::Timerfd ? "Timerfd"
+                                                                                : "other";
+        fprintf(stderr,
+                "[pause_upstream_recv_cancels_recv_spares_send] init failed: "
+                "source=%s(%u) code/errno=%d (%s) ring_fd=%d timer_fd=%d capacity=%u\n",
+                source_name,
+                static_cast<unsigned>(init_error.source),
+                init_error.code,
+                strerror(init_error.code),
+                backend.ring_fd,
+                backend.timer_fd,
+                backend.connection_capacity);
         close(fds[0]);
         close(fds[1]);
         SKIP("io_uring init failed");
