@@ -58106,6 +58106,221 @@ TEST(iouring_retirement, max_episode_quarantines_and_never_reuses_slot) {
     CHECK_EQ(loop->free_top, free_before);
 }
 
+struct UserspaceSendWaitFixture {
+    IoUringBackend backend{};
+    u32 sq_head = 0;
+    u32 sq_tail = 0;
+    u32 sq_mask = 7;
+    u32 sq_array[8]{};
+    io_uring_sqe sq_entries[8]{};
+    u32 cq_head = 0;
+    u32 cq_tail = 0;
+    u32 cq_mask = 7;
+    io_uring_cqe cq_entries[8]{};
+
+    bool init() {
+        auto states = backend.init_send_state_storage(1);
+        if (!states) return false;
+        backend.sq_head = &sq_head;
+        backend.sq_tail = &sq_tail;
+        backend.sq_ring_mask = &sq_mask;
+        backend.sq_array = sq_array;
+        backend.sq_entries = sq_entries;
+        backend.sq_ring_entries = 8;
+        backend.cq_head = &cq_head;
+        backend.cq_tail = &cq_tail;
+        backend.cq_ring_mask = &cq_mask;
+        backend.cq_entries = cq_entries;
+        backend.cq_ring_entries = 8;
+        return true;
+    }
+
+    bool push(u32 generation, i32 result, u32 flags = 0) {
+        const u32 tail = __atomic_load_n(&cq_tail, __ATOMIC_RELAXED);
+        const u32 head = __atomic_load_n(&cq_head, __ATOMIC_ACQUIRE);
+        if (tail - head >= 8) return false;
+        auto& cqe = cq_entries[tail & cq_mask];
+        cqe.user_data = IoUringBackend::encode_user_data(0, IoEventType::Send, generation);
+        cqe.res = result;
+        cqe.flags = flags;
+        __atomic_store_n(&cq_tail, tail + 1, __ATOMIC_RELEASE);
+        return true;
+    }
+
+    ~UserspaceSendWaitFixture() { backend.destroy_send_state_storage(); }
+};
+
+TEST(iouring_send_generation, backend_wait_bypasses_stale_cancel_and_more_before_proactor) {
+    UserspaceSendWaitFixture fixture;
+    REQUIRE(fixture.init());
+    auto& backend = fixture.backend;
+    static const u8 payload[] = "current-send-payload";
+    Connection conns[1]{};
+    conns[0].reset();
+    conns[0].id = 0;
+    conns[0].fd = 91;
+
+    auto expect_default = [&](u32 incoming, i32 result, u32 flags) {
+        backend.send_state[0] = {payload, 91, 4, 5, IoEventType::Send, 0, 41};
+        const auto before = backend.send_state[0];
+        const u32 sq_tail_before = fixture.sq_tail;
+        const u32 pending_before = backend.pending;
+        REQUIRE(fixture.push(incoming, result, flags));
+        IoEvent event;
+        memset(&event, 0xA5, sizeof(event));
+        const u32 head_before = fixture.cq_head;
+        REQUIRE_EQ(backend.wait(&event, 1, conns, 1), 1u);
+        CHECK_EQ(fixture.cq_head, head_before + 1);
+        CHECK_EQ(fixture.sq_tail, sq_tail_before);
+        CHECK_EQ(backend.pending, pending_before);
+        CHECK(same_send_state(backend.send_state[0], before));
+        CHECK_EQ(event.conn_id, 0u);
+        CHECK_EQ(event.type, IoEventType::Send);
+        CHECK_EQ(event.result, result);
+        CHECK_EQ(event.non_upstream_generation, incoming);
+        CHECK_EQ(event.more, (flags & IORING_CQE_F_MORE) != 0 ? 1 : 0);
+        CHECK_EQ(event.aux, 0u);
+        CHECK_EQ(event.buf_id, 0u);
+        CHECK_EQ(event.has_buf, 0u);
+        CHECK_EQ(event.upstream_episode, 0u);
+        CHECK_EQ(event.copy_witness, IoEventCopyWitness::None);
+        CHECK_EQ(event.copy_deadline_generation, 0u);
+        CHECK_EQ(event.copy_deadline_profile, 0u);
+        CHECK_EQ(event.copy_deadline_method, 0xffu);
+        CHECK_EQ(event.copy_begin, 0u);
+        CHECK_EQ(event.copy_end, 0u);
+    };
+
+    // Every positive stale token differs from the live generation and would
+    // corrupt its nonzero-offset proactor if accepted: partial, apparent
+    // completion, and overflow.
+    expect_default(40, 1, 0);
+    expect_default(39, 5, 0);
+    expect_default(42, 6, 0);
+    // Equality rejects both generation-zero mismatch directions.
+    expect_default(0, 2, 0);
+    backend.send_state[0] = {payload, 91, 4, 5, IoEventType::Send, 0, 0};
+    const auto zero_generation_before = backend.send_state[0];
+    const u32 sq_tail_before = fixture.sq_tail;
+    REQUIRE(fixture.push(9, 2));
+    IoEvent nonzero_to_zero;
+    memset(&nonzero_to_zero, 0xA5, sizeof(nonzero_to_zero));
+    REQUIRE_EQ(backend.wait(&nonzero_to_zero, 1, conns, 1), 1u);
+    CHECK(same_send_state(backend.send_state[0], zero_generation_before));
+    CHECK_EQ(fixture.sq_tail, sq_tail_before);
+    CHECK_EQ(nonzero_to_zero.result, 2);
+    CHECK_EQ(nonzero_to_zero.non_upstream_generation, 9u);
+
+    // Cancel CQEs and malformed multishot records preserve the raw event and
+    // never alter the target SendState, regardless of completion result.
+    expect_default(41 | kNonUpstreamSendCancelBit, 2, 0);
+    expect_default(41 | kNonUpstreamSendCancelBit, -ECANCELED, 0);
+    expect_default(40, 0, 0);
+    expect_default(40, -EPIPE, 0);
+    expect_default(41, 2, IORING_CQE_F_MORE);
+}
+
+TEST(iouring_send_generation, backend_wait_accepts_only_current_proactor_and_keeps_legacy_zero) {
+    UserspaceSendWaitFixture fixture;
+    REQUIRE(fixture.init());
+    auto& backend = fixture.backend;
+    static const u8 payload[] = "abcdefghi";
+    Connection conns[1]{};
+    conns[0].reset();
+    conns[0].id = 0;
+    conns[0].fd = 91;
+
+    backend.send_state[0] = {payload, 91, 2, 6, IoEventType::Send, 0, 23};
+    const u32 sq_tail_before = fixture.sq_tail;
+    REQUIRE(fixture.push(23, 3));
+    IoEvent partial{};
+    CHECK_EQ(backend.wait(&partial, 1, conns, 1), 0u);
+    CHECK_EQ(backend.send_state[0].offset, 5u);
+    CHECK_EQ(backend.send_state[0].remaining, 3u);
+    CHECK_EQ(backend.send_state[0].generation, 23u);
+    CHECK_EQ(fixture.sq_tail, sq_tail_before + 1);
+    CHECK_EQ(backend.pending, 1u);
+    const auto& suffix = fixture.sq_entries[sq_tail_before & fixture.sq_mask];
+    CHECK_EQ(suffix.opcode, IORING_OP_SEND);
+    CHECK_EQ(suffix.addr, reinterpret_cast<u64>(payload + 5));
+    CHECK_EQ(suffix.len, 3u);
+    u32 conn_id = 99;
+    IoEventType type = IoEventType::Count;
+    u32 generation = 0;
+    IoUringBackend::decode_user_data(suffix.user_data, conn_id, type, generation);
+    CHECK_EQ(conn_id, 0u);
+    CHECK_EQ(type, IoEventType::Send);
+    CHECK_EQ(generation, 23u);
+
+    // Isolate the terminal completion from the queued userspace SQE. wait()
+    // does not submit to a kernel in this fixture.
+    backend.pending = 0;
+    backend.send_state[0] = {payload, 91, 2, 3, IoEventType::Send, 0, 23};
+    REQUIRE(fixture.push(23, 3));
+    IoEvent complete{};
+    CHECK_EQ(backend.wait(&complete, 1, conns, 1), 1u);
+    CHECK_EQ(complete.result, 5);
+    CHECK_EQ(complete.non_upstream_generation, 23u);
+    CHECK_EQ(backend.send_state[0].offset, 5u);
+    CHECK_EQ(backend.send_state[0].remaining, 0u);
+
+    backend.send_state[0] = {payload, 91, 0, 4, IoEventType::Send, 0, 0};
+    REQUIRE(fixture.push(0, 4));
+    IoEvent legacy{};
+    CHECK_EQ(backend.wait(&legacy, 1, conns, 1), 1u);
+    CHECK_EQ(legacy.result, 4);
+    CHECK_EQ(legacy.non_upstream_generation, 0u);
+
+    backend.send_state[0] = {payload, 91, UINT32_MAX - 1, 4, IoEventType::Send, 0, 23};
+    REQUIRE(fixture.push(23, 3));
+    IoEvent overflow{};
+    CHECK_EQ(backend.wait(&overflow, 1, conns, 1), 1u);
+    CHECK_EQ(overflow.result, -EOVERFLOW);
+    CHECK_EQ(overflow.non_upstream_generation, 23u);
+    CHECK_EQ(backend.send_state[0].remaining, 0u);
+}
+
+TEST(iouring_send_generation, backend_wait_stale_then_current_in_one_batch) {
+    UserspaceSendWaitFixture fixture;
+    REQUIRE(fixture.init());
+    auto& backend = fixture.backend;
+    static const u8 payload[] = "current";
+    backend.send_state[0] = {payload, 91, 0, 6, IoEventType::Send, 0, 52};
+    REQUIRE(fixture.push(51, 2));
+    REQUIRE(fixture.push(52, 6));
+    IoEvent events[2];
+    memset(events, 0xA5, sizeof(events));
+    CHECK_EQ(backend.wait(events, 2, nullptr, 0), 2u);
+    CHECK_EQ(fixture.cq_head, 2u);
+    CHECK_EQ(events[0].result, 2);
+    CHECK_EQ(events[0].non_upstream_generation, 51u);
+    CHECK_EQ(events[0].copy_witness, IoEventCopyWitness::None);
+    CHECK_EQ(events[1].result, 6);
+    CHECK_EQ(events[1].non_upstream_generation, 52u);
+    CHECK_EQ(backend.send_state[0].offset, 6u);
+    CHECK_EQ(backend.send_state[0].remaining, 0u);
+
+    // The stale token remains owned by the existing strict-send dispatcher;
+    // it must neither invoke nor retire the live generation-52 owner.
+    static constexpr u8 response[] = "HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n";
+    StagedLocalSendFixture loop_fixture;
+    REQUIRE(loop_fixture.stage(response, sizeof(response) - 1u));
+    Connection& live = loop_fixture.loop->conns[0];
+    live.fd = 91;
+    live.send_armed = true;
+    live.pending_ops = 3;
+    live.response_read_deadline_send_owner_active = true;
+    live.response_read_deadline_send_owner_generation = 52;
+    live.on_send = &test_sentinel_callback<IoUringEventLoop>;
+    const u32 pending_before = live.pending_ops;
+    g_callback_invoked = false;
+    loop_fixture.loop->dispatch(events[0]);
+    CHECK_FALSE(g_callback_invoked);
+    CHECK(live.send_armed);
+    CHECK_EQ(live.pending_ops, pending_before);
+    CHECK_EQ(live.response_read_deadline_send_owner_generation, 52u);
+}
+
 TEST(iouring_episode, stale_partial_send_does_not_touch_reused_episode_state) {
     IoUringBackend backend{};
     auto initialized = backend.init(0, -1);
