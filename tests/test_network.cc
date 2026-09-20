@@ -63253,6 +63253,223 @@ TEST(connection_capacity, low_limit_exhaustion_and_reuse) {
     loop.shutdown();
 }
 
+namespace {
+struct ScopedIoUringBodyPumpStorage {
+    void* storage = MAP_FAILED;
+    IoUringEventLoop* loop = nullptr;
+    bool initialized = false;
+    bool shut_down = false;
+
+    bool construct() {
+        storage = mmap(nullptr,
+                       sizeof(IoUringEventLoop),
+                       PROT_READ | PROT_WRITE,
+                       MAP_PRIVATE | MAP_ANONYMOUS,
+                       -1,
+                       0);
+        if (storage == MAP_FAILED) return false;
+        loop = new (storage) IoUringEventLoop();
+        return true;
+    }
+
+    bool init(u32 capacity) {
+        if (loop == nullptr && !construct()) return false;
+        auto result = loop->init_slot_storage(capacity);
+        initialized = result.has_value();
+        return initialized;
+    }
+
+    void shutdown() {
+        if (loop == nullptr || !initialized || shut_down) return;
+        loop->shutdown();
+        shut_down = true;
+    }
+
+    ~ScopedIoUringBodyPumpStorage() {
+        if (loop != nullptr) {
+            loop->destroy_slot_storage();
+            loop->~IoUringEventLoop();
+        }
+        if (storage != MAP_FAILED) munmap(storage, sizeof(IoUringEventLoop));
+    }
+};
+
+void check_body_pump_visits(rut::test::TestCase* _tc,
+                            const std::vector<u32>& actual,
+                            const std::vector<u32>& expected) {
+    CHECK_EQ(actual.size(), expected.size());
+    const size_t common = actual.size() < expected.size() ? actual.size() : expected.size();
+    for (size_t i = 0; i < common; ++i) CHECK_EQ(actual[i], expected[i]);
+}
+}  // namespace
+
+TEST(iouring_body_pump_ready_set, bounded_capacity_edges_coalesce_and_empty_drain) {
+    for (const u32 capacity : {1u, 3u, 63u, 64u, 65u, 32768u}) {
+        ScopedIoUringBodyPumpStorage guard;
+        REQUIRE(guard.init(capacity));
+        auto& loop = *guard.loop;
+        CHECK_EQ(loop.body_pump_ready_words.size(), (capacity + 63u) / 64u);
+
+        std::vector<u32> visits;
+        loop.test_drain_response_read_deadline_body_pump_ready(
+            [&](Connection& c) { visits.push_back(c.id); });
+        CHECK(visits.empty());
+
+        const u32 id = capacity - 1u;
+        Connection& conn = loop.conns[id];
+        conn.fd = 100;
+        loop.defer_response_read_deadline_body_pump(conn);
+        loop.defer_response_read_deadline_body_pump(conn);
+        CHECK_EQ(loop.body_pump_ready_words[id >> 6], u64{1} << (id & 63u));
+
+        // Re-initializing identical storage is idempotent and must preserve a
+        // pending bit rather than clearing work already published to the loop.
+        REQUIRE(loop.init_slot_storage(capacity).has_value());
+        loop.test_drain_response_read_deadline_body_pump_ready(
+            [&](Connection& c) { visits.push_back(c.id); });
+        check_body_pump_visits(_tc, visits, {id});
+        CHECK_FALSE(loop.response_read_deadline_body_pump_pending);
+        CHECK_EQ(loop.body_pump_ready_words[id >> 6], 0u);
+    }
+}
+
+TEST(iouring_body_pump_ready_set, ascending_order_and_republishing_during_drain) {
+    ScopedIoUringBodyPumpStorage guard;
+    REQUIRE(guard.init(130));
+    auto& loop = *guard.loop;
+    std::vector<u32> visits;
+
+    for (const u32 id : {65u, 63u, 64u, 62u, 1u, 0u}) loop.conns[id].fd = 100 + id;
+    loop.defer_response_read_deadline_body_pump(loop.conns[65]);
+    loop.defer_response_read_deadline_body_pump(loop.conns[63]);
+    loop.defer_response_read_deadline_body_pump(loop.conns[64]);
+    loop.defer_response_read_deadline_body_pump(loop.conns[62]);
+    loop.defer_response_read_deadline_body_pump(loop.conns[1]);
+    loop.defer_response_read_deadline_body_pump(loop.conns[0]);
+    loop.test_drain_response_read_deadline_body_pump_ready(
+        [&](Connection& c) { visits.push_back(c.id); });
+    check_body_pump_visits(_tc, visits, {0u, 1u, 62u, 63u, 64u, 65u});
+
+    visits.clear();
+    loop.conns[2].fd = 102;
+    loop.conns[3].fd = 103;
+    loop.conns[66].fd = 166;
+    loop.conns[129].fd = 229;
+    loop.defer_response_read_deadline_body_pump(loop.conns[2]);
+    bool republished_from_two = false;
+    bool republished_from_sixty_five = false;
+    loop.test_drain_response_read_deadline_body_pump_ready([&](Connection& c) {
+        visits.push_back(c.id);
+        if (c.id == 2 && !republished_from_two) {
+            republished_from_two = true;
+            loop.defer_response_read_deadline_body_pump(c);               // same bit: next drain
+            loop.defer_response_read_deadline_body_pump(loop.conns[1]);   // lower: next drain
+            loop.defer_response_read_deadline_body_pump(loop.conns[3]);   // higher: this drain
+            loop.defer_response_read_deadline_body_pump(loop.conns[65]);  // next word: this drain
+        } else if (c.id == 65 && !republished_from_sixty_five) {
+            republished_from_sixty_five = true;
+            loop.defer_response_read_deadline_body_pump(loop.conns[64]);  // lower: next drain
+            loop.defer_response_read_deadline_body_pump(loop.conns[66]);  // higher: this drain
+            loop.defer_response_read_deadline_body_pump(loop.conns[0]);   // lower word: next drain
+            loop.defer_response_read_deadline_body_pump(
+                loop.conns[129]);  // higher word: this drain
+        }
+    });
+    check_body_pump_visits(_tc, visits, {2u, 3u, 65u, 66u, 129u});
+    CHECK(loop.response_read_deadline_body_pump_pending);
+
+    visits.clear();
+    loop.test_drain_response_read_deadline_body_pump_ready(
+        [&](Connection& c) { visits.push_back(c.id); });
+    check_body_pump_visits(_tc, visits, {0u, 1u, 2u, 64u});
+    CHECK_FALSE(loop.response_read_deadline_body_pump_pending);
+}
+
+TEST(iouring_body_pump_ready_set, stale_slot_reset_reuse_and_shutdown_clear) {
+    ScopedIoUringBodyPumpStorage guard;
+    REQUIRE(guard.init(3));
+    auto& loop = *guard.loop;
+    Connection& conn = loop.conns[2];
+    conn.fd = 202;
+    loop.defer_response_read_deadline_body_pump(conn);
+
+    conn.reset();
+    conn.id = 2;
+    std::vector<u32> visits;
+    loop.test_drain_response_read_deadline_body_pump_ready(
+        [&](Connection& c) { visits.push_back(c.id); });
+    CHECK(visits.empty());
+    CHECK_FALSE(conn.response_read_deadline_post_commit_pump_pending);
+    CHECK_EQ(loop.body_pump_ready_words[0], 0u);
+
+    conn.fd = -1;
+    loop.defer_response_read_deadline_body_pump(conn);
+    loop.test_drain_response_read_deadline_body_pump_ready(
+        [&](Connection& c) { visits.push_back(c.id); });
+    CHECK(visits.empty());
+    CHECK_FALSE(conn.response_read_deadline_post_commit_pump_pending);
+
+    // Leave another old bit live across reuse, then publish the new owner's
+    // bit before draining. The merged slot must invoke only the current owner.
+    conn.fd = 202;
+    loop.defer_response_read_deadline_body_pump(conn);
+    conn.reset();
+    conn.id = 2;
+    conn.fd = 203;
+    loop.defer_response_read_deadline_body_pump(conn);
+    loop.test_drain_response_read_deadline_body_pump_ready(
+        [&](Connection& c) { visits.push_back(c.fd == 203 ? c.id : 99u); });
+    check_body_pump_visits(_tc, visits, {2u});
+
+    loop.defer_response_read_deadline_body_pump(conn);
+    CHECK(loop.response_read_deadline_body_pump_pending);
+    conn.fd = -1;
+    guard.shutdown();
+    CHECK_EQ(loop.connection_capacity, 0u);
+    CHECK_EQ(loop.body_pump_ready_words.data(), nullptr);
+    CHECK_FALSE(loop.response_read_deadline_body_pump_pending);
+}
+
+TEST(iouring_body_pump_ready_set, rejects_foreign_slots_and_rolls_back_bitmap_allocation) {
+    ScopedIoUringBodyPumpStorage guard;
+    REQUIRE(guard.construct());
+    Connection foreign{};
+    foreign.id = 1;
+    guard.loop->defer_response_read_deadline_body_pump(foreign);
+    CHECK_FALSE(guard.loop->response_read_deadline_body_pump_pending);
+
+    auto invalid = guard.loop->init_slot_storage(0);
+    CHECK_FALSE(invalid.has_value());
+    CHECK_EQ(guard.loop->connection_capacity, 0u);
+    CHECK_EQ(guard.loop->body_pump_ready_words.data(), nullptr);
+
+    // Six mmap-backed tables are allocated here: connections, free stack,
+    // pending-free, two send-state arrays, then the ready-word set.
+    {
+        ScopedMemoryFault fail_ready_words(6);
+        auto failed = guard.loop->init_slot_storage(65);
+        CHECK_FALSE(failed.has_value());
+    }
+    CHECK_EQ(guard.loop->connection_capacity, 0u);
+    CHECK_EQ(guard.loop->backend.connection_capacity, 0u);
+    CHECK_EQ(guard.loop->conns.data(), nullptr);
+    CHECK_EQ(guard.loop->free_stack.data(), nullptr);
+    CHECK_EQ(guard.loop->pending_free.data(), nullptr);
+    CHECK_EQ(guard.loop->backend.send_state.data(), nullptr);
+    CHECK_EQ(guard.loop->backend.upstream_send_state.data(), nullptr);
+    CHECK_EQ(guard.loop->body_pump_ready_words.data(), nullptr);
+    CHECK_FALSE(guard.loop->response_read_deadline_body_pump_pending);
+
+    REQUIRE(guard.init(65));
+    CHECK_EQ(guard.loop->body_pump_ready_words.size(), 2u);
+    foreign.id = 1;
+    guard.loop->defer_response_read_deadline_body_pump(foreign);
+    CHECK_FALSE(guard.loop->response_read_deadline_body_pump_pending);
+    foreign.id = 65;
+    guard.loop->defer_response_read_deadline_body_pump(foreign);
+    CHECK_FALSE(guard.loop->response_read_deadline_body_pump_pending);
+}
+
 int main(int argc, char** argv) {
     return rut::test::run_all(argc, argv);
 }
