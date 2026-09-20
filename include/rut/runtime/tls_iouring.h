@@ -85,6 +85,69 @@ enum class TlsFill : u8 {
     Fatal,     // crypto error or raw-send submission failure — caller closes
 };
 
+// Synchronous witness for the one logical plaintext completion. It is copied
+// before the owner is detached and never retained as a reusable cache.
+struct TlsLogicalSendCompletionWitness {
+    u32 generation = 0;
+    i32 fd = -1;
+    u32 handler_generation = 0;
+    const u8* src = nullptr;
+    u32 len = 0;
+};
+
+template <class Self>
+bool tls_single_shot_send_owner_is_current(const Connection& c) {
+    return c.tls_active && !c.tls_proxy_stream && c.tls_send_owner_generation != 0 &&
+           (c.tls_send_owner_generation & kNonUpstreamSendCancelBit) == 0 && c.fd >= 0 &&
+           c.tls_send_owner_fd == c.fd && c.tls_send_owner_handler_generation == c.handler_gen &&
+           c.tls_send_src != nullptr && c.tls_send_len != 0 && c.tls_send_off <= c.tls_send_len;
+}
+
+template <class Self>
+bool tls_send_retry_has_driver(Self* loop, Connection& c, TlsFill status) {
+    if (status == TlsFill::Fatal) return false;
+    if (c.tls_send_owner_generation != 0 && !tls_single_shot_send_owner_is_current<Self>(c))
+        return false;
+    if (c.tls_send_owner_generation == 0 && !c.tls_proxy_stream) return false;
+    if (status == TlsFill::NeedRead) {
+        c.tls_pending_on_recv = &tls_resume_pending_send_recv<Self>;
+        return loop->submit_recv(c);
+    }
+    if (!c.tls_out_inflight) return false;
+    if constexpr (requires { loop->tls_ciphertext_send_is_current(c); })
+        return loop->tls_ciphertext_send_is_current(c);
+    return true;
+}
+
+template <class Self>
+bool tls_finish_single_shot_send(Self* loop, Connection& c) {
+    if (c.tls_send_owner_generation == 0) return true;
+    if (!tls_single_shot_send_owner_is_current<Self>(c) || c.tls_send_off != c.tls_send_len ||
+        c.tls_out_inflight || c.tls_out_buf.len() != 0 ||
+        c.tls_pending_on_recv == &tls_resume_pending_send_recv<Self> || c.send_armed ||
+        c.tls_send_len > static_cast<u32>(INT32_MAX)) {
+        loop->close_conn(c);
+        return false;
+    }
+
+    const TlsLogicalSendCompletionWitness witness{c.tls_send_owner_generation,
+                                                  c.tls_send_owner_fd,
+                                                  c.tls_send_owner_handler_generation,
+                                                  c.tls_send_src,
+                                                  c.tls_send_len};
+    const auto continuation = c.tls_pending_on_send;
+    c.on_send = continuation;
+    Connection::visit_tls_single_shot_send_owner_fields(
+        c, [](auto& value, const auto& reset_value) { value = reset_value; });
+    c.recv_paused_for_send = false;
+    loop->complete_tls_logical_send(c, witness, continuation);
+
+    // The continuation may close/reuse the slot or synchronously install the
+    // next response body's logical owner. No old completion tail may alter it.
+    return c.tls_active && c.fd == witness.fd && c.handler_gen == witness.handler_generation &&
+           c.tls_send_owner_generation == 0;
+}
+
 // Ensure exactly one raw send is draining tls_out_buf. Submits at most
 // kTlsDrainChunk per SQE so the drain handler runs at slice granularity (the
 // backend has full-send semantics — see the design doc), and records the
@@ -93,6 +156,7 @@ enum class TlsFill : u8 {
 template <class Self>
 bool tls_ensure_draining(Self* loop, Connection& c) {
     if (c.tls_out_inflight) {
+        if (loop == nullptr || !loop->tls_ciphertext_send_is_current(c)) return false;
         // A send is already draining its chunk; its completion must still reach
         // tls_on_out_drain even if the upper layer overwrote on_send via
         // transition_to_sending() — e.g. a response started while a control/
@@ -105,11 +169,7 @@ bool tls_ensure_draining(Self* loop, Connection& c) {
     if (c.tls_out_buf.len() == 0) return true;
     const u32 kAvail = c.tls_out_buf.len();
     const u32 kN = kAvail < Self::kTlsDrainChunk ? kAvail : Self::kTlsDrainChunk;
-    if (!loop->submit_send_raw(c, c.tls_out_buf.data(), kN)) return false;
-    c.tls_out_inflight = true;
-    c.tls_out_inflight_len = kN;
-    c.on_send = &tls_on_out_drain<Self>;
-    return true;
+    return loop->submit_tls_ciphertext_send(c, c.tls_out_buf.data(), kN);
 }
 
 // Encrypt plaintext src[0..len) into the owned tls_out_buf, keeping a send
@@ -154,13 +214,32 @@ TlsFill tls_fill_output(Self* loop, Connection& c, const u8* src, u32 len, u32& 
 template <class Self>
 void tls_on_out_drain(void* lp, Connection& c, IoEvent ev) {
     auto* loop = static_cast<Self*>(lp);
-    if (ev.result <= 0) {
+    if (loop == nullptr) return;
+    if (ev.type != IoEventType::Send || ev.more || ev.aux != 0 || !c.tls_out_inflight ||
+        c.tls_out_inflight_generation == 0 ||
+        ev.non_upstream_generation != c.tls_out_inflight_generation || ev.result <= 0 ||
+        static_cast<u32>(ev.result) != c.tls_out_inflight_len ||
+        c.tls_out_inflight_src == nullptr || c.tls_out_inflight_src != c.tls_out_buf.data() ||
+        c.tls_out_inflight_len == 0 || c.tls_out_inflight_len > c.tls_out_buf.len() ||
+        c.tls_out_inflight_fd < 0) {
         loop->close_conn(c);
         return;
     }
-    c.tls_out_buf.consume(c.tls_out_inflight_len);
-    c.tls_out_inflight = false;
-    c.tls_out_inflight_len = 0;
+    if ((c.tls_send_owner_generation != 0 && !tls_single_shot_send_owner_is_current<Self>(c)) ||
+        (c.tls_send_owner_generation == 0 && c.tls_send_src != nullptr && !c.tls_proxy_stream) ||
+        (c.tls_send_owner_generation == 0 && c.tls_pending_on_send != nullptr)) {
+        loop->close_conn(c);
+        return;
+    }
+    const u32 kDrainedLen = c.tls_out_inflight_len;
+    if (c.id >= loop->connection_capacity) {
+        loop->close_conn(c);
+        return;
+    }
+    loop->backend.send_state[c.id] = {};
+    Connection::visit_tls_raw_send_owner_fields(
+        c, [](auto& value, const auto& reset_value) { value = reset_value; });
+    c.tls_out_buf.consume(kDrainedLen);
 
     // Low-watermark resume: the proxy read side pauses the upstream recv once the
     // ciphertext buffer crosses the high watermark; as it drains back below the
@@ -217,13 +296,8 @@ void tls_on_out_drain(void* lp, Connection& c, IoEvent ev) {
             proxy_tls_parked_drained<Self>(loop, c, consumed);
             if (!c.tls_active) return;
         }
-        if (kSt == TlsFill::NeedRoom) return;  // still full — resume at the next drain
-        if (kSt == TlsFill::NeedRead) {
-            // SSL_write needs peer input to retry. If no recv is armed and we
-            // can't queue one (SQ pressure), nothing will ever deliver that input
-            // — fail closed instead of hanging until the idle timeout.
-            c.tls_pending_on_recv = &tls_resume_pending_send_recv<Self>;
-            if (!c.recv_armed && !loop->submit_recv(c)) loop->close_conn(c);
+        if (kSt == TlsFill::NeedRoom || kSt == TlsFill::NeedRead) {
+            if (!tls_send_retry_has_driver<Self>(loop, c, kSt)) loop->close_conn(c);
             return;
         }
         // Done: remainder fully encrypted — fall through.
@@ -236,22 +310,10 @@ void tls_on_out_drain(void* lp, Connection& c, IoEvent ev) {
 
     // Buffer empty: app-data send fully drained (or a handshake/control flight,
     // which has no upper-layer continuation).
-    const u32 kCompletedLen = c.tls_send_len;
-    c.tls_send_src = nullptr;
-    c.tls_send_len = 0;
-    c.tls_send_off = 0;
-    auto pending = c.tls_pending_on_send;
-    c.tls_pending_on_send = nullptr;
-    if (pending) {
-        // Single-shot send (response / wait(send)): fire the upper-layer
-        // continuation now, on the real drain CQE, with the plaintext length.
-        c.on_send = pending;
-        IoEvent sev = {};
-        sev.conn_id = c.id;
-        sev.type = IoEventType::Send;
-        sev.result = static_cast<i32>(kCompletedLen);
-        pending(loop, c, sev);
-        if (!c.tls_active) return;
+    if (c.tls_send_owner_generation != 0) {
+        // Detach before callback. It may close, advance the HTTP request or
+        // synchronously install a successor owner; stop on any identity change.
+        if (!tls_finish_single_shot_send<Self>(loop, c)) return;
     } else if (c.tls_proxy_stream) {
         // Proxy streaming body (read/drain decoupled): the request completes only
         // when the whole body is buffered AND the buffer is empty. Otherwise the
@@ -271,6 +333,10 @@ void tls_on_out_drain(void* lp, Connection& c, IoEvent ev) {
         }
         return;
     } else {
+        if (c.tls_send_src != nullptr || c.tls_pending_on_send != nullptr) {
+            loop->close_conn(c);
+            return;
+        }
         c.on_send = nullptr;  // handshake/control flight; no upper-layer continuation
     }
     if (c.tls_engine.ssl && c.pending_handler_fn &&
@@ -323,6 +389,10 @@ void tls_process(Self* loop, Connection& c) {
     }
 
     if (!c.tls_pending_on_recv) {
+        if (c.tls_send_owner_generation != 0) {
+            loop->close_conn(c);
+            return;
+        }
         if (!c.recv_armed) loop->submit_recv(c);
         return;
     }
@@ -388,7 +458,18 @@ void tls_process(Self* loop, Connection& c) {
         pev.type = IoEventType::Recv;
         pev.result = static_cast<i32>(c.recv_buf.len() - kBefore);
         auto pending_recv = c.tls_pending_on_recv;
+        if (c.tls_send_owner_generation != 0 &&
+            pending_recv != &tls_resume_pending_send_recv<Self>) {
+            loop->close_conn(c);
+            return;
+        }
         if (pending_recv == &tls_resume_pending_send_recv<Self>) {
+            const bool single_shot = c.tls_send_owner_generation != 0;
+            if ((single_shot && !tls_single_shot_send_owner_is_current<Self>(c)) ||
+                (!single_shot && !c.tls_proxy_stream)) {
+                loop->close_conn(c);
+                return;
+            }
             c.tls_pending_on_recv = nullptr;
             if (c.tls_send_src && c.tls_send_off < c.tls_send_len) {
                 u32 consumed = 0;
@@ -409,19 +490,15 @@ void tls_process(Self* loop, Connection& c) {
                     proxy_tls_parked_drained<Self>(loop, c, consumed);
                     if (!c.tls_active) return;
                 }
-                if (kFs == TlsFill::NeedRead) {
-                    c.tls_pending_on_recv = &tls_resume_pending_send_recv<Self>;
-                    // The driving Recv CQE may have been terminal (!more), so
-                    // dispatch already cleared recv_armed. Arm a recv (like the
-                    // other NeedRead paths) so a future CQE drives the retry —
-                    // otherwise the proxy-stream early return below exits with no
-                    // armed recv and, if no ciphertext send was queued, the
-                    // download stalls until timeout. Fail closed if it can't queue.
-                    if (!c.recv_armed && !loop->submit_recv(c)) {
-                        loop->close_conn(c);
-                        return;
-                    }
+                if (kFs == TlsFill::NeedRead || kFs == TlsFill::NeedRoom) {
+                    if (!tls_send_retry_has_driver<Self>(loop, c, kFs)) loop->close_conn(c);
+                    // Newly decrypted application bytes remain in recv_buf until
+                    // the current logical send advances the HTTP request boundary.
+                    return;
                 }
+            } else if (single_shot && c.tls_send_off != c.tls_send_len) {
+                loop->close_conn(c);
+                return;
             }
             // For a proxy stream, the plaintext just decrypted is the client's
             // pipelined NEXT request. Parsing/dispatching it now — mid-response,
@@ -429,10 +506,23 @@ void tls_process(Self* loop, Connection& c) {
             // pipelining and clobber per-request proxy state. Leave it buffered in
             // recv_buf; proxy_stream_complete dispatches it once the response ends.
             if (c.tls_proxy_stream) return;
-            pending_recv = &on_header_received<Self>;
+            if (single_shot) {
+                if (c.tls_out_inflight || c.tls_out_buf.len() != 0) return;
+                if (!tls_finish_single_shot_send<Self>(loop, c)) return;
+                // Completion callbacks own pipeline_shift / request-boundary
+                // replay. This pre-completion Recv event is stale after they may
+                // have consumed or moved recv_buf, even if handler_gen is stable.
+                return;
+            } else {
+                pending_recv = c.tls_pending_on_recv;
+            }
+            if (pending_recv == nullptr) pending_recv = &on_header_received<Self>;
         } else if (!pending_recv) {
             pending_recv = &on_header_received<Self>;
         }
+        const i32 callback_fd = c.fd;
+        const u32 callback_handler_generation = c.handler_gen;
+        const u32 callback_send_owner_generation = c.tls_send_owner_generation;
         pending_recv(loop, c, pev);
 
         // on_header_received may have closed the connection synchronously (EOF /
@@ -440,7 +530,10 @@ void tls_process(Self* loop, Connection& c) {
         // io_uring close path reset()s the slot (tls_active=false, fd=-1, buffers
         // unbound) — touching c past here is use-after-close, and the trailing
         // submit_recv would arm a recv on a dead fd. Bail immediately.
-        if (!c.tls_active) return;
+        if (!c.tls_active || c.fd != callback_fd || c.handler_gen != callback_handler_generation ||
+            c.tls_send_owner_generation != callback_send_owner_generation ||
+            c.tls_send_owner_generation != 0)
+            return;
 
         // on_header_received may have started a response send (tls_out_inflight)
         // or drained recv_buf. Stop if we can't safely produce more.
@@ -487,12 +580,23 @@ void tls_resume_pending_handler_recv(void* lp, Connection& c, IoEvent ev) {
 template <class Self>
 void tls_resume_pending_send_recv(void* lp, Connection& c, IoEvent /*ev*/) {
     auto* loop = static_cast<Self*>(lp);
+    const bool single_shot = c.tls_send_owner_generation != 0;
+    if ((single_shot && !tls_single_shot_send_owner_is_current<Self>(c)) ||
+        (!single_shot && !c.tls_proxy_stream)) {
+        loop->close_conn(c);
+        return;
+    }
     c.tls_pending_on_recv = nullptr;
-    if (!c.tls_send_src || c.tls_send_off >= c.tls_send_len) return;
     u32 consumed = 0;
-    const TlsFill kSt = tls_fill_output<Self>(
-        loop, c, c.tls_send_src + c.tls_send_off, c.tls_send_len - c.tls_send_off, consumed);
-    c.tls_send_off += consumed;
+    TlsFill kSt = TlsFill::Done;
+    if (c.tls_send_src && c.tls_send_off < c.tls_send_len) {
+        kSt = tls_fill_output<Self>(
+            loop, c, c.tls_send_src + c.tls_send_off, c.tls_send_len - c.tls_send_off, consumed);
+        c.tls_send_off += consumed;
+    } else if (c.tls_send_off != c.tls_send_len) {
+        loop->close_conn(c);
+        return;
+    }
     if (kSt == TlsFill::Fatal) {
         loop->close_conn(c);
         return;
@@ -504,12 +608,26 @@ void tls_resume_pending_send_recv(void* lp, Connection& c, IoEvent /*ev*/) {
         proxy_tls_parked_drained<Self>(loop, c, consumed);
         if (!c.tls_active) return;
     }
-    if (kSt == TlsFill::NeedRead) {
-        // Need peer input again to retry — fail closed if no recv can be armed.
-        c.tls_pending_on_recv = &tls_resume_pending_send_recv<Self>;
-        if (!c.recv_armed && !loop->submit_recv(c)) loop->close_conn(c);
+    if (kSt == TlsFill::NeedRead || kSt == TlsFill::NeedRoom) {
+        if (!tls_send_retry_has_driver<Self>(loop, c, kSt)) loop->close_conn(c);
+        return;
     }
-    // NeedRoom resumes at the next drain; Done drains via tls_on_out_drain.
+    if (c.tls_out_inflight) {
+        if (!loop->tls_ciphertext_send_is_current(c)) loop->close_conn(c);
+        return;
+    }
+    if (c.tls_out_buf.len() != 0) {
+        if (!tls_ensure_draining<Self>(loop, c)) loop->close_conn(c);
+        return;
+    }
+    if (single_shot) {
+        tls_finish_single_shot_send<Self>(loop, c);
+        return;
+    }
+    // A proxy-stream write retry with no raw target has no future driver.
+    // Normally SSL_write emits ciphertext; treat a no-output terminal retry as
+    // an invalid state rather than leaving the parked body unowned.
+    loop->close_conn(c);
 }
 
 }  // namespace rut

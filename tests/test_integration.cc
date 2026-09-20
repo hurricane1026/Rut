@@ -5873,12 +5873,80 @@ struct TlsIouringHarness : SmallLoop {
     [[maybe_unused]] static constexpr u32 kTlsDrainChunk = SlicePool::kSliceSize;
     [[maybe_unused]] static constexpr u32 kTlsOutHigh = IoUringEventLoop::kTlsOutHigh;
     [[maybe_unused]] static constexpr u32 kTlsOutLow = IoUringEventLoop::kTlsOutLow;
+    struct SendState {
+        const u8* src = nullptr;
+        i32 fd = -1;
+        u32 offset = 0;
+        u32 remaining = 0;
+        IoEventType type = IoEventType::Send;
+        u32 upstream_episode = 0;
+        u32 generation = 0;
+    };
+    struct Backend {
+        SendState send_state[SmallLoop::kMaxConns];
+    } backend;
+    u32 connection_capacity = SmallLoop::kMaxConns;
     bool sent = false;
     bool closed = false;
 
     bool submit_send_raw(Connection& /*conn*/, const u8* /*buf*/, u32 len) {
         sent = len > 0;
         return true;
+    }
+
+    // Keep the raw ciphertext target under test control. TLS tests explicitly
+    // drive the final drain callback rather than relying on a kernel CQE.
+    bool submit_tls_ciphertext_send(Connection& conn, const u8* buf, u32 len) {
+        if (conn.id >= connection_capacity || conn.fd < 0 || buf == nullptr || len == 0 ||
+            buf != conn.tls_out_buf.data() || len > conn.tls_out_buf.len() || conn.send_armed ||
+            !conn.tls_raw_send_owner_is_neutral())
+            return false;
+        u32 generation = 0;
+        if (!conn.next_non_upstream_send_generation(generation)) return false;
+        conn.tls_out_inflight = true;
+        conn.tls_out_inflight_len = len;
+        conn.tls_out_inflight_generation = generation;
+        conn.tls_out_inflight_fd = conn.fd;
+        conn.tls_out_inflight_src = buf;
+        conn.pending_ops++;
+        conn.send_armed = true;
+        conn.on_send = &tls_on_out_drain<TlsIouringHarness>;
+        backend.send_state[conn.id] = {buf, conn.fd, 0, len, IoEventType::Send, 0, generation};
+        sent = len > 0;
+        return sent;
+    }
+
+    bool tls_ciphertext_send_is_current(const Connection& conn) const {
+        if (conn.id >= connection_capacity || !conn.tls_out_inflight || !conn.send_armed ||
+            conn.pending_ops == 0 || conn.tls_out_inflight_generation == 0 ||
+            conn.tls_out_inflight_fd != conn.fd || conn.tls_out_inflight_src == nullptr ||
+            conn.tls_out_inflight_src != conn.tls_out_buf.data() ||
+            conn.tls_out_inflight_len == 0 || conn.tls_out_inflight_len > conn.tls_out_buf.len())
+            return false;
+        const auto& state = backend.send_state[conn.id];
+        return state.src == conn.tls_out_inflight_src && state.fd == conn.tls_out_inflight_fd &&
+               state.type == IoEventType::Send &&
+               state.generation == conn.tls_out_inflight_generation &&
+               state.offset + state.remaining == conn.tls_out_inflight_len;
+    }
+
+    void complete_tls_logical_send(Connection& conn,
+                                   const TlsLogicalSendCompletionWitness& witness,
+                                   Connection::Callback continuation) {
+        if (!conn.tls_active || conn.fd != witness.fd ||
+            conn.handler_gen != witness.handler_generation || witness.generation == 0 ||
+            witness.src == nullptr || witness.len == 0 || conn.send_armed ||
+            !conn.tls_raw_send_owner_is_neutral() ||
+            !conn.tls_single_shot_send_owner_is_neutral()) {
+            close_conn(conn);
+            return;
+        }
+        if (continuation == nullptr) return;
+        IoEvent ev = {};
+        ev.conn_id = conn.id;
+        ev.type = IoEventType::Send;
+        ev.result = static_cast<i32>(witness.len);
+        continuation(this, conn, ev);
     }
 
     void close_conn(Connection& conn) {
@@ -5892,11 +5960,272 @@ struct TlsIouringHarness : SmallLoop {
 bool g_tls_iouring_plain_recv_called = false;
 u32 g_tls_iouring_plain_recv_result = 0;
 
+bool g_tls_iouring_logical_send_called = false;
+u32 g_tls_iouring_logical_send_calls = 0;
+u32 g_tls_iouring_logical_send_result = 0;
+u32 g_tls_iouring_recv_buf_len_at_logical_send = 0;
+u8 g_tls_iouring_recv_buf_at_logical_send[128];
+bool g_tls_iouring_next_request_called = false;
+u32 g_tls_iouring_next_request_result = 0;
+u32 g_tls_iouring_next_request_len = 0;
+u8 g_tls_iouring_next_request_buf[128];
+
 void tls_iouring_plain_recv_probe(void* /*lp*/, Connection& /*conn*/, IoEvent ev) {
     g_tls_iouring_plain_recv_called = true;
     g_tls_iouring_plain_recv_result = static_cast<u32>(ev.result);
 }
+
+void tls_iouring_next_request_probe(void* lp, Connection& conn, IoEvent ev);
+
+void tls_iouring_logical_send_probe(void* /*lp*/, Connection& conn, IoEvent ev) {
+    g_tls_iouring_logical_send_called = true;
+    g_tls_iouring_logical_send_calls++;
+    g_tls_iouring_logical_send_result = static_cast<u32>(ev.result);
+    g_tls_iouring_recv_buf_len_at_logical_send = conn.recv_buf.len();
+    const u32 copy_len = conn.recv_buf.len() < sizeof(g_tls_iouring_recv_buf_at_logical_send)
+                             ? conn.recv_buf.len()
+                             : sizeof(g_tls_iouring_recv_buf_at_logical_send);
+    if (copy_len > 0)
+        __builtin_memcpy(g_tls_iouring_recv_buf_at_logical_send, conn.recv_buf.data(), copy_len);
+    // Model the real response-completion pipeline boundary: it consumes the
+    // bytes accumulated during the prior send, then installs the next request's
+    // plaintext receiver through the normal slot transition.
+    conn.recv_buf.reset();
+    conn.transition_to_reading_header(&tls_iouring_next_request_probe);
+}
+
+void tls_iouring_next_request_probe(void* /*lp*/, Connection& conn, IoEvent ev) {
+    g_tls_iouring_next_request_called = true;
+    g_tls_iouring_next_request_result = static_cast<u32>(ev.result);
+    g_tls_iouring_next_request_len = conn.recv_buf.len();
+    const u32 copy_len = conn.recv_buf.len() < sizeof(g_tls_iouring_next_request_buf)
+                             ? conn.recv_buf.len()
+                             : sizeof(g_tls_iouring_next_request_buf);
+    if (copy_len > 0)
+        __builtin_memcpy(g_tls_iouring_next_request_buf, conn.recv_buf.data(), copy_len);
+}
 }  // namespace
+
+// Model a legal parked-owner resume state corresponding to WANT_READ without
+// forcing SSL_write to produce that result, then feed real TLS app data through
+// tls_process. The newly decrypted next request must remain buffered until the
+// authenticated raw ciphertext target drains and delivers the saved logical
+// completion exactly once.
+TEST(tls_iouring, want_read_resume_state_preserves_pipelined_plaintext_until_raw_drain) {
+    auto tls_ctx = create_tls_server_context(kTestCertPath, kTestKeyPath);
+    REQUIRE(tls_ctx.has_value());
+
+    TlsIouringHarness loop;
+    Connection& conn = loop.conns[0];
+    u8 tls_in_storage[4096];
+    u8 tls_out_storage[4096];
+    conn.reset();
+    conn.id = 0;
+    conn.fd = 42;
+    conn.tls_active = true;
+    conn.recv_slice = loop.recv_storage[0];
+    conn.tls_in_slice = tls_in_storage;
+    conn.tls_out_slice = tls_out_storage;
+    conn.recv_buf.bind(loop.recv_storage[0], sizeof(loop.recv_storage[0]));
+    conn.tls_in_buf.bind(tls_in_storage, sizeof(tls_in_storage));
+    conn.tls_out_buf.bind(tls_out_storage, sizeof(tls_out_storage));
+    REQUIRE(tls_engine_init(conn.tls_engine, tls_ctx.value()).has_value());
+
+    TlsClientPeer cl;
+    REQUIRE(tls_engine_handshake_loopback(conn.tls_engine, cl));
+
+    static constexpr u8 kCurrentRequest[] = "request-one";
+    static constexpr u8 kNextRequest[] = "GET /next HTTP/1.1\r\nHost: x\r\n\r\n";
+    static constexpr u8 kReplyTail[] = "response-tail";
+    REQUIRE_EQ(conn.recv_buf.write(kCurrentRequest, sizeof(kCurrentRequest) - 1),
+               sizeof(kCurrentRequest) - 1);
+    REQUIRE(SSL_write(cl.ssl, kNextRequest, sizeof(kNextRequest) - 1) ==
+            static_cast<int>(sizeof(kNextRequest) - 1));
+    const int cipher_len = BIO_read(
+        cl.wbio, conn.tls_in_buf.write_ptr(), static_cast<int>(conn.tls_in_buf.write_avail()));
+    REQUIRE(cipher_len > 0);
+    conn.tls_in_buf.commit(static_cast<u32>(cipher_len));
+
+    u32 owner_generation = 0;
+    REQUIRE(conn.next_non_upstream_send_generation(owner_generation));
+    conn.tls_send_owner_generation = owner_generation;
+    conn.tls_send_owner_fd = conn.fd;
+    conn.tls_send_owner_handler_generation = conn.handler_gen;
+    conn.tls_send_src = kReplyTail;
+    conn.tls_send_len = sizeof(kReplyTail) - 1;
+    conn.tls_send_off = 0;
+    conn.tls_pending_on_send = &tls_iouring_logical_send_probe;
+    conn.tls_pending_on_recv = &tls_resume_pending_send_recv<TlsIouringHarness>;
+    conn.recv_armed = true;
+    g_tls_iouring_logical_send_called = false;
+    g_tls_iouring_logical_send_calls = 0;
+    g_tls_iouring_logical_send_result = 0;
+    g_tls_iouring_recv_buf_len_at_logical_send = 0;
+    g_tls_iouring_next_request_called = false;
+    g_tls_iouring_next_request_result = 0;
+    g_tls_iouring_next_request_len = 0;
+
+    tls_process<TlsIouringHarness>(&loop, conn);
+
+    CHECK(loop.sent);
+    CHECK(conn.tls_out_inflight);
+    CHECK_FALSE(g_tls_iouring_logical_send_called);
+    CHECK_EQ(conn.recv_buf.len(), sizeof(kCurrentRequest) - 1 + sizeof(kNextRequest) - 1);
+    CHECK(memcmp(conn.recv_buf.data(), kCurrentRequest, sizeof(kCurrentRequest) - 1) == 0);
+    CHECK(memcmp(conn.recv_buf.data() + sizeof(kCurrentRequest) - 1,
+                 kNextRequest,
+                 sizeof(kNextRequest) - 1) == 0);
+
+    const u32 raw_len = conn.tls_out_inflight_len;
+    const u32 raw_generation = conn.tls_out_inflight_generation;
+    REQUIRE(raw_len > 0);
+    auto& state = loop.backend.send_state[conn.id];
+    state.offset = raw_len;
+    state.remaining = 0;
+    conn.pending_ops--;
+    conn.send_armed = false;
+    IoEvent drain = {};
+    drain.conn_id = conn.id;
+    drain.result = static_cast<i32>(raw_len);
+    drain.type = IoEventType::Send;
+    drain.non_upstream_generation = raw_generation;
+    tls_on_out_drain<TlsIouringHarness>(&loop, conn, drain);
+
+    CHECK(g_tls_iouring_logical_send_called);
+    CHECK_EQ(g_tls_iouring_logical_send_calls, 1u);
+    CHECK_EQ(g_tls_iouring_logical_send_result, sizeof(kReplyTail) - 1);
+    CHECK_EQ(g_tls_iouring_recv_buf_len_at_logical_send,
+             sizeof(kCurrentRequest) - 1 + sizeof(kNextRequest) - 1);
+    CHECK(memcmp(g_tls_iouring_recv_buf_at_logical_send,
+                 kCurrentRequest,
+                 sizeof(kCurrentRequest) - 1) == 0);
+    CHECK(memcmp(g_tls_iouring_recv_buf_at_logical_send + sizeof(kCurrentRequest) - 1,
+                 kNextRequest,
+                 sizeof(kNextRequest) - 1) == 0);
+    CHECK(conn.tls_raw_send_owner_is_neutral());
+    CHECK(conn.tls_single_shot_send_owner_is_neutral());
+    CHECK_EQ(conn.recv_buf.len(), 0u);
+    CHECK(conn.tls_pending_on_recv == &tls_iouring_next_request_probe);
+
+    // Later application data after the logical completion must use the normal
+    // callback installed by the response boundary and be decrypted once.
+    static constexpr u8 kLaterRequest[] = "GET /later HTTP/1.1\r\nHost: x\r\n\r\n";
+    REQUIRE(SSL_write(cl.ssl, kLaterRequest, sizeof(kLaterRequest) - 1) ==
+            static_cast<int>(sizeof(kLaterRequest) - 1));
+    const int later_cipher_len = BIO_read(
+        cl.wbio, conn.tls_in_buf.write_ptr(), static_cast<int>(conn.tls_in_buf.write_avail()));
+    REQUIRE(later_cipher_len > 0);
+    conn.tls_in_buf.commit(static_cast<u32>(later_cipher_len));
+    tls_process<TlsIouringHarness>(&loop, conn);
+    CHECK(g_tls_iouring_next_request_called);
+    CHECK_EQ(g_tls_iouring_next_request_result, sizeof(kLaterRequest) - 1);
+    CHECK_EQ(g_tls_iouring_next_request_len, sizeof(kLaterRequest) - 1);
+    CHECK(g_tls_iouring_next_request_len == sizeof(kLaterRequest) - 1 &&
+          memcmp(g_tls_iouring_next_request_buf, kLaterRequest, sizeof(kLaterRequest) - 1) == 0);
+
+    cl.destroy();
+    tls_engine_free(conn.tls_engine);
+    destroy_tls_server_context(tls_ctx.value());
+}
+
+TEST(tls_iouring, need_room_retry_drains_multiple_ciphertext_targets_before_one_logical_send) {
+    auto tls_ctx = create_tls_server_context(kTestCertPath, kTestKeyPath);
+    REQUIRE(tls_ctx.has_value());
+
+    TlsIouringHarness loop;
+    Connection& conn = loop.conns[0];
+    u8 tls_in_storage[4096];
+    u8 tls_out_storage[4096];
+    conn.reset();
+    conn.id = 0;
+    conn.fd = 42;
+    conn.tls_active = true;
+    conn.recv_slice = loop.recv_storage[0];
+    conn.tls_in_slice = tls_in_storage;
+    conn.tls_out_slice = tls_out_storage;
+    conn.recv_buf.bind(loop.recv_storage[0], sizeof(loop.recv_storage[0]));
+    conn.tls_in_buf.bind(tls_in_storage, sizeof(tls_in_storage));
+    conn.tls_out_buf.bind(tls_out_storage, sizeof(tls_out_storage));
+    REQUIRE(tls_engine_init(conn.tls_engine, tls_ctx.value()).has_value());
+
+    TlsClientPeer cl;
+    REQUIRE(tls_engine_handshake_loopback(conn.tls_engine, cl));
+
+    static u8 payload[40000];
+    static u8 decrypted[40000];
+    for (u32 i = 0; i < sizeof(payload); i++) payload[i] = static_cast<u8>((i * 31u + 7u) & 0xffu);
+
+    u32 logical_generation = 0;
+    REQUIRE(conn.next_non_upstream_send_generation(logical_generation));
+    conn.tls_send_owner_generation = logical_generation;
+    conn.tls_send_owner_fd = conn.fd;
+    conn.tls_send_owner_handler_generation = conn.handler_gen;
+    conn.tls_send_src = payload;
+    conn.tls_send_len = sizeof(payload);
+    conn.tls_send_off = 0;
+    conn.tls_pending_on_send = &tls_iouring_logical_send_probe;
+    g_tls_iouring_logical_send_called = false;
+    g_tls_iouring_logical_send_calls = 0;
+    g_tls_iouring_logical_send_result = 0;
+
+    u32 consumed = 0;
+    const TlsFill initial =
+        tls_fill_output<TlsIouringHarness>(&loop, conn, payload, sizeof(payload), consumed);
+    conn.tls_send_off = consumed;
+    REQUIRE_EQ(initial, TlsFill::NeedRoom);
+    REQUIRE(tls_send_retry_has_driver<TlsIouringHarness>(&loop, conn, initial));
+    REQUIRE(conn.tls_out_inflight);
+
+    u32 raw_drains = 0;
+    u32 ciphertext_total = 0;
+    for (u32 iteration = 0; conn.tls_out_inflight && iteration < 128; iteration++) {
+        const u32 raw_len = conn.tls_out_inflight_len;
+        const u32 raw_generation = conn.tls_out_inflight_generation;
+        REQUIRE_GT(raw_len, 0u);
+        REQUIRE_NE(raw_generation, 0u);
+        REQUIRE_EQ(BIO_write(cl.rbio, conn.tls_out_buf.data(), static_cast<int>(raw_len)),
+                   static_cast<int>(raw_len));
+        ciphertext_total += raw_len;
+
+        auto& send = loop.backend.send_state[conn.id];
+        send.offset = raw_len;
+        send.remaining = 0;
+        REQUIRE_GT(conn.pending_ops, 0u);
+        conn.pending_ops--;
+        conn.send_armed = false;
+        IoEvent drain = {};
+        drain.conn_id = conn.id;
+        drain.type = IoEventType::Send;
+        drain.result = static_cast<i32>(raw_len);
+        drain.non_upstream_generation = raw_generation;
+        tls_on_out_drain<TlsIouringHarness>(&loop, conn, drain);
+        raw_drains++;
+        CHECK_FALSE(loop.closed);
+    }
+
+    CHECK_FALSE(conn.tls_out_inflight);
+    CHECK_EQ(conn.tls_out_buf.len(), 0u);
+    CHECK_GT(raw_drains, 1u);
+    CHECK_GT(ciphertext_total,
+             sizeof(payload));  // raw-wire accounting differs from plaintext bytes
+    CHECK(g_tls_iouring_logical_send_called);
+    CHECK_EQ(g_tls_iouring_logical_send_calls, 1u);
+    CHECK_EQ(g_tls_iouring_logical_send_result, sizeof(payload));
+
+    u32 decrypted_len = 0;
+    for (u32 iteration = 0; iteration < 5000 && decrypted_len < sizeof(decrypted); iteration++) {
+        const int read_len = SSL_read(
+            cl.ssl, decrypted + decrypted_len, static_cast<int>(sizeof(decrypted) - decrypted_len));
+        if (read_len <= 0) break;
+        decrypted_len += static_cast<u32>(read_len);
+    }
+    CHECK_EQ(decrypted_len, sizeof(payload));
+    CHECK(decrypted_len == sizeof(payload) && memcmp(decrypted, payload, sizeof(payload)) == 0);
+
+    cl.destroy();
+    tls_engine_free(conn.tls_engine);
+    destroy_tls_server_context(tls_ctx.value());
+}
 
 // Encrypt a payload far larger than the output buffer, forcing the WantWrite /
 // flush-and-continue loop that tls_fill_output drives over tls_out_buf on
@@ -7056,95 +7385,106 @@ struct ScopedWatermarkTestResources {
 
 TEST(tls_iouring, exact_local_response_normalized_fragmented_and_sequential) {
     if (!iouring_socket_live()) SKIP("io_uring async socket ops unavailable");
-    auto config = std::make_unique<RouteConfig>();
-    char body[1024];
-    memset(body, 'x', sizeof(body));
-    StrictLocalResponsePolicySpec policy{};
-    policy.version = StrictLocalResponseVersion::Http11;
-    policy.status_code = 200;
-    policy.date = StrictLocalResponseDate::Current;
-    policy.connection = StrictLocalResponseConnection::Request;
-    policy.head_mode = StrictLocalResponseHeadMode::SuppressBody;
-    policy.reason = lit_str("OK");
-    policy.content_type = lit_str("text/plain");
-    policy.server = lit_str("rut");
-    policy.body = {body, sizeof(body)};
-    const u16 id = config->add_strict_local_response_policy(policy);
-    REQUIRE(id != 0);
-    ExactStrictLocalResponseBinding binding{};
-    memcpy(binding.path, "/assets/static", 14);
-    binding.path_len = 14;
-    binding.path_view = ExactPathView::SlashNormalized;
-    binding.method = kRouteMethodAny;
-    binding.policy_id = id;
-    REQUIRE(config->append_exact_strict_local_response_binding(binding, id));
-    REQUIRE(config->strict_local_response_table_is_valid());
-    const RouteConfig* active = config.get();
-    Shard<IoUringEventLoop> shard;
-    ScopedWatermarkTestResources resources;
-    resources.shard = &shard;
-    auto tls = create_tls_server_context(kTestCertPath, kTestKeyPath);
-    REQUIRE(tls.has_value());
-    resources.tls_server_ctx = tls.value();
-    resources.listen_fd = create_listen_socket(0).value_or(-1);
-    REQUIRE(resources.listen_fd >= 0);
-    const u16 port = get_port(resources.listen_fd);
-    auto initialized = shard.init(0, resources.listen_fd);
-    resources.shard_initialized = initialized.has_value();
-    REQUIRE(initialized.has_value());
-    shard.loop->tls_server = tls.value();
-    shard.loop->config_ptr = &active;
-    REQUIRE(shard.spawn(-1).has_value());
-    resources.client_ctx = create_test_client_ctx();
-    REQUIRE(resources.client_ctx != nullptr);
-    resources.client_fd = connect_to(port);
-    REQUIRE(resources.client_fd >= 0);
-    set_socket_timeouts(resources.client_fd, 3);
-    resources.client_ssl = SSL_new(resources.client_ctx);
-    REQUIRE(resources.client_ssl != nullptr);
-    REQUIRE_EQ(SSL_set_fd(resources.client_ssl, resources.client_fd), 1);
-    REQUIRE_EQ(SSL_connect(resources.client_ssl), 1);
-    for (u32 request = 0; request < 4; ++request) {
-        const char* wire =
-            request == 3   ? "GET /assets//static HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n"
-            : request == 1 ? "HEAD /assets//static HTTP/1.1\r\nHost: x\r\n\r\n"
-                           : "GET /assets//static HTTP/1.1\r\nHost: x\r\n\r\n";
-        REQUIRE(ssl_write_all(resources.client_ssl, wire, 12));
-        usleep(1000);
-        REQUIRE(
-            ssl_write_all(resources.client_ssl, wire + 12, static_cast<u32>(strlen(wire)) - 12));
-        const u32 expected_body = request == 1 ? 0u : sizeof(body);
-        char received[4096]{};
-        u32 total = 0;
-        char* end = nullptr;
-        while (total < sizeof(received) - 1) {
-            const int count = SSL_read(resources.client_ssl,
-                                       received + total,
-                                       static_cast<int>(sizeof(received) - 1 - total));
-            // A worker wakeup can interrupt the blocking BIO read. Retry the
-            // identical SSL operation only for EINTR; socket timeouts still fail.
-            if (count <= 0 && errno == EINTR &&
-                SSL_get_error(resources.client_ssl, count) == SSL_ERROR_WANT_READ)
-                continue;
-            REQUIRE(count > 0);
-            total += static_cast<u32>(count);
-            end = strstr(received, "\r\n\r\n");
-            if (end != nullptr && total >= static_cast<u32>(end + 4 - received) + expected_body)
-                break;
+    for (const u32 body_len : {1024u, 4096u}) {
+        auto config = std::make_unique<RouteConfig>();
+        char body[4096];
+        memset(body, 'x', body_len);
+        StrictLocalResponsePolicySpec policy{};
+        policy.version = StrictLocalResponseVersion::Http11;
+        policy.status_code = 200;
+        policy.date = StrictLocalResponseDate::Current;
+        policy.connection = StrictLocalResponseConnection::Request;
+        policy.head_mode = StrictLocalResponseHeadMode::SuppressBody;
+        policy.reason = lit_str("OK");
+        policy.content_type = lit_str("text/plain");
+        policy.server = lit_str("rut");
+        policy.body = {body, body_len};
+        const u16 id = config->add_strict_local_response_policy(policy);
+        REQUIRE(id != 0);
+        ExactStrictLocalResponseBinding binding{};
+        memcpy(binding.path, "/assets/static", 14);
+        binding.path_len = 14;
+        binding.path_view = ExactPathView::SlashNormalized;
+        binding.method = kRouteMethodAny;
+        binding.policy_id = id;
+        REQUIRE(config->append_exact_strict_local_response_binding(binding, id));
+        REQUIRE(config->strict_local_response_table_is_valid());
+        const RouteConfig* active = config.get();
+        Shard<IoUringEventLoop> shard;
+        ScopedWatermarkTestResources resources;
+        resources.shard = &shard;
+        auto tls = create_tls_server_context(kTestCertPath, kTestKeyPath);
+        REQUIRE(tls.has_value());
+        resources.tls_server_ctx = tls.value();
+        resources.listen_fd = create_listen_socket(0).value_or(-1);
+        REQUIRE(resources.listen_fd >= 0);
+        const u16 port = get_port(resources.listen_fd);
+        auto initialized = shard.init(0, resources.listen_fd);
+        resources.shard_initialized = initialized.has_value();
+        REQUIRE(initialized.has_value());
+        shard.loop->tls_server = tls.value();
+        shard.loop->config_ptr = &active;
+        REQUIRE(shard.spawn(-1).has_value());
+        resources.client_ctx = create_test_client_ctx();
+        REQUIRE(resources.client_ctx != nullptr);
+        resources.client_fd = connect_to(port);
+        REQUIRE(resources.client_fd >= 0);
+        set_socket_timeouts(resources.client_fd, 3);
+        resources.client_ssl = SSL_new(resources.client_ctx);
+        REQUIRE(resources.client_ssl != nullptr);
+        REQUIRE_EQ(SSL_set_fd(resources.client_ssl, resources.client_fd), 1);
+        REQUIRE_EQ(SSL_connect(resources.client_ssl), 1);
+        char expected_content_length[64];
+        const int content_length_len = snprintf(expected_content_length,
+                                                sizeof(expected_content_length),
+                                                "Content-Length: %u\r\n",
+                                                body_len);
+        REQUIRE_GT(content_length_len, 0);
+        REQUIRE_LT(static_cast<u32>(content_length_len), sizeof(expected_content_length));
+
+        for (u32 request = 0; request < 3; ++request) {
+            const char* wire =
+                request == 2
+                    ? "GET /assets//static HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n"
+                : request == 1 ? "HEAD /assets//static HTTP/1.1\r\nHost: x\r\n\r\n"
+                               : "GET /assets//static HTTP/1.1\r\nHost: x\r\n\r\n";
+            REQUIRE(ssl_write_all(resources.client_ssl, wire, 12));
+            usleep(1000);
+            REQUIRE(ssl_write_all(
+                resources.client_ssl, wire + 12, static_cast<u32>(strlen(wire)) - 12));
+            const u32 expected_body = request == 1 ? 0u : body_len;
+            char received[8192]{};
+            u32 total = 0;
+            char* end = nullptr;
+            while (total < sizeof(received) - 1) {
+                const int count = SSL_read(resources.client_ssl,
+                                           received + total,
+                                           static_cast<int>(sizeof(received) - 1 - total));
+                // A worker wakeup can interrupt the blocking BIO read. Retry the
+                // identical SSL operation only for EINTR; socket timeouts still fail.
+                if (count <= 0 && errno == EINTR &&
+                    SSL_get_error(resources.client_ssl, count) == SSL_ERROR_WANT_READ)
+                    continue;
+                REQUIRE(count > 0);
+                total += static_cast<u32>(count);
+                end = strstr(received, "\r\n\r\n");
+                if (end != nullptr && total >= static_cast<u32>(end + 4 - received) + expected_body)
+                    break;
+            }
+            REQUIRE(end != nullptr);
+            CHECK_EQ(memcmp(received, "HTTP/1.1 200 OK\r\n", 17), 0);
+            CHECK(strstr(received, expected_content_length) != nullptr);
+            CHECK_EQ(total, static_cast<u32>(end + 4 - received) + expected_body);
+            CHECK_EQ(memcmp(end + 4, body, expected_body), 0);
         }
-        REQUIRE(end != nullptr);
-        CHECK_EQ(memcmp(received, "HTTP/1.1 200 OK\r\n", 17), 0);
-        CHECK(strstr(received, "Content-Length: 1024\r\n") != nullptr);
-        CHECK_EQ(total, static_cast<u32>(end + 4 - received) + expected_body);
-        CHECK_EQ(memcmp(end + 4, body, expected_body), 0);
+        char extra;
+        int closed;
+        do {
+            closed = SSL_read(resources.client_ssl, &extra, 1);
+        } while (closed < 0 && errno == EINTR &&
+                 SSL_get_error(resources.client_ssl, closed) == SSL_ERROR_WANT_READ);
+        CHECK_EQ(closed, 0);
     }
-    char extra;
-    int closed;
-    do {
-        closed = SSL_read(resources.client_ssl, &extra, 1);
-    } while (closed < 0 && errno == EINTR &&
-             SSL_get_error(resources.client_ssl, closed) == SSL_ERROR_WANT_READ);
-    CHECK_EQ(closed, 0);
 }
 
 TEST(proxy_tls_iouring, watermark_observer_guard_scopes_callbacks_and_cleanup) {

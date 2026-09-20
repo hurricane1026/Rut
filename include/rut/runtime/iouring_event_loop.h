@@ -1632,7 +1632,7 @@ public:
         return true;
     }
 
-    bool consume_response_read_deadline_send_event(Connection& c, const IoEvent& ev) {
+    bool consume_tagged_send_close_event(Connection& c, const IoEvent& ev) {
         if (ev.type != IoEventType::Send) return false;
         const bool close_cancel = (ev.non_upstream_generation & kNonUpstreamSendCancelBit) != 0;
         const u32 event_generation = ev.non_upstream_generation & kNonUpstreamSendGenerationMask;
@@ -1655,6 +1655,79 @@ public:
             if (c.fd < 0 && c.pending_ops == 0) reclaim_slot(c.id);
             return true;
         }
+        return false;
+    }
+
+    bool consume_tls_ciphertext_send_event(Connection& c, const IoEvent& ev) {
+        if (ev.type != IoEventType::Send || !c.tls_active) return false;
+        // Every io_uring TLS Send is a tagged ciphertext target. With no raw
+        // target there is no valid application-level CQE to account; while a
+        // target is live, any other token (including legacy zero) is stale.
+        if (!c.tls_out_inflight) return true;
+        if (c.tls_out_inflight_generation == 0) {
+            backend.fatal_error.store(EPROTO, std::memory_order_release);
+            running_.store(false, std::memory_order_release);
+            close_conn(c);
+            return true;
+        }
+        if (ev.non_upstream_generation != c.tls_out_inflight_generation) return true;
+
+        // F_MORE is not a terminal send completion. Close transfers the raw
+        // token and its still-live target to the common close/cancel ledger.
+        if (ev.more) {
+            close_conn(c);
+            return true;
+        }
+
+        if (c.id >= connection_capacity) {
+            backend.fatal_error.store(EPROTO, std::memory_order_release);
+            running_.store(false, std::memory_order_release);
+            close_conn(c);
+            return true;
+        }
+        const bool has_target = c.send_armed && c.pending_ops > 0;
+        const auto& send = backend.send_state[c.id];
+        const bool raw_identity = tls_ciphertext_send_raw_state_matches(c) &&
+                                  c.on_send == &tls_on_out_drain<Self> && ev.aux == 0;
+        const bool successful = raw_identity && ev.result > 0 &&
+                                static_cast<u32>(ev.result) == c.tls_out_inflight_len &&
+                                send.offset == c.tls_out_inflight_len && send.remaining == 0;
+        if (!has_target) {
+            backend.fatal_error.store(EPROTO, std::memory_order_release);
+            running_.store(false, std::memory_order_release);
+            close_conn(c);
+            return true;
+        }
+
+        // This authenticated, terminal raw CQE owns exactly one real kernel
+        // target whether it succeeded or failed. The TLS drain must never let
+        // generic dispatch decrement it a second time.
+        c.pending_ops--;
+        c.send_armed = false;
+        // These are generic terminal Send-dispatch side effects. Apply them
+        // before either the TLS continuation or fail-closed error handling.
+        if (!c.throttle_paused &&
+            c.response_read_deadline_state != ResponseReadDeadlineState::Armed &&
+            c.response_read_deadline_state != ResponseReadDeadlineState::ExpiryPending &&
+            c.response_read_deadline_state != ResponseReadDeadlineState::BatchPending &&
+            c.response_read_deadline_state != ResponseReadDeadlineState::RefreshPending)
+            timer.refresh(&c,
+                          c.state == ConnState::Proxying ? upstream_timeout : keepalive_timeout);
+        c.recv_paused_for_send = false;
+        if (!successful) {
+            backend.send_state[c.id] = {};
+            Connection::visit_tls_raw_send_owner_fields(
+                c, [](auto& value, const auto& reset_value) { value = reset_value; });
+            close_conn(c);
+            return true;
+        }
+
+        tls_on_out_drain<Self>(this, c, ev);
+        return true;
+    }
+
+    bool consume_response_read_deadline_send_event(Connection& c, const IoEvent& ev) {
+        if (ev.type != IoEventType::Send) return false;
         if (!c.response_read_deadline_send_owner_active) {
             // A nonzero token is owned by this dedicated Send namespace.  Once
             // tombstoned it remains consumable across retirement/request-2;
@@ -2459,6 +2532,75 @@ public:
         return false;
     }
 
+    bool tls_ciphertext_send_raw_state_matches(const Connection& c) const {
+        if (c.id >= connection_capacity || c.fd < 0 || !c.tls_active || !c.tls_out_inflight ||
+            c.tls_out_inflight_len == 0 || c.tls_out_inflight_generation == 0 ||
+            (c.tls_out_inflight_generation & kNonUpstreamSendCancelBit) != 0 ||
+            c.tls_out_inflight_fd != c.fd || c.tls_out_inflight_src == nullptr ||
+            c.tls_out_inflight_src != c.tls_out_buf.data() ||
+            c.tls_out_inflight_len > c.tls_out_buf.len() || !c.send_armed || c.pending_ops == 0)
+            return false;
+        const auto& send = backend.send_state[c.id];
+        return send.src == c.tls_out_inflight_src && send.fd == c.tls_out_inflight_fd &&
+               send.type == IoEventType::Send && send.generation == c.tls_out_inflight_generation &&
+               send.offset <= c.tls_out_inflight_len &&
+               send.remaining <= c.tls_out_inflight_len - send.offset;
+    }
+
+    bool tls_ciphertext_send_is_current(const Connection& c) const {
+        if (!tls_ciphertext_send_raw_state_matches(c)) return false;
+        const auto& send = backend.send_state[c.id];
+        return send.offset + send.remaining == c.tls_out_inflight_len;
+    }
+
+    // Deliver the saved continuation as a logical plaintext completion. Raw
+    // ciphertext CQE accounting has already finished and is never repeated here.
+    void complete_tls_logical_send(Connection& c,
+                                   const TlsLogicalSendCompletionWitness& witness,
+                                   Connection::Callback continuation) {
+        const bool valid =
+            c.id < connection_capacity && c.tls_active && c.fd == witness.fd &&
+            witness.generation != 0 && (witness.generation & kNonUpstreamSendCancelBit) == 0 &&
+            c.handler_gen == witness.handler_generation && witness.src != nullptr &&
+            witness.len != 0 && witness.len <= static_cast<u32>(INT32_MAX) && !c.send_armed &&
+            c.tls_raw_send_owner_is_neutral() && c.tls_single_shot_send_owner_is_neutral();
+        if (!valid) {
+            close_conn(c);
+            return;
+        }
+        if (continuation == nullptr) return;
+
+        IoEvent ev = {};
+        ev.conn_id = c.id;
+        ev.type = IoEventType::Send;
+        ev.result = static_cast<i32>(witness.len);
+        continuation(this, c, ev);
+    }
+
+    // Submit one authenticated kernel target for the current ciphertext
+    // prefix. TLS raw targets use their own identity and never inherit the
+    // response-phase plaintext owner inferred by submit_send_raw().
+    bool submit_tls_ciphertext_send(Connection& c, const u8* src, u32 len) {
+        if (backend.failure_code() != 0 || c.id >= connection_capacity || c.fd < 0 ||
+            !c.tls_active || c.tls_engine.ssl == nullptr || c.send_armed ||
+            !c.tls_raw_send_owner_is_neutral() || src == nullptr || len == 0 ||
+            src != c.tls_out_buf.data() || len > c.tls_out_buf.len() ||
+            backend.send_state[c.id].remaining != 0)
+            return false;
+        u32 generation = 0;
+        if (!c.next_non_upstream_send_generation(generation)) return false;
+        if (!backend.add_send(c.fd, c.id, src, len, generation)) return false;
+        c.tls_out_inflight = true;
+        c.tls_out_inflight_len = len;
+        c.tls_out_inflight_generation = generation;
+        c.tls_out_inflight_fd = c.fd;
+        c.tls_out_inflight_src = src;
+        c.pending_ops++;
+        c.send_armed = true;
+        c.on_send = &tls_on_out_drain<Self>;
+        return true;
+    }
+
     // Raw client send — bytes go to the wire as-is (plaintext, or already-
     // encrypted ciphertext from the TLS layer).
     bool submit_send_raw(Connection& c, const u8* buf, u32 len) {
@@ -2514,17 +2656,20 @@ public:
 
     bool submit_send_impl(Connection& c, const u8* buf, u32 len) {
         if (c.tls_active) {
-            // A previous single-shot send still mid-encryption (its plaintext
-            // didn't fit tls_out_buf in one shot) must not be overwritten or its
-            // remainder is lost. The upper layer serializes client sends via
-            // pause/resume; phase 3 decouples proxy streaming. Fail safe (caller
-            // closes) rather than corrupt.
-            if (c.tls_send_src && c.tls_send_off < c.tls_send_len) {
+            // Proxy-stream tails use the cursor fields but retain their own
+            // accounting. A single-shot send owns its continuation until the
+            // final ciphertext target drains, including after encryption ends.
+            if (c.tls_proxy_stream || buf == nullptr || len == 0 ||
+                len > static_cast<u32>(INT32_MAX) || c.fd < 0 ||
+                !c.tls_single_shot_send_owner_is_neutral() || c.tls_send_src != nullptr) {
                 close_conn(c);
                 return false;
             }
-            // Encrypt into the owned tls_out_buf; ciphertext drains via
-            // tls_on_out_drain, which fires this continuation once fully sent.
+            u32 generation = 0;
+            if (!c.next_non_upstream_send_generation(generation)) return false;
+            c.tls_send_owner_generation = generation;
+            c.tls_send_owner_fd = c.fd;
+            c.tls_send_owner_handler_generation = c.handler_gen;
             c.tls_pending_on_send = c.on_send;
             c.tls_send_src = buf;
             c.tls_send_len = len;
@@ -2532,30 +2677,12 @@ public:
             u32 consumed = 0;
             const TlsFill kFs = tls_fill_output<Self>(this, c, buf, len, consumed);
             c.tls_send_off = consumed;
-            if (kFs == TlsFill::Fatal) {
-                c.tls_pending_on_send = nullptr;
-                c.tls_send_src = nullptr;
-                c.tls_send_len = 0;
-                c.tls_send_off = 0;
-                return false;  // caller closes
+            if (!tls_send_retry_has_driver<Self>(this, c, kFs)) {
+                close_conn(c);
+                return false;
             }
-            if (kFs == TlsFill::NeedRead) {
-                c.tls_pending_on_recv = &tls_resume_pending_send_recv<Self>;
-                // SSL_write needs peer input to retry. If no recv is armed and one
-                // can't be queued (SQ pressure), nothing will ever deliver that
-                // input — fail closed rather than hang until the idle timeout
-                // (mirrors the resume/drain WANT_READ paths).
-                if (!c.recv_armed && !submit_recv(c)) {
-                    c.tls_pending_on_recv = nullptr;
-                    c.tls_pending_on_send = nullptr;
-                    c.tls_send_src = nullptr;
-                    c.tls_send_len = 0;
-                    c.tls_send_off = 0;
-                    return false;  // caller closes
-                }
-            }
-            // Done / NeedRoom: the upper-layer continuation fires from
-            // tls_on_out_drain once the whole plaintext is encrypted and sent.
+            // Initial submission cannot complete synchronously. Done and
+            // NeedRoom need a live raw target; NeedRead has an armed recv.
             return true;
         }
         return submit_send_raw(c, buf, len);
@@ -4759,7 +4886,17 @@ public:
     }
 
     void close_conn_impl(Connection& c) {
-        if (c.response_read_deadline_send_owner_active) {
+        if (c.tls_out_inflight) {
+            // TLS close custody belongs to the actual ciphertext SQE, not the
+            // logical plaintext continuation. The common ledger survives
+            // free_conn::reset until target/cancel both drain.
+            c.response_read_deadline_send_close_generation = c.tls_out_inflight_generation;
+            if (c.response_read_deadline_send_close_generation == 0 && c.id < connection_capacity)
+                c.response_read_deadline_send_close_generation =
+                    backend.send_state[c.id].generation;
+            c.response_read_deadline_send_close_target_owned = c.send_armed;
+            c.response_read_deadline_send_close_cancel_owned = false;
+        } else if (c.response_read_deadline_send_owner_active) {
             c.response_read_deadline_send_close_generation =
                 c.response_read_deadline_send_owner_generation;
             c.response_read_deadline_send_close_target_owned = c.send_armed;
@@ -4768,6 +4905,10 @@ public:
                 c.response_read_deadline_send_owner_generation;
             c.clear_response_read_deadline_send_owner();
         }
+        c.tls_pending_on_send = nullptr;
+        c.tls_pending_on_recv = nullptr;
+        Connection::visit_tls_single_shot_send_owner_fields(
+            c, [](auto& value, const auto& reset_value) { value = reset_value; });
         disarm_response_read_deadline(c);
         timer.remove(&c);
         // A close is terminal for a parked request boundary. Readiness may have
@@ -5120,6 +5261,10 @@ public:
             case IoEventType::UpstreamSend:
                 if (ev.conn_id < connection_capacity) {
                     auto& conn = conns[ev.conn_id];
+                    if (ev.type == IoEventType::Send && consume_tagged_send_close_event(conn, ev))
+                        break;
+                    if (ev.type == IoEventType::Send && consume_tls_ciphertext_send_event(conn, ev))
+                        break;
                     if (consume_strict_upstream_retirement_event(conn, ev)) break;
                     if (consume_response_read_deadline_send_event(conn, ev)) break;
                     if (consume_prebuilt_http1_header_send_event(conn, ev)) break;
