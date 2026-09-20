@@ -49078,6 +49078,327 @@ TEST(response_buffering_runtime,
     cleanup_prebuilt_d2(loop, fixture);
 }
 
+TEST(response_buffering_runtime, complete_post_commit_role_validation_is_bound_fresh_and_strict) {
+    ScopedIoUringLoopForRetirement guard;
+    if (!guard.init()) SKIP("io_uring unavailable");
+    auto* loop = guard.loop;
+    RouteConfig config{};
+    PrebuiltD2Fixture fixture{};
+    REQUIRE(stage_live_precise_get(loop, config, &fixture));
+    Connection& conn = *fixture.conn;
+    static constexpr u8 kPartial[] = "HTTP/1.1 200 OK\r\nContent-Length: 4\r\n\r\na";
+    const u32 partial_len = sizeof(kPartial) - 1u;
+    REQUIRE_EQ(conn.upstream_recv_buf.write(kPartial, partial_len), partial_len);
+    const IoEvent partial = response_read_copy_event(conn, partial_len, true, 0, partial_len);
+    loop->dispatch_batch(&partial, 1);
+    REQUIRE_EQ(conn.response_read_deadline_post_commit_phase,
+               ResponseReadDeadlinePostCommitPhase::Buffering);
+    REQUIRE(response_read_deadline_post_commit_is_stable(conn));
+
+    const u16 bundle_id = conn.response_read_deadline_bundle_id;
+    REQUIRE_NE(bundle_id, 0u);
+    auto& bundle = config.policy_bundles[bundle_id - 1u];
+    const ForwardPolicyBundle original_bundle = bundle;
+    const ForwardResponsePolicySpec original_response = config.response_policies[0];
+    const ForwardFailurePolicySpec original_failure = config.failure_policies[0];
+    const ForwardFailurePolicySpec original_timeout = config.failure_policies[1];
+
+    static constexpr char kAltFailureReason[] = "Alt gateway";
+    static constexpr char kAltFailureServer[] = "alt-failure";
+    static constexpr char kAltTimeoutReason[] = "Alt timeout";
+    static constexpr char kAltTimeoutServer[] = "alt-timeout";
+    ForwardResponsePolicySpec alt_response = original_response;
+    alt_response.hide_header_count = 1;
+    alt_response.hide_headers[0] = {"x-alt-only", 10};
+    const u16 alt_response_id = config.add_response_policy(alt_response);
+    ForwardFailurePolicySpec alt_failure = original_failure;
+    alt_failure.reason = {kAltFailureReason, sizeof(kAltFailureReason) - 1u};
+    alt_failure.server = {kAltFailureServer, sizeof(kAltFailureServer) - 1u};
+    const u16 alt_failure_id = config.add_failure_policy(alt_failure);
+    ForwardFailurePolicySpec alt_timeout = original_timeout;
+    alt_timeout.reason = {kAltTimeoutReason, sizeof(kAltTimeoutReason) - 1u};
+    alt_timeout.server = {kAltTimeoutServer, sizeof(kAltTimeoutServer) - 1u};
+    const u16 alt_timeout_id = config.add_failure_policy(alt_timeout);
+    REQUIRE_NE(alt_response_id, 0u);
+    REQUIRE_NE(alt_failure_id, 0u);
+    REQUIRE_NE(alt_timeout_id, 0u);
+    const u16 alt_bundle_id =
+        config.add_policy_bundle(alt_response_id,
+                                 alt_failure_id,
+                                 alt_timeout_id,
+                                 original_bundle.response_read_timeout_seconds,
+                                 ForwardResponseBufferingMode::CompleteContentLength);
+    REQUIRE_NE(alt_bundle_id, 0u);
+    REQUIRE(config.policy_bundle_id_is_valid(alt_bundle_id));
+
+    const auto expect_reject_and_restore = [&](auto mutate, auto restore) {
+        mutate();
+        CHECK_FALSE(response_read_deadline_post_commit_is_stable(conn));
+        restore();
+        CHECK(response_read_deadline_post_commit_is_stable(conn));
+    };
+
+    // Buffering equality is part of the binding: a Complete bundle is valid as
+    // None on its own, but cannot authorize this Complete connection.
+    bundle.response_buffering = ForwardResponseBufferingMode::None;
+    REQUIRE(config.policy_bundle_id_is_valid(bundle_id));
+    CHECK_FALSE(response_read_deadline_post_commit_is_stable(conn));
+    bundle = original_bundle;
+    CHECK(response_read_deadline_post_commit_is_stable(conn));
+    REQUIRE(config.policy_bundle_id_is_valid(bundle_id));
+    expect_reject_and_restore(
+        [&] { conn.response_read_deadline_buffering = ForwardResponseBufferingMode::None; },
+        [&] {
+            conn.response_read_deadline_buffering =
+                ForwardResponseBufferingMode::CompleteContentLength;
+        });
+
+    // A different valid ID on either side must not borrow the Complete tuple
+    // proof from another role binding.
+    expect_reject_and_restore(
+        [&] { conn.response_policy_id = alt_response_id; },
+        [&] { conn.response_policy_id = original_bundle.response_policy_id; });
+    expect_reject_and_restore([&] { conn.failure_policy_id = alt_failure_id; },
+                              [&] { conn.failure_policy_id = original_bundle.failure_policy_id; });
+    expect_reject_and_restore(
+        [&] { conn.timeout_failure_policy_id = alt_timeout_id; },
+        [&] { conn.timeout_failure_policy_id = original_bundle.timeout_failure_policy_id; });
+    bundle.response_policy_id = alt_response_id;
+    REQUIRE(config.policy_bundle_id_is_valid(bundle_id));
+    CHECK_FALSE(response_read_deadline_post_commit_is_stable(conn));
+    bundle = original_bundle;
+    CHECK(response_read_deadline_post_commit_is_stable(conn));
+    REQUIRE(config.policy_bundle_id_is_valid(bundle_id));
+    bundle.failure_policy_id = alt_failure_id;
+    REQUIRE(config.policy_bundle_id_is_valid(bundle_id));
+    CHECK_FALSE(response_read_deadline_post_commit_is_stable(conn));
+    bundle = original_bundle;
+    CHECK(response_read_deadline_post_commit_is_stable(conn));
+    REQUIRE(config.policy_bundle_id_is_valid(bundle_id));
+    bundle.timeout_failure_policy_id = alt_timeout_id;
+    REQUIRE(config.policy_bundle_id_is_valid(bundle_id));
+    CHECK_FALSE(response_read_deadline_post_commit_is_stable(conn));
+    bundle = original_bundle;
+    CHECK(response_read_deadline_post_commit_is_stable(conn));
+    REQUIRE(config.policy_bundle_id_is_valid(bundle_id));
+
+    bundle.response_read_timeout_seconds = 6;
+    REQUIRE(config.policy_bundle_id_is_valid(bundle_id));
+    CHECK_FALSE(response_read_deadline_post_commit_is_stable(conn));
+    bundle = original_bundle;
+    CHECK(response_read_deadline_post_commit_is_stable(conn));
+    REQUIRE(config.policy_bundle_id_is_valid(bundle_id));
+    for (const u8 seconds : {u8{0}, u8{64}}) {
+        bundle.response_read_timeout_seconds = seconds;
+        CHECK_FALSE(config.policy_bundle_id_is_valid(bundle_id));
+        CHECK_FALSE(response_read_deadline_post_commit_is_stable(conn));
+        bundle = original_bundle;
+        CHECK(config.policy_bundle_id_is_valid(bundle_id));
+        CHECK(response_read_deadline_post_commit_is_stable(conn));
+    }
+    expect_reject_and_restore([&] { conn.response_read_deadline_seconds = 6; },
+                              [&] {
+                                  conn.response_read_deadline_seconds =
+                                      original_bundle.response_read_timeout_seconds;
+                              });
+    for (const u8 seconds : {u8{0}, u8{64}}) {
+        const u8 saved_seconds = conn.response_read_deadline_seconds;
+        conn.response_read_deadline_seconds = seconds;
+        CHECK_FALSE(response_read_deadline_post_commit_is_stable(conn));
+        conn.response_read_deadline_seconds = saved_seconds;
+        CHECK(response_read_deadline_post_commit_is_stable(conn));
+    }
+
+    // The bundle validator must still reject absent and out-of-range IDs for
+    // each role before indexing its policy table.
+    enum class BundleRole : u8 { Response, Failure, Timeout };
+    for (const BundleRole role : {BundleRole::Response, BundleRole::Failure, BundleRole::Timeout}) {
+        for (const bool out_of_range : {false, true}) {
+            bundle = original_bundle;
+            const u16 invalid = out_of_range
+                                    ? static_cast<u16>(role == BundleRole::Response
+                                                           ? config.response_policy_count + 1u
+                                                           : config.failure_policy_count + 1u)
+                                    : 0;
+            if (role == BundleRole::Response)
+                bundle.response_policy_id = invalid;
+            else if (role == BundleRole::Failure)
+                bundle.failure_policy_id = invalid;
+            else
+                bundle.timeout_failure_policy_id = invalid;
+            CHECK_FALSE(response_read_deadline_post_commit_is_stable(conn));
+            bundle = original_bundle;
+            CHECK(response_read_deadline_post_commit_is_stable(conn));
+        }
+    }
+    for (const BundleRole role : {BundleRole::Response, BundleRole::Failure, BundleRole::Timeout}) {
+        for (const bool out_of_range : {false, true}) {
+            const u16 saved = role == BundleRole::Response  ? conn.response_policy_id
+                              : role == BundleRole::Failure ? conn.failure_policy_id
+                                                            : conn.timeout_failure_policy_id;
+            const u16 invalid = out_of_range
+                                    ? static_cast<u16>(role == BundleRole::Response
+                                                           ? config.response_policy_count + 1u
+                                                           : config.failure_policy_count + 1u)
+                                    : 0;
+            if (role == BundleRole::Response)
+                conn.response_policy_id = invalid;
+            else if (role == BundleRole::Failure)
+                conn.failure_policy_id = invalid;
+            else
+                conn.timeout_failure_policy_id = invalid;
+            CHECK_FALSE(response_read_deadline_post_commit_is_stable(conn));
+            if (role == BundleRole::Response)
+                conn.response_policy_id = saved;
+            else if (role == BundleRole::Failure)
+                conn.failure_policy_id = saved;
+            else
+                conn.timeout_failure_policy_id = saved;
+            CHECK(response_read_deadline_post_commit_is_stable(conn));
+        }
+    }
+
+    // Individually valid role shapes can still violate the Complete tuple.
+    expect_reject_and_restore(
+        [&] { config.response_policies[0].connection = ResponsePolicyConnection::KeepAlive; },
+        [&] { config.response_policies[0] = original_response; });
+    expect_reject_and_restore(
+        [&] { config.response_policies[0].head_mode = ResponsePolicyHeadMode::SuppressBody; },
+        [&] { config.response_policies[0] = original_response; });
+    expect_reject_and_restore(
+        [&] { config.failure_policies[0].head_mode = FailurePolicyHeadMode::SuppressBody; },
+        [&] { config.failure_policies[0] = original_failure; });
+    expect_reject_and_restore(
+        [&] { config.failure_policies[1].head_mode = FailurePolicyHeadMode::SuppressBody; },
+        [&] { config.failure_policies[1] = original_timeout; });
+    expect_reject_and_restore(
+        [&] {
+            config.response_policies[0].head_mode = ResponsePolicyHeadMode::SuppressBody;
+            config.failure_policies[0].head_mode = FailurePolicyHeadMode::SuppressBody;
+            config.failure_policies[1].head_mode = FailurePolicyHeadMode::SuppressBody;
+        },
+        [&] {
+            config.response_policies[0] = original_response;
+            config.failure_policies[0] = original_failure;
+            config.failure_policies[1] = original_timeout;
+        });
+
+    // Invalid policy contents are re-read on every call, and restoring them
+    // makes the same live owner stable again.
+    expect_reject_and_restore([&] { config.response_policies[0].server = {"bad\r", 4}; },
+                              [&] { config.response_policies[0] = original_response; });
+    expect_reject_and_restore(
+        [&] {
+            config.response_policies[0].hide_header_count = 2;
+            config.response_policies[0].hide_headers[0] = {"Server", 6};
+            config.response_policies[0].hide_headers[1] = {"server", 6};
+        },
+        [&] { config.response_policies[0] = original_response; });
+    expect_reject_and_restore([&] { config.failure_policies[0].status_code = 500; },
+                              [&] { config.failure_policies[0] = original_failure; });
+    expect_reject_and_restore([&] { config.failure_policies[1].status_code = 600; },
+                              [&] { config.failure_policies[1] = original_timeout; });
+    expect_reject_and_restore([&] { config.failure_policies[0].reason = {"bad\r", 4}; },
+                              [&] { config.failure_policies[0] = original_failure; });
+    expect_reject_and_restore([&] { config.failure_policies[1].reason = {"bad\r", 4}; },
+                              [&] { config.failure_policies[1] = original_timeout; });
+    expect_reject_and_restore([&] { config.failure_policies[0].body = {nullptr, 1}; },
+                              [&] { config.failure_policies[0] = original_failure; });
+
+    cleanup_prebuilt_d2(loop, fixture);
+}
+
+TEST(response_buffering_runtime,
+     complete_combined_post_commit_still_checks_frame_and_none_post_commit_keeps_strict_roles) {
+    {
+        ScopedIoUringLoopForRetirement guard;
+        if (!guard.init()) SKIP("io_uring unavailable");
+        auto* loop = guard.loop;
+        RouteConfig config{};
+        PrebuiltD2Fixture fixture{};
+        REQUIRE(stage_live_precise_get(loop, config, &fixture));
+        Connection& conn = *fixture.conn;
+        static constexpr u8 kResponse[] = "HTTP/1.1 200 OK\r\nContent-Length: 4\r\n\r\nabcd";
+        const u32 response_len = sizeof(kResponse) - 1u;
+        REQUIRE_EQ(conn.upstream_recv_buf.write(kResponse, response_len), response_len);
+        const IoEvent response =
+            response_read_copy_event(conn, response_len, true, 0, response_len);
+        loop->dispatch_batch(&response, 1);
+        REQUIRE_EQ(conn.response_read_deadline_post_commit_phase,
+                   ResponseReadDeadlinePostCommitPhase::CombinedSend);
+        REQUIRE_EQ(conn.response_read_deadline_send_kind, ResponseReadDeadlineSendKind::Combined);
+        REQUIRE(response_read_deadline_post_commit_is_stable(conn));
+        const u32 header_len = conn.response_header_buf.len();
+        const u8 saved_body = conn.response_header_slice[header_len];
+        conn.response_header_slice[header_len] ^= 1u;
+        CHECK_FALSE(response_read_deadline_post_commit_is_stable(conn));
+        conn.response_header_slice[header_len] = saved_body;
+        CHECK(response_read_deadline_post_commit_is_stable(conn));
+        cleanup_prebuilt_d2(loop, fixture);
+    }
+
+    {
+        ScopedIoUringLoopForRetirement guard;
+        if (!guard.init()) SKIP("io_uring unavailable");
+        auto* loop = guard.loop;
+        RouteConfig config{};
+        REQUIRE(config.add_upstream("backend", 0x7F000001, 9000).has_value());
+        REQUIRE(add_bodyless_non_head_response_read_deadline_bundle(
+            config, 5, ForwardResponseBufferingMode::None));
+        PrebuiltD2Fixture fixture{};
+        REQUIRE(stage_strict_read_timeout_method(
+            loop, &config, nullptr, 0, &fixture, LogHttpMethod::Get));
+        REQUIRE(arm_staged_response_read_deadline(loop, fixture));
+        Connection& conn = *fixture.conn;
+        static constexpr u8 kResponse[] = "HTTP/1.1 200 OK\r\nContent-Length: 4\r\n\r\nabcd";
+        const u32 response_len = sizeof(kResponse) - 1u;
+        REQUIRE_EQ(conn.upstream_recv_buf.write(kResponse, response_len), response_len);
+        const IoEvent response =
+            response_read_copy_event(conn, response_len, true, 0, response_len);
+        loop->dispatch_batch(&response, 1);
+        REQUIRE_EQ(conn.response_read_deadline_post_commit_phase,
+                   ResponseReadDeadlinePostCommitPhase::HeaderSend);
+        REQUIRE(response_read_deadline_post_commit_is_stable(conn));
+        IoEvent header = exact_response_deadline_send_event(loop, conn);
+        loop->dispatch_batch(&header, 1);
+        REQUIRE_EQ(conn.response_read_deadline_post_commit_phase,
+                   ResponseReadDeadlinePostCommitPhase::BodySend);
+        REQUIRE(response_read_deadline_post_commit_is_stable(conn));
+
+        const u16 bundle_id = conn.response_read_deadline_bundle_id;
+        auto& bundle = config.policy_bundles[bundle_id - 1u];
+        const ForwardPolicyBundle original_bundle = bundle;
+        const u16 original_response_id = conn.response_policy_id;
+        const u16 original_failure_id = conn.failure_policy_id;
+        const u16 original_timeout_id = conn.timeout_failure_policy_id;
+        for (u8 missing : {u8{0}, u8{1}, u8{2}}) {
+            bundle = original_bundle;
+            if (missing == 0) {
+                bundle.timeout_failure_policy_id = 0;
+                conn.timeout_failure_policy_id = 0;
+            } else if (missing == 1) {
+                bundle.response_policy_id = 0;
+                bundle.timeout_failure_policy_id = 0;
+                conn.response_policy_id = 0;
+                conn.timeout_failure_policy_id = 0;
+            } else {
+                bundle.failure_policy_id = 0;
+                bundle.timeout_failure_policy_id = 0;
+                conn.failure_policy_id = 0;
+                conn.timeout_failure_policy_id = 0;
+            }
+            REQUIRE(config.policy_bundle_id_is_valid(bundle_id));
+            CHECK_FALSE(response_read_deadline_post_commit_is_stable(conn));
+            bundle = original_bundle;
+            conn.response_policy_id = original_response_id;
+            conn.failure_policy_id = original_failure_id;
+            conn.timeout_failure_policy_id = original_timeout_id;
+            CHECK(response_read_deadline_post_commit_is_stable(conn));
+        }
+        cleanup_prebuilt_d2(loop, fixture);
+    }
+}
+
 TEST(response_buffering_runtime,
      coherent_single_range_206_complete_and_fragmented_body_release_once) {
     for (const bool fragmented_body : {false, true}) {
