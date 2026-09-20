@@ -1843,17 +1843,26 @@ public:
             !forward_response_buffering_mode_valid(b.response_buffering) ||
             (b.response_read_timeout_seconds == 0 && b.failure_policy_id == 0))
             return false;
-        if (b.response_buffering != ForwardResponseBufferingMode::None &&
-            (b.response_buffering != ForwardResponseBufferingMode::CompleteContentLength ||
-             !response_read_timeout_seconds_valid(b.response_read_timeout_seconds) ||
-             b.response_policy_id == 0 || b.failure_policy_id == 0 ||
-             b.timeout_failure_policy_id == 0 ||
-             !timeout_failure_policy_id_is_valid(b.timeout_failure_policy_id) ||
-             !complete_content_length_buffering_policies_valid(
-                 response_policies[b.response_policy_id - 1],
-                 failure_policies[b.failure_policy_id - 1],
-                 failure_policies[b.timeout_failure_policy_id - 1])))
-            return false;
+        if (b.response_buffering != ForwardResponseBufferingMode::None) {
+            if (b.response_buffering != ForwardResponseBufferingMode::CompleteContentLength ||
+                !response_read_timeout_seconds_valid(b.response_read_timeout_seconds) ||
+                b.response_policy_id == 0 || b.failure_policy_id == 0 ||
+                b.timeout_failure_policy_id == 0 ||
+                !timeout_failure_policy_id_is_valid(b.timeout_failure_policy_id))
+                return false;
+            const auto& response = response_policies[b.response_policy_id - 1];
+            const auto& failure = failure_policies[b.failure_policy_id - 1];
+            const auto& timeout = failure_policies[b.timeout_failure_policy_id - 1];
+            // The entry checks above already validated all three complete policy shapes.
+            // The buffering role only needs these tuple fields; all Reject modes also satisfy
+            // the suppress-body equality check in the legacy None path below.
+            return response.version == ResponsePolicyVersion::Http11 &&
+                   response.framing == ResponsePolicyFraming::ContentLength &&
+                   response.connection == ResponsePolicyConnection::Request &&
+                   response.head_mode == ResponsePolicyHeadMode::Reject &&
+                   failure.head_mode == FailurePolicyHeadMode::Reject &&
+                   timeout.head_mode == FailurePolicyHeadMode::Reject;
+        }
         if (b.timeout_failure_policy_id == 0) return true;
         if (b.response_policy_id == 0 || b.failure_policy_id == 0 ||
             !timeout_failure_policy_id_is_valid(b.timeout_failure_policy_id))

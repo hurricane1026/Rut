@@ -1710,6 +1710,200 @@ TEST(response_policy, response_read_timeout_bundle_config_shapes_are_exact_and_f
     CHECK_EQ(legacy.policy_bundles[0].response_read_timeout_seconds, 0u);
 }
 
+namespace {
+bool add_response_policy_test_roles(
+    RouteConfig& config,
+    u16& response_id,
+    u16& failure_id,
+    u16& timeout_id,
+    ResponsePolicyHeadMode response_head = ResponsePolicyHeadMode::Reject,
+    FailurePolicyHeadMode failure_head = FailurePolicyHeadMode::Reject,
+    FailurePolicyHeadMode timeout_head = FailurePolicyHeadMode::Reject) {
+    ForwardResponsePolicySpec response{};
+    response.version = ResponsePolicyVersion::Http11;
+    response.framing = ResponsePolicyFraming::ContentLength;
+    response.connection = ResponsePolicyConnection::Request;
+    response.date = ResponsePolicyDate::Current;
+    response.head_mode = response_head;
+    response.server = {"rut", 3};
+
+    ForwardFailurePolicySpec failure{};
+    failure.version = ForwardFailurePolicyVersion::Http11;
+    failure.status_code = 502;
+    failure.date = ForwardFailurePolicyDate::Current;
+    failure.connection = ForwardFailurePolicyConnection::Request;
+    failure.head_mode = failure_head;
+    failure.reason = {"Bad Gateway", 11};
+    failure.content_type = {"text/plain", 10};
+    failure.server = {"rut", 3};
+    failure.body = {"bad", 3};
+    ForwardFailurePolicySpec timeout = failure;
+    timeout.status_code = 504;
+    timeout.head_mode = timeout_head;
+    timeout.reason = {"Gateway Time-out", 16};
+    timeout.body = {"slow", 4};
+
+    response_id = config.add_response_policy(response);
+    failure_id = config.add_failure_policy(failure);
+    timeout_id = config.add_failure_policy(timeout);
+    return response_id != 0 && failure_id != 0 && timeout_id != 0;
+}
+}  // namespace
+
+TEST(response_policy, complete_buffering_bundle_revalidates_roles_and_tuple_fields) {
+    RouteConfig config{};
+    u16 response_id = 0;
+    u16 failure_id = 0;
+    u16 timeout_id = 0;
+    REQUIRE(add_response_policy_test_roles(config, response_id, failure_id, timeout_id));
+    REQUIRE_EQ(config.add_policy_bundle(response_id,
+                                        failure_id,
+                                        timeout_id,
+                                        3,
+                                        ForwardResponseBufferingMode::CompleteContentLength),
+               1u);
+    const u16 bundle_id = 1;
+    CHECK(config.policy_bundle_id_is_valid(bundle_id));
+
+    const auto valid_bundle = config.policy_bundles[0];
+    const auto valid_response = config.response_policies[0];
+    const auto valid_failure = config.failure_policies[0];
+    const auto valid_timeout = config.failure_policies[1];
+    auto rejects = [&](auto&& mutate) {
+        config.policy_bundles[0] = valid_bundle;
+        config.response_policies[0] = valid_response;
+        config.failure_policies[0] = valid_failure;
+        config.failure_policies[1] = valid_timeout;
+        mutate();
+        CHECK_FALSE(config.policy_bundle_id_is_valid(bundle_id));
+    };
+
+    rejects([&] { config.policy_bundles[0].response_policy_id = 0; });
+    rejects([&] { config.policy_bundles[0].response_policy_id = 2; });
+    rejects([&] { config.policy_bundles[0].failure_policy_id = 0; });
+    rejects([&] { config.policy_bundles[0].failure_policy_id = 3; });
+    rejects([&] { config.policy_bundles[0].timeout_failure_policy_id = 0; });
+    rejects([&] { config.policy_bundles[0].timeout_failure_policy_id = 3; });
+    rejects([&] { config.policy_bundles[0].response_read_timeout_seconds = 0; });
+    rejects([&] { config.policy_bundles[0].response_read_timeout_seconds = 64; });
+    rejects([&] {
+        config.policy_bundles[0].response_buffering = static_cast<ForwardResponseBufferingMode>(2);
+    });
+
+    rejects([&] { config.response_policies[0].server = {"", 0}; });
+    rejects([&] { config.response_policies[0].server = {"ru\r", 3}; });
+    rejects(
+        [&] { config.response_policies[0].hide_header_count = kMaxResponsePolicyHideHeaders + 1; });
+    rejects([&] {
+        config.response_policies[0].hide_header_count = 1;
+        config.response_policies[0].hide_headers[0] = {"Bad Header", 10};
+    });
+    rejects([&] {
+        config.response_policies[0].hide_header_count = 2;
+        config.response_policies[0].hide_headers[0] = {"X-Test", 6};
+        config.response_policies[0].hide_headers[1] = {"x-test", 6};
+    });
+    rejects([&] { config.failure_policies[0].status_code = 503; });
+    rejects([&] { config.failure_policies[1].status_code = 399; });
+    rejects([&] { config.failure_policies[1].status_code = 600; });
+    rejects([&] { config.failure_policies[0].reason = {"bad\r", 4}; });
+    rejects([&] { config.failure_policies[0].server = {"ru\r", 3}; });
+    rejects([&] { config.failure_policies[0].body = {nullptr, 1}; });
+    rejects([&] { config.failure_policies[1].reason = {"bad\r", 4}; });
+    rejects([&] { config.failure_policies[1].server = {"ru\r", 3}; });
+    rejects([&] { config.failure_policies[1].body = {nullptr, 1}; });
+
+    // KeepAlive is valid as a standalone response policy but is not the
+    // request-connection tuple required by CompleteContentLength buffering.
+    rejects([&] { config.response_policies[0].connection = ResponsePolicyConnection::KeepAlive; });
+    rejects([&] { config.response_policies[0].head_mode = ResponsePolicyHeadMode::SuppressBody; });
+    rejects([&] { config.failure_policies[0].head_mode = FailurePolicyHeadMode::SuppressBody; });
+    rejects([&] { config.failure_policies[1].head_mode = FailurePolicyHeadMode::SuppressBody; });
+    rejects([&] {
+        config.response_policies[0].head_mode = ResponsePolicyHeadMode::SuppressBody;
+        config.failure_policies[0].head_mode = FailurePolicyHeadMode::SuppressBody;
+        config.failure_policies[1].head_mode = FailurePolicyHeadMode::SuppressBody;
+    });
+
+    // The same policy can be checked again after a failed validation; there is
+    // no cached success bit on RouteConfig.
+    config.policy_bundles[0] = valid_bundle;
+    config.response_policies[0] = valid_response;
+    config.failure_policies[0] = valid_failure;
+    config.failure_policies[1] = valid_timeout;
+    CHECK(config.policy_bundle_id_is_valid(bundle_id));
+    config.failure_policies[1].status_code = 600;
+    CHECK_FALSE(config.policy_bundle_id_is_valid(bundle_id));
+    config.failure_policies[1] = valid_timeout;
+    CHECK(config.policy_bundle_id_is_valid(bundle_id));
+
+    RouteConfig shared_timeout{};
+    u16 shared_response_id = 0;
+    u16 shared_failure_id = 0;
+    u16 unused_timeout_id = 0;
+    REQUIRE(add_response_policy_test_roles(
+        shared_timeout, shared_response_id, shared_failure_id, unused_timeout_id));
+    REQUIRE_EQ(
+        shared_timeout.add_policy_bundle(shared_response_id,
+                                         shared_failure_id,
+                                         shared_failure_id,
+                                         3,
+                                         ForwardResponseBufferingMode::CompleteContentLength),
+        1u);
+    CHECK(shared_timeout.policy_bundle_id_is_valid(1));
+}
+
+TEST(response_policy, none_buffering_bundle_keeps_timeout_and_head_compatibility) {
+    RouteConfig config{};
+    u16 response_id = 0;
+    u16 failure_id = 0;
+    u16 timeout_id = 0;
+    REQUIRE(add_response_policy_test_roles(config, response_id, failure_id, timeout_id));
+    const auto response_suppress = [&] {
+        auto policy = config.response_policies[response_id - 1];
+        policy.head_mode = ResponsePolicyHeadMode::SuppressBody;
+        return config.add_response_policy(policy);
+    }();
+    const auto failure_suppress = [&] {
+        auto policy = config.failure_policies[failure_id - 1];
+        policy.head_mode = FailurePolicyHeadMode::SuppressBody;
+        return config.add_failure_policy(policy);
+    }();
+    const auto timeout_suppress = [&] {
+        auto policy = config.failure_policies[timeout_id - 1];
+        policy.head_mode = FailurePolicyHeadMode::SuppressBody;
+        return config.add_failure_policy(policy);
+    }();
+    REQUIRE(response_suppress != 0);
+    REQUIRE(failure_suppress != 0);
+    REQUIRE(timeout_suppress != 0);
+
+    const auto add_none = [&](u16 response, u16 failure, u16 timeout, u8 seconds) {
+        return config.add_policy_bundle(
+            response, failure, timeout, seconds, ForwardResponseBufferingMode::None);
+    };
+    REQUIRE_EQ(add_none(0, 0, 0, 3), 1u);                              // timer-only
+    REQUIRE_EQ(add_none(0, failure_id, 0, 0), 2u);                     // failure-only
+    REQUIRE_EQ(add_none(response_id, failure_id, 0, 3), 3u);           // no timeout policy
+    REQUIRE_EQ(add_none(response_id, failure_id, timeout_id, 3), 4u);  // all Reject
+    REQUIRE_EQ(add_none(response_suppress, failure_suppress, timeout_suppress, 3), 5u);
+    CHECK(config.policy_bundle_id_is_valid(1));
+    CHECK(config.policy_bundle_id_is_valid(2));
+    CHECK(config.policy_bundle_id_is_valid(3));
+    CHECK(config.policy_bundle_id_is_valid(4));
+    CHECK(config.policy_bundle_id_is_valid(5));
+
+    // Mutating a previously valid None bundle still enforces the legacy
+    // three-role suppress-body equality rule.
+    config.policy_bundles[3].timeout_failure_policy_id = timeout_suppress;
+    CHECK_FALSE(config.policy_bundle_id_is_valid(4));
+    config.policy_bundles[3].response_policy_id = response_suppress;
+    config.policy_bundles[3].failure_policy_id = failure_suppress;
+    CHECK(config.policy_bundle_id_is_valid(4));
+    config.policy_bundles[3].failure_policy_id = failure_id;
+    CHECK_FALSE(config.policy_bundle_id_is_valid(4));
+}
+
 TEST(response_read_timeout, h1_rejects_before_every_forward_effect_and_preserves_absence) {
     RouteConfig config{};
     REQUIRE(config.add_upstream("backend", 0x7F000001, 9000).has_value());
