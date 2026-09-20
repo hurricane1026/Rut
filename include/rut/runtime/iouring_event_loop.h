@@ -536,6 +536,18 @@ public:
                c.upstream_close_pause_cancel_owned;
     }
 
+    void maybe_publish_http1_boundary_ready(Connection& c) {
+        if (c.id >= connection_capacity || conns.data() == nullptr || &conns[c.id] != &c ||
+            c.fd < 0 || !c.http1_boundary_deferred || c.http1_boundary_ready ||
+            (c.http1_prebuilt_disposition != Http1RequestBufferDisposition::None &&
+             c.http1_prebuilt_wait != 0) ||
+            strict_upstream_retirement_blocks_reclaim(c) ||
+            !c.response_read_timer_owner_is_neutral())
+            return;
+        c.http1_boundary_ready = true;
+        http1_boundary_ready_pending = true;
+    }
+
     static constexpr u8 upstream_op_for_event(IoEventType type) {
         if (type == IoEventType::UpstreamConnect) return kUpstreamOpConnect;
         if (type == IoEventType::UpstreamRecv) return kUpstreamOpRecv;
@@ -558,7 +570,9 @@ public:
 
     // Park only the post-response request-boundary tail. Every request-1 side
     // effect (metrics/log/epoch/upstream release) has already completed before
-    // this hook is called from on_proxy_response_sent.
+    // this hook is called from on_proxy_response_sent. Origin retirement and
+    // the precise response timer are independent owners; neither may be reused
+    // as request-2 readiness until both have settled.
     [[nodiscard]] bool defer_http1_request_boundary(Connection& c) {
         // Exhausting the episode space quarantines the slot even when C1 had
         // no recv owner to drain. Never admit request 2 under an invalid token.
@@ -566,7 +580,9 @@ public:
             close_conn(c);
             return true;
         }
-        if (!strict_upstream_retirement_blocks_reclaim(c)) return false;
+        if (!strict_upstream_retirement_blocks_reclaim(c) &&
+            c.response_read_timer_owner_is_neutral())
+            return false;
         if (c.http1_boundary_deferred || c.http1_boundary_ready) {
             // A duplicate rendezvous cannot be resumed safely. Keep it parked;
             // the normal close path will clear it.
@@ -1167,8 +1183,7 @@ private:
         if (c.http1_prebuilt_disposition == Http1RequestBufferDisposition::None ||
             c.http1_prebuilt_wait != 0 || !c.http1_boundary_deferred || c.http1_boundary_ready)
             return;
-        c.http1_boundary_ready = true;
-        http1_boundary_ready_pending = true;
+        maybe_publish_http1_boundary_ready(c);
     }
 
     bool normalize_prebuilt_http1_request_buffer(Connection& c) {
@@ -1918,8 +1933,7 @@ public:
                     c.http1_prebuilt_wait &= static_cast<u8>(~kHttp1WaitUpstreamRetirement);
                     publish_prebuilt_http1_ready(c);
                 } else if (c.http1_boundary_deferred && !c.http1_boundary_ready) {
-                    c.http1_boundary_ready = true;
-                    http1_boundary_ready_pending = true;
+                    maybe_publish_http1_boundary_ready(c);
                 }
                 if (c.fd < 0 && c.pending_ops == 0) reclaim_slot(c.id);
             }
@@ -1982,6 +1996,9 @@ public:
 
             c.http1_boundary_ready = false;
             if (!c.http1_boundary_deferred) continue;
+            if (strict_upstream_retirement_blocks_reclaim(c) ||
+                !c.response_read_timer_owner_is_neutral())
+                continue;
             const u32 expected_episode = c.http1_boundary_successor_episode;
 
             if (c.http1_prebuilt_disposition != Http1RequestBufferDisposition::None) {
@@ -4048,6 +4065,7 @@ public:
                 saw_timer_target = true;
             }
             if (!saw_timer_target) return false;
+            if (c.response_read_timer_owner_is_neutral()) maybe_publish_http1_boundary_ready(c);
         }
 
         const u32 header = c.response_read_deadline_post_commit_raw_header_end;
@@ -4193,6 +4211,7 @@ public:
                     if (owner.precise_timer_semantic && c.fd >= 0) close_conn(c);
                     continue;
                 }
+                if (c.response_read_timer_owner_is_neutral()) maybe_publish_http1_boundary_ready(c);
                 // The logical deadline was already disarmed before this
                 // custody-only CQE was harvested. No timer result can affect
                 // the successor/504 state; only the owner barrier is drained.
@@ -5550,8 +5569,10 @@ public:
                     // consume-only behavior.
                     if (response_read_batch_event_count == 0) {
                         if (c.consume_response_read_timer_completion(ev.non_upstream_generation) &&
-                            c.response_read_timer_owner_is_neutral())
+                            c.response_read_timer_owner_is_neutral()) {
+                            maybe_publish_http1_boundary_ready(c);
                             reclaim_pending();
+                        }
                     }
                 }
                 break;
