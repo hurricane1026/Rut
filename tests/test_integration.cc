@@ -34,8 +34,12 @@
 #include <string>
 #include <vector>
 
+#include <errno.h>
+#include <openssl/err.h>
 #include <openssl/ssl.h>
+#include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 
 namespace rut {
 
@@ -7103,7 +7107,32 @@ static void run_tls_iouring_exact_local_response_body(u32 body_size, rut::test::
     resources.client_ssl = SSL_new(resources.client_ctx);
     REQUIRE(resources.client_ssl != nullptr);
     REQUIRE_EQ(SSL_set_fd(resources.client_ssl, resources.client_fd), 1);
-    REQUIRE_EQ(SSL_connect(resources.client_ssl), 1);
+    ERR_clear_error();
+    errno = 0;
+    const int ssl_connect_result = SSL_connect(resources.client_ssl);
+    const int ssl_connect_errno = errno;
+    const int ssl_connect_error = ssl_connect_result == 1
+                                      ? SSL_ERROR_NONE
+                                      : SSL_get_error(resources.client_ssl, ssl_connect_result);
+    if (ssl_connect_result != 1) {
+        const uint32_t queued_error = ERR_peek_error();
+        char error_text[256] = "none";
+        if (queued_error != 0) ERR_error_string_n(queued_error, error_text, sizeof(error_text));
+        const char* const ssl_state = SSL_state_string_long(resources.client_ssl);
+        fprintf(stderr,
+                "[tls-local-response] handshake failed body=%u port=%u result=%d ssl_error=%d "
+                "errno=%d (%s) state=%s error_queue=%u (%s)\n",
+                body_size,
+                port,
+                ssl_connect_result,
+                ssl_connect_error,
+                ssl_connect_errno,
+                strerror(ssl_connect_errno),
+                ssl_state != nullptr ? ssl_state : "<unknown>",
+                queued_error,
+                error_text);
+    }
+    REQUIRE_EQ(ssl_connect_result, 1);
     const std::string content_length = "Content-Length: " + std::to_string(body_size) + "\r\n";
     for (u32 request = 0; request < 4; ++request) {
         const char* wire =
