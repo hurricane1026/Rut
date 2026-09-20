@@ -1322,6 +1322,15 @@ inline bool http1_pipeline_successor_upstream_owners_are_neutral(const Connectio
            !c.h2_proxy_synth_quarantined;
 }
 
+// TLS capability for the deliberately narrow HTTP/1 deadline profile.  This
+// says nothing about queued I/O; the request/deadline owner can remain valid
+// while raw TLS receive or send work is outstanding independently.
+inline bool response_read_deadline_tls_http11_engine_is_stable(const Connection& c) {
+    return c.tls_active && c.uses_iouring_tls() && c.tls_engine.handshake_done &&
+           c.tls_handshake_complete && !c.tls_proxy_stream && c.protocol == ConnProtocol::Http11 &&
+           c.h2 == nullptr;
+}
+
 inline bool http1_pipeline_successor_semantic_shape_is_stable(
     const Connection& c,
     const ResponseReadDeadlineUploadProof& proof,
@@ -1649,6 +1658,16 @@ inline bool http1_pipeline_request_generation_prebuilt_is_stable(
            target.max_inflight == 0;
 }
 
+// A response can be staged through SSL_write only when no older TLS output or
+// logical send owns the output buffer.  Receive ownership is independent and
+// is deliberately not required to be absent here.
+inline bool response_read_deadline_tls_output_is_settled(const Connection& c) {
+    return response_read_deadline_tls_http11_engine_is_stable(c) &&
+           c.tls_raw_send_owner_is_neutral() && c.tls_single_shot_send_owner_is_neutral() &&
+           !c.tls_out_inflight && c.tls_out_buf.len() == 0 && !c.send_armed &&
+           c.tls_pending_on_send == nullptr && c.tls_pending_on_recv == nullptr;
+}
+
 inline bool response_read_deadline_owner_is_stable(const Connection& c,
                                                    Connection::Callback expected_upstream_recv,
                                                    ResponseReadDeadlineOwnerPhase phase) {
@@ -1719,9 +1738,22 @@ inline bool response_read_deadline_owner_is_stable(const Connection& c,
             c.response_read_deadline_buffering,
             c.response_read_deadline_method,
             c.response_read_deadline_route_method);
+    // This owner is used by the precise bodyless-GET path before response
+    // commit.  Other TLS profiles and TLS post-commit phases remain outside
+    // this bounded transport bridge.
+    const bool tls_bodyless_get_owner =
+        c.tls_active &&
+        c.response_read_deadline_profile ==
+            ResponseReadDeadlineProfile::BodylessNonHeadContentLengthZero &&
+        c.response_read_deadline_buffering == ForwardResponseBufferingMode::CompleteContentLength &&
+        c.response_read_deadline_method == static_cast<u8>(LogHttpMethod::Get) &&
+        c.pipeline_depth == 0 && c.http1_pipeline_request_generation == 0 &&
+        c.pipeline_stash_len == 0 &&
+        c.response_read_deadline_post_commit_phase == ResponseReadDeadlinePostCommitPhase::None &&
+        response_read_deadline_tls_http11_engine_is_stable(c);
     const bool common_request =
-        c.protocol == ConnProtocol::Http11 && !c.tls_active && c.h2 == nullptr &&
-        c.req_http_version == static_cast<u8>(HttpVersion::Http11) &&
+        c.protocol == ConnProtocol::Http11 && (!c.tls_active || tls_bodyless_get_owner) &&
+        c.h2 == nullptr && c.req_http_version == static_cast<u8>(HttpVersion::Http11) &&
         response_read_deadline_persistence_owner_is_stable(c, c.response_read_deadline_upload) &&
         !c.req_client_has_transfer_encoding && !c.req_client_has_te && !c.req_client_has_expect &&
         !c.req_client_has_upgrade_header && !c.req_malformed && !c.req_wants_upgrade &&
