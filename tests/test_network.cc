@@ -6051,7 +6051,7 @@ struct ScopedTlsRawSendLoop {
     u32 cq_mask = 7;
     io_uring_cqe cq_entries[8]{};
 
-    bool init() {
+    bool init(u32 capacity = 1) {
         storage = mmap(nullptr,
                        sizeof(IoUringEventLoop),
                        PROT_READ | PROT_WRITE,
@@ -6060,7 +6060,7 @@ struct ScopedTlsRawSendLoop {
                        0);
         if (storage == MAP_FAILED) return false;
         loop = new (storage) IoUringEventLoop();
-        initialized = loop->init_slot_storage(1).has_value();
+        initialized = loop->init_slot_storage(capacity).has_value();
         if (initialized) {
             loop->timer.init();
             auto& backend = loop->backend;
@@ -6103,6 +6103,63 @@ struct ScopedTlsRawSendLoop {
         if (storage != MAP_FAILED) munmap(storage, sizeof(IoUringEventLoop));
     }
 };
+
+struct TlsMemoryClientPeer {
+    SSL_CTX* ctx = nullptr;
+    SSL* ssl = nullptr;
+
+    ~TlsMemoryClientPeer() {
+        if (ssl) SSL_free(ssl);
+        if (ctx) SSL_CTX_free(ctx);
+    }
+
+    bool init() {
+        ctx = SSL_CTX_new(TLS_client_method());
+        if (!ctx) return false;
+        SSL_CTX_set_verify(ctx, SSL_VERIFY_NONE, nullptr);
+        ssl = SSL_new(ctx);
+        if (!ssl) return false;
+        BIO* rbio = BIO_new(BIO_s_mem());
+        BIO* wbio = BIO_new(BIO_s_mem());
+        if (!rbio || !wbio) {
+            if (rbio) BIO_free(rbio);
+            if (wbio) BIO_free(wbio);
+            return false;
+        }
+        SSL_set_bio(ssl, rbio, wbio);
+        SSL_set_connect_state(ssl);
+        return true;
+    }
+};
+
+bool tls_engine_handshake_with_memory_client(TlsEngine& engine, SSL* client) {
+    u8 client_to_server[16384];
+    u8 server_to_client[16384];
+    bool client_done = false;
+    for (u32 attempt = 0; attempt < 64 && !(client_done && engine.handshake_done); attempt++) {
+        if (!client_done) {
+            const int rc = SSL_do_handshake(client);
+            if (rc == 1) {
+                client_done = true;
+            } else {
+                const int error = SSL_get_error(client, rc);
+                if (error != SSL_ERROR_WANT_READ && error != SSL_ERROR_WANT_WRITE) return false;
+            }
+        }
+
+        int client_len = BIO_read(SSL_get_wbio(client), client_to_server, sizeof(client_to_server));
+        if (client_len < 0) client_len = 0;
+        tls_engine_set_input(engine, client_to_server, static_cast<u32>(client_len));
+        tls_engine_set_output(engine, server_to_client, sizeof(server_to_client));
+        if (tls_engine_handshake(engine) == TlsOp::Error) return false;
+        const u32 server_len = tls_engine_output_len(engine);
+        if (server_len > 0 &&
+            BIO_write(SSL_get_rbio(client), server_to_client, static_cast<int>(server_len)) !=
+                static_cast<int>(server_len))
+            return false;
+    }
+    return client_done && engine.handshake_done;
+}
 
 struct ScopedTlsOutMmap {
     u8* data = nullptr;
@@ -6362,6 +6419,61 @@ TEST(tls_iouring, failed_raw_submit_is_atomic_and_encrypted_live_owner_blocks_re
     CHECK_EQ(loop.free_top, 1u);
 }
 
+TEST(tls_iouring, ws_send_sq_full_closes_the_connection_once_after_encryption) {
+    auto context_result = create_tls_server_context(RUT_TESTDATA_DIR "/localhost_cert.pem",
+                                                    RUT_TESTDATA_DIR "/localhost_key.pem");
+    REQUIRE(context_result.has_value());
+    std::unique_ptr<TlsServerContext, decltype(&destroy_tls_server_context)> context(
+        context_result.value(), destroy_tls_server_context);
+
+    ScopedTlsRawSendLoop guard;
+    REQUIRE(guard.init(/*capacity=*/2));
+    IoUringEventLoop& loop = *guard.loop;
+    Connection& conn = loop.conns[0];
+    conn.fd = dup(STDERR_FILENO);
+    REQUIRE_GE(conn.fd, 0);
+    struct CloseUnclaimedConnection {
+        IoUringEventLoop& loop;
+        Connection& conn;
+        ~CloseUnclaimedConnection() {
+            if (conn.fd >= 0) loop.close_conn(conn);
+        }
+    } close_unclaimed{loop, conn};
+
+    loop.tls_server = context.get();
+    REQUIRE(loop.tls_setup(conn));
+    TlsMemoryClientPeer client;
+    REQUIRE(client.init());
+    REQUIRE(tls_engine_handshake_with_memory_client(conn.tls_engine, client.ssl));
+    conn.tls_handshake_complete = true;
+    conn.is_ws_tunnel = true;
+
+    static constexpr u8 kUpstreamBytes[] = "websocket-data";
+    u8 upstream_storage[64];
+    conn.upstream_recv_buf.bind(upstream_storage, sizeof(upstream_storage));
+    REQUIRE_EQ(conn.upstream_recv_buf.write(kUpstreamBytes, sizeof(kUpstreamBytes) - 1),
+               sizeof(kUpstreamBytes) - 1);
+
+    // The completed TLS session makes the real WebSocket callback encrypt
+    // application bytes; a full one-entry SQ then rejects the ciphertext send.
+    guard.sq_head = 0;
+    guard.sq_tail = 1;
+    guard.sq_mask = 0;
+    loop.backend.sq_ring_entries = 1;
+    loop.free_top = 0;
+    IoEvent recv = {};
+    recv.conn_id = conn.id;
+    recv.type = IoEventType::UpstreamRecv;
+    recv.result = static_cast<i32>(sizeof(kUpstreamBytes) - 1);
+    on_ws_upstream_recv<IoUringEventLoop>(&loop, conn, recv);
+
+    CHECK_EQ(conn.fd, -1);
+    CHECK_EQ(conn.pending_ops, 0u);
+    CHECK_EQ(loop.free_top, 1u);
+    CHECK_EQ(loop.free_stack[0], 0u);
+    CHECK_EQ(guard.sq_tail, 1u);
+}
+
 TEST(tls_iouring, current_token_bad_raw_identity_fails_closed_before_logical_completion) {
     enum class Corruption : u8 { Fd, Source, Length, BackendGeneration, Callback, Aux };
     for (const Corruption corruption : {Corruption::Fd,
@@ -6581,74 +6693,91 @@ TEST(tls_iouring, f_more_transfers_raw_generation_to_close_ledger_in_either_drai
 }
 
 TEST(tls_iouring, logical_want_read_close_submits_only_recv_cancel_and_reclaims_in_both_orders) {
-    for (const bool cancel_first : {false, true}) {
-        ScopedTlsRawSendLoop guard;
-        REQUIRE(guard.init());
-        IoUringEventLoop& loop = *guard.loop;
-        Connection& conn = loop.conns[0];
-        conn.reset();
-        conn.id = 0;
-        conn.fd = dup(STDERR_FILENO);
-        REQUIRE_GE(conn.fd, 0);
-        loop.free_top = 0;
-        conn.tls_active = true;
-        conn.recv_armed = true;
-        conn.pending_ops = 1;
-        conn.tls_pending_on_recv = &tls_resume_pending_send_recv<IoUringEventLoop>;
-        u32 logical_generation = 0;
-        REQUIRE(conn.next_non_upstream_send_generation(logical_generation));
-        conn.tls_send_owner_generation = logical_generation;
-        conn.tls_send_owner_fd = conn.fd;
-        conn.tls_send_owner_handler_generation = conn.handler_gen;
-        conn.tls_send_src = reinterpret_cast<const u8*>("pending plaintext");
-        conn.tls_send_len = 16;
-        conn.tls_send_off = 0;  // parked logical owner, with no raw ciphertext target
-        conn.tls_pending_on_send = &tls_pending_send_probe;
+    for (const bool close_through_ws_consumer : {false, true}) {
+        for (const bool cancel_first : {false, true}) {
+            ScopedTlsRawSendLoop guard;
+            REQUIRE(guard.init());
+            IoUringEventLoop& loop = *guard.loop;
+            Connection& conn = loop.conns[0];
+            conn.reset();
+            conn.id = 0;
+            conn.fd = dup(STDERR_FILENO);
+            REQUIRE_GE(conn.fd, 0);
+            loop.free_top = 0;
+            conn.tls_active = true;
+            conn.recv_armed = true;
+            conn.pending_ops = 1;
+            conn.tls_pending_on_recv = &tls_resume_pending_send_recv<IoUringEventLoop>;
+            u32 logical_generation = 0;
+            REQUIRE(conn.next_non_upstream_send_generation(logical_generation));
+            conn.tls_send_owner_generation = logical_generation;
+            conn.tls_send_owner_fd = conn.fd;
+            conn.tls_send_owner_handler_generation = conn.handler_gen;
+            conn.tls_send_src = reinterpret_cast<const u8*>("pending plaintext");
+            conn.tls_send_len = 16;
+            conn.tls_send_off = 0;  // parked logical owner, with no raw ciphertext target
+            conn.tls_pending_on_send = &tls_pending_send_probe;
 
-        loop.close_conn(conn);
-        const Connection& closed = loop.conns[0];
-        CHECK_EQ(closed.response_read_deadline_send_close_generation, 0u);
-        CHECK_FALSE(closed.response_read_deadline_send_close_target_owned);
-        CHECK_FALSE(closed.response_read_deadline_send_close_cancel_owned);
-        REQUIRE_EQ(closed.pending_ops, 2u);  // recv target plus its close cancel
-        REQUIRE_EQ(loop.pending_free_count, 1u);
-        CHECK_EQ(loop.free_top, 0u);
-        REQUIRE_EQ(guard.sq_tail, 1u);
-        const io_uring_sqe& cancel_sqe = guard.sq_entries[0];
-        CHECK_EQ(cancel_sqe.opcode, IORING_OP_ASYNC_CANCEL);
-        u32 cancel_id = UINT32_MAX;
-        u32 cancel_aux = 0;
-        IoEventType cancel_type = IoEventType::Count;
-        IoUringBackend::decode_user_data(cancel_sqe.user_data, cancel_id, cancel_type, cancel_aux);
-        CHECK_EQ(cancel_id, conn.id);
-        CHECK_EQ(cancel_type, IoEventType::Recv);
-        CHECK_EQ(cancel_aux, kDownstreamCloseCancelAux);
+            if (close_through_ws_consumer) {
+                static constexpr u8 kUpstreamData[] = "websocket";
+                u8 upstream_storage[64];
+                conn.upstream_recv_buf.bind(upstream_storage, sizeof(upstream_storage));
+                REQUIRE_EQ(conn.upstream_recv_buf.write(kUpstreamData, sizeof(kUpstreamData) - 1),
+                           sizeof(kUpstreamData) - 1);
+                conn.is_ws_tunnel = true;
+                IoEvent upstream_recv{};
+                upstream_recv.conn_id = conn.id;
+                upstream_recv.result = static_cast<i32>(sizeof(kUpstreamData) - 1);
+                upstream_recv.type = IoEventType::UpstreamRecv;
+                on_ws_upstream_recv<IoUringEventLoop>(&loop, conn, upstream_recv);
+            } else {
+                loop.close_conn(conn);
+            }
+            const Connection& closed = loop.conns[0];
+            CHECK_EQ(closed.response_read_deadline_send_close_generation, 0u);
+            CHECK_FALSE(closed.response_read_deadline_send_close_target_owned);
+            CHECK_FALSE(closed.response_read_deadline_send_close_cancel_owned);
+            REQUIRE_EQ(closed.pending_ops, 2u);  // recv target plus its close cancel
+            REQUIRE_EQ(loop.pending_free_count, 1u);
+            CHECK_EQ(loop.free_top, 0u);
+            REQUIRE_EQ(guard.sq_tail, 1u);
+            const io_uring_sqe& cancel_sqe = guard.sq_entries[0];
+            CHECK_EQ(cancel_sqe.opcode, IORING_OP_ASYNC_CANCEL);
+            u32 cancel_id = UINT32_MAX;
+            u32 cancel_aux = 0;
+            IoEventType cancel_type = IoEventType::Count;
+            IoUringBackend::decode_user_data(
+                cancel_sqe.user_data, cancel_id, cancel_type, cancel_aux);
+            CHECK_EQ(cancel_id, conn.id);
+            CHECK_EQ(cancel_type, IoEventType::Recv);
+            CHECK_EQ(cancel_aux, kDownstreamCloseCancelAux);
 
-        IoEvent target{};
-        target.conn_id = conn.id;
-        target.result = -ECANCELED;
-        target.type = IoEventType::Recv;
-        IoEvent cancel{};
-        cancel.conn_id = conn.id;
-        cancel.result = -ENOENT;
-        cancel.type = IoEventType::Recv;
-        cancel.aux = kDownstreamCloseCancelAux;
+            IoEvent target{};
+            target.conn_id = conn.id;
+            target.result = -ECANCELED;
+            target.type = IoEventType::Recv;
+            IoEvent cancel{};
+            cancel.conn_id = conn.id;
+            cancel.result = -ENOENT;
+            cancel.type = IoEventType::Recv;
+            cancel.aux = kDownstreamCloseCancelAux;
 
-        loop.dispatch(cancel_first ? cancel : target);
-        CHECK_EQ(closed.pending_ops, 1u);
-        CHECK_EQ(loop.pending_free_count, 1u);
-        CHECK_EQ(loop.free_top, 0u);
+            loop.dispatch(cancel_first ? cancel : target);
+            CHECK_EQ(closed.pending_ops, 1u);
+            CHECK_EQ(loop.pending_free_count, 1u);
+            CHECK_EQ(loop.free_top, 0u);
 
-        loop.dispatch(cancel_first ? target : cancel);
-        CHECK_EQ(closed.pending_ops, 0u);
-        CHECK_EQ(loop.pending_free_count, 0u);
-        CHECK_EQ(loop.free_top, 1u);
+            loop.dispatch(cancel_first ? target : cancel);
+            CHECK_EQ(closed.pending_ops, 0u);
+            CHECK_EQ(loop.pending_free_count, 0u);
+            CHECK_EQ(loop.free_top, 1u);
 
-        // The target's terminal duplicate has no second free-stack ownership.
-        loop.dispatch(target);
-        CHECK_EQ(closed.pending_ops, 0u);
-        CHECK_EQ(loop.pending_free_count, 0u);
-        CHECK_EQ(loop.free_top, 1u);
+            // The target's terminal duplicate has no second free-stack ownership.
+            loop.dispatch(target);
+            CHECK_EQ(closed.pending_ops, 0u);
+            CHECK_EQ(loop.pending_free_count, 0u);
+            CHECK_EQ(loop.free_top, 1u);
+        }
     }
 }
 
@@ -27783,6 +27912,35 @@ TEST(state_invariant, jit_downstream_send_yield_fails_closed_when_send_cannot_qu
     CHECK(!c->keep_alive);
     CHECK(!c->recv_paused_for_send);
     CHECK_EQ(loop.backend.count_ops(MockOp::PauseRecv), 0u);
+}
+
+TEST(state_invariant, jit_send_failure_after_terminal_close_does_not_format_second_response) {
+    SmallLoop loop;
+    loop.setup();
+    loop.inject_and_dispatch(make_ev(0, IoEventType::Accept, 42));
+    auto* c = loop.find_fd(42);
+    REQUIRE(c != nullptr);
+    c->send_buf.reset();
+    static constexpr u8 kChunk[] = "already-encrypted-owner";
+    REQUIRE_EQ(c->send_buf.write(kChunk, sizeof(kChunk) - 1), sizeof(kChunk) - 1);
+
+    JitDispatchOutcome outcome{};
+    outcome.kind = JitDispatchOutcome::Kind::EventYield;
+    outcome.next_state = 3;
+    outcome.yield_kind = jit::YieldKind::Send;
+    loop.backend.fail_send = true;
+    loop.close_on_failed_send = true;
+    loop.send_submit_attempts = 0;
+    handle_jit_outcome<SmallLoop>(&loop, *c, outcome, &state_invariant_configured_jit_result, true);
+
+    // The io_uring TLS contract terminal-closes before returning false. The
+    // JIT caller must not format a 500 into the reset slot or make a second
+    // send attempt against its empty buffers.
+    CHECK_EQ(c->fd, -1);
+    CHECK_EQ(c->resp_status, 0u);
+    CHECK_EQ(loop.free_top, SmallLoop::kMaxConns);
+    CHECK_EQ(loop.send_submit_attempts, 1u);
+    CHECK_EQ(loop.backend.count_ops(MockOp::Send), 0u);
 }
 
 TEST(state_invariant, jit_recv_yield_sets_recv_rearm_pending_if_recv_pause_cancel_pending) {
