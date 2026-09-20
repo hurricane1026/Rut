@@ -276,6 +276,17 @@ void tls_on_out_drain(void* lp, Connection& c, IoEvent ev) {
         }
     }
 
+    // A recv CQE may have arrived while this raw send was in flight. tls_process
+    // deliberately left it in tls_in_buf because SSL cannot consume input while
+    // tls_out_buf is kernel-owned. If the parked write is waiting for peer input,
+    // feed that buffered ciphertext back through the normal TLS resume path before
+    // retrying SSL_write; otherwise a second WANT_READ can arm a recv after the
+    // only input CQE has already been consumed.
+    if (c.tls_pending_on_recv == &tls_resume_pending_send_recv<Self> && c.tls_in_buf.len() > 0) {
+        tls_process<Self>(loop, c);
+        return;
+    }
+
     // (a) Finish a parked plaintext remainder (the buffer filled mid-chunk)
     // before any completion, so the chunk's tail is never lost.
     if (c.tls_send_src && c.tls_send_off < c.tls_send_len) {

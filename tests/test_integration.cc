@@ -5966,6 +5966,7 @@ u32 g_tls_iouring_logical_send_result = 0;
 u32 g_tls_iouring_recv_buf_len_at_logical_send = 0;
 u8 g_tls_iouring_recv_buf_at_logical_send[128];
 bool g_tls_iouring_next_request_called = false;
+u32 g_tls_iouring_next_request_calls = 0;
 u32 g_tls_iouring_next_request_result = 0;
 u32 g_tls_iouring_next_request_len = 0;
 u8 g_tls_iouring_next_request_buf[128];
@@ -5996,6 +5997,7 @@ void tls_iouring_logical_send_probe(void* /*lp*/, Connection& conn, IoEvent ev) 
 
 void tls_iouring_next_request_probe(void* /*lp*/, Connection& conn, IoEvent ev) {
     g_tls_iouring_next_request_called = true;
+    g_tls_iouring_next_request_calls++;
     g_tls_iouring_next_request_result = static_cast<u32>(ev.result);
     g_tls_iouring_next_request_len = conn.recv_buf.len();
     const u32 copy_len = conn.recv_buf.len() < sizeof(g_tls_iouring_next_request_buf)
@@ -6062,6 +6064,7 @@ TEST(tls_iouring, want_read_resume_state_preserves_pipelined_plaintext_until_raw
     g_tls_iouring_logical_send_result = 0;
     g_tls_iouring_recv_buf_len_at_logical_send = 0;
     g_tls_iouring_next_request_called = false;
+    g_tls_iouring_next_request_calls = 0;
     g_tls_iouring_next_request_result = 0;
     g_tls_iouring_next_request_len = 0;
 
@@ -6126,6 +6129,277 @@ TEST(tls_iouring, want_read_resume_state_preserves_pipelined_plaintext_until_raw
     cl.destroy();
     tls_engine_free(conn.tls_engine);
     destroy_tls_server_context(tls_ctx.value());
+}
+
+enum class BufferedRecvBeforeRawDrainCase : u8 { CompleteRecord, PartialRecord, CorruptRecord };
+
+// Model a legal parked WANT_READ owner with an encrypted prefix already in
+// flight. Peer ciphertext arrives before its raw CQE; the real TLS engine must
+// defer processing until the raw owner drains. The resumed WANT_READ owner
+// state is injected directly because this fixture does not force SSL_write to
+// produce WANT_READ itself.
+void run_buffered_recv_before_raw_send_completion(rut::test::TestCase* test_case,
+                                                  BufferedRecvBeforeRawDrainCase test_case_kind) {
+    auto* _tc = test_case;
+    auto tls_ctx = create_tls_server_context(kTestCertPath, kTestKeyPath);
+    REQUIRE(tls_ctx.has_value());
+
+    TlsIouringHarness loop;
+    Connection& conn = loop.conns[0];
+    u8 tls_in_storage[4096];
+    u8 tls_out_storage[4096];
+    conn.reset();
+    conn.id = 0;
+    conn.fd = 42;
+    conn.tls_active = true;
+    conn.recv_slice = loop.recv_storage[0];
+    conn.tls_in_slice = tls_in_storage;
+    conn.tls_out_slice = tls_out_storage;
+    conn.recv_buf.bind(loop.recv_storage[0], sizeof(loop.recv_storage[0]));
+    conn.tls_in_buf.bind(tls_in_storage, sizeof(tls_in_storage));
+    conn.tls_out_buf.bind(tls_out_storage, sizeof(tls_out_storage));
+    conn.on_recv = &tls_recv<TlsIouringHarness>;
+    REQUIRE(tls_engine_init(conn.tls_engine, tls_ctx.value()).has_value());
+
+    TlsClientPeer cl;
+    REQUIRE(tls_engine_handshake_loopback(conn.tls_engine, cl));
+
+    static constexpr u8 kResponse[] = "response-prefix-and-tail";
+    static constexpr u32 kPrefixLen = 9;
+    static constexpr u8 kNextRequest[] = "GET /next HTTP/1.1\r\nHost: x\r\n\r\n";
+    u32 logical_generation = 0;
+    REQUIRE(conn.next_non_upstream_send_generation(logical_generation));
+    conn.tls_send_owner_generation = logical_generation;
+    conn.tls_send_owner_fd = conn.fd;
+    conn.tls_send_owner_handler_generation = conn.handler_gen;
+    conn.tls_send_src = kResponse;
+    conn.tls_send_len = sizeof(kResponse) - 1u;
+    conn.tls_send_off = 0;
+    conn.tls_pending_on_send = &tls_iouring_logical_send_probe;
+    g_tls_iouring_logical_send_called = false;
+    g_tls_iouring_logical_send_calls = 0;
+    g_tls_iouring_logical_send_result = 0;
+    g_tls_iouring_recv_buf_len_at_logical_send = 0;
+    g_tls_iouring_next_request_called = false;
+    g_tls_iouring_next_request_calls = 0;
+
+    // Produce the first raw record for this logical send, leaving a parked tail.
+    u32 consumed = 0;
+    const TlsFill first_fill =
+        tls_fill_output<TlsIouringHarness>(&loop, conn, kResponse, kPrefixLen, consumed);
+    REQUIRE_EQ(first_fill, TlsFill::Done);
+    REQUIRE_EQ(consumed, kPrefixLen);
+    conn.tls_send_off = consumed;
+    REQUIRE(conn.tls_out_inflight);
+    const u32 first_raw_len = conn.tls_out_inflight_len;
+    const u32 first_raw_generation = conn.tls_out_inflight_generation;
+    REQUIRE_GT(first_raw_len, 0u);
+    REQUIRE_NE(first_raw_generation, 0u);
+    REQUIRE(loop.tls_ciphertext_send_is_current(conn));
+
+    // Model the already-submitted recv owner for the WANT_READ continuation.
+    REQUIRE(tls_send_retry_has_driver<TlsIouringHarness>(&loop, conn, TlsFill::NeedRead));
+    // SmallLoop::submit_recv records the request but does not mutate Connection
+    // ownership fields, so model that one outstanding recv alongside the raw send.
+    conn.recv_armed = true;
+    conn.pending_ops++;
+    CHECK_EQ(conn.pending_ops, 2u);
+    CHECK_EQ(loop.SmallLoop::backend.count_ops(MockOp::Recv), 1u);
+
+    u8 peer_ciphertext[4096]{};
+    int input_cipher_len = 0;
+    if (test_case_kind == BufferedRecvBeforeRawDrainCase::CorruptRecord) {
+        // Invalid TLS content type; the buffered record must fail closed after
+        // the raw output owner releases tls_out_buf.
+        peer_ciphertext[0] = 0;
+        peer_ciphertext[1] = 3;
+        peer_ciphertext[2] = 3;
+        peer_ciphertext[3] = 0;
+        peer_ciphertext[4] = 0;
+        input_cipher_len = 5;
+    } else {
+        REQUIRE(SSL_write(cl.ssl, kNextRequest, sizeof(kNextRequest) - 1u) ==
+                static_cast<int>(sizeof(kNextRequest) - 1u));
+        input_cipher_len =
+            BIO_read(cl.wbio, peer_ciphertext, static_cast<int>(sizeof(peer_ciphertext)));
+        REQUIRE_GT(input_cipher_len, 0);
+    }
+    const u32 first_input_len = test_case_kind == BufferedRecvBeforeRawDrainCase::PartialRecord
+                                    ? 1u
+                                    : static_cast<u32>(input_cipher_len);
+    REQUIRE_LE(first_input_len, conn.tls_in_buf.write_avail());
+    memcpy(conn.tls_in_buf.write_ptr(), peer_ciphertext, first_input_len);
+    conn.tls_in_buf.commit(first_input_len);
+
+    // A terminal recv CQE is delivered while the raw target still owns output.
+    // tls_process must defer consuming the new record, not dispatch it early.
+    conn.recv_armed = false;
+    REQUIRE_GT(conn.pending_ops, 1u);
+    conn.pending_ops--;
+    IoEvent recv = {};
+    recv.conn_id = conn.id;
+    recv.type = IoEventType::Recv;
+    recv.result = static_cast<i32>(first_input_len);
+    conn.on_recv(&loop, conn, recv);
+    CHECK_EQ(conn.tls_in_buf.len(), first_input_len);
+    CHECK_EQ(conn.recv_buf.len(), 0u);
+    CHECK(conn.tls_out_inflight);
+    CHECK(loop.tls_ciphertext_send_is_current(conn));
+    CHECK_FALSE(g_tls_iouring_logical_send_called);
+
+    // Complete the old raw target and make its bytes visible to the TLS peer.
+    REQUIRE_EQ(BIO_write(cl.rbio, conn.tls_out_buf.data(), static_cast<int>(first_raw_len)),
+               static_cast<int>(first_raw_len));
+    auto& first_send = loop.backend.send_state[conn.id];
+    first_send.offset = first_raw_len;
+    first_send.remaining = 0;
+    REQUIRE_GT(conn.pending_ops, 0u);
+    conn.pending_ops--;
+    conn.send_armed = false;
+    IoEvent first_drain = {};
+    first_drain.conn_id = conn.id;
+    first_drain.type = IoEventType::Send;
+    first_drain.result = static_cast<i32>(first_raw_len);
+    first_drain.non_upstream_generation = first_raw_generation;
+    tls_on_out_drain<TlsIouringHarness>(&loop, conn, first_drain);
+
+    if (test_case_kind == BufferedRecvBeforeRawDrainCase::CorruptRecord) {
+        CHECK(loop.closed);
+        CHECK_FALSE(conn.tls_active);
+        CHECK_FALSE(g_tls_iouring_logical_send_called);
+        CHECK_EQ(g_tls_iouring_logical_send_calls, 0u);
+        CHECK_FALSE(conn.tls_out_inflight);
+        tls_engine_free(conn.tls_engine);
+        cl.destroy();
+        destroy_tls_server_context(tls_ctx.value());
+        return;
+    }
+
+    // A complete record must decrypt before the parked write retries. A
+    // one-byte fragment must remain non-dispatchable and the response owner
+    // must still be driven only by the second ciphertext target.
+    CHECK_FALSE(loop.closed);
+    CHECK_EQ(conn.tls_send_off, sizeof(kResponse) - 1u);
+    CHECK_EQ(conn.tls_send_owner_generation, logical_generation);
+    CHECK(conn.tls_out_inflight);
+    CHECK(loop.tls_ciphertext_send_is_current(conn));
+    CHECK_EQ(conn.pending_ops, 1u);
+    CHECK_EQ(loop.SmallLoop::backend.op_count, 1u);
+    CHECK_FALSE(g_tls_iouring_logical_send_called);
+    if (test_case_kind == BufferedRecvBeforeRawDrainCase::CompleteRecord) {
+        CHECK_EQ(conn.tls_in_buf.len(), 0u);
+        CHECK_EQ(conn.recv_buf.len(), sizeof(kNextRequest) - 1u);
+        CHECK(memcmp(conn.recv_buf.data(), kNextRequest, sizeof(kNextRequest) - 1u) == 0);
+        CHECK_EQ(conn.tls_pending_on_recv, nullptr);
+    } else {
+        CHECK_EQ(conn.recv_buf.len(), 0u);
+        CHECK_FALSE(g_tls_iouring_next_request_called);
+    }
+
+    // The retried tail has its own raw target; logical completion follows only
+    // after this target drains, exactly once.
+    const u32 tail_raw_len = conn.tls_out_inflight_len;
+    const u32 tail_raw_generation = conn.tls_out_inflight_generation;
+    REQUIRE_GT(tail_raw_len, 0u);
+    REQUIRE_NE(tail_raw_generation, first_raw_generation);
+    REQUIRE_EQ(BIO_write(cl.rbio, conn.tls_out_buf.data(), static_cast<int>(tail_raw_len)),
+               static_cast<int>(tail_raw_len));
+    auto& tail_send = loop.backend.send_state[conn.id];
+    tail_send.offset = tail_raw_len;
+    tail_send.remaining = 0;
+    conn.pending_ops--;
+    conn.send_armed = false;
+    IoEvent tail_drain = {};
+    tail_drain.conn_id = conn.id;
+    tail_drain.type = IoEventType::Send;
+    tail_drain.result = static_cast<i32>(tail_raw_len);
+    tail_drain.non_upstream_generation = tail_raw_generation;
+    tls_on_out_drain<TlsIouringHarness>(&loop, conn, tail_drain);
+
+    CHECK_FALSE(loop.closed);
+    CHECK(g_tls_iouring_logical_send_called);
+    CHECK_EQ(g_tls_iouring_logical_send_calls, 1u);
+    CHECK_EQ(g_tls_iouring_logical_send_result, sizeof(kResponse) - 1u);
+    if (test_case_kind == BufferedRecvBeforeRawDrainCase::CompleteRecord) {
+        CHECK_EQ(g_tls_iouring_recv_buf_len_at_logical_send, sizeof(kNextRequest) - 1u);
+        CHECK(memcmp(g_tls_iouring_recv_buf_at_logical_send,
+                     kNextRequest,
+                     sizeof(kNextRequest) - 1u) == 0);
+    } else {
+        CHECK_EQ(g_tls_iouring_recv_buf_len_at_logical_send, 0u);
+        CHECK_FALSE(g_tls_iouring_next_request_called);
+        CHECK_EQ(conn.tls_pending_on_recv, &tls_iouring_next_request_probe);
+
+        // The response boundary re-arms client input. Deliver the rest of the
+        // record only after that owner is installed. This exact second recv
+        // proves the drain path preserved a driver before the fixture injects
+        // the suffix; the TLS engine then joins it with the saved prefix.
+        CHECK_EQ(loop.SmallLoop::backend.count_ops(MockOp::Recv), 2u);
+        const u32 remainder_len = static_cast<u32>(input_cipher_len) - first_input_len;
+        REQUIRE_GT(remainder_len, 0u);
+        REQUIRE_LE(remainder_len, conn.tls_in_buf.write_avail());
+        memcpy(conn.tls_in_buf.write_ptr(), peer_ciphertext + first_input_len, remainder_len);
+        conn.tls_in_buf.commit(remainder_len);
+        conn.recv_armed = true;
+        conn.pending_ops++;
+        conn.recv_armed = false;
+        conn.pending_ops--;
+        IoEvent rest = {};
+        rest.conn_id = conn.id;
+        rest.type = IoEventType::Recv;
+        rest.result = static_cast<i32>(remainder_len);
+        conn.on_recv(&loop, conn, rest);
+        CHECK_FALSE(loop.closed);
+        CHECK(g_tls_iouring_next_request_called);
+        CHECK_EQ(g_tls_iouring_next_request_result, sizeof(kNextRequest) - 1u);
+        CHECK_EQ(g_tls_iouring_next_request_len, sizeof(kNextRequest) - 1u);
+        CHECK_EQ(g_tls_iouring_next_request_calls, 1u);
+        CHECK(memcmp(g_tls_iouring_next_request_buf, kNextRequest, sizeof(kNextRequest) - 1u) == 0);
+    }
+    CHECK(conn.tls_raw_send_owner_is_neutral());
+    CHECK(conn.tls_single_shot_send_owner_is_neutral());
+    CHECK_EQ(conn.pending_ops, 0u);
+    CHECK_EQ(conn.tls_in_buf.len(), 0u);
+    CHECK(conn.tls_pending_on_recv == &tls_iouring_next_request_probe);
+    if (test_case_kind == BufferedRecvBeforeRawDrainCase::CompleteRecord) {
+        CHECK_EQ(conn.recv_buf.len(), 0u);
+        CHECK_EQ(g_tls_iouring_next_request_calls, 0u);
+    } else {
+        CHECK_EQ(conn.recv_buf.len(), sizeof(kNextRequest) - 1u);
+        CHECK_EQ(g_tls_iouring_next_request_calls, 1u);
+    }
+
+    u8 response[sizeof(kResponse)]{};
+    u32 response_len = 0;
+    for (u32 attempt = 0; attempt < 4 && response_len < sizeof(kResponse) - 1u; ++attempt) {
+        const int n = SSL_read(cl.ssl,
+                               response + response_len,
+                               static_cast<int>(sizeof(response) - 1u - response_len));
+        if (n <= 0) break;
+        response_len += static_cast<u32>(n);
+    }
+    CHECK_EQ(response_len, sizeof(kResponse) - 1u);
+    CHECK(response_len == sizeof(kResponse) - 1u &&
+          memcmp(response, kResponse, sizeof(kResponse) - 1u) == 0);
+
+    cl.destroy();
+    tls_engine_free(conn.tls_engine);
+    destroy_tls_server_context(tls_ctx.value());
+}
+
+TEST(tls_iouring, buffered_recv_before_raw_send_completion_resumes_pending_write) {
+    run_buffered_recv_before_raw_send_completion(_tc,
+                                                 BufferedRecvBeforeRawDrainCase::CompleteRecord);
+}
+
+TEST(tls_iouring, partial_record_before_raw_send_completion_waits_for_suffix) {
+    run_buffered_recv_before_raw_send_completion(_tc,
+                                                 BufferedRecvBeforeRawDrainCase::PartialRecord);
+}
+
+TEST(tls_iouring, corrupt_record_before_raw_send_completion_fails_closed) {
+    run_buffered_recv_before_raw_send_completion(_tc,
+                                                 BufferedRecvBeforeRawDrainCase::CorruptRecord);
 }
 
 TEST(tls_iouring, need_room_retry_drains_multiple_ciphertext_targets_before_one_logical_send) {
