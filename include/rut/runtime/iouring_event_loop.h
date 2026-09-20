@@ -6,6 +6,7 @@
 #include "rut/runtime/access_log_live_producer.h"
 #include "rut/runtime/callbacks.h"
 #include "rut/runtime/connection.h"
+#include "rut/runtime/connection_capacity.h"
 #include "rut/runtime/drain.h"
 #include "rut/runtime/error.h"
 #include "rut/runtime/event_loop.h"
@@ -14,6 +15,7 @@
 #include "rut/runtime/io_event.h"
 #include "rut/runtime/io_uring_backend.h"
 #include "rut/runtime/jit_dispatch.h"
+#include "rut/runtime/mapped_array.h"
 #include "rut/runtime/metrics.h"
 #include "rut/runtime/rate_limit.h"
 #include "rut/runtime/response_read_deadline.h"
@@ -87,7 +89,7 @@ private:
         Connection& c, const u8* src, u32 len, Submit&& submit, FlushResult&& flush_result) {
         const bool staged_in_response_header_buf =
             src == c.response_header_buf.data() && len == c.response_header_buf.len() && len != 0;
-        if (c.id >= kMaxConns || c.fd < 0 || src == nullptr || len == 0 || c.tls_active ||
+        if (c.id >= connection_capacity || c.fd < 0 || src == nullptr || len == 0 || c.tls_active ||
             !staged_in_response_header_buf || c.send_armed ||
             backend.send_state[c.id].remaining != 0 ||
             !c.response_read_deadline_owner_is_neutral() || c.upstream_send_armed ||
@@ -122,7 +124,8 @@ private:
     }
 
 public:
-    static constexpr u32 kMaxConns = 16384;
+    static constexpr u32 kMaxConns = kDefaultConnectionCapacity;
+    u32 connection_capacity = 0;
     // Active health-check probing requires synchronous probe teardown; the
     // io_uring loop doesn't support that yet, so sweep_health_probes only re-arms
     // deadlines here and issues no connects (epoll-only this slice).
@@ -161,13 +164,13 @@ public:
     // h2 upgrade; bounded, over-cap upgrades close the connection.
     static constexpr u32 kH2PoolCap = 2048;
     SlabPool<Http2Conn, kH2PoolCap> h2_pool;
-    Connection conns[kMaxConns];
-    u32 free_stack[kMaxConns];
-    u32 free_top;
+    MappedArray<Connection> conns;
+    MappedArray<u32> free_stack;
+    u32 free_top = 0;
 
     // Pending-free list: slots closed during the current dispatch batch.
-    u32 pending_free[kMaxConns];
-    u32 pending_free_count;
+    MappedArray<u32> pending_free;
+    u32 pending_free_count = 0;
     // Normally zero. A strict retirement cancel that could not acquire an SQE
     // is retried before the next blocking wait; the count avoids scanning the
     // full connection table on the ordinary hot path.
@@ -239,12 +242,67 @@ public:
     static constexpr u32 kCaptureSliceSize = 8192;
     u8* capture_region_ = nullptr;
 
+    core::Expected<void, Error> init_slot_storage(u32 capacity, u32 id = 0) {
+        if (!validate_connection_capacity(capacity))
+            return core::make_unexpected(Error::make(EINVAL, Error::Source::Mmap));
+        if (connection_capacity != 0)
+            return connection_capacity == capacity
+                       ? core::Expected<void, Error>{}
+                       : core::make_unexpected(Error::make(EINVAL, Error::Source::Mmap));
+        auto c = conns.init(capacity);
+        if (!c) return core::make_unexpected(c.error());
+        auto f = free_stack.init(capacity);
+        if (!f) {
+            conns.destroy();
+            return core::make_unexpected(f.error());
+        }
+        auto p = pending_free.init(capacity);
+        if (!p) {
+            free_stack.destroy();
+            conns.destroy();
+            return core::make_unexpected(p.error());
+        }
+        auto b = backend.init_send_state_storage(capacity);
+        if (!b) {
+            pending_free.destroy();
+            free_stack.destroy();
+            conns.destroy();
+            return core::make_unexpected(b.error());
+        }
+        for (u32 i = 0; i < capacity; i++) {
+            conns[i].reset();
+            conns[i].id = i;
+            conns[i].shard_id = static_cast<u8>(id);
+            free_stack[i] = i;
+            pending_free[i] = 0;
+        }
+        free_top = capacity;
+        pending_free_count = 0;
+        connection_capacity = capacity;
+        return {};
+    }
+
+    void destroy_slot_storage() {
+        connection_capacity = 0;
+        pending_free_count = 0;
+        free_top = 0;
+        backend.destroy_send_state_storage();
+        pending_free.destroy();
+        free_stack.destroy();
+        conns.destroy();
+    }
+
     bool set_capture(CaptureRing* ring) {
         capture_ring = ring;
         if (!ring) return true;
+        if (connection_capacity == 0 || static_cast<u64>(connection_capacity) >
+                                            static_cast<u64>(SIZE_MAX) / kCaptureSliceSize) {
+            capture_ring = nullptr;
+            return false;
+        }
         if (!capture_region_) {
             void* region = mmap(nullptr,
-                                static_cast<u64>(kMaxConns) * kCaptureSliceSize,
+                                static_cast<size_t>(connection_capacity) * kCaptureSliceSize,
                                 PROT_READ | PROT_WRITE,
                                 MAP_PRIVATE | MAP_ANONYMOUS,
                                 -1,
@@ -255,7 +313,7 @@ public:
             }
             capture_region_ = static_cast<u8*>(region);
         }
-        for (u32 i = 0; i < kMaxConns; i++) {
+        for (u32 i = 0; i < connection_capacity; i++) {
             if (conns[i].fd >= 0 && !conns[i].capture_buf)
                 conns[i].capture_buf = capture_region_ + static_cast<u64>(i) * kCaptureSliceSize;
         }
@@ -276,7 +334,14 @@ public:
     ShardEpoch* epoch = nullptr;
     void** jit_code_ptr = nullptr;
 
-    core::Expected<void, Error> init(u32 id, i32 lfd, u32 pool_prealloc = 0) {
+    core::Expected<void, Error> init(u32 id,
+                                     i32 lfd,
+                                     u32 pool_prealloc = 0,
+                                     u32 capacity = kDefaultConnectionCapacity) {
+        if (connection_capacity != 0)
+            return core::make_unexpected(Error::make(EINVAL, Error::Source::Mmap));
+        auto slots = init_slot_storage(capacity, id);
+        if (!slots) return core::make_unexpected(slots.error());
         shard_id = id;
         listen_fd = lfd;
         this->listener_context = {};
@@ -293,8 +358,6 @@ public:
         control = nullptr;
         epoch = nullptr;
         jit_code_ptr = nullptr;
-        free_top = kMaxConns;
-        pending_free_count = 0;
         upstream_retirement_retry_count = 0;
         http1_boundary_ready_pending = false;
         response_read_deadline_expiry_pending = false;
@@ -306,26 +369,28 @@ public:
         response_read_batch_pin_count = 0;
         deferred_accept_count = 0;
         timer.init();
-        for (u32 i = 0; i < kMaxConns; i++) {
-            conns[i].reset();
-            conns[i].id = i;
-            conns[i].shard_id = static_cast<u8>(id);
-            free_stack[i] = i;
-        }
         // Plaintext needs recv + send + lazy upstream_recv. TLS termination adds
         // one long-lived ciphertext output slice per connection. TLS input uses
         // a slightly larger mmap buffer so one full ciphertext record fits.
         // tls_server is wired after init(), so reserve for the TLS-capable case.
-        TRY_VOID(pool.init(kMaxConns * 6, pool_prealloc));
+        auto pooled = pool.init(connection_capacity * 6, pool_prealloc);
+        if (!pooled) {
+            backend.shutdown();
+            destroy_slot_storage();
+            return core::make_unexpected(pooled.error());
+        }
         auto h2p = h2_pool.init();
         if (!h2p) {
             pool.destroy();
+            backend.shutdown();
+            destroy_slot_storage();
             return core::make_unexpected(h2p.error());
         }
-        auto be = backend.init(id, lfd);
+        auto be = backend.init(id, lfd, connection_capacity);
         if (!be) {
             h2_pool.destroy();
             pool.destroy();
+            destroy_slot_storage();
             return core::make_unexpected(be.error());
         }
         return {};
@@ -344,7 +409,7 @@ public:
 
         while (is_running()) {
             retry_strict_upstream_retirement_cancels();
-            u32 n = backend.wait(events, kMaxEventsPerWait, conns, kMaxConns);
+            u32 n = backend.wait(events, kMaxEventsPerWait, conns, connection_capacity);
             if (backend.failure_code() != 0) {
                 // A zero-event wait is valid; a sticky backend error is not. Stop
                 // this shard so an io_uring_enter failure cannot become a silent
@@ -422,9 +487,10 @@ public:
         h2_pool.destroy();
         pool.destroy();
         if (capture_region_) {
-            munmap(capture_region_, static_cast<u64>(kMaxConns) * kCaptureSliceSize);
+            munmap(capture_region_, static_cast<u64>(connection_capacity) * kCaptureSliceSize);
             capture_region_ = nullptr;
         }
+        destroy_slot_storage();
     }
 
     void drain(u32 period_secs) {
@@ -443,7 +509,7 @@ public:
         }
     }
 
-    u32 active_count() const { return kMaxConns - free_top; }
+    u32 active_count() const { return connection_capacity - free_top; }
 
     // Lazy-allocate upstream recv buffer for proxy connections.
     // Only called when a connection starts proxying — non-proxy connections
@@ -1135,7 +1201,7 @@ private:
              previous_tombstone < c.upstream_episode && !c.upstream_retirement_active &&
              c.upstream_retirement_target_owned == 0 && c.upstream_retirement_cancel_owned == 0 &&
              c.upstream_retirement_cancel_retry == 0);
-        if (c.id >= kMaxConns || c.upstream_episode_quarantined ||
+        if (c.id >= connection_capacity || c.upstream_episode_quarantined ||
             !valid_upstream_episode(c.upstream_episode) || !replaceable_tombstone ||
             (selected_targets & static_cast<u8>(~kAllUpstreamOps)) != 0 ||
             ((selected_targets & kUpstreamOpConnect) != 0 &&
@@ -1412,7 +1478,7 @@ public:
                      ->policy_bundles[c.http1_prebuilt_deadline_bundle_id - 1]
                      .response_buffering,
                  c.http1_prebuilt_deadline_profile));
-        if (c.id >= kMaxConns || c.fd < 0 || c.upstream_fd < 0 ||
+        if (c.id >= connection_capacity || c.fd < 0 || c.upstream_fd < 0 ||
             c.protocol != ConnProtocol::Http11 || c.tls_active || c.state != ConnState::Proxying ||
             ((!c.keep_alive || !c.req_client_keep_alive) && !explicit_close) ||
             c.req_start_us == 0 || c.epoch_held || c.resp_body_mode != BodyMode::None ||
@@ -1493,8 +1559,8 @@ public:
         const u8 expected_wait =
             kHttp1WaitHeaderSend |
             (c.upstream_retirement_active ? kHttp1WaitUpstreamRetirement : static_cast<u8>(0));
-        if (c.id >= kMaxConns || ev.conn_id != c.id || ev.type != IoEventType::Send || ev.more ||
-            ev.aux != 0 || ev.result <= 0 ||
+        if (c.id >= connection_capacity || ev.conn_id != c.id || ev.type != IoEventType::Send ||
+            ev.more || ev.aux != 0 || ev.result <= 0 ||
             static_cast<u32>(ev.result) != c.response_header_buf.len() ||
             !prebuilt_http1_response_is_complete(c) ||
             c.http1_prebuilt_disposition == Http1RequestBufferDisposition::None ||
@@ -1520,7 +1586,7 @@ public:
         if ((c.http1_prebuilt_wait & kHttp1WaitHeaderSend) == 0) return true;
 
         const auto& send = backend.send_state[c.id];
-        const bool exact_owner = c.id < kMaxConns && c.state == ConnState::Sending &&
+        const bool exact_owner = c.id < connection_capacity && c.state == ConnState::Sending &&
                                  c.send_armed && c.req_start_us != 0 && !c.epoch_held &&
                                  c.on_send == &on_prebuilt_http1_header_sent<IoUringEventLoop> &&
                                  send.src == c.response_header_buf.data() && send.fd == c.fd &&
@@ -1590,8 +1656,8 @@ public:
         const bool body = c.response_read_deadline_send_kind == ResponseReadDeadlineSendKind::Body;
         const auto& send = backend.send_state[c.id];
         const bool exact_shape =
-            c.id < kMaxConns && c.fd >= 0 && c.send_armed && c.pending_ops > 0 && !ev.more &&
-            ev.aux == 0 && ev.result > 0 &&
+            c.id < connection_capacity && c.fd >= 0 && c.send_armed && c.pending_ops > 0 &&
+            !ev.more && ev.aux == 0 && ev.result > 0 &&
             static_cast<u32>(ev.result) == c.response_read_deadline_send_len &&
             c.response_read_deadline_send_deadline_generation ==
                 c.response_read_deadline_post_commit_generation &&
@@ -1649,7 +1715,7 @@ public:
     bool response_read_deadline_send_completion_is_valid(const Connection& c,
                                                          const IoEvent& ev,
                                                          ResponseReadDeadlineSendKind kind) const {
-        if (c.id >= kMaxConns) return false;
+        if (c.id >= connection_capacity) return false;
         const auto& send = backend.send_state[c.id];
         return !c.response_read_deadline_send_owner_active &&
                c.response_read_deadline_send_owner_generation != 0 &&
@@ -1724,7 +1790,7 @@ public:
     // the shard through the existing explicit fatal path.
     void retry_strict_upstream_retirement_cancels() {
         if (upstream_retirement_retry_count == 0) return;
-        for (u32 id = 0; id < kMaxConns && upstream_retirement_retry_count != 0; id++) {
+        for (u32 id = 0; id < connection_capacity && upstream_retirement_retry_count != 0; id++) {
             Connection& c = conns[id];
             if (!c.upstream_retirement_cancel_retry) continue;
             if (!c.upstream_retirement_active ||
@@ -1877,7 +1943,7 @@ public:
     void resume_deferred_http1_boundaries() {
         if (!http1_boundary_ready_pending) return;
         http1_boundary_ready_pending = false;
-        for (u32 id = 0; id < kMaxConns; id++) {
+        for (u32 id = 0; id < connection_capacity; id++) {
             Connection& c = conns[id];
             if (!c.http1_boundary_ready) continue;
 
@@ -2135,14 +2201,14 @@ public:
     }
 
     void pin_response_read_batch_slot(u32 cid) {
-        if (cid >= kMaxConns || response_read_batch_reuse_pinned(cid) ||
+        if (cid >= connection_capacity || response_read_batch_reuse_pinned(cid) ||
             response_read_batch_pin_count >= kMaxEventsPerWait)
             return;
         response_read_batch_pins[response_read_batch_pin_count++] = cid;
     }
 
     void reclaim_slot(u32 cid) {
-        if (cid >= kMaxConns || response_read_batch_reuse_pinned(cid) ||
+        if (cid >= connection_capacity || response_read_batch_reuse_pinned(cid) ||
             strict_upstream_retirement_blocks_reclaim(conns[cid]) ||
             !conns[cid].response_read_timer_owner_is_neutral())
             return;
@@ -2832,7 +2898,7 @@ public:
     // Semantic ownership is independent of timer transport custody: consuming a
     // target CQE must not make an otherwise valid stream ineligible for rearm.
     [[nodiscard]] bool streaming_response_read_timer_is_stable(const Connection& c) const {
-        if (c.id >= kMaxConns || c.state != ConnState::Sending || c.req_start_us == 0 ||
+        if (c.id >= connection_capacity || c.state != ConnState::Sending || c.req_start_us == 0 ||
             c.epoch_held ||
             c.response_read_deadline_buffering != ForwardResponseBufferingMode::None ||
             c.response_read_deadline_profile !=
@@ -2919,7 +2985,7 @@ public:
         const u16 bundle_id = c.response_read_deadline_bundle_id;
         const bool post_commit =
             c.response_read_deadline_post_commit_phase != ResponseReadDeadlinePostCommitPhase::None;
-        if (c.id >= kMaxConns || c.fd < 0 || c.upstream_fd < 0 || is_draining() ||
+        if (c.id >= connection_capacity || c.fd < 0 || c.upstream_fd < 0 || is_draining() ||
             (c.state != ConnState::Proxying && !(post_commit && c.state == ConnState::Sending)) ||
             c.protocol != ConnProtocol::Http11 || c.tls_active || c.h2 != nullptr ||
             c.response_read_deadline_owner_generation == 0 ||
@@ -3002,7 +3068,8 @@ public:
         for (u32 i = 0; i < response_read_batch_owner_count; ++i) {
             if (response_read_batch_owners[i].conn_id == cid) return static_cast<u16>(i + 1);
         }
-        if (cid >= kMaxConns || response_read_batch_owner_count >= kMaxEventsPerWait) return 0;
+        if (cid >= connection_capacity || response_read_batch_owner_count >= kMaxEventsPerWait)
+            return 0;
         const Connection& c = conns[cid];
         if (c.response_read_deadline_state != ResponseReadDeadlineState::Armed &&
             c.response_read_deadline_state != ResponseReadDeadlineState::ExpiryPending &&
@@ -3041,7 +3108,8 @@ public:
                 return static_cast<u16>(i + 1);
             }
         }
-        if (cid >= kMaxConns || response_read_batch_owner_count >= kMaxEventsPerWait) return 0;
+        if (cid >= connection_capacity || response_read_batch_owner_count >= kMaxEventsPerWait)
+            return 0;
         const Connection& c = conns[cid];
         if (!c.response_read_timer_owner_is_valid()) return 0;
         auto& owner = response_read_batch_owners[response_read_batch_owner_count];
@@ -3078,7 +3146,7 @@ public:
         // terminal creates an entry without retaining a Connection pointer.
         for (u32 i = 0; i < count; ++i) {
             const IoEvent& ev = events[i];
-            if (ev.conn_id >= kMaxConns) continue;
+            if (ev.conn_id >= connection_capacity) continue;
             const Connection& c = conns[ev.conn_id];
             const bool current_upstream =
                 ev.type == IoEventType::UpstreamRecv && ev.upstream_episode == c.upstream_episode;
@@ -3091,7 +3159,7 @@ public:
 
         for (u32 i = 0; i < count; ++i) {
             const IoEvent& ev = events[i];
-            if (ev.conn_id >= kMaxConns) continue;
+            if (ev.conn_id >= connection_capacity) continue;
             u16 owner_index = 0;
             for (u32 oi = 0; oi < response_read_batch_owner_count; ++oi) {
                 if (response_read_batch_owners[oi].conn_id == ev.conn_id) {
@@ -3926,7 +3994,7 @@ public:
     void settle_response_read_deadline_batch() {
         for (u32 oi = 0; oi < response_read_batch_owner_count; ++oi) {
             auto& owner = response_read_batch_owners[oi];
-            if (owner.conn_id >= kMaxConns) continue;
+            if (owner.conn_id >= connection_capacity) continue;
             Connection& c = conns[owner.conn_id];
             const bool precise_complete_content_length =
                 c.response_read_deadline_post_commit_phase ==
@@ -4361,7 +4429,7 @@ public:
             close_conn(c);
             return true;
         };
-        for (u32 id = 0; id < kMaxConns; id++) {
+        for (u32 id = 0; id < connection_capacity; id++) {
             Connection& c = conns[id];
             if (c.response_read_deadline_state != ResponseReadDeadlineState::ExpiryPending)
                 continue;
@@ -4393,7 +4461,7 @@ public:
     void pump_response_read_deadline_bodies() {
         if (!response_read_deadline_body_pump_pending) return;
         response_read_deadline_body_pump_pending = false;
-        for (u32 id = 0; id < kMaxConns; ++id) {
+        for (u32 id = 0; id < connection_capacity; ++id) {
             Connection& c = conns[id];
             if (!c.response_read_deadline_post_commit_pump_pending) continue;
             c.response_read_deadline_post_commit_pump_pending = false;
@@ -4789,7 +4857,7 @@ public:
                 // here and must each decrement. yield_armed can't gate this
                 // because free_conn_impl::reset() clears the flag when a
                 // close lands while the timer is in flight.
-                if (ev.conn_id < kMaxConns) {
+                if (ev.conn_id < connection_capacity) {
                     auto& c = conns[ev.conn_id];
                     if (c.pending_ops > 0) c.pending_ops--;
                     const bool matching_generation =
@@ -4878,7 +4946,7 @@ public:
                     u64 start = drain_start_.load(std::memory_order_relaxed);
                     u32 period = drain_period_.load(std::memory_order_relaxed);
                     u64 now = monotonic_secs();
-                    for (u32 i = 0; i < kMaxConns; i++) {
+                    for (u32 i = 0; i < connection_capacity; i++) {
                         if (conns[i].fd >= 0 && conns[i].state == ConnState::ReadingHeader &&
                             should_drain_close(i, start, now, period)) {
                             this->close_conn(conns[i]);
@@ -4892,7 +4960,7 @@ public:
             case IoEventType::UpstreamConnect:
             case IoEventType::UpstreamRecv:
             case IoEventType::UpstreamSend:
-                if (ev.conn_id < kMaxConns) {
+                if (ev.conn_id < connection_capacity) {
                     auto& conn = conns[ev.conn_id];
                     if (consume_strict_upstream_retirement_event(conn, ev)) break;
                     if (consume_response_read_deadline_send_event(conn, ev)) break;
@@ -5315,7 +5383,8 @@ public:
                 }
                 break;
             case IoEventType::ResponseReadTimer:
-                if (ev.conn_id < kMaxConns && valid_response_read_timer_transport_event(ev)) {
+                if (ev.conn_id < connection_capacity &&
+                    valid_response_read_timer_transport_event(ev)) {
                     auto& c = conns[ev.conn_id];
                     // Timer CQEs are settled after the complete wait batch so
                     // a same-batch positive Full-copy response wins regardless
@@ -5345,7 +5414,7 @@ private:
     using Self = IoUringEventLoop;
 
     void close_live_clients() {
-        for (u32 i = 0; i < kMaxConns; i++) {
+        for (u32 i = 0; i < connection_capacity; i++) {
             if (conns[i].fd >= 0) {
                 // A LIVE keep-alive client can also hold a parked idle_return_fd while
                 // its upstream recv cancel drains. close_conn takes the deferred path
@@ -5357,7 +5426,7 @@ private:
     }
 
     void close_deferred_idle_return_fds() {
-        for (u32 i = 0; i < kMaxConns; i++) {
+        for (u32 i = 0; i < connection_capacity; i++) {
             // A reusable upstream fd is parked in idle_return_fd awaiting a recv-cancel
             // drain that this forced shutdown will never deliver — close it directly so
             // it can't leak. Covers both a slot whose client fd was already closed

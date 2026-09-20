@@ -8,6 +8,7 @@
 #include "rut/runtime/chunked_parser.h"
 #include "rut/runtime/connection.h"
 #include "rut/runtime/connection_base.h"
+#include "rut/runtime/connection_capacity.h"
 #include "rut/runtime/http_parser.h"
 #include "rut/runtime/io_event.h"
 #include "rut/runtime/jit_dispatch.h"
@@ -4576,7 +4577,7 @@ inline bool try_prebuilt_strict_read_timeout(Loop* loop, Connection& conn) {
                           candidate->disarm_response_read_deadline(candidate->conns[0]);
                       }) {
             if (conn.response_read_deadline_state == ResponseReadDeadlineState::ExpiryPending &&
-                conn.id < Loop::kMaxConns && &loop->conns[conn.id] == &conn &&
+                conn.id < connection_capacity_of(*loop) && &loop->conns[conn.id] == &conn &&
                 conn.upstream_recv_armed && loop->response_read_deadline_identity_is_stable(conn)) {
                 const bool no_progress = conn.upstream_recv_buf.len() == 0 &&
                                          conn.response_read_deadline_progress_generation == 0 &&
@@ -8976,11 +8977,11 @@ inline bool validated_preconnect_failure_owner_is_stable(Loop* loop,
     } else {
         const RouteConfig* config = conn.request_config;
         const u16 bundle_id = conn.response_read_deadline_bundle_id;
-        if (loop == nullptr || conn.id >= Loop::kMaxConns || &loop->conns[conn.id] != &conn ||
-            conn.fd < 0 || config == nullptr || conn.state != ConnState::Proxying ||
-            conn.protocol != ConnProtocol::Http11 || conn.tls_active || conn.h2 != nullptr ||
-            conn.req_start_us == 0 || conn.epoch_held || conn.is_health_probe ||
-            conn.req_http_version != static_cast<u8>(HttpVersion::Http11) ||
+        if (loop == nullptr || conn.id >= connection_capacity_of(*loop) ||
+            &loop->conns[conn.id] != &conn || conn.fd < 0 || config == nullptr ||
+            conn.state != ConnState::Proxying || conn.protocol != ConnProtocol::Http11 ||
+            conn.tls_active || conn.h2 != nullptr || conn.req_start_us == 0 || conn.epoch_held ||
+            conn.is_health_probe || conn.req_http_version != static_cast<u8>(HttpVersion::Http11) ||
             !conn.req_strict_h1_complete || conn.req_client_has_transfer_encoding ||
             conn.req_client_has_te || conn.req_client_has_expect ||
             conn.req_client_has_upgrade_header || conn.req_malformed || conn.req_wants_upgrade ||

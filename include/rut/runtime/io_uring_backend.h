@@ -2,8 +2,10 @@
 
 #include "core/expected.h"
 #include "rut/common/types.h"
+#include "rut/runtime/connection_capacity.h"
 #include "rut/runtime/error.h"
 #include "rut/runtime/io_backend.h"
+#include "rut/runtime/mapped_array.h"
 #include <atomic>
 
 #include <errno.h>
@@ -78,7 +80,7 @@ struct IoUringBackend {
     // Outstanding partial-send state per connection.
     // When IORING_OP_SEND completes partially, wait() re-submits the remainder.
     // Only emits Send completion when all bytes are sent (or error).
-    static constexpr u32 kMaxSendState = 16384;
+    static constexpr u32 kMaxSendState = kDefaultConnectionCapacity;
     struct SendState {
         const u8* src;
         i32 fd;
@@ -88,8 +90,12 @@ struct IoUringBackend {
         u32 upstream_episode;
         u32 generation = 0;
     };
-    SendState send_state[kMaxSendState];
-    SendState upstream_send_state[kMaxSendState];
+    MappedArray<SendState> send_state;
+    MappedArray<SendState> upstream_send_state;
+    u32 connection_capacity = 0;
+
+    core::Expected<void, Error> init_send_state_storage(u32 capacity);
+    void destroy_send_state_storage();
 
     // Pending SQE count (for submission)
     u32 pending = 0;
@@ -130,7 +136,9 @@ struct IoUringBackend {
     // --- Interface methods ---
 
     // Initialize the io_uring instance for this shard.
-    core::Expected<void, Error> init(u32 shard_id, i32 listen_fd);
+    core::Expected<void, Error> init(u32 shard_id,
+                                     i32 listen_fd,
+                                     u32 capacity = kDefaultConnectionCapacity);
 
     // Submit a multishot accept on the listen socket.
     void add_accept();
