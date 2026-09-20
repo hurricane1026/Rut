@@ -6104,6 +6104,7 @@ struct ScopedTlsRawSendLoop {
     }
 };
 
+#if RUT_ENABLE_WEBSOCKET
 struct TlsMemoryClientPeer {
     SSL_CTX* ctx = nullptr;
     SSL* ssl = nullptr;
@@ -6160,6 +6161,7 @@ bool tls_engine_handshake_with_memory_client(TlsEngine& engine, SSL* client) {
     }
     return client_done && engine.handshake_done;
 }
+#endif  // RUT_ENABLE_WEBSOCKET
 
 struct ScopedTlsOutMmap {
     u8* data = nullptr;
@@ -6419,6 +6421,7 @@ TEST(tls_iouring, failed_raw_submit_is_atomic_and_encrypted_live_owner_blocks_re
     CHECK_EQ(loop.free_top, 1u);
 }
 
+#if RUT_ENABLE_WEBSOCKET
 TEST(tls_iouring, ws_send_sq_full_closes_the_connection_once_after_encryption) {
     auto context_result = create_tls_server_context(RUT_TESTDATA_DIR "/localhost_cert.pem",
                                                     RUT_TESTDATA_DIR "/localhost_key.pem");
@@ -6473,6 +6476,7 @@ TEST(tls_iouring, ws_send_sq_full_closes_the_connection_once_after_encryption) {
     CHECK_EQ(loop.free_stack[0], 0u);
     CHECK_EQ(guard.sq_tail, 1u);
 }
+#endif  // RUT_ENABLE_WEBSOCKET
 
 TEST(tls_iouring, current_token_bad_raw_identity_fails_closed_before_logical_completion) {
     enum class Corruption : u8 { Fd, Source, Length, BackendGeneration, Callback, Aux };
@@ -6693,7 +6697,11 @@ TEST(tls_iouring, f_more_transfers_raw_generation_to_close_ledger_in_either_drai
 }
 
 TEST(tls_iouring, logical_want_read_close_submits_only_recv_cancel_and_reclaims_in_both_orders) {
+#if RUT_ENABLE_WEBSOCKET
     for (const bool close_through_ws_consumer : {false, true}) {
+#else
+    for (u8 direct_close_case = 0; direct_close_case < 1; direct_close_case++) {
+#endif
         for (const bool cancel_first : {false, true}) {
             ScopedTlsRawSendLoop guard;
             REQUIRE(guard.init());
@@ -6718,6 +6726,7 @@ TEST(tls_iouring, logical_want_read_close_submits_only_recv_cancel_and_reclaims_
             conn.tls_send_off = 0;  // parked logical owner, with no raw ciphertext target
             conn.tls_pending_on_send = &tls_pending_send_probe;
 
+#if RUT_ENABLE_WEBSOCKET
             if (close_through_ws_consumer) {
                 static constexpr u8 kUpstreamData[] = "websocket";
                 u8 upstream_storage[64];
@@ -6733,6 +6742,9 @@ TEST(tls_iouring, logical_want_read_close_submits_only_recv_cancel_and_reclaims_
             } else {
                 loop.close_conn(conn);
             }
+#else
+            loop.close_conn(conn);
+#endif
             const Connection& closed = loop.conns[0];
             CHECK_EQ(closed.response_read_deadline_send_close_generation, 0u);
             CHECK_FALSE(closed.response_read_deadline_send_close_target_owned);
@@ -31108,9 +31120,18 @@ void drain_prebuilt_d2_retirement(IoUringEventLoop* loop,
 
 void cleanup_prebuilt_d2(IoUringEventLoop* loop, PrebuiltD2Fixture& fixture) {
     if (loop == nullptr || fixture.conn == nullptr) return;
+    Connection& conn = *fixture.conn;
+    if (conn.fd < 0) {
+        // A test may already have closed this connection while synthetic recv
+        // owners are still represented in pending_free. Preserve that ledger;
+        // resetting it and closing again would free the same slot twice.
+        if (fixture.peer_fd >= 0) close(fixture.peer_fd);
+        fixture.peer_fd = -1;
+        fixture.conn = nullptr;
+        return;
+    }
     __atomic_store_n(loop->backend.sq_tail, fixture.sq_tail_before, __ATOMIC_RELEASE);
     loop->backend.pending = fixture.backend_pending_before;
-    Connection& conn = *fixture.conn;
     conn.recv_armed = false;
     conn.send_armed = false;
     conn.upstream_connect_armed = false;
@@ -53348,13 +53369,69 @@ TEST(response_buffering_runtime,
             if (conn.http1_boundary_ready) loop->resume_deferred_http1_boundaries();
         }
         if (downstream_close) {
-            CHECK_EQ(loop->conns[id].fd, -1);
+            const Connection& closed = loop->conns[id];
+            CHECK_EQ(closed.fd, -1);
+            const i32 closed_fd_before_cleanup = closed.fd;
+            const u32 pending_ops_before_cleanup = closed.pending_ops;
+            const u32 upstream_retiring_episode_before_cleanup = closed.upstream_retiring_episode;
+            const bool upstream_retirement_active_before_cleanup =
+                closed.upstream_retirement_active;
+            const u8 upstream_retirement_target_before_cleanup =
+                closed.upstream_retirement_target_owned;
+            const u8 upstream_retirement_cancel_before_cleanup =
+                closed.upstream_retirement_cancel_owned;
+            const u32 upstream_close_episode_before_cleanup = closed.upstream_close_episode;
+            const u8 upstream_close_target_before_cleanup = closed.upstream_close_target_owned;
+            const u8 upstream_close_cancel_before_cleanup = closed.upstream_close_cancel_owned;
+            const bool upstream_close_pause_cancel_before_cleanup =
+                closed.upstream_close_pause_cancel_owned;
+            const u32 send_close_generation_before_cleanup =
+                closed.response_read_deadline_send_close_generation;
+            const bool send_close_target_before_cleanup =
+                closed.response_read_deadline_send_close_target_owned;
+            const bool send_close_cancel_before_cleanup =
+                closed.response_read_deadline_send_close_cancel_owned;
+            const u32 pending_free_before_cleanup = loop->pending_free_count;
+            const u32 free_top_before_cleanup = loop->free_top;
+            u32 id_occurrences_before_cleanup = 0;
+            for (u32 i = 0; i < pending_free_before_cleanup && i < loop->connection_capacity; ++i) {
+                if (loop->pending_free[i] == id) ++id_occurrences_before_cleanup;
+            }
+            CHECK_EQ(id_occurrences_before_cleanup, 1u);
+            CHECK_GT(pending_ops_before_cleanup, 0u);
+            cleanup_prebuilt_d2(loop, fixture);
+            CHECK_EQ(loop->pending_free_count, pending_free_before_cleanup);
+            CHECK_EQ(loop->free_top, free_top_before_cleanup);
+            CHECK_EQ(closed.fd, closed_fd_before_cleanup);
+            CHECK_EQ(closed.pending_ops, pending_ops_before_cleanup);
+            CHECK_EQ(closed.upstream_retiring_episode, upstream_retiring_episode_before_cleanup);
+            CHECK_EQ(closed.upstream_retirement_active, upstream_retirement_active_before_cleanup);
+            CHECK_EQ(closed.upstream_retirement_target_owned,
+                     upstream_retirement_target_before_cleanup);
+            CHECK_EQ(closed.upstream_retirement_cancel_owned,
+                     upstream_retirement_cancel_before_cleanup);
+            CHECK_EQ(closed.upstream_close_episode, upstream_close_episode_before_cleanup);
+            CHECK_EQ(closed.upstream_close_target_owned, upstream_close_target_before_cleanup);
+            CHECK_EQ(closed.upstream_close_cancel_owned, upstream_close_cancel_before_cleanup);
+            CHECK_EQ(closed.upstream_close_pause_cancel_owned,
+                     upstream_close_pause_cancel_before_cleanup);
+            CHECK_EQ(closed.response_read_deadline_send_close_generation,
+                     send_close_generation_before_cleanup);
+            CHECK_EQ(closed.response_read_deadline_send_close_target_owned,
+                     send_close_target_before_cleanup);
+            CHECK_EQ(closed.response_read_deadline_send_close_cancel_owned,
+                     send_close_cancel_before_cleanup);
+            u32 id_occurrences_after_cleanup = 0;
+            for (u32 i = 0; i < loop->pending_free_count && i < loop->connection_capacity; ++i) {
+                if (loop->pending_free[i] == id) ++id_occurrences_after_cleanup;
+            }
+            CHECK_EQ(id_occurrences_after_cleanup, id_occurrences_before_cleanup);
         } else {
             REQUIRE_GE(loop->conns[id].fd, 0);
             CHECK_EQ(loop->conns[id].state, ConnState::ReadingHeader);
             CHECK(loop->conns[id].response_read_deadline_owner_is_neutral());
+            cleanup_prebuilt_d2(loop, fixture);
         }
-        cleanup_prebuilt_d2(loop, fixture);
     }
 }
 
