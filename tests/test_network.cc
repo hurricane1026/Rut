@@ -3106,6 +3106,49 @@ TEST(response_read_deadline, bodyless_complete_owner_preserves_transparent_id0) 
         conn, conn.response_read_deadline_upload));
 }
 
+TEST(request_metadata, single_parse_fragment_admission_and_malformed_fallback) {
+    Connection conn{};
+    u8 storage[512]{};
+    conn.bind_request_receive_buffer(storage, sizeof(storage));
+    conn.req_metadata_episode = 9;
+    conn.req_method = static_cast<u8>(LogHttpMethod::Head);
+    conn.resp_status = 202;
+    conn.resp_body_sent = 19;
+    const char first[] = "POST /upload?part=1 HTTP/1.1\r\nHost: x\r\nContent-Length: 3\r\n";
+    REQUIRE_EQ(conn.recv_buf.write(reinterpret_cast<const u8*>(first), sizeof(first) - 1u),
+               sizeof(first) - 1u);
+    CHECK(parse_and_capture_request_metadata(conn) == ParseStatus::Incomplete);
+    CHECK_EQ(conn.req_metadata_episode, 9u);
+    CHECK_EQ(conn.req_method, static_cast<u8>(LogHttpMethod::Head));
+    CHECK_EQ(conn.resp_status, 202u);
+    CHECK_EQ(conn.resp_body_sent, 19u);
+    const char tail[] = "\r\nabcNEXT";
+    REQUIRE_EQ(conn.recv_buf.write(reinterpret_cast<const u8*>(tail), sizeof(tail) - 1u),
+               sizeof(tail) - 1u);
+    REQUIRE(parse_and_capture_request_metadata(conn) == ParseStatus::Complete);
+    CHECK_EQ(conn.req_metadata_episode, 10u);
+    CHECK_EQ(conn.resp_status, 0u);
+    CHECK_EQ(conn.resp_body_sent, 0u);
+    CHECK(conn.req_strict_h1_complete);
+    CHECK_EQ(conn.req_method, static_cast<u8>(LogHttpMethod::Post));
+    CHECK_EQ(conn.req_content_length, 3u);
+    CHECK_EQ(conn.req_initial_send_len, conn.recv_buf.len() - 4u);
+    const auto witness = conn.checked_raw_request_target();
+    REQUIRE(witness.state == RawRequestTargetWitnessState::Valid);
+    CHECK(witness.target.eq(lit_str("/upload?part=1")));
+    conn.reset_request_receive_buffer();
+    const char bad[] = "GET /bad HTTP/1.1\r\nBroken\r\n\r\n";
+    REQUIRE_EQ(conn.recv_buf.write(reinterpret_cast<const u8*>(bad), sizeof(bad) - 1u),
+               sizeof(bad) - 1u);
+    REQUIRE(parse_and_capture_request_metadata(conn) == ParseStatus::Error);
+    CHECK_EQ(conn.req_metadata_episode, 11u);
+    CHECK_FALSE(conn.req_strict_h1_complete);
+    CHECK_EQ(conn.req_header_end, 0u);
+    CHECK_EQ(conn.req_method, static_cast<u8>(LogHttpMethod::Get));
+    CHECK_EQ(strcmp(conn.req_path, "/bad"), 0);
+    CHECK(conn.checked_raw_request_target().state == RawRequestTargetWitnessState::Neutral);
+}
+
 TEST(request_policy, content_length_after_host_exact_wire_and_fail_closed_boundaries) {
     static constexpr u16 kLegacy = static_cast<u16>(RequestPolicyId::Http11FixedStrip);
     static constexpr u16 kAfterHost =
