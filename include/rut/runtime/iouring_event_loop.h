@@ -180,7 +180,8 @@ public:
     // the run loop consumes this after the complete wait batch.
     bool http1_boundary_ready_pending;
     bool response_read_deadline_expiry_pending;
-    bool response_read_deadline_body_pump_pending;
+    bool response_read_deadline_body_pump_pending = false;
+    MappedArray<u64> body_pump_ready_words;
 
     enum class CompleteContentLengthTerminalDisposition : u8 {
         CompleteBody,
@@ -249,6 +250,7 @@ public:
             return connection_capacity == capacity
                        ? core::Expected<void, Error>{}
                        : core::make_unexpected(Error::make(EINVAL, Error::Source::Mmap));
+        response_read_deadline_body_pump_pending = false;
         auto c = conns.init(capacity);
         if (!c) return core::make_unexpected(c.error());
         auto f = free_stack.init(capacity);
@@ -269,6 +271,14 @@ public:
             conns.destroy();
             return core::make_unexpected(b.error());
         }
+        auto ready_words = body_pump_ready_words.init((capacity + 63u) / 64u);
+        if (!ready_words) {
+            backend.destroy_send_state_storage();
+            pending_free.destroy();
+            free_stack.destroy();
+            conns.destroy();
+            return core::make_unexpected(ready_words.error());
+        }
         for (u32 i = 0; i < capacity; i++) {
             conns[i].reset();
             conns[i].id = i;
@@ -278,6 +288,7 @@ public:
         }
         free_top = capacity;
         pending_free_count = 0;
+        response_read_deadline_body_pump_pending = false;
         connection_capacity = capacity;
         return {};
     }
@@ -286,6 +297,8 @@ public:
         connection_capacity = 0;
         pending_free_count = 0;
         free_top = 0;
+        response_read_deadline_body_pump_pending = false;
+        body_pump_ready_words.destroy();
         backend.destroy_send_state_storage();
         pending_free.destroy();
         free_stack.destroy();
@@ -3849,7 +3862,11 @@ public:
     }
 
     void defer_response_read_deadline_body_pump(Connection& c) {
+        if (c.id >= connection_capacity || conns.data() == nullptr || &conns[c.id] != &c ||
+            body_pump_ready_words.data() == nullptr)
+            return;
         c.response_read_deadline_post_commit_pump_pending = true;
+        body_pump_ready_words[c.id >> 6] |= u64{1} << (c.id & 63u);
         response_read_deadline_body_pump_pending = true;
     }
 
@@ -4458,15 +4475,43 @@ public:
         }
     }
 
-    void pump_response_read_deadline_bodies() {
+private:
+    template <typename Callback>
+    void drain_response_read_deadline_body_pump_ready(Callback&& callback) {
         if (!response_read_deadline_body_pump_pending) return;
         response_read_deadline_body_pump_pending = false;
-        for (u32 id = 0; id < connection_capacity; ++id) {
-            Connection& c = conns[id];
-            if (!c.response_read_deadline_post_commit_pump_pending) continue;
-            c.response_read_deadline_post_commit_pump_pending = false;
-            if (c.fd >= 0) pump_response_read_deadline_body<Self>(this, c);
+        for (u32 word_index = 0; word_index < body_pump_ready_words.size(); ++word_index) {
+            u64 remaining_mask = ~u64{0};
+            while (remaining_mask != 0) {
+                const u64 ready = body_pump_ready_words[word_index] & remaining_mask;
+                if (ready == 0) break;
+                const u32 bit = static_cast<u32>(__builtin_ctzll(ready));
+                const u32 id = word_index * 64u + bit;
+                const u64 bit_mask = u64{1} << bit;
+                body_pump_ready_words[word_index] &= ~bit_mask;
+                remaining_mask = bit == 63u ? 0 : (~u64{0} << (bit + 1u));
+
+                if (id >= connection_capacity) continue;
+                Connection& c = conns[id];
+                if (!c.response_read_deadline_post_commit_pump_pending) continue;
+                c.response_read_deadline_post_commit_pump_pending = false;
+                if (c.fd >= 0) callback(c);
+            }
         }
+    }
+
+#ifdef RUT_TESTING
+public:
+    template <typename Callback>
+    void test_drain_response_read_deadline_body_pump_ready(Callback&& callback) {
+        drain_response_read_deadline_body_pump_ready(static_cast<Callback&&>(callback));
+    }
+#endif
+
+public:
+    void pump_response_read_deadline_bodies() {
+        drain_response_read_deadline_body_pump_ready(
+            [this](Connection& c) { pump_response_read_deadline_body<Self>(this, c); });
     }
 
     // Public deterministic seam used by the production run loop and focused
