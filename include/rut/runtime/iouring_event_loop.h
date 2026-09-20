@@ -84,6 +84,37 @@ private:
     std::atomic<u32> drain_period_;
 
 private:
+    template <typename Submit>
+    [[nodiscard]] bool submit_staged_tls_local_response_impl(Connection& c,
+                                                             const u8* src,
+                                                             u32 len,
+                                                             Submit&& submit) {
+        const bool staged_in_response_header_buf =
+            src == c.response_header_buf.data() && len == c.response_header_buf.len() && len != 0;
+        if (c.id >= connection_capacity || c.fd < 0 || src == nullptr ||
+            !staged_in_response_header_buf || !c.uses_iouring_tls() || !c.tls_handshake_complete ||
+            !c.tls_engine.handshake_done || c.protocol != ConnProtocol::Http11 || c.h2 != nullptr ||
+            c.state != ConnState::Sending ||
+            c.on_send != &on_validated_preconnect_failure_sent<IoUringEventLoop> ||
+            c.resp_status != kStatusBadGateway || c.resp_body_mode != BodyMode::None ||
+            c.resp_body_remaining != 0 || c.upstream_fd >= 0 || !c.upstream_abandoned ||
+            c.send_armed || backend.send_state[c.id].remaining != 0 ||
+            !c.response_read_deadline_owner_is_neutral() ||
+            !c.http1_prebuilt_response_proof_is_neutral() ||
+            !c.tls_single_shot_send_owner_is_neutral() || !c.tls_raw_send_owner_is_neutral() ||
+            c.tls_in_buf.len() != 0 || c.tls_out_buf.len() != 0 || c.tls_proxy_stream ||
+            c.upstream_send_len != 0 || c.upstream_send_armed || c.on_upstream_send != nullptr ||
+            backend.upstream_send_state[c.id].remaining != 0 || c.retry_req_send_len != 0 ||
+            c.pipeline_stash_len != 0 || c.response_mutations_snapshotted ||
+            c.upstream_request_incomplete || backend.failure_code() != 0)
+            return false;
+
+        // SSL_write consumes the staged plaintext before the ciphertext SQE
+        // can be rejected. Make one submission attempt only; its failure is
+        // terminal and must be observed by the caller without a second close.
+        return submit();
+    }
+
     template <typename Submit, typename FlushResult>
     [[nodiscard]] bool submit_staged_local_response_impl(
         Connection& c, const u8* src, u32 len, Submit&& submit, FlushResult&& flush_result) {
@@ -1334,16 +1365,14 @@ private:
     }
 
 public:
-    // Queue an already-built immutable cleartext local response that owns the
-    // whole response_header_buf. This helper is intentionally narrower than
-    // client_send(): every response-deadline owner and every upstream-send or
-    // request-snapshot owner must already be neutral. It does not serialize,
-    // select policy, advance throttling, enter TLS, or participate in the
-    // response-deadline Send-generation namespace. On initial SQ exhaustion it
-    // performs one nonblocking flush and retries exactly once. Both failed
-    // attempts leave downstream send ownership unpublished, so a caller can
-    // fail closed without preserving a deferred response marker.
+    // Queue an already-built immutable local failure response. Cleartext uses
+    // the private staged helper's single flush/retry; TLS has a separate
+    // one-shot path because SSL_write consumes plaintext before ciphertext
+    // submission and therefore cannot safely retry after SQ exhaustion.
     [[nodiscard]] bool submit_staged_local_response(Connection& c, const u8* src, u32 len) {
+        if (c.tls_active)
+            return submit_staged_tls_local_response_impl(
+                c, src, len, [&]() { return submit_send_impl(c, src, len); });
         return submit_staged_local_response_impl(
             c,
             src,

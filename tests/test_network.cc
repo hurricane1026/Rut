@@ -6104,6 +6104,35 @@ struct ScopedTlsRawSendLoop {
     }
 };
 
+struct ScopedTlsRawSendPool {
+    IoUringEventLoop* loop = nullptr;
+    bool initialized = false;
+
+    bool init(IoUringEventLoop& event_loop, u32 capacity) {
+        loop = &event_loop;
+        initialized = loop->pool.init(capacity).has_value();
+        return initialized;
+    }
+
+    ~ScopedTlsRawSendPool() {
+        if (!initialized || loop == nullptr) return;
+        for (u32 i = 0; i < loop->connection_capacity; ++i) {
+            Connection& conn = loop->conns[i];
+            if (conn.tls_engine.ssl) tls_engine_free(conn.tls_engine);
+            loop->free_tls_in_buf(conn);
+            loop->free_tls_out_buf(conn);
+            if (conn.recv_slice) loop->pool.free(conn.recv_slice);
+            if (conn.send_slice) loop->pool.free(conn.send_slice);
+            if (conn.upstream_recv_slice) loop->pool.free(conn.upstream_recv_slice);
+            if (conn.response_header_slice) loop->pool.free(conn.response_header_slice);
+            if (conn.fd >= 0) ::close(conn.fd);
+            if (conn.upstream_fd >= 0) ::close(conn.upstream_fd);
+            conn.reset();
+        }
+        loop->pool.destroy();
+    }
+};
+
 struct TlsMemoryClientPeer {
     SSL_CTX* ctx = nullptr;
     SSL* ssl = nullptr;
@@ -6376,6 +6405,100 @@ TEST(connection_base, tls_send_owners_reset_and_share_nonwrapping_tokens) {
     CHECK_EQ(untouched, 77u);
     CHECK_FALSE(conn.next_response_read_deadline_send_generation());
     CHECK_EQ(conn.response_read_deadline_send_owner_generation, 0u);
+}
+
+TEST(tls_iouring, staged_502_uses_one_shot_ciphertext_submit_and_terminal_completion) {
+    auto context_result = create_tls_server_context(RUT_TESTDATA_DIR "/localhost_cert.pem",
+                                                    RUT_TESTDATA_DIR "/localhost_key.pem");
+    REQUIRE(context_result.has_value());
+    std::unique_ptr<TlsServerContext, decltype(&destroy_tls_server_context)> context(
+        context_result.value(), destroy_tls_server_context);
+    ScopedTlsRawSendLoop guard;
+    REQUIRE(guard.init(/*capacity=*/2));
+    IoUringEventLoop& loop = *guard.loop;
+    ScopedTlsRawSendPool pool_guard;
+    REQUIRE(pool_guard.init(loop, /*capacity=*/12));
+    loop.tls_server = context.get();
+    ShardMetrics metrics{};
+    metrics.init();
+    loop.metrics = &metrics;
+    static constexpr u8 kResponse[] =
+        "HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+
+    auto prepare = [&](TlsMemoryClientPeer& client) -> Connection* {
+        Connection* conn = loop.alloc_conn();
+        if (conn == nullptr) return nullptr;
+        conn->fd = dup(STDERR_FILENO);
+        if (conn->fd < 0 || !loop.tls_setup(*conn) || !client.init() ||
+            !tls_engine_handshake_with_memory_client(conn->tls_engine, client.ssl) ||
+            !loop.alloc_response_header_buf(*conn) ||
+            conn->response_header_buf.write(kResponse, sizeof(kResponse) - 1u) !=
+                sizeof(kResponse) - 1u)
+            return nullptr;
+        conn->tls_handshake_complete = true;
+        conn->protocol = ConnProtocol::Http11;
+        conn->req_start_us = monotonic_us();
+        conn->resp_status = kStatusBadGateway;
+        conn->resp_body_mode = BodyMode::None;
+        conn->resp_body_remaining = 0;
+        conn->keep_alive = false;
+        conn->upstream_fd = -1;
+        conn->upstream_abandoned = true;
+        conn->transition_to_sending(&on_validated_preconnect_failure_sent<IoUringEventLoop>);
+        return conn;
+    };
+
+    TlsMemoryClientPeer successful_client;
+    Connection* successful = prepare(successful_client);
+    REQUIRE(successful != nullptr);
+    const u32 conn_id = successful->id;
+    const u32 tail_before = guard.sq_tail;
+    REQUIRE(loop.submit_staged_local_response(*successful,
+                                              successful->response_header_buf.data(),
+                                              successful->response_header_buf.len()));
+    REQUIRE(successful->tls_send_owner_generation != 0);
+    REQUIRE(successful->tls_out_inflight);
+    CHECK_EQ(successful->pending_ops, 1u);
+    CHECK_EQ(guard.sq_tail, tail_before + 1u);
+    CHECK_EQ(loop.backend.pending, 1u);
+    CHECK_EQ(successful->tls_pending_on_send,
+             &on_validated_preconnect_failure_sent<IoUringEventLoop>);
+    const u32 raw_generation = successful->tls_out_inflight_generation;
+    const u32 cipher_len = successful->tls_out_inflight_len;
+    REQUIRE_GT(cipher_len, 0u);
+    loop.backend.send_state[conn_id].offset = cipher_len;
+    loop.backend.send_state[conn_id].remaining = 0;
+    guard.sq_head = guard.sq_tail;
+    loop.backend.pending = 0;
+    CHECK_EQ(metrics.requests_total, 0u);
+    loop.dispatch(tls_send_event(conn_id, static_cast<i32>(cipher_len), raw_generation));
+    CHECK_EQ(successful->fd, -1);
+    CHECK_EQ(successful->pending_ops, 0u);
+    CHECK_EQ(loop.free_top, 2u);
+    CHECK_EQ(metrics.requests_total, 1u);
+    loop.dispatch(tls_send_event(conn_id, static_cast<i32>(cipher_len), raw_generation));
+    CHECK_EQ(metrics.requests_total, 1u);
+    CHECK_EQ(loop.free_top, 2u);
+
+    TlsMemoryClientPeer full_client;
+    Connection* full = prepare(full_client);
+    REQUIRE(full != nullptr);
+    const u32 full_id = full->id;
+    guard.sq_head = 0;
+    guard.sq_tail = loop.backend.sq_ring_entries;
+    loop.backend.pending = loop.backend.sq_ring_entries;
+    const u32 full_tail = guard.sq_tail;
+    CHECK_FALSE(loop.submit_staged_local_response(
+        *full, full->response_header_buf.data(), full->response_header_buf.len()));
+    // SSL_write consumed the response, so SQ pressure is terminal: no flush,
+    // second attempt, raw target, or retained slot may follow.
+    CHECK_EQ(full->fd, -1);
+    CHECK_EQ(full->pending_ops, 0u);
+    CHECK_EQ(guard.sq_tail, full_tail);
+    CHECK_EQ(loop.backend.pending, loop.backend.sq_ring_entries);
+    CHECK_EQ(metrics.requests_total, 1u);
+    CHECK_EQ(loop.free_top, 2u);
+    CHECK_EQ(loop.conns[full_id].fd, -1);
 }
 
 TEST(tls_iouring, strict_completion_validator_authenticates_tls_logical_tombstones) {

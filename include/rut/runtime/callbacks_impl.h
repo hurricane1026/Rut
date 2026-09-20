@@ -975,8 +975,6 @@ template <typename Loop>
 inline void respond_validated_connect_completion_failure(Loop* loop,
                                                          Connection& conn,
                                                          const IoEvent& ev);
-template <typename Loop>
-void on_validated_preconnect_failure_sent(void* lp, Connection& conn, IoEvent ev);
 void prepare_early_response_state(Connection& conn);
 u32 consume_upstream_sent(Connection& conn);
 
@@ -9331,7 +9329,9 @@ template <typename Loop>
 inline void respond_validated_preconnect_failure(Loop* loop,
                                                  Connection& conn,
                                                  ValidatedPreconnectFailureSite site) {
-    const auto fail_closed = [&]() { loop->close_conn(conn); };
+    const auto fail_closed = [&]() {
+        if (conn.fd >= 0) loop->close_conn(conn);
+    };
     if (!validated_preconnect_failure_owner_is_stable(loop, conn, site)) {
         fail_closed();
         return;
@@ -9408,7 +9408,9 @@ template <typename Loop>
 inline void respond_validated_connect_completion_failure(Loop* loop,
                                                          Connection& conn,
                                                          const IoEvent& ev) {
-    const auto fail_closed = [&]() { loop->close_conn(conn); };
+    const auto fail_closed = [&]() {
+        if (conn.fd >= 0) loop->close_conn(conn);
+    };
     if (!validated_connect_completion_failure_owner_is_stable(loop, conn, ev)) {
         fail_closed();
         return;
