@@ -1,6 +1,6 @@
 # Portable targets are registered in CMakeLists.txt on both platforms.
 add_executable(test_kqueue test_kqueue.cc)
-target_link_libraries(test_kqueue PRIVATE rut_runtime)
+target_link_libraries(test_kqueue PRIVATE rut_test_fault rut_runtime)
 target_include_directories(test_kqueue PRIVATE ${PROJECT_SOURCE_DIR}/testing)
 add_test(NAME test_kqueue COMMAND test_kqueue)
 set_tests_properties(test_kqueue PROPERTIES LABELS "unit;macos" TIMEOUT 120)

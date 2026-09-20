@@ -1,3 +1,4 @@
+#include "fault_injection.h"
 #include "rut/platform/socket.h"
 #include "rut/runtime/kqueue_backend.h"
 #include "test.h"
@@ -214,6 +215,78 @@ TEST(kqueue, upstream_episode_detach_and_reuse) {
     REQUIRE_EQ(b.wait(&event, 1, &conn, 1), 1u);
     CHECK_EQ(event.upstream_episode, conn.upstream_episode);
     CHECK_EQ(event.result, 1);
+}
+
+TEST(kqueue, failed_detach_closes_before_retiring_episode) {
+    Backend backend;
+    REQUIRE(backend.init());
+    Pair pair;
+    REQUIRE(pair.init());
+    auto& b = *backend.value;
+    Connection conn{};
+    conn.reset();
+    conn.id = 0;
+    conn.upstream_fd = pair.fd[0];
+    const u32 episode = conn.upstream_episode;
+    REQUIRE(b.begin_upstream_episode(0, episode));
+    REQUIRE(b.add_recv_upstream(pair.fd[0], 0, episode));
+    // Leave the real queue alive while forcing both filter deletions to fail.
+    const int queue = b.kqueue_fd;
+    b.kqueue_fd = -1;
+    int detached_fd = -1;
+    const bool detached = b.detach_upstream(conn, &detached_fd);
+    b.kqueue_fd = queue;
+    CHECK(!detached);
+    CHECK_EQ(detached_fd, -1);
+    CHECK_EQ(fcntl(pair.fd[0], F_GETFD), -1);
+    CHECK_EQ(errno, EBADF);
+    pair.fd[0] = -1;  // The backend consumed the descriptor.
+    CHECK_EQ(conn.upstream_fd, -1);
+    CHECK_NE(conn.upstream_episode, episode);
+    CHECK_EQ(b.active_upstream_episode[0], 0u);
+    CHECK(b.begin_upstream_episode(0, conn.upstream_episode));
+}
+
+TEST(kqueue, failed_detach_and_close_quarantines_episode) {
+    Backend backend;
+    REQUIRE(backend.init());
+    Pair pair;
+    REQUIRE(pair.init());
+    auto& b = *backend.value;
+    Connection conn{};
+    conn.reset();
+    conn.id = 0;
+    conn.upstream_fd = pair.fd[0];
+    const u32 episode = conn.upstream_episode;
+    REQUIRE(b.begin_upstream_episode(0, episode));
+    REQUIRE(b.add_recv_upstream(pair.fd[0], 0, episode));
+    REQUIRE_EQ(write(pair.fd[1], "x", 1), 1);
+    REQUIRE(ready(b));
+    auto fault = test_fault::io_fault_for_fd(pair.fd[0]);
+    fault.close_errno = EINTR;
+    fault.close_failures = 1;
+    int detached_fd = -1;
+    bool detached;
+    {
+        test_fault::ScopedIoFault scope(fault);
+        const int queue = b.kqueue_fd;
+        b.kqueue_fd = -1;
+        detached = b.detach_upstream(conn, &detached_fd);
+        b.kqueue_fd = queue;
+    }
+    CHECK(!detached);
+    CHECK_EQ(detached_fd, -1);
+    CHECK(fcntl(pair.fd[0], F_GETFD) >= 0);  // No retry after the injected close failure.
+    CHECK_EQ(conn.upstream_fd, -1);
+    CHECK_EQ(conn.upstream_episode, episode);
+    CHECK_EQ(b.active_upstream_episode[0], KqueueBackend::kUpstreamEpisodeExhausted);
+    CHECK(!b.detach_upstream(conn));  // A second, fd-less cleanup cannot clear quarantine.
+    CHECK(!b.begin_upstream_episode(0, episode + 1));
+    REQUIRE(ready(b));
+    IoEvent event;
+    CHECK_EQ(b.wait(&event, 1, &conn, 1), 0u);  // Reject the surviving kernel event.
+    b.quarantine_upstream_episode_on_slot_release(0);
+    CHECK_EQ(b.active_upstream_episode[0], KqueueBackend::kUpstreamEpisodeExhausted);
 }
 
 TEST(kqueue, eof_preserves_unread_bytes) {

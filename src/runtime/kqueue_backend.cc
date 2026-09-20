@@ -623,10 +623,22 @@ bool KqueueBackend::detach_upstream(Connection& conn, i32* detached_fd) {
     }
     conn.upstream_fd = -1;
     conn.upstream_recv_armed = conn.upstream_send_armed = false;
-    const bool retired = retire_upstream_episode_after_detach(conn, conn.upstream_episode);
+    // A failed filter deletion may leave kernel events live. Close before
+    // retiring ownership; never retry an indeterminate close or let a later
+    // fd-less detach release the quarantined slot.
+    bool fd_closed = false;
+    bool close_failed = false;
+    if (!detached && fd >= 0) {
+        fd_closed = true;
+        close_failed = close(fd) < 0;
+    }
+    if (close_failed && conn.id < kMaxFdMap)
+        active_upstream_episode[conn.id] = kUpstreamEpisodeExhausted;
+    const bool retired =
+        !close_failed && retire_upstream_episode_after_detach(conn, conn.upstream_episode);
     if (detached && retired && detached_fd)
         *detached_fd = fd;
-    else if (fd >= 0)
+    else if (fd >= 0 && !fd_closed)
         close(fd);
     return detached && retired;
 }
