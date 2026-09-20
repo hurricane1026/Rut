@@ -462,6 +462,8 @@ configure_file(
 )
 
 add_custom_target(test_tls_fixtures DEPENDS ${RUT_TLS_TEST_CERT} ${RUT_TLS_TEST_KEY})
+target_compile_definitions(test_network PRIVATE RUT_TESTDATA_DIR="${RUT_TLS_TESTDATA_DIR}")
+add_dependencies(test_network test_tls_fixtures)
 
 add_executable(test_integration
     test_integration.cc

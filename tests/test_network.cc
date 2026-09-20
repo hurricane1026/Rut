@@ -6012,6 +6012,210 @@ void tls_set_slots_recv_probe(void*, Connection&, IoEvent) {
 }
 
 void tls_set_slots_send_probe(void*, Connection&, IoEvent) {}
+
+u32 g_tls_reentrant_completion_calls = 0;
+u32 g_tls_reentrant_completion_result = 0;
+static constexpr u8 kTlsSuccessorSendPayload[] = "next";
+
+void tls_successor_send_probe(void*, Connection& conn, IoEvent ev) {
+    g_tls_reentrant_completion_calls++;
+    g_tls_reentrant_completion_result = static_cast<u32>(ev.result);
+    u32 generation = 0;
+    if (!conn.next_non_upstream_send_generation(generation)) return;
+    conn.tls_send_owner_generation = generation;
+    conn.tls_send_owner_fd = conn.fd;
+    conn.tls_send_owner_handler_generation = conn.handler_gen;
+    conn.tls_send_src = kTlsSuccessorSendPayload;
+    conn.tls_send_len = sizeof(kTlsSuccessorSendPayload) - 1u;
+    conn.tls_send_off = conn.tls_send_len;
+    conn.tls_pending_on_send = &tls_pending_send_probe;
+}
+
+void tls_close_on_send_probe(void* lp, Connection& conn, IoEvent ev) {
+    g_tls_reentrant_completion_calls++;
+    g_tls_reentrant_completion_result = static_cast<u32>(ev.result);
+    static_cast<IoUringEventLoop*>(lp)->close_conn(conn);
+}
+
+struct ScopedTlsRawSendLoop {
+    void* storage = MAP_FAILED;
+    IoUringEventLoop* loop = nullptr;
+    bool initialized = false;
+    u32 sq_head = 0;
+    u32 sq_tail = 0;
+    u32 sq_mask = 7;
+    u32 sq_array[8]{};
+    io_uring_sqe sq_entries[8]{};
+    u32 cq_head = 0;
+    u32 cq_tail = 0;
+    u32 cq_mask = 7;
+    io_uring_cqe cq_entries[8]{};
+
+    bool init(u32 capacity = 1) {
+        storage = mmap(nullptr,
+                       sizeof(IoUringEventLoop),
+                       PROT_READ | PROT_WRITE,
+                       MAP_PRIVATE | MAP_ANONYMOUS,
+                       -1,
+                       0);
+        if (storage == MAP_FAILED) return false;
+        loop = new (storage) IoUringEventLoop();
+        initialized = loop->init_slot_storage(capacity).has_value();
+        if (initialized) {
+            loop->timer.init();
+            auto& backend = loop->backend;
+            backend.sq_head = &sq_head;
+            backend.sq_tail = &sq_tail;
+            backend.sq_ring_mask = &sq_mask;
+            backend.sq_array = sq_array;
+            backend.sq_entries = sq_entries;
+            backend.sq_ring_entries = 8;
+            backend.cq_head = &cq_head;
+            backend.cq_tail = &cq_tail;
+            backend.cq_ring_mask = &cq_mask;
+            backend.cq_entries = cq_entries;
+            backend.cq_ring_entries = 8;
+        }
+        return initialized;
+    }
+
+    bool push_send_cqe(u32 generation, i32 result, u32 flags = 0) {
+        const u32 tail = __atomic_load_n(&cq_tail, __ATOMIC_RELAXED);
+        const u32 head = __atomic_load_n(&cq_head, __ATOMIC_ACQUIRE);
+        if (tail - head >= 8) return false;
+        io_uring_cqe& cqe = cq_entries[tail & cq_mask];
+        cqe.user_data = IoUringBackend::encode_user_data(0, IoEventType::Send, generation);
+        cqe.res = result;
+        cqe.flags = flags;
+        __atomic_store_n(&cq_tail, tail + 1, __ATOMIC_RELEASE);
+        return true;
+    }
+
+    ~ScopedTlsRawSendLoop() {
+        if (loop != nullptr) {
+            if (initialized) {
+                for (u32 i = 0; i < loop->connection_capacity; i++)
+                    loop->timer.remove(&loop->conns[i]);
+                loop->destroy_slot_storage();
+            }
+            loop->~IoUringEventLoop();
+        }
+        if (storage != MAP_FAILED) munmap(storage, sizeof(IoUringEventLoop));
+    }
+};
+
+#if RUT_ENABLE_WEBSOCKET
+struct TlsMemoryClientPeer {
+    SSL_CTX* ctx = nullptr;
+    SSL* ssl = nullptr;
+
+    ~TlsMemoryClientPeer() {
+        if (ssl) SSL_free(ssl);
+        if (ctx) SSL_CTX_free(ctx);
+    }
+
+    bool init() {
+        ctx = SSL_CTX_new(TLS_client_method());
+        if (!ctx) return false;
+        SSL_CTX_set_verify(ctx, SSL_VERIFY_NONE, nullptr);
+        ssl = SSL_new(ctx);
+        if (!ssl) return false;
+        BIO* rbio = BIO_new(BIO_s_mem());
+        BIO* wbio = BIO_new(BIO_s_mem());
+        if (!rbio || !wbio) {
+            if (rbio) BIO_free(rbio);
+            if (wbio) BIO_free(wbio);
+            return false;
+        }
+        SSL_set_bio(ssl, rbio, wbio);
+        SSL_set_connect_state(ssl);
+        return true;
+    }
+};
+
+bool tls_engine_handshake_with_memory_client(TlsEngine& engine, SSL* client) {
+    u8 client_to_server[16384];
+    u8 server_to_client[16384];
+    bool client_done = false;
+    for (u32 attempt = 0; attempt < 64 && !(client_done && engine.handshake_done); attempt++) {
+        if (!client_done) {
+            const int rc = SSL_do_handshake(client);
+            if (rc == 1) {
+                client_done = true;
+            } else {
+                const int error = SSL_get_error(client, rc);
+                if (error != SSL_ERROR_WANT_READ && error != SSL_ERROR_WANT_WRITE) return false;
+            }
+        }
+
+        int client_len = BIO_read(SSL_get_wbio(client), client_to_server, sizeof(client_to_server));
+        if (client_len < 0) client_len = 0;
+        tls_engine_set_input(engine, client_to_server, static_cast<u32>(client_len));
+        tls_engine_set_output(engine, server_to_client, sizeof(server_to_client));
+        if (tls_engine_handshake(engine) == TlsOp::Error) return false;
+        const u32 server_len = tls_engine_output_len(engine);
+        if (server_len > 0 &&
+            BIO_write(SSL_get_rbio(client), server_to_client, static_cast<int>(server_len)) !=
+                static_cast<int>(server_len))
+            return false;
+    }
+    return client_done && engine.handshake_done;
+}
+#endif  // RUT_ENABLE_WEBSOCKET
+
+struct ScopedTlsOutMmap {
+    u8* data = nullptr;
+
+    bool init() {
+        void* region = mmap(nullptr,
+                            IoUringEventLoop::kTlsOutBufCap,
+                            PROT_READ | PROT_WRITE,
+                            MAP_PRIVATE | MAP_ANONYMOUS,
+                            -1,
+                            0);
+        if (region == MAP_FAILED) return false;
+        data = static_cast<u8*>(region);
+        return true;
+    }
+
+    void relinquish() { data = nullptr; }
+
+    ~ScopedTlsOutMmap() {
+        if (data != nullptr) munmap(data, IoUringEventLoop::kTlsOutBufCap);
+    }
+};
+
+u32 stage_tls_raw_send_target(
+    IoUringEventLoop& loop, Connection& conn, const u8* ciphertext, u32 len, bool complete) {
+    u32 generation = 0;
+    if (!conn.next_non_upstream_send_generation(generation)) return 0;
+    conn.tls_active = true;
+    conn.tls_out_inflight = true;
+    conn.tls_out_inflight_len = len;
+    conn.tls_out_inflight_generation = generation;
+    conn.tls_out_inflight_fd = conn.fd;
+    conn.tls_out_inflight_src = ciphertext;
+    conn.send_armed = true;
+    conn.pending_ops++;
+    conn.on_send = &tls_on_out_drain<IoUringEventLoop>;
+    loop.backend.send_state[conn.id] = {ciphertext,
+                                        conn.fd,
+                                        complete ? len : 0u,
+                                        complete ? 0u : len,
+                                        IoEventType::Send,
+                                        0,
+                                        generation};
+    return generation;
+}
+
+IoEvent tls_send_event(u32 conn_id, i32 result, u32 generation) {
+    IoEvent ev = {};
+    ev.conn_id = conn_id;
+    ev.result = result;
+    ev.type = IoEventType::Send;
+    ev.non_upstream_generation = generation;
+    return ev;
+}
 }  // namespace
 
 TEST(connection_base, set_slots_redirects_recv_slot_for_iouring_tls) {
@@ -6035,6 +6239,49 @@ TEST(connection_base, set_slots_redirects_recv_slot_for_iouring_tls) {
     conn.tls_engine.ssl = nullptr;
 }
 
+TEST(connection_base, tls_send_owners_reset_and_share_nonwrapping_tokens) {
+    Connection conn;
+    conn.reset();
+    CHECK(conn.tls_single_shot_send_owner_is_neutral());
+    CHECK(conn.tls_raw_send_owner_is_neutral());
+
+    u32 raw_generation = 0;
+    u32 logical_generation = 0;
+    REQUIRE(conn.next_non_upstream_send_generation(raw_generation));
+    REQUIRE(conn.next_non_upstream_send_generation(logical_generation));
+    CHECK_NE(raw_generation, logical_generation);
+    CHECK_EQ(logical_generation, raw_generation + 1u);
+
+    conn.tls_send_owner_generation = logical_generation;
+    conn.tls_send_owner_fd = 17;
+    conn.tls_send_owner_handler_generation = 9;
+    conn.tls_send_src = reinterpret_cast<const u8*>("body");
+    conn.tls_send_len = 4;
+    conn.tls_send_off = 2;
+    conn.tls_pending_on_send = &tls_pending_send_probe;
+    Connection::visit_tls_single_shot_send_owner_fields(
+        conn, [](auto& value, const auto& reset_value) { value = reset_value; });
+    CHECK(conn.tls_single_shot_send_owner_is_neutral());
+
+    conn.tls_out_inflight = true;
+    conn.tls_out_inflight_len = 5;
+    conn.tls_out_inflight_generation = raw_generation;
+    conn.tls_out_inflight_fd = 17;
+    conn.tls_out_inflight_src = reinterpret_cast<const u8*>("cipher");
+    Connection::visit_tls_raw_send_owner_fields(
+        conn, [](auto& value, const auto& reset_value) { value = reset_value; });
+    CHECK(conn.tls_raw_send_owner_is_neutral());
+
+    conn.reset();
+    CHECK_EQ(conn.response_read_deadline_send_generation, logical_generation);
+    u32 untouched = 77;
+    conn.response_read_deadline_send_generation = kNonUpstreamSendGenerationMask;
+    CHECK_FALSE(conn.next_non_upstream_send_generation(untouched));
+    CHECK_EQ(untouched, 77u);
+    CHECK_FALSE(conn.next_response_read_deadline_send_generation());
+    CHECK_EQ(conn.response_read_deadline_send_owner_generation, 0u);
+}
+
 TEST(tls_engine, accessor_helpers_track_ciphertext_offsets) {
     TlsEngine engine;
     u8 in[16];
@@ -6053,30 +6300,36 @@ TEST(tls_engine, accessor_helpers_track_ciphertext_offsets) {
 }
 
 TEST(tls_iouring, drain_completion_invokes_saved_send_continuation) {
-    Connection conn;
-    u8 recv_storage[SmallLoop::kBufSize];
-    u8 send_storage[SmallLoop::kBufSize];
+    ScopedTlsRawSendLoop guard;
+    REQUIRE(guard.init());
+    IoUringEventLoop& loop = *guard.loop;
+    Connection& conn = loop.conns[0];
     u8 tls_out_storage[256];
+    static constexpr u8 kCiphertext[] = {0x17, 0x03, 0x03, 0x00, 0x04, 0xAA, 0xBB};
+    static constexpr u8 kPlaintext[] = "plain";
     conn.reset();
-    conn.id = 7;
+    conn.id = 0;
     conn.fd = 42;
-    conn.recv_slice = recv_storage;
-    conn.send_slice = send_storage;
-    conn.recv_buf.bind(recv_storage, SmallLoop::kBufSize);
-    conn.send_buf.bind(send_storage, SmallLoop::kBufSize);
     conn.tls_out_buf.bind(tls_out_storage, sizeof(tls_out_storage));
-    conn.tls_active = true;
-    conn.tls_out_inflight = true;
-    conn.tls_out_inflight_len = 0;  // ciphertext already drained; just complete
-    conn.tls_send_src = reinterpret_cast<const u8*>("plain");
+    REQUIRE_EQ(conn.tls_out_buf.write(kCiphertext, sizeof(kCiphertext)), sizeof(kCiphertext));
+    const u32 raw_generation =
+        stage_tls_raw_send_target(loop, conn, conn.tls_out_buf.data(), sizeof(kCiphertext), true);
+    REQUIRE_NE(raw_generation, 0u);
+    u32 logical_generation = 0;
+    REQUIRE(conn.next_non_upstream_send_generation(logical_generation));
+    conn.tls_send_owner_generation = logical_generation;
+    conn.tls_send_owner_fd = conn.fd;
+    conn.tls_send_owner_handler_generation = conn.handler_gen;
+    conn.tls_send_src = kPlaintext;
     conn.tls_send_len = 5;
     conn.tls_send_off = 5;  // fully encrypted — no parked remainder
     conn.tls_pending_on_send = &tls_pending_send_probe;
-    conn.on_send = &tls_on_out_drain<IoUringEventLoop>;
+    conn.recv_armed = true;  // no real recv target needed for this storage-only fixture
+    conn.pending_ops++;
     g_tls_pending_send_called = false;
     g_tls_pending_send_result = 0;
 
-    tls_on_out_drain<IoUringEventLoop>(nullptr, conn, make_ev(conn.id, IoEventType::Send, 9));
+    loop.dispatch(tls_send_event(conn.id, static_cast<i32>(sizeof(kCiphertext)), raw_generation));
 
     CHECK(g_tls_pending_send_called);
     CHECK_EQ(g_tls_pending_send_result, 5u);  // fires with the plaintext length
@@ -6084,6 +6337,563 @@ TEST(tls_iouring, drain_completion_invokes_saved_send_continuation) {
     CHECK(conn.tls_send_src == nullptr);
     CHECK_EQ(conn.tls_send_len, 0u);
     CHECK(conn.tls_pending_on_send == nullptr);
+    CHECK_EQ(conn.pending_ops, 1u);  // only the independently armed recv remains
+}
+
+TEST(tls_iouring, failed_raw_submit_is_atomic_and_encrypted_live_owner_blocks_replacement) {
+    ScopedTlsRawSendLoop guard;
+    REQUIRE(guard.init());
+    IoUringEventLoop& loop = *guard.loop;
+    Connection& conn = loop.conns[0];
+    u8 tls_out_storage[32];
+    static constexpr u8 kCiphertext[] = {0x17, 0x03, 0x03, 0x00, 0x06, 0xA1, 0xA2};
+    static constexpr u8 kPlaintext[] = "cleartext";
+    static constexpr u8 kReplacement[] = "replacement";
+    conn.reset();
+    conn.id = 0;
+    conn.fd = dup(STDERR_FILENO);
+    REQUIRE_GE(conn.fd, 0);
+    loop.free_top = 0;
+    conn.tls_active = true;
+    conn.tls_engine.ssl = reinterpret_cast<SSL*>(1);
+    conn.tls_out_buf.bind(tls_out_storage, sizeof(tls_out_storage));
+    REQUIRE_EQ(conn.tls_out_buf.write(kCiphertext, sizeof(kCiphertext)), sizeof(kCiphertext));
+
+    loop.backend.sq_ring_entries = 0;  // deterministic SQ-full: no target can be published
+    CHECK_FALSE(
+        loop.submit_tls_ciphertext_send(conn, conn.tls_out_buf.data(), conn.tls_out_buf.len()));
+    CHECK(conn.tls_raw_send_owner_is_neutral());
+    CHECK_FALSE(conn.send_armed);
+    CHECK_EQ(conn.pending_ops, 0u);
+    CHECK_EQ(loop.backend.send_state[0].remaining, 0u);
+    CHECK_EQ(guard.sq_tail, 0u);
+
+    loop.backend.sq_ring_entries = 8;
+    u32 logical_generation = 0;
+    REQUIRE(conn.next_non_upstream_send_generation(logical_generation));
+    conn.tls_send_owner_generation = logical_generation;
+    conn.tls_send_owner_fd = conn.fd;
+    conn.tls_send_owner_handler_generation = conn.handler_gen;
+    conn.tls_send_src = kPlaintext;
+    conn.tls_send_len = sizeof(kPlaintext) - 1u;
+    conn.tls_send_off = conn.tls_send_len;  // all plaintext is encrypted, raw bytes still drain
+    conn.tls_pending_on_send = &tls_pending_send_probe;
+
+    const u8* const raw_src = conn.tls_out_buf.data();
+    REQUIRE(loop.submit_tls_ciphertext_send(conn, conn.tls_out_buf.data(), conn.tls_out_buf.len()));
+    const u32 raw_generation = conn.tls_out_inflight_generation;
+    REQUIRE_NE(raw_generation, 0u);
+    const u32 sq_tail_after_submit = guard.sq_tail;
+    const u32 pending_after_submit = conn.pending_ops;
+    CHECK_FALSE(
+        loop.submit_tls_ciphertext_send(conn, conn.tls_out_buf.data(), conn.tls_out_buf.len()));
+    CHECK_EQ(guard.sq_tail, sq_tail_after_submit);
+    CHECK_EQ(conn.pending_ops, pending_after_submit);
+    CHECK_EQ(conn.tls_out_inflight_generation, raw_generation);
+    CHECK_EQ(conn.tls_send_owner_generation, logical_generation);
+    CHECK_EQ(conn.tls_send_src, kPlaintext);
+    CHECK_EQ(conn.tls_send_off, conn.tls_send_len);
+    conn.tls_engine.ssl = nullptr;
+
+    // A second plaintext request must be rejected by the real admission path.
+    // Its close must transfer custody of the already-submitted raw ciphertext
+    // target, whose token is distinct from the logical send's token.
+    CHECK_FALSE(loop.submit_send_impl(conn, kReplacement, sizeof(kReplacement) - 1u));
+    Connection& closed = loop.conns[0];
+    REQUIRE_EQ(closed.fd, -1);
+    REQUIRE_EQ(closed.pending_ops, 2u);
+    REQUIRE_EQ(closed.response_read_deadline_send_close_generation, raw_generation);
+    REQUIRE(closed.response_read_deadline_send_close_target_owned);
+    REQUIRE(closed.response_read_deadline_send_close_cancel_owned);
+    CHECK_NE(raw_generation, logical_generation);
+    CHECK_EQ(guard.sq_tail, sq_tail_after_submit + 1u);  // only the close cancel was submitted
+    CHECK_EQ(guard.sq_entries[sq_tail_after_submit].opcode, IORING_OP_ASYNC_CANCEL);
+    CHECK_EQ(guard.sq_entries[sq_tail_after_submit].addr, guard.sq_entries[0].user_data);
+    CHECK_EQ(loop.backend.send_state[0].src, raw_src);
+    CHECK_EQ(loop.backend.send_state[0].generation, raw_generation);
+
+    IoEvent target = tls_send_event(conn.id, -ECANCELED, raw_generation);
+    IoEvent cancel = tls_send_event(conn.id, -ENOENT, raw_generation | kNonUpstreamSendCancelBit);
+    loop.dispatch(target);
+    CHECK_EQ(loop.conns[0].pending_ops, 1u);
+    loop.dispatch(cancel);
+    CHECK_EQ(loop.pending_free_count, 0u);
+    CHECK_EQ(loop.free_top, 1u);
+}
+
+#if RUT_ENABLE_WEBSOCKET
+TEST(tls_iouring, ws_send_sq_full_closes_the_connection_once_after_encryption) {
+    auto context_result = create_tls_server_context(RUT_TESTDATA_DIR "/localhost_cert.pem",
+                                                    RUT_TESTDATA_DIR "/localhost_key.pem");
+    REQUIRE(context_result.has_value());
+    std::unique_ptr<TlsServerContext, decltype(&destroy_tls_server_context)> context(
+        context_result.value(), destroy_tls_server_context);
+
+    ScopedTlsRawSendLoop guard;
+    REQUIRE(guard.init(/*capacity=*/2));
+    IoUringEventLoop& loop = *guard.loop;
+    Connection& conn = loop.conns[0];
+    conn.fd = dup(STDERR_FILENO);
+    REQUIRE_GE(conn.fd, 0);
+    struct CloseUnclaimedConnection {
+        IoUringEventLoop& loop;
+        Connection& conn;
+        ~CloseUnclaimedConnection() {
+            if (conn.fd >= 0) loop.close_conn(conn);
+        }
+    } close_unclaimed{loop, conn};
+
+    loop.tls_server = context.get();
+    REQUIRE(loop.tls_setup(conn));
+    TlsMemoryClientPeer client;
+    REQUIRE(client.init());
+    REQUIRE(tls_engine_handshake_with_memory_client(conn.tls_engine, client.ssl));
+    conn.tls_handshake_complete = true;
+    conn.is_ws_tunnel = true;
+
+    static constexpr u8 kUpstreamBytes[] = "websocket-data";
+    u8 upstream_storage[64];
+    conn.upstream_recv_buf.bind(upstream_storage, sizeof(upstream_storage));
+    REQUIRE_EQ(conn.upstream_recv_buf.write(kUpstreamBytes, sizeof(kUpstreamBytes) - 1),
+               sizeof(kUpstreamBytes) - 1);
+
+    // The completed TLS session makes the real WebSocket callback encrypt
+    // application bytes; a full one-entry SQ then rejects the ciphertext send.
+    guard.sq_head = 0;
+    guard.sq_tail = 1;
+    guard.sq_mask = 0;
+    loop.backend.sq_ring_entries = 1;
+    loop.free_top = 0;
+    IoEvent recv = {};
+    recv.conn_id = conn.id;
+    recv.type = IoEventType::UpstreamRecv;
+    recv.result = static_cast<i32>(sizeof(kUpstreamBytes) - 1);
+    on_ws_upstream_recv<IoUringEventLoop>(&loop, conn, recv);
+
+    CHECK_EQ(conn.fd, -1);
+    CHECK_EQ(conn.pending_ops, 0u);
+    CHECK_EQ(loop.free_top, 1u);
+    CHECK_EQ(loop.free_stack[0], 0u);
+    CHECK_EQ(guard.sq_tail, 1u);
+}
+#endif  // RUT_ENABLE_WEBSOCKET
+
+TEST(tls_iouring, current_token_bad_raw_identity_fails_closed_before_logical_completion) {
+    enum class Corruption : u8 { Fd, Source, Length, BackendGeneration, Callback, Aux };
+    for (const Corruption corruption : {Corruption::Fd,
+                                        Corruption::Source,
+                                        Corruption::Length,
+                                        Corruption::BackendGeneration,
+                                        Corruption::Callback,
+                                        Corruption::Aux}) {
+        ScopedTlsRawSendLoop guard;
+        REQUIRE(guard.init());
+        IoUringEventLoop& loop = *guard.loop;
+        Connection& conn = loop.conns[0];
+        u8 tls_out_storage[16];
+        static constexpr u8 kCiphertext[] = {0x17, 0x03, 0x03, 0x00, 0x01};
+        static constexpr u8 kPlaintext[] = "request";
+        conn.reset();
+        conn.id = 0;
+        conn.fd = dup(STDERR_FILENO);
+        REQUIRE_GE(conn.fd, 0);
+        loop.free_top = 0;  // close_conn owns this storage-only slot in this fixture
+        conn.tls_out_buf.bind(tls_out_storage, sizeof(tls_out_storage));
+        REQUIRE_EQ(conn.tls_out_buf.write(kCiphertext, sizeof(kCiphertext)), sizeof(kCiphertext));
+        const u32 raw_generation = stage_tls_raw_send_target(
+            loop, conn, conn.tls_out_buf.data(), sizeof(kCiphertext), true);
+        REQUIRE_NE(raw_generation, 0u);
+        u32 logical_generation = 0;
+        REQUIRE(conn.next_non_upstream_send_generation(logical_generation));
+        conn.tls_send_owner_generation = logical_generation;
+        conn.tls_send_owner_fd = conn.fd;
+        conn.tls_send_owner_handler_generation = conn.handler_gen;
+        conn.tls_send_src = kPlaintext;
+        conn.tls_send_len = sizeof(kPlaintext) - 1u;
+        conn.tls_send_off = conn.tls_send_len;
+        conn.tls_pending_on_send = &tls_pending_send_probe;
+        g_tls_pending_send_called = false;
+
+        IoEvent bad = tls_send_event(conn.id, sizeof(kCiphertext), raw_generation);
+        switch (corruption) {
+            case Corruption::Fd:
+                conn.tls_out_inflight_fd++;
+                break;
+            case Corruption::Source:
+                conn.tls_out_inflight_src = kPlaintext;
+                break;
+            case Corruption::Length:
+                conn.tls_out_inflight_len++;
+                break;
+            case Corruption::BackendGeneration:
+                loop.backend.send_state[0].generation++;
+                break;
+            case Corruption::Callback:
+                conn.on_send = &tls_pending_send_probe;
+                break;
+            case Corruption::Aux:
+                bad.aux = 1;
+                break;
+        }
+        loop.dispatch(bad);
+
+        CHECK_FALSE(g_tls_pending_send_called);
+        CHECK_EQ(conn.fd, -1);
+        CHECK_EQ(conn.pending_ops, 0u);
+        CHECK(loop.conns[0].tls_raw_send_owner_is_neutral());
+        CHECK(loop.conns[0].tls_single_shot_send_owner_is_neutral());
+        CHECK_EQ(loop.free_top, 1u);
+    }
+}
+
+TEST(tls_iouring, partial_ciphertext_send_then_error_never_completes_logical_owner) {
+    for (const i32 error : {-EPIPE, -ECONNRESET}) {
+        ScopedTlsRawSendLoop guard;
+        REQUIRE(guard.init());
+        IoUringEventLoop& loop = *guard.loop;
+        Connection& conn = loop.conns[0];
+        u8 tls_out_storage[16];
+        static constexpr u8 kCiphertext[] = {0x17, 0x03, 0x03, 0x00, 0x01, 0xA5, 0x5A};
+        static constexpr u8 kPlaintext[] = "logical-response";
+        conn.reset();
+        conn.id = 0;
+        conn.fd = dup(STDERR_FILENO);
+        REQUIRE_GE(conn.fd, 0);
+        loop.free_top = 0;
+        conn.tls_out_buf.bind(tls_out_storage, sizeof(tls_out_storage));
+        REQUIRE_EQ(conn.tls_out_buf.write(kCiphertext, sizeof(kCiphertext)), sizeof(kCiphertext));
+        const u32 raw_generation = stage_tls_raw_send_target(
+            loop, conn, conn.tls_out_buf.data(), sizeof(kCiphertext), false);
+        REQUIRE_NE(raw_generation, 0u);
+        u32 logical_generation = 0;
+        REQUIRE(conn.next_non_upstream_send_generation(logical_generation));
+        conn.tls_send_owner_generation = logical_generation;
+        conn.tls_send_owner_fd = conn.fd;
+        conn.tls_send_owner_handler_generation = conn.handler_gen;
+        conn.tls_send_src = kPlaintext;
+        conn.tls_send_len = sizeof(kPlaintext) - 1u;
+        conn.tls_send_off = conn.tls_send_len;
+        conn.tls_pending_on_send = &tls_pending_send_probe;
+        g_tls_pending_send_called = false;
+
+        // stage_tls_raw_send_target models the already-submitted first SQE;
+        // the userspace ring below supplies the actual backend.wait proactor.
+        guard.sq_tail = 1;
+        loop.backend.pending = 1;
+        guard.sq_head = guard.sq_tail;
+        loop.backend.pending = 0;
+        REQUIRE(guard.push_send_cqe(raw_generation, 3));
+        IoEvent partial{};
+        CHECK_EQ(loop.backend.wait(&partial, 1, loop.conns, 1), 0u);
+        CHECK_EQ(loop.backend.send_state[0].offset, 3u);
+        CHECK_EQ(loop.backend.send_state[0].remaining, sizeof(kCiphertext) - 3u);
+        CHECK_EQ(guard.sq_tail, 2u);  // backend submitted precisely the remaining suffix
+        CHECK_EQ(conn.pending_ops, 1u);
+        CHECK(conn.send_armed);
+
+        guard.sq_head = guard.sq_tail;
+        loop.backend.pending = 0;
+        REQUIRE(guard.push_send_cqe(raw_generation, error));
+        IoEvent failed{};
+        REQUIRE_EQ(loop.backend.wait(&failed, 1, loop.conns, 1), 1u);
+        CHECK_EQ(failed.result, error);
+        CHECK_EQ(failed.non_upstream_generation, raw_generation);
+        loop.dispatch(failed);
+
+        CHECK_FALSE(g_tls_pending_send_called);
+        CHECK_EQ(loop.conns[0].fd, -1);
+        CHECK_EQ(loop.conns[0].pending_ops, 0u);
+        CHECK(loop.conns[0].tls_raw_send_owner_is_neutral());
+        CHECK(loop.conns[0].tls_single_shot_send_owner_is_neutral());
+        CHECK_EQ(loop.backend.send_state[0].remaining, 0u);
+        CHECK_EQ(loop.free_top, 1u);
+    }
+}
+
+TEST(tls_iouring, f_more_transfers_raw_generation_to_close_ledger_in_either_drain_order) {
+    for (const bool cancel_first : {false, true}) {
+        ScopedTlsRawSendLoop guard;
+        REQUIRE(guard.init());
+        ScopedTlsOutMmap tls_out_mapping;
+        REQUIRE(tls_out_mapping.init());
+        IoUringEventLoop& loop = *guard.loop;
+        Connection& conn = loop.conns[0];
+        static constexpr u8 kCiphertext[] = {0x17, 0x03, 0x03, 0x00, 0x01};
+        conn.reset();
+        conn.id = 0;
+        conn.fd = dup(STDERR_FILENO);
+        REQUIRE_GE(conn.fd, 0);
+        loop.free_top = 0;
+        conn.tls_out_slice = tls_out_mapping.data;
+        conn.tls_out_buf.bind(tls_out_mapping.data, IoUringEventLoop::kTlsOutBufCap);
+        REQUIRE_EQ(conn.tls_out_buf.write(kCiphertext, sizeof(kCiphertext)), sizeof(kCiphertext));
+        const u8* const owned_ciphertext = conn.tls_out_slice;
+        const u32 raw_generation = stage_tls_raw_send_target(
+            loop, conn, conn.tls_out_buf.data(), sizeof(kCiphertext), false);
+        REQUIRE_NE(raw_generation, 0u);
+        static constexpr u8 kLogicalPlaintext[] = "logical-owner";
+        u32 logical_generation = 0;
+        REQUIRE(conn.next_non_upstream_send_generation(logical_generation));
+        REQUIRE_NE(logical_generation, raw_generation);
+        conn.tls_send_owner_generation = logical_generation;
+        conn.tls_send_owner_fd = conn.fd;
+        conn.tls_send_owner_handler_generation = conn.handler_gen;
+        conn.tls_send_src = kLogicalPlaintext;
+        conn.tls_send_len = sizeof(kLogicalPlaintext) - 1u;
+        conn.tls_send_off = conn.tls_send_len;
+        conn.tls_pending_on_send = &tls_pending_send_probe;
+        guard.sq_entries[0].opcode = IORING_OP_SEND;
+        guard.sq_entries[0].fd = conn.fd;
+        guard.sq_entries[0].user_data =
+            IoUringBackend::encode_user_data(conn.id, IoEventType::Send, raw_generation);
+        guard.sq_tail = 1;
+        loop.backend.pending = 1;
+
+        IoEvent more = tls_send_event(conn.id, sizeof(kCiphertext), raw_generation);
+        more.more = 1;
+        loop.dispatch(more);
+
+        Connection& closed = loop.conns[0];
+        REQUIRE_EQ(closed.fd, -1);
+        REQUIRE_EQ(closed.pending_ops, 2u);  // target plus its close cancellation
+        CHECK_EQ(closed.tls_out_slice, owned_ciphertext);
+        CHECK_EQ(owned_ciphertext[0], kCiphertext[0]);
+        REQUIRE_EQ(closed.response_read_deadline_send_close_generation, raw_generation);
+        REQUIRE(closed.response_read_deadline_send_close_target_owned);
+        REQUIRE(closed.response_read_deadline_send_close_cancel_owned);
+        CHECK_EQ(loop.free_top, 0u);
+        CHECK_EQ(loop.pending_free_count, 1u);
+        REQUIRE_EQ(guard.sq_tail, 2u);
+        const io_uring_sqe& cancel_sqe = guard.sq_entries[1];
+        CHECK_EQ(cancel_sqe.opcode, IORING_OP_ASYNC_CANCEL);
+        CHECK_EQ(cancel_sqe.addr, guard.sq_entries[0].user_data);
+        u32 cancel_id = UINT32_MAX;
+        u32 cancel_aux = 0;
+        IoEventType cancel_type = IoEventType::Count;
+        IoUringBackend::decode_user_data(cancel_sqe.user_data, cancel_id, cancel_type, cancel_aux);
+        CHECK_EQ(cancel_id, conn.id);
+        CHECK_EQ(cancel_type, IoEventType::Send);
+        CHECK_EQ(cancel_aux, raw_generation | kNonUpstreamSendCancelBit);
+
+        IoEvent target = tls_send_event(conn.id, -ECANCELED, raw_generation);
+        IoEvent cancel =
+            tls_send_event(conn.id, -ENOENT, raw_generation | kNonUpstreamSendCancelBit);
+        loop.dispatch(cancel_first ? cancel : target);
+        CHECK_EQ(loop.conns[0].pending_ops, 1u);
+        CHECK_EQ(loop.free_top, 0u);
+        CHECK_EQ(closed.tls_out_slice, owned_ciphertext);
+        CHECK_EQ(owned_ciphertext[0], kCiphertext[0]);
+        loop.dispatch(cancel_first ? target : cancel);
+        CHECK_EQ(loop.conns[0].pending_ops, 0u);
+        CHECK_EQ(loop.pending_free_count, 0u);
+        CHECK_EQ(loop.free_top, 1u);
+        const bool slice_released = closed.tls_out_slice == nullptr;
+        tls_out_mapping.relinquish();  // reclaim_slot already munmapped the owned slice
+        CHECK(slice_released);
+        const u32 free_after_drain = loop.free_top;
+        loop.dispatch(cancel_first ? cancel : target);  // duplicate final owns nothing
+        CHECK_EQ(loop.free_top, free_after_drain);
+    }
+}
+
+TEST(tls_iouring, logical_want_read_close_submits_only_recv_cancel_and_reclaims_in_both_orders) {
+#if RUT_ENABLE_WEBSOCKET
+    for (const bool close_through_ws_consumer : {false, true}) {
+#else
+    for (u8 direct_close_case = 0; direct_close_case < 1; direct_close_case++) {
+#endif
+        for (const bool cancel_first : {false, true}) {
+            ScopedTlsRawSendLoop guard;
+            REQUIRE(guard.init());
+            IoUringEventLoop& loop = *guard.loop;
+            Connection& conn = loop.conns[0];
+            conn.reset();
+            conn.id = 0;
+            conn.fd = dup(STDERR_FILENO);
+            REQUIRE_GE(conn.fd, 0);
+            loop.free_top = 0;
+            conn.tls_active = true;
+            conn.recv_armed = true;
+            conn.pending_ops = 1;
+            conn.tls_pending_on_recv = &tls_resume_pending_send_recv<IoUringEventLoop>;
+            u32 logical_generation = 0;
+            REQUIRE(conn.next_non_upstream_send_generation(logical_generation));
+            conn.tls_send_owner_generation = logical_generation;
+            conn.tls_send_owner_fd = conn.fd;
+            conn.tls_send_owner_handler_generation = conn.handler_gen;
+            conn.tls_send_src = reinterpret_cast<const u8*>("pending plaintext");
+            conn.tls_send_len = 16;
+            conn.tls_send_off = 0;  // parked logical owner, with no raw ciphertext target
+            conn.tls_pending_on_send = &tls_pending_send_probe;
+
+#if RUT_ENABLE_WEBSOCKET
+            if (close_through_ws_consumer) {
+                static constexpr u8 kUpstreamData[] = "websocket";
+                u8 upstream_storage[64];
+                conn.upstream_recv_buf.bind(upstream_storage, sizeof(upstream_storage));
+                REQUIRE_EQ(conn.upstream_recv_buf.write(kUpstreamData, sizeof(kUpstreamData) - 1),
+                           sizeof(kUpstreamData) - 1);
+                conn.is_ws_tunnel = true;
+                IoEvent upstream_recv{};
+                upstream_recv.conn_id = conn.id;
+                upstream_recv.result = static_cast<i32>(sizeof(kUpstreamData) - 1);
+                upstream_recv.type = IoEventType::UpstreamRecv;
+                on_ws_upstream_recv<IoUringEventLoop>(&loop, conn, upstream_recv);
+            } else {
+                loop.close_conn(conn);
+            }
+#else
+            loop.close_conn(conn);
+#endif
+            const Connection& closed = loop.conns[0];
+            CHECK_EQ(closed.response_read_deadline_send_close_generation, 0u);
+            CHECK_FALSE(closed.response_read_deadline_send_close_target_owned);
+            CHECK_FALSE(closed.response_read_deadline_send_close_cancel_owned);
+            REQUIRE_EQ(closed.pending_ops, 2u);  // recv target plus its close cancel
+            REQUIRE_EQ(loop.pending_free_count, 1u);
+            CHECK_EQ(loop.free_top, 0u);
+            REQUIRE_EQ(guard.sq_tail, 1u);
+            const io_uring_sqe& cancel_sqe = guard.sq_entries[0];
+            CHECK_EQ(cancel_sqe.opcode, IORING_OP_ASYNC_CANCEL);
+            u32 cancel_id = UINT32_MAX;
+            u32 cancel_aux = 0;
+            IoEventType cancel_type = IoEventType::Count;
+            IoUringBackend::decode_user_data(
+                cancel_sqe.user_data, cancel_id, cancel_type, cancel_aux);
+            CHECK_EQ(cancel_id, conn.id);
+            CHECK_EQ(cancel_type, IoEventType::Recv);
+            CHECK_EQ(cancel_aux, kDownstreamCloseCancelAux);
+
+            IoEvent target{};
+            target.conn_id = conn.id;
+            target.result = -ECANCELED;
+            target.type = IoEventType::Recv;
+            IoEvent cancel{};
+            cancel.conn_id = conn.id;
+            cancel.result = -ENOENT;
+            cancel.type = IoEventType::Recv;
+            cancel.aux = kDownstreamCloseCancelAux;
+
+            loop.dispatch(cancel_first ? cancel : target);
+            CHECK_EQ(closed.pending_ops, 1u);
+            CHECK_EQ(loop.pending_free_count, 1u);
+            CHECK_EQ(loop.free_top, 0u);
+
+            loop.dispatch(cancel_first ? target : cancel);
+            CHECK_EQ(closed.pending_ops, 0u);
+            CHECK_EQ(loop.pending_free_count, 0u);
+            CHECK_EQ(loop.free_top, 1u);
+
+            // The target's terminal duplicate has no second free-stack ownership.
+            loop.dispatch(target);
+            CHECK_EQ(closed.pending_ops, 0u);
+            CHECK_EQ(loop.pending_free_count, 0u);
+            CHECK_EQ(loop.free_top, 1u);
+        }
+    }
+}
+
+TEST(tls_iouring, completion_callback_close_or_successor_owner_is_not_overwritten_by_old_tail) {
+    for (const bool close_in_callback : {false, true}) {
+        ScopedTlsRawSendLoop guard;
+        REQUIRE(guard.init());
+        IoUringEventLoop& loop = *guard.loop;
+        Connection& conn = loop.conns[0];
+        u8 tls_out_storage[16];
+        static constexpr u8 kCiphertext[] = {0x17, 0x03, 0x03, 0x00, 0x01, 0xCA, 0xFE};
+        static constexpr u8 kPlaintext[] = "payload";
+        conn.reset();
+        conn.id = 0;
+        conn.fd = close_in_callback ? dup(STDERR_FILENO) : 42;
+        if (close_in_callback) REQUIRE_GE(conn.fd, 0);
+        loop.free_top = 0;
+        conn.tls_out_buf.bind(tls_out_storage, sizeof(tls_out_storage));
+        REQUIRE_EQ(conn.tls_out_buf.write(kCiphertext, sizeof(kCiphertext)), sizeof(kCiphertext));
+        const u32 raw_generation = stage_tls_raw_send_target(
+            loop, conn, conn.tls_out_buf.data(), sizeof(kCiphertext), true);
+        REQUIRE_NE(raw_generation, 0u);
+        u32 logical_generation = 0;
+        REQUIRE(conn.next_non_upstream_send_generation(logical_generation));
+        conn.tls_send_owner_generation = logical_generation;
+        conn.tls_send_owner_fd = conn.fd;
+        conn.tls_send_owner_handler_generation = conn.handler_gen;
+        conn.tls_send_src = kPlaintext;
+        conn.tls_send_len = sizeof(kPlaintext) - 1u;
+        conn.tls_send_off = conn.tls_send_len;
+        conn.tls_pending_on_send =
+            close_in_callback ? &tls_close_on_send_probe : &tls_successor_send_probe;
+        g_tls_reentrant_completion_calls = 0;
+        g_tls_reentrant_completion_result = 0;
+
+        loop.dispatch(tls_send_event(conn.id, sizeof(kCiphertext), raw_generation));
+
+        CHECK_EQ(g_tls_reentrant_completion_calls, 1u);
+        CHECK_EQ(g_tls_reentrant_completion_result, sizeof(kPlaintext) - 1u);
+        if (close_in_callback) {
+            CHECK_EQ(loop.conns[0].fd, -1);
+            CHECK(loop.conns[0].tls_single_shot_send_owner_is_neutral());
+            CHECK(loop.conns[0].tls_raw_send_owner_is_neutral());
+            CHECK_EQ(loop.free_top, 1u);
+        } else {
+            CHECK_EQ(conn.fd, 42);
+            CHECK(conn.tls_raw_send_owner_is_neutral());
+            REQUIRE_NE(conn.tls_send_owner_generation, 0u);
+            CHECK_NE(conn.tls_send_owner_generation, logical_generation);
+            CHECK_EQ(conn.tls_send_src, kTlsSuccessorSendPayload);
+            CHECK_EQ(conn.tls_send_len, 4u);
+            CHECK_EQ(conn.tls_send_off, 4u);
+            CHECK(conn.tls_pending_on_send == &tls_pending_send_probe);
+            CHECK_EQ(loop.free_top, 0u);
+        }
+    }
+}
+
+TEST(tls_iouring, live_raw_owner_consumes_zero_and_stale_tokens_without_accounting) {
+    for (const u32 bad_generation : {0u, 17u}) {
+        ScopedTlsRawSendLoop guard;
+        REQUIRE(guard.init());
+        IoUringEventLoop& loop = *guard.loop;
+        Connection& conn = loop.conns[0];
+        u8 tls_out_storage[16];
+        static constexpr u8 kCiphertext[] = {0x17, 0x03, 0x03};
+        conn.reset();
+        conn.id = 0;
+        conn.fd = 42;
+        conn.tls_out_buf.bind(tls_out_storage, sizeof(tls_out_storage));
+        REQUIRE_EQ(conn.tls_out_buf.write(kCiphertext, sizeof(kCiphertext)), sizeof(kCiphertext));
+        const u32 raw_generation = stage_tls_raw_send_target(
+            loop, conn, conn.tls_out_buf.data(), sizeof(kCiphertext), false);
+        REQUIRE_NE(raw_generation, 0u);
+        conn.recv_armed = true;
+        conn.recv_paused_for_send = true;
+        conn.pending_ops++;
+        g_tls_pending_send_called = false;
+
+        loop.dispatch(tls_send_event(conn.id, sizeof(kCiphertext), bad_generation));
+        CHECK(conn.tls_out_inflight);
+        CHECK_EQ(conn.tls_out_inflight_generation, raw_generation);
+        CHECK(conn.send_armed);
+        CHECK_EQ(conn.pending_ops, 2u);
+        CHECK_EQ(loop.backend.send_state[conn.id].remaining, sizeof(kCiphertext));
+        CHECK(conn.recv_paused_for_send);  // stale CQEs leave generic Send side effects alone
+        CHECK_FALSE(g_tls_pending_send_called);
+
+        // Model the backend's exact full-send result for the authenticated owner.
+        loop.backend.send_state[conn.id].offset = sizeof(kCiphertext);
+        loop.backend.send_state[conn.id].remaining = 0;
+        loop.dispatch(tls_send_event(conn.id, sizeof(kCiphertext), raw_generation));
+        CHECK_FALSE(conn.tls_out_inflight);
+        CHECK_FALSE(conn.send_armed);
+        CHECK_FALSE(conn.recv_paused_for_send);
+        CHECK_EQ(conn.pending_ops, 1u);
+
+        // A repeated final record still belongs to the TLS Send namespace; it
+        // cannot consume the independently armed recv after the raw owner clears.
+        loop.dispatch(tls_send_event(conn.id, sizeof(kCiphertext), raw_generation));
+        CHECK_EQ(conn.pending_ops, 1u);
+        CHECK_FALSE(conn.send_armed);
+        CHECK_FALSE(g_tls_pending_send_called);
+    }
 }
 
 TEST(tls_iouring, ensure_draining_empty_buffer_is_noop) {
@@ -6101,14 +6911,22 @@ TEST(tls_iouring, ensure_draining_empty_buffer_is_noop) {
 // drain hook so the in-flight send's Send CQE still clears tls_out_inflight
 // (rather than being dispatched as the response completion → stuck buffer).
 TEST(tls_iouring, ensure_draining_restores_hook_while_inflight) {
-    Connection conn;
+    ScopedTlsRawSendLoop guard;
+    REQUIRE(guard.init());
+    IoUringEventLoop& loop = *guard.loop;
+    Connection& conn = loop.conns[0];
+    u8 tls_out_storage[16];
     conn.reset();
-    conn.id = 9;
-    conn.tls_active = true;
-    conn.tls_out_inflight = true;            // a ciphertext send is already draining
-    conn.on_send = &tls_pending_send_probe;  // upper layer overwrote it (response start)
-    // inflight → returns true without touching the loop (safe to pass nullptr).
-    CHECK(tls_ensure_draining<IoUringEventLoop>(nullptr, conn));
+    conn.id = 0;
+    conn.fd = 42;
+    conn.tls_out_buf.bind(tls_out_storage, sizeof(tls_out_storage));
+    static constexpr u8 kCiphertext[] = {0x17, 0x03, 0x03};
+    REQUIRE_EQ(conn.tls_out_buf.write(kCiphertext, sizeof(kCiphertext)), sizeof(kCiphertext));
+    REQUIRE_NE(
+        stage_tls_raw_send_target(loop, conn, conn.tls_out_buf.data(), sizeof(kCiphertext), false),
+        0u);
+    conn.on_send = &tls_pending_send_probe;  // upper layer overwrote the drain hook
+    CHECK(tls_ensure_draining<IoUringEventLoop>(&loop, conn));
     CHECK(conn.on_send == &tls_on_out_drain<IoUringEventLoop>);  // hook restored
     CHECK(conn.tls_out_inflight);                                // still inflight, untouched
 }
@@ -27108,6 +27926,35 @@ TEST(state_invariant, jit_downstream_send_yield_fails_closed_when_send_cannot_qu
     CHECK_EQ(loop.backend.count_ops(MockOp::PauseRecv), 0u);
 }
 
+TEST(state_invariant, jit_send_failure_after_terminal_close_does_not_format_second_response) {
+    SmallLoop loop;
+    loop.setup();
+    loop.inject_and_dispatch(make_ev(0, IoEventType::Accept, 42));
+    auto* c = loop.find_fd(42);
+    REQUIRE(c != nullptr);
+    c->send_buf.reset();
+    static constexpr u8 kChunk[] = "already-encrypted-owner";
+    REQUIRE_EQ(c->send_buf.write(kChunk, sizeof(kChunk) - 1), sizeof(kChunk) - 1);
+
+    JitDispatchOutcome outcome{};
+    outcome.kind = JitDispatchOutcome::Kind::EventYield;
+    outcome.next_state = 3;
+    outcome.yield_kind = jit::YieldKind::Send;
+    loop.backend.fail_send = true;
+    loop.close_on_failed_send = true;
+    loop.send_submit_attempts = 0;
+    handle_jit_outcome<SmallLoop>(&loop, *c, outcome, &state_invariant_configured_jit_result, true);
+
+    // The io_uring TLS contract terminal-closes before returning false. The
+    // JIT caller must not format a 500 into the reset slot or make a second
+    // send attempt against its empty buffers.
+    CHECK_EQ(c->fd, -1);
+    CHECK_EQ(c->resp_status, 0u);
+    CHECK_EQ(loop.free_top, SmallLoop::kMaxConns);
+    CHECK_EQ(loop.send_submit_attempts, 1u);
+    CHECK_EQ(loop.backend.count_ops(MockOp::Send), 0u);
+}
+
 TEST(state_invariant, jit_recv_yield_sets_recv_rearm_pending_if_recv_pause_cancel_pending) {
     SmallLoop loop;
     loop.setup();
@@ -28858,11 +29705,11 @@ TEST(iouring_upstream_recv, ring_full_closes_initial_incomplete_and_tls_low_wate
                 conn.tls_out_buf.bind(conn.tls_out_slice, IoUringEventLoop::kTlsOutBufCap);
                 static constexpr u8 kCiphertext = 0x17;
                 REQUIRE_EQ(conn.tls_out_buf.write(&kCiphertext, 1), 1u);
-                conn.tls_out_inflight = true;
-                conn.tls_out_inflight_len = 1;
                 conn.tls_recv_paused_hw = true;
                 conn.tls_proxy_stream = true;
                 conn.resp_fully_buffered = false;
+                REQUIRE_NE(
+                    stage_tls_raw_send_target(*loop, conn, conn.tls_out_buf.data(), 1u, true), 0u);
             }
 
             u32 full_pending = 0;
@@ -28905,8 +29752,7 @@ TEST(iouring_upstream_recv, ring_full_closes_initial_incomplete_and_tls_low_wate
                      0,
                      conn.upstream_episode});
             } else {
-                tls_on_out_drain<IoUringEventLoop>(
-                    loop, conn, {id, 1, 0, 0, IoEventType::Send, 0, 0, conn.upstream_episode});
+                loop->dispatch(tls_send_event(id, 1, conn.tls_out_inflight_generation));
             }
 
             if (!ring_full) {
@@ -30274,9 +31120,18 @@ void drain_prebuilt_d2_retirement(IoUringEventLoop* loop,
 
 void cleanup_prebuilt_d2(IoUringEventLoop* loop, PrebuiltD2Fixture& fixture) {
     if (loop == nullptr || fixture.conn == nullptr) return;
+    Connection& conn = *fixture.conn;
+    if (conn.fd < 0) {
+        // A test may already have closed this connection while synthetic recv
+        // owners are still represented in pending_free. Preserve that ledger;
+        // resetting it and closing again would free the same slot twice.
+        if (fixture.peer_fd >= 0) close(fixture.peer_fd);
+        fixture.peer_fd = -1;
+        fixture.conn = nullptr;
+        return;
+    }
     __atomic_store_n(loop->backend.sq_tail, fixture.sq_tail_before, __ATOMIC_RELEASE);
     loop->backend.pending = fixture.backend_pending_before;
-    Connection& conn = *fixture.conn;
     conn.recv_armed = false;
     conn.send_armed = false;
     conn.upstream_connect_armed = false;
@@ -52514,13 +53369,69 @@ TEST(response_buffering_runtime,
             if (conn.http1_boundary_ready) loop->resume_deferred_http1_boundaries();
         }
         if (downstream_close) {
-            CHECK_EQ(loop->conns[id].fd, -1);
+            const Connection& closed = loop->conns[id];
+            CHECK_EQ(closed.fd, -1);
+            const i32 closed_fd_before_cleanup = closed.fd;
+            const u32 pending_ops_before_cleanup = closed.pending_ops;
+            const u32 upstream_retiring_episode_before_cleanup = closed.upstream_retiring_episode;
+            const bool upstream_retirement_active_before_cleanup =
+                closed.upstream_retirement_active;
+            const u8 upstream_retirement_target_before_cleanup =
+                closed.upstream_retirement_target_owned;
+            const u8 upstream_retirement_cancel_before_cleanup =
+                closed.upstream_retirement_cancel_owned;
+            const u32 upstream_close_episode_before_cleanup = closed.upstream_close_episode;
+            const u8 upstream_close_target_before_cleanup = closed.upstream_close_target_owned;
+            const u8 upstream_close_cancel_before_cleanup = closed.upstream_close_cancel_owned;
+            const bool upstream_close_pause_cancel_before_cleanup =
+                closed.upstream_close_pause_cancel_owned;
+            const u32 send_close_generation_before_cleanup =
+                closed.response_read_deadline_send_close_generation;
+            const bool send_close_target_before_cleanup =
+                closed.response_read_deadline_send_close_target_owned;
+            const bool send_close_cancel_before_cleanup =
+                closed.response_read_deadline_send_close_cancel_owned;
+            const u32 pending_free_before_cleanup = loop->pending_free_count;
+            const u32 free_top_before_cleanup = loop->free_top;
+            u32 id_occurrences_before_cleanup = 0;
+            for (u32 i = 0; i < pending_free_before_cleanup && i < loop->connection_capacity; ++i) {
+                if (loop->pending_free[i] == id) ++id_occurrences_before_cleanup;
+            }
+            CHECK_EQ(id_occurrences_before_cleanup, 1u);
+            CHECK_GT(pending_ops_before_cleanup, 0u);
+            cleanup_prebuilt_d2(loop, fixture);
+            CHECK_EQ(loop->pending_free_count, pending_free_before_cleanup);
+            CHECK_EQ(loop->free_top, free_top_before_cleanup);
+            CHECK_EQ(closed.fd, closed_fd_before_cleanup);
+            CHECK_EQ(closed.pending_ops, pending_ops_before_cleanup);
+            CHECK_EQ(closed.upstream_retiring_episode, upstream_retiring_episode_before_cleanup);
+            CHECK_EQ(closed.upstream_retirement_active, upstream_retirement_active_before_cleanup);
+            CHECK_EQ(closed.upstream_retirement_target_owned,
+                     upstream_retirement_target_before_cleanup);
+            CHECK_EQ(closed.upstream_retirement_cancel_owned,
+                     upstream_retirement_cancel_before_cleanup);
+            CHECK_EQ(closed.upstream_close_episode, upstream_close_episode_before_cleanup);
+            CHECK_EQ(closed.upstream_close_target_owned, upstream_close_target_before_cleanup);
+            CHECK_EQ(closed.upstream_close_cancel_owned, upstream_close_cancel_before_cleanup);
+            CHECK_EQ(closed.upstream_close_pause_cancel_owned,
+                     upstream_close_pause_cancel_before_cleanup);
+            CHECK_EQ(closed.response_read_deadline_send_close_generation,
+                     send_close_generation_before_cleanup);
+            CHECK_EQ(closed.response_read_deadline_send_close_target_owned,
+                     send_close_target_before_cleanup);
+            CHECK_EQ(closed.response_read_deadline_send_close_cancel_owned,
+                     send_close_cancel_before_cleanup);
+            u32 id_occurrences_after_cleanup = 0;
+            for (u32 i = 0; i < loop->pending_free_count && i < loop->connection_capacity; ++i) {
+                if (loop->pending_free[i] == id) ++id_occurrences_after_cleanup;
+            }
+            CHECK_EQ(id_occurrences_after_cleanup, id_occurrences_before_cleanup);
         } else {
             REQUIRE_GE(loop->conns[id].fd, 0);
             CHECK_EQ(loop->conns[id].state, ConnState::ReadingHeader);
             CHECK(loop->conns[id].response_read_deadline_owner_is_neutral());
+            cleanup_prebuilt_d2(loop, fixture);
         }
-        cleanup_prebuilt_d2(loop, fixture);
     }
 }
 
