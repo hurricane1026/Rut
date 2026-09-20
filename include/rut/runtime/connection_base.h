@@ -69,6 +69,7 @@ enum class ResponseReadDeadlinePostCommitPhase : u8 {
     BodySend,
     WaitingBody,
     OriginComplete,
+    CombinedSend,
 };
 
 enum class CompleteContentLengthResponseClass : u8 {
@@ -81,6 +82,7 @@ enum class ResponseReadDeadlineSendKind : u8 {
     None,
     Header,
     Body,
+    Combined,
 };
 
 // Kernel ownership for the generic precise response-read timer. CancelPending

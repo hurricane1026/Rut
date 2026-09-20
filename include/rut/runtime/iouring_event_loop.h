@@ -1667,6 +1667,8 @@ public:
         const bool header =
             c.response_read_deadline_send_kind == ResponseReadDeadlineSendKind::Header;
         const bool body = c.response_read_deadline_send_kind == ResponseReadDeadlineSendKind::Body;
+        const bool combined =
+            c.response_read_deadline_send_kind == ResponseReadDeadlineSendKind::Combined;
         const auto& send = backend.send_state[c.id];
         const bool exact_shape =
             c.id < connection_capacity && c.fd >= 0 && c.send_armed && c.pending_ops > 0 &&
@@ -1690,7 +1692,12 @@ public:
               c.on_send == &on_response_body_sent<Self> &&
               c.response_read_deadline_send_src == c.upstream_recv_buf.data() &&
               c.response_read_deadline_send_len ==
-                  c.response_read_deadline_post_commit_inflight_body)) &&
+                  c.response_read_deadline_post_commit_inflight_body) ||
+             (combined &&
+              c.response_read_deadline_post_commit_phase ==
+                  ResponseReadDeadlinePostCommitPhase::CombinedSend &&
+              c.on_send == &on_complete_response_sent<Self> &&
+              response_read_deadline_combined_send_frame_is_stable(c))) &&
             send.src == c.response_read_deadline_send_src && send.fd == c.fd &&
             send.type == IoEventType::Send && send.generation == owner &&
             send.offset == c.response_read_deadline_send_len && send.remaining == 0;
@@ -1729,6 +1736,22 @@ public:
                                                          const IoEvent& ev,
                                                          ResponseReadDeadlineSendKind kind) const {
         if (c.id >= connection_capacity) return false;
+        Connection::Callback expected_callback = nullptr;
+        switch (kind) {
+            case ResponseReadDeadlineSendKind::None:
+                return false;
+            case ResponseReadDeadlineSendKind::Header:
+                expected_callback = &on_response_header_sent<Self>;
+                break;
+            case ResponseReadDeadlineSendKind::Body:
+                expected_callback = &on_response_body_sent<Self>;
+                break;
+            case ResponseReadDeadlineSendKind::Combined:
+                expected_callback = &on_complete_response_sent<Self>;
+                break;
+            default:
+                return false;
+        }
         const auto& send = backend.send_state[c.id];
         return !c.response_read_deadline_send_owner_active &&
                c.response_read_deadline_send_owner_generation != 0 &&
@@ -1738,10 +1761,7 @@ public:
                !ev.more && ev.aux == 0 &&
                ev.non_upstream_generation == c.response_read_deadline_send_owner_generation &&
                ev.result > 0 && static_cast<u32>(ev.result) == c.response_read_deadline_send_len &&
-               !c.send_armed &&
-               c.on_send == (kind == ResponseReadDeadlineSendKind::Header
-                                 ? &on_response_header_sent<Self>
-                                 : &on_response_body_sent<Self>) &&
+               !c.send_armed && c.on_send == expected_callback &&
                send.src == c.response_read_deadline_send_src && send.fd == c.fd &&
                send.type == IoEventType::Send &&
                send.generation == c.response_read_deadline_send_owner_generation &&
@@ -2442,17 +2462,31 @@ public:
     // Raw client send — bytes go to the wire as-is (plaintext, or already-
     // encrypted ciphertext from the TLS layer).
     bool submit_send_raw(Connection& c, const u8* buf, u32 len) {
-        const bool deadline_send = c.response_read_deadline_post_commit_phase ==
-                                       ResponseReadDeadlinePostCommitPhase::HeaderSend ||
-                                   c.response_read_deadline_post_commit_phase ==
-                                       ResponseReadDeadlinePostCommitPhase::BodySend;
+        const auto phase = c.response_read_deadline_post_commit_phase;
+        const bool deadline_send = phase == ResponseReadDeadlinePostCommitPhase::HeaderSend ||
+                                   phase == ResponseReadDeadlinePostCommitPhase::BodySend ||
+                                   phase == ResponseReadDeadlinePostCommitPhase::CombinedSend;
         u32 generation = 0;
         if (deadline_send) {
-            const ResponseReadDeadlineSendKind kind =
-                c.response_read_deadline_post_commit_phase ==
-                        ResponseReadDeadlinePostCommitPhase::HeaderSend
-                    ? ResponseReadDeadlineSendKind::Header
-                    : ResponseReadDeadlineSendKind::Body;
+            ResponseReadDeadlineSendKind kind = ResponseReadDeadlineSendKind::None;
+            switch (phase) {
+                case ResponseReadDeadlinePostCommitPhase::None:
+                case ResponseReadDeadlinePostCommitPhase::Buffering:
+                case ResponseReadDeadlinePostCommitPhase::WaitingBody:
+                case ResponseReadDeadlinePostCommitPhase::OriginComplete:
+                    return false;
+                case ResponseReadDeadlinePostCommitPhase::HeaderSend:
+                    kind = ResponseReadDeadlineSendKind::Header;
+                    break;
+                case ResponseReadDeadlinePostCommitPhase::BodySend:
+                    kind = ResponseReadDeadlineSendKind::Body;
+                    break;
+                case ResponseReadDeadlinePostCommitPhase::CombinedSend:
+                    kind = ResponseReadDeadlineSendKind::Combined;
+                    break;
+                default:
+                    return false;
+            }
             if (c.response_read_deadline_send_owner_active || buf == nullptr || len == 0 ||
                 c.fd < 0 || !c.next_response_read_deadline_send_generation())
                 return false;
@@ -3820,6 +3854,63 @@ public:
              (body_to_send != c.response_read_deadline_post_commit_declared_body ||
               body_to_send != c.response_read_deadline_post_commit_origin_received)))
             return false;
+
+        // Complete-buffered sends may reuse the spare tail of the pinned
+        // response-header slice, but only when all existing downstream
+        // transport ownership is neutral. A capacity miss is an ordinary
+        // fallback; stale ownership is a hard failure for either path.
+        if (c.id >= connection_capacity) return false;
+        const auto& send_state = backend.send_state[c.id];
+        if (c.send_armed || c.send_progress != 0 || c.on_send != nullptr ||
+            c.response_read_deadline_send_owner_active ||
+            c.response_read_deadline_send_owner_generation != 0 ||
+            c.response_read_deadline_send_deadline_generation != 0 ||
+            c.response_read_deadline_send_upstream_episode != 0 ||
+            c.response_read_deadline_send_src != nullptr ||
+            c.response_read_deadline_send_len != 0 || c.response_read_deadline_send_fd != -1 ||
+            c.response_read_deadline_send_kind != ResponseReadDeadlineSendKind::None ||
+            c.response_read_deadline_send_close_generation != 0 ||
+            c.response_read_deadline_send_close_target_owned ||
+            c.response_read_deadline_send_close_cancel_owned || send_state.remaining != 0)
+            return false;
+
+        // This is intentionally read-only and evaluated before timer/send
+        // ownership changes or origin retirement. Noneligible responses keep
+        // the established header-then-body path without staging any bytes.
+        enum class CombinedSendEligibility : u8 { Eligible, Fallback, Invalid };
+        const auto combined_send_eligibility = [&]() {
+            if (disposition != CompleteContentLengthTerminalDisposition::CompleteBody ||
+                terminal_owner != nullptr || received != declared || declared == 0 ||
+                c.response_read_deadline_post_commit_response_class !=
+                    CompleteContentLengthResponseClass::BoundedPositiveBody)
+                return CombinedSendEligibility::Fallback;
+            const bool precise_get_profile =
+                c.response_read_deadline_profile ==
+                    ResponseReadDeadlineProfile::BodylessNonHeadContentLengthZero &&
+                c.response_read_deadline_method == static_cast<u8>(LogHttpMethod::Get) &&
+                c.response_read_deadline_route_method == kRouteMethodGet &&
+                c.req_method == static_cast<u8>(LogHttpMethod::Get) && c.pipeline_depth == 0 &&
+                c.http1_pipeline_request_generation == 0 && c.pipeline_stash_len == 0 &&
+                bodyless_get_complete_content_length_request_policy_is_admitted(
+                    c.request_policy_id) &&
+                c.response_read_deadline_upload.request_policy_id == c.request_policy_id;
+            if (!precise_get_profile) return CombinedSendEligibility::Fallback;
+            if (!bodyless_get_complete_content_length_precise_buffering_is_stable(c))
+                return CombinedSendEligibility::Invalid;
+            const u32 header_len = c.response_header_buf.len();
+            const u32 raw_header_end = c.response_read_deadline_post_commit_raw_header_end;
+            if (c.response_header_buf.data() == nullptr || c.upstream_recv_buf.data() == nullptr ||
+                header_len == 0 || header_len > c.response_header_buf.capacity() ||
+                raw_header_end == 0 || raw_header_end > c.upstream_recv_buf.len() ||
+                declared != c.upstream_recv_buf.len() - raw_header_end)
+                return CombinedSendEligibility::Invalid;
+            if (declared > c.response_header_buf.capacity() - header_len)
+                return CombinedSendEligibility::Fallback;
+            return CombinedSendEligibility::Eligible;
+        };
+        const CombinedSendEligibility combined_send_state = combined_send_eligibility();
+        if (combined_send_state == CombinedSendEligibility::Invalid) return false;
+        const bool combined_send = combined_send_state == CombinedSendEligibility::Eligible;
         if (c.response_read_timer_phase != ResponseReadTimerPhase::None) {
             if (c.response_read_timer_phase != ResponseReadTimerPhase::Armed ||
                 !bodyless_get_complete_content_length_precise_buffering_is_stable(c) ||
@@ -3849,14 +3940,36 @@ public:
         c.response_read_deadline_state = ResponseReadDeadlineState::BodyComplete;
         c.response_read_deadline_post_commit_send_body = body_to_send;
         c.response_read_deadline_post_commit_close_after_drain = close_after_drain;
+        c.resp_body_mode = BodyMode::ContentLength;
+        c.upstream_keep_alive = false;
+        c.proxy_resp_started = true;
+        if (combined_send) {
+            const u32 header_len = c.response_header_buf.len();
+            const u32 raw_header_end = c.response_read_deadline_post_commit_raw_header_end;
+            // Use the header buffer's writable tail only as I/O staging. Keep
+            // its logical length equal to the pure rewritten header so all
+            // pinned-header proofs and response accounting retain their
+            // existing meaning.
+            __builtin_memcpy(c.response_header_buf.write_ptr(),
+                             c.upstream_recv_buf.data() + raw_header_end,
+                             body_to_send);
+            c.response_read_deadline_post_commit_phase =
+                ResponseReadDeadlinePostCommitPhase::CombinedSend;
+            c.response_read_deadline_post_commit_downstream_submitted = body_to_send;
+            c.response_read_deadline_post_commit_downstream_completed = 0;
+            c.response_read_deadline_post_commit_inflight_body = body_to_send;
+            c.resp_body_remaining = 0;
+            c.resp_body_sent = header_len + body_to_send;
+            c.upstream_send_len = raw_header_end + body_to_send;
+            c.transition_to_sending(&on_complete_response_sent<Self>);
+            return submit_send(c, c.response_header_buf.data(), header_len + body_to_send);
+        }
+
         c.response_read_deadline_post_commit_phase =
             ResponseReadDeadlinePostCommitPhase::HeaderSend;
-        c.resp_body_mode = BodyMode::ContentLength;
         c.resp_body_remaining = body_to_send;
         c.resp_body_sent = c.response_header_buf.len();
         c.upstream_send_len = c.response_read_deadline_post_commit_raw_header_end;
-        c.upstream_keep_alive = false;
-        c.proxy_resp_started = true;
         c.transition_to_sending(&on_response_header_sent<Self>);
         return submit_send(c, c.response_header_buf.data(), c.response_header_buf.len());
     }

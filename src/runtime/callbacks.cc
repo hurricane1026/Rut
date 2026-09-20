@@ -906,6 +906,7 @@ template void on_upstream_response<IoUringEventLoop>(void*, Connection&, IoEvent
 template void on_proxy_response_sent<IoUringEventLoop>(void*, Connection&, IoEvent);
 template void continue_http1_request_boundary<IoUringEventLoop>(IoUringEventLoop*, Connection&);
 template void on_response_header_sent<IoUringEventLoop>(void*, Connection&, IoEvent);
+template void on_complete_response_sent<IoUringEventLoop>(void*, Connection&, IoEvent);
 template void on_response_body_recvd<IoUringEventLoop>(void*, Connection&, IoEvent);
 template void on_response_body_sent<IoUringEventLoop>(void*, Connection&, IoEvent);
 template void pump_response_read_deadline_body<IoUringEventLoop>(IoUringEventLoop*, Connection&);
