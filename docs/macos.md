@@ -10,19 +10,20 @@ Install Xcode Command Line Tools (`xcode-select --install`) and the existing
 project build dependencies. With Homebrew:
 
 ```bash
-brew install cmake ninja llvm boost ragel
+brew install cmake ninja llvm@20 boost ragel
 git submodule update --init --recursive
 ./dev.sh build
 ./dev.sh test
 ```
 
-`dev.sh` locates Homebrew's keg-only LLVM. A manual build can use:
+`dev.sh` uses Homebrew's keg-only LLVM 20 for the compiler, JIT library, formatter
+and linter. A manual build can use:
 
 ```bash
 cmake -B build -G Ninja \
-  -DCMAKE_C_COMPILER="$(brew --prefix llvm)/bin/clang" \
-  -DCMAKE_CXX_COMPILER="$(brew --prefix llvm)/bin/clang++" \
-  -DLLVM_DIR="$(brew --prefix llvm)/lib/cmake/llvm"
+  -DCMAKE_C_COMPILER="$(brew --prefix llvm@20)/bin/clang" \
+  -DCMAKE_CXX_COMPILER="$(brew --prefix llvm@20)/bin/clang++" \
+  -DLLVM_DIR="$(brew --prefix llvm@20)/lib/cmake/llvm"
 cmake --build build
 ctest --test-dir build --output-on-failure
 ```

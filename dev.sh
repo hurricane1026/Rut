@@ -19,20 +19,27 @@ SRC_FILES=$(find "$PROJECT_DIR/include" "$PROJECT_DIR/src" "$PROJECT_DIR/tests" 
     "$PROJECT_DIR/testing" "$PROJECT_DIR/bench" \
     -name '*.h' -o -name '*.cc' 2>/dev/null | grep -v third_party)
 
-# Homebrew LLVM is keg-only. On macOS use the installed toolchain consistently
-# (compiler, formatter and linter), while respecting explicit CC/CXX overrides.
+# Use LLVM 20 consistently for macOS compilation, JIT, formatting and linting.
+# Explicit CC/CXX overrides are still honored.
 RUT_CMAKE_ARGS=(-DCMAKE_C_COMPILER="${CC:-clang}" -DCMAKE_CXX_COMPILER="${CXX:-clang++}")
-if [[ "$(uname -s)" == Darwin ]] && command -v brew >/dev/null 2>&1; then
-    RUT_LLVM_PREFIX=$(brew --prefix llvm 2>/dev/null || true)
-    if [[ -n "$RUT_LLVM_PREFIX" && -d "$RUT_LLVM_PREFIX/bin" ]]; then
-        export PATH="$RUT_LLVM_PREFIX/bin:$PATH"
-        RUT_CMAKE_ARGS+=("-DLLVM_DIR=$RUT_LLVM_PREFIX/lib/cmake/llvm")
+if [[ "$(uname -s)" == Darwin ]]; then
+    RUT_LLVM_PREFIX=$(brew --prefix llvm@20 2>/dev/null || true)
+    if [[ -z "$RUT_LLVM_PREFIX" || ! -x "$RUT_LLVM_PREFIX/bin/clang++" ]]; then
+        echo "LLVM 20 is required on macOS. Install it with: brew install llvm@20" >&2
+        exit 1
     fi
+    export PATH="$RUT_LLVM_PREFIX/bin:$PATH"
+    RUT_CMAKE_ARGS=(
+        -DCMAKE_C_COMPILER="${CC:-$RUT_LLVM_PREFIX/bin/clang}"
+        -DCMAKE_CXX_COMPILER="${CXX:-$RUT_LLVM_PREFIX/bin/clang++}"
+        -DLLVM_DIR="$RUT_LLVM_PREFIX/lib/cmake/llvm"
+    )
 fi
 
-# ---- Configure (if needed) ----
+# ---- Configure ----
 configure() {
-    if [ ! -f "$BUILD_DIR/build.ninja" ]; then
+    # Reconfigure on macOS so a cached LLVM 23 build cannot bypass toolchain selection.
+    if [[ ! -f "$BUILD_DIR/build.ninja" || "$(uname -s)" == Darwin ]]; then
         echo "=== Configuring (clang, Ninja) ==="
         cmake -B "$BUILD_DIR" -G Ninja \
             "${RUT_CMAKE_ARGS[@]}" \
@@ -58,8 +65,7 @@ test() {
 coverage() {
     echo "=== Building with coverage ==="
     cmake -B "$BUILD_DIR-cov" -G Ninja \
-        -DCMAKE_C_COMPILER=clang \
-        -DCMAKE_CXX_COMPILER=clang++ \
+        "${RUT_CMAKE_ARGS[@]}" \
         -DCMAKE_CXX_FLAGS="-fprofile-instr-generate -fcoverage-mapping" \
         -DCMAKE_BUILD_TYPE=Debug \
         "$PROJECT_DIR"
