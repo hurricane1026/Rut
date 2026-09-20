@@ -1741,6 +1741,101 @@ public:
         return true;
     }
 
+    [[nodiscard]] static ResponseReadDeadlineSendKind response_read_deadline_tls_send_kind(
+        const Connection& c) {
+        switch (c.response_read_deadline_post_commit_phase) {
+            case ResponseReadDeadlinePostCommitPhase::HeaderSend:
+                return ResponseReadDeadlineSendKind::Header;
+            case ResponseReadDeadlinePostCommitPhase::BodySend:
+                return ResponseReadDeadlineSendKind::Body;
+            case ResponseReadDeadlinePostCommitPhase::CombinedSend:
+                return ResponseReadDeadlineSendKind::Combined;
+            case ResponseReadDeadlinePostCommitPhase::None:
+            case ResponseReadDeadlinePostCommitPhase::Buffering:
+            case ResponseReadDeadlinePostCommitPhase::WaitingBody:
+            case ResponseReadDeadlinePostCommitPhase::OriginComplete:
+                return ResponseReadDeadlineSendKind::None;
+        }
+        return ResponseReadDeadlineSendKind::None;
+    }
+
+    [[nodiscard]] static Connection::Callback response_read_deadline_tls_send_callback(
+        ResponseReadDeadlineSendKind kind) {
+        switch (kind) {
+            case ResponseReadDeadlineSendKind::Header:
+                return &on_response_header_sent<Self>;
+            case ResponseReadDeadlineSendKind::Body:
+                return &on_response_body_sent<Self>;
+            case ResponseReadDeadlineSendKind::Combined:
+                return &on_complete_response_sent<Self>;
+            case ResponseReadDeadlineSendKind::None:
+                return nullptr;
+        }
+        return nullptr;
+    }
+
+    [[nodiscard]] bool response_read_deadline_tls_send_frame_is_valid(
+        const Connection& c,
+        ResponseReadDeadlineSendKind kind,
+        Connection::Callback callback,
+        const u8* src,
+        u32 len) const {
+        if (c.id >= connection_capacity || c.fd < 0 || !c.tls_active || !c.tls_handshake_complete ||
+            !c.uses_iouring_tls() || c.protocol != ConnProtocol::Http11 || c.h2 != nullptr ||
+            c.state != ConnState::Sending || c.req_start_us == 0 || c.epoch_held ||
+            callback == nullptr || c.on_send != callback || src == nullptr || len == 0 ||
+            c.response_read_deadline_post_commit_generation == 0 ||
+            c.response_read_deadline_post_commit_generation !=
+                c.response_read_deadline_generation ||
+            c.response_read_deadline_buffering !=
+                ForwardResponseBufferingMode::CompleteContentLength ||
+            c.response_read_deadline_send_owner_generation == 0 ||
+            c.response_read_deadline_send_deadline_generation !=
+                c.response_read_deadline_post_commit_generation ||
+            c.response_read_deadline_send_upstream_episode !=
+                c.response_read_deadline_post_commit_episode ||
+            c.response_read_deadline_send_fd != c.fd || c.response_read_deadline_send_src != src ||
+            c.response_read_deadline_send_len != len || c.response_read_deadline_send_kind != kind)
+            return false;
+
+        switch (kind) {
+            case ResponseReadDeadlineSendKind::Header:
+                return c.response_read_deadline_post_commit_phase ==
+                           ResponseReadDeadlinePostCommitPhase::HeaderSend &&
+                       callback == &on_response_header_sent<Self> &&
+                       src == c.response_header_buf.data() && len == c.response_header_buf.len() &&
+                       c.response_read_deadline_post_commit_inflight_body == 0 &&
+                       c.upstream_send_len == c.response_read_deadline_post_commit_raw_header_end &&
+                       c.upstream_recv_buf.len() >= c.upstream_send_len;
+            case ResponseReadDeadlineSendKind::Body:
+                return c.response_read_deadline_post_commit_phase ==
+                           ResponseReadDeadlinePostCommitPhase::BodySend &&
+                       callback == &on_response_body_sent<Self> &&
+                       src == c.upstream_recv_buf.data() &&
+                       len == c.response_read_deadline_post_commit_inflight_body && len != 0 &&
+                       c.upstream_send_len == len && c.upstream_recv_buf.len() >= len;
+            case ResponseReadDeadlineSendKind::Combined:
+                return c.response_read_deadline_post_commit_phase ==
+                           ResponseReadDeadlinePostCommitPhase::CombinedSend &&
+                       callback == &on_complete_response_sent<Self> &&
+                       src == c.response_header_buf.data() &&
+                       response_read_deadline_combined_send_frame_is_stable(c) &&
+                       len == c.response_read_deadline_send_len;
+            case ResponseReadDeadlineSendKind::None:
+                return false;
+        }
+        return false;
+    }
+
+    [[nodiscard]] static bool response_read_deadline_send_fields_are_neutral(const Connection& c) {
+        bool neutral = true;
+        const auto check = [&](const auto& value, const auto& reset_value) {
+            neutral = neutral && value == reset_value;
+        };
+        Connection::visit_response_read_deadline_send_owner_fields(c, check);
+        return neutral;
+    }
+
     bool consume_response_read_deadline_send_event(Connection& c, const IoEvent& ev) {
         if (ev.type != IoEventType::Send) return false;
         if (!c.response_read_deadline_send_owner_active) {
@@ -1839,6 +1934,34 @@ public:
                 break;
             default:
                 return false;
+        }
+        if (c.tls_active) {
+            const bool exact_tuple =
+                !c.response_read_deadline_send_owner_active &&
+                c.response_read_deadline_send_owner_generation != 0 &&
+                c.response_read_deadline_send_tombstone_generation ==
+                    c.response_read_deadline_send_owner_generation &&
+                c.response_read_deadline_send_deadline_generation ==
+                    c.response_read_deadline_generation &&
+                c.response_read_deadline_send_deadline_generation ==
+                    c.response_read_deadline_post_commit_generation &&
+                c.response_read_deadline_send_upstream_episode ==
+                    c.response_read_deadline_post_commit_episode &&
+                c.response_read_deadline_send_fd == c.fd &&
+                c.response_read_deadline_send_src != nullptr &&
+                response_read_deadline_tls_send_frame_is_valid(c,
+                                                               kind,
+                                                               expected_callback,
+                                                               c.response_read_deadline_send_src,
+                                                               c.response_read_deadline_send_len);
+            return exact_tuple && ev.type == IoEventType::Send && !ev.more && ev.aux == 0 &&
+                   ev.conn_id == c.id &&
+                   ev.non_upstream_generation == c.response_read_deadline_send_owner_generation &&
+                   ev.result > 0 &&
+                   static_cast<u32>(ev.result) == c.response_read_deadline_send_len &&
+                   !c.send_armed && c.on_send == expected_callback &&
+                   c.tls_raw_send_owner_is_neutral() && c.tls_single_shot_send_owner_is_neutral() &&
+                   c.tls_out_buf.len() == 0;
         }
         const auto& send = backend.send_state[c.id];
         return !c.response_read_deadline_send_owner_active &&
@@ -2585,12 +2708,46 @@ public:
             close_conn(c);
             return;
         }
-        if (continuation == nullptr) return;
 
         IoEvent ev = {};
         ev.conn_id = c.id;
         ev.type = IoEventType::Send;
         ev.result = static_cast<i32>(witness.len);
+        const ResponseReadDeadlineSendKind strict_kind = response_read_deadline_tls_send_kind(c);
+        if (strict_kind != ResponseReadDeadlineSendKind::None) {
+            const bool owner_matches =
+                continuation != nullptr && c.on_send == continuation &&
+                c.response_read_deadline_send_owner_active &&
+                c.response_read_deadline_send_owner_generation == witness.generation &&
+                c.response_read_deadline_send_fd == witness.fd &&
+                c.response_read_deadline_send_src == witness.src &&
+                c.response_read_deadline_send_len == witness.len &&
+                c.response_read_deadline_send_tombstone_generation < witness.generation &&
+                c.response_read_deadline_send_deadline_generation ==
+                    c.response_read_deadline_post_commit_generation &&
+                c.response_read_deadline_send_upstream_episode ==
+                    c.response_read_deadline_post_commit_episode &&
+                response_read_deadline_tls_send_frame_is_valid(
+                    c, strict_kind, continuation, witness.src, witness.len);
+            if (!owner_matches) {
+                close_conn(c);
+                return;
+            }
+            c.response_read_deadline_send_owner_active = false;
+            c.response_read_deadline_send_tombstone_generation = witness.generation;
+            ev.non_upstream_generation = witness.generation;
+            if (!response_read_deadline_send_completion_is_valid(c, ev, strict_kind)) {
+                close_conn(c);
+                return;
+            }
+        } else if (!response_read_deadline_send_fields_are_neutral(c)) {
+            close_conn(c);
+            return;
+        }
+        if (continuation == nullptr) {
+            if (strict_kind != ResponseReadDeadlineSendKind::None) close_conn(c);
+            return;
+        }
         continuation(this, c, ev);
     }
 
@@ -2682,6 +2839,15 @@ public:
                 close_conn(c);
                 return false;
             }
+            const ResponseReadDeadlineSendKind strict_kind =
+                response_read_deadline_tls_send_kind(c);
+            const Connection::Callback strict_callback =
+                response_read_deadline_tls_send_callback(strict_kind);
+            if (!response_read_deadline_send_fields_are_neutral(c) ||
+                (strict_kind != ResponseReadDeadlineSendKind::None && strict_callback == nullptr)) {
+                close_conn(c);
+                return false;
+            }
             u32 generation = 0;
             if (!c.next_non_upstream_send_generation(generation)) return false;
             c.tls_send_owner_generation = generation;
@@ -2691,6 +2857,24 @@ public:
             c.tls_send_src = buf;
             c.tls_send_len = len;
             c.tls_send_off = 0;
+            if (strict_kind != ResponseReadDeadlineSendKind::None) {
+                c.response_read_deadline_send_owner_generation = generation;
+                c.response_read_deadline_send_deadline_generation =
+                    c.response_read_deadline_post_commit_generation;
+                c.response_read_deadline_send_upstream_episode =
+                    c.response_read_deadline_post_commit_episode;
+                c.response_read_deadline_send_src = buf;
+                c.response_read_deadline_send_len = len;
+                c.response_read_deadline_send_fd = c.fd;
+                c.response_read_deadline_send_kind = strict_kind;
+                c.response_read_deadline_send_owner_active = true;
+                if (c.response_read_deadline_send_tombstone_generation >= generation ||
+                    !response_read_deadline_tls_send_frame_is_valid(
+                        c, strict_kind, strict_callback, buf, len)) {
+                    close_conn(c);
+                    return false;
+                }
+            }
             u32 consumed = 0;
             const TlsFill kFs = tls_fill_output<Self>(this, c, buf, len, consumed);
             c.tls_send_off = consumed;
@@ -4924,6 +5108,12 @@ public:
                     backend.send_state[c.id].generation;
             c.response_read_deadline_send_close_target_owned = c.send_armed;
             c.response_read_deadline_send_close_cancel_owned = false;
+        } else if (c.tls_active && !c.tls_out_inflight &&
+                   c.response_read_deadline_send_owner_active) {
+            // A strict TLS logical owner with no raw ciphertext target is not a
+            // kernel Send. Drop only its semantic tuple; the independent recv
+            // owner below still retains its own target/cancel accounting.
+            c.clear_response_read_deadline_send_owner();
         } else if (c.response_read_deadline_send_owner_active) {
             c.response_read_deadline_send_close_generation =
                 c.response_read_deadline_send_owner_generation;
