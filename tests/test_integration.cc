@@ -5918,9 +5918,12 @@ struct TlsClientPeer {
     }
 };
 
-bool tls_engine_handshake_loopback(TlsEngine& eng, TlsClientPeer& cl) {
+bool tls_engine_handshake_loopback(TlsEngine& eng, TlsClientPeer& cl, bool tls13_only = false) {
     cl.ctx = create_test_client_ctx();
     if (!cl.ctx) return false;
+    if (tls13_only && (SSL_CTX_set_min_proto_version(cl.ctx, TLS1_3_VERSION) != 1 ||
+                       SSL_CTX_set_max_proto_version(cl.ctx, TLS1_3_VERSION) != 1))
+        return false;
     cl.ssl = SSL_new(cl.ctx);
     if (!cl.ssl) return false;
     cl.rbio = BIO_new(BIO_s_mem());
@@ -5944,6 +5947,8 @@ bool tls_engine_handshake_loopback(TlsEngine& eng, TlsClientPeer& cl) {
     return client_done && eng.handshake_done;
 }
 
+struct TlsKeyUpdateDiagnostic;
+
 struct TlsIouringHarness : SmallLoop {
     [[maybe_unused]] static constexpr u32 kTlsDrainChunk = SlicePool::kSliceSize;
     [[maybe_unused]] static constexpr u32 kTlsOutHigh = IoUringEventLoop::kTlsOutHigh;
@@ -5963,6 +5968,7 @@ struct TlsIouringHarness : SmallLoop {
     u32 connection_capacity = SmallLoop::kMaxConns;
     bool sent = false;
     bool closed = false;
+    TlsKeyUpdateDiagnostic* key_update_diagnostic = nullptr;
 
     bool submit_send_raw(Connection& /*conn*/, const u8* /*buf*/, u32 len) {
         sent = len > 0;
@@ -6032,6 +6038,152 @@ struct TlsIouringHarness : SmallLoop {
     void disarm_yield_timer(Connection& /*conn*/) {}
 };
 
+enum class TlsKeyUpdatePeer : u8 { Client, Server };
+
+struct TlsKeyUpdateDiagnostic {
+    u32 client_requested_out = 0;
+    u32 server_requested_in = 0;
+    // The SSL message callback observes serialization, not transport delivery.
+    u32 server_reciprocal_serialized = 0;
+    u32 client_reciprocal_in = 0;
+    u32 malformed_key_updates = 0;
+    u32 key_update_version = 0;
+
+    u32 app_callback_calls = 0;
+    u32 app_plaintext_len = 0;
+    bool app_plaintext_matches = false;
+    bool callback_entry_raw_inflight = true;
+    u32 callback_entry_output_len = UINT32_MAX;
+    u32 callback_entry_reciprocal_serialized = UINT32_MAX;
+    u32 callback_entry_pending_ops = UINT32_MAX;
+    u32 callback_entry_logical_owner = UINT32_MAX;
+    u32 callback_entry_raw_generation = UINT32_MAX;
+    u32 callback_entry_raw_len = UINT32_MAX;
+    TlsFill response_fill = TlsFill::Fatal;
+    u32 response_plaintext_consumed = 0;
+    u32 logical_callback_calls = 0;
+    u32 logical_callback_result = 0;
+};
+
+struct TlsKeyUpdateMessageArg {
+    TlsKeyUpdateDiagnostic* diagnostic = nullptr;
+    TlsKeyUpdatePeer peer = TlsKeyUpdatePeer::Client;
+};
+
+static constexpr char kTlsKeyUpdateRequest[] = "GET /key-update HTTP/1.1\r\nHost: x\r\n\r\n";
+static constexpr char kTlsKeyUpdateResponse[] =
+    "HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: keep-alive\r\n\r\nok";
+
+void tls_key_update_message_callback(int write_p,
+                                     int version,
+                                     int content_type,
+                                     const void* message,
+                                     size_t message_len,
+                                     SSL* /*ssl*/,
+                                     void* arg) {
+    if (content_type != SSL3_RT_HANDSHAKE || message == nullptr || arg == nullptr) return;
+    auto* endpoint = static_cast<TlsKeyUpdateMessageArg*>(arg);
+    if (endpoint->diagnostic == nullptr) return;
+    auto& diagnostic = *endpoint->diagnostic;
+    const auto* bytes = static_cast<const u8*>(message);
+    size_t offset = 0;
+    while (offset + 4u <= message_len) {
+        const u8 type = bytes[offset];
+        const size_t body_len = (static_cast<size_t>(bytes[offset + 1u]) << 16u) |
+                                (static_cast<size_t>(bytes[offset + 2u]) << 8u) |
+                                static_cast<size_t>(bytes[offset + 3u]);
+        const size_t message_size = body_len + 4u;
+        if (message_size > message_len - offset) {
+            if (type == SSL3_MT_KEY_UPDATE) diagnostic.malformed_key_updates++;
+            return;
+        }
+        if (type == SSL3_MT_KEY_UPDATE) {
+            if (message_size != 5u || body_len != 1u || version != TLS1_3_VERSION ||
+                bytes[offset + 4u] > SSL_KEY_UPDATE_REQUESTED) {
+                diagnostic.malformed_key_updates++;
+            } else {
+                diagnostic.key_update_version = static_cast<u32>(version);
+                const bool requested = bytes[offset + 4u] == SSL_KEY_UPDATE_REQUESTED;
+                if (endpoint->peer == TlsKeyUpdatePeer::Client && write_p && requested)
+                    diagnostic.client_requested_out++;
+                else if (endpoint->peer == TlsKeyUpdatePeer::Server && !write_p && requested)
+                    diagnostic.server_requested_in++;
+                else if (endpoint->peer == TlsKeyUpdatePeer::Server && write_p && !requested)
+                    diagnostic.server_reciprocal_serialized++;
+                else if (endpoint->peer == TlsKeyUpdatePeer::Client && !write_p && !requested)
+                    diagnostic.client_reciprocal_in++;
+            }
+        }
+        offset += message_size;
+    }
+}
+
+void tls_key_update_logical_send_probe(void* lp, Connection& /*conn*/, IoEvent ev) {
+    auto* loop = static_cast<TlsIouringHarness*>(lp);
+    if (loop == nullptr || loop->key_update_diagnostic == nullptr) return;
+    auto& diagnostic = *loop->key_update_diagnostic;
+    diagnostic.logical_callback_calls++;
+    diagnostic.logical_callback_result = ev.result > 0 ? static_cast<u32>(ev.result) : 0;
+}
+
+void tls_key_update_plaintext_probe(void* lp, Connection& conn, IoEvent ev) {
+    auto* loop = static_cast<TlsIouringHarness*>(lp);
+    if (loop == nullptr || loop->key_update_diagnostic == nullptr) return;
+    auto& diagnostic = *loop->key_update_diagnostic;
+    diagnostic.app_callback_calls++;
+    diagnostic.app_plaintext_len = ev.result > 0 ? static_cast<u32>(ev.result) : 0;
+    diagnostic.app_plaintext_matches =
+        ev.result == static_cast<i32>(sizeof(kTlsKeyUpdateRequest) - 1u) &&
+        conn.recv_buf.len() == sizeof(kTlsKeyUpdateRequest) - 1u &&
+        memcmp(conn.recv_buf.data(), kTlsKeyUpdateRequest, sizeof(kTlsKeyUpdateRequest) - 1u) == 0;
+    diagnostic.callback_entry_raw_inflight = conn.tls_out_inflight;
+    diagnostic.callback_entry_output_len = conn.tls_out_buf.len();
+    diagnostic.callback_entry_reciprocal_serialized = diagnostic.server_reciprocal_serialized;
+    diagnostic.callback_entry_pending_ops = conn.pending_ops;
+    diagnostic.callback_entry_logical_owner = conn.tls_send_owner_generation;
+    diagnostic.callback_entry_raw_generation = conn.tls_out_inflight_generation;
+    diagnostic.callback_entry_raw_len = conn.tls_out_inflight_len;
+    if (!diagnostic.app_plaintext_matches || conn.tls_out_inflight || conn.tls_out_buf.len() != 0 ||
+        conn.send_armed || diagnostic.server_requested_in != 1u ||
+        diagnostic.server_reciprocal_serialized > 1u) {
+        loop->close_conn(conn);
+        return;
+    }
+
+    u32 generation = 0;
+    if (!conn.next_non_upstream_send_generation(generation)) {
+        loop->close_conn(conn);
+        return;
+    }
+    conn.transition_to_sending(&tls_key_update_logical_send_probe);
+    conn.tls_send_owner_generation = generation;
+    conn.tls_send_owner_fd = conn.fd;
+    conn.tls_send_owner_handler_generation = conn.handler_gen;
+    conn.tls_pending_on_send = conn.on_send;
+    conn.tls_send_src = reinterpret_cast<const u8*>(kTlsKeyUpdateResponse);
+    conn.tls_send_len = sizeof(kTlsKeyUpdateResponse) - 1u;
+    conn.tls_send_off = 0;
+    u32 consumed = 0;
+    diagnostic.response_fill = tls_fill_output<TlsIouringHarness>(
+        loop, conn, conn.tls_send_src, conn.tls_send_len, consumed);
+    diagnostic.response_plaintext_consumed = consumed;
+    conn.tls_send_off = consumed;
+    if (diagnostic.response_fill != TlsFill::Done || consumed != conn.tls_send_len)
+        loop->close_conn(conn);
+}
+
+struct ScopedTlsKeyUpdateResources {
+    Connection& conn;
+    TlsClientPeer& client;
+    TlsServerContext* context;
+
+    ~ScopedTlsKeyUpdateResources() {
+        client.destroy();
+        tls_engine_free(conn.tls_engine);
+        if (context != nullptr) destroy_tls_server_context(context);
+    }
+};
+
 bool g_tls_iouring_plain_recv_called = false;
 u32 g_tls_iouring_plain_recv_result = 0;
 
@@ -6082,6 +6234,182 @@ void tls_iouring_next_request_probe(void* /*lp*/, Connection& conn, IoEvent ev) 
         __builtin_memcpy(g_tls_iouring_next_request_buf, conn.recv_buf.data(), copy_len);
 }
 }  // namespace
+
+// Diagnostic for TLS 1.3's requested/reciprocal KeyUpdate ordering. The client
+// sends one input flight containing both KeyUpdate(REQUESTED) and a GET. The
+// server's SSL_read callback records its state before its response SSL_write
+// flushes the reciprocal control message queued by BoringSSL.
+TEST(tls_iouring, tls13_key_update_with_request_is_observed_and_reciprocated) {
+    auto tls_ctx = create_tls_server_context(kTestCertPath, kTestKeyPath);
+    REQUIRE(tls_ctx.has_value());
+
+    TlsIouringHarness loop;
+    Connection& conn = loop.conns[0];
+    u8 tls_in_storage[4096]{};
+    u8 tls_out_storage[4096]{};
+    conn.reset();
+    conn.id = 0;
+    conn.fd = 42;
+    conn.tls_active = true;
+    conn.keep_alive = true;
+    conn.recv_slice = loop.recv_storage[0];
+    conn.tls_in_slice = tls_in_storage;
+    conn.tls_out_slice = tls_out_storage;
+    conn.recv_buf.bind(loop.recv_storage[0], sizeof(loop.recv_storage[0]));
+    conn.tls_in_buf.bind(tls_in_storage, sizeof(tls_in_storage));
+    conn.tls_out_buf.bind(tls_out_storage, sizeof(tls_out_storage));
+    TlsClientPeer client;
+    ScopedTlsKeyUpdateResources cleanup{conn, client, tls_ctx.value()};
+    REQUIRE(tls_engine_init(conn.tls_engine, tls_ctx.value()).has_value());
+    REQUIRE(tls_engine_handshake_loopback(conn.tls_engine, client, /*tls13_only=*/true));
+    REQUIRE_EQ(SSL_version(client.ssl), TLS1_3_VERSION);
+    REQUIRE_EQ(SSL_version(conn.tls_engine.ssl), TLS1_3_VERSION);
+    conn.tls_handshake_complete = true;
+
+    // The loopback handshake may leave a TLS 1.3 NewSessionTicket for the
+    // client. Consume post-handshake control traffic before installing the
+    // message observers so they count only this test's KeyUpdate exchange.
+    bool settled = false;
+    for (u32 attempt = 0; attempt < 8u; attempt++) {
+        char scratch[256];
+        const int read = SSL_read(client.ssl, scratch, sizeof(scratch));
+        if (read > 0) break;
+        const int error = SSL_get_error(client.ssl, read);
+        if (error == SSL_ERROR_WANT_READ) {
+            settled = true;
+            break;
+        }
+        CHECK(false);
+        break;
+    }
+    REQUIRE(settled);
+    REQUIRE_EQ(BIO_ctrl_pending(client.rbio), 0u);
+    REQUIRE_EQ(BIO_ctrl_pending(client.wbio), 0u);
+
+    TlsKeyUpdateDiagnostic diagnostic;
+    TlsKeyUpdateMessageArg client_observer{&diagnostic, TlsKeyUpdatePeer::Client};
+    TlsKeyUpdateMessageArg server_observer{&diagnostic, TlsKeyUpdatePeer::Server};
+    SSL_set_msg_callback(client.ssl, &tls_key_update_message_callback);
+    SSL_set_msg_callback_arg(client.ssl, &client_observer);
+    SSL_set_msg_callback(conn.tls_engine.ssl, &tls_key_update_message_callback);
+    SSL_set_msg_callback_arg(conn.tls_engine.ssl, &server_observer);
+    loop.key_update_diagnostic = &diagnostic;
+
+    REQUIRE_EQ(BIO_ctrl_pending(client.wbio), 0u);
+    REQUIRE_EQ(SSL_key_update(client.ssl, SSL_KEY_UPDATE_REQUESTED), 1);
+    // SSL_key_update only queues the update; one following SSL_write emits the
+    // requested message and the complete request into the same BIO flight.
+    REQUIRE_EQ(BIO_ctrl_pending(client.wbio), 0u);
+    REQUIRE_EQ(diagnostic.server_requested_in, 0u);
+    REQUIRE_EQ(
+        SSL_write(
+            client.ssl, kTlsKeyUpdateRequest, static_cast<int>(sizeof(kTlsKeyUpdateRequest) - 1u)),
+        static_cast<int>(sizeof(kTlsKeyUpdateRequest) - 1u));
+    u8 client_flight[4096];
+    const size_t client_flight_len = BIO_ctrl_pending(client.wbio);
+    REQUIRE_GT(client_flight_len, 0u);
+    REQUIRE_LE(client_flight_len, sizeof(client_flight));
+    REQUIRE_EQ(BIO_read(client.wbio, client_flight, static_cast<int>(client_flight_len)),
+               static_cast<int>(client_flight_len));
+    REQUIRE_EQ(BIO_ctrl_pending(client.wbio), 0u);
+    REQUIRE_EQ(diagnostic.client_requested_out, 1u);
+    REQUIRE_EQ(diagnostic.server_requested_in, 0u);
+
+    REQUIRE_EQ(conn.tls_in_buf.write(client_flight, static_cast<u32>(client_flight_len)),
+               client_flight_len);
+    conn.on_recv = &tls_recv<TlsIouringHarness>;
+    conn.transition_to_reading_header(&tls_key_update_plaintext_probe);
+    IoEvent recv = {};
+    recv.conn_id = conn.id;
+    recv.type = IoEventType::Recv;
+    recv.result = static_cast<i32>(client_flight_len);
+    conn.on_recv(&loop, conn, recv);
+
+    CHECK_FALSE(loop.closed);
+    CHECK_EQ(diagnostic.server_requested_in, 1u);
+    CHECK_EQ(diagnostic.app_callback_calls, 1u);
+    CHECK(diagnostic.app_plaintext_matches);
+    CHECK_EQ(diagnostic.app_plaintext_len, sizeof(kTlsKeyUpdateRequest) - 1u);
+    // The message callback can observe the reciprocal while BoringSSL is
+    // serializing/queuing it, before any ciphertext is exposed to this loop.
+    // Preserve that count as an observation, not as proof of network output;
+    // the client's incoming callback below proves actual protocol receipt.
+    CHECK_FALSE(diagnostic.callback_entry_raw_inflight);
+    CHECK_EQ(diagnostic.callback_entry_output_len, 0u);
+    CHECK_LE(diagnostic.callback_entry_reciprocal_serialized, 1u);
+    CHECK_EQ(diagnostic.callback_entry_pending_ops, 0u);
+    CHECK_EQ(diagnostic.callback_entry_logical_owner, 0u);
+    CHECK_EQ(diagnostic.callback_entry_raw_generation, 0u);
+    CHECK_EQ(diagnostic.callback_entry_raw_len, 0u);
+    CHECK_EQ(diagnostic.response_fill, TlsFill::Done);
+    CHECK_EQ(diagnostic.response_plaintext_consumed, sizeof(kTlsKeyUpdateResponse) - 1u);
+    CHECK_EQ(diagnostic.server_reciprocal_serialized, 1u);
+    CHECK(conn.tls_out_inflight);
+    CHECK_GT(conn.tls_out_inflight_len, 0u);
+
+    // Deliver each exact owned ciphertext prefix to the client before its
+    // matching tagged raw completion. The harness accounts each CQE once, then
+    // lets the production drain callback retire the output and logical owner.
+    for (u32 drain = 0; conn.tls_out_inflight && drain < 8u; drain++) {
+        REQUIRE(loop.tls_ciphertext_send_is_current(conn));
+        const u32 raw_len = conn.tls_out_inflight_len;
+        const u32 raw_generation = conn.tls_out_inflight_generation;
+        REQUIRE_GT(raw_len, 0u);
+        REQUIRE_EQ(BIO_write(client.rbio, conn.tls_out_buf.data(), static_cast<int>(raw_len)),
+                   static_cast<int>(raw_len));
+        auto& send = loop.backend.send_state[conn.id];
+        send.offset = raw_len;
+        send.remaining = 0;
+        REQUIRE_GT(conn.pending_ops, 0u);
+        conn.pending_ops--;
+        conn.send_armed = false;
+        IoEvent sent = {};
+        sent.conn_id = conn.id;
+        sent.type = IoEventType::Send;
+        sent.result = static_cast<i32>(raw_len);
+        sent.non_upstream_generation = raw_generation;
+        tls_on_out_drain<TlsIouringHarness>(&loop, conn, sent);
+        CHECK_FALSE(loop.closed);
+    }
+
+    CHECK_FALSE(conn.tls_out_inflight);
+    CHECK_EQ(conn.tls_out_buf.len(), 0u);
+    CHECK(conn.tls_raw_send_owner_is_neutral());
+    CHECK(conn.tls_single_shot_send_owner_is_neutral());
+    CHECK_EQ(diagnostic.logical_callback_calls, 1u);
+    CHECK_EQ(diagnostic.logical_callback_result, sizeof(kTlsKeyUpdateResponse) - 1u);
+
+    u8 response[sizeof(kTlsKeyUpdateResponse)];
+    u32 response_len = 0;
+    bool client_wants_read = false;
+    for (u32 read_attempt = 0; read_attempt < 16u; read_attempt++) {
+        const int read = SSL_read(
+            client.ssl, response + response_len, static_cast<int>(sizeof(response) - response_len));
+        if (read > 0) {
+            response_len += static_cast<u32>(read);
+            if (response_len == sizeof(kTlsKeyUpdateResponse) - 1u) break;
+            continue;
+        }
+        client_wants_read = SSL_get_error(client.ssl, read) == SSL_ERROR_WANT_READ;
+        break;
+    }
+    CHECK_EQ(response_len, sizeof(kTlsKeyUpdateResponse) - 1u);
+    CHECK(response_len == sizeof(kTlsKeyUpdateResponse) - 1u &&
+          memcmp(response, kTlsKeyUpdateResponse, response_len) == 0);
+    if (response_len == sizeof(kTlsKeyUpdateResponse) - 1u) {
+        const int extra = SSL_read(client.ssl, response, sizeof(response));
+        CHECK_LE(extra, 0);
+        if (extra <= 0) client_wants_read = SSL_get_error(client.ssl, extra) == SSL_ERROR_WANT_READ;
+    }
+    CHECK(client_wants_read);
+    CHECK_EQ(diagnostic.client_reciprocal_in, 1u);
+    CHECK_EQ(diagnostic.malformed_key_updates, 0u);
+    CHECK_EQ(diagnostic.key_update_version, TLS1_3_VERSION);
+    CHECK_FALSE(loop.closed);
+    CHECK(conn.tls_active);
+    CHECK_EQ(conn.pending_ops, 0u);
+    CHECK_EQ(BIO_ctrl_pending(client.rbio), 0u);
+}
 
 // Model a legal parked-owner resume state corresponding to WANT_READ without
 // forcing SSL_write to produce that result, then feed real TLS app data through
