@@ -43296,6 +43296,147 @@ TEST(response_read_deadline, tls_complete_get_copy_owner_requires_full_profile_w
     }
 }
 
+TEST(tls_iouring, deferred_boundary_drains_buffered_next_request_with_recv_still_armed) {
+    auto context_result = create_tls_server_context(RUT_TESTDATA_DIR "/localhost_cert.pem",
+                                                    RUT_TESTDATA_DIR "/localhost_key.pem");
+    REQUIRE(context_result.has_value());
+    std::unique_ptr<TlsServerContext, decltype(&destroy_tls_server_context)> context(
+        context_result.value(), destroy_tls_server_context);
+
+    ScopedIoUringLoopForRetirement guard;
+    if (!guard.init()) SKIP("io_uring unavailable");
+    IoUringEventLoop* loop = guard.loop;
+    ShardMetrics metrics{};
+    metrics.init();
+    loop->metrics = &metrics;
+
+    RouteConfig config{};
+    const RouteConfig* active_config = &config;
+    loop->config_ptr = &active_config;
+    TlsMemoryClientPeer client;
+    REQUIRE(client.init());
+    PrebuiltD2Fixture fixture{};
+    REQUIRE(stage_live_precise_get(loop,
+                                   config,
+                                   &fixture,
+                                   /*force_initial_timer_sq_full=*/false,
+                                   /*downstream_close=*/false,
+                                   RequestPolicyId::Http11FixedStrip,
+                                   &client,
+                                   context.get(),
+                                   /*tls_before_preflight=*/true));
+    struct FixtureCleanup {
+        IoUringEventLoop* loop;
+        PrebuiltD2Fixture* fixture;
+        ~FixtureCleanup() { cleanup_prebuilt_d2(loop, *fixture); }
+    } cleanup{loop, &fixture};
+    REQUIRE(config.add_jit_handler(
+        "/next", kRouteMethodGet, &response_read_timeout_later_handler, false));
+    response_read_timeout_later_handler_calls = 0;
+
+    Connection& conn = *fixture.conn;
+    REQUIRE(conn.tls_active);
+    REQUIRE(conn.tls_engine.handshake_done);
+    REQUIRE_EQ(conn.on_recv, &tls_recv<IoUringEventLoop>);
+    REQUIRE(conn.tls_pending_on_recv == nullptr);
+    // stage_live_precise_get models the already-parsed first request. Restore
+    // its long-lived multishot client-recv owner as it exists in the real keep-
+    // alive path; the event below is positive+MORE, so that owner must survive.
+    REQUIRE_FALSE(conn.recv_armed);
+    conn.recv_armed = true;
+    conn.pending_ops++;
+
+    static constexpr u8 kResponse[] = "HTTP/1.1 200 OK\r\nContent-Length: 1\r\n\r\nx";
+    REQUIRE_EQ(conn.upstream_recv_buf.write(kResponse, sizeof(kResponse) - 1u),
+               sizeof(kResponse) - 1u);
+    const IoEvent response =
+        response_read_copy_event(conn, sizeof(kResponse) - 1u, true, 0, sizeof(kResponse) - 1u);
+    loop->dispatch_batch(&response, 1);
+    REQUIRE_EQ(conn.response_read_deadline_post_commit_phase,
+               ResponseReadDeadlinePostCommitPhase::CombinedSend);
+    REQUIRE(conn.tls_out_inflight);
+    REQUIRE(conn.response_read_timer_phase == ResponseReadTimerPhase::CancelPending);
+    REQUIRE(conn.upstream_retirement_active);
+
+    static constexpr u8 kNextRequest[] = "GET /next HTTP/1.1\r\nHost: client.example\r\n\r\n";
+    REQUIRE_EQ(SSL_write(client.ssl, kNextRequest, sizeof(kNextRequest) - 1u),
+               static_cast<int>(sizeof(kNextRequest) - 1u));
+    u8 next_request_ciphertext[512]{};
+    const int ciphertext_len = BIO_read(
+        SSL_get_wbio(client.ssl), next_request_ciphertext, sizeof(next_request_ciphertext));
+    REQUIRE_GT(ciphertext_len, 0);
+    REQUIRE_EQ(conn.tls_in_buf.write(next_request_ciphertext, static_cast<u32>(ciphertext_len)),
+               static_cast<u32>(ciphertext_len));
+
+    // This is the already-harvested TLS recv while the response ciphertext is
+    // still kernel-owned. tls_process must leave the bytes parked until the raw
+    // send drains; no later socket bytes are supplied in this test.
+    const u32 recv_pending_before = conn.pending_ops;
+    const IoEvent buffered_recv{conn.id, ciphertext_len, 0, 0, IoEventType::Recv, 1};
+    loop->dispatch(buffered_recv);
+    CHECK_EQ(conn.tls_in_buf.len(), static_cast<u32>(ciphertext_len));
+    CHECK_EQ(conn.recv_buf.len(), 0u);
+    CHECK(conn.recv_armed);
+    CHECK_EQ(conn.pending_ops, recv_pending_before);
+    CHECK_EQ(response_read_timeout_later_handler_calls, 0u);
+
+    const u32 conn_id = conn.id;
+    const u32 raw_generation = conn.tls_out_inflight_generation;
+    const u32 raw_len = conn.tls_out_inflight_len;
+    REQUIRE_GT(raw_len, 0u);
+    loop->backend.send_state[conn_id].offset = raw_len;
+    loop->backend.send_state[conn_id].remaining = 0;
+    __atomic_store_n(loop->backend.sq_head,
+                     __atomic_load_n(loop->backend.sq_tail, __ATOMIC_ACQUIRE),
+                     __ATOMIC_RELEASE);
+    loop->backend.pending = 0;
+    const IoEvent raw_send = tls_send_event(conn_id, static_cast<i32>(raw_len), raw_generation);
+    loop->dispatch_batch(&raw_send, 1);
+    REQUIRE(conn.http1_boundary_deferred);
+    CHECK_FALSE(conn.http1_boundary_ready);
+    CHECK(conn.recv_armed);
+    CHECK_EQ(conn.tls_in_buf.len(), static_cast<u32>(ciphertext_len));
+    CHECK_EQ(response_read_timeout_later_handler_calls, 0u);
+    CHECK_EQ(metrics.requests_total, 1u);
+
+    // Retire origin first; the precise timer remains the sole parked owner.
+    drain_staged_tls_prebuilt_retirement(loop, conn, /*cancel_first=*/false);
+    REQUIRE_FALSE(conn.upstream_retirement_active);
+    CHECK(conn.http1_boundary_deferred);
+    CHECK_FALSE(conn.http1_boundary_ready);
+    CHECK(conn.recv_armed);
+    CHECK_EQ(response_read_timeout_later_handler_calls, 0u);
+    REQUIRE(drain_owned_response_read_timer_cqes(loop, conn));
+    REQUIRE(conn.response_read_timer_owner_is_neutral());
+    REQUIRE(conn.http1_boundary_ready);
+    loop->resume_deferred_http1_boundaries();
+
+    // The exact buffered GET reaches the real parser/JIT handler during the
+    // boundary continuation. No additional client CQE was injected after the
+    // original positive+MORE recv, and the existing recv owner was not replaced.
+    CHECK_EQ(response_read_timeout_later_handler_calls, 1u);
+    CHECK_EQ(conn.tls_in_buf.len(), 0u);
+    CHECK(conn.recv_armed);
+    CHECK_EQ(metrics.requests_total, 1u);
+    CHECK(conn.fd >= 0);
+
+    // The local 204 response started by /next may still own one TLS raw send;
+    // settle it before the fixture rolls back its synthetic ring state.
+    if (conn.tls_out_inflight) {
+        const u32 next_raw_generation = conn.tls_out_inflight_generation;
+        const u32 next_raw_len = conn.tls_out_inflight_len;
+        REQUIRE_GT(next_raw_len, 0u);
+        loop->backend.send_state[conn.id].offset = next_raw_len;
+        loop->backend.send_state[conn.id].remaining = 0;
+        __atomic_store_n(loop->backend.sq_head,
+                         __atomic_load_n(loop->backend.sq_tail, __ATOMIC_ACQUIRE),
+                         __ATOMIC_RELEASE);
+        loop->backend.pending = 0;
+        loop->dispatch(
+            tls_send_event(conn.id, static_cast<i32>(next_raw_len), next_raw_generation));
+    }
+}
+
 TEST(response_read_deadline, batch_ledger_rejects_ranges_terminals_and_cancel_zero_byte) {
     enum class Shape : u8 {
         Gap,

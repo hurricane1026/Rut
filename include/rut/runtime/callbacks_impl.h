@@ -7352,6 +7352,9 @@ void proxy_stream_complete(Loop* loop, Connection& conn) {
     conn.http1_pipeline_boundary_owners_settled = false;
     conn.reset_request_receive_buffer();
     conn.transition_to_reading_header(&on_header_received<Loop>);
+    if constexpr (requires { loop->process_buffered_tls_input(conn); }) {
+        if (loop->process_buffered_tls_input(conn)) return;
+    }
     if (!loop->submit_recv(conn) && conn.uses_iouring_tls()) close_conn_if_live(loop, conn);
 }
 
@@ -11497,6 +11500,9 @@ void continue_http1_request_boundary(Loop* loop, Connection& conn) {
     conn.http1_pipeline_boundary_owners_settled = false;
     conn.reset_request_receive_buffer();
     conn.transition_to_reading_header(&on_header_received<Loop>);
+    if constexpr (requires { loop->process_buffered_tls_input(conn); }) {
+        if (loop->process_buffered_tls_input(conn)) return;
+    }
     if (!loop->submit_recv(conn) && conn.uses_iouring_tls()) close_conn_if_live(loop, conn);
 }
 
