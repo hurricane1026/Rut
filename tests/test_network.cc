@@ -30443,6 +30443,80 @@ TEST(iouring_upstream_response, native_client_close_marks_downstream_before_body
     fixture.cleanup();
 }
 
+TEST(iouring_upstream_recv, one_shot_moves_slice_sized_chunks_through_dedicated_ring) {
+    ScopedIoUringLoopForRetirement guard;
+    if (!guard.init()) SKIP("io_uring unavailable");
+    auto* loop = guard.loop;
+    auto& backend = loop->backend;
+    if (backend.large_buf_ring == nullptr) SKIP("dedicated provided buffer ring unavailable");
+    OneShotRecvFixture fixture;
+    REQUIRE(fixture.stage(loop, /*plaintext=*/true));
+    Connection& conn = *fixture.conn;
+    REQUIRE_EQ(conn.upstream_recv_buf.write_avail(), kLargeProvidedBufSize);
+
+    // An empty upstream slice requests one whole slice from the dedicated ring.
+    REQUIRE(loop->submit_recv_upstream(conn));
+    REQUIRE(conn.upstream_recv_armed);
+    const auto& sqe = backend.sq_entries[fixture.sq_tail_before & *backend.sq_ring_mask];
+    CHECK_EQ(sqe.opcode, static_cast<u8>(IORING_OP_RECV));
+    CHECK_EQ(sqe.len, kLargeProvidedBufSize);
+    CHECK_EQ(sqe.buf_group, kLargeBufGroupId);
+    CHECK((sqe.flags & IOSQE_BUFFER_SELECT) != 0);
+    CHECK_EQ(sqe.ioprio & IORING_RECV_MULTISHOT, 0u);
+    fixture.restore_ring();
+
+    auto append_cqe = [&](u16 buf_id, u32 len, u32 episode) {
+        const u32 cq_tail = __atomic_load_n(backend.cq_tail, __ATOMIC_ACQUIRE);
+        auto& cqe = backend.cq_entries[cq_tail & *backend.cq_ring_mask];
+        cqe.user_data =
+            encode_upstream_event_token({conn.id, IoEventType::UpstreamRecv, episode, 0});
+        cqe.res = static_cast<i32>(len);
+        cqe.flags = IORING_CQE_F_BUFFER | (static_cast<u32>(buf_id) << IORING_CQE_BUFFER_SHIFT);
+        __atomic_store_n(backend.cq_tail, cq_tail + 1u, __ATOMIC_RELEASE);
+    };
+    auto large_bytes = [&](u16 buf_id) {
+        return const_cast<u8*>(backend.provided_buffer_data(buf_id));
+    };
+    const u16 small_tail = __atomic_load_n(&backend.buf_ring->tail, __ATOMIC_ACQUIRE);
+    const u16 large_tail = __atomic_load_n(&backend.large_buf_ring->tail, __ATOMIC_ACQUIRE);
+
+    // A full-slice completion is copied intact and its buffer returns to the
+    // dedicated ring, never the ordinary one.
+    constexpr u16 kBufId = static_cast<u16>(kLargeProvidedBufIdBase + 5u);
+    REQUIRE(backend.provided_buffer_id_valid(kBufId));
+    CHECK_EQ(backend.provided_buffer_size(kBufId), kLargeProvidedBufSize);
+    for (u32 i = 0; i < kLargeProvidedBufSize; i++)
+        large_bytes(kBufId)[i] = static_cast<u8>((i * 131u + 7u) & 0xFFu);
+    append_cqe(kBufId, kLargeProvidedBufSize, conn.upstream_episode);
+    backend.pending = 0;
+    IoEvent events[2]{};
+    REQUIRE_EQ(backend.wait(events, 2, loop->conns, IoUringEventLoop::kMaxConns), 1u);
+    CHECK_EQ(events[0].type, IoEventType::UpstreamRecv);
+    CHECK_EQ(events[0].result, static_cast<i32>(kLargeProvidedBufSize));
+    REQUIRE_EQ(conn.upstream_recv_buf.len(), kLargeProvidedBufSize);
+    CHECK_EQ(
+        __builtin_memcmp(conn.upstream_recv_buf.data(), large_bytes(kBufId), kLargeProvidedBufSize),
+        0);
+    CHECK_EQ(__atomic_load_n(&backend.large_buf_ring->tail, __ATOMIC_ACQUIRE),
+             static_cast<u16>(large_tail + 1u));
+    CHECK_EQ(__atomic_load_n(&backend.buf_ring->tail, __ATOMIC_ACQUIRE), small_tail);
+
+    // A stale episode's selected buffer is returned without touching the slice.
+    conn.upstream_recv_buf.reset();
+    append_cqe(static_cast<u16>(kBufId + 1u), 64u, conn.upstream_episode + 1u);
+    backend.pending = 0;
+    REQUIRE_EQ(backend.wait(events, 2, loop->conns, IoUringEventLoop::kMaxConns), 1u);
+    CHECK_EQ(conn.upstream_recv_buf.len(), 0u);
+    CHECK_EQ(__atomic_load_n(&backend.large_buf_ring->tail, __ATOMIC_ACQUIRE),
+             static_cast<u16>(large_tail + 2u));
+    CHECK_EQ(__atomic_load_n(&backend.buf_ring->tail, __ATOMIC_ACQUIRE), small_tail);
+
+    // Ids past the dedicated ring are never treated as selected buffers.
+    CHECK_FALSE(backend.provided_buffer_id_valid(
+        static_cast<u16>(kLargeProvidedBufIdBase + kLargeProvidedBufCount)));
+    fixture.cleanup();
+}
+
 TEST(iouring_upstream_recv, terminal_dispatch_rearms_once_across_reuse_clear_and_drain) {
     ScopedIoUringLoopForRetirement guard;
     if (!guard.init()) SKIP("io_uring unavailable");
@@ -58362,8 +58436,13 @@ TEST(iouring_episode, upstream_submissions_carry_episode_and_aux) {
     CHECK((multishot.ioprio & IORING_RECV_MULTISHOT) != 0);
     CHECK_EQ(one_shot.ioprio & IORING_RECV_MULTISHOT, 0u);
     CHECK_EQ(bounded_one_shot.ioprio & IORING_RECV_MULTISHOT, 0u);
-    CHECK_EQ(multishot.buf_group, one_shot.buf_group);
-    CHECK_EQ(multishot.buf_group, bounded_one_shot.buf_group);
+    // Multishot recvs select from the ordinary ring; bounded one-shot recvs
+    // select from the dedicated slice-sized ring whenever it is registered.
+    const u16 expected_one_shot_group =
+        backend.large_buf_ring != nullptr ? kLargeBufGroupId : kBufGroupId;
+    CHECK_EQ(multishot.buf_group, kBufGroupId);
+    CHECK_EQ(one_shot.buf_group, expected_one_shot_group);
+    CHECK_EQ(bounded_one_shot.buf_group, expected_one_shot_group);
     for (u32 i = 0; i < 9; i++) {
         decoded_conn = 0;
         decoded_type = IoEventType::Count;
@@ -58400,7 +58479,8 @@ TEST(iouring_episode, invalid_upstream_episodes_do_not_acquire_sqe_or_state) {
     CHECK_FALSE(backend.add_recv_upstream_once(-1, kConnId, 0));
     CHECK_FALSE(backend.add_recv_upstream_once(-1, kConnId, kIoUserDataMaxUpstreamEpisode + 1u));
     CHECK_FALSE(backend.add_recv_upstream_once(-1, kConnId, 1u, 0u));
-    CHECK_FALSE(backend.add_recv_upstream_once(-1, kConnId, 1u, kProvidedBufSize + 1u));
+    CHECK_FALSE(
+        backend.add_recv_upstream_once(-1, kConnId, 1u, backend.upstream_once_max_len() + 1u));
     CHECK_FALSE(backend.pause_upstream_recv(42, kConnId, 0));
     CHECK_FALSE(backend.pause_upstream_recv(42, kConnId, kIoUserDataMaxUpstreamEpisode + 1u));
     CHECK_FALSE(backend.cancel_retiring_upstream_recv(kConnId, 0));

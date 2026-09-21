@@ -358,10 +358,63 @@ core::Expected<void, Error> IoUringBackend::setup_buf_ring() {
     // Advance the ring tail to make all buffers available
     __atomic_store_n(&buf_ring->tail, static_cast<u16>(kProvidedBufCount), __ATOMIC_RELEASE);
 
+    setup_large_buf_ring();
     return {};
 }
 
+void IoUringBackend::setup_large_buf_ring() {
+    // Buffer memory is faulted in on first use: idle shards keep it unresident.
+    const u64 total_buf_sz = static_cast<u64>(kLargeProvidedBufCount) * kLargeProvidedBufSize;
+    void* base =
+        mmap(nullptr, total_buf_sz, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (base == MAP_FAILED) return;
+    const u64 ring_sz = sizeof(io_uring_buf_ring) + kLargeProvidedBufCount * sizeof(io_uring_buf);
+    void* ring_mem = mmap(nullptr,
+                          ring_sz,
+                          PROT_READ | PROT_WRITE,
+                          MAP_PRIVATE | MAP_ANONYMOUS | MAP_POPULATE,
+                          -1,
+                          0);
+    if (ring_mem == MAP_FAILED) {
+        munmap(base, total_buf_sz);
+        return;
+    }
+    auto* ring = static_cast<io_uring_buf_ring*>(ring_mem);
+
+    struct io_uring_buf_reg reg;
+    memset(&reg, 0, sizeof(reg));
+    reg.ring_addr = reinterpret_cast<u64>(ring);
+    reg.ring_entries = kLargeProvidedBufCount;
+    reg.bgid = kLargeBufGroupId;
+    if (io_uring_register(ring_fd, IORING_REGISTER_PBUF_RING, &reg, 1) < 0) {
+        munmap(ring_mem, ring_sz);
+        munmap(base, total_buf_sz);
+        return;
+    }
+
+    auto* data = static_cast<u8*>(base);
+    for (u32 i = 0; i < kLargeProvidedBufCount; i++) {
+        io_uring_buf* buf = &ring->bufs[i];
+        buf->addr = reinterpret_cast<u64>(data + static_cast<u64>(i) * kLargeProvidedBufSize);
+        buf->len = kLargeProvidedBufSize;
+        buf->bid = static_cast<u16>(kLargeProvidedBufIdBase + i);
+    }
+    __atomic_store_n(&ring->tail, static_cast<u16>(kLargeProvidedBufCount), __ATOMIC_RELEASE);
+    large_buf_base = data;
+    large_buf_ring = ring;
+}
+
 void IoUringBackend::return_buffer(u16 buf_id) {
+    if (buf_id >= kLargeProvidedBufIdBase) {
+        if (!provided_buffer_id_valid(buf_id)) return;
+        const u16 tail = __atomic_load_n(&large_buf_ring->tail, __ATOMIC_RELAXED);
+        io_uring_buf* buf = &large_buf_ring->bufs[tail & (kLargeProvidedBufCount - 1)];
+        buf->addr = reinterpret_cast<u64>(provided_buffer_data(buf_id));
+        buf->len = kLargeProvidedBufSize;
+        buf->bid = buf_id;
+        __atomic_store_n(&large_buf_ring->tail, static_cast<u16>(tail + 1), __ATOMIC_RELEASE);
+        return;
+    }
     // Add buffer back to the provided ring
     u16 tail = __atomic_load_n(&buf_ring->tail, __ATOMIC_RELAXED);
     u16 mask = kProvidedBufCount - 1;  // power of 2
@@ -453,7 +506,7 @@ bool IoUringBackend::add_recv_upstream_once(i32 fd,
                                             u32 upstream_episode,
                                             u32 max_len) {
     if (conn_id >= connection_capacity || !valid_upstream_episode(upstream_episode) ||
-        max_len == 0 || max_len > kProvidedBufSize)
+        max_len == 0 || max_len > upstream_once_max_len())
         return false;
     io_uring_sqe* sqe = get_sqe();
     if (!sqe) return false;
@@ -462,7 +515,7 @@ bool IoUringBackend::add_recv_upstream_once(i32 fd,
     sqe->opcode = IORING_OP_RECV;
     sqe->fd = fd;
     sqe->len = max_len;
-    sqe->buf_group = kBufGroupId;
+    sqe->buf_group = large_buf_ring != nullptr ? kLargeBufGroupId : kBufGroupId;
     sqe->flags = IOSQE_BUFFER_SELECT;
     sqe->user_data =
         encode_upstream_user_data(conn_id, IoEventType::UpstreamRecv, upstream_episode);
@@ -1219,7 +1272,7 @@ u32 IoUringBackend::wait(IoEvent* events, u32 max_events, Connection* conns, u32
                         (!conn.upstream_recv_armed && !conn.upstream_recv_cancel_inflight);
                 }
             }
-            const bool valid_buffer_id = buf_id < kProvidedBufCount;
+            const bool valid_buffer_id = provided_buffer_id_valid(buf_id);
             const bool stale_downstream =
                 type == IoEventType::Recv &&
                 (conns == nullptr || conn_id >= max_conns || conns[conn_id].fd < 0);
@@ -1233,11 +1286,11 @@ u32 IoUringBackend::wait(IoEvent* events, u32 max_events, Connection* conns, u32
                                        ? conns[conn_id].upstream_recv_buf
                                    : conns[conn_id].tls_active ? conns[conn_id].tls_in_buf
                                                                : conns[conn_id].recv_buf;
-                const u8* src = buf_base + static_cast<u64>(buf_id) * kProvidedBufSize;
+                const u8* src = provided_buffer_data(buf_id);
                 u32 avail = target_buf.write_avail();
                 const bool deadline_copy_eligible =
                     type == IoEventType::UpstreamRecv && deadline_owner &&
-                    nbytes <= kProvidedBufSize && nbytes <= avail &&
+                    nbytes <= provided_buffer_size(buf_id) && nbytes <= avail &&
                     response_deadline_copy_owner(conns[conn_id], upstream_episode, aux);
                 // A matching explicit-deadline owner never enters the legacy
                 // partial-copy path.  Its provided-buffer payload is one
@@ -1493,6 +1546,15 @@ void IoUringBackend::shutdown() {
         u64 ring_sz = sizeof(io_uring_buf_ring) + kProvidedBufCount * sizeof(io_uring_buf);
         munmap(buf_ring, ring_sz);
         buf_ring = nullptr;
+    }
+    if (large_buf_base != nullptr) {
+        munmap(large_buf_base, static_cast<u64>(kLargeProvidedBufCount) * kLargeProvidedBufSize);
+        large_buf_base = nullptr;
+    }
+    if (large_buf_ring != nullptr) {
+        munmap(large_buf_ring,
+               sizeof(io_uring_buf_ring) + kLargeProvidedBufCount * sizeof(io_uring_buf));
+        large_buf_ring = nullptr;
     }
     if (sqes_ptr != nullptr) {
         munmap(sqes_ptr, sqes_sz);

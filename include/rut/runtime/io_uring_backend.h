@@ -69,6 +69,11 @@ struct IoUringBackend {
     io_uring_buf_ring* buf_ring = nullptr;
     u8* buf_base = nullptr;  // kProvidedBufCount * kProvidedBufSize bytes
 
+    // Dedicated ring for bounded one-shot upstream recvs (kLargeBufGroupId).
+    // Optional: when registration fails those recvs use the ordinary ring.
+    io_uring_buf_ring* large_buf_ring = nullptr;
+    u8* large_buf_base = nullptr;  // kLargeProvidedBufCount * kLargeProvidedBufSize bytes
+
     // Listen socket
     i32 listen_fd = -1;
 
@@ -155,7 +160,8 @@ struct IoUringBackend {
     // provided-buffer selection and episode fencing but deliberately omits
     // IORING_RECV_MULTISHOT so each CQE is consumed before another upstream
     // buffer can be selected. max_len bounds the selected-buffer copy to the
-    // current destination space; zero and oversized values are rejected.
+    // current destination space; zero and values above upstream_once_max_len()
+    // are rejected. Selects from the dedicated large ring when registered.
     bool add_recv_upstream_once(i32 fd,
                                 u32 conn_id,
                                 u32 upstream_episode = 1,
@@ -269,6 +275,27 @@ struct IoUringBackend {
     // Return a provided buffer back to the ring after processing.
     void return_buffer(u16 buf_id);
 
+    // Provided buffer ids span the ordinary ring, then the dedicated large
+    // ring when it is registered.
+    bool provided_buffer_id_valid(u16 buf_id) const {
+        if (buf_id < kProvidedBufCount) return true;
+        return large_buf_ring != nullptr && buf_id >= kLargeProvidedBufIdBase &&
+               buf_id - kLargeProvidedBufIdBase < kLargeProvidedBufCount;
+    }
+    u32 provided_buffer_size(u16 buf_id) const {
+        return buf_id < kProvidedBufCount ? kProvidedBufSize : kLargeProvidedBufSize;
+    }
+    const u8* provided_buffer_data(u16 buf_id) const {
+        if (buf_id < kProvidedBufCount)
+            return buf_base + static_cast<u64>(buf_id) * kProvidedBufSize;
+        return large_buf_base +
+               static_cast<u64>(buf_id - kLargeProvidedBufIdBase) * kLargeProvidedBufSize;
+    }
+    // Largest length a bounded one-shot upstream recv may request.
+    u32 upstream_once_max_len() const {
+        return large_buf_ring != nullptr ? kLargeProvidedBufSize : kProvidedBufSize;
+    }
+
 #ifdef RUT_TESTING
 public:
 #else
@@ -318,6 +345,8 @@ private:
 
     // Setup provided buffer ring via io_uring_register.
     core::Expected<void, Error> setup_buf_ring();
+    // Setup the optional dedicated large ring; failure leaves it unset.
+    void setup_large_buf_ring();
 
     // Submit IORING_OP_READ on timer_fd to receive next tick.
     void submit_timer_read();

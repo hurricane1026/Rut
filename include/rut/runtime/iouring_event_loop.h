@@ -37,6 +37,10 @@
 
 namespace rut {
 
+// A bounded one-shot upstream recv may fill the whole upstream receive slice
+// from one dedicated provided buffer.
+static_assert(kLargeProvidedBufSize == SlicePool::kSliceSize);
+
 namespace detail {
 
 // Optional test-binary hook. Production binaries leave this weak symbol
@@ -3116,7 +3120,8 @@ public:
         if (one_shot) {
             const u32 available = c.upstream_recv_buf.write_avail();
             if (available == 0) return false;
-            const u32 recv_len = available < kProvidedBufSize ? available : kProvidedBufSize;
+            const u32 max_len = backend.upstream_once_max_len();
+            const u32 recv_len = available < max_len ? available : max_len;
             submitted =
                 backend.add_recv_upstream_once(c.upstream_fd, c.id, c.upstream_episode, recv_len);
         } else {
