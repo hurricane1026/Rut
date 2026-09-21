@@ -12,10 +12,7 @@
 #endif
 
 // Placement new — declaration only; definition lives in src/placement_new.cc.
-#ifndef RUE_PLACEMENT_NEW_DECLARED
-#define RUE_PLACEMENT_NEW_DECLARED
-void* operator new(decltype(sizeof(0)), void* p) noexcept;
-#endif
+#include "core/placement_new.h"
 
 namespace rut {
 

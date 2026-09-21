@@ -4,7 +4,11 @@
 #include <atomic>
 
 #include <sys/mman.h>
+#ifdef __APPLE__
+#include <stdlib.h>
+#else
 #include <sys/random.h>
+#endif
 #include <time.h>
 
 // Cache<K, i64> substrate — per-shard lossy per-key state slots
@@ -208,7 +212,11 @@ inline void cache_registry_publish_locked(CacheRegistry& reg,
         // precomputed against Cache-backed rate limits).
         u64 s = 0;
         for (int tries = 0; tries < 16 && s == 0; tries++) {
+#ifdef __APPLE__
+            arc4random_buf(&s, sizeof(s));
+#else
             if (::getrandom(&s, sizeof(s), 0) != static_cast<long>(sizeof(s))) s = 0;
+#endif
         }
         if (s == 0) {
             struct timespec ts{};

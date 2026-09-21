@@ -1,6 +1,9 @@
 #include "fault_injection.h"
+#include "posix.h"
 #include "rut/runtime/access_log.h"
+#ifdef __linux__
 #include "rut/runtime/epoll_backend.h"
+#endif
 #include "rut/runtime/error.h"
 #include "test.h"
 
@@ -12,8 +15,12 @@
 #include <string.h>
 #include <sys/mman.h>
 #include <sys/socket.h>
+#ifdef __linux__
 #include <sys/syscall.h>
+#endif
+#ifdef __linux__
 #include <sys/timerfd.h>
+#endif
 #include <unistd.h>
 
 using namespace rut;
@@ -39,6 +46,7 @@ struct timespec* opaque_null_timespec() {
     return reinterpret_cast<struct timespec*>(bits);
 }
 
+#ifdef __linux__
 struct HeldEpollTestFds {
     i32 epoll_fds[2] = {-1, -1};
     i32 pipe_fds[2] = {-1, -1};
@@ -80,6 +88,8 @@ struct HeldEpollTestFds {
         return write(pipe_fds[1], &byte, 1) == 1;
     }
 };
+
+#endif
 
 }  // namespace
 
@@ -156,6 +166,7 @@ TEST(syscall_fault, open_tmpfile_mode_arg_is_forwarded) {
 #endif
 }
 
+#ifdef __linux__
 TEST(syscall_fault, timerfd_settime_failure_is_injected) {
     i32 fd = timerfd_create(CLOCK_MONOTONIC, TFD_NONBLOCK | TFD_CLOEXEC);
     REQUIRE(fd >= 0);
@@ -172,6 +183,8 @@ TEST(syscall_fault, timerfd_settime_failure_is_injected) {
     CHECK_EQ(errno, EINVAL);
     close(fd);
 }
+
+#endif
 
 TEST(syscall_fault, mkstemp_and_unlink_failures_are_injected) {
     {
@@ -209,7 +222,7 @@ TEST(syscall_fault, clock_gettime_fixed_time_is_injected_by_clock_id) {
 
 TEST(io_fault, single_send_eintr_helper_injects_once) {
     i32 fds[2];
-    REQUIRE_EQ(socketpair(AF_UNIX, SOCK_STREAM | SOCK_NONBLOCK, 0, fds), 0);
+    REQUIRE_EQ(rut::test::nonblocking_socketpair(fds), 0);
 
     u8 data[4] = {'o', 'k', 'a', 'y'};
     {
@@ -224,7 +237,7 @@ TEST(io_fault, single_send_eintr_helper_injects_once) {
 
 TEST(io_fault, single_recv_eintr_helper_injects_once) {
     i32 fds[2];
-    REQUIRE_EQ(socketpair(AF_UNIX, SOCK_STREAM | SOCK_NONBLOCK, 0, fds), 0);
+    REQUIRE_EQ(rut::test::nonblocking_socketpair(fds), 0);
 
     const char data[] = "abc";
     auto recv_fault = single_recv_eintr(fds[1], data, sizeof(data) - 1);
@@ -267,6 +280,8 @@ TEST(syscall_fault, clock_gettime_null_timespec_fails_with_efault) {
     CHECK_EQ(errno, EFAULT);
 }
 
+// Linux raw clock syscall validates arbitrary output addresses in the kernel.
+#ifdef __linux__
 TEST(syscall_fault, clock_gettime_invalid_timespec_fails_with_efault) {
     SyscallFaultConfig fault_config;
     fault_config.clock_gettime_fixed = true;
@@ -281,6 +296,8 @@ TEST(syscall_fault, clock_gettime_invalid_timespec_fails_with_efault) {
     CHECK_EQ(injected_clock_gettime(CLOCK_REALTIME, invalid_ts), -1);
     CHECK_EQ(errno, EFAULT);
 }
+
+#endif
 
 TEST(syscall_fault, clock_gettime_fixed_time_preserves_invalid_clock_errno) {
     SyscallFaultConfig fault_config;
@@ -386,6 +403,7 @@ TEST(syscall_fault, monotonic_us_clamps_first_success_after_clock_error) {
     CHECK_GT(monotonic_us(), failure_value);
 }
 
+#ifdef __linux__
 TEST(epoll_fault, init_reports_epoll_create_failure) {
     SyscallFaultConfig fault_config;
     fault_config.epoll_create1_errno = EMFILE;
@@ -792,7 +810,7 @@ TEST(epoll_fault, accept4_failure_is_injected) {
 
 TEST(epoll_fault, add_send_records_injected_partial_send) {
     i32 fds[2];
-    REQUIRE_EQ(socketpair(AF_UNIX, SOCK_STREAM | SOCK_NONBLOCK, 0, fds), 0);
+    REQUIRE_EQ(rut::test::nonblocking_socketpair(fds), 0);
 
     EpollBackend backend;
     REQUIRE(backend.init(0, -1).has_value());
@@ -827,7 +845,7 @@ TEST(epoll_fault, add_send_records_injected_partial_send) {
 
 TEST(epoll_fault, add_send_reports_injected_eagain_epoll_ctl_failure) {
     i32 fds[2];
-    REQUIRE_EQ(socketpair(AF_UNIX, SOCK_STREAM | SOCK_NONBLOCK, 0, fds), 0);
+    REQUIRE_EQ(rut::test::nonblocking_socketpair(fds), 0);
 
     EpollBackend backend;
     REQUIRE(backend.init(0, -1).has_value());
@@ -882,6 +900,8 @@ TEST(epoll_fault, add_connect_reports_injected_failure) {
     backend.shutdown();
     close(fd);
 }
+
+#endif
 
 int main(int argc, char** argv) {
     return rut::test::run_all(argc, argv);

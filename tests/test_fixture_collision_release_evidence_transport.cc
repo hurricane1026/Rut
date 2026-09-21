@@ -1,3 +1,4 @@
+#include "../testing/posix.h"
 #include "fixture_collision_release_evidence_transport.h"
 #include <algorithm>
 #include <array>
@@ -103,7 +104,7 @@ bool no_peer_bytes(int fd) {
 }
 
 bool open_pair(int descriptors[2]) {
-    return ::socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, descriptors) == 0;
+    return rut::test::stream_socketpair(descriptors) == 0;
 }
 
 void close_pair(int descriptors[2]) {

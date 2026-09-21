@@ -16,10 +16,20 @@
 #include "rut/runtime/tls_engine.h"
 #include "rut/runtime/ws_terminate.h"
 
+#ifdef __linux__
 #include <linux/time_types.h>
+#else
+#include <time.h>
+#endif
 #include <openssl/base.h>
 
 namespace rut {
+
+#ifdef __linux__
+using IoTimespec = __kernel_timespec;
+#else
+using IoTimespec = timespec;
+#endif
 
 struct RouteConfig;  // forward for per-request config pin below
 struct Http2Conn;    // forward: per-connection HTTP/2 engine, pool-allocated
@@ -692,7 +702,7 @@ struct ConnectionBase {
     // identity are kernel-owned storage: reset() must not mutate them before
     // every owned CQE has been harvested. The generation counter survives
     // ordinary reset/slot reuse and never wraps through the cancel-marker bit.
-    __kernel_timespec response_read_timer_timespec{};
+    IoTimespec response_read_timer_timespec{};
     u32 response_read_timer_generation = 0;
     u32 response_read_timer_owner_generation = 0;
     u32 response_read_timer_deadline_generation = 0;
@@ -998,7 +1008,7 @@ struct ConnectionBase {
     // outlive the submit call — on-connection storage is the simplest
     // stable lifetime. Unused by the epoll backend (which uses a shared
     // yield_timer_fd + min-heap).
-    __kernel_timespec yield_timespec;
+    IoTimespec yield_timespec;
     u32 yield_timer_gen = 0;
 
     bool keep_alive;

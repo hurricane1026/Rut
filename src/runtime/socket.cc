@@ -1,6 +1,7 @@
-#include "rut/runtime/socket.h"
+#include "rut/platform/socket.h"
 
 #include "rut/runtime/listener.h"
+#include "rut/runtime/socket.h"
 
 #include <errno.h>
 #include <fcntl.h>
@@ -26,12 +27,14 @@ core::Expected<i32, Error> create_listen_socket(const ListenerSpec& declared, u1
     if (declared.port != 0u && declared.port != requested_port)
         return core::make_unexpected(Error::make(EINVAL, Error::Source::Socket));
 
-    i32 fd = socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
+    i32 fd = platform::stream_socket();
     if (fd < 0) return core::make_unexpected(Error::from_errno(Error::Source::Socket));
 
     i32 one = 1;
     setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
+#ifdef __linux__
     setsockopt(fd, SOL_SOCKET, SO_REUSEPORT, &one, sizeof(one));
+#endif
     setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
 
     struct sockaddr_in addr;

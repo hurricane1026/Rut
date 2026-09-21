@@ -8145,19 +8145,29 @@ TEST(helpers, str_regex_scratch_cache_grows_and_reuses_entries) {
 
 struct RegexScratchPruneThreadState {
     void* db = nullptr;
-    pthread_barrier_t* warmed = nullptr;
-    pthread_barrier_t* pruned = nullptr;
+    pthread_mutex_t mutex = PTHREAD_MUTEX_INITIALIZER;
+    pthread_cond_t condition = PTHREAD_COND_INITIALIZER;
+    bool warmed = false;
+    bool pruned = false;
     u32 warm_count = 0;
     u32 final_count = 0;
     u8 matched = 0;
+
+    ~RegexScratchPruneThreadState() {
+        pthread_cond_destroy(&condition);
+        pthread_mutex_destroy(&mutex);
+    }
 };
 
 static void* regex_scratch_prune_thread(void* arg) {
     auto* state = static_cast<RegexScratchPruneThreadState*>(arg);
     state->matched = rut_helper_str_regex_match("/worker", 7, state->db);
     state->warm_count = rut_helper_regex_scratch_cache_entry_count_for_test();
-    pthread_barrier_wait(state->warmed);
-    pthread_barrier_wait(state->pruned);
+    pthread_mutex_lock(&state->mutex);
+    state->warmed = true;
+    pthread_cond_signal(&state->condition);
+    while (!state->pruned) pthread_cond_wait(&state->condition, &state->mutex);
+    pthread_mutex_unlock(&state->mutex);
     state->final_count = rut_helper_regex_scratch_cache_entry_count_for_test();
     return nullptr;
 }
@@ -8168,30 +8178,23 @@ TEST(helpers, str_regex_free_prunes_other_thread_scratch_cache) {
     void* db = rut_helper_regex_compile("^/worker$", 9);
     REQUIRE(db != nullptr);
 
-    pthread_barrier_t warmed;
-    pthread_barrier_t pruned;
-    REQUIRE(pthread_barrier_init(&warmed, nullptr, 2) == 0);
-    REQUIRE(pthread_barrier_init(&pruned, nullptr, 2) == 0);
-
     RegexScratchPruneThreadState state{};
     state.db = db;
-    state.warmed = &warmed;
-    state.pruned = &pruned;
 
     pthread_t thread{};
     REQUIRE(pthread_create(&thread, nullptr, regex_scratch_prune_thread, &state) == 0);
-    pthread_barrier_wait(&warmed);
+    pthread_mutex_lock(&state.mutex);
+    while (!state.warmed) pthread_cond_wait(&state.condition, &state.mutex);
 
     CHECK(state.matched == 1);
     CHECK(state.warm_count == 1);
     rut_helper_regex_free(db);
-    pthread_barrier_wait(&pruned);
+    state.pruned = true;
+    pthread_cond_signal(&state.condition);
+    pthread_mutex_unlock(&state.mutex);
 
     REQUIRE(pthread_join(thread, nullptr) == 0);
     CHECK(state.final_count == 0);
-
-    pthread_barrier_destroy(&pruned);
-    pthread_barrier_destroy(&warmed);
 }
 
 TEST(helpers, str_trim_prefix) {

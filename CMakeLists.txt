@@ -58,7 +58,13 @@ if(RUT_ENABLE_IPO)
 endif()
 set(CMAKE_CXX_FLAGS_DEBUG "-O0 -g -DDEBUG")
 
-set(CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS} -Wl,--gc-sections")
+if(APPLE)
+    set(CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS} -Wl,-dead_strip")
+elseif(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+    set(CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS} -Wl,--gc-sections")
+else()
+    message(FATAL_ERROR "Rut supports Linux and macOS")
+endif()
 
 # LLVM — required for JIT compilation (ORC JIT via C API).
 # Only the rut_jit library links LLVM; rut_runtime stays LLVM-free.

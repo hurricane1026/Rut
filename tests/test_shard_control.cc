@@ -1,5 +1,4 @@
 // Per-shard independent control system tests.
-#include "rut/runtime/epoll_event_loop.h"
 #include "rut/runtime/route_table.h"
 #include "rut/runtime/shard.h"
 #include "rut/runtime/shard_control.h"
@@ -8,7 +7,6 @@
 #include "test_helpers.h"
 
 #include <sys/mman.h>
-#include <sys/timerfd.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -63,9 +61,9 @@ struct EpochLoopF {
     }
 };
 
-// Shard<EpollEventLoop> with listen socket (non-spawned only).
+// Shard<RealLoop> with listen socket (non-spawned only).
 struct ShardF {
-    Shard<EpollEventLoop> shard;
+    Shard<RealLoop> shard;
     i32 lfd = -1;
     bool ok = false;
 
@@ -245,7 +243,7 @@ TEST(shard_control, reload_config_refuses_out_of_range_timer_shard) {
         /*interval_ms=*/1000,
         [](void*, jit::HandlerCtx*, const u8*, u32, void*) -> u64 { return 0; },
         /*shard=*/5));
-    Shard<EpollEventLoop> shard{};
+    Shard<RealLoop> shard{};
     CHECK(!shard.reload_config(&cfg, /*shard_count=*/2));  // dead pin refused
     CHECK(shard.active_config == nullptr);                 // nothing installed
     CHECK(shard.reload_config(&cfg, /*shard_count=*/8));   // in range: installs
@@ -258,7 +256,7 @@ TEST(shard_control, shard_reload_config) {
     REQUIRE(lfd_result.has_value());
     i32 lfd = lfd_result.value();
 
-    Shard<EpollEventLoop> shard;
+    Shard<RealLoop> shard;
     auto rc = shard.init(0, lfd);
     REQUIRE(rc.has_value());
     CHECK(shard.active_config == nullptr);
@@ -299,7 +297,7 @@ TEST(shard_control, shard_swap_jit) {
     REQUIRE(lfd_result.has_value());
     i32 lfd = lfd_result.value();
 
-    Shard<EpollEventLoop> shard;
+    Shard<RealLoop> shard;
     auto rc = shard.init(0, lfd);
     REQUIRE(rc.has_value());
     CHECK(shard.jit_code == nullptr);
@@ -479,8 +477,8 @@ TEST(shard_control, stop_does_not_affect_other_shards) {
     REQUIRE(lfd2_result.has_value());
     i32 lfd2 = lfd2_result.value();
 
-    Shard<EpollEventLoop> shard1;
-    Shard<EpollEventLoop> shard2;
+    Shard<RealLoop> shard1;
+    Shard<RealLoop> shard2;
     REQUIRE(shard1.init(0, lfd1).has_value());
     REQUIRE(shard2.init(1, lfd2).has_value());
 
@@ -539,7 +537,7 @@ TEST(shard_control, command_processed_within_timer_tick) {
     REQUIRE(lfd_result.has_value());
     i32 lfd = lfd_result.value();
 
-    Shard<EpollEventLoop> shard;
+    Shard<RealLoop> shard;
     REQUIRE(shard.init(0, lfd).has_value());
     CHECK(shard.active_config == nullptr);
 
@@ -615,7 +613,7 @@ TEST_F(ShardF, swap_jit_before_spawn_applies_directly) {
 
 TEST(shard_control, reload_after_stop_applies_directly) {
     // Spawn, stop, join, then reload — should not hang.
-    Shard<EpollEventLoop> s;
+    Shard<RealLoop> s;
     auto lfd_result = create_listen_socket(0);
     REQUIRE(lfd_result.has_value());
     i32 lfd = lfd_result.value();
@@ -643,7 +641,7 @@ TEST(shard_control, spawn_seeds_active_config_from_route_config) {
     REQUIRE(lfd_result.has_value());
     i32 lfd = lfd_result.value();
 
-    Shard<EpollEventLoop> s;
+    Shard<RealLoop> s;
     auto rc = s.init(0, lfd);
     REQUIRE(rc.has_value());
 
@@ -672,7 +670,7 @@ TEST(shard_control, reload_after_stop_before_join) {
     REQUIRE(lfd_result.has_value());
     i32 lfd = lfd_result.value();
 
-    Shard<EpollEventLoop> s;
+    Shard<RealLoop> s;
     REQUIRE(s.init(0, lfd).has_value());
     REQUIRE(s.spawn(false).has_value());
 
@@ -704,7 +702,7 @@ TEST(shard_control, join_clears_stale_pending_without_overwrite) {
     REQUIRE(lfd_result.has_value());
     i32 lfd = lfd_result.value();
 
-    Shard<EpollEventLoop> s;
+    Shard<RealLoop> s;
     REQUIRE(s.init(0, lfd).has_value());
     REQUIRE(s.spawn(false).has_value());
 
@@ -734,7 +732,7 @@ TEST(shard_control, join_clears_stale_pending_without_overwrite) {
 // apply in reload_config, or pending-apply in join) must drain too — otherwise
 // idle fds parked under the OLD config survive into the new config and could be
 // handed out for a now-different (upstream_id, backend_idx). These exercise the
-// real EpollEventLoop + real UpstreamPool wired by Shard::init().
+// real RealLoop + real UpstreamPool wired by Shard::init().
 
 TEST_F(ShardF, reload_before_spawn_drains_idle_pool) {
     REQUIRE(self.ok);
@@ -753,7 +751,7 @@ TEST_F(ShardF, reload_before_spawn_drains_idle_pool) {
 
 // === Graceful-drain pool teardown stays on the shard thread (F2) ===
 //
-// EpollEventLoop::drain(period) runs on the CONTROL/caller thread (Shard::drain).
+// RealLoop::drain(period) runs on the CONTROL/caller thread (Shard::drain).
 // It must NOT mutate the share-nothing UpstreamPool: the shard's event-loop thread
 // may concurrently be in take_idle/put_idle/sweep, and touching the pool here would
 // race fd reuse and corrupt idle_count/free_stack. The pool is instead emptied on the
@@ -786,7 +784,7 @@ TEST(shard_control, reload_after_join_drains_idle_pool) {
     REQUIRE(lfd_result.has_value());
     i32 lfd = lfd_result.value();
 
-    Shard<EpollEventLoop> s;
+    Shard<RealLoop> s;
     REQUIRE(s.init(0, lfd).has_value());
     REQUIRE(s.spawn(false).has_value());
     s.stop();
@@ -815,7 +813,7 @@ TEST(shard_control, join_applies_pending_reload_drains_idle_pool) {
     REQUIRE(lfd_result.has_value());
     i32 lfd = lfd_result.value();
 
-    Shard<EpollEventLoop> s;
+    Shard<RealLoop> s;
     REQUIRE(s.init(0, lfd).has_value());
     REQUIRE(s.spawn(false).has_value());
     s.stop();
@@ -957,7 +955,7 @@ TEST(shard_control, swap_jit_after_stop_before_join) {
     REQUIRE(lfd_result.has_value());
     i32 lfd = lfd_result.value();
 
-    Shard<EpollEventLoop> shard;
+    Shard<RealLoop> shard;
     REQUIRE(shard.init(0, lfd).has_value());
     REQUIRE(shard.spawn(false).has_value());
 
@@ -1032,7 +1030,7 @@ TEST(shard_control, reload_after_join_applies_directly) {
     REQUIRE(lfd_result.has_value());
     i32 lfd = lfd_result.value();
 
-    Shard<EpollEventLoop> s;
+    Shard<RealLoop> s;
     REQUIRE(s.init(0, lfd).has_value());
     REQUIRE(s.spawn(false).has_value());
     s.stop();
@@ -1077,7 +1075,7 @@ TEST(shard_control, real_shard_simultaneous_config_and_jit) {
     REQUIRE(lfd_result.has_value());
     i32 lfd = lfd_result.value();
 
-    Shard<EpollEventLoop> shard;
+    Shard<RealLoop> shard;
     REQUIRE(shard.init(0, lfd).has_value());
     REQUIRE(shard.spawn(false).has_value());
 
@@ -1153,7 +1151,7 @@ TEST(shard_capture, enable_after_spawn_via_control_block) {
     REQUIRE(lfd_result.has_value());
     i32 lfd = lfd_result.value();
     u16 port = get_port(lfd);
-    Shard<EpollEventLoop> shard;
+    Shard<RealLoop> shard;
     REQUIRE(shard.init(0, lfd).has_value());
     REQUIRE(shard.spawn().has_value());
     CaptureRing* ring = shard.enable_capture();
@@ -1178,7 +1176,7 @@ TEST(shard_capture, disable_after_spawn_via_control_block) {
     REQUIRE(lfd_result.has_value());
     i32 lfd = lfd_result.value();
     u16 port = get_port(lfd);
-    Shard<EpollEventLoop> shard;
+    Shard<RealLoop> shard;
     REQUIRE(shard.init(0, lfd).has_value());
     REQUIRE(shard.spawn().has_value());
     CaptureRing* ring = shard.enable_capture();

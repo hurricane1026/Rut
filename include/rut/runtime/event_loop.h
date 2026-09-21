@@ -24,8 +24,10 @@
 
 #include <netinet/in.h>
 #include <sys/socket.h>
-#include <sys/timerfd.h>  // timerfd_settime
-#include <unistd.h>       // close()
+#ifdef __linux__
+#include <sys/timerfd.h>
+#endif
+#include <unistd.h>  // close()
 
 namespace rut {
 
@@ -681,12 +683,16 @@ public:
         // timerfd_settime is async-signal-safe and thread-safe (POSIX).
         // Setting a 1ns expiry fires immediately, causing wait() to return
         // a Timeout event so the run loop can observe draining_ and close_listen().
+#ifdef __linux__
         if (backend.timer_fd >= 0) {
             struct itimerspec wake = {};
             wake.it_value.tv_nsec = 1;    // fire immediately
             wake.it_interval.tv_sec = 1;  // preserve 1-second periodic tick
             timerfd_settime(backend.timer_fd, 0, &wake, nullptr);
         }
+#else
+        if constexpr (requires { backend.wake(); }) backend.wake();
+#endif
     }
 
     // Lazy-allocate upstream recv buffer for proxy connections.

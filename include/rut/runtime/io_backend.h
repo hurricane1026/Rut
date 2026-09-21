@@ -5,7 +5,7 @@
 
 namespace rut {
 
-// I/O backend concept — satisfied by both IoUringBackend and EpollBackend.
+// I/O backend concept — IoUringBackend/EpollBackend on Linux, KqueueBackend on macOS.
 // Selected at compile time via template parameter — no virtual dispatch.
 //
 // Required interface:
@@ -25,7 +25,7 @@ namespace rut {
 //
 // Proactor model: wait() returns completed I/O events.
 // - io_uring: native proactor, I/O is already done when CQE arrives
-// - epoll: reactor internally, but wait() does recv/send and emits completions
+// - epoll/kqueue: reactor internally, but wait() does recv/send and emits completions
 //
 // Error convention: IoEvent.result < 0 means -errno.
 // Upstream producers require a valid nonzero episode; downstream and other

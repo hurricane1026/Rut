@@ -127,14 +127,20 @@ target_compile_options(zstd_compress PRIVATE
     -ffunction-sections -fdata-sections
 )
 
+# Each platform owns its native backend; Linux's implementations stay intact.
+if(APPLE)
+    set(RUT_IO_SOURCES runtime/kqueue_backend.cc)
+else()
+    set(RUT_IO_SOURCES runtime/io_uring_backend.cc runtime/epoll_backend.cc)
+endif()
+
 # Runtime library
 add_library(rut_runtime STATIC
     placement_new.cc
     runtime/arena.cc
     runtime/callbacks.cc
     runtime/shard.cc
-    runtime/io_uring_backend.cc
-    runtime/epoll_backend.cc
+    ${RUT_IO_SOURCES}
     runtime/timer_wheel.cc
     runtime/socket.cc
     runtime/tls.cc

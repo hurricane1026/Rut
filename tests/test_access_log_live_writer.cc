@@ -1,4 +1,5 @@
 #include "fault_injection.h"
+#include "posix.h"
 #include "rut/runtime/access_log_live_writer.h"
 #include "test.h"
 #include <atomic>
@@ -41,7 +42,7 @@ struct Pipe {
 
     bool open_nonblocking() {
         i32 fds[2];
-        if (pipe2(fds, O_NONBLOCK | O_CLOEXEC) != 0) return false;
+        if (rut::test::nonblocking_pipe(fds) != 0) return false;
         read_fd = fds[0];
         write_fd = fds[1];
         return true;
@@ -119,7 +120,11 @@ u64 fill_pipe(i32 fd) {
 }
 
 i32 open_fd_count() {
+#ifdef __APPLE__
+    DIR* dir = opendir("/dev/fd");
+#else
     DIR* dir = opendir("/proc/self/fd");
+#endif
     if (dir == nullptr) return -1;
     i32 count = 0;
     while (dirent* entry = readdir(dir)) {

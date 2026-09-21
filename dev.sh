@@ -1,5 +1,5 @@
 #!/bin/bash
-# dev.sh — build, test, lint, format for the Rue project.
+# dev.sh — build, test, lint, format for the Rut project.
 #
 # Usage:
 #   ./dev.sh              # build + test
@@ -19,13 +19,32 @@ SRC_FILES=$(find "$PROJECT_DIR/include" "$PROJECT_DIR/src" "$PROJECT_DIR/tests" 
     "$PROJECT_DIR/testing" "$PROJECT_DIR/bench" \
     -name '*.h' -o -name '*.cc' 2>/dev/null | grep -v third_party)
 
-# ---- Configure (if needed) ----
+# Use LLVM 20 consistently for macOS compilation, JIT, formatting and linting.
+# Explicit CC/CXX overrides are still honored.
+RUT_CMAKE_ARGS=(-DCMAKE_C_COMPILER="${CC:-clang}" -DCMAKE_CXX_COMPILER="${CXX:-clang++}")
+if [[ "$(uname -s)" == Darwin ]]; then
+    RUT_LLVM_PREFIX=$(brew --prefix llvm@20 2>/dev/null || true)
+    if [[ -z "$RUT_LLVM_PREFIX" || ! -x "$RUT_LLVM_PREFIX/bin/clang++" ]]; then
+        echo "LLVM 20 is required on macOS. Install it with: brew install llvm@20" >&2
+        exit 1
+    fi
+    export PATH="$RUT_LLVM_PREFIX/bin:$PATH"
+    # clang-tidy does not load Homebrew clang's SDK configuration file.
+    export SDKROOT="${SDKROOT:-$(xcrun --sdk macosx --show-sdk-path)}"
+    RUT_CMAKE_ARGS=(
+        -DCMAKE_C_COMPILER="${CC:-$RUT_LLVM_PREFIX/bin/clang}"
+        -DCMAKE_CXX_COMPILER="${CXX:-$RUT_LLVM_PREFIX/bin/clang++}"
+        -DLLVM_DIR="$RUT_LLVM_PREFIX/lib/cmake/llvm"
+    )
+fi
+
+# ---- Configure ----
 configure() {
-    if [ ! -f "$BUILD_DIR/build.ninja" ]; then
+    # Reconfigure on macOS so a cached LLVM 23 build cannot bypass toolchain selection.
+    if [[ ! -f "$BUILD_DIR/build.ninja" || "$(uname -s)" == Darwin ]]; then
         echo "=== Configuring (clang, Ninja) ==="
         cmake -B "$BUILD_DIR" -G Ninja \
-            -DCMAKE_C_COMPILER=clang \
-            -DCMAKE_CXX_COMPILER=clang++ \
+            "${RUT_CMAKE_ARGS[@]}" \
             "$PROJECT_DIR"
     fi
 }
@@ -48,8 +67,7 @@ test() {
 coverage() {
     echo "=== Building with coverage ==="
     cmake -B "$BUILD_DIR-cov" -G Ninja \
-        -DCMAKE_C_COMPILER=clang \
-        -DCMAKE_CXX_COMPILER=clang++ \
+        "${RUT_CMAKE_ARGS[@]}" \
         -DCMAKE_CXX_FLAGS="-fprofile-instr-generate -fcoverage-mapping" \
         -DCMAKE_BUILD_TYPE=Debug \
         "$PROJECT_DIR"
@@ -90,6 +108,11 @@ tidy() {
         ! -path '*/simd/neon.cc' \
         ! -path '*/simd/sve.cc' | \
         grep -v third_party)
+    if [[ "$(uname -s)" == Darwin ]]; then
+        src_cc=$(printf '%s\n' "$src_cc" | grep -v -E '/(epoll_backend|io_uring_backend)\.cc$')
+    else
+        src_cc=$(printf '%s\n' "$src_cc" | grep -v '/kqueue_backend\.cc$')
+    fi
     # Match CI exactly (ci.yml): bugprone-*/performance-* are hard errors and
     # the exit code must gate `./dev.sh all` — the old grep-only form let
     # CI-fatal findings pass silently on developer machines.

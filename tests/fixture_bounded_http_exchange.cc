@@ -1,5 +1,6 @@
 #include "fixture_bounded_http_exchange.h"
 
+#include "../include/rut/platform/socket.h"
 #include <algorithm>
 #include <array>
 #include <cctype>
@@ -195,7 +196,7 @@ bool exchange(const std::string& ipv4,
         return fail(Outcome::InvalidArgument, "invalid bounded exchange argument");
     if (deadline_ns <= observation.start_nanoseconds)
         return fail(Outcome::DeadlineExceeded, "exchange deadline exceeded");
-    const int fd = socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
+    const int fd = rut::platform::stream_socket();
     if (fd < 0) return fail(Outcome::SocketCreateFailed, "IPv4 socket creation failed");
     struct FdGuard {
         int fd;

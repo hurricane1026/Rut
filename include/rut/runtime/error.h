@@ -23,6 +23,7 @@ struct Error {
         SlabPool,    // SlabPool init failed
         RouteTable,  // RouteTable capacity exceeded
         HttpParser,  // HTTP parse error (invalid input)
+        Kqueue,      // kqueue/kevent failed
     };
     Source source;
 

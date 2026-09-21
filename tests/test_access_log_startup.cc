@@ -1,3 +1,4 @@
+#include "posix.h"
 #include "rut/runtime/access_log_startup.h"
 #include "test.h"
 #include <filesystem>
@@ -68,7 +69,11 @@ std::string read_file(const std::string& path) {
 }
 
 i32 open_fd_count() {
+#ifdef __APPLE__
+    DIR* dir = opendir("/dev/fd");
+#else
     DIR* dir = opendir("/proc/self/fd");
+#endif
     if (dir == nullptr) return -1;
     i32 count = 0;
     while (dirent* entry = readdir(dir)) {
@@ -319,7 +324,7 @@ bool write_all(i32 fd, const char* bytes, size_t length) {
 
 i32 bind_loopback_listener(u16 first_port, u16 last_port, u16& port) {
     for (u32 candidate = first_port; candidate <= last_port; candidate++) {
-        const i32 fd = socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0);
+        const i32 fd = rut::test::cloexec_socket(AF_INET, SOCK_STREAM, 0);
         if (fd < 0) return -1;
         struct sockaddr_in address{};
         address.sin_family = AF_INET;
@@ -344,7 +349,7 @@ void record_one_proxy_request(i32 listener, ProxyBackendResult& result) {
         close(listener);
         return;
     }
-    const i32 client = accept4(listener, nullptr, nullptr, SOCK_CLOEXEC);
+    const i32 client = rut::test::cloexec_accept(listener);
     if (client < 0) {
         result.timed_out = true;
         close(listener);
@@ -370,7 +375,7 @@ void record_one_proxy_request(i32 listener, ProxyBackendResult& result) {
     close(client);
     struct pollfd retry{listener, POLLIN, 0};
     if (poll(&retry, 1, 300) > 0) {
-        const i32 extra = accept4(listener, nullptr, nullptr, SOCK_CLOEXEC);
+        const i32 extra = rut::test::cloexec_accept(listener);
         if (extra >= 0) {
             result.accepts++;
             close(extra);
@@ -383,7 +388,7 @@ bool transact_loopback(u16 port,
                        const char* request,
                        size_t request_length,
                        std::string& response) {
-    const i32 fd = socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0);
+    const i32 fd = rut::test::cloexec_socket(AF_INET, SOCK_STREAM, 0);
     if (fd < 0) return false;
     struct sockaddr_in address{};
     address.sin_family = AF_INET;
@@ -867,7 +872,7 @@ TEST(access_log_startup, public_main_conflicts_before_creating_any_source_sink) 
 TEST(access_log_startup, public_main_source_absence_keeps_legacy_cli_startup_path) {
     const std::string dir = make_temp_dir("/tmp/rut-access-log-startup-legacy-XXXXXX");
     REQUIRE_FALSE(dir.empty());
-    i32 occupied_8080 = socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0);
+    i32 occupied_8080 = rut::test::cloexec_socket(AF_INET, SOCK_STREAM, 0);
     REQUIRE(occupied_8080 >= 0);
     struct sockaddr_in address{};
     address.sin_family = AF_INET;

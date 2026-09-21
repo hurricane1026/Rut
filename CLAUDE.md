@@ -51,6 +51,10 @@ ninja -C build
 
 Binary: `build/src/rut`. Compiler: clang++. Linter: clang-tidy (`.clang-tidy`). Formatter: clang-format (`.clang-format`, Google-based, 4-space indent).
 
+macOS provides a native kqueue development environment (single shard, no CPU pinning).
+See [docs/macos.md](docs/macos.md) for setup, supported tests, and platform limits.
+Linux remains the production/performance target.
+
 ## C++ Conventions
 
 - No C++ standard library headers or libraries: use custom `FixedVec<T, Cap>`, `Str` (non-owning string view), `FlatMap<K, V, Cap>`, `ListNode` (intrusive linked list)

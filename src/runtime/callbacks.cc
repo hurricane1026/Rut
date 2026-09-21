@@ -5,13 +5,25 @@
 #include "rut/runtime/chunked_parser.h"
 #include "rut/runtime/connection.h"
 #include "rut/runtime/connection_base.h"
+#ifdef __APPLE__
+#include "rut/runtime/kqueue_event_loop.h"  // IWYU pragma: keep
+#else
 #include "rut/runtime/epoll_event_loop.h"  // IWYU pragma: keep
+#endif
 #include "rut/runtime/http_parser.h"
+#ifdef __linux__
 #include "rut/runtime/iouring_event_loop.h"  // IWYU pragma: keep
+#endif
 #include "rut/runtime/route_canon.h"
 #include "rut/runtime/traffic_capture.h"
 
 namespace rut {
+
+#ifdef __APPLE__
+using NativeReactorEventLoop = KqueueEventLoop;
+#else
+using NativeReactorEventLoop = EpollEventLoop;
+#endif
 
 bool h2_apply_forward_request_overrides(Connection& conn) {
     return rewrite_request_line_path(conn) && apply_request_header_overrides(conn);
@@ -837,37 +849,44 @@ u32 consume_upstream_sent(Connection& conn) {
     return kRemaining;
 }
 
-template void on_request_complete<EpollEventLoop>(EpollEventLoop*, Connection&, u16, u32);
-template void pipeline_dispatch<EpollEventLoop>(EpollEventLoop*, Connection&);
-template void on_header_received<EpollEventLoop>(void*, Connection&, IoEvent);
-template void on_response_sent<EpollEventLoop>(void*, Connection&, IoEvent);
-template void on_jit_wait_send_sent<EpollEventLoop>(void*, Connection&, IoEvent);
-template void on_upstream_connected<EpollEventLoop>(void*, Connection&, IoEvent);
-template void on_upstream_request_sent<EpollEventLoop>(void*, Connection&, IoEvent);
-template void on_upstream_response<EpollEventLoop>(void*, Connection&, IoEvent);
-template void on_proxy_response_sent<EpollEventLoop>(void*, Connection&, IoEvent);
-template void continue_http1_request_boundary<EpollEventLoop>(EpollEventLoop*, Connection&);
-template void on_response_header_sent<EpollEventLoop>(void*, Connection&, IoEvent);
-template void on_response_body_recvd<EpollEventLoop>(void*, Connection&, IoEvent);
-template void on_response_body_sent<EpollEventLoop>(void*, Connection&, IoEvent);
-template void handle_early_upstream_recv<EpollEventLoop>(EpollEventLoop*,
-                                                         Connection&,
-                                                         IoEvent,
-                                                         bool);
-template void on_body_send_with_early_response<EpollEventLoop>(void*, Connection&, IoEvent);
-template void on_request_body_sent<EpollEventLoop>(void*, Connection&, IoEvent);
-template void on_early_upstream_recvd<EpollEventLoop>(void*, Connection&, IoEvent);
-template void on_early_upstream_recvd_send_inflight<EpollEventLoop>(void*, Connection&, IoEvent);
-template void on_request_body_recvd<EpollEventLoop>(void*, Connection&, IoEvent);
-template void on_jit_request_body_recvd<EpollEventLoop>(void*, Connection&, IoEvent);
-template void resume_jit_handler<EpollEventLoop>(EpollEventLoop*, Connection&);
-template void respond_upstream_timeout<EpollEventLoop>(EpollEventLoop*, Connection&);
-template void h2_proxy_fail<EpollEventLoop>(EpollEventLoop*, Connection&, u16);
-template void throttle_resume<EpollEventLoop>(EpollEventLoop*, Connection&);
+template void on_request_complete<NativeReactorEventLoop>(NativeReactorEventLoop*,
+                                                          Connection&,
+                                                          u16,
+                                                          u32);
+template void pipeline_dispatch<NativeReactorEventLoop>(NativeReactorEventLoop*, Connection&);
+template void on_header_received<NativeReactorEventLoop>(void*, Connection&, IoEvent);
+template void on_response_sent<NativeReactorEventLoop>(void*, Connection&, IoEvent);
+template void on_jit_wait_send_sent<NativeReactorEventLoop>(void*, Connection&, IoEvent);
+template void on_upstream_connected<NativeReactorEventLoop>(void*, Connection&, IoEvent);
+template void on_upstream_request_sent<NativeReactorEventLoop>(void*, Connection&, IoEvent);
+template void on_upstream_response<NativeReactorEventLoop>(void*, Connection&, IoEvent);
+template void on_proxy_response_sent<NativeReactorEventLoop>(void*, Connection&, IoEvent);
+template void continue_http1_request_boundary<NativeReactorEventLoop>(NativeReactorEventLoop*,
+                                                                      Connection&);
+template void on_response_header_sent<NativeReactorEventLoop>(void*, Connection&, IoEvent);
+template void on_response_body_recvd<NativeReactorEventLoop>(void*, Connection&, IoEvent);
+template void on_response_body_sent<NativeReactorEventLoop>(void*, Connection&, IoEvent);
+template void handle_early_upstream_recv<NativeReactorEventLoop>(NativeReactorEventLoop*,
+                                                                 Connection&,
+                                                                 IoEvent,
+                                                                 bool);
+template void on_body_send_with_early_response<NativeReactorEventLoop>(void*, Connection&, IoEvent);
+template void on_request_body_sent<NativeReactorEventLoop>(void*, Connection&, IoEvent);
+template void on_early_upstream_recvd<NativeReactorEventLoop>(void*, Connection&, IoEvent);
+template void on_early_upstream_recvd_send_inflight<NativeReactorEventLoop>(void*,
+                                                                            Connection&,
+                                                                            IoEvent);
+template void on_request_body_recvd<NativeReactorEventLoop>(void*, Connection&, IoEvent);
+template void on_jit_request_body_recvd<NativeReactorEventLoop>(void*, Connection&, IoEvent);
+template void resume_jit_handler<NativeReactorEventLoop>(NativeReactorEventLoop*, Connection&);
+template void respond_upstream_timeout<NativeReactorEventLoop>(NativeReactorEventLoop*,
+                                                               Connection&);
+template void h2_proxy_fail<NativeReactorEventLoop>(NativeReactorEventLoop*, Connection&, u16);
+template void throttle_resume<NativeReactorEventLoop>(NativeReactorEventLoop*, Connection&);
 // Active health-check probes are EPOLL ONLY this slice (IoUringEventLoop's sweep
 // re-arms deadlines but issues no probes), so only the epoll instantiation is
 // emitted. This pulls in the on_probe_* callbacks + free_probe_conn transitively.
-template bool start_health_probe<EpollEventLoop>(EpollEventLoop*, u16, u32);
+template bool start_health_probe<NativeReactorEventLoop>(NativeReactorEventLoop*, u16, u32);
 
 // Out-of-line definition (declared in callbacks.h, documented in callbacks_impl.h)
 // — odr-used from sweep_health_probes in multiple TUs, so a single strong symbol
@@ -892,9 +911,13 @@ bool probe_in_flight(u16 upstream_id, u32 backend_idx) {
 // The probe teardown / config-pin helpers are also odr-used directly from the
 // epoll timer tick (stalled-probe reap), where only their callbacks.h
 // declarations are visible — emit the epoll instantiations here.
-template void free_probe_conn<EpollEventLoop>(EpollEventLoop*, Connection&);
-template void record_probe_if_current<EpollEventLoop>(EpollEventLoop*, Connection&, bool, u64);
+template void free_probe_conn<NativeReactorEventLoop>(NativeReactorEventLoop*, Connection&);
+template void record_probe_if_current<NativeReactorEventLoop>(NativeReactorEventLoop*,
+                                                              Connection&,
+                                                              bool,
+                                                              u64);
 
+#ifdef __linux__
 template void on_request_complete<IoUringEventLoop>(IoUringEventLoop*, Connection&, u16, u32);
 template void pipeline_dispatch<IoUringEventLoop>(IoUringEventLoop*, Connection&);
 template void on_header_received<IoUringEventLoop>(void*, Connection&, IoEvent);
@@ -923,5 +946,7 @@ template void resume_jit_handler<IoUringEventLoop>(IoUringEventLoop*, Connection
 template void respond_upstream_timeout<IoUringEventLoop>(IoUringEventLoop*, Connection&);
 template void h2_proxy_fail<IoUringEventLoop>(IoUringEventLoop*, Connection&, u16);
 template void throttle_resume<IoUringEventLoop>(IoUringEventLoop*, Connection&);
+
+#endif
 
 }  // namespace rut

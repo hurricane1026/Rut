@@ -821,19 +821,21 @@ TEST(batch, flushes_when_batch_overflows) {
         CHECK(ring.push(entry));
     }
 
-    i32 fds[2];
-    REQUIRE(pipe(fds) == 0);
-    (void)fcntl(fds[0], 1031 /*F_SETPIPE_SZ*/, 1048576);
+    // A regular file keeps this batch-size test independent of pipe capacity.
+    char path[] = "/tmp/rut-log-batch-XXXXXX";
+    const i32 fd = mkstemp(path);
+    REQUIRE(fd >= 0);
+    REQUIRE_EQ(unlink(path), 0);
 
     AccessLogFlusher flusher;
-    flusher.init(fds[1]);
+    flusher.init(fd);
     flusher.add_ring(&ring);
     CHECK_EQ(flusher.flush_once(), AccessLogRing::kCapacity);
-    close(fds[1]);
+    REQUIRE_EQ(lseek(fd, 0, SEEK_SET), 0);
 
     char buf[131072];
-    u32 n = read_all(fds[0], buf, sizeof(buf) - 1);
-    close(fds[0]);
+    u32 n = read_all(fd, buf, sizeof(buf) - 1);
+    close(fd);
     buf[n] = '\0';
 
     CHECK_EQ(count_lines(buf, n), AccessLogRing::kCapacity);

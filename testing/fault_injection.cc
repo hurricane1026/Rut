@@ -9,11 +9,17 @@
 #include <pthread.h>
 #include <stdarg.h>
 #include <stdint.h>
+#ifdef __linux__
 #include <sys/epoll.h>
+#endif
 #include <sys/mman.h>
 #include <sys/socket.h>
+#ifdef __linux__
 #include <sys/syscall.h>
+#endif
+#ifdef __linux__
 #include <sys/timerfd.h>
+#endif
 #include <sys/types.h>
 #include <time.h>
 #include <unistd.h>
@@ -23,6 +29,7 @@ namespace {
 
 thread_local FaultState g_state{};
 
+#ifdef __linux__
 struct HeldEpollEventState {
     ScopedHeldEpollEvent* owner = nullptr;
     int target_epoll_fd = -1;
@@ -41,6 +48,8 @@ void poison_held_epoll_event(HeldEpollEventState& state, HeldEpollEventError err
     state.replay_armed = false;
     state.error = error;
 }
+
+#endif
 
 struct HeldPositiveWriteState {
     pthread_mutex_t mutex = PTHREAD_MUTEX_INITIALIZER;
@@ -74,12 +83,15 @@ using SendFn = ssize_t (*)(int, const void*, size_t, int);
 using ConnectFn = int (*)(int, const struct sockaddr*, socklen_t);
 using CloseFn = int (*)(int);
 using FcntlFn = int (*)(int, int, ...);
+#ifdef __linux__
 using EpollCreate1Fn = int (*)(int);
 using EpollCtlFn = int (*)(int, int, int, struct epoll_event*);
 using EpollWaitFn = int (*)(int, struct epoll_event*, int, int);
 using TimerfdCreateFn = int (*)(int, int);
 using TimerfdSettimeFn = int (*)(int, int, const struct itimerspec*, struct itimerspec*);
 using Accept4Fn = int (*)(int, struct sockaddr*, socklen_t*, int);
+#endif
+
 using OpenFn = int (*)(const char*, int, ...);
 using MkstempFn = int (*)(char*);
 using UnlinkFn = int (*)(const char*);
@@ -96,12 +108,15 @@ SendFn g_real_send = nullptr;
 ConnectFn g_real_connect = nullptr;
 CloseFn g_real_close = nullptr;
 FcntlFn g_real_fcntl = nullptr;
+#ifdef __linux__
 EpollCreate1Fn g_real_epoll_create1 = nullptr;
 EpollCtlFn g_real_epoll_ctl = nullptr;
 EpollWaitFn g_real_epoll_wait = nullptr;
 TimerfdCreateFn g_real_timerfd_create = nullptr;
 TimerfdSettimeFn g_real_timerfd_settime = nullptr;
 Accept4Fn g_real_accept4 = nullptr;
+#endif
+
 OpenFn g_real_open = nullptr;
 MkstempFn g_real_mkstemp = nullptr;
 UnlinkFn g_real_unlink = nullptr;
@@ -172,6 +187,7 @@ void resolve_syscalls() {
     g_real_connect = reinterpret_cast<ConnectFn>(dlsym(RTLD_NEXT, "connect"));
     g_real_close = reinterpret_cast<CloseFn>(dlsym(RTLD_NEXT, "close"));
     g_real_fcntl = reinterpret_cast<FcntlFn>(dlsym(RTLD_NEXT, "fcntl"));
+#ifdef __linux__
     g_real_epoll_create1 = reinterpret_cast<EpollCreate1Fn>(dlsym(RTLD_NEXT, "epoll_create1"));
     g_real_epoll_ctl = reinterpret_cast<EpollCtlFn>(dlsym(RTLD_NEXT, "epoll_ctl"));
     g_real_epoll_wait = reinterpret_cast<EpollWaitFn>(dlsym(RTLD_NEXT, "epoll_wait"));
@@ -179,10 +195,24 @@ void resolve_syscalls() {
     g_real_timerfd_settime =
         reinterpret_cast<TimerfdSettimeFn>(dlsym(RTLD_NEXT, "timerfd_settime"));
     g_real_accept4 = reinterpret_cast<Accept4Fn>(dlsym(RTLD_NEXT, "accept4"));
+#endif
+
     g_real_open = reinterpret_cast<OpenFn>(dlsym(RTLD_NEXT, "open"));
     g_real_mkstemp = reinterpret_cast<MkstempFn>(dlsym(RTLD_NEXT, "mkstemp"));
     g_real_unlink = reinterpret_cast<UnlinkFn>(dlsym(RTLD_NEXT, "unlink"));
     g_real_clock_gettime = reinterpret_cast<ClockGettimeFn>(dlsym(RTLD_NEXT, "clock_gettime"));
+}
+
+int probe_clock_gettime(clockid_t id, struct timespec* ts) {
+#ifdef __linux__
+    return static_cast<int>(syscall(SYS_clock_gettime, id, ts));
+#else
+    if (!g_real_clock_gettime) {
+        errno = ENOSYS;
+        return -1;
+    }
+    return g_real_clock_gettime(id, ts);
+#endif
 }
 
 bool consume_fault(std::atomic<int>& counter) {
@@ -336,10 +366,13 @@ FcntlArgKind fcntl_arg_kind(int cmd) {
         case F_SETFD:
         case F_SETFL:
         case F_SETOWN:
+#ifdef __linux__
         case F_SETSIG:
         case F_SETLEASE:
         case F_NOTIFY:
         case F_SETPIPE_SZ:
+#endif
+
 #ifdef F_ADD_SEALS
         case F_ADD_SEALS:
 #endif
@@ -616,6 +649,7 @@ ScopedSyscallFault::~ScopedSyscallFault() {
     apply_syscall_fault_config(previous_);
 }
 
+#ifdef __linux__
 ScopedHeldEpollEvent::ScopedHeldEpollEvent(int target_epoll_fd) {
     if (target_epoll_fd < 0) {
         local_error_ = HeldEpollEventError::InvalidTargetFd;
@@ -696,6 +730,8 @@ uint64_t ScopedHeldEpollEvent::captured_data() const {
     return captured() ? g_held_epoll_event.event.data.u64 : 0;
 }
 
+#endif
+
 }  // namespace rut::test_fault
 
 namespace rut::detail {
@@ -728,18 +764,45 @@ extern "C" void* mmap(void* addr, size_t len, int prot, int flags, int fd, off_t
     return rut::test_fault::g_real_mmap(addr, len, prot, flags, fd, offset);
 }
 
+#ifdef __APPLE__
+namespace {
+// libSystem initializes malloc before this dylib's TLS is available. Calls
+// originating in the interposing image keep the original dyld binding.
+// Volatile preserves the pre-constructor check even under startup optimization;
+// this flag is set once by dyld before application threads start.
+volatile bool g_mprotect_interpose_ready = false;
+__attribute__((constructor)) void enable_mprotect_interposition() {
+    g_mprotect_interpose_ready = true;
+}
+int native_mprotect(void* addr, size_t len, int prot) {
+    return mprotect(addr, len, prot);
+}
+}  // namespace
+#define mprotect rut_test_mprotect
+#endif
+
 extern "C" int mprotect(void* addr, size_t len, int prot) {
+#ifdef __APPLE__
+    if (!g_mprotect_interpose_ready) return native_mprotect(addr, len, prot);
+#else
     pthread_once(&rut::test_fault::g_syscall_once, rut::test_fault::resolve_syscalls);
+#endif
     auto& state = rut::test_fault::state();
     if (state.mprotect_fail) {
         errno = ENOMEM;
         return -1;
     }
+#ifdef __APPLE__
+    // dlsym may return the interposed address; an intra-image call retains
+    // the original binding and cannot recurse into this replacement.
+    return native_mprotect(addr, len, prot);
+#else
     if (!rut::test_fault::g_real_mprotect) {
         errno = ENOSYS;
         return -1;
     }
     return rut::test_fault::g_real_mprotect(addr, len, prot);
+#endif
 }
 
 extern "C" int socket(int domain, int type, int protocol) {
@@ -756,7 +819,12 @@ extern "C" int socket(int domain, int type, int protocol) {
         return fd;
     }
     if (!rut::test_fault::g_real_socket) {
+#ifdef __linux__
         return static_cast<int>(syscall(SYS_socket, domain, type, protocol));
+#else
+        errno = ENOSYS;
+        return -1;
+#endif
     }
     return rut::test_fault::g_real_socket(domain, type, protocol);
 }
@@ -938,7 +1006,12 @@ extern "C" ssize_t send(int fd, const void* buf, size_t len, int flags) {
         }
     }
     if (!rut::test_fault::g_real_send) {
+#ifdef __linux__
         return static_cast<ssize_t>(syscall(SYS_sendto, fd, buf, len, flags, nullptr, 0));
+#else
+        errno = ENOSYS;
+        return -1;
+#endif
     }
     return rut::test_fault::g_real_send(fd, buf, len, flags);
 }
@@ -952,7 +1025,12 @@ extern "C" int connect(int fd, const struct sockaddr* addr, socklen_t len) {
         return -1;
     }
     if (!rut::test_fault::g_real_connect) {
+#ifdef __linux__
         return static_cast<int>(syscall(SYS_connect, fd, addr, len));
+#else
+        errno = ENOSYS;
+        return -1;
+#endif
     }
     return rut::test_fault::g_real_connect(fd, addr, len);
 }
@@ -1005,6 +1083,7 @@ extern "C" int fcntl(int fd, int cmd, ...) {
     return rut::test_fault::g_real_fcntl(fd, cmd, int_arg);
 }
 
+#ifdef __linux__
 extern "C" int epoll_create1(int flags) {
     pthread_once(&rut::test_fault::g_syscall_once, rut::test_fault::resolve_syscalls);
     if (rut::test_fault::consume_fault(rut::test_fault::g_epoll_create1_fail_count)) {
@@ -1126,6 +1205,8 @@ extern "C" int accept4(int fd, struct sockaddr* addr, socklen_t* len, int flags)
     return rut::test_fault::g_real_accept4(fd, addr, len, flags);
 }
 
+#endif
+
 extern "C" int open(const char* path, int flags, ...) {
     pthread_once(&rut::test_fault::g_syscall_once, rut::test_fault::resolve_syscalls);
     mode_t mode = 0;
@@ -1190,7 +1271,7 @@ extern "C" int clock_gettime(clockid_t clockid, struct timespec* ts) {
     if (rut::test_fault::g_clock_gettime_fixed.load(std::memory_order_relaxed) &&
         (match_all || configured_clock == clockid)) {
         struct timespec probe_ts{};
-        if (syscall(SYS_clock_gettime, clockid, &probe_ts) != 0) {
+        if (rut::test_fault::probe_clock_gettime(clockid, &probe_ts) != 0) {
             return -1;
         }
         if (ts_is_null) {
@@ -1203,7 +1284,7 @@ extern "C" int clock_gettime(clockid_t clockid, struct timespec* ts) {
             errno = EINVAL;
             return -1;
         }
-        if (syscall(SYS_clock_gettime, clockid, ts) != 0) {
+        if (rut::test_fault::probe_clock_gettime(clockid, ts) != 0) {
             return -1;
         }
         ts->tv_sec = static_cast<time_t>(
@@ -1213,14 +1294,23 @@ extern "C" int clock_gettime(clockid_t clockid, struct timespec* ts) {
     }
     if (ts_is_null) {
         struct timespec probe_ts{};
-        if (syscall(SYS_clock_gettime, clockid, &probe_ts) != 0) {
+        if (rut::test_fault::probe_clock_gettime(clockid, &probe_ts) != 0) {
             return -1;
         }
         errno = EFAULT;
         return -1;
     }
     if (!rut::test_fault::g_real_clock_gettime) {
-        return static_cast<int>(syscall(SYS_clock_gettime, clockid, ts));
+        return rut::test_fault::probe_clock_gettime(clockid, ts);
     }
     return rut::test_fault::g_real_clock_gettime(clockid, ts);
 }
+
+#ifdef __APPLE__
+#undef mprotect
+// dyld interposes both the test executable and LLVM's two-level dylib bindings.
+__attribute__((used, section("__DATA,__interpose"))) static const struct {
+    int (*replacement)(void*, size_t, int);
+    int (*original)(void*, size_t, int);
+} kMprotectInterpose{rut_test_mprotect, mprotect};
+#endif

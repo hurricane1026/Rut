@@ -1,3 +1,4 @@
+#include "../include/rut/platform/socket.h"
 #include "fixture_bounded_http_exchange.h"
 #include <algorithm>
 #include <cerrno>
@@ -21,7 +22,7 @@ static bool check(bool condition, const char* message) {
 }
 
 static int open_listener(std::uint16_t& port) {
-    const int listener = socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC | SOCK_NONBLOCK, 0);
+    const int listener = rut::platform::stream_socket();
     if (!check(listener >= 0, "listener socket creation")) return -1;
     int one = 1;
     if (!check(setsockopt(listener, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one)) == 0,
@@ -57,7 +58,7 @@ static int open_listener(std::uint16_t& port) {
 }
 
 static int open_unlistened_socket(std::uint16_t& port) {
-    const int reservation = socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0);
+    const int reservation = rut::platform::stream_socket();
     if (!check(reservation >= 0, "refusal socket creation")) return -1;
     sockaddr_in address{};
     address.sin_family = AF_INET;
@@ -434,6 +435,11 @@ int main() {
     if (reservation < 0) {
         ok = false;
     } else {
+#ifdef __APPLE__
+        // Darwin may defer SYNs to a bound, non-listening socket. Release it
+        // before testing connection refusal, keeping the selected local port.
+        if (!check(close(reservation) == 0, "refusal socket close")) ok = false;
+#endif
         Observation failure;
         const auto failed_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
         const auto failed_deadline_ns =
@@ -458,7 +464,9 @@ int main() {
             ok = false;
         if (!check(failure.outcome == Outcome::DeadlineExceeded, "expired exchange outcome"))
             ok = false;
+#ifndef __APPLE__
         if (!check(close(reservation) == 0, "refusal socket close")) ok = false;
+#endif
     }
     if (!check(open_fd_count() == descriptors_before, "FD count after all exchanges")) ok = false;
     return ok ? 0 : 1;

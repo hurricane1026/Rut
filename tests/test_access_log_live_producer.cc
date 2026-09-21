@@ -1,8 +1,9 @@
 #include "fault_injection.h"
+#include "posix.h"
 #include "rut/runtime/access_log_live_producer.h"
-#include "rut/runtime/epoll_event_loop.h"
 #include "rut/runtime/shard.h"
 #include "test.h"
+#include "test_helpers.h"
 #include <atomic>
 #include <string>
 #include <thread>
@@ -31,7 +32,7 @@ struct Pipe {
 
     bool open_nonblocking() {
         i32 fds[2];
-        if (pipe2(fds, O_NONBLOCK | O_CLOEXEC) != 0) return false;
+        if (rut::test::nonblocking_pipe(fds) != 0) return false;
         read_fd = fds[0];
         write_fd = fds[1];
         return true;
@@ -178,7 +179,7 @@ TEST(access_log_live_producer, notify_fatal_keeps_enqueued_record_for_finish_dra
 }
 
 TEST(access_log_live_lease, shard_retains_pre_attach_borrow_through_shutdown_until_finish) {
-    Shard<EpollEventLoop> shard;
+    Shard<RealLoop> shard;
     REQUIRE(shard.init(0u, -1).has_value());
     auto allocated = shard.init_live_access_log_ring();
     REQUIRE(allocated.has_value());
@@ -211,7 +212,7 @@ TEST(access_log_live_lease, shard_retains_pre_attach_borrow_through_shutdown_unt
 }
 
 TEST(access_log_live_lease, finishing_writer_holds_lease_until_blocked_write_and_join_complete) {
-    Shard<EpollEventLoop> shard;
+    Shard<RealLoop> shard;
     REQUIRE(shard.init(0u, -1).has_value());
     auto allocated = shard.init_live_access_log_ring();
     REQUIRE(allocated.has_value());
@@ -271,7 +272,7 @@ TEST(access_log_live_lease, finishing_writer_holds_lease_until_blocked_write_and
 
 TEST(access_log_live_lease, raw_attach_rejects_and_conflicting_start_unwinds_exact_owner) {
     {
-        Shard<EpollEventLoop> shard;
+        Shard<RealLoop> shard;
         REQUIRE(shard.init(0u, -1).has_value());
         auto allocated = shard.init_live_access_log_ring();
         REQUIRE(allocated.has_value());

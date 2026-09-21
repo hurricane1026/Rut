@@ -1,3 +1,13 @@
+# Fault shims live in a dylib on macOS so dyld can interpose calls from LLVM.
+# Linux keeps the existing directly linked syscall overrides.
+if(APPLE)
+    add_library(rut_test_fault SHARED ${PROJECT_SOURCE_DIR}/testing/fault_injection.cc)
+else()
+    add_library(rut_test_fault OBJECT ${PROJECT_SOURCE_DIR}/testing/fault_injection.cc)
+endif()
+target_include_directories(rut_test_fault PRIVATE
+    ${PROJECT_SOURCE_DIR}/include ${PROJECT_SOURCE_DIR}/testing)
+
 add_executable(test_framework test_framework.cc)
 target_include_directories(test_framework PRIVATE
     ${PROJECT_SOURCE_DIR}/include
@@ -130,6 +140,8 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
         TIMEOUT 30)
 endif()
 
+# Linux custody contracts use renameat2, procfs, pidfds and capability checks.
+if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
 # Tests-only identity-bound private /tmp directory custody for #377.
 add_library(fixture_private_directory_lease STATIC fixture_private_directory_lease.cc)
 target_include_directories(fixture_private_directory_lease PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
@@ -390,6 +402,8 @@ if(RUT_ENABLE_JIT)
         LABELS "unit;jit" TIMEOUT 30)
 endif()
 
+endif()
+
 add_executable(test_exact_path_view test_exact_path_view.cc)
 target_include_directories(test_exact_path_view PRIVATE
     ${PROJECT_SOURCE_DIR}/include
@@ -400,9 +414,8 @@ set_tests_properties(test_exact_path_view PROPERTIES LABELS "unit")
 
 add_executable(test_network
     test_network.cc
-    ${PROJECT_SOURCE_DIR}/testing/fault_injection.cc
 )
-target_link_libraries(test_network rut_runtime)
+target_link_libraries(test_network rut_test_fault rut_runtime)
 target_include_directories(test_network PRIVATE
     ${PROJECT_SOURCE_DIR}/include
     ${PROJECT_SOURCE_DIR}/testing
@@ -453,6 +466,7 @@ configure_file(
 
 add_custom_target(test_tls_fixtures DEPENDS ${RUT_TLS_TEST_CERT} ${RUT_TLS_TEST_KEY})
 
+if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
 add_executable(test_integration
     test_integration.cc
     epoll_tls_test_hooks.cc
@@ -494,12 +508,13 @@ set_tests_properties(
         RESOURCE_LOCK rut_integration
         TIMEOUT 300)
 
+endif()
+
 add_executable(test_arena
     test_arena.cc
     ${PROJECT_SOURCE_DIR}/src/placement_new.cc
-    ${PROJECT_SOURCE_DIR}/testing/fault_injection.cc
 )
-target_link_libraries(test_arena rut_runtime)
+target_link_libraries(test_arena rut_test_fault rut_runtime)
 target_include_directories(test_arena PRIVATE
     ${PROJECT_SOURCE_DIR}/include
     ${PROJECT_SOURCE_DIR}/testing
@@ -706,7 +721,6 @@ set_tests_properties(test_drain PROPERTIES LABELS "unit")
 
 add_executable(test_access_log
     test_access_log.cc
-    ${PROJECT_SOURCE_DIR}/testing/fault_injection.cc
 )
 find_library(RUT_TEST_ZSTD_DECOMPRESS_LIBRARY NAMES zstd REQUIRED)
 add_executable(test_access_log_zstd_decompress_helper zstd_decompress_helper.cc)
@@ -716,7 +730,7 @@ target_include_directories(test_access_log_zstd_decompress_helper PRIVATE
 target_link_libraries(test_access_log_zstd_decompress_helper
     ${RUT_TEST_ZSTD_DECOMPRESS_LIBRARY}
 )
-target_link_libraries(test_access_log rut_runtime)
+target_link_libraries(test_access_log rut_test_fault rut_runtime)
 target_compile_definitions(test_access_log PRIVATE
     RUT_TEST_ZSTD_DECOMPRESS_HELPER="$<TARGET_FILE:test_access_log_zstd_decompress_helper>"
 )
@@ -740,9 +754,8 @@ set_tests_properties(test_access_log_live PROPERTIES LABELS "unit;runtime" TIMEO
 
 add_executable(test_access_log_live_writer
     test_access_log_live_writer.cc
-    ${PROJECT_SOURCE_DIR}/testing/fault_injection.cc
 )
-target_link_libraries(test_access_log_live_writer rut_runtime)
+target_link_libraries(test_access_log_live_writer rut_test_fault rut_runtime)
 target_include_directories(test_access_log_live_writer PRIVATE
     ${PROJECT_SOURCE_DIR}/include
     ${PROJECT_SOURCE_DIR}/testing
@@ -752,9 +765,8 @@ set_tests_properties(test_access_log_live_writer PROPERTIES LABELS "unit;runtime
 
 add_executable(test_access_log_live_producer
     test_access_log_live_producer.cc
-    ${PROJECT_SOURCE_DIR}/testing/fault_injection.cc
 )
-target_link_libraries(test_access_log_live_producer rut_runtime)
+target_link_libraries(test_access_log_live_producer rut_test_fault rut_runtime)
 target_include_directories(test_access_log_live_producer PRIVATE
     ${PROJECT_SOURCE_DIR}/include
     ${PROJECT_SOURCE_DIR}/testing
@@ -803,9 +815,8 @@ set_tests_properties(test_debug PROPERTIES LABELS "unit")
 
 add_executable(test_fault_injection
     test_fault_injection.cc
-    ${PROJECT_SOURCE_DIR}/testing/fault_injection.cc
 )
-target_link_libraries(test_fault_injection rut_runtime)
+target_link_libraries(test_fault_injection rut_test_fault rut_runtime)
 target_include_directories(test_fault_injection PRIVATE
     ${PROJECT_SOURCE_DIR}/include
     ${PROJECT_SOURCE_DIR}/testing
@@ -825,6 +836,7 @@ add_test(NAME test_shard_control COMMAND test_shard_control)
 set_tests_properties(test_shard_control PROPERTIES LABELS "unit")
 
 if(RUT_ENABLE_JIT)
+    if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
     set(_RUT_PINNED_NGINX_IMAGE_FILE "${CMAKE_CURRENT_SOURCE_DIR}/pinned-nginx-image.txt")
     set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS
         "${_RUT_PINNED_NGINX_IMAGE_FILE}"
@@ -3260,6 +3272,8 @@ if(RUT_ENABLE_JIT)
         TIMEOUT 30
     )
 
+    endif()
+
     add_executable(test_jit test_jit.cc ${PROJECT_SOURCE_DIR}/src/placement_new.cc)
     target_link_libraries(test_jit rut_jit rut_compiler)
     target_include_directories(test_jit PRIVATE
@@ -3286,9 +3300,8 @@ endif()
 
 add_executable(test_traffic_capture
     test_traffic_capture.cc
-    ${PROJECT_SOURCE_DIR}/testing/fault_injection.cc
 )
-target_link_libraries(test_traffic_capture rut_runtime Threads::Threads)
+target_link_libraries(test_traffic_capture rut_test_fault rut_runtime Threads::Threads)
 target_include_directories(test_traffic_capture PRIVATE
     ${PROJECT_SOURCE_DIR}/include
     ${PROJECT_SOURCE_DIR}/testing
@@ -3299,9 +3312,8 @@ set_tests_properties(test_traffic_capture PROPERTIES LABELS "unit")
 
 add_executable(test_traffic_replay
     test_traffic_replay.cc
-    ${PROJECT_SOURCE_DIR}/testing/fault_injection.cc
 )
-target_link_libraries(test_traffic_replay rut_runtime rut_harness_core)
+target_link_libraries(test_traffic_replay rut_test_fault rut_runtime rut_harness_core)
 target_include_directories(test_traffic_replay PRIVATE
     ${PROJECT_SOURCE_DIR}/include
     ${PROJECT_SOURCE_DIR}/testing
@@ -3331,7 +3343,7 @@ add_test(NAME test_harness COMMAND test_harness)
 set_tests_properties(test_harness PROPERTIES LABELS "unit;harness")
 
 if(RUT_ENABLE_JIT)
-    target_sources(test_harness PRIVATE ${PROJECT_SOURCE_DIR}/testing/fault_injection.cc)
+    target_link_libraries(test_harness rut_test_fault)
     target_link_libraries(test_harness rut_harness_runtime)
     target_include_directories(test_harness PRIVATE ${LLVM_INCLUDE_DIRS})
     target_compile_definitions(test_harness PRIVATE
@@ -3365,7 +3377,9 @@ add_test(
 )
 set_tests_properties(test_runtime_state_model PROPERTIES LABELS "unit;model")
 
-if(RUT_ENABLE_JIT)
+if(APPLE)
+    include(macos.cmake)
+elseif(RUT_ENABLE_JIT)
     add_custom_target(check
         COMMAND ${Python3_EXECUTABLE} ${PROJECT_SOURCE_DIR}/scripts/check_runtime_state_model.py
         COMMAND $<TARGET_FILE:test_network>
