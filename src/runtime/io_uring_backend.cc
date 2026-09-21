@@ -616,6 +616,7 @@ void IoUringBackend::probe_nop_inject_result() {
     // Kernels without IORING_NOP_INJECT_RESULT fail the NOP with -EINVAL.
     static constexpr u32 kProbeResult = 7;
     nop_inject_result = false;
+    const u32 tail_before = __atomic_load_n(sq_tail, __ATOMIC_RELAXED);
     io_uring_sqe* sqe = get_sqe();
     if (!sqe) return;
     memset(sqe, 0, sizeof(*sqe));
@@ -624,9 +625,22 @@ void IoUringBackend::probe_nop_inject_result() {
     sqe->len = kProbeResult;
     sqe->user_data = encode_user_data(kCancelConnId, IoEventType::Send);
     sqe_advance_tail(sq_tail);
-    if (io_uring_enter(ring_fd, 1, 1, IORING_ENTER_GETEVENTS) < 0) return;
-    const u32 head = __atomic_load_n(cq_head, __ATOMIC_RELAXED);
-    if (head == __atomic_load_n(cq_tail, __ATOMIC_ACQUIRE)) return;
+    // -EINTR means nothing was submitted. A probe the kernel did not accept
+    // is withdrawn, so the next submission starts with the runtime's own SQEs.
+    i32 rc = 0;
+    do {
+        rc = io_uring_enter(ring_fd, 1, 1, IORING_ENTER_GETEVENTS);
+    } while (rc == -EINTR);
+    if (rc < 1) {
+        __atomic_store_n(sq_tail, tail_before, __ATOMIC_RELEASE);
+        return;
+    }
+    // Accepted: consume its completion here rather than in the first wait().
+    u32 head = __atomic_load_n(cq_head, __ATOMIC_RELAXED);
+    while (head == __atomic_load_n(cq_tail, __ATOMIC_ACQUIRE)) {
+        rc = io_uring_enter(ring_fd, 0, 1, IORING_ENTER_GETEVENTS);
+        if (rc < 0 && rc != -EINTR) return;  // wait() drops the sentinel completion
+    }
     nop_inject_result = cq_entries[head & *cq_ring_mask].res == static_cast<i32>(kProbeResult);
     __atomic_store_n(cq_head, head + 1, __ATOMIC_RELEASE);
 }
