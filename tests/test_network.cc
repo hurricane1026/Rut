@@ -30143,6 +30143,8 @@ TEST(iouring_upstream_recv, one_shot_selector_is_narrow_and_episode_stable) {
     CHECK_FALSE(loop->use_one_shot_upstream_recv(*conn));
     conn->upstream_attempts = 1;
     conn->response_policy_id = 1;
+    CHECK(loop->use_one_shot_upstream_recv(*conn));
+    conn->upstream_attempts = 2;
     CHECK_FALSE(loop->use_one_shot_upstream_recv(*conn));
     conn->upstream_attempts = 3;
     CHECK_FALSE(loop->use_one_shot_upstream_recv(*conn));
