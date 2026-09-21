@@ -1038,6 +1038,7 @@ int main(int argc, char** argv) {
                                           pin_cpus,
                                           drain_secs,
                                           pool_prealloc,
+                                          connection_capacity,
                                           tls_server,
                                           access_log_path,
                                           access_log_compress,

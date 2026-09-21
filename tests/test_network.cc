@@ -6044,6 +6044,7 @@ void tls_set_slots_recv_probe(void*, Connection&, IoEvent) {
 
 void tls_set_slots_send_probe(void*, Connection&, IoEvent) {}
 
+#ifdef __linux__
 u32 g_tls_reentrant_completion_calls = 0;
 u32 g_tls_reentrant_completion_result = 0;
 static constexpr u8 kTlsSuccessorSendPayload[] = "next";
@@ -6373,6 +6374,7 @@ void stage_strict_tls_send_owner(Connection& conn,
     conn.response_read_deadline_send_owner_active = true;
 }
 }  // namespace
+#endif  // __linux__
 
 TEST(connection_base, set_slots_redirects_recv_slot_for_iouring_tls) {
     Connection conn;
@@ -6395,6 +6397,7 @@ TEST(connection_base, set_slots_redirects_recv_slot_for_iouring_tls) {
     conn.tls_engine.ssl = nullptr;
 }
 
+#ifdef __linux__
 TEST(connection_base, tls_send_owners_reset_and_share_nonwrapping_tokens) {
     Connection conn;
     conn.reset();
@@ -6935,6 +6938,7 @@ TEST(tls_iouring, strict_tls_constrained_output_needroom_keeps_raw_owner_and_rec
     CHECK_EQ(loop.pending_free_count, 0u);
     CHECK_EQ(loop.free_top, 1u);
 }
+#endif  // __linux__
 
 TEST(tls_engine, accessor_helpers_track_ciphertext_offsets) {
     TlsEngine engine;
@@ -31219,6 +31223,7 @@ struct RawDownstreamRecvBatch {
 };
 #endif
 
+#ifdef __linux__
 TEST(iouring_wait, ready_cq_does_not_enter_but_pending_or_kernel_work_does) {
     for (const u32 mode : {0u, 1u, 2u, 3u, 4u}) {
         RawDownstreamRecvBatch fixture;
@@ -31363,6 +31368,7 @@ TEST(iouring_downstream_send_boundary, receive_before_response_remains_real_pipe
     CHECK_EQ(conn.recv_buf.len(), 1u);
     CHECK_EQ(fixture.guard.loop->backend.failure_code(), 0);
 }
+#endif  // __linux__
 
 static constexpr u8 kSplitHeaderPrefix[] =
     "GET /ledger?q=raw HTTP/1.1\r\n"
@@ -67635,6 +67641,7 @@ TEST(response_read_deadline, http_date_normalization_accepts_only_imf_fixdate_sh
         Str{kShort, static_cast<u32>(sizeof(kShort) - 1u)}));
 }
 
+#ifdef __linux__
 TEST(connection_capacity, runtime_storage_bounds_and_backend_guards) {
     static_assert(kDefaultConnectionCapacity == 16384);
     static_assert(kMaxConnectionCapacity == 0xFFFFFD);
@@ -68000,6 +68007,7 @@ TEST(iouring_body_pump_ready_set, rejects_foreign_slots_and_rolls_back_bitmap_al
     guard.loop->defer_response_read_deadline_body_pump(foreign);
     CHECK_FALSE(guard.loop->response_read_deadline_body_pump_pending);
 }
+#endif  // __linux__
 
 int main(int argc, char** argv) {
     return rut::test::run_all(argc, argv);
