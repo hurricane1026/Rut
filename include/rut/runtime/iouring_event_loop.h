@@ -254,18 +254,20 @@ public:
     };
     ResponseReadBatchOwner response_read_batch_owners[kMaxEventsPerWait];
     u16 response_read_batch_event_owner[kMaxEventsPerWait];
-    u32 response_read_batch_owner_count;
-    u32 response_read_batch_event_count;
-    u32 response_read_batch_event_index;
-    const IoEvent* response_read_batch_events;
+    // Counters default to empty so a loop whose slots are used before init()
+    // (e.g. storage-only setup) never scans indeterminate batch state.
+    u32 response_read_batch_owner_count = 0;
+    u32 response_read_batch_event_count = 0;
+    u32 response_read_batch_event_index = 0;
+    const IoEvent* response_read_batch_events = nullptr;
     u32 response_read_batch_pins[kMaxEventsPerWait];
-    u32 response_read_batch_pin_count;
+    u32 response_read_batch_pin_count = 0;
 
     // Deferred accepts: accepted fds that couldn't be allocated during
     // dispatch because all slots were in pending_free.
     static constexpr u32 kMaxDeferredAccepts = 64;
     i32 deferred_accepts[kMaxDeferredAccepts];
-    u32 deferred_accept_count;
+    u32 deferred_accept_count = 0;
 
     u32 keepalive_timeout = kDefaultKeepaliveTimeout;
     u32 upstream_timeout = kDefaultUpstreamTimeout;
