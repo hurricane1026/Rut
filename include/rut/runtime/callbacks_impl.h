@@ -7256,7 +7256,7 @@ void proxy_stream_complete(Loop* loop, Connection& conn) {
     if constexpr (requires(Loop* candidate, Connection& c) {
                       candidate->defer_http1_request_boundary(c);
                   }) {
-        if (conn.upstream_retirement_active && loop->defer_http1_request_boundary(conn)) return;
+        if (loop->defer_http1_request_boundary(conn)) return;
     }
 
     // If this response was throttled, arm_throttle_timer pulled the connection off
