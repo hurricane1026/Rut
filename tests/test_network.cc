@@ -9000,6 +9000,69 @@ TEST(upstream_pool, take_idle_empty_and_bad_fd) {
     CHECK_EQ(pool.idle_count, 0u);
 }
 
+TEST(upstream_pool, take_idle_prefers_most_recent_and_unlinks_any_position) {
+    UpstreamPool pool;
+    pool.init();
+    i32 a[2], b[2], c[2];
+    REQUIRE_EQ(socketpair(AF_UNIX, SOCK_STREAM, 0, a), 0);
+    REQUIRE_EQ(socketpair(AF_UNIX, SOCK_STREAM, 0, b), 0);
+    REQUIRE_EQ(socketpair(AF_UNIX, SOCK_STREAM, 0, c), 0);
+    REQUIRE(pool.put_idle(a[0], 1, 0, 0));
+    REQUIRE(pool.put_idle(b[0], 2, 0, 0));
+    REQUIRE(pool.put_idle(c[0], 1, 0, 0));
+    CHECK_EQ(pool.take_idle(1, 0), c[0]);  // most recently parked first
+    CHECK_EQ(pool.take_idle(2, 0), b[0]);  // unlinked from the middle
+    CHECK_EQ(pool.take_idle(1, 0), a[0]);
+    CHECK_EQ(pool.take_idle(1, 0), -1);
+    CHECK_EQ(pool.idle_count, 0u);
+    CHECK_EQ(pool.idle_head, UpstreamPool::kNoSlot);
+    CHECK_EQ(pool.free_top, UpstreamPool::kMaxConns);
+    // Freed slots are reusable and relinked.
+    REQUIRE(pool.put_idle(b[0], 2, 0, 0));
+    CHECK_EQ(pool.take_idle(2, 0), b[0]);
+    for (i32* sv : {a, b, c}) {
+        close(sv[0]);
+        close(sv[1]);
+    }
+}
+
+TEST(upstream_pool, take_idle_skips_dead_candidate_to_next_live_one) {
+    UpstreamPool pool;
+    pool.init();
+    i32 live[2], dead[2];
+    REQUIRE_EQ(socketpair(AF_UNIX, SOCK_STREAM, 0, live), 0);
+    REQUIRE_EQ(socketpair(AF_UNIX, SOCK_STREAM, 0, dead), 0);
+    close(dead[1]);
+    REQUIRE(pool.put_idle(live[0], 4, 1, 0));
+    REQUIRE(pool.put_idle(dead[0], 4, 1, 0));  // tried first, probe sees EOF
+    CHECK_EQ(pool.take_idle(4, 1), live[0]);
+    CHECK(close(dead[0]) < 0);  // evicted and closed
+    CHECK_EQ(pool.idle_count, 0u);
+    CHECK_EQ(pool.idle_head, UpstreamPool::kNoSlot);
+    close(live[0]);
+    close(live[1]);
+}
+
+TEST(upstream_pool, sweep_closes_only_expired_sockets) {
+    UpstreamPool pool;
+    pool.init();
+    i32 old_a[2], fresh[2], old_b[2];
+    REQUIRE_EQ(socketpair(AF_UNIX, SOCK_STREAM, 0, old_a), 0);
+    REQUIRE_EQ(socketpair(AF_UNIX, SOCK_STREAM, 0, fresh), 0);
+    REQUIRE_EQ(socketpair(AF_UNIX, SOCK_STREAM, 0, old_b), 0);
+    REQUIRE(pool.put_idle(old_a[0], 1, 0, 0));
+    REQUIRE(pool.put_idle(fresh[0], 1, 0, 10));
+    REQUIRE(pool.put_idle(old_b[0], 1, 0, 0));
+    pool.sweep(/*now_sec=*/15, /*max_idle_sec=*/10);
+    CHECK_EQ(pool.idle_count, 1u);
+    CHECK(close(old_a[0]) < 0);
+    CHECK(close(old_b[0]) < 0);
+    CHECK_EQ(pool.take_idle(1, 0), fresh[0]);
+    CHECK_EQ(pool.idle_head, UpstreamPool::kNoSlot);
+    close(fresh[0]);
+    for (i32* sv : {old_a, fresh, old_b}) close(sv[1]);
+}
+
 TEST(upstream_pool, create_socket) {
     i32 fake_fd = socket(AF_INET, SOCK_STREAM, 0);
     REQUIRE(fake_fd >= 0);
