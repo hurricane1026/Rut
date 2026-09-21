@@ -165,6 +165,10 @@ public:
             return;
         }
         if (ev.result < 0) {
+            // A response written directly still awaits its Send completion,
+            // which accounts the request and closes this connection; a client
+            // that read it and reset must not pre-empt that completion.
+            if (conn.direct_write_completion_pending) return;
             self().close_conn(conn);  // -ENOBUFS: prevent busy-loop
             return;
         }

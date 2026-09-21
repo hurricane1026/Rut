@@ -9574,7 +9574,7 @@ void on_validated_preconnect_failure_sent(void* lp, Connection& conn, IoEvent ev
     conn.response_header_buf.reset();
     conn.send_buf.reset();
     if (loop->is_draining() || !conn.keep_alive) {
-        loop->close_conn(conn);
+        close_conn_after_complete_response(loop, conn);
         return;
     }
     const PipelineTransitionResult kTransition = pipeline_shift(conn);

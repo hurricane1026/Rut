@@ -58689,6 +58689,51 @@ TEST(iouring_final_response, closing_local_response_ends_stream_before_completio
     close(sv[1]);
 }
 
+TEST(iouring_final_response, client_reset_waits_for_the_direct_write_completion) {
+    ScopedIoUringLoopForRetirement guard;
+    if (!guard.init()) SKIP("io_uring unavailable");
+    auto* loop = guard.loop;
+    if (!loop->backend.nop_inject_result) SKIP("IORING_NOP_INJECT_RESULT unsupported");
+    ShardMetrics metrics{};
+    metrics.init();
+    loop->metrics = &metrics;
+    static const char kResponse[] = "HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n";
+    constexpr u32 kLen = sizeof(kResponse) - 1u;
+    Connection* conn = loop->alloc_conn();
+    REQUIRE(conn != nullptr);
+    const u32 cid = conn->id;
+    i32 sv[2] = {-1, -1};
+    REQUIRE_EQ(rut::test::stream_socketpair(sv), 0);
+    conn->fd = sv[0];
+    conn->keep_alive = false;
+    conn->req_start_us = monotonic_us();
+    conn->resp_status = 200;
+    REQUIRE_EQ(conn->send_buf.write(reinterpret_cast<const u8*>(kResponse), kLen), kLen);
+    conn->transition_to_sending(&on_response_sent<IoUringEventLoop>);
+    REQUIRE(loop->submit_send(*conn, conn->send_buf.data(), kLen));
+    REQUIRE(conn->direct_write_completion_pending);
+
+    // The client already holds the response and resets before the Send
+    // completion is harvested: the connection must wait for that completion.
+    loop->dispatch_event(*conn, {cid, -ECONNRESET, 0, 0, IoEventType::Recv, 0, 0, 0});
+    CHECK_GE(conn->fd, 0);
+    CHECK(conn->on_send == &on_response_sent<IoUringEventLoop>);
+
+    IoEvent events[4]{};
+    u32 n = 0;
+    for (u32 attempt = 0; attempt < 8 && n == 0; attempt++)
+        n = loop->backend.wait(events, 4, loop->conns, IoUringEventLoop::kMaxConns);
+    REQUIRE_EQ(n, 1u);
+    REQUIRE_EQ(events[0].type, IoEventType::Send);
+    loop->dispatch(events[0]);
+    // The completion accounted the request and closed the connection.
+    CHECK_EQ(metrics.requests_total, 1u);
+    CHECK_EQ(loop->conns[cid].fd, -1);
+    CHECK_FALSE(loop->conns[cid].direct_write_completion_pending);
+    loop->metrics = nullptr;
+    close(sv[1]);
+}
+
 TEST(iouring_final_response, full_submission_queue_writes_nothing_directly) {
     ScopedIoUringLoopForRetirement guard;
     if (!guard.init()) SKIP("io_uring unavailable");

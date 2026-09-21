@@ -2975,6 +2975,7 @@ public:
                         c.fd, c.id, buf, len, written, generation)) {
                     c.pending_ops++;
                     c.send_armed = true;
+                    c.direct_write_completion_pending = true;
                     return true;
                 }
                 return false;
@@ -5891,7 +5892,10 @@ public:
                     if (!ev.more) {
                         if (conn.pending_ops > 0) conn.pending_ops--;
                         if (ev.type == IoEventType::Recv) conn.recv_armed = false;
-                        if (ev.type == IoEventType::Send) conn.send_armed = false;
+                        if (ev.type == IoEventType::Send) {
+                            conn.send_armed = false;
+                            conn.direct_write_completion_pending = false;
+                        }
                         if (ev.type == IoEventType::UpstreamConnect)
                             conn.upstream_connect_armed = false;
                         if (ev.type == IoEventType::UpstreamSend) {
