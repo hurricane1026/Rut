@@ -30517,6 +30517,92 @@ TEST(iouring_upstream_recv, one_shot_moves_slice_sized_chunks_through_dedicated_
     fixture.cleanup();
 }
 
+TEST(iouring_upstream_recv, backend_marks_only_empty_ring_enobufs) {
+    ScopedIoUringLoopForRetirement guard;
+    if (!guard.init()) SKIP("io_uring unavailable");
+    auto* loop = guard.loop;
+    auto& backend = loop->backend;
+    OneShotRecvFixture fixture;
+    REQUIRE(fixture.stage(loop, /*plaintext=*/true));
+    Connection& conn = *fixture.conn;
+    REQUIRE(loop->submit_recv_upstream(conn));
+    fixture.restore_ring();
+
+    auto append_cqe = [&](i32 res, u32 flags) {
+        const u32 cq_tail = __atomic_load_n(backend.cq_tail, __ATOMIC_ACQUIRE);
+        auto& cqe = backend.cq_entries[cq_tail & *backend.cq_ring_mask];
+        cqe.user_data = encode_upstream_event_token(
+            {conn.id, IoEventType::UpstreamRecv, conn.upstream_episode, 0});
+        cqe.res = res;
+        cqe.flags = flags;
+        __atomic_store_n(backend.cq_tail, cq_tail + 1u, __ATOMIC_RELEASE);
+    };
+    IoEvent events[2]{};
+
+    // The kernel reports an empty provided ring without selecting a buffer.
+    append_cqe(-ENOBUFS, 0);
+    backend.pending = 0;
+    REQUIRE_EQ(backend.wait(events, 2, loop->conns, IoUringEventLoop::kMaxConns), 1u);
+    CHECK_EQ(events[0].result, -ENOBUFS);
+    CHECK_EQ(events[0].provided_ring_empty, 1u);
+
+    // A selected buffer that does not fit is a lossy -ENOBUFS, never marked.
+    REQUIRE_EQ(conn.upstream_recv_buf.write_avail(), SlicePool::kSliceSize);
+    conn.upstream_recv_buf.commit(SlicePool::kSliceSize - 1u);
+    constexpr u16 kBufId = 3;
+    append_cqe(8, IORING_CQE_F_BUFFER | (static_cast<u32>(kBufId) << IORING_CQE_BUFFER_SHIFT));
+    backend.pending = 0;
+    REQUIRE_EQ(backend.wait(events, 2, loop->conns, IoUringEventLoop::kMaxConns), 1u);
+    CHECK_EQ(events[0].result, -ENOBUFS);
+    CHECK_EQ(events[0].provided_ring_empty, 0u);
+    conn.upstream_recv_buf.reset();
+    fixture.cleanup();
+}
+
+TEST(iouring_upstream_recv, empty_ring_terminal_rearms_one_shot_body_recv) {
+    ScopedIoUringLoopForRetirement guard;
+    if (!guard.init()) SKIP("io_uring unavailable");
+    auto* loop = guard.loop;
+    for (const bool ring_empty : {true, false}) {
+        OneShotRecvFixture fixture;
+        REQUIRE(fixture.stage(loop, /*plaintext=*/true));
+        Connection& conn = *fixture.conn;
+        conn.on_upstream_recv = &on_response_body_recvd<IoUringEventLoop>;
+        conn.state = ConnState::Sending;
+        conn.resp_body_mode = BodyMode::ContentLength;
+        conn.resp_body_remaining = 1024;
+        REQUIRE(loop->submit_recv_upstream(conn));
+        REQUIRE_EQ(conn.pending_ops, 1u);
+        const u32 tail_after_first = __atomic_load_n(loop->backend.sq_tail, __ATOMIC_ACQUIRE);
+
+        IoEvent terminal{
+            conn.id, -ENOBUFS, 0, 0, IoEventType::UpstreamRecv, 0, 0, conn.upstream_episode};
+        terminal.provided_ring_empty = ring_empty ? 1 : 0;
+        loop->dispatch(terminal);
+
+        CHECK_GE(conn.fd, 0);
+        CHECK_EQ(conn.upstream_recv_buf.len(), 0u);
+        if (ring_empty) {
+            // Exactly one fresh one-shot recv replaces the failed selection.
+            CHECK(conn.upstream_recv_armed);
+            CHECK_EQ(conn.pending_ops, 1u);
+            CHECK_EQ(__atomic_load_n(loop->backend.sq_tail, __ATOMIC_ACQUIRE),
+                     tail_after_first + 1u);
+            const auto& sqe =
+                loop->backend.sq_entries[tail_after_first & *loop->backend.sq_ring_mask];
+            CHECK_EQ(sqe.opcode, static_cast<u8>(IORING_OP_RECV));
+            CHECK_EQ(sqe.ioprio & IORING_RECV_MULTISHOT, 0u);
+            CHECK_EQ(sqe.len, loop->backend.upstream_once_max_len());
+        } else {
+            // Unmarked -ENOBUFS keeps the established body-pump contract.
+            CHECK_FALSE(conn.upstream_recv_armed);
+            CHECK_EQ(conn.pending_ops, 0u);
+            CHECK_EQ(__atomic_load_n(loop->backend.sq_tail, __ATOMIC_ACQUIRE), tail_after_first);
+        }
+        fixture.cleanup();
+    }
+}
+
 TEST(iouring_upstream_recv, terminal_dispatch_rearms_once_across_reuse_clear_and_drain) {
     ScopedIoUringLoopForRetirement guard;
     if (!guard.init()) SKIP("io_uring unavailable");

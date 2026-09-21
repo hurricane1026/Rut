@@ -5871,6 +5871,15 @@ public:
                             conn.upstream_recv_armed = false;
                             conn.upstream_recv_cancel_inflight = false;
                             conn.upstream_recv_terminal_stale = false;
+                            // A bounded one-shot recv that found its provided ring
+                            // empty consumed no socket bytes, and its owner is still
+                            // waiting for them: select another buffer rather than
+                            // deliver a terminal the response pumps treat as fatal
+                            // (header) or as already re-armed (body). This batch's
+                            // buffers were returned before dispatch.
+                            const bool one_shot_ring_empty = ev.provided_ring_empty &&
+                                                             ev.result == -ENOBUFS &&
+                                                             use_one_shot_upstream_recv(conn);
                             // A torn-down h2-proxy episode's recv terminal has now drained;
                             // discard any stale positive bytes it left so the next stream
                             // can't parse them as its response. Gated on the flag so the
@@ -5894,6 +5903,10 @@ public:
                             }
                             if (!this->try_deferred_upstream_rearm(conn)) {
                                 this->close_conn(conn);
+                                break;
+                            }
+                            if (one_shot_ring_empty) {
+                                if (!this->submit_recv_upstream(conn)) this->close_conn(conn);
                                 break;
                             }
                         }

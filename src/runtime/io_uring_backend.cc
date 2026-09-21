@@ -1496,6 +1496,10 @@ u32 IoUringBackend::wait(IoEvent* events, u32 max_events, Connection* conns, u32
         events[count].upstream_episode = upstream_episode;
         events[count].non_upstream_generation =
             (type == IoEventType::Send || type == IoEventType::ResponseReadTimer) ? aux : 0;
+        // Selected-buffer completions were handled above, so an UpstreamRecv
+        // -ENOBUFS here is the kernel reporting an empty provided ring.
+        events[count].provided_ring_empty =
+            type == IoEventType::UpstreamRecv && cqe->res == -ENOBUFS ? 1 : 0;
         if (type == IoEventType::UpstreamRecv && conns != nullptr && conn_id < max_conns &&
             conns[conn_id].response_read_deadline_state == ResponseReadDeadlineState::Armed &&
             conns[conn_id].response_read_deadline_owner_generation != 0 &&

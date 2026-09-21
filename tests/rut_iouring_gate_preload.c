@@ -79,6 +79,9 @@ _Static_assert(RUT_GATE_PBUF_REG_RESERVED_OFFSET + RUT_GATE_PBUF_REG_RESERVED_SI
 #define RUT_GATE_BUFFER_COUNT 2048U
 #define RUT_GATE_BUFFER_SIZE 4096U
 #define RUT_GATE_BUFFER_GROUP 0U
+/* Runtime's dedicated ring for bounded one-shot upstream recvs (io_backend.h). */
+#define RUT_GATE_LARGE_BUFFER_COUNT 1024U
+#define RUT_GATE_LARGE_BUFFER_GROUP 1U
 #define RUT_GATE_RECV_EVENT 1U
 #define RUT_GATE_SEND_EVENT 2U
 #define RUT_GATE_UPSTREAM_CONNECT_EVENT 3U
@@ -109,6 +112,7 @@ struct ring_view {
     uint64_t target_recv_user_data;
     int setup_valid;
     int pbuf_registered;
+    int large_pbuf_registered;
 };
 
 static struct rut_iouring_gate* gate;
@@ -1151,6 +1155,27 @@ __attribute__((visibility("hidden"))) long rut_gate_io_uring_syscall(long number
         unlock_identity();
         if (failed_now) rut_downstream_gate_wake(&gate->state);
         return libc_result(result);
+    }
+    if (number == __NR_io_uring_register && (int)arg1 == ring_view.fd &&
+        arg2 == IORING_REGISTER_PBUF_RING && arg4 == 1 && arg3 != 0) {
+        /* After the ordinary ring, accept exactly one registration of the
+         * runtime's dedicated upstream ring. It never replaces the gated
+         * ordinary ring's identity, entries or group. */
+        const struct io_uring_buf_reg* registration = (const struct io_uring_buf_reg*)arg3;
+        lock_identity();
+        const int large_request =
+            !failed_locked() && ring_view.pbuf_registered && !ring_view.large_pbuf_registered &&
+            registration->bgid == RUT_GATE_LARGE_BUFFER_GROUP &&
+            registration->ring_entries == RUT_GATE_LARGE_BUFFER_COUNT && registration->flags == 0 &&
+            registration->ring_addr != 0 && pbuf_registration_reserved_bytes_zero(registration);
+        unlock_identity();
+        if (large_request) {
+            const long result = rut_gate_kernel_syscall(number, arg1, arg2, arg3, arg4, 0, 0);
+            lock_identity();
+            if (result >= 0) ring_view.large_pbuf_registered = 1;
+            unlock_identity();
+            return libc_result(result);
+        }
     }
     if (number == __NR_io_uring_register && (int)arg1 == ring_view.fd) {
         const struct io_uring_buf_reg* registration = (const struct io_uring_buf_reg*)arg3;
