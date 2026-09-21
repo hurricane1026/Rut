@@ -30768,6 +30768,35 @@ TEST(iouring_upstream_relay, final_and_ineligible_chunks_keep_the_serialized_pum
     }
 }
 
+TEST(iouring_upstream_relay, full_submission_queue_defers_the_recv_to_send_completion) {
+    ScopedIoUringLoopForRetirement guard;
+    if (!guard.init()) SKIP("io_uring unavailable");
+    auto* loop = guard.loop;
+    constexpr u32 kSlice = SlicePool::kSliceSize;
+    OneShotRecvFixture fixture;
+    REQUIRE(stage_relay_body(fixture, loop, kSlice, 2u * kSlice));
+    Connection& conn = *fixture.conn;
+    // Leave exactly one free SQE: the relay's client send takes it.
+    const u32 head = __atomic_load_n(loop->backend.sq_head, __ATOMIC_ACQUIRE);
+    __atomic_store_n(
+        loop->backend.sq_tail, head + loop->backend.sq_ring_entries - 1u, __ATOMIC_RELEASE);
+
+    on_response_body_recvd<IoUringEventLoop>(loop, conn, relay_upstream_event(conn, kSlice));
+    CHECK_GE(conn.fd, 0);
+    CHECK_EQ(conn.upstream_relay_send_len, kSlice);
+    CHECK(conn.send_armed);
+    CHECK_FALSE(conn.upstream_recv_armed);
+
+    // Once the send completes (with room again), the pump arms the recv.
+    fixture.restore_ring();
+    on_response_body_sent<IoUringEventLoop>(loop, conn, relay_send_event(conn, kSlice));
+    CHECK_GE(conn.fd, 0);
+    CHECK_EQ(conn.upstream_relay_send_len, 0u);
+    CHECK(conn.upstream_recv_armed);
+    settle_relay_ops(conn);
+    fixture.cleanup();
+}
+
 TEST(iouring_upstream_relay, slices_outlive_an_inflight_relay_send) {
     ScopedIoUringLoopForRetirement guard;
     if (!guard.init()) SKIP("io_uring unavailable");

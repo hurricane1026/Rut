@@ -7024,8 +7024,13 @@ bool start_upstream_body_relay(Loop* loop, Connection& conn, u32 send_len) {
         conn.state = ConnState::Sending;
         conn.set_slots(
             nullptr, &on_response_body_sent<Loop>, &on_response_body_recvd<Loop>, nullptr);
-        if (!client_send(loop, conn, sending, send_len) || !loop->submit_recv_upstream(conn))
+        if (!client_send(loop, conn, sending, send_len)) {
             close_conn_if_live(loop, conn);
+            return true;
+        }
+        // If the submission queue had room only for the send, the recv is
+        // armed by on_response_body_sent once the send completes.
+        (void)loop->submit_recv_upstream(conn);
         return true;
     }
 }
