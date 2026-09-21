@@ -11164,6 +11164,8 @@ void on_upstream_response(void* lp, Connection& conn, IoEvent ev) {
         return;
     }
 
+    if (conn.req_client_connection_close) conn.keep_alive = false;
+
     const bool kIsHead = (conn.req_method == static_cast<u8>(LogHttpMethod::Head));
     const bool kNoBodyStatus =
         resp.status_code == 204 || resp.status_code == 205 || resp.status_code == 304;
@@ -11193,9 +11195,9 @@ void on_upstream_response(void* lp, Connection& conn, IoEvent ev) {
     // so a client Connection: close (or an HTTP/1.0 request) told the origin it may
     // close after responding — even if the response itself is self-framed HTTP/1.1
     // keep-alive. Pooling such an fd would race the origin's close, so refuse it.
-    // NOTE: this must NOT be conn.keep_alive — that is derived from drain state
-    // (set to !is_draining() in on_header_received), not the parsed request, so a
-    // Connection: close request on a live shard still has conn.keep_alive == true.
+    // NOTE: this must NOT be conn.keep_alive — that is also used for downstream
+    // drain/close state, while upstream pooling follows the request and response
+    // framing facts above.
     conn.upstream_keep_alive = resp.keep_alive && !resp.connection_close &&
                                conn.resp_body_mode != BodyMode::UntilClose && conn.req_keep_alive;
 

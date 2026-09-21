@@ -30290,6 +30290,70 @@ TEST(iouring_upstream_recv, pipeline_state_keeps_one_shot_for_tls_and_plaintext)
     }
 }
 
+TEST(iouring_upstream_response, native_client_close_marks_downstream_before_body_drain) {
+    static constexpr u8 kHeader[] =
+        "HTTP/1.1 200 OK\r\nContent-Length: 4\r\nConnection: keep-alive\r\n\r\n";
+    static constexpr u8 kBody[] = "body";
+
+    ScopedIoUringLoopForRetirement guard;
+    if (!guard.init()) SKIP("io_uring unavailable");
+    auto* loop = guard.loop;
+    for (const bool streaming : {false, true}) {
+        OneShotRecvFixture fixture;
+        REQUIRE(fixture.stage(loop, /*plaintext=*/true));
+        Connection& conn = *fixture.conn;
+        conn.keep_alive = true;
+        conn.req_keep_alive = true;
+        conn.req_client_connection_close = true;
+        const u32 header_len = sizeof(kHeader) - 1u;
+        REQUIRE_EQ(conn.upstream_recv_buf.write(kHeader, header_len), header_len);
+        if (!streaming)
+            REQUIRE_EQ(conn.upstream_recv_buf.write(kBody, sizeof(kBody) - 1u),
+                       sizeof(kBody) - 1u);
+        const u32 response_len = conn.upstream_recv_buf.len();
+        on_upstream_response<IoUringEventLoop>(
+            loop,
+            conn,
+            {conn.id,
+             static_cast<i32>(response_len),
+             0,
+             0,
+             IoEventType::UpstreamRecv,
+             0,
+             0,
+             conn.upstream_episode});
+        CHECK_FALSE(conn.keep_alive);
+        CHECK_EQ(conn.resp_body_mode, BodyMode::ContentLength);
+        CHECK_EQ(conn.resp_body_remaining, streaming ? 4u : 0u);
+        CHECK_GE(conn.fd, 0);
+        fixture.cleanup();
+    }
+
+    OneShotRecvFixture fixture;
+    REQUIRE(fixture.stage(loop, /*plaintext=*/true));
+    Connection& conn = *fixture.conn;
+    conn.keep_alive = true;
+    conn.req_keep_alive = true;
+    conn.req_client_connection_close = false;
+    static constexpr u8 kNoClose[] =
+        "HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: keep-alive\r\n\r\n";
+    REQUIRE_EQ(conn.upstream_recv_buf.write(kNoClose, sizeof(kNoClose) - 1u),
+               sizeof(kNoClose) - 1u);
+    on_upstream_response<IoUringEventLoop>(
+        loop,
+        conn,
+        {conn.id,
+         static_cast<i32>(sizeof(kNoClose) - 1u),
+         0,
+         0,
+         IoEventType::UpstreamRecv,
+         0,
+         0,
+         conn.upstream_episode});
+    CHECK(conn.keep_alive);
+    fixture.cleanup();
+}
+
 TEST(iouring_upstream_recv, terminal_dispatch_rearms_once_across_reuse_clear_and_drain) {
     ScopedIoUringLoopForRetirement guard;
     if (!guard.init()) SKIP("io_uring unavailable");
