@@ -33134,7 +33134,7 @@ TEST(route, ordinary_source_coalesced_exact_strict_get_successor_iouring) {
                                     sqe.addr == reinterpret_cast<u64>(send.src);
                                 const bool direct_write_completion =
                                     sqe.opcode == IORING_OP_NOP &&
-                                    sqe.nop_flags == IORING_NOP_INJECT_RESULT;
+                                    static_cast<u32>(sqe.rw_flags) == (1u << 0);
                                 const u64 user_data = sqe.user_data;
                                 const bool target_identity =
                                     static_cast<IoEventType>(user_data & 0xFFu) ==

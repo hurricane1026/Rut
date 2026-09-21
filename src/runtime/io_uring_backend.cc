@@ -60,6 +60,13 @@ static bool response_deadline_copy_owner(const Connection& conn, u32 upstream_ep
            !conn.h2_proxy_recv_draining && !conn.h2_proxy_synth_quarantined;
 }
 
+// IORING_OP_NOP result injection (Linux 6.10). Older UAPI headers lack the
+// name and the nop_flags alias of the shared per-op flags word (rw_flags); the
+// ABI is fixed, and support is probed at runtime.
+#ifndef IORING_NOP_INJECT_RESULT
+#define IORING_NOP_INJECT_RESULT (1U << 0)
+#endif
+
 // Sentinel conn_id for timer events (same value as epoll backend)
 static constexpr u32 kTimerConnId = 0xFFFFFE;
 // Sentinel conn_id for cancel completions (must not collide with real conn_ids or timer)
@@ -613,7 +620,7 @@ void IoUringBackend::probe_nop_inject_result() {
     if (!sqe) return;
     memset(sqe, 0, sizeof(*sqe));
     sqe->opcode = IORING_OP_NOP;
-    sqe->nop_flags = IORING_NOP_INJECT_RESULT;
+    sqe->rw_flags = static_cast<decltype(sqe->rw_flags)>(IORING_NOP_INJECT_RESULT);
     sqe->len = kProbeResult;
     sqe->user_data = encode_user_data(kCancelConnId, IoEventType::Send);
     sqe_advance_tail(sq_tail);
@@ -637,7 +644,7 @@ bool IoUringBackend::add_send_after_direct_write(
     memset(sqe, 0, sizeof(*sqe));
     if (written == len) {
         sqe->opcode = IORING_OP_NOP;
-        sqe->nop_flags = IORING_NOP_INJECT_RESULT;
+        sqe->rw_flags = static_cast<decltype(sqe->rw_flags)>(IORING_NOP_INJECT_RESULT);
         sqe->len = len;
         send_state[conn_id].offset = 0;
         send_state[conn_id].remaining = len;
