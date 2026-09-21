@@ -448,6 +448,9 @@ find_package(Threads REQUIRED)
 target_link_libraries(test_fixture_bounded_http_exchange PRIVATE Threads::Threads)
 find_package(Python3 REQUIRED COMPONENTS Interpreter)
 
+# Runtime connection capacity is a Linux backend option; the macOS kqueue
+# development backend accepts only the default and rejects other values.
+if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
 add_test(
     NAME test_cli_connection_capacity
     COMMAND ${Python3_EXECUTABLE}
@@ -457,6 +460,7 @@ set_tests_properties(test_cli_connection_capacity PROPERTIES
     LABELS "cli"
     RUN_SERIAL TRUE
     TIMEOUT 45)
+endif()
 
 set(RUT_TLS_TESTDATA_DIR ${CMAKE_CURRENT_BINARY_DIR}/testdata)
 set(RUT_TLS_TEST_CERT ${RUT_TLS_TESTDATA_DIR}/localhost_cert.pem)

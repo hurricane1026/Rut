@@ -6373,8 +6373,8 @@ void stage_strict_tls_send_owner(Connection& conn,
     conn.response_read_deadline_send_kind = kind;
     conn.response_read_deadline_send_owner_active = true;
 }
-}  // namespace
 #endif  // __linux__
+}  // namespace
 
 TEST(connection_base, set_slots_redirects_recv_slot_for_iouring_tls) {
     Connection conn;

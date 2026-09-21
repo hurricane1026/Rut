@@ -155,7 +155,7 @@ without either declaration the listener defaults to `:8080`.
 | `--drain N` | Graceful drain window, seconds | `30` |
 | `--opt N` | JIT optimization level: `0` (low, fastest startup) .. `3` (high) | `2` |
 | `--pool-prealloc N` | Pre-commit N buffer slices per shard | `0` (lazy) |
-| `--max-connections-per-shard N` | Maximum connection slots allocated by each shard | `16384` |
+| `--max-connections-per-shard N` | Maximum connection slots allocated by each shard (Linux; macOS accepts only the default) | `16384` |
 | `--tls-cert PATH` | TLS certificate (PEM); enables TLS | off |
 | `--tls-key PATH` | TLS private key (PEM); required with `--tls-cert` | off |
 | `--access-log PATH` | Write access logs to PATH | off |

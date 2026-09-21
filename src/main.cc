@@ -714,6 +714,15 @@ int main(int argc, char** argv) {
                     write_str("\n");
                     return 1;
                 }
+#ifndef __linux__
+                // The macOS kqueue development backend has fixed connection storage.
+                if (parsed != kDefaultConnectionCapacity) {
+                    write_str("--max-connections-per-shard capacity other than ");
+                    write_u32(kDefaultConnectionCapacity);
+                    write_str(" requires a Linux backend\n");
+                    return 1;
+                }
+#endif
                 connection_capacity = parsed;
                 i++;
             } else if (str_eq(argv[i], "--access-log")) {

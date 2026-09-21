@@ -3,7 +3,6 @@
 #include "core/expected.h"
 #include "rut/common/types.h"
 #include "rut/runtime/error.h"
-#include <new>
 
 #include <sys/mman.h>
 
