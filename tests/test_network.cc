@@ -30088,6 +30088,13 @@ TEST(iouring_upstream_recv, one_shot_selector_is_narrow_and_episode_stable) {
     };
     conn->tls_active = false;
     CHECK(loop->use_one_shot_upstream_recv(*conn));
+    conn->upstream_attempts = 2;
+    CHECK(loop->use_one_shot_upstream_recv(*conn));
+    conn->upstream_attempts = 3;
+    CHECK(loop->use_one_shot_upstream_recv(*conn));
+    conn->upstream_attempts = 0;
+    CHECK_FALSE(loop->use_one_shot_upstream_recv(*conn));
+    conn->upstream_attempts = 1;
     conn->response_policy_id = 1;
     CHECK_FALSE(loop->use_one_shot_upstream_recv(*conn));
     conn->response_policy_id = 0;
@@ -30126,9 +30133,27 @@ TEST(iouring_upstream_recv, one_shot_selector_is_narrow_and_episode_stable) {
                    [&] { conn->upstream_recv_idle_stale_bytes = false; });
     rejected_while([&] { conn->upstream_recv_pause_rearm_pending = true; },
                    [&] { conn->upstream_recv_pause_rearm_pending = false; });
-    // Attempts can change only when a retry selects a new upstream episode;
-    // an existing selected episode remains one-shot across response progress.
-    rejected_while([&] { conn->upstream_attempts = 2; }, [&] { conn->upstream_attempts = 1; });
+    // Native retries keep the bounded one-shot primitive across response
+    // progress; an uninitialized attempt count remains excluded.
+    conn->upstream_attempts = 2;
+    CHECK(loop->use_one_shot_upstream_recv(*conn));
+    conn->upstream_attempts = 3;
+    CHECK(loop->use_one_shot_upstream_recv(*conn));
+    conn->upstream_attempts = 0;
+    CHECK_FALSE(loop->use_one_shot_upstream_recv(*conn));
+    conn->upstream_attempts = 1;
+    conn->response_policy_id = 1;
+    CHECK_FALSE(loop->use_one_shot_upstream_recv(*conn));
+    conn->upstream_attempts = 3;
+    CHECK_FALSE(loop->use_one_shot_upstream_recv(*conn));
+    conn->response_policy_id = 0;
+    conn->upstream_attempts = 2;
+    conn->on_upstream_recv = &on_response_body_recvd<IoUringEventLoop>;
+    conn->state = ConnState::Sending;
+    CHECK(loop->use_one_shot_upstream_recv(*conn));
+    conn->on_upstream_recv = &on_upstream_response<IoUringEventLoop>;
+    conn->state = ConnState::Proxying;
+    conn->upstream_attempts = 1;
     rejected_while([&] { conn->on_upstream_recv = &test_sentinel_callback<IoUringEventLoop>; },
                    [&] { conn->on_upstream_recv = &on_upstream_response<IoUringEventLoop>; });
 
@@ -30141,6 +30166,7 @@ TEST(iouring_upstream_recv, one_shot_selector_is_narrow_and_episode_stable) {
     CHECK(loop->use_one_shot_upstream_recv(*conn));
 
     resources.snapshot_ring();
+    conn->upstream_attempts = 2;
     const u32 tail_before = resources.sq_tail_before;
     REQUIRE(loop->submit_recv_upstream(*conn));
     CHECK(conn->upstream_recv_armed);

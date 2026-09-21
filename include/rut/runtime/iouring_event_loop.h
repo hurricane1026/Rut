@@ -3064,7 +3064,9 @@ public:
                !c.epoch_held && ordinary_response_owner && c.on_upstream_send == nullptr &&
                !c.upstream_connect_armed && !c.upstream_send_armed &&
                valid_upstream_episode(c.upstream_episode) && !c.upstream_episode_quarantined &&
-               c.upstream_attempts == 1 && c.request_upload_complete &&
+               c.upstream_attempts != 0 &&
+               (c.response_policy_id == 0 || c.upstream_attempts == 1) &&
+               c.request_upload_complete &&
                !c.upstream_request_incomplete && c.req_body_mode == BodyMode::None &&
                c.req_body_remaining == 0 && !c.req_client_has_content_length &&
                !c.req_client_has_transfer_encoding && !c.req_client_has_te &&
