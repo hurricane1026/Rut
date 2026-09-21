@@ -58649,7 +58649,8 @@ TEST(iouring_final_response, closing_local_response_ends_stream_before_completio
     if (!guard.init()) SKIP("io_uring unavailable");
     auto* loop = guard.loop;
     if (!loop->backend.nop_inject_result) SKIP("IORING_NOP_INJECT_RESULT unsupported");
-    static const char kResponse[] = "HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok";
+    static const char kResponse[] =
+        "HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok";
     constexpr u32 kLen = sizeof(kResponse) - 1u;
     Connection* conn = loop->alloc_conn();
     REQUIRE(conn != nullptr);

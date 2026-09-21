@@ -2969,7 +2969,8 @@ public:
             if (n > 0) {
                 const u32 written = static_cast<u32>(n);
                 if (written == len) (void)::shutdown(c.fd, SHUT_WR);
-                if (backend.add_send_after_direct_write(c.fd, c.id, buf, len, written, generation)) {
+                if (backend.add_send_after_direct_write(
+                        c.fd, c.id, buf, len, written, generation)) {
                     c.pending_ops++;
                     c.send_armed = true;
                     return true;
@@ -2986,11 +2987,13 @@ public:
         return false;
     }
 
-    [[nodiscard]] bool final_local_response_send(const Connection& c, const u8* buf, u32 len) const {
+    [[nodiscard]] bool final_local_response_send(const Connection& c,
+                                                 const u8* buf,
+                                                 u32 len) const {
         return backend.nop_inject_result && !c.tls_active && !c.keep_alive && c.fd >= 0 &&
-               !c.send_armed && len != 0 &&
-               len <= static_cast<u32>(INT32_MAX) && c.on_send == &on_response_sent<Self> &&
-               c.send_progress == 0 && buf == c.send_buf.data() && len == c.send_buf.len();
+               !c.send_armed && len != 0 && len <= static_cast<u32>(INT32_MAX) &&
+               c.on_send == &on_response_sent<Self> && c.send_progress == 0 &&
+               buf == c.send_buf.data() && len == c.send_buf.len();
     }
 
     bool submit_send_impl(Connection& c, const u8* buf, u32 len) {
