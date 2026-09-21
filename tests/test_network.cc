@@ -31118,6 +31118,31 @@ void drain_prebuilt_d2_retirement(IoUringEventLoop* loop,
     }
 }
 
+bool drain_owned_response_read_timer_cqes(IoUringEventLoop* loop, Connection& conn) {
+    if (loop == nullptr) return false;
+    if (conn.response_read_timer_owner_is_neutral()) return true;
+    if (!conn.response_read_timer_owner_is_valid() ||
+        conn.response_read_timer_phase != ResponseReadTimerPhase::CancelPending ||
+        !conn.http1_boundary_deferred || conn.http1_boundary_ready)
+        return false;
+
+    const u32 generation = conn.response_read_timer_owner_generation;
+    const bool target_owned = conn.response_read_timer_target_owned;
+    const bool cancel_owned = conn.response_read_timer_cancel_owned;
+    if (target_owned) {
+        IoEvent target = inert_response_read_timer_event(conn.id, generation);
+        target.result = -ECANCELED;
+        loop->dispatch(target);
+    }
+    if (cancel_owned) {
+        IoEvent cancel =
+            inert_response_read_timer_event(conn.id, generation | kResponseReadTimerCancelBit);
+        cancel.result = -ENOENT;
+        loop->dispatch(cancel);
+    }
+    return conn.response_read_timer_owner_is_neutral();
+}
+
 void cleanup_prebuilt_d2(IoUringEventLoop* loop, PrebuiltD2Fixture& fixture) {
     if (loop == nullptr || fixture.conn == nullptr) return;
     Connection& conn = *fixture.conn;
@@ -47392,6 +47417,7 @@ TEST(response_read_deadline,
             PrebuiltD2Fixture fixture{};
             REQUIRE(stage_live_precise_get(loop, config, &fixture, false, true, request_policy));
             Connection& conn = *fixture.conn;
+            const u32 connection_id = conn.id;
             const auto proof = conn.response_read_deadline_upload;
             const u32 original_handler_generation = conn.handler_gen;
             REQUIRE_NE(original_handler_generation, 0u);
@@ -47515,17 +47541,32 @@ TEST(response_read_deadline,
             }
             REQUIRE(conn.http1_boundary_deferred);
             drain_prebuilt_d2_retirement(loop, conn, kUpstreamOpRecv, false);
+            REQUIRE(drain_owned_response_read_timer_cqes(loop, conn));
             REQUIRE(conn.http1_boundary_ready);
+            REQUIRE_EQ(conn.id, connection_id);
+            REQUIRE_EQ(conn.handler_gen, original_handler_generation);
+            const u32 free_top_before_close = loop->free_top;
+            const u32 pending_free_count_before_close = loop->pending_free_count;
             loop->resume_deferred_http1_boundaries();
-            REQUIRE_EQ(loop->conns[conn.id].fd, -1);
-            CHECK_EQ(loop->conns[conn.id].handler_gen, original_handler_generation);
-            CHECK_EQ(loop->conns[conn.id].pending_ops, 0u);
-            CHECK_FALSE(loop->conns[conn.id].upstream_retirement_active);
-            CHECK_EQ(loop->conns[conn.id].upstream_retirement_target_owned, 0u);
-            CHECK_EQ(loop->conns[conn.id].upstream_retirement_cancel_owned, 0u);
-            CHECK_FALSE(loop->conns[conn.id].http1_boundary_deferred);
-            CHECK_FALSE(loop->conns[conn.id].http1_boundary_ready);
-            CHECK_EQ(conn.pipeline_depth, 0u);
+            const Connection& reclaimed = loop->conns[connection_id];
+            CHECK_EQ(reclaimed.fd, -1);
+            CHECK_EQ(reclaimed.handler_gen, original_handler_generation);
+            CHECK_EQ(reclaimed.state, ConnState::Idle);
+            CHECK_EQ(reclaimed.id, 0u);
+            CHECK_EQ(reclaimed.pending_ops, 0u);
+            CHECK_FALSE(reclaimed.upstream_retirement_active);
+            CHECK_EQ(reclaimed.upstream_retirement_target_owned, 0u);
+            CHECK_EQ(reclaimed.upstream_retirement_cancel_owned, 0u);
+            CHECK_FALSE(reclaimed.http1_boundary_deferred);
+            CHECK_FALSE(reclaimed.http1_boundary_ready);
+            CHECK_EQ(reclaimed.pipeline_depth, 0u);
+            CHECK(reclaimed.response_read_timer_owner_is_neutral());
+            CHECK_EQ(reclaimed.response_read_deadline_state, ResponseReadDeadlineState::None);
+            CHECK_EQ(reclaimed.on_recv, nullptr);
+            CHECK_EQ(reclaimed.on_send, nullptr);
+            CHECK_EQ(loop->pending_free_count, pending_free_count_before_close);
+            CHECK_EQ(loop->free_top, free_top_before_close + 1u);
+            CHECK_EQ(loop->free_stack[loop->free_top - 1u], connection_id);
             release_closed_response_read_fixture(fixture);
         }
     }
@@ -49734,6 +49775,483 @@ TEST(response_buffering_runtime, complete_content_length_status_allowlist_is_exa
                              static_cast<u16>(400),
                              static_cast<u16>(500)})
         CHECK_FALSE(complete_content_length_response_status_is_admitted(status));
+}
+
+TEST(iouring_response_read_timer,
+     complete_get_boundary_waits_for_origin_and_timer_custody_in_either_order) {
+    static constexpr u8 kResponse[] = "HTTP/1.1 200 OK\r\nContent-Length: 4\r\n\r\nabcd";
+    for (const bool origin_first : {false, true}) {
+        for (const bool cancel_first : {false, true}) {
+            ScopedIoUringLoopForRetirement guard;
+            if (!guard.init()) SKIP("io_uring unavailable");
+            IoUringEventLoop* loop = guard.loop;
+            ShardMetrics metrics{};
+            metrics.init();
+            loop->metrics = &metrics;
+            RouteConfig config{};
+            PrebuiltD2Fixture fixture{};
+            REQUIRE(stage_live_precise_get(loop, config, &fixture));
+            Connection& conn = *fixture.conn;
+
+            REQUIRE_EQ(conn.upstream_recv_buf.write(kResponse, sizeof(kResponse) - 1u),
+                       sizeof(kResponse) - 1u);
+            const IoEvent response = response_read_copy_event(
+                conn, sizeof(kResponse) - 1u, true, 0, sizeof(kResponse) - 1u);
+            loop->dispatch_batch(&response, 1);
+            REQUIRE_EQ(conn.response_read_deadline_post_commit_phase,
+                       ResponseReadDeadlinePostCommitPhase::CombinedSend);
+            REQUIRE_EQ(conn.response_read_timer_phase, ResponseReadTimerPhase::CancelPending);
+            REQUIRE(conn.response_read_timer_target_owned);
+            REQUIRE(conn.response_read_timer_cancel_owned);
+            const u32 timer_generation = conn.response_read_timer_owner_generation;
+            const u32 retiring_episode = conn.upstream_retiring_episode;
+            REQUIRE(conn.upstream_retirement_active);
+
+            const IoEvent send = exact_response_deadline_send_event(loop, conn);
+            loop->dispatch_batch(&send, 1);
+            REQUIRE(conn.http1_boundary_deferred);
+            CHECK_FALSE(conn.http1_boundary_ready);
+            CHECK_FALSE(conn.recv_armed);
+            CHECK_EQ(metrics.requests_total, 1u);
+            CHECK_EQ(conn.req_start_us, 0u);
+
+            const auto consume_timer_owner = [&] {
+                IoEvent target = inert_response_read_timer_event(conn.id, timer_generation);
+                target.result = -ECANCELED;
+                IoEvent cancel = inert_response_read_timer_event(
+                    conn.id, timer_generation | kResponseReadTimerCancelBit);
+                cancel.result = -ENOENT;
+                const IoEvent first = cancel_first ? cancel : target;
+                const IoEvent second = cancel_first ? target : cancel;
+                loop->dispatch_batch(&first, 1);
+                CHECK_FALSE(conn.response_read_timer_owner_is_neutral());
+                CHECK_FALSE(conn.http1_boundary_ready);
+                CHECK(conn.http1_boundary_deferred);
+                CHECK_EQ(conn.state, ConnState::Sending);
+                CHECK_FALSE(conn.recv_armed);
+                CHECK_EQ(conn.req_start_us, 0u);
+                CHECK_EQ(metrics.requests_total, 1u);
+                loop->dispatch_batch(&second, 1);
+                CHECK(conn.response_read_timer_owner_is_neutral());
+            };
+            const auto consume_origin_retirement = [&] {
+                IoEvent target{
+                    conn.id, -ECANCELED, 0, 0, IoEventType::UpstreamRecv, 0, 0, retiring_episode};
+                IoEvent cancel{conn.id,
+                               -ENOENT,
+                               0,
+                               0,
+                               IoEventType::UpstreamRecv,
+                               0,
+                               kUpstreamRetirementCancelAux,
+                               retiring_episode};
+                loop->dispatch_batch(&target, 1);
+                CHECK_FALSE(conn.http1_boundary_ready);
+                loop->dispatch_batch(&cancel, 1);
+                CHECK_FALSE(conn.upstream_retirement_active);
+            };
+
+            if (origin_first) {
+                const u32 boundary_successor_before_origin = conn.http1_boundary_successor_episode;
+                REQUIRE_EQ(boundary_successor_before_origin, conn.upstream_episode);
+                REQUIRE(valid_upstream_episode(boundary_successor_before_origin));
+                const u32 timer_generation_before_origin = conn.response_read_timer_generation;
+                const u32 timer_owner_generation_before_origin =
+                    conn.response_read_timer_owner_generation;
+                const u32 timer_deadline_generation_before_origin =
+                    conn.response_read_timer_deadline_generation;
+                const u32 timer_upstream_episode_before_origin =
+                    conn.response_read_timer_upstream_episode;
+                const u64 timer_last_progress_before_origin =
+                    conn.response_read_timer_last_progress_ns;
+                const auto timer_phase_before_origin = conn.response_read_timer_phase;
+                const auto timer_tv_sec_before_origin = conn.response_read_timer_timespec.tv_sec;
+                const auto timer_tv_nsec_before_origin = conn.response_read_timer_timespec.tv_nsec;
+                const bool timer_target_before_origin = conn.response_read_timer_target_owned;
+                const bool timer_cancel_before_origin = conn.response_read_timer_cancel_owned;
+                consume_origin_retirement();
+                CHECK(conn.http1_boundary_deferred);
+                CHECK_FALSE(conn.http1_boundary_ready);
+                CHECK_EQ(conn.state, ConnState::Sending);
+                CHECK_FALSE(conn.recv_armed);
+                CHECK_EQ(conn.req_start_us, 0u);
+                CHECK_EQ(conn.http1_boundary_successor_episode, boundary_successor_before_origin);
+                CHECK_EQ(metrics.requests_total, 1u);
+                CHECK_EQ(conn.response_read_timer_generation, timer_generation_before_origin);
+                CHECK_EQ(conn.response_read_timer_owner_generation,
+                         timer_owner_generation_before_origin);
+                CHECK_EQ(conn.response_read_timer_deadline_generation,
+                         timer_deadline_generation_before_origin);
+                CHECK_EQ(conn.response_read_timer_upstream_episode,
+                         timer_upstream_episode_before_origin);
+                CHECK_EQ(conn.response_read_timer_last_progress_ns,
+                         timer_last_progress_before_origin);
+                CHECK_EQ(conn.response_read_timer_phase, timer_phase_before_origin);
+                CHECK_EQ(conn.response_read_timer_timespec.tv_sec, timer_tv_sec_before_origin);
+                CHECK_EQ(conn.response_read_timer_timespec.tv_nsec, timer_tv_nsec_before_origin);
+                CHECK_EQ(conn.response_read_timer_target_owned, timer_target_before_origin);
+                CHECK_EQ(conn.response_read_timer_cancel_owned, timer_cancel_before_origin);
+                consume_timer_owner();
+            } else {
+                consume_timer_owner();
+                CHECK_FALSE(conn.http1_boundary_ready);
+                consume_origin_retirement();
+            }
+
+            CHECK_FALSE(conn.http1_boundary_deferred);
+            CHECK_FALSE(conn.http1_boundary_ready);
+            CHECK_EQ(conn.state, ConnState::ReadingHeader);
+            CHECK(conn.recv_armed);
+            CHECK_EQ(conn.pending_ops, 1u);
+            CHECK_EQ(metrics.requests_total, 1u);
+            CHECK_EQ(conn.http1_boundary_successor_episode, 0u);
+
+            const IoEvent stale_timer = inert_response_read_timer_event(conn.id, timer_generation);
+            loop->dispatch_batch(&stale_timer, 1);
+            CHECK_EQ(conn.state, ConnState::ReadingHeader);
+            CHECK(conn.recv_armed);
+            CHECK_EQ(metrics.requests_total, 1u);
+            cleanup_prebuilt_d2(loop, fixture);
+        }
+    }
+}
+
+TEST(iouring_response_read_timer,
+     complete_get_boundary_waits_for_timer_when_origin_retires_before_send) {
+    static constexpr u8 kResponse[] = "HTTP/1.1 200 OK\r\nContent-Length: 4\r\n\r\nabcd";
+    ScopedIoUringLoopForRetirement guard;
+    if (!guard.init()) SKIP("io_uring unavailable");
+    auto* loop = guard.loop;
+    ShardMetrics metrics{};
+    metrics.init();
+    loop->metrics = &metrics;
+    RouteConfig config{};
+    PrebuiltD2Fixture fixture{};
+    REQUIRE(stage_live_precise_get(loop, config, &fixture));
+    Connection& conn = *fixture.conn;
+
+    REQUIRE_EQ(conn.upstream_recv_buf.write(kResponse, sizeof(kResponse) - 1u),
+               sizeof(kResponse) - 1u);
+    const IoEvent response =
+        response_read_copy_event(conn, sizeof(kResponse) - 1u, true, 0, sizeof(kResponse) - 1u);
+    loop->dispatch_batch(&response, 1);
+    REQUIRE_EQ(conn.response_read_deadline_post_commit_phase,
+               ResponseReadDeadlinePostCommitPhase::CombinedSend);
+    REQUIRE_EQ(conn.response_read_timer_phase, ResponseReadTimerPhase::CancelPending);
+    REQUIRE(conn.response_read_timer_target_owned);
+    REQUIRE(conn.response_read_timer_cancel_owned);
+    REQUIRE(conn.upstream_retirement_active);
+    const u32 timer_generation = conn.response_read_timer_owner_generation;
+    const u32 retiring_episode = conn.upstream_retiring_episode;
+    const auto timespec = conn.response_read_timer_timespec;
+    const u32 timer_deadline_generation = conn.response_read_timer_deadline_generation;
+    const u32 timer_upstream_episode = conn.response_read_timer_upstream_episode;
+    const u64 timer_last_progress_ns = conn.response_read_timer_last_progress_ns;
+    const auto check_timer_unchanged = [&] {
+        CHECK_EQ(conn.response_read_timer_generation, timer_generation);
+        CHECK_EQ(conn.response_read_timer_owner_generation, timer_generation);
+        CHECK_EQ(conn.response_read_timer_deadline_generation, timer_deadline_generation);
+        CHECK_EQ(conn.response_read_timer_upstream_episode, timer_upstream_episode);
+        CHECK_EQ(conn.response_read_timer_last_progress_ns, timer_last_progress_ns);
+        CHECK_EQ(conn.response_read_timer_phase, ResponseReadTimerPhase::CancelPending);
+        CHECK_EQ(conn.response_read_timer_timespec.tv_sec, timespec.tv_sec);
+        CHECK_EQ(conn.response_read_timer_timespec.tv_nsec, timespec.tv_nsec);
+    };
+
+    const IoEvent origin_target{
+        conn.id, -ECANCELED, 0, 0, IoEventType::UpstreamRecv, 0, 0, retiring_episode};
+    const IoEvent origin_cancel{conn.id,
+                                -ENOENT,
+                                0,
+                                0,
+                                IoEventType::UpstreamRecv,
+                                0,
+                                kUpstreamRetirementCancelAux,
+                                retiring_episode};
+    loop->dispatch_batch(&origin_target, 1);
+    REQUIRE(conn.upstream_retirement_active);
+    loop->dispatch_batch(&origin_cancel, 1);
+    CHECK_FALSE(conn.upstream_retirement_active);
+    CHECK_FALSE(conn.http1_boundary_deferred);
+    CHECK_EQ(conn.state, ConnState::Sending);
+    CHECK_EQ(metrics.requests_total, 0u);
+    check_timer_unchanged();
+
+    const IoEvent send = exact_response_deadline_send_event(loop, conn);
+    loop->dispatch_batch(&send, 1);
+    REQUIRE(conn.http1_boundary_deferred);
+    CHECK_FALSE(conn.http1_boundary_ready);
+    CHECK_EQ(conn.state, ConnState::Sending);
+    CHECK_FALSE(conn.recv_armed);
+    CHECK_EQ(conn.req_start_us, 0u);
+    CHECK_EQ(metrics.requests_total, 1u);
+    CHECK_EQ(conn.http1_boundary_successor_episode, conn.upstream_episode);
+    CHECK(valid_upstream_episode(conn.http1_boundary_successor_episode));
+    check_timer_unchanged();
+
+    // A timer CQE with a different generation is foreign custody and cannot
+    // publish the parked boundary while the real target/cancel remain owned.
+    const IoEvent foreign_timer = inert_response_read_timer_event(conn.id, timer_generation + 1u);
+    loop->dispatch_batch(&foreign_timer, 1);
+    CHECK(conn.http1_boundary_deferred);
+    CHECK_FALSE(conn.http1_boundary_ready);
+    CHECK_EQ(conn.state, ConnState::Sending);
+    CHECK_FALSE(conn.recv_armed);
+    CHECK_EQ(metrics.requests_total, 1u);
+    CHECK_EQ(conn.http1_boundary_successor_episode, conn.upstream_episode);
+    CHECK(conn.response_read_timer_target_owned);
+    CHECK(conn.response_read_timer_cancel_owned);
+    check_timer_unchanged();
+
+    IoEvent timer_target = inert_response_read_timer_event(conn.id, timer_generation);
+    timer_target.result = -ECANCELED;
+    loop->dispatch_batch(&timer_target, 1);
+    CHECK(conn.http1_boundary_deferred);
+    CHECK_FALSE(conn.http1_boundary_ready);
+    CHECK_EQ(conn.state, ConnState::Sending);
+    CHECK_FALSE(conn.recv_armed);
+    CHECK_FALSE(conn.response_read_timer_target_owned);
+    CHECK(conn.response_read_timer_cancel_owned);
+    CHECK_EQ(metrics.requests_total, 1u);
+    CHECK_EQ(conn.http1_boundary_successor_episode, conn.upstream_episode);
+    check_timer_unchanged();
+
+    IoEvent timer_cancel =
+        inert_response_read_timer_event(conn.id, timer_generation | kResponseReadTimerCancelBit);
+    timer_cancel.result = -ENOENT;
+    loop->dispatch_batch(&timer_cancel, 1);
+    CHECK(conn.response_read_timer_owner_is_neutral());
+    CHECK_FALSE(conn.http1_boundary_deferred);
+    CHECK_FALSE(conn.http1_boundary_ready);
+    CHECK_EQ(conn.state, ConnState::ReadingHeader);
+    CHECK(conn.recv_armed);
+    CHECK_EQ(conn.pending_ops, 1u);
+    CHECK_EQ(metrics.requests_total, 1u);
+    CHECK_EQ(conn.http1_boundary_successor_episode, 0u);
+
+    const u32 pending_after_resume = conn.pending_ops;
+    const IoEvent duplicate_timer = inert_response_read_timer_event(conn.id, timer_generation);
+    loop->dispatch_batch(&duplicate_timer, 1);
+    CHECK_EQ(conn.state, ConnState::ReadingHeader);
+    CHECK(conn.recv_armed);
+    CHECK_EQ(conn.pending_ops, pending_after_resume);
+    CHECK_EQ(metrics.requests_total, 1u);
+    cleanup_prebuilt_d2(loop, fixture);
+}
+
+TEST(iouring_response_read_timer,
+     custody_only_same_batch_noise_releases_boundary_only_after_owned_timer_drain) {
+    static constexpr u8 kResponse[] = "HTTP/1.1 200 OK\r\nContent-Length: 4\r\n\r\nabcd";
+    enum class BatchNoise : u8 { DuplicateTarget, ForeignGeneration, MissingCancel };
+    for (const BatchNoise noise_kind :
+         {BatchNoise::DuplicateTarget, BatchNoise::ForeignGeneration, BatchNoise::MissingCancel}) {
+        ScopedIoUringLoopForRetirement guard;
+        if (!guard.init()) SKIP("io_uring unavailable");
+        auto* loop = guard.loop;
+        ShardMetrics metrics{};
+        metrics.init();
+        loop->metrics = &metrics;
+        RouteConfig config{};
+        PrebuiltD2Fixture fixture{};
+        REQUIRE(stage_live_precise_get(loop, config, &fixture));
+        Connection& conn = *fixture.conn;
+
+        REQUIRE_EQ(conn.upstream_recv_buf.write(kResponse, sizeof(kResponse) - 1u),
+                   sizeof(kResponse) - 1u);
+        const IoEvent response =
+            response_read_copy_event(conn, sizeof(kResponse) - 1u, true, 0, sizeof(kResponse) - 1u);
+        loop->dispatch_batch(&response, 1);
+        REQUIRE_EQ(conn.response_read_deadline_post_commit_phase,
+                   ResponseReadDeadlinePostCommitPhase::CombinedSend);
+        REQUIRE_EQ(conn.response_read_timer_phase, ResponseReadTimerPhase::CancelPending);
+        REQUIRE(conn.response_read_timer_target_owned);
+        REQUIRE(conn.response_read_timer_cancel_owned);
+        const u32 timer_generation = conn.response_read_timer_owner_generation;
+
+        // Settle the origin before downstream completion so the timer is the
+        // only remaining owner when the request boundary is parked.
+        drain_prebuilt_d2_retirement(loop, conn, kUpstreamOpRecv, false);
+        REQUIRE_FALSE(conn.upstream_retirement_active);
+        const IoEvent send = exact_response_deadline_send_event(loop, conn);
+        loop->dispatch_batch(&send, 1);
+        REQUIRE(conn.http1_boundary_deferred);
+        CHECK_FALSE(conn.http1_boundary_ready);
+        CHECK_EQ(conn.state, ConnState::Sending);
+        CHECK_FALSE(conn.recv_armed);
+        CHECK_EQ(metrics.requests_total, 1u);
+
+        IoEvent target = inert_response_read_timer_event(conn.id, timer_generation);
+        target.result = -ECANCELED;
+        IoEvent cancel = inert_response_read_timer_event(
+            conn.id, timer_generation | kResponseReadTimerCancelBit);
+        cancel.result = -ENOENT;
+        IoEvent noise = noise_kind == BatchNoise::DuplicateTarget
+                            ? target
+                            : inert_response_read_timer_event(conn.id, timer_generation + 1u);
+
+        if (noise_kind == BatchNoise::MissingCancel) {
+            const IoEvent batch[] = {target, noise};
+            loop->dispatch_batch(batch, 2);
+            CHECK_FALSE(conn.response_read_timer_owner_is_neutral());
+            CHECK_FALSE(conn.response_read_timer_target_owned);
+            CHECK(conn.response_read_timer_cancel_owned);
+            CHECK(conn.http1_boundary_deferred);
+            CHECK_FALSE(conn.http1_boundary_ready);
+            CHECK_EQ(conn.state, ConnState::Sending);
+            CHECK_FALSE(conn.recv_armed);
+            CHECK_EQ(metrics.requests_total, 1u);
+
+            loop->dispatch_batch(&cancel, 1);
+        } else {
+            const IoEvent batch[] = {noise_kind == BatchNoise::ForeignGeneration ? noise : target,
+                                     cancel,
+                                     noise_kind == BatchNoise::DuplicateTarget ? noise : target};
+            loop->dispatch_batch(batch, 3);
+        }
+
+        CHECK(conn.response_read_timer_owner_is_neutral());
+        CHECK_FALSE(conn.http1_boundary_deferred);
+        CHECK_FALSE(conn.http1_boundary_ready);
+        CHECK_EQ(conn.state, ConnState::ReadingHeader);
+        CHECK(conn.recv_armed);
+        CHECK_EQ(conn.pending_ops, 1u);
+        CHECK_EQ(metrics.requests_total, 1u);
+        CHECK_EQ(conn.http1_boundary_successor_episode, 0u);
+        cleanup_prebuilt_d2(loop, fixture);
+    }
+}
+
+TEST(iouring_response_read_timer,
+     prebuilt_head_boundary_waits_for_timer_after_header_and_origin_retire) {
+    static constexpr u8 kHeadResponse[] =
+        "HTTP/1.1 200 OK\r\nContent-Length: 12\r\nX-Origin: timer-boundary\r\n\r\nabc";
+    ScopedIoUringLoopForRetirement guard;
+    if (!guard.init()) SKIP("io_uring unavailable");
+    auto* loop = guard.loop;
+    ShardMetrics metrics{};
+    metrics.init();
+    loop->metrics = &metrics;
+    RouteConfig config{};
+    PrebuiltD2Fixture fixture{};
+    // The existing HeaderOnlyHead profile only produces timeout responses.
+    // StrictHeadHeaderOnly success is exercised by the fixed-upload HEAD
+    // admission path, which also keeps downstream persistence enabled.
+    REQUIRE(stage_live_precise_fixed_upload_head(loop, config, &fixture));
+    Connection& conn = *fixture.conn;
+
+    REQUIRE(deliver_unreachable_fixed_upload_head_response(
+        loop, fixture, kHeadResponse, sizeof(kHeadResponse) - 1u));
+    REQUIRE_EQ(conn.http1_prebuilt_response_purpose,
+               Http1PrebuiltResponsePurpose::StrictHeadHeaderOnly);
+    REQUIRE_EQ(conn.http1_prebuilt_response_layout, Http1PrebuiltResponseLayout::HeaderOnlyHead);
+    CHECK_FALSE(conn.http1_prebuilt_deadline_upload.downstream_close);
+    REQUIRE_EQ(conn.state, ConnState::Sending);
+    REQUIRE_EQ(conn.response_read_timer_phase, ResponseReadTimerPhase::CancelPending);
+    REQUIRE(conn.response_read_timer_target_owned);
+    REQUIRE(conn.response_read_timer_cancel_owned);
+    REQUIRE(conn.upstream_retirement_active);
+    REQUIRE_EQ(conn.http1_prebuilt_wait,
+               static_cast<u8>(kHttp1WaitHeaderSend | kHttp1WaitUpstreamRetirement));
+    const u32 timer_generation = conn.response_read_timer_owner_generation;
+    const u32 timer_deadline_generation = conn.response_read_timer_deadline_generation;
+    const u32 timer_upstream_episode = conn.response_read_timer_upstream_episode;
+    const u64 timer_last_progress_ns = conn.response_read_timer_last_progress_ns;
+    const auto timespec = conn.response_read_timer_timespec;
+    const u32 retiring_episode = conn.upstream_retiring_episode;
+    const auto check_timer_unchanged = [&] {
+        CHECK_EQ(conn.response_read_timer_generation, timer_generation);
+        CHECK_EQ(conn.response_read_timer_owner_generation, timer_generation);
+        CHECK_EQ(conn.response_read_timer_deadline_generation, timer_deadline_generation);
+        CHECK_EQ(conn.response_read_timer_upstream_episode, timer_upstream_episode);
+        CHECK_EQ(conn.response_read_timer_last_progress_ns, timer_last_progress_ns);
+        CHECK_EQ(conn.response_read_timer_phase, ResponseReadTimerPhase::CancelPending);
+        CHECK_EQ(conn.response_read_timer_timespec.tv_sec, timespec.tv_sec);
+        CHECK_EQ(conn.response_read_timer_timespec.tv_nsec, timespec.tv_nsec);
+    };
+
+    complete_prebuilt_d2_header(loop, conn);
+    REQUIRE(conn.http1_boundary_deferred);
+    CHECK_FALSE(conn.http1_boundary_ready);
+    CHECK_EQ(conn.http1_prebuilt_wait, kHttp1WaitUpstreamRetirement);
+    CHECK_EQ(conn.state, ConnState::Sending);
+    CHECK_EQ(conn.req_start_us, 0u);
+    CHECK_EQ(metrics.requests_total, 1u);
+    CHECK_EQ(conn.http1_boundary_successor_episode, conn.upstream_episode);
+    check_timer_unchanged();
+
+    const IoEvent origin_target{
+        conn.id, -ECANCELED, 0, 0, IoEventType::UpstreamRecv, 0, 0, retiring_episode};
+    const IoEvent origin_cancel{conn.id,
+                                -ENOENT,
+                                0,
+                                0,
+                                IoEventType::UpstreamRecv,
+                                0,
+                                kUpstreamRetirementCancelAux,
+                                retiring_episode};
+    loop->dispatch_batch(&origin_target, 1);
+    CHECK(conn.http1_boundary_deferred);
+    CHECK_FALSE(conn.http1_boundary_ready);
+    CHECK(conn.upstream_retirement_active);
+    CHECK_EQ(conn.state, ConnState::Sending);
+    CHECK_EQ(metrics.requests_total, 1u);
+    check_timer_unchanged();
+    loop->dispatch_batch(&origin_cancel, 1);
+    CHECK_FALSE(conn.upstream_retirement_active);
+    CHECK_EQ(conn.http1_prebuilt_wait, 0u);
+    CHECK(conn.http1_boundary_deferred);
+    CHECK_FALSE(conn.http1_boundary_ready);
+    CHECK_EQ(conn.state, ConnState::Sending);
+    CHECK_EQ(conn.req_start_us, 0u);
+    CHECK_EQ(metrics.requests_total, 1u);
+    check_timer_unchanged();
+
+    const IoEvent foreign_timer = inert_response_read_timer_event(conn.id, timer_generation + 1u);
+    loop->dispatch_batch(&foreign_timer, 1);
+    CHECK(conn.http1_boundary_deferred);
+    CHECK_FALSE(conn.http1_boundary_ready);
+    CHECK_EQ(conn.state, ConnState::Sending);
+    CHECK_FALSE(conn.recv_armed);
+    CHECK_EQ(metrics.requests_total, 1u);
+    CHECK_EQ(conn.http1_boundary_successor_episode, conn.upstream_episode);
+    check_timer_unchanged();
+
+    IoEvent timer_target = inert_response_read_timer_event(conn.id, timer_generation);
+    timer_target.result = -ECANCELED;
+    loop->dispatch_batch(&timer_target, 1);
+    CHECK(conn.http1_boundary_deferred);
+    CHECK_FALSE(conn.http1_boundary_ready);
+    CHECK_EQ(conn.state, ConnState::Sending);
+    CHECK_FALSE(conn.recv_armed);
+    CHECK_FALSE(conn.response_read_timer_target_owned);
+    CHECK(conn.response_read_timer_cancel_owned);
+    CHECK_EQ(metrics.requests_total, 1u);
+    CHECK_EQ(conn.http1_boundary_successor_episode, conn.upstream_episode);
+    check_timer_unchanged();
+
+    IoEvent timer_cancel =
+        inert_response_read_timer_event(conn.id, timer_generation | kResponseReadTimerCancelBit);
+    timer_cancel.result = -ENOENT;
+    loop->dispatch_batch(&timer_cancel, 1);
+    CHECK(conn.response_read_timer_owner_is_neutral());
+    CHECK_FALSE(conn.http1_boundary_deferred);
+    CHECK_FALSE(conn.http1_boundary_ready);
+    CHECK_EQ(conn.http1_prebuilt_disposition, Http1RequestBufferDisposition::None);
+    CHECK_EQ(conn.http1_boundary_successor_episode, 0u);
+    CHECK_EQ(conn.state, ConnState::ReadingHeader);
+    CHECK(conn.recv_armed);
+    CHECK_EQ(conn.pending_ops, 1u);
+    CHECK_EQ(conn.req_start_us, 0u);
+    CHECK_EQ(metrics.requests_total, 1u);
+
+    const u32 pending_after_resume = conn.pending_ops;
+    const IoEvent duplicate_timer = inert_response_read_timer_event(conn.id, timer_generation);
+    loop->dispatch_batch(&duplicate_timer, 1);
+    CHECK_EQ(conn.state, ConnState::ReadingHeader);
+    CHECK(conn.recv_armed);
+    CHECK_EQ(conn.pending_ops, pending_after_resume);
+    CHECK_EQ(metrics.requests_total, 1u);
+    cleanup_prebuilt_d2(loop, fixture);
 }
 
 static void drain_strict_304_timer_cancel(rut::test::TestCase* _tc,
@@ -54920,6 +55438,7 @@ TEST(response_read_deadline_get_positive_cl,
             CHECK_EQ(conn.response_read_deadline_post_commit_phase,
                      ResponseReadDeadlinePostCommitPhase::None);
             drain_prebuilt_d2_retirement(loop, conn, kUpstreamOpRecv, false);
+            REQUIRE(drain_owned_response_read_timer_cqes(loop, conn));
             REQUIRE(conn.http1_boundary_ready);
             loop->resume_deferred_http1_boundaries();
             CHECK_EQ(conn.state, ConnState::ReadingHeader);
@@ -55210,6 +55729,7 @@ TEST(response_read_deadline_get_positive_cl,
         CHECK_EQ(conn.response_read_deadline_post_commit_phase,
                  ResponseReadDeadlinePostCommitPhase::None);
         drain_prebuilt_d2_retirement(loop, conn, kUpstreamOpRecv, false);
+        REQUIRE(drain_owned_response_read_timer_cqes(loop, conn));
         REQUIRE(conn.http1_boundary_ready);
         loop->resume_deferred_http1_boundaries();
         CHECK_EQ(conn.state, ConnState::ReadingHeader);
