@@ -12241,6 +12241,25 @@ struct KeepAliveCountingUpstream {
     }
 };
 
+// A Connection: close response reaches the client's EOF as soon as the
+// server half-closes, possibly before the shard has drained the close-path
+// cancel of that connection. After stop()+join() the test thread owns the
+// loop: harvest those remaining completions so slot and slice accounting
+// reflects the settled state. io_uring only (epoll closes synchronously);
+// the armed 1 s timer read bounds each wait.
+template <typename ShardT>
+void settle_stopped_iouring_shard(ShardT& shard) {
+    auto* loop = shard.loop;
+    if constexpr (requires { loop->backend.sq_tail; }) {
+        IoEvent events[64];
+        for (u32 it = 0; it < 16u && (loop->active_count() > 0u || loop->pool.in_use() > 0u);
+             it++) {
+            const u32 n = loop->backend.wait(events, 64, loop->conns, loop->connection_capacity);
+            for (u32 i = 0; i < n; i++) loop->dispatch(events[i]);
+        }
+    }
+}
+
 template <typename ShardT>
 bool wait_for_idle_pool_count(ShardT& shard, u32 expected, u32 timeout_ms = 1000) {
     for (u32 waited = 0; waited < timeout_ms; waited++) {
@@ -21434,6 +21453,7 @@ route exact GET "/static" { return local_response({
 
     shard.stop();
     shard.join();
+    settle_stopped_iouring_shard(shard);
     shard_guard.spawned = false;
     REQUIRE_EQ(shard.backend_failure_code(), 0);
     backend.teardown();
@@ -21714,6 +21734,7 @@ route exact "/static" { return local_response({
 
     shard.stop();
     shard.join();
+    settle_stopped_iouring_shard(shard);
     shard_guard.spawned = false;
     REQUIRE_EQ(shard.backend_failure_code(), 0);
     backend.teardown();
@@ -22038,6 +22059,7 @@ route exact "/static" { return local_response({
 
     shard.stop();
     shard.join();
+    settle_stopped_iouring_shard(shard);
     shard_guard.spawned = false;
     REQUIRE_EQ(shard.backend_failure_code(), 0);
     backend.teardown();
@@ -22360,6 +22382,7 @@ route exact "/static" { return local_response({
 
     shard.stop();
     shard.join();
+    settle_stopped_iouring_shard(shard);
     shard_guard.spawned = false;
     REQUIRE_EQ(shard.backend_failure_code(), 0);
     backend.teardown();
@@ -22685,6 +22708,7 @@ route exact "/static" { return local_response({
 
     shard.stop();
     shard.join();
+    settle_stopped_iouring_shard(shard);
     shard_guard.spawned = false;
     REQUIRE_EQ(shard.backend_failure_code(), 0);
     backend.teardown();
@@ -23067,6 +23091,7 @@ route "/" {
 
     shard.stop();
     shard.join();
+    settle_stopped_iouring_shard(shard);
     shard_guard.spawned = false;
     REQUIRE_EQ(shard.backend_failure_code(), 0);
     backend.teardown();
@@ -24071,6 +24096,7 @@ route GET "/fixed" {
 
     shard.stop();
     shard.join();
+    settle_stopped_iouring_shard(shard);
     shard_guard.spawned = false;
     REQUIRE_EQ(shard.backend_failure_code(), 0);
     backend.teardown();
@@ -24418,6 +24444,7 @@ static void run_public_complete_access_target_66(rut::test::TestCase* _tc) {
     REQUIRE_EQ(shard.log_ring->available(), 1u);
     shard.stop();
     shard.join();
+    settle_stopped_iouring_shard(shard);
     shard_guard.spawned = false;
     REQUIRE_EQ(shard.backend_failure_code(), 0);
     REQUIRE_EQ(shard.log_ring->available(), 1u);
@@ -27931,6 +27958,7 @@ route GET "/" {
 
     shard.stop();
     shard.join();
+    settle_stopped_iouring_shard(shard);
     shard_guard.spawned = false;
     REQUIRE_EQ(shard.backend_failure_code(), 0);
     neighbor_epoch.teardown();
@@ -28259,6 +28287,7 @@ route GET "/" {
 
     shard.stop();
     shard.join();
+    settle_stopped_iouring_shard(shard);
     shard_guard.spawned = false;
     REQUIRE_EQ(shard.backend_failure_code(), 0);
     neighbor_epoch.teardown();
@@ -28871,6 +28900,7 @@ route GET "/" {
 
     shard.stop();
     shard.join();
+    settle_stopped_iouring_shard(shard);
     shard_guard.spawned = false;
     REQUIRE_EQ(shard.backend_failure_code(), 0);
 
