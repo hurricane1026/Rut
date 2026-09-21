@@ -1331,6 +1331,27 @@ inline bool response_read_deadline_tls_http11_engine_is_stable(const Connection&
            c.h2 == nullptr;
 }
 
+// The end-to-end TLS bridge is limited to the two admitted depth-zero GET
+// request policies. Raw TLS send/receive ownership remains independent and is
+// checked by the phase-specific transport predicates.
+inline bool response_read_deadline_tls_complete_get_profile_is_stable(const Connection& c) {
+    const RouteConfig* config = c.request_config;
+    const u16 bundle_id = c.response_read_deadline_bundle_id;
+    return response_read_deadline_tls_http11_engine_is_stable(c) && config != nullptr &&
+           config->policy_bundle_id_is_valid(bundle_id) &&
+           config->policy_bundles[bundle_id - 1u].response_buffering ==
+               ForwardResponseBufferingMode::CompleteContentLength &&
+           c.response_read_deadline_profile ==
+               ResponseReadDeadlineProfile::BodylessNonHeadContentLengthZero &&
+           c.response_read_deadline_buffering ==
+               ForwardResponseBufferingMode::CompleteContentLength &&
+           c.response_read_deadline_method == static_cast<u8>(LogHttpMethod::Get) &&
+           c.response_read_deadline_route_method == kRouteMethodGet &&
+           response_read_deadline_exact_get_layout_is_stable(c) &&
+           bodyless_get_complete_content_length_request_policy_is_admitted(c.request_policy_id) &&
+           c.response_read_deadline_upload.request_policy_id == c.request_policy_id;
+}
+
 inline bool http1_pipeline_successor_semantic_shape_is_stable(
     const Connection& c,
     const ResponseReadDeadlineUploadProof& proof,
@@ -1738,9 +1759,8 @@ inline bool response_read_deadline_owner_is_stable(const Connection& c,
             c.response_read_deadline_buffering,
             c.response_read_deadline_method,
             c.response_read_deadline_route_method);
-    // This owner is used by the precise bodyless-GET path before response
-    // commit.  Other TLS profiles and TLS post-commit phases remain outside
-    // this bounded transport bridge.
+    // TLS keeps the same narrow bodyless-GET owner profile through post-commit;
+    // its raw send/receive ownership is validated separately below.
     const bool tls_bodyless_get_owner =
         c.tls_active &&
         c.response_read_deadline_profile ==
@@ -1748,9 +1768,9 @@ inline bool response_read_deadline_owner_is_stable(const Connection& c,
         c.response_read_deadline_buffering == ForwardResponseBufferingMode::CompleteContentLength &&
         c.response_read_deadline_method == static_cast<u8>(LogHttpMethod::Get) &&
         c.pipeline_depth == 0 && c.http1_pipeline_request_generation == 0 &&
-        c.pipeline_stash_len == 0 &&
-        c.response_read_deadline_post_commit_phase == ResponseReadDeadlinePostCommitPhase::None &&
-        response_read_deadline_tls_http11_engine_is_stable(c);
+        c.pipeline_stash_len == 0 && response_read_deadline_tls_http11_engine_is_stable(c) &&
+        (c.response_read_deadline_post_commit_phase == ResponseReadDeadlinePostCommitPhase::None ||
+         response_read_deadline_tls_complete_get_profile_is_stable(c));
     const bool common_request =
         c.protocol == ConnProtocol::Http11 && (!c.tls_active || tls_bodyless_get_owner) &&
         c.h2 == nullptr && c.req_http_version == static_cast<u8>(HttpVersion::Http11) &&
@@ -2215,8 +2235,9 @@ inline bool response_read_deadline_post_commit_is_stable(const Connection& c) {
         c.response_read_deadline_post_commit_inflight_body >
             c.response_read_deadline_post_commit_downstream_submitted -
                 c.response_read_deadline_post_commit_downstream_completed ||
-        c.protocol != ConnProtocol::Http11 || c.tls_active || c.h2 != nullptr ||
-        c.req_http_version != static_cast<u8>(HttpVersion::Http11) ||
+        c.protocol != ConnProtocol::Http11 ||
+        (c.tls_active && !response_read_deadline_tls_complete_get_profile_is_stable(c)) ||
+        c.h2 != nullptr || c.req_http_version != static_cast<u8>(HttpVersion::Http11) ||
         !response_read_deadline_persistence_owner_is_stable(c, c.response_read_deadline_upload) ||
         (!fixed_upload && c.req_client_has_content_length) || c.req_client_has_transfer_encoding ||
         c.req_client_has_te || c.req_client_has_expect || c.req_client_has_upgrade_header ||

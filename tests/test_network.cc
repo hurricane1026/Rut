@@ -31869,7 +31869,8 @@ bool stage_live_precise_request(IoUringEventLoop* loop,
                                 bool force_initial_timer_sq_full,
                                 RequestPolicyId request_policy = RequestPolicyId::Http11FixedStrip,
                                 TlsMemoryClientPeer* tls_client = nullptr,
-                                TlsServerContext* tls_server = nullptr) {
+                                TlsServerContext* tls_server = nullptr,
+                                bool tls_before_preflight = false) {
     if (loop == nullptr || out == nullptr ||
         !config.add_upstream("backend", 0x7F000001, 9000).has_value() ||
         !(bodyless_get ? add_bodyless_non_head_response_read_deadline_bundle(
@@ -31952,6 +31953,19 @@ bool stage_live_precise_request(IoUringEventLoop* loop,
     if (bodyless_get) conn->req_start_us = monotonic_us();
     conn->handler_gen = 1;
     conn->request_config = &config;
+    bool tls_ready = false;
+    if (tls_before_preflight) {
+        if (tls_client == nullptr || tls_server == nullptr) return fail();
+        loop->tls_server = tls_server;
+        if (!loop->tls_setup(*conn) ||
+            !tls_engine_handshake_with_memory_client(conn->tls_engine, tls_client->ssl))
+            return fail();
+        conn->tls_handshake_complete = true;
+        // Preflight runs inside on_header_received, before the route handler
+        // transition clears this exact TLS-driver continuation.
+        conn->tls_pending_on_recv = &on_header_received<IoUringEventLoop>;
+        tls_ready = true;
+    }
     if (!prepare_response_read_deadline_preflight(loop, *conn, &config.routes[0], &config)) {
         // Preflight owns the failure close and may recycle the slot. Diagnose
         // using only local inputs; never dereference or clean the closed owner.
@@ -31963,6 +31977,7 @@ bool stage_live_precise_request(IoUringEventLoop* loop,
         out->conn = nullptr;
         return false;
     }
+    if (tls_ready) conn->tls_pending_on_recv = nullptr;
     JitDispatchOutcome outcome{};
     outcome.kind = JitDispatchOutcome::Kind::Forward;
     outcome.upstream_id = 0;
@@ -32022,14 +32037,16 @@ bool stage_live_precise_request(IoUringEventLoop* loop,
     // preflight proofs have been established. Attach a real TLS engine only
     // after the upstream request is validated, immediately before its send
     // completion arms the deadline; this does not exercise TLS ingress/JIT
-    // admission, which remains outside this internal bridge test.
+    // admission unless tls_before_preflight is explicitly selected by a test.
     if (tls_client != nullptr || tls_server != nullptr) {
         if (tls_client == nullptr || tls_server == nullptr) return fail();
-        loop->tls_server = tls_server;
-        if (!loop->tls_setup(*conn) ||
-            !tls_engine_handshake_with_memory_client(conn->tls_engine, tls_client->ssl))
-            return fail();
-        conn->tls_handshake_complete = true;
+        if (!tls_ready) {
+            loop->tls_server = tls_server;
+            if (!loop->tls_setup(*conn) ||
+                !tls_engine_handshake_with_memory_client(conn->tls_engine, tls_client->ssl))
+                return fail();
+            conn->tls_handshake_complete = true;
+        }
     }
     send.offset = sent_len;
     send.remaining = 0;
@@ -32090,7 +32107,8 @@ bool stage_live_precise_get(IoUringEventLoop* loop,
                             bool downstream_close = false,
                             RequestPolicyId request_policy = RequestPolicyId::Http11FixedStrip,
                             TlsMemoryClientPeer* tls_client = nullptr,
-                            TlsServerContext* tls_server = nullptr) {
+                            TlsServerContext* tls_server = nullptr,
+                            bool tls_before_preflight = false) {
     return stage_live_precise_request(loop,
                                       config,
                                       out,
@@ -32099,7 +32117,8 @@ bool stage_live_precise_get(IoUringEventLoop* loop,
                                       force_initial_timer_sq_full,
                                       request_policy,
                                       tls_client,
-                                      tls_server);
+                                      tls_server,
+                                      tls_before_preflight);
 }
 
 bool stage_tls_precise_get_timeout(IoUringEventLoop* loop,
@@ -32128,6 +32147,52 @@ bool stage_tls_precise_get_timeout(IoUringEventLoop* loop,
     if (!conn.consume_response_read_timer_completion(timer_generation)) return false;
     conn.response_read_deadline_state = ResponseReadDeadlineState::ExpiryPending;
     return try_prebuilt_strict_read_timeout(loop, conn);
+}
+
+TEST(tls_iouring, strict_bodyless_get_tls_preflight_reaches_precise_owner) {
+    auto context_result = create_tls_server_context(RUT_TESTDATA_DIR "/localhost_cert.pem",
+                                                    RUT_TESTDATA_DIR "/localhost_key.pem");
+    REQUIRE(context_result.has_value());
+    std::unique_ptr<TlsServerContext, decltype(&destroy_tls_server_context)> context(
+        context_result.value(), destroy_tls_server_context);
+
+    for (const RequestPolicyId policy :
+         {RequestPolicyId::Http11FixedStrip, RequestPolicyId::Http11FixedTrimSpPreserveHtab}) {
+        ScopedTlsRawSendLoop guard;
+        REQUIRE(guard.init(/*capacity=*/2));
+        IoUringEventLoop& loop = *guard.loop;
+        ScopedTlsRawSendPool pool_guard;
+        REQUIRE(pool_guard.init(loop, /*capacity=*/12));
+
+        RouteConfig config{};
+        TlsMemoryClientPeer client;
+        REQUIRE(client.init());
+        PrebuiltD2Fixture fixture{};
+        REQUIRE(stage_live_precise_get(&loop,
+                                       config,
+                                       &fixture,
+                                       /*force_initial_timer_sq_full=*/false,
+                                       /*downstream_close=*/false,
+                                       policy,
+                                       &client,
+                                       context.get(),
+                                       /*tls_before_preflight=*/true));
+        Connection& conn = *fixture.conn;
+        CHECK(conn.tls_active);
+        CHECK(conn.tls_engine.handshake_done);
+        CHECK_EQ(conn.on_recv, &tls_recv<IoUringEventLoop>);
+        CHECK(conn.tls_pending_on_recv == nullptr);
+        CHECK_EQ(conn.response_read_deadline_profile,
+                 ResponseReadDeadlineProfile::BodylessNonHeadContentLengthZero);
+        CHECK_EQ(conn.response_read_deadline_buffering,
+                 ForwardResponseBufferingMode::CompleteContentLength);
+        CHECK_EQ(conn.request_policy_id, static_cast<u16>(policy));
+        CHECK_EQ(conn.response_read_deadline_state, ResponseReadDeadlineState::Armed);
+        CHECK(conn.response_read_timer_owner_is_valid());
+        CHECK_EQ(conn.pipeline_depth, 0u);
+        CHECK_EQ(conn.http1_pipeline_request_generation, 0u);
+        cleanup_prebuilt_d2(&loop, fixture);
+    }
 }
 
 void complete_staged_tls_prebuilt_send(ScopedTlsRawSendLoop& guard,
@@ -43149,6 +43214,86 @@ TEST(response_read_deadline, backend_copy_witness_is_atomic_and_reused_slots_cle
     CHECK_EQ(neutral.copy_begin, 0u);
     CHECK_EQ(neutral.copy_end, 0u);
     cleanup_prebuilt_d2(loop, fixture);
+}
+
+TEST(response_read_deadline, tls_complete_get_copy_owner_requires_full_profile_witness) {
+    auto context_result = create_tls_server_context(RUT_TESTDATA_DIR "/localhost_cert.pem",
+                                                    RUT_TESTDATA_DIR "/localhost_key.pem");
+    REQUIRE(context_result.has_value());
+    std::unique_ptr<TlsServerContext, decltype(&destroy_tls_server_context)> context(
+        context_result.value(), destroy_tls_server_context);
+
+    for (const RequestPolicyId policy :
+         {RequestPolicyId::Http11FixedStrip, RequestPolicyId::Http11FixedTrimSpPreserveHtab}) {
+        ScopedIoUringLoopForRetirement guard;
+        if (!guard.init()) SKIP("io_uring unavailable");
+        auto* loop = guard.loop;
+        RouteConfig config{};
+        TlsMemoryClientPeer client;
+        REQUIRE(client.init());
+        PrebuiltD2Fixture fixture{};
+        REQUIRE(stage_live_precise_get(loop,
+                                       config,
+                                       &fixture,
+                                       /*force_initial_timer_sq_full=*/false,
+                                       /*downstream_close=*/false,
+                                       policy,
+                                       &client,
+                                       context.get(),
+                                       /*tls_before_preflight=*/true));
+        Connection& conn = *fixture.conn;
+        REQUIRE(conn.tls_active);
+        REQUIRE(conn.tls_engine.ssl != nullptr);
+        REQUIRE(conn.tls_engine.handshake_done);
+        REQUIRE(response_read_deadline_tls_complete_get_profile_is_stable(conn));
+
+        static constexpr u16 kBufferId = 13;
+        static constexpr u8 kResponse[] = "HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n";
+        static_assert(sizeof(kResponse) - 1u <= kProvidedBufSize);
+        __builtin_memcpy(loop->backend.buf_base + static_cast<u64>(kBufferId) * kProvidedBufSize,
+                         kResponse,
+                         sizeof(kResponse) - 1u);
+        auto inject_cqe = [&]() {
+            const u32 tail = __atomic_load_n(loop->backend.cq_tail, __ATOMIC_ACQUIRE);
+            auto& cqe = loop->backend.cq_entries[tail & *loop->backend.cq_ring_mask];
+            cqe.user_data = IoUringBackend::encode_upstream_user_data(
+                conn.id, IoEventType::UpstreamRecv, conn.upstream_episode);
+            cqe.res = static_cast<i32>(sizeof(kResponse) - 1u);
+            cqe.flags = IORING_CQE_F_BUFFER | IORING_CQE_F_MORE |
+                        (static_cast<u32>(kBufferId) << IORING_CQE_BUFFER_SHIFT);
+            __atomic_store_n(loop->backend.cq_tail, tail + 1u, __ATOMIC_RELEASE);
+            // The fixture's SQEs are staged but intentionally never submitted.
+            loop->backend.pending = 0;
+        };
+        auto harvest = [&](IoEvent& output) {
+            inject_cqe();
+            return loop->backend.wait(&output, 1, loop->conns, IoUringEventLoop::kMaxConns);
+        };
+
+        const auto saved_profile = conn.response_read_deadline_profile;
+        conn.response_read_deadline_profile = ResponseReadDeadlineProfile::HeaderOnlyHead;
+        IoEvent rejected{};
+        REQUIRE_EQ(harvest(rejected), 1u);
+        CHECK_EQ(rejected.result, -ENOBUFS);
+        CHECK_EQ(rejected.copy_witness, IoEventCopyWitness::Invalid);
+        CHECK_EQ(conn.upstream_recv_buf.len(), 0u);
+        conn.response_read_deadline_profile = saved_profile;
+
+        IoEvent copied{};
+        REQUIRE_EQ(harvest(copied), 1u);
+        CHECK_EQ(copied.result, sizeof(kResponse) - 1u);
+        CHECK_EQ(copied.copy_witness, IoEventCopyWitness::Full);
+        CHECK_EQ(copied.copy_deadline_generation, conn.response_read_deadline_generation);
+        CHECK_EQ(copied.copy_deadline_profile,
+                 static_cast<u8>(ResponseReadDeadlineProfile::BodylessNonHeadContentLengthZero));
+        CHECK_EQ(copied.copy_deadline_method, static_cast<u8>(LogHttpMethod::Get));
+        CHECK_EQ(copied.copy_begin, 0u);
+        CHECK_EQ(copied.copy_end, sizeof(kResponse) - 1u);
+        CHECK_EQ(conn.upstream_recv_buf.len(), sizeof(kResponse) - 1u);
+        CHECK_EQ(__builtin_memcmp(conn.upstream_recv_buf.data(), kResponse, sizeof(kResponse) - 1u),
+                 0);
+        cleanup_prebuilt_d2(loop, fixture);
+    }
 }
 
 TEST(response_read_deadline, batch_ledger_rejects_ranges_terminals_and_cancel_zero_byte) {

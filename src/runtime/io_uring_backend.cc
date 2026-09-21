@@ -33,7 +33,9 @@ static bool response_deadline_copy_owner(const Connection& conn, u32 upstream_ep
     return aux == 0 && conn.fd >= 0 && conn.upstream_fd >= 0 &&
            (conn.state == ConnState::Proxying ||
             (post_commit && conn.state == ConnState::Sending)) &&
-           conn.protocol == ConnProtocol::Http11 && !conn.tls_active && conn.h2 == nullptr &&
+           conn.protocol == ConnProtocol::Http11 &&
+           (!conn.tls_active || response_read_deadline_tls_complete_get_profile_is_stable(conn)) &&
+           conn.h2 == nullptr &&
            (conn.response_read_deadline_state == ResponseReadDeadlineState::Armed ||
             (post_commit &&
              conn.response_read_deadline_state == ResponseReadDeadlineState::BodyComplete)) &&

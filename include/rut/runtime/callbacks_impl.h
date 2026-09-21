@@ -1253,6 +1253,20 @@ bool prepare_response_read_deadline_preflight_for_mode(Loop* loop,
              preflight_downstream_close) &&
             conn.pipeline_depth == 0 && conn.http1_pipeline_request_generation == 0 &&
             conn.recv_buf.len() == conn.req_initial_send_len;
+        const bool tls_preflight_pending_recv_stable =
+            expected_mode == ForwardPreflightMode::EagerDirect
+                ? conn.tls_pending_on_recv == &on_header_received<Loop>
+                : ((expected_mode == ForwardPreflightMode::AfterCanonicalSelection ||
+                    expected_mode == ForwardPreflightMode::AfterRequestFramingSelection) &&
+                   conn.tls_pending_on_recv == nullptr);
+        const bool tls_bodyless_get_precise_preflight =
+            !conn.tls_active ||
+            (exact_bodyless_get_precise_preflight &&
+             response_read_deadline_tls_http11_engine_is_stable(conn) &&
+             tls_recv_callback_is_current<Loop>(conn) && tls_preflight_pending_recv_stable &&
+             conn.tls_raw_send_owner_is_neutral() && conn.tls_single_shot_send_owner_is_neutral() &&
+             !conn.tls_out_inflight && conn.tls_out_buf.len() == 0 && !conn.send_armed &&
+             conn.tls_pending_on_send == nullptr);
         const bool pipeline_generation_stable =
             http1_pipeline_request_generation_provisional_is_stable(conn,
                                                                     profile,
@@ -1270,7 +1284,8 @@ bool prepare_response_read_deadline_preflight_for_mode(Loop* loop,
             failure.connection != ForwardFailurePolicyConnection::Request ||
             timeout.version != ForwardFailurePolicyVersion::Http11 ||
             timeout.connection != ForwardFailurePolicyConnection::Request ||
-            conn.protocol != ConnProtocol::Http11 || conn.tls_active || conn.req_malformed ||
+            conn.protocol != ConnProtocol::Http11 || !tls_bodyless_get_precise_preflight ||
+            conn.req_malformed ||
             (!fixed_upload && (conn.req_body_mode != BodyMode::None ||
                                conn.req_body_remaining != 0 || conn.request_body_fully_buffered)) ||
             conn.req_client_has_transfer_encoding || conn.req_client_has_te ||
@@ -3551,6 +3566,7 @@ void handle_jit_outcome(Loop* loop,
             bool staged_fixed_head_continuation = false;
             bool fixed_upload_head_admitted = false;
             bool fixed_upload_head_initial_phase = false;
+            bool tls_complete_get_deadline_outcome_valid = false;
             if (outcome.response_read_timeout_seconds != 0) {
                 const bool loop_supports_deadline = [] {
                     if constexpr (requires { Loop::kSupportsExplicitFirstResponseDeadline; })
@@ -3746,7 +3762,9 @@ void handle_jit_outcome(Loop* loop,
                     conn.resp_header_mutation_pending_count != 0 ||
                     conn.resp_header_mutation_pending_overflow ||
                     conn.resp_header_mutation_overflow || conn.protocol != ConnProtocol::Http11 ||
-                    conn.tls_active ||
+                    (conn.tls_active &&
+                     (!bodyless_get_materialization ||
+                      !response_read_deadline_tls_http11_engine_is_stable(conn))) ||
                     !http1_pipeline_request_generation_jit_candidate_is_stable(
                         conn,
                         deadline_proof,
@@ -3765,6 +3783,9 @@ void handle_jit_outcome(Loop* loop,
                     loop->close_conn(conn);
                     return;
                 }
+                tls_complete_get_deadline_outcome_valid =
+                    conn.tls_active && bodyless_get_materialization && request_policy_valid &&
+                    target_valid && response_read_deadline_tls_http11_engine_is_stable(conn);
                 if (fixed_upload) {
                     auto& proof = conn.response_read_deadline_upload;
                     if ((proof.upstream_id != 0xffffu &&
@@ -4232,7 +4253,10 @@ void handle_jit_outcome(Loop* loop,
                  (forward_response_policy_id != 0 && !response_policy_request_connection &&
                   !conn.req_keep_alive) ||
                  (!suppress_body_head && conn.req_method == static_cast<u8>(LogHttpMethod::Head)) ||
-                 conn.tls_active || conn.req_path_canon.ptr == nullptr || conn.req_wants_upgrade ||
+                 (conn.tls_active &&
+                  (!tls_complete_get_deadline_outcome_valid ||
+                   !response_read_deadline_tls_complete_get_profile_is_stable(conn))) ||
+                 conn.req_path_canon.ptr == nullptr || conn.req_wants_upgrade ||
                  ((conn.req_body_mode != BodyMode::None || conn.request_body_fully_buffered) &&
                   !request_policy_body_response_admitted(conn)) ||
                  target.addr_count != 1 || target.addrs[0].sin_family != AF_INET ||
@@ -4678,8 +4702,8 @@ inline bool try_prebuilt_strict_read_timeout(Loop* loop, Connection& conn) {
                 ResponseReadDeadlineOwnerPhase::ActiveAfterCopy,
                 &on_upstream_response<Loop>);
         const bool tls_timeout_transport =
-            !conn.tls_active ||
-            (response_read_deadline_tls_output_is_settled(conn) && conn.on_recv == &tls_recv<Loop>);
+            !conn.tls_active || (response_read_deadline_tls_output_is_settled(conn) &&
+                                 tls_recv_callback_is_current<Loop>(conn));
         if (conn.protocol != ConnProtocol::Http11 || !tls_timeout_transport ||
             conn.req_http_version != static_cast<u8>(HttpVersion::Http11) ||
             ((response_read_deadline_profile_suppresses_head(profile) &&
@@ -4713,9 +4737,9 @@ inline bool try_prebuilt_strict_read_timeout(Loop* loop, Connection& conn) {
             conn.resp_header_mutation_pending_overflow || conn.resp_header_mutation_overflow)
             return false;
 
-        const bool recv_slot_stable =
-            conn.tls_active ? conn.on_recv == &tls_recv<Loop> && conn.tls_pending_on_recv == nullptr
-                            : conn.on_recv == nullptr;
+        const bool recv_slot_stable = conn.tls_active ? tls_recv_callback_is_current<Loop>(conn) &&
+                                                            conn.tls_pending_on_recv == nullptr
+                                                      : conn.on_recv == nullptr;
         if (conn.state != ConnState::Proxying || conn.req_start_us == 0 || conn.epoch_held ||
             loop->is_draining() || conn.is_health_probe || conn.pending_handler_fn != nullptr ||
             conn.yield_armed || conn.yield_timeout_armed || conn.throttle_paused ||
@@ -7328,7 +7352,7 @@ void proxy_stream_complete(Loop* loop, Connection& conn) {
     conn.http1_pipeline_boundary_owners_settled = false;
     conn.reset_request_receive_buffer();
     conn.transition_to_reading_header(&on_header_received<Loop>);
-    loop->submit_recv(conn);
+    if (!loop->submit_recv(conn) && conn.uses_iouring_tls()) close_conn_if_live(loop, conn);
 }
 
 template <typename Loop>
@@ -8714,7 +8738,13 @@ inline ResponseReadDeadlineProfile classify_response_read_deadline_profile(
         conn.req_header_override_count != 0 || conn.req_header_override_overflow ||
         conn.resp_header_mutation_count != 0 || conn.resp_header_mutation_pending_count != 0 ||
         conn.resp_header_mutation_pending_overflow || conn.resp_header_mutation_overflow ||
-        conn.pipeline_stash_len != 0 || conn.protocol != ConnProtocol::Http11 || conn.tls_active)
+        conn.pipeline_stash_len != 0 || conn.protocol != ConnProtocol::Http11 ||
+        (conn.tls_active &&
+         (!response_read_deadline_tls_http11_engine_is_stable(conn) ||
+          buffering != ForwardResponseBufferingMode::CompleteContentLength ||
+          conn.req_method != static_cast<u8>(LogHttpMethod::Get) || conn.request_policy_id != 0 ||
+          conn.request_policy_body_pending || conn.pending_forward_request_policy_id != 0 ||
+          conn.pipeline_depth != 0 || conn.http1_pipeline_request_generation != 0)))
         return ResponseReadDeadlineProfile::None;
     if (conn.recv_buf.data() == nullptr || conn.recv_buf.len() == 0)
         return ResponseReadDeadlineProfile::None;
@@ -9091,11 +9121,21 @@ inline bool validated_preconnect_failure_owner_is_stable(Loop* loop,
     } else {
         const RouteConfig* config = conn.request_config;
         const u16 bundle_id = conn.response_read_deadline_bundle_id;
+        const bool tls_complete_get_owner =
+            !conn.tls_active ||
+            (response_read_deadline_tls_complete_get_profile_is_stable(conn) &&
+             conn.response_read_deadline_state == ResponseReadDeadlineState::Validated &&
+             conn.response_read_deadline_post_commit_phase ==
+                 ResponseReadDeadlinePostCommitPhase::None &&
+             conn.pipeline_depth == 0 && conn.http1_pipeline_request_generation == 0 &&
+             conn.pipeline_stash_len == 0 && tls_recv_callback_is_current<Loop>(conn) &&
+             conn.tls_pending_on_recv == nullptr);
         if (loop == nullptr || conn.id >= connection_capacity_of(*loop) ||
             &loop->conns[conn.id] != &conn || conn.fd < 0 || config == nullptr ||
             conn.state != ConnState::Proxying || conn.protocol != ConnProtocol::Http11 ||
-            conn.tls_active || conn.h2 != nullptr || conn.req_start_us == 0 || conn.epoch_held ||
-            conn.is_health_probe || conn.req_http_version != static_cast<u8>(HttpVersion::Http11) ||
+            !tls_complete_get_owner || conn.h2 != nullptr || conn.req_start_us == 0 ||
+            conn.epoch_held || conn.is_health_probe ||
+            conn.req_http_version != static_cast<u8>(HttpVersion::Http11) ||
             !conn.req_strict_h1_complete || conn.req_client_has_transfer_encoding ||
             conn.req_client_has_te || conn.req_client_has_expect ||
             conn.req_client_has_upgrade_header || conn.req_malformed || conn.req_wants_upgrade ||
@@ -9318,14 +9358,23 @@ inline bool validated_preconnect_failure_owner_is_stable(Loop* loop,
         const bool terminal_downstream_recv_consumed = !conn.recv_armed && conn.pending_ops == 0u;
         if (!live_downstream_recv && !terminal_downstream_recv_consumed) return false;
         if (site == ValidatedPreconnectFailureSite::SocketCreate) {
+            const bool recv_slot_matches =
+                fixed_upload ? conn.on_recv == &on_request_policy_body_recvd<Loop>
+                             : (conn.tls_active ? tls_recv_callback_is_current<Loop>(conn)
+                                                : conn.on_recv == nullptr);
             if (conn.upstream_fd >= 0 || conn.on_upstream_recv != nullptr ||
                 conn.on_upstream_send != nullptr || conn.upstream_connect_armed ||
-                conn.on_recv != (fixed_upload ? &on_request_policy_body_recvd<Loop> : nullptr))
+                !recv_slot_matches || (conn.tls_active && conn.tls_pending_on_recv != nullptr))
                 return false;
-        } else if (conn.upstream_fd < 0 || conn.on_upstream_send != &on_upstream_connected<Loop> ||
-                   conn.on_upstream_recv != nullptr || conn.on_recv != nullptr ||
-                   conn.upstream_connect_armed) {
-            return false;
+        } else {
+            const bool recv_slot_matches = conn.tls_active
+                                               ? tls_recv_callback_is_current<Loop>(conn)
+                                               : conn.on_recv == nullptr;
+            if (conn.upstream_fd < 0 || conn.on_upstream_send != &on_upstream_connected<Loop> ||
+                conn.on_upstream_recv != nullptr || !recv_slot_matches ||
+                (conn.tls_active && conn.tls_pending_on_recv != nullptr) ||
+                conn.upstream_connect_armed)
+                return false;
         }
         return true;
     }
@@ -11448,7 +11497,7 @@ void continue_http1_request_boundary(Loop* loop, Connection& conn) {
     conn.http1_pipeline_boundary_owners_settled = false;
     conn.reset_request_receive_buffer();
     conn.transition_to_reading_header(&on_header_received<Loop>);
-    loop->submit_recv(conn);
+    if (!loop->submit_recv(conn) && conn.uses_iouring_tls()) close_conn_if_live(loop, conn);
 }
 
 template <typename Loop>
