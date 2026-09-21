@@ -33126,16 +33126,27 @@ TEST(route, ordinary_source_coalesced_exact_strict_get_successor_iouring) {
                                 const io_uring_sqe& sqe = loop->backend.sq_entries[sqe_index];
                                 if (sqe.opcode == IORING_OP_CONNECT)
                                     self->exact_connect_sqe_count++;
-                                if (sqe.opcode == IORING_OP_SEND && sqe.fd == conn.fd) {
+                                // The closing response is either a kernel Send of the
+                                // staged bytes, or (direct write) a NOP completing the
+                                // bytes already written, under the same identity.
+                                const bool kernel_send =
+                                    sqe.opcode == IORING_OP_SEND && sqe.fd == conn.fd &&
+                                    sqe.addr == reinterpret_cast<u64>(send.src);
+                                const bool direct_write_completion =
+                                    sqe.opcode == IORING_OP_NOP &&
+                                    sqe.nop_flags == IORING_NOP_INJECT_RESULT;
+                                const u64 user_data = sqe.user_data;
+                                const bool target_identity =
+                                    static_cast<IoEventType>(user_data & 0xFFu) ==
+                                        IoEventType::Send &&
+                                    static_cast<u32>((user_data >> 8) & 0xFFFFFFu) == self->conn_id;
+                                if ((sqe.opcode == IORING_OP_SEND && sqe.fd == conn.fd) ||
+                                    (direct_write_completion && target_identity)) {
                                     self->exact_target_send_sqe_count++;
-                                    const u64 user_data = sqe.user_data;
                                     self->exact_sq_identity =
-                                        static_cast<IoEventType>(user_data & 0xFFu) ==
-                                            IoEventType::Send &&
-                                        static_cast<u32>((user_data >> 8) & 0xFFFFFFu) ==
-                                            self->conn_id &&
+                                        target_identity &&
+                                        (kernel_send || direct_write_completion) &&
                                         static_cast<u32>(user_data >> 32) == 0 &&
-                                        sqe.addr == reinterpret_cast<u64>(send.src) &&
                                         sqe.len == send.remaining;
                                 }
                             }

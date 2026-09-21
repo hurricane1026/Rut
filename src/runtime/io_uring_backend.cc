@@ -279,6 +279,7 @@ core::Expected<void, Error> IoUringBackend::init(u32 /*shard_id*/, i32 lfd, u32 
 
     // Setup provided buffer ring for zero-copy recv
     TRY_VOID(setup_buf_ring());
+    probe_nop_inject_result();
 
     // Create timerfd for 1-second ticks (drives timer wheel)
     timer_fd = timerfd_create(CLOCK_MONOTONIC, TFD_NONBLOCK | TFD_CLOEXEC);
@@ -598,6 +599,55 @@ bool IoUringBackend::add_send(i32 fd, u32 conn_id, const u8* buf, u32 len, u32 g
     sqe->len = len;
     sqe->user_data = encode_user_data(conn_id, IoEventType::Send, generation);
 
+    sqe_advance_tail(sq_tail);
+    pending++;
+    return true;
+}
+
+void IoUringBackend::probe_nop_inject_result() {
+    // Runs before any other submission, so the only CQE is this probe's.
+    // Kernels without IORING_NOP_INJECT_RESULT fail the NOP with -EINVAL.
+    static constexpr u32 kProbeResult = 7;
+    nop_inject_result = false;
+    io_uring_sqe* sqe = get_sqe();
+    if (!sqe) return;
+    memset(sqe, 0, sizeof(*sqe));
+    sqe->opcode = IORING_OP_NOP;
+    sqe->nop_flags = IORING_NOP_INJECT_RESULT;
+    sqe->len = kProbeResult;
+    sqe->user_data = encode_user_data(kCancelConnId, IoEventType::Send);
+    sqe_advance_tail(sq_tail);
+    if (io_uring_enter(ring_fd, 1, 1, IORING_ENTER_GETEVENTS) < 0) return;
+    const u32 head = __atomic_load_n(cq_head, __ATOMIC_RELAXED);
+    if (head == __atomic_load_n(cq_tail, __ATOMIC_ACQUIRE)) return;
+    nop_inject_result = cq_entries[head & *cq_ring_mask].res == static_cast<i32>(kProbeResult);
+    __atomic_store_n(cq_head, head + 1, __ATOMIC_RELEASE);
+}
+
+bool IoUringBackend::add_send_after_direct_write(
+    i32 fd, u32 conn_id, const u8* buf, u32 len, u32 written, u32 generation) {
+    if (conn_id >= connection_capacity || connection_capacity == 0 || written > len ||
+        (written == len && !nop_inject_result))
+        return false;
+    io_uring_sqe* sqe = get_sqe();
+    if (!sqe) return false;
+    // Same send state as add_send, advanced past the bytes the caller already
+    // wrote directly; the Send completion still reports the whole length.
+    send_state[conn_id] = {buf, fd, written, len - written, IoEventType::Send, 0, generation};
+    memset(sqe, 0, sizeof(*sqe));
+    if (written == len) {
+        sqe->opcode = IORING_OP_NOP;
+        sqe->nop_flags = IORING_NOP_INJECT_RESULT;
+        sqe->len = len;
+        send_state[conn_id].offset = 0;
+        send_state[conn_id].remaining = len;
+    } else {
+        sqe->opcode = IORING_OP_SEND;
+        sqe->fd = fd;
+        sqe->addr = reinterpret_cast<u64>(buf + written);
+        sqe->len = len - written;
+    }
+    sqe->user_data = encode_user_data(conn_id, IoEventType::Send, generation);
     sqe_advance_tail(sq_tail);
     pending++;
     return true;

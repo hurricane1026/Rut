@@ -58608,6 +58608,117 @@ TEST(iouring_episode, upstream_submissions_carry_episode_and_aux) {
     backend.shutdown();
 }
 
+TEST(iouring_final_response, backend_completes_direct_writes_with_the_whole_length) {
+    ScopedIoUringLoopForRetirement guard;
+    if (!guard.init()) SKIP("io_uring unavailable");
+    auto& backend = guard.loop->backend;
+    if (!backend.nop_inject_result) SKIP("IORING_NOP_INJECT_RESULT unsupported");
+    static const u8 payload[] = {'0', '1', '2', '3', '4', '5', '6', '7', '8', '9'};
+    constexpr u32 kLen = sizeof(payload);
+    constexpr u32 kConnId = 5;
+    for (const u32 written : {kLen, 3u}) {
+        i32 sv[2] = {-1, -1};
+        REQUIRE_EQ(rut::test::stream_socketpair(sv), 0);
+        REQUIRE_EQ(::send(sv[0], payload, written, MSG_NOSIGNAL), static_cast<ssize_t>(written));
+        REQUIRE(backend.add_send_after_direct_write(sv[0], kConnId, payload, kLen, written, 3u));
+        IoEvent events[4]{};
+        u32 n = 0;
+        for (u32 attempt = 0; attempt < 8 && n == 0; attempt++)
+            n = backend.wait(events, 4, guard.loop->conns, IoUringEventLoop::kMaxConns);
+        REQUIRE_EQ(n, 1u);
+        CHECK_EQ(events[0].type, IoEventType::Send);
+        CHECK_EQ(events[0].conn_id, kConnId);
+        CHECK_EQ(events[0].result, static_cast<i32>(kLen));
+        CHECK_EQ(events[0].non_upstream_generation, 3u);
+        u8 received[kLen + 1]{};
+        u32 total = 0;
+        while (total < kLen) {
+            const ssize_t got = ::recv(sv[1], received + total, sizeof(received) - total, 0);
+            if (got <= 0) break;
+            total += static_cast<u32>(got);
+        }
+        CHECK_EQ(total, kLen);
+        CHECK_EQ(__builtin_memcmp(received, payload, kLen), 0);
+        close(sv[0]);
+        close(sv[1]);
+    }
+}
+
+TEST(iouring_final_response, closing_local_response_ends_stream_before_completion) {
+    ScopedIoUringLoopForRetirement guard;
+    if (!guard.init()) SKIP("io_uring unavailable");
+    auto* loop = guard.loop;
+    if (!loop->backend.nop_inject_result) SKIP("IORING_NOP_INJECT_RESULT unsupported");
+    static const char kResponse[] = "HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok";
+    constexpr u32 kLen = sizeof(kResponse) - 1u;
+    Connection* conn = loop->alloc_conn();
+    REQUIRE(conn != nullptr);
+    i32 sv[2] = {-1, -1};
+    REQUIRE_EQ(rut::test::stream_socketpair(sv), 0);
+    conn->fd = sv[0];
+    conn->keep_alive = false;
+    REQUIRE_EQ(conn->send_buf.write(reinterpret_cast<const u8*>(kResponse), kLen), kLen);
+    conn->transition_to_sending(&on_response_sent<IoUringEventLoop>);
+    REQUIRE(loop->final_local_response_send(*conn, conn->send_buf.data(), kLen));
+    REQUIRE(loop->submit_send(*conn, conn->send_buf.data(), kLen));
+    CHECK(conn->send_armed);
+    CHECK_EQ(conn->pending_ops, 1u);
+
+    // Before any completion is harvested the peer already has the whole
+    // response followed by end of stream.
+    u8 received[kLen + 8]{};
+    u32 total = 0;
+    ssize_t got = 0;
+    while ((got = ::recv(sv[1], received + total, sizeof(received) - total, MSG_DONTWAIT)) > 0)
+        total += static_cast<u32>(got);
+    CHECK_EQ(total, kLen);
+    CHECK_EQ(__builtin_memcmp(received, kResponse, kLen), 0);
+    CHECK_EQ(got, 0);  // FIN
+
+    IoEvent events[4]{};
+    u32 n = 0;
+    for (u32 attempt = 0; attempt < 8 && n == 0; attempt++)
+        n = loop->backend.wait(events, 4, loop->conns, IoUringEventLoop::kMaxConns);
+    REQUIRE_EQ(n, 1u);
+    CHECK_EQ(events[0].type, IoEventType::Send);
+    CHECK_EQ(events[0].result, static_cast<i32>(kLen));
+    conn->send_armed = false;
+    conn->pending_ops = 0;
+    loop->close_conn(*conn);
+    close(sv[1]);
+}
+
+TEST(iouring_final_response, direct_write_is_limited_to_closing_plaintext_local_responses) {
+    ScopedIoUringLoopForRetirement guard;
+    if (!guard.init()) SKIP("io_uring unavailable");
+    auto* loop = guard.loop;
+    if (!loop->backend.nop_inject_result) SKIP("IORING_NOP_INJECT_RESULT unsupported");
+    Connection* conn = loop->alloc_conn();
+    REQUIRE(conn != nullptr);
+    conn->fd = dup(STDERR_FILENO);
+    REQUIRE_GE(conn->fd, 0);
+    conn->keep_alive = false;
+    static const u8 kBody[] = "abc";
+    REQUIRE_EQ(conn->send_buf.write(kBody, 3u), 3u);
+    conn->transition_to_sending(&on_response_sent<IoUringEventLoop>);
+    const u8* buf = conn->send_buf.data();
+    CHECK(loop->final_local_response_send(*conn, buf, 3u));
+    CHECK_FALSE(loop->final_local_response_send(*conn, buf, 2u));  // not the whole buffer
+    CHECK_FALSE(loop->final_local_response_send(*conn, buf + 1, 2u));
+    conn->keep_alive = true;
+    CHECK_FALSE(loop->final_local_response_send(*conn, buf, 3u));
+    conn->keep_alive = false;
+    conn->send_progress = 1;
+    CHECK_FALSE(loop->final_local_response_send(*conn, buf, 3u));
+    conn->send_progress = 0;
+    conn->tls_active = true;
+    CHECK_FALSE(loop->final_local_response_send(*conn, buf, 3u));
+    conn->tls_active = false;
+    conn->transition_to_sending(&on_response_body_sent<IoUringEventLoop>);
+    CHECK_FALSE(loop->final_local_response_send(*conn, buf, 3u));
+    loop->close_conn(*conn);
+}
+
 TEST(iouring_episode, invalid_upstream_episodes_do_not_acquire_sqe_or_state) {
     IoUringBackend backend{};
     auto initialized = backend.init(0, -1);
