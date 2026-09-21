@@ -7069,7 +7069,8 @@ void on_response_body_recvd(void* lp, Connection& conn, IoEvent ev) {
             }
             on_request_complete(loop, conn, conn.resp_status, conn.resp_body_sent);
             loop->epoch_leave();
-            loop->close_conn(conn);
+            // The FIN also frames this close-delimited body.
+            close_conn_after_complete_response(loop, conn);
             return;
         }
         // A parked TLS proxy tail still owns the final body bytes: the body parser

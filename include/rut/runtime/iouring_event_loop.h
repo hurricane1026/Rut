@@ -3085,7 +3085,9 @@ public:
     // has usually closed first. For a plaintext connection whose response is
     // complete, half-close the write side now. TLS keeps its own shutdown path.
     void end_stream_before_close(Connection& c) {
-        if (c.fd >= 0 && !c.tls_active) (void)::shutdown(c.fd, SHUT_WR);
+        // A send still in flight keeps the ordinary close ordering: half-
+        // closing now would fail that send and truncate the response.
+        if (c.fd >= 0 && !c.tls_active && !c.send_armed) (void)::shutdown(c.fd, SHUT_WR);
     }
 
     // A provided-buffer multishot recv can complete several 4 KiB CQEs in one

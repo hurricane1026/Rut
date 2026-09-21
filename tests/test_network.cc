@@ -58734,6 +58734,30 @@ TEST(iouring_final_response, client_reset_waits_for_the_direct_write_completion)
     close(sv[1]);
 }
 
+TEST(iouring_final_response, half_close_waits_for_an_inflight_send) {
+    ScopedIoUringLoopForRetirement guard;
+    if (!guard.init()) SKIP("io_uring unavailable");
+    auto* loop = guard.loop;
+    for (const bool send_in_flight : {true, false}) {
+        Connection* conn = loop->alloc_conn();
+        REQUIRE(conn != nullptr);
+        i32 sv[2] = {-1, -1};
+        REQUIRE_EQ(rut::test::stream_socketpair(sv), 0);
+        conn->fd = sv[0];
+        conn->send_armed = send_in_flight;
+        loop->end_stream_before_close(*conn);
+        u8 probe[4];
+        const ssize_t got = ::recv(sv[1], probe, sizeof(probe), MSG_DONTWAIT);
+        if (send_in_flight)
+            CHECK_LT(got, 0);  // no FIN ahead of the queued send
+        else
+            CHECK_EQ(got, 0);  // FIN
+        conn->send_armed = false;
+        loop->close_conn(*conn);
+        close(sv[1]);
+    }
+}
+
 TEST(iouring_final_response, full_submission_queue_writes_nothing_directly) {
     ScopedIoUringLoopForRetirement guard;
     if (!guard.init()) SKIP("io_uring unavailable");
