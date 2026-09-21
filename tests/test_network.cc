@@ -6104,7 +6104,6 @@ struct ScopedTlsRawSendLoop {
     }
 };
 
-#if RUT_ENABLE_WEBSOCKET
 struct TlsMemoryClientPeer {
     SSL_CTX* ctx = nullptr;
     SSL* ssl = nullptr;
@@ -6161,7 +6160,6 @@ bool tls_engine_handshake_with_memory_client(TlsEngine& engine, SSL* client) {
     }
     return client_done && engine.handshake_done;
 }
-#endif  // RUT_ENABLE_WEBSOCKET
 
 struct ScopedTlsOutMmap {
     u8* data = nullptr;
@@ -6215,6 +6213,104 @@ IoEvent tls_send_event(u32 conn_id, i32 result, u32 generation) {
     ev.type = IoEventType::Send;
     ev.non_upstream_generation = generation;
     return ev;
+}
+
+struct StrictTlsResponseFrame {
+    const u8* src = nullptr;
+    u32 len = 0;
+    Connection::Callback callback = nullptr;
+};
+
+StrictTlsResponseFrame stage_strict_tls_response_frame(Connection& conn,
+                                                       ResponseReadDeadlineSendKind kind,
+                                                       u8* response_storage,
+                                                       u32 response_capacity,
+                                                       u8* upstream_storage,
+                                                       u32 upstream_capacity) {
+    static constexpr u8 kHeader[] = "HTTP/1.1 200 OK\r\nContent-Length: 3\r\n\r\n";
+    static constexpr u8 kBody[] = "xyz";
+    static constexpr u8 kOriginHeader[] = "HTTP/1.1 200 OK\r\nContent-Length: 3\r\n\r\n";
+    const u32 header_len = sizeof(kHeader) - 1u;
+    const u32 body_len = sizeof(kBody) - 1u;
+    const u32 raw_header_len = sizeof(kOriginHeader) - 1u;
+
+    conn.response_header_buf.bind(response_storage, response_capacity);
+    conn.upstream_recv_buf.bind(upstream_storage, upstream_capacity);
+    conn.response_read_deadline_generation = 7;
+    conn.response_read_deadline_post_commit_generation = 7;
+    conn.response_read_deadline_post_commit_episode = 1;
+    conn.response_read_deadline_buffering = ForwardResponseBufferingMode::CompleteContentLength;
+    conn.response_read_deadline_post_commit_response_class =
+        CompleteContentLengthResponseClass::BoundedPositiveBody;
+    conn.response_read_deadline_post_commit_declared_body = body_len;
+    conn.response_read_deadline_post_commit_origin_received = body_len;
+    conn.response_read_deadline_post_commit_send_body = body_len;
+    conn.response_read_deadline_post_commit_downstream_submitted = body_len;
+    conn.response_read_deadline_post_commit_downstream_completed = 0;
+    conn.response_read_deadline_post_commit_inflight_body = body_len;
+    conn.response_read_deadline_state = ResponseReadDeadlineState::BodyComplete;
+    conn.response_read_deadline_send_generation = 1;
+    conn.response_read_deadline_send_tombstone_generation = 1;
+    conn.upstream_episode = 1;
+    conn.protocol = ConnProtocol::Http11;
+    conn.state = ConnState::Sending;
+    conn.req_start_us = 1;
+    conn.epoch_held = false;
+
+    if (kind == ResponseReadDeadlineSendKind::Header) {
+        conn.response_read_deadline_post_commit_phase =
+            ResponseReadDeadlinePostCommitPhase::HeaderSend;
+        conn.response_read_deadline_post_commit_raw_header_end = raw_header_len;
+        conn.response_read_deadline_post_commit_inflight_body = 0;
+        conn.upstream_send_len = raw_header_len;
+        (void)conn.response_header_buf.write(kHeader, header_len);
+        (void)conn.upstream_recv_buf.write(kOriginHeader, raw_header_len);
+        return {conn.response_header_buf.data(),
+                header_len,
+                &on_response_header_sent<IoUringEventLoop>};
+    }
+    if (kind == ResponseReadDeadlineSendKind::Body) {
+        conn.response_read_deadline_post_commit_phase =
+            ResponseReadDeadlinePostCommitPhase::BodySend;
+        conn.response_read_deadline_post_commit_raw_header_end = raw_header_len;
+        conn.upstream_send_len = body_len;
+        (void)conn.response_header_buf.write(kHeader, header_len);
+        (void)conn.upstream_recv_buf.write(kBody, body_len);
+        return {conn.upstream_recv_buf.data(), body_len, &on_response_body_sent<IoUringEventLoop>};
+    }
+
+    conn.response_read_deadline_post_commit_phase =
+        ResponseReadDeadlinePostCommitPhase::CombinedSend;
+    conn.response_read_deadline_post_commit_raw_header_end = raw_header_len;
+    conn.upstream_send_len = raw_header_len + body_len;
+    conn.resp_body_mode = BodyMode::ContentLength;
+    conn.resp_body_sent = header_len + body_len;
+    conn.resp_body_remaining = 0;
+    (void)conn.response_header_buf.write(kHeader, header_len);
+    memcpy(response_storage + header_len, kBody, body_len);  // staged beyond Buffer's header len
+    (void)conn.upstream_recv_buf.write(kOriginHeader, raw_header_len);
+    (void)conn.upstream_recv_buf.write(kBody, body_len);
+    return {conn.response_header_buf.data(),
+            header_len + body_len,
+            &on_complete_response_sent<IoUringEventLoop>};
+}
+
+void stage_strict_tls_send_owner(Connection& conn,
+                                 const StrictTlsResponseFrame& frame,
+                                 ResponseReadDeadlineSendKind kind,
+                                 u32 generation) {
+    conn.on_send = frame.callback;
+    conn.response_read_deadline_send_owner_generation = generation;
+    conn.response_read_deadline_send_tombstone_generation = generation - 1u;
+    conn.response_read_deadline_send_deadline_generation =
+        conn.response_read_deadline_post_commit_generation;
+    conn.response_read_deadline_send_upstream_episode =
+        conn.response_read_deadline_post_commit_episode;
+    conn.response_read_deadline_send_src = frame.src;
+    conn.response_read_deadline_send_len = frame.len;
+    conn.response_read_deadline_send_fd = conn.fd;
+    conn.response_read_deadline_send_kind = kind;
+    conn.response_read_deadline_send_owner_active = true;
 }
 }  // namespace
 
@@ -6280,6 +6376,410 @@ TEST(connection_base, tls_send_owners_reset_and_share_nonwrapping_tokens) {
     CHECK_EQ(untouched, 77u);
     CHECK_FALSE(conn.next_response_read_deadline_send_generation());
     CHECK_EQ(conn.response_read_deadline_send_owner_generation, 0u);
+}
+
+TEST(tls_iouring, strict_completion_validator_authenticates_tls_logical_tombstones) {
+    ScopedTlsRawSendLoop guard;
+    REQUIRE(guard.init());
+    IoUringEventLoop& loop = *guard.loop;
+    static constexpr ResponseReadDeadlineSendKind kKinds[] = {
+        ResponseReadDeadlineSendKind::Header,
+        ResponseReadDeadlineSendKind::Body,
+        ResponseReadDeadlineSendKind::Combined};
+
+    for (const ResponseReadDeadlineSendKind kind : kKinds) {
+        Connection conn;
+        conn.reset();
+        conn.id = 0;
+        conn.fd = 42;
+        conn.tls_active = true;
+        conn.tls_handshake_complete = true;
+        conn.tls_engine.ssl = reinterpret_cast<SSL*>(&conn);
+        u8 response_storage[SlicePool::kSliceSize]{};
+        u8 upstream_storage[128]{};
+        const StrictTlsResponseFrame frame =
+            stage_strict_tls_response_frame(conn,
+                                            kind,
+                                            response_storage,
+                                            sizeof(response_storage),
+                                            upstream_storage,
+                                            sizeof(upstream_storage));
+        conn.on_send = frame.callback;
+        conn.response_read_deadline_send_owner_generation = 2;
+        conn.response_read_deadline_send_tombstone_generation = 2;
+        conn.response_read_deadline_send_deadline_generation =
+            conn.response_read_deadline_post_commit_generation;
+        conn.response_read_deadline_send_upstream_episode =
+            conn.response_read_deadline_post_commit_episode;
+        conn.response_read_deadline_send_src = frame.src;
+        conn.response_read_deadline_send_len = frame.len;
+        conn.response_read_deadline_send_fd = conn.fd;
+        conn.response_read_deadline_send_kind = kind;
+
+        IoEvent completion{};
+        completion.conn_id = conn.id;
+        completion.result = static_cast<i32>(frame.len);
+        completion.type = IoEventType::Send;
+        completion.non_upstream_generation = 2;
+        REQUIRE(loop.response_read_deadline_send_completion_is_valid(conn, completion, kind));
+
+        IoEvent stale_generation = completion;
+        stale_generation.non_upstream_generation++;
+        CHECK_FALSE(
+            loop.response_read_deadline_send_completion_is_valid(conn, stale_generation, kind));
+        IoEvent nonterminal = completion;
+        nonterminal.more = 1;
+        CHECK_FALSE(loop.response_read_deadline_send_completion_is_valid(conn, nonterminal, kind));
+        IoEvent wrong_connection = completion;
+        wrong_connection.conn_id++;
+        CHECK_FALSE(
+            loop.response_read_deadline_send_completion_is_valid(conn, wrong_connection, kind));
+
+        const Connection::Callback callback = conn.on_send;
+        conn.on_send = nullptr;
+        CHECK_FALSE(loop.response_read_deadline_send_completion_is_valid(conn, completion, kind));
+        conn.on_send = callback;
+
+        const u32 owner_generation = conn.response_read_deadline_send_owner_generation;
+        conn.response_read_deadline_send_owner_generation++;
+        CHECK_FALSE(loop.response_read_deadline_send_completion_is_valid(conn, completion, kind));
+        conn.response_read_deadline_send_owner_generation = owner_generation;
+        const i32 owner_fd = conn.response_read_deadline_send_fd;
+        conn.response_read_deadline_send_fd++;
+        CHECK_FALSE(loop.response_read_deadline_send_completion_is_valid(conn, completion, kind));
+        conn.response_read_deadline_send_fd = owner_fd;
+        const u8* const owner_src = conn.response_read_deadline_send_src;
+        conn.response_read_deadline_send_src++;
+        CHECK_FALSE(loop.response_read_deadline_send_completion_is_valid(conn, completion, kind));
+        conn.response_read_deadline_send_src = owner_src;
+        conn.response_read_deadline_send_len++;
+        CHECK_FALSE(loop.response_read_deadline_send_completion_is_valid(conn, completion, kind));
+        conn.response_read_deadline_send_len--;
+        const ResponseReadDeadlineSendKind owner_kind = conn.response_read_deadline_send_kind;
+        conn.response_read_deadline_send_kind = kind == ResponseReadDeadlineSendKind::Header
+                                                    ? ResponseReadDeadlineSendKind::Body
+                                                    : ResponseReadDeadlineSendKind::Header;
+        CHECK_FALSE(loop.response_read_deadline_send_completion_is_valid(conn, completion, kind));
+        conn.response_read_deadline_send_kind = owner_kind;
+        conn.response_read_deadline_send_deadline_generation++;
+        CHECK_FALSE(loop.response_read_deadline_send_completion_is_valid(conn, completion, kind));
+        conn.response_read_deadline_send_deadline_generation--;
+        conn.response_read_deadline_send_upstream_episode++;
+        CHECK_FALSE(loop.response_read_deadline_send_completion_is_valid(conn, completion, kind));
+        conn.tls_engine.ssl = nullptr;  // validator-only fixture; never owns an SSL object
+    }
+}
+
+TEST(tls_iouring, strict_tls_logical_send_completion_bridges_each_phase_after_raw_drain) {
+    auto context_result = create_tls_server_context(RUT_TESTDATA_DIR "/localhost_cert.pem",
+                                                    RUT_TESTDATA_DIR "/localhost_key.pem");
+    REQUIRE(context_result.has_value());
+    std::unique_ptr<TlsServerContext, decltype(&destroy_tls_server_context)> context(
+        context_result.value(), destroy_tls_server_context);
+    static constexpr ResponseReadDeadlineSendKind kKinds[] = {
+        ResponseReadDeadlineSendKind::Header,
+        ResponseReadDeadlineSendKind::Body,
+        ResponseReadDeadlineSendKind::Combined};
+
+    for (const ResponseReadDeadlineSendKind kind : kKinds) {
+        ScopedTlsRawSendLoop guard;
+        REQUIRE(guard.init(/*capacity=*/2));
+        IoUringEventLoop& loop = *guard.loop;
+        Connection& conn = loop.conns[0];
+        conn.reset();
+        conn.id = 0;
+        conn.fd = dup(STDERR_FILENO);
+        REQUIRE_GE(conn.fd, 0);
+        loop.free_top = 0;
+        loop.tls_server = context.get();
+        REQUIRE(loop.tls_setup(conn));
+        TlsMemoryClientPeer client;
+        REQUIRE(client.init());
+        REQUIRE(tls_engine_handshake_with_memory_client(conn.tls_engine, client.ssl));
+        conn.tls_handshake_complete = true;
+
+        u8 response_storage[SlicePool::kSliceSize]{};
+        u8 upstream_storage[SlicePool::kSliceSize]{};
+        StrictTlsResponseFrame frame = stage_strict_tls_response_frame(conn,
+                                                                       kind,
+                                                                       response_storage,
+                                                                       sizeof(response_storage),
+                                                                       upstream_storage,
+                                                                       sizeof(upstream_storage));
+        if (kind == ResponseReadDeadlineSendKind::Combined) {
+            // Exercise two raw drain chunks with a staged 16 KiB combined
+            // frame. The origin header plus body still fit one 16 KiB slot;
+            // this is a transport-boundary fixture, not a new profile limit.
+            static constexpr u8 kLargeResponseHeader[] =
+                "HTTP/1.1 200 OK\r\nContent-Length: 16342\r\n\r\n";
+            const u32 large_header_len = sizeof(kLargeResponseHeader) - 1u;
+            const u32 large_body_len = sizeof(upstream_storage) - large_header_len;
+            static_assert(SlicePool::kSliceSize <= 65535u);
+            REQUIRE_EQ(large_body_len, 16342u);
+            REQUIRE_GT(large_body_len, 0u);
+            __builtin_memset(response_storage + large_header_len, 'z', large_body_len);
+            conn.response_header_buf.reset();
+            REQUIRE_EQ(conn.response_header_buf.write(kLargeResponseHeader, large_header_len),
+                       large_header_len);
+            conn.upstream_recv_buf.reset();
+            REQUIRE_EQ(conn.upstream_recv_buf.write(kLargeResponseHeader, large_header_len),
+                       large_header_len);
+            REQUIRE_EQ(
+                conn.upstream_recv_buf.write(response_storage + large_header_len, large_body_len),
+                large_body_len);
+            frame.src = conn.response_header_buf.data();
+            frame.len = large_header_len + large_body_len;
+            conn.response_read_deadline_post_commit_declared_body = large_body_len;
+            conn.response_read_deadline_post_commit_origin_received = large_body_len;
+            conn.response_read_deadline_post_commit_send_body = large_body_len;
+            conn.response_read_deadline_post_commit_downstream_submitted = large_body_len;
+            conn.response_read_deadline_post_commit_inflight_body = large_body_len;
+            conn.response_read_deadline_post_commit_raw_header_end = large_header_len;
+            conn.upstream_send_len = large_header_len + large_body_len;
+            conn.resp_body_mode = BodyMode::ContentLength;
+            conn.resp_body_sent = frame.len;
+            conn.resp_body_remaining = 0;
+        }
+        conn.on_send = frame.callback;
+        REQUIRE(loop.submit_send_impl(conn, frame.src, frame.len));
+        const u32 logical_generation = conn.tls_send_owner_generation;
+        const u32 raw_generation = conn.tls_out_inflight_generation;
+        REQUIRE_NE(logical_generation, 0u);
+        REQUIRE_NE(raw_generation, 0u);
+        CHECK_EQ(conn.response_read_deadline_send_owner_generation, logical_generation);
+        CHECK_EQ(conn.response_read_deadline_send_tombstone_generation, 1u);
+        CHECK_NE(logical_generation, raw_generation);
+        CHECK_EQ(conn.tls_out_inflight_src, conn.tls_out_buf.data());
+        CHECK(conn.response_read_deadline_send_owner_active);
+
+        const u32 first_raw_generation = conn.tls_out_inflight_generation;
+        const u32 first_ciphertext_len = conn.tls_out_inflight_len;
+        REQUIRE_GT(first_ciphertext_len, 0u);
+        const bool has_second_raw = conn.tls_out_buf.len() > first_ciphertext_len;
+        if (kind == ResponseReadDeadlineSendKind::Combined) REQUIRE(has_second_raw);
+        if (has_second_raw) {
+            loop.backend.send_state[conn.id].offset = first_ciphertext_len;
+            loop.backend.send_state[conn.id].remaining = 0;
+            guard.sq_head = guard.sq_tail;
+            loop.backend.pending = 0;
+            loop.dispatch(tls_send_event(
+                conn.id, static_cast<i32>(first_ciphertext_len), first_raw_generation));
+            REQUIRE(conn.response_read_deadline_send_owner_active);
+            CHECK_EQ(conn.response_read_deadline_send_owner_generation, logical_generation);
+            CHECK_EQ(conn.response_read_deadline_send_tombstone_generation, 1u);
+            CHECK_GE(conn.fd, 0);
+            CHECK_NE(conn.tls_out_inflight_generation, first_raw_generation);
+            CHECK_NE(conn.tls_out_inflight_generation, logical_generation);
+            REQUIRE(conn.tls_out_inflight);
+            CHECK(conn.tls_out_buf.len() > 0);
+        }
+
+        // strict_completion_validator_authenticates_tls_logical_tombstones
+        // independently validates the post-drain witness for all three kinds.
+        // Here the real TLS drain must consume that logical token before the
+        // intentionally closed T1a response gate rejects the continuation.
+        const u32 final_raw_generation = conn.tls_out_inflight_generation;
+        const u32 final_ciphertext_len = conn.tls_out_inflight_len;
+        REQUIRE_GT(final_ciphertext_len, 0u);
+        loop.backend.send_state[conn.id].offset = final_ciphertext_len;
+        loop.backend.send_state[conn.id].remaining = 0;
+        guard.sq_head = guard.sq_tail;  // the submitted raw SQE is now in flight
+        loop.backend.pending = 0;
+        loop.dispatch(
+            tls_send_event(conn.id, static_cast<i32>(final_ciphertext_len), final_raw_generation));
+        CHECK_EQ(loop.conns[0].response_read_deadline_send_tombstone_generation,
+                 logical_generation);
+
+        // T1a leaves the outer strict-response gate closed for TLS. The actual
+        // continuation therefore closes after transport validation; the
+        // plaintext generation never becomes a kernel close-cancel target.
+        CHECK_EQ(loop.conns[0].fd, -1);
+        CHECK_EQ(loop.free_top, 1u);
+        CHECK_EQ(loop.pending_free_count, 0u);
+        CHECK_EQ(loop.conns[0].response_read_deadline_send_close_generation, 0u);
+        CHECK_EQ(loop.backend.failure_code(), 0);
+        const u32 free_after_completion = loop.free_top;
+        loop.dispatch(
+            tls_send_event(conn.id, static_cast<i32>(final_ciphertext_len), final_raw_generation));
+        CHECK_EQ(loop.free_top, free_after_completion);
+        CHECK_EQ(loop.conns[0].response_read_deadline_send_tombstone_generation,
+                 logical_generation);
+    }
+}
+
+TEST(tls_iouring, strict_tls_parked_needread_close_cancels_recv_only_with_corrupt_generation) {
+    auto context_result = create_tls_server_context(RUT_TESTDATA_DIR "/localhost_cert.pem",
+                                                    RUT_TESTDATA_DIR "/localhost_key.pem");
+    REQUIRE(context_result.has_value());
+    std::unique_ptr<TlsServerContext, decltype(&destroy_tls_server_context)> context(
+        context_result.value(), destroy_tls_server_context);
+
+    for (const bool corrupt_tls_generation : {false, true}) {
+        for (const bool cancel_first : {false, true}) {
+            ScopedTlsRawSendLoop guard;
+            REQUIRE(guard.init());
+            IoUringEventLoop& loop = *guard.loop;
+            Connection& conn = loop.conns[0];
+            conn.reset();
+            conn.id = 0;
+            conn.fd = dup(STDERR_FILENO);
+            REQUIRE_GE(conn.fd, 0);
+            loop.free_top = 0;
+            loop.tls_server = context.get();
+            REQUIRE(loop.tls_setup(conn));
+            conn.tls_handshake_complete = true;
+            u8 response_storage[128]{};
+            u8 upstream_storage[128]{};
+            const StrictTlsResponseFrame frame =
+                stage_strict_tls_response_frame(conn,
+                                                ResponseReadDeadlineSendKind::Body,
+                                                response_storage,
+                                                sizeof(response_storage),
+                                                upstream_storage,
+                                                sizeof(upstream_storage));
+            u32 logical_generation = 0;
+            REQUIRE(conn.next_non_upstream_send_generation(logical_generation));
+            stage_strict_tls_send_owner(
+                conn, frame, ResponseReadDeadlineSendKind::Body, logical_generation);
+            conn.tls_send_owner_generation =
+                logical_generation + static_cast<u32>(corrupt_tls_generation);
+            conn.tls_send_owner_fd = conn.fd;
+            conn.tls_send_owner_handler_generation = conn.handler_gen;
+            conn.tls_send_src = frame.src;
+            conn.tls_send_len = frame.len;
+            conn.tls_send_off = 0;  // parked NeedRead owner with no raw target
+            conn.tls_pending_on_send = frame.callback;
+            conn.tls_pending_on_recv = &tls_resume_pending_send_recv<IoUringEventLoop>;
+            // Inject the parked NeedRead continuation state explicitly. This
+            // checks ownership on close, not SSL WANT_READ generation or resume.
+            conn.recv_armed = true;
+            conn.pending_ops = 1;
+
+            loop.close_conn(conn);
+            const Connection& closed = loop.conns[0];
+            CHECK_EQ(closed.response_read_deadline_send_close_generation, 0u);
+            CHECK_FALSE(closed.response_read_deadline_send_close_target_owned);
+            CHECK_FALSE(closed.response_read_deadline_send_close_cancel_owned);
+            CHECK_EQ(closed.pending_ops, 2u);  // recv target plus its close cancel
+            CHECK_EQ(loop.pending_free_count, 1u);
+            CHECK_EQ(loop.free_top, 0u);
+            REQUIRE_EQ(guard.sq_tail, 1u);
+            u32 cancel_id = UINT32_MAX;
+            u32 cancel_aux = 0;
+            IoEventType cancel_type = IoEventType::Count;
+            IoUringBackend::decode_user_data(
+                guard.sq_entries[0].user_data, cancel_id, cancel_type, cancel_aux);
+            CHECK_EQ(guard.sq_entries[0].opcode, IORING_OP_ASYNC_CANCEL);
+            CHECK_EQ(cancel_id, conn.id);
+            CHECK_EQ(cancel_type, IoEventType::Recv);
+            CHECK_EQ(cancel_aux, kDownstreamCloseCancelAux);
+
+            IoEvent target{};
+            target.conn_id = conn.id;
+            target.result = -ECANCELED;
+            target.type = IoEventType::Recv;
+            IoEvent cancel = target;
+            cancel.result = -ENOENT;
+            cancel.aux = kDownstreamCloseCancelAux;
+            loop.dispatch(cancel_first ? cancel : target);
+            CHECK_EQ(closed.pending_ops, 1u);
+            CHECK_EQ(loop.pending_free_count, 1u);
+            CHECK_EQ(loop.free_top, 0u);
+            loop.dispatch(cancel_first ? target : cancel);
+            CHECK_EQ(closed.pending_ops, 0u);
+            CHECK_EQ(loop.pending_free_count, 0u);
+            CHECK_EQ(loop.free_top, 1u);
+        }
+    }
+}
+
+TEST(tls_iouring, strict_tls_constrained_output_needroom_keeps_raw_owner_and_reclaims_close) {
+    auto context_result = create_tls_server_context(RUT_TESTDATA_DIR "/localhost_cert.pem",
+                                                    RUT_TESTDATA_DIR "/localhost_key.pem");
+    REQUIRE(context_result.has_value());
+    std::unique_ptr<TlsServerContext, decltype(&destroy_tls_server_context)> context(
+        context_result.value(), destroy_tls_server_context);
+    ScopedTlsRawSendLoop guard;
+    REQUIRE(guard.init());
+    IoUringEventLoop& loop = *guard.loop;
+    Connection& conn = loop.conns[0];
+    conn.reset();
+    conn.id = 0;
+    conn.fd = dup(STDERR_FILENO);
+    REQUIRE_GE(conn.fd, 0);
+    loop.free_top = 0;
+    loop.tls_server = context.get();
+    REQUIRE(loop.tls_setup(conn));
+    TlsMemoryClientPeer client;
+    REQUIRE(client.init());
+    REQUIRE(tls_engine_handshake_with_memory_client(conn.tls_engine, client.ssl));
+    conn.tls_handshake_complete = true;
+    const Connection::Callback pending_recv_before_send = conn.tls_pending_on_recv;
+    REQUIRE(pending_recv_before_send != nullptr);
+
+    u8 response_storage[128]{};
+    u8 upstream_storage[128]{};
+    const StrictTlsResponseFrame frame =
+        stage_strict_tls_response_frame(conn,
+                                        ResponseReadDeadlineSendKind::Body,
+                                        response_storage,
+                                        sizeof(response_storage),
+                                        upstream_storage,
+                                        sizeof(upstream_storage));
+    conn.on_send = frame.callback;
+
+    // Deliberately leave one output byte available while a distinct raw
+    // ciphertext target is already live. This constrained-buffer fixture drives
+    // SSL_write's real WANT_WRITE path; it is not a claim that a normal bounded
+    // response profile naturally exhausts the 64 KiB TLS output buffer.
+    static u8 backlog[IoUringEventLoop::kTlsOutBufCap - 1u];
+    __builtin_memset(backlog, 0x16, sizeof(backlog));
+    REQUIRE_EQ(conn.tls_out_buf.write(backlog, sizeof(backlog)), sizeof(backlog));
+    REQUIRE_EQ(conn.tls_out_buf.write_avail(), 1u);
+    REQUIRE(tls_ensure_draining<IoUringEventLoop>(&loop, conn));
+    const u32 raw_generation = conn.tls_out_inflight_generation;
+    REQUIRE_NE(raw_generation, 0u);
+    REQUIRE_EQ(conn.tls_out_inflight_len, IoUringEventLoop::kTlsDrainChunk);
+    conn.on_send = frame.callback;
+    REQUIRE(loop.submit_send_impl(conn, frame.src, frame.len));
+
+    const u32 logical_generation = conn.tls_send_owner_generation;
+    REQUIRE_NE(logical_generation, 0u);
+    CHECK_NE(logical_generation, raw_generation);
+    CHECK(conn.response_read_deadline_send_owner_active);
+    CHECK_EQ(conn.response_read_deadline_send_owner_generation, logical_generation);
+    CHECK(conn.tls_pending_on_send == frame.callback);
+    CHECK(conn.tls_send_off < conn.tls_send_len);  // NeedRoom parked the plaintext tail
+    CHECK(conn.tls_out_inflight);
+    CHECK_EQ(conn.tls_out_inflight_generation, raw_generation);
+    CHECK_FALSE(conn.recv_armed);  // this is NeedRoom, not a NeedRead recv driver
+    CHECK(conn.tls_pending_on_recv == pending_recv_before_send);
+    CHECK_EQ(guard.sq_tail, 1u);  // NeedRoom did not create a second raw target
+    CHECK_EQ(conn.pending_ops, 1u);
+
+    guard.sq_head = guard.sq_tail;
+    loop.backend.pending = 0;
+    loop.close_conn(conn);
+    const Connection& closed = loop.conns[0];
+    REQUIRE_EQ(closed.fd, -1);
+    REQUIRE_EQ(closed.pending_ops, 2u);
+    CHECK_EQ(closed.response_read_deadline_send_close_generation, raw_generation);
+    CHECK_NE(closed.response_read_deadline_send_close_generation, logical_generation);
+    REQUIRE(closed.response_read_deadline_send_close_target_owned);
+    REQUIRE(closed.response_read_deadline_send_close_cancel_owned);
+    REQUIRE_EQ(guard.sq_tail, 2u);
+    CHECK_EQ(guard.sq_entries[1].opcode, IORING_OP_ASYNC_CANCEL);
+    CHECK_EQ(guard.sq_entries[1].addr, guard.sq_entries[0].user_data);
+
+    IoEvent target = tls_send_event(conn.id, -ECANCELED, raw_generation);
+    IoEvent cancel = tls_send_event(conn.id, -ENOENT, raw_generation | kNonUpstreamSendCancelBit);
+    loop.dispatch(target);
+    CHECK_EQ(loop.conns[0].pending_ops, 1u);
+    CHECK_EQ(loop.free_top, 0u);
+    loop.dispatch(cancel);
+    CHECK_EQ(loop.conns[0].pending_ops, 0u);
+    CHECK_EQ(loop.pending_free_count, 0u);
+    CHECK_EQ(loop.free_top, 1u);
 }
 
 TEST(tls_engine, accessor_helpers_track_ciphertext_offsets) {
@@ -6546,153 +7046,212 @@ TEST(tls_iouring, current_token_bad_raw_identity_fails_closed_before_logical_com
     }
 }
 
-TEST(tls_iouring, partial_ciphertext_send_then_error_never_completes_logical_owner) {
+TEST(tls_iouring, partial_ciphertext_send_then_error_closes_raw_and_logical_owner_once) {
     for (const i32 error : {-EPIPE, -ECONNRESET}) {
-        ScopedTlsRawSendLoop guard;
-        REQUIRE(guard.init());
-        IoUringEventLoop& loop = *guard.loop;
-        Connection& conn = loop.conns[0];
-        u8 tls_out_storage[16];
-        static constexpr u8 kCiphertext[] = {0x17, 0x03, 0x03, 0x00, 0x01, 0xA5, 0x5A};
-        static constexpr u8 kPlaintext[] = "logical-response";
-        conn.reset();
-        conn.id = 0;
-        conn.fd = dup(STDERR_FILENO);
-        REQUIRE_GE(conn.fd, 0);
-        loop.free_top = 0;
-        conn.tls_out_buf.bind(tls_out_storage, sizeof(tls_out_storage));
-        REQUIRE_EQ(conn.tls_out_buf.write(kCiphertext, sizeof(kCiphertext)), sizeof(kCiphertext));
-        const u32 raw_generation = stage_tls_raw_send_target(
-            loop, conn, conn.tls_out_buf.data(), sizeof(kCiphertext), false);
-        REQUIRE_NE(raw_generation, 0u);
-        u32 logical_generation = 0;
-        REQUIRE(conn.next_non_upstream_send_generation(logical_generation));
-        conn.tls_send_owner_generation = logical_generation;
-        conn.tls_send_owner_fd = conn.fd;
-        conn.tls_send_owner_handler_generation = conn.handler_gen;
-        conn.tls_send_src = kPlaintext;
-        conn.tls_send_len = sizeof(kPlaintext) - 1u;
-        conn.tls_send_off = conn.tls_send_len;
-        conn.tls_pending_on_send = &tls_pending_send_probe;
-        g_tls_pending_send_called = false;
+        for (const bool strict_owner : {false, true}) {
+            ScopedTlsRawSendLoop guard;
+            REQUIRE(guard.init());
+            IoUringEventLoop& loop = *guard.loop;
+            Connection& conn = loop.conns[0];
+            u8 tls_out_storage[16];
+            static constexpr u8 kCiphertext[] = {0x17, 0x03, 0x03, 0x00, 0x01, 0xA5, 0x5A};
+            static constexpr u8 kPlaintext[] = "logical-response";
+            conn.reset();
+            conn.id = 0;
+            conn.fd = dup(STDERR_FILENO);
+            REQUIRE_GE(conn.fd, 0);
+            loop.free_top = 0;
+            u8 response_storage[128]{};
+            u8 upstream_storage[128]{};
+            StrictTlsResponseFrame frame{};
+            if (strict_owner) {
+                frame = stage_strict_tls_response_frame(conn,
+                                                        ResponseReadDeadlineSendKind::Body,
+                                                        response_storage,
+                                                        sizeof(response_storage),
+                                                        upstream_storage,
+                                                        sizeof(upstream_storage));
+                conn.tls_handshake_complete = true;
+            }
+            conn.tls_out_buf.bind(tls_out_storage, sizeof(tls_out_storage));
+            REQUIRE_EQ(conn.tls_out_buf.write(kCiphertext, sizeof(kCiphertext)),
+                       sizeof(kCiphertext));
+            const u32 raw_generation = stage_tls_raw_send_target(
+                loop, conn, conn.tls_out_buf.data(), sizeof(kCiphertext), false);
+            REQUIRE_NE(raw_generation, 0u);
+            u32 logical_generation = 0;
+            REQUIRE(conn.next_non_upstream_send_generation(logical_generation));
+            if (strict_owner) {
+                stage_strict_tls_send_owner(
+                    conn, frame, ResponseReadDeadlineSendKind::Body, logical_generation);
+                conn.tls_send_src = frame.src;
+                conn.tls_send_len = frame.len;
+                conn.tls_send_off = conn.tls_send_len;
+                conn.tls_pending_on_send = frame.callback;
+                CHECK_NE(logical_generation, raw_generation);
+            } else {
+                conn.tls_send_src = kPlaintext;
+                conn.tls_send_len = sizeof(kPlaintext) - 1u;
+                conn.tls_send_off = conn.tls_send_len;
+                conn.tls_pending_on_send = &tls_pending_send_probe;
+            }
+            conn.tls_send_owner_generation = logical_generation;
+            conn.tls_send_owner_fd = conn.fd;
+            conn.tls_send_owner_handler_generation = conn.handler_gen;
+            conn.on_send = &tls_on_out_drain<IoUringEventLoop>;
+            g_tls_pending_send_called = false;
 
-        // stage_tls_raw_send_target models the already-submitted first SQE;
-        // the userspace ring below supplies the actual backend.wait proactor.
-        guard.sq_tail = 1;
-        loop.backend.pending = 1;
-        guard.sq_head = guard.sq_tail;
-        loop.backend.pending = 0;
-        REQUIRE(guard.push_send_cqe(raw_generation, 3));
-        IoEvent partial{};
-        CHECK_EQ(loop.backend.wait(&partial, 1, loop.conns, 1), 0u);
-        CHECK_EQ(loop.backend.send_state[0].offset, 3u);
-        CHECK_EQ(loop.backend.send_state[0].remaining, sizeof(kCiphertext) - 3u);
-        CHECK_EQ(guard.sq_tail, 2u);  // backend submitted precisely the remaining suffix
-        CHECK_EQ(conn.pending_ops, 1u);
-        CHECK(conn.send_armed);
+            // stage_tls_raw_send_target models the already-submitted first SQE;
+            // the userspace ring below supplies the actual backend.wait proactor.
+            guard.sq_tail = 1;
+            loop.backend.pending = 1;
+            guard.sq_head = guard.sq_tail;
+            loop.backend.pending = 0;
+            REQUIRE(guard.push_send_cqe(raw_generation, 3));
+            IoEvent partial{};
+            CHECK_EQ(loop.backend.wait(&partial, 1, loop.conns, 1), 0u);
+            CHECK_EQ(loop.backend.send_state[0].offset, 3u);
+            CHECK_EQ(loop.backend.send_state[0].remaining, sizeof(kCiphertext) - 3u);
+            CHECK_EQ(guard.sq_tail, 2u);  // backend submitted precisely the remaining suffix
+            CHECK_EQ(conn.pending_ops, 1u);
+            CHECK(conn.send_armed);
+            if (strict_owner) {
+                CHECK(conn.response_read_deadline_send_owner_active);
+                CHECK_EQ(conn.response_read_deadline_send_owner_generation, logical_generation);
+            }
 
-        guard.sq_head = guard.sq_tail;
-        loop.backend.pending = 0;
-        REQUIRE(guard.push_send_cqe(raw_generation, error));
-        IoEvent failed{};
-        REQUIRE_EQ(loop.backend.wait(&failed, 1, loop.conns, 1), 1u);
-        CHECK_EQ(failed.result, error);
-        CHECK_EQ(failed.non_upstream_generation, raw_generation);
-        loop.dispatch(failed);
+            guard.sq_head = guard.sq_tail;
+            loop.backend.pending = 0;
+            REQUIRE(guard.push_send_cqe(raw_generation, error));
+            IoEvent failed{};
+            REQUIRE_EQ(loop.backend.wait(&failed, 1, loop.conns, 1), 1u);
+            CHECK_EQ(failed.result, error);
+            CHECK_EQ(failed.non_upstream_generation, raw_generation);
+            loop.dispatch(failed);
 
-        CHECK_FALSE(g_tls_pending_send_called);
-        CHECK_EQ(loop.conns[0].fd, -1);
-        CHECK_EQ(loop.conns[0].pending_ops, 0u);
-        CHECK(loop.conns[0].tls_raw_send_owner_is_neutral());
-        CHECK(loop.conns[0].tls_single_shot_send_owner_is_neutral());
-        CHECK_EQ(loop.backend.send_state[0].remaining, 0u);
-        CHECK_EQ(loop.free_top, 1u);
+            if (!strict_owner) CHECK_FALSE(g_tls_pending_send_called);
+            CHECK_EQ(loop.conns[0].fd, -1);
+            CHECK_EQ(loop.conns[0].pending_ops, 0u);
+            CHECK(loop.conns[0].tls_raw_send_owner_is_neutral());
+            CHECK(loop.conns[0].tls_single_shot_send_owner_is_neutral());
+            CHECK_EQ(loop.conns[0].response_read_deadline_send_close_generation, 0u);
+            CHECK_EQ(loop.backend.send_state[0].remaining, 0u);
+            CHECK_EQ(loop.free_top, 1u);
+        }
     }
 }
 
 TEST(tls_iouring, f_more_transfers_raw_generation_to_close_ledger_in_either_drain_order) {
-    for (const bool cancel_first : {false, true}) {
-        ScopedTlsRawSendLoop guard;
-        REQUIRE(guard.init());
-        ScopedTlsOutMmap tls_out_mapping;
-        REQUIRE(tls_out_mapping.init());
-        IoUringEventLoop& loop = *guard.loop;
-        Connection& conn = loop.conns[0];
-        static constexpr u8 kCiphertext[] = {0x17, 0x03, 0x03, 0x00, 0x01};
-        conn.reset();
-        conn.id = 0;
-        conn.fd = dup(STDERR_FILENO);
-        REQUIRE_GE(conn.fd, 0);
-        loop.free_top = 0;
-        conn.tls_out_slice = tls_out_mapping.data;
-        conn.tls_out_buf.bind(tls_out_mapping.data, IoUringEventLoop::kTlsOutBufCap);
-        REQUIRE_EQ(conn.tls_out_buf.write(kCiphertext, sizeof(kCiphertext)), sizeof(kCiphertext));
-        const u8* const owned_ciphertext = conn.tls_out_slice;
-        const u32 raw_generation = stage_tls_raw_send_target(
-            loop, conn, conn.tls_out_buf.data(), sizeof(kCiphertext), false);
-        REQUIRE_NE(raw_generation, 0u);
-        static constexpr u8 kLogicalPlaintext[] = "logical-owner";
-        u32 logical_generation = 0;
-        REQUIRE(conn.next_non_upstream_send_generation(logical_generation));
-        REQUIRE_NE(logical_generation, raw_generation);
-        conn.tls_send_owner_generation = logical_generation;
-        conn.tls_send_owner_fd = conn.fd;
-        conn.tls_send_owner_handler_generation = conn.handler_gen;
-        conn.tls_send_src = kLogicalPlaintext;
-        conn.tls_send_len = sizeof(kLogicalPlaintext) - 1u;
-        conn.tls_send_off = conn.tls_send_len;
-        conn.tls_pending_on_send = &tls_pending_send_probe;
-        guard.sq_entries[0].opcode = IORING_OP_SEND;
-        guard.sq_entries[0].fd = conn.fd;
-        guard.sq_entries[0].user_data =
-            IoUringBackend::encode_user_data(conn.id, IoEventType::Send, raw_generation);
-        guard.sq_tail = 1;
-        loop.backend.pending = 1;
+    for (const bool strict_owner : {false, true}) {
+        for (const bool cancel_first : {false, true}) {
+            ScopedTlsRawSendLoop guard;
+            REQUIRE(guard.init());
+            ScopedTlsOutMmap tls_out_mapping;
+            REQUIRE(tls_out_mapping.init());
+            IoUringEventLoop& loop = *guard.loop;
+            Connection& conn = loop.conns[0];
+            static constexpr u8 kCiphertext[] = {0x17, 0x03, 0x03, 0x00, 0x01};
+            conn.reset();
+            conn.id = 0;
+            conn.fd = dup(STDERR_FILENO);
+            REQUIRE_GE(conn.fd, 0);
+            loop.free_top = 0;
+            conn.tls_out_slice = tls_out_mapping.data;
+            conn.tls_out_buf.bind(tls_out_mapping.data, IoUringEventLoop::kTlsOutBufCap);
+            REQUIRE_EQ(conn.tls_out_buf.write(kCiphertext, sizeof(kCiphertext)),
+                       sizeof(kCiphertext));
+            const u8* const owned_ciphertext = conn.tls_out_slice;
+            u8 response_storage[128]{};
+            u8 upstream_storage[128]{};
+            StrictTlsResponseFrame frame{};
+            if (strict_owner) {
+                frame = stage_strict_tls_response_frame(conn,
+                                                        ResponseReadDeadlineSendKind::Body,
+                                                        response_storage,
+                                                        sizeof(response_storage),
+                                                        upstream_storage,
+                                                        sizeof(upstream_storage));
+                conn.tls_handshake_complete = true;
+            }
+            const u32 raw_generation = stage_tls_raw_send_target(
+                loop, conn, conn.tls_out_buf.data(), sizeof(kCiphertext), false);
+            REQUIRE_NE(raw_generation, 0u);
+            u32 logical_generation = 0;
+            REQUIRE(conn.next_non_upstream_send_generation(logical_generation));
+            REQUIRE_NE(logical_generation, raw_generation);
+            if (strict_owner) {
+                stage_strict_tls_send_owner(
+                    conn, frame, ResponseReadDeadlineSendKind::Body, logical_generation);
+                conn.tls_pending_on_send = frame.callback;
+                conn.tls_send_src = frame.src;
+                conn.tls_send_len = frame.len;
+            } else {
+                conn.tls_pending_on_send = &tls_pending_send_probe;
+                conn.tls_send_src = reinterpret_cast<const u8*>("logical-owner");
+                conn.tls_send_len = 13;
+            }
+            conn.tls_send_owner_generation = logical_generation;
+            conn.tls_send_owner_fd = conn.fd;
+            conn.tls_send_owner_handler_generation = conn.handler_gen;
+            conn.tls_send_off = conn.tls_send_len;
+            conn.on_send = &tls_on_out_drain<IoUringEventLoop>;
+            if (strict_owner) {
+                REQUIRE(conn.response_read_deadline_send_owner_active);
+                CHECK_EQ(conn.response_read_deadline_send_owner_generation, logical_generation);
+            }
+            guard.sq_entries[0].opcode = IORING_OP_SEND;
+            guard.sq_entries[0].fd = conn.fd;
+            guard.sq_entries[0].user_data =
+                IoUringBackend::encode_user_data(conn.id, IoEventType::Send, raw_generation);
+            guard.sq_tail = 1;
+            loop.backend.pending = 1;
 
-        IoEvent more = tls_send_event(conn.id, sizeof(kCiphertext), raw_generation);
-        more.more = 1;
-        loop.dispatch(more);
+            IoEvent more = tls_send_event(conn.id, sizeof(kCiphertext), raw_generation);
+            more.more = 1;
+            loop.dispatch(more);
 
-        Connection& closed = loop.conns[0];
-        REQUIRE_EQ(closed.fd, -1);
-        REQUIRE_EQ(closed.pending_ops, 2u);  // target plus its close cancellation
-        CHECK_EQ(closed.tls_out_slice, owned_ciphertext);
-        CHECK_EQ(owned_ciphertext[0], kCiphertext[0]);
-        REQUIRE_EQ(closed.response_read_deadline_send_close_generation, raw_generation);
-        REQUIRE(closed.response_read_deadline_send_close_target_owned);
-        REQUIRE(closed.response_read_deadline_send_close_cancel_owned);
-        CHECK_EQ(loop.free_top, 0u);
-        CHECK_EQ(loop.pending_free_count, 1u);
-        REQUIRE_EQ(guard.sq_tail, 2u);
-        const io_uring_sqe& cancel_sqe = guard.sq_entries[1];
-        CHECK_EQ(cancel_sqe.opcode, IORING_OP_ASYNC_CANCEL);
-        CHECK_EQ(cancel_sqe.addr, guard.sq_entries[0].user_data);
-        u32 cancel_id = UINT32_MAX;
-        u32 cancel_aux = 0;
-        IoEventType cancel_type = IoEventType::Count;
-        IoUringBackend::decode_user_data(cancel_sqe.user_data, cancel_id, cancel_type, cancel_aux);
-        CHECK_EQ(cancel_id, conn.id);
-        CHECK_EQ(cancel_type, IoEventType::Send);
-        CHECK_EQ(cancel_aux, raw_generation | kNonUpstreamSendCancelBit);
+            Connection& closed = loop.conns[0];
+            REQUIRE_EQ(closed.fd, -1);
+            REQUIRE_EQ(closed.pending_ops, 2u);  // target plus its close cancellation
+            CHECK_EQ(closed.tls_out_slice, owned_ciphertext);
+            CHECK_EQ(owned_ciphertext[0], kCiphertext[0]);
+            REQUIRE_EQ(closed.response_read_deadline_send_close_generation, raw_generation);
+            REQUIRE(closed.response_read_deadline_send_close_target_owned);
+            REQUIRE(closed.response_read_deadline_send_close_cancel_owned);
+            CHECK_EQ(loop.free_top, 0u);
+            CHECK_EQ(loop.pending_free_count, 1u);
+            REQUIRE_EQ(guard.sq_tail, 2u);
+            const io_uring_sqe& cancel_sqe = guard.sq_entries[1];
+            CHECK_EQ(cancel_sqe.opcode, IORING_OP_ASYNC_CANCEL);
+            CHECK_EQ(cancel_sqe.addr, guard.sq_entries[0].user_data);
+            u32 cancel_id = UINT32_MAX;
+            u32 cancel_aux = 0;
+            IoEventType cancel_type = IoEventType::Count;
+            IoUringBackend::decode_user_data(
+                cancel_sqe.user_data, cancel_id, cancel_type, cancel_aux);
+            CHECK_EQ(cancel_id, conn.id);
+            CHECK_EQ(cancel_type, IoEventType::Send);
+            CHECK_EQ(cancel_aux, raw_generation | kNonUpstreamSendCancelBit);
 
-        IoEvent target = tls_send_event(conn.id, -ECANCELED, raw_generation);
-        IoEvent cancel =
-            tls_send_event(conn.id, -ENOENT, raw_generation | kNonUpstreamSendCancelBit);
-        loop.dispatch(cancel_first ? cancel : target);
-        CHECK_EQ(loop.conns[0].pending_ops, 1u);
-        CHECK_EQ(loop.free_top, 0u);
-        CHECK_EQ(closed.tls_out_slice, owned_ciphertext);
-        CHECK_EQ(owned_ciphertext[0], kCiphertext[0]);
-        loop.dispatch(cancel_first ? target : cancel);
-        CHECK_EQ(loop.conns[0].pending_ops, 0u);
-        CHECK_EQ(loop.pending_free_count, 0u);
-        CHECK_EQ(loop.free_top, 1u);
-        const bool slice_released = closed.tls_out_slice == nullptr;
-        tls_out_mapping.relinquish();  // reclaim_slot already munmapped the owned slice
-        CHECK(slice_released);
-        const u32 free_after_drain = loop.free_top;
-        loop.dispatch(cancel_first ? cancel : target);  // duplicate final owns nothing
-        CHECK_EQ(loop.free_top, free_after_drain);
+            IoEvent target = tls_send_event(conn.id, -ECANCELED, raw_generation);
+            IoEvent cancel =
+                tls_send_event(conn.id, -ENOENT, raw_generation | kNonUpstreamSendCancelBit);
+            loop.dispatch(cancel_first ? cancel : target);
+            CHECK_EQ(loop.conns[0].pending_ops, 1u);
+            CHECK_EQ(loop.free_top, 0u);
+            CHECK_EQ(closed.tls_out_slice, owned_ciphertext);
+            CHECK_EQ(owned_ciphertext[0], kCiphertext[0]);
+            loop.dispatch(cancel_first ? target : cancel);
+            CHECK_EQ(loop.conns[0].pending_ops, 0u);
+            CHECK_EQ(loop.pending_free_count, 0u);
+            CHECK_EQ(loop.free_top, 1u);
+            const bool slice_released = closed.tls_out_slice == nullptr;
+            tls_out_mapping.relinquish();  // reclaim_slot already munmapped the owned slice
+            CHECK(slice_released);
+            const u32 free_after_drain = loop.free_top;
+            loop.dispatch(cancel_first ? cancel : target);  // duplicate final owns nothing
+            CHECK_EQ(loop.free_top, free_after_drain);
+        }
     }
 }
 
