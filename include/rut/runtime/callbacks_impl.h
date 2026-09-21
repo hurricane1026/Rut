@@ -6966,7 +6966,7 @@ void pump_response_read_deadline_body(Loop* loop, Connection& conn) {
             // A default-persistent request reached a verified truncated
             // response terminal.  The transaction is complete, but the
             // connection is not reusable and must not dispatch a successor.
-            loop->close_conn(conn);
+            close_conn_after_complete_response(loop, conn);
             return;
         }
         if (received == conn.response_read_deadline_post_commit_declared_body) {

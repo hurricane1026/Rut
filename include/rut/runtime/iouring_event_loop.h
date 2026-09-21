@@ -2340,6 +2340,7 @@ public:
                     c.http1_boundary_deferred = false;
                     c.http1_boundary_successor_episode = 0;
                     c.http1_prebuilt_wait = 0;
+                    end_stream_before_close(c);  // completed response
                     close_conn(c);
                     continue;
                 }
@@ -2379,11 +2380,9 @@ public:
                     c.http1_prebuilt_deadline_upload,
                     ForwardResponseBufferingMode::CompleteContentLength,
                     ResponseReadDeadlineProfile::BodylessNonHeadContentLengthZero);
-            if (c.http1_prebuilt_deadline_upload.downstream_close && !explicit_close) {
-                close_conn(c);
-                continue;
-            }
-            if (explicit_close) {
+            // Both branches close after a completed response.
+            if (c.http1_prebuilt_deadline_upload.downstream_close || explicit_close) {
+                end_stream_before_close(c);
                 close_conn(c);
                 continue;
             }
