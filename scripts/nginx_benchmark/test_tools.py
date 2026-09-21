@@ -342,6 +342,106 @@ class ToolsTest(unittest.TestCase):
             request_bytes("proxy", True, "explicit"),
         )
 
+    def test_first_engine_option_and_alternating_repeat_order(self):
+        parser = run.argparse.ArgumentParser()
+        run.add_first_engine_argument(parser)
+        self.assertEqual(parser.parse_args([]).first_engine, "nginx")
+        self.assertEqual(parser.parse_args(["--first-engine", "rut"]).first_engine, "rut")
+        with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
+            parser.parse_args(["--first-engine", "other"])
+
+    def test_benchmark_engine_start_order_matches_recorded_metadata(self):
+        with tempfile.TemporaryDirectory() as directory:
+            for first_engine in ("nginx", "rut"):
+                out = Path(directory) / first_engine
+                out.mkdir()
+                tools = {}
+                for name in ("rut", "converter", "wrk"):
+                    path = out / name
+                    path.write_text("mock executable\n")
+                    path.chmod(0o755)
+                    tools[name] = path
+                args = SimpleNamespace(
+                    output=out,
+                    rut=tools["rut"],
+                    converter=tools["converter"],
+                    wrk=tools["wrk"],
+                    tls_cert=None,
+                    tls_key=None,
+                    body_size=None,
+                    mode="benchmark",
+                    server_cpu=2,
+                    origin_cpu=3,
+                    client_cpus="4,5",
+                    keepalive_header="implicit",
+                    front_port=8087,
+                    origin_port=9087,
+                    concurrency=[1],
+                    duration=1,
+                    warmup=1,
+                    repeats=4,
+                    first_engine=first_engine,
+                    scenarios=["proxy-close"],
+                )
+                harness = Harness(args)
+
+                def fake_command(argv, timeout=20):
+                    if argv == ["docker", "context", "inspect"]:
+                        stdout = '[{"Endpoints":{"docker":{"Host":"unix:///mock.sock"}}}]'
+                    elif argv[:2] == ["docker", "info"]:
+                        stdout = "mock docker"
+                    elif argv[:3] == ["docker", "image", "inspect"]:
+                        stdout = '[{"Id":"mock-image"}]'
+                    elif argv[0] == "git":
+                        stdout = "" if "status" in argv else "mock-head"
+                    elif argv == ["lscpu"]:
+                        stdout = "mock cpu topology"
+                    elif str(argv[0]) == str(tools["converter"]):
+                        stdout = f"listen 127.0.0.1:{args.front_port}\nmock config\n"
+                    else:
+                        raise AssertionError(f"unexpected external command: {argv!r}")
+                    return subprocess.CompletedProcess(argv, 0, stdout, "")
+
+                with mock.patch.object(harness, "command", side_effect=fake_command):
+                    harness.prepare()
+                metadata = json.loads((out / "environment.json").read_text())
+
+                started = []
+
+                @contextlib.contextmanager
+                def mock_frontend(engine, _work, _label):
+                    started.append(engine)
+                    yield 123
+
+                harness.frontend = mock_frontend
+                harness.validate = lambda *_args: None
+                sample = {
+                    "requests": 1,
+                    "seconds": 1.0,
+                    "rps": 1.0,
+                    "p50_us": 1.0,
+                    "p95_us": 1.0,
+                    "p99_us": 1.0,
+                    "errors": dict.fromkeys(run.ERROR_NAMES, 0),
+                    "client_cpu_seconds": 0.0,
+                }
+                harness.wrk = lambda *_args: dict(sample)
+                with mock.patch.object(run, "proc_usage", return_value=(0.0, 0)), \
+                        contextlib.redirect_stdout(io.StringIO()):
+                    self.assertTrue(harness.benchmark(456))
+
+                metadata_order = metadata["engine_order_by_scenario_and_repeat"]
+                self.assertEqual([entry["repeat"] for entry in metadata_order], [1, 2, 3, 4])
+                self.assertEqual({entry["scenario"] for entry in metadata_order}, {"proxy-close"})
+                expected = (
+                    ["nginx", "rut", "rut", "nginx", "nginx", "rut", "rut", "nginx"]
+                    if first_engine == "nginx"
+                    else ["rut", "nginx", "nginx", "rut", "rut", "nginx", "nginx", "rut"]
+                )
+                self.assertEqual(started, expected)
+                self.assertEqual(started, [engine for entry in metadata_order
+                                           for engine in entry["engines"]])
+
     def test_fragmented_body_and_normal_close(self):
         sock = FakeSocket(
             [

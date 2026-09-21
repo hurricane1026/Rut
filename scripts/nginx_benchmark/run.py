@@ -26,6 +26,20 @@ ERROR_NAMES = ("connect", "read", "write", "status", "timeout")
 STATIC_BODY_LIMIT = 4093
 
 
+def engine_order(first_engine, repeat):
+    other_engine = "rut" if first_engine == "nginx" else "nginx"
+    return (first_engine, other_engine) if repeat % 2 else (other_engine, first_engine)
+
+
+def add_first_engine_argument(parser):
+    parser.add_argument(
+        "--first-engine",
+        choices=("nginx", "rut"),
+        default="nginx",
+        help="first engine in odd-numbered repeats; even repeats alternate",
+    )
+
+
 def save_json(path, value):
     temporary = path.with_suffix(".tmp")
     temporary.write_text(json.dumps(value, indent=2) + "\n")
@@ -162,6 +176,7 @@ class Harness:
 
     def prepare(self):
         a = self.args
+        first_engine = getattr(a, "first_engine", "nginx")
         body_size = getattr(a, "body_size", None)
         if (body_size is not None and body_size > STATIC_BODY_LIMIT
                 and any(scenario.startswith("static-") for scenario in a.scenarios)):
@@ -193,6 +208,12 @@ class Harness:
             "arguments": {
                 k: str(v) if isinstance(v, Path) else v for k, v in vars(a).items()
             },
+            "engine_order_by_scenario_and_repeat": [
+                {"scenario": scenario, "repeat": rep,
+                 "engines": list(engine_order(first_engine, rep))}
+                for scenario in a.scenarios
+                for rep in range(1, a.repeats + 1)
+            ] if a.mode == "benchmark" else [],
             "binaries_sha256": {str(p): sha256(p) for p in (a.rut, a.converter, a.wrk)},
             "nginx_image": self.image,
             "nginx_image_id": inspection["Id"],
@@ -468,10 +489,11 @@ class Harness:
         }
 
     def benchmark(self, origin_pid):
+        first_engine = getattr(self.args, "first_engine", "nginx")
         for scenario in self.args.scenarios:
             work, mode = scenario.split("-")
             for rep in range(1, self.args.repeats + 1):
-                for engine in ("nginx", "rut") if rep % 2 else ("rut", "nginx"):
+                for engine in engine_order(first_engine, rep):
                     label = f"{scenario}-{engine}-r{rep}"
                     with self.frontend(engine, work, label) as pid:
                         self.validate(work, mode == "keepalive")
@@ -663,6 +685,7 @@ def arguments():
     parser.add_argument("--duration", type=positive, default=8)
     parser.add_argument("--warmup", type=positive, default=2)
     parser.add_argument("--repeats", type=positive, default=3)
+    add_first_engine_argument(parser)
     parser.add_argument(
         "--scenarios", nargs="+", choices=SCENARIOS, default=list(SCENARIOS)
     )
