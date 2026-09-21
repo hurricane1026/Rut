@@ -2761,6 +2761,19 @@ public:
         return false;
     }
 
+    // A request-boundary continuation may install the next HTTP callback after
+    // an earlier TLS recv CQE was deferred behind a raw ciphertext send. The
+    // CQE's bytes are already in tls_in_buf, so there may be no later socket
+    // event to call tls_process. Drive that existing input only when the raw
+    // send no longer owns the TLS output buffer. The caller must return
+    // immediately when this reports true: tls_process can synchronously
+    // dispatch a request or close/reset the connection.
+    bool process_buffered_tls_input(Connection& c) {
+        if (!c.uses_iouring_tls() || c.tls_in_buf.len() == 0 || c.tls_out_inflight) return false;
+        tls_process<Self>(this, c);
+        return true;
+    }
+
     bool tls_ciphertext_send_raw_state_matches(const Connection& c) const {
         if (c.id >= connection_capacity || c.fd < 0 || !c.tls_active || !c.tls_out_inflight ||
             c.tls_out_inflight_len == 0 || c.tls_out_inflight_generation == 0 ||
