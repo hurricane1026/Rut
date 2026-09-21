@@ -49,6 +49,38 @@ shape, which is recorded in `environment.json`. Close cases always send
 `Connection: close`. Passing the implicit profile does **not** establish support
 for explicit keep-alive, nor erase the original failed results.
 
+`--proxy-profile native-streaming` selects the public native Rut DSL for the
+bounded 256 KiB `GET /proxy` keepalive workload. It requires exactly
+`--keepalive-header implicit --scenarios proxy-keepalive`; choose a nonempty
+subset of `--concurrency 1 32` (other levels are rejected);
+HTTP is the default, and the same run can use the existing `--tls-cert` /
+`--tls-key` TLS listener. This profile has no converter strict-response or
+request-deadline policy, so its measurements are recorded separately from the
+default `converter-strict` profile. Both frontends use a 60-second origin idle
+timeout and origin connection reuse; nginx has a 4096-entry idle upstream pool
+and streams responses with buffering disabled. Nginx's 16 KiB response header
+buffer is paired with a 16 KiB busy-buffer limit to satisfy its buffer
+configuration constraints; response buffering remains off and cannot spill to
+temporary files. Rut uses the native
+`upstream` / `forward` DSL and its per-shard 4096-connection idle pool.
+
+The native preflight first delays reading a complete 256 KiB response, then
+reads a successor response on that same downstream socket. It saves the exact
+response bytes and a read timing trace; this checks response integrity across a
+slow reader without claiming to prove an internal high/low water mark. It then
+sends 100 sequential requests on that socket and checks status, one exact
+Content-Length, one `application/octet-stream` Content-Type, keepalive
+semantics, no Transfer-Encoding, and every byte of a deterministic payload with
+distinct blocks. Separate marker values identify the slow-read and 100-request
+stages. The shared origin conditionally logs those markers with `$connection`
+and `$connection_requests`; the runner requires each stage to use one origin
+connection with a continuous request counter and retains the raw log. wrk does
+not send the marker, so the origin performs no access-log writes during
+throughput timing. This validates actual origin reuse instead of inferring it
+from pool settings. Nginx origin, upstream idle pool, and downstream connection
+allow up to 1,000,000,000 requests before recycling; the value is recorded in
+`environment.json`.
+
 Use `--duration 1 --warmup 1 --repeats 1 --concurrency 1 32` for a smoke test.
 Select cases with `--scenarios static-close proxy-keepalive`. Ports default to
 8087/9087; `--front-port` and `--origin-port` accept distinct free unprivileged
