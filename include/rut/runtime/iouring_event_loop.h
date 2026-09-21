@@ -3064,14 +3064,15 @@ public:
                !c.epoch_held && ordinary_response_owner && c.on_upstream_send == nullptr &&
                !c.upstream_connect_armed && !c.upstream_send_armed &&
                valid_upstream_episode(c.upstream_episode) && !c.upstream_episode_quarantined &&
-               c.upstream_attempts == 1 && c.request_upload_complete &&
-               !c.upstream_request_incomplete && c.req_body_mode == BodyMode::None &&
-               c.req_body_remaining == 0 && !c.req_client_has_content_length &&
-               !c.req_client_has_transfer_encoding && !c.req_client_has_te &&
-               !c.req_client_has_expect && !c.req_client_has_upgrade_header &&
-               !c.req_wants_upgrade && !c.req_malformed && !c.request_policy_body_pending &&
-               !c.request_body_fully_buffered && !c.req_body_streamed && !c.is_health_probe &&
-               !c.h2_proxy_recv_draining &&
+               c.upstream_attempts != 0 &&
+               (c.response_policy_id == 0 || c.upstream_attempts == 1) &&
+               c.request_upload_complete && !c.upstream_request_incomplete &&
+               c.req_body_mode == BodyMode::None && c.req_body_remaining == 0 &&
+               !c.req_client_has_content_length && !c.req_client_has_transfer_encoding &&
+               !c.req_client_has_te && !c.req_client_has_expect &&
+               !c.req_client_has_upgrade_header && !c.req_wants_upgrade && !c.req_malformed &&
+               !c.request_policy_body_pending && !c.request_body_fully_buffered &&
+               !c.req_body_streamed && !c.is_health_probe && !c.h2_proxy_recv_draining &&
                !c.h2_proxy_synth_quarantined && !c.is_ws_tunnel && !c.is_ws_terminate_route &&
                !c.is_ws_terminate && !c.ws_closing && c.response_read_deadline_owner_is_neutral() &&
                !c.upstream_abandoned && !c.upstream_recv_armed &&

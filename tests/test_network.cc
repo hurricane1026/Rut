@@ -30088,6 +30088,13 @@ TEST(iouring_upstream_recv, one_shot_selector_is_narrow_and_episode_stable) {
     };
     conn->tls_active = false;
     CHECK(loop->use_one_shot_upstream_recv(*conn));
+    conn->upstream_attempts = 2;
+    CHECK(loop->use_one_shot_upstream_recv(*conn));
+    conn->upstream_attempts = 3;
+    CHECK(loop->use_one_shot_upstream_recv(*conn));
+    conn->upstream_attempts = 0;
+    CHECK_FALSE(loop->use_one_shot_upstream_recv(*conn));
+    conn->upstream_attempts = 1;
     conn->response_policy_id = 1;
     CHECK_FALSE(loop->use_one_shot_upstream_recv(*conn));
     conn->response_policy_id = 0;
@@ -30126,9 +30133,29 @@ TEST(iouring_upstream_recv, one_shot_selector_is_narrow_and_episode_stable) {
                    [&] { conn->upstream_recv_idle_stale_bytes = false; });
     rejected_while([&] { conn->upstream_recv_pause_rearm_pending = true; },
                    [&] { conn->upstream_recv_pause_rearm_pending = false; });
-    // Attempts can change only when a retry selects a new upstream episode;
-    // an existing selected episode remains one-shot across response progress.
-    rejected_while([&] { conn->upstream_attempts = 2; }, [&] { conn->upstream_attempts = 1; });
+    // Native retries keep the bounded one-shot primitive across response
+    // progress; an uninitialized attempt count remains excluded.
+    conn->upstream_attempts = 2;
+    CHECK(loop->use_one_shot_upstream_recv(*conn));
+    conn->upstream_attempts = 3;
+    CHECK(loop->use_one_shot_upstream_recv(*conn));
+    conn->upstream_attempts = 0;
+    CHECK_FALSE(loop->use_one_shot_upstream_recv(*conn));
+    conn->upstream_attempts = 1;
+    conn->response_policy_id = 1;
+    CHECK(loop->use_one_shot_upstream_recv(*conn));
+    conn->upstream_attempts = 2;
+    CHECK_FALSE(loop->use_one_shot_upstream_recv(*conn));
+    conn->upstream_attempts = 3;
+    CHECK_FALSE(loop->use_one_shot_upstream_recv(*conn));
+    conn->response_policy_id = 0;
+    conn->upstream_attempts = 2;
+    conn->on_upstream_recv = &on_response_body_recvd<IoUringEventLoop>;
+    conn->state = ConnState::Sending;
+    CHECK(loop->use_one_shot_upstream_recv(*conn));
+    conn->on_upstream_recv = &on_upstream_response<IoUringEventLoop>;
+    conn->state = ConnState::Proxying;
+    conn->upstream_attempts = 1;
     rejected_while([&] { conn->on_upstream_recv = &test_sentinel_callback<IoUringEventLoop>; },
                    [&] { conn->on_upstream_recv = &on_upstream_response<IoUringEventLoop>; });
 
@@ -30141,6 +30168,7 @@ TEST(iouring_upstream_recv, one_shot_selector_is_narrow_and_episode_stable) {
     CHECK(loop->use_one_shot_upstream_recv(*conn));
 
     resources.snapshot_ring();
+    conn->upstream_attempts = 2;
     const u32 tail_before = resources.sq_tail_before;
     REQUIRE(loop->submit_recv_upstream(*conn));
     CHECK(conn->upstream_recv_armed);
@@ -30260,8 +30288,8 @@ TEST(iouring_upstream_recv, pipeline_state_keeps_one_shot_for_tls_and_plaintext)
         OneShotRecvFixture fixture;
         REQUIRE(fixture.stage(loop, plaintext));
         Connection& conn = *fixture.conn;
-        for (const auto callback : {&on_upstream_response<IoUringEventLoop>,
-                                    &on_response_body_recvd<IoUringEventLoop>}) {
+        for (const auto callback :
+             {&on_upstream_response<IoUringEventLoop>, &on_response_body_recvd<IoUringEventLoop>}) {
             conn.on_upstream_recv = callback;
             conn.state = callback == &on_response_body_recvd<IoUringEventLoop>
                              ? ConnState::Sending
@@ -30308,20 +30336,18 @@ TEST(iouring_upstream_response, native_client_close_marks_downstream_before_body
         const u32 header_len = sizeof(kHeader) - 1u;
         REQUIRE_EQ(conn.upstream_recv_buf.write(kHeader, header_len), header_len);
         if (!streaming)
-            REQUIRE_EQ(conn.upstream_recv_buf.write(kBody, sizeof(kBody) - 1u),
-                       sizeof(kBody) - 1u);
+            REQUIRE_EQ(conn.upstream_recv_buf.write(kBody, sizeof(kBody) - 1u), sizeof(kBody) - 1u);
         const u32 response_len = conn.upstream_recv_buf.len();
-        on_upstream_response<IoUringEventLoop>(
-            loop,
-            conn,
-            {conn.id,
-             static_cast<i32>(response_len),
-             0,
-             0,
-             IoEventType::UpstreamRecv,
-             0,
-             0,
-             conn.upstream_episode});
+        on_upstream_response<IoUringEventLoop>(loop,
+                                               conn,
+                                               {conn.id,
+                                                static_cast<i32>(response_len),
+                                                0,
+                                                0,
+                                                IoEventType::UpstreamRecv,
+                                                0,
+                                                0,
+                                                conn.upstream_episode});
         CHECK_FALSE(conn.keep_alive);
         CHECK_EQ(conn.resp_body_mode, BodyMode::ContentLength);
         CHECK_EQ(conn.resp_body_remaining, streaming ? 4u : 0u);
@@ -30339,17 +30365,16 @@ TEST(iouring_upstream_response, native_client_close_marks_downstream_before_body
         "HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: keep-alive\r\n\r\n";
     REQUIRE_EQ(conn.upstream_recv_buf.write(kNoClose, sizeof(kNoClose) - 1u),
                sizeof(kNoClose) - 1u);
-    on_upstream_response<IoUringEventLoop>(
-        loop,
-        conn,
-        {conn.id,
-         static_cast<i32>(sizeof(kNoClose) - 1u),
-         0,
-         0,
-         IoEventType::UpstreamRecv,
-         0,
-         0,
-         conn.upstream_episode});
+    on_upstream_response<IoUringEventLoop>(loop,
+                                           conn,
+                                           {conn.id,
+                                            static_cast<i32>(sizeof(kNoClose) - 1u),
+                                            0,
+                                            0,
+                                            IoEventType::UpstreamRecv,
+                                            0,
+                                            0,
+                                            conn.upstream_episode});
     CHECK(conn.keep_alive);
     fixture.cleanup();
 }
