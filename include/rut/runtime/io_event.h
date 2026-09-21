@@ -193,7 +193,7 @@ inline constexpr bool valid_response_read_timer_transport_event(const IoEvent& e
            event.more == 0 && event.aux == 0 && event.upstream_episode == 0 &&
            event.copy_witness == IoEventCopyWitness::None && event.copy_deadline_generation == 0 &&
            event.copy_deadline_profile == 0 && event.copy_deadline_method == 0xffu &&
-           event.copy_begin == 0 && event.copy_end == 0;
+           event.copy_begin == 0 && event.copy_end == 0 && event.provided_ring_empty == 0;
 }
 
 inline constexpr bool io_event_is_tagged_stale(const IoEvent& event, u32 current_episode) {

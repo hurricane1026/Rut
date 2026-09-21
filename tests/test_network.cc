@@ -26723,7 +26723,7 @@ static void check_matching_response_read_timer_mutations_do_not_consume(rut::tes
                                                                         Loop& loop,
                                                                         Connection& conn,
                                                                         u32 generation) {
-    IoEvent invalid[13];
+    IoEvent invalid[14];
     for (auto& event : invalid) event = inert_response_read_timer_event(conn.id, generation);
     invalid[0].result = 1;
     invalid[1].result = -EIO;
@@ -26738,6 +26738,7 @@ static void check_matching_response_read_timer_mutations_do_not_consume(rut::tes
     invalid[10].copy_deadline_method = 0;
     invalid[11].copy_begin = 1;
     invalid[12].copy_end = 1;
+    invalid[13].provided_ring_empty = 1;
 
     for (const auto& event : invalid) {
         loop.dispatch(event);
