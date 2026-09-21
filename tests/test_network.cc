@@ -58689,6 +58689,37 @@ TEST(iouring_final_response, closing_local_response_ends_stream_before_completio
     close(sv[1]);
 }
 
+TEST(iouring_final_response, full_submission_queue_writes_nothing_directly) {
+    ScopedIoUringLoopForRetirement guard;
+    if (!guard.init()) SKIP("io_uring unavailable");
+    auto* loop = guard.loop;
+    if (!loop->backend.nop_inject_result) SKIP("IORING_NOP_INJECT_RESULT unsupported");
+    static const char kResponse[] = "HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n";
+    constexpr u32 kLen = sizeof(kResponse) - 1u;
+    Connection* conn = loop->alloc_conn();
+    REQUIRE(conn != nullptr);
+    i32 sv[2] = {-1, -1};
+    REQUIRE_EQ(rut::test::stream_socketpair(sv), 0);
+    conn->fd = sv[0];
+    conn->keep_alive = false;
+    REQUIRE_EQ(conn->send_buf.write(reinterpret_cast<const u8*>(kResponse), kLen), kLen);
+    conn->transition_to_sending(&on_response_sent<IoUringEventLoop>);
+    REQUIRE(loop->final_local_response_send(*conn, conn->send_buf.data(), kLen));
+
+    // No SQE is available for the completion: nothing may reach the wire.
+    const u32 tail = __atomic_load_n(loop->backend.sq_tail, __ATOMIC_ACQUIRE);
+    const u32 head = __atomic_load_n(loop->backend.sq_head, __ATOMIC_ACQUIRE);
+    __atomic_store_n(loop->backend.sq_tail, head + loop->backend.sq_ring_entries, __ATOMIC_RELEASE);
+    CHECK_FALSE(loop->backend.sq_has_room());
+    CHECK_FALSE(loop->submit_send(*conn, conn->send_buf.data(), kLen));
+    u8 probe[8];
+    CHECK_LT(::recv(sv[1], probe, sizeof(probe), MSG_DONTWAIT), 0);
+    CHECK_FALSE(conn->send_armed);
+    __atomic_store_n(loop->backend.sq_tail, tail, __ATOMIC_RELEASE);
+    loop->close_conn(*conn);
+    close(sv[1]);
+}
+
 TEST(iouring_final_response, direct_write_is_limited_to_closing_plaintext_local_responses) {
     ScopedIoUringLoopForRetirement guard;
     if (!guard.init()) SKIP("io_uring unavailable");

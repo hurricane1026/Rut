@@ -30593,6 +30593,7 @@ TEST(route, ordinary_source_local_response_request_persistence_iouring) {
     client.fd = -1;
     shard.drain(1);
     shard.join();
+    settle_stopped_iouring_shard(shard);
 
     REQUIRE_EQ(shard.backend_failure_code(), 0);
     CHECK_FALSE(shard.loop->is_running());
@@ -31118,6 +31119,7 @@ TEST(
     REQUIRE_EQ(accepts_connections, 0);
 
     runner.stop_and_join();
+    settle_stopped_iouring_shard(shard);
     CHECK_EQ(shard.backend_failure_code(), 0);
     CHECK_FALSE(shard.loop->is_running());
     CHECK_EQ(shard.loop->active_count(), 0u);
@@ -31654,6 +31656,7 @@ TEST(route, ordinary_source_validated_failure_late_successor_iouring) {
     client.fd = -1;
     shard.stop();
     runner.join();
+    settle_stopped_iouring_shard(shard);
     REQUIRE(runner.exited.load(std::memory_order_acquire));
 
     CHECK_EQ(shard.backend_failure_code(), 0);
@@ -32307,6 +32310,7 @@ TEST(route, ordinary_source_validated_failure_late_strict_successor_iouring) {
     client.fd = -1;
     shard.stop();
     runner.join();
+    settle_stopped_iouring_shard(shard);
     REQUIRE(runner.exited.load(std::memory_order_acquire));
 
     CHECK_EQ(shard.backend_failure_code(), 0);
@@ -32771,6 +32775,7 @@ TEST(route, ordinary_source_coalesced_strict_get_successor_iouring) {
     client.fd = -1;
     shard.stop();
     runner.join();
+    settle_stopped_iouring_shard(shard);
     REQUIRE(runner.exited.load(std::memory_order_acquire));
     CHECK_EQ(shard.backend_failure_code(), 0);
     CHECK_FALSE(shard.loop->is_running());
@@ -33351,6 +33356,7 @@ TEST(route, ordinary_source_coalesced_exact_strict_get_successor_iouring) {
     client.fd = -1;
     shard.stop();
     runner.join();
+    settle_stopped_iouring_shard(shard);
     REQUIRE(runner.exited.load(std::memory_order_acquire));
     const Connection& final_conn = shard.loop->conns[runner.conn_id];
     const u32 final_upstream_episode = final_conn.upstream_episode;

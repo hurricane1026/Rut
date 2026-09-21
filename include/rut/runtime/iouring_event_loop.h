@@ -2961,7 +2961,9 @@ public:
             c.response_read_deadline_send_kind = kind;
             c.response_read_deadline_send_owner_active = true;
         }
-        if (!deadline_send && final_local_response_send(c, buf, len)) {
+        // The completion SQE is reserved first: once written, the bytes and
+        // FIN cannot be withdrawn, so the send must stay accountable.
+        if (!deadline_send && final_local_response_send(c, buf, len) && backend.sq_has_room()) {
             // The last response on a closing plaintext connection: write it
             // directly and end the stream at once, as nginx does, so the FIN
             // follows the data before the client can close first.

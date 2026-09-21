@@ -219,6 +219,13 @@ struct IoUringBackend {
 #endif
 
     // Same as add_send but encodes UpstreamSend in user_data.
+    // True when get_sqe() can hand out at least one more SQE.
+    bool sq_has_room() const {
+        return __atomic_load_n(sq_tail, __ATOMIC_RELAXED) -
+                   __atomic_load_n(sq_head, __ATOMIC_ACQUIRE) <
+               sq_ring_entries;
+    }
+
     // Complete a downstream send the caller already started with a direct
     // write of `written` bytes: a NOP injecting `len` when all bytes were
     // written, else a Send of the remainder whose completion reports `len`.

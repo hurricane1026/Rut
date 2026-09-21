@@ -7280,7 +7280,7 @@ void proxy_stream_complete(Loop* loop, Connection& conn) {
     // check therefore precedes release_upstream_conn (which would pool a
     // reusable fd). A normal (non-draining) completion still pools as before.
     if (loop->is_draining()) {
-        loop->close_conn(conn);
+        close_conn_after_complete_response(loop, conn);
         return;
     }
 
@@ -11545,7 +11545,7 @@ void on_proxy_response_sent(void* lp, Connection& conn, IoEvent ev) {
     loop->epoch_leave();
 
     if (loop->is_draining()) {
-        loop->close_conn(conn);
+        close_conn_after_complete_response(loop, conn);
         return;
     }
 
