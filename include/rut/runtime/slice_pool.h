@@ -144,8 +144,14 @@ struct SlicePool {
             ++cached_count;
             return;
         }
-        // A failed discard must not expose the previous owner's bytes either.
+        // A discarded slice must not expose the previous owner's bytes either.
+#ifdef __linux__
+        // Private anonymous pages read back zero-filled after MADV_DONTNEED.
         if (madvise(ptr, kSliceSize, MADV_DONTNEED) != 0) __builtin_memset(ptr, 0, kSliceSize);
+#else
+        // Elsewhere (macOS) MADV_DONTNEED may keep the page contents.
+        __builtin_memset(ptr, 0, kSliceSize);
+#endif
         // Insert below the cached suffix in O(1). Pushing discarded slices on
         // top would strand the cache after a burst and keep faulting cold pages.
         const u32 boundary = free_top - cached_count;
