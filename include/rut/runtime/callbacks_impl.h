@@ -7440,7 +7440,7 @@ void on_response_body_sent(void* lp, Connection& conn, IoEvent ev) {
                          conn.upstream_episode};
         on_response_body_recvd<Loop>(lp, conn, synth);
     } else {
-        loop->submit_recv_upstream(conn);
+        if (!loop->submit_recv_upstream(conn)) loop->close_conn(conn);
     }
 }
 

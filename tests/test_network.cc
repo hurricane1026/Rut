@@ -30035,6 +30035,7 @@ TEST(iouring_upstream_recv, one_shot_selector_is_narrow_and_episode_stable) {
     ScopedOneShotSelectorResources resources;
     resources.loop = loop;
     resources.conn = conn;
+    REQUIRE(loop->alloc_upstream_buf(*conn));
 
     RouteConfig pinned;
     pinned.upstream_count = 1;
@@ -30085,7 +30086,14 @@ TEST(iouring_upstream_recv, one_shot_selector_is_narrow_and_episode_stable) {
         restore();
         CHECK(loop->use_one_shot_upstream_recv(*conn));
     };
-    rejected_while([&] { conn->tls_active = false; }, [&] { conn->tls_active = true; });
+    conn->tls_active = false;
+    CHECK(loop->use_one_shot_upstream_recv(*conn));
+    conn->response_policy_id = 1;
+    CHECK_FALSE(loop->use_one_shot_upstream_recv(*conn));
+    conn->response_policy_id = 0;
+    CHECK(loop->use_one_shot_upstream_recv(*conn));
+    conn->tls_active = true;
+    CHECK(loop->use_one_shot_upstream_recv(*conn));
     rejected_while([&] { conn->tls_handshake_complete = false; },
                    [&] { conn->tls_handshake_complete = true; });
     rejected_while([&] { conn->protocol = ConnProtocol::Http2; },
@@ -30178,7 +30186,7 @@ struct OneShotRecvFixture {
 
     ~OneShotRecvFixture() { cleanup(); }
 
-    bool stage(IoUringEventLoop* event_loop) {
+    bool stage(IoUringEventLoop* event_loop, bool plaintext = false) {
         if (event_loop == nullptr || loop != nullptr) return false;
         loop = event_loop;
         sq_tail_before = __atomic_load_n(loop->backend.sq_tail, __ATOMIC_ACQUIRE);
@@ -30193,12 +30201,14 @@ struct OneShotRecvFixture {
         peer_fd = downstream[1];
         conn->upstream_fd = dup(STDERR_FILENO);
         if (conn->upstream_fd < 0) return false;
-        ssl_ctx = SSL_CTX_new(TLS_server_method());
-        if (ssl_ctx == nullptr) return false;
-        conn->tls_engine.ssl = SSL_new(ssl_ctx);
-        if (conn->tls_engine.ssl == nullptr) return false;
-        conn->tls_active = true;
-        conn->tls_handshake_complete = true;
+        if (!plaintext) {
+            ssl_ctx = SSL_CTX_new(TLS_server_method());
+            if (ssl_ctx == nullptr) return false;
+            conn->tls_engine.ssl = SSL_new(ssl_ctx);
+            if (conn->tls_engine.ssl == nullptr) return false;
+        }
+        conn->tls_active = !plaintext;
+        conn->tls_handshake_complete = !plaintext;
         conn->protocol = ConnProtocol::Http11;
         conn->state = ConnState::Proxying;
         conn->request_config = &config;
@@ -30292,6 +30302,92 @@ TEST(iouring_upstream_recv, terminal_dispatch_rearms_once_across_reuse_clear_and
     const auto& third_sqe =
         loop->backend.sq_entries[(fixture.sq_tail_before + 2u) & *loop->backend.sq_ring_mask];
     CHECK_EQ(third_sqe.ioprio & IORING_RECV_MULTISHOT, 0u);
+    fixture.cleanup();
+}
+
+TEST(iouring_upstream_recv, plaintext_native_recv_is_one_shot_and_bounded_by_slice_space) {
+    ScopedIoUringLoopForRetirement guard;
+    if (!guard.init()) SKIP("io_uring unavailable");
+    auto* loop = guard.loop;
+    OneShotRecvFixture fixture;
+    REQUIRE(fixture.stage(loop, /*plaintext=*/true));
+    Connection& conn = *fixture.conn;
+    CHECK(loop->use_one_shot_upstream_recv(conn));
+
+    const u32 capacity = conn.upstream_recv_buf.capacity();
+    REQUIRE_GE(capacity, kProvidedBufSize);
+    for (const u32 available : {kProvidedBufSize, 4095u, 1u, 0u}) {
+        conn.upstream_recv_buf.reset();
+        REQUIRE_EQ(conn.upstream_recv_buf.write_avail(), capacity);
+        conn.upstream_recv_buf.commit(capacity - available);
+        CHECK(loop->use_one_shot_upstream_recv(conn));
+
+        const u32 tail_before = __atomic_load_n(loop->backend.sq_tail, __ATOMIC_ACQUIRE);
+        const u32 pending_before = loop->backend.pending;
+        const u32 conn_pending_before = conn.pending_ops;
+        if (available == 0) {
+            CHECK_FALSE(loop->submit_recv_upstream(conn));
+            CHECK_EQ(__atomic_load_n(loop->backend.sq_tail, __ATOMIC_ACQUIRE), tail_before);
+            CHECK_EQ(loop->backend.pending, pending_before);
+            CHECK_EQ(conn.pending_ops, conn_pending_before);
+            CHECK_FALSE(conn.upstream_recv_armed);
+            continue;
+        }
+
+        REQUIRE(loop->submit_recv_upstream(conn));
+        CHECK(conn.upstream_recv_armed);
+        CHECK_EQ(conn.pending_ops, conn_pending_before + 1u);
+        CHECK_EQ(loop->backend.pending, pending_before + 1u);
+        const auto& sqe = loop->backend.sq_entries[tail_before & *loop->backend.sq_ring_mask];
+        CHECK_EQ(sqe.opcode, static_cast<u8>(IORING_OP_RECV));
+        CHECK_EQ(sqe.len, available);
+        CHECK((sqe.flags & IOSQE_BUFFER_SELECT) != 0);
+        CHECK_EQ(sqe.ioprio & IORING_RECV_MULTISHOT, 0u);
+
+        // Consume the synthetic one-shot terminal owner before exercising the
+        // next remaining-capacity boundary; the fixture restores SQ state.
+        conn.upstream_recv_armed = false;
+        REQUIRE_GT(conn.pending_ops, 0u);
+        --conn.pending_ops;
+    }
+
+    // Plaintext selection excludes the configured strict response domain,
+    // while the existing TLS path remains separately covered above.
+    conn.response_policy_id = 1;
+    CHECK_FALSE(loop->use_one_shot_upstream_recv(conn));
+    conn.response_policy_id = 0;
+    CHECK(loop->use_one_shot_upstream_recv(conn));
+    fixture.cleanup();
+}
+
+TEST(iouring_upstream_recv, plaintext_body_rearm_failure_closes_connection) {
+    ScopedIoUringLoopForRetirement guard;
+    if (!guard.init()) SKIP("io_uring unavailable");
+    auto* loop = guard.loop;
+    OneShotRecvFixture fixture;
+    REQUIRE(fixture.stage(loop, /*plaintext=*/true));
+    Connection& conn = *fixture.conn;
+    const u32 id = conn.id;
+
+    static constexpr u8 kSentBodyByte = 'x';
+    REQUIRE_EQ(conn.upstream_recv_buf.write(&kSentBodyByte, 1u), 1u);
+    conn.upstream_send_len = 1;
+    conn.resp_body_mode = BodyMode::ContentLength;
+    conn.resp_body_remaining = 1;
+    conn.resp_body_sent = 1;
+    conn.state = ConnState::Sending;
+
+    const u32 sq_head = __atomic_load_n(loop->backend.sq_head, __ATOMIC_ACQUIRE);
+    __atomic_store_n(
+        loop->backend.sq_tail, sq_head + loop->backend.sq_ring_entries, __ATOMIC_RELEASE);
+    loop->backend.pending = fixture.backend_pending_before + loop->backend.sq_ring_entries;
+    const u32 tail_before = __atomic_load_n(loop->backend.sq_tail, __ATOMIC_ACQUIRE);
+
+    on_response_body_sent<IoUringEventLoop>(loop, conn, {id, 1, 0, 0, IoEventType::Send, 0});
+
+    CHECK_EQ(loop->conns[id].fd, -1);
+    CHECK_FALSE(loop->conns[id].upstream_recv_armed);
+    CHECK_EQ(__atomic_load_n(loop->backend.sq_tail, __ATOMIC_ACQUIRE), tail_before);
     fixture.cleanup();
 }
 
@@ -57871,6 +57967,7 @@ TEST(iouring_episode, upstream_submissions_carry_episode_and_aux) {
     CHECK(backend.add_send_upstream(-1, kConnId, payload, sizeof(payload), kEpisode));
     CHECK(backend.add_recv_upstream(-1, kConnId, kEpisode));
     CHECK(backend.add_recv_upstream_once(-1, kConnId, kEpisode));
+    CHECK(backend.add_recv_upstream_once(-1, kConnId, kEpisode, 1u));
     CHECK(backend.pause_upstream_recv(42, kConnId, kEpisode));
     CHECK(backend.cancel_retiring_upstream_recv(kConnId, kEpisode));
     CHECK(backend.cancel_retiring_upstream(kConnId, IoEventType::UpstreamConnect, kEpisode));
@@ -57902,8 +57999,10 @@ TEST(iouring_episode, upstream_submissions_carry_episode_and_aux) {
         backend.sq_entries[(first_tail + 5) & sq_mask].user_data,
         backend.sq_entries[(first_tail + 6) & sq_mask].user_data,
         backend.sq_entries[(first_tail + 7) & sq_mask].user_data,
+        backend.sq_entries[(first_tail + 8) & sq_mask].user_data,
     };
     const u8 expected_aux[] = {0,
+                               0,
                                0,
                                0,
                                0,
@@ -57917,20 +58016,27 @@ TEST(iouring_episode, upstream_submissions_carry_episode_and_aux) {
                                          IoEventType::UpstreamRecv,
                                          IoEventType::UpstreamRecv,
                                          IoEventType::UpstreamRecv,
+                                         IoEventType::UpstreamRecv,
                                          IoEventType::UpstreamConnect,
                                          IoEventType::UpstreamSend};
     const auto& multishot = backend.sq_entries[(first_tail + 2) & sq_mask];
     const auto& one_shot = backend.sq_entries[(first_tail + 3) & sq_mask];
+    const auto& bounded_one_shot = backend.sq_entries[(first_tail + 4) & sq_mask];
     CHECK_EQ(multishot.opcode, static_cast<u8>(IORING_OP_RECV));
     CHECK_EQ(one_shot.opcode, static_cast<u8>(IORING_OP_RECV));
+    CHECK_EQ(bounded_one_shot.opcode, static_cast<u8>(IORING_OP_RECV));
     CHECK_EQ(multishot.len, 4096u);
     CHECK_EQ(one_shot.len, 4096u);
+    CHECK_EQ(bounded_one_shot.len, 1u);
     CHECK((multishot.flags & IOSQE_BUFFER_SELECT) != 0);
     CHECK((one_shot.flags & IOSQE_BUFFER_SELECT) != 0);
+    CHECK((bounded_one_shot.flags & IOSQE_BUFFER_SELECT) != 0);
     CHECK((multishot.ioprio & IORING_RECV_MULTISHOT) != 0);
     CHECK_EQ(one_shot.ioprio & IORING_RECV_MULTISHOT, 0u);
+    CHECK_EQ(bounded_one_shot.ioprio & IORING_RECV_MULTISHOT, 0u);
     CHECK_EQ(multishot.buf_group, one_shot.buf_group);
-    for (u32 i = 0; i < 8; i++) {
+    CHECK_EQ(multishot.buf_group, bounded_one_shot.buf_group);
+    for (u32 i = 0; i < 9; i++) {
         decoded_conn = 0;
         decoded_type = IoEventType::Count;
         decoded_aux = 0;
@@ -57965,6 +58071,8 @@ TEST(iouring_episode, invalid_upstream_episodes_do_not_acquire_sqe_or_state) {
     CHECK_FALSE(backend.add_recv_upstream(-1, kConnId, kIoUserDataMaxUpstreamEpisode + 1u));
     CHECK_FALSE(backend.add_recv_upstream_once(-1, kConnId, 0));
     CHECK_FALSE(backend.add_recv_upstream_once(-1, kConnId, kIoUserDataMaxUpstreamEpisode + 1u));
+    CHECK_FALSE(backend.add_recv_upstream_once(-1, kConnId, 1u, 0u));
+    CHECK_FALSE(backend.add_recv_upstream_once(-1, kConnId, 1u, kProvidedBufSize + 1u));
     CHECK_FALSE(backend.pause_upstream_recv(42, kConnId, 0));
     CHECK_FALSE(backend.pause_upstream_recv(42, kConnId, kIoUserDataMaxUpstreamEpisode + 1u));
     CHECK_FALSE(backend.cancel_retiring_upstream_recv(kConnId, 0));
