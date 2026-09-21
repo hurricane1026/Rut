@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Local pinned-nginx / converter-stdout benchmark; no performance CI gate."""
+"""Local pinned-nginx / Rut benchmark; no performance CI gate."""
 
 import argparse
 import asyncio
@@ -12,6 +12,7 @@ import re
 import shutil
 import signal
 import socket
+import ssl
 import subprocess
 import sys
 import time
@@ -21,6 +22,23 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[2]
 SCENARIOS = ("static-close", "static-keepalive", "proxy-close", "proxy-keepalive")
 ERROR_NAMES = ("connect", "read", "write", "status", "timeout")
+# Keep aligned with the converter's safe quoted return-body profile.
+STATIC_BODY_LIMIT = 4093
+NATIVE_BODY_SIZE = 256 * 1024
+
+
+def engine_order(first_engine, repeat):
+    other_engine = "rut" if first_engine == "nginx" else "nginx"
+    return (first_engine, other_engine) if repeat % 2 else (other_engine, first_engine)
+
+
+def add_first_engine_argument(parser):
+    parser.add_argument(
+        "--first-engine",
+        choices=("nginx", "rut"),
+        default="nginx",
+        help="first engine in odd-numbered repeats; even repeats alternate",
+    )
 
 
 def save_json(path, value):
@@ -34,7 +52,7 @@ def sha256(path):
         return hashlib.file_digest(stream, "sha256").hexdigest()
 
 
-def response_head(head):
+def response_head(head, max_body=2048, native_streaming=False):
     if not head.startswith(b"HTTP/1.1 200 OK\r\n"):
         raise ValueError(f"unexpected status: {head[:100]!r}")
     headers = {}
@@ -47,22 +65,45 @@ def response_head(head):
             raise ValueError(f"duplicate header: {key!r}")
         headers[key] = value.strip()
     length = headers.get(b"content-length", b"")
-    if not length.isdigit() or int(length) > 2048 or b"transfer-encoding" in headers:
+    if not length.isdigit() or int(length) > max_body or b"transfer-encoding" in headers:
         raise ValueError("expected bounded Content-Length response")
+    if native_streaming:
+        if headers.get(b"content-type") != b"application/octet-stream":
+            raise ValueError("native-streaming requires one application/octet-stream Content-Type")
+        connection = headers.get(b"connection", b"").lower()
+        if connection not in (b"", b"keep-alive"):
+            raise ValueError("native-streaming response must preserve keepalive semantics")
     return int(length), headers.get(b"connection", b"").lower() == b"close"
 
 
-def request_bytes(work, close):
-    mode = "close" if close else "keep-alive"
-    return f"GET /{work} HTTP/1.1\r\nHost: client.example\r\nConnection: {mode}\r\n\r\n".encode()
+def connection_header(close, keepalive_header="explicit"):
+    return "close" if close else ("keep-alive" if keepalive_header == "explicit" else None)
 
 
-def expected_body(work):
+def request_bytes(work, close, keepalive_header="explicit", preflight_id=None):
+    mode = connection_header(close, keepalive_header)
+    header = f"Connection: {mode}\r\n" if mode else ""
+    marker = f"X-Rut-Benchmark-Preflight: {preflight_id}\r\n" if preflight_id else ""
+    return f"GET /{work} HTTP/1.1\r\nHost: client.example\r\n{header}{marker}\r\n".encode()
+
+
+def expected_body(work, body_size=None, native_streaming=False):
+    if native_streaming:
+        # Distinct deterministic 4 KiB blocks expose truncation, duplication,
+        # and reordering while remaining identical at nginx and Rut.
+        blocks = []
+        for block in range(NATIVE_BODY_SIZE // 4096):
+            prefix = block.to_bytes(4, "big")
+            blocks.append(prefix + bytes(((block * 17 + i * 29) & 255) for i in range(4092)))
+        return b"".join(blocks)
+    if body_size is not None:
+        return b"x" * body_size
     return b"hello from nginx" if work == "static" else b"x" * 1024
 
 
-def response(sock, work, close):
-    sock.sendall(request_bytes(work, close))
+def response(sock, work, close, keepalive_header="explicit", body_size=None,
+             native_streaming=False, preflight_id=None):
+    sock.sendall(request_bytes(work, close, keepalive_header, preflight_id))
     data = b""
     while b"\r\n\r\n" not in data:
         chunk = sock.recv(4096)
@@ -72,17 +113,18 @@ def response(sock, work, close):
         if len(data) > 8192:
             raise ValueError("oversized response")
     head, body = data.split(b"\r\n\r\n", 1)
-    length, server_close = response_head(head)
+    wanted = expected_body(work, body_size, native_streaming)
+    length, server_close = response_head(head, len(wanted), native_streaming)
     while len(body) < length:
         chunk = sock.recv(4096)
         if not chunk:
             raise ValueError("EOF before complete body")
         body += chunk
-    if len(body) != length or body != expected_body(work):
+    if len(body) != length or body != wanted:
         raise ValueError("unexpected body")
     if (close or server_close) and sock.recv(1) != b"":
         raise ValueError("expected EOF after response")
-    normalized = re.sub(rb"(?im)^Date: [^\r\n]+", b"Date: NORMALIZED", head)
+    normalized = head if native_streaming else re.sub(rb"(?im)^Date: [^\r\n]+", b"Date: NORMALIZED", head)
     return normalized + b"\r\n\r\n" + body, server_close
 
 
@@ -109,6 +151,12 @@ class Harness:
         self.references = {}
         self.results = []
         self.commands = []
+        self.tls_context = None
+        if getattr(args, "tls_cert", None):
+            self.tls_context = ssl.create_default_context(cafile=str(args.tls_cert))
+            self.tls_context.set_alpn_protocols(["http/1.1"])
+            self.tls_context.minimum_version = ssl.TLSVersion.TLSv1_3
+            self.tls_context.maximum_version = ssl.TLSVersion.TLSv1_3
 
     def command(self, argv, *, timeout=20):
         argv = [str(v) for v in argv]
@@ -146,6 +194,17 @@ class Harness:
 
     def prepare(self):
         a = self.args
+        first_engine = getattr(a, "first_engine", "nginx")
+        body_size = getattr(a, "body_size", None)
+        native_streaming = getattr(a, "proxy_profile", "converter-strict") == "native-streaming"
+        if native_streaming:
+            body_size = NATIVE_BODY_SIZE
+        if (body_size is not None and body_size > STATIC_BODY_LIMIT
+                and any(scenario.startswith("static-") for scenario in a.scenarios)):
+            raise ValueError(
+                f"unsupported static body: converter local_response is bounded to "
+                f"{STATIC_BODY_LIMIT} bytes; this matrix cell has NOT passed"
+            )
         context = self.command(["docker", "context", "inspect"]).stdout
         endpoint = (
             os.environ.get("DOCKER_HOST")
@@ -170,6 +229,23 @@ class Harness:
             "arguments": {
                 k: str(v) if isinstance(v, Path) else v for k, v in vars(a).items()
             },
+            "proxy_profile": {
+                "name": getattr(a, "proxy_profile", "converter-strict"),
+                "body_size": body_size,
+                "origin_keepalive": "enabled; 60s idle timeout" if native_streaming else "disabled",
+                "native_origin_reuse_observation": "conditional access log for marked preflight requests only" if native_streaming else None,
+                "nginx_keepalive_requests": ({
+                    "origin": 1000000000,
+                    "upstream_idle_connection": 1000000000,
+                    "frontend_downstream": 1000000000,
+                } if native_streaming else None),
+            },
+            "engine_order_by_scenario_and_repeat": [
+                {"scenario": scenario, "repeat": rep,
+                 "engines": list(engine_order(first_engine, rep))}
+                for scenario in a.scenarios
+                for rep in range(1, a.repeats + 1)
+            ] if a.mode == "benchmark" else [],
             "binaries_sha256": {str(p): sha256(p) for p in (a.rut, a.converter, a.wrk)},
             "nginx_image": self.image,
             "nginx_image_id": inspection["Id"],
@@ -178,18 +254,83 @@ class Harness:
             "tcp_tw_reuse": Path("/proc/sys/net/ipv4/tcp_tw_reuse").read_text().strip(),
             "note": "Harness revision is not proof of binary source revision. Record build provenance separately.",
         }
+        if self.tls_context:
+            metadata["tls_profile"] = {
+                "certificate_sha256": sha256(a.tls_cert),
+                "protocol": "TLSv1.3",
+                "cipher": "TLS_AES_256_GCM_SHA384",
+                "reconnect": "full-handshake",
+                "key_exchange": "X25519 (enforced by load client)",
+                "listener_adaptation": "native source listener stripped; CLI configures TLS; wildcard IPv4 on both frontends" if native_streaming else "converter cleartext listener replaced by CLI TLS; wildcard IPv4 on both frontends",
+            }
         save_json(self.out / "environment.json", metadata)
-        (self.out / "origin.conf").write_text(
-            self.nginx_config(
-                f"server {{ listen 127.0.0.1:{a.origin_port}; keepalive_timeout 0; "
-                'location / { default_type text/plain; return 200 "'
-                + "x" * 1024
-                + '"; } }'
-            )
-        )
-        for work in ("static", "proxy"):
+        origin_observation = ""
+        origin_log = ""
+        if native_streaming:
+            payloads = self.out / "payloads"
+            payloads.mkdir()
+            (payloads / "proxy").write_bytes(expected_body("proxy", native_streaming=True))
+            origin_location = ('location / { root /benchmark-payloads; default_type application/octet-stream; '
+                               'etag off; max_ranges 0; add_header Last-Modified ""; }')
+            origin_observation = ('map $http_x_rut_benchmark_preflight $benchmark_preflight { '
+                                  'default 0; ~.+ 1; }\n'
+                                  'log_format rut_preflight "marker=$http_x_rut_benchmark_preflight '
+                                  'connection=$connection requests=$connection_requests";\n')
+            origin_log = 'access_log /dev/stdout rut_preflight if=$benchmark_preflight;'
+        elif body_size is None:
+            origin_location = 'location / { default_type text/plain; return 200 "' + "x" * 1024 + '"; }'
+        else:
+            payloads = self.out / "payloads"
+            payloads.mkdir()
+            (payloads / "proxy").write_bytes(expected_body("proxy", body_size))
+            origin_location = ('location / { root /benchmark-payloads; default_type text/plain; '
+                               'etag off; max_ranges 0; add_header Last-Modified ""; }')
+            origin_observation = ""
+            origin_log = ""
+        if not native_streaming:
+            origin_observation = ""
+        origin_keepalive = "keepalive_timeout 60;" if native_streaming else "keepalive_timeout 0;"
+        (self.out / "origin.conf").write_text(self.nginx_config(
+            f"server {{ listen 127.0.0.1:{a.origin_port}; {origin_keepalive} "
+            f"{'keepalive_requests 1000000000;' if native_streaming else ''} {origin_log} {origin_location} }}",
+            extra_http=origin_observation,
+        ))
+        works = sorted({scenario.split("-")[0] for scenario in a.scenarios})
+        for work in works:
+            if native_streaming:
+                native = (f'listen 127.0.0.1:{a.front_port}\n'
+                          f'upstream backend at "127.0.0.1:{a.origin_port}"\n'
+                          'route GET "/proxy" { return forward(backend) }\n')
+                (self.out / (work + ".source.rut")).write_text(native)
+                runnable = native
+                if self.tls_context:
+                    listener = f"listen 127.0.0.1:{a.front_port}\n"
+                    if not runnable.startswith(listener):
+                        raise ValueError("unexpected native listener; cannot adapt TLS transport")
+                    runnable = runnable[len(listener):]
+                (self.out / (work + ".rut")).write_text(runnable)
+                # Rut's native frontend is streamed; nginx must use matching
+                # response streaming and origin idle reuse semantics.
+                upstream_name = "benchmark_origin"
+                nginx_server = (f'server {{ listen 127.0.0.1:{a.front_port}; keepalive_requests 1000000000; '
+                                f'location = /proxy {{ proxy_pass http://{upstream_name}; '
+                                'proxy_http_version 1.1; proxy_buffering off; proxy_buffer_size 16k; '
+                                'proxy_busy_buffers_size 16k; '
+                                'proxy_set_header Host $http_host; proxy_set_header Connection ""; } }')
+                nginx_http = (f'upstream {upstream_name} {{ server 127.0.0.1:{a.origin_port}; '
+                              'keepalive 4096; keepalive_timeout 60s; keepalive_requests 1000000000; }\n')
+                if self.tls_context:
+                    nginx_server = nginx_server.replace(
+                        f"listen 127.0.0.1:{a.front_port};",
+                        f"listen {a.front_port} ssl; ssl_certificate /benchmark-cert.pem; "
+                        "ssl_certificate_key /benchmark-key.pem; ssl_protocols TLSv1.3; "
+                        "ssl_conf_command Ciphersuites TLS_AES_256_GCM_SHA384; "
+                        "ssl_ecdh_curve X25519; ssl_session_cache off;")
+                (self.out / (work + "-nginx.conf")).write_text(
+                    self.nginx_config(nginx_server, extra_http=nginx_http))
+                continue
             local = (
-                'location = /static { return 200 "hello from nginx"; }'
+                'location = /static { return 200 "' + expected_body("static", body_size).decode() + '"; }'
                 if work == "static"
                 else ""
             )
@@ -199,17 +340,35 @@ class Harness:
             )
             source = self.out / (work + ".conf")
             source.write_text(fragment)
-            (self.out / (work + "-nginx.conf")).write_text(self.nginx_config(fragment))
+            nginx_fragment = fragment
+            if self.tls_context:
+                nginx_fragment = fragment.replace(
+                    f"listen 127.0.0.1:{a.front_port};",
+                    f"listen {a.front_port} ssl; "
+                    "ssl_certificate /benchmark-cert.pem; ssl_certificate_key /benchmark-key.pem; "
+                    "ssl_protocols TLSv1.3; ssl_conf_command Ciphersuites TLS_AES_256_GCM_SHA384; "
+                    "ssl_ecdh_curve X25519; ssl_session_cache off;",
+                )
+            (self.out / (work + "-nginx.conf")).write_text(self.nginx_config(nginx_fragment))
             converted = self.command([a.converter, "--format", "server", source])
-            (self.out / (work + ".rut")).write_text(converted.stdout)
+            program = converted.stdout
+            if self.tls_context:
+                # Source listeners currently describe cleartext only. Preserve
+                # converter stdout, then select the existing CLI TLS listener.
+                (self.out / (work + ".converted.rut")).write_text(program)
+                listener = f"listen 127.0.0.1:{a.front_port}\n"
+                if not program.startswith(listener):
+                    raise ValueError("unexpected converter listener; cannot adapt TLS transport")
+                program = program[len(listener):]
+            (self.out / (work + ".rut")).write_text(program)
             (self.out / (work + "-converter.log")).write_text(converted.stderr)
 
     @staticmethod
-    def nginx_config(server):
+    def nginx_config(server, extra_http=""):
         return (
             "worker_processes 1;\nerror_log /dev/stderr warn;\npid /tmp/nginx.pid;\n"
             "events { worker_connections 8192; }\nhttp { access_log off;\n"
-            + server
+            + extra_http + server
             + "\n}\n"
         )
 
@@ -242,12 +401,19 @@ class Harness:
                 "nofile=65536:65536",
                 "--mount",
                 f"type=bind,src={self.out / config},dst=/etc/nginx/nginx.conf,readonly",
+                *(["--mount", f"type=bind,src={self.out / 'payloads'},dst=/benchmark-payloads,readonly"]
+                  if (self.out / "payloads").exists() else []),
+                *(["--mount", f"type=bind,src={self.args.tls_cert},dst=/benchmark-cert.pem,readonly",
+                   "--mount", f"type=bind,src={self.args.tls_key},dst=/benchmark-key.pem,readonly"]
+                  if self.tls_context else []),
                 self.image,
                 "nginx",
                 "-g",
                 "daemon off;",
             ]
         ).stdout.strip()
+        if name == "origin":
+            self.origin_container_id = cid
         try:
             self.command(["docker", "start", cid])
             pid = int(
@@ -261,6 +427,8 @@ class Harness:
             finally:
                 try:
                     logs = self.command(["docker", "logs", cid])
+                    (self.out / (name + "-server.stdout.log")).write_text(logs.stdout)
+                    (self.out / (name + "-server.stderr.log")).write_text(logs.stderr)
                     (self.out / (name + "-server.log")).write_text(
                         logs.stdout + logs.stderr
                     )
@@ -270,6 +438,7 @@ class Harness:
     @contextlib.contextmanager
     def frontend(self, engine, work, label):
         a = self.args
+        self.active_label = label
         if engine == "nginx":
             with self.nginx(
                 label, work + "-nginx.conf", a.server_cpu, a.front_port
@@ -290,6 +459,8 @@ class Harness:
             "--opt",
             "2",
         ]
+        if self.tls_context:
+            argv += [str(a.front_port), "--tls-cert", str(a.tls_cert), "--tls-key", str(a.tls_key)]
         self.commands.append(argv)
         save_json(self.out / "commands.json", self.commands)
         with (self.out / (label + "-server.log")).open("w") as log:
@@ -309,6 +480,10 @@ class Harness:
                 proc.wait(timeout=5)
 
     def validate(self, work, keepalive):
+        native_streaming = getattr(self.args, "proxy_profile", "converter-strict") == "native-streaming"
+        if native_streaming:
+            self.validate_native_keepalive(work)
+            return
         for close in [True, False] if keepalive else [True]:
             sock = None
             try:
@@ -317,7 +492,20 @@ class Harness:
                         sock = socket.create_connection(
                             ("127.0.0.1", self.args.front_port), timeout=3
                         )
-                    raw, server_close = response(sock, work, close)
+                        if self.tls_context:
+                            sock = self.tls_context.wrap_socket(sock, server_hostname="localhost")
+                            if sock.version() != "TLSv1.3" or sock.cipher()[0] != "TLS_AES_256_GCM_SHA384" or sock.session_reused:
+                                raise ValueError("unexpected TLS protocol/cipher/session reuse")
+                            save_json(self.out / f"{self.active_label}-tls.json", {
+                                "version": sock.version(), "cipher": sock.cipher(),
+                                "alpn": sock.selected_alpn_protocol(), "session_reused": sock.session_reused,
+                            })
+                    raw, server_close = response(
+                        sock, work, close, self.args.keepalive_header,
+                        getattr(self.args, "body_size", None),
+                        False,
+                        None,
+                    )
                     key = (work, close)
                     if key in self.references and self.references[key] != raw:
                         raise ValueError(f"response mismatch for {key}")
@@ -337,14 +525,159 @@ class Harness:
                 if sock is not None:
                     sock.close()
 
+    def validate_native_keepalive(self, work):
+        sock = None
+        try:
+            sock = self.open_preflight_socket()
+            slow_markers = [f"{self.active_label}-slow-{i}" for i in range(2)]
+            self.slow_read_response(sock, work, slow_markers[0])
+            raw, server_close = response(
+                sock, work, False, "implicit", NATIVE_BODY_SIZE, True, slow_markers[1]
+            )
+            if server_close:
+                raise ValueError("native slow-read preflight closed before successor response")
+            self.save_native_response("slow-successor", raw)
+            self.verify_origin_reuse(slow_markers)
+
+            markers = [f"{self.active_label}-keepalive-{i}" for i in range(100)]
+            request_evidence = []
+            for index, marker in enumerate(markers):
+                raw, server_close = response(
+                    sock, work, False, "implicit", NATIVE_BODY_SIZE, True, marker
+                )
+                if server_close:
+                    raise ValueError("native keepalive preflight closed before 100 responses")
+                head, body = raw.split(b"\r\n\r\n", 1)
+                request_evidence.append({
+                    "marker": marker,
+                    "response_sha256": hashlib.sha256(raw).hexdigest(),
+                    "body_sha256": hashlib.sha256(body).hexdigest(),
+                    "body_bytes": len(body),
+                    "status_line": head.split(b"\r\n", 1)[0].decode("ascii"),
+                })
+                if index == 0:
+                    self.save_native_response("keepalive-representative", raw)
+            save_json(self.out / f"{self.active_label}-keepalive-responses.json", request_evidence)
+            self.verify_origin_reuse(markers)
+        finally:
+            if sock is not None:
+                sock.close()
+
+    def open_preflight_socket(self):
+        sock = socket.create_connection(("127.0.0.1", self.args.front_port), timeout=3)
+        if self.tls_context:
+            sock = self.tls_context.wrap_socket(sock, server_hostname="localhost")
+            if (sock.version() != "TLSv1.3" or sock.cipher()[0] != "TLS_AES_256_GCM_SHA384"
+                    or sock.session_reused):
+                raise ValueError("unexpected TLS protocol/cipher/session reuse")
+            save_json(self.out / f"{self.active_label}-tls.json", {
+                "version": sock.version(), "cipher": sock.cipher(),
+                "alpn": sock.selected_alpn_protocol(), "session_reused": sock.session_reused,
+            })
+        return sock
+
+    def save_native_response(self, label, raw):
+        path = self.out / f"{self.active_label}-{label}-response.bin"
+        path.write_bytes(raw)
+
+    def slow_read_response(self, sock, work, marker):
+        started = time.monotonic()
+        data = b""
+        head = b""
+        body = b""
+        events = []
+        declared_body_bytes = None
+        try:
+            sock.sendall(request_bytes(work, False, "implicit", marker))
+            started = time.monotonic()
+            while b"\r\n\r\n" not in data:
+                chunk = sock.recv(4096)
+                if not chunk:
+                    events.append({"phase": "header", "bytes": 0, "elapsed_seconds": time.monotonic() - started})
+                    raise ValueError("EOF before slow-read response header")
+                data += chunk
+                events.append({"phase": "header", "bytes": len(chunk), "elapsed_seconds": time.monotonic() - started})
+                if len(data) > 8192:
+                    raise ValueError("oversized slow-read response header")
+            head, body = data.split(b"\r\n\r\n", 1)
+            if body:
+                events.append({"phase": "body-prefetch", "bytes": len(body), "elapsed_seconds": time.monotonic() - started})
+            wanted = expected_body(work, native_streaming=True)
+            length, server_close = response_head(head, len(wanted), native_streaming=True)
+            declared_body_bytes = length
+            if length != NATIVE_BODY_SIZE or server_close:
+                raise ValueError("slow-read response has invalid length or closes keepalive")
+            time.sleep(0.2)
+            while len(body) < length:
+                chunk = sock.recv(min(4096, length - len(body)))
+                if not chunk:
+                    events.append({"phase": "body", "bytes": 0, "elapsed_seconds": time.monotonic() - started})
+                    raise ValueError("EOF during slow-read response body")
+                body += chunk
+                events.append({"phase": "body", "bytes": len(chunk), "elapsed_seconds": time.monotonic() - started})
+                time.sleep(0.005)
+            if len(body) != length or body != wanted:
+                raise ValueError("slow-read response body mismatch")
+            raw = head + b"\r\n\r\n" + body
+            self.save_native_response("slow-read", raw)
+            save_json(self.out / f"{self.active_label}-slow-read.json", {
+                "preflight_marker": marker, "body_bytes": len(body),
+                "header_delay_seconds": next(
+                    (event["elapsed_seconds"] for event in events if event["phase"] in ("body-prefetch", "body")),
+                    time.monotonic() - started,
+                ),
+                "read_events": events, "completed": True,
+            })
+        except Exception as error:
+            received = data if b"\r\n\r\n" not in data else head + b"\r\n\r\n" + body
+            self.save_slow_read_failure(marker, started, head, body, received,
+                                        declared_body_bytes, events, error)
+            raise
+
+    def save_slow_read_failure(self, marker, started, head, body, received,
+                               declared_body_bytes, events, error):
+        raw_path = self.out / f"{self.active_label}-slow-read-failure-response.bin"
+        metadata_path = self.out / f"{self.active_label}-slow-read-failure.json"
+        try:
+            raw_path.write_bytes(received)
+            save_json(metadata_path, {
+                "preflight_marker": marker,
+                "exception_category": type(error).__name__,
+                "exception": repr(error),
+                "elapsed_seconds": time.monotonic() - started,
+                "expected_body_bytes": NATIVE_BODY_SIZE,
+                "declared_response_body_bytes": declared_body_bytes,
+                "received_body_bytes": len(body),
+                "received_wire_bytes": len(received),
+                "response_head_bytes": len(head),
+                "response_head_complete": bool(head),
+                "read_events": events,
+                "completed": False,
+            })
+        except OSError:
+            # Preserve the original preflight failure if evidence storage fails.
+            pass
+
+    def verify_origin_reuse(self, expected_markers):
+        logs = self.command(["docker", "logs", getattr(self, "origin_container_id", "")]).stdout
+        marker_prefix = expected_markers[0].rsplit("-", 1)[0]
+        (self.out / f"{marker_prefix}-origin-reuse.log").write_text(logs)
+        records = origin_reuse_records(logs, expected_markers)
+        if not valid_origin_reuse(records, expected_markers):
+            raise ValueError(f"origin reuse preflight failed for markers {expected_markers!r}: got {records!r}")
+
     def wrk(self, work, close, concurrency, duration, label):
         a = self.args
-        mode = "close" if close else "keep-alive"
+        mode = connection_header(close, a.keepalive_header)
         lua = self.out / (label + ".lua")
         lua.write_text(
             f'wrk.method="GET"\nwrk.path="/{work}"\nwrk.headers["Host"]="client.example"\n'
-            f'wrk.headers["Connection"]="{mode}"\n'
-            'done=function(s,l,r)\n print(string.format("METRICS %.0f %.0f %.0f %.0f %.0f %d %d %d %d %d",'
+            + (
+                f'wrk.headers["Connection"]="{mode}"\n'
+                if mode
+                else 'wrk.headers["Connection"]=nil\n'
+            )
+            + 'done=function(s,l,r)\n print(string.format("METRICS %.0f %.0f %.0f %.0f %.0f %d %d %d %d %d",'
             "s.requests,s.duration,l:percentile(50),l:percentile(95),l:percentile(99),"
             "s.errors.connect,s.errors.read,s.errors.write,s.errors.status,s.errors.timeout))\nend\n"
         )
@@ -367,10 +700,12 @@ class Harness:
             "2s",
             "-s",
             lua,
-            f"http://127.0.0.1:{a.front_port}/{work}",
+            f"{'https' if self.tls_context else 'http'}://127.0.0.1:{a.front_port}/{work}",
         ]
         result = self.command(argv, timeout=duration + 15)
         (self.out / (label + ".log")).write_text(result.stdout + result.stderr)
+        if self.tls_context and "TLS_PROFILE TLSv1.3 TLS_AES_256_GCM_SHA384 X25519 full-handshake" not in result.stdout:
+            raise ValueError("HTTPS requires the checked wrk-tls-full-handshake.patch client")
         match = re.search(r"^METRICS (.+)$", result.stdout, re.MULTILINE)
         if not match:
             raise ValueError(f"missing wrk metrics: {label}")
@@ -389,10 +724,11 @@ class Harness:
         }
 
     def benchmark(self, origin_pid):
+        first_engine = getattr(self.args, "first_engine", "nginx")
         for scenario in self.args.scenarios:
             work, mode = scenario.split("-")
             for rep in range(1, self.args.repeats + 1):
-                for engine in ("nginx", "rut") if rep % 2 else ("rut", "nginx"):
+                for engine in engine_order(first_engine, rep):
                     label = f"{scenario}-{engine}-r{rep}"
                     with self.frontend(engine, work, label) as pid:
                         self.validate(work, mode == "keepalive")
@@ -419,6 +755,9 @@ class Harness:
                             origin_after, _ = proc_usage(origin_pid)
                             result.update(
                                 workload=work,
+                                proxy_profile=getattr(self.args, "proxy_profile", "converter-strict"),
+                                transport="https" if self.tls_context else "http",
+                                body_size=len(expected_body(work, getattr(self.args, "body_size", None))),
                                 connection=mode,
                                 engine=engine,
                                 rep=rep,
@@ -465,16 +804,21 @@ class Harness:
                         if writer is None:
                             reader, writer = await asyncio.wait_for(
                                 asyncio.open_connection(
-                                    "127.0.0.1", self.args.front_port
+                                    "127.0.0.1", self.args.front_port,
+                                    ssl=self.tls_context,
+                                    server_hostname="localhost" if self.tls_context else None,
                                 ),
                                 3,
                             )
-                        writer.write(request_bytes(work, close))
+                        writer.write(
+                            request_bytes(work, close, self.args.keepalive_header)
+                        )
                         await asyncio.wait_for(writer.drain(), 3)
                         head = await asyncio.wait_for(reader.readuntil(b"\r\n\r\n"), 3)
-                        length, server_close = response_head(head)
+                        wanted = expected_body(work, getattr(self.args, "body_size", None))
+                        length, server_close = response_head(head, len(wanted))
                         body = await asyncio.wait_for(reader.readexactly(length), 3)
-                        if body != expected_body(work):
+                        if body != wanted:
                             raise ValueError("unexpected response body")
                         if close or server_close:
                             if await asyncio.wait_for(reader.read(1), 3) != b"":
@@ -544,6 +888,43 @@ def positive(value):
     return number
 
 
+def origin_reuse_records(logs, expected_markers):
+    expected = set(expected_markers)
+    records = []
+    for line in logs.splitlines():
+        match = re.fullmatch(r'marker=(\S+) connection=(\d+) requests=(\d+)', line.strip())
+        if match and match[1] in expected:
+            records.append((match[1], int(match[2]), int(match[3])))
+    return records
+
+
+def valid_origin_reuse(records, expected_markers):
+    if [record[0] for record in records] != list(expected_markers):
+        return False
+    if not records or any(connection <= 0 or requests <= 0 for _, connection, requests in records):
+        return False
+    connection = records[0][1]
+    first_request = records[0][2]
+    return all(
+        record[1] == connection and record[2] == first_request + index
+        for index, record in enumerate(records)
+    )
+
+
+def validate_proxy_profile(parser, args):
+    if args.proxy_profile != "native-streaming":
+        return
+    if args.body_size not in (None, NATIVE_BODY_SIZE):
+        parser.error("native-streaming requires a 256 KiB response")
+    if args.scenarios != ["proxy-keepalive"]:
+        parser.error("native-streaming supports only proxy-keepalive")
+    if not args.concurrency or any(value not in (1, 32) for value in args.concurrency):
+        parser.error("native-streaming supports only concurrency values 1 and 32")
+    if args.keepalive_header != "implicit":
+        parser.error("native-streaming requires --keepalive-header implicit")
+    args.body_size = NATIVE_BODY_SIZE
+
+
 def arguments():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--rut", type=Path, required=True)
@@ -562,18 +943,42 @@ def arguments():
         required=True,
         help="comma-separated CPU IDs on distinct physical cores",
     )
+    parser.add_argument(
+        "--keepalive-header",
+        choices=("explicit", "implicit"),
+        default="explicit",
+        help="explicit preserves the original workload; implicit uses HTTP/1.1 default persistence",
+    )
+    parser.add_argument("--body-size", type=positive, help="exact response body bytes (max 1 MiB); omitted preserves legacy bodies")
+    parser.add_argument("--proxy-profile", choices=("converter-strict", "native-streaming"),
+                        default="converter-strict", help="proxy implementation profile; default preserves converter behavior")
+    parser.add_argument("--tls-cert", type=Path, help="PEM certificate with localhost SAN; enables HTTPS")
+    parser.add_argument("--tls-key", type=Path)
     parser.add_argument("--front-port", type=int, default=8087)
     parser.add_argument("--origin-port", type=int, default=9087)
     parser.add_argument("--concurrency", nargs="+", type=positive, default=[1, 32, 128])
     parser.add_argument("--duration", type=positive, default=8)
     parser.add_argument("--warmup", type=positive, default=2)
     parser.add_argument("--repeats", type=positive, default=3)
+    add_first_engine_argument(parser)
     parser.add_argument(
         "--scenarios", nargs="+", choices=SCENARIOS, default=list(SCENARIOS)
     )
     args = parser.parse_args()
+    if args.body_size is not None and args.body_size > 1048576:
+        parser.error("body-size must be <= 1048576")
+    validate_proxy_profile(parser, args)
+    if bool(args.tls_cert) != bool(args.tls_key):
+        parser.error("tls-cert and tls-key must be supplied together")
+    if args.tls_cert:
+        args.tls_cert = args.tls_cert.resolve()
+        args.tls_key = args.tls_key.resolve()
+        if not args.tls_cert.is_file() or not args.tls_key.is_file():
+            parser.error("TLS certificate and key must exist")
     if args.mode == "diagnose" and len(args.concurrency) != 1:
         parser.error("diagnose requires one --concurrency value")
+    if args.mode == "diagnose" and args.proxy_profile == "native-streaming":
+        parser.error("diagnose mode does not support native-streaming response validation")
     if len(set(args.concurrency)) != len(args.concurrency) or len(
         set(args.scenarios)
     ) != len(args.scenarios):
@@ -630,14 +1035,14 @@ def arguments():
 
 def main():
     args = arguments()
-    harness = Harness(args)
     status = {"complete": False, "valid": False}
 
     def interrupt(_signum, _frame):
         raise KeyboardInterrupt
 
-    signal.signal(signal.SIGTERM, interrupt)
+    previous_sigterm = signal.signal(signal.SIGTERM, interrupt)
     try:
+        harness = Harness(args)
         harness.prepare()
         with harness.nginx(
             "origin", "origin.conf", args.origin_cpu, args.origin_port
@@ -654,6 +1059,7 @@ def main():
         print(repr(error), file=sys.stderr)
         return 2
     finally:
+        signal.signal(signal.SIGTERM, previous_sigterm)
         save_json(args.output / "status.json", status)
 
 

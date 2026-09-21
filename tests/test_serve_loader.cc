@@ -1213,21 +1213,24 @@ TEST(serve_loader, nginx_exact_loopback_no_content_output_is_owned_and_reuses_cl
     std::filesystem::remove(path);
 }
 
-TEST(serve_loader, nginx_exact_loopback_bodyful_output_is_owned_and_reuses_cleanly) {
-    const std::string dir = "/tmp/rut_serve_loader_nginx_exact_bodyful";
+TEST(serve_loader, nginx_exact_loopback_max_body_output_is_owned_and_reuses_cleanly) {
+    constexpr u32 kBodyLen = nginx::kMaxLocalReturnBodyLen;
+    const std::string dir = "/tmp/rut_serve_loader_nginx_exact_max_body";
     const std::string path = dir + "/app.rut";
     std::string generated;
     {
-        char nginx_source[] =
-            "server { listen 127.0.0.1:8082; "
-            "location = /static { return 200 \"successor-static\"; } "
-            "location / { proxy_pass http://127.0.0.1:9000; } }";
-        const auto parsed = nginx::parse({nginx_source, sizeof(nginx_source) - 1u});
+        const std::string body(kBodyLen, 'a');
+        std::string nginx_source =
+            "server { listen 127.0.0.1:8082; location / { "
+            "proxy_pass http://127.0.0.1:9000; } location = /static { return 200 \"" +
+            body + "\"; } }";
+        const auto parsed =
+            nginx::parse({nginx_source.data(), static_cast<u32>(nginx_source.size())});
         REQUIRE(parsed);
         const auto lowered = nginx::lower_to_rut(parsed.value());
         REQUIRE(lowered);
         generated.assign(lowered.value().data, lowered.value().len);
-        memset(nginx_source, 'x', sizeof(nginx_source) - 1u);
+        std::fill(nginx_source.begin(), nginx_source.end(), 'x');
     }
     write_file(dir, "app.rut", generated.c_str());
     std::fill(generated.begin(), generated.end(), 'y');
@@ -1296,7 +1299,11 @@ TEST(serve_loader, nginx_exact_loopback_bodyful_output_is_owned_and_reuses_clean
         CHECK(policy.content_type.eq(lit_str("text/plain")));
         CHECK(policy.connection == StrictLocalResponseConnection::Request);
         CHECK(policy.head_mode == StrictLocalResponseHeadMode::SuppressBody);
-        CHECK(policy.body.eq(lit_str("successor-static")));
+        REQUIRE_EQ(policy.body.len, kBodyLen);
+        REQUIRE(program.config.strict_local_response_bytes_owned(policy.body));
+        CHECK(std::all_of(policy.body.ptr, policy.body.ptr + policy.body.len, [](char byte) {
+            return byte == 'a';
+        }));
         CHECK(program.config.strict_local_response_bytes_owned(policy.reason));
         CHECK(program.config.strict_local_response_bytes_owned(policy.server));
         CHECK(program.config.strict_local_response_bytes_owned(policy.content_type));
@@ -3696,7 +3703,7 @@ TEST(serve_loader, nginx_issue357_wildcard_p63_no_uri_output_is_owned_and_reuses
         REQUIRE(lowered);
         REQUIRE_EQ(lowered.value().len, 3417u);
         CHECK_EQ(lowered.value().data[lowered.value().len], '\0');
-        CHECK_EQ(nginx::RutSource::kCapacity - lowered.value().len, 5333u);
+        CHECK_EQ(nginx::RutSource::kCapacity - lowered.value().len, 9362u);
         generated.assign(lowered.value().data, lowered.value().len);
         REQUIRE_EQ(generated.rfind("listen :65535\n", 0u), 0u);
         CHECK(generated.find("target_transform") == std::string::npos);

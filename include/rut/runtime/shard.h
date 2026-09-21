@@ -5,6 +5,7 @@
 #include "rut/runtime/access_log.h"
 #include "rut/runtime/access_log_live_producer.h"
 #include "rut/runtime/arena.h"
+#include "rut/runtime/connection_capacity.h"
 #include "rut/runtime/error.h"
 #include "rut/runtime/event_loop.h"
 #include "rut/runtime/metrics.h"
@@ -99,7 +100,16 @@ struct Shard {
 
     // Initialize shard: mmap EventLoop, init backend + arena.
     // listen_fd must already be created with SO_REUSEPORT.
-    core::Expected<void, Error> init(u32 shard_id, i32 lfd, u32 pool_prealloc = 0) {
+    core::Expected<void, Error> init(u32 shard_id,
+                                     i32 lfd,
+                                     u32 pool_prealloc = 0,
+                                     u32 capacity = kDefaultConnectionCapacity) {
+        if (!validate_connection_capacity(capacity))
+            return core::make_unexpected(Error::make(EINVAL, Error::Source::Mmap));
+        if constexpr (!(requires { loop->init(shard_id, listen_fd, pool_prealloc, capacity); })) {
+            if (capacity != kDefaultConnectionCapacity)
+                return core::make_unexpected(Error::make(EINVAL, Error::Source::Mmap));
+        }
         id = shard_id;
         listen_fd = lfd;
 
@@ -113,7 +123,12 @@ struct Shard {
         if (mem == MAP_FAILED) return core::make_unexpected(Error::from_errno(Error::Source::Mmap));
         loop = new (mem) EventLoopType();
 
-        auto loop_result = loop->init(shard_id, listen_fd, pool_prealloc);
+        auto loop_result = [&]() {
+            if constexpr (requires { loop->init(shard_id, listen_fd, pool_prealloc, capacity); })
+                return loop->init(shard_id, listen_fd, pool_prealloc, capacity);
+            else
+                return loop->init(shard_id, listen_fd, pool_prealloc);
+        }();
         if (!loop_result) {
             loop->~EventLoopType();
             munmap(loop, sizeof(EventLoopType));

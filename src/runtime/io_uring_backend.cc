@@ -33,7 +33,9 @@ static bool response_deadline_copy_owner(const Connection& conn, u32 upstream_ep
     return aux == 0 && conn.fd >= 0 && conn.upstream_fd >= 0 &&
            (conn.state == ConnState::Proxying ||
             (post_commit && conn.state == ConnState::Sending)) &&
-           conn.protocol == ConnProtocol::Http11 && !conn.tls_active && conn.h2 == nullptr &&
+           conn.protocol == ConnProtocol::Http11 &&
+           (!conn.tls_active || response_read_deadline_tls_complete_get_profile_is_stable(conn)) &&
+           conn.h2 == nullptr &&
            (conn.response_read_deadline_state == ResponseReadDeadlineState::Armed ||
             (post_commit &&
              conn.response_read_deadline_state == ResponseReadDeadlineState::BodyComplete)) &&
@@ -160,7 +162,36 @@ static void sqe_advance_tail(u32* sq_tail) {
 
 // --- Init ---
 
-core::Expected<void, Error> IoUringBackend::init(u32 /*shard_id*/, i32 lfd) {
+core::Expected<void, Error> IoUringBackend::init_send_state_storage(u32 capacity) {
+    if (!validate_connection_capacity(capacity))
+        return core::make_unexpected(Error::make(EINVAL, Error::Source::Mmap));
+    auto downstream = send_state.init(capacity);
+    if (!downstream) return core::make_unexpected(downstream.error());
+    auto upstream = upstream_send_state.init(capacity);
+    if (!upstream) {
+        send_state.destroy();
+        return core::make_unexpected(upstream.error());
+    }
+    for (u32 i = 0; i < capacity; i++) {
+        send_state[i] = {nullptr, -1, 0, 0, IoEventType::Send, 0, 0};
+        upstream_send_state[i] = {nullptr, -1, 0, 0, IoEventType::UpstreamSend, 0, 0};
+    }
+    connection_capacity = capacity;
+    return {};
+}
+
+void IoUringBackend::destroy_send_state_storage() {
+    connection_capacity = 0;
+    upstream_send_state.destroy();
+    send_state.destroy();
+}
+
+core::Expected<void, Error> IoUringBackend::init(u32 /*shard_id*/, i32 lfd, u32 capacity) {
+    if ((connection_capacity != 0 && connection_capacity != capacity) || ring_fd >= 0 ||
+        timer_fd >= 0)
+        return core::make_unexpected(Error::make(EINVAL, Error::Source::IoUring));
+    auto storage = init_send_state_storage(capacity);
+    if (!storage) return core::make_unexpected(storage.error());
     listen_fd = lfd;
     // Explicitly init fds to -1: mmap-zeroed memory skips default member initializers,
     // so timer_fd/ring_fd could be 0. If init fails early and calls shutdown(), closing
@@ -170,21 +201,22 @@ core::Expected<void, Error> IoUringBackend::init(u32 /*shard_id*/, i32 lfd) {
     timer_read_armed = false;
     fatal_error.store(0, std::memory_order_relaxed);
     reset_downstream_recv_wait_state();
-    for (u32 i = 0; i < kMaxSendState; i++) {
-        send_state[i] = {nullptr, -1, 0, 0, IoEventType::Send, 0, 0};
-        upstream_send_state[i] = {nullptr, -1, 0, 0, IoEventType::UpstreamSend, 0, 0};
-    }
-
     // Setup io_uring with desired flags
     struct io_uring_params params;
     memset(&params, 0, sizeof(params));
-    params.flags = IORING_SETUP_COOP_TASKRUN;
+    // wait() consults IORING_SQ_TASKRUN before bypassing enter. Request the
+    // notification so a busy visible CQ cannot hide cooperative task work.
+    params.flags = IORING_SETUP_COOP_TASKRUN | IORING_SETUP_TASKRUN_FLAG;
     // Note: SQPOLL requires CAP_SYS_NICE or io_uring_register credentials.
     // Omit for now, add as optimization later.
 
     constexpr u32 kRingEntries = 16384;
     ring_fd = io_uring_setup(kRingEntries, &params);
-    if (ring_fd < 0) return core::make_unexpected(Error::make(-ring_fd, Error::Source::IoUring));
+    if (ring_fd < 0) {
+        i32 err = -ring_fd;
+        shutdown();
+        return core::make_unexpected(Error::make(err, Error::Source::IoUring));
+    }
 
     sq_ring_entries = params.sq_entries;
     cq_ring_entries = params.cq_entries;
@@ -206,6 +238,7 @@ core::Expected<void, Error> IoUringBackend::init(u32 /*shard_id*/, i32 lfd) {
     auto* sq_base = static_cast<u8*>(sq_ring_ptr);
     sq_head = reinterpret_cast<u32*>(sq_base + params.sq_off.head);
     sq_tail = reinterpret_cast<u32*>(sq_base + params.sq_off.tail);
+    sq_flags = reinterpret_cast<u32*>(sq_base + params.sq_off.flags);
     sq_ring_mask = reinterpret_cast<u32*>(sq_base + params.sq_off.ring_mask);
     sq_array = reinterpret_cast<u32*>(sq_base + params.sq_off.array);
 
@@ -361,6 +394,7 @@ void IoUringBackend::submit_timer_read() {
 // --- Operations ---
 
 void IoUringBackend::add_accept() {
+    if (ring_fd < 0) return;
     io_uring_sqe* sqe = get_sqe();
     if (!sqe) return;
 
@@ -376,6 +410,7 @@ void IoUringBackend::add_accept() {
 }
 
 bool IoUringBackend::add_recv(i32 fd, u32 conn_id) {
+    if (conn_id >= connection_capacity || connection_capacity == 0) return false;
     io_uring_sqe* sqe = get_sqe();
     if (!sqe) return false;
 
@@ -394,7 +429,7 @@ bool IoUringBackend::add_recv(i32 fd, u32 conn_id) {
 }
 
 bool IoUringBackend::add_recv_upstream(i32 fd, u32 conn_id, u32 upstream_episode) {
-    if (conn_id >= kMaxSendState || !valid_upstream_episode(upstream_episode)) return false;
+    if (conn_id >= connection_capacity || !valid_upstream_episode(upstream_episode)) return false;
     io_uring_sqe* sqe = get_sqe();
     if (!sqe) return false;
 
@@ -413,15 +448,20 @@ bool IoUringBackend::add_recv_upstream(i32 fd, u32 conn_id, u32 upstream_episode
     return true;
 }
 
-bool IoUringBackend::add_recv_upstream_once(i32 fd, u32 conn_id, u32 upstream_episode) {
-    if (conn_id >= kMaxSendState || !valid_upstream_episode(upstream_episode)) return false;
+bool IoUringBackend::add_recv_upstream_once(i32 fd,
+                                            u32 conn_id,
+                                            u32 upstream_episode,
+                                            u32 max_len) {
+    if (conn_id >= connection_capacity || !valid_upstream_episode(upstream_episode) ||
+        max_len == 0 || max_len > kProvidedBufSize)
+        return false;
     io_uring_sqe* sqe = get_sqe();
     if (!sqe) return false;
 
     memset(sqe, 0, sizeof(*sqe));
     sqe->opcode = IORING_OP_RECV;
     sqe->fd = fd;
-    sqe->len = kProvidedBufSize;
+    sqe->len = max_len;
     sqe->buf_group = kBufGroupId;
     sqe->flags = IOSQE_BUFFER_SELECT;
     sqe->user_data =
@@ -433,7 +473,7 @@ bool IoUringBackend::add_recv_upstream_once(i32 fd, u32 conn_id, u32 upstream_ep
 }
 
 bool IoUringBackend::add_first_response_recv(i32 fd, u32 conn_id, u32 upstream_episode) {
-    if (fd < 0 || conn_id >= kMaxSendState || !valid_upstream_episode(upstream_episode))
+    if (fd < 0 || conn_id >= connection_capacity || !valid_upstream_episode(upstream_episode))
         return false;
     io_uring_sqe* sqe = get_sqe();
     if (!sqe) return false;
@@ -454,7 +494,7 @@ bool IoUringBackend::add_first_response_recv(i32 fd, u32 conn_id, u32 upstream_e
 }
 
 bool IoUringBackend::pause_recv(i32 fd, u32 conn_id) {
-    if (fd < 0 || conn_id >= kMaxSendState) return false;
+    if (fd < 0 || conn_id >= connection_capacity) return false;
     return cancel_by_user_data(
         encode_user_data(conn_id, IoEventType::Recv), kCancelConnId, IoEventType::Recv);
 }
@@ -466,7 +506,7 @@ bool IoUringBackend::pause_recv(i32 fd, u32 conn_id) {
 // (pinning the slot until it drains) and re-arms the recv only once it arrives — so
 // the in-flight cancel can never match a freshly-armed recv on the reused conn_id.
 bool IoUringBackend::pause_upstream_recv(i32 fd, u32 conn_id, u32 upstream_episode) {
-    if (fd < 0 || conn_id >= kMaxSendState || !valid_upstream_episode(upstream_episode))
+    if (fd < 0 || conn_id >= connection_capacity || !valid_upstream_episode(upstream_episode))
         return false;
     return cancel_by_user_data(
         encode_upstream_user_data(conn_id, IoEventType::UpstreamRecv, upstream_episode),
@@ -477,7 +517,7 @@ bool IoUringBackend::pause_upstream_recv(i32 fd, u32 conn_id, u32 upstream_episo
 }
 
 bool IoUringBackend::cancel_retiring_upstream(u32 conn_id, IoEventType type, u32 upstream_episode) {
-    if (conn_id >= kMaxSendState || !io_event_is_upstream(type) ||
+    if (conn_id >= connection_capacity || !io_event_is_upstream(type) ||
         !valid_upstream_episode(upstream_episode))
         return false;
     return cancel_by_user_data(encode_upstream_user_data(conn_id, type, upstream_episode),
@@ -488,12 +528,13 @@ bool IoUringBackend::cancel_retiring_upstream(u32 conn_id, IoEventType type, u32
 }
 
 bool IoUringBackend::add_send(i32 fd, u32 conn_id, const u8* buf, u32 len, u32 generation) {
+    if (conn_id >= connection_capacity || connection_capacity == 0) return false;
     io_uring_sqe* sqe = get_sqe();
     if (!sqe) return false;  // SQ full — don't record send_state without a submitted SQE
 
     // Record send state only after acquiring SQE — if kernel returns partial,
     // wait() re-submits the remainder.
-    if (conn_id < kMaxSendState) {
+    if (conn_id < connection_capacity) {
         send_state[conn_id] = {buf, fd, 0, len, IoEventType::Send, 0, generation};
     }
 
@@ -517,11 +558,11 @@ bool IoUringBackend::flush_pending_nonblocking() {
 
 bool IoUringBackend::add_send_upstream(
     i32 fd, u32 conn_id, const u8* buf, u32 len, u32 upstream_episode) {
-    if (conn_id >= kMaxSendState || !valid_upstream_episode(upstream_episode)) return false;
+    if (conn_id >= connection_capacity || !valid_upstream_episode(upstream_episode)) return false;
     io_uring_sqe* sqe = get_sqe();
     if (!sqe) return false;
 
-    if (conn_id < kMaxSendState) {
+    if (conn_id < connection_capacity) {
         upstream_send_state[conn_id] = {
             buf, fd, 0, len, IoEventType::UpstreamSend, upstream_episode, 0};
     }
@@ -541,7 +582,7 @@ bool IoUringBackend::add_send_upstream(
 
 bool IoUringBackend::add_connect(
     i32 fd, u32 conn_id, const void* addr, u32 addr_len, u32 upstream_episode) {
-    if (conn_id >= kMaxSendState || !valid_upstream_episode(upstream_episode)) return false;
+    if (conn_id >= connection_capacity || !valid_upstream_episode(upstream_episode)) return false;
     io_uring_sqe* sqe = get_sqe();
     if (!sqe) return false;
 
@@ -559,6 +600,8 @@ bool IoUringBackend::add_connect(
 }
 
 bool IoUringBackend::add_yield_timeout(u32 conn_id, Connection& conn, u32 ms) {
+    if (connection_capacity == 0 || conn_id >= connection_capacity || conn.id != conn_id)
+        return false;
     io_uring_sqe* sqe = get_sqe();
     if (!sqe) {
         // SQ full — flush pending SQEs to make room, then retry once.
@@ -601,7 +644,7 @@ bool IoUringBackend::add_response_read_timer(u32 conn_id,
                                              u32 milliseconds,
                                              u32 deadline_generation,
                                              u32 upstream_episode) {
-    if (conn_id >= kMaxSendState || conn_id > kIoUserDataMaxConnId || conn.id != conn_id ||
+    if (conn_id >= connection_capacity || conn_id > kIoUserDataMaxConnId || conn.id != conn_id ||
         milliseconds == 0 || deadline_generation == 0 ||
         !valid_upstream_episode(upstream_episode) || !conn.response_read_timer_owner_is_neutral() ||
         conn.response_read_timer_generation >= kResponseReadTimerGenerationMask)
@@ -647,7 +690,7 @@ bool IoUringBackend::add_response_read_timer(u32 conn_id,
 }
 
 bool IoUringBackend::cancel_response_read_timer(u32 conn_id, Connection& conn) {
-    if (conn_id >= kMaxSendState || conn_id > kIoUserDataMaxConnId || conn.id != conn_id ||
+    if (conn_id >= connection_capacity || conn_id > kIoUserDataMaxConnId || conn.id != conn_id ||
         conn.response_read_timer_phase != ResponseReadTimerPhase::Armed ||
         !conn.response_read_timer_owner_is_valid())
         return false;
@@ -686,6 +729,7 @@ bool IoUringBackend::cancel_response_read_timer(u32 conn_id, Connection& conn) {
 }
 
 void IoUringBackend::cancel_accept() {
+    if (ring_fd < 0) return;
     io_uring_sqe* sqe = get_sqe();
     if (!sqe) return;
 
@@ -716,8 +760,10 @@ void IoUringBackend::cancel_accept() {
 // Returns true if the SQE was queued, false if SQ is full.
 bool IoUringBackend::cancel_by_user_data(
     u64 target, u32 conn_id, IoEventType type, u32 aux, u32 upstream_episode) {
+    if (conn_id != kCancelConnId && (connection_capacity == 0 || conn_id >= connection_capacity))
+        return false;
     if (io_event_is_upstream(type) &&
-        (conn_id >= kMaxSendState || !valid_upstream_episode(upstream_episode)))
+        (conn_id >= connection_capacity || !valid_upstream_episode(upstream_episode)))
         return false;
     io_uring_sqe* sqe = get_sqe();
     if (!sqe) {
@@ -752,6 +798,7 @@ bool IoUringBackend::cancel_by_user_data(
 }
 
 bool IoUringBackend::cancel_yield_timeout(u32 conn_id, u32 yield_timer_gen) {
+    if (connection_capacity == 0 || conn_id >= connection_capacity) return false;
     return cancel_by_user_data(
         encode_user_data(conn_id, IoEventType::HandlerTimer, yield_timer_gen),
         kCancelConnId,
@@ -774,6 +821,7 @@ u32 IoUringBackend::cancel(i32 /*fd*/,
                            bool* send_cancel_owned) {
     if (upstream_cancel_mask) *upstream_cancel_mask = 0;
     if (send_cancel_owned) *send_cancel_owned = false;
+    if (connection_capacity == 0 || conn_id >= connection_capacity) return 0;
     if ((has_upstream || upstream_connect_armed || upstream_recv_armed || upstream_send_armed) &&
         !valid_upstream_episode(upstream_episode))
         return 0;
@@ -788,7 +836,7 @@ u32 IoUringBackend::cancel(i32 /*fd*/,
             submitted++;
     }
     if (send_armed) {
-        const u32 generation = conn_id < kMaxSendState ? send_state[conn_id].generation : 0;
+        const u32 generation = conn_id < connection_capacity ? send_state[conn_id].generation : 0;
         if (cancel_by_user_data(encode_user_data(conn_id, IoEventType::Send, generation),
                                 conn_id,
                                 IoEventType::Send,
@@ -866,10 +914,16 @@ u32 IoUringBackend::wait(IoEvent* events, u32 max_events, Connection* conns, u32
     // Retry timer read if previous submit_timer_read() failed (SQ was full)
     if (timer_fd >= 0 && !timer_read_armed) submit_timer_read();
 
-    // Submit pending SQEs and wait for at least 1 CQE
+    // A previous submission (including close-path cancellation) may already
+    // have produced CQEs. Harvest them without another enter when there is no
+    // SQ work to flush. Never defer pending submissions behind a busy CQ.
+    const bool ready =
+        __atomic_load_n(cq_head, __ATOMIC_ACQUIRE) != __atomic_load_n(cq_tail, __ATOMIC_ACQUIRE);
+    const u32 kernel_flags = sq_flags ? __atomic_load_n(sq_flags, __ATOMIC_ACQUIRE) : 0;
+    const bool kernel_work = (kernel_flags & (IORING_SQ_CQ_OVERFLOW | IORING_SQ_TASKRUN)) != 0;
     u32 flags = IORING_ENTER_GETEVENTS;
     i32 ret;
-    for (;;) {
+    while (pending != 0 || !ready || kernel_work) {
         if (pending > 0) {
             ret = io_uring_enter(ring_fd, pending, 1, flags);
             if (ret >= 0) pending -= static_cast<u32>(ret);
@@ -986,6 +1040,29 @@ u32 IoUringBackend::wait(IoEvent* events, u32 max_events, Connection* conns, u32
         u32 aux = 0;
         u32 upstream_episode = 0;
         decode_user_data(cqe->user_data, conn_id, type, aux, upstream_episode);
+
+        // Dispatch an already completed downstream send before copying
+        // or publishing a later receive for that same connection. A sequential
+        // client can receive the response and submit its next request before
+        // userspace dispatches the send CQE; eager copying must not turn that
+        // request into a pipelined successor of the still-live old request.
+        // The same boundary keeps a following FIN out of the old completed-body
+        // deadline batch. Tagged sends with an active deadline retain whole-batch
+        // arbitration; only BodyComplete no longer has an expiry to arbitrate.
+        // Prebuilt header/retirement rendezvous already owns late receive
+        // bytes explicitly and must retain its existing whole-batch settlement.
+        if (type == IoEventType::Recv && aux == 0 &&
+            (conns == nullptr || conn_id >= max_conns ||
+             conns[conn_id].http1_prebuilt_disposition == Http1RequestBufferDisposition::None)) {
+            bool prior_send = false;
+            for (u32 i = 0; i < count; ++i)
+                prior_send |= events[i].conn_id == conn_id && events[i].type == IoEventType::Send &&
+                              (events[i].non_upstream_generation == 0 ||
+                               (conns != nullptr && conn_id < max_conns &&
+                                conns[conn_id].response_read_deadline_state ==
+                                    ResponseReadDeadlineState::BodyComplete));
+            if (prior_send) break;
+        }
 
         // Cancel CQEs — silently consume, don't emit event
         if (conn_id == kCancelConnId) {
@@ -1232,8 +1309,18 @@ u32 IoUringBackend::wait(IoEvent* events, u32 max_events, Connection* conns, u32
         // --- Send completion: enforce full-send proactor semantics ---
         // If IORING_OP_SEND returned partial, re-submit the remainder.
         // Only emit completion when all bytes sent (or error).
-        if ((type == IoEventType::Send || (type == IoEventType::UpstreamSend && aux == 0)) &&
-            conn_id < kMaxSendState) {
+        // A downstream token authenticates the SendState whose byte counters
+        // the proactor is about to mutate. Stale/cancel tokens and multishot
+        // records reach the default emitter unchanged for dispatch to handle.
+        bool downstream_send_proactor = false;
+        if (type == IoEventType::Send && conn_id < connection_capacity) {
+            const u32 current_generation = send_state[conn_id].generation;
+            downstream_send_proactor = aux == current_generation &&
+                                       (aux & kNonUpstreamSendCancelBit) == 0 &&
+                                       (cqe->flags & IORING_CQE_F_MORE) == 0;
+        }
+        if ((type == IoEventType::Send && downstream_send_proactor) ||
+            (type == IoEventType::UpstreamSend && aux == 0 && conn_id < connection_capacity)) {
             auto& ss = (type == IoEventType::UpstreamSend) ? upstream_send_state[conn_id]
                                                            : send_state[conn_id];
             const bool live_upstream_send_owned =
@@ -1423,6 +1510,7 @@ void IoUringBackend::shutdown() {
         close(ring_fd);
         ring_fd = -1;
     }
+    destroy_send_state_storage();
 }
 
 }  // namespace rut

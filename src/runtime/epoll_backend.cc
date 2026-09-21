@@ -135,8 +135,9 @@ static void rearm_recv_interest(i32 epoll_fd,
                                 IoEventType type,
                                 const i32* downstream_fd_map,
                                 const i32* upstream_fd_map,
+                                u32 capacity,
                                 u32 upstream_episode) {
-    if (conn_id >= EpollBackend::kMaxFdMap) return;
+    if (conn_id >= capacity) return;
 
     if (type == IoEventType::UpstreamRecv || type == IoEventType::UpstreamSend) {
         i32 fd = upstream_fd_map[conn_id];
@@ -173,29 +174,80 @@ bool EpollBackend::decode_data(u64 data, u32& conn_id, IoEventType& type, u32& u
     return true;
 }
 
-core::Expected<void, Error> EpollBackend::init(u32 /*shard_id*/, i32 lfd) {
-    listen_fd = lfd;
-    epoll_fd = -1;
-    timer_fd = -1;
-    yield_timer_fd = -1;
-    pending_count = 0;
-    pending_streak = 0;
-    for (u32 i = 0; i < kMaxFdMap; i++) {
+core::Expected<void, Error> EpollBackend::init_state_storage(u32 capacity) {
+    if (!validate_connection_capacity(capacity))
+        return core::make_unexpected(Error::make(EINVAL, Error::Source::Mmap));
+    auto d = downstream_fd_map.init(capacity);
+    if (!d) return core::make_unexpected(d.error());
+    auto u = upstream_fd_map.init(capacity);
+    if (!u) {
+        downstream_fd_map.destroy();
+        return core::make_unexpected(u.error());
+    }
+    auto a = active_upstream_episode.init(capacity);
+    if (!a) {
+        upstream_fd_map.destroy();
+        downstream_fd_map.destroy();
+        return core::make_unexpected(a.error());
+    }
+    auto s = send_state.init(capacity);
+    if (!s) {
+        active_upstream_episode.destroy();
+        upstream_fd_map.destroy();
+        downstream_fd_map.destroy();
+        return core::make_unexpected(s.error());
+    }
+    auto us = upstream_send_state.init(capacity);
+    if (!us) {
+        send_state.destroy();
+        active_upstream_episode.destroy();
+        upstream_fd_map.destroy();
+        downstream_fd_map.destroy();
+        return core::make_unexpected(us.error());
+    }
+    for (u32 i = 0; i < capacity; i++) {
         downstream_fd_map[i] = -1;
         upstream_fd_map[i] = -1;
         active_upstream_episode[i] = 0;
         send_state[i] = {nullptr, -1, 0, 0, IoEventType::Send, false, 0, 0};
         upstream_send_state[i] = {nullptr, -1, 0, 0, IoEventType::UpstreamSend, false, 0, 0};
     }
+    connection_capacity = capacity;
+    return {};
+}
 
+void EpollBackend::destroy_state_storage() {
+    connection_capacity = 0;
+    upstream_send_state.destroy();
+    send_state.destroy();
+    active_upstream_episode.destroy();
+    upstream_fd_map.destroy();
+    downstream_fd_map.destroy();
+}
+
+core::Expected<void, Error> EpollBackend::init(u32 /*shard_id*/, i32 lfd, u32 capacity) {
+    if ((connection_capacity != 0 && connection_capacity != capacity) || epoll_fd >= 0 ||
+        timer_fd >= 0 || yield_timer_fd >= 0)
+        return core::make_unexpected(Error::make(EINVAL, Error::Source::Epoll));
+    auto storage = init_state_storage(capacity);
+    if (!storage) return core::make_unexpected(storage.error());
+    listen_fd = lfd;
+    epoll_fd = -1;
+    timer_fd = -1;
+    yield_timer_fd = -1;
+    pending_count = 0;
+    pending_streak = 0;
     epoll_fd = epoll_create1(EPOLL_CLOEXEC);
-    if (epoll_fd < 0) return core::make_unexpected(Error::from_errno(Error::Source::Epoll));
+    if (epoll_fd < 0) {
+        i32 err = errno;
+        shutdown();
+        return core::make_unexpected(Error::make(err, Error::Source::Epoll));
+    }
 
     timer_fd = timerfd_create(CLOCK_MONOTONIC, TFD_NONBLOCK | TFD_CLOEXEC);
     if (timer_fd < 0) {
         i32 err = errno;
-        close(epoll_fd);
-        epoll_fd = -1;
+        shutdown();
         return core::make_unexpected(Error::make(err, Error::Source::Timerfd));
     }
 
@@ -250,6 +302,7 @@ void EpollBackend::arm_yield_timerfd(u64 deadline_ns) {
 }
 
 void EpollBackend::add_accept() {
+    if (epoll_fd < 0 || listen_fd < 0) return;
     struct epoll_event ev;
     ev.events = EPOLLIN;
     ev.data.u64 = encode_data(kListenConnId, IoEventType::Accept, 0);
@@ -257,7 +310,8 @@ void EpollBackend::add_accept() {
 }
 
 bool EpollBackend::add_recv(i32 fd, u32 conn_id) {
-    if (conn_id < kMaxFdMap) downstream_fd_map[conn_id] = fd;
+    if (conn_id >= connection_capacity || connection_capacity == 0) return false;
+    downstream_fd_map[conn_id] = fd;
     // Re-arming the recv must not clobber an in-flight downstream send on the
     // same fd: a single fd carries one epoll interest mask, so a bare EPOLLIN
     // would drop a pending send's EPOLLOUT and stall it. This happens in the
@@ -268,7 +322,7 @@ bool EpollBackend::add_recv(i32 fd, u32 conn_id) {
     // and chains EPOLLOUT to handle_epollout).
     IoEventType type = IoEventType::Recv;
     u32 events = EPOLLIN;
-    if (conn_id < kMaxFdMap) {
+    if (conn_id < connection_capacity) {
         const auto& ss = send_state[conn_id];
         if (ss.remaining > 0 && ss.fd == fd) {
             type = ss.type;
@@ -285,7 +339,7 @@ bool EpollBackend::add_recv(i32 fd, u32 conn_id) {
 
 void EpollBackend::quiesce_recv(u32 conn_id, bool upstream, u32 upstream_episode) {
     if (upstream && !valid_upstream_episode(upstream_episode)) return;
-    if (conn_id >= kMaxFdMap) return;
+    if (conn_id >= connection_capacity) return;
     i32 fd = upstream ? upstream_fd_map[conn_id] : downstream_fd_map[conn_id];
     if (fd < 0) return;
     const auto& ss = upstream ? upstream_send_state[conn_id] : send_state[conn_id];
@@ -304,13 +358,13 @@ void EpollBackend::quiesce_recv(u32 conn_id, bool upstream, u32 upstream_episode
 }
 
 void EpollBackend::clear_send_state(u32 conn_id) {
-    if (conn_id >= kMaxFdMap) return;
+    if (conn_id >= connection_capacity) return;
     send_state[conn_id] = {nullptr, -1, 0, 0, IoEventType::Send, false, 0, 0};
     upstream_send_state[conn_id] = {nullptr, -1, 0, 0, IoEventType::UpstreamSend, false, 0, 0};
 }
 
 bool EpollBackend::begin_upstream_episode(u32 conn_id, u32 episode) {
-    if (conn_id >= kMaxFdMap || !valid_upstream_episode(episode)) return false;
+    if (conn_id >= connection_capacity || !valid_upstream_episode(episode)) return false;
     if (active_upstream_episode[conn_id] != 0) return false;
     if (upstream_fd_map[conn_id] != -1) return false;
     if (!upstream_send_state_detached(upstream_send_state[conn_id])) return false;
@@ -321,7 +375,7 @@ bool EpollBackend::begin_upstream_episode(u32 conn_id, u32 episode) {
 
 bool EpollBackend::retire_upstream_episode_after_detach(Connection& conn, u32 expected_episode) {
     const u32 conn_id = conn.id;
-    if (conn_id >= kMaxFdMap || !valid_upstream_episode(expected_episode)) return false;
+    if (conn_id >= connection_capacity || !valid_upstream_episode(expected_episode)) return false;
     if (active_upstream_episode[conn_id] != expected_episode ||
         conn.upstream_episode != expected_episode)
         return false;
@@ -362,7 +416,7 @@ bool EpollBackend::detach_upstream(Connection& conn, i32* detached_fd) {
     bool del_ok = true;
     if (fd >= 0 && epoll_ctl(epoll_fd, EPOLL_CTL_DEL, fd, nullptr) < 0) del_ok = (errno == ENOENT);
     clear_send_state(conn.id);
-    if (conn.id < kMaxFdMap) upstream_fd_map[conn.id] = -1;
+    if (conn.id < connection_capacity) upstream_fd_map[conn.id] = -1;
     conn.upstream_recv_armed = false;
     conn.upstream_send_armed = false;
     conn.upstream_fd = -1;
@@ -385,7 +439,7 @@ bool EpollBackend::detach_upstream(Connection& conn, i32* detached_fd) {
     // quarantine is intentionally sticky until the backend is rebuilt, and a
     // close failure may leave the descriptor leaked by the injected/observed
     // contract.
-    if (close_failed && conn.id < kMaxFdMap)
+    if (close_failed && conn.id < connection_capacity)
         active_upstream_episode[conn.id] = kUpstreamEpisodeExhausted;
 
     const bool retired =
@@ -400,14 +454,14 @@ bool EpollBackend::detach_upstream(Connection& conn, i32* detached_fd) {
 }
 
 void EpollBackend::quarantine_upstream_episode_on_slot_release(u32 conn_id) {
-    if (conn_id >= kMaxFdMap) return;
+    if (conn_id >= connection_capacity) return;
     const u32 owner = active_upstream_episode[conn_id];
     if (owner != 0 && owner != kUpstreamEpisodeExhausted)
         active_upstream_episode[conn_id] = kUpstreamEpisodeExhausted;
 }
 
 void EpollBackend::pause_recv(u32 conn_id, bool preserve_send_interest) {
-    if (conn_id >= kMaxFdMap) return;
+    if (conn_id >= connection_capacity) return;
     i32 fd = downstream_fd_map[conn_id];
     if (fd < 0) return;
     // Mask EPOLLIN so client data bytes during wait(ms) don't wake us on
@@ -437,7 +491,7 @@ void EpollBackend::pause_recv(u32 conn_id, bool preserve_send_interest) {
 void EpollBackend::pause_upstream_recv(u32 conn_id,
                                        u32 upstream_episode,
                                        bool preserve_send_interest) {
-    if (conn_id >= kMaxFdMap || !valid_upstream_episode(upstream_episode)) return;
+    if (conn_id >= connection_capacity || !valid_upstream_episode(upstream_episode)) return;
     i32 fd = upstream_fd_map[conn_id];
     if (fd < 0) return;
     // Mask all readability (events=0) so neither buffered upstream data nor a
@@ -459,7 +513,7 @@ void EpollBackend::pause_upstream_recv(u32 conn_id,
 
 bool EpollBackend::add_send_upstream(
     i32 fd, u32 conn_id, const u8* buf, u32 len, u32 upstream_episode) {
-    if (conn_id >= kMaxFdMap || !valid_upstream_episode(upstream_episode)) return false;
+    if (conn_id >= connection_capacity || !valid_upstream_episode(upstream_episode)) return false;
 
     // This operation can produce at most one synchronous completion.  The
     // producer is single-threaded/non-reentrant, so this entry check reserves
@@ -489,7 +543,7 @@ bool EpollBackend::add_send_upstream(
     }
 
     u32 sent = (nw > 0) ? static_cast<u32>(nw) : 0;
-    if (conn_id < kMaxFdMap) {
+    if (conn_id < connection_capacity) {
         upstream_send_state[conn_id] = {
             buf, fd, sent, len - sent, IoEventType::UpstreamSend, false, 0, upstream_episode};
     }
@@ -503,7 +557,7 @@ bool EpollBackend::add_send_upstream(
     }
     if (rc < 0) {
         const i32 registration_error = -errno;
-        if (conn_id < kMaxFdMap) {
+        if (conn_id < connection_capacity) {
             upstream_send_state[conn_id] = {
                 nullptr, -1, 0, 0, IoEventType::UpstreamSend, false, 0, 0};
         }
@@ -521,13 +575,13 @@ bool EpollBackend::add_send_upstream(
 }
 
 bool EpollBackend::add_recv_upstream(i32 fd, u32 conn_id, u32 upstream_episode) {
-    if (conn_id >= kMaxFdMap || !valid_upstream_episode(upstream_episode)) return false;
+    if (conn_id >= connection_capacity || !valid_upstream_episode(upstream_episode)) return false;
 
     // Registration failure emits one local-submit completion, so reserve its
     // slot before changing the fd map or calling epoll_ctl.
     if (pending_count >= kPendingCap) return false;
 
-    if (conn_id < kMaxFdMap) upstream_fd_map[conn_id] = fd;
+    if (conn_id < connection_capacity) upstream_fd_map[conn_id] = fd;
     // Symmetric to add_recv: preserve a pending client→upstream send's EPOLLOUT
     // when resuming upstream reads, so the upstream→client send completing does
     // not strand a still-draining client→upstream send on the upstream fd. Keep
@@ -535,7 +589,7 @@ bool EpollBackend::add_recv_upstream(i32 fd, u32 conn_id, u32 upstream_episode) 
     // to upstream_send_state for any non-Send type, and reads to the upstream fd.
     IoEventType type = IoEventType::UpstreamRecv;
     u32 events = EPOLLIN;
-    if (conn_id < kMaxFdMap) {
+    if (conn_id < connection_capacity) {
         const auto& ss = upstream_send_state[conn_id];
         if (ss.remaining > 0 && ss.fd == fd && ss.upstream_episode == upstream_episode) {
             if (ss.tls) {
@@ -547,7 +601,7 @@ bool EpollBackend::add_recv_upstream(i32 fd, u32 conn_id, u32 upstream_episode) 
     }
     if (set_fd_interest(epoll_fd, fd, conn_id, type, events, upstream_episode) < 0) {
         const i32 err = errno;
-        if (conn_id < kMaxFdMap) upstream_fd_map[conn_id] = -1;
+        if (conn_id < connection_capacity) upstream_fd_map[conn_id] = -1;
         return queue_pending_completion(pending_completions,
                                         pending_count,
                                         conn_id,
@@ -560,7 +614,7 @@ bool EpollBackend::add_recv_upstream(i32 fd, u32 conn_id, u32 upstream_episode) 
 }
 
 bool EpollBackend::add_send(i32 fd, u32 conn_id, const u8* buf, u32 len) {
-    if (conn_id >= kMaxFdMap) return false;
+    if (conn_id >= connection_capacity) return false;
 
     // One immediate/error completion is the only synchronous result this
     // producer can append; partial/EAGAIN uses epoll and consumes no slot.
@@ -579,7 +633,7 @@ bool EpollBackend::add_send(i32 fd, u32 conn_id, const u8* buf, u32 len) {
     }
 
     u32 sent = (nw > 0) ? static_cast<u32>(nw) : 0;
-    if (conn_id < kMaxFdMap) {
+    if (conn_id < connection_capacity) {
         send_state[conn_id] = {buf, fd, sent, len - sent, IoEventType::Send, false, 0, 0};
     }
 
@@ -592,7 +646,7 @@ bool EpollBackend::add_send(i32 fd, u32 conn_id, const u8* buf, u32 len) {
     }
     if (rc < 0) {
         i32 err = errno;
-        if (conn_id < kMaxFdMap) {
+        if (conn_id < connection_capacity) {
             send_state[conn_id] = {nullptr, -1, 0, 0, IoEventType::Send, false, 0, 0};
         }
         if (!queue_pending_completion(
@@ -603,7 +657,7 @@ bool EpollBackend::add_send(i32 fd, u32 conn_id, const u8* buf, u32 len) {
 }
 
 bool EpollBackend::add_send_tls(Connection& c, const u8* buf, u32 len) {
-    if (c.id >= kMaxFdMap) return false;
+    if (connection_capacity == 0 || c.id >= connection_capacity) return false;
 
     if (!c.tls_active || !c.tls) return add_send(c.fd, c.id, buf, len);
 
@@ -653,18 +707,18 @@ bool EpollBackend::add_send_tls(Connection& c, const u8* buf, u32 len) {
 
 bool EpollBackend::add_connect(
     i32 fd, u32 conn_id, const void* addr, u32 addr_len, u32 upstream_episode) {
-    if (conn_id >= kMaxFdMap || !valid_upstream_episode(upstream_episode)) return false;
+    if (conn_id >= connection_capacity || !valid_upstream_episode(upstream_episode)) return false;
 
     // Immediate connect results need one synthetic completion; reserve it
     // before changing the map or entering the kernel.
     if (pending_count >= kPendingCap) return false;
 
-    if (conn_id < kMaxFdMap) upstream_fd_map[conn_id] = fd;
+    if (conn_id < connection_capacity) upstream_fd_map[conn_id] = fd;
     i32 rc = connect(fd, static_cast<const struct sockaddr*>(addr), addr_len);
     if (rc == 0) {
         if (set_fd_interest(
                 epoll_fd, fd, conn_id, IoEventType::UpstreamRecv, EPOLLIN, upstream_episode) < 0) {
-            if (conn_id < kMaxFdMap) upstream_fd_map[conn_id] = -1;
+            if (conn_id < connection_capacity) upstream_fd_map[conn_id] = -1;
             // The probe/connect caller owns registration failure.  In
             // particular, do not turn this into a synthetic completion: the
             // pre-C1 health-probe contract treats false as deferred cleanup.
@@ -677,7 +731,7 @@ bool EpollBackend::add_connect(
                                       0,
                                       0,
                                       upstream_episode)) {
-            if (conn_id < kMaxFdMap) upstream_fd_map[conn_id] = -1;
+            if (conn_id < connection_capacity) upstream_fd_map[conn_id] = -1;
             return false;
         }
         return true;
@@ -687,7 +741,7 @@ bool EpollBackend::add_connect(
         if (set_fd_interest(
                 epoll_fd, fd, conn_id, IoEventType::UpstreamConnect, EPOLLOUT, upstream_episode) <
             0) {
-            if (conn_id < kMaxFdMap) upstream_fd_map[conn_id] = -1;
+            if (conn_id < connection_capacity) upstream_fd_map[conn_id] = -1;
             return false;
         }
         return true;
@@ -700,7 +754,7 @@ bool EpollBackend::add_connect(
                                   -errno,
                                   0,
                                   upstream_episode)) {
-        if (conn_id < kMaxFdMap) upstream_fd_map[conn_id] = -1;
+        if (conn_id < connection_capacity) upstream_fd_map[conn_id] = -1;
         return false;
     }
     return true;
@@ -730,7 +784,7 @@ u32 EpollBackend::wait(IoEvent* events, u32 max_events, Connection* conns, u32 m
         while (pending_count > 0) {
             IoEvent candidate = pending_completions[--pending_count];
             if (io_event_is_upstream(candidate.type) &&
-                (candidate.conn_id >= kMaxFdMap ||
+                (candidate.conn_id >= connection_capacity ||
                  active_upstream_episode[candidate.conn_id] != candidate.upstream_episode ||
                  pending_conns == nullptr || candidate.conn_id >= pending_max_conns ||
                  pending_conns[candidate.conn_id].upstream_episode != candidate.upstream_episode))
@@ -786,7 +840,7 @@ u32 EpollBackend::wait(IoEvent* events, u32 max_events, Connection* conns, u32 m
         // them before touching maps, socket state, connection buffers, or the
         // partial-send state; a malformed/stale record is simply consumed.
         if (io_event_is_upstream(type) &&
-            (conns == nullptr || conn_id >= max_conns || conn_id >= kMaxFdMap ||
+            (conns == nullptr || conn_id >= max_conns || conn_id >= connection_capacity ||
              !valid_upstream_episode(upstream_episode) ||
              conns[conn_id].upstream_episode != upstream_episode ||
              active_upstream_episode[conn_id] != upstream_episode))
@@ -801,7 +855,8 @@ u32 EpollBackend::wait(IoEvent* events, u32 max_events, Connection* conns, u32 m
         bool has_read = (ep_events[i].events & (EPOLLIN | EPOLLHUP | EPOLLERR | EPOLLRDHUP)) != 0;
         bool has_write = (ep_events[i].events & EPOLLOUT) != 0;
         bool send_ready = false;
-        if (!(ep_events[i].events & (EPOLLHUP | EPOLLERR | EPOLLRDHUP)) && conn_id < kMaxFdMap) {
+        if (!(ep_events[i].events & (EPOLLHUP | EPOLLERR | EPOLLRDHUP)) &&
+            conn_id < connection_capacity) {
             const auto& send_state_for_event =
                 (type == IoEventType::Send) ? send_state[conn_id] : upstream_send_state[conn_id];
             if (send_state_for_event.remaining > 0 && send_state_for_event.src != nullptr &&
@@ -853,7 +908,7 @@ u32 EpollBackend::wait(IoEvent* events, u32 max_events, Connection* conns, u32 m
                    (has_write || (ep_events[i].events & (EPOLLHUP | EPOLLERR | EPOLLRDHUP)))) {
             i32 err = 0;
             socklen_t errlen = sizeof(err);
-            i32 cfd = (conn_id < kMaxFdMap) ? upstream_fd_map[conn_id] : -1;
+            i32 cfd = (conn_id < connection_capacity) ? upstream_fd_map[conn_id] : -1;
             if (cfd >= 0) getsockopt(cfd, SOL_SOCKET, SO_ERROR, &err, &errlen);
             events[out] = {};
             events[out].conn_id = conn_id;
@@ -876,7 +931,7 @@ u32 EpollBackend::wait(IoEvent* events, u32 max_events, Connection* conns, u32 m
             IoEventType recv_type = type;
             if (type == IoEventType::Send) recv_type = IoEventType::Recv;
             i32 fd = -1;
-            if (conn_id < kMaxFdMap) {
+            if (conn_id < connection_capacity) {
                 fd = (recv_type == IoEventType::UpstreamRecv) ? upstream_fd_map[conn_id]
                                                               : downstream_fd_map[conn_id];
             }
@@ -939,7 +994,7 @@ u32 EpollBackend::wait(IoEvent* events, u32 max_events, Connection* conns, u32 m
                         if (nr > 0) {
                             buf.commit(static_cast<u32>(nr));
                             result = nr;
-                            if (type == IoEventType::Send && conn_id < kMaxFdMap &&
+                            if (type == IoEventType::Send && conn_id < connection_capacity &&
                                 send_state[conn_id].remaining > 0) {
                                 set_fd_interest(epoll_fd,
                                                 fd,
@@ -954,7 +1009,7 @@ u32 EpollBackend::wait(IoEvent* events, u32 max_events, Connection* conns, u32 m
                         } else {
                             i32 ssl_err = get_tls_hooks()->ssl_get_error(ssl, nr);
                             if (ssl_err == SSL_ERROR_WANT_READ || ssl_err == SSL_ERROR_WANT_WRITE) {
-                                if (type == IoEventType::Send && conn_id < kMaxFdMap &&
+                                if (type == IoEventType::Send && conn_id < connection_capacity &&
                                     send_state[conn_id].remaining > 0) {
                                     set_fd_interest(
                                         epoll_fd,
@@ -1021,7 +1076,7 @@ u32 EpollBackend::wait(IoEvent* events, u32 max_events, Connection* conns, u32 m
             out++;
 
         } else if (has_write) {
-            if (conn_id < kMaxFdMap) {
+            if (conn_id < connection_capacity) {
                 const auto& ss = (type == IoEventType::Send) ? send_state[conn_id]
                                                              : upstream_send_state[conn_id];
                 const bool upstream_state_current =
@@ -1038,23 +1093,33 @@ u32 EpollBackend::wait(IoEvent* events, u32 max_events, Connection* conns, u32 m
                 }
             }
         handle_epollout:
-            if (conn_id >= kMaxFdMap) continue;
+            if (conn_id >= connection_capacity) continue;
             auto& ss =
                 (type == IoEventType::Send) ? send_state[conn_id] : upstream_send_state[conn_id];
             if (io_event_is_upstream(type) && ss.upstream_episode != upstream_episode) {
                 // The raw record is current, but its partial-send state is
                 // stale. Do not perform I/O, clear state, or downgrade to a
                 // neutral legacy registration.
-                rearm_recv_interest(
-                    epoll_fd, conn_id, type, downstream_fd_map, upstream_fd_map, upstream_episode);
+                rearm_recv_interest(epoll_fd,
+                                    conn_id,
+                                    type,
+                                    downstream_fd_map,
+                                    upstream_fd_map,
+                                    connection_capacity,
+                                    upstream_episode);
                 continue;
             }
             if (ss.tls && (conns == nullptr || conn_id >= max_conns)) continue;
             if (ss.remaining == 0 || !ss.src || ss.fd < 0) {
                 // No outstanding send associated with this connection.
                 // Drop EPOLLOUT so a stale level-triggered wakeup cannot spin.
-                rearm_recv_interest(
-                    epoll_fd, conn_id, type, downstream_fd_map, upstream_fd_map, upstream_episode);
+                rearm_recv_interest(epoll_fd,
+                                    conn_id,
+                                    type,
+                                    downstream_fd_map,
+                                    upstream_fd_map,
+                                    connection_capacity,
+                                    upstream_episode);
                 continue;
             }
 
@@ -1154,7 +1219,7 @@ u32 EpollBackend::wait(IoEvent* events, u32 max_events, Connection* conns, u32 m
 void EpollBackend::shutdown() {
     pending_count = 0;
     pending_streak = 0;
-    for (u32 i = 0; i < kMaxFdMap; i++) active_upstream_episode[i] = 0;
+    for (u32 i = 0; i < connection_capacity; i++) active_upstream_episode[i] = 0;
     if (timer_fd >= 0) {
         close(timer_fd);
         timer_fd = -1;
@@ -1167,6 +1232,7 @@ void EpollBackend::shutdown() {
         close(epoll_fd);
         epoll_fd = -1;
     }
+    destroy_state_storage();
 }
 
 }  // namespace rut

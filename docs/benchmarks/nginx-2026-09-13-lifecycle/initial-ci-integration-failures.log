@@ -1,0 +1,10 @@
+ci-gcc-debug.log
+2026-09-13T11:29:12.9535584Z     require: /home/runner/work/Rut/Rut/tests/test_integration.cc:24647 -> proxy.wait_until_reached(3000)
+2026-09-13T11:29:12.9536400Z   FAIL: response_policy_request_connection_preserves_client_intent (/home/runner/work/Rut/Rut/tests/test_integration.cc:24647: proxy.wait_until_reached(3000))
+2026-09-13T11:29:12.9554747Z     require: /home/runner/work/Rut/Rut/tests/test_integration.cc:31768 -> runner.exact_upstream_neutral
+2026-09-13T11:29:12.9555537Z   FAIL: ordinary_source_coalesced_exact_strict_get_successor_iouring (/home/runner/work/Rut/Rut/tests/test_integration.cc:31768: runner.exact_upstream_neutral)
+ci-coverage.log
+2026-09-13T11:30:28.8391748Z     require: /home/runner/work/Rut/Rut/tests/test_integration.cc:24647 -> proxy.wait_until_reached(3000)
+2026-09-13T11:30:28.8421247Z   FAIL: response_policy_request_connection_preserves_client_intent (/home/runner/work/Rut/Rut/tests/test_integration.cc:24647: proxy.wait_until_reached(3000))
+2026-09-13T11:31:04.0073552Z     require: /home/runner/work/Rut/Rut/tests/test_integration.cc:31768 -> runner.exact_upstream_neutral
+2026-09-13T11:31:04.0102233Z   FAIL: ordinary_source_coalesced_exact_strict_get_successor_iouring (/home/runner/work/Rut/Rut/tests/test_integration.cc:31768: runner.exact_upstream_neutral)

@@ -155,6 +155,7 @@ without either declaration the listener defaults to `:8080`.
 | `--drain N` | Graceful drain window, seconds | `30` |
 | `--opt N` | JIT optimization level: `0` (low, fastest startup) .. `3` (high) | `2` |
 | `--pool-prealloc N` | Pre-commit N buffer slices per shard | `0` (lazy) |
+| `--max-connections-per-shard N` | Maximum connection slots allocated by each shard (Linux; macOS accepts only the default) | `16384` |
 | `--tls-cert PATH` | TLS certificate (PEM); enables TLS | off |
 | `--tls-key PATH` | TLS private key (PEM); required with `--tls-cert` | off |
 | `--access-log PATH` | Write access logs to PATH | off |
@@ -163,6 +164,14 @@ without either declaration the listener defaults to `:8080`.
 
 `--tls-cert`/`--tls-key` must be given together. With TLS enabled the
 server uses the epoll backend.
+
+`--max-connections-per-shard` is a startup-only setting. It accepts values
+from 1 through 16,777,213 (the runtime maximum) and applies independently to
+each shard, so aggregate capacity is approximately the configured value times
+the shard count and is also limited by available file descriptors and memory.
+Connection metadata scales with this setting; request and I/O buffers are
+still committed on demand. HTTP/2 connection and idle-upstream pools have
+their own bounded limits and are not changed by this option.
 
 `--opt` selects how hard the JIT optimizes each handler at startup:
 

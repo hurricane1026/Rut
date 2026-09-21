@@ -265,6 +265,41 @@ TEST(nginx_convert, server_and_http_outputs_match_api_without_opening_access_log
     CHECK(access(access_path.c_str(), F_OK) != 0);
 }
 
+TEST(nginx_convert, exact_local_return_cli_body_capacity_boundaries) {
+    const std::string directory = make_temp_dir();
+    REQUIRE_FALSE(directory.empty());
+    const auto source_for_body = [](const std::string& body) {
+        return std::string("server { listen 127.0.0.1:8080; location / { ") +
+               "proxy_pass http://127.0.0.1:9000; } location = /healthz { return 200 \"" + body +
+               "\"; } }\n";
+    };
+
+    for (const rut::u32 body_len : {1024u, rut::nginx::kMaxLocalReturnBodyLen}) {
+        const std::string body(body_len, 'a');
+        const std::string path = directory + "/body-" + std::to_string(body_len) + ".conf";
+        REQUIRE(write_file(path, source_for_body(body)));
+        const RunResult result = run_converter(g_executable, "server", path, path);
+        REQUIRE(WIFEXITED(result.status));
+        CHECK_EQ(WEXITSTATUS(result.status), 0);
+        CHECK(result.err.empty());
+        const size_t body_start = result.out.find(body);
+        REQUIRE_NE(body_start, std::string::npos);
+        CHECK_EQ(result.out.find(body, body_start + body.size()), std::string::npos);
+    }
+
+    const std::string oversized_body(rut::nginx::kMaxLocalReturnBodyLen + 1u, 'a');
+    const std::string oversized_path = directory + "/body-oversized.conf";
+    REQUIRE(write_file(oversized_path, source_for_body(oversized_body)));
+    const RunResult rejected =
+        run_converter(g_executable, "server", oversized_path, oversized_path);
+    REQUIRE(WIFEXITED(rejected.status));
+    CHECK_EQ(WEXITSTATUS(rejected.status), 1);
+    CHECK(rejected.out.empty());
+    CHECK(rejected.err.find(
+              "return body must match the bounded 1..4093-byte safe quoted ASCII grammar") !=
+          std::string::npos);
+}
+
 TEST(nginx_convert, access_log_off_cli_matches_server_output_without_log_declaration) {
     const std::string directory = make_temp_dir();
     REQUIRE_FALSE(directory.empty());

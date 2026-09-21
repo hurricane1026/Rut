@@ -5,6 +5,9 @@
 #include "rut/common/strict_local_response.h"
 
 namespace rut::nginx {
+
+static_assert(kMaxLocalReturnBodyLen <= kMaxStrictLocalResponseBodyLen);
+
 namespace {
 
 static constexpr char kTraceBody[] =

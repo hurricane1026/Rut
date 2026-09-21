@@ -1,0 +1,98 @@
+[
+  {
+    "requests": 140958,
+    "seconds": 1.099725,
+    "rps": 128175.68028370729,
+    "p50_us": 241.0,
+    "p95_us": 291.0,
+    "p99_us": 463.0,
+    "errors": {
+      "connect": 0,
+      "read": 0,
+      "write": 0,
+      "status": 0,
+      "timeout": 0
+    },
+    "client_cpu_seconds": 0.84,
+    "workload": "static",
+    "connection": "keepalive",
+    "engine": "nginx",
+    "rep": 1,
+    "concurrency": 32,
+    "warmup_errors": {
+      "connect": 0,
+      "read": 0,
+      "write": 0,
+      "status": 0,
+      "timeout": 0
+    },
+    "server_cpu_pct": 64.56159494419059,
+    "origin_cpu_pct": 0.0,
+    "server_rss_bytes": 16556032,
+    "valid": true
+  },
+  {
+    "requests": 137083,
+    "seconds": 1.099993,
+    "rps": 124621.70213810452,
+    "p50_us": 249.0,
+    "p95_us": 296.0,
+    "p99_us": 364.0,
+    "errors": {
+      "connect": 0,
+      "read": 0,
+      "write": 0,
+      "status": 0,
+      "timeout": 0
+    },
+    "client_cpu_seconds": 0.62,
+    "workload": "static",
+    "connection": "keepalive",
+    "engine": "rut",
+    "rep": 1,
+    "concurrency": 32,
+    "warmup_errors": {
+      "connect": 0,
+      "read": 0,
+      "write": 0,
+      "status": 0,
+      "timeout": 0
+    },
+    "server_cpu_pct": 76.36412231714203,
+    "origin_cpu_pct": 0.0,
+    "server_rss_bytes": 132939776,
+    "valid": true
+  },
+  {
+    "requests": 17880,
+    "seconds": 1.099484,
+    "rps": 16262.173892480474,
+    "p50_us": 1914.0,
+    "p95_us": 2163.0,
+    "p99_us": 2699.0,
+    "errors": {
+      "connect": 0,
+      "read": 0,
+      "write": 0,
+      "status": 0,
+      "timeout": 0
+    },
+    "client_cpu_seconds": 0.12,
+    "workload": "proxy",
+    "connection": "keepalive",
+    "engine": "nginx",
+    "rep": 1,
+    "concurrency": 32,
+    "warmup_errors": {
+      "connect": 0,
+      "read": 0,
+      "write": 0,
+      "status": 0,
+      "timeout": 0
+    },
+    "server_cpu_pct": 57.299605996994956,
+    "origin_cpu_pct": 28.19504422074355,
+    "server_rss_bytes": 16699392,
+    "valid": true
+  }
+]

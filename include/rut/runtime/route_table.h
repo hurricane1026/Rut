@@ -578,12 +578,18 @@ struct RouteConfig {
     // bounded the scan and admitted every enum value.
     bool has_slash_normalized_exact_strict_local_response_inventory() const {
         if (!strict_local_response_table_is_valid()) return false;
+        return has_slash_normalized_exact_strict_local_response_inventory_validated();
+    }
+
+private:
+    bool has_slash_normalized_exact_strict_local_response_inventory_validated() const {
         for (u32 i = 0; i < exact_strict_local_response_binding_count; i++)
             if (exact_strict_local_response_bindings[i].path_view == ExactPathView::SlashNormalized)
                 return true;
         return false;
     }
 
+public:
     bool has_strict_local_response_table_inventory() const {
         return has_strict_local_response_policy_inventory() || has_pre_route_metadata() ||
                has_unmatched_metadata() || has_exact_strict_local_response_inventory();
@@ -678,26 +684,74 @@ struct RouteConfig {
         return true;
     }
 
+    // Internal synchronous-use view. Public lookups still deep-validate every
+    // call. This object must not cross a callback, yield, or configuration
+    // mutation; create a fresh view after each such boundary.
+    class StrictLocalResponseView {
+        friend struct RouteConfig;
+        const RouteConfig* config_;
+        explicit StrictLocalResponseView(const RouteConfig& config)
+            : config_(config.strict_local_response_table_is_valid() ? &config : nullptr) {}
+
+    public:
+        StrictLocalResponseView(const StrictLocalResponseView&) = delete;
+        StrictLocalResponseView& operator=(const StrictLocalResponseView&) = delete;
+        bool valid_for(const RouteConfig* config) const {
+            return config_ != nullptr && config_ == config;
+        }
+        u16 pre_route_policy_id(u8 method) const {
+            return config_ ? config_->pre_route_policy_id_validated(method) : 0;
+        }
+        bool has_slash_normalized_exact_strict_local_response_inventory() const {
+            return config_ &&
+                   config_->has_slash_normalized_exact_strict_local_response_inventory_validated();
+        }
+        u16 match_exact_strict_local_response(Str target, u8 method) const {
+            return config_ ? config_->match_exact_strict_local_response_validated(target, method)
+                           : 0;
+        }
+        ExactStrictLocalResponseMatchResult match_exact_strict_local_response_views(
+            Str raw, Str normalized, u8 method) const {
+            return config_ ? config_->match_exact_strict_local_response_views_validated(
+                                 raw, normalized, method)
+                           : ExactStrictLocalResponseMatchResult{};
+        }
+    };
+
+    StrictLocalResponseView strict_local_response_view() const {
+        return StrictLocalResponseView(*this);
+    }
+
     bool unmatched_policy_table_is_valid() const {
         return !has_pre_route_metadata() && !has_exact_strict_local_response_inventory() &&
                strict_local_response_table_is_valid();
     }
 
     u16 pre_route_policy_id(u8 method_key) const {
+        if (!strict_local_response_table_is_valid()) return 0;
+        return pre_route_policy_id_validated(method_key);
+    }
+
+private:
+    u16 pre_route_policy_id_validated(u8 method_key) const {
         const u32 slot = route_method_slot_from_key(method_key);
-        if (slot == kRouteMethodSlotInvalid || slot == kRouteMethodAny ||
-            !strict_local_response_table_is_valid())
-            return 0;
+        if (slot == kRouteMethodSlotInvalid || slot == kRouteMethodAny) return 0;
         return pre_route_policy_ids[slot];
     }
 
+public:
     // Raw origin-form exact lookup. Query bytes are outside the selector; no
     // canonicalization is performed. Callers separately enforce the mandatory
     // full-target fragment witness before invoking this helper.
     u16 match_exact_strict_local_response(Str raw_target, u8 method_key) const {
-        if (!strict_local_response_table_is_valid() || raw_target.ptr == nullptr ||
-            raw_target.len == 0 || raw_target.ptr[0] != '/' || method_key == kRouteMethodInvalid ||
-            method_key == kRouteMethodAny ||
+        if (!strict_local_response_table_is_valid()) return 0;
+        return match_exact_strict_local_response_validated(raw_target, method_key);
+    }
+
+private:
+    u16 match_exact_strict_local_response_validated(Str raw_target, u8 method_key) const {
+        if (raw_target.ptr == nullptr || raw_target.len == 0 || raw_target.ptr[0] != '/' ||
+            method_key == kRouteMethodInvalid || method_key == kRouteMethodAny ||
             route_method_slot_from_key(method_key) == kRouteMethodSlotInvalid)
             return 0;
         auto match_method = [&](u8 wanted) -> u16 {
@@ -719,6 +773,7 @@ struct RouteConfig {
         return exact != 0 ? exact : match_method(kRouteMethodAny);
     }
 
+public:
     // Exact strict-local lookup over two independently supplied selection
     // views. The caller owns storage provenance for both ranges and must supply
     // the complete raw target plus an already-computed slash-normalized,
@@ -729,11 +784,18 @@ struct RouteConfig {
     // SlashNormalized ANY.
     ExactStrictLocalResponseMatchResult match_exact_strict_local_response_views(
         Str raw_target, Str slash_normalized_path, u8 method_key) const {
+        if (!strict_local_response_table_is_valid()) return {};
+        return match_exact_strict_local_response_views_validated(
+            raw_target, slash_normalized_path, method_key);
+    }
+
+private:
+    ExactStrictLocalResponseMatchResult match_exact_strict_local_response_views_validated(
+        Str raw_target, Str slash_normalized_path, u8 method_key) const {
         const ExactStrictLocalResponseMatchResult invalid{
             ExactStrictLocalResponseMatchState::InvalidInput, 0};
-        if (!strict_local_response_table_is_valid() || raw_target.ptr == nullptr ||
-            raw_target.len == 0 || slash_normalized_path.ptr == nullptr ||
-            slash_normalized_path.len == 0 ||
+        if (raw_target.ptr == nullptr || raw_target.len == 0 ||
+            slash_normalized_path.ptr == nullptr || slash_normalized_path.len == 0 ||
             slash_normalized_path.len > kMaxExactStrictLocalResponsePathLen ||
             method_key == kRouteMethodInvalid || method_key == kRouteMethodAny ||
             route_method_slot_from_key(method_key) == kRouteMethodSlotInvalid)
@@ -785,6 +847,7 @@ struct RouteConfig {
         return {ExactStrictLocalResponseMatchState::Miss, 0};
     }
 
+public:
     bool strict_local_response_policy_id_is_owned(u16 id) const {
         if (id == 0 || id > strict_local_response_policy_count ||
             strict_local_response_policy_count > kMaxStrictLocalResponsePolicies ||
@@ -1781,17 +1844,26 @@ public:
             !forward_response_buffering_mode_valid(b.response_buffering) ||
             (b.response_read_timeout_seconds == 0 && b.failure_policy_id == 0))
             return false;
-        if (b.response_buffering != ForwardResponseBufferingMode::None &&
-            (b.response_buffering != ForwardResponseBufferingMode::CompleteContentLength ||
-             !response_read_timeout_seconds_valid(b.response_read_timeout_seconds) ||
-             b.response_policy_id == 0 || b.failure_policy_id == 0 ||
-             b.timeout_failure_policy_id == 0 ||
-             !timeout_failure_policy_id_is_valid(b.timeout_failure_policy_id) ||
-             !complete_content_length_buffering_policies_valid(
-                 response_policies[b.response_policy_id - 1],
-                 failure_policies[b.failure_policy_id - 1],
-                 failure_policies[b.timeout_failure_policy_id - 1])))
-            return false;
+        if (b.response_buffering != ForwardResponseBufferingMode::None) {
+            if (b.response_buffering != ForwardResponseBufferingMode::CompleteContentLength ||
+                !response_read_timeout_seconds_valid(b.response_read_timeout_seconds) ||
+                b.response_policy_id == 0 || b.failure_policy_id == 0 ||
+                b.timeout_failure_policy_id == 0 ||
+                !timeout_failure_policy_id_is_valid(b.timeout_failure_policy_id))
+                return false;
+            const auto& response = response_policies[b.response_policy_id - 1];
+            const auto& failure = failure_policies[b.failure_policy_id - 1];
+            const auto& timeout = failure_policies[b.timeout_failure_policy_id - 1];
+            // The entry checks above already validated all three complete policy shapes.
+            // The buffering role only needs these tuple fields; all Reject modes also satisfy
+            // the suppress-body equality check in the legacy None path below.
+            return response.version == ResponsePolicyVersion::Http11 &&
+                   response.framing == ResponsePolicyFraming::ContentLength &&
+                   response.connection == ResponsePolicyConnection::Request &&
+                   response.head_mode == ResponsePolicyHeadMode::Reject &&
+                   failure.head_mode == FailurePolicyHeadMode::Reject &&
+                   timeout.head_mode == FailurePolicyHeadMode::Reject;
+        }
         if (b.timeout_failure_policy_id == 0) return true;
         if (b.response_policy_id == 0 || b.failure_policy_id == 0 ||
             !timeout_failure_policy_id_is_valid(b.timeout_failure_policy_id))

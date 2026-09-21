@@ -3,7 +3,7 @@
 Run real pinned nginx and converter-generated RUT against the same requests on
 one physical core each, with separate cores for the client and origin. This is
 an opt-in local experiment, not a performance CI gate or an expansion of the
-nginx compatibility matrix. No production code is changed.
+nginx compatibility matrix. The harness does not modify production source.
 
 ## Requirements
 
@@ -40,6 +40,47 @@ one frontend per engine, then runs all concurrency levels in order on that
 same process. Higher levels include the earlier load history; this is not a
 cold-start-per-level capacity measurement. JIT startup is outside timing.
 
+The default `--keepalive-header explicit` preserves #644's original wire shape
+(`Connection: keep-alive`). The bounded converter proxy currently rejects that
+request shape, so the full default run can fail its proxy keepalive preflight.
+Use `--keepalive-header implicit` to test HTTP/1.1 default persistence with no
+Connection header. Preflight, wrk and the independent client all use the chosen
+shape, which is recorded in `environment.json`. Close cases always send
+`Connection: close`. Passing the implicit profile does **not** establish support
+for explicit keep-alive, nor erase the original failed results.
+
+`--proxy-profile native-streaming` selects the public native Rut DSL for the
+bounded 256 KiB `GET /proxy` keepalive workload. It requires exactly
+`--keepalive-header implicit --scenarios proxy-keepalive`; choose a nonempty
+subset of `--concurrency 1 32` (other levels are rejected);
+HTTP is the default, and the same run can use the existing `--tls-cert` /
+`--tls-key` TLS listener. This profile has no converter strict-response or
+request-deadline policy, so its measurements are recorded separately from the
+default `converter-strict` profile. Both frontends use a 60-second origin idle
+timeout and origin connection reuse; nginx has a 4096-entry idle upstream pool
+and streams responses with buffering disabled. Nginx's 16 KiB response header
+buffer is paired with a 16 KiB busy-buffer limit to satisfy its buffer
+configuration constraints; response buffering remains off and cannot spill to
+temporary files. Rut uses the native
+`upstream` / `forward` DSL and its per-shard 4096-connection idle pool.
+
+The native preflight first delays reading a complete 256 KiB response, then
+reads a successor response on that same downstream socket. It saves the exact
+response bytes and a read timing trace; this checks response integrity across a
+slow reader without claiming to prove an internal high/low water mark. It then
+sends 100 sequential requests on that socket and checks status, one exact
+Content-Length, one `application/octet-stream` Content-Type, keepalive
+semantics, no Transfer-Encoding, and every byte of a deterministic payload with
+distinct blocks. Separate marker values identify the slow-read and 100-request
+stages. The shared origin conditionally logs those markers with `$connection`
+and `$connection_requests`; the runner requires each stage to use one origin
+connection with a continuous request counter and retains the raw log. wrk does
+not send the marker, so the origin performs no access-log writes during
+throughput timing. This validates actual origin reuse instead of inferring it
+from pool settings. Nginx origin, upstream idle pool, and downstream connection
+allow up to 1,000,000,000 requests before recycling; the value is recorded in
+`environment.json`.
+
 Use `--duration 1 --warmup 1 --repeats 1 --concurrency 1 32` for a smoke test.
 Select cases with `--scenarios static-close proxy-keepalive`. Ports default to
 8087/9087; `--front-port` and `--origin-port` accept distinct free unprivileged
@@ -50,7 +91,7 @@ there is no resume that silently replaces warmed processes with fresh ones.
   proxy fallback required by the converter.
 - `proxy`: root proxy to a separate nginx origin returning 1024 bytes.
 - `close` / `keepalive`: downstream HTTP/1.1 connection behavior. Origin
-  keepalive is disabled identically for both engines. No TLS or pipelining.
+  keepalive is disabled identically for both engines. Default transport is HTTP; no pipelining.
 - nginx: one worker, Docker host network, access logging off. RUT: one shard,
   `--no-pin` with outer `taskset`, JIT O2, automatic I/O backend. Check the
   retained startup log for the actual backend (io_uring in the original run).
@@ -120,3 +161,54 @@ retained runtime failures are recorded in [VALIDATION.md](VALIDATION.md).
 preserves the original local findings. It was measured before this portable
 harness was extracted; the original numbers are not a rerun of this PR.
 EOF root-cause fixes and performance optimization are separate work.
+
+
+## TLS and response-size matrix
+
+`--body-size N` requests exactly N `x` bytes, up to 1 MiB. Without it, the
+original static/proxy payloads remain unchanged. Configurable proxy payloads
+are served from a read-only file mount by the origin. ETag, range advertisement
+and Last-Modified are disabled identically at that shared origin to preserve
+the controlled response-header shape; this is not a range/caching-header test. Static converter
+`local_response` currently supports at most 4093 bytes: larger static cases
+fail explicitly and do not count as passed. Established io_uring TLS supports
+exact local responses; strict proxy TLS and larger-body cells still require
+separate capability validation.
+
+HTTPS uses `--tls-cert cert.pem --tls-key key.pem`. Generate a throwaway RSA
+certificate with `openssl req -x509 -newkey rsa:2048 -nodes -days 7 -subj
+/CN=localhost -addext subjectAltName=DNS:localhost -keyout key.pem -out cert.pem`.
+Both frontends use the same certificate. The Python preflight verifies it and
+requires TLS 1.3 / TLS_AES_256_GCM_SHA384. Build the pinned wrk source with
+`wrk-tls-full-handshake.patch`, using the same OpenSSL and LuaJIT build options
+as the original client. The patch fixes protocol/cipher and X25519 key exchange, clears sessions on
+reconnect and rejects any resumed handshake. The harness rejects an HTTPS
+measurement lacking the patch's capability marker. Retain the client patch,
+build log and binary hash; a label alone is not external provenance proof.
+
+Short connections use full TLS handshakes; keepalive reuses established TLS
+connections. Ticket/resumption performance is a separate, unmeasured profile.
+TLS listener setup uses Rut's existing CLI: raw converter output is preserved
+as `.converted.rut`, its cleartext listener line is removed in the runnable
+file, and CLI port/certificate/key configure TLS. Both TLS frontends bind the
+same wildcard IPv4 port. This tests Rut TLS runtime performance, **not** TLS
+converter compatibility. Original HTTP output stays unmodified.
+
+`matrix.py` accepts the same binary/CPU arguments as `run.py`, plus required
+`--tls-cert` / `--tls-key`. Defaults are all four scenarios, HTTP and HTTPS,
+16 B / 1 KiB / 64 KiB / 1 MiB, and concurrency 1 / 32 / 128: 96 cells. Each
+case has isolated retained evidence. Failed setup, unsupported capabilities,
+missing repetitions and response errors leave their cells unpassed. A completed
+child run with exit 1 preserves valid sibling-concurrency measurements while
+rejecting the groups with bad samples. Other nonzero exits or missing/incomplete
+`status.json` completion evidence invalidate every group from that child. Unreadable
+or malformed JSON and invalid sample shapes are recorded as `evidence_error` for
+that coordinate; later coordinates still run. It keeps
+running other cases to expose the complete gap. `matrix.json` records exact
+coordinates, commands, median ratios and validity. The overall target requires
+every cell to reach Rut/nginx >= 1.10; both the requested duration and every
+sample's measured `seconds` must be at least 5, with at least three repeats.
+Short but otherwise valid measurements remain visible without qualifying for
+performance acceptance. Exit 2 includes
+valid measurements below target, not only execution errors. An interrupted
+matrix remains incomplete. This is a local goal check, not a performance CI gate.

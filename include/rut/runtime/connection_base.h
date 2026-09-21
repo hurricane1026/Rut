@@ -79,6 +79,7 @@ enum class ResponseReadDeadlinePostCommitPhase : u8 {
     BodySend,
     WaitingBody,
     OriginComplete,
+    CombinedSend,
 };
 
 enum class CompleteContentLengthResponseClass : u8 {
@@ -91,6 +92,7 @@ enum class ResponseReadDeadlineSendKind : u8 {
     None,
     Header,
     Body,
+    Combined,
 };
 
 // Kernel ownership for the generic precise response-read timer. CancelPending
@@ -698,6 +700,13 @@ struct ConnectionBase {
     bool response_read_deadline_send_close_target_owned = false;
     bool response_read_deadline_send_close_cancel_owned = false;
 
+    // Logical single-shot TLS application-send identity. It is separate from
+    // the per-SQE ciphertext identity and lives until the plaintext
+    // continuation is delivered or the connection closes.
+    u32 tls_send_owner_generation = 0;
+    i32 tls_send_owner_fd = -1;
+    u32 tls_send_owner_handler_generation = 0;
+
     // Generic precise response-read transport timer. The timespec and active
     // identity are kernel-owned storage: reset() must not mutate them before
     // every owned CQE has been harvested. The generation counter survives
@@ -810,10 +819,47 @@ struct ConnectionBase {
     }
 
     bool next_response_read_deadline_send_generation() {
+        return next_non_upstream_send_generation(response_read_deadline_send_owner_generation);
+    }
+
+    // One monotonically increasing token namespace covers strict plaintext and
+    // raw TLS sends. Allocating a raw/logical TLS token must not overwrite the
+    // active strict plaintext owner's generation.
+    bool next_non_upstream_send_generation(u32& generation) {
         if (response_read_deadline_send_generation == kNonUpstreamSendGenerationMask) return false;
-        ++response_read_deadline_send_generation;
-        response_read_deadline_send_owner_generation = response_read_deadline_send_generation;
+        generation = ++response_read_deadline_send_generation;
         return true;
+    }
+
+    template <typename Self, typename Visitor>
+    static void visit_tls_single_shot_send_owner_fields(Self& c, Visitor&& visit) {
+        visit(c.tls_send_owner_generation, u32{0});
+        visit(c.tls_send_owner_fd, i32{-1});
+        visit(c.tls_send_owner_handler_generation, u32{0});
+        visit(c.tls_send_src, static_cast<const u8*>(nullptr));
+        visit(c.tls_send_len, u32{0});
+        visit(c.tls_send_off, u32{0});
+        visit(c.tls_pending_on_send, static_cast<Callback>(nullptr));
+    }
+
+    template <typename Self, typename Visitor>
+    static void visit_tls_raw_send_owner_fields(Self& c, Visitor&& visit) {
+        visit(c.tls_out_inflight, false);
+        visit(c.tls_out_inflight_len, u32{0});
+        visit(c.tls_out_inflight_generation, u32{0});
+        visit(c.tls_out_inflight_fd, i32{-1});
+        visit(c.tls_out_inflight_src, static_cast<const u8*>(nullptr));
+    }
+
+    [[nodiscard]] bool tls_single_shot_send_owner_is_neutral() const {
+        return tls_send_owner_generation == 0 && tls_send_owner_fd == -1 &&
+               tls_send_owner_handler_generation == 0 && tls_send_src == nullptr &&
+               tls_send_len == 0 && tls_send_off == 0 && tls_pending_on_send == nullptr;
+    }
+
+    [[nodiscard]] bool tls_raw_send_owner_is_neutral() const {
+        return !tls_out_inflight && tls_out_inflight_len == 0 && tls_out_inflight_generation == 0 &&
+               tls_out_inflight_fd == -1 && tls_out_inflight_src == nullptr;
     }
 
     void clear_response_read_deadline_send_owner() {
@@ -1055,6 +1101,11 @@ struct ConnectionBase {
     // consume against this, not the (possibly grown) tls_out_buf.len(). See
     // docs/iouring-tls-output-buffer.md §3.1.
     u32 tls_out_inflight_len;
+    // Immutable source/fd/token snapshot for the current raw TLS target.
+    // Read-ahead can append output but cannot change the submitted prefix.
+    u32 tls_out_inflight_generation = 0;
+    i32 tls_out_inflight_fd = -1;
+    const u8* tls_out_inflight_src = nullptr;
     // Proxy-over-TLS streaming backpressure state (io_uring). Per-response, not
     // per-connection — cleared at the keep-alive request boundary, not only reset().
     bool tls_recv_paused_hw;   // upstream recv paused at the high watermark
@@ -1681,16 +1732,14 @@ struct ConnectionBase {
         tls_in_buf.bind(nullptr, 0);
         tls_out_slice = nullptr;
         tls_out_buf.bind(nullptr, 0);
-        tls_out_inflight = false;
-        tls_out_inflight_len = 0;
+        visit_tls_raw_send_owner_fields(
+            *this, [](auto& value, const auto& reset_value) { value = reset_value; });
         tls_recv_paused_hw = false;
         resp_fully_buffered = false;
         tls_proxy_stream = false;
-        tls_send_src = nullptr;
-        tls_send_len = 0;
-        tls_send_off = 0;
         tls_pending_on_recv = nullptr;
-        tls_pending_on_send = nullptr;
+        visit_tls_single_shot_send_owner_fields(
+            *this, [](auto& value, const auto& reset_value) { value = reset_value; });
         pipeline_depth = 0;
         pipeline_stash_len = 0;
         http1_pipeline_request_generation = 0;
