@@ -999,7 +999,10 @@ u32 IoUringBackend::wait(IoEvent* events, u32 max_events, Connection* conns, u32
         return true;
     };
 
-    u64 positive_downstream_tokens[kMaxEventsPerWait]{};
+    // Only entries below the count are read, and each is written first, so the
+    // array is left uninitialized: zeroing 2 KiB on every wait() call showed up
+    // as ~8% of userspace CPU in body-streaming proxy profiles.
+    u64 positive_downstream_tokens[kMaxEventsPerWait];
     u32 positive_downstream_token_count = 0;
 
     if (deferred_downstream_recv.active) {
