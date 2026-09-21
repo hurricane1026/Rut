@@ -3489,14 +3489,7 @@ public:
         const bool post_commit =
             c.response_read_deadline_post_commit_phase != ResponseReadDeadlinePostCommitPhase::None;
         const bool tls_bodyless_get_owner =
-            !post_commit &&
-            c.response_read_deadline_profile ==
-                ResponseReadDeadlineProfile::BodylessNonHeadContentLengthZero &&
-            c.response_read_deadline_buffering ==
-                ForwardResponseBufferingMode::CompleteContentLength &&
-            c.response_read_deadline_method == static_cast<u8>(LogHttpMethod::Get) &&
-            c.pipeline_depth == 0 && c.http1_pipeline_request_generation == 0 &&
-            c.pipeline_stash_len == 0 && response_read_deadline_tls_http11_engine_is_stable(c) &&
+            response_read_deadline_tls_complete_get_profile_is_stable(c) &&
             c.on_recv == &tls_recv<Self> && c.tls_pending_on_recv == nullptr;
         if (c.id >= connection_capacity || c.fd < 0 || c.upstream_fd < 0 || is_draining() ||
             (c.state != ConnState::Proxying && !(post_commit && c.state == ConnState::Sending)) ||

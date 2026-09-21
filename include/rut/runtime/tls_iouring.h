@@ -559,6 +559,25 @@ void tls_process(Self* loop, Connection& c) {
     if (!c.tls_out_inflight && !c.recv_armed && !loop->submit_recv(c)) loop->close_conn(c);
 }
 
+// Keep generic callback validation usable by loops that do not implement the
+// io_uring TLS engine. Taking the address of tls_recv<Self> instantiates its
+// body, which requires the io_uring-specific TLS drain interface.
+template <class Self>
+void tls_recv(void* lp, Connection& c, IoEvent ev);
+
+template <class Self>
+inline bool tls_recv_callback_is_current(const Connection& c) {
+    if constexpr (requires(Self* loop, Connection& conn, const u8* src, u32 len) {
+                      Self::kTlsDrainChunk;
+                      Self::kTlsOutHigh;
+                      loop->tls_ciphertext_send_is_current(conn);
+                      loop->submit_tls_ciphertext_send(conn, src, len);
+                  }) {
+        return c.on_recv != nullptr && c.on_recv == &tls_recv<Self>;
+    }
+    return false;
+}
+
 // on_recv handler for TLS connections: validate the recv, then drive the engine.
 template <class Self>
 void tls_recv(void* lp, Connection& c, IoEvent ev) {
