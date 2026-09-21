@@ -37,6 +37,8 @@ struct SmallLoop : EventLoopCRTP<SmallLoop> {
     TimerWheel timer;
     u32 shard_id = 0;
     bool running = true;
+    bool close_on_failed_send = false;
+    u32 send_submit_attempts = 0;
 
     static constexpr u32 kMaxConns = 64;
     static constexpr u32 kBufSize = 4096;  // test buffer size per direction
@@ -105,6 +107,8 @@ struct SmallLoop : EventLoopCRTP<SmallLoop> {
 
     void setup() {
         running = true;
+        close_on_failed_send = false;
+        send_submit_attempts = 0;
         draining = false;
         access_log = nullptr;
         live_access_log = nullptr;
@@ -168,7 +172,10 @@ struct SmallLoop : EventLoopCRTP<SmallLoop> {
     }
     bool submit_recv_impl(Connection& c) { return backend.add_recv(c.fd, c.id); }
     bool submit_send_impl(Connection& c, const u8* buf, u32 len) {
-        return backend.add_send(c.fd, c.id, buf, len);
+        send_submit_attempts++;
+        const bool submitted = backend.add_send(c.fd, c.id, buf, len);
+        if (!submitted && close_on_failed_send) close_conn(c);
+        return submitted;
     }
     bool submit_send_upstream_impl(Connection& c, const u8* buf, u32 len) {
         return backend.add_send_upstream(c.upstream_fd, c.id, buf, len, c.upstream_episode);

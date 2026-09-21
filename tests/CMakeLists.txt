@@ -448,6 +448,16 @@ find_package(Threads REQUIRED)
 target_link_libraries(test_fixture_bounded_http_exchange PRIVATE Threads::Threads)
 find_package(Python3 REQUIRED COMPONENTS Interpreter)
 
+add_test(
+    NAME test_cli_connection_capacity
+    COMMAND ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/test_cli_connection_capacity.py
+            $<TARGET_FILE:rut>)
+set_tests_properties(test_cli_connection_capacity PROPERTIES
+    LABELS "cli"
+    RUN_SERIAL TRUE
+    TIMEOUT 45)
+
 set(RUT_TLS_TESTDATA_DIR ${CMAKE_CURRENT_BINARY_DIR}/testdata)
 set(RUT_TLS_TEST_CERT ${RUT_TLS_TESTDATA_DIR}/localhost_cert.pem)
 set(RUT_TLS_TEST_KEY ${RUT_TLS_TESTDATA_DIR}/localhost_key.pem)
@@ -465,6 +475,8 @@ configure_file(
 )
 
 add_custom_target(test_tls_fixtures DEPENDS ${RUT_TLS_TEST_CERT} ${RUT_TLS_TEST_KEY})
+target_compile_definitions(test_network PRIVATE RUT_TESTDATA_DIR="${RUT_TLS_TESTDATA_DIR}")
+add_dependencies(test_network test_tls_fixtures)
 
 if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
 add_executable(test_integration

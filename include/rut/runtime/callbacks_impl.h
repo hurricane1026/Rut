@@ -8,6 +8,7 @@
 #include "rut/runtime/chunked_parser.h"
 #include "rut/runtime/connection.h"
 #include "rut/runtime/connection_base.h"
+#include "rut/runtime/connection_capacity.h"
 #include "rut/runtime/http_parser.h"
 #include "rut/runtime/io_event.h"
 #include "rut/runtime/jit_dispatch.h"
@@ -464,6 +465,13 @@ bool handle_configured_strict_local_response(Loop* loop,
                                              Connection& conn,
                                              const RouteConfig* config,
                                              u16 policy_id);
+template <typename Loop>
+bool handle_configured_strict_local_response_in_scope(
+    Loop* loop,
+    Connection& conn,
+    const RouteConfig* config,
+    u16 policy_id,
+    const RouteConfig::StrictLocalResponseView& view);
 u32 pipeline_leftover(const Connection& conn);
 PipelineTransitionResult pipeline_transition_status(const Connection& conn);
 PipelineTransitionResult pipeline_advance(Connection& conn);
@@ -547,7 +555,12 @@ inline bool ordinary_local_response_may_persist(Loop* loop,
 }
 
 inline bool exact_strict_local_response_base_request_shape_is_admitted(const Connection& conn) {
-    return conn.protocol == ConnProtocol::Http11 && !conn.tls_active && conn.h2 == nullptr &&
+    // io_uring TLS parses decrypted application bytes into the same receive
+    // buffer. Admit only an established engine; a forged tls_active flag or
+    // an unfinished handshake must not broaden the strict request domain.
+    const bool transport_ready =
+        !conn.tls_active || (conn.uses_iouring_tls() && conn.tls_handshake_complete);
+    return conn.protocol == ConnProtocol::Http11 && transport_ready && conn.h2 == nullptr &&
            conn.req_strict_h1_complete &&
            conn.req_http_version == static_cast<u8>(HttpVersion::Http11) &&
            conn.req_path_canon.ptr != nullptr && !conn.req_target_has_fragment &&
@@ -588,8 +601,9 @@ struct SlashNormalizedExactSelectionResult {
 // never changes the recv/log/forward target. OutputOverflow is a proven miss
 // for the normalized view but still permits an exact match against the complete
 // Raw view.
+template <typename ConfigView>
 inline SlashNormalizedExactSelectionResult select_slash_normalized_exact_strict_local_response(
-    const Connection& conn, const RouteConfig& config, u8 method_key) {
+    const Connection& conn, const ConfigView& config, u8 method_key) {
     const SlashNormalizedExactSelectionResult invalid{
         SlashNormalizedExactSelectionState::InvalidInput, 0};
     if (!config.has_slash_normalized_exact_strict_local_response_inventory() ||
@@ -961,8 +975,6 @@ template <typename Loop>
 inline void respond_validated_connect_completion_failure(Loop* loop,
                                                          Connection& conn,
                                                          const IoEvent& ev);
-template <typename Loop>
-void on_validated_preconnect_failure_sent(void* lp, Connection& conn, IoEvent ev);
 void prepare_early_response_state(Connection& conn);
 u32 consume_upstream_sent(Connection& conn);
 
@@ -1241,6 +1253,20 @@ bool prepare_response_read_deadline_preflight_for_mode(Loop* loop,
              preflight_downstream_close) &&
             conn.pipeline_depth == 0 && conn.http1_pipeline_request_generation == 0 &&
             conn.recv_buf.len() == conn.req_initial_send_len;
+        const bool tls_preflight_pending_recv_stable =
+            expected_mode == ForwardPreflightMode::EagerDirect
+                ? conn.tls_pending_on_recv == &on_header_received<Loop>
+                : ((expected_mode == ForwardPreflightMode::AfterCanonicalSelection ||
+                    expected_mode == ForwardPreflightMode::AfterRequestFramingSelection) &&
+                   conn.tls_pending_on_recv == nullptr);
+        const bool tls_bodyless_get_precise_preflight =
+            !conn.tls_active ||
+            (exact_bodyless_get_precise_preflight &&
+             response_read_deadline_tls_http11_engine_is_stable(conn) &&
+             tls_recv_callback_is_current<Loop>(conn) && tls_preflight_pending_recv_stable &&
+             conn.tls_raw_send_owner_is_neutral() && conn.tls_single_shot_send_owner_is_neutral() &&
+             !conn.tls_out_inflight && conn.tls_out_buf.len() == 0 && !conn.send_armed &&
+             conn.tls_pending_on_send == nullptr);
         const bool pipeline_generation_stable =
             http1_pipeline_request_generation_provisional_is_stable(conn,
                                                                     profile,
@@ -1258,7 +1284,8 @@ bool prepare_response_read_deadline_preflight_for_mode(Loop* loop,
             failure.connection != ForwardFailurePolicyConnection::Request ||
             timeout.version != ForwardFailurePolicyVersion::Http11 ||
             timeout.connection != ForwardFailurePolicyConnection::Request ||
-            conn.protocol != ConnProtocol::Http11 || conn.tls_active || conn.req_malformed ||
+            conn.protocol != ConnProtocol::Http11 || !tls_bodyless_get_precise_preflight ||
+            conn.req_malformed ||
             (!fixed_upload && (conn.req_body_mode != BodyMode::None ||
                                conn.req_body_remaining != 0 || conn.request_body_fully_buffered)) ||
             conn.req_client_has_transfer_encoding || conn.req_client_has_te ||
@@ -1598,6 +1625,11 @@ template <typename Loop>
 bool client_send(Loop* loop, Connection& conn, const u8* buf, u32 len) {
     throttle_advance(conn, len);
     return loop->submit_send(conn, buf, len);
+}
+
+template <typename Loop>
+void close_conn_if_live(Loop* loop, Connection& conn) {
+    if (conn.fd >= 0) loop->close_conn(conn);
 }
 
 // @throttle read-side gate for the proxy body pump. Called at each point where
@@ -2194,11 +2226,21 @@ void on_header_received(void* lp, Connection& conn, IoEvent ev) {
     // accounting or any response publication.  An active exact table also
     // requires a complete origin-form HTTP/1.1 request and the full-target
     // fragment witness before either exact selection or canonical fallback.
-    if ((has_strict_inventory && !config->strict_local_response_table_is_valid()) ||
-        (has_exact_inventory && (!conn.req_strict_h1_complete ||
-                                 conn.req_http_version != static_cast<u8>(HttpVersion::Http11) ||
-                                 conn.req_path_canon.ptr == nullptr ||
-                                 conn.req_target_has_fragment || conn.req_malformed))) {
+    const u8 request_method_key = route_method_key(static_cast<LogHttpMethod>(conn.req_method));
+    u16 pre_route_policy_id = 0;
+    if (config != nullptr) {
+        const auto entry_view = config->strict_local_response_view();
+        if (has_strict_inventory && !entry_view.valid_for(config)) {
+            conn.req_start_us = 0;
+            loop->close_conn(conn);
+            return;
+        }
+        pre_route_policy_id = entry_view.pre_route_policy_id(request_method_key);
+    }
+    if (has_exact_inventory && (!conn.req_strict_h1_complete ||
+                                conn.req_http_version != static_cast<u8>(HttpVersion::Http11) ||
+                                conn.req_path_canon.ptr == nullptr ||
+                                conn.req_target_has_fragment || conn.req_malformed)) {
         // The request timestamp is provisionally captured before config pin,
         // but this fence deliberately precedes epoch/metrics acquisition.
         // Clear it so close_conn does not publish a matching epoch leave or
@@ -2207,9 +2249,6 @@ void on_header_received(void* lp, Connection& conn, IoEvent ev) {
         loop->close_conn(conn);
         return;
     }
-    const u8 request_method_key = route_method_key(static_cast<LogHttpMethod>(conn.req_method));
-    const u16 pre_route_policy_id =
-        config != nullptr ? config->pre_route_policy_id(request_method_key) : 0;
     if (pre_route_policy_id != 0 &&
         !pre_route_strict_local_response_request_is_admitted(conn, request_method_key)) {
         conn.req_start_us = 0;
@@ -2283,36 +2322,46 @@ void on_header_received(void* lp, Connection& conn, IoEvent ev) {
     RouteParam route_params[kMaxRouteParams]{};
     u32 route_param_count = 0;
     if (config) {
-        const bool has_normalized_exact_inventory =
-            has_exact_inventory &&
-            config->has_slash_normalized_exact_strict_local_response_inventory();
-        u16 exact_policy_id = 0;
-        if (has_normalized_exact_inventory) {
-            const auto selection = select_slash_normalized_exact_strict_local_response(
-                conn, *config, request_method_key);
-            if (selection.state == SlashNormalizedExactSelectionState::InvalidInput) {
+        if (has_exact_inventory) {
+            // Request accounting/firewall/metrics above may call out. Revalidate
+            // here; reuse only through synchronous exact selection and publication.
+            const auto exact_view = config->strict_local_response_view();
+            if (has_strict_inventory && !exact_view.valid_for(config)) {
                 loop->close_conn(conn);
                 return;
             }
-            if (selection.state == SlashNormalizedExactSelectionState::Match)
-                exact_policy_id = selection.policy_id;
-        } else if (has_exact_inventory) {
-            // Preserve the established Raw-only fast path byte-for-byte: it
-            // neither obtains the new witness nor invokes the normalizer.
-            u32 raw_target_len = 0;
-            while (raw_target_len < sizeof(conn.req_path) && conn.req_path[raw_target_len] != '\0')
-                raw_target_len++;
-            exact_policy_id = config->match_exact_strict_local_response(
-                Str{conn.req_path, raw_target_len}, request_method_key);
-        }
-        if (exact_policy_id != 0) {
-            if (!exact_strict_local_response_request_is_admitted(conn)) {
-                loop->close_conn(conn);
+            const bool has_normalized_exact_inventory =
+                exact_view.has_slash_normalized_exact_strict_local_response_inventory();
+            u16 exact_policy_id = 0;
+            if (has_normalized_exact_inventory) {
+                const auto selection = select_slash_normalized_exact_strict_local_response(
+                    conn, exact_view, request_method_key);
+                if (selection.state == SlashNormalizedExactSelectionState::InvalidInput) {
+                    loop->close_conn(conn);
+                    return;
+                }
+                if (selection.state == SlashNormalizedExactSelectionState::Match)
+                    exact_policy_id = selection.policy_id;
+            } else {
+                // Preserve the established Raw-only fast path byte-for-byte: it
+                // neither obtains the new witness nor invokes the normalizer.
+                u32 raw_target_len = 0;
+                while (raw_target_len < sizeof(conn.req_path) &&
+                       conn.req_path[raw_target_len] != '\0')
+                    raw_target_len++;
+                exact_policy_id = exact_view.match_exact_strict_local_response(
+                    Str{conn.req_path, raw_target_len}, request_method_key);
+            }
+            if (exact_policy_id != 0) {
+                if (!exact_strict_local_response_request_is_admitted(conn)) {
+                    loop->close_conn(conn);
+                    return;
+                }
+                conn.http1_pipeline_boundary_owners_settled = false;
+                (void)handle_configured_strict_local_response_in_scope(
+                    loop, conn, config, exact_policy_id, exact_view);
                 return;
             }
-            conn.http1_pipeline_boundary_owners_settled = false;
-            (void)handle_configured_strict_local_response(loop, conn, config, exact_policy_id);
-            return;
         }
         // Use the parser-supplied canonical view (PR #50 round 7 path A)
         // to skip the redundant canon scan and the strlen-style scan
@@ -3300,6 +3349,10 @@ void handle_jit_outcome(Loop* loop,
                 client_send(loop, conn, conn.send_buf.data(), conn.send_buf.len());
             };
             auto send_internal_error = [&]() {
+                // A failed io_uring TLS send may already have closed and reset
+                // the connection. Do not format into buffers belonging to its
+                // reclaimed slot or attempt a second response.
+                if (conn.fd < 0) return;
                 conn.pending_handler_fn = nullptr;
                 conn.resp_status = 500;
                 format_static_response(conn, 500, /*keep_alive=*/false);
@@ -3513,6 +3566,7 @@ void handle_jit_outcome(Loop* loop,
             bool staged_fixed_head_continuation = false;
             bool fixed_upload_head_admitted = false;
             bool fixed_upload_head_initial_phase = false;
+            bool tls_complete_get_deadline_outcome_valid = false;
             if (outcome.response_read_timeout_seconds != 0) {
                 const bool loop_supports_deadline = [] {
                     if constexpr (requires { Loop::kSupportsExplicitFirstResponseDeadline; })
@@ -3708,7 +3762,9 @@ void handle_jit_outcome(Loop* loop,
                     conn.resp_header_mutation_pending_count != 0 ||
                     conn.resp_header_mutation_pending_overflow ||
                     conn.resp_header_mutation_overflow || conn.protocol != ConnProtocol::Http11 ||
-                    conn.tls_active ||
+                    (conn.tls_active &&
+                     (!bodyless_get_materialization ||
+                      !response_read_deadline_tls_http11_engine_is_stable(conn))) ||
                     !http1_pipeline_request_generation_jit_candidate_is_stable(
                         conn,
                         deadline_proof,
@@ -3727,6 +3783,9 @@ void handle_jit_outcome(Loop* loop,
                     loop->close_conn(conn);
                     return;
                 }
+                tls_complete_get_deadline_outcome_valid =
+                    conn.tls_active && bodyless_get_materialization && request_policy_valid &&
+                    target_valid && response_read_deadline_tls_http11_engine_is_stable(conn);
                 if (fixed_upload) {
                     auto& proof = conn.response_read_deadline_upload;
                     if ((proof.upstream_id != 0xffffu &&
@@ -4194,7 +4253,10 @@ void handle_jit_outcome(Loop* loop,
                  (forward_response_policy_id != 0 && !response_policy_request_connection &&
                   !conn.req_keep_alive) ||
                  (!suppress_body_head && conn.req_method == static_cast<u8>(LogHttpMethod::Head)) ||
-                 conn.tls_active || conn.req_path_canon.ptr == nullptr || conn.req_wants_upgrade ||
+                 (conn.tls_active &&
+                  (!tls_complete_get_deadline_outcome_valid ||
+                   !response_read_deadline_tls_complete_get_profile_is_stable(conn))) ||
+                 conn.req_path_canon.ptr == nullptr || conn.req_wants_upgrade ||
                  ((conn.req_body_mode != BodyMode::None || conn.request_body_fully_buffered) &&
                   !request_policy_body_response_admitted(conn)) ||
                  target.addr_count != 1 || target.addrs[0].sin_family != AF_INET ||
@@ -4546,7 +4608,7 @@ inline bool try_prebuilt_strict_read_timeout(Loop* loop, Connection& conn) {
                           candidate->disarm_response_read_deadline(candidate->conns[0]);
                       }) {
             if (conn.response_read_deadline_state == ResponseReadDeadlineState::ExpiryPending &&
-                conn.id < Loop::kMaxConns && &loop->conns[conn.id] == &conn &&
+                conn.id < connection_capacity_of(*loop) && &loop->conns[conn.id] == &conn &&
                 conn.upstream_recv_armed && loop->response_read_deadline_identity_is_stable(conn)) {
                 const bool no_progress = conn.upstream_recv_buf.len() == 0 &&
                                          conn.response_read_deadline_progress_generation == 0 &&
@@ -4639,7 +4701,10 @@ inline bool try_prebuilt_strict_read_timeout(Loop* loop, Connection& conn) {
                 conn.response_read_deadline_bundle_id,
                 ResponseReadDeadlineOwnerPhase::ActiveAfterCopy,
                 &on_upstream_response<Loop>);
-        if (conn.protocol != ConnProtocol::Http11 || conn.tls_active ||
+        const bool tls_timeout_transport =
+            !conn.tls_active || (response_read_deadline_tls_output_is_settled(conn) &&
+                                 tls_recv_callback_is_current<Loop>(conn));
+        if (conn.protocol != ConnProtocol::Http11 || !tls_timeout_transport ||
             conn.req_http_version != static_cast<u8>(HttpVersion::Http11) ||
             ((response_read_deadline_profile_suppresses_head(profile) &&
               conn.req_method != static_cast<u8>(LogHttpMethod::Head)) ||
@@ -4672,6 +4737,9 @@ inline bool try_prebuilt_strict_read_timeout(Loop* loop, Connection& conn) {
             conn.resp_header_mutation_pending_overflow || conn.resp_header_mutation_overflow)
             return false;
 
+        const bool recv_slot_stable = conn.tls_active ? tls_recv_callback_is_current<Loop>(conn) &&
+                                                            conn.tls_pending_on_recv == nullptr
+                                                      : conn.on_recv == nullptr;
         if (conn.state != ConnState::Proxying || conn.req_start_us == 0 || conn.epoch_held ||
             loop->is_draining() || conn.is_health_probe || conn.pending_handler_fn != nullptr ||
             conn.yield_armed || conn.yield_timeout_armed || conn.throttle_paused ||
@@ -4679,7 +4747,7 @@ inline bool try_prebuilt_strict_read_timeout(Loop* loop, Connection& conn) {
             conn.upstream_request_incomplete || conn.proxy_resp_started || conn.resp_status != 0 ||
             conn.resp_body_mode != BodyMode::None || conn.resp_body_remaining != 0 ||
             conn.resp_body_sent != 0 || conn.upstream_send_len != 0 || conn.send_progress != 0 ||
-            conn.send_armed || conn.on_send != nullptr || conn.on_recv != nullptr ||
+            conn.send_armed || conn.on_send != nullptr || !recv_slot_stable ||
             conn.response_header_buf.is_released() || !conn.response_header_buf.valid() ||
             conn.response_header_buf.len() != 0 || conn.upstream_fd < 0 ||
             !valid_upstream_episode(conn.upstream_episode) || conn.upstream_episode_quarantined ||
@@ -6722,6 +6790,66 @@ void on_response_header_sent(void* lp, Connection& conn, IoEvent ev) {
 }
 
 template <typename Loop>
+void on_complete_response_sent(void* lp, Connection& conn, IoEvent ev) {
+    auto* loop = static_cast<Loop*>(lp);
+    const bool send_owner_valid = [&]() {
+        if constexpr (requires(const Loop* candidate, const Connection& c, const IoEvent& event) {
+                          candidate->response_read_deadline_send_completion_is_valid(
+                              c, event, ResponseReadDeadlineSendKind::Combined);
+                      }) {
+            return loop->response_read_deadline_send_completion_is_valid(
+                conn, ev, ResponseReadDeadlineSendKind::Combined);
+        }
+        return false;
+    }();
+    if (!send_owner_valid || ev.result <= 0 ||
+        conn.response_read_deadline_post_commit_phase !=
+            ResponseReadDeadlinePostCommitPhase::CombinedSend ||
+        !response_read_deadline_post_commit_is_stable(conn)) {
+        loop->close_conn(conn);
+        return;
+    }
+
+    const u32 header_len = conn.response_header_buf.len();
+    const u32 body_len = conn.response_read_deadline_post_commit_declared_body;
+    const u32 raw_header_end = conn.response_read_deadline_post_commit_raw_header_end;
+    if (body_len > 0xFFFFFFFFu - header_len ||
+        static_cast<u32>(ev.result) != header_len + body_len ||
+        conn.response_read_deadline_post_commit_origin_received != body_len ||
+        conn.response_read_deadline_post_commit_send_body != body_len ||
+        conn.response_read_deadline_post_commit_downstream_submitted != body_len ||
+        conn.response_read_deadline_post_commit_downstream_completed != 0 ||
+        conn.response_read_deadline_post_commit_inflight_body != body_len ||
+        conn.resp_body_mode != BodyMode::ContentLength ||
+        conn.resp_body_sent != header_len + body_len || conn.resp_body_remaining != 0 ||
+        raw_header_end > 0xFFFFFFFFu - body_len ||
+        conn.upstream_send_len != raw_header_end + body_len ||
+        conn.upstream_recv_buf.len() != raw_header_end + body_len) {
+        loop->close_conn(conn);
+        return;
+    }
+
+    // The completion proves that the header and staged body both reached the
+    // client. Only now retire the original raw header+body prefix and let the
+    // existing post-batch pump perform normal origin/request completion.
+    conn.response_read_deadline_post_commit_downstream_completed = body_len;
+    conn.response_read_deadline_post_commit_inflight_body = 0;
+    if (consume_upstream_sent(conn) != 0 || conn.upstream_recv_buf.len() != 0) {
+        loop->close_conn(conn);
+        return;
+    }
+    conn.response_read_deadline_post_commit_phase =
+        ResponseReadDeadlinePostCommitPhase::WaitingBody;
+    if constexpr (requires(Loop* candidate, Connection& c) {
+                      candidate->defer_response_read_deadline_body_pump(c);
+                  }) {
+        loop->defer_response_read_deadline_body_pump(conn);
+    } else {
+        loop->close_conn(conn);
+    }
+}
+
+template <typename Loop>
 void pump_response_read_deadline_body(Loop* loop, Connection& conn) {
     if (!response_read_deadline_post_commit_is_stable(conn) ||
         conn.response_read_deadline_post_commit_phase !=
@@ -6746,6 +6874,44 @@ void pump_response_read_deadline_body(Loop* loop, Connection& conn) {
     }
     const u32 available = publish_body - completed;
     if (available == 0) {
+        const bool combined_send_marker =
+            conn.response_read_deadline_send_kind == ResponseReadDeadlineSendKind::Combined ||
+            conn.on_send == &on_complete_response_sent<Loop>;
+        const u32 combined_header_len = conn.response_header_buf.len();
+        const u32 combined_body_len = conn.response_read_deadline_post_commit_declared_body;
+        const bool combined_terminal_valid =
+            combined_body_len != 0 && combined_body_len <= 0xFFFFFFFFu - combined_header_len &&
+            complete_buffering && conn.state == ConnState::Sending && conn.req_start_us != 0 &&
+            !conn.epoch_held && conn.on_send == &on_complete_response_sent<Loop> &&
+            conn.response_read_deadline_send_kind == ResponseReadDeadlineSendKind::Combined &&
+            !conn.response_read_deadline_send_owner_active &&
+            conn.response_read_deadline_send_owner_generation != 0 &&
+            conn.response_read_deadline_send_tombstone_generation ==
+                conn.response_read_deadline_send_owner_generation &&
+            conn.response_read_deadline_send_deadline_generation ==
+                conn.response_read_deadline_post_commit_generation &&
+            conn.response_read_deadline_send_deadline_generation ==
+                conn.response_read_deadline_generation &&
+            conn.response_read_deadline_send_upstream_episode ==
+                conn.response_read_deadline_post_commit_episode &&
+            conn.response_read_deadline_post_commit_response_class ==
+                CompleteContentLengthResponseClass::BoundedPositiveBody &&
+            conn.response_read_deadline_post_commit_send_body == combined_body_len &&
+            conn.response_read_deadline_post_commit_origin_received == combined_body_len &&
+            conn.response_read_deadline_post_commit_downstream_submitted == combined_body_len &&
+            conn.response_read_deadline_post_commit_downstream_completed == combined_body_len &&
+            conn.response_read_deadline_post_commit_inflight_body == 0 &&
+            conn.response_read_deadline_post_commit_declared_body == combined_body_len &&
+            conn.response_read_deadline_send_src == conn.response_header_buf.data() &&
+            conn.response_read_deadline_send_len == combined_header_len + combined_body_len &&
+            conn.response_read_deadline_send_fd == conn.fd && conn.resp_body_remaining == 0 &&
+            conn.resp_body_sent == combined_header_len + combined_body_len &&
+            conn.upstream_send_len == 0 && conn.upstream_recv_buf.len() == 0 && !conn.send_armed &&
+            conn.send_progress == 0;
+        if (combined_send_marker && !combined_terminal_valid) {
+            loop->close_conn(conn);
+            return;
+        }
         if (complete_buffering && conn.response_read_deadline_post_commit_close_after_drain) {
             const ResponseReadDeadlineUploadProof close_proof = conn.response_read_deadline_upload;
             const bool explicit_close = close_proof.downstream_close;
@@ -6759,9 +6925,11 @@ void pump_response_read_deadline_body(Loop* loop, Connection& conn) {
                 !conn.response_read_deadline_send_owner_active && conn.send_progress == 0 &&
                 conn.resp_body_remaining == 0 &&
                 conn.resp_body_sent == conn.response_header_buf.len() + publish_body;
+            const bool combined_completion_valid = combined_terminal_valid;
             const bool completion_callback_valid =
-                publish_body == 0 ? conn.on_send == &on_response_header_sent<Loop>
-                                  : conn.on_send == &on_response_body_sent<Loop>;
+                publish_body == 0
+                    ? conn.on_send == &on_response_header_sent<Loop>
+                    : conn.on_send == &on_response_body_sent<Loop> || combined_completion_valid;
             const bool request_completion_owner_valid = conn.state == ConnState::Sending &&
                                                         completion_callback_valid &&
                                                         conn.req_start_us != 0 && !conn.epoch_held;
@@ -6825,7 +6993,8 @@ void pump_response_read_deadline_body(Loop* loop, Connection& conn) {
     conn.upstream_send_len = available;
     conn.response_read_deadline_post_commit_phase = ResponseReadDeadlinePostCommitPhase::BodySend;
     conn.transition_to_sending(&on_response_body_sent<Loop>);
-    if (!client_send(loop, conn, conn.upstream_recv_buf.data(), available)) loop->close_conn(conn);
+    if (!client_send(loop, conn, conn.upstream_recv_buf.data(), available))
+        close_conn_if_live(loop, conn);
 }
 
 template <typename Loop>
@@ -7115,7 +7284,7 @@ void proxy_stream_complete(Loop* loop, Connection& conn) {
     if constexpr (requires(Loop* candidate, Connection& c) {
                       candidate->defer_http1_request_boundary(c);
                   }) {
-        if (conn.upstream_retirement_active && loop->defer_http1_request_boundary(conn)) return;
+        if (loop->defer_http1_request_boundary(conn)) return;
     }
 
     // If this response was throttled, arm_throttle_timer pulled the connection off
@@ -7183,7 +7352,10 @@ void proxy_stream_complete(Loop* loop, Connection& conn) {
     conn.http1_pipeline_boundary_owners_settled = false;
     conn.reset_request_receive_buffer();
     conn.transition_to_reading_header(&on_header_received<Loop>);
-    loop->submit_recv(conn);
+    if constexpr (requires { loop->process_buffered_tls_input(conn); }) {
+        if (loop->process_buffered_tls_input(conn)) return;
+    }
+    if (!loop->submit_recv(conn) && conn.uses_iouring_tls()) close_conn_if_live(loop, conn);
 }
 
 template <typename Loop>
@@ -7268,7 +7440,7 @@ void on_response_body_sent(void* lp, Connection& conn, IoEvent ev) {
                          conn.upstream_episode};
         on_response_body_recvd<Loop>(lp, conn, synth);
     } else {
-        loop->submit_recv_upstream(conn);
+        if (!loop->submit_recv_upstream(conn)) loop->close_conn(conn);
     }
 }
 
@@ -7706,7 +7878,7 @@ bool ws_drive_close(Loop* loop, Connection& conn) {
     // Both slots have finished their Close (none pending, none draining) → tear down.
     if (!conn.ws_close_client_need && !conn.ws_close_client_inflight &&
         !conn.ws_close_upstream_need && !conn.ws_close_upstream_inflight) {
-        loop->close_conn(conn);
+        close_conn_if_live(loop, conn);
     }
     return true;
 }
@@ -7880,7 +8052,7 @@ template <typename Loop>
 void ws_close_if_drained(Loop* loop, Connection& conn) {
     if (!conn.ws_client_send_pending && !conn.ws_upstream_send_pending &&
         conn.recv_buf.len() == 0 && conn.upstream_recv_buf.len() == 0) {
-        loop->close_conn(conn);
+        close_conn_if_live(loop, conn);
     }
 }
 
@@ -7906,7 +8078,7 @@ void on_ws_client_recv(void* lp, Connection& conn, IoEvent ev) {
             // io_uring already consumed the socket data into its provided buffer
             // and discarded what didn't fit (IoUringBackend::wait), so pausing
             // would forward a corrupted stream. Fail closed instead.
-            loop->close_conn(conn);
+            close_conn_if_live(loop, conn);
             return;
         }
         // recv_buf full while the paired client→upstream send drains it. On
@@ -7915,12 +8087,12 @@ void on_ws_client_recv(void* lp, Connection& conn, IoEvent ev) {
         // reset + submit_recv). State-aware like on_response_body_recvd: only
         // pause when truly full — a non-full -ENOBUFS is a stale completion.
         if (conn.recv_buf.write_avail() == 0) {
-            if (!ws_pause_client_recv(loop, conn)) loop->close_conn(conn);
+            if (!ws_pause_client_recv(loop, conn)) close_conn_if_live(loop, conn);
         }
         return;
     }
     if (ev.result < 0) {
-        loop->close_conn(conn);  // hard error (e.g. ECONNRESET): not a clean FIN
+        close_conn_if_live(loop, conn);  // hard error (e.g. ECONNRESET): not a clean FIN
         return;
     }
     if (ev.result == 0) {
@@ -7928,13 +8100,13 @@ void on_ws_client_recv(void* lp, Connection& conn, IoEvent ev) {
         // buffered/in-flight bytes, then tear down once everything has drained.
         conn.ws_client_eof = true;
         if (!ws_drain_pump(loop, conn)) {
-            loop->close_conn(conn);
+            close_conn_if_live(loop, conn);
             return;
         }
         ws_close_if_drained(loop, conn);
         return;
     }
-    if (!ws_try_send_client_to_upstream(loop, conn)) loop->close_conn(conn);
+    if (!ws_try_send_client_to_upstream(loop, conn)) close_conn_if_live(loop, conn);
 }
 
 template <typename Loop>
@@ -7942,7 +8114,7 @@ void on_ws_client_to_upstream_sent(void* lp, Connection& conn, IoEvent ev) {
     auto* loop = static_cast<Loop*>(lp);
     conn.ws_client_send_pending = false;
     if (ev.result <= 0) {
-        loop->close_conn(conn);
+        close_conn_if_live(loop, conn);
         return;
     }
 #if RUT_ENABLE_WEBSOCKET
@@ -7954,12 +8126,12 @@ void on_ws_client_to_upstream_sent(void* lp, Connection& conn, IoEvent ev) {
         conn.ws_client_send_len = 0;
         if (conn.ws_closing) {  // a Close drained on the upstream slot — advance the handshake
             conn.ws_close_upstream_inflight = false;
-            if (!ws_drive_close(loop, conn)) loop->close_conn(conn);
+            if (!ws_drive_close(loop, conn)) close_conn_if_live(loop, conn);
             return;
         }
         if (ws_draining(conn)) {
             if (!ws_drain_pump(loop, conn)) {
-                loop->close_conn(conn);
+                close_conn_if_live(loop, conn);
                 return;
             }
             ws_close_if_drained(loop, conn);
@@ -7973,12 +8145,12 @@ void on_ws_client_to_upstream_sent(void* lp, Connection& conn, IoEvent ev) {
         // ws_try_send re-sets it via ws_pause_client_recv if it does send.
         conn.recv_paused_for_send = false;
         if (conn.recv_buf.len() > 0) {
-            if (!ws_try_send_client_to_upstream(loop, conn)) loop->close_conn(conn);
+            if (!ws_try_send_client_to_upstream(loop, conn)) close_conn_if_live(loop, conn);
             return;
         }
         // Resume client recv (paused for this send), and pump the opposite direction.
         if (!ws_resume_client_recv(loop, conn) || !ws_try_send_upstream_to_client(loop, conn)) {
-            loop->close_conn(conn);
+            close_conn_if_live(loop, conn);
         }
         return;
     }
@@ -7988,18 +8160,18 @@ void on_ws_client_to_upstream_sent(void* lp, Connection& conn, IoEvent ev) {
     if (ws_draining(conn)) {
         // Keep flushing both directions; close once everything has drained.
         if (!ws_drain_pump(loop, conn)) {
-            loop->close_conn(conn);
+            close_conn_if_live(loop, conn);
             return;
         }
         ws_close_if_drained(loop, conn);
         return;
     }
     if (conn.recv_buf.len() > 0) {
-        if (!ws_try_send_client_to_upstream(loop, conn)) loop->close_conn(conn);
+        if (!ws_try_send_client_to_upstream(loop, conn)) close_conn_if_live(loop, conn);
         return;
     }
     if (!ws_resume_client_recv(loop, conn) || !ws_try_send_upstream_to_client(loop, conn))
-        loop->close_conn(conn);
+        close_conn_if_live(loop, conn);
 }
 
 template <typename Loop>
@@ -8007,18 +8179,18 @@ void on_ws_upstream_recv(void* lp, Connection& conn, IoEvent ev) {
     auto* loop = static_cast<Loop*>(lp);
     if (ev.result == -ENOBUFS) {
         if constexpr (ws_loop_async<Loop>()) {
-            loop->close_conn(conn);  // overflow discarded by io_uring (see above)
+            close_conn_if_live(loop, conn);  // overflow discarded by io_uring (see above)
             return;
         }
         // upstream_recv_buf full while the paired upstream→client send drains it
         // (see on_ws_client_recv). Pause the upstream direction when truly full.
         if (conn.upstream_recv_buf.write_avail() == 0) {
-            if (!ws_pause_upstream_recv(loop, conn)) loop->close_conn(conn);
+            if (!ws_pause_upstream_recv(loop, conn)) close_conn_if_live(loop, conn);
         }
         return;
     }
     if (ev.result < 0) {
-        loop->close_conn(conn);  // hard error (e.g. ECONNRESET): not a clean FIN
+        close_conn_if_live(loop, conn);  // hard error (e.g. ECONNRESET): not a clean FIN
         return;
     }
     if (ev.result == 0) {
@@ -8026,13 +8198,13 @@ void on_ws_upstream_recv(void* lp, Connection& conn, IoEvent ev) {
         // directions, then tear down once everything has flushed.
         conn.ws_upstream_eof = true;
         if (!ws_drain_pump(loop, conn)) {
-            loop->close_conn(conn);
+            close_conn_if_live(loop, conn);
             return;
         }
         ws_close_if_drained(loop, conn);
         return;
     }
-    if (!ws_try_send_upstream_to_client(loop, conn)) loop->close_conn(conn);
+    if (!ws_try_send_upstream_to_client(loop, conn)) close_conn_if_live(loop, conn);
 }
 
 template <typename Loop>
@@ -8040,7 +8212,7 @@ void on_ws_upstream_to_client_sent(void* lp, Connection& conn, IoEvent ev) {
     auto* loop = static_cast<Loop*>(lp);
     conn.ws_upstream_send_pending = false;
     if (ev.result <= 0) {
-        loop->close_conn(conn);
+        close_conn_if_live(loop, conn);
         return;
     }
 #if RUT_ENABLE_WEBSOCKET
@@ -8050,13 +8222,13 @@ void on_ws_upstream_to_client_sent(void* lp, Connection& conn, IoEvent ev) {
         conn.ws_upstream_send_len = 0;
         if (conn.ws_closing) {  // a Close drained on the client slot — advance the handshake
             conn.ws_close_client_inflight = false;
-            if (!ws_drive_close(loop, conn)) loop->close_conn(conn);
+            if (!ws_drive_close(loop, conn)) close_conn_if_live(loop, conn);
             return;
         }
         if (conn.ws_pre_tunnel_upstream_closed) conn.ws_upstream_eof = true;
         if (ws_draining(conn)) {
             if (!ws_drain_pump(loop, conn)) {
-                loop->close_conn(conn);
+                close_conn_if_live(loop, conn);
                 return;
             }
             ws_close_if_drained(loop, conn);
@@ -8067,14 +8239,14 @@ void on_ws_upstream_to_client_sent(void* lp, Connection& conn, IoEvent ev) {
         // pause first so a zero-output re-inspection that re-arms doesn't leave it stale.
         conn.upstream_recv_paused_for_send = false;
         if (conn.upstream_recv_buf.len() > 0) {
-            if (!ws_try_send_upstream_to_client(loop, conn)) loop->close_conn(conn);
+            if (!ws_try_send_upstream_to_client(loop, conn)) close_conn_if_live(loop, conn);
             return;
         }
         if (!loop->submit_recv_upstream(conn)) {  // re-arm upstream->client direction
-            loop->close_conn(conn);
+            close_conn_if_live(loop, conn);
             return;
         }
-        if (!ws_try_send_client_to_upstream(loop, conn)) loop->close_conn(conn);
+        if (!ws_try_send_client_to_upstream(loop, conn)) close_conn_if_live(loop, conn);
         return;
     }
 #endif
@@ -8088,22 +8260,22 @@ void on_ws_upstream_to_client_sent(void* lp, Connection& conn, IoEvent ev) {
     }
     if (ws_draining(conn)) {
         if (!ws_drain_pump(loop, conn)) {
-            loop->close_conn(conn);
+            close_conn_if_live(loop, conn);
             return;
         }
         ws_close_if_drained(loop, conn);
         return;
     }
     if (conn.upstream_recv_buf.len() > 0) {
-        if (!ws_try_send_upstream_to_client(loop, conn)) loop->close_conn(conn);
+        if (!ws_try_send_upstream_to_client(loop, conn)) close_conn_if_live(loop, conn);
         return;
     }
     conn.upstream_recv_paused_for_send = false;
     if (!loop->submit_recv_upstream(conn)) {  // re-arm upstream→client direction
-        loop->close_conn(conn);
+        close_conn_if_live(loop, conn);
         return;
     }
-    if (!ws_try_send_client_to_upstream(loop, conn)) loop->close_conn(conn);
+    if (!ws_try_send_client_to_upstream(loop, conn)) close_conn_if_live(loop, conn);
 }
 
 template <typename Loop>
@@ -8111,18 +8283,18 @@ void on_ws_pre_tunnel_upstream_recv(void* lp, Connection& conn, IoEvent ev) {
     auto* loop = static_cast<Loop*>(lp);
     if (ev.result == -ENOBUFS) {
         if constexpr (ws_loop_async<Loop>()) {
-            loop->close_conn(conn);  // overflow discarded by io_uring
+            close_conn_if_live(loop, conn);  // overflow discarded by io_uring
             return;
         }
         if (conn.upstream_recv_buf.write_avail() == 0) {
-            if (!ws_pause_upstream_recv(loop, conn)) loop->close_conn(conn);
+            if (!ws_pause_upstream_recv(loop, conn)) close_conn_if_live(loop, conn);
         }
         return;
     }
     if (ev.result < 0) {
         // Hard error (e.g. ECONNRESET): the stream is not cleanly half-closed —
         // don't advertise a successful upgrade. Close immediately.
-        loop->close_conn(conn);
+        close_conn_if_live(loop, conn);
         return;
     }
     if (ev.result == 0) {
@@ -8133,7 +8305,7 @@ void on_ws_pre_tunnel_upstream_recv(void* lp, Connection& conn, IoEvent ev) {
         ws_stop_upstream_poll(loop, conn);
         return;
     }
-    if (!ws_pause_upstream_recv(loop, conn)) loop->close_conn(conn);
+    if (!ws_pause_upstream_recv(loop, conn)) close_conn_if_live(loop, conn);
 }
 
 // The 101 (and any bytes the backend already sent) has been forwarded to the
@@ -8142,7 +8314,7 @@ template <typename Loop>
 void on_ws_101_sent(void* lp, Connection& conn, IoEvent ev) {
     auto* loop = static_cast<Loop*>(lp);
     if (ev.result <= 0) {
-        loop->close_conn(conn);
+        close_conn_if_live(loop, conn);
         return;
     }
     conn.is_ws_tunnel = true;
@@ -8159,7 +8331,7 @@ void on_ws_101_sent(void* lp, Connection& conn, IoEvent ev) {
     // passthrough tunnel, which relays bytes correctly, rather than mis-parsing them.
     if (conn.is_ws_terminate_route && conn.req_upgrade_is_websocket &&
         conn.resp_upgrade_is_websocket && !ws_arm_terminate(loop, conn)) {
-        loop->close_conn(conn);
+        close_conn_if_live(loop, conn);
         return;
     }
 #endif
@@ -8169,7 +8341,7 @@ void on_ws_101_sent(void* lp, Connection& conn, IoEvent ev) {
         // tunnel stream.
         if (pipeline_recover(conn, /*count_transition=*/false) !=
             PipelineTransitionResult::Advanced) {
-            loop->close_conn(conn);
+            close_conn_if_live(loop, conn);
             return;
         }
     }
@@ -8206,7 +8378,7 @@ void on_ws_101_sent(void* lp, Connection& conn, IoEvent ev) {
         // client→upstream bytes), then tear down once everything has drained.
         conn.ws_upstream_eof = true;
         if (!ws_drain_pump(loop, conn)) {
-            loop->close_conn(conn);
+            close_conn_if_live(loop, conn);
             return;
         }
         ws_close_if_drained(loop, conn);
@@ -8218,7 +8390,7 @@ void on_ws_101_sent(void* lp, Connection& conn, IoEvent ev) {
         // send is in flight (correct backpressure); on_ws_client_to_upstream_sent resumes via
         // ws_resume_client_recv, which clears recv_paused_for_send.
         if (!ws_try_send_client_to_upstream(loop, conn)) {
-            loop->close_conn(conn);
+            close_conn_if_live(loop, conn);
             return;
         }
     } else {
@@ -8228,14 +8400,14 @@ void on_ws_101_sent(void* lp, Connection& conn, IoEvent ev) {
         // (it only marks recv_pause_rearm_pending) — so with no client send ever in flight to
         // clear it, the tunnel would stall and never read further client frames.
         if (!ws_resume_client_recv(loop, conn)) {
-            loop->close_conn(conn);
+            close_conn_if_live(loop, conn);
             return;
         }
     }
     if (conn.upstream_recv_buf.len() > 0) {
-        if (!ws_try_send_upstream_to_client(loop, conn)) loop->close_conn(conn);
+        if (!ws_try_send_upstream_to_client(loop, conn)) close_conn_if_live(loop, conn);
     } else {
-        if (!loop->submit_recv_upstream(conn)) loop->close_conn(conn);
+        if (!loop->submit_recv_upstream(conn)) close_conn_if_live(loop, conn);
     }
 }
 // Case-insensitive scan of a comma/whitespace-separated header value for an exact token
@@ -8569,7 +8741,13 @@ inline ResponseReadDeadlineProfile classify_response_read_deadline_profile(
         conn.req_header_override_count != 0 || conn.req_header_override_overflow ||
         conn.resp_header_mutation_count != 0 || conn.resp_header_mutation_pending_count != 0 ||
         conn.resp_header_mutation_pending_overflow || conn.resp_header_mutation_overflow ||
-        conn.pipeline_stash_len != 0 || conn.protocol != ConnProtocol::Http11 || conn.tls_active)
+        conn.pipeline_stash_len != 0 || conn.protocol != ConnProtocol::Http11 ||
+        (conn.tls_active &&
+         (!response_read_deadline_tls_http11_engine_is_stable(conn) ||
+          buffering != ForwardResponseBufferingMode::CompleteContentLength ||
+          conn.req_method != static_cast<u8>(LogHttpMethod::Get) || conn.request_policy_id != 0 ||
+          conn.request_policy_body_pending || conn.pending_forward_request_policy_id != 0 ||
+          conn.pipeline_depth != 0 || conn.http1_pipeline_request_generation != 0)))
         return ResponseReadDeadlineProfile::None;
     if (conn.recv_buf.data() == nullptr || conn.recv_buf.len() == 0)
         return ResponseReadDeadlineProfile::None;
@@ -8749,12 +8927,26 @@ bool handle_configured_strict_local_response(Loop* loop,
                                              Connection& conn,
                                              const RouteConfig* config,
                                              u16 policy_id) {
+    if (config == nullptr) {
+        loop->close_conn(conn);
+        return true;
+    }
+    const auto view = config->strict_local_response_view();
+    return handle_configured_strict_local_response_in_scope(loop, conn, config, policy_id, view);
+}
+
+template <typename Loop>
+bool handle_configured_strict_local_response_in_scope(
+    Loop* loop,
+    Connection& conn,
+    const RouteConfig* config,
+    u16 policy_id,
+    const RouteConfig::StrictLocalResponseView& view) {
     auto fail_closed = [&]() {
         loop->close_conn(conn);
         return true;
     };
-    if (config == nullptr || !config->strict_local_response_table_is_valid() ||
-        !config->strict_local_response_policy_id_is_owned(policy_id) ||
+    if (!view.valid_for(config) || !config->strict_local_response_policy_id_is_owned(policy_id) ||
         !conn.req_strict_h1_complete ||
         conn.req_http_version != static_cast<u8>(HttpVersion::Http11) || conn.req_malformed ||
         conn.req_header_end == 0 || conn.req_header_end > conn.recv_buf.len())
@@ -8932,10 +9124,20 @@ inline bool validated_preconnect_failure_owner_is_stable(Loop* loop,
     } else {
         const RouteConfig* config = conn.request_config;
         const u16 bundle_id = conn.response_read_deadline_bundle_id;
-        if (loop == nullptr || conn.id >= Loop::kMaxConns || &loop->conns[conn.id] != &conn ||
-            conn.fd < 0 || config == nullptr || conn.state != ConnState::Proxying ||
-            conn.protocol != ConnProtocol::Http11 || conn.tls_active || conn.h2 != nullptr ||
-            conn.req_start_us == 0 || conn.epoch_held || conn.is_health_probe ||
+        const bool tls_complete_get_owner =
+            !conn.tls_active ||
+            (response_read_deadline_tls_complete_get_profile_is_stable(conn) &&
+             conn.response_read_deadline_state == ResponseReadDeadlineState::Validated &&
+             conn.response_read_deadline_post_commit_phase ==
+                 ResponseReadDeadlinePostCommitPhase::None &&
+             conn.pipeline_depth == 0 && conn.http1_pipeline_request_generation == 0 &&
+             conn.pipeline_stash_len == 0 && tls_recv_callback_is_current<Loop>(conn) &&
+             conn.tls_pending_on_recv == nullptr);
+        if (loop == nullptr || conn.id >= connection_capacity_of(*loop) ||
+            &loop->conns[conn.id] != &conn || conn.fd < 0 || config == nullptr ||
+            conn.state != ConnState::Proxying || conn.protocol != ConnProtocol::Http11 ||
+            !tls_complete_get_owner || conn.h2 != nullptr || conn.req_start_us == 0 ||
+            conn.epoch_held || conn.is_health_probe ||
             conn.req_http_version != static_cast<u8>(HttpVersion::Http11) ||
             !conn.req_strict_h1_complete || conn.req_client_has_transfer_encoding ||
             conn.req_client_has_te || conn.req_client_has_expect ||
@@ -9159,14 +9361,23 @@ inline bool validated_preconnect_failure_owner_is_stable(Loop* loop,
         const bool terminal_downstream_recv_consumed = !conn.recv_armed && conn.pending_ops == 0u;
         if (!live_downstream_recv && !terminal_downstream_recv_consumed) return false;
         if (site == ValidatedPreconnectFailureSite::SocketCreate) {
+            const bool recv_slot_matches =
+                fixed_upload ? conn.on_recv == &on_request_policy_body_recvd<Loop>
+                             : (conn.tls_active ? tls_recv_callback_is_current<Loop>(conn)
+                                                : conn.on_recv == nullptr);
             if (conn.upstream_fd >= 0 || conn.on_upstream_recv != nullptr ||
                 conn.on_upstream_send != nullptr || conn.upstream_connect_armed ||
-                conn.on_recv != (fixed_upload ? &on_request_policy_body_recvd<Loop> : nullptr))
+                !recv_slot_matches || (conn.tls_active && conn.tls_pending_on_recv != nullptr))
                 return false;
-        } else if (conn.upstream_fd < 0 || conn.on_upstream_send != &on_upstream_connected<Loop> ||
-                   conn.on_upstream_recv != nullptr || conn.on_recv != nullptr ||
-                   conn.upstream_connect_armed) {
-            return false;
+        } else {
+            const bool recv_slot_matches = conn.tls_active
+                                               ? tls_recv_callback_is_current<Loop>(conn)
+                                               : conn.on_recv == nullptr;
+            if (conn.upstream_fd < 0 || conn.on_upstream_send != &on_upstream_connected<Loop> ||
+                conn.on_upstream_recv != nullptr || !recv_slot_matches ||
+                (conn.tls_active && conn.tls_pending_on_recv != nullptr) ||
+                conn.upstream_connect_armed)
+                return false;
         }
         return true;
     }
@@ -9176,7 +9387,9 @@ template <typename Loop>
 inline void respond_validated_preconnect_failure(Loop* loop,
                                                  Connection& conn,
                                                  ValidatedPreconnectFailureSite site) {
-    const auto fail_closed = [&]() { loop->close_conn(conn); };
+    const auto fail_closed = [&]() {
+        if (conn.fd >= 0) loop->close_conn(conn);
+    };
     if (!validated_preconnect_failure_owner_is_stable(loop, conn, site)) {
         fail_closed();
         return;
@@ -9253,7 +9466,9 @@ template <typename Loop>
 inline void respond_validated_connect_completion_failure(Loop* loop,
                                                          Connection& conn,
                                                          const IoEvent& ev) {
-    const auto fail_closed = [&]() { loop->close_conn(conn); };
+    const auto fail_closed = [&]() {
+        if (conn.fd >= 0) loop->close_conn(conn);
+    };
     if (!validated_connect_completion_failure_owner_is_stable(loop, conn, ev)) {
         fail_closed();
         return;
@@ -10727,7 +10942,7 @@ void on_upstream_response(void* lp, Connection& conn, IoEvent ev) {
             conn.transition_to_sending(&on_response_header_sent<Loop>);
             if (!client_send(
                     loop, conn, conn.response_header_buf.data(), conn.response_header_buf.len()))
-                loop->close_conn(conn);
+                close_conn_if_live(loop, conn);
             return;
         }
 
@@ -10858,7 +11073,7 @@ void on_upstream_response(void* lp, Connection& conn, IoEvent ev) {
         conn.transition_to_sending(&on_ws_101_sent<Loop>);
         conn.on_upstream_recv = &on_ws_pre_tunnel_upstream_recv<Loop>;
         if (!loop->submit_send(conn, upgrade_response, upgrade_response_len)) {
-            loop->close_conn(conn);
+            close_conn_if_live(loop, conn);
             return;
         }
         // Stop reading from the client until the tunnel slots are installed: a
@@ -10949,6 +11164,8 @@ void on_upstream_response(void* lp, Connection& conn, IoEvent ev) {
         return;
     }
 
+    if (conn.req_client_connection_close) conn.keep_alive = false;
+
     const bool kIsHead = (conn.req_method == static_cast<u8>(LogHttpMethod::Head));
     const bool kNoBodyStatus =
         resp.status_code == 204 || resp.status_code == 205 || resp.status_code == 304;
@@ -10978,9 +11195,9 @@ void on_upstream_response(void* lp, Connection& conn, IoEvent ev) {
     // so a client Connection: close (or an HTTP/1.0 request) told the origin it may
     // close after responding — even if the response itself is self-framed HTTP/1.1
     // keep-alive. Pooling such an fd would race the origin's close, so refuse it.
-    // NOTE: this must NOT be conn.keep_alive — that is derived from drain state
-    // (set to !is_draining() in on_header_received), not the parsed request, so a
-    // Connection: close request on a live shard still has conn.keep_alive == true.
+    // NOTE: this must NOT be conn.keep_alive — that is also used for downstream
+    // drain/close state, while upstream pooling follows the request and response
+    // framing facts above.
     conn.upstream_keep_alive = resp.keep_alive && !resp.connection_close &&
                                conn.resp_body_mode != BodyMode::UntilClose && conn.req_keep_alive;
 
@@ -11285,7 +11502,10 @@ void continue_http1_request_boundary(Loop* loop, Connection& conn) {
     conn.http1_pipeline_boundary_owners_settled = false;
     conn.reset_request_receive_buffer();
     conn.transition_to_reading_header(&on_header_received<Loop>);
-    loop->submit_recv(conn);
+    if constexpr (requires { loop->process_buffered_tls_input(conn); }) {
+        if (loop->process_buffered_tls_input(conn)) return;
+    }
+    if (!loop->submit_recv(conn) && conn.uses_iouring_tls()) close_conn_if_live(loop, conn);
 }
 
 template <typename Loop>

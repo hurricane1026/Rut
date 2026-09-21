@@ -2,6 +2,7 @@
 
 #include "rut/common/types.h"
 #include "rut/runtime/connection.h"
+#include "rut/runtime/connection_capacity.h"
 #include "rut/runtime/io_event.h"
 #include "rut/runtime/traffic_capture.h"
 
@@ -146,7 +147,7 @@ ReplayResult replay_one(Loop& loop, const CaptureEntry& entry, i32 fake_fd) {
     result.backend_completions += n;
 
     Connection* conn = nullptr;
-    for (u32 i = 0; i < Loop::kMaxConns; i++) {
+    for (u32 i = 0; i < connection_capacity_of(loop); i++) {
         if (loop.conns[i].fd == fake_fd) {
             conn = &loop.conns[i];
             break;

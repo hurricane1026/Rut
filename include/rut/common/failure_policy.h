@@ -88,9 +88,10 @@ inline bool forward_failure_policy_spec_shape_valid(const ForwardFailurePolicySp
         !failure_policy_safe_text(policy.server, kMaxFailurePolicyServerLen) ||
         !failure_policy_safe_body(policy.body))
         return false;
-    return validate_response_header(
-               "Content-Type", 12, policy.content_type.ptr, policy.content_type.len) ==
-           HttpHeaderValidation::Ok;
+    // The fixed Content-Type name is a valid, non-reserved token. The text
+    // check above already rejects every forbidden value byte (and also HTAB,
+    // which generic response headers allow), so no second scan is needed.
+    return true;
 }
 
 // The existing default failure-policy contract remains the exact 502 shape.

@@ -1,0 +1,16 @@
+=== iouring_downstream_send_boundary ===
+RUN: iouring_downstream_send_boundary.response_before_next_request_preserves_buffer
+    require: /home/hurricane/private/code/Rut_benchmark_lifecycle_fix/tests/test_network.cc:28905 -> (fixture.wait(events)) == (1u)
+  FAIL: response_before_next_request_preserves_buffer (/home/hurricane/private/code/Rut_benchmark_lifecycle_fix/tests/test_network.cc:28905: (fixture.wait(events)) == (1u))
+RUN: iouring_downstream_send_boundary.response_before_fin_or_error_is_dispatched_first
+    require: /home/hurricane/private/code/Rut_benchmark_lifecycle_fix/tests/test_network.cc:28929 -> (fixture.wait(events)) == (1u)
+  FAIL: response_before_fin_or_error_is_dispatched_first (/home/hurricane/private/code/Rut_benchmark_lifecycle_fix/tests/test_network.cc:28929: (fixture.wait(events)) == (1u))
+RUN: iouring_downstream_send_boundary.completed_body_tagged_send_precedes_fin
+    require: /home/hurricane/private/code/Rut_benchmark_lifecycle_fix/tests/test_network.cc:28949 -> (fixture.wait(events)) == (1u)
+  FAIL: completed_body_tagged_send_precedes_fin (/home/hurricane/private/code/Rut_benchmark_lifecycle_fix/tests/test_network.cc:28949: (fixture.wait(events)) == (1u))
+RUN: iouring_downstream_send_boundary.unrelated_recv_and_tagged_timer_send_keep_batch_order
+  PASS: unrelated_recv_and_tagged_timer_send_keep_batch_order
+RUN: iouring_downstream_send_boundary.receive_before_response_remains_real_pipeline
+  PASS: receive_before_response_remains_real_pipeline
+
+2 passed, 3 failed, 25 checks, 3 failed checks, 1233 skipped

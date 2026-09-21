@@ -3,8 +3,10 @@
 #include "core/expected.h"
 #include "rut/common/types.h"
 #include "rut/runtime/connection.h"
+#include "rut/runtime/connection_capacity.h"
 #include "rut/runtime/error.h"
 #include "rut/runtime/io_backend.h"
+#include "rut/runtime/mapped_array.h"
 
 #include <sys/epoll.h>
 #include <sys/timerfd.h>
@@ -38,9 +40,9 @@ struct EpollBackend {
 
     // conn_id → fd mappings. Separate maps for client and upstream so that
     // proxy connections with both fds registered don't overwrite each other.
-    static constexpr u32 kMaxFdMap = 16384;
-    i32 downstream_fd_map[kMaxFdMap];  // downstream (client) fd per conn_id
-    i32 upstream_fd_map[kMaxFdMap];    // upstream (origin) fd per conn_id
+    static constexpr u32 kMaxFdMap = kDefaultConnectionCapacity;
+    MappedArray<i32> downstream_fd_map;  // downstream (client) fd per conn_id
+    MappedArray<i32> upstream_fd_map;    // upstream (origin) fd per conn_id
 
     // Epoll-owned upstream episode ownership. Zero means no active episode;
     // this table is deliberately independent from Connection::upstream_episode
@@ -48,7 +50,7 @@ struct EpollBackend {
     // start calling it. kUpstreamEpisodeExhausted is outside the 24-bit token
     // domain and is never passed to an epoll registration.
     static constexpr u32 kUpstreamEpisodeExhausted = kInvalidUpstreamEventEpisode;
-    u32 active_upstream_episode[kMaxFdMap];
+    MappedArray<u32> active_upstream_episode;
 
     // Pending synthetic completion events (from immediate sends). FIXED LIFO
     // stack. Scoped producers preflight this capacity before their synchronous
@@ -78,13 +80,19 @@ struct EpollBackend {
         u32 tls_wait_events;
         u32 upstream_episode;  // 0 for downstream; submission episode upstream
     };
-    SendState send_state[kMaxFdMap];
-    SendState upstream_send_state[kMaxFdMap];
+    MappedArray<SendState> send_state;
+    MappedArray<SendState> upstream_send_state;
+    u32 connection_capacity = 0;
+
+    core::Expected<void, Error> init_state_storage(u32 capacity);
+    void destroy_state_storage();
 
     // --- Interface methods ---
 
     // Initialize epoll and timerfd for this shard.
-    core::Expected<void, Error> init(u32 shard_id, i32 listen_fd);
+    core::Expected<void, Error> init(u32 shard_id,
+                                     i32 listen_fd,
+                                     u32 capacity = kDefaultConnectionCapacity);
 
     // Register listen socket for accept events.
     void add_accept();

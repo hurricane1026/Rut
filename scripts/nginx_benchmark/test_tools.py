@@ -1,14 +1,32 @@
 """Checks for evidence gating and HTTP-close handling; no Docker required."""
 
+import contextlib
+import io
+import json
+import os
+import signal
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
+from unittest import mock
 
-from run import Harness, expected_body, response, response_head
+import run
+import matrix
+
+from run import (
+    Harness,
+    connection_header,
+    expected_body,
+    request_bytes,
+    response,
+    response_head,
+)
 from summarize import aggregate, render
+from matrix import assess
 
 
 class FakeSocket:
@@ -23,6 +41,307 @@ class FakeSocket:
 
 
 class ToolsTest(unittest.TestCase):
+    def test_matrix_keeps_valid_groups_only_after_completed_child(self):
+        cases = (
+            # One failed concurrency must not erase its valid siblings.
+            (1, True, True, [True, True, False], 2),
+            (0, True, False, [True, True, True], 0),
+            # Setup errors, signals and missing/incomplete completion evidence
+            # invalidate all groups even if results.json already has good rows.
+            (2, True, False, [False, False, False], 2),
+            (-signal.SIGTERM, True, False, [False, False, False], 2),
+            (1, False, False, [False, False, False], 2),
+            (1, None, False, [False, False, False], 2),
+            (0, False, False, [False, False, False], 2),
+        )
+        for returncode, complete, bad_sample, expected, expected_exit in cases:
+            with self.subTest(returncode=returncode, complete=complete, bad_sample=bad_sample), \
+                    tempfile.TemporaryDirectory() as directory:
+                output = Path(directory) / "matrix"
+                argv = ["matrix.py", "--output", str(output),
+                        "--tls-cert", "unused.pem", "--tls-key", "unused.key",
+                        "--transports", "http", "--body-sizes", "16",
+                        "--scenarios", "static-close", "--concurrency", "1", "32", "128",
+                        "--duration", "5", "--repeats", "3"]
+
+                def child_run(command, _log):
+                    folder = Path(command[command.index("--output") + 1])
+                    folder.mkdir()
+                    rows = []
+                    for concurrency in (1, 32, 128):
+                        for engine, rps in (("nginx", 100), ("rut", 120)):
+                            for rep in (1, 2, 3):
+                                invalid = bad_sample and concurrency == 128 and engine == "rut" and rep == 1
+                                rows.append(dict(
+                                    workload="static", connection="close", transport="http",
+                                    body_size=16, concurrency=concurrency, engine=engine,
+                                    rep=rep, requests=500, rps=rps, seconds=5, valid=not invalid,
+                                    errors=dict(connect=0, read=int(invalid), write=0, status=0, timeout=0),
+                                    warmup_errors=dict(connect=0, read=0, write=0, status=0, timeout=0)))
+                    run.save_json(folder / "results.json", rows)
+                    if complete is not None:
+                        run.save_json(folder / "status.json",
+                                      {"complete": complete, "valid": not bad_sample})
+                    return returncode
+
+                previous_sigterm = signal.getsignal(signal.SIGTERM)
+                try:
+                    with mock.patch.object(sys, "argv", argv), \
+                            mock.patch.object(matrix, "run_cell", side_effect=child_run), \
+                            contextlib.redirect_stdout(io.StringIO()):
+                        self.assertEqual(matrix.main(), expected_exit)
+                finally:
+                    signal.signal(signal.SIGTERM, previous_sigterm)
+                report = json.loads((output / "matrix.json").read_text())
+                self.assertTrue(report["complete"])
+                self.assertEqual(report["target_met"], all(expected))
+                self.assertEqual([c["measurement_valid"] for c in report["cells"]], expected)
+                self.assertEqual([c["target_met"] for c in report["cells"]], expected)
+                self.assertTrue(all(c["exit_code"] == returncode for c in report["cells"]))
+
+    def test_invalid_tls_certificate_retains_failed_status(self):
+        with tempfile.TemporaryDirectory() as directory:
+            out = Path(directory)
+            cert = out / "invalid.pem"
+            cert.write_text("not a PEM certificate\n")
+            args = SimpleNamespace(output=out, tls_cert=cert)
+            with mock.patch.object(run, "arguments", return_value=args), \
+                    mock.patch.object(Harness, "prepare") as prepare, \
+                    contextlib.redirect_stderr(io.StringIO()):
+                self.assertEqual(run.main(), 2)
+            prepare.assert_not_called()
+            status = json.loads((out / "status.json").read_text())
+            self.assertFalse(status["complete"])
+            self.assertFalse(status["valid"])
+            self.assertIn("SSLError", status["error"])
+
+    def test_static_body_bound_rejected_before_external_commands(self):
+        with tempfile.TemporaryDirectory() as directory:
+            for scenario, size, rejected in (
+                ("static-close", run.STATIC_BODY_LIMIT, False),
+                ("static-keepalive", run.STATIC_BODY_LIMIT + 1, True),
+                ("static-close", 1048576, True),
+                ("static-close", None, False),
+                ("proxy-close", 1048576, False),
+            ):
+                with self.subTest(scenario=scenario, size=size):
+                    harness = Harness(SimpleNamespace(
+                        output=Path(directory), scenarios=[scenario], body_size=size))
+                    with mock.patch.object(harness, "command", side_effect=RuntimeError("external")) as command:
+                        if rejected:
+                            with self.assertRaisesRegex(ValueError, "this matrix cell has NOT passed"):
+                                harness.prepare()
+                            command.assert_not_called()
+                        else:
+                            with self.assertRaisesRegex(RuntimeError, "external"):
+                                harness.prepare()
+                            command.assert_called_once()
+
+    def test_matrix_interrupt_allows_child_cleanup_once(self):
+        tools_dir = Path(__file__).resolve().parent
+        for group_signal in (True, False):
+            with self.subTest(group_signal=group_signal), tempfile.TemporaryDirectory() as directory:
+                out = Path(directory)
+                child_script = out / "child.py"
+                child_script.write_text(
+                    "import os,signal,time\nfrom pathlib import Path\n"
+                    "def interrupt(sig,frame):\n"
+                    "    with Path('signals').open('a') as f: f.write(str(sig)+'\\n')\n"
+                    "    raise KeyboardInterrupt\n"
+                    "signal.signal(signal.SIGTERM,interrupt)\n"
+                    "signal.signal(signal.SIGINT,interrupt)\n"
+                    "Path('child.pid').write_text(str(os.getpid()))\n"
+                    "try:\n"
+                    "    Path('ready').touch()\n"
+                    "    time.sleep(20)\n"
+                    "except KeyboardInterrupt:\n"
+                    "    Path('cleaning').touch()\n"
+                    "    time.sleep(0.5)\n"
+                    "    Path('cleaned').touch()\n"
+                )
+                parent_code = (
+                    "import signal,sys\nfrom pathlib import Path\n"
+                    f"sys.path.insert(0,{str(tools_dir)!r})\n"
+                    "from matrix import run_cell\n"
+                    "def interrupt(sig,frame): raise KeyboardInterrupt\n"
+                    "signal.signal(signal.SIGTERM,interrupt)\n"
+                    "try:\n"
+                    "    with open('child.log','w') as log:\n"
+                    "        run_cell([sys.executable,'child.py'],log)\n"
+                    "except KeyboardInterrupt:\n"
+                    "    Path('interrupted').touch()\n"
+                )
+
+                def wait_for(name, parent):
+                    deadline = time.monotonic() + 5
+                    while not (out / name).exists():
+                        self.assertIsNone(parent.poll(), 'parent exited before ' + name)
+                        self.assertLess(time.monotonic(), deadline, 'timed out waiting for ' + name)
+                        time.sleep(0.01)
+
+                with (out / "parent.log").open("w") as log:
+                    parent = subprocess.Popen([sys.executable, "-c", parent_code],
+                                              cwd=out, stdout=log, stderr=log,
+                                              start_new_session=True)
+                    try:
+                        wait_for("ready", parent)
+                        if group_signal:
+                            os.killpg(parent.pid, signal.SIGINT)
+                        else:
+                            parent.terminate()
+                        wait_for("cleaning", parent)
+                        # A second terminal interruption must not interrupt the
+                        # child's resource cleanup while the parent waits.
+                        os.killpg(parent.pid, signal.SIGTERM)
+                        self.assertEqual(parent.wait(timeout=5), 0)
+                        self.assertTrue((out / "cleaned").exists())
+                        self.assertTrue((out / "interrupted").exists())
+                        self.assertEqual((out / "signals").read_text(), f"{signal.SIGTERM}\n")
+                    finally:
+                        if parent.poll() is None:
+                            parent.kill()
+                            parent.wait()
+                        child_pid_file = out / "child.pid"
+                        if child_pid_file.exists() and not (out / "cleaned").exists():
+                            with contextlib.suppress(ProcessLookupError):
+                                os.kill(int(child_pid_file.read_text()), signal.SIGKILL)
+
+    def test_large_body_preflight_is_exact_and_bounded(self):
+        size = 1048576
+        head = f"HTTP/1.1 200 OK\r\nContent-Length: {size}\r\n\r\n".encode()
+        chunks = [head] + [b"x" * 4096] * (size // 4096)
+        raw, closed = response(FakeSocket(chunks), "proxy", True, body_size=size)
+        self.assertTrue(raw.endswith(b"x" * size))
+        with self.assertRaises(ValueError):
+            response_head(head)
+        with self.assertRaises(ValueError):
+            response(FakeSocket(chunks[:-1]), "proxy", True, body_size=size)
+        with self.assertRaises(ValueError):
+            response(FakeSocket([head, b"y" * size]), "proxy", True, body_size=size)
+
+    def test_matrix_missing_wrong_shape_errors_and_smoke_never_pass(self):
+        import copy
+        rows = []
+        for engine, rps in (("nginx", 100), ("rut", 120)):
+            for rep in (1, 2, 3):
+                rows.append(dict(workload="proxy", connection="close", transport="https",
+                                 body_size=65536, concurrency=32, engine=engine, rep=rep,
+                                 requests=500, rps=rps, seconds=5, valid=True,
+                                 errors=dict(connect=0, read=0, write=0, status=0, timeout=0),
+                                 warmup_errors=dict(connect=0, read=0, write=0, status=0, timeout=0)))
+        def evaluate(data, duration=5):
+            return assess(data, "proxy-close", "https", 65536, 32, 3, duration)
+        self.assertTrue(evaluate(rows)["target_met"])
+        self.assertFalse(evaluate(rows[:-1])["target_met"])
+        self.assertFalse(evaluate(rows, duration=1)["target_met"])
+        for key, value in (("body_size", 16), ("transport", "http"), ("rep", 99),
+                           ("valid", False), ("errors", {"timeout": 1}), ("rps", 105)):
+            bad = copy.deepcopy(rows)
+            for row in bad:
+                if row["engine"] == "rut":
+                    row[key] = value
+            self.assertFalse(evaluate(bad)["target_met"], key)
+
+    def test_matrix_requires_actual_measurement_duration(self):
+        import copy
+        rows = [dict(workload="static", connection="close", transport="http",
+                     body_size=16, concurrency=1, engine=engine, rep=rep,
+                     requests=500, rps=rps, seconds=5, valid=True,
+                     errors=dict.fromkeys(run.ERROR_NAMES, 0),
+                     warmup_errors=dict.fromkeys(run.ERROR_NAMES, 0))
+                for engine, rps in (("nginx", 100), ("rut", 120)) for rep in (1, 2, 3)]
+        self.assertTrue(assess(rows, "static-close", "http", 16, 1, 3, 5)["target_met"])
+        for engine in ("nginx", "rut"):
+            for seconds in (4.999, 0, -1, None, "5", True, float("nan"), float("inf")):
+                with self.subTest(engine=engine, seconds=seconds):
+                    bad = copy.deepcopy(rows)
+                    next(r for r in bad if r["engine"] == engine)["seconds"] = seconds
+                    result = assess(bad, "static-close", "http", 16, 1, 3, 10)
+                    self.assertFalse(result["performance_eligible"])
+                    self.assertFalse(result["target_met"])
+                    if seconds == 4.999:
+                        self.assertTrue(result["measurement_valid"])
+        missing = copy.deepcopy(rows)
+        del missing[0]["seconds"]
+        self.assertFalse(assess(missing, "static-close", "http", 16, 1, 3, 10)["target_met"])
+
+    def test_matrix_continues_after_bad_evidence(self):
+        cases = (
+            ("results.json", b"[", "truncated rows"),
+            ("status.json", b"{", "truncated status"),
+            ("results.json", b"\xff", "invalid UTF-8"),
+            ("results.json", b"[" * 2000 + b"]" * 2000, "excessive JSON nesting"),
+            ("results.json", b"{}", "rows object"),
+            ("results.json", b"[null]", "non-object row"),
+            ("results.json", b"[{}]", "missing fields"),
+            ("status.json", b"[]", "status array"),
+            ("status.json", b'{"complete": "true", "valid": true}', "non-boolean completion"),
+            ("status.json", None, "missing status"),
+            ("results.json", None, "missing rows"),
+            ("results.json", b"DIRECTORY", "unreadable rows path"),
+        )
+        for filename, payload, label in cases:
+            with self.subTest(case=label), tempfile.TemporaryDirectory() as directory:
+                output = Path(directory) / "matrix"
+                argv = ["matrix.py", "--output", str(output),
+                        "--tls-cert", "unused.pem", "--tls-key", "unused.key",
+                        "--transports", "http", "--body-sizes", "16", "32",
+                        "--scenarios", "static-close", "--concurrency", "1",
+                        "--duration", "5", "--repeats", "3"]
+
+                def child_run(command, _log):
+                    folder = Path(command[command.index("--output") + 1])
+                    size = int(command[command.index("--body-size") + 1])
+                    folder.mkdir()
+                    rows = [dict(workload="static", connection="close", transport="http",
+                                 body_size=size, concurrency=1, engine=engine, rep=rep,
+                                 requests=500, rps=rps, seconds=5, valid=True,
+                                 errors=dict.fromkeys(run.ERROR_NAMES, 0),
+                                 warmup_errors=dict.fromkeys(run.ERROR_NAMES, 0))
+                            for engine, rps in (("nginx", 100), ("rut", 120)) for rep in (1, 2, 3)]
+                    run.save_json(folder / "results.json", rows)
+                    run.save_json(folder / "status.json", {"complete": True, "valid": True})
+                    if size == 16:
+                        artifact = folder / filename
+                        if payload is None:
+                            artifact.unlink()
+                        elif payload == b"DIRECTORY":
+                            artifact.unlink()
+                            artifact.mkdir()
+                        else:
+                            artifact.write_bytes(payload)
+                    return 0
+
+                previous_sigterm = signal.getsignal(signal.SIGTERM)
+                try:
+                    with mock.patch.object(sys, "argv", argv), \
+                            mock.patch.object(matrix, "run_cell", side_effect=child_run) as child, \
+                            contextlib.redirect_stdout(io.StringIO()):
+                        self.assertEqual(matrix.main(), 2)
+                        self.assertEqual(child.call_count, 2)
+                finally:
+                    signal.signal(signal.SIGTERM, previous_sigterm)
+                report = json.loads((output / "matrix.json").read_text())
+                self.assertTrue(report["complete"])
+                self.assertFalse(report["target_met"])
+                first, second = report["cells"]
+                self.assertFalse(first["measurement_valid"])
+                self.assertFalse(first["target_met"])
+                self.assertTrue(first["evidence_error"])
+                self.assertTrue(second["measurement_valid"])
+                self.assertTrue(second["target_met"])
+
+    def test_keepalive_wire_profiles_preserve_original_and_default_persistence(self):
+        explicit = request_bytes("proxy", False)
+        self.assertIn(b"Connection: keep-alive\r\n", explicit)
+        implicit = request_bytes("proxy", False, "implicit")
+        self.assertEqual(implicit, b"GET /proxy HTTP/1.1\r\nHost: client.example\r\n\r\n")
+        self.assertIsNone(connection_header(False, "implicit"))
+        self.assertEqual(
+            request_bytes("proxy", True, "implicit"),
+            request_bytes("proxy", True, "explicit"),
+        )
+
     def test_fragmented_body_and_normal_close(self):
         sock = FakeSocket(
             [

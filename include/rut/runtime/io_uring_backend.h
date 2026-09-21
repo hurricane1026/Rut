@@ -2,8 +2,10 @@
 
 #include "core/expected.h"
 #include "rut/common/types.h"
+#include "rut/runtime/connection_capacity.h"
 #include "rut/runtime/error.h"
 #include "rut/runtime/io_backend.h"
+#include "rut/runtime/mapped_array.h"
 #include <atomic>
 
 #include <errno.h>
@@ -42,6 +44,7 @@ struct IoUringBackend {
     // SQ ring mapped memory
     u32* sq_head = nullptr;
     u32* sq_tail = nullptr;
+    u32* sq_flags = nullptr;
     u32* sq_ring_mask = nullptr;
     u32* sq_array = nullptr;
     io_uring_sqe* sq_entries = nullptr;
@@ -77,7 +80,7 @@ struct IoUringBackend {
     // Outstanding partial-send state per connection.
     // When IORING_OP_SEND completes partially, wait() re-submits the remainder.
     // Only emits Send completion when all bytes are sent (or error).
-    static constexpr u32 kMaxSendState = 16384;
+    static constexpr u32 kMaxSendState = kDefaultConnectionCapacity;
     struct SendState {
         const u8* src;
         i32 fd;
@@ -87,8 +90,12 @@ struct IoUringBackend {
         u32 upstream_episode;
         u32 generation = 0;
     };
-    SendState send_state[kMaxSendState];
-    SendState upstream_send_state[kMaxSendState];
+    MappedArray<SendState> send_state;
+    MappedArray<SendState> upstream_send_state;
+    u32 connection_capacity = 0;
+
+    core::Expected<void, Error> init_send_state_storage(u32 capacity);
+    void destroy_send_state_storage();
 
     // Pending SQE count (for submission)
     u32 pending = 0;
@@ -129,7 +136,9 @@ struct IoUringBackend {
     // --- Interface methods ---
 
     // Initialize the io_uring instance for this shard.
-    core::Expected<void, Error> init(u32 shard_id, i32 listen_fd);
+    core::Expected<void, Error> init(u32 shard_id,
+                                     i32 listen_fd,
+                                     u32 capacity = kDefaultConnectionCapacity);
 
     // Submit a multishot accept on the listen socket.
     void add_accept();
@@ -142,11 +151,15 @@ struct IoUringBackend {
     // Same as add_recv but encodes UpstreamRecv in user_data so dispatch
     // can distinguish upstream vs client recv CQEs.
     bool add_recv_upstream(i32 fd, u32 conn_id, u32 upstream_episode = 1);
-    // One-shot counterpart used by the bounded downstream-TLS HTTP/1 proxy
-    // profile.  It retains provided-buffer selection and episode fencing but
-    // deliberately omits IORING_RECV_MULTISHOT so each CQE is consumed before
-    // another upstream buffer can be selected.
-    bool add_recv_upstream_once(i32 fd, u32 conn_id, u32 upstream_episode = 1);
+    // One-shot counterpart used by bounded HTTP/1 proxy profiles. It retains
+    // provided-buffer selection and episode fencing but deliberately omits
+    // IORING_RECV_MULTISHOT so each CQE is consumed before another upstream
+    // buffer can be selected. max_len bounds the selected-buffer copy to the
+    // current destination space; zero and oversized values are rejected.
+    bool add_recv_upstream_once(i32 fd,
+                                u32 conn_id,
+                                u32 upstream_episode = 1,
+                                u32 max_len = kProvidedBufSize);
     // Dedicated single submission point for the bounded explicit
     // first-response deadline.  It intentionally does not inherit the ordinary
     // recv path's idempotent/deferred-rearm semantics.

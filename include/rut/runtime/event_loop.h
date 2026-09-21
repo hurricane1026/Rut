@@ -6,12 +6,14 @@
 #include "rut/runtime/access_log_live_producer.h"
 #include "rut/runtime/callbacks.h"
 #include "rut/runtime/connection.h"
+#include "rut/runtime/connection_capacity.h"
 #include "rut/runtime/drain.h"
 #include "rut/runtime/error.h"
 #include "rut/runtime/io_backend.h"
 #include "rut/runtime/io_event.h"
 #include "rut/runtime/jit_dispatch.h"  // jit::HandlerCtx for fire_due_timers
 #include "rut/runtime/listener_context.h"
+#include "rut/runtime/mapped_array.h"
 #include "rut/runtime/metrics.h"
 #include "rut/runtime/rate_limit.h"
 #include "rut/runtime/route_table.h"  // RouteConfig::kMaxTimers / timers[] for fire_due_timers
@@ -393,7 +395,9 @@ private:
     std::atomic<u32> drain_period_;  // seconds until force-close
 
 public:
-    static constexpr u32 kMaxConns = 16384;
+    static constexpr u32 kMaxConns = kDefaultConnectionCapacity;
+    // Zero means per-connection storage has not been initialized.
+    u32 connection_capacity = 0;
     static constexpr u32 kDefaultKeepaliveTimeout = 60;
     // Deadline (seconds; coarse 1s timer-wheel resolution) for a connection in
     // the Proxying state. SCOPE: the post-connect phase only — from the upstream
@@ -409,16 +413,16 @@ public:
     static constexpr bool kSupportsEventYieldResume = false;
     SlicePool
         pool;  // per-shard buffer pool (3 slices max per connection: recv + send + upstream_recv)
-    Connection conns[kMaxConns];
-    u32 free_stack[kMaxConns];
-    u32 free_top;
+    MappedArray<Connection> conns;
+    MappedArray<u32> free_stack;
+    u32 free_top = 0;
 
     // Pending-free list: slots closed during the current dispatch batch.
     // Moved to free_stack (and deferred slices returned to pool) after the
     // next wait() cycle, which submits cancel SQEs and harvests CQEs so
     // the kernel no longer references the buffers.
-    u32 pending_free[kMaxConns];
-    u32 pending_free_count;
+    MappedArray<u32> pending_free;
+    u32 pending_free_count = 0;
 
     // Deferred accepts: accepted fds that couldn't be allocated during
     // dispatch because all slots were in pending_free. Retried after the
@@ -443,12 +447,59 @@ public:
     static constexpr u32 kCaptureSliceSize = 8192;  // must match CaptureEntry::kMaxHeaderLen
     u8* capture_region_ = nullptr;
 
+    core::Expected<void, Error> init_slot_storage(u32 capacity, u32 id = 0) {
+        if (!validate_connection_capacity(capacity))
+            return core::make_unexpected(Error::make(EINVAL, Error::Source::Mmap));
+        if (connection_capacity != 0)
+            return connection_capacity == capacity
+                       ? core::Expected<void, Error>{}
+                       : core::make_unexpected(Error::make(EINVAL, Error::Source::Mmap));
+        auto c = conns.init(capacity);
+        if (!c) return core::make_unexpected(c.error());
+        auto f = free_stack.init(capacity);
+        if (!f) {
+            conns.destroy();
+            return core::make_unexpected(f.error());
+        }
+        auto p = pending_free.init(capacity);
+        if (!p) {
+            free_stack.destroy();
+            conns.destroy();
+            return core::make_unexpected(p.error());
+        }
+        for (u32 i = 0; i < capacity; i++) {
+            conns[i].reset();
+            conns[i].id = i;
+            conns[i].shard_id = static_cast<u8>(id);
+            free_stack[i] = i;
+            pending_free[i] = 0;
+        }
+        free_top = capacity;
+        pending_free_count = 0;
+        connection_capacity = capacity;
+        return {};
+    }
+
+    void destroy_slot_storage() {
+        connection_capacity = 0;
+        pending_free_count = 0;
+        free_top = 0;
+        pending_free.destroy();
+        free_stack.destroy();
+        conns.destroy();
+    }
+
     bool set_capture(CaptureRing* ring) {
         capture_ring = ring;
         if (!ring) return true;
+        if (connection_capacity == 0 || static_cast<u64>(connection_capacity) >
+                                            static_cast<u64>(SIZE_MAX) / kCaptureSliceSize) {
+            capture_ring = nullptr;
+            return false;
+        }
         if (!capture_region_) {
             void* region = mmap(nullptr,
-                                static_cast<u64>(kMaxConns) * kCaptureSliceSize,
+                                static_cast<size_t>(connection_capacity) * kCaptureSliceSize,
                                 PROT_READ | PROT_WRITE,
                                 MAP_PRIVATE | MAP_ANONYMOUS,
                                 -1,
@@ -459,7 +510,7 @@ public:
             }
             capture_region_ = static_cast<u8*>(region);
         }
-        for (u32 i = 0; i < kMaxConns; i++) {
+        for (u32 i = 0; i < connection_capacity; i++) {
             if (conns[i].fd >= 0 && !conns[i].capture_buf)
                 conns[i].capture_buf = capture_region_ + static_cast<u64>(i) * kCaptureSliceSize;
         }
@@ -477,7 +528,14 @@ public:
     ShardEpoch* epoch = nullptr;
     void** jit_code_ptr = nullptr;
 
-    core::Expected<void, Error> init(u32 id, i32 lfd, u32 pool_prealloc = 0) {
+    core::Expected<void, Error> init(u32 id,
+                                     i32 lfd,
+                                     u32 pool_prealloc = 0,
+                                     u32 capacity = kDefaultConnectionCapacity) {
+        if (connection_capacity != 0)
+            return core::make_unexpected(Error::make(EINVAL, Error::Source::Mmap));
+        auto slots = init_slot_storage(capacity, id);
+        if (!slots) return core::make_unexpected(slots.error());
         shard_id = id;
         listen_fd = lfd;
         this->listener_context = {};
@@ -494,22 +552,24 @@ public:
         control = nullptr;
         epoch = nullptr;
         jit_code_ptr = nullptr;
-        free_top = kMaxConns;
-        pending_free_count = 0;
         deferred_accept_count = 0;
         timer.init();
-        for (u32 i = 0; i < kMaxConns; i++) {
-            conns[i].reset();
-            conns[i].id = i;
-            conns[i].shard_id = static_cast<u8>(id);
-            free_stack[i] = i;
-        }
         // Up to 5 slices per connection (lazy): recv + send + upstream_recv + the two
         // WebSocket terminate-mode reassembly slices. Matches the io_uring loop.
-        TRY_VOID(pool.init(kMaxConns * 6, pool_prealloc));
-        auto be = backend.init(id, lfd);
+        auto pooled = pool.init(connection_capacity * 6, pool_prealloc);
+        if (!pooled) {
+            destroy_slot_storage();
+            return core::make_unexpected(pooled.error());
+        }
+        auto be = [&]() {
+            if constexpr (requires { backend.init(id, lfd, connection_capacity); })
+                return backend.init(id, lfd, connection_capacity);
+            else
+                return backend.init(id, lfd);
+        }();
         if (!be) {
             pool.destroy();
+            destroy_slot_storage();
             return core::make_unexpected(be.error());
         }
         return {};
@@ -520,7 +580,7 @@ public:
         IoEvent events[kMaxEventsPerWait];
 
         while (is_running()) {
-            u32 n = backend.wait(events, kMaxEventsPerWait, conns, kMaxConns);
+            u32 n = backend.wait(events, kMaxEventsPerWait, conns, connection_capacity);
             for (u32 i = 0; i < n; i++) {
                 dispatch(events[i]);
             }
@@ -594,9 +654,10 @@ public:
         backend.shutdown();
         pool.destroy();
         if (capture_region_) {
-            munmap(capture_region_, static_cast<u64>(kMaxConns) * kCaptureSliceSize);
+            munmap(capture_region_, static_cast<u64>(connection_capacity) * kCaptureSliceSize);
             capture_region_ = nullptr;
         }
+        destroy_slot_storage();
     }
 
     // Reclaim a single slot from pending_free by conn_id. Frees slices,
@@ -604,7 +665,8 @@ public:
     // Called inline from dispatch() when a stale CQE completes reclamation,
     // so a later Accept in the same batch can reuse the slot immediately.
     void reclaim_slot(u32 cid) {
-        if (cid >= kMaxConns || !conns[cid].response_read_timer_owner_is_neutral()) return;
+        if (cid >= connection_capacity || !conns[cid].response_read_timer_owner_is_neutral())
+            return;
         bool was_pending = false;
         for (u32 i = 0; i < pending_free_count; i++) {
             if (pending_free[i] == cid) {
@@ -740,7 +802,7 @@ public:
     // Number of connections not yet fully reclaimed.
     // Includes pending_free slots: they're closed but still waiting for
     // CQEs, so drain must keep running until they're reclaimed too.
-    u32 active_count() const { return kMaxConns - free_top; }
+    u32 active_count() const { return connection_capacity - free_top; }
 
     // Allocatable Connection slots remaining (free_stack depth). Used by
     // start_health_probe to keep a reserve for real client accepts.
@@ -1042,7 +1104,7 @@ public:
                     u64 start = drain_start_.load(std::memory_order_relaxed);
                     u32 period = drain_period_.load(std::memory_order_relaxed);
                     u64 now = monotonic_secs();
-                    for (u32 i = 0; i < kMaxConns; i++) {
+                    for (u32 i = 0; i < connection_capacity; i++) {
                         if (conns[i].fd >= 0 && conns[i].state == ConnState::ReadingHeader &&
                             should_drain_close(i, start, now, period)) {
                             this->close_conn(conns[i]);
@@ -1057,7 +1119,7 @@ public:
             case IoEventType::UpstreamRecv:
             case IoEventType::UpstreamSend:
             case IoEventType::HandlerTimer:
-                if (ev.conn_id < kMaxConns) {
+                if (ev.conn_id < connection_capacity) {
                     auto& conn = conns[ev.conn_id];
                     const bool stale_tagged_upstream =
                         io_event_is_tagged_stale(ev, conn.upstream_episode);
@@ -1101,7 +1163,8 @@ public:
                 }
                 break;
             case IoEventType::ResponseReadTimer:
-                if (ev.conn_id < kMaxConns && valid_response_read_timer_transport_event(ev)) {
+                if (ev.conn_id < connection_capacity &&
+                    valid_response_read_timer_transport_event(ev)) {
                     auto& conn = conns[ev.conn_id];
                     if (conn.consume_response_read_timer_completion(ev.non_upstream_generation) &&
                         conn.response_read_timer_owner_is_neutral())
@@ -1230,7 +1293,7 @@ private:
 
     // Force-close all active connections (drain deadline exceeded).
     void force_close_all() {
-        for (u32 i = 0; i < kMaxConns; i++) {
+        for (u32 i = 0; i < connection_capacity; i++) {
             if (conns[i].fd >= 0) {
                 this->close_conn(conns[i]);
             }

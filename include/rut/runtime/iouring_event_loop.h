@@ -6,6 +6,7 @@
 #include "rut/runtime/access_log_live_producer.h"
 #include "rut/runtime/callbacks.h"
 #include "rut/runtime/connection.h"
+#include "rut/runtime/connection_capacity.h"
 #include "rut/runtime/drain.h"
 #include "rut/runtime/error.h"
 #include "rut/runtime/event_loop.h"
@@ -14,6 +15,7 @@
 #include "rut/runtime/io_event.h"
 #include "rut/runtime/io_uring_backend.h"
 #include "rut/runtime/jit_dispatch.h"
+#include "rut/runtime/mapped_array.h"
 #include "rut/runtime/metrics.h"
 #include "rut/runtime/rate_limit.h"
 #include "rut/runtime/response_read_deadline.h"
@@ -82,12 +84,43 @@ private:
     std::atomic<u32> drain_period_;
 
 private:
+    template <typename Submit>
+    [[nodiscard]] bool submit_staged_tls_local_response_impl(Connection& c,
+                                                             const u8* src,
+                                                             u32 len,
+                                                             Submit&& submit) {
+        const bool staged_in_response_header_buf =
+            src == c.response_header_buf.data() && len == c.response_header_buf.len() && len != 0;
+        if (c.id >= connection_capacity || c.fd < 0 || src == nullptr ||
+            !staged_in_response_header_buf || !c.uses_iouring_tls() || !c.tls_handshake_complete ||
+            !c.tls_engine.handshake_done || c.protocol != ConnProtocol::Http11 || c.h2 != nullptr ||
+            c.state != ConnState::Sending ||
+            c.on_send != &on_validated_preconnect_failure_sent<IoUringEventLoop> ||
+            c.resp_status != kStatusBadGateway || c.resp_body_mode != BodyMode::None ||
+            c.resp_body_remaining != 0 || c.upstream_fd >= 0 || !c.upstream_abandoned ||
+            c.send_armed || backend.send_state[c.id].remaining != 0 ||
+            !c.response_read_deadline_owner_is_neutral() ||
+            !c.http1_prebuilt_response_proof_is_neutral() ||
+            !c.tls_single_shot_send_owner_is_neutral() || !c.tls_raw_send_owner_is_neutral() ||
+            c.tls_in_buf.len() != 0 || c.tls_out_buf.len() != 0 || c.tls_proxy_stream ||
+            c.upstream_send_len != 0 || c.upstream_send_armed || c.on_upstream_send != nullptr ||
+            backend.upstream_send_state[c.id].remaining != 0 || c.retry_req_send_len != 0 ||
+            c.pipeline_stash_len != 0 || c.response_mutations_snapshotted ||
+            c.upstream_request_incomplete || backend.failure_code() != 0)
+            return false;
+
+        // SSL_write consumes the staged plaintext before the ciphertext SQE
+        // can be rejected. Make one submission attempt only; its failure is
+        // terminal and must be observed by the caller without a second close.
+        return submit();
+    }
+
     template <typename Submit, typename FlushResult>
     [[nodiscard]] bool submit_staged_local_response_impl(
         Connection& c, const u8* src, u32 len, Submit&& submit, FlushResult&& flush_result) {
         const bool staged_in_response_header_buf =
             src == c.response_header_buf.data() && len == c.response_header_buf.len() && len != 0;
-        if (c.id >= kMaxConns || c.fd < 0 || src == nullptr || len == 0 || c.tls_active ||
+        if (c.id >= connection_capacity || c.fd < 0 || src == nullptr || len == 0 || c.tls_active ||
             !staged_in_response_header_buf || c.send_armed ||
             backend.send_state[c.id].remaining != 0 ||
             !c.response_read_deadline_owner_is_neutral() || c.upstream_send_armed ||
@@ -122,7 +155,8 @@ private:
     }
 
 public:
-    static constexpr u32 kMaxConns = 16384;
+    static constexpr u32 kMaxConns = kDefaultConnectionCapacity;
+    u32 connection_capacity = 0;
     // Active health-check probing requires synchronous probe teardown; the
     // io_uring loop doesn't support that yet, so sweep_health_probes only re-arms
     // deadlines here and issues no connects (epoll-only this slice).
@@ -161,13 +195,13 @@ public:
     // h2 upgrade; bounded, over-cap upgrades close the connection.
     static constexpr u32 kH2PoolCap = 2048;
     SlabPool<Http2Conn, kH2PoolCap> h2_pool;
-    Connection conns[kMaxConns];
-    u32 free_stack[kMaxConns];
-    u32 free_top;
+    MappedArray<Connection> conns;
+    MappedArray<u32> free_stack;
+    u32 free_top = 0;
 
     // Pending-free list: slots closed during the current dispatch batch.
-    u32 pending_free[kMaxConns];
-    u32 pending_free_count;
+    MappedArray<u32> pending_free;
+    u32 pending_free_count = 0;
     // Normally zero. A strict retirement cancel that could not acquire an SQE
     // is retried before the next blocking wait; the count avoids scanning the
     // full connection table on the ordinary hot path.
@@ -177,7 +211,8 @@ public:
     // the run loop consumes this after the complete wait batch.
     bool http1_boundary_ready_pending;
     bool response_read_deadline_expiry_pending;
-    bool response_read_deadline_body_pump_pending;
+    bool response_read_deadline_body_pump_pending = false;
+    MappedArray<u64> body_pump_ready_words;
 
     enum class CompleteContentLengthTerminalDisposition : u8 {
         CompleteBody,
@@ -239,12 +274,79 @@ public:
     static constexpr u32 kCaptureSliceSize = 8192;
     u8* capture_region_ = nullptr;
 
+    core::Expected<void, Error> init_slot_storage(u32 capacity, u32 id = 0) {
+        if (!validate_connection_capacity(capacity))
+            return core::make_unexpected(Error::make(EINVAL, Error::Source::Mmap));
+        if (connection_capacity != 0)
+            return connection_capacity == capacity
+                       ? core::Expected<void, Error>{}
+                       : core::make_unexpected(Error::make(EINVAL, Error::Source::Mmap));
+        response_read_deadline_body_pump_pending = false;
+        auto c = conns.init(capacity);
+        if (!c) return core::make_unexpected(c.error());
+        auto f = free_stack.init(capacity);
+        if (!f) {
+            conns.destroy();
+            return core::make_unexpected(f.error());
+        }
+        auto p = pending_free.init(capacity);
+        if (!p) {
+            free_stack.destroy();
+            conns.destroy();
+            return core::make_unexpected(p.error());
+        }
+        auto b = backend.init_send_state_storage(capacity);
+        if (!b) {
+            pending_free.destroy();
+            free_stack.destroy();
+            conns.destroy();
+            return core::make_unexpected(b.error());
+        }
+        auto ready_words = body_pump_ready_words.init((capacity + 63u) / 64u);
+        if (!ready_words) {
+            backend.destroy_send_state_storage();
+            pending_free.destroy();
+            free_stack.destroy();
+            conns.destroy();
+            return core::make_unexpected(ready_words.error());
+        }
+        for (u32 i = 0; i < capacity; i++) {
+            conns[i].reset();
+            conns[i].id = i;
+            conns[i].shard_id = static_cast<u8>(id);
+            free_stack[i] = i;
+            pending_free[i] = 0;
+        }
+        free_top = capacity;
+        pending_free_count = 0;
+        response_read_deadline_body_pump_pending = false;
+        connection_capacity = capacity;
+        return {};
+    }
+
+    void destroy_slot_storage() {
+        connection_capacity = 0;
+        pending_free_count = 0;
+        free_top = 0;
+        response_read_deadline_body_pump_pending = false;
+        body_pump_ready_words.destroy();
+        backend.destroy_send_state_storage();
+        pending_free.destroy();
+        free_stack.destroy();
+        conns.destroy();
+    }
+
     bool set_capture(CaptureRing* ring) {
         capture_ring = ring;
         if (!ring) return true;
+        if (connection_capacity == 0 || static_cast<u64>(connection_capacity) >
+                                            static_cast<u64>(SIZE_MAX) / kCaptureSliceSize) {
+            capture_ring = nullptr;
+            return false;
+        }
         if (!capture_region_) {
             void* region = mmap(nullptr,
-                                static_cast<u64>(kMaxConns) * kCaptureSliceSize,
+                                static_cast<size_t>(connection_capacity) * kCaptureSliceSize,
                                 PROT_READ | PROT_WRITE,
                                 MAP_PRIVATE | MAP_ANONYMOUS,
                                 -1,
@@ -255,7 +357,7 @@ public:
             }
             capture_region_ = static_cast<u8*>(region);
         }
-        for (u32 i = 0; i < kMaxConns; i++) {
+        for (u32 i = 0; i < connection_capacity; i++) {
             if (conns[i].fd >= 0 && !conns[i].capture_buf)
                 conns[i].capture_buf = capture_region_ + static_cast<u64>(i) * kCaptureSliceSize;
         }
@@ -276,7 +378,14 @@ public:
     ShardEpoch* epoch = nullptr;
     void** jit_code_ptr = nullptr;
 
-    core::Expected<void, Error> init(u32 id, i32 lfd, u32 pool_prealloc = 0) {
+    core::Expected<void, Error> init(u32 id,
+                                     i32 lfd,
+                                     u32 pool_prealloc = 0,
+                                     u32 capacity = kDefaultConnectionCapacity) {
+        if (connection_capacity != 0)
+            return core::make_unexpected(Error::make(EINVAL, Error::Source::Mmap));
+        auto slots = init_slot_storage(capacity, id);
+        if (!slots) return core::make_unexpected(slots.error());
         shard_id = id;
         listen_fd = lfd;
         this->listener_context = {};
@@ -293,8 +402,6 @@ public:
         control = nullptr;
         epoch = nullptr;
         jit_code_ptr = nullptr;
-        free_top = kMaxConns;
-        pending_free_count = 0;
         upstream_retirement_retry_count = 0;
         http1_boundary_ready_pending = false;
         response_read_deadline_expiry_pending = false;
@@ -306,26 +413,28 @@ public:
         response_read_batch_pin_count = 0;
         deferred_accept_count = 0;
         timer.init();
-        for (u32 i = 0; i < kMaxConns; i++) {
-            conns[i].reset();
-            conns[i].id = i;
-            conns[i].shard_id = static_cast<u8>(id);
-            free_stack[i] = i;
-        }
         // Plaintext needs recv + send + lazy upstream_recv. TLS termination adds
         // one long-lived ciphertext output slice per connection. TLS input uses
         // a slightly larger mmap buffer so one full ciphertext record fits.
         // tls_server is wired after init(), so reserve for the TLS-capable case.
-        TRY_VOID(pool.init(kMaxConns * 6, pool_prealloc));
+        auto pooled = pool.init(connection_capacity * 6, pool_prealloc);
+        if (!pooled) {
+            backend.shutdown();
+            destroy_slot_storage();
+            return core::make_unexpected(pooled.error());
+        }
         auto h2p = h2_pool.init();
         if (!h2p) {
             pool.destroy();
+            backend.shutdown();
+            destroy_slot_storage();
             return core::make_unexpected(h2p.error());
         }
-        auto be = backend.init(id, lfd);
+        auto be = backend.init(id, lfd, connection_capacity);
         if (!be) {
             h2_pool.destroy();
             pool.destroy();
+            destroy_slot_storage();
             return core::make_unexpected(be.error());
         }
         return {};
@@ -344,7 +453,7 @@ public:
 
         while (is_running()) {
             retry_strict_upstream_retirement_cancels();
-            u32 n = backend.wait(events, kMaxEventsPerWait, conns, kMaxConns);
+            u32 n = backend.wait(events, kMaxEventsPerWait, conns, connection_capacity);
             if (backend.failure_code() != 0) {
                 // A zero-event wait is valid; a sticky backend error is not. Stop
                 // this shard so an io_uring_enter failure cannot become a silent
@@ -422,9 +531,10 @@ public:
         h2_pool.destroy();
         pool.destroy();
         if (capture_region_) {
-            munmap(capture_region_, static_cast<u64>(kMaxConns) * kCaptureSliceSize);
+            munmap(capture_region_, static_cast<u64>(connection_capacity) * kCaptureSliceSize);
             capture_region_ = nullptr;
         }
+        destroy_slot_storage();
     }
 
     void drain(u32 period_secs) {
@@ -443,7 +553,7 @@ public:
         }
     }
 
-    u32 active_count() const { return kMaxConns - free_top; }
+    u32 active_count() const { return connection_capacity - free_top; }
 
     // Lazy-allocate upstream recv buffer for proxy connections.
     // Only called when a connection starts proxying — non-proxy connections
@@ -455,6 +565,18 @@ public:
                c.upstream_retirement_cancel_owned != 0 || c.upstream_retirement_cancel_retry != 0 ||
                c.upstream_close_target_owned != 0 || c.upstream_close_cancel_owned != 0 ||
                c.upstream_close_pause_cancel_owned;
+    }
+
+    void maybe_publish_http1_boundary_ready(Connection& c) {
+        if (c.id >= connection_capacity || conns.data() == nullptr || &conns[c.id] != &c ||
+            c.fd < 0 || !c.http1_boundary_deferred || c.http1_boundary_ready ||
+            (c.http1_prebuilt_disposition != Http1RequestBufferDisposition::None &&
+             c.http1_prebuilt_wait != 0) ||
+            strict_upstream_retirement_blocks_reclaim(c) ||
+            !c.response_read_timer_owner_is_neutral())
+            return;
+        c.http1_boundary_ready = true;
+        http1_boundary_ready_pending = true;
     }
 
     static constexpr u8 upstream_op_for_event(IoEventType type) {
@@ -479,7 +601,9 @@ public:
 
     // Park only the post-response request-boundary tail. Every request-1 side
     // effect (metrics/log/epoch/upstream release) has already completed before
-    // this hook is called from on_proxy_response_sent.
+    // this hook is called from on_proxy_response_sent. Origin retirement and
+    // the precise response timer are independent owners; neither may be reused
+    // as request-2 readiness until both have settled.
     [[nodiscard]] bool defer_http1_request_boundary(Connection& c) {
         // Exhausting the episode space quarantines the slot even when C1 had
         // no recv owner to drain. Never admit request 2 under an invalid token.
@@ -487,7 +611,9 @@ public:
             close_conn(c);
             return true;
         }
-        if (!strict_upstream_retirement_blocks_reclaim(c)) return false;
+        if (!strict_upstream_retirement_blocks_reclaim(c) &&
+            c.response_read_timer_owner_is_neutral())
+            return false;
         if (c.http1_boundary_deferred || c.http1_boundary_ready) {
             // A duplicate rendezvous cannot be resumed safely. Keep it parked;
             // the normal close path will clear it.
@@ -1088,8 +1214,7 @@ private:
         if (c.http1_prebuilt_disposition == Http1RequestBufferDisposition::None ||
             c.http1_prebuilt_wait != 0 || !c.http1_boundary_deferred || c.http1_boundary_ready)
             return;
-        c.http1_boundary_ready = true;
-        http1_boundary_ready_pending = true;
+        maybe_publish_http1_boundary_ready(c);
     }
 
     bool normalize_prebuilt_http1_request_buffer(Connection& c) {
@@ -1135,7 +1260,7 @@ private:
              previous_tombstone < c.upstream_episode && !c.upstream_retirement_active &&
              c.upstream_retirement_target_owned == 0 && c.upstream_retirement_cancel_owned == 0 &&
              c.upstream_retirement_cancel_retry == 0);
-        if (c.id >= kMaxConns || c.upstream_episode_quarantined ||
+        if (c.id >= connection_capacity || c.upstream_episode_quarantined ||
             !valid_upstream_episode(c.upstream_episode) || !replaceable_tombstone ||
             (selected_targets & static_cast<u8>(~kAllUpstreamOps)) != 0 ||
             ((selected_targets & kUpstreamOpConnect) != 0 &&
@@ -1240,16 +1365,14 @@ private:
     }
 
 public:
-    // Queue an already-built immutable cleartext local response that owns the
-    // whole response_header_buf. This helper is intentionally narrower than
-    // client_send(): every response-deadline owner and every upstream-send or
-    // request-snapshot owner must already be neutral. It does not serialize,
-    // select policy, advance throttling, enter TLS, or participate in the
-    // response-deadline Send-generation namespace. On initial SQ exhaustion it
-    // performs one nonblocking flush and retries exactly once. Both failed
-    // attempts leave downstream send ownership unpublished, so a caller can
-    // fail closed without preserving a deferred response marker.
+    // Queue an already-built immutable local failure response. Cleartext uses
+    // the private staged helper's single flush/retry; TLS has a separate
+    // one-shot path because SSL_write consumes plaintext before ciphertext
+    // submission and therefore cannot safely retry after SQ exhaustion.
     [[nodiscard]] bool submit_staged_local_response(Connection& c, const u8* src, u32 len) {
+        if (c.tls_active)
+            return submit_staged_tls_local_response_impl(
+                c, src, len, [&]() { return submit_send_impl(c, src, len); });
         return submit_staged_local_response_impl(
             c,
             src,
@@ -1350,6 +1473,54 @@ public:
         return begin_upstream_retirement_impl(c, 0, false, true);
     }
 
+    // The 504 TLS bridge is narrower than the general prebuilt-response path:
+    // it only accepts the fully typed CompleteContentLength bodyless-GET
+    // timeout frame, and only while TLS output ownership is settled.
+    bool prebuilt_http11_tls_read_timeout_is_stable(const Connection& c,
+                                                    bool sending = false) const {
+        if (c.id >= connection_capacity || c.fd < 0 || c.request_config == nullptr ||
+            c.http1_prebuilt_deadline_config != c.request_config ||
+            !c.request_config->policy_bundle_id_is_valid(c.http1_prebuilt_deadline_bundle_id))
+            return false;
+        const auto& bundle =
+            c.request_config->policy_bundles[c.http1_prebuilt_deadline_bundle_id - 1u];
+        const u8 expected_wait =
+            kHttp1WaitHeaderSend |
+            (c.upstream_retirement_active ? kHttp1WaitUpstreamRetirement : static_cast<u8>(0));
+        const bool phase_state =
+            sending ? (c.state == ConnState::Sending &&
+                       c.http1_prebuilt_disposition ==
+                           Http1RequestBufferDisposition::ExistingPipeline &&
+                       c.http1_prebuilt_wait == expected_wait && !c.http1_boundary_deferred &&
+                       c.http1_prebuilt_request_prefix_len == 0 && !c.http1_boundary_ready &&
+                       c.http1_boundary_successor_episode == c.upstream_episode)
+                    : (c.state == ConnState::Proxying &&
+                       c.http1_prebuilt_disposition == Http1RequestBufferDisposition::None &&
+                       c.http1_prebuilt_wait == 0 && c.http1_prebuilt_request_prefix_len == 0 &&
+                       !c.http1_boundary_deferred && !c.http1_boundary_ready &&
+                       c.http1_boundary_successor_episode == 0);
+        return phase_state && c.pipeline_depth == 0 && c.http1_pipeline_request_generation == 0 &&
+               c.pipeline_stash_len == 0 &&
+               bundle.response_buffering == ForwardResponseBufferingMode::CompleteContentLength &&
+               bodyless_get_complete_content_length_request_policy_is_admitted(
+                   c.request_policy_id) &&
+               c.http1_prebuilt_deadline_upload.request_policy_id == c.request_policy_id &&
+               c.http1_prebuilt_deadline_upload.handler_generation == c.handler_gen &&
+               response_read_deadline_tls_http11_engine_is_stable(c) &&
+               response_read_deadline_tls_output_is_settled(c) && c.on_recv == &tls_recv<Self> &&
+               c.http1_prebuilt_response_layout ==
+                   Http1PrebuiltResponseLayout::FullContentLengthNonHead &&
+               c.http1_prebuilt_response_purpose ==
+                   Http1PrebuiltResponsePurpose::ResponseReadTimeout &&
+               c.http1_prebuilt_deadline_profile ==
+                   ResponseReadDeadlineProfile::BodylessNonHeadContentLengthZero &&
+               c.http1_prebuilt_deadline_method == static_cast<u8>(LogHttpMethod::Get) &&
+               c.http1_prebuilt_deadline_route_method == kRouteMethodGet &&
+               c.http1_prebuilt_deadline_generation == c.response_read_deadline_generation &&
+               !c.http1_prebuilt_response_proof_is_neutral() &&
+               prebuilt_http1_response_is_complete(c);
+    }
+
     // Internal D2 seam. The complete header is already owned by
     // response_header_buf; this method proves transport and request-buffer
     // ownership before advancing the episode or submitting any downstream byte.
@@ -1412,8 +1583,10 @@ public:
                      ->policy_bundles[c.http1_prebuilt_deadline_bundle_id - 1]
                      .response_buffering,
                  c.http1_prebuilt_deadline_profile));
-        if (c.id >= kMaxConns || c.fd < 0 || c.upstream_fd < 0 ||
-            c.protocol != ConnProtocol::Http11 || c.tls_active || c.state != ConnState::Proxying ||
+        const bool tls_read_timeout = c.tls_active && prebuilt_http11_tls_read_timeout_is_stable(c);
+        if (c.id >= connection_capacity || c.fd < 0 || c.upstream_fd < 0 ||
+            c.protocol != ConnProtocol::Http11 || (c.tls_active && !tls_read_timeout) ||
+            c.state != ConnState::Proxying ||
             ((!c.keep_alive || !c.req_client_keep_alive) && !explicit_close) ||
             c.req_start_us == 0 || c.epoch_held || c.resp_body_mode != BodyMode::None ||
             c.resp_body_remaining != 0 ||
@@ -1468,7 +1641,7 @@ public:
         c.resp_body_sent = c.response_header_buf.len();
         c.transition_to_sending(&on_prebuilt_http1_header_sent<IoUringEventLoop>);
         if (!submit_send(c, c.response_header_buf.data(), c.response_header_buf.len())) {
-            close_conn(c);
+            if (c.fd >= 0) close_conn(c);
             return false;
         }
         return true;
@@ -1493,8 +1666,8 @@ public:
         const u8 expected_wait =
             kHttp1WaitHeaderSend |
             (c.upstream_retirement_active ? kHttp1WaitUpstreamRetirement : static_cast<u8>(0));
-        if (c.id >= kMaxConns || ev.conn_id != c.id || ev.type != IoEventType::Send || ev.more ||
-            ev.aux != 0 || ev.result <= 0 ||
+        if (c.id >= connection_capacity || ev.conn_id != c.id || ev.type != IoEventType::Send ||
+            ev.more || ev.aux != 0 || ev.result <= 0 ||
             static_cast<u32>(ev.result) != c.response_header_buf.len() ||
             !prebuilt_http1_response_is_complete(c) ||
             c.http1_prebuilt_disposition == Http1RequestBufferDisposition::None ||
@@ -1502,6 +1675,16 @@ public:
             c.send_armed || c.req_start_us == 0 || c.epoch_held ||
             c.on_send != &on_prebuilt_http1_header_sent<IoUringEventLoop>)
             return false;
+        if (c.tls_active) {
+            return prebuilt_http11_tls_read_timeout_is_stable(c, /*sending=*/true) &&
+                   c.response_read_deadline_send_tombstone_generation != 0 &&
+                   ev.non_upstream_generation ==
+                       c.response_read_deadline_send_tombstone_generation &&
+                   !c.response_read_deadline_send_owner_active &&
+                   response_read_deadline_send_fields_are_neutral(c) &&
+                   c.tls_raw_send_owner_is_neutral() && c.tls_single_shot_send_owner_is_neutral() &&
+                   !c.tls_out_inflight && c.tls_out_buf.len() == 0;
+        }
         const auto& send = backend.send_state[c.id];
         return send.src == c.response_header_buf.data() && send.fd == c.fd &&
                send.offset == c.response_header_buf.len() && send.remaining == 0 &&
@@ -1520,7 +1703,7 @@ public:
         if ((c.http1_prebuilt_wait & kHttp1WaitHeaderSend) == 0) return true;
 
         const auto& send = backend.send_state[c.id];
-        const bool exact_owner = c.id < kMaxConns && c.state == ConnState::Sending &&
+        const bool exact_owner = c.id < connection_capacity && c.state == ConnState::Sending &&
                                  c.send_armed && c.req_start_us != 0 && !c.epoch_held &&
                                  c.on_send == &on_prebuilt_http1_header_sent<IoUringEventLoop> &&
                                  send.src == c.response_header_buf.data() && send.fd == c.fd &&
@@ -1553,7 +1736,7 @@ public:
         return true;
     }
 
-    bool consume_response_read_deadline_send_event(Connection& c, const IoEvent& ev) {
+    bool consume_tagged_send_close_event(Connection& c, const IoEvent& ev) {
         if (ev.type != IoEventType::Send) return false;
         const bool close_cancel = (ev.non_upstream_generation & kNonUpstreamSendCancelBit) != 0;
         const u32 event_generation = ev.non_upstream_generation & kNonUpstreamSendGenerationMask;
@@ -1576,6 +1759,174 @@ public:
             if (c.fd < 0 && c.pending_ops == 0) reclaim_slot(c.id);
             return true;
         }
+        return false;
+    }
+
+    bool consume_tls_ciphertext_send_event(Connection& c, const IoEvent& ev) {
+        if (ev.type != IoEventType::Send || !c.tls_active) return false;
+        // Every io_uring TLS Send is a tagged ciphertext target. With no raw
+        // target there is no valid application-level CQE to account; while a
+        // target is live, any other token (including legacy zero) is stale.
+        if (!c.tls_out_inflight) return true;
+        if (c.tls_out_inflight_generation == 0) {
+            backend.fatal_error.store(EPROTO, std::memory_order_release);
+            running_.store(false, std::memory_order_release);
+            close_conn(c);
+            return true;
+        }
+        if (ev.non_upstream_generation != c.tls_out_inflight_generation) return true;
+
+        // F_MORE is not a terminal send completion. Close transfers the raw
+        // token and its still-live target to the common close/cancel ledger.
+        if (ev.more) {
+            close_conn(c);
+            return true;
+        }
+
+        if (c.id >= connection_capacity) {
+            backend.fatal_error.store(EPROTO, std::memory_order_release);
+            running_.store(false, std::memory_order_release);
+            close_conn(c);
+            return true;
+        }
+        const bool has_target = c.send_armed && c.pending_ops > 0;
+        const auto& send = backend.send_state[c.id];
+        const bool raw_identity = tls_ciphertext_send_raw_state_matches(c) &&
+                                  c.on_send == &tls_on_out_drain<Self> && ev.aux == 0;
+        const bool successful = raw_identity && ev.result > 0 &&
+                                static_cast<u32>(ev.result) == c.tls_out_inflight_len &&
+                                send.offset == c.tls_out_inflight_len && send.remaining == 0;
+        if (!has_target) {
+            backend.fatal_error.store(EPROTO, std::memory_order_release);
+            running_.store(false, std::memory_order_release);
+            close_conn(c);
+            return true;
+        }
+
+        // This authenticated, terminal raw CQE owns exactly one real kernel
+        // target whether it succeeded or failed. The TLS drain must never let
+        // generic dispatch decrement it a second time.
+        c.pending_ops--;
+        c.send_armed = false;
+        // These are generic terminal Send-dispatch side effects. Apply them
+        // before either the TLS continuation or fail-closed error handling.
+        if (!c.throttle_paused &&
+            c.response_read_deadline_state != ResponseReadDeadlineState::Armed &&
+            c.response_read_deadline_state != ResponseReadDeadlineState::ExpiryPending &&
+            c.response_read_deadline_state != ResponseReadDeadlineState::BatchPending &&
+            c.response_read_deadline_state != ResponseReadDeadlineState::RefreshPending)
+            timer.refresh(&c,
+                          c.state == ConnState::Proxying ? upstream_timeout : keepalive_timeout);
+        c.recv_paused_for_send = false;
+        if (!successful) {
+            backend.send_state[c.id] = {};
+            Connection::visit_tls_raw_send_owner_fields(
+                c, [](auto& value, const auto& reset_value) { value = reset_value; });
+            close_conn(c);
+            return true;
+        }
+
+        tls_on_out_drain<Self>(this, c, ev);
+        return true;
+    }
+
+    [[nodiscard]] static ResponseReadDeadlineSendKind response_read_deadline_tls_send_kind(
+        const Connection& c) {
+        switch (c.response_read_deadline_post_commit_phase) {
+            case ResponseReadDeadlinePostCommitPhase::HeaderSend:
+                return ResponseReadDeadlineSendKind::Header;
+            case ResponseReadDeadlinePostCommitPhase::BodySend:
+                return ResponseReadDeadlineSendKind::Body;
+            case ResponseReadDeadlinePostCommitPhase::CombinedSend:
+                return ResponseReadDeadlineSendKind::Combined;
+            case ResponseReadDeadlinePostCommitPhase::None:
+            case ResponseReadDeadlinePostCommitPhase::Buffering:
+            case ResponseReadDeadlinePostCommitPhase::WaitingBody:
+            case ResponseReadDeadlinePostCommitPhase::OriginComplete:
+                return ResponseReadDeadlineSendKind::None;
+        }
+        return ResponseReadDeadlineSendKind::None;
+    }
+
+    [[nodiscard]] static Connection::Callback response_read_deadline_tls_send_callback(
+        ResponseReadDeadlineSendKind kind) {
+        switch (kind) {
+            case ResponseReadDeadlineSendKind::Header:
+                return &on_response_header_sent<Self>;
+            case ResponseReadDeadlineSendKind::Body:
+                return &on_response_body_sent<Self>;
+            case ResponseReadDeadlineSendKind::Combined:
+                return &on_complete_response_sent<Self>;
+            case ResponseReadDeadlineSendKind::None:
+                return nullptr;
+        }
+        return nullptr;
+    }
+
+    [[nodiscard]] bool response_read_deadline_tls_send_frame_is_valid(
+        const Connection& c,
+        ResponseReadDeadlineSendKind kind,
+        Connection::Callback callback,
+        const u8* src,
+        u32 len) const {
+        if (c.id >= connection_capacity || c.fd < 0 || !c.tls_active || !c.tls_handshake_complete ||
+            !c.uses_iouring_tls() || c.protocol != ConnProtocol::Http11 || c.h2 != nullptr ||
+            c.state != ConnState::Sending || c.req_start_us == 0 || c.epoch_held ||
+            callback == nullptr || c.on_send != callback || src == nullptr || len == 0 ||
+            c.response_read_deadline_post_commit_generation == 0 ||
+            c.response_read_deadline_post_commit_generation !=
+                c.response_read_deadline_generation ||
+            c.response_read_deadline_buffering !=
+                ForwardResponseBufferingMode::CompleteContentLength ||
+            c.response_read_deadline_send_owner_generation == 0 ||
+            c.response_read_deadline_send_deadline_generation !=
+                c.response_read_deadline_post_commit_generation ||
+            c.response_read_deadline_send_upstream_episode !=
+                c.response_read_deadline_post_commit_episode ||
+            c.response_read_deadline_send_fd != c.fd || c.response_read_deadline_send_src != src ||
+            c.response_read_deadline_send_len != len || c.response_read_deadline_send_kind != kind)
+            return false;
+
+        switch (kind) {
+            case ResponseReadDeadlineSendKind::Header:
+                return c.response_read_deadline_post_commit_phase ==
+                           ResponseReadDeadlinePostCommitPhase::HeaderSend &&
+                       callback == &on_response_header_sent<Self> &&
+                       src == c.response_header_buf.data() && len == c.response_header_buf.len() &&
+                       c.response_read_deadline_post_commit_inflight_body == 0 &&
+                       c.upstream_send_len == c.response_read_deadline_post_commit_raw_header_end &&
+                       c.upstream_recv_buf.len() >= c.upstream_send_len;
+            case ResponseReadDeadlineSendKind::Body:
+                return c.response_read_deadline_post_commit_phase ==
+                           ResponseReadDeadlinePostCommitPhase::BodySend &&
+                       callback == &on_response_body_sent<Self> &&
+                       src == c.upstream_recv_buf.data() &&
+                       len == c.response_read_deadline_post_commit_inflight_body && len != 0 &&
+                       c.upstream_send_len == len && c.upstream_recv_buf.len() >= len;
+            case ResponseReadDeadlineSendKind::Combined:
+                return c.response_read_deadline_post_commit_phase ==
+                           ResponseReadDeadlinePostCommitPhase::CombinedSend &&
+                       callback == &on_complete_response_sent<Self> &&
+                       src == c.response_header_buf.data() &&
+                       response_read_deadline_combined_send_frame_is_stable(c) &&
+                       len == c.response_read_deadline_send_len;
+            case ResponseReadDeadlineSendKind::None:
+                return false;
+        }
+        return false;
+    }
+
+    [[nodiscard]] static bool response_read_deadline_send_fields_are_neutral(const Connection& c) {
+        bool neutral = true;
+        const auto check = [&](const auto& value, const auto& reset_value) {
+            neutral = neutral && value == reset_value;
+        };
+        Connection::visit_response_read_deadline_send_owner_fields(c, check);
+        return neutral;
+    }
+
+    bool consume_response_read_deadline_send_event(Connection& c, const IoEvent& ev) {
+        if (ev.type != IoEventType::Send) return false;
         if (!c.response_read_deadline_send_owner_active) {
             // A nonzero token is owned by this dedicated Send namespace.  Once
             // tombstoned it remains consumable across retirement/request-2;
@@ -1588,10 +1939,12 @@ public:
         const bool header =
             c.response_read_deadline_send_kind == ResponseReadDeadlineSendKind::Header;
         const bool body = c.response_read_deadline_send_kind == ResponseReadDeadlineSendKind::Body;
+        const bool combined =
+            c.response_read_deadline_send_kind == ResponseReadDeadlineSendKind::Combined;
         const auto& send = backend.send_state[c.id];
         const bool exact_shape =
-            c.id < kMaxConns && c.fd >= 0 && c.send_armed && c.pending_ops > 0 && !ev.more &&
-            ev.aux == 0 && ev.result > 0 &&
+            c.id < connection_capacity && c.fd >= 0 && c.send_armed && c.pending_ops > 0 &&
+            !ev.more && ev.aux == 0 && ev.result > 0 &&
             static_cast<u32>(ev.result) == c.response_read_deadline_send_len &&
             c.response_read_deadline_send_deadline_generation ==
                 c.response_read_deadline_post_commit_generation &&
@@ -1611,7 +1964,12 @@ public:
               c.on_send == &on_response_body_sent<Self> &&
               c.response_read_deadline_send_src == c.upstream_recv_buf.data() &&
               c.response_read_deadline_send_len ==
-                  c.response_read_deadline_post_commit_inflight_body)) &&
+                  c.response_read_deadline_post_commit_inflight_body) ||
+             (combined &&
+              c.response_read_deadline_post_commit_phase ==
+                  ResponseReadDeadlinePostCommitPhase::CombinedSend &&
+              c.on_send == &on_complete_response_sent<Self> &&
+              response_read_deadline_combined_send_frame_is_stable(c))) &&
             send.src == c.response_read_deadline_send_src && send.fd == c.fd &&
             send.type == IoEventType::Send && send.generation == owner &&
             send.offset == c.response_read_deadline_send_len && send.remaining == 0;
@@ -1649,7 +2007,51 @@ public:
     bool response_read_deadline_send_completion_is_valid(const Connection& c,
                                                          const IoEvent& ev,
                                                          ResponseReadDeadlineSendKind kind) const {
-        if (c.id >= kMaxConns) return false;
+        if (c.id >= connection_capacity) return false;
+        Connection::Callback expected_callback = nullptr;
+        switch (kind) {
+            case ResponseReadDeadlineSendKind::None:
+                return false;
+            case ResponseReadDeadlineSendKind::Header:
+                expected_callback = &on_response_header_sent<Self>;
+                break;
+            case ResponseReadDeadlineSendKind::Body:
+                expected_callback = &on_response_body_sent<Self>;
+                break;
+            case ResponseReadDeadlineSendKind::Combined:
+                expected_callback = &on_complete_response_sent<Self>;
+                break;
+            default:
+                return false;
+        }
+        if (c.tls_active) {
+            const bool exact_tuple =
+                !c.response_read_deadline_send_owner_active &&
+                c.response_read_deadline_send_owner_generation != 0 &&
+                c.response_read_deadline_send_tombstone_generation ==
+                    c.response_read_deadline_send_owner_generation &&
+                c.response_read_deadline_send_deadline_generation ==
+                    c.response_read_deadline_generation &&
+                c.response_read_deadline_send_deadline_generation ==
+                    c.response_read_deadline_post_commit_generation &&
+                c.response_read_deadline_send_upstream_episode ==
+                    c.response_read_deadline_post_commit_episode &&
+                c.response_read_deadline_send_fd == c.fd &&
+                c.response_read_deadline_send_src != nullptr &&
+                response_read_deadline_tls_send_frame_is_valid(c,
+                                                               kind,
+                                                               expected_callback,
+                                                               c.response_read_deadline_send_src,
+                                                               c.response_read_deadline_send_len);
+            return exact_tuple && ev.type == IoEventType::Send && !ev.more && ev.aux == 0 &&
+                   ev.conn_id == c.id &&
+                   ev.non_upstream_generation == c.response_read_deadline_send_owner_generation &&
+                   ev.result > 0 &&
+                   static_cast<u32>(ev.result) == c.response_read_deadline_send_len &&
+                   !c.send_armed && c.on_send == expected_callback &&
+                   c.tls_raw_send_owner_is_neutral() && c.tls_single_shot_send_owner_is_neutral() &&
+                   c.tls_out_buf.len() == 0;
+        }
         const auto& send = backend.send_state[c.id];
         return !c.response_read_deadline_send_owner_active &&
                c.response_read_deadline_send_owner_generation != 0 &&
@@ -1659,10 +2061,7 @@ public:
                !ev.more && ev.aux == 0 &&
                ev.non_upstream_generation == c.response_read_deadline_send_owner_generation &&
                ev.result > 0 && static_cast<u32>(ev.result) == c.response_read_deadline_send_len &&
-               !c.send_armed &&
-               c.on_send == (kind == ResponseReadDeadlineSendKind::Header
-                                 ? &on_response_header_sent<Self>
-                                 : &on_response_body_sent<Self>) &&
+               !c.send_armed && c.on_send == expected_callback &&
                send.src == c.response_read_deadline_send_src && send.fd == c.fd &&
                send.type == IoEventType::Send &&
                send.generation == c.response_read_deadline_send_owner_generation &&
@@ -1724,7 +2123,7 @@ public:
     // the shard through the existing explicit fatal path.
     void retry_strict_upstream_retirement_cancels() {
         if (upstream_retirement_retry_count == 0) return;
-        for (u32 id = 0; id < kMaxConns && upstream_retirement_retry_count != 0; id++) {
+        for (u32 id = 0; id < connection_capacity && upstream_retirement_retry_count != 0; id++) {
             Connection& c = conns[id];
             if (!c.upstream_retirement_cancel_retry) continue;
             if (!c.upstream_retirement_active ||
@@ -1819,8 +2218,7 @@ public:
                     c.http1_prebuilt_wait &= static_cast<u8>(~kHttp1WaitUpstreamRetirement);
                     publish_prebuilt_http1_ready(c);
                 } else if (c.http1_boundary_deferred && !c.http1_boundary_ready) {
-                    c.http1_boundary_ready = true;
-                    http1_boundary_ready_pending = true;
+                    maybe_publish_http1_boundary_ready(c);
                 }
                 if (c.fd < 0 && c.pending_ops == 0) reclaim_slot(c.id);
             }
@@ -1877,12 +2275,15 @@ public:
     void resume_deferred_http1_boundaries() {
         if (!http1_boundary_ready_pending) return;
         http1_boundary_ready_pending = false;
-        for (u32 id = 0; id < kMaxConns; id++) {
+        for (u32 id = 0; id < connection_capacity; id++) {
             Connection& c = conns[id];
             if (!c.http1_boundary_ready) continue;
 
             c.http1_boundary_ready = false;
             if (!c.http1_boundary_deferred) continue;
+            if (strict_upstream_retirement_blocks_reclaim(c) ||
+                !c.response_read_timer_owner_is_neutral())
+                continue;
             const u32 expected_episode = c.http1_boundary_successor_episode;
 
             if (c.http1_prebuilt_disposition != Http1RequestBufferDisposition::None) {
@@ -2135,14 +2536,14 @@ public:
     }
 
     void pin_response_read_batch_slot(u32 cid) {
-        if (cid >= kMaxConns || response_read_batch_reuse_pinned(cid) ||
+        if (cid >= connection_capacity || response_read_batch_reuse_pinned(cid) ||
             response_read_batch_pin_count >= kMaxEventsPerWait)
             return;
         response_read_batch_pins[response_read_batch_pin_count++] = cid;
     }
 
     void reclaim_slot(u32 cid) {
-        if (cid >= kMaxConns || response_read_batch_reuse_pinned(cid) ||
+        if (cid >= connection_capacity || response_read_batch_reuse_pinned(cid) ||
             strict_upstream_retirement_blocks_reclaim(conns[cid]) ||
             !conns[cid].response_read_timer_owner_is_neutral())
             return;
@@ -2225,6 +2626,12 @@ public:
             return nullptr;
         }
         u32 id = free_stack[--free_top];
+        // A free slot has drained every target and cancel completion. Failed
+        // sends can leave unsent bytes in the backend proactor even after the
+        // connection's close ledger drains; those bytes belong to the old fd.
+        // Clear both proactors before the new connection can validate or send.
+        backend.send_state[id] = {nullptr, -1, 0, 0, IoEventType::Send, 0, 0};
+        backend.upstream_send_state[id] = {nullptr, -1, 0, 0, IoEventType::UpstreamSend, 0, 0};
         conns[id].reset();
         conns[id].id = id;
         conns[id].shard_id = static_cast<u8>(shard_id);
@@ -2354,20 +2761,184 @@ public:
         return false;
     }
 
+    // A request-boundary continuation may install the next HTTP callback after
+    // an earlier TLS recv CQE was deferred behind a raw ciphertext send. The
+    // CQE's bytes are already in tls_in_buf, so there may be no later socket
+    // event to call tls_process. Drive that existing input only when the raw
+    // send no longer owns the TLS output buffer. The caller must return
+    // immediately when this reports true: tls_process can synchronously
+    // dispatch a request or close/reset the connection.
+    bool process_buffered_tls_input(Connection& c) {
+        if (!c.uses_iouring_tls() || c.tls_in_buf.len() == 0 || c.tls_out_inflight) return false;
+        tls_process<Self>(this, c);
+        return true;
+    }
+
+    bool tls_ciphertext_send_raw_state_matches(const Connection& c) const {
+        if (c.id >= connection_capacity || c.fd < 0 || !c.tls_active || !c.tls_out_inflight ||
+            c.tls_out_inflight_len == 0 || c.tls_out_inflight_generation == 0 ||
+            (c.tls_out_inflight_generation & kNonUpstreamSendCancelBit) != 0 ||
+            c.tls_out_inflight_fd != c.fd || c.tls_out_inflight_src == nullptr ||
+            c.tls_out_inflight_src != c.tls_out_buf.data() ||
+            c.tls_out_inflight_len > c.tls_out_buf.len() || !c.send_armed || c.pending_ops == 0)
+            return false;
+        const auto& send = backend.send_state[c.id];
+        return send.src == c.tls_out_inflight_src && send.fd == c.tls_out_inflight_fd &&
+               send.type == IoEventType::Send && send.generation == c.tls_out_inflight_generation &&
+               send.offset <= c.tls_out_inflight_len &&
+               send.remaining <= c.tls_out_inflight_len - send.offset;
+    }
+
+    bool tls_ciphertext_send_is_current(const Connection& c) const {
+        if (!tls_ciphertext_send_raw_state_matches(c)) return false;
+        const auto& send = backend.send_state[c.id];
+        return send.offset + send.remaining == c.tls_out_inflight_len;
+    }
+
+    // Deliver the saved continuation as a logical plaintext completion. Raw
+    // ciphertext CQE accounting has already finished and is never repeated here.
+    void complete_tls_logical_send(Connection& c,
+                                   const TlsLogicalSendCompletionWitness& witness,
+                                   Connection::Callback continuation) {
+        const bool valid =
+            c.id < connection_capacity && c.tls_active && c.fd == witness.fd &&
+            witness.generation != 0 && (witness.generation & kNonUpstreamSendCancelBit) == 0 &&
+            c.handler_gen == witness.handler_generation && witness.src != nullptr &&
+            witness.len != 0 && witness.len <= static_cast<u32>(INT32_MAX) && !c.send_armed &&
+            c.tls_raw_send_owner_is_neutral() && c.tls_single_shot_send_owner_is_neutral();
+        if (!valid) {
+            close_conn(c);
+            return;
+        }
+
+        IoEvent ev = {};
+        ev.conn_id = c.id;
+        ev.type = IoEventType::Send;
+        ev.result = static_cast<i32>(witness.len);
+        const ResponseReadDeadlineSendKind strict_kind = response_read_deadline_tls_send_kind(c);
+        const bool prebuilt_candidate =
+            continuation == &on_prebuilt_http1_header_sent<Self> ||
+            c.on_send == &on_prebuilt_http1_header_sent<Self> ||
+            !c.http1_prebuilt_response_proof_is_neutral() || c.http1_prebuilt_wait != 0 ||
+            c.http1_prebuilt_disposition != Http1RequestBufferDisposition::None;
+        if (strict_kind != ResponseReadDeadlineSendKind::None && prebuilt_candidate) {
+            close_conn(c);
+            return;
+        }
+        if (strict_kind != ResponseReadDeadlineSendKind::None) {
+            const bool owner_matches =
+                continuation != nullptr && c.on_send == continuation &&
+                c.response_read_deadline_send_owner_active &&
+                c.response_read_deadline_send_owner_generation == witness.generation &&
+                c.response_read_deadline_send_fd == witness.fd &&
+                c.response_read_deadline_send_src == witness.src &&
+                c.response_read_deadline_send_len == witness.len &&
+                c.response_read_deadline_send_tombstone_generation < witness.generation &&
+                c.response_read_deadline_send_deadline_generation ==
+                    c.response_read_deadline_post_commit_generation &&
+                c.response_read_deadline_send_upstream_episode ==
+                    c.response_read_deadline_post_commit_episode &&
+                response_read_deadline_tls_send_frame_is_valid(
+                    c, strict_kind, continuation, witness.src, witness.len);
+            if (!owner_matches) {
+                close_conn(c);
+                return;
+            }
+            c.response_read_deadline_send_owner_active = false;
+            c.response_read_deadline_send_tombstone_generation = witness.generation;
+            ev.non_upstream_generation = witness.generation;
+            if (!response_read_deadline_send_completion_is_valid(c, ev, strict_kind)) {
+                close_conn(c);
+                return;
+            }
+        } else if (continuation == &on_prebuilt_http1_header_sent<Self> ||
+                   c.on_send == &on_prebuilt_http1_header_sent<Self> ||
+                   !c.http1_prebuilt_response_proof_is_neutral() || c.http1_prebuilt_wait != 0 ||
+                   c.http1_prebuilt_disposition != Http1RequestBufferDisposition::None) {
+            const bool owner_matches =
+                continuation == &on_prebuilt_http1_header_sent<Self> && c.on_send == continuation &&
+                witness.src == c.response_header_buf.data() &&
+                witness.len == c.http1_prebuilt_total_len &&
+                response_read_deadline_send_fields_are_neutral(c) &&
+                c.response_read_deadline_send_tombstone_generation < witness.generation &&
+                prebuilt_http11_tls_read_timeout_is_stable(c, /*sending=*/true);
+            if (!owner_matches) {
+                close_conn(c);
+                return;
+            }
+            // Publish the already-drained TLS logical send in the persistent
+            // semantic tombstone.  This authenticates the synthetic event for
+            // the existing prebuilt-response validator without inventing a
+            // backend send-state owner.
+            c.response_read_deadline_send_tombstone_generation = witness.generation;
+            ev.non_upstream_generation = witness.generation;
+            if (!prebuilt_http1_header_send_completion_is_valid(c, ev)) {
+                close_conn(c);
+                return;
+            }
+        } else if (!response_read_deadline_send_fields_are_neutral(c)) {
+            close_conn(c);
+            return;
+        }
+        if (continuation == nullptr) {
+            if (strict_kind != ResponseReadDeadlineSendKind::None) close_conn(c);
+            return;
+        }
+        continuation(this, c, ev);
+    }
+
+    // Submit one authenticated kernel target for the current ciphertext
+    // prefix. TLS raw targets use their own identity and never inherit the
+    // response-phase plaintext owner inferred by submit_send_raw().
+    bool submit_tls_ciphertext_send(Connection& c, const u8* src, u32 len) {
+        if (backend.failure_code() != 0 || c.id >= connection_capacity || c.fd < 0 ||
+            !c.tls_active || c.tls_engine.ssl == nullptr || c.send_armed ||
+            !c.tls_raw_send_owner_is_neutral() || src == nullptr || len == 0 ||
+            src != c.tls_out_buf.data() || len > c.tls_out_buf.len() ||
+            backend.send_state[c.id].remaining != 0)
+            return false;
+        u32 generation = 0;
+        if (!c.next_non_upstream_send_generation(generation)) return false;
+        if (!backend.add_send(c.fd, c.id, src, len, generation)) return false;
+        c.tls_out_inflight = true;
+        c.tls_out_inflight_len = len;
+        c.tls_out_inflight_generation = generation;
+        c.tls_out_inflight_fd = c.fd;
+        c.tls_out_inflight_src = src;
+        c.pending_ops++;
+        c.send_armed = true;
+        c.on_send = &tls_on_out_drain<Self>;
+        return true;
+    }
+
     // Raw client send — bytes go to the wire as-is (plaintext, or already-
     // encrypted ciphertext from the TLS layer).
     bool submit_send_raw(Connection& c, const u8* buf, u32 len) {
-        const bool deadline_send = c.response_read_deadline_post_commit_phase ==
-                                       ResponseReadDeadlinePostCommitPhase::HeaderSend ||
-                                   c.response_read_deadline_post_commit_phase ==
-                                       ResponseReadDeadlinePostCommitPhase::BodySend;
+        const auto phase = c.response_read_deadline_post_commit_phase;
+        const bool deadline_send = phase == ResponseReadDeadlinePostCommitPhase::HeaderSend ||
+                                   phase == ResponseReadDeadlinePostCommitPhase::BodySend ||
+                                   phase == ResponseReadDeadlinePostCommitPhase::CombinedSend;
         u32 generation = 0;
         if (deadline_send) {
-            const ResponseReadDeadlineSendKind kind =
-                c.response_read_deadline_post_commit_phase ==
-                        ResponseReadDeadlinePostCommitPhase::HeaderSend
-                    ? ResponseReadDeadlineSendKind::Header
-                    : ResponseReadDeadlineSendKind::Body;
+            ResponseReadDeadlineSendKind kind = ResponseReadDeadlineSendKind::None;
+            switch (phase) {
+                case ResponseReadDeadlinePostCommitPhase::None:
+                case ResponseReadDeadlinePostCommitPhase::Buffering:
+                case ResponseReadDeadlinePostCommitPhase::WaitingBody:
+                case ResponseReadDeadlinePostCommitPhase::OriginComplete:
+                    return false;
+                case ResponseReadDeadlinePostCommitPhase::HeaderSend:
+                    kind = ResponseReadDeadlineSendKind::Header;
+                    break;
+                case ResponseReadDeadlinePostCommitPhase::BodySend:
+                    kind = ResponseReadDeadlineSendKind::Body;
+                    break;
+                case ResponseReadDeadlinePostCommitPhase::CombinedSend:
+                    kind = ResponseReadDeadlineSendKind::Combined;
+                    break;
+                default:
+                    return false;
+            }
             if (c.response_read_deadline_send_owner_active || buf == nullptr || len == 0 ||
                 c.fd < 0 || !c.next_response_read_deadline_send_generation())
                 return false;
@@ -2395,48 +2966,60 @@ public:
 
     bool submit_send_impl(Connection& c, const u8* buf, u32 len) {
         if (c.tls_active) {
-            // A previous single-shot send still mid-encryption (its plaintext
-            // didn't fit tls_out_buf in one shot) must not be overwritten or its
-            // remainder is lost. The upper layer serializes client sends via
-            // pause/resume; phase 3 decouples proxy streaming. Fail safe (caller
-            // closes) rather than corrupt.
-            if (c.tls_send_src && c.tls_send_off < c.tls_send_len) {
+            // Proxy-stream tails use the cursor fields but retain their own
+            // accounting. A single-shot send owns its continuation until the
+            // final ciphertext target drains, including after encryption ends.
+            if (c.tls_proxy_stream || buf == nullptr || len == 0 ||
+                len > static_cast<u32>(INT32_MAX) || c.fd < 0 ||
+                !c.tls_single_shot_send_owner_is_neutral() || c.tls_send_src != nullptr) {
                 close_conn(c);
                 return false;
             }
-            // Encrypt into the owned tls_out_buf; ciphertext drains via
-            // tls_on_out_drain, which fires this continuation once fully sent.
+            const ResponseReadDeadlineSendKind strict_kind =
+                response_read_deadline_tls_send_kind(c);
+            const Connection::Callback strict_callback =
+                response_read_deadline_tls_send_callback(strict_kind);
+            if (!response_read_deadline_send_fields_are_neutral(c) ||
+                (strict_kind != ResponseReadDeadlineSendKind::None && strict_callback == nullptr)) {
+                close_conn(c);
+                return false;
+            }
+            u32 generation = 0;
+            if (!c.next_non_upstream_send_generation(generation)) return false;
+            c.tls_send_owner_generation = generation;
+            c.tls_send_owner_fd = c.fd;
+            c.tls_send_owner_handler_generation = c.handler_gen;
             c.tls_pending_on_send = c.on_send;
             c.tls_send_src = buf;
             c.tls_send_len = len;
             c.tls_send_off = 0;
+            if (strict_kind != ResponseReadDeadlineSendKind::None) {
+                c.response_read_deadline_send_owner_generation = generation;
+                c.response_read_deadline_send_deadline_generation =
+                    c.response_read_deadline_post_commit_generation;
+                c.response_read_deadline_send_upstream_episode =
+                    c.response_read_deadline_post_commit_episode;
+                c.response_read_deadline_send_src = buf;
+                c.response_read_deadline_send_len = len;
+                c.response_read_deadline_send_fd = c.fd;
+                c.response_read_deadline_send_kind = strict_kind;
+                c.response_read_deadline_send_owner_active = true;
+                if (c.response_read_deadline_send_tombstone_generation >= generation ||
+                    !response_read_deadline_tls_send_frame_is_valid(
+                        c, strict_kind, strict_callback, buf, len)) {
+                    close_conn(c);
+                    return false;
+                }
+            }
             u32 consumed = 0;
             const TlsFill kFs = tls_fill_output<Self>(this, c, buf, len, consumed);
             c.tls_send_off = consumed;
-            if (kFs == TlsFill::Fatal) {
-                c.tls_pending_on_send = nullptr;
-                c.tls_send_src = nullptr;
-                c.tls_send_len = 0;
-                c.tls_send_off = 0;
-                return false;  // caller closes
+            if (!tls_send_retry_has_driver<Self>(this, c, kFs)) {
+                close_conn(c);
+                return false;
             }
-            if (kFs == TlsFill::NeedRead) {
-                c.tls_pending_on_recv = &tls_resume_pending_send_recv<Self>;
-                // SSL_write needs peer input to retry. If no recv is armed and one
-                // can't be queued (SQ pressure), nothing will ever deliver that
-                // input — fail closed rather than hang until the idle timeout
-                // (mirrors the resume/drain WANT_READ paths).
-                if (!c.recv_armed && !submit_recv(c)) {
-                    c.tls_pending_on_recv = nullptr;
-                    c.tls_pending_on_send = nullptr;
-                    c.tls_send_src = nullptr;
-                    c.tls_send_len = 0;
-                    c.tls_send_off = 0;
-                    return false;  // caller closes
-                }
-            }
-            // Done / NeedRoom: the upper-layer continuation fires from
-            // tls_on_out_drain once the whole plaintext is encrypted and sent.
+            // Initial submission cannot complete synchronously. Done and
+            // NeedRoom need a live raw target; NeedRead has an armed recv.
             return true;
         }
         return submit_send_raw(c, buf, len);
@@ -2463,39 +3046,42 @@ public:
     }
 
     // A provided-buffer multishot recv can complete several 4 KiB CQEs in one
-    // backend wait before the TLS consumer gets a chance to drain them.  Keep
-    // the mode selection deliberately structural and episode-stable: only the
-    // ordinary, already-uploaded bodyless HTTP/1 proxy path behind downstream
-    // TLS may consume one provided buffer at a time.  Every excluded or
-    // ambiguous owner retains the established multishot path.
+    // backend wait before the response callback gets a chance to drain them.
+    // Keep mode selection structural and episode-stable: retain the existing
+    // downstream-TLS owner and the ordinary, already-uploaded, bodyless HTTP/1
+    // plaintext owner without a response policy. Pipeline progress is consumed
+    // by pipeline_advance/recover; it does not change the recv primitive.
     [[nodiscard]] bool use_one_shot_upstream_recv(const Connection& c) const {
         const RouteConfig* cfg = c.request_config;
         const bool ordinary_response_owner = c.on_upstream_recv == &on_upstream_response<Self> ||
                                              c.on_upstream_recv == &on_response_body_recvd<Self>;
         const bool normal_state = c.state == ConnState::Proxying || c.state == ConnState::Sending;
-        return c.fd >= 0 && c.upstream_fd >= 0 && c.tls_active && c.tls_handshake_complete &&
-               c.uses_iouring_tls() && c.protocol == ConnProtocol::Http11 && c.h2 == nullptr &&
-               normal_state && cfg != nullptr && c.upstream_idx < cfg->upstream_count &&
-               c.req_start_us != 0 && !c.epoch_held && ordinary_response_owner &&
-               c.on_upstream_send == nullptr && !c.upstream_connect_armed &&
-               !c.upstream_send_armed && valid_upstream_episode(c.upstream_episode) &&
-               !c.upstream_episode_quarantined && c.upstream_attempts == 1 &&
+        const bool tls_transport = c.tls_active && c.tls_handshake_complete && c.uses_iouring_tls();
+        const bool plaintext_native_transport = !c.tls_active && c.response_policy_id == 0;
+        return c.fd >= 0 && c.upstream_fd >= 0 && (tls_transport || plaintext_native_transport) &&
+               c.protocol == ConnProtocol::Http11 && c.h2 == nullptr && normal_state &&
+               cfg != nullptr && c.upstream_idx < cfg->upstream_count && c.req_start_us != 0 &&
+               !c.epoch_held && ordinary_response_owner && c.on_upstream_send == nullptr &&
+               !c.upstream_connect_armed && !c.upstream_send_armed &&
+               valid_upstream_episode(c.upstream_episode) && !c.upstream_episode_quarantined &&
+               c.upstream_attempts != 0 &&
+               (c.response_policy_id == 0 || c.upstream_attempts == 1) &&
                c.request_upload_complete && !c.upstream_request_incomplete &&
                c.req_body_mode == BodyMode::None && c.req_body_remaining == 0 &&
                !c.req_client_has_content_length && !c.req_client_has_transfer_encoding &&
                !c.req_client_has_te && !c.req_client_has_expect &&
                !c.req_client_has_upgrade_header && !c.req_wants_upgrade && !c.req_malformed &&
                !c.request_policy_body_pending && !c.request_body_fully_buffered &&
-               !c.req_body_streamed && c.pipeline_depth == 0 && c.pipeline_stash_len == 0 &&
-               !c.is_health_probe && !c.h2_proxy_recv_draining && !c.h2_proxy_synth_quarantined &&
-               !c.is_ws_tunnel && !c.is_ws_terminate_route && !c.is_ws_terminate && !c.ws_closing &&
-               c.response_read_deadline_owner_is_neutral() && !c.upstream_abandoned &&
-               !c.upstream_recv_armed && !c.upstream_recv_paused_for_send &&
-               !c.upstream_recv_pause_cancel_pending && !c.upstream_recv_pause_rearm_pending &&
-               !c.upstream_recv_cancel_inflight && !c.upstream_recv_terminal_stale &&
-               !strict_upstream_retirement_blocks_reclaim(c) && c.idle_return_fd < 0 &&
-               c.idle_return_config == nullptr && !c.close_after_idle_return &&
-               !c.upstream_recv_idle_stale_bytes && !c.http1_boundary_deferred &&
+               !c.req_body_streamed && !c.is_health_probe && !c.h2_proxy_recv_draining &&
+               !c.h2_proxy_synth_quarantined && !c.is_ws_tunnel && !c.is_ws_terminate_route &&
+               !c.is_ws_terminate && !c.ws_closing && c.response_read_deadline_owner_is_neutral() &&
+               !c.upstream_abandoned && !c.upstream_recv_armed &&
+               !c.upstream_recv_paused_for_send && !c.upstream_recv_pause_cancel_pending &&
+               !c.upstream_recv_pause_rearm_pending && !c.upstream_recv_cancel_inflight &&
+               !c.upstream_recv_terminal_stale && !strict_upstream_retirement_blocks_reclaim(c) &&
+               c.idle_return_fd < 0 && c.idle_return_config == nullptr &&
+               !c.close_after_idle_return && !c.upstream_recv_idle_stale_bytes &&
+               !c.http1_boundary_deferred &&
                c.http1_prebuilt_disposition == Http1RequestBufferDisposition::None;
     }
 
@@ -2525,10 +3111,17 @@ public:
             c.upstream_recv_pause_rearm_pending = true;
             return true;
         }
-        const bool submitted =
-            use_one_shot_upstream_recv(c)
-                ? backend.add_recv_upstream_once(c.upstream_fd, c.id, c.upstream_episode)
-                : backend.add_recv_upstream(c.upstream_fd, c.id, c.upstream_episode);
+        const bool one_shot = use_one_shot_upstream_recv(c);
+        bool submitted = false;
+        if (one_shot) {
+            const u32 available = c.upstream_recv_buf.write_avail();
+            if (available == 0) return false;
+            const u32 recv_len = available < kProvidedBufSize ? available : kProvidedBufSize;
+            submitted =
+                backend.add_recv_upstream_once(c.upstream_fd, c.id, c.upstream_episode, recv_len);
+        } else {
+            submitted = backend.add_recv_upstream(c.upstream_fd, c.id, c.upstream_episode);
+        }
         if (submitted) {
             c.pending_ops++;
             c.upstream_recv_armed = true;
@@ -2617,8 +3210,11 @@ public:
             cfg->upstreams[c.upstream_idx].addrs[0].sin_family != AF_INET)
             return false;
         const u32 ordinary_pending = c.recv_armed ? 1u : 0u;
-        if (c.state != ConnState::Proxying || c.protocol != ConnProtocol::Http11 || c.tls_active ||
-            c.upstream_fd < 0 || c.upstream_reused || c.upstream_attempts != 1 ||
+        const bool tls_arm_owner =
+            !c.tls_active || (response_read_deadline_tls_output_is_settled(c) &&
+                              c.on_recv == &tls_recv<Self> && c.tls_pending_on_recv == nullptr);
+        if (c.state != ConnState::Proxying || c.protocol != ConnProtocol::Http11 ||
+            !tls_arm_owner || c.upstream_fd < 0 || c.upstream_reused || c.upstream_attempts != 1 ||
             !valid_upstream_episode(c.upstream_episode) || c.upstream_episode_quarantined ||
             !c.request_upload_complete || c.upstream_request_incomplete ||
             c.upstream_recv_buf.len() != 0 || c.on_upstream_recv != &on_upstream_response<Self> ||
@@ -2664,8 +3260,10 @@ public:
     [[nodiscard]] bool response_read_deadline_uses_precise_timer(
         const Connection& c, bool allow_consumed_terminal_episode = false) const {
         if (c.req_http_version != static_cast<u8>(HttpVersion::Http11) ||
-            c.protocol != ConnProtocol::Http11 || c.tls_active || c.h2 != nullptr ||
-            c.upstream_reused || c.upstream_attempts != 1 || c.upstream_fd < 0 ||
+            c.protocol != ConnProtocol::Http11 ||
+            (c.tls_active && !response_read_deadline_tls_http11_engine_is_stable(c)) ||
+            (c.tls_active && (c.on_recv != &tls_recv<Self> || c.tls_pending_on_recv != nullptr)) ||
+            c.h2 != nullptr || c.upstream_reused || c.upstream_attempts != 1 || c.upstream_fd < 0 ||
             c.response_mutations_snapshotted || !valid_upstream_episode(c.upstream_episode) ||
             c.response_read_deadline_upstream_episode != c.upstream_episode)
             return false;
@@ -2826,7 +3424,7 @@ public:
     // Semantic ownership is independent of timer transport custody: consuming a
     // target CQE must not make an otherwise valid stream ineligible for rearm.
     [[nodiscard]] bool streaming_response_read_timer_is_stable(const Connection& c) const {
-        if (c.id >= kMaxConns || c.state != ConnState::Sending || c.req_start_us == 0 ||
+        if (c.id >= connection_capacity || c.state != ConnState::Sending || c.req_start_us == 0 ||
             c.epoch_held ||
             c.response_read_deadline_buffering != ForwardResponseBufferingMode::None ||
             c.response_read_deadline_profile !=
@@ -2913,10 +3511,13 @@ public:
         const u16 bundle_id = c.response_read_deadline_bundle_id;
         const bool post_commit =
             c.response_read_deadline_post_commit_phase != ResponseReadDeadlinePostCommitPhase::None;
-        if (c.id >= kMaxConns || c.fd < 0 || c.upstream_fd < 0 || is_draining() ||
+        const bool tls_bodyless_get_owner =
+            response_read_deadline_tls_complete_get_profile_is_stable(c) &&
+            c.on_recv == &tls_recv<Self> && c.tls_pending_on_recv == nullptr;
+        if (c.id >= connection_capacity || c.fd < 0 || c.upstream_fd < 0 || is_draining() ||
             (c.state != ConnState::Proxying && !(post_commit && c.state == ConnState::Sending)) ||
-            c.protocol != ConnProtocol::Http11 || c.tls_active || c.h2 != nullptr ||
-            c.response_read_deadline_owner_generation == 0 ||
+            c.protocol != ConnProtocol::Http11 || (c.tls_active && !tls_bodyless_get_owner) ||
+            c.h2 != nullptr || c.response_read_deadline_owner_generation == 0 ||
             c.response_read_deadline_owner_generation != c.response_read_deadline_generation ||
             c.response_read_deadline_profile == ResponseReadDeadlineProfile::None ||
             c.response_read_deadline_upstream_episode != c.upstream_episode ||
@@ -2996,7 +3597,8 @@ public:
         for (u32 i = 0; i < response_read_batch_owner_count; ++i) {
             if (response_read_batch_owners[i].conn_id == cid) return static_cast<u16>(i + 1);
         }
-        if (cid >= kMaxConns || response_read_batch_owner_count >= kMaxEventsPerWait) return 0;
+        if (cid >= connection_capacity || response_read_batch_owner_count >= kMaxEventsPerWait)
+            return 0;
         const Connection& c = conns[cid];
         if (c.response_read_deadline_state != ResponseReadDeadlineState::Armed &&
             c.response_read_deadline_state != ResponseReadDeadlineState::ExpiryPending &&
@@ -3035,7 +3637,8 @@ public:
                 return static_cast<u16>(i + 1);
             }
         }
-        if (cid >= kMaxConns || response_read_batch_owner_count >= kMaxEventsPerWait) return 0;
+        if (cid >= connection_capacity || response_read_batch_owner_count >= kMaxEventsPerWait)
+            return 0;
         const Connection& c = conns[cid];
         if (!c.response_read_timer_owner_is_valid()) return 0;
         auto& owner = response_read_batch_owners[response_read_batch_owner_count];
@@ -3072,7 +3675,7 @@ public:
         // terminal creates an entry without retaining a Connection pointer.
         for (u32 i = 0; i < count; ++i) {
             const IoEvent& ev = events[i];
-            if (ev.conn_id >= kMaxConns) continue;
+            if (ev.conn_id >= connection_capacity) continue;
             const Connection& c = conns[ev.conn_id];
             const bool current_upstream =
                 ev.type == IoEventType::UpstreamRecv && ev.upstream_episode == c.upstream_episode;
@@ -3085,7 +3688,7 @@ public:
 
         for (u32 i = 0; i < count; ++i) {
             const IoEvent& ev = events[i];
-            if (ev.conn_id >= kMaxConns) continue;
+            if (ev.conn_id >= connection_capacity) continue;
             u16 owner_index = 0;
             for (u32 oi = 0; oi < response_read_batch_owner_count; ++oi) {
                 if (response_read_batch_owners[oi].conn_id == ev.conn_id) {
@@ -3733,6 +4336,63 @@ public:
              (body_to_send != c.response_read_deadline_post_commit_declared_body ||
               body_to_send != c.response_read_deadline_post_commit_origin_received)))
             return false;
+
+        // Complete-buffered sends may reuse the spare tail of the pinned
+        // response-header slice, but only when all existing downstream
+        // transport ownership is neutral. A capacity miss is an ordinary
+        // fallback; stale ownership is a hard failure for either path.
+        if (c.id >= connection_capacity) return false;
+        const auto& send_state = backend.send_state[c.id];
+        if (c.send_armed || c.send_progress != 0 || c.on_send != nullptr ||
+            c.response_read_deadline_send_owner_active ||
+            c.response_read_deadline_send_owner_generation != 0 ||
+            c.response_read_deadline_send_deadline_generation != 0 ||
+            c.response_read_deadline_send_upstream_episode != 0 ||
+            c.response_read_deadline_send_src != nullptr ||
+            c.response_read_deadline_send_len != 0 || c.response_read_deadline_send_fd != -1 ||
+            c.response_read_deadline_send_kind != ResponseReadDeadlineSendKind::None ||
+            c.response_read_deadline_send_close_generation != 0 ||
+            c.response_read_deadline_send_close_target_owned ||
+            c.response_read_deadline_send_close_cancel_owned || send_state.remaining != 0)
+            return false;
+
+        // This is intentionally read-only and evaluated before timer/send
+        // ownership changes or origin retirement. Noneligible responses keep
+        // the established header-then-body path without staging any bytes.
+        enum class CombinedSendEligibility : u8 { Eligible, Fallback, Invalid };
+        const auto combined_send_eligibility = [&]() {
+            if (disposition != CompleteContentLengthTerminalDisposition::CompleteBody ||
+                terminal_owner != nullptr || received != declared || declared == 0 ||
+                c.response_read_deadline_post_commit_response_class !=
+                    CompleteContentLengthResponseClass::BoundedPositiveBody)
+                return CombinedSendEligibility::Fallback;
+            const bool precise_get_profile =
+                c.response_read_deadline_profile ==
+                    ResponseReadDeadlineProfile::BodylessNonHeadContentLengthZero &&
+                c.response_read_deadline_method == static_cast<u8>(LogHttpMethod::Get) &&
+                c.response_read_deadline_route_method == kRouteMethodGet &&
+                c.req_method == static_cast<u8>(LogHttpMethod::Get) && c.pipeline_depth == 0 &&
+                c.http1_pipeline_request_generation == 0 && c.pipeline_stash_len == 0 &&
+                bodyless_get_complete_content_length_request_policy_is_admitted(
+                    c.request_policy_id) &&
+                c.response_read_deadline_upload.request_policy_id == c.request_policy_id;
+            if (!precise_get_profile) return CombinedSendEligibility::Fallback;
+            if (!bodyless_get_complete_content_length_precise_buffering_is_stable(c))
+                return CombinedSendEligibility::Invalid;
+            const u32 header_len = c.response_header_buf.len();
+            const u32 raw_header_end = c.response_read_deadline_post_commit_raw_header_end;
+            if (c.response_header_buf.data() == nullptr || c.upstream_recv_buf.data() == nullptr ||
+                header_len == 0 || header_len > c.response_header_buf.capacity() ||
+                raw_header_end == 0 || raw_header_end > c.upstream_recv_buf.len() ||
+                declared != c.upstream_recv_buf.len() - raw_header_end)
+                return CombinedSendEligibility::Invalid;
+            if (declared > c.response_header_buf.capacity() - header_len)
+                return CombinedSendEligibility::Fallback;
+            return CombinedSendEligibility::Eligible;
+        };
+        const CombinedSendEligibility combined_send_state = combined_send_eligibility();
+        if (combined_send_state == CombinedSendEligibility::Invalid) return false;
+        const bool combined_send = combined_send_state == CombinedSendEligibility::Eligible;
         if (c.response_read_timer_phase != ResponseReadTimerPhase::None) {
             if (c.response_read_timer_phase != ResponseReadTimerPhase::Armed ||
                 !bodyless_get_complete_content_length_precise_buffering_is_stable(c) ||
@@ -3762,20 +4422,46 @@ public:
         c.response_read_deadline_state = ResponseReadDeadlineState::BodyComplete;
         c.response_read_deadline_post_commit_send_body = body_to_send;
         c.response_read_deadline_post_commit_close_after_drain = close_after_drain;
+        c.resp_body_mode = BodyMode::ContentLength;
+        c.upstream_keep_alive = false;
+        c.proxy_resp_started = true;
+        if (combined_send) {
+            const u32 header_len = c.response_header_buf.len();
+            const u32 raw_header_end = c.response_read_deadline_post_commit_raw_header_end;
+            // Use the header buffer's writable tail only as I/O staging. Keep
+            // its logical length equal to the pure rewritten header so all
+            // pinned-header proofs and response accounting retain their
+            // existing meaning.
+            __builtin_memcpy(c.response_header_buf.write_ptr(),
+                             c.upstream_recv_buf.data() + raw_header_end,
+                             body_to_send);
+            c.response_read_deadline_post_commit_phase =
+                ResponseReadDeadlinePostCommitPhase::CombinedSend;
+            c.response_read_deadline_post_commit_downstream_submitted = body_to_send;
+            c.response_read_deadline_post_commit_downstream_completed = 0;
+            c.response_read_deadline_post_commit_inflight_body = body_to_send;
+            c.resp_body_remaining = 0;
+            c.resp_body_sent = header_len + body_to_send;
+            c.upstream_send_len = raw_header_end + body_to_send;
+            c.transition_to_sending(&on_complete_response_sent<Self>);
+            return submit_send(c, c.response_header_buf.data(), header_len + body_to_send);
+        }
+
         c.response_read_deadline_post_commit_phase =
             ResponseReadDeadlinePostCommitPhase::HeaderSend;
-        c.resp_body_mode = BodyMode::ContentLength;
         c.resp_body_remaining = body_to_send;
         c.resp_body_sent = c.response_header_buf.len();
         c.upstream_send_len = c.response_read_deadline_post_commit_raw_header_end;
-        c.upstream_keep_alive = false;
-        c.proxy_resp_started = true;
         c.transition_to_sending(&on_response_header_sent<Self>);
         return submit_send(c, c.response_header_buf.data(), c.response_header_buf.len());
     }
 
     void defer_response_read_deadline_body_pump(Connection& c) {
+        if (c.id >= connection_capacity || conns.data() == nullptr || &conns[c.id] != &c ||
+            body_pump_ready_words.data() == nullptr)
+            return;
         c.response_read_deadline_post_commit_pump_pending = true;
+        body_pump_ready_words[c.id >> 6] |= u64{1} << (c.id & 63u);
         response_read_deadline_body_pump_pending = true;
     }
 
@@ -3844,6 +4530,7 @@ public:
                 saw_timer_target = true;
             }
             if (!saw_timer_target) return false;
+            if (c.response_read_timer_owner_is_neutral()) maybe_publish_http1_boundary_ready(c);
         }
 
         const u32 header = c.response_read_deadline_post_commit_raw_header_end;
@@ -3920,7 +4607,7 @@ public:
     void settle_response_read_deadline_batch() {
         for (u32 oi = 0; oi < response_read_batch_owner_count; ++oi) {
             auto& owner = response_read_batch_owners[oi];
-            if (owner.conn_id >= kMaxConns) continue;
+            if (owner.conn_id >= connection_capacity) continue;
             Connection& c = conns[owner.conn_id];
             const bool precise_complete_content_length =
                 c.response_read_deadline_post_commit_phase ==
@@ -3981,6 +4668,15 @@ public:
                         }
                     }
                 }
+                // A disarmed deadline may retain only timer transport custody
+                // while an HTTP/1 boundary is parked.  Duplicate or foreign
+                // CQEs can invalidate the batch proof without consuming the
+                // real target/cancel records; once those real owners are
+                // nevertheless neutral, release the independent boundary wait.
+                // Active semantic timer batches still follow the strict
+                // custody/owner validation and fail-closed paths below.
+                if (!owner.precise_timer_semantic && c.response_read_timer_owner_is_neutral())
+                    maybe_publish_http1_boundary_ready(c);
                 if (!custody_ok) {
                     if (owner.precise_timer_semantic && c.fd >= 0) close_conn(c);
                     continue;
@@ -3989,6 +4685,7 @@ public:
                     if (owner.precise_timer_semantic && c.fd >= 0) close_conn(c);
                     continue;
                 }
+                if (c.response_read_timer_owner_is_neutral()) maybe_publish_http1_boundary_ready(c);
                 // The logical deadline was already disarmed before this
                 // custody-only CQE was harvested. No timer result can affect
                 // the successor/504 state; only the owner barrier is drained.
@@ -4355,7 +5052,7 @@ public:
             close_conn(c);
             return true;
         };
-        for (u32 id = 0; id < kMaxConns; id++) {
+        for (u32 id = 0; id < connection_capacity; id++) {
             Connection& c = conns[id];
             if (c.response_read_deadline_state != ResponseReadDeadlineState::ExpiryPending)
                 continue;
@@ -4384,15 +5081,43 @@ public:
         }
     }
 
-    void pump_response_read_deadline_bodies() {
+private:
+    template <typename Callback>
+    void drain_response_read_deadline_body_pump_ready(Callback&& callback) {
         if (!response_read_deadline_body_pump_pending) return;
         response_read_deadline_body_pump_pending = false;
-        for (u32 id = 0; id < kMaxConns; ++id) {
-            Connection& c = conns[id];
-            if (!c.response_read_deadline_post_commit_pump_pending) continue;
-            c.response_read_deadline_post_commit_pump_pending = false;
-            if (c.fd >= 0) pump_response_read_deadline_body<Self>(this, c);
+        for (u32 word_index = 0; word_index < body_pump_ready_words.size(); ++word_index) {
+            u64 remaining_mask = ~u64{0};
+            while (remaining_mask != 0) {
+                const u64 ready = body_pump_ready_words[word_index] & remaining_mask;
+                if (ready == 0) break;
+                const u32 bit = static_cast<u32>(__builtin_ctzll(ready));
+                const u32 id = word_index * 64u + bit;
+                const u64 bit_mask = u64{1} << bit;
+                body_pump_ready_words[word_index] &= ~bit_mask;
+                remaining_mask = bit == 63u ? 0 : (~u64{0} << (bit + 1u));
+
+                if (id >= connection_capacity) continue;
+                Connection& c = conns[id];
+                if (!c.response_read_deadline_post_commit_pump_pending) continue;
+                c.response_read_deadline_post_commit_pump_pending = false;
+                if (c.fd >= 0) callback(c);
+            }
         }
+    }
+
+#ifdef RUT_TESTING
+public:
+    template <typename Callback>
+    void test_drain_response_read_deadline_body_pump_ready(Callback&& callback) {
+        drain_response_read_deadline_body_pump_ready(static_cast<Callback&&>(callback));
+    }
+#endif
+
+public:
+    void pump_response_read_deadline_bodies() {
+        drain_response_read_deadline_body_pump_ready(
+            [this](Connection& c) { pump_response_read_deadline_body<Self>(this, c); });
     }
 
     // Public deterministic seam used by the production run loop and focused
@@ -4527,7 +5252,23 @@ public:
     }
 
     void close_conn_impl(Connection& c) {
-        if (c.response_read_deadline_send_owner_active) {
+        if (c.tls_out_inflight) {
+            // TLS close custody belongs to the actual ciphertext SQE, not the
+            // logical plaintext continuation. The common ledger survives
+            // free_conn::reset until target/cancel both drain.
+            c.response_read_deadline_send_close_generation = c.tls_out_inflight_generation;
+            if (c.response_read_deadline_send_close_generation == 0 && c.id < connection_capacity)
+                c.response_read_deadline_send_close_generation =
+                    backend.send_state[c.id].generation;
+            c.response_read_deadline_send_close_target_owned = c.send_armed;
+            c.response_read_deadline_send_close_cancel_owned = false;
+        } else if (c.tls_active && !c.tls_out_inflight &&
+                   c.response_read_deadline_send_owner_active) {
+            // A strict TLS logical owner with no raw ciphertext target is not a
+            // kernel Send. Drop only its semantic tuple; the independent recv
+            // owner below still retains its own target/cancel accounting.
+            c.clear_response_read_deadline_send_owner();
+        } else if (c.response_read_deadline_send_owner_active) {
             c.response_read_deadline_send_close_generation =
                 c.response_read_deadline_send_owner_generation;
             c.response_read_deadline_send_close_target_owned = c.send_armed;
@@ -4536,6 +5277,10 @@ public:
                 c.response_read_deadline_send_owner_generation;
             c.clear_response_read_deadline_send_owner();
         }
+        c.tls_pending_on_send = nullptr;
+        c.tls_pending_on_recv = nullptr;
+        Connection::visit_tls_single_shot_send_owner_fields(
+            c, [](auto& value, const auto& reset_value) { value = reset_value; });
         disarm_response_read_deadline(c);
         timer.remove(&c);
         // A close is terminal for a parked request boundary. Readiness may have
@@ -4783,7 +5528,7 @@ public:
                 // here and must each decrement. yield_armed can't gate this
                 // because free_conn_impl::reset() clears the flag when a
                 // close lands while the timer is in flight.
-                if (ev.conn_id < kMaxConns) {
+                if (ev.conn_id < connection_capacity) {
                     auto& c = conns[ev.conn_id];
                     if (c.pending_ops > 0) c.pending_ops--;
                     const bool matching_generation =
@@ -4872,7 +5617,7 @@ public:
                     u64 start = drain_start_.load(std::memory_order_relaxed);
                     u32 period = drain_period_.load(std::memory_order_relaxed);
                     u64 now = monotonic_secs();
-                    for (u32 i = 0; i < kMaxConns; i++) {
+                    for (u32 i = 0; i < connection_capacity; i++) {
                         if (conns[i].fd >= 0 && conns[i].state == ConnState::ReadingHeader &&
                             should_drain_close(i, start, now, period)) {
                             this->close_conn(conns[i]);
@@ -4886,8 +5631,12 @@ public:
             case IoEventType::UpstreamConnect:
             case IoEventType::UpstreamRecv:
             case IoEventType::UpstreamSend:
-                if (ev.conn_id < kMaxConns) {
+                if (ev.conn_id < connection_capacity) {
                     auto& conn = conns[ev.conn_id];
+                    if (ev.type == IoEventType::Send && consume_tagged_send_close_event(conn, ev))
+                        break;
+                    if (ev.type == IoEventType::Send && consume_tls_ciphertext_send_event(conn, ev))
+                        break;
                     if (consume_strict_upstream_retirement_event(conn, ev)) break;
                     if (consume_response_read_deadline_send_event(conn, ev)) break;
                     if (consume_prebuilt_http1_header_send_event(conn, ev)) break;
@@ -5309,7 +6058,8 @@ public:
                 }
                 break;
             case IoEventType::ResponseReadTimer:
-                if (ev.conn_id < kMaxConns && valid_response_read_timer_transport_event(ev)) {
+                if (ev.conn_id < connection_capacity &&
+                    valid_response_read_timer_transport_event(ev)) {
                     auto& c = conns[ev.conn_id];
                     // Timer CQEs are settled after the complete wait batch so
                     // a same-batch positive Full-copy response wins regardless
@@ -5317,8 +6067,10 @@ public:
                     // consume-only behavior.
                     if (response_read_batch_event_count == 0) {
                         if (c.consume_response_read_timer_completion(ev.non_upstream_generation) &&
-                            c.response_read_timer_owner_is_neutral())
+                            c.response_read_timer_owner_is_neutral()) {
+                            maybe_publish_http1_boundary_ready(c);
                             reclaim_pending();
+                        }
                     }
                 }
                 break;
@@ -5339,7 +6091,7 @@ private:
     using Self = IoUringEventLoop;
 
     void close_live_clients() {
-        for (u32 i = 0; i < kMaxConns; i++) {
+        for (u32 i = 0; i < connection_capacity; i++) {
             if (conns[i].fd >= 0) {
                 // A LIVE keep-alive client can also hold a parked idle_return_fd while
                 // its upstream recv cancel drains. close_conn takes the deferred path
@@ -5351,7 +6103,7 @@ private:
     }
 
     void close_deferred_idle_return_fds() {
-        for (u32 i = 0; i < kMaxConns; i++) {
+        for (u32 i = 0; i < connection_capacity; i++) {
             // A reusable upstream fd is parked in idle_return_fd awaiting a recv-cancel
             // drain that this forced shutdown will never deliver — close it directly so
             // it can't leak. Covers both a slot whose client fd was already closed

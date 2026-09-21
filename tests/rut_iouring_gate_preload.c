@@ -403,7 +403,8 @@ static int setup_params_valid(const struct io_uring_params* params) {
         RUT_GATE_IORING_FEAT_NO_IOWAIT;
     const uint32_t required_features = IORING_FEAT_SINGLE_MMAP | IORING_FEAT_NODROP;
     if (params == 0 || params->sq_entries != RUT_GATE_RING_ENTRIES ||
-        params->cq_entries != RUT_GATE_CQ_ENTRIES || params->flags != IORING_SETUP_COOP_TASKRUN ||
+        params->cq_entries != RUT_GATE_CQ_ENTRIES ||
+        params->flags != (IORING_SETUP_COOP_TASKRUN | IORING_SETUP_TASKRUN_FLAG) ||
         params->sq_thread_cpu != 0 || params->sq_thread_idle != 0 || params->wq_fd != 0 ||
         params->resv[0] != 0 || params->resv[1] != 0 || params->resv[2] != 0 ||
         (params->features & required_features) != required_features ||
@@ -437,7 +438,7 @@ static int setup_params_valid(const struct io_uring_params* params) {
 static int setup_request_valid(const struct io_uring_params* params) {
     struct io_uring_params expected;
     memset(&expected, 0, sizeof(expected));
-    expected.flags = IORING_SETUP_COOP_TASKRUN;
+    expected.flags = IORING_SETUP_COOP_TASKRUN | IORING_SETUP_TASKRUN_FLAG;
     return params != 0 && memcmp(params, &expected, sizeof(expected)) == 0;
 }
 

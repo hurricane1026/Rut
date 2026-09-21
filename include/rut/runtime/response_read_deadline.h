@@ -2,6 +2,7 @@
 
 #include "rut/common/request_policy.h"
 #include "rut/runtime/connection.h"
+#include "rut/runtime/connection_capacity.h"
 #include "rut/runtime/http_parser.h"
 #include "rut/runtime/route_table.h"
 
@@ -1321,6 +1322,36 @@ inline bool http1_pipeline_successor_upstream_owners_are_neutral(const Connectio
            !c.h2_proxy_synth_quarantined;
 }
 
+// TLS capability for the deliberately narrow HTTP/1 deadline profile.  This
+// says nothing about queued I/O; the request/deadline owner can remain valid
+// while raw TLS receive or send work is outstanding independently.
+inline bool response_read_deadline_tls_http11_engine_is_stable(const Connection& c) {
+    return c.tls_active && c.uses_iouring_tls() && c.tls_engine.handshake_done &&
+           c.tls_handshake_complete && !c.tls_proxy_stream && c.protocol == ConnProtocol::Http11 &&
+           c.h2 == nullptr;
+}
+
+// The end-to-end TLS bridge is limited to the two admitted depth-zero GET
+// request policies. Raw TLS send/receive ownership remains independent and is
+// checked by the phase-specific transport predicates.
+inline bool response_read_deadline_tls_complete_get_profile_is_stable(const Connection& c) {
+    const RouteConfig* config = c.request_config;
+    const u16 bundle_id = c.response_read_deadline_bundle_id;
+    return response_read_deadline_tls_http11_engine_is_stable(c) && config != nullptr &&
+           config->policy_bundle_id_is_valid(bundle_id) &&
+           config->policy_bundles[bundle_id - 1u].response_buffering ==
+               ForwardResponseBufferingMode::CompleteContentLength &&
+           c.response_read_deadline_profile ==
+               ResponseReadDeadlineProfile::BodylessNonHeadContentLengthZero &&
+           c.response_read_deadline_buffering ==
+               ForwardResponseBufferingMode::CompleteContentLength &&
+           c.response_read_deadline_method == static_cast<u8>(LogHttpMethod::Get) &&
+           c.response_read_deadline_route_method == kRouteMethodGet &&
+           response_read_deadline_exact_get_layout_is_stable(c) &&
+           bodyless_get_complete_content_length_request_policy_is_admitted(c.request_policy_id) &&
+           c.response_read_deadline_upload.request_policy_id == c.request_policy_id;
+}
+
 inline bool http1_pipeline_successor_semantic_shape_is_stable(
     const Connection& c,
     const ResponseReadDeadlineUploadProof& proof,
@@ -1548,9 +1579,9 @@ inline bool http1_pipeline_request_generation_connected_is_stable(
                   }) {
         return false;
     } else {
-        if (loop == nullptr || expected_upstream_connect == nullptr || c.id >= Loop::kMaxConns ||
-            &loop->conns[c.id] != &c || c.fd < 0 || c.req_start_us == 0 ||
-            c.state != ConnState::Proxying || c.upstream_fd < 0 ||
+        if (loop == nullptr || expected_upstream_connect == nullptr ||
+            c.id >= connection_capacity_of(*loop) || &loop->conns[c.id] != &c || c.fd < 0 ||
+            c.req_start_us == 0 || c.state != ConnState::Proxying || c.upstream_fd < 0 ||
             c.on_upstream_send != expected_upstream_connect || c.on_upstream_recv != nullptr ||
             c.on_recv != nullptr || c.on_send != nullptr || c.upstream_connect_armed ||
             c.upstream_send_armed || c.upstream_recv_armed || c.upstream_slot_held ||
@@ -1648,6 +1679,16 @@ inline bool http1_pipeline_request_generation_prebuilt_is_stable(
            target.max_inflight == 0;
 }
 
+// A response can be staged through SSL_write only when no older TLS output or
+// logical send owns the output buffer.  Receive ownership is independent and
+// is deliberately not required to be absent here.
+inline bool response_read_deadline_tls_output_is_settled(const Connection& c) {
+    return response_read_deadline_tls_http11_engine_is_stable(c) &&
+           c.tls_raw_send_owner_is_neutral() && c.tls_single_shot_send_owner_is_neutral() &&
+           !c.tls_out_inflight && c.tls_out_buf.len() == 0 && !c.send_armed &&
+           c.tls_pending_on_send == nullptr && c.tls_pending_on_recv == nullptr;
+}
+
 inline bool response_read_deadline_owner_is_stable(const Connection& c,
                                                    Connection::Callback expected_upstream_recv,
                                                    ResponseReadDeadlineOwnerPhase phase) {
@@ -1718,9 +1759,21 @@ inline bool response_read_deadline_owner_is_stable(const Connection& c,
             c.response_read_deadline_buffering,
             c.response_read_deadline_method,
             c.response_read_deadline_route_method);
+    // TLS keeps the same narrow bodyless-GET owner profile through post-commit;
+    // its raw send/receive ownership is validated separately below.
+    const bool tls_bodyless_get_owner =
+        c.tls_active &&
+        c.response_read_deadline_profile ==
+            ResponseReadDeadlineProfile::BodylessNonHeadContentLengthZero &&
+        c.response_read_deadline_buffering == ForwardResponseBufferingMode::CompleteContentLength &&
+        c.response_read_deadline_method == static_cast<u8>(LogHttpMethod::Get) &&
+        c.pipeline_depth == 0 && c.http1_pipeline_request_generation == 0 &&
+        c.pipeline_stash_len == 0 && response_read_deadline_tls_http11_engine_is_stable(c) &&
+        (c.response_read_deadline_post_commit_phase == ResponseReadDeadlinePostCommitPhase::None ||
+         response_read_deadline_tls_complete_get_profile_is_stable(c));
     const bool common_request =
-        c.protocol == ConnProtocol::Http11 && !c.tls_active && c.h2 == nullptr &&
-        c.req_http_version == static_cast<u8>(HttpVersion::Http11) &&
+        c.protocol == ConnProtocol::Http11 && (!c.tls_active || tls_bodyless_get_owner) &&
+        c.h2 == nullptr && c.req_http_version == static_cast<u8>(HttpVersion::Http11) &&
         response_read_deadline_persistence_owner_is_stable(c, c.response_read_deadline_upload) &&
         !c.req_client_has_transfer_encoding && !c.req_client_has_te && !c.req_client_has_expect &&
         !c.req_client_has_upgrade_header && !c.req_malformed && !c.req_wants_upgrade &&
@@ -2076,6 +2129,50 @@ inline bool fixed_upload_head_after_host_precise_progress_is_stable(
            c.on_upstream_send == nullptr;
 }
 
+// The combined-send staging area lives beyond response_header_buf's logical
+// length. While the combined owner is live, these bytes must still match the
+// retained origin body; the Buffer length intentionally remains header-only.
+inline bool response_read_deadline_combined_send_frame_is_stable(const Connection& c) {
+    const u32 header_len = c.response_header_buf.len();
+    const u32 body_len = c.response_read_deadline_post_commit_declared_body;
+    const u32 raw_header_end = c.response_read_deadline_post_commit_raw_header_end;
+    if (c.response_read_deadline_post_commit_phase !=
+            ResponseReadDeadlinePostCommitPhase::CombinedSend ||
+        c.response_read_deadline_buffering != ForwardResponseBufferingMode::CompleteContentLength ||
+        c.response_read_deadline_state != ResponseReadDeadlineState::BodyComplete ||
+        c.response_read_deadline_post_commit_response_class !=
+            CompleteContentLengthResponseClass::BoundedPositiveBody ||
+        header_len == 0 || body_len == 0 || c.response_header_buf.data() == nullptr ||
+        c.upstream_recv_buf.data() == nullptr || header_len > c.response_header_buf.capacity() ||
+        body_len > c.response_header_buf.capacity() - header_len || raw_header_end == 0 ||
+        raw_header_end > c.upstream_recv_buf.capacity() ||
+        body_len > c.upstream_recv_buf.capacity() - raw_header_end)
+        return false;
+
+    const u32 send_len = header_len + body_len;
+    const u32 retained_len = raw_header_end + body_len;
+    return c.response_read_deadline_post_commit_origin_received == body_len &&
+           c.response_read_deadline_post_commit_send_body == body_len &&
+           c.response_read_deadline_post_commit_downstream_submitted == body_len &&
+           c.response_read_deadline_post_commit_downstream_completed == 0 &&
+           c.response_read_deadline_post_commit_inflight_body == body_len &&
+           c.resp_body_mode == BodyMode::ContentLength && c.resp_body_sent == send_len &&
+           c.resp_body_remaining == 0 && c.upstream_send_len == retained_len &&
+           c.upstream_recv_buf.len() == retained_len &&
+           c.response_read_deadline_send_kind == ResponseReadDeadlineSendKind::Combined &&
+           c.response_read_deadline_send_src == c.response_header_buf.data() &&
+           c.response_read_deadline_send_len == send_len && c.fd >= 0 &&
+           c.response_read_deadline_send_fd == c.fd &&
+           c.response_read_deadline_send_deadline_generation ==
+               c.response_read_deadline_generation &&
+           c.response_read_deadline_send_upstream_episode ==
+               c.response_read_deadline_post_commit_episode &&
+           c.response_read_deadline_send_owner_generation != 0 &&
+           __builtin_memcmp(c.response_header_buf.data() + header_len,
+                            c.upstream_recv_buf.data() + raw_header_end,
+                            body_len) == 0;
+}
+
 inline bool response_read_deadline_post_commit_is_stable(const Connection& c) {
     const RouteConfig* cfg = c.request_config;
     const u16 bundle_id = c.response_read_deadline_bundle_id;
@@ -2138,8 +2235,9 @@ inline bool response_read_deadline_post_commit_is_stable(const Connection& c) {
         c.response_read_deadline_post_commit_inflight_body >
             c.response_read_deadline_post_commit_downstream_submitted -
                 c.response_read_deadline_post_commit_downstream_completed ||
-        c.protocol != ConnProtocol::Http11 || c.tls_active || c.h2 != nullptr ||
-        c.req_http_version != static_cast<u8>(HttpVersion::Http11) ||
+        c.protocol != ConnProtocol::Http11 ||
+        (c.tls_active && !response_read_deadline_tls_complete_get_profile_is_stable(c)) ||
+        c.h2 != nullptr || c.req_http_version != static_cast<u8>(HttpVersion::Http11) ||
         !response_read_deadline_persistence_owner_is_stable(c, c.response_read_deadline_upload) ||
         (!fixed_upload && c.req_client_has_content_length) || c.req_client_has_transfer_encoding ||
         c.req_client_has_te || c.req_client_has_expect || c.req_client_has_upgrade_header ||
@@ -2264,24 +2362,23 @@ inline bool response_read_deadline_post_commit_is_stable(const Connection& c) {
                 return false;
         }
     }
-    if (complete_buffering &&
-        (!cfg->response_policy_id_is_valid(bundle.response_policy_id) ||
-         !cfg->failure_policy_id_is_valid(bundle.failure_policy_id) ||
-         !cfg->timeout_failure_policy_id_is_valid(bundle.timeout_failure_policy_id) ||
-         !complete_content_length_buffering_policies_valid(
-             cfg->response_policies[bundle.response_policy_id - 1],
-             cfg->failure_policies[bundle.failure_policy_id - 1],
-             cfg->failure_policies[bundle.timeout_failure_policy_id - 1])))
-        return false;
-    return response_read_timeout_seconds_valid(bundle.response_read_timeout_seconds) &&
-           bundle.response_read_timeout_seconds == c.response_read_deadline_seconds &&
-           bundle.response_buffering == c.response_read_deadline_buffering &&
-           bundle.response_policy_id == c.response_policy_id &&
-           bundle.failure_policy_id == c.failure_policy_id &&
-           bundle.timeout_failure_policy_id == c.timeout_failure_policy_id &&
-           cfg->response_policy_id_is_valid(bundle.response_policy_id) &&
-           cfg->failure_policy_id_is_valid(bundle.failure_policy_id) &&
-           cfg->timeout_failure_policy_id_is_valid(bundle.timeout_failure_policy_id);
+    const bool stable =
+        response_read_timeout_seconds_valid(bundle.response_read_timeout_seconds) &&
+        bundle.response_read_timeout_seconds == c.response_read_deadline_seconds &&
+        bundle.response_buffering == c.response_read_deadline_buffering &&
+        bundle.response_policy_id == c.response_policy_id &&
+        bundle.failure_policy_id == c.failure_policy_id &&
+        bundle.timeout_failure_policy_id == c.timeout_failure_policy_id &&
+        // The successful same-call bundle validation above, together with
+        // the buffering equality, already established the Complete role and
+        // tuple contract. None still needs its strict post-commit role checks.
+        (complete_buffering ||
+         (cfg->response_policy_id_is_valid(bundle.response_policy_id) &&
+          cfg->failure_policy_id_is_valid(bundle.failure_policy_id) &&
+          cfg->timeout_failure_policy_id_is_valid(bundle.timeout_failure_policy_id)));
+    return stable && (c.response_read_deadline_post_commit_phase !=
+                          ResponseReadDeadlinePostCommitPhase::CombinedSend ||
+                      response_read_deadline_combined_send_frame_is_stable(c));
 }
 
 // The currently admitted default-buffered GET keeps the same precise

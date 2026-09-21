@@ -2195,6 +2195,9 @@ struct PreloadContainerGuard {
     }
 };
 
+// Bind mounts below use shared SELinux labels (:z) for test-owned files and
+// directories. Shared labels allow successive containers to reuse the preload
+// artifact and overlapping config/control mounts without changing read-only flags.
 static bool run_pinned_nginx_preload_loader(const std::string& preload_path,
                                             const std::string& log_path,
                                             bool expect_success,
@@ -2220,7 +2223,7 @@ static bool run_pinned_nginx_preload_loader(const std::string& preload_path,
                       "--name",
                       container_name,
                       "-v",
-                      preload_path + ":/rut-gate/preload.so:ro",
+                      preload_path + ":/rut-gate/preload.so:ro,z",
                       "-e",
                       "LD_PRELOAD=/rut-gate/preload.so",
                       "--entrypoint",
@@ -2712,9 +2715,9 @@ public:
                           "--name",
                           name_,
                           "-v",
-                          temp_.nginx_config + ":/etc/nginx/nginx.conf:ro",
+                          temp_.nginx_config + ":/etc/nginx/nginx.conf:ro,z",
                           "-v",
-                          std::string(temp_.path) + ":" + temp_.path,
+                          std::string(temp_.path) + ":" + temp_.path + ":z",
                           kNginxImage,
                           "nginx",
                           "-g",
@@ -7304,10 +7307,10 @@ static bool capture_nginx_default_buffering_timeout(u16 frontend_port,
                                             "--name",
                                             container_name,
                                             "-v",
-                                            nginx_config_path + ":/etc/nginx/nginx.conf:ro"};
+                                            nginx_config_path + ":/etc/nginx/nginx.conf:ro,z"};
     if (access_mount_dir != nullptr) {
         docker_args.push_back("-v");
-        docker_args.push_back(*access_mount_dir + ":" + *access_mount_dir);
+        docker_args.push_back(*access_mount_dir + ":" + *access_mount_dir + ":z");
     }
     docker_args.insert(docker_args.end(), {kNginxImage, "nginx", "-g", "daemon off;"});
     if (!spawn_child(docker_args, nginx_log_path, nginx.child)) {
@@ -7515,7 +7518,7 @@ static bool capture_nginx_default_buffering_complete(
                       "--name",
                       container_name,
                       "-v",
-                      nginx_config_path + ":/etc/nginx/nginx.conf:ro",
+                      nginx_config_path + ":/etc/nginx/nginx.conf:ro,z",
                       kNginxImage,
                       "nginx",
                       "-g",
@@ -7780,7 +7783,7 @@ static bool capture_nginx_default_buffering_eof(u16 frontend_port,
                       "--name",
                       container_name,
                       "-v",
-                      nginx_config_path + ":/etc/nginx/nginx.conf:ro",
+                      nginx_config_path + ":/etc/nginx/nginx.conf:ro,z",
                       kNginxImage,
                       "nginx",
                       "-g",
@@ -7975,7 +7978,7 @@ static bool capture_nginx_head_keepalive_success(u16 frontend_port,
                       "--name",
                       container_name,
                       "-v",
-                      nginx_config_path + ":/etc/nginx/nginx.conf:ro",
+                      nginx_config_path + ":/etc/nginx/nginx.conf:ro,z",
                       kNginxImage,
                       "nginx",
                       "-g",
@@ -8062,7 +8065,7 @@ static bool capture_nginx_head_keepalive_gateway(u16 frontend_port,
                       "--name",
                       container_name,
                       "-v",
-                      nginx_config_path + ":/etc/nginx/nginx.conf:ro",
+                      nginx_config_path + ":/etc/nginx/nginx.conf:ro,z",
                       kNginxImage,
                       "nginx",
                       "-g",
@@ -8325,7 +8328,7 @@ static bool capture_nginx_head_malformed_reuse(u16 frontend_port,
                       "--name",
                       container_name,
                       "-v",
-                      nginx_config_path + ":/etc/nginx/nginx.conf:ro",
+                      nginx_config_path + ":/etc/nginx/nginx.conf:ro,z",
                       kNginxImage,
                       "nginx",
                       "-g",
@@ -8400,7 +8403,7 @@ static bool capture_nginx_head_incomplete_eof_reuse(u16 frontend_port,
                       "--name",
                       container_name,
                       "-v",
-                      nginx_config_path + ":/etc/nginx/nginx.conf:ro",
+                      nginx_config_path + ":/etc/nginx/nginx.conf:ro,z",
                       kNginxImage,
                       "nginx",
                       "-g",
@@ -8521,7 +8524,7 @@ static bool capture_case(u16 frontend_port,
                       "--name",
                       container_name,
                       "-v",
-                      nginx_config_path + ":/etc/nginx/nginx.conf:ro",
+                      nginx_config_path + ":/etc/nginx/nginx.conf:ro,z",
                       kNginxImage,
                       "nginx",
                       "-g",
@@ -8641,7 +8644,7 @@ static bool capture_pinned_local_rejection_case(u16 frontend_port,
                       "--name",
                       container_name,
                       "-v",
-                      nginx_config_path + ":/etc/nginx/nginx.conf:ro",
+                      nginx_config_path + ":/etc/nginx/nginx.conf:ro,z",
                       kNginxImage,
                       "nginx",
                       "-g",
@@ -8784,7 +8787,7 @@ static bool capture_head_case(u16 frontend_port,
                       "--name",
                       container_name,
                       "-v",
-                      nginx_config_path + ":/etc/nginx/nginx.conf:ro",
+                      nginx_config_path + ":/etc/nginx/nginx.conf:ro,z",
                       kNginxImage,
                       "nginx",
                       "-g",
@@ -8946,7 +8949,7 @@ static bool capture_head_gateway_case(u16 frontend_port,
                       "--name",
                       container_name,
                       "-v",
-                      nginx_config_path + ":/etc/nginx/nginx.conf:ro",
+                      nginx_config_path + ":/etc/nginx/nginx.conf:ro,z",
                       kNginxImage,
                       "nginx",
                       "-g",
@@ -9149,7 +9152,7 @@ static bool capture_gateway_case(u16 frontend_port,
                       "--name",
                       container_name,
                       "-v",
-                      nginx_config_path + ":/etc/nginx/nginx.conf:ro",
+                      nginx_config_path + ":/etc/nginx/nginx.conf:ro,z",
                       kNginxImage,
                       "nginx",
                       "-g",
@@ -9243,7 +9246,7 @@ static bool capture_api_side(u16 frontend_port,
                           "--name",
                           container_name,
                           "-v",
-                          nginx_config_path + ":/etc/nginx/nginx.conf:ro",
+                          nginx_config_path + ":/etc/nginx/nginx.conf:ro,z",
                           kNginxImage,
                           "nginx",
                           "-g",
@@ -9413,7 +9416,7 @@ static bool capture_api_redirect_side(u16 frontend_port,
                           "--name",
                           container_name,
                           "-v",
-                          nginx_config_path + ":/etc/nginx/nginx.conf:ro",
+                          nginx_config_path + ":/etc/nginx/nginx.conf:ro,z",
                           kNginxImage,
                           "nginx",
                           "-g",
@@ -9927,7 +9930,7 @@ static bool run_pinned_clean_proxy_uri_oracle(u16 frontend_port,
                       "--name",
                       container_name,
                       "-v",
-                      temp.nginx_config + ":/etc/nginx/nginx.conf:ro",
+                      temp.nginx_config + ":/etc/nginx/nginx.conf:ro,z",
                       kNginxImage,
                       "nginx",
                       "-g",
@@ -10676,10 +10679,10 @@ static bool capture_pinned_bounded_exact_local_path_order(
                                             "--name",
                                             container_name,
                                             "-v",
-                                            temp.nginx_config + ":/etc/nginx/nginx.conf:ro"};
+                                            temp.nginx_config + ":/etc/nginx/nginx.conf:ro,z"};
     if (no_content_return204) {
         docker_args.push_back("-v");
-        docker_args.push_back(std::string(temp.path) + ":" + std::string(temp.path));
+        docker_args.push_back(std::string(temp.path) + ":" + std::string(temp.path) + ":z");
     }
     docker_args.insert(docker_args.end(), {kNginxImage, "nginx", "-g", "daemon off;"});
     if (frontend_reservation != nullptr && *frontend_reservation >= 0) {
@@ -12019,10 +12022,10 @@ static bool capture_pinned_exact_local_return204_order(
                                             "--name",
                                             container_name,
                                             "-v",
-                                            temp.nginx_config + ":/etc/nginx/nginx.conf:ro"};
+                                            temp.nginx_config + ":/etc/nginx/nginx.conf:ro,z"};
     if (query_target) {
         docker_args.push_back("-v");
-        docker_args.push_back(std::string(temp.path) + ":" + std::string(temp.path));
+        docker_args.push_back(std::string(temp.path) + ":" + std::string(temp.path) + ":z");
     }
     docker_args.insert(docker_args.end(), {kNginxImage, "nginx", "-g", "daemon off;"});
     Recorder local_recorder;
@@ -14376,10 +14379,10 @@ static bool capture_pinned_normalized_exact_trailing_slash_order(
                                             "--name",
                                             container_name,
                                             "-v",
-                                            config_path + ":/etc/nginx/nginx.conf:ro"};
+                                            config_path + ":/etc/nginx/nginx.conf:ro,z"};
     if (no_content_return204) {
         docker_args.push_back("-v");
-        docker_args.push_back(observation.temp_path + ":" + observation.temp_path);
+        docker_args.push_back(observation.temp_path + ":" + observation.temp_path + ":z");
     }
     docker_args.insert(docker_args.end(), {kNginxImage, "nginx", "-g", "daemon off;"});
     if (frontend_reservation != nullptr) {
@@ -15506,9 +15509,9 @@ static bool capture_pinned_max_boundary_side(u16 frontend_port,
                                                   "--name",
                                                   container_name,
                                                   "-v",
-                                                  temp.nginx_config + ":/etc/nginx/nginx.conf:ro",
+                                                  temp.nginx_config + ":/etc/nginx/nginx.conf:ro,z",
                                                   "-v",
-                                                  std::string(temp.path) + ":" + temp.path,
+                                                  std::string(temp.path) + ":" + temp.path + ":z",
                                                   kNginxImage,
                                                   "nginx",
                                                   "-g",
@@ -16184,9 +16187,9 @@ static bool capture_pinned_bodyful_normalized_exact_side(
                                                   "--name",
                                                   container_name,
                                                   "-v",
-                                                  temp.nginx_config + ":/etc/nginx/nginx.conf:ro",
+                                                  temp.nginx_config + ":/etc/nginx/nginx.conf:ro,z",
                                                   "-v",
-                                                  std::string(temp.path) + ":" + temp.path,
+                                                  std::string(temp.path) + ":" + temp.path + ":z",
                                                   kNginxImage,
                                                   "nginx",
                                                   "-g",
@@ -18498,7 +18501,7 @@ static bool capture_pinned_exact_local_body_space_order_with_spec(
                       "--name",
                       container_name,
                       "-v",
-                      temp.nginx_config + ":/etc/nginx/nginx.conf:ro",
+                      temp.nginx_config + ":/etc/nginx/nginx.conf:ro,z",
                       kNginxImage,
                       "nginx",
                       "-g",
@@ -24087,9 +24090,9 @@ static bool capture_max_proxy_prefix_side(
                                "--name",
                                process_identity,
                                "-v",
-                               temp.nginx_config + ":/etc/nginx/nginx.conf:ro",
+                               temp.nginx_config + ":/etc/nginx/nginx.conf:ro,z",
                                "-v",
-                               std::string(temp.path) + ":" + temp.path,
+                               std::string(temp.path) + ":" + temp.path + ":z",
                                kNginxImage,
                                "nginx",
                                "-g",
@@ -24704,8 +24707,8 @@ static bool run_max_proxy_prefix_self_checks(std::string& error) {
     }
     const auto maximum_lowered = rut::nginx::lower_to_rut(maximum_parsed.value());
     if (!maximum_lowered || maximum_lowered.value().len != 3573u ||
-        rut::nginx::RutSource::kCapacity != 8750u) {
-        if (error.empty()) error = "#335 maximum generated source was not exactly 3573/8750 bytes";
+        rut::nginx::RutSource::kCapacity != 12779u) {
+        if (error.empty()) error = "#335 maximum generated source was not exactly 3573/12779 bytes";
         return false;
     }
     const rut::Str maximum_source_view = maximum_lowered.value().view();
@@ -25205,9 +25208,9 @@ static bool capture_max_proxy_replacement_side(u16 frontend_port,
                                "--name",
                                process_identity,
                                "-v",
-                               temp.nginx_config + ":/etc/nginx/nginx.conf:ro",
+                               temp.nginx_config + ":/etc/nginx/nginx.conf:ro,z",
                                "-v",
-                               std::string(temp.path) + ":" + temp.path,
+                               std::string(temp.path) + ":" + temp.path + ":z",
                                kNginxImage,
                                "nginx",
                                "-g",
@@ -25779,8 +25782,8 @@ static bool run_max_proxy_replacement_self_checks(std::string& error) {
     }
     const auto maximum_lowered = rut::nginx::lower_to_rut(maximum_parsed.value());
     if (!maximum_lowered || maximum_lowered.value().len != 3468u ||
-        rut::nginx::RutSource::kCapacity != 8750u) {
-        if (error.empty()) error = "#336 maximum generated source was not exactly 3468/8750 bytes";
+        rut::nginx::RutSource::kCapacity != 12779u) {
+        if (error.empty()) error = "#336 maximum generated source was not exactly 3468/12779 bytes";
         return false;
     }
     const rut::Str maximum_source_view = maximum_lowered.value().view();
@@ -26787,11 +26790,11 @@ static bool run_nginx_downstream_gate_spike(u16 frontend_port,
                       "-e",
                       "RUT_DOWNSTREAM_GATE_TARGET_EXECUTABLE=/usr/sbin/nginx",
                       "-v",
-                      std::string(preload_path) + ":/rut-gate/preload.so:ro",
+                      std::string(preload_path) + ":/rut-gate/preload.so:ro,z",
                       "-v",
-                      temp.gate_control + ":/rut-gate/control",
+                      temp.gate_control + ":/rut-gate/control" + ":z",
                       "-v",
-                      temp.nginx_config + ":/etc/nginx/nginx.conf:ro",
+                      temp.nginx_config + ":/etc/nginx/nginx.conf:ro,z",
                       kNginxImage,
                       "nginx",
                       "-g",
@@ -27081,11 +27084,11 @@ static bool run_nginx_coalesced_ingress_gate_evidence(u16 frontend_port,
                       "-e",
                       "RUT_DOWNSTREAM_GATE_TARGET_EXECUTABLE=/usr/sbin/nginx",
                       "-v",
-                      std::string(preload_path) + ":/rut-gate/preload.so:ro",
+                      std::string(preload_path) + ":/rut-gate/preload.so:ro,z",
                       "-v",
-                      temp.gate_control + ":/rut-gate/control",
+                      temp.gate_control + ":/rut-gate/control" + ":z",
                       "-v",
-                      temp.nginx_config + ":/etc/nginx/nginx.conf:ro",
+                      temp.nginx_config + ":/etc/nginx/nginx.conf:ro,z",
                       kNginxImage,
                       "nginx",
                       "-g",
@@ -28859,7 +28862,7 @@ static bool capture_pinned_exact_local_order(u16 frontend_port,
                       "--name",
                       container_name,
                       "-v",
-                      temp.nginx_config + ":/etc/nginx/nginx.conf:ro",
+                      temp.nginx_config + ":/etc/nginx/nginx.conf:ro,z",
                       kNginxImage,
                       "nginx",
                       "-g",
@@ -29254,7 +29257,7 @@ static bool run_pinned_root_proxy_trace_oracle(u16 frontend_port,
                       "--name",
                       container_name,
                       "-v",
-                      temp.nginx_config + ":/etc/nginx/nginx.conf:ro",
+                      temp.nginx_config + ":/etc/nginx/nginx.conf:ro,z",
                       kNginxImage,
                       "nginx",
                       "-g",
@@ -29416,7 +29419,7 @@ static bool run_pinned_api_proxy_trace_oracle(u16 frontend_port,
                       "--name",
                       container_name,
                       "-v",
-                      temp.nginx_config + ":/etc/nginx/nginx.conf:ro",
+                      temp.nginx_config + ":/etc/nginx/nginx.conf:ro,z",
                       kNginxImage,
                       "nginx",
                       "-g",
@@ -29633,7 +29636,7 @@ static bool capture_pinned_exact_absolute_redirect_order(
                       "--name",
                       container_name,
                       "-v",
-                      temp.nginx_config + ":/etc/nginx/nginx.conf:ro",
+                      temp.nginx_config + ":/etc/nginx/nginx.conf:ro,z",
                       kNginxImage,
                       "nginx",
                       "-g",
@@ -30044,7 +30047,7 @@ static bool capture_pinned_exact_absolute_redirect_302_order(
                       "--name",
                       container_name,
                       "-v",
-                      temp.nginx_config + ":/etc/nginx/nginx.conf:ro",
+                      temp.nginx_config + ":/etc/nginx/nginx.conf:ro,z",
                       kNginxImage,
                       "nginx",
                       "-g",
@@ -30638,7 +30641,7 @@ static bool capture_converter_exact_absolute_redirect_order(
                                           "--name",
                                           container_name,
                                           "-v",
-                                          temp.nginx_config + ":/etc/nginx/nginx.conf:ro",
+                                          temp.nginx_config + ":/etc/nginx/nginx.conf:ro,z",
                                           kNginxImage,
                                           "nginx",
                                           "-g",
@@ -31122,7 +31125,7 @@ static bool run_converter_root_proxy_trace_differential(u16 frontend_port,
                           "--name",
                           container_name,
                           "-v",
-                          temp.nginx_config + ":/etc/nginx/nginx.conf:ro",
+                          temp.nginx_config + ":/etc/nginx/nginx.conf:ro,z",
                           kNginxImage,
                           "nginx",
                           "-g",
@@ -31437,7 +31440,7 @@ static bool run_converter_api_proxy_trace_differential(u16 frontend_port,
                           "--name",
                           container_name,
                           "-v",
-                          temp.nginx_config + ":/etc/nginx/nginx.conf:ro",
+                          temp.nginx_config + ":/etc/nginx/nginx.conf:ro,z",
                           kNginxImage,
                           "nginx",
                           "-g",
@@ -31666,7 +31669,7 @@ static bool run_strict_local_response_differential(
                           "--name",
                           container_name,
                           "-v",
-                          temp.nginx_config + ":/etc/nginx/nginx.conf:ro",
+                          temp.nginx_config + ":/etc/nginx/nginx.conf:ro,z",
                           kNginxImage,
                           "nginx",
                           "-g",
@@ -32201,7 +32204,7 @@ static bool run_converter_exact_local_differential(
                                           "--name",
                                           container_name,
                                           "-v",
-                                          temp.nginx_config + ":/etc/nginx/nginx.conf:ro",
+                                          temp.nginx_config + ":/etc/nginx/nginx.conf:ro,z",
                                           kNginxImage,
                                           "nginx",
                                           "-g",
@@ -32934,7 +32937,7 @@ route exact "/static" { return local_response({
                                           "--name",
                                           container_name,
                                           "-v",
-                                          temp.nginx_config + ":/etc/nginx/nginx.conf:ro",
+                                          temp.nginx_config + ":/etc/nginx/nginx.conf:ro,z",
                                           kNginxImage,
                                           "nginx",
                                           "-g",
@@ -34413,7 +34416,7 @@ static constexpr StaticQueryProxyOracleProfile kRootEmptyQueryProxyOracleProfile
     kRootEmptyQueryProxyUpstreamRequestSizes,
     true,
     3343u,
-    5406u,
+    9435u,
     true,
     true,
     true};
@@ -35934,7 +35937,7 @@ static bool run_proxy_hide_header_name_config_preflight(std::string& error) {
                           "--name",
                           container_name,
                           "-v",
-                          temp.nginx_config + ":/etc/nginx/nginx.conf:ro",
+                          temp.nginx_config + ":/etc/nginx/nginx.conf:ro,z",
                           "--entrypoint",
                           "/usr/sbin/nginx",
                           kNginxImage,
@@ -37610,11 +37613,11 @@ static bool run_empty_query_proxy_differential_self_checks(std::string& error) {
     std::string canonical[2];
     if (!lower(8080u, 9000u, true, canonical[0]) || !lower(8080u, 9000u, false, canonical[1]) ||
         canonical[0] != canonical[1] || canonical[0].size() != 3337u ||
-        rut::nginx::RutSource::kCapacity - canonical[0].size() - 1u != 5412u ||
+        rut::nginx::RutSource::kCapacity - canonical[0].size() - 1u != 9441u ||
         !validate_static_query_proxy_generated_source(canonical[0], 8080u, 9000u, error, profile) ||
         !validate_static_query_proxy_generated_source(canonical[1], 8080u, 9000u, error, profile)) {
         if (error.empty())
-            error = "#360 canonical declaration-order source lost exact 3337/5412 evidence";
+            error = "#360 canonical declaration-order source lost exact 3337/9441 evidence";
         return false;
     }
 
@@ -37803,10 +37806,10 @@ static bool run_root_empty_query_proxy_differential_self_checks(std::string& err
     std::string canonical[2];
     if (!lower(8080u, 9000u, true, canonical[0]) || !lower(8080u, 9000u, false, canonical[1]) ||
         canonical[0] != canonical[1] || canonical[0].size() != 3343u ||
-        rut::nginx::RutSource::kCapacity - canonical[0].size() - 1u != 5406u ||
+        rut::nginx::RutSource::kCapacity - canonical[0].size() - 1u != 9435u ||
         !validate_static_query_proxy_generated_source(canonical[0], 8080u, 9000u, error, profile) ||
         !validate_static_query_proxy_generated_source(canonical[1], 8080u, 9000u, error, profile)) {
-        if (error.empty()) error = "#372 canonical source lost exact 3343/5406 evidence";
+        if (error.empty()) error = "#372 canonical source lost exact 3343/9435 evidence";
         return false;
     }
 
@@ -40510,9 +40513,9 @@ static bool capture_pinned_exact_loopback_action_side(
                       "--name",
                       process_identity,
                       "-v",
-                      temp.nginx_config + ":/etc/nginx/nginx.conf:ro",
+                      temp.nginx_config + ":/etc/nginx/nginx.conf:ro,z",
                       "-v",
-                      std::string(temp.path) + ":" + temp.path,
+                      std::string(temp.path) + ":" + temp.path + ":z",
                       kNginxImage,
                       "nginx",
                       "-g",
@@ -42144,9 +42147,9 @@ static bool capture_pinned_exact_loopback_fixed_redirect_side(
                       "--name",
                       process_identity,
                       "-v",
-                      temp.nginx_config + ":/etc/nginx/nginx.conf:ro",
+                      temp.nginx_config + ":/etc/nginx/nginx.conf:ro,z",
                       "-v",
-                      std::string(temp.path) + ":" + temp.path,
+                      std::string(temp.path) + ":" + temp.path + ":z",
                       kNginxImage,
                       "nginx",
                       "-g",
@@ -45620,9 +45623,9 @@ static bool capture_pinned_exact_loopback_prefix_root_side(
                       "--name",
                       process_identity,
                       "-v",
-                      temp.nginx_config + ":/etc/nginx/nginx.conf:ro",
+                      temp.nginx_config + ":/etc/nginx/nginx.conf:ro,z",
                       "-v",
-                      std::string(temp.path) + ":" + std::string(temp.path),
+                      std::string(temp.path) + ":" + std::string(temp.path) + ":z",
                       kNginxImage,
                       "nginx",
                       "-g",
@@ -47677,7 +47680,7 @@ static bool run_exact_max_proxy_prefix_self_checks(
         maximum_ipv4_lowered.value().len != profile.maximum_exact_size ||
         profile.maximum_exact_size >= rut::nginx::RutSource::kCapacity ||
         rut::nginx::RutSource::kCapacity - profile.maximum_exact_size !=
-            (profile.uses_target_transform ? 5168u : 5324u) ||
+            (profile.uses_target_transform ? 9197u : 9353u) ||
         maximum_ipv4_lowered.value().data[maximum_ipv4_lowered.value().len] != '\0') {
         error = std::string(profile.issue) +
                 " P63 genuine maximum lowering lost its canonical size/capacity/NUL boundary";
@@ -48142,9 +48145,9 @@ static bool run_wildcard_max_no_uri_prefix_self_checks(std::string& error) {
     }
     const auto maximum_lowered = rut::nginx::lower_to_rut(maximum_parsed.value());
     if (!maximum_lowered || maximum_lowered.value().len != 3417u ||
-        rut::nginx::RutSource::kCapacity != 8750u ||
-        rut::nginx::RutSource::kCapacity - maximum_lowered.value().len != 5333u ||
-        rut::nginx::RutSource::kCapacity - 1u - maximum_lowered.value().len != 5332u ||
+        rut::nginx::RutSource::kCapacity != 12779u ||
+        rut::nginx::RutSource::kCapacity - maximum_lowered.value().len != 9362u ||
+        rut::nginx::RutSource::kCapacity - 1u - maximum_lowered.value().len != 9361u ||
         maximum_lowered.value().data[maximum_lowered.value().len] != '\0' ||
         !validate_max_proxy_prefix_generated_source(
             std::string(maximum_lowered.value().data, maximum_lowered.value().len),
@@ -48155,7 +48158,7 @@ static bool run_wildcard_max_no_uri_prefix_self_checks(std::string& error) {
             false,
             kWildcardMaxProxyPrefixNoUriProfile)) {
         if (error.empty())
-            error = "#357 genuine maximum wildcard endpoints lost 3417/8750/5333/5332 evidence";
+            error = "#357 genuine maximum wildcard endpoints lost 3417/12779/9362/9361 evidence";
         return false;
     }
 
@@ -52651,9 +52654,9 @@ static bool run_pinned_request_length_oracle(TempDir& temp,
                       "--name",
                       container_name,
                       "-v",
-                      temp.nginx_config + ":/etc/nginx/nginx.conf:ro",
+                      temp.nginx_config + ":/etc/nginx/nginx.conf:ro,z",
                       "-v",
-                      std::string(temp.path) + ":" + temp.path,
+                      std::string(temp.path) + ":" + temp.path + ":z",
                       kNginxImage,
                       "nginx",
                       "-g",
@@ -52860,9 +52863,9 @@ static bool run_pinned_request_length_split_header_oracle(TempDir& temp,
                       "--name",
                       container_name,
                       "-v",
-                      temp.nginx_config + ":/etc/nginx/nginx.conf:ro",
+                      temp.nginx_config + ":/etc/nginx/nginx.conf:ro,z",
                       "-v",
-                      std::string(temp.path) + ":" + temp.path,
+                      std::string(temp.path) + ":" + temp.path + ":z",
                       kNginxImage,
                       "nginx",
                       "-g",
@@ -53445,12 +53448,12 @@ static bool run_pinned_retained_header_whitespace_oracle(
                                             "--name",
                                             container_name,
                                             "-v",
-                                            temp.nginx_config + ":/etc/nginx/nginx.conf:ro",
+                                            temp.nginx_config + ":/etc/nginx/nginx.conf:ro,z",
                                             "-v",
-                                            std::string(temp.path) + ":" + temp.path};
+                                            std::string(temp.path) + ":" + temp.path + ":z"};
     if (special_monitor) {
         docker_args.emplace_back("-v");
-        docker_args.emplace_back(std::string(temp.path) + ":/var/log/nginx");
+        docker_args.emplace_back(std::string(temp.path) + ":/var/log/nginx" + ":z");
     }
     docker_args.insert(docker_args.end(), {kNginxImage, "nginx", "-g", "daemon off;"});
     if (!handoff_held_loopback_port(&reservations.fds[0], frontend_port, kDiagnostic, error) ||
@@ -53938,9 +53941,9 @@ static bool run_pinned_request_length_fixed_body_oracle_impl(TempDir& temp,
                       "--name",
                       container_name,
                       "-v",
-                      temp.nginx_config + ":/etc/nginx/nginx.conf:ro",
+                      temp.nginx_config + ":/etc/nginx/nginx.conf:ro,z",
                       "-v",
-                      std::string(temp.path) + ":" + temp.path,
+                      std::string(temp.path) + ":" + temp.path + ":z",
                       kNginxImage,
                       "nginx",
                       "-g",
@@ -57092,7 +57095,7 @@ static bool validate_proxy_hide_header_generated_source(const std::string& sourc
     const u32 forwards = count_text(source, "return forward(nginx_upstream");
     if (source.empty() || source.size() != 5366u || source.find('\0') != std::string::npos ||
         source.size() + 1u > rut::nginx::RutSource::kCapacity ||
-        rut::nginx::RutSource::kCapacity - source.size() - 1u != 3383u ||
+        rut::nginx::RutSource::kCapacity - source.size() - 1u != 7412u ||
         count_text(source, listener) != 1u || count_text(source, upstream) != 1u || routes != 3u ||
         forwards != 3u || count_text(source, "route HEAD \"/\" {") != 1u ||
         count_text(source, "route GET \"/\" {") != 1u ||
@@ -63136,7 +63139,7 @@ static bool run_converter_default_buffering_positive_get_differential(
                       "--name",
                       container_name,
                       "-v",
-                      std::string(temps[0].path) + ":" + temps[0].path,
+                      std::string(temps[0].path) + ":" + temps[0].path + ":z",
                       kNginxImage,
                       "nginx",
                       "-c",
@@ -63537,7 +63540,7 @@ static bool run_converter_default_buffering_incomplete_clean_eof_differential(
                       "--name",
                       container_name,
                       "-v",
-                      std::string(temps[0].path) + ":" + temps[0].path,
+                      std::string(temps[0].path) + ":" + temps[0].path + ":z",
                       kNginxImage,
                       "nginx",
                       "-c",
@@ -64064,7 +64067,7 @@ static bool run_converter_default_buffering_incomplete_body_inactivity_expiry_di
                       "--name",
                       container_name,
                       "-v",
-                      std::string(temps[0].path) + ":" + temps[0].path,
+                      std::string(temps[0].path) + ":" + temps[0].path + ":z",
                       kNginxImage,
                       "nginx",
                       "-c",
@@ -64577,7 +64580,7 @@ static bool run_converter_default_buffering_incomplete_body_inactivity_expiry_st
                       "--name",
                       container_name,
                       "-v",
-                      std::string(temps[0].path) + ":" + temps[0].path,
+                      std::string(temps[0].path) + ":" + temps[0].path + ":z",
                       kNginxImage,
                       "nginx",
                       "-c",
@@ -65116,7 +65119,7 @@ static bool run_pinned_nginx_default_buffering_201_incomplete_body_inactivity_ex
                       "--name",
                       container_name,
                       "-v",
-                      std::string(temp.path) + ":" + temp.path,
+                      std::string(temp.path) + ":" + temp.path + ":z",
                       kNginxImage,
                       "nginx",
                       "-c",
@@ -66846,7 +66849,7 @@ static bool run_pinned_nginx_explicit_buffering_off_oracle(TempDir& temp,
                       "--name",
                       container_name,
                       "-v",
-                      std::string(temp.path) + ":" + temp.path,
+                      std::string(temp.path) + ":" + temp.path + ":z",
                       kNginxImage,
                       "nginx",
                       "-c",
@@ -67386,7 +67389,7 @@ static bool run_pinned_nginx_default_buffering_202_incomplete_body_inactivity_ex
                       "--name",
                       container_name,
                       "-v",
-                      std::string(temp.path) + ":" + temp.path,
+                      std::string(temp.path) + ":" + temp.path + ":z",
                       kNginxImage,
                       "nginx",
                       "-c",
@@ -67739,7 +67742,7 @@ static bool run_pinned_nginx_default_buffering_304_content_length_metadata_oracl
                       "--name",
                       container_name,
                       "-v",
-                      std::string(temp.path) + ":" + temp.path,
+                      std::string(temp.path) + ":" + temp.path + ":z",
                       kNginxImage,
                       "nginx",
                       "-c",
@@ -68060,7 +68063,7 @@ static bool run_pinned_nginx_default_buffering_206_range_completion_oracle(
                       "--name",
                       container_name,
                       "-v",
-                      std::string(temp.path) + ":" + temp.path,
+                      std::string(temp.path) + ":" + temp.path + ":z",
                       kNginxImage,
                       "nginx",
                       "-c",
@@ -68420,7 +68423,7 @@ static bool run_pinned_nginx_default_buffering_206_range_delayed_completion_orac
                       "--name",
                       container_name,
                       "-v",
-                      std::string(temp.path) + ":" + temp.path,
+                      std::string(temp.path) + ":" + temp.path + ":z",
                       kNginxImage,
                       "nginx",
                       "-c",
@@ -68915,7 +68918,7 @@ static bool run_pinned_nginx_default_buffering_206_range_three_publication_compl
                       "--name",
                       container_name,
                       "-v",
-                      std::string(temp.path) + ":" + temp.path,
+                      std::string(temp.path) + ":" + temp.path + ":z",
                       kNginxImage,
                       "nginx",
                       "-c",
@@ -69542,7 +69545,7 @@ static bool run_pinned_nginx_default_buffering_206_range_incomplete_clean_eof_or
                       "--name",
                       container_name,
                       "-v",
-                      std::string(temp.path) + ":" + temp.path,
+                      std::string(temp.path) + ":" + temp.path + ":z",
                       kNginxImage,
                       "nginx",
                       "-c",
@@ -70061,7 +70064,7 @@ static bool run_pinned_nginx_default_buffering_206_range_incomplete_body_inactiv
                       "--name",
                       container_name,
                       "-v",
-                      std::string(temp.path) + ":" + temp.path,
+                      std::string(temp.path) + ":" + temp.path + ":z",
                       kNginxImage,
                       "nginx",
                       "-c",
@@ -71308,7 +71311,7 @@ static bool run_converter_default_buffering_206_range_incomplete_body_inactivity
                       "--name",
                       container_name,
                       "-v",
-                      std::string(temps[0].path) + ":" + temps[0].path,
+                      std::string(temps[0].path) + ":" + temps[0].path + ":z",
                       kNginxImage,
                       "nginx",
                       "-c",
@@ -71861,7 +71864,7 @@ static bool run_converter_default_buffering_206_range_incomplete_clean_eof_diffe
                       "--name",
                       container_name,
                       "-v",
-                      std::string(temps[0].path) + ":" + temps[0].path,
+                      std::string(temps[0].path) + ":" + temps[0].path + ":z",
                       kNginxImage,
                       "nginx",
                       "-c",
@@ -72831,7 +72834,7 @@ static bool run_converter_default_buffering_304_content_length_metadata_differen
                       "--name",
                       container_name,
                       "-v",
-                      std::string(temps[0].path) + ":" + temps[0].path,
+                      std::string(temps[0].path) + ":" + temps[0].path + ":z",
                       kNginxImage,
                       "nginx",
                       "-c",
@@ -73414,7 +73417,7 @@ static bool run_converter_default_buffering_206_range_completion_differential(
                       "--name",
                       container_name,
                       "-v",
-                      std::string(temps[0].path) + ":" + temps[0].path,
+                      std::string(temps[0].path) + ":" + temps[0].path + ":z",
                       kNginxImage,
                       "nginx",
                       "-c",
@@ -73990,7 +73993,7 @@ static bool run_converter_default_buffering_206_range_delayed_completion_differe
                       "--name",
                       container_name,
                       "-v",
-                      std::string(temps[0].path) + ":" + temps[0].path,
+                      std::string(temps[0].path) + ":" + temps[0].path + ":z",
                       kNginxImage,
                       "nginx",
                       "-c",
@@ -74825,7 +74828,7 @@ static bool run_converter_default_buffering_206_range_three_publication_completi
                       "--name",
                       container_name,
                       "-v",
-                      std::string(temps[0].path) + ":" + temps[0].path,
+                      std::string(temps[0].path) + ":" + temps[0].path + ":z",
                       kNginxImage,
                       "nginx",
                       "-c",
@@ -76223,7 +76226,7 @@ static bool run_pinned_nginx_custom_hide_timeout_probe(
                                                   "--name",
                                                   container_name,
                                                   "-v",
-                                                  std::string(temp.path) + ":" + temp.path,
+                                                  std::string(temp.path) + ":" + temp.path + ":z",
                                                   kNginxImage,
                                                   "nginx",
                                                   "-c",
@@ -77811,9 +77814,9 @@ static bool run_pinned_nginx_bodyless_head_delayed_completion_oracle(std::string
                       "--name",
                       docker.name,
                       "-v",
-                      std::string(temp.path) + ":" + temp.path,
+                      std::string(temp.path) + ":" + temp.path + ":z",
                       "-v",
-                      temp.nginx_config + ":/etc/nginx/nginx.conf:ro",
+                      temp.nginx_config + ":/etc/nginx/nginx.conf:ro,z",
                       kNginxImage,
                       "nginx",
                       "-g",
@@ -78162,7 +78165,7 @@ static bool run_pinned_nginx_default_buffering_three_publication_oracle_impl(
                       "--name",
                       container_name,
                       "-v",
-                      std::string(temp.path) + ":" + temp.path,
+                      std::string(temp.path) + ":" + temp.path + ":z",
                       kNginxImage,
                       "nginx",
                       "-c",
@@ -78874,7 +78877,7 @@ static bool run_converter_default_buffering_three_publication_differential_impl(
                       "--name",
                       container_name,
                       "-v",
-                      std::string(temps[0].path) + ":" + temps[0].path,
+                      std::string(temps[0].path) + ":" + temps[0].path + ":z",
                       kNginxImage,
                       "nginx",
                       "-c",
@@ -79860,7 +79863,7 @@ static bool run_converter_default_buffering_second_body_progress_refresh_differe
                       "--name",
                       container_name,
                       "-v",
-                      std::string(temps[0].path) + ":" + temps[0].path,
+                      std::string(temps[0].path) + ":" + temps[0].path + ":z",
                       kNginxImage,
                       "nginx",
                       "-c",
@@ -80777,9 +80780,9 @@ static bool run_issue630_head_same_file_pair(const char* rut_path,
                               "--name",
                               docker.name,
                               "-v",
-                              std::string(temp.path) + ":" + temp.path,
+                              std::string(temp.path) + ":" + temp.path + ":z",
                               "-v",
-                              temp.nginx_config + ":/etc/nginx/nginx.conf:ro",
+                              temp.nginx_config + ":/etc/nginx/nginx.conf:ro,z",
                               kNginxImage,
                               "nginx",
                               "-g",
@@ -85179,7 +85182,7 @@ int main(int argc, char** argv) {
                "with zero extra upstream. Generated source ownership, zero target transforms "
                "through public RIR/config, scoped access and clean lifecycle passed. Runtime "
                "source size was derived from actual port widths; genuine maximum ports/IP is "
-               "3426 bytes with 5324 bytes capacity delta and 5323 bytes payload headroom "
+               "3426 bytes with 9353 bytes capacity delta and 9352 bytes payload headroom "
                "before NUL (#356 boundary "
                "only; representative both-order behavior is separately proven; wildcard "
                "no-URI, configured URI/query, normalization-sensitive/absolute-form targets, "
@@ -85216,8 +85219,8 @@ int main(int argc, char** argv) {
                "binding, owned policies and zero transforms through source/intermediate teardown "
                "and post-readiness source overwrite. All three wildcard nginx spellings and both "
                "orders were preflight-proven byte-identical at P63; only port-only listen-first "
-               "behavior ran here. Maximum endpoints emit 3417 bytes with 5333 capacity delta "
-               "and 5332 payload headroom before NUL; P64 is only the declared converter "
+               "behavior ran here. Maximum endpoints emit 3417 bytes with 9362 capacity delta "
+               "and 9361 payload headroom before NUL; P64 is only the declared converter "
                "support-boundary rejection (#357 remains PARTIAL; nginx.conf was translated, "
                "never loaded by RUT; configured URI/query, normalization-sensitive/absolute "
                "targets, broader methods/bodies/framing/reuse/failures/H1.0/H2/TLS and "
@@ -86205,7 +86208,7 @@ int main(int argc, char** argv) {
                "X-Dupe fields, with no fifth/retry, and six ordered original raw-target access "
                "records under its current runtime-specific schema. The generated orders retain "
                "exact 3337-byte canonical 8080/9000 source "
-               "with 5412 bytes headroom, one owned /api/ + /v1/? RouteConfig transform after "
+               "with 9441 bytes headroom, one owned /api/ + /v1/? RouteConfig transform after "
                "source/RIR/compiler teardown, post-load source overwrite, disjoint resources "
                "and clean lifecycle (#360 bounded converter equivalence only; excludes /? "
                "profile, exact-listener allowlists, variables, quoted/escaped/repeated-query, "
@@ -86239,7 +86242,7 @@ int main(int argc, char** argv) {
         std::cerr
             << "PASS: #372 exact /api/ with proxy_pass replacement /? in both declaration "
                "orders traversed the genuine borrowed nginx parser/model and independent "
-               "converter lowering into exact 3343-byte ordinary RUT sources with 5406 bytes "
+               "converter lowering into exact 3343-byte ordinary RUT sources with 9435 bytes "
                "NUL headroom and one owned generic transform ID 1. Two isolated pinned nginx "
                "1.29.7 sides and two public-CLI/O2-JIT/io_uring generated-RUT sides used eight "
                "simultaneously held unique endpoints, with all four generated endpoints P4, "

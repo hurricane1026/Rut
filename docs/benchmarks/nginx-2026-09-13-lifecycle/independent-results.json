@@ -1,0 +1,202 @@
+[
+  {
+    "counts": {
+      "correct_responses": 31104
+    },
+    "examples": [],
+    "scenario": "static-close",
+    "engine": "nginx",
+    "prior_wrk": {
+      "requests": 91531,
+      "seconds": 2.100451,
+      "rps": 43576.83183278258,
+      "p50_us": 299.0,
+      "p95_us": 585.0,
+      "p99_us": 703.0,
+      "errors": {
+        "connect": 0,
+        "read": 0,
+        "write": 0,
+        "status": 0,
+        "timeout": 0
+      },
+      "client_cpu_seconds": 2.27
+    },
+    "valid": true
+  },
+  {
+    "counts": {
+      "correct_responses": 31712
+    },
+    "examples": [],
+    "scenario": "static-close",
+    "engine": "rut",
+    "prior_wrk": {
+      "requests": 32678,
+      "seconds": 2.019141,
+      "rps": 16184.109975479672,
+      "p50_us": 1078.0,
+      "p95_us": 4831.0,
+      "p99_us": 7824.0,
+      "errors": {
+        "connect": 0,
+        "read": 0,
+        "write": 0,
+        "status": 0,
+        "timeout": 0
+      },
+      "client_cpu_seconds": 2.6999999999999997
+    },
+    "valid": true
+  },
+  {
+    "counts": {
+      "correct_responses": 155893
+    },
+    "examples": [],
+    "scenario": "static-keepalive",
+    "engine": "nginx",
+    "prior_wrk": {
+      "requests": 280257,
+      "seconds": 2.099809,
+      "rps": 133467.85350477113,
+      "p50_us": 232.0,
+      "p95_us": 282.0,
+      "p99_us": 390.0,
+      "errors": {
+        "connect": 0,
+        "read": 0,
+        "write": 0,
+        "status": 0,
+        "timeout": 0
+      },
+      "client_cpu_seconds": 1.68
+    },
+    "valid": true
+  },
+  {
+    "counts": {
+      "correct_responses": 157962
+    },
+    "examples": [],
+    "scenario": "static-keepalive",
+    "engine": "rut",
+    "prior_wrk": {
+      "requests": 264145,
+      "seconds": 2.100119,
+      "rps": 125776.2060149925,
+      "p50_us": 246.0,
+      "p95_us": 296.0,
+      "p99_us": 377.0,
+      "errors": {
+        "connect": 0,
+        "read": 0,
+        "write": 0,
+        "status": 0,
+        "timeout": 0
+      },
+      "client_cpu_seconds": 1.19
+    },
+    "valid": true
+  },
+  {
+    "counts": {
+      "correct_responses": 27559
+    },
+    "examples": [],
+    "scenario": "proxy-close",
+    "engine": "nginx",
+    "prior_wrk": {
+      "requests": 26451,
+      "seconds": 2.000361,
+      "rps": 13223.113228062335,
+      "p50_us": 2324.0,
+      "p95_us": 2613.0,
+      "p99_us": 3017.0,
+      "errors": {
+        "connect": 0,
+        "read": 0,
+        "write": 0,
+        "status": 0,
+        "timeout": 0
+      },
+      "client_cpu_seconds": 0.86
+    },
+    "valid": true
+  },
+  {
+    "counts": {
+      "correct_responses": 26646
+    },
+    "examples": [],
+    "scenario": "proxy-close",
+    "engine": "rut",
+    "prior_wrk": {
+      "requests": 18336,
+      "seconds": 2.000487,
+      "rps": 9165.768135459015,
+      "p50_us": 3334.0,
+      "p95_us": 3694.0,
+      "p99_us": 6743.0,
+      "errors": {
+        "connect": 0,
+        "read": 0,
+        "write": 0,
+        "status": 0,
+        "timeout": 0
+      },
+      "client_cpu_seconds": 0.48000000000000004
+    },
+    "valid": true
+  },
+  {
+    "counts": {
+      "correct_responses": 80554
+    },
+    "examples": [],
+    "scenario": "proxy-keepalive",
+    "engine": "nginx",
+    "prior_wrk": {
+      "requests": 34537,
+      "seconds": 2.100133,
+      "rps": 16445.148950090304,
+      "p50_us": 1898.0,
+      "p95_us": 2092.0,
+      "p99_us": 2648.0,
+      "errors": {
+        "connect": 0,
+        "read": 0,
+        "write": 0,
+        "status": 0,
+        "timeout": 0
+      },
+      "client_cpu_seconds": 0.25
+    },
+    "valid": true
+  },
+  {
+    "counts": {
+      "correct_responses": 59680
+    },
+    "examples": [],
+    "scenario": "proxy-keepalive",
+    "engine": "rut",
+    "prior_wrk": {
+      "requests": 24848,
+      "seconds": 2.001083,
+      "rps": 12417.276045021621,
+      "p50_us": 2520.0,
+      "p95_us": 2746.0,
+      "p99_us": 4258.0,
+      "errors": {
+        "connect": 0,
+        "read": 0,
+        "write": 0,
+        "status": 0,
+        "timeout": 0
+      },
+      "client_cpu_seconds": 0.19999999999999998
+    },
+    "valid": true
+  }
+]
