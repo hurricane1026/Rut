@@ -1595,6 +1595,11 @@ struct ConnectionBase {
     // Lazy-allocated: only proxy connections pay the cost.
     u8* upstream_recv_slice;
     Buffer upstream_recv_buf;
+    // io_uring plaintext body relay: the second upstream receive slice. While
+    // a client send reads one slice, the next upstream recv fills the other.
+    // Owned like the other slices: freed only once no kernel op references it.
+    u8* upstream_relay_slice;
+    u32 upstream_relay_send_len;  // bytes of upstream_relay_slice in flight; 0 = none
 
     void bind_request_receive_buffer(u8* slice, u32 capacity) {
         clear_raw_request_target_witness();
@@ -1849,6 +1854,8 @@ struct ConnectionBase {
         send_progress = 0;
         upstream_recv_slice = nullptr;
         upstream_recv_buf.bind(nullptr, 0);
+        upstream_relay_slice = nullptr;
+        upstream_relay_send_len = 0;
     }
 };
 
