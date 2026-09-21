@@ -1,6 +1,7 @@
 """Checks for evidence gating and HTTP-close handling; no Docker required."""
 
 import contextlib
+import argparse
 import io
 import json
 import os
@@ -24,6 +25,9 @@ from run import (
     request_bytes,
     response,
     response_head,
+    origin_reuse_records,
+    valid_origin_reuse,
+    validate_proxy_profile,
 )
 from summarize import aggregate, render
 from matrix import assess
@@ -41,6 +45,95 @@ class FakeSocket:
 
 
 class ToolsTest(unittest.TestCase):
+    def test_native_streaming_payload_and_reuse_evidence_reject_corruption(self):
+        wanted = expected_body("proxy", native_streaming=True)
+        self.assertEqual(len(wanted), 256 * 1024)
+        self.assertNotEqual(wanted[:4096], wanted[4096:8192])
+        head = (b"HTTP/1.1 200 OK\r\nContent-Length: 262144\r\n"
+                b"Content-Type: application/octet-stream\r\n\r\n")
+        raw, closed = response(
+            FakeSocket([head, wanted]), "proxy", False,
+            keepalive_header="implicit", native_streaming=True,
+        )
+        self.assertFalse(closed)
+        self.assertTrue(raw.endswith(wanted))
+        with self.assertRaisesRegex(ValueError, "complete body"):
+            response(FakeSocket([head, wanted[:-1]]), "proxy", False,
+                     keepalive_header="implicit", native_streaming=True)
+        reordered = wanted[4096:8192] + wanted[:4096] + wanted[8192:]
+        with self.assertRaisesRegex(ValueError, "unexpected body"):
+            response(FakeSocket([head, reordered]), "proxy", False,
+                     keepalive_header="implicit", native_streaming=True)
+        with self.assertRaisesRegex(ValueError, "bounded Content-Length"):
+            response(FakeSocket([b"HTTP/1.1 200 OK\r\nContent-Length: 262143\r\n"
+                                 b"Content-Type: application/octet-stream\r\n"
+                                 b"Transfer-Encoding: chunked\r\n\r\n", wanted]),
+                     "proxy", False, keepalive_header="implicit", native_streaming=True)
+        with self.assertRaisesRegex(ValueError, "unexpected body"):
+            response(FakeSocket([b"HTTP/1.1 200 OK\r\nContent-Length: 262143\r\n"
+                                 b"Content-Type: application/octet-stream\r\n\r\n", wanted]),
+                     "proxy", False, keepalive_header="implicit", native_streaming=True)
+        with self.assertRaisesRegex(ValueError, "Content-Type"):
+            response(FakeSocket([b"HTTP/1.1 200 OK\r\nContent-Length: 262144\r\n"
+                                 b"Content-Type: text/plain\r\n\r\n", wanted]),
+                     "proxy", False, keepalive_header="implicit", native_streaming=True)
+        for duplicated in (
+            b"HTTP/1.1 200 OK\r\nContent-Length: 262144\r\nContent-Length: 262144\r\n"
+            b"Content-Type: application/octet-stream\r\n\r\n",
+            b"HTTP/1.1 200 OK\r\nContent-Length: 262144\r\n"
+            b"Content-Type: application/octet-stream\r\nContent-Type: application/octet-stream\r\n\r\n",
+        ):
+            with self.subTest(duplicated=duplicated), self.assertRaisesRegex(ValueError, "duplicate header"):
+                response(FakeSocket([duplicated, wanted]), "proxy", False,
+                         keepalive_header="implicit", native_streaming=True)
+        with self.assertRaisesRegex(ValueError, "keepalive semantics"):
+            response(FakeSocket([b"HTTP/1.1 200 OK\r\nContent-Length: 262144\r\n"
+                                 b"Content-Type: application/octet-stream\r\n"
+                                 b"Connection: close\r\n\r\n", wanted]),
+                     "proxy", False, keepalive_header="implicit", native_streaming=True)
+
+        markers = [f"sample-r1-nginx-keepalive-{n}" for n in range(3)]
+        complete = "\n".join(
+            f"marker={marker_prefix} connection=91 requests={i + 8}"
+            for i, marker_prefix in enumerate(markers)
+        )
+        rows = origin_reuse_records(complete, markers)
+        self.assertEqual(len(rows), 3)
+        self.assertEqual(len({row[1] for row in rows}), 1)
+        self.assertTrue(valid_origin_reuse(rows, markers))
+        reconnect = complete.replace("connection=91 requests=9", "connection=92 requests=1")
+        self.assertFalse(valid_origin_reuse(origin_reuse_records(reconnect, markers), markers))
+        out_of_order = complete.replace("requests=9", "requests=11").replace("requests=10", "requests=9")
+        self.assertFalse(valid_origin_reuse(origin_reuse_records(out_of_order, markers), markers))
+        missing = "\n".join(complete.splitlines()[:-1])
+        self.assertFalse(valid_origin_reuse(origin_reuse_records(missing, markers), markers))
+
+    def test_native_streaming_profile_rejects_unsupported_matrix_shapes(self):
+        parser = argparse.ArgumentParser()
+        baseline = dict(proxy_profile="native-streaming", body_size=None,
+                        scenarios=["proxy-keepalive"], concurrency=[1, 32],
+                        keepalive_header="implicit")
+        args = SimpleNamespace(**baseline)
+        validate_proxy_profile(parser, args)
+        self.assertEqual(args.body_size, 256 * 1024)
+        single = SimpleNamespace(**(baseline | {"concurrency": [32]}))
+        validate_proxy_profile(parser, single)
+        self.assertEqual(single.body_size, 256 * 1024)
+        for key, value in (("scenarios", ["proxy-close"]),
+                           ("concurrency", [8]),
+                           ("concurrency", []),
+                           ("body_size", 65536),
+                           ("keepalive_header", "explicit")):
+            with self.subTest(key=key), self.assertRaises(SystemExit):
+                validate_proxy_profile(parser, SimpleNamespace(**(baseline | {key: value})))
+
+    def test_default_proxy_profile_leaves_arguments_unchanged(self):
+        args = SimpleNamespace(proxy_profile="converter-strict", body_size=None,
+                               scenarios=["proxy-close"], concurrency=[1],
+                               keepalive_header="explicit")
+        validate_proxy_profile(argparse.ArgumentParser(), args)
+        self.assertIsNone(args.body_size)
+
     def test_matrix_keeps_valid_groups_only_after_completed_child(self):
         cases = (
             # One failed concurrency must not erase its valid siblings.
