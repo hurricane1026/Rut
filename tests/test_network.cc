@@ -6104,6 +6104,35 @@ struct ScopedTlsRawSendLoop {
     }
 };
 
+struct ScopedTlsRawSendPool {
+    IoUringEventLoop* loop = nullptr;
+    bool initialized = false;
+
+    bool init(IoUringEventLoop& event_loop, u32 capacity) {
+        loop = &event_loop;
+        initialized = loop->pool.init(capacity).has_value();
+        return initialized;
+    }
+
+    ~ScopedTlsRawSendPool() {
+        if (!initialized || loop == nullptr) return;
+        for (u32 i = 0; i < loop->connection_capacity; ++i) {
+            Connection& conn = loop->conns[i];
+            if (conn.tls_engine.ssl) tls_engine_free(conn.tls_engine);
+            loop->free_tls_in_buf(conn);
+            loop->free_tls_out_buf(conn);
+            if (conn.recv_slice) loop->pool.free(conn.recv_slice);
+            if (conn.send_slice) loop->pool.free(conn.send_slice);
+            if (conn.upstream_recv_slice) loop->pool.free(conn.upstream_recv_slice);
+            if (conn.response_header_slice) loop->pool.free(conn.response_header_slice);
+            if (conn.fd >= 0) ::close(conn.fd);
+            if (conn.upstream_fd >= 0) ::close(conn.upstream_fd);
+            conn.reset();
+        }
+        loop->pool.destroy();
+    }
+};
+
 struct TlsMemoryClientPeer {
     SSL_CTX* ctx = nullptr;
     SSL* ssl = nullptr;
@@ -6376,6 +6405,100 @@ TEST(connection_base, tls_send_owners_reset_and_share_nonwrapping_tokens) {
     CHECK_EQ(untouched, 77u);
     CHECK_FALSE(conn.next_response_read_deadline_send_generation());
     CHECK_EQ(conn.response_read_deadline_send_owner_generation, 0u);
+}
+
+TEST(tls_iouring, staged_502_uses_one_shot_ciphertext_submit_and_terminal_completion) {
+    auto context_result = create_tls_server_context(RUT_TESTDATA_DIR "/localhost_cert.pem",
+                                                    RUT_TESTDATA_DIR "/localhost_key.pem");
+    REQUIRE(context_result.has_value());
+    std::unique_ptr<TlsServerContext, decltype(&destroy_tls_server_context)> context(
+        context_result.value(), destroy_tls_server_context);
+    ScopedTlsRawSendLoop guard;
+    REQUIRE(guard.init(/*capacity=*/2));
+    IoUringEventLoop& loop = *guard.loop;
+    ScopedTlsRawSendPool pool_guard;
+    REQUIRE(pool_guard.init(loop, /*capacity=*/12));
+    loop.tls_server = context.get();
+    ShardMetrics metrics{};
+    metrics.init();
+    loop.metrics = &metrics;
+    static constexpr u8 kResponse[] =
+        "HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+
+    auto prepare = [&](TlsMemoryClientPeer& client) -> Connection* {
+        Connection* conn = loop.alloc_conn();
+        if (conn == nullptr) return nullptr;
+        conn->fd = dup(STDERR_FILENO);
+        if (conn->fd < 0 || !loop.tls_setup(*conn) || !client.init() ||
+            !tls_engine_handshake_with_memory_client(conn->tls_engine, client.ssl) ||
+            !loop.alloc_response_header_buf(*conn) ||
+            conn->response_header_buf.write(kResponse, sizeof(kResponse) - 1u) !=
+                sizeof(kResponse) - 1u)
+            return nullptr;
+        conn->tls_handshake_complete = true;
+        conn->protocol = ConnProtocol::Http11;
+        conn->req_start_us = monotonic_us();
+        conn->resp_status = kStatusBadGateway;
+        conn->resp_body_mode = BodyMode::None;
+        conn->resp_body_remaining = 0;
+        conn->keep_alive = false;
+        conn->upstream_fd = -1;
+        conn->upstream_abandoned = true;
+        conn->transition_to_sending(&on_validated_preconnect_failure_sent<IoUringEventLoop>);
+        return conn;
+    };
+
+    TlsMemoryClientPeer successful_client;
+    Connection* successful = prepare(successful_client);
+    REQUIRE(successful != nullptr);
+    const u32 conn_id = successful->id;
+    const u32 tail_before = guard.sq_tail;
+    REQUIRE(loop.submit_staged_local_response(*successful,
+                                              successful->response_header_buf.data(),
+                                              successful->response_header_buf.len()));
+    REQUIRE(successful->tls_send_owner_generation != 0);
+    REQUIRE(successful->tls_out_inflight);
+    CHECK_EQ(successful->pending_ops, 1u);
+    CHECK_EQ(guard.sq_tail, tail_before + 1u);
+    CHECK_EQ(loop.backend.pending, 1u);
+    CHECK_EQ(successful->tls_pending_on_send,
+             &on_validated_preconnect_failure_sent<IoUringEventLoop>);
+    const u32 raw_generation = successful->tls_out_inflight_generation;
+    const u32 cipher_len = successful->tls_out_inflight_len;
+    REQUIRE_GT(cipher_len, 0u);
+    loop.backend.send_state[conn_id].offset = cipher_len;
+    loop.backend.send_state[conn_id].remaining = 0;
+    guard.sq_head = guard.sq_tail;
+    loop.backend.pending = 0;
+    CHECK_EQ(metrics.requests_total, 0u);
+    loop.dispatch(tls_send_event(conn_id, static_cast<i32>(cipher_len), raw_generation));
+    CHECK_EQ(successful->fd, -1);
+    CHECK_EQ(successful->pending_ops, 0u);
+    CHECK_EQ(loop.free_top, 2u);
+    CHECK_EQ(metrics.requests_total, 1u);
+    loop.dispatch(tls_send_event(conn_id, static_cast<i32>(cipher_len), raw_generation));
+    CHECK_EQ(metrics.requests_total, 1u);
+    CHECK_EQ(loop.free_top, 2u);
+
+    TlsMemoryClientPeer full_client;
+    Connection* full = prepare(full_client);
+    REQUIRE(full != nullptr);
+    const u32 full_id = full->id;
+    guard.sq_head = 0;
+    guard.sq_tail = loop.backend.sq_ring_entries;
+    loop.backend.pending = loop.backend.sq_ring_entries;
+    const u32 full_tail = guard.sq_tail;
+    CHECK_FALSE(loop.submit_staged_local_response(
+        *full, full->response_header_buf.data(), full->response_header_buf.len()));
+    // SSL_write consumed the response, so SQ pressure is terminal: no flush,
+    // second attempt, raw target, or retained slot may follow.
+    CHECK_EQ(full->fd, -1);
+    CHECK_EQ(full->pending_ops, 0u);
+    CHECK_EQ(guard.sq_tail, full_tail);
+    CHECK_EQ(loop.backend.pending, loop.backend.sq_ring_entries);
+    CHECK_EQ(metrics.requests_total, 1u);
+    CHECK_EQ(loop.free_top, 2u);
+    CHECK_EQ(loop.conns[full_id].fd, -1);
 }
 
 TEST(tls_iouring, strict_completion_validator_authenticates_tls_logical_tombstones) {
@@ -31738,14 +31861,15 @@ bool add_bodyless_non_head_response_read_deadline_bundle(RouteConfig& config,
                                                          u8 seconds,
                                                          ForwardResponseBufferingMode buffering);
 
-bool stage_live_precise_request(
-    IoUringEventLoop* loop,
-    RouteConfig& config,
-    PrebuiltD2Fixture* out,
-    bool bodyless_get,
-    bool downstream_close,
-    bool force_initial_timer_sq_full,
-    RequestPolicyId request_policy = RequestPolicyId::Http11FixedStrip) {
+bool stage_live_precise_request(IoUringEventLoop* loop,
+                                RouteConfig& config,
+                                PrebuiltD2Fixture* out,
+                                bool bodyless_get,
+                                bool downstream_close,
+                                bool force_initial_timer_sq_full,
+                                RequestPolicyId request_policy = RequestPolicyId::Http11FixedStrip,
+                                TlsMemoryClientPeer* tls_client = nullptr,
+                                TlsServerContext* tls_server = nullptr) {
     if (loop == nullptr || out == nullptr ||
         !config.add_upstream("backend", 0x7F000001, 9000).has_value() ||
         !(bodyless_get ? add_bodyless_non_head_response_read_deadline_bundle(
@@ -31894,6 +32018,19 @@ bool stage_live_precise_request(
         if (captured_wire != expected_wire)
             return fail_with_diagnostics("upstream-wire-before-consumption");
     }
+    // The TLS 504 bridge is intentionally staged after the plain request and
+    // preflight proofs have been established. Attach a real TLS engine only
+    // after the upstream request is validated, immediately before its send
+    // completion arms the deadline; this does not exercise TLS ingress/JIT
+    // admission, which remains outside this internal bridge test.
+    if (tls_client != nullptr || tls_server != nullptr) {
+        if (tls_client == nullptr || tls_server == nullptr) return fail();
+        loop->tls_server = tls_server;
+        if (!loop->tls_setup(*conn) ||
+            !tls_engine_handshake_with_memory_client(conn->tls_engine, tls_client->ssl))
+            return fail();
+        conn->tls_handshake_complete = true;
+    }
     send.offset = sent_len;
     send.remaining = 0;
     const u32 tail_before_send = __atomic_load_n(loop->backend.sq_tail, __ATOMIC_ACQUIRE);
@@ -31951,9 +32088,298 @@ bool stage_live_precise_get(IoUringEventLoop* loop,
                             PrebuiltD2Fixture* out,
                             bool force_initial_timer_sq_full = false,
                             bool downstream_close = false,
-                            RequestPolicyId request_policy = RequestPolicyId::Http11FixedStrip) {
-    return stage_live_precise_request(
-        loop, config, out, true, downstream_close, force_initial_timer_sq_full, request_policy);
+                            RequestPolicyId request_policy = RequestPolicyId::Http11FixedStrip,
+                            TlsMemoryClientPeer* tls_client = nullptr,
+                            TlsServerContext* tls_server = nullptr) {
+    return stage_live_precise_request(loop,
+                                      config,
+                                      out,
+                                      true,
+                                      downstream_close,
+                                      force_initial_timer_sq_full,
+                                      request_policy,
+                                      tls_client,
+                                      tls_server);
+}
+
+bool stage_tls_precise_get_timeout(IoUringEventLoop* loop,
+                                   RouteConfig& config,
+                                   PrebuiltD2Fixture* fixture,
+                                   TlsMemoryClientPeer* client,
+                                   TlsServerContext* server,
+                                   RequestPolicyId request_policy) {
+    if (loop == nullptr || fixture == nullptr || client == nullptr || server == nullptr ||
+        !stage_live_precise_get(
+            loop, config, fixture, false, false, request_policy, client, server))
+        return false;
+    Connection& conn = *fixture->conn;
+    if (!conn.response_read_timer_owner_is_valid() ||
+        conn.response_read_deadline_state != ResponseReadDeadlineState::Armed)
+        return false;
+
+    // The fake ring stages real timer/Recv SQEs but does not submit them. Mark
+    // them as submitted, then consume the exact timer target to model the
+    // natural -ETIME batch result that sets ExpiryPending in production.
+    loop->backend.pending = 0;
+    __atomic_store_n(loop->backend.sq_head,
+                     __atomic_load_n(loop->backend.sq_tail, __ATOMIC_ACQUIRE),
+                     __ATOMIC_RELEASE);
+    const u32 timer_generation = conn.response_read_timer_owner_generation;
+    if (!conn.consume_response_read_timer_completion(timer_generation)) return false;
+    conn.response_read_deadline_state = ResponseReadDeadlineState::ExpiryPending;
+    return try_prebuilt_strict_read_timeout(loop, conn);
+}
+
+void complete_staged_tls_prebuilt_send(ScopedTlsRawSendLoop& guard,
+                                       Connection& conn,
+                                       u32 raw_generation,
+                                       u32 cipher_len) {
+    guard.loop->backend.send_state[conn.id].offset = cipher_len;
+    guard.loop->backend.send_state[conn.id].remaining = 0;
+    guard.sq_head = guard.sq_tail;
+    guard.loop->backend.pending = 0;
+    guard.loop->dispatch(tls_send_event(conn.id, static_cast<i32>(cipher_len), raw_generation));
+}
+
+void drain_staged_tls_prebuilt_retirement(IoUringEventLoop* loop,
+                                          Connection& conn,
+                                          bool cancel_first) {
+    const u32 episode = conn.upstream_retiring_episode;
+    const IoEvent target{conn.id, -ECANCELED, 0, 0, IoEventType::UpstreamRecv, 0, 0, episode};
+    const IoEvent cancel{conn.id,
+                         -ENOENT,
+                         0,
+                         0,
+                         IoEventType::UpstreamRecv,
+                         0,
+                         kUpstreamRetirementCancelAux,
+                         episode};
+    loop->dispatch(cancel_first ? cancel : target);
+    loop->dispatch(cancel_first ? target : cancel);
+}
+
+TEST(tls_iouring, strict_bodyless_get_504_bridges_tls_send_and_retirement_in_both_orders) {
+    auto context_result = create_tls_server_context(RUT_TESTDATA_DIR "/localhost_cert.pem",
+                                                    RUT_TESTDATA_DIR "/localhost_key.pem");
+    REQUIRE(context_result.has_value());
+    std::unique_ptr<TlsServerContext, decltype(&destroy_tls_server_context)> context(
+        context_result.value(), destroy_tls_server_context);
+
+    for (const RequestPolicyId policy :
+         {RequestPolicyId::Http11FixedStrip, RequestPolicyId::Http11FixedTrimSpPreserveHtab}) {
+        for (const bool retirement_first : {false, true}) {
+            ScopedTlsRawSendLoop guard;
+            REQUIRE(guard.init(/*capacity=*/2));
+            IoUringEventLoop& loop = *guard.loop;
+            ScopedTlsRawSendPool pool_guard;
+            REQUIRE(pool_guard.init(loop, /*capacity=*/12));
+            ShardMetrics metrics{};
+            metrics.init();
+            loop.metrics = &metrics;
+
+            RouteConfig config{};
+            TlsMemoryClientPeer client;
+            REQUIRE(client.init());
+            PrebuiltD2Fixture fixture{};
+            REQUIRE(stage_tls_precise_get_timeout(
+                &loop, config, &fixture, &client, context.get(), policy));
+            Connection& conn = *fixture.conn;
+            REQUIRE(conn.tls_active);
+            REQUIRE(conn.tls_engine.handshake_done);
+            REQUIRE_EQ(conn.request_policy_id, static_cast<u16>(policy));
+            REQUIRE_EQ(conn.http1_prebuilt_response_layout,
+                       Http1PrebuiltResponseLayout::FullContentLengthNonHead);
+            REQUIRE_EQ(conn.http1_prebuilt_response_purpose,
+                       Http1PrebuiltResponsePurpose::ResponseReadTimeout);
+            REQUIRE_EQ(conn.http1_prebuilt_deadline_profile,
+                       ResponseReadDeadlineProfile::BodylessNonHeadContentLengthZero);
+            REQUIRE_EQ(config.policy_bundles[1].response_buffering,
+                       ForwardResponseBufferingMode::CompleteContentLength);
+            REQUIRE_EQ(conn.response_read_deadline_post_commit_phase,
+                       ResponseReadDeadlinePostCommitPhase::None);
+            REQUIRE_EQ(conn.pipeline_depth, 0u);
+            REQUIRE_EQ(conn.http1_pipeline_request_generation, 0u);
+            REQUIRE_EQ(conn.pipeline_stash_len, 0u);
+            REQUIRE(conn.upstream_retirement_active);
+            REQUIRE_EQ(conn.http1_prebuilt_wait,
+                       kHttp1WaitHeaderSend | kHttp1WaitUpstreamRetirement);
+            REQUIRE(conn.tls_send_owner_generation != 0);
+            REQUIRE(conn.tls_out_inflight);
+            REQUIRE_EQ(loop.backend.send_state[conn.id].src, conn.tls_out_buf.data());
+            REQUIRE_EQ(loop.backend.send_state[conn.id].src,
+                       static_cast<const u8*>(conn.tls_out_inflight_src));
+            REQUIRE_EQ(conn.response_read_deadline_send_tombstone_generation, 0u);
+            CHECK_EQ(metrics.requests_total, 0u);
+
+            const u32 conn_id = conn.id;
+            const u32 logical_generation = conn.tls_send_owner_generation;
+            const u32 raw_generation = conn.tls_out_inflight_generation;
+            const u32 cipher_len = conn.tls_out_inflight_len;
+            REQUIRE_GT(cipher_len, 0u);
+            REQUIRE_EQ(conn.tls_out_buf.len(), cipher_len);
+
+            if (retirement_first) {
+                drain_staged_tls_prebuilt_retirement(&loop, conn, /*cancel_first=*/true);
+                REQUIRE_FALSE(conn.upstream_retirement_active);
+                REQUIRE_EQ(conn.http1_prebuilt_wait, kHttp1WaitHeaderSend);
+                REQUIRE_FALSE(conn.http1_boundary_ready);
+            }
+
+            complete_staged_tls_prebuilt_send(guard, conn, raw_generation, cipher_len);
+            REQUIRE_GE(conn.fd, 0);
+            CHECK_EQ(conn.response_read_deadline_send_tombstone_generation, logical_generation);
+            CHECK_FALSE(conn.response_read_deadline_send_owner_active);
+            CHECK(IoUringEventLoop::response_read_deadline_send_fields_are_neutral(conn));
+            CHECK_EQ(metrics.requests_total, 1u);
+            CHECK_EQ(conn.req_start_us, 0u);
+            CHECK_EQ(conn.tls_out_buf.len(), 0u);
+
+            if (retirement_first) {
+                CHECK_EQ(conn.http1_prebuilt_wait, 0u);
+                CHECK(conn.http1_boundary_ready);
+            } else {
+                REQUIRE_EQ(conn.http1_prebuilt_wait, kHttp1WaitUpstreamRetirement);
+                CHECK(conn.http1_boundary_deferred);
+                CHECK_FALSE(conn.http1_boundary_ready);
+                drain_staged_tls_prebuilt_retirement(&loop, conn, /*cancel_first=*/false);
+                CHECK_EQ(conn.http1_prebuilt_wait, 0u);
+                CHECK(conn.http1_boundary_ready);
+            }
+
+            // A duplicate raw completion cannot account the logical request a
+            // second time after the T0 transport owner has been tombstoned.
+            loop.dispatch(tls_send_event(conn_id, static_cast<i32>(cipher_len), raw_generation));
+            CHECK_EQ(metrics.requests_total, 1u);
+            CHECK_GE(conn.fd, 0);
+            cleanup_prebuilt_d2(&loop, fixture);
+        }
+    }
+}
+
+TEST(tls_iouring, strict_bodyless_get_504_rejects_wrong_token_and_timeout_proof) {
+    auto context_result = create_tls_server_context(RUT_TESTDATA_DIR "/localhost_cert.pem",
+                                                    RUT_TESTDATA_DIR "/localhost_key.pem");
+    REQUIRE(context_result.has_value());
+    std::unique_ptr<TlsServerContext, decltype(&destroy_tls_server_context)> context(
+        context_result.value(), destroy_tls_server_context);
+    enum class Corruption : u8 {
+        LogicalToken,
+        Layout,
+        Buffering,
+        RequestPolicy,
+        WrongPurpose,
+        WrongSuccessor,
+        WrongWait,
+        WrongDisposition,
+        WrongRequestPrefix,
+        DeferredBoundary,
+        ReadyBoundary,
+        WrongWitnessSource,
+        WrongFrameLength,
+        PipelineDepth,
+        PipelineGeneration,
+    };
+    for (const Corruption corruption : {Corruption::LogicalToken,
+                                        Corruption::Layout,
+                                        Corruption::Buffering,
+                                        Corruption::RequestPolicy,
+                                        Corruption::WrongPurpose,
+                                        Corruption::WrongSuccessor,
+                                        Corruption::WrongWait,
+                                        Corruption::WrongDisposition,
+                                        Corruption::WrongRequestPrefix,
+                                        Corruption::DeferredBoundary,
+                                        Corruption::ReadyBoundary,
+                                        Corruption::WrongWitnessSource,
+                                        Corruption::WrongFrameLength,
+                                        Corruption::PipelineDepth,
+                                        Corruption::PipelineGeneration}) {
+        ScopedTlsRawSendLoop guard;
+        REQUIRE(guard.init(/*capacity=*/2));
+        IoUringEventLoop& loop = *guard.loop;
+        ScopedTlsRawSendPool pool_guard;
+        REQUIRE(pool_guard.init(loop, /*capacity=*/12));
+        ShardMetrics metrics{};
+        metrics.init();
+        loop.metrics = &metrics;
+
+        RouteConfig config{};
+        TlsMemoryClientPeer client;
+        REQUIRE(client.init());
+        PrebuiltD2Fixture fixture{};
+        REQUIRE(stage_tls_precise_get_timeout(
+            &loop, config, &fixture, &client, context.get(), RequestPolicyId::Http11FixedStrip));
+        Connection& conn = *fixture.conn;
+        const u32 raw_generation = conn.tls_out_inflight_generation;
+        const u32 logical_generation = conn.tls_send_owner_generation;
+        const u32 cipher_len = conn.tls_out_inflight_len;
+        REQUIRE_GT(cipher_len, 0u);
+        REQUIRE_EQ(conn.tls_pending_on_send, &on_prebuilt_http1_header_sent<IoUringEventLoop>);
+        switch (corruption) {
+            case Corruption::LogicalToken:
+                conn.response_read_deadline_send_tombstone_generation = logical_generation;
+                break;
+            case Corruption::Layout:
+                conn.http1_prebuilt_response_layout = Http1PrebuiltResponseLayout::HeaderOnlyHead;
+                break;
+            case Corruption::Buffering:
+                config.policy_bundles[1].response_buffering = ForwardResponseBufferingMode::None;
+                break;
+            case Corruption::RequestPolicy:
+                conn.request_policy_id =
+                    static_cast<u16>(RequestPolicyId::Http11FixedStripContentLengthAfterHost);
+                break;
+            case Corruption::WrongPurpose:
+                conn.http1_prebuilt_response_purpose =
+                    Http1PrebuiltResponsePurpose::StrictNoBodyMetadataSuccess;
+                break;
+            case Corruption::WrongSuccessor:
+                conn.http1_boundary_successor_episode = conn.upstream_episode + 1u;
+                break;
+            case Corruption::WrongWait:
+                conn.http1_prebuilt_wait = 0;
+                break;
+            case Corruption::WrongDisposition:
+                conn.http1_prebuilt_disposition = Http1RequestBufferDisposition::PrefixInRecv;
+                break;
+            case Corruption::WrongRequestPrefix:
+                conn.http1_prebuilt_request_prefix_len = 1;
+                break;
+            case Corruption::DeferredBoundary:
+                conn.http1_boundary_deferred = true;
+                break;
+            case Corruption::ReadyBoundary:
+                conn.http1_boundary_ready = true;
+                break;
+            case Corruption::WrongWitnessSource: {
+                static u8 wrong_source = 0;
+                conn.tls_send_src = &wrong_source;
+                break;
+            }
+            case Corruption::WrongFrameLength:
+                ++conn.http1_prebuilt_total_len;
+                break;
+            case Corruption::PipelineDepth:
+                conn.pipeline_depth = 1;
+                break;
+            case Corruption::PipelineGeneration:
+                conn.http1_pipeline_request_generation = 1;
+                break;
+        }
+
+        complete_staged_tls_prebuilt_send(guard, conn, raw_generation, cipher_len);
+        CHECK_EQ(conn.fd, -1);
+        CHECK_EQ(metrics.requests_total, 0u);
+        CHECK_FALSE(conn.http1_boundary_ready);
+        CHECK_EQ(conn.response_read_deadline_send_tombstone_generation,
+                 corruption == Corruption::LogicalToken ? logical_generation : 0u);
+        REQUIRE(conn.upstream_retirement_active);
+        drain_staged_tls_prebuilt_retirement(&loop, conn, /*cancel_first=*/true);
+        CHECK_EQ(conn.pending_ops, 0u);
+        CHECK_EQ(loop.pending_free_count, 0u);
+        CHECK_EQ(metrics.requests_total, 0u);
+        cleanup_prebuilt_d2(&loop, fixture);
+    }
 }
 
 void neutralize_staged_precise_timer(IoUringEventLoop* loop, PrebuiltD2Fixture& fixture) {

@@ -975,8 +975,6 @@ template <typename Loop>
 inline void respond_validated_connect_completion_failure(Loop* loop,
                                                          Connection& conn,
                                                          const IoEvent& ev);
-template <typename Loop>
-void on_validated_preconnect_failure_sent(void* lp, Connection& conn, IoEvent ev);
 void prepare_early_response_state(Connection& conn);
 u32 consume_upstream_sent(Connection& conn);
 
@@ -4679,7 +4677,10 @@ inline bool try_prebuilt_strict_read_timeout(Loop* loop, Connection& conn) {
                 conn.response_read_deadline_bundle_id,
                 ResponseReadDeadlineOwnerPhase::ActiveAfterCopy,
                 &on_upstream_response<Loop>);
-        if (conn.protocol != ConnProtocol::Http11 || conn.tls_active ||
+        const bool tls_timeout_transport =
+            !conn.tls_active ||
+            (response_read_deadline_tls_output_is_settled(conn) && conn.on_recv == &tls_recv<Loop>);
+        if (conn.protocol != ConnProtocol::Http11 || !tls_timeout_transport ||
             conn.req_http_version != static_cast<u8>(HttpVersion::Http11) ||
             ((response_read_deadline_profile_suppresses_head(profile) &&
               conn.req_method != static_cast<u8>(LogHttpMethod::Head)) ||
@@ -4712,6 +4713,9 @@ inline bool try_prebuilt_strict_read_timeout(Loop* loop, Connection& conn) {
             conn.resp_header_mutation_pending_overflow || conn.resp_header_mutation_overflow)
             return false;
 
+        const bool recv_slot_stable =
+            conn.tls_active ? conn.on_recv == &tls_recv<Loop> && conn.tls_pending_on_recv == nullptr
+                            : conn.on_recv == nullptr;
         if (conn.state != ConnState::Proxying || conn.req_start_us == 0 || conn.epoch_held ||
             loop->is_draining() || conn.is_health_probe || conn.pending_handler_fn != nullptr ||
             conn.yield_armed || conn.yield_timeout_armed || conn.throttle_paused ||
@@ -4719,7 +4723,7 @@ inline bool try_prebuilt_strict_read_timeout(Loop* loop, Connection& conn) {
             conn.upstream_request_incomplete || conn.proxy_resp_started || conn.resp_status != 0 ||
             conn.resp_body_mode != BodyMode::None || conn.resp_body_remaining != 0 ||
             conn.resp_body_sent != 0 || conn.upstream_send_len != 0 || conn.send_progress != 0 ||
-            conn.send_armed || conn.on_send != nullptr || conn.on_recv != nullptr ||
+            conn.send_armed || conn.on_send != nullptr || !recv_slot_stable ||
             conn.response_header_buf.is_released() || !conn.response_header_buf.valid() ||
             conn.response_header_buf.len() != 0 || conn.upstream_fd < 0 ||
             !valid_upstream_episode(conn.upstream_episode) || conn.upstream_episode_quarantined ||
@@ -9331,7 +9335,9 @@ template <typename Loop>
 inline void respond_validated_preconnect_failure(Loop* loop,
                                                  Connection& conn,
                                                  ValidatedPreconnectFailureSite site) {
-    const auto fail_closed = [&]() { loop->close_conn(conn); };
+    const auto fail_closed = [&]() {
+        if (conn.fd >= 0) loop->close_conn(conn);
+    };
     if (!validated_preconnect_failure_owner_is_stable(loop, conn, site)) {
         fail_closed();
         return;
@@ -9408,7 +9414,9 @@ template <typename Loop>
 inline void respond_validated_connect_completion_failure(Loop* loop,
                                                          Connection& conn,
                                                          const IoEvent& ev) {
-    const auto fail_closed = [&]() { loop->close_conn(conn); };
+    const auto fail_closed = [&]() {
+        if (conn.fd >= 0) loop->close_conn(conn);
+    };
     if (!validated_connect_completion_failure_owner_is_stable(loop, conn, ev)) {
         fail_closed();
         return;
