@@ -49185,6 +49185,88 @@ TEST(iouring_response_read_timer,
 }
 
 TEST(iouring_response_read_timer,
+     custody_only_same_batch_noise_releases_boundary_only_after_owned_timer_drain) {
+    static constexpr u8 kResponse[] = "HTTP/1.1 200 OK\r\nContent-Length: 4\r\n\r\nabcd";
+    enum class BatchNoise : u8 { DuplicateTarget, ForeignGeneration, MissingCancel };
+    for (const BatchNoise noise_kind :
+         {BatchNoise::DuplicateTarget, BatchNoise::ForeignGeneration, BatchNoise::MissingCancel}) {
+        ScopedIoUringLoopForRetirement guard;
+        if (!guard.init()) SKIP("io_uring unavailable");
+        auto* loop = guard.loop;
+        ShardMetrics metrics{};
+        metrics.init();
+        loop->metrics = &metrics;
+        RouteConfig config{};
+        PrebuiltD2Fixture fixture{};
+        REQUIRE(stage_live_precise_get(loop, config, &fixture));
+        Connection& conn = *fixture.conn;
+
+        REQUIRE_EQ(conn.upstream_recv_buf.write(kResponse, sizeof(kResponse) - 1u),
+                   sizeof(kResponse) - 1u);
+        const IoEvent response =
+            response_read_copy_event(conn, sizeof(kResponse) - 1u, true, 0, sizeof(kResponse) - 1u);
+        loop->dispatch_batch(&response, 1);
+        REQUIRE_EQ(conn.response_read_deadline_post_commit_phase,
+                   ResponseReadDeadlinePostCommitPhase::CombinedSend);
+        REQUIRE_EQ(conn.response_read_timer_phase, ResponseReadTimerPhase::CancelPending);
+        REQUIRE(conn.response_read_timer_target_owned);
+        REQUIRE(conn.response_read_timer_cancel_owned);
+        const u32 timer_generation = conn.response_read_timer_owner_generation;
+
+        // Settle the origin before downstream completion so the timer is the
+        // only remaining owner when the request boundary is parked.
+        drain_prebuilt_d2_retirement(loop, conn, kUpstreamOpRecv, false);
+        REQUIRE_FALSE(conn.upstream_retirement_active);
+        const IoEvent send = exact_response_deadline_send_event(loop, conn);
+        loop->dispatch_batch(&send, 1);
+        REQUIRE(conn.http1_boundary_deferred);
+        CHECK_FALSE(conn.http1_boundary_ready);
+        CHECK_EQ(conn.state, ConnState::Sending);
+        CHECK_FALSE(conn.recv_armed);
+        CHECK_EQ(metrics.requests_total, 1u);
+
+        IoEvent target = inert_response_read_timer_event(conn.id, timer_generation);
+        target.result = -ECANCELED;
+        IoEvent cancel = inert_response_read_timer_event(
+            conn.id, timer_generation | kResponseReadTimerCancelBit);
+        cancel.result = -ENOENT;
+        IoEvent noise = noise_kind == BatchNoise::DuplicateTarget
+                            ? target
+                            : inert_response_read_timer_event(conn.id, timer_generation + 1u);
+
+        if (noise_kind == BatchNoise::MissingCancel) {
+            const IoEvent batch[] = {target, noise};
+            loop->dispatch_batch(batch, 2);
+            CHECK_FALSE(conn.response_read_timer_owner_is_neutral());
+            CHECK_FALSE(conn.response_read_timer_target_owned);
+            CHECK(conn.response_read_timer_cancel_owned);
+            CHECK(conn.http1_boundary_deferred);
+            CHECK_FALSE(conn.http1_boundary_ready);
+            CHECK_EQ(conn.state, ConnState::Sending);
+            CHECK_FALSE(conn.recv_armed);
+            CHECK_EQ(metrics.requests_total, 1u);
+
+            loop->dispatch_batch(&cancel, 1);
+        } else {
+            const IoEvent batch[] = {noise_kind == BatchNoise::ForeignGeneration ? noise : target,
+                                     cancel,
+                                     noise_kind == BatchNoise::DuplicateTarget ? noise : target};
+            loop->dispatch_batch(batch, 3);
+        }
+
+        CHECK(conn.response_read_timer_owner_is_neutral());
+        CHECK_FALSE(conn.http1_boundary_deferred);
+        CHECK_FALSE(conn.http1_boundary_ready);
+        CHECK_EQ(conn.state, ConnState::ReadingHeader);
+        CHECK(conn.recv_armed);
+        CHECK_EQ(conn.pending_ops, 1u);
+        CHECK_EQ(metrics.requests_total, 1u);
+        CHECK_EQ(conn.http1_boundary_successor_episode, 0u);
+        cleanup_prebuilt_d2(loop, fixture);
+    }
+}
+
+TEST(iouring_response_read_timer,
      prebuilt_head_boundary_waits_for_timer_after_header_and_origin_retire) {
     static constexpr u8 kHeadResponse[] =
         "HTTP/1.1 200 OK\r\nContent-Length: 12\r\nX-Origin: timer-boundary\r\n\r\nabc";

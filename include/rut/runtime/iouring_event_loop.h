@@ -4203,6 +4203,15 @@ public:
                         }
                     }
                 }
+                // A disarmed deadline may retain only timer transport custody
+                // while an HTTP/1 boundary is parked.  Duplicate or foreign
+                // CQEs can invalidate the batch proof without consuming the
+                // real target/cancel records; once those real owners are
+                // nevertheless neutral, release the independent boundary wait.
+                // Active semantic timer batches still follow the strict
+                // custody/owner validation and fail-closed paths below.
+                if (!owner.precise_timer_semantic && c.response_read_timer_owner_is_neutral())
+                    maybe_publish_http1_boundary_ready(c);
                 if (!custody_ok) {
                     if (owner.precise_timer_semantic && c.fd >= 0) close_conn(c);
                     continue;
