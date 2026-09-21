@@ -3048,9 +3048,9 @@ public:
     // A provided-buffer multishot recv can complete several 4 KiB CQEs in one
     // backend wait before the response callback gets a chance to drain them.
     // Keep mode selection structural and episode-stable: retain the existing
-    // downstream-TLS owner and add only the ordinary, already-uploaded,
-    // bodyless HTTP/1 plaintext owner without a response policy. Every excluded
-    // or ambiguous owner retains the established multishot path.
+    // downstream-TLS owner and the ordinary, already-uploaded, bodyless HTTP/1
+    // plaintext owner without a response policy. Pipeline progress is consumed
+    // by pipeline_advance/recover; it does not change the recv primitive.
     [[nodiscard]] bool use_one_shot_upstream_recv(const Connection& c) const {
         const RouteConfig* cfg = c.request_config;
         const bool ordinary_response_owner = c.on_upstream_recv == &on_upstream_response<Self> ||
@@ -3070,8 +3070,8 @@ public:
                !c.req_client_has_transfer_encoding && !c.req_client_has_te &&
                !c.req_client_has_expect && !c.req_client_has_upgrade_header &&
                !c.req_wants_upgrade && !c.req_malformed && !c.request_policy_body_pending &&
-               !c.request_body_fully_buffered && !c.req_body_streamed && c.pipeline_depth == 0 &&
-               c.pipeline_stash_len == 0 && !c.is_health_probe && !c.h2_proxy_recv_draining &&
+               !c.request_body_fully_buffered && !c.req_body_streamed && !c.is_health_probe &&
+               !c.h2_proxy_recv_draining &&
                !c.h2_proxy_synth_quarantined && !c.is_ws_tunnel && !c.is_ws_terminate_route &&
                !c.is_ws_terminate && !c.ws_closing && c.response_read_deadline_owner_is_neutral() &&
                !c.upstream_abandoned && !c.upstream_recv_armed &&

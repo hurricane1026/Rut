@@ -30251,6 +30251,45 @@ struct OneShotRecvFixture {
     }
 };
 
+TEST(iouring_upstream_recv, pipeline_state_keeps_one_shot_for_tls_and_plaintext) {
+    ScopedIoUringLoopForRetirement guard;
+    if (!guard.init()) SKIP("io_uring unavailable");
+    auto* loop = guard.loop;
+
+    for (const bool plaintext : {false, true}) {
+        OneShotRecvFixture fixture;
+        REQUIRE(fixture.stage(loop, plaintext));
+        Connection& conn = *fixture.conn;
+        for (const auto callback : {&on_upstream_response<IoUringEventLoop>,
+                                    &on_response_body_recvd<IoUringEventLoop>}) {
+            conn.on_upstream_recv = callback;
+            conn.state = callback == &on_response_body_recvd<IoUringEventLoop>
+                             ? ConnState::Sending
+                             : ConnState::Proxying;
+            for (const u16 depth : {u16{0}, u16{1}, u16{2}}) {
+                for (const u16 stash_len : {u16{0}, u16{7}}) {
+                    conn.pipeline_depth = depth;
+                    conn.send_buf.reset();
+                    conn.pipeline_stash_len = 0;
+                    if (stash_len != 0) {
+                        static constexpr u8 kRetryPrefix[] = "GET /one HTTP/1.1\r\n\r\n";
+                        static constexpr u8 kSuccessor[] = "GET /two HTTP/1.1\r\n\r\n";
+                        REQUIRE_EQ(conn.send_buf.write(kRetryPrefix, sizeof(kRetryPrefix) - 1u),
+                                   sizeof(kRetryPrefix) - 1u);
+                        REQUIRE_EQ(conn.send_buf.write(kSuccessor, stash_len), stash_len);
+                        conn.retry_req_send_len = sizeof(kRetryPrefix) - 1u;
+                        conn.pipeline_stash_len = stash_len;
+                    } else {
+                        conn.retry_req_send_len = 0;
+                    }
+                    CHECK(loop->use_one_shot_upstream_recv(conn));
+                }
+            }
+        }
+        fixture.cleanup();
+    }
+}
+
 TEST(iouring_upstream_recv, terminal_dispatch_rearms_once_across_reuse_clear_and_drain) {
     ScopedIoUringLoopForRetirement guard;
     if (!guard.init()) SKIP("io_uring unavailable");
@@ -30303,6 +30342,90 @@ TEST(iouring_upstream_recv, terminal_dispatch_rearms_once_across_reuse_clear_and
         loop->backend.sq_entries[(fixture.sq_tail_before + 2u) & *loop->backend.sq_ring_mask];
     CHECK_EQ(third_sqe.ioprio & IORING_RECV_MULTISHOT, 0u);
     fixture.cleanup();
+}
+
+TEST(iouring_upstream_recv, pipelined_header_rearm_preserves_send_stash_and_offset) {
+    ScopedIoUringLoopForRetirement guard;
+    if (!guard.init()) SKIP("io_uring unavailable");
+    auto* loop = guard.loop;
+
+    static constexpr u8 kRetryPrefix[] = "GET /one HTTP/1.1\r\n\r\n";
+    static constexpr u8 kStash[] = "GET /two";
+    for (const bool plaintext : {false, true}) {
+        for (const u16 depth : {u16{1}, u16{2}}) {
+            OneShotRecvFixture fixture;
+            REQUIRE(fixture.stage(loop, plaintext));
+            Connection& conn = *fixture.conn;
+            REQUIRE_GT(conn.send_buf.capacity(), 0u);
+            REQUIRE_EQ(conn.send_buf.write(kRetryPrefix, sizeof(kRetryPrefix) - 1u),
+                       sizeof(kRetryPrefix) - 1u);
+            REQUIRE_EQ(conn.send_buf.write(kStash, sizeof(kStash) - 1u), sizeof(kStash) - 1u);
+            conn.retry_req_send_len = sizeof(kRetryPrefix) - 1u;
+            conn.pipeline_stash_len = sizeof(kStash) - 1u;
+            conn.pipeline_depth = depth;
+            CHECK_EQ(conn.retry_req_send_len, sizeof(kRetryPrefix) - 1u);
+            CHECK_EQ(conn.pipeline_stash_len, sizeof(kStash) - 1u);
+            const u32 send_len = conn.send_buf.len();
+            u8 stash_snapshot[sizeof(kStash) - 1u];
+            __builtin_memcpy(stash_snapshot,
+                             conn.send_buf.data() + conn.retry_req_send_len,
+                             sizeof(stash_snapshot));
+
+            conn.upstream_reused = true;
+            REQUIRE(loop->submit_recv_upstream(conn));
+            REQUIRE_EQ(conn.pending_ops, 1u);
+            const u32 id = conn.id;
+            const u32 tail_before = __atomic_load_n(loop->backend.sq_tail, __ATOMIC_ACQUIRE);
+            static constexpr u8 kFirst[] = "HTTP/";
+            REQUIRE_EQ(conn.upstream_recv_buf.write(kFirst, sizeof(kFirst) - 1u),
+                       sizeof(kFirst) - 1u);
+            loop->dispatch({id,
+                            static_cast<i32>(sizeof(kFirst) - 1u),
+                            0,
+                            0,
+                            IoEventType::UpstreamRecv,
+                            0,
+                            0,
+                            conn.upstream_episode});
+            CHECK(conn.upstream_recv_armed);
+            CHECK_EQ(conn.pending_ops, 1u);
+            CHECK_EQ(__atomic_load_n(loop->backend.sq_tail, __ATOMIC_ACQUIRE), tail_before + 1u);
+            const auto& first_rearm =
+                loop->backend.sq_entries[tail_before & *loop->backend.sq_ring_mask];
+            CHECK_EQ(first_rearm.ioprio & IORING_RECV_MULTISHOT, 0u);
+            CHECK_EQ(conn.send_buf.len(), send_len);
+            CHECK(__builtin_memcmp(conn.send_buf.data() + conn.retry_req_send_len,
+                                   stash_snapshot,
+                                   sizeof(stash_snapshot)) == 0);
+            CHECK_EQ(conn.retry_req_send_len, sizeof(kRetryPrefix) - 1u);
+            CHECK_EQ(conn.pipeline_stash_len, sizeof(kStash) - 1u);
+
+            static constexpr u8 kSecond[] = "1.1 ";
+            REQUIRE_EQ(conn.upstream_recv_buf.write(kSecond, sizeof(kSecond) - 1u),
+                       sizeof(kSecond) - 1u);
+            loop->dispatch({id,
+                            static_cast<i32>(sizeof(kSecond) - 1u),
+                            0,
+                            0,
+                            IoEventType::UpstreamRecv,
+                            0,
+                            0,
+                            conn.upstream_episode});
+            CHECK(conn.upstream_recv_armed);
+            CHECK_EQ(conn.pending_ops, 1u);
+            CHECK_EQ(__atomic_load_n(loop->backend.sq_tail, __ATOMIC_ACQUIRE), tail_before + 2u);
+            const auto& second_rearm =
+                loop->backend.sq_entries[(tail_before + 1u) & *loop->backend.sq_ring_mask];
+            CHECK_EQ(second_rearm.ioprio & IORING_RECV_MULTISHOT, 0u);
+            CHECK_EQ(conn.send_buf.len(), send_len);
+            CHECK(__builtin_memcmp(conn.send_buf.data() + conn.retry_req_send_len,
+                                   stash_snapshot,
+                                   sizeof(stash_snapshot)) == 0);
+            CHECK_EQ(conn.retry_req_send_len, sizeof(kRetryPrefix) - 1u);
+            CHECK_EQ(conn.pipeline_stash_len, sizeof(kStash) - 1u);
+            fixture.cleanup();
+        }
+    }
 }
 
 TEST(iouring_upstream_recv, plaintext_native_recv_is_one_shot_and_bounded_by_slice_space) {
