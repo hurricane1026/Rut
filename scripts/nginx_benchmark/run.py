@@ -344,6 +344,8 @@ class Harness:
                               "ssl_ecdh_curve X25519; ssl_session_cache off;")
                 server = (f"server {{ {listen} keepalive_requests 1000000000; "
                           'location = /static { root /benchmark-payloads; sendfile on; '
+                          'open_file_cache max=1 inactive=1h; open_file_cache_valid 1h; '
+                          'open_file_cache_min_uses 1; '
                           'default_type "text/plain; charset=utf-8"; '
                           'etag off; max_ranges 0; add_header Last-Modified ""; } }')
                 (self.out / "static-nginx.conf").write_text(self.nginx_config(server))

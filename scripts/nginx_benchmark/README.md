@@ -187,7 +187,8 @@ rejects a large literal `return` parameter. Larger converter cells therefore
 remain explicit failures, never passes.
 
 `--static-profile native-body` is a separate static performance comparison:
-nginx serves a read-only file with `sendfile on`, while Rut uses
+nginx serves a read-only file with `sendfile on` and a warmed one-entry
+`open_file_cache` (one-hour validity), while Rut uses
 `return response(200, body: "...")`. The serving loader pins the existing
 source/RIR bytes; each connection reuses its ordinary send slice. Static
 preflight compares the complete body and framing/content headers, ignoring only
