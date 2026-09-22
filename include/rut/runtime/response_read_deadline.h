@@ -496,8 +496,9 @@ inline bool header_only_head_explicit_close_arm_is_stable(
     const auto& response = config->response_policies[bundle.response_policy_id - 1];
     const auto& failure = config->failure_policies[bundle.failure_policy_id - 1];
     const auto& timeout = config->failure_policies[bundle.timeout_failure_policy_id - 1];
-    if (!response_policy_spec_valid(response) || !forward_failure_policy_spec_valid(failure) ||
-        !forward_timeout_failure_policy_spec_valid(timeout) ||
+    if (!admitted_response_policy_valid(response) ||
+        !admitted_forward_failure_policy_valid(failure) ||
+        !admitted_forward_timeout_failure_policy_valid(timeout) ||
         response.version != ResponsePolicyVersion::Http11 ||
         response.framing != ResponsePolicyFraming::ContentLength ||
         response.connection != ResponsePolicyConnection::Request ||
@@ -711,8 +712,9 @@ inline bool response_read_timeout_header_only_head_response_is_stable(
     const auto& response = config->response_policies[bundle.response_policy_id - 1];
     const auto& failure = config->failure_policies[bundle.failure_policy_id - 1];
     const auto& timeout = config->failure_policies[bundle.timeout_failure_policy_id - 1];
-    if (!response_policy_spec_valid(response) || !forward_failure_policy_spec_valid(failure) ||
-        !forward_timeout_failure_policy_spec_valid(timeout) ||
+    if (!admitted_response_policy_valid(response) ||
+        !admitted_forward_failure_policy_valid(failure) ||
+        !admitted_forward_timeout_failure_policy_valid(timeout) ||
         response.version != ResponsePolicyVersion::Http11 ||
         response.framing != ResponsePolicyFraming::ContentLength ||
         response.connection != ResponsePolicyConnection::Request ||
@@ -1061,8 +1063,9 @@ inline bool fixed_upload_head_success_proof_is_stable(
     const auto& response = config->response_policies[bundle.response_policy_id - 1];
     const auto& failure = config->failure_policies[bundle.failure_policy_id - 1];
     const auto& timeout = config->failure_policies[bundle.timeout_failure_policy_id - 1];
-    if (!response_policy_spec_valid(response) || !forward_failure_policy_spec_valid(failure) ||
-        !forward_timeout_failure_policy_spec_valid(timeout) ||
+    if (!admitted_response_policy_valid(response) ||
+        !admitted_forward_failure_policy_valid(failure) ||
+        !admitted_forward_timeout_failure_policy_valid(timeout) ||
         response.version != ResponsePolicyVersion::Http11 ||
         response.framing != ResponsePolicyFraming::ContentLength ||
         response.connection != ResponsePolicyConnection::Request ||
@@ -1741,8 +1744,9 @@ inline bool response_read_deadline_owner_is_stable(const Connection& c,
     const auto& response = cfg->response_policies[bundle.response_policy_id - 1];
     const auto& failure = cfg->failure_policies[bundle.failure_policy_id - 1];
     const auto& timeout = cfg->failure_policies[bundle.timeout_failure_policy_id - 1];
-    if (!response_policy_spec_valid(response) || !forward_failure_policy_spec_valid(failure) ||
-        !forward_timeout_failure_policy_spec_valid(timeout) ||
+    if (!admitted_response_policy_valid(response) ||
+        !admitted_forward_failure_policy_valid(failure) ||
+        !admitted_forward_timeout_failure_policy_valid(timeout) ||
         response.version != ResponsePolicyVersion::Http11 ||
         response.framing != ResponsePolicyFraming::ContentLength ||
         response.connection != ResponsePolicyConnection::Request ||
