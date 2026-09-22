@@ -250,6 +250,55 @@ TEST(shard_control, reload_config_refuses_out_of_range_timer_shard) {
     CHECK(shard.active_config == &cfg);
 }
 
+// Release builds skip the byte-level re-scan of admitted forward policies on
+// the request path, so publication is the trust boundary: a hand-built config
+// whose public policy tables bypass the add_* builders (here a server value
+// with an injected header) must be refused by every publish entry point.
+TEST(shard_control, publish_refuses_hand_built_invalid_forward_policies) {
+    using namespace rut;
+    static RouteConfig cfg{};
+    ForwardResponsePolicySpec response{};
+    response.version = ResponsePolicyVersion::Http11;
+    response.framing = ResponsePolicyFraming::ContentLength;
+    response.connection = ResponsePolicyConnection::Request;
+    response.date = ResponsePolicyDate::Current;
+    response.head_mode = ResponsePolicyHeadMode::Reject;
+    response.server = {"rut", 3};
+    ForwardFailurePolicySpec failure{};
+    failure.version = ForwardFailurePolicyVersion::Http11;
+    failure.status_code = 502;
+    failure.date = ForwardFailurePolicyDate::Current;
+    failure.connection = ForwardFailurePolicyConnection::Request;
+    failure.head_mode = FailurePolicyHeadMode::Reject;
+    failure.reason = {"Bad Gateway", 11};
+    failure.content_type = {"text/plain", 10};
+    failure.server = {"rut", 3};
+    failure.body = {"bad", 3};
+    REQUIRE_EQ(cfg.add_response_policy(response), 1u);
+    REQUIRE_EQ(cfg.add_failure_policy(failure), 1u);
+    REQUIRE_EQ(cfg.add_policy_bundle(1, 1), 1u);
+    CHECK(cfg.forward_policy_tables_valid());
+
+    static constexpr char kInjected[] = "rut\r\nX-Injected: yes";
+    const ForwardResponsePolicySpec saved_response = cfg.response_policies[0];
+    cfg.response_policies[0].server = {kInjected, sizeof(kInjected) - 1u};
+    CHECK_FALSE(cfg.forward_policy_tables_valid());
+    Shard<RealLoop> shard{};
+    CHECK_FALSE(shard.reload_config(&cfg, /*shard_count=*/1));
+    CHECK_FALSE(shard.reload_config_unchecked(&cfg));
+    CHECK(shard.active_config == nullptr);
+
+    cfg.response_policies[0] = saved_response;
+    cfg.failure_policies[0].reason = {"bad\r", 4};
+    CHECK_FALSE(cfg.forward_policy_tables_valid());
+    CHECK_FALSE(shard.reload_config(&cfg, /*shard_count=*/1));
+    CHECK(shard.active_config == nullptr);
+
+    cfg.failure_policies[0].reason = {"Bad Gateway", 11};
+    CHECK(shard.reload_config(&cfg, /*shard_count=*/1));
+    CHECK(shard.active_config == &cfg);
+}
+
 TEST(shard_control, shard_reload_config) {
     // Spawn a real shard, send ReloadConfig, verify active_config changes.
     auto lfd_result = create_listen_socket(0);

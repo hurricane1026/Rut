@@ -1833,6 +1833,27 @@ public:
                admitted_forward_timeout_failure_policy_valid(failure_policies[id - 1]);
     }
 
+    // Full validation of every forward policy table, run once when a config is
+    // published to a shard. The add_* builders already validate, but the
+    // tables are public and a hand-built config can bypass them; runtime
+    // re-checks of admitted policies skip the byte scans in release builds
+    // (kRescanAdmittedPolicies), so publication is the trust boundary.
+    bool forward_policy_tables_valid() const {
+        if (response_policy_count > kMaxResponsePolicies ||
+            failure_policy_count > kMaxForwardFailurePolicies ||
+            policy_bundle_count > kMaxForwardPolicyBundles)
+            return false;
+        for (u32 i = 0; i < response_policy_count; i++)
+            if (!response_policy_spec_valid(response_policies[i])) return false;
+        for (u32 i = 0; i < failure_policy_count; i++)
+            if (!forward_failure_policy_table_spec_valid(failure_policies[i])) return false;
+        // Every referenced spec is now fully valid, so the admitted checks in
+        // policy_bundle_id_is_valid() decide exactly what the full ones would.
+        for (u32 i = 0; i < policy_bundle_count; i++)
+            if (!policy_bundle_id_is_valid(static_cast<u16>(i + 1))) return false;
+        return true;
+    }
+
     bool policy_bundle_id_is_valid(u16 id) const {
         if (policy_bundle_count > kMaxForwardPolicyBundles || id == 0 || id > policy_bundle_count)
             return false;

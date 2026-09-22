@@ -327,6 +327,8 @@ struct Shard {
         if (!active_config) active_config = route_config;
         if (thread_spawned)
             return core::make_unexpected(Error::make(EEXIST, Error::Source::Thread));
+        if (active_config != nullptr && !active_config->forward_policy_tables_valid())
+            return core::make_unexpected(Error::make(EINVAL, Error::Source::Thread));
 
         pthread_attr_t attr;
         i32 attr_rc = pthread_attr_init(&attr);
@@ -391,11 +393,13 @@ struct Shard {
     // startup config, enforced here so hot-reload callers cannot skip it.
     [[nodiscard]] bool reload_config(const RouteConfig* cfg, u32 shard_count) {
         if (cfg != nullptr && cfg->first_out_of_range_timer_shard(shard_count) >= 0) return false;
-        reload_config_unchecked(cfg);
-        return true;
+        return reload_config_unchecked(cfg);
     }
 
-    void reload_config_unchecked(const RouteConfig* cfg) {
+    // Skips only the timer-shard check. A config whose forward policy tables
+    // fail full validation is still refused (returns false, nothing installed).
+    bool reload_config_unchecked(const RouteConfig* cfg) {
+        if (cfg != nullptr && !cfg->forward_policy_tables_valid()) return false;
         if (!thread_spawned) {
             // No thread — direct apply. The running path's poll_command() drains
             // the idle pool on every config adopt; this not-running path must do
@@ -405,11 +409,12 @@ struct Shard {
             // empty pool, so an apply-before-spawn is harmless.
             active_config = cfg;
             if (upstream) upstream->drain();
-            return;
+            return true;
         }
         // Thread may be running or exiting. Queue atomically.
         // If thread consumes it — good. If not, join() applies it.
         control.pending_config.store(cfg, std::memory_order_release);
+        return true;
     }
 
     // Send a JIT swap to the shard (fire-and-forget).
