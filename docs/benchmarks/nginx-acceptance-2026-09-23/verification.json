@@ -1,0 +1,13 @@
+{
+  "coordinate_coverage": "96/96 exact, no duplicates",
+  "verdict_recomputed_from_archived_samples": {
+    "below_target": 10,
+    "pass": 38,
+    "invalid": 48
+  },
+  "archive_matches_published_matrix": true,
+  "harness_hashes_match": true,
+  "runtime_and_converter_hashes_unchanged_after_run": true,
+  "private_key_not_archived": true,
+  "overall_target_met": false
+}

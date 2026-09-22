@@ -231,3 +231,7 @@ Short but otherwise valid measurements remain visible without qualifying for
 performance acceptance. Exit 2 includes
 valid measurements below target, not only execution errors. An interrupted
 matrix remains incomplete. This is a local goal check, not a performance CI gate.
+
+[The 2026-09-23 full acceptance run](../../docs/benchmarks/nginx-acceptance-2026-09-23/README.md)
+uses a fresh main build and evaluates all 96 coordinates: 38 passed, 10 below
+target, 48 invalid. The overall verdict is FAIL; full evidence is retained.

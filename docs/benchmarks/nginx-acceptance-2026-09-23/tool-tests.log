@@ -1,0 +1,15 @@
+...............usage: python3 -m unittest [-h]
+python3 -m unittest: error: native-streaming supports only proxy-keepalive
+usage: python3 -m unittest [-h]
+python3 -m unittest: error: native-streaming supports only concurrency values 1 and 32
+usage: python3 -m unittest [-h]
+python3 -m unittest: error: native-streaming supports only concurrency values 1 and 32
+usage: python3 -m unittest [-h]
+python3 -m unittest: error: native-streaming requires a 256 KiB response
+usage: python3 -m unittest [-h]
+python3 -m unittest: error: native-streaming requires --keepalive-header implicit
+.......
+----------------------------------------------------------------------
+Ran 22 tests in 3.117s
+
+OK

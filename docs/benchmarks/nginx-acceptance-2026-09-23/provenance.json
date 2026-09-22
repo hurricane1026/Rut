@@ -1,0 +1,32 @@
+{
+  "runtime_source": "601f144e13ae0d8d991c0c9f7fb0c831848f3b0a",
+  "harness_source": "ac01bee3f1a0587c6e6b7148cacfbf2c2a407ab8",
+  "runtime_source_diff_from_main": "",
+  "working_tree_status_before_run": "",
+  "compiler": "clang version 22.1.8 (Fedora 22.1.8-4.fc44)\nTarget: x86_64-redhat-linux-gnu\nThread model: posix\nInstalledDir: /usr/bin\nConfiguration file: /etc/clang/x86_64-redhat-linux-gnu-clang++.cfg\n",
+  "build": "Fresh CMake Ninja Release, project -O2 -DNDEBUG; JIT ON, IPO OFF; rut and rut-nginx-convert targets",
+  "submodules": " 7f5a43945aab78fe4e71459ac4881ff9033d73d8 third_party/boringssl (0.20260327.0-11-g7f5a43945)\n b585ad466658624bb31fb1d194cdb168df34833c third_party/vectorscan (v4.4.1-1575-gb585ad46)\n 416091ebdb9e901b29d026633e73167d6353a0b0 third_party/vectorscan/simde (v0.8.0-34-g416091eb)\n da8f73412998e4f1adf1100dc187533a51af77fd third_party/vectorscan/simde/test/munit (v0.2.0-37-gda8f734)\n",
+  "binaries_sha256": {
+    "rut": "41d8b3806367f6bf38af9dbfdecf1a277f009e3129bfec5e017010b2a5b733a4",
+    "converter": "bd87d83a1a67ead19c5f05df18795530b6e308907a1b1f5af4882d027adb991b",
+    "wrk": "8d38af6d4ccec7be5c41beb50bec9ebde506f89dc76377a1d15f2c2e593f9203",
+    "certificate": "001c832bac2f123795ff7cfa7a653150959bed02faa8d4abbb48b69adb3e86e4"
+  },
+  "harness_sha256": {
+    "run.py": "7cd1fd9ff207e8dfa857a401d9a4e32ffb65577b2b17add50fe6bf95689072d1",
+    "matrix.py": "a2da495a5417314391eb0209853ae9141c8c2ffbe9564fc8c4c5c4032bf84d5e",
+    "summarize.py": "58b4d7a5b7eb9ca04a6124391983b6a8c62b24d891afedd4f0a1683148a7296a"
+  },
+  "wrk_provenance": "make -j2 WITH_OPENSSL=/home/hurricane/private/code/Rut/.cache/perf-tools/openssl/usr; bundled LuaJIT; system OpenSSL3.5.8",
+  "wrk_source": "a211dd5a7050b1f9e8a9870b95513060e72ac4a0 with retained wrk-tls-full-handshake.patch",
+  "sampling": {
+    "profile": "acceptance",
+    "warmup": 1,
+    "duration": 5,
+    "repeats": 3,
+    "expected_cells": 96
+  },
+  "scope": "HTTP/HTTPS, four scenarios, 16/1024/65536/1048576 bytes, concurrency 1/32/128; implicit keepalive; strict converter proxy",
+  "target": "Every cell valid, >=3 repeats, each actual measurement >=5s, Rut/nginx median RPS >=1.10",
+  "machine_isolation": "Separate physical cores for frontend/origin/client; no frequency lock or exclusive host reservation; no builds/tests during measurement"
+}
