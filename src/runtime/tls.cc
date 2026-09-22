@@ -1,10 +1,12 @@
 #include "rut/runtime/tls.h"
 
+#include "rut/platform/socket.h"
 #include <mutex>
 
 #include <errno.h>
 #include <openssl/bio.h>
 #include <openssl/ssl.h>
+#include <stdint.h>
 #include <stdlib.h>
 
 namespace rut {
@@ -121,6 +123,70 @@ void destroy_tls_server_context(TlsServerContext* ctx) {
     free(ctx);
 }
 
+namespace {
+
+// BoringSSL's socket BIO writes with write(2), which raises SIGPIPE when the
+// peer has already closed. This BIO sends with platform::kSendFlags
+// (MSG_NOSIGNAL; macOS sockets set SO_NOSIGPIPE instead), so a disconnect
+// surfaces as EPIPE on its own connection. It never owns the descriptor.
+int nosigpipe_socket_fd(BIO* bio) {
+    return static_cast<int>(reinterpret_cast<intptr_t>(BIO_get_data(bio)));
+}
+
+bool nosigpipe_socket_should_retry() {
+    return errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR;
+}
+
+int nosigpipe_socket_write(BIO* bio, const char* in, int len) {
+    BIO_clear_retry_flags(bio);
+    if (len <= 0) return 0;
+    const ssize_t n =
+        ::send(nosigpipe_socket_fd(bio), in, static_cast<size_t>(len), platform::kSendFlags);
+    if (n < 0 && nosigpipe_socket_should_retry()) BIO_set_retry_write(bio);
+    return static_cast<int>(n);
+}
+
+int nosigpipe_socket_read(BIO* bio, char* out, int len) {
+    BIO_clear_retry_flags(bio);
+    if (len <= 0) return 0;
+    const ssize_t n = ::recv(nosigpipe_socket_fd(bio), out, static_cast<size_t>(len), 0);
+    if (n < 0 && nosigpipe_socket_should_retry()) BIO_set_retry_read(bio);
+    return static_cast<int>(n);
+}
+
+long nosigpipe_socket_ctrl(BIO* /*bio*/, int cmd, long /*num*/, void* /*ptr*/) {
+    return cmd == BIO_CTRL_FLUSH ? 1 : 0;
+}
+
+const BIO_METHOD* nosigpipe_socket_method() {
+    static std::once_flag once;
+    static BIO_METHOD* method = nullptr;
+    std::call_once(once, []() {
+        BIO_METHOD* m = BIO_meth_new(BIO_TYPE_SOCKET, "rut socket (no SIGPIPE)");
+        if (m == nullptr) return;
+        if (!BIO_meth_set_write(m, nosigpipe_socket_write) ||
+            !BIO_meth_set_read(m, nosigpipe_socket_read) ||
+            !BIO_meth_set_ctrl(m, nosigpipe_socket_ctrl)) {
+            BIO_meth_free(m);
+            return;
+        }
+        method = m;
+    });
+    return method;
+}
+
+BIO* new_nosigpipe_socket_bio(i32 fd) {
+    const BIO_METHOD* method = nosigpipe_socket_method();
+    if (method == nullptr || fd < 0) return nullptr;
+    BIO* bio = BIO_new(method);
+    if (bio == nullptr) return nullptr;
+    BIO_set_data(bio, reinterpret_cast<void*>(static_cast<intptr_t>(fd)));
+    BIO_set_init(bio, 1);
+    return bio;
+}
+
+}  // namespace
+
 core::Expected<SSL*, Error> create_tls_server_ssl(TlsServerContext* ctx, i32 fd) {
     if (!ctx || !ctx->ssl_ctx)
         return core::make_unexpected(Error::make(EINVAL, Error::Source::Socket));
@@ -128,7 +194,7 @@ core::Expected<SSL*, Error> create_tls_server_ssl(TlsServerContext* ctx, i32 fd)
     SSL* ssl = SSL_new(ctx->ssl_ctx);
     if (!ssl) return core::make_unexpected(Error::make(EIO, Error::Source::Socket));
 
-    BIO* bio = BIO_new_socket(fd, BIO_NOCLOSE);
+    BIO* bio = new_nosigpipe_socket_bio(fd);
     if (!bio) {
         SSL_free(ssl);
         return core::make_unexpected(Error::make(EIO, Error::Source::Socket));

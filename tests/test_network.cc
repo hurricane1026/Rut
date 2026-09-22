@@ -8954,31 +8954,62 @@ TEST(route, upstream_backend_list_full) {
 
 // === Process signals ===
 
-TEST(platform, ignore_sigpipe_turns_a_peerless_write_into_epipe) {
+// Runs `body` with SIGPIPE at its default (terminating) action, so any write
+// path that still raises it kills the test process instead of passing.
+template <typename Body>
+static void with_default_sigpipe(rut::test::TestCase* _tc, Body&& body) {
     struct sigaction original{};
     REQUIRE_EQ(sigaction(SIGPIPE, nullptr, &original), 0);
-    // Start from the default action so the check below proves the helper.
     struct sigaction fallback{};
     fallback.sa_handler = SIG_DFL;
     sigemptyset(&fallback.sa_mask);
     REQUIRE_EQ(sigaction(SIGPIPE, &fallback, nullptr), 0);
-
-    REQUIRE(rut::platform::ignore_sigpipe());
-    struct sigaction current{};
-    REQUIRE_EQ(sigaction(SIGPIPE, nullptr, &current), 0);
-    CHECK(current.sa_handler == SIG_IGN);
-
-    // With the default action this write would terminate the test process.
-    i32 fds[2] = {-1, -1};
-    REQUIRE_EQ(pipe(fds), 0);
-    close(fds[0]);
-    const u8 byte = 1;
-    errno = 0;
-    CHECK_EQ(::write(fds[1], &byte, 1), -1);
-    CHECK_EQ(errno, EPIPE);
-    close(fds[1]);
-
+    body();
     REQUIRE_EQ(sigaction(SIGPIPE, &original, nullptr), 0);
+}
+
+TEST(platform, ignore_sigpipe_turns_a_peerless_write_into_epipe) {
+    struct sigaction original{};
+    REQUIRE_EQ(sigaction(SIGPIPE, nullptr, &original), 0);
+    with_default_sigpipe(_tc, [&] {
+        REQUIRE(rut::platform::ignore_sigpipe());
+        struct sigaction current{};
+        REQUIRE_EQ(sigaction(SIGPIPE, nullptr, &current), 0);
+        CHECK(current.sa_handler == SIG_IGN);
+        // With the default action this write would terminate the test process.
+        i32 fds[2] = {-1, -1};
+        REQUIRE_EQ(pipe(fds), 0);
+        close(fds[0]);
+        const u8 byte = 1;
+        errno = 0;
+        CHECK_EQ(::write(fds[1], &byte, 1), -1);
+        CHECK_EQ(errno, EPIPE);
+        close(fds[1]);
+    });
+    REQUIRE_EQ(sigaction(SIGPIPE, &original, nullptr), 0);
+}
+
+TEST(tls, server_socket_bio_reports_epipe_without_sigpipe) {
+    auto context_result = create_tls_server_context(RUT_TESTDATA_DIR "/localhost_cert.pem",
+                                                    RUT_TESTDATA_DIR "/localhost_key.pem");
+    REQUIRE(context_result.has_value());
+    TlsServerContext* context = context_result.value();
+    with_default_sigpipe(_tc, [&] {
+        i32 sv[2] = {-1, -1};
+        REQUIRE_EQ(rut::test::stream_socketpair(sv), 0);
+        auto ssl_result = create_tls_server_ssl(context, sv[0]);
+        REQUIRE(ssl_result.has_value());
+        SSL* ssl = ssl_result.value();
+        close(sv[1]);  // the client is gone
+        // The server's socket BIO writes to a closed peer: EPIPE, not SIGPIPE.
+        errno = 0;
+        CHECK_EQ(BIO_write(SSL_get_wbio(ssl), "x", 1), -1);
+        CHECK_EQ(errno, EPIPE);
+        CHECK_FALSE(BIO_should_retry(SSL_get_wbio(ssl)));
+        destroy_tls_server_ssl(ssl);
+        close(sv[0]);
+    });
+    destroy_tls_server_context(context);
 }
 
 // === UpstreamPool ===
@@ -58873,6 +58904,37 @@ TEST(iouring_episode, upstream_submissions_carry_episode_and_aux) {
         CHECK_EQ(decoded_episode, kEpisode);
     }
     backend.shutdown();
+}
+
+TEST(iouring_send, peerless_send_completes_with_epipe_without_sigpipe) {
+    ScopedIoUringLoopForRetirement guard;
+    if (!guard.init()) SKIP("io_uring unavailable");
+    auto& backend = guard.loop->backend;
+    struct sigaction original{};
+    REQUIRE_EQ(sigaction(SIGPIPE, nullptr, &original), 0);
+    struct sigaction fallback{};
+    fallback.sa_handler = SIG_DFL;
+    sigemptyset(&fallback.sa_mask);
+    REQUIRE_EQ(sigaction(SIGPIPE, &fallback, nullptr), 0);
+
+    // SIGPIPE keeps its terminating default. The send SQE carries
+    // MSG_NOSIGNAL (current kernels also force it for io_uring sends), so a
+    // closed peer completes the send with -EPIPE and the process survives.
+    i32 sv[2] = {-1, -1};
+    REQUIRE_EQ(rut::test::stream_socketpair(sv), 0);
+    close(sv[1]);
+    static const u8 payload[] = {'x', 'y', 'z'};
+    constexpr u32 kConnId = 6;
+    REQUIRE(backend.add_send(sv[0], kConnId, payload, sizeof(payload), 4u));
+    IoEvent events[4]{};
+    u32 n = 0;
+    for (u32 attempt = 0; attempt < 8 && n == 0; attempt++)
+        n = backend.wait(events, 4, guard.loop->conns, IoUringEventLoop::kMaxConns);
+    REQUIRE_EQ(n, 1u);
+    CHECK_EQ(events[0].type, IoEventType::Send);
+    CHECK_EQ(events[0].result, -EPIPE);
+    close(sv[0]);
+    REQUIRE_EQ(sigaction(SIGPIPE, &original, nullptr), 0);
 }
 
 TEST(iouring_final_response, backend_completes_direct_writes_with_the_whole_length) {
