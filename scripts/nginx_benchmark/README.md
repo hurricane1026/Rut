@@ -34,13 +34,16 @@ python3 scripts/nginx_benchmark/run.py \
 python3 scripts/nginx_benchmark/summarize.py /tmp/nginx-rut-benchmark
 ```
 
-Default `--profile quick`: four scenarios, concurrency 1/32/128, 1-second warmup
-and 2-second measurement, one repeat. The scheduled load takes 72 seconds,
-plus startup, response validation and cleanup (previous default: 720 seconds).
-This is a quick comparison with limited statistical confidence.
+Default `--profile acceptance`: four scenarios, concurrency 1/32/128, 1-second
+warmup and 5-second measurement, three repeats. Scheduled load takes 432 seconds
+(previous default: 720 seconds), plus startup, validation and cleanup. This
+retains the matrix minimum sampling requirements; actual durations, errors and
+throughput must still pass its acceptance checks.
+Use `--profile quick` only for smoke testing (1-second warmup, 2-second
+measurement, one repeat; 72 seconds of scheduled load).
 Use `--profile full` for the original 2-second warmup, 8-second measurement and
 three repeats, alternating nginx/RUT order. Explicit `--warmup`, `--duration`
-and `--repeats` override either profile independently. Both profiles retain
+and `--repeats` override each profile independently. All profiles retain
 all selected coordinates and the same response/error checks. The harness prints
 the scheduled load budget before starting. Each repeat starts
 one frontend per engine, then runs all concurrency levels in order on that
@@ -204,14 +207,15 @@ converter compatibility. Original HTTP output stays unmodified.
 `matrix.py` accepts the same binary/CPU arguments as `run.py`, plus required
 `--tls-cert` / `--tls-key`. Defaults are all four scenarios, HTTP and HTTPS,
 16 B / 1 KiB / 64 KiB / 1 MiB, and concurrency 1 / 32 / 128: 96 cells.
-The default quick profile schedules 9.6 minutes of load for all 96 cells;
+The default acceptance profile schedules 57.6 minutes of load for all 96 cells;
+quick schedules 9.6 minutes but is ineligible for performance acceptance.
 `--profile full` restores the original 10-second measurement, 2-second warmup
 and three repeats (115.2 minutes). Startup/validation/cleanup add overhead;
 unsupported cells can fail before consuming their load budget. Execution stays
 serial because simultaneous cases would compete for the same pinned CPU cores.
 Quick runs retain the same acceptance rules below, so their default short
 samples do not meet the target and the matrix exits 2 even if error-free.
-Use full for performance acceptance. Each
+Acceptance and full use qualifying sampling budgets. Each
 case has isolated retained evidence. Failed setup, unsupported capabilities,
 missing repetitions and response errors leave their cells unpassed. A completed
 child run with exit 1 preserves valid sibling-concurrency measurements while

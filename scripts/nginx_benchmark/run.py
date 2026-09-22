@@ -927,8 +927,8 @@ def validate_proxy_profile(parser, args):
 
 def add_measurement_arguments(parser, full_duration):
     parser.add_argument(
-        "--profile", choices=("quick", "full"), default="quick",
-        help="quick (default): 1s warmup, 2s measurement, 1 repeat; full: original sampling budget",
+        "--profile", choices=("acceptance", "quick", "full"), default="acceptance",
+        help="acceptance (default): 1s warmup, 5s measurement, 3 repeats; quick: smoke only; full: original sampling budget",
     )
     parser.add_argument("--duration", type=positive, help=f"measurement seconds (full: {full_duration}); overrides profile")
     parser.add_argument("--warmup", type=positive, help="warmup seconds (full: 2); overrides profile")
@@ -937,7 +937,8 @@ def add_measurement_arguments(parser, full_duration):
 
 
 def resolve_measurement_arguments(args):
-    defaults = (2, 1, 1) if args.profile == "quick" else (args.full_duration, 2, 3)
+    defaults = {"acceptance": (5, 1, 3), "quick": (2, 1, 1),
+                "full": (args.full_duration, 2, 3)}[args.profile]
     for name, value in zip(("duration", "warmup", "repeats"), defaults):
         if getattr(args, name) is None:
             setattr(args, name, value)

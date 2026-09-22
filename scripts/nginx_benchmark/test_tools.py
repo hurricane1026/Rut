@@ -136,7 +136,8 @@ class ToolsTest(unittest.TestCase):
 
 
     def test_matrix_profiles_forward_budget_without_dropping_coordinates(self):
-        cases = (([], (2, 1, 1)),
+        cases = (([], (5, 1, 3)),
+                 (["--profile", "quick"], (2, 1, 1)),
                  (["--profile", "full"], (10, 2, 3)),
                  (["--duration", "5", "--warmup", "3", "--repeats", "4"], (5, 3, 4)))
         for flags, expected in cases:

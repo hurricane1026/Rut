@@ -1,6 +1,6 @@
 # Quick nginx / Rut benchmark — 2026-09-23
 
-This run exercises the new default quick profile on all four HTTP scenarios at
+This run exercises the explicit quick profile on all four HTTP scenarios at
 concurrency 1 / 32 / 128 (12 comparisons, 24 engine samples). Each sample has a
 1-second warmup and 2-second measurement, with one repeat and nginx first.
 Static responses contain 16 bytes; strict converter proxy responses contain
@@ -15,6 +15,9 @@ All three executable hashes were checked against retained provenance before
 execution; see [provenance.json](provenance.json). The converter's exact source
 revision is unknown. Harness base is `601f144e` plus this PR's changes;
 [harness-source-sha256.json](harness-source-sha256.json) pins the runner sources.
+
+The quick run below was captured before the default changed to acceptance;
+its recorded runner hashes and raw evidence are unchanged.
 
 ## Results
 
@@ -48,7 +51,7 @@ python3 scripts/nginx_benchmark/run.py \
   --rut /path/to/archived/rut --converter /path/to/archived/converter \
   --wrk /path/to/archived/wrk --output /tmp/nginx-quick \
   --server-cpu 2 --origin-cpu 3 --client-cpus 4,5 \
-  --keepalive-header implicit
+  --keepalive-header implicit --profile quick
 python3 scripts/nginx_benchmark/summarize.py /tmp/nginx-quick
 ```
 
