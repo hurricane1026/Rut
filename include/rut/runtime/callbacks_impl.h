@@ -8892,7 +8892,9 @@ inline bool build_bounded_local_response_bytes(const Connection& conn,
     auto put = [&](const u8* data, u32 len) {
         if ((data == nullptr && len != 0) || len > out_cap - (pos <= out_cap ? pos : out_cap))
             return false;
-        for (u32 i = 0; i < len; i++) out[pos + i] = data[i];
+        // Bulk copy (overlap-safe for borrowed views); a byte loop here was
+        // the dominant cost of serving ~4 KiB local responses.
+        if (len != 0) __builtin_memmove(out + pos, data, len);
         pos += len;
         return true;
     };
@@ -8960,7 +8962,7 @@ inline bool build_no_content204_response_bytes(const Connection& conn,
     auto put = [&](const void* data, u32 len) {
         if ((data == nullptr && len != 0) || pos > required || len > required - pos) return false;
         const auto* bytes = static_cast<const u8*>(data);
-        for (u32 i = 0; i < len; i++) out[pos + i] = bytes[i];
+        if (len != 0) __builtin_memmove(out + pos, bytes, len);
         pos += len;
         return true;
     };
