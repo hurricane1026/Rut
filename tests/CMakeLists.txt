@@ -448,6 +448,16 @@ find_package(Threads REQUIRED)
 target_link_libraries(test_fixture_bounded_http_exchange PRIVATE Threads::Threads)
 find_package(Python3 REQUIRED COMPONENTS Interpreter)
 
+# /proc-based check that the process ignores SIGPIPE (Linux only).
+if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+add_test(
+    NAME test_cli_sigpipe
+    COMMAND ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/test_cli_sigpipe.py
+            $<TARGET_FILE:rut>)
+set_tests_properties(test_cli_sigpipe PROPERTIES LABELS "cli" TIMEOUT 30)
+endif()
+
 # Runtime connection capacity is a Linux backend option; the macOS kqueue
 # development backend accepts only the default and rejects other values.
 if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
