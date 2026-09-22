@@ -77,12 +77,16 @@ inline bool failure_policy_safe_body(Str value) {
     return (value.ptr != nullptr || value.len == 0) && value.len <= kMaxFailurePolicyBodyLen;
 }
 
+inline bool forward_failure_policy_spec_scalar_valid(const ForwardFailurePolicySpec& policy) {
+    return policy.version == ForwardFailurePolicyVersion::Http11 && policy.status_code >= 400 &&
+           policy.status_code <= 599 && policy.date == ForwardFailurePolicyDate::Current &&
+           policy.connection == ForwardFailurePolicyConnection::Request &&
+           (policy.head_mode == FailurePolicyHeadMode::Reject ||
+            policy.head_mode == FailurePolicyHeadMode::SuppressBody);
+}
+
 inline bool forward_failure_policy_spec_shape_valid(const ForwardFailurePolicySpec& policy) {
-    if (policy.version != ForwardFailurePolicyVersion::Http11 || policy.status_code < 400 ||
-        policy.status_code > 599 || policy.date != ForwardFailurePolicyDate::Current ||
-        policy.connection != ForwardFailurePolicyConnection::Request ||
-        (policy.head_mode != FailurePolicyHeadMode::Reject &&
-         policy.head_mode != FailurePolicyHeadMode::SuppressBody) ||
+    if (!forward_failure_policy_spec_scalar_valid(policy) ||
         !failure_policy_safe_text(policy.reason, kMaxFailurePolicyReasonLen) ||
         !failure_policy_safe_text(policy.content_type, kMaxFailurePolicyContentTypeLen) ||
         !failure_policy_safe_text(policy.server, kMaxFailurePolicyServerLen) ||
@@ -104,6 +108,41 @@ inline bool forward_failure_policy_spec_valid(const ForwardFailurePolicySpec& po
 // default 502 policy.
 inline bool forward_timeout_failure_policy_spec_valid(const ForwardFailurePolicySpec& policy) {
     return forward_failure_policy_spec_shape_valid(policy);
+}
+
+// Re-checks of policies owned by an immutable RouteConfig: the role checks
+// always run, the byte-level re-scan only when kRescanAdmittedPolicies.
+inline bool admitted_forward_failure_policy_valid(const ForwardFailurePolicySpec& policy) {
+    return kRescanAdmittedPolicies
+               ? forward_failure_policy_spec_valid(policy)
+               : policy.status_code == 502 && forward_failure_policy_spec_scalar_valid(policy);
+}
+
+inline bool admitted_forward_timeout_failure_policy_valid(const ForwardFailurePolicySpec& policy) {
+    return kRescanAdmittedPolicies ? forward_timeout_failure_policy_spec_valid(policy)
+                                   : forward_failure_policy_spec_scalar_valid(policy);
+}
+
+inline bool complete_content_length_buffering_policy_roles_valid(
+    const ForwardResponsePolicySpec& response,
+    const ForwardFailurePolicySpec& failure,
+    const ForwardFailurePolicySpec& timeout) {
+    return response.version == ResponsePolicyVersion::Http11 &&
+           response.framing == ResponsePolicyFraming::ContentLength &&
+           response.connection == ResponsePolicyConnection::Request &&
+           response.head_mode == ResponsePolicyHeadMode::Reject &&
+           failure.head_mode == FailurePolicyHeadMode::Reject &&
+           timeout.head_mode == FailurePolicyHeadMode::Reject;
+}
+
+inline bool admitted_complete_content_length_buffering_policies_valid(
+    const ForwardResponsePolicySpec& response,
+    const ForwardFailurePolicySpec& failure,
+    const ForwardFailurePolicySpec& timeout) {
+    return admitted_response_policy_valid(response) &&
+           admitted_forward_failure_policy_valid(failure) &&
+           admitted_forward_timeout_failure_policy_valid(timeout) &&
+           complete_content_length_buffering_policy_roles_valid(response, failure, timeout);
 }
 
 inline bool complete_content_length_buffering_policies_valid(
@@ -133,6 +172,19 @@ inline bool fixed_upload_head_timeout_policies_valid(const ForwardResponsePolicy
            forward_failure_policy_spec_valid(failure) &&
            failure.head_mode == FailurePolicyHeadMode::SuppressBody &&
            forward_timeout_failure_policy_spec_valid(timeout) &&
+           timeout.head_mode == FailurePolicyHeadMode::SuppressBody;
+}
+
+inline bool admitted_fixed_upload_head_timeout_policies_valid(
+    const ForwardResponsePolicySpec& response,
+    const ForwardFailurePolicySpec& failure,
+    const ForwardFailurePolicySpec& timeout) {
+    return admitted_response_policy_valid(response) &&
+           response.connection == ResponsePolicyConnection::Request &&
+           response.head_mode == ResponsePolicyHeadMode::SuppressBody &&
+           admitted_forward_failure_policy_valid(failure) &&
+           failure.head_mode == FailurePolicyHeadMode::SuppressBody &&
+           admitted_forward_timeout_failure_policy_valid(timeout) &&
            timeout.head_mode == FailurePolicyHeadMode::SuppressBody;
 }
 

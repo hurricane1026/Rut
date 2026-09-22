@@ -1726,7 +1726,7 @@ public:
 
     bool response_policy_id_is_valid(u16 id) const {
         return id != 0 && id <= response_policy_count &&
-               response_policy_spec_valid(response_policies[id - 1]);
+               admitted_response_policy_valid(response_policies[id - 1]);
     }
 
     u16 add_failure_policy(const ForwardFailurePolicySpec& policy) {
@@ -1824,13 +1824,13 @@ public:
     bool failure_policy_id_is_valid(u16 id) const {
         return failure_policy_count <= kMaxForwardFailurePolicies && id != 0 &&
                id <= failure_policy_count &&
-               forward_failure_policy_spec_valid(failure_policies[id - 1]);
+               admitted_forward_failure_policy_valid(failure_policies[id - 1]);
     }
 
     bool timeout_failure_policy_id_is_valid(u16 id) const {
         return failure_policy_count <= kMaxForwardFailurePolicies && id != 0 &&
                id <= failure_policy_count &&
-               forward_timeout_failure_policy_spec_valid(failure_policies[id - 1]);
+               admitted_forward_timeout_failure_policy_valid(failure_policies[id - 1]);
     }
 
     bool policy_bundle_id_is_valid(u16 id) const {

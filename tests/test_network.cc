@@ -1782,6 +1782,54 @@ bool add_response_policy_test_roles(
 }
 }  // namespace
 
+// Admitted (RouteConfig-owned) policies keep their scalar and role checks in
+// every build; the byte-level re-scan of their strings runs only when
+// kRescanAdmittedPolicies (debug/test builds). Registration always scans.
+TEST(response_policy, admitted_checks_keep_roles_and_rescan_bytes_only_in_debug) {
+    RouteConfig config{};
+    u16 response_id = 0;
+    u16 failure_id = 0;
+    u16 timeout_id = 0;
+    REQUIRE(add_response_policy_test_roles(config, response_id, failure_id, timeout_id));
+    const ForwardResponsePolicySpec response = config.response_policies[response_id - 1];
+    const ForwardFailurePolicySpec failure = config.failure_policies[failure_id - 1];
+    const ForwardFailurePolicySpec timeout = config.failure_policies[timeout_id - 1];
+    CHECK(admitted_response_policy_valid(response));
+    CHECK(admitted_forward_failure_policy_valid(failure));
+    CHECK(admitted_forward_timeout_failure_policy_valid(timeout));
+    CHECK(admitted_complete_content_length_buffering_policies_valid(response, failure, timeout));
+
+    // Scalar and role checks: rejected in every build.
+    ForwardResponsePolicySpec r = response;
+    r.hide_header_count = kMaxResponsePolicyHideHeaders + 1;
+    CHECK_FALSE(admitted_response_policy_valid(r));
+    r = response;
+    r.connection = static_cast<ResponsePolicyConnection>(0xff);
+    CHECK_FALSE(admitted_response_policy_valid(r));
+    ForwardFailurePolicySpec f = failure;
+    f.status_code = 503;  // the default failure role is exactly 502
+    CHECK_FALSE(admitted_forward_failure_policy_valid(f));
+    CHECK(admitted_forward_timeout_failure_policy_valid(f));
+    f.status_code = 600;
+    CHECK_FALSE(admitted_forward_timeout_failure_policy_valid(f));
+    f = failure;
+    f.head_mode = FailurePolicyHeadMode::SuppressBody;
+    CHECK_FALSE(admitted_complete_content_length_buffering_policies_valid(response, f, timeout));
+
+    // Byte-level corruption: the full validators always reject it; the
+    // admitted re-check rejects it only when re-scanning.
+    r = response;
+    r.server = {"ru\r", 3};
+    CHECK_FALSE(response_policy_spec_valid(r));
+    CHECK_EQ(admitted_response_policy_valid(r), !kRescanAdmittedPolicies);
+    CHECK_EQ(config.add_response_policy(r), 0u);
+    f = failure;
+    f.reason = {"bad\r", 4};
+    CHECK_FALSE(forward_failure_policy_spec_valid(f));
+    CHECK_EQ(admitted_forward_failure_policy_valid(f), !kRescanAdmittedPolicies);
+    CHECK_EQ(config.add_failure_policy(f), 0u);
+}
+
 TEST(response_policy, complete_buffering_bundle_revalidates_roles_and_tuple_fields) {
     RouteConfig config{};
     u16 response_id = 0;
@@ -1822,28 +1870,32 @@ TEST(response_policy, complete_buffering_bundle_revalidates_roles_and_tuple_fiel
         config.policy_bundles[0].response_buffering = static_cast<ForwardResponseBufferingMode>(2);
     });
 
-    rejects([&] { config.response_policies[0].server = {"", 0}; });
-    rejects([&] { config.response_policies[0].server = {"ru\r", 3}; });
     rejects(
         [&] { config.response_policies[0].hide_header_count = kMaxResponsePolicyHideHeaders + 1; });
-    rejects([&] {
-        config.response_policies[0].hide_header_count = 1;
-        config.response_policies[0].hide_headers[0] = {"Bad Header", 10};
-    });
-    rejects([&] {
-        config.response_policies[0].hide_header_count = 2;
-        config.response_policies[0].hide_headers[0] = {"X-Test", 6};
-        config.response_policies[0].hide_headers[1] = {"x-test", 6};
-    });
     rejects([&] { config.failure_policies[0].status_code = 503; });
     rejects([&] { config.failure_policies[1].status_code = 399; });
     rejects([&] { config.failure_policies[1].status_code = 600; });
-    rejects([&] { config.failure_policies[0].reason = {"bad\r", 4}; });
-    rejects([&] { config.failure_policies[0].server = {"ru\r", 3}; });
-    rejects([&] { config.failure_policies[0].body = {nullptr, 1}; });
-    rejects([&] { config.failure_policies[1].reason = {"bad\r", 4}; });
-    rejects([&] { config.failure_policies[1].server = {"ru\r", 3}; });
-    rejects([&] { config.failure_policies[1].body = {nullptr, 1}; });
+    // Admitted policy strings were scanned at registration; the runtime
+    // re-scan of in-place corrupted bytes is a debug/test-build check.
+    if constexpr (kRescanAdmittedPolicies) {
+        rejects([&] { config.response_policies[0].server = {"", 0}; });
+        rejects([&] { config.response_policies[0].server = {"ru\r", 3}; });
+        rejects([&] {
+            config.response_policies[0].hide_header_count = 1;
+            config.response_policies[0].hide_headers[0] = {"Bad Header", 10};
+        });
+        rejects([&] {
+            config.response_policies[0].hide_header_count = 2;
+            config.response_policies[0].hide_headers[0] = {"X-Test", 6};
+            config.response_policies[0].hide_headers[1] = {"x-test", 6};
+        });
+        rejects([&] { config.failure_policies[0].reason = {"bad\r", 4}; });
+        rejects([&] { config.failure_policies[0].server = {"ru\r", 3}; });
+        rejects([&] { config.failure_policies[0].body = {nullptr, 1}; });
+        rejects([&] { config.failure_policies[1].reason = {"bad\r", 4}; });
+        rejects([&] { config.failure_policies[1].server = {"ru\r", 3}; });
+        rejects([&] { config.failure_policies[1].body = {nullptr, 1}; });
+    }
 
     // KeepAlive is valid as a standalone response policy but is not the
     // request-connection tuple required by CompleteContentLength buffering.
@@ -52986,25 +53038,28 @@ TEST(response_buffering_runtime, complete_post_commit_role_validation_is_bound_f
 
     // Invalid policy contents are re-read on every call, and restoring them
     // makes the same live owner stable again.
-    expect_reject_and_restore([&] { config.response_policies[0].server = {"bad\r", 4}; },
-                              [&] { config.response_policies[0] = original_response; });
-    expect_reject_and_restore(
-        [&] {
-            config.response_policies[0].hide_header_count = 2;
-            config.response_policies[0].hide_headers[0] = {"Server", 6};
-            config.response_policies[0].hide_headers[1] = {"server", 6};
-        },
-        [&] { config.response_policies[0] = original_response; });
     expect_reject_and_restore([&] { config.failure_policies[0].status_code = 500; },
                               [&] { config.failure_policies[0] = original_failure; });
     expect_reject_and_restore([&] { config.failure_policies[1].status_code = 600; },
                               [&] { config.failure_policies[1] = original_timeout; });
-    expect_reject_and_restore([&] { config.failure_policies[0].reason = {"bad\r", 4}; },
-                              [&] { config.failure_policies[0] = original_failure; });
-    expect_reject_and_restore([&] { config.failure_policies[1].reason = {"bad\r", 4}; },
-                              [&] { config.failure_policies[1] = original_timeout; });
-    expect_reject_and_restore([&] { config.failure_policies[0].body = {nullptr, 1}; },
-                              [&] { config.failure_policies[0] = original_failure; });
+    // Byte-level re-scan of admitted policy strings is a debug/test-build check.
+    if constexpr (kRescanAdmittedPolicies) {
+        expect_reject_and_restore([&] { config.response_policies[0].server = {"bad\r", 4}; },
+                                  [&] { config.response_policies[0] = original_response; });
+        expect_reject_and_restore(
+            [&] {
+                config.response_policies[0].hide_header_count = 2;
+                config.response_policies[0].hide_headers[0] = {"Server", 6};
+                config.response_policies[0].hide_headers[1] = {"server", 6};
+            },
+            [&] { config.response_policies[0] = original_response; });
+        expect_reject_and_restore([&] { config.failure_policies[0].reason = {"bad\r", 4}; },
+                                  [&] { config.failure_policies[0] = original_failure; });
+        expect_reject_and_restore([&] { config.failure_policies[1].reason = {"bad\r", 4}; },
+                                  [&] { config.failure_policies[1] = original_timeout; });
+        expect_reject_and_restore([&] { config.failure_policies[0].body = {nullptr, 1}; },
+                                  [&] { config.failure_policies[0] = original_failure; });
+    }
 
     cleanup_prebuilt_d2(loop, fixture);
 }

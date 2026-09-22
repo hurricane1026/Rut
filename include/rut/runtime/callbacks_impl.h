@@ -1305,7 +1305,8 @@ bool prepare_response_read_deadline_preflight_for_mode(Loop* loop,
               !response_read_deadline_route_method_matches(conn.req_method, route->method) ||
               conn.request_policy_id != 0 || conn.request_policy_body_pending ||
               conn.pending_forward_request_policy_id != 0 ||
-              !complete_content_length_buffering_policies_valid(response, failure, timeout))) ||
+              !admitted_complete_content_length_buffering_policies_valid(
+                  response, failure, timeout))) ||
             !response_read_deadline_route_method_matches(conn.req_method, route->method) ||
             !pipeline_generation_stable ||
             (conn.recv_buf.len() != conn.req_initial_send_len &&
@@ -1454,14 +1455,14 @@ inline bool deferred_request_framing_selection_route_is_valid(const Connection& 
         return false;
     if (route->method == kRouteMethodHead &&
         (bundle.response_buffering != ForwardResponseBufferingMode::None ||
-         !fixed_upload_head_timeout_policies_valid(
+         !admitted_fixed_upload_head_timeout_policies_valid(
              config->response_policies[bundle.response_policy_id - 1],
              config->failure_policies[bundle.failure_policy_id - 1],
              config->failure_policies[bundle.timeout_failure_policy_id - 1])))
         return false;
     if (route->method == kRouteMethodGet &&
         (bundle.response_buffering != ForwardResponseBufferingMode::CompleteContentLength ||
-         !complete_content_length_buffering_policies_valid(
+         !admitted_complete_content_length_buffering_policies_valid(
              config->response_policies[bundle.response_policy_id - 1],
              config->failure_policies[bundle.failure_policy_id - 1],
              config->failure_policies[bundle.timeout_failure_policy_id - 1])))
@@ -3865,7 +3866,7 @@ void handle_jit_outcome(Loop* loop,
                 const bool fixed_upload_head_policies_admitted =
                     forward_response_policy_id != 0 && forward_failure_policy_id != 0 &&
                     forward_timeout_failure_policy_id != 0 &&
-                    fixed_upload_head_timeout_policies_valid(
+                    admitted_fixed_upload_head_timeout_policies_valid(
                         config->response_policies[forward_response_policy_id - 1],
                         config->failure_policies[forward_failure_policy_id - 1],
                         config->failure_policies[forward_timeout_failure_policy_id - 1]);
@@ -9278,8 +9279,9 @@ inline bool validated_preconnect_failure_owner_is_stable(Loop* loop,
         const auto& response = config->response_policies[bundle.response_policy_id - 1];
         const auto& failure = config->failure_policies[bundle.failure_policy_id - 1];
         const auto& timeout = config->failure_policies[bundle.timeout_failure_policy_id - 1];
-        if (!response_policy_spec_valid(response) || !forward_failure_policy_spec_valid(failure) ||
-            !forward_timeout_failure_policy_spec_valid(timeout) ||
+        if (!admitted_response_policy_valid(response) ||
+            !admitted_forward_failure_policy_valid(failure) ||
+            !admitted_forward_timeout_failure_policy_valid(timeout) ||
             response.version != ResponsePolicyVersion::Http11 ||
             response.framing != ResponsePolicyFraming::ContentLength ||
             response.connection != ResponsePolicyConnection::Request ||
@@ -10043,7 +10045,7 @@ inline bool build_strict_response_headers(
     const bool strict_no_body_metadata =
         purpose == Http1PrebuiltResponsePurpose::StrictNoBodyMetadataSuccess;
     if ((purpose != Http1PrebuiltResponsePurpose::None && !strict_no_body_metadata) ||
-        !response_policy_spec_valid(policy) || resp.version != HttpVersion::Http11 ||
+        !admitted_response_policy_valid(policy) || resp.version != HttpVersion::Http11 ||
         resp.status_code < 200 || resp.status_code > 599 || resp.status_code == 204 ||
         resp.status_code == 205 ||
         (strict_no_body_metadata ? resp.status_code != 304 || resp.content_length == 0

@@ -82,16 +82,29 @@ inline bool response_policy_hides_header(const ForwardResponsePolicySpec& policy
     return false;
 }
 
+// Policies admitted into an immutable RouteConfig were fully validated when
+// they were registered. Runtime re-checks of an admitted policy keep the cheap
+// scalar and role checks; the byte-level re-scan of its strings runs only in
+// debug/test builds, where it catches a corrupted or mis-built config.
+#ifdef NDEBUG
+inline constexpr bool kRescanAdmittedPolicies = false;
+#else
+inline constexpr bool kRescanAdmittedPolicies = true;
+#endif
+
+inline bool response_policy_spec_scalar_valid(const ForwardResponsePolicySpec& policy) {
+    return policy.version == ResponsePolicyVersion::Http11 &&
+           policy.framing == ResponsePolicyFraming::ContentLength &&
+           (policy.connection == ResponsePolicyConnection::KeepAlive ||
+            policy.connection == ResponsePolicyConnection::Request) &&
+           policy.date == ResponsePolicyDate::Current &&
+           (policy.head_mode == ResponsePolicyHeadMode::Reject ||
+            policy.head_mode == ResponsePolicyHeadMode::SuppressBody) &&
+           policy.hide_header_count <= kMaxResponsePolicyHideHeaders;
+}
+
 inline bool response_policy_spec_valid(const ForwardResponsePolicySpec& policy) {
-    if (policy.version != ResponsePolicyVersion::Http11 ||
-        policy.framing != ResponsePolicyFraming::ContentLength ||
-        (policy.connection != ResponsePolicyConnection::KeepAlive &&
-         policy.connection != ResponsePolicyConnection::Request) ||
-        policy.date != ResponsePolicyDate::Current ||
-        (policy.head_mode != ResponsePolicyHeadMode::Reject &&
-         policy.head_mode != ResponsePolicyHeadMode::SuppressBody) ||
-        !response_policy_safe_server(policy.server) ||
-        policy.hide_header_count > kMaxResponsePolicyHideHeaders)
+    if (!response_policy_spec_scalar_valid(policy) || !response_policy_safe_server(policy.server))
         return false;
     for (u32 i = 0; i < policy.hide_header_count; i++) {
         if (!response_policy_safe_header_name(policy.hide_headers[i])) return false;
@@ -104,6 +117,12 @@ inline bool response_policy_spec_valid(const ForwardResponsePolicySpec& policy) 
         }
     }
     return true;
+}
+
+// Re-check of a policy owned by an immutable RouteConfig (see above).
+inline bool admitted_response_policy_valid(const ForwardResponsePolicySpec& policy) {
+    return kRescanAdmittedPolicies ? response_policy_spec_valid(policy)
+                                   : response_policy_spec_scalar_valid(policy);
 }
 
 inline bool response_policy_spec_equal(const ForwardResponsePolicySpec& a,
