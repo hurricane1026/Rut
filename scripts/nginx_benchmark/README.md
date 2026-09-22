@@ -179,11 +179,32 @@ EOF root-cause fixes and performance optimization are separate work.
 original static/proxy payloads remain unchanged. Configurable proxy payloads
 are served from a read-only file mount by the origin. ETag, range advertisement
 and Last-Modified are disabled identically at that shared origin to preserve
-the controlled response-header shape; this is not a range/caching-header test. Static converter
-`local_response` currently supports at most 4093 bytes: larger static cases
-fail explicitly and do not count as passed. Established io_uring TLS supports
-exact local responses; strict proxy TLS and larger-body cells still require
-separate capability validation.
+the controlled response-header shape; this is not a range/caching-header test.
+
+The default `--static-profile converter-return` retains converter compatibility
+coverage. Its `local_response` supports at most 4093 bytes; nginx itself also
+rejects a large literal `return` parameter. Larger converter cells therefore
+remain explicit failures, never passes.
+
+`--static-profile native-body` is a separate static performance comparison:
+nginx serves a read-only file with `sendfile on`, while Rut uses
+`return response(200, body: "...")`. The serving loader pins the existing
+source/RIR bytes; each connection reuses its ordinary send slice. Static
+preflight compares the complete body and framing/content headers, ignoring only
+engine-specific Server and Date metadata. This profile does not demonstrate
+converter support for large static returns. Both scripts record the selected
+static profile; matrix assessment rejects samples from a different profile.
+
+Strict io_uring proxy responses retain complete Content-Length buffering through
+1 MiB using on-demand slices from the existing pool. Input bounds and async
+reclamation remain enforced. Large responses use the existing separate receive
+ring to avoid starving downstream TLS input; no ring or per-connection buffer
+capacity is increased.
+
+Preflight performs `max(3, min(100, 1 MiB / body_size))` requests per connection
+mode, with exact full-body comparisons. This avoids repeatedly comparing 100 MiB
+for each large-body case while preserving multiple keepalive boundaries. Load
+sampling and the performance acceptance gate are unchanged.
 
 HTTPS uses `--tls-cert cert.pem --tls-key key.pem`. Generate a throwaway RSA
 certificate with `openssl req -x509 -newkey rsa:2048 -nodes -days 7 -subj

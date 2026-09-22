@@ -331,6 +331,40 @@ class ToolsTest(unittest.TestCase):
                             with contextlib.suppress(ProcessLookupError):
                                 os.kill(int(child_pid_file.read_text()), signal.SIGKILL)
 
+    def test_native_static_comparison_keeps_content_and_framing(self):
+        nginx = (b"HTTP/1.1 200 OK\r\nServer: nginx\r\nDate: today\r\n"
+                 b"Content-Length: 3\r\nContent-Type: text/plain; charset=utf-8\r\n"
+                 b"Connection: keep-alive\r\n\r\nabc")
+        rut = (b"HTTP/1.1 200 OK\r\nContent-Length: 3\r\n"
+               b"Content-Type: text/plain; charset=utf-8\r\nConnection: keep-alive\r\n\r\nabc")
+        canonical = run.canonical_native_static_response
+        self.assertEqual(canonical(nginx), canonical(rut))
+        for changed in (rut.replace(b"abc", b"abd"), rut.replace(b"keep-alive", b"close"),
+                        rut.replace(b"Length: 3", b"Length: 4")):
+            self.assertNotEqual(canonical(nginx), canonical(changed))
+        with self.assertRaises(ValueError):
+            canonical(rut.replace(b"text/plain", b"text/html"))
+
+    def test_matrix_rejects_static_samples_from_a_different_profile(self):
+        rows = [dict(workload="static", connection="close", transport="http",
+                     body_size=65536, concurrency=32, engine=engine, rep=rep,
+                     requests=600, rps=rps, seconds=5, valid=True,
+                     errors=dict.fromkeys(run.ERROR_NAMES, 0),
+                     warmup_errors=dict.fromkeys(run.ERROR_NAMES, 0))
+                for engine, rps in (("nginx", 100), ("rut", 120)) for rep in (1, 2, 3)]
+        def result():
+            return assess(rows, "static-close", "http", 65536, 32, 3, 5, "native-body")
+        self.assertFalse(result()["measurement_valid"])
+        for row in rows:
+            row["static_profile"] = "native-body"
+        self.assertTrue(result()["target_met"])
+        rows[0]["static_profile"] = "converter-return"
+        self.assertFalse(result()["measurement_valid"])
+
+    def test_preflight_comparison_budget_retains_multiple_requests(self):
+        for size, count in ((0, 100), (16, 100), (1024, 100), (65536, 16), (1048576, 3)):
+            self.assertEqual(run.preflight_request_count(size), count)
+
     def test_large_body_preflight_is_exact_and_bounded(self):
         size = 1048576
         head = f"HTTP/1.1 200 OK\r\nContent-Length: {size}\r\n\r\n".encode()

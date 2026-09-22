@@ -101,6 +101,30 @@ def expected_body(work, body_size=None, native_streaming=False):
     return b"hello from nginx" if work == "static" else b"x" * 1024
 
 
+def canonical_native_static_response(raw):
+    head, body = raw.split(b"\r\n\r\n", 1)
+    lines = head.split(b"\r\n")
+    headers = {}
+    for line in lines[1:]:
+        key, value = line.split(b":", 1)
+        headers[key.lower()] = value.strip()
+    if headers.get(b"content-type") != b"text/plain; charset=utf-8":
+        raise ValueError("native static response has unexpected Content-Type")
+    # Engine identity and wall-clock metadata differ; all framing/content
+    # headers and the complete body must still match between engines.
+    headers.pop(b"server", None)
+    headers.pop(b"date", None)
+    return lines[0] + b"\r\n" + b"\r\n".join(
+        key + b": " + value for key, value in sorted(headers.items())
+    ) + b"\r\n\r\n" + body
+
+
+def preflight_request_count(body_size):
+    # Bound repeated full-body comparisons; retain three consecutive requests
+    # even for MiB bodies so keepalive reuse crosses more than one boundary.
+    return max(3, min(100, (1024 * 1024) // max(1, body_size)))
+
+
 def response(sock, work, close, keepalive_header="explicit", body_size=None,
              native_streaming=False, preflight_id=None):
     sock.sendall(request_bytes(work, close, keepalive_header, preflight_id))
@@ -115,12 +139,16 @@ def response(sock, work, close, keepalive_header="explicit", body_size=None,
     head, body = data.split(b"\r\n\r\n", 1)
     wanted = expected_body(work, body_size, native_streaming)
     length, server_close = response_head(head, len(wanted), native_streaming)
-    while len(body) < length:
-        chunk = sock.recv(4096)
+    chunks = [body]
+    received = len(body)
+    while received < length:
+        chunk = sock.recv(min(65536, length - received))
         if not chunk:
             raise ValueError("EOF before complete body")
-        body += chunk
-    if len(body) != length or body != wanted:
+        chunks.append(chunk)
+        received += len(chunk)
+    body = b"".join(chunks)
+    if received != length or body != wanted:
         raise ValueError("unexpected body")
     if (close or server_close) and sock.recv(1) != b"":
         raise ValueError("expected EOF after response")
@@ -199,7 +227,8 @@ class Harness:
         native_streaming = getattr(a, "proxy_profile", "converter-strict") == "native-streaming"
         if native_streaming:
             body_size = NATIVE_BODY_SIZE
-        if (body_size is not None and body_size > STATIC_BODY_LIMIT
+        if (getattr(a, "static_profile", "converter-return") == "converter-return"
+                and body_size is not None and body_size > STATIC_BODY_LIMIT
                 and any(scenario.startswith("static-") for scenario in a.scenarios)):
             raise ValueError(
                 f"unsupported static body: converter local_response is bounded to "
@@ -229,6 +258,7 @@ class Harness:
             "arguments": {
                 k: str(v) if isinstance(v, Path) else v for k, v in vars(a).items()
             },
+            "static_profile": getattr(a, "static_profile", "converter-return"),
             "proxy_profile": {
                 "name": getattr(a, "proxy_profile", "converter-strict"),
                 "body_size": body_size,
@@ -297,6 +327,27 @@ class Harness:
         ))
         works = sorted({scenario.split("-")[0] for scenario in a.scenarios})
         for work in works:
+            if work == "static" and getattr(a, "static_profile", "converter-return") == "native-body":
+                body = expected_body(work, body_size)
+                payloads = self.out / "payloads"
+                payloads.mkdir(exist_ok=True)
+                (payloads / "static").write_bytes(body)
+                listener = f"listen 127.0.0.1:{a.front_port}\n"
+                native = listener + 'route GET "/static" { return response(200, body: "' + body.decode() + '") }\n'
+                (self.out / "static.source.rut").write_text(native)
+                (self.out / "static.rut").write_text(native[len(listener):] if self.tls_context else native)
+                listen = f"listen 127.0.0.1:{a.front_port};"
+                if self.tls_context:
+                    listen = (f"listen {a.front_port} ssl; "
+                              "ssl_certificate /benchmark-cert.pem; ssl_certificate_key /benchmark-key.pem; "
+                              "ssl_protocols TLSv1.3; ssl_conf_command Ciphersuites TLS_AES_256_GCM_SHA384; "
+                              "ssl_ecdh_curve X25519; ssl_session_cache off;")
+                server = (f"server {{ {listen} keepalive_requests 1000000000; "
+                          'location = /static { root /benchmark-payloads; sendfile on; '
+                          'default_type "text/plain; charset=utf-8"; '
+                          'etag off; max_ranges 0; add_header Last-Modified ""; } }')
+                (self.out / "static-nginx.conf").write_text(self.nginx_config(server))
+                continue
             if native_streaming:
                 native = (f'listen 127.0.0.1:{a.front_port}\n'
                           f'upstream backend at "127.0.0.1:{a.origin_port}"\n'
@@ -484,10 +535,15 @@ class Harness:
         if native_streaming:
             self.validate_native_keepalive(work)
             return
+        requests = preflight_request_count(len(expected_body(work, getattr(self.args, "body_size", None))))
+        save_json(self.out / f"{self.active_label}-preflight.json", {
+            "requests_per_connection_mode": requests, "full_body_comparison": True,
+            "connection_modes": ["close", "keepalive"] if keepalive else ["close"],
+        })
         for close in [True, False] if keepalive else [True]:
             sock = None
             try:
-                for _ in range(100):
+                for _ in range(requests):
                     if sock is None:
                         sock = socket.create_connection(
                             ("127.0.0.1", self.args.front_port), timeout=3
@@ -506,10 +562,13 @@ class Harness:
                         False,
                         None,
                     )
+                    comparison = canonical_native_static_response(raw) if (
+                        work == "static" and getattr(self.args, "static_profile", "converter-return") == "native-body"
+                    ) else raw
                     key = (work, close)
-                    if key in self.references and self.references[key] != raw:
+                    if key in self.references and self.references[key] != comparison:
                         raise ValueError(f"response mismatch for {key}")
-                    self.references[key] = raw
+                    self.references[key] = comparison
                     (
                         self.out
                         / f"{work}-{'close' if close else 'keepalive'}-response.txt"
@@ -519,7 +578,7 @@ class Harness:
                         sock = None
                         if not close:
                             raise ValueError(
-                                "keepalive preflight closed before 100 requests"
+                                f"keepalive preflight closed before {requests} requests"
                             )
             finally:
                 if sock is not None:
@@ -756,6 +815,7 @@ class Harness:
                             result.update(
                                 workload=work,
                                 proxy_profile=getattr(self.args, "proxy_profile", "converter-strict"),
+                                static_profile=getattr(self.args, "static_profile", "converter-return"),
                                 transport="https" if self.tls_context else "http",
                                 body_size=len(expected_body(work, getattr(self.args, "body_size", None))),
                                 connection=mode,
@@ -979,6 +1039,8 @@ def arguments():
         help="explicit preserves the original workload; implicit uses HTTP/1.1 default persistence",
     )
     parser.add_argument("--body-size", type=positive, help="exact response body bytes (max 1 MiB); omitted preserves legacy bodies")
+    parser.add_argument("--static-profile", choices=("converter-return", "native-body"),
+                        default="converter-return", help="native-body compares a pinned Rut body with an nginx static file; separate from converter acceptance")
     parser.add_argument("--proxy-profile", choices=("converter-strict", "native-streaming"),
                         default="converter-strict", help="proxy implementation profile; default preserves converter behavior")
     parser.add_argument("--tls-cert", type=Path, help="PEM certificate with localhost SAN; enables HTTPS")
