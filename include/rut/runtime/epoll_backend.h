@@ -44,6 +44,26 @@ struct EpollBackend {
     MappedArray<i32> downstream_fd_map;  // downstream (client) fd per conn_id
     MappedArray<i32> upstream_fd_map;    // upstream (origin) fd per conn_id
 
+    // The registration set_fd_interest() last installed, per conn_id and side
+    // (downstream, upstream), so an identical re-install skips epoll_ctl. A
+    // raw epoll_ctl on the fd invalidates the record (fd = -1), and so does
+    // closing or reallocating the connection: a closed fd leaves the epoll set
+    // and its number may come back. Upstream tokens carry the episode, so a
+    // reused upstream fd number never matches an older episode's record.
+    // `gen` advances on every interest change of the slot's side, kept or
+    // not, so a readiness record harvested before the change is recognisable.
+    struct FdInterest {
+        i32 fd = -1;
+        u32 events = 0;
+        u64 data = 0;
+        u32 gen = 0;
+    };
+    MappedArray<FdInterest> fd_interest;  // 2 * capacity entries
+    static u32 fd_interest_slot(u32 conn_id, IoEventType type) {
+        return 2 * conn_id + (io_event_is_upstream(type) ? 1u : 0u);
+    }
+    static void reset_fd_interest(FdInterest& r) { r = {-1, 0, 0, r.gen + 1}; }
+
     // Epoll-owned upstream episode ownership. Zero means no active episode;
     // this table is deliberately independent from Connection::upstream_episode
     // so the lifecycle foundation can be introduced before production owners
@@ -61,8 +81,28 @@ struct EpollBackend {
     IoEvent pending_completions[kPendingCap];
     u32 pending_count = 0;
     // Consecutive synthetic completions returned by wait(); once the quota is
-    // reached, wait() performs one nonblocking kernel probe before popping.
+    // reached, wait() takes one kernel readiness record (harvested earlier or
+    // by a nonblocking probe) before popping.
     u32 pending_streak = 0;
+
+    // Readiness records harvested by one epoll_wait and not yet consumed.
+    // wait() still converts a single record per call, at consumption time, so
+    // each is handled against current state: a record whose connection an
+    // earlier dispatch closed finds no fd, or — if the slot and fd number were
+    // reused — a recv/accept that returns EAGAIN, which emits nothing.
+    // A record whose connection side changed interest since the harvest
+    // (ready_gen no longer matches) is dropped: level-triggered epoll reports
+    // it again under the current interest.
+    // 16 keeps the syscall saving without bunching replies: a batch that
+    // spans every active connection (64 at 32 keep-alive clients) raised p99
+    // ~40% while 8-16 matched its throughput with a lower tail than before.
+    static constexpr u32 kReadyBatch = 16;
+    static constexpr u32 kNoReadySlot = 0xFFFFFFFFu;
+    struct epoll_event ready[kReadyBatch];
+    u32 ready_slot[kReadyBatch];
+    u32 ready_gen[kReadyBatch];
+    u32 ready_head = 0;
+    u32 ready_count = 0;
 
     // Outstanding partial-send state per connection.
     // When add_send() can't complete immediately (partial write or EAGAIN),
@@ -99,6 +139,24 @@ struct EpollBackend {
 
     // Register fd for EPOLLIN — actual recv happens inside wait().
     bool add_recv(i32 fd, u32 conn_id);
+    // A connection slot is closed or (re)allocated: forget its registrations.
+    void forget_fd_interest(u32 conn_id) {
+        if (conn_id >= connection_capacity) return;
+        reset_fd_interest(fd_interest[2 * conn_id]);
+        reset_fd_interest(fd_interest[2 * conn_id + 1]);
+    }
+    // An interest change set_fd_interest() did not make: drop records for fd
+    // and age both sides' harvested readiness.
+    void invalidate_fd_interest(u32 conn_id, i32 fd) {
+        if (conn_id >= connection_capacity) return;
+        for (u32 side = 0; side < 2; side++) {
+            FdInterest& r = fd_interest[2 * conn_id + side];
+            if (r.fd == fd)
+                reset_fd_interest(r);
+            else
+                r.gen++;
+        }
+    }
     bool add_recv_upstream(i32 fd, u32 conn_id, u32 upstream_episode);
 
     // Suspend EPOLLIN on the downstream fd for conn_id. Used when a JIT

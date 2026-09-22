@@ -4007,6 +4007,8 @@ TEST(partial_send, epollout_no_pending_switches_to_epollin) {
     ev.events = EPOLLOUT;
     ev.data.u64 = (static_cast<u64>(0) << 8) | static_cast<u64>(IoEventType::Send);
     REQUIRE_EQ(epoll_ctl(backend.epoll_fd, EPOLL_CTL_MOD, fds[0], &ev), 0);
+    // Raw interest changes must drop the backend's cached registration.
+    backend.invalidate_fd_interest(0, fds[0]);
 
     // wait() should see EPOLLOUT with no pending send and not emit a Send event.
     u32 n = backend.wait(events, 8, &conn, 1);
