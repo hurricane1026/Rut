@@ -35,9 +35,16 @@ struct UpstreamConn {
 struct UpstreamPool {
     static constexpr u32 kMaxConns = 4096;
 
+    static constexpr u32 kNoSlot = 0xFFFFFFFFu;
+
     UpstreamConn conns[kMaxConns];
     u32 free_stack[kMaxConns];
     u32 free_top = 0;
+    // Parked slots form an intrusive list, most recently parked first, so
+    // take_idle() and sweep() visit only idle entries instead of every slot.
+    u32 idle_prev[kMaxConns];
+    u32 idle_next[kMaxConns];
+    u32 idle_head = kNoSlot;
     // live idle entries — lets take_idle() skip the scan when cold. Atomic only for
     // cross-thread observation; pool slot ownership remains single-threaded.
     std::atomic<u32> idle_count{0};
@@ -45,6 +52,7 @@ struct UpstreamPool {
     void init() {
         free_top = kMaxConns;
         idle_count.store(0, std::memory_order_relaxed);
+        reset_idle_list();
         for (u32 i = 0; i < kMaxConns; i++) {
             conns[i] = UpstreamConn{};
             free_stack[i] = i;
@@ -58,6 +66,7 @@ struct UpstreamPool {
         if (fd < 0 || free_top == 0) return false;
         const u32 idx = free_stack[--free_top];
         conns[idx] = {fd, upstream_id, backend_idx, /*idle=*/true, /*allocated=*/true, now_sec};
+        link_idle(idx);
         idle_count.fetch_add(1, std::memory_order_release);
         return true;
     }
@@ -69,12 +78,14 @@ struct UpstreamPool {
     // Driven by the per-shard 1s timer tick. No-op when the pool is empty.
     void sweep(u32 now_sec, u32 max_idle_sec) {
         if (idle_count.load(std::memory_order_acquire) == 0) return;
-        for (u32 i = 0; i < kMaxConns; i++) {
+        for (u32 i = idle_head; i != kNoSlot;) {
+            const u32 next = idle_next[i];
             UpstreamConn& c = conns[i];
-            if (!c.idle || !c.allocated || c.fd < 0) continue;
-            if (now_sec - c.parked_sec < max_idle_sec) continue;
-            ::close(c.fd);
-            release_slot(i);
+            if (now_sec - c.parked_sec >= max_idle_sec) {
+                ::close(c.fd);
+                release_slot(i);
+            }
+            i = next;
         }
     }
 
@@ -85,18 +96,23 @@ struct UpstreamPool {
     // — only an EAGAIN (nothing buffered, still open) socket is handed back. This
     // catches the common idle-timeout race before any request bytes are sent; the
     // residual probe-vs-send race is handled by the caller's idempotent resend.
+    // Candidates are tried most recently parked first (the likeliest to be live).
     i32 take_idle(u16 upstream_id, u8 backend_idx) {
         if (idle_count.load(std::memory_order_acquire) == 0) return -1;
-        for (u32 i = 0; i < kMaxConns; i++) {
-            UpstreamConn& c = conns[i];
-            if (!c.idle || !c.allocated || c.fd < 0) continue;
-            if (c.upstream_id != upstream_id || c.backend_idx != backend_idx) continue;
+        for (u32 i = idle_head; i != kNoSlot;) {
+            const u32 next = idle_next[i];
+            const UpstreamConn& c = conns[i];
+            if (c.upstream_id != upstream_id || c.backend_idx != backend_idx) {
+                i = next;
+                continue;
+            }
             const i32 fd = c.fd;
             release_slot(i);
             char probe;
             const ssize_t n = ::recv(fd, &probe, 1, MSG_PEEK | MSG_DONTWAIT);
             if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) return fd;  // healthy
             ::close(fd);  // EOF / unexpected data / hard error → not reusable
+            i = next;
         }
         return -1;
     }
@@ -113,6 +129,7 @@ struct UpstreamPool {
         }
         free_top = kMaxConns;
         idle_count.store(0, std::memory_order_release);
+        reset_idle_list();
         for (u32 i = 0; i < kMaxConns; i++) free_stack[i] = i;
     }
 
@@ -124,6 +141,7 @@ struct UpstreamPool {
         }
         free_top = kMaxConns;
         idle_count.store(0, std::memory_order_release);
+        reset_idle_list();
         for (u32 i = 0; i < kMaxConns; i++) free_stack[i] = i;
     }
 
@@ -131,7 +149,31 @@ struct UpstreamPool {
     static i32 create_socket() { return platform::stream_socket(); }
 
 private:
+    void reset_idle_list() {
+        idle_head = kNoSlot;
+        for (u32 i = 0; i < kMaxConns; i++) idle_prev[i] = idle_next[i] = kNoSlot;
+    }
+
+    void link_idle(u32 i) {
+        idle_prev[i] = kNoSlot;
+        idle_next[i] = idle_head;
+        if (idle_head != kNoSlot) idle_prev[idle_head] = i;
+        idle_head = i;
+    }
+
+    void unlink_idle(u32 i) {
+        const u32 prev = idle_prev[i];
+        const u32 next = idle_next[i];
+        if (prev != kNoSlot)
+            idle_next[prev] = next;
+        else
+            idle_head = next;
+        if (next != kNoSlot) idle_prev[next] = prev;
+        idle_prev[i] = idle_next[i] = kNoSlot;
+    }
+
     void release_slot(u32 i) {
+        unlink_idle(i);
         conns[i] = UpstreamConn{};
         if (free_top < kMaxConns) free_stack[free_top++] = i;
         u32 count = idle_count.load(std::memory_order_relaxed);
