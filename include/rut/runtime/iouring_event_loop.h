@@ -1422,11 +1422,12 @@ public:
     // Use the existing separate receive ring so a large buffered origin
     // cannot consume all buffers needed by downstream TLS requests.
     bool add_response_read_recv(Connection& c) {
-        if (c.response_read_deadline_buffering ==
-            ForwardResponseBufferingMode::CompleteContentLength)
-            return backend.add_recv_upstream_once(
-                c.upstream_fd, c.id, c.upstream_episode, backend.upstream_once_max_len());
-        return backend.add_first_response_recv(c.upstream_fd, c.id, c.upstream_episode);
+        return backend.add_first_response_recv(
+            c.upstream_fd,
+            c.id,
+            c.upstream_episode,
+            c.response_read_deadline_buffering ==
+                ForwardResponseBufferingMode::CompleteContentLength);
     }
 
     // Exact one-dispatch witness for a positive terminal upstream Recv.  The

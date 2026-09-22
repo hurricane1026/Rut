@@ -533,7 +533,10 @@ bool IoUringBackend::add_recv_upstream_once(i32 fd,
     return true;
 }
 
-bool IoUringBackend::add_first_response_recv(i32 fd, u32 conn_id, u32 upstream_episode) {
+bool IoUringBackend::add_first_response_recv(i32 fd,
+                                             u32 conn_id,
+                                             u32 upstream_episode,
+                                             bool separate_body_ring) {
     if (fd < 0 || conn_id >= connection_capacity || !valid_upstream_episode(upstream_episode))
         return false;
     io_uring_sqe* sqe = get_sqe();
@@ -542,8 +545,9 @@ bool IoUringBackend::add_first_response_recv(i32 fd, u32 conn_id, u32 upstream_e
     memset(sqe, 0, sizeof(*sqe));
     sqe->opcode = IORING_OP_RECV;
     sqe->fd = fd;
-    sqe->len = kProvidedBufSize;
-    sqe->buf_group = kBufGroupId;
+    const bool large = separate_body_ring && large_buf_ring != nullptr;
+    sqe->len = large ? kLargeProvidedBufSize : kProvidedBufSize;
+    sqe->buf_group = large ? kLargeBufGroupId : kBufGroupId;
     sqe->flags = IOSQE_BUFFER_SELECT;
     sqe->ioprio = IORING_RECV_MULTISHOT;
     sqe->user_data =
@@ -1068,6 +1072,9 @@ u32 IoUringBackend::wait(IoEvent* events, u32 max_events, Connection* conns, u32
     u32 tail = __atomic_load_n(cq_tail, __ATOMIC_ACQUIRE);
     u32 mask = *cq_ring_mask;
     u32 count = 0;
+    u64 last_read_owner_token = 0;
+    u32 last_read_owner_head = 0;
+    bool last_read_owner_valid = false;
 
     auto protocol_failure = [&]() { fatal_error.store(EPROTO, std::memory_order_release); };
     if (tail - head > cq_ring_entries ||
@@ -1375,7 +1382,9 @@ u32 IoUringBackend::wait(IoEvent* events, u32 max_events, Connection* conns, u32
                     type == IoEventType::UpstreamRecv && deadline_owner &&
                     nbytes <= provided_buffer_size(buf_id) &&
                     (nbytes <= avail || buffered_overflow) &&
-                    response_deadline_copy_owner(conn, upstream_episode, aux);
+                    ((last_read_owner_valid && head == last_read_owner_head + 1u &&
+                      cqe->user_data == last_read_owner_token) ||
+                     response_deadline_copy_owner(conn, upstream_episode, aux));
                 const u32 copy_begin =
                     deadline_owner ? conn.buffered_response_len() : target_buf.len();
                 if (deadline_copy_eligible && buffered_overflow)
@@ -1389,6 +1398,19 @@ u32 IoUringBackend::wait(IoEvent* events, u32 max_events, Connection* conns, u32
                 if (to_copy > 0 && !buffered_overflow) {
                     __builtin_memcpy(target_buf.write_ptr(), src, to_copy);
                     target_buf.commit(to_copy);
+                }
+                // Adjacent fragments only append bytes: dispatch has not run,
+                // so their previously checked logical owner cannot change.
+                // Do not reuse this proof across another CQE or a send phase.
+                if (deadline_copy_eligible &&
+                    conn.response_read_deadline_state == ResponseReadDeadlineState::Armed &&
+                    (conn.response_read_deadline_post_commit_phase ==
+                         ResponseReadDeadlinePostCommitPhase::None ||
+                     conn.response_read_deadline_post_commit_phase ==
+                         ResponseReadDeadlinePostCommitPhase::Buffering)) {
+                    last_read_owner_valid = true;
+                    last_read_owner_token = cqe->user_data;
+                    last_read_owner_head = head;
                 }
                 // Report actual bytes copied, not kernel bytes (may differ if buf full)
                 buf_result = (to_copy < nbytes) ? -ENOBUFS : static_cast<i32>(to_copy);
@@ -1456,8 +1478,10 @@ u32 IoUringBackend::wait(IoEvent* events, u32 max_events, Connection* conns, u32
             conns[conn_id].response_read_deadline_buffering ==
                 ForwardResponseBufferingMode::CompleteContentLength &&
             response_deadline_copy_owner(conns[conn_id], upstream_episode, aux) &&
-            add_recv_upstream_once(
-                conns[conn_id].upstream_fd, conn_id, upstream_episode, upstream_once_max_len())) {
+            add_first_response_recv(conns[conn_id].upstream_fd,
+                                    conn_id,
+                                    upstream_episode,
+                                    /*separate_body_ring=*/true)) {
             head++;
             continue;
         }

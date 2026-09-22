@@ -30813,6 +30813,23 @@ TEST(iouring_upstream_recv, one_shot_moves_slice_sized_chunks_through_dedicated_
     fixture.cleanup();
 }
 
+TEST(iouring_upstream_recv, buffered_response_uses_existing_separate_multishot_ring) {
+    ScopedIoUringLoopForRetirement guard;
+    if (!guard.init()) SKIP("io_uring unavailable");
+    auto& backend = guard.loop->backend;
+    const u32 tail = __atomic_load_n(backend.sq_tail, __ATOMIC_ACQUIRE);
+    const u32 pending = backend.pending;
+    REQUIRE(backend.add_first_response_recv(42, 0, 1, true));
+    const auto& sqe = backend.sq_entries[tail & *backend.sq_ring_mask];
+    CHECK_EQ(sqe.opcode, IORING_OP_RECV);
+    CHECK_EQ(sqe.ioprio, IORING_RECV_MULTISHOT);
+    CHECK_EQ(sqe.flags, IOSQE_BUFFER_SELECT);
+    CHECK_EQ(sqe.len, backend.large_buf_ring ? kLargeProvidedBufSize : kProvidedBufSize);
+    CHECK_EQ(sqe.buf_group, backend.large_buf_ring ? kLargeBufGroupId : kBufGroupId);
+    __atomic_store_n(backend.sq_tail, tail, __ATOMIC_RELEASE);
+    backend.pending = pending;
+}
+
 TEST(iouring_upstream_recv, backend_marks_only_empty_ring_enobufs) {
     ScopedIoUringLoopForRetirement guard;
     if (!guard.init()) SKIP("io_uring unavailable");
