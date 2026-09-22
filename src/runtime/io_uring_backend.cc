@@ -601,6 +601,7 @@ bool IoUringBackend::add_send(i32 fd, u32 conn_id, const u8* buf, u32 len, u32 g
 
     memset(sqe, 0, sizeof(*sqe));
     sqe->opcode = IORING_OP_SEND;
+    sqe->msg_flags = MSG_NOSIGNAL;  // explicit; current kernels also force it for io_uring
     sqe->fd = fd;
     sqe->addr = reinterpret_cast<u64>(buf);
     sqe->len = len;
@@ -664,6 +665,7 @@ bool IoUringBackend::add_send_after_direct_write(
         send_state[conn_id].remaining = len;
     } else {
         sqe->opcode = IORING_OP_SEND;
+        sqe->msg_flags = MSG_NOSIGNAL;  // explicit; current kernels also force it for io_uring
         sqe->fd = fd;
         sqe->addr = reinterpret_cast<u64>(buf + written);
         sqe->len = len - written;
@@ -693,6 +695,7 @@ bool IoUringBackend::add_send_upstream(
 
     memset(sqe, 0, sizeof(*sqe));
     sqe->opcode = IORING_OP_SEND;
+    sqe->msg_flags = MSG_NOSIGNAL;  // explicit; current kernels also force it for io_uring
     sqe->fd = fd;
     sqe->addr = reinterpret_cast<u64>(buf);
     sqe->len = len;
@@ -1509,6 +1512,8 @@ u32 IoUringBackend::wait(IoEvent* events, u32 max_events, Connection* conns, u32
                     if (sqe) {
                         memset(sqe, 0, sizeof(*sqe));
                         sqe->opcode = IORING_OP_SEND;
+                        sqe->msg_flags =
+                            MSG_NOSIGNAL;  // explicit; current kernels also force it for io_uring
                         sqe->fd = ss.fd;
                         sqe->addr = reinterpret_cast<u64>(ss.src + ss.offset);
                         sqe->len = ss.remaining;
