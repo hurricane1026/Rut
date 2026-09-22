@@ -134,6 +134,37 @@ class ToolsTest(unittest.TestCase):
         validate_proxy_profile(argparse.ArgumentParser(), args)
         self.assertIsNone(args.body_size)
 
+
+    def test_matrix_profiles_forward_budget_without_dropping_coordinates(self):
+        cases = (([], (2, 1, 1)),
+                 (["--profile", "full"], (10, 2, 3)),
+                 (["--duration", "5", "--warmup", "3", "--repeats", "4"], (5, 3, 4)))
+        for flags, expected in cases:
+            with self.subTest(flags=flags), tempfile.TemporaryDirectory() as directory:
+                output = Path(directory) / "matrix"
+                argv = ["matrix.py", "--output", str(output),
+                        "--tls-cert", "unused.pem", "--tls-key", "unused.key", *flags]
+                previous_sigterm = signal.getsignal(signal.SIGTERM)
+                try:
+                    with mock.patch.object(sys, "argv", argv), \
+                            mock.patch.object(matrix, "run_cell", return_value=2) as child, \
+                            contextlib.redirect_stdout(io.StringIO()) as stdout:
+                        self.assertEqual(matrix.main(), 2)
+                finally:
+                    signal.signal(signal.SIGTERM, previous_sigterm)
+                self.assertEqual(child.call_count, 32)
+                for call in child.call_args_list:
+                    command = call.args[0]
+                    self.assertEqual(tuple(int(command[command.index(flag) + 1])
+                                           for flag in ("--duration", "--warmup", "--repeats")),
+                                     expected)
+                report = json.loads((output / "matrix.json").read_text())
+                self.assertEqual(len(report["cells"]), 96)
+                self.assertFalse(report["target_met"])
+                duration, warmup, repeats = expected
+                self.assertIn(f"load budget {96 * 2 * repeats * (warmup + duration)}s",
+                              stdout.getvalue())
+
     def test_matrix_keeps_valid_groups_only_after_completed_child(self):
         cases = (
             # One failed concurrency must not erase its valid siblings.

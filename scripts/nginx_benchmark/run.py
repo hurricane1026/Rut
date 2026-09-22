@@ -925,6 +925,34 @@ def validate_proxy_profile(parser, args):
     args.body_size = NATIVE_BODY_SIZE
 
 
+def add_measurement_arguments(parser, full_duration):
+    parser.add_argument(
+        "--profile", choices=("quick", "full"), default="quick",
+        help="quick (default): 1s warmup, 2s measurement, 1 repeat; full: original sampling budget",
+    )
+    parser.add_argument("--duration", type=positive, help=f"measurement seconds (full: {full_duration}); overrides profile")
+    parser.add_argument("--warmup", type=positive, help="warmup seconds (full: 2); overrides profile")
+    parser.add_argument("--repeats", type=positive, help="repeats (full: 3); overrides profile")
+    parser.set_defaults(full_duration=full_duration)
+
+
+def resolve_measurement_arguments(args):
+    defaults = (2, 1, 1) if args.profile == "quick" else (args.full_duration, 2, 3)
+    for name, value in zip(("duration", "warmup", "repeats"), defaults):
+        if getattr(args, name) is None:
+            setattr(args, name, value)
+    del args.full_duration
+
+
+def print_measurement_budget(args, cells):
+    repeats = args.repeats if getattr(args, "mode", "benchmark") == "benchmark" else 1
+    seconds = cells * 2 * repeats * (args.warmup + args.duration)
+    print(f"{args.profile} profile: {cells} cells, {repeats} repeat(s), "
+          f"{args.warmup}s warmup + {args.duration}s measurement per engine; "
+          f"load budget {seconds}s ({seconds / 60:.1f} min), plus startup/validation/cleanup",
+          flush=True)
+
+
 def arguments():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--rut", type=Path, required=True)
@@ -957,14 +985,13 @@ def arguments():
     parser.add_argument("--front-port", type=int, default=8087)
     parser.add_argument("--origin-port", type=int, default=9087)
     parser.add_argument("--concurrency", nargs="+", type=positive, default=[1, 32, 128])
-    parser.add_argument("--duration", type=positive, default=8)
-    parser.add_argument("--warmup", type=positive, default=2)
-    parser.add_argument("--repeats", type=positive, default=3)
+    add_measurement_arguments(parser, full_duration=8)
     add_first_engine_argument(parser)
     parser.add_argument(
         "--scenarios", nargs="+", choices=SCENARIOS, default=list(SCENARIOS)
     )
     args = parser.parse_args()
+    resolve_measurement_arguments(args)
     if args.body_size is not None and args.body_size > 1048576:
         parser.error("body-size must be <= 1048576")
     validate_proxy_profile(parser, args)
@@ -1043,6 +1070,7 @@ def main():
     previous_sigterm = signal.signal(signal.SIGTERM, interrupt)
     try:
         harness = Harness(args)
+        print_measurement_budget(args, len(args.scenarios) * len(args.concurrency))
         harness.prepare()
         with harness.nginx(
             "origin", "origin.conf", args.origin_cpu, args.origin_port

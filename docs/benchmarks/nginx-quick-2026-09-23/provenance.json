@@ -1,0 +1,19 @@
+{
+  "runtime_source_from_archived_provenance": "ddf27ee6e4a57929bc99233a22646f48510a4392",
+  "converter_source_from_archived_provenance": "unchanged prior benchmark converter; pinned by binary hash",
+  "runtime_build_from_archived_provenance": "clang22 Release -O2 JIT ON IPO OFF",
+  "wrk_source_from_archived_provenance": "a211dd5a7050b1f9e8a9870b95513060e72ac4a0",
+  "wrk_build_from_archived_provenance": "make -j2 WITH_OPENSSL=/home/hurricane/private/code/Rut/.cache/perf-tools/openssl/usr; bundled LuaJIT; system OpenSSL3.5.8",
+  "binary_hashes_verified_before_run": {
+    "rut": "9ef971fb25949099061580b06a031c52901f7b523f97d86392b31b4bd0b971a2",
+    "converter": "1e5505b58f5392384070b9b8f64053573f51b8fbeaab1ba7b50ccef074e6c3bc",
+    "wrk": "8d38af6d4ccec7be5c41beb50bec9ebde506f89dc76377a1d15f2c2e593f9203"
+  },
+  "harness_source_base": "601f144e",
+  "harness_changes": "Quick-profile changes included in this PR; see harness-source-sha256.json.",
+  "scope": "Fresh HTTP harness run using archived binaries. This is not a rebuild or performance acceptance of current main.",
+  "host_adjustments": [
+    "sg docker uses existing docker group membership",
+    "chcon -t container_file_t on the empty raw output directory permits read-only container config mounts under enforcing SELinux"
+  ]
+}

@@ -10,7 +10,9 @@ import subprocess
 import sys
 from pathlib import Path
 
-from run import SCENARIOS, ERROR_NAMES, positive, save_json
+from run import (SCENARIOS, ERROR_NAMES, positive, save_json,
+                 add_measurement_arguments, resolve_measurement_arguments,
+                 print_measurement_budget)
 
 
 def run_cell(command, log):
@@ -122,10 +124,9 @@ def main():
     parser.add_argument("--body-sizes", nargs="+", type=positive, default=[16, 1024, 65536, 1048576])
     parser.add_argument("--scenarios", nargs="+", choices=SCENARIOS, default=list(SCENARIOS))
     parser.add_argument("--concurrency", nargs="+", type=positive, default=[1, 32, 128])
-    parser.add_argument("--duration", type=positive, default=10)
-    parser.add_argument("--warmup", type=positive, default=2)
-    parser.add_argument("--repeats", type=positive, default=3)
+    add_measurement_arguments(parser, full_duration=10)
     args, common = parser.parse_known_args()
+    resolve_measurement_arguments(args)
     for values in (args.transports, args.body_sizes, args.scenarios, args.concurrency):
         if len(values) != len(set(values)):
             parser.error("duplicate matrix coordinate")
@@ -137,7 +138,9 @@ def main():
     args.output.mkdir(parents=True, exist_ok=True)
     coordinates = list(itertools.product(args.transports, args.body_sizes, args.scenarios))
     report = {"complete": False, "target_met": False,
+              "profile": args.profile,
               "expected_cells": len(coordinates) * len(args.concurrency), "cells": []}
+    print_measurement_budget(args, report["expected_cells"])
     save_json(args.output / "matrix.json", report)
     def interrupt(_signum, _frame):
         raise KeyboardInterrupt
@@ -146,6 +149,7 @@ def main():
         for transport, size, scenario in coordinates:
             folder = args.output / f"{transport}-{size}-{scenario}"
             command = [sys.executable, str(Path(__file__).with_name("run.py")), *common,
+                       "--profile", args.profile,
                        "--output", str(folder), "--body-size", str(size), "--scenarios", scenario,
                        "--concurrency", *map(str, args.concurrency), "--duration", str(args.duration),
                        "--warmup", str(args.warmup), "--repeats", str(args.repeats)]
