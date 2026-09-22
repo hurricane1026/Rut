@@ -8997,6 +8997,9 @@ TEST(tls, server_socket_bio_reports_epipe_without_sigpipe) {
     with_default_sigpipe(_tc, [&] {
         i32 sv[2] = {-1, -1};
         REQUIRE_EQ(rut::test::stream_socketpair(sv), 0);
+        // Prepared like an accepted connection (SO_NOSIGPIPE on macOS, where
+        // kSendFlags carries no MSG_NOSIGNAL).
+        REQUIRE(rut::platform::prepare_socket(sv[0]));
         auto ssl_result = create_tls_server_ssl(context, sv[0]);
         REQUIRE(ssl_result.has_value());
         SSL* ssl = ssl_result.value();
@@ -58910,31 +58913,25 @@ TEST(iouring_send, peerless_send_completes_with_epipe_without_sigpipe) {
     ScopedIoUringLoopForRetirement guard;
     if (!guard.init()) SKIP("io_uring unavailable");
     auto& backend = guard.loop->backend;
-    struct sigaction original{};
-    REQUIRE_EQ(sigaction(SIGPIPE, nullptr, &original), 0);
-    struct sigaction fallback{};
-    fallback.sa_handler = SIG_DFL;
-    sigemptyset(&fallback.sa_mask);
-    REQUIRE_EQ(sigaction(SIGPIPE, &fallback, nullptr), 0);
-
     // SIGPIPE keeps its terminating default. The send SQE carries
     // MSG_NOSIGNAL (current kernels also force it for io_uring sends), so a
     // closed peer completes the send with -EPIPE and the process survives.
-    i32 sv[2] = {-1, -1};
-    REQUIRE_EQ(rut::test::stream_socketpair(sv), 0);
-    close(sv[1]);
-    static const u8 payload[] = {'x', 'y', 'z'};
-    constexpr u32 kConnId = 6;
-    REQUIRE(backend.add_send(sv[0], kConnId, payload, sizeof(payload), 4u));
-    IoEvent events[4]{};
-    u32 n = 0;
-    for (u32 attempt = 0; attempt < 8 && n == 0; attempt++)
-        n = backend.wait(events, 4, guard.loop->conns, IoUringEventLoop::kMaxConns);
-    REQUIRE_EQ(n, 1u);
-    CHECK_EQ(events[0].type, IoEventType::Send);
-    CHECK_EQ(events[0].result, -EPIPE);
-    close(sv[0]);
-    REQUIRE_EQ(sigaction(SIGPIPE, &original, nullptr), 0);
+    with_default_sigpipe(_tc, [&] {
+        i32 sv[2] = {-1, -1};
+        REQUIRE_EQ(rut::test::stream_socketpair(sv), 0);
+        close(sv[1]);
+        static const u8 payload[] = {'x', 'y', 'z'};
+        constexpr u32 kConnId = 6;
+        REQUIRE(backend.add_send(sv[0], kConnId, payload, sizeof(payload), 4u));
+        IoEvent events[4]{};
+        u32 n = 0;
+        for (u32 attempt = 0; attempt < 8 && n == 0; attempt++)
+            n = backend.wait(events, 4, guard.loop->conns, IoUringEventLoop::kMaxConns);
+        close(sv[0]);
+        REQUIRE_EQ(n, 1u);
+        CHECK_EQ(events[0].type, IoEventType::Send);
+        CHECK_EQ(events[0].result, -EPIPE);
+    });
 }
 
 TEST(iouring_final_response, backend_completes_direct_writes_with_the_whole_length) {
