@@ -173,6 +173,10 @@ struct IoEvent {
     u8 copy_deadline_method = 0xffu;
     u32 copy_begin = 0;
     u32 copy_end = 0;
+    // io_uring only: an UpstreamRecv failed with -ENOBUFS because its provided
+    // buffer ring was empty, so no socket bytes were consumed. A -ENOBUFS
+    // produced after a selected buffer's bytes were dropped leaves this clear.
+    u8 provided_ring_empty = 0;
 };
 
 // ResponseReadTimer is a transport-only event. Accept only the exact result
@@ -189,7 +193,7 @@ inline constexpr bool valid_response_read_timer_transport_event(const IoEvent& e
            event.more == 0 && event.aux == 0 && event.upstream_episode == 0 &&
            event.copy_witness == IoEventCopyWitness::None && event.copy_deadline_generation == 0 &&
            event.copy_deadline_profile == 0 && event.copy_deadline_method == 0xffu &&
-           event.copy_begin == 0 && event.copy_end == 0;
+           event.copy_begin == 0 && event.copy_end == 0 && event.provided_ring_empty == 0;
 }
 
 inline constexpr bool io_event_is_tagged_stale(const IoEvent& event, u32 current_episode) {

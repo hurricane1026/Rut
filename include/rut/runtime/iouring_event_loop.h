@@ -37,6 +37,10 @@
 
 namespace rut {
 
+// A bounded one-shot upstream recv may fill the whole upstream receive slice
+// from one dedicated provided buffer.
+static_assert(kLargeProvidedBufSize == SlicePool::kSliceSize);
+
 namespace detail {
 
 // Optional test-binary hook. Production binaries leave this weak symbol
@@ -250,18 +254,20 @@ public:
     };
     ResponseReadBatchOwner response_read_batch_owners[kMaxEventsPerWait];
     u16 response_read_batch_event_owner[kMaxEventsPerWait];
-    u32 response_read_batch_owner_count;
-    u32 response_read_batch_event_count;
-    u32 response_read_batch_event_index;
-    const IoEvent* response_read_batch_events;
+    // Counters default to empty so a loop whose slots are used before init()
+    // (e.g. storage-only setup) never scans indeterminate batch state.
+    u32 response_read_batch_owner_count = 0;
+    u32 response_read_batch_event_count = 0;
+    u32 response_read_batch_event_index = 0;
+    const IoEvent* response_read_batch_events = nullptr;
     u32 response_read_batch_pins[kMaxEventsPerWait];
-    u32 response_read_batch_pin_count;
+    u32 response_read_batch_pin_count = 0;
 
     // Deferred accepts: accepted fds that couldn't be allocated during
     // dispatch because all slots were in pending_free.
     static constexpr u32 kMaxDeferredAccepts = 64;
     i32 deferred_accepts[kMaxDeferredAccepts];
-    u32 deferred_accept_count;
+    u32 deferred_accept_count = 0;
 
     u32 keepalive_timeout = kDefaultKeepaliveTimeout;
     u32 upstream_timeout = kDefaultUpstreamTimeout;
@@ -3116,7 +3122,8 @@ public:
         if (one_shot) {
             const u32 available = c.upstream_recv_buf.write_avail();
             if (available == 0) return false;
-            const u32 recv_len = available < kProvidedBufSize ? available : kProvidedBufSize;
+            const u32 max_len = backend.upstream_once_max_len();
+            const u32 recv_len = available < max_len ? available : max_len;
             submitted =
                 backend.add_recv_upstream_once(c.upstream_fd, c.id, c.upstream_episode, recv_len);
         } else {
@@ -5866,6 +5873,15 @@ public:
                             conn.upstream_recv_armed = false;
                             conn.upstream_recv_cancel_inflight = false;
                             conn.upstream_recv_terminal_stale = false;
+                            // A bounded one-shot recv that found its provided ring
+                            // empty consumed no socket bytes, and its owner is still
+                            // waiting for them: select another buffer rather than
+                            // deliver a terminal the response pumps treat as fatal
+                            // (header) or as already re-armed (body). This batch's
+                            // buffers were returned before dispatch.
+                            const bool one_shot_ring_empty = ev.provided_ring_empty &&
+                                                             ev.result == -ENOBUFS &&
+                                                             use_one_shot_upstream_recv(conn);
                             // A torn-down h2-proxy episode's recv terminal has now drained;
                             // discard any stale positive bytes it left so the next stream
                             // can't parse them as its response. Gated on the flag so the
@@ -5889,6 +5905,10 @@ public:
                             }
                             if (!this->try_deferred_upstream_rearm(conn)) {
                                 this->close_conn(conn);
+                                break;
+                            }
+                            if (one_shot_ring_empty) {
+                                if (!this->submit_recv_upstream(conn)) this->close_conn(conn);
                                 break;
                             }
                         }
