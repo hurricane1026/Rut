@@ -13,6 +13,7 @@
 #include "rut/runtime/http_parser.h"
 #include "rut/runtime/io_event.h"
 #include "rut/runtime/listener_context.h"
+#include "rut/runtime/response_body_chain.h"
 #include "rut/runtime/tls_engine.h"
 #include "rut/runtime/ws_terminate.h"
 
@@ -1587,6 +1588,9 @@ struct ConnectionBase {
     Buffer recv_buf;
     Buffer send_buf;
     u32 send_progress;
+    const u8* local_body_cursor = nullptr;
+    u32 local_body_remaining = 0;
+    u32 local_response_size = 0;
 
     // Upstream recv buffer — separate from client recv_buf to prevent:
     // 1. Client pipelined data being parsed as upstream response
@@ -1595,6 +1599,16 @@ struct ConnectionBase {
     // Lazy-allocated: only proxy connections pay the cost.
     u8* upstream_recv_slice;
     Buffer upstream_recv_buf;
+    ResponseBodyChain response_body_tail{};
+
+    u32 buffered_response_len() const { return upstream_recv_buf.len() + response_body_tail.size; }
+    const u8* buffered_response_data() const {
+        return upstream_recv_buf.len() ? upstream_recv_buf.data() : response_body_tail.data();
+    }
+    u32 buffered_response_front_size() const {
+        return upstream_recv_buf.len() ? upstream_recv_buf.len() : response_body_tail.front_size();
+    }
+
     // io_uring: the final response was written directly and its Send
     // completion (which accounts the request) is still pending.
     bool direct_write_completion_pending;
@@ -1621,6 +1635,7 @@ struct ConnectionBase {
     }
 
     void reset() {
+        response_body_tail = {};
         on_recv = nullptr;
         on_send = nullptr;
         on_upstream_recv = nullptr;
@@ -1855,6 +1870,9 @@ struct ConnectionBase {
         recv_buf.bind(nullptr, 0);
         send_buf.bind(nullptr, 0);
         send_progress = 0;
+        local_body_cursor = nullptr;
+        local_body_remaining = 0;
+        local_response_size = 0;
         upstream_recv_slice = nullptr;
         upstream_recv_buf.bind(nullptr, 0);
         direct_write_completion_pending = false;

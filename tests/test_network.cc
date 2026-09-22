@@ -33016,8 +33016,8 @@ bool stage_live_precise_request(IoUringEventLoop* loop,
     const u8* request = bodyless_get ? (downstream_close ? kGetCloseRequest : kGetKeepAliveRequest)
                         : downstream_close ? kCloseRequest
                                            : kKeepAliveRequest;
-    const u32 request_len = bodyless_get       ? (downstream_close ? sizeof(kGetCloseRequest) - 1u
-                                                                   : sizeof(kGetKeepAliveRequest) - 1u)
+    const u32 request_len = bodyless_get ? (downstream_close ? sizeof(kGetCloseRequest) - 1u
+                                                             : sizeof(kGetKeepAliveRequest) - 1u)
                             : downstream_close ? sizeof(kCloseRequest) - 1u
                                                : sizeof(kKeepAliveRequest) - 1u;
     if (conn->recv_buf.write(request, request_len) != request_len) return fail();
@@ -55425,8 +55425,123 @@ TEST(response_buffering_runtime,
     }
 }
 
+TEST(response_buffering_runtime, body_slices_remain_owned_until_deferred_send_reclamation) {
+    for (const bool pending : {false, true}) {
+        ScopedIoUringLoopForRetirement guard;
+        if (!guard.init()) SKIP("io_uring unavailable");
+        auto* loop = guard.loop;
+        Connection* conn = loop->alloc_conn();
+        REQUIRE(conn != nullptr);
+        u8 body[4096];
+        memset(body, 0x7b, sizeof(body));
+        REQUIRE(conn->response_body_tail.append(loop->pool, body, sizeof(body)));
+        const u8* bytes = conn->response_body_tail.data();
+        const u32 index = (reinterpret_cast<u8*>(conn->response_body_tail.head) - loop->pool.base) /
+                          SlicePool::kSliceSize;
+        const u32 id = conn->id;
+        const u32 free_before = loop->free_top;
+        conn->pending_ops = pending ? 1 : 0;
+        loop->free_conn_impl(*conn);
+        if (pending) {
+            CHECK_EQ(loop->free_top, free_before);
+            CHECK_EQ(loop->pool.in_use_map[index], 1u);
+            CHECK_EQ(loop->conns[id].response_body_tail.data(), bytes);
+            CHECK_EQ(memcmp(bytes, body, sizeof(body)), 0);
+            loop->reclaim_pending();
+            CHECK_EQ(loop->pool.in_use_map[index], 1u);
+            loop->conns[id].pending_ops = 0;
+            loop->reclaim_pending();
+        }
+        CHECK_EQ(loop->pool.in_use_map[index], 0u);
+        CHECK_EQ(loop->conns[id].response_body_tail.size, 0u);
+        CHECK_EQ(loop->free_top, free_before + 1u);
+        loop->reclaim_pending();
+        CHECK_EQ(loop->free_top, free_before + 1u);
+    }
+}
+
+TEST(response_buffering_runtime, empty_provided_ring_rearms_without_losing_buffered_bytes) {
+    for (const bool with_progress : {false, true}) {
+        for (const bool kernel_empty : {false, true}) {
+            ScopedIoUringLoopForRetirement guard;
+            if (!guard.init()) SKIP("io_uring unavailable");
+            auto* loop = guard.loop;
+            RouteConfig config{};
+            REQUIRE(config.add_upstream("backend", 0x7F000001, 9000).has_value());
+            REQUIRE(add_bodyless_non_head_response_read_deadline_bundle(
+                config, 5, ForwardResponseBufferingMode::CompleteContentLength));
+            PrebuiltD2Fixture fixture{};
+            REQUIRE(stage_strict_read_timeout(loop, &config, nullptr, 0, &fixture, true));
+            REQUIRE(arm_staged_response_read_deadline(loop, fixture));
+            Connection& conn = *fixture.conn;
+            static constexpr u8 header[] = "HTTP/1.1 200 OK\r\nContent-Length: 65536\r\n\r\n";
+            REQUIRE_EQ(conn.upstream_recv_buf.write(header, sizeof(header) - 1),
+                       sizeof(header) - 1);
+            const IoEvent first =
+                response_read_copy_event(conn, sizeof(header) - 1, true, 0, sizeof(header) - 1);
+            loop->dispatch_batch(&first, 1);
+            REQUIRE_EQ(conn.response_read_deadline_post_commit_phase,
+                       ResponseReadDeadlinePostCommitPhase::Buffering);
+            u8 bytes[4096];
+            memset(bytes, 0x5a, sizeof(bytes));
+            IoEvent events[2]{};
+            u32 count = 0;
+            if (with_progress) {
+                const u32 begin = conn.buffered_response_len();
+                REQUIRE(conn.response_body_tail.append(loop->pool, bytes, sizeof(bytes)));
+                events[count++] = response_read_copy_event(
+                    conn, sizeof(bytes), true, begin, conn.buffered_response_len());
+            }
+            IoEvent empty{
+                conn.id, -ENOBUFS, 0, 0, IoEventType::UpstreamRecv, 0, 0, conn.upstream_episode};
+            empty.provided_ring_empty = kernel_empty;
+            const u32 id = conn.id;
+            if (kernel_empty) {
+                // Keep the staged operations out of the real kernel. Inject
+                // the empty-ring CQE at the backend boundary that owns retries.
+                auto& backend = loop->backend;
+                __atomic_store_n(backend.sq_tail, fixture.sq_tail_before, __ATOMIC_RELEASE);
+                backend.pending = 0;
+                const u32 cq_tail = __atomic_load_n(backend.cq_tail, __ATOMIC_ACQUIRE);
+                auto& cqe = backend.cq_entries[cq_tail & *backend.cq_ring_mask];
+                cqe.user_data = encode_upstream_event_token(
+                    {id, IoEventType::UpstreamRecv, conn.upstream_episode, 0});
+                cqe.res = -ENOBUFS;
+                cqe.flags = 0;
+                __atomic_store_n(backend.cq_tail, cq_tail + 1u, __ATOMIC_RELEASE);
+                IoEvent harvested[2]{};
+                const u32 pending_ops = conn.pending_ops;
+                REQUIRE_EQ(backend.wait(harvested, 2, loop->conns, IoUringEventLoop::kMaxConns),
+                           0u);
+                CHECK_EQ(backend.pending, 1u);
+                CHECK_EQ(conn.pending_ops, pending_ops);
+                if (count) loop->dispatch_batch(events, count);
+            } else {
+                events[count++] = empty;
+                loop->dispatch_batch(events, count);
+            }
+            if (kernel_empty) {
+                REQUIRE_GE(conn.fd, 0);
+                CHECK(conn.upstream_recv_armed);
+                CHECK_EQ(conn.response_read_deadline_state, ResponseReadDeadlineState::Armed);
+                CHECK_EQ(conn.response_read_deadline_post_commit_origin_received,
+                         with_progress ? sizeof(bytes) : 0u);
+                CHECK_EQ(conn.response_body_tail.size, with_progress ? sizeof(bytes) : 0u);
+                if (with_progress)
+                    CHECK_EQ(memcmp(conn.response_body_tail.data(), bytes, sizeof(bytes)), 0);
+                CHECK_EQ(loop->backend.send_state[id].remaining, 0u);
+                cleanup_prebuilt_d2(loop, fixture);
+            } else {
+                CHECK_EQ(loop->conns[id].fd, -1);
+                CHECK_EQ(loop->backend.send_state[id].remaining, 0u);
+                release_closed_response_read_fixture(fixture);
+            }
+        }
+    }
+}
+
 TEST(response_buffering_runtime,
-     exact_origin_slice_capacity_is_admitted_and_capacity_plus_one_is_atomic) {
+     slice_boundary_and_body_limit_are_admitted_but_limit_plus_one_is_atomic) {
     char header[128];
     u32 exact_cl = SlicePool::kSliceSize - 48u;
     u32 header_len = 0;
@@ -55440,7 +55555,9 @@ TEST(response_buffering_runtime,
     }
     REQUIRE_EQ(header_len + exact_cl, SlicePool::kSliceSize);
 
-    for (const bool overflow : {false, true}) {
+    for (u32 declared :
+         {exact_cl, exact_cl + 1u, ResponseBodyChain::kMaxBody, ResponseBodyChain::kMaxBody + 1u}) {
+        const bool overflow = declared > ResponseBodyChain::kMaxBody;
         ScopedIoUringLoopForRetirement guard;
         if (!guard.init()) SKIP("io_uring unavailable");
         auto* loop = guard.loop;
@@ -55452,7 +55569,6 @@ TEST(response_buffering_runtime,
         REQUIRE(stage_strict_read_timeout(loop, &config, nullptr, 0, &fixture, true));
         REQUIRE(arm_staged_response_read_deadline(loop, fixture));
         Connection& conn = *fixture.conn;
-        const u32 declared = exact_cl + static_cast<u32>(overflow);
         const int n = snprintf(
             header, sizeof(header), "HTTP/1.1 200 OK\r\nContent-Length: %u\r\n\r\n", declared);
         REQUIRE_GT(n, 0);
@@ -55469,9 +55585,9 @@ TEST(response_buffering_runtime,
             REQUIRE_GE(conn.fd, 0);
             CHECK_EQ(conn.response_read_deadline_post_commit_phase,
                      ResponseReadDeadlinePostCommitPhase::Buffering);
-            CHECK_EQ(conn.response_read_deadline_post_commit_raw_header_end +
-                         conn.response_read_deadline_post_commit_declared_body,
-                     conn.upstream_recv_buf.capacity());
+            CHECK_EQ(conn.response_read_deadline_post_commit_declared_body, declared);
+            CHECK_EQ(conn.response_body_tail.size, 0u);  // no eager body allocation
+            CHECK_EQ(conn.upstream_recv_buf.capacity(), SlicePool::kSliceSize);
             CHECK_EQ(loop->backend.send_state[id].remaining, 0u);
             cleanup_prebuilt_d2(loop, fixture);
         }
@@ -59301,6 +59417,9 @@ TEST(iouring_final_response, direct_write_is_limited_to_closing_plaintext_local_
     conn->transition_to_sending(&on_response_sent<IoUringEventLoop>);
     const u8* buf = conn->send_buf.data();
     CHECK(loop->final_local_response_send(*conn, buf, 3u));
+    conn->local_body_remaining = 1;
+    CHECK_FALSE(loop->final_local_response_send(*conn, buf, 3u));
+    conn->local_body_remaining = 0;
     CHECK_FALSE(loop->final_local_response_send(*conn, buf, 2u));  // not the whole buffer
     CHECK_FALSE(loop->final_local_response_send(*conn, buf + 1, 2u));
     conn->keep_alive = true;
@@ -66512,6 +66631,63 @@ TEST(response_headers, content_type_removal_suppresses_direct_response_default) 
     CHECK(buf_contains(response, conn.send_buf.len(), "Content-Length: 2\r\n", 19));
     CHECK_FALSE(buf_contains(response, conn.send_buf.len(), "Content-Type:", 13));
     CHECK(buf_contains(response, conn.send_buf.len(), "\r\n\r\n{}", 6));
+}
+
+TEST(response_headers, large_config_body_drains_in_order_through_the_existing_send_slice) {
+    for (const bool custom_headers : {false, true}) {
+        SmallLoop loop;
+        loop.setup();
+        loop.inject_and_dispatch(make_ev(0, IoEventType::Accept, 42));
+        auto* conn = loop.find_fd(42);
+        REQUIRE(conn != nullptr);
+        RouteConfig cfg{};
+        u8 body[65536];
+        for (u32 i = 0; i < sizeof(body); ++i) body[i] = static_cast<u8>(i * 29 + i / 4096);
+        REQUIRE_EQ(cfg.add_response_body_view(reinterpret_cast<const char*>(body), sizeof(body)),
+                   1u);
+        conn->request_config = &cfg;
+        if (custom_headers) {
+            const char* keys[] = {"X-Test"};
+            const u32 key_lens[] = {6};
+            const char* values[] = {"yes"};
+            const u32 value_lens[] = {3};
+            REQUIRE_EQ(cfg.add_response_header_set(keys, key_lens, values, value_lens, 1), 1u);
+        }
+        JitDispatchOutcome outcome{};
+        outcome.kind = JitDispatchOutcome::Kind::ReturnStatus;
+        outcome.status_code = 200;
+        outcome.response_body_idx = 1;
+        outcome.response_headers_idx = custom_headers ? 1 : 0;
+        handle_jit_outcome<SmallLoop>(&loop, *conn, outcome, nullptr, true);
+        const u8* slice = conn->send_buf.data();
+        const u32 capacity = conn->send_buf.capacity();
+        u32 header_end = 0;
+        for (u32 i = 0; i + 4 <= conn->send_buf.len(); ++i) {
+            if (memcmp(slice + i, "\r\n\r\n", 4) == 0) {
+                header_end = i + 4;
+                break;
+            }
+        }
+        REQUIRE_GT(header_end, 0u);
+        CHECK_EQ(conn->local_response_size, header_end + sizeof(body));
+        u32 offset = 0;
+        u32 prefix = header_end;
+        while (offset < sizeof(body)) {
+            REQUIRE_EQ(conn->send_buf.data(), slice);
+            REQUIRE_EQ(conn->send_buf.capacity(), capacity);
+            const u32 n = conn->send_buf.len() - prefix;
+            REQUIRE_GT(n, 0u);
+            REQUIRE_LE(n, sizeof(body) - offset);
+            CHECK_EQ(memcmp(conn->send_buf.data() + prefix, body + offset, n), 0);
+            offset += n;
+            const u32 sent = conn->send_buf.len();
+            on_response_sent<SmallLoop>(&loop, *conn, make_ev(conn->id, IoEventType::Send, sent));
+            prefix = 0;
+        }
+        CHECK_EQ(conn->local_body_remaining, 0u);
+        CHECK_EQ(conn->local_body_cursor, nullptr);
+        CHECK_EQ(conn->local_response_size, 0u);
+    }
 }
 
 TEST(response_headers, committed_after_header_preserves_status_reason_body) {

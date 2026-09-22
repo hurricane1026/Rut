@@ -191,6 +191,24 @@ static u64 sentinel_timer_handler(void*, jit::HandlerCtx*, const u8*, u32, void*
     return jit::HandlerResult::make_status(200).pack();
 }
 
+TEST(serve_loader, large_response_body_borrows_the_pinned_module_storage) {
+    const std::string body(1048576, 'x');
+    const std::string source =
+        "route GET \"/static\" { return response(200, body: \"" + body + "\") }\n";
+    const std::string path =
+        write_file("/tmp/rut_serve_loader_large_body", "app.rut", source.c_str());
+    LoadedProgram program;
+    LoadError err;
+    REQUIRE(load_rut_program(path.c_str(), program, err));
+    REQUIRE_EQ(program.config.response_body_count, 1u);
+    CHECK_EQ(program.config.body_pool_used, 0u);
+    CHECK_EQ(program.config.response_bodies[0].data, program.rir.module.response_bodies[0].ptr);
+    CHECK_EQ(program.config.response_bodies[0].len, body.size());
+    CHECK_EQ(memcmp(program.config.response_bodies[0].data, body.data(), body.size()), 0);
+    program.destroy();
+    CHECK_EQ(program.config.response_body_count, 0u);
+}
+
 TEST(serve_loader, status_routes_load) {
     const std::string dir = "/tmp/rut_serve_loader_status";
     const std::string path = write_file(dir,

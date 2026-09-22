@@ -294,7 +294,8 @@ bool load_rut_program(
     // register_jit_routes then resolves each handler symbol and adds
     // the routes. Both fail closed.
     err.stage = LoadStage::Register;
-    if (!populate_route_config(out.config, out.rir.module)) return false;
+    if (!populate_route_config(out.config, out.rir.module, /*retain_response_body_views=*/true))
+        return false;
     if (!register_jit_routes(out.config, out.rir.module, out.engine)) return false;
 
 #if RUT_ENABLE_WEBSOCKET

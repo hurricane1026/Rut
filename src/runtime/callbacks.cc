@@ -603,8 +603,12 @@ void format_static_response(Connection& conn, u16 code, bool keep_alive) {
     if (kBodyLen > 0) conn.send_buf.write(reinterpret_cast<const u8*>(reason), kBodyLen);
 }
 
-void format_response_with_body(
-    Connection& conn, u16 code, const char* body_data, u32 body_len, bool keep_alive) {
+void format_response_with_body(Connection& conn,
+                               u16 code,
+                               const char* body_data,
+                               u32 body_len,
+                               bool keep_alive,
+                               bool headers_only) {
     // 204 / 304 / 1xx carry no body per HTTP spec; fall back to the
     // default formatter for those codes even if a body was supplied.
     const bool kNoBody = (code < 200 || code == 204 || code == 304);
@@ -624,7 +628,8 @@ void format_response_with_body(
                            keep_alive,
                            kDefaultContentType,
                            sizeof(kDefaultContentType) - 1);
-    if (body_len > 0) conn.send_buf.write(reinterpret_cast<const u8*>(body_data), body_len);
+    if (!headers_only && body_len > 0)
+        conn.send_buf.write(reinterpret_cast<const u8*>(body_data), body_len);
 }
 
 // Case-insensitive compare against a string literal. Templated on the
@@ -694,7 +699,7 @@ static u32 decimal_digit_count(u32 v) {
     return n;
 }
 
-void format_response_with_body_and_headers(Connection& conn,
+bool format_response_with_body_and_headers(Connection& conn,
                                            u16 code,
                                            const char* body_data,
                                            u32 body_len,
@@ -702,7 +707,8 @@ void format_response_with_body_and_headers(Connection& conn,
                                            u32 header_count,
                                            bool keep_alive,
                                            bool body_is_fallback_reason_phrase,
-                                           bool suppress_default_content_type) {
+                                           bool suppress_default_content_type,
+                                           bool headers_only) {
     const bool kNoBody = (code < 200 || code == 204 || code == 304);
     const u32 body_len_emit = kNoBody ? 0 : body_len;
     const char* reason = status_reason(code);
@@ -755,7 +761,7 @@ void format_response_with_body_and_headers(Connection& conn,
     }
     needed += (keep_alive ? kConnKeepAliveLine : kConnCloseLine);
     needed += 2;  // blank line terminator
-    needed += body_len_emit;
+    if (!headers_only) needed += body_len_emit;
     if (needed > conn.send_buf.capacity()) {
         // Fail closed: force connection close and emit a small 500.
         // format_static_response uses the reason-phrase body which is
@@ -767,7 +773,7 @@ void format_response_with_body_and_headers(Connection& conn,
         conn.resp_status = 500;
         conn.keep_alive = false;
         format_static_response(conn, 500, /*keep_alive=*/false);
-        return;
+        return false;
     }
 
     conn.send_buf.reset();
@@ -812,9 +818,10 @@ void format_response_with_body_and_headers(Connection& conn,
         conn.send_buf.write(reinterpret_cast<const u8*>("Connection: close\r\n"), 19);
     conn.send_buf.write(reinterpret_cast<const u8*>("\r\n"), 2);
 
-    if (body_len_emit > 0) {
+    if (!headers_only && body_len_emit > 0) {
         conn.send_buf.write(reinterpret_cast<const u8*>(body_data), body_len_emit);
     }
+    return true;
 }
 
 void prepare_early_response_state(Connection& conn) {

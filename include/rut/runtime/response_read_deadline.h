@@ -232,21 +232,13 @@ inline bool complete_content_length_content_type_view(const ParsedResponse& resp
     return true;
 }
 
-inline bool complete_content_length_pinned_header_matches(
+inline bool complete_content_length_parsed_header_matches(
     const Connection& c,
+    const ParsedResponse& parsed,
     u32 declared_body,
     CompleteContentLengthResponseClassification* out_classification = nullptr) {
     if (c.request_config == nullptr ||
-        !c.request_config->response_policy_id_is_valid(c.response_policy_id) ||
-        c.response_header_buf.data() == nullptr || c.response_header_buf.len() == 0)
-        return false;
-    HttpResponseParser parser;
-    ParsedResponse parsed;
-    parser.reset();
-    parsed.reset();
-    if (parser.parse(c.response_header_buf.data(), c.response_header_buf.len(), &parsed) !=
-            ParseStatus::Complete ||
-        parser.header_end != c.response_header_buf.len() || parsed.version != HttpVersion::Http11)
+        !c.request_config->response_policy_id_is_valid(c.response_policy_id))
         return false;
     const CompleteContentLengthResponseClassification classification =
         classify_complete_content_length_response(parsed);
@@ -289,13 +281,30 @@ inline bool complete_content_length_pinned_header_matches(
     return true;
 }
 
+inline bool complete_content_length_pinned_header_matches(
+    const Connection& c,
+    u32 declared_body,
+    CompleteContentLengthResponseClassification* out_classification = nullptr) {
+    if (c.response_header_buf.data() == nullptr || c.response_header_buf.len() == 0) return false;
+    HttpResponseParser parser;
+    ParsedResponse parsed;
+    parser.reset();
+    parsed.reset();
+    if (parser.parse(c.response_header_buf.data(), c.response_header_buf.len(), &parsed) !=
+            ParseStatus::Complete ||
+        parser.header_end != c.response_header_buf.len() || parsed.version != HttpVersion::Http11)
+        return false;
+    return complete_content_length_parsed_header_matches(
+        c, parsed, declared_body, out_classification);
+}
+
 inline bool complete_content_length_raw_origin_matches_pinned(
     const Connection& c,
     u32 raw_header_end,
     u32 declared_body,
     CompleteContentLengthResponseClassification* out_classification = nullptr) {
     if (raw_header_end == 0 || raw_header_end > c.upstream_recv_buf.len() ||
-        !complete_content_length_pinned_header_matches(c, declared_body))
+        c.response_header_buf.data() == nullptr || c.response_header_buf.len() == 0)
         return false;
 
     HttpResponseParser raw_parser;
@@ -317,6 +326,8 @@ inline bool complete_content_length_raw_origin_matches_pinned(
     if (pinned_parser.parse(c.response_header_buf.data(), c.response_header_buf.len(), &pinned) !=
             ParseStatus::Complete ||
         pinned_parser.header_end != c.response_header_buf.len() ||
+        pinned.version != HttpVersion::Http11 ||
+        !complete_content_length_parsed_header_matches(c, pinned, declared_body) ||
         raw.status_code != pinned.status_code || raw.reason.len != pinned.reason.len ||
         (raw.reason.len != 0 &&
          __builtin_memcmp(raw.reason.ptr, pinned.reason.ptr, raw.reason.len) != 0))
@@ -2229,7 +2240,9 @@ inline bool response_read_deadline_post_commit_is_stable(const Connection& c) {
         c.response_read_deadline_post_commit_declared_body == 0 ||
         c.response_read_deadline_post_commit_raw_header_end > c.upstream_recv_buf.capacity() ||
         c.response_read_deadline_post_commit_declared_body >
-            c.upstream_recv_buf.capacity() - c.response_read_deadline_post_commit_raw_header_end ||
+            (complete_buffering ? ResponseBodyChain::kMaxBody
+                                : c.upstream_recv_buf.capacity() -
+                                      c.response_read_deadline_post_commit_raw_header_end) ||
         c.response_read_deadline_post_commit_origin_received >
             c.response_read_deadline_post_commit_declared_body ||
         c.response_read_deadline_post_commit_downstream_completed >

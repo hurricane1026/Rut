@@ -3,6 +3,7 @@
 // SliceArena: SlicePool-backed, fixed 16KB blocks (runtime hot path).
 #include "fault_injection.h"
 #include "rut/runtime/arena.h"
+#include "rut/runtime/response_body_chain.h"
 #include "rut/runtime/slice_pool.h"
 #include "test.h"
 
@@ -871,4 +872,53 @@ TEST(slice_arena, multiple_arenas_same_pool) {
 
 int main(int argc, char** argv) {
     return rut::test::run_all(argc, argv);
+}
+
+TEST(response_body_chain, fragmented_bytes_drain_without_copying_live_nodes) {
+    SlicePool pool;
+    REQUIRE(pool.init(80).has_value());
+    ResponseBodyChain chain;
+    u8 bytes[SlicePool::kSliceSize];
+    for (u32 i = 0; i < sizeof(bytes); ++i) bytes[i] = static_cast<u8>(i * 17 + i / 251);
+    for (u32 i = 0; i < 64; ++i) REQUIRE(chain.append(pool, bytes, sizeof(bytes)));
+    CHECK_EQ(chain.size, ResponseBodyChain::kMaxBody);
+    CHECK(!chain.append(pool, bytes, 1));
+    u32 offset = 0;
+    while (chain.size != 0) {
+        const u8* address = chain.data();
+        const u32 available = chain.front_size();
+        const u32 n = available > 137 ? 137 : available;
+        for (u32 i = 0; i < n; ++i) CHECK_EQ(address[i], bytes[(offset + i) % sizeof(bytes)]);
+        chain.consume(n);
+        if (n < available) CHECK(chain.data() == address + n);
+        offset += n;
+    }
+    CHECK_EQ(offset, ResponseBodyChain::kMaxBody);
+    CHECK_EQ(pool.in_use(), 0u);
+    chain.release();
+    pool.destroy();
+}
+
+TEST(response_body_chain, exhausted_reservation_is_atomic_and_reusable) {
+    SlicePool pool;
+    REQUIRE(pool.init(2).has_value());
+    ResponseBodyChain chain;
+    u8 bytes[SlicePool::kSliceSize]{};
+    bytes[0] = 91;
+    REQUIRE(chain.append(pool, bytes, 1));
+    const u8* first = chain.data();
+    // Needs two new slices; only one is available. No prefix may be appended.
+    CHECK(!chain.append(pool, bytes, ResponseBodyChain::kPayload * 2));
+    CHECK_EQ(chain.size, 1u);
+    CHECK_EQ(pool.in_use(), 1u);
+    CHECK(chain.data() == first);
+    CHECK_EQ(chain.data()[0], 91);
+    REQUIRE(chain.append(pool, bytes, sizeof(bytes)));
+    CHECK_EQ(chain.size, 1u + sizeof(bytes));
+    chain.release();
+    CHECK_EQ(pool.in_use(), 0u);
+    REQUIRE(chain.append(pool, bytes, 1));
+    CHECK_EQ(chain.data()[0], 91);
+    chain.release();
+    pool.destroy();
 }

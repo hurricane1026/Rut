@@ -880,8 +880,12 @@ void format_static_response(Connection& conn, u16 code, bool keep_alive);
 // body_len + default Content-Type (text/plain; charset=utf-8) + body
 // bytes. For codes that must have no body (1xx / 204 / 304) falls
 // back to format_static_response.
-void format_response_with_body(
-    Connection& conn, u16 code, const char* body_data, u32 body_len, bool keep_alive);
+void format_response_with_body(Connection& conn,
+                               u16 code,
+                               const char* body_data,
+                               u32 body_len,
+                               bool keep_alive,
+                               bool headers_only = false);
 
 // Custom-headers variant: emits each `headers[i]` pair (indexed
 // [0, header_count)) before the blank line. If any user-supplied key
@@ -910,7 +914,7 @@ struct ResponseHeaderKV {
     const char* value_data;
     u32 value_len;
 };
-void format_response_with_body_and_headers(Connection& conn,
+bool format_response_with_body_and_headers(Connection& conn,
                                            u16 code,
                                            const char* body_data,
                                            u32 body_len,
@@ -918,7 +922,8 @@ void format_response_with_body_and_headers(Connection& conn,
                                            u32 header_count,
                                            bool keep_alive,
                                            bool body_is_fallback_reason_phrase = false,
-                                           bool suppress_default_content_type = false);
+                                           bool suppress_default_content_type = false,
+                                           bool headers_only = false);
 inline bool apply_request_policy(Connection& conn, const sockaddr_in& endpoint, u16 policy_id);
 inline bool materialize_request_target_transform(Connection& conn, const RouteConfig& config);
 inline bool build_redirect_response(const Connection& conn,
@@ -2783,11 +2788,29 @@ void on_response_sent(void* lp, Connection& conn, IoEvent ev) {
         return;
     }
 
-    // Send complete — clear all slots (will set on_recv for keep-alive below).
     conn.send_progress = 0;
+    if (conn.local_body_remaining != 0) {
+        // Reuse the existing send slice. The config stays pinned until request
+        // completion; kernel sends never borrow config memory past close.
+        const u32 n = conn.local_body_remaining < conn.send_buf.capacity()
+                          ? conn.local_body_remaining
+                          : conn.send_buf.capacity();
+        conn.send_buf.reset();
+        conn.send_buf.write(conn.local_body_cursor, n);
+        conn.local_body_cursor += n;
+        conn.local_body_remaining -= n;
+        conn.transition_to_sending(&on_response_sent<Loop>);
+        if (!client_send(loop, conn, conn.send_buf.data(), n) && conn.fd >= 0)
+            loop->close_conn(conn);
+        return;
+    }
+    // Send complete — clear all slots (will set on_recv for keep-alive below).
     conn.clear_slots();
-
-    on_request_complete(loop, conn, conn.resp_status, conn.send_buf.len());
+    const u32 response_size =
+        conn.local_response_size ? conn.local_response_size : conn.send_buf.len();
+    conn.local_body_cursor = nullptr;
+    conn.local_response_size = 0;
+    on_request_complete(loop, conn, conn.resp_status, response_size);
     conn.send_buf.reset();
     loop->epoch_leave();
 
@@ -3222,6 +3245,10 @@ void handle_jit_outcome(Loop* loop,
             const RouteConfig* cfg = conn.request_config;
             const bool has_body = outcome.response_body_idx != 0 && cfg != nullptr &&
                                   outcome.response_body_idx <= cfg->response_body_count;
+            const bool segmented_body = has_body && outcome.status_code >= 200 &&
+                                        outcome.status_code != 204 && outcome.status_code != 304 &&
+                                        cfg->response_bodies[outcome.response_body_idx - 1].len >
+                                            RouteConfig::kResponseBodyPoolBytes;
             const bool has_header_set =
                 outcome.response_headers_idx != 0 && cfg != nullptr &&
                 outcome.response_headers_idx <= cfg->response_header_set_count;
@@ -3251,6 +3278,7 @@ void handle_jit_outcome(Loop* loop,
             // — matches the no-headers path's documented behavior of
             // falling back rather than rendering garbage.
             const bool body_idx_invalid = outcome.response_body_idx != 0 && !has_body;
+            bool response_formatted = true;
             if (has_header_set || header_count != 0 || suppress_default_content_type) {
                 const char* body_data = nullptr;
                 u32 body_len = 0;
@@ -3273,21 +3301,36 @@ void handle_jit_outcome(Loop* loop,
                     body_len = reason_len;
                     body_is_fallback = true;
                 }
-                format_response_with_body_and_headers(conn,
-                                                      outcome.status_code,
-                                                      body_data,
-                                                      body_len,
-                                                      kvs,
-                                                      header_count,
-                                                      effective_keep_alive,
-                                                      body_is_fallback,
-                                                      suppress_default_content_type);
+                response_formatted =
+                    format_response_with_body_and_headers(conn,
+                                                          outcome.status_code,
+                                                          body_data,
+                                                          body_len,
+                                                          kvs,
+                                                          header_count,
+                                                          effective_keep_alive,
+                                                          body_is_fallback,
+                                                          suppress_default_content_type,
+                                                          segmented_body);
             } else if (has_body) {
                 const auto& body = cfg->response_bodies[outcome.response_body_idx - 1];
-                format_response_with_body(
-                    conn, outcome.status_code, body.data, body.len, effective_keep_alive);
+                format_response_with_body(conn,
+                                          outcome.status_code,
+                                          body.data,
+                                          body.len,
+                                          effective_keep_alive,
+                                          segmented_body);
             } else {
                 format_static_response(conn, outcome.status_code, effective_keep_alive);
+            }
+            if (segmented_body && response_formatted) {
+                const auto& body = cfg->response_bodies[outcome.response_body_idx - 1];
+                const u32 n =
+                    body.len < conn.send_buf.write_avail() ? body.len : conn.send_buf.write_avail();
+                conn.local_response_size = conn.send_buf.len() + body.len;
+                conn.send_buf.write(reinterpret_cast<const u8*>(body.data), n);
+                conn.local_body_cursor = reinterpret_cast<const u8*>(body.data) + n;
+                conn.local_body_remaining = body.len - n;
             }
             conn.transition_to_sending(&on_response_sent<Loop>);
             client_send(loop, conn, conn.send_buf.data(), conn.send_buf.len());
@@ -6871,7 +6914,7 @@ void pump_response_read_deadline_body(Loop* loop, Connection& conn) {
     }
     const u32 received = conn.response_read_deadline_post_commit_origin_received;
     const u32 completed = conn.response_read_deadline_post_commit_downstream_completed;
-    if (completed > received || conn.upstream_recv_buf.len() != received - completed) {
+    if (completed > received || conn.buffered_response_len() != received - completed) {
         loop->close_conn(conn);
         return;
     }
@@ -6883,7 +6926,9 @@ void pump_response_read_deadline_body(Loop* loop, Connection& conn) {
         loop->close_conn(conn);
         return;
     }
-    const u32 available = publish_body - completed;
+    const u32 remaining = publish_body - completed;
+    const u32 front = conn.buffered_response_front_size();
+    const u32 available = remaining < front ? remaining : front;
     if (available == 0) {
         const bool combined_send_marker =
             conn.response_read_deadline_send_kind == ResponseReadDeadlineSendKind::Combined ||
@@ -7004,7 +7049,7 @@ void pump_response_read_deadline_body(Loop* loop, Connection& conn) {
     conn.upstream_send_len = available;
     conn.response_read_deadline_post_commit_phase = ResponseReadDeadlinePostCommitPhase::BodySend;
     conn.transition_to_sending(&on_response_body_sent<Loop>);
-    if (!client_send(loop, conn, conn.upstream_recv_buf.data(), available))
+    if (!client_send(loop, conn, conn.buffered_response_data(), available))
         close_conn_if_live(loop, conn);
 }
 
@@ -7439,7 +7484,7 @@ void on_response_body_sent(void* lp, Connection& conn, IoEvent ev) {
             conn.response_read_deadline_post_commit_phase !=
                 ResponseReadDeadlinePostCommitPhase::BodySend ||
             !response_read_deadline_post_commit_is_stable(conn) ||
-            conn.upstream_send_len != inflight || conn.upstream_recv_buf.len() < inflight ||
+            conn.upstream_send_len != inflight || conn.buffered_response_front_size() < inflight ||
             conn.response_read_deadline_post_commit_downstream_completed > 0xFFFFFFFFu - inflight) {
             loop->close_conn(conn);
             return;
@@ -7447,7 +7492,12 @@ void on_response_body_sent(void* lp, Connection& conn, IoEvent ev) {
         conn.clear_response_read_deadline_send_owner();
         conn.response_read_deadline_post_commit_downstream_completed += inflight;
         conn.response_read_deadline_post_commit_inflight_body = 0;
-        (void)consume_upstream_sent(conn);
+        if (conn.upstream_recv_buf.len() != 0) {
+            (void)consume_upstream_sent(conn);
+        } else {
+            conn.response_body_tail.consume(inflight);
+            conn.upstream_send_len = 0;
+        }
         conn.response_read_deadline_post_commit_phase =
             ResponseReadDeadlinePostCommitPhase::WaitingBody;
         if constexpr (requires(Loop* candidate, Connection& c) {
@@ -10871,7 +10921,7 @@ void on_upstream_response(void* lp, Connection& conn, IoEvent ev) {
             conn.req_header_override_count == 0 && !conn.req_header_override_overflow &&
             strict_response_upload_ready(conn);
         const u32 raw_header_end = resp_parser.header_end;
-        const u32 raw_total = conn.upstream_recv_buf.len();
+        const u32 raw_total = conn.buffered_response_len();
         const CompleteContentLengthResponseClassification complete_content_length_classification =
             classify_complete_content_length_response(resp);
         const bool strict_cl0 = strict_common && !fixed_upload_head && resp.status_code == 200 &&
@@ -10895,7 +10945,7 @@ void on_upstream_response(void* lp, Connection& conn, IoEvent ev) {
                        response_read_deadline_route_method_matches(explicit_method,
                                                                    explicit_route_method)) &&
             resp.content_length > 0 && raw_header_end <= conn.upstream_recv_buf.capacity() &&
-            resp.content_length <= conn.upstream_recv_buf.capacity() - raw_header_end &&
+            resp.content_length <= ResponseBodyChain::kMaxBody &&
             raw_total - raw_header_end <= resp.content_length;
         const bool strict_positive_streaming_get =
             strict_common && resp.status_code == 200 && !fixed_upload &&

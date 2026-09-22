@@ -16,6 +16,7 @@
 
 namespace rut {
 
+struct SlicePool;
 struct ConnectionBase;              // forward declaration for wait() signature
 using Connection = ConnectionBase;  // alias (matches connection.h)
 
@@ -33,6 +34,7 @@ using Connection = ConnectionBase;  // alias (matches connection.h)
 // not used: submissions and enters may come from the spawned shard thread.
 //
 struct IoUringBackend {
+    SlicePool* response_pool = nullptr;
     // io_uring is async: the kernel may still access user buffers between
     // SQE submission and CQE completion. EventLoop uses this trait to
     // enable CQE-driven deferred slice reclamation (pending_ops tracking).
