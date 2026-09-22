@@ -21518,6 +21518,122 @@ TEST(epoll_loop, add_recv_preserves_pending_send_epollout) {
     destroy_real_loop(loop);
 }
 
+// add_recv/set_fd_interest skip an epoll_ctl that would re-install the
+// registration they last made. Closing an fd drops it from the epoll set, so
+// the record must not survive close_conn: a reallocated slot whose new socket
+// reuses the fd number would otherwise skip the ADD and never see readiness.
+TEST(epoll_loop, redundant_rearm_is_skipped_and_fd_reuse_reregisters) {
+    auto* loop = create_real_loop();
+    REQUIRE(loop != nullptr);
+    auto res = loop->init(0, -1, 0);
+    REQUIRE(res.has_value());
+    auto* c = loop->alloc_conn();
+    REQUIRE(c != nullptr);
+    const u32 cid = c->id;
+    const u32 slot = EpollBackend::fd_interest_slot(cid, IoEventType::Recv);
+
+    i32 a[2];
+    REQUIRE(socketpair(AF_UNIX, SOCK_STREAM, 0, a) == 0);
+    c->fd = a[0];
+    REQUIRE(loop->backend.add_recv(a[0], cid));
+    CHECK_EQ(loop->backend.fd_interest[slot].fd, a[0]);
+    CHECK_EQ(loop->backend.fd_interest[slot].events, static_cast<u32>(EPOLLIN));
+
+    // Proof of the skip: remove the registration behind the backend's back;
+    // an identical re-arm must not touch the kernel, so the fd stays absent.
+    REQUIRE(epoll_ctl(loop->backend.epoll_fd, EPOLL_CTL_DEL, a[0], nullptr) == 0);
+    REQUIRE(loop->backend.add_recv(a[0], cid));
+    CHECK_EQ(epoll_ctl(loop->backend.epoll_fd, EPOLL_CTL_DEL, a[0], nullptr), -1);
+    CHECK_EQ(errno, ENOENT);
+    // A raw interest change invalidates the record, so the next re-arm is real.
+    loop->backend.invalidate_fd_interest(cid, a[0]);
+    REQUIRE(loop->backend.add_recv(a[0], cid));
+    CHECK_EQ(loop->backend.fd_interest[slot].fd, a[0]);
+
+    loop->close_conn(*c);  // closes a[0]
+    CHECK_EQ(loop->backend.fd_interest[slot].fd, -1);
+    close(a[1]);
+
+    auto* c2 = loop->alloc_conn();
+    REQUIRE(c2 != nullptr);
+    i32 b[2];
+    REQUIRE(socketpair(AF_UNIX, SOCK_STREAM, 0, b) == 0);
+    c2->fd = b[0];
+    REQUIRE(loop->backend.add_recv(b[0], c2->id));
+    static const u8 msg[] = {'h', 'i'};
+    REQUIRE(send(b[1], msg, sizeof(msg), 0) == static_cast<ssize_t>(sizeof(msg)));
+    struct epoll_event evs[8];
+    const i32 n = epoll_wait(loop->backend.epoll_fd, evs, 8, 1000);
+    bool registered = false;
+    for (i32 i = 0; i < n; i++)
+        if (evs[i].data.u64 == encode_non_upstream_user_data({c2->id, IoEventType::Recv, 0}))
+            registered = true;
+    CHECK(registered);
+
+    // A fresh upstream episode never inherits the previous episode's record.
+    REQUIRE(loop->begin_upstream_episode(*c2));
+    const u32 up_slot = EpollBackend::fd_interest_slot(c2->id, IoEventType::UpstreamRecv);
+    loop->backend.fd_interest[up_slot] = {b[1], EPOLLIN, 1};
+    loop->backend.active_upstream_episode[c2->id] = 0;
+    REQUIRE(loop->begin_upstream_episode(*c2));
+    CHECK_EQ(loop->backend.fd_interest[up_slot].fd, -1);
+    loop->backend.active_upstream_episode[c2->id] = 0;
+
+    loop->close_conn(*c2);  // closes b[0]
+    close(b[1]);
+    loop->shutdown();
+    destroy_real_loop(loop);
+}
+
+// wait() harvests a batch of readiness records but converts one per call. A
+// record whose connection changed interest after the harvest (here: a yield's
+// pause_recv) must be dropped rather than turned into a Recv behind the pause.
+TEST(epoll_loop, harvested_readiness_is_dropped_after_interest_change) {
+    auto* loop = create_real_loop();
+    REQUIRE(loop != nullptr);
+    auto res = loop->init(0, -1, 0);
+    REQUIRE(res.has_value());
+    auto* x = loop->alloc_conn();
+    auto* y = loop->alloc_conn();
+    REQUIRE(x != nullptr);
+    REQUIRE(y != nullptr);
+    i32 xs[2], ys[2];
+    REQUIRE(socketpair(AF_UNIX, SOCK_STREAM, 0, xs) == 0);
+    REQUIRE(socketpair(AF_UNIX, SOCK_STREAM, 0, ys) == 0);
+    x->fd = xs[0];
+    y->fd = ys[0];
+    REQUIRE(loop->backend.add_recv(xs[0], x->id));
+    REQUIRE(loop->backend.add_recv(ys[0], y->id));
+    static const u8 msg[] = {'r', 'q'};
+    REQUIRE(send(xs[1], msg, sizeof(msg), 0) == static_cast<ssize_t>(sizeof(msg)));
+    REQUIRE(send(ys[1], msg, sizeof(msg), 0) == static_cast<ssize_t>(sizeof(msg)));
+
+    IoEvent ev[8];
+    u32 n = loop->backend.wait(ev, 8, loop->conns, RealLoop::kMaxConns);
+    REQUIRE_EQ(n, 1u);
+    CHECK_EQ(loop->backend.ready_count, 2u);  // both records harvested at once
+    CHECK(ev[0].type == IoEventType::Recv);
+    Connection* first = ev[0].conn_id == x->id ? x : y;
+    Connection* other = first == x ? y : x;
+    const i32 first_peer = first == x ? xs[1] : ys[1];
+
+    // The other connection yields before its harvested record is consumed.
+    loop->backend.pause_recv(other->id);
+    // Keep the first connection readable so the next harvest cannot block.
+    REQUIRE(send(first_peer, msg, sizeof(msg), 0) == static_cast<ssize_t>(sizeof(msg)));
+    n = loop->backend.wait(ev, 8, loop->conns, RealLoop::kMaxConns);
+    REQUIRE_EQ(n, 1u);
+    CHECK_EQ(ev[0].conn_id, first->id);  // the paused record was dropped
+    CHECK_EQ(other->recv_buf.len(), 0u);
+
+    close(xs[1]);
+    close(ys[1]);
+    loop->close_conn(*x);
+    loop->close_conn(*y);
+    loop->shutdown();
+    destroy_real_loop(loop);
+}
+
 TEST(epoll_loop, upstream_recv_registration_failure_queues_local_error) {
     auto* loop = create_real_loop();
     REQUIRE(loop != nullptr);

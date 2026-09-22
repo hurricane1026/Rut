@@ -1120,7 +1120,7 @@ extern "C" int epoll_wait(int epfd, struct epoll_event* events, int maxevents, i
         if (epfd != held.target_epoll_fd) {
             rut::test_fault::poison_held_epoll_event(
                 held, rut::test_fault::HeldEpollEventError::WrongEpollFd);
-        } else if (rut::test_fault::is_null_ptr(events) || maxevents != 1) {
+        } else if (rut::test_fault::is_null_ptr(events) || maxevents < 1) {
             rut::test_fault::poison_held_epoll_event(
                 held, rut::test_fault::HeldEpollEventError::InvalidWaitOutput);
         }
@@ -1138,7 +1138,7 @@ extern "C" int epoll_wait(int epfd, struct epoll_event* events, int maxevents, i
     }
     if (held.owner != nullptr && held.error == rut::test_fault::HeldEpollEventError::None &&
         held.replay_armed && epfd == held.target_epoll_fd &&
-        !rut::test_fault::is_null_ptr(events) && maxevents == 1) {
+        !rut::test_fault::is_null_ptr(events) && maxevents >= 1) {
         events[0] = held.event;
         held.replay_armed = false;
         held.replay_consumed = true;
@@ -1148,12 +1148,16 @@ extern "C" int epoll_wait(int epfd, struct epoll_event* events, int maxevents, i
         errno = ENOSYS;
         return -1;
     }
-    const int result = rut::test_fault::g_real_epoll_wait(epfd, events, maxevents, timeout);
-    // maxevents == 1 is a capture precondition, so a multi-record real result
-    // is impossible on this path. A zero result leaves capture armed for retry.
-    if (held.owner != nullptr && held.error == rut::test_fault::HeldEpollEventError::None &&
-        held.capture_armed && epfd == held.target_epoll_fd &&
-        !rut::test_fault::is_null_ptr(events) && maxevents == 1 && result == 1) {
+    // An armed capture harvests exactly one real record, whatever the caller's
+    // batch size, so the seam never has to suppress some records of a batch.
+    // A zero result leaves capture armed for retry.
+    const bool capturing = held.owner != nullptr &&
+                           held.error == rut::test_fault::HeldEpollEventError::None &&
+                           held.capture_armed && epfd == held.target_epoll_fd &&
+                           !rut::test_fault::is_null_ptr(events) && maxevents >= 1;
+    const int result =
+        rut::test_fault::g_real_epoll_wait(epfd, events, capturing ? 1 : maxevents, timeout);
+    if (capturing && result == 1) {
         held.event = events[0];
         held.capture_armed = false;
         held.captured = true;

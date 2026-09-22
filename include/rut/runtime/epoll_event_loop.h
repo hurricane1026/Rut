@@ -664,6 +664,7 @@ public:
             return nullptr;
         }
         u32 id = free_stack[--free_top];
+        backend.forget_fd_interest(id);
         conns[id].reset();
         conns[id].id = id;
         conns[id].shard_id = static_cast<u8>(shard_id);
@@ -781,6 +782,7 @@ public:
         (void)backend.detach_upstream(c);
         // Clear downstream fd map to prevent stale fd matching after reuse.
         if (c.id < connection_capacity) backend.downstream_fd_map[c.id] = -1;
+        backend.forget_fd_interest(c.id);
         // Drop any in-flight partial-send bookkeeping so a reused conn_id+fd
         // cannot resurrect a stale send (see EpollBackend::clear_send_state).
         backend.clear_send_state(c.id);

@@ -512,16 +512,15 @@ TEST(epoll_fault, held_raw_event_is_exact_one_shot_and_fails_closed) {
         CHECK_FALSE(wrong_fd.replay_armed());
     }
     {
-        ScopedHeldEpollEvent invalid_output(guard.epoll_fds[0]);
-        REQUIRE(invalid_output.arm_capture_once());
-        // Capture deliberately requires maxevents == 1, so the seam can never
-        // harvest or ambiguously suppress multiple real epoll records.
+        ScopedHeldEpollEvent batched_capture(guard.epoll_fds[0]);
+        REQUIRE(batched_capture.arm_capture_once());
+        // A batched wait still captures exactly one record: the seam narrows
+        // the real harvest to one, so it never suppresses part of a batch.
         struct epoll_event events[2]{};
-        REQUIRE_EQ(epoll_wait(guard.epoll_fds[0], events, 2, 0), 1);
-        CHECK_EQ(events[0].data.u64, kRawData);
-        CHECK_EQ(invalid_output.error(), HeldEpollEventError::InvalidWaitOutput);
-        CHECK_FALSE(invalid_output.capture_armed());
-        CHECK_FALSE(invalid_output.replay_armed());
+        REQUIRE_EQ(epoll_wait(guard.epoll_fds[0], events, 2, 0), 0);
+        CHECK(batched_capture.captured());
+        CHECK_FALSE(batched_capture.failed_closed());
+        CHECK_FALSE(batched_capture.capture_armed());
     }
     {
         ScopedHeldEpollEvent invalid_maxevents(guard.epoll_fds[0]);
@@ -562,18 +561,18 @@ TEST(epoll_fault, held_raw_event_is_exact_one_shot_and_fails_closed) {
         CHECK_FALSE(wrong_fd_replay.replay_consumed());
     }
     {
-        ScopedHeldEpollEvent invalid_replay_output(guard.epoll_fds[0]);
-        REQUIRE(invalid_replay_output.arm_capture_once());
+        ScopedHeldEpollEvent batched_replay(guard.epoll_fds[0]);
+        REQUIRE(batched_replay.arm_capture_once());
         struct epoll_event suppressed{};
         REQUIRE_EQ(epoll_wait(guard.epoll_fds[0], &suppressed, 1, 0), 0);
-        REQUIRE(invalid_replay_output.replay_once());
+        REQUIRE(batched_replay.replay_once());
+        // A batched wait receives the held record alone.
         struct epoll_event events[2]{};
         REQUIRE_EQ(epoll_wait(guard.epoll_fds[0], events, 2, 0), 1);
         CHECK_EQ(events[0].data.u64, kRawData);
-        CHECK_EQ(invalid_replay_output.error(), HeldEpollEventError::InvalidWaitOutput);
-        CHECK_FALSE(invalid_replay_output.capture_armed());
-        CHECK_FALSE(invalid_replay_output.replay_armed());
-        CHECK_FALSE(invalid_replay_output.replay_consumed());
+        CHECK_FALSE(batched_replay.failed_closed());
+        CHECK_FALSE(batched_replay.replay_armed());
+        CHECK(batched_replay.replay_consumed());
     }
     {
         ScopedHeldEpollEvent duplicate_replay(guard.epoll_fds[0]);

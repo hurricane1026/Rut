@@ -825,6 +825,7 @@ public:
             return nullptr;  // pool exhausted — back-pressure
         }
         u32 id = free_stack[--free_top];
+        if constexpr (requires { backend.forget_fd_interest(id); }) backend.forget_fd_interest(id);
         conns[id].reset();
         conns[id].id = id;
         conns[id].shard_id = static_cast<u8>(shard_id);
