@@ -30667,6 +30667,243 @@ TEST(iouring_upstream_recv, empty_ring_terminal_rearms_one_shot_body_recv) {
     }
 }
 
+namespace {
+
+// Stage an ordinary native Content-Length body owner whose upstream slice holds
+// `len` pattern bytes and whose one-shot recv has completed.
+bool stage_relay_body(OneShotRecvFixture& fixture,
+                      IoUringEventLoop* loop,
+                      u32 len,
+                      u32 body_remaining) {
+    if (!fixture.stage(loop, /*plaintext=*/true)) return false;
+    Connection& conn = *fixture.conn;
+    conn.on_upstream_recv = &on_response_body_recvd<IoUringEventLoop>;
+    conn.state = ConnState::Sending;
+    conn.resp_body_mode = BodyMode::ContentLength;
+    conn.resp_body_remaining = body_remaining;
+    for (u32 i = 0; i < len; i++) conn.upstream_recv_buf.write_ptr()[i] = static_cast<u8>(i * 7u);
+    conn.upstream_recv_buf.commit(len);
+    return true;
+}
+
+IoEvent relay_upstream_event(const Connection& conn, u32 len) {
+    return {conn.id,
+            static_cast<i32>(len),
+            0,
+            0,
+            IoEventType::UpstreamRecv,
+            0,
+            0,
+            conn.upstream_episode};
+}
+
+IoEvent relay_send_event(const Connection& conn, u32 len) {
+    return {conn.id, static_cast<i32>(len), 0, 0, IoEventType::Send, 0, 0, 0};
+}
+
+// Unwind fixture-visible kernel ownership before cleanup closes the slot.
+void settle_relay_ops(Connection& conn) {
+    conn.send_armed = false;
+    conn.upstream_recv_armed = false;
+    conn.pending_ops = 0;
+}
+
+}  // namespace
+
+TEST(iouring_upstream_relay, sends_one_slice_while_next_recv_fills_the_other) {
+    ScopedIoUringLoopForRetirement guard;
+    if (!guard.init()) SKIP("io_uring unavailable");
+    auto* loop = guard.loop;
+    constexpr u32 kSlice = SlicePool::kSliceSize;
+    OneShotRecvFixture fixture;
+    REQUIRE(stage_relay_body(fixture, loop, kSlice, 3u * kSlice));
+    Connection& conn = *fixture.conn;
+    u8* const first = conn.upstream_recv_slice;
+    const u32 tail0 = __atomic_load_n(loop->backend.sq_tail, __ATOMIC_ACQUIRE);
+
+    on_response_body_recvd<IoUringEventLoop>(loop, conn, relay_upstream_event(conn, kSlice));
+
+    // The full slice is sent while the next recv targets the other, empty slice.
+    CHECK_GE(conn.fd, 0);
+    CHECK_EQ(conn.upstream_relay_send_len, kSlice);
+    CHECK_EQ(conn.upstream_relay_slice, first);
+    REQUIRE(conn.upstream_recv_slice != nullptr);
+    CHECK(conn.upstream_recv_slice != first);
+    CHECK_EQ(conn.upstream_recv_buf.len(), 0u);
+    CHECK_EQ(conn.upstream_recv_buf.data(), conn.upstream_recv_slice);
+    CHECK_EQ(conn.resp_body_remaining, 2u * kSlice);
+    CHECK_EQ(conn.resp_body_sent, kSlice);
+    CHECK(conn.on_send == &on_response_body_sent<IoUringEventLoop>);
+    CHECK(conn.on_upstream_recv == &on_response_body_recvd<IoUringEventLoop>);
+    CHECK(conn.upstream_recv_armed);
+    REQUIRE_EQ(__atomic_load_n(loop->backend.sq_tail, __ATOMIC_ACQUIRE), tail0 + 2u);
+    const u32 mask = *loop->backend.sq_ring_mask;
+    const auto& send_sqe = loop->backend.sq_entries[tail0 & mask];
+    const auto& recv_sqe = loop->backend.sq_entries[(tail0 + 1u) & mask];
+    CHECK_EQ(send_sqe.opcode, static_cast<u8>(IORING_OP_SEND));
+    CHECK_EQ(send_sqe.addr, reinterpret_cast<u64>(first));
+    CHECK_EQ(send_sqe.len, kSlice);
+    CHECK_EQ(recv_sqe.opcode, static_cast<u8>(IORING_OP_RECV));
+    CHECK_EQ(recv_sqe.ioprio & IORING_RECV_MULTISHOT, 0u);
+    CHECK_EQ(recv_sqe.len, loop->backend.upstream_once_max_len());
+
+    // The next chunk lands while the send is in flight: it stays buffered.
+    conn.upstream_recv_armed = false;
+    conn.pending_ops--;
+    constexpr u32 kNext = 100;
+    for (u32 i = 0; i < kNext; i++) conn.upstream_recv_buf.write_ptr()[i] = 0xA5;
+    conn.upstream_recv_buf.commit(kNext);
+    const u32 tail1 = __atomic_load_n(loop->backend.sq_tail, __ATOMIC_ACQUIRE);
+    on_response_body_recvd<IoUringEventLoop>(loop, conn, relay_upstream_event(conn, kNext));
+    CHECK_EQ(conn.upstream_recv_buf.len(), kNext);
+    CHECK_EQ(conn.resp_body_remaining, 2u * kSlice);
+    CHECK_EQ(conn.upstream_relay_send_len, kSlice);
+    CHECK_EQ(__atomic_load_n(loop->backend.sq_tail, __ATOMIC_ACQUIRE), tail1);
+
+    // The send drains: the buffered chunk is relayed from the current slice and
+    // the freed first slice becomes the receive slice again.
+    u8* const second = conn.upstream_recv_slice;
+    on_response_body_sent<IoUringEventLoop>(loop, conn, relay_send_event(conn, kSlice));
+    CHECK_EQ(conn.upstream_relay_send_len, kNext);
+    CHECK_EQ(conn.upstream_relay_slice, second);
+    CHECK_EQ(conn.upstream_recv_slice, first);
+    CHECK_EQ(conn.resp_body_remaining, 2u * kSlice - kNext);
+    REQUIRE_EQ(__atomic_load_n(loop->backend.sq_tail, __ATOMIC_ACQUIRE), tail1 + 2u);
+    const auto& replay_send = loop->backend.sq_entries[tail1 & mask];
+    CHECK_EQ(replay_send.addr, reinterpret_cast<u64>(second));
+    CHECK_EQ(replay_send.len, kNext);
+    settle_relay_ops(conn);
+    fixture.cleanup();
+}
+
+TEST(iouring_upstream_relay, send_completion_leaves_armed_recv_to_deliver_its_bytes) {
+    ScopedIoUringLoopForRetirement guard;
+    if (!guard.init()) SKIP("io_uring unavailable");
+    auto* loop = guard.loop;
+    constexpr u32 kSlice = SlicePool::kSliceSize;
+    OneShotRecvFixture fixture;
+    REQUIRE(stage_relay_body(fixture, loop, kSlice, 2u * kSlice));
+    Connection& conn = *fixture.conn;
+    on_response_body_recvd<IoUringEventLoop>(loop, conn, relay_upstream_event(conn, kSlice));
+    REQUIRE(conn.upstream_recv_armed);
+    // The backend already copied the recv's bytes this batch, but its terminal
+    // has not been dispatched yet.
+    conn.upstream_recv_buf.commit(64);
+    const u32 tail = __atomic_load_n(loop->backend.sq_tail, __ATOMIC_ACQUIRE);
+    on_response_body_sent<IoUringEventLoop>(loop, conn, relay_send_event(conn, kSlice));
+    CHECK_EQ(conn.upstream_relay_send_len, 0u);
+    CHECK_EQ(conn.upstream_recv_buf.len(), 64u);
+    CHECK_EQ(conn.resp_body_remaining, kSlice);
+    CHECK(conn.on_send == nullptr);
+    CHECK(conn.on_upstream_recv == &on_response_body_recvd<IoUringEventLoop>);
+    CHECK_EQ(__atomic_load_n(loop->backend.sq_tail, __ATOMIC_ACQUIRE), tail);
+    settle_relay_ops(conn);
+    fixture.cleanup();
+}
+
+TEST(iouring_upstream_relay, final_and_ineligible_chunks_keep_the_serialized_pump) {
+    ScopedIoUringLoopForRetirement guard;
+    if (!guard.init()) SKIP("io_uring unavailable");
+    auto* loop = guard.loop;
+    constexpr u32 kSlice = SlicePool::kSliceSize;
+    for (const int variant : {0, 1, 2}) {
+        OneShotRecvFixture fixture;
+        // 0: the chunk completes the body; 1: throttled; 2: surplus beyond the body.
+        const u32 remaining = variant == 1 ? 2u * kSlice : variant == 0 ? kSlice : kSlice - 1u;
+        REQUIRE(stage_relay_body(fixture, loop, kSlice, remaining));
+        Connection& conn = *fixture.conn;
+        if (variant == 1) conn.throttle_down_bps = 1u << 30;
+        u8* const slice = conn.upstream_recv_slice;
+        on_response_body_recvd<IoUringEventLoop>(loop, conn, relay_upstream_event(conn, kSlice));
+        if (variant == 2) {
+            // Surplus bytes beyond the declared length are unchanged behavior.
+            CHECK_EQ(conn.upstream_relay_send_len, 0u);
+        } else {
+            CHECK_EQ(conn.upstream_relay_send_len, 0u);
+            CHECK_EQ(conn.upstream_relay_slice, nullptr);
+            CHECK_EQ(conn.upstream_recv_slice, slice);
+            CHECK_EQ(conn.upstream_send_len, kSlice);
+            CHECK(conn.on_upstream_recv == nullptr);
+            CHECK_FALSE(conn.upstream_recv_armed);
+        }
+        settle_relay_ops(conn);
+        fixture.cleanup();
+    }
+}
+
+TEST(iouring_upstream_relay, full_submission_queue_defers_the_recv_to_send_completion) {
+    ScopedIoUringLoopForRetirement guard;
+    if (!guard.init()) SKIP("io_uring unavailable");
+    auto* loop = guard.loop;
+    constexpr u32 kSlice = SlicePool::kSliceSize;
+    OneShotRecvFixture fixture;
+    REQUIRE(stage_relay_body(fixture, loop, kSlice, 2u * kSlice));
+    Connection& conn = *fixture.conn;
+    // Leave exactly one free SQE: the relay's client send takes it.
+    const u32 head = __atomic_load_n(loop->backend.sq_head, __ATOMIC_ACQUIRE);
+    __atomic_store_n(
+        loop->backend.sq_tail, head + loop->backend.sq_ring_entries - 1u, __ATOMIC_RELEASE);
+
+    on_response_body_recvd<IoUringEventLoop>(loop, conn, relay_upstream_event(conn, kSlice));
+    CHECK_GE(conn.fd, 0);
+    CHECK_EQ(conn.upstream_relay_send_len, kSlice);
+    CHECK(conn.send_armed);
+    CHECK_FALSE(conn.upstream_recv_armed);
+
+    // Once the send completes (with room again), the pump arms the recv.
+    fixture.restore_ring();
+    on_response_body_sent<IoUringEventLoop>(loop, conn, relay_send_event(conn, kSlice));
+    CHECK_GE(conn.fd, 0);
+    CHECK_EQ(conn.upstream_relay_send_len, 0u);
+    CHECK(conn.upstream_recv_armed);
+    settle_relay_ops(conn);
+    fixture.cleanup();
+}
+
+TEST(iouring_upstream_relay, slices_outlive_an_inflight_relay_send) {
+    ScopedIoUringLoopForRetirement guard;
+    if (!guard.init()) SKIP("io_uring unavailable");
+    auto* loop = guard.loop;
+    constexpr u32 kSlice = SlicePool::kSliceSize;
+    {
+        OneShotRecvFixture fixture;
+        REQUIRE(stage_relay_body(fixture, loop, kSlice, 2u * kSlice));
+        Connection& conn = *fixture.conn;
+        on_response_body_recvd<IoUringEventLoop>(loop, conn, relay_upstream_event(conn, kSlice));
+        u8* const relay = conn.upstream_relay_slice;
+        u8* const recv = conn.upstream_recv_slice;
+        REQUIRE(relay != nullptr);
+
+        // A response boundary never frees a slice a send still reads.
+        loop->release_upstream_relay_slice(conn);
+        CHECK_EQ(conn.upstream_relay_slice, relay);
+
+        // Closing with the send in flight keeps both upstream slices attached
+        // to the slot, like every other kernel-referenced slice.
+        const u32 cid = conn.id;
+        fixture.restore_ring();
+        REQUIRE_GT(conn.pending_ops, 0u);
+        loop->close_conn(conn);
+        CHECK_EQ(loop->conns[cid].upstream_relay_slice, relay);
+        CHECK_EQ(loop->conns[cid].upstream_recv_slice, recv);
+        fixture.conn = nullptr;
+        fixture.cleanup();
+    }
+    {
+        // With nothing in flight, close returns every slice, including the
+        // relay slice, to the pool.
+        const u32 available_before = loop->pool.available();
+        Connection* conn = loop->alloc_conn();
+        REQUIRE(conn != nullptr);
+        REQUIRE(loop->alloc_upstream_buf(*conn));
+        REQUIRE(loop->alloc_upstream_relay_slice(*conn));
+        CHECK_LT(loop->pool.available(), available_before);
+        conn->fd = -1;
+        loop->free_conn(*conn);
+        CHECK_EQ(loop->pool.available(), available_before);
+    }
+}
+
 TEST(iouring_upstream_recv, terminal_dispatch_rearms_once_across_reuse_clear_and_drain) {
     ScopedIoUringLoopForRetirement guard;
     if (!guard.init()) SKIP("io_uring unavailable");

@@ -2576,6 +2576,10 @@ public:
             pool.free(conns[cid].upstream_recv_slice);
             conns[cid].upstream_recv_slice = nullptr;
         }
+        if (conns[cid].upstream_relay_slice) {
+            pool.free(conns[cid].upstream_relay_slice);
+            conns[cid].upstream_relay_slice = nullptr;
+        }
         if (conns[cid].response_header_slice) {
             pool.free(conns[cid].response_header_slice);
             conns[cid].response_header_slice = nullptr;
@@ -2604,6 +2608,10 @@ public:
                 if (conns[cid].upstream_recv_slice) {
                     pool.free(conns[cid].upstream_recv_slice);
                     conns[cid].upstream_recv_slice = nullptr;
+                }
+                if (conns[cid].upstream_relay_slice) {
+                    pool.free(conns[cid].upstream_relay_slice);
+                    conns[cid].upstream_relay_slice = nullptr;
                 }
                 if (conns[cid].response_header_slice) {
                     pool.free(conns[cid].response_header_slice);
@@ -2688,6 +2696,7 @@ public:
             if (c.recv_slice) pool.free(c.recv_slice);
             if (c.send_slice) pool.free(c.send_slice);
             if (c.upstream_recv_slice) pool.free(c.upstream_recv_slice);
+            if (c.upstream_relay_slice) pool.free(c.upstream_relay_slice);
             if (c.response_header_slice) pool.free(c.response_header_slice);
             free_tls_in_buf(c);
             free_tls_out_buf(c);
@@ -2699,6 +2708,7 @@ public:
         u8* rs = c.recv_slice;
         u8* ss = c.send_slice;
         u8* us = c.upstream_recv_slice;
+        u8* relay = c.upstream_relay_slice;
         u8* hs = c.response_header_slice;
         u8* tin = c.tls_in_slice;
         u8* tout = c.tls_out_slice;
@@ -2725,6 +2735,7 @@ public:
         conns[cid].recv_slice_capacity = rs != nullptr ? SlicePool::kSliceSize : 0;
         conns[cid].send_slice = ss;
         conns[cid].upstream_recv_slice = us;
+        conns[cid].upstream_relay_slice = relay;
         conns[cid].response_header_slice = hs;
         conns[cid].tls_in_slice = tin;
         conns[cid].tls_out_slice = tout;
@@ -3087,6 +3098,31 @@ public:
         // A send still in flight keeps the ordinary close ordering: half-
         // closing now would fail that send and truncate the response.
         if (c.fd >= 0 && !c.tls_active && !c.send_armed) (void)::shutdown(c.fd, SHUT_WR);
+    }
+
+    // Plaintext body relay: the one-shot body owner of an ordinary native
+    // Content-Length response may send one upstream slice while the next
+    // upstream recv fills a second slice. Every other owner keeps the
+    // serialized recv -> send -> recv body pump.
+    [[nodiscard]] bool upstream_body_relay_eligible(const Connection& c) const {
+        return !c.tls_active && c.response_policy_id == 0 && c.throttle_down_bps == 0 &&
+               c.resp_body_mode == BodyMode::ContentLength && c.upstream_relay_send_len == 0 &&
+               c.on_upstream_recv == &on_response_body_recvd<Self> && use_one_shot_upstream_recv(c);
+    }
+
+    bool alloc_upstream_relay_slice(Connection& c) {
+        if (c.upstream_relay_slice) return true;
+        u8* s = pool.alloc();
+        if (!s) return false;
+        c.upstream_relay_slice = s;
+        return true;
+    }
+
+    // Response boundary: return the relay slice unless a send still reads it.
+    void release_upstream_relay_slice(Connection& c) {
+        if (c.upstream_relay_slice == nullptr || c.upstream_relay_send_len != 0) return;
+        pool.free(c.upstream_relay_slice);
+        c.upstream_relay_slice = nullptr;
     }
 
     // A provided-buffer multishot recv can complete several 4 KiB CQEs in one
