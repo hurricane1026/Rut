@@ -16,6 +16,7 @@
 #ifdef __linux__
 #include "rut/runtime/tls_iouring.h"
 #endif
+#include "rut/platform/socket.h"
 #include "rut/runtime/upstream_concurrency.h"
 #include "rut/runtime/upstream_pool.h"
 #include "test.h"
@@ -8949,6 +8950,35 @@ TEST(route, upstream_backend_list_full) {
     CHECK_EQ(t.addr_count, UpstreamTarget::kMaxBackends);
     CHECK(!t.add_addr(0xDEADBEEF, 9999));  // full
     CHECK_EQ(t.addr_count, UpstreamTarget::kMaxBackends);
+}
+
+// === Process signals ===
+
+TEST(platform, ignore_sigpipe_turns_a_peerless_write_into_epipe) {
+    struct sigaction original{};
+    REQUIRE_EQ(sigaction(SIGPIPE, nullptr, &original), 0);
+    // Start from the default action so the check below proves the helper.
+    struct sigaction fallback{};
+    fallback.sa_handler = SIG_DFL;
+    sigemptyset(&fallback.sa_mask);
+    REQUIRE_EQ(sigaction(SIGPIPE, &fallback, nullptr), 0);
+
+    REQUIRE(rut::platform::ignore_sigpipe());
+    struct sigaction current{};
+    REQUIRE_EQ(sigaction(SIGPIPE, nullptr, &current), 0);
+    CHECK(current.sa_handler == SIG_IGN);
+
+    // With the default action this write would terminate the test process.
+    i32 fds[2] = {-1, -1};
+    REQUIRE_EQ(pipe(fds), 0);
+    close(fds[0]);
+    const u8 byte = 1;
+    errno = 0;
+    CHECK_EQ(::write(fds[1], &byte, 1), -1);
+    CHECK_EQ(errno, EPIPE);
+    close(fds[1]);
+
+    REQUIRE_EQ(sigaction(SIGPIPE, &original, nullptr), 0);
 }
 
 // === UpstreamPool ===

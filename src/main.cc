@@ -1,4 +1,5 @@
 #include "rut/common/shard_limits.h"
+#include "rut/platform/socket.h"
 #include "rut/runtime/access_log_startup.h"
 #include "rut/runtime/connection_capacity.h"
 #ifdef __linux__
@@ -608,6 +609,12 @@ static RunShardsOutcome run_shards(ListenerSpec listener,
 }
 
 int main(int argc, char** argv) {
+    // Before any listener, connection or shard thread exists: a client that
+    // disconnects mid-response must not kill the process (see ignore_sigpipe).
+    if (!rut::platform::ignore_sigpipe()) {
+        write_str("Failed to ignore SIGPIPE\n");
+        return 1;
+    }
     bool cli_port_present = false;
     u16 cli_port = 0;
     u32 shard_count = 0;  // 0 = auto-detect
