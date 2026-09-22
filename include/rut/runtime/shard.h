@@ -324,11 +324,13 @@ struct Shard {
             return core::make_unexpected(Error::make(EINVAL, Error::Source::Thread));
         // Seed from route_config only if active_config wasn't already set
         // by a reload_config() call before spawn.
-        if (!active_config) active_config = route_config;
         if (thread_spawned)
             return core::make_unexpected(Error::make(EEXIST, Error::Source::Thread));
-        if (active_config != nullptr && !active_config->forward_policy_tables_valid())
+        // Validate before seeding so a rejected config is never left installed.
+        const RouteConfig* seed = active_config ? active_config : route_config;
+        if (seed != nullptr && !seed->forward_policy_tables_valid())
             return core::make_unexpected(Error::make(EINVAL, Error::Source::Thread));
+        active_config = seed;
 
         pthread_attr_t attr;
         i32 attr_rc = pthread_attr_init(&attr);

@@ -595,15 +595,20 @@ public:
                has_unmatched_metadata() || has_exact_strict_local_response_inventory();
     }
 
-    bool strict_local_response_bytes_owned(Str value) const {
-        const uintptr_t begin = reinterpret_cast<uintptr_t>(strict_local_response_bytes);
+    // True when `value` lies inside the first `used` bytes of `pool` (an empty
+    // value may point one past the end, as the builders' copies do).
+    static bool pool_bytes_owned(const char* pool, u32 used, Str value) {
+        const uintptr_t begin = reinterpret_cast<uintptr_t>(pool);
         const uintptr_t ptr = reinterpret_cast<uintptr_t>(value.ptr);
-        if (value.len == 0)
-            return value.ptr != nullptr && ptr >= begin &&
-                   ptr - begin <= strict_local_response_bytes_used;
-        if (value.ptr == nullptr || value.len > strict_local_response_bytes_used) return false;
-        if (ptr < begin || ptr - begin >= strict_local_response_bytes_used) return false;
-        return value.len <= strict_local_response_bytes_used - static_cast<u32>(ptr - begin);
+        if (value.len == 0) return value.ptr != nullptr && ptr >= begin && ptr - begin <= used;
+        if (value.ptr == nullptr || value.len > used) return false;
+        if (ptr < begin || ptr - begin >= used) return false;
+        return value.len <= used - static_cast<u32>(ptr - begin);
+    }
+
+    bool strict_local_response_bytes_owned(Str value) const {
+        return pool_bytes_owned(
+            strict_local_response_bytes, strict_local_response_bytes_used, value);
     }
 
     // Complete runtime validation. Source policy IDs may collapse under stable
@@ -1838,15 +1843,34 @@ public:
     // tables are public and a hand-built config can bypass them; runtime
     // re-checks of admitted policies skip the byte scans in release builds
     // (kRescanAdmittedPolicies), so publication is the trust boundary.
+    // Every string must also be RouteConfig-owned: a caller-owned buffer could
+    // change after publication, when release builds no longer re-scan it.
     bool forward_policy_tables_valid() const {
         if (response_policy_count > kMaxResponsePolicies ||
             failure_policy_count > kMaxForwardFailurePolicies ||
-            policy_bundle_count > kMaxForwardPolicyBundles)
+            policy_bundle_count > kMaxForwardPolicyBundles ||
+            response_policy_bytes_used > kResponsePolicyBytesPoolBytes ||
+            failure_policy_bytes_used > kFailurePolicyBytesPoolBytes)
             return false;
-        for (u32 i = 0; i < response_policy_count; i++)
-            if (!response_policy_spec_valid(response_policies[i])) return false;
-        for (u32 i = 0; i < failure_policy_count; i++)
-            if (!forward_failure_policy_table_spec_valid(failure_policies[i])) return false;
+        auto response_owned = [&](Str v) {
+            return pool_bytes_owned(response_policy_bytes, response_policy_bytes_used, v);
+        };
+        auto failure_owned = [&](Str v) {
+            return pool_bytes_owned(failure_policy_bytes, failure_policy_bytes_used, v);
+        };
+        for (u32 i = 0; i < response_policy_count; i++) {
+            const auto& p = response_policies[i];
+            if (!response_policy_spec_valid(p) || !response_owned(p.server)) return false;
+            for (u32 h = 0; h < p.hide_header_count; h++)
+                if (!response_owned(p.hide_headers[h])) return false;
+        }
+        for (u32 i = 0; i < failure_policy_count; i++) {
+            const auto& p = failure_policies[i];
+            if (!forward_failure_policy_table_spec_valid(p) || !failure_owned(p.reason) ||
+                !failure_owned(p.content_type) || !failure_owned(p.server) ||
+                !failure_owned(p.body))
+                return false;
+        }
         // Every referenced spec is now fully valid, so the admitted checks in
         // policy_bundle_id_is_valid() decide exactly what the full ones would.
         for (u32 i = 0; i < policy_bundle_count; i++)

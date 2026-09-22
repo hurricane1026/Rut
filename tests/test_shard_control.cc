@@ -289,14 +289,64 @@ TEST(shard_control, publish_refuses_hand_built_invalid_forward_policies) {
     CHECK(shard.active_config == nullptr);
 
     cfg.response_policies[0] = saved_response;
+    const ForwardFailurePolicySpec owned_failure = cfg.failure_policies[0];
     cfg.failure_policies[0].reason = {"bad\r", 4};
     CHECK_FALSE(cfg.forward_policy_tables_valid());
     CHECK_FALSE(shard.reload_config(&cfg, /*shard_count=*/1));
     CHECK(shard.active_config == nullptr);
 
+    // Valid bytes are not enough: a string outside the config's own pool
+    // (here a caller-owned literal) could change after publication.
+    const ForwardFailurePolicySpec saved_failure = owned_failure;
     cfg.failure_policies[0].reason = {"Bad Gateway", 11};
+    CHECK_FALSE(cfg.forward_policy_tables_valid());
+    CHECK_FALSE(shard.reload_config(&cfg, /*shard_count=*/1));
+    cfg.failure_policies[0] = saved_failure;
+    cfg.response_policies[0].server = {"rut", 3};
+    CHECK_FALSE(cfg.forward_policy_tables_valid());
+    cfg.response_policies[0] = saved_response;
+    const u32 saved_used = cfg.response_policy_bytes_used;
+    cfg.response_policy_bytes_used = RouteConfig::kResponsePolicyBytesPoolBytes + 1u;
+    CHECK_FALSE(cfg.forward_policy_tables_valid());
+    cfg.response_policy_bytes_used = saved_used;
+
     CHECK(shard.reload_config(&cfg, /*shard_count=*/1));
     CHECK(shard.active_config == &cfg);
+}
+
+// spawn() validates its seed config before installing it: a rejected startup
+// config must not stay installed and shadow a corrected one on retry.
+TEST(shard_control, spawn_rejects_invalid_seed_without_installing_it) {
+    using namespace rut;
+    static RouteConfig bad{};
+    static RouteConfig good{};
+    ForwardResponsePolicySpec response{};
+    response.version = ResponsePolicyVersion::Http11;
+    response.framing = ResponsePolicyFraming::ContentLength;
+    response.connection = ResponsePolicyConnection::Request;
+    response.date = ResponsePolicyDate::Current;
+    response.head_mode = ResponsePolicyHeadMode::Reject;
+    response.server = {"rut", 3};
+    REQUIRE_EQ(bad.add_response_policy(response), 1u);
+    static constexpr char kInjected[] = "rut\r\nX-Injected: yes";
+    bad.response_policies[0].server = {kInjected, sizeof(kInjected) - 1u};
+    REQUIRE_EQ(good.add_response_policy(response), 1u);
+
+    auto lfd_result = create_listen_socket(0);
+    REQUIRE(lfd_result.has_value());
+    const i32 lfd = lfd_result.value();
+    Shard<RealLoop> shard;
+    REQUIRE(shard.init(0, lfd).has_value());
+    shard.route_config = &bad;
+    CHECK_FALSE(shard.spawn().has_value());
+    CHECK(shard.active_config == nullptr);
+    shard.route_config = &good;
+    REQUIRE(shard.spawn().has_value());
+    CHECK(shard.active_config == &good);
+    shard.stop();
+    shard.join();
+    shard.shutdown();
+    close(lfd);
 }
 
 TEST(shard_control, shard_reload_config) {
