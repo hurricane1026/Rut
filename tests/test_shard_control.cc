@@ -305,6 +305,21 @@ TEST(shard_control, publish_refuses_hand_built_invalid_forward_policies) {
     cfg.response_policies[0].server = {"rut", 3};
     CHECK_FALSE(cfg.forward_policy_tables_valid());
     cfg.response_policies[0] = saved_response;
+    // Dangling views are refused by the ownership check before any byte scan
+    // (these addresses are never mapped; dereferencing them would crash).
+    cfg.response_policies[0].server = {reinterpret_cast<const char*>(0x10), 8};
+    CHECK_FALSE(cfg.forward_policy_tables_valid());
+    cfg.response_policies[0] = saved_response;
+    cfg.response_policies[0].hide_header_count = 1;
+    cfg.response_policies[0].hide_headers[0] = {reinterpret_cast<const char*>(0x20), 8};
+    CHECK_FALSE(cfg.forward_policy_tables_valid());
+    cfg.response_policies[0].hide_header_count = kMaxResponsePolicyHideHeaders + 1;
+    CHECK_FALSE(cfg.forward_policy_tables_valid());
+    cfg.response_policies[0] = saved_response;
+    cfg.failure_policies[0].body = {reinterpret_cast<const char*>(0x30), 8};
+    CHECK_FALSE(cfg.forward_policy_tables_valid());
+    cfg.failure_policies[0] = saved_failure;
+    CHECK(cfg.forward_policy_tables_valid());
     const u32 saved_used = cfg.response_policy_bytes_used;
     cfg.response_policy_bytes_used = RouteConfig::kResponsePolicyBytesPoolBytes + 1u;
     CHECK_FALSE(cfg.forward_policy_tables_valid());

@@ -1858,17 +1858,21 @@ public:
         auto failure_owned = [&](Str v) {
             return pool_bytes_owned(failure_policy_bytes, failure_policy_bytes_used, v);
         };
+        // Ownership first: a hand-built config may carry dangling or unmapped
+        // views, and the byte-level validators below dereference them.
         for (u32 i = 0; i < response_policy_count; i++) {
             const auto& p = response_policies[i];
-            if (!response_policy_spec_valid(p) || !response_owned(p.server)) return false;
+            if (p.hide_header_count > kMaxResponsePolicyHideHeaders || !response_owned(p.server))
+                return false;
             for (u32 h = 0; h < p.hide_header_count; h++)
                 if (!response_owned(p.hide_headers[h])) return false;
+            if (!response_policy_spec_valid(p)) return false;
         }
         for (u32 i = 0; i < failure_policy_count; i++) {
             const auto& p = failure_policies[i];
-            if (!forward_failure_policy_table_spec_valid(p) || !failure_owned(p.reason) ||
-                !failure_owned(p.content_type) || !failure_owned(p.server) ||
-                !failure_owned(p.body))
+            if (!failure_owned(p.reason) || !failure_owned(p.content_type) ||
+                !failure_owned(p.server) || !failure_owned(p.body) ||
+                !forward_failure_policy_table_spec_valid(p))
                 return false;
         }
         // Every referenced spec is now fully valid, so the admitted checks in
