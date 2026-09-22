@@ -1632,6 +1632,16 @@ void close_conn_if_live(Loop* loop, Connection& conn) {
     if (conn.fd >= 0) loop->close_conn(conn);
 }
 
+// A response has been completely sent on a connection that does not persist.
+// Backends whose close() cannot end the stream immediately send the FIN now so
+// the server, not the client, closes first (and holds TIME_WAIT), as nginx does.
+template <typename Loop>
+void close_conn_after_complete_response(Loop* loop, Connection& conn) {
+    if constexpr (requires { loop->end_stream_before_close(conn); })
+        loop->end_stream_before_close(conn);
+    loop->close_conn(conn);
+}
+
 // @throttle read-side gate for the proxy body pump. Called at each point where
 // the proxy would read the next upstream chunk. If the token bucket has run ahead
 // of real time (the bytes sent so far "should" take until throttle_tat_ns at the
@@ -2784,7 +2794,7 @@ void on_response_sent(void* lp, Connection& conn, IoEvent ev) {
     conn.upstream_idx = 0;
 
     if (loop->is_draining() || !conn.keep_alive) {
-        loop->close_conn(conn);
+        close_conn_after_complete_response(loop, conn);
         return;
     }
 
@@ -6956,7 +6966,7 @@ void pump_response_read_deadline_body(Loop* loop, Connection& conn) {
             // A default-persistent request reached a verified truncated
             // response terminal.  The transaction is complete, but the
             // connection is not reusable and must not dispatch a successor.
-            loop->close_conn(conn);
+            close_conn_after_complete_response(loop, conn);
             return;
         }
         if (received == conn.response_read_deadline_post_commit_declared_body) {
@@ -7059,7 +7069,8 @@ void on_response_body_recvd(void* lp, Connection& conn, IoEvent ev) {
             }
             on_request_complete(loop, conn, conn.resp_status, conn.resp_body_sent);
             loop->epoch_leave();
-            loop->close_conn(conn);
+            // The FIN also frames this close-delimited body.
+            close_conn_after_complete_response(loop, conn);
             return;
         }
         // A parked TLS proxy tail still owns the final body bytes: the body parser
@@ -7270,14 +7281,14 @@ void proxy_stream_complete(Loop* loop, Connection& conn) {
     // check therefore precedes release_upstream_conn (which would pool a
     // reusable fd). A normal (non-draining) completion still pools as before.
     if (loop->is_draining()) {
-        loop->close_conn(conn);
+        close_conn_after_complete_response(loop, conn);
         return;
     }
 
     release_upstream_conn(loop, conn);  // pool for reuse if keep-alive, else close
 
     if (!conn.keep_alive) {
-        loop->close_conn(conn);
+        close_conn_after_complete_response(loop, conn);
         return;
     }
 
@@ -9564,7 +9575,7 @@ void on_validated_preconnect_failure_sent(void* lp, Connection& conn, IoEvent ev
     conn.response_header_buf.reset();
     conn.send_buf.reset();
     if (loop->is_draining() || !conn.keep_alive) {
-        loop->close_conn(conn);
+        close_conn_after_complete_response(loop, conn);
         return;
     }
     const PipelineTransitionResult kTransition = pipeline_shift(conn);
@@ -11535,7 +11546,7 @@ void on_proxy_response_sent(void* lp, Connection& conn, IoEvent ev) {
     loop->epoch_leave();
 
     if (loop->is_draining()) {
-        loop->close_conn(conn);
+        close_conn_after_complete_response(loop, conn);
         return;
     }
 
@@ -11553,7 +11564,7 @@ void on_proxy_response_sent(void* lp, Connection& conn, IoEvent ev) {
     release_upstream_conn(loop, conn);  // pool for reuse if keep-alive, else close
 
     if (!conn.keep_alive) {
-        loop->close_conn(conn);
+        close_conn_after_complete_response(loop, conn);
         return;
     }
 

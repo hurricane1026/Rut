@@ -2340,6 +2340,7 @@ public:
                     c.http1_boundary_deferred = false;
                     c.http1_boundary_successor_episode = 0;
                     c.http1_prebuilt_wait = 0;
+                    end_stream_before_close(c);  // completed response
                     close_conn(c);
                     continue;
                 }
@@ -2379,11 +2380,9 @@ public:
                     c.http1_prebuilt_deadline_upload,
                     ForwardResponseBufferingMode::CompleteContentLength,
                     ResponseReadDeadlineProfile::BodylessNonHeadContentLengthZero);
-            if (c.http1_prebuilt_deadline_upload.downstream_close && !explicit_close) {
-                close_conn(c);
-                continue;
-            }
-            if (explicit_close) {
+            // Both branches close after a completed response.
+            if (c.http1_prebuilt_deadline_upload.downstream_close || explicit_close) {
+                end_stream_before_close(c);
                 close_conn(c);
                 continue;
             }
@@ -2961,6 +2960,26 @@ public:
             c.response_read_deadline_send_kind = kind;
             c.response_read_deadline_send_owner_active = true;
         }
+        // The completion SQE is reserved first: once written, the bytes and
+        // FIN cannot be withdrawn, so the send must stay accountable.
+        if (!deadline_send && final_local_response_send(c, buf, len) && backend.sq_has_room()) {
+            // The last response on a closing plaintext connection: write it
+            // directly and end the stream at once, as nginx does, so the FIN
+            // follows the data before the client can close first.
+            const ssize_t n = ::send(c.fd, buf, len, MSG_DONTWAIT | MSG_NOSIGNAL);
+            if (n > 0) {
+                const u32 written = static_cast<u32>(n);
+                if (written == len) (void)::shutdown(c.fd, SHUT_WR);
+                if (backend.add_send_after_direct_write(
+                        c.fd, c.id, buf, len, written, generation)) {
+                    c.pending_ops++;
+                    c.send_armed = true;
+                    c.direct_write_completion_pending = true;
+                    return true;
+                }
+                return false;
+            }
+        }
         if (backend.add_send(c.fd, c.id, buf, len, generation)) {
             c.pending_ops++;
             c.send_armed = true;
@@ -2968,6 +2987,15 @@ public:
         }
         if (deadline_send) c.clear_response_read_deadline_send_owner();
         return false;
+    }
+
+    [[nodiscard]] bool final_local_response_send(const Connection& c,
+                                                 const u8* buf,
+                                                 u32 len) const {
+        return backend.nop_inject_result && !c.tls_active && !c.keep_alive && c.fd >= 0 &&
+               !c.send_armed && len != 0 && len <= static_cast<u32>(INT32_MAX) &&
+               c.on_send == &on_response_sent<Self> && c.send_progress == 0 &&
+               buf == c.send_buf.data() && len == c.send_buf.len();
     }
 
     bool submit_send_impl(Connection& c, const u8* buf, u32 len) {
@@ -3049,6 +3077,16 @@ public:
             return true;
         }
         return false;
+    }
+
+    // close() cannot end a stream that an armed io_uring recv still references:
+    // the FIN would wait until the close-path cancel drains, after the client
+    // has usually closed first. For a plaintext connection whose response is
+    // complete, half-close the write side now. TLS keeps its own shutdown path.
+    void end_stream_before_close(Connection& c) {
+        // A send still in flight keeps the ordinary close ordering: half-
+        // closing now would fail that send and truncate the response.
+        if (c.fd >= 0 && !c.tls_active && !c.send_armed) (void)::shutdown(c.fd, SHUT_WR);
     }
 
     // A provided-buffer multishot recv can complete several 4 KiB CQEs in one
@@ -5855,7 +5893,10 @@ public:
                     if (!ev.more) {
                         if (conn.pending_ops > 0) conn.pending_ops--;
                         if (ev.type == IoEventType::Recv) conn.recv_armed = false;
-                        if (ev.type == IoEventType::Send) conn.send_armed = false;
+                        if (ev.type == IoEventType::Send) {
+                            conn.send_armed = false;
+                            conn.direct_write_completion_pending = false;
+                        }
                         if (ev.type == IoEventType::UpstreamConnect)
                             conn.upstream_connect_armed = false;
                         if (ev.type == IoEventType::UpstreamSend) {

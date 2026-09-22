@@ -12241,6 +12241,26 @@ struct KeepAliveCountingUpstream {
     }
 };
 
+// A Connection: close response reaches the client's EOF as soon as the
+// server half-closes, possibly before the shard has drained the close-path
+// cancel of that connection. After stop()+join() the test thread owns the
+// loop: harvest those remaining completions so slot and slice accounting
+// reflects the settled state. io_uring only (epoll closes synchronously);
+// the armed 1 s timer read bounds each wait.
+template <typename ShardT>
+void settle_stopped_iouring_shard(ShardT& shard) {
+    auto* loop = shard.loop;
+    if constexpr (requires { loop->backend.sq_tail; }) {
+        IoEvent events[64];
+        for (u32 it = 0; it < 16u && (loop->active_count() > 0u || loop->pending_free_count > 0u ||
+                                      loop->pool.in_use() > 0u);
+             it++) {
+            const u32 n = loop->backend.wait(events, 64, loop->conns, loop->connection_capacity);
+            for (u32 i = 0; i < n; i++) loop->dispatch(events[i]);
+        }
+    }
+}
+
 template <typename ShardT>
 bool wait_for_idle_pool_count(ShardT& shard, u32 expected, u32 timeout_ms = 1000) {
     for (u32 waited = 0; waited < timeout_ms; waited++) {
@@ -20575,6 +20595,7 @@ route "/" { return forward(backend) }
     usleep(500000);
     shard.stop();
     shard.join();
+    settle_stopped_iouring_shard(shard);
     shard_guard.spawned = false;
     backend.teardown();
 
@@ -20788,6 +20809,7 @@ route "/" { return forward(backend) }
     usleep(500000);
     shard.stop();
     shard.join();
+    settle_stopped_iouring_shard(shard);
     shard_guard.spawned = false;
     backend.teardown();
 
@@ -21089,6 +21111,7 @@ route GET "/compiled-sentinel" { return 204 }
 
     shard.stop();
     shard.join();
+    settle_stopped_iouring_shard(shard);
     shard_guard.spawned = false;
     REQUIRE_EQ(shard.backend_failure_code(), 0);
     CHECK_FALSE(shard.loop->is_running());
@@ -21434,6 +21457,7 @@ route exact GET "/static" { return local_response({
 
     shard.stop();
     shard.join();
+    settle_stopped_iouring_shard(shard);
     shard_guard.spawned = false;
     REQUIRE_EQ(shard.backend_failure_code(), 0);
     backend.teardown();
@@ -21714,6 +21738,7 @@ route exact "/static" { return local_response({
 
     shard.stop();
     shard.join();
+    settle_stopped_iouring_shard(shard);
     shard_guard.spawned = false;
     REQUIRE_EQ(shard.backend_failure_code(), 0);
     backend.teardown();
@@ -22038,6 +22063,7 @@ route exact "/static" { return local_response({
 
     shard.stop();
     shard.join();
+    settle_stopped_iouring_shard(shard);
     shard_guard.spawned = false;
     REQUIRE_EQ(shard.backend_failure_code(), 0);
     backend.teardown();
@@ -22360,6 +22386,7 @@ route exact "/static" { return local_response({
 
     shard.stop();
     shard.join();
+    settle_stopped_iouring_shard(shard);
     shard_guard.spawned = false;
     REQUIRE_EQ(shard.backend_failure_code(), 0);
     backend.teardown();
@@ -22685,6 +22712,7 @@ route exact "/static" { return local_response({
 
     shard.stop();
     shard.join();
+    settle_stopped_iouring_shard(shard);
     shard_guard.spawned = false;
     REQUIRE_EQ(shard.backend_failure_code(), 0);
     backend.teardown();
@@ -23067,6 +23095,7 @@ route "/" {
 
     shard.stop();
     shard.join();
+    settle_stopped_iouring_shard(shard);
     shard_guard.spawned = false;
     REQUIRE_EQ(shard.backend_failure_code(), 0);
     backend.teardown();
@@ -24071,6 +24100,7 @@ route GET "/fixed" {
 
     shard.stop();
     shard.join();
+    settle_stopped_iouring_shard(shard);
     shard_guard.spawned = false;
     REQUIRE_EQ(shard.backend_failure_code(), 0);
     backend.teardown();
@@ -24418,6 +24448,7 @@ static void run_public_complete_access_target_66(rut::test::TestCase* _tc) {
     REQUIRE_EQ(shard.log_ring->available(), 1u);
     shard.stop();
     shard.join();
+    settle_stopped_iouring_shard(shard);
     shard_guard.spawned = false;
     REQUIRE_EQ(shard.backend_failure_code(), 0);
     REQUIRE_EQ(shard.log_ring->available(), 1u);
@@ -27931,6 +27962,7 @@ route GET "/" {
 
     shard.stop();
     shard.join();
+    settle_stopped_iouring_shard(shard);
     shard_guard.spawned = false;
     REQUIRE_EQ(shard.backend_failure_code(), 0);
     neighbor_epoch.teardown();
@@ -28259,6 +28291,7 @@ route GET "/" {
 
     shard.stop();
     shard.join();
+    settle_stopped_iouring_shard(shard);
     shard_guard.spawned = false;
     REQUIRE_EQ(shard.backend_failure_code(), 0);
     neighbor_epoch.teardown();
@@ -28871,6 +28904,7 @@ route GET "/" {
 
     shard.stop();
     shard.join();
+    settle_stopped_iouring_shard(shard);
     shard_guard.spawned = false;
     REQUIRE_EQ(shard.backend_failure_code(), 0);
 
@@ -30559,6 +30593,7 @@ TEST(route, ordinary_source_local_response_request_persistence_iouring) {
     client.fd = -1;
     shard.drain(1);
     shard.join();
+    settle_stopped_iouring_shard(shard);
 
     REQUIRE_EQ(shard.backend_failure_code(), 0);
     CHECK_FALSE(shard.loop->is_running());
@@ -30802,6 +30837,7 @@ TEST(
     usleep(100000);
     shard.stop();
     shard.join();
+    settle_stopped_iouring_shard(shard);
     shard_guard.spawned = false;
     backend.teardown();
 
@@ -31083,6 +31119,7 @@ TEST(
     REQUIRE_EQ(accepts_connections, 0);
 
     runner.stop_and_join();
+    settle_stopped_iouring_shard(shard);
     CHECK_EQ(shard.backend_failure_code(), 0);
     CHECK_FALSE(shard.loop->is_running());
     CHECK_EQ(shard.loop->active_count(), 0u);
@@ -31619,6 +31656,7 @@ TEST(route, ordinary_source_validated_failure_late_successor_iouring) {
     client.fd = -1;
     shard.stop();
     runner.join();
+    settle_stopped_iouring_shard(shard);
     REQUIRE(runner.exited.load(std::memory_order_acquire));
 
     CHECK_EQ(shard.backend_failure_code(), 0);
@@ -32272,6 +32310,7 @@ TEST(route, ordinary_source_validated_failure_late_strict_successor_iouring) {
     client.fd = -1;
     shard.stop();
     runner.join();
+    settle_stopped_iouring_shard(shard);
     REQUIRE(runner.exited.load(std::memory_order_acquire));
 
     CHECK_EQ(shard.backend_failure_code(), 0);
@@ -32736,6 +32775,7 @@ TEST(route, ordinary_source_coalesced_strict_get_successor_iouring) {
     client.fd = -1;
     shard.stop();
     runner.join();
+    settle_stopped_iouring_shard(shard);
     REQUIRE(runner.exited.load(std::memory_order_acquire));
     CHECK_EQ(shard.backend_failure_code(), 0);
     CHECK_FALSE(shard.loop->is_running());
@@ -33126,16 +33166,27 @@ TEST(route, ordinary_source_coalesced_exact_strict_get_successor_iouring) {
                                 const io_uring_sqe& sqe = loop->backend.sq_entries[sqe_index];
                                 if (sqe.opcode == IORING_OP_CONNECT)
                                     self->exact_connect_sqe_count++;
-                                if (sqe.opcode == IORING_OP_SEND && sqe.fd == conn.fd) {
+                                // The closing response is either a kernel Send of the
+                                // staged bytes, or (direct write) a NOP completing the
+                                // bytes already written, under the same identity.
+                                const bool kernel_send =
+                                    sqe.opcode == IORING_OP_SEND && sqe.fd == conn.fd &&
+                                    sqe.addr == reinterpret_cast<u64>(send.src);
+                                const bool direct_write_completion =
+                                    sqe.opcode == IORING_OP_NOP &&
+                                    static_cast<u32>(sqe.rw_flags) == (1u << 0);
+                                const u64 user_data = sqe.user_data;
+                                const bool target_identity =
+                                    static_cast<IoEventType>(user_data & 0xFFu) ==
+                                        IoEventType::Send &&
+                                    static_cast<u32>((user_data >> 8) & 0xFFFFFFu) == self->conn_id;
+                                if ((sqe.opcode == IORING_OP_SEND && sqe.fd == conn.fd) ||
+                                    (direct_write_completion && target_identity)) {
                                     self->exact_target_send_sqe_count++;
-                                    const u64 user_data = sqe.user_data;
                                     self->exact_sq_identity =
-                                        static_cast<IoEventType>(user_data & 0xFFu) ==
-                                            IoEventType::Send &&
-                                        static_cast<u32>((user_data >> 8) & 0xFFFFFFu) ==
-                                            self->conn_id &&
+                                        target_identity &&
+                                        (kernel_send || direct_write_completion) &&
                                         static_cast<u32>(user_data >> 32) == 0 &&
-                                        sqe.addr == reinterpret_cast<u64>(send.src) &&
                                         sqe.len == send.remaining;
                                 }
                             }
@@ -33305,6 +33356,7 @@ TEST(route, ordinary_source_coalesced_exact_strict_get_successor_iouring) {
     client.fd = -1;
     shard.stop();
     runner.join();
+    settle_stopped_iouring_shard(shard);
     REQUIRE(runner.exited.load(std::memory_order_acquire));
     const Connection& final_conn = shard.loop->conns[runner.conn_id];
     const u32 final_upstream_episode = final_conn.upstream_episode;
@@ -33837,6 +33889,7 @@ route GET "/buffered" {
     client.fd = -1;
     shard.stop();
     shard.join();
+    settle_stopped_iouring_shard(shard);
     shard_guard.spawned = false;
     REQUIRE_EQ(shard.backend_failure_code(), 0);
 
@@ -34081,6 +34134,7 @@ TEST(
     REQUIRE_EQ(backend.request_count.load(std::memory_order_acquire), 1u);
     shard.stop();
     shard.join();
+    settle_stopped_iouring_shard(shard);
     shard_guard.spawned = false;
     backend.teardown();
     REQUIRE_EQ(backend.accepted_count.load(std::memory_order_acquire), 1u);
@@ -34325,6 +34379,7 @@ TEST(
     REQUIRE_EQ(backend.request_count.load(std::memory_order_acquire), 1u);
     shard.stop();
     shard.join();
+    settle_stopped_iouring_shard(shard);
     shard_guard.spawned = false;
     backend.teardown();
     REQUIRE_EQ(backend.accepted_count.load(std::memory_order_acquire), 1u);
@@ -36490,6 +36545,7 @@ TEST(
     client.fd = -1;
     shard.stop();
     shard.join();
+    settle_stopped_iouring_shard(shard);
     shard_guard.spawned = false;
     REQUIRE_EQ(shard.backend_failure_code(), 0);
     backend.teardown();
@@ -37380,6 +37436,7 @@ TEST(
     client.fd = -1;
     shard.stop();
     shard.join();
+    settle_stopped_iouring_shard(shard);
     shard_guard.spawned = false;
     REQUIRE_EQ(shard.backend_failure_code(), 0);
     backend.teardown();
@@ -37750,6 +37807,7 @@ TEST(
     client.fd = -1;
     shard.stop();
     shard.join();
+    settle_stopped_iouring_shard(shard);
     shard_guard.spawned = false;
     REQUIRE_EQ(shard.backend_failure_code(), 0);
     backend.teardown();
@@ -38689,6 +38747,7 @@ TEST(
     }
     shard.stop();
     shard.join();
+    settle_stopped_iouring_shard(shard);
     shard_guard.spawned = false;
     REQUIRE_EQ(shard.backend_failure_code(), 0);
     REQUIRE_EQ(shard.log_ring->available(), 1u);
@@ -39500,6 +39559,7 @@ TEST(route, public_ordinary_source_distinct_response_read_deadlines_iouring) {
     long_client.fd = -1;
     shard.stop();
     shard.join();
+    settle_stopped_iouring_shard(shard);
     shard_guard.spawned = false;
     short_backend.teardown();
     long_backend.teardown();
@@ -41740,6 +41800,7 @@ TEST(
     client.fd = -1;
     shard.stop();
     shard.join();
+    settle_stopped_iouring_shard(shard);
     shard_guard.spawned = false;
     REQUIRE_EQ(shard.backend_failure_code(), 0);
     backend.teardown();

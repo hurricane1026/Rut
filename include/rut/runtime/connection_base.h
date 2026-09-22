@@ -1595,6 +1595,9 @@ struct ConnectionBase {
     // Lazy-allocated: only proxy connections pay the cost.
     u8* upstream_recv_slice;
     Buffer upstream_recv_buf;
+    // io_uring: the final response was written directly and its Send
+    // completion (which accounts the request) is still pending.
+    bool direct_write_completion_pending;
 
     void bind_request_receive_buffer(u8* slice, u32 capacity) {
         clear_raw_request_target_witness();
@@ -1849,6 +1852,7 @@ struct ConnectionBase {
         send_progress = 0;
         upstream_recv_slice = nullptr;
         upstream_recv_buf.bind(nullptr, 0);
+        direct_write_completion_pending = false;
     }
 };
 

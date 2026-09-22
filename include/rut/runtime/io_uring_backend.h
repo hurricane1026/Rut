@@ -65,6 +65,10 @@ struct IoUringBackend {
     void* sqes_ptr = nullptr;
     u64 sqes_sz = 0;
 
+    // Kernel supports IORING_NOP_INJECT_RESULT (probed at init); required to
+    // complete a send that was written directly in full.
+    bool nop_inject_result = false;
+
     // Provided buffer ring
     io_uring_buf_ring* buf_ring = nullptr;
     u8* buf_base = nullptr;  // kProvidedBufCount * kProvidedBufSize bytes
@@ -215,6 +219,18 @@ struct IoUringBackend {
 #endif
 
     // Same as add_send but encodes UpstreamSend in user_data.
+    // True when get_sqe() can hand out at least one more SQE.
+    bool sq_has_room() const {
+        return __atomic_load_n(sq_tail, __ATOMIC_RELAXED) -
+                   __atomic_load_n(sq_head, __ATOMIC_ACQUIRE) <
+               sq_ring_entries;
+    }
+
+    // Complete a downstream send the caller already started with a direct
+    // write of `written` bytes: a NOP injecting `len` when all bytes were
+    // written, else a Send of the remainder whose completion reports `len`.
+    bool add_send_after_direct_write(
+        i32 fd, u32 conn_id, const u8* buf, u32 len, u32 written, u32 generation);
     bool add_send_upstream(i32 fd, u32 conn_id, const u8* buf, u32 len, u32 upstream_episode = 1);
 
     // Submit a connect to upstream.
@@ -347,6 +363,8 @@ private:
     core::Expected<void, Error> setup_buf_ring();
     // Setup the optional dedicated large ring; failure leaves it unset.
     void setup_large_buf_ring();
+    // Detect IORING_NOP_INJECT_RESULT support (Linux 6.10+).
+    void probe_nop_inject_result();
 
     // Submit IORING_OP_READ on timer_fd to receive next tick.
     void submit_timer_read();

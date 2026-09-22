@@ -60,6 +60,13 @@ static bool response_deadline_copy_owner(const Connection& conn, u32 upstream_ep
            !conn.h2_proxy_recv_draining && !conn.h2_proxy_synth_quarantined;
 }
 
+// IORING_OP_NOP result injection (Linux 6.10). Older UAPI headers lack the
+// name and the nop_flags alias of the shared per-op flags word (rw_flags); the
+// ABI is fixed, and support is probed at runtime.
+#ifndef IORING_NOP_INJECT_RESULT
+#define IORING_NOP_INJECT_RESULT (1U << 0)
+#endif
+
 // Sentinel conn_id for timer events (same value as epoll backend)
 static constexpr u32 kTimerConnId = 0xFFFFFE;
 // Sentinel conn_id for cancel completions (must not collide with real conn_ids or timer)
@@ -279,6 +286,7 @@ core::Expected<void, Error> IoUringBackend::init(u32 /*shard_id*/, i32 lfd, u32 
 
     // Setup provided buffer ring for zero-copy recv
     TRY_VOID(setup_buf_ring());
+    probe_nop_inject_result();
 
     // Create timerfd for 1-second ticks (drives timer wheel)
     timer_fd = timerfd_create(CLOCK_MONOTONIC, TFD_NONBLOCK | TFD_CLOEXEC);
@@ -598,6 +606,69 @@ bool IoUringBackend::add_send(i32 fd, u32 conn_id, const u8* buf, u32 len, u32 g
     sqe->len = len;
     sqe->user_data = encode_user_data(conn_id, IoEventType::Send, generation);
 
+    sqe_advance_tail(sq_tail);
+    pending++;
+    return true;
+}
+
+void IoUringBackend::probe_nop_inject_result() {
+    // Runs before any other submission, so the only CQE is this probe's.
+    // Kernels without IORING_NOP_INJECT_RESULT fail the NOP with -EINVAL.
+    static constexpr u32 kProbeResult = 7;
+    nop_inject_result = false;
+    const u32 tail_before = __atomic_load_n(sq_tail, __ATOMIC_RELAXED);
+    io_uring_sqe* sqe = get_sqe();
+    if (!sqe) return;
+    memset(sqe, 0, sizeof(*sqe));
+    sqe->opcode = IORING_OP_NOP;
+    sqe->rw_flags = static_cast<decltype(sqe->rw_flags)>(IORING_NOP_INJECT_RESULT);
+    sqe->len = kProbeResult;
+    sqe->user_data = encode_user_data(kCancelConnId, IoEventType::Send);
+    sqe_advance_tail(sq_tail);
+    // -EINTR means nothing was submitted. A probe the kernel did not accept
+    // is withdrawn, so the next submission starts with the runtime's own SQEs.
+    i32 rc = 0;
+    do {
+        rc = io_uring_enter(ring_fd, 1, 1, IORING_ENTER_GETEVENTS);
+    } while (rc == -EINTR);
+    if (rc < 1) {
+        __atomic_store_n(sq_tail, tail_before, __ATOMIC_RELEASE);
+        return;
+    }
+    // Accepted: consume its completion here rather than in the first wait().
+    u32 head = __atomic_load_n(cq_head, __ATOMIC_RELAXED);
+    while (head == __atomic_load_n(cq_tail, __ATOMIC_ACQUIRE)) {
+        rc = io_uring_enter(ring_fd, 0, 1, IORING_ENTER_GETEVENTS);
+        if (rc < 0 && rc != -EINTR) return;  // wait() drops the sentinel completion
+    }
+    nop_inject_result = cq_entries[head & *cq_ring_mask].res == static_cast<i32>(kProbeResult);
+    __atomic_store_n(cq_head, head + 1, __ATOMIC_RELEASE);
+}
+
+bool IoUringBackend::add_send_after_direct_write(
+    i32 fd, u32 conn_id, const u8* buf, u32 len, u32 written, u32 generation) {
+    if (conn_id >= connection_capacity || connection_capacity == 0 || written > len ||
+        (written == len && !nop_inject_result))
+        return false;
+    io_uring_sqe* sqe = get_sqe();
+    if (!sqe) return false;
+    // Same send state as add_send, advanced past the bytes the caller already
+    // wrote directly; the Send completion still reports the whole length.
+    send_state[conn_id] = {buf, fd, written, len - written, IoEventType::Send, 0, generation};
+    memset(sqe, 0, sizeof(*sqe));
+    if (written == len) {
+        sqe->opcode = IORING_OP_NOP;
+        sqe->rw_flags = static_cast<decltype(sqe->rw_flags)>(IORING_NOP_INJECT_RESULT);
+        sqe->len = len;
+        send_state[conn_id].offset = 0;
+        send_state[conn_id].remaining = len;
+    } else {
+        sqe->opcode = IORING_OP_SEND;
+        sqe->fd = fd;
+        sqe->addr = reinterpret_cast<u64>(buf + written);
+        sqe->len = len - written;
+    }
+    sqe->user_data = encode_user_data(conn_id, IoEventType::Send, generation);
     sqe_advance_tail(sq_tail);
     pending++;
     return true;
