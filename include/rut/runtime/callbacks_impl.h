@@ -6997,6 +6997,44 @@ void pump_response_read_deadline_body(Loop* loop, Connection& conn) {
         close_conn_if_live(loop, conn);
 }
 
+// Plaintext body relay (io_uring): send the upstream slice that holds this
+// chunk while the next one-shot upstream recv fills the connection's second
+// slice, instead of waiting for the send before receiving again. Applies only
+// to a whole-buffer chunk that does not finish the body; the final chunk and
+// every ineligible owner keep the serialized pump. Returns true once it owns
+// the chunk (the connection may have been closed on submission failure).
+template <typename Loop>
+bool start_upstream_body_relay(Loop* loop, Connection& conn, u32 send_len) {
+    if constexpr (!(requires(Loop* l, Connection& c) {
+                      l->upstream_body_relay_eligible(c);
+                      l->alloc_upstream_relay_slice(c);
+                  })) {
+        return false;
+    } else {
+        if (send_len == 0 || send_len != conn.upstream_recv_buf.len() ||
+            proxy_body_complete(conn) || !loop->upstream_body_relay_eligible(conn) ||
+            !loop->alloc_upstream_relay_slice(conn))
+            return false;
+        u8* const sending = conn.upstream_recv_slice;
+        conn.upstream_recv_slice = conn.upstream_relay_slice;
+        conn.upstream_relay_slice = sending;
+        conn.upstream_recv_buf.bind(conn.upstream_recv_slice, SlicePool::kSliceSize);
+        conn.upstream_relay_send_len = send_len;
+        conn.resp_body_sent += send_len;
+        conn.state = ConnState::Sending;
+        conn.set_slots(
+            nullptr, &on_response_body_sent<Loop>, &on_response_body_recvd<Loop>, nullptr);
+        if (!client_send(loop, conn, sending, send_len)) {
+            close_conn_if_live(loop, conn);
+            return true;
+        }
+        // If the submission queue had room only for the send, the recv is
+        // armed by on_response_body_sent once the send completes.
+        (void)loop->submit_recv_upstream(conn);
+        return true;
+    }
+}
+
 template <typename Loop>
 void on_response_body_recvd(void* lp, Connection& conn, IoEvent ev) {
     auto* loop = static_cast<Loop*>(lp);
@@ -7083,6 +7121,10 @@ void on_response_body_recvd(void* lp, Connection& conn, IoEvent ev) {
     // drain replays these appended bytes once the remainder finishes
     // (proxy_tls_parked_drained → consume_upstream_sent → synthetic recv).
     if (conn.tls_proxy_stream && conn.tls_send_src) return;
+
+    // A relayed chunk's client send still reads the other slice. Keep these
+    // bytes buffered; on_response_body_sent replays them once that send drains.
+    if (conn.upstream_relay_send_len != 0) return;
 
     const u32 kDataLen = conn.upstream_recv_buf.len();
     if (conn.response_policy_id != 0 && conn.resp_body_mode == BodyMode::ContentLength &&
@@ -7215,6 +7257,8 @@ void on_response_body_recvd(void* lp, Connection& conn, IoEvent ev) {
         }
     }
 
+    if (start_upstream_body_relay<Loop>(loop, conn, send_len)) return;
+
     conn.resp_body_sent += send_len;
     conn.upstream_send_len = send_len;
     conn.transition_to_sending(&on_response_body_sent<Loop>);
@@ -7258,6 +7302,8 @@ void proxy_stream_complete(Loop* loop, Connection& conn) {
     // bytes observed before completion are still rejected by the body pump.
     if (conn.response_policy_id != 0) conn.upstream_keep_alive = false;
     conn.upstream_recv_buf.reset();
+    if constexpr (requires { loop->release_upstream_relay_slice(conn); })
+        loop->release_upstream_relay_slice(conn);
     release_upstream_slot(loop, conn);  // free the backend slot promptly
 
     on_request_complete(loop, conn, conn.resp_status, conn.resp_body_sent);
@@ -7404,6 +7450,35 @@ void on_response_body_sent(void* lp, Connection& conn, IoEvent ev) {
 
     if (ev.result <= 0) {
         loop->close_conn(conn);
+        return;
+    }
+
+    if (conn.upstream_relay_send_len != 0) {
+        // The relayed slice is free again. The next upstream recv is either
+        // still armed or has already buffered bytes in the current slice.
+        if (static_cast<u32>(ev.result) != conn.upstream_relay_send_len) {
+            loop->close_conn(conn);
+            return;
+        }
+        conn.upstream_relay_send_len = 0;
+        conn.set_slots(nullptr, nullptr, &on_response_body_recvd<Loop>, nullptr);
+        // While the recv is armed its own completion delivers whatever it
+        // buffered (the backend may already have copied it this batch).
+        if (conn.upstream_recv_armed) return;
+        const u32 kBuffered = conn.upstream_recv_buf.len();
+        if (kBuffered > 0) {
+            IoEvent synth = {conn.id,
+                             static_cast<i32>(kBuffered),
+                             0,
+                             0,
+                             IoEventType::UpstreamRecv,
+                             0,
+                             0,
+                             conn.upstream_episode};
+            on_response_body_recvd<Loop>(lp, conn, synth);
+        } else if (!loop->submit_recv_upstream(conn)) {
+            loop->close_conn(conn);
+        }
         return;
     }
 
