@@ -7014,6 +7014,150 @@ TEST(http2, proxy_finish_preserves_body_after_upstream_teardown) {
     CHECK_FALSE(conn->epoch_held);
 }
 
+TEST(http2, proxy_finish_bodyless_and_head_preserve_framing_and_epoch) {
+    const auto run = [&](bool is_head) {
+        SmallLoop loop;
+        loop.setup();
+        auto* conn = loop.alloc_conn();
+        REQUIRE(conn != nullptr);
+        Http2Conn h2{};
+        h2.init();
+        h2.nstreams = 1;
+        h2.streams[0] = {1,
+                         Http2StreamState::Open,
+                         static_cast<i32>(kDefaultInitialWindowSize),
+                         static_cast<i32>(kDefaultInitialWindowSize),
+                         true};
+        h2.async_stream = 1;
+        h2.preface_seen = true;
+        h2.our_settings_sent = true;
+        conn->h2 = &h2;
+        conn->epoch_held = true;
+        static u8 upstream[512];
+        const char response[] = "HTTP/1.1 200 OK\r\nContent-Length: 9\r\n\r\n";
+        constexpr u32 kHeaderLen = sizeof(response) - 1;
+        memcpy(upstream, response, kHeaderLen);
+        conn->upstream_recv_buf.bind(upstream, sizeof(upstream));
+        conn->upstream_recv_buf.commit(kHeaderLen);
+        ParsedResponse parsed{};
+        parsed.reset();
+        parsed.status_code = 200;
+        parsed.version = HttpVersion::Http11;
+        parsed.header_count = 1;
+        parsed.headers[0] = {{"content-length", 14}, {"9", 1}};
+        parsed.has_content_length = true;
+        parsed.content_length = 9;
+
+        h2_proxy_finish(&loop, *conn, parsed, kHeaderLen, 0, is_head);
+        REQUIRE_GT(conn->send_buf.len(), 0u);
+        CHECK_EQ(conn->upstream_recv_buf.len(), 0u);
+        CHECK_FALSE(conn->upstream_recv_armed);
+        CHECK_FALSE(conn->upstream_send_armed);
+        CHECK_FALSE(conn->epoch_held);
+        Http2FrameHeader frame{};
+        REQUIRE_EQ(parse_frame_header(conn->send_buf.data(), conn->send_buf.len(), &frame),
+                   ParseStatus::Complete);
+        hpack::DynamicTable decoded;
+        decoded.init(kDefaultHeaderTableSize);
+        hpack::Header headers[8];
+        u8 scratch[256]{};
+        u32 count = 0;
+        REQUIRE(hpack::decode_header_block(decoded,
+                                           conn->send_buf.data() + kFrameHeaderSize,
+                                           frame.length,
+                                           scratch,
+                                           sizeof(scratch),
+                                           headers,
+                                           8,
+                                           &count));
+        bool saw_length = false;
+        for (u32 i = 0; i < count; i++) {
+            if (headers[i].name.eq({"content-length", 14})) {
+                saw_length = headers[i].value.eq({"9", 1});
+            }
+        }
+        CHECK_EQ(saw_length, is_head);
+        const u32 send_len = conn->send_buf.len();
+        loop.inject_and_dispatch(make_ev(conn->id, IoEventType::Send, static_cast<i32>(send_len)));
+        CHECK_EQ(conn->state, ConnState::ReadingHeader);
+    };
+    run(false);
+    run(true);
+}
+
+TEST(http2, proxy_finish_guarded_failure_preserves_pending_synth) {
+    const auto run = [&](bool send_armed, bool quarantined, bool bad_bounds = false) {
+        SmallLoop loop;
+        loop.setup();
+        auto* conn = loop.alloc_conn();
+        REQUIRE(conn != nullptr);
+        Http2Conn h2{};
+        h2.init();
+        h2.nstreams = 1;
+        h2.streams[0] = {1,
+                         Http2StreamState::Open,
+                         static_cast<i32>(kDefaultInitialWindowSize),
+                         static_cast<i32>(kDefaultInitialWindowSize),
+                         true};
+        h2.async_stream = 1;
+        h2.preface_seen = true;
+        h2.our_settings_sent = true;
+        conn->h2 = &h2;
+        conn->epoch_held = true;
+        conn->upstream_send_armed = send_armed;
+        conn->h2_proxy_synth_quarantined = quarantined;
+        static u8 upstream[512];
+        const char response[] = "HTTP/1.1 200 OK\r\nContent-Length: 3\r\n\r\nabc";
+        constexpr u32 kHeaderLen = sizeof(response) - 1 - 3;
+        memcpy(upstream, response, sizeof(response) - 1);
+        conn->upstream_recv_buf.bind(upstream, sizeof(upstream));
+        conn->upstream_recv_buf.commit(sizeof(response) - 1);
+        memset(h2.pending_synth, 0xA5, sizeof(h2.pending_synth));
+        u8 before[32]{};
+        memcpy(before, h2.pending_synth, sizeof(before));
+        ParsedResponse parsed{};
+        parsed.reset();
+        parsed.status_code = 200;
+        parsed.version = HttpVersion::Http11;
+        h2_proxy_finish(&loop, *conn, parsed, bad_bounds ? kHeaderLen + 1 : kHeaderLen, 3, false);
+        REQUIRE_GT(conn->send_buf.len(), 0u);
+        Http2FrameHeader frame{};
+        REQUIRE_EQ(parse_frame_header(conn->send_buf.data(), conn->send_buf.len(), &frame),
+                   ParseStatus::Complete);
+        CHECK_EQ(frame.type, static_cast<u8>(Http2FrameType::Headers));
+        hpack::DynamicTable decoded;
+        decoded.init(kDefaultHeaderTableSize);
+        hpack::Header headers[8];
+        u8 scratch[256]{};
+        u32 count = 0;
+        REQUIRE(hpack::decode_header_block(decoded,
+                                           conn->send_buf.data() + kFrameHeaderSize,
+                                           frame.length,
+                                           scratch,
+                                           sizeof(scratch),
+                                           headers,
+                                           8,
+                                           &count));
+        bool saw_502 = false;
+        for (u32 i = 0; i < count; i++)
+            if (headers[i].name.eq({":status", 7}) && headers[i].value.eq({"502", 3}))
+                saw_502 = true;
+        CHECK(saw_502);
+        CHECK_EQ(h2.outbound_stream, 0u);
+        CHECK_FALSE(conn->epoch_held);
+        CHECK_EQ(h2.pending_synth[0], before[0]);
+        CHECK_EQ(memcmp(h2.pending_synth, before, sizeof(before)), 0);
+        CHECK_EQ(conn->upstream_recv_buf.len(), 0u);
+        CHECK_FALSE(conn->upstream_send_armed);
+        const u32 send_len = conn->send_buf.len();
+        loop.inject_and_dispatch(make_ev(conn->id, IoEventType::Send, static_cast<i32>(send_len)));
+        CHECK_EQ(conn->state, ConnState::ReadingHeader);
+    };
+    run(true, false);
+    run(false, true);
+    run(false, false, true);
+}
+
 TEST(http2, rst_owner_clears_parked_flush_gate_but_preserves_staged_send_gate) {
     SmallLoop loop;
     loop.setup();
