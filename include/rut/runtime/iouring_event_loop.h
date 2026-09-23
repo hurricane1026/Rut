@@ -418,10 +418,8 @@ public:
         response_read_batch_pin_count = 0;
         deferred_accept_count = 0;
         timer.init();
-        // Plaintext needs recv + send + lazy upstream_recv. TLS termination adds
-        // one long-lived ciphertext output slice per connection. TLS input uses
-        // a slightly larger mmap buffer so one full ciphertext record fits.
-        // tls_server is wired after init(), so reserve for the TLS-capable case.
+        // Reserve six ordinary slices and one complete bounded response chain
+        // per admitted connection. TLS input remains separately mmap-backed.
         auto pooled =
             pool.init(SlicePool::capacity_for_connections(connection_capacity), pool_prealloc);
         if (!pooled) {

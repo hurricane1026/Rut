@@ -558,8 +558,8 @@ public:
         jit_code_ptr = nullptr;
         deferred_accept_count = 0;
         timer.init();
-        // Reserve ordinary connection buffers plus one complete bounded
-        // buffered response chain per shard. All storage remains lazy.
+        // Reserve six ordinary slices and one complete bounded response chain
+        // per admitted connection. Storage remains lazy and shared by the shard.
         auto pooled =
             pool.init(SlicePool::capacity_for_connections(connection_capacity), pool_prealloc);
         if (!pooled) {

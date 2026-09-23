@@ -289,8 +289,8 @@ public:
             conns[i].shard_id = static_cast<u8>(id);
             free_stack[i] = i;
         }
-        // Reserve ordinary connection buffers plus one complete bounded buffered
-        // response chain per shard. All storage is lazy and VA-reserved.
+        // Reserve six ordinary slices and one complete bounded response chain
+        // per admitted connection. Storage is lazy and VA-reserved.
         TRY_VOID(pool.init(SlicePool::capacity_for_connections(kMaxConns), pool_prealloc));
         auto h2p = h2_pool.init();
         if (!h2p) {

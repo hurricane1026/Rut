@@ -9253,23 +9253,31 @@ TEST(slice_pool, init_destroy) {
 TEST(slice_pool, buffered_response_capacity_is_bounded_per_shard) {
     static_assert(SlicePool::kMaxBufferedResponseBody == 1u << 20);
     static_assert(SlicePool::kMaxBufferedResponseSlices == 65u);
+    static_assert(SlicePool::kSlicesPerConnection == 71u);
     CHECK_EQ(SlicePool::capacity_for_connections(1), 71u);
-    CHECK_EQ(SlicePool::capacity_for_connections(2), 77u);
+    CHECK_EQ(SlicePool::capacity_for_connections(2), 142u);
 
     SlicePool pool;
-    REQUIRE(pool.init(SlicePool::capacity_for_connections(1)).has_value());
-    u8* ordinary[SlicePool::kOrdinarySlicesPerConnection]{};
+    REQUIRE(pool.init(SlicePool::capacity_for_connections(2)).has_value());
+    u8* ordinary[SlicePool::kOrdinarySlicesPerConnection * 2]{};
     for (u8*& slice : ordinary) REQUIRE((slice = pool.alloc()) != nullptr);
 
     std::vector<u8> body(ResponseBodyChain::kMaxBody, 0x5a);
+    std::vector<u8> second_body(ResponseBodyChain::kMaxBody, 0x6b);
     ResponseBodyChain chain;
+    ResponseBodyChain second_chain;
     REQUIRE(chain.append(pool, body.data(), ResponseBodyChain::kMaxBody));
+    REQUIRE(second_chain.append(pool, second_body.data(), ResponseBodyChain::kMaxBody));
     CHECK_EQ(chain.size, ResponseBodyChain::kMaxBody);
+    CHECK_EQ(second_chain.size, ResponseBodyChain::kMaxBody);
     CHECK_EQ(pool.available(), 0u);
     CHECK(!chain.append(pool, body.data(), 1));
+    CHECK(!second_chain.append(pool, second_body.data(), 1));
     CHECK_EQ(chain.size, ResponseBodyChain::kMaxBody);
+    CHECK_EQ(second_chain.size, ResponseBodyChain::kMaxBody);
 
     chain.release();
+    second_chain.release();
     for (u8* slice : ordinary) pool.free(slice);
     CHECK_EQ(pool.available(), pool.max_count);
     pool.destroy();
@@ -56850,12 +56858,13 @@ TEST(response_buffering_runtime,
 
     // Leave only ten bytes in the receive slice.  The CQE completes the
     // header and carries a body suffix, forcing the suffix into the chain.
-    u8 receive_storage[48]{};
-    conn.upstream_recv_buf.bind(receive_storage, sizeof(receive_storage));
-    static constexpr u8 kPrefix[] = "HTTP/1.1 200 OK\r\nContent-Length: 10\r\n";
+    const u32 prefix_len = conn.upstream_recv_buf.capacity() - 10u;
+    std::vector<u8> prefix(prefix_len, 'x');
+    static constexpr char kHeader[] = "HTTP/1.1 200 OK\r\nContent-Length: 18\r\nX-Pad: ";
     static constexpr u8 kOverflow[] = "\r\n\r\nabcdefghijkl";
-    REQUIRE_EQ(sizeof(kPrefix) - 1u, 38u);
-    REQUIRE_EQ(conn.upstream_recv_buf.write(kPrefix, sizeof(kPrefix) - 1u), sizeof(kPrefix) - 1u);
+    REQUIRE_LT(sizeof(kHeader) - 1u, prefix.size());
+    memcpy(prefix.data(), kHeader, sizeof(kHeader) - 1u);
+    REQUIRE_EQ(conn.upstream_recv_buf.write(prefix.data(), prefix.size()), prefix.size());
     REQUIRE_EQ(conn.upstream_recv_buf.write_avail(), 10u);
 
     auto& backend = loop->backend;
@@ -56864,8 +56873,8 @@ TEST(response_buffering_runtime,
         backend.buf_base + static_cast<u64>(buf_id) * 4096, kOverflow, sizeof(kOverflow) - 1u);
     const u32 cq_tail = __atomic_load_n(backend.cq_tail, __ATOMIC_ACQUIRE);
     auto& cqe = backend.cq_entries[cq_tail & *backend.cq_ring_mask];
-    cqe.user_data = IoUringBackend::encode_upstream_event_token(
-        {conn.id, IoEventType::UpstreamRecv, conn.upstream_episode, 0});
+    cqe.user_data =
+        encode_upstream_event_token({conn.id, IoEventType::UpstreamRecv, conn.upstream_episode, 0});
     cqe.res = sizeof(kOverflow) - 1u;
     cqe.flags = IORING_CQE_F_BUFFER | (static_cast<u32>(buf_id) << IORING_CQE_BUFFER_SHIFT);
     __atomic_store_n(backend.cq_tail, cq_tail + 1u, __ATOMIC_RELEASE);
@@ -56875,13 +56884,13 @@ TEST(response_buffering_runtime,
     REQUIRE_EQ(backend.wait(&event, 1, loop->conns, loop->connection_capacity), 1u);
     CHECK_EQ(event.result, static_cast<i32>(sizeof(kOverflow) - 1u));
     CHECK_EQ(event.copy_witness, IoEventCopyWitness::Full);
-    CHECK_EQ(event.copy_begin, sizeof(kPrefix) - 1u);
-    CHECK_EQ(event.copy_end, sizeof(kPrefix) - 1u + sizeof(kOverflow) - 1u);
-    CHECK_EQ(conn.upstream_recv_buf.len(), sizeof(receive_storage));
-    CHECK_EQ(conn.response_body_tail.size, 4u);
-    CHECK_EQ(memcmp(conn.upstream_recv_buf.data(), kPrefix, sizeof(kPrefix) - 1u), 0);
-    CHECK_EQ(memcmp(conn.upstream_recv_buf.data() + sizeof(kPrefix) - 1u, kOverflow, 10u), 0);
-    CHECK_EQ(memcmp(conn.response_body_tail.data(), kOverflow + 10u, 4u), 0);
+    CHECK_EQ(event.copy_begin, prefix.size());
+    CHECK_EQ(event.copy_end, prefix.size() + sizeof(kOverflow) - 1u);
+    CHECK_EQ(conn.upstream_recv_buf.len(), conn.upstream_recv_buf.capacity());
+    CHECK_EQ(conn.response_body_tail.size, 6u);
+    CHECK_EQ(memcmp(conn.upstream_recv_buf.data(), prefix.data(), prefix.size()), 0);
+    CHECK_EQ(memcmp(conn.upstream_recv_buf.data() + prefix.size(), kOverflow, 10u), 0);
+    CHECK_EQ(memcmp(conn.response_body_tail.data(), kOverflow + 10u, 6u), 0);
 
     loop->dispatch(event);
     CHECK_EQ(conn.response_read_deadline_post_commit_phase,
@@ -56904,20 +56913,28 @@ TEST(response_buffering_runtime, backend_wait_overflow_allocation_failure_is_ato
     conn.request_policy_id = static_cast<u16>(RequestPolicyId::Http11FixedStrip);
     conn.response_read_deadline_upload.request_policy_id = conn.request_policy_id;
     REQUIRE(arm_staged_response_read_deadline(loop, fixture));
-    u8 receive_storage[48]{};
-    conn.upstream_recv_buf.bind(receive_storage, sizeof(receive_storage));
-    static constexpr u8 kPrefix[] = "HTTP/1.1 200 OK\r\nContent-Length: 10\r\n";
+    const u32 prefix_len = conn.upstream_recv_buf.capacity() - 10u;
+    std::vector<u8> prefix(prefix_len, 'x');
+    static constexpr char kHeader[] = "HTTP/1.1 200 OK\r\nContent-Length: 18\r\nX-Pad: ";
     static constexpr u8 kOverflow[] = "\r\n\r\nabcdefghijkl";
-    REQUIRE_EQ(conn.upstream_recv_buf.write(kPrefix, sizeof(kPrefix) - 1u), sizeof(kPrefix) - 1u);
+    REQUIRE_LT(sizeof(kHeader) - 1u, prefix.size());
+    memcpy(prefix.data(), kHeader, sizeof(kHeader) - 1u);
+    REQUIRE_EQ(conn.upstream_recv_buf.write(prefix.data(), prefix.size()), prefix.size());
+    // Consume only the already committed free entries and cap growth at the
+    // committed count. This makes the next chain allocation fail without
+    // committing a full default-capacity pool in the test.
+    const u32 original_max = loop->pool.max_count;
     loop->pool.max_count = loop->pool.count;
+    std::vector<u8*> held;
+    while (u8* slice = loop->pool.alloc()) held.push_back(slice);
     const u16 buf_id = 12;
     __builtin_memcpy(loop->backend.buf_base + static_cast<u64>(buf_id) * 4096,
                      kOverflow,
                      sizeof(kOverflow) - 1u);
     const u32 cq_tail = __atomic_load_n(loop->backend.cq_tail, __ATOMIC_ACQUIRE);
     auto& cqe = loop->backend.cq_entries[cq_tail & *loop->backend.cq_ring_mask];
-    cqe.user_data = IoUringBackend::encode_upstream_event_token(
-        {conn.id, IoEventType::UpstreamRecv, conn.upstream_episode, 0});
+    cqe.user_data =
+        encode_upstream_event_token({conn.id, IoEventType::UpstreamRecv, conn.upstream_episode, 0});
     cqe.res = sizeof(kOverflow) - 1u;
     cqe.flags = IORING_CQE_F_BUFFER | (static_cast<u32>(buf_id) << IORING_CQE_BUFFER_SHIFT);
     __atomic_store_n(loop->backend.cq_tail, cq_tail + 1u, __ATOMIC_RELEASE);
@@ -56926,8 +56943,10 @@ TEST(response_buffering_runtime, backend_wait_overflow_allocation_failure_is_ato
     REQUIRE_EQ(loop->backend.wait(&event, 1, loop->conns, loop->connection_capacity), 1u);
     CHECK_EQ(event.result, -ENOBUFS);
     CHECK_EQ(event.copy_witness, IoEventCopyWitness::Invalid);
-    CHECK_EQ(conn.upstream_recv_buf.len(), sizeof(kPrefix) - 1u);
+    CHECK_EQ(conn.upstream_recv_buf.len(), prefix.size());
     CHECK_EQ(conn.response_body_tail.size, 0u);
+    loop->pool.max_count = original_max;
+    for (u8* slice : held) loop->pool.free(slice);
     cleanup_prebuilt_d2(loop, fixture);
 }
 

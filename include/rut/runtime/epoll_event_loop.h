@@ -366,8 +366,8 @@ public:
         epoch = nullptr;
         jit_code_ptr = nullptr;
         timer.init();
-        // Reserve ordinary connection buffers plus one complete bounded buffered
-        // response chain per shard. All storage is lazy and VA-reserved.
+        // Reserve six ordinary slices and one complete bounded response chain
+        // per admitted connection. Storage is lazy and VA-reserved.
         auto pooled =
             pool.init(SlicePool::capacity_for_connections(connection_capacity), pool_prealloc);
         if (!pooled) {

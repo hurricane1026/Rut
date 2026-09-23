@@ -40,12 +40,13 @@ struct SlicePool {
     static constexpr u32 kMaxBufferedResponseSlices =
         (kMaxBufferedResponseBody + kResponseBodyPayload - 1) / kResponseBodyPayload;
     static constexpr u32 kOrdinarySlicesPerConnection = 6;
+    static constexpr u32 kSlicesPerConnection =
+        kOrdinarySlicesPerConnection + kMaxBufferedResponseSlices;
 
     static constexpr u32 capacity_for_connections(u32 connections) {
         constexpr u32 kMaxU32 = 0xFFFFFFFFu;
-        if (connections > (kMaxU32 - kMaxBufferedResponseSlices) / kOrdinarySlicesPerConnection)
-            return 0;
-        return connections * kOrdinarySlicesPerConnection + kMaxBufferedResponseSlices;
+        if (connections > kMaxU32 / kSlicesPerConnection) return 0;
+        return connections * kSlicesPerConnection;
     }
 
     u8* base = nullptr;         // mmap'd region: max_count * kSliceSize bytes
