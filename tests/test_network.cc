@@ -56919,7 +56919,7 @@ TEST(response_buffering_runtime,
 
     // A later CQE must append wholly after the existing tail, preserving the
     // logical body order while the header/prefix slice remains the owner.
-    static constexpr u8 kFinalBody[] = "uvwxyz";
+    static constexpr u8 kFinalBody[] = "mnopqr";
     const u16 final_buf_id = 13;
     __builtin_memcpy(backend.buf_base + static_cast<u64>(final_buf_id) * 4096,
                      kFinalBody,
@@ -56949,6 +56949,25 @@ TEST(response_buffering_runtime,
                ResponseReadDeadlinePostCommitPhase::HeaderSend);
     REQUIRE_EQ(conn.response_read_deadline_post_commit_origin_received, 18u);
     REQUIRE(conn.send_armed);
+    REQUIRE_EQ(conn.response_read_deadline_send_len, conn.response_header_buf.len());
+    const IoEvent header_sent = exact_response_deadline_send_event(loop, conn);
+    loop->dispatch_batch(&header_sent, 1);
+    REQUIRE_EQ(conn.response_read_deadline_post_commit_phase,
+               ResponseReadDeadlinePostCommitPhase::BodySend);
+    REQUIRE_EQ(conn.response_read_deadline_send_len, 6u);
+    REQUIRE_EQ(__builtin_memcmp(conn.response_read_deadline_send_src, "abcdef", 6u), 0);
+
+    const IoEvent first_body_sent = exact_response_deadline_send_event(loop, conn);
+    loop->dispatch_batch(&first_body_sent, 1);
+    REQUIRE_EQ(conn.response_read_deadline_post_commit_phase,
+               ResponseReadDeadlinePostCommitPhase::BodySend);
+    REQUIRE_EQ(conn.response_read_deadline_send_len, 12u);
+    REQUIRE_EQ(__builtin_memcmp(conn.response_read_deadline_send_src, "ghijklmnopqr", 12u), 0);
+
+    const IoEvent second_body_sent = exact_response_deadline_send_event(loop, conn);
+    loop->dispatch_batch(&second_body_sent, 1);
+    REQUIRE_EQ(conn.response_body_tail.size, 0u);
+    REQUIRE_FALSE(conn.send_armed);
     cleanup_prebuilt_d2(loop, fixture);
 }
 
