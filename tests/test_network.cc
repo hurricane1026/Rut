@@ -6530,6 +6530,90 @@ static void h2_owner_gate_headers(
     capture->last_stream = stream_id;
 }
 
+struct H2ResetCapture {
+    u32 calls = 0;
+    u32 stream_id = 0;
+    Http2Error error = Http2Error::NoError;
+};
+
+static void h2_reset_capture(void* opaque, Http2Conn&, u32 stream_id, Http2Error error) {
+    auto* capture = static_cast<H2ResetCapture*>(opaque);
+    capture->calls++;
+    capture->stream_id = stream_id;
+    capture->error = error;
+}
+
+TEST(http2, local_stream_window_errors_notify_reset_once) {
+    auto make_window_update = [](u8* out, u32 stream_id, u32 increment) {
+        Http2FrameHeader h{};
+        h.length = 4;
+        h.type = static_cast<u8>(Http2FrameType::WindowUpdate);
+        h.stream_id = stream_id;
+        write_frame_header(out, h);
+        out[kFrameHeaderSize + 0] = static_cast<u8>(increment >> 24);
+        out[kFrameHeaderSize + 1] = static_cast<u8>(increment >> 16);
+        out[kFrameHeaderSize + 2] = static_cast<u8>(increment >> 8);
+        out[kFrameHeaderSize + 3] = static_cast<u8>(increment);
+    };
+    Http2Conn h2{};
+    h2.init();
+    h2.preface_seen = true;
+    h2.nstreams = 1;
+    h2.streams[0] = {1,
+                     Http2StreamState::Open,
+                     static_cast<i32>(kDefaultInitialWindowSize),
+                     static_cast<i32>(kDefaultInitialWindowSize),
+                     true};
+    H2ResetCapture capture{};
+    h2.cb_ctx = &capture;
+    h2.on_reset = &h2_reset_capture;
+    u8 input[kFrameHeaderSize + 4]{};
+    u8 output[128]{};
+    u32 written = 0;
+    make_window_update(input, 1, 0);
+    const Http2Result first = h2.process(input, sizeof(input), output, sizeof(output), &written);
+    CHECK_FALSE(first.close);
+    CHECK_EQ(capture.calls, 1u);
+    CHECK_EQ(capture.stream_id, 1u);
+    CHECK_EQ(capture.error, Http2Error::ProtocolError);
+    CHECK_EQ(h2.streams[0].state, Http2StreamState::Closed);
+    Http2FrameHeader rst{};
+    REQUIRE_EQ(parse_frame_header(output, written, &rst), ParseStatus::Complete);
+    CHECK_EQ(rst.type, static_cast<u8>(Http2FrameType::RstStream));
+    CHECK_EQ(rst.stream_id, 1u);
+    h2.process(input, sizeof(input), output, sizeof(output), &written);
+    CHECK_EQ(capture.calls, 1u);
+
+    Http2Conn overflow{};
+    overflow.init();
+    overflow.preface_seen = true;
+    overflow.nstreams = 1;
+    overflow.streams[0] = {1,
+                           Http2StreamState::Open,
+                           static_cast<i32>(kMaxWindowSize),
+                           static_cast<i32>(kDefaultInitialWindowSize),
+                           true};
+    H2ResetCapture overflow_capture{};
+    overflow.cb_ctx = &overflow_capture;
+    overflow.on_reset = &h2_reset_capture;
+    make_window_update(input, 1, kMaxWindowSize);
+    overflow.process(input, sizeof(input), output, sizeof(output), &written);
+    CHECK_EQ(overflow_capture.calls, 1u);
+    CHECK_EQ(overflow_capture.error, Http2Error::FlowControlError);
+
+    Http2Conn connection_error{};
+    connection_error.init();
+    connection_error.preface_seen = true;
+    H2ResetCapture connection_capture{};
+    connection_error.cb_ctx = &connection_capture;
+    connection_error.on_reset = &h2_reset_capture;
+    make_window_update(input, 0, 0);
+    const Http2Result connection_result =
+        connection_error.process(input, sizeof(input), output, sizeof(output), &written);
+    CHECK(connection_result.close);
+    CHECK_EQ(connection_capture.calls, 0u);
+}
+
 TEST(http2, outbound_owner_refuses_after_continuation_and_keeps_control_sync) {
     Http2Conn h2{};
     h2.init();
@@ -7530,6 +7614,109 @@ TEST(http2, rst_owner_processes_next_headers_after_parked_cancel) {
     REQUIRE_EQ(count, 1u);
     for (u32 i = 0; i < count; i++) loop.dispatch(events[i]);
     CHECK_EQ(rst_owner_route_calls, 1u);
+    CHECK_EQ(h2.outbound_stream, 0u);
+    CHECK_FALSE(h2.response_flush_pending);
+    CHECK_FALSE(conn->epoch_held);
+    CHECK_EQ(epoch.epoch.load(std::memory_order_acquire), 2u);
+    REQUIRE_GT(conn->send_buf.len(), 0u);
+    loop.inject_and_dispatch(
+        make_ev(conn_id, IoEventType::Send, static_cast<i32>(conn->send_buf.len())));
+    CHECK_EQ(conn->recv_buf.len(), 0u);
+    CHECK_EQ(conn->state, ConnState::ReadingHeader);
+    CHECK_EQ(h2.outbound_stream, 0u);
+    CHECK_FALSE(h2.response_flush_pending);
+    CHECK_EQ(epoch.epoch.load(std::memory_order_acquire), 2u);
+    CHECK(conn->fd >= 0);
+}
+
+TEST(http2, window_update_owner_processes_next_headers_after_local_reset) {
+    SmallLoop loop;
+    loop.setup();
+    RouteConfig config{};
+    REQUIRE_EQ(config.add_jit_handler("/next", kRouteMethodGet, &rst_owner_route_handler, false),
+               1u);
+    const RouteConfig* active = &config;
+    loop.config_ptr = &active;
+    ShardEpoch epoch{};
+    loop.epoch = &epoch;
+    Connection* conn = loop.alloc_conn();
+    REQUIRE(conn != nullptr);
+    conn->fd = 42;
+    const u32 conn_id = conn->id;
+    Http2Conn h2{};
+    h2.init();
+    h2.preface_seen = true;
+    h2.our_settings_sent = true;
+    h2.nstreams = 1;
+    h2.streams[0] = {1,
+                     Http2StreamState::Open,
+                     static_cast<i32>(kDefaultInitialWindowSize),
+                     static_cast<i32>(kDefaultInitialWindowSize),
+                     true};
+    conn->h2 = &h2;
+    conn->epoch_held = true;
+    epoch.epoch.store(1, std::memory_order_release);
+    static u8 upstream[256];
+    const char response[] = "HTTP/1.1 200 OK\r\nContent-Length: 9\r\n\r\nproxybody";
+    constexpr u32 kHeaderLen = sizeof(response) - 1 - 9;
+    memcpy(upstream, response, sizeof(response) - 1);
+    conn->upstream_recv_buf.bind(upstream, sizeof(upstream));
+    conn->upstream_recv_buf.commit(sizeof(response) - 1);
+    ParsedResponse parsed{};
+    parsed.reset();
+    parsed.status_code = 200;
+    parsed.version = HttpVersion::Http11;
+    parsed.has_content_length = true;
+    parsed.content_length = 9;
+    h2.async_stream = 1;
+    h2.conn_send_window = 0;
+    h2_proxy_finish(&loop, *conn, parsed, kHeaderLen, 9, false);
+    REQUIRE_EQ(h2.outbound_source, H2OutboundBodySource::ProxySynth);
+    REQUIRE_GT(conn->send_buf.len(), 0u);
+    const u32 header_send_len = conn->send_buf.len();
+    loop.inject_and_dispatch(
+        make_ev(conn_id, IoEventType::Send, static_cast<i32>(header_send_len)));
+    CHECK_EQ(h2.outbound_stream, 1u);
+    CHECK(h2.response_flush_pending);
+    const hpack::Header request[] = {
+        {{":method", 7}, {"GET", 3}},
+        {{":scheme", 7}, {"https", 5}},
+        {{":path", 5}, {"/next", 5}},
+        {{":authority", 10}, {"example.test", 12}},
+    };
+    u8 block[256]{};
+    u32 block_len = 0;
+    for (const auto& header : request)
+        block_len += hpack::encode_header(block + block_len, header.name, header.value);
+    u8 input[512]{};
+    Http2FrameHeader reset_header{};
+    reset_header.length = 4;
+    reset_header.type = static_cast<u8>(Http2FrameType::WindowUpdate);
+    reset_header.stream_id = 1;
+    write_frame_header(input, reset_header);
+    memset(input + kFrameHeaderSize, 0, 4);
+    Http2FrameHeader headers_header{};
+    headers_header.length = block_len;
+    headers_header.type = static_cast<u8>(Http2FrameType::Headers);
+    headers_header.flags = http2_flag::kEndHeaders | http2_flag::kEndStream;
+    headers_header.stream_id = 3;
+    write_frame_header(input + kFrameHeaderSize + 4, headers_header);
+    memcpy(input + 2 * kFrameHeaderSize + 4, block, block_len);
+    conn->recv_buf.reset();
+    REQUIRE_EQ(conn->recv_buf.write(input, 2 * kFrameHeaderSize + 4 + block_len),
+               2 * kFrameHeaderSize + 4 + block_len);
+    rst_owner_route_calls = 0;
+    loop.backend.inject(make_ev(conn_id, IoEventType::Recv, 2 * kFrameHeaderSize + 4 + block_len));
+    IoEvent events[8];
+    const u32 count = loop.backend.wait(events, 8);
+    REQUIRE_EQ(count, 1u);
+    for (u32 i = 0; i < count; i++) loop.dispatch(events[i]);
+    CHECK_EQ(rst_owner_route_calls, 1u);
+    Http2FrameHeader emitted_rst{};
+    REQUIRE_EQ(parse_frame_header(conn->send_buf.data(), conn->send_buf.len(), &emitted_rst),
+               ParseStatus::Complete);
+    CHECK_EQ(emitted_rst.type, static_cast<u8>(Http2FrameType::RstStream));
+    CHECK_EQ(emitted_rst.stream_id, 1u);
     CHECK_EQ(h2.outbound_stream, 0u);
     CHECK_FALSE(h2.response_flush_pending);
     CHECK_FALSE(conn->epoch_held);
