@@ -176,8 +176,7 @@ public:
     static constexpr u32 kTlsOutHigh =
         kTlsOutBufCap - kTlsRecordMax;                    // pause upstream recv above this
     static constexpr u32 kTlsOutLow = kTlsOutBufCap / 4;  // resume below this
-    static constexpr u32 kTlsDrainChunk =
-        SlicePool::kSliceSize;  // a raw send submits ≤ this at once
+    static constexpr u32 kTlsDrainChunk = kTlsRecordMax;  // keep one TLS record within a raw send
     static constexpr u32 kDefaultKeepaliveTimeout = 60;
     // Deadline (seconds; coarse 1s timer-wheel resolution) for a connection in
     // the Proxying state. SCOPE: the post-connect phase only — from the upstream
