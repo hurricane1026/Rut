@@ -8565,6 +8565,7 @@ TEST(http2, queued_owner_cross_batch_rst_and_window_update) {
     dispatch_recv(reset, sizeof(reset));
     CHECK_EQ(h2.outbound_stream, 1u);
     CHECK_EQ(h2.queued_stream, 0u);
+    REQUIRE(h2.find_stream(3) == nullptr);
     CHECK(h2.response_flush_pending);
     CHECK(conn->epoch_held);
 

@@ -1557,7 +1557,6 @@ inline void h2_on_reset_cb(void* ctx, Http2Conn& c, u32 stream_id, Http2Error /*
     if (c.async_stream != 0 && c.async_stream == stream_id) h2_clear_async(c);
     if (c.outbound_stream == stream_id) {
         if (c.queued_stream != 0) {
-            h2_close_stream(&c, stream_id);
             h2_clear_primary_outbound(c);
             h2_promote_queued(c);
         } else {
