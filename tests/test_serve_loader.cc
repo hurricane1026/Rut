@@ -229,6 +229,7 @@ TEST(serve_loader, all_response_body_literals_borrow_pinned_module_storage) {
     CHECK_EQ(program.config.response_bodies[1].len, second.size());
     CHECK_EQ(memcmp(program.config.response_bodies[0].data, first.data(), first.size()), 0);
     CHECK_EQ(memcmp(program.config.response_bodies[1].data, second.data(), second.size()), 0);
+    program.destroy();
 }
 
 TEST(serve_loader, status_routes_load) {

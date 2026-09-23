@@ -56832,6 +56832,106 @@ TEST(response_buffering_runtime, combined_send_short_terminal_results_never_cons
 }
 
 TEST(response_buffering_runtime,
+     backend_wait_splits_header_prefix_and_buffered_body_overflow_atomically) {
+    ScopedIoUringLoopForRetirement guard;
+    if (!guard.init()) SKIP("io_uring unavailable");
+    auto* loop = guard.loop;
+    RouteConfig config{};
+    REQUIRE(config.add_upstream("backend", 0x7F000001, 9000).has_value());
+    REQUIRE(add_bodyless_non_head_response_read_deadline_bundle(
+        config, 5, ForwardResponseBufferingMode::CompleteContentLength));
+    PrebuiltD2Fixture fixture{};
+    REQUIRE(
+        stage_strict_read_timeout_method(loop, &config, nullptr, 0, &fixture, LogHttpMethod::Get));
+    Connection& conn = *fixture.conn;
+    conn.request_policy_id = static_cast<u16>(RequestPolicyId::Http11FixedStrip);
+    conn.response_read_deadline_upload.request_policy_id = conn.request_policy_id;
+    REQUIRE(arm_staged_response_read_deadline(loop, fixture));
+
+    // Leave only ten bytes in the receive slice.  The CQE completes the
+    // header and carries a body suffix, forcing the suffix into the chain.
+    u8 receive_storage[48]{};
+    conn.upstream_recv_buf.bind(receive_storage, sizeof(receive_storage));
+    static constexpr u8 kPrefix[] = "HTTP/1.1 200 OK\r\nContent-Length: 10\r\n";
+    static constexpr u8 kOverflow[] = "\r\n\r\nabcdefghijkl";
+    REQUIRE_EQ(sizeof(kPrefix) - 1u, 38u);
+    REQUIRE_EQ(conn.upstream_recv_buf.write(kPrefix, sizeof(kPrefix) - 1u), sizeof(kPrefix) - 1u);
+    REQUIRE_EQ(conn.upstream_recv_buf.write_avail(), 10u);
+
+    auto& backend = loop->backend;
+    const u16 buf_id = 11;
+    __builtin_memcpy(
+        backend.buf_base + static_cast<u64>(buf_id) * 4096, kOverflow, sizeof(kOverflow) - 1u);
+    const u32 cq_tail = __atomic_load_n(backend.cq_tail, __ATOMIC_ACQUIRE);
+    auto& cqe = backend.cq_entries[cq_tail & *backend.cq_ring_mask];
+    cqe.user_data = IoUringBackend::encode_upstream_event_token(
+        {conn.id, IoEventType::UpstreamRecv, conn.upstream_episode, 0});
+    cqe.res = sizeof(kOverflow) - 1u;
+    cqe.flags = IORING_CQE_F_BUFFER | (static_cast<u32>(buf_id) << IORING_CQE_BUFFER_SHIFT);
+    __atomic_store_n(backend.cq_tail, cq_tail + 1u, __ATOMIC_RELEASE);
+    backend.pending = 0;
+
+    IoEvent event{};
+    REQUIRE_EQ(backend.wait(&event, 1, loop->conns, loop->connection_capacity), 1u);
+    CHECK_EQ(event.result, static_cast<i32>(sizeof(kOverflow) - 1u));
+    CHECK_EQ(event.copy_witness, IoEventCopyWitness::Full);
+    CHECK_EQ(event.copy_begin, sizeof(kPrefix) - 1u);
+    CHECK_EQ(event.copy_end, sizeof(kPrefix) - 1u + sizeof(kOverflow) - 1u);
+    CHECK_EQ(conn.upstream_recv_buf.len(), sizeof(receive_storage));
+    CHECK_EQ(conn.response_body_tail.size, 4u);
+    CHECK_EQ(memcmp(conn.upstream_recv_buf.data(), kPrefix, sizeof(kPrefix) - 1u), 0);
+    CHECK_EQ(memcmp(conn.upstream_recv_buf.data() + sizeof(kPrefix) - 1u, kOverflow, 10u), 0);
+    CHECK_EQ(memcmp(conn.response_body_tail.data(), kOverflow + 10u, 4u), 0);
+
+    loop->dispatch(event);
+    CHECK_EQ(conn.response_read_deadline_post_commit_phase,
+             ResponseReadDeadlinePostCommitPhase::Buffering);
+    cleanup_prebuilt_d2(loop, fixture);
+}
+
+TEST(response_buffering_runtime, backend_wait_overflow_allocation_failure_is_atomic) {
+    ScopedIoUringLoopForRetirement guard;
+    if (!guard.init()) SKIP("io_uring unavailable");
+    auto* loop = guard.loop;
+    RouteConfig config{};
+    REQUIRE(config.add_upstream("backend", 0x7F000001, 9000).has_value());
+    REQUIRE(add_bodyless_non_head_response_read_deadline_bundle(
+        config, 5, ForwardResponseBufferingMode::CompleteContentLength));
+    PrebuiltD2Fixture fixture{};
+    REQUIRE(
+        stage_strict_read_timeout_method(loop, &config, nullptr, 0, &fixture, LogHttpMethod::Get));
+    Connection& conn = *fixture.conn;
+    conn.request_policy_id = static_cast<u16>(RequestPolicyId::Http11FixedStrip);
+    conn.response_read_deadline_upload.request_policy_id = conn.request_policy_id;
+    REQUIRE(arm_staged_response_read_deadline(loop, fixture));
+    u8 receive_storage[48]{};
+    conn.upstream_recv_buf.bind(receive_storage, sizeof(receive_storage));
+    static constexpr u8 kPrefix[] = "HTTP/1.1 200 OK\r\nContent-Length: 10\r\n";
+    static constexpr u8 kOverflow[] = "\r\n\r\nabcdefghijkl";
+    REQUIRE_EQ(conn.upstream_recv_buf.write(kPrefix, sizeof(kPrefix) - 1u), sizeof(kPrefix) - 1u);
+    loop->pool.max_count = loop->pool.count;
+    const u16 buf_id = 12;
+    __builtin_memcpy(loop->backend.buf_base + static_cast<u64>(buf_id) * 4096,
+                     kOverflow,
+                     sizeof(kOverflow) - 1u);
+    const u32 cq_tail = __atomic_load_n(loop->backend.cq_tail, __ATOMIC_ACQUIRE);
+    auto& cqe = loop->backend.cq_entries[cq_tail & *loop->backend.cq_ring_mask];
+    cqe.user_data = IoUringBackend::encode_upstream_event_token(
+        {conn.id, IoEventType::UpstreamRecv, conn.upstream_episode, 0});
+    cqe.res = sizeof(kOverflow) - 1u;
+    cqe.flags = IORING_CQE_F_BUFFER | (static_cast<u32>(buf_id) << IORING_CQE_BUFFER_SHIFT);
+    __atomic_store_n(loop->backend.cq_tail, cq_tail + 1u, __ATOMIC_RELEASE);
+    loop->backend.pending = 0;
+    IoEvent event{};
+    REQUIRE_EQ(loop->backend.wait(&event, 1, loop->conns, loop->connection_capacity), 1u);
+    CHECK_EQ(event.result, -ENOBUFS);
+    CHECK_EQ(event.copy_witness, IoEventCopyWitness::Invalid);
+    CHECK_EQ(conn.upstream_recv_buf.len(), sizeof(kPrefix) - 1u);
+    CHECK_EQ(conn.response_body_tail.size, 0u);
+    cleanup_prebuilt_d2(loop, fixture);
+}
+
+TEST(response_buffering_runtime,
      combined_send_partial_backend_progress_aggregates_across_header_and_body_boundary) {
     ScopedIoUringLoopForRetirement guard;
     if (!guard.init()) SKIP("io_uring unavailable");
