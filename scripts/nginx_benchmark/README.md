@@ -77,8 +77,9 @@ temporary files. Rut uses the native
 For the 1 MiB `converter-strict` proxy comparison, nginx keeps response
 buffering enabled with eight 16 KiB proxy buffers and a 16 KiB header buffer.
 The default smaller buffers caused repeatable nginx-side wrk timeouts in the
-HTTP close case. This bounded 128 KiB setting passed a three-repeat close
-diagnostic without a timeout and does not hold an entire response in memory.
+HTTP close case. The eight 16 KiB response buffers plus separate 16 KiB header
+buffer passed a three-repeat close diagnostic without a timeout and do not
+hold an entire response in memory.
 The converter source is unchanged; the generated nginx config records the
 comparison setting.
 

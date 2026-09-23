@@ -1,0 +1,15 @@
+.................usage: test_tools.py [-h]
+test_tools.py: error: native-streaming supports only proxy-keepalive
+usage: test_tools.py [-h]
+test_tools.py: error: native-streaming supports only concurrency values 1 and 32
+usage: test_tools.py [-h]
+test_tools.py: error: native-streaming supports only concurrency values 1 and 32
+usage: test_tools.py [-h]
+test_tools.py: error: native-streaming requires a 256 KiB response
+usage: test_tools.py [-h]
+test_tools.py: error: native-streaming requires --keepalive-header implicit
+........
+----------------------------------------------------------------------
+Ran 25 tests in 3.114s
+
+OK
