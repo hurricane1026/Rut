@@ -394,8 +394,15 @@ class Harness:
             source = self.out / (work + ".conf")
             source.write_text(fragment)
             nginx_fragment = fragment
+            if work == "proxy" and body_size == 1024 * 1024:
+                nginx_fragment = nginx_fragment.replace(
+                    f"proxy_pass http://127.0.0.1:{a.origin_port};",
+                    f"proxy_pass http://127.0.0.1:{a.origin_port}; "
+                    "proxy_buffer_size 16k; proxy_buffers 8 16k; "
+                    "proxy_busy_buffers_size 32k;",
+                )
             if self.tls_context:
-                nginx_fragment = fragment.replace(
+                nginx_fragment = nginx_fragment.replace(
                     f"listen 127.0.0.1:{a.front_port};",
                     f"listen {a.front_port} ssl; "
                     "ssl_certificate /benchmark-cert.pem; ssl_certificate_key /benchmark-key.pem; "

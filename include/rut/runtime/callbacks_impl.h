@@ -2755,7 +2755,8 @@ void on_request_policy_body_recvd(void* lp, Connection& conn, IoEvent ev) {
 template <typename Loop>
 void on_response_sent(void* lp, Connection& conn, IoEvent ev) {
     auto* loop = static_cast<Loop*>(lp);
-    const u32 kSendLen = conn.send_buf.len();
+    const u32 kSendLen =
+        conn.local_body_send_len != 0 ? conn.local_body_send_len : conn.send_buf.len();
     const u32 kResult = static_cast<u32>(ev.result);
 
     if (ev.result < 0) {
@@ -2782,25 +2783,28 @@ void on_response_sent(void* lp, Connection& conn, IoEvent ev) {
 
         const u32 kRemaining = kSendLen - conn.send_progress;
         conn.transition_to_sending(&on_response_sent<Loop>);
-        if (!client_send(loop, conn, conn.send_buf.data() + conn.send_progress, kRemaining) &&
-            conn.fd >= 0)
+        const u8* src =
+            conn.local_body_send_len != 0 ? conn.local_body_cursor : conn.send_buf.data();
+        if (!client_send(loop, conn, src + conn.send_progress, kRemaining) && conn.fd >= 0)
             loop->close_conn(conn);
         return;
     }
 
     conn.send_progress = 0;
+    if (conn.local_body_send_len != 0) {
+        conn.local_body_cursor += conn.local_body_send_len;
+        conn.local_body_send_len = 0;
+    }
     if (conn.local_body_remaining != 0) {
-        // Reuse the existing send slice. The config stays pinned until request
-        // completion; kernel sends never borrow config memory past close.
-        const u32 n = conn.local_body_remaining < conn.send_buf.capacity()
-                          ? conn.local_body_remaining
-                          : conn.send_buf.capacity();
-        conn.send_buf.reset();
-        conn.send_buf.write(conn.local_body_cursor, n);
-        conn.local_body_cursor += n;
+        // The config stays pinned through the send completion. Submit its
+        // immutable body directly instead of copying it through the send slice.
+        constexpr u32 kMaxDirectBodySend = 64 * 1024;
+        const u32 n = conn.local_body_remaining < kMaxDirectBodySend ? conn.local_body_remaining
+                                                                     : kMaxDirectBodySend;
         conn.local_body_remaining -= n;
+        conn.local_body_send_len = n;
         conn.transition_to_sending(&on_response_sent<Loop>);
-        if (!client_send(loop, conn, conn.send_buf.data(), n) && conn.fd >= 0)
+        if (!client_send(loop, conn, conn.local_body_cursor, n) && conn.fd >= 0)
             loop->close_conn(conn);
         return;
     }

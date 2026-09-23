@@ -66650,7 +66650,7 @@ TEST(response_headers, content_type_removal_suppresses_direct_response_default) 
     CHECK(buf_contains(response, conn.send_buf.len(), "\r\n\r\n{}", 6));
 }
 
-TEST(response_headers, large_config_body_drains_in_order_through_the_existing_send_slice) {
+TEST(response_headers, large_config_body_sends_from_pinned_read_only_memory) {
     for (const bool custom_headers : {false, true}) {
         SmallLoop loop;
         loop.setup();
@@ -66658,7 +66658,7 @@ TEST(response_headers, large_config_body_drains_in_order_through_the_existing_se
         auto* conn = loop.find_fd(42);
         REQUIRE(conn != nullptr);
         RouteConfig cfg{};
-        u8 body[65536];
+        u8 body[131072];
         for (u32 i = 0; i < sizeof(body); ++i) body[i] = static_cast<u8>(i * 29 + i / 4096);
         REQUIRE_EQ(cfg.add_response_body_view(reinterpret_cast<const char*>(body), sizeof(body)),
                    1u);
@@ -66687,21 +66687,35 @@ TEST(response_headers, large_config_body_drains_in_order_through_the_existing_se
         }
         REQUIRE_GT(header_end, 0u);
         CHECK_EQ(conn->local_response_size, header_end + sizeof(body));
-        u32 offset = 0;
-        u32 prefix = header_end;
-        while (offset < sizeof(body)) {
-            REQUIRE_EQ(conn->send_buf.data(), slice);
-            REQUIRE_EQ(conn->send_buf.capacity(), capacity);
-            const u32 n = conn->send_buf.len() - prefix;
-            REQUIRE_GT(n, 0u);
-            REQUIRE_LE(n, sizeof(body) - offset);
-            CHECK_EQ(memcmp(conn->send_buf.data() + prefix, body + offset, n), 0);
-            offset += n;
-            const u32 sent = conn->send_buf.len();
-            on_response_sent<SmallLoop>(&loop, *conn, make_ev(conn->id, IoEventType::Send, sent));
-            prefix = 0;
-        }
+        REQUIRE_EQ(conn->send_buf.data(), slice);
+        REQUIRE_EQ(conn->send_buf.capacity(), capacity);
+        const u32 prefix = conn->send_buf.len() - header_end;
+        REQUIRE_GT(prefix, 0u);
+        CHECK_EQ(memcmp(slice + header_end, body, prefix), 0);
+        on_response_sent<SmallLoop>(
+            &loop, *conn, make_ev(conn->id, IoEventType::Send, conn->send_buf.len()));
+        auto* send = loop.backend.last_op(MockOp::Send);
+        REQUIRE(send != nullptr);
+        CHECK_EQ(send->send_buf, body + prefix);
+        constexpr u32 kChunk = 64 * 1024;
+        CHECK_EQ(send->send_len, kChunk);
+        CHECK_EQ(conn->local_body_send_len, kChunk);
+        constexpr u32 kPartial = 8192;
+        on_response_sent<SmallLoop>(&loop, *conn, make_ev(conn->id, IoEventType::Send, kPartial));
+        send = loop.backend.last_op(MockOp::Send);
+        REQUIRE(send != nullptr);
+        CHECK_EQ(send->send_buf, body + prefix + kPartial);
+        CHECK_EQ(send->send_len, kChunk - kPartial);
+        on_response_sent<SmallLoop>(
+            &loop, *conn, make_ev(conn->id, IoEventType::Send, kChunk - kPartial));
+        send = loop.backend.last_op(MockOp::Send);
+        REQUIRE(send != nullptr);
+        CHECK_EQ(send->send_buf, body + prefix + kChunk);
+        CHECK_EQ(send->send_len, sizeof(body) - prefix - kChunk);
+        on_response_sent<SmallLoop>(
+            &loop, *conn, make_ev(conn->id, IoEventType::Send, sizeof(body) - prefix - kChunk));
         CHECK_EQ(conn->local_body_remaining, 0u);
+        CHECK_EQ(conn->local_body_send_len, 0u);
         CHECK_EQ(conn->local_body_cursor, nullptr);
         CHECK_EQ(conn->local_response_size, 0u);
     }

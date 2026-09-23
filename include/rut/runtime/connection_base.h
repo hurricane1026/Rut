@@ -1590,6 +1590,7 @@ struct ConnectionBase {
     u32 send_progress;
     const u8* local_body_cursor = nullptr;
     u32 local_body_remaining = 0;
+    u32 local_body_send_len = 0;
     u32 local_response_size = 0;
 
     // Upstream recv buffer — separate from client recv_buf to prevent:
@@ -1872,6 +1873,7 @@ struct ConnectionBase {
         send_progress = 0;
         local_body_cursor = nullptr;
         local_body_remaining = 0;
+        local_body_send_len = 0;
         local_response_size = 0;
         upstream_recv_slice = nullptr;
         upstream_recv_buf.bind(nullptr, 0);

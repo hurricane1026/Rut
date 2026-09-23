@@ -74,6 +74,14 @@ configuration constraints; response buffering remains off and cannot spill to
 temporary files. Rut uses the native
 `upstream` / `forward` DSL and its per-shard 4096-connection idle pool.
 
+For the 1 MiB `converter-strict` proxy comparison, nginx keeps response
+buffering enabled with eight 16 KiB proxy buffers and a 16 KiB header buffer.
+The default smaller buffers caused repeatable nginx-side wrk timeouts in the
+HTTP close case. This bounded 128 KiB setting passed a three-repeat close
+diagnostic without a timeout and does not hold an entire response in memory.
+The converter source is unchanged; the generated nginx config records the
+comparison setting.
+
 The native preflight first delays reading a complete 256 KiB response, then
 reads a successor response on that same downstream socket. It saves the exact
 response bytes and a read timing trace; this checks response integrity across a

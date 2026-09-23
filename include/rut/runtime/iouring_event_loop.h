@@ -3023,7 +3023,10 @@ public:
         return backend.nop_inject_result && !c.tls_active && !c.keep_alive && c.fd >= 0 &&
                !c.send_armed && len != 0 && len <= static_cast<u32>(INT32_MAX) &&
                c.on_send == &on_response_sent<Self> && c.send_progress == 0 &&
-               c.local_body_remaining == 0 && buf == c.send_buf.data() && len == c.send_buf.len();
+               c.local_body_remaining == 0 &&
+               ((buf == c.send_buf.data() && len == c.send_buf.len() &&
+                 c.local_body_send_len == 0) ||
+                (buf == c.local_body_cursor && len == c.local_body_send_len));
     }
 
     bool submit_send_impl(Connection& c, const u8* buf, u32 len) {
