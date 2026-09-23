@@ -8,7 +8,7 @@ namespace rut {
 // remains the header/prefix owner; only bytes beyond it allocate these slices.
 // Nodes are sent in place and reclaimed after their send completion.
 struct ResponseBodyChain {
-    static constexpr u32 kMaxBody = 1u << 20;
+    static constexpr u32 kMaxBody = SlicePool::kMaxBufferedResponseBody;
     struct Node {
         Node* next;
         u32 len;
@@ -17,6 +17,7 @@ struct ResponseBodyChain {
     };
     static_assert(sizeof(Node) == SlicePool::kSliceSize);
     static constexpr u32 kPayload = sizeof(Node::bytes);
+    static_assert(kPayload == SlicePool::kResponseBodyPayload);
 
     Node* head = nullptr;
     Node* tail = nullptr;

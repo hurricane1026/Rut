@@ -619,6 +619,14 @@ A `{ }` after a status is never a header map — braces in statement position ar
 always code blocks. Anonymous object literals `{ key: value }` exist only as
 call arguments (see §3.2.1), not as response construction.
 
+For a configured local/static response, `response(status, body: "...")` is the
+shipped literal-body form. The body is limited to 1 MiB and is published as a
+non-owning view into the loaded program's RIR response-body storage; the
+`LoadedProgram` keeps that RIR/module storage pinned through request dispatch,
+teardown, and reload retirement. This form does not imply a general mutable
+runtime response-body buffer: dynamic `resp.body` mutation remains a separate,
+resumable runtime feature.
+
 #### 3.3.6 State Types
 
 > **Revised 2026-07 (decisions in docs/state-types.md):** the taxonomy is

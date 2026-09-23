@@ -289,10 +289,9 @@ public:
             conns[i].shard_id = static_cast<u8>(id);
             free_stack[i] = i;
         }
-        // Up to 5 slices per connection (all lazy, VA-reserved): recv + send +
-        // upstream_recv, plus the two WebSocket terminate-mode reassembly slices. Matches
-        // the io_uring loop so a terminate tunnel can't fail to arm under load.
-        TRY_VOID(pool.init(kMaxConns * 6, pool_prealloc));
+        // Reserve ordinary connection buffers plus one complete bounded buffered
+        // response chain per shard. All storage is lazy and VA-reserved.
+        TRY_VOID(pool.init(SlicePool::capacity_for_connections(kMaxConns), pool_prealloc));
         auto h2p = h2_pool.init();
         if (!h2p) {
             pool.destroy();

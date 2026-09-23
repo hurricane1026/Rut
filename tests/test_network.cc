@@ -9,6 +9,7 @@
 #include "rut/runtime/iouring_event_loop.h"
 #endif
 #include "rut/runtime/rate_limit.h"
+#include "rut/runtime/response_body_chain.h"
 #include "rut/runtime/route_table.h"
 #include "rut/runtime/simd/simd.h"
 #include "rut/runtime/slab_pool.h"
@@ -9246,6 +9247,31 @@ TEST(slice_pool, init_destroy) {
     CHECK_EQ(pool.max_count, 64u);
     CHECK_EQ(pool.count, 0u);
     CHECK_EQ(pool.available(), 0u);
+    pool.destroy();
+}
+
+TEST(slice_pool, buffered_response_capacity_is_bounded_per_shard) {
+    static_assert(SlicePool::kMaxBufferedResponseBody == 1u << 20);
+    static_assert(SlicePool::kMaxBufferedResponseSlices == 65u);
+    CHECK_EQ(SlicePool::capacity_for_connections(1), 71u);
+    CHECK_EQ(SlicePool::capacity_for_connections(2), 77u);
+
+    SlicePool pool;
+    REQUIRE(pool.init(SlicePool::capacity_for_connections(1)).has_value());
+    u8* ordinary[SlicePool::kOrdinarySlicesPerConnection]{};
+    for (u8*& slice : ordinary) REQUIRE((slice = pool.alloc()) != nullptr);
+
+    std::vector<u8> body(ResponseBodyChain::kMaxBody, 0x5a);
+    ResponseBodyChain chain;
+    REQUIRE(chain.append(pool, body.data(), ResponseBodyChain::kMaxBody));
+    CHECK_EQ(chain.size, ResponseBodyChain::kMaxBody);
+    CHECK_EQ(pool.available(), 0u);
+    CHECK(!chain.append(pool, body.data(), 1));
+    CHECK_EQ(chain.size, ResponseBodyChain::kMaxBody);
+
+    chain.release();
+    for (u8* slice : ordinary) pool.free(slice);
+    CHECK_EQ(pool.available(), pool.max_count);
     pool.destroy();
 }
 
@@ -68825,7 +68851,7 @@ TEST(connection_capacity, runtime_storage_bounds_and_backend_guards) {
     {
         IoUringEventLoop iouring;
         REQUIRE(iouring.init_slot_storage(32768).has_value());
-        REQUIRE(iouring.pool.init(32768u * 6u, 0).has_value());
+        REQUIRE(iouring.pool.init(SlicePool::capacity_for_connections(32768u), 0).has_value());
         CHECK_EQ(iouring.connection_capacity, 32768u);
         CHECK_EQ(iouring.backend.send_state.size(), 32768u);
         CHECK_EQ(iouring.backend.upstream_send_state.size(), 32768u);
@@ -68872,7 +68898,7 @@ TEST(connection_capacity, runtime_storage_bounds_and_backend_guards) {
     {
         EpollEventLoop epoll;
         REQUIRE(epoll.init_slot_storage(32768).has_value());
-        REQUIRE(epoll.pool.init(32768u * 6u, 0).has_value());
+        REQUIRE(epoll.pool.init(SlicePool::capacity_for_connections(32768u), 0).has_value());
         CHECK_EQ(epoll.connection_capacity, 32768u);
         CHECK_EQ(epoll.backend.downstream_fd_map.size(), 32768u);
         CHECK_EQ(epoll.backend.upstream_fd_map.size(), 32768u);

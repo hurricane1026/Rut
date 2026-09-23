@@ -422,7 +422,8 @@ public:
         // one long-lived ciphertext output slice per connection. TLS input uses
         // a slightly larger mmap buffer so one full ciphertext record fits.
         // tls_server is wired after init(), so reserve for the TLS-capable case.
-        auto pooled = pool.init(connection_capacity * 6, pool_prealloc);
+        auto pooled =
+            pool.init(SlicePool::capacity_for_connections(connection_capacity), pool_prealloc);
         if (!pooled) {
             backend.shutdown();
             destroy_slot_storage();
