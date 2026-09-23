@@ -209,6 +209,28 @@ TEST(serve_loader, large_response_body_borrows_the_pinned_module_storage) {
     CHECK_EQ(program.config.response_body_count, 0u);
 }
 
+TEST(serve_loader, all_response_body_literals_borrow_pinned_module_storage) {
+    const std::string first(5u * 1024u, 'a');
+    const std::string second(5u * 1024u, 'b');
+    const std::string source = "route GET \"/first\" { return response(200, body: \"" + first +
+                               "\") }\nroute GET \"/second\" { return response(200, body: \"" +
+                               second + "\") }\n";
+    const std::string path =
+        write_file("/tmp/rut_serve_loader_all_body_views", "app.rut", source.c_str());
+    LoadedProgram program;
+    LoadError err;
+    REQUIRE(load_rut_program(path.c_str(), program, err));
+    REQUIRE_EQ(program.config.response_body_count, 2u);
+    CHECK_EQ(program.config.body_pool_used, 0u);
+    CHECK_EQ(program.config.response_bodies[0].data, program.rir.module.response_bodies[0].ptr);
+    CHECK_EQ(program.config.response_bodies[1].data, program.rir.module.response_bodies[1].ptr);
+    CHECK_NE(program.config.response_bodies[0].data, program.config.response_bodies[1].data);
+    CHECK_EQ(program.config.response_bodies[0].len, first.size());
+    CHECK_EQ(program.config.response_bodies[1].len, second.size());
+    CHECK_EQ(memcmp(program.config.response_bodies[0].data, first.data(), first.size()), 0);
+    CHECK_EQ(memcmp(program.config.response_bodies[1].data, second.data(), second.size()), 0);
+}
+
 TEST(serve_loader, status_routes_load) {
     const std::string dir = "/tmp/rut_serve_loader_status";
     const std::string path = write_file(dir,

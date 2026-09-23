@@ -592,9 +592,8 @@ inline bool populate_verified_route_config(RouteConfig& cfg,
     // feed the bytes straight through.
     for (u32 i = 0; i < mod.response_body_count; i++) {
         const auto& body = mod.response_bodies[i];
-        u16 idx = retain_response_body_views && body.len > RouteConfig::kResponseBodyPoolBytes
-                      ? cfg.add_response_body_view(body.ptr, body.len)
-                      : cfg.add_response_body(body.ptr, body.len);
+        u16 idx = retain_response_body_views ? cfg.add_response_body_view(body.ptr, body.len)
+                                             : cfg.add_response_body(body.ptr, body.len);
         if (idx == 0) return false;
         // Belt-and-suspenders: the 1-based index must match i+1 so
         // callers that packed body_idx at compile time still resolve

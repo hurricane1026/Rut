@@ -1387,9 +1387,22 @@ u32 IoUringBackend::wait(IoEvent* events, u32 max_events, Connection* conns, u32
                      response_deadline_copy_owner(conn, upstream_episode, aux));
                 const u32 copy_begin =
                     deadline_owner ? conn.buffered_response_len() : target_buf.len();
-                if (deadline_copy_eligible && buffered_overflow)
+                u32 prefix_copy = 0;
+                if (deadline_copy_eligible && buffered_overflow) {
+                    // Keep the receive buffer's contiguous prefix visible to the
+                    // header parser. Reserve the overflow first so a failed
+                    // allocation leaves both buffers and the witness unchanged.
+                    prefix_copy =
+                        conn.response_body_tail.size == 0 ? (nbytes < avail ? nbytes : avail) : 0;
+                    const u32 overflow = nbytes - prefix_copy;
                     deadline_copy_eligible =
-                        conn.response_body_tail.append(*response_pool, src, nbytes);
+                        overflow == 0 ||
+                        conn.response_body_tail.append(*response_pool, src + prefix_copy, overflow);
+                    if (deadline_copy_eligible && prefix_copy != 0) {
+                        __builtin_memcpy(target_buf.write_ptr(), src, prefix_copy);
+                        target_buf.commit(prefix_copy);
+                    }
+                }
                 // A matching explicit-deadline owner never enters the legacy
                 // partial-copy path.  Its provided-buffer payload is one
                 // indivisible witness: exact and fully eligible, or zero bytes.
