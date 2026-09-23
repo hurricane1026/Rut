@@ -7139,6 +7139,11 @@ TEST(http2, bodyless_then_owned_response_appends_transactionally) {
                      static_cast<i32>(kDefaultInitialWindowSize),
                      static_cast<i32>(kDefaultInitialWindowSize),
                      true};
+    h2.streams[2] = {5,
+                     Http2StreamState::Open,
+                     static_cast<i32>(kDefaultInitialWindowSize),
+                     static_cast<i32>(kDefaultInitialWindowSize),
+                     true};
     conn->h2 = &h2;
     conn->epoch_held = true;
     static u8 body[9000];
@@ -7169,6 +7174,15 @@ TEST(http2, bodyless_then_owned_response_appends_transactionally) {
     CHECK_EQ(second.type, static_cast<u8>(Http2FrameType::Headers));
     CHECK((second.flags & http2_flag::kEndStream) == 0);
     CHECK_EQ(h2.outbound_stream, 3u);
+
+    const u32 owner_end = dispatch.owned_resp_end;
+    const hpack::Header repeated{{"x-owner", 7}, {"pending", 7}};
+    h2_emit_response(dispatch, 5, 204, &repeated, 1, nullptr, 0);
+    REQUIRE_GT(dispatch.resp_len, owner_end);
+    CHECK(dispatch.owned_hpack_pending);
+    h2_on_reset_dispatch_cb<SmallLoop>(&dispatch, h2, 3, Http2Error::Cancel);
+    CHECK(dispatch.close_after_process);
+    CHECK_EQ(h2.outbound_stream, 0u);
 }
 
 TEST(http2, outbound_pump_distinguishes_invalid_owner_from_window_block) {

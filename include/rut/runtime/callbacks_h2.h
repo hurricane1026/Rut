@@ -101,6 +101,7 @@ struct H2Dispatch {
     bool close_after_process = false;
     u32 owned_stream = 0;
     u32 owned_resp_begin = 0;
+    u32 owned_resp_end = 0;
     // Bodyful staging assigns the current connection encoder before using this
     // pending state; bodyless dispatches never read it.
     hpack::Encoder owned_hpack_after;
@@ -263,6 +264,7 @@ bool h2_stage_owned_response(H2Dispatch<Loop>& d,
         return false;
     }
     d.resp_len += n;
+    d.owned_resp_end = d.resp_len;
     d.owned_hpack_pending = true;
     h2.outbound_stream = stream_id;
     h2.outbound_config = cfg;
@@ -291,7 +293,7 @@ void h2_emit_response(H2Dispatch<Loop>& d,
                       const u8* body,
                       u32 body_len,
                       bool allow_fallback = true) {
-    auto enc = d.conn->h2->hpack_enc;
+    auto enc = d.owned_hpack_pending ? d.owned_hpack_after : d.conn->h2->hpack_enc;
     if (body_len != 0) {
         d.overflow = true;
         return;
@@ -306,7 +308,10 @@ void h2_emit_response(H2Dispatch<Loop>& d,
                                         body,
                                         body_len);
     if (kN != 0) {
-        d.conn->h2->hpack_enc = enc;
+        if (d.owned_hpack_pending)
+            d.owned_hpack_after = enc;
+        else
+            d.conn->h2->hpack_enc = enc;
         d.resp_len += kN;
         h2_close_stream(d.conn->h2, stream_id);
         return;
@@ -319,13 +324,16 @@ void h2_emit_response(H2Dispatch<Loop>& d,
         return;
     }
     // First frame, fallback allowed: a tiny synthetic 500 always fits.
-    enc = d.conn->h2->hpack_enc;
+    enc = d.owned_hpack_pending ? d.owned_hpack_after : d.conn->h2->hpack_enc;
     const u32 kFallback = http2_write_response(
         d.resp + d.resp_len, d.resp_cap - d.resp_len, enc, stream_id, 500, nullptr, 0, nullptr, 0);
     if (kFallback == 0)
         d.overflow = true;
     else {
-        d.conn->h2->hpack_enc = enc;
+        if (d.owned_hpack_pending)
+            d.owned_hpack_after = enc;
+        else
+            d.conn->h2->hpack_enc = enc;
         d.resp_len += kFallback;
         h2_close_stream(d.conn->h2, stream_id);
     }
@@ -1505,9 +1513,18 @@ void h2_on_reset_dispatch_cb(void* ctx, Http2Conn& c, u32 stream_id, Http2Error 
     const bool kOutboundOwner = c.outbound_stream == stream_id;
     if (d->close_after_process) return;
     if (kOutboundOwner && d->owned_hpack_pending && d->owned_stream == stream_id) {
-        d->resp_len = d->owned_resp_begin;
-        d->owned_hpack_pending = false;
-        d->owned_stream = 0;
+        if (d->resp_len == d->owned_resp_end) {
+            d->resp_len = d->owned_resp_begin;
+            d->owned_hpack_pending = false;
+            d->owned_stream = 0;
+        } else if (d->resp_len > d->owned_resp_end) {
+            // A later response was encoded against the owner's pending HPACK
+            // state. It cannot be removed independently; discard the whole
+            // batch before any wire bytes are submitted.
+            d->close_after_process = true;
+            d->owned_hpack_pending = false;
+            d->owned_stream = 0;
+        }
     }
     h2_on_reset_cb(ctx, c, stream_id, err);
     // A parked owner has no downstream send to drain, so its flush gate can be
