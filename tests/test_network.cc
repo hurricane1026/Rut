@@ -29624,6 +29624,85 @@ struct ScopedIoUringLoopForRetirement {
     }
 };
 
+TEST(iouring_local_body_epoch, close_defers_leave_until_send_slot_reclaims) {
+    ScopedIoUringLoopForRetirement guard;
+    if (!guard.init()) SKIP("io_uring unavailable");
+    auto* loop = guard.loop;
+    ShardEpoch epoch{};
+    epoch.epoch.store(7, std::memory_order_relaxed);
+    loop->epoch = &epoch;
+    Connection* conn = loop->alloc_conn();
+    REQUIRE(conn != nullptr);
+    const u32 id = conn->id;
+    i32 downstream[2] = {-1, -1};
+    REQUIRE_EQ(rut::test::stream_socketpair(downstream), 0);
+    conn->fd = downstream[0];
+    downstream[0] = -1;
+    static constexpr u8 kBody[64 * 1024] = {};
+    conn->keep_alive = true;
+    conn->req_start_us = 1;
+    conn->local_body_cursor = kBody;
+    conn->local_body_send_len = sizeof(kBody);
+    conn->local_body_remaining = 0;
+    conn->send_progress = 32;
+    conn->on_send = &on_response_sent<IoUringEventLoop>;
+    REQUIRE(loop->submit_send(*conn, kBody + 32, sizeof(kBody) - 32));
+
+    loop->close_conn(*conn);
+    CHECK_EQ(epoch.epoch.load(std::memory_order_relaxed), 7u);
+    CHECK_EQ(loop->pending_free_count, 1u);
+    CHECK(loop->conns[id].epoch_leave_deferred);
+    CHECK_EQ(loop->conns[id].local_body_cursor, nullptr);
+
+    REQUIRE_GE(loop->conns[id].pending_ops, 2u);  // Send target plus its close cancellation.
+    for (u32 rounds = 0; loop->conns[id].pending_ops != 0 && rounds < 4; rounds++) {
+        IoEvent events[8]{};
+        const u32 count = loop->backend.wait(events, 1, loop->conns, loop->connection_capacity);
+        REQUIRE_GE(count, 1u);
+        for (u32 i = 0; i < count; i++) {
+            loop->dispatch(events[i]);
+            if (loop->conns[id].pending_ops != 0) {
+                CHECK_EQ(epoch.epoch.load(), 7u);
+                CHECK(loop->conns[id].epoch_leave_deferred);
+                CHECK_EQ(loop->pending_free_count, 1u);
+            }
+        }
+    }
+    CHECK_EQ(loop->conns[id].pending_ops, 0u);
+    CHECK_EQ(loop->pending_free_count, 0u);
+    CHECK_EQ(epoch.epoch.load(std::memory_order_relaxed), 8u);
+    CHECK_FALSE(loop->conns[id].epoch_leave_deferred);
+    loop->reclaim_pending();
+    loop->reclaim_slot(id);
+    CHECK_EQ(epoch.epoch.load(std::memory_order_relaxed), 8u);
+    close(downstream[1]);
+}
+
+TEST(iouring_local_body_epoch, unowned_local_body_send_does_not_defer_epoch) {
+    ScopedIoUringLoopForRetirement guard;
+    if (!guard.init()) SKIP("io_uring unavailable");
+    auto* loop = guard.loop;
+    ShardEpoch epoch{};
+    epoch.epoch.store(9, std::memory_order_relaxed);
+    loop->epoch = &epoch;
+    Connection* conn = loop->alloc_conn();
+    REQUIRE(conn != nullptr);
+    i32 downstream[2] = {-1, -1};
+    REQUIRE_EQ(rut::test::stream_socketpair(downstream), 0);
+    conn->fd = downstream[0];
+    downstream[0] = -1;
+    static constexpr u8 kBody[4096] = {};
+    conn->keep_alive = true;
+    conn->local_body_cursor = kBody;
+    conn->local_body_send_len = sizeof(kBody);
+    conn->on_send = &on_response_sent<IoUringEventLoop>;
+    REQUIRE(loop->submit_send(*conn, kBody, sizeof(kBody)));
+    loop->close_conn(*conn);
+    CHECK_EQ(epoch.epoch.load(std::memory_order_relaxed), 9u);
+    CHECK_FALSE(loop->conns[conn->id].epoch_leave_deferred);
+    close(downstream[1]);
+}
+
 TEST(iouring_response_read_timer,
      armed_owner_blocks_reuse_and_exact_expiry_reclaims_without_live_behavior) {
     ScopedIoUringLoopForRetirement guard;

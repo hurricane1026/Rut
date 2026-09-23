@@ -533,6 +533,10 @@ public:
         close_deferred_idle_return_fds();
         reclaim_pending();
         backend.shutdown();
+        // No CQE can arrive after the backend is stopped.  Release any
+        // deferred config epochs now so shutdown does not leave a shard pinned
+        // forever when the kernel never returned a cancelled Send.
+        for (u32 i = 0; i < pending_free_count; i++) release_deferred_epoch(conns[pending_free[i]]);
         h2_pool.destroy();
         pool.destroy();
         if (capture_region_) {
@@ -2557,6 +2561,13 @@ public:
         response_read_batch_pins[response_read_batch_pin_count++] = cid;
     }
 
+    void release_deferred_epoch(Connection& c) {
+        if (c.epoch_leave_deferred) {
+            epoch_leave();
+            c.epoch_leave_deferred = false;
+        }
+    }
+
     void reclaim_slot(u32 cid) {
         if (cid >= connection_capacity || response_read_batch_reuse_pinned(cid) ||
             strict_upstream_retirement_blocks_reclaim(conns[cid]) ||
@@ -2594,6 +2605,7 @@ public:
             pool.free(conns[cid].response_header_slice);
             conns[cid].response_header_slice = nullptr;
         }
+        release_deferred_epoch(conns[cid]);
         conns[cid].response_body_tail.release();
         free_tls_in_buf(conns[cid]);
         free_tls_out_buf(conns[cid]);
@@ -2628,6 +2640,7 @@ public:
                     pool.free(conns[cid].response_header_slice);
                     conns[cid].response_header_slice = nullptr;
                 }
+                release_deferred_epoch(conns[cid]);
                 conns[cid].response_body_tail.release();
                 free_tls_in_buf(conns[cid]);
                 free_tls_out_buf(conns[cid]);
@@ -2713,6 +2726,7 @@ public:
             c.response_body_tail.release();
             free_tls_in_buf(c);
             free_tls_out_buf(c);
+            release_deferred_epoch(c);
             c.reset();
             if (!c.upstream_episode_quarantined) free_stack[free_top++] = cid;
             return;
@@ -2742,6 +2756,7 @@ public:
             c.response_read_deadline_send_close_target_owned;
         const bool deadline_send_close_cancel_owned =
             c.response_read_deadline_send_close_cancel_owned;
+        const bool epoch_leave_deferred = c.epoch_leave_deferred;
         c.reset();
         conns[cid].id = cid;
         conns[cid].shard_id = allocated_shard;
@@ -2769,6 +2784,7 @@ public:
             deadline_send_close_target_owned;
         conns[cid].response_read_deadline_send_close_cancel_owned =
             deadline_send_close_cancel_owned;
+        conns[cid].epoch_leave_deferred = epoch_leave_deferred;
         pending_free[pending_free_count++] = cid;
     }
 
@@ -5349,6 +5365,22 @@ public:
         return backend.pause_recv(c.fd, c.id);
     }
 
+    [[nodiscard]] bool local_body_send_holds_epoch(const Connection& c) const {
+        if (c.id >= connection_capacity || !c.send_armed || c.pending_ops == 0 || c.fd < 0 ||
+            c.tls_active || c.local_body_cursor == nullptr || c.local_body_send_len == 0 ||
+            c.epoch_leave_deferred || (c.req_start_us == 0 && !c.epoch_held) ||
+            c.send_progress >= c.local_body_send_len ||
+            c.response_read_deadline_post_commit_phase !=
+                ResponseReadDeadlinePostCommitPhase::None ||
+            c.on_send != &on_response_sent<IoUringEventLoop>)
+            return false;
+        const auto& send = backend.send_state[c.id];
+        const u32 remaining = c.local_body_send_len - c.send_progress;
+        return send.type == IoEventType::Send && send.fd == c.fd && send.generation == 0 &&
+               send.src == c.local_body_cursor + c.send_progress && send.offset <= remaining &&
+               send.remaining == remaining - send.offset;
+    }
+
     void close_conn_impl(Connection& c) {
         if (c.tls_out_inflight) {
             // TLS close custody belongs to the actual ciphertext SQE, not the
@@ -5393,7 +5425,11 @@ public:
         // epoch_held covers a suspended continuation pinning the config epoch
         // after its ordinary req_start_us ownership has ended (or an HTTP/2
         // async stream which never used h1 request timing).
-        if (c.req_start_us != 0 || c.epoch_held) epoch_leave();
+        if (local_body_send_holds_epoch(c)) {
+            c.epoch_leave_deferred = true;
+        } else if (!c.epoch_leave_deferred && (c.req_start_us != 0 || c.epoch_held)) {
+            epoch_leave();
+        }
         c.epoch_held = false;
         // Release any held upstream concurrency slot (catch-all; held flag makes a
         // prior release at completion a no-op).

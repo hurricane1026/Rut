@@ -1563,6 +1563,12 @@ struct ConnectionBase {
     // cleared and before batch-end request-boundary admission.
     bool epoch_held;
 
+    // A closing io_uring slot may still have a downstream Send CQE whose
+    // source is the current config's borrowed local response body.  Keep the
+    // config epoch pinned across free_conn::reset() until that CQE (or its
+    // cancel) has drained.
+    bool epoch_leave_deferred;
+
     // Outstanding I/O ops submitted to the backend. Incremented on
     // submit_recv/submit_send/etc., decremented when the final CQE
     // arrives in dispatch() (multishot CQEs with IORING_CQE_F_MORE
@@ -1864,6 +1870,7 @@ struct ConnectionBase {
         capture_header_len = 0;
         req_start_us = 0;
         epoch_held = false;
+        epoch_leave_deferred = false;
         pending_ops = 0;
         recv_slice = nullptr;
         recv_slice_capacity = 0;
