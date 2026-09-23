@@ -56895,6 +56895,33 @@ TEST(response_buffering_runtime,
     loop->dispatch(event);
     CHECK_EQ(conn.response_read_deadline_post_commit_phase,
              ResponseReadDeadlinePostCommitPhase::Buffering);
+
+    // A later CQE must append wholly after the existing tail, preserving the
+    // logical body order while the header/prefix slice remains the owner.
+    static constexpr u8 kFinalBody[] = "uvwxyz";
+    const u16 final_buf_id = 13;
+    __builtin_memcpy(backend.buf_base + static_cast<u64>(final_buf_id) * 4096,
+                     kFinalBody,
+                     sizeof(kFinalBody) - 1u);
+    const u32 final_cq_tail = __atomic_load_n(backend.cq_tail, __ATOMIC_ACQUIRE);
+    auto& final_cqe = backend.cq_entries[final_cq_tail & *backend.cq_ring_mask];
+    final_cqe.user_data =
+        encode_upstream_event_token({conn.id, IoEventType::UpstreamRecv, conn.upstream_episode, 0});
+    final_cqe.res = sizeof(kFinalBody) - 1u;
+    final_cqe.flags =
+        IORING_CQE_F_BUFFER | (static_cast<u32>(final_buf_id) << IORING_CQE_BUFFER_SHIFT);
+    __atomic_store_n(backend.cq_tail, final_cq_tail + 1u, __ATOMIC_RELEASE);
+    backend.pending = 0;
+    IoEvent final_event{};
+    REQUIRE_EQ(backend.wait(&final_event, 1, loop->conns, loop->connection_capacity), 1u);
+    CHECK_EQ(final_event.result, static_cast<i32>(sizeof(kFinalBody) - 1u));
+    CHECK_EQ(final_event.copy_witness, IoEventCopyWitness::Full);
+    CHECK_EQ(conn.response_body_tail.size, 12u);
+    CHECK_EQ(memcmp(conn.response_body_tail.data(), kOverflow + 10u, 6u), 0);
+    CHECK_EQ(memcmp(conn.response_body_tail.data() + 6u, kFinalBody, 6u), 0);
+    loop->dispatch(final_event);
+    CHECK_EQ(conn.response_read_deadline_post_commit_phase,
+             ResponseReadDeadlinePostCommitPhase::OriginComplete);
     cleanup_prebuilt_d2(loop, fixture);
 }
 
