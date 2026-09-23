@@ -7187,8 +7187,8 @@ struct H2InitialSubmitCaptureLoop : SmallLoop {
     bool submit_send(Connection& conn, const u8* buf, u32 len) {
         submit_calls++;
         if (conn.h2 != nullptr) {
-            saw_owner = conn.h2->outbound_stream == 1 &&
-                        conn.h2->outbound_body == conn.h2->pending_synth;
+            saw_owner =
+                conn.h2->outbound_stream == 1 && conn.h2->outbound_body == conn.h2->pending_synth;
             saw_proxy_source = conn.h2->outbound_source == H2OutboundBodySource::ProxySynth;
         }
         Http2FrameHeader frame{};
@@ -7208,8 +7208,8 @@ struct H2InitialSubmitCaptureLoop : SmallLoop {
                                            8,
                                            &count)) {
                 for (u32 i = 0; i < count; i++)
-                    saw_status_200 |= headers[i].name.eq({":status", 7}) &&
-                                      headers[i].value.eq({"200", 3});
+                    saw_status_200 |=
+                        headers[i].name.eq({":status", 7}) && headers[i].value.eq({"200", 3});
             }
             const u32 data_offset = kFrameHeaderSize + frame.length;
             Http2FrameHeader data{};
@@ -7219,8 +7219,7 @@ struct H2InitialSubmitCaptureLoop : SmallLoop {
                 data.type == static_cast<u8>(Http2FrameType::Data) && data.stream_id == 1 &&
                 data.length == 3 && (data.flags & http2_flag::kEndStream) != 0 &&
                 len >= data_offset + kFrameHeaderSize + 3)
-                saw_data_abc =
-                    memcmp(buf + data_offset + kFrameHeaderSize, "abc", 3) == 0;
+                saw_data_abc = memcmp(buf + data_offset + kFrameHeaderSize, "abc", 3) == 0;
         }
         return false;
     }
@@ -7336,7 +7335,8 @@ TEST(http2, owned_response_data_submit_failure_after_headers_cqe_closes) {
     h2_proxy_finish(&loop, *conn, parsed, kHeaderLen, 9, false);
     REQUIRE_GT(conn->send_buf.len(), 0u);
     const u32 header_send_len = conn->send_buf.len();
-    loop.inject_and_dispatch(make_ev(conn->id, IoEventType::Send, static_cast<i32>(header_send_len)));
+    loop.inject_and_dispatch(
+        make_ev(conn->id, IoEventType::Send, static_cast<i32>(header_send_len)));
     CHECK_EQ(h2.outbound_stream, 1u);
     CHECK_EQ(h2.outbound_body_offset, 0u);
     loop.backend.fail_send = true;
@@ -7437,17 +7437,9 @@ static u64 rst_owner_route_handler(void*, jit::HandlerCtx*, const u8*, u32, void
 
 static u32 staged_body_route_calls = 0;
 static u32 staged_next_route_calls = 0;
-static u64 staged_body_route_handler(void*,
-                                     jit::HandlerCtx*,
-                                     const u8*,
-                                     u32,
-                                     void*) {
+static u64 staged_body_route_handler(void*, jit::HandlerCtx*, const u8*, u32, void*) {
     ++staged_body_route_calls;
-    return jit::HandlerResult{jit::HandlerAction::ReturnStatus,
-                              200,
-                              1,
-                              0,
-                              jit::YieldKind::HttpGet}
+    return jit::HandlerResult{jit::HandlerAction::ReturnStatus, 200, 1, 0, jit::YieldKind::HttpGet}
         .pack();
 }
 static u64 staged_next_route_handler(void*, jit::HandlerCtx*, const u8*, u32, void*) {
@@ -7500,7 +7492,8 @@ TEST(http2, rst_owner_processes_next_headers_after_parked_cancel) {
     REQUIRE_EQ(h2.outbound_source, H2OutboundBodySource::ProxySynth);
     REQUIRE_GT(conn->send_buf.len(), 0u);
     const u32 header_send_len = conn->send_buf.len();
-    loop.inject_and_dispatch(make_ev(conn_id, IoEventType::Send, static_cast<i32>(header_send_len)));
+    loop.inject_and_dispatch(
+        make_ev(conn_id, IoEventType::Send, static_cast<i32>(header_send_len)));
     CHECK_EQ(h2.outbound_stream, 1u);
     CHECK(h2.response_flush_pending);
     const hpack::Header request[] = {
@@ -7558,7 +7551,8 @@ TEST(http2, rst_staged_owner_replays_buffered_headers_after_send) {
     RouteConfig config{};
     static u8 body[9000];
     memset(body, 'b', sizeof(body));
-    REQUIRE_EQ(config.add_response_body_view(reinterpret_cast<const char*>(body), sizeof(body)), 1u);
+    REQUIRE_EQ(config.add_response_body_view(reinterpret_cast<const char*>(body), sizeof(body)),
+               1u);
     REQUIRE_EQ(config.add_jit_handler("/body", kRouteMethodGet, &staged_body_route_handler, false),
                1u);
     REQUIRE_EQ(config.add_jit_handler("/next", kRouteMethodGet, &staged_next_route_handler, false),

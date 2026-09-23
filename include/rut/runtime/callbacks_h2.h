@@ -1550,11 +1550,8 @@ void on_h2_sent(void* lp, Connection& conn, IoEvent ev) {
             h2_async_epoch_leave(loop, conn);
         } else {
             H2PumpStatus pump_status = H2PumpStatus::Blocked;
-            const u32 n =
-                h2_pump_outbound(*conn.h2,
-                                 conn.send_buf.write_ptr(),
-                                 conn.send_buf.write_avail(),
-                                 pump_status);
+            const u32 n = h2_pump_outbound(
+                *conn.h2, conn.send_buf.write_ptr(), conn.send_buf.write_avail(), pump_status);
             if (pump_status == H2PumpStatus::Invalid) {
                 h2_clear_outbound(*conn.h2);
                 loop->close_conn(conn);
@@ -1650,16 +1647,14 @@ void on_h2_data(void* lp, Connection& conn, IoEvent ev) {
 
     if (!kClose && conn.h2->outbound_stream != 0) {
         const u32 kUsed = ctrl_len + d.resp_len;
-        const u32 kWireRoom = kUsed <= conn.send_buf.capacity()
-                                  ? conn.send_buf.capacity() - kUsed
-                                  : 0;
+        const u32 kWireRoom =
+            kUsed <= conn.send_buf.capacity() ? conn.send_buf.capacity() - kUsed : 0;
         H2PumpStatus pump_status = H2PumpStatus::Blocked;
-        const u32 kN = h2_pump_outbound(*conn.h2,
-                                        d.resp + d.resp_len,
-                                        d.resp_cap - d.resp_len < kWireRoom
-                                            ? d.resp_cap - d.resp_len
-                                            : kWireRoom,
-                                        pump_status);
+        const u32 kN = h2_pump_outbound(
+            *conn.h2,
+            d.resp + d.resp_len,
+            d.resp_cap - d.resp_len < kWireRoom ? d.resp_cap - d.resp_len : kWireRoom,
+            pump_status);
         if (pump_status == H2PumpStatus::Invalid) {
             h2_clear_outbound(*conn.h2);
             loop->close_conn(conn);
@@ -1968,8 +1963,8 @@ void h2_resume_jit_handler(Loop* loop, Connection& conn) {
     }
     if (h2->outbound_stream != 0) {
         H2PumpStatus pump_status = H2PumpStatus::Blocked;
-        const u32 kN = h2_pump_outbound(
-            *h2, resp + d.resp_len, sizeof(resp) - d.resp_len, pump_status);
+        const u32 kN =
+            h2_pump_outbound(*h2, resp + d.resp_len, sizeof(resp) - d.resp_len, pump_status);
         if (pump_status == H2PumpStatus::Invalid) {
             h2_clear_outbound(*h2);
             loop->close_conn(conn);
