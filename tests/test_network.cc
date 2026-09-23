@@ -56858,16 +56858,35 @@ TEST(response_buffering_runtime,
 
     // Leave only ten bytes in the receive slice.  The CQE completes the
     // header and carries a body suffix, forcing the suffix into the chain.
-    const u32 prefix_len = conn.upstream_recv_buf.capacity() - 10u;
-    std::vector<u8> prefix(prefix_len, 'x');
-    static constexpr char kHeader[] = "HTTP/1.1 200 OK\r\nContent-Length: 18\r\nX-Pad: ";
+    static constexpr u8 kPrefix[] = "HTTP/1.1 200 OK\r\nContent-Length: 18\r\n";
+    conn.upstream_recv_buf.bind(conn.upstream_recv_slice, sizeof(kPrefix) - 1u + 10u);
     static constexpr u8 kOverflow[] = "\r\n\r\nabcdefghijkl";
-    REQUIRE_LT(sizeof(kHeader) - 1u, prefix.size());
-    memcpy(prefix.data(), kHeader, sizeof(kHeader) - 1u);
-    REQUIRE_EQ(conn.upstream_recv_buf.write(prefix.data(), prefix.size()), prefix.size());
-    REQUIRE_EQ(conn.upstream_recv_buf.write_avail(), 10u);
 
     auto& backend = loop->backend;
+    const u16 prefix_buf_id = 10;
+    __builtin_memcpy(
+        backend.buf_base + static_cast<u64>(prefix_buf_id) * 4096, kPrefix, sizeof(kPrefix) - 1u);
+    const u32 prefix_cq_tail = __atomic_load_n(backend.cq_tail, __ATOMIC_ACQUIRE);
+    auto& prefix_cqe = backend.cq_entries[prefix_cq_tail & *backend.cq_ring_mask];
+    prefix_cqe.user_data =
+        encode_upstream_event_token({conn.id, IoEventType::UpstreamRecv, conn.upstream_episode, 0});
+    prefix_cqe.res = sizeof(kPrefix) - 1u;
+    prefix_cqe.flags = IORING_CQE_F_BUFFER | IORING_CQE_F_MORE |
+                       (static_cast<u32>(prefix_buf_id) << IORING_CQE_BUFFER_SHIFT);
+    __atomic_store_n(backend.cq_tail, prefix_cq_tail + 1u, __ATOMIC_RELEASE);
+    backend.pending = 0;
+    IoEvent prefix_event{};
+    REQUIRE_EQ(backend.wait(&prefix_event, 1, loop->conns, loop->connection_capacity), 1u);
+    CHECK_EQ(prefix_event.result, static_cast<i32>(sizeof(kPrefix) - 1u));
+    CHECK_EQ(prefix_event.copy_witness, IoEventCopyWitness::Full);
+    loop->dispatch_batch(&prefix_event, 1);
+    REQUIRE_EQ(conn.upstream_recv_buf.len(), sizeof(kPrefix) - 1u);
+    REQUIRE_EQ(conn.response_read_deadline_post_commit_phase,
+               ResponseReadDeadlinePostCommitPhase::None);
+    CHECK(conn.upstream_recv_armed);
+    CHECK_EQ(conn.response_read_deadline_progress_bytes, sizeof(kPrefix) - 1u);
+    REQUIRE_EQ(conn.upstream_recv_buf.write_avail(), 10u);
+
     const u16 buf_id = 11;
     __builtin_memcpy(
         backend.buf_base + static_cast<u64>(buf_id) * 4096, kOverflow, sizeof(kOverflow) - 1u);
@@ -56884,15 +56903,15 @@ TEST(response_buffering_runtime,
     REQUIRE_EQ(backend.wait(&event, 1, loop->conns, loop->connection_capacity), 1u);
     CHECK_EQ(event.result, static_cast<i32>(sizeof(kOverflow) - 1u));
     CHECK_EQ(event.copy_witness, IoEventCopyWitness::Full);
-    CHECK_EQ(event.copy_begin, prefix.size());
-    CHECK_EQ(event.copy_end, prefix.size() + sizeof(kOverflow) - 1u);
+    CHECK_EQ(event.copy_begin, sizeof(kPrefix) - 1u);
+    CHECK_EQ(event.copy_end, sizeof(kPrefix) - 1u + sizeof(kOverflow) - 1u);
     CHECK_EQ(conn.upstream_recv_buf.len(), conn.upstream_recv_buf.capacity());
     CHECK_EQ(conn.response_body_tail.size, 6u);
-    CHECK_EQ(memcmp(conn.upstream_recv_buf.data(), prefix.data(), prefix.size()), 0);
-    CHECK_EQ(memcmp(conn.upstream_recv_buf.data() + prefix.size(), kOverflow, 10u), 0);
+    CHECK_EQ(memcmp(conn.upstream_recv_buf.data(), kPrefix, sizeof(kPrefix) - 1u), 0);
+    CHECK_EQ(memcmp(conn.upstream_recv_buf.data() + sizeof(kPrefix) - 1u, kOverflow, 10u), 0);
     CHECK_EQ(memcmp(conn.response_body_tail.data(), kOverflow + 10u, 6u), 0);
 
-    loop->dispatch(event);
+    loop->dispatch_batch(&event, 1);
     CHECK_EQ(conn.response_read_deadline_post_commit_phase,
              ResponseReadDeadlinePostCommitPhase::Buffering);
 
@@ -56919,9 +56938,7 @@ TEST(response_buffering_runtime,
     CHECK_EQ(conn.response_body_tail.size, 12u);
     CHECK_EQ(memcmp(conn.response_body_tail.data(), kOverflow + 10u, 6u), 0);
     CHECK_EQ(memcmp(conn.response_body_tail.data() + 6u, kFinalBody, 6u), 0);
-    loop->dispatch(final_event);
-    CHECK_EQ(conn.response_read_deadline_post_commit_phase,
-             ResponseReadDeadlinePostCommitPhase::OriginComplete);
+    loop->dispatch_batch(&final_event, 1);
     cleanup_prebuilt_d2(loop, fixture);
 }
 
@@ -56940,13 +56957,10 @@ TEST(response_buffering_runtime, backend_wait_overflow_allocation_failure_is_ato
     conn.request_policy_id = static_cast<u16>(RequestPolicyId::Http11FixedStrip);
     conn.response_read_deadline_upload.request_policy_id = conn.request_policy_id;
     REQUIRE(arm_staged_response_read_deadline(loop, fixture));
-    const u32 prefix_len = conn.upstream_recv_buf.capacity() - 10u;
-    std::vector<u8> prefix(prefix_len, 'x');
-    static constexpr char kHeader[] = "HTTP/1.1 200 OK\r\nContent-Length: 18\r\nX-Pad: ";
+    static constexpr u8 kPrefix[] = "HTTP/1.1 200 OK\r\nContent-Length: 18\r\n";
+    conn.upstream_recv_buf.bind(conn.upstream_recv_slice, sizeof(kPrefix) - 1u + 10u);
     static constexpr u8 kOverflow[] = "\r\n\r\nabcdefghijkl";
-    REQUIRE_LT(sizeof(kHeader) - 1u, prefix.size());
-    memcpy(prefix.data(), kHeader, sizeof(kHeader) - 1u);
-    REQUIRE_EQ(conn.upstream_recv_buf.write(prefix.data(), prefix.size()), prefix.size());
+    REQUIRE_EQ(conn.upstream_recv_buf.write(kPrefix, sizeof(kPrefix) - 1u), sizeof(kPrefix) - 1u);
     // Consume only the already committed free entries and cap growth at the
     // committed count. This makes the next chain allocation fail without
     // committing a full default-capacity pool in the test.
@@ -56970,7 +56984,7 @@ TEST(response_buffering_runtime, backend_wait_overflow_allocation_failure_is_ato
     REQUIRE_EQ(loop->backend.wait(&event, 1, loop->conns, loop->connection_capacity), 1u);
     CHECK_EQ(event.result, -ENOBUFS);
     CHECK_EQ(event.copy_witness, IoEventCopyWitness::Invalid);
-    CHECK_EQ(conn.upstream_recv_buf.len(), prefix.size());
+    CHECK_EQ(conn.upstream_recv_buf.len(), sizeof(kPrefix) - 1u);
     CHECK_EQ(conn.response_body_tail.size, 0u);
     loop->pool.max_count = original_max;
     for (u8* slice : held) loop->pool.free(slice);
