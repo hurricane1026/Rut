@@ -127,6 +127,46 @@ inline void h2_close_stream(Http2Conn* h2, u32 stream_id) {
     }
 }
 
+inline void h2_clear_outbound(Http2Conn& h2) {
+    h2.outbound_stream = 0;
+    h2.outbound_config = nullptr;
+    h2.outbound_body = nullptr;
+    h2.outbound_body_len = 0;
+    h2.outbound_body_offset = 0;
+    h2.outbound_final_staged = false;
+}
+
+// Append at most one DATA frame to a wire buffer. The caller must invoke this
+// only while no downstream send is in flight; flow-control windows are deducted
+// when the frame is published into the buffer, not when its CQE arrives.
+inline u32 h2_pump_outbound(Http2Conn& h2, u8* out, u32 cap) {
+    if (h2.outbound_stream == 0 || h2.outbound_final_staged ||
+        h2.outbound_body_offset >= h2.outbound_body_len)
+        return 0;
+    Http2Stream* stream = h2.find_stream(h2.outbound_stream);
+    if (stream == nullptr || h2.conn_send_window <= 0 || stream->send_window <= 0) return 0;
+    if (cap < kFrameHeaderSize + 1) return 0;
+    const u32 kRemaining = h2.outbound_body_len - h2.outbound_body_offset;
+    u32 n = kRemaining;
+    if (n > h2.peer_settings.max_frame_size) n = h2.peer_settings.max_frame_size;
+    if (static_cast<i64>(n) > h2.conn_send_window) n = static_cast<u32>(h2.conn_send_window);
+    if (static_cast<i64>(n) > stream->send_window) n = static_cast<u32>(stream->send_window);
+    if (n > cap - kFrameHeaderSize) n = cap - kFrameHeaderSize;
+    if (n == 0) return 0;
+    Http2FrameHeader frame{};
+    frame.length = n;
+    frame.type = static_cast<u8>(Http2FrameType::Data);
+    frame.flags = (n == kRemaining) ? http2_flag::kEndStream : 0;
+    frame.stream_id = h2.outbound_stream;
+    write_frame_header(out, frame);
+    __builtin_memcpy(out + kFrameHeaderSize, h2.outbound_body + h2.outbound_body_offset, n);
+    h2.outbound_body_offset += n;
+    h2.conn_send_window -= n;
+    stream->send_window -= static_cast<i32>(n);
+    h2.outbound_final_staged = n == kRemaining;
+    return kFrameHeaderSize + n;
+}
+
 // Connection-specific (hop-by-hop) header names that MUST NOT appear in an HTTP/2
 // response (RFC 7540 §8.1.2.2). validate_response_header already blocks Connection
 // / Transfer-Encoding / Content-Length, but a route's response(headers:) set can
@@ -149,22 +189,44 @@ void h2_emit_response(H2Dispatch<Loop>& d,
                       u32 nhdrs,
                       const u8* body,
                       u32 body_len,
-                      bool allow_fallback = true) {
+                      bool allow_fallback = true,
+                      bool borrow_body = false) {
     auto enc = d.conn->h2->hpack_enc;
-    const u32 kN = http2_write_response(d.resp + d.resp_len,
-                                        d.resp_cap - d.resp_len,
-                                        enc,
-                                        stream_id,
-                                        status,
-                                        hdrs,
-                                        nhdrs,
-                                        body,
-                                        body_len);
+    const u32 kN = (body_len == 0 || !borrow_body) ? http2_write_response(d.resp + d.resp_len,
+                                                                          d.resp_cap - d.resp_len,
+                                                                          enc,
+                                                                          stream_id,
+                                                                          status,
+                                                                          hdrs,
+                                                                          nhdrs,
+                                                                          body,
+                                                                          body_len)
+                                                   : 0;
     if (kN != 0) {
         d.conn->h2->hpack_enc = enc;
         d.resp_len += kN;
         h2_close_stream(d.conn->h2, stream_id);
+        d.conn->h2->response_flush_pending = true;
         return;
+    }
+    // Large local bodies are borrowed from RouteConfig and sent in bounded H2
+    // DATA frames after their nonterminal HEADERS frame. Keep the existing
+    // single-buffer path for small responses.
+    if (borrow_body && body_len != 0 && d.resp_len == 0) {
+        enc = d.conn->h2->hpack_enc;
+        const u32 kHeaders = http2_write_response_headers(
+            d.resp, d.resp_cap, enc, stream_id, status, hdrs, nhdrs, body_len, false);
+        if (kHeaders != 0) {
+            d.conn->h2->hpack_enc = enc;
+            d.resp_len = kHeaders;
+            d.conn->h2->outbound_stream = stream_id;
+            d.conn->h2->outbound_body = body;
+            d.conn->h2->outbound_body_len = body_len;
+            d.conn->h2->outbound_body_offset = 0;
+            d.conn->h2->outbound_final_staged = false;
+            d.conn->h2->response_flush_pending = true;
+            return;
+        }
     }
     // The response didn't fit. If it isn't the first frame in the batch, or the
     // caller opted out of the generic fallback (e.g. the proxy wants its own 502),
@@ -183,6 +245,7 @@ void h2_emit_response(H2Dispatch<Loop>& d,
         d.conn->h2->hpack_enc = enc;
         d.resp_len += kFallback;
         h2_close_stream(d.conn->h2, stream_id);
+        d.conn->h2->response_flush_pending = true;
     }
 }
 
@@ -582,7 +645,8 @@ void h2_emit_outcome(H2Dispatch<Loop>& d,
             nhdrs++;
         }
     }
-    h2_emit_response(d, stream_id, o.status_code, hdrs, nhdrs, body, body_len);
+    h2_emit_response(d, stream_id, o.status_code, hdrs, nhdrs, body, body_len, true, true);
+    if (d.conn->h2->outbound_stream == stream_id) d.conn->h2->outbound_config = cfg;
 }
 
 // An h2 stream going async (wait/proxy) must pin the RCU config epoch the same
@@ -1337,6 +1401,7 @@ void h2_on_data_cb(
 inline void h2_on_reset_cb(void* ctx, Http2Conn& c, u32 stream_id, Http2Error /*err*/) {
     (void)ctx;
     if (c.async_stream != 0 && c.async_stream == stream_id) h2_clear_async(c);
+    if (c.outbound_stream == stream_id) h2_clear_outbound(c);
 }
 
 template <typename Loop>
@@ -1394,17 +1459,20 @@ void on_h2_sent(void* lp, Connection& conn, IoEvent ev) {
     auto* loop = static_cast<Loop*>(lp);
     const u32 kSendLen = conn.send_buf.len();
     if (ev.result < 0) {
+        if (conn.h2) h2_clear_outbound(*conn.h2);
         loop->close_conn(conn);
         return;
     }
     const u32 kResult = static_cast<u32>(ev.result);
     if (conn.send_progress > kSendLen || kResult > (kSendLen - conn.send_progress)) {
+        if (conn.h2) h2_clear_outbound(*conn.h2);
         loop->close_conn(conn);
         return;
     }
     conn.send_progress += kResult;
     if (conn.send_progress < kSendLen) {
         if (kResult == 0u) {
+            if (conn.h2) h2_clear_outbound(*conn.h2);
             loop->close_conn(conn);
             return;
         }
@@ -1416,6 +1484,24 @@ void on_h2_sent(void* lp, Connection& conn, IoEvent ev) {
 
     conn.send_progress = 0;
     conn.send_buf.reset();
+    if (conn.h2 && conn.h2->outbound_stream != 0) {
+        if (conn.h2->outbound_final_staged) {
+            const u32 stream_id = conn.h2->outbound_stream;
+            h2_close_stream(conn.h2, stream_id);
+            h2_clear_outbound(*conn.h2);
+            h2_async_epoch_leave(loop, conn);
+        } else {
+            const u32 n =
+                h2_pump_outbound(*conn.h2, conn.send_buf.write_ptr(), conn.send_buf.write_avail());
+            conn.send_buf.commit(n);
+            if (n != 0) {
+                conn.transition_to_sending(&on_h2_sent<Loop>);
+                loop->submit_send(conn, conn.send_buf.data(), conn.send_buf.len());
+                return;
+            }
+        }
+    }
+    if (conn.h2 && conn.h2->outbound_stream == 0) conn.h2->response_flush_pending = false;
     if (!conn.keep_alive) {  // engine signalled GOAWAY / connection error
         loop->close_conn(conn);
         return;
@@ -1491,6 +1577,19 @@ void on_h2_data(void* lp, Connection& conn, IoEvent ev) {
     if (kRemaining > 0) conn.recv_buf.commit(kRemaining);
 
     const bool kClose = r.close || d.overflow;
+
+    if (!kClose && conn.h2->outbound_stream != 0) {
+        const u32 kUsed = ctrl_len + d.resp_len;
+        const u32 kWireRoom = kUsed <= conn.send_buf.capacity()
+                                  ? conn.send_buf.capacity() - kUsed
+                                  : 0;
+        const u32 kN = h2_pump_outbound(*conn.h2,
+                                        d.resp + d.resp_len,
+                                        d.resp_cap - d.resp_len < kWireRoom
+                                            ? d.resp_cap - d.resp_len
+                                            : kWireRoom);
+        d.resp_len += kN;
+    }
 
     // A handler suspended on wait() during this batch. Flush whatever queued
     // (control frames + any synchronously-completed streams' responses); the
@@ -1774,6 +1873,10 @@ void h2_resume_jit_handler(Loop* loop, Connection& conn) {
         h2_emit_outcome(d, kStreamId, kOutcome, h2->async_cfg);
     } else {
         h2_emit_status(d, kStreamId, 503);  // forward / event-yield over h2: follow-up
+    }
+    if (h2->outbound_stream != 0) {
+        const u32 kN = h2_pump_outbound(*h2, resp + d.resp_len, sizeof(resp) - d.resp_len);
+        d.resp_len += kN;
     }
 
     // Clear the suspension before responding so the flush's on_h2_sent re-arms

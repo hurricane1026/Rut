@@ -73,6 +73,8 @@ void Http2Conn::init() {
     outbound_body = nullptr;
     outbound_body_len = 0;
     outbound_body_offset = 0;
+    outbound_final_staged = false;
+    response_flush_pending = false;
 }
 
 Http2Stream* Http2Conn::find_stream(u32 id) {
@@ -910,6 +912,12 @@ Http2Result Http2Conn::process(const u8* in, u32 len, u8* out, u32 out_cap, u32*
         // first one and leave it buffered until the parked stream resumes — else the
         // next coalesced stream would be dispatched now and refused (503).
         if (async_stream != 0) {
+            const auto kT = static_cast<Http2FrameType>(h.type);
+            if (kT == Http2FrameType::Headers || kT == Http2FrameType::Continuation ||
+                kT == Http2FrameType::Data || kT == Http2FrameType::PushPromise)
+                break;
+        }
+        if (response_flush_pending && outbound_stream == 0) {
             const auto kT = static_cast<Http2FrameType>(h.type);
             if (kT == Http2FrameType::Headers || kT == Http2FrameType::Continuation ||
                 kT == Http2FrameType::Data || kT == Http2FrameType::PushPromise)

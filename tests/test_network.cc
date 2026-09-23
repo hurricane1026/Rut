@@ -6704,6 +6704,59 @@ TEST(http2, outbound_owner_refuses_after_continuation_and_keeps_control_sync) {
     CHECK_EQ(unowned_result.consumed, kFrameHeaderSize + block_len);
     CHECK_EQ(unowned_capture.headers_calls, 1u);
 }
+
+TEST(http2, nonempty_response_uses_flow_controlled_data_owner) {
+    SmallLoop loop;
+    loop.setup();
+    auto* conn = loop.alloc_conn();
+    REQUIRE(conn != nullptr);
+    Http2Conn h2{};
+    h2.init();
+    h2.nstreams = 1;
+    h2.streams[0] = {1,
+                     Http2StreamState::Open,
+                     static_cast<i32>(kDefaultInitialWindowSize),
+                     static_cast<i32>(kDefaultInitialWindowSize),
+                     true};
+    conn->h2 = &h2;
+    static u8 body[9000];
+    for (u32 i = 0; i < sizeof(body); i++) body[i] = static_cast<u8>(i * 17 + 3);
+    RouteConfig cfg{};
+    REQUIRE_EQ(cfg.add_response_body_view(reinterpret_cast<const char*>(body), sizeof(body)), 1u);
+    JitDispatchOutcome outcome{};
+    outcome.kind = JitDispatchOutcome::Kind::ReturnStatus;
+    outcome.status_code = 200;
+    outcome.response_body_idx = 1;
+    u8 response[20000]{};
+    H2Dispatch<SmallLoop> dispatch{&loop, conn, response, sizeof(response), 0, false, false};
+    h2_emit_outcome(dispatch, 1, outcome, &cfg);
+    CHECK_EQ(h2.outbound_stream, 1u);
+    CHECK_EQ(h2.outbound_body_len, 9000u);
+    CHECK_EQ(h2.outbound_body_offset, 0u);
+    CHECK_EQ(h2.conn_send_window, static_cast<i64>(kDefaultInitialWindowSize));
+    const u32 header_len = dispatch.resp_len;
+    h2.conn_send_window = 0;
+    CHECK_EQ(
+        h2_pump_outbound(h2, response + dispatch.resp_len, sizeof(response) - dispatch.resp_len),
+        0u);
+    h2.conn_send_window = kDefaultInitialWindowSize;
+    const u32 data_len =
+        h2_pump_outbound(h2, response + dispatch.resp_len, sizeof(response) - dispatch.resp_len);
+    REQUIRE_EQ(data_len, kFrameHeaderSize + sizeof(body));
+    dispatch.resp_len += data_len;
+    Http2FrameHeader headers_frame{};
+    REQUIRE_EQ(parse_frame_header(response, header_len, &headers_frame), ParseStatus::Complete);
+    CHECK_EQ(headers_frame.type, static_cast<u8>(Http2FrameType::Headers));
+    Http2FrameHeader data_frame{};
+    REQUIRE_EQ(parse_frame_header(response + header_len, data_len, &data_frame),
+               ParseStatus::Complete);
+    CHECK_EQ(data_frame.type, static_cast<u8>(Http2FrameType::Data));
+    CHECK((data_frame.flags & http2_flag::kEndStream) != 0);
+    CHECK_EQ(data_frame.length, static_cast<u32>(sizeof(body)));
+    CHECK_EQ(memcmp(response + header_len + kFrameHeaderSize, body, sizeof(body)), 0);
+    CHECK_EQ(h2.conn_send_window, static_cast<i64>(kDefaultInitialWindowSize - sizeof(body)));
+    CHECK_EQ(h2.streams[0].send_window, static_cast<i32>(kDefaultInitialWindowSize - sizeof(body)));
+}
 }  // namespace
 
 TEST(connection_base, set_slots_redirects_recv_slot_for_iouring_tls) {

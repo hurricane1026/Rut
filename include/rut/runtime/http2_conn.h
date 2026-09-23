@@ -182,6 +182,8 @@ struct Http2Conn {
     const u8* outbound_body;
     u32 outbound_body_len;
     u32 outbound_body_offset;
+    bool outbound_final_staged;
+    bool response_flush_pending;
 
     // Set callbacks (any may be null) then call init().
     void init();
