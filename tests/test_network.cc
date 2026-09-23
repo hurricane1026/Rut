@@ -7086,7 +7086,10 @@ TEST(http2, proxy_finish_bodyless_and_head_preserve_framing_and_epoch) {
 }
 
 TEST(http2, proxy_finish_guarded_failure_preserves_pending_synth) {
-    const auto run = [&](bool send_armed, bool quarantined, bool bad_bounds = false) {
+    const auto run = [&](bool send_armed,
+                         bool quarantined,
+                         bool bad_bounds = false,
+                         bool fail_submit = false) {
         SmallLoop loop;
         loop.setup();
         auto* conn = loop.alloc_conn();
@@ -7119,7 +7122,14 @@ TEST(http2, proxy_finish_guarded_failure_preserves_pending_synth) {
         parsed.reset();
         parsed.status_code = 200;
         parsed.version = HttpVersion::Http11;
+        loop.backend.fail_send = fail_submit;
         h2_proxy_finish(&loop, *conn, parsed, bad_bounds ? kHeaderLen + 1 : kHeaderLen, 3, false);
+        if (fail_submit) {
+            CHECK_EQ(h2.outbound_stream, 0u);
+            CHECK_FALSE(conn->epoch_held);
+            CHECK_EQ(loop.free_top, SmallLoop::kMaxConns);
+            return;
+        }
         REQUIRE_GT(conn->send_buf.len(), 0u);
         Http2FrameHeader frame{};
         REQUIRE_EQ(parse_frame_header(conn->send_buf.data(), conn->send_buf.len(), &frame),
@@ -7156,6 +7166,39 @@ TEST(http2, proxy_finish_guarded_failure_preserves_pending_synth) {
     run(true, false);
     run(false, true);
     run(false, false, true);
+    run(false, false, false, true);
+}
+
+TEST(http2, owned_response_submit_failures_release_owner_and_epoch) {
+    SmallLoop loop;
+    loop.setup();
+    auto* conn = loop.alloc_conn();
+    REQUIRE(conn != nullptr);
+    Http2Conn h2{};
+    h2.init();
+    h2.nstreams = 1;
+    h2.streams[0] = {1,
+                     Http2StreamState::Open,
+                     static_cast<i32>(kDefaultInitialWindowSize),
+                     static_cast<i32>(kDefaultInitialWindowSize),
+                     true};
+    conn->h2 = &h2;
+    conn->epoch_held = true;
+    static u8 body[9000];
+    memset(body, 0x3C, sizeof(body));
+    h2.outbound_stream = 1;
+    h2.outbound_body = body;
+    h2.outbound_body_len = sizeof(body);
+    h2.outbound_body_offset = 128;
+    u8 pending_send[64]{};
+    REQUIRE_EQ(conn->send_buf.write(pending_send, sizeof(pending_send)), sizeof(pending_send));
+    conn->send_progress = 0;
+    conn->transition_to_sending(&on_h2_sent<SmallLoop>);
+    loop.backend.fail_send = true;
+    on_h2_sent<SmallLoop>(&loop, *conn, make_ev(conn->id, IoEventType::Send, 1));
+    CHECK_EQ(h2.outbound_stream, 0u);
+    CHECK_FALSE(conn->epoch_held);
+    CHECK_EQ(loop.free_top, SmallLoop::kMaxConns);
 }
 
 TEST(http2, rst_owner_clears_parked_flush_gate_but_preserves_staged_send_gate) {
