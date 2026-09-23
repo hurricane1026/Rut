@@ -469,8 +469,8 @@ Http2Error finish_headers(Http2Conn& c, u32 stream_id, bool end_stream, bool ref
     c.cont_refuse = false;
     if (refuse) {
         if (Http2Stream* s = c.find_stream(stream_id)) s->state = Http2StreamState::Closed;
-        if (w.room(kFrameHeaderSize + 4))
-            w.len += write_rst_stream(w.out + w.len, stream_id, Http2Error::RefusedStream);
+        if (!w.room(kFrameHeaderSize + 4)) return Http2Error::InternalError;
+        w.len += write_rst_stream(w.out + w.len, stream_id, Http2Error::RefusedStream);
         return Http2Error::NoError;
     }
     if (c.on_headers) c.on_headers(c.cb_ctx, c, stream_id, hs, nh, end_stream);
@@ -886,6 +886,19 @@ Http2Result Http2Conn::process(const u8* in, u32 len, u8* out, u32 out_cap, u32*
             return {pos, true};
         }
         if (len - pos < kFrameHeaderSize + h.length) break;  // wait for full payload
+
+        // Refusing a stream is retryable: do not consume a new stream's
+        // HEADERS, or the final CONTINUATION of a refused block, unless the
+        // control writer can publish the mandatory RST_STREAM. The caller
+        // compacts this untouched frame and retries it after flushing output.
+        const auto kType = static_cast<Http2FrameType>(h.type);
+        const bool kNewOwnedConflict = outbound_stream != 0 && kType == Http2FrameType::Headers &&
+                                       h.stream_id > last_stream_id &&
+                                       h.stream_id != outbound_stream &&
+                                       find_stream(h.stream_id) == nullptr;
+        const bool kFinalOwnedConflict = kType == Http2FrameType::Continuation && cont_refuse &&
+                                         (h.flags & http2_flag::kEndHeaders) != 0;
+        if ((kNewOwnedConflict || kFinalOwnedConflict) && !w.room(kFrameHeaderSize + 4)) break;
 
         // A serving callback parked a stream (one-at-a-time wait/proxy). We still
         // drain control frames already coalesced in this buffer — above all a

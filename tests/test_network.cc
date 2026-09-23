@@ -4465,7 +4465,8 @@ TEST(response_read_timeout,
     for (u32 i = 0; i < kClientPrefaceLen; i++) input[input_len++] = kClientPreface[i];
     Http2Settings settings{};
     settings.set_defaults();
-    input_len += write_settings_frame(input + input_len, settings);
+    const u32 initial_settings_len = write_settings_frame(input + input_len, settings);
+    input_len += initial_settings_len;
     const hpack::Header upload[] = {
         {{":method", 7}, {"POST", 4}},
         {{":scheme", 7}, {"http", 4}},
@@ -6579,9 +6580,20 @@ TEST(http2, outbound_owner_refuses_after_continuation_and_keeps_control_sync) {
 
     u8 output[1024]{};
     u32 output_len = 0;
-    const Http2Result result = h2.process(input, input_len, output, sizeof(output), &output_len);
+    u8 first_output[13]{};
+    u32 first_output_len = 0;
+    const Http2Result first_result =
+        h2.process(input, input_len, first_output, sizeof(first_output), &first_output_len);
+    REQUIRE_FALSE(first_result.close);
+    CHECK_LT(first_result.consumed, input_len);
+    CHECK_EQ(h2.nstreams, 1u);
+    const Http2Result result = h2.process(input + first_result.consumed,
+                                          input_len - first_result.consumed,
+                                          output,
+                                          sizeof(output),
+                                          &output_len);
     REQUIRE_FALSE(result.close);
-    CHECK_EQ(result.consumed, input_len);
+    CHECK_EQ(result.consumed, input_len - first_result.consumed);
     CHECK_EQ(capture.headers_calls, 1u);
     CHECK_EQ(capture.last_stream, 1u);
     CHECK_EQ(h2.outbound_stream, 1u);
@@ -6610,6 +6622,87 @@ TEST(http2, outbound_owner_refuses_after_continuation_and_keeps_control_sync) {
         pos += kFrameHeaderSize + frame.length;
     }
     CHECK_EQ(refused_count, 2u);
+
+    // A previously accepted refused HEADERS fragment leaves the final
+    // CONTINUATION pending. With no room for its RST, the continuation remains
+    // untouched; retrying it decodes the block exactly once.
+    Http2Conn fragmented{};
+    fragmented.init();
+    fragmented.outbound_stream = 1;
+    fragmented.preface_seen = true;
+    fragmented.our_settings_sent = true;
+    H2OwnerGateCapture fragmented_capture{};
+    fragmented.cb_ctx = &fragmented_capture;
+    fragmented.on_headers = &h2_owner_gate_headers;
+    fragmented.last_stream_id = 3;
+    fragmented.nstreams = 1;
+    fragmented.streams[0] = {3,
+                             Http2StreamState::Open,
+                             static_cast<i32>(kDefaultInitialWindowSize),
+                             static_cast<i32>(kDefaultInitialWindowSize),
+                             true};
+    fragmented.cont_stream = 3;
+    fragmented.cont_refuse = true;
+    memcpy(fragmented.hdr_block, block, split);
+    fragmented.hdr_block_len = split;
+    u8 continuation_input[256]{};
+    Http2FrameHeader continuation_header{};
+    continuation_header.length = block_len - split;
+    continuation_header.type = static_cast<u8>(Http2FrameType::Continuation);
+    continuation_header.flags = http2_flag::kEndHeaders;
+    continuation_header.stream_id = 3;
+    write_frame_header(continuation_input, continuation_header);
+    memcpy(continuation_input + kFrameHeaderSize, block + split, block_len - split);
+    const u32 continuation_len = kFrameHeaderSize + block_len - split;
+    u8 fragmented_first_output[12]{};
+    u32 fragmented_first_output_len = 0;
+    const Http2Result fragmented_first = fragmented.process(continuation_input,
+                                                            continuation_len,
+                                                            fragmented_first_output,
+                                                            sizeof(fragmented_first_output),
+                                                            &fragmented_first_output_len);
+    REQUIRE_FALSE(fragmented_first.close);
+    CHECK_EQ(fragmented_first.consumed, 0u);
+    CHECK(fragmented.cont_refuse);
+    u8 fragmented_output[1024]{};
+    u32 fragmented_output_len = 0;
+    const Http2Result fragmented_second = fragmented.process(continuation_input,
+                                                             continuation_len,
+                                                             fragmented_output,
+                                                             sizeof(fragmented_output),
+                                                             &fragmented_output_len);
+    REQUIRE_FALSE(fragmented_second.close);
+    CHECK_EQ(fragmented_second.consumed, continuation_len);
+    CHECK_EQ(fragmented_capture.headers_calls, 0u);
+    CHECK(fragmented.streams[0].state == Http2StreamState::Closed);
+
+    // Without an owner, a small control buffer must not preflight ordinary
+    // HEADERS as a refusal; the request remains fully consumable.
+    Http2Conn unowned{};
+    unowned.init();
+    unowned.preface_seen = true;
+    unowned.our_settings_sent = true;
+    H2OwnerGateCapture unowned_capture{};
+    unowned.cb_ctx = &unowned_capture;
+    unowned.on_headers = &h2_owner_gate_headers;
+    u8 unowned_input[256]{};
+    Http2FrameHeader unowned_header{};
+    unowned_header.length = block_len;
+    unowned_header.type = static_cast<u8>(Http2FrameType::Headers);
+    unowned_header.flags = http2_flag::kEndHeaders;
+    unowned_header.stream_id = 1;
+    write_frame_header(unowned_input, unowned_header);
+    memcpy(unowned_input + kFrameHeaderSize, block, block_len);
+    u8 unowned_output[12]{};
+    u32 unowned_output_len = 0;
+    const Http2Result unowned_result = unowned.process(unowned_input,
+                                                       kFrameHeaderSize + block_len,
+                                                       unowned_output,
+                                                       sizeof(unowned_output),
+                                                       &unowned_output_len);
+    CHECK_FALSE(unowned_result.close);
+    CHECK_EQ(unowned_result.consumed, kFrameHeaderSize + block_len);
+    CHECK_EQ(unowned_capture.headers_calls, 1u);
 }
 }  // namespace
 
