@@ -9250,7 +9250,7 @@ TEST(slice_pool, init_destroy) {
     pool.destroy();
 }
 
-TEST(slice_pool, buffered_response_capacity_is_bounded_per_shard) {
+TEST(slice_pool, buffered_response_capacity_covers_each_connection) {
     static_assert(SlicePool::kMaxBufferedResponseBody == 1u << 20);
     static_assert(SlicePool::kMaxBufferedResponseSlices == 65u);
     static_assert(SlicePool::kSlicesPerConnection == 71u);
@@ -11256,15 +11256,15 @@ TEST(slice_conn, buffers_usable_through_request_cycle) {
 }
 
 TEST(slice_conn, real_eventloop_pool_init) {
-    // Verify real EventLoop reserves ordinary buffers plus one shard-wide
-    // maximum buffered response chain.
+    // Verify real EventLoop reserves ordinary buffers plus one bounded response
+    // chain for each admitted connection.
     RealLoop* loop = create_real_loop();
     REQUIRE(loop != nullptr);
     auto rc = loop->init(0, -1);
     REQUIRE(rc.has_value());
 
-    // Lazy commit: pool starts empty; six ordinary slices per connection plus
-    // one 1 MiB response-chain reserve are VA-reserved.
+    // Lazy commit: pool starts empty; six ordinary slices plus one 1 MiB
+    // response-chain reserve per admitted connection are VA-reserved.
     CHECK_EQ(loop->pool.max_count, SlicePool::capacity_for_connections(RealLoop::kMaxConns));
     CHECK_EQ(loop->pool.count, 0u);
 
@@ -18330,8 +18330,8 @@ TEST(buffer_isolation, client_data_during_proxy_ignored) {
     CHECK_EQ(conn->on_upstream_recv, saved_recv);
 }
 
-// Pool sized for six ordinary slices per connection plus one shard-wide
-// maximum buffered response-chain reserve.
+// Pool sized for six ordinary slices plus one bounded response-chain reserve
+// per admitted connection.
 TEST(buffer_isolation, pool_sized_for_connection_and_response_reserve) {
     RealLoop* loop = create_real_loop();
     REQUIRE(loop != nullptr);
