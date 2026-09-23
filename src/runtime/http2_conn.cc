@@ -74,6 +74,7 @@ void Http2Conn::init() {
     outbound_body_len = 0;
     outbound_body_offset = 0;
     outbound_final_staged = false;
+    outbound_source = H2OutboundBodySource::None;
     response_flush_pending = false;
 }
 

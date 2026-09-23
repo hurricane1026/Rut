@@ -6719,6 +6719,7 @@ TEST(http2, nonempty_response_uses_flow_controlled_data_owner) {
                      static_cast<i32>(kDefaultInitialWindowSize),
                      true};
     conn->h2 = &h2;
+    conn->epoch_held = true;
     static u8 body[9000];
     for (u32 i = 0; i < sizeof(body); i++) body[i] = static_cast<u8>(i * 17 + 3);
     RouteConfig cfg{};

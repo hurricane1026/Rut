@@ -6478,8 +6478,51 @@ void h2_proxy_finish(Loop* loop,
             nhdrs++;
         }
     }
-    // body points into upstream_recv_buf, which h2_emit_response copies into the
-    // DATA frame in pending_synth scratch — so serialize BEFORE teardown.
+    if (body_len != 0) {
+        if (body_len > Http2Conn::kBodySynthCap || hdr_end > conn.upstream_recv_buf.len() ||
+            body_len > conn.upstream_recv_buf.len() - hdr_end ||
+            conn.h2_proxy_synth_quarantined || h2->outbound_stream != 0) {
+            h2_proxy_fail(loop, conn, 502);
+            return;
+        }
+        // Preserve the body before retiring upstream_recv_buf. The owner points
+        // only at this bounded scratch after teardown.
+        const u8* body = conn.upstream_recv_buf.data() + hdr_end;
+        memcpy(h2->pending_synth, body, body_len);
+        u8 response_scratch[8192];
+        H2Dispatch<Loop> d{loop, &conn, response_scratch, sizeof(response_scratch), 0, false};
+        if (!h2_stage_owned_response(d,
+                                     kStreamId,
+                                     resp.status_code,
+                                     hdrs,
+                                     nhdrs,
+                                     h2->pending_synth,
+                                     body_len,
+                                     H2OutboundBodySource::ProxySynth,
+                                     nullptr)) {
+            h2_proxy_fail(loop, conn, 502);
+            return;
+        }
+        h2_proxy_teardown_upstream(loop, conn);
+        h2_clear_async(*h2);
+        loop->timer.refresh(&conn, loop->keepalive_timeout);
+        conn.send_progress = 0;
+        conn.send_buf.reset();
+        if (conn.send_buf.write(response_scratch, d.resp_len) != d.resp_len) {
+            h2_clear_outbound(*h2);
+            loop->close_conn(conn);
+            return;
+        }
+        const u32 data_len =
+            h2_pump_outbound(*h2, conn.send_buf.write_ptr(), conn.send_buf.write_avail());
+        conn.send_buf.commit(data_len);
+        conn.keep_alive = true;
+        conn.transition_to_sending(&on_h2_sent<Loop>);
+        loop->submit_send(conn, conn.send_buf.data(), conn.send_buf.len());
+        return;
+    }
+
+    // Bodyless proxy responses retain the existing bounded header path.
     const u8* body = conn.upstream_recv_buf.data() + hdr_end;
     H2Dispatch<Loop> d{loop, &conn, h2->pending_synth, Http2Conn::kBodySynthCap, 0, false};
     // A re-framed response too large for the scratch buffer (large body OR large

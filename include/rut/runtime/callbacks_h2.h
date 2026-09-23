@@ -134,6 +134,7 @@ inline void h2_clear_outbound(Http2Conn& h2) {
     h2.outbound_body_len = 0;
     h2.outbound_body_offset = 0;
     h2.outbound_final_staged = false;
+    h2.outbound_source = H2OutboundBodySource::None;
 }
 
 // Append at most one DATA frame to a wire buffer. The caller must invoke this
@@ -182,6 +183,46 @@ inline bool h2_is_prohibited_response_header(const char* name, u32 len) {
 }
 
 template <typename Loop>
+bool h2_stage_owned_response(H2Dispatch<Loop>& d,
+                             u32 stream_id,
+                             u16 status,
+                             const hpack::Header* hdrs,
+                             u32 nhdrs,
+                             const u8* body,
+                             u32 body_len,
+                             H2OutboundBodySource source,
+                             const RouteConfig* cfg) {
+    Http2Conn& h2 = *d.conn->h2;
+    if (body_len == 0 || d.resp_len != 0 || h2.outbound_stream != 0 || !d.conn->epoch_held ||
+        h2.find_stream(stream_id) == nullptr)
+        return false;
+    if (source == H2OutboundBodySource::RouteConfig) {
+        if (cfg == nullptr || body == nullptr) return false;
+    } else if (source == H2OutboundBodySource::ProxySynth) {
+        if (body != h2.pending_synth || body_len > Http2Conn::kBodySynthCap ||
+            d.conn->h2_proxy_synth_quarantined)
+            return false;
+    } else {
+        return false;
+    }
+    auto enc = h2.hpack_enc;
+    const u32 n = http2_write_response_headers(
+        d.resp, d.resp_cap, enc, stream_id, status, hdrs, nhdrs, body_len, false);
+    if (n == 0) return false;
+    h2.hpack_enc = enc;
+    d.resp_len = n;
+    h2.outbound_stream = stream_id;
+    h2.outbound_config = cfg;
+    h2.outbound_body = body;
+    h2.outbound_body_len = body_len;
+    h2.outbound_body_offset = 0;
+    h2.outbound_final_staged = false;
+    h2.outbound_source = source;
+    h2.response_flush_pending = true;
+    return true;
+}
+
+template <typename Loop>
 void h2_emit_response(H2Dispatch<Loop>& d,
                       u32 stream_id,
                       u16 status,
@@ -189,44 +230,27 @@ void h2_emit_response(H2Dispatch<Loop>& d,
                       u32 nhdrs,
                       const u8* body,
                       u32 body_len,
-                      bool allow_fallback = true,
-                      bool borrow_body = false) {
+                      bool allow_fallback = true) {
     auto enc = d.conn->h2->hpack_enc;
-    const u32 kN = (body_len == 0 || !borrow_body) ? http2_write_response(d.resp + d.resp_len,
-                                                                          d.resp_cap - d.resp_len,
-                                                                          enc,
-                                                                          stream_id,
-                                                                          status,
-                                                                          hdrs,
-                                                                          nhdrs,
-                                                                          body,
-                                                                          body_len)
-                                                   : 0;
+    if (body_len != 0) {
+        d.overflow = true;
+        return;
+    }
+    const u32 kN = http2_write_response(d.resp + d.resp_len,
+                                        d.resp_cap - d.resp_len,
+                                        enc,
+                                        stream_id,
+                                        status,
+                                        hdrs,
+                                        nhdrs,
+                                        body,
+                                        body_len);
     if (kN != 0) {
         d.conn->h2->hpack_enc = enc;
         d.resp_len += kN;
         h2_close_stream(d.conn->h2, stream_id);
         d.conn->h2->response_flush_pending = true;
         return;
-    }
-    // Large local bodies are borrowed from RouteConfig and sent in bounded H2
-    // DATA frames after their nonterminal HEADERS frame. Keep the existing
-    // single-buffer path for small responses.
-    if (borrow_body && body_len != 0 && d.resp_len == 0) {
-        enc = d.conn->h2->hpack_enc;
-        const u32 kHeaders = http2_write_response_headers(
-            d.resp, d.resp_cap, enc, stream_id, status, hdrs, nhdrs, body_len, false);
-        if (kHeaders != 0) {
-            d.conn->h2->hpack_enc = enc;
-            d.resp_len = kHeaders;
-            d.conn->h2->outbound_stream = stream_id;
-            d.conn->h2->outbound_body = body;
-            d.conn->h2->outbound_body_len = body_len;
-            d.conn->h2->outbound_body_offset = 0;
-            d.conn->h2->outbound_final_staged = false;
-            d.conn->h2->response_flush_pending = true;
-            return;
-        }
     }
     // The response didn't fit. If it isn't the first frame in the batch, or the
     // caller opted out of the generic fallback (e.g. the proxy wants its own 502),
@@ -645,8 +669,20 @@ void h2_emit_outcome(H2Dispatch<Loop>& d,
             nhdrs++;
         }
     }
-    h2_emit_response(d, stream_id, o.status_code, hdrs, nhdrs, body, body_len, true, true);
-    if (d.conn->h2->outbound_stream == stream_id) d.conn->h2->outbound_config = cfg;
+    if (body_len != 0) {
+        if (!h2_stage_owned_response(d,
+                                     stream_id,
+                                     o.status_code,
+                                     hdrs,
+                                     nhdrs,
+                                     body,
+                                     body_len,
+                                     H2OutboundBodySource::RouteConfig,
+                                     cfg))
+            h2_emit_status(d, stream_id, 500);
+    } else {
+        h2_emit_response(d, stream_id, o.status_code, hdrs, nhdrs, nullptr, 0);
+    }
 }
 
 // An h2 stream going async (wait/proxy) must pin the RCU config epoch the same
