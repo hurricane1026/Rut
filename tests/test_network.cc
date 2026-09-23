@@ -8335,13 +8335,37 @@ TEST(http2, pending_body_then_owned_body_preserves_wire_hpack_order) {
     CHECK_EQ(h2.hpack_enc.dyn.byte_used, decoded.byte_used);
     CHECK_EQ(h2.hpack_enc.dyn.table_size, decoded.table_size);
     CHECK_EQ(memcmp(h2.hpack_enc.dyn.buf, decoded.buf, decoded.byte_used), 0);
+    u32 data_bytes_stream1 = 0;
+    u32 data_bytes_stream3 = 0;
+    bool data_end_stream1 = false;
+    bool data_end_stream3 = false;
     for (u32 sends = 0; sends < 16 && conn->send_buf.len() != 0; sends++) {
+        for (u32 cursor = 0; cursor < conn->send_buf.len();) {
+            Http2FrameHeader frame{};
+            REQUIRE_EQ(parse_frame_header(
+                           conn->send_buf.data() + cursor, conn->send_buf.len() - cursor, &frame),
+                       ParseStatus::Complete);
+            if (frame.type == static_cast<u8>(Http2FrameType::Data)) {
+                if (frame.stream_id == 1) {
+                    data_bytes_stream1 += frame.length;
+                    data_end_stream1 |= (frame.flags & http2_flag::kEndStream) != 0;
+                } else if (frame.stream_id == 3) {
+                    data_bytes_stream3 += frame.length;
+                    data_end_stream3 |= (frame.flags & http2_flag::kEndStream) != 0;
+                }
+            }
+            cursor += kFrameHeaderSize + frame.length;
+        }
         const u32 send_len = conn->send_buf.len();
         loop.backend.inject(make_ev(conn_id, IoEventType::Send, static_cast<i32>(send_len)));
         const u32 send_count = loop.backend.wait(events, 8);
         REQUIRE_EQ(send_count, 1u);
         for (u32 i = 0; i < send_count; i++) loop.dispatch(events[i]);
     }
+    CHECK_EQ(data_bytes_stream1, 9000u);
+    CHECK_EQ(data_bytes_stream3, 9000u);
+    CHECK(data_end_stream1);
+    CHECK(data_end_stream3);
     CHECK(conn->fd >= 0);
     CHECK_FALSE(conn->epoch_held);
 
