@@ -264,8 +264,7 @@ bool h2_stage_owned_response(H2Dispatch<Loop>& d,
                              H2OutboundBodySource source,
                              const RouteConfig* cfg) {
     Http2Conn& h2 = *d.conn->h2;
-    if (body_len == 0 || !d.conn->epoch_held || h2.find_stream(stream_id) == nullptr)
-        return false;
+    if (body_len == 0 || !d.conn->epoch_held || h2.find_stream(stream_id) == nullptr) return false;
     const bool queued = h2.outbound_stream != 0;
     if (queued && (h2.queued_stream != 0 || source != H2OutboundBodySource::RouteConfig))
         return false;
@@ -1601,8 +1600,8 @@ void h2_on_reset_dispatch_cb(void* ctx, Http2Conn& c, u32 stream_id, Http2Error 
     // A parked owner has no downstream send to drain, so its flush gate can be
     // released with the epoch. If this batch already staged response bytes, or
     // a send CQE is still outstanding, retain the gate until on_h2_sent clears it.
-    if (kOutboundOwner && c.outbound_stream == 0 && c.queued_stream == 0 &&
-        d->resp_len == 0 && !d->conn->send_armed)
+    if (kOutboundOwner && c.outbound_stream == 0 && c.queued_stream == 0 && d->resp_len == 0 &&
+        !d->conn->send_armed)
         c.response_flush_pending = false;
 }
 
@@ -1689,8 +1688,10 @@ void on_h2_sent(void* lp, Connection& conn, IoEvent ev) {
             if (conn.h2->queued_stream != 0) {
                 h2_promote_queued(*conn.h2);
                 H2PumpStatus queued_status = H2PumpStatus::Blocked;
-                const u32 queued_n = h2_pump_outbound(
-                    *conn.h2, conn.send_buf.write_ptr(), conn.send_buf.write_avail(), queued_status);
+                const u32 queued_n = h2_pump_outbound(*conn.h2,
+                                                      conn.send_buf.write_ptr(),
+                                                      conn.send_buf.write_avail(),
+                                                      queued_status);
                 if (queued_status == H2PumpStatus::Invalid) {
                     h2_clear_outbound(*conn.h2);
                     loop->close_conn(conn);
