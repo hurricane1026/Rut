@@ -6369,7 +6369,10 @@ void h2_proxy_flush(Loop* loop, Connection& conn, const u8* src, u32 resp_len) {
     conn.send_buf.write(src, resp_len);
     conn.keep_alive = true;
     conn.transition_to_sending(&on_h2_sent<Loop>);
-    loop->submit_send(conn, conn.send_buf.data(), conn.send_buf.len());
+    if (!loop->submit_send(conn, conn.send_buf.data(), conn.send_buf.len())) {
+        h2_clear_outbound(*conn.h2);
+        loop->close_conn(conn);
+    }
 }
 
 // Answer the suspended proxy stream with a synthetic status (502 upstream
@@ -6480,7 +6483,8 @@ void h2_proxy_finish(Loop* loop,
     }
     if (body_len != 0) {
         if (body_len > Http2Conn::kBodySynthCap || hdr_end > conn.upstream_recv_buf.len() ||
-            body_len > conn.upstream_recv_buf.len() - hdr_end ||
+            body_len > conn.upstream_recv_buf.len() - hdr_end || conn.upstream_send_armed ||
+            conn.on_upstream_send != nullptr || h2->async_synth_sent != h2->async_synth_len ||
             conn.h2_proxy_synth_quarantined || h2->outbound_stream != 0) {
             h2_proxy_fail(loop, conn, 502);
             return;
@@ -6518,7 +6522,10 @@ void h2_proxy_finish(Loop* loop,
         conn.send_buf.commit(data_len);
         conn.keep_alive = true;
         conn.transition_to_sending(&on_h2_sent<Loop>);
-        loop->submit_send(conn, conn.send_buf.data(), conn.send_buf.len());
+        if (!loop->submit_send(conn, conn.send_buf.data(), conn.send_buf.len())) {
+            h2_clear_outbound(*h2);
+            loop->close_conn(conn);
+        }
         return;
     }
 

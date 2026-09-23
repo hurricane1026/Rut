@@ -1520,7 +1520,10 @@ void on_h2_sent(void* lp, Connection& conn, IoEvent ev) {
         }
         const u32 kRemaining = kSendLen - conn.send_progress;
         conn.transition_to_sending(&on_h2_sent<Loop>);
-        loop->submit_send(conn, conn.send_buf.data() + conn.send_progress, kRemaining);
+        if (!loop->submit_send(conn, conn.send_buf.data() + conn.send_progress, kRemaining)) {
+            if (conn.h2) h2_clear_outbound(*conn.h2);
+            loop->close_conn(conn);
+        }
         return;
     }
 
@@ -1538,7 +1541,10 @@ void on_h2_sent(void* lp, Connection& conn, IoEvent ev) {
             conn.send_buf.commit(n);
             if (n != 0) {
                 conn.transition_to_sending(&on_h2_sent<Loop>);
-                loop->submit_send(conn, conn.send_buf.data(), conn.send_buf.len());
+                if (!loop->submit_send(conn, conn.send_buf.data(), conn.send_buf.len())) {
+                    h2_clear_outbound(*conn.h2);
+                    loop->close_conn(conn);
+                }
                 return;
             }
         }
@@ -1648,7 +1654,10 @@ void on_h2_data(void* lp, Connection& conn, IoEvent ev) {
         conn.send_buf.write(resp, d.resp_len);
         conn.keep_alive = true;
         conn.transition_to_sending(&on_h2_sent<Loop>);
-        loop->submit_send(conn, conn.send_buf.data(), conn.send_buf.len());
+        if (!loop->submit_send(conn, conn.send_buf.data(), conn.send_buf.len())) {
+            h2_clear_outbound(*conn.h2);
+            loop->close_conn(conn);
+        }
         return;
     }
 
@@ -1678,7 +1687,10 @@ void on_h2_data(void* lp, Connection& conn, IoEvent ev) {
     conn.send_buf.write(resp, d.resp_len);
     conn.keep_alive = !kClose;  // on_h2_sent closes the connection when false
     conn.transition_to_sending(&on_h2_sent<Loop>);
-    loop->submit_send(conn, conn.send_buf.data(), conn.send_buf.len());
+    if (!loop->submit_send(conn, conn.send_buf.data(), conn.send_buf.len())) {
+        h2_clear_outbound(*conn.h2);
+        loop->close_conn(conn);
+    }
 }
 
 // Switch a connection to HTTP/2 and process whatever bytes already arrived.
@@ -1764,7 +1776,10 @@ void h2_resume_jit_handler(Loop* loop, Connection& conn) {
         conn.send_buf.write(resp, d.resp_len);
         conn.keep_alive = true;
         conn.transition_to_sending(&on_h2_sent<Loop>);
-        loop->submit_send(conn, conn.send_buf.data(), conn.send_buf.len());
+        if (!loop->submit_send(conn, conn.send_buf.data(), conn.send_buf.len())) {
+            h2_clear_outbound(*h2);
+            loop->close_conn(conn);
+        }
         return;
     }
 
@@ -1799,7 +1814,10 @@ void h2_resume_jit_handler(Loop* loop, Connection& conn) {
         conn.send_buf.write(resp, d.resp_len);
         conn.keep_alive = true;
         conn.transition_to_sending(&on_h2_sent<Loop>);
-        loop->submit_send(conn, conn.send_buf.data(), conn.send_buf.len());
+        if (!loop->submit_send(conn, conn.send_buf.data(), conn.send_buf.len())) {
+            h2_clear_outbound(*h2);
+            loop->close_conn(conn);
+        }
         return;
     }
 
@@ -1905,7 +1923,10 @@ void h2_resume_jit_handler(Loop* loop, Connection& conn) {
         conn.send_buf.write(resp, d.resp_len);
         conn.keep_alive = true;
         conn.transition_to_sending(&on_h2_sent<Loop>);
-        loop->submit_send(conn, conn.send_buf.data(), conn.send_buf.len());
+        if (!loop->submit_send(conn, conn.send_buf.data(), conn.send_buf.len())) {
+            h2_clear_outbound(*h2);
+            loop->close_conn(conn);
+        }
         return;
     }
 
@@ -1937,7 +1958,10 @@ void h2_resume_jit_handler(Loop* loop, Connection& conn) {
     conn.send_buf.write(resp, d.resp_len);
     conn.keep_alive = true;
     conn.transition_to_sending(&on_h2_sent<Loop>);
-    loop->submit_send(conn, conn.send_buf.data(), conn.send_buf.len());
+    if (!loop->submit_send(conn, conn.send_buf.data(), conn.send_buf.len())) {
+        h2_clear_outbound(*h2);
+        loop->close_conn(conn);
+    }
 }
 
 }  // namespace rut

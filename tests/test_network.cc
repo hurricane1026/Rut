@@ -6759,6 +6759,55 @@ TEST(http2, nonempty_response_uses_flow_controlled_data_owner) {
     CHECK_EQ(h2.streams[0].send_window, static_cast<i32>(kDefaultInitialWindowSize - sizeof(body)));
 }
 
+TEST(http2, proxy_synth_owner_is_transactional_and_pinned) {
+    SmallLoop loop;
+    loop.setup();
+    auto* conn = loop.alloc_conn();
+    REQUIRE(conn != nullptr);
+    Http2Conn h2{};
+    h2.init();
+    h2.nstreams = 1;
+    h2.streams[0] = {1,
+                     Http2StreamState::Open,
+                     static_cast<i32>(kDefaultInitialWindowSize),
+                     static_cast<i32>(kDefaultInitialWindowSize),
+                     true};
+    conn->h2 = &h2;
+    conn->epoch_held = true;
+    const u8 body[] = "proxy-body";
+    memcpy(h2.pending_synth, body, sizeof(body) - 1);
+    u8 response[1024]{};
+    H2Dispatch<SmallLoop> dispatch{&loop, conn, response, sizeof(response), 0, false, false};
+    REQUIRE(h2_stage_owned_response(dispatch,
+                                    1,
+                                    200,
+                                    nullptr,
+                                    0,
+                                    h2.pending_synth,
+                                    sizeof(body) - 1,
+                                    H2OutboundBodySource::ProxySynth,
+                                    nullptr));
+    CHECK_EQ(h2.outbound_source, H2OutboundBodySource::ProxySynth);
+    CHECK_EQ(h2.outbound_body, h2.pending_synth);
+    CHECK_EQ(h2.outbound_body_len, sizeof(body) - 1);
+    CHECK(dispatch.resp_len > 0u);
+
+    h2_clear_outbound(h2);
+    conn->h2_proxy_synth_quarantined = true;
+    H2Dispatch<SmallLoop> rejected{&loop, conn, response, sizeof(response), 0, false, false};
+    CHECK_FALSE(h2_stage_owned_response(rejected,
+                                        1,
+                                        200,
+                                        nullptr,
+                                        0,
+                                        h2.pending_synth,
+                                        sizeof(body) - 1,
+                                        H2OutboundBodySource::ProxySynth,
+                                        nullptr));
+    CHECK_EQ(rejected.resp_len, 0u);
+    CHECK_EQ(h2.outbound_stream, 0u);
+}
+
 TEST(http2, rst_owner_clears_parked_flush_gate_but_preserves_staged_send_gate) {
     SmallLoop loop;
     loop.setup();
