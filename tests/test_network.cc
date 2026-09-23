@@ -11248,15 +11248,16 @@ TEST(slice_conn, buffers_usable_through_request_cycle) {
 }
 
 TEST(slice_conn, real_eventloop_pool_init) {
-    // Verify real EventLoop allocates pool with 3*kMaxConns slices.
+    // Verify real EventLoop reserves ordinary buffers plus one shard-wide
+    // maximum buffered response chain.
     RealLoop* loop = create_real_loop();
     REQUIRE(loop != nullptr);
     auto rc = loop->init(0, -1);
     REQUIRE(rc.has_value());
 
-    // Lazy commit: pool starts empty, max set to 5 * kMaxConns (recv + send + upstream +
-    // the two WebSocket terminate-mode reassembly slices).
-    CHECK_EQ(loop->pool.max_count, RealLoop::kMaxConns * 6);
+    // Lazy commit: pool starts empty; six ordinary slices per connection plus
+    // one 1 MiB response-chain reserve are VA-reserved.
+    CHECK_EQ(loop->pool.max_count, SlicePool::capacity_for_connections(RealLoop::kMaxConns));
     CHECK_EQ(loop->pool.count, 0u);
 
     // Alloc a connection — triggers lazy grow, consumes 2 slices
@@ -18321,15 +18322,15 @@ TEST(buffer_isolation, client_data_during_proxy_ignored) {
     CHECK_EQ(conn->on_upstream_recv, saved_recv);
 }
 
-// Pool sized for 3 slices per connection (recv + send + upstream_recv).
-TEST(buffer_isolation, pool_sized_for_six_slices) {
+// Pool sized for six ordinary slices per connection plus one shard-wide
+// maximum buffered response-chain reserve.
+TEST(buffer_isolation, pool_sized_for_connection_and_response_reserve) {
     RealLoop* loop = create_real_loop();
     REQUIRE(loop != nullptr);
     auto rc = loop->init(0, -1);
     REQUIRE(rc.has_value());
 
-    // recv + send + upstream_recv + the two WebSocket terminate reassembly slices.
-    CHECK_EQ(loop->pool.max_count, RealLoop::kMaxConns * 6);
+    CHECK_EQ(loop->pool.max_count, SlicePool::capacity_for_connections(RealLoop::kMaxConns));
 
     loop->shutdown();
     destroy_real_loop(loop);
@@ -33059,8 +33060,8 @@ bool stage_live_precise_request(IoUringEventLoop* loop,
     const u8* request = bodyless_get ? (downstream_close ? kGetCloseRequest : kGetKeepAliveRequest)
                         : downstream_close ? kCloseRequest
                                            : kKeepAliveRequest;
-    const u32 request_len = bodyless_get ? (downstream_close ? sizeof(kGetCloseRequest) - 1u
-                                                             : sizeof(kGetKeepAliveRequest) - 1u)
+    const u32 request_len = bodyless_get       ? (downstream_close ? sizeof(kGetCloseRequest) - 1u
+                                                                   : sizeof(kGetKeepAliveRequest) - 1u)
                             : downstream_close ? sizeof(kCloseRequest) - 1u
                                                : sizeof(kKeepAliveRequest) - 1u;
     if (conn->recv_buf.write(request, request_len) != request_len) return fail();
