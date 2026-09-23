@@ -99,6 +99,27 @@ struct H2Dispatch {
     // request connection close, but must not reclaim the connection while the
     // engine is still walking coalesced frames on its stack.
     bool close_after_process = false;
+    u32 owned_stream = 0;
+    u32 owned_resp_begin = 0;
+    // Bodyful staging assigns the current connection encoder before using this
+    // pending state; bodyless dispatches never read it.
+    hpack::Encoder owned_hpack_after;
+    bool owned_hpack_pending = false;
+
+    H2Dispatch(Loop* loop_,
+               Connection* conn_,
+               u8* resp_,
+               u32 resp_cap_,
+               u32 resp_len_,
+               bool overflow_,
+               bool close_after_process_ = false)
+        : loop(loop_),
+          conn(conn_),
+          resp(resp_),
+          resp_cap(resp_cap_),
+          resp_len(resp_len_),
+          overflow(overflow_),
+          close_after_process(close_after_process_) {}
 };
 
 // Append a response (HEADERS + optional DATA body) for a stream, encoded with
@@ -224,7 +245,10 @@ bool h2_stage_owned_response(H2Dispatch<Loop>& d,
         d.overflow = true;
         return false;
     }
-    auto enc = h2.hpack_enc;
+    d.owned_stream = stream_id;
+    d.owned_resp_begin = d.resp_len;
+    d.owned_hpack_after = h2.hpack_enc;
+    auto& enc = d.owned_hpack_after;
     const u32 n = http2_write_response_headers(d.resp + d.resp_len,
                                                d.resp_cap - d.resp_len,
                                                enc,
@@ -238,8 +262,8 @@ bool h2_stage_owned_response(H2Dispatch<Loop>& d,
         if (d.resp_len != 0) d.overflow = true;
         return false;
     }
-    h2.hpack_enc = enc;
     d.resp_len += n;
+    d.owned_hpack_pending = true;
     h2.outbound_stream = stream_id;
     h2.outbound_config = cfg;
     h2.outbound_body = body;
@@ -249,6 +273,13 @@ bool h2_stage_owned_response(H2Dispatch<Loop>& d,
     h2.outbound_source = source;
     h2.response_flush_pending = true;
     return true;
+}
+
+template <typename Loop>
+inline void h2_commit_owned_hpack(H2Dispatch<Loop>& d) {
+    if (!d.owned_hpack_pending) return;
+    d.conn->h2->hpack_enc = d.owned_hpack_after;
+    d.owned_hpack_pending = false;
 }
 
 template <typename Loop>
@@ -1473,6 +1504,11 @@ void h2_on_reset_dispatch_cb(void* ctx, Http2Conn& c, u32 stream_id, Http2Error 
     auto* d = static_cast<H2Dispatch<Loop>*>(ctx);
     const bool kOutboundOwner = c.outbound_stream == stream_id;
     if (d->close_after_process) return;
+    if (kOutboundOwner && d->owned_hpack_pending && d->owned_stream == stream_id) {
+        d->resp_len = d->owned_resp_begin;
+        d->owned_hpack_pending = false;
+        d->owned_stream = 0;
+    }
     h2_on_reset_cb(ctx, c, stream_id, err);
     // A parked owner has no downstream send to drain, so its flush gate can be
     // released with the epoch. If this batch already staged response bytes, or
@@ -1648,6 +1684,7 @@ void on_h2_data(void* lp, Connection& conn, IoEvent ev) {
         loop->close_conn(conn);
         return;
     }
+    h2_commit_owned_hpack(d);
 
     // Compact unconsumed bytes (a partial trailing frame) to the front so the
     // next recv appends after them.
@@ -1987,6 +2024,7 @@ void h2_resume_jit_handler(Loop* loop, Connection& conn) {
         }
         d.resp_len += kN;
     }
+    h2_commit_owned_hpack(d);
 
     // Clear the suspension before responding so the flush's on_h2_sent re-arms
     // recv (async_stream == 0) rather than the timer. The async episode is over —

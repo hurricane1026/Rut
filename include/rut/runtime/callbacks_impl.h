@@ -6507,6 +6507,7 @@ void h2_proxy_finish(Loop* loop,
             h2_proxy_fail(loop, conn, 502);
             return;
         }
+        h2_commit_owned_hpack(d);
         h2_proxy_teardown_upstream(loop, conn);
         h2_clear_async(*h2);
         loop->timer.refresh(&conn, loop->keepalive_timeout);
