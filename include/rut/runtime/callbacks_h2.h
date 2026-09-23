@@ -102,6 +102,8 @@ struct H2Dispatch {
     u32 owned_stream = 0;
     u32 owned_resp_begin = 0;
     u32 owned_resp_end = 0;
+    u32 queued_resp_begin = 0;
+    u32 queued_resp_end = 0;
     // Bodyful staging assigns the current connection encoder before using this
     // pending state; bodyless dispatches never read it.
     hpack::Encoder owned_hpack_after;
@@ -149,7 +151,24 @@ inline void h2_close_stream(Http2Conn* h2, u32 stream_id) {
     }
 }
 
-inline void h2_clear_outbound(Http2Conn& h2) {
+inline void h2_promote_queued(Http2Conn& h2) {
+    h2.outbound_stream = h2.queued_stream;
+    h2.outbound_config = h2.queued_config;
+    h2.outbound_body = h2.queued_body;
+    h2.outbound_body_len = h2.queued_body_len;
+    h2.outbound_body_offset = h2.queued_body_offset;
+    h2.outbound_final_staged = h2.queued_final_staged;
+    h2.outbound_source = h2.queued_source;
+    h2.queued_stream = 0;
+    h2.queued_config = nullptr;
+    h2.queued_body = nullptr;
+    h2.queued_body_len = 0;
+    h2.queued_body_offset = 0;
+    h2.queued_final_staged = false;
+    h2.queued_source = H2OutboundBodySource::None;
+}
+
+inline void h2_clear_primary_outbound(Http2Conn& h2) {
     h2.outbound_stream = 0;
     h2.outbound_config = nullptr;
     h2.outbound_body = nullptr;
@@ -157,6 +176,21 @@ inline void h2_clear_outbound(Http2Conn& h2) {
     h2.outbound_body_offset = 0;
     h2.outbound_final_staged = false;
     h2.outbound_source = H2OutboundBodySource::None;
+}
+
+inline void h2_clear_queued_outbound(Http2Conn& h2) {
+    h2.queued_stream = 0;
+    h2.queued_config = nullptr;
+    h2.queued_body = nullptr;
+    h2.queued_body_len = 0;
+    h2.queued_body_offset = 0;
+    h2.queued_final_staged = false;
+    h2.queued_source = H2OutboundBodySource::None;
+}
+
+inline void h2_clear_outbound(Http2Conn& h2) {
+    h2_clear_primary_outbound(h2);
+    h2_clear_queued_outbound(h2);
 }
 
 enum class H2PumpStatus : u8 { Blocked, Produced, Invalid };
@@ -230,8 +264,10 @@ bool h2_stage_owned_response(H2Dispatch<Loop>& d,
                              H2OutboundBodySource source,
                              const RouteConfig* cfg) {
     Http2Conn& h2 = *d.conn->h2;
-    if (body_len == 0 || h2.outbound_stream != 0 || !d.conn->epoch_held ||
-        h2.find_stream(stream_id) == nullptr)
+    if (body_len == 0 || !d.conn->epoch_held || h2.find_stream(stream_id) == nullptr)
+        return false;
+    const bool queued = h2.outbound_stream != 0;
+    if (queued && (h2.queued_stream != 0 || source != H2OutboundBodySource::RouteConfig))
         return false;
     if (source == H2OutboundBodySource::RouteConfig) {
         if (cfg == nullptr || body == nullptr) return false;
@@ -246,9 +282,14 @@ bool h2_stage_owned_response(H2Dispatch<Loop>& d,
         d.overflow = true;
         return false;
     }
-    d.owned_stream = stream_id;
-    d.owned_resp_begin = d.resp_len;
-    d.owned_hpack_after = h2.hpack_enc;
+    if (queued) {
+        d.queued_resp_begin = d.resp_len;
+    } else {
+        d.owned_stream = stream_id;
+        d.owned_resp_begin = d.resp_len;
+        d.owned_hpack_after = h2.hpack_enc;
+    }
+    if (!d.owned_hpack_pending) d.owned_hpack_after = h2.hpack_enc;
     auto& enc = d.owned_hpack_after;
     const u32 n = http2_write_response_headers(d.resp + d.resp_len,
                                                d.resp_cap - d.resp_len,
@@ -264,15 +305,26 @@ bool h2_stage_owned_response(H2Dispatch<Loop>& d,
         return false;
     }
     d.resp_len += n;
-    d.owned_resp_end = d.resp_len;
+    if (queued) {
+        d.queued_resp_end = d.resp_len;
+        h2.queued_stream = stream_id;
+        h2.queued_config = cfg;
+        h2.queued_body = body;
+        h2.queued_body_len = body_len;
+        h2.queued_body_offset = 0;
+        h2.queued_final_staged = false;
+        h2.queued_source = source;
+    } else {
+        d.owned_resp_end = d.resp_len;
+        h2.outbound_stream = stream_id;
+        h2.outbound_config = cfg;
+        h2.outbound_body = body;
+        h2.outbound_body_len = body_len;
+        h2.outbound_body_offset = 0;
+        h2.outbound_final_staged = false;
+        h2.outbound_source = source;
+    }
     d.owned_hpack_pending = true;
-    h2.outbound_stream = stream_id;
-    h2.outbound_config = cfg;
-    h2.outbound_body = body;
-    h2.outbound_body_len = body_len;
-    h2.outbound_body_offset = 0;
-    h2.outbound_final_staged = false;
-    h2.outbound_source = source;
     h2.response_flush_pending = true;
     return true;
 }
@@ -1504,7 +1556,15 @@ void h2_on_data_cb(
 inline void h2_on_reset_cb(void* ctx, Http2Conn& c, u32 stream_id, Http2Error /*err*/) {
     (void)ctx;
     if (c.async_stream != 0 && c.async_stream == stream_id) h2_clear_async(c);
-    if (c.outbound_stream == stream_id) h2_clear_outbound(c);
+    if (c.outbound_stream == stream_id) {
+        if (c.queued_stream != 0) {
+            h2_close_stream(&c, stream_id);
+            h2_clear_primary_outbound(c);
+            h2_promote_queued(c);
+        } else {
+            h2_clear_outbound(c);
+        }
+    }
 }
 
 template <typename Loop>
@@ -1526,11 +1586,23 @@ void h2_on_reset_dispatch_cb(void* ctx, Http2Conn& c, u32 stream_id, Http2Error 
             d->owned_stream = 0;
         }
     }
+    if (c.queued_stream == stream_id) {
+        if (d->owned_hpack_pending && d->queued_resp_end != 0) {
+            // A same-batch queued response is an HPACK suffix; discard the
+            // complete batch before any bytes are submitted.
+            d->close_after_process = true;
+            h2_clear_outbound(c);
+            d->owned_hpack_pending = false;
+        } else {
+            h2_clear_queued_outbound(c);
+        }
+    }
     h2_on_reset_cb(ctx, c, stream_id, err);
     // A parked owner has no downstream send to drain, so its flush gate can be
     // released with the epoch. If this batch already staged response bytes, or
     // a send CQE is still outstanding, retain the gate until on_h2_sent clears it.
-    if (kOutboundOwner && d->resp_len == 0 && !d->conn->send_armed)
+    if (kOutboundOwner && c.outbound_stream == 0 && c.queued_stream == 0 &&
+        d->resp_len == 0 && !d->conn->send_armed)
         c.response_flush_pending = false;
 }
 
@@ -1614,8 +1686,29 @@ void on_h2_sent(void* lp, Connection& conn, IoEvent ev) {
         if (conn.h2->outbound_final_staged) {
             const u32 stream_id = conn.h2->outbound_stream;
             h2_close_stream(conn.h2, stream_id);
-            h2_clear_outbound(*conn.h2);
-            h2_async_epoch_leave(loop, conn);
+            if (conn.h2->queued_stream != 0) {
+                h2_promote_queued(*conn.h2);
+                H2PumpStatus queued_status = H2PumpStatus::Blocked;
+                const u32 queued_n = h2_pump_outbound(
+                    *conn.h2, conn.send_buf.write_ptr(), conn.send_buf.write_avail(), queued_status);
+                if (queued_status == H2PumpStatus::Invalid) {
+                    h2_clear_outbound(*conn.h2);
+                    loop->close_conn(conn);
+                    return;
+                }
+                conn.send_buf.commit(queued_n);
+                if (queued_n != 0) {
+                    conn.transition_to_sending(&on_h2_sent<Loop>);
+                    if (!loop->submit_send(conn, conn.send_buf.data(), conn.send_buf.len())) {
+                        h2_clear_outbound(*conn.h2);
+                        loop->close_conn(conn);
+                    }
+                    return;
+                }
+            } else {
+                h2_clear_outbound(*conn.h2);
+                h2_async_epoch_leave(loop, conn);
+            }
         } else {
             H2PumpStatus pump_status = H2PumpStatus::Blocked;
             const u32 n = h2_pump_outbound(
@@ -1698,6 +1791,7 @@ void on_h2_data(void* lp, Connection& conn, IoEvent ev) {
         conn.h2->process(conn.recv_buf.data(), conn.recv_buf.len(), ctrl, sizeof(ctrl), &ctrl_len);
 
     if (d.close_after_process) {
+        h2_clear_outbound(*conn.h2);
         loop->close_conn(conn);
         return;
     }

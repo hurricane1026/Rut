@@ -7759,9 +7759,9 @@ static u64 staged_next_route_handler(void*, jit::HandlerCtx*, const u8*, u32, vo
     return jit::HandlerResult::make_status(204).pack();
 }
 
-static u64 h2_pending_bodyless_header_handler(void*, jit::HandlerCtx*, const u8*, u32, void*) {
-    auto result = jit::HandlerResult::make_status(204);
-    result.next_state = 1;
+static u64 h2_pending_bodyful_header_handler(void*, jit::HandlerCtx*, const u8*, u32, void*) {
+    auto result =
+        jit::HandlerResult{jit::HandlerAction::ReturnStatus, 200, 1, 1, jit::YieldKind::HttpGet};
     return result.pack();
 }
 
@@ -8246,7 +8246,7 @@ TEST(http2, pending_body_then_owned_body_preserves_wire_hpack_order) {
     REQUIRE_EQ(config.add_response_header_set(
                    owner_names, owner_name_lens, owner_values, owner_value_lens, 1),
                2u);
-    REQUIRE_EQ(config.add_jit_handler("/pending", 'P', &h2_pending_bodyless_header_handler, true),
+    REQUIRE_EQ(config.add_jit_handler("/pending", 'P', &h2_pending_bodyful_header_handler, true),
                1u);
     REQUIRE_EQ(
         config.add_jit_handler("/body", kRouteMethodGet, &h2_owned_body_header_handler, false), 1u);
@@ -8335,7 +8335,7 @@ TEST(http2, pending_body_then_owned_body_preserves_wire_hpack_order) {
     CHECK_EQ(h2.hpack_enc.dyn.byte_used, decoded.byte_used);
     CHECK_EQ(h2.hpack_enc.dyn.table_size, decoded.table_size);
     CHECK_EQ(memcmp(h2.hpack_enc.dyn.buf, decoded.buf, decoded.byte_used), 0);
-    for (u32 sends = 0; sends < 4 && conn->send_buf.len() != 0; sends++) {
+    for (u32 sends = 0; sends < 16 && conn->send_buf.len() != 0; sends++) {
         const u32 send_len = conn->send_buf.len();
         loop.backend.inject(make_ev(conn_id, IoEventType::Send, static_cast<i32>(send_len)));
         const u32 send_count = loop.backend.wait(events, 8);

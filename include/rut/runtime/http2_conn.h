@@ -185,6 +185,13 @@ struct Http2Conn {
     u32 outbound_body_offset;
     bool outbound_final_staged;
     H2OutboundBodySource outbound_source;
+    u32 queued_stream;
+    const RouteConfig* queued_config;
+    const u8* queued_body;
+    u32 queued_body_len;
+    u32 queued_body_offset;
+    bool queued_final_staged;
+    H2OutboundBodySource queued_source;
     bool response_flush_pending;
 
     // Set callbacks (any may be null) then call init().

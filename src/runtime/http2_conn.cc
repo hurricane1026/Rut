@@ -75,6 +75,13 @@ void Http2Conn::init() {
     outbound_body_offset = 0;
     outbound_final_staged = false;
     outbound_source = H2OutboundBodySource::None;
+    queued_stream = 0;
+    queued_config = nullptr;
+    queued_body = nullptr;
+    queued_body_len = 0;
+    queued_body_offset = 0;
+    queued_final_staged = false;
+    queued_source = H2OutboundBodySource::None;
     response_flush_pending = false;
 }
 
