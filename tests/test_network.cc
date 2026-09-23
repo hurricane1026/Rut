@@ -56966,6 +56966,14 @@ TEST(response_buffering_runtime,
 
     const IoEvent second_body_sent = exact_response_deadline_send_event(loop, conn);
     loop->dispatch_batch(&second_body_sent, 1);
+    REQUIRE_GE(conn.fd, 0);
+    REQUIRE_EQ(conn.upstream_fd, -1);
+    REQUIRE_EQ(conn.state, ConnState::ReadingHeader);
+    REQUIRE(conn.recv_armed);
+    REQUIRE(conn.on_recv == &on_header_received<IoUringEventLoop>);
+    REQUIRE_EQ(conn.response_read_deadline_state, ResponseReadDeadlineState::None);
+    REQUIRE_EQ(conn.response_read_deadline_post_commit_phase,
+               ResponseReadDeadlinePostCommitPhase::None);
     REQUIRE_EQ(conn.response_body_tail.size, 0u);
     REQUIRE_FALSE(conn.send_armed);
     cleanup_prebuilt_d2(loop, fixture);
