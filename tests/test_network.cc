@@ -8331,6 +8331,10 @@ TEST(http2, pending_body_then_owned_body_preserves_wire_hpack_order) {
     CHECK(saw_pending);
     CHECK(saw_owner);
     CHECK_GT(h2.hpack_enc.dyn.nent, 0u);
+    CHECK_EQ(h2.hpack_enc.dyn.nent, decoded.nent);
+    CHECK_EQ(h2.hpack_enc.dyn.byte_used, decoded.byte_used);
+    CHECK_EQ(h2.hpack_enc.dyn.table_size, decoded.table_size);
+    CHECK_EQ(memcmp(h2.hpack_enc.dyn.buf, decoded.buf, decoded.byte_used), 0);
     for (u32 sends = 0; sends < 4 && conn->send_buf.len() != 0; sends++) {
         const u32 send_len = conn->send_buf.len();
         loop.backend.inject(make_ev(conn_id, IoEventType::Send, static_cast<i32>(send_len)));
@@ -8340,6 +8344,38 @@ TEST(http2, pending_body_then_owned_body_preserves_wire_hpack_order) {
     }
     CHECK(conn->fd >= 0);
     CHECK_FALSE(conn->epoch_held);
+
+    Http2FrameHeader reset{};
+    reset.length = 4;
+    reset.type = static_cast<u8>(Http2FrameType::RstStream);
+    reset.stream_id = 3;
+    write_frame_header(input + input_len, reset);
+    memset(input + input_len + kFrameHeaderSize, 0, 4);
+    const u32 reset_len = input_len + kFrameHeaderSize + 4;
+    SmallLoop rst_loop;
+    rst_loop.setup();
+    rst_loop.config_ptr = &active;
+    ShardEpoch rst_epoch{};
+    rst_loop.epoch = &rst_epoch;
+    Connection* rst_conn = rst_loop.alloc_conn();
+    REQUIRE(rst_conn != nullptr);
+    rst_conn->fd = 43;
+    const u32 rst_id = rst_conn->id;
+    Http2Conn rst_h2{};
+    rst_h2.init();
+    rst_conn->h2 = &rst_h2;
+    REQUIRE_EQ(rst_conn->recv_buf.write(input, reset_len), reset_len);
+    rst_conn->transition_to_reading_header(&on_h2_data<SmallLoop>);
+    REQUIRE(rst_loop.submit_recv(*rst_conn));
+    rst_loop.backend.inject(make_ev(rst_id, IoEventType::Recv, static_cast<i32>(reset_len)));
+    IoEvent rst_events[8];
+    const u32 rst_count = rst_loop.backend.wait(rst_events, 8);
+    REQUIRE_EQ(rst_count, 1u);
+    for (u32 i = 0; i < rst_count; i++) rst_loop.dispatch(rst_events[i]);
+    CHECK_EQ(rst_h2.outbound_stream, 0u);
+    CHECK_FALSE(rst_conn->epoch_held);
+    CHECK_EQ(rst_loop.backend.count_ops(MockOp::Send), 0u);
+    CHECK_EQ(rst_loop.free_top, SmallLoop::kMaxConns);
 }
 
 TEST(http2, bodyless_then_bodyful_owner_rolls_back_on_peer_reset) {
