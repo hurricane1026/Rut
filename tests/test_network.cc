@@ -7169,6 +7169,106 @@ TEST(http2, proxy_finish_guarded_failure_preserves_pending_synth) {
     run(false, false, false, true);
 }
 
+struct H2InitialSubmitCaptureLoop : SmallLoop {
+    bool saw_owner = false;
+    bool saw_proxy_source = false;
+    bool saw_status_200 = false;
+    bool saw_data_abc = false;
+    u32 submit_calls = 0;
+
+    void close_conn(Connection& conn) {
+        if (conn.epoch_held) {
+            epoch_leave();
+            conn.epoch_held = false;
+        }
+        close_conn_impl(conn);
+    }
+
+    bool submit_send(Connection& conn, const u8* buf, u32 len) {
+        submit_calls++;
+        if (conn.h2 != nullptr) {
+            saw_owner = conn.h2->outbound_stream == 1 &&
+                        conn.h2->outbound_body == conn.h2->pending_synth;
+            saw_proxy_source = conn.h2->outbound_source == H2OutboundBodySource::ProxySynth;
+        }
+        Http2FrameHeader frame{};
+        if (parse_frame_header(buf, len, &frame) == ParseStatus::Complete &&
+            frame.type == static_cast<u8>(Http2FrameType::Headers)) {
+            hpack::DynamicTable decoded;
+            decoded.init(kDefaultHeaderTableSize);
+            hpack::Header headers[8];
+            u8 scratch[256]{};
+            u32 count = 0;
+            if (hpack::decode_header_block(decoded,
+                                           buf + kFrameHeaderSize,
+                                           frame.length,
+                                           scratch,
+                                           sizeof(scratch),
+                                           headers,
+                                           8,
+                                           &count)) {
+                for (u32 i = 0; i < count; i++)
+                    saw_status_200 |= headers[i].name.eq({":status", 7}) &&
+                                      headers[i].value.eq({"200", 3});
+            }
+            const u32 data_offset = kFrameHeaderSize + frame.length;
+            Http2FrameHeader data{};
+            if (data_offset <= len &&
+                parse_frame_header(buf + data_offset, len - data_offset, &data) ==
+                    ParseStatus::Complete &&
+                data.type == static_cast<u8>(Http2FrameType::Data) && data.stream_id == 1 &&
+                data.length == 3 && (data.flags & http2_flag::kEndStream) != 0 &&
+                len >= data_offset + kFrameHeaderSize + 3)
+                saw_data_abc =
+                    memcmp(buf + data_offset + kFrameHeaderSize, "abc", 3) == 0;
+        }
+        return false;
+    }
+};
+
+TEST(http2, initial_owned_submit_failure_captures_proxy_body_headers) {
+    H2InitialSubmitCaptureLoop loop;
+    loop.setup();
+    auto* conn = loop.alloc_conn();
+    REQUIRE(conn != nullptr);
+    Http2Conn h2{};
+    h2.init();
+    h2.nstreams = 1;
+    h2.streams[0] = {1,
+                     Http2StreamState::Open,
+                     static_cast<i32>(kDefaultInitialWindowSize),
+                     static_cast<i32>(kDefaultInitialWindowSize),
+                     true};
+    h2.async_stream = 1;
+    h2.preface_seen = true;
+    h2.our_settings_sent = true;
+    conn->h2 = &h2;
+    conn->epoch_held = true;
+    conn->req_start_us = 1;
+    static u8 upstream[256];
+    const char response[] = "HTTP/1.1 200 OK\r\nContent-Length: 3\r\n\r\nabc";
+    constexpr u32 kHeaderLen = sizeof(response) - 1 - 3;
+    memcpy(upstream, response, sizeof(response) - 1);
+    conn->upstream_recv_buf.bind(upstream, sizeof(upstream));
+    conn->upstream_recv_buf.commit(sizeof(response) - 1);
+    ParsedResponse parsed{};
+    parsed.reset();
+    parsed.status_code = 200;
+    parsed.version = HttpVersion::Http11;
+    parsed.has_content_length = true;
+    parsed.content_length = 3;
+
+    h2_proxy_finish(&loop, *conn, parsed, kHeaderLen, 3, false);
+    CHECK_EQ(loop.submit_calls, 1u);
+    CHECK(h2.outbound_stream == 0);
+    CHECK(loop.saw_owner);
+    CHECK(loop.saw_proxy_source);
+    CHECK(loop.saw_status_200);
+    CHECK(loop.saw_data_abc);
+    CHECK_FALSE(conn->epoch_held);
+    CHECK_EQ(loop.free_top, SmallLoop::kMaxConns);
+}
+
 TEST(http2, owned_response_submit_failures_release_owner_and_epoch) {
     SmallLoop loop;
     loop.setup();
