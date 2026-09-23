@@ -821,7 +821,7 @@ void h2_async_epoch_enter(Loop* loop, Connection& conn) {
 template <typename Loop>
 void h2_async_epoch_leave(Loop* loop, Connection& conn) {
     if (conn.h2 != nullptr && (conn.h2->async_stream != 0 || conn.h2->pending_stream != 0 ||
-                               conn.h2->outbound_stream != 0))
+                               conn.h2->outbound_stream != 0 || conn.h2->queued_stream != 0))
         return;
     if (conn.epoch_held) {
         loop->epoch_leave();
@@ -1708,8 +1708,7 @@ void on_h2_sent(void* lp, Connection& conn, IoEvent ev) {
                 }
             } else {
                 h2_clear_outbound(*conn.h2);
-                if (conn.h2->outbound_stream == 0 && conn.h2->queued_stream == 0)
-                    h2_async_epoch_leave(loop, conn);
+                h2_async_epoch_leave(loop, conn);
             }
         } else {
             H2PumpStatus pump_status = H2PumpStatus::Blocked;
@@ -1856,9 +1855,7 @@ void on_h2_data(void* lp, Connection& conn, IoEvent ev) {
     // (close_conn releases it). The leave is idempotent, so a later close_conn is
     // a harmless no-op.
     if (conn.h2->async_stream == 0 && conn.h2->pending_stream == 0)
-        if (conn.h2->outbound_stream == 0 && conn.h2->queued_stream == 0)
-            if (conn.h2->outbound_stream == 0 && conn.h2->queued_stream == 0)
-                h2_async_epoch_leave(loop, conn);
+        h2_async_epoch_leave(loop, conn);
 
     // No output and a partial frame that fills the whole recv buffer => the peer
     // sent a frame larger than we can buffer. Fail closed.
@@ -1957,9 +1954,7 @@ void h2_resume_jit_handler(Loop* loop, Connection& conn) {
         h2_emit_status(d, kStreamId, 400);
         conn.pending_handler_fn = nullptr;
         h2_clear_async(*h2);
-        if (conn.h2->outbound_stream == 0 && conn.h2->queued_stream == 0)
-            if (conn.h2->outbound_stream == 0 && conn.h2->queued_stream == 0)
-                h2_async_epoch_leave(loop, conn);
+        h2_async_epoch_leave(loop, conn);
         if (d.resp_len == 0 || d.overflow) {
             loop->close_conn(conn);
             return;
@@ -1997,9 +1992,7 @@ void h2_resume_jit_handler(Loop* loop, Connection& conn) {
         h2_emit_status(d, kStreamId, 400);
         conn.pending_handler_fn = nullptr;
         h2_clear_async(*h2);
-        if (conn.h2->outbound_stream == 0 && conn.h2->queued_stream == 0)
-            if (conn.h2->outbound_stream == 0 && conn.h2->queued_stream == 0)
-                h2_async_epoch_leave(loop, conn);
+        h2_async_epoch_leave(loop, conn);
         if (d.resp_len == 0 || d.overflow) {
             loop->close_conn(conn);
             return;
@@ -2108,9 +2101,7 @@ void h2_resume_jit_handler(Loop* loop, Connection& conn) {
         h2_emit_status(d, kStreamId, failure_status);
         conn.pending_handler_fn = nullptr;
         h2_clear_async(*h2);
-        if (conn.h2->outbound_stream == 0 && conn.h2->queued_stream == 0)
-            if (conn.h2->outbound_stream == 0 && conn.h2->queued_stream == 0)
-                h2_async_epoch_leave(loop, conn);
+        h2_async_epoch_leave(loop, conn);
         if (d.resp_len == 0 || d.overflow) {
             loop->close_conn(conn);
             return;
@@ -2152,8 +2143,7 @@ void h2_resume_jit_handler(Loop* loop, Connection& conn) {
     // release the config epoch pinned at park time.
     conn.pending_handler_fn = nullptr;
     h2_clear_async(*h2);
-    if (conn.h2->outbound_stream == 0 && conn.h2->queued_stream == 0)
-        h2_async_epoch_leave(loop, conn);
+    h2_async_epoch_leave(loop, conn);
 
     if (d.resp_len == 0 || d.overflow) {
         loop->close_conn(conn);
