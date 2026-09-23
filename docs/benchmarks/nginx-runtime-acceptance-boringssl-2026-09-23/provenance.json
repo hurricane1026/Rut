@@ -1,0 +1,26 @@
+{
+  "started_at": "2026-09-23T13:25:02.457717+00:00",
+  "source_sha": "12bd10e9e84a7f3a6df9af54a4c543416f470dfd",
+  "remote_head_sha": "12bd10e9e84a7f3a6df9af54a4c543416f470dfd",
+  "files": {
+    "rut": "/tmp/pr-watchdog/hurricane1026_Rut_687/release-build/src/rut",
+    "converter": "/tmp/pr-watchdog/hurricane1026_Rut_687/release-build/src/rut-nginx-convert",
+    "wrk": "/tmp/pr-watchdog/hurricane1026_Rut_687/wrk-boringssl-src2/wrk",
+    "wrk_patch": "/tmp/pr-watchdog/hurricane1026_Rut_687/wrk-boringssl-full-handshake.patch"
+  },
+  "sha256": {
+    "rut": "5e1e642becffd2d5a7c8a717a24ff844f617997ce0479c25590efc639821a46f",
+    "converter": "bd87d83a1a67ead19c5f05df18795530b6e308907a1b1f5af4882d027adb991b",
+    "wrk": "d7866c40dcb47f67138cdc420c346272d06b7b5dfc2705161178c996b6e7cf30",
+    "wrk_patch": "00de42ee31f3cc910303a4d49881d150880bb8cae2c91e0336255b9ffab6d1f4"
+  },
+  "wrk_revision": "a211dd5a7050b1f9e8a9870b95513060e72ac4a0",
+  "boringssl_revision": "7f5a43945aab78fe4e71459ac4881ff9033d73d8",
+  "profile": "acceptance",
+  "static_profile": "native-body",
+  "planned_cells": 96,
+  "repeats_per_cell": 3,
+  "minimum_seconds_per_sample": 5,
+  "minimum_rut_over_nginx": 1.1,
+  "tls_handshake": "BoringSSL full handshake"
+}
