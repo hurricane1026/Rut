@@ -7435,6 +7435,26 @@ static u64 rst_owner_route_handler(void*, jit::HandlerCtx*, const u8*, u32, void
     return jit::HandlerResult::make_status(204).pack();
 }
 
+static u32 staged_body_route_calls = 0;
+static u32 staged_next_route_calls = 0;
+static u64 staged_body_route_handler(void*,
+                                     jit::HandlerCtx*,
+                                     const u8*,
+                                     u32,
+                                     void*) {
+    ++staged_body_route_calls;
+    return jit::HandlerResult{jit::HandlerAction::ReturnStatus,
+                              200,
+                              1,
+                              0,
+                              jit::YieldKind::HttpGet}
+        .pack();
+}
+static u64 staged_next_route_handler(void*, jit::HandlerCtx*, const u8*, u32, void*) {
+    ++staged_next_route_calls;
+    return jit::HandlerResult::make_status(204).pack();
+}
+
 TEST(http2, rst_owner_processes_next_headers_after_parked_cancel) {
     SmallLoop loop;
     loop.setup();
@@ -7529,6 +7549,102 @@ TEST(http2, rst_owner_processes_next_headers_after_parked_cancel) {
     CHECK_EQ(h2.outbound_stream, 0u);
     CHECK_FALSE(h2.response_flush_pending);
     CHECK_EQ(epoch.epoch.load(std::memory_order_acquire), 2u);
+    CHECK(conn->fd >= 0);
+}
+
+TEST(http2, rst_staged_owner_replays_buffered_headers_after_send) {
+    SmallLoop loop;
+    loop.setup();
+    RouteConfig config{};
+    static u8 body[9000];
+    memset(body, 'b', sizeof(body));
+    REQUIRE_EQ(config.add_response_body_view(reinterpret_cast<const char*>(body), sizeof(body)), 1u);
+    REQUIRE_EQ(config.add_jit_handler("/body", kRouteMethodGet, &staged_body_route_handler, false),
+               1u);
+    REQUIRE_EQ(config.add_jit_handler("/next", kRouteMethodGet, &staged_next_route_handler, false),
+               1u);
+    const RouteConfig* active = &config;
+    loop.config_ptr = &active;
+    ShardEpoch epoch{};
+    loop.epoch = &epoch;
+    epoch.epoch.store(1, std::memory_order_release);
+    Connection* conn = loop.alloc_conn();
+    REQUIRE(conn != nullptr);
+    conn->fd = 42;
+    const u32 conn_id = conn->id;
+    Http2Conn h2{};
+    h2.init();
+    conn->h2 = &h2;
+
+    u8 input[4096]{};
+    u32 input_len = 0;
+    for (u32 i = 0; i < kClientPrefaceLen; i++) input[input_len++] = kClientPreface[i];
+    Http2Settings settings{};
+    settings.set_defaults();
+    input_len += write_settings_frame(input + input_len, settings);
+    auto append_headers = [&](u32 stream_id, const char* path) {
+        const hpack::Header headers[] = {
+            {{":method", 7}, {"GET", 3}},
+            {{":scheme", 7}, {"https", 5}},
+            {{":authority", 10}, {"example.test", 12}},
+            {{":path", 5}, {path, static_cast<u32>(strlen(path))}},
+        };
+        const u32 written = http2_write_headers(
+            input + input_len, sizeof(input) - input_len, stream_id, headers, 4, true);
+        REQUIRE_GT(written, 0u);
+        input_len += written;
+    };
+    append_headers(1, "/body");
+    Http2FrameHeader reset{};
+    reset.length = 4;
+    reset.type = static_cast<u8>(Http2FrameType::RstStream);
+    reset.stream_id = 1;
+    write_frame_header(input + input_len, reset);
+    memset(input + input_len + kFrameHeaderSize, 0, 4);
+    input_len += kFrameHeaderSize + 4;
+    const u32 next_offset = input_len;
+    append_headers(3, "/next");
+    const u32 next_len = input_len - next_offset;
+    conn->transition_to_reading_header(&on_h2_data<SmallLoop>);
+    REQUIRE(loop.submit_recv(*conn));
+    REQUIRE_EQ(conn->recv_buf.write(input, input_len), input_len);
+    staged_body_route_calls = 0;
+    staged_next_route_calls = 0;
+    loop.backend.inject(make_ev(conn_id, IoEventType::Recv, static_cast<i32>(input_len)));
+    IoEvent events[8];
+    u32 count = loop.backend.wait(events, 8);
+    REQUIRE_EQ(count, 1u);
+    for (u32 i = 0; i < count; i++) loop.dispatch(events[i]);
+    CHECK_EQ(staged_body_route_calls, 1u);
+    CHECK_EQ(staged_next_route_calls, 0u);
+    CHECK_EQ(h2.outbound_stream, 0u);
+    CHECK_EQ(epoch.epoch.load(std::memory_order_acquire), 3u);
+    CHECK(h2.response_flush_pending);
+    CHECK_EQ(conn->recv_buf.len(), next_len);
+    CHECK_EQ(memcmp(conn->recv_buf.data(), input + next_offset, next_len), 0);
+    REQUIRE_GT(conn->send_buf.len(), 0u);
+    CHECK_EQ(loop.backend.count_ops(MockOp::Send), 1u);
+    const u32 first_send_len = conn->send_buf.len();
+
+    loop.backend.inject(make_ev(conn_id, IoEventType::Send, static_cast<i32>(first_send_len)));
+    count = loop.backend.wait(events, 8);
+    REQUIRE_EQ(count, 1u);
+    for (u32 i = 0; i < count; i++) loop.dispatch(events[i]);
+    CHECK_EQ(staged_next_route_calls, 1u);
+    CHECK_EQ(epoch.epoch.load(std::memory_order_acquire), 5u);
+    CHECK_EQ(conn->recv_buf.len(), 0u);
+    REQUIRE_GT(conn->send_buf.len(), 0u);
+    CHECK_EQ(loop.backend.count_ops(MockOp::Send), 2u);
+    const u32 second_send_len = conn->send_buf.len();
+    loop.backend.inject(make_ev(conn_id, IoEventType::Send, static_cast<i32>(second_send_len)));
+    count = loop.backend.wait(events, 8);
+    REQUIRE_EQ(count, 1u);
+    for (u32 i = 0; i < count; i++) loop.dispatch(events[i]);
+    CHECK_EQ(conn->state, ConnState::ReadingHeader);
+    CHECK_EQ(h2.outbound_stream, 0u);
+    CHECK_FALSE(h2.response_flush_pending);
+    CHECK_FALSE(conn->epoch_held);
+    CHECK_EQ(epoch.epoch.load(std::memory_order_acquire), 5u);
     CHECK(conn->fd >= 0);
 }
 }  // namespace
