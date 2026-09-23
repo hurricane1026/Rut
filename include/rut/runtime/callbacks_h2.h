@@ -144,7 +144,7 @@ enum class H2PumpStatus : u8 { Blocked, Produced, Invalid };
 // when the frame is published into the buffer, not when its CQE arrives.
 inline u32 h2_pump_outbound(Http2Conn& h2, u8* out, u32 cap, H2PumpStatus& status) {
     status = H2PumpStatus::Blocked;
-    if (h2.outbound_stream == 0) return 0;
+    if (h2.outbound_stream == 0 || h2.outbound_final_staged) return 0;
     if (h2.outbound_body == nullptr || h2.outbound_body_len == 0 ||
         h2.outbound_body_offset >= h2.outbound_body_len) {
         status = H2PumpStatus::Invalid;
@@ -154,7 +154,8 @@ inline u32 h2_pump_outbound(Http2Conn& h2, u8* out, u32 cap, H2PumpStatus& statu
         return 0;
     }
     Http2Stream* stream = h2.find_stream(h2.outbound_stream);
-    if (stream == nullptr || stream->state == Http2StreamState::Closed) {
+    if (stream == nullptr || (stream->state != Http2StreamState::Open &&
+                              stream->state != Http2StreamState::HalfClosedRemote)) {
         status = H2PumpStatus::Invalid;
         return 0;
     }

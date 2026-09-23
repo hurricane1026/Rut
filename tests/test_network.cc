@@ -6894,6 +6894,94 @@ TEST(http2, outbound_pump_distinguishes_invalid_owner_from_window_block) {
     h2.conn_send_window = 0;
     CHECK_EQ(h2_pump_outbound(h2, output, sizeof(output), status), 0u);
     CHECK_EQ(status, H2PumpStatus::Blocked);
+
+    h2.outbound_final_staged = true;
+    h2.outbound_body_offset = h2.outbound_body_len;
+    CHECK_EQ(h2_pump_outbound(h2, output, sizeof(output), status), 0u);
+    CHECK_EQ(status, H2PumpStatus::Blocked);
+
+    h2.outbound_final_staged = false;
+    h2.streams[0].state = Http2StreamState::HalfClosedLocal;
+    h2.outbound_body_offset = 0;
+    h2.conn_send_window = kDefaultInitialWindowSize;
+    CHECK_EQ(h2_pump_outbound(h2, output, sizeof(output), status), 0u);
+    CHECK_EQ(status, H2PumpStatus::Invalid);
+}
+
+TEST(http2, proxy_finish_preserves_body_after_upstream_teardown) {
+    SmallLoop loop;
+    loop.setup();
+    auto* conn = loop.alloc_conn();
+    REQUIRE(conn != nullptr);
+    Http2Conn h2{};
+    h2.init();
+    h2.nstreams = 1;
+    h2.streams[0] = {1,
+                     Http2StreamState::Open,
+                     static_cast<i32>(kDefaultInitialWindowSize),
+                     static_cast<i32>(kDefaultInitialWindowSize),
+                     true};
+    h2.async_stream = 1;
+    h2.conn_send_window = 0;
+    conn->h2 = &h2;
+    conn->epoch_held = true;
+    static u8 upstream[1024];
+    const char response[] = "HTTP/1.1 200 OK\r\nContent-Length: 9\r\n\r\nproxybody";
+    constexpr u32 kHeaderLen = sizeof(response) - 1 - 9;
+    memcpy(upstream, response, sizeof(response) - 1);
+    conn->upstream_recv_buf.bind(upstream, sizeof(upstream));
+    conn->upstream_recv_buf.commit(sizeof(response) - 1);
+    ParsedResponse parsed{};
+    parsed.reset();
+    parsed.status_code = 200;
+    parsed.version = HttpVersion::Http11;
+    parsed.has_content_length = true;
+    parsed.content_length = 9;
+
+    h2_proxy_finish(&loop, *conn, parsed, kHeaderLen, 9, false);
+    CHECK_EQ(h2.outbound_source, H2OutboundBodySource::ProxySynth);
+    CHECK_EQ(h2.outbound_body, h2.pending_synth);
+    CHECK_EQ(h2.outbound_body_len, 9u);
+    CHECK_EQ(h2.conn_send_window, 0);
+    CHECK_EQ(conn->upstream_recv_buf.len(), 0u);
+    CHECK_FALSE(conn->upstream_recv_armed);
+    CHECK_FALSE(conn->upstream_send_armed);
+    Http2FrameHeader headers_frame{};
+    REQUIRE_EQ(parse_frame_header(conn->send_buf.data(), conn->send_buf.len(), &headers_frame),
+               ParseStatus::Complete);
+    CHECK_EQ(headers_frame.type, static_cast<u8>(Http2FrameType::Headers));
+    hpack::DynamicTable decoded;
+    decoded.init(kDefaultHeaderTableSize);
+    hpack::Header decoded_headers[8];
+    u8 decoded_scratch[256]{};
+    u32 decoded_count = 0;
+    REQUIRE(hpack::decode_header_block(decoded,
+                                       conn->send_buf.data() + kFrameHeaderSize,
+                                       headers_frame.length,
+                                       decoded_scratch,
+                                       sizeof(decoded_scratch),
+                                       decoded_headers,
+                                       8,
+                                       &decoded_count));
+    bool saw_status = false;
+    bool saw_length = false;
+    for (u32 i = 0; i < decoded_count; i++) {
+        if (decoded_headers[i].name.eq({":status", 7}) && decoded_headers[i].value.eq({"200", 3}))
+            saw_status = true;
+        if (decoded_headers[i].name.eq({"content-length", 14}) &&
+            decoded_headers[i].value.eq({"9", 1}))
+            saw_length = true;
+    }
+    CHECK(saw_status);
+    CHECK(saw_length);
+    memset(upstream, 'X', sizeof(upstream));
+    h2.conn_send_window = kDefaultInitialWindowSize;
+    u8 data_frame[64]{};
+    H2PumpStatus status = H2PumpStatus::Blocked;
+    const u32 n = h2_pump_outbound(h2, data_frame, sizeof(data_frame), status);
+    REQUIRE_EQ(status, H2PumpStatus::Produced);
+    REQUIRE_EQ(n, kFrameHeaderSize + 9u);
+    CHECK_EQ(memcmp(data_frame + kFrameHeaderSize, "proxybody", 9), 0);
 }
 
 TEST(http2, rst_owner_clears_parked_flush_gate_but_preserves_staged_send_gate) {
