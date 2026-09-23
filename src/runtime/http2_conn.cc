@@ -30,6 +30,7 @@ void Http2Conn::init() {
     cont_stream = 0;
     cont_end_stream = false;
     cont_discard = false;
+    cont_refuse = false;
     hdr_block_len = 0;
     nstreams = 0;
     pending_stream = 0;
@@ -67,6 +68,11 @@ void Http2Conn::init() {
     async_state = 0;
     async_upstream_id = 0;
     async_resp_len = 0;
+    outbound_stream = 0;
+    outbound_config = nullptr;
+    outbound_body = nullptr;
+    outbound_body_len = 0;
+    outbound_body_offset = 0;
 }
 
 Http2Stream* Http2Conn::find_stream(u32 id) {
@@ -156,16 +162,16 @@ u32 u32_to_dec(u32 v, char* buf) {
 }  // namespace
 
 static u32 http2_write_response_impl(u8* out,
-                         u32 out_cap,
-                         hpack::Encoder& enc,
-                         u32 stream_id,
-                         u16 status,
-                         const hpack::Header* hdrs,
-                         u32 nhdrs,
-                         const u8* body,
-                         u32 body_len,
-                         bool headers_only,
-                         bool end_stream) {
+                                     u32 out_cap,
+                                     hpack::Encoder& enc,
+                                     u32 stream_id,
+                                     u16 status,
+                                     const hpack::Header* hdrs,
+                                     u32 nhdrs,
+                                     const u8* body,
+                                     u32 body_len,
+                                     bool headers_only,
+                                     bool end_stream) {
     // Encode the header block: :status, caller headers, then content-length when
     // there's a body. Sized for the bounded route-config header set + slack.
     u8 hblock[8192];
@@ -223,8 +229,8 @@ static u32 http2_write_response_impl(u8* out,
     }
 
     const bool kEndOnHeaders = headers_only ? end_stream : (body_len == 0);
-    const u32 kNeed = kFrameHeaderSize + hb +
-                      (!headers_only && body_len > 0 ? kFrameHeaderSize + body_len : 0u);
+    const u32 kNeed =
+        kFrameHeaderSize + hb + (!headers_only && body_len > 0 ? kFrameHeaderSize + body_len : 0u);
     if (kNeed > out_cap) return 0;
 
     Http2FrameHeader h;
@@ -252,8 +258,8 @@ u32 http2_write_response_headers(u8* out,
                                  bool end_stream) {
     if (body_len != 0 && end_stream) return 0;
     auto staged = enc;
-    const u32 n = http2_write_response_impl(out, out_cap, staged, stream_id, status, hdrs, nhdrs,
-                                            nullptr, body_len, true, end_stream);
+    const u32 n = http2_write_response_impl(
+        out, out_cap, staged, stream_id, status, hdrs, nhdrs, nullptr, body_len, true, end_stream);
     if (n != 0) enc = staged;
     return n;
 }
@@ -268,8 +274,8 @@ u32 http2_write_response(u8* out,
                          const u8* body,
                          u32 body_len) {
     auto staged = enc;
-    const u32 n = http2_write_response_impl(out, out_cap, staged, stream_id, status, hdrs, nhdrs,
-                                            body, body_len, false, false);
+    const u32 n = http2_write_response_impl(
+        out, out_cap, staged, stream_id, status, hdrs, nhdrs, body, body_len, false, false);
     if (n != 0) enc = staged;
     return n;
 }
@@ -444,7 +450,7 @@ struct OutWriter {
 };
 
 // Decode the accumulated header block and deliver it; reset assembly state.
-Http2Error finish_headers(Http2Conn& c, u32 stream_id, bool end_stream) {
+Http2Error finish_headers(Http2Conn& c, u32 stream_id, bool end_stream, bool refuse, OutWriter& w) {
     hpack::Header hs[Http2Conn::kMaxHeadersPerReq];
     u32 nh = 0;
     if (!hpack::decode_header_block(c.hpack_dec,
@@ -460,6 +466,13 @@ Http2Error finish_headers(Http2Conn& c, u32 stream_id, bool end_stream) {
     c.hdr_block_len = 0;
     c.cont_stream = 0;
     c.cont_discard = false;
+    c.cont_refuse = false;
+    if (refuse) {
+        if (Http2Stream* s = c.find_stream(stream_id)) s->state = Http2StreamState::Closed;
+        if (w.room(kFrameHeaderSize + 4))
+            w.len += write_rst_stream(w.out + w.len, stream_id, Http2Error::RefusedStream);
+        return Http2Error::NoError;
+    }
     if (c.on_headers) c.on_headers(c.cb_ctx, c, stream_id, hs, nh, end_stream);
     return Http2Error::NoError;
 }
@@ -594,10 +607,12 @@ static Http2Error handle_frame(Http2Conn& c,
             n -= pad;
 
             Http2Stream* s = c.find_stream(h.stream_id);
+            bool new_stream = false;
             if (!s) {
                 if (h.stream_id <= c.last_stream_id) return Http2Error::ProtocolError;
                 s = alloc_stream(c, h.stream_id);
                 c.last_stream_id = h.stream_id;
+                new_stream = true;
                 if (!s) {
                     if (w.room(kFrameHeaderSize + 4))
                         w.len +=
@@ -650,10 +665,17 @@ static Http2Error handle_frame(Http2Conn& c,
             if (kAe != Http2Error::NoError) return kAe;
             if (h.flags & http2_flag::kEndHeaders) {
                 if (kEndStream) s->state = Http2StreamState::HalfClosedRemote;
-                return finish_headers(c, h.stream_id, kEndStream);
+                return finish_headers(
+                    c,
+                    h.stream_id,
+                    kEndStream,
+                    new_stream && c.outbound_stream != 0 && h.stream_id != c.outbound_stream,
+                    w);
             }
             c.cont_stream = h.stream_id;
             c.cont_end_stream = kEndStream;
+            c.cont_refuse =
+                new_stream && c.outbound_stream != 0 && h.stream_id != c.outbound_stream;
             return Http2Error::NoError;
         }
 
@@ -688,7 +710,7 @@ static Http2Error handle_frame(Http2Conn& c,
                     return Http2Error::NoError;
                 }
                 if (s && c.cont_end_stream) s->state = Http2StreamState::HalfClosedRemote;
-                return finish_headers(c, h.stream_id, c.cont_end_stream);
+                return finish_headers(c, h.stream_id, c.cont_end_stream, c.cont_refuse, w);
             }
             return Http2Error::NoError;
         }

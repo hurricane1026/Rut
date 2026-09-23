@@ -602,6 +602,9 @@ void h2_async_epoch_enter(Loop* loop, Connection& conn) {
 }
 template <typename Loop>
 void h2_async_epoch_leave(Loop* loop, Connection& conn) {
+    if (conn.h2 != nullptr && (conn.h2->async_stream != 0 || conn.h2->pending_stream != 0 ||
+                               conn.h2->outbound_stream != 0))
+        return;
     if (conn.epoch_held) {
         loop->epoch_leave();
         conn.epoch_held = false;

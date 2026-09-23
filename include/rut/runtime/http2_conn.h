@@ -93,6 +93,7 @@ struct Http2Conn {
     u32 cont_stream;       // stream awaiting CONTINUATION (0 = none)
     bool cont_end_stream;  // END_STREAM flagged on the pending HEADERS
     bool cont_discard;     // pending header block should be decoded, then reset
+    bool cont_refuse;      // pending new stream is decoded, then refused
     u32 hdr_block_len;
     u8 hdr_block[kHeaderBlockCap];
     u8 hdr_scratch[kHeaderScratchCap];
@@ -173,6 +174,14 @@ struct Http2Conn {
     // response buffer once the request is sent).
     u16 async_upstream_id;
     u32 async_resp_len;
+
+    // One response body owner is staged at a time. The body remains a borrowed
+    // RouteConfig view; DATA pumping fills this owner in a later slice.
+    u32 outbound_stream;
+    const RouteConfig* outbound_config;
+    const u8* outbound_body;
+    u32 outbound_body_len;
+    u32 outbound_body_offset;
 
     // Set callbacks (any may be null) then call init().
     void init();

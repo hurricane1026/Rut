@@ -6437,8 +6437,8 @@ TEST(http2, response_headers_body_length_is_transactional_and_nonterminal) {
     control.init(kDefaultHeaderTableSize);
     const hpack::Header headers[] = {{{"x-test", 6}, {"ok", 2}}};
     u8 first[8192]{};
-    const u32 n = http2_write_response_headers(
-        first, sizeof(first), enc, 3, 200, headers, 1, 9000, false);
+    const u32 n =
+        http2_write_response_headers(first, sizeof(first), enc, 3, 200, headers, 1, 9000, false);
     REQUIRE_GT(n, 0u);
     u8 control_first[8192]{};
     REQUIRE_EQ(http2_write_response_headers(
@@ -6452,14 +6452,43 @@ TEST(http2, response_headers_body_length_is_transactional_and_nonterminal) {
     CHECK((h.flags & http2_flag::kEndStream) == 0);
     CHECK_EQ(n, kFrameHeaderSize + h.length);
 
+    hpack::DynamicTable decoded;
+    decoded.init(kDefaultHeaderTableSize);
+    hpack::Header decoded_headers[8];
+    u8 decoded_scratch[256]{};
+    u32 decoded_count = 0;
+    REQUIRE(hpack::decode_header_block(decoded,
+                                       first + kFrameHeaderSize,
+                                       h.length,
+                                       decoded_scratch,
+                                       sizeof(decoded_scratch),
+                                       decoded_headers,
+                                       8,
+                                       &decoded_count));
+    bool saw_status = false;
+    bool saw_length = false;
+    bool saw_test = false;
+    for (u32 i = 0; i < decoded_count; i++) {
+        if (decoded_headers[i].name.eq({":status", 7}) && decoded_headers[i].value.eq({"200", 3}))
+            saw_status = true;
+        if (decoded_headers[i].name.eq({"content-length", 14}) &&
+            decoded_headers[i].value.eq({"9000", 4}))
+            saw_length = true;
+        if (decoded_headers[i].name.eq({"x-test", 6}) && decoded_headers[i].value.eq({"ok", 2}))
+            saw_test = true;
+    }
+    CHECK(saw_status);
+    CHECK(saw_length);
+    CHECK(saw_test);
+
     // A failed staging attempt must not consume encoder state or partially write.
     u8 too_small[8]{};
     CHECK_EQ(http2_write_response_headers(
                  too_small, sizeof(too_small), enc, 3, 200, headers, 1, 9000, false),
              0u);
     u8 second[8192]{};
-    const u32 n2 = http2_write_response_headers(
-        second, sizeof(second), enc, 3, 200, headers, 1, 9000, false);
+    const u32 n2 =
+        http2_write_response_headers(second, sizeof(second), enc, 3, 200, headers, 1, 9000, false);
     u8 control_second[8192]{};
     const u32 control_n2 = http2_write_response_headers(
         control_second, sizeof(control_second), control, 3, 200, headers, 1, 9000, false);
@@ -6486,6 +6515,101 @@ TEST(http2, refused_stream_rst_writer_is_bounded_and_exact) {
     CHECK_EQ(h.type, static_cast<u8>(Http2FrameType::RstStream));
     CHECK_EQ(h.stream_id, 7u);
     CHECK_EQ(h.length, 4u);
+}
+
+struct H2OwnerGateCapture {
+    u32 headers_calls = 0;
+    u32 last_stream = 0;
+};
+
+static void h2_owner_gate_headers(
+    void* opaque, Http2Conn&, u32 stream_id, const hpack::Header*, u32, bool) {
+    auto* capture = static_cast<H2OwnerGateCapture*>(opaque);
+    capture->headers_calls++;
+    capture->last_stream = stream_id;
+}
+
+TEST(http2, outbound_owner_refuses_after_continuation_and_keeps_control_sync) {
+    Http2Conn h2{};
+    h2.init();
+    h2.outbound_stream = 1;
+    H2OwnerGateCapture capture{};
+    h2.cb_ctx = &capture;
+    h2.on_headers = &h2_owner_gate_headers;
+
+    u8 input[2048]{};
+    u32 input_len = 0;
+    for (u32 i = 0; i < kClientPrefaceLen; i++) input[input_len++] = kClientPreface[i];
+    Http2Settings settings{};
+    settings.set_defaults();
+    input_len += write_settings_frame(input + input_len, settings);
+
+    const hpack::Header request[] = {
+        {{":method", 7}, {"GET", 3}},
+        {{":scheme", 7}, {"https", 5}},
+        {{":path", 5}, {"/", 1}},
+        {{":authority", 10}, {"example.test", 12}},
+    };
+    u8 block[256]{};
+    u32 block_len = 0;
+    for (const auto& header : request)
+        block_len += hpack::encode_header(block + block_len, header.name, header.value);
+
+    auto append_frame =
+        [&](Http2FrameType type, u8 flags, u32 stream_id, const u8* payload, u32 payload_len) {
+            REQUIRE(input_len + kFrameHeaderSize + payload_len <= sizeof(input));
+            Http2FrameHeader header{};
+            header.length = payload_len;
+            header.type = static_cast<u8>(type);
+            header.flags = flags;
+            header.stream_id = stream_id;
+            write_frame_header(input + input_len, header);
+            input_len += kFrameHeaderSize;
+            if (payload_len != 0) memcpy(input + input_len, payload, payload_len);
+            input_len += payload_len;
+        };
+    append_frame(Http2FrameType::Headers, http2_flag::kEndHeaders, 1, block, block_len);
+    const u32 split = block_len / 2;
+    append_frame(Http2FrameType::Headers, 0, 3, block, split);
+    append_frame(
+        Http2FrameType::Continuation, http2_flag::kEndHeaders, 3, block + split, block_len - split);
+    const u8 window_increment[] = {0, 0, 0, 1};
+    append_frame(Http2FrameType::WindowUpdate, 0, 1, window_increment, sizeof(window_increment));
+    append_frame(Http2FrameType::Headers, http2_flag::kEndHeaders, 5, block, block_len);
+
+    u8 output[1024]{};
+    u32 output_len = 0;
+    const Http2Result result = h2.process(input, input_len, output, sizeof(output), &output_len);
+    REQUIRE_FALSE(result.close);
+    CHECK_EQ(result.consumed, input_len);
+    CHECK_EQ(capture.headers_calls, 1u);
+    CHECK_EQ(capture.last_stream, 1u);
+    CHECK_EQ(h2.outbound_stream, 1u);
+    // The second refused stream reuses the first closed slot, so the table
+    // remains bounded while both requests still produce independent RSTs.
+    REQUIRE_EQ(h2.nstreams, 2u);
+    CHECK_EQ(h2.streams[1].id, 5u);
+    CHECK(h2.streams[1].state == Http2StreamState::Closed);
+    CHECK_EQ(h2.find_stream(3), nullptr);
+    CHECK_EQ(h2.streams[0].send_window, static_cast<i32>(kDefaultInitialWindowSize + 1));
+
+    u32 refused_count = 0;
+    for (u32 pos = 0; pos + kFrameHeaderSize <= output_len;) {
+        Http2FrameHeader frame{};
+        REQUIRE_EQ(parse_frame_header(output + pos, output_len - pos, &frame),
+                   ParseStatus::Complete);
+        REQUIRE_LE(pos + kFrameHeaderSize + frame.length, output_len);
+        if (frame.type == static_cast<u8>(Http2FrameType::RstStream) &&
+            (frame.stream_id == 3 || frame.stream_id == 5)) {
+            REQUIRE_EQ(frame.length, 4u);
+            const u8* error = output + pos + kFrameHeaderSize;
+            if (error[0] == 0 && error[1] == 0 && error[2] == 0 &&
+                error[3] == static_cast<u8>(Http2Error::RefusedStream))
+                refused_count++;
+        }
+        pos += kFrameHeaderSize + frame.length;
+    }
+    CHECK_EQ(refused_count, 2u);
 }
 }  // namespace
 
