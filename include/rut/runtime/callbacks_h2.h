@@ -208,7 +208,7 @@ bool h2_stage_owned_response(H2Dispatch<Loop>& d,
                              H2OutboundBodySource source,
                              const RouteConfig* cfg) {
     Http2Conn& h2 = *d.conn->h2;
-    if (body_len == 0 || d.resp_len != 0 || h2.outbound_stream != 0 || !d.conn->epoch_held ||
+    if (body_len == 0 || h2.outbound_stream != 0 || !d.conn->epoch_held ||
         h2.find_stream(stream_id) == nullptr)
         return false;
     if (source == H2OutboundBodySource::RouteConfig) {
@@ -220,12 +220,26 @@ bool h2_stage_owned_response(H2Dispatch<Loop>& d,
     } else {
         return false;
     }
+    if (d.resp_len > d.resp_cap) {
+        d.overflow = true;
+        return false;
+    }
     auto enc = h2.hpack_enc;
-    const u32 n = http2_write_response_headers(
-        d.resp, d.resp_cap, enc, stream_id, status, hdrs, nhdrs, body_len, false);
-    if (n == 0) return false;
+    const u32 n = http2_write_response_headers(d.resp + d.resp_len,
+                                               d.resp_cap - d.resp_len,
+                                               enc,
+                                               stream_id,
+                                               status,
+                                               hdrs,
+                                               nhdrs,
+                                               body_len,
+                                               false);
+    if (n == 0) {
+        if (d.resp_len != 0) d.overflow = true;
+        return false;
+    }
     h2.hpack_enc = enc;
-    d.resp_len = n;
+    d.resp_len += n;
     h2.outbound_stream = stream_id;
     h2.outbound_config = cfg;
     h2.outbound_body = body;
@@ -691,8 +705,9 @@ void h2_emit_outcome(H2Dispatch<Loop>& d,
                                      body,
                                      body_len,
                                      H2OutboundBodySource::RouteConfig,
-                                     cfg))
-            h2_emit_status(d, stream_id, 500);
+                                     cfg)) {
+            if (!d.overflow) h2_emit_status(d, stream_id, 500);
+        }
     } else {
         h2_emit_response(d, stream_id, o.status_code, hdrs, nhdrs, nullptr, 0);
     }

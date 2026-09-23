@@ -6555,6 +6555,36 @@ TEST(http2, local_stream_window_errors_notify_reset_once) {
         out[kFrameHeaderSize + 2] = static_cast<u8>(increment >> 8);
         out[kFrameHeaderSize + 3] = static_cast<u8>(increment);
     };
+    Http2Conn no_room{};
+    no_room.init();
+    no_room.preface_seen = true;
+    no_room.nstreams = 1;
+    no_room.streams[0] = {1,
+                          Http2StreamState::Open,
+                          static_cast<i32>(kDefaultInitialWindowSize),
+                          static_cast<i32>(kDefaultInitialWindowSize),
+                          true};
+    H2ResetCapture no_room_capture{};
+    no_room.cb_ctx = &no_room_capture;
+    no_room.on_reset = &h2_reset_capture;
+    u8 short_output[12]{};
+    u8 short_input[kFrameHeaderSize + 4]{};
+    make_window_update(short_input, 1, 0);
+    u32 short_written = 0;
+    const Http2Result no_room_result = no_room.process(
+        short_input, sizeof(short_input), short_output, sizeof(short_output), &short_written);
+    CHECK(no_room_result.close);
+    CHECK_EQ(no_room_capture.calls, 0u);
+    CHECK_EQ(no_room.streams[0].state, Http2StreamState::Open);
+    u8 exact_output[13]{};
+    u32 exact_written = 0;
+    const Http2Result exact_result = no_room.process(
+        short_input, sizeof(short_input), exact_output, sizeof(exact_output), &exact_written);
+    CHECK_FALSE(exact_result.close);
+    CHECK_EQ(exact_written, 13u);
+    CHECK_EQ(no_room_capture.calls, 1u);
+    CHECK_EQ(no_room.streams[0].state, Http2StreamState::Closed);
+
     Http2Conn h2{};
     h2.init();
     h2.preface_seen = true;
@@ -6955,6 +6985,56 @@ TEST(http2, proxy_synth_owner_is_transactional_and_pinned) {
                                         nullptr));
     CHECK_EQ(rejected.resp_len, 0u);
     CHECK_EQ(h2.outbound_stream, 0u);
+}
+
+TEST(http2, bodyless_then_owned_response_appends_transactionally) {
+    SmallLoop loop;
+    loop.setup();
+    auto* conn = loop.alloc_conn();
+    REQUIRE(conn != nullptr);
+    Http2Conn h2{};
+    h2.init();
+    h2.nstreams = 2;
+    h2.streams[0] = {1,
+                     Http2StreamState::Open,
+                     static_cast<i32>(kDefaultInitialWindowSize),
+                     static_cast<i32>(kDefaultInitialWindowSize),
+                     true};
+    h2.streams[1] = {3,
+                     Http2StreamState::Open,
+                     static_cast<i32>(kDefaultInitialWindowSize),
+                     static_cast<i32>(kDefaultInitialWindowSize),
+                     true};
+    conn->h2 = &h2;
+    conn->epoch_held = true;
+    static u8 body[9000];
+    memset(body, 'b', sizeof(body));
+    u8 response[16384]{};
+    H2Dispatch<SmallLoop> dispatch{&loop, conn, response, sizeof(response), 0, false, false};
+    h2_emit_status(dispatch, 1, 204);
+    const u32 bodyless_len = dispatch.resp_len;
+    REQUIRE_GT(bodyless_len, 0u);
+    REQUIRE(h2_stage_owned_response(dispatch,
+                                    3,
+                                    200,
+                                    nullptr,
+                                    0,
+                                    body,
+                                    sizeof(body),
+                                    H2OutboundBodySource::RouteConfig,
+                                    reinterpret_cast<const RouteConfig*>(1)));
+    CHECK_GT(dispatch.resp_len, bodyless_len);
+    Http2FrameHeader first{};
+    REQUIRE_EQ(parse_frame_header(response, dispatch.resp_len, &first), ParseStatus::Complete);
+    CHECK_EQ(first.type, static_cast<u8>(Http2FrameType::Headers));
+    CHECK((first.flags & http2_flag::kEndStream) != 0);
+    Http2FrameHeader second{};
+    REQUIRE_EQ(
+        parse_frame_header(response + bodyless_len, dispatch.resp_len - bodyless_len, &second),
+        ParseStatus::Complete);
+    CHECK_EQ(second.type, static_cast<u8>(Http2FrameType::Headers));
+    CHECK((second.flags & http2_flag::kEndStream) == 0);
+    CHECK_EQ(h2.outbound_stream, 3u);
 }
 
 TEST(http2, outbound_pump_distinguishes_invalid_owner_from_window_block) {
@@ -7826,6 +7906,171 @@ TEST(http2, rst_staged_owner_replays_buffered_headers_after_send) {
     CHECK_FALSE(h2.response_flush_pending);
     CHECK_FALSE(conn->epoch_held);
     CHECK_EQ(epoch.epoch.load(std::memory_order_acquire), 5u);
+    CHECK(conn->fd >= 0);
+}
+TEST(http2, bodyless_then_bodyful_coalesced_h2_responses) {
+    SmallLoop loop;
+    loop.setup();
+    RouteConfig config{};
+    static u8 body[9000];
+    memset(body, 'b', sizeof(body));
+    REQUIRE_EQ(config.add_response_body_view(reinterpret_cast<const char*>(body), sizeof(body)),
+               1u);
+    REQUIRE_EQ(config.add_jit_handler("/body", kRouteMethodGet, &staged_body_route_handler, false),
+               1u);
+    REQUIRE_EQ(config.add_jit_handler("/next", kRouteMethodGet, &staged_next_route_handler, false),
+               1u);
+    const RouteConfig* active = &config;
+    loop.config_ptr = &active;
+    ShardEpoch epoch{};
+    loop.epoch = &epoch;
+    epoch.epoch.store(1, std::memory_order_release);
+    Connection* conn = loop.alloc_conn();
+    REQUIRE(conn != nullptr);
+    conn->fd = 42;
+    const u32 conn_id = conn->id;
+    Http2Conn h2{};
+    h2.init();
+    conn->h2 = &h2;
+    const i32 initial_conn_window = h2.conn_send_window;
+    const i32 initial_stream_window = kDefaultInitialWindowSize;
+
+    u8 input[4096]{};
+    u32 input_len = 0;
+    for (u32 i = 0; i < kClientPrefaceLen; i++) input[input_len++] = kClientPreface[i];
+    Http2Settings settings{};
+    settings.set_defaults();
+    input_len += write_settings_frame(input + input_len, settings);
+    auto append_headers = [&](u32 stream_id, const char* path) {
+        const hpack::Header headers[] = {
+            {{":method", 7}, {"GET", 3}},
+            {{":scheme", 7}, {"https", 5}},
+            {{":authority", 10}, {"example.test", 12}},
+            {{":path", 5}, {path, static_cast<u32>(strlen(path))}},
+        };
+        const u32 written = http2_write_headers(
+            input + input_len, sizeof(input) - input_len, stream_id, headers, 4, true);
+        REQUIRE_GT(written, 0u);
+        input_len += written;
+    };
+    append_headers(1, "/next");
+    append_headers(3, "/body");
+    conn->transition_to_reading_header(&on_h2_data<SmallLoop>);
+    REQUIRE(loop.submit_recv(*conn));
+    REQUIRE_EQ(conn->recv_buf.write(input, input_len), input_len);
+    staged_body_route_calls = 0;
+    staged_next_route_calls = 0;
+    loop.backend.inject(make_ev(conn_id, IoEventType::Recv, static_cast<i32>(input_len)));
+    IoEvent events[8];
+    u32 count = loop.backend.wait(events, 8);
+    REQUIRE_EQ(count, 1u);
+    for (u32 i = 0; i < count; i++) loop.dispatch(events[i]);
+    CHECK_EQ(staged_next_route_calls, 1u);
+    CHECK_EQ(staged_body_route_calls, 1u);
+    CHECK_EQ(h2.outbound_stream, 3u);
+    CHECK(h2.response_flush_pending);
+    Http2Stream* stream3 = h2.find_stream(3);
+    REQUIRE(stream3 != nullptr);
+    REQUIRE_GT(conn->send_buf.len(), 0u);
+    bool saw_first_headers = false;
+    bool saw_second_headers = false;
+    bool saw_data = false;
+    bool saw_data_end = false;
+    u32 data_bytes = 0;
+    hpack::DynamicTable decoded;
+    decoded.init(kDefaultHeaderTableSize);
+    hpack::Header decoded_headers[16];
+    u8 decoded_scratch[512]{};
+    u32 cursor = 0;
+    while (cursor < conn->send_buf.len()) {
+        Http2FrameHeader frame{};
+        REQUIRE_EQ(parse_frame_header(
+                       conn->send_buf.data() + cursor, conn->send_buf.len() - cursor, &frame),
+                   ParseStatus::Complete);
+        if (frame.type == static_cast<u8>(Http2FrameType::Headers) && frame.stream_id == 1) {
+            saw_first_headers = true;
+            CHECK((frame.flags & http2_flag::kEndStream) != 0);
+            u32 decoded_count = 0;
+            REQUIRE(hpack::decode_header_block(decoded,
+                                               conn->send_buf.data() + cursor + kFrameHeaderSize,
+                                               frame.length,
+                                               decoded_scratch,
+                                               sizeof(decoded_scratch),
+                                               decoded_headers,
+                                               16,
+                                               &decoded_count));
+            bool status_204 = false;
+            for (u32 i = 0; i < decoded_count; i++)
+                if (decoded_headers[i].name.eq({":status", 7}) &&
+                    decoded_headers[i].value.eq({"204", 3}))
+                    status_204 = true;
+            CHECK(status_204);
+        }
+        if (frame.type == static_cast<u8>(Http2FrameType::Headers) && frame.stream_id == 3) {
+            saw_second_headers = true;
+            CHECK((frame.flags & http2_flag::kEndStream) == 0);
+            u32 decoded_count = 0;
+            REQUIRE(hpack::decode_header_block(decoded,
+                                               conn->send_buf.data() + cursor + kFrameHeaderSize,
+                                               frame.length,
+                                               decoded_scratch,
+                                               sizeof(decoded_scratch),
+                                               decoded_headers,
+                                               16,
+                                               &decoded_count));
+            bool status_200 = false;
+            bool length_9000 = false;
+            for (u32 i = 0; i < decoded_count; i++) {
+                if (decoded_headers[i].name.eq({":status", 7}) &&
+                    decoded_headers[i].value.eq({"200", 3}))
+                    status_200 = true;
+                if (decoded_headers[i].name.eq({"content-length", 14}) &&
+                    decoded_headers[i].value.eq({"9000", 4}))
+                    length_9000 = true;
+            }
+            CHECK(status_200);
+            CHECK(length_9000);
+        }
+        cursor += kFrameHeaderSize + frame.length;
+    }
+    CHECK(saw_first_headers);
+    CHECK(saw_second_headers);
+    for (u32 sends = 0; sends < 4 && (h2.outbound_stream != 0 || conn->send_buf.len() != 0);
+         sends++) {
+        const u32 send_len = conn->send_buf.len();
+        REQUIRE_GT(send_len, 0u);
+        u32 data_cursor = 0;
+        while (data_cursor < send_len) {
+            Http2FrameHeader frame{};
+            REQUIRE_EQ(parse_frame_header(
+                           conn->send_buf.data() + data_cursor, send_len - data_cursor, &frame),
+                       ParseStatus::Complete);
+            if (frame.type == static_cast<u8>(Http2FrameType::Data) && frame.stream_id == 3) {
+                saw_data = true;
+                data_bytes += frame.length;
+                saw_data_end |= (frame.flags & http2_flag::kEndStream) != 0;
+                CHECK_EQ(
+                    memcmp(
+                        conn->send_buf.data() + data_cursor + kFrameHeaderSize, body, frame.length),
+                    0);
+            }
+            data_cursor += kFrameHeaderSize + frame.length;
+        }
+        loop.backend.inject(make_ev(conn_id, IoEventType::Send, static_cast<i32>(send_len)));
+        count = loop.backend.wait(events, 8);
+        REQUIRE_EQ(count, 1u);
+        for (u32 i = 0; i < count; i++) loop.dispatch(events[i]);
+    }
+    CHECK_EQ(conn->state, ConnState::ReadingHeader);
+    CHECK_EQ(h2.outbound_stream, 0u);
+    CHECK_FALSE(h2.response_flush_pending);
+    CHECK_FALSE(conn->epoch_held);
+    CHECK(saw_data);
+    CHECK(saw_data_end);
+    CHECK_EQ(data_bytes, 9000u);
+    CHECK_EQ(h2.conn_send_window, initial_conn_window - 9000);
+    CHECK_EQ(stream3->send_window, initial_stream_window - 9000);
+    CHECK_EQ(epoch.epoch.load(std::memory_order_acquire), 3u);
     CHECK(conn->fd >= 0);
 }
 }  // namespace

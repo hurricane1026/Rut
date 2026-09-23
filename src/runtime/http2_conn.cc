@@ -544,13 +544,15 @@ void clear_pending_upload(Http2Conn& c, u32 stream_id) {
     }
 }
 
-void reset_known_stream(Http2Conn& c, u32 stream_id, Http2Error error, OutWriter& w) {
+Http2Error reset_known_stream(Http2Conn& c, u32 stream_id, Http2Error error, OutWriter& w) {
     Http2Stream* s = c.find_stream(stream_id);
-    if (w.room(kFrameHeaderSize + 4)) w.len += write_rst_stream(w.out + w.len, stream_id, error);
+    if (!w.room(kFrameHeaderSize + 4)) return Http2Error::InternalError;
+    w.len += write_rst_stream(w.out + w.len, stream_id, error);
     clear_pending_upload(c, stream_id);
-    if (s == nullptr || s->state == Http2StreamState::Closed) return;
+    if (s == nullptr || s->state == Http2StreamState::Closed) return Http2Error::NoError;
     s->state = Http2StreamState::Closed;
     if (c.on_reset) c.on_reset(c.cb_ctx, c, stream_id, error);
+    return Http2Error::NoError;
 }
 
 }  // namespace
@@ -659,8 +661,7 @@ static Http2Error handle_frame(Http2Conn& c,
                             c.on_data(c.cb_ctx, c, h.stream_id, nullptr, 0, /*end_stream=*/true);
                         return Http2Error::NoError;
                     }
-                    reset_known_stream(c, h.stream_id, Http2Error::ProtocolError, w);
-                    return Http2Error::NoError;
+                    return reset_known_stream(c, h.stream_id, Http2Error::ProtocolError, w);
                 }
                 c.cont_stream = h.stream_id;
                 c.cont_end_stream = kEndStream;  // carry END_STREAM for trailers
@@ -710,8 +711,7 @@ static Http2Error handle_frame(Http2Conn& c,
                             c.on_data(c.cb_ctx, c, h.stream_id, nullptr, 0, /*end_stream=*/true);
                         return Http2Error::NoError;
                     }
-                    reset_known_stream(c, h.stream_id, Http2Error::ProtocolError, w);
-                    return Http2Error::NoError;
+                    return reset_known_stream(c, h.stream_id, Http2Error::ProtocolError, w);
                 }
                 if (s && c.cont_end_stream) s->state = Http2StreamState::HalfClosedRemote;
                 return finish_headers(c, h.stream_id, c.cont_end_stream, c.cont_refuse, w);
@@ -750,9 +750,10 @@ static Http2Error handle_frame(Http2Conn& c,
 
             s->recv_window -= static_cast<i32>(h.length);
             if (s->recv_window < 0) {
-                reset_known_stream(c, h.stream_id, Http2Error::FlowControlError, w);
+                const Http2Error kReset =
+                    reset_known_stream(c, h.stream_id, Http2Error::FlowControlError, w);
                 c.conn_recv_window += static_cast<i64>(h.length);
-                return Http2Error::NoError;
+                return kReset;
             }
 
             const bool kEndStream = (h.flags & http2_flag::kEndStream) != 0;
@@ -794,13 +795,11 @@ static Http2Error handle_frame(Http2Conn& c,
                     return Http2Error::NoError;
                 }
                 if (kInc == 0) {
-                    reset_known_stream(c, h.stream_id, Http2Error::ProtocolError, w);
-                    return Http2Error::NoError;
+                    return reset_known_stream(c, h.stream_id, Http2Error::ProtocolError, w);
                 }
                 const i64 kNw = static_cast<i64>(s->send_window) + kInc;
                 if (kNw > kMaxWindow) {
-                    reset_known_stream(c, h.stream_id, Http2Error::FlowControlError, w);
-                    return Http2Error::NoError;
+                    return reset_known_stream(c, h.stream_id, Http2Error::FlowControlError, w);
                 }
                 s->send_window = static_cast<i32>(kNw);
             }
