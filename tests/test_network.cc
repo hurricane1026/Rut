@@ -56858,7 +56858,7 @@ TEST(response_buffering_runtime,
 
     // Leave only ten bytes in the receive slice.  The CQE completes the
     // header and carries a body suffix, forcing the suffix into the chain.
-    static constexpr u8 kPrefix[] = "HTTP/1.1 200 OK\r\nContent-Length: 18\r\n";
+    static constexpr u8 kPrefix[] = "HTTP/1.1 200 OK\r\nContent-Length: 18";
     conn.upstream_recv_buf.bind(conn.upstream_recv_slice, sizeof(kPrefix) - 1u + 10u);
     static constexpr u8 kOverflow[] = "\r\n\r\nabcdefghijkl";
 
@@ -56912,6 +56912,8 @@ TEST(response_buffering_runtime,
     CHECK_EQ(memcmp(conn.response_body_tail.data(), kOverflow + 10u, 6u), 0);
 
     loop->dispatch_batch(&event, 1);
+    CHECK(conn.on_upstream_recv == nullptr);
+    REQUIRE_EQ(conn.response_read_deadline_post_commit_raw_header_end, sizeof(kPrefix) - 1u + 4u);
     CHECK_EQ(conn.response_read_deadline_post_commit_phase,
              ResponseReadDeadlinePostCommitPhase::Buffering);
 
@@ -56938,7 +56940,15 @@ TEST(response_buffering_runtime,
     CHECK_EQ(conn.response_body_tail.size, 12u);
     CHECK_EQ(memcmp(conn.response_body_tail.data(), kOverflow + 10u, 6u), 0);
     CHECK_EQ(memcmp(conn.response_body_tail.data() + 6u, kFinalBody, 6u), 0);
+    CHECK(conn.on_upstream_recv == nullptr);
     loop->dispatch_batch(&final_event, 1);
+    REQUIRE_GE(conn.fd, 0);
+    REQUIRE_EQ(conn.upstream_fd, -1);
+    REQUIRE_EQ(conn.response_read_deadline_state, ResponseReadDeadlineState::BodyComplete);
+    REQUIRE_EQ(conn.response_read_deadline_post_commit_phase,
+               ResponseReadDeadlinePostCommitPhase::HeaderSend);
+    REQUIRE_EQ(conn.response_read_deadline_post_commit_origin_received, 18u);
+    REQUIRE(conn.send_armed);
     cleanup_prebuilt_d2(loop, fixture);
 }
 
