@@ -7325,6 +7325,101 @@ TEST(http2, rst_owner_clears_parked_flush_gate_but_preserves_staged_send_gate) {
     CHECK_EQ(h2.outbound_stream, 0u);
     CHECK(h2.response_flush_pending);
 }
+
+static u32 rst_owner_route_calls = 0;
+static u64 rst_owner_route_handler(void*, jit::HandlerCtx*, const u8*, u32, void*) {
+    ++rst_owner_route_calls;
+    return jit::HandlerResult::make_status(204).pack();
+}
+
+TEST(http2, rst_owner_processes_next_headers_after_parked_cancel) {
+    SmallLoop loop;
+    loop.setup();
+    RouteConfig config{};
+    REQUIRE_EQ(config.add_jit_handler("/next", kRouteMethodGet, &rst_owner_route_handler, false),
+               1u);
+    const RouteConfig* active = &config;
+    loop.config_ptr = &active;
+    ShardEpoch epoch{};
+    loop.epoch = &epoch;
+    Connection* conn = loop.alloc_conn();
+    REQUIRE(conn != nullptr);
+    conn->fd = 42;
+    const u32 conn_id = conn->id;
+    Http2Conn h2{};
+    h2.init();
+    h2.preface_seen = true;
+    h2.our_settings_sent = true;
+    h2.nstreams = 1;
+    h2.streams[0] = {1,
+                     Http2StreamState::Open,
+                     static_cast<i32>(kDefaultInitialWindowSize),
+                     static_cast<i32>(kDefaultInitialWindowSize),
+                     true};
+    conn->h2 = &h2;
+    conn->epoch_held = true;
+    epoch.epoch.store(1, std::memory_order_release);
+    static u8 upstream[256];
+    const char response[] = "HTTP/1.1 200 OK\r\nContent-Length: 9\r\n\r\nproxybody";
+    constexpr u32 kHeaderLen = sizeof(response) - 1 - 9;
+    memcpy(upstream, response, sizeof(response) - 1);
+    conn->upstream_recv_buf.bind(upstream, sizeof(upstream));
+    conn->upstream_recv_buf.commit(sizeof(response) - 1);
+    ParsedResponse parsed{};
+    parsed.reset();
+    parsed.status_code = 200;
+    parsed.version = HttpVersion::Http11;
+    parsed.has_content_length = true;
+    parsed.content_length = 9;
+    h2.async_stream = 1;
+    h2.conn_send_window = 0;
+    h2_proxy_finish(&loop, *conn, parsed, kHeaderLen, 9, false);
+    REQUIRE_EQ(h2.outbound_source, H2OutboundBodySource::ProxySynth);
+    REQUIRE_GT(conn->send_buf.len(), 0u);
+    const u32 header_send_len = conn->send_buf.len();
+    loop.inject_and_dispatch(make_ev(conn_id, IoEventType::Send, static_cast<i32>(header_send_len)));
+    CHECK_EQ(h2.outbound_stream, 1u);
+    CHECK(h2.response_flush_pending);
+    const hpack::Header request[] = {
+        {{":method", 7}, {"GET", 3}},
+        {{":scheme", 7}, {"https", 5}},
+        {{":path", 5}, {"/next", 5}},
+        {{":authority", 10}, {"example.test", 12}},
+    };
+    u8 block[256]{};
+    u32 block_len = 0;
+    for (const auto& header : request)
+        block_len += hpack::encode_header(block + block_len, header.name, header.value);
+    u8 input[512]{};
+    Http2FrameHeader reset_header{};
+    reset_header.length = 4;
+    reset_header.type = static_cast<u8>(Http2FrameType::RstStream);
+    reset_header.stream_id = 1;
+    write_frame_header(input, reset_header);
+    memset(input + kFrameHeaderSize, 0, 4);
+    Http2FrameHeader headers_header{};
+    headers_header.length = block_len;
+    headers_header.type = static_cast<u8>(Http2FrameType::Headers);
+    headers_header.flags = http2_flag::kEndHeaders;
+    headers_header.stream_id = 3;
+    write_frame_header(input + kFrameHeaderSize + 4, headers_header);
+    memcpy(input + 2 * kFrameHeaderSize + 4, block, block_len);
+    u8 recv_storage[1024]{};
+    conn->recv_buf.bind(recv_storage, sizeof(recv_storage));
+    REQUIRE_EQ(conn->recv_buf.write(input, 2 * kFrameHeaderSize + 4 + block_len),
+               2 * kFrameHeaderSize + 4 + block_len);
+    rst_owner_route_calls = 0;
+    on_h2_data<SmallLoop>(
+        &loop, *conn, make_ev(conn_id, IoEventType::Recv, 2 * kFrameHeaderSize + 4 + block_len));
+    CHECK_EQ(rst_owner_route_calls, 1u);
+    CHECK_EQ(h2.outbound_stream, 0u);
+    CHECK_FALSE(h2.response_flush_pending);
+    CHECK_FALSE(conn->epoch_held);
+    CHECK_EQ(epoch.epoch.load(std::memory_order_acquire), 2u);
+    REQUIRE_GT(conn->send_buf.len(), 0u);
+    loop.inject_and_dispatch(
+        make_ev(conn_id, IoEventType::Send, static_cast<i32>(conn->send_buf.len())));
+}
 }  // namespace
 
 TEST(connection_base, set_slots_redirects_recv_slot_for_iouring_tls) {
