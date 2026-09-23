@@ -7229,6 +7229,9 @@ struct H2InitialSubmitCaptureLoop : SmallLoop {
 TEST(http2, initial_owned_submit_failure_captures_proxy_body_headers) {
     H2InitialSubmitCaptureLoop loop;
     loop.setup();
+    ShardEpoch epoch{};
+    loop.epoch = &epoch;
+    epoch.epoch.store(1, std::memory_order_release);
     auto* conn = loop.alloc_conn();
     REQUIRE(conn != nullptr);
     Http2Conn h2{};
@@ -7244,7 +7247,6 @@ TEST(http2, initial_owned_submit_failure_captures_proxy_body_headers) {
     h2.our_settings_sent = true;
     conn->h2 = &h2;
     conn->epoch_held = true;
-    conn->req_start_us = 1;
     static u8 upstream[256];
     const char response[] = "HTTP/1.1 200 OK\r\nContent-Length: 3\r\n\r\nabc";
     constexpr u32 kHeaderLen = sizeof(response) - 1 - 3;
@@ -7266,6 +7268,7 @@ TEST(http2, initial_owned_submit_failure_captures_proxy_body_headers) {
     CHECK(loop.saw_status_200);
     CHECK(loop.saw_data_abc);
     CHECK_FALSE(conn->epoch_held);
+    CHECK_EQ(epoch.epoch.load(std::memory_order_acquire), 2u);
     CHECK_EQ(loop.free_top, SmallLoop::kMaxConns);
 }
 
@@ -7500,17 +7503,19 @@ TEST(http2, rst_owner_processes_next_headers_after_parked_cancel) {
     Http2FrameHeader headers_header{};
     headers_header.length = block_len;
     headers_header.type = static_cast<u8>(Http2FrameType::Headers);
-    headers_header.flags = http2_flag::kEndHeaders;
+    headers_header.flags = http2_flag::kEndHeaders | http2_flag::kEndStream;
     headers_header.stream_id = 3;
     write_frame_header(input + kFrameHeaderSize + 4, headers_header);
     memcpy(input + 2 * kFrameHeaderSize + 4, block, block_len);
-    u8 recv_storage[1024]{};
-    conn->recv_buf.bind(recv_storage, sizeof(recv_storage));
+    conn->recv_buf.reset();
     REQUIRE_EQ(conn->recv_buf.write(input, 2 * kFrameHeaderSize + 4 + block_len),
                2 * kFrameHeaderSize + 4 + block_len);
     rst_owner_route_calls = 0;
-    on_h2_data<SmallLoop>(
-        &loop, *conn, make_ev(conn_id, IoEventType::Recv, 2 * kFrameHeaderSize + 4 + block_len));
+    loop.backend.inject(make_ev(conn_id, IoEventType::Recv, 2 * kFrameHeaderSize + 4 + block_len));
+    IoEvent events[8];
+    const u32 count = loop.backend.wait(events, 8);
+    REQUIRE_EQ(count, 1u);
+    for (u32 i = 0; i < count; i++) loop.dispatch(events[i]);
     CHECK_EQ(rst_owner_route_calls, 1u);
     CHECK_EQ(h2.outbound_stream, 0u);
     CHECK_FALSE(h2.response_flush_pending);
@@ -7519,6 +7524,12 @@ TEST(http2, rst_owner_processes_next_headers_after_parked_cancel) {
     REQUIRE_GT(conn->send_buf.len(), 0u);
     loop.inject_and_dispatch(
         make_ev(conn_id, IoEventType::Send, static_cast<i32>(conn->send_buf.len())));
+    CHECK_EQ(conn->recv_buf.len(), 0u);
+    CHECK_EQ(conn->state, ConnState::ReadingHeader);
+    CHECK_EQ(h2.outbound_stream, 0u);
+    CHECK_FALSE(h2.response_flush_pending);
+    CHECK_EQ(epoch.epoch.load(std::memory_order_acquire), 2u);
+    CHECK(conn->fd >= 0);
 }
 }  // namespace
 
