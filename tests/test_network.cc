@@ -6737,12 +6737,17 @@ TEST(http2, nonempty_response_uses_flow_controlled_data_owner) {
     CHECK_EQ(h2.conn_send_window, static_cast<i64>(kDefaultInitialWindowSize));
     const u32 header_len = dispatch.resp_len;
     h2.conn_send_window = 0;
+    H2PumpStatus blocked_status = H2PumpStatus::Produced;
     CHECK_EQ(
-        h2_pump_outbound(h2, response + dispatch.resp_len, sizeof(response) - dispatch.resp_len),
+        h2_pump_outbound(
+            h2, response + dispatch.resp_len, sizeof(response) - dispatch.resp_len, blocked_status),
         0u);
+    CHECK_EQ(blocked_status, H2PumpStatus::Blocked);
     h2.conn_send_window = kDefaultInitialWindowSize;
-    const u32 data_len =
-        h2_pump_outbound(h2, response + dispatch.resp_len, sizeof(response) - dispatch.resp_len);
+    H2PumpStatus data_status = H2PumpStatus::Blocked;
+    const u32 data_len = h2_pump_outbound(
+        h2, response + dispatch.resp_len, sizeof(response) - dispatch.resp_len, data_status);
+    REQUIRE_EQ(data_status, H2PumpStatus::Produced);
     REQUIRE_EQ(data_len, kFrameHeaderSize + sizeof(body));
     dispatch.resp_len += data_len;
     Http2FrameHeader headers_frame{};
@@ -6757,6 +6762,66 @@ TEST(http2, nonempty_response_uses_flow_controlled_data_owner) {
     CHECK_EQ(memcmp(response + header_len + kFrameHeaderSize, body, sizeof(body)), 0);
     CHECK_EQ(h2.conn_send_window, static_cast<i64>(kDefaultInitialWindowSize - sizeof(body)));
     CHECK_EQ(h2.streams[0].send_window, static_cast<i32>(kDefaultInitialWindowSize - sizeof(body)));
+}
+
+TEST(http2, flow_controlled_route_body_boundaries_and_window_resume) {
+    SmallLoop loop;
+    loop.setup();
+    auto* conn = loop.alloc_conn();
+    REQUIRE(conn != nullptr);
+    static u8 body[1u << 20];
+    static u8 wire[(1u << 20) + 32768];
+    for (u32 i = 0; i < sizeof(body); i++) body[i] = static_cast<u8>(i * 29u + 7u);
+    constexpr u32 kSizes[] = {8167, 8168, 9000, 65535, 65536, 1u << 20};
+    for (u32 body_len : kSizes) {
+        Http2Conn h2{};
+        h2.init();
+        h2.nstreams = 1;
+        h2.streams[0] = {1, Http2StreamState::Open, INT32_MAX, INT32_MAX, true};
+        h2.conn_send_window = INT32_MAX;
+        conn->h2 = &h2;
+        conn->epoch_held = true;
+        RouteConfig cfg{};
+        REQUIRE_EQ(cfg.add_response_body_view(reinterpret_cast<const char*>(body), body_len), 1u);
+        JitDispatchOutcome outcome{};
+        outcome.kind = JitDispatchOutcome::Kind::ReturnStatus;
+        outcome.status_code = 200;
+        outcome.response_body_idx = 1;
+        memset(wire, 0, sizeof(wire));
+        H2Dispatch<SmallLoop> dispatch{&loop, conn, wire, sizeof(wire), 0, false, false};
+        h2_emit_outcome(dispatch, 1, outcome, &cfg);
+        REQUIRE_EQ(h2.outbound_body_len, body_len);
+        const u32 header_len = dispatch.resp_len;
+        h2.conn_send_window = 0;
+        H2PumpStatus blocked = H2PumpStatus::Produced;
+        CHECK_EQ(h2_pump_outbound(
+                     h2, wire + dispatch.resp_len, sizeof(wire) - dispatch.resp_len, blocked),
+                 0u);
+        CHECK_EQ(blocked, H2PumpStatus::Blocked);
+        h2.conn_send_window = INT32_MAX;
+        u32 body_seen = 0;
+        while (!h2.outbound_final_staged) {
+            H2PumpStatus status = H2PumpStatus::Blocked;
+            const u32 n = h2_pump_outbound(
+                h2, wire + dispatch.resp_len, sizeof(wire) - dispatch.resp_len, status);
+            REQUIRE_EQ(status, H2PumpStatus::Produced);
+            REQUIRE(n > kFrameHeaderSize);
+            dispatch.resp_len += n;
+        }
+        u32 cursor = header_len;
+        while (cursor < dispatch.resp_len) {
+            Http2FrameHeader frame{};
+            REQUIRE_EQ(parse_frame_header(wire + cursor, dispatch.resp_len - cursor, &frame),
+                       ParseStatus::Complete);
+            REQUIRE_EQ(frame.type, static_cast<u8>(Http2FrameType::Data));
+            REQUIRE(cursor + kFrameHeaderSize + frame.length <= dispatch.resp_len);
+            CHECK_EQ(memcmp(wire + cursor + kFrameHeaderSize, body + body_seen, frame.length), 0);
+            body_seen += frame.length;
+            cursor += kFrameHeaderSize + frame.length;
+        }
+        CHECK_EQ(body_seen, body_len);
+        CHECK_EQ(h2.outbound_body_offset, body_len);
+    }
 }
 
 TEST(http2, proxy_synth_owner_is_transactional_and_pinned) {
@@ -6806,6 +6871,29 @@ TEST(http2, proxy_synth_owner_is_transactional_and_pinned) {
                                         nullptr));
     CHECK_EQ(rejected.resp_len, 0u);
     CHECK_EQ(h2.outbound_stream, 0u);
+}
+
+TEST(http2, outbound_pump_distinguishes_invalid_owner_from_window_block) {
+    Http2Conn h2{};
+    h2.init();
+    h2.nstreams = 1;
+    h2.streams[0] = {1,
+                     Http2StreamState::Open,
+                     static_cast<i32>(kDefaultInitialWindowSize),
+                     static_cast<i32>(kDefaultInitialWindowSize),
+                     true};
+    h2.outbound_stream = 1;
+    h2.outbound_body_len = 1;
+    u8 output[32]{};
+    H2PumpStatus status = H2PumpStatus::Blocked;
+    CHECK_EQ(h2_pump_outbound(h2, output, sizeof(output), status), 0u);
+    CHECK_EQ(status, H2PumpStatus::Invalid);
+
+    const u8 body[] = {'x'};
+    h2.outbound_body = body;
+    h2.conn_send_window = 0;
+    CHECK_EQ(h2_pump_outbound(h2, output, sizeof(output), status), 0u);
+    CHECK_EQ(status, H2PumpStatus::Blocked);
 }
 
 TEST(http2, rst_owner_clears_parked_flush_gate_but_preserves_staged_send_gate) {

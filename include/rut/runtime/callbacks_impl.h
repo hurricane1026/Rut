@@ -6517,8 +6517,14 @@ void h2_proxy_finish(Loop* loop,
             loop->close_conn(conn);
             return;
         }
-        const u32 data_len =
-            h2_pump_outbound(*h2, conn.send_buf.write_ptr(), conn.send_buf.write_avail());
+        H2PumpStatus pump_status = H2PumpStatus::Blocked;
+        const u32 data_len = h2_pump_outbound(
+            *h2, conn.send_buf.write_ptr(), conn.send_buf.write_avail(), pump_status);
+        if (pump_status == H2PumpStatus::Invalid) {
+            h2_clear_outbound(*h2);
+            loop->close_conn(conn);
+            return;
+        }
         conn.send_buf.commit(data_len);
         conn.keep_alive = true;
         conn.transition_to_sending(&on_h2_sent<Loop>);
