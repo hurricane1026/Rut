@@ -215,6 +215,16 @@ u32 http2_write_response(u8* out,
                          const u8* body,
                          u32 body_len);
 
+u32 http2_write_response_headers(u8* out,
+                                 u32 out_cap,
+                                 hpack::Encoder& enc,
+                                 u32 stream_id,
+                                 u16 status,
+                                 const hpack::Header* hdrs,
+                                 u32 nhdrs,
+                                 u32 body_len,
+                                 bool end_stream);
+
 // --- Request bridge ---
 
 // Map a decoded HTTP/2 header list into the ParsedRequest the existing routing

@@ -155,7 +155,7 @@ u32 u32_to_dec(u32 v, char* buf) {
 }
 }  // namespace
 
-u32 http2_write_response(u8* out,
+static u32 http2_write_response_impl(u8* out,
                          u32 out_cap,
                          hpack::Encoder& enc,
                          u32 stream_id,
@@ -163,7 +163,9 @@ u32 http2_write_response(u8* out,
                          const hpack::Header* hdrs,
                          u32 nhdrs,
                          const u8* body,
-                         u32 body_len) {
+                         u32 body_len,
+                         bool headers_only,
+                         bool end_stream) {
     // Encode the header block: :status, caller headers, then content-length when
     // there's a body. Sized for the bounded route-config header set + slack.
     u8 hblock[8192];
@@ -220,8 +222,9 @@ u32 http2_write_response(u8* out,
         hb += enc.encode(hblock + hb, Str{"content-length", 14}, Str{clbuf, kClLen});
     }
 
-    const bool kEndOnHeaders = (body_len == 0);
-    const u32 kNeed = kFrameHeaderSize + hb + (body_len > 0 ? kFrameHeaderSize + body_len : 0u);
+    const bool kEndOnHeaders = headers_only ? end_stream : (body_len == 0);
+    const u32 kNeed = kFrameHeaderSize + hb +
+                      (!headers_only && body_len > 0 ? kFrameHeaderSize + body_len : 0u);
     if (kNeed > out_cap) return 0;
 
     Http2FrameHeader h;
@@ -233,9 +236,42 @@ u32 http2_write_response(u8* out,
     write_frame_header(out, h);
     for (u32 i = 0; i < hb; i++) out[kFrameHeaderSize + i] = hblock[i];
     u32 o = kFrameHeaderSize + hb;
-    if (body_len > 0)
+    if (!headers_only && body_len > 0)
         o += http2_write_data(out + o, stream_id, body, body_len, /*end_stream=*/true);
     return o;
+}
+
+u32 http2_write_response_headers(u8* out,
+                                 u32 out_cap,
+                                 hpack::Encoder& enc,
+                                 u32 stream_id,
+                                 u16 status,
+                                 const hpack::Header* hdrs,
+                                 u32 nhdrs,
+                                 u32 body_len,
+                                 bool end_stream) {
+    if (body_len != 0 && end_stream) return 0;
+    auto staged = enc;
+    const u32 n = http2_write_response_impl(out, out_cap, staged, stream_id, status, hdrs, nhdrs,
+                                            nullptr, body_len, true, end_stream);
+    if (n != 0) enc = staged;
+    return n;
+}
+
+u32 http2_write_response(u8* out,
+                         u32 out_cap,
+                         hpack::Encoder& enc,
+                         u32 stream_id,
+                         u16 status,
+                         const hpack::Header* hdrs,
+                         u32 nhdrs,
+                         const u8* body,
+                         u32 body_len) {
+    auto staged = enc;
+    const u32 n = http2_write_response_impl(out, out_cap, staged, stream_id, status, hdrs, nhdrs,
+                                            body, body_len, false, false);
+    if (n != 0) enc = staged;
+    return n;
 }
 
 namespace {

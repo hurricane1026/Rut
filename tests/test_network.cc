@@ -4,6 +4,7 @@
 #include "rut/runtime/arena.h"
 #include "rut/runtime/compile_to_config.h"
 #include "rut/runtime/error.h"
+#include "rut/runtime/http2_conn.h"
 #ifdef __linux__
 #include "rut/runtime/io_uring_backend.h"
 #include "rut/runtime/iouring_event_loop.h"
@@ -6428,6 +6429,64 @@ void stage_strict_tls_send_owner(Connection& conn,
     conn.response_read_deadline_send_owner_active = true;
 }
 #endif  // __linux__
+
+TEST(http2, response_headers_body_length_is_transactional_and_nonterminal) {
+    hpack::Encoder enc;
+    enc.init(kDefaultHeaderTableSize);
+    hpack::Encoder control;
+    control.init(kDefaultHeaderTableSize);
+    const hpack::Header headers[] = {{{"x-test", 6}, {"ok", 2}}};
+    u8 first[8192]{};
+    const u32 n = http2_write_response_headers(
+        first, sizeof(first), enc, 3, 200, headers, 1, 9000, false);
+    REQUIRE_GT(n, 0u);
+    u8 control_first[8192]{};
+    REQUIRE_EQ(http2_write_response_headers(
+                   control_first, sizeof(control_first), control, 3, 200, headers, 1, 9000, false),
+               n);
+    Http2FrameHeader h{};
+    REQUIRE_EQ(parse_frame_header(first, n, &h), ParseStatus::Complete);
+    CHECK_EQ(h.type, static_cast<u8>(Http2FrameType::Headers));
+    CHECK_EQ(h.stream_id, 3u);
+    CHECK((h.flags & http2_flag::kEndHeaders) != 0);
+    CHECK((h.flags & http2_flag::kEndStream) == 0);
+    CHECK_EQ(n, kFrameHeaderSize + h.length);
+
+    // A failed staging attempt must not consume encoder state or partially write.
+    u8 too_small[8]{};
+    CHECK_EQ(http2_write_response_headers(
+                 too_small, sizeof(too_small), enc, 3, 200, headers, 1, 9000, false),
+             0u);
+    u8 second[8192]{};
+    const u32 n2 = http2_write_response_headers(
+        second, sizeof(second), enc, 3, 200, headers, 1, 9000, false);
+    u8 control_second[8192]{};
+    const u32 control_n2 = http2_write_response_headers(
+        control_second, sizeof(control_second), control, 3, 200, headers, 1, 9000, false);
+    REQUIRE_EQ(n2, control_n2);
+    CHECK_EQ(__builtin_memcmp(second, control_second, n2), 0);
+
+    u8 terminal[128]{};
+    const u32 terminal_len =
+        http2_write_response_headers(terminal, sizeof(terminal), enc, 3, 204, nullptr, 0, 0, true);
+    REQUIRE_GT(terminal_len, 0u);
+    Http2FrameHeader terminal_header{};
+    REQUIRE_EQ(parse_frame_header(terminal, terminal_len, &terminal_header), ParseStatus::Complete);
+    CHECK_EQ(terminal_header.type, static_cast<u8>(Http2FrameType::Headers));
+    CHECK((terminal_header.flags & http2_flag::kEndHeaders) != 0);
+    CHECK((terminal_header.flags & http2_flag::kEndStream) != 0);
+}
+
+TEST(http2, refused_stream_rst_writer_is_bounded_and_exact) {
+    u8 frame[32]{};
+    const u32 n = write_rst_stream(frame, 7, Http2Error::RefusedStream);
+    REQUIRE_EQ(n, kFrameHeaderSize + 4u);
+    Http2FrameHeader h{};
+    REQUIRE_EQ(parse_frame_header(frame, n, &h), ParseStatus::Complete);
+    CHECK_EQ(h.type, static_cast<u8>(Http2FrameType::RstStream));
+    CHECK_EQ(h.stream_id, 7u);
+    CHECK_EQ(h.length, 4u);
+}
 }  // namespace
 
 TEST(connection_base, set_slots_redirects_recv_slot_for_iouring_tls) {
