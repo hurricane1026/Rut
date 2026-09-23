@@ -6922,6 +6922,8 @@ TEST(http2, proxy_finish_preserves_body_after_upstream_teardown) {
                      static_cast<i32>(kDefaultInitialWindowSize),
                      true};
     h2.async_stream = 1;
+    h2.preface_seen = true;
+    h2.our_settings_sent = true;
     h2.conn_send_window = 0;
     conn->h2 = &h2;
     conn->epoch_held = true;
@@ -6943,11 +6945,13 @@ TEST(http2, proxy_finish_preserves_body_after_upstream_teardown) {
     CHECK_EQ(h2.outbound_body, h2.pending_synth);
     CHECK_EQ(h2.outbound_body_len, 9u);
     CHECK_EQ(h2.conn_send_window, 0);
-    CHECK_EQ(conn->upstream_recv_buf.len(), 0u);
-    CHECK_FALSE(conn->upstream_recv_armed);
-    CHECK_FALSE(conn->upstream_send_armed);
+    REQUIRE_GT(conn->send_buf.len(), 0u);
+    const u32 headers_send_len = conn->send_buf.len();
+    u8 header_copy[8192]{};
+    REQUIRE_LE(headers_send_len, static_cast<u32>(sizeof(header_copy)));
+    memcpy(header_copy, conn->send_buf.data(), headers_send_len);
     Http2FrameHeader headers_frame{};
-    REQUIRE_EQ(parse_frame_header(conn->send_buf.data(), conn->send_buf.len(), &headers_frame),
+    REQUIRE_EQ(parse_frame_header(header_copy, headers_send_len, &headers_frame),
                ParseStatus::Complete);
     CHECK_EQ(headers_frame.type, static_cast<u8>(Http2FrameType::Headers));
     hpack::DynamicTable decoded;
@@ -6956,7 +6960,7 @@ TEST(http2, proxy_finish_preserves_body_after_upstream_teardown) {
     u8 decoded_scratch[256]{};
     u32 decoded_count = 0;
     REQUIRE(hpack::decode_header_block(decoded,
-                                       conn->send_buf.data() + kFrameHeaderSize,
+                                       header_copy + kFrameHeaderSize,
                                        headers_frame.length,
                                        decoded_scratch,
                                        sizeof(decoded_scratch),
@@ -6974,14 +6978,40 @@ TEST(http2, proxy_finish_preserves_body_after_upstream_teardown) {
     }
     CHECK(saw_status);
     CHECK(saw_length);
+    loop.inject_and_dispatch(
+        make_ev(conn->id, IoEventType::Send, static_cast<i32>(headers_send_len)));
+    CHECK_EQ(h2.outbound_stream, 1u);
+    CHECK_EQ(h2.outbound_body_offset, 0u);
+    CHECK(h2.response_flush_pending);
+    CHECK_EQ(conn->upstream_recv_buf.len(), 0u);
+    CHECK_FALSE(conn->upstream_recv_armed);
+    CHECK_FALSE(conn->upstream_send_armed);
     memset(upstream, 'X', sizeof(upstream));
-    h2.conn_send_window = kDefaultInitialWindowSize;
-    u8 data_frame[64]{};
-    H2PumpStatus status = H2PumpStatus::Blocked;
-    const u32 n = h2_pump_outbound(h2, data_frame, sizeof(data_frame), status);
-    REQUIRE_EQ(status, H2PumpStatus::Produced);
-    REQUIRE_EQ(n, kFrameHeaderSize + 9u);
-    CHECK_EQ(memcmp(data_frame + kFrameHeaderSize, "proxybody", 9), 0);
+    u8 window_update[kFrameHeaderSize + 4]{};
+    Http2FrameHeader update_header{};
+    update_header.length = 4;
+    update_header.type = static_cast<u8>(Http2FrameType::WindowUpdate);
+    update_header.stream_id = 0;
+    write_frame_header(window_update, update_header);
+    window_update[kFrameHeaderSize + 3] = 9;
+    conn->recv_buf.reset();
+    REQUIRE_EQ(conn->recv_buf.write(window_update, sizeof(window_update)), sizeof(window_update));
+    loop.inject_and_dispatch(
+        make_ev(conn->id, IoEventType::Recv, static_cast<i32>(sizeof(window_update))));
+    REQUIRE_GT(conn->send_buf.len(), 0u);
+    Http2FrameHeader data_frame{};
+    REQUIRE_EQ(parse_frame_header(conn->send_buf.data(), conn->send_buf.len(), &data_frame),
+               ParseStatus::Complete);
+    REQUIRE_EQ(data_frame.type, static_cast<u8>(Http2FrameType::Data));
+    CHECK((data_frame.flags & http2_flag::kEndStream) != 0);
+    CHECK_EQ(data_frame.length, 9u);
+    REQUIRE_GE(conn->send_buf.len(), kFrameHeaderSize + data_frame.length);
+    CHECK_EQ(memcmp(conn->send_buf.data() + kFrameHeaderSize, "proxybody", 9), 0);
+    const u32 data_send_len = conn->send_buf.len();
+    loop.inject_and_dispatch(make_ev(conn->id, IoEventType::Send, static_cast<i32>(data_send_len)));
+    CHECK_EQ(h2.outbound_stream, 0u);
+    CHECK_FALSE(h2.response_flush_pending);
+    CHECK_FALSE(conn->epoch_held);
 }
 
 TEST(http2, rst_owner_clears_parked_flush_gate_but_preserves_staged_send_gate) {

@@ -264,7 +264,6 @@ void h2_emit_response(H2Dispatch<Loop>& d,
         d.conn->h2->hpack_enc = enc;
         d.resp_len += kN;
         h2_close_stream(d.conn->h2, stream_id);
-        d.conn->h2->response_flush_pending = true;
         return;
     }
     // The response didn't fit. If it isn't the first frame in the batch, or the
@@ -284,7 +283,6 @@ void h2_emit_response(H2Dispatch<Loop>& d,
         d.conn->h2->hpack_enc = enc;
         d.resp_len += kFallback;
         h2_close_stream(d.conn->h2, stream_id);
-        d.conn->h2->response_flush_pending = true;
     }
 }
 
