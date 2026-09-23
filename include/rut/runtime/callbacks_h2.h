@@ -1407,8 +1407,14 @@ inline void h2_on_reset_cb(void* ctx, Http2Conn& c, u32 stream_id, Http2Error /*
 template <typename Loop>
 void h2_on_reset_dispatch_cb(void* ctx, Http2Conn& c, u32 stream_id, Http2Error err) {
     auto* d = static_cast<H2Dispatch<Loop>*>(ctx);
+    const bool kOutboundOwner = c.outbound_stream == stream_id;
     if (d->close_after_process) return;
     h2_on_reset_cb(ctx, c, stream_id, err);
+    // A parked owner has no downstream send to drain, so its flush gate can be
+    // released with the epoch. If this batch already staged response bytes, or
+    // a send CQE is still outstanding, retain the gate until on_h2_sent clears it.
+    if (kOutboundOwner && d->resp_len == 0 && !d->conn->send_armed)
+        c.response_flush_pending = false;
 }
 
 // Forward declaration: defined below; on_h2_data re-arms via this on send done.

@@ -6757,6 +6757,32 @@ TEST(http2, nonempty_response_uses_flow_controlled_data_owner) {
     CHECK_EQ(h2.conn_send_window, static_cast<i64>(kDefaultInitialWindowSize - sizeof(body)));
     CHECK_EQ(h2.streams[0].send_window, static_cast<i32>(kDefaultInitialWindowSize - sizeof(body)));
 }
+
+TEST(http2, rst_owner_clears_parked_flush_gate_but_preserves_staged_send_gate) {
+    SmallLoop loop;
+    loop.setup();
+    Connection conn{};
+    conn.reset();
+    Http2Conn h2{};
+    h2.init();
+    conn.h2 = &h2;
+    conn.send_armed = false;
+    u8 response[32]{};
+    H2Dispatch<SmallLoop> dispatch{&loop, &conn, response, sizeof(response), 0, false, false};
+
+    h2.outbound_stream = 1;
+    h2.response_flush_pending = true;
+    h2_on_reset_dispatch_cb<SmallLoop>(&dispatch, h2, 1, Http2Error::Cancel);
+    CHECK_EQ(h2.outbound_stream, 0u);
+    CHECK_FALSE(h2.response_flush_pending);
+
+    h2.outbound_stream = 1;
+    h2.response_flush_pending = true;
+    dispatch.resp_len = 1;
+    h2_on_reset_dispatch_cb<SmallLoop>(&dispatch, h2, 1, Http2Error::Cancel);
+    CHECK_EQ(h2.outbound_stream, 0u);
+    CHECK(h2.response_flush_pending);
+}
 }  // namespace
 
 TEST(connection_base, set_slots_redirects_recv_slot_for_iouring_tls) {
