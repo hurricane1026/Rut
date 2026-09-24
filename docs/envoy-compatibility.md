@@ -11,9 +11,22 @@ Allowed states are `SUPPORTED`, `PARTIAL`, `BLOCKED_BY_RUT`,
 Column meanings: `parser` is semantic-model admission with source spans and
 fail-closed diagnostics (`tests/test_envoy_parser.cc`); `converter` is
 deterministic RUT emission; `RUT capability` is whether the runtime can carry
-the behavior; `behavior test` is the differential evidence. The pinned Envoy
-image does not exist yet; no row can be promoted past `PARTIAL` until
-`tests/pinned-envoy-image.txt` and the differential target land.
+the behavior; `behavior test` is the differential evidence. The pinned image
+is `envoyproxy/envoy@sha256:57e14a549d7bd43c8d3f6d03e8cfa653e037d4b38e133acd9b54f38c524401b4`
+(tag `v1.39.1`, `tests/pinned-envoy-image.txt`); no row may be promoted past
+`PARTIAL` until the differential evidence for that exact row lands.
+
+Evidence note: `tests/test_envoy_differential.cc` (envoy-pr-plan.md PR 2) runs
+the milestone-S bootstrap through the pinned image against a recording
+upstream over loopback and writes the observed bytes as a transcript header.
+It exercises no RUT or converter code path and asserts only two invariants
+(`get_smoke` downstream/upstream shape, `connect_failure` downstream status);
+everything else is recorded evidence for PRs 3-6, not a behavioral claim. The
+transcript is produced by CI (`envoy-required` job, label `envoy;docker`,
+`RESOURCE_LOCK envoy-differential`) as the `envoy-oracle-transcript` artifact;
+it is committed as `tests/fixtures/envoy_oracle_milestone_s.inc` by the lead
+after a CI run, at which point that run's id is recorded here. No such run has
+landed yet, so no row below changes status in this PR.
 
 The design contract's fail-closed rule is about configuration semantics: a
 bootstrap that needs a RUT surface the shipped binary does not have must be
@@ -304,3 +317,13 @@ converter fails closed on the whole configuration until then.
   table row) with the two converter-level fixes that were tried and found
   infeasible within the lexer's token budget and the language's expression
   grammar.
+- PR 2 (envoy-pr-plan.md): pinned
+  `envoyproxy/envoy@sha256:57e14a549d7bd43c8d3f6d03e8cfa653e037d4b38e133acd9b54f38c524401b4`
+  (`v1.39.1`, `tests/pinned-envoy-image.txt`) and added the docker-gated
+  oracle-recording scaffold `tests/test_envoy_differential.cc`. It runs the milestone-S
+  bootstrap through the pinned image against a recording upstream and writes
+  the wire bytes as `tests/fixtures/envoy_oracle_milestone_s.inc`; it does not
+  exercise RUT or the converter and asserts only two invariants (see the
+  evidence note above). CI runs it as the `envoy-required` job and uploads the
+  transcript as an artifact; the lead commits that artifact as a fixture and
+  records the run id once a run lands. No status changes in this PR.
