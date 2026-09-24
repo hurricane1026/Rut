@@ -366,17 +366,32 @@ core::Expected<void, Error> IoUringBackend::setup_buf_ring() {
     // Advance the ring tail to make all buffers available
     __atomic_store_n(&buf_ring->tail, static_cast<u16>(kProvidedBufCount), __ATOMIC_RELEASE);
 
-    setup_large_buf_ring();
+    setup_extra_buf_ring(kLargeProvidedBufCount,
+                         kLargeProvidedBufSize,
+                         kLargeBufGroupId,
+                         kLargeProvidedBufIdBase,
+                         large_buf_ring,
+                         large_buf_base);
+    // The bulk ring only serves recvs sized past the large ring, so it is
+    // meaningless without it.
+    if (large_buf_ring != nullptr)
+        setup_extra_buf_ring(kBulkProvidedBufCount,
+                             kBulkProvidedBufSize,
+                             kBulkBufGroupId,
+                             kBulkProvidedBufIdBase,
+                             bulk_buf_ring,
+                             bulk_buf_base);
     return {};
 }
 
-void IoUringBackend::setup_large_buf_ring() {
+void IoUringBackend::setup_extra_buf_ring(
+    u32 count, u32 size, u16 group, u32 id_base, io_uring_buf_ring*& ring_out, u8*& base_out) {
     // Buffer memory is faulted in on first use: idle shards keep it unresident.
-    const u64 total_buf_sz = static_cast<u64>(kLargeProvidedBufCount) * kLargeProvidedBufSize;
+    const u64 total_buf_sz = static_cast<u64>(count) * size;
     void* base =
         mmap(nullptr, total_buf_sz, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
     if (base == MAP_FAILED) return;
-    const u64 ring_sz = sizeof(io_uring_buf_ring) + kLargeProvidedBufCount * sizeof(io_uring_buf);
+    const u64 ring_sz = sizeof(io_uring_buf_ring) + count * sizeof(io_uring_buf);
     void* ring_mem = mmap(nullptr,
                           ring_sz,
                           PROT_READ | PROT_WRITE,
@@ -392,8 +407,8 @@ void IoUringBackend::setup_large_buf_ring() {
     struct io_uring_buf_reg reg;
     memset(&reg, 0, sizeof(reg));
     reg.ring_addr = reinterpret_cast<u64>(ring);
-    reg.ring_entries = kLargeProvidedBufCount;
-    reg.bgid = kLargeBufGroupId;
+    reg.ring_entries = count;
+    reg.bgid = group;
     if (io_uring_register(ring_fd, IORING_REGISTER_PBUF_RING, &reg, 1) < 0) {
         munmap(ring_mem, ring_sz);
         munmap(base, total_buf_sz);
@@ -401,18 +416,28 @@ void IoUringBackend::setup_large_buf_ring() {
     }
 
     auto* data = static_cast<u8*>(base);
-    for (u32 i = 0; i < kLargeProvidedBufCount; i++) {
+    for (u32 i = 0; i < count; i++) {
         io_uring_buf* buf = &ring->bufs[i];
-        buf->addr = reinterpret_cast<u64>(data + static_cast<u64>(i) * kLargeProvidedBufSize);
-        buf->len = kLargeProvidedBufSize;
-        buf->bid = static_cast<u16>(kLargeProvidedBufIdBase + i);
+        buf->addr = reinterpret_cast<u64>(data + static_cast<u64>(i) * size);
+        buf->len = size;
+        buf->bid = static_cast<u16>(id_base + i);
     }
-    __atomic_store_n(&ring->tail, static_cast<u16>(kLargeProvidedBufCount), __ATOMIC_RELEASE);
-    large_buf_base = data;
-    large_buf_ring = ring;
+    __atomic_store_n(&ring->tail, static_cast<u16>(count), __ATOMIC_RELEASE);
+    base_out = data;
+    ring_out = ring;
 }
 
 void IoUringBackend::return_buffer(u16 buf_id) {
+    if (is_bulk_buffer_id(buf_id)) {
+        if (!provided_buffer_id_valid(buf_id)) return;
+        const u16 tail = __atomic_load_n(&bulk_buf_ring->tail, __ATOMIC_RELAXED);
+        io_uring_buf* buf = &bulk_buf_ring->bufs[tail & (kBulkProvidedBufCount - 1)];
+        buf->addr = reinterpret_cast<u64>(provided_buffer_data(buf_id));
+        buf->len = kBulkProvidedBufSize;
+        buf->bid = buf_id;
+        __atomic_store_n(&bulk_buf_ring->tail, static_cast<u16>(tail + 1), __ATOMIC_RELEASE);
+        return;
+    }
     if (buf_id >= kLargeProvidedBufIdBase) {
         if (!provided_buffer_id_valid(buf_id)) return;
         const u16 tail = __atomic_load_n(&large_buf_ring->tail, __ATOMIC_RELAXED);
@@ -523,7 +548,10 @@ bool IoUringBackend::add_recv_upstream_once(i32 fd,
     sqe->opcode = IORING_OP_RECV;
     sqe->fd = fd;
     sqe->len = max_len;
-    sqe->buf_group = large_buf_ring != nullptr ? kLargeBufGroupId : kBufGroupId;
+    // Only a bulk relay buffer has room past one large buffer.
+    sqe->buf_group = max_len > kLargeProvidedBufSize ? kBulkBufGroupId
+                     : large_buf_ring != nullptr     ? kLargeBufGroupId
+                                                     : kBufGroupId;
     sqe->flags = IOSQE_BUFFER_SELECT;
     sqe->user_data =
         encode_upstream_user_data(conn_id, IoEventType::UpstreamRecv, upstream_episode);
@@ -1400,7 +1428,12 @@ u32 IoUringBackend::wait(IoEvent* events, u32 max_events, Connection* conns, u32
                     const u32 overflow = nbytes - prefix_copy;
                     deadline_copy_eligible =
                         overflow == 0 ||
-                        conn.response_body_tail.append(*response_pool, src + prefix_copy, overflow);
+                        conn.response_body_tail.append(
+                            *response_pool,
+                            src + prefix_copy,
+                            overflow,
+                            conn.tls_active ? ResponseBodyChain::kBulkAfterTls
+                                            : ResponseBodyChain::kBulkAfterPlaintext);
                     if (deadline_copy_eligible && prefix_copy != 0) {
                         __builtin_memcpy(target_buf.write_ptr(), src, prefix_copy);
                         target_buf.commit(prefix_copy);
@@ -1703,6 +1736,15 @@ void IoUringBackend::shutdown() {
         munmap(large_buf_ring,
                sizeof(io_uring_buf_ring) + kLargeProvidedBufCount * sizeof(io_uring_buf));
         large_buf_ring = nullptr;
+    }
+    if (bulk_buf_base != nullptr) {
+        munmap(bulk_buf_base, static_cast<u64>(kBulkProvidedBufCount) * kBulkProvidedBufSize);
+        bulk_buf_base = nullptr;
+    }
+    if (bulk_buf_ring != nullptr) {
+        munmap(bulk_buf_ring,
+               sizeof(io_uring_buf_ring) + kBulkProvidedBufCount * sizeof(io_uring_buf));
+        bulk_buf_ring = nullptr;
     }
     if (sqes_ptr != nullptr) {
         munmap(sqes_ptr, sqes_sz);
