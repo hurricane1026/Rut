@@ -3397,6 +3397,42 @@ TEST(response_read_deadline, bodyless_complete_owner_preserves_transparent_id0) 
         conn, conn.response_read_deadline_upload));
 }
 
+// PR3: ID4 (Http11PreserveHostLowercase) must be supported generically, but
+// admitted into none of the closed profiles below -- those remain the
+// original {0,1}/{0,1,2}/{1,3} sets they were before ID4 existed.
+TEST(request_policy, preserve_host_lowercase_admission_table) {
+    static constexpr u16 kNone = static_cast<u16>(RequestPolicyId::None);
+    static constexpr u16 kLegacy = static_cast<u16>(RequestPolicyId::Http11FixedStrip);
+    static constexpr u16 kAfterHost =
+        static_cast<u16>(RequestPolicyId::Http11FixedStripContentLengthAfterHost);
+    static constexpr u16 kRetained =
+        static_cast<u16>(RequestPolicyId::Http11FixedTrimSpPreserveHtab);
+    static constexpr u16 kPreserveHost =
+        static_cast<u16>(RequestPolicyId::Http11PreserveHostLowercase);
+
+    CHECK(request_policy_is_supported(kPreserveHost));
+    CHECK(request_policy_preserves_host(kPreserveHost));
+    CHECK_FALSE(request_policy_preserves_host(kNone));
+    CHECK_FALSE(request_policy_preserves_host(kLegacy));
+    CHECK_FALSE(request_policy_preserves_host(kAfterHost));
+    CHECK_FALSE(request_policy_preserves_host(kRetained));
+
+    CHECK_FALSE(bodyless_get_complete_content_length_request_policy_is_admitted(kPreserveHost));
+    CHECK_FALSE(response_read_deadline_request_policy_is_admitted(kPreserveHost));
+    CHECK_FALSE(fixed_upload_head_request_policy_is_admitted(kPreserveHost));
+    CHECK_FALSE(complete_content_length_request_policy_is_admitted(kPreserveHost));
+
+    // Every closed profile's original admission set is unaffected by ID4.
+    CHECK(bodyless_get_complete_content_length_request_policy_is_admitted(kLegacy));
+    CHECK(bodyless_get_complete_content_length_request_policy_is_admitted(kRetained));
+    CHECK(response_read_deadline_request_policy_is_admitted(kNone));
+    CHECK(response_read_deadline_request_policy_is_admitted(kLegacy));
+    CHECK(fixed_upload_head_request_policy_is_admitted(kLegacy));
+    CHECK(fixed_upload_head_request_policy_is_admitted(kAfterHost));
+    CHECK(complete_content_length_request_policy_is_admitted(kNone));
+    CHECK(complete_content_length_request_policy_is_admitted(kLegacy));
+}
+
 TEST(request_policy, content_length_after_host_exact_wire_and_fail_closed_boundaries) {
     static constexpr u16 kLegacy = static_cast<u16>(RequestPolicyId::Http11FixedStrip);
     static constexpr u16 kAfterHost =
@@ -3660,6 +3696,116 @@ TEST(request_policy, content_length_after_host_exact_wire_and_fail_closed_bounda
     REQUIRE(apply_request_policy(conn, endpoint, 0));
     CHECK_EQ(conn.send_buf.len(), 0u);
     require_wire(transparent, transparent_len);
+}
+
+// PR3 wire-level unit coverage for ID4 (Http11PreserveHostLowercase), ahead of
+// the full-socket oracle wire test in test_integration.cc. Exercises header
+// lowercasing, Connection-nominated drops, the te:trailers exception,
+// x-forwarded-proto pass-through/append, and the fail-closed Host cases.
+TEST(request_policy, preserve_host_lowercase_wire_and_fail_closed_host) {
+    static constexpr u16 kPreserveHost =
+        static_cast<u16>(RequestPolicyId::Http11PreserveHostLowercase);
+    Connection conn{};
+    u8 recv[1024]{};
+    u8 send[1024]{};
+    sockaddr_in endpoint{};
+    endpoint.sin_family = AF_INET;
+    endpoint.sin_addr.s_addr = htonl(0x7f000001u);
+    endpoint.sin_port = htons(9000);
+
+    auto prepare = [&](const char* wire) {
+        conn.reset();
+        conn.recv_slice = recv;
+        conn.send_slice = send;
+        conn.bind_request_receive_buffer(recv, sizeof(recv));
+        conn.send_buf.bind(send, sizeof(send));
+        const u32 len = static_cast<u32>(strlen(wire));
+        REQUIRE_EQ(conn.recv_buf.write(reinterpret_cast<const u8*>(wire), len), len);
+        capture_request_metadata(conn);
+    };
+    auto require_wire = [&](const char* expected) {
+        const u32 expected_len = static_cast<u32>(strlen(expected));
+        REQUIRE_EQ(conn.recv_buf.len(), expected_len);
+        CHECK_EQ(__builtin_memcmp(conn.recv_buf.data(), expected, expected_len), 0);
+        CHECK_EQ(conn.send_buf.len(), 0u);
+    };
+
+    // Mixed-case names, a Connection header nominating an extra header, a
+    // kept te:trailers, and an appended x-forwarded-proto: http.
+    prepare(
+        "GET /hop HTTP/1.1\r\n"
+        "Host: client.example\r\n"
+        "User-Agent: rut-diff/1\r\n"
+        "X-Mixed-Case: Value\r\n"
+        "Accept: */*\r\n"
+        "Connection: keep-alive, X-Drop-Me\r\n"
+        "Keep-Alive: timeout=5\r\n"
+        "Proxy-Connection: keep-alive\r\n"
+        "TE: trailers\r\n"
+        "X-Drop-Me: 1\r\n"
+        "\r\n");
+    REQUIRE(apply_request_policy(conn, endpoint, kPreserveHost));
+    require_wire(
+        "GET /hop HTTP/1.1\r\n"
+        "host: client.example\r\n"
+        "user-agent: rut-diff/1\r\n"
+        "x-mixed-case: Value\r\n"
+        "accept: */*\r\n"
+        "te: trailers\r\n"
+        "x-forwarded-proto: http\r\n"
+        "\r\n");
+
+    // TE with a non-trailers value is stripped.
+    prepare("GET /te HTTP/1.1\r\nHost: client.example\r\nTE: gzip\r\n\r\n");
+    REQUIRE(apply_request_policy(conn, endpoint, kPreserveHost));
+    require_wire("GET /te HTTP/1.1\r\nhost: client.example\r\nx-forwarded-proto: http\r\n\r\n");
+
+    // A client-supplied X-Forwarded-Proto passes through unchanged, in place;
+    // none is appended.
+    prepare(
+        "GET /xfp HTTP/1.1\r\n"
+        "Host: client.example\r\n"
+        "X-Forwarded-Proto: https\r\n"
+        "X-After: yes\r\n\r\n");
+    REQUIRE(apply_request_policy(conn, endpoint, kPreserveHost));
+    require_wire(
+        "GET /xfp HTTP/1.1\r\n"
+        "host: client.example\r\n"
+        "x-forwarded-proto: https\r\n"
+        "x-after: yes\r\n\r\n");
+
+    // Content-Length is re-emitted lowercase in place; body bytes pass
+    // through unchanged.
+    prepare("POST /upload HTTP/1.1\r\nHost: client.example\r\nContent-Length: 4\r\n\r\nabcd");
+    REQUIRE(apply_request_policy(conn, endpoint, kPreserveHost));
+    require_wire(
+        "POST /upload HTTP/1.1\r\nhost: client.example\r\ncontent-length: 4\r\n"
+        "x-forwarded-proto: http\r\n\r\nabcd");
+
+    // Fail closed: no Host header. No upstream bytes (recv_buf untouched).
+    prepare("GET /nohost HTTP/1.1\r\nX-Only: yes\r\n\r\n");
+    u8 untouched_nohost[256]{};
+    const u32 nohost_len = conn.recv_buf.len();
+    __builtin_memcpy(untouched_nohost, conn.recv_buf.data(), nohost_len);
+    CHECK_FALSE(apply_request_policy(conn, endpoint, kPreserveHost));
+    CHECK_EQ(conn.send_buf.len(), 0u);
+    REQUIRE_EQ(conn.recv_buf.len(), nohost_len);
+    CHECK_EQ(__builtin_memcmp(conn.recv_buf.data(), untouched_nohost, nohost_len), 0);
+
+    // Fail closed: duplicate Host header. No upstream bytes.
+    prepare("GET /duphost HTTP/1.1\r\nHost: a\r\nHost: b\r\n\r\n");
+    u8 untouched_duphost[256]{};
+    const u32 duphost_len = conn.recv_buf.len();
+    __builtin_memcpy(untouched_duphost, conn.recv_buf.data(), duphost_len);
+    CHECK_FALSE(apply_request_policy(conn, endpoint, kPreserveHost));
+    CHECK_EQ(conn.send_buf.len(), 0u);
+    REQUIRE_EQ(conn.recv_buf.len(), duphost_len);
+    CHECK_EQ(__builtin_memcmp(conn.recv_buf.data(), untouched_duphost, duphost_len), 0);
+
+    // Fail closed: an empty Host value.
+    prepare("GET /emptyhost HTTP/1.1\r\nHost:\r\n\r\n");
+    CHECK_FALSE(apply_request_policy(conn, endpoint, kPreserveHost));
+    CHECK_EQ(conn.send_buf.len(), 0u);
 }
 
 TEST(request_policy, content_length_after_host_wait_and_rejection_never_touch_upstream) {

@@ -12,6 +12,15 @@ enum class RequestPolicyId : u16 {
     Http11FixedStrip = 1,
     Http11FixedStripContentLengthAfterHost = 2,
     Http11FixedTrimSpPreserveHtab = 3,
+    // Envoy-compatible H1 profile: preserves the client's Host header instead
+    // of writing the upstream endpoint, lowercases every forwarded header
+    // name, drops Envoy's hop-by-hop set (including Proxy-Connection and any
+    // header nominated by the client's Connection header), keeps `te` only
+    // when its value is exactly "trailers", and ensures a trailing
+    // x-forwarded-proto. Ordinary-forward-only: never admitted alongside a
+    // response read deadline or response buffering (see the closed
+    // admission predicates below).
+    Http11PreserveHostLowercase = 4,
     // Reserved in the 16-bit forward-result slot for invalid direct-RIR values.
     Invalid = 0xffffu,
 };
@@ -19,11 +28,18 @@ enum class RequestPolicyId : u16 {
 inline bool request_policy_is_supported(u16 id) {
     return id == static_cast<u16>(RequestPolicyId::Http11FixedStrip) ||
            id == static_cast<u16>(RequestPolicyId::Http11FixedStripContentLengthAfterHost) ||
-           id == static_cast<u16>(RequestPolicyId::Http11FixedTrimSpPreserveHtab);
+           id == static_cast<u16>(RequestPolicyId::Http11FixedTrimSpPreserveHtab) ||
+           id == static_cast<u16>(RequestPolicyId::Http11PreserveHostLowercase);
 }
 
 inline bool request_policy_trims_sp_preserves_htab(u16 id) {
     return id == static_cast<u16>(RequestPolicyId::Http11FixedTrimSpPreserveHtab);
+}
+
+// ID4 preserves the client's Host header verbatim instead of writing the
+// upstream endpoint authority. Every other supported policy writes Host.
+inline bool request_policy_preserves_host(u16 id) {
+    return id == static_cast<u16>(RequestPolicyId::Http11PreserveHostLowercase);
 }
 
 // ID3 is intentionally admitted only by the closed bodyless GET + complete

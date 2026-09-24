@@ -33076,6 +33076,138 @@ route GET "/" {
     }
 }
 
+// PR3: the Envoy-compatible `host: "preserve"` request-policy combination
+// (RequestPolicyId::Http11PreserveHostLowercase). The oracle
+// (tests/fixtures/envoy_oracle_milestone_s.inc) establishes the runtime wire
+// behaviour; this test only pins the grammar -> RIR pipeline.
+TEST(frontend, request_policy_preserve_host_parses_to_id4) {
+    const char* valid = R"rut(
+upstream backend at "127.0.0.1:9000"
+route GET "/" {
+    return forward(backend, request_policy: {
+        version: "HTTP/1.1",
+        host: "preserve",
+        connection: "omit",
+        header_names: "lowercase",
+        forwarded_proto: "http",
+        strip_headers: ["Connection", "Keep-Alive", "TE", "Expect", "Upgrade", "Proxy-Connection"]
+    })
+}
+)rut";
+    auto lexed = lex(lit(valid));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    CHECK_EQ(ast->items[1].route.statements[0]->forward_request_policy_id,
+             static_cast<u16>(RequestPolicyId::Http11PreserveHostLowercase));
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    CHECK_EQ(hir->routes[0].control.direct_term.forward_request_policy_id,
+             static_cast<u16>(RequestPolicyId::Http11PreserveHostLowercase));
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    CHECK_EQ(mir->functions[0].blocks[0].term.forward_request_policy_id,
+             static_cast<u16>(RequestPolicyId::Http11PreserveHostLowercase));
+    FrontendRirModule rir{};
+    REQUIRE(lower_to_rir(mir.value(), rir));
+    REQUIRE(rir::verify_module(rir.module).ok);
+    const auto* ret = find_first_op(rir.module.functions[0], rir::Opcode::RetForward);
+    REQUIRE(ret != nullptr);
+    REQUIRE_EQ(ret->operand_count, 2u);
+    const auto policy = ret->operand(1);
+    const auto& value = rir.module.functions[0].values[policy.id];
+    auto& constant = rir.module.functions[0].blocks[value.def_block.id].insts[value.def_inst];
+    REQUIRE_EQ(constant.op, rir::Opcode::ConstI32);
+    CHECK_EQ(constant.imm.i32_val, static_cast<i32>(RequestPolicyId::Http11PreserveHostLowercase));
+    rir.destroy();
+}
+
+TEST(frontend, request_policy_preserve_host_rejects_every_other_combination) {
+    const char* invalid[] = {
+        // Missing header_names.
+        "upstream b at \"127.0.0.1:9000\"\nroute GET \"/\" { return forward(b, request_policy: { "
+        "version: \"HTTP/1.1\", host: \"preserve\", connection: \"omit\", "
+        "forwarded_proto: \"http\", strip_headers: [\"Connection\", \"Keep-Alive\", \"TE\", "
+        "\"Expect\", \"Upgrade\", \"Proxy-Connection\"] }) }\n",
+        // Missing forwarded_proto.
+        "upstream b at \"127.0.0.1:9000\"\nroute GET \"/\" { return forward(b, request_policy: { "
+        "version: \"HTTP/1.1\", host: \"preserve\", connection: \"omit\", "
+        "header_names: \"lowercase\", strip_headers: [\"Connection\", \"Keep-Alive\", \"TE\", "
+        "\"Expect\", \"Upgrade\", \"Proxy-Connection\"] }) }\n",
+        // Five-name strip list (missing Proxy-Connection) with preserve.
+        "upstream b at \"127.0.0.1:9000\"\nroute GET \"/\" { return forward(b, request_policy: { "
+        "version: \"HTTP/1.1\", host: \"preserve\", connection: \"omit\", "
+        "header_names: \"lowercase\", forwarded_proto: \"http\", strip_headers: [\"Connection\", "
+        "\"Keep-Alive\", \"TE\", \"Expect\", \"Upgrade\"] }) }\n",
+        // content_length_position rejected with preserve.
+        "upstream b at \"127.0.0.1:9000\"\nroute GET \"/\" { return forward(b, request_policy: { "
+        "version: \"HTTP/1.1\", host: \"preserve\", connection: \"omit\", "
+        "header_names: \"lowercase\", forwarded_proto: \"http\", content_length_position: "
+        "\"after_host\", strip_headers: [\"Connection\", \"Keep-Alive\", \"TE\", \"Expect\", "
+        "\"Upgrade\", \"Proxy-Connection\"] }) }\n",
+        // retained_header_value rejected with preserve.
+        "upstream b at \"127.0.0.1:9000\"\nroute GET \"/\" { return forward(b, request_policy: { "
+        "version: \"HTTP/1.1\", host: \"preserve\", connection: \"omit\", "
+        "header_names: \"lowercase\", forwarded_proto: \"http\", retained_header_value: "
+        "\"trim_sp_preserve_htab\", strip_headers: [\"Connection\", \"Keep-Alive\", \"TE\", "
+        "\"Expect\", \"Upgrade\", \"Proxy-Connection\"] }) }\n",
+        // header_names rejected with host: "upstream".
+        "upstream b at \"127.0.0.1:9000\"\nroute GET \"/\" { return forward(b, request_policy: { "
+        "version: \"HTTP/1.1\", host: \"upstream\", connection: \"omit\", "
+        "header_names: \"lowercase\", strip_headers: [\"Connection\", \"Keep-Alive\", \"TE\", "
+        "\"Expect\", \"Upgrade\"] }) }\n",
+        // forwarded_proto rejected with host: "upstream".
+        "upstream b at \"127.0.0.1:9000\"\nroute GET \"/\" { return forward(b, request_policy: { "
+        "version: \"HTTP/1.1\", host: \"upstream\", connection: \"omit\", "
+        "forwarded_proto: \"http\", strip_headers: [\"Connection\", \"Keep-Alive\", \"TE\", "
+        "\"Expect\", \"Upgrade\"] }) }\n",
+        // "Proxy-Connection" rejected in the strip list with host: "upstream".
+        "upstream b at \"127.0.0.1:9000\"\nroute GET \"/\" { return forward(b, request_policy: { "
+        "version: \"HTTP/1.1\", host: \"upstream\", connection: \"omit\", "
+        "strip_headers: [\"Connection\", \"Keep-Alive\", \"TE\", \"Expect\", \"Upgrade\", "
+        "\"Proxy-Connection\"] }) }\n",
+    };
+    for (const char* src : invalid) {
+        auto bad_lex = lex(lit(src));
+        REQUIRE(bad_lex);
+        auto bad_ast = parse_file_heap(bad_lex.value());
+        CHECK_FALSE(bad_ast.has_value());
+    }
+}
+
+TEST(frontend, request_policy_preserve_host_rejects_timing_and_buffering_options) {
+    const auto source_for = [](const char* kwarg) {
+        return std::string(R"rut(
+upstream backend at "127.0.0.1:9000"
+route GET "/" {
+    return forward(backend, request_policy: {
+        version: "HTTP/1.1",
+        host: "preserve",
+        connection: "omit",
+        header_names: "lowercase",
+        forwarded_proto: "http",
+        strip_headers: ["Connection", "Keep-Alive", "TE", "Expect", "Upgrade", "Proxy-Connection"]
+    }, )rut") + kwarg +
+               ")\n}\n";
+    };
+    const char* rejected_kwargs[] = {
+        "response_read_timeout: 1s",
+        "response_buffering: \"complete_content_length\"",
+        "target_transform: { strip_prefix: \"/\", replace_prefix: \"/x/\" }",
+    };
+    for (const char* kwarg : rejected_kwargs) {
+        const std::string source = source_for(kwarg);
+        auto lexed = lex({source.data(), static_cast<u32>(source.size())});
+        REQUIRE(lexed);
+        auto ast = parse_file_heap(lexed.value());
+        REQUIRE(ast);
+        auto hir = analyze_file_heap(ast.value());
+        REQUIRE_FALSE(hir.has_value());
+        CHECK(hir.error().detail.eq(
+            lit("request_policy host: \"preserve\" does not support this forward option")));
+    }
+}
+
 TEST(frontend, request_policy_content_length_position_selects_id_after_complete_object) {
     const char source[] = R"rut(
 upstream backend at "127.0.0.1:9000"

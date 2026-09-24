@@ -1,5 +1,6 @@
 // Real-socket integration tests. Ported from libuv/libevent2 scenarios.
 #include "epoll_tls_test_hooks.h"
+#include "fixtures/envoy_oracle_milestone_s.inc"
 #include "framing_selection_preflight_fixture.h"
 #include "rut/compiler/analyze.h"
 #include "rut/compiler/lexer.h"
@@ -24682,6 +24683,145 @@ TEST(route, forward_request_policy_rebuilds_nginx_h11_headers) {
                            static_cast<u32>(reject_response_len),
                            vector.expected_status,
                            static_cast<u32>(strlen(vector.expected_status))));
+        usleep(100000);
+        CHECK_EQ(upstream.accepted_count.load(std::memory_order_acquire), accepted_before);
+        CHECK_EQ(upstream.request_count.load(std::memory_order_acquire), requests_before);
+    }
+}
+
+// PR3: the Envoy-compatible `host: "preserve"` request policy
+// (RequestPolicyId::Http11PreserveHostLowercase). Byte-for-byte against the
+// CI-recorded Envoy v1.39.1 oracle transcript (tests/fixtures/
+// envoy_oracle_milestone_s.inc, envoy-pr-plan.md PR2/PR3): preserved Host
+// first, lowercase header names, Envoy's hop-by-hop set (incl.
+// Proxy-Connection and Connection-nominated headers) dropped, `te` kept only
+// for an exact "trailers" value, and a trailing x-forwarded-proto.
+TEST(route, forward_request_policy_preserve_host_lowercase_h11_wire) {
+    using namespace rut;
+    struct JitResources {
+        FrontendRirModule rir{};
+        jit::JitEngine engine{};
+        ~JitResources() {
+            engine.shutdown();
+            rir.destroy();
+        }
+    } resources;
+    RecordingUpstream upstream;
+    REQUIRE(upstream.setup());
+
+    auto route_block = [](const char* path) {
+        return std::string("route \"") + path +
+               "\" {\n"
+               "    return forward(backend, request_policy: {\n"
+               "        version: \"HTTP/1.1\", host: \"preserve\", connection: \"omit\",\n"
+               "        header_names: \"lowercase\", forwarded_proto: \"http\",\n"
+               "        strip_headers: [\"Connection\", \"Keep-Alive\", \"TE\", \"Expect\", "
+               "\"Upgrade\", \"Proxy-Connection\"]\n"
+               "    })\n"
+               "}\n";
+    };
+    char upstream_line[64];
+    const int upstream_line_len = snprintf(upstream_line,
+                                           sizeof(upstream_line),
+                                           "upstream backend at \"127.0.0.1:%u\"\n",
+                                           upstream.port);
+    REQUIRE_GT(upstream_line_len, 0);
+    std::string source(upstream_line);
+    source += route_block("/smoke");
+    source += route_block("/hop");
+    source += route_block("/upload");
+    source += route_block("/head");
+
+    auto lexed = lex({source.data(), static_cast<u32>(source.size())});
+    REQUIRE(lexed);
+    auto ast = parse_file(lexed.value());
+    REQUIRE(ast);
+    std::unique_ptr<AstFile> ast_owned(ast.value());
+    auto hir = analyze_file(*ast_owned);
+    REQUIRE(hir);
+    std::unique_ptr<HirModule> hir_owned(hir.value());
+    auto mir = build_mir(*hir_owned);
+    REQUIRE(mir);
+    std::unique_ptr<MirModule> mir_owned(mir.value());
+    auto& rir = resources.rir;
+    REQUIRE(lower_to_rir(*mir_owned, rir));
+    auto cg = jit::codegen(rir.module);
+    REQUIRE(cg.ok);
+    auto& engine = resources.engine;
+    REQUIRE(engine.init());
+    REQUIRE(engine.compile(cg.mod, cg.ctx));
+    RouteConfig cfg{};
+    REQUIRE(populate_route_config(cfg, rir.module));
+    REQUIRE(register_jit_routes(cfg, rir.module, engine));
+    const RouteConfig* active = &cfg;
+    ScopedProxyLoop proxy;
+    REQUIRE(proxy.setup(&active, 1000));
+
+    auto send_case = [&](const char* client_bytes,
+                         u32 client_len,
+                         u32 expected_history_slot,
+                         const char* expected_upstream,
+                         u32 expected_upstream_len) {
+        i32 client = connect_to(proxy.port);
+        REQUIRE_GE(client, 0);
+        REQUIRE(send_all(client, client_bytes, client_len));
+        char response[1024];
+        const i32 response_read = recv_timeout(client, response, sizeof(response), 2000);
+        close(client);
+        CHECK_GT(response_read, 0);
+        for (u32 i = 0; i < 400 && upstream.request_count.load(std::memory_order_acquire) <=
+                                       expected_history_slot;
+             i++)
+            usleep(5000);
+        REQUIRE_GT(upstream.request_count.load(std::memory_order_acquire), expected_history_slot);
+        REQUIRE_LT(expected_history_slot,
+                   static_cast<u32>(RecordingUpstream::kMaxRecordedRequests));
+        const u32 recorded_len = upstream.request_history_len[expected_history_slot];
+        REQUIRE_EQ(recorded_len, expected_upstream_len);
+        CHECK_EQ(__builtin_memcmp(upstream.request_history[expected_history_slot],
+                                  expected_upstream,
+                                  expected_upstream_len),
+                 0);
+    };
+
+    send_case(kEnvoyOracle_get_smoke_client,
+              static_cast<u32>(sizeof(kEnvoyOracle_get_smoke_client) - 1),
+              0,
+              kEnvoyOracle_get_smoke_upstream,
+              static_cast<u32>(sizeof(kEnvoyOracle_get_smoke_upstream) - 1));
+    send_case(kEnvoyOracle_get_hop_by_hop_client,
+              static_cast<u32>(sizeof(kEnvoyOracle_get_hop_by_hop_client) - 1),
+              1,
+              kEnvoyOracle_get_hop_by_hop_upstream,
+              static_cast<u32>(sizeof(kEnvoyOracle_get_hop_by_hop_upstream) - 1));
+    send_case(kEnvoyOracle_post_fixed_client,
+              static_cast<u32>(sizeof(kEnvoyOracle_post_fixed_client) - 1),
+              2,
+              kEnvoyOracle_post_fixed_upstream,
+              static_cast<u32>(sizeof(kEnvoyOracle_post_fixed_upstream) - 1));
+    send_case(kEnvoyOracle_head_smoke_client,
+              static_cast<u32>(sizeof(kEnvoyOracle_head_smoke_client) - 1),
+              3,
+              kEnvoyOracle_head_smoke_upstream,
+              static_cast<u32>(sizeof(kEnvoyOracle_head_smoke_upstream) - 1));
+
+    // Missing/duplicate Host each fail closed: no additional upstream
+    // connection is opened, and the downstream sees 400.
+    const u32 accepted_before = upstream.accepted_count.load(std::memory_order_acquire);
+    const u32 requests_before = upstream.request_count.load(std::memory_order_acquire);
+    const char* fail_closed[] = {
+        "GET /smoke HTTP/1.1\r\nX-Only: yes\r\n\r\n",
+        "GET /smoke HTTP/1.1\r\nHost: a\r\nHost: b\r\n\r\n",
+    };
+    for (const char* req : fail_closed) {
+        i32 client = connect_to(proxy.port);
+        REQUIRE_GE(client, 0);
+        REQUIRE(send_all(client, req, static_cast<u32>(strlen(req))));
+        char response[512];
+        const i32 response_read = recv_timeout(client, response, sizeof(response), 2000);
+        close(client);
+        CHECK_GT(response_read, 0);
+        CHECK(buf_contains(response, static_cast<u32>(response_read), "400", 3));
         usleep(100000);
         CHECK_EQ(upstream.accepted_count.load(std::memory_order_acquire), accepted_before);
         CHECK_EQ(upstream.request_count.load(std::memory_order_acquire), requests_before);

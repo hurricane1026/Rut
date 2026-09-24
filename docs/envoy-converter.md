@@ -286,10 +286,15 @@ folded into the golden below and into the parser/converter implementation:
    must be written `listen :8080`; a non-wildcard IPv4 listener is still
    `listen a.b.c.d:port`.
 2. `request_policy.strip_headers` accepts exactly the closed list
-   `["Connection", "Keep-Alive", "TE", "Expect", "Upgrade"]` today, plus
-   `"Proxy-Connection"` once the `host: "preserve"` capability
-   (`request_envoy_h1`) is admitted. `"Transfer-Encoding"` is rejected in
-   every combination the converter uses; it is dropped from the lowering.
+   `["Connection", "Keep-Alive", "TE", "Expect", "Upgrade"]` with
+   `host: "upstream"`, or exactly the six-name list adding
+   `"Proxy-Connection"` with `host: "preserve"` (the `request_envoy_h1`
+   capability, landed in PR3). `"Transfer-Encoding"` is rejected in every
+   combination the converter uses; it is dropped from the lowering. The
+   `"TE"` entry does not mean "always strip": per the Envoy oracle
+   (`tests/fixtures/envoy_oracle_milestone_s.inc`), `host: "preserve"` keeps
+   a client `te` header when its value is exactly `trailers` (Envoy forwards
+   only that token) and strips it for every other value.
 3. `request_policy` and `set_header` cannot be used together
    (`src/compiler/parser.cc` around lines 2022 and 2568). The milestone
    lowering therefore does not use `set_header`; `x-forwarded-proto` is
@@ -990,24 +995,32 @@ Everything below is a Rut-side gap the milestone or the next increments hit.
 Each needs its own issue before the corresponding row can leave
 `BLOCKED_BY_RUT`.
 
-- `request_policy.host: "preserve"`: Envoy never rewrites `Host`; Rut's policy
-  grammar only offers rewriting to the upstream address.
-- Header-name casing selector on request and response policies: Envoy emits
-  lowercase names over HTTP/1.1.
+- `request_policy.host: "preserve"` (`request_envoy_h1`, PR3): landed. The
+  runtime serializer follows the Envoy oracle where it differs from this
+  document's original sketch: the client's `x-forwarded-proto` (if any) is
+  kept unchanged in its original position rather than overwritten, and
+  `x-forwarded-proto: http` is appended only when the client sent none. See
+  `tests/fixtures/envoy_oracle_milestone_s.inc` and
+  `docs/envoy-compatibility.md`.
+- Header-name casing selector on the response policy: Envoy emits lowercase
+  names over HTTP/1.1. The request side landed with `request_envoy_h1`
+  (PR3, `header_names: "lowercase"` in `request_policy`); the response side
+  is still `response_envoy_h1`.
 - Dynamic `Connection`-nominated header stripping on the upstream request:
   Envoy parses the client's `Connection` header value and removes every
-  header it names (e.g. `Connection: X-Secret` also removes `X-Secret`).
-  Today's `request_policy.strip_headers` is a fixed, closed literal list
-  (`Connection`, `Keep-Alive`, `TE`, `Expect`, `Upgrade`, and
-  `Proxy-Connection` once `request_envoy_h1` lands) parsed at
-  `src/compiler/parser.cc` — it cannot express "whatever this request's
-  `Connection` header names". This is a distinct gap from Host preservation
-  and header casing; `request_envoy_h1` landing (PR3) must not be considered
-  a byte-for-byte match for Envoy's `get_hop_by_hop` behavior unless it also
-  covers this. (Rut's response path already has the equivalent dynamic
-  nomination handling for the upstream→downstream direction —
-  `upstream_connection_nominates` in `include/rut/runtime/callbacks_impl.h`;
-  only the downstream→upstream request direction is missing it.)
+  header it names (e.g. `Connection: X-Secret` also removes `X-Secret`). This
+  landed on the `host: "preserve"` profile with `request_envoy_h1` (PR3):
+  `apply_preserve_host_lowercase_request_policy`
+  (`include/rut/runtime/callbacks_impl.h`) parses the client's `Connection`
+  header into its comma-separated token list and drops every nominated
+  header name, matching Envoy's `get_hop_by_hop` behavior for that profile.
+  The fixed, closed `request_policy.strip_headers` literal list
+  (`Connection`, `Keep-Alive`, `TE`, `Expect`, `Upgrade`, `Proxy-Connection`)
+  parsed at `src/compiler/parser.cc` is unchanged and still cannot express
+  dynamic nomination; the gap remains for the `host: "upstream"` request
+  policies (ID1/ID2/ID3). (Rut's response path already has the equivalent
+  dynamic nomination handling for the upstream→downstream direction —
+  `upstream_connection_nominates` in `include/rut/runtime/callbacks_impl.h`.)
 - `response_policy.date: "preserve_or_current"`: add `date` only when absent.
 - `response_policy.server: "envoy"` with overwrite semantics, and an explicit
   "pass through upstream `server`" mode for `server_header_transformation:
