@@ -3433,6 +3433,64 @@ TEST(request_policy, preserve_host_lowercase_admission_table) {
     CHECK(complete_content_length_request_policy_is_admitted(kLegacy));
 }
 
+// `request_policy_body_response_admitted` (callbacks_impl.h) is the ordinary
+// strict-response body-path admission check for a body-carrying request
+// paired with a response_policy. It used to admit only ID1
+// (Http11FixedStrip); this is the fix that also admits ID4
+// (Http11PreserveHostLowercase) there, without widening the closed
+// FixedContentLengthUploadHeaderOnlyHead profile (still gated by
+// `fixed_upload_head_request_policy_is_admitted`, which excludes ID4).
+TEST(request_policy, body_response_admitted_accepts_preserve_host_lowercase) {
+    static constexpr u16 kLegacy = static_cast<u16>(RequestPolicyId::Http11FixedStrip);
+    static constexpr u16 kAfterHost =
+        static_cast<u16>(RequestPolicyId::Http11FixedStripContentLengthAfterHost);
+    static constexpr u16 kRetained =
+        static_cast<u16>(RequestPolicyId::Http11FixedTrimSpPreserveHtab);
+    static constexpr u16 kPreserveHost =
+        static_cast<u16>(RequestPolicyId::Http11PreserveHostLowercase);
+
+    Connection conn{};
+    u8 recv[64]{};
+    u8 send[64]{};
+    conn.reset();
+    conn.recv_slice = recv;
+    conn.send_slice = send;
+    conn.bind_request_receive_buffer(recv, sizeof(recv));
+    conn.send_buf.bind(send, sizeof(send));
+    static constexpr char kBody[] = "abcd";
+    REQUIRE_EQ(conn.recv_buf.write(reinterpret_cast<const u8*>(kBody), sizeof(kBody) - 1),
+               sizeof(kBody) - 1);
+    conn.req_initial_send_len = sizeof(kBody) - 1;
+    conn.request_body_fully_buffered = true;
+    conn.request_policy_body_pending = false;
+    conn.req_body_streamed = false;
+    conn.req_body_remaining = 0;
+    conn.req_body_mode = BodyMode::ContentLength;
+    conn.response_read_deadline_profile = ResponseReadDeadlineProfile::None;
+
+    conn.request_policy_id = kPreserveHost;
+    CHECK(request_policy_body_response_admitted(conn));
+    conn.request_policy_id = kLegacy;
+    CHECK(request_policy_body_response_admitted(conn));
+    // Every other supported request policy remains excluded from this
+    // ordinary body path.
+    conn.request_policy_id = kAfterHost;
+    CHECK_FALSE(request_policy_body_response_admitted(conn));
+    conn.request_policy_id = kRetained;
+    CHECK_FALSE(request_policy_body_response_admitted(conn));
+
+    // The closed fixed-upload-HEAD deadline profile is unaffected: it still
+    // admits only {ID1, ID2}, never ID4.
+    conn.response_read_deadline_profile =
+        ResponseReadDeadlineProfile::FixedContentLengthUploadHeaderOnlyHead;
+    conn.request_policy_id = kPreserveHost;
+    CHECK_FALSE(request_policy_body_response_admitted(conn));
+    conn.request_policy_id = kLegacy;
+    CHECK(request_policy_body_response_admitted(conn));
+    conn.request_policy_id = kAfterHost;
+    CHECK(request_policy_body_response_admitted(conn));
+}
+
 TEST(request_policy, content_length_after_host_exact_wire_and_fail_closed_boundaries) {
     static constexpr u16 kLegacy = static_cast<u16>(RequestPolicyId::Http11FixedStrip);
     static constexpr u16 kAfterHost =

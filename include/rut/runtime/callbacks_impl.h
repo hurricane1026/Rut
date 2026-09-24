@@ -8877,7 +8877,9 @@ inline bool request_policy_body_response_admitted(const Connection& conn) {
     return conn.response_read_deadline_profile ==
                    ResponseReadDeadlineProfile::FixedContentLengthUploadHeaderOnlyHead
                ? fixed_upload_head_request_policy_is_admitted(conn.request_policy_id)
-               : conn.request_policy_id == static_cast<u16>(RequestPolicyId::Http11FixedStrip);
+               : conn.request_policy_id == static_cast<u16>(RequestPolicyId::Http11FixedStrip) ||
+                     conn.request_policy_id ==
+                         static_cast<u16>(RequestPolicyId::Http11PreserveHostLowercase);
 }
 
 // Check immediately before strict response headers are committed. The body
