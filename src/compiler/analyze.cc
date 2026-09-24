@@ -9761,6 +9761,16 @@ static FrontendResult<HirTerminator> analyze_term(const AstStatement& stmt, cons
         if (!response_policy_spec_valid(*response_policy))
             return frontend_error(
                 FrontendError::UnsupportedSyntax, stmt.span, lit_str("invalid response policy"));
+        // `header_order: "upstream"` is ordinary-forward-only, mirroring
+        // `request_policy host: "preserve"` above: it never carries response
+        // read timing, response buffering, or a timeout failure policy bundle.
+        if (response_policy->header_order == ResponsePolicyHeaderOrder::Upstream &&
+            (stmt.has_forward_response_read_timeout || stmt.has_forward_response_buffering ||
+             stmt.has_forward_timeout_failure_policy))
+            return frontend_error(FrontendError::UnsupportedSyntax,
+                                  stmt.span,
+                                  lit_str("response_policy header_order: \"upstream\" does not "
+                                          "support this forward option"));
     }
     if (stmt.has_forward_failure_policy) {
         if (stmt.forward_failure_policy_id == 0 ||
