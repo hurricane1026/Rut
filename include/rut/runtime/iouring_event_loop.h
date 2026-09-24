@@ -2946,7 +2946,9 @@ public:
             return false;
         u32 generation = 0;
         if (!c.next_non_upstream_send_generation(generation)) return false;
-        if (!backend.add_send(c.fd, c.id, src, len, generation)) return false;
+        if (!backend.add_send(
+                c.fd, c.id, src, len, generation, c.tls_ciphertext_send_has_follow_up(len)))
+            return false;
         c.tls_out_inflight = true;
         c.tls_out_inflight_len = len;
         c.tls_out_inflight_generation = generation;
@@ -3022,7 +3024,7 @@ public:
                 return false;
             }
         }
-        if (backend.add_send(c.fd, c.id, buf, len, generation)) {
+        if (backend.add_send(c.fd, c.id, buf, len, generation, c.plaintext_send_has_follow_up())) {
             c.pending_ops++;
             c.send_armed = true;
             return true;

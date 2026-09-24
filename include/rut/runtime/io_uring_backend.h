@@ -100,6 +100,7 @@ struct IoUringBackend {
         IoEventType type;
         u32 upstream_episode;
         u32 generation = 0;
+        u32 msg_flags = 0;  // extra flags kept for partial-send resubmission
     };
     MappedArray<SendState> send_state;
     MappedArray<SendState> upstream_send_state;
@@ -195,9 +196,12 @@ struct IoUringBackend {
         return cancel_retiring_upstream(conn_id, IoEventType::UpstreamRecv, upstream_episode);
     }
 
-    // Submit a send (or zero-copy send).
+    // Submit a send (or zero-copy send). more_follows adds MSG_MORE (also on
+    // any partial-send resubmission): the caller submits more of the same
+    // stream from this send's completion.
     // Returns false if SQ is full (no SQE submitted).
-    bool add_send(i32 fd, u32 conn_id, const u8* buf, u32 len, u32 generation = 0);
+    bool add_send(
+        i32 fd, u32 conn_id, const u8* buf, u32 len, u32 generation = 0, bool more_follows = false);
 
     // Submit the currently staged SQ entries without waiting for a completion.
     // This is a bounded pressure-relief primitive: callers decide whether to

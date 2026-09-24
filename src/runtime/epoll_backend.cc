@@ -684,14 +684,15 @@ bool EpollBackend::add_recv_upstream(i32 fd, u32 conn_id, u32 upstream_episode) 
     return true;
 }
 
-bool EpollBackend::add_send(i32 fd, u32 conn_id, const u8* buf, u32 len) {
+bool EpollBackend::add_send(i32 fd, u32 conn_id, const u8* buf, u32 len, bool more_follows) {
     if (conn_id >= connection_capacity) return false;
 
     // One immediate/error completion is the only synchronous result this
     // producer can append; partial/EAGAIN uses epoll and consumes no slot.
     if (pending_count >= kPendingCap) return false;
 
-    ssize_t nw = send(fd, buf, len, MSG_NOSIGNAL);
+    const u32 extra_flags = more_follows ? static_cast<u32>(MSG_MORE) : 0u;
+    ssize_t nw = send(fd, buf, len, MSG_NOSIGNAL | extra_flags);
 
     if (nw == static_cast<ssize_t>(len)) {
         return queue_pending_completion(
@@ -705,7 +706,8 @@ bool EpollBackend::add_send(i32 fd, u32 conn_id, const u8* buf, u32 len) {
 
     u32 sent = (nw > 0) ? static_cast<u32>(nw) : 0;
     if (conn_id < connection_capacity) {
-        send_state[conn_id] = {buf, fd, sent, len - sent, IoEventType::Send, false, 0, 0};
+        send_state[conn_id] = {
+            buf, fd, sent, len - sent, IoEventType::Send, false, 0, 0, extra_flags};
     }
 
     invalidate_fd_interest(conn_id, fd);
@@ -1313,7 +1315,8 @@ u32 EpollBackend::wait(IoEvent* events, u32 max_events, Connection* conns, u32 m
                 while (ss.remaining > 0) {
                     ssize_t nw;
                     do {
-                        nw = send(ss.fd, ss.src + ss.offset, ss.remaining, MSG_NOSIGNAL);
+                        nw = send(
+                            ss.fd, ss.src + ss.offset, ss.remaining, MSG_NOSIGNAL | ss.msg_flags);
                     } while (nw < 0 && errno == EINTR);
                     if (nw > 0) {
                         ss.offset += static_cast<u32>(nw);

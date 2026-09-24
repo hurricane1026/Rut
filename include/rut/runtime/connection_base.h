@@ -858,6 +858,25 @@ struct ConnectionBase {
                tls_send_len == 0 && tls_send_off == 0 && tls_pending_on_send == nullptr;
     }
 
+    // Whether a downstream send is followed, straight from its own completion
+    // and without waiting on any other I/O or computation, by more bytes of the
+    // same response. Such sends carry MSG_MORE: the kernel then coalesces a
+    // short head (e.g. the header slice of a large local body) with the next
+    // chunk instead of pushing it alone. A lone sub-MSS head can leave a small
+    // receive window below one MSS with the rest queued, and the stream then
+    // waits for a delayed ACK or the persist timer. Anything that waits on
+    // upstream I/O must push.
+    [[nodiscard]] bool plaintext_send_has_follow_up() const { return local_body_remaining != 0; }
+
+    // TLS variant for a raw ciphertext send of `len` bytes from tls_out_buf:
+    // only ciphertext already queued behind it counts. Plaintext still to be
+    // encrypted (or a local body chunk still to be fed) would hold the corked
+    // record for a whole encryption pass, which costs latency at low
+    // concurrency more than the coalescing gains.
+    [[nodiscard]] bool tls_ciphertext_send_has_follow_up(u32 len) const {
+        return len < tls_out_buf.len();
+    }
+
     [[nodiscard]] bool tls_raw_send_owner_is_neutral() const {
         return !tls_out_inflight && tls_out_inflight_len == 0 && tls_out_inflight_generation == 0 &&
                tls_out_inflight_fd == -1 && tls_out_inflight_src == nullptr;

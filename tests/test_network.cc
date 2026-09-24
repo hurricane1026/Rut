@@ -9116,6 +9116,45 @@ TEST(connection_base, tls_send_owners_reset_and_share_nonwrapping_tokens) {
     CHECK_EQ(conn.response_read_deadline_send_owner_generation, 0u);
 }
 
+TEST(iouring_send, more_follows_sets_msg_more_across_partial_resubmission) {
+    ScopedTlsRawSendLoop guard;
+    REQUIRE(guard.init());
+    IoUringBackend& backend = guard.loop->backend;
+    static const u8 kBody[64] = {};
+    constexpr u32 kGeneration = 5;
+    REQUIRE(backend.add_send(/*fd=*/9, /*conn_id=*/0, kBody, sizeof(kBody), kGeneration, true));
+    REQUIRE_EQ(guard.sq_tail, 1u);
+    CHECK_EQ(guard.sq_entries[0].opcode, IORING_OP_SEND);
+    CHECK_EQ(guard.sq_entries[0].msg_flags, static_cast<u32>(MSG_NOSIGNAL | MSG_MORE));
+    CHECK_EQ(backend.send_state[0].msg_flags, static_cast<u32>(MSG_MORE));
+
+    guard.sq_head = guard.sq_tail;
+    backend.pending = 0;
+    REQUIRE(guard.push_send_cqe(kGeneration, 10));
+    IoEvent partial{};
+    CHECK_EQ(backend.wait(&partial, 1, guard.loop->conns, 1), 0u);
+    REQUIRE_EQ(guard.sq_tail, 2u);  // the remainder is resubmitted, still corked
+    CHECK_EQ(guard.sq_entries[1].opcode, IORING_OP_SEND);
+    CHECK_EQ(guard.sq_entries[1].addr, reinterpret_cast<u64>(kBody + 10));
+    CHECK_EQ(guard.sq_entries[1].len, sizeof(kBody) - 10u);
+    CHECK_EQ(guard.sq_entries[1].msg_flags, static_cast<u32>(MSG_NOSIGNAL | MSG_MORE));
+
+    guard.sq_head = guard.sq_tail;
+    backend.pending = 0;
+    REQUIRE(guard.push_send_cqe(kGeneration, static_cast<i32>(sizeof(kBody) - 10u)));
+    IoEvent done{};
+    REQUIRE_EQ(backend.wait(&done, 1, guard.loop->conns, 1), 1u);
+    CHECK_EQ(done.result, static_cast<i32>(sizeof(kBody)));
+
+    // A send with nothing behind it is pushed immediately.
+    REQUIRE(backend.add_send(/*fd=*/9, /*conn_id=*/0, kBody, sizeof(kBody), kGeneration + 1));
+    CHECK_EQ(guard.sq_entries[guard.sq_tail - 1].msg_flags, static_cast<u32>(MSG_NOSIGNAL));
+    CHECK_EQ(backend.send_state[0].msg_flags, 0u);
+    guard.sq_head = guard.sq_tail;
+    backend.pending = 0;
+    backend.send_state[0].remaining = 0;
+}
+
 TEST(tls_iouring, staged_502_uses_one_shot_ciphertext_submit_and_terminal_completion) {
     auto context_result = create_tls_server_context(RUT_TESTDATA_DIR "/localhost_cert.pem",
                                                     RUT_TESTDATA_DIR "/localhost_key.pem");
@@ -24509,6 +24548,43 @@ TEST(epoll_loop, poll_command_config_swap) {
     destroy_real_loop(loop);
 }
 
+TEST(epoll_send, more_follows_is_kept_for_partial_write_continuation) {
+    const i32 listener = socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0);
+    REQUIRE_GE(listener, 0);
+    sockaddr_in addr{};
+    addr.sin_family = AF_INET;
+    addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    REQUIRE_EQ(bind(listener, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)), 0);
+    REQUIRE_EQ(listen(listener, 1), 0);
+    socklen_t addr_len = sizeof(addr);
+    REQUIRE_EQ(getsockname(listener, reinterpret_cast<sockaddr*>(&addr), &addr_len), 0);
+    const i32 client = socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0);
+    REQUIRE_GE(client, 0);
+    const i32 small = 4096;
+    REQUIRE_EQ(setsockopt(client, SOL_SOCKET, SO_RCVBUF, &small, sizeof(small)), 0);
+    REQUIRE_EQ(connect(client, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)), 0);
+    const i32 server = accept4(listener, nullptr, nullptr, SOCK_NONBLOCK | SOCK_CLOEXEC);
+    REQUIRE_GE(server, 0);
+    REQUIRE_EQ(setsockopt(server, SOL_SOCKET, SO_SNDBUF, &small, sizeof(small)), 0);
+
+    EpollBackend backend{};
+    REQUIRE(backend.init(0, -1).has_value());
+    // Far more than the shrunken socket buffers can absorb: the write is partial.
+    constexpr u32 kLen = 8u << 20;
+    void* big = mmap(nullptr, kLen, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    REQUIRE_NE(big, MAP_FAILED);
+    REQUIRE(backend.add_send(server, /*conn_id=*/3, static_cast<const u8*>(big), kLen, true));
+    CHECK_EQ(backend.pending_count, 0u);  // parked on EPOLLOUT, no completion yet
+    CHECK_GT(backend.send_state[3].remaining, 0u);
+    CHECK_EQ(backend.send_state[3].msg_flags, static_cast<u32>(MSG_MORE));
+    backend.clear_send_state(3);
+    backend.shutdown();
+    munmap(big, kLen);
+    close(server);
+    close(client);
+    close(listener);
+}
+
 TEST(epoll_episode, invalid_upstream_registration_has_no_side_effects) {
     EpollBackend backend{};
     REQUIRE(backend.init(0, -1).has_value());
@@ -35768,8 +35844,8 @@ bool stage_live_precise_request(IoUringEventLoop* loop,
     const u8* request = bodyless_get ? (downstream_close ? kGetCloseRequest : kGetKeepAliveRequest)
                         : downstream_close ? kCloseRequest
                                            : kKeepAliveRequest;
-    const u32 request_len = bodyless_get       ? (downstream_close ? sizeof(kGetCloseRequest) - 1u
-                                                                   : sizeof(kGetKeepAliveRequest) - 1u)
+    const u32 request_len = bodyless_get ? (downstream_close ? sizeof(kGetCloseRequest) - 1u
+                                                             : sizeof(kGetKeepAliveRequest) - 1u)
                             : downstream_close ? sizeof(kCloseRequest) - 1u
                                                : sizeof(kKeepAliveRequest) - 1u;
     if (conn->recv_buf.write(request, request_len) != request_len) return fail();
@@ -69729,8 +69805,12 @@ TEST(response_headers, large_config_body_sends_from_pinned_read_only_memory) {
         const u32 prefix = conn->send_buf.len() - header_end;
         REQUIRE_GT(prefix, 0u);
         CHECK_EQ(memcmp(slice + header_end, body, prefix), 0);
+        // The header slice is followed straight from its completion by the
+        // body span, so it is submitted as MSG_MORE; the final span is not.
+        CHECK(conn->plaintext_send_has_follow_up());
         on_response_sent<SmallLoop>(
             &loop, *conn, make_ev(conn->id, IoEventType::Send, conn->send_buf.len()));
+        CHECK_FALSE(conn->plaintext_send_has_follow_up());
         auto* send = loop.backend.last_op(MockOp::Send);
         REQUIRE(send != nullptr);
         CHECK_EQ(send->send_buf, body + prefix);
@@ -69751,6 +69831,34 @@ TEST(response_headers, large_config_body_sends_from_pinned_read_only_memory) {
         CHECK_EQ(conn->local_body_cursor, nullptr);
         CHECK_EQ(conn->local_response_size, 0u);
     }
+}
+
+TEST(send_follow_up, tls_ciphertext_send_follows_only_queued_ciphertext) {
+    Connection conn{};
+    conn.reset();
+    static u8 out_storage[64];
+    conn.tls_out_buf.bind(out_storage, sizeof(out_storage));
+    static const u8 kCipher[40] = {};
+    REQUIRE_EQ(conn.tls_out_buf.write(kCipher, sizeof(kCipher)), sizeof(kCipher));
+    // The whole queued ciphertext with nothing behind it pushes.
+    CHECK_FALSE(conn.tls_ciphertext_send_has_follow_up(sizeof(kCipher)));
+    // A chunked drain leaves queued ciphertext behind it.
+    CHECK(conn.tls_ciphertext_send_has_follow_up(16));
+    // Plaintext still to be encrypted, or a local body still to be fed, does
+    // not cork: the record would wait for a whole encryption pass.
+    static const u8 kPlain[8] = {};
+    conn.tls_send_src = kPlain;
+    conn.tls_send_len = sizeof(kPlain);
+    conn.tls_send_off = 4;
+    conn.local_body_remaining = 1;
+    CHECK_FALSE(conn.tls_ciphertext_send_has_follow_up(sizeof(kCipher)));
+    // The plaintext path corks while a local body continues.
+    CHECK(conn.plaintext_send_has_follow_up());
+    conn.local_body_remaining = 0;
+    CHECK_FALSE(conn.plaintext_send_has_follow_up());
+    conn.tls_send_src = nullptr;
+    conn.tls_send_len = 0;
+    conn.tls_send_off = 0;
 }
 
 TEST(response_headers, tls_large_config_body_keeps_bounded_continuation_chunk) {
