@@ -7127,9 +7127,11 @@ void pump_response_read_deadline_body(Loop* loop, Connection& conn) {
 // the chunk (the connection may have been closed on submission failure).
 template <typename Loop>
 bool start_upstream_body_relay(Loop* loop, Connection& conn, u32 send_len) {
-    if constexpr (!(requires(Loop* l, Connection& c) {
+    if constexpr (!(requires(Loop* l, Connection& c, const u8* b) {
                       l->upstream_body_relay_eligible(c);
                       l->alloc_upstream_relay_slice(c);
+                      l->take_relay_recv_buffer(c);
+                      l->relay_buffer_capacity(b);
                   })) {
         return false;
     } else {
@@ -7138,9 +7140,10 @@ bool start_upstream_body_relay(Loop* loop, Connection& conn, u32 send_len) {
             !loop->alloc_upstream_relay_slice(conn))
             return false;
         u8* const sending = conn.upstream_recv_slice;
-        conn.upstream_recv_slice = conn.upstream_relay_slice;
+        u8* const next = loop->take_relay_recv_buffer(conn);
+        conn.upstream_recv_slice = next;
         conn.upstream_relay_slice = sending;
-        conn.upstream_recv_buf.bind(conn.upstream_recv_slice, SlicePool::kSliceSize);
+        conn.upstream_recv_buf.bind(next, loop->relay_buffer_capacity(next));
         conn.upstream_relay_send_len = send_len;
         conn.resp_body_sent += send_len;
         conn.state = ConnState::Sending;
@@ -7629,6 +7632,8 @@ void on_response_body_sent(void* lp, Connection& conn, IoEvent ev) {
         proxy_stream_complete<Loop>(loop, conn);
         return;
     }
+    if constexpr (requires { loop->upgrade_upstream_recv_to_bulk(conn); })
+        loop->upgrade_upstream_recv_to_bulk(conn);
 
     conn.set_slots(nullptr, nullptr, &on_response_body_recvd<Loop>, nullptr);
     if (throttle_pause_before_pump(loop, conn, kRemaining)) return;
