@@ -1301,7 +1301,7 @@ TEST(route_config, no_content204_owned_install_normalizes_empty_views_and_dedupl
     forged = policies[0];
     forged.reason = {"No Content", 10};
     forged.server = {"nginx/1.29.7", 12};
-    forged.reserved1 = 1;
+    forged.header_order = StrictLocalResponseHeaderOrder::DateServerLength;
     CHECK_FALSE(rejected->install_strict_local_response_table_with_pre_route(
         &forged, 1, empty_pre_route, forged_unmatched, neutral, 0));
     CHECK_EQ(__builtin_memcmp(before.data(), rejected.get(), sizeof(RouteConfig)), 0);

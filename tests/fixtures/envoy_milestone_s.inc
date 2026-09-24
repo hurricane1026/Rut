@@ -47,7 +47,7 @@ route HEAD "/" {
             header_names: "lowercase",
             header_order: "length_type_date_server",
             head_mode: "suppress_body",
-            body: b"upstream connect error or disconnect/reset before headers. reset reason: remote connection failure, transport failure reason: delayed connect error: 111"
+            body: b"upstream connect error or disconnect/reset before headers. reset reason: remote connection failure"
         }
     )
 }
@@ -83,7 +83,7 @@ route "/" {
             connection_header: "close_only",
             header_names: "lowercase",
             header_order: "length_type_date_server",
-            body: b"upstream connect error or disconnect/reset before headers. reset reason: remote connection failure, transport failure reason: delayed connect error: 111"
+            body: b"upstream connect error or disconnect/reset before headers. reset reason: remote connection failure"
         }
     )
 }
