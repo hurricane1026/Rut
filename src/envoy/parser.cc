@@ -74,9 +74,37 @@ constexpr Field kEndpoint = RUT_FIELD("endpoint");
 constexpr Field kTimeout = RUT_FIELD("timeout");
 constexpr Field kSuppressEnvoyHeaders =
     RUT_FIELD2("suppress_envoy_headers", "suppressEnvoyHeaders");
+constexpr Field kPath = RUT_FIELD("path");
+constexpr Field kDirectResponse = RUT_FIELD2("direct_response", "directResponse");
+constexpr Field kStatus = RUT_FIELD("status");
+constexpr Field kBody = RUT_FIELD("body");
+constexpr Field kInlineString = RUT_FIELD2("inline_string", "inlineString");
+constexpr Field kRedirect = RUT_FIELD("redirect");
+constexpr Field kPathRedirect = RUT_FIELD2("path_redirect", "pathRedirect");
+constexpr Field kHostRedirect = RUT_FIELD2("host_redirect", "hostRedirect");
+constexpr Field kResponseCode = RUT_FIELD2("response_code", "responseCode");
 
 #undef RUT_FIELD
 #undef RUT_FIELD2
+
+// Route match text (`prefix` / `path`): printable ASCII excluding the
+// reserved characters that would make a plain-string match ambiguous with
+// query/fragment/percent-encoding, bounded to a small fixed length.
+constexpr u32 kMaxRouteMatchLen = 64u;
+
+bool route_match_byte_ok(char c) {
+    const auto b = static_cast<unsigned char>(c);
+    return b >= 0x21u && b <= 0x7eu && c != '?' && c != '#' && c != '%';
+}
+
+bool prefix_shape_ok(Str text) {
+    if (text.eq(lit_str("/"))) return true;
+    return text.len >= 2u && text.ptr[0] == '/' && text.ptr[text.len - 1u] == '/';
+}
+
+bool path_shape_ok(Str text) {
+    return text.len >= 1u && text.ptr[0] == '/';
+}
 
 bool field_matches(const Field& f, Str key) {
     return key.eq(f.snake) || (f.camel.len != 0u && key.eq(f.camel));
@@ -100,11 +128,20 @@ public:
         bootstrap.span = doc_.at(root).span;
         if (auto r = parse_static_resources(static_resources.value(), &bootstrap); !r)
             return core::make_unexpected(r.error());
-        if (!bootstrap.listener.filter_chain.hcm.route_config.virtual_host.route.action.cluster.eq(
-                bootstrap.cluster.name))
-            return invalid(bootstrap.listener.filter_chain.hcm.route_config.virtual_host.route
-                               .action.cluster_span,
-                           lit_str("route cluster does not name a declared cluster"));
+        for (const Route& route :
+             bootstrap.listener.filter_chain.hcm.route_config.virtual_host.routes) {
+            if (route.action.kind != RouteActionKind::Forward) continue;
+            bool declared = false;
+            for (const Cluster& cluster : bootstrap.clusters) {
+                if (route.action.cluster.eq(cluster.name)) {
+                    declared = true;
+                    break;
+                }
+            }
+            if (!declared)
+                return invalid(route.action.cluster_span,
+                               lit_str("route cluster does not name a declared cluster"));
+        }
         return bootstrap;
     }
 
@@ -330,11 +367,32 @@ private:
 
         auto clusters = required(node, kClusters, lit_str("static_resources.clusters is required"));
         if (!clusters) return core::make_unexpected(clusters.error());
-        auto cluster = single_element(clusters.value(),
-                                      lit_str("at least one cluster is required"),
-                                      lit_str("multiple clusters are unsupported"));
-        if (!cluster) return core::make_unexpected(cluster.error());
-        return parse_cluster(cluster.value(), &out->cluster);
+        return parse_clusters(clusters.value(), &out->clusters);
+    }
+
+    // A bounded, ordered list of clusters (`kMaxEnvoyClusters`); names must be
+    // unique. The (kMaxEnvoyClusters + 1)th element is rejected at its own
+    // span rather than the array's.
+    FrontendResult<bool> parse_clusters(u32 array, FixedVec<Cluster, kMaxEnvoyClusters>* out) {
+        auto ok = expect_array(array, lit_str("expected a JSON array"));
+        if (!ok) return core::make_unexpected(ok.error());
+        const JsonNode& node = doc_.at(array);
+        if (node.child_count == 0u)
+            return missing(node.span, lit_str("at least one cluster is required"));
+        for (u32 child = node.first_child; child != kJsonNoNode;
+             child = doc_.at(child).next_sibling) {
+            if (out->full())
+                return unsupported(doc_.at(child).span,
+                                   lit_str("more than 8 clusters are unsupported"));
+            Cluster cluster{};
+            if (auto r = parse_cluster(child, &cluster); !r) return r;
+            for (const Cluster& seen : *out) {
+                if (seen.name.eq(cluster.name))
+                    return invalid(cluster.name_span, lit_str("duplicate cluster name"));
+            }
+            out->push(cluster);
+        }
+        return true;
     }
 
     FrontendResult<bool> parse_listener(u32 node, Listener* out) {
@@ -581,63 +639,244 @@ private:
 
         auto routes = required(node, kRoutes, lit_str("virtual host routes is required"));
         if (!routes) return core::make_unexpected(routes.error());
-        auto route = single_element(routes.value(),
-                                    lit_str("at least one route is required"),
-                                    lit_str("multiple routes are unsupported"));
-        if (!route) return core::make_unexpected(route.error());
-        return parse_route(route.value(), &out->route);
+        return parse_routes(routes.value(), &out->routes);
+    }
+
+    // A bounded, ordered list of routes (`kMaxEnvoyRoutes`). Order is
+    // preserved from the source array; the list is not checked for shadowing
+    // here (that is a lowering-time concern, PR 8). The (kMaxEnvoyRoutes +
+    // 1)th element is rejected at its own span rather than the array's.
+    FrontendResult<bool> parse_routes(u32 array, FixedVec<Route, kMaxEnvoyRoutes>* out) {
+        auto ok = expect_array(array, lit_str("expected a JSON array"));
+        if (!ok) return core::make_unexpected(ok.error());
+        const JsonNode& node = doc_.at(array);
+        if (node.child_count == 0u)
+            return missing(node.span, lit_str("at least one route is required"));
+        for (u32 child = node.first_child; child != kJsonNoNode;
+             child = doc_.at(child).next_sibling) {
+            if (out->full())
+                return unsupported(doc_.at(child).span,
+                                   lit_str("more than 8 routes are unsupported"));
+            Route route{};
+            if (auto r = parse_route(child, &route); !r) return r;
+            out->push(route);
+        }
+        return true;
     }
 
     FrontendResult<bool> parse_route(u32 node, Route* out) {
         auto ok = expect_object(node, lit_str("route must be an object"));
         if (!ok) return ok;
-        const Field allowed[] = {kMatch, kRoute};
-        if (auto r = reject_unknown(node, allowed, 2u); !r) return r;
+        const Field allowed[] = {kMatch, kRoute, kDirectResponse, kRedirect};
+        if (auto r = reject_unknown(node, allowed, 4u); !r) return r;
         out->span = doc_.at(node).span;
 
         auto match = required(node, kMatch, lit_str("route match is required"));
         if (!match) return core::make_unexpected(match.error());
-        ok = expect_object(match.value(), lit_str("route match must be an object"));
-        if (!ok) return ok;
-        const Field allowed_match[] = {kPrefix};
-        if (auto r = reject_unknown(match.value(), allowed_match, 1u); !r) return r;
-        auto prefix =
-            required(match.value(), kPrefix, lit_str("only prefix route matching is supported"));
-        if (!prefix) return core::make_unexpected(prefix.error());
-        auto prefix_text = plain_string(prefix.value(), lit_str("prefix must be a string"));
-        if (!prefix_text) return core::make_unexpected(prefix_text.error());
-        if (!prefix_text.value().eq(lit_str("/")))
-            return unsupported(doc_.at(prefix.value()).span,
-                               lit_str("only the catch-all prefix \"/\" is supported"));
-        out->match.prefix = prefix_text.value();
-        out->match.prefix_span = doc_.at(prefix.value()).span;
-        out->match.span = doc_.at(match.value()).span;
+        if (auto r = parse_route_match(match.value(), &out->match); !r) return r;
 
-        auto action =
-            required(node, kRoute, lit_str("only route actions with a cluster are supported"));
-        if (!action) return core::make_unexpected(action.error());
-        ok = expect_object(action.value(), lit_str("route action must be an object"));
+        auto route_action = optional(node, kRoute);
+        if (!route_action) return core::make_unexpected(route_action.error());
+        auto direct_response = optional(node, kDirectResponse);
+        if (!direct_response) return core::make_unexpected(direct_response.error());
+        auto redirect = optional(node, kRedirect);
+        if (!redirect) return core::make_unexpected(redirect.error());
+
+        const u32 present = (route_action.value() != kJsonNoNode ? 1u : 0u) +
+                            (direct_response.value() != kJsonNoNode ? 1u : 0u) +
+                            (redirect.value() != kJsonNoNode ? 1u : 0u);
+        if (present == 0u)
+            return missing(
+                doc_.at(node).span,
+                lit_str("only route actions with route, direct_response, or redirect are "
+                        "supported"));
+        if (present > 1u)
+            return invalid(
+                doc_.at(node).span,
+                lit_str("route must set exactly one of route, direct_response, or redirect"));
+
+        if (route_action.value() != kJsonNoNode)
+            return parse_forward_action(route_action.value(), &out->action);
+        if (direct_response.value() != kJsonNoNode)
+            return parse_direct_response_action(direct_response.value(), &out->action);
+        return parse_redirect_action(redirect.value(), &out->action);
+    }
+
+    FrontendResult<bool> parse_route_match(u32 node, RouteMatch* out) {
+        auto ok = expect_object(node, lit_str("route match must be an object"));
         if (!ok) return ok;
-        const Field allowed_action[] = {kCluster, kTimeout};
-        if (auto r = reject_unknown(action.value(), allowed_action, 2u); !r) return r;
-        auto cluster =
-            required(action.value(), kCluster, lit_str("route action cluster is required"));
+        const Field allowed[] = {kPrefix, kPath};
+        if (auto r = reject_unknown(node, allowed, 2u); !r) return r;
+        out->span = doc_.at(node).span;
+
+        auto prefix = optional(node, kPrefix);
+        if (!prefix) return core::make_unexpected(prefix.error());
+        auto path = optional(node, kPath);
+        if (!path) return core::make_unexpected(path.error());
+
+        if (prefix.value() != kJsonNoNode && path.value() != kJsonNoNode)
+            return invalid(doc_.at(path.value()).span,
+                           lit_str("route match must set exactly one of prefix or path"));
+        if (prefix.value() == kJsonNoNode && path.value() == kJsonNoNode)
+            return missing(doc_.at(node).span,
+                           lit_str("only prefix or path route matching is supported"));
+
+        if (prefix.value() != kJsonNoNode) {
+            auto text = plain_string(prefix.value(), lit_str("prefix must be a string"));
+            if (!text) return core::make_unexpected(text.error());
+            const Span span = doc_.at(prefix.value()).span;
+            if (auto r = validate_route_match_bytes(text.value(), span); !r) return r;
+            if (!prefix_shape_ok(text.value()))
+                return unsupported(span,
+                                   lit_str("only \"/\" or prefixes ending in \"/\" are supported"));
+            out->kind = RouteMatchKind::Prefix;
+            out->prefix = text.value();
+            out->prefix_span = span;
+            return true;
+        }
+
+        auto text = plain_string(path.value(), lit_str("path must be a string"));
+        if (!text) return core::make_unexpected(text.error());
+        const Span span = doc_.at(path.value()).span;
+        if (auto r = validate_route_match_bytes(text.value(), span); !r) return r;
+        if (!path_shape_ok(text.value()))
+            return unsupported(span, lit_str("path must start with \"/\""));
+        out->kind = RouteMatchKind::Path;
+        out->path = text.value();
+        out->path_span = span;
+        return true;
+    }
+
+    FrontendResult<bool> validate_route_match_bytes(Str text, Span span) {
+        if (text.len > kMaxRouteMatchLen)
+            return unsupported(span, lit_str("route match value exceeds 64 bytes"));
+        for (u32 i = 0; i < text.len; i++) {
+            if (!route_match_byte_ok(text.ptr[i]))
+                return unsupported(
+                    span,
+                    lit_str("route match value must be printable ASCII excluding ?, #, and %"));
+        }
+        return true;
+    }
+
+    FrontendResult<bool> parse_forward_action(u32 node, RouteAction* out) {
+        auto ok = expect_object(node, lit_str("route action must be an object"));
+        if (!ok) return ok;
+        const Field allowed[] = {kCluster, kTimeout};
+        if (auto r = reject_unknown(node, allowed, 2u); !r) return r;
+        out->kind = RouteActionKind::Forward;
+        out->span = doc_.at(node).span;
+
+        auto cluster = required(node, kCluster, lit_str("route action cluster is required"));
         if (!cluster) return core::make_unexpected(cluster.error());
         auto cluster_text = name_string(
             cluster.value(), false, lit_str("route cluster must be a non-empty string"));
         if (!cluster_text) return core::make_unexpected(cluster_text.error());
-        out->action.cluster = cluster_text.value();
-        out->action.cluster_span = doc_.at(cluster.value()).span;
-        out->action.span = doc_.at(action.value()).span;
+        out->cluster = cluster_text.value();
+        out->cluster_span = doc_.at(cluster.value()).span;
 
-        auto timeout = optional(action.value(), kTimeout);
+        auto timeout = optional(node, kTimeout);
         if (!timeout) return core::make_unexpected(timeout.error());
         if (timeout.value() != kJsonNoNode) {
-            if (auto r = parse_duration(timeout.value(), &out->action.timeout, /*allow_zero=*/true);
-                !r)
+            if (auto r = parse_duration(timeout.value(), &out->timeout, /*allow_zero=*/true); !r)
                 return r;
-            out->action.timeout_present = true;
+            out->timeout_present = true;
         }
+        return true;
+    }
+
+    FrontendResult<bool> parse_direct_response_action(u32 node, RouteAction* out) {
+        auto ok = expect_object(node, lit_str("direct_response must be an object"));
+        if (!ok) return ok;
+        const Field allowed[] = {kStatus, kBody};
+        if (auto r = reject_unknown(node, allowed, 2u); !r) return r;
+        out->kind = RouteActionKind::DirectResponse;
+        out->span = doc_.at(node).span;
+        out->direct_response.span = doc_.at(node).span;
+
+        auto status = required(node, kStatus, lit_str("direct_response status is required"));
+        if (!status) return core::make_unexpected(status.error());
+        u32 status_value = 0;
+        if (!json_u32(doc_.at(status.value()), &status_value))
+            return invalid(doc_.at(status.value()).span,
+                           lit_str("direct_response status must be a non-negative integer"));
+        if (status_value < 100u || status_value > 599u)
+            return invalid(doc_.at(status.value()).span,
+                           lit_str("direct_response status must be in 100..599"));
+        out->direct_response.status = static_cast<u16>(status_value);
+
+        auto body = optional(node, kBody);
+        if (!body) return core::make_unexpected(body.error());
+        if (body.value() != kJsonNoNode) {
+            ok = expect_object(body.value(), lit_str("direct_response body must be an object"));
+            if (!ok) return ok;
+            const Field allowed_body[] = {kInlineString};
+            if (auto r = reject_unknown(body.value(), allowed_body, 1u); !r) return r;
+            auto inline_string =
+                required(body.value(), kInlineString, lit_str("body inline_string is required"));
+            if (!inline_string) return core::make_unexpected(inline_string.error());
+            auto text =
+                plain_string(inline_string.value(), lit_str("inline_string must be a string"));
+            if (!text) return core::make_unexpected(text.error());
+            if (text.value().len > 4096u)
+                return unsupported(doc_.at(inline_string.value()).span,
+                                   lit_str("inline_string exceeds 4096 bytes"));
+            out->direct_response.has_body = true;
+            out->direct_response.inline_string = text.value();
+        }
+        return true;
+    }
+
+    FrontendResult<bool> parse_redirect_action(u32 node, RouteAction* out) {
+        auto ok = expect_object(node, lit_str("redirect must be an object"));
+        if (!ok) return ok;
+        const Field allowed[] = {kPathRedirect, kHostRedirect, kResponseCode};
+        if (auto r = reject_unknown(node, allowed, 3u); !r) return r;
+        out->kind = RouteActionKind::Redirect;
+        out->span = doc_.at(node).span;
+        out->redirect.span = doc_.at(node).span;
+
+        auto path_redirect = optional(node, kPathRedirect);
+        if (!path_redirect) return core::make_unexpected(path_redirect.error());
+        if (path_redirect.value() != kJsonNoNode) {
+            auto text =
+                plain_string(path_redirect.value(), lit_str("path_redirect must be a string"));
+            if (!text) return core::make_unexpected(text.error());
+            out->redirect.path_redirect = text.value();
+        }
+
+        auto host_redirect = optional(node, kHostRedirect);
+        if (!host_redirect) return core::make_unexpected(host_redirect.error());
+        if (host_redirect.value() != kJsonNoNode) {
+            auto text =
+                plain_string(host_redirect.value(), lit_str("host_redirect must be a string"));
+            if (!text) return core::make_unexpected(text.error());
+            out->redirect.host_redirect = text.value();
+        }
+
+        auto response_code =
+            required(node, kResponseCode, lit_str("redirect response_code is required"));
+        if (!response_code) return core::make_unexpected(response_code.error());
+        auto code_text =
+            plain_string(response_code.value(), lit_str("response_code must be a string"));
+        if (!code_text) return core::make_unexpected(code_text.error());
+        u16 mapped = 0;
+        if (code_text.value().eq(lit_str("MOVED_PERMANENTLY"))) {
+            mapped = 301u;
+        } else if (code_text.value().eq(lit_str("FOUND"))) {
+            mapped = 302u;
+        } else if (code_text.value().eq(lit_str("SEE_OTHER"))) {
+            mapped = 303u;
+        } else if (code_text.value().eq(lit_str("TEMPORARY_REDIRECT"))) {
+            mapped = 307u;
+        } else if (code_text.value().eq(lit_str("PERMANENT_REDIRECT"))) {
+            mapped = 308u;
+        } else {
+            return unsupported(doc_.at(response_code.value()).span,
+                               lit_str("response_code must be one of MOVED_PERMANENTLY, FOUND, "
+                                       "SEE_OTHER, TEMPORARY_REDIRECT, PERMANENT_REDIRECT"));
+        }
+        out->redirect.response_code = mapped;
         return true;
     }
 

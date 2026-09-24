@@ -9,7 +9,8 @@ namespace rut::envoy {
 // Envoy v3 bootstrap semantic model for the first converter milestone
 // (docs/envoy-converter.md, "Semantic model boundary for the first
 // increment"). The model represents exactly one HTTP listener, one wildcard
-// virtual host with one catch-all route, and one STATIC cluster with one IPv4
+// virtual host with a bounded ordered list of routes (`kMaxEnvoyRoutes`), and
+// a bounded set of STATIC clusters (`kMaxEnvoyClusters`) each with one IPv4
 // endpoint. Every field outside that boundary is a source-located diagnostic.
 //
 // String values borrow the raw bytes of the JSON source; the document must
@@ -17,6 +18,8 @@ namespace rut::envoy {
 // admitted, so a borrowed slice is always the literal value.
 
 static constexpr u32 kMaxEnvoyNameLen = 128;
+static constexpr u32 kMaxEnvoyRoutes = 8;
+static constexpr u32 kMaxEnvoyClusters = 8;
 
 // Every proto3 JSON field is accepted in both its lowerCamelCase and its
 // snake_case spelling. Both spellings present at once is a duplicate-field
@@ -39,21 +42,66 @@ struct Duration {
     Span span{};
 };
 
+enum class RouteMatchKind : u8 {
+    Prefix,
+    Path,
+};
+
+// Exactly one of `prefix` / `path` is set, selected by `kind`. Both are
+// bounded to printable ASCII (0x21-0x7e) excluding `?`, `#` and `%`, and to
+// 64 bytes. `prefix` must be exactly "/" or start and end with "/"; a raw
+// prefix like "/api" has no segment-equivalent RUT meaning and is rejected.
+// `path` must start with "/".
 struct RouteMatch {
-    // Exactly "/" in this increment.
+    RouteMatchKind kind = RouteMatchKind::Prefix;
     Str prefix{};
     Span prefix_span{};
+    Str path{};
+    Span path_span{};
+    Span span{};
+};
+
+enum class RouteActionKind : u8 {
+    Forward,
+    DirectResponse,
+    Redirect,
+};
+
+// `envoy.config.route.v3.DirectResponseAction`. Only `body.inline_string` is
+// modeled; other `DataSource` variants (`inline_bytes`, `filename`, ...) are
+// unsupported fields. The body is optional and bounded to 4096 bytes.
+struct DirectResponse {
+    u16 status = 0;
+    bool has_body = false;
+    Str inline_string{};
+    Span span{};
+};
+
+// `envoy.config.route.v3.RedirectAction`, restricted to `path_redirect`,
+// `host_redirect` and `response_code`; every other field (`https_redirect`,
+// `scheme_redirect`, `port_redirect`, `prefix_rewrite`, `strip_query`, ...) is
+// an unsupported field. `response_code` is resolved from its proto3 JSON
+// enum name to the numeric HTTP status it names.
+struct Redirect {
+    Str path_redirect{};
+    Str host_redirect{};
+    u16 response_code = 0;
     Span span{};
 };
 
 struct RouteAction {
+    RouteActionKind kind = RouteActionKind::Forward;
+    // Forward (`route.cluster`) only.
     Str cluster{};
     Span cluster_span{};
     // `timeout` is optional today only in the sense that its absence is a
     // capability gap (Envoy's implicit 15s default); the converter requires
-    // an explicit "0s" (docs/envoy-converter.md, "milestone-S").
+    // an explicit "0s" (docs/envoy-converter.md, "milestone-S"). Forward
+    // only.
     bool timeout_present = false;
     Duration timeout{};
+    DirectResponse direct_response{};
+    Redirect redirect{};
     Span span{};
 };
 
@@ -68,7 +116,10 @@ struct VirtualHost {
     Span name_span{};
     // `domains` is exactly ["*"] in this increment; the span pins the array.
     Span domains_span{};
-    Route route{};
+    // Order preserved from the source array; Envoy selects the first
+    // matching route. Lowering an ordered list (beyond the single-route
+    // shape) is not yet implemented (PR 8).
+    FixedVec<Route, kMaxEnvoyRoutes> routes{};
     Span span{};
 };
 
@@ -165,7 +216,9 @@ struct Cluster {
 
 struct Bootstrap {
     Listener listener{};
-    Cluster cluster{};
+    // Names are unique among the declared clusters; every Forward route's
+    // `cluster` must name one of them.
+    FixedVec<Cluster, kMaxEnvoyClusters> clusters{};
     Span span{};
 };
 

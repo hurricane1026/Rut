@@ -217,13 +217,12 @@ FrontendResult<bool> validate(const Bootstrap& model, const RutCapabilities& cap
     const HttpConnectionManager& hcm = model.listener.filter_chain.hcm;
     const RouterFilter& router = hcm.router;
     const VirtualHost& virtual_host = hcm.route_config.virtual_host;
-    const Route& route = virtual_host.route;
-    const RouteAction& action = route.action;
-
     if (model.listener.address.port == 0u)
         return invalid(model.listener.address.span, lit_str("listener port must be non-zero"));
-    if (model.cluster.endpoint.address.port == 0u)
-        return invalid(model.cluster.endpoint.address.span,
+    if (model.clusters.len == 0u)
+        return invalid(model.span, lit_str("at least one cluster is required"));
+    if (model.clusters[0].endpoint.address.port == 0u)
+        return invalid(model.clusters[0].endpoint.address.span,
                        lit_str("endpoint port must be non-zero"));
     // PR #692 round-15 review: `listener.name` and `hcm.route_config.name`
     // are optional (`name_string(..., allow_empty=true)`,
@@ -237,70 +236,124 @@ FrontendResult<bool> validate(const Bootstrap& model, const RutCapabilities& cap
         return unsupported(model.listener.name_span, lit_str("name exceeds the bounded length"));
     if (hcm.route_config.name.len > kMaxEnvoyNameLen)
         return unsupported(hcm.route_config.name_span, lit_str("name exceeds the bounded length"));
-    // PR #692 round-10 review: revalidate `cluster.connect_timeout` too — the
-    // parser requires it strictly positive (`parse_duration(...,
-    // allow_zero=false)`, src/envoy/parser.cc:674, same "duration must be
-    // positive" diagnostic reused here) because Envoy itself rejects a zero
-    // `connect_timeout`, but the emitted RUT program never reads this field.
-    // A hand-built `Bootstrap` passed to the public `lower_to_rut(model,
-    // capabilities)` overload that sets `connect_timeout.milliseconds` to
-    // zero (or a caller who mutates it on a parsed copy) would otherwise
-    // still lower successfully, returning a working gateway for a bootstrap
-    // Envoy would reject at startup.
-    if (model.cluster.connect_timeout.milliseconds == 0u)
-        return invalid(model.cluster.connect_timeout.span, lit_str("duration must be positive"));
-    // PR #692 round-9 review: `Str::eq` treats two empty views as equal, so
-    // a caller of the public `lower_to_rut(model, capabilities)` overload
-    // who clears both `action.cluster` and `model.cluster.name` on a parsed
-    // copy (or hand-builds a `Bootstrap` that never sets either) passes this
-    // check and reaches the hard-coded `envoy_cluster_0` upstream below. The
-    // parser requires both names non-empty (`min_len: 1` on both the v3
-    // `Cluster.name` and the route action's `cluster`), so an empty/empty
-    // pairing is a forgery this converter must also reject.
-    if (action.cluster.empty() || model.cluster.name.empty() ||
-        !action.cluster.eq(model.cluster.name))
+    // PR #692 round-9/round-8 review, ported to the route-list model (PR 8's
+    // `clusters[]`): loop over every declared cluster, not just the first,
+    // so both checks still hold once multiple clusters are lowered.
+    // `name.empty()` guards the `Str::eq` empty-vs-empty forgery the
+    // `action.cluster` check below relies on being impossible (a caller of
+    // the public `lower_to_rut(model, capabilities)` overload who clears a
+    // declared cluster's `name` on a parsed copy, or hand-builds a
+    // `Bootstrap` that never sets it, would otherwise let an also-cleared
+    // `action.cluster` pass an equality check it should fail; the parser
+    // requires both non-empty, `min_len: 1` on both the v3 `Cluster.name`
+    // and the route action's `cluster`). `load_assignment_name_present` is
+    // the model's only record that `parse_bootstrap_json` ever saw and
+    // validated that cluster's `load_assignment.cluster_name` (required,
+    // non-empty, and equal to `name` per Envoy's v3
+    // `ClusterLoadAssignment.cluster_name` `min_len: 1`) -- the same
+    // evidence-bit shape as `hcm.type_url_span` (round-5) and
+    // `hcm.generate_request_id_span` (round-6) below. A hand-built
+    // `Bootstrap`, or a parsed copy with either bit cleared, still has a
+    // matching `action.cluster` / cluster `name` pair and would otherwise
+    // lower successfully, emitting a working gateway for a bootstrap Envoy
+    // would reject at startup.
+    for (u32 i = 0; i < model.clusters.len; i++) {
+        if (model.clusters[i].name.empty())
+            return invalid(model.clusters[i].name_span,
+                           lit_str("cluster name must be a non-empty string"));
+        // PR #692 round-12 review, ported: revalidate the bounded length
+        // too, not just non-emptiness/equality. `name_string`
+        // (src/envoy/parser.cc:179-185) rejects every name over
+        // `kMaxEnvoyNameLen` during parsing, but nothing above re-checks
+        // that bound; a caller of the public `lower_to_rut(model,
+        // capabilities)` overload who sets a declared cluster's `name` (and
+        // the matching `action.cluster`) to the same overlong string still
+        // passes the equality check below and would otherwise lower
+        // successfully, accepting a model `parse_bootstrap_json` would
+        // reject. Checked for every declared cluster now that route lists
+        // may name more than one.
+        if (model.clusters[i].name.len > kMaxEnvoyNameLen)
+            return unsupported(model.clusters[i].name_span,
+                               lit_str("name exceeds the bounded length"));
+        if (!model.clusters[i].load_assignment_name_present)
+            return invalid(model.clusters[i].span,
+                           lit_str("cluster load_assignment.cluster_name is required"));
+        // PR #692 round-12 review, ported: presence of the bit is not proof
+        // that the *current* `name`/a route's `action.cluster` still match
+        // what `parse_bootstrap_json` validated `load_assignment.cluster_
+        // name` against -- a caller of the public `lower_to_rut(model,
+        // capabilities)` overload can rename both a route's `action.cluster`
+        // and this declared cluster's `name` on a parsed copy (to the same
+        // new string, so the equality check below still passes) while
+        // leaving `load_assignment_name_present` true and
+        // `load_assignment_name` holding the old, now-stale name. Retaining
+        // the parsed value (`Cluster::load_assignment_name`,
+        // include/rut/envoy/parser.h) lets this revalidate the equality at
+        // lowering time instead of trusting historical presence. Checked for
+        // every declared cluster now that route lists may name more than
+        // one.
+        if (!model.clusters[i].load_assignment_name.eq(model.clusters[i].name))
+            return invalid(model.clusters[i].load_assignment_name_span,
+                           lit_str("load_assignment.cluster_name must equal the cluster name"));
+        // PR #692 round-10 review, ported: revalidate `connect_timeout` too
+        // -- the parser requires it strictly positive (`parse_duration(...,
+        // allow_zero=false)`, src/envoy/parser.cc, same "duration must be
+        // positive" diagnostic reused here) because Envoy itself rejects a
+        // zero `connect_timeout`, but the emitted RUT program never reads
+        // this field. A hand-built `Bootstrap` passed to the public
+        // `lower_to_rut(model, capabilities)` overload that sets a declared
+        // cluster's `connect_timeout.milliseconds` to zero (or a caller who
+        // mutates it on a parsed copy) would otherwise still lower
+        // successfully, returning a working gateway for a bootstrap Envoy
+        // would reject at startup. Checked for every declared cluster now
+        // that route lists may name more than one.
+        if (model.clusters[i].connect_timeout.milliseconds == 0u)
+            return invalid(model.clusters[i].connect_timeout.span,
+                           lit_str("duration must be positive"));
+    }
+    if (virtual_host.routes.len == 0u)
+        return invalid(virtual_host.span, lit_str("at least one route is required"));
+
+    // Route-list lowering (multiple routes, multiple clusters,
+    // direct_response, redirect) is not implemented yet (PR 8-10); reject
+    // precisely, before the capability checks below, so a model that would
+    // also hit a BLOCKED_BY_RUT row gets the more specific diagnostic.
+    if (virtual_host.routes.len > 1u)
+        return unsupported(virtual_host.routes[1].span,
+                           lit_str("multiple routes are not lowered yet"));
+    if (model.clusters.len > 1u)
+        return unsupported(model.clusters[1].span,
+                           lit_str("multiple clusters are not lowered yet"));
+
+    const Route& route = virtual_host.routes[0];
+    const RouteAction& action = route.action;
+    if (action.kind == RouteActionKind::DirectResponse)
+        return unsupported(action.span, lit_str("direct_response is not lowered yet"));
+    if (action.kind == RouteActionKind::Redirect)
+        return unsupported(action.span, lit_str("redirect is not lowered yet"));
+
+    // PR #692 round-9 review, ported: reject an empty `action.cluster`
+    // explicitly too (see the per-cluster `name.empty()` loop above for the
+    // matching declared-name-emptiness guard the forgery needed both sides
+    // of).
+    if (action.cluster.empty() || !action.cluster.eq(model.clusters[0].name))
         return invalid(action.cluster_span,
                        lit_str("route cluster does not name a declared cluster"));
-    // PR #692 round-12 review: revalidate the bounded length too, not just
-    // non-emptiness/equality. `name_string` (src/envoy/parser.cc:179-185)
-    // rejects every name over `kMaxEnvoyNameLen` during parsing, but nothing
-    // above re-checks that bound; a caller of the public `lower_to_rut(model,
-    // capabilities)` overload who sets both `action.cluster` and
-    // `model.cluster.name` to the same overlong string still passes the
-    // equality check above and would otherwise lower successfully, accepting
-    // a model `parse_bootstrap_json` would reject.
+    // PR #692 round-12 review, ported: revalidate the bounded length too,
+    // not just non-emptiness/equality. `name_string`
+    // (src/envoy/parser.cc:179-185) rejects every name over
+    // `kMaxEnvoyNameLen` during parsing, but nothing above re-checks that
+    // bound; a caller of the public `lower_to_rut(model, capabilities)`
+    // overload who sets both this route's `action.cluster` and a declared
+    // cluster's `name` to the same overlong string still passes the equality
+    // check above and would otherwise lower successfully, accepting a model
+    // `parse_bootstrap_json` would reject. The matching per-cluster `name`
+    // bound (and the `load_assignment_name` presence/equality revalidation)
+    // is ported into the per-cluster loop above instead of repeated here,
+    // since it must hold for every declared cluster now that route lists may
+    // name more than one, not just the one route currently reachable here.
     if (action.cluster.len > kMaxEnvoyNameLen)
         return unsupported(action.cluster_span, lit_str("name exceeds the bounded length"));
-    if (model.cluster.name.len > kMaxEnvoyNameLen)
-        return unsupported(model.cluster.name_span, lit_str("name exceeds the bounded length"));
-    // PR #692 round-8 review: `load_assignment_name_present` is the model's
-    // only record that `parse_bootstrap_json` ever saw and validated
-    // `load_assignment.cluster_name` (required, non-empty, and equal to
-    // `cluster.name` per Envoy's v3 `ClusterLoadAssignment.cluster_name`
-    // `min_len: 1`) — the same evidence-bit shape as `hcm.type_url_span`
-    // (round-5) and `hcm.generate_request_id_span` (round-6). A hand-built
-    // `Bootstrap` passed to the public `lower_to_rut(model, capabilities)`
-    // overload that never populated `load_assignment` (or a caller who
-    // cleared the bit on a parsed copy) still has a matching `action.cluster`
-    // / `cluster.name` pair and would otherwise lower successfully, emitting
-    // a working gateway for a bootstrap Envoy would reject at startup.
-    if (!model.cluster.load_assignment_name_present)
-        return invalid(model.cluster.span,
-                       lit_str("cluster load_assignment.cluster_name is required"));
-    // PR #692 round-12 review: presence of the bit is not proof that the
-    // *current* `cluster.name`/`action.cluster` still match what
-    // `parse_bootstrap_json` validated `load_assignment.cluster_name`
-    // against — a caller of the public `lower_to_rut(model, capabilities)`
-    // overload can rename both `action.cluster` and `model.cluster.name` on
-    // a parsed copy (to the same new string, so the equality check above
-    // still passes) while leaving `load_assignment_name_present` true and
-    // `load_assignment_name` holding the old, now-stale name. Retaining the
-    // parsed value (`Cluster::load_assignment_name`,
-    // include/rut/envoy/parser.h) lets this revalidate the equality at
-    // lowering time instead of trusting historical presence.
-    if (!model.cluster.load_assignment_name.eq(model.cluster.name))
-        return invalid(model.cluster.load_assignment_name_span,
-                       lit_str("load_assignment.cluster_name must equal the cluster name"));
     // PR #692 round-3 review: the emitted route is always the literal `"/"`
     // catch-all (see put_forward_route below) — nothing about the route's
     // actual `match.prefix` value ever reaches the generated text. A model
@@ -478,7 +531,7 @@ FrontendResult<RutSource> lower_to_rut(const Bootstrap& model,
     };
 
     const SocketAddress& listen = model.listener.address;
-    const SocketAddress& upstream = model.cluster.endpoint.address;
+    const SocketAddress& upstream = model.clusters[0].endpoint.address;
 
     if (!writer.put_cstr("listen ")) return fail_overflow();
     if (listen.ipv4_host == 0u) {

@@ -443,30 +443,30 @@ TEST(envoy_parser, accepts_milestone_bootstrap) {
     CHECK(hcm.route_config.name.eq(lit_str("local")));
     CHECK(hcm.route_config.virtual_host.name.eq(lit_str("all")));
     CHECK_EQ(hcm.route_config.virtual_host.domains_span.line, 15u);
-    CHECK(hcm.route_config.virtual_host.route.match.prefix.eq(lit_str("/")));
-    CHECK_EQ(hcm.route_config.virtual_host.route.match.prefix_span.line, 16u);
-    CHECK(hcm.route_config.virtual_host.route.action.cluster.eq(lit_str("backend")));
+    CHECK(hcm.route_config.virtual_host.routes[0].match.prefix.eq(lit_str("/")));
+    CHECK_EQ(hcm.route_config.virtual_host.routes[0].match.prefix_span.line, 16u);
+    CHECK(hcm.route_config.virtual_host.routes[0].action.cluster.eq(lit_str("backend")));
     CHECK(hcm.router.name.eq(lit_str("envoy.filters.http.router")));
     CHECK(hcm.router.has_typed_config);
     CHECK_EQ(hcm.router.typed_config_span.line, 19u);
 
-    CHECK(b.cluster.name.eq(lit_str("backend")));
-    CHECK_EQ(b.cluster.name_span.line, 23u);
-    CHECK(b.cluster.type_present);
-    CHECK_EQ(b.cluster.type_span.line, 24u);
-    CHECK_EQ(b.cluster.connect_timeout.milliseconds, 5000u);
-    CHECK(b.cluster.connect_timeout.text.eq(lit_str("5s")));
-    CHECK_EQ(b.cluster.connect_timeout.span.line, 25u);
-    CHECK(b.cluster.load_assignment_name_present);
-    // PR #692 round-12 review: `load_assignment_name` retains the parsed
-    // `load_assignment.cluster_name` value itself (not just the presence
-    // bit), so lowering can revalidate it against `cluster.name` at use
+    CHECK(b.clusters[0].name.eq(lit_str("backend")));
+    CHECK_EQ(b.clusters[0].name_span.line, 23u);
+    CHECK(b.clusters[0].type_present);
+    CHECK_EQ(b.clusters[0].type_span.line, 24u);
+    CHECK_EQ(b.clusters[0].connect_timeout.milliseconds, 5000u);
+    CHECK(b.clusters[0].connect_timeout.text.eq(lit_str("5s")));
+    CHECK_EQ(b.clusters[0].connect_timeout.span.line, 25u);
+    CHECK(b.clusters[0].load_assignment_name_present);
+    // PR #692 round-12 review, ported: `load_assignment_name` retains the
+    // parsed `load_assignment.cluster_name` value itself (not just the
+    // presence bit), so lowering can revalidate it against `name` at use
     // time rather than trusting historical presence.
-    CHECK(b.cluster.load_assignment_name.eq(lit_str("backend")));
-    CHECK_EQ(b.cluster.endpoint.address.ipv4_host, 0x7f000001u);
-    CHECK_EQ(b.cluster.endpoint.address.port, 9000u);
-    CHECK_EQ(b.cluster.endpoint.address.address_span.line, 27u);
-    CHECK_EQ(b.cluster.endpoint.span.line, 27u);
+    CHECK(b.clusters[0].load_assignment_name.eq(lit_str("backend")));
+    CHECK_EQ(b.clusters[0].endpoint.address.ipv4_host, 0x7f000001u);
+    CHECK_EQ(b.clusters[0].endpoint.address.port, 9000u);
+    CHECK_EQ(b.clusters[0].endpoint.address.address_span.line, 27u);
+    CHECK_EQ(b.clusters[0].endpoint.span.line, 27u);
 }
 
 TEST(envoy_parser, accepts_camel_case_spellings_and_optional_fields) {
@@ -511,12 +511,12 @@ TEST(envoy_parser, accepts_camel_case_spellings_and_optional_fields) {
     CHECK_FALSE(result.value().listener.filter_chain.hcm.router.has_typed_config);
     CHECK(result.value().listener.filter_chain.hcm.codec_type_present);
     CHECK(result.value().listener.filter_chain.hcm.codec_type == envoy::CodecType::Http1);
-    CHECK_FALSE(result.value().cluster.type_present);
-    CHECK(result.value().cluster.load_assignment_name_present);
-    CHECK(result.value().cluster.load_assignment_name.eq(lit_str("backend")));
-    CHECK_EQ(result.value().cluster.connect_timeout.milliseconds, 1250u);
+    CHECK_FALSE(result.value().clusters[0].type_present);
+    CHECK(result.value().clusters[0].load_assignment_name_present);
+    CHECK(result.value().clusters[0].load_assignment_name.eq(lit_str("backend")));
+    CHECK_EQ(result.value().clusters[0].connect_timeout.milliseconds, 1250u);
     CHECK_EQ(result.value().listener.address.port, 8080u);
-    CHECK_EQ(result.value().cluster.endpoint.address.port, 9000u);
+    CHECK_EQ(result.value().clusters[0].endpoint.address.port, 9000u);
 }
 
 TEST(envoy_parser, rejects_both_spellings_of_one_field) {
@@ -709,28 +709,30 @@ TEST(envoy_parser, rejects_shapes_outside_the_milestone_boundary) {
          FrontendError::UnsupportedSyntax,
          "host matching"},
         {"\"domains\": [\"*\"]", "\"domains\": []", FrontendError::UnexpectedEof, "domains"},
+        // An empty route object ahead of the (still valid) existing route: no
+        // longer "multiple routes are unsupported" now that route lists are
+        // bounded, but the empty object itself is still missing its match.
         {"\"routes\": [{",
          "\"routes\": [{}, {",
-         FrontendError::UnsupportedSyntax,
-         "multiple routes"},
-        {"\"match\": {\"prefix\": \"/\"}",
-         "\"match\": {\"path\": \"/\"}",
-         FrontendError::UnsupportedSyntax,
-         "unsupported field"},
+         FrontendError::UnexpectedEof,
+         "route match is required"},
         {"\"match\": {\"prefix\": \"/\"}", "\"match\": {}", FrontendError::UnexpectedEof, "prefix"},
+        {"\"match\": {\"prefix\": \"/\"}",
+         "\"match\": {\"prefix\": \"/\", \"path\": \"/\"}",
+         FrontendError::UnexpectedToken,
+         "exactly one of prefix or path"},
         {"\"prefix\": \"/\"",
          "\"prefix\": \"/api\"",
          FrontendError::UnsupportedSyntax,
-         "catch-all"},
-        {"\"prefix\": \"/\"", "\"prefix\": \"\"", FrontendError::UnsupportedSyntax, "catch-all"},
-        {"\"route\": {\"cluster\": \"backend\"}",
-         "\"redirect\": {\"path_redirect\": \"/x\"}",
+         "prefixes ending in"},
+        {"\"prefix\": \"/\"",
+         "\"prefix\": \"\"",
          FrontendError::UnsupportedSyntax,
-         "unsupported field"},
-        {"\"route\": {\"cluster\": \"backend\"}",
-         "\"direct_response\": {\"status\": 200}",
+         "prefixes ending in"},
+        {"\"prefix\": \"/\"",
+         "\"prefix\": \"/a?b\"",
          FrontendError::UnsupportedSyntax,
-         "unsupported field"},
+         "excluding ?, #, and %"},
         {"\"route\": {\"cluster\": \"backend\"}",
          "\"route\": {\"weighted_clusters\": {}}",
          FrontendError::UnsupportedSyntax,
@@ -761,10 +763,13 @@ TEST(envoy_parser, rejects_shapes_outside_the_milestone_boundary) {
          FrontendError::UnsupportedSyntax,
          "v3 Router"},
         // Cluster
+        // An empty cluster object ahead of the (still valid) existing
+        // cluster: no longer "multiple clusters are unsupported" now that
+        // cluster lists are bounded, but the empty object is missing its name.
         {"\"clusters\": [{",
          "\"clusters\": [{}, {",
-         FrontendError::UnsupportedSyntax,
-         "multiple clusters"},
+         FrontendError::UnexpectedEof,
+         "cluster name is required"},
         {"\"name\": \"backend\",\n", "", FrontendError::UnexpectedEof, "cluster name"},
         {"\"type\": \"STATIC\"",
          "\"type\": \"STRICT_DNS\"",
@@ -949,7 +954,7 @@ TEST(envoy_parser, name_length_is_bounded) {
     static envoy::JsonDocument doc;
     auto result = envoy::parse_bootstrap_json(str(text), doc);
     REQUIRE(result);
-    CHECK_EQ(result.value().cluster.name.len, envoy::kMaxEnvoyNameLen);
+    CHECK_EQ(result.value().clusters[0].name.len, envoy::kMaxEnvoyNameLen);
 }
 
 // ── Increment 2 fields: route timeout, router suppress_envoy_headers ──────
@@ -964,7 +969,7 @@ TEST(envoy_parser, route_timeout_accepts_zero_and_rejects_invalid_forms) {
         auto result = envoy::parse_bootstrap_json(str(b.render()), doc);
         REQUIRE(result);
         const envoy::RouteAction& action =
-            result.value().listener.filter_chain.hcm.route_config.virtual_host.route.action;
+            result.value().listener.filter_chain.hcm.route_config.virtual_host.routes[0].action;
         CHECK(action.timeout_present);
         CHECK_EQ(action.timeout.milliseconds, 0u);
     }
@@ -977,7 +982,7 @@ TEST(envoy_parser, route_timeout_accepts_zero_and_rejects_invalid_forms) {
         auto result = envoy::parse_bootstrap_json(str(b.render()), doc);
         REQUIRE(result);
         const envoy::RouteAction& action =
-            result.value().listener.filter_chain.hcm.route_config.virtual_host.route.action;
+            result.value().listener.filter_chain.hcm.route_config.virtual_host.routes[0].action;
         CHECK(action.timeout_present);
         CHECK_EQ(action.timeout.milliseconds, 15000u);
     }
@@ -990,7 +995,7 @@ TEST(envoy_parser, route_timeout_accepts_zero_and_rejects_invalid_forms) {
         auto result = envoy::parse_bootstrap_json(str(b.render()), doc);
         REQUIRE(result);
         const envoy::RouteAction& action =
-            result.value().listener.filter_chain.hcm.route_config.virtual_host.route.action;
+            result.value().listener.filter_chain.hcm.route_config.virtual_host.routes[0].action;
         CHECK(action.timeout_present);
         CHECK_EQ(action.timeout.milliseconds, 250u);
     }
@@ -1077,6 +1082,286 @@ TEST(envoy_parser, suppress_envoy_headers_rejects_duplicate_and_non_bool) {
                         "\"type.googleapis.com/envoy.extensions.filters.http.router.v3.Router\", "
                         "\"suppress_envoy_headers\": \"true\"}"));
         expect_reject(b.render(), FrontendError::UnexpectedToken, "must be a boolean");
+    }
+}
+
+// ── Increment 4: bounded route/cluster lists, `path`, direct_response,
+//    redirect ─────────────────────────────────────────────────────────
+
+namespace {
+
+std::string forward_route_json(const std::string& match_field,
+                               const std::string& match_value,
+                               const std::string& cluster) {
+    return "{\"match\": {\"" + match_field + "\": \"" + match_value +
+           "\"}, \"route\": {\"cluster\": \"" + cluster + "\"}}";
+}
+
+std::string cluster_json(const std::string& name, u16 port) {
+    return "{\"name\": \"" + name +
+           "\", \"type\": \"STATIC\", \"connect_timeout\": \"5s\", \"load_assignment\": "
+           "{\"cluster_name\": \"" +
+           name +
+           "\", \"endpoints\": [{\"lb_endpoints\": [{\"endpoint\": {\"address\": "
+           "{\"socket_address\": {\"address\": \"127.0.0.1\", \"port_value\": " +
+           std::to_string(port) + "}}}}]}]}}";
+}
+
+const char kDefaultRoutesJson[] =
+    "\"routes\": [{\"match\": {\"prefix\": \"/\"}, \"route\": {\"cluster\": \"backend\"}}]";
+
+}  // namespace
+
+TEST(envoy_parser, route_match_accepts_prefix_and_path_forms) {
+    {
+        Bootstrap b;
+        REQUIRE(replace(
+            &b.listeners, "\"match\": {\"prefix\": \"/\"}", "\"match\": {\"path\": \"/healthz\"}"));
+        static envoy::JsonDocument doc;
+        auto result = envoy::parse_bootstrap_json(str(b.render()), doc);
+        REQUIRE(result);
+        const envoy::RouteMatch& match =
+            result.value().listener.filter_chain.hcm.route_config.virtual_host.routes[0].match;
+        CHECK(match.kind == envoy::RouteMatchKind::Path);
+        CHECK(match.path.eq(lit_str("/healthz")));
+    }
+    {
+        Bootstrap b;
+        REQUIRE(replace(&b.listeners, "\"prefix\": \"/\"", "\"prefix\": \"/api/\""));
+        static envoy::JsonDocument doc;
+        auto result = envoy::parse_bootstrap_json(str(b.render()), doc);
+        REQUIRE(result);
+        const envoy::RouteMatch& match =
+            result.value().listener.filter_chain.hcm.route_config.virtual_host.routes[0].match;
+        CHECK(match.kind == envoy::RouteMatchKind::Prefix);
+        CHECK(match.prefix.eq(lit_str("/api/")));
+    }
+    {
+        Bootstrap b;
+        REQUIRE(replace(&b.listeners, "\"prefix\": \"/\"", "\"prefix\": \"/\""));
+        static envoy::JsonDocument doc;
+        auto result = envoy::parse_bootstrap_json(str(b.render()), doc);
+        REQUIRE(result);
+        CHECK(result.value()
+                  .listener.filter_chain.hcm.route_config.virtual_host.routes[0]
+                  .match.kind == envoy::RouteMatchKind::Prefix);
+    }
+    {
+        // "path" must start with "/".
+        Bootstrap b;
+        REQUIRE(replace(
+            &b.listeners, "\"match\": {\"prefix\": \"/\"}", "\"match\": {\"path\": \"healthz\"}"));
+        expect_reject(b.render(), FrontendError::UnsupportedSyntax, "must start with \"/\"");
+    }
+}
+
+TEST(envoy_parser, routes_list_is_bounded_and_ordered) {
+    Bootstrap b;
+    std::string routes = "[";
+    for (u32 i = 0; i < envoy::kMaxEnvoyRoutes; i++) {
+        if (i != 0) routes += ", ";
+        routes += forward_route_json("path", "/r" + std::to_string(i), "backend");
+    }
+    routes += "]";
+    REQUIRE(replace(&b.listeners, kDefaultRoutesJson, "\"routes\": " + routes));
+    {
+        static envoy::JsonDocument doc;
+        auto result = envoy::parse_bootstrap_json(str(b.render()), doc);
+        REQUIRE(result);
+        const FixedVec<envoy::Route, envoy::kMaxEnvoyRoutes>& parsed =
+            result.value().listener.filter_chain.hcm.route_config.virtual_host.routes;
+        CHECK_EQ(parsed.len, envoy::kMaxEnvoyRoutes);
+        for (u32 i = 0; i < envoy::kMaxEnvoyRoutes; i++)
+            CHECK(parsed[i].match.path.eq(str("/r" + std::to_string(i))));
+    }
+    // A 9th route is rejected at its own span, not the array's.
+    {
+        std::string too_many = "[";
+        for (u32 i = 0; i < envoy::kMaxEnvoyRoutes + 1u; i++) {
+            if (i != 0) too_many += ", ";
+            too_many += forward_route_json("path", "/r" + std::to_string(i), "backend");
+        }
+        too_many += "]";
+        Bootstrap b2;
+        REQUIRE(replace(&b2.listeners, kDefaultRoutesJson, "\"routes\": " + too_many));
+        expect_reject(b2.render(), FrontendError::UnsupportedSyntax, "more than 8 routes");
+    }
+}
+
+TEST(envoy_parser, clusters_list_is_bounded_ordered_and_unique) {
+    Bootstrap b;
+    std::string clusters = "[";
+    for (u32 i = 0; i < envoy::kMaxEnvoyClusters; i++) {
+        if (i != 0) clusters += ", ";
+        clusters += cluster_json("backend" + std::to_string(i), static_cast<u16>(9000 + i));
+    }
+    clusters += "]";
+    b.clusters = clusters;
+    REQUIRE(replace(&b.listeners, "\"cluster\": \"backend\"", "\"cluster\": \"backend0\""));
+    {
+        static envoy::JsonDocument doc;
+        auto result = envoy::parse_bootstrap_json(str(b.render()), doc);
+        REQUIRE(result);
+        const FixedVec<envoy::Cluster, envoy::kMaxEnvoyClusters>& parsed = result.value().clusters;
+        CHECK_EQ(parsed.len, envoy::kMaxEnvoyClusters);
+        for (u32 i = 0; i < envoy::kMaxEnvoyClusters; i++)
+            CHECK(parsed[i].name.eq(str("backend" + std::to_string(i))));
+    }
+    // A 9th cluster is rejected at its own span, not the array's.
+    {
+        std::string too_many = "[";
+        for (u32 i = 0; i < envoy::kMaxEnvoyClusters + 1u; i++) {
+            if (i != 0) too_many += ", ";
+            too_many += cluster_json("backend" + std::to_string(i), static_cast<u16>(9000 + i));
+        }
+        too_many += "]";
+        Bootstrap b2;
+        b2.clusters = too_many;
+        REQUIRE(replace(&b2.listeners, "\"cluster\": \"backend\"", "\"cluster\": \"backend0\""));
+        expect_reject(b2.render(), FrontendError::UnsupportedSyntax, "more than 8 clusters");
+    }
+    // Duplicate cluster names are rejected at the duplicate's own span.
+    {
+        Bootstrap b3;
+        b3.clusters =
+            "[" + cluster_json("backend", 9000) + ", " + cluster_json("backend", 9001) + "]";
+        expect_reject(b3.render(), FrontendError::UnexpectedToken, "duplicate cluster name");
+    }
+}
+
+TEST(envoy_parser, route_action_models_direct_response) {
+    {
+        Bootstrap b;
+        REQUIRE(replace(&b.listeners,
+                        "\"route\": {\"cluster\": \"backend\"}",
+                        "\"direct_response\": {\"status\": 200}"));
+        static envoy::JsonDocument doc;
+        auto result = envoy::parse_bootstrap_json(str(b.render()), doc);
+        REQUIRE(result);
+        const envoy::RouteAction& action =
+            result.value().listener.filter_chain.hcm.route_config.virtual_host.routes[0].action;
+        CHECK(action.kind == envoy::RouteActionKind::DirectResponse);
+        CHECK_EQ(action.direct_response.status, 200u);
+        CHECK_FALSE(action.direct_response.has_body);
+    }
+    {
+        Bootstrap b;
+        REQUIRE(replace(&b.listeners,
+                        "\"route\": {\"cluster\": \"backend\"}",
+                        "\"direct_response\": {\"status\": 404, \"body\": {\"inline_string\": "
+                        "\"not found\"}}"));
+        static envoy::JsonDocument doc;
+        auto result = envoy::parse_bootstrap_json(str(b.render()), doc);
+        REQUIRE(result);
+        const envoy::RouteAction& action =
+            result.value().listener.filter_chain.hcm.route_config.virtual_host.routes[0].action;
+        CHECK(action.kind == envoy::RouteActionKind::DirectResponse);
+        CHECK_EQ(action.direct_response.status, 404u);
+        CHECK(action.direct_response.has_body);
+        CHECK(action.direct_response.inline_string.eq(lit_str("not found")));
+    }
+    {
+        // status is required.
+        Bootstrap b;
+        REQUIRE(replace(
+            &b.listeners, "\"route\": {\"cluster\": \"backend\"}", "\"direct_response\": {}"));
+        expect_reject(b.render(), FrontendError::UnexpectedEof, "status is required");
+    }
+    {
+        // Only body.inline_string is modeled.
+        Bootstrap b;
+        REQUIRE(replace(&b.listeners,
+                        "\"route\": {\"cluster\": \"backend\"}",
+                        "\"direct_response\": {\"status\": 200, \"body\": {\"filename\": \"x\"}}"));
+        expect_reject(b.render(), FrontendError::UnsupportedSyntax, "unsupported field");
+    }
+    {
+        // The inline body is bounded.
+        Bootstrap b;
+        const std::string body(4097, 'a');
+        REQUIRE(replace(&b.listeners,
+                        "\"route\": {\"cluster\": \"backend\"}",
+                        "\"direct_response\": {\"status\": 200, \"body\": {\"inline_string\": \"" +
+                            body + "\"}}"));
+        expect_reject(b.render(), FrontendError::UnsupportedSyntax, "exceeds 4096 bytes");
+    }
+}
+
+TEST(envoy_parser, route_action_models_redirect) {
+    {
+        Bootstrap b;
+        REQUIRE(
+            replace(&b.listeners,
+                    "\"route\": {\"cluster\": \"backend\"}",
+                    "\"redirect\": {\"path_redirect\": \"/new\", \"response_code\": \"FOUND\"}"));
+        static envoy::JsonDocument doc;
+        auto result = envoy::parse_bootstrap_json(str(b.render()), doc);
+        REQUIRE(result);
+        const envoy::RouteAction& action =
+            result.value().listener.filter_chain.hcm.route_config.virtual_host.routes[0].action;
+        CHECK(action.kind == envoy::RouteActionKind::Redirect);
+        CHECK(action.redirect.path_redirect.eq(lit_str("/new")));
+        CHECK_EQ(action.redirect.response_code, 302u);
+    }
+    {
+        Bootstrap b;
+        REQUIRE(replace(&b.listeners,
+                        "\"route\": {\"cluster\": \"backend\"}",
+                        "\"redirect\": {\"host_redirect\": \"example.com\", \"response_code\": "
+                        "\"PERMANENT_REDIRECT\"}"));
+        static envoy::JsonDocument doc;
+        auto result = envoy::parse_bootstrap_json(str(b.render()), doc);
+        REQUIRE(result);
+        const envoy::RouteAction& action =
+            result.value().listener.filter_chain.hcm.route_config.virtual_host.routes[0].action;
+        CHECK(action.redirect.host_redirect.eq(lit_str("example.com")));
+        CHECK_EQ(action.redirect.response_code, 308u);
+    }
+    {
+        // response_code is required and closed to the five Envoy names.
+        Bootstrap b;
+        REQUIRE(replace(&b.listeners,
+                        "\"route\": {\"cluster\": \"backend\"}",
+                        "\"redirect\": {\"path_redirect\": \"/new\"}"));
+        expect_reject(b.render(), FrontendError::UnexpectedEof, "response_code is required");
+    }
+    {
+        Bootstrap b;
+        REQUIRE(replace(&b.listeners,
+                        "\"route\": {\"cluster\": \"backend\"}",
+                        "\"redirect\": {\"path_redirect\": \"/new\", \"response_code\": \"OK\"}"));
+        expect_reject(b.render(), FrontendError::UnsupportedSyntax, "must be one of");
+    }
+    {
+        // Only path_redirect, host_redirect, response_code are modeled.
+        Bootstrap b;
+        REQUIRE(replace(&b.listeners,
+                        "\"route\": {\"cluster\": \"backend\"}",
+                        "\"redirect\": {\"path_redirect\": \"/new\", \"response_code\": \"FOUND\", "
+                        "\"https_redirect\": true}"));
+        expect_reject(b.render(), FrontendError::UnsupportedSyntax, "unsupported field");
+    }
+}
+
+TEST(envoy_parser, route_action_rejects_none_or_multiple) {
+    {
+        Bootstrap b;
+        REQUIRE(replace(&b.listeners, "\"route\": {\"cluster\": \"backend\"}", ""));
+        REQUIRE(replace(
+            &b.listeners, "\"match\": {\"prefix\": \"/\"}, ", "\"match\": {\"prefix\": \"/\"}"));
+        expect_reject(b.render(),
+                      FrontendError::UnexpectedEof,
+                      "only route actions with route, direct_response, or redirect");
+    }
+    {
+        Bootstrap b;
+        REQUIRE(replace(
+            &b.listeners,
+            "\"route\": {\"cluster\": \"backend\"}",
+            "\"route\": {\"cluster\": \"backend\"}, \"direct_response\": {\"status\": 200}"));
+        expect_reject(b.render(),
+                      FrontendError::UnexpectedToken,
+                      "exactly one of route, direct_response, or redirect");
     }
 }
 
