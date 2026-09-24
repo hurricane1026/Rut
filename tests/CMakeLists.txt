@@ -735,6 +735,15 @@ add_dependencies(test_nginx_convert rut-nginx-convert)
 add_test(NAME test_nginx_convert COMMAND test_nginx_convert $<TARGET_FILE:rut-nginx-convert>)
 set_tests_properties(test_nginx_convert PROPERTIES LABELS "unit;nginx;converter")
 
+add_executable(test_envoy_parser test_envoy_parser.cc ${PROJECT_SOURCE_DIR}/src/placement_new.cc)
+target_link_libraries(test_envoy_parser rut_envoy)
+target_include_directories(test_envoy_parser PRIVATE
+    ${PROJECT_SOURCE_DIR}/include
+    ${PROJECT_SOURCE_DIR}/testing
+)
+add_test(NAME test_envoy_parser COMMAND test_envoy_parser)
+set_tests_properties(test_envoy_parser PROPERTIES LABELS "unit;envoy;compiler")
+
 add_executable(test_drain test_drain.cc)
 target_link_libraries(test_drain rut_runtime)
 target_include_directories(test_drain PRIVATE
