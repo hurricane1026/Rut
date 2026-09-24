@@ -36,7 +36,8 @@ struct RutCapabilities {
     bool local_reply_envoy_h1 = false;  // PR5: lowercase local_response / failure_policy layout
 };
 
-inline constexpr RutCapabilities kShippedRutCapabilities{.request_envoy_h1 = true};
+inline constexpr RutCapabilities kShippedRutCapabilities{.request_envoy_h1 = true,
+                                                         .response_envoy_h1 = true};
 
 // Lower the milestone Envoy semantic model to deterministic RUT source using
 // the capabilities this binary actually ships. Fails closed with a

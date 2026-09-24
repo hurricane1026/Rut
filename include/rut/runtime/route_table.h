@@ -1732,6 +1732,10 @@ public:
         dst.connection = policy.connection;
         dst.date = policy.date;
         dst.head_mode = policy.head_mode;
+        dst.header_order = policy.header_order;
+        dst.header_names = policy.header_names;
+        dst.connection_header = policy.connection_header;
+        dst.status_reason = policy.status_reason;
         copy(policy.server, dst.server);
         dst.hide_header_count = policy.hide_header_count;
         for (u32 i = 0; i < policy.hide_header_count; i++)

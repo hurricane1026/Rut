@@ -1528,6 +1528,93 @@ TEST(response_policy, head_mode_config_copy_is_owned_and_atomic) {
     CHECK_EQ(untouched.response_policy_bytes_used, 0u);
 }
 
+TEST(response_policy, upstream_header_order_config_copy_is_owned_and_spec_valid_table) {
+    char server[] = "envoy";
+    ForwardResponsePolicySpec synth{};
+    synth.version = ResponsePolicyVersion::Http11;
+    synth.framing = ResponsePolicyFraming::ContentLength;
+    synth.connection = ResponsePolicyConnection::Request;
+    synth.date = ResponsePolicyDate::Current;
+    synth.server = {server, 5};
+    CHECK(response_policy_spec_valid(synth));
+
+    ForwardResponsePolicySpec upstream_order = synth;
+    upstream_order.header_order = ResponsePolicyHeaderOrder::Upstream;
+    upstream_order.header_names = ResponsePolicyHeaderNames::Lowercase;
+    upstream_order.connection_header = ResponsePolicyConnectionHeader::CloseOnly;
+    upstream_order.status_reason = ResponsePolicyStatusReason::Canonical;
+    upstream_order.date = ResponsePolicyDate::PreserveOrCurrent;
+    CHECK(response_policy_spec_valid(upstream_order));
+
+    // Every one of the four new fields is required at its one supported
+    // value when `header_order == Upstream`; the reverse (any of the four
+    // set to a non-default value while `header_order == Synthesized`) is
+    // also rejected. `nginx` (Synthesized) is otherwise untouched.
+    struct Case {
+        ForwardResponsePolicySpec spec;
+        bool valid;
+    };
+    auto make_invalid_upstream = [&](auto mutate) {
+        auto spec = upstream_order;
+        mutate(spec);
+        return spec;
+    };
+    auto make_invalid_synth = [&](auto mutate) {
+        auto spec = synth;
+        mutate(spec);
+        return spec;
+    };
+    Case cases[] = {
+        {synth, true},
+        {upstream_order, true},
+        {make_invalid_upstream(
+             [](auto& s) { s.header_names = ResponsePolicyHeaderNames::Preserve; }),
+         false},
+        {make_invalid_upstream(
+             [](auto& s) { s.connection_header = ResponsePolicyConnectionHeader::Always; }),
+         false},
+        {make_invalid_upstream(
+             [](auto& s) { s.status_reason = ResponsePolicyStatusReason::Upstream; }),
+         false},
+        {make_invalid_upstream([](auto& s) { s.date = ResponsePolicyDate::Current; }), false},
+        {make_invalid_synth([](auto& s) { s.header_names = ResponsePolicyHeaderNames::Lowercase; }),
+         false},
+        {make_invalid_synth(
+             [](auto& s) { s.connection_header = ResponsePolicyConnectionHeader::CloseOnly; }),
+         false},
+        {make_invalid_synth(
+             [](auto& s) { s.status_reason = ResponsePolicyStatusReason::Canonical; }),
+         false},
+        {make_invalid_synth([](auto& s) { s.date = ResponsePolicyDate::PreserveOrCurrent; }),
+         false},
+        {make_invalid_synth([](auto& s) { s.header_order = ResponsePolicyHeaderOrder::Upstream; }),
+         false},
+    };
+    for (const auto& c : cases) CHECK_EQ(response_policy_spec_valid(c.spec), c.valid);
+
+    rir::Module module{};
+    module.response_policy_count = 2;
+    module.response_policies[0] = synth;
+    module.response_policies[1] = upstream_order;
+    RouteConfig config{};
+    REQUIRE(populate_route_config(config, module));
+    CHECK_EQ(config.response_policy_count, 2u);
+    CHECK(config.response_policies[0].header_order == ResponsePolicyHeaderOrder::Synthesized);
+    CHECK(config.response_policies[1].header_order == ResponsePolicyHeaderOrder::Upstream);
+    CHECK(config.response_policies[1].header_names == ResponsePolicyHeaderNames::Lowercase);
+    CHECK(config.response_policies[1].connection_header ==
+          ResponsePolicyConnectionHeader::CloseOnly);
+    CHECK(config.response_policies[1].status_reason == ResponsePolicyStatusReason::Canonical);
+    CHECK(config.response_policies[1].date == ResponsePolicyDate::PreserveOrCurrent);
+
+    rir::Module malformed = module;
+    malformed.response_policies[1].header_names = ResponsePolicyHeaderNames::Preserve;
+    RouteConfig untouched{};
+    CHECK_FALSE(populate_route_config(untouched, malformed));
+    CHECK_EQ(untouched.response_policy_count, 0u);
+    CHECK_EQ(untouched.response_policy_bytes_used, 0u);
+}
+
 TEST(response_policy, failure_head_mode_config_copy_is_owned_and_deduplicated) {
     char reason[] = "Bad Gateway";
     char type[] = "text/plain";

@@ -34,6 +34,34 @@ enum class ResponsePolicyConnection : u8 {
 enum class ResponsePolicyDate : u8 {
     Invalid = 0,
     Current = 1,
+    // Envoy H1 profile: keep an upstream `date` in place, or append `date:
+    // <now>` when the upstream response sent none. Admitted only alongside
+    // `header_order: "upstream"`.
+    PreserveOrCurrent = 2,
+};
+
+// Envoy H1 profile fields (only meaningful together with `header_order ==
+// Upstream`, see `response_policy_spec_scalar_valid` below). The nginx-style
+// fixed-order profile (`Synthesized`) requires every one of these at its
+// default and is otherwise unaffected.
+enum class ResponsePolicyHeaderOrder : u8 {
+    Synthesized = 0,
+    Upstream = 1,
+};
+
+enum class ResponsePolicyHeaderNames : u8 {
+    Preserve = 0,
+    Lowercase = 1,
+};
+
+enum class ResponsePolicyConnectionHeader : u8 {
+    Always = 0,
+    CloseOnly = 1,
+};
+
+enum class ResponsePolicyStatusReason : u8 {
+    Upstream = 0,
+    Canonical = 1,
 };
 
 struct ForwardResponsePolicySpec {
@@ -42,6 +70,10 @@ struct ForwardResponsePolicySpec {
     ResponsePolicyConnection connection = ResponsePolicyConnection::Invalid;
     ResponsePolicyDate date = ResponsePolicyDate::Invalid;
     ResponsePolicyHeadMode head_mode = ResponsePolicyHeadMode::Reject;
+    ResponsePolicyHeaderOrder header_order = ResponsePolicyHeaderOrder::Synthesized;
+    ResponsePolicyHeaderNames header_names = ResponsePolicyHeaderNames::Preserve;
+    ResponsePolicyConnectionHeader connection_header = ResponsePolicyConnectionHeader::Always;
+    ResponsePolicyStatusReason status_reason = ResponsePolicyStatusReason::Upstream;
     Str server{};
     u32 hide_header_count = 0;
     Str hide_headers[kMaxResponsePolicyHideHeaders]{};
@@ -93,14 +125,29 @@ inline constexpr bool kRescanAdmittedPolicies = true;
 #endif
 
 inline bool response_policy_spec_scalar_valid(const ForwardResponsePolicySpec& policy) {
-    return policy.version == ResponsePolicyVersion::Http11 &&
-           policy.framing == ResponsePolicyFraming::ContentLength &&
-           (policy.connection == ResponsePolicyConnection::KeepAlive ||
-            policy.connection == ResponsePolicyConnection::Request) &&
-           policy.date == ResponsePolicyDate::Current &&
-           (policy.head_mode == ResponsePolicyHeadMode::Reject ||
-            policy.head_mode == ResponsePolicyHeadMode::SuppressBody) &&
-           policy.hide_header_count <= kMaxResponsePolicyHideHeaders;
+    if (policy.version != ResponsePolicyVersion::Http11 ||
+        policy.framing != ResponsePolicyFraming::ContentLength ||
+        (policy.connection != ResponsePolicyConnection::KeepAlive &&
+         policy.connection != ResponsePolicyConnection::Request) ||
+        (policy.head_mode != ResponsePolicyHeadMode::Reject &&
+         policy.head_mode != ResponsePolicyHeadMode::SuppressBody) ||
+        policy.hide_header_count > kMaxResponsePolicyHideHeaders)
+        return false;
+    // `header_order: "upstream"` is the closed Envoy H1 combination: every
+    // other new field is required at its one supported value. The
+    // nginx-compatible fixed-order profile (`Synthesized`) keeps today's
+    // contract and rejects any of these fields being set to anything else.
+    if (policy.header_order == ResponsePolicyHeaderOrder::Upstream) {
+        return policy.header_names == ResponsePolicyHeaderNames::Lowercase &&
+               policy.connection_header == ResponsePolicyConnectionHeader::CloseOnly &&
+               policy.status_reason == ResponsePolicyStatusReason::Canonical &&
+               policy.date == ResponsePolicyDate::PreserveOrCurrent;
+    }
+    return policy.header_order == ResponsePolicyHeaderOrder::Synthesized &&
+           policy.header_names == ResponsePolicyHeaderNames::Preserve &&
+           policy.connection_header == ResponsePolicyConnectionHeader::Always &&
+           policy.status_reason == ResponsePolicyStatusReason::Upstream &&
+           policy.date == ResponsePolicyDate::Current;
 }
 
 inline bool response_policy_spec_valid(const ForwardResponsePolicySpec& policy) {
@@ -128,7 +175,9 @@ inline bool admitted_response_policy_valid(const ForwardResponsePolicySpec& poli
 inline bool response_policy_spec_equal(const ForwardResponsePolicySpec& a,
                                        const ForwardResponsePolicySpec& b) {
     if (a.version != b.version || a.framing != b.framing || a.connection != b.connection ||
-        a.date != b.date || a.head_mode != b.head_mode || !a.server.eq(b.server) ||
+        a.date != b.date || a.head_mode != b.head_mode || a.header_order != b.header_order ||
+        a.header_names != b.header_names || a.connection_header != b.connection_header ||
+        a.status_reason != b.status_reason || !a.server.eq(b.server) ||
         a.hide_header_count != b.hide_header_count)
         return false;
     for (u32 i = 0; i < a.hide_header_count; i++) {

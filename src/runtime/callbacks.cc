@@ -517,6 +517,20 @@ const char* status_reason(u16 code) {
     }
 }
 
+// Envoy H1 profile: reuses the table above, but returns false instead of
+// substituting "Unknown" for a code with no canonical entry. None of the
+// mapped reason phrases equal the literal fallback text, so detecting it by
+// content is exact and avoids duplicating the switch.
+bool canonical_status_reason(u16 code, Str* out) {
+    if (out == nullptr) return false;
+    const char* reason = status_reason(code);
+    u32 len = 0;
+    while (reason[len]) len++;
+    if (len == 7 && __builtin_memcmp(reason, "Unknown", 7) == 0) return false;
+    *out = {reason, len};
+    return true;
+}
+
 // Shared writer: status line + Content-Length + Connection header,
 // used by both the default (reason-phrase) body path and the custom
 // body path. Leaves the builder positioned just past "\r\n" so the

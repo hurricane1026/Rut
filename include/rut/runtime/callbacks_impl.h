@@ -875,6 +875,10 @@ bool pipeline_stash(Connection& conn);
 PipelineTransitionResult pipeline_recover(Connection& conn, bool count_transition = true);
 void capture_stage_headers(Connection& conn);
 const char* status_reason(u16 code);
+// Envoy H1 profile: like `status_reason` above, but fails closed (returns
+// false) for a code with no canonical table entry instead of falling back to
+// the "Unknown" placeholder reason phrase used by the legacy formatters.
+bool canonical_status_reason(u16 code, Str* out);
 void format_static_response(Connection& conn, u16 code, bool keep_alive);
 // Custom-body variant: writes status line + Content-Length matching
 // body_len + default Content-Type (text/plain; charset=utf-8) + body
@@ -11157,6 +11161,109 @@ inline bool stage_redirect_response(Connection& conn, const RouteConfig& config,
     return conn.send_buf.write(scratch, len) == len;
 }
 
+// Envoy H1 profile (`header_order == Upstream`): preserves the upstream
+// header order, lowercases every forwarded name, keeps an upstream `date`
+// header in place (or appends one when absent), replaces the first `server`
+// value in place (a later duplicate is dropped entirely, matching the
+// upstream-value rule), and appends `connection: close` only when the
+// downstream connection is closing. Dispatched from
+// `build_strict_response_headers` below; every other prebuilt-response
+// purpose fails closed here too so the response-read-deadline and buffering
+// profiles (which assume the fixed-order `Synthesized` layout) can never
+// observe this serializer even if their own admission checks are bypassed.
+inline bool build_upstream_order_response_headers(
+    Connection& conn,
+    const RouteConfig& config,
+    const ParsedResponse& resp,
+    Http1PrebuiltResponsePurpose purpose = Http1PrebuiltResponsePurpose::None) {
+    if (conn.response_policy_id == 0 || conn.response_policy_id > config.response_policy_count)
+        return false;
+    const auto& policy = config.response_policies[conn.response_policy_id - 1];
+    if (purpose != Http1PrebuiltResponsePurpose::None || !admitted_response_policy_valid(policy) ||
+        policy.header_order != ResponsePolicyHeaderOrder::Upstream ||
+        resp.version != HttpVersion::Http11 || resp.status_code < 200 || resp.status_code > 599 ||
+        resp.status_code == 204 || resp.status_code == 205 || resp.status_code == 304 ||
+        resp.headers_truncated || resp.content_length_count != 1 || !resp.has_content_length ||
+        resp.chunked || resp.reason.len == 0)
+        return false;
+    for (u32 i = 0; i < resp.reason.len; i++) {
+        const u8 c = static_cast<u8>(resp.reason.ptr[i]);
+        if ((c < 0x20 && c != '\t') || c == 0x7f) return false;
+    }
+    u32 connection_count = 0;
+    for (u32 i = 0; i < resp.header_count; i++) {
+        if (response_policy_name_eq(resp.headers[i].name, "connection", 10) &&
+            ++connection_count > 1)
+            return false;
+    }
+    Str reason{};
+    if (!canonical_status_reason(resp.status_code, &reason)) return false;
+    conn.response_header_buf.reset();
+    auto put = [&](const char* p, u32 n) {
+        return conn.response_header_buf.write(reinterpret_cast<const u8*>(p), n) == n;
+    };
+    auto put_lit = [&](const char* p) { return put(p, static_cast<u32>(__builtin_strlen(p))); };
+    char line[3] = {static_cast<char>('0' + resp.status_code / 100),
+                    static_cast<char>('0' + (resp.status_code / 10) % 10),
+                    static_cast<char>('0' + resp.status_code % 10)};
+    if (!put_lit("HTTP/1.1 ") || !put(line, 3) || !put_lit(" ") || !put(reason.ptr, reason.len) ||
+        !put_lit("\r\n"))
+        return false;
+    bool seen_date = false;
+    bool seen_server = false;
+    for (u32 i = 0; i < resp.header_count; i++) {
+        const Header& h = resp.headers[i];
+        const Str name = h.name;
+        if (response_policy_name_eq(name, "connection", 10) ||
+            response_policy_name_eq(name, "keep-alive", 10) ||
+            response_policy_name_eq(name, "proxy-connection", 16) ||
+            response_policy_name_eq(name, "upgrade", 7) || response_policy_name_eq(name, "te", 2) ||
+            response_policy_name_eq(name, "trailer", 7) ||
+            response_policy_name_eq(name, "transfer-encoding", 17) ||
+            response_policy_hides_header(policy, name))
+            continue;
+        if (response_policy_name_eq(name, "server", 6)) {
+            if (seen_server) continue;
+            seen_server = true;
+            if (!put_lit("server: ") || !put(policy.server.ptr, policy.server.len) ||
+                !put_lit("\r\n"))
+                return false;
+            continue;
+        }
+        if (response_policy_name_eq(name, "date", 4)) seen_date = true;
+        u32 start = 0;
+        while (start < h.raw_value.len &&
+               (h.raw_value.ptr[start] == ' ' || h.raw_value.ptr[start] == '\t'))
+            start++;
+        for (u32 c = 0; c < name.len; c++) {
+            char lower = name.ptr[c];
+            if (lower >= 'A' && lower <= 'Z') lower = static_cast<char>(lower + 32);
+            if (!put(&lower, 1)) return false;
+        }
+        if (!put_lit(": ") || !put(h.raw_value.ptr + start, h.raw_value.len - start) ||
+            !put_lit("\r\n"))
+            return false;
+    }
+    if (!seen_date) {
+        char date[32];
+        const u32 date_len = strict_response_date(date, realtime_us());
+        if (date_len == 0 || !put_lit("date: ") || !put(date, date_len) || !put_lit("\r\n"))
+            return false;
+    }
+    if (!seen_server &&
+        (!put_lit("server: ") || !put(policy.server.ptr, policy.server.len) || !put_lit("\r\n")))
+        return false;
+    const bool policy_keep_alive =
+        policy.connection == ResponsePolicyConnection::KeepAlive ||
+        (policy.connection == ResponsePolicyConnection::Request && conn.req_client_keep_alive);
+    // Preserve the server lifecycle gate set at the request boundary, exactly
+    // as the Synthesized serializer does above.
+    const bool effective_keep_alive = conn.keep_alive && policy_keep_alive;
+    conn.keep_alive = effective_keep_alive;
+    if (!effective_keep_alive && !put_lit("connection: close\r\n")) return false;
+    return put_lit("\r\n");
+}
+
 inline bool build_strict_response_headers(
     Connection& conn,
     const RouteConfig& config,
@@ -11165,6 +11272,8 @@ inline bool build_strict_response_headers(
     if (conn.response_policy_id == 0 || conn.response_policy_id > config.response_policy_count)
         return false;
     const auto& policy = config.response_policies[conn.response_policy_id - 1];
+    if (policy.header_order == ResponsePolicyHeaderOrder::Upstream)
+        return build_upstream_order_response_headers(conn, config, resp, purpose);
     const bool strict_no_body_metadata =
         purpose == Http1PrebuiltResponsePurpose::StrictNoBodyMetadataSuccess;
     if ((purpose != Http1PrebuiltResponsePurpose::None && !strict_no_body_metadata) ||

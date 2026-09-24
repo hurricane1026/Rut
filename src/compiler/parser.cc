@@ -2225,6 +2225,10 @@ struct Parser {
                         bool have_date = false;
                         bool have_hide_headers = false;
                         bool have_head_mode = false;
+                        bool have_header_order = false;
+                        bool have_header_names = false;
+                        bool have_connection_header = false;
+                        bool have_status_reason = false;
                         while (true) {
                             auto field = expect(TokenType::Ident);
                             if (!field) return core::make_unexpected(field.error());
@@ -2276,11 +2280,59 @@ struct Parser {
                                 seen = &have_date;
                                 auto value = expect(TokenType::StringLit);
                                 if (!value) return core::make_unexpected(value.error());
-                                if (!value.value()->text.eq({"current", 7}))
+                                const Str v = value.value()->text;
+                                if (v.eq({"current", 7})) {
+                                    policy.date = ResponsePolicyDate::Current;
+                                } else if (v.eq({"preserve_or_current", 19})) {
+                                    policy.date = ResponsePolicyDate::PreserveOrCurrent;
+                                } else {
                                     return frontend_error(FrontendError::UnsupportedSyntax,
                                                           span_from(*value.value()),
-                                                          value.value()->text);
-                                policy.date = ResponsePolicyDate::Current;
+                                                          v);
+                                }
+                            } else if (field_name.eq({"header_order", 12})) {
+                                seen = &have_header_order;
+                                auto value = expect(TokenType::StringLit);
+                                if (!value) return core::make_unexpected(value.error());
+                                const Str v = value.value()->text;
+                                if (v.eq({"upstream", 8})) {
+                                    policy.header_order = ResponsePolicyHeaderOrder::Upstream;
+                                } else {
+                                    return frontend_error(FrontendError::UnsupportedSyntax,
+                                                          span_from(*value.value()),
+                                                          v);
+                                }
+                            } else if (field_name.eq({"header_names", 12})) {
+                                seen = &have_header_names;
+                                auto value = expect(TokenType::StringLit);
+                                if (!value) return core::make_unexpected(value.error());
+                                const Str v = value.value()->text;
+                                if (!v.eq({"lowercase", 9}))
+                                    return frontend_error(FrontendError::UnsupportedSyntax,
+                                                          span_from(*value.value()),
+                                                          v);
+                                policy.header_names = ResponsePolicyHeaderNames::Lowercase;
+                            } else if (field_name.eq({"connection_header", 17})) {
+                                seen = &have_connection_header;
+                                auto value = expect(TokenType::StringLit);
+                                if (!value) return core::make_unexpected(value.error());
+                                const Str v = value.value()->text;
+                                if (!v.eq({"close_only", 10}))
+                                    return frontend_error(FrontendError::UnsupportedSyntax,
+                                                          span_from(*value.value()),
+                                                          v);
+                                policy.connection_header =
+                                    ResponsePolicyConnectionHeader::CloseOnly;
+                            } else if (field_name.eq({"status_reason", 13})) {
+                                seen = &have_status_reason;
+                                auto value = expect(TokenType::StringLit);
+                                if (!value) return core::make_unexpected(value.error());
+                                const Str v = value.value()->text;
+                                if (!v.eq({"canonical", 9}))
+                                    return frontend_error(FrontendError::UnsupportedSyntax,
+                                                          span_from(*value.value()),
+                                                          v);
+                                policy.status_reason = ResponsePolicyStatusReason::Canonical;
                             } else if (field_name.eq({"head_mode", 9})) {
                                 seen = &have_head_mode;
                                 auto value = expect(TokenType::StringLit);
