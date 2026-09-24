@@ -38,6 +38,7 @@
 #include <poll.h>
 #include <pthread.h>
 #include <sched.h>
+#include <sys/mman.h>
 #include <sys/socket.h>
 #include <unistd.h>
 
@@ -9132,6 +9133,117 @@ TEST(connection_base, tls_send_owners_reset_and_share_nonwrapping_tokens) {
     CHECK_EQ(untouched, 77u);
     CHECK_FALSE(conn.next_response_read_deadline_send_generation());
     CHECK_EQ(conn.response_read_deadline_send_owner_generation, 0u);
+}
+
+TEST(iouring_send, send_file_continues_on_pollout_and_completes_once) {
+    ScopedTlsRawSendLoop guard;
+    REQUIRE(guard.init());
+    IoUringBackend& backend = guard.loop->backend;
+    backend.nop_inject_result = true;
+
+    const i32 listener = socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0);
+    REQUIRE_GE(listener, 0);
+    sockaddr_in addr{};
+    addr.sin_family = AF_INET;
+    addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    REQUIRE_EQ(bind(listener, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)), 0);
+    REQUIRE_EQ(listen(listener, 1), 0);
+    socklen_t addr_len = sizeof(addr);
+    REQUIRE_EQ(getsockname(listener, reinterpret_cast<sockaddr*>(&addr), &addr_len), 0);
+    const i32 client = socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0);
+    REQUIRE_GE(client, 0);
+    const i32 small = 4096;
+    REQUIRE_EQ(setsockopt(client, SOL_SOCKET, SO_RCVBUF, &small, sizeof(small)), 0);
+    REQUIRE_EQ(connect(client, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)), 0);
+    const i32 server = accept4(listener, nullptr, nullptr, SOCK_NONBLOCK | SOCK_CLOEXEC);
+    REQUIRE_GE(server, 0);
+    REQUIRE_EQ(setsockopt(server, SOL_SOCKET, SO_SNDBUF, &small, sizeof(small)), 0);
+
+    constexpr u32 kLen = 4u << 20;
+    const i32 file = memfd_create("send-file-test", MFD_CLOEXEC);
+    REQUIRE_GE(file, 0);
+    std::vector<u8> bytes(kLen);
+    for (u32 i = 0; i < kLen; ++i) bytes[i] = static_cast<u8>(i * 131 + i / 4099);
+    REQUIRE_EQ(write(file, bytes.data(), kLen), static_cast<ssize_t>(kLen));
+
+    constexpr u32 kGen = 3;
+    // A chunk the idle socket takes at once completes through an injected NOP.
+    REQUIRE(backend.add_send_file(server, 0, file, 0, 512, kGen + 2));
+    REQUIRE_EQ(guard.sq_tail, 1u);
+    CHECK_EQ(guard.sq_entries[0].opcode, IORING_OP_NOP);
+    CHECK_EQ(guard.sq_entries[0].len, 512u);
+    CHECK_EQ(backend.send_state[0].file_fd, -1);
+    {
+        u8 head[512];
+        u32 have = 0;
+        while (have < sizeof(head)) {
+            const ssize_t r = recv(client, head + have, sizeof(head) - have, 0);
+            REQUIRE_GT(r, 0);
+            have += static_cast<u32>(r);
+        }
+        CHECK(memcmp(head, bytes.data(), sizeof(head)) == 0);
+    }
+    guard.sq_head = guard.sq_tail;
+    backend.pending = 0;
+    backend.send_state[0].remaining = 0;
+    const u32 kBase = guard.sq_tail;
+
+    // Offset 16: the body chunk starts partway into the file.
+    constexpr u32 kOff = 16;
+    REQUIRE(backend.add_send_file(server, 0, file, kOff, kLen - kOff, kGen));
+    REQUIRE_EQ(guard.sq_tail, kBase + 1u);
+    // Partial: waits for POLLOUT.
+    CHECK_EQ(guard.sq_entries[kBase & guard.sq_mask].opcode, IORING_OP_POLL_ADD);
+    CHECK_EQ(backend.send_state[0].file_fd, file);
+    CHECK_GT(backend.send_state[0].remaining, 0u);
+
+    std::vector<u8> got;
+    got.reserve(kLen);
+    u8 buf[65536];
+    IoEvent done{};
+    for (u32 round = 0; round < 100000; ++round) {
+        ssize_t n;
+        while ((n = recv(client, buf, sizeof(buf), MSG_DONTWAIT)) > 0)
+            got.insert(got.end(), buf, buf + n);
+        guard.sq_head = guard.sq_tail;
+        backend.pending = 0;
+        REQUIRE(guard.push_send_cqe(kGen, POLLOUT));
+        IoEvent ev{};
+        if (backend.wait(&ev, 1, guard.loop->conns, 1) == 1) {
+            done = ev;
+            break;
+        }
+        // Not finished: exactly one fresh POLLOUT poll was re-armed.
+        CHECK_EQ(guard.sq_entries[(guard.sq_tail - 1) & guard.sq_mask].opcode, IORING_OP_POLL_ADD);
+    }
+    CHECK_EQ(done.type, IoEventType::Send);
+    CHECK_EQ(done.result, static_cast<i32>(kLen - kOff));  // one completion, whole length
+    CHECK_EQ(done.non_upstream_generation, kGen);
+    CHECK_EQ(backend.send_state[0].file_fd, -1);
+    ssize_t n;
+    while (got.size() < kLen - kOff && (n = recv(client, buf, sizeof(buf), 0)) > 0)
+        got.insert(got.end(), buf, buf + n);
+    REQUIRE_EQ(got.size(), static_cast<size_t>(kLen - kOff));
+    CHECK(memcmp(got.data(), bytes.data() + kOff, got.size()) == 0);
+
+    // A poll error ends a pending file send with that error.
+    guard.sq_head = guard.sq_tail;
+    backend.pending = 0;
+    REQUIRE(backend.add_send_file(server, 0, file, 0, kLen, kGen + 1));
+    if (backend.send_state[0].file_fd >= 0) {
+        guard.sq_head = guard.sq_tail;
+        backend.pending = 0;
+        REQUIRE(guard.push_send_cqe(kGen + 1, -ECANCELED));
+        IoEvent failed{};
+        REQUIRE_EQ(backend.wait(&failed, 1, guard.loop->conns, 1), 1u);
+        CHECK_EQ(failed.result, -ECANCELED);
+        CHECK_EQ(backend.send_state[0].file_fd, -1);
+    }
+
+    close(file);
+    close(server);
+    close(client);
+    close(listener);
 }
 
 TEST(iouring_send, more_follows_sets_msg_more_across_partial_resubmission) {

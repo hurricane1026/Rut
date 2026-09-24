@@ -107,6 +107,13 @@ struct IoUringBackend {
         u32 upstream_episode;
         u32 generation = 0;
         u32 msg_flags = 0;  // extra flags kept for partial-send resubmission
+        // File-backed send (add_send_file): bytes come from file_fd at
+        // file_base + offset via sendfile(2); src is unused. A pending
+        // continuation is a POLLOUT poll whose CQE carries a poll mask, not
+        // a byte count.
+        i32 file_fd = -1;
+        u32 file_base = 0;
+        bool shutdown_when_done = false;  // end the stream once every byte is out
     };
     MappedArray<SendState> send_state;
     MappedArray<SendState> upstream_send_state;
@@ -208,6 +215,23 @@ struct IoUringBackend {
     // Returns false if SQ is full (no SQE submitted).
     bool add_send(
         i32 fd, u32 conn_id, const u8* buf, u32 len, u32 generation = 0, bool more_follows = false);
+
+    // Send `len` bytes of `file_fd` starting at `file_off` with sendfile(2):
+    // page-cache pages go to the socket without a user-space copy. Writes
+    // what the socket takes right away, then continues on POLLOUT inside
+    // wait(); the Send completion reports the whole length, as add_send's
+    // does. Returns false when no SQE is available or sendfile fails outright.
+    // shutdown_when_done ends the write side as soon as the last byte is out
+    // (a closing connection's final chunk: the FIN follows the data at once,
+    // as nginx does); *wrote_all reports that sendfile took everything now.
+    bool add_send_file(i32 fd,
+                       u32 conn_id,
+                       i32 file_fd,
+                       u32 file_off,
+                       u32 len,
+                       u32 generation = 0,
+                       bool shutdown_when_done = false,
+                       bool* wrote_all = nullptr);
 
     // Submit the currently staged SQ entries without waiting for a completion.
     // This is a bounded pressure-relief primitive: callers decide whether to

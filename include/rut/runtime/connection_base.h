@@ -1616,6 +1616,10 @@ struct ConnectionBase {
     const u8* local_body_cursor = nullptr;
     u32 local_body_remaining = 0;
     u32 local_body_send_len = 0;
+    // The local body's sealed memfd (fd, or -1) and its first byte, so a
+    // chunk at local_body_cursor is file offset cursor - base.
+    i32 local_body_file_fd = -1;
+    const u8* local_body_base = nullptr;
     u32 local_response_size = 0;
 
     // Upstream recv buffer — separate from client recv_buf to prevent:
@@ -1900,6 +1904,8 @@ struct ConnectionBase {
         local_body_cursor = nullptr;
         local_body_remaining = 0;
         local_body_send_len = 0;
+        local_body_file_fd = -1;
+        local_body_base = nullptr;
         local_response_size = 0;
         upstream_recv_slice = nullptr;
         upstream_recv_buf.bind(nullptr, 0);

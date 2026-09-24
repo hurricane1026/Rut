@@ -2809,6 +2809,19 @@ void on_response_sent(void* lp, Connection& conn, IoEvent ev) {
         conn.local_body_remaining -= n;
         conn.local_body_send_len = n;
         conn.transition_to_sending(&on_response_sent<Loop>);
+        if constexpr (requires(Loop* l, Connection& c) { l->submit_send_file(c, 0, 0u, 0u); }) {
+            // A plaintext body with a sealed memfd leaves by sendfile: the
+            // socket takes page-cache pages instead of a copy of the bytes.
+            if (conn.local_body_file_fd >= 0 && !conn.tls_active && conn.local_body_base &&
+                loop->submit_send_file(
+                    conn,
+                    conn.local_body_file_fd,
+                    static_cast<u32>(conn.local_body_cursor - conn.local_body_base),
+                    n)) {
+                throttle_advance(conn, n);
+                return;
+            }
+        }
         if (!client_send(loop, conn, conn.local_body_cursor, n) && conn.fd >= 0)
             loop->close_conn(conn);
         return;
@@ -2818,6 +2831,8 @@ void on_response_sent(void* lp, Connection& conn, IoEvent ev) {
     const u32 response_size =
         conn.local_response_size ? conn.local_response_size : conn.send_buf.len();
     conn.local_body_cursor = nullptr;
+    conn.local_body_base = nullptr;
+    conn.local_body_file_fd = -1;
     conn.local_response_size = 0;
     on_request_complete(loop, conn, conn.resp_status, response_size);
     conn.send_buf.reset();
@@ -3340,6 +3355,8 @@ void handle_jit_outcome(Loop* loop,
                 conn.send_buf.write(reinterpret_cast<const u8*>(body.data), n);
                 conn.local_body_cursor = reinterpret_cast<const u8*>(body.data) + n;
                 conn.local_body_remaining = body.len - n;
+                conn.local_body_base = reinterpret_cast<const u8*>(body.data);
+                conn.local_body_file_fd = body.file_fd();
             }
             conn.transition_to_sending(&on_response_sent<Loop>);
             client_send(loop, conn, conn.send_buf.data(), conn.send_buf.len());

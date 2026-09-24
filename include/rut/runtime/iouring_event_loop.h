@@ -3034,6 +3034,30 @@ public:
         return false;
     }
 
+    // Plaintext local-body chunk from a sealed memfd (see add_send_file).
+    // Declines — leaving the caller to send from memory — on TLS, while a
+    // response-deadline send owns the connection, or without an SQE.
+    bool submit_send_file(Connection& c, i32 file_fd, u32 file_off, u32 len) {
+        if (c.tls_active || c.fd < 0 || c.send_armed || file_fd < 0 || len == 0 ||
+            c.response_read_deadline_post_commit_phase !=
+                ResponseReadDeadlinePostCommitPhase::None ||
+            backend.failure_code() != 0)
+            return false;
+        // The last chunk of a closing response ends the stream as soon as it
+        // is out, like final_local_response_send's direct write.
+        const bool kFinal =
+            !c.keep_alive && c.local_body_remaining == 0 && c.on_send == &on_response_sent<Self>;
+        bool wrote_all = false;
+        if (!backend.add_send_file(c.fd, c.id, file_fd, file_off, len, 0, kFinal, &wrote_all))
+            return false;
+        c.pending_ops++;
+        c.send_armed = true;
+        // Bytes and FIN are on the wire: a client that read them and reset
+        // must not pre-empt the completion that accounts the request.
+        if (kFinal && wrote_all) c.direct_write_completion_pending = true;
+        return true;
+    }
+
     [[nodiscard]] bool final_local_response_send(const Connection& c,
                                                  const u8* buf,
                                                  u32 len) const {

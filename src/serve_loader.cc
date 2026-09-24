@@ -23,6 +23,48 @@
 
 namespace rut {
 
+namespace {
+
+// Give each large response body a sealed memfd copy so the runtime can
+// sendfile() it: the socket then takes page-cache pages instead of a
+// user-space copy per response. Best effort — a body without a file keeps
+// the ordinary memory send.
+void attach_response_body_files(RouteConfig& cfg) {
+#ifndef __linux__
+    (void)cfg;  // memfd/sendfile are Linux-only; bodies keep memory sends.
+#else
+    for (u32 i = 0; i < cfg.response_body_count; ++i) {
+        auto& body = cfg.response_bodies[i];
+        if (body.file_ref != 0 || body.len < RouteConfig::kFileBodyMinLen) continue;
+        const int fd = memfd_create("rut-response-body", MFD_CLOEXEC | MFD_ALLOW_SEALING);
+        if (fd < 0) continue;
+        u32 done = 0;
+        while (done < body.len) {
+            const ssize_t n = ::write(fd, body.data + done, body.len - done);
+            if (n <= 0) break;
+            done += static_cast<u32>(n);
+        }
+        if (done != body.len ||
+            fcntl(fd, F_ADD_SEALS, F_SEAL_SHRINK | F_SEAL_GROW | F_SEAL_WRITE | F_SEAL_SEAL) != 0) {
+            ::close(fd);
+            continue;
+        }
+        body.file_ref = static_cast<u32>(fd) + 1u;
+    }
+#endif
+}
+
+void close_response_body_files(RouteConfig& cfg) {
+    for (u32 i = 0; i < cfg.response_body_count; ++i) {
+        auto& body = cfg.response_bodies[i];
+        if (body.file_ref == 0) continue;
+        ::close(body.file_fd());
+        body.file_ref = 0;
+    }
+}
+
+}  // namespace
+
 void LoadedProgram::destroy() {
     (void)cache_registry_unpublish_if_owner(this);
     if (jit_inited) {
@@ -35,6 +77,7 @@ void LoadedProgram::destroy() {
         src_map = nullptr;
         src_map_len = 0;
     }
+    close_response_body_files(config);
     config.~RouteConfig();
     new (&config) RouteConfig();
     has_listener = false;
@@ -296,6 +339,9 @@ bool load_rut_program(
     err.stage = LoadStage::Register;
     if (!populate_route_config(out.config, out.rir.module, /*retain_response_body_views=*/true))
         return false;
+    // After the transactional populate: a failed populate restores a byte
+    // snapshot, which would leak files created inside it.
+    attach_response_body_files(out.config);
     if (!register_jit_routes(out.config, out.rir.module, out.engine)) return false;
 
 #if RUT_ENABLE_WEBSOCKET
