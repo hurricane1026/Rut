@@ -1050,10 +1050,6 @@ Each needs its own issue before the corresponding row can leave
   duplicates into one value and this profile does not replicate that
   coalescing. See `tests/fixtures/envoy_oracle_milestone_s.inc` and
   `docs/envoy-compatibility.md`.
-- Header-name casing selector on the response policy: Envoy emits lowercase
-  names over HTTP/1.1. The request side landed with `request_envoy_h1`
-  (PR3, `header_names: "lowercase"` in `request_policy`); the response side
-  is still `response_envoy_h1`.
 - Dynamic `Connection`-nominated header stripping on the upstream request:
   Envoy parses the client's `Connection` header value and removes every
   header it names (e.g. `Connection: X-Secret` also removes `X-Secret`). This
@@ -1091,10 +1087,20 @@ Each needs its own issue before the corresponding row can leave
   policies (ID1/ID2/ID3) already apply to any `Expect` header; `request_envoy_h1`
   does not add interim-response support and this request shape stays outside
   its advertised capability until a `100 Continue` primitive exists.
-- `response_policy.date: "preserve_or_current"`: add `date` only when absent.
-- `response_policy.server: "envoy"` with overwrite semantics, and an explicit
-  "pass through upstream `server`" mode for `server_header_transformation:
-  PASS_THROUGH`.
+- `response_policy.header_order: "upstream"` (`response_envoy_h1`, PR4):
+  landed. `header_names: "lowercase"`, `connection_header: "close_only"`,
+  `status_reason: "canonical"`, and `date: "preserve_or_current"` are admitted
+  only together with it (nginx's fixed-order `Synthesized` layout is
+  unchanged). The runtime serializer keeps upstream header order, lowercases
+  every forwarded name, replaces the first `server` value in place (a later
+  duplicate is dropped) or appends `server: envoy` when absent, keeps an
+  upstream `date` in place or appends `date: <now>` when absent (`date` then
+  `server` when both are absent), appends `connection: close` last only when
+  the downstream connection is closing, and looks up the canonical reason
+  phrase from a fixed table (failing closed for an unmapped status). Verified
+  byte for byte against `tests/fixtures/envoy_oracle_milestone_s.inc`; see
+  `docs/envoy-compatibility.md`. An explicit "pass through upstream `server`"
+  mode for `server_header_transformation: PASS_THROUGH` is not modeled.
 - Route-level `set_header` on the upstream request is available for literal
   values; `x-envoy-upstream-service-time` on the response needs a runtime
   measured value, which no policy exposes. Until then only the
