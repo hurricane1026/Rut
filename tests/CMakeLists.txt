@@ -792,18 +792,38 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
         "RUT_PINNED_ENVOY_IMAGE=\"${_RUT_PINNED_ENVOY_IMAGE}\""
     )
 
-    add_test(NAME test_envoy_differential_selftest COMMAND test_envoy_differential --self-test)
-    set_tests_properties(test_envoy_differential_selftest PROPERTIES
-        LABELS "unit;envoy"
-        TIMEOUT 60
-    )
-
     add_test(NAME test_envoy_oracle_milestone_s
              COMMAND test_envoy_differential --oracle-milestone-s
                      ${CMAKE_BINARY_DIR}/envoy_oracle_milestone_s.inc)
     set_tests_properties(test_envoy_oracle_milestone_s PROPERTIES
         LABELS "integration;envoy;docker" RUN_SERIAL TRUE RESOURCE_LOCK envoy-differential
         TIMEOUT 120 SKIP_RETURN_CODE 77)
+
+    # Envoy-vs-generated-RUT pair differential (envoy-pr-plan.md PR 6). Needs
+    # the real `rut` binary and `rut-envoy-convert`, so it (and the
+    # RUT-vs-oracle pass of --self-test) is gated on RUT_ENABLE_JIT, mirroring
+    # how test_nginx_differential's rut-binary tests are gated above.
+    if(RUT_ENABLE_JIT)
+        add_dependencies(test_envoy_differential rut rut-envoy-convert)
+
+        add_test(NAME test_envoy_differential_selftest
+                 COMMAND test_envoy_differential --self-test
+                         $<TARGET_FILE:rut> $<TARGET_FILE:rut-envoy-convert>)
+
+        add_test(NAME test_envoy_pair_milestone_s
+                 COMMAND test_envoy_differential --pair-milestone-s
+                         $<TARGET_FILE:rut> $<TARGET_FILE:rut-envoy-convert>
+                         ${CMAKE_BINARY_DIR}/envoy_pair_milestone_s.inc)
+        set_tests_properties(test_envoy_pair_milestone_s PROPERTIES
+            LABELS "integration;envoy;docker" RUN_SERIAL TRUE RESOURCE_LOCK envoy-differential
+            TIMEOUT 180 SKIP_RETURN_CODE 77)
+    else()
+        add_test(NAME test_envoy_differential_selftest COMMAND test_envoy_differential --self-test)
+    endif()
+    set_tests_properties(test_envoy_differential_selftest PROPERTIES
+        LABELS "unit;envoy"
+        TIMEOUT 90
+    )
 endif()
 
 add_executable(test_drain test_drain.cc)

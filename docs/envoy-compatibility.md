@@ -276,6 +276,41 @@ converter fails closed on the whole configuration until then.
 | Connect failure → 503 `upstream connect error or disconnect/reset before headers. reset reason: remote connection failure` (Envoy's exact text) | `failure_policy` `header_order: "length_type_date_server"` (`local_reply_envoy_h1`, PR5) admits status 503 with `content-length, content-type, date, server, [connection: close]` and the oracle's exact 98-byte body; unit/wire- and end-to-end-tested (connect-refused) byte for byte against the recorded Envoy oracle. 502 stays exactly today's Synthesized-only contract. No pinned-Envoy differential-pair run yet (PR6) | PARTIAL |
 | Timeout → 504 `upstream request timeout` | no RUT route-timeout surface exists yet (PR12: admit a timeout request-policy ID and `header_order: "upstream"` into `response_read_deadline`) | BLOCKED_BY_RUT |
 
+## Envoy-vs-generated-RUT pair differential (envoy-pr-plan.md PR 6)
+
+`tests/test_envoy_differential.cc --pair-milestone-s` runs the milestone-S
+bootstrap through the pinned Envoy image and, separately, through
+`rut-envoy-convert` piped into the real `rut` binary, on the same
+listener/upstream ports against the same recording upstream, and compares
+upstream bytes and downstream bytes exactly (only a synthesized `date:`
+header value is normalized before the downstream comparison; the preserved
+`date` in `get_upstream_date_server` is compared unnormalized). It registers
+as CTest `test_envoy_pair_milestone_s` (`integration;envoy;docker`,
+`RESOURCE_LOCK envoy-differential`, `SKIP_RETURN_CODE 77`), runs in the
+`envoy-required` CI job, and uploads its transcript as the
+`envoy-pair-transcript` artifact (`build/envoy_pair_milestone_s.inc`). It has
+not yet run in CI (no docker in this environment); `--self-test <rut>
+<rut-envoy-convert>` exercises the identical comparison logic locally,
+without docker, against the committed Envoy oracle fixture, and passed for
+all six asserted cases as of this PR (see the internal evidence note below).
+
+Each row below is `PARTIAL` until a passing CI run of
+`test_envoy_pair_milestone_s` (zero skips) is cited by run id; the lead
+promotes a row to `SUPPORTED` at that point, not before.
+
+| Pair case | method/path | parser | converter | RUT capability | asserted | status |
+| --- | --- | --- | --- | --- | --- | --- |
+| GET smoke (headers pass through lowercased, `x-forwarded-proto` appended) | `GET /smoke?q=1` | yes | yes | yes (`request_envoy_h1`, `response_envoy_h1`) | yes | PARTIAL (pair differential registered; CI run pending) |
+| Upstream `date`/`server` preservation and canonical reason phrase | `GET /date` | yes | yes | yes (`response_envoy_h1`) | yes | PARTIAL (pair differential registered; CI run pending) |
+| Client close (`connection: close` appended downstream) | `GET /close` | yes | yes | yes (`response_envoy_h1`) | yes | PARTIAL (pair differential registered; CI run pending) |
+| HEAD (body suppressed both sides) | `HEAD /head` | yes | yes | yes (`response_envoy_h1` `head_mode`) | yes | PARTIAL (pair differential registered; CI run pending) |
+| Fixed-length POST | `POST /upload` | yes | yes | yes (`request_envoy_h1`, `response_envoy_h1`) | yes | PARTIAL (pair differential registered; CI run pending) |
+| Connect failure → 503 with Envoy's exact body | `GET /smoke` against a closed upstream port | yes | yes | yes (`local_reply_envoy_h1` `failure_policy`) | yes | PARTIAL (pair differential registered; CI run pending) |
+| Hop-by-hop stripping (`Connection`-nominated headers, `Proxy-Connection`, `TE`) | `GET /hop` | yes | yes | yes (`request_envoy_h1`) | no (record-only) | PARTIAL (pair differential registered; CI run pending) |
+| TRACE | `TRACE /trace` | yes | yes | yes (ordinary forward path) | no (record-only) | PARTIAL (pair differential registered; CI run pending) |
+| OPTIONS * (unmatched → 404) | `OPTIONS *` | yes | yes | yes (`local_reply_envoy_h1` `local_response`) | no (record-only) | PARTIAL (pair differential registered; CI run pending) |
+| CONNECT authority-form (unmatched → 404) | `CONNECT example.com:443` | yes | yes | yes (`local_reply_envoy_h1` `local_response`) | no (record-only) | PARTIAL (pair differential registered; CI run pending) |
+
 ## Not planned in the converter
 
 | Envoy feature | reason |
@@ -382,3 +417,20 @@ converter fails closed on the whole configuration until then.
   evidence note above). CI runs it as the `envoy-required` job and uploads the
   transcript as an artifact; the artifact from run `36040192963` is committed
   verbatim as the fixture. No status changes in this PR.
+- PR 6 (envoy-pr-plan.md): added `--pair-milestone-s` to
+  `tests/test_envoy_differential.cc` (Envoy first, then `rut-envoy-convert` +
+  `rut`, on the same ports against the same recording upstream, sequential;
+  see the pair-differential section above) and the `test_envoy_pair_milestone_s`
+  CTest entry (gated on `RUT_ENABLE_JIT`, same as the `rut`-binary nginx
+  differential tests). Also extended `--self-test` with a RUT-only pass
+  (`--self-test <rut> <rut-envoy-convert>`) that runs the same six asserted
+  cases through the real `rut` binary against the in-process recording
+  upstream and compares them, date-normalized, against the committed Envoy
+  oracle fixture (`tests/fixtures/envoy_oracle_milestone_s.inc`) -- no docker
+  needed. Locally (no docker in this environment) that pass matched the
+  oracle byte for byte on all six asserted cases (`get_smoke`,
+  `get_upstream_date_server`, `get_client_close`, `head_smoke`, `post_fixed`,
+  `connect_failure`); `--pair-milestone-s` itself skips (77) here for lack of
+  docker and has not yet run in CI. No status changes in this PR; every pair
+  row above stays `PARTIAL` until a passing `envoy-required` CI run of
+  `test_envoy_pair_milestone_s` is cited by run id.

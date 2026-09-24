@@ -1,7 +1,8 @@
-// Envoy oracle-recording differential harness (envoy-pr-plan.md, PR 2).
+// Envoy oracle-recording and Envoy-vs-generated-RUT pair differential harness
+// (envoy-pr-plan.md, PR 2 and PR 6).
 //
-// This binary never asserts RUT behavior: no RUT/converter/runtime code is
-// invoked here at all. It drives the pinned Envoy image against a small
+// The oracle mode never asserts RUT behavior: no RUT/converter/runtime code
+// is invoked there at all. It drives the pinned Envoy image against a small
 // recording upstream over loopback, records the exact bytes observed on the
 // wire, and writes them as a ready-to-commit C++ header
 // (tests/fixtures/envoy_oracle_milestone_s.inc once the lead commits the CI
@@ -9,11 +10,30 @@
 // `assert_get_smoke` / `assert_connect_failure`); everything else is
 // recorded evidence for PRs 3-6, not a behavioral claim.
 //
+// The pair mode (PR 6) DOES exercise RUT: it converts the same milestone-S
+// bootstrap with `rut-envoy-convert` and runs the generated `.rut` source
+// through the real `rut` binary, on the same listener/upstream ports Envoy
+// just used, against the same recording upstream and client case table.
+// Upstream and downstream bytes are compared exactly (only a synthesized
+// `date:` header value is normalized before the downstream comparison).
+//
 // Modes:
-//   --self-test                     Exercises the pieces that need no
+//   --self-test [rut] [rut-envoy-convert]
+//                                    Exercises the pieces that need no
 //                                    docker: the recording upstream against
 //                                    the raw client on loopback, and the
-//                                    transcript writer's escaping.
+//                                    transcript writer's escaping. When both
+//                                    binary paths are given, also runs the
+//                                    asserted cases through the real `rut`
+//                                    binary (converted from the milestone-S
+//                                    bootstrap) and compares them against the
+//                                    committed Envoy oracle fixture
+//                                    (date-normalized) -- this is the
+//                                    strongest local evidence for the pair
+//                                    logic below, since it needs no docker.
+//                                    Without the binaries, that pass is
+//                                    skipped with a printed note, not a
+//                                    failure.
 //   --oracle-milestone-s <out-path> Runs the milestone-S bootstrap through
 //                                    the pinned Envoy image (docker
 //                                    required); writes the transcript to
@@ -21,11 +41,26 @@
 //                                    or the pinned image is unavailable,
 //                                    unless RUT_ENVOY_DIFFERENTIAL_REQUIRED=1
 //                                    is set, in which case it exits 1.
+//   --pair-milestone-s <rut> <rut-envoy-convert> [<out.inc>]
+//                                    Runs the milestone-S bootstrap through
+//                                    the pinned Envoy image, then converts it
+//                                    and runs the result through `rut`, both
+//                                    on the same ports against the same
+//                                    recording upstream; compares every case
+//                                    byte for byte (date-normalized
+//                                    downstream only). Same docker
+//                                    prerequisites/skip contract as
+//                                    --oracle-milestone-s. Exits 1 if any
+//                                    `asserted` case mismatches; record-only
+//                                    cases are printed but never affect the
+//                                    exit code. <out.inc> is optional; when
+//                                    given, both sides' bytes are written
+//                                    there as a transcript header.
 //
 // This file is intentionally independent of tests/test_nginx_differential.cc
-// (do not copy it): the scope here is much smaller (one bootstrap shape, no
-// byte-equality assertions, no converter/runtime involvement) and does not
-// need that file's process-launch self-check infrastructure.
+// (do not copy it): the scope here is much smaller (one bootstrap shape, a
+// small fixed case table) and does not need that file's much larger
+// process-launch self-check infrastructure.
 
 #include <algorithm>
 #include <atomic>
@@ -62,6 +97,11 @@
 #ifndef RUT_PINNED_ENVOY_IMAGE
 #error "RUT_PINNED_ENVOY_IMAGE must be provided by the build system"
 #endif
+
+// The committed Envoy-only oracle transcript (PR 2). Used only by the
+// `--self-test` RUT pass (PR 6) to compare the real `rut` binary's output
+// against recorded Envoy bytes without needing docker.
+#include "fixtures/envoy_oracle_milestone_s.inc"
 
 namespace {
 
@@ -754,6 +794,16 @@ public:
         return it == requests_by_path_.end() ? std::vector<std::string>{} : it->second;
     }
 
+    // Discards every recorded request without stopping the accept loop or
+    // dropping pooled connections. `--pair-milestone-s` (PR 6) uses this to
+    // reuse one live upstream across the Envoy and RUT phases -- same
+    // ports, same reply table -- while still being able to attribute each
+    // phase's recorded bytes unambiguously (`requests_for(...).front()`).
+    void clear_requests() {
+        std::lock_guard<std::mutex> lock(mu_);
+        requests_by_path_.clear();
+    }
+
     // Idempotent: safe to call more than once (the destructor calls it again
     // after an explicit stop()).
     void stop() {
@@ -1113,15 +1163,26 @@ bool envoy_log_confirms_listener(const std::string& contents) {
     return contents.find("starting main dispatch loop") != std::string::npos;
 }
 
-bool wait_ready(uint16_t port, EnvoyInstance& envoy, int timeout_ms, std::string* error) {
+// Polls `port` until a TCP connect succeeds, failing early (without waiting
+// out `timeout_ms`) if `proc`'s child has already exited -- shared by the
+// Envoy and RUT readiness waits below (PR 6 adds the RUT side; `EnvoyInstance`
+// already carried this exact loop for PR 2, inlined here so both instance
+// types share one implementation).
+template <typename ProcessInstance>
+bool wait_ready_process(uint16_t port,
+                        ProcessInstance& proc,
+                        int timeout_ms,
+                        const char* exited_early_message,
+                        const char* timed_out_message,
+                        std::string* error) {
     const int64_t deadline = now_ms() + timeout_ms;
     while (now_ms() < deadline) {
-        if (envoy.pid > 0) {
+        if (proc.pid > 0) {
             int status = 0;
-            const pid_t waited = waitpid(envoy.pid, &status, WNOHANG);
-            if (waited == envoy.pid) {
-                envoy.pid = -1;
-                *error = "docker run exited before Envoy became ready";
+            const pid_t waited = waitpid(proc.pid, &status, WNOHANG);
+            if (waited == proc.pid) {
+                proc.pid = -1;
+                *error = exited_early_message;
                 return false;
             }
         }
@@ -1129,8 +1190,17 @@ bool wait_ready(uint16_t port, EnvoyInstance& envoy, int timeout_ms, std::string
         struct timespec ts{0, 50'000'000};
         nanosleep(&ts, nullptr);
     }
-    *error = "timed out waiting for Envoy to accept connections";
+    *error = timed_out_message;
     return false;
+}
+
+bool wait_ready(uint16_t port, EnvoyInstance& envoy, int timeout_ms, std::string* error) {
+    return wait_ready_process(port,
+                              envoy,
+                              timeout_ms,
+                              "docker run exited before Envoy became ready",
+                              "timed out waiting for Envoy to accept connections",
+                              error);
 }
 
 // wait_ready() only proves that *some* process is now accepting connections
@@ -1210,6 +1280,165 @@ bool wait_ready_and_confirm_ownership(
         struct timespec retry_ts{0, 50'000'000};
         nanosleep(&retry_ts, nullptr);
     }
+}
+
+// Polls until `port` stops accepting connections (or `timeout_ms` elapses),
+// returning the final observation either way. Used between the Envoy and RUT
+// phases of `--pair-milestone-s`: both sides listen on the SAME port in
+// sequence, so the harness must see Envoy's listener actually go away before
+// starting `rut` on it.
+bool wait_port_closed(uint16_t port, int timeout_ms) {
+    const int64_t deadline = now_ms() + timeout_ms;
+    do {
+        if (!tcp_port_open(port)) return true;
+        struct timespec ts{0, 50'000'000};
+        nanosleep(&ts, nullptr);
+    } while (now_ms() < deadline);
+    return !tcp_port_open(port);
+}
+
+// ── RUT process management (PR 6) ───────────────────────────────────────
+
+// Launches the real `rut` binary (built by this repo, not a container) on
+// the listener/upstream ports baked into `rut_source_path` by
+// `rut-envoy-convert`. Mirrors `EnvoyInstance` above: fork/exec, redirect
+// stdio to a log file, SIGTERM-then-SIGKILL teardown with reaping.
+struct RutInstance {
+    pid_t pid = -1;
+    std::string log_path;
+
+    bool launch(const std::string& rut_binary, const std::string& rut_source_path) {
+        pid = fork();
+        if (pid < 0) return false;
+        if (pid == 0) {
+            const int log_fd = open(log_path.c_str(), O_CREAT | O_TRUNC | O_WRONLY, 0644);
+            if (log_fd >= 0) {
+                dup2(log_fd, STDOUT_FILENO);
+                dup2(log_fd, STDERR_FILENO);
+                if (log_fd > STDERR_FILENO) close(log_fd);
+            }
+            // rut <source.rut> --shards 1 --no-pin --drain 0
+            //
+            // No CLI port override is passed: the listener port comes from
+            // the `listen :<port>` line `rut-envoy-convert` already baked
+            // into `rut_source_path` from the SAME bootstrap Envoy is (or
+            // was) serving (envoy-pr-plan.md PR 6: "pass only what is
+            // required"). `--drain 0` skips the graceful drain window on
+            // SIGTERM: this harness always stops `rut` with no in-flight
+            // connections, so the only effect of a nonzero drain here is
+            // teardown latency (tests/test_nginx_differential.cc uses the
+            // same flag for the same reason).
+            std::vector<std::string> argv = {
+                rut_binary, rut_source_path, "--shards", "1", "--no-pin", "--drain", "0"};
+            std::vector<char*> args;
+            args.reserve(argv.size() + 1);
+            for (const auto& a : argv) args.push_back(const_cast<char*>(a.c_str()));
+            args.push_back(nullptr);
+            execv(rut_binary.c_str(), args.data());
+            _exit(127);
+        }
+        return true;
+    }
+
+    void stop() {
+        if (pid > 0) {
+            kill(pid, SIGTERM);
+            const int64_t deadline = now_ms() + 5000;
+            int status = 0;
+            for (;;) {
+                const pid_t waited = waitpid(pid, &status, WNOHANG);
+                if (waited == pid) break;
+                if (now_ms() >= deadline) {
+                    kill(pid, SIGKILL);
+                    while (waitpid(pid, &status, 0) < 0 && errno == EINTR) {
+                    }
+                    break;
+                }
+                struct timespec ts{0, 10'000'000};
+                nanosleep(&ts, nullptr);
+            }
+            pid = -1;
+        }
+    }
+
+    ~RutInstance() { stop(); }
+};
+
+bool wait_ready(uint16_t port, RutInstance& rut, int timeout_ms, std::string* error) {
+    return wait_ready_process(port,
+                              rut,
+                              timeout_ms,
+                              "rut exited before it became ready",
+                              "timed out waiting for rut to accept connections",
+                              error);
+}
+
+void dump_rut_log(const std::string& path) {
+    std::ifstream in(path);
+    if (!in) return;
+    std::cerr << "---- rut log (" << path << ") ----\n" << in.rdbuf() << "\n---- end log ----\n";
+}
+
+// ── Converter invocation (PR 6) ──────────────────────────────────────────
+
+// Runs `rut-envoy-convert --format bootstrap-json <bootstrap_path>`,
+// redirecting stdout to `out_rut_path` and capturing stderr into
+// `*stderr_out`. Returns true only on exit 0 with empty stderr (the
+// contract both --self-test's RUT pass and --pair-milestone-s rely on); the
+// caller prints `*stderr_out` on failure.
+bool run_converter_to_file(const std::string& converter_binary,
+                           const std::string& bootstrap_path,
+                           const std::string& out_rut_path,
+                           std::string* stderr_out) {
+    const std::string stderr_path = out_rut_path + ".stderr";
+    const pid_t child = fork();
+    if (child < 0) return false;
+    if (child == 0) {
+        const int out_fd = open(out_rut_path.c_str(), O_CREAT | O_TRUNC | O_WRONLY, 0644);
+        const int err_fd = open(stderr_path.c_str(), O_CREAT | O_TRUNC | O_WRONLY, 0644);
+        if (out_fd >= 0) dup2(out_fd, STDOUT_FILENO);
+        if (err_fd >= 0) dup2(err_fd, STDERR_FILENO);
+        if (out_fd > STDERR_FILENO) close(out_fd);
+        if (err_fd > STDERR_FILENO) close(err_fd);
+        std::vector<std::string> argv = {
+            converter_binary, "--format", "bootstrap-json", bootstrap_path};
+        std::vector<char*> args;
+        args.reserve(argv.size() + 1);
+        for (const auto& a : argv) args.push_back(const_cast<char*>(a.c_str()));
+        args.push_back(nullptr);
+        execv(converter_binary.c_str(), args.data());
+        _exit(127);
+    }
+    int status = 0;
+    const int64_t deadline_ms = now_ms() + 10'000;
+    for (;;) {
+        const pid_t waited = waitpid(child, &status, WNOHANG);
+        if (waited == child) break;
+        if (waited < 0 && errno == EINTR) continue;
+        if (waited < 0) {
+            unlink(stderr_path.c_str());
+            return false;
+        }
+        if (now_ms() >= deadline_ms) {
+            kill(child, SIGKILL);
+            while (waitpid(child, &status, 0) < 0 && errno == EINTR) {
+            }
+            unlink(stderr_path.c_str());
+            return false;
+        }
+        struct timespec ts{0, 5'000'000};
+        nanosleep(&ts, nullptr);
+    }
+    {
+        std::ifstream in(stderr_path);
+        if (in) {
+            std::ostringstream ss;
+            ss << in.rdbuf();
+            *stderr_out = ss.str();
+        }
+    }
+    unlink(stderr_path.c_str());
+    return WIFEXITED(status) && WEXITSTATUS(status) == 0 && stderr_out->empty();
 }
 
 // ── Bootstrap template ──────────────────────────────────────────────────
@@ -1433,6 +1662,33 @@ std::vector<CaseSpec> run1_cases() {
     return cases;
 }
 
+// The run-2 case (PR 2's second Envoy instance, pointed at a closed port):
+// `get_smoke`'s exact client bytes, renamed. Shared by oracle, pair and
+// self-test modes so the client bytes for this case can never drift from the
+// ones actually recorded in the oracle fixture's `kEnvoyOracle_connect_failure_*`.
+CaseSpec connect_failure_case() {
+    CaseSpec spec = run1_cases().front();  // get_smoke
+    spec.name = "connect_failure";
+    return spec;
+}
+
+// The six cases envoy-pr-plan.md PR 6 requires byte-for-byte agreement on.
+// Shared by --pair-milestone-s (which also runs the four record-only cases)
+// and --self-test's RUT pass (which, per the plan, only needs the asserted
+// six against the committed oracle).
+constexpr const char* kAssertedCaseNames[] = {"get_smoke",
+                                              "get_upstream_date_server",
+                                              "get_client_close",
+                                              "head_smoke",
+                                              "post_fixed",
+                                              "connect_failure"};
+
+bool is_asserted_case(const std::string& name) {
+    for (const char* asserted : kAssertedCaseNames)
+        if (name == asserted) return true;
+    return false;
+}
+
 // ── Case results & transcript ────────────────────────────────────────────
 
 struct CaseResult {
@@ -1468,6 +1724,45 @@ bool run_client_case(uint16_t listen_port, const CaseSpec& spec, CaseResult* res
     return sent;
 }
 
+// Runs every case in `cases` against an already-listening `listen_port`, in
+// order, returning one `CaseResult` per case (populated with client/
+// downstream bytes only -- see `fill_upstream_bytes` for the upstream side).
+// Shared by --pair-milestone-s (Envoy and RUT phases) and --self-test's RUT
+// pass; --oracle-milestone-s keeps its own inline loop (PR 2, unchanged).
+std::vector<CaseResult> run_case_batch(uint16_t listen_port, const std::vector<CaseSpec>& cases) {
+    std::vector<CaseResult> results;
+    results.reserve(cases.size());
+    for (const auto& spec : cases) {
+        CaseResult r;
+        if (!run_client_case(listen_port, spec, &r))
+            std::cerr << "WARN: case " << spec.name << " exchange did not complete cleanly\n";
+        results.push_back(std::move(r));
+    }
+    return results;
+}
+
+// Fills in `upstream_contacted`/`upstream_contact_count`/`upstream_bytes` on
+// each result in `results` from what `upstream` actually recorded for that
+// case's path, matching cases by name against `cases` to find each one's
+// `upstream_path`. `upstream_contact_count` feeds the same at-most-once-
+// contact rule `validate_results` enforces for the oracle transcript
+// (round-3 review).
+void fill_upstream_bytes(std::vector<CaseResult>* results,
+                         const std::vector<CaseSpec>& cases,
+                         RecordingUpstream& upstream) {
+    for (auto& r : *results) {
+        const auto it = std::find_if(
+            cases.begin(), cases.end(), [&](const CaseSpec& s) { return r.name == s.name; });
+        if (it == cases.end()) continue;
+        const auto observed = upstream.requests_for(it->upstream_path);
+        r.upstream_contact_count = static_cast<int>(observed.size());
+        if (!observed.empty()) {
+            r.upstream_contacted = true;
+            r.upstream_bytes = observed.front();
+        }
+    }
+}
+
 // Refuses evidence that would make write_transcript() emit a fixture
 // claiming bytes for an exchange that never actually completed, or claiming
 // a single upstream request when the recording upstream in fact observed
@@ -1488,6 +1783,54 @@ std::string validate_results(const std::vector<CaseResult>& results) {
         }
     }
     return "";
+}
+
+// Returns `raw` with its `date:` header value replaced by a fixed
+// placeholder, UNLESS that value is exactly `preserved_date` (the literal
+// the recording upstream sent for `get_upstream_date_server`, which Envoy
+// and RUT must both preserve unchanged -- normalizing it away would hide a
+// real bug). Every other case's `date` is synthesized to "now" by whichever
+// side produced it, so those are always normalized before a byte comparison.
+// `preserved_date` is empty for every other case, which never matches a
+// real Date value and so always normalizes.
+std::string normalize_date_for_compare(const std::string& raw, const std::string& preserved_date) {
+    const size_t header_end = raw.find("\r\n\r\n");
+    if (header_end == std::string::npos) return raw;
+    const std::string head = raw.substr(0, header_end);
+    const std::string rest = raw.substr(header_end);  // "\r\n\r\n" + body
+    std::vector<std::string> lines;
+    size_t start = 0;
+    for (;;) {
+        const size_t nl = head.find("\r\n", start);
+        if (nl == std::string::npos) {
+            lines.push_back(head.substr(start));
+            break;
+        }
+        lines.push_back(head.substr(start, nl - start));
+        start = nl + 2;
+    }
+    for (auto& line : lines) {
+        const size_t colon = line.find(':');
+        if (colon == std::string::npos) continue;
+        const std::string key = line.substr(0, colon);
+        constexpr char kDate[] = "date";
+        if (key.size() != 4 || !std::equal(key.begin(), key.end(), kDate, [](char a, char b) {
+                return std::tolower(static_cast<unsigned char>(a)) == b;
+            }))
+            continue;
+        std::string value = line.substr(colon + 1);
+        const size_t a = value.find_first_not_of(" \t");
+        const size_t b = value.find_last_not_of(" \t");
+        const std::string trimmed = a == std::string::npos ? "" : value.substr(a, b - a + 1);
+        if (trimmed != preserved_date) line = line.substr(0, colon + 1) + " <normalized-date>";
+    }
+    std::string out;
+    for (size_t i = 0; i < lines.size(); i++) {
+        if (i != 0) out += "\r\n";
+        out += lines[i];
+    }
+    out += rest;
+    return out;
 }
 
 bool write_transcript(const std::string& path, const std::vector<CaseResult>& results) {
@@ -1532,6 +1875,51 @@ bool write_transcript(const std::string& path, const std::vector<CaseResult>& re
     out.flush();
     out.close();
     return out.good();
+}
+
+// One case's paired Envoy/RUT observation (--pair-milestone-s, PR 6).
+struct PairCaseResult {
+    std::string name;
+    bool asserted = false;
+    CaseResult envoy;
+    CaseResult rut;
+};
+
+// Writes both sides' bytes for every pair case as a transcript header, in
+// the same one-literal-per-wire-line style as `write_transcript`. This is
+// the "<out.inc>" CI artifact evidence for PR 6: unlike the oracle
+// transcript, each case here carries two upstream and two downstream
+// literals (`_envoy_*` / `_rut_*`) so a reviewer can diff them directly.
+bool write_pair_transcript(const std::string& path, const std::vector<PairCaseResult>& results) {
+    std::ofstream out(path, std::ios::trunc);
+    if (!out) return false;
+    time_t now = time(nullptr);
+    char date_buf[64];
+    struct tm tm_buf{};
+    gmtime_r(&now, &tm_buf);
+    strftime(date_buf, sizeof(date_buf), "%Y-%m-%dT%H:%M:%SZ", &tm_buf);
+    out << "#pragma once\n\n";
+    out << "// Envoy-vs-generated-RUT pair transcript recorded against " << kEnvoyImage << " ("
+        << date_buf << ").\n";
+    out << "// Generated by tests/test_envoy_differential.cc --pair-milestone-s; do not\n";
+    out << "// hand-edit. See docs/envoy-compatibility.md and envoy-pr-plan.md PR 6.\n\n";
+    for (const auto& r : results) {
+        out << "// " << r.name << (r.asserted ? " (asserted)" : " (record-only)") << "\n";
+        out << "static constexpr char kEnvoyVsRut_" << r.name << "_client[] =\n    "
+            << wrap_wire_literal(r.envoy.client_bytes) << ";\n";
+        if (!r.envoy.upstream_contacted)
+            out << "// " << r.name << ": envoy upstream not contacted\n";
+        out << "static constexpr char kEnvoyVsRut_" << r.name << "_envoy_upstream[] =\n    "
+            << wrap_wire_literal(r.envoy.upstream_bytes) << ";\n";
+        out << "static constexpr char kEnvoyVsRut_" << r.name << "_envoy_downstream[] =\n    "
+            << wrap_wire_literal(r.envoy.downstream_bytes) << ";\n";
+        if (!r.rut.upstream_contacted) out << "// " << r.name << ": rut upstream not contacted\n";
+        out << "static constexpr char kEnvoyVsRut_" << r.name << "_rut_upstream[] =\n    "
+            << wrap_wire_literal(r.rut.upstream_bytes) << ";\n";
+        out << "static constexpr char kEnvoyVsRut_" << r.name << "_rut_downstream[] =\n    "
+            << wrap_wire_literal(r.rut.downstream_bytes) << ";\n\n";
+    }
+    return static_cast<bool>(out);
 }
 
 int count_header(const std::string& raw, const std::string& name) {
@@ -1853,6 +2241,223 @@ int run_oracle_milestone_s(const std::string& output_path) {
     const bool smoke_ok = assert_get_smoke(results);
     const bool connect_failure_ok = assert_connect_failure(results);
     return (smoke_ok && connect_failure_ok) ? 0 : 1;
+}
+
+// ── --pair-milestone-s (PR 6) ────────────────────────────────────────────
+
+// Compares one pair case's Envoy and RUT observations, printing
+// MATCH/MISMATCH with escaped literals for either mismatching side. Returns
+// true iff both upstream and downstream bytes agree (downstream compared
+// after `normalize_date_for_compare`, everything else byte for byte).
+bool compare_pair_case(const PairCaseResult& c) {
+    const std::string preserved_date =
+        c.name == "get_upstream_date_server" ? "Mon, 01 Jan 2024 00:00:00 GMT" : std::string();
+    const std::string envoy_down =
+        normalize_date_for_compare(c.envoy.downstream_bytes, preserved_date);
+    const std::string rut_down = normalize_date_for_compare(c.rut.downstream_bytes, preserved_date);
+    const bool upstream_match = c.envoy.upstream_contacted == c.rut.upstream_contacted &&
+                                c.envoy.upstream_bytes == c.rut.upstream_bytes;
+    const bool downstream_match = envoy_down == rut_down;
+    const bool match = upstream_match && downstream_match;
+    std::cerr << (match ? "MATCH    [" : "MISMATCH [") << c.name << "]"
+              << (c.asserted ? " (asserted)" : " (record-only)") << "\n";
+    if (!upstream_match) {
+        std::cerr << "  upstream envoy: \"" << escape_wire_bytes(c.envoy.upstream_bytes) << "\"\n";
+        std::cerr << "  upstream rut:   \"" << escape_wire_bytes(c.rut.upstream_bytes) << "\"\n";
+    }
+    if (!downstream_match) {
+        std::cerr << "  downstream envoy: \"" << escape_wire_bytes(envoy_down) << "\"\n";
+        std::cerr << "  downstream rut:   \"" << escape_wire_bytes(rut_down) << "\"\n";
+    }
+    return match;
+}
+
+int run_pair_milestone_s(const std::string& rut_binary,
+                         const std::string& converter_binary,
+                         const std::string& transcript_path) {
+    const std::string missing = check_docker_prerequisites();
+    if (!missing.empty()) return missing_prerequisite(missing);
+
+    uint16_t listen_port1 = 0, upstream_port1 = 0, listen_port2 = 0, closed_port = 0;
+    if (!allocate_distinct_ports({&listen_port1, &upstream_port1, &listen_port2, &closed_port})) {
+        std::cerr << "FAIL: could not allocate loopback ports\n";
+        return 1;
+    }
+
+    std::vector<PairCaseResult> comparisons;
+
+    // ---- Run 1: live recording upstream, Envoy then RUT, same ports ----
+    {
+        const std::string dir = make_temp_dir("rut-envoy-pair");
+        if (dir.empty()) {
+            std::cerr << "FAIL: could not create temp directory\n";
+            return 1;
+        }
+        const std::string bootstrap_path = dir + "/bootstrap.json";
+        if (!write_file_mode(
+                bootstrap_path, render_bootstrap(listen_port1, upstream_port1), 0644)) {
+            std::cerr << "FAIL: could not write bootstrap.json\n";
+            return 1;
+        }
+        const std::string out_rut_path = dir + "/out.rut";
+        std::string convert_stderr;
+        if (!run_converter_to_file(
+                converter_binary, bootstrap_path, out_rut_path, &convert_stderr)) {
+            std::cerr << "FAIL: rut-envoy-convert did not exit 0 with empty stderr on the "
+                         "milestone-S bootstrap\n";
+            if (!convert_stderr.empty()) std::cerr << "stderr: " << convert_stderr << "\n";
+            return 1;
+        }
+
+        RecordingUpstream upstream;
+        const auto cases = run1_cases();
+        for (const auto& spec : cases) upstream.set_reply(spec.upstream_path, spec.upstream_reply);
+        if (!upstream.start(upstream_port1)) {
+            std::cerr << "FAIL: could not start recording upstream\n";
+            return 1;
+        }
+
+        // Envoy first.
+        EnvoyInstance envoy;
+        envoy.name = make_container_name("pair-run1");
+        envoy.log_path = dir + "/envoy.log";
+        if (!envoy.launch(bootstrap_path, listen_port1)) {
+            std::cerr << "FAIL: could not fork/exec docker run\n";
+            upstream.stop();
+            return 1;
+        }
+        std::string ready_error;
+        if (!wait_ready(listen_port1, envoy, 15'000, &ready_error)) {
+            std::cerr << "FAIL: " << ready_error << "\n";
+            dump_log(envoy.log_path);
+            upstream.stop();
+            return 1;
+        }
+        auto envoy_results = run_case_batch(listen_port1, cases);
+        envoy.stop();
+        fill_upstream_bytes(&envoy_results, cases, upstream);
+        if (!wait_port_closed(listen_port1, 5000)) {
+            std::cerr << "FAIL: listener port " << listen_port1
+                      << " did not become free after stopping Envoy\n";
+            upstream.stop();
+            return 1;
+        }
+        upstream.clear_requests();
+
+        // Then RUT, on the same ports, against the same (now-cleared)
+        // recording upstream.
+        RutInstance rut;
+        rut.log_path = dir + "/rut.log";
+        if (!rut.launch(rut_binary, out_rut_path)) {
+            std::cerr << "FAIL: could not fork/exec rut\n";
+            upstream.stop();
+            return 1;
+        }
+        std::string rut_ready_error;
+        if (!wait_ready(listen_port1, rut, 15'000, &rut_ready_error)) {
+            std::cerr << "FAIL: " << rut_ready_error << "\n";
+            dump_rut_log(rut.log_path);
+            upstream.stop();
+            return 1;
+        }
+        auto rut_results = run_case_batch(listen_port1, cases);
+        rut.stop();
+        fill_upstream_bytes(&rut_results, cases, upstream);
+        upstream.stop();
+
+        for (const auto& spec : cases) {
+            PairCaseResult c;
+            c.name = spec.name;
+            c.asserted = is_asserted_case(spec.name);
+            if (const auto* e = find_case(envoy_results, spec.name)) c.envoy = *e;
+            if (const auto* r = find_case(rut_results, spec.name)) c.rut = *r;
+            comparisons.push_back(std::move(c));
+        }
+    }
+
+    // ---- Run 2: connect_failure against a closed upstream port ----
+    {
+        const std::string dir = make_temp_dir("rut-envoy-pair2");
+        if (dir.empty()) {
+            std::cerr << "FAIL: could not create temp directory\n";
+            return 1;
+        }
+        const std::string bootstrap_path = dir + "/bootstrap.json";
+        if (!write_file_mode(bootstrap_path, render_bootstrap(listen_port2, closed_port), 0644)) {
+            std::cerr << "FAIL: could not write bootstrap.json\n";
+            return 1;
+        }
+        const std::string out_rut_path = dir + "/out.rut";
+        std::string convert_stderr;
+        if (!run_converter_to_file(
+                converter_binary, bootstrap_path, out_rut_path, &convert_stderr)) {
+            std::cerr << "FAIL: rut-envoy-convert did not exit 0 with empty stderr on the "
+                         "closed-port bootstrap\n";
+            if (!convert_stderr.empty()) std::cerr << "stderr: " << convert_stderr << "\n";
+            return 1;
+        }
+        const CaseSpec spec = connect_failure_case();
+
+        EnvoyInstance envoy;
+        envoy.name = make_container_name("pair-run2");
+        envoy.log_path = dir + "/envoy.log";
+        if (!envoy.launch(bootstrap_path, listen_port2)) {
+            std::cerr << "FAIL: could not fork/exec docker run\n";
+            return 1;
+        }
+        std::string ready_error;
+        if (!wait_ready(listen_port2, envoy, 15'000, &ready_error)) {
+            std::cerr << "FAIL: " << ready_error << "\n";
+            dump_log(envoy.log_path);
+            return 1;
+        }
+        PairCaseResult c;
+        c.name = "connect_failure";
+        c.asserted = true;
+        if (!run_client_case(listen_port2, spec, &c.envoy))
+            std::cerr << "WARN: case connect_failure (envoy) exchange did not complete cleanly\n";
+        c.envoy.name = "connect_failure";
+        envoy.stop();
+        if (!wait_port_closed(listen_port2, 5000)) {
+            std::cerr << "FAIL: listener port " << listen_port2
+                      << " did not become free after stopping Envoy\n";
+            return 1;
+        }
+
+        RutInstance rut;
+        rut.log_path = dir + "/rut.log";
+        if (!rut.launch(rut_binary, out_rut_path)) {
+            std::cerr << "FAIL: could not fork/exec rut\n";
+            return 1;
+        }
+        std::string rut_ready_error;
+        if (!wait_ready(listen_port2, rut, 15'000, &rut_ready_error)) {
+            std::cerr << "FAIL: " << rut_ready_error << "\n";
+            dump_rut_log(rut.log_path);
+            return 1;
+        }
+        if (!run_client_case(listen_port2, spec, &c.rut))
+            std::cerr << "WARN: case connect_failure (rut) exchange did not complete cleanly\n";
+        c.rut.name = "connect_failure";
+        rut.stop();
+
+        comparisons.push_back(std::move(c));
+    }
+
+    bool any_asserted_mismatch = false;
+    for (const auto& c : comparisons) {
+        if (!compare_pair_case(c) && c.asserted) any_asserted_mismatch = true;
+    }
+
+    if (!transcript_path.empty()) {
+        if (!write_pair_transcript(transcript_path, comparisons)) {
+            std::cerr << "FAIL: could not write pair transcript to " << transcript_path << "\n";
+            return 1;
+        }
+        std::cerr << "wrote pair transcript to " << transcript_path << "\n";
+    }
+
+    return any_asserted_mismatch ? 1 : 0;
 }
 
 // ── --self-test ───────────────────────────────────────────────────────
@@ -2819,7 +3424,196 @@ bool self_test_reserved_closed_port() {
     return ok;
 }
 
-int run_self_test() {
+// ── --self-test RUT pass (PR 6) ─────────────────────────────────────────
+//
+// No docker needed: converts the milestone-S bootstrap, starts the real
+// `rut` binary against the in-process recording upstream on ephemeral
+// loopback ports, runs the six asserted cases, and compares them against
+// the committed Envoy oracle fixture (tests/fixtures/envoy_oracle_milestone_s.inc,
+// date-normalized). This is the strongest local evidence for the pair logic
+// above that this environment (no docker) can produce.
+
+struct OracleCase {
+    const char* name;
+    const char* upstream;
+    size_t upstream_len;
+    const char* downstream;
+    size_t downstream_len;
+};
+
+#define RUT_ORACLE_CASE(n)                              \
+    OracleCase{#n,                                      \
+               kEnvoyOracle_##n##_upstream,             \
+               sizeof(kEnvoyOracle_##n##_upstream) - 1, \
+               kEnvoyOracle_##n##_downstream,           \
+               sizeof(kEnvoyOracle_##n##_downstream) - 1}
+
+// One entry per name in `kAssertedCaseNames`, same order.
+const OracleCase kAssertedOracleCases[] = {
+    RUT_ORACLE_CASE(get_smoke),
+    RUT_ORACLE_CASE(get_upstream_date_server),
+    RUT_ORACLE_CASE(get_client_close),
+    RUT_ORACLE_CASE(head_smoke),
+    RUT_ORACLE_CASE(post_fixed),
+    RUT_ORACLE_CASE(connect_failure),
+};
+
+#undef RUT_ORACLE_CASE
+
+// Compares one RUT-side result against its recorded Envoy oracle bytes
+// (date-normalized on the downstream side only), printing PASS/FAIL with
+// escaped literals on mismatch. Returns false only on an actual mismatch
+// (a missing result is reported as a mismatch by the caller before this is
+// reached).
+bool compare_case_against_oracle(const CaseResult& result, const OracleCase& oracle) {
+    const std::string oracle_upstream(oracle.upstream, oracle.upstream_len);
+    const std::string oracle_downstream(oracle.downstream, oracle.downstream_len);
+    const std::string preserved_date = std::string(oracle.name) == "get_upstream_date_server"
+                                           ? "Mon, 01 Jan 2024 00:00:00 GMT"
+                                           : std::string();
+    const std::string rut_down =
+        normalize_date_for_compare(result.downstream_bytes, preserved_date);
+    const std::string oracle_down = normalize_date_for_compare(oracle_downstream, preserved_date);
+    const bool upstream_match = result.upstream_bytes == oracle_upstream;
+    const bool downstream_match = rut_down == oracle_down;
+    const bool match = upstream_match && downstream_match;
+    std::cerr << (match ? "PASS [self-test rut vs oracle: " : "FAIL [self-test rut vs oracle: ")
+              << oracle.name << "]\n";
+    if (!upstream_match) {
+        std::cerr << "  upstream oracle: \"" << escape_wire_bytes(oracle_upstream) << "\"\n";
+        std::cerr << "  upstream rut:    \"" << escape_wire_bytes(result.upstream_bytes) << "\"\n";
+    }
+    if (!downstream_match) {
+        std::cerr << "  downstream oracle: \"" << escape_wire_bytes(oracle_down) << "\"\n";
+        std::cerr << "  downstream rut:    \"" << escape_wire_bytes(rut_down) << "\"\n";
+    }
+    return match;
+}
+
+bool run_self_test_rut_pass(const std::string& rut_binary, const std::string& converter_binary) {
+    bool ok = true;
+    std::vector<CaseResult> results;  // indices align with kAssertedOracleCases
+
+    // ---- Live recording upstream: every asserted case but connect_failure ----
+    {
+        const std::string dir = make_temp_dir("rut-envoy-selftest");
+        if (dir.empty()) {
+            std::cerr << "FAIL [self-test rut]: could not create temp directory\n";
+            return false;
+        }
+        uint16_t listen_port = 0, upstream_port = 0;
+        if (!allocate_distinct_ports({&listen_port, &upstream_port})) {
+            std::cerr << "FAIL [self-test rut]: could not allocate loopback ports\n";
+            return false;
+        }
+        const std::string bootstrap_path = dir + "/bootstrap.json";
+        if (!write_file_mode(bootstrap_path, render_bootstrap(listen_port, upstream_port), 0644)) {
+            std::cerr << "FAIL [self-test rut]: could not write bootstrap.json\n";
+            return false;
+        }
+        const std::string out_rut_path = dir + "/out.rut";
+        std::string convert_stderr;
+        if (!run_converter_to_file(
+                converter_binary, bootstrap_path, out_rut_path, &convert_stderr)) {
+            std::cerr << "FAIL [self-test rut]: rut-envoy-convert did not exit 0 with empty "
+                         "stderr\n";
+            if (!convert_stderr.empty()) std::cerr << "stderr: " << convert_stderr << "\n";
+            return false;
+        }
+
+        RecordingUpstream upstream;
+        const auto all_cases = run1_cases();
+        for (const auto& spec : all_cases)
+            upstream.set_reply(spec.upstream_path, spec.upstream_reply);
+        if (!upstream.start(upstream_port)) {
+            std::cerr << "FAIL [self-test rut]: could not start recording upstream\n";
+            return false;
+        }
+
+        RutInstance rut;
+        rut.log_path = dir + "/rut.log";
+        if (!rut.launch(rut_binary, out_rut_path)) {
+            std::cerr << "FAIL [self-test rut]: could not fork/exec rut\n";
+            upstream.stop();
+            return false;
+        }
+        std::string ready_error;
+        if (!wait_ready(listen_port, rut, 15'000, &ready_error)) {
+            std::cerr << "FAIL [self-test rut]: " << ready_error << "\n";
+            dump_rut_log(rut.log_path);
+            upstream.stop();
+            return false;
+        }
+        std::vector<CaseSpec> live_asserted;
+        for (const auto& spec : all_cases)
+            if (is_asserted_case(spec.name)) live_asserted.push_back(spec);
+        auto live_results = run_case_batch(listen_port, live_asserted);
+        rut.stop();
+        fill_upstream_bytes(&live_results, live_asserted, upstream);
+        upstream.stop();
+        for (auto& r : live_results) results.push_back(std::move(r));
+    }
+
+    // ---- connect_failure: closed upstream port ----
+    {
+        const std::string dir = make_temp_dir("rut-envoy-selftest2");
+        if (dir.empty()) {
+            std::cerr << "FAIL [self-test rut]: could not create temp directory\n";
+            return false;
+        }
+        uint16_t listen_port = 0, closed_port = 0;
+        if (!allocate_distinct_ports({&listen_port, &closed_port})) {
+            std::cerr << "FAIL [self-test rut]: could not allocate loopback ports\n";
+            return false;
+        }
+        const std::string bootstrap_path = dir + "/bootstrap.json";
+        if (!write_file_mode(bootstrap_path, render_bootstrap(listen_port, closed_port), 0644)) {
+            std::cerr << "FAIL [self-test rut]: could not write bootstrap.json\n";
+            return false;
+        }
+        const std::string out_rut_path = dir + "/out.rut";
+        std::string convert_stderr;
+        if (!run_converter_to_file(
+                converter_binary, bootstrap_path, out_rut_path, &convert_stderr)) {
+            std::cerr << "FAIL [self-test rut]: rut-envoy-convert did not exit 0 with empty "
+                         "stderr (closed-port bootstrap)\n";
+            if (!convert_stderr.empty()) std::cerr << "stderr: " << convert_stderr << "\n";
+            return false;
+        }
+        RutInstance rut;
+        rut.log_path = dir + "/rut.log";
+        if (!rut.launch(rut_binary, out_rut_path)) {
+            std::cerr << "FAIL [self-test rut]: could not fork/exec rut\n";
+            return false;
+        }
+        std::string ready_error;
+        if (!wait_ready(listen_port, rut, 15'000, &ready_error)) {
+            std::cerr << "FAIL [self-test rut]: " << ready_error << "\n";
+            dump_rut_log(rut.log_path);
+            return false;
+        }
+        CaseResult r;
+        if (!run_client_case(listen_port, connect_failure_case(), &r))
+            std::cerr << "WARN: case connect_failure exchange did not complete cleanly\n";
+        r.name = "connect_failure";
+        rut.stop();
+        results.push_back(std::move(r));
+    }
+
+    for (const auto& oracle : kAssertedOracleCases) {
+        const CaseResult* result = find_case(results, oracle.name);
+        if (result == nullptr) {
+            std::cerr << "FAIL [self-test rut vs oracle: " << oracle.name << "]: case missing\n";
+            ok = false;
+            continue;
+        }
+        if (!compare_case_against_oracle(*result, oracle)) ok = false;
+    }
+    if (ok) std::cerr << "PASS [self-test rut vs oracle]\n";
+    return ok;
+}
+
+int run_self_test(const std::string& rut_binary, const std::string& converter_binary) {
     bool ok = true;
     ok &= self_test_escaping();
     ok &= self_test_recording_upstream();
@@ -2832,6 +3626,12 @@ int run_self_test() {
     ok &= self_test_temp_dir_cleanup();
     ok &= self_test_envoy_instance_skips_docker_when_unlaunched();
     ok &= self_test_reserved_closed_port();
+    if (!rut_binary.empty() && !converter_binary.empty()) {
+        ok &= run_self_test_rut_pass(rut_binary, converter_binary);
+    } else {
+        std::cerr << "NOTE: --self-test RUT pass skipped (pass [rut-binary] "
+                     "[rut-envoy-convert-binary] to run it)\n";
+    }
     return ok ? 0 : 1;
 }
 
@@ -2839,9 +3639,20 @@ int run_self_test() {
 
 int main(int argc, char** argv) {
     signal(SIGPIPE, SIG_IGN);
-    if (argc >= 2 && std::string(argv[1]) == "--self-test") return run_self_test();
+    if (argc >= 2 && std::string(argv[1]) == "--self-test") {
+        const std::string rut_binary = argc >= 3 ? argv[2] : "";
+        const std::string converter_binary = argc >= 4 ? argv[3] : "";
+        return run_self_test(rut_binary, converter_binary);
+    }
     if (argc >= 3 && std::string(argv[1]) == "--oracle-milestone-s")
         return run_oracle_milestone_s(argv[2]);
-    std::cerr << "usage: " << argv[0] << " --self-test | --oracle-milestone-s <output-path>\n";
+    if (argc >= 4 && std::string(argv[1]) == "--pair-milestone-s") {
+        const std::string transcript_path = argc >= 5 ? argv[4] : "";
+        return run_pair_milestone_s(argv[2], argv[3], transcript_path);
+    }
+    std::cerr << "usage: " << argv[0]
+              << " --self-test [rut-binary] [rut-envoy-convert-binary] | "
+                 "--oracle-milestone-s <output-path> | "
+                 "--pair-milestone-s <rut-binary> <rut-envoy-convert-binary> [<output-path>]\n";
     return 2;
 }
