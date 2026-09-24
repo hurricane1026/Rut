@@ -5473,11 +5473,225 @@ inline RequestPolicyBodyState inspect_request_policy_body(const Connection& conn
     return RequestPolicyBodyState::Complete;
 }
 
+// ID4 (Http11PreserveHostLowercase): the Envoy-compatible H1 profile. Unlike
+// every other supported policy, it keeps the client's Host header instead of
+// writing the upstream endpoint. It lowercases every forwarded header name,
+// drops Envoy's hop-by-hop set (host is re-emitted separately; connection,
+// keep-alive, proxy-connection, expect, upgrade, transfer-encoding, and any
+// header nominated by the client's Connection header value are dropped),
+// keeps `te` only when its value is exactly "trailers" (Envoy forwards only
+// the trailers token), and appends `x-forwarded-proto: http` as the last
+// header when the client did not already supply one (a client-supplied value
+// passes through unchanged, in its original position). Fails closed with no
+// upstream bytes touched unless exactly one non-empty Host header is present.
+inline bool apply_preserve_host_lowercase_request_policy(Connection& conn, u16 policy_id) {
+    if (inspect_request_policy_body(conn, policy_id) != RequestPolicyBodyState::Complete)
+        return false;
+
+    struct ScratchResetGuard {
+        Connection& conn;
+        bool committed = false;
+        ~ScratchResetGuard() {
+            if (!committed) conn.send_buf.reset();
+        }
+    } scratch_guard{conn};
+
+    const u8* data = conn.recv_buf.data();
+    const u32 len = conn.recv_buf.len();
+    HttpParser parser;
+    ParsedRequest req;
+    parser.reset();
+    if (parser.parse(data, len, &req) != ParseStatus::Complete) return false;
+    const u32 body_len = req.has_content_length ? req.content_length : 0;
+    const u8* end = data + parser.header_end;
+    const u8* line_end = data;
+    while (line_end + 1 < end && !(line_end[0] == '\r' && line_end[1] == '\n')) line_end++;
+    const u8* path_ptr = reinterpret_cast<const u8*>(req.path.ptr);
+    if (line_end + 1 >= end || path_ptr < data || path_ptr + req.path.len > line_end) return false;
+    const u8* header_end = end - 2;
+
+    // Pass 1: locate the single client Host header and gather every header
+    // name nominated by a Connection header's comma-separated token list.
+    struct NominatedName {
+        const u8* ptr;
+        u32 len;
+    };
+    NominatedName nominated[kMaxHeaders];
+    u32 nominated_count = 0;
+    u32 host_count = 0;
+    const u8* host_value_start = nullptr;
+    u32 host_value_len = 0;
+    {
+        const u8* hs = line_end + 2;
+        while (hs < header_end) {
+            const u8* le = hs;
+            while (le + 1 < end && !(le[0] == '\r' && le[1] == '\n')) le++;
+            if (le + 1 >= end || le <= hs) return false;
+            const u8* colon = hs;
+            while (colon < le && *colon != ':') colon++;
+            if (colon == hs || colon == le) return false;
+            const u32 name_len = static_cast<u32>(colon - hs);
+            const u8* value_start = colon + 1;
+            const u8* value_end = le;
+            while (value_start < value_end && (*value_start == ' ' || *value_start == '\t'))
+                value_start++;
+            while (value_end > value_start && (value_end[-1] == ' ' || value_end[-1] == '\t'))
+                value_end--;
+            if (request_policy_name_eq(hs, name_len, "host", 4)) {
+                host_count++;
+                host_value_start = value_start;
+                host_value_len = static_cast<u32>(value_end - value_start);
+            } else if (request_policy_name_eq(hs, name_len, "connection", 10)) {
+                const u8* tok = value_start;
+                while (tok <= value_end) {
+                    const u8* tok_end = tok;
+                    while (tok_end < value_end && *tok_end != ',') tok_end++;
+                    const u8* t0 = tok;
+                    const u8* t1 = tok_end;
+                    while (t0 < t1 && (*t0 == ' ' || *t0 == '\t')) t0++;
+                    while (t1 > t0 && (t1[-1] == ' ' || t1[-1] == '\t')) t1--;
+                    if (t1 > t0) {
+                        if (nominated_count >= kMaxHeaders) return false;
+                        nominated[nominated_count].ptr = t0;
+                        nominated[nominated_count].len = static_cast<u32>(t1 - t0);
+                        nominated_count++;
+                    }
+                    if (tok_end >= value_end) break;
+                    tok = tok_end + 1;
+                }
+            }
+            hs = le + 2;
+        }
+    }
+    if (host_count != 1 || host_value_len == 0) return false;
+
+    auto name_nominated = [&](const u8* name, u32 name_len) {
+        for (u32 i = 0; i < nominated_count; i++) {
+            if (request_policy_name_eq(name,
+                                       name_len,
+                                       reinterpret_cast<const char*>(nominated[i].ptr),
+                                       nominated[i].len))
+                return true;
+        }
+        return false;
+    };
+
+    auto append = [&](const u8* p, u32 n) {
+        return n <= conn.send_buf.capacity() - conn.send_buf.len() &&
+               conn.send_buf.write(p, n) == n;
+    };
+    auto append_lit = [&](const char* p, u32 n) {
+        return append(reinterpret_cast<const u8*>(p), n);
+    };
+    auto append_lower = [&](const u8* p, u32 n) {
+        for (u32 i = 0; i < n; i++) {
+            u8 c = p[i];
+            if (c >= 'A' && c <= 'Z') c = static_cast<u8>(c + ('a' - 'A'));
+            if (!append(&c, 1)) return false;
+        }
+        return true;
+    };
+    auto append_dec = [&](u32 value) {
+        char digits[10];
+        u32 n = 0;
+        do {
+            digits[n++] = static_cast<char>('0' + value % 10);
+            value /= 10;
+        } while (value != 0);
+        for (u32 i = n; i > 0; i--) {
+            if (!append(reinterpret_cast<const u8*>(&digits[i - 1]), 1)) return false;
+        }
+        return true;
+    };
+
+    conn.send_buf.reset();
+    const u32 method_prefix = static_cast<u32>(path_ptr - data);
+    if (!append(data, method_prefix) || !append(path_ptr, req.path.len) || !append_lit(" ", 1) ||
+        !append_lit(request_policy_version(policy_id), 8) || !append_lit("\r\n", 2))
+        return false;
+    if (!append_lit("host: ", 6) || !append(host_value_start, host_value_len) ||
+        !append_lit("\r\n", 2))
+        return false;
+
+    bool saw_xfp = false;
+    {
+        const u8* hs = line_end + 2;
+        while (hs < header_end) {
+            const u8* le = hs;
+            while (le + 1 < end && !(le[0] == '\r' && le[1] == '\n')) le++;
+            const u8* colon = hs;
+            while (colon < le && *colon != ':') colon++;
+            const u32 name_len = static_cast<u32>(colon - hs);
+            const u8* value_start = colon + 1;
+            const u8* value_end = le;
+            while (value_start < value_end && (*value_start == ' ' || *value_start == '\t'))
+                value_start++;
+            while (value_end > value_start && (value_end[-1] == ' ' || value_end[-1] == '\t'))
+                value_end--;
+
+            const bool is_cl = request_policy_name_eq(hs, name_len, "content-length", 14);
+            const bool is_te = request_policy_name_eq(hs, name_len, "te", 2);
+            const bool is_xfp = request_policy_name_eq(hs, name_len, "x-forwarded-proto", 17);
+            const bool drop_fixed = request_policy_name_eq(hs, name_len, "host", 4) ||
+                                    request_policy_name_eq(hs, name_len, "connection", 10) ||
+                                    request_policy_name_eq(hs, name_len, "keep-alive", 10) ||
+                                    request_policy_name_eq(hs, name_len, "proxy-connection", 16) ||
+                                    request_policy_name_eq(hs, name_len, "expect", 6) ||
+                                    request_policy_name_eq(hs, name_len, "upgrade", 7) ||
+                                    request_policy_name_eq(hs, name_len, "transfer-encoding", 17);
+            const bool drop_te =
+                is_te && !request_policy_name_eq(
+                             value_start, static_cast<u32>(value_end - value_start), "trailers", 8);
+            const bool drop_nominated = name_nominated(hs, name_len);
+            if (!drop_fixed && !drop_te && !drop_nominated) {
+                if (is_cl) {
+                    if (!append_lit("content-length: ", 16) || !append_dec(body_len) ||
+                        !append_lit("\r\n", 2))
+                        return false;
+                } else {
+                    if (!append_lower(hs, name_len) || !append_lit(": ", 2) ||
+                        !append(value_start, static_cast<u32>(value_end - value_start)) ||
+                        !append_lit("\r\n", 2))
+                        return false;
+                    if (is_xfp) saw_xfp = true;
+                }
+            }
+            hs = le + 2;
+        }
+    }
+    if (!saw_xfp && !append_lit("x-forwarded-proto: http\r\n", 25)) return false;
+    if (!append_lit("\r\n", 2)) return false;
+
+    const u32 new_header_len = conn.send_buf.len();
+    const u32 body_start = parser.header_end;
+    const u64 request_end64 = static_cast<u64>(body_start) + body_len;
+    if (request_end64 > len) return false;
+    const u32 request_end = static_cast<u32>(request_end64);
+    if (!append(data + body_start, body_len) || !append(data + request_end, len - request_end))
+        return false;
+    if (conn.send_buf.len() > conn.recv_buf.capacity()) return false;
+    conn.reset_request_receive_buffer();
+    if (conn.recv_buf.write(conn.send_buf.data(), conn.send_buf.len()) != conn.send_buf.len())
+        return false;
+    conn.req_header_end = new_header_len;
+    conn.req_initial_send_len = new_header_len + body_len;
+    conn.req_size = conn.req_initial_send_len;
+    conn.req_keep_alive = true;
+    conn.request_policy_id = policy_id;
+    conn.request_body_fully_buffered = req.has_content_length;
+    conn.request_upload_complete = false;
+    scratch_guard.committed = true;
+    conn.send_buf.reset();
+    return true;
+}
+
 // Validate and materialise the first explicit upstream request policy. This runs
 // before slot acquisition and before a TCP connect, so unsupported input cannot
 // accidentally fall back to transparent forwarding or touch the upstream.
 inline bool apply_request_policy(Connection& conn, const sockaddr_in& endpoint, u16 policy_id) {
     if (policy_id == 0) return true;
+    if (request_policy_preserves_host(policy_id))
+        return apply_preserve_host_lowercase_request_policy(conn, policy_id);
     if (inspect_request_policy_body(conn, policy_id) != RequestPolicyBodyState::Complete)
         return false;
 

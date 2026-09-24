@@ -319,6 +319,15 @@ return forward(users, request_policy: {
     version: "HTTP/1.1", host: "upstream", connection: "omit",
     strip_headers: ["Connection", "Keep-Alive", "TE", "Expect", "Upgrade"]
 })                                               // fixed header-only rebuild
+// host: "preserve" is a separate closed combination (Envoy-compatible H1):
+// keeps the client's Host verbatim (fails closed unless exactly one
+// non-empty Host header is present), lowercases every forwarded header
+// name, and requires forwarded_proto and the six-name strip list together.
+return forward(users, request_policy: {
+    version: "HTTP/1.1", host: "preserve", connection: "omit",
+    header_names: "lowercase", forwarded_proto: "http",
+    strip_headers: ["Connection", "Keep-Alive", "TE", "Expect", "Upgrade", "Proxy-Connection"]
+})
 // Bounded response-policy serialization currently accepts only a cleartext
 // HTTP/1.1, origin-form, bodyless non-HEAD request and one final upstream
 // HTTP/1.1 response framed by exactly one Content-Length. Requests with a
