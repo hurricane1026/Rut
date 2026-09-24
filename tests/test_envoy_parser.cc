@@ -966,7 +966,9 @@ TEST(envoy_parser, route_timeout_accepts_zero_and_rejects_invalid_forms) {
                         "\"route\": {\"cluster\": \"backend\"}",
                         "\"route\": {\"cluster\": \"backend\", \"timeout\": \"0s\"}"));
         static envoy::JsonDocument doc;
-        auto result = envoy::parse_bootstrap_json(str(b.render()), doc);
+        // The model borrows the JSON bytes, so the source must outlive the result.
+        const std::string source_text = b.render();
+        auto result = envoy::parse_bootstrap_json(str(source_text), doc);
         REQUIRE(result);
         const envoy::RouteAction& action =
             result.value().listener.filter_chain.hcm.route_config.virtual_host.routes[0].action;
@@ -979,7 +981,9 @@ TEST(envoy_parser, route_timeout_accepts_zero_and_rejects_invalid_forms) {
                         "\"route\": {\"cluster\": \"backend\"}",
                         "\"route\": {\"cluster\": \"backend\", \"timeout\": \"15s\"}"));
         static envoy::JsonDocument doc;
-        auto result = envoy::parse_bootstrap_json(str(b.render()), doc);
+        // The model borrows the JSON bytes, so the source must outlive the result.
+        const std::string source_text = b.render();
+        auto result = envoy::parse_bootstrap_json(str(source_text), doc);
         REQUIRE(result);
         const envoy::RouteAction& action =
             result.value().listener.filter_chain.hcm.route_config.virtual_host.routes[0].action;
@@ -992,7 +996,9 @@ TEST(envoy_parser, route_timeout_accepts_zero_and_rejects_invalid_forms) {
                         "\"route\": {\"cluster\": \"backend\"}",
                         "\"route\": {\"cluster\": \"backend\", \"timeout\": \"0.250s\"}"));
         static envoy::JsonDocument doc;
-        auto result = envoy::parse_bootstrap_json(str(b.render()), doc);
+        // The model borrows the JSON bytes, so the source must outlive the result.
+        const std::string source_text = b.render();
+        auto result = envoy::parse_bootstrap_json(str(source_text), doc);
         REQUIRE(result);
         const envoy::RouteAction& action =
             result.value().listener.filter_chain.hcm.route_config.virtual_host.routes[0].action;
@@ -1027,7 +1033,9 @@ TEST(envoy_parser, suppress_envoy_headers_accepts_bool_and_camel_case) {
                         "\"type.googleapis.com/envoy.extensions.filters.http.router.v3.Router\", "
                         "\"suppress_envoy_headers\": true}"));
         static envoy::JsonDocument doc;
-        auto result = envoy::parse_bootstrap_json(str(b.render()), doc);
+        // The model borrows the JSON bytes, so the source must outlive the result.
+        const std::string source_text = b.render();
+        auto result = envoy::parse_bootstrap_json(str(source_text), doc);
         REQUIRE(result);
         const envoy::RouterFilter& router = result.value().listener.filter_chain.hcm.router;
         CHECK(router.suppress_envoy_headers_present);
@@ -1041,7 +1049,9 @@ TEST(envoy_parser, suppress_envoy_headers_accepts_bool_and_camel_case) {
                         "\"type.googleapis.com/envoy.extensions.filters.http.router.v3.Router\", "
                         "\"suppress_envoy_headers\": false}"));
         static envoy::JsonDocument doc;
-        auto result = envoy::parse_bootstrap_json(str(b.render()), doc);
+        // The model borrows the JSON bytes, so the source must outlive the result.
+        const std::string source_text = b.render();
+        auto result = envoy::parse_bootstrap_json(str(source_text), doc);
         REQUIRE(result);
         const envoy::RouterFilter& router = result.value().listener.filter_chain.hcm.router;
         CHECK(router.suppress_envoy_headers_present);
@@ -1055,7 +1065,9 @@ TEST(envoy_parser, suppress_envoy_headers_accepts_bool_and_camel_case) {
                         "\"type.googleapis.com/envoy.extensions.filters.http.router.v3.Router\", "
                         "\"suppressEnvoyHeaders\": true}"));
         static envoy::JsonDocument doc;
-        auto result = envoy::parse_bootstrap_json(str(b.render()), doc);
+        // The model borrows the JSON bytes, so the source must outlive the result.
+        const std::string source_text = b.render();
+        auto result = envoy::parse_bootstrap_json(str(source_text), doc);
         REQUIRE(result);
         CHECK(result.value().listener.filter_chain.hcm.router.suppress_envoy_headers);
     }
@@ -1118,7 +1130,9 @@ TEST(envoy_parser, route_match_accepts_prefix_and_path_forms) {
         REQUIRE(replace(
             &b.listeners, "\"match\": {\"prefix\": \"/\"}", "\"match\": {\"path\": \"/healthz\"}"));
         static envoy::JsonDocument doc;
-        auto result = envoy::parse_bootstrap_json(str(b.render()), doc);
+        // The model borrows the JSON bytes, so the source must outlive the result.
+        const std::string source_text = b.render();
+        auto result = envoy::parse_bootstrap_json(str(source_text), doc);
         REQUIRE(result);
         const envoy::RouteMatch& match =
             result.value().listener.filter_chain.hcm.route_config.virtual_host.routes[0].match;
@@ -1129,7 +1143,9 @@ TEST(envoy_parser, route_match_accepts_prefix_and_path_forms) {
         Bootstrap b;
         REQUIRE(replace(&b.listeners, "\"prefix\": \"/\"", "\"prefix\": \"/api/\""));
         static envoy::JsonDocument doc;
-        auto result = envoy::parse_bootstrap_json(str(b.render()), doc);
+        // The model borrows the JSON bytes, so the source must outlive the result.
+        const std::string source_text = b.render();
+        auto result = envoy::parse_bootstrap_json(str(source_text), doc);
         REQUIRE(result);
         const envoy::RouteMatch& match =
             result.value().listener.filter_chain.hcm.route_config.virtual_host.routes[0].match;
@@ -1140,7 +1156,9 @@ TEST(envoy_parser, route_match_accepts_prefix_and_path_forms) {
         Bootstrap b;
         REQUIRE(replace(&b.listeners, "\"prefix\": \"/\"", "\"prefix\": \"/\""));
         static envoy::JsonDocument doc;
-        auto result = envoy::parse_bootstrap_json(str(b.render()), doc);
+        // The model borrows the JSON bytes, so the source must outlive the result.
+        const std::string source_text = b.render();
+        auto result = envoy::parse_bootstrap_json(str(source_text), doc);
         REQUIRE(result);
         CHECK(result.value()
                   .listener.filter_chain.hcm.route_config.virtual_host.routes[0]
@@ -1166,7 +1184,9 @@ TEST(envoy_parser, routes_list_is_bounded_and_ordered) {
     REQUIRE(replace(&b.listeners, kDefaultRoutesJson, "\"routes\": " + routes));
     {
         static envoy::JsonDocument doc;
-        auto result = envoy::parse_bootstrap_json(str(b.render()), doc);
+        // The model borrows the JSON bytes, so the source must outlive the result.
+        const std::string source_text = b.render();
+        auto result = envoy::parse_bootstrap_json(str(source_text), doc);
         REQUIRE(result);
         const FixedVec<envoy::Route, envoy::kMaxEnvoyRoutes>& parsed =
             result.value().listener.filter_chain.hcm.route_config.virtual_host.routes;
@@ -1200,7 +1220,9 @@ TEST(envoy_parser, clusters_list_is_bounded_ordered_and_unique) {
     REQUIRE(replace(&b.listeners, "\"cluster\": \"backend\"", "\"cluster\": \"backend0\""));
     {
         static envoy::JsonDocument doc;
-        auto result = envoy::parse_bootstrap_json(str(b.render()), doc);
+        // The model borrows the JSON bytes, so the source must outlive the result.
+        const std::string source_text = b.render();
+        auto result = envoy::parse_bootstrap_json(str(source_text), doc);
         REQUIRE(result);
         const FixedVec<envoy::Cluster, envoy::kMaxEnvoyClusters>& parsed = result.value().clusters;
         CHECK_EQ(parsed.len, envoy::kMaxEnvoyClusters);
@@ -1236,7 +1258,9 @@ TEST(envoy_parser, route_action_models_direct_response) {
                         "\"route\": {\"cluster\": \"backend\"}",
                         "\"direct_response\": {\"status\": 200}"));
         static envoy::JsonDocument doc;
-        auto result = envoy::parse_bootstrap_json(str(b.render()), doc);
+        // The model borrows the JSON bytes, so the source must outlive the result.
+        const std::string source_text = b.render();
+        auto result = envoy::parse_bootstrap_json(str(source_text), doc);
         REQUIRE(result);
         const envoy::RouteAction& action =
             result.value().listener.filter_chain.hcm.route_config.virtual_host.routes[0].action;
@@ -1251,7 +1275,9 @@ TEST(envoy_parser, route_action_models_direct_response) {
                         "\"direct_response\": {\"status\": 404, \"body\": {\"inline_string\": "
                         "\"not found\"}}"));
         static envoy::JsonDocument doc;
-        auto result = envoy::parse_bootstrap_json(str(b.render()), doc);
+        // The model borrows the JSON bytes, so the source must outlive the result.
+        const std::string source_text = b.render();
+        auto result = envoy::parse_bootstrap_json(str(source_text), doc);
         REQUIRE(result);
         const envoy::RouteAction& action =
             result.value().listener.filter_chain.hcm.route_config.virtual_host.routes[0].action;
@@ -1295,7 +1321,9 @@ TEST(envoy_parser, route_action_models_redirect) {
                     "\"route\": {\"cluster\": \"backend\"}",
                     "\"redirect\": {\"path_redirect\": \"/new\", \"response_code\": \"FOUND\"}"));
         static envoy::JsonDocument doc;
-        auto result = envoy::parse_bootstrap_json(str(b.render()), doc);
+        // The model borrows the JSON bytes, so the source must outlive the result.
+        const std::string source_text = b.render();
+        auto result = envoy::parse_bootstrap_json(str(source_text), doc);
         REQUIRE(result);
         const envoy::RouteAction& action =
             result.value().listener.filter_chain.hcm.route_config.virtual_host.routes[0].action;
@@ -1310,7 +1338,9 @@ TEST(envoy_parser, route_action_models_redirect) {
                         "\"redirect\": {\"host_redirect\": \"example.com\", \"response_code\": "
                         "\"PERMANENT_REDIRECT\"}"));
         static envoy::JsonDocument doc;
-        auto result = envoy::parse_bootstrap_json(str(b.render()), doc);
+        // The model borrows the JSON bytes, so the source must outlive the result.
+        const std::string source_text = b.render();
+        auto result = envoy::parse_bootstrap_json(str(source_text), doc);
         REQUIRE(result);
         const envoy::RouteAction& action =
             result.value().listener.filter_chain.hcm.route_config.virtual_host.routes[0].action;
