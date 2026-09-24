@@ -24828,6 +24828,99 @@ TEST(route, forward_request_policy_preserve_host_lowercase_h11_wire) {
     }
 }
 
+// A body-carrying request (ID4, preserved Host) paired with a response_policy
+// on the ordinary strict-response body path.
+// `request_policy_body_response_admitted` (callbacks_impl.h) used to admit
+// only `Http11FixedStrip` (ID1) here, so this exact combination -- ID4 plus
+// any response_policy -- was rejected with a 400 before ever reaching the
+// upstream, even though Envoy itself forwards this POST unmodified (see
+// `kEnvoyOracle_post_fixed_*`). Uses a nginx-era (Synthesized) response_policy
+// since the Envoy upstream-order response layout is PR4 scope; only the
+// forwarded request bytes and the downstream status are asserted here.
+TEST(route, forward_request_policy_preserve_host_lowercase_post_fixed_with_response_policy) {
+    using namespace rut;
+    struct JitResources {
+        FrontendRirModule rir{};
+        jit::JitEngine engine{};
+        ~JitResources() {
+            engine.shutdown();
+            rir.destroy();
+        }
+    } resources;
+    RecordingUpstream upstream;
+    REQUIRE(upstream.setup());
+    char source[1024];
+    const int source_len =
+        snprintf(source,
+                 sizeof(source),
+                 "upstream backend at \"127.0.0.1:%u\"\n"
+                 "route POST \"/upload\" {\n"
+                 "    return forward(backend, request_policy: {\n"
+                 "        version: \"HTTP/1.1\", host: \"preserve\", connection: \"omit\",\n"
+                 "        header_names: \"lowercase\", forwarded_proto: \"http\",\n"
+                 "        strip_headers: [\"Connection\", \"Keep-Alive\", \"TE\", \"Expect\", "
+                 "\"Upgrade\", \"Proxy-Connection\"]\n"
+                 "    }, response_policy: {\n"
+                 "        version: \"HTTP/1.1\", framing: \"content_length\", connection: "
+                 "\"request\",\n"
+                 "        server: \"nginx/1.29.7\", date: \"current\", hide_headers: []\n"
+                 "    })\n"
+                 "}\n",
+                 upstream.port);
+    REQUIRE_GT(source_len, 0);
+    REQUIRE_LT(source_len, static_cast<int>(sizeof(source)));
+    auto lexed = lex(Str{source, static_cast<u32>(source_len)});
+    REQUIRE(lexed);
+    auto ast = parse_file(lexed.value());
+    REQUIRE(ast);
+    std::unique_ptr<AstFile> ast_owned(ast.value());
+    auto hir = analyze_file(*ast_owned);
+    REQUIRE(hir);
+    std::unique_ptr<HirModule> hir_owned(hir.value());
+    auto mir = build_mir(*hir_owned);
+    REQUIRE(mir);
+    std::unique_ptr<MirModule> mir_owned(mir.value());
+    auto& rir = resources.rir;
+    REQUIRE(lower_to_rir(*mir_owned, rir));
+    auto cg = jit::codegen(rir.module);
+    REQUIRE(cg.ok);
+    auto& engine = resources.engine;
+    REQUIRE(engine.init());
+    REQUIRE(engine.compile(cg.mod, cg.ctx));
+    RouteConfig cfg{};
+    REQUIRE(populate_route_config(cfg, rir.module));
+    REQUIRE(register_jit_routes(cfg, rir.module, engine));
+    const RouteConfig* active = &cfg;
+    ScopedProxyLoop proxy;
+    REQUIRE(proxy.setup(&active, 1000));
+
+    static constexpr char kUploadUpstreamReply[] =
+        "HTTP/1.1 201 Created\r\nContent-Length: 0\r\n\r\n";
+    upstream.response = kUploadUpstreamReply;
+    upstream.response_len = static_cast<u32>(sizeof(kUploadUpstreamReply) - 1);
+
+    i32 client = connect_to(proxy.port);
+    REQUIRE_GE(client, 0);
+    REQUIRE(send_all(client,
+                     kEnvoyOracle_post_fixed_client,
+                     static_cast<u32>(sizeof(kEnvoyOracle_post_fixed_client) - 1)));
+    char response[512];
+    const i32 response_read = recv_timeout(client, response, sizeof(response), 2000);
+    close(client);
+    REQUIRE_GT(response_read, 0);
+    CHECK(buf_contains(response, static_cast<u32>(response_read), "201", 3));
+
+    for (u32 i = 0; i < 400 && upstream.request_count.load(std::memory_order_acquire) == 0; i++)
+        usleep(5000);
+    REQUIRE_EQ(upstream.request_count.load(std::memory_order_acquire), 1u);
+    REQUIRE_EQ(upstream.request_len,
+               static_cast<u32>(sizeof(kEnvoyOracle_post_fixed_upstream) - 1));
+    CHECK_EQ(memcmp(upstream.request,
+                    kEnvoyOracle_post_fixed_upstream,
+                    sizeof(kEnvoyOracle_post_fixed_upstream) - 1),
+             0);
+}
+
 TEST(route, request_policy_buffers_fixed_content_length_body) {
     using namespace rut;
     RecordingUpstream backend;
