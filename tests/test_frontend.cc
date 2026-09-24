@@ -1088,7 +1088,7 @@ TEST(frontend, lex_token_capacity_boundaries_are_exact) {
         const std::string source = make_ident_stream(931);
         auto result = lex({source.data(), static_cast<u32>(source.size())});
         REQUIRE(result);
-        CHECK_EQ(result->tokens.len, 932u);  // 931 identifiers + EOF
+        CHECK_EQ(result->tokens.len, 932u);  // retained former-boundary regression
         CHECK(result->tokens[931].type == TokenType::Eof);
         CHECK_EQ(result->tokens[931].start, static_cast<u32>(source.size()));
         CHECK_EQ(result->tokens[931].end, static_cast<u32>(source.size()));
@@ -1097,7 +1097,19 @@ TEST(frontend, lex_token_capacity_boundaries_are_exact) {
     }
 
     {
-        const std::string source = make_ident_stream(932);
+        const std::string source = make_ident_stream(4095);
+        auto result = lex({source.data(), static_cast<u32>(source.size())});
+        REQUIRE(result);
+        CHECK_EQ(result->tokens.len, 4096u);  // 4095 identifiers + EOF
+        CHECK(result->tokens[4095].type == TokenType::Eof);
+        CHECK_EQ(result->tokens[4095].start, static_cast<u32>(source.size()));
+        CHECK_EQ(result->tokens[4095].end, static_cast<u32>(source.size()));
+        CHECK_EQ(result->tokens[4095].line, 1u);
+        CHECK_EQ(result->tokens[4095].col, static_cast<u32>(source.size() + 1u));
+    }
+
+    {
+        const std::string source = make_ident_stream(4096);
         auto result = lex({source.data(), static_cast<u32>(source.size())});
         REQUIRE(!result);
         CHECK_FALSE(result.has_value());
@@ -1109,16 +1121,16 @@ TEST(frontend, lex_token_capacity_boundaries_are_exact) {
     }
 
     {
-        const std::string source = make_ident_stream(933);
+        const std::string source = make_ident_stream(4097);
         auto result = lex({source.data(), static_cast<u32>(source.size())});
         REQUIRE(!result);
         CHECK_FALSE(result.has_value());
         CHECK(result.error().code == FrontendError::TooManyTokens);
-        // The 933rd one-character identifier starts after 932 "a " pairs.
-        CHECK_EQ(result.error().span.start, 1864u);
-        CHECK_EQ(result.error().span.end, 1865u);
+        // The 4097th one-character identifier starts after 4096 "a " pairs.
+        CHECK_EQ(result.error().span.start, 8192u);
+        CHECK_EQ(result.error().span.end, 8193u);
         CHECK_EQ(result.error().span.line, 1u);
-        CHECK_EQ(result.error().span.col, 1865u);
+        CHECK_EQ(result.error().span.col, 8193u);
     }
 }
 
@@ -1218,6 +1230,64 @@ TEST(frontend, six_hundred_fifty_three_slot_source_reaches_verified_rir) {
     CHECK_EQ(last.http_method, kRouteMethodAny);
     CHECK(last.route_pattern.eq({"/capacity/92", 12}));
     rir.destroy();
+}
+
+// A single route with a full request/response/failure policy triple, matching
+// the density of converter-generated output (nginx/Envoy lowering): every
+// value below already parses on main (copied from the nginx373_hide.inc
+// pattern), so this stays independent of any not-yet-landed vocabulary.
+static std::string make_policy_heavy_route_source(u32 route_count) {
+    std::string source = "listen 127.0.0.1:8080\nupstream nginx_upstream at \"127.0.0.1:9000\"\n";
+    for (u32 i = 0; i < route_count; i++) {
+        source += "route GET \"/route" + std::to_string(i) +
+                  "\" {\n"
+                  "    return forward(nginx_upstream, request_policy: {\n"
+                  "            version: \"HTTP/1.1\",\n"
+                  "            host: \"upstream\",\n"
+                  "            connection: \"omit\",\n"
+                  "            strip_headers: [\"Connection\", \"Keep-Alive\", \"TE\", "
+                  "\"Expect\", \"Upgrade\"]\n"
+                  "        },\n"
+                  "        response_policy: {\n"
+                  "            version: \"HTTP/1.1\",\n"
+                  "            framing: \"content_length\",\n"
+                  "            connection: \"request\",\n"
+                  "            server: \"nginx/1.29.7\",\n"
+                  "            date: \"current\",\n"
+                  "            hide_headers: [\"Date\", \"Server\", \"X-Pad\", "
+                  "\"X-Compat-Hidden\"]\n"
+                  "        },\n"
+                  "        failure_policy: {\n"
+                  "            version: \"HTTP/1.1\",\n"
+                  "            status: 502,\n"
+                  "            reason: \"Bad Gateway\",\n"
+                  "            content_type: \"text/html\",\n"
+                  "            server: \"nginx/1.29.7\",\n"
+                  "            date: \"current\",\n"
+                  "            connection: \"request\",\n"
+                  "            body: b\"<html><body>502 Bad Gateway</body></html>\"\n"
+                  "        }\n"
+                  "    )\n"
+                  "}\n";
+    }
+    return source;
+}
+
+TEST(frontend, policy_heavy_multi_route_source_exceeds_legacy_token_bound_and_parses) {
+    // 9 routes at ~113 tokens each (plus the shared listen/upstream preamble)
+    // clears the legacy 932-token bound with margin while staying well inside
+    // the new LexedTokens::kMaxTokens capacity raised for converter-generated
+    // (nginx/Envoy) multi-route programs.
+    const std::string source = make_policy_heavy_route_source(9);
+    auto lexed = lex({source.data(), static_cast<u32>(source.size())});
+    REQUIRE(lexed);
+    CHECK_GT(lexed->tokens.len, 932u);
+    CHECK_LT(lexed->tokens.len, LexedTokens::kMaxTokens);
+    REQUIRE_EQ(lexed->tokens.len, 1032u);
+
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    REQUIRE_EQ(ast->items.len, 11u);  // listen + upstream + 9 routes
 }
 
 TEST(frontend, lex_recognizes_downstream_keyword) {

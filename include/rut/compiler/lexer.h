@@ -129,24 +129,29 @@ struct Token {
 };
 
 struct LexedTokens {
-    // The maximum current generated HTTP-profile program has 931 lexical
-    // tokens plus EOF. Keep this exact 932-token bound allocation-free; it is
-    // a general frontend capacity and does not grant any semantic admission.
-    static constexpr u32 kMaxTokens = 932;
+    // Converter-generated multi-route programs (e.g. the Envoy/nginx RUT
+    // lowering, several routes per node, each with a full request/response/
+    // failure policy) need far more headroom than a single hand-written
+    // route. A 2-node/4-route-method Envoy lowering measures 963 tokens; a
+    // realistic upper bound of 8 routes x 2 methods with the same
+    // policy-heavy shape is ~4x that (~3,852 tokens). 4096 covers that with
+    // margin while staying a single allocation-free FixedVec.
+    static constexpr u32 kMaxTokens = 4096;
     FixedVec<Token, kMaxTokens> tokens;
 };
 
 using LexResult = core::Expected<LexedTokens, Diagnostic>;
 
-// Keep each bounded lexer result object below 64 KiB on every supported data
-// model. At capacity 932 the current LP64 sizes are 37,288 bytes for
-// LexedTokens and 37,296 bytes for LexResult. lex() may transiently place both
-// its output and the returned value on the call stack (~72.9 KiB before other
-// frames/redzones), so callers with custom small stacks must budget for both.
-static_assert(sizeof(LexedTokens) <= 64uz * 1024uz,
-              "LexedTokens exceeds the bounded 64 KiB object size");
-static_assert(sizeof(LexResult) <= 64uz * 1024uz,
-              "LexResult exceeds the bounded 64 KiB object size");
+// Keep each bounded lexer result object below 256 KiB on every supported data
+// model. At capacity 4096 the current LP64 sizes are 163,848 bytes for
+// LexedTokens and 163,856 bytes for LexResult. lex() may transiently place
+// both its output and the returned value on the call stack (~320 KiB before
+// other frames/redzones), so callers with custom small stacks (or deep
+// recursion, e.g. nested `import`) must budget for both.
+static_assert(sizeof(LexedTokens) <= 256uz * 1024uz,
+              "LexedTokens exceeds the bounded 256 KiB object size");
+static_assert(sizeof(LexResult) <= 256uz * 1024uz,
+              "LexResult exceeds the bounded 256 KiB object size");
 
 LexResult lex(Str source);
 
