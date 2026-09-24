@@ -62304,9 +62304,12 @@ void* direct_write_reader_main(void* opaque) {
     while (monotonic_us() < deadline) {
         pollfd pfd{ctx->fd, POLLIN | POLLHUP, 0};
         if (::poll(&pfd, 1, 100) <= 0) continue;
-        u8* dst = ctx->length < ctx->capacity ? ctx->dst + ctx->length : tail;
-        const size_t cap = ctx->length < ctx->capacity ? ctx->capacity - ctx->length
-                                                       : sizeof(tail);
+        u8* dst = tail;
+        size_t cap = sizeof(tail);
+        if (ctx->length < ctx->capacity) {
+            dst = ctx->dst + ctx->length;
+            cap = ctx->capacity - ctx->length;
+        }
         const ssize_t n = ::recv(ctx->fd, dst, cap, 0);
         if (n > 0) {
             if (ctx->length < ctx->capacity)
