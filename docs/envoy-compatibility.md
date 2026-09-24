@@ -25,8 +25,26 @@ everything else is recorded evidence for PRs 3-6, not a behavioral claim. The
 transcript is produced by CI (`envoy-required` job, label `envoy;docker`,
 `RESOURCE_LOCK envoy-differential`) as the `envoy-oracle-transcript` artifact;
 it is committed as `tests/fixtures/envoy_oracle_milestone_s.inc` by the lead
-after a CI run, at which point that run's id is recorded here. No such run has
-landed yet, so no row below changes status in this PR.
+after a CI run. The committed transcript comes from CI run `36040192963`
+(`envoy-required` job, v1.39.1, recorded 2026-09-24T18:18:42Z). It is
+Envoy-only evidence: no row below changes status in this PR.
+
+Facts the transcript establishes for PRs 3-5 (each is a byte in the fixture,
+not an assumption): the upstream request keeps the client's `Host` value as
+the first header, lowercases every header name, removes `Connection`,
+`Keep-Alive`, `Proxy-Connection` and the Connection-nominated header, keeps
+`te: trailers`, keeps a client-supplied `x-forwarded-proto` value unchanged,
+and appends `x-forwarded-proto: http` as the last header when absent. The
+downstream response keeps the upstream header order with lowercase names,
+replaces `server` in place, keeps an upstream `date` in place, appends
+`date` then `server: envoy` when the upstream omitted them, uses the
+canonical reason phrase (`200 Fine` becomes `200 OK`), and appends
+`connection: close` last only when closing. Local replies (404 for
+`OPTIONS *` and authority-form CONNECT) are `date, server, [connection:
+close,] content-length: 0`; the connect failure is a 503 with
+`content-length: 98, content-type: text/plain, date, server` and the body
+`upstream connect error or disconnect/reset before headers. reset reason:
+remote connection failure`.
 
 The design contract's fail-closed rule is about configuration semantics: a
 bootstrap that needs a RUT surface the shipped binary does not have must be
@@ -325,5 +343,5 @@ converter fails closed on the whole configuration until then.
   the wire bytes as `tests/fixtures/envoy_oracle_milestone_s.inc`; it does not
   exercise RUT or the converter and asserts only two invariants (see the
   evidence note above). CI runs it as the `envoy-required` job and uploads the
-  transcript as an artifact; the lead commits that artifact as a fixture and
-  records the run id once a run lands. No status changes in this PR.
+  transcript as an artifact; the artifact from run `36040192963` is committed
+  verbatim as the fixture. No status changes in this PR.
