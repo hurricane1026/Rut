@@ -744,6 +744,17 @@ target_include_directories(test_envoy_parser PRIVATE
 add_test(NAME test_envoy_parser COMMAND test_envoy_parser)
 set_tests_properties(test_envoy_parser PROPERTIES LABELS "unit;envoy;compiler")
 
+add_executable(test_envoy_convert test_envoy_convert.cc ${PROJECT_SOURCE_DIR}/src/placement_new.cc)
+target_link_libraries(test_envoy_convert rut_envoy)
+target_include_directories(test_envoy_convert PRIVATE
+    ${PROJECT_SOURCE_DIR}/include
+    ${PROJECT_SOURCE_DIR}/testing
+    ${CMAKE_CURRENT_SOURCE_DIR}
+)
+add_dependencies(test_envoy_convert rut-envoy-convert)
+add_test(NAME test_envoy_convert COMMAND test_envoy_convert $<TARGET_FILE:rut-envoy-convert>)
+set_tests_properties(test_envoy_convert PROPERTIES LABELS "unit;envoy;converter")
+
 add_executable(test_drain test_drain.cc)
 target_link_libraries(test_drain rut_runtime)
 target_include_directories(test_drain PRIVATE

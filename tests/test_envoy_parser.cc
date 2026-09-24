@@ -549,8 +549,6 @@ TEST(envoy_parser, rejects_unknown_fields_at_their_key) {
         {"\"name\": \"all\",", "\"name\": \"all\", \"request_headers_to_add\": [],"},
         {"\"match\": {\"prefix\": \"/\"}", "\"match\": {\"prefix\": \"/\", \"headers\": []}"},
         {"\"route\": {\"cluster\": \"backend\"}",
-         "\"route\": {\"cluster\": \"backend\", \"timeout\": \"1s\"}"},
-        {"\"route\": {\"cluster\": \"backend\"}",
          "\"route\": {\"cluster\": \"backend\", \"prefix_rewrite\": \"/\"}"},
         {"\"route\": {\"cluster\": \"backend\"}",
          "\"route\": {\"cluster\": \"backend\", \"retry_policy\": {}}"},
@@ -561,9 +559,6 @@ TEST(envoy_parser, rejects_unknown_fields_at_their_key) {
         {"\"endpoints\": [{", "\"endpoints\": [{\"locality\": {},"},
         {"\"endpoint\": {", "\"load_balancing_weight\": 1, \"endpoint\": {"},
         {"\"endpoint\": {\"address\"", "\"endpoint\": {\"health_check_config\": {}, \"address\""},
-        {"\"@type\": \"type.googleapis.com/envoy.extensions.filters.http.router.v3.Router\"",
-         "\"@type\": \"type.googleapis.com/envoy.extensions.filters.http.router.v3.Router\", "
-         "\"suppress_envoy_headers\": true"},
     };
     for (const Case& c : cases) {
         std::string text = Bootstrap{}.render();
@@ -949,6 +944,134 @@ TEST(envoy_parser, name_length_is_bounded) {
     auto result = envoy::parse_bootstrap_json(str(text), doc);
     REQUIRE(result);
     CHECK_EQ(result.value().cluster.name.len, envoy::kMaxEnvoyNameLen);
+}
+
+// ── Increment 2 fields: route timeout, router suppress_envoy_headers ──────
+
+TEST(envoy_parser, route_timeout_accepts_zero_and_rejects_invalid_forms) {
+    {
+        Bootstrap b;
+        REQUIRE(replace(&b.listeners,
+                        "\"route\": {\"cluster\": \"backend\"}",
+                        "\"route\": {\"cluster\": \"backend\", \"timeout\": \"0s\"}"));
+        static envoy::JsonDocument doc;
+        auto result = envoy::parse_bootstrap_json(str(b.render()), doc);
+        REQUIRE(result);
+        const envoy::RouteAction& action =
+            result.value().listener.filter_chain.hcm.route_config.virtual_host.route.action;
+        CHECK(action.timeout_present);
+        CHECK_EQ(action.timeout.milliseconds, 0u);
+    }
+    {
+        Bootstrap b;
+        REQUIRE(replace(&b.listeners,
+                        "\"route\": {\"cluster\": \"backend\"}",
+                        "\"route\": {\"cluster\": \"backend\", \"timeout\": \"15s\"}"));
+        static envoy::JsonDocument doc;
+        auto result = envoy::parse_bootstrap_json(str(b.render()), doc);
+        REQUIRE(result);
+        const envoy::RouteAction& action =
+            result.value().listener.filter_chain.hcm.route_config.virtual_host.route.action;
+        CHECK(action.timeout_present);
+        CHECK_EQ(action.timeout.milliseconds, 15000u);
+    }
+    {
+        Bootstrap b;
+        REQUIRE(replace(&b.listeners,
+                        "\"route\": {\"cluster\": \"backend\"}",
+                        "\"route\": {\"cluster\": \"backend\", \"timeout\": \"0.250s\"}"));
+        static envoy::JsonDocument doc;
+        auto result = envoy::parse_bootstrap_json(str(b.render()), doc);
+        REQUIRE(result);
+        const envoy::RouteAction& action =
+            result.value().listener.filter_chain.hcm.route_config.virtual_host.route.action;
+        CHECK(action.timeout_present);
+        CHECK_EQ(action.timeout.milliseconds, 250u);
+    }
+    {
+        Bootstrap b;
+        REQUIRE(replace(&b.listeners,
+                        "\"route\": {\"cluster\": \"backend\"}",
+                        "\"route\": {\"cluster\": \"backend\", \"timeout\": \"abc\"}"));
+        expect_reject(b.render(), FrontendError::UnexpectedToken, "s suffix");
+    }
+    {
+        Bootstrap b;
+        REQUIRE(replace(&b.listeners,
+                        "\"route\": {\"cluster\": \"backend\"}",
+                        "\"route\": {\"cluster\": \"backend\", \"timeout\": \"0.0001s\"}"));
+        expect_reject(b.render(), FrontendError::UnsupportedSyntax, "finer than milliseconds");
+    }
+}
+
+TEST(envoy_parser, suppress_envoy_headers_accepts_bool_and_camel_case) {
+    static constexpr char kTypedConfig[] =
+        "\"typed_config\": {\"@type\": "
+        "\"type.googleapis.com/envoy.extensions.filters.http.router.v3.Router\"}";
+    {
+        Bootstrap b;
+        REQUIRE(replace(&b.listeners,
+                        kTypedConfig,
+                        "\"typed_config\": {\"@type\": "
+                        "\"type.googleapis.com/envoy.extensions.filters.http.router.v3.Router\", "
+                        "\"suppress_envoy_headers\": true}"));
+        static envoy::JsonDocument doc;
+        auto result = envoy::parse_bootstrap_json(str(b.render()), doc);
+        REQUIRE(result);
+        const envoy::RouterFilter& router = result.value().listener.filter_chain.hcm.router;
+        CHECK(router.suppress_envoy_headers_present);
+        CHECK(router.suppress_envoy_headers);
+    }
+    {
+        Bootstrap b;
+        REQUIRE(replace(&b.listeners,
+                        kTypedConfig,
+                        "\"typed_config\": {\"@type\": "
+                        "\"type.googleapis.com/envoy.extensions.filters.http.router.v3.Router\", "
+                        "\"suppress_envoy_headers\": false}"));
+        static envoy::JsonDocument doc;
+        auto result = envoy::parse_bootstrap_json(str(b.render()), doc);
+        REQUIRE(result);
+        const envoy::RouterFilter& router = result.value().listener.filter_chain.hcm.router;
+        CHECK(router.suppress_envoy_headers_present);
+        CHECK_FALSE(router.suppress_envoy_headers);
+    }
+    {
+        Bootstrap b;
+        REQUIRE(replace(&b.listeners,
+                        kTypedConfig,
+                        "\"typed_config\": {\"@type\": "
+                        "\"type.googleapis.com/envoy.extensions.filters.http.router.v3.Router\", "
+                        "\"suppressEnvoyHeaders\": true}"));
+        static envoy::JsonDocument doc;
+        auto result = envoy::parse_bootstrap_json(str(b.render()), doc);
+        REQUIRE(result);
+        CHECK(result.value().listener.filter_chain.hcm.router.suppress_envoy_headers);
+    }
+}
+
+TEST(envoy_parser, suppress_envoy_headers_rejects_duplicate_and_non_bool) {
+    static constexpr char kTypedConfig[] =
+        "\"typed_config\": {\"@type\": "
+        "\"type.googleapis.com/envoy.extensions.filters.http.router.v3.Router\"}";
+    {
+        Bootstrap b;
+        REQUIRE(replace(&b.listeners,
+                        kTypedConfig,
+                        "\"typed_config\": {\"@type\": "
+                        "\"type.googleapis.com/envoy.extensions.filters.http.router.v3.Router\", "
+                        "\"suppress_envoy_headers\": true, \"suppressEnvoyHeaders\": true}"));
+        expect_reject(b.render(), FrontendError::UnexpectedToken, "both snake_case and camelCase");
+    }
+    {
+        Bootstrap b;
+        REQUIRE(replace(&b.listeners,
+                        kTypedConfig,
+                        "\"typed_config\": {\"@type\": "
+                        "\"type.googleapis.com/envoy.extensions.filters.http.router.v3.Router\", "
+                        "\"suppress_envoy_headers\": \"true\"}"));
+        expect_reject(b.render(), FrontendError::UnexpectedToken, "must be a boolean");
+    }
 }
 
 int main(int argc, char** argv) {

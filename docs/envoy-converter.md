@@ -203,43 +203,159 @@ Proto3 JSON accepts both `lowerCamelCase` and `snake_case` field names; the
 model must accept both spellings for every supported field and treat them as
 the same key for duplicate detection.
 
+## Corrections found while implementing lowering (increment 2)
+
+The lowering shape originally sketched for this document did not parse
+against today's RUT grammar (`src/compiler/parser.cc`). Five differences,
+folded into the golden below and into the parser/converter implementation:
+
+1. `listen 0.0.0.0:8080` is rejected by the RUT parser
+   (`parse_listen`, `kListenerWildcardSpellingDetail`). The wildcard listener
+   must be written `listen :8080`; a non-wildcard IPv4 listener is still
+   `listen a.b.c.d:port`.
+2. `request_policy.strip_headers` accepts exactly the closed list
+   `["Connection", "Keep-Alive", "TE", "Expect", "Upgrade"]` today, plus
+   `"Proxy-Connection"` once the `host: "preserve"` capability
+   (`request_envoy_h1`) is admitted. `"Transfer-Encoding"` is rejected in
+   every combination the converter uses; it is dropped from the lowering.
+3. `request_policy` and `set_header` cannot be used together
+   (`src/compiler/parser.cc` around lines 2022 and 2568). The milestone
+   lowering therefore does not use `set_header`; `x-forwarded-proto` is
+   carried by `request_policy.forwarded_proto` instead (a capability
+   dependency, see "milestone-S" below), and
+   `x-envoy-expected-rq-timeout-ms` has no RUT equivalent at all (it is
+   removed by `suppress_envoy_headers: true`, also below).
+4. `failure_policy.status` must be exactly 502
+   (`forward_failure_policy_spec_valid`, `admitted_forward_failure_policy_valid`)
+   until the `local_reply_envoy_h1` capability admits 503 with the Envoy
+   connect-failure layout. Envoy's connect failure is a 503, not a 502, so
+   the milestone's `failure_policy` is a capability dependency, not a
+   same-shape substitution.
+5. `local_response(...)` requires all 9 fields, including a non-empty
+   `content_type` for 4xx/5xx statuses. Envoy's no-route 404 has no
+   `content-type`, so the unmatched 404 is also a capability dependency
+   rather than an emittable `local_response` today.
+
+## milestone-S: the first fully specified shape
+
+The plain milestone bootstrap (above) still hits the `x-envoy-upstream-
+service-time` and 15s-route-timeout capability gaps unconditionally, because
+Envoy applies both by default even when nothing in the bootstrap asks for
+them. Rather than leave every input `BLOCKED_BY_RUT` forever, the converter
+recognizes one additional shape, "milestone-S", that removes both defaults
+explicitly:
+
+- `suppress_envoy_headers: true` on the router filter's `typed_config`
+  (`http_filters[].typed_config.suppress_envoy_headers`, v3 `Router` only).
+  This is an Envoy-real knob: it removes `x-envoy-upstream-service-time` and
+  `x-envoy-expected-rq-timeout-ms` from the upstream-facing behavior, which
+  removes the non-deterministic value and the field with no RUT equivalent
+  in one step.
+- `timeout: "0s"` on the route action (`route.route.timeout`). Envoy treats
+  `0s` as "no timeout" (rather than an instant timeout), which removes the
+  implicit 15s route timeout default and makes `response_read_timeout`
+  unnecessary for this milestone.
+
+Milestone-S is still capability-gated on everything else (request header
+casing/host preservation, response header order, and the local-reply
+layouts); it only removes the two defaults that would otherwise make no
+input convertible before those capabilities land. Bootstraps that omit
+either field, or that set a non-zero `timeout`, remain `BLOCKED_BY_RUT` with
+a diagnostic naming exactly what to change (see "Capability validation"
+below).
+
 ## Lowering shape
 
-The milestone lowers to ordinary RUT of the following shape. Exact policy
-values are recorded from the pinned Envoy oracle during increment 3, not from
-this document.
+The milestone-S bootstrap (the accepted-JSON milestone above, plus
+`suppress_envoy_headers: true` and `timeout: "0s"`) lowers to the RUT below
+once every capability in `rut::envoy::RutCapabilities` is available. The
+shipped converter (`rut::envoy::kShippedRutCapabilities`, all `false`) fails
+closed with a `BLOCKED_BY_RUT` diagnostic instead of emitting this text; the
+exact bytes are pinned in `tests/fixtures/envoy_milestone_s.inc` and checked
+byte for byte by `tests/test_envoy_convert.cc`
+(`api_all_capabilities_matches_golden`). Values shown here (the connect-failure
+body, in particular) are provisional pending the pinned Envoy oracle (PR2)
+and are marked `// PROVISIONAL: reconcile with oracle` at their source.
 
 ```rut
-listen 0.0.0.0:8080
-upstream backend at "127.0.0.1:9000"
-unmatched { return local_response({ ... Envoy "no route" 404 shape ... }) }
-route "/" {
-    return forward(backend, request_policy: {
+listen :8080
+upstream envoy_cluster_0 at "127.0.0.1:9000"
+unmatched { return local_response({
+  version: "HTTP/1.1", status: 404, reason: "Not Found", server: "envoy",
+  date: "current", connection: "request", connection_header: "close_only",
+  header_names: "lowercase", header_order: "date_server_length",
+  head_mode: "suppress_body", body: b""
+}) }
+route HEAD "/" {
+    return forward(envoy_cluster_0, request_policy: {
             version: "HTTP/1.1",
             host: "preserve",
             connection: "omit",
-            strip_headers: ["Connection", "Keep-Alive", "TE", "Expect", "Upgrade",
-                            "Proxy-Connection", "Transfer-Encoding"]
-        },
-        set_header: {
-            "x-forwarded-proto": "http",
-            "x-envoy-expected-rq-timeout-ms": "15000"
+            header_names: "lowercase",
+            forwarded_proto: "http",
+            strip_headers: ["Connection", "Keep-Alive", "TE", "Expect", "Upgrade", "Proxy-Connection"]
         },
         response_policy: {
-            version: "HTTP/1.1", framing: "content_length", connection: "request",
-            server: "envoy", date: "preserve_or_current",
-            hide_headers: [ ... ]
+            version: "HTTP/1.1",
+            framing: "content_length",
+            connection: "request",
+            head_mode: "suppress_body",
+            header_order: "upstream",
+            header_names: "lowercase",
+            connection_header: "close_only",
+            status_reason: "canonical",
+            server: "envoy",
+            date: "preserve_or_current",
+            hide_headers: []
         },
-        failure_policy: { ... Envoy 503 upstream connect error shape ... },
-        timeout_failure_policy: { ... Envoy 504 upstream request timeout shape ... },
-        response_read_timeout: 15s)
+        failure_policy: {
+            version: "HTTP/1.1",
+            status: 503,
+            reason: "Service Unavailable",
+            content_type: "text/plain",
+            server: "envoy",
+            date: "current",
+            connection: "request",
+            connection_header: "close_only",
+            header_names: "lowercase",
+            header_order: "length_type_date_server",
+            head_mode: "suppress_body",
+            body: b"<kEnvoyConnectFailureBody, PROVISIONAL>"
+        }
+    )
+}
+route "/" {
+    <identical forward(...), with the two `head_mode: "suppress_body",` lines omitted>
 }
 ```
 
-Fields shown with `...` or with values that do not exist in today's
-`request_policy` / `response_policy` grammar (for example `host: "preserve"`)
-are capability dependencies, listed below. The converter must fail closed on
-them until the RUT side exists; it must not emit the nearest existing value.
+The upstream identifier is always `envoy_cluster_0` regardless of the
+bootstrap's cluster name; the listener line is `listen :<port>` when the
+listener address is the IPv4 wildcard and `listen a.b.c.d:<port>` otherwise.
+No bytes from the JSON source reach the emitted RUT — only the numeric
+listener/endpoint address and port fields are rendered; every other token is
+a fixed literal chosen by the converter.
+
+Fields with values that do not exist in today's `request_policy` /
+`response_policy` / `local_response` / `failure_policy` grammar (for example
+`host: "preserve"`, `header_order: "upstream"`) are capability dependencies,
+listed below and gated by `rut::envoy::RutCapabilities`. The converter must
+fail closed on them until the RUT side exists; it must not emit the nearest
+existing value. The six checks, in order (first failure wins), are:
+
+1. Router `suppress_envoy_headers` must be `true`.
+2. Route `timeout` must be present.
+3. Route `timeout` must be exactly `0s`.
+4. `RutCapabilities::request_envoy_h1` (Host preserve + lowercase request
+   headers) must be available.
+5. `RutCapabilities::response_envoy_h1` (upstream header order + lowercase +
+   preserved date) must be available.
+6. `RutCapabilities::local_reply_envoy_h1` (lowercase local-reply layouts)
+   must be available.
+
+Each of 1-3 is a plain modeling gap (the bootstrap can be edited to satisfy
+it); each of 4-6 is a Rut-side capability gap tracked as a separate PR (see
+the project plan) and cannot be worked around from the bootstrap.
 
 ## Envoy semantics the first end-to-end test must preserve
 
