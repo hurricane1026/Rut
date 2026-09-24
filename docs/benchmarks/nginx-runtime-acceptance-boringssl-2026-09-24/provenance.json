@@ -1,0 +1,27 @@
+{
+  "started_at": "2026-09-24T00:48:57+00:00",
+  "source_sha": "e2866fe02a0d921be6e24a6eb1ccc768c492441c",
+  "remote_head_sha": "e2866fe02a0d921be6e24a6eb1ccc768c492441c",
+  "files": {
+    "rut": "/tmp/pr-watchdog/hurricane1026_Rut_687/release-build/src/rut",
+    "converter": "/tmp/pr-watchdog/hurricane1026_Rut_687/release-build/src/rut-nginx-convert",
+    "wrk": "/tmp/pr-watchdog/hurricane1026_Rut_687/wrk-boringssl-src2/wrk",
+    "wrk_patch": "/tmp/pr-watchdog/hurricane1026_Rut_687/wrk-boringssl-full-handshake.patch"
+  },
+  "sha256": {
+    "rut": "5d0dc2613fc16ebe64b1ff62ce257a91f9e7b6b801971cc879d321f0107f8378",
+    "converter": "bd87d83a1a67ead19c5f05df18795530b6e308907a1b1f5af4882d027adb991b",
+    "wrk": "d7866c40dcb47f67138cdc420c346272d06b7b5dfc2705161178c996b6e7cf30",
+    "wrk_patch": "00de42ee31f3cc910303a4d49881d150880bb8cae2c91e0336255b9ffab6d1f4"
+  },
+  "wrk_revision": "a211dd5a7050b1f9e8a9870b95513060e72ac4a0",
+  "boringssl_revision": "7f5a43945aab78fe4e71459ac4881ff9033d73d8",
+  "profile": "acceptance",
+  "static_profile": "native-body",
+  "planned_cells": 96,
+  "repeats_per_cell": 3,
+  "minimum_seconds_per_sample": 5,
+  "minimum_rut_over_nginx": 1.1,
+  "tls_handshake": "BoringSSL full handshake",
+  "note": "The later bd362f8 head changes only test helper formatting; the production source and measured binaries are identical to e2866fe."
+}

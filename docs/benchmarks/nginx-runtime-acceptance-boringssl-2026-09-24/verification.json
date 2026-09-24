@@ -1,0 +1,1472 @@
+{
+  "coordinates_unique_and_complete": true,
+  "provenance_integrity": {
+    "source_sha_present": true,
+    "required_file_schema": true,
+    "hashes_checked": 4,
+    "hashes_match": 4,
+    "remote_ref_checked": true,
+    "remote_ref_match": false,
+    "exact_head_match": false,
+    "source_reachable_from_remote_ref": true,
+    "remote_reachability": {
+      "remote": "git@github.com:hurricane1026/Rut.git",
+      "ref": "refs/heads/perf/quick-nginx-benchmark",
+      "observed_head": "bd362f8813a33c009ffa793aba5c4612d3de035d",
+      "checked_at": "2026-09-24T01:56:10.036407+00:00",
+      "reachable": true,
+      "fetch_succeeded": true
+    },
+    "remote_arg": "git@github.com:hurricane1026/Rut.git",
+    "resolved_url": "git@github.com:hurricane1026/Rut.git"
+  },
+  "raw_samples": 576,
+  "expected_samples": 576,
+  "all_sample_durations_and_errors_valid": true,
+  "short_samples": [],
+  "error_samples": [],
+  "independently_recomputed": true,
+  "cell_checks": [
+    {
+      "coordinate": [
+        "http",
+        "static-close",
+        16,
+        1
+      ],
+      "ratio": 1.0658072165702872,
+      "ratio_ok": false,
+      "target_matches": true,
+      "measurement_quality_ok": true,
+      "reps_unique": true,
+      "measurement_valid_matches": true,
+      "raw_recomputed": true
+    },
+    {
+      "coordinate": [
+        "http",
+        "static-close",
+        16,
+        32
+      ],
+      "ratio": 1.3347272393840308,
+      "ratio_ok": true,
+      "target_matches": true,
+      "measurement_quality_ok": true,
+      "reps_unique": true,
+      "measurement_valid_matches": true,
+      "raw_recomputed": true
+    },
+    {
+      "coordinate": [
+        "http",
+        "static-close",
+        16,
+        128
+      ],
+      "ratio": 1.394309016606726,
+      "ratio_ok": true,
+      "target_matches": true,
+      "measurement_quality_ok": true,
+      "reps_unique": true,
+      "measurement_valid_matches": true,
+      "raw_recomputed": true
+    },
+    {
+      "coordinate": [
+        "http",
+        "static-keepalive",
+        16,
+        1
+      ],
+      "ratio": 1.5843278923132156,
+      "ratio_ok": true,
+      "target_matches": true,
+      "measurement_quality_ok": true,
+      "reps_unique": true,
+      "measurement_valid_matches": true,
+      "raw_recomputed": true
+    },
+    {
+      "coordinate": [
+        "http",
+        "static-keepalive",
+        16,
+        32
+      ],
+      "ratio": 2.930927243275457,
+      "ratio_ok": true,
+      "target_matches": true,
+      "measurement_quality_ok": true,
+      "reps_unique": true,
+      "measurement_valid_matches": true,
+      "raw_recomputed": true
+    },
+    {
+      "coordinate": [
+        "http",
+        "static-keepalive",
+        16,
+        128
+      ],
+      "ratio": 3.0499529767393803,
+      "ratio_ok": true,
+      "target_matches": true,
+      "measurement_quality_ok": true,
+      "reps_unique": true,
+      "measurement_valid_matches": true,
+      "raw_recomputed": true
+    },
+    {
+      "coordinate": [
+        "http",
+        "proxy-close",
+        16,
+        1
+      ],
+      "ratio": 1.1762774571843722,
+      "ratio_ok": true,
+      "target_matches": true,
+      "measurement_quality_ok": true,
+      "reps_unique": true,
+      "measurement_valid_matches": true,
+      "raw_recomputed": true
+    },
+    {
+      "coordinate": [
+        "http",
+        "proxy-close",
+        16,
+        32
+      ],
+      "ratio": 1.057007041698759,
+      "ratio_ok": false,
+      "target_matches": true,
+      "measurement_quality_ok": true,
+      "reps_unique": true,
+      "measurement_valid_matches": true,
+      "raw_recomputed": true
+    },
+    {
+      "coordinate": [
+        "http",
+        "proxy-close",
+        16,
+        128
+      ],
+      "ratio": 1.0650169137793417,
+      "ratio_ok": false,
+      "target_matches": true,
+      "measurement_quality_ok": true,
+      "reps_unique": true,
+      "measurement_valid_matches": true,
+      "raw_recomputed": true
+    },
+    {
+      "coordinate": [
+        "http",
+        "proxy-keepalive",
+        16,
+        1
+      ],
+      "ratio": 1.1220344939350952,
+      "ratio_ok": true,
+      "target_matches": true,
+      "measurement_quality_ok": true,
+      "reps_unique": true,
+      "measurement_valid_matches": true,
+      "raw_recomputed": true
+    },
+    {
+      "coordinate": [
+        "http",
+        "proxy-keepalive",
+        16,
+        32
+      ],
+      "ratio": 1.1651439747644905,
+      "ratio_ok": true,
+      "target_matches": true,
+      "measurement_quality_ok": true,
+      "reps_unique": true,
+      "measurement_valid_matches": true,
+      "raw_recomputed": true
+    },
+    {
+      "coordinate": [
+        "http",
+        "proxy-keepalive",
+        16,
+        128
+      ],
+      "ratio": 1.2826267860703584,
+      "ratio_ok": true,
+      "target_matches": true,
+      "measurement_quality_ok": true,
+      "reps_unique": true,
+      "measurement_valid_matches": true,
+      "raw_recomputed": true
+    },
+    {
+      "coordinate": [
+        "http",
+        "static-close",
+        1024,
+        1
+      ],
+      "ratio": 1.0721468854032332,
+      "ratio_ok": false,
+      "target_matches": true,
+      "measurement_quality_ok": true,
+      "reps_unique": true,
+      "measurement_valid_matches": true,
+      "raw_recomputed": true
+    },
+    {
+      "coordinate": [
+        "http",
+        "static-close",
+        1024,
+        32
+      ],
+      "ratio": 1.3350837497151253,
+      "ratio_ok": true,
+      "target_matches": true,
+      "measurement_quality_ok": true,
+      "reps_unique": true,
+      "measurement_valid_matches": true,
+      "raw_recomputed": true
+    },
+    {
+      "coordinate": [
+        "http",
+        "static-close",
+        1024,
+        128
+      ],
+      "ratio": 1.3857365578627603,
+      "ratio_ok": true,
+      "target_matches": true,
+      "measurement_quality_ok": true,
+      "reps_unique": true,
+      "measurement_valid_matches": true,
+      "raw_recomputed": true
+    },
+    {
+      "coordinate": [
+        "http",
+        "static-keepalive",
+        1024,
+        1
+      ],
+      "ratio": 1.585047343584468,
+      "ratio_ok": true,
+      "target_matches": true,
+      "measurement_quality_ok": true,
+      "reps_unique": true,
+      "measurement_valid_matches": true,
+      "raw_recomputed": true
+    },
+    {
+      "coordinate": [
+        "http",
+        "static-keepalive",
+        1024,
+        32
+      ],
+      "ratio": 2.8118077766703347,
+      "ratio_ok": true,
+      "target_matches": true,
+      "measurement_quality_ok": true,
+      "reps_unique": true,
+      "measurement_valid_matches": true,
+      "raw_recomputed": true
+    },
+    {
+      "coordinate": [
+        "http",
+        "static-keepalive",
+        1024,
+        128
+      ],
+      "ratio": 2.8750030378801075,
+      "ratio_ok": true,
+      "target_matches": true,
+      "measurement_quality_ok": true,
+      "reps_unique": true,
+      "measurement_valid_matches": true,
+      "raw_recomputed": true
+    },
+    {
+      "coordinate": [
+        "http",
+        "proxy-close",
+        1024,
+        1
+      ],
+      "ratio": 1.1775003546602356,
+      "ratio_ok": true,
+      "target_matches": true,
+      "measurement_quality_ok": true,
+      "reps_unique": true,
+      "measurement_valid_matches": true,
+      "raw_recomputed": true
+    },
+    {
+      "coordinate": [
+        "http",
+        "proxy-close",
+        1024,
+        32
+      ],
+      "ratio": 1.0243789566578922,
+      "ratio_ok": false,
+      "target_matches": true,
+      "measurement_quality_ok": true,
+      "reps_unique": true,
+      "measurement_valid_matches": true,
+      "raw_recomputed": true
+    },
+    {
+      "coordinate": [
+        "http",
+        "proxy-close",
+        1024,
+        128
+      ],
+      "ratio": 1.1089811633204307,
+      "ratio_ok": true,
+      "target_matches": true,
+      "measurement_quality_ok": true,
+      "reps_unique": true,
+      "measurement_valid_matches": true,
+      "raw_recomputed": true
+    },
+    {
+      "coordinate": [
+        "http",
+        "proxy-keepalive",
+        1024,
+        1
+      ],
+      "ratio": 1.1264756282342074,
+      "ratio_ok": true,
+      "target_matches": true,
+      "measurement_quality_ok": true,
+      "reps_unique": true,
+      "measurement_valid_matches": true,
+      "raw_recomputed": true
+    },
+    {
+      "coordinate": [
+        "http",
+        "proxy-keepalive",
+        1024,
+        32
+      ],
+      "ratio": 1.1617423181544664,
+      "ratio_ok": true,
+      "target_matches": true,
+      "measurement_quality_ok": true,
+      "reps_unique": true,
+      "measurement_valid_matches": true,
+      "raw_recomputed": true
+    },
+    {
+      "coordinate": [
+        "http",
+        "proxy-keepalive",
+        1024,
+        128
+      ],
+      "ratio": 1.2867943080959834,
+      "ratio_ok": true,
+      "target_matches": true,
+      "measurement_quality_ok": true,
+      "reps_unique": true,
+      "measurement_valid_matches": true,
+      "raw_recomputed": true
+    },
+    {
+      "coordinate": [
+        "http",
+        "static-close",
+        65536,
+        1
+      ],
+      "ratio": 1.1578655105503746,
+      "ratio_ok": true,
+      "target_matches": true,
+      "measurement_quality_ok": true,
+      "reps_unique": true,
+      "measurement_valid_matches": true,
+      "raw_recomputed": true
+    },
+    {
+      "coordinate": [
+        "http",
+        "static-close",
+        65536,
+        32
+      ],
+      "ratio": 1.0423403988921383,
+      "ratio_ok": false,
+      "target_matches": true,
+      "measurement_quality_ok": true,
+      "reps_unique": true,
+      "measurement_valid_matches": true,
+      "raw_recomputed": true
+    },
+    {
+      "coordinate": [
+        "http",
+        "static-close",
+        65536,
+        128
+      ],
+      "ratio": 1.0329828045196332,
+      "ratio_ok": false,
+      "target_matches": true,
+      "measurement_quality_ok": true,
+      "reps_unique": true,
+      "measurement_valid_matches": true,
+      "raw_recomputed": true
+    },
+    {
+      "coordinate": [
+        "http",
+        "static-keepalive",
+        65536,
+        1
+      ],
+      "ratio": 1.0270568366647432,
+      "ratio_ok": false,
+      "target_matches": true,
+      "measurement_quality_ok": true,
+      "reps_unique": true,
+      "measurement_valid_matches": true,
+      "raw_recomputed": true
+    },
+    {
+      "coordinate": [
+        "http",
+        "static-keepalive",
+        65536,
+        32
+      ],
+      "ratio": 1.280886529106891,
+      "ratio_ok": true,
+      "target_matches": true,
+      "measurement_quality_ok": true,
+      "reps_unique": true,
+      "measurement_valid_matches": true,
+      "raw_recomputed": true
+    },
+    {
+      "coordinate": [
+        "http",
+        "static-keepalive",
+        65536,
+        128
+      ],
+      "ratio": 1.2777248958222778,
+      "ratio_ok": true,
+      "target_matches": true,
+      "measurement_quality_ok": true,
+      "reps_unique": true,
+      "measurement_valid_matches": true,
+      "raw_recomputed": true
+    },
+    {
+      "coordinate": [
+        "http",
+        "proxy-close",
+        65536,
+        1
+      ],
+      "ratio": 0.8553491358185868,
+      "ratio_ok": false,
+      "target_matches": true,
+      "measurement_quality_ok": true,
+      "reps_unique": true,
+      "measurement_valid_matches": true,
+      "raw_recomputed": true
+    },
+    {
+      "coordinate": [
+        "http",
+        "proxy-close",
+        65536,
+        32
+      ],
+      "ratio": 1.1202232603752613,
+      "ratio_ok": true,
+      "target_matches": true,
+      "measurement_quality_ok": true,
+      "reps_unique": true,
+      "measurement_valid_matches": true,
+      "raw_recomputed": true
+    },
+    {
+      "coordinate": [
+        "http",
+        "proxy-close",
+        65536,
+        128
+      ],
+      "ratio": 1.0265023300343006,
+      "ratio_ok": false,
+      "target_matches": true,
+      "measurement_quality_ok": true,
+      "reps_unique": true,
+      "measurement_valid_matches": true,
+      "raw_recomputed": true
+    },
+    {
+      "coordinate": [
+        "http",
+        "proxy-keepalive",
+        65536,
+        1
+      ],
+      "ratio": 0.8253260915871461,
+      "ratio_ok": false,
+      "target_matches": true,
+      "measurement_quality_ok": true,
+      "reps_unique": true,
+      "measurement_valid_matches": true,
+      "raw_recomputed": true
+    },
+    {
+      "coordinate": [
+        "http",
+        "proxy-keepalive",
+        65536,
+        32
+      ],
+      "ratio": 1.1552365798141784,
+      "ratio_ok": true,
+      "target_matches": true,
+      "measurement_quality_ok": true,
+      "reps_unique": true,
+      "measurement_valid_matches": true,
+      "raw_recomputed": true
+    },
+    {
+      "coordinate": [
+        "http",
+        "proxy-keepalive",
+        65536,
+        128
+      ],
+      "ratio": 1.1468224972216428,
+      "ratio_ok": true,
+      "target_matches": true,
+      "measurement_quality_ok": true,
+      "reps_unique": true,
+      "measurement_valid_matches": true,
+      "raw_recomputed": true
+    },
+    {
+      "coordinate": [
+        "http",
+        "static-close",
+        1048576,
+        1
+      ],
+      "ratio": 0.8893612463682187,
+      "ratio_ok": false,
+      "target_matches": true,
+      "measurement_quality_ok": true,
+      "reps_unique": true,
+      "measurement_valid_matches": true,
+      "raw_recomputed": true
+    },
+    {
+      "coordinate": [
+        "http",
+        "static-close",
+        1048576,
+        32
+      ],
+      "ratio": 0.9085877214622184,
+      "ratio_ok": false,
+      "target_matches": true,
+      "measurement_quality_ok": true,
+      "reps_unique": true,
+      "measurement_valid_matches": true,
+      "raw_recomputed": true
+    },
+    {
+      "coordinate": [
+        "http",
+        "static-close",
+        1048576,
+        128
+      ],
+      "ratio": 0.8348398857234278,
+      "ratio_ok": false,
+      "target_matches": true,
+      "measurement_quality_ok": true,
+      "reps_unique": true,
+      "measurement_valid_matches": true,
+      "raw_recomputed": true
+    },
+    {
+      "coordinate": [
+        "http",
+        "static-keepalive",
+        1048576,
+        1
+      ],
+      "ratio": 0.9312408082138427,
+      "ratio_ok": false,
+      "target_matches": true,
+      "measurement_quality_ok": true,
+      "reps_unique": true,
+      "measurement_valid_matches": true,
+      "raw_recomputed": true
+    },
+    {
+      "coordinate": [
+        "http",
+        "static-keepalive",
+        1048576,
+        32
+      ],
+      "ratio": 0.8981501543764678,
+      "ratio_ok": false,
+      "target_matches": true,
+      "measurement_quality_ok": true,
+      "reps_unique": true,
+      "measurement_valid_matches": true,
+      "raw_recomputed": true
+    },
+    {
+      "coordinate": [
+        "http",
+        "static-keepalive",
+        1048576,
+        128
+      ],
+      "ratio": 0.8312646548735951,
+      "ratio_ok": false,
+      "target_matches": true,
+      "measurement_quality_ok": true,
+      "reps_unique": true,
+      "measurement_valid_matches": true,
+      "raw_recomputed": true
+    },
+    {
+      "coordinate": [
+        "http",
+        "proxy-close",
+        1048576,
+        1
+      ],
+      "ratio": 1.0596613628380802,
+      "ratio_ok": false,
+      "target_matches": true,
+      "measurement_quality_ok": true,
+      "reps_unique": true,
+      "measurement_valid_matches": true,
+      "raw_recomputed": true
+    },
+    {
+      "coordinate": [
+        "http",
+        "proxy-close",
+        1048576,
+        32
+      ],
+      "ratio": 0.4487700076989463,
+      "ratio_ok": false,
+      "target_matches": true,
+      "measurement_quality_ok": true,
+      "reps_unique": true,
+      "measurement_valid_matches": true,
+      "raw_recomputed": true
+    },
+    {
+      "coordinate": [
+        "http",
+        "proxy-close",
+        1048576,
+        128
+      ],
+      "ratio": 0.41741782750697565,
+      "ratio_ok": false,
+      "target_matches": true,
+      "measurement_quality_ok": true,
+      "reps_unique": true,
+      "measurement_valid_matches": true,
+      "raw_recomputed": true
+    },
+    {
+      "coordinate": [
+        "http",
+        "proxy-keepalive",
+        1048576,
+        1
+      ],
+      "ratio": 0.6451080251172049,
+      "ratio_ok": false,
+      "target_matches": true,
+      "measurement_quality_ok": true,
+      "reps_unique": true,
+      "measurement_valid_matches": true,
+      "raw_recomputed": true
+    },
+    {
+      "coordinate": [
+        "http",
+        "proxy-keepalive",
+        1048576,
+        32
+      ],
+      "ratio": 0.5833838800648651,
+      "ratio_ok": false,
+      "target_matches": true,
+      "measurement_quality_ok": true,
+      "reps_unique": true,
+      "measurement_valid_matches": true,
+      "raw_recomputed": true
+    },
+    {
+      "coordinate": [
+        "http",
+        "proxy-keepalive",
+        1048576,
+        128
+      ],
+      "ratio": 0.5810333271545788,
+      "ratio_ok": false,
+      "target_matches": true,
+      "measurement_quality_ok": true,
+      "reps_unique": true,
+      "measurement_valid_matches": true,
+      "raw_recomputed": true
+    },
+    {
+      "coordinate": [
+        "https",
+        "static-close",
+        16,
+        1
+      ],
+      "ratio": 1.1914495882109706,
+      "ratio_ok": true,
+      "target_matches": true,
+      "measurement_quality_ok": true,
+      "reps_unique": true,
+      "measurement_valid_matches": true,
+      "raw_recomputed": true
+    },
+    {
+      "coordinate": [
+        "https",
+        "static-close",
+        16,
+        32
+      ],
+      "ratio": 1.3158010608557718,
+      "ratio_ok": true,
+      "target_matches": true,
+      "measurement_quality_ok": true,
+      "reps_unique": true,
+      "measurement_valid_matches": true,
+      "raw_recomputed": true
+    },
+    {
+      "coordinate": [
+        "https",
+        "static-close",
+        16,
+        128
+      ],
+      "ratio": 1.3230777745037214,
+      "ratio_ok": true,
+      "target_matches": true,
+      "measurement_quality_ok": true,
+      "reps_unique": true,
+      "measurement_valid_matches": true,
+      "raw_recomputed": true
+    },
+    {
+      "coordinate": [
+        "https",
+        "static-keepalive",
+        16,
+        1
+      ],
+      "ratio": 1.32657749699543,
+      "ratio_ok": true,
+      "target_matches": true,
+      "measurement_quality_ok": true,
+      "reps_unique": true,
+      "measurement_valid_matches": true,
+      "raw_recomputed": true
+    },
+    {
+      "coordinate": [
+        "https",
+        "static-keepalive",
+        16,
+        32
+      ],
+      "ratio": 3.0499525217688284,
+      "ratio_ok": true,
+      "target_matches": true,
+      "measurement_quality_ok": true,
+      "reps_unique": true,
+      "measurement_valid_matches": true,
+      "raw_recomputed": true
+    },
+    {
+      "coordinate": [
+        "https",
+        "static-keepalive",
+        16,
+        128
+      ],
+      "ratio": 3.1172003668261263,
+      "ratio_ok": true,
+      "target_matches": true,
+      "measurement_quality_ok": true,
+      "reps_unique": true,
+      "measurement_valid_matches": true,
+      "raw_recomputed": true
+    },
+    {
+      "coordinate": [
+        "https",
+        "proxy-close",
+        16,
+        1
+      ],
+      "ratio": 1.1762546937466436,
+      "ratio_ok": true,
+      "target_matches": true,
+      "measurement_quality_ok": true,
+      "reps_unique": true,
+      "measurement_valid_matches": true,
+      "raw_recomputed": true
+    },
+    {
+      "coordinate": [
+        "https",
+        "proxy-close",
+        16,
+        32
+      ],
+      "ratio": 1.3264847255411931,
+      "ratio_ok": true,
+      "target_matches": true,
+      "measurement_quality_ok": true,
+      "reps_unique": true,
+      "measurement_valid_matches": true,
+      "raw_recomputed": true
+    },
+    {
+      "coordinate": [
+        "https",
+        "proxy-close",
+        16,
+        128
+      ],
+      "ratio": 1.3150194849959502,
+      "ratio_ok": true,
+      "target_matches": true,
+      "measurement_quality_ok": true,
+      "reps_unique": true,
+      "measurement_valid_matches": true,
+      "raw_recomputed": true
+    },
+    {
+      "coordinate": [
+        "https",
+        "proxy-keepalive",
+        16,
+        1
+      ],
+      "ratio": 1.1876241757109254,
+      "ratio_ok": true,
+      "target_matches": true,
+      "measurement_quality_ok": true,
+      "reps_unique": true,
+      "measurement_valid_matches": true,
+      "raw_recomputed": true
+    },
+    {
+      "coordinate": [
+        "https",
+        "proxy-keepalive",
+        16,
+        32
+      ],
+      "ratio": 1.2760697406141626,
+      "ratio_ok": true,
+      "target_matches": true,
+      "measurement_quality_ok": true,
+      "reps_unique": true,
+      "measurement_valid_matches": true,
+      "raw_recomputed": true
+    },
+    {
+      "coordinate": [
+        "https",
+        "proxy-keepalive",
+        16,
+        128
+      ],
+      "ratio": 1.4684339475764916,
+      "ratio_ok": true,
+      "target_matches": true,
+      "measurement_quality_ok": true,
+      "reps_unique": true,
+      "measurement_valid_matches": true,
+      "raw_recomputed": true
+    },
+    {
+      "coordinate": [
+        "https",
+        "static-close",
+        1024,
+        1
+      ],
+      "ratio": 1.1945454348896913,
+      "ratio_ok": true,
+      "target_matches": true,
+      "measurement_quality_ok": true,
+      "reps_unique": true,
+      "measurement_valid_matches": true,
+      "raw_recomputed": true
+    },
+    {
+      "coordinate": [
+        "https",
+        "static-close",
+        1024,
+        32
+      ],
+      "ratio": 1.2939433405630048,
+      "ratio_ok": true,
+      "target_matches": true,
+      "measurement_quality_ok": true,
+      "reps_unique": true,
+      "measurement_valid_matches": true,
+      "raw_recomputed": true
+    },
+    {
+      "coordinate": [
+        "https",
+        "static-close",
+        1024,
+        128
+      ],
+      "ratio": 1.2970860888581635,
+      "ratio_ok": true,
+      "target_matches": true,
+      "measurement_quality_ok": true,
+      "reps_unique": true,
+      "measurement_valid_matches": true,
+      "raw_recomputed": true
+    },
+    {
+      "coordinate": [
+        "https",
+        "static-keepalive",
+        1024,
+        1
+      ],
+      "ratio": 1.2729940177425592,
+      "ratio_ok": true,
+      "target_matches": true,
+      "measurement_quality_ok": true,
+      "reps_unique": true,
+      "measurement_valid_matches": true,
+      "raw_recomputed": true
+    },
+    {
+      "coordinate": [
+        "https",
+        "static-keepalive",
+        1024,
+        32
+      ],
+      "ratio": 2.81508621163883,
+      "ratio_ok": true,
+      "target_matches": true,
+      "measurement_quality_ok": true,
+      "reps_unique": true,
+      "measurement_valid_matches": true,
+      "raw_recomputed": true
+    },
+    {
+      "coordinate": [
+        "https",
+        "static-keepalive",
+        1024,
+        128
+      ],
+      "ratio": 2.8293395584481384,
+      "ratio_ok": true,
+      "target_matches": true,
+      "measurement_quality_ok": true,
+      "reps_unique": true,
+      "measurement_valid_matches": true,
+      "raw_recomputed": true
+    },
+    {
+      "coordinate": [
+        "https",
+        "proxy-close",
+        1024,
+        1
+      ],
+      "ratio": 1.1846077441485465,
+      "ratio_ok": true,
+      "target_matches": true,
+      "measurement_quality_ok": true,
+      "reps_unique": true,
+      "measurement_valid_matches": true,
+      "raw_recomputed": true
+    },
+    {
+      "coordinate": [
+        "https",
+        "proxy-close",
+        1024,
+        32
+      ],
+      "ratio": 1.3263537935682066,
+      "ratio_ok": true,
+      "target_matches": true,
+      "measurement_quality_ok": true,
+      "reps_unique": true,
+      "measurement_valid_matches": true,
+      "raw_recomputed": true
+    },
+    {
+      "coordinate": [
+        "https",
+        "proxy-close",
+        1024,
+        128
+      ],
+      "ratio": 1.3162175161954612,
+      "ratio_ok": true,
+      "target_matches": true,
+      "measurement_quality_ok": true,
+      "reps_unique": true,
+      "measurement_valid_matches": true,
+      "raw_recomputed": true
+    },
+    {
+      "coordinate": [
+        "https",
+        "proxy-keepalive",
+        1024,
+        1
+      ],
+      "ratio": 1.1810883940138381,
+      "ratio_ok": true,
+      "target_matches": true,
+      "measurement_quality_ok": true,
+      "reps_unique": true,
+      "measurement_valid_matches": true,
+      "raw_recomputed": true
+    },
+    {
+      "coordinate": [
+        "https",
+        "proxy-keepalive",
+        1024,
+        32
+      ],
+      "ratio": 1.2677107347532406,
+      "ratio_ok": true,
+      "target_matches": true,
+      "measurement_quality_ok": true,
+      "reps_unique": true,
+      "measurement_valid_matches": true,
+      "raw_recomputed": true
+    },
+    {
+      "coordinate": [
+        "https",
+        "proxy-keepalive",
+        1024,
+        128
+      ],
+      "ratio": 1.442580606607247,
+      "ratio_ok": true,
+      "target_matches": true,
+      "measurement_quality_ok": true,
+      "reps_unique": true,
+      "measurement_valid_matches": true,
+      "raw_recomputed": true
+    },
+    {
+      "coordinate": [
+        "https",
+        "static-close",
+        65536,
+        1
+      ],
+      "ratio": 1.1568790768456592,
+      "ratio_ok": true,
+      "target_matches": true,
+      "measurement_quality_ok": true,
+      "reps_unique": true,
+      "measurement_valid_matches": true,
+      "raw_recomputed": true
+    },
+    {
+      "coordinate": [
+        "https",
+        "static-close",
+        65536,
+        32
+      ],
+      "ratio": 1.2395521425842868,
+      "ratio_ok": true,
+      "target_matches": true,
+      "measurement_quality_ok": true,
+      "reps_unique": true,
+      "measurement_valid_matches": true,
+      "raw_recomputed": true
+    },
+    {
+      "coordinate": [
+        "https",
+        "static-close",
+        65536,
+        128
+      ],
+      "ratio": 1.201690559617616,
+      "ratio_ok": true,
+      "target_matches": true,
+      "measurement_quality_ok": true,
+      "reps_unique": true,
+      "measurement_valid_matches": true,
+      "raw_recomputed": true
+    },
+    {
+      "coordinate": [
+        "https",
+        "static-keepalive",
+        65536,
+        1
+      ],
+      "ratio": 1.1563809293681153,
+      "ratio_ok": true,
+      "target_matches": true,
+      "measurement_quality_ok": true,
+      "reps_unique": true,
+      "measurement_valid_matches": true,
+      "raw_recomputed": true
+    },
+    {
+      "coordinate": [
+        "https",
+        "static-keepalive",
+        65536,
+        32
+      ],
+      "ratio": 1.554198189722806,
+      "ratio_ok": true,
+      "target_matches": true,
+      "measurement_quality_ok": true,
+      "reps_unique": true,
+      "measurement_valid_matches": true,
+      "raw_recomputed": true
+    },
+    {
+      "coordinate": [
+        "https",
+        "static-keepalive",
+        65536,
+        128
+      ],
+      "ratio": 1.5300088915630046,
+      "ratio_ok": true,
+      "target_matches": true,
+      "measurement_quality_ok": true,
+      "reps_unique": true,
+      "measurement_valid_matches": true,
+      "raw_recomputed": true
+    },
+    {
+      "coordinate": [
+        "https",
+        "proxy-close",
+        65536,
+        1
+      ],
+      "ratio": 1.1317754395738053,
+      "ratio_ok": true,
+      "target_matches": true,
+      "measurement_quality_ok": true,
+      "reps_unique": true,
+      "measurement_valid_matches": true,
+      "raw_recomputed": true
+    },
+    {
+      "coordinate": [
+        "https",
+        "proxy-close",
+        65536,
+        32
+      ],
+      "ratio": 1.2957377162494483,
+      "ratio_ok": true,
+      "target_matches": true,
+      "measurement_quality_ok": true,
+      "reps_unique": true,
+      "measurement_valid_matches": true,
+      "raw_recomputed": true
+    },
+    {
+      "coordinate": [
+        "https",
+        "proxy-close",
+        65536,
+        128
+      ],
+      "ratio": 1.2535015002419045,
+      "ratio_ok": true,
+      "target_matches": true,
+      "measurement_quality_ok": true,
+      "reps_unique": true,
+      "measurement_valid_matches": true,
+      "raw_recomputed": true
+    },
+    {
+      "coordinate": [
+        "https",
+        "proxy-keepalive",
+        65536,
+        1
+      ],
+      "ratio": 0.974467340204628,
+      "ratio_ok": false,
+      "target_matches": true,
+      "measurement_quality_ok": true,
+      "reps_unique": true,
+      "measurement_valid_matches": true,
+      "raw_recomputed": true
+    },
+    {
+      "coordinate": [
+        "https",
+        "proxy-keepalive",
+        65536,
+        32
+      ],
+      "ratio": 1.2969477417864,
+      "ratio_ok": true,
+      "target_matches": true,
+      "measurement_quality_ok": true,
+      "reps_unique": true,
+      "measurement_valid_matches": true,
+      "raw_recomputed": true
+    },
+    {
+      "coordinate": [
+        "https",
+        "proxy-keepalive",
+        65536,
+        128
+      ],
+      "ratio": 1.2784848017103354,
+      "ratio_ok": true,
+      "target_matches": true,
+      "measurement_quality_ok": true,
+      "reps_unique": true,
+      "measurement_valid_matches": true,
+      "raw_recomputed": true
+    },
+    {
+      "coordinate": [
+        "https",
+        "static-close",
+        1048576,
+        1
+      ],
+      "ratio": 0.012341402223276605,
+      "ratio_ok": false,
+      "target_matches": true,
+      "measurement_quality_ok": true,
+      "reps_unique": true,
+      "measurement_valid_matches": true,
+      "raw_recomputed": true
+    },
+    {
+      "coordinate": [
+        "https",
+        "static-close",
+        1048576,
+        32
+      ],
+      "ratio": 1.0894856669326434,
+      "ratio_ok": false,
+      "target_matches": true,
+      "measurement_quality_ok": true,
+      "reps_unique": true,
+      "measurement_valid_matches": true,
+      "raw_recomputed": true
+    },
+    {
+      "coordinate": [
+        "https",
+        "static-close",
+        1048576,
+        128
+      ],
+      "ratio": 0.9136151565113936,
+      "ratio_ok": false,
+      "target_matches": true,
+      "measurement_quality_ok": true,
+      "reps_unique": true,
+      "measurement_valid_matches": true,
+      "raw_recomputed": true
+    },
+    {
+      "coordinate": [
+        "https",
+        "static-keepalive",
+        1048576,
+        1
+      ],
+      "ratio": 1.1779778868301019,
+      "ratio_ok": true,
+      "target_matches": true,
+      "measurement_quality_ok": true,
+      "reps_unique": true,
+      "measurement_valid_matches": true,
+      "raw_recomputed": true
+    },
+    {
+      "coordinate": [
+        "https",
+        "static-keepalive",
+        1048576,
+        32
+      ],
+      "ratio": 1.351325690327597,
+      "ratio_ok": true,
+      "target_matches": true,
+      "measurement_quality_ok": true,
+      "reps_unique": true,
+      "measurement_valid_matches": true,
+      "raw_recomputed": true
+    },
+    {
+      "coordinate": [
+        "https",
+        "static-keepalive",
+        1048576,
+        128
+      ],
+      "ratio": 1.2776866601380175,
+      "ratio_ok": true,
+      "target_matches": true,
+      "measurement_quality_ok": true,
+      "reps_unique": true,
+      "measurement_valid_matches": true,
+      "raw_recomputed": true
+    },
+    {
+      "coordinate": [
+        "https",
+        "proxy-close",
+        1048576,
+        1
+      ],
+      "ratio": 1.0143328428522005,
+      "ratio_ok": false,
+      "target_matches": true,
+      "measurement_quality_ok": true,
+      "reps_unique": true,
+      "measurement_valid_matches": true,
+      "raw_recomputed": true
+    },
+    {
+      "coordinate": [
+        "https",
+        "proxy-close",
+        1048576,
+        32
+      ],
+      "ratio": 0.8793385101116209,
+      "ratio_ok": false,
+      "target_matches": true,
+      "measurement_quality_ok": true,
+      "reps_unique": true,
+      "measurement_valid_matches": true,
+      "raw_recomputed": true
+    },
+    {
+      "coordinate": [
+        "https",
+        "proxy-close",
+        1048576,
+        128
+      ],
+      "ratio": 0.776028717332696,
+      "ratio_ok": false,
+      "target_matches": true,
+      "measurement_quality_ok": true,
+      "reps_unique": true,
+      "measurement_valid_matches": true,
+      "raw_recomputed": true
+    },
+    {
+      "coordinate": [
+        "https",
+        "proxy-keepalive",
+        1048576,
+        1
+      ],
+      "ratio": 0.9295172920384535,
+      "ratio_ok": false,
+      "target_matches": true,
+      "measurement_quality_ok": true,
+      "reps_unique": true,
+      "measurement_valid_matches": true,
+      "raw_recomputed": true
+    },
+    {
+      "coordinate": [
+        "https",
+        "proxy-keepalive",
+        1048576,
+        32
+      ],
+      "ratio": 0.8922114626524562,
+      "ratio_ok": false,
+      "target_matches": true,
+      "measurement_quality_ok": true,
+      "reps_unique": true,
+      "measurement_valid_matches": true,
+      "raw_recomputed": true
+    },
+    {
+      "coordinate": [
+        "https",
+        "proxy-keepalive",
+        1048576,
+        128
+      ],
+      "ratio": 0.884864206863295,
+      "ratio_ok": false,
+      "target_matches": true,
+      "measurement_quality_ok": true,
+      "reps_unique": true,
+      "measurement_valid_matches": true,
+      "raw_recomputed": true
+    }
+  ],
+  "problems": []
+}
