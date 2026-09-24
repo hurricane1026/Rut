@@ -745,7 +745,7 @@ add_test(NAME test_envoy_parser COMMAND test_envoy_parser)
 set_tests_properties(test_envoy_parser PROPERTIES LABELS "unit;envoy;compiler")
 
 add_executable(test_envoy_convert test_envoy_convert.cc ${PROJECT_SOURCE_DIR}/src/placement_new.cc)
-target_link_libraries(test_envoy_convert rut_envoy)
+target_link_libraries(test_envoy_convert rut_envoy rut_compiler rut_runtime)
 target_include_directories(test_envoy_convert PRIVATE
     ${PROJECT_SOURCE_DIR}/include
     ${PROJECT_SOURCE_DIR}/testing

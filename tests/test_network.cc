@@ -21544,6 +21544,165 @@ TEST(unmatched_local_response,
     CHECK_EQ(epoch.epoch.load(std::memory_order_acquire), 2u);
 }
 
+// Envoy H1 local-reply layouts (envoy-pr-plan.md PR5): `header_order`
+// spec/profile validity table, config-copy ownership of the new field, and a
+// regression check that nginx's 502 contract is untouched.
+TEST(unmatched_local_response, envoy_header_order_spec_profile_validity_table) {
+    // strict_local_response: header_order x status x content_type x body.
+    struct LocalCase {
+        u16 status;
+        StrictLocalResponseHeaderOrder header_order;
+        bool has_content_type;
+        bool has_body;
+        bool expect_valid;
+    };
+    const LocalCase local_cases[] = {
+        // Synthesized (today's contract) is unaffected either way.
+        {404, StrictLocalResponseHeaderOrder::Synthesized, true, true, true},
+        {404, StrictLocalResponseHeaderOrder::Synthesized, false, true, false},
+        // date_server_length: 4xx/5xx, no content-type, empty body only.
+        {404, StrictLocalResponseHeaderOrder::DateServerLength, false, false, true},
+        {404, StrictLocalResponseHeaderOrder::DateServerLength, true, false, false},
+        {404, StrictLocalResponseHeaderOrder::DateServerLength, false, true, false},
+        {200, StrictLocalResponseHeaderOrder::DateServerLength, false, false, false},
+        // length_type_date_server: follows the LegacyError (content-type
+        // required) rules on a 4xx/5xx status.
+        {503, StrictLocalResponseHeaderOrder::LengthTypeDateServer, true, true, true},
+        {503, StrictLocalResponseHeaderOrder::LengthTypeDateServer, false, true, false},
+        {200, StrictLocalResponseHeaderOrder::LengthTypeDateServer, true, true, false},
+    };
+    for (const auto& c : local_cases) {
+        StrictLocalResponsePolicySpec policy{};
+        policy.version = StrictLocalResponseVersion::Http11;
+        policy.status_code = c.status;
+        policy.date = StrictLocalResponseDate::Current;
+        policy.connection = StrictLocalResponseConnection::Request;
+        policy.head_mode = StrictLocalResponseHeadMode::SuppressBody;
+        policy.header_order = c.header_order;
+        policy.reason = lit_str("Reason");
+        policy.server = lit_str("envoy");
+        if (c.has_content_type) policy.content_type = lit_str("text/plain");
+        if (c.has_body) policy.body = lit_str("x");
+        CHECK_EQ(strict_local_response_policy_spec_valid(policy), c.expect_valid);
+    }
+
+    // failure_policy: header_order x status x body-empty.
+    struct FailureCase {
+        u16 status;
+        FailurePolicyHeaderOrder header_order;
+        bool empty_body;
+        bool expect_valid;
+        bool expect_timeout_valid;
+    };
+    const FailureCase failure_cases[] = {
+        // nginx's 502 contract: unchanged, Synthesized only.
+        {502, FailurePolicyHeaderOrder::Synthesized, false, true, true},
+        {502, FailurePolicyHeaderOrder::LengthTypeDateServer, false, false, false},
+        // 503 is admitted only with the Envoy layout and a non-empty body.
+        {503, FailurePolicyHeaderOrder::LengthTypeDateServer, false, true, false},
+        {503, FailurePolicyHeaderOrder::LengthTypeDateServer, true, false, false},
+        {503, FailurePolicyHeaderOrder::Synthesized, false, false, true},
+        // 504 is never valid on the default-failure role; the timeout role
+        // still spans 400..599 but stays Synthesized-only.
+        {504, FailurePolicyHeaderOrder::Synthesized, false, false, true},
+        {504, FailurePolicyHeaderOrder::LengthTypeDateServer, false, false, false},
+    };
+    for (const auto& c : failure_cases) {
+        ForwardFailurePolicySpec policy{};
+        policy.version = ForwardFailurePolicyVersion::Http11;
+        policy.status_code = c.status;
+        policy.date = ForwardFailurePolicyDate::Current;
+        policy.connection = ForwardFailurePolicyConnection::Request;
+        policy.head_mode = FailurePolicyHeadMode::Reject;
+        policy.header_order = c.header_order;
+        policy.reason = lit_str("Reason");
+        policy.content_type = lit_str("text/plain");
+        policy.server = lit_str("envoy");
+        policy.body = c.empty_body ? Str{} : lit_str("x");
+        CHECK_EQ(forward_failure_policy_spec_valid(policy), c.expect_valid);
+        CHECK_EQ(forward_timeout_failure_policy_spec_valid(policy), c.expect_timeout_valid);
+        // The shared table predicate admits an entry valid under either role.
+        CHECK_EQ(forward_failure_policy_table_spec_valid(policy),
+                 c.expect_valid || c.expect_timeout_valid);
+    }
+}
+
+TEST(unmatched_local_response, envoy_header_order_survives_config_copy_and_502_stays_synthesized) {
+    // `RouteConfig::add_failure_policy` (route_table.h) copies `header_order`
+    // field by field into the owned table; verify it round-trips.
+    RouteConfig config{};
+    ForwardFailurePolicySpec envoy_failure{};
+    envoy_failure.version = ForwardFailurePolicyVersion::Http11;
+    envoy_failure.status_code = 503;
+    envoy_failure.header_order = FailurePolicyHeaderOrder::LengthTypeDateServer;
+    envoy_failure.date = ForwardFailurePolicyDate::Current;
+    envoy_failure.connection = ForwardFailurePolicyConnection::Request;
+    envoy_failure.head_mode = FailurePolicyHeadMode::Reject;
+    envoy_failure.reason = lit_str("Service Unavailable");
+    envoy_failure.content_type = lit_str("text/plain");
+    envoy_failure.server = lit_str("envoy");
+    envoy_failure.body = lit_str("upstream connect error");
+    const u16 envoy_id = config.add_failure_policy(envoy_failure);
+    REQUIRE_EQ(envoy_id, 1u);
+    CHECK(config.failure_policies[envoy_id - 1].header_order ==
+          FailurePolicyHeaderOrder::LengthTypeDateServer);
+    CHECK(admitted_forward_failure_policy_valid(config.failure_policies[envoy_id - 1]));
+
+    // A second, byte-identical policy dedups to the same id (spec_equal now
+    // compares header_order too, so this also proves dedup didn't regress).
+    CHECK_EQ(config.add_failure_policy(envoy_failure), envoy_id);
+
+    // nginx's default 502 path is untouched: Synthesized-only, unaffected by
+    // the Envoy addition above.
+    ForwardFailurePolicySpec nginx_failure{};
+    nginx_failure.version = ForwardFailurePolicyVersion::Http11;
+    nginx_failure.status_code = 502;
+    nginx_failure.date = ForwardFailurePolicyDate::Current;
+    nginx_failure.connection = ForwardFailurePolicyConnection::Request;
+    nginx_failure.head_mode = FailurePolicyHeadMode::Reject;
+    nginx_failure.reason = lit_str("Bad Gateway");
+    nginx_failure.content_type = lit_str("text/plain");
+    nginx_failure.server = lit_str("nginx");
+    nginx_failure.body = lit_str("legacy");
+    const u16 nginx_id = config.add_failure_policy(nginx_failure);
+    REQUIRE_EQ(nginx_id, 2u);
+    CHECK(config.failure_policies[nginx_id - 1].header_order ==
+          FailurePolicyHeaderOrder::Synthesized);
+
+    // Forcing the Envoy layout onto a 502 policy is rejected outright: it
+    // never reaches the owned table (nginx's contract stays closed).
+    ForwardFailurePolicySpec forged_502 = nginx_failure;
+    forged_502.header_order = FailurePolicyHeaderOrder::LengthTypeDateServer;
+    CHECK_EQ(config.add_failure_policy(forged_502), 0u);
+
+    // strict_local_response: the DateServerLength no-route 404 also survives
+    // the owned-table copy path (`copy_strict_local_response_table_from_owned`).
+    StrictLocalResponsePolicySpec envoy_404{};
+    envoy_404.version = StrictLocalResponseVersion::Http11;
+    envoy_404.status_code = 404;
+    envoy_404.date = StrictLocalResponseDate::Current;
+    envoy_404.connection = StrictLocalResponseConnection::Request;
+    envoy_404.head_mode = StrictLocalResponseHeadMode::SuppressBody;
+    envoy_404.header_order = StrictLocalResponseHeaderOrder::DateServerLength;
+    envoy_404.reason = lit_str("Not Found");
+    envoy_404.server = lit_str("envoy");
+    u16 unmatched[kStrictLocalResponseMethodSlots]{};
+    unmatched[kRouteMethodAny] = 1;
+    u16 pre_route[kStrictLocalResponseMethodSlots]{};
+    ExactStrictLocalResponseBinding exact[kMaxExactStrictLocalResponseBindings]{};
+    auto source = std::make_unique<RouteConfig>();
+    REQUIRE(source->install_strict_local_response_table_with_pre_route(
+        &envoy_404, 1, pre_route, unmatched, exact, 0));
+    REQUIRE(source->strict_local_response_table_is_valid());
+
+    auto copied = std::make_unique<RouteConfig>();
+    REQUIRE(copied->copy_strict_local_response_table_from_owned(*source));
+    REQUIRE(copied->strict_local_response_table_is_valid());
+    REQUIRE_EQ(copied->strict_local_response_policy_count, 1u);
+    CHECK(copied->strict_local_response_policies[0].header_order ==
+          StrictLocalResponseHeaderOrder::DateServerLength);
+}
+
 TEST(unmatched_local_response, generic_serializer_preserves_failure_policy_wire) {
     Connection conn{};
     u8 recv[64]{}, send[1024]{};
@@ -21734,7 +21893,10 @@ TEST(unmatched_local_response,
     forged.head_mode = StrictLocalResponseHeadMode::Reject;
     rejects(forged);
     forged = policy;
-    forged.reserved1 = 1;
+    forged.header_order = StrictLocalResponseHeaderOrder::DateServerLength;
+    rejects(forged);
+    forged = policy;
+    forged.header_order = StrictLocalResponseHeaderOrder::LengthTypeDateServer;
     rejects(forged);
     forged = policy;
     forged.reason = {"Not Content", 11};

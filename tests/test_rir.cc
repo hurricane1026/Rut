@@ -2180,7 +2180,7 @@ TEST(RirVerifier, NoContent204PublicAndInternalVerificationRequireExactTuple) {
     forged.reserved0 = 1;
     rejects(forged);
     forged = policy;
-    forged.reserved1 = 1;
+    forged.header_order = StrictLocalResponseHeaderOrder::DateServerLength;
     rejects(forged);
 
     auto bad_id = module_with(policy);

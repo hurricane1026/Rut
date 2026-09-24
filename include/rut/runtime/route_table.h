@@ -897,7 +897,7 @@ private:
         dst.date = policy.date;
         dst.connection = policy.connection;
         dst.head_mode = policy.head_mode;
-        dst.reserved1 = policy.reserved1;
+        dst.header_order = policy.header_order;
         copy(policy.reason, dst.reason);
         copy(policy.content_type, dst.content_type);
         copy(policy.server, dst.server);
@@ -1023,7 +1023,7 @@ private:
             dst.date = src.date;
             dst.connection = src.connection;
             dst.head_mode = src.head_mode;
-            dst.reserved1 = src.reserved1;
+            dst.header_order = src.header_order;
             dst.reason = {strict_local_response_bytes + offsets[i][0], src.reason.len};
             dst.content_type = {strict_local_response_bytes + offsets[i][1], src.content_type.len};
             dst.server = {strict_local_response_bytes + offsets[i][2], src.server.len};
@@ -1779,6 +1779,7 @@ public:
         dst.date = policy.date;
         dst.connection = policy.connection;
         dst.head_mode = policy.head_mode;
+        dst.header_order = policy.header_order;
         copy(policy.reason, dst.reason);
         copy(policy.content_type, dst.content_type);
         copy(policy.server, dst.server);

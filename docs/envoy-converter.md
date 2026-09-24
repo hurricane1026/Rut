@@ -306,16 +306,21 @@ folded into the golden below and into the parser/converter implementation:
    dependency, see "milestone-S" below), and
    `x-envoy-expected-rq-timeout-ms` has no RUT equivalent at all (it is
    removed by `suppress_envoy_headers: true`, also below).
-4. `failure_policy.status` must be exactly 502
+4. `failure_policy.status` was exactly 502
    (`forward_failure_policy_spec_valid`, `admitted_forward_failure_policy_valid`)
-   until the `local_reply_envoy_h1` capability admits 503 with the Envoy
-   connect-failure layout. Envoy's connect failure is a 503, not a 502, so
-   the milestone's `failure_policy` is a capability dependency, not a
-   same-shape substitution.
-5. `local_response(...)` requires all 9 fields, including a non-empty
+   until the `local_reply_envoy_h1` capability (landed, PR5) admitted 503
+   with the Envoy connect-failure layout
+   (`header_order: "length_type_date_server"`): `content-length,
+   content-type, date, server, [connection: close]`, plus the oracle's
+   exact 98-byte body. 502 stays exactly the prior Synthesized-only
+   contract, so nginx's behavior is untouched.
+5. `local_response(...)` required all 9 fields, including a non-empty
    `content_type` for 4xx/5xx statuses. Envoy's no-route 404 has no
-   `content-type`, so the unmatched 404 is also a capability dependency
-   rather than an emittable `local_response` today.
+   `content-type`; `local_reply_envoy_h1` (landed, PR5) added the optional
+   `header_names`/`connection_header`/`header_order` trio, and
+   `header_order: "date_server_length"` inverts the `content_type`
+   requirement (it must be absent) for the empty-body no-route shape:
+   `date, server, [connection: close,] content-length: 0`.
 
 ## milestone-S: the first fully specified shape
 
@@ -337,28 +342,31 @@ explicitly:
   implicit 15s route timeout default and makes `response_read_timeout`
   unnecessary for this milestone.
 
-Milestone-S is still capability-gated on everything else (request header
+Milestone-S was capability-gated on everything else (request header
 casing/host preservation, response header order, and the local-reply
-layouts); it only removes the two defaults that would otherwise make no
-input convertible before those capabilities land. Bootstraps that omit
-either field, or that set a non-zero `timeout`, remain `BLOCKED_BY_RUT` with
+layouts) until PR3 (`request_envoy_h1`), PR4 (`response_envoy_h1`) and PR5
+(`local_reply_envoy_h1`) landed; `rut::envoy::kShippedRutCapabilities` is now
+all `true`, and `rut-envoy-convert` converts the milestone-S bootstrap end to
+end. Bootstraps that omit `suppress_envoy_headers: true` or a `timeout: "0s"`
+route action, or that set a non-zero `timeout`, remain `BLOCKED_BY_RUT` with
 a diagnostic naming exactly what to change (see "Capability validation"
-below).
+below); those two defaults are Envoy-real knobs the bootstrap itself must set
+(see D1), not a Rut-side gap.
 
 ## Lowering shape
 
 The milestone-S bootstrap (the accepted-JSON milestone above, plus
-`suppress_envoy_headers: true` and `timeout: "0s"`) lowers to the RUT below
-once every capability in `rut::envoy::RutCapabilities` is available. The
-shipped converter (`rut::envoy::kShippedRutCapabilities`: `request_envoy_h1`
-and `response_envoy_h1` true, `local_reply_envoy_h1` still false) fails
-closed with a `BLOCKED_BY_RUT` diagnostic naming the missing
-`local_reply_envoy_h1` capability instead of emitting this text; the
-exact bytes are pinned in `tests/fixtures/envoy_milestone_s.inc` and checked
-byte for byte by `tests/test_envoy_convert.cc`
-(`api_all_capabilities_matches_golden`). Values shown here (the connect-failure
-body, in particular) are provisional pending the pinned Envoy oracle (PR2)
-and are marked `// PROVISIONAL: reconcile with oracle` at their source.
+`suppress_envoy_headers: true` and `timeout: "0s"`) lowers to the RUT below.
+`rut::envoy::kShippedRutCapabilities` is now all `true` (PR5), so the shipped
+`rut-envoy-convert` CLI emits exactly this text for the milestone-S bootstrap
+(`cli_milestone_s_converts`) instead of failing closed. The exact bytes are
+pinned in `tests/fixtures/envoy_milestone_s.inc` and checked byte for byte by
+`tests/test_envoy_convert.cc` (`api_all_capabilities_matches_golden`,
+`cli_milestone_s_converts`); `golden_compiles` additionally proves the golden
+lexes, parses, analyzes, and lowers to RIR. The connect-failure body below is
+the pinned Envoy oracle's exact 98 bytes
+(`tests/fixtures/envoy_oracle_milestone_s.inc`,
+`kEnvoyOracle_connect_failure_downstream`), not a placeholder.
 
 ```rut
 listen :8080
@@ -403,7 +411,7 @@ route HEAD "/" {
             header_names: "lowercase",
             header_order: "length_type_date_server",
             head_mode: "suppress_body",
-            body: b"<kEnvoyConnectFailureBody, PROVISIONAL>"
+            body: b"upstream connect error or disconnect/reset before headers. reset reason: remote connection failure"
         }
     )
 }
@@ -437,8 +445,13 @@ existing value. The six checks, in order (first failure wins), are:
    must be available.
 
 Each of 1-3 is a plain modeling gap (the bootstrap can be edited to satisfy
-it); each of 4-6 is a Rut-side capability gap tracked as a separate PR (see
-the project plan) and cannot be worked around from the bootstrap.
+it); each of 4-6 was a Rut-side capability gap tracked as a separate PR (see
+the project plan) and could not be worked around from the bootstrap. All
+three (PR3, PR4, PR5) have landed and `kShippedRutCapabilities` sets all
+three fields `true`, so checks 4-6 pass unconditionally in the shipped
+binary; the six-check gate itself, and the `RutCapabilities` override used by
+tests to pin the golden ahead of a capability landing, remain in place for
+future capability additions.
 
 Not every Envoy-vs-Rut behavioral difference belongs in this list. This gate
 is about configuration semantics: whether the bootstrap can be lowered at all.

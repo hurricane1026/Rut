@@ -101,6 +101,21 @@ enum class StrictLocalResponseProfile : u8 {
     Representation200 = 1,
     LegacyError = 2,
     NoContent204 = 3,
+    // Envoy H1 no-route 404: 4xx/5xx, empty body, no content-type, the
+    // lowercase `date, server, connection?, content-length: 0` layout.
+    EmptyError = 4,
+};
+
+// Envoy H1 local-reply layouts (docs/envoy-converter.md; envoy-pr-plan.md PR5).
+// `Synthesized` is today's nginx-compatible fixed order and is the only value
+// `Representation200`/`NoContent204` ever admit. `DateServerLength` is the
+// empty-body no-route shape; `LengthTypeDateServer` is the bodied shape (e.g.
+// a 503 connect failure). Both are closed to the LegacyError (4xx/5xx) base
+// profile only; see `strict_local_response_policy_profile`.
+enum class StrictLocalResponseHeaderOrder : u8 {
+    Synthesized = 0,
+    DateServerLength = 1,
+    LengthTypeDateServer = 2,
 };
 
 struct StrictLocalResponsePolicySpec {
@@ -110,7 +125,7 @@ struct StrictLocalResponsePolicySpec {
     StrictLocalResponseDate date = StrictLocalResponseDate::Invalid;
     StrictLocalResponseConnection connection = StrictLocalResponseConnection::Invalid;
     StrictLocalResponseHeadMode head_mode = StrictLocalResponseHeadMode::Invalid;
-    u8 reserved1 = 0;
+    StrictLocalResponseHeaderOrder header_order = StrictLocalResponseHeaderOrder::Synthesized;
     Str reason{};
     Str content_type{};
     Str server{};
@@ -124,7 +139,7 @@ static_assert(offsetof(StrictLocalResponsePolicySpec, status_code) == 2);
 static_assert(offsetof(StrictLocalResponsePolicySpec, date) == 4);
 static_assert(offsetof(StrictLocalResponsePolicySpec, connection) == 5);
 static_assert(offsetof(StrictLocalResponsePolicySpec, head_mode) == 6);
-static_assert(offsetof(StrictLocalResponsePolicySpec, reserved1) == 7);
+static_assert(offsetof(StrictLocalResponsePolicySpec, header_order) == 7);
 static_assert(offsetof(StrictLocalResponsePolicySpec, reason) == 8);
 static_assert(offsetof(StrictLocalResponsePolicySpec, content_type) == 24);
 static_assert(offsetof(StrictLocalResponsePolicySpec, server) == 40);
@@ -167,8 +182,7 @@ constexpr bool strict_local_response_status_supported(u16 status_code) {
 inline StrictLocalResponseProfile strict_local_response_policy_profile(
     const StrictLocalResponsePolicySpec& policy) {
     const auto profile = strict_local_response_profile(policy.status_code);
-    if (policy.reserved0 != 0 || policy.reserved1 != 0 ||
-        policy.version != StrictLocalResponseVersion::Http11 ||
+    if (policy.reserved0 != 0 || policy.version != StrictLocalResponseVersion::Http11 ||
         policy.date != StrictLocalResponseDate::Current ||
         policy.connection != StrictLocalResponseConnection::Request ||
         (policy.head_mode != StrictLocalResponseHeadMode::Reject &&
@@ -177,20 +191,35 @@ inline StrictLocalResponseProfile strict_local_response_policy_profile(
         !strict_local_response_safe_text(policy.server, kMaxStrictLocalResponseServerLen))
         return StrictLocalResponseProfile::Invalid;
     if (policy.status_code == 204) {
-        if (!policy.reason.eq(lit_str("No Content")) ||
+        if (policy.header_order != StrictLocalResponseHeaderOrder::Synthesized ||
+            !policy.reason.eq(lit_str("No Content")) ||
             policy.head_mode != StrictLocalResponseHeadMode::SuppressBody ||
             policy.content_type.len != 0 || policy.body.len != 0)
             return StrictLocalResponseProfile::Invalid;
         return StrictLocalResponseProfile::NoContent204;
     }
-    if (profile == StrictLocalResponseProfile::Invalid ||
-        !strict_local_response_content_type_valid(policy.content_type) ||
+    if (profile == StrictLocalResponseProfile::Invalid) return StrictLocalResponseProfile::Invalid;
+    // Envoy H1 no-route 404: closed to the LegacyError (4xx/5xx) base profile,
+    // empty body, no content-type at all.
+    if (policy.header_order == StrictLocalResponseHeaderOrder::DateServerLength) {
+        if (profile != StrictLocalResponseProfile::LegacyError || policy.content_type.len != 0 ||
+            policy.body.len != 0)
+            return StrictLocalResponseProfile::Invalid;
+        return StrictLocalResponseProfile::EmptyError;
+    }
+    if (!strict_local_response_content_type_valid(policy.content_type) ||
         !strict_local_response_body_valid(policy.body))
         return StrictLocalResponseProfile::Invalid;
-    if (profile == StrictLocalResponseProfile::Representation200 &&
-        (!policy.reason.eq(lit_str("OK")) || !policy.content_type.eq(lit_str("text/plain")) ||
-         policy.head_mode != StrictLocalResponseHeadMode::SuppressBody || policy.body.len == 0))
-        return StrictLocalResponseProfile::Invalid;
+    if (profile == StrictLocalResponseProfile::Representation200) {
+        if (policy.header_order != StrictLocalResponseHeaderOrder::Synthesized ||
+            !policy.reason.eq(lit_str("OK")) || !policy.content_type.eq(lit_str("text/plain")) ||
+            policy.head_mode != StrictLocalResponseHeadMode::SuppressBody || policy.body.len == 0)
+            return StrictLocalResponseProfile::Invalid;
+        return StrictLocalResponseProfile::Representation200;
+    }
+    // profile == LegacyError here: header_order Synthesized (today's contract)
+    // or LengthTypeDateServer (the bodied Envoy layout) are both admitted; the
+    // wire layout is selected by header_order alone at serialization time.
     return profile;
 }
 
@@ -198,7 +227,8 @@ inline bool strict_local_response_policy_spec_valid(const StrictLocalResponsePol
     const auto profile = strict_local_response_policy_profile(policy);
     return profile == StrictLocalResponseProfile::Representation200 ||
            profile == StrictLocalResponseProfile::LegacyError ||
-           profile == StrictLocalResponseProfile::NoContent204;
+           profile == StrictLocalResponseProfile::NoContent204 ||
+           profile == StrictLocalResponseProfile::EmptyError;
 }
 
 // Retained explicit entry point for the staged compiler/config propagation
@@ -211,9 +241,10 @@ inline bool strict_local_response_policy_spec_valid_for_internal_propagation(
 
 inline bool strict_local_response_policy_spec_equal(const StrictLocalResponsePolicySpec& a,
                                                     const StrictLocalResponsePolicySpec& b) {
-    if (a.reserved0 != 0 || a.reserved1 != 0 || b.reserved0 != 0 || b.reserved1 != 0) return false;
+    if (a.reserved0 != 0 || b.reserved0 != 0) return false;
     return a.version == b.version && a.status_code == b.status_code && a.date == b.date &&
-           a.connection == b.connection && a.head_mode == b.head_mode && a.reason.eq(b.reason) &&
+           a.connection == b.connection && a.head_mode == b.head_mode &&
+           a.header_order == b.header_order && a.reason.eq(b.reason) &&
            a.content_type.eq(b.content_type) && a.server.eq(b.server) && a.body.eq(b.body);
 }
 
