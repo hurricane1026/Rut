@@ -2034,6 +2034,10 @@ struct Parser {
                         bool have_content_length_position = false;
                         bool have_retained_header_value = false;
                         bool retained_header_value_trim_sp_preserve_htab = false;
+                        bool have_header_names = false;
+                        bool have_forwarded_proto = false;
+                        bool host_preserve = false;
+                        bool strip_found[6] = {};
                         while (true) {
                             auto field = expect(TokenType::Ident);
                             if (!field) return core::make_unexpected(field.error());
@@ -2055,16 +2059,37 @@ struct Parser {
                                 auto value = expect(TokenType::StringLit);
                                 if (!value) return core::make_unexpected(value.error());
                                 const Str v = value.value()->text;
-                                if (!v.eq({"upstream", 8}))
+                                if (v.eq({"preserve", 8})) {
+                                    host_preserve = true;
+                                } else if (!v.eq({"upstream", 8})) {
                                     return frontend_error(FrontendError::UnsupportedSyntax,
                                                           span_from(*value.value()),
                                                           v);
+                                }
                             } else if (field_name.eq({"connection", 10})) {
                                 seen = &have_connection;
                                 auto value = expect(TokenType::StringLit);
                                 if (!value) return core::make_unexpected(value.error());
                                 const Str v = value.value()->text;
                                 if (!v.eq({"omit", 4}))
+                                    return frontend_error(FrontendError::UnsupportedSyntax,
+                                                          span_from(*value.value()),
+                                                          v);
+                            } else if (field_name.eq({"header_names", 12})) {
+                                seen = &have_header_names;
+                                auto value = expect(TokenType::StringLit);
+                                if (!value) return core::make_unexpected(value.error());
+                                const Str v = value.value()->text;
+                                if (!v.eq({"lowercase", 9}))
+                                    return frontend_error(FrontendError::UnsupportedSyntax,
+                                                          span_from(*value.value()),
+                                                          v);
+                            } else if (field_name.eq({"forwarded_proto", 15})) {
+                                seen = &have_forwarded_proto;
+                                auto value = expect(TokenType::StringLit);
+                                if (!value) return core::make_unexpected(value.error());
+                                const Str v = value.value()->text;
+                                if (!v.eq({"http", 4}))
                                     return frontend_error(FrontendError::UnsupportedSyntax,
                                                           span_from(*value.value()),
                                                           v);
@@ -2091,10 +2116,16 @@ struct Parser {
                                 seen = &have_strip_headers;
                                 auto lbracket = expect(TokenType::LBracket);
                                 if (!lbracket) return core::make_unexpected(lbracket.error());
-                                static constexpr const char* kStrip[] = {
-                                    "Connection", "Keep-Alive", "TE", "Expect", "Upgrade"};
-                                bool found[5] = {};
-                                u32 count = 0;
+                                // The 6th name (Proxy-Connection) is gated by
+                                // `host: "preserve"`; validated once the full
+                                // object (and thus the host mode) is known, at
+                                // the closing brace below.
+                                static constexpr const char* kStrip[] = {"Connection",
+                                                                         "Keep-Alive",
+                                                                         "TE",
+                                                                         "Expect",
+                                                                         "Upgrade",
+                                                                         "Proxy-Connection"};
                                 if (cur().type == TokenType::RBracket)
                                     return frontend_error(FrontendError::UnsupportedSyntax,
                                                           span_from(cur()),
@@ -2102,8 +2133,8 @@ struct Parser {
                                 while (true) {
                                     auto item = expect(TokenType::StringLit);
                                     if (!item) return core::make_unexpected(item.error());
-                                    u32 match = 5;
-                                    for (u32 si = 0; si < 5; si++) {
+                                    u32 match = 6;
+                                    for (u32 si = 0; si < 6; si++) {
                                         if (item.value()->text.eq(
                                                 {kStrip[si],
                                                  static_cast<u32>(__builtin_strlen(kStrip[si]))})) {
@@ -2111,21 +2142,16 @@ struct Parser {
                                             break;
                                         }
                                     }
-                                    if (match == 5 || found[match] || count >= 5)
+                                    if (match == 6 || strip_found[match])
                                         return frontend_error(FrontendError::UnsupportedSyntax,
                                                               span_from(*item.value()),
                                                               item.value()->text);
-                                    found[match] = true;
-                                    count++;
+                                    strip_found[match] = true;
                                     if (!take(TokenType::Comma)) break;
                                     if (cur().type == TokenType::RBracket) break;
                                 }
                                 auto rbracket = expect(TokenType::RBracket);
                                 if (!rbracket) return core::make_unexpected(rbracket.error());
-                                if (count != 5)
-                                    return frontend_error(FrontendError::UnsupportedSyntax,
-                                                          span_from(*rbracket.value()),
-                                                          field_name);
                             } else {
                                 // The strip list is the only non-scalar field.
                                 return frontend_error(FrontendError::UnexpectedToken,
@@ -2151,8 +2177,32 @@ struct Parser {
                             return frontend_error(FrontendError::UnsupportedSyntax,
                                                   span_from(*rbrace.value()),
                                                   kw_text);
+                        // `host: "preserve"` is the only Envoy H1 combination:
+                        // header_names + forwarded_proto + the full six-name
+                        // strip list (including Proxy-Connection) are all
+                        // required, and the upstream-only fields are rejected.
+                        // `host: "upstream"` keeps today's closed contract:
+                        // header_names/forwarded_proto/Proxy-Connection are
+                        // rejected and exactly the original five strip names
+                        // are required.
+                        if (host_preserve) {
+                            if (!have_header_names || !have_forwarded_proto ||
+                                have_content_length_position || have_retained_header_value ||
+                                !strip_found[0] || !strip_found[1] || !strip_found[2] ||
+                                !strip_found[3] || !strip_found[4] || !strip_found[5])
+                                return frontend_error(FrontendError::UnsupportedSyntax,
+                                                      span_from(*rbrace.value()),
+                                                      kw_text);
+                        } else if (have_header_names || have_forwarded_proto || strip_found[5] ||
+                                   !strip_found[0] || !strip_found[1] || !strip_found[2] ||
+                                   !strip_found[3] || !strip_found[4]) {
+                            return frontend_error(FrontendError::UnsupportedSyntax,
+                                                  span_from(*rbrace.value()),
+                                                  kw_text);
+                        }
                         stmt.forward_request_policy_id = static_cast<u16>(
-                            retained_header_value_trim_sp_preserve_htab
+                            host_preserve ? RequestPolicyId::Http11PreserveHostLowercase
+                            : retained_header_value_trim_sp_preserve_htab
                                 ? RequestPolicyId::Http11FixedTrimSpPreserveHtab
                             : have_content_length_position
                                 ? RequestPolicyId::Http11FixedStripContentLengthAfterHost
