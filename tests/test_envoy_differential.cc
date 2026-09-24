@@ -1674,14 +1674,20 @@ CaseSpec connect_failure_case() {
 
 // The six cases envoy-pr-plan.md PR 6 requires byte-for-byte agreement on.
 // Shared by --pair-milestone-s (which also runs the four record-only cases)
-// and --self-test's RUT pass (which, per the plan, only needs the asserted
-// six against the committed oracle).
+// and --self-test's RUT pass (which only needs the asserted cases against
+// the committed oracle).
+// get_hop_by_hop, trace and options_star were record-only until CI run
+// 36069445967 showed their Envoy and RUT bytes equal; connect_authority stays
+// record-only because Envoy closes that connection and Rut does not.
 constexpr const char* kAssertedCaseNames[] = {"get_smoke",
                                               "get_upstream_date_server",
                                               "get_client_close",
                                               "head_smoke",
                                               "post_fixed",
-                                              "connect_failure"};
+                                              "connect_failure",
+                                              "get_hop_by_hop",
+                                              "trace",
+                                              "options_star"};
 
 bool is_asserted_case(const std::string& name) {
     for (const char* asserted : kAssertedCaseNames)
@@ -3428,7 +3434,7 @@ bool self_test_reserved_closed_port() {
 //
 // No docker needed: converts the milestone-S bootstrap, starts the real
 // `rut` binary against the in-process recording upstream on ephemeral
-// loopback ports, runs the six asserted cases, and compares them against
+// loopback ports, runs the asserted cases, and compares them against
 // the committed Envoy oracle fixture (tests/fixtures/envoy_oracle_milestone_s.inc,
 // date-normalized). This is the strongest local evidence for the pair logic
 // above that this environment (no docker) can produce.
@@ -3456,6 +3462,9 @@ const OracleCase kAssertedOracleCases[] = {
     RUT_ORACLE_CASE(head_smoke),
     RUT_ORACLE_CASE(post_fixed),
     RUT_ORACLE_CASE(connect_failure),
+    RUT_ORACLE_CASE(get_hop_by_hop),
+    RUT_ORACLE_CASE(trace),
+    RUT_ORACLE_CASE(options_star),
 };
 
 #undef RUT_ORACLE_CASE
