@@ -16,6 +16,7 @@
 
 namespace rut {
 
+struct SlicePool;
 struct ConnectionBase;              // forward declaration for wait() signature
 using Connection = ConnectionBase;  // alias (matches connection.h)
 
@@ -33,6 +34,7 @@ using Connection = ConnectionBase;  // alias (matches connection.h)
 // not used: submissions and enters may come from the spawned shard thread.
 //
 struct IoUringBackend {
+    SlicePool* response_pool = nullptr;
     // io_uring is async: the kernel may still access user buffers between
     // SQE submission and CQE completion. EventLoop uses this trait to
     // enable CQE-driven deferred slice reclamation (pending_ops tracking).
@@ -173,7 +175,10 @@ struct IoUringBackend {
     // Dedicated single submission point for the bounded explicit
     // first-response deadline.  It intentionally does not inherit the ordinary
     // recv path's idempotent/deferred-rearm semantics.
-    bool add_first_response_recv(i32 fd, u32 conn_id, u32 upstream_episode);
+    bool add_first_response_recv(i32 fd,
+                                 u32 conn_id,
+                                 u32 upstream_episode,
+                                 bool separate_body_ring = false);
 
     // Pause downstream recv while a send wait is pending.
     // Uses a silent cancel CQE so the event loop does not have to special-case it.

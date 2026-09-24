@@ -558,9 +558,10 @@ public:
         jit_code_ptr = nullptr;
         deferred_accept_count = 0;
         timer.init();
-        // Up to 5 slices per connection (lazy): recv + send + upstream_recv + the two
-        // WebSocket terminate-mode reassembly slices. Matches the io_uring loop.
-        auto pooled = pool.init(connection_capacity * 6, pool_prealloc);
+        // Reserve six ordinary slices and one complete bounded response chain
+        // per admitted connection. Storage remains lazy and shared by the shard.
+        auto pooled =
+            pool.init(SlicePool::capacity_for_connections(connection_capacity), pool_prealloc);
         if (!pooled) {
             destroy_slot_storage();
             return core::make_unexpected(pooled.error());

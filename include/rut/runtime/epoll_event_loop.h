@@ -366,10 +366,10 @@ public:
         epoch = nullptr;
         jit_code_ptr = nullptr;
         timer.init();
-        // Up to 5 slices per connection (all lazy, VA-reserved): recv + send +
-        // upstream_recv, plus the two WebSocket terminate-mode reassembly slices. Matches
-        // the io_uring loop so a terminate tunnel can't fail to arm under load.
-        auto pooled = pool.init(connection_capacity * 6, pool_prealloc);
+        // Reserve six ordinary slices and one complete bounded response chain
+        // per admitted connection. Storage is lazy and VA-reserved.
+        auto pooled =
+            pool.init(SlicePool::capacity_for_connections(connection_capacity), pool_prealloc);
         if (!pooled) {
             backend.shutdown();
             destroy_slot_storage();

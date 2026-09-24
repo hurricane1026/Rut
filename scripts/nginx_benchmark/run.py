@@ -101,6 +101,30 @@ def expected_body(work, body_size=None, native_streaming=False):
     return b"hello from nginx" if work == "static" else b"x" * 1024
 
 
+def canonical_native_static_response(raw):
+    head, body = raw.split(b"\r\n\r\n", 1)
+    lines = head.split(b"\r\n")
+    headers = {}
+    for line in lines[1:]:
+        key, value = line.split(b":", 1)
+        headers[key.lower()] = value.strip()
+    if headers.get(b"content-type") != b"text/plain; charset=utf-8":
+        raise ValueError("native static response has unexpected Content-Type")
+    # Engine identity and wall-clock metadata differ; all framing/content
+    # headers and the complete body must still match between engines.
+    headers.pop(b"server", None)
+    headers.pop(b"date", None)
+    return lines[0] + b"\r\n" + b"\r\n".join(
+        key + b": " + value for key, value in sorted(headers.items())
+    ) + b"\r\n\r\n" + body
+
+
+def preflight_request_count(body_size):
+    # Bound repeated full-body comparisons; retain three consecutive requests
+    # even for MiB bodies so keepalive reuse crosses more than one boundary.
+    return max(3, min(100, (1024 * 1024) // max(1, body_size)))
+
+
 def response(sock, work, close, keepalive_header="explicit", body_size=None,
              native_streaming=False, preflight_id=None):
     sock.sendall(request_bytes(work, close, keepalive_header, preflight_id))
@@ -115,12 +139,16 @@ def response(sock, work, close, keepalive_header="explicit", body_size=None,
     head, body = data.split(b"\r\n\r\n", 1)
     wanted = expected_body(work, body_size, native_streaming)
     length, server_close = response_head(head, len(wanted), native_streaming)
-    while len(body) < length:
-        chunk = sock.recv(4096)
+    chunks = [body]
+    received = len(body)
+    while received < length:
+        chunk = sock.recv(min(65536, length - received))
         if not chunk:
             raise ValueError("EOF before complete body")
-        body += chunk
-    if len(body) != length or body != wanted:
+        chunks.append(chunk)
+        received += len(chunk)
+    body = b"".join(chunks)
+    if received != length or body != wanted:
         raise ValueError("unexpected body")
     if (close or server_close) and sock.recv(1) != b"":
         raise ValueError("expected EOF after response")
@@ -199,7 +227,8 @@ class Harness:
         native_streaming = getattr(a, "proxy_profile", "converter-strict") == "native-streaming"
         if native_streaming:
             body_size = NATIVE_BODY_SIZE
-        if (body_size is not None and body_size > STATIC_BODY_LIMIT
+        if (getattr(a, "static_profile", "converter-return") == "converter-return"
+                and body_size is not None and body_size > STATIC_BODY_LIMIT
                 and any(scenario.startswith("static-") for scenario in a.scenarios)):
             raise ValueError(
                 f"unsupported static body: converter local_response is bounded to "
@@ -229,6 +258,7 @@ class Harness:
             "arguments": {
                 k: str(v) if isinstance(v, Path) else v for k, v in vars(a).items()
             },
+            "static_profile": getattr(a, "static_profile", "converter-return"),
             "proxy_profile": {
                 "name": getattr(a, "proxy_profile", "converter-strict"),
                 "body_size": body_size,
@@ -297,6 +327,29 @@ class Harness:
         ))
         works = sorted({scenario.split("-")[0] for scenario in a.scenarios})
         for work in works:
+            if work == "static" and getattr(a, "static_profile", "converter-return") == "native-body":
+                body = expected_body(work, body_size)
+                payloads = self.out / "payloads"
+                payloads.mkdir(exist_ok=True)
+                (payloads / "static").write_bytes(body)
+                listener = f"listen 127.0.0.1:{a.front_port}\n"
+                native = listener + 'route GET "/static" { return response(200, body: "' + body.decode() + '") }\n'
+                (self.out / "static.source.rut").write_text(native)
+                (self.out / "static.rut").write_text(native[len(listener):] if self.tls_context else native)
+                listen = f"listen 127.0.0.1:{a.front_port};"
+                if self.tls_context:
+                    listen = (f"listen {a.front_port} ssl; "
+                              "ssl_certificate /benchmark-cert.pem; ssl_certificate_key /benchmark-key.pem; "
+                              "ssl_protocols TLSv1.3; ssl_conf_command Ciphersuites TLS_AES_256_GCM_SHA384; "
+                              "ssl_ecdh_curve X25519; ssl_session_cache off;")
+                server = (f"server {{ {listen} keepalive_requests 1000000000; "
+                          'location = /static { root /benchmark-payloads; sendfile on; '
+                          'open_file_cache max=1 inactive=1h; open_file_cache_valid 1h; '
+                          'open_file_cache_min_uses 1; '
+                          'default_type "text/plain; charset=utf-8"; '
+                          'etag off; max_ranges 0; add_header Last-Modified ""; } }')
+                (self.out / "static-nginx.conf").write_text(self.nginx_config(server))
+                continue
             if native_streaming:
                 native = (f'listen 127.0.0.1:{a.front_port}\n'
                           f'upstream backend at "127.0.0.1:{a.origin_port}"\n'
@@ -341,8 +394,15 @@ class Harness:
             source = self.out / (work + ".conf")
             source.write_text(fragment)
             nginx_fragment = fragment
+            if work == "proxy" and body_size == 1024 * 1024:
+                nginx_fragment = nginx_fragment.replace(
+                    f"proxy_pass http://127.0.0.1:{a.origin_port};",
+                    f"proxy_pass http://127.0.0.1:{a.origin_port}; "
+                    "proxy_buffer_size 16k; proxy_buffers 8 16k; "
+                    "proxy_busy_buffers_size 32k;",
+                )
             if self.tls_context:
-                nginx_fragment = fragment.replace(
+                nginx_fragment = nginx_fragment.replace(
                     f"listen 127.0.0.1:{a.front_port};",
                     f"listen {a.front_port} ssl; "
                     "ssl_certificate /benchmark-cert.pem; ssl_certificate_key /benchmark-key.pem; "
@@ -484,10 +544,15 @@ class Harness:
         if native_streaming:
             self.validate_native_keepalive(work)
             return
+        requests = preflight_request_count(len(expected_body(work, getattr(self.args, "body_size", None))))
+        save_json(self.out / f"{self.active_label}-preflight.json", {
+            "requests_per_connection_mode": requests, "full_body_comparison": True,
+            "connection_modes": ["close", "keepalive"] if keepalive else ["close"],
+        })
         for close in [True, False] if keepalive else [True]:
             sock = None
             try:
-                for _ in range(100):
+                for _ in range(requests):
                     if sock is None:
                         sock = socket.create_connection(
                             ("127.0.0.1", self.args.front_port), timeout=3
@@ -506,10 +571,13 @@ class Harness:
                         False,
                         None,
                     )
+                    comparison = canonical_native_static_response(raw) if (
+                        work == "static" and getattr(self.args, "static_profile", "converter-return") == "native-body"
+                    ) else raw
                     key = (work, close)
-                    if key in self.references and self.references[key] != raw:
+                    if key in self.references and self.references[key] != comparison:
                         raise ValueError(f"response mismatch for {key}")
-                    self.references[key] = raw
+                    self.references[key] = comparison
                     (
                         self.out
                         / f"{work}-{'close' if close else 'keepalive'}-response.txt"
@@ -519,7 +587,7 @@ class Harness:
                         sock = None
                         if not close:
                             raise ValueError(
-                                "keepalive preflight closed before 100 requests"
+                                f"keepalive preflight closed before {requests} requests"
                             )
             finally:
                 if sock is not None:
@@ -756,6 +824,7 @@ class Harness:
                             result.update(
                                 workload=work,
                                 proxy_profile=getattr(self.args, "proxy_profile", "converter-strict"),
+                                static_profile=getattr(self.args, "static_profile", "converter-return"),
                                 transport="https" if self.tls_context else "http",
                                 body_size=len(expected_body(work, getattr(self.args, "body_size", None))),
                                 connection=mode,
@@ -925,6 +994,35 @@ def validate_proxy_profile(parser, args):
     args.body_size = NATIVE_BODY_SIZE
 
 
+def add_measurement_arguments(parser, full_duration):
+    parser.add_argument(
+        "--profile", choices=("acceptance", "quick", "full"), default="acceptance",
+        help="acceptance (default): 1s warmup, 5s measurement, 3 repeats; quick: smoke only; full: original sampling budget",
+    )
+    parser.add_argument("--duration", type=positive, help=f"measurement seconds (full: {full_duration}); overrides profile")
+    parser.add_argument("--warmup", type=positive, help="warmup seconds (full: 2); overrides profile")
+    parser.add_argument("--repeats", type=positive, help="repeats (full: 3); overrides profile")
+    parser.set_defaults(full_duration=full_duration)
+
+
+def resolve_measurement_arguments(args):
+    defaults = {"acceptance": (5, 1, 3), "quick": (2, 1, 1),
+                "full": (args.full_duration, 2, 3)}[args.profile]
+    for name, value in zip(("duration", "warmup", "repeats"), defaults):
+        if getattr(args, name) is None:
+            setattr(args, name, value)
+    del args.full_duration
+
+
+def print_measurement_budget(args, cells):
+    repeats = args.repeats if getattr(args, "mode", "benchmark") == "benchmark" else 1
+    seconds = cells * 2 * repeats * (args.warmup + args.duration)
+    print(f"{args.profile} profile: {cells} cells, {repeats} repeat(s), "
+          f"{args.warmup}s warmup + {args.duration}s measurement per engine; "
+          f"load budget {seconds}s ({seconds / 60:.1f} min), plus startup/validation/cleanup",
+          flush=True)
+
+
 def arguments():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--rut", type=Path, required=True)
@@ -950,6 +1048,8 @@ def arguments():
         help="explicit preserves the original workload; implicit uses HTTP/1.1 default persistence",
     )
     parser.add_argument("--body-size", type=positive, help="exact response body bytes (max 1 MiB); omitted preserves legacy bodies")
+    parser.add_argument("--static-profile", choices=("converter-return", "native-body"),
+                        default="converter-return", help="native-body compares a pinned Rut body with an nginx static file; separate from converter acceptance")
     parser.add_argument("--proxy-profile", choices=("converter-strict", "native-streaming"),
                         default="converter-strict", help="proxy implementation profile; default preserves converter behavior")
     parser.add_argument("--tls-cert", type=Path, help="PEM certificate with localhost SAN; enables HTTPS")
@@ -957,14 +1057,13 @@ def arguments():
     parser.add_argument("--front-port", type=int, default=8087)
     parser.add_argument("--origin-port", type=int, default=9087)
     parser.add_argument("--concurrency", nargs="+", type=positive, default=[1, 32, 128])
-    parser.add_argument("--duration", type=positive, default=8)
-    parser.add_argument("--warmup", type=positive, default=2)
-    parser.add_argument("--repeats", type=positive, default=3)
+    add_measurement_arguments(parser, full_duration=8)
     add_first_engine_argument(parser)
     parser.add_argument(
         "--scenarios", nargs="+", choices=SCENARIOS, default=list(SCENARIOS)
     )
     args = parser.parse_args()
+    resolve_measurement_arguments(args)
     if args.body_size is not None and args.body_size > 1048576:
         parser.error("body-size must be <= 1048576")
     validate_proxy_profile(parser, args)
@@ -1043,6 +1142,7 @@ def main():
     previous_sigterm = signal.signal(signal.SIGTERM, interrupt)
     try:
         harness = Harness(args)
+        print_measurement_budget(args, len(args.scenarios) * len(args.concurrency))
         harness.prepare()
         with harness.nginx(
             "origin", "origin.conf", args.origin_cpu, args.origin_port

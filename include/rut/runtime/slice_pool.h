@@ -32,6 +32,22 @@ namespace rut {
 struct SlicePool {
     static constexpr u32 kSliceSize = 16384;      // 16KB per slice
     static constexpr u32 kMaxCachedSlices = 256;  // At most 4 MiB idle retention per pool.
+    // A buffered response keeps its header/prefix slice separately and stores
+    // the remaining bounded body in whole SlicePool nodes. Keep this reserve
+    // with the pool sizing contract so every backend accounts for it equally.
+    static constexpr u32 kMaxBufferedResponseBody = 1u << 20;
+    static constexpr u32 kResponseBodyPayload = kSliceSize - sizeof(void*) - 2 * sizeof(u32);
+    static constexpr u32 kMaxBufferedResponseSlices =
+        (kMaxBufferedResponseBody + kResponseBodyPayload - 1) / kResponseBodyPayload;
+    static constexpr u32 kOrdinarySlicesPerConnection = 6;
+    static constexpr u32 kSlicesPerConnection =
+        kOrdinarySlicesPerConnection + kMaxBufferedResponseSlices;
+
+    static constexpr u32 capacity_for_connections(u32 connections) {
+        constexpr u32 kMaxU32 = 0xFFFFFFFFu;
+        if (connections > kMaxU32 / kSlicesPerConnection) return 0;
+        return connections * kSlicesPerConnection;
+    }
 
     u8* base = nullptr;         // mmap'd region: max_count * kSliceSize bytes
     u32* free_stack = nullptr;  // mmap'd: free slice indices

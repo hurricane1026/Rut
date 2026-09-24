@@ -396,7 +396,9 @@ inline void cache_registry_publish_config(const RouteConfig& cfg, const void* ow
 
 namespace detail {
 
-inline bool populate_verified_route_config(RouteConfig& cfg, const rir::Module& mod) {
+inline bool populate_verified_route_config(RouteConfig& cfg,
+                                           const rir::Module& mod,
+                                           bool retain_response_body_views = false) {
     // Bodies / header sets / routes must always start empty — there's
     // no "merge" semantics for those tables, and a non-zero count
     // would break the compile-time body_idx / headers_idx invariants.
@@ -590,7 +592,8 @@ inline bool populate_verified_route_config(RouteConfig& cfg, const rir::Module& 
     // feed the bytes straight through.
     for (u32 i = 0; i < mod.response_body_count; i++) {
         const auto& body = mod.response_bodies[i];
-        u16 idx = cfg.add_response_body(body.ptr, body.len);
+        u16 idx = retain_response_body_views ? cfg.add_response_body_view(body.ptr, body.len)
+                                             : cfg.add_response_body(body.ptr, body.len);
         if (idx == 0) return false;
         // Belt-and-suspenders: the 1-based index must match i+1 so
         // callers that packed body_idx at compile time still resolve
@@ -665,7 +668,11 @@ inline bool populate_verified_route_config(RouteConfig& cfg, const rir::Module& 
 
 }  // namespace detail
 
-inline bool populate_route_config(RouteConfig& cfg, const rir::Module& mod) {
+// retain_response_body_views requires the caller to pin the module/source until
+// every user of cfg has retired (the serving loader's LoadedProgram does this).
+inline bool populate_route_config(RouteConfig& cfg,
+                                  const rir::Module& mod,
+                                  bool retain_response_body_views = false) {
     if (!rir::verify_module(mod).ok) return false;
     std::unique_ptr<RouteConfig> strict_local_response_probe;
     if (module_has_strict_local_response_metadata(mod)) {
@@ -686,7 +693,8 @@ inline bool populate_route_config(RouteConfig& cfg, const rir::Module& mod) {
     std::unique_ptr<u8[]> before(new (std::nothrow) u8[sizeof(RouteConfig)]);
     if (!before) return false;
     __builtin_memcpy(before.get(), static_cast<const void*>(&cfg), sizeof(RouteConfig));
-    const bool populated = detail::populate_verified_route_config(cfg, mod);
+    const bool populated =
+        detail::populate_verified_route_config(cfg, mod, retain_response_body_views);
     const bool strict_copied =
         populated &&
         (!strict_local_response_probe ||

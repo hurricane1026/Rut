@@ -215,6 +215,7 @@ req.ctx.userId               // typed per-request context (user declares struct 
 
 // Response construction — names are literal; values may be runtime strings
 let resp = response(429)          // ✅ literal status
+return response(200, body: "static body") // ✅ configured local/static body, ≤ 1 MiB
 resp.set("Retry-After", "60")     // ✅ literal replace/dedupe
 resp.set("X-Request-Path", req.path) // ✅ dynamic value
 resp.remove("Server")             // ✅ literal delete
@@ -234,6 +235,12 @@ without `wait` or `for`. Pending mutations are published only by the selected
 success terminator, so guard and pre-middleware short circuits cannot inherit
 them. Reading or changing a buffered response body/status remains ⏳ and needs a
 resumable, stream-owned runtime Response object.
+
+The literal `response(status, body: "...")` form is limited to 1 MiB. Its bytes
+are a non-owning view into the loaded program's RIR/module response-body
+storage; `LoadedProgram` keeps that storage alive through teardown and reload
+retirement. This documents the configured local/static response path and does
+not make dynamic `resp.body` mutation available.
 
 ## State types (top-level, per-shard, bounded)
 
@@ -318,6 +325,7 @@ return forward(users, request_policy: {
 // body, TLS/H2, interim/Upgrade responses, chunking/trailers, close-delimited
 // framing, or unsupported status/header controls fail closed; transparent
 // forward(...) remains the default for all other routes.
+
 return forward(users, response_policy: {
     version: "HTTP/1.1", framing: "content_length", connection: "request",
     server: "nginx/1.29.7", date: "current", hide_headers: ["Date", "Server", "X-Pad"]

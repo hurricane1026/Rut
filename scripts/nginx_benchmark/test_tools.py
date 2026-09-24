@@ -134,6 +134,38 @@ class ToolsTest(unittest.TestCase):
         validate_proxy_profile(argparse.ArgumentParser(), args)
         self.assertIsNone(args.body_size)
 
+
+    def test_matrix_profiles_forward_budget_without_dropping_coordinates(self):
+        cases = (([], (5, 1, 3)),
+                 (["--profile", "quick"], (2, 1, 1)),
+                 (["--profile", "full"], (10, 2, 3)),
+                 (["--duration", "5", "--warmup", "3", "--repeats", "4"], (5, 3, 4)))
+        for flags, expected in cases:
+            with self.subTest(flags=flags), tempfile.TemporaryDirectory() as directory:
+                output = Path(directory) / "matrix"
+                argv = ["matrix.py", "--output", str(output),
+                        "--tls-cert", "unused.pem", "--tls-key", "unused.key", *flags]
+                previous_sigterm = signal.getsignal(signal.SIGTERM)
+                try:
+                    with mock.patch.object(sys, "argv", argv), \
+                            mock.patch.object(matrix, "run_cell", return_value=2) as child, \
+                            contextlib.redirect_stdout(io.StringIO()) as stdout:
+                        self.assertEqual(matrix.main(), 2)
+                finally:
+                    signal.signal(signal.SIGTERM, previous_sigterm)
+                self.assertEqual(child.call_count, 32)
+                for call in child.call_args_list:
+                    command = call.args[0]
+                    self.assertEqual(tuple(int(command[command.index(flag) + 1])
+                                           for flag in ("--duration", "--warmup", "--repeats")),
+                                     expected)
+                report = json.loads((output / "matrix.json").read_text())
+                self.assertEqual(len(report["cells"]), 96)
+                self.assertFalse(report["target_met"])
+                duration, warmup, repeats = expected
+                self.assertIn(f"load budget {96 * 2 * repeats * (warmup + duration)}s",
+                              stdout.getvalue())
+
     def test_matrix_keeps_valid_groups_only_after_completed_child(self):
         cases = (
             # One failed concurrency must not erase its valid siblings.
@@ -298,6 +330,40 @@ class ToolsTest(unittest.TestCase):
                         if child_pid_file.exists() and not (out / "cleaned").exists():
                             with contextlib.suppress(ProcessLookupError):
                                 os.kill(int(child_pid_file.read_text()), signal.SIGKILL)
+
+    def test_native_static_comparison_keeps_content_and_framing(self):
+        nginx = (b"HTTP/1.1 200 OK\r\nServer: nginx\r\nDate: today\r\n"
+                 b"Content-Length: 3\r\nContent-Type: text/plain; charset=utf-8\r\n"
+                 b"Connection: keep-alive\r\n\r\nabc")
+        rut = (b"HTTP/1.1 200 OK\r\nContent-Length: 3\r\n"
+               b"Content-Type: text/plain; charset=utf-8\r\nConnection: keep-alive\r\n\r\nabc")
+        canonical = run.canonical_native_static_response
+        self.assertEqual(canonical(nginx), canonical(rut))
+        for changed in (rut.replace(b"abc", b"abd"), rut.replace(b"keep-alive", b"close"),
+                        rut.replace(b"Length: 3", b"Length: 4")):
+            self.assertNotEqual(canonical(nginx), canonical(changed))
+        with self.assertRaises(ValueError):
+            canonical(rut.replace(b"text/plain", b"text/html"))
+
+    def test_matrix_rejects_static_samples_from_a_different_profile(self):
+        rows = [dict(workload="static", connection="close", transport="http",
+                     body_size=65536, concurrency=32, engine=engine, rep=rep,
+                     requests=600, rps=rps, seconds=5, valid=True,
+                     errors=dict.fromkeys(run.ERROR_NAMES, 0),
+                     warmup_errors=dict.fromkeys(run.ERROR_NAMES, 0))
+                for engine, rps in (("nginx", 100), ("rut", 120)) for rep in (1, 2, 3)]
+        def result():
+            return assess(rows, "static-close", "http", 65536, 32, 3, 5, "native-body")
+        self.assertFalse(result()["measurement_valid"])
+        for row in rows:
+            row["static_profile"] = "native-body"
+        self.assertTrue(result()["target_met"])
+        rows[0]["static_profile"] = "converter-return"
+        self.assertFalse(result()["measurement_valid"])
+
+    def test_preflight_comparison_budget_retains_multiple_requests(self):
+        for size, count in ((0, 100), (16, 100), (1024, 100), (65536, 16), (1048576, 3)):
+            self.assertEqual(run.preflight_request_count(size), count)
 
     def test_large_body_preflight_is_exact_and_bounded(self):
         size = 1048576

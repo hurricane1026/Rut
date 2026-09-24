@@ -149,7 +149,7 @@ bool tls_finish_single_shot_send(Self* loop, Connection& c) {
 }
 
 // Ensure exactly one raw send is draining tls_out_buf. Submits at most
-// kTlsDrainChunk per SQE so the drain handler runs at slice granularity (the
+// kTlsDrainChunk per SQE so the drain handler runs at record granularity (the
 // backend has full-send semantics — see the design doc), and records the
 // SQE-captured length so read-ahead appends don't confuse the drain. Returns
 // false (caller fails closed) if the send can't be queued.

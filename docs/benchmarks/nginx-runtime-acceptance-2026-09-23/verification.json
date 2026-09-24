@@ -1,0 +1,24 @@
+{
+  "coordinates": 96,
+  "expected_coordinates": 96,
+  "raw_samples": 576,
+  "expected_samples": 576,
+  "minimum_measurement_seconds": 5.000106,
+  "counts": {
+    "PASS": 65,
+    "BELOW_TARGET": 31,
+    "INVALID": 0
+  },
+  "error_samples": [],
+  "source_revision": "984280ad56af89bac69e34c282f2b82c4cd4add8",
+  "source_clean_after_run": true,
+  "binary_hashes_after_run": {
+    "/home/hurricane/private/code/Rut-benchmark-quick/build/src/rut": "83147d45cd679dba3851fd3b5daadf84415232ee7fa12f9e3e820b969c95b0af",
+    "/home/hurricane/private/code/Rut-benchmark-quick/build/src/rut-nginx-convert": "bd87d83a1a67ead19c5f05df18795530b6e308907a1b1f5af4882d027adb991b",
+    "/home/hurricane/private/code/Rut/.cache/perf-evidence/full-matrix-2026-09-20/wrk": "8d38af6d4ccec7be5c41beb50bec9ebde506f89dc76377a1d15f2c2e593f9203"
+  },
+  "child_sources_verified": 32,
+  "independently_recomputed": true,
+  "static_profile": "native-body",
+  "proxy_profile": "converter-strict"
+}

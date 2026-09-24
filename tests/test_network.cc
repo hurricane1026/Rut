@@ -4,11 +4,13 @@
 #include "rut/runtime/arena.h"
 #include "rut/runtime/compile_to_config.h"
 #include "rut/runtime/error.h"
+#include "rut/runtime/http2_conn.h"
 #ifdef __linux__
 #include "rut/runtime/io_uring_backend.h"
 #include "rut/runtime/iouring_event_loop.h"
 #endif
 #include "rut/runtime/rate_limit.h"
+#include "rut/runtime/response_body_chain.h"
 #include "rut/runtime/route_table.h"
 #include "rut/runtime/simd/simd.h"
 #include "rut/runtime/slab_pool.h"
@@ -34,6 +36,7 @@
 #include <netinet/tcp.h>
 #include <openssl/ssl.h>
 #include <poll.h>
+#include <pthread.h>
 #include <sched.h>
 #include <sys/socket.h>
 #include <unistd.h>
@@ -564,6 +567,16 @@ u64 h2_target_transform_handler(void* opaque, jit::HandlerCtx*, const u8*, u32, 
 
 static u64 h2_timer_then_redirect_handler(void*, jit::HandlerCtx* ctx, const u8*, u32, void*) {
     if (ctx != nullptr && ctx->state == 7) return jit::HandlerResult::make_redirect(1).pack();
+    return jit::HandlerResult::make_yield(7, jit::YieldKind::Timer).pack();
+}
+
+static u64 h2_timer_then_body_handler(void*, jit::HandlerCtx* ctx, const u8*, u32, void*) {
+    if (ctx != nullptr && ctx->state == 7) {
+        auto result = jit::HandlerResult::make_status(200);
+        result.upstream_id = 1;
+        result.next_state = 1;
+        return result.pack();
+    }
     return jit::HandlerResult::make_yield(7, jit::YieldKind::Timer).pack();
 }
 
@@ -4463,7 +4476,8 @@ TEST(response_read_timeout,
     for (u32 i = 0; i < kClientPrefaceLen; i++) input[input_len++] = kClientPreface[i];
     Http2Settings settings{};
     settings.set_defaults();
-    input_len += write_settings_frame(input + input_len, settings);
+    const u32 initial_settings_len = write_settings_frame(input + input_len, settings);
+    input_len += initial_settings_len;
     const hpack::Header upload[] = {
         {{":method", 7}, {"POST", 4}},
         {{":scheme", 7}, {"http", 4}},
@@ -4567,6 +4581,130 @@ TEST(redirect, h2_initial_and_timer_resume_reject_without_proxy) {
     CHECK_EQ(loop.backend.count_ops(MockOp::Connect), 0u);
     CHECK_EQ(loop.backend.count_ops(MockOp::Send), 1u);
     CHECK_EQ(h2_staged_status(conn->send_buf.data(), conn->send_buf.len(), 1), 400u);
+    loop.free_conn(*conn);
+}
+
+TEST(http2, timer_resume_owned_body_commits_hpack_for_next_response) {
+    SmallLoop loop;
+    loop.setup();
+    RouteConfig cfg{};
+    static constexpr char kBody[] = "timer-body";
+    REQUIRE_EQ(cfg.add_response_body_view(kBody, sizeof(kBody) - 1), 1u);
+    const char* header_names[] = {"x-test"};
+    const u32 header_name_lens[] = {6};
+    const char* header_values[] = {"timer-body"};
+    const u32 header_value_lens[] = {10};
+    REQUIRE_EQ(cfg.add_response_header_set(
+                   header_names, header_name_lens, header_values, header_value_lens, 1),
+               1u);
+    auto* conn = loop.alloc_conn();
+    REQUIRE(conn != nullptr);
+    conn->fd = 42;
+    ShardEpoch epoch{};
+    loop.epoch = &epoch;
+    Http2Conn h2{};
+    h2.init();
+    h2.preface_seen = true;
+    h2.our_settings_sent = true;
+    h2.nstreams = 2;
+    h2.streams[0] = {1,
+                     Http2StreamState::Open,
+                     static_cast<i32>(kDefaultInitialWindowSize),
+                     static_cast<i32>(kDefaultInitialWindowSize),
+                     true};
+    h2.streams[1] = {3,
+                     Http2StreamState::Open,
+                     static_cast<i32>(kDefaultInitialWindowSize),
+                     static_cast<i32>(kDefaultInitialWindowSize),
+                     true};
+    conn->h2 = &h2;
+    JitDispatchOutcome yielded{};
+    yielded.kind = JitDispatchOutcome::Kind::TimerYield;
+    yielded.next_state = 7;
+    yielded.timer_ms = 1;
+    yielded.yield_kind = jit::YieldKind::Timer;
+    const u8 synth[] = "GET /timer HTTP/1.1\r\nHost: example.test\r\n\r\n";
+    u8 response[8192]{};
+    H2Dispatch<SmallLoop> dispatch{&loop, conn, response, sizeof(response), 0, false};
+    REQUIRE(h2_suspend_timer(dispatch,
+                             1,
+                             &h2_timer_then_body_handler,
+                             yielded,
+                             &cfg,
+                             synth,
+                             sizeof(synth) - 1,
+                             false,
+                             true));
+    conn->pending_handler_fn = &h2_timer_then_body_handler;
+    conn->handler_state = 7;
+    h2_resume_jit_handler(&loop, *conn);
+    REQUIRE_GT(conn->send_buf.len(), 0u);
+    Http2FrameHeader first{};
+    REQUIRE_EQ(parse_frame_header(conn->send_buf.data(), conn->send_buf.len(), &first),
+               ParseStatus::Complete);
+    REQUIRE_EQ(first.type, static_cast<u8>(Http2FrameType::Headers));
+    CHECK((first.flags & http2_flag::kEndStream) == 0);
+    Http2FrameHeader first_data{};
+    REQUIRE_EQ(parse_frame_header(conn->send_buf.data() + kFrameHeaderSize + first.length,
+                                  conn->send_buf.len() - kFrameHeaderSize - first.length,
+                                  &first_data),
+               ParseStatus::Complete);
+    REQUIRE_EQ(first_data.type, static_cast<u8>(Http2FrameType::Data));
+    CHECK_EQ(first_data.length, sizeof(kBody) - 1);
+    CHECK_EQ(
+        memcmp(
+            conn->send_buf.data() + 2 * kFrameHeaderSize + first.length, kBody, sizeof(kBody) - 1),
+        0);
+    hpack::DynamicTable decoded;
+    decoded.init(kDefaultHeaderTableSize);
+    hpack::Header headers[16];
+    u8 scratch[512]{};
+    u32 decoded_count = 0;
+    REQUIRE(hpack::decode_header_block(decoded,
+                                       conn->send_buf.data() + kFrameHeaderSize,
+                                       first.length,
+                                       scratch,
+                                       sizeof(scratch),
+                                       headers,
+                                       16,
+                                       &decoded_count));
+    bool saw_dynamic_header = false;
+    for (u32 i = 0; i < h2.hpack_enc.dyn.nent; i++) {
+        const auto& entry = h2.hpack_enc.dyn.ents[i];
+        if (entry.nlen == 6 && entry.vlen == 10 &&
+            memcmp(h2.hpack_enc.dyn.buf + entry.off, "x-test", 6) == 0 &&
+            memcmp(h2.hpack_enc.dyn.buf + entry.off + entry.nlen, "timer-body", 10) == 0)
+            saw_dynamic_header = true;
+    }
+    CHECK(saw_dynamic_header);
+    loop.inject_and_dispatch(
+        make_ev(conn->id, IoEventType::Send, static_cast<i32>(conn->send_buf.len())));
+    u8 next_response[8192]{};
+    H2Dispatch<SmallLoop> next{&loop, conn, next_response, sizeof(next_response), 0, false};
+    const hpack::Header repeated{{"x-test", 6}, {"timer-body", 10}};
+    h2_emit_response(next, 3, 200, &repeated, 1, nullptr, 0);
+    REQUIRE_GT(next.resp_len, 0u);
+    Http2FrameHeader second{};
+    REQUIRE_EQ(parse_frame_header(next.resp, next.resp_len, &second), ParseStatus::Complete);
+    REQUIRE_EQ(second.type, static_cast<u8>(Http2FrameType::Headers));
+    decoded_count = 0;
+    REQUIRE(hpack::decode_header_block(decoded,
+                                       next.resp + kFrameHeaderSize,
+                                       second.length,
+                                       scratch,
+                                       sizeof(scratch),
+                                       headers,
+                                       16,
+                                       &decoded_count));
+    bool status_200 = false;
+    bool repeated_header = false;
+    for (u32 i = 0; i < decoded_count; i++)
+        if (headers[i].name.eq({":status", 7}) && headers[i].value.eq({"200", 3}))
+            status_200 = true;
+        else if (headers[i].name.eq({"x-test", 6}) && headers[i].value.eq({"timer-body", 10}))
+            repeated_header = true;
+    CHECK(status_200);
+    CHECK(repeated_header);
     loop.free_conn(*conn);
 }
 
@@ -6427,6 +6565,2490 @@ void stage_strict_tls_send_owner(Connection& conn,
     conn.response_read_deadline_send_owner_active = true;
 }
 #endif  // __linux__
+
+TEST(http2, response_headers_body_length_is_transactional_and_nonterminal) {
+    hpack::Encoder enc;
+    enc.init(kDefaultHeaderTableSize);
+    hpack::Encoder control;
+    control.init(kDefaultHeaderTableSize);
+    const hpack::Header headers[] = {{{"x-test", 6}, {"ok", 2}}};
+    u8 first[8192]{};
+    const u32 n =
+        http2_write_response_headers(first, sizeof(first), enc, 3, 200, headers, 1, 9000, false);
+    REQUIRE_GT(n, 0u);
+    u8 control_first[8192]{};
+    REQUIRE_EQ(http2_write_response_headers(
+                   control_first, sizeof(control_first), control, 3, 200, headers, 1, 9000, false),
+               n);
+    Http2FrameHeader h{};
+    REQUIRE_EQ(parse_frame_header(first, n, &h), ParseStatus::Complete);
+    CHECK_EQ(h.type, static_cast<u8>(Http2FrameType::Headers));
+    CHECK_EQ(h.stream_id, 3u);
+    CHECK((h.flags & http2_flag::kEndHeaders) != 0);
+    CHECK((h.flags & http2_flag::kEndStream) == 0);
+    CHECK_EQ(n, kFrameHeaderSize + h.length);
+
+    hpack::DynamicTable decoded;
+    decoded.init(kDefaultHeaderTableSize);
+    hpack::Header decoded_headers[8];
+    u8 decoded_scratch[256]{};
+    u32 decoded_count = 0;
+    REQUIRE(hpack::decode_header_block(decoded,
+                                       first + kFrameHeaderSize,
+                                       h.length,
+                                       decoded_scratch,
+                                       sizeof(decoded_scratch),
+                                       decoded_headers,
+                                       8,
+                                       &decoded_count));
+    bool saw_status = false;
+    bool saw_length = false;
+    bool saw_test = false;
+    for (u32 i = 0; i < decoded_count; i++) {
+        if (decoded_headers[i].name.eq({":status", 7}) && decoded_headers[i].value.eq({"200", 3}))
+            saw_status = true;
+        if (decoded_headers[i].name.eq({"content-length", 14}) &&
+            decoded_headers[i].value.eq({"9000", 4}))
+            saw_length = true;
+        if (decoded_headers[i].name.eq({"x-test", 6}) && decoded_headers[i].value.eq({"ok", 2}))
+            saw_test = true;
+    }
+    CHECK(saw_status);
+    CHECK(saw_length);
+    CHECK(saw_test);
+
+    // A failed staging attempt must not consume encoder state or partially write.
+    u8 too_small[8]{};
+    CHECK_EQ(http2_write_response_headers(
+                 too_small, sizeof(too_small), enc, 3, 200, headers, 1, 9000, false),
+             0u);
+    u8 second[8192]{};
+    const u32 n2 =
+        http2_write_response_headers(second, sizeof(second), enc, 3, 200, headers, 1, 9000, false);
+    u8 control_second[8192]{};
+    const u32 control_n2 = http2_write_response_headers(
+        control_second, sizeof(control_second), control, 3, 200, headers, 1, 9000, false);
+    REQUIRE_EQ(n2, control_n2);
+    CHECK_EQ(__builtin_memcmp(second, control_second, n2), 0);
+
+    u8 terminal[128]{};
+    const u32 terminal_len =
+        http2_write_response_headers(terminal, sizeof(terminal), enc, 3, 204, nullptr, 0, 0, true);
+    REQUIRE_GT(terminal_len, 0u);
+    Http2FrameHeader terminal_header{};
+    REQUIRE_EQ(parse_frame_header(terminal, terminal_len, &terminal_header), ParseStatus::Complete);
+    CHECK_EQ(terminal_header.type, static_cast<u8>(Http2FrameType::Headers));
+    CHECK((terminal_header.flags & http2_flag::kEndHeaders) != 0);
+    CHECK((terminal_header.flags & http2_flag::kEndStream) != 0);
+}
+
+TEST(http2, refused_stream_rst_writer_is_bounded_and_exact) {
+    u8 frame[32]{};
+    const u32 n = write_rst_stream(frame, 7, Http2Error::RefusedStream);
+    REQUIRE_EQ(n, kFrameHeaderSize + 4u);
+    Http2FrameHeader h{};
+    REQUIRE_EQ(parse_frame_header(frame, n, &h), ParseStatus::Complete);
+    CHECK_EQ(h.type, static_cast<u8>(Http2FrameType::RstStream));
+    CHECK_EQ(h.stream_id, 7u);
+    CHECK_EQ(h.length, 4u);
+}
+
+struct H2OwnerGateCapture {
+    u32 headers_calls = 0;
+    u32 last_stream = 0;
+};
+
+static void h2_owner_gate_headers(
+    void* opaque, Http2Conn&, u32 stream_id, const hpack::Header*, u32, bool) {
+    auto* capture = static_cast<H2OwnerGateCapture*>(opaque);
+    capture->headers_calls++;
+    capture->last_stream = stream_id;
+}
+
+struct H2ResetCapture {
+    u32 calls = 0;
+    u32 stream_id = 0;
+    Http2Error error = Http2Error::NoError;
+};
+
+static void h2_reset_capture(void* opaque, Http2Conn&, u32 stream_id, Http2Error error) {
+    auto* capture = static_cast<H2ResetCapture*>(opaque);
+    capture->calls++;
+    capture->stream_id = stream_id;
+    capture->error = error;
+}
+
+TEST(http2, local_stream_window_errors_notify_reset_once) {
+    auto make_window_update = [](u8* out, u32 stream_id, u32 increment) {
+        Http2FrameHeader h{};
+        h.length = 4;
+        h.type = static_cast<u8>(Http2FrameType::WindowUpdate);
+        h.stream_id = stream_id;
+        write_frame_header(out, h);
+        out[kFrameHeaderSize + 0] = static_cast<u8>(increment >> 24);
+        out[kFrameHeaderSize + 1] = static_cast<u8>(increment >> 16);
+        out[kFrameHeaderSize + 2] = static_cast<u8>(increment >> 8);
+        out[kFrameHeaderSize + 3] = static_cast<u8>(increment);
+    };
+    Http2Conn no_room{};
+    no_room.init();
+    no_room.preface_seen = true;
+    no_room.nstreams = 1;
+    no_room.streams[0] = {1,
+                          Http2StreamState::Open,
+                          static_cast<i32>(kDefaultInitialWindowSize),
+                          static_cast<i32>(kDefaultInitialWindowSize),
+                          true};
+    H2ResetCapture no_room_capture{};
+    no_room.cb_ctx = &no_room_capture;
+    no_room.on_reset = &h2_reset_capture;
+    u8 short_output[12]{};
+    u8 short_input[kFrameHeaderSize + 4]{};
+    make_window_update(short_input, 1, 0);
+    u32 short_written = 0;
+    const Http2Result no_room_result = no_room.process(
+        short_input, sizeof(short_input), short_output, sizeof(short_output), &short_written);
+    CHECK(no_room_result.close);
+    CHECK_EQ(no_room_capture.calls, 0u);
+    CHECK_EQ(no_room.streams[0].state, Http2StreamState::Open);
+    u8 exact_output[13]{};
+    u32 exact_written = 0;
+    const Http2Result exact_result = no_room.process(
+        short_input, sizeof(short_input), exact_output, sizeof(exact_output), &exact_written);
+    CHECK_FALSE(exact_result.close);
+    CHECK_EQ(exact_written, 13u);
+    CHECK_EQ(no_room_capture.calls, 1u);
+    CHECK_EQ(no_room.streams[0].state, Http2StreamState::Closed);
+
+    Http2Conn h2{};
+    h2.init();
+    h2.preface_seen = true;
+    h2.nstreams = 1;
+    h2.streams[0] = {1,
+                     Http2StreamState::Open,
+                     static_cast<i32>(kDefaultInitialWindowSize),
+                     static_cast<i32>(kDefaultInitialWindowSize),
+                     true};
+    H2ResetCapture capture{};
+    h2.cb_ctx = &capture;
+    h2.on_reset = &h2_reset_capture;
+    u8 input[kFrameHeaderSize + 4]{};
+    u8 output[128]{};
+    u32 written = 0;
+    make_window_update(input, 1, 0);
+    const Http2Result first = h2.process(input, sizeof(input), output, sizeof(output), &written);
+    CHECK_FALSE(first.close);
+    CHECK_EQ(capture.calls, 1u);
+    CHECK_EQ(capture.stream_id, 1u);
+    CHECK_EQ(capture.error, Http2Error::ProtocolError);
+    CHECK_EQ(h2.streams[0].state, Http2StreamState::Closed);
+    Http2FrameHeader rst{};
+    REQUIRE_EQ(parse_frame_header(output, written, &rst), ParseStatus::Complete);
+    CHECK_EQ(rst.type, static_cast<u8>(Http2FrameType::RstStream));
+    CHECK_EQ(rst.stream_id, 1u);
+    h2.process(input, sizeof(input), output, sizeof(output), &written);
+    CHECK_EQ(capture.calls, 1u);
+
+    Http2Conn overflow{};
+    overflow.init();
+    overflow.preface_seen = true;
+    overflow.nstreams = 1;
+    overflow.streams[0] = {1,
+                           Http2StreamState::Open,
+                           static_cast<i32>(kMaxWindowSize),
+                           static_cast<i32>(kDefaultInitialWindowSize),
+                           true};
+    H2ResetCapture overflow_capture{};
+    overflow.cb_ctx = &overflow_capture;
+    overflow.on_reset = &h2_reset_capture;
+    make_window_update(input, 1, kMaxWindowSize);
+    overflow.process(input, sizeof(input), output, sizeof(output), &written);
+    CHECK_EQ(overflow_capture.calls, 1u);
+    CHECK_EQ(overflow_capture.error, Http2Error::FlowControlError);
+
+    Http2Conn connection_error{};
+    connection_error.init();
+    connection_error.preface_seen = true;
+    H2ResetCapture connection_capture{};
+    connection_error.cb_ctx = &connection_capture;
+    connection_error.on_reset = &h2_reset_capture;
+    make_window_update(input, 0, 0);
+    const Http2Result connection_result =
+        connection_error.process(input, sizeof(input), output, sizeof(output), &written);
+    CHECK(connection_result.close);
+    CHECK_EQ(connection_capture.calls, 0u);
+}
+
+TEST(http2, outbound_owner_refuses_after_continuation_and_keeps_control_sync) {
+    Http2Conn h2{};
+    h2.init();
+    h2.outbound_stream = 1;
+    H2OwnerGateCapture capture{};
+    h2.cb_ctx = &capture;
+    h2.on_headers = &h2_owner_gate_headers;
+
+    u8 input[2048]{};
+    u32 input_len = 0;
+    for (u32 i = 0; i < kClientPrefaceLen; i++) input[input_len++] = kClientPreface[i];
+    Http2Settings settings{};
+    settings.set_defaults();
+    input_len += write_settings_frame(input + input_len, settings);
+
+    const hpack::Header request[] = {
+        {{":method", 7}, {"GET", 3}},
+        {{":scheme", 7}, {"https", 5}},
+        {{":path", 5}, {"/", 1}},
+        {{":authority", 10}, {"example.test", 12}},
+    };
+    u8 block[256]{};
+    u32 block_len = 0;
+    for (const auto& header : request)
+        block_len += hpack::encode_header(block + block_len, header.name, header.value);
+
+    auto append_frame =
+        [&](Http2FrameType type, u8 flags, u32 stream_id, const u8* payload, u32 payload_len) {
+            REQUIRE(input_len + kFrameHeaderSize + payload_len <= sizeof(input));
+            Http2FrameHeader header{};
+            header.length = payload_len;
+            header.type = static_cast<u8>(type);
+            header.flags = flags;
+            header.stream_id = stream_id;
+            write_frame_header(input + input_len, header);
+            input_len += kFrameHeaderSize;
+            if (payload_len != 0) memcpy(input + input_len, payload, payload_len);
+            input_len += payload_len;
+        };
+    append_frame(Http2FrameType::Headers, http2_flag::kEndHeaders, 1, block, block_len);
+    const u32 split = block_len / 2;
+    append_frame(Http2FrameType::Headers, 0, 3, block, split);
+    append_frame(
+        Http2FrameType::Continuation, http2_flag::kEndHeaders, 3, block + split, block_len - split);
+    const u8 window_increment[] = {0, 0, 0, 1};
+    append_frame(Http2FrameType::WindowUpdate, 0, 1, window_increment, sizeof(window_increment));
+    append_frame(Http2FrameType::Headers, http2_flag::kEndHeaders, 5, block, block_len);
+
+    u8 output[1024]{};
+    u32 output_len = 0;
+    u8 first_output[13]{};
+    u32 first_output_len = 0;
+    const Http2Result first_result =
+        h2.process(input, input_len, first_output, sizeof(first_output), &first_output_len);
+    REQUIRE_FALSE(first_result.close);
+    CHECK_LT(first_result.consumed, input_len);
+    CHECK_EQ(h2.nstreams, 1u);
+    const Http2Result result = h2.process(input + first_result.consumed,
+                                          input_len - first_result.consumed,
+                                          output,
+                                          sizeof(output),
+                                          &output_len);
+    REQUIRE_FALSE(result.close);
+    CHECK_EQ(result.consumed, input_len - first_result.consumed);
+    CHECK_EQ(capture.headers_calls, 1u);
+    CHECK_EQ(capture.last_stream, 1u);
+    CHECK_EQ(h2.outbound_stream, 1u);
+    // The second refused stream reuses the first closed slot, so the table
+    // remains bounded while both requests still produce independent RSTs.
+    REQUIRE_EQ(h2.nstreams, 2u);
+    CHECK_EQ(h2.streams[1].id, 5u);
+    CHECK(h2.streams[1].state == Http2StreamState::Closed);
+    CHECK_EQ(h2.find_stream(3), nullptr);
+    CHECK_EQ(h2.streams[0].send_window, static_cast<i32>(kDefaultInitialWindowSize + 1));
+
+    u32 refused_count = 0;
+    for (u32 pos = 0; pos + kFrameHeaderSize <= output_len;) {
+        Http2FrameHeader frame{};
+        REQUIRE_EQ(parse_frame_header(output + pos, output_len - pos, &frame),
+                   ParseStatus::Complete);
+        REQUIRE_LE(pos + kFrameHeaderSize + frame.length, output_len);
+        if (frame.type == static_cast<u8>(Http2FrameType::RstStream) &&
+            (frame.stream_id == 3 || frame.stream_id == 5)) {
+            REQUIRE_EQ(frame.length, 4u);
+            const u8* error = output + pos + kFrameHeaderSize;
+            if (error[0] == 0 && error[1] == 0 && error[2] == 0 &&
+                error[3] == static_cast<u8>(Http2Error::RefusedStream))
+                refused_count++;
+        }
+        pos += kFrameHeaderSize + frame.length;
+    }
+    CHECK_EQ(refused_count, 2u);
+
+    // A previously accepted refused HEADERS fragment leaves the final
+    // CONTINUATION pending. With no room for its RST, the continuation remains
+    // untouched; retrying it decodes the block exactly once.
+    Http2Conn fragmented{};
+    fragmented.init();
+    fragmented.outbound_stream = 1;
+    fragmented.preface_seen = true;
+    fragmented.our_settings_sent = true;
+    H2OwnerGateCapture fragmented_capture{};
+    fragmented.cb_ctx = &fragmented_capture;
+    fragmented.on_headers = &h2_owner_gate_headers;
+    fragmented.last_stream_id = 3;
+    fragmented.nstreams = 1;
+    fragmented.streams[0] = {3,
+                             Http2StreamState::Open,
+                             static_cast<i32>(kDefaultInitialWindowSize),
+                             static_cast<i32>(kDefaultInitialWindowSize),
+                             true};
+    fragmented.cont_stream = 3;
+    fragmented.cont_refuse = true;
+    memcpy(fragmented.hdr_block, block, split);
+    fragmented.hdr_block_len = split;
+    u8 continuation_input[256]{};
+    Http2FrameHeader continuation_header{};
+    continuation_header.length = block_len - split;
+    continuation_header.type = static_cast<u8>(Http2FrameType::Continuation);
+    continuation_header.flags = http2_flag::kEndHeaders;
+    continuation_header.stream_id = 3;
+    write_frame_header(continuation_input, continuation_header);
+    memcpy(continuation_input + kFrameHeaderSize, block + split, block_len - split);
+    const u32 continuation_len = kFrameHeaderSize + block_len - split;
+    u8 fragmented_first_output[12]{};
+    u32 fragmented_first_output_len = 0;
+    const Http2Result fragmented_first = fragmented.process(continuation_input,
+                                                            continuation_len,
+                                                            fragmented_first_output,
+                                                            sizeof(fragmented_first_output),
+                                                            &fragmented_first_output_len);
+    REQUIRE_FALSE(fragmented_first.close);
+    CHECK_EQ(fragmented_first.consumed, 0u);
+    CHECK(fragmented.cont_refuse);
+    u8 fragmented_output[1024]{};
+    u32 fragmented_output_len = 0;
+    const Http2Result fragmented_second = fragmented.process(continuation_input,
+                                                             continuation_len,
+                                                             fragmented_output,
+                                                             sizeof(fragmented_output),
+                                                             &fragmented_output_len);
+    REQUIRE_FALSE(fragmented_second.close);
+    CHECK_EQ(fragmented_second.consumed, continuation_len);
+    CHECK_EQ(fragmented_capture.headers_calls, 0u);
+    CHECK(fragmented.streams[0].state == Http2StreamState::Closed);
+
+    // Without an owner, a small control buffer must not preflight ordinary
+    // HEADERS as a refusal; the request remains fully consumable.
+    Http2Conn unowned{};
+    unowned.init();
+    unowned.preface_seen = true;
+    unowned.our_settings_sent = true;
+    H2OwnerGateCapture unowned_capture{};
+    unowned.cb_ctx = &unowned_capture;
+    unowned.on_headers = &h2_owner_gate_headers;
+    u8 unowned_input[256]{};
+    Http2FrameHeader unowned_header{};
+    unowned_header.length = block_len;
+    unowned_header.type = static_cast<u8>(Http2FrameType::Headers);
+    unowned_header.flags = http2_flag::kEndHeaders;
+    unowned_header.stream_id = 1;
+    write_frame_header(unowned_input, unowned_header);
+    memcpy(unowned_input + kFrameHeaderSize, block, block_len);
+    u8 unowned_output[12]{};
+    u32 unowned_output_len = 0;
+    const Http2Result unowned_result = unowned.process(unowned_input,
+                                                       kFrameHeaderSize + block_len,
+                                                       unowned_output,
+                                                       sizeof(unowned_output),
+                                                       &unowned_output_len);
+    CHECK_FALSE(unowned_result.close);
+    CHECK_EQ(unowned_result.consumed, kFrameHeaderSize + block_len);
+    CHECK_EQ(unowned_capture.headers_calls, 1u);
+}
+
+TEST(http2, nonempty_response_uses_flow_controlled_data_owner) {
+    SmallLoop loop;
+    loop.setup();
+    auto* conn = loop.alloc_conn();
+    REQUIRE(conn != nullptr);
+    Http2Conn h2{};
+    h2.init();
+    h2.nstreams = 1;
+    h2.streams[0] = {1,
+                     Http2StreamState::Open,
+                     static_cast<i32>(kDefaultInitialWindowSize),
+                     static_cast<i32>(kDefaultInitialWindowSize),
+                     true};
+    conn->h2 = &h2;
+    conn->epoch_held = true;
+    static u8 body[9000];
+    for (u32 i = 0; i < sizeof(body); i++) body[i] = static_cast<u8>(i * 17 + 3);
+    RouteConfig cfg{};
+    REQUIRE_EQ(cfg.add_response_body_view(reinterpret_cast<const char*>(body), sizeof(body)), 1u);
+    JitDispatchOutcome outcome{};
+    outcome.kind = JitDispatchOutcome::Kind::ReturnStatus;
+    outcome.status_code = 200;
+    outcome.response_body_idx = 1;
+    u8 response[20000]{};
+    H2Dispatch<SmallLoop> dispatch{&loop, conn, response, sizeof(response), 0, false, false};
+    h2_emit_outcome(dispatch, 1, outcome, &cfg);
+    CHECK_EQ(h2.outbound_stream, 1u);
+    CHECK_EQ(h2.outbound_body_len, 9000u);
+    CHECK_EQ(h2.outbound_body_offset, 0u);
+    CHECK_EQ(h2.conn_send_window, static_cast<i64>(kDefaultInitialWindowSize));
+    const u32 header_len = dispatch.resp_len;
+    h2.conn_send_window = 0;
+    H2PumpStatus blocked_status = H2PumpStatus::Produced;
+    CHECK_EQ(
+        h2_pump_outbound(
+            h2, response + dispatch.resp_len, sizeof(response) - dispatch.resp_len, blocked_status),
+        0u);
+    CHECK_EQ(blocked_status, H2PumpStatus::Blocked);
+    h2.conn_send_window = kDefaultInitialWindowSize;
+    H2PumpStatus data_status = H2PumpStatus::Blocked;
+    const u32 data_len = h2_pump_outbound(
+        h2, response + dispatch.resp_len, sizeof(response) - dispatch.resp_len, data_status);
+    REQUIRE_EQ(data_status, H2PumpStatus::Produced);
+    REQUIRE_EQ(data_len, kFrameHeaderSize + sizeof(body));
+    dispatch.resp_len += data_len;
+    Http2FrameHeader headers_frame{};
+    REQUIRE_EQ(parse_frame_header(response, header_len, &headers_frame), ParseStatus::Complete);
+    CHECK_EQ(headers_frame.type, static_cast<u8>(Http2FrameType::Headers));
+    Http2FrameHeader data_frame{};
+    REQUIRE_EQ(parse_frame_header(response + header_len, data_len, &data_frame),
+               ParseStatus::Complete);
+    CHECK_EQ(data_frame.type, static_cast<u8>(Http2FrameType::Data));
+    CHECK((data_frame.flags & http2_flag::kEndStream) != 0);
+    CHECK_EQ(data_frame.length, static_cast<u32>(sizeof(body)));
+    CHECK_EQ(memcmp(response + header_len + kFrameHeaderSize, body, sizeof(body)), 0);
+    CHECK_EQ(h2.conn_send_window, static_cast<i64>(kDefaultInitialWindowSize - sizeof(body)));
+    CHECK_EQ(h2.streams[0].send_window, static_cast<i32>(kDefaultInitialWindowSize - sizeof(body)));
+}
+
+TEST(http2, flow_controlled_route_body_boundaries_and_window_resume) {
+    SmallLoop loop;
+    loop.setup();
+    auto* conn = loop.alloc_conn();
+    REQUIRE(conn != nullptr);
+    static u8 body[1u << 20];
+    static u8 wire[(1u << 20) + 32768];
+    for (u32 i = 0; i < sizeof(body); i++) body[i] = static_cast<u8>(i * 29u + 7u);
+    constexpr u32 kSizes[] = {8167, 8168, 9000, 65535, 65536, 1u << 20};
+    for (u32 body_len : kSizes) {
+        Http2Conn h2{};
+        h2.init();
+        h2.nstreams = 1;
+        h2.streams[0] = {1, Http2StreamState::Open, INT32_MAX, INT32_MAX, true};
+        h2.conn_send_window = INT32_MAX;
+        conn->h2 = &h2;
+        conn->epoch_held = true;
+        RouteConfig cfg{};
+        REQUIRE_EQ(cfg.add_response_body_view(reinterpret_cast<const char*>(body), body_len), 1u);
+        JitDispatchOutcome outcome{};
+        outcome.kind = JitDispatchOutcome::Kind::ReturnStatus;
+        outcome.status_code = 200;
+        outcome.response_body_idx = 1;
+        memset(wire, 0, sizeof(wire));
+        H2Dispatch<SmallLoop> dispatch{&loop, conn, wire, sizeof(wire), 0, false, false};
+        h2_emit_outcome(dispatch, 1, outcome, &cfg);
+        REQUIRE_EQ(h2.outbound_body_len, body_len);
+        const u32 header_len = dispatch.resp_len;
+        h2.conn_send_window = 0;
+        H2PumpStatus blocked = H2PumpStatus::Produced;
+        CHECK_EQ(h2_pump_outbound(
+                     h2, wire + dispatch.resp_len, sizeof(wire) - dispatch.resp_len, blocked),
+                 0u);
+        CHECK_EQ(blocked, H2PumpStatus::Blocked);
+        h2.conn_send_window = INT32_MAX;
+        u32 body_seen = 0;
+        while (!h2.outbound_final_staged) {
+            H2PumpStatus status = H2PumpStatus::Blocked;
+            const u32 n = h2_pump_outbound(
+                h2, wire + dispatch.resp_len, sizeof(wire) - dispatch.resp_len, status);
+            REQUIRE_EQ(status, H2PumpStatus::Produced);
+            REQUIRE(n > kFrameHeaderSize);
+            dispatch.resp_len += n;
+        }
+        u32 cursor = header_len;
+        while (cursor < dispatch.resp_len) {
+            Http2FrameHeader frame{};
+            REQUIRE_EQ(parse_frame_header(wire + cursor, dispatch.resp_len - cursor, &frame),
+                       ParseStatus::Complete);
+            REQUIRE_EQ(frame.type, static_cast<u8>(Http2FrameType::Data));
+            REQUIRE(cursor + kFrameHeaderSize + frame.length <= dispatch.resp_len);
+            CHECK_EQ(memcmp(wire + cursor + kFrameHeaderSize, body + body_seen, frame.length), 0);
+            body_seen += frame.length;
+            cursor += kFrameHeaderSize + frame.length;
+        }
+        CHECK_EQ(body_seen, body_len);
+        CHECK_EQ(h2.outbound_body_offset, body_len);
+    }
+}
+
+TEST(http2, proxy_synth_owner_is_transactional_and_pinned) {
+    SmallLoop loop;
+    loop.setup();
+    auto* conn = loop.alloc_conn();
+    REQUIRE(conn != nullptr);
+    Http2Conn h2{};
+    h2.init();
+    h2.nstreams = 1;
+    h2.streams[0] = {1,
+                     Http2StreamState::Open,
+                     static_cast<i32>(kDefaultInitialWindowSize),
+                     static_cast<i32>(kDefaultInitialWindowSize),
+                     true};
+    conn->h2 = &h2;
+    conn->epoch_held = true;
+    const u8 body[] = "proxy-body";
+    memcpy(h2.pending_synth, body, sizeof(body) - 1);
+    u8 response[1024]{};
+    H2Dispatch<SmallLoop> dispatch{&loop, conn, response, sizeof(response), 0, false, false};
+    REQUIRE(h2_stage_owned_response(dispatch,
+                                    1,
+                                    200,
+                                    nullptr,
+                                    0,
+                                    h2.pending_synth,
+                                    sizeof(body) - 1,
+                                    H2OutboundBodySource::ProxySynth,
+                                    nullptr));
+    CHECK_EQ(h2.outbound_source, H2OutboundBodySource::ProxySynth);
+    CHECK_EQ(h2.outbound_body, h2.pending_synth);
+    CHECK_EQ(h2.outbound_body_len, sizeof(body) - 1);
+    CHECK(dispatch.resp_len > 0u);
+
+    h2_clear_outbound(h2);
+    conn->h2_proxy_synth_quarantined = true;
+    H2Dispatch<SmallLoop> rejected{&loop, conn, response, sizeof(response), 0, false, false};
+    CHECK_FALSE(h2_stage_owned_response(rejected,
+                                        1,
+                                        200,
+                                        nullptr,
+                                        0,
+                                        h2.pending_synth,
+                                        sizeof(body) - 1,
+                                        H2OutboundBodySource::ProxySynth,
+                                        nullptr));
+    CHECK_EQ(rejected.resp_len, 0u);
+    CHECK_EQ(h2.outbound_stream, 0u);
+}
+
+TEST(http2, bodyless_then_owned_response_appends_transactionally) {
+    SmallLoop loop;
+    loop.setup();
+    auto* conn = loop.alloc_conn();
+    REQUIRE(conn != nullptr);
+    Http2Conn h2{};
+    h2.init();
+    h2.nstreams = 2;
+    h2.streams[0] = {1,
+                     Http2StreamState::Open,
+                     static_cast<i32>(kDefaultInitialWindowSize),
+                     static_cast<i32>(kDefaultInitialWindowSize),
+                     true};
+    h2.streams[1] = {3,
+                     Http2StreamState::Open,
+                     static_cast<i32>(kDefaultInitialWindowSize),
+                     static_cast<i32>(kDefaultInitialWindowSize),
+                     true};
+    h2.streams[2] = {5,
+                     Http2StreamState::Open,
+                     static_cast<i32>(kDefaultInitialWindowSize),
+                     static_cast<i32>(kDefaultInitialWindowSize),
+                     true};
+    conn->h2 = &h2;
+    conn->epoch_held = true;
+    static u8 body[9000];
+    memset(body, 'b', sizeof(body));
+    u8 response[16384]{};
+    H2Dispatch<SmallLoop> dispatch{&loop, conn, response, sizeof(response), 0, false, false};
+    h2_emit_status(dispatch, 1, 204);
+    const u32 bodyless_len = dispatch.resp_len;
+    REQUIRE_GT(bodyless_len, 0u);
+    REQUIRE(h2_stage_owned_response(dispatch,
+                                    3,
+                                    200,
+                                    nullptr,
+                                    0,
+                                    body,
+                                    sizeof(body),
+                                    H2OutboundBodySource::RouteConfig,
+                                    reinterpret_cast<const RouteConfig*>(1)));
+    CHECK_GT(dispatch.resp_len, bodyless_len);
+    Http2FrameHeader first{};
+    REQUIRE_EQ(parse_frame_header(response, dispatch.resp_len, &first), ParseStatus::Complete);
+    CHECK_EQ(first.type, static_cast<u8>(Http2FrameType::Headers));
+    CHECK((first.flags & http2_flag::kEndStream) != 0);
+    Http2FrameHeader second{};
+    REQUIRE_EQ(
+        parse_frame_header(response + bodyless_len, dispatch.resp_len - bodyless_len, &second),
+        ParseStatus::Complete);
+    CHECK_EQ(second.type, static_cast<u8>(Http2FrameType::Headers));
+    CHECK((second.flags & http2_flag::kEndStream) == 0);
+    CHECK_EQ(h2.outbound_stream, 3u);
+
+    const u32 owner_end = dispatch.owned_resp_end;
+    const hpack::Header repeated{{"x-owner", 7}, {"pending", 7}};
+    h2_emit_response(dispatch, 5, 204, &repeated, 1, nullptr, 0);
+    REQUIRE_GT(dispatch.resp_len, owner_end);
+    CHECK(dispatch.owned_hpack_pending);
+    h2_on_reset_dispatch_cb<SmallLoop>(&dispatch, h2, 3, Http2Error::Cancel);
+    CHECK(dispatch.close_after_process);
+    CHECK_EQ(h2.outbound_stream, 0u);
+}
+
+TEST(http2, outbound_pump_distinguishes_invalid_owner_from_window_block) {
+    Http2Conn h2{};
+    h2.init();
+    h2.nstreams = 1;
+    h2.streams[0] = {1,
+                     Http2StreamState::Open,
+                     static_cast<i32>(kDefaultInitialWindowSize),
+                     static_cast<i32>(kDefaultInitialWindowSize),
+                     true};
+    h2.outbound_stream = 1;
+    h2.outbound_body_len = 1;
+    u8 output[32]{};
+    H2PumpStatus status = H2PumpStatus::Blocked;
+    CHECK_EQ(h2_pump_outbound(h2, output, sizeof(output), status), 0u);
+    CHECK_EQ(status, H2PumpStatus::Invalid);
+
+    const u8 body[] = {'x'};
+    h2.outbound_body = body;
+    h2.conn_send_window = 0;
+    CHECK_EQ(h2_pump_outbound(h2, output, sizeof(output), status), 0u);
+    CHECK_EQ(status, H2PumpStatus::Blocked);
+
+    h2.outbound_final_staged = true;
+    h2.outbound_body_offset = h2.outbound_body_len;
+    CHECK_EQ(h2_pump_outbound(h2, output, sizeof(output), status), 0u);
+    CHECK_EQ(status, H2PumpStatus::Blocked);
+
+    h2.outbound_final_staged = false;
+    h2.streams[0].state = Http2StreamState::HalfClosedLocal;
+    h2.outbound_body_offset = 0;
+    h2.conn_send_window = kDefaultInitialWindowSize;
+    CHECK_EQ(h2_pump_outbound(h2, output, sizeof(output), status), 0u);
+    CHECK_EQ(status, H2PumpStatus::Invalid);
+}
+
+TEST(http2, proxy_finish_preserves_body_after_upstream_teardown) {
+    SmallLoop loop;
+    loop.setup();
+    auto* conn = loop.alloc_conn();
+    REQUIRE(conn != nullptr);
+    Http2Conn h2{};
+    h2.init();
+    h2.nstreams = 1;
+    h2.streams[0] = {1,
+                     Http2StreamState::Open,
+                     static_cast<i32>(kDefaultInitialWindowSize),
+                     static_cast<i32>(kDefaultInitialWindowSize),
+                     true};
+    h2.async_stream = 1;
+    h2.preface_seen = true;
+    h2.our_settings_sent = true;
+    h2.conn_send_window = 0;
+    conn->h2 = &h2;
+    conn->epoch_held = true;
+    static u8 upstream[1024];
+    const char response[] = "HTTP/1.1 200 OK\r\nContent-Length: 9\r\n\r\nproxybody";
+    constexpr u32 kHeaderLen = sizeof(response) - 1 - 9;
+    memcpy(upstream, response, sizeof(response) - 1);
+    conn->upstream_recv_buf.bind(upstream, sizeof(upstream));
+    conn->upstream_recv_buf.commit(sizeof(response) - 1);
+    ParsedResponse parsed{};
+    parsed.reset();
+    parsed.status_code = 200;
+    parsed.version = HttpVersion::Http11;
+    parsed.has_content_length = true;
+    parsed.content_length = 9;
+
+    h2_proxy_finish(&loop, *conn, parsed, kHeaderLen, 9, false);
+    CHECK_EQ(h2.outbound_source, H2OutboundBodySource::ProxySynth);
+    CHECK_EQ(h2.outbound_body, h2.pending_synth);
+    CHECK_EQ(h2.outbound_body_len, 9u);
+    CHECK_EQ(h2.conn_send_window, 0);
+    REQUIRE_GT(conn->send_buf.len(), 0u);
+    const u32 headers_send_len = conn->send_buf.len();
+    u8 header_copy[8192]{};
+    REQUIRE_LE(headers_send_len, static_cast<u32>(sizeof(header_copy)));
+    memcpy(header_copy, conn->send_buf.data(), headers_send_len);
+    Http2FrameHeader headers_frame{};
+    REQUIRE_EQ(parse_frame_header(header_copy, headers_send_len, &headers_frame),
+               ParseStatus::Complete);
+    CHECK_EQ(headers_frame.type, static_cast<u8>(Http2FrameType::Headers));
+    hpack::DynamicTable decoded;
+    decoded.init(kDefaultHeaderTableSize);
+    hpack::Header decoded_headers[8];
+    u8 decoded_scratch[256]{};
+    u32 decoded_count = 0;
+    REQUIRE(hpack::decode_header_block(decoded,
+                                       header_copy + kFrameHeaderSize,
+                                       headers_frame.length,
+                                       decoded_scratch,
+                                       sizeof(decoded_scratch),
+                                       decoded_headers,
+                                       8,
+                                       &decoded_count));
+    bool saw_status = false;
+    bool saw_length = false;
+    for (u32 i = 0; i < decoded_count; i++) {
+        if (decoded_headers[i].name.eq({":status", 7}) && decoded_headers[i].value.eq({"200", 3}))
+            saw_status = true;
+        if (decoded_headers[i].name.eq({"content-length", 14}) &&
+            decoded_headers[i].value.eq({"9", 1}))
+            saw_length = true;
+    }
+    CHECK(saw_status);
+    CHECK(saw_length);
+    loop.inject_and_dispatch(
+        make_ev(conn->id, IoEventType::Send, static_cast<i32>(headers_send_len)));
+    CHECK_EQ(h2.outbound_stream, 1u);
+    CHECK_EQ(h2.outbound_body_offset, 0u);
+    CHECK(h2.response_flush_pending);
+    CHECK_EQ(conn->upstream_recv_buf.len(), 0u);
+    CHECK_FALSE(conn->upstream_recv_armed);
+    CHECK_FALSE(conn->upstream_send_armed);
+    memset(upstream, 'X', sizeof(upstream));
+    u8 window_update[kFrameHeaderSize + 4]{};
+    Http2FrameHeader update_header{};
+    update_header.length = 4;
+    update_header.type = static_cast<u8>(Http2FrameType::WindowUpdate);
+    update_header.stream_id = 0;
+    write_frame_header(window_update, update_header);
+    window_update[kFrameHeaderSize + 3] = 9;
+    conn->recv_buf.reset();
+    REQUIRE_EQ(conn->recv_buf.write(window_update, sizeof(window_update)), sizeof(window_update));
+    loop.inject_and_dispatch(
+        make_ev(conn->id, IoEventType::Recv, static_cast<i32>(sizeof(window_update))));
+    REQUIRE_GT(conn->send_buf.len(), 0u);
+    Http2FrameHeader data_frame{};
+    REQUIRE_EQ(parse_frame_header(conn->send_buf.data(), conn->send_buf.len(), &data_frame),
+               ParseStatus::Complete);
+    REQUIRE_EQ(data_frame.type, static_cast<u8>(Http2FrameType::Data));
+    CHECK((data_frame.flags & http2_flag::kEndStream) != 0);
+    CHECK_EQ(data_frame.length, 9u);
+    REQUIRE_GE(conn->send_buf.len(), kFrameHeaderSize + data_frame.length);
+    CHECK_EQ(memcmp(conn->send_buf.data() + kFrameHeaderSize, "proxybody", 9), 0);
+    const u32 data_send_len = conn->send_buf.len();
+    loop.inject_and_dispatch(make_ev(conn->id, IoEventType::Send, static_cast<i32>(data_send_len)));
+    CHECK_EQ(h2.outbound_stream, 0u);
+    CHECK_FALSE(h2.response_flush_pending);
+    CHECK_FALSE(conn->epoch_held);
+}
+
+TEST(http2, proxy_finish_bodyless_and_head_preserve_framing_and_epoch) {
+    const auto run = [&](bool is_head) {
+        SmallLoop loop;
+        loop.setup();
+        auto* conn = loop.alloc_conn();
+        REQUIRE(conn != nullptr);
+        Http2Conn h2{};
+        h2.init();
+        h2.nstreams = 1;
+        h2.streams[0] = {1,
+                         Http2StreamState::Open,
+                         static_cast<i32>(kDefaultInitialWindowSize),
+                         static_cast<i32>(kDefaultInitialWindowSize),
+                         true};
+        h2.async_stream = 1;
+        h2.preface_seen = true;
+        h2.our_settings_sent = true;
+        conn->h2 = &h2;
+        conn->epoch_held = true;
+        static u8 upstream[512];
+        const char response[] = "HTTP/1.1 200 OK\r\nContent-Length: 9\r\n\r\n";
+        constexpr u32 kHeaderLen = sizeof(response) - 1;
+        memcpy(upstream, response, kHeaderLen);
+        conn->upstream_recv_buf.bind(upstream, sizeof(upstream));
+        conn->upstream_recv_buf.commit(kHeaderLen);
+        ParsedResponse parsed{};
+        parsed.reset();
+        parsed.status_code = 200;
+        parsed.version = HttpVersion::Http11;
+        parsed.header_count = 1;
+        parsed.headers[0] = {{"content-length", 14}, {"9", 1}};
+        parsed.has_content_length = true;
+        parsed.content_length = 9;
+
+        h2_proxy_finish(&loop, *conn, parsed, kHeaderLen, 0, is_head);
+        REQUIRE_GT(conn->send_buf.len(), 0u);
+        CHECK_EQ(conn->upstream_recv_buf.len(), 0u);
+        CHECK_FALSE(conn->upstream_recv_armed);
+        CHECK_FALSE(conn->upstream_send_armed);
+        CHECK_FALSE(conn->epoch_held);
+        Http2FrameHeader frame{};
+        REQUIRE_EQ(parse_frame_header(conn->send_buf.data(), conn->send_buf.len(), &frame),
+                   ParseStatus::Complete);
+        hpack::DynamicTable decoded;
+        decoded.init(kDefaultHeaderTableSize);
+        hpack::Header headers[8];
+        u8 scratch[256]{};
+        u32 count = 0;
+        REQUIRE(hpack::decode_header_block(decoded,
+                                           conn->send_buf.data() + kFrameHeaderSize,
+                                           frame.length,
+                                           scratch,
+                                           sizeof(scratch),
+                                           headers,
+                                           8,
+                                           &count));
+        bool saw_length = false;
+        for (u32 i = 0; i < count; i++) {
+            if (headers[i].name.eq({"content-length", 14})) {
+                saw_length = headers[i].value.eq({"9", 1});
+            }
+        }
+        CHECK_EQ(saw_length, is_head);
+        const u32 send_len = conn->send_buf.len();
+        loop.inject_and_dispatch(make_ev(conn->id, IoEventType::Send, static_cast<i32>(send_len)));
+        CHECK_EQ(conn->state, ConnState::ReadingHeader);
+    };
+    run(false);
+    run(true);
+}
+
+TEST(http2, proxy_finish_guarded_failure_preserves_pending_synth) {
+    const auto run = [&](bool send_armed,
+                         bool quarantined,
+                         bool bad_bounds = false,
+                         bool fail_submit = false) {
+        SmallLoop loop;
+        loop.setup();
+        auto* conn = loop.alloc_conn();
+        REQUIRE(conn != nullptr);
+        Http2Conn h2{};
+        h2.init();
+        h2.nstreams = 1;
+        h2.streams[0] = {1,
+                         Http2StreamState::Open,
+                         static_cast<i32>(kDefaultInitialWindowSize),
+                         static_cast<i32>(kDefaultInitialWindowSize),
+                         true};
+        h2.async_stream = 1;
+        h2.preface_seen = true;
+        h2.our_settings_sent = true;
+        conn->h2 = &h2;
+        conn->epoch_held = true;
+        conn->upstream_send_armed = send_armed;
+        conn->h2_proxy_synth_quarantined = quarantined;
+        static u8 upstream[512];
+        const char response[] = "HTTP/1.1 200 OK\r\nContent-Length: 3\r\n\r\nabc";
+        constexpr u32 kHeaderLen = sizeof(response) - 1 - 3;
+        memcpy(upstream, response, sizeof(response) - 1);
+        conn->upstream_recv_buf.bind(upstream, sizeof(upstream));
+        conn->upstream_recv_buf.commit(sizeof(response) - 1);
+        memset(h2.pending_synth, 0xA5, sizeof(h2.pending_synth));
+        u8 before[32]{};
+        memcpy(before, h2.pending_synth, sizeof(before));
+        ParsedResponse parsed{};
+        parsed.reset();
+        parsed.status_code = 200;
+        parsed.version = HttpVersion::Http11;
+        loop.backend.fail_send = fail_submit;
+        h2_proxy_finish(&loop, *conn, parsed, bad_bounds ? kHeaderLen + 1 : kHeaderLen, 3, false);
+        if (fail_submit) {
+            CHECK_EQ(h2.outbound_stream, 0u);
+            CHECK_FALSE(conn->epoch_held);
+            CHECK_EQ(loop.free_top, SmallLoop::kMaxConns);
+            return;
+        }
+        REQUIRE_GT(conn->send_buf.len(), 0u);
+        Http2FrameHeader frame{};
+        REQUIRE_EQ(parse_frame_header(conn->send_buf.data(), conn->send_buf.len(), &frame),
+                   ParseStatus::Complete);
+        CHECK_EQ(frame.type, static_cast<u8>(Http2FrameType::Headers));
+        hpack::DynamicTable decoded;
+        decoded.init(kDefaultHeaderTableSize);
+        hpack::Header headers[8];
+        u8 scratch[256]{};
+        u32 count = 0;
+        REQUIRE(hpack::decode_header_block(decoded,
+                                           conn->send_buf.data() + kFrameHeaderSize,
+                                           frame.length,
+                                           scratch,
+                                           sizeof(scratch),
+                                           headers,
+                                           8,
+                                           &count));
+        bool saw_502 = false;
+        for (u32 i = 0; i < count; i++)
+            if (headers[i].name.eq({":status", 7}) && headers[i].value.eq({"502", 3}))
+                saw_502 = true;
+        CHECK(saw_502);
+        CHECK_EQ(h2.outbound_stream, 0u);
+        CHECK_FALSE(conn->epoch_held);
+        CHECK_EQ(h2.pending_synth[0], before[0]);
+        CHECK_EQ(memcmp(h2.pending_synth, before, sizeof(before)), 0);
+        CHECK_EQ(conn->upstream_recv_buf.len(), 0u);
+        CHECK_FALSE(conn->upstream_send_armed);
+        const u32 send_len = conn->send_buf.len();
+        loop.inject_and_dispatch(make_ev(conn->id, IoEventType::Send, static_cast<i32>(send_len)));
+        CHECK_EQ(conn->state, ConnState::ReadingHeader);
+    };
+    run(true, false);
+    run(false, true);
+    run(false, false, true);
+    run(false, false, false, true);
+}
+
+struct H2InitialSubmitCaptureLoop : SmallLoop {
+    bool saw_owner = false;
+    bool saw_proxy_source = false;
+    bool saw_status_200 = false;
+    bool saw_data_abc = false;
+    u32 submit_calls = 0;
+
+    void close_conn(Connection& conn) {
+        if (conn.epoch_held) {
+            epoch_leave();
+            conn.epoch_held = false;
+        }
+        close_conn_impl(conn);
+    }
+
+    bool submit_send(Connection& conn, const u8* buf, u32 len) {
+        submit_calls++;
+        if (conn.h2 != nullptr) {
+            saw_owner =
+                conn.h2->outbound_stream == 1 && conn.h2->outbound_body == conn.h2->pending_synth;
+            saw_proxy_source = conn.h2->outbound_source == H2OutboundBodySource::ProxySynth;
+        }
+        Http2FrameHeader frame{};
+        if (parse_frame_header(buf, len, &frame) == ParseStatus::Complete &&
+            frame.type == static_cast<u8>(Http2FrameType::Headers)) {
+            hpack::DynamicTable decoded;
+            decoded.init(kDefaultHeaderTableSize);
+            hpack::Header headers[8];
+            u8 scratch[256]{};
+            u32 count = 0;
+            if (hpack::decode_header_block(decoded,
+                                           buf + kFrameHeaderSize,
+                                           frame.length,
+                                           scratch,
+                                           sizeof(scratch),
+                                           headers,
+                                           8,
+                                           &count)) {
+                for (u32 i = 0; i < count; i++)
+                    saw_status_200 |=
+                        headers[i].name.eq({":status", 7}) && headers[i].value.eq({"200", 3});
+            }
+            const u32 data_offset = kFrameHeaderSize + frame.length;
+            Http2FrameHeader data{};
+            if (data_offset <= len &&
+                parse_frame_header(buf + data_offset, len - data_offset, &data) ==
+                    ParseStatus::Complete &&
+                data.type == static_cast<u8>(Http2FrameType::Data) && data.stream_id == 1 &&
+                data.length == 3 && (data.flags & http2_flag::kEndStream) != 0 &&
+                len >= data_offset + kFrameHeaderSize + 3)
+                saw_data_abc = memcmp(buf + data_offset + kFrameHeaderSize, "abc", 3) == 0;
+        }
+        return false;
+    }
+};
+
+TEST(http2, initial_owned_submit_failure_captures_proxy_body_headers) {
+    H2InitialSubmitCaptureLoop loop;
+    loop.setup();
+    ShardEpoch epoch{};
+    loop.epoch = &epoch;
+    epoch.epoch.store(1, std::memory_order_release);
+    auto* conn = loop.alloc_conn();
+    REQUIRE(conn != nullptr);
+    Http2Conn h2{};
+    h2.init();
+    h2.nstreams = 1;
+    h2.streams[0] = {1,
+                     Http2StreamState::Open,
+                     static_cast<i32>(kDefaultInitialWindowSize),
+                     static_cast<i32>(kDefaultInitialWindowSize),
+                     true};
+    h2.async_stream = 1;
+    h2.preface_seen = true;
+    h2.our_settings_sent = true;
+    conn->h2 = &h2;
+    conn->epoch_held = true;
+    static u8 upstream[256];
+    const char response[] = "HTTP/1.1 200 OK\r\nContent-Length: 3\r\n\r\nabc";
+    constexpr u32 kHeaderLen = sizeof(response) - 1 - 3;
+    memcpy(upstream, response, sizeof(response) - 1);
+    conn->upstream_recv_buf.bind(upstream, sizeof(upstream));
+    conn->upstream_recv_buf.commit(sizeof(response) - 1);
+    ParsedResponse parsed{};
+    parsed.reset();
+    parsed.status_code = 200;
+    parsed.version = HttpVersion::Http11;
+    parsed.has_content_length = true;
+    parsed.content_length = 3;
+
+    h2_proxy_finish(&loop, *conn, parsed, kHeaderLen, 3, false);
+    CHECK_EQ(loop.submit_calls, 1u);
+    CHECK(h2.outbound_stream == 0);
+    CHECK(loop.saw_owner);
+    CHECK(loop.saw_proxy_source);
+    CHECK(loop.saw_status_200);
+    CHECK(loop.saw_data_abc);
+    CHECK_FALSE(conn->epoch_held);
+    CHECK_EQ(epoch.epoch.load(std::memory_order_acquire), 2u);
+    CHECK_EQ(loop.free_top, SmallLoop::kMaxConns);
+}
+
+TEST(http2, owned_response_submit_failures_release_owner_and_epoch) {
+    SmallLoop loop;
+    loop.setup();
+    auto* conn = loop.alloc_conn();
+    REQUIRE(conn != nullptr);
+    Http2Conn h2{};
+    h2.init();
+    h2.nstreams = 1;
+    h2.streams[0] = {1,
+                     Http2StreamState::Open,
+                     static_cast<i32>(kDefaultInitialWindowSize),
+                     static_cast<i32>(kDefaultInitialWindowSize),
+                     true};
+    conn->h2 = &h2;
+    conn->epoch_held = true;
+    static u8 body[9000];
+    memset(body, 0x3C, sizeof(body));
+    h2.outbound_stream = 1;
+    h2.outbound_body = body;
+    h2.outbound_body_len = sizeof(body);
+    h2.outbound_body_offset = 128;
+    u8 pending_send[64]{};
+    REQUIRE_EQ(conn->send_buf.write(pending_send, sizeof(pending_send)), sizeof(pending_send));
+    conn->send_progress = 0;
+    conn->transition_to_sending(&on_h2_sent<SmallLoop>);
+    loop.backend.fail_send = true;
+    on_h2_sent<SmallLoop>(&loop, *conn, make_ev(conn->id, IoEventType::Send, 1));
+    CHECK_EQ(h2.outbound_stream, 0u);
+    CHECK_FALSE(conn->epoch_held);
+    CHECK_EQ(loop.free_top, SmallLoop::kMaxConns);
+}
+
+TEST(http2, owned_response_data_submit_failure_after_headers_cqe_closes) {
+    SmallLoop loop;
+    loop.setup();
+    auto* conn = loop.alloc_conn();
+    REQUIRE(conn != nullptr);
+    Http2Conn h2{};
+    h2.init();
+    h2.nstreams = 1;
+    h2.streams[0] = {1,
+                     Http2StreamState::Open,
+                     static_cast<i32>(kDefaultInitialWindowSize),
+                     static_cast<i32>(kDefaultInitialWindowSize),
+                     true};
+    h2.async_stream = 1;
+    h2.preface_seen = true;
+    h2.our_settings_sent = true;
+    h2.conn_send_window = 0;
+    conn->h2 = &h2;
+    conn->epoch_held = true;
+    static u8 upstream[256];
+    const char response[] = "HTTP/1.1 200 OK\r\nContent-Length: 9\r\n\r\nproxybody";
+    constexpr u32 kHeaderLen = sizeof(response) - 1 - 9;
+    memcpy(upstream, response, sizeof(response) - 1);
+    conn->upstream_recv_buf.bind(upstream, sizeof(upstream));
+    conn->upstream_recv_buf.commit(sizeof(response) - 1);
+    ParsedResponse parsed{};
+    parsed.reset();
+    parsed.status_code = 200;
+    parsed.version = HttpVersion::Http11;
+    h2_proxy_finish(&loop, *conn, parsed, kHeaderLen, 9, false);
+    REQUIRE_GT(conn->send_buf.len(), 0u);
+    const u32 header_send_len = conn->send_buf.len();
+    loop.inject_and_dispatch(
+        make_ev(conn->id, IoEventType::Send, static_cast<i32>(header_send_len)));
+    CHECK_EQ(h2.outbound_stream, 1u);
+    CHECK_EQ(h2.outbound_body_offset, 0u);
+    loop.backend.fail_send = true;
+    u8 update[kFrameHeaderSize + 4]{};
+    Http2FrameHeader update_header{};
+    update_header.length = 4;
+    update_header.type = static_cast<u8>(Http2FrameType::WindowUpdate);
+    write_frame_header(update, update_header);
+    update[kFrameHeaderSize + 3] = 9;
+    conn->recv_buf.reset();
+    REQUIRE_EQ(conn->recv_buf.write(update, sizeof(update)), sizeof(update));
+    loop.inject_and_dispatch(make_ev(conn->id, IoEventType::Recv, sizeof(update)));
+    CHECK_EQ(h2.outbound_stream, 0u);
+    CHECK_FALSE(conn->epoch_held);
+    CHECK_EQ(loop.free_top, SmallLoop::kMaxConns);
+}
+
+TEST(http2, proxy_synth_capacity_boundary_is_exact) {
+    const auto run = [&](u32 body_len, bool expect_owner) {
+        SmallLoop loop;
+        loop.setup();
+        auto* conn = loop.alloc_conn();
+        REQUIRE(conn != nullptr);
+        Http2Conn h2{};
+        h2.init();
+        h2.nstreams = 1;
+        h2.streams[0] = {1,
+                         Http2StreamState::Open,
+                         static_cast<i32>(kDefaultInitialWindowSize),
+                         static_cast<i32>(kDefaultInitialWindowSize),
+                         true};
+        h2.async_stream = 1;
+        h2.preface_seen = true;
+        h2.our_settings_sent = true;
+        conn->h2 = &h2;
+        conn->epoch_held = true;
+        static u8 upstream[Http2Conn::kBodySynthCap + 256];
+        char header[96]{};
+        const int header_len_i = snprintf(
+            header, sizeof(header), "HTTP/1.1 200 OK\r\nContent-Length: %u\r\n\r\n", body_len);
+        REQUIRE_GT(header_len_i, 0);
+        const u32 header_len = static_cast<u32>(header_len_i);
+        memcpy(upstream, header, header_len);
+        for (u32 i = 0; i < body_len; i++) upstream[header_len + i] = static_cast<u8>(i * 7u);
+        conn->upstream_recv_buf.bind(upstream, sizeof(upstream));
+        conn->upstream_recv_buf.commit(header_len + body_len);
+        ParsedResponse parsed{};
+        parsed.reset();
+        parsed.status_code = 200;
+        parsed.version = HttpVersion::Http11;
+        memset(h2.pending_synth, 0xD7, sizeof(h2.pending_synth));
+        h2_proxy_finish(&loop, *conn, parsed, header_len, body_len, false);
+        if (expect_owner) {
+            CHECK_EQ(h2.outbound_source, H2OutboundBodySource::ProxySynth);
+            CHECK_EQ(h2.outbound_body_len, body_len);
+            CHECK_EQ(h2.outbound_body, h2.pending_synth);
+        } else {
+            CHECK_EQ(h2.outbound_stream, 0u);
+            CHECK_EQ(h2.pending_synth[0], 0xD7);
+            CHECK_FALSE(conn->epoch_held);
+        }
+    };
+    run(Http2Conn::kBodySynthCap, true);
+    run(Http2Conn::kBodySynthCap + 1, false);
+}
+
+TEST(http2, rst_owner_clears_parked_flush_gate_but_preserves_staged_send_gate) {
+    SmallLoop loop;
+    loop.setup();
+    Connection conn{};
+    conn.reset();
+    Http2Conn h2{};
+    h2.init();
+    conn.h2 = &h2;
+    conn.send_armed = false;
+    u8 response[32]{};
+    H2Dispatch<SmallLoop> dispatch{&loop, &conn, response, sizeof(response), 0, false, false};
+
+    h2.outbound_stream = 1;
+    h2.response_flush_pending = true;
+    h2_on_reset_dispatch_cb<SmallLoop>(&dispatch, h2, 1, Http2Error::Cancel);
+    CHECK_EQ(h2.outbound_stream, 0u);
+    CHECK_FALSE(h2.response_flush_pending);
+
+    h2.outbound_stream = 1;
+    h2.response_flush_pending = true;
+    dispatch.resp_len = 1;
+    h2_on_reset_dispatch_cb<SmallLoop>(&dispatch, h2, 1, Http2Error::Cancel);
+    CHECK_EQ(h2.outbound_stream, 0u);
+    CHECK(h2.response_flush_pending);
+}
+
+static u32 rst_owner_route_calls = 0;
+static u64 rst_owner_route_handler(void*, jit::HandlerCtx*, const u8*, u32, void*) {
+    ++rst_owner_route_calls;
+    return jit::HandlerResult::make_status(204).pack();
+}
+
+static u32 staged_body_route_calls = 0;
+static u32 staged_next_route_calls = 0;
+static u64 staged_body_route_handler(void*, jit::HandlerCtx*, const u8*, u32, void*) {
+    ++staged_body_route_calls;
+    return jit::HandlerResult{jit::HandlerAction::ReturnStatus, 200, 1, 0, jit::YieldKind::HttpGet}
+        .pack();
+}
+static u64 staged_next_route_handler(void*, jit::HandlerCtx*, const u8*, u32, void*) {
+    ++staged_next_route_calls;
+    return jit::HandlerResult::make_status(204).pack();
+}
+
+static u64 h2_pending_bodyful_header_handler(void*, jit::HandlerCtx*, const u8*, u32, void*) {
+    auto result =
+        jit::HandlerResult{jit::HandlerAction::ReturnStatus, 200, 1, 1, jit::YieldKind::HttpGet};
+    return result.pack();
+}
+
+static u64 h2_owned_body_header_handler(void*, jit::HandlerCtx*, const u8*, u32, void*) {
+    auto result =
+        jit::HandlerResult{jit::HandlerAction::ReturnStatus, 200, 1, 2, jit::YieldKind::HttpGet};
+    return result.pack();
+}
+
+TEST(http2, rst_owner_processes_next_headers_after_parked_cancel) {
+    SmallLoop loop;
+    loop.setup();
+    RouteConfig config{};
+    REQUIRE_EQ(config.add_jit_handler("/next", kRouteMethodGet, &rst_owner_route_handler, false),
+               1u);
+    const RouteConfig* active = &config;
+    loop.config_ptr = &active;
+    ShardEpoch epoch{};
+    loop.epoch = &epoch;
+    Connection* conn = loop.alloc_conn();
+    REQUIRE(conn != nullptr);
+    conn->fd = 42;
+    const u32 conn_id = conn->id;
+    Http2Conn h2{};
+    h2.init();
+    h2.preface_seen = true;
+    h2.our_settings_sent = true;
+    h2.nstreams = 1;
+    h2.streams[0] = {1,
+                     Http2StreamState::Open,
+                     static_cast<i32>(kDefaultInitialWindowSize),
+                     static_cast<i32>(kDefaultInitialWindowSize),
+                     true};
+    conn->h2 = &h2;
+    conn->epoch_held = true;
+    epoch.epoch.store(1, std::memory_order_release);
+    static u8 upstream[256];
+    const char response[] = "HTTP/1.1 200 OK\r\nContent-Length: 9\r\n\r\nproxybody";
+    constexpr u32 kHeaderLen = sizeof(response) - 1 - 9;
+    memcpy(upstream, response, sizeof(response) - 1);
+    conn->upstream_recv_buf.bind(upstream, sizeof(upstream));
+    conn->upstream_recv_buf.commit(sizeof(response) - 1);
+    ParsedResponse parsed{};
+    parsed.reset();
+    parsed.status_code = 200;
+    parsed.version = HttpVersion::Http11;
+    parsed.has_content_length = true;
+    parsed.content_length = 9;
+    h2.async_stream = 1;
+    h2.conn_send_window = 0;
+    h2_proxy_finish(&loop, *conn, parsed, kHeaderLen, 9, false);
+    REQUIRE_EQ(h2.outbound_source, H2OutboundBodySource::ProxySynth);
+    REQUIRE_GT(conn->send_buf.len(), 0u);
+    const u32 header_send_len = conn->send_buf.len();
+    loop.inject_and_dispatch(
+        make_ev(conn_id, IoEventType::Send, static_cast<i32>(header_send_len)));
+    CHECK_EQ(h2.outbound_stream, 1u);
+    CHECK(h2.response_flush_pending);
+    const hpack::Header request[] = {
+        {{":method", 7}, {"GET", 3}},
+        {{":scheme", 7}, {"https", 5}},
+        {{":path", 5}, {"/next", 5}},
+        {{":authority", 10}, {"example.test", 12}},
+    };
+    u8 block[256]{};
+    u32 block_len = 0;
+    for (const auto& header : request)
+        block_len += hpack::encode_header(block + block_len, header.name, header.value);
+    u8 input[512]{};
+    Http2FrameHeader reset_header{};
+    reset_header.length = 4;
+    reset_header.type = static_cast<u8>(Http2FrameType::RstStream);
+    reset_header.stream_id = 1;
+    write_frame_header(input, reset_header);
+    memset(input + kFrameHeaderSize, 0, 4);
+    Http2FrameHeader headers_header{};
+    headers_header.length = block_len;
+    headers_header.type = static_cast<u8>(Http2FrameType::Headers);
+    headers_header.flags = http2_flag::kEndHeaders | http2_flag::kEndStream;
+    headers_header.stream_id = 3;
+    write_frame_header(input + kFrameHeaderSize + 4, headers_header);
+    memcpy(input + 2 * kFrameHeaderSize + 4, block, block_len);
+    conn->recv_buf.reset();
+    REQUIRE_EQ(conn->recv_buf.write(input, 2 * kFrameHeaderSize + 4 + block_len),
+               2 * kFrameHeaderSize + 4 + block_len);
+    rst_owner_route_calls = 0;
+    loop.backend.inject(make_ev(conn_id, IoEventType::Recv, 2 * kFrameHeaderSize + 4 + block_len));
+    IoEvent events[8];
+    const u32 count = loop.backend.wait(events, 8);
+    REQUIRE_EQ(count, 1u);
+    for (u32 i = 0; i < count; i++) loop.dispatch(events[i]);
+    CHECK_EQ(rst_owner_route_calls, 1u);
+    CHECK_EQ(h2.outbound_stream, 0u);
+    CHECK_FALSE(h2.response_flush_pending);
+    CHECK_FALSE(conn->epoch_held);
+    CHECK_EQ(epoch.epoch.load(std::memory_order_acquire), 2u);
+    REQUIRE_GT(conn->send_buf.len(), 0u);
+    loop.inject_and_dispatch(
+        make_ev(conn_id, IoEventType::Send, static_cast<i32>(conn->send_buf.len())));
+    CHECK_EQ(conn->recv_buf.len(), 0u);
+    CHECK_EQ(conn->state, ConnState::ReadingHeader);
+    CHECK_EQ(h2.outbound_stream, 0u);
+    CHECK_FALSE(h2.response_flush_pending);
+    CHECK_EQ(epoch.epoch.load(std::memory_order_acquire), 2u);
+    CHECK(conn->fd >= 0);
+}
+
+TEST(http2, window_update_owner_processes_next_headers_after_local_reset) {
+    SmallLoop loop;
+    loop.setup();
+    RouteConfig config{};
+    REQUIRE_EQ(config.add_jit_handler("/next", kRouteMethodGet, &rst_owner_route_handler, false),
+               1u);
+    const RouteConfig* active = &config;
+    loop.config_ptr = &active;
+    ShardEpoch epoch{};
+    loop.epoch = &epoch;
+    Connection* conn = loop.alloc_conn();
+    REQUIRE(conn != nullptr);
+    conn->fd = 42;
+    const u32 conn_id = conn->id;
+    Http2Conn h2{};
+    h2.init();
+    h2.preface_seen = true;
+    h2.our_settings_sent = true;
+    h2.nstreams = 1;
+    h2.streams[0] = {1,
+                     Http2StreamState::Open,
+                     static_cast<i32>(kDefaultInitialWindowSize),
+                     static_cast<i32>(kDefaultInitialWindowSize),
+                     true};
+    conn->h2 = &h2;
+    conn->epoch_held = true;
+    epoch.epoch.store(1, std::memory_order_release);
+    static u8 upstream[256];
+    const char response[] = "HTTP/1.1 200 OK\r\nContent-Length: 9\r\n\r\nproxybody";
+    constexpr u32 kHeaderLen = sizeof(response) - 1 - 9;
+    memcpy(upstream, response, sizeof(response) - 1);
+    conn->upstream_recv_buf.bind(upstream, sizeof(upstream));
+    conn->upstream_recv_buf.commit(sizeof(response) - 1);
+    ParsedResponse parsed{};
+    parsed.reset();
+    parsed.status_code = 200;
+    parsed.version = HttpVersion::Http11;
+    parsed.has_content_length = true;
+    parsed.content_length = 9;
+    h2.async_stream = 1;
+    h2.conn_send_window = 0;
+    h2_proxy_finish(&loop, *conn, parsed, kHeaderLen, 9, false);
+    REQUIRE_EQ(h2.outbound_source, H2OutboundBodySource::ProxySynth);
+    REQUIRE_GT(conn->send_buf.len(), 0u);
+    const u32 header_send_len = conn->send_buf.len();
+    loop.inject_and_dispatch(
+        make_ev(conn_id, IoEventType::Send, static_cast<i32>(header_send_len)));
+    CHECK_EQ(h2.outbound_stream, 1u);
+    CHECK(h2.response_flush_pending);
+    const hpack::Header request[] = {
+        {{":method", 7}, {"GET", 3}},
+        {{":scheme", 7}, {"https", 5}},
+        {{":path", 5}, {"/next", 5}},
+        {{":authority", 10}, {"example.test", 12}},
+    };
+    u8 block[256]{};
+    u32 block_len = 0;
+    for (const auto& header : request)
+        block_len += hpack::encode_header(block + block_len, header.name, header.value);
+    u8 input[512]{};
+    Http2FrameHeader reset_header{};
+    reset_header.length = 4;
+    reset_header.type = static_cast<u8>(Http2FrameType::WindowUpdate);
+    reset_header.stream_id = 1;
+    write_frame_header(input, reset_header);
+    memset(input + kFrameHeaderSize, 0, 4);
+    Http2FrameHeader headers_header{};
+    headers_header.length = block_len;
+    headers_header.type = static_cast<u8>(Http2FrameType::Headers);
+    headers_header.flags = http2_flag::kEndHeaders | http2_flag::kEndStream;
+    headers_header.stream_id = 3;
+    write_frame_header(input + kFrameHeaderSize + 4, headers_header);
+    memcpy(input + 2 * kFrameHeaderSize + 4, block, block_len);
+    conn->recv_buf.reset();
+    REQUIRE_EQ(conn->recv_buf.write(input, 2 * kFrameHeaderSize + 4 + block_len),
+               2 * kFrameHeaderSize + 4 + block_len);
+    rst_owner_route_calls = 0;
+    loop.backend.inject(make_ev(conn_id, IoEventType::Recv, 2 * kFrameHeaderSize + 4 + block_len));
+    IoEvent events[8];
+    const u32 count = loop.backend.wait(events, 8);
+    REQUIRE_EQ(count, 1u);
+    for (u32 i = 0; i < count; i++) loop.dispatch(events[i]);
+    CHECK_EQ(rst_owner_route_calls, 1u);
+    Http2FrameHeader emitted_rst{};
+    REQUIRE_EQ(parse_frame_header(conn->send_buf.data(), conn->send_buf.len(), &emitted_rst),
+               ParseStatus::Complete);
+    CHECK_EQ(emitted_rst.type, static_cast<u8>(Http2FrameType::RstStream));
+    CHECK_EQ(emitted_rst.stream_id, 1u);
+    CHECK_EQ(h2.outbound_stream, 0u);
+    CHECK_FALSE(h2.response_flush_pending);
+    CHECK_FALSE(conn->epoch_held);
+    CHECK_EQ(epoch.epoch.load(std::memory_order_acquire), 2u);
+    REQUIRE_GT(conn->send_buf.len(), 0u);
+    loop.inject_and_dispatch(
+        make_ev(conn_id, IoEventType::Send, static_cast<i32>(conn->send_buf.len())));
+    CHECK_EQ(conn->recv_buf.len(), 0u);
+    CHECK_EQ(conn->state, ConnState::ReadingHeader);
+    CHECK_EQ(h2.outbound_stream, 0u);
+    CHECK_FALSE(h2.response_flush_pending);
+    CHECK_EQ(epoch.epoch.load(std::memory_order_acquire), 2u);
+    CHECK(conn->fd >= 0);
+}
+
+TEST(http2, rst_parked_owner_releases_gate_for_next_headers) {
+    SmallLoop loop;
+    loop.setup();
+    RouteConfig config{};
+    static u8 body[9000];
+    memset(body, 'b', sizeof(body));
+    REQUIRE_EQ(config.add_response_body_view(reinterpret_cast<const char*>(body), sizeof(body)),
+               1u);
+    REQUIRE_EQ(config.add_jit_handler("/body", kRouteMethodGet, &staged_body_route_handler, false),
+               1u);
+    REQUIRE_EQ(config.add_jit_handler("/next", kRouteMethodGet, &staged_next_route_handler, false),
+               1u);
+    const RouteConfig* active = &config;
+    loop.config_ptr = &active;
+    ShardEpoch epoch{};
+    loop.epoch = &epoch;
+    epoch.epoch.store(1, std::memory_order_release);
+    Connection* conn = loop.alloc_conn();
+    REQUIRE(conn != nullptr);
+    conn->fd = 42;
+    const u32 conn_id = conn->id;
+    Http2Conn h2{};
+    h2.init();
+    conn->h2 = &h2;
+
+    u8 input[4096]{};
+    u32 input_len = 0;
+    for (u32 i = 0; i < kClientPrefaceLen; i++) input[input_len++] = kClientPreface[i];
+    Http2Settings settings{};
+    settings.set_defaults();
+    input_len += write_settings_frame(input + input_len, settings);
+    auto append_headers = [&](u32 stream_id, const char* path) {
+        const hpack::Header headers[] = {
+            {{":method", 7}, {"GET", 3}},
+            {{":scheme", 7}, {"https", 5}},
+            {{":authority", 10}, {"example.test", 12}},
+            {{":path", 5}, {path, static_cast<u32>(strlen(path))}},
+        };
+        const u32 written = http2_write_headers(
+            input + input_len, sizeof(input) - input_len, stream_id, headers, 4, true);
+        REQUIRE_GT(written, 0u);
+        input_len += written;
+    };
+    append_headers(1, "/body");
+    Http2FrameHeader reset{};
+    reset.length = 4;
+    reset.type = static_cast<u8>(Http2FrameType::RstStream);
+    reset.stream_id = 1;
+    write_frame_header(input + input_len, reset);
+    memset(input + input_len + kFrameHeaderSize, 0, 4);
+    input_len += kFrameHeaderSize + 4;
+    append_headers(3, "/next");
+    conn->transition_to_reading_header(&on_h2_data<SmallLoop>);
+    REQUIRE(loop.submit_recv(*conn));
+    REQUIRE_EQ(conn->recv_buf.write(input, input_len), input_len);
+    staged_body_route_calls = 0;
+    staged_next_route_calls = 0;
+    loop.backend.inject(make_ev(conn_id, IoEventType::Recv, static_cast<i32>(input_len)));
+    IoEvent events[8];
+    u32 count = loop.backend.wait(events, 8);
+    REQUIRE_EQ(count, 1u);
+    for (u32 i = 0; i < count; i++) loop.dispatch(events[i]);
+    CHECK_EQ(staged_body_route_calls, 1u);
+    CHECK_EQ(staged_next_route_calls, 1u);
+    CHECK_EQ(h2.outbound_stream, 0u);
+    CHECK_FALSE(h2.response_flush_pending);
+    CHECK_EQ(conn->recv_buf.len(), 0u);
+    REQUIRE_GT(conn->send_buf.len(), 0u);
+    CHECK_EQ(loop.backend.count_ops(MockOp::Send), 1u);
+    const u32 first_send_len = conn->send_buf.len();
+
+    loop.backend.inject(make_ev(conn_id, IoEventType::Send, static_cast<i32>(first_send_len)));
+    count = loop.backend.wait(events, 8);
+    REQUIRE_EQ(count, 1u);
+    for (u32 i = 0; i < count; i++) loop.dispatch(events[i]);
+    CHECK_EQ(staged_next_route_calls, 1u);
+    CHECK_EQ(epoch.epoch.load(std::memory_order_acquire), 3u);
+    CHECK_EQ(conn->recv_buf.len(), 0u);
+    CHECK_EQ(conn->send_buf.len(), 0u);
+    CHECK_EQ(loop.backend.count_ops(MockOp::Send), 1u);
+    CHECK_EQ(conn->state, ConnState::ReadingHeader);
+    CHECK_EQ(h2.outbound_stream, 0u);
+    CHECK_FALSE(h2.response_flush_pending);
+    CHECK_FALSE(conn->epoch_held);
+    CHECK_EQ(epoch.epoch.load(std::memory_order_acquire), 3u);
+    CHECK(conn->fd >= 0);
+}
+
+TEST(http2, bodyless_then_bodyful_coalesced_h2_responses) {
+    SmallLoop loop;
+    loop.setup();
+    RouteConfig config{};
+    static u8 body[9000];
+    memset(body, 'b', sizeof(body));
+    REQUIRE_EQ(config.add_response_body_view(reinterpret_cast<const char*>(body), sizeof(body)),
+               1u);
+    REQUIRE_EQ(config.add_jit_handler("/body", kRouteMethodGet, &staged_body_route_handler, false),
+               1u);
+    REQUIRE_EQ(config.add_jit_handler("/next", kRouteMethodGet, &staged_next_route_handler, false),
+               1u);
+    const RouteConfig* active = &config;
+    loop.config_ptr = &active;
+    ShardEpoch epoch{};
+    loop.epoch = &epoch;
+    epoch.epoch.store(1, std::memory_order_release);
+    Connection* conn = loop.alloc_conn();
+    REQUIRE(conn != nullptr);
+    conn->fd = 42;
+    const u32 conn_id = conn->id;
+    Http2Conn h2{};
+    h2.init();
+    conn->h2 = &h2;
+    const i32 initial_conn_window = h2.conn_send_window;
+    const i32 initial_stream_window = kDefaultInitialWindowSize;
+    u8 input[4096]{};
+    u32 input_len = 0;
+    for (u32 i = 0; i < kClientPrefaceLen; i++) input[input_len++] = kClientPreface[i];
+    Http2Settings settings{};
+    settings.set_defaults();
+    input_len += write_settings_frame(input + input_len, settings);
+    auto append_headers = [&](u32 stream_id, const char* path) {
+        const hpack::Header headers[] = {
+            {{":method", 7}, {"GET", 3}},
+            {{":scheme", 7}, {"https", 5}},
+            {{":authority", 10}, {"example.test", 12}},
+            {{":path", 5}, {path, static_cast<u32>(strlen(path))}},
+        };
+        const u32 written = http2_write_headers(
+            input + input_len, sizeof(input) - input_len, stream_id, headers, 4, true);
+        REQUIRE_GT(written, 0u);
+        input_len += written;
+    };
+    append_headers(1, "/next");
+    append_headers(3, "/body");
+    conn->transition_to_reading_header(&on_h2_data<SmallLoop>);
+    REQUIRE(loop.submit_recv(*conn));
+    REQUIRE_EQ(conn->recv_buf.write(input, input_len), input_len);
+    staged_body_route_calls = 0;
+    staged_next_route_calls = 0;
+    loop.backend.inject(make_ev(conn_id, IoEventType::Recv, static_cast<i32>(input_len)));
+    IoEvent events[8];
+    u32 count = loop.backend.wait(events, 8);
+    REQUIRE_EQ(count, 1u);
+    for (u32 i = 0; i < count; i++) loop.dispatch(events[i]);
+    CHECK_EQ(staged_next_route_calls, 1u);
+    CHECK_EQ(staged_body_route_calls, 1u);
+    CHECK_EQ(h2.outbound_stream, 3u);
+    CHECK(h2.response_flush_pending);
+    Http2Stream* stream3 = h2.find_stream(3);
+    REQUIRE(stream3 != nullptr);
+    REQUIRE_GT(conn->send_buf.len(), 0u);
+    bool saw_first_headers = false;
+    bool saw_second_headers = false;
+    bool saw_data = false;
+    bool saw_data_end = false;
+    u32 data_bytes = 0;
+    hpack::DynamicTable decoded;
+    decoded.init(kDefaultHeaderTableSize);
+    hpack::Header decoded_headers[16];
+    u8 decoded_scratch[512]{};
+    u32 cursor = 0;
+    while (cursor < conn->send_buf.len()) {
+        Http2FrameHeader frame{};
+        REQUIRE_EQ(parse_frame_header(
+                       conn->send_buf.data() + cursor, conn->send_buf.len() - cursor, &frame),
+                   ParseStatus::Complete);
+        if (frame.type == static_cast<u8>(Http2FrameType::Headers) && frame.stream_id == 1) {
+            saw_first_headers = true;
+            CHECK((frame.flags & http2_flag::kEndStream) != 0);
+            u32 decoded_count = 0;
+            REQUIRE(hpack::decode_header_block(decoded,
+                                               conn->send_buf.data() + cursor + kFrameHeaderSize,
+                                               frame.length,
+                                               decoded_scratch,
+                                               sizeof(decoded_scratch),
+                                               decoded_headers,
+                                               16,
+                                               &decoded_count));
+            bool status_204 = false;
+            for (u32 i = 0; i < decoded_count; i++)
+                if (decoded_headers[i].name.eq({":status", 7}) &&
+                    decoded_headers[i].value.eq({"204", 3}))
+                    status_204 = true;
+            CHECK(status_204);
+        }
+        if (frame.type == static_cast<u8>(Http2FrameType::Headers) && frame.stream_id == 3) {
+            saw_second_headers = true;
+            CHECK((frame.flags & http2_flag::kEndStream) == 0);
+            u32 decoded_count = 0;
+            REQUIRE(hpack::decode_header_block(decoded,
+                                               conn->send_buf.data() + cursor + kFrameHeaderSize,
+                                               frame.length,
+                                               decoded_scratch,
+                                               sizeof(decoded_scratch),
+                                               decoded_headers,
+                                               16,
+                                               &decoded_count));
+            bool status_200 = false;
+            bool length_9000 = false;
+            for (u32 i = 0; i < decoded_count; i++) {
+                if (decoded_headers[i].name.eq({":status", 7}) &&
+                    decoded_headers[i].value.eq({"200", 3}))
+                    status_200 = true;
+                if (decoded_headers[i].name.eq({"content-length", 14}) &&
+                    decoded_headers[i].value.eq({"9000", 4}))
+                    length_9000 = true;
+            }
+            CHECK(status_200);
+            CHECK(length_9000);
+        }
+        cursor += kFrameHeaderSize + frame.length;
+    }
+    CHECK(saw_first_headers);
+    CHECK(saw_second_headers);
+    for (u32 sends = 0; sends < 4 && (h2.outbound_stream != 0 || conn->send_buf.len() != 0);
+         sends++) {
+        const u32 send_len = conn->send_buf.len();
+        REQUIRE_GT(send_len, 0u);
+        u32 data_cursor = 0;
+        while (data_cursor < send_len) {
+            Http2FrameHeader frame{};
+            REQUIRE_EQ(parse_frame_header(
+                           conn->send_buf.data() + data_cursor, send_len - data_cursor, &frame),
+                       ParseStatus::Complete);
+            if (frame.type == static_cast<u8>(Http2FrameType::Data) && frame.stream_id == 3) {
+                saw_data = true;
+                data_bytes += frame.length;
+                saw_data_end |= (frame.flags & http2_flag::kEndStream) != 0;
+                CHECK_EQ(
+                    memcmp(
+                        conn->send_buf.data() + data_cursor + kFrameHeaderSize, body, frame.length),
+                    0);
+            }
+            data_cursor += kFrameHeaderSize + frame.length;
+        }
+        loop.backend.inject(make_ev(conn_id, IoEventType::Send, static_cast<i32>(send_len)));
+        count = loop.backend.wait(events, 8);
+        REQUIRE_EQ(count, 1u);
+        for (u32 i = 0; i < count; i++) loop.dispatch(events[i]);
+    }
+    CHECK_EQ(conn->state, ConnState::ReadingHeader);
+    CHECK_EQ(h2.outbound_stream, 0u);
+    CHECK_FALSE(h2.response_flush_pending);
+    CHECK_FALSE(conn->epoch_held);
+    CHECK(saw_data);
+    CHECK(saw_data_end);
+    CHECK_EQ(data_bytes, 9000u);
+    CHECK_EQ(h2.conn_send_window, initial_conn_window - 9000);
+    CHECK_EQ(stream3->send_window, initial_stream_window - 9000);
+    CHECK_EQ(epoch.epoch.load(std::memory_order_acquire), 3u);
+    CHECK(conn->fd >= 0);
+}
+TEST(http2, pending_body_then_owned_body_preserves_wire_hpack_order) {
+    SmallLoop loop;
+    loop.setup();
+    RouteConfig config{};
+    static u8 body[9000];
+    memset(body, 'b', sizeof(body));
+    REQUIRE_EQ(config.add_response_body_view(reinterpret_cast<const char*>(body), sizeof(body)),
+               1u);
+    const char* pending_names[] = {"x-pending"};
+    const u32 pending_name_lens[] = {9};
+    const char* pending_values[] = {"B"};
+    const u32 pending_value_lens[] = {1};
+    REQUIRE_EQ(config.add_response_header_set(
+                   pending_names, pending_name_lens, pending_values, pending_value_lens, 1),
+               1u);
+    const char* owner_names[] = {"x-owner"};
+    const u32 owner_name_lens[] = {7};
+    const char* owner_values[] = {"A"};
+    const u32 owner_value_lens[] = {1};
+    REQUIRE_EQ(config.add_response_header_set(
+                   owner_names, owner_name_lens, owner_values, owner_value_lens, 1),
+               2u);
+    REQUIRE_EQ(config.add_jit_handler("/pending", 'P', &h2_pending_bodyful_header_handler, true),
+               1u);
+    REQUIRE_EQ(
+        config.add_jit_handler("/body", kRouteMethodGet, &h2_owned_body_header_handler, false), 1u);
+    const RouteConfig* active = &config;
+    loop.config_ptr = &active;
+    ShardEpoch epoch{};
+    loop.epoch = &epoch;
+    Connection* conn = loop.alloc_conn();
+    REQUIRE(conn != nullptr);
+    conn->fd = 42;
+    const u32 conn_id = conn->id;
+    Http2Conn h2{};
+    h2.init();
+    conn->h2 = &h2;
+    u8 input[4096]{};
+    u32 input_len = kClientPrefaceLen;
+    memcpy(input, kClientPreface, kClientPrefaceLen);
+    Http2Settings settings{};
+    settings.set_defaults();
+    input_len += write_settings_frame(input + input_len, settings);
+    const hpack::Header pending[] = {{{":method", 7}, {"POST", 4}},
+                                     {{":scheme", 7}, {"https", 5}},
+                                     {{":authority", 10}, {"example.test", 12}},
+                                     {{":path", 5}, {"/pending", 8}},
+                                     {{"content-length", 14}, {"1", 1}}};
+    input_len +=
+        http2_write_headers(input + input_len, sizeof(input) - input_len, 1, pending, 5, false);
+    const hpack::Header owner[] = {{{":method", 7}, {"GET", 3}},
+                                   {{":scheme", 7}, {"https", 5}},
+                                   {{":authority", 10}, {"example.test", 12}},
+                                   {{":path", 5}, {"/body", 5}}};
+    input_len +=
+        http2_write_headers(input + input_len, sizeof(input) - input_len, 3, owner, 4, true);
+    Http2FrameHeader data_header{};
+    data_header.length = 1;
+    data_header.type = static_cast<u8>(Http2FrameType::Data);
+    data_header.flags = http2_flag::kEndStream;
+    data_header.stream_id = 1;
+    write_frame_header(input + input_len, data_header);
+    input_len += kFrameHeaderSize;
+    input[input_len++] = 'x';
+    REQUIRE_EQ(conn->recv_buf.write(input, input_len), input_len);
+    conn->transition_to_reading_header(&on_h2_data<SmallLoop>);
+    REQUIRE(loop.submit_recv(*conn));
+    loop.backend.inject(make_ev(conn_id, IoEventType::Recv, static_cast<i32>(input_len)));
+    IoEvent events[8];
+    const u32 count = loop.backend.wait(events, 8);
+    REQUIRE_EQ(count, 1u);
+    for (u32 i = 0; i < count; i++) loop.dispatch(events[i]);
+    REQUIRE_GT(conn->send_buf.len(), 0u);
+    CHECK_EQ(h2.outbound_stream, 3u);
+    hpack::DynamicTable decoded;
+    decoded.init(kDefaultHeaderTableSize);
+    hpack::Header decoded_headers[32];
+    u8 scratch[1024]{};
+    bool saw_pending = false;
+    bool saw_owner = false;
+    for (u32 cursor = 0; cursor < conn->send_buf.len();) {
+        Http2FrameHeader frame{};
+        REQUIRE_EQ(parse_frame_header(
+                       conn->send_buf.data() + cursor, conn->send_buf.len() - cursor, &frame),
+                   ParseStatus::Complete);
+        if (frame.type == static_cast<u8>(Http2FrameType::Headers)) {
+            u32 decoded_count = 0;
+            REQUIRE(hpack::decode_header_block(decoded,
+                                               conn->send_buf.data() + cursor + kFrameHeaderSize,
+                                               frame.length,
+                                               scratch,
+                                               sizeof(scratch),
+                                               decoded_headers,
+                                               32,
+                                               &decoded_count));
+            for (u32 i = 0; i < decoded_count; i++) {
+                saw_pending |= decoded_headers[i].name.eq({"x-pending", 9}) &&
+                               decoded_headers[i].value.eq({"B", 1});
+                saw_owner |= decoded_headers[i].name.eq({"x-owner", 7}) &&
+                             decoded_headers[i].value.eq({"A", 1});
+            }
+        }
+        cursor += kFrameHeaderSize + frame.length;
+    }
+    CHECK(saw_pending);
+    CHECK(saw_owner);
+    CHECK_GT(h2.hpack_enc.dyn.nent, 0u);
+    CHECK_EQ(h2.hpack_enc.dyn.nent, decoded.nent);
+    CHECK_EQ(h2.hpack_enc.dyn.byte_used, decoded.byte_used);
+    CHECK_EQ(h2.hpack_enc.dyn.table_size, decoded.table_size);
+    CHECK_EQ(memcmp(h2.hpack_enc.dyn.buf, decoded.buf, decoded.byte_used), 0);
+    u32 data_bytes_stream1 = 0;
+    u32 data_bytes_stream3 = 0;
+    bool data_end_stream1 = false;
+    bool data_end_stream3 = false;
+    for (u32 sends = 0; sends < 16 && conn->send_buf.len() != 0; sends++) {
+        for (u32 cursor = 0; cursor < conn->send_buf.len();) {
+            Http2FrameHeader frame{};
+            REQUIRE_EQ(parse_frame_header(
+                           conn->send_buf.data() + cursor, conn->send_buf.len() - cursor, &frame),
+                       ParseStatus::Complete);
+            if (frame.type == static_cast<u8>(Http2FrameType::Data)) {
+                if (frame.stream_id == 1) {
+                    data_bytes_stream1 += frame.length;
+                    data_end_stream1 |= (frame.flags & http2_flag::kEndStream) != 0;
+                } else if (frame.stream_id == 3) {
+                    data_bytes_stream3 += frame.length;
+                    data_end_stream3 |= (frame.flags & http2_flag::kEndStream) != 0;
+                }
+            }
+            cursor += kFrameHeaderSize + frame.length;
+        }
+        const u32 send_len = conn->send_buf.len();
+        loop.backend.inject(make_ev(conn_id, IoEventType::Send, static_cast<i32>(send_len)));
+        const u32 send_count = loop.backend.wait(events, 8);
+        REQUIRE_EQ(send_count, 1u);
+        for (u32 i = 0; i < send_count; i++) loop.dispatch(events[i]);
+    }
+    CHECK_EQ(data_bytes_stream1, 9000u);
+    CHECK_EQ(data_bytes_stream3, 9000u);
+    CHECK(data_end_stream1);
+    CHECK(data_end_stream3);
+    CHECK(conn->fd >= 0);
+    CHECK_FALSE(conn->epoch_held);
+
+    Http2FrameHeader reset{};
+    reset.length = 4;
+    reset.type = static_cast<u8>(Http2FrameType::RstStream);
+    reset.stream_id = 3;
+    write_frame_header(input + input_len, reset);
+    memset(input + input_len + kFrameHeaderSize, 0, 4);
+    const u32 reset_len = input_len + kFrameHeaderSize + 4;
+    SmallLoop rst_loop;
+    rst_loop.setup();
+    rst_loop.config_ptr = &active;
+    ShardEpoch rst_epoch{};
+    rst_loop.epoch = &rst_epoch;
+    Connection* rst_conn = rst_loop.alloc_conn();
+    REQUIRE(rst_conn != nullptr);
+    rst_conn->fd = 43;
+    const u32 rst_id = rst_conn->id;
+    Http2Conn rst_h2{};
+    rst_h2.init();
+    rst_conn->h2 = &rst_h2;
+    REQUIRE_EQ(rst_conn->recv_buf.write(input, reset_len), reset_len);
+    rst_conn->transition_to_reading_header(&on_h2_data<SmallLoop>);
+    REQUIRE(rst_loop.submit_recv(*rst_conn));
+    rst_loop.backend.inject(make_ev(rst_id, IoEventType::Recv, static_cast<i32>(reset_len)));
+    IoEvent rst_events[8];
+    const u32 rst_count = rst_loop.backend.wait(rst_events, 8);
+    REQUIRE_EQ(rst_count, 1u);
+    for (u32 i = 0; i < rst_count; i++) rst_loop.dispatch(rst_events[i]);
+    CHECK_EQ(rst_h2.outbound_stream, 0u);
+    CHECK_FALSE(rst_conn->epoch_held);
+    CHECK_EQ(rst_loop.backend.count_ops(MockOp::Send), 0u);
+    CHECK_EQ(rst_loop.free_top, SmallLoop::kMaxConns);
+}
+
+TEST(http2, queued_owner_cross_batch_rst_and_window_update) {
+    SmallLoop loop;
+    loop.setup();
+    RouteConfig config{};
+    static u8 body[9000];
+    memset(body, 'b', sizeof(body));
+    REQUIRE_EQ(config.add_response_body_view(reinterpret_cast<const char*>(body), sizeof(body)),
+               1u);
+    const char* pending_names[] = {"x-pending"};
+    const u32 pending_name_lens[] = {9};
+    const char* pending_values[] = {"B"};
+    const u32 pending_value_lens[] = {1};
+    REQUIRE_EQ(config.add_response_header_set(
+                   pending_names, pending_name_lens, pending_values, pending_value_lens, 1),
+               1u);
+    const char* owner_names[] = {"x-owner"};
+    const u32 owner_name_lens[] = {7};
+    const char* owner_values[] = {"A"};
+    const u32 owner_value_lens[] = {1};
+    REQUIRE_EQ(config.add_response_header_set(
+                   owner_names, owner_name_lens, owner_values, owner_value_lens, 1),
+               2u);
+    REQUIRE_EQ(config.add_jit_handler("/pending", 'P', &h2_pending_bodyful_header_handler, true),
+               1u);
+    REQUIRE_EQ(
+        config.add_jit_handler("/body", kRouteMethodGet, &h2_owned_body_header_handler, false), 1u);
+    const RouteConfig* active = &config;
+    loop.config_ptr = &active;
+    ShardEpoch epoch{};
+    loop.epoch = &epoch;
+    epoch.epoch.store(1, std::memory_order_release);
+    Connection* conn = loop.alloc_conn();
+    REQUIRE(conn != nullptr);
+    conn->fd = 42;
+    const u32 conn_id = conn->id;
+    Http2Conn h2{};
+    h2.init();
+    conn->h2 = &h2;
+
+    u8 first[4096]{};
+    u32 first_len = kClientPrefaceLen;
+    memcpy(first, kClientPreface, kClientPrefaceLen);
+    Http2Settings settings{};
+    settings.set_defaults();
+    settings.initial_window_size = 0;
+    first_len += write_settings_frame(first + first_len, settings);
+    const hpack::Header pending[] = {{{":method", 7}, {"POST", 4}},
+                                     {{":scheme", 7}, {"https", 5}},
+                                     {{":authority", 10}, {"example.test", 12}},
+                                     {{":path", 5}, {"/pending", 8}},
+                                     {{"content-length", 14}, {"1", 1}}};
+    first_len +=
+        http2_write_headers(first + first_len, sizeof(first) - first_len, 1, pending, 5, false);
+    const hpack::Header owner[] = {{{":method", 7}, {"GET", 3}},
+                                   {{":scheme", 7}, {"https", 5}},
+                                   {{":authority", 10}, {"example.test", 12}},
+                                   {{":path", 5}, {"/body", 5}}};
+    first_len +=
+        http2_write_headers(first + first_len, sizeof(first) - first_len, 3, owner, 4, true);
+
+    hpack::DynamicTable decoded;
+    decoded.init(kDefaultHeaderTableSize);
+    hpack::Header decoded_headers[32];
+    u8 decoded_scratch[1024]{};
+    auto inspect_headers = [&](bool& saw_pending, bool& saw_owner) {
+        for (u32 cursor = 0; cursor < conn->send_buf.len();) {
+            Http2FrameHeader frame{};
+            REQUIRE_EQ(parse_frame_header(
+                           conn->send_buf.data() + cursor, conn->send_buf.len() - cursor, &frame),
+                       ParseStatus::Complete);
+            if (frame.type == static_cast<u8>(Http2FrameType::Headers)) {
+                u32 decoded_count = 0;
+                REQUIRE(
+                    hpack::decode_header_block(decoded,
+                                               conn->send_buf.data() + cursor + kFrameHeaderSize,
+                                               frame.length,
+                                               decoded_scratch,
+                                               sizeof(decoded_scratch),
+                                               decoded_headers,
+                                               32,
+                                               &decoded_count));
+                for (u32 i = 0; i < decoded_count; i++) {
+                    saw_pending |= decoded_headers[i].name.eq({"x-pending", 9}) &&
+                                   decoded_headers[i].value.eq({"B", 1});
+                    saw_owner |= decoded_headers[i].name.eq({"x-owner", 7}) &&
+                                 decoded_headers[i].value.eq({"A", 1});
+                }
+            }
+            cursor += kFrameHeaderSize + frame.length;
+        }
+    };
+    auto dispatch_recv = [&](const u8* data, u32 len) {
+        REQUIRE_EQ(conn->recv_buf.write(data, len), len);
+        loop.backend.inject(make_ev(conn_id, IoEventType::Recv, static_cast<i32>(len)));
+        IoEvent events[8];
+        const u32 count = loop.backend.wait(events, 8);
+        REQUIRE_EQ(count, 1u);
+        for (u32 i = 0; i < count; i++) loop.dispatch(events[i]);
+    };
+    auto drain_send = [&]() {
+        u32 sends = 0;
+        while (conn->send_buf.len() != 0) {
+            REQUIRE_LT(sends, 16u);
+            sends++;
+            const u32 send_len = conn->send_buf.len();
+            loop.backend.inject(make_ev(conn_id, IoEventType::Send, static_cast<i32>(send_len)));
+            IoEvent events[8];
+            const u32 count = loop.backend.wait(events, 8);
+            REQUIRE_EQ(count, 1u);
+            for (u32 i = 0; i < count; i++) loop.dispatch(events[i]);
+        }
+    };
+
+    conn->transition_to_reading_header(&on_h2_data<SmallLoop>);
+    REQUIRE(loop.submit_recv(*conn));
+    dispatch_recv(first, first_len);
+    REQUIRE_GT(conn->send_buf.len(), 0u);
+    CHECK_EQ(h2.outbound_stream, 3u);
+    CHECK_EQ(h2.queued_stream, 0u);
+    CHECK(h2.response_flush_pending);
+    CHECK(conn->epoch_held);
+    bool saw_pending = false;
+    bool saw_owner = false;
+    inspect_headers(saw_pending, saw_owner);
+    CHECK_FALSE(saw_pending);
+    CHECK(saw_owner);
+    drain_send();
+    CHECK_EQ(h2.outbound_stream, 3u);
+    CHECK(conn->epoch_held);
+
+    u8 data[1 + kFrameHeaderSize]{};
+    Http2FrameHeader data_header{};
+    data_header.length = 1;
+    data_header.type = static_cast<u8>(Http2FrameType::Data);
+    data_header.flags = http2_flag::kEndStream;
+    data_header.stream_id = 1;
+    write_frame_header(data, data_header);
+    data[kFrameHeaderSize] = 'x';
+    dispatch_recv(data, sizeof(data));
+    REQUIRE_GT(conn->send_buf.len(), 0u);
+    CHECK_EQ(h2.outbound_stream, 3u);
+    CHECK_EQ(h2.queued_stream, 1u);
+    CHECK(h2.response_flush_pending);
+    CHECK(conn->epoch_held);
+    saw_pending = false;
+    saw_owner = false;
+    inspect_headers(saw_pending, saw_owner);
+    CHECK(saw_pending);
+    CHECK_FALSE(saw_owner);
+    drain_send();
+    CHECK_EQ(h2.outbound_stream, 3u);
+    CHECK_EQ(h2.queued_stream, 1u);
+    CHECK(conn->epoch_held);
+
+    u8 reset[kFrameHeaderSize + 4]{};
+    Http2FrameHeader reset_header{};
+    reset_header.length = 4;
+    reset_header.type = static_cast<u8>(Http2FrameType::RstStream);
+    reset_header.stream_id = 3;
+    write_frame_header(reset, reset_header);
+    dispatch_recv(reset, sizeof(reset));
+    CHECK_EQ(h2.outbound_stream, 1u);
+    CHECK_EQ(h2.queued_stream, 0u);
+    REQUIRE(h2.find_stream(3) == nullptr);
+    CHECK(h2.response_flush_pending);
+    CHECK(conn->epoch_held);
+
+    u8 updates[2 * (kFrameHeaderSize + 4)]{};
+    auto append_window_update = [](u8* out, u32 stream_id, u32 increment) {
+        Http2FrameHeader header{};
+        header.length = 4;
+        header.type = static_cast<u8>(Http2FrameType::WindowUpdate);
+        header.stream_id = stream_id;
+        write_frame_header(out, header);
+        out[kFrameHeaderSize + 0] = static_cast<u8>(increment >> 24);
+        out[kFrameHeaderSize + 1] = static_cast<u8>(increment >> 16);
+        out[kFrameHeaderSize + 2] = static_cast<u8>(increment >> 8);
+        out[kFrameHeaderSize + 3] = static_cast<u8>(increment);
+    };
+    append_window_update(updates, 0, sizeof(body));
+    append_window_update(updates + kFrameHeaderSize + 4, 1, sizeof(body));
+    dispatch_recv(updates, sizeof(updates));
+    REQUIRE_GT(conn->send_buf.len(), 0u);
+    u32 data_bytes = 0;
+    bool data_end = false;
+    auto inspect_data = [&]() {
+        for (u32 cursor = 0; cursor < conn->send_buf.len();) {
+            Http2FrameHeader frame{};
+            REQUIRE_EQ(parse_frame_header(
+                           conn->send_buf.data() + cursor, conn->send_buf.len() - cursor, &frame),
+                       ParseStatus::Complete);
+            if (frame.type == static_cast<u8>(Http2FrameType::Data)) {
+                CHECK_EQ(frame.stream_id, 1u);
+                REQUIRE_LE(data_bytes + frame.length, static_cast<u32>(sizeof(body)));
+                CHECK_EQ(memcmp(conn->send_buf.data() + cursor + kFrameHeaderSize,
+                                body + data_bytes,
+                                frame.length),
+                         0);
+                data_bytes += frame.length;
+                data_end |= (frame.flags & http2_flag::kEndStream) != 0;
+            }
+            cursor += kFrameHeaderSize + frame.length;
+        }
+    };
+    u32 final_sends = 0;
+    while (conn->send_buf.len() != 0) {
+        REQUIRE_LT(final_sends, 16u);
+        final_sends++;
+        inspect_data();
+        const u32 send_len = conn->send_buf.len();
+        loop.backend.inject(make_ev(conn_id, IoEventType::Send, static_cast<i32>(send_len)));
+        IoEvent events[8];
+        const u32 count = loop.backend.wait(events, 8);
+        REQUIRE_EQ(count, 1u);
+        for (u32 i = 0; i < count; i++) loop.dispatch(events[i]);
+    }
+    CHECK_EQ(data_bytes, sizeof(body));
+    CHECK(data_end);
+    CHECK_EQ(h2.outbound_stream, 0u);
+    CHECK_EQ(h2.queued_stream, 0u);
+    CHECK_FALSE(h2.response_flush_pending);
+    CHECK_FALSE(conn->epoch_held);
+    CHECK_EQ(epoch.epoch.load(std::memory_order_acquire), 3u);
+    CHECK_EQ(conn->state, ConnState::ReadingHeader);
+    CHECK(conn->fd >= 0);
+}
+
+TEST(http2, queued_owner_cross_batch_queued_rst_and_window_update) {
+    SmallLoop loop;
+    loop.setup();
+    RouteConfig config{};
+    static u8 body[9000];
+    memset(body, 'b', sizeof(body));
+    REQUIRE_EQ(config.add_response_body_view(reinterpret_cast<const char*>(body), sizeof(body)),
+               1u);
+    const char* pending_names[] = {"x-pending"};
+    const u32 pending_name_lens[] = {9};
+    const char* pending_values[] = {"B"};
+    const u32 pending_value_lens[] = {1};
+    REQUIRE_EQ(config.add_response_header_set(
+                   pending_names, pending_name_lens, pending_values, pending_value_lens, 1),
+               1u);
+    const char* owner_names[] = {"x-owner"};
+    const u32 owner_name_lens[] = {7};
+    const char* owner_values[] = {"A"};
+    const u32 owner_value_lens[] = {1};
+    REQUIRE_EQ(config.add_response_header_set(
+                   owner_names, owner_name_lens, owner_values, owner_value_lens, 1),
+               2u);
+    REQUIRE_EQ(config.add_jit_handler("/pending", 'P', &h2_pending_bodyful_header_handler, true),
+               1u);
+    REQUIRE_EQ(
+        config.add_jit_handler("/body", kRouteMethodGet, &h2_owned_body_header_handler, false), 1u);
+    const RouteConfig* active = &config;
+    loop.config_ptr = &active;
+    ShardEpoch epoch{};
+    loop.epoch = &epoch;
+    epoch.epoch.store(1, std::memory_order_release);
+    Connection* conn = loop.alloc_conn();
+    REQUIRE(conn != nullptr);
+    conn->fd = 42;
+    const u32 conn_id = conn->id;
+    Http2Conn h2{};
+    h2.init();
+    conn->h2 = &h2;
+
+    u8 first[4096]{};
+    u32 first_len = kClientPrefaceLen;
+    memcpy(first, kClientPreface, kClientPrefaceLen);
+    Http2Settings settings{};
+    settings.set_defaults();
+    settings.initial_window_size = 0;
+    first_len += write_settings_frame(first + first_len, settings);
+    const hpack::Header pending[] = {{{":method", 7}, {"POST", 4}},
+                                     {{":scheme", 7}, {"https", 5}},
+                                     {{":authority", 10}, {"example.test", 12}},
+                                     {{":path", 5}, {"/pending", 8}},
+                                     {{"content-length", 14}, {"1", 1}}};
+    first_len +=
+        http2_write_headers(first + first_len, sizeof(first) - first_len, 1, pending, 5, false);
+    const hpack::Header owner[] = {{{":method", 7}, {"GET", 3}},
+                                   {{":scheme", 7}, {"https", 5}},
+                                   {{":authority", 10}, {"example.test", 12}},
+                                   {{":path", 5}, {"/body", 5}}};
+    first_len +=
+        http2_write_headers(first + first_len, sizeof(first) - first_len, 3, owner, 4, true);
+
+    hpack::DynamicTable decoded;
+    decoded.init(kDefaultHeaderTableSize);
+    hpack::Header decoded_headers[32];
+    u8 decoded_scratch[1024]{};
+    auto inspect_headers = [&](bool& saw_pending, bool& saw_owner) {
+        for (u32 cursor = 0; cursor < conn->send_buf.len();) {
+            Http2FrameHeader frame{};
+            REQUIRE_EQ(parse_frame_header(
+                           conn->send_buf.data() + cursor, conn->send_buf.len() - cursor, &frame),
+                       ParseStatus::Complete);
+            if (frame.type == static_cast<u8>(Http2FrameType::Headers)) {
+                u32 decoded_count = 0;
+                REQUIRE(
+                    hpack::decode_header_block(decoded,
+                                               conn->send_buf.data() + cursor + kFrameHeaderSize,
+                                               frame.length,
+                                               decoded_scratch,
+                                               sizeof(decoded_scratch),
+                                               decoded_headers,
+                                               32,
+                                               &decoded_count));
+                for (u32 i = 0; i < decoded_count; i++) {
+                    saw_pending |= decoded_headers[i].name.eq({"x-pending", 9}) &&
+                                   decoded_headers[i].value.eq({"B", 1});
+                    saw_owner |= decoded_headers[i].name.eq({"x-owner", 7}) &&
+                                 decoded_headers[i].value.eq({"A", 1});
+                }
+            }
+            cursor += kFrameHeaderSize + frame.length;
+        }
+    };
+    auto dispatch_recv = [&](const u8* data, u32 len) {
+        REQUIRE_EQ(conn->recv_buf.write(data, len), len);
+        loop.backend.inject(make_ev(conn_id, IoEventType::Recv, static_cast<i32>(len)));
+        IoEvent events[8];
+        const u32 count = loop.backend.wait(events, 8);
+        REQUIRE_EQ(count, 1u);
+        for (u32 i = 0; i < count; i++) loop.dispatch(events[i]);
+    };
+    auto drain_send = [&]() {
+        u32 sends = 0;
+        while (conn->send_buf.len() != 0) {
+            REQUIRE_LT(sends, 16u);
+            sends++;
+            const u32 send_len = conn->send_buf.len();
+            loop.backend.inject(make_ev(conn_id, IoEventType::Send, static_cast<i32>(send_len)));
+            IoEvent events[8];
+            const u32 count = loop.backend.wait(events, 8);
+            REQUIRE_EQ(count, 1u);
+            for (u32 i = 0; i < count; i++) loop.dispatch(events[i]);
+        }
+    };
+
+    conn->transition_to_reading_header(&on_h2_data<SmallLoop>);
+    REQUIRE(loop.submit_recv(*conn));
+    dispatch_recv(first, first_len);
+    REQUIRE_GT(conn->send_buf.len(), 0u);
+    CHECK_EQ(h2.outbound_stream, 3u);
+    CHECK_EQ(h2.queued_stream, 0u);
+    CHECK(h2.response_flush_pending);
+    CHECK(conn->epoch_held);
+    bool saw_pending = false;
+    bool saw_owner = false;
+    inspect_headers(saw_pending, saw_owner);
+    CHECK_FALSE(saw_pending);
+    CHECK(saw_owner);
+    drain_send();
+    CHECK_EQ(h2.outbound_stream, 3u);
+    CHECK(conn->epoch_held);
+
+    u8 data[1 + kFrameHeaderSize]{};
+    Http2FrameHeader data_header{};
+    data_header.length = 1;
+    data_header.type = static_cast<u8>(Http2FrameType::Data);
+    data_header.flags = http2_flag::kEndStream;
+    data_header.stream_id = 1;
+    write_frame_header(data, data_header);
+    data[kFrameHeaderSize] = 'x';
+    dispatch_recv(data, sizeof(data));
+    REQUIRE_GT(conn->send_buf.len(), 0u);
+    CHECK_EQ(h2.outbound_stream, 3u);
+    CHECK_EQ(h2.queued_stream, 1u);
+    CHECK(h2.response_flush_pending);
+    CHECK(conn->epoch_held);
+    saw_pending = false;
+    saw_owner = false;
+    inspect_headers(saw_pending, saw_owner);
+    CHECK(saw_pending);
+    CHECK_FALSE(saw_owner);
+    drain_send();
+    CHECK_EQ(h2.outbound_stream, 3u);
+    CHECK_EQ(h2.queued_stream, 1u);
+    CHECK(conn->epoch_held);
+
+    u8 reset[kFrameHeaderSize + 4]{};
+    Http2FrameHeader reset_header{};
+    reset_header.length = 4;
+    reset_header.type = static_cast<u8>(Http2FrameType::RstStream);
+    reset_header.stream_id = 1;
+    write_frame_header(reset, reset_header);
+    dispatch_recv(reset, sizeof(reset));
+    CHECK_EQ(h2.outbound_stream, 3u);
+    CHECK_EQ(h2.queued_stream, 0u);
+    REQUIRE(h2.find_stream(1) == nullptr);
+    CHECK(h2.response_flush_pending);
+    CHECK(conn->epoch_held);
+
+    u8 updates[2 * (kFrameHeaderSize + 4)]{};
+    auto append_window_update = [](u8* out, u32 stream_id, u32 increment) {
+        Http2FrameHeader header{};
+        header.length = 4;
+        header.type = static_cast<u8>(Http2FrameType::WindowUpdate);
+        header.stream_id = stream_id;
+        write_frame_header(out, header);
+        out[kFrameHeaderSize + 0] = static_cast<u8>(increment >> 24);
+        out[kFrameHeaderSize + 1] = static_cast<u8>(increment >> 16);
+        out[kFrameHeaderSize + 2] = static_cast<u8>(increment >> 8);
+        out[kFrameHeaderSize + 3] = static_cast<u8>(increment);
+    };
+    append_window_update(updates, 0, sizeof(body));
+    append_window_update(updates + kFrameHeaderSize + 4, 3, sizeof(body));
+    dispatch_recv(updates, sizeof(updates));
+    REQUIRE_GT(conn->send_buf.len(), 0u);
+    u32 data_bytes = 0;
+    bool data_end = false;
+    auto inspect_data = [&]() {
+        for (u32 cursor = 0; cursor < conn->send_buf.len();) {
+            Http2FrameHeader frame{};
+            REQUIRE_EQ(parse_frame_header(
+                           conn->send_buf.data() + cursor, conn->send_buf.len() - cursor, &frame),
+                       ParseStatus::Complete);
+            if (frame.type == static_cast<u8>(Http2FrameType::Data)) {
+                CHECK_EQ(frame.stream_id, 3u);
+                REQUIRE_LE(data_bytes + frame.length, static_cast<u32>(sizeof(body)));
+                CHECK_EQ(memcmp(conn->send_buf.data() + cursor + kFrameHeaderSize,
+                                body + data_bytes,
+                                frame.length),
+                         0);
+                data_bytes += frame.length;
+                data_end |= (frame.flags & http2_flag::kEndStream) != 0;
+            }
+            cursor += kFrameHeaderSize + frame.length;
+        }
+    };
+    u32 final_sends = 0;
+    while (conn->send_buf.len() != 0) {
+        REQUIRE_LT(final_sends, 16u);
+        final_sends++;
+        inspect_data();
+        const u32 send_len = conn->send_buf.len();
+        loop.backend.inject(make_ev(conn_id, IoEventType::Send, static_cast<i32>(send_len)));
+        IoEvent events[8];
+        const u32 count = loop.backend.wait(events, 8);
+        REQUIRE_EQ(count, 1u);
+        for (u32 i = 0; i < count; i++) loop.dispatch(events[i]);
+    }
+    CHECK_EQ(data_bytes, sizeof(body));
+    CHECK(data_end);
+    CHECK_EQ(h2.outbound_stream, 0u);
+    CHECK_EQ(h2.queued_stream, 0u);
+    CHECK_FALSE(h2.response_flush_pending);
+    CHECK_FALSE(conn->epoch_held);
+    CHECK_EQ(epoch.epoch.load(std::memory_order_acquire), 3u);
+    CHECK_EQ(conn->state, ConnState::ReadingHeader);
+    CHECK(conn->fd >= 0);
+}
+
+TEST(http2, bodyless_then_bodyful_owner_rolls_back_on_peer_reset) {
+    SmallLoop loop;
+    loop.setup();
+    RouteConfig config{};
+    static u8 body[9000];
+    memset(body, 'b', sizeof(body));
+    REQUIRE_EQ(config.add_response_body_view(reinterpret_cast<const char*>(body), sizeof(body)),
+               1u);
+    REQUIRE_EQ(config.add_jit_handler("/body", kRouteMethodGet, &staged_body_route_handler, false),
+               1u);
+    REQUIRE_EQ(config.add_jit_handler("/next", kRouteMethodGet, &staged_next_route_handler, false),
+               1u);
+    const RouteConfig* active = &config;
+    loop.config_ptr = &active;
+    ShardEpoch epoch{};
+    loop.epoch = &epoch;
+    epoch.epoch.store(1, std::memory_order_release);
+    Connection* conn = loop.alloc_conn();
+    REQUIRE(conn != nullptr);
+    conn->fd = 42;
+    const u32 conn_id = conn->id;
+    Http2Conn h2{};
+    h2.init();
+    conn->h2 = &h2;
+
+    u8 input[4096]{};
+    u32 input_len = 0;
+    for (u32 i = 0; i < kClientPrefaceLen; i++) input[input_len++] = kClientPreface[i];
+    Http2Settings settings{};
+    settings.set_defaults();
+    input_len += write_settings_frame(input + input_len, settings);
+    auto append_headers = [&](u32 stream_id, const char* path) {
+        const hpack::Header headers[] = {
+            {{":method", 7}, {"GET", 3}},
+            {{":scheme", 7}, {"https", 5}},
+            {{":authority", 10}, {"example.test", 12}},
+            {{":path", 5}, {path, static_cast<u32>(strlen(path))}},
+        };
+        const u32 written = http2_write_headers(
+            input + input_len, sizeof(input) - input_len, stream_id, headers, 4, true);
+        REQUIRE_GT(written, 0u);
+        input_len += written;
+    };
+    append_headers(1, "/next");
+    append_headers(3, "/body");
+    Http2FrameHeader reset{};
+    reset.length = 4;
+    reset.type = static_cast<u8>(Http2FrameType::RstStream);
+    reset.stream_id = 3;
+    write_frame_header(input + input_len, reset);
+    memset(input + input_len + kFrameHeaderSize, 0, 4);
+    input_len += kFrameHeaderSize + 4;
+    conn->transition_to_reading_header(&on_h2_data<SmallLoop>);
+    REQUIRE(loop.submit_recv(*conn));
+    REQUIRE_EQ(conn->recv_buf.write(input, input_len), input_len);
+    staged_body_route_calls = 0;
+    staged_next_route_calls = 0;
+    loop.backend.inject(make_ev(conn_id, IoEventType::Recv, static_cast<i32>(input_len)));
+    IoEvent events[8];
+    u32 count = loop.backend.wait(events, 8);
+    REQUIRE_EQ(count, 1u);
+    for (u32 i = 0; i < count; i++) loop.dispatch(events[i]);
+    CHECK_EQ(staged_next_route_calls, 1u);
+    CHECK_EQ(staged_body_route_calls, 1u);
+    CHECK_EQ(h2.outbound_stream, 0u);
+    CHECK(h2.response_flush_pending);
+    CHECK_EQ(conn->recv_buf.len(), 0u);
+    REQUIRE_GT(conn->send_buf.len(), 0u);
+    bool saw_stream1_headers = false;
+    bool saw_stream3_frame = false;
+    for (u32 offset = 0; offset < conn->send_buf.len();) {
+        Http2FrameHeader frame{};
+        REQUIRE_EQ(parse_frame_header(
+                       conn->send_buf.data() + offset, conn->send_buf.len() - offset, &frame),
+                   ParseStatus::Complete);
+        if (frame.stream_id == 1 && frame.type == static_cast<u8>(Http2FrameType::Headers))
+            saw_stream1_headers = true;
+        if (frame.stream_id == 3 && (frame.type == static_cast<u8>(Http2FrameType::Headers) ||
+                                     frame.type == static_cast<u8>(Http2FrameType::Data)))
+            saw_stream3_frame = true;
+        offset += kFrameHeaderSize + frame.length;
+    }
+    CHECK(saw_stream1_headers);
+    CHECK_FALSE(saw_stream3_frame);
+    const u64 epoch_after_batch = epoch.epoch.load(std::memory_order_acquire);
+    const u32 send_len = conn->send_buf.len();
+    loop.backend.inject(make_ev(conn_id, IoEventType::Send, static_cast<i32>(send_len)));
+    count = loop.backend.wait(events, 8);
+    REQUIRE_EQ(count, 1u);
+    for (u32 i = 0; i < count; i++) loop.dispatch(events[i]);
+    CHECK_EQ(epoch.epoch.load(std::memory_order_acquire), epoch_after_batch);
+    CHECK_EQ(conn->state, ConnState::ReadingHeader);
+    CHECK_FALSE(h2.response_flush_pending);
+    CHECK(conn->fd >= 0);
+}
+
+TEST(http2, bodyless_then_bodyful_owner_rolls_back_on_invalid_window_update) {
+    SmallLoop loop;
+    loop.setup();
+    RouteConfig config{};
+    static u8 body[9000];
+    memset(body, 'b', sizeof(body));
+    REQUIRE_EQ(config.add_response_body_view(reinterpret_cast<const char*>(body), sizeof(body)),
+               1u);
+    REQUIRE_EQ(config.add_jit_handler("/body", kRouteMethodGet, &staged_body_route_handler, false),
+               1u);
+    REQUIRE_EQ(config.add_jit_handler("/next", kRouteMethodGet, &staged_next_route_handler, false),
+               1u);
+    const RouteConfig* active = &config;
+    loop.config_ptr = &active;
+    ShardEpoch epoch{};
+    loop.epoch = &epoch;
+    epoch.epoch.store(1, std::memory_order_release);
+    Connection* conn = loop.alloc_conn();
+    REQUIRE(conn != nullptr);
+    conn->fd = 42;
+    const u32 conn_id = conn->id;
+    Http2Conn h2{};
+    h2.init();
+    conn->h2 = &h2;
+
+    u8 input[4096]{};
+    u32 input_len = 0;
+    for (u32 i = 0; i < kClientPrefaceLen; i++) input[input_len++] = kClientPreface[i];
+    Http2Settings settings{};
+    settings.set_defaults();
+    input_len += write_settings_frame(input + input_len, settings);
+    auto append_headers = [&](u32 stream_id, const char* path) {
+        const hpack::Header headers[] = {
+            {{":method", 7}, {"GET", 3}},
+            {{":scheme", 7}, {"https", 5}},
+            {{":authority", 10}, {"example.test", 12}},
+            {{":path", 5}, {path, static_cast<u32>(strlen(path))}},
+        };
+        const u32 written = http2_write_headers(
+            input + input_len, sizeof(input) - input_len, stream_id, headers, 4, true);
+        REQUIRE_GT(written, 0u);
+        input_len += written;
+    };
+    append_headers(1, "/next");
+    append_headers(3, "/body");
+    Http2FrameHeader reset{};
+    reset.length = 4;
+    reset.type = static_cast<u8>(Http2FrameType::WindowUpdate);
+    reset.stream_id = 3;
+    write_frame_header(input + input_len, reset);
+    memset(input + input_len + kFrameHeaderSize, 0, 4);
+    input_len += kFrameHeaderSize + 4;
+    conn->transition_to_reading_header(&on_h2_data<SmallLoop>);
+    REQUIRE(loop.submit_recv(*conn));
+    REQUIRE_EQ(conn->recv_buf.write(input, input_len), input_len);
+    staged_body_route_calls = 0;
+    staged_next_route_calls = 0;
+    loop.backend.inject(make_ev(conn_id, IoEventType::Recv, static_cast<i32>(input_len)));
+    IoEvent events[8];
+    u32 count = loop.backend.wait(events, 8);
+    REQUIRE_EQ(count, 1u);
+    for (u32 i = 0; i < count; i++) loop.dispatch(events[i]);
+    CHECK_EQ(staged_next_route_calls, 1u);
+    CHECK_EQ(staged_body_route_calls, 1u);
+    CHECK_EQ(h2.outbound_stream, 0u);
+    CHECK(h2.response_flush_pending);
+    CHECK_EQ(conn->recv_buf.len(), 0u);
+    REQUIRE_GT(conn->send_buf.len(), 0u);
+    bool saw_stream1_headers = false;
+    bool saw_stream3_frame = false;
+    for (u32 offset = 0; offset < conn->send_buf.len();) {
+        Http2FrameHeader frame{};
+        REQUIRE_EQ(parse_frame_header(
+                       conn->send_buf.data() + offset, conn->send_buf.len() - offset, &frame),
+                   ParseStatus::Complete);
+        if (frame.stream_id == 1 && frame.type == static_cast<u8>(Http2FrameType::Headers))
+            saw_stream1_headers = true;
+        if (frame.stream_id == 3 && (frame.type == static_cast<u8>(Http2FrameType::Headers) ||
+                                     frame.type == static_cast<u8>(Http2FrameType::Data)))
+            saw_stream3_frame = true;
+        offset += kFrameHeaderSize + frame.length;
+    }
+    CHECK(saw_stream1_headers);
+    CHECK_FALSE(saw_stream3_frame);
+    const u64 epoch_after_batch = epoch.epoch.load(std::memory_order_acquire);
+    const u32 send_len = conn->send_buf.len();
+    loop.backend.inject(make_ev(conn_id, IoEventType::Send, static_cast<i32>(send_len)));
+    count = loop.backend.wait(events, 8);
+    REQUIRE_EQ(count, 1u);
+    for (u32 i = 0; i < count; i++) loop.dispatch(events[i]);
+    CHECK_EQ(epoch.epoch.load(std::memory_order_acquire), epoch_after_batch);
+    CHECK_EQ(conn->state, ConnState::ReadingHeader);
+    CHECK_FALSE(h2.response_flush_pending);
+    CHECK(conn->fd >= 0);
+}
+
 }  // namespace
 
 TEST(connection_base, set_slots_redirects_recv_slot_for_iouring_tls) {
@@ -9249,6 +11871,39 @@ TEST(slice_pool, init_destroy) {
     pool.destroy();
 }
 
+TEST(slice_pool, buffered_response_capacity_covers_each_connection) {
+    static_assert(SlicePool::kMaxBufferedResponseBody == 1u << 20);
+    static_assert(SlicePool::kMaxBufferedResponseSlices == 65u);
+    static_assert(SlicePool::kSlicesPerConnection == 71u);
+    CHECK_EQ(SlicePool::capacity_for_connections(1), 71u);
+    CHECK_EQ(SlicePool::capacity_for_connections(2), 142u);
+
+    SlicePool pool;
+    REQUIRE(pool.init(SlicePool::capacity_for_connections(2)).has_value());
+    u8* ordinary[SlicePool::kOrdinarySlicesPerConnection * 2]{};
+    for (u8*& slice : ordinary) REQUIRE((slice = pool.alloc()) != nullptr);
+
+    std::vector<u8> body(ResponseBodyChain::kMaxBody, 0x5a);
+    std::vector<u8> second_body(ResponseBodyChain::kMaxBody, 0x6b);
+    ResponseBodyChain chain;
+    ResponseBodyChain second_chain;
+    REQUIRE(chain.append(pool, body.data(), ResponseBodyChain::kMaxBody));
+    REQUIRE(second_chain.append(pool, second_body.data(), ResponseBodyChain::kMaxBody));
+    CHECK_EQ(chain.size, ResponseBodyChain::kMaxBody);
+    CHECK_EQ(second_chain.size, ResponseBodyChain::kMaxBody);
+    CHECK_EQ(pool.available(), 0u);
+    CHECK(!chain.append(pool, body.data(), 1));
+    CHECK(!second_chain.append(pool, second_body.data(), 1));
+    CHECK_EQ(chain.size, ResponseBodyChain::kMaxBody);
+    CHECK_EQ(second_chain.size, ResponseBodyChain::kMaxBody);
+
+    chain.release();
+    second_chain.release();
+    for (u8* slice : ordinary) pool.free(slice);
+    CHECK_EQ(pool.available(), pool.max_count);
+    pool.destroy();
+}
+
 TEST(slice_pool, alloc_free) {
     SlicePool pool;
     REQUIRE(pool.init(4).has_value());
@@ -11222,15 +13877,16 @@ TEST(slice_conn, buffers_usable_through_request_cycle) {
 }
 
 TEST(slice_conn, real_eventloop_pool_init) {
-    // Verify real EventLoop allocates pool with 3*kMaxConns slices.
+    // Verify real EventLoop reserves ordinary buffers plus one bounded response
+    // chain for each admitted connection.
     RealLoop* loop = create_real_loop();
     REQUIRE(loop != nullptr);
     auto rc = loop->init(0, -1);
     REQUIRE(rc.has_value());
 
-    // Lazy commit: pool starts empty, max set to 5 * kMaxConns (recv + send + upstream +
-    // the two WebSocket terminate-mode reassembly slices).
-    CHECK_EQ(loop->pool.max_count, RealLoop::kMaxConns * 6);
+    // Lazy commit: pool starts empty; six ordinary slices plus one 1 MiB
+    // response-chain reserve per admitted connection are VA-reserved.
+    CHECK_EQ(loop->pool.max_count, SlicePool::capacity_for_connections(RealLoop::kMaxConns));
     CHECK_EQ(loop->pool.count, 0u);
 
     // Alloc a connection — triggers lazy grow, consumes 2 slices
@@ -18295,15 +20951,15 @@ TEST(buffer_isolation, client_data_during_proxy_ignored) {
     CHECK_EQ(conn->on_upstream_recv, saved_recv);
 }
 
-// Pool sized for 3 slices per connection (recv + send + upstream_recv).
-TEST(buffer_isolation, pool_sized_for_six_slices) {
+// Pool sized for six ordinary slices plus one bounded response-chain reserve
+// per admitted connection.
+TEST(buffer_isolation, pool_sized_for_connection_and_response_reserve) {
     RealLoop* loop = create_real_loop();
     REQUIRE(loop != nullptr);
     auto rc = loop->init(0, -1);
     REQUIRE(rc.has_value());
 
-    // recv + send + upstream_recv + the two WebSocket terminate reassembly slices.
-    CHECK_EQ(loop->pool.max_count, RealLoop::kMaxConns * 6);
+    CHECK_EQ(loop->pool.max_count, SlicePool::capacity_for_connections(RealLoop::kMaxConns));
 
     loop->shutdown();
     destroy_real_loop(loop);
@@ -29589,6 +32245,85 @@ struct ScopedIoUringLoopForRetirement {
     }
 };
 
+TEST(iouring_local_body_epoch, close_defers_leave_until_send_slot_reclaims) {
+    ScopedIoUringLoopForRetirement guard;
+    if (!guard.init()) SKIP("io_uring unavailable");
+    auto* loop = guard.loop;
+    ShardEpoch epoch{};
+    epoch.epoch.store(7, std::memory_order_relaxed);
+    loop->epoch = &epoch;
+    Connection* conn = loop->alloc_conn();
+    REQUIRE(conn != nullptr);
+    const u32 id = conn->id;
+    i32 downstream[2] = {-1, -1};
+    REQUIRE_EQ(rut::test::stream_socketpair(downstream), 0);
+    conn->fd = downstream[0];
+    downstream[0] = -1;
+    static constexpr u8 kBody[1u << 20] = {};
+    conn->keep_alive = true;
+    conn->req_start_us = 1;
+    conn->local_body_cursor = kBody;
+    conn->local_body_send_len = sizeof(kBody);
+    conn->local_body_remaining = 0;
+    conn->send_progress = 32;
+    conn->on_send = &on_response_sent<IoUringEventLoop>;
+    REQUIRE(loop->submit_send(*conn, kBody + 32, sizeof(kBody) - 32));
+
+    loop->close_conn(*conn);
+    CHECK_EQ(epoch.epoch.load(std::memory_order_relaxed), 7u);
+    CHECK_EQ(loop->pending_free_count, 1u);
+    CHECK(loop->conns[id].epoch_leave_deferred);
+    CHECK_EQ(loop->conns[id].local_body_cursor, nullptr);
+
+    REQUIRE_GE(loop->conns[id].pending_ops, 2u);  // Send target plus its close cancellation.
+    for (u32 rounds = 0; loop->conns[id].pending_ops != 0 && rounds < 4; rounds++) {
+        IoEvent events[8]{};
+        const u32 count = loop->backend.wait(events, 1, loop->conns, loop->connection_capacity);
+        REQUIRE_GE(count, 1u);
+        for (u32 i = 0; i < count; i++) {
+            loop->dispatch(events[i]);
+            if (loop->conns[id].pending_ops != 0) {
+                CHECK_EQ(epoch.epoch.load(), 7u);
+                CHECK(loop->conns[id].epoch_leave_deferred);
+                CHECK_EQ(loop->pending_free_count, 1u);
+            }
+        }
+    }
+    CHECK_EQ(loop->conns[id].pending_ops, 0u);
+    CHECK_EQ(loop->pending_free_count, 0u);
+    CHECK_EQ(epoch.epoch.load(std::memory_order_relaxed), 8u);
+    CHECK_FALSE(loop->conns[id].epoch_leave_deferred);
+    loop->reclaim_pending();
+    loop->reclaim_slot(id);
+    CHECK_EQ(epoch.epoch.load(std::memory_order_relaxed), 8u);
+    close(downstream[1]);
+}
+
+TEST(iouring_local_body_epoch, unowned_local_body_send_does_not_defer_epoch) {
+    ScopedIoUringLoopForRetirement guard;
+    if (!guard.init()) SKIP("io_uring unavailable");
+    auto* loop = guard.loop;
+    ShardEpoch epoch{};
+    epoch.epoch.store(9, std::memory_order_relaxed);
+    loop->epoch = &epoch;
+    Connection* conn = loop->alloc_conn();
+    REQUIRE(conn != nullptr);
+    i32 downstream[2] = {-1, -1};
+    REQUIRE_EQ(rut::test::stream_socketpair(downstream), 0);
+    conn->fd = downstream[0];
+    downstream[0] = -1;
+    static constexpr u8 kBody[4096] = {};
+    conn->keep_alive = true;
+    conn->local_body_cursor = kBody;
+    conn->local_body_send_len = sizeof(kBody);
+    conn->on_send = &on_response_sent<IoUringEventLoop>;
+    REQUIRE(loop->submit_send(*conn, kBody, sizeof(kBody)));
+    loop->close_conn(*conn);
+    CHECK_EQ(epoch.epoch.load(std::memory_order_relaxed), 9u);
+    CHECK_FALSE(loop->conns[conn->id].epoch_leave_deferred);
+    close(downstream[1]);
+}
+
 TEST(iouring_response_read_timer,
      armed_owner_blocks_reuse_and_exact_expiry_reclaims_without_live_behavior) {
     ScopedIoUringLoopForRetirement guard;
@@ -30811,6 +33546,23 @@ TEST(iouring_upstream_recv, one_shot_moves_slice_sized_chunks_through_dedicated_
     CHECK_FALSE(backend.provided_buffer_id_valid(
         static_cast<u16>(kLargeProvidedBufIdBase + kLargeProvidedBufCount)));
     fixture.cleanup();
+}
+
+TEST(iouring_upstream_recv, buffered_response_uses_existing_separate_multishot_ring) {
+    ScopedIoUringLoopForRetirement guard;
+    if (!guard.init()) SKIP("io_uring unavailable");
+    auto& backend = guard.loop->backend;
+    const u32 tail = __atomic_load_n(backend.sq_tail, __ATOMIC_ACQUIRE);
+    const u32 pending = backend.pending;
+    REQUIRE(backend.add_first_response_recv(42, 0, 1, true));
+    const auto& sqe = backend.sq_entries[tail & *backend.sq_ring_mask];
+    CHECK_EQ(sqe.opcode, IORING_OP_RECV);
+    CHECK_EQ(sqe.ioprio, IORING_RECV_MULTISHOT);
+    CHECK_EQ(sqe.flags, IOSQE_BUFFER_SELECT);
+    CHECK_EQ(sqe.len, backend.large_buf_ring ? kLargeProvidedBufSize : kProvidedBufSize);
+    CHECK_EQ(sqe.buf_group, backend.large_buf_ring ? kLargeBufGroupId : kBufGroupId);
+    __atomic_store_n(backend.sq_tail, tail, __ATOMIC_RELEASE);
+    backend.pending = pending;
 }
 
 TEST(iouring_upstream_recv, backend_marks_only_empty_ring_enobufs) {
@@ -55425,8 +58177,123 @@ TEST(response_buffering_runtime,
     }
 }
 
+TEST(response_buffering_runtime, body_slices_remain_owned_until_deferred_send_reclamation) {
+    for (const bool pending : {false, true}) {
+        ScopedIoUringLoopForRetirement guard;
+        if (!guard.init()) SKIP("io_uring unavailable");
+        auto* loop = guard.loop;
+        Connection* conn = loop->alloc_conn();
+        REQUIRE(conn != nullptr);
+        u8 body[4096];
+        memset(body, 0x7b, sizeof(body));
+        REQUIRE(conn->response_body_tail.append(loop->pool, body, sizeof(body)));
+        const u8* bytes = conn->response_body_tail.data();
+        const u32 index = (reinterpret_cast<u8*>(conn->response_body_tail.head) - loop->pool.base) /
+                          SlicePool::kSliceSize;
+        const u32 id = conn->id;
+        const u32 free_before = loop->free_top;
+        conn->pending_ops = pending ? 1 : 0;
+        loop->free_conn_impl(*conn);
+        if (pending) {
+            CHECK_EQ(loop->free_top, free_before);
+            CHECK_EQ(loop->pool.in_use_map[index], 1u);
+            CHECK_EQ(loop->conns[id].response_body_tail.data(), bytes);
+            CHECK_EQ(memcmp(bytes, body, sizeof(body)), 0);
+            loop->reclaim_pending();
+            CHECK_EQ(loop->pool.in_use_map[index], 1u);
+            loop->conns[id].pending_ops = 0;
+            loop->reclaim_pending();
+        }
+        CHECK_EQ(loop->pool.in_use_map[index], 0u);
+        CHECK_EQ(loop->conns[id].response_body_tail.size, 0u);
+        CHECK_EQ(loop->free_top, free_before + 1u);
+        loop->reclaim_pending();
+        CHECK_EQ(loop->free_top, free_before + 1u);
+    }
+}
+
+TEST(response_buffering_runtime, empty_provided_ring_rearms_without_losing_buffered_bytes) {
+    for (const bool with_progress : {false, true}) {
+        for (const bool kernel_empty : {false, true}) {
+            ScopedIoUringLoopForRetirement guard;
+            if (!guard.init()) SKIP("io_uring unavailable");
+            auto* loop = guard.loop;
+            RouteConfig config{};
+            REQUIRE(config.add_upstream("backend", 0x7F000001, 9000).has_value());
+            REQUIRE(add_bodyless_non_head_response_read_deadline_bundle(
+                config, 5, ForwardResponseBufferingMode::CompleteContentLength));
+            PrebuiltD2Fixture fixture{};
+            REQUIRE(stage_strict_read_timeout(loop, &config, nullptr, 0, &fixture, true));
+            REQUIRE(arm_staged_response_read_deadline(loop, fixture));
+            Connection& conn = *fixture.conn;
+            static constexpr u8 header[] = "HTTP/1.1 200 OK\r\nContent-Length: 65536\r\n\r\n";
+            REQUIRE_EQ(conn.upstream_recv_buf.write(header, sizeof(header) - 1),
+                       sizeof(header) - 1);
+            const IoEvent first =
+                response_read_copy_event(conn, sizeof(header) - 1, true, 0, sizeof(header) - 1);
+            loop->dispatch_batch(&first, 1);
+            REQUIRE_EQ(conn.response_read_deadline_post_commit_phase,
+                       ResponseReadDeadlinePostCommitPhase::Buffering);
+            u8 bytes[4096];
+            memset(bytes, 0x5a, sizeof(bytes));
+            IoEvent events[2]{};
+            u32 count = 0;
+            if (with_progress) {
+                const u32 begin = conn.buffered_response_len();
+                REQUIRE(conn.response_body_tail.append(loop->pool, bytes, sizeof(bytes)));
+                events[count++] = response_read_copy_event(
+                    conn, sizeof(bytes), true, begin, conn.buffered_response_len());
+            }
+            IoEvent empty{
+                conn.id, -ENOBUFS, 0, 0, IoEventType::UpstreamRecv, 0, 0, conn.upstream_episode};
+            empty.provided_ring_empty = kernel_empty;
+            const u32 id = conn.id;
+            if (kernel_empty) {
+                // Keep the staged operations out of the real kernel. Inject
+                // the empty-ring CQE at the backend boundary that owns retries.
+                auto& backend = loop->backend;
+                __atomic_store_n(backend.sq_tail, fixture.sq_tail_before, __ATOMIC_RELEASE);
+                backend.pending = 0;
+                const u32 cq_tail = __atomic_load_n(backend.cq_tail, __ATOMIC_ACQUIRE);
+                auto& cqe = backend.cq_entries[cq_tail & *backend.cq_ring_mask];
+                cqe.user_data = encode_upstream_event_token(
+                    {id, IoEventType::UpstreamRecv, conn.upstream_episode, 0});
+                cqe.res = -ENOBUFS;
+                cqe.flags = 0;
+                __atomic_store_n(backend.cq_tail, cq_tail + 1u, __ATOMIC_RELEASE);
+                IoEvent harvested[2]{};
+                const u32 pending_ops = conn.pending_ops;
+                REQUIRE_EQ(backend.wait(harvested, 2, loop->conns, IoUringEventLoop::kMaxConns),
+                           0u);
+                CHECK_EQ(backend.pending, 1u);
+                CHECK_EQ(conn.pending_ops, pending_ops);
+                if (count) loop->dispatch_batch(events, count);
+            } else {
+                events[count++] = empty;
+                loop->dispatch_batch(events, count);
+            }
+            if (kernel_empty) {
+                REQUIRE_GE(conn.fd, 0);
+                CHECK(conn.upstream_recv_armed);
+                CHECK_EQ(conn.response_read_deadline_state, ResponseReadDeadlineState::Armed);
+                CHECK_EQ(conn.response_read_deadline_post_commit_origin_received,
+                         with_progress ? sizeof(bytes) : 0u);
+                CHECK_EQ(conn.response_body_tail.size, with_progress ? sizeof(bytes) : 0u);
+                if (with_progress)
+                    CHECK_EQ(memcmp(conn.response_body_tail.data(), bytes, sizeof(bytes)), 0);
+                CHECK_EQ(loop->backend.send_state[id].remaining, 0u);
+                cleanup_prebuilt_d2(loop, fixture);
+            } else {
+                CHECK_EQ(loop->conns[id].fd, -1);
+                CHECK_EQ(loop->backend.send_state[id].remaining, 0u);
+                release_closed_response_read_fixture(fixture);
+            }
+        }
+    }
+}
+
 TEST(response_buffering_runtime,
-     exact_origin_slice_capacity_is_admitted_and_capacity_plus_one_is_atomic) {
+     slice_boundary_and_body_limit_are_admitted_but_limit_plus_one_is_atomic) {
     char header[128];
     u32 exact_cl = SlicePool::kSliceSize - 48u;
     u32 header_len = 0;
@@ -55440,7 +58307,9 @@ TEST(response_buffering_runtime,
     }
     REQUIRE_EQ(header_len + exact_cl, SlicePool::kSliceSize);
 
-    for (const bool overflow : {false, true}) {
+    for (u32 declared :
+         {exact_cl, exact_cl + 1u, ResponseBodyChain::kMaxBody, ResponseBodyChain::kMaxBody + 1u}) {
+        const bool overflow = declared > ResponseBodyChain::kMaxBody;
         ScopedIoUringLoopForRetirement guard;
         if (!guard.init()) SKIP("io_uring unavailable");
         auto* loop = guard.loop;
@@ -55452,7 +58321,6 @@ TEST(response_buffering_runtime,
         REQUIRE(stage_strict_read_timeout(loop, &config, nullptr, 0, &fixture, true));
         REQUIRE(arm_staged_response_read_deadline(loop, fixture));
         Connection& conn = *fixture.conn;
-        const u32 declared = exact_cl + static_cast<u32>(overflow);
         const int n = snprintf(
             header, sizeof(header), "HTTP/1.1 200 OK\r\nContent-Length: %u\r\n\r\n", declared);
         REQUIRE_GT(n, 0);
@@ -55469,9 +58337,9 @@ TEST(response_buffering_runtime,
             REQUIRE_GE(conn.fd, 0);
             CHECK_EQ(conn.response_read_deadline_post_commit_phase,
                      ResponseReadDeadlinePostCommitPhase::Buffering);
-            CHECK_EQ(conn.response_read_deadline_post_commit_raw_header_end +
-                         conn.response_read_deadline_post_commit_declared_body,
-                     conn.upstream_recv_buf.capacity());
+            CHECK_EQ(conn.response_read_deadline_post_commit_declared_body, declared);
+            CHECK_EQ(conn.response_body_tail.size, 0u);  // no eager body allocation
+            CHECK_EQ(conn.upstream_recv_buf.capacity(), SlicePool::kSliceSize);
             CHECK_EQ(loop->backend.send_state[id].remaining, 0u);
             cleanup_prebuilt_d2(loop, fixture);
         }
@@ -56669,6 +59537,195 @@ TEST(response_buffering_runtime, combined_send_short_terminal_results_never_cons
         CHECK_EQ(metrics.requests_total, 0u);
         release_closed_response_read_fixture(fixture);
     }
+}
+
+TEST(response_buffering_runtime,
+     backend_wait_splits_header_prefix_and_buffered_body_overflow_atomically) {
+    ScopedIoUringLoopForRetirement guard;
+    if (!guard.init()) SKIP("io_uring unavailable");
+    auto* loop = guard.loop;
+    RouteConfig config{};
+    REQUIRE(config.add_upstream("backend", 0x7F000001, 9000).has_value());
+    REQUIRE(add_bodyless_non_head_response_read_deadline_bundle(
+        config, 5, ForwardResponseBufferingMode::CompleteContentLength));
+    PrebuiltD2Fixture fixture{};
+    REQUIRE(
+        stage_strict_read_timeout_method(loop, &config, nullptr, 0, &fixture, LogHttpMethod::Get));
+    Connection& conn = *fixture.conn;
+    conn.request_policy_id = static_cast<u16>(RequestPolicyId::Http11FixedStrip);
+    conn.response_read_deadline_upload.request_policy_id = conn.request_policy_id;
+    REQUIRE(arm_staged_response_read_deadline(loop, fixture));
+
+    // Leave only ten bytes in the receive slice.  The CQE completes the
+    // header and carries a body suffix, forcing the suffix into the chain.
+    static constexpr u8 kPrefix[] = "HTTP/1.1 200 OK\r\nContent-Length: 18";
+    conn.upstream_recv_buf.bind(conn.upstream_recv_slice, sizeof(kPrefix) - 1u + 10u);
+    static constexpr u8 kOverflow[] = "\r\n\r\nabcdefghijkl";
+
+    auto& backend = loop->backend;
+    const u16 prefix_buf_id = 10;
+    __builtin_memcpy(
+        backend.buf_base + static_cast<u64>(prefix_buf_id) * 4096, kPrefix, sizeof(kPrefix) - 1u);
+    const u32 prefix_cq_tail = __atomic_load_n(backend.cq_tail, __ATOMIC_ACQUIRE);
+    auto& prefix_cqe = backend.cq_entries[prefix_cq_tail & *backend.cq_ring_mask];
+    prefix_cqe.user_data =
+        encode_upstream_event_token({conn.id, IoEventType::UpstreamRecv, conn.upstream_episode, 0});
+    prefix_cqe.res = sizeof(kPrefix) - 1u;
+    prefix_cqe.flags = IORING_CQE_F_BUFFER | IORING_CQE_F_MORE |
+                       (static_cast<u32>(prefix_buf_id) << IORING_CQE_BUFFER_SHIFT);
+    __atomic_store_n(backend.cq_tail, prefix_cq_tail + 1u, __ATOMIC_RELEASE);
+    backend.pending = 0;
+    IoEvent prefix_event{};
+    REQUIRE_EQ(backend.wait(&prefix_event, 1, loop->conns, loop->connection_capacity), 1u);
+    CHECK_EQ(prefix_event.result, static_cast<i32>(sizeof(kPrefix) - 1u));
+    CHECK_EQ(prefix_event.copy_witness, IoEventCopyWitness::Full);
+    loop->dispatch_batch(&prefix_event, 1);
+    REQUIRE_EQ(conn.upstream_recv_buf.len(), sizeof(kPrefix) - 1u);
+    REQUIRE_EQ(conn.response_read_deadline_post_commit_phase,
+               ResponseReadDeadlinePostCommitPhase::None);
+    CHECK(conn.upstream_recv_armed);
+    CHECK_EQ(conn.response_read_deadline_progress_bytes, sizeof(kPrefix) - 1u);
+    REQUIRE_EQ(conn.upstream_recv_buf.write_avail(), 10u);
+
+    const u16 buf_id = 11;
+    __builtin_memcpy(
+        backend.buf_base + static_cast<u64>(buf_id) * 4096, kOverflow, sizeof(kOverflow) - 1u);
+    const u32 cq_tail = __atomic_load_n(backend.cq_tail, __ATOMIC_ACQUIRE);
+    auto& cqe = backend.cq_entries[cq_tail & *backend.cq_ring_mask];
+    cqe.user_data =
+        encode_upstream_event_token({conn.id, IoEventType::UpstreamRecv, conn.upstream_episode, 0});
+    cqe.res = sizeof(kOverflow) - 1u;
+    cqe.flags = IORING_CQE_F_BUFFER | (static_cast<u32>(buf_id) << IORING_CQE_BUFFER_SHIFT);
+    __atomic_store_n(backend.cq_tail, cq_tail + 1u, __ATOMIC_RELEASE);
+    backend.pending = 0;
+
+    IoEvent event{};
+    REQUIRE_EQ(backend.wait(&event, 1, loop->conns, loop->connection_capacity), 1u);
+    CHECK_EQ(event.result, static_cast<i32>(sizeof(kOverflow) - 1u));
+    CHECK_EQ(event.copy_witness, IoEventCopyWitness::Full);
+    CHECK_EQ(event.copy_begin, sizeof(kPrefix) - 1u);
+    CHECK_EQ(event.copy_end, sizeof(kPrefix) - 1u + sizeof(kOverflow) - 1u);
+    CHECK_EQ(conn.upstream_recv_buf.len(), conn.upstream_recv_buf.capacity());
+    CHECK_EQ(conn.response_body_tail.size, 6u);
+    CHECK_EQ(memcmp(conn.upstream_recv_buf.data(), kPrefix, sizeof(kPrefix) - 1u), 0);
+    CHECK_EQ(memcmp(conn.upstream_recv_buf.data() + sizeof(kPrefix) - 1u, kOverflow, 10u), 0);
+    CHECK_EQ(memcmp(conn.response_body_tail.data(), kOverflow + 10u, 6u), 0);
+
+    loop->dispatch_batch(&event, 1);
+    CHECK(conn.on_upstream_recv == nullptr);
+    REQUIRE_EQ(conn.response_read_deadline_post_commit_raw_header_end, sizeof(kPrefix) - 1u + 4u);
+    CHECK_EQ(conn.response_read_deadline_post_commit_phase,
+             ResponseReadDeadlinePostCommitPhase::Buffering);
+
+    // A later CQE must append wholly after the existing tail, preserving the
+    // logical body order while the header/prefix slice remains the owner.
+    static constexpr u8 kFinalBody[] = "mnopqr";
+    const u16 final_buf_id = 13;
+    __builtin_memcpy(backend.buf_base + static_cast<u64>(final_buf_id) * 4096,
+                     kFinalBody,
+                     sizeof(kFinalBody) - 1u);
+    const u32 final_cq_tail = __atomic_load_n(backend.cq_tail, __ATOMIC_ACQUIRE);
+    auto& final_cqe = backend.cq_entries[final_cq_tail & *backend.cq_ring_mask];
+    final_cqe.user_data =
+        encode_upstream_event_token({conn.id, IoEventType::UpstreamRecv, conn.upstream_episode, 0});
+    final_cqe.res = sizeof(kFinalBody) - 1u;
+    final_cqe.flags =
+        IORING_CQE_F_BUFFER | (static_cast<u32>(final_buf_id) << IORING_CQE_BUFFER_SHIFT);
+    __atomic_store_n(backend.cq_tail, final_cq_tail + 1u, __ATOMIC_RELEASE);
+    backend.pending = 0;
+    IoEvent final_event{};
+    REQUIRE_EQ(backend.wait(&final_event, 1, loop->conns, loop->connection_capacity), 1u);
+    CHECK_EQ(final_event.result, static_cast<i32>(sizeof(kFinalBody) - 1u));
+    CHECK_EQ(final_event.copy_witness, IoEventCopyWitness::Full);
+    CHECK_EQ(conn.response_body_tail.size, 12u);
+    CHECK_EQ(memcmp(conn.response_body_tail.data(), kOverflow + 10u, 6u), 0);
+    CHECK_EQ(memcmp(conn.response_body_tail.data() + 6u, kFinalBody, 6u), 0);
+    CHECK(conn.on_upstream_recv == nullptr);
+    loop->dispatch_batch(&final_event, 1);
+    REQUIRE_GE(conn.fd, 0);
+    REQUIRE_EQ(conn.upstream_fd, -1);
+    REQUIRE_EQ(conn.response_read_deadline_state, ResponseReadDeadlineState::BodyComplete);
+    REQUIRE_EQ(conn.response_read_deadline_post_commit_phase,
+               ResponseReadDeadlinePostCommitPhase::HeaderSend);
+    REQUIRE_EQ(conn.response_read_deadline_post_commit_origin_received, 18u);
+    REQUIRE(conn.send_armed);
+    REQUIRE_EQ(conn.response_read_deadline_send_len, conn.response_header_buf.len());
+    const IoEvent header_sent = exact_response_deadline_send_event(loop, conn);
+    loop->dispatch_batch(&header_sent, 1);
+    REQUIRE_EQ(conn.response_read_deadline_post_commit_phase,
+               ResponseReadDeadlinePostCommitPhase::BodySend);
+    REQUIRE_EQ(conn.response_read_deadline_send_len, 6u);
+    REQUIRE_EQ(__builtin_memcmp(conn.response_read_deadline_send_src, "abcdef", 6u), 0);
+
+    const IoEvent first_body_sent = exact_response_deadline_send_event(loop, conn);
+    loop->dispatch_batch(&first_body_sent, 1);
+    REQUIRE_EQ(conn.response_read_deadline_post_commit_phase,
+               ResponseReadDeadlinePostCommitPhase::BodySend);
+    REQUIRE_EQ(conn.response_read_deadline_send_len, 12u);
+    REQUIRE_EQ(__builtin_memcmp(conn.response_read_deadline_send_src, "ghijklmnopqr", 12u), 0);
+
+    const IoEvent second_body_sent = exact_response_deadline_send_event(loop, conn);
+    loop->dispatch_batch(&second_body_sent, 1);
+    REQUIRE_GE(conn.fd, 0);
+    REQUIRE_EQ(conn.upstream_fd, -1);
+    REQUIRE_EQ(conn.state, ConnState::ReadingHeader);
+    REQUIRE(conn.recv_armed);
+    REQUIRE(conn.on_recv == &on_header_received<IoUringEventLoop>);
+    REQUIRE_EQ(conn.response_read_deadline_state, ResponseReadDeadlineState::None);
+    REQUIRE_EQ(conn.response_read_deadline_post_commit_phase,
+               ResponseReadDeadlinePostCommitPhase::None);
+    REQUIRE_EQ(conn.response_body_tail.size, 0u);
+    REQUIRE_FALSE(conn.send_armed);
+    cleanup_prebuilt_d2(loop, fixture);
+}
+
+TEST(response_buffering_runtime, backend_wait_overflow_allocation_failure_is_atomic) {
+    ScopedIoUringLoopForRetirement guard;
+    if (!guard.init()) SKIP("io_uring unavailable");
+    auto* loop = guard.loop;
+    RouteConfig config{};
+    REQUIRE(config.add_upstream("backend", 0x7F000001, 9000).has_value());
+    REQUIRE(add_bodyless_non_head_response_read_deadline_bundle(
+        config, 5, ForwardResponseBufferingMode::CompleteContentLength));
+    PrebuiltD2Fixture fixture{};
+    REQUIRE(
+        stage_strict_read_timeout_method(loop, &config, nullptr, 0, &fixture, LogHttpMethod::Get));
+    Connection& conn = *fixture.conn;
+    conn.request_policy_id = static_cast<u16>(RequestPolicyId::Http11FixedStrip);
+    conn.response_read_deadline_upload.request_policy_id = conn.request_policy_id;
+    REQUIRE(arm_staged_response_read_deadline(loop, fixture));
+    static constexpr u8 kPrefix[] = "HTTP/1.1 200 OK\r\nContent-Length: 18\r\n";
+    conn.upstream_recv_buf.bind(conn.upstream_recv_slice, sizeof(kPrefix) - 1u + 10u);
+    static constexpr u8 kOverflow[] = "\r\n\r\nabcdefghijkl";
+    REQUIRE_EQ(conn.upstream_recv_buf.write(kPrefix, sizeof(kPrefix) - 1u), sizeof(kPrefix) - 1u);
+    // Consume only the already committed free entries and cap growth at the
+    // committed count. This makes the next chain allocation fail without
+    // committing a full default-capacity pool in the test.
+    const u32 original_max = loop->pool.max_count;
+    loop->pool.max_count = loop->pool.count;
+    std::vector<u8*> held;
+    while (u8* slice = loop->pool.alloc()) held.push_back(slice);
+    const u16 buf_id = 12;
+    __builtin_memcpy(loop->backend.buf_base + static_cast<u64>(buf_id) * 4096,
+                     kOverflow,
+                     sizeof(kOverflow) - 1u);
+    const u32 cq_tail = __atomic_load_n(loop->backend.cq_tail, __ATOMIC_ACQUIRE);
+    auto& cqe = loop->backend.cq_entries[cq_tail & *loop->backend.cq_ring_mask];
+    cqe.user_data =
+        encode_upstream_event_token({conn.id, IoEventType::UpstreamRecv, conn.upstream_episode, 0});
+    cqe.res = sizeof(kOverflow) - 1u;
+    cqe.flags = IORING_CQE_F_BUFFER | (static_cast<u32>(buf_id) << IORING_CQE_BUFFER_SHIFT);
+    __atomic_store_n(loop->backend.cq_tail, cq_tail + 1u, __ATOMIC_RELEASE);
+    loop->backend.pending = 0;
+    IoEvent event{};
+    REQUIRE_EQ(loop->backend.wait(&event, 1, loop->conns, loop->connection_capacity), 1u);
+    CHECK_EQ(event.result, -ENOBUFS);
+    CHECK_EQ(event.copy_witness, IoEventCopyWitness::Invalid);
+    CHECK_EQ(conn.upstream_recv_buf.len(), sizeof(kPrefix) - 1u);
+    CHECK_EQ(conn.response_body_tail.size, 0u);
+    loop->pool.max_count = original_max;
+    for (u8* slice : held) loop->pool.free(slice);
+    cleanup_prebuilt_d2(loop, fixture);
 }
 
 TEST(response_buffering_runtime,
@@ -59231,6 +62288,119 @@ TEST(iouring_final_response, client_reset_waits_for_the_direct_write_completion)
     close(sv[1]);
 }
 
+struct DirectWriteReaderContext {
+    i32 fd;
+    u8* dst;
+    u32 capacity;
+    u32 length;
+    bool saw_fin;
+    bool error;
+};
+
+void* direct_write_reader_main(void* opaque) {
+    auto* ctx = static_cast<DirectWriteReaderContext*>(opaque);
+    const u64 deadline = monotonic_us() + 5'000'000;
+    u8 tail[64 * 1024];
+    while (monotonic_us() < deadline) {
+        pollfd pfd{ctx->fd, POLLIN | POLLHUP, 0};
+        if (::poll(&pfd, 1, 100) <= 0) continue;
+        u8* dst = tail;
+        size_t cap = sizeof(tail);
+        if (ctx->length < ctx->capacity) {
+            dst = ctx->dst + ctx->length;
+            cap = ctx->capacity - ctx->length;
+        }
+        const ssize_t n = ::recv(ctx->fd, dst, cap, 0);
+        if (n > 0) {
+            if (ctx->length < ctx->capacity)
+                ctx->length += static_cast<u32>(n);
+            else
+                ctx->error = true;
+            continue;
+        }
+        if (n == 0) {
+            ctx->saw_fin = true;
+            return nullptr;
+        }
+        if (errno != EINTR && errno != EAGAIN && errno != EWOULDBLOCK) {
+            ctx->error = true;
+            return nullptr;
+        }
+    }
+    ctx->error = true;
+    shutdown(ctx->fd, SHUT_RDWR);
+    return nullptr;
+}
+
+TEST(iouring_final_response, config_body_direct_write_partial_drains_before_close) {
+    ScopedIoUringLoopForRetirement guard;
+    if (!guard.init()) SKIP("io_uring unavailable");
+    auto* loop = guard.loop;
+    if (!loop->backend.nop_inject_result) SKIP("IORING_NOP_INJECT_RESULT unsupported");
+    static u8 body[1u << 20];
+    for (u32 i = 0; i < sizeof(body); i++) body[i] = static_cast<u8>(i * 29u + i / 4096u);
+    RouteConfig config{};
+    REQUIRE_EQ(config.add_response_body_view(reinterpret_cast<const char*>(body), sizeof(body)),
+               1u);
+    ShardEpoch epoch{};
+    epoch.epoch.store(1, std::memory_order_relaxed);
+    loop->epoch = &epoch;
+    Connection* conn = loop->alloc_conn();
+    REQUIRE(conn != nullptr);
+    const u32 cid = conn->id;
+    i32 sv[2] = {-1, -1};
+    REQUIRE_EQ(rut::test::stream_socketpair(sv), 0);
+    const int sndbuf = 4096;
+    REQUIRE_EQ(setsockopt(sv[0], SOL_SOCKET, SO_SNDBUF, &sndbuf, sizeof(sndbuf)), 0);
+    conn->fd = sv[0];
+    conn->request_config = &config;
+    conn->keep_alive = false;
+    conn->req_start_us = monotonic_us();
+    conn->resp_status = 200;
+    conn->local_body_cursor = body;
+    conn->local_body_send_len = sizeof(body);
+    conn->local_body_remaining = 0;
+    conn->local_response_size = sizeof(body);
+    conn->transition_to_sending(&on_response_sent<IoUringEventLoop>);
+
+    static u8 received[1u << 20];
+    DirectWriteReaderContext reader_ctx{sv[1], received, sizeof(received), 0, false, false};
+    pthread_t reader;
+    REQUIRE_EQ(pthread_create(&reader, nullptr, &direct_write_reader_main, &reader_ctx), 0);
+
+    const bool submitted = loop->submit_send(*conn, body, sizeof(body));
+    if (!submitted) {
+        shutdown(sv[1], SHUT_RDWR);
+        pthread_join(reader, nullptr);
+        CHECK(submitted);
+        if (conn->fd >= 0) loop->close_conn(*conn);
+        close(sv[1]);
+        return;
+    }
+    CHECK(conn->direct_write_completion_pending);
+    CHECK_EQ(epoch.epoch.load(std::memory_order_relaxed), 1u);
+    CHECK_EQ(loop->backend.send_state[cid].src, body);
+    CHECK_GT(loop->backend.send_state[cid].offset, 0u);
+    CHECK_GT(loop->backend.send_state[cid].remaining, 0u);
+    IoEvent events[4]{};
+    u32 n = 0;
+    for (u32 attempt = 0; attempt < 1000 && n == 0; attempt++)
+        n = loop->backend.wait(events, 4, loop->conns, IoUringEventLoop::kMaxConns);
+    const bool send_event_ok = n == 1u && events[0].type == IoEventType::Send;
+    if (send_event_ok) loop->dispatch(events[0]);
+    if (!send_event_ok) shutdown(sv[1], SHUT_RDWR);
+    pthread_join(reader, nullptr);
+    CHECK(send_event_ok);
+    CHECK_FALSE(reader_ctx.error);
+    REQUIRE_EQ(reader_ctx.length, sizeof(body));
+    CHECK_EQ(memcmp(received, body, sizeof(body)), 0);
+    CHECK(reader_ctx.saw_fin);
+    CHECK_EQ(loop->conns[cid].fd, -1);
+    CHECK_FALSE(loop->conns[cid].direct_write_completion_pending);
+    CHECK_EQ(epoch.epoch.load(std::memory_order_relaxed), 2u);
+    close(sv[1]);
+}
+
 TEST(iouring_final_response, half_close_waits_for_an_inflight_send) {
     ScopedIoUringLoopForRetirement guard;
     if (!guard.init()) SKIP("io_uring unavailable");
@@ -59301,6 +62471,9 @@ TEST(iouring_final_response, direct_write_is_limited_to_closing_plaintext_local_
     conn->transition_to_sending(&on_response_sent<IoUringEventLoop>);
     const u8* buf = conn->send_buf.data();
     CHECK(loop->final_local_response_send(*conn, buf, 3u));
+    conn->local_body_remaining = 1;
+    CHECK_FALSE(loop->final_local_response_send(*conn, buf, 3u));
+    conn->local_body_remaining = 0;
     CHECK_FALSE(loop->final_local_response_send(*conn, buf, 2u));  // not the whole buffer
     CHECK_FALSE(loop->final_local_response_send(*conn, buf + 1, 2u));
     conn->keep_alive = true;
@@ -66514,6 +69687,97 @@ TEST(response_headers, content_type_removal_suppresses_direct_response_default) 
     CHECK(buf_contains(response, conn.send_buf.len(), "\r\n\r\n{}", 6));
 }
 
+TEST(response_headers, large_config_body_sends_from_pinned_read_only_memory) {
+    for (const bool custom_headers : {false, true}) {
+        SmallLoop loop;
+        loop.setup();
+        loop.inject_and_dispatch(make_ev(0, IoEventType::Accept, 42));
+        auto* conn = loop.find_fd(42);
+        REQUIRE(conn != nullptr);
+        RouteConfig cfg{};
+        static u8 body[1u << 20];
+        for (u32 i = 0; i < sizeof(body); ++i) body[i] = static_cast<u8>(i * 29 + i / 4096);
+        REQUIRE_EQ(cfg.add_response_body_view(reinterpret_cast<const char*>(body), sizeof(body)),
+                   1u);
+        conn->request_config = &cfg;
+        if (custom_headers) {
+            const char* keys[] = {"X-Test"};
+            const u32 key_lens[] = {6};
+            const char* values[] = {"yes"};
+            const u32 value_lens[] = {3};
+            REQUIRE_EQ(cfg.add_response_header_set(keys, key_lens, values, value_lens, 1), 1u);
+        }
+        JitDispatchOutcome outcome{};
+        outcome.kind = JitDispatchOutcome::Kind::ReturnStatus;
+        outcome.status_code = 200;
+        outcome.response_body_idx = 1;
+        outcome.response_headers_idx = custom_headers ? 1 : 0;
+        handle_jit_outcome<SmallLoop>(&loop, *conn, outcome, nullptr, true);
+        const u8* slice = conn->send_buf.data();
+        const u32 capacity = conn->send_buf.capacity();
+        u32 header_end = 0;
+        for (u32 i = 0; i + 4 <= conn->send_buf.len(); ++i) {
+            if (memcmp(slice + i, "\r\n\r\n", 4) == 0) {
+                header_end = i + 4;
+                break;
+            }
+        }
+        REQUIRE_GT(header_end, 0u);
+        CHECK_EQ(conn->local_response_size, header_end + sizeof(body));
+        REQUIRE_EQ(conn->send_buf.data(), slice);
+        REQUIRE_EQ(conn->send_buf.capacity(), capacity);
+        const u32 prefix = conn->send_buf.len() - header_end;
+        REQUIRE_GT(prefix, 0u);
+        CHECK_EQ(memcmp(slice + header_end, body, prefix), 0);
+        on_response_sent<SmallLoop>(
+            &loop, *conn, make_ev(conn->id, IoEventType::Send, conn->send_buf.len()));
+        auto* send = loop.backend.last_op(MockOp::Send);
+        REQUIRE(send != nullptr);
+        CHECK_EQ(send->send_buf, body + prefix);
+        const u32 kChunk = sizeof(body) - prefix;
+        CHECK_EQ(send->send_len, kChunk);
+        CHECK_EQ(conn->local_body_send_len, kChunk);
+        constexpr u32 kPartial = 8192;
+        CHECK_GT(kChunk, kPartial);
+        on_response_sent<SmallLoop>(&loop, *conn, make_ev(conn->id, IoEventType::Send, kPartial));
+        send = loop.backend.last_op(MockOp::Send);
+        REQUIRE(send != nullptr);
+        CHECK_EQ(send->send_buf, body + prefix + kPartial);
+        CHECK_EQ(send->send_len, kChunk - kPartial);
+        on_response_sent<SmallLoop>(
+            &loop, *conn, make_ev(conn->id, IoEventType::Send, kChunk - kPartial));
+        CHECK_EQ(conn->local_body_remaining, 0u);
+        CHECK_EQ(conn->local_body_send_len, 0u);
+        CHECK_EQ(conn->local_body_cursor, nullptr);
+        CHECK_EQ(conn->local_response_size, 0u);
+    }
+}
+
+TEST(response_headers, tls_large_config_body_keeps_bounded_continuation_chunk) {
+    SmallLoop loop;
+    loop.setup();
+    loop.inject_and_dispatch(make_ev(0, IoEventType::Accept, 42));
+    auto* conn = loop.find_fd(42);
+    REQUIRE(conn != nullptr);
+
+    static constexpr u8 kBody[131072] = {};
+    conn->tls_active = true;
+    conn->keep_alive = true;
+    conn->local_body_cursor = kBody;
+    conn->local_body_remaining = sizeof(kBody) - 64 * 1024;
+    conn->local_body_send_len = 64 * 1024;
+    conn->transition_to_sending(&on_response_sent<SmallLoop>);
+    REQUIRE(loop.submit_send(*conn, kBody, 64 * 1024));
+
+    on_response_sent<SmallLoop>(&loop, *conn, make_ev(conn->id, IoEventType::Send, 64 * 1024));
+    auto* send = loop.backend.last_op(MockOp::Send);
+    REQUIRE(send != nullptr);
+    CHECK_EQ(send->send_buf, kBody + 64 * 1024);
+    CHECK_EQ(send->send_len, 64 * 1024u);
+    CHECK_EQ(conn->local_body_remaining, 0u);
+    CHECK_EQ(conn->local_body_send_len, 64 * 1024u);
+}
+
 TEST(response_headers, committed_after_header_preserves_status_reason_body) {
     SmallLoop loop;
     loop.setup();
@@ -68618,7 +71882,7 @@ TEST(connection_capacity, runtime_storage_bounds_and_backend_guards) {
     {
         IoUringEventLoop iouring;
         REQUIRE(iouring.init_slot_storage(32768).has_value());
-        REQUIRE(iouring.pool.init(32768u * 6u, 0).has_value());
+        REQUIRE(iouring.pool.init(SlicePool::capacity_for_connections(32768u), 0).has_value());
         CHECK_EQ(iouring.connection_capacity, 32768u);
         CHECK_EQ(iouring.backend.send_state.size(), 32768u);
         CHECK_EQ(iouring.backend.upstream_send_state.size(), 32768u);
@@ -68665,7 +71929,7 @@ TEST(connection_capacity, runtime_storage_bounds_and_backend_guards) {
     {
         EpollEventLoop epoll;
         REQUIRE(epoll.init_slot_storage(32768).has_value());
-        REQUIRE(epoll.pool.init(32768u * 6u, 0).has_value());
+        REQUIRE(epoll.pool.init(SlicePool::capacity_for_connections(32768u), 0).has_value());
         CHECK_EQ(epoll.connection_capacity, 32768u);
         CHECK_EQ(epoll.backend.downstream_fd_map.size(), 32768u);
         CHECK_EQ(epoll.backend.upstream_fd_map.size(), 32768u);

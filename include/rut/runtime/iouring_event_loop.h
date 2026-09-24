@@ -176,8 +176,7 @@ public:
     static constexpr u32 kTlsOutHigh =
         kTlsOutBufCap - kTlsRecordMax;                    // pause upstream recv above this
     static constexpr u32 kTlsOutLow = kTlsOutBufCap / 4;  // resume below this
-    static constexpr u32 kTlsDrainChunk =
-        SlicePool::kSliceSize;  // a raw send submits ≤ this at once
+    static constexpr u32 kTlsDrainChunk = kTlsRecordMax;  // keep one TLS record within a raw send
     static constexpr u32 kDefaultKeepaliveTimeout = 60;
     // Deadline (seconds; coarse 1s timer-wheel resolution) for a connection in
     // the Proxying state. SCOPE: the post-connect phase only — from the upstream
@@ -419,16 +418,16 @@ public:
         response_read_batch_pin_count = 0;
         deferred_accept_count = 0;
         timer.init();
-        // Plaintext needs recv + send + lazy upstream_recv. TLS termination adds
-        // one long-lived ciphertext output slice per connection. TLS input uses
-        // a slightly larger mmap buffer so one full ciphertext record fits.
-        // tls_server is wired after init(), so reserve for the TLS-capable case.
-        auto pooled = pool.init(connection_capacity * 6, pool_prealloc);
+        // Reserve six ordinary slices and one complete bounded response chain
+        // per admitted connection. TLS input remains separately mmap-backed.
+        auto pooled =
+            pool.init(SlicePool::capacity_for_connections(connection_capacity), pool_prealloc);
         if (!pooled) {
             backend.shutdown();
             destroy_slot_storage();
             return core::make_unexpected(pooled.error());
         }
+        backend.response_pool = &pool;
         auto h2p = h2_pool.init();
         if (!h2p) {
             pool.destroy();
@@ -534,6 +533,10 @@ public:
         close_deferred_idle_return_fds();
         reclaim_pending();
         backend.shutdown();
+        // No CQE can arrive after the backend is stopped.  Release any
+        // deferred config epochs now so shutdown does not leave a shard pinned
+        // forever when the kernel never returned a cancelled Send.
+        for (u32 i = 0; i < pending_free_count; i++) release_deferred_epoch(conns[pending_free[i]]);
         h2_pool.destroy();
         pool.destroy();
         if (capture_region_) {
@@ -1418,6 +1421,17 @@ public:
         return begin_upstream_retirement_impl(c, selected_targets, false, true);
     }
 
+    // Use the existing separate receive ring so a large buffered origin
+    // cannot consume all buffers needed by downstream TLS requests.
+    bool add_response_read_recv(Connection& c) {
+        return backend.add_first_response_recv(
+            c.upstream_fd,
+            c.id,
+            c.upstream_episode,
+            c.response_read_deadline_buffering ==
+                ForwardResponseBufferingMode::CompleteContentLength);
+    }
+
     // Exact one-dispatch witness for a positive terminal upstream Recv.  The
     // owner was captured before generic CQE accounting consumed the armed flag
     // and pending count.  It is intentionally stored only in the bounded batch
@@ -1436,7 +1450,7 @@ public:
             ev.copy_deadline_profile != static_cast<u8>(profile) ||
             ev.copy_deadline_method != method || ev.copy_end < ev.copy_begin ||
             ev.copy_end - ev.copy_begin != static_cast<u32>(ev.result) ||
-            ev.copy_end != c.upstream_recv_buf.len() || c.upstream_episode != upstream_episode)
+            ev.copy_end != c.buffered_response_len() || c.upstream_episode != upstream_episode)
             return false;
         const u16 owner_index = response_read_batch_event_owner[response_read_batch_event_index];
         if (owner_index == 0 || owner_index > response_read_batch_owner_count) return false;
@@ -1448,7 +1462,7 @@ public:
                owner.positive_terminal && !owner.terminal_fault && !owner.clean_eof &&
                !owner.terminal_error && owner.last_relevant == response_read_batch_event_index &&
                owner.last_positive == response_read_batch_event_index &&
-               owner.expected_copy_end == c.upstream_recv_buf.len();
+               owner.expected_copy_end == c.buffered_response_len();
     }
 
     // The strict no-body metadata success is evidenced only while the origin's
@@ -1901,14 +1915,14 @@ public:
                        src == c.response_header_buf.data() && len == c.response_header_buf.len() &&
                        c.response_read_deadline_post_commit_inflight_body == 0 &&
                        c.upstream_send_len == c.response_read_deadline_post_commit_raw_header_end &&
-                       c.upstream_recv_buf.len() >= c.upstream_send_len;
+                       c.buffered_response_len() >= c.upstream_send_len;
             case ResponseReadDeadlineSendKind::Body:
                 return c.response_read_deadline_post_commit_phase ==
                            ResponseReadDeadlinePostCommitPhase::BodySend &&
                        callback == &on_response_body_sent<Self> &&
-                       src == c.upstream_recv_buf.data() &&
+                       src == c.buffered_response_data() &&
                        len == c.response_read_deadline_post_commit_inflight_body && len != 0 &&
-                       c.upstream_send_len == len && c.upstream_recv_buf.len() >= len;
+                       c.upstream_send_len == len && c.buffered_response_len() >= len;
             case ResponseReadDeadlineSendKind::Combined:
                 return c.response_read_deadline_post_commit_phase ==
                            ResponseReadDeadlinePostCommitPhase::CombinedSend &&
@@ -1968,7 +1982,7 @@ public:
               c.response_read_deadline_post_commit_phase ==
                   ResponseReadDeadlinePostCommitPhase::BodySend &&
               c.on_send == &on_response_body_sent<Self> &&
-              c.response_read_deadline_send_src == c.upstream_recv_buf.data() &&
+              c.response_read_deadline_send_src == c.buffered_response_data() &&
               c.response_read_deadline_send_len ==
                   c.response_read_deadline_post_commit_inflight_body) ||
              (combined &&
@@ -2547,6 +2561,13 @@ public:
         response_read_batch_pins[response_read_batch_pin_count++] = cid;
     }
 
+    void release_deferred_epoch(Connection& c) {
+        if (c.epoch_leave_deferred) {
+            epoch_leave();
+            c.epoch_leave_deferred = false;
+        }
+    }
+
     void reclaim_slot(u32 cid) {
         if (cid >= connection_capacity || response_read_batch_reuse_pinned(cid) ||
             strict_upstream_retirement_blocks_reclaim(conns[cid]) ||
@@ -2584,6 +2605,8 @@ public:
             pool.free(conns[cid].response_header_slice);
             conns[cid].response_header_slice = nullptr;
         }
+        release_deferred_epoch(conns[cid]);
+        conns[cid].response_body_tail.release();
         free_tls_in_buf(conns[cid]);
         free_tls_out_buf(conns[cid]);
         if (!conns[cid].upstream_episode_quarantined) free_stack[free_top++] = cid;
@@ -2617,6 +2640,8 @@ public:
                     pool.free(conns[cid].response_header_slice);
                     conns[cid].response_header_slice = nullptr;
                 }
+                release_deferred_epoch(conns[cid]);
+                conns[cid].response_body_tail.release();
                 free_tls_in_buf(conns[cid]);
                 free_tls_out_buf(conns[cid]);
                 if (!conns[cid].upstream_episode_quarantined) free_stack[free_top++] = cid;
@@ -2698,8 +2723,10 @@ public:
             if (c.upstream_recv_slice) pool.free(c.upstream_recv_slice);
             if (c.upstream_relay_slice) pool.free(c.upstream_relay_slice);
             if (c.response_header_slice) pool.free(c.response_header_slice);
+            c.response_body_tail.release();
             free_tls_in_buf(c);
             free_tls_out_buf(c);
+            release_deferred_epoch(c);
             c.reset();
             if (!c.upstream_episode_quarantined) free_stack[free_top++] = cid;
             return;
@@ -2707,6 +2734,7 @@ public:
         // Kernel ownership remains: defer until its CQEs drain.
         u8* rs = c.recv_slice;
         u8* ss = c.send_slice;
+        auto response_body_tail = c.response_body_tail;
         u8* us = c.upstream_recv_slice;
         u8* relay = c.upstream_relay_slice;
         u8* hs = c.response_header_slice;
@@ -2728,12 +2756,14 @@ public:
             c.response_read_deadline_send_close_target_owned;
         const bool deadline_send_close_cancel_owned =
             c.response_read_deadline_send_close_cancel_owned;
+        const bool epoch_leave_deferred = c.epoch_leave_deferred;
         c.reset();
         conns[cid].id = cid;
         conns[cid].shard_id = allocated_shard;
         conns[cid].recv_slice = rs;
         conns[cid].recv_slice_capacity = rs != nullptr ? SlicePool::kSliceSize : 0;
         conns[cid].send_slice = ss;
+        conns[cid].response_body_tail = response_body_tail;
         conns[cid].upstream_recv_slice = us;
         conns[cid].upstream_relay_slice = relay;
         conns[cid].response_header_slice = hs;
@@ -2754,6 +2784,7 @@ public:
             deadline_send_close_target_owned;
         conns[cid].response_read_deadline_send_close_cancel_owned =
             deadline_send_close_cancel_owned;
+        conns[cid].epoch_leave_deferred = epoch_leave_deferred;
         pending_free[pending_free_count++] = cid;
     }
 
@@ -3006,7 +3037,10 @@ public:
         return backend.nop_inject_result && !c.tls_active && !c.keep_alive && c.fd >= 0 &&
                !c.send_armed && len != 0 && len <= static_cast<u32>(INT32_MAX) &&
                c.on_send == &on_response_sent<Self> && c.send_progress == 0 &&
-               buf == c.send_buf.data() && len == c.send_buf.len();
+               c.local_body_remaining == 0 &&
+               ((buf == c.send_buf.data() && len == c.send_buf.len() &&
+                 c.local_body_send_len == 0) ||
+                (buf == c.local_body_cursor && len == c.local_body_send_len));
     }
 
     bool submit_send_impl(Connection& c, const u8* buf, u32 len) {
@@ -3298,7 +3332,7 @@ public:
             !tls_arm_owner || c.upstream_fd < 0 || c.upstream_reused || c.upstream_attempts != 1 ||
             !valid_upstream_episode(c.upstream_episode) || c.upstream_episode_quarantined ||
             !c.request_upload_complete || c.upstream_request_incomplete ||
-            c.upstream_recv_buf.len() != 0 || c.on_upstream_recv != &on_upstream_response<Self> ||
+            c.buffered_response_len() != 0 || c.on_upstream_recv != &on_upstream_response<Self> ||
             c.on_upstream_send != nullptr || c.upstream_connect_armed || c.upstream_send_armed ||
             c.upstream_recv_armed || c.upstream_recv_paused_for_send ||
             c.upstream_recv_pause_cancel_pending || c.upstream_recv_pause_rearm_pending ||
@@ -3311,7 +3345,7 @@ public:
             c.h2_proxy_recv_draining || c.h2_proxy_synth_quarantined ||
             c.pending_ops != ordinary_pending)
             return false;
-        if (!backend.add_first_response_recv(c.upstream_fd, c.id, c.upstream_episode)) {
+        if (!add_response_read_recv(c)) {
             c.clear_response_read_deadline();
             return false;
         }
@@ -3370,7 +3404,7 @@ public:
                 c.response_read_deadline_bundle_id,
                 ResponseReadDeadlineOwnerPhase::ActiveAfterCopy,
                 &on_upstream_response<Self>,
-                c.upstream_recv_buf.len(),
+                c.buffered_response_len(),
                 allow_consumed_terminal_episode);
         }
         if (streaming_response_read_timer_is_stable(c)) return true;
@@ -3427,7 +3461,7 @@ public:
                    ev.upstream_episode == c.upstream_episode &&
                    ev.copy_witness == IoEventCopyWitness::Full && ev.copy_end >= ev.copy_begin &&
                    ev.copy_end - ev.copy_begin == static_cast<u32>(ev.result) &&
-                   ev.copy_end == c.upstream_recv_buf.len() &&
+                   ev.copy_end == c.buffered_response_len() &&
                    ev.copy_deadline_generation == c.response_read_deadline_generation &&
                    ev.copy_deadline_profile == static_cast<u8>(c.response_read_deadline_profile) &&
                    ev.copy_deadline_method == c.response_read_deadline_method;
@@ -3438,7 +3472,7 @@ public:
             ev.upstream_episode != c.upstream_episode ||
             ev.copy_witness != IoEventCopyWitness::Full || ev.copy_end < ev.copy_begin ||
             ev.copy_end - ev.copy_begin != static_cast<u32>(ev.result) ||
-            ev.copy_end != c.upstream_recv_buf.len() ||
+            ev.copy_end != c.buffered_response_len() ||
             ev.copy_deadline_generation != c.response_read_deadline_generation ||
             ev.copy_deadline_profile != static_cast<u8>(c.response_read_deadline_profile) ||
             ev.copy_deadline_method != c.response_read_deadline_method)
@@ -3872,7 +3906,7 @@ public:
             const Connection& c = conns[owner.conn_id];
             if (!owner.saw_relevant && !owner.saw_precise_timer) owner.valid = false;
             const u32 pre_batch_bytes =
-                owner.saw_positive ? owner.first_copy_begin : c.upstream_recv_buf.len();
+                owner.saw_positive ? owner.first_copy_begin : c.buffered_response_len();
             const bool no_prior_progress = c.response_read_deadline_progress_generation == 0 &&
                                            c.response_read_deadline_progress_episode == 0 &&
                                            c.response_read_deadline_progress_bytes == 0;
@@ -3904,7 +3938,7 @@ public:
             if (owner.saw_positive &&
                 (owner.first_copy_begin > 0xFFFFFFFFu - owner.positive_bytes ||
                  owner.first_copy_begin + owner.positive_bytes != owner.expected_copy_end ||
-                 owner.expected_copy_end != c.upstream_recv_buf.len()))
+                 owner.expected_copy_end != c.buffered_response_len()))
                 owner.valid = false;
         }
 
@@ -3949,7 +3983,7 @@ public:
         }
         if (c.upstream_recv_armed || c.upstream_recv_pause_cancel_pending ||
             c.upstream_recv_pause_rearm_pending || c.upstream_recv_cancel_inflight ||
-            !backend.add_first_response_recv(c.upstream_fd, c.id, c.upstream_episode))
+            !add_response_read_recv(c))
             return false;
         c.pending_ops++;
         c.upstream_recv_armed = true;
@@ -3973,7 +4007,7 @@ public:
             !c.upstream_recv_armed || !response_read_deadline_identity_is_stable(c))
             return false;
 
-        const u32 total = c.upstream_recv_buf.len();
+        const u32 total = c.buffered_response_len();
         if (total == 0 || owner.expected_copy_end != total ||
             owner.first_copy_begin > 0xFFFFFFFFu - owner.positive_bytes ||
             owner.first_copy_begin + owner.positive_bytes != total)
@@ -3994,7 +4028,8 @@ public:
         ParsedResponse response;
         parser.reset();
         response.reset();
-        if (parser.parse(c.upstream_recv_buf.data(), total, &response) != ParseStatus::Incomplete)
+        if (parser.parse(c.upstream_recv_buf.data(), c.upstream_recv_buf.len(), &response) !=
+            ParseStatus::Incomplete)
             return false;
 
         c.response_read_deadline_progress_generation = owner.deadline_generation;
@@ -4030,7 +4065,7 @@ public:
             owner.first_copy_begin + owner.positive_bytes != owner.expected_copy_end ||
             header > 0xFFFFFFFFu - (received - completed) ||
             header + received - completed > 0xFFFFFFFFu - owner.positive_bytes ||
-            c.upstream_recv_buf.len() != header + received - completed + owner.positive_bytes ||
+            c.buffered_response_len() != header + received - completed + owner.positive_bytes ||
             c.response_read_deadline_progress_generation != owner.deadline_generation ||
             c.response_read_deadline_progress_episode != owner.upstream_episode ||
             c.response_read_deadline_progress_bytes != received)
@@ -4057,10 +4092,10 @@ public:
             c.response_read_deadline_profile !=
                 ResponseReadDeadlineProfile::BodylessNonHeadContentLengthZero ||
             c.req_method != static_cast<u8>(LogHttpMethod::Get) || declared_body == 0 ||
-            raw_header_end == 0 || raw_header_end > c.upstream_recv_buf.len() ||
+            raw_header_end == 0 || raw_header_end > c.buffered_response_len() ||
             declared_body > c.upstream_recv_buf.capacity() - raw_header_end)
             return false;
-        const u32 initial_body = c.upstream_recv_buf.len() - raw_header_end;
+        const u32 initial_body = c.buffered_response_len() - raw_header_end;
         if (initial_body > declared_body) return false;
         const bool fragmented_header_transition =
             c.response_read_deadline_progress_generation == c.response_read_deadline_generation &&
@@ -4102,7 +4137,7 @@ public:
         } else {
             if (c.upstream_recv_armed || c.upstream_recv_pause_cancel_pending ||
                 c.upstream_recv_pause_rearm_pending || c.upstream_recv_cancel_inflight ||
-                !backend.add_first_response_recv(c.upstream_fd, c.id, c.upstream_episode))
+                !add_response_read_recv(c))
                 return false;
             c.pending_ops++;
             c.upstream_recv_armed = true;
@@ -4132,14 +4167,14 @@ public:
             !response_read_deadline_route_method_matches(c.req_method,
                                                          c.response_read_deadline_route_method) ||
             declared_body == 0 || raw_header_end == 0 ||
-            raw_header_end > c.upstream_recv_buf.len() ||
-            declared_body > c.upstream_recv_buf.capacity() - raw_header_end ||
+            raw_header_end > c.buffered_response_len() ||
+            declared_body > ResponseBodyChain::kMaxBody ||
             c.response_header_buf.data() == nullptr || c.response_header_buf.len() == 0 ||
             c.response_header_buf.len() > c.response_header_buf.capacity() ||
             !complete_content_length_raw_origin_matches_pinned(
                 c, raw_header_end, declared_body, &classification))
             return false;
-        const u32 initial_body = c.upstream_recv_buf.len() - raw_header_end;
+        const u32 initial_body = c.buffered_response_len() - raw_header_end;
         if (initial_body > declared_body) return false;
         const bool precise_header_timer = response_read_deadline_uses_precise_timer(c);
         if (precise_header_timer && c.response_read_timer_phase != ResponseReadTimerPhase::Armed)
@@ -4205,7 +4240,7 @@ public:
         } else {
             if (c.upstream_recv_armed || c.upstream_recv_pause_cancel_pending ||
                 c.upstream_recv_pause_rearm_pending || c.upstream_recv_cancel_inflight ||
-                !backend.add_first_response_recv(c.upstream_fd, c.id, c.upstream_episode))
+                !add_response_read_recv(c))
                 return false;
             c.pending_ops++;
             c.upstream_recv_armed = true;
@@ -4238,7 +4273,7 @@ public:
         const u32 header = c.response_read_deadline_post_commit_raw_header_end;
         const u32 received = c.response_read_deadline_post_commit_origin_received;
         if (header == 0 || header > 0xFFFFFFFFu - received ||
-            header + received != c.upstream_recv_buf.len())
+            header + received != c.buffered_response_len())
             return false;
         CompleteContentLengthResponseClassification raw_classification{};
         if (!complete_content_length_raw_origin_matches_pinned(
@@ -4301,7 +4336,7 @@ public:
         const u32 header = c.response_read_deadline_post_commit_raw_header_end;
         const u32 received = c.response_read_deadline_post_commit_origin_received;
         if (header == 0 || header > 0xFFFFFFFFu - received ||
-            header + received != c.upstream_recv_buf.len())
+            header + received != c.buffered_response_len())
             return false;
         CompleteContentLengthResponseClassification raw_classification{};
         if (!complete_content_length_raw_origin_matches_pinned(
@@ -4321,7 +4356,7 @@ public:
         if (owner.saw_positive &&
             (owner.first_copy_begin > 0xFFFFFFFFu - owner.positive_bytes ||
              owner.first_copy_begin + owner.positive_bytes != owner.expected_copy_end ||
-             owner.expected_copy_end != c.upstream_recv_buf.len()))
+             owner.expected_copy_end != c.buffered_response_len()))
             return false;
         if (owner.post_commit_at_start &&
             (!owner.saw_positive && (owner.positive_bytes != 0 || owner.first_copy_begin != 0 ||
@@ -4442,6 +4477,7 @@ public:
         // the established header-then-body path without staging any bytes.
         enum class CombinedSendEligibility : u8 { Eligible, Fallback, Invalid };
         const auto combined_send_eligibility = [&]() {
+            if (c.response_body_tail.size != 0) return CombinedSendEligibility::Fallback;
             if (disposition != CompleteContentLengthTerminalDisposition::CompleteBody ||
                 terminal_owner != nullptr || received != declared || declared == 0 ||
                 c.response_read_deadline_post_commit_response_class !=
@@ -4464,8 +4500,8 @@ public:
             const u32 raw_header_end = c.response_read_deadline_post_commit_raw_header_end;
             if (c.response_header_buf.data() == nullptr || c.upstream_recv_buf.data() == nullptr ||
                 header_len == 0 || header_len > c.response_header_buf.capacity() ||
-                raw_header_end == 0 || raw_header_end > c.upstream_recv_buf.len() ||
-                declared != c.upstream_recv_buf.len() - raw_header_end)
+                raw_header_end == 0 || raw_header_end > c.buffered_response_len() ||
+                declared != c.buffered_response_len() - raw_header_end)
                 return CombinedSendEligibility::Invalid;
             if (declared > c.response_header_buf.capacity() - header_len)
                 return CombinedSendEligibility::Fallback;
@@ -4617,9 +4653,9 @@ public:
         const u32 header = c.response_read_deadline_post_commit_raw_header_end;
         const u32 declared = c.response_read_deadline_post_commit_declared_body;
         u32 received = c.response_read_deadline_post_commit_origin_received;
-        if (header == 0 || header > c.upstream_recv_buf.len() || received > declared) return false;
+        if (header == 0 || header > c.buffered_response_len() || received > declared) return false;
         if (owner.saw_positive) {
-            if (owner.terminal_error || owner.expected_copy_end != c.upstream_recv_buf.len() ||
+            if (owner.terminal_error || owner.expected_copy_end != c.buffered_response_len() ||
                 owner.first_copy_begin > 0xFFFFFFFFu - owner.positive_bytes ||
                 owner.first_copy_begin + owner.positive_bytes != owner.expected_copy_end)
                 return false;
@@ -4629,7 +4665,7 @@ public:
                     return false;
                 received += owner.positive_bytes;
                 c.response_read_deadline_post_commit_origin_received = received;
-            } else if (received != c.upstream_recv_buf.len() - header) {
+            } else if (received != c.buffered_response_len() - header) {
                 return false;
             }
             c.response_read_deadline_progress_generation = owner.deadline_generation;
@@ -4653,8 +4689,7 @@ public:
         if (owner.terminal_fault) return false;
         if (owner.saw_terminal && !c.upstream_recv_armed) {
             if (c.upstream_recv_pause_cancel_pending || c.upstream_recv_pause_rearm_pending ||
-                c.upstream_recv_cancel_inflight ||
-                !backend.add_first_response_recv(c.upstream_fd, c.id, c.upstream_episode))
+                c.upstream_recv_cancel_inflight || !add_response_read_recv(c))
                 return false;
             c.pending_ops++;
             c.upstream_recv_armed = true;
@@ -4830,7 +4865,7 @@ public:
                 if (streaming_progress && owner.saw_terminal && !c.upstream_recv_armed) {
                     if (owner.terminal_fault || c.upstream_recv_pause_cancel_pending ||
                         c.upstream_recv_pause_rearm_pending || c.upstream_recv_cancel_inflight ||
-                        !backend.add_first_response_recv(c.upstream_fd, c.id, c.upstream_episode)) {
+                        !add_response_read_recv(c)) {
                         close_conn(c);
                         continue;
                     }
@@ -4943,7 +4978,7 @@ public:
                 if (owner.saw_terminal && !c.upstream_recv_armed) {
                     if (c.upstream_recv_pause_cancel_pending ||
                         c.upstream_recv_pause_rearm_pending || c.upstream_recv_cancel_inflight ||
-                        !backend.add_first_response_recv(c.upstream_fd, c.id, c.upstream_episode)) {
+                        !add_response_read_recv(c)) {
                         close_conn(c);
                         continue;
                     }
@@ -5004,9 +5039,7 @@ public:
                     if (owner.saw_terminal && !c.upstream_recv_armed) {
                         if (c.upstream_recv_pause_cancel_pending ||
                             c.upstream_recv_pause_rearm_pending ||
-                            c.upstream_recv_cancel_inflight ||
-                            !backend.add_first_response_recv(
-                                c.upstream_fd, c.id, c.upstream_episode)) {
+                            c.upstream_recv_cancel_inflight || !add_response_read_recv(c)) {
                             close_conn(c);
                             continue;
                         }
@@ -5036,7 +5069,7 @@ public:
                        c.response_read_deadline_state ==
                            ResponseReadDeadlineState::RefreshPending &&
                        c.upstream_recv_armed && response_read_deadline_identity_is_stable(c)) {
-                if (c.upstream_recv_buf.len() == 0) {
+                if (c.buffered_response_len() == 0) {
                     close_conn(c);
                     continue;
                 }
@@ -5055,7 +5088,7 @@ public:
                 c.response_read_deadline_progress_bytes =
                     c.response_read_deadline_post_commit_phase ==
                             ResponseReadDeadlinePostCommitPhase::None
-                        ? c.upstream_recv_buf.len()
+                        ? c.buffered_response_len()
                         : c.response_read_deadline_post_commit_origin_received;
                 const bool streaming_timer =
                     c.response_read_deadline_profile ==
@@ -5110,7 +5143,7 @@ public:
                 c.response_read_deadline_post_commit_origin_received >=
                     c.response_read_deadline_post_commit_declared_body ||
                 c.response_read_deadline_post_commit_inflight_body != 0 ||
-                c.upstream_recv_buf.len() != 0 || c.send_armed ||
+                c.buffered_response_len() != 0 || c.send_armed ||
                 c.response_read_deadline_send_owner_active || c.send_progress != 0 ||
                 c.resp_body_mode != BodyMode::ContentLength ||
                 c.resp_body_remaining != c.response_read_deadline_post_commit_declared_body -
@@ -5286,7 +5319,7 @@ public:
             // see them anymore, so the next reuse would parse them as an early response —
             // close rather than pool a desynced socket.
             const bool kStaleBytes =
-                c.upstream_recv_buf.len() != 0 || c.upstream_recv_idle_stale_bytes;
+                c.buffered_response_len() != 0 || c.upstream_recv_idle_stale_bytes;
             const bool kDraining = is_draining();
             if (kStaleBytes) c.upstream_recv_buf.reset();
             c.upstream_recv_idle_stale_bytes = false;
@@ -5330,6 +5363,22 @@ public:
         c.recv_pause_cancel_pending = true;
         if (!c.recv_armed) return true;
         return backend.pause_recv(c.fd, c.id);
+    }
+
+    [[nodiscard]] bool local_body_send_holds_epoch(const Connection& c) const {
+        if (c.id >= connection_capacity || !c.send_armed || c.pending_ops == 0 || c.fd < 0 ||
+            c.tls_active || c.local_body_cursor == nullptr || c.local_body_send_len == 0 ||
+            c.epoch_leave_deferred || (c.req_start_us == 0 && !c.epoch_held) ||
+            c.send_progress >= c.local_body_send_len ||
+            c.response_read_deadline_post_commit_phase !=
+                ResponseReadDeadlinePostCommitPhase::None ||
+            c.on_send != &on_response_sent<IoUringEventLoop>)
+            return false;
+        const auto& send = backend.send_state[c.id];
+        const u32 remaining = c.local_body_send_len - c.send_progress;
+        return send.type == IoEventType::Send && send.fd == c.fd && send.generation == 0 &&
+               send.src == c.local_body_cursor + c.send_progress && send.offset <= remaining &&
+               send.remaining == remaining - send.offset;
     }
 
     void close_conn_impl(Connection& c) {
@@ -5376,7 +5425,11 @@ public:
         // epoch_held covers a suspended continuation pinning the config epoch
         // after its ordinary req_start_us ownership has ended (or an HTTP/2
         // async stream which never used h1 request timing).
-        if (c.req_start_us != 0 || c.epoch_held) epoch_leave();
+        if (local_body_send_holds_epoch(c)) {
+            c.epoch_leave_deferred = true;
+        } else if (!c.epoch_leave_deferred && (c.req_start_us != 0 || c.epoch_held)) {
+            epoch_leave();
+        }
         c.epoch_held = false;
         // Release any held upstream concurrency slot (catch-all; held flag makes a
         // prior release at completion a no-op).
@@ -5482,7 +5535,7 @@ public:
             // upstream_recv_buf both desync reuse — close rather than pool.
             const bool kConfigStale = !config_ptr || *config_ptr != c.idle_return_config;
             const bool kStaleBytes =
-                c.upstream_recv_buf.len() != 0 || c.upstream_recv_idle_stale_bytes;
+                c.buffered_response_len() != 0 || c.upstream_recv_idle_stale_bytes;
             const bool kDraining = is_draining();
             if (kStaleBytes) c.upstream_recv_buf.reset();
             c.upstream_recv_idle_stale_bytes = false;

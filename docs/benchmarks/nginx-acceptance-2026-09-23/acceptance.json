@@ -1,0 +1,16 @@
+{
+  "complete": true,
+  "target_met": false,
+  "expected_cells": 96,
+  "verdict_counts": {
+    "BELOW_TARGET": 10,
+    "PASS": 38,
+    "INVALID": 48
+  },
+  "wall_time": {
+    "elapsed_seconds": 2122.5,
+    "exit_code": 2,
+    "started_at_utc": "2026-09-22T18:32:06Z"
+  },
+  "evidence_sha256": "40a3571f2038419ba5688614e92904e9f3fbeae05d0efac9221aa6f28d358343"
+}

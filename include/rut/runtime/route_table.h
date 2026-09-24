@@ -1615,6 +1615,17 @@ public:
         return static_cast<u16>(idx + 1);  // 1-based; 0 reserved
     }
 
+    // For loaders that retain the source/RIR for the entire config lifetime.
+    // No copy or allocation; ordinary callers continue to use add_response_body.
+    u16 add_response_body_view(const char* data, u32 len) {
+        if (response_body_count >= kMaxResponseBodies || len > (1u << 20) ||
+            (len != 0 && data == nullptr))
+            return 0;
+        const u32 idx = response_body_count++;
+        response_bodies[idx] = {data, len};
+        return static_cast<u16>(idx + 1);
+    }
+
     // Register a response header set. `keys[i]` / `key_lens[i]` and
     // `values[i]` / `value_lens[i]` describe the i-th pair (i in
     // [0, count)). Bytes are copied into header_bytes_pool so callers

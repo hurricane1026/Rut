@@ -1,0 +1,8 @@
+{
+  "started_at": "2026-09-24T00:48:57+00:00",
+  "completed_at": "2026-09-24T01:51:24.382270+00:00",
+  "wall_seconds": 3747.382,
+  "matrix_exit_code": 2,
+  "load_budget_seconds": 3456,
+  "method": "process start from ps lstart; completion from final matrix.json mtime"
+}

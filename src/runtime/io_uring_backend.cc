@@ -533,7 +533,10 @@ bool IoUringBackend::add_recv_upstream_once(i32 fd,
     return true;
 }
 
-bool IoUringBackend::add_first_response_recv(i32 fd, u32 conn_id, u32 upstream_episode) {
+bool IoUringBackend::add_first_response_recv(i32 fd,
+                                             u32 conn_id,
+                                             u32 upstream_episode,
+                                             bool separate_body_ring) {
     if (fd < 0 || conn_id >= connection_capacity || !valid_upstream_episode(upstream_episode))
         return false;
     io_uring_sqe* sqe = get_sqe();
@@ -542,8 +545,9 @@ bool IoUringBackend::add_first_response_recv(i32 fd, u32 conn_id, u32 upstream_e
     memset(sqe, 0, sizeof(*sqe));
     sqe->opcode = IORING_OP_RECV;
     sqe->fd = fd;
-    sqe->len = kProvidedBufSize;
-    sqe->buf_group = kBufGroupId;
+    const bool large = separate_body_ring && large_buf_ring != nullptr;
+    sqe->len = large ? kLargeProvidedBufSize : kProvidedBufSize;
+    sqe->buf_group = large ? kLargeBufGroupId : kBufGroupId;
     sqe->flags = IOSQE_BUFFER_SELECT;
     sqe->ioprio = IORING_RECV_MULTISHOT;
     sqe->user_data =
@@ -1068,6 +1072,9 @@ u32 IoUringBackend::wait(IoEvent* events, u32 max_events, Connection* conns, u32
     u32 tail = __atomic_load_n(cq_tail, __ATOMIC_ACQUIRE);
     u32 mask = *cq_ring_mask;
     u32 count = 0;
+    u64 last_read_owner_token = 0;
+    u32 last_read_owner_head = 0;
+    bool last_read_owner_valid = false;
 
     auto protocol_failure = [&]() { fatal_error.store(EPROTO, std::memory_order_release); };
     if (tail - head > cq_ring_entries ||
@@ -1365,19 +1372,58 @@ u32 IoUringBackend::wait(IoEvent* events, u32 max_events, Connection* conns, u32
                                                                : conns[conn_id].recv_buf;
                 const u8* src = provided_buffer_data(buf_id);
                 u32 avail = target_buf.write_avail();
-                const bool deadline_copy_eligible =
+                auto& conn = conns[conn_id];
+                const bool buffered_overflow =
+                    deadline_owner && response_pool != nullptr &&
+                    conn.response_read_deadline_buffering ==
+                        ForwardResponseBufferingMode::CompleteContentLength &&
+                    (conn.response_body_tail.size != 0 || nbytes > avail);
+                bool deadline_copy_eligible =
                     type == IoEventType::UpstreamRecv && deadline_owner &&
-                    nbytes <= provided_buffer_size(buf_id) && nbytes <= avail &&
-                    response_deadline_copy_owner(conns[conn_id], upstream_episode, aux);
+                    nbytes <= provided_buffer_size(buf_id) &&
+                    (nbytes <= avail || buffered_overflow) &&
+                    ((last_read_owner_valid && head == last_read_owner_head + 1u &&
+                      cqe->user_data == last_read_owner_token) ||
+                     response_deadline_copy_owner(conn, upstream_episode, aux));
+                const u32 copy_begin =
+                    deadline_owner ? conn.buffered_response_len() : target_buf.len();
+                u32 prefix_copy = 0;
+                if (deadline_copy_eligible && buffered_overflow) {
+                    // Keep the receive buffer's contiguous prefix visible to the
+                    // header parser. Reserve the overflow first so a failed
+                    // allocation leaves both buffers and the witness unchanged.
+                    prefix_copy =
+                        conn.response_body_tail.size == 0 ? (nbytes < avail ? nbytes : avail) : 0;
+                    const u32 overflow = nbytes - prefix_copy;
+                    deadline_copy_eligible =
+                        overflow == 0 ||
+                        conn.response_body_tail.append(*response_pool, src + prefix_copy, overflow);
+                    if (deadline_copy_eligible && prefix_copy != 0) {
+                        __builtin_memcpy(target_buf.write_ptr(), src, prefix_copy);
+                        target_buf.commit(prefix_copy);
+                    }
+                }
                 // A matching explicit-deadline owner never enters the legacy
                 // partial-copy path.  Its provided-buffer payload is one
                 // indivisible witness: exact and fully eligible, or zero bytes.
                 u32 to_copy = deadline_owner ? (deadline_copy_eligible ? nbytes : 0)
                                              : (nbytes < avail ? nbytes : avail);
-                const u32 copy_begin = target_buf.len();
-                if (to_copy > 0) {
+                if (to_copy > 0 && !buffered_overflow) {
                     __builtin_memcpy(target_buf.write_ptr(), src, to_copy);
                     target_buf.commit(to_copy);
+                }
+                // Adjacent fragments only append bytes: dispatch has not run,
+                // so their previously checked logical owner cannot change.
+                // Do not reuse this proof across another CQE or a send phase.
+                if (deadline_copy_eligible &&
+                    conn.response_read_deadline_state == ResponseReadDeadlineState::Armed &&
+                    (conn.response_read_deadline_post_commit_phase ==
+                         ResponseReadDeadlinePostCommitPhase::None ||
+                     conn.response_read_deadline_post_commit_phase ==
+                         ResponseReadDeadlinePostCommitPhase::Buffering)) {
+                    last_read_owner_valid = true;
+                    last_read_owner_token = cqe->user_data;
+                    last_read_owner_head = head;
                 }
                 // Report actual bytes copied, not kernel bytes (may differ if buf full)
                 buf_result = (to_copy < nbytes) ? -ENOBUFS : static_cast<i32>(to_copy);
@@ -1393,7 +1439,7 @@ u32 IoUringBackend::wait(IoEvent* events, u32 max_events, Connection* conns, u32
                         conns[conn_id].response_read_deadline_method;
                     if (events[count].copy_witness == IoEventCopyWitness::Full) {
                         events[count].copy_begin = copy_begin;
-                        events[count].copy_end = target_buf.len();
+                        events[count].copy_end = conn.buffered_response_len();
                     }
                 }
             } else if (cqe->res > 0 && deadline_active) {
@@ -1433,6 +1479,23 @@ u32 IoUringBackend::wait(IoEvent* events, u32 max_events, Connection* conns, u32
             if (downstream_recv_target && (cqe->flags & IORING_CQE_F_MORE) == 0 &&
                 !add_terminal_window(cqe->user_data, tail))
                 break;
+            continue;
+        }
+
+        // Kernel ring exhaustion has consumed no response bytes. Replace the
+        // completed multishot recv under its existing logical owner, just as
+        // partial sends below retain their owner until completion. Selected-
+        // buffer copy failures already took the branch above and never retry.
+        if (type == IoEventType::UpstreamRecv && cqe->res == -ENOBUFS &&
+            (cqe->flags & IORING_CQE_F_MORE) == 0 && conns != nullptr && conn_id < max_conns &&
+            conns[conn_id].response_read_deadline_buffering ==
+                ForwardResponseBufferingMode::CompleteContentLength &&
+            response_deadline_copy_owner(conns[conn_id], upstream_episode, aux) &&
+            add_first_response_recv(conns[conn_id].upstream_fd,
+                                    conn_id,
+                                    upstream_episode,
+                                    /*separate_body_ring=*/true)) {
+            head++;
             continue;
         }
 

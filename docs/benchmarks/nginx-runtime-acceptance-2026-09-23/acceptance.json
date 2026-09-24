@@ -1,0 +1,14 @@
+{
+  "accepted": false,
+  "counts": {
+    "PASS": 65,
+    "BELOW_TARGET": 31,
+    "INVALID": 0
+  },
+  "started_at": "2026-09-23T07:54:39.095462+00:00",
+  "finished_at": "2026-09-23T08:57:07.998275+00:00",
+  "elapsed_seconds": 3748.9028265699744,
+  "exit_code": 2,
+  "evidence_sha256": "f32ca1f690c475a3cdc380c232b49d6d4826a9dc458fbfe8cb8624b65effadb9",
+  "evidence_bytes": 712804
+}

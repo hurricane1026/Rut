@@ -10,7 +10,9 @@ import subprocess
 import sys
 from pathlib import Path
 
-from run import SCENARIOS, ERROR_NAMES, positive, save_json
+from run import (SCENARIOS, ERROR_NAMES, positive, save_json,
+                 add_measurement_arguments, resolve_measurement_arguments,
+                 print_measurement_budget)
 
 
 def run_cell(command, log):
@@ -78,7 +80,7 @@ def load_evidence(folder):
         return [], {}, f"{type(error).__name__}: {error}"
 
 
-def assess(rows, scenario, transport, size, concurrency, repeats, duration):
+def assess(rows, scenario, transport, size, concurrency, repeats, duration, static_profile=None):
     work, connection = scenario.split("-")
     if not isinstance(rows, list) or not all(sample_shape_valid(row) for row in rows):
         rows = []
@@ -90,6 +92,8 @@ def assess(rows, scenario, transport, size, concurrency, repeats, duration):
         valid = valid and all(
             r.get("valid") and r.get("workload") == work
             and r.get("connection") == connection and r.get("transport") == transport
+            and (work != "static" or static_profile is None
+                 or r.get("static_profile", "converter-return") == static_profile)
             and r.get("body_size") == size and r.get("requests", 0) > 0
             and r.get("rps", 0) > 0 and r["seconds"] > 0
             and set(r.get("errors", {})) == set(ERROR_NAMES)
@@ -115,6 +119,7 @@ def assess(rows, scenario, transport, size, concurrency, repeats, duration):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--static-profile", choices=("converter-return", "native-body"), default="converter-return")
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--tls-cert", type=Path, required=True)
     parser.add_argument("--tls-key", type=Path, required=True)
@@ -122,10 +127,9 @@ def main():
     parser.add_argument("--body-sizes", nargs="+", type=positive, default=[16, 1024, 65536, 1048576])
     parser.add_argument("--scenarios", nargs="+", choices=SCENARIOS, default=list(SCENARIOS))
     parser.add_argument("--concurrency", nargs="+", type=positive, default=[1, 32, 128])
-    parser.add_argument("--duration", type=positive, default=10)
-    parser.add_argument("--warmup", type=positive, default=2)
-    parser.add_argument("--repeats", type=positive, default=3)
+    add_measurement_arguments(parser, full_duration=10)
     args, common = parser.parse_known_args()
+    resolve_measurement_arguments(args)
     for values in (args.transports, args.body_sizes, args.scenarios, args.concurrency):
         if len(values) != len(set(values)):
             parser.error("duplicate matrix coordinate")
@@ -137,7 +141,9 @@ def main():
     args.output.mkdir(parents=True, exist_ok=True)
     coordinates = list(itertools.product(args.transports, args.body_sizes, args.scenarios))
     report = {"complete": False, "target_met": False,
+              "profile": args.profile, "static_profile": args.static_profile,
               "expected_cells": len(coordinates) * len(args.concurrency), "cells": []}
+    print_measurement_budget(args, report["expected_cells"])
     save_json(args.output / "matrix.json", report)
     def interrupt(_signum, _frame):
         raise KeyboardInterrupt
@@ -146,6 +152,7 @@ def main():
         for transport, size, scenario in coordinates:
             folder = args.output / f"{transport}-{size}-{scenario}"
             command = [sys.executable, str(Path(__file__).with_name("run.py")), *common,
+                       "--profile", args.profile, "--static-profile", args.static_profile,
                        "--output", str(folder), "--body-size", str(size), "--scenarios", scenario,
                        "--concurrency", *map(str, args.concurrency), "--duration", str(args.duration),
                        "--warmup", str(args.warmup), "--repeats", str(args.repeats)]
@@ -159,7 +166,10 @@ def main():
             # every group, including results written before cleanup failed.
             completed = returncode in (0, 1) and status.get("complete") is True
             for concurrency in args.concurrency:
-                cell = assess(rows, scenario, transport, size, concurrency, args.repeats, args.duration)
+                cell = assess(rows, scenario, transport, size, concurrency, args.repeats, args.duration,
+                              args.static_profile)
+                if scenario.startswith("static-"):
+                    cell["static_profile"] = args.static_profile
                 cell.update(exit_code=returncode, evidence=str(folder), command=command)
                 if evidence_error:
                     cell["evidence_error"] = evidence_error

@@ -1,0 +1,135 @@
+=== block ===
+RUN: block.data_starts_after_header
+  PASS: data_starts_after_header
+RUN: block.capacity_equals_size_minus_header
+  PASS: capacity_equals_size_minus_header
+RUN: block.remaining_decreases_after_alloc
+  PASS: remaining_decreases_after_alloc
+RUN: block.chain_integrity
+  PASS: chain_integrity
+RUN: block.three_block_chain
+  PASS: three_block_chain
+=== arena ===
+RUN: arena.init_succeeds
+  PASS: init_succeeds
+RUN: arena.init_reports_mmap_failure
+  PASS: init_reports_mmap_failure
+RUN: arena.init_min_256
+  PASS: init_min_256
+RUN: arena.small_alloc
+  PASS: small_alloc
+RUN: arena.alloc_returns_sequential_addresses
+  PASS: alloc_returns_sequential_addresses
+RUN: arena.multiple_allocs_in_one_block
+  PASS: multiple_allocs_in_one_block
+RUN: arena.alignment_8byte
+  PASS: alignment_8byte
+RUN: arena.alignment_various_sizes
+  PASS: alignment_various_sizes
+RUN: arena.zero_size_alloc
+  PASS: zero_size_alloc
+RUN: arena.overflow_to_new_block
+  PASS: overflow_to_new_block
+RUN: arena.overflow_mmap_failure_keeps_existing_block_usable
+  PASS: overflow_mmap_failure_keeps_existing_block_usable
+RUN: arena.large_alloc_gets_own_block
+  PASS: large_alloc_gets_own_block
+RUN: arena.many_blocks
+  PASS: many_blocks
+RUN: arena.alloc_exact_block_capacity
+  PASS: alloc_exact_block_capacity
+RUN: arena.reset_single_block_only
+  PASS: reset_single_block_only
+RUN: arena.reset_reuses_first_block
+  PASS: reset_reuses_first_block
+RUN: arena.reset_frees_extra_blocks
+  PASS: reset_frees_extra_blocks
+RUN: arena.reset_total_allocated_tracking
+  PASS: reset_total_allocated_tracking
+RUN: arena.reset_then_alloc_10_cycles
+  PASS: reset_then_alloc_10_cycles
+RUN: arena.alloc_t_pod
+  PASS: alloc_t_pod
+RUN: arena.alloc_t_with_constructor
+  PASS: alloc_t_with_constructor
+RUN: arena.alloc_t_large_struct
+  PASS: alloc_t_large_struct
+RUN: arena.alloc_t_multiple_types
+  PASS: alloc_t_multiple_types
+RUN: arena.alloc_array_int
+  PASS: alloc_array_int
+RUN: arena.alloc_array_struct
+  PASS: alloc_array_struct
+RUN: arena.alloc_array_zero_count
+  PASS: alloc_array_zero_count
+RUN: arena.destroy_frees_all
+  PASS: destroy_frees_all
+RUN: arena.double_destroy_safe
+  PASS: double_destroy_safe
+RUN: arena.destroy_single_block
+  PASS: destroy_single_block
+RUN: arena.space_used_single_block
+  PASS: space_used_single_block
+RUN: arena.space_used_across_blocks
+  PASS: space_used_across_blocks
+RUN: arena.space_allocated_grows_with_blocks
+  PASS: space_allocated_grows_with_blocks
+RUN: arena.space_used_zero_after_reset
+  PASS: space_used_zero_after_reset
+RUN: arena.stress_10k_small_allocs
+  PASS: stress_10k_small_allocs
+RUN: arena.stress_mixed_sizes
+  PASS: stress_mixed_sizes
+RUN: arena.stress_alloc_reset_1000_cycles
+  PASS: stress_alloc_reset_1000_cycles
+RUN: arena.stress_large_allocs_across_blocks
+  PASS: stress_large_allocs_across_blocks
+RUN: arena.stress_reset_preserves_first_block_across_cycles
+  PASS: stress_reset_preserves_first_block_across_cycles
+RUN: arena.data_integrity_after_alloc
+  PASS: data_integrity_after_alloc
+RUN: arena.data_integrity_across_blocks
+  PASS: data_integrity_across_blocks
+RUN: arena.alloc_before_init_returns_null
+  PASS: alloc_before_init_returns_null
+RUN: arena.alloc_after_destroy_returns_null
+  PASS: alloc_after_destroy_returns_null
+RUN: arena.reset_after_destroy_no_crash
+  PASS: reset_after_destroy_no_crash
+RUN: arena.reset_before_init_no_crash
+  PASS: reset_before_init_no_crash
+=== SliceArenaF ===
+RUN: SliceArenaF.basic_alloc
+  PASS: basic_alloc
+RUN: SliceArenaF.alloc_t
+  PASS: alloc_t
+RUN: SliceArenaF.alloc_array
+  PASS: alloc_array
+RUN: SliceArenaF.chain_to_second_slice
+  PASS: chain_to_second_slice
+RUN: SliceArenaF.chain_three_slices
+  PASS: chain_three_slices
+RUN: SliceArenaF.single_alloc_exceeding_slice_fails
+  PASS: single_alloc_exceeding_slice_fails
+RUN: SliceArenaF.reset_then_reuse
+  PASS: reset_then_reuse
+=== slice_arena ===
+RUN: slice_arena.init_reports_pool_grow_failure
+  PASS: init_reports_pool_grow_failure
+RUN: slice_arena.overflow_pool_grow_failure_keeps_existing_slice_usable
+  PASS: overflow_pool_grow_failure_keeps_existing_slice_usable
+RUN: slice_arena.reset_returns_slices_to_pool
+  PASS: reset_returns_slices_to_pool
+RUN: slice_arena.destroy_returns_all_slices
+  PASS: destroy_returns_all_slices
+RUN: slice_arena.pool_exhaustion
+  PASS: pool_exhaustion
+RUN: slice_arena.multiple_arenas_same_pool
+  PASS: multiple_arenas_same_pool
+=== response_body_chain ===
+RUN: response_body_chain.fragmented_bytes_drain_without_copying_live_nodes
+  PASS: fragmented_bytes_drain_without_copying_live_nodes
+RUN: response_body_chain.exhausted_reservation_is_atomic_and_reusable
+  PASS: exhausted_reservation_is_atomic_and_reusable
+
+64 passed, 0 failed, 1073371 checks, 0 failed checks

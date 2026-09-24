@@ -1,0 +1,97 @@
+transport,body_size,scenario,concurrency,nginx_median_rps,rut_median_rps,rut_over_nginx,measurement_valid,performance_eligible,target_met,verdict,error,exit_code,evidence_folder
+http,16,static-close,1,14140.998974619228,14167.714427569588,1.0018892196370504,True,True,False,BELOW_TARGET,,0,http-16-static-close
+http,16,static-close,32,40990.737082744745,40745.797590287744,0.9940245160275464,True,True,False,BELOW_TARGET,,0,http-16-static-close
+http,16,static-close,128,40773.57344850554,39394.03271841834,0.9661658124758314,True,True,False,BELOW_TARGET,,0,http-16-static-close
+http,16,static-keepalive,1,48951.506951389296,51267.93382599333,1.0473208491191974,True,True,False,BELOW_TARGET,,0,http-16-static-keepalive
+http,16,static-keepalive,32,127253.19048183947,190617.55572624152,1.4979393051323526,True,True,True,PASS,,0,http-16-static-keepalive
+http,16,static-keepalive,128,126548.50140403828,196355.34736721945,1.5516212771284037,True,True,True,PASS,,0,http-16-static-keepalive
+http,16,proxy-close,1,6909.108662826596,8090.8239746273275,1.1710373029966616,True,True,True,PASS,,0,http-16-proxy-close
+http,16,proxy-close,32,12590.577312411457,13512.625881866677,1.0732332240671991,True,True,False,BELOW_TARGET,,0,http-16-proxy-close
+http,16,proxy-close,128,12513.660018509461,13662.904409010871,1.0918391892381218,True,True,False,BELOW_TARGET,,0,http-16-proxy-close
+http,16,proxy-keepalive,1,9937.23736565955,11098.189719584014,1.1168284817203227,True,True,True,PASS,,0,http-16-proxy-keepalive
+http,16,proxy-keepalive,32,15283.973366424983,17773.336230449368,1.1628740645081785,True,True,True,PASS,,0,http-16-proxy-keepalive
+http,16,proxy-keepalive,128,15215.187215337834,19346.833007510035,1.2715474830311158,True,True,True,PASS,,0,http-16-proxy-keepalive
+http,1024,static-close,1,14142.690913483353,14160.21906169307,1.0012393785819786,True,True,False,BELOW_TARGET,,0,http-1024-static-close
+http,1024,static-close,32,40920.68552192487,41343.58868773622,1.010334703840305,True,True,False,BELOW_TARGET,,0,http-1024-static-close
+http,1024,static-close,128,40584.38403444636,41258.605749573755,1.016612835975412,True,True,False,BELOW_TARGET,,0,http-1024-static-close
+http,1024,static-keepalive,1,48401.221388894555,50573.05567734138,1.0448714769199015,True,True,False,BELOW_TARGET,,0,http-1024-static-keepalive
+http,1024,static-keepalive,32,124020.70162207677,180990.5114729268,1.45935726137441,True,True,True,PASS,,0,http-1024-static-keepalive
+http,1024,static-keepalive,128,125582.65607446861,184413.91924613045,1.4684664667131724,True,True,True,PASS,,0,http-1024-static-keepalive
+http,1024,proxy-close,1,6830.002911933141,8057.860355127047,1.1797740731630781,True,True,True,PASS,,0,http-1024-proxy-close
+http,1024,proxy-close,32,12484.076782797416,13896.187111974174,1.1131129160566036,True,True,True,PASS,,0,http-1024-proxy-close
+http,1024,proxy-close,128,12471.64698424166,13827.302022517944,1.1086989585248201,True,True,True,PASS,,0,http-1024-proxy-close
+http,1024,proxy-keepalive,1,9843.74286150701,10980.117302190807,1.1154412967375935,True,True,True,PASS,,0,http-1024-proxy-keepalive
+http,1024,proxy-keepalive,32,15186.439189044775,17317.971479096817,1.1403576087533207,True,True,True,PASS,,0,http-1024-proxy-keepalive
+http,1024,proxy-keepalive,128,15107.856682544745,19264.096331217286,1.2751045191919619,True,True,True,PASS,,0,http-1024-proxy-keepalive
+http,65536,static-close,1,,,,False,False,False,INVALID,ValueError('unsupported static body: converter local_response is bounded to 4093 bytes; this matrix cell has NOT passed'),2,http-65536-static-close
+http,65536,static-close,32,,,,False,False,False,INVALID,ValueError('unsupported static body: converter local_response is bounded to 4093 bytes; this matrix cell has NOT passed'),2,http-65536-static-close
+http,65536,static-close,128,,,,False,False,False,INVALID,ValueError('unsupported static body: converter local_response is bounded to 4093 bytes; this matrix cell has NOT passed'),2,http-65536-static-close
+http,65536,static-keepalive,1,,,,False,False,False,INVALID,ValueError('unsupported static body: converter local_response is bounded to 4093 bytes; this matrix cell has NOT passed'),2,http-65536-static-keepalive
+http,65536,static-keepalive,32,,,,False,False,False,INVALID,ValueError('unsupported static body: converter local_response is bounded to 4093 bytes; this matrix cell has NOT passed'),2,http-65536-static-keepalive
+http,65536,static-keepalive,128,,,,False,False,False,INVALID,ValueError('unsupported static body: converter local_response is bounded to 4093 bytes; this matrix cell has NOT passed'),2,http-65536-static-keepalive
+http,65536,proxy-close,1,,,,False,False,False,INVALID,ValueError('EOF before response header'),2,http-65536-proxy-close
+http,65536,proxy-close,32,,,,False,False,False,INVALID,ValueError('EOF before response header'),2,http-65536-proxy-close
+http,65536,proxy-close,128,,,,False,False,False,INVALID,ValueError('EOF before response header'),2,http-65536-proxy-close
+http,65536,proxy-keepalive,1,,,,False,False,False,INVALID,ValueError('EOF before response header'),2,http-65536-proxy-keepalive
+http,65536,proxy-keepalive,32,,,,False,False,False,INVALID,ValueError('EOF before response header'),2,http-65536-proxy-keepalive
+http,65536,proxy-keepalive,128,,,,False,False,False,INVALID,ValueError('EOF before response header'),2,http-65536-proxy-keepalive
+http,1048576,static-close,1,,,,False,False,False,INVALID,ValueError('unsupported static body: converter local_response is bounded to 4093 bytes; this matrix cell has NOT passed'),2,http-1048576-static-close
+http,1048576,static-close,32,,,,False,False,False,INVALID,ValueError('unsupported static body: converter local_response is bounded to 4093 bytes; this matrix cell has NOT passed'),2,http-1048576-static-close
+http,1048576,static-close,128,,,,False,False,False,INVALID,ValueError('unsupported static body: converter local_response is bounded to 4093 bytes; this matrix cell has NOT passed'),2,http-1048576-static-close
+http,1048576,static-keepalive,1,,,,False,False,False,INVALID,ValueError('unsupported static body: converter local_response is bounded to 4093 bytes; this matrix cell has NOT passed'),2,http-1048576-static-keepalive
+http,1048576,static-keepalive,32,,,,False,False,False,INVALID,ValueError('unsupported static body: converter local_response is bounded to 4093 bytes; this matrix cell has NOT passed'),2,http-1048576-static-keepalive
+http,1048576,static-keepalive,128,,,,False,False,False,INVALID,ValueError('unsupported static body: converter local_response is bounded to 4093 bytes; this matrix cell has NOT passed'),2,http-1048576-static-keepalive
+http,1048576,proxy-close,1,,,,False,False,False,INVALID,ValueError('EOF before response header'),2,http-1048576-proxy-close
+http,1048576,proxy-close,32,,,,False,False,False,INVALID,ValueError('EOF before response header'),2,http-1048576-proxy-close
+http,1048576,proxy-close,128,,,,False,False,False,INVALID,ValueError('EOF before response header'),2,http-1048576-proxy-close
+http,1048576,proxy-keepalive,1,,,,False,False,False,INVALID,ValueError('EOF before response header'),2,http-1048576-proxy-keepalive
+http,1048576,proxy-keepalive,32,,,,False,False,False,INVALID,ValueError('EOF before response header'),2,http-1048576-proxy-keepalive
+http,1048576,proxy-keepalive,128,,,,False,False,False,INVALID,ValueError('EOF before response header'),2,http-1048576-proxy-keepalive
+https,16,static-close,1,964.8955281474595,1102.0573764014218,1.1421520198329707,True,True,True,PASS,,0,https-16-static-close
+https,16,static-close,32,1238.6034075024818,1580.3527317497785,1.2759150525319478,True,True,True,PASS,,0,https-16-static-close
+https,16,static-close,128,1214.215096243319,1570.119584712414,1.2931148604314293,True,True,True,PASS,,0,https-16-static-close
+https,16,static-keepalive,1,30813.05432408536,37245.31727350864,1.2087512286763287,True,True,True,PASS,,0,https-16-static-keepalive
+https,16,static-keepalive,32,67375.98248103276,163637.21216064354,2.428717268897854,True,True,True,PASS,,0,https-16-static-keepalive
+https,16,static-keepalive,128,66547.8277077787,160796.94131454514,2.416261309394322,True,True,True,PASS,,0,https-16-static-keepalive
+https,16,proxy-close,1,881.0826668507402,999.3089551103202,1.1341829690988667,True,True,True,PASS,,0,https-16-proxy-close
+https,16,proxy-close,32,1106.8766353146393,1465.9485080930083,1.3244009868148492,True,True,True,PASS,,0,https-16-proxy-close
+https,16,proxy-close,128,1099.144462084789,1440.593576953361,1.3106498978495806,True,True,True,PASS,,0,https-16-proxy-close
+https,16,proxy-keepalive,1,8624.36614810796,10503.039920180034,1.217833257518203,True,True,True,PASS,,0,https-16-proxy-keepalive
+https,16,proxy-keepalive,32,12866.07451496101,16695.364094069442,1.2976268771532167,True,True,True,PASS,,0,https-16-proxy-keepalive
+https,16,proxy-keepalive,128,12830.955688821194,18812.649936790134,1.466192417232055,True,True,True,PASS,,0,https-16-proxy-keepalive
+https,1024,static-close,1,966.4213679529734,1100.5203351135406,1.1387582804016525,True,True,True,PASS,,0,https-1024-static-close
+https,1024,static-close,32,1246.9035718101766,1624.4459709975815,1.3027839583772405,True,True,True,PASS,,0,https-1024-static-close
+https,1024,static-close,128,1237.4037547240268,1588.7798612159324,1.2839623729526113,True,True,True,PASS,,0,https-1024-static-close
+https,1024,static-keepalive,1,29864.409571735065,35610.247240007804,1.1923974975788854,True,True,True,PASS,,0,https-1024-static-keepalive
+https,1024,static-keepalive,32,63551.779729045586,146172.0300727102,2.300046209499055,True,True,True,PASS,,0,https-1024-static-keepalive
+https,1024,static-keepalive,128,62246.409121309596,142676.5522822212,2.292125028516335,True,True,True,PASS,,0,https-1024-static-keepalive
+https,1024,proxy-close,1,856.3922217544019,989.6567438234204,1.1556115512072416,True,True,True,PASS,,0,https-1024-proxy-close
+https,1024,proxy-close,32,1094.631833728895,1454.7603066268537,1.3289950664701307,True,True,True,PASS,,0,https-1024-proxy-close
+https,1024,proxy-close,128,1083.1092703718734,1425.9344963574342,1.3165195196490707,True,True,True,PASS,,0,https-1024-proxy-close
+https,1024,proxy-keepalive,1,8586.37667454936,10400.300580374267,1.2112560366937442,True,True,True,PASS,,0,https-1024-proxy-keepalive
+https,1024,proxy-keepalive,32,12794.897960183936,16530.495952135465,1.2919599674476674,True,True,True,PASS,,0,https-1024-proxy-keepalive
+https,1024,proxy-keepalive,128,12668.70077964603,18338.573484444296,1.4475496582812721,True,True,True,PASS,,0,https-1024-proxy-keepalive
+https,65536,static-close,1,,,,False,False,False,INVALID,ValueError('unsupported static body: converter local_response is bounded to 4093 bytes; this matrix cell has NOT passed'),2,https-65536-static-close
+https,65536,static-close,32,,,,False,False,False,INVALID,ValueError('unsupported static body: converter local_response is bounded to 4093 bytes; this matrix cell has NOT passed'),2,https-65536-static-close
+https,65536,static-close,128,,,,False,False,False,INVALID,ValueError('unsupported static body: converter local_response is bounded to 4093 bytes; this matrix cell has NOT passed'),2,https-65536-static-close
+https,65536,static-keepalive,1,,,,False,False,False,INVALID,ValueError('unsupported static body: converter local_response is bounded to 4093 bytes; this matrix cell has NOT passed'),2,https-65536-static-keepalive
+https,65536,static-keepalive,32,,,,False,False,False,INVALID,ValueError('unsupported static body: converter local_response is bounded to 4093 bytes; this matrix cell has NOT passed'),2,https-65536-static-keepalive
+https,65536,static-keepalive,128,,,,False,False,False,INVALID,ValueError('unsupported static body: converter local_response is bounded to 4093 bytes; this matrix cell has NOT passed'),2,https-65536-static-keepalive
+https,65536,proxy-close,1,,,,False,False,False,INVALID,ValueError('EOF before response header'),2,https-65536-proxy-close
+https,65536,proxy-close,32,,,,False,False,False,INVALID,ValueError('EOF before response header'),2,https-65536-proxy-close
+https,65536,proxy-close,128,,,,False,False,False,INVALID,ValueError('EOF before response header'),2,https-65536-proxy-close
+https,65536,proxy-keepalive,1,,,,False,False,False,INVALID,ValueError('EOF before response header'),2,https-65536-proxy-keepalive
+https,65536,proxy-keepalive,32,,,,False,False,False,INVALID,ValueError('EOF before response header'),2,https-65536-proxy-keepalive
+https,65536,proxy-keepalive,128,,,,False,False,False,INVALID,ValueError('EOF before response header'),2,https-65536-proxy-keepalive
+https,1048576,static-close,1,,,,False,False,False,INVALID,ValueError('unsupported static body: converter local_response is bounded to 4093 bytes; this matrix cell has NOT passed'),2,https-1048576-static-close
+https,1048576,static-close,32,,,,False,False,False,INVALID,ValueError('unsupported static body: converter local_response is bounded to 4093 bytes; this matrix cell has NOT passed'),2,https-1048576-static-close
+https,1048576,static-close,128,,,,False,False,False,INVALID,ValueError('unsupported static body: converter local_response is bounded to 4093 bytes; this matrix cell has NOT passed'),2,https-1048576-static-close
+https,1048576,static-keepalive,1,,,,False,False,False,INVALID,ValueError('unsupported static body: converter local_response is bounded to 4093 bytes; this matrix cell has NOT passed'),2,https-1048576-static-keepalive
+https,1048576,static-keepalive,32,,,,False,False,False,INVALID,ValueError('unsupported static body: converter local_response is bounded to 4093 bytes; this matrix cell has NOT passed'),2,https-1048576-static-keepalive
+https,1048576,static-keepalive,128,,,,False,False,False,INVALID,ValueError('unsupported static body: converter local_response is bounded to 4093 bytes; this matrix cell has NOT passed'),2,https-1048576-static-keepalive
+https,1048576,proxy-close,1,,,,False,False,False,INVALID,ValueError('EOF before response header'),2,https-1048576-proxy-close
+https,1048576,proxy-close,32,,,,False,False,False,INVALID,ValueError('EOF before response header'),2,https-1048576-proxy-close
+https,1048576,proxy-close,128,,,,False,False,False,INVALID,ValueError('EOF before response header'),2,https-1048576-proxy-close
+https,1048576,proxy-keepalive,1,,,,False,False,False,INVALID,ValueError('EOF before response header'),2,https-1048576-proxy-keepalive
+https,1048576,proxy-keepalive,32,,,,False,False,False,INVALID,ValueError('EOF before response header'),2,https-1048576-proxy-keepalive
+https,1048576,proxy-keepalive,128,,,,False,False,False,INVALID,ValueError('EOF before response header'),2,https-1048576-proxy-keepalive

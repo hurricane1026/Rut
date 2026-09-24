@@ -34,8 +34,18 @@ python3 scripts/nginx_benchmark/run.py \
 python3 scripts/nginx_benchmark/summarize.py /tmp/nginx-rut-benchmark
 ```
 
-Default: four scenarios, concurrency 1/32/128, 2-second warmup and 8-second
-measurement, three repeats, alternating nginx/RUT order. Each repeat starts
+Default `--profile acceptance`: four scenarios, concurrency 1/32/128, 1-second
+warmup and 5-second measurement, three repeats. Scheduled load takes 432 seconds
+(previous default: 720 seconds), plus startup, validation and cleanup. This
+retains the matrix minimum sampling requirements; actual durations, errors and
+throughput must still pass its acceptance checks.
+Use `--profile quick` only for smoke testing (1-second warmup, 2-second
+measurement, one repeat; 72 seconds of scheduled load).
+Use `--profile full` for the original 2-second warmup, 8-second measurement and
+three repeats, alternating nginx/RUT order. Explicit `--warmup`, `--duration`
+and `--repeats` override each profile independently. All profiles retain
+all selected coordinates and the same response/error checks. The harness prints
+the scheduled load budget before starting. Each repeat starts
 one frontend per engine, then runs all concurrency levels in order on that
 same process. Higher levels include the earlier load history; this is not a
 cold-start-per-level capacity measurement. JIT startup is outside timing.
@@ -63,6 +73,15 @@ buffer is paired with a 16 KiB busy-buffer limit to satisfy its buffer
 configuration constraints; response buffering remains off and cannot spill to
 temporary files. Rut uses the native
 `upstream` / `forward` DSL and its per-shard 4096-connection idle pool.
+
+For the 1 MiB `converter-strict` proxy comparison, nginx keeps response
+buffering enabled with eight 16 KiB proxy buffers and a 16 KiB header buffer.
+The default smaller buffers caused repeatable nginx-side wrk timeouts in the
+HTTP close case. The eight 16 KiB response buffers plus separate 16 KiB header
+buffer passed a three-repeat close diagnostic without a timeout and do not
+hold an entire response in memory.
+The converter source is unchanged; the generated nginx config records the
+comparison setting.
 
 The native preflight first delays reading a complete 256 KiB response, then
 reads a successor response on that same downstream socket. It saves the exact
@@ -169,11 +188,33 @@ EOF root-cause fixes and performance optimization are separate work.
 original static/proxy payloads remain unchanged. Configurable proxy payloads
 are served from a read-only file mount by the origin. ETag, range advertisement
 and Last-Modified are disabled identically at that shared origin to preserve
-the controlled response-header shape; this is not a range/caching-header test. Static converter
-`local_response` currently supports at most 4093 bytes: larger static cases
-fail explicitly and do not count as passed. Established io_uring TLS supports
-exact local responses; strict proxy TLS and larger-body cells still require
-separate capability validation.
+the controlled response-header shape; this is not a range/caching-header test.
+
+The default `--static-profile converter-return` retains converter compatibility
+coverage. Its `local_response` supports at most 4093 bytes; nginx itself also
+rejects a large literal `return` parameter. Larger converter cells therefore
+remain explicit failures, never passes.
+
+`--static-profile native-body` is a separate static performance comparison:
+nginx serves a read-only file with `sendfile on` and a warmed one-entry
+`open_file_cache` (one-hour validity), while Rut uses
+`return response(200, body: "...")`. The serving loader pins the existing
+source/RIR bytes; each connection reuses its ordinary send slice. Static
+preflight compares the complete body and framing/content headers, ignoring only
+engine-specific Server and Date metadata. This profile does not demonstrate
+converter support for large static returns. Both scripts record the selected
+static profile; matrix assessment rejects samples from a different profile.
+
+Strict io_uring proxy responses retain complete Content-Length buffering through
+1 MiB using on-demand slices from the existing pool. Input bounds and async
+reclamation remain enforced. Large responses use the existing separate receive
+ring to avoid starving downstream TLS input; no ring or per-connection buffer
+capacity is increased.
+
+Preflight performs `max(3, min(100, 1 MiB / body_size))` requests per connection
+mode, with exact full-body comparisons. This avoids repeatedly comparing 100 MiB
+for each large-body case while preserving multiple keepalive boundaries. Load
+sampling and the performance acceptance gate are unchanged.
 
 HTTPS uses `--tls-cert cert.pem --tls-key key.pem`. Generate a throwaway RSA
 certificate with `openssl req -x509 -newkey rsa:2048 -nodes -days 7 -subj
@@ -196,7 +237,16 @@ converter compatibility. Original HTTP output stays unmodified.
 
 `matrix.py` accepts the same binary/CPU arguments as `run.py`, plus required
 `--tls-cert` / `--tls-key`. Defaults are all four scenarios, HTTP and HTTPS,
-16 B / 1 KiB / 64 KiB / 1 MiB, and concurrency 1 / 32 / 128: 96 cells. Each
+16 B / 1 KiB / 64 KiB / 1 MiB, and concurrency 1 / 32 / 128: 96 cells.
+The default acceptance profile schedules 57.6 minutes of load for all 96 cells;
+quick schedules 9.6 minutes but is ineligible for performance acceptance.
+`--profile full` restores the original 10-second measurement, 2-second warmup
+and three repeats (115.2 minutes). Startup/validation/cleanup add overhead;
+unsupported cells can fail before consuming their load budget. Execution stays
+serial because simultaneous cases would compete for the same pinned CPU cores.
+Quick runs retain the same acceptance rules below, so their default short
+samples do not meet the target and the matrix exits 2 even if error-free.
+Acceptance and full use qualifying sampling budgets. Each
 case has isolated retained evidence. Failed setup, unsupported capabilities,
 missing repetitions and response errors leave their cells unpassed. A completed
 child run with exit 1 preserves valid sibling-concurrency measurements while
@@ -212,3 +262,7 @@ Short but otherwise valid measurements remain visible without qualifying for
 performance acceptance. Exit 2 includes
 valid measurements below target, not only execution errors. An interrupted
 matrix remains incomplete. This is a local goal check, not a performance CI gate.
+
+[The 2026-09-23 full acceptance run](../../docs/benchmarks/nginx-acceptance-2026-09-23/README.md)
+uses a fresh main build and evaluates all 96 coordinates: 38 passed, 10 below
+target, 48 invalid. The overall verdict is FAIL; full evidence is retained.
