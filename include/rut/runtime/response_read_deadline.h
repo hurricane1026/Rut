@@ -247,6 +247,12 @@ inline bool complete_content_length_parsed_header_matches(
         parsed.headers_truncated || parsed.content_length != declared_body)
         return false;
     const auto& policy = c.request_config->response_policies[c.response_policy_id - 1];
+    // This profile assumes the fixed-order `Synthesized` layout (exactly one
+    // Server/Connection field, in the positions checked below). The Envoy
+    // `Upstream` header-order layout is never admitted into a bundle that
+    // reaches this path (see analyze.cc and compile_to_config.h); fail closed
+    // defensively if that invariant is ever violated.
+    if (policy.header_order != ResponsePolicyHeaderOrder::Synthesized) return false;
     CompleteContentLengthContentTypeView content_type{};
     if (!complete_content_length_content_type_view(parsed, true, &content_type)) return false;
     static constexpr Str kContentTypeName{"Content-Type", 12};
@@ -513,6 +519,7 @@ inline bool header_only_head_explicit_close_arm_is_stable(
         response.version != ResponsePolicyVersion::Http11 ||
         response.framing != ResponsePolicyFraming::ContentLength ||
         response.connection != ResponsePolicyConnection::Request ||
+        response.header_order != ResponsePolicyHeaderOrder::Synthesized ||
         response.head_mode != ResponsePolicyHeadMode::SuppressBody ||
         failure.version != ForwardFailurePolicyVersion::Http11 || failure.status_code != 502 ||
         failure.connection != ForwardFailurePolicyConnection::Request ||
@@ -729,6 +736,7 @@ inline bool response_read_timeout_header_only_head_response_is_stable(
         response.version != ResponsePolicyVersion::Http11 ||
         response.framing != ResponsePolicyFraming::ContentLength ||
         response.connection != ResponsePolicyConnection::Request ||
+        response.header_order != ResponsePolicyHeaderOrder::Synthesized ||
         response.head_mode != ResponsePolicyHeadMode::SuppressBody ||
         failure.version != ForwardFailurePolicyVersion::Http11 || failure.status_code != 502 ||
         failure.connection != ForwardFailurePolicyConnection::Request ||
@@ -1080,6 +1088,7 @@ inline bool fixed_upload_head_success_proof_is_stable(
         response.version != ResponsePolicyVersion::Http11 ||
         response.framing != ResponsePolicyFraming::ContentLength ||
         response.connection != ResponsePolicyConnection::Request ||
+        response.header_order != ResponsePolicyHeaderOrder::Synthesized ||
         response.head_mode != ResponsePolicyHeadMode::SuppressBody ||
         failure.version != ForwardFailurePolicyVersion::Http11 || failure.status_code != 502 ||
         failure.connection != ForwardFailurePolicyConnection::Request ||
@@ -1761,6 +1770,7 @@ inline bool response_read_deadline_owner_is_stable(const Connection& c,
         response.version != ResponsePolicyVersion::Http11 ||
         response.framing != ResponsePolicyFraming::ContentLength ||
         response.connection != ResponsePolicyConnection::Request ||
+        response.header_order != ResponsePolicyHeaderOrder::Synthesized ||
         failure.version != ForwardFailurePolicyVersion::Http11 || failure.status_code != 502 ||
         failure.connection != ForwardFailurePolicyConnection::Request ||
         timeout.version != ForwardFailurePolicyVersion::Http11 ||
