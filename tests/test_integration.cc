@@ -25266,55 +25266,39 @@ TEST(route, forward_response_policy_upstream_order_wire) {
     REQUIRE(lastmod_backend.setup());
     REQUIRE(chunked_backend.setup());
 
-    // `use_request_policy4` is false only for the body-bearing POST /upload
-    // route: `request_policy_body_response_admitted` (callbacks_impl.h:8875)
-    // admits only `Http11FixedStrip` (ID1) for a body-carrying request paired
-    // with a response_policy -- ID4 (and no request_policy at all) are not in
-    // that admitted set regardless of `header_order`, a pre-existing
-    // PR3-scoped restriction on request_policy admission, not something this
-    // PR's response-policy work changes. That route falls back to ID1 (host:
-    // "upstream") so the response-side assertions below (its actual PR4
-    // scope) can still run; every bodyless route below keeps request_policy 4
-    // end to end.
-    auto route_block = [](const char* method,
-                          const char* path,
-                          const char* upstream_name,
-                          bool suppress_body,
-                          bool use_request_policy4 = true) {
-        return std::string("route ") + method + " \"" + path + "\" {\n" + "    return forward(" +
-               upstream_name + ", " +
-               (use_request_policy4
-                    ? "request_policy: {\n"
-                      "        version: \"HTTP/1.1\", host: \"preserve\", connection: \"omit\",\n"
-                      "        header_names: \"lowercase\", forwarded_proto: \"http\",\n"
-                      "        strip_headers: [\"Connection\", \"Keep-Alive\", \"TE\", \"Expect\", "
-                      "\"Upgrade\", \"Proxy-Connection\"]\n"
-                      "    }, "
-                    : "request_policy: {\n"
-                      "        version: \"HTTP/1.1\", host: \"upstream\", connection: \"omit\",\n"
-                      "        strip_headers: [\"Connection\", \"Keep-Alive\", \"TE\", \"Expect\", "
-                      "\"Upgrade\"]\n"
-                      "    }, ") +
-               "response_policy: {\n"
-               "        version: \"HTTP/1.1\", framing: \"content_length\", connection: "
-               "\"request\",\n" +
-               std::string(suppress_body ? "        head_mode: \"suppress_body\",\n" : "") +
-               "        header_order: \"upstream\", header_names: \"lowercase\",\n"
-               "        connection_header: \"close_only\", status_reason: \"canonical\",\n"
-               "        server: \"envoy\", date: \"preserve_or_current\", hide_headers: []\n"
-               "    }" +
-               std::string(suppress_body ? ", failure_policy: {\n"
-                                           "        version: \"HTTP/1.1\", status: 502, "
-                                           "reason: \"Bad Gateway\",\n"
-                                           "        content_type: \"text/plain\", server: "
-                                           "\"envoy\", date: \"current\",\n"
-                                           "        connection: \"request\", head_mode: "
-                                           "\"suppress_body\", body: b\"x\"\n"
-                                           "    }"
-                                         : "") +
-               ")\n"
-               "}\n";
-    };
+    // Request policy 4 (host preserve + lowercase, PR3) on every route,
+    // including the body-bearing POST /upload route:
+    // `request_policy_body_response_admitted` (callbacks_impl.h) now admits
+    // ID4 on the ordinary strict-response body path exactly like ID1.
+    auto route_block =
+        [](const char* method, const char* path, const char* upstream_name, bool suppress_body) {
+            return std::string("route ") + method + " \"" + path + "\" {\n" +
+                   "    return forward(" + upstream_name +
+                   ", request_policy: {\n"
+                   "        version: \"HTTP/1.1\", host: \"preserve\", connection: \"omit\",\n"
+                   "        header_names: \"lowercase\", forwarded_proto: \"http\",\n"
+                   "        strip_headers: [\"Connection\", \"Keep-Alive\", \"TE\", \"Expect\", "
+                   "\"Upgrade\", \"Proxy-Connection\"]\n"
+                   "    }, response_policy: {\n"
+                   "        version: \"HTTP/1.1\", framing: \"content_length\", connection: "
+                   "\"request\",\n" +
+                   std::string(suppress_body ? "        head_mode: \"suppress_body\",\n" : "") +
+                   "        header_order: \"upstream\", header_names: \"lowercase\",\n"
+                   "        connection_header: \"close_only\", status_reason: \"canonical\",\n"
+                   "        server: \"envoy\", date: \"preserve_or_current\", hide_headers: []\n"
+                   "    }" +
+                   std::string(suppress_body ? ", failure_policy: {\n"
+                                               "        version: \"HTTP/1.1\", status: 502, "
+                                               "reason: \"Bad Gateway\",\n"
+                                               "        content_type: \"text/plain\", server: "
+                                               "\"envoy\", date: \"current\",\n"
+                                               "        connection: \"request\", head_mode: "
+                                               "\"suppress_body\", body: b\"x\"\n"
+                                               "    }"
+                                             : "") +
+                   ")\n"
+                   "}\n";
+        };
     auto upstream_line = [](const char* name, u16 port) {
         char buf[64];
         const int len = snprintf(buf, sizeof(buf), "upstream %s at \"127.0.0.1:%u\"\n", name, port);
@@ -25331,8 +25315,7 @@ TEST(route, forward_response_policy_upstream_order_wire) {
     source += route_block("GET", "/date", "date_backend", false);
     source += route_block("GET", "/close", "close_backend", false);
     source += route_block("HEAD", "/head", "head_backend", true);
-    source +=
-        route_block("POST", "/upload", "upload_backend", false, /*use_request_policy4=*/false);
+    source += route_block("POST", "/upload", "upload_backend", false);
     source += route_block("GET", "/lastmod", "lastmod_backend", false);
     source += route_block("GET", "/chunked", "chunked_backend", false);
 
@@ -25490,7 +25473,9 @@ TEST(route, forward_response_policy_upstream_order_wire) {
              kEnvoyOracle_head_smoke_upstream,
              static_cast<u32>(sizeof(kEnvoyOracle_head_smoke_upstream) - 1));
 
-    // post_fixed: 201 Created, Content-Length: 0, no content-type.
+    // post_fixed: 201 Created, Content-Length: 0, no content-type. Request
+    // policy 4 end to end -- both the forwarded upstream request and the
+    // downstream response are asserted byte for byte against the oracle.
     static constexpr char kUploadUpstream[] = "HTTP/1.1 201 Created\r\nContent-Length: 0\r\n\r\n";
     run_case(upload_backend,
              kEnvoyOracle_post_fixed_client,
@@ -25501,8 +25486,8 @@ TEST(route, forward_response_policy_upstream_order_wire) {
              static_cast<u32>(sizeof(kEnvoyOracle_post_fixed_downstream) - 1),
              /*mask_date=*/true,
              /*expect_downstream_close=*/false,
-             nullptr,
-             0);
+             kEnvoyOracle_post_fixed_upstream,
+             static_cast<u32>(sizeof(kEnvoyOracle_post_fixed_upstream) - 1));
 
     // Last-Modified pass-through: not one of `build_strict_response_headers`'s
     // forbidden names, so the Upstream-order serializer must carry it through
