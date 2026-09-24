@@ -1,5 +1,6 @@
 // Real-socket integration tests. Ported from libuv/libevent2 scenarios.
 #include "epoll_tls_test_hooks.h"
+#include "fixtures/envoy_milestone_s.inc"
 #include "fixtures/envoy_oracle_milestone_s.inc"
 #include "framing_selection_preflight_fixture.h"
 #include "rut/compiler/analyze.h"
@@ -25543,6 +25544,155 @@ TEST(route, forward_response_policy_upstream_order_wire) {
         CHECK_GT(response_read, 0);
         CHECK(buf_contains(response, static_cast<u32>(response_read), "502", 3));
         CHECK_FALSE(buf_contains(response, static_cast<u32>(response_read), "hello", 5));
+    }
+}
+
+// End-to-end Envoy local-reply layouts (envoy-pr-plan.md PR5, oracle
+// overrides): the milestone-S golden itself (`kEnvoyMilestoneSGolden`,
+// docs/envoy-converter.md) compiled and run through the real gateway, with
+// its upstream repointed at a dead endpoint so every forward connect fails
+// and exercises the 503 `failure_policy`. `unmatched` (404) is exercised by
+// request shapes the route table can never match: `OPTIONS *` and a CONNECT
+// authority-form target.
+TEST(route, envoy_milestone_s_local_replies_match_oracle) {
+    using namespace rut;
+    struct JitResources {
+        FrontendRirModule rir{};
+        jit::JitEngine engine{};
+        ~JitResources() {
+            engine.shutdown();
+            rir.destroy();
+        }
+    } resources;
+
+    DeadEndpoint dead;
+    REQUIRE(dead.reserve());
+
+    std::string source(kEnvoyMilestoneSGolden);
+    const std::string needle = "127.0.0.1:9000";
+    const auto pos = source.find(needle);
+    REQUIRE_NE(pos, std::string::npos);
+    source.replace(pos, needle.size(), "127.0.0.1:" + std::to_string(dead.port));
+
+    auto lexed = lex({source.data(), static_cast<u32>(source.size())});
+    REQUIRE(lexed);
+    auto ast = parse_file(lexed.value());
+    REQUIRE(ast);
+    std::unique_ptr<AstFile> ast_owned(ast.value());
+    auto hir = analyze_file(*ast_owned);
+    REQUIRE(hir);
+    std::unique_ptr<HirModule> hir_owned(hir.value());
+    auto mir = build_mir(*hir_owned);
+    REQUIRE(mir);
+    std::unique_ptr<MirModule> mir_owned(mir.value());
+    auto& rir = resources.rir;
+    REQUIRE(lower_to_rir(*mir_owned, rir));
+    auto cg = jit::codegen(rir.module);
+    REQUIRE(cg.ok);
+    auto& engine = resources.engine;
+    REQUIRE(engine.init());
+    REQUIRE(engine.compile(cg.mod, cg.ctx));
+    RouteConfig cfg{};
+    REQUIRE(populate_route_config(cfg, rir.module));
+    REQUIRE(register_jit_routes(cfg, rir.module, engine));
+    const RouteConfig* active = &cfg;
+    ScopedProxyLoop proxy;
+    REQUIRE(proxy.setup(&active, 1000));
+
+    auto recv_all_until_idle = [](i32 fd, char* buf, u32 cap) {
+        u32 total = 0;
+        while (total < cap) {
+            const i32 got = recv_timeout(fd, buf + total, cap - total, 200);
+            if (got <= 0) break;
+            total += static_cast<u32>(got);
+        }
+        return total;
+    };
+
+    // connect_failure: GET to "/" (the route table always tries to forward
+    // to the dead endpoint), keep-alive request -> the 503 Envoy failure
+    // layout, byte for byte against the oracle after date normalization.
+    {
+        const char kReq[] = "GET / HTTP/1.1\r\nHost: client.example\r\n\r\n";
+        i32 client = connect_to(proxy.port);
+        REQUIRE_GE(client, 0);
+        REQUIRE(send_all(client, kReq, sizeof(kReq) - 1));
+        char response[512];
+        const u32 got = recv_all_until_idle(client, response, sizeof(response));
+        close(client);
+        const u32 expected_len =
+            static_cast<u32>(sizeof(kEnvoyOracle_connect_failure_downstream) - 1);
+        REQUIRE_EQ(got, expected_len);
+        char expected[512];
+        memcpy(expected, kEnvoyOracle_connect_failure_downstream, expected_len);
+        REQUIRE(normalize_lowercase_date(response, expected_len));
+        REQUIRE(normalize_lowercase_date(expected, expected_len));
+        CHECK_EQ(memcmp(response, expected, expected_len), 0);
+    }
+
+    // connect_failure + HEAD: the failure_policy's `head_mode:
+    // "suppress_body"` on the HEAD route withholds the 98-byte body even
+    // though `content-length: 98` is still declared.
+    {
+        const char kReq[] = "HEAD / HTTP/1.1\r\nHost: client.example\r\n\r\n";
+        i32 client = connect_to(proxy.port);
+        REQUIRE_GE(client, 0);
+        REQUIRE(send_all(client, kReq, sizeof(kReq) - 1));
+        char response[512];
+        const u32 got = recv_all_until_idle(client, response, sizeof(response));
+        close(client);
+        REQUIRE(normalize_lowercase_date(response, got));
+        const std::string head(response, got);
+        CHECK_NE(head.find("HTTP/1.1 503 Service Unavailable\r\n"), std::string::npos);
+        CHECK_NE(head.find("content-length: 98\r\n"), std::string::npos);
+        CHECK_NE(head.find("content-type: text/plain\r\n"), std::string::npos);
+        CHECK(head.ends_with("\r\n\r\n"));  // body suppressed
+    }
+
+    // unmatched -> 404: `OPTIONS *` never reaches route dispatch (the route
+    // table refuses non-origin-form targets), so the generic unmatched
+    // policy answers with the Envoy no-route 404 layout.
+    {
+        const char kReq[] = "OPTIONS * HTTP/1.1\r\nHost: client.example\r\n\r\n";
+        i32 client = connect_to(proxy.port);
+        REQUIRE_GE(client, 0);
+        REQUIRE(send_all(client, kReq, sizeof(kReq) - 1));
+        char response[256];
+        const u32 got = recv_all_until_idle(client, response, sizeof(response));
+        close(client);
+        const u32 expected_len = static_cast<u32>(sizeof(kEnvoyOracle_options_star_downstream) - 1);
+        REQUIRE_EQ(got, expected_len);
+        char expected[256];
+        memcpy(expected, kEnvoyOracle_options_star_downstream, expected_len);
+        REQUIRE(normalize_lowercase_date(response, expected_len));
+        REQUIRE(normalize_lowercase_date(expected, expected_len));
+        CHECK_EQ(memcmp(response, expected, expected_len), 0);
+    }
+
+    // unmatched -> 404: a CONNECT authority-form target also misses the
+    // route table (same non-origin-form refusal) and reaches the same
+    // unmatched policy. NOTE: Envoy's oracle closes this connection
+    // (`connection: close`); Rut's unmatched responder decides persistence
+    // from the parsed request alone (no method-specific override for
+    // CONNECT), so a well-formed keep-alive CONNECT request stays
+    // keep-alive here. This one header is a documented deviation from
+    // `kEnvoyOracle_connect_authority_downstream`
+    // (docs/envoy-compatibility.md); the rest of the layout (date, server,
+    // content-length: 0 order) matches.
+    {
+        const char kReq[] = "CONNECT example.com:443 HTTP/1.1\r\nHost: example.com:443\r\n\r\n";
+        i32 client = connect_to(proxy.port);
+        REQUIRE_GE(client, 0);
+        REQUIRE(send_all(client, kReq, sizeof(kReq) - 1));
+        char response[256];
+        const u32 got = recv_all_until_idle(client, response, sizeof(response));
+        close(client);
+        REQUIRE(normalize_lowercase_date(response, got));
+        const std::string body(response, got);
+        CHECK_NE(body.find("HTTP/1.1 404 Not Found\r\n"), std::string::npos);
+        CHECK_NE(body.find("date: "), std::string::npos);
+        CHECK_NE(body.find("\r\nserver: envoy\r\n"), std::string::npos);
+        CHECK(body.ends_with("content-length: 0\r\n\r\n"));
     }
 }
 
