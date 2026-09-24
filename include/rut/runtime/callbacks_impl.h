@@ -2798,9 +2798,14 @@ void on_response_sent(void* lp, Connection& conn, IoEvent ev) {
     if (conn.local_body_remaining != 0) {
         // The config stays pinned through the send completion. Submit its
         // immutable body directly instead of copying it through the send slice.
+        // Plaintext local bodies are immutable RouteConfig storage and can be
+        // submitted as one remaining span. TLS still feeds the existing
+        // bounded chunks so its record/output path is unchanged.
         constexpr u32 kMaxDirectBodySend = 64 * 1024;
-        const u32 n = conn.local_body_remaining < kMaxDirectBodySend ? conn.local_body_remaining
-                                                                     : kMaxDirectBodySend;
+        const u32 n = conn.tls_active ? (conn.local_body_remaining < kMaxDirectBodySend
+                                             ? conn.local_body_remaining
+                                             : kMaxDirectBodySend)
+                                      : conn.local_body_remaining;
         conn.local_body_remaining -= n;
         conn.local_body_send_len = n;
         conn.transition_to_sending(&on_response_sent<Loop>);

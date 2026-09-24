@@ -36,6 +36,7 @@
 #include <netinet/tcp.h>
 #include <openssl/ssl.h>
 #include <poll.h>
+#include <pthread.h>
 #include <sched.h>
 #include <sys/socket.h>
 #include <unistd.h>
@@ -32258,7 +32259,7 @@ TEST(iouring_local_body_epoch, close_defers_leave_until_send_slot_reclaims) {
     REQUIRE_EQ(rut::test::stream_socketpair(downstream), 0);
     conn->fd = downstream[0];
     downstream[0] = -1;
-    static constexpr u8 kBody[64 * 1024] = {};
+    static constexpr u8 kBody[1u << 20] = {};
     conn->keep_alive = true;
     conn->req_start_us = 1;
     conn->local_body_cursor = kBody;
@@ -62287,6 +62288,116 @@ TEST(iouring_final_response, client_reset_waits_for_the_direct_write_completion)
     close(sv[1]);
 }
 
+struct DirectWriteReaderContext {
+    i32 fd;
+    u8* dst;
+    u32 capacity;
+    u32 length;
+    bool saw_fin;
+    bool error;
+};
+
+void* direct_write_reader_main(void* opaque) {
+    auto* ctx = static_cast<DirectWriteReaderContext*>(opaque);
+    const u64 deadline = monotonic_us() + 5'000'000;
+    u8 tail[64 * 1024];
+    while (monotonic_us() < deadline) {
+        pollfd pfd{ctx->fd, POLLIN | POLLHUP, 0};
+        if (::poll(&pfd, 1, 100) <= 0) continue;
+        u8* dst = ctx->length < ctx->capacity ? ctx->dst + ctx->length : tail;
+        const size_t cap = ctx->length < ctx->capacity ? ctx->capacity - ctx->length
+                                                       : sizeof(tail);
+        const ssize_t n = ::recv(ctx->fd, dst, cap, 0);
+        if (n > 0) {
+            if (ctx->length < ctx->capacity)
+                ctx->length += static_cast<u32>(n);
+            else
+                ctx->error = true;
+            continue;
+        }
+        if (n == 0) {
+            ctx->saw_fin = true;
+            return nullptr;
+        }
+        if (errno != EINTR && errno != EAGAIN && errno != EWOULDBLOCK) {
+            ctx->error = true;
+            return nullptr;
+        }
+    }
+    ctx->error = true;
+    shutdown(ctx->fd, SHUT_RDWR);
+    return nullptr;
+}
+
+TEST(iouring_final_response, config_body_direct_write_partial_drains_before_close) {
+    ScopedIoUringLoopForRetirement guard;
+    if (!guard.init()) SKIP("io_uring unavailable");
+    auto* loop = guard.loop;
+    if (!loop->backend.nop_inject_result) SKIP("IORING_NOP_INJECT_RESULT unsupported");
+    static u8 body[1u << 20];
+    for (u32 i = 0; i < sizeof(body); i++) body[i] = static_cast<u8>(i * 29u + i / 4096u);
+    RouteConfig config{};
+    REQUIRE_EQ(config.add_response_body_view(reinterpret_cast<const char*>(body), sizeof(body)),
+               1u);
+    ShardEpoch epoch{};
+    epoch.epoch.store(1, std::memory_order_relaxed);
+    loop->epoch = &epoch;
+    Connection* conn = loop->alloc_conn();
+    REQUIRE(conn != nullptr);
+    const u32 cid = conn->id;
+    i32 sv[2] = {-1, -1};
+    REQUIRE_EQ(rut::test::stream_socketpair(sv), 0);
+    const int sndbuf = 4096;
+    REQUIRE_EQ(setsockopt(sv[0], SOL_SOCKET, SO_SNDBUF, &sndbuf, sizeof(sndbuf)), 0);
+    conn->fd = sv[0];
+    conn->request_config = &config;
+    conn->keep_alive = false;
+    conn->req_start_us = monotonic_us();
+    conn->resp_status = 200;
+    conn->local_body_cursor = body;
+    conn->local_body_send_len = sizeof(body);
+    conn->local_body_remaining = 0;
+    conn->local_response_size = sizeof(body);
+    conn->transition_to_sending(&on_response_sent<IoUringEventLoop>);
+
+    static u8 received[1u << 20];
+    DirectWriteReaderContext reader_ctx{sv[1], received, sizeof(received), 0, false, false};
+    pthread_t reader;
+    REQUIRE_EQ(pthread_create(&reader, nullptr, &direct_write_reader_main, &reader_ctx), 0);
+
+    const bool submitted = loop->submit_send(*conn, body, sizeof(body));
+    if (!submitted) {
+        shutdown(sv[1], SHUT_RDWR);
+        pthread_join(reader, nullptr);
+        CHECK(submitted);
+        if (conn->fd >= 0) loop->close_conn(*conn);
+        close(sv[1]);
+        return;
+    }
+    CHECK(conn->direct_write_completion_pending);
+    CHECK_EQ(epoch.epoch.load(std::memory_order_relaxed), 1u);
+    CHECK_EQ(loop->backend.send_state[cid].src, body);
+    CHECK_GT(loop->backend.send_state[cid].offset, 0u);
+    CHECK_GT(loop->backend.send_state[cid].remaining, 0u);
+    IoEvent events[4]{};
+    u32 n = 0;
+    for (u32 attempt = 0; attempt < 1000 && n == 0; attempt++)
+        n = loop->backend.wait(events, 4, loop->conns, IoUringEventLoop::kMaxConns);
+    const bool send_event_ok = n == 1u && events[0].type == IoEventType::Send;
+    if (send_event_ok) loop->dispatch(events[0]);
+    if (!send_event_ok) shutdown(sv[1], SHUT_RDWR);
+    pthread_join(reader, nullptr);
+    CHECK(send_event_ok);
+    CHECK_FALSE(reader_ctx.error);
+    REQUIRE_EQ(reader_ctx.length, sizeof(body));
+    CHECK_EQ(memcmp(received, body, sizeof(body)), 0);
+    CHECK(reader_ctx.saw_fin);
+    CHECK_EQ(loop->conns[cid].fd, -1);
+    CHECK_FALSE(loop->conns[cid].direct_write_completion_pending);
+    CHECK_EQ(epoch.epoch.load(std::memory_order_relaxed), 2u);
+    close(sv[1]);
+}
+
 TEST(iouring_final_response, half_close_waits_for_an_inflight_send) {
     ScopedIoUringLoopForRetirement guard;
     if (!guard.init()) SKIP("io_uring unavailable");
@@ -69581,7 +69692,7 @@ TEST(response_headers, large_config_body_sends_from_pinned_read_only_memory) {
         auto* conn = loop.find_fd(42);
         REQUIRE(conn != nullptr);
         RouteConfig cfg{};
-        u8 body[131072];
+        static u8 body[1u << 20];
         for (u32 i = 0; i < sizeof(body); ++i) body[i] = static_cast<u8>(i * 29 + i / 4096);
         REQUIRE_EQ(cfg.add_response_body_view(reinterpret_cast<const char*>(body), sizeof(body)),
                    1u);
@@ -69620,10 +69731,11 @@ TEST(response_headers, large_config_body_sends_from_pinned_read_only_memory) {
         auto* send = loop.backend.last_op(MockOp::Send);
         REQUIRE(send != nullptr);
         CHECK_EQ(send->send_buf, body + prefix);
-        constexpr u32 kChunk = 64 * 1024;
+        const u32 kChunk = sizeof(body) - prefix;
         CHECK_EQ(send->send_len, kChunk);
         CHECK_EQ(conn->local_body_send_len, kChunk);
         constexpr u32 kPartial = 8192;
+        CHECK_GT(kChunk, kPartial);
         on_response_sent<SmallLoop>(&loop, *conn, make_ev(conn->id, IoEventType::Send, kPartial));
         send = loop.backend.last_op(MockOp::Send);
         REQUIRE(send != nullptr);
@@ -69631,17 +69743,36 @@ TEST(response_headers, large_config_body_sends_from_pinned_read_only_memory) {
         CHECK_EQ(send->send_len, kChunk - kPartial);
         on_response_sent<SmallLoop>(
             &loop, *conn, make_ev(conn->id, IoEventType::Send, kChunk - kPartial));
-        send = loop.backend.last_op(MockOp::Send);
-        REQUIRE(send != nullptr);
-        CHECK_EQ(send->send_buf, body + prefix + kChunk);
-        CHECK_EQ(send->send_len, sizeof(body) - prefix - kChunk);
-        on_response_sent<SmallLoop>(
-            &loop, *conn, make_ev(conn->id, IoEventType::Send, sizeof(body) - prefix - kChunk));
         CHECK_EQ(conn->local_body_remaining, 0u);
         CHECK_EQ(conn->local_body_send_len, 0u);
         CHECK_EQ(conn->local_body_cursor, nullptr);
         CHECK_EQ(conn->local_response_size, 0u);
     }
+}
+
+TEST(response_headers, tls_large_config_body_keeps_bounded_continuation_chunk) {
+    SmallLoop loop;
+    loop.setup();
+    loop.inject_and_dispatch(make_ev(0, IoEventType::Accept, 42));
+    auto* conn = loop.find_fd(42);
+    REQUIRE(conn != nullptr);
+
+    static constexpr u8 kBody[131072] = {};
+    conn->tls_active = true;
+    conn->keep_alive = true;
+    conn->local_body_cursor = kBody;
+    conn->local_body_remaining = sizeof(kBody) - 64 * 1024;
+    conn->local_body_send_len = 64 * 1024;
+    conn->transition_to_sending(&on_response_sent<SmallLoop>);
+    REQUIRE(loop.submit_send(*conn, kBody, 64 * 1024));
+
+    on_response_sent<SmallLoop>(&loop, *conn, make_ev(conn->id, IoEventType::Send, 64 * 1024));
+    auto* send = loop.backend.last_op(MockOp::Send);
+    REQUIRE(send != nullptr);
+    CHECK_EQ(send->send_buf, kBody + 64 * 1024);
+    CHECK_EQ(send->send_len, 64 * 1024u);
+    CHECK_EQ(conn->local_body_remaining, 0u);
+    CHECK_EQ(conn->local_body_send_len, 64 * 1024u);
 }
 
 TEST(response_headers, committed_after_header_preserves_status_reason_body) {
