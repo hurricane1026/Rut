@@ -12,7 +12,22 @@ namespace rut::envoy {
 struct RutSource {
     // Strict completion rule: `len < kCapacity`, NUL-terminated, overflow is a
     // diagnostic rather than a truncated program.
-    static constexpr u32 kCapacity = 16384;
+    //
+    // Sized for the increment-4 ordered route-list lowering (envoy-pr-plan.md,
+    // PR 8 "Capacity"). Worst case: `kMaxEnvoyRoutes` (8) routes, each
+    // contributing at most one HEAD and one non-HEAD forward() block (~1500
+    // bytes apiece, see the golden in tests/fixtures/envoy_milestone_s.inc)
+    // plus nested if/else wrapper lines (~100 bytes per nesting level, up to
+    // 8 levels deep) and up to `kMaxEnvoyRoutes` `route exact` 404 fallbacks
+    // (~400 bytes each), plus fixed listen/upstream/unmatched overhead:
+    //   2 * 8 * 1500 + 2 * 8 * 8 * 100 + 8 * 400 + 2048 = 40448 bytes,
+    // comfortably under the 256 KiB ceiling the plan sets as the point where
+    // `kMaxEnvoyRoutes` itself would need to shrink. kCapacity is set with
+    // generous headroom above that bound for later increments (PR 9/10 add
+    // `direct_response`/`redirect` bodies).
+    static constexpr u32 kCapacity = 131072;  // 128 KiB
+    static_assert(kCapacity >= 2u * 8u * 1500u + 2u * 8u * 8u * 100u + 8u * 400u + 2048u,
+                  "RutSource::kCapacity must cover the PR8 worst-case ordered route-list lowering");
     char data[kCapacity]{};
     u32 len = 0;
 

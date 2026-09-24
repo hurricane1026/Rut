@@ -1,10 +1,17 @@
 #include "fixtures/envoy_milestone_s.inc"
+#include "fixtures/envoy_routes_a.inc"
+#include "fixtures/envoy_routes_b.inc"
+#include "fixtures/envoy_routes_c.inc"
+#include "fixtures/envoy_routes_d.inc"
+#include "fixtures/envoy_routes_e.inc"
 #include "rut/envoy/converter.h"
 #include "rut/envoy/parser.h"
 #include "test.h"
+#include <algorithm>
 #include <cerrno>
 #include <cstdio>
 #include <cstdlib>
+#include <memory>
 #include <string>
 #include <vector>
 
@@ -23,6 +30,20 @@
 using namespace rut;
 
 namespace {
+
+// `RutSource` is 128 KiB (PR8's ordered route-list capacity, see
+// include/rut/envoy/converter.h). Every `lower_to_rut` result a test keeps
+// around (as opposed to consuming immediately in one expression) is heap-held
+// through this alias rather than a plain stack local.
+using LowerResult = std::unique_ptr<FrontendResult<envoy::RutSource>>;
+
+LowerResult lower_heap(const envoy::Bootstrap& model) {
+    return std::make_unique<FrontendResult<envoy::RutSource>>(envoy::lower_to_rut(model));
+}
+
+LowerResult lower_heap(const envoy::Bootstrap& model, const envoy::RutCapabilities& caps) {
+    return std::make_unique<FrontendResult<envoy::RutSource>>(envoy::lower_to_rut(model, caps));
+}
 
 const char* g_executable = nullptr;
 
@@ -325,56 +346,8 @@ std::string milestone_s_json(const char* listener_address = "0.0.0.0") {
 
 // Variants of the milestone-S bootstrap exercising the increment-4 shapes
 // that the converter must reject before the six capability checks
-// (docs/envoy-converter.md, "Capability validation"): more than one route,
-// more than one cluster, `direct_response`, `redirect`.
-
-std::string two_routes_json(rut::test::TestCase* _tc) {
-    std::string text = milestone_s_json();
-    CHECK(replace_first(
-        &text,
-        "\"routes\": [{\"match\": {\"prefix\": \"/\"}, \"route\": {\"cluster\": \"backend\", "
-        "\"timeout\": \"0s\"}}]",
-        "\"routes\": [{\"match\": {\"prefix\": \"/\"}, \"route\": {\"cluster\": \"backend\", "
-        "\"timeout\": \"0s\"}}, {\"match\": {\"path\": \"/x\"}, \"route\": {\"cluster\": "
-        "\"backend\"}}]"));
-    return text;
-}
-
-std::string two_clusters_json(rut::test::TestCase* _tc) {
-    std::string text = milestone_s_json();
-    CHECK(replace_first(
-        &text,
-        "\"clusters\": [{\n"
-        "\"name\": \"backend\",\n"
-        "\"type\": \"STATIC\",\n"
-        "\"connect_timeout\": \"5s\",\n"
-        "\"load_assignment\": {\"cluster_name\": \"backend\", \"endpoints\": [{\"lb_endpoints\": "
-        "[{\n"
-        "\"endpoint\": {\"address\": {\"socket_address\": {\"address\": \"127.0.0.1\", "
-        "\"port_value\": 9000}}}\n"
-        "}]}]}\n"
-        "}]",
-        "\"clusters\": [{\n"
-        "\"name\": \"backend\",\n"
-        "\"type\": \"STATIC\",\n"
-        "\"connect_timeout\": \"5s\",\n"
-        "\"load_assignment\": {\"cluster_name\": \"backend\", \"endpoints\": [{\"lb_endpoints\": "
-        "[{\n"
-        "\"endpoint\": {\"address\": {\"socket_address\": {\"address\": \"127.0.0.1\", "
-        "\"port_value\": 9000}}}\n"
-        "}]}]}\n"
-        "}, {\n"
-        "\"name\": \"backend2\",\n"
-        "\"type\": \"STATIC\",\n"
-        "\"connect_timeout\": \"5s\",\n"
-        "\"load_assignment\": {\"cluster_name\": \"backend2\", \"endpoints\": [{\"lb_endpoints\": "
-        "[{\n"
-        "\"endpoint\": {\"address\": {\"socket_address\": {\"address\": \"127.0.0.1\", "
-        "\"port_value\": 9001}}}\n"
-        "}]}]}\n"
-        "}]"));
-    return text;
-}
+// (docs/envoy-converter.md, "Capability validation"): `direct_response`,
+// `redirect`.
 
 std::string path_match_json(rut::test::TestCase* _tc) {
     std::string text = milestone_s_json();
@@ -431,6 +404,220 @@ std::string direct_response_no_clusters_json(rut::test::TestCase* _tc) {
 }])";
     CHECK(replace_first(&text, ",\n\"clusters\": " + clusters_literal + "\n", "\n"));
     return text;
+}
+
+// ── PR 8: ordered route-list bootstraps ────────────────────────────────
+//
+// A general builder for the increment-4 shapes: an arbitrary ordered
+// `routes` array and `clusters` array (both already JSON-encoded by the
+// caller), dropped into the same milestone-S envelope (`suppress_envoy_headers:
+// true`, `generate_request_id: false`) so every route can carry
+// `"timeout": "0s"` and clear the six capability checks once
+// `RutCapabilities` are all true.
+std::string route_list_json(const std::string& routes_json, const std::string& clusters_json) {
+    std::string text = "{\n\"static_resources\": {\n\"listeners\": [{\n";
+    text += "\"name\": \"ingress\",\n";
+    text +=
+        "\"address\": {\"socket_address\": {\"address\": \"0.0.0.0\", \"port_value\": 8080}},\n";
+    text += "\"filter_chains\": [{\"filters\": [{\n";
+    text += "\"name\": \"envoy.filters.network.http_connection_manager\",\n";
+    text += "\"typed_config\": {\n";
+    text +=
+        "\"@type\": "
+        "\"type.googleapis.com/envoy.extensions.filters.network.http_connection_manager.v3."
+        "HttpConnectionManager\",\n";
+    text += "\"stat_prefix\": \"ingress\",\n";
+    text += "\"codec_type\": \"HTTP1\",\n";
+    text += "\"generate_request_id\": false,\n";
+    text += "\"route_config\": {\"name\": \"local\", \"virtual_hosts\": [{\n";
+    text += "\"name\": \"all\",\n";
+    text += "\"domains\": [\"*\"],\n";
+    text += "\"routes\": " + routes_json + "\n";
+    text += "}]},\n";
+    text += "\"http_filters\": [{\"name\": \"envoy.filters.http.router\",\n";
+    text +=
+        "\"typed_config\": {\"@type\": "
+        "\"type.googleapis.com/envoy.extensions.filters.http.router.v3.Router\", "
+        "\"suppress_envoy_headers\": true}}]\n";
+    text += "}}]}]\n";
+    text += "}],\n";
+    text += "\"clusters\": " + clusters_json + "\n";
+    text += "}\n}\n";
+    return text;
+}
+
+std::string prefix_route_json(const std::string& prefix, const std::string& cluster_name) {
+    return "{\"match\": {\"prefix\": \"" + prefix + "\"}, \"route\": {\"cluster\": \"" +
+           cluster_name + "\", \"timeout\": \"0s\"}}";
+}
+
+std::string path_route_json(const std::string& path, const std::string& cluster_name) {
+    return "{\"match\": {\"path\": \"" + path + "\"}, \"route\": {\"cluster\": \"" + cluster_name +
+           "\", \"timeout\": \"0s\"}}";
+}
+
+std::string cluster_json(const std::string& name, int port) {
+    return "{\"name\": \"" + name +
+           "\", \"type\": \"STATIC\", \"connect_timeout\": \"5s\", \"load_assignment\": "
+           "{\"cluster_name\": \"" +
+           name +
+           "\", \"endpoints\": [{\"lb_endpoints\": [{\"endpoint\": {\"address\": "
+           "{\"socket_address\": {\"address\": \"127.0.0.1\", \"port_value\": " +
+           std::to_string(port) + "}}}}]}]}}";
+}
+
+std::string json_array(const std::vector<std::string>& items) {
+    std::string out = "[";
+    for (size_t i = 0; i < items.size(); i++) {
+        if (i != 0u) out += ", ";
+        out += items[i];
+    }
+    out += "]";
+    return out;
+}
+
+// Goldens (a)-(e) from envoy-pr-plan.md, PR 8 "Tests" — see the algorithm
+// doc comment in src/envoy/converter.cc for why each one lowers the way it
+// does. Cluster ports and names match the fixtures under
+// tests/fixtures/envoy_routes_<letter>.inc exactly (regenerated by hand-
+// running rut::envoy::lower_to_rut on each of these bootstraps).
+
+// (a) prefix "/api/" declared before the catch-all "/".
+std::string routes_scenario_a_json() {
+    return route_list_json(
+        json_array({prefix_route_json("/api/", "api_backend"), prefix_route_json("/", "backend")}),
+        json_array({cluster_json("backend", 9000), cluster_json("api_backend", 9001)}));
+}
+
+// (b) the catch-all "/" declared before prefix "/api/".
+std::string routes_scenario_b_json() {
+    return route_list_json(
+        json_array({prefix_route_json("/", "backend"), prefix_route_json("/api/", "api_backend")}),
+        json_array({cluster_json("backend", 9000), cluster_json("api_backend", 9001)}));
+}
+
+// (c) exact path "/healthz" declared before the catch-all "/".
+std::string routes_scenario_c_json() {
+    return route_list_json(
+        json_array(
+            {path_route_json("/healthz", "health_backend"), prefix_route_json("/", "backend")}),
+        json_array({cluster_json("backend", 9000), cluster_json("health_backend", 9001)}));
+}
+
+// (d) prefix "/api/" only, no catch-all declared.
+std::string routes_scenario_d_json() {
+    return route_list_json(json_array({prefix_route_json("/api/", "api_backend")}),
+                           json_array({cluster_json("api_backend", 9001)}));
+}
+
+// (e) prefix "/api/" declared before an exact path under it, "/api/x"
+// (permanently shadowed and omitted from the emitted RUT).
+std::string routes_scenario_e_json() {
+    return route_list_json(
+        json_array(
+            {prefix_route_json("/api/", "api_backend"), path_route_json("/api/x", "dead_backend")}),
+        json_array({cluster_json("api_backend", 9001), cluster_json("dead_backend", 9002)}));
+}
+
+// ── Brute-force equivalence: Envoy first-match vs. the lowered structure ──
+//
+// A route-list model used only by the two independent simulations below (not
+// by `rut::envoy::parse_bootstrap_json`): one entry per Envoy route, in
+// declared order.
+struct SimRoute {
+    bool is_prefix;
+    std::string text;  // prefix (as declared, may or may not end in "/") or exact path
+    std::string cluster;
+};
+
+bool sim_is_under(const std::string& node, const std::string& p) {
+    if (node == "/") return true;
+    if (node == p) return true;
+    if (p.size() <= node.size()) return false;
+    return p.compare(0, node.size(), node) == 0 && p[node.size()] == '/';
+}
+
+bool sim_is_strict_ancestor(const std::string& m, const std::string& node) {
+    return m != node && sim_is_under(m, node);
+}
+
+std::string sim_strip_trailing_slash(const std::string& prefix) {
+    if (prefix == "/") return "/";
+    return prefix.substr(0, prefix.size() - 1);
+}
+
+// Envoy's real semantics: first declared route (in list order) whose match
+// applies. `prefix` is a plain byte-prefix test; `path` is exact equality.
+std::string envoy_first_match(const std::vector<SimRoute>& routes, const std::string& path) {
+    for (const SimRoute& route : routes) {
+        if (route.is_prefix) {
+            if (route.text == "/" || path.compare(0, route.text.size(), route.text) == 0)
+                return route.cluster;
+        } else if (route.text == path) {
+            return route.cluster;
+        }
+    }
+    return "<404>";
+}
+
+// The structure PR8 lowers to: exact routes win over the trie (RUT's
+// exact_strict_local_response fast path runs before match_canonical, see the
+// VERIFY note in src/envoy/converter.cc), then the longest matching declared
+// node, then that node's own if/else arm chain. Written independently of
+// src/envoy/converter.cc's build_node_plan so a bug in the converter is not
+// also baked into the "expected" side of this test.
+std::string sim_dispatch(const std::vector<SimRoute>& routes, const std::string& path) {
+    std::vector<std::string> nodes = {"/"};
+    for (const SimRoute& route : routes) {
+        if (!route.is_prefix || route.text == "/") continue;
+        const std::string node = sim_strip_trailing_slash(route.text);
+        if (std::find(nodes.begin(), nodes.end(), node) == nodes.end()) nodes.push_back(node);
+    }
+    auto longest_node = [&](const std::string& p) {
+        std::string best = "/";
+        for (const std::string& n : nodes) {
+            if (n.size() > best.size() && sim_is_under(n, p)) best = n;
+        }
+        return best;
+    };
+    const std::string node = longest_node(path);
+
+    if (path == node && node != "/") {
+        // route_exact(node): the first route (Envoy order) that is either an
+        // exact match on `node` itself or a strict-ancestor prefix.
+        for (const SimRoute& route : routes) {
+            if (!route.is_prefix && route.text == node) return route.cluster;
+            if (route.is_prefix) {
+                const std::string m = sim_strip_trailing_slash(route.text);
+                if (sim_is_strict_ancestor(m, node)) return route.cluster;
+            }
+        }
+        return "<404>";
+    }
+
+    // The node's own body only ever sees `path != node` here (a non-root
+    // node's own literal text is always diverted to the `route_exact` branch
+    // above; root's own arm matches `path == "/"` too, so root never reaches
+    // this comment's premise but is handled by the explicit `node == "/"`
+    // check below). That makes an exact route naming `node` itself
+    // irrelevant here (it can never match) and the node's own prefix arm
+    // unconditional the first time it is reached (its real condition,
+    // `pathOnly != node`, is trivially true) — no "have we seen the node's
+    // own prefix yet" bookkeeping is needed in this branch.
+    for (const SimRoute& route : routes) {
+        if (!route.is_prefix) {
+            if (route.text == node) continue;  // irrelevant: never matches here
+            const std::string owner = longest_node(route.text);
+            if (owner != node) continue;
+            if (path == route.text) return route.cluster;
+            continue;
+        }
+        const std::string m = sim_strip_trailing_slash(route.text);
+        if (m == node) return route.cluster;  // node's own arm: unconditional here
+        if (sim_is_strict_ancestor(m, node)) return route.cluster;
+        // strict descendant or unrelated: irrelevant to this node
+    }
+    return "<404>";  // unreachable for a well-formed model (see converter.cc)
 }
 
 }  // namespace
@@ -1021,13 +1208,13 @@ TEST(envoy_convert, blocked_without_suppress_envoy_headers) {
         auto parsed = envoy::parse_bootstrap_json(str(text), doc);
         REQUIRE(parsed);
         const envoy::RouterFilter& router = parsed.value().listener.filter_chain.hcm.router;
-        auto lowered = envoy::lower_to_rut(parsed.value());
-        REQUIRE_FALSE(lowered);
-        CHECK(lowered.error().code == FrontendError::UnsupportedSyntax);
-        CHECK(to_string(lowered.error().detail).find("suppress_envoy_headers: true") !=
+        auto lowered = lower_heap(parsed.value());
+        REQUIRE_FALSE(*lowered);
+        CHECK(lowered->error().code == FrontendError::UnsupportedSyntax);
+        CHECK(to_string(lowered->error().detail).find("suppress_envoy_headers: true") !=
               std::string::npos);
-        CHECK_EQ(lowered.error().span.line, router.span.line);
-        CHECK_EQ(lowered.error().span.col, router.span.col);
+        CHECK_EQ(lowered->error().span.line, router.span.line);
+        CHECK_EQ(lowered->error().span.col, router.span.col);
     }
     {
         const std::string text = milestone_json(
@@ -1037,13 +1224,13 @@ TEST(envoy_convert, blocked_without_suppress_envoy_headers) {
         REQUIRE(parsed);
         const envoy::RouterFilter& router = parsed.value().listener.filter_chain.hcm.router;
         REQUIRE(router.suppress_envoy_headers_present);
-        auto lowered = envoy::lower_to_rut(parsed.value());
-        REQUIRE_FALSE(lowered);
-        CHECK(lowered.error().code == FrontendError::UnsupportedSyntax);
-        CHECK(to_string(lowered.error().detail).find("suppress_envoy_headers: true") !=
+        auto lowered = lower_heap(parsed.value());
+        REQUIRE_FALSE(*lowered);
+        CHECK(lowered->error().code == FrontendError::UnsupportedSyntax);
+        CHECK(to_string(lowered->error().detail).find("suppress_envoy_headers: true") !=
               std::string::npos);
-        CHECK_EQ(lowered.error().span.line, router.suppress_envoy_headers_span.line);
-        CHECK_EQ(lowered.error().span.col, router.suppress_envoy_headers_span.col);
+        CHECK_EQ(lowered->error().span.line, router.suppress_envoy_headers_span.line);
+        CHECK_EQ(lowered->error().span.col, router.suppress_envoy_headers_span.col);
     }
 }
 
@@ -1057,13 +1244,13 @@ TEST(envoy_convert, blocked_on_route_timeout) {
         const envoy::RouteAction& action =
             parsed.value().listener.filter_chain.hcm.route_config.virtual_host.routes[0].action;
         REQUIRE_FALSE(action.timeout_present);
-        auto lowered = envoy::lower_to_rut(parsed.value());
-        REQUIRE_FALSE(lowered);
-        CHECK(lowered.error().code == FrontendError::UnsupportedSyntax);
-        CHECK(to_string(lowered.error().detail).find("default 15s route timeout") !=
+        auto lowered = lower_heap(parsed.value());
+        REQUIRE_FALSE(*lowered);
+        CHECK(lowered->error().code == FrontendError::UnsupportedSyntax);
+        CHECK(to_string(lowered->error().detail).find("default 15s route timeout") !=
               std::string::npos);
-        CHECK_EQ(lowered.error().span.line, action.span.line);
-        CHECK_EQ(lowered.error().span.col, action.span.col);
+        CHECK_EQ(lowered->error().span.line, action.span.line);
+        CHECK_EQ(lowered->error().span.col, action.span.col);
     }
     {
         const std::string text = milestone_json(
@@ -1075,13 +1262,13 @@ TEST(envoy_convert, blocked_on_route_timeout) {
             parsed.value().listener.filter_chain.hcm.route_config.virtual_host.routes[0].action;
         REQUIRE(action.timeout_present);
         CHECK_EQ(action.timeout.milliseconds, 15000u);
-        auto lowered = envoy::lower_to_rut(parsed.value());
-        REQUIRE_FALSE(lowered);
-        CHECK(lowered.error().code == FrontendError::UnsupportedSyntax);
-        CHECK(to_string(lowered.error().detail).find("non-zero route timeout") !=
+        auto lowered = lower_heap(parsed.value());
+        REQUIRE_FALSE(*lowered);
+        CHECK(lowered->error().code == FrontendError::UnsupportedSyntax);
+        CHECK(to_string(lowered->error().detail).find("non-zero route timeout") !=
               std::string::npos);
-        CHECK_EQ(lowered.error().span.line, action.timeout.span.line);
-        CHECK_EQ(lowered.error().span.col, action.timeout.span.col);
+        CHECK_EQ(lowered->error().span.line, action.timeout.span.line);
+        CHECK_EQ(lowered->error().span.col, action.timeout.span.col);
     }
 }
 
@@ -1092,42 +1279,47 @@ TEST(envoy_convert, api_all_capabilities_matches_golden) {
     REQUIRE(parsed);
 
     const envoy::RutCapabilities all_true = all_capabilities_true();
-    auto lowered = envoy::lower_to_rut(parsed.value(), all_true);
-    REQUIRE(lowered);
+    auto lowered = lower_heap(parsed.value(), all_true);
+    REQUIRE(*lowered);
     const Str golden = lit_str(kEnvoyMilestoneSGolden);
-    REQUIRE_EQ(lowered.value().len, golden.len);
-    CHECK(lowered.value().view().eq(golden));
-    CHECK_EQ(lowered.value().data[lowered.value().len], '\0');
-    CHECK_LT(lowered.value().len, envoy::RutSource::kCapacity);
+    REQUIRE_EQ((*lowered).value().len, golden.len);
+    CHECK((*lowered).value().view().eq(golden));
+    CHECK_EQ((*lowered).value().data[(*lowered).value().len], '\0');
+    CHECK_LT((*lowered).value().len, envoy::RutSource::kCapacity);
 
-    auto lowered_again = envoy::lower_to_rut(parsed.value(), all_true);
-    REQUIRE(lowered_again);
-    CHECK(lowered_again.value().view().eq(golden));
+    auto lowered_again = lower_heap(parsed.value(), all_true);
+    REQUIRE(*lowered_again);
+    CHECK((*lowered_again).value().view().eq(golden));
 
     // Overwriting the JSON source after lowering must not change output
-    // bytes: no borrowed source text reaches the emitted RUT for output
-    // generation, only numeric model fields do. `validate` does need to
-    // read the borrowed route-match prefix, cluster-name, load-assignment-
-    // name, router-name, and network-filter-name bytes (it must, to fail
-    // closed when hand-built content no longer matches its modeled shape;
-    // see `api_forged_model_rejected`'s `forged_short_prefix` case, added by
-    // PR #692 round-3 review's defensive `validate()` check that the prefix
-    // is exactly "/", `forged_router_name`/`cleared_typed_config`, added by
-    // round-4's check that the router filter name is exactly
-    // "envoy.filters.http.router", round-5's check that the network filter
-    // name is exactly "envoy.filters.network.http_connection_manager", and
-    // `renamed_cluster_stale_load_assignment`, added by round-12's check
-    // that `load_assignment.cluster_name` still equals the declared
-    // cluster's `name`), so this leaves those specific source spans
-    // untouched and corrupts every other byte.
+    // bytes: `validate` still needs to read the borrowed router-name and
+    // network-filter-name bytes (it must, to fail closed when hand-built
+    // content no longer matches its modeled shape; see
+    // `api_forged_model_rejected`'s `forged_router_name`/`cleared_typed_config`,
+    // added by PR #692 round-4's check that the router filter name is
+    // exactly "envoy.filters.http.router", and `forged_filter_name`/
+    // `cleared_filter_name`, added by round-5's check that the network
+    // filter name is exactly
+    // "envoy.filters.network.http_connection_manager"). PR #692 round-3's
+    // defensive `match.prefix == "/"` check no longer applies now that PR8
+    // lowers arbitrary declared prefixes by construction (see the algorithm
+    // doc comment in src/envoy/converter.cc), so this single-route,
+    // root-only shape no longer needs to preserve the route-match prefix or
+    // cluster-name bytes: no borrowed source text besides the router name
+    // and network filter name reaches the emitted RUT for it, only numeric
+    // model fields and the grammar-guaranteed root literal do. PR8's
+    // multi-route lowering (the envoy_routes_<letter> goldens below)
+    // intentionally emits real borrowed path/prefix text and is not held to
+    // this invariant. Round-12's `load_assignment.cluster_name == name`
+    // revalidation (`renamed_cluster_stale_load_assignment`,
+    // `api_forged_model_rejected`) doesn't need its own kept span here
+    // either: `name`/`action.cluster`/`load_assignment_name` all corrupt to
+    // the same fixed-length run of 'x' bytes (parsing already required them
+    // equal in both length and content), so any two of them remain equal to
+    // each other after the uniform byte-for-byte overwrite below, and the
+    // equality/declared-cluster checks still pass.
     const envoy::Bootstrap model_copy = parsed.value();
-    const envoy::Route& route_copy =
-        model_copy.listener.filter_chain.hcm.route_config.virtual_host.routes[0];
     const Span kept_spans[] = {
-        route_copy.match.prefix_span,
-        route_copy.action.cluster_span,
-        model_copy.clusters[0].name_span,
-        model_copy.clusters[0].load_assignment_name_span,
         model_copy.listener.filter_chain.hcm.router.name_span,
         model_copy.listener.filter_chain.filter_name_span,
     };
@@ -1141,9 +1333,9 @@ TEST(envoy_convert, api_all_capabilities_matches_golden) {
         }
         if (!keep) text[i] = 'x';
     }
-    auto lowered_after_mutation = envoy::lower_to_rut(model_copy, all_true);
-    REQUIRE(lowered_after_mutation);
-    CHECK(lowered_after_mutation.value().view().eq(golden));
+    auto lowered_after_mutation = lower_heap(model_copy, all_true);
+    REQUIRE(*lowered_after_mutation);
+    CHECK((*lowered_after_mutation).value().view().eq(golden));
 }
 
 // PR #692 round-7 review: the milestone bootstrap's HCM requires
@@ -1185,9 +1377,9 @@ TEST(envoy_convert, api_exact_listener_address) {
     auto parsed = envoy::parse_bootstrap_json(str(text), doc);
     REQUIRE(parsed);
     const envoy::RutCapabilities all_true = all_capabilities_true();
-    auto lowered = envoy::lower_to_rut(parsed.value(), all_true);
-    REQUIRE(lowered);
-    const std::string out = to_string(lowered.value().view());
+    auto lowered = lower_heap(parsed.value(), all_true);
+    REQUIRE(*lowered);
+    const std::string out = to_string((*lowered).value().view());
     CHECK_EQ(out.rfind("listen 127.0.0.1:8080\n", 0), 0u);
 }
 
@@ -1211,24 +1403,6 @@ TEST(envoy_convert, api_forged_model_rejected) {
         .action.cluster = lit_str("other");
     CHECK_FALSE(envoy::lower_to_rut(mismatched_cluster, all_true));
 
-    // PR #692 round-3 review: a hand-mutated `match.prefix` must not lower
-    // successfully. The emitted route is always the literal `"/"` catch-all
-    // (put_forward_route never reads `match.prefix`), so without a check
-    // a forged "/admin" prefix would silently widen what the generated RUT
-    // actually matches relative to what the model claims — caught here by
-    // the earlier "route matches other than \"prefix\": \"/\" are not
-    // lowered yet" guard (this increment lowers only the root catch-all;
-    // see the `blocked_on_nonroot_prefix` shape above), which already
-    // covers every non-"/" prefix regardless of how the model was built.
-    envoy::Bootstrap forged_prefix = parsed.value();
-    forged_prefix.listener.filter_chain.hcm.route_config.virtual_host.routes[0].match.prefix =
-        lit_str("/admin");
-    const auto forged_prefix_result = envoy::lower_to_rut(forged_prefix, all_true);
-    CHECK_FALSE(forged_prefix_result);
-    CHECK(forged_prefix_result.error().code == FrontendError::UnsupportedSyntax);
-    CHECK(to_string(forged_prefix_result.error().detail).find("are not lowered yet") !=
-          std::string::npos);
-
     // PR #692 round-4 review: a hand-mutated router filter identity must not
     // lower successfully either. `validate()` only inspected
     // `suppress_envoy_headers` on the router filter; a caller retargeting
@@ -1251,15 +1425,12 @@ TEST(envoy_convert, api_forged_model_rejected) {
     CHECK(to_string(cleared_typed_config_result.error().detail).find("typed_config is required") !=
           std::string::npos);
 
-    // A hand-built model can set a `Prefix` match to a length-1 string that
-    // is not "/" (the parser's own `prefix_shape_ok` never produces this);
-    // the same guard above compares prefix bytes, not just length, so this
-    // is rejected the same way instead of being silently broadened into the
-    // `route "/"` catch-all.
-    envoy::Bootstrap forged_short_prefix = parsed.value();
-    forged_short_prefix.listener.filter_chain.hcm.route_config.virtual_host.routes[0].match.prefix =
-        lit_str("x");
-    CHECK_FALSE(envoy::lower_to_rut(forged_short_prefix, all_true));
+    // PR #692 round-3 review's defensive `match.prefix == "/"` check (a
+    // hand-mutated non-"/" prefix must not lower successfully) no longer
+    // applies once PR8 lowers arbitrary declared prefixes by construction
+    // (see the algorithm doc comment in src/envoy/converter.cc): a forged
+    // "/admin" or length-1 non-"/" prefix now lowers to its own route node
+    // like any other declared prefix instead of being rejected.
 
     // A hand-built model can also drop every declared cluster while its
     // route still forwards; the empty-cluster allowance is only for
@@ -1615,53 +1786,10 @@ TEST(envoy_convert, api_forged_model_rejected) {
               .find("route count exceeds the bounded capacity") != std::string::npos);
 }
 
-// ── Increment 4: reject route lists / direct_response / redirect before the
-//    six capability checks ─────────────────────────────────────────────
-
-TEST(envoy_convert, blocked_on_multiple_routes) {
-    const std::string text = two_routes_json(_tc);
-    static envoy::JsonDocument doc;
-    auto parsed = envoy::parse_bootstrap_json(str(text), doc);
-    REQUIRE(parsed);
-    REQUIRE_EQ(parsed.value().listener.filter_chain.hcm.route_config.virtual_host.routes.len, 2u);
-    const Span second_route_span =
-        parsed.value().listener.filter_chain.hcm.route_config.virtual_host.routes[1].span;
-
-    // Rejected the same way regardless of capabilities: this check runs
-    // before the capability-gated ones.
-    const envoy::RutCapabilities all_true{true, true, true};
-    for (const bool use_all_true : {false, true}) {
-        auto lowered = use_all_true ? envoy::lower_to_rut(parsed.value(), all_true)
-                                    : envoy::lower_to_rut(parsed.value());
-        REQUIRE_FALSE(lowered);
-        CHECK(lowered.error().code == FrontendError::UnsupportedSyntax);
-        CHECK(to_string(lowered.error().detail).find("multiple routes are not lowered yet") !=
-              std::string::npos);
-        CHECK_EQ(lowered.error().span.line, second_route_span.line);
-        CHECK_EQ(lowered.error().span.col, second_route_span.col);
-    }
-}
-
-TEST(envoy_convert, blocked_on_multiple_clusters) {
-    const std::string text = two_clusters_json(_tc);
-    static envoy::JsonDocument doc;
-    auto parsed = envoy::parse_bootstrap_json(str(text), doc);
-    REQUIRE(parsed);
-    REQUIRE_EQ(parsed.value().clusters.len, 2u);
-    const Span second_cluster_span = parsed.value().clusters[1].span;
-
-    const envoy::RutCapabilities all_true{true, true, true};
-    for (const bool use_all_true : {false, true}) {
-        auto lowered = use_all_true ? envoy::lower_to_rut(parsed.value(), all_true)
-                                    : envoy::lower_to_rut(parsed.value());
-        REQUIRE_FALSE(lowered);
-        CHECK(lowered.error().code == FrontendError::UnsupportedSyntax);
-        CHECK(to_string(lowered.error().detail).find("multiple clusters are not lowered yet") !=
-              std::string::npos);
-        CHECK_EQ(lowered.error().span.line, second_cluster_span.line);
-        CHECK_EQ(lowered.error().span.col, second_cluster_span.col);
-    }
-}
+// ── Increment 4: reject direct_response / redirect before the six
+//    capability checks (multiple routes and clusters are lowered by this PR;
+//    see the golden_routes_* and cli_two_routes_blocked_by_first_capability
+//    tests below) ─────────────────────────────────────────────────────────
 
 TEST(envoy_convert, blocked_on_path_match) {
     const std::string text = path_match_json(_tc);
@@ -1713,13 +1841,13 @@ TEST(envoy_convert, blocked_on_direct_response) {
     REQUIRE(action.kind == envoy::RouteActionKind::DirectResponse);
 
     const envoy::RutCapabilities all_true{true, true, true};
-    auto lowered = envoy::lower_to_rut(parsed.value(), all_true);
-    REQUIRE_FALSE(lowered);
-    CHECK(lowered.error().code == FrontendError::UnsupportedSyntax);
-    CHECK(to_string(lowered.error().detail).find("direct_response is not lowered yet") !=
+    auto lowered = lower_heap(parsed.value(), all_true);
+    REQUIRE_FALSE(*lowered);
+    CHECK(lowered->error().code == FrontendError::UnsupportedSyntax);
+    CHECK(to_string(lowered->error().detail).find("direct_response is not lowered yet") !=
           std::string::npos);
-    CHECK_EQ(lowered.error().span.line, action.span.line);
-    CHECK_EQ(lowered.error().span.col, action.span.col);
+    CHECK_EQ(lowered->error().span.line, action.span.line);
+    CHECK_EQ(lowered->error().span.col, action.span.col);
 }
 
 TEST(envoy_convert, local_only_route_table_omits_clusters) {
@@ -1753,13 +1881,237 @@ TEST(envoy_convert, blocked_on_redirect) {
     REQUIRE(action.kind == envoy::RouteActionKind::Redirect);
 
     const envoy::RutCapabilities all_true{true, true, true};
-    auto lowered = envoy::lower_to_rut(parsed.value(), all_true);
-    REQUIRE_FALSE(lowered);
-    CHECK(lowered.error().code == FrontendError::UnsupportedSyntax);
-    CHECK(to_string(lowered.error().detail).find("redirect is not lowered yet") !=
+    auto lowered = lower_heap(parsed.value(), all_true);
+    REQUIRE_FALSE(*lowered);
+    CHECK(lowered->error().code == FrontendError::UnsupportedSyntax);
+    CHECK(to_string(lowered->error().detail).find("redirect is not lowered yet") !=
           std::string::npos);
-    CHECK_EQ(lowered.error().span.line, action.span.line);
-    CHECK_EQ(lowered.error().span.col, action.span.col);
+    CHECK_EQ(lowered->error().span.line, action.span.line);
+    CHECK_EQ(lowered->error().span.col, action.span.col);
+}
+
+// ── PR 8: ordered route-list lowering ──────────────────────────────────
+//
+// TODO(PR3-PR5): once the RUT policy vocabulary these goldens use
+// (`host: "preserve"`, `header_order: "upstream"`, the Envoy local_response
+// layout) exists in the compiler, add the lex/parse/analyze/MIR/RIR
+// round-trip test for each golden here, mirroring
+// tests/test_nginx_parser.cc's `golden_compiles`-style checks (see PR5's
+// `cli_milestone_s_converts` / `golden_compiles` in envoy-pr-plan.md). Today
+// none of the five goldens below even lex cleanly against
+// LexedTokens::kMaxTokens once the multi-node output grows past a couple of
+// nodes, and `local_response`'s `connection_header` / `header_names` /
+// `header_order` fields are rejected by the current parser — both gaps are
+// pre-existing (the single-route milestone-S golden already fails the same
+// way) and are PR3-PR5's job, not this PR's.
+
+TEST(envoy_convert, golden_routes_a_prefix_then_root) {
+    const std::string text = routes_scenario_a_json();
+    static envoy::JsonDocument doc;
+    auto parsed = envoy::parse_bootstrap_json(str(text), doc);
+    REQUIRE(parsed);
+    const envoy::RutCapabilities all_true{true, true, true};
+    auto lowered = lower_heap(parsed.value(), all_true);
+    REQUIRE(*lowered);
+    const Str golden = lit_str(kEnvoyRoutesAGolden);
+    REQUIRE_EQ((*lowered).value().len, golden.len);
+    CHECK((*lowered).value().view().eq(golden));
+}
+
+TEST(envoy_convert, golden_routes_b_root_then_prefix) {
+    const std::string text = routes_scenario_b_json();
+    static envoy::JsonDocument doc;
+    auto parsed = envoy::parse_bootstrap_json(str(text), doc);
+    REQUIRE(parsed);
+    const envoy::RutCapabilities all_true{true, true, true};
+    auto lowered = lower_heap(parsed.value(), all_true);
+    REQUIRE(*lowered);
+    const Str golden = lit_str(kEnvoyRoutesBGolden);
+    REQUIRE_EQ((*lowered).value().len, golden.len);
+    CHECK((*lowered).value().view().eq(golden));
+}
+
+TEST(envoy_convert, golden_routes_c_exact_then_root) {
+    const std::string text = routes_scenario_c_json();
+    static envoy::JsonDocument doc;
+    auto parsed = envoy::parse_bootstrap_json(str(text), doc);
+    REQUIRE(parsed);
+    const envoy::RutCapabilities all_true{true, true, true};
+    auto lowered = lower_heap(parsed.value(), all_true);
+    REQUIRE(*lowered);
+    const Str golden = lit_str(kEnvoyRoutesCGolden);
+    REQUIRE_EQ((*lowered).value().len, golden.len);
+    CHECK((*lowered).value().view().eq(golden));
+}
+
+TEST(envoy_convert, golden_routes_d_prefix_only) {
+    const std::string text = routes_scenario_d_json();
+    static envoy::JsonDocument doc;
+    auto parsed = envoy::parse_bootstrap_json(str(text), doc);
+    REQUIRE(parsed);
+    const envoy::RutCapabilities all_true{true, true, true};
+    auto lowered = lower_heap(parsed.value(), all_true);
+    REQUIRE(*lowered);
+    const Str golden = lit_str(kEnvoyRoutesDGolden);
+    REQUIRE_EQ((*lowered).value().len, golden.len);
+    CHECK((*lowered).value().view().eq(golden));
+}
+
+TEST(envoy_convert, golden_routes_e_shadowed_exact_omitted) {
+    const std::string text = routes_scenario_e_json();
+    static envoy::JsonDocument doc;
+    auto parsed = envoy::parse_bootstrap_json(str(text), doc);
+    REQUIRE(parsed);
+    const envoy::RutCapabilities all_true{true, true, true};
+    auto lowered = lower_heap(parsed.value(), all_true);
+    REQUIRE(*lowered);
+    const Str golden = lit_str(kEnvoyRoutesEGolden);
+    REQUIRE_EQ((*lowered).value().len, golden.len);
+    CHECK((*lowered).value().view().eq(golden));
+}
+
+// A no-catch-all node with exact arms and no ancestor to resolve the
+// remainder has no RUT form (converter.cc, "Root has no such escape hatch").
+TEST(envoy_convert, blocked_root_exact_arms_without_catch_all) {
+    const std::string text =
+        route_list_json(json_array({path_route_json("/healthz", "health_backend")}),
+                        json_array({cluster_json("health_backend", 9001)}));
+    static envoy::JsonDocument doc;
+    auto parsed = envoy::parse_bootstrap_json(str(text), doc);
+    REQUIRE(parsed);
+    const envoy::RutCapabilities all_true{true, true, true};
+    auto lowered = lower_heap(parsed.value(), all_true);
+    REQUIRE_FALSE(*lowered);
+    CHECK(lowered->error().code == FrontendError::UnsupportedSyntax);
+    CHECK(to_string(lowered->error().detail).find("no-route 404 inside a route branch") !=
+          std::string::npos);
+}
+
+// A model with no catch-all and no exact arms for root simply omits
+// `route "/"`; Rut's own `unmatched` policy already covers it.
+TEST(envoy_convert, root_omitted_without_catch_all_or_exact_arms) {
+    const std::string text = routes_scenario_d_json();
+    static envoy::JsonDocument doc;
+    auto parsed = envoy::parse_bootstrap_json(str(text), doc);
+    REQUIRE(parsed);
+    const envoy::RutCapabilities all_true{true, true, true};
+    auto lowered = lower_heap(parsed.value(), all_true);
+    REQUIRE(*lowered);
+    const std::string out = to_string((*lowered).value().view());
+    CHECK(out.find("route \"/\" {") == std::string::npos);
+    CHECK(out.find("route HEAD \"/\" {") == std::string::npos);
+}
+
+// A two-route bootstrap is lowered (not rejected) by this PR, so with the
+// shipped (all-false) capabilities it still fails closed, but now on the
+// same capability diagnostic the single-route milestone-S bootstrap hits
+// (check 4, `request_envoy_h1`) rather than a "multiple routes" rejection.
+TEST(envoy_convert, cli_two_routes_blocked_by_first_capability) {
+    const TempDir temp_dir;
+    REQUIRE(temp_dir.ok());
+    const std::string& directory = temp_dir.path();
+    const std::string text = routes_scenario_a_json();
+    const std::string path = directory + "/two_routes.json";
+    REQUIRE(write_file(path, text));
+
+    static envoy::JsonDocument doc;
+    auto parsed = envoy::parse_bootstrap_json(str(text), doc);
+    REQUIRE(parsed);
+    REQUIRE_EQ(parsed.value().listener.filter_chain.hcm.route_config.virtual_host.routes.len, 2u);
+    const Span span = parsed.value()
+                          .listener.filter_chain.hcm.route_config.virtual_host.routes[0]
+                          .action.cluster_span;
+
+    const RunResult result = run_converter(g_executable, path);
+    REQUIRE(WIFEXITED(result.status));
+    CHECK_EQ(WEXITSTATUS(result.status), 1);
+    CHECK(result.out.empty());
+    const std::string expected_prefix = expected_location(path, span);
+    CHECK_EQ(result.err.compare(0, expected_prefix.size(), expected_prefix), 0);
+    CHECK(result.err.find("RUT request_policy lacks host: \"preserve\"") != std::string::npos);
+}
+
+// Brute-force equivalence: for a route list rich enough to exercise exact
+// arms, a node's own prefix arm, shadowing by an earlier ancestor prefix, and
+// a node whose own literal path resolves through `route exact` (both to a
+// forward and to a 404), every probe path must get the same answer from
+// Envoy's real first-match semantics and from the "longest node, then arm
+// chain" structure PR8 lowers to.
+TEST(envoy_convert, brute_force_equivalence_ordered_route_list) {
+    const std::vector<SimRoute> routes = {
+        {false, "/healthz", "health"},
+        {false, "/api/x", "apix"},
+        {true, "/api/", "api"},
+        {true, "/api/v1/", "apiv1"},
+        {true, "/", "root"},
+    };
+
+    const std::string text = route_list_json(json_array({path_route_json("/healthz", "health"),
+                                                         path_route_json("/api/x", "apix"),
+                                                         prefix_route_json("/api/", "api"),
+                                                         prefix_route_json("/api/v1/", "apiv1"),
+                                                         prefix_route_json("/", "root")}),
+                                             json_array({cluster_json("health", 9001),
+                                                         cluster_json("apix", 9002),
+                                                         cluster_json("api", 9003),
+                                                         cluster_json("apiv1", 9004),
+                                                         cluster_json("root", 9000)}));
+    static envoy::JsonDocument doc;
+    auto parsed = envoy::parse_bootstrap_json(str(text), doc);
+    REQUIRE(parsed);
+    const envoy::RutCapabilities all_true{true, true, true};
+    auto lowered = lower_heap(parsed.value(), all_true);
+    REQUIRE(*lowered);
+
+    const std::vector<std::string> probes = {
+        "/",
+        "/healthz",
+        "/healthzz",
+        "/health",
+        "/api",
+        "/api/",
+        "/api/x",
+        "/api/y",
+        "/api/x/",
+        "/api/x/y",
+        "/apiz",
+        "/apix",
+        "/api2",
+        "/api/v1",
+        "/api/v1/",
+        "/api/v1/foo",
+        "/api/v1x",
+        "/api/v10",
+        "/api/v1/foo/bar",
+        "/other",
+        "/a",
+        "/ap",
+        "/apihealthz",
+        "/healthz/x",
+        "/api/xx",
+        "/api/x2",
+        "/api//x",
+        "/API",
+        "/API/X",
+        "/api/v1/v1",
+        "/api/health",
+        "/health/api",
+        "/api/v",
+        "/api/v1/healthz",
+        "/apixx",
+        "//",
+        "/api/./x",
+        "/api/../x",
+        "/very/long/unrelated/path",
+        "/api/x/",
+    };
+    REQUIRE(probes.size() >= 40u);
+
+    for (const std::string& probe : probes) {
+        const std::string expected = envoy_first_match(routes, probe);
+        const std::string actual = sim_dispatch(routes, probe);
+        CHECK_EQ(expected, actual);
+    }
 }
 
 int main(int argc, char** argv) {
