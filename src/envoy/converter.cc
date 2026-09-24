@@ -65,6 +65,20 @@ public:
         return put_lit(text, static_cast<u32>(__builtin_strlen(text)));
     }
 
+    // Writes `text` into a RUT string literal body, escaping `\` and `"` so
+    // that Envoy path/prefix bytes outside the escape-free set the parser
+    // otherwise assumes (route match text may contain `"` or `\`, since
+    // `validate_route_match_bytes` in src/envoy/parser.cc only excludes
+    // `?`, `#` and `%`) never break out of the emitted literal.
+    bool put_escaped(Str text) {
+        for (u32 i = 0; i < text.len; i++) {
+            const char c = text.ptr[i];
+            if ((c == '"' || c == '\\') && !put_lit("\\", 1)) return false;
+            if (!put_lit(&c, 1)) return false;
+        }
+        return true;
+    }
+
     bool put_u16(u16 value) {
         char digits[5];
         u32 count = 0;
@@ -122,46 +136,37 @@ bool put_unmatched(Writer& w) {
         "}) }\n");
 }
 
-// One `forward(envoy_cluster_0, ...)` route body. `include_head_mode` is true
-// only for the HEAD route, where the response/failure bodies must be
-// suppressed even though the policies otherwise describe a bodied response.
-//
-// PR #692 round-3 review found that this route, when emitted with a
-// method-omitted (any-method) declaration, also matches CONNECT — confirmed
-// live against this converter's own shape (nginx-era policy fixture, since
-// this branch predates PR3-PR5): `CONNECT / HTTP/1.1` matched the any-method
-// route, Rut opened the upstream connection, and the origin's response was
-// relayed back to the client, whereas Envoy rejects that request locally (a
-// non-empty `:path` on a CONNECT request fails HCM's
-// `ConnectionManagerImpl::ActiveStream::decodeHeaders` validation) without
-// ever contacting an upstream — a real mis-forward, not a fail-closed
-// refusal. Two ways to prevent it inside the grammar were tried and both
-// failed: (1) splitting every forwarded method into its own `route <METHOD>
-// "/"` blows the lexer's fixed `kMaxTokens` budget
-// (`include/rut/compiler/lexer.h`) once duplicated across all 7 non-HEAD
-// forwarded methods (confirmed by compiling that shape with `rut`); (2) a
-// `guard req.method == GET || … else { return 400 }` inside this route body
-// stays within the token budget, but CONNECT and TRACE are both plain
-// identifiers with no `req.method == <KW>` expression-position keyword and
-// no `route <METHOD> "/"` declaration spelling (`is_method_keyword`,
-// `src/compiler/parser.cc`, covers only GET/POST/PUT/DELETE/PATCH/HEAD/
-// OPTIONS; confirmed live that `route TRACE "/"` and `pre_route TRACE {
-// return forward(...) }` are both parse errors — `pre_route`/`unmatched`
-// bodies are fixed-shape local-response policies only, per
-// `AstPreRouteDecl`/`AstUnmatchedDecl`, include/rut/compiler/ast.h), so a
-// guard that excludes CONNECT is indistinguishable from one that also
-// excludes TRACE, and TRACE must keep forwarding (Envoy forwards it like any
-// other method; docs/envoy-converter.md, "Routing"). Trading the CONNECT
-// mis-forward for a new TRACE mis-forward-turned-fail-closed is not an
-// improvement, so this converter does not attempt a code fix here; see
-// docs/envoy-compatibility.md for the recorded bug row and
-// docs/envoy-converter.md's round-3 section for the full investigation.
-bool put_forward_route(Writer& w, const char* method, u32 method_len, bool include_head_mode) {
-    if (!w.put_cstr("route ")) return false;
-    if (method_len != 0u && (!w.put_lit(method, method_len) || !w.put_cstr(" "))) return false;
-    if (!w.put_cstr("\"/\" {\n")) return false;
+// One `route exact "<node_text>" { return local_response(...) }` — the same
+// fixed 404 shape as `put_unmatched`, used when a node's own prefix action
+// never matches the literal node path (see the algorithm doc comment below,
+// "genuine 404"). `local_response` bodies are always empty here, so unlike
+// `forward(...)` this never needs a HEAD-specific variant (see the algorithm
+// comment, "No HEAD split needed for `route exact` 404 fallbacks").
+bool put_route_exact_404(Writer& w, Str node_text) {
+    if (!w.put_cstr("route exact \"") || !w.put_escaped(node_text) || !w.put_cstr("\" {\n"))
+        return false;
+    return w.put_cstr(
+        "    return local_response({\n"
+        "        version: \"HTTP/1.1\", status: 404, reason: \"Not Found\", server: \"envoy\",\n"
+        "        date: \"current\", connection: \"request\", connection_header: \"close_only\",\n"
+        "        header_names: \"lowercase\", header_order: \"date_server_length\",\n"
+        "        head_mode: \"suppress_body\", body: b\"\"\n"
+        "    })\n"
+        "}\n");
+}
+
+// The `forward(envoy_cluster_<cluster_index>, ...)` call body shared by every
+// node's arms and by PR1's single-route milestone-S golden. Byte-identical to
+// PR1's `put_forward_route` kwargs except for the upstream identifier;
+// `include_head_mode` is true only for the HEAD variant of a node's body.
+// Deliberately ends at the closing `)` of the `forward(...)` call (no
+// enclosing `route "..." { }` braces) so it can be reused both as the sole
+// statement of a `route "N" { ... }` body and nested inside if/else arms.
+bool put_forward_call(Writer& w, u32 cluster_index, bool include_head_mode) {
+    if (!w.put_cstr("    return forward(envoy_cluster_")) return false;
+    if (!w.put_u16(static_cast<u16>(cluster_index))) return false;
     if (!w.put_cstr(
-            "    return forward(envoy_cluster_0, request_policy: {\n"
+            ", request_policy: {\n"
             "            version: \"HTTP/1.1\",\n"
             "            host: \"preserve\",\n"
             "            connection: \"omit\",\n"
@@ -200,21 +205,451 @@ bool put_forward_route(Writer& w, const char* method, u32 method_len, bool inclu
     if (include_head_mode && !w.put_cstr("            head_mode: \"suppress_body\",\n"))
         return false;
     return w.put_cstr("            body: b\"") && w.put_cstr(kEnvoyConnectFailureBody) &&
-           w.put_cstr(
-               "\"\n"
-               "        }\n"
-               "    )\n"
-               "}\n");
+           w.put_cstr("\"\n        }\n    )\n");
+}
+
+// ── Increment-4 ordered route-list lowering (envoy-pr-plan.md, PR 8) ───────
+//
+// Envoy selects the first route (in declared list order) whose match applies;
+// Rut's route trie selects the *longest* matching declared prefix. This
+// section reconciles the two by building, for every RUT route entry we
+// declare ("node"), a linear if/else chain that reproduces Envoy's
+// first-match order restricted to the routes that could ever apply to a
+// request the trie hands to that node — instead of rejecting any input where
+// list order and longest-prefix order could disagree (owner decision D3,
+// "lowered correctly by construction").
+//
+// Nodes. `"/"` (the root) always exists as a node, whether or not Envoy
+// explicitly declares a `prefix: "/"` route. For every OTHER declared
+// `prefix` route `P` (`P != "/"`), `N(P)` is `P` with its trailing `/`
+// removed (e.g. `"/api/"` -> `"/api"`); duplicate `N(P)` values (two routes
+// naming the same prefix) collapse to one node. `path` (exact) routes never
+// create a node; each is attached to the SINGLE node whose text is the
+// longest declared node under which it falls ("owner" below).
+//
+// "Under": path `p` is under node `N` iff `N == "/"` (root is under
+// everything) or `p == N` or `p` starts with `N + "/"`. `M` is a *strict
+// ancestor* of `N` iff `M != N` and `N` is under `M`.
+//
+// Owner: for an exact route with path `q`, its owner is the node with the
+// LONGEST text among all node candidates (every declared node plus the
+// always-present root) under which `q` falls. Root is always a candidate, so
+// an owner always exists.
+//
+// Per-node body (`route "N" { ... }` / `route HEAD "N" { ... }`): walk every
+// Envoy route in DECLARATION order and classify it against `N`:
+//   - exact `path q` owned by `N`, `q != N`               -> conditional arm
+//     `if req.pathOnly == "q" { <forward> } else { <continue> }`.
+//   - exact `path q` owned by `N`, `q == N` (Envoy declared an exact route
+//     for N's own literal text)                            -> conditional
+//     arm UNLESS a same-node prefix arm (below) was already placed earlier
+//     in the walk, in which case `req.pathOnly == N` is already guaranteed
+//     true at this point in the chain (see "Remainder" below) and the arm
+//     becomes the chain's unconditional terminator.
+//   - prefix route naming exactly `N` ("N's own arm"): for the root, this is
+//     UNCONDITIONAL and terminates the chain immediately wherever it
+//     appears (Envoy's own `"/"` prefix matches the literal path `"/"` too,
+//     so root's body never needs to exclude `p == "/"`). For a non-root
+//     node, Envoy's `prefix: "N/"` never matches the literal path `N`
+//      itself (`"N"` does not start with `"N/"`), so the FIRST such arm is
+//     conditional: `if req.pathOnly != "N" { <forward> } else { <continue> }`.
+//     A second (duplicate) declaration of N's own prefix is dead — Envoy
+//     already resolved every request that could reach it via the first one
+//     — and is dropped.
+//   - prefix route naming a STRICT ANCESTOR of `N`: UNCONDITIONAL — every
+//     request the trie ever hands to `N`'s handler already satisfies this
+//     ancestor's prefix, so it terminates the chain wherever it appears,
+//     dropping every route declared after it in Envoy's order (this is the
+//     "shadowing" case; see golden (e), where a `prefix` arm declared before
+//     an exact route for one of its own descendants makes that exact route
+//     permanently dead and it is omitted from the emitted RUT entirely,
+//     rather than nested unreachably inside the chain).
+//   - anything else (a prefix naming a strict DESCENDANT of `N`, or an exact
+//     route owned by a different node) is irrelevant to `N` and skipped.
+// The chain always ends at the first UNCONDITIONAL arm it places (ancestor,
+// root's own arm, or a same-node exact `q == N` arm reached after `N`'s own
+// prefix arm already fired conditionally) — dropping everything Envoy would
+// never reach past that point for a request under `N`.
+//
+// Remainder ("only p == N can remain"). A non-root node N always owns at
+// least one prefix arm naming itself (that is what makes it a node), so the
+// walk above always terminates UNLESS the chain never finds an unconditional
+// arm at all. That can only happen when N's own prefix arm ends up as the
+// LAST arm the walk keeps (everything declared after it is either dead, per
+// the dead-arm rules above, or would have already resolved the chain). At
+// that point the only request value that has not been accounted for is the
+// literal path `p == N` itself: N's own prefix action never matches it
+// (established above), no ancestor arm exists anywhere in the route list
+// (else it would have terminated the chain earlier), and no exact route for
+// `q == N` was ever declared (else it would have resolved the chain, per the
+// bullet above). `req.pathOnly == "N"` therefore has no Envoy route at all —
+// a genuine 404 — but there is no RUT form for "respond 404" nested inside an
+// `if` branch (`local_response(...)` parses only as the sole statement of a
+// top-level `unmatched` / `pre_route` / `route exact "..."` item — see
+// VERIFY below). So the algorithm instead DROPS the wrapping
+// `if req.pathOnly != "N"` condition on that final arm (making it
+// unconditionally forward, since every request actually reaching `route "N"`
+// is now guaranteed to be a proper descendant of N) and emits a companion
+// `route exact "N" { return local_response(...) }` with the fixed 404 shape
+// to intercept the literal path `N` — matched with higher priority than the
+// prefix trie (VERIFY below) — before it would otherwise reach the
+// now-always-true `route "N"` body.
+//
+// Root has no such escape hatch (there is no "ancestor of the root" to
+// delegate to). If root's own body ends up with exact arms but no
+// unconditional terminator (Envoy never declares a `prefix: "/"` route, so
+// nothing ever resolves the fallthrough), lowering fails closed:
+// `BLOCKED_BY_RUT: a no-route 404 inside a route branch has no RUT form`. If
+// root has NO arms at all in that situation, `route "/"` is omitted
+// entirely — any request that would reach it falls through Rut's trie to the
+// `unmatched` policy declared above, which is exactly Envoy's real
+// no-matching-route 404.
+//
+// No HEAD split needed for `route exact` 404 fallbacks: the emitted body is
+// always `body: b""`, so `head_mode: "suppress_body"` is harmless (and
+// already set) regardless of the request method — unlike `forward(...)`,
+// which needs the HEAD/any-method split for its (non-empty) upstream
+// response, `route exact "N"`'s 404 needs only one, ANY-method declaration
+// (mirroring `unmatched`, which is single-declaration for the same reason).
+//
+// VERIFY outcomes this algorithm depends on (src/compiler/parser.cc,
+// include/rut/runtime/route_trie.h, include/rut/runtime/callbacks_impl.h):
+//   - `else if` is NOT supported; every `else` must be followed immediately
+//     by `{` (parse_stmt's `If` handling always calls `expect(LBrace)` right
+//     after `expect(KwElse)`). Nested arms are therefore always written as
+//     `else { if ... }`, never `else if ...`.
+//   - `req.pathOnly == "..."` / `!= "..."` both parse and analyze (Eq is
+//     type-generic over same-typed operands including Str;
+//     `!=` desugars to `(a == b) == false` at parse time) and `req.pathOnly`
+//     is the RAW request path with only `?`/`#` stripped (never slash- or
+//     percent-normalized) — see "Not implemented" below.
+//   - `return local_response(...)` is accepted ONLY inside `unmatched`,
+//     `pre_route`, and `route exact "..."` items (all three route through
+//     `parse_strict_local_response_block`, which hard-requires the callee
+//     name `local_response`); it is not reachable from `parse_stmt`'s
+//     general `if`/`else` bodies used inside an ordinary `route`, so a
+//     no-route 404 can never be nested inside a route's `if` branch.
+//   - Exact routes are matched before the prefix trie: in
+//     `callbacks_impl.h`'s request path, `exact_view.match_exact_strict_local_response`
+//     (and its slash-normalized variant) runs and, on a hit, serves the
+//     configured local response and returns BEFORE `config->match_canonical`
+//     (the trie lookup) is ever called. `route exact "N"` therefore always
+//     wins over `route "N"` for the literal path `N`.
+// Not implemented (documented, not fixed here): the prefix trie normalizes
+// empty path segments (`route_trie.h`: "/api/" and "/api//v1" collapse the
+// same as "/api" and "/api/v1"), so which declared NODE a request reaches is
+// segment-normalized, while `req.pathOnly`'s own byte comparisons inside a
+// node's body are not. Envoy's literal string-prefix matching does neither
+// by default (`merge_slashes` and percent-decoding are separate, unmodeled
+// knobs). This does not affect the golden/equivalence tests below (all
+// probe paths are already normalized), but it is a real divergence for
+// requests containing redundant slashes or percent-encoded segments; see the
+// compatibility matrix.
+
+// One arm of a node's if/else chain. All but the last arm in a chain are
+// conditional (`is_terminal == false`); the last is the chain's unconditional
+// terminator (`is_terminal == true`), always a `forward(...)` to
+// `cluster_index` (never a `route "N"` body ends in a 404 — see the
+// "Remainder" section above).
+struct RouteArm {
+    bool is_terminal = false;
+    // Only meaningful when `!is_terminal`: true for an exact-path arm
+    // (`req.pathOnly == "compare_text"`), false for a node's-own-prefix arm
+    // (`req.pathOnly != "compare_text"`).
+    bool exact_match = false;
+    Str compare_text{};
+    u32 cluster_index = 0;
+};
+
+using RouteArms = FixedVec<RouteArm, kMaxEnvoyRoutes>;
+
+Str strip_trailing_slash(Str prefix) {
+    // Classify by LENGTH, not content: `prefix_shape_ok` in src/envoy/parser.cc
+    // guarantees a length-1 prefix is always exactly "/" (the only other
+    // accepted shape starts AND ends with '/', so it is at least 2 bytes).
+    // Checking length instead of comparing bytes keeps this decision (and
+    // the literal "/" this returns for the root case) immune to a caller
+    // mutating the JSON source buffer after parsing but before lowering
+    // (api_all_capabilities_matches_golden's mutation check) — `len` is a
+    // plain integer captured at parse time, not re-read from the buffer.
+    // Non-root node text is genuinely borrowed from the source (PR8 lowers
+    // real path/prefix bytes), so no such guarantee applies there.
+    if (prefix.len == 1u) return lit_str("/");
+    return prefix.slice(0, prefix.len - 1u);
+}
+
+// Is `p` located under node `N` (`N == p`, or `N` is a segment-boundary
+// prefix of `p`)? Root (`N == "/"`) is under everything.
+bool is_under(Str node, Str p) {
+    if (node.eq(lit_str("/"))) return true;
+    if (node.eq(p)) return true;
+    if (p.len <= node.len) return false;
+    for (u32 i = 0; i < node.len; i++) {
+        if (p.ptr[i] != node.ptr[i]) return false;
+    }
+    return p.ptr[node.len] == '/';
+}
+
+bool is_strict_ancestor(Str maybe_ancestor, Str node) {
+    return !maybe_ancestor.eq(node) && is_under(maybe_ancestor, node);
+}
+
+// The node whose text is the longest match under which `q` falls. Root is
+// always a candidate, so this always returns a value.
+Str owner_node(Str q, const FixedVec<Str, kMaxEnvoyRoutes + 1>& candidates) {
+    Str best = lit_str("/");
+    for (u32 i = 0; i < candidates.len; i++) {
+        if (candidates[i].len > best.len && is_under(candidates[i], q)) best = candidates[i];
+    }
+    return best;
+}
+
+u32 cluster_index_of(const Bootstrap& model, Str name) {
+    for (u32 i = 0; i < model.clusters.len; i++) {
+        if (model.clusters[i].name.eq(name)) return i;
+    }
+    return model.clusters.len;  // unreachable post-validation: every forward
+                                // route's cluster is checked in `validate`.
+}
+
+// Builds one node's arm chain (see the algorithm comment above).
+// `needs_exact_fallback` is set when the chain's last arm had its condition
+// dropped and a companion `route exact "node_text"` 404 is required.
+// `omit` (root only) means the node has no arms at all and should not be
+// emitted; leaving `omit` false with an empty `arms` for a non-root node
+// cannot happen (a non-root node's own prefix arm is always present).
+struct NodePlanResult {
+    RouteArms arms{};
+    bool needs_exact_fallback = false;
+    bool omit = false;
+};
+
+FrontendResult<NodePlanResult> build_node_plan(
+    Str node_text,
+    bool is_root,
+    const VirtualHost& virtual_host,
+    const FixedVec<Str, kMaxEnvoyRoutes + 1>& node_candidates,
+    const Bootstrap& model) {
+    NodePlanResult result{};
+    bool saw_own_prefix = false;
+    Span last_span{};
+
+    for (u32 route_index = 0; route_index < virtual_host.routes.len; route_index++) {
+        const Route& route = virtual_host.routes[route_index];
+        const RouteMatch& match = route.match;
+        const u32 cluster_index = cluster_index_of(model, route.action.cluster);
+
+        if (match.kind == RouteMatchKind::Path) {
+            const Str q = match.path;
+            if (!owner_node(q, node_candidates).eq(node_text)) continue;
+            if (q.eq(node_text)) {
+                RouteArm arm{};
+                arm.cluster_index = cluster_index;
+                if (!saw_own_prefix) {
+                    arm.exact_match = true;
+                    arm.compare_text = q;
+                    if (!result.arms.push(arm))
+                        return out_of_memory(route.span, lit_str("too many routes to lower"));
+                    last_span = route.span;
+                    continue;
+                }
+                arm.is_terminal = true;
+                if (!result.arms.push(arm))
+                    return out_of_memory(route.span, lit_str("too many routes to lower"));
+                return result;  // resolved
+            }
+            if (saw_own_prefix) continue;  // dead: path == node_text already excluded
+            RouteArm arm{};
+            arm.exact_match = true;
+            arm.compare_text = q;
+            arm.cluster_index = cluster_index;
+            if (!result.arms.push(arm))
+                return out_of_memory(route.span, lit_str("too many routes to lower"));
+            last_span = route.span;
+            continue;
+        }
+
+        // Prefix route.
+        const Str prefix_node = strip_trailing_slash(match.prefix);
+        if (prefix_node.eq(node_text)) {
+            if (is_root) {
+                RouteArm arm{};
+                arm.is_terminal = true;
+                arm.cluster_index = cluster_index;
+                if (!result.arms.push(arm))
+                    return out_of_memory(route.span, lit_str("too many routes to lower"));
+                return result;  // resolved: root's own prefix always matches
+            }
+            if (saw_own_prefix) continue;  // duplicate declaration: dead
+            RouteArm arm{};
+            arm.exact_match = false;
+            arm.compare_text = node_text;
+            arm.cluster_index = cluster_index;
+            if (!result.arms.push(arm))
+                return out_of_memory(route.span, lit_str("too many routes to lower"));
+            saw_own_prefix = true;
+            last_span = route.span;
+            continue;
+        }
+        if (is_strict_ancestor(prefix_node, node_text)) {
+            RouteArm arm{};
+            arm.is_terminal = true;
+            arm.cluster_index = cluster_index;
+            if (!result.arms.push(arm))
+                return out_of_memory(route.span, lit_str("too many routes to lower"));
+            return result;  // resolved: an ancestor prefix always matches
+        }
+        // Strict descendant of `node_text`, or unrelated: irrelevant to this
+        // node's chain.
+    }
+
+    // The walk finished without an unconditional arm.
+    if (is_root) {
+        if (result.arms.len == 0u) {
+            result.omit = true;
+            return result;
+        }
+        return unsupported(
+            last_span,
+            lit_str("BLOCKED_BY_RUT: a no-route 404 inside a route branch has no RUT form"));
+    }
+    // Non-root: the last kept arm is always this node's own prefix arm (see
+    // the algorithm comment, "Remainder"). Drop its condition.
+    result.arms[result.arms.len - 1].is_terminal = true;
+    result.needs_exact_fallback = true;
+    return result;
+}
+
+bool put_route_arms(Writer& w, const RouteArms& arms, u32 index, bool include_head_mode) {
+    const RouteArm& arm = arms[index];
+    if (arm.is_terminal) return put_forward_call(w, arm.cluster_index, include_head_mode);
+    if (!w.put_cstr("    if req.pathOnly ")) return false;
+    if (!w.put_cstr(arm.exact_match ? "== \"" : "!= \"")) return false;
+    if (!w.put_escaped(arm.compare_text) || !w.put_cstr("\" {\n")) return false;
+    if (!put_forward_call(w, arm.cluster_index, include_head_mode)) return false;
+    if (!w.put_cstr("    } else {\n")) return false;
+    if (!put_route_arms(w, arms, index + 1u, include_head_mode)) return false;
+    return w.put_cstr("    }\n");
+}
+
+// PR #692 round-3 review found that a method-omitted (any-method)
+// `route "N" { ... }` / `route HEAD "N" { ... }` declaration, in the
+// PR1-era `put_forward_route` this function replaced, also matches CONNECT —
+// confirmed live against this converter's own shape (nginx-era policy
+// fixture, since that branch predates PR3-PR5): `CONNECT / HTTP/1.1` matched
+// the any-method route, Rut opened the upstream connection, and the origin's
+// response was relayed back to the client, whereas Envoy rejects that
+// request locally (a non-empty `:path` on a CONNECT request fails HCM's
+// `ConnectionManagerImpl::ActiveStream::decodeHeaders` validation) without
+// ever contacting an upstream — a real mis-forward, not a fail-closed
+// refusal. The same any-method emission shape (`method_len == 0`) is used
+// here for every non-root/root forwarding node, so the finding still
+// applies. Two ways to prevent it inside the grammar were tried and both
+// failed: (1) splitting every forwarded method into its own `route <METHOD>
+// "N"` blows the lexer's fixed `kMaxTokens` budget
+// (`include/rut/compiler/lexer.h`) once duplicated across all 7 non-HEAD
+// forwarded methods (confirmed by compiling that shape with `rut`); (2) a
+// `guard req.method == GET || … else { return 400 }` inside a node's body
+// stays within the token budget, but CONNECT and TRACE are both plain
+// identifiers with no `req.method == <KW>` expression-position keyword and
+// no `route <METHOD> "N"` declaration spelling (`is_method_keyword`,
+// `src/compiler/parser.cc`, covers only GET/POST/PUT/DELETE/PATCH/HEAD/
+// OPTIONS; confirmed live that `route TRACE "/"` and `pre_route TRACE {
+// return forward(...) }` are both parse errors — `pre_route`/`unmatched`
+// bodies are fixed-shape local-response policies only, per
+// `AstPreRouteDecl`/`AstUnmatchedDecl`, include/rut/compiler/ast.h), so a
+// guard that excludes CONNECT is indistinguishable from one that also
+// excludes TRACE, and TRACE must keep forwarding (Envoy forwards it like any
+// other method; docs/envoy-converter.md, "Routing"). Trading the CONNECT
+// mis-forward for a new TRACE mis-forward-turned-fail-closed is not an
+// improvement, so this converter does not attempt a code fix here; see
+// docs/envoy-compatibility.md for the recorded bug row and
+// docs/envoy-converter.md's round-3 section for the full investigation.
+bool put_route_node(
+    Writer& w, Str node_text, const RouteArms& arms, const char* method, u32 method_len) {
+    const bool include_head_mode = method_len != 0u;
+    if (!w.put_cstr("route ")) return false;
+    if (method_len != 0u && (!w.put_lit(method, method_len) || !w.put_cstr(" "))) return false;
+    if (!w.put_cstr("\"") || !w.put_escaped(node_text) || !w.put_cstr("\" {\n")) return false;
+    if (!put_route_arms(w, arms, 0u, include_head_mode)) return false;
+    return w.put_cstr("}\n");
+}
+
+struct NodePlanEntry {
+    Str text{};
+    RouteArms arms{};
+    bool needs_exact_fallback = false;
+};
+
+struct LoweringPlan {
+    FixedVec<NodePlanEntry, kMaxEnvoyRoutes + 1> emit_order{};
+};
+
+FrontendResult<LoweringPlan> build_lowering_plan(const Bootstrap& model) {
+    const VirtualHost& virtual_host = model.listener.filter_chain.hcm.route_config.virtual_host;
+    LoweringPlan plan{};
+
+    FixedVec<Str, kMaxEnvoyRoutes + 1> node_candidates{};
+    node_candidates.push(lit_str("/"));
+    FixedVec<Str, kMaxEnvoyRoutes> declared_nodes{};
+    bool root_declared = false;
+
+    for (u32 route_index = 0; route_index < virtual_host.routes.len; route_index++) {
+        const Route& route = virtual_host.routes[route_index];
+        if (route.match.kind != RouteMatchKind::Prefix) continue;
+        const Str node_text = strip_trailing_slash(route.match.prefix);
+        bool seen = false;
+        for (const Str& existing : declared_nodes) {
+            if (existing.eq(node_text)) {
+                seen = true;
+                break;
+            }
+        }
+        if (seen) continue;
+        if (!declared_nodes.push(node_text))
+            return out_of_memory(route.span, lit_str("too many routes to lower"));
+        if (node_text.eq(lit_str("/"))) {
+            root_declared = true;
+        } else if (!node_candidates.push(node_text)) {
+            return out_of_memory(route.span, lit_str("too many routes to lower"));
+        }
+    }
+
+    for (const Str& node_text : declared_nodes) {
+        const bool is_root = node_text.eq(lit_str("/"));
+        auto planned = build_node_plan(node_text, is_root, virtual_host, node_candidates, model);
+        if (!planned) return core::make_unexpected(planned.error());
+        NodePlanEntry entry{};
+        entry.text = node_text;
+        entry.arms = planned.value().arms;
+        entry.needs_exact_fallback = planned.value().needs_exact_fallback;
+        if (!plan.emit_order.push(entry))
+            return out_of_memory(model.span, lit_str("too many routes to lower"));
+    }
+
+    if (!root_declared) {
+        auto planned = build_node_plan(lit_str("/"), true, virtual_host, node_candidates, model);
+        if (!planned) return core::make_unexpected(planned.error());
+        if (!planned.value().omit) {
+            NodePlanEntry entry{};
+            entry.text = lit_str("/");
+            entry.arms = planned.value().arms;
+            entry.needs_exact_fallback = false;
+            if (!plan.emit_order.push(entry))
+                return out_of_memory(model.span, lit_str("too many routes to lower"));
+        }
+    }
+    return plan;
 }
 
 // Capability validation (docs/envoy-converter.md; PR1 plan, "Capability
-// validation"). Defensive model checks run throughout because a hand-built
-// `Bootstrap` (as opposed to one produced by `parse_bootstrap_json`) must
-// still fail closed rather than emit an upstream with no address or a route
-// to an undeclared cluster. The cluster/endpoint checks are deferred until
-// the route's action is known to be `Forward`, so a local-only route table
-// (every route `direct_response`/`redirect`) is not forced to declare an
-// unused cluster. The six BLOCKED_BY_RUT checks then run in a fixed order;
+// validation", generalized to an ordered route list in PR8). Defensive model
+// checks come first because a hand-built `Bootstrap` (as opposed to one
+// produced by `parse_bootstrap_json`) must still fail closed rather than
+// emit an upstream with no address or a route to an undeclared cluster.
+// `direct_response` / `redirect` and raw prefixes remain rejected (PR
+// 9/10 lower them); every remaining route must be `route.cluster`-only, with
+// `timeout: "0s"`. The six BLOCKED_BY_RUT checks then run in a fixed order;
 // the first failure wins.
 FrontendResult<bool> validate(const Bootstrap& model, const RutCapabilities& caps) {
     const HttpConnectionManager& hcm = model.listener.filter_chain.hcm;
@@ -251,33 +686,34 @@ FrontendResult<bool> validate(const Bootstrap& model, const RutCapabilities& cap
         return unsupported(model.listener.name_span, lit_str("name exceeds the bounded length"));
     if (hcm.route_config.name.len > kMaxEnvoyNameLen)
         return unsupported(hcm.route_config.name_span, lit_str("name exceeds the bounded length"));
-    // PR #692 round-9/round-8 review, ported to the route-list model (PR 8's
-    // `clusters[]`): loop over every declared cluster, not just the first,
-    // so both checks still hold once multiple clusters are lowered, and run
-    // this unconditionally (not deferred behind the Forward-action check
-    // below) so a malformed declared cluster is rejected even when it is
-    // never referenced by any route -- this cannot reject a legitimate
-    // local-only route table (every route `direct_response`/`redirect`,
-    // round-3 below), since `model.clusters.len` is then legitimately 0 and
-    // the loop body never runs. `name.empty()` guards the `Str::eq`
-    // empty-vs-empty forgery the `action.cluster` check further below
-    // relies on being impossible (a caller of the public `lower_to_rut(
-    // model, capabilities)` overload who clears a declared cluster's `name`
-    // on a parsed copy, or hand-builds a `Bootstrap` that never sets it,
-    // would otherwise let an also-cleared `action.cluster` pass an equality
-    // check it should fail; the parser requires both non-empty, `min_len: 1`
-    // on both the v3 `Cluster.name` and the route action's `cluster`).
-    // `load_assignment_name_present` is the model's only record that
-    // `parse_bootstrap_json` ever saw and validated that cluster's
-    // `load_assignment.cluster_name` (required, non-empty, and equal to
-    // `name` per Envoy's v3 `ClusterLoadAssignment.cluster_name` `min_len:
-    // 1`) -- the same evidence-bit shape as `hcm.type_url_span` (round-5)
-    // and `hcm.generate_request_id_span` (round-6) below. A hand-built
-    // `Bootstrap`, or a parsed copy with either bit cleared, still has a
-    // matching `action.cluster` / cluster `name` pair and would otherwise
-    // lower successfully, emitting a working gateway for a bootstrap Envoy
-    // would reject at startup.
+    // `model.clusters` may legitimately be empty for a local-only route
+    // table (every route `direct_response`/`redirect`; see the
+    // `direct_response`/`redirect` checks in the per-route loop below and
+    // docs/envoy-compatibility.md, "Allow local-only route tables to omit
+    // clusters"), so cluster-count is not checked unconditionally here. A
+    // `Forward` route with no declared clusters still fails closed below:
+    // the per-route "declared" search over an empty `model.clusters` never
+    // finds a match, so it falls through to "route cluster does not name a
+    // declared cluster".
+    //
+    // PR #692 round-9/round-8 review, ported to the route-list model:
+    // `name.empty()` guards the `Str::eq` empty-vs-empty forgery the
+    // per-route `action.cluster` check below relies on being impossible (a
+    // caller of the public `lower_to_rut(model, capabilities)` overload who
+    // clears a declared cluster's `name` on a parsed copy, or hand-builds a
+    // `Bootstrap` that never sets it, would otherwise let an also-cleared
+    // `action.cluster` pass an equality check it should fail; the parser
+    // requires both non-empty, `min_len: 1` on both the v3 `Cluster.name`
+    // and the route action's `cluster`). `load_assignment_name_present` is
+    // the model's only record that `parse_bootstrap_json` ever saw and
+    // validated that cluster's `load_assignment.cluster_name` (required,
+    // non-empty, and equal to `name` per Envoy's v3
+    // `ClusterLoadAssignment.cluster_name` `min_len: 1`). Checked for every
+    // declared cluster now that route lists may name more than one.
     for (u32 i = 0; i < model.clusters.len; i++) {
+        if (model.clusters[i].endpoint.address.port == 0u)
+            return invalid(model.clusters[i].endpoint.address.span,
+                           lit_str("endpoint port must be non-zero"));
         if (model.clusters[i].name.empty())
             return invalid(model.clusters[i].name_span,
                            lit_str("cluster name must be a non-empty string"));
@@ -334,108 +770,73 @@ FrontendResult<bool> validate(const Bootstrap& model, const RutCapabilities& cap
     if (virtual_host.routes.len == 0u)
         return invalid(virtual_host.span, lit_str("at least one route is required"));
 
-    // Route-list lowering (multiple routes, multiple clusters,
-    // direct_response, redirect) is not implemented yet (PR 8-10); reject
-    // precisely, before the capability checks below, so a model that would
-    // also hit a BLOCKED_BY_RUT row gets the more specific diagnostic.
-    if (virtual_host.routes.len > 1u)
-        return unsupported(virtual_host.routes[1].span,
-                           lit_str("multiple routes are not lowered yet"));
-    if (model.clusters.len > 1u)
-        return unsupported(model.clusters[1].span,
-                           lit_str("multiple clusters are not lowered yet"));
-
-    const Route& route = virtual_host.routes[0];
-    // Route matching beyond the catch-all is modeled (RouteMatchKind::Path,
-    // non-root RouteMatchKind::Prefix) but not lowered yet (PR 8 lowers an
-    // ordered, match-aware route list). Reject explicitly here: `lower_to_rut`
-    // below unconditionally emits a `route "/"` catch-all, so silently
-    // falling through would make an exact or scoped match accept every path.
-    // Compared against the byte content of "/" rather than only the length,
-    // so a hand-built `Bootstrap` (not produced by `parse_bootstrap_json`,
-    // e.g. a length-1 prefix like "x") cannot slip through and be silently
-    // broadened into the `route "/"` catch-all below. The parser's own
-    // `prefix_shape_ok` (src/envoy/parser.cc) already guarantees this for
-    // parsed models (a length-1 prefix is only ever exactly "/"), but
-    // `validate` must fail closed for direct model construction too.
-    if (route.match.kind == RouteMatchKind::Path)
-        return unsupported(route.match.span, lit_str("match.path is not lowered yet"));
-    // Codex round-6 review: the public hand-built-model overload does not go
-    // through the parser, whose `parse_route_match` only ever produces one of
-    // the two declared `RouteMatchKind` enumerators. Without this explicit
-    // check, a forged `match.kind` outside {Prefix, Path} (e.g.
-    // `static_cast<RouteMatchKind>(2)`) would skip both the Path rejection
-    // above and the byte-content check below whenever `match.prefix` happens
-    // to equal "/", reaching the `route "/"` catch-all lowering by
-    // elimination instead of by being verified as `Prefix` -- matching the
-    // defensive `RouteActionKind` check already applied to `action.kind`
-    // below.
-    if (route.match.kind != RouteMatchKind::Prefix)
-        return invalid(route.match.span, lit_str("match kind is not recognized"));
-    if (!route.match.prefix.eq(lit_str("/")))
-        return unsupported(
-            route.match.span,
-            lit_str("route matches other than \"prefix\": \"/\" are not lowered yet"));
-
-    const RouteAction& action = route.action;
-    if (action.kind == RouteActionKind::DirectResponse)
-        return unsupported(action.span, lit_str("direct_response is not lowered yet"));
-    if (action.kind == RouteActionKind::Redirect)
-        return unsupported(action.span, lit_str("redirect is not lowered yet"));
-    // The public hand-built-model overload does not go through the parser,
-    // whose `parse_route_action` only ever produces one of the three
-    // `RouteActionKind` enumerators. Without this explicit check, an
-    // out-of-range discriminator (a forged model, or a future enumerator
-    // this function hasn't been taught about) would fall through the two
-    // checks above and reach the Forward-only lowering below by elimination
-    // rather than by being verified as `Forward` — `lower_to_rut` would then
-    // silently emit a forwarding route for an action kind it does not
-    // actually recognize.
-    if (action.kind != RouteActionKind::Forward)
-        return invalid(action.span, lit_str("route action kind is not recognized"));
-
-    // Only Forward remains beyond this point, and it is the only action that
-    // needs a declared cluster: a local-only route table (every route
-    // `direct_response`/`redirect`) has already returned above without
-    // requiring `model.clusters` to be non-empty.
-    if (model.clusters.len == 0u)
-        return invalid(model.span, lit_str("at least one cluster is required"));
-    if (model.clusters[0].endpoint.address.port == 0u)
-        return invalid(model.clusters[0].endpoint.address.span,
-                       lit_str("endpoint port must be non-zero"));
-    // PR #692 round-9 review, ported: reject an empty `action.cluster`
-    // explicitly too (see the per-cluster `name.empty()` loop above for the
-    // matching declared-name-emptiness guard the forgery needed both sides
-    // of; the load_assignment evidence check is ported there too, so it is
-    // not repeated here).
-    if (action.cluster.empty() || !action.cluster.eq(model.clusters[0].name))
-        return invalid(action.cluster_span,
-                       lit_str("route cluster does not name a declared cluster"));
-    // PR #692 round-12 review, ported: revalidate the bounded length too,
-    // not just non-emptiness/equality. `name_string`
-    // (src/envoy/parser.cc:179-185) rejects every name over
-    // `kMaxEnvoyNameLen` during parsing, but nothing above re-checks that
-    // bound; a caller of the public `lower_to_rut(model, capabilities)`
-    // overload who sets both this route's `action.cluster` and a declared
-    // cluster's `name` to the same overlong string still passes the equality
-    // check above and would otherwise lower successfully, accepting a model
-    // `parse_bootstrap_json` would reject. The matching per-cluster `name`
-    // bound (and the `load_assignment_name` presence/equality revalidation)
-    // is ported into the per-cluster loop above instead of repeated here,
-    // since it must hold for every declared cluster now that route lists may
-    // name more than one, not just the one route currently reachable here.
-    if (action.cluster.len > kMaxEnvoyNameLen)
-        return unsupported(action.cluster_span, lit_str("name exceeds the bounded length"));
-    // PR #692 round-3 review's own defensive `match.prefix == "/"` check
-    // (guarding a hand-mutated, e.g. "/admin", prefix from silently
-    // widening what the generated RUT actually matches) is unreachable
-    // here: by this point `route.match.kind` is already known to be
-    // `Prefix` (the `Path` case returned above) and `route.match.prefix`
-    // is already known to equal "/" (any other prefix already returned
-    // above, "route matches other than \"prefix\": \"/\" are not lowered
-    // yet"), so a hand-built model with a forged non-"/" prefix already
-    // fails closed earlier with that diagnostic instead of reaching here.
-    //
+    // direct_response / redirect actions are modeled (RouteActionKind) but
+    // not lowered yet (PR 9/10 lower them). Reject precisely, before the
+    // capability checks below, so a model that would also hit a
+    // BLOCKED_BY_RUT row gets the more specific diagnostic. Route lists with
+    // multiple routes, multiple clusters, `match.path`, and non-root
+    // `match.prefix` are lowered by `build_lowering_plan` below.
+    for (u32 i = 0; i < virtual_host.routes.len; i++) {
+        // Codex round-6 review, ported: the public hand-built-model overload
+        // does not go through the parser, whose `parse_route_match` only
+        // ever produces one of the two declared `RouteMatchKind`
+        // enumerators. Without this explicit check, a forged `match.kind`
+        // outside {Prefix, Path} would reach `build_lowering_plan` below,
+        // which treats every non-`Path` kind as a `Prefix` using the
+        // untouched (possibly default-empty) `match.prefix`.
+        const RouteMatch& match = virtual_host.routes[i].match;
+        if (match.kind != RouteMatchKind::Prefix && match.kind != RouteMatchKind::Path)
+            return invalid(match.span, lit_str("match kind is not recognized"));
+        const RouteAction& action = virtual_host.routes[i].action;
+        if (action.kind == RouteActionKind::DirectResponse)
+            return unsupported(action.span, lit_str("direct_response is not lowered yet"));
+        if (action.kind == RouteActionKind::Redirect)
+            return unsupported(action.span, lit_str("redirect is not lowered yet"));
+        // The public hand-built-model overload does not go through the
+        // parser, whose `parse_route_action` only ever produces one of the
+        // three `RouteActionKind` enumerators. Without this explicit check,
+        // an out-of-range discriminator (a forged model, or a future
+        // enumerator this function hasn't been taught about) would fall
+        // through the two checks above and reach the Forward-only lowering
+        // below by elimination rather than by being verified as `Forward` —
+        // `lower_to_rut` would then silently emit a forwarding route for an
+        // action kind it does not actually recognize.
+        if (action.kind != RouteActionKind::Forward)
+            return invalid(action.span, lit_str("route action kind is not recognized"));
+        // PR #692 round-9 review, ported: reject an empty `action.cluster`
+        // explicitly too (see the per-cluster `name.empty()` loop above for
+        // the matching declared-name-emptiness guard the forgery needed
+        // both sides of).
+        if (action.cluster.empty())
+            return invalid(action.cluster_span,
+                           lit_str("route cluster does not name a declared cluster"));
+        bool declared = false;
+        for (u32 j = 0; j < model.clusters.len; j++) {
+            if (action.cluster.eq(model.clusters[j].name)) {
+                declared = true;
+                break;
+            }
+        }
+        if (!declared)
+            return invalid(action.cluster_span,
+                           lit_str("route cluster does not name a declared cluster"));
+        // PR #692 round-12 review, ported to the route-list model: revalidate
+        // the bounded length too, not just non-emptiness/equality.
+        // `name_string` (src/envoy/parser.cc:179-185) rejects every name
+        // over `kMaxEnvoyNameLen` during parsing, but nothing above
+        // re-checks that bound; a caller of the public
+        // `lower_to_rut(model, capabilities)` overload who sets a route's
+        // `action.cluster` and a declared cluster's `name` to the same
+        // overlong string still passes the equality check above and would
+        // otherwise lower successfully, accepting a model
+        // `parse_bootstrap_json` would reject. Checked for every route now
+        // that route lists may have more than one. The matching per-cluster
+        // `name` bound (and the `load_assignment_name` presence/equality
+        // revalidation) is ported into the per-cluster loop above instead of
+        // repeated here.
+        if (action.cluster.len > kMaxEnvoyNameLen)
+            return unsupported(action.cluster_span, lit_str("name exceeds the bounded length"));
+    }
     // PR #692 round-10 review: revalidate `virtual_host.name` too — the
     // parser requires it non-empty (`parse_virtual_host`, "virtual host name
     // must be a non-empty string", src/envoy/parser.cc), but the emitted RUT
@@ -454,25 +855,23 @@ FrontendResult<bool> validate(const Bootstrap& model, const RutCapabilities& cap
     // `virtual_host.name` would otherwise still lower successfully.
     if (virtual_host.name.len > kMaxEnvoyNameLen)
         return unsupported(virtual_host.name_span, lit_str("name exceeds the bounded length"));
-    // PR #692 round-9 review: validation never checked that parsing
-    // established `domains: ["*"]` on the virtual host — only the nested
-    // route's `match.prefix` (round-3 above). A hand-built `Bootstrap`, or a
-    // parsed copy with `virtual_host.domains_span` cleared, still lowers
-    // even though the generated route has no host dimension and therefore
-    // matches every authority, which widens routing beyond what the model
-    // claims. `domains_span` is the model's only record that
-    // `parse_virtual_host` ever saw and accepted the exact single-element
-    // `["*"]` array (the parser rejects every other `domains` value), the
-    // same evidence-bit shape as `hcm.type_url_span` and
-    // `hcm.generate_request_id_span` below.
+    // PR #692 round-9 review, ported to the route-list model: validation
+    // never checked that parsing established `domains: ["*"]` on the
+    // virtual host. A hand-built `Bootstrap`, or a parsed copy with
+    // `virtual_host.domains_span` cleared, still lowers even though the
+    // generated route has no host dimension and therefore matches every
+    // authority, which widens routing beyond what the model claims.
+    // `domains_span` is the model's only record that `parse_virtual_host`
+    // ever saw and accepted the exact single-element `["*"]` array (the
+    // parser rejects every other `domains` value), the same evidence-bit
+    // shape as `hcm.type_url_span` and `hcm.generate_request_id_span` below.
     if (virtual_host.domains_span.start == 0u && virtual_host.domains_span.end == 0u)
         return invalid(virtual_host.span, lit_str("virtual host domains must be [\"*\"]"));
     // PR #692 round-4 review: revalidate the router filter's identity here
     // too, not just `suppress_envoy_headers` on it — a forged `router.name`
     // or a cleared `has_typed_config` would otherwise still lower
     // successfully and silently omit whatever filter the model actually
-    // named (e.g. a Lua filter's behavior), the same class of gap the
-    // `route.match.prefix` check above closes for the route.
+    // named (e.g. a Lua filter's behavior).
     if (!router.name.eq(kRouterFilterName))
         return invalid(router.name_span,
                        lit_str("router filter name must be envoy.filters.http.router"));
@@ -558,19 +957,24 @@ FrontendResult<bool> validate(const Bootstrap& model, const RutCapabilities& cap
             lit_str("BLOCKED_BY_RUT: x-envoy-upstream-service-time has no RUT equivalent; set "
                     "suppress_envoy_headers: true on the router filter"));
     }
-    if (!action.timeout_present)
-        return unsupported(
-            action.span,
-            lit_str("BLOCKED_BY_RUT: Envoy's default 15s route timeout has no RUT equivalent "
-                    "here; set route timeout \"0s\""));
-    if (action.timeout.milliseconds != 0u)
-        return unsupported(
-            action.timeout.span,
-            lit_str("BLOCKED_BY_RUT: a non-zero route timeout has no RUT equivalent here; set "
-                    "route timeout \"0s\""));
+
+    for (u32 i = 0; i < virtual_host.routes.len; i++) {
+        const RouteAction& action = virtual_host.routes[i].action;
+        if (!action.timeout_present)
+            return unsupported(
+                action.span,
+                lit_str("BLOCKED_BY_RUT: Envoy's default 15s route timeout has no RUT equivalent "
+                        "here; set route timeout \"0s\""));
+        if (action.timeout.milliseconds != 0u)
+            return unsupported(
+                action.timeout.span,
+                lit_str("BLOCKED_BY_RUT: a non-zero route timeout has no RUT equivalent here; set "
+                        "route timeout \"0s\""));
+    }
+
     if (!caps.request_envoy_h1)
         return unsupported(
-            action.cluster_span,
+            virtual_host.routes[0].action.cluster_span,
             lit_str("BLOCKED_BY_RUT: Envoy preserves Host and lowercases upstream request header "
                     "names; RUT request_policy lacks host: \"preserve\""));
     if (!caps.response_envoy_h1)
@@ -593,6 +997,10 @@ FrontendResult<RutSource> lower_to_rut(const Bootstrap& model,
     auto validated = validate(model, capabilities);
     if (!validated) return core::make_unexpected(validated.error());
 
+    auto planned = build_lowering_plan(model);
+    if (!planned) return core::make_unexpected(planned.error());
+    const LoweringPlan& plan = planned.value();
+
     RutSource output{};
     Writer writer(output);
     auto fail_overflow = [&]() -> FrontendResult<RutSource> {
@@ -600,7 +1008,6 @@ FrontendResult<RutSource> lower_to_rut(const Bootstrap& model,
     };
 
     const SocketAddress& listen = model.listener.address;
-    const SocketAddress& upstream = model.clusters[0].endpoint.address;
 
     if (!writer.put_cstr("listen ")) return fail_overflow();
     if (listen.ipv4_host == 0u) {
@@ -610,14 +1017,23 @@ FrontendResult<RutSource> lower_to_rut(const Bootstrap& model,
     }
     if (!writer.put_u16(listen.port) || !writer.put_cstr("\n")) return fail_overflow();
 
-    if (!writer.put_cstr("upstream envoy_cluster_0 at \"") ||
-        !writer.put_ipv4_host(upstream.ipv4_host) || !writer.put_cstr(":") ||
-        !writer.put_u16(upstream.port) || !writer.put_cstr("\"\n"))
-        return fail_overflow();
+    for (u32 i = 0; i < model.clusters.len; i++) {
+        const SocketAddress& upstream = model.clusters[i].endpoint.address;
+        if (!writer.put_cstr("upstream envoy_cluster_") || !writer.put_u16(static_cast<u16>(i)) ||
+            !writer.put_cstr(" at \"") || !writer.put_ipv4_host(upstream.ipv4_host) ||
+            !writer.put_cstr(":") || !writer.put_u16(upstream.port) || !writer.put_cstr("\"\n"))
+            return fail_overflow();
+    }
 
     if (!put_unmatched(writer)) return fail_overflow();
-    if (!put_forward_route(writer, "HEAD", 4u, /*include_head_mode=*/true)) return fail_overflow();
-    if (!put_forward_route(writer, "", 0u, /*include_head_mode=*/false)) return fail_overflow();
+
+    for (u32 i = 0; i < plan.emit_order.len; i++) {
+        const NodePlanEntry& node = plan.emit_order[i];
+        if (node.needs_exact_fallback && !put_route_exact_404(writer, node.text))
+            return fail_overflow();
+        if (!put_route_node(writer, node.text, node.arms, "HEAD", 4u)) return fail_overflow();
+        if (!put_route_node(writer, node.text, node.arms, "", 0u)) return fail_overflow();
+    }
 
     return output;
 }
