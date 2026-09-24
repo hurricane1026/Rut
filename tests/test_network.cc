@@ -35844,8 +35844,8 @@ bool stage_live_precise_request(IoUringEventLoop* loop,
     const u8* request = bodyless_get ? (downstream_close ? kGetCloseRequest : kGetKeepAliveRequest)
                         : downstream_close ? kCloseRequest
                                            : kKeepAliveRequest;
-    const u32 request_len = bodyless_get ? (downstream_close ? sizeof(kGetCloseRequest) - 1u
-                                                             : sizeof(kGetKeepAliveRequest) - 1u)
+    const u32 request_len = bodyless_get       ? (downstream_close ? sizeof(kGetCloseRequest) - 1u
+                                                                   : sizeof(kGetKeepAliveRequest) - 1u)
                             : downstream_close ? sizeof(kCloseRequest) - 1u
                                                : sizeof(kKeepAliveRequest) - 1u;
     if (conn->recv_buf.write(request, request_len) != request_len) return fail();
