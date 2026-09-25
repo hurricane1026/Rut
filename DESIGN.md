@@ -657,10 +657,13 @@ empty `content_type`/`body`).
 `header_names`, `connection_header`, and `header_order` are an optional
 **closed trio** added for Envoy H1 compatibility: any one present requires all
 three. `header_names` accepts only `"lowercase"`; `connection_header` only
-`"close_only"` (append `connection: close` last, and only when the downstream
-connection is actually closing — unlike the default fixed-order layout, which
-always sends one Connection header or the other). `header_order` selects the
-wire layout:
+`"close_only"` (append `connection: close` immediately after `server`, and
+only when the downstream connection is actually closing — unlike the default
+fixed-order layout, which always sends one Connection header or the other).
+Where `connection: close` falls in the overall wire order is layout-specific:
+last for `"length_type_date_server"`, but followed by a trailing
+`content-length: 0` for `"date_server_length"` (see the two bullets below).
+`header_order` selects the wire layout:
 
 - *(trio omitted)* — `Synthesized`, today's fixed nginx-compatible order; the
   only layout `status: 200`/`status: 204` admit.

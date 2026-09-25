@@ -2269,6 +2269,63 @@ TEST(RirPrinter, StrictLocalResponseForgedMetadataPrintsOneSafeMarker) {
     check_marker(*empty_forgery);
 }
 
+// Codex round-3 review: a synthesized policy and an Envoy-layout policy with
+// otherwise identical values must produce distinguishable RIR output, since
+// they generate different header casing, ordering, and connection headers at
+// runtime (build_strict_local_response_bytes,
+// include/rut/runtime/callbacks_impl.h).
+TEST(RirPrinter, StrictLocalResponsePrintsHeaderOrder) {
+    static constexpr char kReason[] = "Bad Request";
+    static constexpr char kType[] = "text/plain";
+    static constexpr char kServer[] = "rut";
+    static constexpr char kBody[] = "x";
+    StrictLocalResponsePolicySpec policy{};
+    policy.version = StrictLocalResponseVersion::Http11;
+    policy.status_code = 400;
+    policy.date = StrictLocalResponseDate::Current;
+    policy.connection = StrictLocalResponseConnection::Request;
+    policy.head_mode = StrictLocalResponseHeadMode::Reject;
+    policy.reason = {kReason, sizeof(kReason) - 1};
+    policy.content_type = {kType, sizeof(kType) - 1};
+    policy.server = {kServer, sizeof(kServer) - 1};
+    policy.body = {kBody, sizeof(kBody) - 1};
+
+    Module mod{};
+    mod.strict_local_response_policies[0] = policy;
+    mod.strict_local_response_policies[0].header_order =
+        StrictLocalResponseHeaderOrder::Synthesized;
+    mod.strict_local_response_policies[1] = policy;
+    mod.strict_local_response_policies[1].header_order =
+        StrictLocalResponseHeaderOrder::LengthTypeDateServer;
+    mod.strict_local_response_policy_count = 2;
+    mod.unmatched_policy_ids[kRouteMethodGet] = 1;
+    mod.unmatched_policy_ids[kRouteMethodPost] = 2;
+    REQUIRE(verify_module(mod).ok);
+
+    char data[1024];
+    PrintBuf buf;
+    buf.init(data, sizeof(data), -1);
+    print_module(buf, mod);
+    CHECK_FALSE(buf.overflow);
+    const Str output{buf.data, buf.len};
+
+    auto contains = [&](const char* needle) {
+        const Str expected = lit(needle);
+        for (u32 i = 0; i + expected.len <= output.len; i++) {
+            if (output.slice(i, i + expected.len).eq(expected)) return true;
+        }
+        return false;
+    };
+    CHECK(
+        contains("local_response#1: version=HTTP/1.1, status=400, reason=\"Bad Request\", "
+                 "server=\"rut\", content_type=\"text/plain\", date=current, "
+                 "connection=request, head_mode=reject, header_order=synthesized"));
+    CHECK(
+        contains("local_response#2: version=HTTP/1.1, status=400, reason=\"Bad Request\", "
+                 "server=\"rut\", content_type=\"text/plain\", date=current, "
+                 "connection=request, head_mode=reject, header_order=length_type_date_server"));
+}
+
 int main(int argc, char** argv) {
     return rut::test::run_all(argc, argv);
 }
