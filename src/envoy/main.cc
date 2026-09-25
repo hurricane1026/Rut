@@ -334,7 +334,13 @@ int main(int argc, char** argv) {
         report(argv[3], lowered.error().span, lowered.error().detail, "conversion failed");
         return 1;
     }
-    warn_connect_timeout(parsed.value().clusters[0].connect_timeout.text);
+    // PR8 lowers every declared cluster (multiple clusters are no longer
+    // rejected), so D2's warning must name every one of them, not only
+    // `clusters[0]` -- a config with a second cluster whose `connect_timeout`
+    // silently went unmentioned would contradict the documented contract of
+    // naming every ignored value on stderr.
+    for (rut::u32 i = 0; i < parsed.value().clusters.len; i++)
+        warn_connect_timeout(parsed.value().clusters[i].connect_timeout.text);
     if (rut::envoy::needs_h2c_preface_warning(parsed.value())) warn_h2c_preface();
 
     const rut::Str view = lowered.value().view();

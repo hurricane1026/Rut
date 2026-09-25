@@ -6,11 +6,12 @@
 #include "rut/envoy/parser.h"
 #include "test.h"
 #include <algorithm>
+#include <cctype>
 #include <cerrno>
 #include <cstdio>
 #include <cstdlib>
-#include <memory>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include <dirent.h>
@@ -31,16 +32,35 @@ namespace {
 
 // `RutSource` is 128 KiB (PR8's ordered route-list capacity, see
 // include/rut/envoy/converter.h). Every `lower_to_rut` result a test keeps
-// around (as opposed to consuming immediately in one expression) is heap-held
-// through this alias rather than a plain stack local.
-using LowerResult = std::unique_ptr<FrontendResult<envoy::RutSource>>;
+// around (as opposed to consuming immediately in one expression) is kept out
+// of the stack frame the same way this file already keeps a `JsonDocument`
+// out of it (`static envoy::JsonDocument doc;`, used throughout): a small
+// fixed pool of function-local static storage, round-robined across calls,
+// rather than a heap allocation. No test holds more than 3 results live at
+// once (`api_all_capabilities_matches_golden`) and every result already read
+// is fully consumed via CHECK/REQUIRE before the call that would recycle its
+// slot, so 4 slots leaves headroom without needing per-call-site storage.
+constexpr u32 kLowerResultSlots = 4;
 
-LowerResult lower_heap(const envoy::Bootstrap& model) {
-    return std::make_unique<FrontendResult<envoy::RutSource>>(envoy::lower_to_rut(model));
+FrontendResult<envoy::RutSource>* lower_result_slot() {
+    static FrontendResult<envoy::RutSource> slots[kLowerResultSlots];
+    static u32 next = 0;
+    FrontendResult<envoy::RutSource>* slot = &slots[next];
+    next = (next + 1u) % kLowerResultSlots;
+    return slot;
 }
 
-LowerResult lower_heap(const envoy::Bootstrap& model, const envoy::RutCapabilities& caps) {
-    return std::make_unique<FrontendResult<envoy::RutSource>>(envoy::lower_to_rut(model, caps));
+FrontendResult<envoy::RutSource>* lower_heap(const envoy::Bootstrap& model) {
+    FrontendResult<envoy::RutSource>* slot = lower_result_slot();
+    *slot = envoy::lower_to_rut(model);
+    return slot;
+}
+
+FrontendResult<envoy::RutSource>* lower_heap(const envoy::Bootstrap& model,
+                                             const envoy::RutCapabilities& caps) {
+    FrontendResult<envoy::RutSource>* slot = lower_result_slot();
+    *slot = envoy::lower_to_rut(model, caps);
+    return slot;
 }
 
 const char* g_executable = nullptr;
@@ -622,6 +642,150 @@ std::string sim_dispatch(const std::vector<SimRoute>& routes, const std::string&
         // strict descendant or unrelated: irrelevant to this node
     }
     return "<404>";  // unreachable for a well-formed model (see converter.cc)
+}
+
+// ── Drive the actual emitted RUT text, not a second independent model ──
+//
+// `sim_dispatch` above models what the converter *should* produce,
+// independently of `src/envoy/converter.cc`, so a probe/expectation bug
+// there cannot also hide a converter bug. But comparing `envoy_first_match`
+// against `sim_dispatch` alone never reads the real `lower_to_rut` output:
+// a bug in `build_node_plan` (wrong arm order, wrong cluster, a dropped
+// node) would not fail the brute-force tests below (Codex P1 on PR #695
+// round 3). `rut_dispatch` closes that gap by parsing the fixed, documented
+// shape `put_route_node` / `put_route_arms` emit (the algorithm doc comment
+// above `build_node_plan` in src/envoy/converter.cc) out of the emitted RUT
+// text itself, then re-running the SAME node-selection rule (`sim_is_under`,
+// already used to check `rut_dispatch` isn't just `sim_dispatch` again) over
+// that PARSED structure.
+
+// One `\` or `"` byte unescaped (inverse of `Writer::put_escaped`,
+// src/envoy/converter.cc); every prefix/path in the fixtures below is
+// already escape-free, so this only guards against a fixture growing one.
+std::string rut_unescape(const std::string& s) {
+    std::string out;
+    for (size_t i = 0; i < s.size(); i++) {
+        if (s[i] == '\\' && i + 1u < s.size()) {
+            i++;
+        }
+        out += s[i];
+    }
+    return out;
+}
+
+struct RutArm {
+    bool is_exact = false;     // meaningless for the chain's last (terminal) arm
+    std::string compare_text;  // meaningless for the chain's last (terminal) arm
+    u32 cluster_index = 0;
+};
+
+struct RutNode {
+    std::string text;
+    std::vector<RutArm> arms;  // last entry is the chain's unconditional terminator
+};
+
+// Parses every ANY-method `route "N" { ... }` block out of `rut_text`
+// (skipping the byte-identical `route HEAD "N" { ... }` variant: both share
+// the same arm structure, see `put_route_node`). Relies only on the fixed
+// textual shape `put_route_arms` emits: an ordered, alternating sequence of
+// `req.pathOnly (==|!=) "text"` conditions and `forward(envoy_cluster_N`
+// calls, with exactly one more call than conditions (the trailing call is
+// the chain's terminator).
+std::vector<RutNode> parse_rut_route_nodes(const std::string& rut_text) {
+    std::vector<RutNode> nodes;
+    size_t pos = 0;
+    while (true) {
+        pos = rut_text.find("\nroute \"", pos);
+        if (pos == std::string::npos) break;
+        const size_t text_start = pos + std::string("\nroute \"").size();
+        const size_t text_end = rut_text.find("\" {\n", text_start);
+        if (text_end == std::string::npos) break;
+        RutNode node;
+        node.text = rut_unescape(rut_text.substr(text_start, text_end - text_start));
+
+        const size_t body_start = text_end + std::string("\" {\n").size();
+        size_t i = body_start;
+        int depth = 1;
+        for (; i < rut_text.size() && depth > 0; i++) {
+            if (rut_text[i] == '{')
+                depth++;
+            else if (rut_text[i] == '}')
+                depth--;
+        }
+        const std::string body = rut_text.substr(body_start, i - 1u - body_start);
+
+        std::vector<std::pair<bool, std::string>> conditions;
+        size_t cpos = 0;
+        while (true) {
+            cpos = body.find("req.pathOnly ", cpos);
+            if (cpos == std::string::npos) break;
+            const size_t op_start = cpos + std::string("req.pathOnly ").size();
+            const bool is_exact = body.compare(op_start, 2u, "==") == 0;
+            const size_t q1 = body.find('"', op_start);
+            const size_t q2 = body.find('"', q1 + 1u);
+            conditions.emplace_back(is_exact, rut_unescape(body.substr(q1 + 1u, q2 - q1 - 1u)));
+            cpos = q2 + 1u;
+        }
+        std::vector<u32> clusters;
+        size_t fpos = 0;
+        while (true) {
+            fpos = body.find("forward(envoy_cluster_", fpos);
+            if (fpos == std::string::npos) break;
+            const size_t num_start = fpos + std::string("forward(envoy_cluster_").size();
+            size_t num_end = num_start;
+            while (num_end < body.size() && std::isdigit(static_cast<unsigned char>(body[num_end])))
+                num_end++;
+            clusters.push_back(
+                static_cast<u32>(std::stoul(body.substr(num_start, num_end - num_start))));
+            fpos = num_end;
+        }
+        for (size_t k = 0; k < conditions.size(); k++) {
+            RutArm arm;
+            arm.is_exact = conditions[k].first;
+            arm.compare_text = conditions[k].second;
+            arm.cluster_index = k < clusters.size() ? clusters[k] : 0u;
+            node.arms.push_back(arm);
+        }
+        RutArm terminal;
+        terminal.cluster_index = clusters.empty() ? 0u : clusters.back();
+        node.arms.push_back(terminal);
+        nodes.push_back(node);
+        pos = i;
+    }
+    return nodes;
+}
+
+std::string rut_cluster_name(const std::vector<std::string>& cluster_names, u32 index) {
+    return index < cluster_names.size() ? cluster_names[index] : "<bad-cluster-index>";
+}
+
+// Re-runs the SAME "longest declared node the probe falls under" selection
+// (`sim_is_under`) over the PARSED real output, then walks that node's
+// parsed arm chain exactly as `req.pathOnly ==`/`!=` comparisons would at
+// runtime.
+std::string rut_dispatch(const std::vector<RutNode>& nodes,
+                         const std::vector<std::string>& cluster_names,
+                         const std::string& probe) {
+    std::string best = "/";
+    for (const RutNode& n : nodes) {
+        if (n.text.size() > best.size() && sim_is_under(n.text, probe)) best = n.text;
+    }
+    const RutNode* node = nullptr;
+    for (const RutNode& n : nodes) {
+        if (n.text == best) {
+            node = &n;
+            break;
+        }
+    }
+    if (node == nullptr || node->arms.empty()) return "<404>";  // no emitted node applies
+    for (size_t i = 0; i < node->arms.size(); i++) {
+        const RutArm& arm = node->arms[i];
+        if (i + 1u == node->arms.size()) return rut_cluster_name(cluster_names, arm.cluster_index);
+        const bool matches =
+            arm.is_exact ? (probe == arm.compare_text) : (probe != arm.compare_text);
+        if (matches) return rut_cluster_name(cluster_names, arm.cluster_index);
+    }
+    return "<404>";  // unreachable: the last arm is always the terminator
 }
 
 }  // namespace
@@ -1458,6 +1622,35 @@ TEST(envoy_convert, api_forged_model_rejected) {
         lit_str("/:tenant/");
     CHECK_FALSE(envoy::lower_to_rut(param_prefix, all_true));
 
+    // A prefix containing "//" collapses, in Rut's route trie, to the same
+    // node text as its single-slash form -- bypasses the parser (which never
+    // produces one), so a hand-built model must be rejected here instead.
+    envoy::Bootstrap double_slash_prefix = parsed.value();
+    double_slash_prefix.listener.filter_chain.hcm.route_config.virtual_host.routes[0].match.prefix =
+        lit_str("/api//");
+    CHECK_FALSE(envoy::lower_to_rut(double_slash_prefix, all_true));
+
+    // A hand-built exact path carrying a control byte (e.g. a newline)
+    // bypasses the parser's `validate_route_match_bytes`; `put_escaped`
+    // only escapes `\` and `"`, so an unvalidated newline would otherwise be
+    // copied into the generated RUT literal verbatim.
+    envoy::Bootstrap control_byte_path = parsed.value();
+    control_byte_path.listener.filter_chain.hcm.route_config.virtual_host.routes[0].match.kind =
+        envoy::RouteMatchKind::Path;
+    control_byte_path.listener.filter_chain.hcm.route_config.virtual_host.routes[0].match.path =
+        Str{"/ok\n", 4u};
+    CHECK_FALSE(envoy::lower_to_rut(control_byte_path, all_true));
+
+    // A hand-built exact path over 64 bytes bypasses the parser's length
+    // bound the same way.
+    static const std::string oversized = "/" + std::string(64u, 'a');
+    envoy::Bootstrap oversized_path = parsed.value();
+    oversized_path.listener.filter_chain.hcm.route_config.virtual_host.routes[0].match.kind =
+        envoy::RouteMatchKind::Path;
+    oversized_path.listener.filter_chain.hcm.route_config.virtual_host.routes[0].match.path =
+        str(oversized);
+    CHECK_FALSE(envoy::lower_to_rut(oversized_path, all_true));
+
     // A hand-built model can also drop every declared cluster while its
     // route still forwards; the empty-cluster allowance is only for
     // direct_response/redirect routes.
@@ -1812,6 +2005,51 @@ TEST(envoy_convert, api_forged_model_rejected) {
               .find("route count exceeds the bounded capacity") != std::string::npos);
 }
 
+TEST(envoy_convert, colon_segment_allowed_in_exact_path_with_root_prefix) {
+    // An exact `path` match is never emitted as a route declaration (only
+    // ever compared as a string literal, `req.pathOnly == "..."`), unlike a
+    // `prefix` match that becomes a `route "<node_text>" { ... }`
+    // declaration route_trie.h would treat a ':' segment in specially. A
+    // path containing "/:tenant" alongside a root prefix must lower
+    // successfully instead of being rejected for a parameter-capture risk
+    // it does not carry.
+    const std::string text = route_list_json(
+        json_array(
+            {path_route_json("/:tenant", "tenant_backend"), prefix_route_json("/", "backend")}),
+        json_array({cluster_json("tenant_backend", 9001), cluster_json("backend", 9000)}));
+    static envoy::JsonDocument doc;
+    auto parsed = envoy::parse_bootstrap_json(str(text), doc);
+    REQUIRE(parsed);
+    const envoy::RutCapabilities all_true{true, true, true};
+    auto lowered = lower_heap(parsed.value(), all_true);
+    REQUIRE(*lowered);
+    const std::string out = to_string((*lowered).value().view());
+    CHECK(out.find("req.pathOnly == \"/:tenant\"") != std::string::npos);
+}
+
+TEST(envoy_convert, prefix_containing_double_slash_is_rejected_end_to_end) {
+    // Unlike the hand-built-model case above, this goes through the real
+    // JSON parser: `route_match_byte_ok` (src/envoy/parser.cc) allows '/'
+    // freely and `prefix_shape_ok` only checks the first/last byte, so a
+    // configured "//api/v1/" prefix parses successfully and must be caught
+    // by the converter instead.
+    const std::string text =
+        route_list_json(json_array({prefix_route_json("/api//v1/", "backend")}),
+                        json_array({cluster_json("backend", 9000)}));
+    static envoy::JsonDocument doc;
+    auto parsed = envoy::parse_bootstrap_json(str(text), doc);
+    REQUIRE(parsed);
+    const envoy::RouteMatch& match =
+        parsed.value().listener.filter_chain.hcm.route_config.virtual_host.routes[0].match;
+    REQUIRE(match.prefix.eq(lit_str("/api//v1/")));
+
+    const envoy::RutCapabilities all_true{true, true, true};
+    auto lowered = lower_heap(parsed.value(), all_true);
+    REQUIRE_FALSE(*lowered);
+    CHECK(lowered->error().code == FrontendError::UnsupportedSyntax);
+    CHECK(to_string(lowered->error().detail).find("\"//\"") != std::string::npos);
+}
+
 TEST(envoy_convert, api_forged_duplicate_cluster_name_rejected) {
     const std::string text = routes_scenario_a_json();
     static envoy::JsonDocument doc;
@@ -2102,6 +2340,15 @@ TEST(envoy_convert, brute_force_equivalence_ordered_route_list) {
     auto lowered = lower_heap(parsed.value(), all_true);
     REQUIRE(*lowered);
 
+    // Parse the REAL emitted RUT text (not `routes`/`sim_dispatch`'s
+    // independent model) so a `build_node_plan` regression fails this test.
+    const std::vector<RutNode> rut_nodes =
+        parse_rut_route_nodes(to_string((*lowered).value().view()));
+    REQUIRE_EQ(rut_nodes.size(), 3u);  // "/", "/api", "/api/v1"
+    std::vector<std::string> cluster_names;
+    for (u32 i = 0; i < parsed.value().clusters.len; i++)
+        cluster_names.push_back(to_string(parsed.value().clusters[i].name));
+
     const std::vector<std::string> probes = {
         "/",
         "/healthz",
@@ -2150,6 +2397,8 @@ TEST(envoy_convert, brute_force_equivalence_ordered_route_list) {
         const std::string expected = envoy_first_match(routes, probe);
         const std::string actual = sim_dispatch(routes, probe);
         CHECK_EQ(expected, actual);
+        const std::string rut_actual = rut_dispatch(rut_nodes, cluster_names, probe);
+        CHECK_EQ(expected, rut_actual);
     }
 }
 
@@ -2168,6 +2417,23 @@ TEST(envoy_convert, brute_force_equivalence_exact_before_own_prefix_no_catch_all
         {true, "/api/", "api_backend"},
     };
 
+    // Same shape as `routes_scenario_f_json()` (golden_routes_f), lowered
+    // here too so the probes below can also be checked against the REAL
+    // emitted RUT text, not only the independent `sim_dispatch` model.
+    const std::string text = routes_scenario_f_json();
+    static envoy::JsonDocument doc;
+    auto parsed = envoy::parse_bootstrap_json(str(text), doc);
+    REQUIRE(parsed);
+    const envoy::RutCapabilities all_true{true, true, true};
+    auto lowered = lower_heap(parsed.value(), all_true);
+    REQUIRE(*lowered);
+    const std::vector<RutNode> rut_nodes =
+        parse_rut_route_nodes(to_string((*lowered).value().view()));
+    REQUIRE_EQ(rut_nodes.size(), 1u);  // "/api" (no root declared)
+    std::vector<std::string> cluster_names;
+    for (u32 i = 0; i < parsed.value().clusters.len; i++)
+        cluster_names.push_back(to_string(parsed.value().clusters[i].name));
+
     const std::vector<std::string> probes = {
         "/",
         "/api",
@@ -2185,6 +2451,8 @@ TEST(envoy_convert, brute_force_equivalence_exact_before_own_prefix_no_catch_all
         const std::string expected = envoy_first_match(routes, probe);
         const std::string actual = sim_dispatch(routes, probe);
         CHECK_EQ(expected, actual);
+        const std::string rut_actual = rut_dispatch(rut_nodes, cluster_names, probe);
+        CHECK_EQ(expected, rut_actual);
     }
     // The node's own literal forwards through the earlier exact route, not
     // through a `route exact "/api"` 404 (there is none: no root catch-all
@@ -2192,6 +2460,7 @@ TEST(envoy_convert, brute_force_equivalence_exact_before_own_prefix_no_catch_all
     // ONLY way "/api" resolves at all is the earlier exact arm).
     CHECK_EQ(sim_dispatch(routes, "/api"), "exact_backend");
     CHECK_EQ(envoy_first_match(routes, "/api"), "exact_backend");
+    CHECK_EQ(rut_dispatch(rut_nodes, cluster_names, "/api"), "exact_backend");
 }
 
 int main(int argc, char** argv) {
