@@ -942,7 +942,15 @@ Three findings from the round-6 Codex review of PR #692:
    `ConnectionManagerUtility::mutateXfccRequestHeader` (called for every
    request at `conn_manager_utility.cc:324`) removes under the HCM's default
    `forward_client_cert_details: SANITIZE` (`applyForwardClientCertConfig`,
-   lines 541-545, also for any non-mTLS connection). Sixteen names in
+   lines 541-545, also for any non-mTLS connection) -- plus, from the
+   round-8 review of #696, a client-supplied `x-envoy-external-address`:
+   unlike the sixteen names above, Envoy's own `mutateRequestHeaders` never
+   removes a client-supplied value for this one (`setEnvoyExternalAddress`
+   at line 308 only *writes* it, gated by `edge_request`, which is
+   unreachable under this milestone's fixed shape), so this one is Rut-side
+   hardening rather than an Envoy-parity claim -- a client must not be able
+   to forge the address a trusted hop asserts, independent of what this
+   exact Envoy shape happens to also let through. Seventeen names in
    total; the matrix rows are `PARTIAL` pending the pinned-Envoy
    differential run.
 
