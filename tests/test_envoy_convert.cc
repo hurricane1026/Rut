@@ -1547,6 +1547,22 @@ TEST(envoy_convert, api_forged_model_rejected) {
     CHECK(overlong_route_config_name_result.error().code == FrontendError::UnsupportedSyntax);
     CHECK(to_string(overlong_route_config_name_result.error().detail)
               .find("name exceeds the bounded length") != std::string::npos);
+
+    // Codex round-5 review: a hand-built model can set `action.kind` to a
+    // value outside {Forward, DirectResponse, Redirect} (the parser never
+    // produces this). `validate()` used to infer Forward by elimination
+    // after ruling out DirectResponse/Redirect, so this out-of-range
+    // discriminator would fall through and lower as a forwarding route even
+    // though it names no recognized action.
+    envoy::Bootstrap forged_action_kind = parsed.value();
+    forged_action_kind.listener.filter_chain.hcm.route_config.virtual_host.routes[0].action.kind =
+        static_cast<envoy::RouteActionKind>(99);
+    const auto forged_action_kind_result = envoy::lower_to_rut(forged_action_kind, all_true);
+    CHECK_FALSE(forged_action_kind_result);
+    CHECK(forged_action_kind_result.error().code == FrontendError::UnexpectedToken);
+    CHECK(
+        to_string(forged_action_kind_result.error().detail).find("action kind is not recognized") !=
+        std::string::npos);
 }
 
 // ── Increment 4: reject route lists / direct_response / redirect before the

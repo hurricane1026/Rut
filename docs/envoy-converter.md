@@ -446,9 +446,16 @@ are recorded from the pinned Envoy build, not assumed.
 **Routing**
 
 - `prefix` match is a plain string prefix. `prefix: "/api"` matches `/apifoo`.
-  Rut's route trie is segment-aware, so only `prefix: "/"` and prefixes ending
-  in `/` have a segment-equivalent meaning. Other prefixes are `PARTIAL`
-  until Rut offers a raw-prefix match, and the converter rejects them.
+  Rut's route trie is segment-aware, so only `prefix: "/"` has a
+  segment-equivalent meaning today. This increment lowers `prefix: "/"` and
+  rejects every other prefix outright, including ones ending in `/`:
+  `RouteTrie::tokenize_segments` (`src/runtime/route_trie.cc`) drops trailing
+  empty segments, so Rut treats `/api/` and `/api` as equivalent while
+  Envoy's byte-prefix matcher does not — lowering `/api/` as a segment match
+  would broaden the route. Slash-terminated prefixes therefore stay blocked
+  even once ordered-list lowering (PR 8 / PR #695) lands, unless a future
+  change adds an explicit byte-level boundary check; all other non-root
+  prefixes remain `PARTIAL` until Rut offers a raw-prefix match.
 - Routes are evaluated in list order, first match wins; Rut's own route trie
   instead selects the longest matching declared prefix. Per owner decision D3
   (see `docs/envoy-compatibility.md`, "Multiple routes per virtual host"),

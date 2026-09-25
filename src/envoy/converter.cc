@@ -353,6 +353,17 @@ FrontendResult<bool> validate(const Bootstrap& model, const RutCapabilities& cap
         return unsupported(action.span, lit_str("direct_response is not lowered yet"));
     if (action.kind == RouteActionKind::Redirect)
         return unsupported(action.span, lit_str("redirect is not lowered yet"));
+    // The public hand-built-model overload does not go through the parser,
+    // whose `parse_route_action` only ever produces one of the three
+    // `RouteActionKind` enumerators. Without this explicit check, an
+    // out-of-range discriminator (a forged model, or a future enumerator
+    // this function hasn't been taught about) would fall through the two
+    // checks above and reach the Forward-only lowering below by elimination
+    // rather than by being verified as `Forward` — `lower_to_rut` would then
+    // silently emit a forwarding route for an action kind it does not
+    // actually recognize.
+    if (action.kind != RouteActionKind::Forward)
+        return invalid(action.span, lit_str("route action kind is not recognized"));
 
     // Only Forward remains beyond this point, and it is the only action that
     // needs a declared cluster: a local-only route table (every route

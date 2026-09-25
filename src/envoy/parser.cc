@@ -843,6 +843,17 @@ private:
         out->span = doc_.at(node).span;
         out->redirect.span = doc_.at(node).span;
 
+        // `path_redirect` is not required to be non-empty. Verified against
+        // Envoy v3 at the v1.39.1 tag: `RedirectAction.path_redirect`
+        // (api/envoy/config/route/v3/route_components.proto) carries only
+        // `(validate.rules).string = {well_known_regex: HTTP_HEADER_VALUE
+        // strict: false}` — no `min_len` — and `well_known_regex` matches the
+        // empty string. Router construction doesn't reject it either:
+        // `RouteEntryImplBase::isRedirect()` (source/common/router/
+        // config_impl.cc) treats an empty `path_redirect_` exactly like an
+        // omitted one (both fall through to a bare status-code response with
+        // no Location rewrite). Do not add a min-length check here; it would
+        // reject a bootstrap Envoy itself accepts.
         auto path_redirect = optional(node, kPathRedirect);
         if (!path_redirect) return core::make_unexpected(path_redirect.error());
         if (path_redirect.value() != kJsonNoNode) {

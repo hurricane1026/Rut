@@ -1394,6 +1394,29 @@ TEST(envoy_parser, route_action_models_redirect) {
         CHECK_EQ(action.redirect.response_code, 301u);
     }
     {
+        // An explicitly-empty path_redirect is accepted, not rejected:
+        // verified against Envoy v3 at the v1.39.1 tag, `RedirectAction.
+        // path_redirect` has no `min_len` validate rule (only a
+        // well_known_regex(HTTP_HEADER_VALUE), which matches empty), and
+        // `RouteEntryImplBase::isRedirect()` (source/common/router/
+        // config_impl.cc) treats an empty path_redirect_ the same as an
+        // omitted one rather than rejecting the route. Match that leniency.
+        Bootstrap b;
+        REQUIRE(replace(&b.listeners,
+                        "\"route\": {\"cluster\": \"backend\"}",
+                        "\"redirect\": {\"path_redirect\": \"\", \"response_code\": \"FOUND\"}"));
+        static envoy::JsonDocument doc;
+        // The model borrows the JSON bytes, so the source must outlive the result.
+        const std::string source_text = b.render();
+        auto result = envoy::parse_bootstrap_json(str(source_text), doc);
+        REQUIRE(result);
+        const envoy::RouteAction& action =
+            result.value().listener.filter_chain.hcm.route_config.virtual_host.routes[0].action;
+        REQUIRE(action.kind == envoy::RouteActionKind::Redirect);
+        CHECK(action.redirect.path_redirect.eq(lit_str("")));
+        CHECK_EQ(action.redirect.response_code, 302u);
+    }
+    {
         // response_code, when present, is still closed to the five Envoy
         // names.
         Bootstrap b;
