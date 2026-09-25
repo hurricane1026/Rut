@@ -592,20 +592,23 @@ bool IoUringBackend::cancel_retiring_upstream(u32 conn_id, IoEventType type, u32
                                upstream_episode);
 }
 
-bool IoUringBackend::add_send(i32 fd, u32 conn_id, const u8* buf, u32 len, u32 generation) {
+bool IoUringBackend::add_send(
+    i32 fd, u32 conn_id, const u8* buf, u32 len, u32 generation, bool more_follows) {
     if (conn_id >= connection_capacity || connection_capacity == 0) return false;
     io_uring_sqe* sqe = get_sqe();
     if (!sqe) return false;  // SQ full — don't record send_state without a submitted SQE
+    const u32 extra_flags = more_follows ? static_cast<u32>(MSG_MORE) : 0u;
 
     // Record send state only after acquiring SQE — if kernel returns partial,
     // wait() re-submits the remainder.
     if (conn_id < connection_capacity) {
-        send_state[conn_id] = {buf, fd, 0, len, IoEventType::Send, 0, generation};
+        send_state[conn_id] = {buf, fd, 0, len, IoEventType::Send, 0, generation, extra_flags};
     }
 
     memset(sqe, 0, sizeof(*sqe));
     sqe->opcode = IORING_OP_SEND;
-    sqe->msg_flags = MSG_NOSIGNAL;  // explicit; current kernels also force it for io_uring
+    // MSG_NOSIGNAL explicit; current kernels also force it for io_uring.
+    sqe->msg_flags = MSG_NOSIGNAL | extra_flags;
     sqe->fd = fd;
     sqe->addr = reinterpret_cast<u64>(buf);
     sqe->len = len;
@@ -1575,8 +1578,7 @@ u32 IoUringBackend::wait(IoEvent* events, u32 max_events, Connection* conns, u32
                     if (sqe) {
                         memset(sqe, 0, sizeof(*sqe));
                         sqe->opcode = IORING_OP_SEND;
-                        sqe->msg_flags =
-                            MSG_NOSIGNAL;  // explicit; current kernels also force it for io_uring
+                        sqe->msg_flags = MSG_NOSIGNAL | ss.msg_flags;
                         sqe->fd = ss.fd;
                         sqe->addr = reinterpret_cast<u64>(ss.src + ss.offset);
                         sqe->len = ss.remaining;

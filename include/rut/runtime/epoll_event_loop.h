@@ -707,7 +707,7 @@ public:
         if (c.tls_active) {
             return backend.add_send_tls(c, buf, len);
         }
-        return backend.add_send(c.fd, c.id, buf, len);
+        return backend.add_send(c.fd, c.id, buf, len, c.plaintext_send_has_follow_up());
     }
 
     bool submit_connect_impl(Connection& c, const void* addr, u32 addr_len) {

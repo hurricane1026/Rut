@@ -119,6 +119,7 @@ struct EpollBackend {
         bool tls;
         u32 tls_wait_events;
         u32 upstream_episode;  // 0 for downstream; submission episode upstream
+        u32 msg_flags = 0;     // extra flags kept for the EPOLLOUT continuation
     };
     MappedArray<SendState> send_state;
     MappedArray<SendState> upstream_send_state;
@@ -213,8 +214,10 @@ struct EpollBackend {
     // Backend init/shutdown clear the whole table as part of backend rebuild.
     void quarantine_upstream_episode_on_slot_release(u32 conn_id);
 
-    // Try immediate send. If partial/EAGAIN, register EPOLLOUT.
-    bool add_send(i32 fd, u32 conn_id, const u8* buf, u32 len);
+    // Try immediate send. If partial/EAGAIN, register EPOLLOUT. more_follows
+    // adds MSG_MORE (also on the continuation): the caller sends more of the
+    // same stream from this send's completion.
+    bool add_send(i32 fd, u32 conn_id, const u8* buf, u32 len, bool more_follows = false);
     bool add_send_upstream(i32 fd, u32 conn_id, const u8* buf, u32 len, u32 upstream_episode);
     bool add_send_tls(Connection& c, const u8* buf, u32 len);
 
