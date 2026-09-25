@@ -113,11 +113,16 @@ constexpr int kClientTimeoutMs = 3000;
 // this process (Envoy binds it itself inside the container), so this harness
 // can only probe-allocate it and race everyone else for it.
 constexpr int kMaxListenPortAttempts = 3;
-// Bounded grace window given to a HEAD response after its header terminator,
-// to catch a body sent in a later TCP segment (RFC 9110 §9.3.2 forbids one).
-// Short relative to kClientTimeoutMs: it only needs to observe bytes the
-// peer was about to send anyway, not to wait out a legitimately silent peer.
-constexpr int kHeadBodyGraceMs = 200;
+// Bounded grace window used to catch bytes a peer sends after this harness
+// considers a response's own framing already complete: a HEAD body sent in
+// a later TCP segment (RFC 9110 §9.3.2 forbids one), or -- round-6 review,
+// "Check persistent responses for trailing wire bytes" -- erroneous bytes
+// sent right after a Content-Length-framed body on a persistent (non-close)
+// response, which a caller relying on that framing to demarcate the
+// response would otherwise never see. Short relative to kClientTimeoutMs:
+// it only needs to observe bytes the peer was about to send anyway, not to
+// wait out a legitimately silent peer.
+constexpr int kTrailingBytesGraceMs = 200;
 
 // ── Small process helpers ──────────────────────────────────────────────
 
@@ -496,7 +501,7 @@ struct ReadResult {
 // (record-only cases must check it; see ReadResult).
 //
 // For a HEAD response specifically, RFC 9110 §9.3.2 forbids a body; after
-// the header terminator this waits up to kHeadBodyGraceMs for the peer to
+// the header terminator this waits up to kTrailingBytesGraceMs for the peer to
 // send one anyway (in a later TCP segment) so a violation shows up as extra
 // bytes here instead of being silently dropped by returning immediately.
 ReadResult read_http_message(int fd, bool head_request, int timeout_ms) {
@@ -518,11 +523,11 @@ ReadResult read_http_message(int fd, bool head_request, int timeout_ms) {
     if (head_request) {
         // A HEAD response never carries a body (RFC 9110 §9.3.2): the
         // headers are the entire message, so finding the blank line is
-        // completion. Still wait up to kHeadBodyGraceMs for the peer to
+        // completion. Still wait up to kTrailingBytesGraceMs for the peer to
         // send one anyway (in a later TCP segment) so a violation shows up
         // as extra captured bytes instead of being silently dropped by
         // returning immediately.
-        const int64_t grace_deadline = now_ms() + kHeadBodyGraceMs;
+        const int64_t grace_deadline = now_ms() + kTrailingBytesGraceMs;
         for (;;) {
             const int64_t remaining = grace_deadline - now_ms();
             if (remaining <= 0) break;
@@ -572,6 +577,35 @@ ReadResult read_http_message(int fd, bool head_request, int timeout_ms) {
             if (poll(&pfd, 1, static_cast<int>(remaining)) <= 0) return {buf, false};
             const ssize_t n = recv(fd, chunk, sizeof(chunk), 0);
             if (n != 0) return {buf, false};
+            return {buf, true};
+        }
+        // Persistent (keep-alive) framing: round-6 review, "Check
+        // persistent responses for trailing wire bytes". The advertised
+        // Content-Length body completing is not proof the peer sent nothing
+        // more: for an asserted persistent case (post_fixed, trace, ...)
+        // this harness closes its own socket immediately after this call
+        // returns, so any erroneous bytes the peer appended in a later TCP
+        // segment would otherwise never be observed by anything, letting a
+        // caller compare captured bytes that equal the oracle/other side
+        // even though the wire itself carried unsolicited trailing data.
+        // Use a short bounded grace window (not the full remaining
+        // deadline): a well-behaved persistent peer says nothing more until
+        // the next request, so waiting out the whole per-case timeout here
+        // would slow down every persistent case for no reason. Only actual
+        // bytes (n > 0) are a violation; a timeout (nothing arrived) or a
+        // clean EOF (peer closed anyway, which Content-Length framing does
+        // not forbid) are both fine.
+        const int64_t grace_deadline = now_ms() + kTrailingBytesGraceMs;
+        const int64_t grace_remaining = grace_deadline - now_ms();
+        if (grace_remaining > 0) {
+            pollfd pfd{fd, POLLIN, 0};
+            if (poll(&pfd, 1, static_cast<int>(grace_remaining)) > 0) {
+                const ssize_t n = recv(fd, chunk, sizeof(chunk), 0);
+                if (n > 0) {
+                    buf.append(chunk, static_cast<size_t>(n));
+                    return {buf, false};
+                }
+            }
         }
         return {buf, true};
     }
@@ -1039,6 +1073,12 @@ private:
 // launched").
 int g_docker_rm_invocations = 0;
 
+// Renders a `waitpid` status for a FAIL message: "exited N" for a normal
+// exit, "killed by signal N" for one it did not ask for. Forward-declared
+// here (defined below, "RUT process management") so `EnvoyInstance::stop()`
+// can share it with `RutInstance::stop()` rather than duplicating it.
+std::string describe_wait_status(int status);
+
 struct EnvoyInstance {
     pid_t pid = -1;
     std::string name;
@@ -1051,6 +1091,15 @@ struct EnvoyInstance {
     // call (an explicit one followed by the destructor's automatic one)
     // never re-invokes it either.
     bool launched = false;
+    // Set by stop() when the docker-run child had already exited on its own
+    // -- Envoy crashed, or the container otherwise died -- before this call
+    // ever signaled it. Mirrors `RutInstance::exited_unexpectedly` (round-6
+    // review, "Reject unexpected Envoy exits during pair runs"): a caller
+    // that sees this after a run must treat the whole result as a failure,
+    // since byte comparisons collected up to that point prove nothing about
+    // an Envoy that has since died.
+    bool exited_unexpectedly = false;
+    std::string unexpected_exit_description;
 
     bool launch(const std::string& bootstrap_path, uint16_t /*listen_port*/) {
         // docker run --pull=never --rm --network host --name <name>
@@ -1117,50 +1166,75 @@ struct EnvoyInstance {
         return true;
     }
 
-    void stop() {
-        if (pid > 0) kill(pid, SIGTERM);
-        // Skip docker teardown entirely for an instance that never actually
-        // launched a container (round-15 review, "Skip Docker teardown for
-        // instances that were never launched"): self-test EnvoyInstance
-        // objects wrap dummy forked processes without ever calling launch(),
-        // so `name` is empty and no container was ever created. Running
-        // `docker rm -f` for those anyway wastes up to this call's 10s
-        // timeout each -- four times in --self-test -- and, if a Docker CLI
-        // or daemon is present but unresponsive, pushes the whole self-test
-        // toward CTest's 60s limit for no benefit. `launched` is cleared
-        // right after so a later, redundant stop() call never re-invokes it.
+    // Returns false iff the docker-run child had already exited by itself
+    // before this call sent it any signal or ran `docker rm -f` -- an
+    // unexpected exit (Envoy crash or otherwise) that `exited_unexpectedly` /
+    // `unexpected_exit_description` describe. Returns true when there was
+    // nothing to stop, or when the child ended because of the teardown this
+    // call performed (round-6 review, "Reject unexpected Envoy exits during
+    // pair runs"; mirrors `RutInstance::stop()`'s precheck). Docker teardown
+    // itself is skipped entirely for an instance that never actually
+    // launched a container (round-15 review, "Skip Docker teardown for
+    // instances that were never launched"): self-test EnvoyInstance objects
+    // wrap dummy forked processes without ever calling launch(), so `name`
+    // is empty and no container was ever created. Running `docker rm -f`
+    // for those anyway wastes up to this call's 10s timeout each -- four
+    // times in --self-test -- and, if a Docker CLI or daemon is present but
+    // unresponsive, pushes the whole self-test toward CTest's 60s limit for
+    // no benefit. `launched` is cleared right after so a later, redundant
+    // stop() call (an explicit one followed by the destructor's automatic
+    // one) never re-invokes it either.
+    bool stop() {
+        if (pid <= 0) return true;
+        int status = 0;
+        // Check before signaling/removing the container: if the child is
+        // already a zombie here, it exited on its own, not because we asked
+        // it to.
+        const pid_t precheck = waitpid(pid, &status, WNOHANG);
+        if (precheck == pid) {
+            exited_unexpectedly = true;
+            unexpected_exit_description = describe_wait_status(status);
+            pid = -1;
+            // `docker run --rm` normally removes the container on exit, but
+            // a crash mid-startup can leave it behind; still attempt cleanup.
+            if (launched) {
+                g_docker_rm_invocations++;
+                run_and_wait({"docker", "rm", "-f", name}, 10'000);
+                launched = false;
+            }
+            return false;
+        }
+        kill(pid, SIGTERM);
         if (launched) {
             g_docker_rm_invocations++;
             run_and_wait({"docker", "rm", "-f", name}, 10'000);
             launched = false;
         }
-        if (pid > 0) {
-            const int64_t deadline = now_ms() + 5000;
-            int status = 0;
-            for (;;) {
-                const pid_t waited = waitpid(pid, &status, WNOHANG);
-                if (waited == pid) break;
-                if (waited < 0 && errno == ECHILD) {
-                    // Already reaped by someone else (e.g. a caller that
-                    // explicitly waitpid()'d this pid before dropping the
-                    // EnvoyInstance) -- round-9 review, "Treat ECHILD as an
-                    // already-stopped child". Without this, a stale/reaped
-                    // pid would sit through the full 5s deadline below and
-                    // then be signaled again, potentially hitting an
-                    // unrelated process if the pid has since been recycled.
-                    break;
-                }
-                if (now_ms() >= deadline) {
-                    kill(pid, SIGKILL);
-                    while (waitpid(pid, &status, 0) < 0 && errno == EINTR) {
-                    }
-                    break;
-                }
-                struct timespec ts{0, 10'000'000};
-                nanosleep(&ts, nullptr);
+        const int64_t deadline = now_ms() + 5000;
+        for (;;) {
+            const pid_t waited = waitpid(pid, &status, WNOHANG);
+            if (waited == pid) break;
+            if (waited < 0 && errno == ECHILD) {
+                // Already reaped by someone else (e.g. a caller that
+                // explicitly waitpid()'d this pid before dropping the
+                // EnvoyInstance) -- round-9 review, "Treat ECHILD as an
+                // already-stopped child". Without this, a stale/reaped pid
+                // would sit through the full 5s deadline below and then be
+                // signaled again, potentially hitting an unrelated process
+                // if the pid has since been recycled.
+                break;
             }
-            pid = -1;
+            if (now_ms() >= deadline) {
+                kill(pid, SIGKILL);
+                while (waitpid(pid, &status, 0) < 0 && errno == EINTR) {
+                }
+                break;
+            }
+            struct timespec ts{0, 10'000'000};
+            nanosleep(&ts, nullptr);
         }
+        pid = -1;
+        return true;
     }
 
     ~EnvoyInstance() { stop(); }
@@ -1433,11 +1507,13 @@ struct RutInstance {
         }
         kill(pid, SIGTERM);
         const int64_t deadline = now_ms() + 5000;
+        bool escalated = false;
         for (;;) {
             const pid_t waited = waitpid(pid, &status, WNOHANG);
             if (waited == pid) break;
             if (now_ms() >= deadline) {
                 kill(pid, SIGKILL);
+                escalated = true;
                 while (waitpid(pid, &status, 0) < 0 && errno == EINTR) {
                 }
                 break;
@@ -1446,6 +1522,29 @@ struct RutInstance {
             nanosleep(&ts, nullptr);
         }
         pid = -1;
+        // Round-6 review, "Verify the status reaped after signaling RUT":
+        // the precheck above only catches a child that had ALREADY exited
+        // before stop() sent it any signal. A child that dies during the
+        // TOCTOU window between that precheck and `kill(pid, SIGTERM)` right
+        // above is a still-open gap: a zombie process still accepts (and
+        // silently no-ops) a kill(), so the `waitpid(..., WNOHANG)` loop
+        // just reaped above would otherwise be trusted as evidence of a
+        // clean, intentional teardown regardless of what actually killed the
+        // child. Verify the reaped status matches the teardown THIS call
+        // actually performed: rut blocks SIGTERM/SIGINT and exits via a
+        // normal `return` from `main` once it observes one (src/main.cc,
+        // `sigwait`/`sigtimedwait` loop), so a SIGTERM that sufficed must
+        // produce a plain exit 0; a SIGTERM that did not (this call
+        // escalated to SIGKILL) must produce death by exactly that signal.
+        // Anything else -- a crash signal, a nonzero exit, or escaping
+        // SIGKILL -- is unexpected, however it was reaped.
+        const bool clean = escalated ? (WIFSIGNALED(status) && WTERMSIG(status) == SIGKILL)
+                                     : (WIFEXITED(status) && WEXITSTATUS(status) == 0);
+        if (!clean) {
+            exited_unexpectedly = true;
+            unexpected_exit_description = describe_wait_status(status);
+            return false;
+        }
         return true;
     }
 
@@ -2371,7 +2470,12 @@ int run_oracle_milestone_s(const std::string& output_path) {
             results.push_back(std::move(r));
         }
 
-        envoy.stop();
+        if (!envoy.stop()) {
+            std::cerr << "FAIL: envoy exited unexpectedly before teardown ("
+                      << envoy.unexpected_exit_description << ")\n";
+            dump_log(envoy.log_path);
+            return 1;
+        }
 
         for (auto& r : results) {
             const auto it = std::find_if(
@@ -2416,7 +2520,12 @@ int run_oracle_milestone_s(const std::string& output_path) {
                                      // override after the call, not before.
         r.upstream_contacted = false;
         results.push_back(std::move(r));
-        envoy.stop();
+        if (!envoy.stop()) {
+            std::cerr << "FAIL: envoy exited unexpectedly before teardown ("
+                      << envoy.unexpected_exit_description << ")\n";
+            dump_log(envoy.log_path);
+            return 1;
+        }
     }
 
     if (!write_transcript(output_path, results)) {
@@ -2432,15 +2541,32 @@ int run_oracle_milestone_s(const std::string& output_path) {
 
 // ── --pair-milestone-s (PR 6) ────────────────────────────────────────────
 
+// Case names whose whole point is unreachable-upstream behavior, not
+// forwarding: `options_star` (Envoy answers the control `OPTIONS *` request
+// with a local 404, never routing it -- docs/envoy-compatibility.md, "Local
+// replies (404 for OPTIONS * and authority-form CONNECT)") and
+// `connect_failure` (the upstream port is deliberately closed to exercise
+// the connect-failure local reply). Every other case exists specifically to
+// exercise forwarding, so `compare_pair_case` below requires actual upstream
+// contact for them (round-6 review, "Require expected upstream contact for
+// forwarded cases").
+bool case_expects_upstream_forward(const std::string& name) {
+    return name != "options_star" && name != "connect_failure";
+}
+
 // Compares one pair case's Envoy and RUT observations, printing
 // MATCH/MISMATCH with escaped literals for either mismatching side. Returns
 // true iff both sides produced a complete exchange (see
-// `CaseResult::exchange_complete`) AND both upstream and downstream bytes
-// agree (downstream compared after `normalize_date_for_compare`, everything
-// else byte for byte). Two exchanges that both failed identically (e.g. a
-// connection refused on both sides yielding two empty buffers) must never
-// report MATCH: that would let the harness pass without ever exercising the
-// case.
+// `CaseResult::exchange_complete`), both upstream and downstream bytes agree
+// (downstream compared after `normalize_date_for_compare`, everything else
+// byte for byte), AND -- for every case except the two named in
+// `case_expects_upstream_forward` -- both sides actually contacted the
+// upstream exactly once. Two exchanges that both failed identically (e.g. a
+// connection refused on both sides yielding two empty buffers, or the
+// recording upstream itself becoming unavailable and both proxies answering
+// with matching, fully framed local error responses) must never report
+// MATCH: that would let the harness pass without ever exercising forwarding
+// at all.
 bool compare_pair_case(const PairCaseResult& c) {
     const std::string preserved_date =
         c.name == "get_upstream_date_server" ? "Mon, 01 Jan 2024 00:00:00 GMT" : std::string();
@@ -2450,8 +2576,11 @@ bool compare_pair_case(const PairCaseResult& c) {
     const bool both_complete = c.envoy.exchange_complete && c.rut.exchange_complete;
     const bool upstream_match = c.envoy.upstream_contacted == c.rut.upstream_contacted &&
                                 c.envoy.upstream_bytes == c.rut.upstream_bytes;
+    const bool expects_forward = case_expects_upstream_forward(c.name);
+    const bool forwarding_exercised = !expects_forward || (c.envoy.upstream_contact_count == 1 &&
+                                                           c.rut.upstream_contact_count == 1);
     const bool downstream_match = envoy_down == rut_down;
-    const bool match = both_complete && upstream_match && downstream_match;
+    const bool match = both_complete && upstream_match && forwarding_exercised && downstream_match;
     std::cerr << (match ? "MATCH    [" : "MISMATCH [") << c.name << "]"
               << (c.asserted ? " (asserted)" : " (record-only)") << "\n";
     if (!both_complete) {
@@ -2461,6 +2590,12 @@ bool compare_pair_case(const PairCaseResult& c) {
     if (!upstream_match) {
         std::cerr << "  upstream envoy: \"" << escape_wire_bytes(c.envoy.upstream_bytes) << "\"\n";
         std::cerr << "  upstream rut:   \"" << escape_wire_bytes(c.rut.upstream_bytes) << "\"\n";
+    }
+    if (!forwarding_exercised) {
+        std::cerr << "  forwarding not exercised: envoy upstream_contact_count="
+                  << c.envoy.upstream_contact_count
+                  << " rut upstream_contact_count=" << c.rut.upstream_contact_count
+                  << " (expected exactly 1 on each side)\n";
     }
     if (!downstream_match) {
         std::cerr << "  downstream envoy: \"" << escape_wire_bytes(envoy_down) << "\"\n";
@@ -2531,7 +2666,13 @@ int run_pair_milestone_s(const std::string& rut_binary,
             return 1;
         }
         auto envoy_results = run_case_batch(listen_port1, cases);
-        envoy.stop();
+        if (!envoy.stop()) {
+            std::cerr << "FAIL: envoy exited unexpectedly before teardown ("
+                      << envoy.unexpected_exit_description << ")\n";
+            dump_log(envoy.log_path);
+            upstream.stop();
+            return 1;
+        }
         if (!fill_upstream_bytes(&envoy_results, cases, upstream)) {
             upstream.stop();
             return 1;
@@ -2624,7 +2765,12 @@ int run_pair_milestone_s(const std::string& rut_binary,
         if (!run_client_case(listen_port2, spec, &c.envoy))
             std::cerr << "WARN: case connect_failure (envoy) exchange did not complete cleanly\n";
         c.envoy.name = "connect_failure";
-        envoy.stop();
+        if (!envoy.stop()) {
+            std::cerr << "FAIL: envoy exited unexpectedly before teardown ("
+                      << envoy.unexpected_exit_description << ")\n";
+            dump_log(envoy.log_path);
+            return 1;
+        }
         if (!wait_port_closed(listen_port2, 5000)) {
             std::cerr << "FAIL: listener port " << listen_port2
                       << " did not become free after stopping Envoy\n";
@@ -3828,6 +3974,62 @@ bool self_test_rut_early_exit_detected() {
     return ok;
 }
 
+// Round-6 review, "Verify the status reaped after signaling RUT": the
+// precheck exercised above only catches a child that had already exited
+// before stop() ever signaled it. This exercises the status-verification
+// logic that guards the rest of stop()'s reap: a script that traps SIGTERM
+// and exits 0 -- the exact shape rut's own graceful shutdown produces
+// (src/main.cc blocks SIGTERM/SIGINT, drains, then returns 0) -- must be
+// reported as a clean teardown, while one that traps SIGTERM but exits
+// nonzero (it "handled" the signal, but not the way an intentional teardown
+// of rut itself would) must not, even though waitpid() reaps a normal exit
+// either way.
+bool self_test_rut_stop_verifies_exit_status() {
+    const std::string dir = make_temp_dir("rut-diff-selftest-stop");
+    if (dir.empty()) {
+        std::cerr << "FAIL [self-test rut stop status]: could not create temp directory\n";
+        return false;
+    }
+    auto run_case = [&](const char* script_body, bool expect_clean, const char* label) {
+        const std::string script = dir + "/" + label + ".sh";
+        if (!write_file_mode(script, script_body, 0755)) {
+            std::cerr << "FAIL [self-test rut stop status]: could not write " << label << ".sh\n";
+            return false;
+        }
+        RutInstance rut;
+        rut.log_path = "/dev/null";
+        if (!rut.launch(script, "unused.rut")) {
+            std::cerr << "FAIL [self-test rut stop status]: could not fork/exec " << label
+                      << ".sh\n";
+            return false;
+        }
+        // Give the script time to install its trap before stop() sends
+        // SIGTERM.
+        struct timespec ts{0, 100'000'000};
+        nanosleep(&ts, nullptr);
+        const bool stopped_cleanly = rut.stop();
+        bool ok = true;
+        if (stopped_cleanly != expect_clean) {
+            std::cerr << "FAIL [self-test rut stop status]: stop() for " << label << " returned "
+                      << (stopped_cleanly ? "clean" : "unexpected") << ", expected "
+                      << (expect_clean ? "clean" : "unexpected") << "\n";
+            ok = false;
+        }
+        if (rut.exited_unexpectedly == expect_clean) {
+            std::cerr << "FAIL [self-test rut stop status]: exited_unexpectedly for " << label
+                      << " is " << (rut.exited_unexpectedly ? "true" : "false") << ", expected "
+                      << (expect_clean ? "false" : "true") << "\n";
+            ok = false;
+        }
+        return ok;
+    };
+    bool ok = true;
+    ok &= run_case("#!/bin/sh\ntrap 'exit 0' TERM\nsleep 5\n", /*expect_clean=*/true, "clean");
+    ok &= run_case("#!/bin/sh\ntrap 'exit 7' TERM\nsleep 5\n", /*expect_clean=*/false, "dirty");
+    if (ok) std::cerr << "PASS [self-test rut stop status]\n";
+    return ok;
+}
+
 // Exercises the exact `compare_pair_case` path two identically-failed
 // exchanges would hit (e.g. a connection refused on both sides before a
 // single byte crossed the wire, leaving two equal empty buffers): it must
@@ -3846,6 +4048,58 @@ bool self_test_pair_both_failed_rejected() {
     }
     std::cerr << "PASS [self-test pair both-failed]\n";
     return true;
+}
+
+// Round-6 review, "Require expected upstream contact for forwarded cases":
+// if the recording upstream becomes unavailable, both proxies can answer a
+// forwarding case with matching, fully framed local error responses while
+// `upstream_contacted`/bytes stay equal (both empty) -- `compare_pair_case`
+// must not call that a MATCH for a case whose whole point is to exercise
+// forwarding.
+bool self_test_pair_unexercised_forwarding_rejected() {
+    PairCaseResult c;
+    c.name = "get_smoke";  // a forwarding case, not in the exempt list
+    c.asserted = true;
+    c.envoy.exchange_complete = true;
+    c.rut.exchange_complete = true;
+    c.envoy.downstream_bytes = c.rut.downstream_bytes = "HTTP/1.1 503 Service Unavailable\r\n\r\n";
+    // Both sides agree upstream was never contacted -- exactly the
+    // evidence-free shape that must not pass for a case expected to forward.
+    c.envoy.upstream_contacted = c.rut.upstream_contacted = false;
+    c.envoy.upstream_contact_count = c.rut.upstream_contact_count = 0;
+    const bool match = compare_pair_case(c);
+    if (match) {
+        std::cerr << "FAIL [self-test pair unexercised forwarding]: compare_pair_case matched a "
+                     "forwarding case with zero upstream contact on both sides\n";
+        return false;
+    }
+    std::cerr << "PASS [self-test pair unexercised forwarding]\n";
+    return true;
+}
+
+// Companion to the above: `options_star` and `connect_failure` are exempt
+// from the forwarding-contact requirement (Envoy never routes either one to
+// the upstream by design), so the same zero-contact shape must still MATCH
+// for them, proving the round-6 fix does not regress these two cases.
+bool self_test_pair_exempt_cases_zero_contact_matches() {
+    bool ok = true;
+    for (const char* name : {"options_star", "connect_failure"}) {
+        PairCaseResult c;
+        c.name = name;
+        c.asserted = true;
+        c.envoy.exchange_complete = true;
+        c.rut.exchange_complete = true;
+        c.envoy.downstream_bytes = c.rut.downstream_bytes = "HTTP/1.1 404 Not Found\r\n\r\n";
+        c.envoy.upstream_contacted = c.rut.upstream_contacted = false;
+        c.envoy.upstream_contact_count = c.rut.upstream_contact_count = 0;
+        if (!compare_pair_case(c)) {
+            std::cerr << "FAIL [self-test pair exempt zero-contact]: compare_pair_case rejected "
+                      << name << " despite zero upstream contact, which is expected for it\n";
+            ok = false;
+        }
+    }
+    if (ok) std::cerr << "PASS [self-test pair exempt zero-contact]\n";
+    return ok;
 }
 
 // Round-4 review: verifies the exact unblock mechanism
@@ -3974,6 +4228,98 @@ bool self_test_head_body_detected() {
     server.join();
     if (listen_fd >= 0) close(listen_fd);
     if (ok) std::cerr << "PASS [self-test head body]\n";
+    return ok;
+}
+
+// Round-6 review, "Check persistent responses for trailing wire bytes": for
+// a persistent (non-close) Content-Length-framed response, read_http_message
+// used to return {buf, true} the instant the advertised body length was
+// captured, with no check for the peer sending anything more -- unlike the
+// `Connection: close` branch immediately above it, which already required a
+// bounded EOF. Verifies both shapes directly: a persistent response
+// followed by erroneous trailing bytes in a later TCP segment must now be
+// reported incomplete, while an ordinary persistent response with no
+// trailing bytes must still be reported complete (no regression on the
+// common case every asserted persistent case, e.g. post_fixed/trace,
+// depends on).
+bool self_test_persistent_trailing_bytes_detected() {
+    auto run_case = [](bool send_trailing_garbage, const char* label) {
+        uint16_t port = 0;
+        if (!allocate_loopback_port(&port)) {
+            std::cerr << "FAIL [self-test " << label << "]: could not allocate a loopback port\n";
+            return false;
+        }
+        int listen_fd = socket(AF_INET, SOCK_STREAM, 0);
+        if (listen_fd < 0) {
+            std::cerr << "FAIL [self-test " << label << "]: could not create listening socket\n";
+            return false;
+        }
+        const int one = 1;
+        setsockopt(listen_fd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
+        sockaddr_in addr{};
+        addr.sin_family = AF_INET;
+        addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+        addr.sin_port = htons(port);
+        if (bind(listen_fd, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) != 0 ||
+            listen(listen_fd, 1) != 0) {
+            std::cerr << "FAIL [self-test " << label << "]: could not bind/listen\n";
+            close(listen_fd);
+            return false;
+        }
+        std::thread server([listen_fd, send_trailing_garbage] {
+            const int conn = accept(listen_fd, nullptr, nullptr);
+            if (conn < 0) return;
+            char buf[512];
+            recv(conn, buf, sizeof(buf), 0);  // discard the request
+            // No `Connection: close`: persistent framing, exactly the shape
+            // post_fixed/trace exercise.
+            const std::string resp = "HTTP/1.1 201 Created\r\nContent-Length: 2\r\n\r\nok";
+            send(conn, resp.data(), resp.size(), 0);
+            if (send_trailing_garbage) {
+                struct timespec delay{0, 20'000'000};
+                nanosleep(&delay, nullptr);
+                const std::string garbage = "oops!";
+                send(conn, garbage.data(), garbage.size(), 0);
+            }
+            struct timespec settle{0, 250'000'000};
+            nanosleep(&settle, nullptr);
+            close(conn);
+        });
+        bool ok = true;
+        const int fd = connect_with_timeout(port, kClientTimeoutMs);
+        if (fd < 0) {
+            std::cerr << "FAIL [self-test " << label << "]: could not connect\n";
+            ok = false;
+            shutdown(listen_fd, SHUT_RDWR);
+            close(listen_fd);
+            listen_fd = -1;
+        } else {
+            const std::string req =
+                "POST /x HTTP/1.1\r\nHost: t.example\r\nContent-Length: 0\r\n\r\n";
+            send_all(fd, req);
+            const ReadResult resp = read_http_message(fd, /*head_request=*/false, kClientTimeoutMs);
+            if (send_trailing_garbage && resp.complete) {
+                std::cerr << "FAIL [self-test " << label
+                          << "]: trailing bytes after a persistent response's declared "
+                             "Content-Length were not detected (reported complete)\n";
+                ok = false;
+            }
+            if (!send_trailing_garbage && !resp.complete) {
+                std::cerr << "FAIL [self-test " << label
+                          << "]: an ordinary persistent response with no trailing bytes was "
+                             "reported incomplete\n";
+                ok = false;
+            }
+            close(fd);
+        }
+        server.join();
+        if (listen_fd >= 0) close(listen_fd);
+        if (ok) std::cerr << "PASS [self-test " << label << "]\n";
+        return ok;
+    };
+    bool ok = true;
+    ok &= run_case(true, "persistent trailing bytes detected");
+    ok &= run_case(false, "persistent no trailing bytes");
     return ok;
 }
 
@@ -4200,9 +4546,13 @@ int run_self_test(const std::string& rut_binary, const std::string& converter_bi
     ok &= self_test_duplicate_upstream_rejected();
     ok &= self_test_unexpected_upstream_path_rejected();
     ok &= self_test_rut_early_exit_detected();
+    ok &= self_test_rut_stop_verifies_exit_status();
     ok &= self_test_pair_both_failed_rejected();
+    ok &= self_test_pair_unexercised_forwarding_rejected();
+    ok &= self_test_pair_exempt_cases_zero_contact_matches();
     ok &= self_test_accept_unblocks_on_shutdown_close();
     ok &= self_test_head_body_detected();
+    ok &= self_test_persistent_trailing_bytes_detected();
     if (!rut_binary.empty() && !converter_binary.empty()) {
         ok &= run_self_test_rut_pass(rut_binary, converter_binary);
     } else {
