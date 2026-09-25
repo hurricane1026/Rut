@@ -2433,6 +2433,48 @@ TEST(RirPrinter, FailurePolicyPrintsHeaderOrder) {
                  "connection=request, head_mode=reject, header_order=length_type_date_server"));
 }
 
+// Codex round-13 review: a hand-built or verifier-rejected module can carry a
+// forged failure-policy table (an out-of-range count, or a non-owning string
+// view like `reason = {nullptr, 1}`); print_module must never dereference
+// those views, and instead prints one safe `<invalid>` marker, mirroring
+// StrictLocalResponseForgedMetadataPrintsOneSafeMarker above.
+TEST(RirPrinter, FailurePolicyForgedMetadataPrintsOneSafeMarker) {
+    ForwardFailurePolicySpec policy{};
+    policy.version = ForwardFailurePolicyVersion::Http11;
+    policy.status_code = 502;
+    policy.date = ForwardFailurePolicyDate::Current;
+    policy.connection = ForwardFailurePolicyConnection::Request;
+    policy.head_mode = FailurePolicyHeadMode::Reject;
+    policy.header_order = FailurePolicyHeaderOrder::Synthesized;
+    policy.reason = {"Bad Gateway", 11};
+    policy.content_type = {"text/plain", 10};
+    policy.server = {"rut", 3};
+    policy.body = {"upstream error", 14};
+
+    auto check_marker = [&](const Module& mod) {
+        char data[256];
+        PrintBuf buf;
+        buf.init(data, sizeof(data), -1);
+        print_module(buf, mod);
+        CHECK_FALSE(buf.overflow);
+        const Str printed{buf.data, buf.len};
+        CHECK(printed.eq(lit("failure_policy_table: <invalid>\n")));
+    };
+    auto valid_module = [&]() {
+        Module mod{};
+        mod.failure_policies[0] = policy;
+        mod.failure_policy_count = 1;
+        return mod;
+    };
+
+    Module mod = valid_module();
+    mod.failure_policy_count = kMaxForwardFailurePolicies + 1;
+    check_marker(mod);
+    mod = valid_module();
+    mod.failure_policies[0].reason = {nullptr, 1};
+    check_marker(mod);
+}
+
 int main(int argc, char** argv) {
     return rut::test::run_all(argc, argv);
 }
