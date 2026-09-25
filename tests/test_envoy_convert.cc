@@ -1579,6 +1579,39 @@ TEST(envoy_convert, api_forged_model_rejected) {
     CHECK(forged_match_kind_result.error().code == FrontendError::UnexpectedToken);
     CHECK(to_string(forged_match_kind_result.error().detail).find("match kind is not recognized") !=
           std::string::npos);
+
+    // Codex round-10 review (P2): `FixedVec::len` (include/rut/common/types.h)
+    // is a public field with no accompanying bound check, and the
+    // fixed-capacity `data` array beneath it is only ever `Cap` (here
+    // `kMaxEnvoyClusters`) elements wide. `parse_clusters` never produces a
+    // `len` past that cap, but the public hand-built-model overload can set
+    // `model.clusters.len` to anything: the cluster-validation loop in
+    // `validate()` (src/envoy/converter.cc) would then index
+    // `model.clusters[i]` past the end of `data` before ever reaching the
+    // later "multiple clusters are not lowered yet" rejection -- undefined
+    // behavior, reproducible as an ASan stack-buffer-overflow. `validate()`
+    // now rejects an out-of-bounds count before that loop ever runs.
+    envoy::Bootstrap forged_cluster_count = parsed.value();
+    forged_cluster_count.clusters.len = envoy::kMaxEnvoyClusters + 1u;
+    const auto forged_cluster_count_result = envoy::lower_to_rut(forged_cluster_count, all_true);
+    CHECK_FALSE(forged_cluster_count_result);
+    CHECK(forged_cluster_count_result.error().code == FrontendError::UnexpectedToken);
+    CHECK(to_string(forged_cluster_count_result.error().detail)
+              .find("cluster count exceeds the bounded capacity") != std::string::npos);
+
+    // Same hazard, applied to the public routes vector: a hand-built
+    // `Bootstrap` with `virtual_host.routes.len` set past `kMaxEnvoyRoutes`
+    // would run any per-route loop (and `virtual_host.routes[1]` in the
+    // "multiple routes" rejection above) past the end of the
+    // `kMaxEnvoyRoutes`-wide `data` array. Reject it before that happens.
+    envoy::Bootstrap forged_route_count = parsed.value();
+    forged_route_count.listener.filter_chain.hcm.route_config.virtual_host.routes.len =
+        envoy::kMaxEnvoyRoutes + 1u;
+    const auto forged_route_count_result = envoy::lower_to_rut(forged_route_count, all_true);
+    CHECK_FALSE(forged_route_count_result);
+    CHECK(forged_route_count_result.error().code == FrontendError::UnexpectedToken);
+    CHECK(to_string(forged_route_count_result.error().detail)
+              .find("route count exceeds the bounded capacity") != std::string::npos);
 }
 
 // ── Increment 4: reject route lists / direct_response / redirect before the

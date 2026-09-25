@@ -222,6 +222,23 @@ FrontendResult<bool> validate(const Bootstrap& model, const RutCapabilities& cap
     const VirtualHost& virtual_host = hcm.route_config.virtual_host;
     if (model.listener.address.port == 0u)
         return invalid(model.listener.address.span, lit_str("listener port must be non-zero"));
+    // Codex round-10 review: `FixedVec::len` (include/rut/common/types.h) is
+    // a public field with no accompanying bound check, and the
+    // fixed-capacity `data` array beneath it is only ever `Cap` (here
+    // `kMaxEnvoyClusters`/`kMaxEnvoyRoutes`) elements wide. `parse_clusters`/
+    // `parse_routes` (src/envoy/parser.cc) never produce a `len` past their
+    // respective caps, but the public hand-built-model overload can set
+    // `model.clusters.len` or `virtual_host.routes.len` to anything: the
+    // cluster loop immediately below indexes `model.clusters[i]` for every
+    // `i` up to `model.clusters.len`, so an oversized forged count runs that
+    // loop past the end of `data` -- undefined behavior, reproducible as an
+    // ASan stack-buffer-overflow -- before the `len > 1u` "not lowered yet"
+    // rejection further down ever gets a chance to run. Reject both
+    // out-of-bounds counts here, before any loop over either vector.
+    if (model.clusters.len > kMaxEnvoyClusters)
+        return invalid(model.span, lit_str("cluster count exceeds the bounded capacity"));
+    if (virtual_host.routes.len > kMaxEnvoyRoutes)
+        return invalid(virtual_host.span, lit_str("route count exceeds the bounded capacity"));
     // PR #692 round-15 review: `listener.name` and `hcm.route_config.name`
     // are optional (`name_string(..., allow_empty=true)`,
     // src/envoy/parser.cc:350-352 and :538-540) but the parser still bounds
