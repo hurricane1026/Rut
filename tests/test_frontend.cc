@@ -37163,6 +37163,35 @@ TEST(frontend, exact_local_response_syntax_and_selector_rejection_matrix) {
     REQUIRE(generic_lexed);
     CHECK_FALSE(parse_file_heap(generic_lexed.value()).has_value());
 
+    // DESIGN.md §3.3.5.1: the optional method precedes the exact path
+    // (`route exact GET "/healthz"`, either method case). The path-first
+    // spelling `route exact "/healthz" GET` parses the string literal as an
+    // ANY-method selector and is rejected at the trailing method token, where
+    // the policy block's opening brace is expected.
+    for (const char* method : {"GET", "get"}) {
+        const std::string path_first = source_for("\"/healthz\" " + std::string(method));
+        auto path_first_lexed = lex({path_first.data(), static_cast<u32>(path_first.size())});
+        REQUIRE(path_first_lexed);
+        auto rejected = parse_file_heap(path_first_lexed.value());
+        REQUIRE_FALSE(rejected);
+        CHECK_EQ(rejected.error().code, FrontendError::UnexpectedToken);
+        const std::size_t method_at = path_first.find(method, path_first.find("/healthz\""));
+        REQUIRE(method_at != std::string::npos);
+        CHECK_EQ(rejected.error().span.start, static_cast<u32>(method_at));
+        CHECK_EQ(rejected.error().span.line, 1u);
+        CHECK_EQ(rejected.error().span.col, static_cast<u32>(method_at + 1u));
+
+        const std::string method_first =
+            source_for(std::string(method) + " \"/healthz\"", "reject");
+        auto method_first_lexed = lex({method_first.data(), static_cast<u32>(method_first.size())});
+        REQUIRE(method_first_lexed);
+        auto accepted = parse_file_heap(method_first_lexed.value());
+        REQUIRE(accepted);
+        REQUIRE_EQ(accepted->exact_strict_local_response_bindings.len, 1u);
+        CHECK_EQ(accepted->exact_strict_local_response_bindings[0].method, kRouteMethodGet);
+        CHECK_EQ(accepted->exact_strict_local_response_bindings[0].path_len, 8u);
+    }
+
     const std::string normalized_invalid[] = {
         "slash_normalized \"/\"",
         "slash_normalized \"//health\"",
