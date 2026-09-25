@@ -10,6 +10,7 @@
 #include <thread>
 #include <vector>
 
+#include <dirent.h>
 #include <fcntl.h>
 #include <signal.h>
 #include <sys/stat.h>
@@ -165,11 +166,51 @@ RunResult run_converter(const char* executable, const std::string& input) {
     return run_with_args(executable, {"--format", "bootstrap-json", input});
 }
 
-std::string make_temp_dir() {
-    char pattern[] = "/tmp/rut-envoy-convert-XXXXXX";
-    char* path = mkdtemp(pattern);
-    return path == nullptr ? std::string{} : std::string(path);
-}
+// RAII temp directory: `mkdtemp`s a fresh `/tmp/rut-envoy-convert-XXXXXX` on
+// construction and, on destruction, unlinks every entry directly inside it
+// (this suite never creates subdirectories, so a flat scan is enough) before
+// `rmdir`ing the directory itself. Every `TEST` below used to call a bare
+// `make_temp_dir()` with no matching cleanup, leaking one directory (plus
+// whatever JSON/fifo/etc. it wrote) per run — 1044 stale
+// `/tmp/rut-envoy-convert-*` directories had accumulated from prior test
+// runs before this fix. Non-copyable/movable: exactly one directory per
+// instance, removed exactly once.
+class TempDir {
+public:
+    TempDir() {
+        char pattern[] = "/tmp/rut-envoy-convert-XXXXXX";
+        char* result = mkdtemp(pattern);
+        if (result != nullptr) path_ = result;
+    }
+
+    ~TempDir() { remove_all(); }
+
+    TempDir(const TempDir&) = delete;
+    TempDir& operator=(const TempDir&) = delete;
+    TempDir(TempDir&&) = delete;
+    TempDir& operator=(TempDir&&) = delete;
+
+    [[nodiscard]] bool ok() const { return !path_.empty(); }
+    [[nodiscard]] const std::string& path() const { return path_; }
+
+private:
+    void remove_all() {
+        if (path_.empty()) return;
+        DIR* dir = opendir(path_.c_str());
+        if (dir != nullptr) {
+            struct dirent* entry;
+            while ((entry = readdir(dir)) != nullptr) {
+                const std::string name = entry->d_name;
+                if (name == "." || name == "..") continue;
+                unlink((path_ + "/" + name).c_str());
+            }
+            closedir(dir);
+        }
+        rmdir(path_.c_str());
+    }
+
+    std::string path_;
+};
 
 std::string expected_location(const std::string& path, Span span) {
     char buf[512];
@@ -284,8 +325,9 @@ std::string milestone_s_json(const char* listener_address = "0.0.0.0") {
 // ── CLI ─────────────────────────────────────────────────────────────
 
 TEST(envoy_convert, cli_usage_errors) {
-    const std::string directory = make_temp_dir();
-    REQUIRE_FALSE(directory.empty());
+    const TempDir temp_dir;
+    REQUIRE(temp_dir.ok());
+    const std::string& directory = temp_dir.path();
     const std::string path = directory + "/input.json";
     REQUIRE(write_file(path, milestone_s_json()));
 
@@ -309,8 +351,9 @@ TEST(envoy_convert, cli_usage_errors) {
 }
 
 TEST(envoy_convert, cli_input_errors) {
-    const std::string directory = make_temp_dir();
-    REQUIRE_FALSE(directory.empty());
+    const TempDir temp_dir;
+    REQUIRE(temp_dir.ok());
+    const std::string& directory = temp_dir.path();
 
     const RunResult missing = run_converter(g_executable, directory + "/does-not-exist.json");
     REQUIRE(WIFEXITED(missing.status));
@@ -384,8 +427,9 @@ TEST(envoy_convert, cli_input_errors) {
 // diagnostic — is a torn read the TOCTOU check let through and must fail
 // this test.
 TEST(envoy_convert, cli_input_toctou_same_size_rewrite_never_admits_torn_read) {
-    const std::string directory = make_temp_dir();
-    REQUIRE_FALSE(directory.empty());
+    const TempDir temp_dir;
+    REQUIRE(temp_dir.ok());
+    const std::string& directory = temp_dir.path();
     const std::string path = directory + "/racing.json";
 
     std::string base = milestone_s_json();
@@ -465,8 +509,9 @@ TEST(envoy_convert, cli_input_toctou_same_size_rewrite_never_admits_torn_read) {
 }
 
 TEST(envoy_convert, cli_parse_error_is_source_located) {
-    const std::string directory = make_temp_dir();
-    REQUIRE_FALSE(directory.empty());
+    const TempDir temp_dir;
+    REQUIRE(temp_dir.ok());
+    const std::string& directory = temp_dir.path();
     std::string text = milestone_s_json();
     const std::string marker = "\"static_resources\": {";
     const auto pos = text.find(marker);
@@ -491,8 +536,9 @@ TEST(envoy_convert, cli_parse_error_is_source_located) {
 }
 
 TEST(envoy_convert, cli_milestone_s_fails_closed_with_request_gap) {
-    const std::string directory = make_temp_dir();
-    REQUIRE_FALSE(directory.empty());
+    const TempDir temp_dir;
+    REQUIRE(temp_dir.ok());
+    const std::string& directory = temp_dir.path();
     const std::string text = milestone_s_json();
     const std::string path = directory + "/milestone.json";
     REQUIRE(write_file(path, text));
@@ -797,7 +843,10 @@ TEST(envoy_convert, api_forged_model_rejected) {
 }
 
 int main(int argc, char** argv) {
-    if (argc != 2) return 2;
+    if (argc != 2) {
+        fprintf(stderr, "usage: test_envoy_convert <path to rut-envoy-convert>\n");
+        return 2;
+    }
     g_executable = argv[1];
     return rut::test::run_all(1, argv);
 }
