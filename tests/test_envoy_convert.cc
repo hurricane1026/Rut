@@ -642,6 +642,39 @@ TEST(envoy_convert, api_all_capabilities_matches_golden) {
     CHECK(lowered_after_mutation.value().view().eq(golden));
 }
 
+// PR #692 round-7 review: the milestone bootstrap's HCM requires
+// `codec_type: "HTTP1"`, so the h2c-preface divergence
+// (docs/envoy-compatibility.md, "HTTP1-only HCM rejects a client that opens
+// with the h2c connection preface") is not gated behind a `RutCapabilities`
+// flag; `rut-envoy-convert` instead accepts and warns on stderr after a
+// successful conversion (src/envoy/main.cc, `warn_h2c_preface`), same as the
+// `connect_timeout` divergence. The real CLI binary can't reach that print
+// today (`kShippedRutCapabilities` is still all-false, so every real
+// conversion fails closed before reaching it — see
+// cli_milestone_s_fails_closed_with_request_gap above), so this test asserts
+// the library-level predicate and message the CLI calls, and confirms the
+// milestone fixture keeps lowering to the unchanged golden RUT text once all
+// three capabilities land.
+TEST(envoy_convert, api_milestone_needs_h2c_preface_warning) {
+    const std::string text = milestone_s_json();
+    static envoy::JsonDocument doc;
+    auto parsed = envoy::parse_bootstrap_json(str(text), doc);
+    REQUIRE(parsed);
+    CHECK(parsed.value().listener.filter_chain.hcm.codec_type == envoy::CodecType::Http1);
+    CHECK(envoy::needs_h2c_preface_warning(parsed.value()));
+
+    const envoy::RutCapabilities all_true = all_capabilities_true();
+    auto lowered = envoy::lower_to_rut(parsed.value(), all_true);
+    REQUIRE(lowered);
+    const Str golden = lit_str(kEnvoyMilestoneSGolden);
+    CHECK(lowered.value().view().eq(golden));
+
+    const std::string warning_text(envoy::kH2cPrefaceWarningText);
+    CHECK(warning_text.find("h2c connection preface") != std::string::npos);
+    CHECK(warning_text.find("HTTP1") != std::string::npos);
+    CHECK(warning_text.find("docs/envoy-compatibility.md") != std::string::npos);
+}
+
 TEST(envoy_convert, api_exact_listener_address) {
     const std::string text = milestone_s_json("127.0.0.1");
     static envoy::JsonDocument doc;

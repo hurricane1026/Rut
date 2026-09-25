@@ -359,4 +359,8 @@ FrontendResult<RutSource> lower_to_rut(const Bootstrap& model) {
     return lower_to_rut(model, kShippedRutCapabilities);
 }
 
+bool needs_h2c_preface_warning(const Bootstrap& model) {
+    return model.listener.filter_chain.hcm.codec_type == CodecType::Http1;
+}
+
 }  // namespace rut::envoy

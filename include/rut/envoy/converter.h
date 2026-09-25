@@ -45,4 +45,34 @@ FrontendResult<RutSource> lower_to_rut(const Bootstrap& model);
 // `RutCapabilities`.
 FrontendResult<RutSource> lower_to_rut(const Bootstrap& model, const RutCapabilities& capabilities);
 
+// PR #692 round-7 review: whether `model`'s accepted bootstrap requires the
+// h2c-preface disclaimer that `rut-envoy-convert` prints on stderr after a
+// successful conversion (src/envoy/main.cc). `codec_type: "HTTP1"` is
+// required by the parser (`Bootstrap::listener.filter_chain.hcm.codec_type`
+// is always `CodecType::Http1` after a successful parse — see
+// `include/rut/envoy/parser.h`), so this is always true today; it stays an
+// explicit predicate rather than an unconditional print so a future codec
+// type (or a listener-protocol capability, if one is ever added) has
+// somewhere to change the answer, and so tests can assert the condition
+// without needing the shipped, still-all-false `RutCapabilities` to be true.
+//
+// This is deliberately NOT a `RutCapabilities` gate: Rut's cleartext `listen`
+// has no knob to disable h2c-preface detection at all
+// (`include/rut/runtime/callbacks_impl.h`, `on_header_received`), so gating
+// would fail closed on every milestone bootstrap for a per-connection client
+// shape, not a configuration Rut cannot express. The divergence is recorded
+// as `BLOCKED_BY_RUT` in docs/envoy-compatibility.md, "HTTP1-only HCM rejects
+// a client that opens with the h2c connection preface", and closing it needs
+// a listener protocol option in Rut, not a capability flag here.
+bool needs_h2c_preface_warning(const Bootstrap& model);
+
+// Text of the stderr warning described above. Exposed (rather than kept a
+// literal `static` in src/envoy/main.cc, the way the sibling
+// `connect_timeout` warning is) so tests can assert its exact wording.
+inline constexpr const char* kH2cPrefaceWarningText =
+    "warning: generated listen still accepts the h2c connection preface and serves HTTP/2 even "
+    "though this bootstrap's codec_type is \"HTTP1\"; Envoy's HTTP1 codec would reject such a "
+    "client before routing (see docs/envoy-compatibility.md, \"HTTP1-only HCM rejects a client "
+    "that opens with the h2c connection preface\")\n";
+
 }  // namespace rut::envoy

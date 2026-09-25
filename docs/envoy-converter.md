@@ -145,6 +145,20 @@ protocol restriction is a runtime/language change out of this increment's
 scope (AGENTS.md: don't add new keywords/knobs without weighing whether
 existing surface is insufficient first).
 
+This is deliberately not a `RutCapabilities` gate (PR #692 round-7 review):
+every milestone bootstrap's HCM requires `codec_type: "HTTP1"`, so a capability
+gate here would fail closed on every conversion, not just the ones that meet
+an h2c client — the divergence only matters for a client that opens with the
+h2c preface, a per-connection shape, not a configuration Rut cannot express.
+Instead `rut-envoy-convert` accepts and prints a stderr warning after a
+successful conversion (same style as the `connect_timeout` warning, D2
+above): "warning: generated listen still accepts the h2c connection preface
+and serves HTTP/2 even though this bootstrap's codec_type is \"HTTP1\";
+Envoy's HTTP1 codec would reject such a client before routing (see
+docs/envoy-compatibility.md, \"HTTP1-only HCM rejects a client that opens
+with the h2c connection preface\")". Closing the gap for real needs a listener
+protocol option in Rut, not a converter-side gate.
+
 Support for arbitrary bootstrap files is not implied. An `admin` block, a
 `node` block, `dynamic_resources`, `layered_runtime`, `stats_sinks`,
 `overload_manager`, `tracing`, and every other top-level field are rejected in
@@ -980,7 +994,10 @@ Each needs its own issue before the corresponding row can leave
   Envoy HCM with `codec_type: "HTTP1"` rejects a client that opens with the
   preface; the lowered Rut listener accepts it. Verified against a live `rut`
   process (raw preface + `SETTINGS` frame answered with an HTTP/2 `SETTINGS`
-  frame).
+  frame). This is permissive, not fail-closed: `rut-envoy-convert` proceeds
+  and prints a stderr warning rather than gating the whole conversion behind
+  a `RutCapabilities` flag, since the divergence is a per-connection client
+  shape, not a configuration Rut cannot express (PR #692 round-7 review).
 - Non-content-length request/response body framing: `request_policy` has no
   surface admitting `Transfer-Encoding` on the client request, and
   `response_policy.framing` (`include/rut/common/response_policy.h`,

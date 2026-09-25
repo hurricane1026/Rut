@@ -198,6 +198,21 @@ void warn_connect_timeout(rut::Str timeout_text) {
                "timeout surface); the value is accepted but not enforced\n");
 }
 
+// PR #692 round-7 review: an Envoy HCM with `codec_type: "HTTP1"` (required
+// by the parser, see include/rut/envoy/parser.h) rejects a client that opens
+// with the h2c connection preface before routing; the emitted Rut `listen`
+// has no protocol knob and always recognizes the preface and upgrades
+// (`on_header_received`, include/rut/runtime/callbacks_impl.h). This is not
+// gated behind a `RutCapabilities` flag: doing so would fail closed on every
+// milestone bootstrap over a per-connection client shape, not a
+// configuration Rut cannot express (docs/envoy-compatibility.md,
+// "HTTP1-only HCM rejects a client that opens with the h2c connection
+// preface", already `BLOCKED_BY_RUT`). Accept, but say so on stderr, the
+// same way `warn_connect_timeout` above does for its own gap.
+void warn_h2c_preface() {
+    write_cstr(STDERR_FILENO, rut::envoy::kH2cPrefaceWarningText);
+}
+
 int usage(const char* program) {
     write_cstr(STDERR_FILENO, "usage: ");
     write_cstr(STDERR_FILENO, program);
@@ -239,6 +254,7 @@ int main(int argc, char** argv) {
         return 1;
     }
     warn_connect_timeout(parsed.value().cluster.connect_timeout.text);
+    if (rut::envoy::needs_h2c_preface_warning(parsed.value())) warn_h2c_preface();
 
     static rut::envoy::RutSource output;
     output = lowered.value();
