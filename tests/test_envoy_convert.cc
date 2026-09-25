@@ -658,6 +658,19 @@ std::string sim_dispatch(const std::vector<SimRoute>& routes, const std::string&
 // text itself, then re-running the SAME node-selection rule (`sim_is_under`,
 // already used to check `rut_dispatch` isn't just `sim_dispatch` again) over
 // that PARSED structure.
+//
+// Scope limit (Codex P1 on PR #695 round 4): `sim_is_under`'s node selection
+// is this test's OWN segment-aware model, not the real RUT compiler's
+// dispatch engine. It proves `build_node_plan`'s if/else arm logic is
+// correct GIVEN a segment-aware node lookup -- including the `/apix` /
+// `/api.` / `/api/` boundary probes below, which stay on the `"/"` node
+// rather than falsely reaching `"/api"` -- but it cannot prove which engine
+// (`RouteTrie` vs `ART`) the compiled module actually gets, because it never
+// builds a real `RouteConfig` or calls `configure_route_dispatch`
+// (`include/rut/runtime/compile_to_config.h`). That selection is a separate,
+// confirmed divergence tracked in docs/envoy-compatibility.md ("Segment-
+// boundary dispatch") and in the algorithm doc comment above
+// `build_node_plan`, src/envoy/converter.cc -- out of this file's reach.
 
 // One `\` or `"` byte unescaped (inverse of `Writer::put_escaped`,
 // src/envoy/converter.cc); every prefix/path in the fixtures below is
@@ -1459,51 +1472,33 @@ TEST(envoy_convert, api_all_capabilities_matches_golden) {
     REQUIRE(*lowered_again);
     CHECK((*lowered_again).value().view().eq(golden));
 
-    // Overwriting the JSON source after lowering must not change output
-    // bytes: `validate` still needs to read the borrowed router-name and
-    // network-filter-name bytes (it must, to fail closed when hand-built
-    // content no longer matches its modeled shape; see
-    // `api_forged_model_rejected`'s `forged_router_name`/`cleared_typed_config`,
-    // added by PR #692 round-4's check that the router filter name is
-    // exactly "envoy.filters.http.router", and `forged_filter_name`/
-    // `cleared_filter_name`, added by round-5's check that the network
-    // filter name is exactly
-    // "envoy.filters.network.http_connection_manager"). PR #692 round-3's
-    // defensive `match.prefix == "/"` check no longer applies now that PR8
-    // lowers arbitrary declared prefixes by construction (see the algorithm
-    // doc comment in src/envoy/converter.cc), so this single-route,
-    // root-only shape no longer needs to preserve the route-match prefix or
-    // cluster-name bytes: no borrowed source text besides the router name
-    // and network filter name reaches the emitted RUT for it, only numeric
-    // model fields and the grammar-guaranteed root literal do. PR8's
-    // multi-route lowering (the envoy_routes_<letter> goldens below)
-    // intentionally emits real borrowed path/prefix text and is not held to
-    // this invariant. Round-12's `load_assignment.cluster_name == name`
-    // revalidation (`renamed_cluster_stale_load_assignment`,
-    // `api_forged_model_rejected`) doesn't need its own kept span here
-    // either: `name`/`action.cluster`/`load_assignment_name` all corrupt to
-    // the same fixed-length run of 'x' bytes (parsing already required them
-    // equal in both length and content), so any two of them remain equal to
-    // each other after the uniform byte-for-byte overwrite below, and the
-    // equality/declared-cluster checks still pass.
+    // Overwriting the JSON source after lowering, for a `Bootstrap` copy
+    // whose Str views still borrow that now-mutated buffer, must fail
+    // closed rather than silently keep routing as root or silently accept a
+    // forged router filter identity. Before Codex P2 on PR #695 round 4,
+    // `validate()`'s one-byte-prefix check was length-only, so
+    // `strip_trailing_slash` (src/envoy/converter.cc) treated ANY length-1
+    // prefix as the literal "/" regardless of its actual byte -- this test
+    // used to assert that mutating the buffer to all 'x' left the golden
+    // output unchanged for exactly that reason. `validate()` now checks the
+    // byte too (the same fix that rejects a hand-built one-byte prefix that
+    // isn't "/", see `api_forged_model_rejected`'s
+    // `one_byte_non_slash_prefix`), so the mutated prefix ("x", not "/") is
+    // correctly rejected instead of silently matched as root: the old
+    // "immune to post-parse mutation" behavior was the bug, not a feature
+    // worth preserving. (The mutated router filter name -- also no longer
+    // "envoy.filters.http.router" -- and the mutated network filter name --
+    // also no longer "envoy.filters.network.http_connection_manager" --
+    // would independently fail closed too, per PR #692 round-4's and
+    // round-5's checks respectively; the prefix check simply fires first.)
+    // PR8's multi-route lowering (the envoy_routes_<letter> goldens below)
+    // already emits real borrowed path/prefix text and was never held to
+    // the old invariant either.
     const envoy::Bootstrap model_copy = parsed.value();
-    const Span kept_spans[] = {
-        model_copy.listener.filter_chain.hcm.router.name_span,
-        model_copy.listener.filter_chain.filter_name_span,
-    };
-    for (size_t i = 0; i < text.size(); i++) {
-        bool keep = false;
-        for (const Span& s : kept_spans) {
-            if (i >= s.start && i < s.end) {
-                keep = true;
-                break;
-            }
-        }
-        if (!keep) text[i] = 'x';
-    }
+    for (char& c : text) c = 'x';
     auto lowered_after_mutation = lower_heap(model_copy, all_true);
-    REQUIRE(*lowered_after_mutation);
-    CHECK((*lowered_after_mutation).value().view().eq(golden));
+    REQUIRE_FALSE(*lowered_after_mutation);
+    CHECK_EQ(lowered_after_mutation->error().code, FrontendError::UnexpectedToken);
 }
 
 // PR #692 round-7 review: the milestone bootstrap's HCM requires
@@ -2003,6 +1998,47 @@ TEST(envoy_convert, api_forged_model_rejected) {
     CHECK(forged_route_count_result.error().code == FrontendError::UnexpectedToken);
     CHECK(to_string(forged_route_count_result.error().detail)
               .find("route count exceeds the bounded capacity") != std::string::npos);
+
+    // A one-byte prefix that is not "/" bypasses the parser's
+    // `prefix_shape_ok` (which requires a length-1 prefix to literally BE
+    // "/", by content, not merely by length). Before the fix, `shape_ok`
+    // here checked length only, so this backed, non-"/" one-byte prefix was
+    // silently accepted and `strip_trailing_slash` treated it as root
+    // (Codex P2 on PR #695 round 4).
+    envoy::Bootstrap one_byte_non_slash_prefix = parsed.value();
+    one_byte_non_slash_prefix.listener.filter_chain.hcm.route_config.virtual_host.routes[0]
+        .match.prefix = lit_str("x");
+    CHECK_FALSE(envoy::lower_to_rut(one_byte_non_slash_prefix, all_true));
+
+    // A direct-model `Str{nullptr, 1}` one-byte prefix must also fail
+    // closed rather than dereference `ptr[0]` (the same finding: the
+    // pre-fix `shape_ok` never checked `ptr != nullptr` for the length-1
+    // case either).
+    envoy::Bootstrap null_one_byte_prefix = parsed.value();
+    null_one_byte_prefix.listener.filter_chain.hcm.route_config.virtual_host.routes[0]
+        .match.prefix = Str{nullptr, 1u};
+    CHECK_FALSE(envoy::lower_to_rut(null_one_byte_prefix, all_true));
+
+    // A hand-built exact path containing a byte (`"`) the RUT lexer treats
+    // as an escape introducer bypasses the parser's `validate_route_match_
+    // bytes`/`plain_string` (which rejects any JSON string with an escape
+    // outright). Before the fix, `put_escaped` silently inserted a `\`
+    // before this byte, changing the runtime string's byte content instead
+    // of preserving it (Codex P2 on PR #695 round 4).
+    envoy::Bootstrap quote_byte_path = parsed.value();
+    quote_byte_path.listener.filter_chain.hcm.route_config.virtual_host.routes[0].match.kind =
+        envoy::RouteMatchKind::Path;
+    quote_byte_path.listener.filter_chain.hcm.route_config.virtual_host.routes[0].match.path =
+        Str{"/a\"b", 4u};
+    CHECK_FALSE(envoy::lower_to_rut(quote_byte_path, all_true));
+
+    // Same for a literal backslash byte.
+    envoy::Bootstrap backslash_byte_path = parsed.value();
+    backslash_byte_path.listener.filter_chain.hcm.route_config.virtual_host.routes[0].match.kind =
+        envoy::RouteMatchKind::Path;
+    backslash_byte_path.listener.filter_chain.hcm.route_config.virtual_host.routes[0].match.path =
+        Str{"/a\\b", 4u};
+    CHECK_FALSE(envoy::lower_to_rut(backslash_byte_path, all_true));
 }
 
 TEST(envoy_convert, colon_segment_allowed_in_exact_path_with_root_prefix) {
@@ -2350,45 +2386,14 @@ TEST(envoy_convert, brute_force_equivalence_ordered_route_list) {
         cluster_names.push_back(to_string(parsed.value().clusters[i].name));
 
     const std::vector<std::string> probes = {
-        "/",
-        "/healthz",
-        "/healthzz",
-        "/health",
-        "/api",
-        "/api/",
-        "/api/x",
-        "/api/y",
-        "/api/x/",
-        "/api/x/y",
-        "/apiz",
-        "/apix",
-        "/api2",
-        "/api/v1",
-        "/api/v1/",
-        "/api/v1/foo",
-        "/api/v1x",
-        "/api/v10",
-        "/api/v1/foo/bar",
-        "/other",
-        "/a",
-        "/ap",
-        "/apihealthz",
-        "/healthz/x",
-        "/api/xx",
-        "/api/x2",
-        "/api//x",
-        "/API",
-        "/API/X",
-        "/api/v1/v1",
-        "/api/health",
-        "/health/api",
-        "/api/v",
-        "/api/v1/healthz",
-        "/apixx",
-        "//",
-        "/api/./x",
-        "/api/../x",
-        "/very/long/unrelated/path",
+        "/",          "/healthz",    "/healthzz",   "/health",     "/api",
+        "/api/",      "/api/x",      "/api/y",      "/api/x/",     "/api/x/y",
+        "/apiz",      "/apix",       "/api.",       "/api2",       "/api/v1",
+        "/api/v1/",   "/api/v1/foo", "/api/v1x",    "/api/v10",    "/api/v1/foo/bar",
+        "/other",     "/a",          "/ap",         "/apihealthz", "/healthz/x",
+        "/api/xx",    "/api/x2",     "/api//x",     "/API",        "/API/X",
+        "/api/v1/v1", "/api/health", "/health/api", "/api/v",      "/api/v1/healthz",
+        "/apixx",     "//",          "/api/./x",    "/api/../x",   "/very/long/unrelated/path",
         "/api/x/",
     };
     REQUIRE(probes.size() >= 40u);
