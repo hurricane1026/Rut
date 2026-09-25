@@ -875,9 +875,16 @@ bool pipeline_stash(Connection& conn);
 PipelineTransitionResult pipeline_recover(Connection& conn, bool count_transition = true);
 void capture_stage_headers(Connection& conn);
 const char* status_reason(u16 code);
-// Envoy H1 profile: like `status_reason` above, but fails closed (returns
-// false) for a code with no canonical table entry instead of falling back to
-// the "Unknown" placeholder reason phrase used by the legacy formatters.
+// Envoy H1 profile: full `CodeUtility::toString` phrase table
+// (source/common/http/codes.cc, Envoy v1.39.1), independent of the much
+// narrower `status_reason` table above used by the legacy local-response
+// formatters. Covers every status the `header_order: "upstream"` admission
+// in `build_upstream_order_response_headers` accepts (200..599 minus the
+// no-body exclusions 204/205/304): every code Envoy names gets its exact
+// phrase, and any admitted-but-unnamed code (e.g. 299) gets "Unknown" --
+// mirroring `CodeUtility::toString`'s own fallthrough for an unmatched
+// `Code` value -- rather than being rejected. Only fails (returns false)
+// when `out` is null; every `u16` code otherwise gets a phrase.
 bool canonical_status_reason(u16 code, Str* out);
 void format_static_response(Connection& conn, u16 code, bool keep_alive);
 // Custom-body variant: writes status line + Content-Length matching

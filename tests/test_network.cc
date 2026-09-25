@@ -2024,6 +2024,198 @@ TEST(response_policy, upstream_header_order_rejects_duplicate_of_every_inline_he
     CHECK(admits("HTTP/1.1 200 OK\r\nx-custom: a\r\nContent-Length: 2\r\nx-custom: b\r\n\r\nhi"));
 }
 
+// Codex round-11 review (PR #698, thread PRRT_kwDORsELtc6mJf61): the
+// `header_order: "upstream"` admission in `build_upstream_order_response_headers`
+// accepts every status 200..599 except the no-body codes 204/205/304, but
+// `canonical_status_reason` used to delegate to the much narrower legacy
+// `status_reason` table (14 codes) and fail closed on anything it didn't
+// name -- so an admitted status like 202, 206, 307, 308, 409, 422, or 504
+// was silently rejected (502) instead of forwarded with its canonical
+// phrase. This table is copied independently from Envoy's own
+// `CodeUtility::toString` (source/common/http/codes.cc, v1.39.1) rather than
+// calling `canonical_status_reason` for the expected value, so the test
+// cannot pass merely by reflecting whatever the implementation does; a
+// status Envoy's switch does not name falls back to "Unknown", matching
+// `CodeUtility::toString`'s own fallthrough.
+TEST(response_policy, upstream_header_order_canonical_reason_covers_admitted_domain) {
+    struct Expected {
+        u16 code;
+        const char* reason;
+    };
+    // Every case in Envoy's `CodeUtility::toString` switch (envoy/http/codes.h
+    // for the numeric values, source/common/http/codes.cc for the phrases).
+    static const Expected kEnvoyNamed[] = {
+        {100, "Continue"},
+        {101, "Switching Protocols"},
+        {200, "OK"},
+        {201, "Created"},
+        {202, "Accepted"},
+        {203, "Non-Authoritative Information"},
+        {204, "No Content"},
+        {205, "Reset Content"},
+        {206, "Partial Content"},
+        {207, "Multi-Status"},
+        {208, "Already Reported"},
+        {226, "IM Used"},
+        {300, "Multiple Choices"},
+        {301, "Moved Permanently"},
+        {302, "Found"},
+        {303, "See Other"},
+        {304, "Not Modified"},
+        {305, "Use Proxy"},
+        {307, "Temporary Redirect"},
+        {308, "Permanent Redirect"},
+        {400, "Bad Request"},
+        {401, "Unauthorized"},
+        {402, "Payment Required"},
+        {403, "Forbidden"},
+        {404, "Not Found"},
+        {405, "Method Not Allowed"},
+        {406, "Not Acceptable"},
+        {407, "Proxy Authentication Required"},
+        {408, "Request Timeout"},
+        {409, "Conflict"},
+        {410, "Gone"},
+        {411, "Length Required"},
+        {412, "Precondition Failed"},
+        {413, "Payload Too Large"},
+        {414, "URI Too Long"},
+        {415, "Unsupported Media Type"},
+        {416, "Range Not Satisfiable"},
+        {417, "Expectation Failed"},
+        {421, "Misdirected Request"},
+        {422, "Unprocessable Entity"},
+        {423, "Locked"},
+        {424, "Failed Dependency"},
+        {425, "Too Early"},
+        {426, "Upgrade Required"},
+        {428, "Precondition Required"},
+        {429, "Too Many Requests"},
+        {431, "Request Header Fields Too Large"},
+        {500, "Internal Server Error"},
+        {501, "Not Implemented"},
+        {502, "Bad Gateway"},
+        {503, "Service Unavailable"},
+        {504, "Gateway Timeout"},
+        {505, "HTTP Version Not Supported"},
+        {506, "Variant Also Negotiates"},
+        {507, "Insufficient Storage"},
+        {508, "Loop Detected"},
+        {510, "Not Extended"},
+        {511, "Network Authentication Required"},
+        {599, "Last Unassigned Server Error Code"},
+    };
+    auto envoy_reason_for = [&](u16 code) -> std::string {
+        for (const auto& e : kEnvoyNamed)
+            if (e.code == code) return e.reason;
+        return "Unknown";
+    };
+
+    char server[] = "envoy";
+    ForwardResponsePolicySpec upstream_order{};
+    upstream_order.version = ResponsePolicyVersion::Http11;
+    upstream_order.framing = ResponsePolicyFraming::ContentLength;
+    upstream_order.connection = ResponsePolicyConnection::Request;
+    upstream_order.header_order = ResponsePolicyHeaderOrder::Upstream;
+    upstream_order.header_names = ResponsePolicyHeaderNames::Lowercase;
+    upstream_order.connection_header = ResponsePolicyConnectionHeader::CloseOnly;
+    upstream_order.status_reason = ResponsePolicyStatusReason::Canonical;
+    upstream_order.date = ResponsePolicyDate::PreserveOrCurrent;
+    upstream_order.server = {server, 5};
+    REQUIRE(response_policy_spec_valid(upstream_order));
+
+    RouteConfig config{};
+    REQUIRE_EQ(config.add_response_policy(upstream_order), 1u);
+
+    auto status_line_for = [&](u16 code, std::string* line) {
+        u8 header_storage[SlicePool::kSliceSize]{};
+        Connection conn{};
+        conn.reset();
+        conn.response_header_slice = header_storage;
+        conn.response_header_buf.bind(header_storage, sizeof(header_storage));
+        conn.response_policy_id = 1;
+        conn.keep_alive = true;
+        conn.req_client_keep_alive = true;
+
+        char digits[3] = {static_cast<char>('0' + code / 100),
+                          static_cast<char>('0' + (code / 10) % 10),
+                          static_cast<char>('0' + code % 10)};
+        // Craft the raw upstream status line with the code under test but a
+        // dummy reason phrase, so a pass here can only be explained by the
+        // canonical replacement -- not by accidentally forwarding the
+        // upstream's own reason.
+        const std::string raw = "HTTP/1.1 " + std::string(digits, 3) +
+                                " placeholder-reason-phrase\r\nContent-Length: 2\r\n\r\nhi";
+        HttpResponseParser parser;
+        ParsedResponse response;
+        parser.reset();
+        response.reset();
+        if (parser.parse(reinterpret_cast<const u8*>(raw.data()),
+                         static_cast<u32>(raw.size()),
+                         &response) != ParseStatus::Complete)
+            return false;
+        if (!build_strict_response_headers(conn, config, response)) return false;
+        *line = std::string(reinterpret_cast<const char*>(conn.response_header_buf.data()),
+                            conn.response_header_buf.len());
+        return true;
+    };
+
+    // Every status 200..599 except the no-body exclusions (204/205/304) must
+    // be admitted, and the status line must carry Envoy's exact canonical
+    // phrase for that code -- "Unknown" for one Envoy itself does not name.
+    for (u32 code = 200; code <= 599; code++) {
+        if (code == 204 || code == 205 || code == 304) continue;
+        std::string line;
+        const bool admitted = status_line_for(static_cast<u16>(code), &line);
+        CHECK(admitted);
+        if (!admitted) continue;
+        const std::string expected_status_line = "HTTP/1.1 " + std::to_string(code) + " " +
+                                                 envoy_reason_for(static_cast<u16>(code)) + "\r\n";
+        CHECK(line.find(expected_status_line) == 0);
+    }
+
+    // The three no-body exclusions remain rejected by the admission check
+    // itself (a separate concern from canonical-reason coverage), not by
+    // `canonical_status_reason` -- confirm they still fail closed here.
+    for (u16 code : {204, 205, 304}) {
+        std::string line;
+        CHECK_FALSE(status_line_for(code, &line));
+    }
+
+    // Direct spot checks named in the review thread, plus one Envoy leaves
+    // unnamed (299 has no assigned meaning; Envoy's own table omits it).
+    struct Spot {
+        u16 code;
+        const char* reason;
+    };
+    static const Spot kSpots[] = {
+        {202, "Accepted"},
+        {206, "Partial Content"},
+        {307, "Temporary Redirect"},
+        {308, "Permanent Redirect"},
+        {409, "Conflict"},
+        {422, "Unprocessable Entity"},
+        {504, "Gateway Timeout"},
+        {299, "Unknown"},
+    };
+    for (const auto& s : kSpots) {
+        Str out{};
+        REQUIRE(canonical_status_reason(s.code, &out));
+        CHECK_EQ(out.len, static_cast<u32>(__builtin_strlen(s.reason)));
+        CHECK(__builtin_memcmp(out.ptr, s.reason, out.len) == 0);
+
+        std::string line;
+        REQUIRE(status_line_for(s.code, &line));
+        const std::string expected_status_line =
+            "HTTP/1.1 " + std::to_string(s.code) + " " + s.reason + "\r\n";
+        CHECK(line.find(expected_status_line) == 0);
+    }
+
+    // `canonical_status_reason` never fails closed for a real `out` pointer
+    // now -- only a null one is rejected.
+    CHECK_FALSE(canonical_status_reason(200, nullptr));
+}
+
 // Codex round-10 review: if graceful drain begins after this request was
 // admitted (keep-alive already granted at the request boundary, mirroring
 // real ingress's `conn.keep_alive = !loop->is_draining()` at admission time)
