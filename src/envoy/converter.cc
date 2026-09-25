@@ -856,19 +856,72 @@ FrontendResult<bool> validate(const Bootstrap& model, const RutCapabilities& cap
             if (path.len == 0u || path.ptr == nullptr || path.ptr[0] != '/')
                 return invalid(match.span, lit_str("route match path must start with \"/\""));
         }
-        // Envoy treats every byte of a `prefix` / `path` literally, but a
-        // generated RUT node interprets any segment beginning with ':' as a
-        // route parameter (include/rut/runtime/route_trie.h): a prefix like
-        // "/:tenant/" would emit `route "/:tenant"`, which then captures and
-        // forwards `/anything/x` where Envoy finds no matching route at all.
-        // Reject rather than silently change the match semantics.
         const Str text = match.kind == RouteMatchKind::Prefix ? match.prefix : match.path;
-        for (u32 c = 0; c + 1u < text.len; c++) {
-            if (text.ptr[c] == '/' && text.ptr[c + 1u] == ':')
+        // `validate_route_match_bytes` (src/envoy/parser.cc) is a private
+        // `Parser` method, so a hand-built `Bootstrap` never goes through
+        // it. Reapply the same byte-set and length bound here so a
+        // caller-supplied prefix/path like "/ok\n..." (or one over 64
+        // bytes) cannot reach `put_escaped`/node-text emission below, which
+        // only escapes `\` and `"`, and produce syntactically invalid --or
+        // merely unintended-- RUT.
+        // Mirrors src/envoy/parser.cc's private `kMaxRouteMatchLen` (same
+        // value, not exported to this translation unit).
+        constexpr u32 kMaxRouteMatchLen = 64u;
+        if (text.len > kMaxRouteMatchLen)
+            return unsupported(match.span, lit_str("route match value exceeds 64 bytes"));
+        for (u32 c = 0; c < text.len; c++) {
+            const auto b = static_cast<unsigned char>(text.ptr[c]);
+            const bool byte_ok = b >= 0x21u && b <= 0x7eu && text.ptr[c] != '?' &&
+                                 text.ptr[c] != '#' && text.ptr[c] != '%';
+            if (!byte_ok)
                 return unsupported(
                     match.span,
-                    lit_str("route match segments beginning with \":\" would become a RUT route "
-                            "parameter, not a literal match; not lowered"));
+                    lit_str("route match value must be printable ASCII excluding ?, #, and %"));
+        }
+        // Only a `prefix` match's text ever becomes a RUT route declaration
+        // (`route "<node_text>" { ... }`, via `strip_trailing_slash` in
+        // `build_lowering_plan` below): an exact `path` match is never
+        // emitted as a route declaration -- `build_node_plan` only ever
+        // compares it as a string literal (`req.pathOnly == "..."`) or
+        // drops it entirely behind an ancestor's terminal arm -- so it
+        // carries neither of the two risks below and must not be rejected
+        // for them.
+        if (match.kind == RouteMatchKind::Prefix) {
+            // Envoy treats every byte of a `prefix` literally, but a
+            // generated RUT node interprets any segment beginning with ':'
+            // as a route parameter (include/rut/runtime/route_trie.h): a
+            // prefix like "/:tenant/" would emit `route "/:tenant"`, which
+            // then captures and forwards `/anything/x` where Envoy finds no
+            // matching route at all. Reject rather than silently change the
+            // match semantics.
+            for (u32 c = 0; c + 1u < text.len; c++) {
+                if (text.ptr[c] == '/' && text.ptr[c + 1u] == ':')
+                    return unsupported(
+                        match.span,
+                        lit_str("route match segments beginning with \":\" would become a RUT "
+                                "route parameter, not a literal match; not lowered"));
+            }
+            // A prefix containing an internal "//" collapses, in Rut's
+            // route trie (route_trie.h: "empty segments are dropped, so
+            // \"/api//v1\" == \"/api/v1\""), to the same node text as its
+            // single-slash form, but this converter treats the two Str
+            // values as distinct declared nodes. A bootstrap that ever
+            // declared both forms would therefore emit two RUT route
+            // declarations the runtime resolves as one (build order decides
+            // which wins), silently dropping one route. Reject the
+            // directly-detectable case -- the configured text itself
+            // containing "//" -- here; a request path reaching an
+            // already-distinct declared node via slash collapsing (no
+            // "//" in any declared text) is the separate, broader
+            // divergence already recorded as NOT_IMPLEMENTED in
+            // docs/envoy-compatibility.md ("Path normalization").
+            for (u32 c = 0; c + 1u < text.len; c++) {
+                if (text.ptr[c] == '/' && text.ptr[c + 1u] == '/')
+                    return unsupported(
+                        match.span,
+                        lit_str("route match prefix contains \"//\", which Rut's route trie "
+                                "collapses; not lowered"));
+            }
         }
 
         const RouteAction& action = virtual_host.routes[i].action;
