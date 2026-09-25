@@ -345,13 +345,15 @@ return forward(users, request_policy: {
 // trailers check decides its fate, matching Envoy's own nomination special
 // case); rejects Connection nominating `upgrade` alongside an Upgrade header
 // (even with `close`) but admits and strips a bare Upgrade header otherwise;
-// rejects more than one X-Forwarded-Proto field; treats an empty or
-// OWS-only X-Forwarded-Proto value as absent (dropped, not forwarded blank);
-// rejects a fragment-bearing request target; and drops the seventeen
-// client-supplied headers Envoy itself strips for external requests, plus
-// one Rut-side hardening addition (`x-envoy-internal`, fourteen more
-// `x-envoy-*` names, `x-forwarded-client-cert`, and
-// `x-envoy-external-address`; docs/envoy-compatibility.md).
+// rejects more than one X-Forwarded-Proto field; treats any X-Forwarded-Proto
+// value that is not (case-insensitively) exactly "http" or "https" -- empty,
+// OWS-only, or otherwise invalid such as "http,https" -- as absent (dropped,
+// not forwarded blank or malformed); rejects a fragment-bearing request
+// target; and drops the sixteen client-supplied headers Envoy itself strips
+// for external requests, plus one Rut-side hardening addition, seventeen in
+// total (`x-envoy-internal`, fourteen more `x-envoy-*` names,
+// `x-forwarded-client-cert`, and `x-envoy-external-address`;
+// docs/envoy-compatibility.md).
 return forward(users, request_policy: {
     version: "HTTP/1.1", host: "preserve", connection: "omit",
     header_names: "lowercase", forwarded_proto: "http",
