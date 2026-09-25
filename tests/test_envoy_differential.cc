@@ -1438,9 +1438,25 @@ void dump_rut_log(const std::string& path) {
 
 // Runs `rut-envoy-convert --format bootstrap-json <bootstrap_path>`,
 // redirecting stdout to `out_rut_path` and capturing stderr into
-// `*stderr_out`. Returns true only on exit 0 with empty stderr (the
-// contract both --self-test's RUT pass and --pair-milestone-s rely on); the
-// caller prints `*stderr_out` on failure.
+// `*stderr_out`. Returns true only on exit 0 with a stderr that is empty or
+// consists solely of `warning:` lines (the converter warns, per the #692
+// review, that Rut does not enforce the cluster's connect_timeout; any other
+// stderr text is a conversion failure). Both --self-test's RUT pass and
+// --pair-milestone-s rely on this; the caller prints `*stderr_out` on
+// failure.
+bool converter_stderr_is_warnings_only(const std::string& text) {
+    size_t pos = 0;
+    while (pos < text.size()) {
+        const size_t end = text.find('\n', pos);
+        const std::string line =
+            text.substr(pos, end == std::string::npos ? std::string::npos : end - pos);
+        if (!line.empty() && line.rfind("warning: ", 0) != 0) return false;
+        if (end == std::string::npos) break;
+        pos = end + 1;
+    }
+    return true;
+}
+
 bool run_converter_to_file(const std::string& converter_binary,
                            const std::string& bootstrap_path,
                            const std::string& out_rut_path,
@@ -1493,7 +1509,8 @@ bool run_converter_to_file(const std::string& converter_binary,
         }
     }
     unlink(stderr_path.c_str());
-    return WIFEXITED(status) && WEXITSTATUS(status) == 0 && stderr_out->empty();
+    return WIFEXITED(status) && WEXITSTATUS(status) == 0 &&
+           converter_stderr_is_warnings_only(*stderr_out);
 }
 
 // ── Bootstrap template ──────────────────────────────────────────────────
@@ -2401,7 +2418,7 @@ int run_pair_milestone_s(const std::string& rut_binary,
         std::string convert_stderr;
         if (!run_converter_to_file(
                 converter_binary, bootstrap_path, out_rut_path, &convert_stderr)) {
-            std::cerr << "FAIL: rut-envoy-convert did not exit 0 with empty stderr on the "
+            std::cerr << "FAIL: rut-envoy-convert did not exit 0 with warnings-only stderr on the "
                          "milestone-S bootstrap\n";
             if (!convert_stderr.empty()) std::cerr << "stderr: " << convert_stderr << "\n";
             return 1;
@@ -2499,7 +2516,7 @@ int run_pair_milestone_s(const std::string& rut_binary,
         std::string convert_stderr;
         if (!run_converter_to_file(
                 converter_binary, bootstrap_path, out_rut_path, &convert_stderr)) {
-            std::cerr << "FAIL: rut-envoy-convert did not exit 0 with empty stderr on the "
+            std::cerr << "FAIL: rut-envoy-convert did not exit 0 with warnings-only stderr on the "
                          "closed-port bootstrap\n";
             if (!convert_stderr.empty()) std::cerr << "stderr: " << convert_stderr << "\n";
             return 1;
