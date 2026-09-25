@@ -1928,9 +1928,15 @@ return forward(users, request_policy: {
 
 All four profiles require `version: "HTTP/1.1"` and `connection: "omit"`
 literally, and reject a request whose framing is ambiguous for this closed
-serializer: a body paired with a client `Expect` header, `Transfer-Encoding`,
-or (ID1/ID2/ID3 only) any semantically-present `Upgrade` header fails closed
-rather than proxying with ambiguous semantics (ID4 instead admits a bare
+serializer: a body paired with a client `Expect` header whose trimmed value
+is non-empty, `Transfer-Encoding`, or (ID1/ID2/ID3 only) any semantically-
+present `Upgrade` header fails closed rather than proxying with ambiguous
+semantics. An empty or OWS-only `Expect` field carries no expectation at all
+(RFC 9110 defines only the "100-continue" expect-value) and is admitted like
+a request with no `Expect` header: the serializer strips every `Expect`
+field via `drop_fixed` regardless of value, so this shape (most commonly
+paired with `Content-Length: 0`) has nothing left to negotiate (Codex
+round-9 review, PR #696). (ID4 instead admits a bare
 `Upgrade` header -- one whose `Connection` value does not itself nominate the
 `upgrade` token -- but always strips it from the forwarded request; the
 request is never rejected for it, but the header itself never reaches the
@@ -1957,8 +1963,13 @@ physical fields that each carry a `trailers` token still collapse to exactly
 one canonical `te: trailers` line, not one per field (rewritten to that exact
 lowercase token regardless of the client's casing or any other token in the
 value); rejects a request whose `Connection` value nominates the `upgrade`
-token together with an `Upgrade` header, even when the value also contains
-`close`; rejects more than one physical `X-Forwarded-Proto` field (Envoy
+token together with an `Upgrade` header whose trimmed value is non-empty,
+even when the `Connection` value also contains `close` (the runtime checks
+`req.has_upgrade_header`, which requires a non-empty value, so
+`Connection: close, upgrade` paired with an empty or OWS-only `Upgrade`
+value is admitted instead, and both fields are then stripped -- one as a
+nominated header, the other as the fixed-list `Upgrade` strip entry); rejects
+more than one physical `X-Forwarded-Proto` field (Envoy
 coalesces duplicates into one inline header; this profile does not, so it
 fails closed instead); rejects a request target carrying a URI fragment;
 drops every client-supplied header that Envoy's own

@@ -5578,6 +5578,90 @@ inline bool request_policy_is_stripped_client_envoy_header(const u8* p, u32 n) {
            request_policy_name_eq(p, n, "x-envoy-external-address", 24);
 }
 
+// Envoy's `HeaderMapImpl` gives every one of these request headers a single
+// O(1) inline storage slot (`envoy/http/header_map.h`, v1.39.1:
+// `INLINE_REQ_HEADERS`/`INLINE_REQ_RESP_HEADERS`, plus every request-side
+// `Http::RegisterCustomInlineHeader<CustomInlineHeaderRegistry::Type::
+// RequestHeaders>` registration -- found via `gh search code
+// "RegisterCustomInlineHeader" --repo envoyproxy/envoy`, e.g.
+// source/extensions/filters/http/{cdn_loop,cors,cache,csrf,decompressor,
+// jwt_authn,grpc_web,oauth2,compressor,grpc_http1_reverse_bridge}/*.cc(.h),
+// source/extensions/filters/common/expr/context.cc,
+// source/extensions/tracers/skywalking/trace_segment_reporter.cc,
+// source/extensions/access_loggers/open_telemetry/access_log_impl.cc, and
+// contrib/sxg/filters/http/source/filter.cc; wire strings resolved from
+// `source/common/http/headers.h`'s `HeaderValues`/`CustomHeaderValues`).
+// `appendCopy`/`HeaderMapImpl::insertByKey` coalesce a second physical field
+// into that one slot (comma-joined) rather than keeping a second line.
+// `:method`/`:path`/`:protocol`/`:scheme`/`:authority` are H2 pseudo-headers
+// with no HTTP/1.1 wire form and are omitted. `host`, `content-length`,
+// `te`, `connection`, `expect`, `upgrade`, and `x-forwarded-proto` are also
+// omitted: each already has its own fail-closed or canonicalizing duplicate
+// handling above (host/xfp count checks, the TE/Connection nomination
+// rules), so folding them into this generic table would just duplicate or
+// conflict with that logic. `keep-alive`, `proxy-connection`, and
+// `transfer-encoding` are omitted too: `drop_fixed` above (via
+// `request_policy_is_stripped_client_envoy_header` and its own literal
+// checks) already strips every physical occurrence of those unconditionally,
+// so no duplicate can ever reach upstream regardless of this table. This
+// profile does not replicate Envoy's coalescing for the remaining names, so
+// a second physical occurrence of any of them fails the request closed
+// (400) instead of silently forwarding upstream bytes that diverge from
+// what an Envoy-parity client intended.
+inline i32 request_policy_inline_request_header_index(const u8* p, u32 n) {
+    struct Entry {
+        const char* name;
+        u32 len;
+    };
+    static constexpr Entry kInlineRequestHeaders[] = {
+        {"x-client-trace-id", 17},
+        {"x-envoy-downstream-service-cluster", 34},
+        {"x-envoy-downstream-service-node", 31},
+        {"x-envoy-is-timeout-retry", 24},
+        {"x-envoy-original-path", 21},
+        {"x-envoy-original-host", 21},
+        {"x-forwarded-for", 15},
+        {"x-forwarded-host", 16},
+        {"grpc-timeout", 12},
+        {"user-agent", 10},
+        {"x-envoy-upstream-stream-duration-ms", 35},
+        {"x-forwarded-port", 16},
+        {"x-envoy-attempt-count", 21},
+        {"content-type", 12},
+        {"x-envoy-decorator-operation", 27},
+        {"proxy-status", 12},
+        {"x-request-id", 12},
+        {"via", 3},
+        {"cdn-loop", 8},
+        {"access-control-request-headers", 30},
+        {"access-control-request-method", 29},
+        {"origin", 6},
+        {"access-control-request-private-network", 38},
+        {"authorization", 13},
+        {"pragma", 6},
+        {"cache-control", 13},
+        {"if-match", 8},
+        {"if-none-match", 13},
+        {"if-modified-since", 17},
+        {"if-unmodified-since", 19},
+        {"if-range", 8},
+        {"referer", 7},
+        {"accept-encoding", 15},
+        {"content-encoding", 16},
+        {"accept", 6},
+        {"grpc-accept-encoding", 20},
+        {"authentication", 14},
+    };
+    constexpr u32 kCount = sizeof(kInlineRequestHeaders) / sizeof(kInlineRequestHeaders[0]);
+    for (u32 i = 0; i < kCount; i++) {
+        if (request_policy_name_eq(
+                p, n, kInlineRequestHeaders[i].name, kInlineRequestHeaders[i].len))
+            return static_cast<i32>(i);
+    }
+    return -1;
+}
+inline constexpr u32 kInlineRequestHeaderTableSize = 37;
+
 // Parse and validate the policy's framing before it can acquire an upstream
 // slot. The existing HTTP parser intentionally accepts identical duplicate
 // Content-Length fields; nginx's fixed policy does not, so count the raw fields
@@ -5736,24 +5820,33 @@ inline RequestPolicyBodyState inspect_request_policy_body(const Connection& conn
 // -- Envoy's own `sanitizeConnectionHeader` (source/common/http/utility.cc)
 // special-cases it the same way `sanitizeTEHeader` does, so the trailers
 // check below decides its fate regardless of the nomination, Codex round-8
-// review, PR #696), keeps `te`
-// per field when that field's value carries a "trailers" token (every field
-// evaluated independently; two or more trailers-carrying fields still
-// collapse to one canonical `te: trailers` line, matching Envoy's inline
-// header storage), drops the fixed seventeen-name set of client-supplied
+// review, PR #696), keeps a single canonical `te: trailers` line, emitted at
+// the *first* physical `TE` field's position, whenever any physical TE
+// field's value carries a "trailers" token (matching Envoy's inline header
+// storage, where `HeaderMapImpl::insertByKey` places a name's one inline
+// slot at its first physical occurrence and every later duplicate coalesces
+// into it rather than appending a second line — e.g. `TE: gzip`,
+// `X-Middle: 1`, `TE: trailers` forwards `te: trailers` before `x-middle`,
+// not after it), drops the fixed seventeen-name set of client-supplied
 // headers Envoy's own `mutateRequestHeaders` sanitizes for a non-internal,
 // non-edge external request on a cleartext listener (`x-envoy-internal`,
 // the fourteen `cleanInternalHeaders` `x-envoy-*` names,
 // `x-forwarded-client-cert`, and `x-envoy-external-address`; see
-// `request_policy_is_stripped_client_envoy_header` above), and appends
-// `x-forwarded-proto: http` as the last header when the client did not
-// already supply one whose trimmed value is a syntactically valid scheme
+// `request_policy_is_stripped_client_envoy_header` above), fails the whole
+// request closed on a second physical occurrence of any other Envoy inline
+// request header (see `request_policy_inline_request_header_index` above;
+// Envoy coalesces these into one wire value, and this profile does not
+// replicate that coalescing), and overwrites `x-forwarded-proto` in place
+// at its original physical position with `x-forwarded-proto: http` when the
+// client's single field's trimmed value is not a syntactically valid scheme
 // (case-insensitively exactly "http" or "https", matching Envoy's own
-// `Utility::schemeIsValid`; a client-supplied field that is empty, OWS-only,
-// or any other non-scheme value such as "http,https" is dropped and treated
-// the same as absent, rather than forwarding a blank or malformed scheme; a
-// valid client-supplied value passes through unchanged, in its original
-// position, without case normalization). Fails closed with no upstream bytes
+// `Utility::schemeIsValid`; empty, OWS-only, or any other non-scheme value
+// such as "http,https" all count as invalid, matching Envoy's own inline
+// `x-forwarded-proto` slot, which is overwritten in place rather than
+// cleared and re-appended), appending that default as the last header only
+// when the client sent no `x-forwarded-proto` field at all; a valid
+// client-supplied value passes through unchanged, in its original position,
+// without case normalization). Fails closed with no upstream bytes
 // touched unless exactly one non-empty Host header is present. A
 // body-carrying request with a client `Expect` header is also outside this
 // profile's admitted shape today: `inspect_request_policy_body` rejects any
@@ -5807,6 +5900,19 @@ inline bool apply_preserve_host_lowercase_request_policy(Connection& conn, u16 p
     u32 xfp_count = 0;
     const u8* host_value_start = nullptr;
     u32 host_value_len = 0;
+    // Whether any physical `TE` field's comma-separated value contains a
+    // "trailers" token. Computed up front because the canonical `te:
+    // trailers` line (when warranted) must be emitted at the *first*
+    // physical TE field's position below, which may precede the field that
+    // actually carries the token (e.g. `TE: gzip`, `X-Middle: 1`,
+    // `TE: trailers`).
+    bool any_te_trailers = false;
+    // Envoy's inline request-header slots (see
+    // `request_policy_inline_request_header_index` above) coalesce a second
+    // physical field into the first rather than forwarding a duplicate line;
+    // this profile fails the request closed instead of risking upstream
+    // bytes that silently diverge from that coalescing.
+    bool seen_inline_request_header[kInlineRequestHeaderTableSize] = {};
     {
         const u8* hs = line_end + 2;
         while (hs < header_end) {
@@ -5823,12 +5929,20 @@ inline bool apply_preserve_host_lowercase_request_policy(Connection& conn, u16 p
                 value_start++;
             while (value_end > value_start && (value_end[-1] == ' ' || value_end[-1] == '\t'))
                 value_end--;
+            const i32 inline_idx = request_policy_inline_request_header_index(hs, name_len);
+            if (inline_idx >= 0) {
+                if (seen_inline_request_header[inline_idx]) return false;
+                seen_inline_request_header[inline_idx] = true;
+            }
             if (request_policy_name_eq(hs, name_len, "host", 4)) {
                 host_count++;
                 host_value_start = value_start;
                 host_value_len = static_cast<u32>(value_end - value_start);
             } else if (request_policy_name_eq(hs, name_len, "x-forwarded-proto", 17)) {
                 xfp_count++;
+            } else if (request_policy_name_eq(hs, name_len, "te", 2)) {
+                if (request_policy_comma_value_has_token(value_start, value_end, "trailers", 8))
+                    any_te_trailers = true;
             } else if (request_policy_name_eq(hs, name_len, "connection", 10)) {
                 const u8* tok = value_start;
                 while (tok <= value_end) {
@@ -5957,12 +6071,17 @@ inline bool apply_preserve_host_lowercase_request_policy(Connection& conn, u16 p
 
     bool saw_xfp = false;
     // Envoy's TE header is inline storage (`HeaderMap::setTE` overwrites the
-    // single logical value, never appends a second physical line), so when
-    // several physical `TE` fields each carry a "trailers" token the client's
-    // multiple lines still collapse to exactly one `te: trailers` on the
-    // wire. Track whether that canonical line has already been emitted and
-    // suppress every later field that would have produced it again.
-    bool te_trailers_emitted = false;
+    // single logical value, never appends a second physical line), and
+    // `HeaderMapImpl::insertByKey` places a newly-created inline entry at the
+    // position of the *first* physical occurrence of that name, not wherever
+    // a later duplicate happened to appear. So however many physical `TE`
+    // fields the client sends, and regardless of which one(s) carry a
+    // "trailers" token, at most one canonical `te: trailers` line reaches
+    // the wire, and it appears at the first physical TE field's position.
+    // `any_te_trailers` (computed in Pass 1 above) already reflects whether
+    // any field's value contains that token; `seen_te_field` below tracks
+    // whether the current field is that first occurrence.
+    bool seen_te_field = false;
     {
         const u8* hs = line_end + 2;
         while (hs < header_end) {
@@ -5995,13 +6114,19 @@ inline bool apply_preserve_host_lowercase_request_policy(Connection& conn, u16 p
             // -- and when kept, rewrites it to exactly that canonical
             // lowercase token (`headers.setTE(TEValues.Trailers)`), not the
             // client's original casing or the other comma-joined tokens.
-            const bool te_has_trailers = is_te && request_policy_comma_value_has_token(
-                                                      value_start, value_end, "trailers", 8);
-            // A second (or later) physical `TE` field that also carries a
-            // "trailers" token has nothing left to contribute once the
-            // canonical line has already been written -- drop it exactly
-            // like a non-trailers TE field rather than emitting a duplicate.
-            const bool drop_te = is_te && (!te_has_trailers || te_trailers_emitted);
+            // Whether *this* field individually carries the token no longer
+            // decides whether the canonical line is emitted here (that is
+            // `any_te_trailers`, computed once from every physical TE field
+            // in Pass 1); it is used only for the position decision below.
+            const bool is_first_te = is_te && !seen_te_field;
+            if (is_te) seen_te_field = true;
+            // The canonical line is emitted exactly once, at the first
+            // physical TE field's position, and only when some TE field
+            // (this one or a later one) carried a "trailers" token. Every
+            // other physical TE field -- first or not, trailers or not --
+            // contributes nothing further and is dropped.
+            const bool emit_te_here = is_first_te && any_te_trailers;
+            const bool drop_te = is_te && !emit_te_here;
             // HTTP/1.1 senders that emit `TE: trailers` are expected to
             // nominate it in `Connection` too (RFC 9110 §9.6), and Envoy's
             // `sanitizeConnectionHeader` (source/common/http/utility.cc)
@@ -6013,7 +6138,7 @@ inline bool apply_preserve_host_lowercase_request_policy(Connection& conn, u16 p
             // `headers.setTE(TEValues.Trailers)` still runs). Folding `te`
             // into the generic `drop_nominated` set would strip the
             // canonical trailers line for this standard wire shape even
-            // though `te_has_trailers`/`drop_te` above already computed the
+            // though `emit_te_here`/`drop_te` above already computed the
             // right outcome; exclude it here and let that existing
             // canonicalization decide instead.
             const bool drop_nominated = !is_te && name_nominated(hs, name_len);
@@ -6029,27 +6154,34 @@ inline bool apply_preserve_host_lowercase_request_policy(Connection& conn, u16 p
             // default instead of forwarding it when validation fails.
             // Forwarding the malformed value verbatim here would instead hand
             // origins that use this header for redirects or security decisions
-            // an attacker-controlled, non-scheme value; treat any value that
-            // fails this check the same as an absent header (drop the field
-            // and let the trailing synthesized default fire below by leaving
-            // `saw_xfp` unset) rather than failing the request closed. A valid
-            // value is forwarded as the client sent it (Envoy's own literal
-            // `x-forwarded-proto` header text is untouched when already
-            // present; only the internal `:scheme` pseudo-header is
-            // lowercased), not case-normalized.
+            // an attacker-controlled, non-scheme value; Envoy's own
+            // `x-forwarded-proto` slot is a single inline entry
+            // (`HeaderMap::setForwardedFor`-style setters overwrite in
+            // place), so an invalid value doesn't vanish and reappear
+            // elsewhere on the wire -- the connection-derived default
+            // overwrites it at its original physical position instead. The
+            // trailing synthesized default (below, once `saw_xfp` is still
+            // unset after this loop) is reserved for a client that sent no
+            // `x-forwarded-proto` field at all. A valid value is forwarded
+            // as the client sent it (Envoy's own literal `x-forwarded-proto`
+            // header text is untouched when already present; only the
+            // internal `:scheme` pseudo-header is lowercased), not
+            // case-normalized.
             const u32 xfp_value_len = static_cast<u32>(value_end - value_start);
             const bool xfp_scheme_valid =
                 is_xfp && (request_policy_name_eq(value_start, xfp_value_len, "http", 4) ||
                            request_policy_name_eq(value_start, xfp_value_len, "https", 5));
-            const bool drop_invalid_xfp = is_xfp && !xfp_scheme_valid;
-            if (!drop_fixed && !drop_te && !drop_nominated && !drop_invalid_xfp) {
+            const bool xfp_invalid = is_xfp && !xfp_scheme_valid;
+            if (!drop_fixed && !drop_te && !drop_nominated) {
                 if (is_cl) {
                     if (!append_lit("content-length: ", 16) || !append_dec(body_len) ||
                         !append_lit("\r\n", 2))
                         return false;
-                } else if (te_has_trailers) {
+                } else if (emit_te_here) {
                     if (!append_lit("te: trailers\r\n", 14)) return false;
-                    te_trailers_emitted = true;
+                } else if (xfp_invalid) {
+                    if (!append_lit("x-forwarded-proto: http\r\n", 25)) return false;
+                    saw_xfp = true;
                 } else {
                     if (!append_lower(hs, name_len) || !append_lit(": ", 2) ||
                         !append(value_start, static_cast<u32>(value_end - value_start)) ||
@@ -9362,10 +9494,24 @@ inline bool response_policy_suppress_head_admitted(const Connection& conn,
     HttpParser parser;
     ParsedRequest req;
     parser.reset();
+    // ID4 (`host: "preserve"`) admits a bare, non-empty `Upgrade` header with
+    // no `Connection: upgrade` nomination -- its serializer
+    // (`apply_preserve_host_lowercase_request_policy`) strips it
+    // unconditionally (`drop_fixed`), matching Envoy, which forwards this
+    // shape unchanged rather than rejecting it (see the body-inspection
+    // comment near `inspect_request_policy_body` above). The genuine-upgrade
+    // shape -- `Upgrade` together with a `Connection: upgrade` nomination --
+    // stays fail-closed for every policy, ID4 included, because Rut's
+    // request_policy path has no upgrade-tunnel capability. Every other
+    // policy keeps the original closed contract of rejecting any `Upgrade`
+    // header outright.
+    const bool id4_route = request_policy_preserves_host(request_policy_id);
     if (parser.parse(conn.recv_buf.data(), conn.recv_buf.len(), &req) != ParseStatus::Complete ||
         req.method != HttpMethod::HEAD || req.version != HttpVersion::Http11 ||
         req.path.ptr == nullptr || req.path.len == 0 || req.path.ptr[0] != '/' ||
-        req.has_content_length || req.chunked || req.upgrade || req.has_upgrade_header)
+        req.has_content_length || req.chunked ||
+        (id4_route ? (req.upgrade && req.has_upgrade_header)
+                   : (req.upgrade || req.has_upgrade_header)))
         return false;
     u32 host_count = 0;
     u32 connection_count = 0;
@@ -9382,10 +9528,31 @@ inline bool response_policy_suppress_head_admitted(const Connection& conn,
                 return false;
         } else if (http_header_name_eq_ci(name.ptr, name.len, "content-length", 14) ||
                    http_header_name_eq_ci(name.ptr, name.len, "transfer-encoding", 17) ||
-                   http_header_name_eq_ci(name.ptr, name.len, "te", 2) ||
-                   http_header_name_eq_ci(name.ptr, name.len, "expect", 6) ||
-                   http_header_name_eq_ci(name.ptr, name.len, "upgrade", 7)) {
+                   http_header_name_eq_ci(name.ptr, name.len, "expect", 6)) {
             if (!conn.request_policy_id || paired_failure) return false;
+        } else if (http_header_name_eq_ci(name.ptr, name.len, "te", 2) ||
+                   http_header_name_eq_ci(name.ptr, name.len, "upgrade", 7)) {
+            // ID4's serializer canonicalizes every physical `TE` field
+            // regardless of its value and unconditionally strips a bare,
+            // non-nominated `Upgrade` field (`drop_fixed` in
+            // `apply_preserve_host_lowercase_request_policy`), matching
+            // Envoy; the genuine-upgrade shape is already excluded above
+            // (this function's own top-of-body check) and below
+            // (`conn.req_wants_upgrade` in the return expression)
+            // regardless of this branch, so it is safe to admit here for
+            // ID4 whether or not this evaluation is for a paired failure
+            // disposition -- unlike content-length/transfer-encoding/
+            // expect above, TE/Upgrade admission for ID4 does not depend on
+            // a request policy actually being committed yet, since the
+            // route's *intended* policy (the `request_policy_id` parameter)
+            // already proves the serializer that will run knows how to
+            // canonicalize/strip these two headers. `conn.request_policy_id`
+            // is not yet committed at this preflight's call sites (see the
+            // `authority_ok` comment below), so `request_policy_id` (not
+            // the not-yet-set connection field) decides ID4-ness here.
+            // Every other policy keeps the original closed contract (Codex
+            // round-11 review, PR #696).
+            if (!id4_route) return false;
         }
     }
     auto valid_authority = [](Str value) {
@@ -9460,8 +9627,14 @@ inline bool response_policy_suppress_head_admitted(const Connection& conn,
            conn.req_http_version == static_cast<u8>(HttpVersion::Http11) &&
            (explicit_close_shape || default_keep_alive_shape) &&
            !conn.req_client_has_content_length && !conn.tls_active &&
-           !conn.req_client_has_transfer_encoding && !conn.req_client_has_te &&
-           !conn.req_client_has_expect && !conn.req_client_has_upgrade_header &&
+           !conn.req_client_has_transfer_encoding && (id4_route || !conn.req_client_has_te) &&
+           !conn.req_client_has_expect &&
+           // A bare, non-nominated `Upgrade` is ID4-admitted per the
+           // top-of-body and per-header-loop comments above; a genuine
+           // upgrade (Upgrade + Connection: upgrade nomination) is still
+           // excluded unconditionally by `!conn.req_wants_upgrade` below,
+           // regardless of `id4_route`.
+           (id4_route || !conn.req_client_has_upgrade_header) &&
            conn.protocol == ConnProtocol::Http11 && conn.req_path_canon.ptr != nullptr &&
            conn.req_body_mode == BodyMode::None && conn.req_body_remaining == 0 &&
            !conn.request_body_fully_buffered && !conn.req_malformed && !conn.req_wants_upgrade &&

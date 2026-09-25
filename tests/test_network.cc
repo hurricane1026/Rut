@@ -4275,6 +4275,83 @@ TEST(request_policy, preserve_host_lowercase_wire_and_fail_closed_host) {
         "GET /te-dup-trailers-triple HTTP/1.1\r\nhost: client.example\r\nte: trailers\r\n"
         "x-forwarded-proto: http\r\n\r\n");
 
+    // Codex round-11 review: when the *first* physical `TE` field lacks
+    // "trailers" and a later, nonadjacent field carries it, the canonical
+    // `te: trailers` line must still land at the first field's position --
+    // matching Envoy's inline `HeaderMapImpl::insertByKey`, which places a
+    // name's one inline slot at its first physical occurrence -- not at the
+    // later field's position (which would forward `te: trailers` after
+    // `x-middle` instead of before it).
+    prepare(
+        "GET /te-position HTTP/1.1\r\n"
+        "Host: client.example\r\n"
+        "TE: gzip\r\n"
+        "X-Middle: 1\r\n"
+        "TE: trailers\r\n\r\n");
+    REQUIRE(apply_request_policy(conn, endpoint, kPreserveHost));
+    require_wire(
+        "GET /te-position HTTP/1.1\r\nhost: client.example\r\nte: trailers\r\n"
+        "x-middle: 1\r\nx-forwarded-proto: http\r\n\r\n");
+
+    // Codex round-11 review: an invalid/empty client `X-Forwarded-Proto`
+    // value is overwritten in place with the connection-derived default,
+    // matching Envoy's inline `x-forwarded-proto` slot (overwritten, not
+    // cleared and re-appended) -- not dropped and appended after later
+    // retained headers.
+    prepare(
+        "GET /xfp-invalid-position HTTP/1.1\r\n"
+        "Host: client.example\r\n"
+        "X-Forwarded-Proto: ftp\r\n"
+        "X-Middle: 1\r\n\r\n");
+    REQUIRE(apply_request_policy(conn, endpoint, kPreserveHost));
+    require_wire(
+        "GET /xfp-invalid-position HTTP/1.1\r\nhost: client.example\r\n"
+        "x-forwarded-proto: http\r\nx-middle: 1\r\n\r\n");
+
+    // Codex round-11 review (thread on PR #698): Envoy stores every name in
+    // `INLINE_REQ_HEADERS`/`INLINE_REQ_RESP_HEADERS` (`envoy/http/
+    // header_map.h`) in a single O(1) inline slot and coalesces a second
+    // physical field into it (`HeaderMapImpl::insertByKey`/`appendCopy`)
+    // rather than forwarding a duplicate line. This profile does not
+    // replicate that coalescing, so a second physical occurrence of any of
+    // those names (other than the seven with their own dedicated handling:
+    // host, content-length, te, connection, expect, upgrade,
+    // x-forwarded-proto) fails the whole request closed instead of
+    // silently forwarding diverging upstream bytes.
+    prepare(
+        "POST /content-type-dup HTTP/1.1\r\n"
+        "Host: client.example\r\n"
+        "Content-Type: text/plain\r\n"
+        "Content-Length: 4\r\n"
+        "Content-Type: application/json\r\n\r\nabcd");
+    CHECK_FALSE(apply_request_policy(conn, endpoint, kPreserveHost));
+    CHECK_EQ(conn.send_buf.len(), 0u);
+
+    // A single occurrence of the same inline header forwards normally.
+    prepare(
+        "POST /content-type-single HTTP/1.1\r\n"
+        "Host: client.example\r\n"
+        "Content-Type: text/plain\r\n"
+        "Content-Length: 4\r\n\r\nabcd");
+    REQUIRE(apply_request_policy(conn, endpoint, kPreserveHost));
+    require_wire(
+        "POST /content-type-single HTTP/1.1\r\nhost: client.example\r\n"
+        "content-type: text/plain\r\ncontent-length: 4\r\n"
+        "x-forwarded-proto: http\r\n\r\nabcd");
+
+    // A non-inline header name is unaffected by the new table: Envoy has no
+    // O(1) slot for an arbitrary header, so a duplicate is forwarded as two
+    // physical lines, same as before this change.
+    prepare(
+        "GET /x-custom-dup HTTP/1.1\r\n"
+        "Host: client.example\r\n"
+        "X-Custom: one\r\n"
+        "X-Custom: two\r\n\r\n");
+    REQUIRE(apply_request_policy(conn, endpoint, kPreserveHost));
+    require_wire(
+        "GET /x-custom-dup HTTP/1.1\r\nhost: client.example\r\nx-custom: one\r\n"
+        "x-custom: two\r\nx-forwarded-proto: http\r\n\r\n");
+
     // Client-supplied `x-envoy-*` headers Envoy's own
     // `ConnectionManagerUtility::cleanInternalHeaders` removes unconditionally
     // for a non-internal, non-edge external request (the fixed shape this
@@ -68018,6 +68095,303 @@ TEST(state_invariant, jit_forward_direct_paired_head_non_id4_still_rejects_ipv6_
     // Not admitted: the generic 400 preflight rejection, not the paired 502
     // failure shape -- the legacy grammar still rejects the IPv6 literal for
     // every non-ID4 policy.
+    CHECK_EQ(c->resp_status, 400u);
+    CHECK_EQ(loop.backend.count_ops(MockOp::Connect), 0u);
+    CHECK_EQ(loop.backend.count_ops(MockOp::Send), 1u);
+    close(fds[1]);
+    loop.close_conn(*c);
+}
+
+// Codex round-11 review, PR #696: the paired-HEAD suppress_body preflight
+// (`response_policy_suppress_head_admitted`) must apply the same TE/Upgrade
+// rules the ID4 serializer (`apply_preserve_host_lowercase_request_policy`)
+// itself uses, or it can reject a bodyless HEAD shape the serializer
+// actually admits and forwards. A `TE` field is admitted -- and later
+// canonicalized/stripped by the serializer -- for ID4 regardless of its
+// value; only non-ID4 policies (with no TE handling at all) keep failing
+// this preflight closed for any TE field.
+TEST(state_invariant, jit_forward_direct_paired_head_id4_admits_te_field) {
+    RouteConfig cfg;
+    auto upstream = cfg.add_upstream("api", 0x7F000001, 9000);
+    REQUIRE(upstream.has_value());
+    cfg.upstreams[upstream.value()].max_inflight = 1;
+
+    static constexpr char kBody[] =
+        "<html>\r\n<head><title>502 Bad Gateway</title></head>\r\n<body>\r\n"
+        "<center><h1>502 Bad Gateway</h1></center>\r\n"
+        "<hr><center>nginx/1.29.7</center>\r\n</body>\r\n</html>\r\n";
+    static_assert(sizeof(kBody) - 1 == 157);
+    ForwardResponsePolicySpec response{};
+    response.version = ResponsePolicyVersion::Http11;
+    response.framing = ResponsePolicyFraming::ContentLength;
+    response.connection = ResponsePolicyConnection::Request;
+    response.date = ResponsePolicyDate::Current;
+    response.head_mode = ResponsePolicyHeadMode::SuppressBody;
+    response.server = {"nginx/1.29.7", 12};
+    REQUIRE_EQ(cfg.add_response_policy(response), 1u);
+
+    ForwardFailurePolicySpec failure{};
+    failure.version = ForwardFailurePolicyVersion::Http11;
+    failure.status_code = 502;
+    failure.date = ForwardFailurePolicyDate::Current;
+    failure.connection = ForwardFailurePolicyConnection::Request;
+    failure.head_mode = FailurePolicyHeadMode::SuppressBody;
+    failure.reason = {"Bad Gateway", 11};
+    failure.content_type = {"text/html", 9};
+    failure.server = {"nginx/1.29.7", 12};
+    failure.body = {kBody, sizeof(kBody) - 1};
+    REQUIRE_EQ(cfg.add_failure_policy(failure), 1u);
+
+    SmallLoop loop;
+    loop.setup();
+    int fds[2];
+    REQUIRE(socketpair(AF_UNIX, SOCK_STREAM, 0, fds) == 0);
+    ScopedFakeSocket fake_socket(fds[0]);
+    loop.inject_and_dispatch(make_ev(0, IoEventType::Accept, 42));
+    auto* c = loop.find_fd(42);
+    REQUIRE(c != nullptr);
+    c->request_config = &cfg;
+    static constexpr char kRequest[] =
+        "HEAD /missing?q=1 HTTP/1.1\r\nHost: client.example\r\nTE: trailers\r\n\r\n";
+    REQUIRE_EQ(c->recv_buf.write(reinterpret_cast<const u8*>(kRequest), sizeof(kRequest) - 1),
+               sizeof(kRequest) - 1);
+    capture_request_metadata(*c);
+    c->req_initial_send_len = c->recv_buf.len();
+    c->keep_alive = true;
+
+    JitDispatchOutcome outcome{};
+    outcome.kind = JitDispatchOutcome::Kind::Forward;
+    outcome.upstream_id = upstream.value();
+    outcome.request_policy_id = static_cast<u16>(RequestPolicyId::Http11PreserveHostLowercase);
+    outcome.response_policy_id = 1;
+    outcome.failure_policy_id = 1;
+    loop.backend.clear_ops();
+    loop.backend.fail_connect = true;
+    handle_jit_outcome<SmallLoop>(&loop, *c, outcome, nullptr, true);
+
+    // Admitted, not a 400 preflight rejection: the paired 502 failure
+    // response proves the preflight let the request proceed to the (here,
+    // injected) failed connect attempt instead of rejecting it for the `TE`
+    // field.
+    CHECK_EQ(c->failure_policy_id, 1u);
+    CHECK(c->failure_policy_suppress_body);
+    CHECK_EQ(c->resp_status, kStatusBadGateway);
+    CHECK_EQ(c->state, ConnState::Sending);
+    CHECK_EQ(loop.backend.count_ops(MockOp::Connect), 0u);
+    CHECK_EQ(loop.backend.count_ops(MockOp::Send), 1u);
+    close(fds[1]);
+    loop.close_conn(*c);
+}
+
+// A non-ID4 policy keeps the original closed contract: any `TE` field still
+// fails this preflight, matching pre-round-11 behavior.
+TEST(state_invariant, jit_forward_direct_paired_head_non_id4_still_rejects_te_field) {
+    RouteConfig cfg;
+    auto upstream = cfg.add_upstream("api", 0x7F000001, 9000);
+    REQUIRE(upstream.has_value());
+    cfg.upstreams[upstream.value()].max_inflight = 1;
+
+    static constexpr char kBody[] =
+        "<html>\r\n<head><title>502 Bad Gateway</title></head>\r\n<body>\r\n"
+        "<center><h1>502 Bad Gateway</h1></center>\r\n"
+        "<hr><center>nginx/1.29.7</center>\r\n</body>\r\n</html>\r\n";
+    static_assert(sizeof(kBody) - 1 == 157);
+    ForwardResponsePolicySpec response{};
+    response.version = ResponsePolicyVersion::Http11;
+    response.framing = ResponsePolicyFraming::ContentLength;
+    response.connection = ResponsePolicyConnection::Request;
+    response.date = ResponsePolicyDate::Current;
+    response.head_mode = ResponsePolicyHeadMode::SuppressBody;
+    response.server = {"nginx/1.29.7", 12};
+    REQUIRE_EQ(cfg.add_response_policy(response), 1u);
+
+    ForwardFailurePolicySpec failure{};
+    failure.version = ForwardFailurePolicyVersion::Http11;
+    failure.status_code = 502;
+    failure.date = ForwardFailurePolicyDate::Current;
+    failure.connection = ForwardFailurePolicyConnection::Request;
+    failure.head_mode = FailurePolicyHeadMode::SuppressBody;
+    failure.reason = {"Bad Gateway", 11};
+    failure.content_type = {"text/html", 9};
+    failure.server = {"nginx/1.29.7", 12};
+    failure.body = {kBody, sizeof(kBody) - 1};
+    REQUIRE_EQ(cfg.add_failure_policy(failure), 1u);
+
+    SmallLoop loop;
+    loop.setup();
+    int fds[2];
+    REQUIRE(socketpair(AF_UNIX, SOCK_STREAM, 0, fds) == 0);
+    ScopedFakeSocket fake_socket(fds[0]);
+    loop.inject_and_dispatch(make_ev(0, IoEventType::Accept, 42));
+    auto* c = loop.find_fd(42);
+    REQUIRE(c != nullptr);
+    c->request_config = &cfg;
+    static constexpr char kRequest[] =
+        "HEAD /missing?q=1 HTTP/1.1\r\nHost: client.example\r\nTE: trailers\r\n\r\n";
+    REQUIRE_EQ(c->recv_buf.write(reinterpret_cast<const u8*>(kRequest), sizeof(kRequest) - 1),
+               sizeof(kRequest) - 1);
+    capture_request_metadata(*c);
+    c->req_initial_send_len = c->recv_buf.len();
+    c->keep_alive = true;
+
+    JitDispatchOutcome outcome{};
+    outcome.kind = JitDispatchOutcome::Kind::Forward;
+    outcome.upstream_id = upstream.value();
+    outcome.request_policy_id = static_cast<u16>(RequestPolicyId::Http11FixedStrip);
+    outcome.response_policy_id = 1;
+    outcome.failure_policy_id = 1;
+    loop.backend.clear_ops();
+    loop.backend.fail_connect = true;
+    handle_jit_outcome<SmallLoop>(&loop, *c, outcome, nullptr, true);
+
+    CHECK_EQ(c->resp_status, 400u);
+    CHECK_EQ(loop.backend.count_ops(MockOp::Connect), 0u);
+    CHECK_EQ(loop.backend.count_ops(MockOp::Send), 1u);
+    close(fds[1]);
+    loop.close_conn(*c);
+}
+
+// A bare, non-nominated `Upgrade` header (no `Connection: upgrade` token) is
+// admitted for ID4 -- the serializer strips it unconditionally
+// (`drop_fixed`), matching Envoy, which forwards this shape unchanged
+// rather than rejecting it.
+TEST(state_invariant, jit_forward_direct_paired_head_id4_admits_bare_upgrade) {
+    RouteConfig cfg;
+    auto upstream = cfg.add_upstream("api", 0x7F000001, 9000);
+    REQUIRE(upstream.has_value());
+    cfg.upstreams[upstream.value()].max_inflight = 1;
+
+    static constexpr char kBody[] =
+        "<html>\r\n<head><title>502 Bad Gateway</title></head>\r\n<body>\r\n"
+        "<center><h1>502 Bad Gateway</h1></center>\r\n"
+        "<hr><center>nginx/1.29.7</center>\r\n</body>\r\n</html>\r\n";
+    static_assert(sizeof(kBody) - 1 == 157);
+    ForwardResponsePolicySpec response{};
+    response.version = ResponsePolicyVersion::Http11;
+    response.framing = ResponsePolicyFraming::ContentLength;
+    response.connection = ResponsePolicyConnection::Request;
+    response.date = ResponsePolicyDate::Current;
+    response.head_mode = ResponsePolicyHeadMode::SuppressBody;
+    response.server = {"nginx/1.29.7", 12};
+    REQUIRE_EQ(cfg.add_response_policy(response), 1u);
+
+    ForwardFailurePolicySpec failure{};
+    failure.version = ForwardFailurePolicyVersion::Http11;
+    failure.status_code = 502;
+    failure.date = ForwardFailurePolicyDate::Current;
+    failure.connection = ForwardFailurePolicyConnection::Request;
+    failure.head_mode = FailurePolicyHeadMode::SuppressBody;
+    failure.reason = {"Bad Gateway", 11};
+    failure.content_type = {"text/html", 9};
+    failure.server = {"nginx/1.29.7", 12};
+    failure.body = {kBody, sizeof(kBody) - 1};
+    REQUIRE_EQ(cfg.add_failure_policy(failure), 1u);
+
+    SmallLoop loop;
+    loop.setup();
+    int fds[2];
+    REQUIRE(socketpair(AF_UNIX, SOCK_STREAM, 0, fds) == 0);
+    ScopedFakeSocket fake_socket(fds[0]);
+    loop.inject_and_dispatch(make_ev(0, IoEventType::Accept, 42));
+    auto* c = loop.find_fd(42);
+    REQUIRE(c != nullptr);
+    c->request_config = &cfg;
+    // No `Connection: upgrade` nomination -- not a genuine upgrade shape.
+    static constexpr char kRequest[] =
+        "HEAD /missing?q=1 HTTP/1.1\r\nHost: client.example\r\nUpgrade: websocket\r\n\r\n";
+    REQUIRE_EQ(c->recv_buf.write(reinterpret_cast<const u8*>(kRequest), sizeof(kRequest) - 1),
+               sizeof(kRequest) - 1);
+    capture_request_metadata(*c);
+    c->req_initial_send_len = c->recv_buf.len();
+    c->keep_alive = true;
+
+    JitDispatchOutcome outcome{};
+    outcome.kind = JitDispatchOutcome::Kind::Forward;
+    outcome.upstream_id = upstream.value();
+    outcome.request_policy_id = static_cast<u16>(RequestPolicyId::Http11PreserveHostLowercase);
+    outcome.response_policy_id = 1;
+    outcome.failure_policy_id = 1;
+    loop.backend.clear_ops();
+    loop.backend.fail_connect = true;
+    handle_jit_outcome<SmallLoop>(&loop, *c, outcome, nullptr, true);
+
+    // Admitted, not a 400 preflight rejection, and not treated as a genuine
+    // upgrade either (no 101 tunnel): the paired 502 failure response proves
+    // the preflight let the request proceed to the (here, injected) failed
+    // connect attempt.
+    CHECK_EQ(c->failure_policy_id, 1u);
+    CHECK(c->failure_policy_suppress_body);
+    CHECK_EQ(c->resp_status, kStatusBadGateway);
+    CHECK_EQ(c->state, ConnState::Sending);
+    CHECK_EQ(loop.backend.count_ops(MockOp::Connect), 0u);
+    CHECK_EQ(loop.backend.count_ops(MockOp::Send), 1u);
+    close(fds[1]);
+    loop.close_conn(*c);
+}
+
+// The genuine-upgrade shape (`Upgrade` together with a `Connection: upgrade`
+// nomination) stays fail-closed for ID4 too: Rut's request_policy path has
+// no upgrade-tunnel capability.
+TEST(state_invariant, jit_forward_direct_paired_head_id4_still_rejects_genuine_upgrade) {
+    RouteConfig cfg;
+    auto upstream = cfg.add_upstream("api", 0x7F000001, 9000);
+    REQUIRE(upstream.has_value());
+    cfg.upstreams[upstream.value()].max_inflight = 1;
+
+    static constexpr char kBody[] =
+        "<html>\r\n<head><title>502 Bad Gateway</title></head>\r\n<body>\r\n"
+        "<center><h1>502 Bad Gateway</h1></center>\r\n"
+        "<hr><center>nginx/1.29.7</center>\r\n</body>\r\n</html>\r\n";
+    static_assert(sizeof(kBody) - 1 == 157);
+    ForwardResponsePolicySpec response{};
+    response.version = ResponsePolicyVersion::Http11;
+    response.framing = ResponsePolicyFraming::ContentLength;
+    response.connection = ResponsePolicyConnection::Request;
+    response.date = ResponsePolicyDate::Current;
+    response.head_mode = ResponsePolicyHeadMode::SuppressBody;
+    response.server = {"nginx/1.29.7", 12};
+    REQUIRE_EQ(cfg.add_response_policy(response), 1u);
+
+    ForwardFailurePolicySpec failure{};
+    failure.version = ForwardFailurePolicyVersion::Http11;
+    failure.status_code = 502;
+    failure.date = ForwardFailurePolicyDate::Current;
+    failure.connection = ForwardFailurePolicyConnection::Request;
+    failure.head_mode = FailurePolicyHeadMode::SuppressBody;
+    failure.reason = {"Bad Gateway", 11};
+    failure.content_type = {"text/html", 9};
+    failure.server = {"nginx/1.29.7", 12};
+    failure.body = {kBody, sizeof(kBody) - 1};
+    REQUIRE_EQ(cfg.add_failure_policy(failure), 1u);
+
+    SmallLoop loop;
+    loop.setup();
+    int fds[2];
+    REQUIRE(socketpair(AF_UNIX, SOCK_STREAM, 0, fds) == 0);
+    ScopedFakeSocket fake_socket(fds[0]);
+    loop.inject_and_dispatch(make_ev(0, IoEventType::Accept, 42));
+    auto* c = loop.find_fd(42);
+    REQUIRE(c != nullptr);
+    c->request_config = &cfg;
+    static constexpr char kRequest[] =
+        "HEAD /missing?q=1 HTTP/1.1\r\nHost: client.example\r\n"
+        "Connection: upgrade\r\nUpgrade: websocket\r\n\r\n";
+    REQUIRE_EQ(c->recv_buf.write(reinterpret_cast<const u8*>(kRequest), sizeof(kRequest) - 1),
+               sizeof(kRequest) - 1);
+    capture_request_metadata(*c);
+    c->req_initial_send_len = c->recv_buf.len();
+    c->keep_alive = true;
+
+    JitDispatchOutcome outcome{};
+    outcome.kind = JitDispatchOutcome::Kind::Forward;
+    outcome.upstream_id = upstream.value();
+    outcome.request_policy_id = static_cast<u16>(RequestPolicyId::Http11PreserveHostLowercase);
+    outcome.response_policy_id = 1;
+    outcome.failure_policy_id = 1;
+    loop.backend.clear_ops();
+    loop.backend.fail_connect = true;
+    handle_jit_outcome<SmallLoop>(&loop, *c, outcome, nullptr, true);
+
     CHECK_EQ(c->resp_status, 400u);
     CHECK_EQ(loop.backend.count_ops(MockOp::Connect), 0u);
     CHECK_EQ(loop.backend.count_ops(MockOp::Send), 1u);
