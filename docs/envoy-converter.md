@@ -979,11 +979,16 @@ alone is `PARTIAL` at most.
 3. First serialized differential smoke case: header-only HTTP/1.1 GET with a
    final `content-length` response, then fixed-length POST, connect failure,
    and route timeout, each as its own row.
-4. Route matching: `path` exact match, `prefix` ending in `/`, multiple routes
-   lowered as an ordered, first-match list (owner decision D3: by
-   construction — nested first-match arms in source order — not by proving
-   that list order and Rut's longest-prefix trie agree; see "Routing" above),
-   per-method rows, `direct_response`, `redirect`.
+4. Route matching: `path` exact match, multiple routes lowered as an
+   ordered, first-match list (owner decision D3: by construction — nested
+   first-match arms in source order — not by proving that list order and
+   Rut's longest-prefix trie agree; see "Routing" above), per-method rows,
+   `direct_response`, `redirect`. `prefix` ending in `/` (e.g. `"/api/"`) is
+   modeled by the parser but stays deferred behind an explicit byte-boundary
+   capability at lowering — `BLOCKED_BY_RUT` until Rut's route trie gains a
+   byte-level boundary check that distinguishes a slash-terminated prefix
+   from its unterminated form; see "Routing" above and
+   docs/envoy-compatibility.md.
 5. Header mutation: `request_headers_to_add/remove`,
    `response_headers_to_add/remove` at route and virtual-host level with
    Envoy's append-vs-overwrite semantics, `prefix_rewrite`,
