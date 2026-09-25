@@ -1710,6 +1710,60 @@ TEST(response_policy, upstream_header_order_accepts_empty_upstream_reason) {
         conn.response_header_buf.data(), conn.response_header_buf.len(), "content-length: 2\r\n"));
 }
 
+// Codex round-3 review: `resp.chunked` is only set when the Transfer-Encoding
+// token list contains "chunked"; a non-chunked coding (or one where chunked
+// is not the final token) leaves it false while the field is still present.
+// Envoy rejects any Transfer-Encoding value that is not exactly "chunked"
+// outright (source/common/http/http1/codec_impl.cc,
+// Http1ResponseCodeDetails::InvalidTransferEncoding) rather than forwarding
+// the coded bytes as an ordinary fixed-length body with the field dropped.
+TEST(response_policy, upstream_header_order_rejects_non_chunked_transfer_encoding) {
+    char server[] = "envoy";
+    ForwardResponsePolicySpec upstream_order{};
+    upstream_order.version = ResponsePolicyVersion::Http11;
+    upstream_order.framing = ResponsePolicyFraming::ContentLength;
+    upstream_order.connection = ResponsePolicyConnection::Request;
+    upstream_order.header_order = ResponsePolicyHeaderOrder::Upstream;
+    upstream_order.header_names = ResponsePolicyHeaderNames::Lowercase;
+    upstream_order.connection_header = ResponsePolicyConnectionHeader::CloseOnly;
+    upstream_order.status_reason = ResponsePolicyStatusReason::Canonical;
+    upstream_order.date = ResponsePolicyDate::PreserveOrCurrent;
+    upstream_order.server = {server, 5};
+    REQUIRE(response_policy_spec_valid(upstream_order));
+
+    RouteConfig config{};
+    REQUIRE_EQ(config.add_response_policy(upstream_order), 1u);
+
+    static constexpr const char* kUpstreams[] = {
+        // A non-chunked coding alone: resp.chunked stays false.
+        "HTTP/1.1 200 OK\r\nContent-Length: 2\r\nTransfer-Encoding: gzip\r\n\r\nhi",
+        // "chunked" present but not the sole/final coding: resp.chunked is
+        // still set true by the token scan, but this exercises the same
+        // header-presence guard for a value real Envoy also rejects (the
+        // full header value is not exactly "chunked").
+        "HTTP/1.1 200 OK\r\nContent-Length: 2\r\nTransfer-Encoding: chunked, gzip\r\n\r\nhi",
+    };
+    for (const char* upstream : kUpstreams) {
+        u8 header_storage[SlicePool::kSliceSize]{};
+        Connection conn{};
+        conn.reset();
+        conn.response_header_slice = header_storage;
+        conn.response_header_buf.bind(header_storage, sizeof(header_storage));
+        conn.response_policy_id = 1;
+        conn.keep_alive = true;
+        conn.req_client_keep_alive = true;
+
+        HttpResponseParser parser;
+        ParsedResponse response;
+        parser.reset();
+        response.reset();
+        const u32 len = static_cast<u32>(__builtin_strlen(upstream));
+        REQUIRE_EQ(parser.parse(reinterpret_cast<const u8*>(upstream), len, &response),
+                   ParseStatus::Complete);
+        CHECK_FALSE(build_strict_response_headers(conn, config, response));
+    }
+}
+
 TEST(response_policy, failure_head_mode_config_copy_is_owned_and_deduplicated) {
     char reason[] = "Bad Gateway";
     char type[] = "text/plain";

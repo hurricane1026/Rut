@@ -11201,6 +11201,19 @@ inline bool build_upstream_order_response_headers(
         if (response_policy_name_eq(resp.headers[i].name, "connection", 10) &&
             ++connection_count > 1)
             return false;
+        // `resp.chunked` (rejected above) is only set when the Transfer-Encoding
+        // token list contains "chunked"; a coding such as `gzip` or
+        // `chunked, gzip` leaves it false while still carrying the field, which
+        // would otherwise pass the has_content_length/!chunked preconditions
+        // above and be forwarded as an ordinary fixed-length body with the
+        // field silently dropped. Envoy rejects the message outright: any
+        // Transfer-Encoding value that is not exactly "chunked" is a protocol
+        // error (ConnectionImpl::onHeadersCompleteImpl,
+        // source/common/http/http1/codec_impl.cc,
+        // Http1ResponseCodeDetails::InvalidTransferEncoding, RFC 7230 §3.3.3).
+        // Match that fail-closed behavior instead of merely filtering the
+        // header.
+        if (response_policy_name_eq(resp.headers[i].name, "transfer-encoding", 17)) return false;
     }
     Str reason{};
     if (!canonical_status_reason(resp.status_code, &reason)) return false;

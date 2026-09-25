@@ -2011,8 +2011,65 @@ or OWS-only `Expect` field is admitted like a request with no `Expect`
 header at all, matching the same nonempty-trimmed-value condition described
 above. See `docs/language-card.md` for the exact field grammar and
 `docs/envoy-converter.md` for the byte-level Envoy oracle this profile is
-verified against. A parallel, separately-closed `response_policy` exists for
-response-side rewriting; see `docs/language-card.md`.
+verified against.
+
+**Response rewrite policy (`response_policy`)**
+
+`forward(upstream, response_policy: { ... })` is `request_policy`'s
+response-side counterpart: a fixed, closed byte-for-byte serialization of the
+upstream response instead of the transparent zero-copy default. Admission is
+bounded to a cleartext HTTP/1.1, origin-form, bodyless non-HEAD request and
+one final upstream HTTP/1.1 response framed by exactly one `Content-Length`
+(chunking, trailers, close-delimited framing, and 1xx/204/304/no-body
+responses all fail closed). Two closed profiles exist:
+
+```swift
+// Fixed-order profile (nginx-compatible default): synthesizes the response
+// in a fixed field order, replacing Server/Date and applying hide_headers.
+return forward(users, response_policy: {
+    version: "HTTP/1.1", framing: "content_length", connection: "request",
+    server: "nginx/1.29.7", date: "current", hide_headers: ["Date", "Server", "X-Pad"]
+})
+
+// Envoy-compatible H1 profile (`header_order: "upstream"`): preserves the
+// upstream's header order instead of the fixed layout above.
+return forward(users, response_policy: {
+    version: "HTTP/1.1", framing: "content_length", connection: "request",
+    header_order: "upstream", header_names: "lowercase",
+    connection_header: "close_only", status_reason: "canonical",
+    server: "envoy", date: "preserve_or_current", hide_headers: []
+})
+```
+
+`header_order: "upstream"` lowercases every forwarded header name, preserves
+upstream header order, keeps an upstream `date` in place or appends one when
+absent (`date: "preserve_or_current"`), replaces the first `server` value in
+place (or appends when absent), appends `connection: close` last only when
+the downstream connection is closing, and always substitutes the canonical
+reason phrase for the status code -- including when the upstream sent an
+empty reason phrase, since it is never forwarded. `hide_headers` cannot
+suppress `Content-Length`: it is the sole framing field this profile admits
+(exactly one, required by the preconditions above), so a hide-list entry
+naming it is not honored, mirroring how the fixed-order profile never routes
+`Content-Length` through its own hide check either. A response carrying
+`Transfer-Encoding` is rejected outright regardless of its value (not merely
+stripped): Envoy treats any Transfer-Encoding value other than exactly
+`chunked` as a protocol error
+(`ConnectionImpl::onHeadersCompleteImpl`, `source/common/http/http1/codec_impl.cc`),
+and forwarding the coded bytes as an ordinary fixed-length body would
+silently corrupt them.
+
+`header_order: "upstream"`'s five governing fields (`header_order`,
+`header_names`, `connection_header`, `status_reason`, `date`) are required
+together at these exact values; the fixed-order profile (all five at their
+default) rejects any of them being set to anything else. Like
+`request_policy`'s `host: "preserve"`, this is an ordinary-forward-only
+combination: `response_read_timeout`, `response_buffering`, and
+`timeout_failure_policy` are rejected alongside it, enforced at analyze
+(`src/compiler/analyze.cc`), `compile_to_config.h`, and the `route_table.h`
+bundle-admission trust boundary. See `docs/language-card.md` for the exact
+field grammar and `docs/envoy-converter.md` for the byte-level Envoy oracle
+this profile is verified against.
 
 #### 3.4.6 Response Caching
 
