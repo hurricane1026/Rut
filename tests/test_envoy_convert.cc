@@ -1514,7 +1514,8 @@ TEST(envoy_convert, api_forged_model_rejected) {
     // not lower successfully.
     envoy::Bootstrap renamed_cluster_stale_load_assignment = parsed.value();
     renamed_cluster_stale_load_assignment.listener.filter_chain.hcm.route_config.virtual_host
-        .routes[0].action.cluster = lit_str("renamed");
+        .routes[0]
+        .action.cluster = lit_str("renamed");
     renamed_cluster_stale_load_assignment.clusters[0].name = lit_str("renamed");
     const auto renamed_cluster_stale_load_assignment_result =
         envoy::lower_to_rut(renamed_cluster_stale_load_assignment, all_true);
