@@ -1107,10 +1107,18 @@ Each needs its own issue before the corresponding row can leave
   upstream `date` in place or appends `date: <now>` when absent (`date` then
   `server` when both are absent), appends `connection: close` last only when
   the downstream connection is closing, and looks up the canonical reason
-  phrase from a fixed table (failing closed for an unmapped status,
-  including when the upstream's own reason phrase is empty — it is never
-  forwarded). `hide_headers` can never suppress `Content-Length`, the sole
-  framing field this profile admits. Verified byte for byte against
+  phrase from a table mirroring Envoy's `CodeUtility::toString`
+  (`source/common/http/codes.cc`, v1.39.1) byte for byte, covering every
+  status this profile admits (200..599 minus the no-body exclusions
+  204/205/304): an admitted status Envoy's own table does not name (e.g.
+  299) gets `Unknown`, matching `CodeUtility::toString`'s own fallthrough,
+  rather than being rejected (Codex round-11 review of #698). The upstream's
+  own reason phrase is never forwarded — the canonical phrase always
+  replaces it — so an empty upstream reason phrase (`HTTP/1.1 200 \r\n`,
+  which `parse_response` accepts per RFC 7230 §3.1.2) needs no special case
+  and is accepted like any other. `hide_headers` can never suppress
+  `Content-Length`, the sole framing field this profile admits. Verified
+  byte for byte against
   `tests/fixtures/envoy_oracle_milestone_s.inc`; see
   `docs/envoy-compatibility.md`. An explicit "pass through upstream `server`"
   mode for `server_header_transformation: PASS_THROUGH` is not modeled.
