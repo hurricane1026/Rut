@@ -38,6 +38,7 @@
 #include <cstring>
 #include <ctime>
 #include <fstream>
+#include <functional>
 #include <iostream>
 #include <map>
 #include <mutex>
@@ -288,20 +289,37 @@ bool allocate_reserved_closed_port(BoundPort* out) {
     return true;
 }
 
-bool allocate_distinct_ports(const std::vector<uint16_t*>& outs) {
+// Core of allocate_distinct_ports(), parameterized on the port source so
+// self_test_allocate_distinct_ports_exhaustion() can force the "every
+// attempt collides" path deterministically (round-9 review, "Return failure
+// when no distinct port was found") without needing to actually exhaust real
+// ephemeral ports. Tracks whether *each* output got assigned and fails the
+// whole call the moment one output's 32 attempts all collide with an
+// already-seen port -- previously the loop just fell through to the next
+// output, leaving that output's pointee at its caller-supplied initial value
+// (zero-initialized in the current caller) while still returning success.
+bool allocate_distinct_ports_with(const std::vector<uint16_t*>& outs,
+                                  const std::function<bool(uint16_t*)>& allocate_one) {
     std::vector<uint16_t> seen;
     for (uint16_t* out : outs) {
+        bool assigned = false;
         for (int attempt = 0; attempt < 32; attempt++) {
             uint16_t candidate = 0;
-            if (!allocate_loopback_port(&candidate)) return false;
+            if (!allocate_one(&candidate)) return false;
             if (std::find(seen.begin(), seen.end(), candidate) == seen.end()) {
                 seen.push_back(candidate);
                 *out = candidate;
+                assigned = true;
                 break;
             }
         }
+        if (!assigned) return false;
     }
     return true;
+}
+
+bool allocate_distinct_ports(const std::vector<uint16_t*>& outs) {
+    return allocate_distinct_ports_with(outs, allocate_loopback_port);
 }
 
 int connect_with_timeout(uint16_t port, int timeout_ms) {
@@ -916,7 +934,18 @@ struct EnvoyInstance {
         //   -e ENVOY_UID=0
         //   -v <bootstrap>:/etc/envoy/rut-bootstrap.json:ro,z
         //   <image> -c /etc/envoy/rut-bootstrap.json
-        //   --concurrency 1 --disable-hot-restart --log-level warn
+        //   --concurrency 1 --disable-hot-restart --log-level info
+        //
+        // --log-level is "info", not the quieter "warn" used before the
+        // round-9 review: wait_ready_and_confirm_ownership()'s launch-
+        // specific ownership evidence (envoy_log_confirms_listener()) keys
+        // off Envoy's `starting main dispatch loop` line, which Envoy logs
+        // at ENVOY_LOG(info, ...) (source/server/server.cc,
+        // InstanceBase::run()); at "warn" that line is filtered out and
+        // ownership could never be confirmed against a real container. This
+        // does not touch the bootstrap JSON itself (still byte-identical to
+        // what pair mode and the oracle use) or the recorded wire bytes of
+        // any case, only Envoy's own stderr verbosity.
         //
         // VERIFY (envoy-pr-plan.md PR2): the official image's
         // distribution/docker/docker-entrypoint.sh (checked at tag
@@ -944,7 +973,7 @@ struct EnvoyInstance {
             "ENVOY_UID=0",   "-v",        bootstrap_path + ":/etc/envoy/rut-bootstrap.json:ro,z",
             kEnvoyImage,     "-c",        "/etc/envoy/rut-bootstrap.json",
             "--concurrency", "1",         "--disable-hot-restart",
-            "--log-level",   "warn"};
+            "--log-level",   "info"};
         const std::vector<char*> args = build_argv(argv);
         pid = fork();
         if (pid < 0) return false;
@@ -970,6 +999,16 @@ struct EnvoyInstance {
             for (;;) {
                 const pid_t waited = waitpid(pid, &status, WNOHANG);
                 if (waited == pid) break;
+                if (waited < 0 && errno == ECHILD) {
+                    // Already reaped by someone else (e.g. a caller that
+                    // explicitly waitpid()'d this pid before dropping the
+                    // EnvoyInstance) -- round-9 review, "Treat ECHILD as an
+                    // already-stopped child". Without this, a stale/reaped
+                    // pid would sit through the full 5s deadline below and
+                    // then be signaled again, potentially hitting an
+                    // unrelated process if the pid has since been recycled.
+                    break;
+                }
                 if (now_ms() >= deadline) {
                     kill(pid, SIGKILL);
                     while (waitpid(pid, &status, 0) < 0 && errno == EINTR) {
@@ -990,6 +1029,52 @@ void dump_log(const std::string& path) {
     std::ifstream in(path);
     if (!in) return;
     std::cerr << "---- envoy log (" << path << ") ----\n" << in.rdbuf() << "\n---- end log ----\n";
+}
+
+std::string read_file_contents(const std::string& path) {
+    std::ifstream in(path);
+    if (!in) return std::string();
+    std::stringstream ss;
+    ss << in.rdbuf();
+    return ss.str();
+}
+
+// Pure, self-test-friendly ownership evidence check: does `contents` (the
+// captured stdout+stderr of an Envoy child) prove that *this specific
+// process* finished startup owning its listeners?
+//
+// A generic protocol-level reply (probe_confirms_envoy_ownership()) cannot
+// rule out a foreign Envoy-like process answering on the same port while our
+// own launched container is still starting or has already lost the bind
+// race (round-9 review, "Use a launch-specific listener ownership
+// challenge"): any Envoy that happens to be listening produces the same
+// 404/"server: envoy"/empty-body reply for the probe's asterisk-form
+// request. What is launch-specific is the *process itself*: Envoy logs
+// `starting main dispatch loop` (source/server/server.cc,
+// InstanceBase::run(), `ENVOY_LOG(info, "starting main dispatch loop")`,
+// verified against the v1.39.1 tag) right before it enters its blocking
+// event loop, and it only reaches that point after every configured
+// listener has already been added and successfully bound -- a bind failure
+// during config application aborts startup before run() is ever called. So
+// this exact line appearing in *our* launched child's own log is
+// launch-specific evidence that our child (not some other process) owns the
+// listener, regardless of what any other process on the port answers.
+//
+// A bind collision is reported separately, as an "address already in use"
+// message (see log_indicates_address_in_use()); if that appears anywhere in
+// the log, ownership is never confirmed by this function even if a startup
+// line also appears (defensive -- the two should never coexist for the same
+// listener in practice).
+bool envoy_log_confirms_listener(const std::string& contents) {
+    std::string lower = contents;
+    std::transform(lower.begin(), lower.end(), lower.begin(), [](unsigned char c) {
+        return static_cast<char>(std::tolower(c));
+    });
+    if (lower.find("address already in use") != std::string::npos ||
+        lower.find("address in use") != std::string::npos) {
+        return false;
+    }
+    return contents.find("starting main dispatch loop") != std::string::npos;
 }
 
 bool wait_ready(uint16_t port, EnvoyInstance& envoy, int timeout_ms, std::string* error) {
@@ -1055,7 +1140,15 @@ bool wait_ready_and_confirm_ownership(
     }
 
     // Real confirmation: the protocol-level probe, retried within the
-    // overall readiness deadline.
+    // overall readiness deadline. The probe alone is not launch-specific --
+    // any Envoy-like process answering on `port` produces the same reply
+    // (round-9 review, "Use a launch-specific listener ownership
+    // challenge") -- so a probe success is only provisional until this
+    // launched child's own captured log also reports having finished
+    // startup as the owner of its listeners (envoy_log_confirms_listener()).
+    // A foreign listener that happens to answer like Envoy therefore still
+    // fails here, because nothing ever writes that line into *our* child's
+    // log file.
     std::string probe_error;
     for (;;) {
         if (envoy.pid > 0) {
@@ -1067,9 +1160,15 @@ bool wait_ready_and_confirm_ownership(
                 return false;
             }
         }
-        if (probe_confirms_envoy_ownership(port, 1000, &probe_error)) return true;
+        if (probe_confirms_envoy_ownership(port, 1000, &probe_error) &&
+            envoy_log_confirms_listener(read_file_contents(envoy.log_path))) {
+            return true;
+        }
         if (now_ms() >= deadline) {
-            *error = "timed out confirming listener ownership: " + probe_error;
+            *error =
+                "timed out confirming listener ownership (protocol probe and/or launch-specific "
+                "log evidence never both succeeded): " +
+                probe_error;
             return false;
         }
         struct timespec retry_ts{0, 50'000'000};
@@ -1952,6 +2051,66 @@ bool self_test_argv_builder() {
     return ok;
 }
 
+// Covers round-9 review thread P3 ("Return failure when no distinct port was
+// found"): if every one of an output's 32 allocation attempts collides with
+// an already-seen port, allocate_distinct_ports() must fail the whole call
+// instead of silently leaving that output unassigned and still reporting
+// success. Forces the exhaustion path deterministically via
+// allocate_distinct_ports_with()'s injectable port source (a fixed port
+// repeated forever), rather than trying to actually exhaust real ephemeral
+// ports.
+bool self_test_allocate_distinct_ports_exhaustion() {
+    bool ok = true;
+
+    // A source that always returns the same port can never produce a second
+    // distinct value, so the second output's 32 attempts must all collide.
+    {
+        uint16_t out1 = 0, out2 = 0;
+        const bool result = allocate_distinct_ports_with({&out1, &out2}, [](uint16_t* port) {
+            *port = 4242;
+            return true;
+        });
+        if (result) {
+            std::cerr << "FAIL [self-test allocate distinct ports exhaustion]: expected failure "
+                         "when every candidate collides, got success\n";
+            ok = false;
+        }
+    }
+
+    // A source that fails outright must also fail the call (pre-existing
+    // behavior, checked here for completeness alongside the exhaustion
+    // path).
+    {
+        uint16_t out1 = 0;
+        const bool result = allocate_distinct_ports_with({&out1}, [](uint16_t*) { return false; });
+        if (result) {
+            std::cerr << "FAIL [self-test allocate distinct ports exhaustion]: expected failure "
+                         "when the port source fails, got success\n";
+            ok = false;
+        }
+    }
+
+    // Sanity check: a source that always produces a fresh distinct port
+    // still succeeds and assigns every output.
+    {
+        uint16_t out1 = 0, out2 = 0;
+        uint16_t next = 100;
+        const bool result = allocate_distinct_ports_with({&out1, &out2}, [&next](uint16_t* port) {
+            *port = next++;
+            return true;
+        });
+        if (!result || out1 != 100 || out2 != 101) {
+            std::cerr << "FAIL [self-test allocate distinct ports exhaustion]: expected success "
+                         "with distinct assigned ports 100/101, got result="
+                      << result << " out1=" << out1 << " out2=" << out2 << "\n";
+            ok = false;
+        }
+    }
+
+    if (ok) std::cerr << "PASS [self-test allocate distinct ports exhaustion]\n";
+    return ok;
+}
+
 // A minimal stand-in for a foreign listener, used only by
 // self_test_wait_ready_ownership() below: it adopts an already-bound,
 // already-listening socket and answers every connection made to it with a
@@ -2129,15 +2288,27 @@ bool self_test_wait_ready_ownership() {
         int status = 0;
         while (waitpid(child, &status, 0) < 0 && errno == EINTR) {
         }
+        // Reaped explicitly above; clear envoy.pid so ~EnvoyInstance()'s
+        // stop() below doesn't wait out its 5s deadline on an already-reaped
+        // (or worse, recycled) pid (round-9 review, "Treat ECHILD as an
+        // already-stopped child").
+        envoy.pid = -1;
         listener.stop();
     }
 
-    // Case 3 (positive): the tracked child stays alive, and the listener it
-    // owns answers exactly like the milestone-S bootstrap's real
+    // Case 3 (negative -- round-9 review, "Use a launch-specific listener
+    // ownership challenge"): the tracked child stays alive, and a *foreign*
+    // listener answers exactly like the milestone-S bootstrap's real
     // router-not-found local reply for an asterisk-form request does (404,
     // "server: envoy", empty body -- see tests/fixtures/
-    // envoy_oracle_milestone_s.inc's own `options_star` case). Ownership
-    // must be confirmed.
+    // envoy_oracle_milestone_s.inc's own `options_star` case). Before the
+    // round-9 fix this alone was accepted as confirmed ownership; now the
+    // protocol reply matching is not enough, because envoy.log_path (this
+    // process's own captured log, checked by envoy_log_confirms_listener())
+    // never gets Envoy's `starting main dispatch loop` line -- nothing ever
+    // wrote to that path. Ownership must NOT be confirmed, and envoy.pid
+    // must still be set (rejection comes from the log check outliving the
+    // protocol probe, not from the child having exited).
     {
         BoundPort foreign;
         if (!allocate_bound_loopback_port(&foreign)) {
@@ -2167,12 +2338,93 @@ bool self_test_wait_ready_ownership() {
         }
         EnvoyInstance envoy;
         envoy.pid = child;
+        envoy.log_path = "/nonexistent/rut-envoy-selftest-case3.log";
+        std::string error;
+        const bool confirmed =
+            wait_ready_and_confirm_ownership(foreign.port, envoy, 1200, 100, &error);
+        if (confirmed) {
+            std::cerr << "FAIL [self-test wait_ready ownership]: confirmed ownership of a "
+                         "foreign listener that merely answered like Envoy, with no "
+                         "launch-specific log evidence\n";
+            ok = false;
+        }
+        if (error.empty()) {
+            std::cerr << "FAIL [self-test wait_ready ownership]: expected a non-empty error on "
+                         "case 3 (matching reply, no log evidence)\n";
+            ok = false;
+        }
+        if (envoy.pid != child) {
+            std::cerr << "FAIL [self-test wait_ready ownership]: case 3 cleared envoy.pid, but "
+                         "the tracked child never exited -- rejection must come from the log "
+                         "check, not from process liveness\n";
+            ok = false;
+        }
+        kill(child, SIGKILL);
+        int status = 0;
+        while (waitpid(child, &status, 0) < 0 && errno == EINTR) {
+        }
+        // See case 2's comment: clear envoy.pid after an explicit reap.
+        envoy.pid = -1;
+        listener.stop();
+    }
+
+    // Case 4 (positive): same matching protocol reply as case 3, but this
+    // time envoy.log_path names a real file containing Envoy's post-bind
+    // startup line (as the launched child's own captured stdout+stderr
+    // would after a real bind succeeds). Ownership must be confirmed.
+    {
+        BoundPort foreign;
+        if (!allocate_bound_loopback_port(&foreign)) {
+            std::cerr
+                << "FAIL [self-test wait_ready ownership]: could not allocate a loopback port\n";
+            return false;
+        }
+        const std::string envoy_like_reply =
+            "HTTP/1.1 404 Not Found\r\ncontent-length: 0\r\nserver: envoy\r\n\r\n";
+        FakeReplyListener listener;
+        if (!listener.adopt(foreign.fd, envoy_like_reply)) {
+            std::cerr << "FAIL [self-test wait_ready ownership]: could not adopt the foreign "
+                         "listener socket\n";
+            close(foreign.fd);
+            return false;
+        }
+        const std::string dir = make_temp_dir("rut-envoy-selftest-case4");
+        if (dir.empty()) {
+            std::cerr << "FAIL [self-test wait_ready ownership]: could not create temp dir for "
+                         "case 4's fake log\n";
+            listener.stop();
+            return false;
+        }
+        const std::string log_path = dir + "/envoy.log";
+        if (!write_file_mode(log_path,
+                             "[info] initializing epoch 0\n[info] starting main dispatch loop\n",
+                             0644)) {
+            std::cerr << "FAIL [self-test wait_ready ownership]: could not write case 4's fake "
+                         "log\n";
+            listener.stop();
+            return false;
+        }
+        const pid_t child = fork();
+        if (child < 0) {
+            std::cerr << "FAIL [self-test wait_ready ownership]: fork failed\n";
+            listener.stop();
+            return false;
+        }
+        if (child == 0) {
+            struct timespec ts{5, 0};
+            nanosleep(&ts, nullptr);
+            _exit(0);
+        }
+        EnvoyInstance envoy;
+        envoy.pid = child;
+        envoy.log_path = log_path;
         std::string error;
         const bool confirmed =
             wait_ready_and_confirm_ownership(foreign.port, envoy, 2000, 200, &error);
         if (!confirmed) {
             std::cerr << "FAIL [self-test wait_ready ownership]: did not confirm ownership for a "
-                         "listener answering like Envoy: "
+                         "listener answering like Envoy with launch-specific log evidence "
+                         "present: "
                       << error << "\n";
             ok = false;
         }
@@ -2180,10 +2432,42 @@ bool self_test_wait_ready_ownership() {
         int status = 0;
         while (waitpid(child, &status, 0) < 0 && errno == EINTR) {
         }
+        // See case 2's comment: clear envoy.pid after an explicit reap.
+        envoy.pid = -1;
         listener.stop();
     }
 
     if (ok) std::cerr << "PASS [self-test wait_ready ownership]\n";
+    return ok;
+}
+
+// Covers round-9 review thread P2 ("Use a launch-specific listener
+// ownership challenge"): envoy_log_confirms_listener() is the small pure
+// function the log-based ownership check reduces to, exercised directly
+// here with three literal strings so its logic is verified independent of
+// any process/log-file plumbing.
+bool self_test_envoy_log_confirms_listener() {
+    bool ok = true;
+
+    if (!envoy_log_confirms_listener("[info] starting main dispatch loop\n")) {
+        std::cerr << "FAIL [self-test envoy log confirms listener]: startup line present should "
+                     "confirm\n";
+        ok = false;
+    }
+
+    if (envoy_log_confirms_listener("[critical] Address already in use: bind: [::]:10000\n")) {
+        std::cerr << "FAIL [self-test envoy log confirms listener]: address-in-use present "
+                     "should never confirm\n";
+        ok = false;
+    }
+
+    if (envoy_log_confirms_listener("[info] loading 1 listener(s)\n")) {
+        std::cerr << "FAIL [self-test envoy log confirms listener]: neither line present should "
+                     "never confirm\n";
+        ok = false;
+    }
+
+    if (ok) std::cerr << "PASS [self-test envoy log confirms listener]\n";
     return ok;
 }
 
@@ -2243,6 +2527,8 @@ int run_self_test() {
     ok &= self_test_recording_upstream();
     ok &= self_test_partial_exchange_rejection();
     ok &= self_test_argv_builder();
+    ok &= self_test_allocate_distinct_ports_exhaustion();
+    ok &= self_test_envoy_log_confirms_listener();
     ok &= self_test_wait_ready_ownership();
     ok &= self_test_reserved_closed_port();
     return ok ? 0 : 1;
