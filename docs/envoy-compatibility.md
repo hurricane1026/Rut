@@ -66,7 +66,7 @@ every bootstrap indefinitely.
 | Listener: optional `name`, one IPv4 `socket_address` with `port_value` 1..65535, one filter chain with no match and no transport socket | yes: IPv6, hostnames, `pipe`, `protocol`, `additional_addresses`, `listener_filters`, `filter_chain_match`, `transport_socket`, multiple listeners/chains rejected | yes: `kShippedRutCapabilities` is all true (PR5) | yes | golden + unit wire tests; pinned Envoy v1.39.1 pair differential, CI run `36069445967`, zero skips | SUPPORTED |
 | HTTP connection manager: v3 `@type`, non-empty `stat_prefix`, `codec_type: "HTTP1"` required, `generate_request_id: false` required, inline `route_config`, `http_filters` = exactly the router | yes: other network filters, other `@type`, `codec_type` omitted/`AUTO`/`HTTP2`/`HTTP3` (AUTO permits downstream h2c, out of scope), `generate_request_id` omitted or `true`, `rds`, `access_log`, `tracing`, `use_remote_address`, `server_name`, non-router HTTP filters rejected | yes: `kShippedRutCapabilities` is all true (PR5) | yes | golden + unit wire tests; pinned Envoy v1.39.1 pair differential, CI run `36069445967`, zero skips | SUPPORTED |
 | Route table: one virtual host with `domains: ["*"]`, one route `match.prefix: "/"` with `route.cluster` naming the declared cluster | yes: host lists, multiple virtual hosts/routes, `path`/`safe_regex`/headers matchers, non-`/` prefixes, `redirect`, `direct_response`, `weighted_clusters`, route `retry_policy`/rewrites, undeclared cluster references rejected | yes: `kShippedRutCapabilities` is all true (PR5) | yes | golden + unit wire tests; pinned Envoy v1.39.1 pair differential, CI run `36069445967`, zero skips | SUPPORTED |
-| Cluster: `type` omitted or `STATIC`, positive `connect_timeout` with millisecond precision, `load_assignment` with required `cluster_name` matching the cluster and one locality with one IPv4 `lb_endpoints` entry | yes: `STRICT_DNS`/`LOGICAL_DNS`/`EDS`/`ORIGINAL_DST`, `lb_policy`, `health_checks`, `circuit_breakers`, `outlier_detection`, `transport_socket`, weights, `locality`, multiple localities/endpoints, sub-millisecond or zero durations, omitted or mismatched `load_assignment.cluster_name` rejected | yes: `kShippedRutCapabilities` is all true (PR5) | yes | golden + unit wire tests; pinned Envoy v1.39.1 pair differential, CI run `36069445967`, zero skips | SUPPORTED |
+| Cluster: `type` omitted or `STATIC`, positive `connect_timeout` with millisecond precision, `load_assignment` with required `cluster_name` matching the cluster and one locality with one IPv4 `lb_endpoints` entry | yes: `STRICT_DNS`/`LOGICAL_DNS`/`EDS`/`ORIGINAL_DST`, `lb_policy`, `health_checks`, `circuit_breakers`, `outlier_detection`, `transport_socket`, weights, `locality`, multiple localities/endpoints, sub-millisecond or zero durations, omitted or mismatched `load_assignment.cluster_name` rejected | yes: `kShippedRutCapabilities` is all true (PR5) | yes for the STATIC single-endpoint shape; `connect_timeout` is parsed and validated but not enforced (Rut uses a fixed 30s `kDefaultUpstreamTimeout` per event loop, see the Blocked-by-Rut table) | golden + unit wire tests; pinned Envoy v1.39.1 pair differential, CI run `36069445967`, zero skips (the differential's connect-failure case is an immediate connection refusal, not a `connect_timeout` expiry, so it does not exercise timeout parity) | PARTIAL: SUPPORTED for the STATIC/single-endpoint cluster shape; `connect_timeout` enforcement stays PARTIAL (see the Blocked-by-Rut table) |
 | Router filter `suppress_envoy_headers: true` (v3 `Router` typed_config; also accepts `suppressEnvoyHeaders`) | yes: boolean-only, duplicate-spelling rejection, only valid inside the router's typed_config | required (milestone-S; see docs/envoy-converter.md) | removes `x-envoy-upstream-service-time` / `x-envoy-expected-rq-timeout-ms`; no separate RUT surface needed once emitted | none | NOT_IMPLEMENTED |
 | Route action `timeout: "0s"` (proto3 JSON `Duration`, zero permitted) | yes: `"0s"` through `"4294967s"`, sub-millisecond and non-numeric forms rejected | required (milestone-S; a present, non-zero `timeout` is also rejected until a RUT route-timeout surface exists) | none needed for `"0s"` (removes the implicit 15s default); non-zero values are BLOCKED_BY_RUT | none | NOT_IMPLEMENTED |
 
@@ -289,14 +289,20 @@ as CTest `test_envoy_pair_milestone_s` (`integration;envoy;docker`,
 `RESOURCE_LOCK envoy-differential`, `SKIP_RETURN_CODE 77`), runs in the
 `envoy-required` CI job, and uploads its transcript as the
 `envoy-pair-transcript` artifact (`build/envoy_pair_milestone_s.inc`). It has
-not yet run in CI (no docker in this environment); `--self-test <rut>
-<rut-envoy-convert>` exercises the identical comparison logic locally,
-without docker, against the committed Envoy oracle fixture, and passed for
-all six asserted cases as of this PR (see the internal evidence note below).
+run in CI twice: run `36069445967` matched on the six then-asserted cases
+(`get_smoke`, `get_upstream_date_server`, `get_client_close`, `head_smoke`,
+`post_fixed`, `connect_failure`) with zero skips and additionally recorded
+`get_hop_by_hop`, `trace` and `options_star` as equal, which promoted those
+three to asserted; run `36070125213` then matched all nine asserted cases
+with zero skips. `--self-test <rut> <rut-envoy-convert>` exercises the
+identical comparison logic locally, without docker, against the committed
+Envoy oracle fixture, and passes for all nine asserted cases as of this
+revision (see the internal evidence notes below).
 
-Each row below is `PARTIAL` until a passing CI run of
-`test_envoy_pair_milestone_s` (zero skips) is cited by run id; the lead
-promotes a row to `SUPPORTED` at that point, not before.
+Each row below stays `PARTIAL` (or lower) until a passing CI run of
+`test_envoy_pair_milestone_s` (zero skips) for that exact case is cited by
+run id; the lead promotes a row to `SUPPORTED` at that point, not before.
+`connect_authority` is not asserted and is not promoted by either run.
 
 | Pair case | method/path | parser | converter | RUT capability | asserted | status |
 | --- | --- | --- | --- | --- | --- | --- |
@@ -434,3 +440,19 @@ promotes a row to `SUPPORTED` at that point, not before.
   docker and has not yet run in CI. No status changes in this PR; every pair
   row above stays `PARTIAL` until a passing `envoy-required` CI run of
   `test_envoy_pair_milestone_s` is cited by run id.
+- Promotion, CI run `36069445967`: the `envoy-required` job ran
+  `test_envoy_pair_milestone_s` against pinned Envoy v1.39.1 with zero skips.
+  The six then-asserted cases matched, and the transcript additionally showed
+  `get_hop_by_hop`, `trace` and `options_star` equal, so those three moved
+  from record-only to asserted (`kAssertedCaseNames` grew from six to nine
+  entries, mirrored in `--self-test`'s RUT-vs-oracle pass). The milestone
+  table rows and the `connect_failure`/six originally-asserted pair rows were
+  promoted to `SUPPORTED` with this run id; `get_hop_by_hop`, `trace` and
+  `options_star` stayed `PARTIAL` pending a run where they are asserted.
+  `connect_authority` stays record-only: Envoy adds `connection: close` to
+  that 404 and closes, Rut does not.
+- Promotion, CI run `36070125213`: the `envoy-required` job ran
+  `test_envoy_pair_milestone_s` again, now asserting all nine cases, and
+  matched with zero skips. The `get_hop_by_hop`, `trace` and `options_star`
+  pair rows were promoted to `SUPPORTED` with this run id. `connect_authority`
+  remains the only non-asserted, `PARTIAL` pair row.
