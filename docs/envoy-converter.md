@@ -1097,8 +1097,11 @@ Each needs its own issue before the corresponding row can leave
   upstream `date` in place or appends `date: <now>` when absent (`date` then
   `server` when both are absent), appends `connection: close` last only when
   the downstream connection is closing, and looks up the canonical reason
-  phrase from a fixed table (failing closed for an unmapped status). Verified
-  byte for byte against `tests/fixtures/envoy_oracle_milestone_s.inc`; see
+  phrase from a fixed table (failing closed for an unmapped status,
+  including when the upstream's own reason phrase is empty — it is never
+  forwarded). `hide_headers` can never suppress `Content-Length`, the sole
+  framing field this profile admits. Verified byte for byte against
+  `tests/fixtures/envoy_oracle_milestone_s.inc`; see
   `docs/envoy-compatibility.md`. An explicit "pass through upstream `server`"
   mode for `server_header_transformation: PASS_THROUGH` is not modeled.
 - Route-level `set_header` on the upstream request is available for literal
