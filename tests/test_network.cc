@@ -4235,12 +4235,15 @@ TEST(request_policy, preserve_host_lowercase_wire_and_fail_closed_host) {
     // no `internal_address_config`) must never reach the upstream, regardless
     // of what the client sends -- an untrusted client must not be able to
     // inject retry/timeout/tracing instructions Envoy's own control plane
-    // would otherwise own. A header outside that fixed removal set --
-    // including `x-envoy-internal` itself, which Envoy only ever overwrites
-    // on the internal-request branch this profile never takes, and
-    // `x-envoy-original-host`, one of the edge-request-only removals that is
-    // unreachable under this fixed shape -- passes through unchanged like any
-    // other header.
+    // would otherwise own. `x-envoy-internal` is stripped as well, by
+    // `mutateRequestHeaders` itself rather than by `cleanInternalHeaders`:
+    // `removeEnvoyInternalRequest()` (conn_manager_utility.cc:142) runs
+    // unconditionally and the header is only ever written back on the
+    // `internal_request` branch, which needs `use_remote_address` and is
+    // therefore unreachable here (Codex round-7 review). A header outside
+    // that fixed removal set -- `x-envoy-original-host`, one of the
+    // edge-request-only removals that is unreachable under this fixed shape
+    // -- passes through unchanged like any other header.
     prepare(
         "GET /envoy-internal-headers HTTP/1.1\r\n"
         "Host: client.example\r\n"
@@ -4251,13 +4254,61 @@ TEST(request_policy, preserve_host_lowercase_wire_and_fail_closed_host) {
     REQUIRE(apply_request_policy(conn, endpoint, kPreserveHost));
     require_wire(
         "GET /envoy-internal-headers HTTP/1.1\r\nhost: client.example\r\n"
-        "x-envoy-internal: true\r\nx-envoy-original-host: internal.example\r\n"
+        "x-envoy-original-host: internal.example\r\n"
         "x-forwarded-proto: http\r\n\r\n");
-    // Every other named header in the fixed removal set is dropped too, not
-    // only the two exercised above.
+    // Positive strip test for the two round-7 additions on their own. A
+    // client-forged `x-envoy-internal: true` (the exact value Envoy itself
+    // writes on the internal branch) must not survive, and neither may a
+    // client-supplied `x-forwarded-client-cert`: `mutateXfccRequestHeader`
+    // applies the HCM's `forward_client_cert_details`, whose default is
+    // `SANITIZE`, and `applyForwardClientCertConfig`
+    // (conn_manager_utility.cc:541-545) removes the header for `Sanitize`
+    // outright and for any non-mTLS connection besides -- so on this
+    // cleartext listener a spoofed certificate identity can only ever reach
+    // the upstream through Rut if this policy forwards it.
+    prepare(
+        "GET /envoy-internal-only HTTP/1.1\r\n"
+        "Host: client.example\r\n"
+        "X-Envoy-Internal: true\r\n\r\n");
+    REQUIRE(apply_request_policy(conn, endpoint, kPreserveHost));
+    require_wire(
+        "GET /envoy-internal-only HTTP/1.1\r\nhost: client.example\r\n"
+        "x-forwarded-proto: http\r\n\r\n");
+    prepare(
+        "GET /xfcc-only HTTP/1.1\r\n"
+        "Host: client.example\r\n"
+        "X-Forwarded-Client-Cert: By=spiffe://mesh/backend;Hash=0123abcd;"
+        "Subject=\"CN=admin\";URI=spiffe://mesh/admin\r\n\r\n");
+    REQUIRE(apply_request_policy(conn, endpoint, kPreserveHost));
+    require_wire(
+        "GET /xfcc-only HTTP/1.1\r\nhost: client.example\r\n"
+        "x-forwarded-proto: http\r\n\r\n");
+    // Both names match case-insensitively and on every physical field, an
+    // ordinary neighbour is kept in place, and a longer name that merely
+    // starts with one of them is not in the set (exact-name match, not a
+    // prefix match).
+    prepare(
+        "GET /xfcc-mixed HTTP/1.1\r\n"
+        "Host: client.example\r\n"
+        "x-forwarded-client-cert: Hash=1\r\n"
+        "X-Regular: keep\r\n"
+        "X-FORWARDED-CLIENT-CERT: Hash=2\r\n"
+        "x-envoy-INTERNAL: 1\r\n"
+        "X-Envoy-Internal-Extra: keep\r\n"
+        "X-Forwarded-Client-Cert-Extra: keep\r\n\r\n");
+    REQUIRE(apply_request_policy(conn, endpoint, kPreserveHost));
+    require_wire(
+        "GET /xfcc-mixed HTTP/1.1\r\nhost: client.example\r\n"
+        "x-regular: keep\r\n"
+        "x-envoy-internal-extra: keep\r\n"
+        "x-forwarded-client-cert-extra: keep\r\n"
+        "x-forwarded-proto: http\r\n\r\n");
+    // Every other named header in the fixed sixteen-name removal set is
+    // dropped too, not only the ones exercised above.
     prepare(
         "GET /envoy-internal-headers-full HTTP/1.1\r\n"
         "Host: client.example\r\n"
+        "X-Envoy-Internal: true\r\n"
         "X-Envoy-Retriable-Status-Codes: 503\r\n"
         "X-Envoy-Retriable-Header-Names: x-should-retry\r\n"
         "X-Envoy-Retry-Grpc-On: cancelled\r\n"
@@ -4269,7 +4320,8 @@ TEST(request_policy, preserve_host_lowercase_wire_and_fail_closed_host) {
         "X-Envoy-Force-Trace: true\r\n"
         "X-Envoy-Ip-Tags: internal\r\n"
         "X-Envoy-Original-Url: https://evil.example/\r\n"
-        "X-Envoy-Hedge-On-Per-Try-Timeout: true\r\n\r\n");
+        "X-Envoy-Hedge-On-Per-Try-Timeout: true\r\n"
+        "X-Forwarded-Client-Cert: Hash=deadbeef\r\n\r\n");
     REQUIRE(apply_request_policy(conn, endpoint, kPreserveHost));
     require_wire(
         "GET /envoy-internal-headers-full HTTP/1.1\r\nhost: client.example\r\n"

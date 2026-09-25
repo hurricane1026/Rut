@@ -344,8 +344,9 @@ return forward(users, request_policy: {
 // rejects Connection nominating `upgrade` alongside an Upgrade header (even
 // with `close`) but admits and strips a bare Upgrade header otherwise;
 // rejects more than one X-Forwarded-Proto field; rejects a fragment-bearing
-// request target; and drops client-supplied `x-envoy-*` headers Envoy itself
-// strips for external requests (docs/envoy-compatibility.md).
+// request target; and drops the sixteen client-supplied headers Envoy itself
+// strips for external requests (`x-envoy-internal`, fourteen more `x-envoy-*`
+// names, and `x-forwarded-client-cert`; docs/envoy-compatibility.md).
 return forward(users, request_policy: {
     version: "HTTP/1.1", host: "preserve", connection: "omit",
     header_names: "lowercase", forwarded_proto: "http",

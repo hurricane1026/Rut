@@ -15,9 +15,13 @@ enum class RequestPolicyId : u16 {
     // Envoy-compatible H1 profile: preserves the client's Host header instead
     // of writing the upstream endpoint, lowercases every forwarded header
     // name, drops Envoy's hop-by-hop set (including Proxy-Connection and any
-    // header nominated by the client's Connection header), keeps `te` only
-    // when its value is exactly "trailers", and ensures a trailing
-    // x-forwarded-proto. Ordinary-forward-only: never admitted alongside a
+    // header nominated by the client's Connection header), keeps a `te`
+    // field only when one of its comma-separated tokens is "trailers" (any
+    // casing; `TE: gzip, trailers` is kept, `TE: gzip` is dropped) and
+    // rewrites the kept field to exactly `te: trailers` -- never the whole
+    // client value -- with several such fields collapsing to one line, and
+    // ensures a trailing x-forwarded-proto. Ordinary-forward-only: never
+    // admitted alongside a
     // response read deadline or response buffering (see the closed
     // admission predicates below).
     Http11PreserveHostLowercase = 4,
