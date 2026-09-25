@@ -993,6 +993,69 @@ TEST(envoy_convert, api_forged_model_rejected) {
     CHECK(empty_virtual_host_name_result.error().code == FrontendError::UnexpectedToken);
     CHECK(to_string(empty_virtual_host_name_result.error().detail)
               .find("virtual host name must be a non-empty string") != std::string::npos);
+
+    // PR #692 round-12 review: an overlong `action.cluster` (paired with an
+    // equally overlong, still-equal `cluster.name`, so the prior
+    // non-empty/equality check alone still passes) must not lower
+    // successfully. `name_string` (src/envoy/parser.cc:179-185) rejects
+    // every name over `kMaxEnvoyNameLen` during parsing, but nothing before
+    // this fix re-enforced that bound at lowering time.
+    const std::string overlong_name(static_cast<size_t>(envoy::kMaxEnvoyNameLen) + 1u, 'a');
+    envoy::Bootstrap overlong_cluster_names = parsed.value();
+    overlong_cluster_names.listener.filter_chain.hcm.route_config.virtual_host.route.action
+        .cluster = str(overlong_name);
+    overlong_cluster_names.cluster.name = str(overlong_name);
+    const auto overlong_cluster_names_result =
+        envoy::lower_to_rut(overlong_cluster_names, all_true);
+    CHECK_FALSE(overlong_cluster_names_result);
+    CHECK(overlong_cluster_names_result.error().code == FrontendError::UnsupportedSyntax);
+    CHECK(to_string(overlong_cluster_names_result.error().detail)
+              .find("name exceeds the bounded length") != std::string::npos);
+
+    // PR #692 round-12 review: an overlong `hcm.stat_prefix` must not lower
+    // successfully either, the same class of gap the cluster-name length
+    // check above closes.
+    envoy::Bootstrap overlong_stat_prefix = parsed.value();
+    overlong_stat_prefix.listener.filter_chain.hcm.stat_prefix = str(overlong_name);
+    const auto overlong_stat_prefix_result = envoy::lower_to_rut(overlong_stat_prefix, all_true);
+    CHECK_FALSE(overlong_stat_prefix_result);
+    CHECK(overlong_stat_prefix_result.error().code == FrontendError::UnsupportedSyntax);
+    CHECK(to_string(overlong_stat_prefix_result.error().detail)
+              .find("name exceeds the bounded length") != std::string::npos);
+
+    // PR #692 round-12 review: an overlong `virtual_host.name` must not
+    // lower successfully either, the same class of gap the checks above
+    // close.
+    envoy::Bootstrap overlong_virtual_host_name = parsed.value();
+    overlong_virtual_host_name.listener.filter_chain.hcm.route_config.virtual_host.name =
+        str(overlong_name);
+    const auto overlong_virtual_host_name_result =
+        envoy::lower_to_rut(overlong_virtual_host_name, all_true);
+    CHECK_FALSE(overlong_virtual_host_name_result);
+    CHECK(overlong_virtual_host_name_result.error().code == FrontendError::UnsupportedSyntax);
+    CHECK(to_string(overlong_virtual_host_name_result.error().detail)
+              .find("name exceeds the bounded length") != std::string::npos);
+
+    // PR #692 round-12 review: presence of
+    // `cluster.load_assignment_name_present` is not proof that the
+    // *current* `cluster.name`/`action.cluster` still match what
+    // `parse_bootstrap_json` validated `load_assignment.cluster_name`
+    // against. Renaming both `action.cluster` and `cluster.name` to the
+    // same new string (so the equality check between them still passes)
+    // while leaving the presence bit true and `load_assignment_name`
+    // holding the stale, parsed "backend" value must not lower successfully.
+    envoy::Bootstrap renamed_cluster_stale_load_assignment = parsed.value();
+    renamed_cluster_stale_load_assignment.listener.filter_chain.hcm.route_config.virtual_host.route
+        .action.cluster = lit_str("renamed");
+    renamed_cluster_stale_load_assignment.cluster.name = lit_str("renamed");
+    const auto renamed_cluster_stale_load_assignment_result =
+        envoy::lower_to_rut(renamed_cluster_stale_load_assignment, all_true);
+    CHECK_FALSE(renamed_cluster_stale_load_assignment_result);
+    CHECK(renamed_cluster_stale_load_assignment_result.error().code ==
+          FrontendError::UnexpectedToken);
+    CHECK(to_string(renamed_cluster_stale_load_assignment_result.error().detail)
+              .find("load_assignment.cluster_name must equal the cluster name") !=
+          std::string::npos);
 }
 
 int main(int argc, char** argv) {

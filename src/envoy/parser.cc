@@ -699,6 +699,7 @@ private:
             return invalid(doc_.at(assignment_name.value()).span,
                            lit_str("load_assignment.cluster_name must equal the cluster name"));
         out->load_assignment_name_present = true;
+        out->load_assignment_name = name_text.value();
         out->load_assignment_name_span = doc_.at(assignment_name.value()).span;
 
         auto endpoints = required(

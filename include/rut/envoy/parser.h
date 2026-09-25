@@ -151,8 +151,13 @@ struct Cluster {
     // `ClusterLoadAssignment.cluster_name` has `min_len: 1`) and must equal
     // `name`; `load_assignment_name_present` is always true after a
     // successful parse and is kept for symmetry with the other
-    // presence-tracking fields.
+    // presence-tracking fields. `load_assignment_name` retains the parsed
+    // value itself (not just the presence bit) so that lowering can
+    // revalidate the equality against `name`/`action.cluster` at use time,
+    // rather than trusting that the equality parsing once established still
+    // holds on a caller-mutated copy (PR #692 round-12 review).
     bool load_assignment_name_present = false;
+    Str load_assignment_name{};
     Span load_assignment_name_span{};
     Endpoint endpoint{};
     Span span{};

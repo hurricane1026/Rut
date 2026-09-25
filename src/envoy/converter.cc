@@ -249,6 +249,18 @@ FrontendResult<bool> validate(const Bootstrap& model, const RutCapabilities& cap
         !action.cluster.eq(model.cluster.name))
         return invalid(action.cluster_span,
                        lit_str("route cluster does not name a declared cluster"));
+    // PR #692 round-12 review: revalidate the bounded length too, not just
+    // non-emptiness/equality. `name_string` (src/envoy/parser.cc:179-185)
+    // rejects every name over `kMaxEnvoyNameLen` during parsing, but nothing
+    // above re-checks that bound; a caller of the public `lower_to_rut(model,
+    // capabilities)` overload who sets both `action.cluster` and
+    // `model.cluster.name` to the same overlong string still passes the
+    // equality check above and would otherwise lower successfully, accepting
+    // a model `parse_bootstrap_json` would reject.
+    if (action.cluster.len > kMaxEnvoyNameLen)
+        return unsupported(action.cluster_span, lit_str("name exceeds the bounded length"));
+    if (model.cluster.name.len > kMaxEnvoyNameLen)
+        return unsupported(model.cluster.name_span, lit_str("name exceeds the bounded length"));
     // PR #692 round-8 review: `load_assignment_name_present` is the model's
     // only record that `parse_bootstrap_json` ever saw and validated
     // `load_assignment.cluster_name` (required, non-empty, and equal to
@@ -263,6 +275,20 @@ FrontendResult<bool> validate(const Bootstrap& model, const RutCapabilities& cap
     if (!model.cluster.load_assignment_name_present)
         return invalid(model.cluster.span,
                        lit_str("cluster load_assignment.cluster_name is required"));
+    // PR #692 round-12 review: presence of the bit is not proof that the
+    // *current* `cluster.name`/`action.cluster` still match what
+    // `parse_bootstrap_json` validated `load_assignment.cluster_name`
+    // against — a caller of the public `lower_to_rut(model, capabilities)`
+    // overload can rename both `action.cluster` and `model.cluster.name` on
+    // a parsed copy (to the same new string, so the equality check above
+    // still passes) while leaving `load_assignment_name_present` true and
+    // `load_assignment_name` holding the old, now-stale name. Retaining the
+    // parsed value (`Cluster::load_assignment_name`,
+    // include/rut/envoy/parser.h) lets this revalidate the equality at
+    // lowering time instead of trusting historical presence.
+    if (!model.cluster.load_assignment_name.eq(model.cluster.name))
+        return invalid(model.cluster.load_assignment_name_span,
+                       lit_str("load_assignment.cluster_name must equal the cluster name"));
     // PR #692 round-3 review: the emitted route is always the literal `"/"`
     // catch-all (see put_forward_route below) — nothing about the route's
     // actual `match.prefix` value ever reaches the generated text. A model
@@ -284,6 +310,14 @@ FrontendResult<bool> validate(const Bootstrap& model, const RutCapabilities& cap
     if (virtual_host.name.empty())
         return invalid(virtual_host.name_span,
                        lit_str("virtual host name must be a non-empty string"));
+    // PR #692 round-12 review: revalidate the bounded length too, the same
+    // gap the `action.cluster`/`cluster.name` length checks above close —
+    // `name_string` (src/envoy/parser.cc:179-185) rejects every name over
+    // `kMaxEnvoyNameLen` during parsing, but nothing re-checks that bound
+    // here, so a hand-built or mutated `Bootstrap` with an overlong
+    // `virtual_host.name` would otherwise still lower successfully.
+    if (virtual_host.name.len > kMaxEnvoyNameLen)
+        return unsupported(virtual_host.name_span, lit_str("name exceeds the bounded length"));
     // PR #692 round-9 review: validation never checked that parsing
     // established `domains: ["*"]` on the virtual host — only the nested
     // route's `match.prefix` (round-3, immediately below). A hand-built
@@ -335,6 +369,15 @@ FrontendResult<bool> validate(const Bootstrap& model, const RutCapabilities& cap
     // reject.
     if (hcm.stat_prefix.empty())
         return invalid(hcm.stat_prefix_span, lit_str("stat_prefix must be a non-empty string"));
+    // PR #692 round-12 review: revalidate the bounded length too, the same
+    // gap the `action.cluster`/`cluster.name`/`virtual_host.name` length
+    // checks close elsewhere in this function — `name_string`
+    // (src/envoy/parser.cc:179-185) rejects every name over
+    // `kMaxEnvoyNameLen` during parsing, but nothing re-checks that bound
+    // here, so a hand-built or mutated `Bootstrap` with an overlong
+    // `stat_prefix` would otherwise still lower successfully.
+    if (hcm.stat_prefix.len > kMaxEnvoyNameLen)
+        return unsupported(hcm.stat_prefix_span, lit_str("name exceeds the bounded length"));
     // PR #692 round-9 review: revalidate `codec_type` too, the same class of
     // gap the `type_url_span` check above closes one field over.
     // `codec_type_present` is the model's only record that `parse_hcm` ever

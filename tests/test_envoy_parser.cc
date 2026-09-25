@@ -458,6 +458,11 @@ TEST(envoy_parser, accepts_milestone_bootstrap) {
     CHECK(b.cluster.connect_timeout.text.eq(lit_str("5s")));
     CHECK_EQ(b.cluster.connect_timeout.span.line, 25u);
     CHECK(b.cluster.load_assignment_name_present);
+    // PR #692 round-12 review: `load_assignment_name` retains the parsed
+    // `load_assignment.cluster_name` value itself (not just the presence
+    // bit), so lowering can revalidate it against `cluster.name` at use
+    // time rather than trusting historical presence.
+    CHECK(b.cluster.load_assignment_name.eq(lit_str("backend")));
     CHECK_EQ(b.cluster.endpoint.address.ipv4_host, 0x7f000001u);
     CHECK_EQ(b.cluster.endpoint.address.port, 9000u);
     CHECK_EQ(b.cluster.endpoint.address.address_span.line, 27u);
@@ -508,6 +513,7 @@ TEST(envoy_parser, accepts_camel_case_spellings_and_optional_fields) {
     CHECK(result.value().listener.filter_chain.hcm.codec_type == envoy::CodecType::Http1);
     CHECK_FALSE(result.value().cluster.type_present);
     CHECK(result.value().cluster.load_assignment_name_present);
+    CHECK(result.value().cluster.load_assignment_name.eq(lit_str("backend")));
     CHECK_EQ(result.value().cluster.connect_timeout.milliseconds, 1250u);
     CHECK_EQ(result.value().listener.address.port, 8080u);
     CHECK_EQ(result.value().cluster.endpoint.address.port, 9000u);
