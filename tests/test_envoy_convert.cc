@@ -608,26 +608,34 @@ TEST(envoy_convert, api_all_capabilities_matches_golden) {
 
     // Overwriting the JSON source after lowering must not change output
     // bytes: no borrowed source text reaches the emitted RUT, only numeric
-    // model fields do. The bytes backing `route.match.prefix` and
-    // `router.name` are left untouched (PR #692 round-3 review added a
-    // defensive `validate()` check that the prefix is exactly "/", and
-    // round-4 added one that the router filter name is exactly
-    // "envoy.filters.http.router" — see api_forged_model_rejected below — so
-    // corrupting either borrowed range would correctly fail lowering rather
-    // than exercise the property this test is about).
+    // model fields do. The bytes backing `route.match.prefix`,
+    // `router.name`, and `filter_chain.filter_name` are left untouched (PR
+    // #692 round-3 review added a defensive `validate()` check that the
+    // prefix is exactly "/", round-4 added one that the router filter name
+    // is exactly "envoy.filters.http.router", and round-5 added one that the
+    // network filter name is exactly
+    // "envoy.filters.network.http_connection_manager" — see
+    // api_forged_model_rejected below — so corrupting any borrowed range
+    // would correctly fail lowering rather than exercise the property this
+    // test is about).
     const envoy::Bootstrap model_copy = parsed.value();
     const Str prefix =
         model_copy.listener.filter_chain.hcm.route_config.virtual_host.route.match.prefix;
     const Str router_name = model_copy.listener.filter_chain.hcm.router.name;
+    const Str filter_name = model_copy.listener.filter_chain.filter_name;
     REQUIRE(prefix.ptr >= text.data() && prefix.ptr < text.data() + text.size());
     REQUIRE(router_name.ptr >= text.data() && router_name.ptr < text.data() + text.size());
+    REQUIRE(filter_name.ptr >= text.data() && filter_name.ptr < text.data() + text.size());
     const size_t prefix_offset = static_cast<size_t>(prefix.ptr - text.data());
     const size_t router_name_offset = static_cast<size_t>(router_name.ptr - text.data());
+    const size_t filter_name_offset = static_cast<size_t>(filter_name.ptr - text.data());
     for (size_t i = 0; i < text.size(); i++) {
         const bool in_prefix = i >= prefix_offset && i < prefix_offset + prefix.len;
         const bool in_router_name =
             i >= router_name_offset && i < router_name_offset + router_name.len;
-        if (!in_prefix && !in_router_name) text[i] = 'x';
+        const bool in_filter_name =
+            i >= filter_name_offset && i < filter_name_offset + filter_name.len;
+        if (!in_prefix && !in_router_name && !in_filter_name) text[i] = 'x';
     }
     auto lowered_after_mutation = envoy::lower_to_rut(model_copy, all_true);
     REQUIRE(lowered_after_mutation);
@@ -699,6 +707,44 @@ TEST(envoy_convert, api_forged_model_rejected) {
     CHECK_FALSE(cleared_typed_config_result);
     CHECK(cleared_typed_config_result.error().code == FrontendError::UnexpectedToken);
     CHECK(to_string(cleared_typed_config_result.error().detail).find("typed_config is required") !=
+          std::string::npos);
+
+    // PR #692 round-5 review: the same forgery is possible one level up, on
+    // the network filter that wraps the HTTP connection manager.
+    // `filter_chain.filter_name` retargeted at another network filter (e.g.
+    // "envoy.filters.network.tcp_proxy") used to still lower, silently
+    // discarding whatever network filter the model actually named.
+    envoy::Bootstrap forged_filter_name = parsed.value();
+    forged_filter_name.listener.filter_chain.filter_name =
+        lit_str("envoy.filters.network.tcp_proxy");
+    const auto forged_filter_name_result = envoy::lower_to_rut(forged_filter_name, all_true);
+    CHECK_FALSE(forged_filter_name_result);
+    CHECK(forged_filter_name_result.error().code == FrontendError::UnexpectedToken);
+    CHECK(to_string(forged_filter_name_result.error().detail).find("network filter name") !=
+          std::string::npos);
+
+    // A cleared (default-constructed) `filter_name` — as a hand-built
+    // `Bootstrap` that never populated the field would have — must be
+    // rejected the same way as an explicitly wrong one.
+    envoy::Bootstrap cleared_filter_name = parsed.value();
+    cleared_filter_name.listener.filter_chain.filter_name = Str{};
+    const auto cleared_filter_name_result = envoy::lower_to_rut(cleared_filter_name, all_true);
+    CHECK_FALSE(cleared_filter_name_result);
+    CHECK(cleared_filter_name_result.error().code == FrontendError::UnexpectedToken);
+    CHECK(to_string(cleared_filter_name_result.error().detail).find("network filter name") !=
+          std::string::npos);
+
+    // A cleared `hcm.type_url_span` — the model's only record that
+    // `parse_hcm`'s `expect_type_url` ever checked the typed_config's
+    // `@type` against the v3 HttpConnectionManager type — must also be
+    // rejected: a hand-built `Bootstrap` that never ran that check leaves
+    // this span at its default `Span{}`.
+    envoy::Bootstrap cleared_hcm_type_url = parsed.value();
+    cleared_hcm_type_url.listener.filter_chain.hcm.type_url_span = Span{};
+    const auto cleared_hcm_type_url_result = envoy::lower_to_rut(cleared_hcm_type_url, all_true);
+    CHECK_FALSE(cleared_hcm_type_url_result);
+    CHECK(cleared_hcm_type_url_result.error().code == FrontendError::UnexpectedToken);
+    CHECK(to_string(cleared_hcm_type_url_result.error().detail).find("typed_config is required") !=
           std::string::npos);
 }
 

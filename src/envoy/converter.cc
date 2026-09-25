@@ -26,6 +26,20 @@ auto out_of_memory(Span span, Str detail) {
 // check rather than duplicating new policy.
 constexpr Str kRouterFilterName = lit_str("envoy.filters.http.router");
 
+// PR #692 round-5 review: the same forgery is possible one level up.
+// `FilterChain::filter_name` is a public field a caller can retarget at
+// another network filter (e.g. "envoy.filters.network.tcp_proxy") while
+// leaving the nested `hcm` populated as if it were still behind the HTTP
+// connection manager, and `HttpConnectionManager::type_url_span` — the only
+// evidence the model records that `parse_hcm`'s `expect_type_url` ever
+// checked the typed_config's `@type` against the v3 HttpConnectionManager
+// type — defaults to the zero `Span{}` on a hand-built model that never ran
+// that check. The parser re-checks the filter name against the same literal
+// (src/envoy/parser.cc, `parse_filter_chain`) before ever producing a model,
+// so this mirrors that check plus the round-4 router pattern rather than
+// duplicating new policy.
+constexpr Str kNetworkFilterName = lit_str("envoy.filters.network.http_connection_manager");
+
 // PROVISIONAL: reconcile with oracle. Recorded from docs/envoy-converter.md
 // pending the pinned Envoy differential (PR2) and the local-reply capability
 // (PR5), which replaces this literal with the pinned bytes.
@@ -237,6 +251,22 @@ FrontendResult<bool> validate(const Bootstrap& model, const RutCapabilities& cap
                        lit_str("router filter name must be envoy.filters.http.router"));
     if (!router.has_typed_config)
         return invalid(router.span, lit_str("router filter typed_config is required"));
+    // PR #692 round-5 review: revalidate the network filter's identity too —
+    // the same class of gap the router checks above close, one level up.
+    // `filter_chain.filter_name` is a public field a caller can retarget at
+    // another network filter (e.g. "envoy.filters.network.tcp_proxy") while
+    // leaving `hcm` populated, and `hcm.type_url_span` — the model's only
+    // record that the typed_config's `@type` was ever checked against the
+    // v3 HttpConnectionManager type — stays the zero `Span{}` on a
+    // hand-built model that skipped that check. Either forgery must not
+    // still lower successfully and silently discard the modeled network
+    // filter's behavior.
+    if (!model.listener.filter_chain.filter_name.eq(kNetworkFilterName))
+        return invalid(
+            model.listener.filter_chain.filter_name_span,
+            lit_str("network filter name must be envoy.filters.network.http_connection_manager"));
+    if (hcm.type_url_span.start == 0u && hcm.type_url_span.end == 0u)
+        return invalid(hcm.span, lit_str("network filter typed_config is required"));
 
     if (!router.suppress_envoy_headers) {
         const Span span = router.suppress_envoy_headers_present ? router.suppress_envoy_headers_span
