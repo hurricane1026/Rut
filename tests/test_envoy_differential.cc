@@ -67,10 +67,31 @@ constexpr int kClientTimeoutMs = 3000;
 
 // ── Small process helpers ──────────────────────────────────────────────
 
+// Builds a null-terminated argv suitable for execvp() from `args`. The
+// returned pointers alias `args`' own storage, so `args` must outlive the
+// result and must not be mutated afterward (reallocation would invalidate
+// every c_str() pointer already copied out).
+//
+// Callers must call this *before* fork(): std::vector/std::string
+// construction is ordinary heap allocation, which is not async-signal-safe.
+// If another thread held the allocator lock at the instant of fork(), a
+// child that then allocated could hang forever (round-3 review, "Build the
+// Docker argv before entering the fork child"). Every fork() below builds
+// its argv first and only touches async-signal-safe calls (open/dup2/close/
+// execvp/_exit) once inside the child.
+std::vector<char*> build_argv(const std::vector<std::string>& args) {
+    std::vector<char*> argv;
+    argv.reserve(args.size() + 1);
+    for (const auto& a : args) argv.push_back(const_cast<char*>(a.c_str()));
+    argv.push_back(nullptr);
+    return argv;
+}
+
 // Runs `argv` to completion (or until `timeout_ms` elapses, in which case the
 // child is SIGKILLed), discarding its stdio. Returns the exit code, or -1 if
 // the process could not be spawned, was killed, or did not exit normally.
 int run_and_wait(const std::vector<std::string>& argv, int timeout_ms) {
+    const std::vector<char*> args = build_argv(argv);
     const pid_t child = fork();
     if (child < 0) return -1;
     if (child == 0) {
@@ -81,10 +102,6 @@ int run_and_wait(const std::vector<std::string>& argv, int timeout_ms) {
             dup2(null_fd, STDERR_FILENO);
             if (null_fd > STDERR_FILENO) close(null_fd);
         }
-        std::vector<char*> args;
-        args.reserve(argv.size() + 1);
-        for (const auto& a : argv) args.push_back(const_cast<char*>(a.c_str()));
-        args.push_back(nullptr);
         execvp(args[0], args.data());
         _exit(127);
     }
@@ -278,12 +295,24 @@ bool find_header(const std::string& headers, const std::string& name, std::strin
     return false;
 }
 
+// Result of read_http_message(): the bytes captured so far, and whether the
+// message's framing (headers, plus body if any) actually completed within
+// the deadline. `complete == false` means the caller observed a partial
+// exchange (timeout or premature EOF mid-frame) and must not treat `bytes`
+// as a trustworthy recording (round-3 review, "Reject partial exchanges
+// before writing the oracle transcript").
+struct ReadResult {
+    std::string bytes;
+    bool complete = false;
+};
+
 // Reads one complete HTTP/1.x message from `fd`: headers up to the blank
 // line, then a body framed by Content-Length (skipped entirely when
 // `head_request` is true, per RFC 9110 §9.3.2), else read-to-EOF. Bounded by
-// `timeout_ms` total. Returns whatever was captured even on a partial read
-// (record-only cases tolerate this; the two asserted cases do not need it).
-std::string read_http_message(int fd, bool head_request, int timeout_ms) {
+// `timeout_ms` total. Always returns whatever was captured, even on a
+// partial read, but `complete` is false whenever the framing did not finish
+// (record-only cases must check it; see ReadResult).
+ReadResult read_http_message(int fd, bool head_request, int timeout_ms) {
     std::string buf;
     const int64_t deadline = now_ms() + timeout_ms;
     char chunk[4096];
@@ -292,14 +321,16 @@ std::string read_http_message(int fd, bool head_request, int timeout_ms) {
         header_end = buf.find("\r\n\r\n");
         if (header_end != std::string::npos) break;
         const int64_t remaining = deadline - now_ms();
-        if (remaining <= 0) return buf;
+        if (remaining <= 0) return {buf, false};
         pollfd pfd{fd, POLLIN, 0};
-        if (poll(&pfd, 1, static_cast<int>(remaining)) <= 0) return buf;
+        if (poll(&pfd, 1, static_cast<int>(remaining)) <= 0) return {buf, false};
         const ssize_t n = recv(fd, chunk, sizeof(chunk), 0);
-        if (n <= 0) return buf;
+        if (n <= 0) return {buf, false};
         buf.append(chunk, static_cast<size_t>(n));
     }
-    if (head_request) return buf;
+    // A HEAD response never carries a body (RFC 9110 §9.3.2): the headers
+    // are the entire message, so finding the blank line is completion.
+    if (head_request) return {buf, true};
     const std::string headers = buf.substr(0, header_end);
     std::string cl_value;
     std::string connection_value;
@@ -316,28 +347,35 @@ std::string read_http_message(int fd, bool head_request, int timeout_ms) {
         const size_t total = body_start + (want > 0 ? static_cast<size_t>(want) : 0u);
         while (buf.size() < total) {
             const int64_t remaining = deadline - now_ms();
-            if (remaining <= 0) return buf;
+            if (remaining <= 0) return {buf, false};
             pollfd pfd{fd, POLLIN, 0};
-            if (poll(&pfd, 1, static_cast<int>(remaining)) <= 0) return buf;
+            if (poll(&pfd, 1, static_cast<int>(remaining)) <= 0) return {buf, false};
             const ssize_t n = recv(fd, chunk, sizeof(chunk), 0);
-            if (n <= 0) return buf;
+            if (n <= 0) return {buf, false};
             buf.append(chunk, static_cast<size_t>(n));
         }
-        return buf;
+        return {buf, true};
     }
     if (connection_value.find("close") != std::string::npos) {
         for (;;) {
             const int64_t remaining = deadline - now_ms();
-            if (remaining <= 0) return buf;
+            if (remaining <= 0) return {buf, false};
             pollfd pfd{fd, POLLIN, 0};
             const int pr = poll(&pfd, 1, static_cast<int>(remaining));
-            if (pr <= 0) return buf;
+            if (pr <= 0) return {buf, false};
             const ssize_t n = recv(fd, chunk, sizeof(chunk), 0);
-            if (n <= 0) return buf;
+            // EOF (n == 0) is the expected terminator for close-delimited
+            // framing, i.e. completion, not a partial read. Any other
+            // failure (n < 0) is a real partial exchange.
+            if (n == 0) return {buf, true};
+            if (n < 0) return {buf, false};
             buf.append(chunk, static_cast<size_t>(n));
         }
     }
-    return buf;
+    // Neither Content-Length nor Connection: close: framing is fully
+    // determined by the headers alone (assumed zero-length body), so this is
+    // complete as soon as the blank line was found above.
+    return {buf, true};
 }
 
 // ── Transcript escaping (self-contained; see --self-test) ─────────────
@@ -514,12 +552,21 @@ public:
     // after an explicit stop()).
     void stop() {
         stopping_.store(true);
+        // accept_loop() reads listen_fd_ on every iteration
+        // (accept(listen_fd_, ...)) with no synchronization, so this thread
+        // must not write to listen_fd_ while that thread could still be
+        // running: doing so is a data race (UB, and ThreadSanitizer flags it
+        // under --self-test; round-3 review, "Stop racing on the listener
+        // descriptor"). shutdown()+close() unblock a thread parked in
+        // accept() without changing the value of listen_fd_ itself, so they
+        // are safe to call before join(); the assignment to -1 is deferred
+        // until the accept thread has actually joined.
         if (listen_fd_ >= 0) {
             shutdown(listen_fd_, SHUT_RDWR);
             close(listen_fd_);
-            listen_fd_ = -1;
         }
         if (accept_thread_.joinable()) accept_thread_.join();
+        listen_fd_ = -1;
         // Unblock every still-running handler (each is parked in poll()/recv()
         // on its own fd) and join it before this object's mutex and maps go
         // away underneath it. Only shutdown() here, never close(): each
@@ -679,6 +726,40 @@ struct EnvoyInstance {
     std::string log_path;
 
     bool launch(const std::string& bootstrap_path, uint16_t /*listen_port*/) {
+        // docker run --pull=never --rm --network host --name <name>
+        //   -e ENVOY_UID=0
+        //   -v <bootstrap>:/etc/envoy/rut-bootstrap.json:ro,z
+        //   <image> -c /etc/envoy/rut-bootstrap.json
+        //   --concurrency 1 --disable-hot-restart --log-level warn
+        //
+        // VERIFY (envoy-pr-plan.md PR2): the official image's
+        // distribution/docker/docker-entrypoint.sh (checked at tag
+        // v1.39.1) does:
+        //   if [ "${1#-}" != "$1" ]; then set -- envoy "$@"; fi
+        //   ...
+        //   if [ "$ENVOY_UID" != "0" ] && [ "$USERID" = 0 ]; then
+        //       ...su-exec envoy...
+        //   else exec "$@"; fi
+        // Our first argument is "-c", which starts with '-', so the
+        // entrypoint prepends "envoy" for us; passing ENVOY_UID=0 takes
+        // the `else exec "$@"` branch directly (no usermod/su-exec
+        // re-exec), running as the image's default root user. Both
+        // match this command exactly as planned; no deviation found.
+        //
+        // Built before fork(): see build_argv()'s comment (round-3 review,
+        // "Build the Docker argv before entering the fork child"). The
+        // accept thread inside `RecordingUpstream` (already running by the
+        // time run_oracle_milestone_s() reaches this call) is exactly the
+        // kind of concurrent thread that makes post-fork allocation unsafe.
+        std::vector<std::string> argv = {
+            "docker",        "run",       "--pull=never",
+            "--rm",          "--network", "host",
+            "--name",        name,        "-e",
+            "ENVOY_UID=0",   "-v",        bootstrap_path + ":/etc/envoy/rut-bootstrap.json:ro,z",
+            kEnvoyImage,     "-c",        "/etc/envoy/rut-bootstrap.json",
+            "--concurrency", "1",         "--disable-hot-restart",
+            "--log-level",   "warn"};
+        const std::vector<char*> args = build_argv(argv);
         pid = fork();
         if (pid < 0) return false;
         if (pid == 0) {
@@ -688,49 +769,6 @@ struct EnvoyInstance {
                 dup2(log_fd, STDERR_FILENO);
                 if (log_fd > STDERR_FILENO) close(log_fd);
             }
-            // docker run --pull=never --rm --network host --name <name>
-            //   -e ENVOY_UID=0
-            //   -v <bootstrap>:/etc/envoy/rut-bootstrap.json:ro,z
-            //   <image> -c /etc/envoy/rut-bootstrap.json
-            //   --concurrency 1 --disable-hot-restart --log-level warn
-            //
-            // VERIFY (envoy-pr-plan.md PR2): the official image's
-            // distribution/docker/docker-entrypoint.sh (checked at tag
-            // v1.39.1) does:
-            //   if [ "${1#-}" != "$1" ]; then set -- envoy "$@"; fi
-            //   ...
-            //   if [ "$ENVOY_UID" != "0" ] && [ "$USERID" = 0 ]; then
-            //       ...su-exec envoy...
-            //   else exec "$@"; fi
-            // Our first argument is "-c", which starts with '-', so the
-            // entrypoint prepends "envoy" for us; passing ENVOY_UID=0 takes
-            // the `else exec "$@"` branch directly (no usermod/su-exec
-            // re-exec), running as the image's default root user. Both
-            // match this command exactly as planned; no deviation found.
-            std::vector<std::string> argv = {"docker",
-                                             "run",
-                                             "--pull=never",
-                                             "--rm",
-                                             "--network",
-                                             "host",
-                                             "--name",
-                                             name,
-                                             "-e",
-                                             "ENVOY_UID=0",
-                                             "-v",
-                                             bootstrap_path + ":/etc/envoy/rut-bootstrap.json:ro,z",
-                                             kEnvoyImage,
-                                             "-c",
-                                             "/etc/envoy/rut-bootstrap.json",
-                                             "--concurrency",
-                                             "1",
-                                             "--disable-hot-restart",
-                                             "--log-level",
-                                             "warn"};
-            std::vector<char*> args;
-            args.reserve(argv.size() + 1);
-            for (const auto& a : argv) args.push_back(const_cast<char*>(a.c_str()));
-            args.push_back(nullptr);
             execvp(args[0], args.data());
             _exit(127);
         }
@@ -947,7 +985,17 @@ std::vector<CaseSpec> run1_cases() {
 struct CaseResult {
     std::string name;
     std::string client_bytes;
+    // Whether the downstream exchange (client request + Envoy's response)
+    // actually finished framing within the deadline; see ReadResult. Never
+    // trust downstream_bytes when this is false.
+    bool exchange_complete = false;
     bool upstream_contacted = false;
+    // How many times the recording upstream observed a request for this
+    // case's path. Expected to be 0 (never contacted) or 1; more than one is
+    // treated as corrupt evidence (an unexpected retry/duplicate), not a
+    // single trustworthy recording (round-3 review, "Reject partial
+    // exchanges before writing the oracle transcript").
+    int upstream_contact_count = 0;
     std::string upstream_bytes;  // first observed request, if any
     std::string downstream_bytes;
 };
@@ -958,12 +1006,43 @@ bool run_client_case(uint16_t listen_port, const CaseSpec& spec, CaseResult* res
     const int fd = connect_with_timeout(listen_port, kClientTimeoutMs);
     if (fd < 0) return false;
     const bool sent = send_all(fd, spec.client_bytes);
-    if (sent) result->downstream_bytes = read_http_message(fd, spec.is_head, kClientTimeoutMs);
+    if (sent) {
+        const ReadResult read = read_http_message(fd, spec.is_head, kClientTimeoutMs);
+        result->downstream_bytes = read.bytes;
+        result->exchange_complete = read.complete;
+    }
     close(fd);
     return sent;
 }
 
+// Refuses evidence that would make write_transcript() emit a fixture
+// claiming bytes for an exchange that never actually completed, or claiming
+// a single upstream request when the recording upstream in fact observed
+// more than one (round-3 review, "Reject partial exchanges before writing
+// the oracle transcript"). Returns empty on success, else a human-readable
+// reason.
+std::string validate_results(const std::vector<CaseResult>& results) {
+    for (const auto& r : results) {
+        if (!r.exchange_complete) {
+            return "case \"" + r.name +
+                   "\": downstream exchange did not complete (partial read/timeout); refusing "
+                   "to record it as evidence";
+        }
+        if (r.upstream_contact_count > 1) {
+            return "case \"" + r.name + "\": upstream was contacted " +
+                   std::to_string(r.upstream_contact_count) +
+                   " times (expected at most 1); refusing to record ambiguous evidence";
+        }
+    }
+    return "";
+}
+
 bool write_transcript(const std::string& path, const std::vector<CaseResult>& results) {
+    const std::string validation_error = validate_results(results);
+    if (!validation_error.empty()) {
+        std::cerr << "FAIL: refusing to write oracle transcript: " << validation_error << "\n";
+        return false;
+    }
     std::ofstream out(path, std::ios::trunc);
     if (!out) return false;
     time_t now = time(nullptr);
@@ -1164,6 +1243,7 @@ int run_oracle_milestone_s(const std::string& output_path) {
                 cases.begin(), cases.end(), [&](const CaseSpec& s) { return r.name == s.name; });
             if (it == cases.end()) continue;
             const auto observed = upstream.requests_for(it->upstream_path);
+            r.upstream_contact_count = static_cast<int>(observed.size());
             if (!observed.empty()) {
                 r.upstream_contacted = true;
                 r.upstream_bytes = observed.front();
@@ -1276,25 +1356,28 @@ bool self_test_recording_upstream() {
         }
         const std::string req1 = "GET /x HTTP/1.1\r\nHost: t.example\r\n\r\n";
         if (!send_all(fd, req1)) ok = false;
-        const std::string resp1 = read_http_message(fd, /*head_request=*/false, kClientTimeoutMs);
-        if (resp1 != "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nhi") {
-            std::cerr << "FAIL [self-test upstream]: unexpected reply 1: " << resp1 << "\n";
+        const ReadResult resp1 = read_http_message(fd, /*head_request=*/false, kClientTimeoutMs);
+        if (!resp1.complete || resp1.bytes != "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nhi") {
+            std::cerr << "FAIL [self-test upstream]: unexpected reply 1: " << resp1.bytes
+                      << " (complete=" << resp1.complete << ")\n";
             ok = false;
         }
         const std::string req2 =
             "POST /x HTTP/1.1\r\nHost: t.example\r\nContent-Length: 3\r\n\r\nabc";
         if (!send_all(fd, req2)) ok = false;
-        const std::string resp2 = read_http_message(fd, /*head_request=*/false, kClientTimeoutMs);
-        if (resp2 != "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nhi") {
-            std::cerr << "FAIL [self-test upstream]: unexpected reply 2: " << resp2 << "\n";
+        const ReadResult resp2 = read_http_message(fd, /*head_request=*/false, kClientTimeoutMs);
+        if (!resp2.complete || resp2.bytes != "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nhi") {
+            std::cerr << "FAIL [self-test upstream]: unexpected reply 2: " << resp2.bytes
+                      << " (complete=" << resp2.complete << ")\n";
             ok = false;
         }
         const std::string req3 =
             "HEAD /head HTTP/1.1\r\nHost: t.example\r\nConnection: close\r\n\r\n";
         if (!send_all(fd, req3)) ok = false;
-        const std::string resp3 = read_http_message(fd, /*head_request=*/true, kClientTimeoutMs);
-        if (resp3 != "HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\n") {
-            std::cerr << "FAIL [self-test upstream]: unexpected HEAD reply: " << resp3 << "\n";
+        const ReadResult resp3 = read_http_message(fd, /*head_request=*/true, kClientTimeoutMs);
+        if (!resp3.complete || resp3.bytes != "HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\n") {
+            std::cerr << "FAIL [self-test upstream]: unexpected HEAD reply: " << resp3.bytes
+                      << " (complete=" << resp3.complete << ")\n";
             ok = false;
         }
         // The server must have closed after Connection: close: further reads hit EOF.
@@ -1324,10 +1407,184 @@ bool self_test_recording_upstream() {
     return ok;
 }
 
+// Covers round-3 review thread P1 ("Reject partial exchanges before writing
+// the oracle transcript"): read_http_message() must report an incomplete
+// frame as incomplete rather than silently returning whatever partial bytes
+// it captured, and write_transcript() must refuse to write anything (no
+// output file at all) when any case is incomplete or the upstream was
+// contacted more than once.
+bool self_test_partial_exchange_rejection() {
+    bool ok = true;
+
+    // read_http_message(): a Content-Length body that never fully arrives
+    // (the peer sends a short prefix and closes) must come back incomplete.
+    {
+        uint16_t port = 0;
+        if (!allocate_loopback_port(&port)) {
+            std::cerr << "FAIL [self-test partial]: could not allocate a loopback port\n";
+            return false;
+        }
+        const int listen_fd = socket(AF_INET, SOCK_STREAM, 0);
+        if (listen_fd < 0) {
+            std::cerr << "FAIL [self-test partial]: could not create listen socket\n";
+            return false;
+        }
+        const int one = 1;
+        setsockopt(listen_fd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
+        sockaddr_in addr{};
+        addr.sin_family = AF_INET;
+        addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+        addr.sin_port = htons(port);
+        if (bind(listen_fd, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) != 0 ||
+            listen(listen_fd, 1) != 0) {
+            std::cerr << "FAIL [self-test partial]: could not bind/listen\n";
+            close(listen_fd);
+            return false;
+        }
+        std::thread server([listen_fd] {
+            const int fd = accept(listen_fd, nullptr, nullptr);
+            if (fd < 0) return;
+            // Advertises a 10-byte body but sends only 3 bytes, then closes:
+            // a connection that dies mid-frame.
+            send_all(fd, "HTTP/1.1 200 OK\r\nContent-Length: 10\r\n\r\nabc");
+            close(fd);
+        });
+        const int fd = connect_with_timeout(port, kClientTimeoutMs);
+        if (fd < 0) {
+            std::cerr << "FAIL [self-test partial]: could not connect to fake server\n";
+            ok = false;
+        } else {
+            const ReadResult read = read_http_message(fd, /*head_request=*/false, 500);
+            if (read.complete) {
+                std::cerr << "FAIL [self-test partial]: truncated Content-Length body was "
+                             "reported complete\n";
+                ok = false;
+            }
+            if (read.bytes.find("abc") == std::string::npos) {
+                std::cerr << "FAIL [self-test partial]: partial bytes were not captured\n";
+                ok = false;
+            }
+            close(fd);
+        }
+        server.join();
+        close(listen_fd);
+    }
+
+    // write_transcript(): must reject an incomplete exchange and a
+    // duplicated upstream contact, in both cases without creating the
+    // output file, and must accept a fully valid run.
+    {
+        const std::string dir = make_temp_dir("rut-envoy-selftest");
+        if (dir.empty()) {
+            std::cerr << "FAIL [self-test partial]: could not create temp dir\n";
+            return false;
+        }
+        const std::string out_path = dir + "/transcript.inc";
+
+        CaseResult incomplete;
+        incomplete.name = "bad_incomplete";
+        incomplete.client_bytes = "GET / HTTP/1.1\r\n\r\n";
+        incomplete.exchange_complete = false;
+        incomplete.upstream_contacted = true;
+        incomplete.upstream_contact_count = 1;
+        incomplete.upstream_bytes = "GET / HTTP/1.1\r\n\r\n";
+        incomplete.downstream_bytes = "HTTP/1.1 200 O";
+        if (write_transcript(out_path, {incomplete})) {
+            std::cerr << "FAIL [self-test partial]: write_transcript accepted an incomplete "
+                         "exchange\n";
+            ok = false;
+        }
+        struct stat st{};
+        if (stat(out_path.c_str(), &st) == 0) {
+            std::cerr << "FAIL [self-test partial]: write_transcript left a file behind for a "
+                         "rejected incomplete-exchange run\n";
+            ok = false;
+        }
+
+        CaseResult duplicated;
+        duplicated.name = "bad_duplicate";
+        duplicated.client_bytes = "GET / HTTP/1.1\r\n\r\n";
+        duplicated.exchange_complete = true;
+        duplicated.upstream_contacted = true;
+        duplicated.upstream_contact_count = 2;
+        duplicated.upstream_bytes = "GET / HTTP/1.1\r\n\r\n";
+        duplicated.downstream_bytes = "HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n";
+        if (write_transcript(out_path, {duplicated})) {
+            std::cerr << "FAIL [self-test partial]: write_transcript accepted a duplicated "
+                         "upstream contact\n";
+            ok = false;
+        }
+        if (stat(out_path.c_str(), &st) == 0) {
+            std::cerr << "FAIL [self-test partial]: write_transcript left a file behind for a "
+                         "rejected duplicate-contact run\n";
+            ok = false;
+        }
+
+        CaseResult good;
+        good.name = "ok";
+        good.client_bytes = "GET / HTTP/1.1\r\n\r\n";
+        good.exchange_complete = true;
+        good.upstream_contacted = true;
+        good.upstream_contact_count = 1;
+        good.upstream_bytes = "GET / HTTP/1.1\r\n\r\n";
+        good.downstream_bytes = "HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n";
+        if (!write_transcript(out_path, {good})) {
+            std::cerr << "FAIL [self-test partial]: write_transcript rejected a fully valid run\n";
+            ok = false;
+        }
+    }
+
+    if (ok) std::cerr << "PASS [self-test partial exchange rejection]\n";
+    return ok;
+}
+
+// Covers round-3 review thread P2 ("Build the Docker argv before entering
+// the fork child"): build_argv() must produce a correctly null-terminated
+// argv that aliases its input, and the prebuild-then-fork pattern it enables
+// (used by run_and_wait()/EnvoyInstance::launch()) must actually work
+// end-to-end.
+bool self_test_argv_builder() {
+    bool ok = true;
+    const std::vector<std::string> input = {"printf", "one", "two"};
+    const std::vector<char*> argv = build_argv(input);
+    if (argv.size() != input.size() + 1) {
+        std::cerr << "FAIL [self-test argv builder]: expected " << (input.size() + 1)
+                  << " entries, got " << argv.size() << "\n";
+        ok = false;
+    } else {
+        if (argv.back() != nullptr) {
+            std::cerr << "FAIL [self-test argv builder]: argv is not null-terminated\n";
+            ok = false;
+        }
+        for (size_t i = 0; i < input.size(); i++) {
+            if (argv[i] == nullptr || input[i] != argv[i]) {
+                std::cerr << "FAIL [self-test argv builder]: argv[" << i
+                          << "] does not alias the source string\n";
+                ok = false;
+            }
+        }
+    }
+    // Exercise the whole prebuild-then-fork path end to end: a real
+    // fork+exec using an argv built entirely before fork(), with only
+    // async-signal-safe work in the child.
+    if (run_and_wait({"true"}, 2000) != 0) {
+        std::cerr << "FAIL [self-test argv builder]: run_and_wait({\"true\"}) did not exit 0\n";
+        ok = false;
+    }
+    if (run_and_wait({"false"}, 2000) != 1) {
+        std::cerr << "FAIL [self-test argv builder]: run_and_wait({\"false\"}) did not exit 1\n";
+        ok = false;
+    }
+    if (ok) std::cerr << "PASS [self-test argv builder]\n";
+    return ok;
+}
+
 int run_self_test() {
     bool ok = true;
     ok &= self_test_escaping();
     ok &= self_test_recording_upstream();
+    ok &= self_test_partial_exchange_rejection();
+    ok &= self_test_argv_builder();
     return ok ? 0 : 1;
 }
 
