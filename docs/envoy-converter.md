@@ -608,13 +608,21 @@ is not a byte-for-byte run of the milestone's own emitted text.
    was forwarded with the `TE` header silently dropped (the origin received
    `GET / HTTP/1.1\r\nHost: 127.0.0.1:9100\r\n\r\n`, no `TE` field at all) —
    a mis-forward for that case, not a fail-closed refusal. PR #696
-   (`envoy/rut-request-envoy-h1`, commit `366ad196`,
-   `apply_preserve_host_lowercase_request_policy`) adds exact-value
-   `TE: trailers` preservation once the `request_envoy_h1` capability lands,
-   fixing the bodyless mis-forward; that function still calls the same
-   `inspect_request_policy_body` gate first, though, so a request with a body
-   still fails closed 400 even after #696 (verified by reading `366ad196` on
-   that branch; not runnable from `envoy/lower-increment-2`).
+   (`envoy/rut-request-envoy-h1`, ID4 `Http11PreserveHostLowercase`,
+   `apply_preserve_host_lowercase_request_policy`) adds `TE: trailers`
+   preservation once the `request_envoy_h1` capability lands, fixing the
+   bodyless mis-forward. **Update (round-4 review):** as of that branch's
+   round-3 revision (commit `8200f648`), `inspect_request_policy_body`
+   admits a fixed-Content-Length request too, whenever the `TE` value
+   carries a `trailers` token among its comma-separated tokens (not only an
+   exact whole-value match), and the serializer rewrites the kept header to
+   the canonical lowercase `te: trailers` regardless of the client's casing
+   or the other tokens in the value — the earlier claim in this item that a
+   body-carrying request "still fails closed 400 even after #696" described
+   only the pre-round-3 state of `366ad196` and no longer holds; see
+   `tests/test_network.cc`'s
+   `preserve_host_lowercase_wire_and_fail_closed_host` for the byte-exact
+   wire assertions covering both the bodyless and fixed-length cases.
 4. **Extension/unrecognized HTTP methods.** Envoy's default HTTP/1 parser
    (`BalsaParser`, used unless `Http1ProtocolOptions.allow_custom_methods` and
    the BalsaParser feature are both on) matches the request method against a

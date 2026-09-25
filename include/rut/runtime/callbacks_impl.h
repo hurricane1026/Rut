@@ -5408,6 +5408,88 @@ inline bool request_policy_name_eq(const u8* p, u32 n, const char* q, u32 qn) {
     return true;
 }
 
+// Trim OWS (space/HTAB) from both ends of [start, end), matching the OWS
+// trimming already applied to header values throughout this file.
+inline void request_policy_trim_ows(const u8*& start, const u8*& end) {
+    while (start < end && (*start == ' ' || *start == '\t')) start++;
+    while (end > start && (end[-1] == ' ' || end[-1] == '\t')) end--;
+}
+
+// Scan a comma-separated header value (already OWS-trimmed at the field
+// level) for a token that, once trimmed of its own OWS, case-insensitively
+// equals `token`. Shared by the TE "trailers" token search (Envoy's
+// `sanitizeConnectionHeader`, source/common/http/utility.cc, splits TE on
+// commas via `StringUtil::splitToken` and keeps the header, rewritten to
+// exactly "trailers", only when one token case-insensitively equals
+// "trailers" -- not only when the whole field value does) and the Connection
+// "upgrade" token search below (RFC 7230 comma-separated Connection tokens;
+// Envoy's `Utility::isUpgrade` uses the same per-token search and does not
+// care whether a "close" token is also present).
+inline bool request_policy_comma_value_has_token(const u8* value_start,
+                                                 const u8* value_end,
+                                                 const char* token,
+                                                 u32 token_len) {
+    const u8* tok = value_start;
+    while (tok <= value_end) {
+        const u8* tok_end = tok;
+        while (tok_end < value_end && *tok_end != ',') tok_end++;
+        const u8* t0 = tok;
+        const u8* t1 = tok_end;
+        request_policy_trim_ows(t0, t1);
+        if (t1 > t0 && request_policy_name_eq(t0, static_cast<u32>(t1 - t0), token, token_len))
+            return true;
+        if (tok_end >= value_end) break;
+        tok = tok_end + 1;
+    }
+    return false;
+}
+
+// Envoy's `HeaderUtility::authorityIsValid` character class
+// (source/common/http/header_utility.cc): permits alnum plus the RFC 3986
+// sub-delims (`!$%&'()*+,;=`), `-._~`, and `:@[]` (colon/at/brackets for
+// port, user-info, and IPv6 literals); rejects `/`, all other punctuation,
+// controls, space, and any byte >= 0x80. ID4 preserves the client's Host
+// verbatim instead of writing the upstream endpoint, so it is the one
+// profile that must validate the value's syntax itself before forwarding it
+// as the upstream request-line/Host authority (Envoy rejects a malformed
+// authority before routing; different origins may otherwise interpret
+// invalid authorities inconsistently).
+inline bool request_policy_host_authority_byte_is_valid(u8 c) {
+    if ((c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9')) return true;
+    switch (c) {
+        case '!':
+        case '$':
+        case '%':
+        case '&':
+        case '\'':
+        case '(':
+        case ')':
+        case '*':
+        case '+':
+        case ',':
+        case '-':
+        case '.':
+        case ':':
+        case ';':
+        case '=':
+        case '@':
+        case '[':
+        case ']':
+        case '_':
+        case '~':
+            return true;
+        default:
+            return false;
+    }
+}
+
+inline bool request_policy_host_authority_is_valid(const u8* p, u32 n) {
+    for (u32 i = 0; i < n; i++) {
+        if (!request_policy_host_authority_byte_is_valid(p[i])) return false;
+    }
+    return true;
+}
+
 // Parse and validate the policy's framing before it can acquire an upstream
 // slot. The existing HTTP parser intentionally accepts identical duplicate
 // Content-Length fields; nginx's fixed policy does not, so count the raw fields
@@ -5444,6 +5526,7 @@ inline RequestPolicyBodyState inspect_request_policy_body(const Connection& conn
     bool has_expect = false;
     bool has_upgrade = false;
     bool te_trailers_seen = false;
+    bool connection_nominates_upgrade = false;
     const u8* hs = line_end + 2;
     const u8* header_end = end - 2;
     while (hs < header_end) {
@@ -5461,18 +5544,34 @@ inline RequestPolicyBodyState inspect_request_policy_body(const Connection& conn
             has_te = true;
             const u8* value_start = colon + 1;
             const u8* value_end = le;
-            while (value_start < value_end && (*value_start == ' ' || *value_start == '\t'))
-                value_start++;
-            while (value_end > value_start && (value_end[-1] == ' ' || value_end[-1] == '\t'))
-                value_end--;
+            request_policy_trim_ows(value_start, value_end);
             // The serializer below evaluates every `te` field independently
             // (each line keeps its own value verbatim or is dropped on its
-            // own), so admission must check whether ANY field is exactly
-            // "trailers" rather than only the last one parsed here; a
-            // `TE: trailers` followed by an unrelated `TE: gzip` is a shape
-            // the serializer already forwards correctly (see drop_te).
-            te_trailers_seen |= request_policy_name_eq(
-                value_start, static_cast<u32>(value_end - value_start), "trailers", 8);
+            // own), so admission must check whether ANY field carries a
+            // "trailers" token rather than only the last field parsed here,
+            // and whether that token is the whole value or one of several
+            // comma-separated tokens (Envoy's `sanitizeConnectionHeader`
+            // splits TE's value on commas); a `TE: trailers` followed by an
+            // unrelated `TE: gzip`, or a single `TE: gzip, trailers` field,
+            // is a shape the serializer already forwards correctly (see
+            // drop_te).
+            te_trailers_seen |=
+                request_policy_comma_value_has_token(value_start, value_end, "trailers", 8);
+        }
+        if (request_policy_name_eq(hs, name_len, "connection", 10)) {
+            const u8* value_start = colon + 1;
+            const u8* value_end = le;
+            request_policy_trim_ows(value_start, value_end);
+            // A raw "upgrade" token survives this scan even when a sibling
+            // "close" token has already cleared `conn.req_wants_upgrade`
+            // (the parser treats "close" as contradicting "upgrade" for the
+            // 101-tunnel decision). Envoy's own `Utility::isUpgrade` does not
+            // care whether "close" is also present -- it observes the
+            // "upgrade" token plus a non-empty Upgrade header alone -- so
+            // this shape must not be silently rewritten into ordinary
+            // traffic below.
+            connection_nominates_upgrade |=
+                request_policy_comma_value_has_token(value_start, value_end, "upgrade", 7);
         }
         has_expect |= request_policy_name_eq(hs, name_len, "expect", 6);
         has_upgrade |= request_policy_name_eq(hs, name_len, "upgrade", 7);
@@ -5491,12 +5590,19 @@ inline RequestPolicyBodyState inspect_request_policy_body(const Connection& conn
     // rejecting it; admission for that profile must not reject it either.
     // Every other supported policy keeps the original closed contract of
     // rejecting any `Upgrade` header outright, matching its own prior tested
-    // behavior (this PR does not touch that non-Envoy-oracle profile).
-    if (has_expect || (has_upgrade && !request_policy_preserves_host(policy_id)))
+    // behavior (this PR does not touch that non-Envoy-oracle profile). But a
+    // `Connection` value that nominates "upgrade" alongside "close" (or on
+    // its own) is a genuine upgrade request per Envoy's own
+    // `Utility::isUpgrade` (which ignores "close" entirely) -- Rut's
+    // request_policy path has no upgrade-tunnel capability, so this shape
+    // must fail closed rather than being silently rewritten into an
+    // ordinary request with both headers dropped.
+    if (has_expect || (has_upgrade &&
+                       (connection_nominates_upgrade || !request_policy_preserves_host(policy_id))))
         return RequestPolicyBodyState::Invalid;
     if (has_te) {
-        // ID4 (host: "preserve") forwards `te` when its value is exactly
-        // "trailers" (see apply_preserve_host_lowercase_request_policy's
+        // ID4 (host: "preserve") forwards `te` when its value carries a
+        // "trailers" token (see apply_preserve_host_lowercase_request_policy's
         // drop_te), matching the Envoy oracle. Every other policy keeps the
         // original closed contract of rejecting any TE header outright.
         const bool te_trailers_ok = request_policy_preserves_host(policy_id) && te_trailers_seen;
@@ -5557,6 +5663,12 @@ inline bool apply_preserve_host_lowercase_request_policy(Connection& conn, u16 p
     ParsedRequest req;
     parser.reset();
     if (parser.parse(data, len, &req) != ParseStatus::Complete) return false;
+    // HTTP request targets cannot carry a URI fragment (RFC 7230 §5.3); Envoy
+    // rejects this shape rather than forwarding it, and route selection above
+    // already matched only the pre-fragment canonical path, so forwarding the
+    // raw fragment-bearing target here would let routing and the origin
+    // observe different target interpretations of the same request.
+    if (req.target_has_fragment) return false;
     const u32 body_len = req.has_content_length ? req.content_length : 0;
     const u8* end = data + parser.header_end;
     const u8* line_end = data;
@@ -5574,6 +5686,7 @@ inline bool apply_preserve_host_lowercase_request_policy(Connection& conn, u16 p
     NominatedName nominated[kMaxHeaders];
     u32 nominated_count = 0;
     u32 host_count = 0;
+    u32 xfp_count = 0;
     const u8* host_value_start = nullptr;
     u32 host_value_len = 0;
     {
@@ -5596,6 +5709,8 @@ inline bool apply_preserve_host_lowercase_request_policy(Connection& conn, u16 p
                 host_count++;
                 host_value_start = value_start;
                 host_value_len = static_cast<u32>(value_end - value_start);
+            } else if (request_policy_name_eq(hs, name_len, "x-forwarded-proto", 17)) {
+                xfp_count++;
             } else if (request_policy_name_eq(hs, name_len, "connection", 10)) {
                 const u8* tok = value_start;
                 while (tok <= value_end) {
@@ -5618,7 +5733,18 @@ inline bool apply_preserve_host_lowercase_request_policy(Connection& conn, u16 p
             hs = le + 2;
         }
     }
-    if (host_count != 1 || host_value_len == 0) return false;
+    if (host_count != 1 || host_value_len == 0 ||
+        !request_policy_host_authority_is_valid(host_value_start, host_value_len))
+        return false;
+    // Envoy stores X-Forwarded-Proto as a single inline header: a second
+    // client-supplied field is not kept as a separate line but coalesced
+    // into the same logical value with a "," delimiter before upstream
+    // encoding (`HeaderMapImpl::appendCopy`/`delimiterByHeader`,
+    // source/common/http/header_map_impl.cc). This profile does not
+    // replicate that coalescing, so more than one physical field is refused
+    // outright rather than risking an origin observing a different,
+    // first-or-last-duplicate scheme than an Envoy-parity client intended.
+    if (xfp_count > 1) return false;
 
     // Fail closed for every Connection nomination this profile cannot safely
     // honor by simply omitting the header:
@@ -5636,14 +5762,22 @@ inline bool apply_preserve_host_lowercase_request_policy(Connection& conn, u16 p
     //    Host-less request is then rejected 400 by its Host-presence check
     //    before the router ever sees it, so the end-to-end behavior this
     //    mirrors is still a fail-closed 400.
-    //  - x-forwarded-proto: Envoy's `sanitizeConnectionHeader` explicitly
-    //    refuses the whole request when Connection nominates any
-    //    `X-Forwarded-*` header, rather than removing it, because doing so
-    //    could mask the origin of the incoming request.
+    //  - x-forwarded-for / x-forwarded-host / x-forwarded-proto: Envoy's
+    //    `sanitizeConnectionHeader` (source/common/http/utility.cc) names
+    //    exactly these three headers (`Http::Headers::get().ForwardedFor`,
+    //    `.ForwardedHost`, `.ForwardedProto`) and explicitly refuses the
+    //    whole request when Connection nominates any of them, rather than
+    //    removing it, because doing so could mask the origin of the incoming
+    //    request. (Envoy separately refuses any token that is itself a
+    //    pseudo-header, i.e. starts with `:`; Rut's Connection header cannot
+    //    carry an HTTP/2 pseudo-header name on this H1-only profile, so that
+    //    check has no analogous case here.)
     // Refuse the whole rewrite instead of ever emitting one of these shapes.
     for (u32 i = 0; i < nominated_count; i++) {
         if (request_policy_name_eq(nominated[i].ptr, nominated[i].len, "content-length", 14) ||
             request_policy_name_eq(nominated[i].ptr, nominated[i].len, "host", 4) ||
+            request_policy_name_eq(nominated[i].ptr, nominated[i].len, "x-forwarded-for", 15) ||
+            request_policy_name_eq(nominated[i].ptr, nominated[i].len, "x-forwarded-host", 16) ||
             request_policy_name_eq(nominated[i].ptr, nominated[i].len, "x-forwarded-proto", 17))
             return false;
     }
@@ -5722,15 +5856,23 @@ inline bool apply_preserve_host_lowercase_request_policy(Connection& conn, u16 p
                                     request_policy_name_eq(hs, name_len, "expect", 6) ||
                                     request_policy_name_eq(hs, name_len, "upgrade", 7) ||
                                     request_policy_name_eq(hs, name_len, "transfer-encoding", 17);
-            const bool drop_te =
-                is_te && !request_policy_name_eq(
-                             value_start, static_cast<u32>(value_end - value_start), "trailers", 8);
+            // Envoy's `sanitizeConnectionHeader` splits TE's value on commas
+            // and keeps the header only when one token case-insensitively
+            // equals "trailers" -- not only when the whole field value does
+            // -- and when kept, rewrites it to exactly that canonical
+            // lowercase token (`headers.setTE(TEValues.Trailers)`), not the
+            // client's original casing or the other comma-joined tokens.
+            const bool te_has_trailers = is_te && request_policy_comma_value_has_token(
+                                                      value_start, value_end, "trailers", 8);
+            const bool drop_te = is_te && !te_has_trailers;
             const bool drop_nominated = name_nominated(hs, name_len);
             if (!drop_fixed && !drop_te && !drop_nominated) {
                 if (is_cl) {
                     if (!append_lit("content-length: ", 16) || !append_dec(body_len) ||
                         !append_lit("\r\n", 2))
                         return false;
+                } else if (te_has_trailers) {
+                    if (!append_lit("te: trailers\r\n", 14)) return false;
                 } else {
                     if (!append_lower(hs, name_len) || !append_lit(": ", 2) ||
                         !append(value_start, static_cast<u32>(value_end - value_start)) ||
