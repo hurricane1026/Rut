@@ -601,6 +601,150 @@ is not a byte-for-byte run of the milestone's own emitted text.
    `HTTP/1.1 200 \r\nContent-Length: 0\r\n\r\n` got the client `HTTP/1.1 502
    Bad Gateway`.
 
+**Round-3 review edge cases (PR #692)**
+
+Six more per-request/per-response behaviors of the milestone's any-method
+`forward(...)` route, found in the round-3 Codex review of PR #692, plus one
+distinct mis-forward bug (`CONNECT`, covered at the end of this section). Same
+non-gating rule as round-2: these are per-request behaviors of an
+already-admitted, already-converted route, not configuration-admission gaps,
+so none is a `RutCapabilities` check.
+
+Verified from Envoy v1.39.1 source and from a live `rut` process built from
+this tree (`envoy/lower-increment-2`, head `ec0f9df4`, `--shards 1 --no-pin`).
+Same stated limitation as round-2: the live checks used the nginx-era policy
+shape (`tests/fixtures/nginx373_hide.inc`) instead of the milestone's own
+emitted text, since that still doesn't compile on this branch.
+
+1. **65-100 request headers.** Envoy's default `HttpProtocolOptions.max_headers_count`
+   is 100, applied per direction (`api/envoy/config/core/v3/protocol.proto`),
+   so a request with up to 100 headers is accepted — the request-side mirror
+   of the round-2 response-header-ceiling row. Rut's `kMaxHeaders` is the same
+   fixed 64 on both parsers (`include/rut/runtime/http_parser.h:46`); the
+   request parser has no `headers_truncated` tolerance the way the response
+   parser does, so `HttpParser::parse` resolves straight to
+   `ParseStatus::Error` once the count is exceeded, before any route lookup.
+   Live: a `GET /` with 73 header fields got the connection closed with no
+   response bytes — not the `400 Bad Request` the parser header comment
+   documents for `ParseStatus::Error` in general (`include/rut/runtime/http_parser.h:128`,
+   "400, close connection"). Confirmed the harness itself reproduces that
+   documented `400 Bad Request` for round-2's `PROPFIND` case on the identical
+   fixture, so the silent close is specific to the header-count-overflow path,
+   not a broken test.
+2. **Request or response header block between 16 KiB and 60 KiB.** Envoy's
+   default `max_request_headers_kb`/`max_response_headers_kb` is 60 KiB
+   (`api/envoy/config/core/v3/protocol.proto`), so a single large header (e.g.
+   a big `Cookie` or `X-Big`) well under that is accepted on both directions.
+   Rut accumulates the request head in one `SlicePool::kSliceSize` (16384
+   byte) receive buffer (`include/rut/runtime/io_backend.h:50`) and the
+   upstream response head in the equivalent upstream buffer; `on_header_received`
+   closes the downstream connection when that buffer is full and the head is
+   still incomplete, and `on_upstream_response`'s `-ENOBUFS` path does the
+   same for an oversized upstream head. Live: a `GET /` with one 20000-byte
+   header got the connection closed with no response bytes and no upstream
+   connection attempted; an upstream response with one 20000-byte header got
+   the upstream contacted but the client connection closed with no response
+   bytes.
+3. **Status-defined no-body responses (204, 304).** Envoy's HTTP/1 codec
+   suppresses the body for 204 (and 1xx) and disables chunked framing for 304
+   while still forwarding the response
+   (`StreamEncoderImpl::encodeHeadersBase`, `source/common/http/http1/codec_impl.cc`),
+   so a `204 No Content` or a `304 Not Modified` with a legal `Content-Length`
+   reaches the client. Rut's `build_strict_response_headers` unconditionally
+   rejects `status_code == 204 || status_code == 205`, and rejects `304`
+   unless a `StrictNoBodyMetadataSuccess` purpose is selected
+   (`include/rut/runtime/callbacks_impl.h:10165-10168`), which this route's
+   plain `forward(...)` does not request. Live: an upstream `204 No Content`
+   and a `304 Not Modified` (`Content-Length: 0`) each got the upstream
+   contacted but the client connection closed with no response bytes.
+4. **Interim (1xx) responses.** Envoy forwards `encode1xxHeaders` unconditionally
+   to the downstream connection ahead of the final response — no per-route or
+   per-filter gate (`ConnectionManagerImpl::ActiveStream::encode1xxHeaders`,
+   `source/common/http/conn_manager_impl.cc`) — so a `103 Early Hints` (or
+   `100 Continue`) followed by the real response reaches the client as two
+   frames. Rut's strict `response_policy` rejects every 1xx immediately
+   (`include/rut/runtime/callbacks_impl.h:11215-11218`, "a strict policy has
+   no interim-response ... domain") before the final response is even read.
+   Live: an upstream sending `100 Continue` immediately followed by `200 OK`
+   got the upstream contacted but the client connection closed with no
+   response bytes at all — the final `200 OK` never reached the client either.
+5. **Ordinary response headers with no special Envoy handling (`Location`,
+   `Refresh`, `Last-Modified`).** Envoy's hop-by-hop stripping
+   (`ConnectionManagerUtility`, `source/common/http/conn_manager_utility.cc`)
+   only removes `connection` and the headers it names, `keep-alive`,
+   `proxy-connection`, `te` (unless `trailers`), `upgrade` outside an upgrade,
+   and `transfer-encoding` on reframe; ordinary headers like a redirect's
+   `Location` or a cache validator's `Last-Modified` pass through unchanged.
+   Rut's `strict_response_forbidden` unconditionally rejects `location`,
+   `refresh`, and `last-modified` (`include/rut/runtime/callbacks_impl.h:9856-9868`)
+   regardless of the route's `hide_headers` list — this milestone's route
+   already requests `hide_headers: []` (hide nothing), so there is no policy
+   value that admits these headers even once `response_envoy_h1` lands. Live:
+   an upstream `302 Found` with `Location: /login` got the upstream contacted
+   but the client connection closed with no response bytes.
+6. **Undifferentiated (and sometimes absent) failure replies.** Envoy maps
+   `LocalConnectionFailure`/`RemoteConnectionFailure`/`ConnectionTimeout` (a
+   refused or timed-out connect attempt) to one local-reply text and
+   `ConnectionTermination` (a reset after the stream was established) to
+   another, with protocol errors mapped to `502` and other resets to `503`
+   (`source/common/router/router.cc`, the `StreamResetReason` →
+   `CoreResponseFlag` mapping). Rut's converter emits exactly one
+   `failure_policy` per route for every non-timeout upstream failure. Live
+   testing found this is not just "one generic text for every cause" as
+   originally suspected, but strictly worse for one of the two causes tested:
+   stopping the origin entirely (connect refused) got the client the route's
+   exact configured `failure_policy` body (`HTTP/1.1 502 Bad Gateway` with the
+   nginx-era fixture's HTML body) — but an origin that accepted the
+   connection, read the request, and closed without writing any response byte
+   got the client connection closed with **no** local-reply text at all, not
+   even the generic one. `failure_policy` fires only for a connect-establishment
+   failure; a post-accept reset with zero response bytes takes a different,
+   silent path.
+7. **`CONNECT` matching the any-method route (bug, not a fail-closed
+   divergence).** `route_table.h`'s own comment states "method 0 in a route
+   entry matches any request method"; a method-omitted `route "/"` therefore
+   matches `CONNECT` too. Envoy's HCM rejects a `CONNECT` request whose
+   `:path` is non-empty before ever reaching the router
+   (`ConnectionManagerImpl::ActiveStream::decodeHeaders`,
+   `source/common/http/conn_manager_impl.cc`) — the request never reaches an
+   upstream. Live: `CONNECT / HTTP/1.1` against this converter's own emitted
+   shape reached the origin (`ORIGIN RECEIVED: b'CONNECT / HTTP/1.1\r\nHost:
+   127.0.0.1:29000\r\n\r\n'`) and the origin's `200 OK` response was relayed
+   back to the client verbatim — Rut opened the upstream connection and
+   forwarded a response Envoy would never have requested. Two converter-level
+   fixes were tried and both are infeasible with today's grammar and token
+   budget:
+   - Splitting the any-method route into one explicit `route <METHOD> "/"`
+     per forwarded method (mirroring the `HEAD` route already emitted)
+     overflows the lexer's fixed `kMaxTokens = 932`
+     (`include/rut/compiler/lexer.h:135`) once duplicated across all 7
+     non-HEAD forwarded methods — confirmed by actually compiling that
+     11+ KB shape with `rut` (`lex failed: too many tokens`).
+   - A `guard req.method == GET || req.method == POST || … else { return
+     400 }` inside the existing any-method route stays comfortably within
+     the token budget, but `CONNECT` and `TRACE` are both plain identifiers:
+     neither has a `req.method == <KW>` expression-position keyword
+     (`is_method_keyword`, `src/compiler/parser.cc`, covers only
+     GET/POST/PUT/DELETE/PATCH/HEAD/OPTIONS) nor a `route <METHOD> "/"`
+     declaration spelling of its own — confirmed live that `route TRACE "/"`
+     is a parse error (`unexpected token ... (TRACE)`), and that
+     `pre_route`/`unmatched` bodies (the only place `CONNECT`/`TRACE` are
+     recognized at all) are fixed-shape local-response policies only, never
+     a `forward(...)` (`AstPreRouteDecl`/`AstUnmatchedDecl`,
+     `include/rut/compiler/ast.h`, carry only a `policy_id`, no statement
+     list). A guard that excludes `CONNECT` is therefore indistinguishable
+     from one that also excludes `TRACE`, and Envoy forwards `TRACE` like
+     any other method (this document, "Routing"), so that guard would trade
+     the `CONNECT` mis-forward for a new `TRACE` divergence rather than fix
+     anything.
+
+   Fixing this without introducing a new divergence needs a runtime or
+   language capability this milestone does not have today: an
+   expression-position `CONNECT` (and `TRACE`) method literal, a per-route
+   method-exclusion list, or a lexer token budget large enough for one
+   explicit route per forwarded method. Recorded as a bug (not a
+   `NOT_IMPLEMENTED`/`PARTIAL` row) in docs/envoy-compatibility.md.
+
 ## Test layers
 
 1. Parser tests (`tests/test_envoy_parser.cc`): JSON document tree, field

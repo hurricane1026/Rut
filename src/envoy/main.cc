@@ -125,7 +125,29 @@ bool read_input(const char* filename, char** output, size_t* length, const char*
         *error = strerror(errno);
         return false;
     }
-    if (after.st_size < 0 || static_cast<uintmax_t>(after.st_size) != used) {
+    // PR #692 round-3 review: comparing only `after.st_size` to `used` (the
+    // byte count this call actually read) does not detect an in-place
+    // rewrite that keeps the file's length unchanged — another process can
+    // overwrite the file with different content of the same size while this
+    // loop is mid-read, and the size-only check above would still pass,
+    // silently admitting a torn mix of the old and new bytes (e.g. a
+    // listener from one revision combined with an endpoint from another).
+    // Comparing every field `write()`/`rename()`-free in-place rewrites are
+    // expected to change — device, inode, size, and the nanosecond mtime/ctime
+    // pair — catches that case: an in-place rewrite that lands entirely
+    // between `before` and this `after` snapshot always advances the file's
+    // mtime/ctime, even when it leaves the length identical, and a
+    // replace-via-rename changes the inode. This is still not a perfect
+    // atomic-snapshot guarantee (a rewrite could in principle restore
+    // identical metadata down to the nanosecond), but it closes the concrete
+    // same-size gap the review reported, which the size-only check could
+    // never see.
+    if (after.st_size < 0 || static_cast<uintmax_t>(after.st_size) != used ||
+        before.st_dev != after.st_dev || before.st_ino != after.st_ino ||
+        before.st_size != after.st_size || before.st_mtim.tv_sec != after.st_mtim.tv_sec ||
+        before.st_mtim.tv_nsec != after.st_mtim.tv_nsec ||
+        before.st_ctim.tv_sec != after.st_ctim.tv_sec ||
+        before.st_ctim.tv_nsec != after.st_ctim.tv_nsec) {
         *error = "input changed while it was being read";
         return false;
     }

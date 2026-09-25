@@ -55,6 +55,54 @@ safely refuses it with a fixed status rather than mis-forwarding.
 | Valid HTTP/1.0 upstream response with `Content-Length`, forwarded by Envoy (`accept_http_10` gates only the downstream-facing server codec, `source/common/http/http1/codec_impl.h`; the client codec's version check accepts any `HTTP/<digit>.<digit>` line) | yes: milestone bootstrap admission does not depend on the upstream's response version | yes: the emitted route's response_policy has no upstream-version knob, no capability gate | no: Rut fails closed with `502 Bad Gateway` before downstream commit (`build_strict_response_headers` requires `resp.version == HttpVersion::Http11`, `include/rut/runtime/callbacks_impl.h:10164`) | live observation on envoy/lower-increment-2 with the nginx-era policy shape: an origin answering `HTTP/1.0 200 OK` with `Content-Length: 5` got the client `HTTP/1.1 502 Bad Gateway` | NOT_IMPLEMENTED |
 | Upstream response with an empty reason phrase, forwarded by Envoy (RFC 7230 §3.1.2 allows a zero-length `reason-phrase`; `BalsaParser::OnResponseFirstLineInput` does not reject it, `source/common/http/http1/balsa_parser.cc`) | yes: milestone bootstrap admission does not depend on the upstream's reason phrase | yes: the emitted route's response_policy has no reason-phrase knob, no capability gate | no: Rut fails closed with `502 Bad Gateway` before downstream commit (`build_strict_response_headers` rejects `resp.reason.len == 0`, `include/rut/runtime/callbacks_impl.h:10170`) | live observation on envoy/lower-increment-2 with the nginx-era policy shape: an origin answering `HTTP/1.1 200 \r\nContent-Length: 0\r\n\r\n` got the client `HTTP/1.1 502 Bad Gateway` | NOT_IMPLEMENTED |
 
+Per-request divergences found in the PR #692 round-3 review (same non-gating
+rule as round-2 above). Live checks used the same nginx-era policy fixture
+(`tests/fixtures/nginx373_hide.inc`) against a `rut` process built from
+`envoy/lower-increment-2` (head `ec0f9df4`), `--shards 1 --no-pin`, driven
+with raw sockets and a scripted Python origin.
+
+| Envoy feature | parser | converter | RUT capability | behavior test | status |
+| --- | --- | --- | --- | --- | --- |
+| Request with 65-100 headers, accepted by Envoy (default `HttpProtocolOptions.max_headers_count` is 100, applied per direction, `api/envoy/config/core/v3/protocol.proto`) | yes: milestone bootstrap admission does not depend on per-request header counts | yes: the emitted route has no request-header-count knob, no capability gate | no: Rut fails closed before any route lookup (`kMaxHeaders` is a fixed 64, `include/rut/runtime/http_parser.h:46`; `HttpParser::parse` resolves to `ParseStatus::Error` once the count is exceeded) | live observation: a `GET /` with 73 header fields got the connection closed with no response bytes at all (not the `400 Bad Request` the parser header comment documents for `ParseStatus::Error` generally — confirmed the harness itself works by reproducing the documented `400 Bad Request` for round-2's `PROPFIND` case on the same fixture) | NOT_IMPLEMENTED |
+| Request or response header block between 16 KiB and Envoy's default 60 KiB limit (`max_request_headers_kb` / `max_response_headers_kb`, default 60, `api/envoy/config/core/v3/protocol.proto`), accepted and forwarded by Envoy | yes: milestone bootstrap admission does not depend on per-request/response header byte size | yes: neither policy has a header-byte-size knob, no capability gate | no: Rut fails closed on both directions before the 16 KiB `SlicePool::kSliceSize` buffer (`include/rut/runtime/io_backend.h:50`) is exceeded — `on_header_received` for the request side, `on_upstream_response`'s `-ENOBUFS` path for the response side | live observation: a `GET /` with one 20000-byte request header got the connection closed with no response bytes, no upstream connection attempted; an upstream response with one 20000-byte header (request otherwise ordinary) got the upstream contacted but the client connection closed with no response bytes | NOT_IMPLEMENTED |
+| Status-defined no-body responses (`204 No Content`, `304 Not Modified` with a legal `Content-Length`), forwarded by Envoy without a body (`StreamEncoderImpl::encodeHeadersBase`, `source/common/http/http1/codec_impl.cc`, suppresses the body for 204/1xx and disables chunking for 304) | yes: milestone bootstrap admission does not depend on per-response status | yes: the emitted route's response_policy has no no-body-status knob, no capability gate | no: `build_strict_response_headers` unconditionally rejects `status_code == 204 \|\| status_code == 205`, and rejects `304` unless a `StrictNoBodyMetadataSuccess` purpose is selected (`include/rut/runtime/callbacks_impl.h:10165-10168`), which this route does not request | live observation: an upstream `204 No Content` and a `304 Not Modified` (with `Content-Length: 0`) each got the upstream contacted but the client connection closed with no response bytes | NOT_IMPLEMENTED |
+| Interim (1xx) responses (e.g. `103 Early Hints`) forwarded unconditionally ahead of the final response (`ConnectionManagerImpl::ActiveStream::encode1xxHeaders`, `source/common/http/conn_manager_impl.cc`, no route/filter gating) | yes: milestone bootstrap admission does not depend on per-response informational status | yes: the emitted route's response_policy has no interim-response knob, no capability gate | no: a strict `response_policy` rejects every 1xx immediately (`include/rut/runtime/callbacks_impl.h:11215-11218`, "a strict policy has no interim-response ... domain") before the final response is ever read | live observation: an upstream sending `100 Continue` followed immediately by `200 OK` got the upstream contacted but the client connection closed with no response bytes — neither the interim nor the final response reached the client | NOT_IMPLEMENTED |
+| Ordinary upstream response headers Envoy has no special handling for beyond hop-by-hop stripping — e.g. `Location` on a `302 Found`, `Refresh`, `Last-Modified` — forwarded unchanged (`ConnectionManagerUtility`, `source/common/http/conn_manager_utility.cc`, only strips `connection`/`keep-alive`/`proxy-connection`/`te`(non-trailers)/`upgrade`/`transfer-encoding`-on-reframe) | yes: milestone bootstrap admission does not depend on per-response header names | yes: the emitted route explicitly requests `hide_headers: []` (hide nothing) | no: `strict_response_forbidden` unconditionally rejects `location`, `refresh`, and `last-modified` regardless of the route's `hide_headers` list (`include/rut/runtime/callbacks_impl.h:9856-9868`) — there is no policy value that admits them, so the converter cannot express this even once `response_envoy_h1` lands | live observation: an upstream `302 Found` with `Location: /login` got the upstream contacted but the client connection closed with no response bytes | NOT_IMPLEMENTED |
+| Upstream failure replies differentiated by cause: Envoy maps `LocalConnectionFailure`/`RemoteConnectionFailure`/`ConnectionTimeout` to one local-reply text and `ConnectionTermination` (reset after the stream was established) to another, and protocol errors to `502` versus other resets to `503` (`source/common/router/router.cc`, `StreamResetReason` → `CoreResponseFlag` mapping) | n/a (per-request runtime behavior, not a parser concern) | yes: the emitted route has exactly one `failure_policy` for every non-timeout upstream failure, no capability gate | no, and worse than "one generic text for every cause": a genuine connect refusal fires the route's configured `failure_policy` (the exact body/status the bootstrap's failure policy specifies), but an upstream that accepts the connection, receives the request, and then resets before sending any response byte gets no local-reply text at all — see behavior test | live observation on the same nginx-era `failure_policy` (502 "Bad Gateway" HTML body): stopping the origin entirely (connect refused) got the client the exact configured `HTTP/1.1 502 Bad Gateway` body; an origin that accepted the connection, read the request, and closed without writing any bytes got the client connection closed with no response bytes at all | NOT_IMPLEMENTED |
+
+The any-method `route "/"` also matches `CONNECT` (`route_table.h`: "method 0
+in a route entry matches any request method"), which is a bug, not a
+fail-closed divergence — recorded separately below rather than in the table
+above because Rut does not merely refuse the request, it forwards it.
+
+**Bug (mis-forward, not fail-closed):** `CONNECT / HTTP/1.1` against the
+milestone's any-method route opens the upstream connection and relays the
+origin's response back to the client. Envoy rejects this request locally
+(a non-empty `:path` on a `CONNECT` request fails
+`ConnectionManagerImpl::ActiveStream::decodeHeaders`'s validation,
+`source/common/http/conn_manager_impl.cc`) without ever contacting an
+upstream. Live observation on `envoy/lower-increment-2` (head `ec0f9df4`)
+with the nginx-era policy fixture: `CONNECT / HTTP/1.1` reached the origin
+(`ORIGIN RECEIVED: b'CONNECT / HTTP/1.1\r\nHost: 127.0.0.1:29000\r\n\r\n'`)
+and the origin's `200 OK` body was relayed back to the client unchanged. Two
+converter-level fixes were investigated and both are infeasible today: (1)
+splitting the any-method route into one explicit `route <METHOD> "/"` per
+forwarded method overflows the lexer's fixed `kMaxTokens = 932`
+(`include/rut/compiler/lexer.h:135`) once duplicated across all 7 non-HEAD
+forwarded methods (confirmed by compiling that shape with `rut`); (2) a
+`guard req.method == GET \|\| … else { return 400 }` inside the existing
+any-method route stays within the token budget, but `CONNECT` and `TRACE`
+are both plain identifiers with no `req.method == <KW>` expression form and
+no `route <METHOD> "/"` declaration spelling of their own (confirmed live:
+`route TRACE "/"` and `pre_route TRACE { return forward(...) }` are both
+parse errors — `pre_route`/`unmatched` bodies are fixed-shape local-response
+policies only), so a guard that excludes `CONNECT` is indistinguishable from
+one that also excludes `TRACE`, and Envoy forwards `TRACE` like any other
+method. This needs either a runtime capability (an expression-level `CONNECT`
+literal, a per-route method exclusion list, or a higher token budget) before
+the converter can prevent it without trading the `CONNECT` mis-forward for a
+new `TRACE` divergence.
+
 ## Blocked by Rut before the milestone can reach SUPPORTED
 
 Each row needs a runtime/language issue before the converter may emit it. The
@@ -143,3 +191,23 @@ converter fails closed on the whole configuration until then.
   lands, though a request with a `Content-Length` body still fails closed
   through the same `inspect_request_policy_body` gate even after #696 (code
   review of `366ad196` on that branch, not runnable from this branch).
+- PR #692 round-3 review (`envoy/lower-increment-2`, base
+  `envoy/parser-increment-1`): the six per-request rows added above (request
+  header ceiling, request/response header byte size, status-defined no-body
+  responses, interim 1xx responses, ordinary-but-forbidden response headers,
+  and undifferentiated failure replies) were each verified against Envoy
+  v1.39.1 source (`http1/codec_impl.cc`, `conn_manager_impl.cc`,
+  `conn_manager_utility.cc`, `router/router.cc`, `protocol.proto`) and against
+  a live `rut` process built from `envoy/lower-increment-2` (head `ec0f9df4`),
+  `--shards 1 --no-pin`, driven with raw sockets and a scripted Python
+  socket-level origin. Same substitution as round-2: this branch predates
+  the request/response/local-reply serializers, so the live checks used the
+  nginx-era policy fixture (`tests/fixtures/nginx373_hide.inc`) instead of
+  the milestone's exact emitted text — see docs/envoy-converter.md, "Round-3
+  review edge cases (PR #692)". None of the six is gated behind a
+  `RutCapabilities` flag, for the same reason as round-2. A seventh finding —
+  `CONNECT` matching the any-method route — is a mis-forward, not a
+  fail-closed refusal, and is recorded separately above (not as a numbered
+  table row) with the two converter-level fixes that were tried and found
+  infeasible within the lexer's token budget and the language's expression
+  grammar.

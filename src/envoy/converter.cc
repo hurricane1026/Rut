@@ -100,6 +100,37 @@ bool put_unmatched(Writer& w) {
 // One `forward(envoy_cluster_0, ...)` route body. `include_head_mode` is true
 // only for the HEAD route, where the response/failure bodies must be
 // suppressed even though the policies otherwise describe a bodied response.
+//
+// PR #692 round-3 review found that this route, when emitted with a
+// method-omitted (any-method) declaration, also matches CONNECT — confirmed
+// live against this converter's own shape (nginx-era policy fixture, since
+// this branch predates PR3-PR5): `CONNECT / HTTP/1.1` matched the any-method
+// route, Rut opened the upstream connection, and the origin's response was
+// relayed back to the client, whereas Envoy rejects that request locally (a
+// non-empty `:path` on a CONNECT request fails HCM's
+// `ConnectionManagerImpl::ActiveStream::decodeHeaders` validation) without
+// ever contacting an upstream — a real mis-forward, not a fail-closed
+// refusal. Two ways to prevent it inside the grammar were tried and both
+// failed: (1) splitting every forwarded method into its own `route <METHOD>
+// "/"` blows the lexer's fixed `kMaxTokens` budget
+// (`include/rut/compiler/lexer.h`) once duplicated across all 7 non-HEAD
+// forwarded methods (confirmed by compiling that shape with `rut`); (2) a
+// `guard req.method == GET || … else { return 400 }` inside this route body
+// stays within the token budget, but CONNECT and TRACE are both plain
+// identifiers with no `req.method == <KW>` expression-position keyword and
+// no `route <METHOD> "/"` declaration spelling (`is_method_keyword`,
+// `src/compiler/parser.cc`, covers only GET/POST/PUT/DELETE/PATCH/HEAD/
+// OPTIONS; confirmed live that `route TRACE "/"` and `pre_route TRACE {
+// return forward(...) }` are both parse errors — `pre_route`/`unmatched`
+// bodies are fixed-shape local-response policies only, per
+// `AstPreRouteDecl`/`AstUnmatchedDecl`, include/rut/compiler/ast.h), so a
+// guard that excludes CONNECT is indistinguishable from one that also
+// excludes TRACE, and TRACE must keep forwarding (Envoy forwards it like any
+// other method; docs/envoy-converter.md, "Routing"). Trading the CONNECT
+// mis-forward for a new TRACE mis-forward-turned-fail-closed is not an
+// improvement, so this converter does not attempt a code fix here; see
+// docs/envoy-compatibility.md for the recorded bug row and
+// docs/envoy-converter.md's round-3 section for the full investigation.
 bool put_forward_route(Writer& w, const char* method, u32 method_len, bool include_head_mode) {
     if (!w.put_cstr("route ")) return false;
     if (method_len != 0u && (!w.put_lit(method, method_len) || !w.put_cstr(" "))) return false;
@@ -171,6 +202,19 @@ FrontendResult<bool> validate(const Bootstrap& model, const RutCapabilities& cap
     if (!action.cluster.eq(model.cluster.name))
         return invalid(action.cluster_span,
                        lit_str("route cluster does not name a declared cluster"));
+    // PR #692 round-3 review: the emitted route is always the literal `"/"`
+    // catch-all (see put_forward_route below) — nothing about the route's
+    // actual `match.prefix` value ever reaches the generated text. A model
+    // built by `parse_bootstrap_json` always has `match.prefix.eq("/")`
+    // already (the parser rejects every other prefix), but a caller of the
+    // public `lower_to_rut(model, capabilities)` overload can copy a parsed
+    // `Bootstrap` and mutate `match.prefix` (e.g. to "/admin") before passing
+    // it back in; without this check, lowering still succeeds and silently
+    // widens what the emitted RUT actually matches relative to what the
+    // model claims. Reject any forged prefix here, alongside the other
+    // defensive model checks above.
+    if (!route.match.prefix.eq(lit_str("/")))
+        return invalid(route.match.prefix_span, lit_str("route match prefix must be \"/\""));
 
     if (!router.suppress_envoy_headers) {
         const Span span = router.suppress_envoy_headers_present ? router.suppress_envoy_headers_span

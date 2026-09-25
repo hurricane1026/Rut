@@ -2,10 +2,12 @@
 #include "rut/envoy/converter.h"
 #include "rut/envoy/parser.h"
 #include "test.h"
+#include <atomic>
 #include <cerrno>
 #include <cstdio>
 #include <cstdlib>
 #include <string>
+#include <thread>
 #include <vector>
 
 #include <fcntl.h>
@@ -312,6 +314,82 @@ TEST(envoy_convert, cli_input_errors) {
     CHECK(fifo.out.empty());
 }
 
+// PR #692 round-3 review: `read_input` (src/envoy/main.cc) used to compare
+// only `after.st_size` against the byte count it actually read, which cannot
+// catch another process rewriting the file in place with different content of
+// the *same* length while the read is in progress — the size check trivially
+// passes throughout. `content_a` and `content_b` below are deliberately not
+// valid JSON at all and are the same length, so every legitimate outcome for
+// this file is exactly one of two known messages regardless of which bytes
+// win the race: `parse_bootstrap_json` fails at byte 0 with the identical
+// "unexpected byte in JSON value" detail whether that byte is 'A' or 'B' (so
+// a torn read reaching the parser is indistinguishable from a clean one and
+// cannot manufacture a third outcome), or `read_input` itself rejects the
+// read as changed. A third outcome (a crash, a hang, or any other message)
+// would mean a same-size rewrite slipped through unnoticed.
+TEST(envoy_convert, cli_input_toctou_same_size_rewrite_never_admits_torn_read) {
+    const std::string directory = make_temp_dir();
+    REQUIRE_FALSE(directory.empty());
+    const std::string path = directory + "/racing.json";
+    constexpr size_t kLen = 4096;
+    const std::string content_a(kLen, 'A');
+    const std::string content_b(kLen, 'B');
+    REQUIRE(write_file(path, content_a));
+
+    static envoy::JsonDocument doc_a;
+    auto parsed_a = envoy::parse_bootstrap_json(str(content_a), doc_a);
+    REQUIRE_FALSE(parsed_a);
+    static envoy::JsonDocument doc_b;
+    auto parsed_b = envoy::parse_bootstrap_json(str(content_b), doc_b);
+    REQUIRE_FALSE(parsed_b);
+    const std::string parse_detail = to_string(parsed_a.error().detail);
+    CHECK_EQ(parse_detail, to_string(parsed_b.error().detail));
+
+    const int fd = open(path.c_str(), O_WRONLY, 0600);
+    REQUIRE(fd >= 0);
+
+    std::atomic<bool> stop{false};
+    std::thread writer([&] {
+        while (!stop.load(std::memory_order_relaxed)) {
+            // Never O_TRUNC, never changes the length: an in-place same-size
+            // rewrite is exactly the case the old size-only check could not
+            // detect.
+            (void)pwrite(fd, content_a.data(), content_a.size(), 0);
+            (void)pwrite(fd, content_b.data(), content_b.size(), 0);
+        }
+    });
+
+    u32 changed_detected = 0;
+    constexpr int kIterations = 300;
+    for (int i = 0; i < kIterations; i++) {
+        const RunResult result = run_converter(g_executable, path);
+        REQUIRE(WIFEXITED(result.status));
+        CHECK_EQ(WEXITSTATUS(result.status), 1);
+        CHECK(result.out.empty());
+        const bool is_changed_error =
+            result.err.find("input changed while it was being read") != std::string::npos;
+        const bool is_parse_error = result.err.find(parse_detail) != std::string::npos;
+        // Exactly one of the two known outcomes, never both, never neither.
+        CHECK(is_changed_error != is_parse_error);
+        if (is_changed_error) changed_detected++;
+    }
+
+    stop.store(true, std::memory_order_relaxed);
+    writer.join();
+    close(fd);
+
+    // Informational only (scheduling-dependent, so not a hard requirement —
+    // a slow or heavily loaded machine must not make this test flaky). When
+    // it fires, every occurrence is a same-size in-place rewrite the new
+    // dev/inode/mtime/ctime comparison caught that the old `after.st_size !=
+    // used` check could never have seen.
+    fprintf(stderr,
+            "cli_input_toctou_same_size_rewrite_never_admits_torn_read: caught %u/%d same-size "
+            "races\n",
+            changed_detected,
+            kIterations);
+}
+
 TEST(envoy_convert, cli_parse_error_is_source_located) {
     const std::string directory = make_temp_dir();
     REQUIRE_FALSE(directory.empty());
@@ -456,9 +534,19 @@ TEST(envoy_convert, api_all_capabilities_matches_golden) {
 
     // Overwriting the JSON source after lowering must not change output
     // bytes: no borrowed source text reaches the emitted RUT, only numeric
-    // model fields do.
+    // model fields do. The single byte backing `route.match.prefix` is left
+    // untouched (PR #692 round-3 review added a defensive `validate()` check
+    // that the prefix is exactly "/" — see api_forged_model_rejected below —
+    // so corrupting that one borrowed byte would correctly fail lowering
+    // rather than exercise the property this test is about).
     const envoy::Bootstrap model_copy = parsed.value();
-    for (char& c : text) c = 'x';
+    const Str prefix =
+        model_copy.listener.filter_chain.hcm.route_config.virtual_host.route.match.prefix;
+    REQUIRE(prefix.ptr >= text.data() && prefix.ptr < text.data() + text.size());
+    const size_t prefix_offset = static_cast<size_t>(prefix.ptr - text.data());
+    for (size_t i = 0; i < text.size(); i++) {
+        if (i < prefix_offset || i >= prefix_offset + prefix.len) text[i] = 'x';
+    }
     auto lowered_after_mutation = envoy::lower_to_rut(model_copy, all_true);
     REQUIRE(lowered_after_mutation);
     CHECK(lowered_after_mutation.value().view().eq(golden));
@@ -495,6 +583,19 @@ TEST(envoy_convert, api_forged_model_rejected) {
     mismatched_cluster.listener.filter_chain.hcm.route_config.virtual_host.route.action.cluster =
         lit_str("other");
     CHECK_FALSE(envoy::lower_to_rut(mismatched_cluster, all_true));
+
+    // PR #692 round-3 review: a hand-mutated `match.prefix` must not lower
+    // successfully. The emitted route is always the literal `"/"` catch-all
+    // (put_forward_route never reads `match.prefix`), so without this check
+    // a forged "/admin" prefix would silently widen what the generated RUT
+    // actually matches relative to what the model claims.
+    envoy::Bootstrap forged_prefix = parsed.value();
+    forged_prefix.listener.filter_chain.hcm.route_config.virtual_host.route.match.prefix =
+        lit_str("/admin");
+    const auto forged_prefix_result = envoy::lower_to_rut(forged_prefix, all_true);
+    CHECK_FALSE(forged_prefix_result);
+    CHECK(forged_prefix_result.error().code == FrontendError::UnexpectedToken);
+    CHECK(to_string(forged_prefix_result.error().detail).find("match prefix") != std::string::npos);
 }
 
 int main(int argc, char** argv) {
