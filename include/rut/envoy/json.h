@@ -15,6 +15,13 @@ namespace rut::envoy {
 // that need a string's contents call `is_plain()` and reject escaped strings
 // as unsupported, so no decoded copy is ever needed.
 //
+// Object keys containing an escape sequence are rejected outright
+// (UnsupportedSyntax, anchored at the key span) instead of being admitted
+// into the tree. This keeps `key` always the literal source bytes, so member
+// lookup and duplicate-key detection can use exact byte comparison without
+// decoding; the semantic layer already treated every escaped key as
+// unsupported, so nothing legitimate is lost.
+//
 // Nodes live in one fixed arena. Object members and array elements are linked
 // through `first_child` / `next_sibling` in source order. An object member is
 // the value node itself carrying its `key`; keys are not separate nodes.
@@ -36,10 +43,10 @@ struct JsonNode {
     // String: raw bytes between the quotes. Number: the raw numeric token.
     Str raw{};
     bool has_escape = false;
-    // Set only for object members.
+    // Set only for object members. `key` is always the literal source bytes:
+    // an escaped key is a parse error, never admitted into the tree.
     bool has_key = false;
     Str key{};
-    bool key_has_escape = false;
     Span key_span{};
     // Span of the whole value, including quotes/brackets.
     Span span{};
@@ -48,7 +55,6 @@ struct JsonNode {
     u32 child_count = 0;
 
     [[nodiscard]] bool is_plain() const { return kind == JsonKind::String && !has_escape; }
-    [[nodiscard]] bool key_is_plain() const { return has_key && !key_has_escape; }
 };
 
 // A 1 MiB input could hold far more values than this, but the bootstrap

@@ -174,11 +174,10 @@ TEST(envoy_json, parses_milestone_document_with_spans_and_lookup) {
 
 TEST(envoy_json, scalar_values_and_escapes) {
     static envoy::JsonDocument doc;
-    const std::string text =
-        R"({"a": true, "b": false, "c": null, "d": "x\ny", "e": "\u00e9", "f\"": 1})";
+    const std::string text = R"({"a": true, "b": false, "c": null, "d": "x\ny", "e": "\u00e9"})";
     auto root = envoy::parse_json(str(text), doc);
     REQUIRE(root);
-    CHECK_EQ(doc.at(root.value()).child_count, 6u);
+    CHECK_EQ(doc.at(root.value()).child_count, 5u);
     const u32 a = doc.member(root.value(), lit_str("a"));
     CHECK(doc.at(a).kind == envoy::JsonKind::Bool);
     CHECK(doc.at(a).bool_value);
@@ -191,14 +190,35 @@ TEST(envoy_json, scalar_values_and_escapes) {
     CHECK_FALSE(doc.at(d).is_plain());
     CHECK(doc.at(d).raw.eq(lit_str("x\\ny")));
     CHECK(doc.at(doc.member(root.value(), lit_str("e"))).has_escape);
-    // Escaped keys are never matched by member lookup.
-    CHECK_EQ(doc.member(root.value(), lit_str("f\\\"")), envoy::kJsonNoNode);
-    u32 count = 0;
-    for (u32 c = doc.at(root.value()).first_child; c != envoy::kJsonNoNode;
-         c = doc.at(c).next_sibling) {
-        if (doc.at(c).key_has_escape) count++;
+}
+
+TEST(envoy_json, rejects_escaped_object_keys) {
+    static envoy::JsonDocument doc;
+
+    // A lone escaped key, no duplicate involved: rejected outright.
+    {
+        const std::string text = R"({"\u0061": 1})";
+        auto result = envoy::parse_json(str(text), doc);
+        REQUIRE_FALSE(result);
+        CHECK(result.error().code == FrontendError::UnsupportedSyntax);
+        CHECK(to_string(result.error().detail).find("escaped object keys") != std::string::npos);
+        CHECK_EQ(result.error().span.line, 1u);
+        CHECK_EQ(result.error().span.col, 2u);
     }
-    CHECK_EQ(count, 1u);
+
+    // An escaped spelling of a key that duplicates an earlier plain key:
+    // rejected as an escaped key (at the second key's span), not merely as a
+    // duplicate. Both names decode to "a", but the JSON layer never decodes
+    // keys, so it refuses the escape instead of comparing decoded values.
+    {
+        const std::string text = R"({"a": 1, "\u0061": 2})";
+        auto result = envoy::parse_json(str(text), doc);
+        REQUIRE_FALSE(result);
+        CHECK(result.error().code == FrontendError::UnsupportedSyntax);
+        CHECK(to_string(result.error().detail).find("escaped object keys") != std::string::npos);
+        CHECK_EQ(result.error().span.line, 1u);
+        CHECK_EQ(result.error().span.col, 10u);
+    }
 }
 
 TEST(envoy_json, accepts_well_formed_utf8_and_surrogate_pairs) {
@@ -824,7 +844,7 @@ TEST(envoy_parser, rejects_shapes_outside_the_milestone_boundary) {
         {"\"name\": \"backend\"",
          "\"na\\u006de\": \"backend\"",
          FrontendError::UnsupportedSyntax,
-         "escaped JSON keys"},
+         "escaped object keys"},
     };
     for (const Case& c : cases) {
         std::string text = Bootstrap{}.render();

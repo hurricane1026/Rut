@@ -191,7 +191,8 @@ The first parser increment represents, but does not yet lower:
   (Envoy's v3 `ClusterLoadAssignment.cluster_name` has `min_len: 1`, so an
   omitted value is a validation error, not the empty string), one locality
   with one `lb_endpoints` entry with an IPv4 `socket_address`, no `lb_policy`
-  other than omitted or `ROUND_ROBIN`, no `health_checks`, no
+  field at all (only omission is supported; Envoy's default for an omitted
+  `lb_policy` is `ROUND_ROBIN`), no `health_checks`, no
   `circuit_breakers`, no `outlier_detection`, no `transport_socket`, no
   `typed_extension_protocol_options`.
 

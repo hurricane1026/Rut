@@ -121,14 +121,13 @@ private:
     }
 
     // Every member of `object` must match one of `allowed`; anything else is
-    // an unsupported field pointing at its key.
+    // an unsupported field pointing at its key. Escaped keys never reach
+    // here: the JSON layer rejects them outright before a document exists.
     FrontendResult<bool> reject_unknown(u32 object, const Field* allowed, u32 allowed_len) {
         const JsonNode& parent = doc_.at(object);
         for (u32 child = parent.first_child; child != kJsonNoNode;
              child = doc_.at(child).next_sibling) {
             const JsonNode& member = doc_.at(child);
-            if (!member.key_is_plain())
-                return unsupported(member.key_span, lit_str("escaped JSON keys are unsupported"));
             bool known = false;
             for (u32 i = 0; i < allowed_len && !known; i++)
                 known = field_matches(allowed[i], member.key);

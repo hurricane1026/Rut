@@ -374,7 +374,11 @@ private:
             auto key = scan_string(&key_has_escape);
             if (!key) return core::make_unexpected(key.error());
             const Span key_span{key_start, pos_, key_line, key_col};
-            if (!key_has_escape && doc_.member(object.value(), key.value()) != kJsonNoNode)
+            if (key_has_escape)
+                return frontend_error(FrontendError::UnsupportedSyntax,
+                                      key_span,
+                                      lit_str("escaped object keys are unsupported"));
+            if (doc_.member(object.value(), key.value()) != kJsonNoNode)
                 return frontend_error(FrontendError::UnexpectedToken,
                                       key_span,
                                       lit_str("duplicate key in JSON object"));
@@ -390,7 +394,6 @@ private:
             JsonNode& member = doc_.nodes[value.value()];
             member.has_key = true;
             member.key = key.value();
-            member.key_has_escape = key_has_escape;
             member.key_span = key_span;
             link_child(object.value(), &last, value.value());
             skip_space();
@@ -438,7 +441,7 @@ u32 JsonDocument::member(u32 object, Str key) const {
     if (parent.kind != JsonKind::Object) return kJsonNoNode;
     for (u32 child = parent.first_child; child != kJsonNoNode; child = nodes[child].next_sibling) {
         const JsonNode& node = nodes[child];
-        if (!node.key_has_escape && node.key.eq(key)) return child;
+        if (node.key.eq(key)) return child;
     }
     return kJsonNoNode;
 }
