@@ -562,15 +562,33 @@ ReadResult read_http_message(int fd,
         // closed a connection it declared persistent (round-7 review,
         // "Reject EOF on responses advertised as persistent", applied to
         // head_smoke the same way as to the Content-Length branch below).
+        // An abortive close (a non-retryable negative recv(), most notably
+        // ECONNRESET) is treated the same as that unexpected EOF: `poll()`
+        // reports the fd readable, but `recv()` returning -1 instead of 0 is
+        // not proof of an orderly close the old `if (n <= 0) break;` used to
+        // let through unexamined (round-8 review, "Reject resets during the
+        // persistent-response grace check"). A retryable error
+        // (EINTR/EAGAIN/EWOULDBLOCK, a spurious wakeup) just waits out the
+        // rest of the grace window instead.
         const int64_t grace_deadline = now_ms() + kTrailingBytesGraceMs;
         for (;;) {
             const int64_t remaining = grace_deadline - now_ms();
             if (remaining <= 0) break;
             pollfd pfd{fd, POLLIN, 0};
-            if (poll(&pfd, 1, static_cast<int>(remaining)) <= 0) break;
+            const int pr = poll(&pfd, 1, static_cast<int>(remaining));
+            if (pr < 0) {
+                if (errno == EINTR) continue;
+                break;
+            }
+            if (pr == 0) break;
             const ssize_t n = recv(fd, chunk, sizeof(chunk), 0);
             if (n == 0 && !advertises_close) return {buf, false, kPersistenceMismatchReason};
-            if (n <= 0) break;
+            if (n == 0) break;
+            if (n < 0) {
+                if (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK) continue;
+                if (!advertises_close) return {buf, false, kPersistenceMismatchReason};
+                break;
+            }
             buf.append(chunk, static_cast<size_t>(n));
         }
         return {buf, true, {}};
@@ -626,21 +644,36 @@ ReadResult read_http_message(int fd,
         // real behavioral difference, and it must fail the case distinctly
         // even when both sides' bytes are otherwise identical (round-7
         // review, "Reject EOF on responses advertised as persistent"). Only
-        // a timeout (nothing arrived at all) is fine.
+        // a timeout (nothing arrived at all) is fine. A non-retryable
+        // negative recv() (most notably ECONNRESET from an abortive close)
+        // is treated exactly like that EOF: `poll()` reporting the fd
+        // readable and `recv()` then failing instead of returning 0 is still
+        // the peer tearing the connection down instead of leaving it open as
+        // its response promised, and the old code let it fall through to the
+        // "nothing arrived" success path unexamined (round-8 review, "Reject
+        // resets during the persistent-response grace check"). A retryable
+        // error (EINTR/EAGAIN/EWOULDBLOCK) just waits out the rest of the
+        // grace window.
         const int64_t grace_deadline = now_ms() + kTrailingBytesGraceMs;
-        const int64_t grace_remaining = grace_deadline - now_ms();
-        if (grace_remaining > 0) {
+        for (;;) {
+            const int64_t grace_remaining = grace_deadline - now_ms();
+            if (grace_remaining <= 0) return {buf, true, {}};
             pollfd pfd{fd, POLLIN, 0};
-            if (poll(&pfd, 1, static_cast<int>(grace_remaining)) > 0) {
-                const ssize_t n = recv(fd, chunk, sizeof(chunk), 0);
-                if (n > 0) {
-                    buf.append(chunk, static_cast<size_t>(n));
-                    return {buf, false, {}};
-                }
-                if (n == 0) return {buf, false, kPersistenceMismatchReason};
+            const int pr = poll(&pfd, 1, static_cast<int>(grace_remaining));
+            if (pr < 0) {
+                if (errno == EINTR) continue;
+                return {buf, true, {}};
             }
+            if (pr == 0) return {buf, true, {}};
+            const ssize_t n = recv(fd, chunk, sizeof(chunk), 0);
+            if (n > 0) {
+                buf.append(chunk, static_cast<size_t>(n));
+                return {buf, false, {}};
+            }
+            if (n == 0) return {buf, false, kPersistenceMismatchReason};
+            if (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK) continue;
+            return {buf, false, kPersistenceMismatchReason};
         }
-        return {buf, true, {}};
     }
     if (advertises_close) {
         for (;;) {
@@ -2319,13 +2352,27 @@ struct PairCaseResult {
 };
 
 // Applies validate_results()'s evidentiary rule (complete exchange, upstream
-// contacted at most once) to BOTH sides of every pair case, so
+// contacted at most once) to BOTH sides of every ASSERTED pair case, so
 // write_pair_transcript refuses ambiguous evidence exactly like
 // write_transcript does (round-3 review, applied uniformly to the pair
 // harness too). Returns empty on success, else a human-readable reason
 // naming which side failed.
+//
+// Record-only rows are deliberately exempt (round-8 review, "Keep
+// record-only transcript failures out of acceptance"): the CLI contract
+// promises record-only cases never affect the run's exit code (see
+// run_pair_milestone_s()'s `any_asserted_mismatch`), but every
+// --pair-milestone-s invocation that CI runs also writes a transcript, and
+// this validation used to apply uniformly to every row regardless of
+// `asserted`. An incomplete or ambiguous record-only observation -- exactly
+// the kind of real divergence this record-only harness exists to surface,
+// not evidence backing a PASS/FAIL decision -- would make write_pair_transcript()
+// fail and turn that observation into a hard CI failure anyway. Only rows
+// whose bytes actually gate acceptance need the strict "never write
+// ambiguous evidence" rule below.
 std::string validate_pair_results(const std::vector<PairCaseResult>& results) {
     for (const auto& r : results) {
+        if (!r.asserted) continue;
         const std::pair<const char*, const CaseResult*> sides[] = {{"envoy", &r.envoy},
                                                                    {"rut", &r.rut}};
         for (const auto& side : sides) {
@@ -2370,6 +2417,26 @@ bool write_pair_transcript(const std::string& path, const std::vector<PairCaseRe
     out << "// hand-edit. See docs/envoy-compatibility.md and envoy-pr-plan.md PR 6.\n\n";
     for (const auto& r : results) {
         out << "// " << r.name << (r.asserted ? " (asserted)" : " (record-only)") << "\n";
+        // Record-only rows skip validate_pair_results()'s strict evidentiary
+        // rule above, so an incomplete exchange or an ambiguous (>1) upstream
+        // contact can reach here; flag it with a NOTE instead of silently
+        // presenting the raw bytes as if they were as trustworthy as an
+        // asserted row's (round-8 review, "Keep record-only transcript
+        // failures out of acceptance").
+        if (!r.asserted) {
+            if (!r.envoy.exchange_complete)
+                out << "// NOTE: " << r.name << " (envoy): downstream exchange did not complete ("
+                    << describe_incomplete_exchange(r.envoy) << ")\n";
+            if (!r.rut.exchange_complete)
+                out << "// NOTE: " << r.name << " (rut): downstream exchange did not complete ("
+                    << describe_incomplete_exchange(r.rut) << ")\n";
+            if (r.envoy.upstream_contact_count > 1)
+                out << "// NOTE: " << r.name << " (envoy): upstream was contacted "
+                    << r.envoy.upstream_contact_count << " times (ambiguous evidence)\n";
+            if (r.rut.upstream_contact_count > 1)
+                out << "// NOTE: " << r.name << " (rut): upstream was contacted "
+                    << r.rut.upstream_contact_count << " times (ambiguous evidence)\n";
+        }
         out << "static constexpr char kEnvoyVsRut_" << r.name << "_client[] =\n    "
             << wrap_wire_literal(r.envoy.client_bytes) << ";\n";
         if (!r.envoy.upstream_contacted)
@@ -2582,6 +2649,115 @@ bool rut_log_indicates_address_in_use(const std::string& path) {
            contents.find(std::string("errno=") + std::to_string(EADDRINUSE)) != std::string::npos;
 }
 
+// The exact bytes of an OPTIONS * request: both Envoy and every generated
+// rut config answer this locally with a 404, never routing it to an
+// upstream (docs/envoy-compatibility.md, "Local replies (404 for OPTIONS *
+// and authority-form CONNECT)"), and the committed oracle fixture pins the
+// exact downstream bytes for it (kEnvoyOracle_options_star_downstream in
+// fixtures/envoy_oracle_milestone_s.inc: status 404, `server: envoy` --
+// the converter mirrors Envoy's own default server_name byte for byte).
+// Used below as the RUT-ownership readiness probe: a request no bootstrap
+// this harness ever generates can route anywhere, so a correct answer can
+// never come from an upstream having been contacted.
+constexpr char kReadinessProbeRequest[] = "OPTIONS * HTTP/1.1\r\nHost: client.example\r\n\r\n";
+
+// Reads just the status line and header block of one HTTP/1.x response from
+// `fd`, bounded by `timeout_ms`. Unlike read_http_message() above, this
+// never reads a body and applies none of that function's persistence/framing
+// checks: it exists only to let the readiness probe below inspect a status
+// code and a header, and the caller tears the connection down the instant
+// the header block is captured (or the read fails) either way.
+bool read_response_head(int fd, int timeout_ms, std::string* out) {
+    std::string buf;
+    const int64_t deadline = now_ms() + timeout_ms;
+    char chunk[4096];
+    for (;;) {
+        const size_t header_end = buf.find("\r\n\r\n");
+        if (header_end != std::string::npos) {
+            *out = buf.substr(0, header_end);
+            return true;
+        }
+        const int64_t remaining = deadline - now_ms();
+        if (remaining <= 0) return false;
+        pollfd pfd{fd, POLLIN, 0};
+        if (poll(&pfd, 1, static_cast<int>(remaining)) <= 0) return false;
+        const ssize_t n = recv(fd, chunk, sizeof(chunk), 0);
+        if (n <= 0) return false;
+        buf.append(chunk, static_cast<size_t>(n));
+    }
+}
+
+// wait_ready()/tcp_port_open() only prove that *some* process is now
+// accepting connections on `port` -- the same limitation
+// wait_ready_and_confirm_ownership() (EnvoyInstance overload, above) exists
+// to close for Envoy's docker child. Unlike that child, though, a foreign
+// process racing rut for a probe-allocated port has no reason to ever exit
+// on its own once rut's own bind() attempt fails with EADDRINUSE: rut fails
+// closed and exits, but nothing makes the FOREIGN listener go away, so the
+// short "did the tracked child die during a grace period" check that works
+// for Envoy's docker child cannot catch this case here -- a long-lived
+// foreign listener would pass an alive-only check forever. Prove ownership
+// instead by holding a real HTTP/1.1 conversation: `rut`, unlike an
+// arbitrary foreign listener, answers `kReadinessProbeRequest` with a
+// specific 404 (`server: envoy`) and never forwards it anywhere, so a
+// correct answer can only come from the generated rut config itself
+// (round-8 review, "Verify RUT owns the port before declaring readiness").
+// Retries the whole connect+probe+alive-check cycle -- rechecking the
+// tracked child is still alive on every iteration, not just once -- until
+// either it succeeds or `deadline_ms` (wall clock) runs out: rut can accept
+// a TCP connection slightly before its own request-handling loop is ready
+// to answer one.
+bool rut_probe_confirms_ownership(uint16_t port, RutInstance& rut, int64_t deadline_ms) {
+    while (now_ms() < deadline_ms) {
+        if (rut.pid > 0) {
+            int status = 0;
+            const pid_t waited = waitpid(rut.pid, &status, WNOHANG);
+            if (waited == rut.pid) {
+                rut.pid = -1;
+                return false;
+            }
+        }
+        const int budget_ms = static_cast<int>(std::min<int64_t>(deadline_ms - now_ms(), 1000));
+        if (budget_ms > 0) {
+            const int fd = connect_with_timeout(port, budget_ms);
+            if (fd >= 0) {
+                std::string head;
+                const bool answered = send_all(fd, kReadinessProbeRequest) &&
+                                      read_response_head(fd, budget_ms, &head);
+                close(fd);
+                if (answered && starts_with(head, "HTTP/1.1 404 ") &&
+                    header_equals_ci(head, "server", "envoy")) {
+                    return true;
+                }
+            }
+        }
+        struct timespec ts{0, 20'000'000};
+        nanosleep(&ts, nullptr);
+    }
+    return false;
+}
+
+// RUT counterpart to wait_ready_and_confirm_ownership(EnvoyInstance&, ...)
+// above: wait_ready() alone can be fooled by a foreign listener that already
+// owns the probe-allocated port (see rut_probe_confirms_ownership()'s
+// comment for why the Envoy-side grace-period trick does not transfer), so
+// launch_rut_with_port_retry() below must not treat plain TCP acceptance as
+// readiness. `confirm_ms` bounds the probe phase separately from
+// `timeout_ms` (which wait_ready() may already have spent waiting for the
+// initial TCP accept).
+bool wait_ready_and_confirm_ownership(
+    uint16_t port, RutInstance& rut, int timeout_ms, int confirm_ms, std::string* error) {
+    if (!wait_ready(port, rut, timeout_ms, error)) return false;
+    if (!rut_probe_confirms_ownership(port, rut, now_ms() + confirm_ms)) {
+        *error =
+            "did not observe rut's own HTTP local reply (404, server: envoy) on the listener "
+            "port before the deadline; a different process likely won the bind race, or rut "
+            "exited while this harness was confirming ownership";
+        return false;
+    }
+    return true;
+}
+
 // RUT-side counterpart to launch_envoy_with_port_retry(), used everywhere
 // this file launches `rut` against a converted milestone-S bootstrap
 // (--pair-milestone-s and --self-test's RUT pass): renders a bootstrap for
@@ -2629,7 +2805,7 @@ bool launch_rut_with_port_retry(const std::string& dir,
             *error = "could not fork/exec rut";
             return false;
         }
-        if (wait_ready(*listen_port, *rut, 15'000, error)) return true;
+        if (wait_ready_and_confirm_ownership(*listen_port, *rut, 15'000, 5'000, error)) return true;
 
         const bool collided = rut_log_indicates_address_in_use(rut->log_path);
         rut->stop();
@@ -2858,8 +3034,18 @@ bool compare_pair_case(const PairCaseResult& c) {
     const bool upstream_match = c.envoy.upstream_contacted == c.rut.upstream_contacted &&
                                 c.envoy.upstream_bytes == c.rut.upstream_bytes;
     const bool expects_forward = case_expects_upstream_forward(c.name);
-    const bool forwarding_exercised = !expects_forward || (c.envoy.upstream_contact_count == 1 &&
-                                                           c.rut.upstream_contact_count == 1);
+    // A forwarding case must show exactly one contact on both sides; an
+    // exempt case (options_star, connect_failure, connect_authority) must
+    // show exactly ZERO -- not merely "don't care" -- so that if both
+    // proxies unexpectedly forwarded one of these (e.g. `options_star`
+    // routed to an upstream that happens to answer identically on both
+    // sides) the mismatch in what was supposed to stay local is still
+    // caught instead of silently reported as MATCH (round-8 review,
+    // "Require zero contacts for locally handled cases").
+    const bool forwarding_exercised =
+        expects_forward
+            ? (c.envoy.upstream_contact_count == 1 && c.rut.upstream_contact_count == 1)
+            : (c.envoy.upstream_contact_count == 0 && c.rut.upstream_contact_count == 0);
     const bool downstream_match = envoy_down == rut_down;
     const bool match =
         both_complete && dates_valid && upstream_match && forwarding_exercised && downstream_match;
@@ -2888,7 +3074,9 @@ bool compare_pair_case(const PairCaseResult& c) {
         std::cerr << "  forwarding not exercised: envoy upstream_contact_count="
                   << c.envoy.upstream_contact_count
                   << " rut upstream_contact_count=" << c.rut.upstream_contact_count
-                  << " (expected exactly 1 on each side)\n";
+                  << (expects_forward ? " (expected exactly 1 on each side)\n"
+                                      : " (expected exactly 0 on each side; this case is exempt "
+                                        "from forwarding)\n");
     }
     if (!downstream_match) {
         std::cerr << "  downstream envoy: \"" << escape_wire_bytes(envoy_down) << "\"\n";
@@ -3493,6 +3681,34 @@ bool self_test_partial_exchange_rejection() {
             std::cerr << "FAIL [self-test partial]: write_pair_transcript rejected a fully "
                          "valid run\n";
             ok = false;
+        }
+
+        // Round-8 review, "Keep record-only transcript failures out of
+        // acceptance": a record-only row's incomplete exchange must NOT make
+        // write_pair_transcript() fail the way an asserted row's does above,
+        // and the incompleteness must still show up in the output as a NOTE
+        // rather than being silently hidden.
+        PairCaseResult incomplete_record_only;
+        incomplete_record_only.name = "connect_authority";
+        incomplete_record_only.asserted = false;
+        incomplete_record_only.envoy = good;
+        incomplete_record_only.rut = good;
+        incomplete_record_only.rut.exchange_complete = false;
+        if (!write_pair_transcript(pair_out_path, {incomplete_record_only})) {
+            std::cerr << "FAIL [self-test partial]: write_pair_transcript rejected a record-only "
+                         "row with an incomplete exchange (record-only rows must never fail the "
+                         "run)\n";
+            ok = false;
+        } else {
+            std::ifstream in(pair_out_path);
+            std::stringstream ss;
+            ss << in.rdbuf();
+            if (ss.str().find("NOTE: connect_authority (rut): downstream exchange did not "
+                              "complete") == std::string::npos) {
+                std::cerr << "FAIL [self-test partial]: write_pair_transcript did not flag the "
+                             "incomplete record-only row with a NOTE\n";
+                ok = false;
+            }
         }
     }
 
@@ -4109,6 +4325,127 @@ bool self_test_envoy_instance_skips_docker_when_unlaunched() {
     return true;
 }
 
+// RUT counterpart to self_test_wait_ready_ownership() above, covering
+// round-8 review, "Verify RUT owns the port before declaring readiness": an
+// alive-only check (the Envoy-side fix) is not enough for rut, because
+// nothing forces a foreign listener that races rut for a port to ever exit
+// on its own. Both cases here keep the tracked "rut" child alive for the
+// WHOLE confirmation window -- an alive-only check would wrongly confirm
+// ownership in the negative case below -- so only the protocol probe itself
+// (rut_probe_confirms_ownership()) can tell the two apart.
+bool self_test_rut_wait_ready_ownership() {
+    bool ok = true;
+
+    // Negative case: a foreign listener answers every request with a
+    // well-formed but non-rut response (200, `Server: not-envoy`) while the
+    // dummy child stays alive throughout. Ownership must NOT be confirmed:
+    // an alive-only check would be fooled by exactly this shape.
+    {
+        BoundPort foreign;
+        if (!allocate_bound_loopback_port(&foreign)) {
+            std::cerr << "FAIL [self-test rut wait_ready ownership]: could not allocate a "
+                         "loopback port\n";
+            return false;
+        }
+        RecordingUpstream fake;
+        fake.set_default_reply("HTTP/1.1 200 OK\r\nServer: not-envoy\r\nContent-Length: 0\r\n\r\n");
+        if (!fake.adopt(foreign.fd)) {
+            std::cerr << "FAIL [self-test rut wait_ready ownership]: could not start the fake "
+                         "foreign listener\n";
+            close(foreign.fd);
+            return false;
+        }
+        const pid_t child = fork();
+        if (child < 0) {
+            std::cerr << "FAIL [self-test rut wait_ready ownership]: fork failed\n";
+            ok = false;
+        } else if (child == 0) {
+            struct timespec ts{5, 0};
+            nanosleep(&ts, nullptr);
+            _exit(0);
+        } else {
+            RutInstance rut;
+            rut.pid = child;
+            std::string error;
+            const bool confirmed =
+                wait_ready_and_confirm_ownership(foreign.port, rut, 2000, 800, &error);
+            if (confirmed) {
+                std::cerr << "FAIL [self-test rut wait_ready ownership]: confirmed ownership of "
+                             "a foreign listener answering a non-rut response while the tracked "
+                             "child stayed alive\n";
+                ok = false;
+            }
+            if (error.empty()) {
+                std::cerr << "FAIL [self-test rut wait_ready ownership]: expected a non-empty "
+                             "error on the negative case\n";
+                ok = false;
+            }
+            kill(child, SIGKILL);
+            int status = 0;
+            while (waitpid(child, &status, 0) < 0 && errno == EINTR) {
+            }
+        }
+        fake.stop();
+    }
+
+    // Positive case: the foreign listener answers exactly like a generated
+    // rut config would (404, `server: envoy`), so ownership must be
+    // confirmed even though nothing here is a real `rut` process -- proving
+    // the probe checks the RESPONSE, not the process identity.
+    {
+        BoundPort foreign;
+        if (!allocate_bound_loopback_port(&foreign)) {
+            std::cerr << "FAIL [self-test rut wait_ready ownership]: could not allocate a "
+                         "loopback port\n";
+            return false;
+        }
+        RecordingUpstream fake;
+        fake.set_default_reply(
+            "HTTP/1.1 404 Not Found\r\ndate: Thu, 24 Sep 2026 18:18:42 GMT\r\nserver: "
+            "envoy\r\ncontent-length: 0\r\n\r\n");
+        if (!fake.adopt(foreign.fd)) {
+            std::cerr << "FAIL [self-test rut wait_ready ownership]: could not start the fake "
+                         "positive listener\n";
+            close(foreign.fd);
+            return false;
+        }
+        const pid_t child = fork();
+        if (child < 0) {
+            std::cerr << "FAIL [self-test rut wait_ready ownership]: fork failed\n";
+            ok = false;
+        } else if (child == 0) {
+            struct timespec ts{5, 0};
+            nanosleep(&ts, nullptr);
+            _exit(0);
+        } else {
+            RutInstance rut;
+            rut.pid = child;
+            std::string error;
+            const bool confirmed =
+                wait_ready_and_confirm_ownership(foreign.port, rut, 2000, 800, &error);
+            if (!confirmed) {
+                std::cerr << "FAIL [self-test rut wait_ready ownership]: did not confirm "
+                             "ownership for a foreign listener answering exactly like rut would: "
+                          << error << "\n";
+                ok = false;
+            }
+            if (fake.all_requests().count("*") == 0) {
+                std::cerr << "FAIL [self-test rut wait_ready ownership]: the probe never reached "
+                             "the fake listener at all\n";
+                ok = false;
+            }
+            kill(child, SIGKILL);
+            int status = 0;
+            while (waitpid(child, &status, 0) < 0 && errno == EINTR) {
+            }
+        }
+        fake.stop();
+    }
+
+    if (ok) std::cerr << "PASS [self-test rut wait_ready ownership]\n";
+    return ok;
+}
+
 // Covers round-7 review thread P2 ("Keep the connect-failure port
 // reserved"): allocate_reserved_closed_port() must hold the port so no other
 // bind can claim it, while still producing "connection refused" semantics
@@ -4432,6 +4769,39 @@ bool self_test_pair_exempt_cases_zero_contact_matches() {
     return ok;
 }
 
+// Round-8 review, "Require zero contacts for locally handled cases":
+// compare_pair_case() must require exactly ZERO upstream contacts for an
+// exempt case, not just "don't require exactly one". Before that fix,
+// `!expects_forward` alone made `forwarding_exercised` unconditionally true,
+// so a case that is supposed to stay local (like `options_star`) but was
+// unexpectedly forwarded by both proxies -- and happened to get back
+// matching bytes from doing so -- would still report MATCH, hiding the fact
+// that the documented local-404 behavior was no longer being exercised at
+// all. Same byte-identical downstream shape as the zero-contact test above,
+// but with both sides showing one contact each, must now MISMATCH.
+bool self_test_pair_exempt_cases_nonzero_contact_rejected() {
+    bool ok = true;
+    for (const char* name : {"options_star", "connect_failure", "connect_authority"}) {
+        PairCaseResult c;
+        c.name = name;
+        c.asserted = true;
+        c.envoy.exchange_complete = true;
+        c.rut.exchange_complete = true;
+        c.envoy.downstream_bytes = c.rut.downstream_bytes = "HTTP/1.1 404 Not Found\r\n\r\n";
+        c.envoy.upstream_bytes = c.rut.upstream_bytes = "GET / HTTP/1.1\r\n\r\n";
+        c.envoy.upstream_contacted = c.rut.upstream_contacted = true;
+        c.envoy.upstream_contact_count = c.rut.upstream_contact_count = 1;
+        if (compare_pair_case(c)) {
+            std::cerr << "FAIL [self-test pair exempt nonzero-contact]: compare_pair_case "
+                         "matched "
+                      << name << " despite both sides unexpectedly forwarding it to the upstream\n";
+            ok = false;
+        }
+    }
+    if (ok) std::cerr << "PASS [self-test pair exempt nonzero-contact]\n";
+    return ok;
+}
+
 // Round-4 review: verifies the exact unblock mechanism
 // self_test_head_body_detected()'s connect-failure branch relies on, so a
 // client connect() failure (e.g. transient fd exhaustion) can never leave
@@ -4561,6 +4931,83 @@ bool self_test_head_body_detected() {
     return ok;
 }
 
+// Round-8 review, "Reject resets during the persistent-response grace
+// check", HEAD counterpart: read_http_message()'s HEAD branch has its own
+// grace-window loop, separate from the Content-Length body one exercised by
+// self_test_persistent_trailing_bytes_detected()'s kAbortiveReset case below.
+// An abortive close (SO_LINGER{on, 0}, RST instead of FIN) there must be
+// rejected identically to an orderly EOF: a HEAD response that did not
+// advertise `Connection: close` still promised to stay open, and the old
+// `if (n <= 0) break;` let a non-retryable negative recv() (ECONNRESET) fall
+// through to a reported-complete result unexamined.
+bool self_test_head_grace_reset_detected() {
+    uint16_t port = 0;
+    if (!allocate_loopback_port(&port)) {
+        std::cerr << "FAIL [self-test head grace reset]: could not allocate a loopback port\n";
+        return false;
+    }
+    int listen_fd = socket(AF_INET, SOCK_STREAM, 0);
+    if (listen_fd < 0) {
+        std::cerr << "FAIL [self-test head grace reset]: could not create listening socket\n";
+        return false;
+    }
+    const int one = 1;
+    setsockopt(listen_fd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
+    sockaddr_in addr{};
+    addr.sin_family = AF_INET;
+    addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    addr.sin_port = htons(port);
+    if (bind(listen_fd, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) != 0 ||
+        listen(listen_fd, 1) != 0) {
+        std::cerr << "FAIL [self-test head grace reset]: could not bind/listen\n";
+        close(listen_fd);
+        return false;
+    }
+    std::thread server([listen_fd] {
+        const int conn = accept(listen_fd, nullptr, nullptr);
+        if (conn < 0) return;
+        char buf[512];
+        recv(conn, buf, sizeof(buf), 0);  // discard the request
+        // No Content-Length, no Connection: close -- persistent framing.
+        const std::string headers = "HTTP/1.1 200 OK\r\n\r\n";
+        send(conn, headers.data(), headers.size(), 0);
+        // SO_LINGER{on, 0}: close() below sends RST immediately instead of
+        // the usual orderly FIN, so the client's recv() in the grace window
+        // fails with ECONNRESET rather than returning 0.
+        struct linger lin{1, 0};
+        setsockopt(conn, SOL_SOCKET, SO_LINGER, &lin, sizeof(lin));
+        close(conn);
+    });
+    bool ok = true;
+    const int fd = connect_with_timeout(port, kClientTimeoutMs);
+    if (fd < 0) {
+        std::cerr << "FAIL [self-test head grace reset]: could not connect\n";
+        ok = false;
+        shutdown(listen_fd, SHUT_RDWR);
+        close(listen_fd);
+        listen_fd = -1;
+    } else {
+        const std::string req = "HEAD /x HTTP/1.1\r\nHost: t.example\r\n\r\n";
+        send_all(fd, req);
+        const ReadResult resp = read_http_message(fd, /*head_request=*/true, kClientTimeoutMs);
+        if (resp.complete) {
+            std::cerr << "FAIL [self-test head grace reset]: ECONNRESET after a HEAD response "
+                         "that did not advertise Connection: close was reported complete\n";
+            ok = false;
+        } else if (resp.reason != kPersistenceMismatchReason) {
+            std::cerr << "FAIL [self-test head grace reset]: ECONNRESET after a persistent HEAD "
+                         "response was rejected without the persistence-mismatch reason (got \""
+                      << resp.reason << "\")\n";
+            ok = false;
+        }
+        close(fd);
+    }
+    server.join();
+    if (listen_fd >= 0) close(listen_fd);
+    if (ok) std::cerr << "PASS [self-test head grace reset]\n";
+    return ok;
+}
+
 // Round-6 review, "Check persistent responses for trailing wire bytes": for
 // a persistent (non-close) Content-Length-framed response, read_http_message
 // used to return {buf, true} the instant the advertised body length was
@@ -4585,6 +5032,14 @@ enum class PeerTail : uint8_t {
     kTrailingGarbage,  // persistent peer appends bytes after the body
     kImmediateClose,   // persistent peer closes right after the body
     kAdvertisedClose,  // `Connection: close` response, then closes
+    // Round-8 review, "Reject resets during the persistent-response grace
+    // check": an abortive close (SO_LINGER{on, 0}, which makes the kernel
+    // send RST instead of the usual FIN) makes the grace window's poll()
+    // report the fd readable and recv() then fail with ECONNRESET, instead
+    // of the orderly EOF (recv() == 0) kImmediateClose above exercises. Both
+    // must be rejected identically: a response that did not advertise
+    // `Connection: close` still promised to stay open.
+    kAbortiveReset,
 };
 
 bool self_test_persistent_trailing_bytes_detected() {
@@ -4633,6 +5088,14 @@ bool self_test_persistent_trailing_bytes_detected() {
                 struct timespec settle{0, 250'000'000};
                 nanosleep(&settle, nullptr);
             }
+            if (tail == PeerTail::kAbortiveReset) {
+                // SO_LINGER{on, 0}: close() below sends RST immediately
+                // instead of the usual orderly FIN, so the client's recv()
+                // in the grace window fails with ECONNRESET rather than
+                // returning 0.
+                struct linger lin{1, 0};
+                setsockopt(conn, SOL_SOCKET, SO_LINGER, &lin, sizeof(lin));
+            }
             close(conn);
         });
         bool ok = true;
@@ -4680,6 +5143,20 @@ bool self_test_persistent_trailing_bytes_detected() {
                         ok = false;
                     }
                     break;
+                case PeerTail::kAbortiveReset:
+                    if (resp.complete) {
+                        std::cerr << "FAIL [self-test " << label
+                                  << "]: ECONNRESET after a response that did not advertise "
+                                     "Connection: close was reported complete\n";
+                        ok = false;
+                    } else if (resp.reason != kPersistenceMismatchReason) {
+                        std::cerr << "FAIL [self-test " << label
+                                  << "]: ECONNRESET after a persistent response was rejected "
+                                     "without the persistence-mismatch reason (got \""
+                                  << resp.reason << "\")\n";
+                        ok = false;
+                    }
+                    break;
                 case PeerTail::kAdvertisedClose:
                     if (!resp.complete) {
                         std::cerr << "FAIL [self-test " << label
@@ -4702,6 +5179,7 @@ bool self_test_persistent_trailing_bytes_detected() {
     ok &= run_case(PeerTail::kSettleThenClose, "persistent no trailing bytes");
     ok &= run_case(PeerTail::kImmediateClose, "persistent EOF is a persistence mismatch");
     ok &= run_case(PeerTail::kAdvertisedClose, "advertised close then EOF is complete");
+    ok &= run_case(PeerTail::kAbortiveReset, "persistent ECONNRESET is a persistence mismatch");
     return ok;
 }
 
@@ -5119,6 +5597,21 @@ bool run_self_test_rut_pass(const std::string& rut_binary, const std::string& co
             upstream.stop();
             return false;
         }
+        // The readiness probe launch_rut_with_port_retry() just ran
+        // (wait_ready_and_confirm_ownership() -> rut_probe_confirms_ownership())
+        // sends an `OPTIONS *` request, which every generated rut config
+        // answers locally; it must never reach this live recording upstream
+        // (round-8 review, "Verify RUT owns the port before declaring
+        // readiness": "The probe must not contact the recording upstream").
+        // Check this before running any case, while the upstream has
+        // recorded nothing else yet.
+        if (!upstream.all_requests().empty()) {
+            std::cerr << "FAIL [self-test rut]: the readiness probe contacted the recording "
+                         "upstream (expected zero requests before any case runs)\n";
+            rut.stop();
+            upstream.stop();
+            return false;
+        }
         std::vector<CaseSpec> live_asserted;
         for (const auto& spec : all_cases)
             if (is_asserted_case(spec.name)) live_asserted.push_back(spec);
@@ -5143,11 +5636,36 @@ bool run_self_test_rut_pass(const std::string& rut_binary, const std::string& co
             std::cerr << "FAIL [self-test rut]: could not create temp directory\n";
             return false;
         }
-        uint16_t listen_port = 0, closed_port = 0;
-        if (!allocate_distinct_ports({&listen_port, &closed_port})) {
+        uint16_t listen_port = 0;
+        if (!allocate_distinct_ports({&listen_port})) {
             std::cerr << "FAIL [self-test rut]: could not allocate loopback ports\n";
             return false;
         }
+        // The connect_failure case's "closed" port must stay reserved end to
+        // end, exactly like run_pair_milestone_s()'s ClosedPortReservation:
+        // allocate_distinct_ports() only probe-binds and immediately
+        // releases each port, leaving a window for another process to bind
+        // and listen on it before this exchange's connect() attempt below,
+        // which would then hit an unrelated listener instead of exercising
+        // connection refusal (round-8 review, "Reserve the self-test's
+        // connect-failure port").
+        BoundPort closed_reserved;
+        if (!allocate_reserved_closed_port(&closed_reserved)) {
+            std::cerr << "FAIL [self-test rut]: could not allocate the connect_failure case's "
+                         "closed port\n";
+            return false;
+        }
+        struct ClosedPortReservation {
+            int fd;
+            ~ClosedPortReservation() {
+                if (fd >= 0) close(fd);
+            }
+            void release() {
+                if (fd >= 0) close(fd);
+                fd = -1;
+            }
+        } closed_reservation{closed_reserved.fd};
+        const uint16_t closed_port = closed_reserved.port;
         const std::string bootstrap_path = dir + "/bootstrap.json";
         if (!write_file_mode(bootstrap_path, render_bootstrap(listen_port, closed_port), 0644)) {
             std::cerr << "FAIL [self-test rut]: could not write bootstrap.json\n";
@@ -5173,6 +5691,8 @@ bool run_self_test_rut_pass(const std::string& rut_binary, const std::string& co
             std::cerr << "WARN: case connect_failure exchange did not complete cleanly ("
                       << describe_incomplete_exchange(r) << ")\n";
         r.name = "connect_failure";
+        // The connect_failure exchange above is done; safe to release now.
+        closed_reservation.release();
         if (!rut.stop()) {
             std::cerr << "FAIL [self-test rut]: rut exited unexpectedly before teardown ("
                       << rut.unexpected_exit_description << ")\n";
@@ -5207,6 +5727,7 @@ int run_self_test(const std::string& rut_binary, const std::string& converter_bi
     ok &= self_test_wait_ready_ownership();
     ok &= self_test_temp_dir_cleanup();
     ok &= self_test_envoy_instance_skips_docker_when_unlaunched();
+    ok &= self_test_rut_wait_ready_ownership();
     ok &= self_test_reserved_closed_port();
     ok &= self_test_duplicate_upstream_rejected();
     ok &= self_test_unexpected_upstream_path_rejected();
@@ -5215,8 +5736,10 @@ int run_self_test(const std::string& rut_binary, const std::string& converter_bi
     ok &= self_test_pair_both_failed_rejected();
     ok &= self_test_pair_unexercised_forwarding_rejected();
     ok &= self_test_pair_exempt_cases_zero_contact_matches();
+    ok &= self_test_pair_exempt_cases_nonzero_contact_rejected();
     ok &= self_test_accept_unblocks_on_shutdown_close();
     ok &= self_test_head_body_detected();
+    ok &= self_test_head_grace_reset_detected();
     ok &= self_test_persistent_trailing_bytes_detected();
     ok &= self_test_envoy_stop_verifies_exit_status();
     ok &= self_test_malformed_date_rejected();
