@@ -3852,16 +3852,21 @@ TEST(request_policy, preserve_host_lowercase_wire_and_fail_closed_host) {
         "POST /te-body HTTP/1.1\r\nhost: client.example\r\ncontent-length: 4\r\n"
         "te: trailers\r\nx-forwarded-proto: http\r\n\r\nabcd");
 
-    // Fail closed: TE with a non-trailers value on a fixed-length request
-    // (the shared body inspector, not just the serializer, must admit this
-    // shape only for the exact "trailers" value).
+    // A fixed-length request with only a non-trailers TE value is admitted,
+    // not rejected: the shared body inspector must not require that some TE
+    // field carry "trailers" before admitting this profile at all -- the
+    // serializer already drops any non-trailers TE field independently, and
+    // adding a second unrelated `TE: trailers` field must not be what makes
+    // this exact same `TE: gzip` line admissible.
     prepare(
         "POST /te-body-bad HTTP/1.1\r\n"
         "Host: client.example\r\n"
         "Content-Length: 4\r\n"
         "TE: gzip\r\n\r\nabcd");
-    CHECK_FALSE(apply_request_policy(conn, endpoint, kPreserveHost));
-    CHECK_EQ(conn.send_buf.len(), 0u);
+    REQUIRE(apply_request_policy(conn, endpoint, kPreserveHost));
+    require_wire(
+        "POST /te-body-bad HTTP/1.1\r\nhost: client.example\r\ncontent-length: 4\r\n"
+        "x-forwarded-proto: http\r\n\r\nabcd");
 
     // Fail closed: Expect on a body-carrying request. Rut has no
     // `100 Continue` interim-response flow, so this shape is rejected rather
@@ -4139,6 +4144,136 @@ TEST(request_policy, preserve_host_lowercase_wire_and_fail_closed_host) {
     prepare("GET /smoke#admin HTTP/1.1\r\nHost: client.example\r\n\r\n");
     CHECK_FALSE(apply_request_policy(conn, endpoint, kPreserveHost));
     CHECK_EQ(conn.send_buf.len(), 0u);
+
+    // The same `Connection: close, upgrade` + non-empty `Upgrade` contradiction
+    // must fail closed on the bodyless path too: the upgrade-nomination check
+    // must run before the `cl_count == 0` early return, not only after it.
+    // `conn.req_wants_upgrade` alone does not catch this shape ("close"
+    // suppresses it), so a request with no Content-Length at all must not
+    // slip through as an ordinary bodyless GET.
+    prepare(
+        "GET /upgrade-close-contradiction-bodyless HTTP/1.1\r\n"
+        "Host: client.example\r\n"
+        "Connection: close, upgrade\r\n"
+        "Upgrade: websocket\r\n\r\n");
+    CHECK_FALSE(apply_request_policy(conn, endpoint, kPreserveHost));
+    CHECK_EQ(conn.send_buf.len(), 0u);
+
+    // An empty (or OWS-only) `Upgrade` value is not a genuine upgrade
+    // request even when `Connection` nominates "upgrade" alongside "close":
+    // Envoy's own `Utility::isUpgrade` requires a non-empty Upgrade value,
+    // matching the parser's own `has_upgrade_header` semantics (any non-OWS
+    // token). This shape must be admitted, with both stray headers stripped,
+    // the same as any other non-upgrade request.
+    prepare(
+        "POST /upgrade-close-empty-value HTTP/1.1\r\n"
+        "Host: client.example\r\n"
+        "Content-Length: 4\r\n"
+        "Connection: close, upgrade\r\n"
+        "Upgrade: \t \r\n\r\nabcd");
+    REQUIRE(apply_request_policy(conn, endpoint, kPreserveHost));
+    require_wire(
+        "POST /upgrade-close-empty-value HTTP/1.1\r\nhost: client.example\r\n"
+        "content-length: 4\r\nx-forwarded-proto: http\r\n\r\nabcd");
+
+    // Fail closed: a Connection token shaped like an HTTP/2 pseudo-header
+    // (its first byte is `:`, e.g. the aliased `:authority`). Rut's parser
+    // accepts this as ordinary bytes in an H1 Connection header value, and
+    // Envoy's own `sanitizeConnectionHeader` (`!token_sv.find(':')`) rejects
+    // any such nomination outright, alongside the named Forwarded* headers.
+    prepare(
+        "GET /nominate-pseudo-authority HTTP/1.1\r\n"
+        "Host: client.example\r\n"
+        "Connection: :authority\r\n\r\n");
+    u8 untouched_nominate_pseudo[256]{};
+    const u32 nominate_pseudo_len = conn.recv_buf.len();
+    __builtin_memcpy(untouched_nominate_pseudo, conn.recv_buf.data(), nominate_pseudo_len);
+    CHECK_FALSE(apply_request_policy(conn, endpoint, kPreserveHost));
+    CHECK_EQ(conn.send_buf.len(), 0u);
+    REQUIRE_EQ(conn.recv_buf.len(), nominate_pseudo_len);
+    CHECK_EQ(__builtin_memcmp(conn.recv_buf.data(), untouched_nominate_pseudo, nominate_pseudo_len),
+             0);
+    // The same rejection applies when the pseudo-header token is nominated
+    // alongside an ordinary one, in either order.
+    prepare(
+        "GET /nominate-pseudo-mixed HTTP/1.1\r\n"
+        "Host: client.example\r\n"
+        "Connection: keep-alive, :path\r\n\r\n");
+    CHECK_FALSE(apply_request_policy(conn, endpoint, kPreserveHost));
+    CHECK_EQ(conn.send_buf.len(), 0u);
+
+    // Two physical `TE` fields that both carry a "trailers" token collapse
+    // to exactly one canonical `te: trailers` line, matching Envoy's inline
+    // `HeaderMap::setTE` storage (which never appends a second physical
+    // line) -- not one line per matching field.
+    prepare(
+        "GET /te-dup-trailers HTTP/1.1\r\n"
+        "Host: client.example\r\n"
+        "TE: trailers\r\n"
+        "TE: trailers\r\n\r\n");
+    REQUIRE(apply_request_policy(conn, endpoint, kPreserveHost));
+    require_wire(
+        "GET /te-dup-trailers HTTP/1.1\r\nhost: client.example\r\nte: trailers\r\n"
+        "x-forwarded-proto: http\r\n\r\n");
+    // A third field, csv-multi-token this time, still contributes nothing
+    // further once the canonical line has already been emitted.
+    prepare(
+        "GET /te-dup-trailers-triple HTTP/1.1\r\n"
+        "Host: client.example\r\n"
+        "TE: trailers\r\n"
+        "TE: gzip, trailers\r\n"
+        "TE: trailers\r\n\r\n");
+    REQUIRE(apply_request_policy(conn, endpoint, kPreserveHost));
+    require_wire(
+        "GET /te-dup-trailers-triple HTTP/1.1\r\nhost: client.example\r\nte: trailers\r\n"
+        "x-forwarded-proto: http\r\n\r\n");
+
+    // Client-supplied `x-envoy-*` headers Envoy's own
+    // `ConnectionManagerUtility::cleanInternalHeaders` removes unconditionally
+    // for a non-internal, non-edge external request (the fixed shape this
+    // milestone's HCM configuration always produces: no `use_remote_address`,
+    // no `internal_address_config`) must never reach the upstream, regardless
+    // of what the client sends -- an untrusted client must not be able to
+    // inject retry/timeout/tracing instructions Envoy's own control plane
+    // would otherwise own. A header outside that fixed removal set --
+    // including `x-envoy-internal` itself, which Envoy only ever overwrites
+    // on the internal-request branch this profile never takes, and
+    // `x-envoy-original-host`, one of the edge-request-only removals that is
+    // unreachable under this fixed shape -- passes through unchanged like any
+    // other header.
+    prepare(
+        "GET /envoy-internal-headers HTTP/1.1\r\n"
+        "Host: client.example\r\n"
+        "X-Envoy-Expected-Rq-Timeout-Ms: 15000\r\n"
+        "X-Envoy-Retry-On: 5xx\r\n"
+        "X-Envoy-Internal: true\r\n"
+        "X-Envoy-Original-Host: internal.example\r\n\r\n");
+    REQUIRE(apply_request_policy(conn, endpoint, kPreserveHost));
+    require_wire(
+        "GET /envoy-internal-headers HTTP/1.1\r\nhost: client.example\r\n"
+        "x-envoy-internal: true\r\nx-envoy-original-host: internal.example\r\n"
+        "x-forwarded-proto: http\r\n\r\n");
+    // Every other named header in the fixed removal set is dropped too, not
+    // only the two exercised above.
+    prepare(
+        "GET /envoy-internal-headers-full HTTP/1.1\r\n"
+        "Host: client.example\r\n"
+        "X-Envoy-Retriable-Status-Codes: 503\r\n"
+        "X-Envoy-Retriable-Header-Names: x-should-retry\r\n"
+        "X-Envoy-Retry-Grpc-On: cancelled\r\n"
+        "X-Envoy-Max-Retries: 3\r\n"
+        "X-Envoy-Upstream-Alt-Stat-Name: custom\r\n"
+        "X-Envoy-Upstream-Rq-Timeout-Ms: 1000\r\n"
+        "X-Envoy-Upstream-Rq-Per-Try-Timeout-Ms: 500\r\n"
+        "X-Envoy-Upstream-Rq-Timeout-Alt-Response: alt\r\n"
+        "X-Envoy-Force-Trace: true\r\n"
+        "X-Envoy-Ip-Tags: internal\r\n"
+        "X-Envoy-Original-Url: https://evil.example/\r\n"
+        "X-Envoy-Hedge-On-Per-Try-Timeout: true\r\n\r\n");
+    REQUIRE(apply_request_policy(conn, endpoint, kPreserveHost));
+    require_wire(
+        "GET /envoy-internal-headers-full HTTP/1.1\r\nhost: client.example\r\n"
+        "x-forwarded-proto: http\r\n\r\n");
 }
 
 TEST(request_policy, content_length_after_host_wait_and_rejection_never_touch_upstream) {

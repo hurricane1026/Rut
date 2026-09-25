@@ -1890,8 +1890,9 @@ return forward(users, request_policy: {
 // `content_length_position: "after_host"`: emits Content-Length
 // immediately after the rewritten Host line instead of in the client's
 // original header order. Mutually exclusive with `retained_header_value`.
-// A request with no body (no Content-Length) is rejected -- this profile
-// exists specifically to pin the upload framing header's position.
+// A request with no framing header at all (no Content-Length) is admitted
+// unchanged -- there is nothing to reposition, so it forwards like ID1. Only
+// an explicit `Content-Length: 0` is rejected.
 return forward(users, request_policy: {
     version: "HTTP/1.1", host: "upstream", connection: "omit",
     content_length_position: "after_host",
@@ -1928,11 +1929,14 @@ return forward(users, request_policy: {
 All four profiles require `version: "HTTP/1.1"` and `connection: "omit"`
 literally, and reject a request whose framing is ambiguous for this closed
 serializer: a body paired with a client `Expect` header, `Transfer-Encoding`,
-or (ID1/ID2/ID3 only) any `Upgrade` header fails closed rather than proxying
-with ambiguous semantics (ID4 forwards a bare `Upgrade` header unmodified
-when the client's `Connection` value does not itself nominate the `upgrade`
-token -- see below). `host: "upstream"` (ID1/ID2/ID3) additionally rejects
-`header_names`, `forwarded_proto`, and a `Proxy-Connection` strip entry, and
+or (ID1/ID2/ID3 only) any semantically-present `Upgrade` header fails closed
+rather than proxying with ambiguous semantics (ID4 instead admits a bare
+`Upgrade` header -- one whose `Connection` value does not itself nominate the
+`upgrade` token -- but always strips it from the forwarded request; the
+request is never rejected for it, but the header itself never reaches the
+wire unmodified -- see below). `host: "upstream"` (ID1/ID2/ID3) additionally
+rejects `header_names`, `forwarded_proto`, and a `Proxy-Connection` strip
+entry, and
 requires exactly the original five strip names; `host: "preserve"` (ID4)
 rejects `content_length_position`/`retained_header_value` and requires
 `header_names`/`forwarded_proto` plus all six strip names.
@@ -1943,15 +1947,29 @@ just the fixed `strip_headers` list) except `content-length`, `host`,
 `x-forwarded-for`, `x-forwarded-host`, and `x-forwarded-proto`, nominating
 any of which fails the whole request closed instead (dropping the framing or
 provenance header while still forwarding the request is unsafe -- see
-`docs/envoy-compatibility.md`); keeps `te` only when one of its
-comma-separated tokens is `trailers` (rewritten to exactly that canonical
-lowercase token, regardless of the client's casing or any other token in the
+`docs/envoy-compatibility.md`), as does nominating a pseudo-header-shaped
+token (one whose first byte is `:`, e.g. the aliased `:authority`), matching
+Envoy's own `sanitizeConnectionHeader` rejection of the same shape; keeps
+`te` when one of its comma-separated tokens is `trailers` -- every field is
+evaluated independently, so a `TE: gzip` field is dropped and a `TE: trailers`
+field is kept even when they appear on the same request, and two or more
+physical fields that each carry a `trailers` token still collapse to exactly
+one canonical `te: trailers` line, not one per field (rewritten to that exact
+lowercase token regardless of the client's casing or any other token in the
 value); rejects a request whose `Connection` value nominates the `upgrade`
 token together with an `Upgrade` header, even when the value also contains
 `close`; rejects more than one physical `X-Forwarded-Proto` field (Envoy
 coalesces duplicates into one inline header; this profile does not, so it
-fails closed instead); rejects a request target carrying a URI fragment; and
-appends `x-forwarded-proto: http` as the last header only when the client did
+fails closed instead); rejects a request target carrying a URI fragment;
+drops every client-supplied `x-envoy-*` header that Envoy's own
+`ConnectionManagerUtility::cleanInternalHeaders` removes for a non-internal,
+non-edge external request -- the fixed shape this profile targets, since
+Envoy's default `internal_address_config` never classifies any address as
+internal and the milestone bootstrap never sets `use_remote_address: true`
+(see `docs/envoy-compatibility.md` for the exact fourteen-header list; the
+handful of edge-request-only removals and `x-envoy-internal` itself are
+unreachable under that fixed shape and pass through unchanged); and appends
+`x-forwarded-proto: http` as the last header only when the client did
 not already send one (a client-supplied value is kept unchanged, in its
 original position). It is closed to ordinary
 zero-copy-shaped forwards: a request with a body paired with a client

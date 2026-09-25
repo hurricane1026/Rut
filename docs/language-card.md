@@ -320,7 +320,9 @@ return forward(users, request_policy: {
     strip_headers: ["Connection", "Keep-Alive", "TE", "Expect", "Upgrade"]
 })                                               // ID1: fixed header-only rebuild
 // ID2 adds content_length_position: "after_host" (Content-Length pinned
-// right after the rewritten Host line; a bodyless request is rejected).
+// right after the rewritten Host line; a request with no Content-Length at
+// all is admitted unchanged -- only an explicit Content-Length: 0 is
+// rejected).
 // ID3 adds retained_header_value: "trim_sp_preserve_htab" (retained values
 // keep leading/trailing HTAB while SP is trimmed; bounded to bodyless GET).
 // The two are mutually exclusive and both require host: "upstream".
@@ -335,11 +337,15 @@ return forward(users, request_policy: {
 // lowercases every forwarded header name, and requires forwarded_proto and
 // the six-name strip list together. Drops every header the client's
 // Connection value nominates except content-length/host/x-forwarded-for/
-// x-forwarded-host/x-forwarded-proto, nominating any of which fails closed;
-// keeps `te` when a comma-separated token is `trailers` (rewritten to that
-// exact lowercase token); rejects Connection nominating `upgrade` alongside
-// an Upgrade header (even with `close`); rejects more than one
-// X-Forwarded-Proto field; and rejects a fragment-bearing request target.
+// x-forwarded-host/x-forwarded-proto, nominating any of which (or a
+// pseudo-header-shaped token starting with `:`) fails closed; keeps `te`
+// when a comma-separated token is `trailers`, per field (rewritten to that
+// exact lowercase token; two trailers-carrying fields collapse to one line);
+// rejects Connection nominating `upgrade` alongside an Upgrade header (even
+// with `close`) but admits and strips a bare Upgrade header otherwise;
+// rejects more than one X-Forwarded-Proto field; rejects a fragment-bearing
+// request target; and drops client-supplied `x-envoy-*` headers Envoy itself
+// strips for external requests (docs/envoy-compatibility.md).
 return forward(users, request_policy: {
     version: "HTTP/1.1", host: "preserve", connection: "omit",
     header_names: "lowercase", forwarded_proto: "http",
