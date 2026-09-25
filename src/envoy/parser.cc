@@ -807,9 +807,13 @@ private:
         if (!json_u32(doc_.at(status.value()), &status_value))
             return invalid(doc_.at(status.value()).span,
                            lit_str("direct_response status must be a non-negative integer"));
-        if (status_value < 100u || status_value > 599u)
+        // Envoy v3 at the v1.39.1 tag: `DirectResponseAction.status`
+        // (api/envoy/config/route/v3/route_components.proto:1968-1969)
+        // carries `(validate.rules).uint32 = {lt: 600 gte: 200}`, so the
+        // valid range is 200..599, not 100..599 (Codex round-12 review).
+        if (status_value < 200u || status_value > 599u)
             return invalid(doc_.at(status.value()).span,
-                           lit_str("direct_response status must be in 100..599"));
+                           lit_str("direct_response status must be in 200..599"));
         out->direct_response.status = static_cast<u16>(status_value);
 
         auto body = optional(node, kBody);
@@ -854,6 +858,22 @@ private:
         // omitted one (both fall through to a bare status-code response with
         // no Location rewrite). Do not add a min-length check here; it would
         // reject a bootstrap Envoy itself accepts.
+        //
+        // Codex round-12 review: no additional byte-level filtering is
+        // needed here either. `well_known_regex: HTTP_HEADER_VALUE` has two
+        // patterns depending on `strict`: the *strict* (default) pattern
+        // rejects 0x00-0x08, 0x0A-0x1F, and 0x7F, but `path_redirect` and
+        // `host_redirect` both request `strict: false` above, which resolves
+        // (Envoy's protoc-gen-validate fork, `module/checker.go`'s
+        // `checkWellKnownRegex`/`regex_map["HEADER_STRING"]`) to the looser
+        // pattern `^[^\x00\x0A\x0D]*$` — i.e. only NUL/LF/CR are forbidden,
+        // and DEL (0x7F) is explicitly allowed. Those three forbidden bytes
+        // are already unconditionally rejected for every JSON string in this
+        // document, including these two fields, by the generic "control byte
+        // inside a JSON string" check in the scanner (< 0x20, `json.cc`), so
+        // there is no reachable gap to close: a raw DEL byte here is
+        // correctly accepted, not rejected, and a raw byte in 0x00-0x1F
+        // (e.g. 0x01) is already rejected upstream of this function.
         auto path_redirect = optional(node, kPathRedirect);
         if (!path_redirect) return core::make_unexpected(path_redirect.error());
         if (path_redirect.value() != kJsonNoNode) {

@@ -1320,6 +1320,51 @@ TEST(envoy_parser, route_action_models_direct_response) {
         expect_reject(b.render(), FrontendError::UnexpectedEof, "status is required");
     }
     {
+        // status must be in Envoy's documented 200..599 range (`gte: 200,
+        // lt: 600`): 199 is rejected (Codex round-12 review).
+        Bootstrap b;
+        REQUIRE(replace(&b.listeners,
+                        "\"route\": {\"cluster\": \"backend\"}",
+                        "\"direct_response\": {\"status\": 199}"));
+        expect_reject(b.render(), FrontendError::UnexpectedToken, "must be in 200..599");
+    }
+    {
+        // 200 is the lower bound and is accepted.
+        Bootstrap b;
+        REQUIRE(replace(&b.listeners,
+                        "\"route\": {\"cluster\": \"backend\"}",
+                        "\"direct_response\": {\"status\": 200}"));
+        static envoy::JsonDocument doc;
+        const std::string source_text = b.render();
+        auto result = envoy::parse_bootstrap_json(str(source_text), doc);
+        REQUIRE(result);
+        const envoy::RouteAction& action =
+            result.value().listener.filter_chain.hcm.route_config.virtual_host.routes[0].action;
+        CHECK_EQ(action.direct_response.status, 200u);
+    }
+    {
+        // 599 is the upper bound and is accepted.
+        Bootstrap b;
+        REQUIRE(replace(&b.listeners,
+                        "\"route\": {\"cluster\": \"backend\"}",
+                        "\"direct_response\": {\"status\": 599}"));
+        static envoy::JsonDocument doc;
+        const std::string source_text = b.render();
+        auto result = envoy::parse_bootstrap_json(str(source_text), doc);
+        REQUIRE(result);
+        const envoy::RouteAction& action =
+            result.value().listener.filter_chain.hcm.route_config.virtual_host.routes[0].action;
+        CHECK_EQ(action.direct_response.status, 599u);
+    }
+    {
+        // 600 is rejected.
+        Bootstrap b;
+        REQUIRE(replace(&b.listeners,
+                        "\"route\": {\"cluster\": \"backend\"}",
+                        "\"direct_response\": {\"status\": 600}"));
+        expect_reject(b.render(), FrontendError::UnexpectedToken, "must be in 200..599");
+    }
+    {
         // Only body.inline_string is modeled.
         Bootstrap b;
         REQUIRE(replace(&b.listeners,
@@ -1433,6 +1478,66 @@ TEST(envoy_parser, route_action_models_redirect) {
                         "\"redirect\": {\"path_redirect\": \"/new\", \"response_code\": \"FOUND\", "
                         "\"https_redirect\": true}"));
         expect_reject(b.render(), FrontendError::UnsupportedSyntax, "unsupported field");
+    }
+    {
+        // A raw DEL byte (0x7f) in path_redirect is accepted, not rejected
+        // (Codex round-12 review). `path_redirect` requests
+        // `well_known_regex: HTTP_HEADER_VALUE strict: false`, which Envoy's
+        // protoc-gen-validate fork resolves to the loose pattern
+        // `^[^\x00\x0A\x0D]*$` (module/checker.go's
+        // regex_map["HEADER_STRING"]) -- DEL is explicitly not forbidden by
+        // that pattern, unlike the strict HTTP_HEADER_VALUE pattern that
+        // would reject it.
+        Bootstrap b;
+        REQUIRE(replace(&b.listeners,
+                        "\"route\": {\"cluster\": \"backend\"}",
+                        "\"redirect\": {\"path_redirect\": \"/a\x7f\", \"response_code\": "
+                        "\"FOUND\"}"));
+        static envoy::JsonDocument doc;
+        const std::string source_text = b.render();
+        auto result = envoy::parse_bootstrap_json(str(source_text), doc);
+        REQUIRE(result);
+        const envoy::RouteAction& action =
+            result.value().listener.filter_chain.hcm.route_config.virtual_host.routes[0].action;
+        CHECK(action.redirect.path_redirect.eq(lit_str("/a\x7f")));
+    }
+    {
+        // Same acceptance for a raw DEL byte in host_redirect.
+        Bootstrap b;
+        REQUIRE(replace(&b.listeners,
+                        "\"route\": {\"cluster\": \"backend\"}",
+                        "\"redirect\": {\"host_redirect\": \"example.com\x7f\", "
+                        "\"response_code\": \"FOUND\"}"));
+        static envoy::JsonDocument doc;
+        const std::string source_text = b.render();
+        auto result = envoy::parse_bootstrap_json(str(source_text), doc);
+        REQUIRE(result);
+        const envoy::RouteAction& action =
+            result.value().listener.filter_chain.hcm.route_config.virtual_host.routes[0].action;
+        CHECK(action.redirect.host_redirect.eq(lit_str("example.com\x7f")));
+    }
+    {
+        // A raw byte below 0x20 (e.g. 0x01) in path_redirect is unreachable:
+        // it is already rejected by the generic JSON scanner's control-byte
+        // check, independent of any header-specific validation (Codex
+        // round-12 review).
+        Bootstrap b;
+        REQUIRE(replace(&b.listeners,
+                        "\"route\": {\"cluster\": \"backend\"}",
+                        "\"redirect\": {\"path_redirect\": \"/a\x01\", \"response_code\": "
+                        "\"FOUND\"}"));
+        expect_reject(
+            b.render(), FrontendError::UnexpectedChar, "control byte inside a JSON string");
+    }
+    {
+        // Same rejection (via the generic JSON scanner) for host_redirect.
+        Bootstrap b;
+        REQUIRE(replace(&b.listeners,
+                        "\"route\": {\"cluster\": \"backend\"}",
+                        "\"redirect\": {\"host_redirect\": \"example.com\x01\", "
+                        "\"response_code\": \"FOUND\"}"));
+        expect_reject(
+            b.render(), FrontendError::UnexpectedChar, "control byte inside a JSON string");
     }
 }
 
