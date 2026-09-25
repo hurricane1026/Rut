@@ -627,6 +627,66 @@ teardown, and reload retirement. This form does not imply a general mutable
 runtime response-body buffer: dynamic `resp.body` mutation remains a separate,
 resumable runtime feature.
 
+#### 3.3.5.1 Local Response and Forward Failure Policies (Envoy H1)
+
+`local_response({...})` is a compiler-validated builtin for a strict, fully
+specified local response — every header and the body are literal, closed
+vocabulary; there is no fallback shape and no implicit header. It shares one
+block grammar across three route forms:
+
+```swift
+unmatched { return local_response({
+    version: "HTTP/1.1", status: 404, reason: "Not Found",
+    content_type: "text/plain", server: "rut", date: "current",
+    connection: "request", head_mode: "suppress_body", body: b"Not Found"
+}) }
+
+unmatched get { return local_response({ ... }) }        // per-method no-route
+pre_route options { return local_response({ ... }) }    // pre-routing strict reply
+route exact "/healthz" get { return local_response({ ... }) }  // exact-path bypass
+```
+
+`version` (`"HTTP/1.1"` only), `status`, `reason`, `server`, `date`
+(`"current"` only), `connection` (`"request"` only), `head_mode` (`"reject"`
+or `"suppress_body"` — HEAD and ANY-method `unmatched`/`pre_route` policies
+must suppress the body), `content_type`, and `body` (a `b"..."` byte-string
+literal, ≤ 4 KiB) are each required exactly once, subject to the per-status
+closed vocabulary in `docs/language-card.md` (e.g. `status: 204` forces an
+empty `content_type`/`body`).
+
+`header_names`, `connection_header`, and `header_order` are an optional
+**closed trio** added for Envoy H1 compatibility: any one present requires all
+three. `header_names` accepts only `"lowercase"`; `connection_header` only
+`"close_only"` (append `connection: close` last, and only when the downstream
+connection is actually closing — unlike the default fixed-order layout, which
+always sends one Connection header or the other). `header_order` selects the
+wire layout:
+
+- *(trio omitted)* — `Synthesized`, today's fixed nginx-compatible order; the
+  only layout `status: 200`/`status: 204` admit.
+- `"date_server_length"` — Envoy's empty-body no-route shape
+  (`date, server, [connection: close,] content-length: 0`): 4xx/5xx status
+  only, requires `body: b""` and `content_type` absent.
+- `"length_type_date_server"` — Envoy's bodied shape
+  (`content-length, content-type, date, server, [connection: close]`): 4xx/5xx
+  status only, with the same `content_type`/`body` rules as the default
+  layout.
+
+`forward(..., failure_policy: {...})` and `forward(..., timeout_failure_policy:
+{...})` reuse this grammar for the 502/503 response synthesized when a proxied
+request never gets an upstream reply. `failure_policy` additionally admits the
+same trio, but only `header_order: "length_type_date_server"`, and only paired
+with `status: 503` and a non-empty `body` — Envoy's upstream connect-failure
+representation (`docs/envoy-converter.md`). `status: 502` stays closed to the
+trio-omitted `Synthesized` shape, so the pre-existing nginx-compatible 502
+contract is unchanged. `timeout_failure_policy` stays `Synthesized`-only
+across the full 400..599 range: no timeout shape has a recorded Envoy oracle
+yet.
+
+See `docs/language-card.md` for the exhaustive per-field/per-status grammar
+and `docs/envoy-converter.md` for the byte-level Envoy oracle these layouts
+reproduce.
+
 #### 3.3.6 State Types
 
 > **Revised 2026-07 (decisions in docs/state-types.md):** the taxonomy is

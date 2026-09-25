@@ -26244,6 +26244,74 @@ TEST(route, failure_policy_connect_error_serializes_binary_body_and_releases_slo
     close(client);
 }
 
+// Regression for the PR #699 Codex review: `respond_upstream_connect_failure`
+// used to unconditionally record `conn.resp_status = kStatusBadGateway`
+// (502), even when the selected failure_policy serialized a different status
+// on the wire (e.g. Envoy's 503 connect-failure layout). That mismatch would
+// have on_request_complete, access logging, traffic capture, and status-based
+// metrics disagree with what the client actually received. Assert the
+// recorded status matches the wire response.
+TEST(route, failure_policy_connect_error_envoy_503_records_matching_resp_status) {
+    DeadEndpoint dead;
+    REQUIRE(dead.reserve());
+    RouteConfig cfg{};
+    REQUIRE(cfg.add_upstream("backend", 0x7F000001, dead.port).has_value());
+    cfg.upstreams[0].max_inflight = 1;
+    ForwardFailurePolicySpec failure{};
+    failure.version = ForwardFailurePolicyVersion::Http11;
+    failure.status_code = 503;
+    failure.header_order = FailurePolicyHeaderOrder::LengthTypeDateServer;
+    failure.date = ForwardFailurePolicyDate::Current;
+    failure.connection = ForwardFailurePolicyConnection::Request;
+    failure.head_mode = FailurePolicyHeadMode::Reject;
+    failure.reason = {"Service Unavailable", 19};
+    failure.content_type = {"text/plain", 10};
+    failure.server = {"envoy", 5};
+    failure.body = {"upstream connect error", 23};
+    REQUIRE_EQ(cfg.add_failure_policy(failure), 1u);
+    REQUIRE_EQ(cfg.add_policy_bundle(0, 1), 1u);
+    REQUIRE_EQ(cfg.add_response_policy(test_response_policy_spec()), 1u);
+    REQUIRE_EQ(cfg.add_policy_bundle(1, 1), 2u);
+    REQUIRE(cfg.add_jit_handler("/api", 'G', &forward_failure_bundle_two_handler));
+    const RouteConfig* active = &cfg;
+    ScopedProxyLoop proxy;
+    REQUIRE(proxy.setup(&active, 1000));
+    auto ring = std::make_unique<AccessLogRing>();
+    ring->init();
+    proxy.loop->access_log = ring.get();
+
+    i32 client = connect_to(proxy.port);
+    REQUIRE_GE(client, 0);
+    set_socket_timeouts(client, 2);
+    static constexpr char kRequest[] = "GET /api HTTP/1.1\r\nHost: client.example\r\n\r\n";
+    REQUIRE(send_all(client, kRequest, sizeof(kRequest) - 1));
+    char response[512];
+    u32 total = 0;
+    while (total < sizeof(response)) {
+        const i32 n = recv_timeout(client, response + total, sizeof(response) - total, 2000);
+        if (n <= 0) break;
+        total += static_cast<u32>(n);
+    }
+    close(client);
+    REQUIRE_GT(total, 0u);
+    CHECK(buf_contains(response, total, "HTTP/1.1 503 Service Unavailable\r\n", 34));
+
+    // The access-log entry is published from on_request_complete, which runs
+    // just after the send completion the client already observed above; poll
+    // briefly for the shard thread to publish it.
+    AccessLogEntry access{};
+    bool popped = false;
+    for (int i = 0; i < 200 && !popped; i++) {
+        if (ring->pop(access)) {
+            popped = true;
+            break;
+        }
+        usleep(1000);
+    }
+    REQUIRE(popped);
+    CHECK_EQ(access.status, 503u);
+}
+
 TEST(route, failure_policy_close_intent_emits_close_and_eof) {
     DeadEndpoint dead;
     REQUIRE(dead.reserve());

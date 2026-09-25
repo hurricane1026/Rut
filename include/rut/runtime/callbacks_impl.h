@@ -10714,6 +10714,12 @@ inline void respond_validated_preconnect_failure(Loop* loop,
         fail_closed();
         return;
     }
+    // build_failure_policy_response above only succeeds for a valid, owned
+    // failure_policy_id: the client received that policy's status (e.g. the
+    // Envoy 503 connect-failure layout), so bookkeeping must match it rather
+    // than assume the legacy 502 shape.
+    const u16 policy_status =
+        conn.request_config->failure_policies[conn.failure_policy_id - 1].status_code;
     conn.clear_slots();
     conn.upstream_abandoned = true;
     conn.upstream_keep_alive = false;
@@ -10726,7 +10732,7 @@ inline void respond_validated_preconnect_failure(Loop* loop,
         return;
     }
     conn.keep_alive = conn.keep_alive && conn.req_client_keep_alive;
-    conn.resp_status = kStatusBadGateway;
+    conn.resp_status = policy_status;
     conn.resp_body_mode = BodyMode::None;
     conn.resp_body_remaining = 0;
     conn.resp_body_sent = response_len;
@@ -10810,6 +10816,12 @@ inline void respond_validated_connect_completion_failure(Loop* loop,
         fail_closed();
         return;
     }
+    // build_failure_policy_response above only succeeds for a valid, owned
+    // failure_policy_id: the client received that policy's status (e.g. the
+    // Envoy 503 connect-failure layout), so bookkeeping must match it rather
+    // than assume the legacy 502 shape.
+    const u16 policy_status =
+        conn.request_config->failure_policies[conn.failure_policy_id - 1].status_code;
     conn.clear_slots();
     conn.upstream_abandoned = true;
     conn.upstream_keep_alive = false;
@@ -10822,7 +10834,7 @@ inline void respond_validated_connect_completion_failure(Loop* loop,
         return;
     }
     conn.keep_alive = conn.keep_alive && conn.req_client_keep_alive;
-    conn.resp_status = kStatusBadGateway;
+    conn.resp_status = policy_status;
     conn.resp_body_mode = BodyMode::None;
     conn.resp_body_remaining = 0;
     conn.resp_body_sent = response_len;
@@ -10895,6 +10907,7 @@ inline void respond_upstream_connect_failure(Loop* loop, Connection& conn) {
     release_upstream_slot(loop, conn);
 
     bool serialized = false;
+    u16 policy_status = kStatusBadGateway;
     if (conn.failure_policy_id != 0 && conn.request_config != nullptr) {
         // Build off-buffer so a capacity/date failure cannot publish a partial
         // policy response or accidentally fall through to the legacy body.
@@ -10910,7 +10923,14 @@ inline void respond_upstream_connect_failure(Loop* loop, Connection& conn) {
             conn.send_buf.reset();
             serialized = conn.send_buf.write(scratch, serialized_len) == serialized_len;
         }
-        if (serialized) conn.keep_alive = conn.keep_alive && conn.req_client_keep_alive;
+        if (serialized) {
+            conn.keep_alive = conn.keep_alive && conn.req_client_keep_alive;
+            // The client received whatever status the selected policy
+            // serialized (e.g. a 503 Envoy connect-failure layout); bookkeeping
+            // must match the wire response, not the legacy 502 fallback.
+            policy_status =
+                conn.request_config->failure_policies[conn.failure_policy_id - 1].status_code;
+        }
     }
     if (!serialized) {
         // A selected policy is never silently approximated by the legacy
@@ -10933,7 +10953,7 @@ inline void respond_upstream_connect_failure(Loop* loop, Connection& conn) {
         }
         conn.keep_alive = false;
     }
-    conn.resp_status = kStatusBadGateway;
+    conn.resp_status = policy_status;
     conn.transition_to_sending(&on_response_sent<Loop>);
     client_send(loop, conn, conn.send_buf.data(), conn.send_buf.len());
 }

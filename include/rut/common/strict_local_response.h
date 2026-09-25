@@ -219,7 +219,11 @@ inline StrictLocalResponseProfile strict_local_response_policy_profile(
     }
     // profile == LegacyError here: header_order Synthesized (today's contract)
     // or LengthTypeDateServer (the bodied Envoy layout) are both admitted; the
-    // wire layout is selected by header_order alone at serialization time.
+    // wire layout is selected by header_order alone at serialization time. Any
+    // other (forged/out-of-range) header_order value is never admitted.
+    if (policy.header_order != StrictLocalResponseHeaderOrder::Synthesized &&
+        policy.header_order != StrictLocalResponseHeaderOrder::LengthTypeDateServer)
+        return StrictLocalResponseProfile::Invalid;
     return profile;
 }
 
