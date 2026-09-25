@@ -24839,8 +24839,12 @@ TEST(route, forward_request_policy_preserve_host_lowercase_h11_wire) {
 // not be able to inject retry/timeout instructions Envoy's own control plane
 // would otherwise own. Verifies end to end, via a real upstream connection,
 // that `x-envoy-expected-rq-timeout-ms` and `x-envoy-retry-on` never reach
-// the upstream, while an ordinary header and a header outside the fixed
-// removal set (`x-envoy-internal`) still do.
+// the upstream, while an ordinary header still does. Round-7 review: neither
+// does a client-forged `x-envoy-internal` (`removeEnvoyInternalRequest()`,
+// conn_manager_utility.cc:142, unconditional; only written back on the
+// `internal_request` branch that needs `use_remote_address`) nor a
+// client-supplied `x-forwarded-client-cert` (`mutateXfccRequestHeader` with
+// the default `forward_client_cert_details: SANITIZE`, lines 541-545).
 TEST(route, forward_request_policy_preserve_host_lowercase_strips_client_envoy_internal_headers) {
     using namespace rut;
     struct JitResources {
@@ -24902,12 +24906,12 @@ TEST(route, forward_request_policy_preserve_host_lowercase_strips_client_envoy_i
         "X-Envoy-Expected-Rq-Timeout-Ms: 15000\r\n"
         "X-Envoy-Retry-On: 5xx\r\n"
         "X-Envoy-Internal: true\r\n"
+        "X-Forwarded-Client-Cert: Hash=0123abcd;URI=spiffe://mesh/admin\r\n"
         "X-Regular: keep\r\n"
         "\r\n";
     static constexpr char kExpectedUpstream[] =
         "GET /smoke HTTP/1.1\r\n"
         "host: client.example\r\n"
-        "x-envoy-internal: true\r\n"
         "x-regular: keep\r\n"
         "x-forwarded-proto: http\r\n"
         "\r\n";
@@ -24925,11 +24929,14 @@ TEST(route, forward_request_policy_preserve_host_lowercase_strips_client_envoy_i
     const u32 recorded_len = upstream.request_history_len[0];
     REQUIRE_EQ(recorded_len, static_cast<u32>(sizeof(kExpectedUpstream) - 1));
     CHECK_EQ(__builtin_memcmp(upstream.request_history[0], kExpectedUpstream, recorded_len), 0);
-    // Belt-and-suspenders: the two headers named in the round-6 review must
-    // not appear anywhere in what the upstream received, however it is
-    // cased.
+    // Belt-and-suspenders: the headers named in the round-6 and round-7
+    // reviews must not appear anywhere in what the upstream received,
+    // however they are cased.
     CHECK_FALSE(buf_contains(upstream.request_history[0], recorded_len, "rq-timeout-ms", 13));
     CHECK_FALSE(buf_contains(upstream.request_history[0], recorded_len, "retry-on", 8));
+    CHECK_FALSE(buf_contains(upstream.request_history[0], recorded_len, "envoy-internal", 14));
+    CHECK_FALSE(buf_contains(upstream.request_history[0], recorded_len, "client-cert", 11));
+    CHECK_FALSE(buf_contains(upstream.request_history[0], recorded_len, "spiffe", 6));
 }
 
 // A body-carrying request (ID4, preserved Host) paired with a response_policy

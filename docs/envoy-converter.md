@@ -292,9 +292,13 @@ folded into the golden below and into the parser/converter implementation:
    capability, landed in PR3). `"Transfer-Encoding"` is rejected in every
    combination the converter uses; it is dropped from the lowering. The
    `"TE"` entry does not mean "always strip": per the Envoy oracle
-   (`tests/fixtures/envoy_oracle_milestone_s.inc`), `host: "preserve"` keeps
-   a client `te` header when its value is exactly `trailers` (Envoy forwards
-   only that token) and strips it for every other value.
+   (`tests/fixtures/envoy_oracle_milestone_s.inc`) and Envoy's own
+   `sanitizeConnectionHeader`, `host: "preserve"` keeps a client `te` field
+   whenever one of its comma-separated tokens is `trailers` (any casing;
+   `TE: gzip, trailers` is kept), rewrites the kept field to exactly
+   `te: trailers` (Envoy forwards only that canonical token, never the
+   client's other tokens or casing), collapses several such fields to one
+   line, and strips a `te` field that carries no `trailers` token.
 3. `request_policy` and `set_header` cannot be used together
    (`src/compiler/parser.cc` around lines 2022 and 2568). The milestone
    lowering therefore does not use `set_header`; `x-forwarded-proto` is
@@ -346,8 +350,10 @@ below).
 The milestone-S bootstrap (the accepted-JSON milestone above, plus
 `suppress_envoy_headers: true` and `timeout: "0s"`) lowers to the RUT below
 once every capability in `rut::envoy::RutCapabilities` is available. The
-shipped converter (`rut::envoy::kShippedRutCapabilities`, all `false`) fails
-closed with a `BLOCKED_BY_RUT` diagnostic instead of emitting this text; the
+shipped converter (`rut::envoy::kShippedRutCapabilities`: `request_envoy_h1`
+`true` since PR3, `response_envoy_h1` and `local_reply_envoy_h1` still
+`false`) fails closed with a `BLOCKED_BY_RUT` diagnostic (at the
+`response_envoy_h1` check) instead of emitting this text; the
 exact bytes are pinned in `tests/fixtures/envoy_milestone_s.inc` and checked
 byte for byte by `tests/test_envoy_convert.cc`
 (`api_all_capabilities_matches_golden`). Values shown here (the connect-failure
@@ -928,7 +934,17 @@ Three findings from the round-6 Codex review of PR #692:
    policy handles (equivalent to "always treat as external", which is
    correct for this milestone since `use_remote_address` can never be set).
    Recorded as a prominently marked `BLOCKED_BY_RUT` matrix row in
-   docs/envoy-compatibility.md pending that runtime change.
+   docs/envoy-compatibility.md pending that runtime change. **Landed in
+   #696** (`request_policy_is_stripped_client_envoy_header`,
+   `include/rut/runtime/callbacks_impl.h`): the ID4 policy drops all 15
+   names above unconditionally, plus -- from the round-7 review of #696 --
+   a client-supplied `x-forwarded-client-cert`, which
+   `ConnectionManagerUtility::mutateXfccRequestHeader` (called for every
+   request at `conn_manager_utility.cc:324`) removes under the HCM's default
+   `forward_client_cert_details: SANITIZE` (`applyForwardClientCertConfig`,
+   lines 541-545, also for any non-mTLS connection). Sixteen names in
+   total; the matrix rows are `PARTIAL` pending the pinned-Envoy
+   differential run.
 
 ## Test layers
 

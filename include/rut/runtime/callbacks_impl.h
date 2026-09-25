@@ -5492,30 +5492,49 @@ inline bool request_policy_host_authority_is_valid(const u8* p, u32 n) {
 
 // ID4 (Http11PreserveHostLowercase) targets the plain milestone bootstrap
 // HTTP connection manager: no `use_remote_address: true`, no configured
-// `internal_address_config` (docs/envoy-converter.md). Under that fixed
-// shape Envoy's own `ConnectionManagerUtility::mutateRequestHeaders`
-// (source/common/http/conn_manager_utility.cc) determines internal/external
-// status statically rather than per-client-address:
-// `DefaultInternalAddressConfig::isInternalAddress`
-// (source/common/router/config_impl.h) unconditionally returns `false`, so
-// `internal_request` is always false, and `edge_request = !internal_request
-// && config.useRemoteAddress()` is therefore always false too (`
-// useRemoteAddress()` defaults false). That always takes the `else` branch
-// into `cleanInternalHeaders(request_headers, /*edge_request=*/false, ...)`,
-// which unconditionally removes exactly the fourteen `x-envoy-*` headers
-// below regardless of what the client supplied -- they let Envoy's own
-// router/retry/hedging/tracing logic accept trusted operator or front-Envoy
-// instructions, and an untrusted external client must not be able to inject
-// them onto the upstream request. `cleanInternalHeaders`'s five
-// `edge_request`-gated removals (`x-envoy-decorator-operation`,
-// `x-envoy-downstream-service-cluster`, `x-envoy-downstream-service-node`,
-// `x-envoy-original-path`, `x-envoy-original-host`) are unreachable under
-// this fixed `edge_request == false` shape, and `x-envoy-internal` itself is
-// never removed by this function at all (only ever overwritten, on the
-// `internal_request` branch this profile never takes) -- both pass through
-// unchanged like any other client header, same as any name not in this list.
+// `internal_address_config`, no `forward_client_cert_details`
+// (docs/envoy-converter.md). Under that fixed shape Envoy's own
+// `ConnectionManagerUtility::mutateRequestHeaders`
+// (source/common/http/conn_manager_utility.cc, v1.39.1 line numbers below)
+// sanitizes the sixteen client-supplied headers listed here on every
+// request, before route selection, regardless of what the client supplied:
+//
+// * `x-envoy-internal`: `request_headers.removeEnvoyInternalRequest()`
+//   (line 142, under "Clean proxy headers") runs unconditionally, and the
+//   header is written back (`setReferenceEnvoyInternalRequest`, lines
+//   278-280) only when `internal_request` is true -- which needs
+//   `allow_trusted_address_checks` (line 263), itself only ever set inside
+//   `if (config.useRemoteAddress())` (lines 163-164). Without
+//   `use_remote_address` a request is external no matter what it carries,
+//   so the removal always stands and a client can never present itself as
+//   internal to the upstream (Codex round-7 review, PR #696).
+// * the fourteen `x-envoy-*` headers `cleanInternalHeaders` (lines
+//   351-388) removes regardless of `edge_request`: `internal_request` is
+//   always false, so line 282 always reaches it, and `edge_request =
+//   !internal_request && config.useRemoteAddress()` (line 275) is always
+//   false too (`useRemoteAddress()` defaults false). They let Envoy's own
+//   router/retry/hedging/tracing logic accept trusted operator or
+//   front-Envoy instructions, and an untrusted external client must not be
+//   able to inject them onto the upstream request. `cleanInternalHeaders`'s
+//   five `edge_request`-gated removals (`x-envoy-decorator-operation`,
+//   `x-envoy-downstream-service-cluster`, `x-envoy-downstream-service-node`,
+//   `x-envoy-original-path`, `x-envoy-original-host`) are unreachable under
+//   this fixed `edge_request == false` shape and pass through unchanged
+//   like any other client header, same as any name not in this list.
+// * `x-forwarded-client-cert`: `mutateXfccRequestHeader` (called at line
+//   324; body at lines 662-686) applies the HCM's static
+//   `forward_client_cert_details`, whose proto default is `SANITIZE` ("Do
+//   not send the XFCC header to the next hop. This is the default value.",
+//   api/envoy/extensions/filters/network/http_connection_manager/v3/
+//   http_connection_manager.proto), and `applyForwardClientCertConfig`
+//   (lines 541-545) then calls `removeForwardedClientCert()` -- for
+//   `Sanitize` outright, and independently for any connection that is not
+//   mutual TLS, so it fires on this cleartext listener either way. An
+//   upstream that trusts XFCC must never receive a certificate identity the
+//   client asserted itself (Codex round-7 review, PR #696).
 inline bool request_policy_is_stripped_client_envoy_header(const u8* p, u32 n) {
-    return request_policy_name_eq(p, n, "x-envoy-retriable-status-codes", 30) ||
+    return request_policy_name_eq(p, n, "x-envoy-internal", 16) ||
+           request_policy_name_eq(p, n, "x-envoy-retriable-status-codes", 30) ||
            request_policy_name_eq(p, n, "x-envoy-retriable-header-names", 30) ||
            request_policy_name_eq(p, n, "x-envoy-retry-on", 16) ||
            request_policy_name_eq(p, n, "x-envoy-retry-grpc-on", 21) ||
@@ -5528,7 +5547,8 @@ inline bool request_policy_is_stripped_client_envoy_header(const u8* p, u32 n) {
            request_policy_name_eq(p, n, "x-envoy-force-trace", 19) ||
            request_policy_name_eq(p, n, "x-envoy-ip-tags", 15) ||
            request_policy_name_eq(p, n, "x-envoy-original-url", 20) ||
-           request_policy_name_eq(p, n, "x-envoy-hedge-on-per-try-timeout", 32);
+           request_policy_name_eq(p, n, "x-envoy-hedge-on-per-try-timeout", 32) ||
+           request_policy_name_eq(p, n, "x-forwarded-client-cert", 23);
 }
 
 // Parse and validate the policy's framing before it can acquire an upstream
@@ -5672,10 +5692,13 @@ inline RequestPolicyBodyState inspect_request_policy_body(const Connection& conn
 // per field when that field's value carries a "trailers" token (every field
 // evaluated independently; two or more trailers-carrying fields still
 // collapse to one canonical `te: trailers` line, matching Envoy's inline
-// header storage), drops the fixed set of client-supplied `x-envoy-*`
-// headers Envoy's own `cleanInternalHeaders` removes for a non-internal,
-// non-edge external request (see `request_policy_is_stripped_client_envoy_header`
-// above), and appends `x-forwarded-proto: http` as the last header when the
+// header storage), drops the fixed sixteen-name set of client-supplied
+// headers Envoy's own `mutateRequestHeaders` sanitizes for a non-internal,
+// non-edge external request on a cleartext listener (`x-envoy-internal`,
+// the fourteen `cleanInternalHeaders` `x-envoy-*` names, and
+// `x-forwarded-client-cert`; see
+// `request_policy_is_stripped_client_envoy_header` above), and appends
+// `x-forwarded-proto: http` as the last header when the
 // client did not already supply one (a client-supplied value passes through
 // unchanged, in its original position). Fails closed with no upstream bytes
 // touched unless exactly one non-empty Host header is present. A
