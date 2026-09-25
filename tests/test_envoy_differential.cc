@@ -1991,6 +1991,28 @@ std::vector<CaseSpec> run1_cases() {
                      false,
                      "/xfcc",
                      smoke_reply});
+    // Record-only (not in kAssertedCaseNames), alongside the two forged-header
+    // cases above: a client-supplied `X-Envoy-External-Address: 10.0.0.1`.
+    // PR #696 round-8 (fix ID4) makes RUT strip this header unconditionally
+    // before forwarding. Codex's review there claimed Envoy strips a
+    // client-supplied value here too, but a worker who checked Envoy
+    // v1.39.1's `ConnectionManagerUtility::mutateRequestHeaders()` for this
+    // milestone's exact shape (`use_remote_address: false`) found Envoy does
+    // NOT remove a client-supplied value in that configuration -- contradicting
+    // the Codex claim. This case exists to record what the pinned Envoy
+    // image's recorded upstream bytes actually show, which will settle the
+    // disagreement once a pinned-Envoy CI run captures it; until then it
+    // stays record-only and is expected to diverge (RUT strips the header,
+    // while Envoy's recorded behavior may forward it unchanged). The matrix
+    // row on PR #696 documents RUT's stripping as intentional Rut-side
+    // hardening regardless of how this case's evidence settles.
+    cases.push_back({"get_forged_envoy_external_address",
+                     "GET /external-address HTTP/1.1\r\nHost: client.example\r\n"
+                     "User-Agent: rut-diff/1\r\nX-Envoy-External-Address: 10.0.0.1\r\n"
+                     "Accept: */*\r\n\r\n",
+                     false,
+                     "/external-address",
+                     smoke_reply});
     return cases;
 }
 
