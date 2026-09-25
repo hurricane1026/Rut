@@ -1843,6 +1843,11 @@ void release_upstream_conn(Loop* loop, Connection& conn) {
             if (conn.upstream_fd < 0) return;  // parked (or closed) + cleared by the loop
         }
     }
+    // io_uring: a still-armed recv must be quarantined, not just orphaned by close().
+    if constexpr (requires { loop->close_released_upstream(conn); }) {
+        loop->close_released_upstream(conn);
+        return;
+    }
     (void)detach_upstream_close(loop, conn);
 }
 
