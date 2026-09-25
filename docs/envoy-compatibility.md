@@ -15,6 +15,18 @@ the behavior; `behavior test` is the differential evidence. The pinned Envoy
 image does not exist yet; no row can be promoted past `PARTIAL` until
 `tests/pinned-envoy-image.txt` and the differential target land.
 
+The design contract's fail-closed rule is about configuration semantics: a
+bootstrap that needs a RUT surface the shipped binary does not have must be
+rejected at conversion time, in full, rather than partially lowered. It is not
+about individual requests or responses that a correctly-converted route later
+sees. When Rut's runtime safely refuses a specific request or response shape
+(a fixed status, no upstream mis-forward) that Envoy would have carried, that
+is a per-request divergence, not a configuration-admission gap: it is recorded
+below as `PARTIAL` or `NOT_IMPLEMENTED` with the observed bytes, the same way
+the nginx compatibility matrix records nginx-vs-Rut per-request differences,
+and it is not gated behind a `RutCapabilities` flag that would otherwise block
+every bootstrap indefinitely.
+
 ## Milestone: one listener, wildcard virtual host, catch-all route, one STATIC endpoint
 
 | Envoy feature | parser | converter | RUT capability | behavior test | status |
@@ -26,6 +38,22 @@ image does not exist yet; no row can be promoted past `PARTIAL` until
 | Cluster: `type` omitted or `STATIC`, positive `connect_timeout` with millisecond precision, `load_assignment` with required `cluster_name` matching the cluster and one locality with one IPv4 `lb_endpoints` entry | yes: `STRICT_DNS`/`LOGICAL_DNS`/`EDS`/`ORIGINAL_DST`, `lb_policy`, `health_checks`, `circuit_breakers`, `outlier_detection`, `transport_socket`, weights, `locality`, multiple localities/endpoints, sub-millisecond or zero durations, omitted or mismatched `load_assignment.cluster_name` rejected | yes, capability-gated (fails closed until the BLOCKED rows land) | `upstream envoy_cluster_0 at "ip:port"` exists; `connect_timeout` has no connect-establishment RUT surface (accepted with a stderr warning, see "Blocked by Rut") | none | NOT_IMPLEMENTED |
 | Router filter `suppress_envoy_headers: true` (v3 `Router` typed_config; also accepts `suppressEnvoyHeaders`) | yes: boolean-only, duplicate-spelling rejection, only valid inside the router's typed_config | required (milestone-S; see docs/envoy-converter.md) | removes `x-envoy-upstream-service-time` / `x-envoy-expected-rq-timeout-ms`; no separate RUT surface needed once emitted | none | NOT_IMPLEMENTED |
 | Route action `timeout: "0s"` (proto3 JSON `Duration`, zero permitted) | yes: `"0s"` through `"4294967s"`, sub-millisecond and non-numeric forms rejected | required (milestone-S; a present, non-zero `timeout` is also rejected until a RUT route-timeout surface exists) | none needed for `"0s"` (removes the implicit 15s default); non-zero values are BLOCKED_BY_RUT | none | NOT_IMPLEMENTED |
+
+Per-request divergences on the milestone's own `forward(...)` route (PR #692
+round-2 review; not configuration-admission gaps, see the note above): the
+converter emits these rows' route unconditionally once PR3-PR5 land, and Rut's
+runtime, when it later sees the specific request or response shape below,
+safely refuses it with a fixed status rather than mis-forwarding.
+
+| Envoy feature | parser | converter | RUT capability | behavior test | status |
+| --- | --- | --- | --- | --- | --- |
+| Fixed-length request body larger than the 16 KiB request slice, forwarded by Envoy (no body-size cap tied to a single buffer; `Cluster.per_connection_buffer_limit_bytes` defaults to a 1 MiB soft watermark, `api/envoy/config/cluster/v3/cluster.proto`) | yes: milestone bootstrap admission does not depend on any per-request body size | yes: the emitted route forwards fixed-length bodies unconditionally, no capability gate | no: Rut fails closed with `400 Bad Request` before upstream contact (`inspect_request_policy_body` requires `content_length <= recv_buf.capacity() - header_end`, `include/rut/runtime/callbacks_impl.h:5461-5463`; `recv_buf` is one `SlicePool::kSliceSize`, 16384 bytes, `include/rut/runtime/io_backend.h:50`) | live observation on envoy/lower-increment-2 with the nginx-era policy shape: `POST /` with a 20000-byte fixed-length body (20051 bytes total) got `HTTP/1.1 400 Bad Request`, no upstream connection attempted | NOT_IMPLEMENTED |
+| `Expect: 100-continue` with a body, forwarded by Envoy after it sends the interim `100 Continue` itself (`ConnectionManagerImpl::ActiveStream::decodeHeaders`, `source/common/http/conn_manager_impl.cc`) and strips `Expect` before forwarding | yes: milestone bootstrap admission does not depend on per-request `Expect` | yes: the emitted route has no interim-response surface to gate on | no: Rut fails closed with `400 Bad Request` before upstream contact (`inspect_request_policy_body` treats `Expect` on a content-length request as invalid, `include/rut/runtime/callbacks_impl.h:5451,5460`); no interim 100 response exists | live observation on envoy/lower-increment-2 with the nginx-era policy shape: `POST /` with `Content-Length: 2` and `Expect: 100-continue` got `HTTP/1.1 400 Bad Request`, no upstream connection attempted | NOT_IMPLEMENTED |
+| `TE: trailers` preserved by Envoy while every other `TE` value and hop-by-hop header is stripped (`ConnectionManagerUtility::sanitizeTEHeader`, `source/common/http/conn_manager_utility.cc`) | yes: milestone bootstrap admission does not depend on per-request `TE` | yes: the emitted route strips `TE` via the fixed `strip_headers` list, no capability gate | no, but improving: for a request with a `Content-Length` body, Rut fails closed with `400 Bad Request` before upstream contact (`inspect_request_policy_body` treats `TE` on a content-length request as invalid, `include/rut/runtime/callbacks_impl.h:5450,5460`). For a bodyless request, today's fixed `strip_headers` list instead silently drops `TE` entirely rather than preserving `trailers` — a mis-forward, not a fail-closed refusal. PR #696 (`envoy/rut-request-envoy-h1`, commit `366ad196`, ID4 `Http11PreserveHostLowercase`) adds exact-value `TE: trailers` preservation for the bodyless case once `request_envoy_h1` lands, but its `apply_preserve_host_lowercase_request_policy` still calls the same `inspect_request_policy_body` gate first, so a request with a body still fails closed 400 even after #696 | live observation on envoy/lower-increment-2 with the nginx-era policy shape: `POST /` with `Content-Length: 2` and `TE: trailers` got `HTTP/1.1 400 Bad Request`, no upstream connection attempted; a bodyless `GET /` with `TE: trailers` was forwarded to the origin with the `TE` header silently removed (`GET / HTTP/1.1\r\nHost: 127.0.0.1:9100\r\n\r\n`, no `TE` field) | PARTIAL |
+| Extension/unrecognized HTTP methods (e.g. `PROPFIND`) forwarded by Envoy's default hard-coded 34-method list, which includes WebDAV methods (`kValidMethods`, `source/common/http/http1/balsa_parser.cc`) | yes: milestone bootstrap admission does not depend on per-request methods | yes: the emitted route is any-method, no capability gate | no: Rut fails closed with `400 Bad Request` before any route lookup (`HttpMethod` recognizes 9 methods; an unrecognized method resolves to `ParseStatus::Error` once the request head is complete, `src/runtime/http_parser.cc:101-159,360,493-501`) | live observation on envoy/lower-increment-2 with the nginx-era policy shape: `PROPFIND / HTTP/1.1` got `HTTP/1.1 400 Bad Request` | NOT_IMPLEMENTED |
+| Upstream response with 65-100 headers, forwarded by Envoy (default `HttpProtocolOptions.max_headers_count` is 100, `api/envoy/config/core/v3/protocol.proto`) | yes: milestone bootstrap admission does not depend on per-response header counts | yes: the emitted route's response_policy has no header-count knob, no capability gate | no: Rut fails closed with `502 Bad Gateway` before downstream commit (`kMaxHeaders` is a fixed 64, `include/rut/runtime/http_parser.h:46`; `build_strict_response_headers` rejects any response with `headers_truncated`, `include/rut/runtime/callbacks_impl.h:10169`, tripping the route's configured failure response) | live observation on envoy/lower-increment-2 with the nginx-era policy shape: an origin returning 90 headers plus `Content-Length: 5` got the client `HTTP/1.1 502 Bad Gateway` | NOT_IMPLEMENTED |
+| Valid HTTP/1.0 upstream response with `Content-Length`, forwarded by Envoy (`accept_http_10` gates only the downstream-facing server codec, `source/common/http/http1/codec_impl.h`; the client codec's version check accepts any `HTTP/<digit>.<digit>` line) | yes: milestone bootstrap admission does not depend on the upstream's response version | yes: the emitted route's response_policy has no upstream-version knob, no capability gate | no: Rut fails closed with `502 Bad Gateway` before downstream commit (`build_strict_response_headers` requires `resp.version == HttpVersion::Http11`, `include/rut/runtime/callbacks_impl.h:10164`) | live observation on envoy/lower-increment-2 with the nginx-era policy shape: an origin answering `HTTP/1.0 200 OK` with `Content-Length: 5` got the client `HTTP/1.1 502 Bad Gateway` | NOT_IMPLEMENTED |
+| Upstream response with an empty reason phrase, forwarded by Envoy (RFC 7230 §3.1.2 allows a zero-length `reason-phrase`; `BalsaParser::OnResponseFirstLineInput` does not reject it, `source/common/http/http1/balsa_parser.cc`) | yes: milestone bootstrap admission does not depend on the upstream's reason phrase | yes: the emitted route's response_policy has no reason-phrase knob, no capability gate | no: Rut fails closed with `502 Bad Gateway` before downstream commit (`build_strict_response_headers` rejects `resp.reason.len == 0`, `include/rut/runtime/callbacks_impl.h:10170`) | live observation on envoy/lower-increment-2 with the nginx-era policy shape: an origin answering `HTTP/1.1 200 \r\nContent-Length: 0\r\n\r\n` got the client `HTTP/1.1 502 Bad Gateway` | NOT_IMPLEMENTED |
 
 ## Blocked by Rut before the milestone can reach SUPPORTED
 
@@ -86,3 +114,32 @@ converter fails closed on the whole configuration until then.
   program using the same `request_policy`/`response_policy` shapes the
   converter emits, driven with raw sockets and `curl --noproxy '*'`), not
   inferred from reading the runtime alone.
+- PR #692 round-2 review (`envoy/lower-increment-2`, base
+  `envoy/parser-increment-1`): the seven per-request rows added above (request
+  body larger than the request slice, `Expect: 100-continue`, `TE: trailers`,
+  extension methods, response header ceiling, HTTP/1.0 upstream response,
+  empty reason phrase) were each verified against Envoy v1.39.1 source
+  (`conn_manager_impl.cc`, `conn_manager_utility.cc`, `balsa_parser.cc`,
+  `codec_impl.h`, `protocol.proto`, `cluster.proto`) and against a live `rut`
+  process built from `envoy/lower-increment-2` (head `738d5e75`), driven with
+  a scripted Python socket-level origin and raw sockets. That branch predates
+  the request/response/local-reply serializers (#696/#698/#699), so the
+  milestone's own emitted policy vocabulary does not compile there yet; the
+  live checks used the nearest existing nginx-era policy shape
+  (`tests/fixtures/nginx373_hide.inc`) instead of the milestone's exact text —
+  see docs/envoy-converter.md, "Round-2 review edge cases (PR #692)" for the
+  full citations and the stated scope of that substitution. Each is a
+  per-request behavior of an already-admitted, already-converted route, not a
+  configuration-admission gap, so none is gated behind a `RutCapabilities`
+  flag: gating them would make the converter reject every bootstrap
+  indefinitely (the flags could only flip once the runtime gained streaming
+  bodies, 100-continue, a raised header ceiling, HTTP/1.0 upstream support,
+  etc.), which would defeat the milestone #699/#700 verify against real
+  Envoy. They are recorded as `PARTIAL`/`NOT_IMPLEMENTED` matrix rows instead,
+  the same way the nginx matrix records nginx-vs-Rut per-request differences.
+  `TE: trailers` is `PARTIAL` rather than `NOT_IMPLEMENTED`: PR #696
+  (`envoy/rut-request-envoy-h1`, commit `366ad196`) already preserves an
+  exact `TE: trailers` value for a bodyless request once `request_envoy_h1`
+  lands, though a request with a `Content-Length` body still fails closed
+  through the same `inspect_request_policy_body` gate even after #696 (code
+  review of `366ad196` on that branch, not runnable from this branch).

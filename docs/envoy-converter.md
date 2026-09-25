@@ -372,6 +372,13 @@ Each of 1-3 is a plain modeling gap (the bootstrap can be edited to satisfy
 it); each of 4-6 is a Rut-side capability gap tracked as a separate PR (see
 the project plan) and cannot be worked around from the bootstrap.
 
+Not every Envoy-vs-Rut behavioral difference belongs in this list. This gate
+is about configuration semantics: whether the bootstrap can be lowered at all.
+A per-request or per-response shape that a correctly-converted, already-
+admitted route later sees at runtime is a different kind of gap — see
+"Round-2 review edge cases (PR #692)" below and docs/envoy-compatibility.md
+for how those are recorded instead.
+
 ## Envoy semantics the first end-to-end test must preserve
 
 These are the observable behaviors of the milestone configuration that differ
@@ -472,6 +479,127 @@ are recorded from the pinned Envoy build, not assumed.
 - Downstream keep-alive follows the request (`connection: close` is honored;
   HTTP/1.1 default is keep-alive). The `connection` response header is emitted
   only for close.
+
+**Round-2 review edge cases (PR #692)**
+
+Seven per-request/per-response behaviors of the milestone's any-method
+`forward(...)` route, found in the round-2 Codex review of PR #692. These are
+not configuration-admission gaps — the bootstrap that produces this route
+lowers and (once PR3-PR5 land) converts the same way regardless of them — so
+they are not `RutCapabilities` checks and the converter does not gate on them.
+Each is a case where Rut's runtime, when it later sees the specific request or
+response shape at connection time, safely refuses it with a fixed status
+rather than mis-forwarding; docs/envoy-compatibility.md records each as its
+own `PARTIAL`/`NOT_IMPLEMENTED` matrix row, the same way the nginx matrix
+records nginx-vs-Rut per-request differences.
+
+Each is verified from Envoy v1.39.1 source and from a live `rut` process
+built from this tree (`envoy/lower-increment-2`). That branch predates the
+request/response/local-reply serializers (#696/#698/#699), so the milestone's
+own emitted policy vocabulary (`host: "preserve"`, `header_names:
+"lowercase"`, `forwarded_proto`, ...) does not compile there yet; the live
+checks instead used the nearest existing nginx-era policy shape
+(`tests/fixtures/nginx373_hide.inc`'s `request_policy`/`response_policy`/
+`failure_policy` grammar — `host: "upstream"`, no header-casing or dynamic
+`Connection`-nomination fields) against a minimal test `.rut` and a scripted
+Python origin. This is a stated limitation: none of the mechanisms below read
+a policy-specific field like `host` or header casing, so the observed
+behavior is the same runtime code path the milestone shape would hit, but it
+is not a byte-for-byte run of the milestone's own emitted text.
+
+1. **Fixed-length request body larger than the request slice.** Envoy has no
+   body-size cap tied to a single buffer; `Cluster.per_connection_buffer_limit_bytes`
+   defaults to a 1 MiB soft watermark, not a hard reject
+   (`api/envoy/config/cluster/v3/cluster.proto`), so an ordinary 20 KB POST
+   streams through. Rut's `inspect_request_policy_body` requires
+   `req.content_length <= conn.recv_buf.capacity() - parser.header_end`
+   (`include/rut/runtime/callbacks_impl.h:5461-5463`), and `recv_buf`'s
+   capacity is `SlicePool::kSliceSize` = 16384 bytes
+   (`include/rut/runtime/io_backend.h:50`). Live: a `POST /` with a 20000-byte
+   fixed-length body (20051 bytes total) got `HTTP/1.1 400 Bad Request` with
+   no upstream connection attempted.
+2. **`Expect: 100-continue`.** Envoy's `ConnectionManagerImpl::ActiveStream::decodeHeaders`
+   (`source/common/http/conn_manager_impl.cc`) sends the interim response
+   itself (`response_encoder_->encode1xxHeaders(continueHeader())`) and then
+   strips `Expect` before forwarding, so a client that waits for `100
+   Continue` gets it and the request proceeds. Rut's
+   `inspect_request_policy_body` treats `Expect` on a request with a body as
+   `Invalid` (`include/rut/runtime/callbacks_impl.h:5451,5460`); there is no
+   interim-response surface at all. Live: `POST /` with `Content-Length: 2`
+   and `Expect: 100-continue` got `HTTP/1.1 400 Bad Request` with no upstream
+   connection attempted.
+3. **`TE: trailers`** (`PARTIAL`, not `NOT_IMPLEMENTED` — see below). Envoy's
+   `ConnectionManagerUtility::sanitizeTEHeader`
+   (`source/common/http/conn_manager_utility.cc`) keeps the request's `TE`
+   header set to exactly `trailers` when that value is present and removes
+   `TE` entirely otherwise; it is the one hop-by-hop header not stripped
+   unconditionally. On this branch, Rut's `request_policy.strip_headers` fixed
+   list removes every `TE` field regardless of value (this doc, "Corrections
+   found while implementing lowering", item 2), and
+   `inspect_request_policy_body` additionally treats `TE` on a
+   content-length request as `Invalid`
+   (`include/rut/runtime/callbacks_impl.h:5450,5460`). Live: `POST /` with
+   `Content-Length: 2` and `TE: trailers` got `HTTP/1.1 400 Bad Request` with
+   no upstream connection attempted; a bodyless `GET /` with `TE: trailers`
+   was forwarded with the `TE` header silently dropped (the origin received
+   `GET / HTTP/1.1\r\nHost: 127.0.0.1:9100\r\n\r\n`, no `TE` field at all) —
+   a mis-forward for that case, not a fail-closed refusal. PR #696
+   (`envoy/rut-request-envoy-h1`, commit `366ad196`,
+   `apply_preserve_host_lowercase_request_policy`) adds exact-value
+   `TE: trailers` preservation once the `request_envoy_h1` capability lands,
+   fixing the bodyless mis-forward; that function still calls the same
+   `inspect_request_policy_body` gate first, though, so a request with a body
+   still fails closed 400 even after #696 (verified by reading `366ad196` on
+   that branch; not runnable from `envoy/lower-increment-2`).
+4. **Extension/unrecognized HTTP methods.** Envoy's default HTTP/1 parser
+   (`BalsaParser`, used unless `Http1ProtocolOptions.allow_custom_methods` and
+   the BalsaParser feature are both on) matches the request method against a
+   34-entry hard-coded list that includes WebDAV methods such as `PROPFIND`
+   (`source/common/http/http1/balsa_parser.cc`, `kValidMethods`), so `PROPFIND
+   / HTTP/1.1` is accepted and reaches the catch-all prefix route. Rut's
+   `HttpMethod` enum recognizes exactly nine methods (GET, POST, PUT, DELETE,
+   PATCH, HEAD, OPTIONS, CONNECT, TRACE); `parse_method_direct` returns
+   `HttpMethod::Unknown` for anything else
+   (`src/runtime/http_parser.cc:101-159`), and once the full request head has
+   arrived the top-level parser resolves an unknown method to
+   `ParseStatus::Error` (`src/runtime/http_parser.cc:360,493-501`) — the
+   request is rejected as malformed before any route lookup runs, so no
+   any-method route can observe it. Live: `PROPFIND / HTTP/1.1` got
+   `HTTP/1.1 400 Bad Request`.
+5. **More than 64 response headers.** Envoy's default header-count ceiling is
+   100, applied per direction (`HttpProtocolOptions.max_headers_count`,
+   `api/envoy/config/core/v3/protocol.proto`: "If unconfigured, the default
+   maximum number of headers allowed is 100"), so a 65-100-header response is
+   accepted and forwarded. Rut's `kMaxHeaders` is a fixed 64
+   (`include/rut/runtime/http_parser.h:46`); the response parser itself
+   tolerates more by setting `headers_truncated = true`
+   (`src/runtime/http_parser.cc:694-708`), but
+   `build_strict_response_headers` then rejects any response with
+   `resp.headers_truncated` (`include/rut/runtime/callbacks_impl.h:10169`),
+   which trips the route's configured failure response. Live: an origin
+   returning 90 headers plus `Content-Length: 5` got the client
+   `HTTP/1.1 502 Bad Gateway`.
+6. **HTTP/1.0 upstream response.** Envoy's `accept_http_10` `Http1Settings`
+   flag gates HTTP/1.0 only on the downstream-facing server codec
+   (`ServerConnectionImpl::supportsHttp10()`,
+   `source/common/http/http1/codec_impl.h`); the client codec used for
+   upstream connections has no such gate, and `BalsaParser`'s version check
+   accepts any `HTTP/<digit>.<digit>` line, so a valid HTTP/1.0 response with
+   `Content-Length` is parsed and proxied. Rut's `build_strict_response_headers`
+   requires `resp.version == HttpVersion::Http11`
+   (`include/rut/runtime/callbacks_impl.h:10164`). Live: an origin answering
+   `HTTP/1.0 200 OK` with `Content-Length: 5` got the client `HTTP/1.1 502 Bad
+   Gateway`.
+7. **Empty reason phrase.** RFC 7230 §3.1.2 defines `reason-phrase` as `*(
+   HTAB / SP / VCHAR / obs-text )`, explicitly allowing zero length,  and
+   Envoy's `BalsaParser` does not reject an empty reason phrase on the
+   response status line (`source/common/http/http1/balsa_parser.cc`,
+   `OnResponseFirstLineInput`), so `HTTP/1.1 200 ` with a trailing space and
+   no text is accepted and forwarded. Rut's `build_strict_response_headers`
+   rejects `resp.reason.len == 0`
+   (`include/rut/runtime/callbacks_impl.h:10170`). Live: an origin answering
+   `HTTP/1.1 200 \r\nContent-Length: 0\r\n\r\n` got the client `HTTP/1.1 502
+   Bad Gateway`.
 
 ## Test layers
 
@@ -617,6 +745,17 @@ Each needs its own issue before the corresponding row can leave
   IPv6.
 - HCM `access_log` with Envoy format strings: Rut has a single fixed access
   log line.
+
+Per-request/per-response behaviors of an already-converted route (fixed-length
+request bodies larger than the 16 KiB request slice, `Expect: 100-continue`,
+`TE: trailers`, extension/unrecognized HTTP methods, upstream responses with
+more than 64 headers, HTTP/1.0 upstream responses, and upstream responses with
+an empty reason phrase) are a different kind of gap from everything above: the
+bootstrap still lowers and converts the same way regardless of them, so they
+are not `RutCapabilities` dependencies and are not listed here. See "Round-2
+review edge cases (PR #692)" below and docs/envoy-compatibility.md for the
+Envoy source citations, the exact Rut code paths, and the observed live bytes
+for each.
 
 ## Semantic risks to check early
 

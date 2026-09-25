@@ -21,6 +21,14 @@ namespace {
 
 const char* g_executable = nullptr;
 
+// All three `RutCapabilities` flags set true (include/rut/envoy/converter.h),
+// so golden/happy-path tests exercise the full lowering without tripping any
+// BLOCKED_BY_RUT check.
+envoy::RutCapabilities all_capabilities_true() {
+    return envoy::RutCapabilities{
+        .request_envoy_h1 = true, .response_envoy_h1 = true, .local_reply_envoy_h1 = true};
+}
+
 Str str(const std::string& s) {
     return Str{s.data(), static_cast<u32>(s.size())};
 }
@@ -433,7 +441,7 @@ TEST(envoy_convert, api_all_capabilities_matches_golden) {
     auto parsed = envoy::parse_bootstrap_json(str(text), doc);
     REQUIRE(parsed);
 
-    const envoy::RutCapabilities all_true{true, true, true};
+    const envoy::RutCapabilities all_true = all_capabilities_true();
     auto lowered = envoy::lower_to_rut(parsed.value(), all_true);
     REQUIRE(lowered);
     const Str golden = lit_str(kEnvoyMilestoneSGolden);
@@ -461,7 +469,7 @@ TEST(envoy_convert, api_exact_listener_address) {
     static envoy::JsonDocument doc;
     auto parsed = envoy::parse_bootstrap_json(str(text), doc);
     REQUIRE(parsed);
-    const envoy::RutCapabilities all_true{true, true, true};
+    const envoy::RutCapabilities all_true = all_capabilities_true();
     auto lowered = envoy::lower_to_rut(parsed.value(), all_true);
     REQUIRE(lowered);
     const std::string out = to_string(lowered.value().view());
@@ -473,7 +481,7 @@ TEST(envoy_convert, api_forged_model_rejected) {
     static envoy::JsonDocument doc;
     auto parsed = envoy::parse_bootstrap_json(str(text), doc);
     REQUIRE(parsed);
-    const envoy::RutCapabilities all_true{true, true, true};
+    const envoy::RutCapabilities all_true = all_capabilities_true();
 
     envoy::Bootstrap listener_port_zero = parsed.value();
     listener_port_zero.listener.address.port = 0;
