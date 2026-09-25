@@ -82,6 +82,9 @@ _Static_assert(RUT_GATE_PBUF_REG_RESERVED_OFFSET + RUT_GATE_PBUF_REG_RESERVED_SI
 /* Runtime's dedicated ring for bounded one-shot upstream recvs (io_backend.h). */
 #define RUT_GATE_LARGE_BUFFER_COUNT 1024U
 #define RUT_GATE_LARGE_BUFFER_GROUP 1U
+/* Runtime's bulk ring for one-shot recvs into bulk relay buffers (io_backend.h). */
+#define RUT_GATE_BULK_BUFFER_COUNT 64U
+#define RUT_GATE_BULK_BUFFER_GROUP 2U
 #define RUT_GATE_RECV_EVENT 1U
 #define RUT_GATE_SEND_EVENT 2U
 #define RUT_GATE_UPSTREAM_CONNECT_EVENT 3U
@@ -113,6 +116,7 @@ struct ring_view {
     int setup_valid;
     int pbuf_registered;
     int large_pbuf_registered;
+    int bulk_pbuf_registered;
 };
 
 static struct rut_iouring_gate* gate;
@@ -1173,6 +1177,22 @@ __attribute__((visibility("hidden"))) long rut_gate_io_uring_syscall(long number
             const long result = rut_gate_kernel_syscall(number, arg1, arg2, arg3, arg4, 0, 0);
             lock_identity();
             if (result >= 0) ring_view.large_pbuf_registered = 1;
+            unlock_identity();
+            return libc_result(result);
+        }
+        /* After the dedicated ring, accept exactly one registration of the
+         * runtime's bulk ring, under the same identity rules. */
+        lock_identity();
+        const int bulk_request =
+            !failed_locked() && ring_view.pbuf_registered && ring_view.large_pbuf_registered &&
+            !ring_view.bulk_pbuf_registered && registration->bgid == RUT_GATE_BULK_BUFFER_GROUP &&
+            registration->ring_entries == RUT_GATE_BULK_BUFFER_COUNT && registration->flags == 0 &&
+            registration->ring_addr != 0 && pbuf_registration_reserved_bytes_zero(registration);
+        unlock_identity();
+        if (bulk_request) {
+            const long result = rut_gate_kernel_syscall(number, arg1, arg2, arg3, arg4, 0, 0);
+            lock_identity();
+            if (result >= 0) ring_view.bulk_pbuf_registered = 1;
             unlock_identity();
             return libc_result(result);
         }
