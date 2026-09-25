@@ -1610,12 +1610,28 @@ struct RutInstance {
             pid = -1;
             return false;
         }
-        kill(pid, SIGTERM);
+        // Round-9 review, "Require SIGTERM delivery before accepting a clean
+        // RUT exit": record whether the signal actually reached a still-
+        // extant process. kill() fails with ESRCH once `pid` has already
+        // been reaped out from under this call (nothing but this function
+        // ever reaps it, but the precheck above cannot rule out every gap,
+        // e.g. if some future caller reaps it independently); a reaped
+        // exit-0-shaped status that this call never actually delivered a
+        // signal for must not be trusted as an intentional teardown,
+        // mirroring EnvoyInstance::stop()'s `term_sent`.
+        const bool term_sent = kill(pid, SIGTERM) == 0;
         const int64_t deadline = now_ms() + 5000;
         bool escalated = false;
         for (;;) {
             const pid_t waited = waitpid(pid, &status, WNOHANG);
             if (waited == pid) break;
+            if (waited < 0 && errno != EINTR) {
+                // No such child left to wait for (consistent with
+                // `term_sent` already being false above): nothing will ever
+                // come back from waitpid() for this pid, so stop spinning
+                // instead of waiting out the full deadline.
+                break;
+            }
             if (now_ms() >= deadline) {
                 kill(pid, SIGKILL);
                 escalated = true;
@@ -1641,10 +1657,11 @@ struct RutInstance {
         // `sigwait`/`sigtimedwait` loop), so a SIGTERM that sufficed must
         // produce a plain exit 0; a SIGTERM that did not (this call
         // escalated to SIGKILL) must produce death by exactly that signal.
-        // Anything else -- a crash signal, a nonzero exit, or escaping
-        // SIGKILL -- is unexpected, however it was reaped.
+        // Anything else -- a crash signal, a nonzero exit, escaping SIGKILL,
+        // or a plain exit 0 this call never actually signaled (`term_sent`
+        // false) -- is unexpected, however it was reaped.
         const bool clean = escalated ? (WIFSIGNALED(status) && WTERMSIG(status) == SIGKILL)
-                                     : (WIFEXITED(status) && WEXITSTATUS(status) == 0);
+                                     : (term_sent && WIFEXITED(status) && WEXITSTATUS(status) == 0);
         if (!clean) {
             exited_unexpectedly = true;
             unexpected_exit_description = describe_wait_status(status);
@@ -2068,6 +2085,15 @@ struct CaseResult {
     // single trustworthy recording (round-3 review, "Reject partial
     // exchanges before writing the oracle transcript").
     int upstream_contact_count = 0;
+    // Set by fill_upstream_bytes() when this case's own upstream evidence is
+    // unreliable (a duplicate contact for its path, or unexpected traffic
+    // elsewhere while this case's own expected path saw none) but the case
+    // is record-only, so the CLI contract ("record-only cases never affect
+    // the exit code") keeps the anomaly from being fatal (round-9 review,
+    // "Keep record-only upstream duplicates/misroutes out of acceptance").
+    // write_pair_transcript() flags it with a NOTE instead of presenting the
+    // bytes as trustworthy evidence.
+    bool upstream_ambiguous = false;
     std::string upstream_bytes;  // first observed request, if any
     std::string downstream_bytes;
 };
@@ -2136,15 +2162,14 @@ std::vector<CaseResult> run_case_batch(uint16_t listen_port, const std::vector<C
 // Fills in `upstream_contacted`/`upstream_contact_count`/`upstream_bytes` on
 // each result in `results` from what `upstream` actually recorded for that
 // case's path, matching cases by name against `cases` to find each one's
-// `upstream_path`. Returns false if any case's path recorded more than one
-// request: a retried, replayed or otherwise duplicated upstream request
-// (which could repeat a side effect in production, e.g. the fixed-length
-// POST) must fail the harness immediately rather than be silently reduced
-// to the first observation. `upstream_contact_count` is always recorded
-// (even on the failing path) so the same at-most-once-contact rule
-// `validate_results`/`validate_pair_results` enforce again at transcript-
-// write time (round-3 review) still catches a duplicate that reaches a
-// transcript writer some other way.
+// `upstream_path`. A case's path recording more than one request -- a
+// retried, replayed or otherwise duplicated upstream request (which could
+// repeat a side effect in production, e.g. the fixed-length POST) -- is
+// ambiguous evidence for THAT case; `upstream_contact_count` is always
+// recorded (even for an ambiguous case) so the same at-most-once-contact
+// rule `validate_results`/`validate_pair_results` enforce again at
+// transcript-write time (round-3 review) still catches a duplicate that
+// reaches a transcript writer some other way.
 //
 // The per-case lookups above only ever query the expected `upstream_path`
 // for each case in `cases`, so a request that lands on any other path --
@@ -2152,8 +2177,20 @@ std::vector<CaseResult> run_case_batch(uint16_t listen_port, const std::vector<C
 // to reach the upstream at all -- would never be queried and every
 // asserted comparison above could still pass (round-4 review). Guard
 // against that separately: every path `upstream` has ever recorded a
-// request for must be one of `cases`' own expected `upstream_path`s,
-// otherwise fail the harness with the offending path and count.
+// request for must be one of `cases`' own expected `upstream_path`s. Such
+// traffic cannot be traced back to a specific request, but it can only have
+// come from one of THIS batch's own cases, so it is attributed to whichever
+// case(s) never saw their own expected contact here -- the most likely
+// source of a request that landed somewhere else instead.
+//
+// Either anomaly (a per-case duplicate, or unattributed traffic explained by
+// an asserted case's missing contact) is only made fatal (returns false) for
+// an asserted case: the CLI contract promises record-only cases never affect
+// the exit code (round-9 review, "Keep record-only upstream duplicates/
+// misroutes out of acceptance"), so a record-only case's anomaly instead
+// just sets `upstream_ambiguous` and lets the caller keep going --
+// write_pair_transcript()'s NOTE handling surfaces it without gating
+// acceptance.
 bool fill_upstream_bytes(std::vector<CaseResult>* results,
                          const std::vector<CaseSpec>& cases,
                          RecordingUpstream& upstream) {
@@ -2166,10 +2203,15 @@ bool fill_upstream_bytes(std::vector<CaseResult>* results,
         r.upstream_contact_count = static_cast<int>(observed.size());
         if (observed.empty()) continue;
         if (observed.size() > 1) {
-            std::cerr << "FAIL: upstream recorded " << observed.size() << " requests for case "
-                      << r.name << " (path \"" << it->upstream_path
+            const bool asserted = is_asserted_case(r.name);
+            std::cerr << (asserted ? "FAIL: " : "NOTE: ") << "upstream recorded " << observed.size()
+                      << " requests for case " << r.name << " (path \"" << it->upstream_path
                       << "\"), expected exactly one\n";
-            ok = false;
+            if (asserted) {
+                ok = false;
+            } else {
+                r.upstream_ambiguous = true;
+            }
             continue;
         }
         r.upstream_contacted = true;
@@ -2178,11 +2220,22 @@ bool fill_upstream_bytes(std::vector<CaseResult>* results,
     for (const auto& [path, reqs] : upstream.all_requests()) {
         const bool expected = std::any_of(
             cases.begin(), cases.end(), [&](const CaseSpec& s) { return s.upstream_path == path; });
-        if (!expected) {
-            std::cerr << "FAIL: upstream recorded " << reqs.size() << " request(s) for path \""
-                      << path << "\", which is not any case's expected upstream_path\n";
-            ok = false;
+        if (expected) continue;
+        bool attributed_to_asserted = false;
+        for (auto& r : *results) {
+            const auto it = std::find_if(
+                cases.begin(), cases.end(), [&](const CaseSpec& s) { return r.name == s.name; });
+            if (it == cases.end() || r.upstream_contact_count != 0) continue;
+            if (is_asserted_case(r.name)) {
+                attributed_to_asserted = true;
+            } else {
+                r.upstream_ambiguous = true;
+            }
         }
+        std::cerr << (attributed_to_asserted ? "FAIL: " : "NOTE: ") << "upstream recorded "
+                  << reqs.size() << " request(s) for path \"" << path
+                  << "\", which is not any case's expected upstream_path\n";
+        if (attributed_to_asserted) ok = false;
     }
     return ok;
 }
@@ -2458,6 +2511,20 @@ bool write_pair_transcript(const std::string& path, const std::vector<PairCaseRe
             if (r.rut.upstream_contact_count > 1)
                 out << "// NOTE: " << r.name << " (rut): upstream was contacted "
                     << r.rut.upstream_contact_count << " times (ambiguous evidence)\n";
+            // Set by fill_upstream_bytes() when this case's own path saw zero
+            // contacts but unexplained traffic landed on some other path in
+            // the same batch (round-9 review): the case's own bytes below
+            // are trustworthy (there is nothing to report for them), but the
+            // case is flagged ambiguous because it is the likely source of
+            // that stray request.
+            if (r.envoy.upstream_ambiguous)
+                out << "// NOTE: " << r.name
+                    << " (envoy): upstream recorded unattributed traffic on another path "
+                       "while this case's own path saw none (ambiguous evidence)\n";
+            if (r.rut.upstream_ambiguous)
+                out << "// NOTE: " << r.name
+                    << " (rut): upstream recorded unattributed traffic on another path while "
+                       "this case's own path saw none (ambiguous evidence)\n";
         }
         out << "static constexpr char kEnvoyVsRut_" << r.name << "_client[] =\n    "
             << wrap_wire_literal(r.envoy.client_bytes) << ";\n";
@@ -2709,6 +2776,32 @@ bool read_response_head(int fd, int timeout_ms, std::string* out) {
     }
 }
 
+// Round-9 review, "Do not accept a RUT-like response as proof of
+// ownership": rut_probe_confirms_ownership()'s HTTP-level probe alone cannot
+// tell a genuine `rut` process apart from ANOTHER generated-rut process that
+// happens to win the same probe-allocated port -- every generated rut
+// config answers `kReadinessProbeRequest` with the exact same 404 +
+// `server: envoy` bytes, so a foreign one still between its own failed
+// bind() and exit can be mistaken for confirmed ownership. Close the gap
+// with process-side evidence, the same way PR #694 closed it for Envoy
+// (`log_indicates_address_in_use()`/its RUT counterpart just above): require
+// rut's own captured stdout/stderr to show it actually completed its
+// post-bind startup for THIS port (src/main.cc's `write_str("Listening on
+// port "); write_u32(port); write_str(" with ");` line -- confirmed exact
+// text) and never logged the bind-failure text
+// `rut_log_indicates_address_in_use()` matches. A pure function taking the
+// log's contents (not a path) so it can be exercised directly with literal
+// strings, independent of any real file or process.
+bool rut_log_confirms_listener(const std::string& log_contents, uint16_t port) {
+    if (log_contents.find("Failed to create listen socket") != std::string::npos &&
+        log_contents.find(std::string("errno=") + std::to_string(EADDRINUSE)) !=
+            std::string::npos) {
+        return false;
+    }
+    return log_contents.find(std::string("Listening on port ") + std::to_string(port) + " with") !=
+           std::string::npos;
+}
+
 // wait_ready()/tcp_port_open() only prove that *some* process is now
 // accepting connections on `port` -- the same limitation
 // wait_ready_and_confirm_ownership() (EnvoyInstance overload, above) exists
@@ -2723,12 +2816,18 @@ bool read_response_head(int fd, int timeout_ms, std::string* out) {
 // arbitrary foreign listener, answers `kReadinessProbeRequest` with a
 // specific 404 (`server: envoy`) and never forwards it anywhere, so a
 // correct answer can only come from the generated rut config itself
-// (round-8 review, "Verify RUT owns the port before declaring readiness").
-// Retries the whole connect+probe+alive-check cycle -- rechecking the
-// tracked child is still alive on every iteration, not just once -- until
-// either it succeeds or `deadline_ms` (wall clock) runs out: rut can accept
-// a TCP connection slightly before its own request-handling loop is ready
-// to answer one.
+// (round-8 review, "Verify RUT owns the port before declaring readiness") --
+// AND, since another generated rut process can answer identically (round-9
+// review above), confirms `rut.log_path` shows the tracked child itself
+// completed startup on this exact port via rut_log_confirms_listener(). A
+// probe reply that matches but whose log does not (yet) confirm ownership
+// falls through and retries, rather than being trusted alone: the log may
+// simply not have flushed yet, or it may belong to a different, still-dying
+// foreign process. Retries the whole connect+probe+alive-check cycle --
+// rechecking the tracked child is still alive on every iteration, not just
+// once -- until either it succeeds or `deadline_ms` (wall clock) runs out:
+// rut can accept a TCP connection slightly before its own request-handling
+// loop is ready to answer one.
 bool rut_probe_confirms_ownership(uint16_t port, RutInstance& rut, int64_t deadline_ms) {
     while (now_ms() < deadline_ms) {
         if (rut.pid > 0) {
@@ -2749,7 +2848,10 @@ bool rut_probe_confirms_ownership(uint16_t port, RutInstance& rut, int64_t deadl
                 close(fd);
                 if (answered && starts_with(head, "HTTP/1.1 404 ") &&
                     header_equals_ci(head, "server", "envoy")) {
-                    return true;
+                    std::ifstream log_in(rut.log_path);
+                    std::stringstream log_ss;
+                    log_ss << log_in.rdbuf();
+                    if (rut_log_confirms_listener(log_ss.str(), port)) return true;
                 }
             }
         }
@@ -4431,10 +4533,89 @@ bool self_test_rut_wait_ready_ownership() {
         fake.stop();
     }
 
+    // Round-9 review, "Do not accept a RUT-like response as proof of
+    // ownership": a foreign listener that answers EXACTLY like a generated
+    // rut config would (404, `server: envoy`) -- e.g. another generated rut
+    // process that won the same probe-allocated port and is still between
+    // its own failed bind() and exit -- must NOT confirm ownership on the
+    // probe reply alone when the tracked child's own log never shows it
+    // completed startup on this port. Distinguishes this case from the
+    // positive case below purely by the log's contents, proving the
+    // rejection comes from rut_log_confirms_listener(), not the probe.
+    {
+        BoundPort foreign;
+        if (!allocate_bound_loopback_port(&foreign)) {
+            std::cerr << "FAIL [self-test rut wait_ready ownership]: could not allocate a "
+                         "loopback port\n";
+            return false;
+        }
+        RecordingUpstream fake;
+        fake.set_default_reply(
+            "HTTP/1.1 404 Not Found\r\ndate: Thu, 24 Sep 2026 18:18:42 GMT\r\nserver: "
+            "envoy\r\ncontent-length: 0\r\n\r\n");
+        if (!fake.adopt(foreign.fd)) {
+            std::cerr << "FAIL [self-test rut wait_ready ownership]: could not start the fake "
+                         "RUT-like listener\n";
+            close(foreign.fd);
+            return false;
+        }
+        const std::string dir = make_temp_dir("rut-selftest-ownership-nolog");
+        if (dir.empty()) {
+            std::cerr << "FAIL [self-test rut wait_ready ownership]: could not create temp "
+                         "directory\n";
+            fake.stop();
+            return false;
+        }
+        const std::string log_path = dir + "/rut.log";
+        // Deliberately never mentions "Listening on port" for this port: the
+        // tracked "rut" child (the dummy fork below) never actually wrote
+        // this log, standing in for a still-starting or foreign process
+        // whose log gives no evidence of owning `foreign.port`.
+        if (!write_file_mode(log_path, "rut: starting up\n", 0644)) {
+            std::cerr << "FAIL [self-test rut wait_ready ownership]: could not write the fake log "
+                         "file\n";
+            fake.stop();
+            return false;
+        }
+        const pid_t child = fork();
+        if (child < 0) {
+            std::cerr << "FAIL [self-test rut wait_ready ownership]: fork failed\n";
+            ok = false;
+        } else if (child == 0) {
+            struct timespec ts{5, 0};
+            nanosleep(&ts, nullptr);
+            _exit(0);
+        } else {
+            RutInstance rut;
+            rut.pid = child;
+            rut.log_path = log_path;
+            std::string error;
+            const bool confirmed =
+                wait_ready_and_confirm_ownership(foreign.port, rut, 2000, 800, &error);
+            if (confirmed) {
+                std::cerr << "FAIL [self-test rut wait_ready ownership]: confirmed ownership of a "
+                             "RUT-like reply with no confirming startup log\n";
+                ok = false;
+            }
+            if (error.empty()) {
+                std::cerr << "FAIL [self-test rut wait_ready ownership]: expected a non-empty "
+                             "error on the no-confirming-log case\n";
+                ok = false;
+            }
+            kill(child, SIGKILL);
+            int status = 0;
+            while (waitpid(child, &status, 0) < 0 && errno == EINTR) {
+            }
+        }
+        fake.stop();
+    }
+
     // Positive case: the foreign listener answers exactly like a generated
-    // rut config would (404, `server: envoy`), so ownership must be
-    // confirmed even though nothing here is a real `rut` process -- proving
-    // the probe checks the RESPONSE, not the process identity.
+    // rut config would (404, `server: envoy`) AND the tracked "rut" child's
+    // log shows it completed startup on this exact port, so ownership must
+    // be confirmed even though nothing here is a real `rut` process --
+    // proving the probe checks the RESPONSE plus the log, not the process
+    // identity.
     {
         BoundPort foreign;
         if (!allocate_bound_loopback_port(&foreign)) {
@@ -4452,6 +4633,27 @@ bool self_test_rut_wait_ready_ownership() {
             close(foreign.fd);
             return false;
         }
+        const std::string dir = make_temp_dir("rut-selftest-ownership-log");
+        if (dir.empty()) {
+            std::cerr << "FAIL [self-test rut wait_ready ownership]: could not create temp "
+                         "directory\n";
+            fake.stop();
+            return false;
+        }
+        const std::string log_path = dir + "/rut.log";
+        // The exact post-bind startup text src/main.cc writes
+        // (write_str("Listening on port "); write_u32(port); write_str("
+        // with "); write_u32(shard_count); write_str(" shard(s)\n");), for
+        // this test's `foreign.port`.
+        if (!write_file_mode(
+                log_path,
+                "Listening on port " + std::to_string(foreign.port) + " with 1 shard(s)\n",
+                0644)) {
+            std::cerr << "FAIL [self-test rut wait_ready ownership]: could not write the fake log "
+                         "file\n";
+            fake.stop();
+            return false;
+        }
         const pid_t child = fork();
         if (child < 0) {
             std::cerr << "FAIL [self-test rut wait_ready ownership]: fork failed\n";
@@ -4463,12 +4665,14 @@ bool self_test_rut_wait_ready_ownership() {
         } else {
             RutInstance rut;
             rut.pid = child;
+            rut.log_path = log_path;
             std::string error;
             const bool confirmed =
                 wait_ready_and_confirm_ownership(foreign.port, rut, 2000, 800, &error);
             if (!confirmed) {
                 std::cerr << "FAIL [self-test rut wait_ready ownership]: did not confirm "
-                             "ownership for a foreign listener answering exactly like rut would: "
+                             "ownership for a foreign listener answering exactly like rut would "
+                             "with a confirming log: "
                           << error << "\n";
                 ok = false;
             }
@@ -4486,6 +4690,34 @@ bool self_test_rut_wait_ready_ownership() {
     }
 
     if (ok) std::cerr << "PASS [self-test rut wait_ready ownership]\n";
+    return ok;
+}
+
+// Round-9 review, "Do not accept a RUT-like response as proof of
+// ownership": exercises rut_log_confirms_listener() directly against three
+// literal log shapes, independent of any real process, socket or file.
+bool self_test_rut_log_confirms_listener() {
+    bool ok = true;
+    const uint16_t port = 54321;
+    if (!rut_log_confirms_listener("Listening on port 54321 with 1 shard(s)\n", port)) {
+        std::cerr << "FAIL [self-test rut log confirms listener]: rejected a log with the exact "
+                     "startup line for this port\n";
+        ok = false;
+    }
+    if (rut_log_confirms_listener("rut: starting up\n", port)) {
+        std::cerr << "FAIL [self-test rut log confirms listener]: accepted a log missing the "
+                     "startup line entirely\n";
+        ok = false;
+    }
+    if (rut_log_confirms_listener(
+            "Failed to create listen socket (errno=" + std::to_string(EADDRINUSE) +
+                ", source=0)\nListening on port 54321 with 1 shard(s)\n",
+            port)) {
+        std::cerr << "FAIL [self-test rut log confirms listener]: accepted a log naming "
+                     "EADDRINUSE even though the startup line was also present\n";
+        ok = false;
+    }
+    if (ok) std::cerr << "PASS [self-test rut log confirms listener]\n";
     return ok;
 }
 
@@ -4542,8 +4774,12 @@ bool self_test_reserved_closed_port() {
 // ── Codex-review regression self-tests (no docker, no `rut` binary) ─────
 
 // Exercises the exact `fill_upstream_bytes` path a retried/replayed
-// upstream request would hit: two requests recorded for one case's path
-// must fail the harness, not silently compare only the first one.
+// upstream request would hit for an ASSERTED case: two requests recorded
+// for one case's path must fail the harness, not silently compare only the
+// first one. Uses "get_smoke" (a real entry in kAssertedCaseNames) so this
+// exercises the asserted-is-fatal branch (round-9 review, "Keep record-only
+// upstream duplicates out of acceptance" -- the record-only counterpart is
+// self_test_duplicate_upstream_record_only_not_fatal() below).
 bool self_test_duplicate_upstream_rejected() {
     BoundPort bound;
     if (!allocate_bound_loopback_port(&bound)) {
@@ -4575,14 +4811,14 @@ bool self_test_duplicate_upstream_rejected() {
         }
         close(fd);
     }
-    const std::vector<CaseSpec> cases = {{"dup_case", "", false, "/dup", reply}};
+    const std::vector<CaseSpec> cases = {{"get_smoke", "", false, "/dup", reply}};
     std::vector<CaseResult> results(1);
-    results[0].name = "dup_case";
+    results[0].name = "get_smoke";
     const bool fill_ok = fill_upstream_bytes(&results, cases, upstream);
     upstream.stop();
     if (fill_ok) {
         std::cerr << "FAIL [self-test duplicate-upstream]: fill_upstream_bytes accepted two "
-                     "recorded requests for one case\n";
+                     "recorded requests for an asserted case\n";
         ok = false;
     }
     if (results[0].upstream_contacted) {
@@ -4594,10 +4830,75 @@ bool self_test_duplicate_upstream_rejected() {
     return ok;
 }
 
+// Round-9 review, "Keep record-only upstream duplicates out of acceptance":
+// the exact same duplicate-contact shape as self_test_duplicate_upstream_
+// rejected() above, but for a record-only case ("get_forged_xfcc", not in
+// kAssertedCaseNames) -- fill_upstream_bytes() must NOT fail the batch for
+// it (the CLI contract promises record-only cases never affect the exit
+// code), but must still flag the case's own evidence as ambiguous rather
+// than silently trusting the first observation.
+bool self_test_duplicate_upstream_record_only_not_fatal() {
+    BoundPort bound;
+    if (!allocate_bound_loopback_port(&bound)) {
+        std::cerr << "FAIL [self-test duplicate-upstream record-only]: could not allocate a "
+                     "loopback port\n";
+        return false;
+    }
+    const uint16_t port = bound.port;
+    RecordingUpstream upstream;
+    const std::string reply = "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nhi";
+    upstream.set_reply("/dup", reply);
+    if (!upstream.adopt(bound.fd)) {
+        std::cerr << "FAIL [self-test duplicate-upstream record-only]: could not start upstream\n";
+        return false;
+    }
+    bool ok = true;
+    {
+        const int fd = connect_with_timeout(port, kClientTimeoutMs);
+        if (fd < 0) {
+            std::cerr << "FAIL [self-test duplicate-upstream record-only]: could not connect\n";
+            upstream.stop();
+            return false;
+        }
+        const std::string req = "GET /dup HTTP/1.1\r\nHost: t.example\r\n\r\n";
+        for (int i = 0; i < 2; i++) {
+            if (!send_all(fd, req) || read_http_message(fd, false, kClientTimeoutMs).bytes != reply)
+                ok = false;
+        }
+        close(fd);
+    }
+    const std::vector<CaseSpec> cases = {{"get_forged_xfcc", "", false, "/dup", reply}};
+    std::vector<CaseResult> results(1);
+    results[0].name = "get_forged_xfcc";
+    const bool fill_ok = fill_upstream_bytes(&results, cases, upstream);
+    upstream.stop();
+    if (!fill_ok) {
+        std::cerr << "FAIL [self-test duplicate-upstream record-only]: fill_upstream_bytes failed "
+                     "the batch for a record-only case's duplicate\n";
+        ok = false;
+    }
+    if (results[0].upstream_contacted) {
+        std::cerr << "FAIL [self-test duplicate-upstream record-only]: upstream_contacted was set "
+                     "true despite the duplicate\n";
+        ok = false;
+    }
+    if (!results[0].upstream_ambiguous) {
+        std::cerr << "FAIL [self-test duplicate-upstream record-only]: upstream_ambiguous was not "
+                     "set for the record-only case's duplicate\n";
+        ok = false;
+    }
+    if (ok) std::cerr << "PASS [self-test duplicate-upstream record-only]\n";
+    return ok;
+}
+
 // Round-4 review: a request landing on a path no case expects (a spurious
-// or misrouted side-effecting request) must fail fill_upstream_bytes, even
-// though every per-case lookup it performs would still pass, because none
-// of them ever query a path outside the case table.
+// or misrouted side-effecting request) must fail fill_upstream_bytes when it
+// leaves an ASSERTED case's own expected path uncontacted, even though every
+// per-case lookup it performs would still pass, because none of them ever
+// query a path outside the case table. Uses "get_smoke" so this exercises
+// the asserted-is-fatal branch (round-9 review, "Exempt record-only
+// misroutes from pair acceptance" -- the record-only counterpart is
+// self_test_unexpected_upstream_path_record_only_not_fatal() below).
 bool self_test_unexpected_upstream_path_rejected() {
     BoundPort bound;
     if (!allocate_bound_loopback_port(&bound)) {
@@ -4630,14 +4931,14 @@ bool self_test_unexpected_upstream_path_rejected() {
             ok = false;
         close(fd);
     }
-    const std::vector<CaseSpec> cases = {{"expected_case", "", false, "/expected", reply}};
+    const std::vector<CaseSpec> cases = {{"get_smoke", "", false, "/expected", reply}};
     std::vector<CaseResult> results(1);
-    results[0].name = "expected_case";
+    results[0].name = "get_smoke";
     const bool fill_ok = fill_upstream_bytes(&results, cases, upstream);
     upstream.stop();
     if (fill_ok) {
         std::cerr << "FAIL [self-test unexpected-upstream-path]: fill_upstream_bytes accepted a "
-                     "request to a path no case expected\n";
+                     "request to a path no case expected, leaving an asserted case uncontacted\n";
         ok = false;
     }
     // The one case that was actually expected must still be reported
@@ -4648,6 +4949,68 @@ bool self_test_unexpected_upstream_path_rejected() {
         ok = false;
     }
     if (ok) std::cerr << "PASS [self-test unexpected-upstream-path]\n";
+    return ok;
+}
+
+// Round-9 review, "Exempt record-only misroutes from pair acceptance": the
+// exact same unlisted-path shape as self_test_unexpected_upstream_path_
+// rejected() above, but the one case in the table is record-only
+// ("get_forged_xfcc") -- fill_upstream_bytes() must NOT fail the batch (the
+// CLI contract promises record-only cases never affect the exit code), but
+// must flag that case as ambiguous, since it is the only plausible source of
+// the stray request.
+bool self_test_unexpected_upstream_path_record_only_not_fatal() {
+    BoundPort bound;
+    if (!allocate_bound_loopback_port(&bound)) {
+        std::cerr << "FAIL [self-test unexpected-upstream-path record-only]: could not allocate a "
+                     "loopback port\n";
+        return false;
+    }
+    const uint16_t port = bound.port;
+    RecordingUpstream upstream;
+    const std::string reply = "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nhi";
+    upstream.set_reply("/expected", reply);
+    upstream.set_default_reply(reply);
+    if (!upstream.adopt(bound.fd)) {
+        std::cerr
+            << "FAIL [self-test unexpected-upstream-path record-only]: could not start upstream\n";
+        return false;
+    }
+    bool ok = true;
+    {
+        const int fd = connect_with_timeout(port, kClientTimeoutMs);
+        if (fd < 0) {
+            std::cerr << "FAIL [self-test unexpected-upstream-path record-only]: could not "
+                         "connect\n";
+            upstream.stop();
+            return false;
+        }
+        const std::string req = "GET /unlisted HTTP/1.1\r\nHost: t.example\r\n\r\n";
+        if (!send_all(fd, req) || read_http_message(fd, false, kClientTimeoutMs).bytes != reply)
+            ok = false;
+        close(fd);
+    }
+    const std::vector<CaseSpec> cases = {{"get_forged_xfcc", "", false, "/expected", reply}};
+    std::vector<CaseResult> results(1);
+    results[0].name = "get_forged_xfcc";
+    const bool fill_ok = fill_upstream_bytes(&results, cases, upstream);
+    upstream.stop();
+    if (!fill_ok) {
+        std::cerr << "FAIL [self-test unexpected-upstream-path record-only]: fill_upstream_bytes "
+                     "failed the batch for a record-only case's misroute\n";
+        ok = false;
+    }
+    if (results[0].upstream_contacted || results[0].upstream_contact_count != 0) {
+        std::cerr << "FAIL [self-test unexpected-upstream-path record-only]: the record-only "
+                     "case's own accounting was disturbed by the unlisted request\n";
+        ok = false;
+    }
+    if (!results[0].upstream_ambiguous) {
+        std::cerr << "FAIL [self-test unexpected-upstream-path record-only]: upstream_ambiguous "
+                     "was not set for the record-only case\n";
+        ok = false;
+    }
+    if (ok) std::cerr << "PASS [self-test unexpected-upstream-path record-only]\n";
     return ok;
 }
 
@@ -4678,6 +5041,47 @@ bool self_test_rut_early_exit_detected() {
         ok = false;
     }
     if (ok) std::cerr << "PASS [self-test rut early exit]\n";
+    return ok;
+}
+
+// Round-9 review, "Require SIGTERM delivery before accepting a clean RUT
+// exit": simulates a child that is entirely gone by the time stop() tries to
+// signal it -- reaping it directly here, standing in for "the child exited
+// on its own and was collected before stop() got a chance to act" -- so
+// stop()'s own kill(pid, SIGTERM) is guaranteed to fail with ESRCH exactly
+// like the TOCTOU race the review describes would. Unlike self_test_rut_
+// early_exit_detected() above (caught by the precheck, before any signal is
+// attempted), this exercises the NEW check after the precheck has already
+// let the call proceed to kill().
+bool self_test_rut_stop_requires_delivered_signal() {
+    RutInstance rut;
+    rut.log_path = "/dev/null";
+    if (!rut.launch("/bin/true", "unused.rut")) {
+        std::cerr << "FAIL [self-test rut stop requires signal]: could not fork/exec /bin/true\n";
+        return false;
+    }
+    // Reap the child ourselves: once reaped, `pid` no longer names any
+    // process, so the precheck inside stop() (which calls waitpid() again)
+    // finds nothing (`ECHILD`, not `pid`) and falls through to kill(), which
+    // is then guaranteed to fail with ESRCH.
+    int status = 0;
+    const pid_t reaped = waitpid(rut.pid, &status, 0);
+    if (reaped != rut.pid) {
+        std::cerr << "FAIL [self-test rut stop requires signal]: could not reap /bin/true\n";
+        return false;
+    }
+    const bool stopped_cleanly = rut.stop();
+    bool ok = true;
+    if (stopped_cleanly) {
+        std::cerr << "FAIL [self-test rut stop requires signal]: stop() reported a clean "
+                     "teardown despite never being able to deliver SIGTERM\n";
+        ok = false;
+    }
+    if (!rut.exited_unexpectedly) {
+        std::cerr << "FAIL [self-test rut stop requires signal]: exited_unexpectedly was not set\n";
+        ok = false;
+    }
+    if (ok) std::cerr << "PASS [self-test rut stop requires signal]\n";
     return ok;
 }
 
@@ -5771,10 +6175,14 @@ int run_self_test(const std::string& rut_binary, const std::string& converter_bi
     ok &= self_test_temp_dir_cleanup();
     ok &= self_test_envoy_instance_skips_docker_when_unlaunched();
     ok &= self_test_rut_wait_ready_ownership();
+    ok &= self_test_rut_log_confirms_listener();
     ok &= self_test_reserved_closed_port();
     ok &= self_test_duplicate_upstream_rejected();
+    ok &= self_test_duplicate_upstream_record_only_not_fatal();
     ok &= self_test_unexpected_upstream_path_rejected();
+    ok &= self_test_unexpected_upstream_path_record_only_not_fatal();
     ok &= self_test_rut_early_exit_detected();
+    ok &= self_test_rut_stop_requires_delivered_signal();
     ok &= self_test_rut_stop_verifies_exit_status();
     ok &= self_test_pair_both_failed_rejected();
     ok &= self_test_pair_unexercised_forwarding_rejected();
