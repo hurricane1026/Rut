@@ -337,16 +337,50 @@ converter fails closed on the whole configuration until then.
   ordered route list of any size up to `kMaxEnvoyRoutes` and multiple
   clusters, lowering them by construction (owner decision D3) instead of
   rejecting the shape; `direct_response` and `redirect` are still rejected.
-  Five goldens (`tests/fixtures/envoy_routes_<letter>.inc`, all capabilities
-  `true`) pin declaration-order variants byte for byte, and a brute-force
-  test compares Envoy's real first-match semantics against an independent
-  reimplementation of the "longest node, then arm chain" structure over ~40
-  probe paths. The lex/parse/analyze/MIR/RIR round-trip these goldens will
-  eventually need is deferred to PR3-PR5 (see the TODO in
-  `tests/test_envoy_convert.cc`): today's parser does not yet accept the
-  `local_response` fields the goldens use, and the single-route milestone-S
-  golden already fails the same way, so this is not a PR8 regression. No
-  differential evidence exists yet.
+  Only three fixture files exist, `tests/fixtures/envoy_routes_{a,b,c}.inc`
+  (all capabilities `true`), and only (b) and (c) are still byte-exact
+  goldens pinning `lower_to_rut`'s output against them
+  (`golden_routes_b_root_then_prefix`: catch-all `/` declared before prefix
+  `/api/`; `golden_routes_c_exact_then_root`: exact `/healthz` declared
+  before catch-all `/`). Four in-bounds shapes fail closed instead of
+  lowering, each covered by a failure test rather than a golden: (1)
+  scenario (a) — prefix `/api/` declared BEFORE the catch-all `/` — lowers to
+  a byte-valid program under `RutSource::kCapacity` (128 KiB) that still
+  exceeds the compiler frontend's own lexer token budget
+  (`LexedTokens::kMaxTokens`, 932 tokens; `envoy_routes_a.inc`'s 8804-byte
+  text hits `TooManyTokens` at byte 8400), so `golden_routes_a_prefix_then_root`
+  now asserts that rejection instead of pinning the old output — the fixture
+  is kept only as the pinned evidence for that measurement, and
+  `token_budget_goldens_match_the_real_lexer` checks the converter's
+  conservative token-count estimate (`estimate_conservative_token_count` in
+  `src/envoy/converter.cc`) against the real lexer for all three fixtures.
+  (2) A lone `prefix: "/api/"` with no catch-all declared leaves the literal
+  path `/api` itself with no Envoy route, and `route exact` cannot stand in
+  for that 404 (its strict local-response admission does not serve every
+  method — TRACE/CONNECT close the connection instead of responding), so
+  `build_node_plan` fails closed as `BLOCKED_BY_RUT`
+  (`blocked_on_node_own_literal_needs_all_method_fallback`, formerly golden
+  (d)). (3) The same shape with an exact route declared under the prefix
+  (permanently shadowed and dropped from the output) fails closed the same
+  way (`blocked_on_shadowed_exact_needs_all_method_fallback`, formerly
+  golden (e)). (4) A root with only exact routes (e.g. `/healthz`) and no
+  catch-all has the same no-RUT-form-for-a-404 problem at the root's own
+  fallthrough — the 404 no-route case —
+  (`blocked_root_exact_arms_without_catch_all`). Two further scenarios ARE
+  still lowered but without a byte-exact fixture backing them: an exact
+  route declared before its own prefix for the same literal
+  (`golden_routes_f_exact_then_own_prefix_not_blocked`, checked by
+  substring match on the emitted text, not a byte-exact golden) and a root
+  with no arms at all, which simply omits `route "/"` and falls through to
+  the `unmatched` policy (`root_omitted_without_catch_all_or_exact_arms`). A
+  brute-force test separately compares Envoy's real first-match semantics
+  against an independent reimplementation of the "longest node, then arm
+  chain" structure over ~40 probe paths. The lex/parse/analyze/MIR/RIR
+  round-trip these goldens will eventually need is deferred to PR3-PR5 (see
+  the TODO in `tests/test_envoy_convert.cc`): today's parser does not yet
+  accept the `local_response` fields the goldens use, and the single-route
+  milestone-S golden already fails the same way, so this is not a PR8
+  regression. No differential evidence exists yet.
 - PR 8 review fixes (Codex on PR #695): (1) a node's own literal path with no
   earlier exact arm covering it now fails closed instead of emitting a
   `route exact "N"` 404 whose strict local-response admission cannot serve
