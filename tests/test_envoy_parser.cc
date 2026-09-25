@@ -926,12 +926,6 @@ TEST(envoy_parser, rejects_missing_required_containers_with_parent_span) {
     text = "{\"static_resources\": []}";
     expect_reject(text, FrontendError::UnexpectedToken, "static_resources must be an object");
 
-    // A cluster list that is empty is a missing cluster, not an unsupported
-    // shape, so the detail names the requirement.
-    text = b.render();
-    REQUIRE(replace(&text, b.clusters, "[]"));
-    expect_reject(text, FrontendError::UnexpectedEof, "at least one cluster");
-
     // Syntax errors surface as JSON diagnostics before any model check.
     text = b.render();
     REQUIRE(replace(&text, "\"port_value\": 8080}", "\"port_value\": 8080,}"));
@@ -1251,6 +1245,38 @@ TEST(envoy_parser, clusters_list_is_bounded_ordered_and_unique) {
     }
 }
 
+TEST(envoy_parser, clusters_may_be_empty_or_omitted) {
+    // A route table where every route is direct_response/redirect needs no
+    // upstream cluster (docs/envoy-compatibility.md, "Allow local-only route
+    // tables to omit clusters"); the parser admits an empty or omitted
+    // `clusters` array and leaves "a Forward route needs a declared cluster"
+    // to the converter (src/envoy/converter.cc).
+    {
+        Bootstrap b;
+        REQUIRE(replace(&b.listeners,
+                        "\"route\": {\"cluster\": \"backend\"}",
+                        "\"direct_response\": {\"status\": 200}"));
+        b.clusters = "[]";
+        static envoy::JsonDocument doc;
+        const std::string source_text = b.render();
+        auto result = envoy::parse_bootstrap_json(str(source_text), doc);
+        REQUIRE(result);
+        CHECK_EQ(result.value().clusters.len, 0u);
+    }
+    {
+        Bootstrap b;
+        REQUIRE(replace(&b.listeners,
+                        "\"route\": {\"cluster\": \"backend\"}",
+                        "\"direct_response\": {\"status\": 200}"));
+        std::string text = b.render();
+        REQUIRE(replace(&text, ",\n\"clusters\": " + b.clusters + "\n", "\n"));
+        static envoy::JsonDocument doc;
+        auto result = envoy::parse_bootstrap_json(str(text), doc);
+        REQUIRE(result);
+        CHECK_EQ(result.value().clusters.len, 0u);
+    }
+}
+
 TEST(envoy_parser, route_action_models_direct_response) {
     {
         Bootstrap b;
@@ -1348,14 +1374,28 @@ TEST(envoy_parser, route_action_models_redirect) {
         CHECK_EQ(action.redirect.response_code, 308u);
     }
     {
-        // response_code is required and closed to the five Envoy names.
+        // response_code is optional: proto3 JSON omits a field left at its
+        // enum's zero value, and RedirectResponseCode's zero value is
+        // MOVED_PERMANENTLY (301, envoy.config.route.v3.RedirectAction). An
+        // omitted response_code must default to 301, not be rejected.
         Bootstrap b;
         REQUIRE(replace(&b.listeners,
                         "\"route\": {\"cluster\": \"backend\"}",
                         "\"redirect\": {\"path_redirect\": \"/new\"}"));
-        expect_reject(b.render(), FrontendError::UnexpectedEof, "response_code is required");
+        static envoy::JsonDocument doc;
+        // The model borrows the JSON bytes, so the source must outlive the result.
+        const std::string source_text = b.render();
+        auto result = envoy::parse_bootstrap_json(str(source_text), doc);
+        REQUIRE(result);
+        const envoy::RouteAction& action =
+            result.value().listener.filter_chain.hcm.route_config.virtual_host.routes[0].action;
+        REQUIRE(action.kind == envoy::RouteActionKind::Redirect);
+        CHECK(action.redirect.path_redirect.eq(lit_str("/new")));
+        CHECK_EQ(action.redirect.response_code, 301u);
     }
     {
+        // response_code, when present, is still closed to the five Envoy
+        // names.
         Bootstrap b;
         REQUIRE(replace(&b.listeners,
                         "\"route\": {\"cluster\": \"backend\"}",

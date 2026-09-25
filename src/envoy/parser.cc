@@ -365,20 +365,27 @@ private:
         if (!listener) return core::make_unexpected(listener.error());
         if (auto r = parse_listener(listener.value(), &out->listener); !r) return r;
 
-        auto clusters = required(node, kClusters, lit_str("static_resources.clusters is required"));
+        // Clusters are optional at the JSON level, both an omitted field and
+        // an empty array: an Envoy bootstrap whose routes are all
+        // `direct_response`/`redirect` needs no upstream cluster at all. The
+        // converter's `validate` (src/envoy/converter.cc) requires a
+        // declared cluster only once a route's action is known to be
+        // `Forward`.
+        auto clusters = optional(node, kClusters);
         if (!clusters) return core::make_unexpected(clusters.error());
+        if (clusters.value() == kJsonNoNode) return true;
         return parse_clusters(clusters.value(), &out->clusters);
     }
 
     // A bounded, ordered list of clusters (`kMaxEnvoyClusters`); names must be
     // unique. The (kMaxEnvoyClusters + 1)th element is rejected at its own
-    // span rather than the array's.
+    // span rather than the array's. An empty array is allowed (see
+    // `parse_static_resources`); the resulting empty `out` fails later, at
+    // the point a `Forward` route action needs a declared cluster.
     FrontendResult<bool> parse_clusters(u32 array, FixedVec<Cluster, kMaxEnvoyClusters>* out) {
         auto ok = expect_array(array, lit_str("expected a JSON array"));
         if (!ok) return core::make_unexpected(ok.error());
         const JsonNode& node = doc_.at(array);
-        if (node.child_count == 0u)
-            return missing(node.span, lit_str("at least one cluster is required"));
         for (u32 child = node.first_child; child != kJsonNoNode;
              child = doc_.at(child).next_sibling) {
             if (out->full())
@@ -854,27 +861,33 @@ private:
             out->redirect.host_redirect = text.value();
         }
 
-        auto response_code =
-            required(node, kResponseCode, lit_str("redirect response_code is required"));
+        // `response_code` is optional: proto3 JSON omits a field left at its
+        // enum's zero value, and `RedirectResponseCode`'s zero value is
+        // `MOVED_PERMANENTLY` (301) (envoy.config.route.v3.RedirectAction).
+        // An omitted field is therefore a valid, fully-specified redirect,
+        // not a missing one.
+        auto response_code = optional(node, kResponseCode);
         if (!response_code) return core::make_unexpected(response_code.error());
-        auto code_text =
-            plain_string(response_code.value(), lit_str("response_code must be a string"));
-        if (!code_text) return core::make_unexpected(code_text.error());
-        u16 mapped = 0;
-        if (code_text.value().eq(lit_str("MOVED_PERMANENTLY"))) {
-            mapped = 301u;
-        } else if (code_text.value().eq(lit_str("FOUND"))) {
-            mapped = 302u;
-        } else if (code_text.value().eq(lit_str("SEE_OTHER"))) {
-            mapped = 303u;
-        } else if (code_text.value().eq(lit_str("TEMPORARY_REDIRECT"))) {
-            mapped = 307u;
-        } else if (code_text.value().eq(lit_str("PERMANENT_REDIRECT"))) {
-            mapped = 308u;
-        } else {
-            return unsupported(doc_.at(response_code.value()).span,
-                               lit_str("response_code must be one of MOVED_PERMANENTLY, FOUND, "
-                                       "SEE_OTHER, TEMPORARY_REDIRECT, PERMANENT_REDIRECT"));
+        u16 mapped = 301u;
+        if (response_code.value() != kJsonNoNode) {
+            auto code_text =
+                plain_string(response_code.value(), lit_str("response_code must be a string"));
+            if (!code_text) return core::make_unexpected(code_text.error());
+            if (code_text.value().eq(lit_str("MOVED_PERMANENTLY"))) {
+                mapped = 301u;
+            } else if (code_text.value().eq(lit_str("FOUND"))) {
+                mapped = 302u;
+            } else if (code_text.value().eq(lit_str("SEE_OTHER"))) {
+                mapped = 303u;
+            } else if (code_text.value().eq(lit_str("TEMPORARY_REDIRECT"))) {
+                mapped = 307u;
+            } else if (code_text.value().eq(lit_str("PERMANENT_REDIRECT"))) {
+                mapped = 308u;
+            } else {
+                return unsupported(doc_.at(response_code.value()).span,
+                                   lit_str("response_code must be one of MOVED_PERMANENTLY, FOUND, "
+                                           "SEE_OTHER, TEMPORARY_REDIRECT, PERMANENT_REDIRECT"));
+            }
         }
         out->redirect.response_code = mapped;
         return true;

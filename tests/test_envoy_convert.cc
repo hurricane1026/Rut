@@ -415,6 +415,24 @@ std::string redirect_json(rut::test::TestCase* _tc) {
     return text;
 }
 
+// A local-only route table: the single route is `direct_response`, and
+// `static_resources.clusters` is omitted entirely (docs/envoy-compatibility.md,
+// "Allow local-only route tables to omit clusters"). Matches Envoy, which
+// needs no upstream cluster when nothing forwards.
+std::string direct_response_no_clusters_json(rut::test::TestCase* _tc) {
+    std::string text = direct_response_json(_tc);
+    const std::string clusters_literal = R"([{
+"name": "backend",
+"type": "STATIC",
+"connect_timeout": "5s",
+"load_assignment": {"cluster_name": "backend", "endpoints": [{"lb_endpoints": [{
+"endpoint": {"address": {"socket_address": {"address": "127.0.0.1", "port_value": 9000}}}
+}]}]}
+}])";
+    CHECK(replace_first(&text, ",\n\"clusters\": " + clusters_literal + "\n", "\n"));
+    return text;
+}
+
 }  // namespace
 
 // ── CLI ─────────────────────────────────────────────────────────────
@@ -1087,35 +1105,41 @@ TEST(envoy_convert, api_all_capabilities_matches_golden) {
     CHECK(lowered_again.value().view().eq(golden));
 
     // Overwriting the JSON source after lowering must not change output
-    // bytes: no borrowed source text reaches the emitted RUT, only numeric
-    // model fields do. The bytes backing `route.match.prefix`,
-    // `router.name`, and `filter_chain.filter_name` are left untouched (PR
-    // #692 round-3 review added a defensive `validate()` check that the
-    // prefix is exactly "/", round-4 added one that the router filter name
-    // is exactly "envoy.filters.http.router", and round-5 added one that the
-    // network filter name is exactly
-    // "envoy.filters.network.http_connection_manager" — see
-    // api_forged_model_rejected below — so corrupting any borrowed range
-    // would correctly fail lowering rather than exercise the property this
-    // test is about).
+    // bytes: no borrowed source text reaches the emitted RUT for output
+    // generation, only numeric model fields do. `validate` does need to
+    // read the borrowed route-match prefix, cluster-name, load-assignment-
+    // name, router-name, and network-filter-name bytes (it must, to fail
+    // closed when hand-built content no longer matches its modeled shape;
+    // see `api_forged_model_rejected`'s `forged_short_prefix` case, added by
+    // PR #692 round-3 review's defensive `validate()` check that the prefix
+    // is exactly "/", `forged_router_name`/`cleared_typed_config`, added by
+    // round-4's check that the router filter name is exactly
+    // "envoy.filters.http.router", round-5's check that the network filter
+    // name is exactly "envoy.filters.network.http_connection_manager", and
+    // `renamed_cluster_stale_load_assignment`, added by round-12's check
+    // that `load_assignment.cluster_name` still equals the declared
+    // cluster's `name`), so this leaves those specific source spans
+    // untouched and corrupts every other byte.
     const envoy::Bootstrap model_copy = parsed.value();
-    const Str prefix =
-        model_copy.listener.filter_chain.hcm.route_config.virtual_host.routes[0].match.prefix;
-    const Str router_name = model_copy.listener.filter_chain.hcm.router.name;
-    const Str filter_name = model_copy.listener.filter_chain.filter_name;
-    REQUIRE(prefix.ptr >= text.data() && prefix.ptr < text.data() + text.size());
-    REQUIRE(router_name.ptr >= text.data() && router_name.ptr < text.data() + text.size());
-    REQUIRE(filter_name.ptr >= text.data() && filter_name.ptr < text.data() + text.size());
-    const size_t prefix_offset = static_cast<size_t>(prefix.ptr - text.data());
-    const size_t router_name_offset = static_cast<size_t>(router_name.ptr - text.data());
-    const size_t filter_name_offset = static_cast<size_t>(filter_name.ptr - text.data());
+    const envoy::Route& route_copy =
+        model_copy.listener.filter_chain.hcm.route_config.virtual_host.routes[0];
+    const Span kept_spans[] = {
+        route_copy.match.prefix_span,
+        route_copy.action.cluster_span,
+        model_copy.clusters[0].name_span,
+        model_copy.clusters[0].load_assignment_name_span,
+        model_copy.listener.filter_chain.hcm.router.name_span,
+        model_copy.listener.filter_chain.filter_name_span,
+    };
     for (size_t i = 0; i < text.size(); i++) {
-        const bool in_prefix = i >= prefix_offset && i < prefix_offset + prefix.len;
-        const bool in_router_name =
-            i >= router_name_offset && i < router_name_offset + router_name.len;
-        const bool in_filter_name =
-            i >= filter_name_offset && i < filter_name_offset + filter_name.len;
-        if (!in_prefix && !in_router_name && !in_filter_name) text[i] = 'x';
+        bool keep = false;
+        for (const Span& s : kept_spans) {
+            if (i >= s.start && i < s.end) {
+                keep = true;
+                break;
+            }
+        }
+        if (!keep) text[i] = 'x';
     }
     auto lowered_after_mutation = envoy::lower_to_rut(model_copy, all_true);
     REQUIRE(lowered_after_mutation);
@@ -1189,16 +1213,21 @@ TEST(envoy_convert, api_forged_model_rejected) {
 
     // PR #692 round-3 review: a hand-mutated `match.prefix` must not lower
     // successfully. The emitted route is always the literal `"/"` catch-all
-    // (put_forward_route never reads `match.prefix`), so without this check
+    // (put_forward_route never reads `match.prefix`), so without a check
     // a forged "/admin" prefix would silently widen what the generated RUT
-    // actually matches relative to what the model claims.
+    // actually matches relative to what the model claims — caught here by
+    // the earlier "route matches other than \"prefix\": \"/\" are not
+    // lowered yet" guard (this increment lowers only the root catch-all;
+    // see the `blocked_on_nonroot_prefix` shape above), which already
+    // covers every non-"/" prefix regardless of how the model was built.
     envoy::Bootstrap forged_prefix = parsed.value();
     forged_prefix.listener.filter_chain.hcm.route_config.virtual_host.routes[0].match.prefix =
         lit_str("/admin");
     const auto forged_prefix_result = envoy::lower_to_rut(forged_prefix, all_true);
     CHECK_FALSE(forged_prefix_result);
-    CHECK(forged_prefix_result.error().code == FrontendError::UnexpectedToken);
-    CHECK(to_string(forged_prefix_result.error().detail).find("match prefix") != std::string::npos);
+    CHECK(forged_prefix_result.error().code == FrontendError::UnsupportedSyntax);
+    CHECK(to_string(forged_prefix_result.error().detail).find("are not lowered yet") !=
+          std::string::npos);
 
     // PR #692 round-4 review: a hand-mutated router filter identity must not
     // lower successfully either. `validate()` only inspected
@@ -1221,6 +1250,23 @@ TEST(envoy_convert, api_forged_model_rejected) {
     CHECK(cleared_typed_config_result.error().code == FrontendError::UnexpectedToken);
     CHECK(to_string(cleared_typed_config_result.error().detail).find("typed_config is required") !=
           std::string::npos);
+
+    // A hand-built model can set a `Prefix` match to a length-1 string that
+    // is not "/" (the parser's own `prefix_shape_ok` never produces this);
+    // the same guard above compares prefix bytes, not just length, so this
+    // is rejected the same way instead of being silently broadened into the
+    // `route "/"` catch-all.
+    envoy::Bootstrap forged_short_prefix = parsed.value();
+    forged_short_prefix.listener.filter_chain.hcm.route_config.virtual_host.routes[0].match.prefix =
+        lit_str("x");
+    CHECK_FALSE(envoy::lower_to_rut(forged_short_prefix, all_true));
+
+    // A hand-built model can also drop every declared cluster while its
+    // route still forwards; the empty-cluster allowance is only for
+    // direct_response/redirect routes.
+    envoy::Bootstrap no_clusters_forward = parsed.value();
+    no_clusters_forward.clusters.len = 0;
+    CHECK_FALSE(envoy::lower_to_rut(no_clusters_forward, all_true));
 
     // PR #692 round-5 review: the same forgery is possible one level up, on
     // the network filter that wraps the HTTP connection manager.
@@ -1608,6 +1654,27 @@ TEST(envoy_convert, blocked_on_direct_response) {
           std::string::npos);
     CHECK_EQ(lowered.error().span.line, action.span.line);
     CHECK_EQ(lowered.error().span.col, action.span.col);
+}
+
+TEST(envoy_convert, local_only_route_table_omits_clusters) {
+    const std::string text = direct_response_no_clusters_json(_tc);
+    static envoy::JsonDocument doc;
+    auto parsed = envoy::parse_bootstrap_json(str(text), doc);
+    REQUIRE(parsed);
+    CHECK_EQ(parsed.value().clusters.len, 0u);
+    const envoy::RouteAction& action =
+        parsed.value().listener.filter_chain.hcm.route_config.virtual_host.routes[0].action;
+    REQUIRE(action.kind == envoy::RouteActionKind::DirectResponse);
+
+    const envoy::RutCapabilities all_true{true, true, true};
+    auto lowered = envoy::lower_to_rut(parsed.value(), all_true);
+    REQUIRE_FALSE(lowered);
+    CHECK(lowered.error().code == FrontendError::UnsupportedSyntax);
+    // The missing cluster set must not itself be rejected: a local-only
+    // route table reaches the same "not lowered yet" diagnostic a
+    // declared-cluster direct_response gets (PR 9 lowers it for real).
+    CHECK(to_string(lowered.error().detail).find("direct_response is not lowered yet") !=
+          std::string::npos);
 }
 
 TEST(envoy_convert, blocked_on_redirect) {

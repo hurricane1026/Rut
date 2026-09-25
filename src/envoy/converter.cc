@@ -208,22 +208,20 @@ bool put_forward_route(Writer& w, const char* method, u32 method_len, bool inclu
 }
 
 // Capability validation (docs/envoy-converter.md; PR1 plan, "Capability
-// validation"). Defensive model checks come first because a hand-built
+// validation"). Defensive model checks run throughout because a hand-built
 // `Bootstrap` (as opposed to one produced by `parse_bootstrap_json`) must
 // still fail closed rather than emit an upstream with no address or a route
-// to an undeclared cluster. The six BLOCKED_BY_RUT checks then run in a fixed
-// order; the first failure wins.
+// to an undeclared cluster. The cluster/endpoint checks are deferred until
+// the route's action is known to be `Forward`, so a local-only route table
+// (every route `direct_response`/`redirect`) is not forced to declare an
+// unused cluster. The six BLOCKED_BY_RUT checks then run in a fixed order;
+// the first failure wins.
 FrontendResult<bool> validate(const Bootstrap& model, const RutCapabilities& caps) {
     const HttpConnectionManager& hcm = model.listener.filter_chain.hcm;
     const RouterFilter& router = hcm.router;
     const VirtualHost& virtual_host = hcm.route_config.virtual_host;
     if (model.listener.address.port == 0u)
         return invalid(model.listener.address.span, lit_str("listener port must be non-zero"));
-    if (model.clusters.len == 0u)
-        return invalid(model.span, lit_str("at least one cluster is required"));
-    if (model.clusters[0].endpoint.address.port == 0u)
-        return invalid(model.clusters[0].endpoint.address.span,
-                       lit_str("endpoint port must be non-zero"));
     // PR #692 round-15 review: `listener.name` and `hcm.route_config.name`
     // are optional (`name_string(..., allow_empty=true)`,
     // src/envoy/parser.cc:350-352 and :538-540) but the parser still bounds
@@ -238,21 +236,26 @@ FrontendResult<bool> validate(const Bootstrap& model, const RutCapabilities& cap
         return unsupported(hcm.route_config.name_span, lit_str("name exceeds the bounded length"));
     // PR #692 round-9/round-8 review, ported to the route-list model (PR 8's
     // `clusters[]`): loop over every declared cluster, not just the first,
-    // so both checks still hold once multiple clusters are lowered.
-    // `name.empty()` guards the `Str::eq` empty-vs-empty forgery the
-    // `action.cluster` check below relies on being impossible (a caller of
-    // the public `lower_to_rut(model, capabilities)` overload who clears a
-    // declared cluster's `name` on a parsed copy, or hand-builds a
-    // `Bootstrap` that never sets it, would otherwise let an also-cleared
-    // `action.cluster` pass an equality check it should fail; the parser
-    // requires both non-empty, `min_len: 1` on both the v3 `Cluster.name`
-    // and the route action's `cluster`). `load_assignment_name_present` is
-    // the model's only record that `parse_bootstrap_json` ever saw and
-    // validated that cluster's `load_assignment.cluster_name` (required,
-    // non-empty, and equal to `name` per Envoy's v3
-    // `ClusterLoadAssignment.cluster_name` `min_len: 1`) -- the same
-    // evidence-bit shape as `hcm.type_url_span` (round-5) and
-    // `hcm.generate_request_id_span` (round-6) below. A hand-built
+    // so both checks still hold once multiple clusters are lowered, and run
+    // this unconditionally (not deferred behind the Forward-action check
+    // below) so a malformed declared cluster is rejected even when it is
+    // never referenced by any route -- this cannot reject a legitimate
+    // local-only route table (every route `direct_response`/`redirect`,
+    // round-3 below), since `model.clusters.len` is then legitimately 0 and
+    // the loop body never runs. `name.empty()` guards the `Str::eq`
+    // empty-vs-empty forgery the `action.cluster` check further below
+    // relies on being impossible (a caller of the public `lower_to_rut(
+    // model, capabilities)` overload who clears a declared cluster's `name`
+    // on a parsed copy, or hand-builds a `Bootstrap` that never sets it,
+    // would otherwise let an also-cleared `action.cluster` pass an equality
+    // check it should fail; the parser requires both non-empty, `min_len: 1`
+    // on both the v3 `Cluster.name` and the route action's `cluster`).
+    // `load_assignment_name_present` is the model's only record that
+    // `parse_bootstrap_json` ever saw and validated that cluster's
+    // `load_assignment.cluster_name` (required, non-empty, and equal to
+    // `name` per Envoy's v3 `ClusterLoadAssignment.cluster_name` `min_len:
+    // 1`) -- the same evidence-bit shape as `hcm.type_url_span` (round-5)
+    // and `hcm.generate_request_id_span` (round-6) below. A hand-built
     // `Bootstrap`, or a parsed copy with either bit cleared, still has a
     // matching `action.cluster` / cluster `name` pair and would otherwise
     // lower successfully, emitting a working gateway for a bootstrap Envoy
@@ -331,15 +334,16 @@ FrontendResult<bool> validate(const Bootstrap& model, const RutCapabilities& cap
     // ordered, match-aware route list). Reject explicitly here: `lower_to_rut`
     // below unconditionally emits a `route "/"` catch-all, so silently
     // falling through would make an exact or scoped match accept every path.
-    // `prefix.len == 1u` is used instead of a content comparison against "/"
-    // because the parser's `prefix_shape_ok` (src/envoy/parser.cc) admits a
-    // length-1 prefix only when it is exactly "/" (the "starts and ends with
-    // /" branch requires length >= 2); this keeps the check, like every other
-    // decision here, a property of the validated model rather than of the
-    // borrowed source bytes.
+    // Compared against the byte content of "/" rather than only the length,
+    // so a hand-built `Bootstrap` (not produced by `parse_bootstrap_json`,
+    // e.g. a length-1 prefix like "x") cannot slip through and be silently
+    // broadened into the `route "/"` catch-all below. The parser's own
+    // `prefix_shape_ok` (src/envoy/parser.cc) already guarantees this for
+    // parsed models (a length-1 prefix is only ever exactly "/"), but
+    // `validate` must fail closed for direct model construction too.
     if (route.match.kind == RouteMatchKind::Path)
         return unsupported(route.match.span, lit_str("match.path is not lowered yet"));
-    if (route.match.prefix.len != 1u)
+    if (!route.match.prefix.eq(lit_str("/")))
         return unsupported(
             route.match.span,
             lit_str("route matches other than \"prefix\": \"/\" are not lowered yet"));
@@ -350,10 +354,20 @@ FrontendResult<bool> validate(const Bootstrap& model, const RutCapabilities& cap
     if (action.kind == RouteActionKind::Redirect)
         return unsupported(action.span, lit_str("redirect is not lowered yet"));
 
+    // Only Forward remains beyond this point, and it is the only action that
+    // needs a declared cluster: a local-only route table (every route
+    // `direct_response`/`redirect`) has already returned above without
+    // requiring `model.clusters` to be non-empty.
+    if (model.clusters.len == 0u)
+        return invalid(model.span, lit_str("at least one cluster is required"));
+    if (model.clusters[0].endpoint.address.port == 0u)
+        return invalid(model.clusters[0].endpoint.address.span,
+                       lit_str("endpoint port must be non-zero"));
     // PR #692 round-9 review, ported: reject an empty `action.cluster`
     // explicitly too (see the per-cluster `name.empty()` loop above for the
     // matching declared-name-emptiness guard the forgery needed both sides
-    // of).
+    // of; the load_assignment evidence check is ported there too, so it is
+    // not repeated here).
     if (action.cluster.empty() || !action.cluster.eq(model.clusters[0].name))
         return invalid(action.cluster_span,
                        lit_str("route cluster does not name a declared cluster"));
@@ -372,23 +386,22 @@ FrontendResult<bool> validate(const Bootstrap& model, const RutCapabilities& cap
     // name more than one, not just the one route currently reachable here.
     if (action.cluster.len > kMaxEnvoyNameLen)
         return unsupported(action.cluster_span, lit_str("name exceeds the bounded length"));
-    // PR #692 round-3 review: the emitted route is always the literal `"/"`
-    // catch-all (see put_forward_route below) — nothing about the route's
-    // actual `match.prefix` value ever reaches the generated text. A model
-    // built by `parse_bootstrap_json` always has `match.prefix.eq("/")`
-    // already (the parser rejects every other prefix), but a caller of the
-    // public `lower_to_rut(model, capabilities)` overload can copy a parsed
-    // `Bootstrap` and mutate `match.prefix` (e.g. to "/admin") before passing
-    // it back in; without this check, lowering still succeeds and silently
-    // widens what the emitted RUT actually matches relative to what the
-    // model claims. Reject any forged prefix here, alongside the other
-    // defensive model checks above.
+    // PR #692 round-3 review's own defensive `match.prefix == "/"` check
+    // (guarding a hand-mutated, e.g. "/admin", prefix from silently
+    // widening what the generated RUT actually matches) is unreachable
+    // here: by this point `route.match.kind` is already known to be
+    // `Prefix` (the `Path` case returned above) and `route.match.prefix`
+    // is already known to equal "/" (any other prefix already returned
+    // above, "route matches other than \"prefix\": \"/\" are not lowered
+    // yet"), so a hand-built model with a forged non-"/" prefix already
+    // fails closed earlier with that diagnostic instead of reaching here.
+    //
     // PR #692 round-10 review: revalidate `virtual_host.name` too — the
     // parser requires it non-empty (`parse_virtual_host`, "virtual host name
-    // must be a non-empty string", src/envoy/parser.cc:562-563), but the
-    // emitted RUT program never reads this field. A hand-built `Bootstrap`
-    // that clears `virtual_host.name` on a parsed copy (or never sets it)
-    // would otherwise still lower successfully, silently accepting a model
+    // must be a non-empty string", src/envoy/parser.cc), but the emitted RUT
+    // program never reads this field. A hand-built `Bootstrap` that clears
+    // `virtual_host.name` on a parsed copy (or never sets it) would
+    // otherwise still lower successfully, silently accepting a model
     // `parse_bootstrap_json` would reject.
     if (virtual_host.name.empty())
         return invalid(virtual_host.name_span,
@@ -403,19 +416,17 @@ FrontendResult<bool> validate(const Bootstrap& model, const RutCapabilities& cap
         return unsupported(virtual_host.name_span, lit_str("name exceeds the bounded length"));
     // PR #692 round-9 review: validation never checked that parsing
     // established `domains: ["*"]` on the virtual host — only the nested
-    // route's `match.prefix` (round-3, immediately below). A hand-built
-    // `Bootstrap`, or a parsed copy with `virtual_host.domains_span`
-    // cleared, still lowers even though the generated route has no host
-    // dimension and therefore matches every authority, which widens routing
-    // beyond what the model claims. `domains_span` is the model's only
-    // record that `parse_virtual_host` ever saw and accepted the exact
-    // single-element `["*"]` array (the parser rejects every other
-    // `domains` value), the same evidence-bit shape as `hcm.type_url_span`
-    // and `hcm.generate_request_id_span` above.
+    // route's `match.prefix` (round-3 above). A hand-built `Bootstrap`, or a
+    // parsed copy with `virtual_host.domains_span` cleared, still lowers
+    // even though the generated route has no host dimension and therefore
+    // matches every authority, which widens routing beyond what the model
+    // claims. `domains_span` is the model's only record that
+    // `parse_virtual_host` ever saw and accepted the exact single-element
+    // `["*"]` array (the parser rejects every other `domains` value), the
+    // same evidence-bit shape as `hcm.type_url_span` and
+    // `hcm.generate_request_id_span` below.
     if (virtual_host.domains_span.start == 0u && virtual_host.domains_span.end == 0u)
         return invalid(virtual_host.span, lit_str("virtual host domains must be [\"*\"]"));
-    if (!route.match.prefix.eq(lit_str("/")))
-        return invalid(route.match.prefix_span, lit_str("route match prefix must be \"/\""));
     // PR #692 round-4 review: revalidate the router filter's identity here
     // too, not just `suppress_envoy_headers` on it — a forged `router.name`
     // or a cleared `has_typed_config` would otherwise still lower
