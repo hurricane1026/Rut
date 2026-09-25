@@ -746,6 +746,21 @@ TEST(envoy_convert, api_forged_model_rejected) {
     CHECK(cleared_hcm_type_url_result.error().code == FrontendError::UnexpectedToken);
     CHECK(to_string(cleared_hcm_type_url_result.error().detail).find("typed_config is required") !=
           std::string::npos);
+
+    // PR #692 round-6 review: a cleared `hcm.generate_request_id_span` —
+    // the model's only record that `parse_hcm` ever saw and accepted
+    // `generate_request_id: false` — must also be rejected. A hand-built
+    // `Bootstrap` that never set the field (or a caller who cleared it after
+    // parsing) leaves this span at its default `Span{}`, the same forgery
+    // shape as `cleared_hcm_type_url` above.
+    envoy::Bootstrap cleared_generate_request_id = parsed.value();
+    cleared_generate_request_id.listener.filter_chain.hcm.generate_request_id_span = Span{};
+    const auto cleared_generate_request_id_result =
+        envoy::lower_to_rut(cleared_generate_request_id, all_true);
+    CHECK_FALSE(cleared_generate_request_id_result);
+    CHECK(cleared_generate_request_id_result.error().code == FrontendError::UnexpectedToken);
+    CHECK(to_string(cleared_generate_request_id_result.error().detail)
+              .find("generate_request_id: false is required") != std::string::npos);
 }
 
 int main(int argc, char** argv) {

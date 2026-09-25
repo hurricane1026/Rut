@@ -267,6 +267,21 @@ FrontendResult<bool> validate(const Bootstrap& model, const RutCapabilities& cap
             lit_str("network filter name must be envoy.filters.network.http_connection_manager"));
     if (hcm.type_url_span.start == 0u && hcm.type_url_span.end == 0u)
         return invalid(hcm.span, lit_str("network filter typed_config is required"));
+    // PR #692 round-6 review: revalidate `generate_request_id`'s evidence
+    // too, the same class of gap the `type_url_span` check above closes one
+    // field over. `HttpConnectionManager::generate_request_id_span` is the
+    // model's only record that `parse_hcm` ever saw and accepted
+    // `generate_request_id: false` (it stays the zero `Span{}` on a
+    // hand-built model that never set the field, or that a caller cleared
+    // after parsing); an omitted `generate_request_id` defaults to `true` in
+    // real Envoy, which adds a random `x-request-id` to every upstream
+    // request that this emitted RUT program never generates. Without this
+    // check, a forged or incomplete model still lowers successfully and
+    // silently admits that divergence.
+    if (hcm.generate_request_id_span.start == 0u && hcm.generate_request_id_span.end == 0u)
+        return invalid(hcm.span,
+                       lit_str("generate_request_id: false is required; Rut does not generate "
+                               "x-request-id"));
 
     if (!router.suppress_envoy_headers) {
         const Span span = router.suppress_envoy_headers_present ? router.suppress_envoy_headers_span

@@ -780,6 +780,84 @@ Five findings from the round-4 Codex review of PR #692:
    `CONNECT` bug in docs/envoy-compatibility.md, and "Known capability
    dependencies" above.
 
+**Round-6 review edge cases (PR #692)**
+
+Three findings from the round-6 Codex review of PR #692:
+
+1. **`generate_request_id` was not revalidated.** `validate()` checked
+   `type_url_span`/`router.name`/`filter_chain.filter_name` for forgery but
+   never `hcm.generate_request_id_span` — the model's only evidence that
+   `parse_hcm` saw and accepted `generate_request_id: false` (an omitted
+   field defaults to `true` in real Envoy, which then adds a random
+   `x-request-id` this emitted RUT program never generates). Fixed by
+   checking the span the same way as `type_url_span`, immediately after it in
+   `validate()` (`src/envoy/converter.cc`); covered by a new
+   `cleared_hcm_generate_request_id` case in
+   `envoy_convert.api_forged_model_rejected` (`tests/test_envoy_convert.cc`).
+2. **Downstream HTTP/1.0 rejection differs in mechanism and status, not just
+   text.** With the milestone's fixed HCM shape (no `http_protocol_options`,
+   so `accept_http_10` is always the proto3 default `false`), Envoy rejects
+   an HTTP/1.0 downstream request at the H1 codec — before route
+   selection — with `426 Upgrade Required`
+   (`ServerConnectionImpl::checkProtocolVersion`,
+   `source/common/http/http1/codec_impl.cc:1176-1189`). Rut's listener
+   accepts the connection at any version and only rejects once the emitted
+   route's `request_policy` (which already pins `version: "HTTP/1.1"`,
+   `src/envoy/converter.cc:165`) is evaluated: `inspect_request_policy_body`
+   (`include/rut/runtime/callbacks_impl.h:5406`) returns `Invalid` because
+   `conn.req_http_version != HttpVersion::Http11`, and
+   `reject_request_policy` (`callbacks_impl.h:5767`) sends a generic `400 Bad
+   Request`. Both fail closed with no upstream contact, but the status code
+   (426 vs 400) and the layer that rejects (codec vs application policy)
+   differ; pinning `version: "HTTP/1.1"` in the request policy does not
+   change this; it only determines *that* Rut rejects, not *how*. No
+   converter-level fix is possible (there is no RUT grammar surface for a
+   codec-level version gate), and this is a per-request divergence, not a
+   configuration-admission gap, so it is not gated behind a
+   `RutCapabilities` flag — recorded as a `PARTIAL` matrix row in
+   docs/envoy-compatibility.md instead, same as the round-2/round-3 rows.
+3. **P1: client-forged `x-envoy-*` internal headers are forwarded verbatim
+   to the upstream.** For the milestone's fixed HCM shape (`use_remote_address`
+   is unreachable through the parser's 6-field allow-list, so
+   `config.useRemoteAddress()` is always `false`), Envoy's
+   `ConnectionManagerUtility::mutateRequestHeaders`
+   (`source/common/http/conn_manager_utility.cc:121-327`) always computes
+   `internal_request = false` and therefore always strips 15 `x-envoy-*`
+   headers from every request before forwarding — `x-envoy-internal` itself
+   (unconditionally removed at line 142 and never re-added, since
+   `internal_request` is always false) plus the 14 headers
+   `cleanInternalHeaders` (lines 351-388) strips unconditionally:
+   `x-envoy-retriable-status-codes`, `x-envoy-retriable-header-names`,
+   `x-envoy-retry-on`, `x-envoy-retry-grpc-on`, `x-envoy-max-retries`,
+   `x-envoy-upstream-alt-stat-name`, `x-envoy-upstream-rq-timeout-ms`,
+   `x-envoy-upstream-rq-per-try-timeout-ms`,
+   `x-envoy-upstream-rq-timeout-alt-response`,
+   `x-envoy-expected-rq-timeout-ms`, `x-envoy-force-trace`,
+   `x-envoy-ip-tags`, `x-envoy-original-url`,
+   `x-envoy-hedge-on-per-try-timeout` (literal names from
+   `source/common/http/headers.h:153-208`, default `x-envoy` prefix). The
+   emitted route's `request_policy.strip_headers`
+   (`src/envoy/converter.cc:171`) is the fixed closed list `["Connection",
+   "Keep-Alive", "TE", "Expect", "Upgrade", "Proxy-Connection"]` — none of
+   the 15 names above are in it, and #696's planned
+   `apply_preserve_host_lowercase_request_policy` (Host preservation, header
+   lowercasing, the same hop-by-hop list) does not add any either. A client
+   can therefore make the converted gateway deliver e.g. a forged
+   `x-envoy-internal: true` or `x-envoy-retry-on` to an upstream that would
+   never see it from the original Envoy config — a real security-relevant
+   divergence, not merely a cosmetic one. **The converter cannot fix this**:
+   `strip_headers` is a fixed array written once at lowering time and has no
+   way to express Envoy's dynamic, address-derived internal/edge
+   determination, so this cannot be closed by adding more literals to the
+   converter's emitted text. **The fix belongs in the runtime**, in #696's
+   `apply_preserve_host_lowercase_request_policy`
+   (`envoy/rut-request-envoy-h1`): strip the same closed
+   `x-envoy-*` list unconditionally for every request the milestone's request
+   policy handles (equivalent to "always treat as external", which is
+   correct for this milestone since `use_remote_address` can never be set).
+   Recorded as a prominently marked `BLOCKED_BY_RUT` matrix row in
+   docs/envoy-compatibility.md pending that runtime change.
+
 ## Test layers
 
 1. Parser tests (`tests/test_envoy_parser.cc`): JSON document tree, field
