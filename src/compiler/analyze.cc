@@ -12883,15 +12883,23 @@ static FrontendResult<void> load_imported_modules(
             return frontend_error(
                 FrontendError::UnsupportedSyntax, item.import_decl.span, item.import_decl.path);
         auto kept_source = stash_owned_string(owned_strings, content);
-        auto lexed = lex(kept_source);
-        if (!lexed) return core::make_unexpected(lexed.error());
-        auto ast = parse_file(lexed.value());
-        if (!ast) return core::make_unexpected(ast.error());
-        // parse_file returns a raw pointer via unique_ptr::release(); take
-        // ownership immediately so the imported AstFile is freed after analyze
-        // consumes it. Without this wrapper an import-heavy test suite leaks
-        // ~58 MB per imported file (confirmed via RSS growth).
-        std::unique_ptr<AstFile> ast_owned(ast.value());
+        // This frame stays live while analyze_file_internal recurses into the
+        // import below, once per nesting level. Keep the ~160 KiB token buffer
+        // out of it: lex into mmap-backed storage and unmap it as soon as the
+        // parse is done (the AST views the kept source, not the tokens).
+        std::unique_ptr<AstFile> ast_owned;
+        {
+            MappedArray<LexedTokens> token_storage;
+            auto lexed = lex_mapped(kept_source, token_storage);
+            if (!lexed) return core::make_unexpected(lexed.error());
+            auto ast = parse_file(*lexed.value());
+            if (!ast) return core::make_unexpected(ast.error());
+            // parse_file returns a raw pointer via unique_ptr::release(); take
+            // ownership immediately so the imported AstFile is freed after
+            // analyze consumes it. Without this wrapper an import-heavy test
+            // suite leaks ~58 MB per imported file (confirmed via RSS growth).
+            ast_owned.reset(ast.value());
+        }
         auto kept_path = stash_owned_string(owned_strings, normalized);
         g_import_analysis_counter++;
         std::vector<Str> imported_decorator_names =

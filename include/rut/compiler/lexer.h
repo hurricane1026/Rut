@@ -3,6 +3,7 @@
 #include "core/expected.h"
 #include "rut/common/types.h"
 #include "rut/compiler/diagnostic.h"
+#include "rut/runtime/mapped_array.h"
 
 namespace rut {
 
@@ -144,15 +145,27 @@ using LexResult = core::Expected<LexedTokens, Diagnostic>;
 
 // Keep each bounded lexer result object below 256 KiB on every supported data
 // model. At capacity 4096 the current LP64 sizes are 163,848 bytes for
-// LexedTokens and 163,856 bytes for LexResult. lex() may transiently place
-// both its output and the returned value on the call stack (~320 KiB before
-// other frames/redzones), so callers with custom small stacks (or deep
-// recursion, e.g. nested `import`) must budget for both.
+// LexedTokens and 163,856 bytes for LexResult. lex() places both its output
+// and the returned value on the call stack (~320 KiB before other
+// frames/redzones), so it is only for shallow, non-recursive callers (tests,
+// tools). Anything that can recurse -- nested `import` analysis re-enters the
+// ~1.3 MiB analyzer frame once per level -- or that keeps tokens alive across
+// analysis must use lex_mapped() so no token buffer sits in its frame.
 static_assert(sizeof(LexedTokens) <= 256uz * 1024uz,
               "LexedTokens exceeds the bounded 256 KiB object size");
 static_assert(sizeof(LexResult) <= 256uz * 1024uz,
               "LexResult exceeds the bounded 256 KiB object size");
 
 LexResult lex(Str source);
+
+// Lex `source` into caller-owned storage. Resets `out` first; on error `out`
+// holds a partial token stream and must not be parsed.
+FrontendResult<void> lex_into(Str source, LexedTokens& out);
+
+// Lex `source` into an mmap-backed LexedTokens owned by `storage` (a
+// one-element MappedArray, initialized here if needed). Keeps the ~160 KiB
+// token buffer out of the caller's stack frame; the tokens live until
+// `storage` is destroyed. mmap failure reports FrontendError::OutOfMemory.
+FrontendResult<const LexedTokens*> lex_mapped(Str source, MappedArray<LexedTokens>& storage);
 
 }  // namespace rut

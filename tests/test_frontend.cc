@@ -15,8 +15,11 @@
 #include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <memory>
 #include <string>
 #include <vector>
+
+#include <pthread.h>
 using namespace rut;
 
 TEST(hir, function_moves_preserve_non_response_statement_effect) {
@@ -1288,6 +1291,167 @@ TEST(frontend, policy_heavy_multi_route_source_exceeds_legacy_token_bound_and_pa
     auto ast = parse_file_heap(lexed.value());
     REQUIRE(ast);
     REQUIRE_EQ(ast->items.len, 11u);  // listen + upstream + 9 routes
+}
+
+TEST(frontend, lex_mapped_matches_lex_and_reuses_mapped_storage) {
+    const char* source = "route GET \"/a\" { return 200 }\n";
+    auto expected = lex(lit(source));
+    REQUIRE(expected);
+    MappedArray<LexedTokens> storage;
+    for (u32 round = 0; round < 2; round++) {
+        auto mapped = lex_mapped(lit(source), storage);
+        REQUIRE(mapped);
+        CHECK(mapped.value() == storage.data());
+        REQUIRE_EQ(mapped.value()->tokens.len, expected->tokens.len);
+        for (u32 i = 0; i < expected->tokens.len; i++) {
+            CHECK(mapped.value()->tokens[i].type == expected->tokens[i].type);
+            CHECK(mapped.value()->tokens[i].text.eq(expected->tokens[i].text));
+        }
+    }
+    auto bad = lex_mapped(lit("route GET \"/a"), storage);
+    REQUIRE_FALSE(bad);
+    CHECK_EQ(bad.error().code, FrontendError::UnterminatedString);
+}
+
+// Nested-import analysis re-enters analyze_file_internal -- a ~1.3 MiB frame
+// in optimized builds -- once per import level, and load_imported_modules
+// stays live across each recursion. Token buffers (~160 KiB at the current
+// LexedTokens capacity) must not sit in that recursive frame. Run the whole
+// frontend on a thread whose stack equals Linux's default 8 MiB main-thread
+// limit so a regression faults here instead of only in the `rut` driver.
+// Unoptimized and sanitized builds have far larger frames, so they keep the
+// logic coverage on a larger stack.
+#if defined(__has_feature)
+#if __has_feature(address_sanitizer) || __has_feature(undefined_behavior_sanitizer)
+#define RUT_TEST_IMPORT_CHAIN_SANITIZED 1
+#endif
+#endif
+#if defined(__OPTIMIZE__) && !defined(RUT_TEST_IMPORT_CHAIN_SANITIZED) && \
+    !defined(__SANITIZE_ADDRESS__)
+static constexpr size_t kImportChainStackBytes = 8uz << 20;
+#else
+static constexpr size_t kImportChainStackBytes = 256uz << 20;
+#endif
+// main.rut + a five-file acyclic chain: six analyzer frames deep.
+static constexpr u32 kImportChainDepth = 5;
+
+struct ImportChainRun {
+    std::string main_path;
+    SourceBudget budget{};
+    // Only static details are safe to copy: an import-path detail views the
+    // imported file's text, which is released with the failed module.
+    bool copy_detail = false;
+    bool analyzed = false;
+    Diagnostic error{};
+    std::string error_detail;
+    u32 imports_analyzed = 0;
+};
+
+static void* run_import_chain(void* arg) {
+    auto& run = *static_cast<ImportChainRun*>(arg);
+    static constexpr char kMain[] = "import \"m1.rut\"\nroute GET \"/\" { return 200 }\n";
+    std::unique_ptr<AstFile> ast;
+    {
+        MappedArray<LexedTokens> tokens;
+        auto lexed = lex_mapped({kMain, sizeof(kMain) - 1}, tokens);
+        if (!lexed) {
+            run.error = lexed.error();
+            return nullptr;
+        }
+        auto parsed = parse_file(*lexed.value());
+        if (!parsed) {
+            run.error = parsed.error();
+            return nullptr;
+        }
+        ast.reset(parsed.value());
+    }
+    reset_import_analysis_counter();
+    auto hir = analyze_file(
+        *ast, {run.main_path.c_str(), static_cast<u32>(run.main_path.size())}, &run.budget);
+    run.imports_analyzed = get_import_analysis_counter();
+    if (!hir) {
+        run.error = hir.error();
+        if (run.copy_detail)
+            run.error_detail.assign(hir.error().detail.ptr, hir.error().detail.len);
+        return nullptr;
+    }
+    delete hir.value();
+    run.analyzed = true;
+    return nullptr;
+}
+
+static bool run_import_chain_on_bounded_stack(ImportChainRun& run) {
+    pthread_attr_t attr;
+    if (pthread_attr_init(&attr) != 0) return false;
+    bool ok = pthread_attr_setstacksize(&attr, kImportChainStackBytes) == 0;
+    pthread_t thread{};
+    ok = ok && pthread_create(&thread, &attr, run_import_chain, &run) == 0;
+    pthread_attr_destroy(&attr);
+    return ok && pthread_join(thread, nullptr) == 0;
+}
+
+// Writes m1.rut .. m<depth>.rut where each file imports the next; the last
+// one imports m1.rut again when `cycle` is set. Returns the summed file sizes
+// of m1 .. m<depth - 1>.
+static u64 write_import_chain(const std::string& dir, u32 depth, bool cycle) {
+    std::filesystem::remove_all(dir);
+    std::filesystem::create_directories(dir);
+    u64 bytes_before_last = 0;
+    for (u32 i = 1; i <= depth; i++) {
+        std::string body;
+        if (i < depth)
+            body = "import \"m" + std::to_string(i + 1) + ".rut\"\n";
+        else if (cycle)
+            body = "import \"m1.rut\"\n";
+        body += "func f" + std::to_string(i) + "() -> i32 => " + std::to_string(i) + "\n";
+        std::ofstream out(dir + "/m" + std::to_string(i) + ".rut", std::ios::binary);
+        out << body;
+        if (i < depth) bytes_before_last += body.size();
+    }
+    return bytes_before_last;
+}
+
+TEST(frontend, nested_import_chain_analyzes_on_default_linux_stack) {
+    const std::string dir = "/tmp/rut_frontend_import_chain_stack";
+    write_import_chain(dir, kImportChainDepth, false);
+    ImportChainRun run;
+    run.main_path = dir + "/main.rut";
+    REQUIRE(run_import_chain_on_bounded_stack(run));
+    CHECK(run.analyzed);
+    CHECK_EQ(run.imports_analyzed, kImportChainDepth);
+    std::filesystem::remove_all(dir);
+}
+
+TEST(frontend, nested_import_cycle_is_diagnosed_on_default_linux_stack) {
+    // m5 imports m1 again: the cycle is detected at the deepest level the
+    // acyclic chain above reaches, and must surface as a diagnostic.
+    const std::string dir = "/tmp/rut_frontend_import_cycle_stack";
+    write_import_chain(dir, kImportChainDepth, true);
+    ImportChainRun run;
+    run.main_path = dir + "/main.rut";
+    REQUIRE(run_import_chain_on_bounded_stack(run));
+    CHECK_FALSE(run.analyzed);
+    CHECK_EQ(run.error.code, FrontendError::UnsupportedSyntax);
+    CHECK_EQ(run.imports_analyzed, kImportChainDepth);
+    std::filesystem::remove_all(dir);
+}
+
+TEST(frontend, nested_import_source_budget_is_diagnosed_on_default_linux_stack) {
+    // The budget admits m1..m4 exactly, so reading the deepest file fails.
+    const std::string dir = "/tmp/rut_frontend_import_budget_stack";
+    const u64 admitted = write_import_chain(dir, kImportChainDepth, false);
+    ImportChainRun run;
+    run.main_path = dir + "/main.rut";
+    run.budget.max_bytes = admitted;
+    run.copy_detail = true;
+    REQUIRE(run_import_chain_on_bounded_stack(run));
+    CHECK_FALSE(run.analyzed);
+    CHECK(run.budget.exceeded);
+    CHECK_EQ(run.budget.used_bytes, admitted);
+    CHECK_EQ(run.error.code, FrontendError::UnsupportedSyntax);
+    CHECK_EQ(run.error_detail, std::string("source-bytes limit reached"));
+    CHECK_EQ(run.imports_analyzed, kImportChainDepth - 1);
+    std::filesystem::remove_all(dir);
 }
 
 TEST(frontend, lex_recognizes_downstream_keyword) {
