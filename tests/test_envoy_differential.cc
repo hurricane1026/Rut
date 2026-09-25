@@ -64,6 +64,11 @@ namespace {
 
 constexpr const char* kEnvoyImage = RUT_PINNED_ENVOY_IMAGE;
 constexpr int kClientTimeoutMs = 3000;
+// How many times to retry Envoy's own listener port after a bind collision
+// (see launch_envoy_with_port_retry()): that port cannot be pre-bound from
+// this process (Envoy binds it itself inside the container), so this harness
+// can only probe-allocate it and race everyone else for it.
+constexpr int kMaxListenPortAttempts = 3;
 
 // ── Small process helpers ──────────────────────────────────────────────
 
@@ -187,6 +192,53 @@ bool allocate_loopback_port(uint16_t* port) {
     }
     close(fd);
     return ok;
+}
+
+// A loopback port that has been allocated by binding and *listening* on it,
+// rather than probe-binding and closing (see allocate_loopback_port() above).
+// The caller owns `fd` and must either hand it to a consumer that adopts it
+// (RecordingUpstream::adopt()) or close() it directly.
+struct BoundPort {
+    int fd = -1;
+    uint16_t port = 0;
+};
+
+// Allocates an ephemeral loopback port and leaves it bound and listening, so
+// the port stays reserved until the caller's eventual consumer takes over the
+// socket. Plain allocate_loopback_port() closes its probe socket immediately
+// after learning the port number, which leaves a window where another
+// process on the same host can grab that port before this harness's own
+// consumer gets around to binding it (round-6 review, "Keep allocated ports
+// reserved until their consumers bind"). Used for the recording upstream,
+// whose listening socket this process itself owns end to end; Envoy's own
+// listener port cannot use this (Envoy binds it inside the container), so
+// that one still goes through the probe-and-retry path in
+// launch_envoy_with_port_retry().
+bool allocate_bound_loopback_port(BoundPort* out) {
+    const int fd = socket(AF_INET, SOCK_STREAM, 0);
+    if (fd < 0) return false;
+    const int one = 1;
+    setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
+    sockaddr_in addr{};
+    addr.sin_family = AF_INET;
+    addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    addr.sin_port = 0;
+    if (bind(fd, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) != 0) {
+        close(fd);
+        return false;
+    }
+    if (listen(fd, 16) != 0) {
+        close(fd);
+        return false;
+    }
+    socklen_t len = sizeof(addr);
+    if (getsockname(fd, reinterpret_cast<sockaddr*>(&addr), &len) != 0) {
+        close(fd);
+        return false;
+    }
+    out->fd = fd;
+    out->port = ntohs(addr.sin_port);
+    return true;
 }
 
 bool allocate_distinct_ports(const std::vector<uint16_t*>& outs) {
@@ -516,17 +568,16 @@ bool decode_wire_literal(const std::string& wrapped, std::string* out) {
 // request headers block naming `Connection: close` closes after replying.
 class RecordingUpstream {
 public:
-    bool start(uint16_t port) {
-        listen_fd_ = socket(AF_INET, SOCK_STREAM, 0);
-        if (listen_fd_ < 0) return false;
-        const int one = 1;
-        setsockopt(listen_fd_, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
-        sockaddr_in addr{};
-        addr.sin_family = AF_INET;
-        addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
-        addr.sin_port = htons(port);
-        if (bind(listen_fd_, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) != 0) return false;
-        if (listen(listen_fd_, 16) != 0) return false;
+    // Adopts an already-bound, already-listening socket, typically the `fd`
+    // out of allocate_bound_loopback_port(): binding a fresh socket to a port
+    // number learned earlier (the old start(uint16_t port) behavior) leaves a
+    // window where another process can take that port first (round-6 review,
+    // "Keep allocated ports reserved until their consumers bind"). Takes
+    // ownership of `listen_fd` on success; on failure the caller still owns
+    // it and must close it.
+    bool adopt(int listen_fd) {
+        if (listen_fd < 0) return false;
+        listen_fd_ = listen_fd;
         stopping_.store(false);
         accept_thread_ = std::thread([this] { accept_loop(); });
         return true;
@@ -1180,13 +1231,100 @@ std::string make_container_name(const char* label) {
            std::to_string(container_name_suffix_counter++);
 }
 
+// Case-insensitive scan of an Envoy log for a bind-collision message (Envoy
+// logs `Address already in use` when its own listen() call races another
+// process for the port), used by launch_envoy_with_port_retry() to tell a
+// genuine startup failure apart from a port collision worth retrying.
+bool log_indicates_address_in_use(const std::string& path) {
+    std::ifstream in(path);
+    if (!in) return false;
+    std::stringstream ss;
+    ss << in.rdbuf();
+    std::string contents = ss.str();
+    std::transform(contents.begin(), contents.end(), contents.begin(), [](unsigned char c) {
+        return static_cast<char>(std::tolower(c));
+    });
+    return contents.find("address already in use") != std::string::npos ||
+           contents.find("address in use") != std::string::npos;
+}
+
+// Launches `envoy` against a bootstrap rendered from `*listen_port` and
+// `other_port` (the upstream port for run 1, the deliberately-closed port for
+// run 2), and waits for it to accept connections.
+//
+// Envoy binds `*listen_port` itself inside the container, so unlike the
+// recording upstream's port (reserved end to end via
+// allocate_bound_loopback_port()/RecordingUpstream::adopt()), this harness
+// can only probe-allocate the number and hand it to Envoy, leaving a window
+// for another process to take it first. When that happens, wait_ready()
+// fails and Envoy's own log names the collision; this function detects that
+// case and retries on a freshly allocated port, up to kMaxListenPortAttempts
+// attempts total (round-6 review, "detect a collision ... retry with a fresh
+// port ... print that it retried, and never record a failed attempt as
+// evidence"). A failed attempt's container is torn down before either
+// retrying or returning, so nothing from it survives to be mistaken for
+// evidence; only a `true` return leaves `envoy`/`*listen_port` describing a
+// live, ready Envoy instance.
+bool launch_envoy_with_port_retry(const std::string& dir,
+                                  const char* label,
+                                  uint16_t* listen_port,
+                                  uint16_t other_port,
+                                  EnvoyInstance* envoy,
+                                  std::string* error) {
+    const std::string bootstrap_path = dir + "/bootstrap.json";
+    for (int attempt = 1; attempt <= kMaxListenPortAttempts; attempt++) {
+        if (!write_file_mode(bootstrap_path, render_bootstrap(*listen_port, other_port), 0644)) {
+            *error = "could not write bootstrap.json";
+            return false;
+        }
+        envoy->name = make_container_name(label);
+        envoy->log_path = dir + "/envoy-attempt" + std::to_string(attempt) + ".log";
+        if (!envoy->launch(bootstrap_path, *listen_port)) {
+            *error = "could not fork/exec docker run";
+            return false;
+        }
+        if (wait_ready(*listen_port, *envoy, 15'000, error)) return true;
+
+        const bool collided = log_indicates_address_in_use(envoy->log_path);
+        envoy->stop();
+        if (!collided || attempt == kMaxListenPortAttempts) return false;
+
+        uint16_t fresh_port = 0;
+        if (!allocate_loopback_port(&fresh_port)) {
+            *error = "could not allocate a replacement loopback port after a bind collision";
+            return false;
+        }
+        std::cerr << "RETRY: Envoy listener port " << *listen_port
+                  << " lost a bind race to another process (attempt " << attempt << "/"
+                  << kMaxListenPortAttempts << "); retrying on port " << fresh_port << "\n";
+        *listen_port = fresh_port;
+    }
+    return false;
+}
+
 int run_oracle_milestone_s(const std::string& output_path) {
     const std::string missing = check_docker_prerequisites();
     if (!missing.empty()) return missing_prerequisite(missing);
 
-    uint16_t listen_port1 = 0, upstream_port1 = 0, listen_port2 = 0, closed_port = 0;
-    if (!allocate_distinct_ports({&listen_port1, &upstream_port1, &listen_port2, &closed_port})) {
+    // The recording upstream's port is reserved end to end: this process
+    // binds and listens on it right here and keeps that same socket alive
+    // until RecordingUpstream::adopt() takes it over, so no other process can
+    // ever grab it out from under us (round-6 review, "Keep allocated ports
+    // reserved until their consumers bind"). Envoy's two listener ports and
+    // the deliberately-unbound "closed" port can only be probe-allocated
+    // (Envoy binds its own port inside the container; "closed" must stay
+    // unbound), so they still go through allocate_distinct_ports() below.
+    BoundPort upstream_bound;
+    if (!allocate_bound_loopback_port(&upstream_bound)) {
+        std::cerr << "FAIL: could not allocate loopback port for the recording upstream\n";
+        return 1;
+    }
+    const uint16_t upstream_port1 = upstream_bound.port;
+
+    uint16_t listen_port1 = 0, listen_port2 = 0, closed_port = 0;
+    if (!allocate_distinct_ports({&listen_port1, &listen_port2, &closed_port})) {
         std::cerr << "FAIL: could not allocate loopback ports\n";
+        close(upstream_bound.fd);
         return 1;
     }
 
@@ -1199,30 +1337,19 @@ int run_oracle_milestone_s(const std::string& output_path) {
             std::cerr << "FAIL: could not create temp directory\n";
             return 1;
         }
-        const std::string bootstrap_path = dir + "/bootstrap.json";
-        if (!write_file_mode(
-                bootstrap_path, render_bootstrap(listen_port1, upstream_port1), 0644)) {
-            std::cerr << "FAIL: could not write bootstrap.json\n";
-            return 1;
-        }
-
         RecordingUpstream upstream;
         for (const auto& spec : run1_cases())
             upstream.set_reply(spec.upstream_path, spec.upstream_reply);
-        if (!upstream.start(upstream_port1)) {
+        if (!upstream.adopt(upstream_bound.fd)) {
             std::cerr << "FAIL: could not start recording upstream\n";
+            close(upstream_bound.fd);
             return 1;
         }
 
         EnvoyInstance envoy;
-        envoy.name = make_container_name("run1");
-        envoy.log_path = dir + "/envoy.log";
-        if (!envoy.launch(bootstrap_path, listen_port1)) {
-            std::cerr << "FAIL: could not fork/exec docker run\n";
-            return 1;
-        }
         std::string ready_error;
-        if (!wait_ready(listen_port1, envoy, 15'000, &ready_error)) {
+        if (!launch_envoy_with_port_retry(
+                dir, "run1", &listen_port1, upstream_port1, &envoy, &ready_error)) {
             std::cerr << "FAIL: " << ready_error << "\n";
             dump_log(envoy.log_path);
             return 1;
@@ -1259,20 +1386,10 @@ int run_oracle_milestone_s(const std::string& output_path) {
             std::cerr << "FAIL: could not create temp directory\n";
             return 1;
         }
-        const std::string bootstrap_path = dir + "/bootstrap.json";
-        if (!write_file_mode(bootstrap_path, render_bootstrap(listen_port2, closed_port), 0644)) {
-            std::cerr << "FAIL: could not write bootstrap.json\n";
-            return 1;
-        }
         EnvoyInstance envoy;
-        envoy.name = make_container_name("run2");
-        envoy.log_path = dir + "/envoy.log";
-        if (!envoy.launch(bootstrap_path, listen_port2)) {
-            std::cerr << "FAIL: could not fork/exec docker run\n";
-            return 1;
-        }
         std::string ready_error;
-        if (!wait_ready(listen_port2, envoy, 15'000, &ready_error)) {
+        if (!launch_envoy_with_port_retry(
+                dir, "run2", &listen_port2, closed_port, &envoy, &ready_error)) {
             std::cerr << "FAIL: " << ready_error << "\n";
             dump_log(envoy.log_path);
             return 1;
@@ -1330,16 +1447,43 @@ bool self_test_escaping() {
 }
 
 bool self_test_recording_upstream() {
-    uint16_t port = 0;
-    if (!allocate_loopback_port(&port)) {
+    // Round-6 review, "Keep allocated ports reserved until their consumers
+    // bind": the upstream's port must come from allocate_bound_loopback_port()
+    // (bound and listening from the moment it's allocated) rather than
+    // probe-and-close, and RecordingUpstream must adopt that live fd instead
+    // of binding a fresh socket of its own.
+    BoundPort bound;
+    if (!allocate_bound_loopback_port(&bound)) {
         std::cerr << "FAIL [self-test upstream]: could not allocate a loopback port\n";
         return false;
     }
+    const uint16_t port = bound.port;
+
+    // While the first port is still held open (and not yet adopted into a
+    // RecordingUpstream), a second allocation must come back with a
+    // different port: proof that holding the listening socket open actually
+    // reserves the port against a racing allocator, unlike a probe-bind that
+    // has already closed by the time its caller gets around to using the
+    // port number.
+    uint16_t second_port = 0;
+    if (!allocate_loopback_port(&second_port)) {
+        std::cerr << "FAIL [self-test upstream]: could not allocate a second loopback port\n";
+        close(bound.fd);
+        return false;
+    }
+    if (second_port == port) {
+        std::cerr << "FAIL [self-test upstream]: second allocation collided with the "
+                     "still-live first port\n";
+        close(bound.fd);
+        return false;
+    }
+
     RecordingUpstream server;
     server.set_reply("/x", "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nhi");
     server.set_reply("/head", "HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\n");
-    if (!server.start(port)) {
-        std::cerr << "FAIL [self-test upstream]: could not start server\n";
+    if (!server.adopt(bound.fd)) {
+        std::cerr << "FAIL [self-test upstream]: could not adopt the bound listening socket\n";
+        close(bound.fd);
         return false;
     }
 
