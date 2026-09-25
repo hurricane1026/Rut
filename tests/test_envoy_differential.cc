@@ -394,6 +394,23 @@ bool find_header(const std::string& headers, const std::string& name, std::strin
     return false;
 }
 
+bool starts_with(const std::string& s, const std::string& prefix) {
+    return s.size() >= prefix.size() && s.compare(0, prefix.size(), prefix) == 0;
+}
+
+bool ends_with(const std::string& s, const std::string& suffix) {
+    return s.size() >= suffix.size() &&
+           s.compare(s.size() - suffix.size(), suffix.size(), suffix) == 0;
+}
+
+bool header_equals_ci(const std::string& raw, const std::string& name, const std::string& expect) {
+    const size_t header_end = raw.find("\r\n\r\n");
+    const std::string headers = header_end == std::string::npos ? raw : raw.substr(0, header_end);
+    std::string value;
+    if (!find_header(headers, name, &value)) return false;
+    return value == expect;
+}
+
 // Result of read_http_message(): the bytes captured so far, and whether the
 // message's framing (headers, plus body if any) actually completed within
 // the deadline. `complete == false` means the caller observed a partial
@@ -475,6 +492,78 @@ ReadResult read_http_message(int fd, bool head_request, int timeout_ms) {
     // determined by the headers alone (assumed zero-length body), so this is
     // complete as soon as the blank line was found above.
     return {buf, true};
+}
+
+// ── Listener ownership probe ────────────────────────────────────────────
+
+// A path this harness's own milestone-S bootstrap route table (see
+// kBootstrapTemplate below) answers with a fixed direct_response, never
+// routing to the "backend" cluster. probe_confirms_envoy_ownership() sends a
+// request for it to tell "this is the Envoy container this harness
+// launched" apart from "some unrelated process happens to be listening on
+// this port" -- and, critically, does so without ever contacting the
+// recording upstream (round-8 review, "Verify listener ownership instead of
+// timing process liveness": a foreign listener answering `port` must not be
+// mistaken for Envoy, and the probe used to rule that out must not itself
+// pollute the recorded oracle evidence). Defined via macros so
+// kBootstrapTemplate's JSON literal and this probe share one source of
+// truth instead of two copies that could drift; undefined again once the
+// template below is built.
+#define RUT_OWNERSHIP_PROBE_PATH "/__rut_ownership_probe__"
+#define RUT_OWNERSHIP_PROBE_BODY "rut-ownership-probe-not-found"
+
+constexpr char kOwnershipProbePath[] = RUT_OWNERSHIP_PROBE_PATH;
+constexpr char kOwnershipProbeBody[] = RUT_OWNERSHIP_PROBE_BODY;
+
+// Sends one GET for kOwnershipProbePath on `port` and checks the response
+// against exactly what the milestone-S bootstrap's direct_response route
+// always answers: a 404 status line, Envoy's "server: envoy" header (added
+// by the connection manager to every response, including direct_response
+// local replies, regardless of the router filter's suppress_envoy_headers
+// setting -- confirmed by every downstream case in
+// tests/fixtures/envoy_oracle_milestone_s.inc, including the router's own
+// local 503 for connect_failure), and the exact probe body. This never
+// reaches the "backend" cluster, so it never touches the recording upstream
+// whether or not one happens to be live on the other end (true for both
+// run 1 and run 2's bootstraps in run_oracle_milestone_s()). A foreign
+// listener will fail to complete this exchange, answer a different status,
+// or lack the "server: envoy" header; any of those means ownership is not
+// confirmed.
+bool probe_confirms_envoy_ownership(uint16_t port, int timeout_ms, std::string* error) {
+    const int fd = connect_with_timeout(port, timeout_ms);
+    if (fd < 0) {
+        *error = "ownership probe: could not connect";
+        return false;
+    }
+    const std::string request = std::string("GET ") + kOwnershipProbePath +
+                                " HTTP/1.1\r\nHost: rut-ownership-probe.internal\r\n"
+                                "Connection: close\r\n\r\n";
+    if (!send_all(fd, request)) {
+        close(fd);
+        *error = "ownership probe: could not send probe request";
+        return false;
+    }
+    const ReadResult read = read_http_message(fd, /*head_request=*/false, timeout_ms);
+    close(fd);
+    if (!read.complete) {
+        *error = "ownership probe: response did not complete";
+        return false;
+    }
+    if (!starts_with(read.bytes, "HTTP/1.1 404")) {
+        *error =
+            "ownership probe: expected a 404 status line from the probe route, got a "
+            "different response";
+        return false;
+    }
+    if (!header_equals_ci(read.bytes, "server", "envoy")) {
+        *error = "ownership probe: response is missing Envoy's \"server: envoy\" header";
+        return false;
+    }
+    if (!ends_with(read.bytes, kOwnershipProbeBody)) {
+        *error = "ownership probe: response body did not match the probe route's expected body";
+        return false;
+    }
+    return true;
 }
 
 // ── Transcript escaping (self-contained; see --self-test) ─────────────
@@ -932,15 +1021,26 @@ bool wait_ready(uint16_t port, EnvoyInstance& envoy, int timeout_ms, std::string
 // the container finishes failing and the docker child exits to report the
 // collision, so wait_ready() can return true for an unrelated listener and
 // bypass launch_envoy_with_port_retry()'s EADDRINUSE-retry branch entirely
-// (round-7 review, "readiness may observe a foreign listener"). Guard
-// against that window by giving the docker child a short grace period after
-// readiness to finish dying if it was ever going to: a child that exits
-// during the grace period never really owned `port`, so this reports
-// failure and leaves the existing collision-retry branch to run instead of
-// sending test cases to an unrelated service.
+// (round-7 review, "readiness may observe a foreign listener").
+//
+// A fixed grace period on its own is not enough to rule that out (round-8
+// review, "Verify listener ownership instead of timing process liveness"):
+// a cold or loaded `docker run` can take longer than any fixed grace period
+// to reach Envoy's own failed bind and exit, so the foreign listener's
+// process being merely *alive* through the grace period proves nothing
+// about who owns `port`. The liveness recheck below stays as a cheap first
+// step (a child that has already exited certainly never owned the port),
+// but real confirmation comes from the protocol: probe_confirms_envoy_
+// ownership() is retried until it succeeds, the tracked child exits, or the
+// overall readiness deadline passes. A foreign listener that answers
+// differently (or not at all) never confirms, and a child that exits while
+// probing is caught immediately instead of waiting out the full deadline.
 bool wait_ready_and_confirm_ownership(
     uint16_t port, EnvoyInstance& envoy, int timeout_ms, int grace_ms, std::string* error) {
+    const int64_t deadline = now_ms() + timeout_ms;
     if (!wait_ready(port, envoy, timeout_ms, error)) return false;
+
+    // Cheap first step: a child that already exited never owned `port`.
     struct timespec grace{grace_ms / 1000, static_cast<long>(grace_ms % 1000) * 1'000'000};
     nanosleep(&grace, nullptr);
     if (envoy.pid > 0) {
@@ -954,7 +1054,28 @@ bool wait_ready_and_confirm_ownership(
             return false;
         }
     }
-    return true;
+
+    // Real confirmation: the protocol-level probe, retried within the
+    // overall readiness deadline.
+    std::string probe_error;
+    for (;;) {
+        if (envoy.pid > 0) {
+            int status = 0;
+            const pid_t waited = waitpid(envoy.pid, &status, WNOHANG);
+            if (waited == envoy.pid) {
+                envoy.pid = -1;
+                *error = "docker run exited while confirming listener ownership";
+                return false;
+            }
+        }
+        if (probe_confirms_envoy_ownership(port, 1000, &probe_error)) return true;
+        if (now_ms() >= deadline) {
+            *error = "timed out confirming listener ownership: " + probe_error;
+            return false;
+        }
+        struct timespec retry_ts{0, 50'000'000};
+        nanosleep(&retry_ts, nullptr);
+    }
 }
 
 // ── Bootstrap template ──────────────────────────────────────────────────
@@ -962,8 +1083,14 @@ bool wait_ready_and_confirm_ownership(
 // The milestone-S bootstrap (docs/envoy-converter.md, "milestone-S";
 // tests/test_envoy_convert.cc's `milestone_s_json`), with the listener and
 // upstream endpoint ports left as placeholders so this harness can bind
-// loopback ephemeral ports per run.
-const char kBootstrapTemplate[] = R"json({
+// loopback ephemeral ports per run. The first route is this harness's own
+// addition, not part of milestone-S proper: a direct_response reserved for
+// probe_confirms_envoy_ownership() (above), matched ahead of the catch-all
+// "/" route so it never shadows (and, since no real case's request path
+// equals kOwnershipProbePath, is never shadowed by) any of run1_cases()'s
+// routes to the "backend" cluster.
+const char kBootstrapTemplate[] =
+    R"json({
 "static_resources": {
 "listeners": [{
 "name": "ingress",
@@ -978,7 +1105,10 @@ const char kBootstrapTemplate[] = R"json({
 "route_config": {"name": "local", "virtual_hosts": [{
 "name": "all",
 "domains": ["*"],
-"routes": [{"match": {"prefix": "/"}, "route": {"cluster": "backend", "timeout": "0s"}}]
+"routes": [{"match": {"path": ")json" RUT_OWNERSHIP_PROBE_PATH
+    R"json("}, "direct_response": {"status": 404, "body": {"inline_string": ")json" RUT_OWNERSHIP_PROBE_BODY
+    R"json("}}},
+{"match": {"prefix": "/"}, "route": {"cluster": "backend", "timeout": "0s"}}]
 }]},
 "http_filters": [{"name": "envoy.filters.http.router",
 "typed_config": {"@type": "type.googleapis.com/envoy.extensions.filters.http.router.v3.Router", "suppress_envoy_headers": true}}]
@@ -994,6 +1124,9 @@ const char kBootstrapTemplate[] = R"json({
 }]
 }
 })json";
+
+#undef RUT_OWNERSHIP_PROBE_PATH
+#undef RUT_OWNERSHIP_PROBE_BODY
 
 void replace_all(std::string* text, const std::string& from, const std::string& to) {
     size_t pos = 0;
@@ -1197,23 +1330,6 @@ bool write_transcript(const std::string& path, const std::vector<CaseResult>& re
             << wrap_wire_literal(r.downstream_bytes) << ";\n\n";
     }
     return static_cast<bool>(out);
-}
-
-bool starts_with(const std::string& s, const std::string& prefix) {
-    return s.size() >= prefix.size() && s.compare(0, prefix.size(), prefix) == 0;
-}
-
-bool ends_with(const std::string& s, const std::string& suffix) {
-    return s.size() >= suffix.size() &&
-           s.compare(s.size() - suffix.size(), suffix.size(), suffix) == 0;
-}
-
-bool header_equals_ci(const std::string& raw, const std::string& name, const std::string& expect) {
-    const size_t header_end = raw.find("\r\n\r\n");
-    const std::string headers = header_end == std::string::npos ? raw : raw.substr(0, header_end);
-    std::string value;
-    if (!find_header(headers, name, &value)) return false;
-    return value == expect;
 }
 
 int count_header(const std::string& raw, const std::string& name) {
@@ -1451,6 +1567,20 @@ int run_oracle_milestone_s(const std::string& output_path) {
                 dir, "run1", &listen_port1, upstream_port1, &envoy, &ready_error)) {
             std::cerr << "FAIL: " << ready_error << "\n";
             dump_log(envoy.log_path);
+            return 1;
+        }
+
+        // launch_envoy_with_port_retry() above already ran the ownership
+        // probe (wait_ready_and_confirm_ownership()) against this same live
+        // recording upstream; confirm it never actually reached it (round-8
+        // review, "the recording upstream must not be contacted by the
+        // probe"), before any of run1_cases()'s own evidence is collected
+        // below.
+        if (!upstream.requests_for(kOwnershipProbePath).empty()) {
+            std::cerr << "FAIL: the listener-ownership probe contacted the recording upstream; "
+                         "it must be answered locally by the bootstrap's direct_response route\n";
+            envoy.stop();
+            upstream.stop();
             return 1;
         }
 
@@ -1828,27 +1958,90 @@ bool self_test_argv_builder() {
     return ok;
 }
 
+// A minimal stand-in for a foreign listener, used only by
+// self_test_wait_ready_ownership() below: it adopts an already-bound,
+// already-listening socket and answers every connection made to it with a
+// fixed canned reply, so the test can exercise probe_confirms_envoy_
+// ownership()'s two outcomes (a matching reply vs. a non-matching one)
+// without a real Envoy.
+class FakeReplyListener {
+public:
+    bool adopt(int listen_fd, std::string reply) {
+        if (listen_fd < 0) return false;
+        listen_fd_ = listen_fd;
+        reply_ = std::move(reply);
+        stopping_.store(false);
+        thread_ = std::thread([this] { run(); });
+        return true;
+    }
+
+    void stop() {
+        stopping_.store(true);
+        if (listen_fd_ >= 0) {
+            shutdown(listen_fd_, SHUT_RDWR);
+            close(listen_fd_);
+        }
+        if (thread_.joinable()) thread_.join();
+        listen_fd_ = -1;
+    }
+
+    ~FakeReplyListener() { stop(); }
+
+private:
+    void run() {
+        while (!stopping_.load()) {
+            const int fd = accept(listen_fd_, nullptr, nullptr);
+            if (fd < 0) {
+                if (stopping_.load()) return;
+                continue;
+            }
+            // Best-effort drain of whatever the probe sent, so its send()
+            // never blocks on a full socket buffer while nobody reads; the
+            // canned reply below does not depend on the request bytes.
+            char discard[1024];
+            pollfd pfd{fd, POLLIN, 0};
+            if (poll(&pfd, 1, 50) > 0) recv(fd, discard, sizeof(discard), MSG_DONTWAIT);
+            send_all(fd, reply_);
+            close(fd);
+        }
+    }
+
+    int listen_fd_ = -1;
+    std::string reply_;
+    std::atomic<bool> stopping_{false};
+    std::thread thread_;
+};
+
 // Covers round-7 review thread P2 ("Verify the opened port belongs to the
-// launched Envoy"): wait_ready() alone would be fooled by a foreign process
-// that already owns the probe-allocated port, reporting readiness before the
-// real docker child has had a chance to fail its own bind and exit.
-// wait_ready_and_confirm_ownership() must catch that by rechecking the child
-// a short grace period later. This test simulates the race directly (no
-// docker needed): a plain bound-and-listening socket stands in for the
-// foreign process's listener, and a forked child that exits shortly after
-// stands in for the docker run process losing its own bind race.
+// launched Envoy") and round-8 review thread P2 ("Verify listener ownership
+// instead of timing process liveness"): wait_ready() alone proves only that
+// *some* process is accepting connections on the port, not that it is the
+// Envoy this harness launched, and a fixed grace period on the tracked
+// child's liveness cannot rule that out either -- a foreign listener whose
+// owning process is not the tracked docker child at all stays alive
+// indefinitely, so "child is still alive" is not evidence of ownership
+// (this is exactly what the previous version of this self-test got wrong:
+// it treated a still-foreign-held listener as confirmed ownership solely
+// because its dummy child remained alive, without ever checking what that
+// listener actually answered). wait_ready_and_confirm_ownership() must
+// instead settle it with a protocol-level probe. This test simulates the
+// race directly (no docker needed): FakeReplyListener stands in for a
+// foreign process's listener (answering either like Envoy or not), and a
+// forked child stands in for the docker run process.
 bool self_test_wait_ready_ownership() {
     bool ok = true;
 
-    BoundPort foreign;
-    if (!allocate_bound_loopback_port(&foreign)) {
-        std::cerr << "FAIL [self-test wait_ready ownership]: could not allocate a loopback port\n";
-        return false;
-    }
-
-    // Negative case: the "docker child" dies shortly after the foreign
-    // listener is already open, so ownership must NOT be confirmed.
+    // Case 1 (negative): the "docker child" dies shortly after the foreign
+    // listener is already open (which never answers anything), so ownership
+    // must NOT be confirmed -- caught by the cheap liveness recheck before
+    // any probe is even attempted.
     {
+        BoundPort foreign;
+        if (!allocate_bound_loopback_port(&foreign)) {
+            std::cerr
+                << "FAIL [self-test wait_ready ownership]: could not allocate a loopback port\n";
+            return false;
+        }
         const pid_t child = fork();
         if (child < 0) {
             std::cerr << "FAIL [self-test wait_ready ownership]: fork failed\n";
@@ -1872,7 +2065,7 @@ bool self_test_wait_ready_ownership() {
         }
         if (error.empty()) {
             std::cerr << "FAIL [self-test wait_ready ownership]: expected a non-empty error on "
-                         "the negative case\n";
+                         "case 1 (child exits)\n";
             ok = false;
         }
         if (envoy.pid != -1) {
@@ -1883,16 +2076,94 @@ bool self_test_wait_ready_ownership() {
         int status = 0;
         while (waitpid(child, &status, 0) < 0 && errno == EINTR) {
         }
+        close(foreign.fd);
     }
 
-    // Positive case: the tracked child stays alive through the grace period,
-    // so ownership of the (still foreign-held, but standing in for Envoy's
-    // own) listener must be confirmed.
+    // Case 2 (negative): the tracked child stays alive for the entire probe
+    // window, but the listener it "owns" answers with a non-Envoy response
+    // (no "server: envoy" header, wrong status). Ownership must NOT be
+    // confirmed, and -- unlike case 1 -- envoy.pid must still be set,
+    // proving the rejection came from the protocol probe rather than from
+    // the child having exited.
     {
+        BoundPort foreign;
+        if (!allocate_bound_loopback_port(&foreign)) {
+            std::cerr
+                << "FAIL [self-test wait_ready ownership]: could not allocate a loopback port\n";
+            return false;
+        }
+        FakeReplyListener listener;
+        if (!listener.adopt(foreign.fd, "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nhi")) {
+            std::cerr << "FAIL [self-test wait_ready ownership]: could not adopt the foreign "
+                         "listener socket\n";
+            close(foreign.fd);
+            return false;
+        }
         const pid_t child = fork();
         if (child < 0) {
             std::cerr << "FAIL [self-test wait_ready ownership]: fork failed\n";
+            listener.stop();
+            return false;
+        }
+        if (child == 0) {
+            struct timespec ts{5, 0};
+            nanosleep(&ts, nullptr);
+            _exit(0);
+        }
+        EnvoyInstance envoy;
+        envoy.pid = child;
+        std::string error;
+        const bool confirmed =
+            wait_ready_and_confirm_ownership(foreign.port, envoy, 1200, 100, &error);
+        if (confirmed) {
+            std::cerr << "FAIL [self-test wait_ready ownership]: confirmed ownership of a "
+                         "foreign listener that answered a non-Envoy response\n";
+            ok = false;
+        }
+        if (error.empty()) {
+            std::cerr << "FAIL [self-test wait_ready ownership]: expected a non-empty error on "
+                         "case 2 (non-Envoy response)\n";
+            ok = false;
+        }
+        if (envoy.pid != child) {
+            std::cerr << "FAIL [self-test wait_ready ownership]: case 2 cleared envoy.pid, but "
+                         "the tracked child never exited -- rejection must come from the probe, "
+                         "not from process liveness\n";
+            ok = false;
+        }
+        kill(child, SIGKILL);
+        int status = 0;
+        while (waitpid(child, &status, 0) < 0 && errno == EINTR) {
+        }
+        listener.stop();
+    }
+
+    // Case 3 (positive): the tracked child stays alive, and the listener it
+    // owns answers exactly like the milestone-S bootstrap's ownership-probe
+    // route would (404, "server: envoy", the expected body). Ownership must
+    // be confirmed.
+    {
+        BoundPort foreign;
+        if (!allocate_bound_loopback_port(&foreign)) {
+            std::cerr
+                << "FAIL [self-test wait_ready ownership]: could not allocate a loopback port\n";
+            return false;
+        }
+        const std::string envoy_like_reply =
+            std::string("HTTP/1.1 404 Not Found\r\n") +
+            "content-length: " + std::to_string(strlen(kOwnershipProbeBody)) +
+            "\r\nserver: envoy\r\n\r\n" + kOwnershipProbeBody;
+        FakeReplyListener listener;
+        if (!listener.adopt(foreign.fd, envoy_like_reply)) {
+            std::cerr << "FAIL [self-test wait_ready ownership]: could not adopt the foreign "
+                         "listener socket\n";
             close(foreign.fd);
+            return false;
+        }
+        const pid_t child = fork();
+        if (child < 0) {
+            std::cerr << "FAIL [self-test wait_ready ownership]: fork failed\n";
+            listener.stop();
             return false;
         }
         if (child == 0) {
@@ -1907,7 +2178,7 @@ bool self_test_wait_ready_ownership() {
             wait_ready_and_confirm_ownership(foreign.port, envoy, 2000, 200, &error);
         if (!confirmed) {
             std::cerr << "FAIL [self-test wait_ready ownership]: did not confirm ownership for a "
-                         "child that stayed alive: "
+                         "listener answering like Envoy: "
                       << error << "\n";
             ok = false;
         }
@@ -1915,10 +2186,9 @@ bool self_test_wait_ready_ownership() {
         int status = 0;
         while (waitpid(child, &status, 0) < 0 && errno == EINTR) {
         }
-        envoy.pid = -1;
+        listener.stop();
     }
 
-    close(foreign.fd);
     if (ok) std::cerr << "PASS [self-test wait_ready ownership]\n";
     return ok;
 }
