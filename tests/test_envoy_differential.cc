@@ -2521,20 +2521,37 @@ std::string validate_results(const std::vector<CaseResult>& results) {
 
 // True iff `value` has the exact 29-byte RFC 1123 (IMF-fixdate, RFC 9110
 // §5.6.7) shape every synthesized HTTP Date must have -- `Sun, 06 Nov 1994
-// 08:49:37 GMT` -- with in-range day/hour/minute/second fields. Same check
+// 08:49:37 GMT` -- with in-range day/hour/minute/second fields, AND names an
+// actual calendar date: the day is valid for that month and year (Gregorian
+// leap years: divisible by 4, except century years unless also divisible by
+// 400), and the weekday token matches the one that date actually falls on
+// (Sakamoto's algorithm). Round-7 review only range-checked each field
+// independently, which still accepted an impossible date like `Sun, 31 Feb
+// 2026 12:00:00 GMT`: if Envoy emits a valid synthesized Date while RUT
+// emits one shaped like that, normalize_date_for_compare() below would
+// replace both with the same placeholder and let an asserted pair case
+// match despite RUT's Date being malformed (round-13 review, "Validate
+// calendar dates before normalization"). Same check
 // tests/test_nginx_differential.cc's normalize_date() applies before it
 // mutates a Date, so the placeholder substitution below can only ever hide
-// the unavoidable timestamp difference, never a malformed value (round-7
-// review, "Validate synthesized Date values before normalizing them").
+// the unavoidable timestamp difference, never a malformed value.
+//
+// Seconds are capped at 59, not 60: this project has no citation that Envoy
+// (or `rut`) ever synthesizes a leap-second `:60` Date, so treating it as
+// valid would only widen what counts as "well-formed" without evidence.
 bool is_rfc1123_http_date(const std::string& value) {
     if (value.size() != 29) return false;
     const char* date = value.data();
     const auto is_digit = [](char c) { return c >= '0' && c <= '9'; };
-    const auto token_is_one_of = [](const char* v, const char* const* tokens, size_t count) {
+    const auto find_token_index =
+        [](const char* v, const char* const* tokens, size_t count) -> int {
         for (size_t i = 0; i < count; i++)
-            if (memcmp(v, tokens[i], 3) == 0) return true;
-        return false;
+            if (memcmp(v, tokens[i], 3) == 0) return static_cast<int>(i);
+        return -1;
     };
+    // Index 0 = Mon .. 6 = Sun (ISO weekday order), matched against the
+    // computed weekday below (see the Sakamoto/kWeekdays remark further
+    // down for the index translation between the two).
     static const char* const kWeekdays[] = {"Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"};
     static const char* const kMonths[] = {
         "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"};
@@ -2544,19 +2561,48 @@ bool is_rfc1123_http_date(const std::string& value) {
                          static_cast<unsigned>(date[offset + 1] - '0')
                    : 100u;
     };
-    if (!token_is_one_of(date, kWeekdays, sizeof(kWeekdays) / sizeof(kWeekdays[0])) ||
-        date[3] != ',' || date[4] != ' ' || date[7] != ' ' ||
-        !token_is_one_of(date + 8, kMonths, sizeof(kMonths) / sizeof(kMonths[0])) ||
-        date[11] != ' ' || date[16] != ' ' || date[19] != ':' || date[22] != ':' ||
-        date[25] != ' ' || memcmp(date + 26, "GMT", 3) != 0)
+    const int weekday_index =
+        find_token_index(date, kWeekdays, sizeof(kWeekdays) / sizeof(kWeekdays[0]));
+    const int month_index =
+        find_token_index(date + 8, kMonths, sizeof(kMonths) / sizeof(kMonths[0]));
+    if (weekday_index < 0 || date[3] != ',' || date[4] != ' ' || date[7] != ' ' ||
+        month_index < 0 || date[11] != ' ' || date[16] != ' ' || date[19] != ':' ||
+        date[22] != ':' || date[25] != ' ' || memcmp(date + 26, "GMT", 3) != 0)
         return false;
     for (size_t i = 12; i < 16; i++)
         if (!is_digit(date[i])) return false;
     const unsigned day = two_digits(5);
+    const unsigned year = static_cast<unsigned>((date[12] - '0') * 1000 + (date[13] - '0') * 100 +
+                                                (date[14] - '0') * 10 + (date[15] - '0'));
     const unsigned hour = two_digits(17);
     const unsigned minute = two_digits(20);
     const unsigned second = two_digits(23);
-    return day >= 1 && day <= 31 && hour <= 23 && minute <= 59 && second <= 59;
+    if (hour > 23 || minute > 59 || second > 59) return false;
+
+    // Day-of-month must be valid for THIS month and year, not just <= 31.
+    static const unsigned kDaysInMonth[] = {31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31};
+    const bool leap_year = (year % 4 == 0 && year % 100 != 0) || (year % 400 == 0);
+    const unsigned days_in_month =
+        (month_index == 1 && leap_year) ? 29u : kDaysInMonth[static_cast<size_t>(month_index)];
+    if (day < 1 || day > days_in_month) return false;
+
+    // Sakamoto's algorithm: the weekday for a Gregorian calendar date, as
+    // 0 = Sunday .. 6 = Saturday.
+    static const int kSakamotoMonthTable[] = {0, 3, 2, 5, 0, 3, 5, 1, 4, 6, 2, 4};
+    int adjusted_year = static_cast<int>(year);
+    const int month_1based = month_index + 1;
+    if (month_1based < 3) adjusted_year -= 1;
+    const int sakamoto_weekday =
+        (adjusted_year + adjusted_year / 4 - adjusted_year / 100 + adjusted_year / 400 +
+         kSakamotoMonthTable[month_index] + static_cast<int>(day)) %
+        7;
+    // Translate Sakamoto's 0=Sunday..6=Saturday into kWeekdays' 0=Mon..6=Sun
+    // indexing: Sunday (0) maps to kWeekdays' last slot (6), Monday (1) to
+    // kWeekdays' first slot (0), and so on.
+    const int computed_weekday_index = (sakamoto_weekday + 6) % 7;
+    if (computed_weekday_index != weekday_index) return false;
+
+    return true;
 }
 
 // Returns `raw` with its `date:` header value replaced by a fixed
@@ -6786,6 +6832,15 @@ bool self_test_malformed_date_rejected() {
         std::cerr << "FAIL [self-test malformed date]: a valid RFC 1123 date was rejected\n";
         ok = false;
     }
+    // Round-13 review, "Validate calendar dates before normalization": Feb
+    // 29 2028 is a real leap day (2028 % 4 == 0, % 100 != 0) that actually
+    // falls on a Tuesday -- both the day-in-month and weekday computations
+    // must accept it.
+    if (!is_rfc1123_http_date("Tue, 29 Feb 2028 00:00:00 GMT")) {
+        std::cerr << "FAIL [self-test malformed date]: a valid leap-day RFC 1123 date (Tue, 29 "
+                     "Feb 2028) was rejected\n";
+        ok = false;
+    }
     for (const char* bad : {"garbage",
                             "",
                             "Xue, 01 Jan 2030 00:00:00 GMT",
@@ -6798,7 +6853,22 @@ bool self_test_malformed_date_rejected() {
                             "Tue, 01 Jan 2030 00:00:60 GMT",
                             "Tue, 01 Jan 2030 00:00:00 UTC",
                             "Tue, 01 Jan 2030 00:00:00 GMT ",
-                            "<normalized-date>"}) {
+                            "<normalized-date>",
+                            // Round-13 review, "Validate calendar dates before
+                            // normalization": these all have a structurally well-formed
+                            // 29-byte shape with every field independently in range, but name
+                            // an impossible or mislabeled calendar date -- the exact gap a
+                            // per-field-only check missed.
+                            //
+                            // February never has 31 days, in a leap year or not.
+                            "Sun, 31 Feb 2026 12:00:00 GMT",
+                            // 2026 is not a leap year (not divisible by 4), so Feb only has 28
+                            // days; day 29 is invalid regardless of the weekday token.
+                            "Mon, 29 Feb 2026 00:00:00 GMT",
+                            // A real, validly-shaped date (Nov 6 1994, day-in-month and every
+                            // field in range) that actually falls on a Sunday, mislabeled here
+                            // as a Monday.
+                            "Mon, 06 Nov 1994 08:49:37 GMT"}) {
         if (is_rfc1123_http_date(bad)) {
             std::cerr << "FAIL [self-test malformed date]: accepted \"" << bad << "\"\n";
             ok = false;
