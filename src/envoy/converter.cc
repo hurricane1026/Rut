@@ -561,6 +561,25 @@ FrontendResult<NodePlanResult> build_node_plan(
                     last_span = route.span;
                     continue;
                 }
+                // Codex round-10 review: a repeat of this node's own exact
+                // literal, declared again after an earlier exact arm for the
+                // same literal already resolved it (`has_exact_arm`), is
+                // unreachable the same way the pre-own-prefix duplicate
+                // above is -- Envoy's first-match semantics already resolved
+                // bare `node_text` via that earlier arm, before either the
+                // own-prefix route or this repeat is ever reached. Without
+                // this check, this `saw_own_prefix` branch bypassed
+                // `has_exact_arm` and appended the duplicate as a second,
+                // dead terminal arm (plus its own duplicated HEAD/any-method
+                // forwarding policy), which could push an otherwise
+                // in-budget arm chain past the lexer's token limit. A
+                // genuinely NEW exact route for the bare literal declared
+                // after the own-prefix route (no earlier exact arm) is still
+                // the legitimate case below and must still produce this
+                // terminal arm: Envoy's `prefix: "N/"` never matches the
+                // bare literal `N`, so a later exact route for `N` is the
+                // first (and only) route that ever resolves it.
+                if (has_exact_arm(result.arms, q)) continue;
                 arm.is_terminal = true;
                 if (!result.arms.push(arm))
                     return out_of_memory(route.span, lit_str("too many routes to lower"));
@@ -1153,41 +1172,7 @@ FrontendResult<bool> validate(const Bootstrap& model, const RutCapabilities& cap
         if (!declared)
             return invalid(action.cluster_span,
                            lit_str("route cluster does not name a declared cluster"));
-        // PR #692 round-12 review, ported to the route-list model: revalidate
-        // the bounded length too, not just non-emptiness/equality.
-        // `name_string` (src/envoy/parser.cc:179-185) rejects every name
-        // over `kMaxEnvoyNameLen` during parsing, but nothing above
-        // re-checks that bound; a caller of the public
-        // `lower_to_rut(model, capabilities)` overload who sets a route's
-        // `action.cluster` and a declared cluster's `name` to the same
-        // overlong string still passes the equality check above and would
-        // otherwise lower successfully, accepting a model
-        // `parse_bootstrap_json` would reject. Checked for every route now
-        // that route lists may have more than one. The matching per-cluster
-        // `name` bound (and the `load_assignment_name` presence/equality
-        // revalidation) is ported into the per-cluster loop above instead of
-        // repeated here.
-        if (action.cluster.len > kMaxEnvoyNameLen)
-            return unsupported(action.cluster_span, lit_str("name exceeds the bounded length"));
     }
-    // PR #692 round-10 review: revalidate `virtual_host.name` too — the
-    // parser requires it non-empty (`parse_virtual_host`, "virtual host name
-    // must be a non-empty string", src/envoy/parser.cc), but the emitted RUT
-    // program never reads this field. A hand-built `Bootstrap` that clears
-    // `virtual_host.name` on a parsed copy (or never sets it) would
-    // otherwise still lower successfully, silently accepting a model
-    // `parse_bootstrap_json` would reject.
-    if (virtual_host.name.empty())
-        return invalid(virtual_host.name_span,
-                       lit_str("virtual host name must be a non-empty string"));
-    // PR #692 round-12 review: revalidate the bounded length too, the same
-    // gap the `action.cluster`/`cluster.name` length checks above close —
-    // `name_string` (src/envoy/parser.cc:179-185) rejects every name over
-    // `kMaxEnvoyNameLen` during parsing, but nothing re-checks that bound
-    // here, so a hand-built or mutated `Bootstrap` with an overlong
-    // `virtual_host.name` would otherwise still lower successfully.
-    if (virtual_host.name.len > kMaxEnvoyNameLen)
-        return unsupported(virtual_host.name_span, lit_str("name exceeds the bounded length"));
     // PR #692 round-9 review, ported to the route-list model: validation
     // never checked that parsing established `domains: ["*"]` on the
     // virtual host. A hand-built `Bootstrap`, or a parsed copy with
@@ -1200,6 +1185,27 @@ FrontendResult<bool> validate(const Bootstrap& model, const RutCapabilities& cap
     // shape as `hcm.type_url_span` and `hcm.generate_request_id_span` below.
     if (virtual_host.domains_span.start == 0u && virtual_host.domains_span.end == 0u)
         return invalid(virtual_host.span, lit_str("virtual host domains must be [\"*\"]"));
+    // Codex round-10 review: `parse_virtual_host`'s `name_string(...,
+    // /*allow_empty=*/false, ...)` (src/envoy/parser.cc) guarantees every
+    // parsed virtual host name is backed and non-empty. The public
+    // hand-built-model overload bypasses that: an empty or unbacked
+    // `virtual_host.name` carries no functional risk in THIS emission (the
+    // name is never copied into the generated RUT text), but leaving it
+    // unchecked would silently accept a bootstrap Envoy itself rejects at
+    // startup (`envoy.config.route.v3.VirtualHost.name` has `min_len: 1`),
+    // the same class of defensive-parity gap the cluster-name checks above
+    // close for `model.clusters[i].name`.
+    if (virtual_host.name.len == 0u || virtual_host.name.ptr == nullptr)
+        return invalid(virtual_host.name_span,
+                       lit_str("virtual host name must be a non-empty string"));
+    // PR #692 round-12 review: revalidate the bounded length too, the same
+    // gap the `action.cluster`/`cluster.name` length checks above close —
+    // `name_string` (src/envoy/parser.cc:179-185) rejects every name over
+    // `kMaxEnvoyNameLen` during parsing, but nothing re-checks that bound
+    // here, so a hand-built or mutated `Bootstrap` with an overlong
+    // `virtual_host.name` would otherwise still lower successfully.
+    if (virtual_host.name.len > kMaxEnvoyNameLen)
+        return unsupported(virtual_host.name_span, lit_str("name exceeds the bounded length"));
     // PR #692 round-4 review: revalidate the router filter's identity here
     // too, not just `suppress_envoy_headers` on it — a forged `router.name`
     // or a cleared `has_typed_config` would otherwise still lower
@@ -1226,24 +1232,6 @@ FrontendResult<bool> validate(const Bootstrap& model, const RutCapabilities& cap
             lit_str("network filter name must be envoy.filters.network.http_connection_manager"));
     if (hcm.type_url_span.start == 0u && hcm.type_url_span.end == 0u)
         return invalid(hcm.span, lit_str("network filter typed_config is required"));
-    // PR #692 round-10 review: revalidate `hcm.stat_prefix` too — the parser
-    // requires it non-empty (`stat_prefix must be a non-empty string`,
-    // src/envoy/parser.cc:419-425), but the emitted RUT program never reads
-    // this field. A hand-built `Bootstrap` that clears `stat_prefix` on a
-    // parsed copy (or never sets it) would otherwise still lower
-    // successfully, silently accepting a model `parse_bootstrap_json` would
-    // reject.
-    if (hcm.stat_prefix.empty())
-        return invalid(hcm.stat_prefix_span, lit_str("stat_prefix must be a non-empty string"));
-    // PR #692 round-12 review: revalidate the bounded length too, the same
-    // gap the `action.cluster`/`cluster.name`/`virtual_host.name` length
-    // checks close elsewhere in this function — `name_string`
-    // (src/envoy/parser.cc:179-185) rejects every name over
-    // `kMaxEnvoyNameLen` during parsing, but nothing re-checks that bound
-    // here, so a hand-built or mutated `Bootstrap` with an overlong
-    // `stat_prefix` would otherwise still lower successfully.
-    if (hcm.stat_prefix.len > kMaxEnvoyNameLen)
-        return unsupported(hcm.stat_prefix_span, lit_str("name exceeds the bounded length"));
     // PR #692 round-9 review: revalidate `codec_type` too, the same class of
     // gap the `type_url_span` check above closes one field over.
     // `codec_type_present` is the model's only record that `parse_hcm` ever
@@ -1276,6 +1264,25 @@ FrontendResult<bool> validate(const Bootstrap& model, const RutCapabilities& cap
         return invalid(hcm.span,
                        lit_str("generate_request_id: false is required; Rut does not generate "
                                "x-request-id"));
+    // Codex round-10 review: `parse_hcm`'s `name_string(..., /*allow_empty=*/
+    // false, ...)` (src/envoy/parser.cc) guarantees every parsed
+    // `stat_prefix` is backed and non-empty (Envoy's own v3
+    // `HttpConnectionManager.stat_prefix` has `min_len: 1`). The public
+    // hand-built-model overload bypasses that; `stat_prefix` is never
+    // copied into the generated RUT text either, but leaving it unchecked
+    // would silently accept a bootstrap Envoy itself rejects at startup,
+    // the same defensive-parity gap `virtual_host.name` above closes.
+    if (hcm.stat_prefix.len == 0u || hcm.stat_prefix.ptr == nullptr)
+        return invalid(hcm.stat_prefix_span, lit_str("stat_prefix must be a non-empty string"));
+    // PR #692 round-12 review: revalidate the bounded length too, the same
+    // gap the `action.cluster`/`cluster.name`/`virtual_host.name` length
+    // checks close elsewhere in this function — `name_string`
+    // (src/envoy/parser.cc:179-185) rejects every name over
+    // `kMaxEnvoyNameLen` during parsing, but nothing re-checks that bound
+    // here, so a hand-built or mutated `Bootstrap` with an overlong
+    // `stat_prefix` would otherwise still lower successfully.
+    if (hcm.stat_prefix.len > kMaxEnvoyNameLen)
+        return unsupported(hcm.stat_prefix_span, lit_str("name exceeds the bounded length"));
 
     // PR #692 round-9 review: require the presence bit too, not just the
     // value — a hand-built model with `suppress_envoy_headers = true` but
