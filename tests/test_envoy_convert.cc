@@ -1563,6 +1563,22 @@ TEST(envoy_convert, api_forged_model_rejected) {
     CHECK(
         to_string(forged_action_kind_result.error().detail).find("action kind is not recognized") !=
         std::string::npos);
+
+    // Codex round-6 review: a hand-built model can set `match.kind` to a
+    // value outside {Prefix, Path} (the parser never produces this) while
+    // leaving `match.prefix` at the model's existing "/" bytes. `validate()`
+    // used to only rule out `Path` explicitly, then check the byte content
+    // of `match.prefix`; a forged kind with `prefix == "/"` would pass both
+    // checks and lower as the root catch-all even though it names no
+    // recognized match kind.
+    envoy::Bootstrap forged_match_kind = parsed.value();
+    forged_match_kind.listener.filter_chain.hcm.route_config.virtual_host.routes[0].match.kind =
+        static_cast<envoy::RouteMatchKind>(2);
+    const auto forged_match_kind_result = envoy::lower_to_rut(forged_match_kind, all_true);
+    CHECK_FALSE(forged_match_kind_result);
+    CHECK(forged_match_kind_result.error().code == FrontendError::UnexpectedToken);
+    CHECK(to_string(forged_match_kind_result.error().detail).find("match kind is not recognized") !=
+          std::string::npos);
 }
 
 // ── Increment 4: reject route lists / direct_response / redirect before the

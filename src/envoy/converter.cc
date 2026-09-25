@@ -343,6 +343,18 @@ FrontendResult<bool> validate(const Bootstrap& model, const RutCapabilities& cap
     // `validate` must fail closed for direct model construction too.
     if (route.match.kind == RouteMatchKind::Path)
         return unsupported(route.match.span, lit_str("match.path is not lowered yet"));
+    // Codex round-6 review: the public hand-built-model overload does not go
+    // through the parser, whose `parse_route_match` only ever produces one of
+    // the two declared `RouteMatchKind` enumerators. Without this explicit
+    // check, a forged `match.kind` outside {Prefix, Path} (e.g.
+    // `static_cast<RouteMatchKind>(2)`) would skip both the Path rejection
+    // above and the byte-content check below whenever `match.prefix` happens
+    // to equal "/", reaching the `route "/"` catch-all lowering by
+    // elimination instead of by being verified as `Prefix` -- matching the
+    // defensive `RouteActionKind` check already applied to `action.kind`
+    // below.
+    if (route.match.kind != RouteMatchKind::Prefix)
+        return invalid(route.match.span, lit_str("match kind is not recognized"));
     if (!route.match.prefix.eq(lit_str("/")))
         return unsupported(
             route.match.span,
