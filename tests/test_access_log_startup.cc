@@ -18,10 +18,12 @@
 #include <netinet/in.h>
 #include <poll.h>
 #include <signal.h>
+#include <stdio.h>
 #include <sys/resource.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/wait.h>
+#include <time.h>
 #include <unistd.h>
 
 using namespace rut;
@@ -423,6 +425,20 @@ bool transact_loopback(u16 port,
 }
 #endif
 
+i64 monotonic_ns() {
+    struct timespec now{};
+    (void)clock_gettime(CLOCK_MONOTONIC, &now);
+    return static_cast<i64>(now.tv_sec) * 1'000'000'000LL + static_cast<i64>(now.tv_nsec);
+}
+
+// Milliseconds to wait in one poll step: at most 100, 0 once the deadline has passed.
+i32 poll_wait_ms(i64 deadline_ns) {
+    const i64 remaining_ns = deadline_ns - monotonic_ns();
+    if (remaining_ns <= 0) return 0;
+    if (remaining_ns >= 100'000'000LL) return 100;
+    return static_cast<i32>(remaining_ns / 1'000'000LL) + 1;
+}
+
 ProcessResult run_rut(const std::vector<std::string>& args,
                       bool enable_env_compression = false,
                       bool terminate_after_listening = false) {
@@ -457,15 +473,29 @@ ProcessResult run_rut(const std::vector<std::string>& args,
     char bytes[1024];
     bool reaped = false;
     bool termination_sent = false;
-    for (u32 attempt = 0; attempt < 50u && !reaped; attempt++) {
-        struct pollfd ready{output_pipe[0], POLLIN | POLLHUP, 0};
-        (void)poll(&ready, 1, 100);
+    bool output_eof = false;
+    // The budget is wall-clock time, never a count of wakeups. Output EOF (POLLHUP)
+    // arrives when the kernel closes the child's descriptors during exit, which can
+    // precede the child becoming reapable; once EOF is seen, poll(2) on the pipe
+    // returns immediately, so a wakeup-count budget could be spent in microseconds
+    // and SIGKILL a child that was already exiting 1.
+    const i64 deadline_ns = monotonic_ns() + 5'000'000'000LL;
+    while (!reaped) {
+        const i32 wait_ms = poll_wait_ms(deadline_ns);
+        if (wait_ms <= 0) break;
+        if (output_eof) {
+            (void)poll(nullptr, 0, wait_ms < 5 ? wait_ms : 5);
+        } else {
+            struct pollfd ready{output_pipe[0], POLLIN | POLLHUP, 0};
+            (void)poll(&ready, 1, wait_ms);
+        }
         for (;;) {
             const ssize_t n = read(output_pipe[0], bytes, sizeof(bytes));
             if (n > 0) {
                 result.output.append(bytes, static_cast<size_t>(n));
                 continue;
             }
+            if (n == 0) output_eof = true;
             if (n < 0 && errno == EINTR) continue;
             break;
         }
@@ -484,7 +514,11 @@ ProcessResult run_rut(const std::vector<std::string>& args,
     if (!reaped) {
         result.forced_kill = true;
         (void)kill(child, SIGKILL);
-        reaped = waitpid(child, &result.status, 0) == child;
+        pid_t waited;
+        do {
+            waited = waitpid(child, &result.status, 0);
+        } while (waited < 0 && errno == EINTR);
+        reaped = waited == child;
         if (reaped) result.status_valid = true;
     }
     for (;;) {
@@ -585,16 +619,26 @@ SourceLiveProxyResult run_source_live_proxy(
     bool transaction_attempted = false;
     bool backend_joined = false;
     bool termination_sent = false;
-    for (u32 attempt = 0; attempt < 80u && !reaped; attempt++) {
+    bool output_eof = false;
+    // Wall-clock budget; see run_rut for why a wakeup-count budget is unsound.
+    const i64 deadline_ns = monotonic_ns() + 8'000'000'000LL;
+    while (!reaped) {
+        const i32 wait_ms = poll_wait_ms(deadline_ns);
+        if (wait_ms <= 0) break;
         bool backend_joined_this_iteration = false;
-        struct pollfd ready{output_pipe[0], POLLIN | POLLHUP, 0};
-        (void)poll(&ready, 1, 100);
+        if (output_eof) {
+            (void)poll(nullptr, 0, wait_ms < 5 ? wait_ms : 5);
+        } else {
+            struct pollfd ready{output_pipe[0], POLLIN | POLLHUP, 0};
+            (void)poll(&ready, 1, wait_ms);
+        }
         for (;;) {
             const ssize_t n = read(output_pipe[0], bytes, sizeof(bytes));
             if (n > 0) {
                 result.process.output.append(bytes, static_cast<size_t>(n));
                 continue;
             }
+            if (n == 0) output_eof = true;
             if (n < 0 && errno == EINTR) continue;
             break;
         }
@@ -636,7 +680,11 @@ SourceLiveProxyResult run_source_live_proxy(
     if (!reaped) {
         result.process.forced_kill = true;
         (void)kill(child, SIGKILL);
-        reaped = waitpid(child, &result.process.status, 0) == child;
+        pid_t waited;
+        do {
+            waited = waitpid(child, &result.process.status, 0);
+        } while (waited < 0 && errno == EINTR);
+        reaped = waited == child;
         if (reaped) result.process.status_valid = true;
     }
     for (;;) {
@@ -664,8 +712,22 @@ u32 count_occurrences(const std::string& text, const std::string& needle) {
 }
 
 bool exited_one(const ProcessResult& result) {
-    return result.status_valid && !result.forced_kill && WIFEXITED(result.status) &&
-           WEXITSTATUS(result.status) == 1;
+    const bool ok = result.status_valid && !result.forced_kill && WIFEXITED(result.status) &&
+                    WEXITSTATUS(result.status) == 1;
+    if (!ok) {
+        // Make the next failure self-describing: which way the status disagreed.
+        (void)fprintf(stderr,
+                      "    exited_one: status_valid=%d forced_kill=%d exited=%d code=%d "
+                      "signaled=%d signal=%d output=[%s]\n",
+                      result.status_valid ? 1 : 0,
+                      result.forced_kill ? 1 : 0,
+                      WIFEXITED(result.status) ? 1 : 0,
+                      WIFEXITED(result.status) ? WEXITSTATUS(result.status) : -1,
+                      WIFSIGNALED(result.status) ? 1 : 0,
+                      WIFSIGNALED(result.status) ? WTERMSIG(result.status) : 0,
+                      result.output.c_str());
+    }
+    return ok;
 }
 
 std::string source_with_sink(const std::string& sink) {
@@ -690,6 +752,17 @@ std::string source_live_proxy(const std::string& sink, u16 backend_port) {
 #endif
 
 }  // namespace
+
+TEST(access_log_startup, process_helper_waits_for_exit_after_output_eof) {
+    // A child's output reaches EOF before the child is reapable: the kernel closes its
+    // descriptors on the way out. Widen that window deterministically; the helper must
+    // report the real exit status instead of spending its budget and SIGKILLing.
+    ProcessResult result =
+        run_rut({"/bin/sh", "-c", "echo before-close; exec >&- 2>&-; sleep 0.2; exit 1"});
+    REQUIRE(exited_one(result));
+    CHECK_FALSE(result.forced_kill);
+    CHECK(result.output.find("before-close") != std::string::npos);
+}
 
 #ifdef RUT_ACCESS_LOG_STARTUP_SOURCE_PROCESS_TEST
 TEST(access_log_startup, public_main_source_live_publishes_downstream_size_before_shutdown) {
