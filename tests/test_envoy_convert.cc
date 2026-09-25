@@ -212,6 +212,34 @@ private:
     std::string path_;
 };
 
+// PR #692 round-8 review: a fatal `REQUIRE` inside the polling loop of
+// `cli_input_toctou_same_size_rewrite_never_admits_torn_read` below used to
+// `return` from the test while the racing writer thread was still joinable
+// (`stop`/`writer.join()` ran only after the loop). Destroying a joinable
+// `std::thread` calls `std::terminate`, so a single failed iteration aborted
+// the whole test binary instead of just failing that test. This guard stops
+// and joins the writer no matter how the enclosing scope is left — a normal
+// fall-through, or an early `REQUIRE` return — mirroring `TempDir` above.
+class StopAndJoinThread {
+public:
+    StopAndJoinThread(std::atomic<bool>& stop, std::thread& thread)
+        : stop_(stop), thread_(thread) {}
+
+    ~StopAndJoinThread() {
+        stop_.store(true, std::memory_order_relaxed);
+        if (thread_.joinable()) thread_.join();
+    }
+
+    StopAndJoinThread(const StopAndJoinThread&) = delete;
+    StopAndJoinThread& operator=(const StopAndJoinThread&) = delete;
+    StopAndJoinThread(StopAndJoinThread&&) = delete;
+    StopAndJoinThread& operator=(StopAndJoinThread&&) = delete;
+
+private:
+    std::atomic<bool>& stop_;
+    std::thread& thread_;
+};
+
 std::string expected_location(const std::string& path, Span span) {
     char buf[512];
     snprintf(buf,
@@ -472,6 +500,11 @@ TEST(envoy_convert, cli_input_toctou_same_size_rewrite_never_admits_torn_read) {
             (void)pwrite(fd, content_b.data(), content_b.size(), 0);
         }
     });
+    // Declared immediately after the thread starts and before the first
+    // fatal `REQUIRE` below, so an early return from this test (or an
+    // exception) still stops and joins `writer` during unwind instead of
+    // destroying a joinable thread.
+    StopAndJoinThread join_writer(stop, writer);
 
     u32 changed_detected = 0;
     constexpr int kIterations = 300;
@@ -840,6 +873,23 @@ TEST(envoy_convert, api_forged_model_rejected) {
     CHECK(cleared_generate_request_id_result.error().code == FrontendError::UnexpectedToken);
     CHECK(to_string(cleared_generate_request_id_result.error().detail)
               .find("generate_request_id: false is required") != std::string::npos);
+
+    // PR #692 round-8 review: a cleared `cluster.load_assignment_name_present`
+    // — the model's only record that `parse_bootstrap_json` ever saw and
+    // validated `load_assignment.cluster_name` — must also be rejected. A
+    // hand-built `Bootstrap` that never populated `load_assignment` (or a
+    // caller who cleared the bit on a parsed copy) still has a matching
+    // `action.cluster` / `cluster.name` pair and would otherwise lower
+    // successfully, emitting a working gateway for a bootstrap Envoy would
+    // reject at startup.
+    envoy::Bootstrap cleared_load_assignment_name = parsed.value();
+    cleared_load_assignment_name.cluster.load_assignment_name_present = false;
+    const auto cleared_load_assignment_name_result =
+        envoy::lower_to_rut(cleared_load_assignment_name, all_true);
+    CHECK_FALSE(cleared_load_assignment_name_result);
+    CHECK(cleared_load_assignment_name_result.error().code == FrontendError::UnexpectedToken);
+    CHECK(to_string(cleared_load_assignment_name_result.error().detail)
+              .find("load_assignment.cluster_name is required") != std::string::npos);
 }
 
 int main(int argc, char** argv) {

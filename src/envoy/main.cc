@@ -91,6 +91,39 @@ int input_error(const char* filename, const char* detail) {
 // `doc` and `output` below.
 static char g_input_buffer[kMaxInputBytes + 1u];
 
+// PR #692 round-8 review: second, independent read used to verify the first
+// one below (`read_input`'s content re-check) — see the round-8 comment
+// there for why a metadata-only comparison is not sufficient. Same
+// static-storage rationale as `g_input_buffer` above.
+static char g_verify_buffer[kMaxInputBytes + 1u];
+
+// Reads the whole of `fd` from offset 0 into `buffer` (capacity `capacity`),
+// the same loop shape `read_input` used inline before round-8 split it out
+// so both the primary read and the round-8 content-verification re-read
+// share one implementation. Uses `pread` (not the shared file offset) so a
+// second call starts at byte 0 regardless of where the first left the
+// offset.
+bool read_whole_file(int fd, char* buffer, size_t capacity, size_t* out_used, const char** error) {
+    size_t used = 0u;
+    for (;;) {
+        const ssize_t count = pread(fd, buffer + used, capacity - used, static_cast<off_t>(used));
+        if (count > 0) {
+            used += static_cast<size_t>(count);
+            if (used > kMaxInputBytes) {
+                *error = "input exceeds the 1 MiB limit";
+                return false;
+            }
+            continue;
+        }
+        if (count == 0) break;
+        if (errno == EINTR) continue;
+        *error = strerror(errno);
+        return false;
+    }
+    *out_used = used;
+    return true;
+}
+
 bool read_input(const char* filename, char** output, size_t* length, const char** error) {
     *output = nullptr;
     *length = 0u;
@@ -119,22 +152,8 @@ bool read_input(const char* filename, char** output, size_t* length, const char*
     }
 
     char* const buffer = g_input_buffer;
-    const size_t capacity = sizeof(g_input_buffer);
     size_t used = 0u;
-    for (;;) {
-        const ssize_t count = read(fd, buffer + used, capacity - used);
-        if (count > 0) {
-            used += static_cast<size_t>(count);
-            if (used > kMaxInputBytes) {
-                *error = "input exceeds the 1 MiB limit";
-                close(fd);
-                return false;
-            }
-            continue;
-        }
-        if (count == 0) break;
-        if (errno == EINTR) continue;
-        *error = strerror(errno);
+    if (!read_whole_file(fd, buffer, sizeof(g_input_buffer), &used, error)) {
         close(fd);
         return false;
     }
@@ -142,11 +161,6 @@ bool read_input(const char* filename, char** output, size_t* length, const char*
     if (fstat(fd, &after) != 0) {
         *error = strerror(errno);
         close(fd);
-        return false;
-    }
-    const int close_result = close(fd);
-    if (close_result != 0) {
-        *error = strerror(errno);
         return false;
     }
     // PR #692 round-3 review: comparing only `after.st_size` to `used` (the
@@ -161,17 +175,47 @@ bool read_input(const char* filename, char** output, size_t* length, const char*
     // pair — catches that case: an in-place rewrite that lands entirely
     // between `before` and this `after` snapshot always advances the file's
     // mtime/ctime, even when it leaves the length identical, and a
-    // replace-via-rename changes the inode. This is still not a perfect
-    // atomic-snapshot guarantee (a rewrite could in principle restore
-    // identical metadata down to the nanosecond), but it closes the concrete
-    // same-size gap the review reported, which the size-only check could
-    // never see.
+    // replace-via-rename changes the inode. Kept as a cheap pre-check (fails
+    // fast, no second read needed) ahead of the round-8 content check below,
+    // which is what actually proves the bytes are stable.
     if (after.st_size < 0 || static_cast<uintmax_t>(after.st_size) != used ||
         before.st_dev != after.st_dev || before.st_ino != after.st_ino ||
         before.st_size != after.st_size || mtime_of(before).tv_sec != mtime_of(after).tv_sec ||
         mtime_of(before).tv_nsec != mtime_of(after).tv_nsec ||
         ctime_of(before).tv_sec != ctime_of(after).tv_sec ||
         ctime_of(before).tv_nsec != ctime_of(after).tv_nsec) {
+        *error = "input changed while it was being read";
+        close(fd);
+        return false;
+    }
+    // PR #692 round-8 review: identical device/inode/size/mtime/ctime is not
+    // proof the content is stable. A same-size in-place rewrite through an
+    // existing shared mapping (mmap + memcpy, no write()/rename()) need not
+    // touch any of those fields at all, and even an ordinary write()-based
+    // rewrite can land twice within the filesystem timestamp's granularity
+    // and still leave `before`/`after` identical. Because the read loop
+    // above and either of those writes are not a single atomic operation,
+    // the buffer can still contain pages from two different revisions and,
+    // if that torn mixture happens to be valid JSON, lower successfully.
+    // Re-reading the whole file into a second, independent buffer and
+    // requiring exact byte-for-byte equality (not just equal length) with
+    // the first read is a real content check: any revision change wide
+    // enough to matter to the parser — or any torn mixture of two
+    // revisions — makes the two reads disagree somewhere, and two
+    // consecutive reads that agree everywhere are the closest thing to a
+    // stable snapshot available without an explicit lock (`flock`) or
+    // copy-on-write snapshot the target filesystem may not support.
+    size_t verify_used = 0u;
+    if (!read_whole_file(fd, g_verify_buffer, sizeof(g_verify_buffer), &verify_used, error)) {
+        close(fd);
+        return false;
+    }
+    const int close_result = close(fd);
+    if (close_result != 0) {
+        *error = strerror(errno);
+        return false;
+    }
+    if (verify_used != used || memcmp(buffer, g_verify_buffer, used) != 0) {
         *error = "input changed while it was being read";
         return false;
     }

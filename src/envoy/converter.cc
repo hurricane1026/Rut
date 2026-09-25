@@ -227,6 +227,20 @@ FrontendResult<bool> validate(const Bootstrap& model, const RutCapabilities& cap
     if (!action.cluster.eq(model.cluster.name))
         return invalid(action.cluster_span,
                        lit_str("route cluster does not name a declared cluster"));
+    // PR #692 round-8 review: `load_assignment_name_present` is the model's
+    // only record that `parse_bootstrap_json` ever saw and validated
+    // `load_assignment.cluster_name` (required, non-empty, and equal to
+    // `cluster.name` per Envoy's v3 `ClusterLoadAssignment.cluster_name`
+    // `min_len: 1`) — the same evidence-bit shape as `hcm.type_url_span`
+    // (round-5) and `hcm.generate_request_id_span` (round-6). A hand-built
+    // `Bootstrap` passed to the public `lower_to_rut(model, capabilities)`
+    // overload that never populated `load_assignment` (or a caller who
+    // cleared the bit on a parsed copy) still has a matching `action.cluster`
+    // / `cluster.name` pair and would otherwise lower successfully, emitting
+    // a working gateway for a bootstrap Envoy would reject at startup.
+    if (!model.cluster.load_assignment_name_present)
+        return invalid(model.cluster.span,
+                       lit_str("cluster load_assignment.cluster_name is required"));
     // PR #692 round-3 review: the emitted route is always the literal `"/"`
     // catch-all (see put_forward_route below) — nothing about the route's
     // actual `match.prefix` value ever reaches the generated text. A model
