@@ -1095,7 +1095,18 @@ inline VerifyResult verify_module_impl(const Module& mod,
                   mod.failure_policies[bundle.failure_policy_id - 1]))) ||
             (seconds != 0 && !response_read_timeout_seconds_valid(seconds)) ||
             !forward_response_buffering_mode_valid(bundle.response_buffering) ||
-            (seconds == 0 && bundle.failure_policy_id == 0))
+            (seconds == 0 && bundle.failure_policy_id == 0) ||
+            // `header_order: "upstream"` is ordinary-forward-only (see
+            // analyze.cc): it never carries response read timing, response
+            // buffering, or a timeout failure policy bundle. Mirror the
+            // compile_to_config.h rejection here so a hand-built module that
+            // skipped analyze cannot be reported as verified and only fail
+            // later during populate_route_config.
+            (bundle.response_policy_id != 0 &&
+             mod.response_policies[bundle.response_policy_id - 1].header_order ==
+                 ResponsePolicyHeaderOrder::Upstream &&
+             (seconds != 0 || bundle.response_buffering != ForwardResponseBufferingMode::None ||
+              bundle.timeout_failure_policy_id != 0)))
             return verify_fail(summary, VerifyIssueCode::InvalidForwardPreflight, 0);
         if (bundle.response_buffering != ForwardResponseBufferingMode::None &&
             (bundle.response_buffering != ForwardResponseBufferingMode::CompleteContentLength ||
