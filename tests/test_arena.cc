@@ -902,6 +902,9 @@ TEST(response_body_chain, fragmented_bytes_drain_without_copying_live_nodes) {
 TEST(response_body_chain, exhausted_reservation_is_atomic_and_reusable) {
     SlicePool pool;
     REQUIRE(pool.init(2).has_value());
+    // Exercise slice exhaustion alone: take every bulk buffer first.
+    u8* bulk[SlicePool::kBulkSlices]{};
+    for (u8*& b : bulk) REQUIRE((b = pool.alloc_bulk()) != nullptr);
     ResponseBodyChain chain;
     u8 bytes[SlicePool::kSliceSize]{};
     bytes[0] = 91;
@@ -919,6 +922,77 @@ TEST(response_body_chain, exhausted_reservation_is_atomic_and_reusable) {
     CHECK_EQ(pool.in_use(), 0u);
     REQUIRE(chain.append(pool, bytes, 1));
     CHECK_EQ(chain.data()[0], 91);
+    chain.release();
+    for (u8* b : bulk) pool.free(b);
+    pool.destroy();
+}
+
+TEST(response_body_chain, proven_large_body_moves_into_bulk_nodes) {
+    SlicePool pool;
+    REQUIRE(pool.init(80).has_value());
+    ResponseBodyChain chain;
+    static u8 body[ResponseBodyChain::kMaxBody];
+    for (u32 i = 0; i < sizeof(body); ++i) body[i] = static_cast<u8>(i * 13 + i / 97);
+    // The first receive fits one slice: it takes an ordinary slice.
+    u32 stored = ResponseBodyChain::kPayload;
+    REQUIRE(chain.append(pool, body, stored));
+    CHECK_FALSE(pool.is_bulk(reinterpret_cast<const u8*>(chain.head)));
+    CHECK_EQ(chain.front_size(), ResponseBodyChain::kPayload);
+    // Once the body outgrew a slice, new nodes are bulk buffers.
+    while (stored < sizeof(body)) {
+        const u32 n = sizeof(body) - stored < SlicePool::kSliceSize ? sizeof(body) - stored
+                                                                    : SlicePool::kSliceSize;
+        REQUIRE(chain.append(pool, body + stored, n));
+        stored += n;
+    }
+    CHECK_EQ(chain.size, ResponseBodyChain::kMaxBody);
+    REQUIRE(chain.head->next != nullptr);
+    CHECK(pool.is_bulk(reinterpret_cast<const u8*>(chain.head->next)));
+    CHECK_LT(pool.bulk_available(), SlicePool::kBulkSlices);
+    CHECK(!chain.append(pool, body, 1));  // the body bound is unchanged
+    u32 offset = 0;
+    u32 largest_front = 0;
+    while (chain.size != 0) {
+        const u32 front = chain.front_size();
+        if (front > largest_front) largest_front = front;
+        CHECK_EQ(__builtin_memcmp(chain.data(), body + offset, front), 0);
+        chain.consume(front);
+        offset += front;
+    }
+    CHECK_EQ(offset, ResponseBodyChain::kMaxBody);
+    CHECK_GT(largest_front, SlicePool::kSliceSize);  // sends leave in bulk steps
+    CHECK_EQ(pool.in_use(), 0u);
+    CHECK_EQ(pool.bulk_available(), SlicePool::kBulkSlices);
+    chain.release();
+    pool.destroy();
+}
+
+TEST(response_body_chain, tls_threshold_keeps_short_bodies_in_slices) {
+    SlicePool pool;
+    REQUIRE(pool.init(80).has_value());
+    ResponseBodyChain chain;
+    static u8 body[ResponseBodyChain::kBulkAfterTls + ResponseBodyChain::kPayload];
+    for (u32 i = 0; i < sizeof(body); ++i) body[i] = static_cast<u8>(i * 7 + i / 131);
+    u32 stored = 0;
+    while (stored < ResponseBodyChain::kBulkAfterTls) {
+        REQUIRE(chain.append(
+            pool, body + stored, ResponseBodyChain::kPayload, ResponseBodyChain::kBulkAfterTls));
+        stored += ResponseBodyChain::kPayload;
+    }
+    CHECK_EQ(pool.bulk_available(), SlicePool::kBulkSlices);  // still all slices
+    REQUIRE(chain.append(
+        pool, body + stored, ResponseBodyChain::kPayload, ResponseBodyChain::kBulkAfterTls));
+    CHECK_EQ(pool.bulk_available(), SlicePool::kBulkSlices - 1u);
+    CHECK(pool.is_bulk(reinterpret_cast<const u8*>(chain.tail)));
+    u32 offset = 0;
+    while (chain.size != 0) {
+        const u32 front = chain.front_size();
+        CHECK_EQ(__builtin_memcmp(chain.data(), body + offset, front), 0);
+        chain.consume(front);
+        offset += front;
+    }
+    CHECK_EQ(offset, sizeof(body));
+    CHECK_EQ(pool.bulk_available(), SlicePool::kBulkSlices);
     chain.release();
     pool.destroy();
 }

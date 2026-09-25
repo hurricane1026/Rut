@@ -11919,6 +11919,11 @@ TEST(slice_pool, buffered_response_capacity_covers_each_connection) {
 
     SlicePool pool;
     REQUIRE(pool.init(SlicePool::capacity_for_connections(2)).has_value());
+    // The slice sizing must hold on its own: bulk buffers are an optional
+    // bounded extra, so take them all first.
+    u8* bulk[SlicePool::kBulkSlices]{};
+    for (u8*& b : bulk) REQUIRE((b = pool.alloc_bulk()) != nullptr);
+    CHECK_EQ(pool.alloc_bulk(), nullptr);
     u8* ordinary[SlicePool::kOrdinarySlicesPerConnection * 2]{};
     for (u8*& slice : ordinary) REQUIRE((slice = pool.alloc()) != nullptr);
 
@@ -11939,7 +11944,77 @@ TEST(slice_pool, buffered_response_capacity_covers_each_connection) {
     chain.release();
     second_chain.release();
     for (u8* slice : ordinary) pool.free(slice);
+    for (u8* b : bulk) pool.free(b);
     CHECK_EQ(pool.available(), pool.max_count);
+    CHECK_EQ(pool.bulk_available(), SlicePool::kBulkSlices);
+    pool.destroy();
+}
+
+TEST(slice_pool, bulk_buffers_are_lazy_bounded_zeroed_and_address_routed) {
+    SlicePool pool;
+    REQUIRE(pool.init(4).has_value());
+    CHECK_EQ(pool.bulk_base, nullptr);  // not mapped until first use
+    CHECK_EQ(pool.bulk_available(), SlicePool::kBulkSlices);
+    u8* slice = pool.alloc();
+    REQUIRE(slice != nullptr);
+    CHECK_FALSE(pool.is_bulk(slice));
+    CHECK_EQ(pool.capacity_of(slice), SlicePool::kSliceSize);
+
+    u8* first = pool.alloc_bulk();
+    REQUIRE(first != nullptr);
+    CHECK(pool.is_bulk(first));
+    CHECK_EQ(pool.capacity_of(first), SlicePool::kBulkSliceSize);
+    __builtin_memset(first, 0xa5, SlicePool::kBulkSliceSize);
+    pool.free(first);  // routed to the bulk set by address
+    CHECK_EQ(pool.bulk_available(), SlicePool::kBulkSlices);
+    CHECK_EQ(pool.in_use(), 1u);  // the ordinary slice is untouched
+    pool.free(first);             // duplicate free is ignored
+    CHECK_EQ(pool.bulk_available(), SlicePool::kBulkSlices);
+    pool.free(first + 1);  // misaligned pointer is ignored
+    CHECK_EQ(pool.bulk_available(), SlicePool::kBulkSlices);
+
+    u8* all[SlicePool::kBulkSlices]{};
+    for (u8*& b : all) REQUIRE((b = pool.alloc_bulk()) != nullptr);
+    CHECK_EQ(pool.alloc_bulk(), nullptr);  // bounded: exhaustion is not an error
+    CHECK_EQ(pool.bulk_available(), 0u);
+    bool reused_first = false;
+    for (u8* b : all) reused_first |= b == first;
+    REQUIRE(reused_first);
+    for (u32 i = 0; i < SlicePool::kBulkSliceSize; ++i) {
+        if (first[i] != 0) {
+            CHECK_EQ(first[i], 0u);  // a returned buffer never exposes old bytes
+            break;
+        }
+    }
+    for (u8* b : all) pool.free(b);
+    CHECK_EQ(pool.bulk_available(), SlicePool::kBulkSlices);
+    pool.free(slice);
+    pool.destroy();
+    CHECK_EQ(pool.bulk_base, nullptr);
+    CHECK_FALSE(pool.is_bulk(first));
+}
+
+TEST(slice_pool, bulk_free_written_rezeroes_the_written_prefix) {
+    SlicePool pool;
+    REQUIRE(pool.init(4).has_value());
+    u8* all[SlicePool::kBulkSlices]{};
+    for (u8*& b : all) REQUIRE((b = pool.alloc_bulk()) != nullptr);
+    u8* const target = all[0];
+    __builtin_memset(target, 0x3c, 4096);
+    pool.free_written(target, 4096);
+    for (u32 i = 1; i < SlicePool::kBulkSlices; ++i) pool.free(all[i]);
+    for (u8*& b : all) REQUIRE((b = pool.alloc_bulk()) != nullptr);
+    bool found = false;
+    for (u8* b : all) found |= b == target;
+    REQUIRE(found);
+    bool all_zero = true;
+    for (u32 i = 0; i < SlicePool::kBulkSliceSize; ++i) all_zero &= target[i] == 0;
+    CHECK(all_zero);
+    // An overstated extent is clamped to the buffer.
+    pool.free_written(target, 0xFFFFFFFFu);
+    for (u8* b : all)
+        if (b != target) pool.free(b);
+    CHECK_EQ(pool.bulk_available(), SlicePool::kBulkSlices);
     pool.destroy();
 }
 
@@ -33618,9 +33693,13 @@ TEST(iouring_upstream_recv, one_shot_moves_slice_sized_chunks_through_dedicated_
              static_cast<u16>(large_tail + 2u));
     CHECK_EQ(__atomic_load_n(&backend.buf_ring->tail, __ATOMIC_ACQUIRE), small_tail);
 
-    // Ids past the dedicated ring are never treated as selected buffers.
+    // Ids past the dedicated ring belong to the bulk ring only when it is
+    // registered; ids past the bulk ring are never treated as selected buffers.
+    CHECK_EQ(backend.provided_buffer_id_valid(
+                 static_cast<u16>(kLargeProvidedBufIdBase + kLargeProvidedBufCount)),
+             backend.bulk_buf_ring != nullptr);
     CHECK_FALSE(backend.provided_buffer_id_valid(
-        static_cast<u16>(kLargeProvidedBufIdBase + kLargeProvidedBufCount)));
+        static_cast<u16>(kBulkProvidedBufIdBase + kBulkProvidedBufCount)));
     fixture.cleanup();
 }
 
@@ -33716,7 +33795,10 @@ TEST(iouring_upstream_recv, empty_ring_terminal_rearms_one_shot_body_recv) {
                 loop->backend.sq_entries[tail_after_first & *loop->backend.sq_ring_mask];
             CHECK_EQ(sqe.opcode, static_cast<u8>(IORING_OP_RECV));
             CHECK_EQ(sqe.ioprio & IORING_RECV_MULTISHOT, 0u);
-            CHECK_EQ(sqe.len, loop->backend.upstream_once_max_len());
+            CHECK_EQ(sqe.len,
+                     conn.upstream_recv_buf.write_avail() < loop->backend.upstream_once_max_len()
+                         ? conn.upstream_recv_buf.write_avail()
+                         : loop->backend.upstream_once_max_len());
         } else {
             // Unmarked -ENOBUFS keeps the established body-pump contract.
             CHECK_FALSE(conn.upstream_recv_armed);
@@ -33805,7 +33887,10 @@ TEST(iouring_upstream_relay, sends_one_slice_while_next_recv_fills_the_other) {
     CHECK_EQ(send_sqe.len, kSlice);
     CHECK_EQ(recv_sqe.opcode, static_cast<u8>(IORING_OP_RECV));
     CHECK_EQ(recv_sqe.ioprio & IORING_RECV_MULTISHOT, 0u);
-    CHECK_EQ(recv_sqe.len, loop->backend.upstream_once_max_len());
+    // A short body keeps ordinary slices: the recv asks for one slice.
+    CHECK_EQ(recv_sqe.len, kSlice);
+    CHECK_EQ(recv_sqe.buf_group,
+             loop->backend.large_buf_ring != nullptr ? kLargeBufGroupId : kBufGroupId);
 
     // The next chunk lands while the send is in flight: it stays buffered.
     conn.upstream_recv_armed = false;
@@ -33832,6 +33917,112 @@ TEST(iouring_upstream_relay, sends_one_slice_while_next_recv_fills_the_other) {
     const auto& replay_send = loop->backend.sq_entries[tail1 & mask];
     CHECK_EQ(replay_send.addr, reinterpret_cast<u64>(second));
     CHECK_EQ(replay_send.len, kNext);
+    settle_relay_ops(conn);
+    fixture.cleanup();
+}
+
+TEST(iouring_upstream_relay, large_body_relays_through_bulk_buffers_and_returns_them) {
+    ScopedIoUringLoopForRetirement guard;
+    if (!guard.init()) SKIP("io_uring unavailable");
+    auto* loop = guard.loop;
+    if (loop->backend.bulk_buf_ring == nullptr) SKIP("bulk provided-buffer ring unavailable");
+    constexpr u32 kSlice = SlicePool::kSliceSize;
+    constexpr u32 kBulk = SlicePool::kBulkSliceSize;
+    OneShotRecvFixture fixture;
+    REQUIRE(stage_relay_body(fixture, loop, kSlice, 64u * kSlice));
+    Connection& conn = *fixture.conn;
+    SlicePool& pool = loop->pool;
+    u8* const first = conn.upstream_recv_slice;
+    const u32 bulk_before = pool.bulk_available();
+    const u32 tail0 = __atomic_load_n(loop->backend.sq_tail, __ATOMIC_ACQUIRE);
+
+    on_response_body_recvd<IoUringEventLoop>(loop, conn, relay_upstream_event(conn, kSlice));
+
+    // Enough body remains: the idle relay slice was traded for a bulk buffer
+    // and the recv asks the bulk ring for a whole bulk buffer.
+    REQUIRE_EQ(conn.upstream_relay_slice, first);
+    u8* const bulk_a = conn.upstream_recv_slice;
+    CHECK(pool.is_bulk(bulk_a));
+    CHECK_EQ(conn.upstream_recv_buf.capacity(), kBulk);
+    CHECK_EQ(pool.bulk_available(), bulk_before - 1u);
+    const u32 mask = *loop->backend.sq_ring_mask;
+    REQUIRE_EQ(__atomic_load_n(loop->backend.sq_tail, __ATOMIC_ACQUIRE), tail0 + 2u);
+    const auto& recv_sqe = loop->backend.sq_entries[(tail0 + 1u) & mask];
+    CHECK_EQ(recv_sqe.opcode, static_cast<u8>(IORING_OP_RECV));
+    CHECK_EQ(recv_sqe.len, kBulk);
+    CHECK_EQ(recv_sqe.buf_group, kBulkBufGroupId);
+
+    // A bulk-sized chunk lands while the first send is in flight; once that send
+    // drains, the chunk is relayed and the freed first slice is traded too.
+    conn.upstream_recv_armed = false;
+    conn.pending_ops--;
+    for (u32 i = 0; i < kBulk; i++) conn.upstream_recv_buf.write_ptr()[i] = static_cast<u8>(i);
+    conn.upstream_recv_buf.commit(kBulk);
+    on_response_body_recvd<IoUringEventLoop>(loop, conn, relay_upstream_event(conn, kBulk));
+    CHECK_EQ(conn.upstream_relay_send_len, kSlice);  // still buffered behind the send
+    const u32 tail1 = __atomic_load_n(loop->backend.sq_tail, __ATOMIC_ACQUIRE);
+    on_response_body_sent<IoUringEventLoop>(loop, conn, relay_send_event(conn, kSlice));
+    CHECK_EQ(conn.upstream_relay_send_len, kBulk);
+    CHECK_EQ(conn.upstream_relay_slice, bulk_a);
+    u8* const bulk_b = conn.upstream_recv_slice;
+    CHECK(pool.is_bulk(bulk_b));
+    CHECK(bulk_b != bulk_a);
+    CHECK_EQ(pool.bulk_available(), bulk_before - 2u);
+    REQUIRE_EQ(__atomic_load_n(loop->backend.sq_tail, __ATOMIC_ACQUIRE), tail1 + 2u);
+    const auto& bulk_send = loop->backend.sq_entries[tail1 & mask];
+    CHECK_EQ(bulk_send.addr, reinterpret_cast<u64>(bulk_a));
+    CHECK_EQ(bulk_send.len, kBulk);
+
+    // Response boundary: the relay buffer and the bulk recv buffer go back to
+    // the bulk set; the connection keeps one ordinary slice.
+    settle_relay_ops(conn);
+    conn.upstream_relay_send_len = 0;
+    conn.upstream_recv_armed = false;
+    conn.upstream_recv_buf.reset();
+    loop->release_upstream_relay_slice(conn);
+    CHECK_EQ(conn.upstream_relay_slice, nullptr);
+    REQUIRE(conn.upstream_recv_slice != nullptr);
+    CHECK_FALSE(pool.is_bulk(conn.upstream_recv_slice));
+    CHECK_EQ(conn.upstream_recv_buf.capacity(), kSlice);
+    CHECK_EQ(pool.bulk_available(), bulk_before);
+    fixture.cleanup();
+}
+
+TEST(iouring_upstream_relay, serialized_pump_moves_buffered_bytes_into_a_bulk_buffer) {
+    ScopedIoUringLoopForRetirement guard;
+    if (!guard.init()) SKIP("io_uring unavailable");
+    auto* loop = guard.loop;
+    constexpr u32 kSlice = SlicePool::kSliceSize;
+    OneShotRecvFixture fixture;
+    REQUIRE(stage_relay_body(fixture, loop, kSlice, 64u * kSlice));
+    Connection& conn = *fixture.conn;
+    SlicePool& pool = loop->pool;
+    const u32 bulk_before = pool.bulk_available();
+    conn.upstream_recv_buf.reset();
+    for (u32 i = 0; i < 100; i++) conn.upstream_recv_buf.write_ptr()[i] = static_cast<u8>(i + 7);
+    conn.upstream_recv_buf.commit(100);
+
+    loop->upgrade_upstream_recv_to_bulk(conn);
+    REQUIRE(pool.is_bulk(conn.upstream_recv_slice));
+    CHECK_EQ(conn.upstream_recv_buf.capacity(), SlicePool::kBulkSliceSize);
+    CHECK_EQ(conn.upstream_recv_buf.len(), 100u);
+    for (u32 i = 0; i < 100; i++)
+        CHECK_EQ(conn.upstream_recv_buf.data()[i], static_cast<u8>(i + 7));
+    CHECK_EQ(pool.bulk_available(), bulk_before - 1u);
+
+    // Already bulk: a second call changes nothing.
+    u8* const bulk = conn.upstream_recv_slice;
+    loop->upgrade_upstream_recv_to_bulk(conn);
+    CHECK_EQ(conn.upstream_recv_slice, bulk);
+
+    // A short remainder never upgrades.
+    conn.upstream_recv_buf.reset();
+    loop->release_upstream_relay_slice(conn);
+    CHECK_FALSE(pool.is_bulk(conn.upstream_recv_slice));
+    CHECK_EQ(pool.bulk_available(), bulk_before);
+    conn.resp_body_remaining = IoUringEventLoop::kBulkRelayMinRemaining - 1u;
+    loop->upgrade_upstream_recv_to_bulk(conn);
+    CHECK_FALSE(pool.is_bulk(conn.upstream_recv_slice));
     settle_relay_ops(conn);
     fixture.cleanup();
 }
