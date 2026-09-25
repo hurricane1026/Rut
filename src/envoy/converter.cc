@@ -252,6 +252,27 @@ bool put_forward_call(Writer& w, u32 cluster_index, bool include_head_mode) {
 // everything) or `p == N` or `p` starts with `N + "/"`. `M` is a *strict
 // ancestor* of `N` iff `M != N` and `N` is under `M`.
 //
+// Global shadowing (Codex round-9): a candidate node `N(P)` is dropped
+// BEFORE it is ever registered as a node -- so no per-node body is planned
+// for it at all -- when an EARLIER-declared `prefix` route names a strict
+// ancestor of `N(P)`. Envoy's prefix match is a raw byte-prefix test with no
+// segment awareness of its own; every accepted prefix's raw text is `"/"` or
+// ends in `/` (`prefix_shape_ok`/`validate`), so a shorter accepted prefix is
+// a byte-prefix of a longer one exactly when it is also that longer one's
+// segment-boundary ancestor, making "strict ancestor" here exactly Envoy's
+// byte-prefix relation. Since an earlier route already wins every request
+// `N(P)` could ever match, `N(P)`'s entire node (both HEAD and any-method
+// bodies, and everything that would have been attached to it as owner) is
+// unreachable, not just the one arm the per-node walk below would otherwise
+// have flagged. Only nodes declared strictly BEFORE the ancestor keep their
+// own bodies (declaration order, not text length, decides precedence); an
+// ancestor prefix declared AFTER `N(P)`'s own prefix route does not shadow
+// it here (it can still affect `N(P)`'s "Remainder" fallback below, when
+// `N(P)`'s own literal path has no route of its own). This is a stronger,
+// general form of the single `"/"`-before-everything case Codex originally
+// reported: any earlier, textually-shorter accepted prefix shadows a later,
+// longer one, not just root.
+//
 // Owner: for an exact route with path `q`, its owner is the node with the
 // LONGEST text among all node candidates (every declared node plus the
 // always-present root) under which `q` falls. Root is always a candidate, so
@@ -708,6 +729,36 @@ FrontendResult<LoweringPlan> build_lowering_plan(const Bootstrap& model) {
             }
         }
         if (seen) continue;
+        // Codex round-9 review: Envoy's route matching is first-match AND
+        // its prefix match is a raw byte-prefix test (no segment awareness
+        // of its own). An EARLIER-declared prefix whose text is a byte-
+        // prefix of this one's makes every path this node could match
+        // already resolve to that earlier route -- this node can never be
+        // reached, for any method. `prefix_shape_ok`/`validate` above
+        // guarantee every accepted prefix's raw text is "/" or ends in
+        // '/', so a shorter accepted prefix is a byte-prefix of a longer
+        // one exactly when it is also its segment-boundary ancestor (the
+        // longer one's byte right after the shorter one's length is
+        // necessarily '/' in both checks) -- so `is_strict_ancestor`
+        // (already segment-boundary-based) is Envoy's raw byte-prefix
+        // relation here, with no extra byte-level helper needed. Checking
+        // only against `declared_nodes` entries already kept (i.e. not
+        // themselves shadowed) is enough: shadowing is transitive over the
+        // prefix relation, so an even-earlier ancestor of a dropped node
+        // still shadows this one too. Drop the node before it is ever
+        // registered, so `build_node_plan` never runs for it and no dead
+        // HEAD/any-method block is planned or charged against the token
+        // budget (Codex P2 on PR #695 round 9; the original report used
+        // root "/" as the earlier catch-all, but the same unreachability
+        // holds for any earlier, textually-shorter prefix).
+        bool shadowed = false;
+        for (const Str& existing : declared_nodes) {
+            if (is_strict_ancestor(existing, node_text)) {
+                shadowed = true;
+                break;
+            }
+        }
+        if (shadowed) continue;
         if (!declared_nodes.push(node_text))
             return out_of_memory(route.span, lit_str("too many routes to lower"));
         if (node_text.eq(lit_str("/"))) {
