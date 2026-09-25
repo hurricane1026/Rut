@@ -65,11 +65,15 @@ public:
         return put_lit(text, static_cast<u32>(__builtin_strlen(text)));
     }
 
-    // Writes `text` into a RUT string literal body, escaping `\` and `"` so
-    // that Envoy path/prefix bytes outside the escape-free set the parser
-    // otherwise assumes (route match text may contain `"` or `\`, since
-    // `validate_route_match_bytes` in src/envoy/parser.cc only excludes
-    // `?`, `#` and `%`) never break out of the emitted literal.
+    // Writes `text` into a RUT string literal body, escaping `\` and `"`.
+    // Defense in depth only: `validate()` below now rejects both bytes in
+    // every route match value it lowers through this function (Codex P2 on
+    // PR #695 round 4 -- the RUT lexer never decodes a `\`-escape, so
+    // inserting one here would change the runtime string's byte content
+    // instead of preserving it), so neither branch should be reachable from
+    // that call site today. Kept because `put_escaped` is a small, general
+    // "make text literal-safe" helper, not one hand-tuned to its current
+    // only caller's already-validated input.
     bool put_escaped(Str text) {
         for (u32 i = 0; i < text.len; i++) {
             const char c = text.ptr[i];
@@ -352,6 +356,35 @@ bool put_forward_call(Writer& w, u32 cluster_index, bool include_head_mode) {
 // probe paths are already normalized), but it is a real divergence for
 // requests containing redundant slashes or percent-encoded segments; see the
 // compatibility matrix.
+//
+// A DIFFERENT, separately-confirmed divergence (Codex P1 on PR #695 round 4)
+// lives one layer BELOW the trie entirely and is NOT fixable from this file:
+// `include/rut/runtime/compile_to_config.h`'s `configure_route_dispatch`
+// chooses between two dispatch engines for the WHOLE compiled module --
+// `RouteTrie` (segment-aware, as this algorithm assumes throughout) or `ART`
+// (`src/runtime/route_art.cc`: pure byte-prefix descent, no segment-boundary
+// check at all) -- based on `needs_segment_aware`
+// (`src/runtime/route_select.cc`), a pairwise scan over the DECLARED route
+// paths only. That scan's root exemption ("root canonicalizes to the empty
+// string, so pairing it with any other route is never boundary-sensitive")
+// is unsound whenever the OTHER route in the pair has no byte-diverging
+// declared sibling of its OWN: confirmed by direct reproduction --
+// `RouteConfig` with exactly the routes `"/"` and `"/api"` (precisely PR8's
+// `golden_routes_a_prefix_then_root` shape) makes `needs_segment_aware`
+// return false, so `configure_route_dispatch` selects ART, under which a
+// request for `/apifoo` incorrectly matches `/api`'s handler instead of
+// falling back to `/`'s (SegmentTrie, forced on the same two routes,
+// correctly falls back to `/`). This reproduces from a plain hand-written
+// `.rut` file with nothing Envoy-specific about it, so it is a
+// `route_select.cc`/`route_art.cc` bug, not a `build_node_plan` one -- this
+// algorithm's own if/else arm logic is exactly right FOR WHICHEVER node the
+// active dispatch engine hands it (proven by `rut_dispatch` in
+// tests/test_envoy_convert.cc, which re-parses the real emitted RUT text and
+// re-runs a segment-aware node selection over it) -- and the converter has
+// no hook into the RUT compiler's later dispatch-engine choice for the
+// module it emits. See docs/envoy-compatibility.md for the tracked row; the
+// fix belongs in a runtime PR that can rebuild and test `route_select.cc`
+// and `route_art.cc` (out of this PR's build scope).
 
 // One arm of a node's if/else chain. All but the last arm in a chain are
 // conditional (`is_terminal == false`); the last is the chain's unconditional
@@ -837,16 +870,24 @@ FrontendResult<bool> validate(const Bootstrap& model, const RutCapabilities& cap
         // caller of the public `Bootstrap` overload fails closed.
         if (match.kind == RouteMatchKind::Prefix) {
             const Str prefix = match.prefix;
-            // Length-only for the length-1 case (never a content compare):
-            // `strip_trailing_slash` below relies on the same guarantee to
-            // stay immune to a caller mutating the JSON source buffer after
-            // parsing but before lowering (see its own comment); a
-            // hand-built model with a non-"/" length-1 prefix is accepted
-            // and treated as root, matching that existing, documented
-            // behavior instead of silently diverging from it here.
+            // A length-1 prefix must actually BE "/" (content, not just
+            // length): `strip_trailing_slash` below classifies by length
+            // alone and returns the literal "/" for every length-1 input
+            // (see its own comment for why -- immunity to a caller mutating
+            // the JSON source buffer after parsing but before lowering), so
+            // a hand-built `Bootstrap` with e.g. prefix "x" (`Str{"x", 1}`)
+            // would otherwise be silently accepted and routed as root
+            // instead of failing closed (Codex P2 on PR #695 round 4); a
+            // direct-model `Str{nullptr, 1}` would additionally dereference
+            // `ptr[0]` in the byte-validation loop below without the
+            // `ptr != nullptr` guard here. Content IS still compared for
+            // this one case -- unlike `strip_trailing_slash`'s
+            // length-only return, which only ever needs to produce the
+            // literal "/" once shape_ok has already confirmed the content.
             const bool shape_ok =
-                prefix.len == 1u || (prefix.len >= 2u && prefix.ptr != nullptr &&
-                                     prefix.ptr[0] == '/' && prefix.ptr[prefix.len - 1u] == '/');
+                (prefix.len == 1u && prefix.ptr != nullptr && prefix.ptr[0] == '/') ||
+                (prefix.len >= 2u && prefix.ptr != nullptr && prefix.ptr[0] == '/' &&
+                 prefix.ptr[prefix.len - 1u] == '/');
             if (!shape_ok)
                 return invalid(match.span,
                                lit_str("route match prefix must be \"/\" or start and end with "
@@ -871,12 +912,29 @@ FrontendResult<bool> validate(const Bootstrap& model, const RutCapabilities& cap
             return unsupported(match.span, lit_str("route match value exceeds 64 bytes"));
         for (u32 c = 0; c < text.len; c++) {
             const auto b = static_cast<unsigned char>(text.ptr[c]);
+            // `"` and `\` are additionally excluded here (beyond the parser's
+            // own `route_match_byte_ok`, src/envoy/parser.cc): `put_escaped`
+            // below inserts a `\` before either byte so the emitted RUT
+            // string literal cannot break out early, but the RUT lexer
+            // (src/compiler/lexer.cc) never decodes that escape -- it only
+            // skips `\`+next-byte pairs while scanning for the closing
+            // quote, and keeps BOTH bytes verbatim in `Token::text`, which
+            // `parse_primary`'s `StrLit` case and `parse_route_entry`'s
+            // `item.route.path` assignment then copy unchanged. A path like
+            // `/a"b` would therefore round-trip through this converter as
+            // the five-byte runtime string `/a\"b`, not the original four
+            // bytes, so `req.pathOnly == "..."` / `route "..."` comparisons
+            // would never match the real request (Codex P2 on PR #695 round
+            // 4). The JSON-parsed path already can't carry these bytes --
+            // `plain_string` rejects any escaped JSON string outright -- so
+            // this only ever fires for a hand-built `Bootstrap` caller.
             const bool byte_ok = b >= 0x21u && b <= 0x7eu && text.ptr[c] != '?' &&
-                                 text.ptr[c] != '#' && text.ptr[c] != '%';
+                                 text.ptr[c] != '#' && text.ptr[c] != '%' && text.ptr[c] != '"' &&
+                                 text.ptr[c] != '\\';
             if (!byte_ok)
-                return unsupported(
-                    match.span,
-                    lit_str("route match value must be printable ASCII excluding ?, #, and %"));
+                return unsupported(match.span,
+                                   lit_str("route match value must be printable ASCII excluding "
+                                           "?, #, %, \", and \\"));
         }
         // Only a `prefix` match's text ever becomes a RUT route declaration
         // (`route "<node_text>" { ... }`, via `strip_trailing_slash` in
