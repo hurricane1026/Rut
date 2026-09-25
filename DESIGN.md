@@ -643,7 +643,7 @@ unmatched { return local_response({
 
 unmatched get { return local_response({ ... }) }        // per-method no-route
 pre_route options { return local_response({ ... }) }    // pre-routing strict reply
-route exact "/healthz" get { return local_response({ ... }) }  // exact-path bypass
+route exact GET "/healthz" { return local_response({ ... }) }  // exact-path bypass
 ```
 
 `version` (`"HTTP/1.1"` only), `status`, `reason`, `server`, `date`
