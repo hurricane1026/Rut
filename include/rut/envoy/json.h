@@ -63,6 +63,16 @@ struct JsonNode {
 static constexpr u32 kMaxJsonNodes = 4096;
 static constexpr u32 kMaxJsonDepth = 32;
 
+// Duplicate-key detection scans prior members of the same object with an
+// exact byte comparison (see JsonDocument::member). That scan is quadratic
+// in the member count of one object, so it is bounded independently of
+// kMaxJsonNodes: without this cap, a single object could hold up to
+// kMaxJsonNodes - 1 members and force on the order of kMaxJsonNodes^2 byte
+// comparisons. No bootstrap shape this frontend recognizes has more than a
+// handful of fields on any one object; 256 leaves generous headroom while
+// keeping the worst case (256 choose 2 comparisons) negligible.
+static constexpr u32 kMaxJsonObjectMembers = 256;
+
 struct JsonDocument {
     FixedVec<JsonNode, kMaxJsonNodes> nodes{};
     u32 root = kJsonNoNode;

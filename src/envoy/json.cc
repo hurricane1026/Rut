@@ -378,6 +378,14 @@ private:
                 return frontend_error(FrontendError::UnsupportedSyntax,
                                       key_span,
                                       lit_str("escaped object keys are unsupported"));
+            // Bound the member count before the linear duplicate-key scan
+            // below: that scan is quadratic in the number of prior members,
+            // so an unbounded member count would let one object force
+            // ~kMaxJsonNodes^2 byte comparisons (see kMaxJsonObjectMembers).
+            if (doc_.nodes[object.value()].child_count >= kMaxJsonObjectMembers)
+                return frontend_error(FrontendError::TooManyItems,
+                                      key_span,
+                                      lit_str("JSON object exceeds the bounded member count"));
             if (doc_.member(object.value(), key.value()) != kJsonNoNode)
                 return frontend_error(FrontendError::UnexpectedToken,
                                       key_span,

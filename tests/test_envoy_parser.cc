@@ -381,6 +381,35 @@ TEST(envoy_json, bounded_depth_and_node_capacity) {
     CHECK_EQ(doc.nodes.len, envoy::kMaxJsonNodes);
 }
 
+// PR #691 round 3: the duplicate-key scan in JsonDocument::member is a
+// linear scan of prior members, quadratic in the number of members of one
+// object. Worst-case keys share a long common prefix (so byte comparison
+// cannot bail out early on the first byte) and are all the same length (so
+// the length pre-check in Str::eq cannot bail out either). This exercises
+// the object-member cap that bounds that scan independently of the overall
+// node budget.
+TEST(envoy_json, bounded_object_member_count) {
+    static envoy::JsonDocument doc;
+    const std::string prefix(230, 'a');
+
+    std::string at_cap = "{";
+    for (u32 i = 0; i < envoy::kMaxJsonObjectMembers; i++) {
+        if (i) at_cap += ",";
+        at_cap += "\"" + prefix + std::to_string(i) + "\":0";
+    }
+    at_cap += "}";
+    auto result = envoy::parse_json(str(at_cap), doc);
+    REQUIRE(result);
+    CHECK_EQ(doc.at(doc.root).child_count, envoy::kMaxJsonObjectMembers);
+
+    std::string over_cap = at_cap.substr(0, at_cap.size() - 1);
+    over_cap += ",\"" + prefix + std::to_string(envoy::kMaxJsonObjectMembers) + "\":0}";
+    result = envoy::parse_json(str(over_cap), doc);
+    REQUIRE_FALSE(result);
+    CHECK(result.error().code == FrontendError::TooManyItems);
+    CHECK(to_string(result.error().detail).find("member") != std::string::npos);
+}
+
 // ── Envoy semantic model ─────────────────────────────────────────────
 
 TEST(envoy_parser, accepts_milestone_bootstrap) {
