@@ -1955,18 +1955,20 @@ TEST(response_policy, upstream_header_order_rejects_duplicate_inline_headers) {
     REQUIRE(build_strict_response_headers(conn, config, response));
 }
 
-// Codex round-9 review: the round-8 fix above only covered Content-Type, Date
-// and Location. Envoy's HeaderMapImpl treats every name enumerated in
-// `kEnvoyInlineResponseHeaders` (callbacks_impl.h -- the full response-relevant
-// slice of `INLINE_RESP_HEADERS` + `INLINE_REQ_RESP_HEADERS`, minus
-// content-length/server/connection/transfer-encoding, which have their own
-// special-cased handling documented on that table) the same way: a
-// single-valued inline slot that coalesces a duplicate into the existing entry
-// rather than emitting two physical fields. Iterate the whole table and prove
-// each entry fails closed (502) on a duplicate and is still accepted with a
-// single occurrence, then prove a non-inline header (`x-custom`) may still
-// repeat -- this profile forwards ordinary headers verbatim in upstream order,
-// duplicates and all.
+// Codex round-9 and round-10 review: the round-8 fix only covered Content-Type,
+// Date and Location; round-9 extended it to every name in the
+// `INLINE_RESP_HEADERS`/`INLINE_REQ_RESP_HEADERS` macros but still missed the
+// headers a stock Envoy binary registers as custom inline slots at
+// static-init time (`cache-control`, `content-encoding`, `last-modified`,
+// `etag`, `age`, `expires`, `vary`, and the `access-control-*` CORS/response
+// headers -- see the citations on `kEnvoyInlineResponseHeaders` in
+// callbacks_impl.h). Envoy's HeaderMapImpl treats every name in that table the
+// same way regardless of source: a single-valued inline slot that coalesces a
+// duplicate into the existing entry rather than emitting two physical fields.
+// Iterate the whole table and prove each entry fails closed (502) on a
+// duplicate and is still accepted with a single occurrence, then prove a
+// non-inline header (`x-custom`) may still repeat -- this profile forwards
+// ordinary headers verbatim in upstream order, duplicates and all.
 TEST(response_policy, upstream_header_order_rejects_duplicate_of_every_inline_header) {
     char server[] = "envoy";
     ForwardResponsePolicySpec upstream_order{};
@@ -2020,6 +2022,98 @@ TEST(response_policy, upstream_header_order_rejects_duplicate_of_every_inline_he
     // A non-inline header may still repeat: this profile forwards ordinary
     // headers verbatim in upstream order without deduplicating them.
     CHECK(admits("HTTP/1.1 200 OK\r\nx-custom: a\r\nContent-Length: 2\r\nx-custom: b\r\n\r\nhi"));
+}
+
+// Codex round-10 review: if graceful drain begins after this request was
+// admitted (keep-alive already granted at the request boundary, mirroring
+// real ingress's `conn.keep_alive = !loop->is_draining()` at admission time)
+// but before the upstream response is serialized, this profile's keep-alive
+// decision used to consult only `conn.keep_alive` and the response policy's
+// own connection intent -- never the shard's current drain state -- so a
+// keep-alive response could still reach the client even though
+// `on_response_sent` (and `on_validated_preconnect_failure_sent`)
+// unconditionally close the connection once `loop->is_draining()`. That would
+// let an HTTP/1.1 client pipeline or reuse a connection for a successor
+// request that can never be served. `build_strict_response_headers` /
+// `build_upstream_order_response_headers` now take a trailing `draining`
+// argument -- threaded from `loop->is_draining()` at both call sites in
+// `on_upstream_response` -- and fold it into the decision exactly as the
+// transparent `build_h1_forward_response_headers` already does with its own
+// `draining` parameter.
+TEST(response_policy, upstream_header_order_advertises_close_when_draining) {
+    char server[] = "envoy";
+    ForwardResponsePolicySpec upstream_order{};
+    upstream_order.version = ResponsePolicyVersion::Http11;
+    upstream_order.framing = ResponsePolicyFraming::ContentLength;
+    upstream_order.connection = ResponsePolicyConnection::Request;
+    upstream_order.header_order = ResponsePolicyHeaderOrder::Upstream;
+    upstream_order.header_names = ResponsePolicyHeaderNames::Lowercase;
+    upstream_order.connection_header = ResponsePolicyConnectionHeader::CloseOnly;
+    upstream_order.status_reason = ResponsePolicyStatusReason::Canonical;
+    upstream_order.date = ResponsePolicyDate::PreserveOrCurrent;
+    upstream_order.server = {server, 5};
+    REQUIRE(response_policy_spec_valid(upstream_order));
+
+    RouteConfig config{};
+    REQUIRE_EQ(config.add_response_policy(upstream_order), 1u);
+
+    static constexpr char kUpstream[] = "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nhi";
+
+    // The shard began draining between request admission and this upstream
+    // response arriving: the response must advertise `connection: close`
+    // even though the request was admitted keep-alive and the policy/client
+    // both want keep-alive.
+    {
+        u8 header_storage[SlicePool::kSliceSize]{};
+        Connection conn{};
+        conn.reset();
+        conn.response_header_slice = header_storage;
+        conn.response_header_buf.bind(header_storage, sizeof(header_storage));
+        conn.response_policy_id = 1;
+        conn.keep_alive = true;
+        conn.req_client_keep_alive = true;
+
+        HttpResponseParser parser;
+        ParsedResponse response;
+        parser.reset();
+        response.reset();
+        REQUIRE_EQ(
+            parser.parse(reinterpret_cast<const u8*>(kUpstream), sizeof(kUpstream) - 1u, &response),
+            ParseStatus::Complete);
+        REQUIRE(build_strict_response_headers(
+            conn, config, response, Http1PrebuiltResponsePurpose::None, /*draining=*/true));
+        CHECK(buf_has(conn.response_header_buf.data(),
+                      conn.response_header_buf.len(),
+                      "connection: close\r\n"));
+        CHECK_FALSE(conn.keep_alive);
+    }
+
+    // Sanity check: the identical request/response shape with no drain stays
+    // keep-alive -- proving the close above is specific to the drain state,
+    // not a regression that now always closes this profile's connection.
+    {
+        u8 header_storage[SlicePool::kSliceSize]{};
+        Connection conn{};
+        conn.reset();
+        conn.response_header_slice = header_storage;
+        conn.response_header_buf.bind(header_storage, sizeof(header_storage));
+        conn.response_policy_id = 1;
+        conn.keep_alive = true;
+        conn.req_client_keep_alive = true;
+
+        HttpResponseParser parser;
+        ParsedResponse response;
+        parser.reset();
+        response.reset();
+        REQUIRE_EQ(
+            parser.parse(reinterpret_cast<const u8*>(kUpstream), sizeof(kUpstream) - 1u, &response),
+            ParseStatus::Complete);
+        REQUIRE(build_strict_response_headers(conn, config, response));
+        CHECK_FALSE(buf_has(conn.response_header_buf.data(),
+                            conn.response_header_buf.len(),
+                            "connection: close\r\n"));
+        CHECK(conn.keep_alive);
+    }
 }
 
 TEST(response_policy, failure_head_mode_config_copy_is_owned_and_deduplicated) {

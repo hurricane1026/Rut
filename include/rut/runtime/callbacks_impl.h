@@ -11161,9 +11161,69 @@ inline bool stage_redirect_response(Connection& conn, const RouteConfig& config,
     return conn.send_buf.write(scratch, len) == len;
 }
 
-// Every Envoy inline *response* header (envoy/http/header_map.h,
-// `INLINE_RESP_HEADERS` + `INLINE_REQ_RESP_HEADERS`, pinned v1.39.1), minus the
-// four names carved out with their own special-cased handling in
+// Every Envoy inline *response* header, pinned v1.39.1, from two sources:
+//
+// 1. The unconditional macro-defined set: envoy/http/header_map.h
+//    `INLINE_RESP_HEADERS` + `INLINE_REQ_RESP_HEADERS`, registered
+//    unconditionally for every build (source/common/http/header_map_impl.cc).
+//
+// 2. Headers a stock (all-extensions-linked) Envoy binary registers as custom
+//    inline slots at static-init time via a file-scope
+//    `Http::RegisterCustomInlineHeader<Type::ResponseHeaders>` member/global
+//    (source/common/http/header_map.h `CustomInlineHeaderRegistry`): this
+//    registration runs whenever the translation unit is linked in, independent
+//    of whether the corresponding filter is configured in any listener.
+//    Enumerated via `gh api search/code -f q='repo:envoyproxy/envoy
+//    RegisterCustomInlineHeader'` (21 hits) and confirmed present at the
+//    v1.39.1 tag for each hit below (a name is included only once even when
+//    multiple filters register it):
+//      - cache-control:    source/extensions/filters/http/cache/cache_custom_headers.cc:42,
+//                          source/extensions/filters/http/cache_v2/cache_custom_headers.cc:42,
+//                          source/extensions/filters/http/compressor/compressor_filter.cc:29-30,
+//                          source/extensions/filters/http/decompressor/decompressor_filter.cc:18-19,
+//                          source/extensions/stat_sinks/hystrix/hystrix.cc:29-30
+//      - content-encoding: source/extensions/filters/http/compressor/compressor_filter.cc:37-38,
+//                          source/extensions/filters/http/decompressor/decompressor_filter.cc:20-21
+//      - last-modified:    source/extensions/filters/http/cache/cache_custom_headers.cc:43,
+//                          source/extensions/filters/http/cache_v2/cache_custom_headers.cc:43
+//      - etag:             source/extensions/filters/http/cache/cache_custom_headers.cc:44,
+//                          source/extensions/filters/http/cache_v2/cache_custom_headers.cc:44,
+//                          source/extensions/filters/http/compressor/compressor_filter.cc:31-32
+//      - age:              source/extensions/filters/http/cache/cache_custom_headers.cc:45,
+//                          source/extensions/filters/http/cache_v2/cache_custom_headers.cc:45
+//      - expires:          source/extensions/filters/http/cache/cache_custom_headers.cc:46,
+//                          source/extensions/filters/http/cache_v2/cache_custom_headers.cc:46
+//      - vary:             source/extensions/filters/http/compressor/compressor_filter.cc:33-34
+//      - access-control-allow-origin:
+//        source/extensions/filters/http/cors/cors_filter.cc:31-32,
+//        source/extensions/stat_sinks/hystrix/hystrix.cc:25-26
+//      - access-control-allow-credentials:
+//        source/extensions/filters/http/cors/cors_filter.cc:33-35
+//      - access-control-allow-methods:
+//        source/extensions/filters/http/cors/cors_filter.cc:36-37
+//      - access-control-allow-headers:
+//        source/extensions/filters/http/cors/cors_filter.cc:38-39,
+//        source/extensions/stat_sinks/hystrix/hystrix.cc:27-28
+//      - access-control-max-age:
+//        source/extensions/filters/http/cors/cors_filter.cc:40-41
+//      - access-control-expose-headers:
+//        source/extensions/filters/http/cors/cors_filter.cc:42-43
+//      - access-control-allow-private-network:
+//        source/extensions/filters/http/cors/cors_filter.cc:47-49
+//    Every other `RegisterCustomInlineHeader` hit in that search registers a
+//    `Type::RequestHeaders` (or, for `test/...` files, is not part of a stock
+//    build) and is therefore not response-relevant here: `accept`
+//    (contrib/sxg, grpc_http1_reverse_bridge, grpc_web), `referer`
+//    (access_loggers/grpc, access_loggers/open_telemetry, filters/common/expr),
+//    `cdn-loop` (cdn_loop/filter.cc), `accept-encoding`/`content-encoding`-request
+//    /`cache-control`-request (compressor/decompressor, request side only),
+//    `origin`/`access-control-request-*` (cors, jwt_authn), `authorization`
+//    (oauth2), `authentication` (skywalking). This inventory is a code-search
+//    snapshot: it would miss a custom registration in a file deleted from the
+//    default branch since v1.39.1 was cut, but every hit it did find was
+//    verified to exist, unchanged in kind, at the pinned tag.
+//
+// Minus the four names carved out with their own special-cased handling in
 // `build_upstream_order_response_headers` below:
 //   - `content-length`: already rejected on duplicate by the
 //     `content_length_count != 1` precondition at the top of that function
@@ -11201,6 +11261,20 @@ inline constexpr Str kEnvoyInlineResponseHeaders[] = {
     lit_str("x-envoy-upstream-healthchecked-cluster"),
     lit_str("x-envoy-upstream-service-time"),
     lit_str("x-request-id"),
+    lit_str("cache-control"),
+    lit_str("content-encoding"),
+    lit_str("last-modified"),
+    lit_str("etag"),
+    lit_str("age"),
+    lit_str("expires"),
+    lit_str("vary"),
+    lit_str("access-control-allow-origin"),
+    lit_str("access-control-allow-credentials"),
+    lit_str("access-control-allow-methods"),
+    lit_str("access-control-allow-headers"),
+    lit_str("access-control-max-age"),
+    lit_str("access-control-expose-headers"),
+    lit_str("access-control-allow-private-network"),
 };
 inline constexpr u32 kEnvoyInlineResponseHeaderCount =
     sizeof(kEnvoyInlineResponseHeaders) / sizeof(kEnvoyInlineResponseHeaders[0]);
@@ -11219,7 +11293,8 @@ inline bool build_upstream_order_response_headers(
     Connection& conn,
     const RouteConfig& config,
     const ParsedResponse& resp,
-    Http1PrebuiltResponsePurpose purpose = Http1PrebuiltResponsePurpose::None) {
+    Http1PrebuiltResponsePurpose purpose = Http1PrebuiltResponsePurpose::None,
+    bool draining = false) {
     if (conn.response_policy_id == 0 || conn.response_policy_id > config.response_policy_count)
         return false;
     const auto& policy = config.response_policies[conn.response_policy_id - 1];
@@ -11361,8 +11436,17 @@ inline bool build_upstream_order_response_headers(
         policy.connection == ResponsePolicyConnection::KeepAlive ||
         (policy.connection == ResponsePolicyConnection::Request && conn.req_client_keep_alive);
     // Preserve the server lifecycle gate set at the request boundary, exactly
-    // as the Synthesized serializer does above.
-    const bool effective_keep_alive = conn.keep_alive && policy_keep_alive;
+    // as the Synthesized serializer does above. `draining` folds in the
+    // shard's graceful-drain state, matching `build_h1_forward_response_headers`
+    // above (`(draining || nominated_framing)`, `callbacks_impl.h:3182`): a
+    // drain that begins after this request was admitted but before the
+    // upstream response arrived must still advertise `connection: close` here,
+    // because `on_response_sent` closes the client connection once
+    // `loop->is_draining()` regardless of what this header block promised --
+    // without this, a keep-alive response would let an HTTP/1.1 client
+    // pipeline or reuse the connection for a request that can never be
+    // served.
+    const bool effective_keep_alive = conn.keep_alive && policy_keep_alive && !draining;
     conn.keep_alive = effective_keep_alive;
     if (!effective_keep_alive && !put_lit("connection: close\r\n")) return false;
     return put_lit("\r\n");
@@ -11372,12 +11456,13 @@ inline bool build_strict_response_headers(
     Connection& conn,
     const RouteConfig& config,
     const ParsedResponse& resp,
-    Http1PrebuiltResponsePurpose purpose = Http1PrebuiltResponsePurpose::None) {
+    Http1PrebuiltResponsePurpose purpose = Http1PrebuiltResponsePurpose::None,
+    bool draining = false) {
     if (conn.response_policy_id == 0 || conn.response_policy_id > config.response_policy_count)
         return false;
     const auto& policy = config.response_policies[conn.response_policy_id - 1];
     if (policy.header_order == ResponsePolicyHeaderOrder::Upstream)
-        return build_upstream_order_response_headers(conn, config, resp, purpose);
+        return build_upstream_order_response_headers(conn, config, resp, purpose, draining);
     const bool strict_no_body_metadata =
         purpose == Http1PrebuiltResponsePurpose::StrictNoBodyMetadataSuccess;
     if ((purpose != Http1PrebuiltResponsePurpose::None && !strict_no_body_metadata) ||
@@ -12288,7 +12373,8 @@ void on_upstream_response(void* lp, Connection& conn, IoEvent ev) {
         const Http1PrebuiltResponsePurpose strict_response_purpose =
             strict_no_body_metadata_304 ? Http1PrebuiltResponsePurpose::StrictNoBodyMetadataSuccess
                                         : Http1PrebuiltResponsePurpose::None;
-        if (!build_strict_response_headers(conn, *config, resp, strict_response_purpose)) {
+        if (!build_strict_response_headers(
+                conn, *config, resp, strict_response_purpose, loop->is_draining())) {
             if (try_configured_head_failure(
                     ConfiguredForwardFailureDomain::CompleteUnsupportedResponse))
                 return;
@@ -12550,7 +12636,11 @@ void on_upstream_response(void* lp, Connection& conn, IoEvent ev) {
             !conn.request_config || !strict_response_upload_ready(conn) ||
             (conn.upstream_recv_buf.len() > resp_parser.header_end &&
              conn.upstream_recv_buf.len() - resp_parser.header_end > resp.content_length) ||
-            !build_strict_response_headers(conn, *conn.request_config, resp)) {
+            !build_strict_response_headers(conn,
+                                           *conn.request_config,
+                                           resp,
+                                           Http1PrebuiltResponsePurpose::None,
+                                           loop->is_draining())) {
             reject_strict_response(loop, conn);
             return;
         }
