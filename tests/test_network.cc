@@ -3840,6 +3840,67 @@ TEST(request_policy, preserve_host_lowercase_wire_and_fail_closed_host) {
         "POST /upload HTTP/1.1\r\nhost: client.example\r\ncontent-length: 4\r\n"
         "x-forwarded-proto: http\r\n\r\nabcd");
 
+    // TE: trailers is kept on a fixed-length (body-carrying) request too,
+    // not only on the bodyless-GET path.
+    prepare(
+        "POST /te-body HTTP/1.1\r\n"
+        "Host: client.example\r\n"
+        "Content-Length: 4\r\n"
+        "TE: trailers\r\n\r\nabcd");
+    REQUIRE(apply_request_policy(conn, endpoint, kPreserveHost));
+    require_wire(
+        "POST /te-body HTTP/1.1\r\nhost: client.example\r\ncontent-length: 4\r\n"
+        "te: trailers\r\nx-forwarded-proto: http\r\n\r\nabcd");
+
+    // Fail closed: TE with a non-trailers value on a fixed-length request
+    // (the shared body inspector, not just the serializer, must admit this
+    // shape only for the exact "trailers" value).
+    prepare(
+        "POST /te-body-bad HTTP/1.1\r\n"
+        "Host: client.example\r\n"
+        "Content-Length: 4\r\n"
+        "TE: gzip\r\n\r\nabcd");
+    CHECK_FALSE(apply_request_policy(conn, endpoint, kPreserveHost));
+    CHECK_EQ(conn.send_buf.len(), 0u);
+
+    // Fail closed: Expect on a body-carrying request. Rut has no
+    // `100 Continue` interim-response flow, so this shape is rejected rather
+    // than silently proxied with the wrong client-visible semantics.
+    prepare(
+        "POST /expect HTTP/1.1\r\n"
+        "Host: client.example\r\n"
+        "Content-Length: 4\r\n"
+        "Expect: 100-continue\r\n\r\nabcd");
+    CHECK_FALSE(apply_request_policy(conn, endpoint, kPreserveHost));
+    CHECK_EQ(conn.send_buf.len(), 0u);
+
+    // Fail closed: a Connection token nominates Content-Length itself. No
+    // upstream bytes touched — dropping the framing header while still
+    // forwarding the already-validated body would desync a persistent
+    // upstream connection (request smuggling).
+    prepare(
+        "POST /nominate-cl HTTP/1.1\r\n"
+        "Host: client.example\r\n"
+        "Content-Length: 4\r\n"
+        "Connection: Content-Length\r\n\r\nabcd");
+    u8 untouched_nominate_cl[256]{};
+    const u32 nominate_cl_len = conn.recv_buf.len();
+    __builtin_memcpy(untouched_nominate_cl, conn.recv_buf.data(), nominate_cl_len);
+    CHECK_FALSE(apply_request_policy(conn, endpoint, kPreserveHost));
+    CHECK_EQ(conn.send_buf.len(), 0u);
+    REQUIRE_EQ(conn.recv_buf.len(), nominate_cl_len);
+    CHECK_EQ(__builtin_memcmp(conn.recv_buf.data(), untouched_nominate_cl, nominate_cl_len), 0);
+
+    // The same nomination is rejected case-insensitively and with the token
+    // list carrying extra entries, and even nominated first.
+    prepare(
+        "POST /nominate-cl-mixed HTTP/1.1\r\n"
+        "Host: client.example\r\n"
+        "Content-Length: 4\r\n"
+        "Connection: content-LENGTH, keep-alive\r\n\r\nabcd");
+    CHECK_FALSE(apply_request_policy(conn, endpoint, kPreserveHost));
+    CHECK_EQ(conn.send_buf.len(), 0u);
+
     // Fail closed: no Host header. No upstream bytes (recv_buf untouched).
     prepare("GET /nohost HTTP/1.1\r\nX-Only: yes\r\n\r\n");
     u8 untouched_nohost[256]{};

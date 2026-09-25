@@ -4445,6 +4445,14 @@ void handle_jit_outcome(Loop* loop,
             // pooled socket to this endpoint and skip the connect. Without this take
             // path, JIT forward(...) completions would deposit idle fds the pool never
             // hands back. On a miss, connect fresh.
+            //
+            // A strict-response-policy body upload (`request_policy_body_response_domain`)
+            // is never eligible for a pooled/reused socket: `strict_response_upload_ready`
+            // requires `!conn.upstream_reused` before it will publish the strict response,
+            // since a reused socket's prior traffic is not ownership evidence for this
+            // upload. Establishing that safely for a reused socket is a separate change;
+            // until then, always pay the fresh-connect cost for this combination rather
+            // than admit a request that can never produce a response.
             if constexpr (requires {
                               loop->reuse_idle_upstream(conn,
                                                         static_cast<u16>(outcome.upstream_id),
@@ -4452,6 +4460,7 @@ void handle_jit_outcome(Loop* loop,
                           }) {
                 if (conn.response_read_deadline_state == ResponseReadDeadlineState::None &&
                     !conn.failure_policy_suppress_body &&
+                    !(conn.response_policy_id != 0 && request_policy_body_response_domain(conn)) &&
                     loop->reuse_idle_upstream(
                         conn, static_cast<u16>(outcome.upstream_id), static_cast<u8>(kBackend))) {
                     conn.upstream_reused = true;
@@ -5434,6 +5443,8 @@ inline RequestPolicyBodyState inspect_request_policy_body(const Connection& conn
     bool has_te = false;
     bool has_expect = false;
     bool has_upgrade = false;
+    const u8* te_value_start = nullptr;
+    const u8* te_value_end = nullptr;
     const u8* hs = line_end + 2;
     const u8* header_end = end - 2;
     while (hs < header_end) {
@@ -5447,7 +5458,17 @@ inline RequestPolicyBodyState inspect_request_policy_body(const Connection& conn
         if (request_policy_name_eq(hs, name_len, "content-length", 14)) cl_count++;
         if (request_policy_name_eq(hs, name_len, "transfer-encoding", 17))
             return RequestPolicyBodyState::Invalid;
-        has_te |= request_policy_name_eq(hs, name_len, "te", 2);
+        if (request_policy_name_eq(hs, name_len, "te", 2)) {
+            has_te = true;
+            const u8* value_start = colon + 1;
+            const u8* value_end = le;
+            while (value_start < value_end && (*value_start == ' ' || *value_start == '\t'))
+                value_start++;
+            while (value_end > value_start && (value_end[-1] == ' ' || value_end[-1] == '\t'))
+                value_end--;
+            te_value_start = value_start;
+            te_value_end = value_end;
+        }
         has_expect |= request_policy_name_eq(hs, name_len, "expect", 6);
         has_upgrade |= request_policy_name_eq(hs, name_len, "upgrade", 7);
         hs = le + 2;
@@ -5457,7 +5478,18 @@ inline RequestPolicyBodyState inspect_request_policy_body(const Connection& conn
         if (conn.req_body_mode != BodyMode::None) return RequestPolicyBodyState::Invalid;
         return RequestPolicyBodyState::Complete;
     }
-    if (has_te || has_expect || has_upgrade) return RequestPolicyBodyState::Invalid;
+    if (has_expect || has_upgrade) return RequestPolicyBodyState::Invalid;
+    if (has_te) {
+        // ID4 (host: "preserve") forwards `te` when its value is exactly
+        // "trailers" (see apply_preserve_host_lowercase_request_policy's
+        // drop_te), matching the Envoy oracle. Every other policy keeps the
+        // original closed contract of rejecting any TE header outright.
+        const bool te_trailers_ok =
+            request_policy_preserves_host(policy_id) &&
+            request_policy_name_eq(
+                te_value_start, static_cast<u32>(te_value_end - te_value_start), "trailers", 8);
+        if (!te_trailers_ok) return RequestPolicyBodyState::Invalid;
+    }
     if (!req.has_content_length ||
         req.content_length > conn.recv_buf.capacity() - parser.header_end)
         return RequestPolicyBodyState::Invalid;
@@ -5484,6 +5516,14 @@ inline RequestPolicyBodyState inspect_request_policy_body(const Connection& conn
 // header when the client did not already supply one (a client-supplied value
 // passes through unchanged, in its original position). Fails closed with no
 // upstream bytes touched unless exactly one non-empty Host header is present.
+// A body-carrying request with a client `Expect` header is also outside this
+// profile's admitted shape today: `inspect_request_policy_body` rejects any
+// `Expect` header once a validated Content-Length is present, because Rut has
+// no `100 Continue` interim-response flow to negotiate the body with the
+// client first (unlike Envoy, which sends the interim response and then
+// applies this same hop-by-hop drop). That request shape gets a fail-closed
+// rejection rather than a byte-accurate Envoy match; see
+// `docs/envoy-converter.md`'s "Known capability dependencies".
 inline bool apply_preserve_host_lowercase_request_policy(Connection& conn, u16 policy_id) {
     if (inspect_request_policy_body(conn, policy_id) != RequestPolicyBodyState::Complete)
         return false;
@@ -5564,6 +5604,21 @@ inline bool apply_preserve_host_lowercase_request_policy(Connection& conn, u16 p
         }
     }
     if (host_count != 1 || host_value_len == 0) return false;
+
+    // Fail closed if the client's Connection header nominates the framing
+    // header itself. Every other nominated header is simply omitted from the
+    // rewritten request below, but Content-Length also drives how many body
+    // bytes this function copies onto the wire; if the header line were
+    // dropped while the (already validated, already-buffered) body bytes
+    // were still forwarded, the persistent upstream connection would receive
+    // unframed bytes it could parse as the start of a second request
+    // (request smuggling). Refuse the whole rewrite instead of ever emitting
+    // that shape, mirroring Envoy's own fail-closed handling of dangerous
+    // Connection nominations (X-Forwarded-*, pseudo-headers).
+    for (u32 i = 0; i < nominated_count; i++) {
+        if (request_policy_name_eq(nominated[i].ptr, nominated[i].len, "content-length", 14))
+            return false;
+    }
 
     auto name_nominated = [&](const u8* name, u32 name_len) {
         for (u32 i = 0; i < nominated_count; i++) {

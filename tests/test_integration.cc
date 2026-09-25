@@ -24921,6 +24921,152 @@ TEST(route, forward_request_policy_preserve_host_lowercase_post_fixed_with_respo
              0);
 }
 
+// A fixed-length ID4 (host: "preserve") upload paired with a response_policy
+// must never borrow an idle pooled upstream socket: strict_response_upload_ready
+// requires !upstream_reused before it will publish the strict response, so a
+// reused socket can never produce one (see the idle-reuse guard next to
+// `request_policy_body_response_domain` in include/rut/runtime/callbacks_impl.h).
+// Run the same oracle-verified request twice, with the production idle pool
+// enabled, and prove both round trips succeed via a fresh connect rather than
+// the second one hanging/failing on a borrowed socket.
+// The idle-pool socket that a strict-response ID4 upload must never borrow
+// does not have to come from a prior request on the *same* route: any other
+// keep-alive request to the same upstream leaves one behind. Warm the pool
+// with an ordinary zero-copy `forward(backend)` route first — a plain
+// RouteAction::Proxy dispatch, unaffected by request_policy/response_policy —
+// then send the oracle-verified fixed-length ID4 upload to the same upstream
+// and prove it still gets its 201 (via a fresh connect) instead of the
+// connection closing early because strict_response_upload_ready refused a
+// borrowed socket (see the idle-reuse guard next to
+// `request_policy_body_response_domain` in include/rut/runtime/callbacks_impl.h).
+TEST(route, forward_request_policy_preserve_host_lowercase_post_fixed_never_reuses_upstream) {
+    using namespace rut;
+    struct JitResources {
+        FrontendRirModule rir{};
+        jit::JitEngine engine{};
+        ~JitResources() {
+            engine.shutdown();
+            rir.destroy();
+        }
+    } resources;
+    RecordingUpstream upstream;
+    // Keep each responded upstream fd open in the recorder so an incorrectly
+    // pooled first fd cannot be evicted and replaced while this test passes;
+    // the accept loop remains available for a second, independent connection.
+    upstream.keep_open = true;
+    REQUIRE(upstream.setup());
+    char source[1536];
+    const int source_len =
+        snprintf(source,
+                 sizeof(source),
+                 "upstream backend at \"127.0.0.1:%u\"\n"
+                 "route GET \"/warm\" { return forward(backend) }\n"
+                 "route POST \"/upload\" {\n"
+                 "    return forward(backend, request_policy: {\n"
+                 "        version: \"HTTP/1.1\", host: \"preserve\", connection: \"omit\",\n"
+                 "        header_names: \"lowercase\", forwarded_proto: \"http\",\n"
+                 "        strip_headers: [\"Connection\", \"Keep-Alive\", \"TE\", \"Expect\", "
+                 "\"Upgrade\", \"Proxy-Connection\"]\n"
+                 "    }, response_policy: {\n"
+                 "        version: \"HTTP/1.1\", framing: \"content_length\", connection: "
+                 "\"request\",\n"
+                 "        server: \"nginx/1.29.7\", date: \"current\", hide_headers: []\n"
+                 "    })\n"
+                 "}\n",
+                 upstream.port);
+    REQUIRE_GT(source_len, 0);
+    REQUIRE_LT(source_len, static_cast<int>(sizeof(source)));
+    auto lexed = lex(Str{source, static_cast<u32>(source_len)});
+    REQUIRE(lexed);
+    auto ast = parse_file(lexed.value());
+    REQUIRE(ast);
+    std::unique_ptr<AstFile> ast_owned(ast.value());
+    auto hir = analyze_file(*ast_owned);
+    REQUIRE(hir);
+    std::unique_ptr<HirModule> hir_owned(hir.value());
+    auto mir = build_mir(*hir_owned);
+    REQUIRE(mir);
+    std::unique_ptr<MirModule> mir_owned(mir.value());
+    auto& rir = resources.rir;
+    REQUIRE(lower_to_rir(*mir_owned, rir));
+    auto cg = jit::codegen(rir.module);
+    REQUIRE(cg.ok);
+    auto& engine = resources.engine;
+    REQUIRE(engine.init());
+    REQUIRE(engine.compile(cg.mod, cg.ctx));
+    RouteConfig cfg{};
+    REQUIRE(populate_route_config(cfg, rir.module));
+    REQUIRE(register_jit_routes(cfg, rir.module, engine));
+    const RouteConfig* active = &cfg;
+    ScopedProxyLoop proxy;
+    // Enable the production idle pool so a wrongly reused socket would sink
+    // the second request instead of this test never exercising the path.
+    REQUIRE(proxy.setup(&active, 1000, true));
+
+    static constexpr char kWarmUpstreamReply[] = "HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n";
+    static constexpr char kUploadUpstreamReply[] =
+        "HTTP/1.1 201 Created\r\nContent-Length: 0\r\n\r\n";
+    upstream.response = kWarmUpstreamReply;
+    upstream.response_len = static_cast<u32>(sizeof(kWarmUpstreamReply) - 1);
+    // Accepted connection 2 onward (the ID4 upload) gets the 201 reply; only
+    // accepted connection 1 (the warm-up) sees the 200 above.
+    upstream.response_after_first = kUploadUpstreamReply;
+    upstream.response_after_first_len = static_cast<u32>(sizeof(kUploadUpstreamReply) - 1);
+
+    // 1. Warm the idle pool: a plain, policy-free GET that leaves a live
+    // keep-alive upstream socket parked for this same upstream_id/backend_idx.
+    {
+        struct ClientGuard {
+            i32 fd;
+            ~ClientGuard() {
+                if (fd >= 0) close(fd);
+            }
+        } client{connect_to(proxy.port)};
+        REQUIRE_GE(client.fd, 0);
+        static constexpr char kWarmRequest[] = "GET /warm HTTP/1.1\r\nHost: client.example\r\n\r\n";
+        REQUIRE(send_all(client.fd, kWarmRequest, sizeof(kWarmRequest) - 1));
+        char response[512];
+        const i32 response_read = recv_timeout(client.fd, response, sizeof(response), 2000);
+        REQUIRE_GT(response_read, 0);
+        CHECK(buf_contains(response, static_cast<u32>(response_read), "200", 3));
+    }
+    for (u32 i = 0; i < 400 && upstream.accepted_count.load(std::memory_order_acquire) < 1; i++)
+        usleep(5000);
+    REQUIRE_EQ(upstream.accepted_count.load(std::memory_order_acquire), 1u);
+
+    // 2. The oracle-verified fixed-length ID4 upload to the same upstream:
+    // it must not borrow the socket just parked above.
+    {
+        struct ClientGuard {
+            i32 fd;
+            ~ClientGuard() {
+                if (fd >= 0) close(fd);
+            }
+        } client{connect_to(proxy.port)};
+        REQUIRE_GE(client.fd, 0);
+        REQUIRE(send_all(client.fd,
+                         kEnvoyOracle_post_fixed_client,
+                         static_cast<u32>(sizeof(kEnvoyOracle_post_fixed_client) - 1)));
+        char response[512];
+        const i32 response_read = recv_timeout(client.fd, response, sizeof(response), 2000);
+        REQUIRE_GT(response_read, 0);
+        CHECK(buf_contains(response, static_cast<u32>(response_read), "201", 3));
+    }
+
+    for (u32 i = 0; i < 400 && upstream.request_count.load(std::memory_order_acquire) < 2; i++)
+        usleep(5000);
+    REQUIRE_EQ(upstream.request_count.load(std::memory_order_acquire), 2u);
+    // The upload used a fresh connect — a second, independent accepted
+    // connection — never the warm-up's parked socket.
+    REQUIRE_EQ(upstream.accepted_count.load(std::memory_order_acquire), 2u);
+    REQUIRE_EQ(upstream.request_history_len[1],
+               static_cast<u32>(sizeof(kEnvoyOracle_post_fixed_upstream) - 1));
+    CHECK_EQ(memcmp(upstream.request_history[1],
+                    kEnvoyOracle_post_fixed_upstream,
+                    sizeof(kEnvoyOracle_post_fixed_upstream) - 1),
+             0);
+}
+
 TEST(route, request_policy_buffers_fixed_content_length_body) {
     using namespace rut;
     RecordingUpstream backend;
