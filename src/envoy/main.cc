@@ -32,6 +32,30 @@ bool write_cstr(int fd, const char* text) {
     return write_all(fd, text, strlen(text));
 }
 
+// `struct stat`'s nanosecond mtime/ctime fields are named `st_mtim`/`st_ctim`
+// on Linux (glibc, POSIX.1-2008) but `st_mtimespec`/`st_ctimespec` on Apple's
+// Darwin `<sys/stat.h>` (macOS `stat(2)` man page: "For compatibility with
+// previous versions of this interface, the times are also available under
+// the names st_atimespec, st_mtimespec and st_ctimespec"); both are
+// `struct timespec`. These accessors hide the name difference so the TOCTOU
+// check below compares the same fields on every supported platform without
+// weakening it.
+const struct timespec& mtime_of(const struct stat& info) {
+#ifdef __APPLE__
+    return info.st_mtimespec;
+#else
+    return info.st_mtim;
+#endif
+}
+
+const struct timespec& ctime_of(const struct stat& info) {
+#ifdef __APPLE__
+    return info.st_ctimespec;
+#else
+    return info.st_ctim;
+#endif
+}
+
 void report(const char* filename, rut::Span span, rut::Str detail, const char* fallback) {
     write_cstr(STDERR_FILENO, filename);
     char coordinates[96];
@@ -144,10 +168,10 @@ bool read_input(const char* filename, char** output, size_t* length, const char*
     // never see.
     if (after.st_size < 0 || static_cast<uintmax_t>(after.st_size) != used ||
         before.st_dev != after.st_dev || before.st_ino != after.st_ino ||
-        before.st_size != after.st_size || before.st_mtim.tv_sec != after.st_mtim.tv_sec ||
-        before.st_mtim.tv_nsec != after.st_mtim.tv_nsec ||
-        before.st_ctim.tv_sec != after.st_ctim.tv_sec ||
-        before.st_ctim.tv_nsec != after.st_ctim.tv_nsec) {
+        before.st_size != after.st_size || mtime_of(before).tv_sec != mtime_of(after).tv_sec ||
+        mtime_of(before).tv_nsec != mtime_of(after).tv_nsec ||
+        ctime_of(before).tv_sec != ctime_of(after).tv_sec ||
+        ctime_of(before).tv_nsec != ctime_of(after).tv_nsec) {
         *error = "input changed while it was being read";
         return false;
     }

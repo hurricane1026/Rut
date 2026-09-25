@@ -15,6 +15,17 @@ auto out_of_memory(Span span, Str detail) {
     return frontend_error(FrontendError::OutOfMemory, span, detail);
 }
 
+// PR #692 round-4 review: `validate` below must not trust that `model` came
+// from `parse_bootstrap_json` — the public explicit-capabilities overload
+// accepts a caller-built `Bootstrap`, and `RouterFilter::name`/
+// `has_typed_config` are public fields a caller can set to anything (e.g.
+// copy a parsed model and retarget the router filter at
+// "envoy.filters.http.lua", or clear `has_typed_config`). The parser itself
+// re-checks this name against the same literal (src/envoy/parser.cc,
+// `parse_router_filter`) before ever producing a model, so this mirrors that
+// check rather than duplicating new policy.
+constexpr Str kRouterFilterName = lit_str("envoy.filters.http.router");
+
 // PROVISIONAL: reconcile with oracle. Recorded from docs/envoy-converter.md
 // pending the pinned Envoy differential (PR2) and the local-reply capability
 // (PR5), which replaces this literal with the pinned bytes.
@@ -215,6 +226,17 @@ FrontendResult<bool> validate(const Bootstrap& model, const RutCapabilities& cap
     // defensive model checks above.
     if (!route.match.prefix.eq(lit_str("/")))
         return invalid(route.match.prefix_span, lit_str("route match prefix must be \"/\""));
+    // PR #692 round-4 review: revalidate the router filter's identity here
+    // too, not just `suppress_envoy_headers` on it — a forged `router.name`
+    // or a cleared `has_typed_config` would otherwise still lower
+    // successfully and silently omit whatever filter the model actually
+    // named (e.g. a Lua filter's behavior), the same class of gap the
+    // `route.match.prefix` check above closes for the route.
+    if (!router.name.eq(kRouterFilterName))
+        return invalid(router.name_span,
+                       lit_str("router filter name must be envoy.filters.http.router"));
+    if (!router.has_typed_config)
+        return invalid(router.span, lit_str("router filter typed_config is required"));
 
     if (!router.suppress_envoy_headers) {
         const Span span = router.suppress_envoy_headers_present ? router.suppress_envoy_headers_span

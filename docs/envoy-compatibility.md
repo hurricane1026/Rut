@@ -103,6 +103,70 @@ literal, a per-route method exclusion list, or a higher token budget) before
 the converter can prevent it without trading the `CONNECT` mis-forward for a
 new `TRACE` divergence.
 
+Found in the PR #692 round-4 review, same class of bug as the `CONNECT` one
+above (Rut forwards where Envoy fails closed, recorded separately from the
+per-request divergence tables because Rut does not merely refuse the
+request): a request target containing a `#` fragment.
+
+**Bug (mis-forward, not fail-closed):** for an origin-form target such as
+`GET /admin#frag HTTP/1.1`, Envoy rejects the request. The accepted HCM shape
+here cannot set `strip_fragment_from_path` (the milestone parser does not
+expose that field at all) and its default is `false`
+(`envoy.extensions.filters.network.http_connection_manager.v3.HttpConnectionManager.strip_fragment_from_path`);
+with fragment stripping off, Envoy's universal header validator rejects the
+`#` in the `:path` pseudo-header (`kPathHeaderCharTableWithAdditionalCharacters`
+explicitly excludes `?`/`#`,
+`source/extensions/http/header_validators/envoy_default/http1_header_validator.cc`),
+so the request never reaches an upstream. Rut instead records the fragment
+(`HttpParser::parse` sets `target_has_fragment`, `src/runtime/http_parser.cc`)
+and canonicalizes the *routing* path at the `#` (`finalize_path_canonical`),
+but `apply_request_policy` — the function that builds the forwarded request
+line for `forward(..., request_policy: {...})`
+(`include/rut/runtime/callbacks_impl.h`) — copies the parser's raw
+`req.path` (which still includes everything after the `#`) verbatim and
+never consults `target_has_fragment`, so the request is forwarded to the
+upstream with the fragment intact. Live observation on
+`envoy/lower-increment-2` (head `ca7f0dce`) with a `route "/" { return
+forward(backend, request_policy: { host: "upstream", ... }) }` route (the
+currently-shipped `host: "upstream"` request policy exercises the same
+`apply_request_policy` path the milestone's future `host: "preserve"` will
+use once `request_envoy_h1` lands — the fragment handling is identical
+either way): `GET /admin#frag HTTP/1.1` got a real `200 OK` from the origin,
+and the origin received `GET /admin#frag HTTP/1.1\r\nHost:
+127.0.0.1:29011\r\n\r\n` — the fragment reached the upstream unchanged. This
+is a runtime bug in `apply_request_policy`, not something the converter can
+gate around (the milestone route is any-method/any-path by construction, and
+the runtime forwards the fragment regardless of which capabilities the
+converter has enabled), so it needs a fix in
+`include/rut/runtime/callbacks_impl.h` — reject a fragment-bearing target in
+`apply_request_policy` the way `inspect_request_policy_body` already rejects
+other malformed shapes — before this milestone's `request_envoy_h1` capability
+can claim behavioral equivalence for this request shape.
+
+## Operational note: `--metrics` shadows a converted `/metrics` route
+
+Found in the PR #692 round-4 review. This is a CLI-launch-mode interaction,
+not a per-request divergence or a converter gap, so it is recorded here as a
+matrix row rather than blocking conversion.
+
+`rut`'s `--metrics` flag (`src/main.cc`) is opt-in and documented at the CLI
+level already: "this RESERVES the /metrics path — GET /metrics (and
+/metrics/, /metrics?…) is served by the built-in endpoint ahead of route
+matching, shadowing any user route on that path" (`src/main.cc`, the
+`--metrics` usage comment; enforced in
+`include/rut/runtime/callbacks_impl.h`, the `RESERVED PATH` block that
+intercepts `GET /metrics` "ahead of route matching, works even with no
+RouteConfig"). The milestone's converted program is an any-method,
+any-path catch-all (`route "/" { return forward(...) }`), so a client
+`GET /metrics` against a `rut` process launched with `--metrics` gets the
+built-in Prometheus exposition instead of being forwarded to the Envoy
+bootstrap's declared cluster, which is what the source Envoy configuration
+would have done (Envoy has no such reserved path).
+
+| Envoy behavior | RUT gap | status |
+| --- | --- | --- |
+| `GET /metrics` forwarded to the declared cluster like any other path (Envoy reserves no `/metrics` path of its own) | `rut --metrics` intercepts `GET /metrics` (and `/metrics/`, `/metrics?…`) ahead of route matching for every loaded program, converted or hand-written; this is an operator launch-mode choice, not something the generated RUT source controls or the converter can gate — only present when the operator opts into `--metrics` on this specific data listener | PARTIAL (opt-in CLI flag only; the converted program itself is unaffected without `--metrics`) |
+
 ## Blocked by Rut before the milestone can reach SUPPORTED
 
 Each row needs a runtime/language issue before the converter may emit it. The

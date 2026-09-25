@@ -125,15 +125,28 @@ RunResult run_with_args(const char* executable, const std::vector<std::string>& 
     RunResult result;
     int capture[2]{};
     if (!make_capture_files(capture)) return result;
+
+    // PR #692 round-4 review: build argv before fork(), not after. A caller
+    // running this concurrently with another live thread (the TOCTOU stress
+    // test's writer thread below) forks with that thread still holding
+    // whatever locks it held at that instant — fork() duplicates only the
+    // calling thread, so a lock an unduplicated thread held (e.g. inside
+    // malloc's arena) stays held forever in the child. `std::vector<char*>`
+    // construction and `push_back` growth both allocate, so doing that
+    // inside the child between fork() and exec() risks exactly that
+    // deadlock. Building argv in the parent keeps every allocation there;
+    // the child performs only async-signal-safe calls (dup2/close/execv/
+    // _exit).
+    std::vector<char*> argv;
+    argv.push_back(const_cast<char*>(executable));
+    for (const auto& arg : args) argv.push_back(const_cast<char*>(arg.c_str()));
+    argv.push_back(nullptr);
+
     const pid_t child = fork();
     if (child == 0) {
         if (dup2(capture[0], STDOUT_FILENO) < 0 || dup2(capture[1], STDERR_FILENO) < 0) _exit(126);
         close(capture[0]);
         close(capture[1]);
-        std::vector<char*> argv;
-        argv.push_back(const_cast<char*>(executable));
-        for (const auto& arg : args) argv.push_back(const_cast<char*>(arg.c_str()));
-        argv.push_back(nullptr);
         execv(executable, argv.data());
         _exit(127);
     }
@@ -179,6 +192,17 @@ bool replace_first(std::string* text, const std::string& from, const std::string
     if (pos == std::string::npos) return false;
     text->replace(pos, from.size(), to);
     return true;
+}
+
+// Replace every occurrence of `from` with `to` (same length in both callers
+// below, so this never changes the string's length).
+std::string replace_all(std::string text, const std::string& from, const std::string& to) {
+    size_t pos = 0;
+    while ((pos = text.find(from, pos)) != std::string::npos) {
+        text.replace(pos, from.size(), to);
+        pos += to.size();
+    }
+    return text;
 }
 
 std::string milestone_json(bool suppress_present,
@@ -318,32 +342,78 @@ TEST(envoy_convert, cli_input_errors) {
 // only `after.st_size` against the byte count it actually read, which cannot
 // catch another process rewriting the file in place with different content of
 // the *same* length while the read is in progress — the size check trivially
-// passes throughout. `content_a` and `content_b` below are deliberately not
-// valid JSON at all and are the same length, so every legitimate outcome for
-// this file is exactly one of two known messages regardless of which bytes
-// win the race: `parse_bootstrap_json` fails at byte 0 with the identical
-// "unexpected byte in JSON value" detail whether that byte is 'A' or 'B' (so
-// a torn read reaching the parser is indistinguishable from a clean one and
-// cannot manufacture a third outcome), or `read_input` itself rejects the
-// read as changed. A third outcome (a crash, a hang, or any other message)
-// would mean a same-size rewrite slipped through unnoticed.
+// passes throughout.
+//
+// PR #692 round-4 review: the original version of this test used
+// same-length but otherwise-invalid `content_a`/`content_b` (a repeated 'A'
+// vs a repeated 'B' byte), and both fail to parse at byte 0 with the exact
+// same content-agnostic "unexpected byte in JSON value" detail (the message
+// never quotes the offending byte — see `src/envoy/json.cc`). Every torn
+// mixture of the two also starts with either 'A' or 'B', so it produces that
+// identical message too; the test could not tell a genuinely torn read from
+// a clean one and would pass even against the pre-round-3 size-only check.
+//
+// `content_a`/`content_b` below fix this: both are the full milestone-S
+// bootstrap (the same shape `milestone_s_json()` produces, which parses
+// successfully and is only ever blocked by the `request_envoy_h1` capability
+// gate — see `cli_milestone_s_fails_closed_with_request_gap` above), and
+// differ *only* in one cluster identifier that is spelled out three times —
+// the route's `cluster`, the static cluster's `name`, and its
+// `load_assignment.cluster_name` (all three must agree; `validate()` checks
+// the first two, and `parse_bootstrap_json` the third) — as either
+// "backend0" (content_a) or "backend1" (content_b), both 8 bytes, so the two
+// documents are byte-for-byte the same length and only ever disagree on that
+// one trailing digit at each of the three spots. A large whitespace pad
+// between the `listeners` and `clusters` sections (JSON insignificant
+// whitespace, so still valid) pushes the first occurrence and the other two
+// onto different pages, widening the same window the round-3 fix closed.
+// A self-consistent read of either document (all three digits '0' or all
+// three '1') reaches the identical, expected `request_envoy_h1`
+// BLOCKED_BY_RUT diagnostic computed once below via the library API. A torn
+// read that mixes '0' and '1' across those three spots — a route naming one
+// cluster revision while the declared cluster is the other, precisely the
+// "listener from one revision combined with an endpoint from another"
+// scenario the round-3 comment in `read_input` describes — makes
+// `action.cluster.eq(model.cluster.name)` fail instead, with a different
+// diagnostic and error code (`invalid()`/`UnexpectedToken`, "route cluster
+// does not name a declared cluster") that cannot be confused with the
+// expected one. A torn read that instead breaks JSON syntax fails
+// `parse_bootstrap_json` and does not print the expected diagnostic either.
+// So exactly one of "input changed" or the expected BLOCKED_BY_RUT message
+// is a passing outcome; anything else — including that mismatched-cluster
+// diagnostic — is a torn read the TOCTOU check let through and must fail
+// this test.
 TEST(envoy_convert, cli_input_toctou_same_size_rewrite_never_admits_torn_read) {
     const std::string directory = make_temp_dir();
     REQUIRE_FALSE(directory.empty());
     const std::string path = directory + "/racing.json";
-    constexpr size_t kLen = 4096;
-    const std::string content_a(kLen, 'A');
-    const std::string content_b(kLen, 'B');
+
+    std::string base = milestone_s_json();
+    REQUIRE(
+        replace_first(&base, ",\n\"clusters\"", ",\n" + std::string(8192, ' ') + "\"clusters\""));
+    const std::string content_a = replace_all(base, "backend", "backend0");
+    const std::string content_b = replace_all(base, "backend", "backend1");
+    REQUIRE_EQ(content_a.size(), content_b.size());
+    REQUIRE_NE(content_a, content_b);
     REQUIRE(write_file(path, content_a));
 
     static envoy::JsonDocument doc_a;
     auto parsed_a = envoy::parse_bootstrap_json(str(content_a), doc_a);
-    REQUIRE_FALSE(parsed_a);
+    REQUIRE(parsed_a);
     static envoy::JsonDocument doc_b;
     auto parsed_b = envoy::parse_bootstrap_json(str(content_b), doc_b);
-    REQUIRE_FALSE(parsed_b);
-    const std::string parse_detail = to_string(parsed_a.error().detail);
-    CHECK_EQ(parse_detail, to_string(parsed_b.error().detail));
+    REQUIRE(parsed_b);
+
+    auto lowered_a = envoy::lower_to_rut(parsed_a.value());
+    REQUIRE_FALSE(lowered_a);
+    auto lowered_b = envoy::lower_to_rut(parsed_b.value());
+    REQUIRE_FALSE(lowered_b);
+    const std::string expected_detail = to_string(lowered_a.error().detail);
+    CHECK(expected_detail.find("BLOCKED_BY_RUT") != std::string::npos);
+    CHECK_EQ(expected_detail, to_string(lowered_b.error().detail));
+    CHECK_EQ(lowered_a.error().span.line, lowered_b.error().span.line);
+    CHECK_EQ(lowered_a.error().span.col, lowered_b.error().span.col);
+    const std::string expected_prefix = expected_location(path, lowered_a.error().span);
 
     const int fd = open(path.c_str(), O_WRONLY, 0600);
     REQUIRE(fd >= 0);
@@ -368,9 +438,13 @@ TEST(envoy_convert, cli_input_toctou_same_size_rewrite_never_admits_torn_read) {
         CHECK(result.out.empty());
         const bool is_changed_error =
             result.err.find("input changed while it was being read") != std::string::npos;
-        const bool is_parse_error = result.err.find(parse_detail) != std::string::npos;
-        // Exactly one of the two known outcomes, never both, never neither.
-        CHECK(is_changed_error != is_parse_error);
+        const bool is_expected_blocked =
+            result.err.compare(0, expected_prefix.size(), expected_prefix) == 0 &&
+            result.err.find(expected_detail) != std::string::npos;
+        // Exactly one of the two known-good outcomes, never both, never
+        // neither — in particular never the mismatched-cluster diagnostic a
+        // torn read across the three spellings would produce.
+        CHECK(is_changed_error != is_expected_blocked);
         if (is_changed_error) changed_detected++;
     }
 
@@ -534,18 +608,26 @@ TEST(envoy_convert, api_all_capabilities_matches_golden) {
 
     // Overwriting the JSON source after lowering must not change output
     // bytes: no borrowed source text reaches the emitted RUT, only numeric
-    // model fields do. The single byte backing `route.match.prefix` is left
-    // untouched (PR #692 round-3 review added a defensive `validate()` check
-    // that the prefix is exactly "/" — see api_forged_model_rejected below —
-    // so corrupting that one borrowed byte would correctly fail lowering
-    // rather than exercise the property this test is about).
+    // model fields do. The bytes backing `route.match.prefix` and
+    // `router.name` are left untouched (PR #692 round-3 review added a
+    // defensive `validate()` check that the prefix is exactly "/", and
+    // round-4 added one that the router filter name is exactly
+    // "envoy.filters.http.router" — see api_forged_model_rejected below — so
+    // corrupting either borrowed range would correctly fail lowering rather
+    // than exercise the property this test is about).
     const envoy::Bootstrap model_copy = parsed.value();
     const Str prefix =
         model_copy.listener.filter_chain.hcm.route_config.virtual_host.route.match.prefix;
+    const Str router_name = model_copy.listener.filter_chain.hcm.router.name;
     REQUIRE(prefix.ptr >= text.data() && prefix.ptr < text.data() + text.size());
+    REQUIRE(router_name.ptr >= text.data() && router_name.ptr < text.data() + text.size());
     const size_t prefix_offset = static_cast<size_t>(prefix.ptr - text.data());
+    const size_t router_name_offset = static_cast<size_t>(router_name.ptr - text.data());
     for (size_t i = 0; i < text.size(); i++) {
-        if (i < prefix_offset || i >= prefix_offset + prefix.len) text[i] = 'x';
+        const bool in_prefix = i >= prefix_offset && i < prefix_offset + prefix.len;
+        const bool in_router_name =
+            i >= router_name_offset && i < router_name_offset + router_name.len;
+        if (!in_prefix && !in_router_name) text[i] = 'x';
     }
     auto lowered_after_mutation = envoy::lower_to_rut(model_copy, all_true);
     REQUIRE(lowered_after_mutation);
@@ -596,6 +678,28 @@ TEST(envoy_convert, api_forged_model_rejected) {
     CHECK_FALSE(forged_prefix_result);
     CHECK(forged_prefix_result.error().code == FrontendError::UnexpectedToken);
     CHECK(to_string(forged_prefix_result.error().detail).find("match prefix") != std::string::npos);
+
+    // PR #692 round-4 review: a hand-mutated router filter identity must not
+    // lower successfully either. `validate()` only inspected
+    // `suppress_envoy_headers` on the router filter; a caller retargeting
+    // `router.name` at some other filter (e.g. a Lua filter) or clearing
+    // `has_typed_config` used to still lower, silently dropping whatever
+    // behavior the model actually named.
+    envoy::Bootstrap forged_router_name = parsed.value();
+    forged_router_name.listener.filter_chain.hcm.router.name = lit_str("envoy.filters.http.lua");
+    const auto forged_router_name_result = envoy::lower_to_rut(forged_router_name, all_true);
+    CHECK_FALSE(forged_router_name_result);
+    CHECK(forged_router_name_result.error().code == FrontendError::UnexpectedToken);
+    CHECK(to_string(forged_router_name_result.error().detail).find("router filter name") !=
+          std::string::npos);
+
+    envoy::Bootstrap cleared_typed_config = parsed.value();
+    cleared_typed_config.listener.filter_chain.hcm.router.has_typed_config = false;
+    const auto cleared_typed_config_result = envoy::lower_to_rut(cleared_typed_config, all_true);
+    CHECK_FALSE(cleared_typed_config_result);
+    CHECK(cleared_typed_config_result.error().code == FrontendError::UnexpectedToken);
+    CHECK(to_string(cleared_typed_config_result.error().detail).find("typed_config is required") !=
+          std::string::npos);
 }
 
 int main(int argc, char** argv) {

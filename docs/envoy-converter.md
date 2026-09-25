@@ -745,6 +745,41 @@ emitted text, since that still doesn't compile on this branch.
    explicit route per forwarded method. Recorded as a bug (not a
    `NOT_IMPLEMENTED`/`PARTIAL` row) in docs/envoy-compatibility.md.
 
+**Round-4 review edge cases (PR #692)**
+
+Five findings from the round-4 Codex review of PR #692:
+
+1. **Router filter identity was not revalidated.** `validate()`
+   (`src/envoy/converter.cc`) checked `router.suppress_envoy_headers` but
+   never `router.name`/`has_typed_config` themselves, so a caller of the
+   public `lower_to_rut(model, capabilities)` overload could retarget
+   `router.name` at a non-router filter (or clear `has_typed_config`) and
+   still get a successful lowering that silently ignored whatever filter the
+   model actually named. Fixed by checking both, mirroring the existing
+   `route.match.prefix` defensive check from round-3.
+2. **`--metrics` shadows a converted `/metrics` route.** A CLI-launch-mode
+   interaction, not a converter gap — see "Known capability dependencies"
+   above and docs/envoy-compatibility.md, "Operational note: `--metrics`
+   shadows a converted `/metrics` route".
+3. **`tests/test_envoy_convert.cc`'s TOCTOU stress test forked with a live
+   writer thread**, then built `argv` (a `std::vector` — allocates) in the
+   child between `fork()` and `exec()`; only async-signal-safe calls are
+   valid there with another thread possibly holding an allocator lock at
+   fork time. Fixed by building `argv` in the parent before `fork()`.
+4. **The same test's `content_a`/`content_b` couldn't detect an actual torn
+   read** — both were a single repeated byte, so every torn mixture produced
+   the identical byte-zero parse error as a clean read regardless of whether
+   the metadata check worked. Replaced with two full, valid milestone
+   bootstraps that agree byte-for-byte except one cluster identifier spelled
+   three times ("backend0" vs "backend1"), so a read that ends up with the
+   two occurrences disagreeing produces a distinct, previously-impossible
+   diagnostic ("route cluster does not name a declared cluster") that the
+   test explicitly rejects.
+5. **Fragment-bearing request targets are a runtime bug, not a converter
+   gap** — see the mis-forward bug recorded right after the round-3
+   `CONNECT` bug in docs/envoy-compatibility.md, and "Known capability
+   dependencies" above.
+
 ## Test layers
 
 1. Parser tests (`tests/test_envoy_parser.cc`): JSON document tree, field
@@ -900,6 +935,28 @@ are not `RutCapabilities` dependencies and are not listed here. See "Round-2
 review edge cases (PR #692)" below and docs/envoy-compatibility.md for the
 Envoy source citations, the exact Rut code paths, and the observed live bytes
 for each.
+
+Two more round-4-review findings belong in this same bucket, not as
+`RutCapabilities` gates:
+
+- A request target with a `#` fragment (e.g. `GET /admin#frag HTTP/1.1`) is a
+  genuine Rut runtime bug, not a converter gap: Envoy rejects it (no HCM
+  surface here to enable `strip_fragment_from_path`, and the universal header
+  validator rejects `#` in `:path` by default), but Rut's
+  `apply_request_policy` (`include/rut/runtime/callbacks_impl.h`) forwards
+  `req.path` — which still carries the fragment — to the upstream unchanged,
+  never consulting `HttpParser`'s `target_has_fragment`. Verified live (see
+  docs/envoy-compatibility.md). This needs a runtime fix in
+  `apply_request_policy`, not a converter change — the milestone route's
+  method/path shape has no way to exclude it.
+- `rut --metrics` reserves `GET /metrics` ahead of route matching on every
+  loaded program (`src/main.cc`, `include/rut/runtime/callbacks_impl.h`),
+  which would shadow this milestone's converted catch-all route for that one
+  path. This is an operator launch-mode choice orthogonal to conversion — the
+  generated RUT source is unaffected, and there is no grammar or runtime
+  surface for a converted program to opt back into forwarding `/metrics`
+  while `--metrics` is set — so it is recorded as a matrix row in
+  docs/envoy-compatibility.md rather than gated here.
 
 ## Semantic risks to check early
 
