@@ -776,10 +776,19 @@ FrontendResult<bool> validate(const Bootstrap& model, const RutCapabilities& cap
         if (model.clusters[i].endpoint.address.port == 0u)
             return invalid(model.clusters[i].endpoint.address.span,
                            lit_str("endpoint port must be non-zero"));
-        if (model.clusters[i].name.empty())
+        // `parse_cluster` (src/envoy/parser.cc) guarantees every parsed
+        // cluster name is backed, non-empty, and at most `kMaxEnvoyNameLen`
+        // bytes (`name_string(node, /*allow_empty=*/false, ...)`). A
+        // hand-built `Bootstrap` bypasses the parser entirely: a malformed
+        // name such as `Str{nullptr, 1}` reaching `Str::eq` below (or the
+        // RUT emission further down) would dereference a null pointer
+        // instead of producing a diagnostic. Reapply that invariant here,
+        // before comparing names, for every cluster.
+        if (model.clusters[i].name.len == 0u || model.clusters[i].name.ptr == nullptr)
             return invalid(model.clusters[i].name_span,
                            lit_str("cluster name must be a non-empty string"));
-        // PR #692 round-12 review, ported: revalidate the bounded length
+        // PR #692 round-12 review / Codex round-5 review on PR #695
+        // (independently the same finding): revalidate the bounded length
         // too, not just non-emptiness/equality. `name_string`
         // (src/envoy/parser.cc:179-185) rejects every name over
         // `kMaxEnvoyNameLen` during parsing, but nothing above re-checks
@@ -793,6 +802,15 @@ FrontendResult<bool> validate(const Bootstrap& model, const RutCapabilities& cap
         if (model.clusters[i].name.len > kMaxEnvoyNameLen)
             return unsupported(model.clusters[i].name_span,
                                lit_str("name exceeds the bounded length"));
+        // PR #692 round-9/round-8 review, ported: `load_assignment_name_present`
+        // is the model's only record that `parse_bootstrap_json` ever saw and
+        // validated this cluster's `load_assignment.cluster_name` (required,
+        // non-empty, and equal to `name` per Envoy's v3
+        // `ClusterLoadAssignment.cluster_name` `min_len: 1`). A hand-built
+        // `Bootstrap`, or a parsed copy with the bit cleared, still has a
+        // matching `action.cluster` / cluster `name` pair and would
+        // otherwise lower successfully, emitting a working gateway for a
+        // bootstrap Envoy would reject at startup.
         if (!model.clusters[i].load_assignment_name_present)
             return invalid(model.clusters[i].span,
                            lit_str("cluster load_assignment.cluster_name is required"));
@@ -896,6 +914,18 @@ FrontendResult<bool> validate(const Bootstrap& model, const RutCapabilities& cap
             const Str path = match.path;
             if (path.len == 0u || path.ptr == nullptr || path.ptr[0] != '/')
                 return invalid(match.span, lit_str("route match path must start with \"/\""));
+        } else {
+            // The JSON parser only ever produces `Prefix` or `Path`. A
+            // hand-built `Bootstrap` can set `match.kind` to a value outside
+            // that two-member enum; without this branch it silently falls
+            // through both checks above with no shape validation, and
+            // `build_node_plan` below treats every non-`Path` kind as a
+            // prefix using the untouched (possibly default-empty)
+            // `match.prefix` — reaching `strip_trailing_slash`, underflowing
+            // `prefix.len - 1u`, and producing a huge out-of-bounds view
+            // instead of a diagnostic. Fail closed on the unknown
+            // discriminator here instead.
+            return invalid(match.span, lit_str("route match kind is not recognized"));
         }
         const Str text = match.kind == RouteMatchKind::Prefix ? match.prefix : match.path;
         // `validate_route_match_bytes` (src/envoy/parser.cc) is a private
