@@ -37314,6 +37314,19 @@ TEST(frontend, strict_local_response_no_content_profile_contract_is_complete_and
     CHECK_EQ(strict_local_response_policy_profile(legacy), StrictLocalResponseProfile::LegacyError);
     CHECK(strict_local_response_policy_spec_valid(legacy));
 
+    // A hand-built RIR module or RouteConfig could smuggle in a
+    // StrictLocalResponseHeaderOrder value outside the closed
+    // {Synthesized, DateServerLength, LengthTypeDateServer} vocabulary: the
+    // LegacyError branch must reject it explicitly rather than fall through
+    // to the final `return profile;` and silently admit it as Synthesized.
+    for (const u8 raw_order : {static_cast<u8>(3), static_cast<u8>(4), static_cast<u8>(255)}) {
+        StrictLocalResponsePolicySpec forged_order = legacy;
+        forged_order.header_order = static_cast<StrictLocalResponseHeaderOrder>(raw_order);
+        CHECK_EQ(strict_local_response_policy_profile(forged_order),
+                 StrictLocalResponseProfile::Invalid);
+        CHECK_FALSE(strict_local_response_policy_spec_valid(forged_order));
+    }
+
     std::string max_reason(kMaxStrictLocalResponseReasonLen, 'r');
     std::string max_content_type(kMaxStrictLocalResponseContentTypeLen, 't');
     std::string max_server(kMaxStrictLocalResponseServerLen, 's');
