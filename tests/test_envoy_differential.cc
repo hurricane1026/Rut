@@ -1274,6 +1274,39 @@ struct EnvoyInstance {
             }
             return false;
         }
+        // Round-10 review, "Do not infer SIGTERM delivery from kill
+        // success": mirrors the identical fix in `RutInstance::stop()`
+        // (same file) -- kill(pid, SIGTERM) succeeding does not prove `pid`
+        // was alive when the signal arrived, since POSIX kill() also
+        // succeeds against an unreaped zombie. waitid(WNOHANG | WNOWAIT)
+        // reports an already-exited (zombie) docker-run client WITHOUT
+        // consuming its wait status, so it can still be reaped normally
+        // afterward; `si_pid` must be zeroed first since waitid() returns 0
+        // with an unspecified `siginfo_t` when WNOHANG finds no match, not
+        // just when it finds one. If the child is already a zombie right
+        // here, it did not die from a signal this call sent -- do not
+        // signal it, reap it directly, and report the unexpected early
+        // exit (still attempting `docker rm -f` cleanup, same as the
+        // precheck branch above).
+        //
+        // The remaining window -- the child exiting between this waitid()
+        // check and the kill() call right below -- cannot be closed this
+        // way (see `RutInstance::stop()`'s identical note for why), and is
+        // bounded the same way: the pair harness's transcript-completeness
+        // checks require every asserted case's exchange to have already
+        // completed before stop() is ever called.
+        siginfo_t zombie_info{};
+        if (waitid(P_PID, pid, &zombie_info, WEXITED | WNOHANG | WNOWAIT) == 0 &&
+            zombie_info.si_pid == pid) {
+            int reap_status = 0;
+            while (waitpid(pid, &reap_status, 0) < 0 && errno == EINTR) {
+            }
+            exited_unexpectedly = true;
+            unexpected_exit_description = describe_wait_status(reap_status);
+            pid = -1;
+            run_and_wait({"docker", "rm", "-f", name}, 10'000);
+            return false;
+        }
         const bool term_sent = kill(pid, SIGTERM) == 0;
         if (launched) {
             g_docker_rm_invocations++;
@@ -1607,6 +1640,55 @@ struct RutInstance {
         if (precheck == pid) {
             exited_unexpectedly = true;
             unexpected_exit_description = describe_wait_status(status);
+            pid = -1;
+            return false;
+        }
+        // Round-10 review, "Do not infer SIGTERM delivery from kill
+        // success": kill(pid, SIGTERM) succeeding does not prove `pid` was
+        // alive when the signal arrived -- POSIX kill() also succeeds
+        // against an unreaped zombie (verified: a zombie still accepts a
+        // signal with rc==0, it just has no effect), so a child that exited
+        // on its own in the gap between the precheck above and the kill()
+        // call below would still make kill() "succeed" and the reap loop
+        // below still observe a clean-looking exit 0, exactly the false
+        // "clean teardown" round-9's `term_sent` check was meant to catch.
+        // Narrow the gap as far as the kernel allows: waitid(WNOHANG |
+        // WNOWAIT) reports an already-exited (zombie) child WITHOUT
+        // consuming its wait status, so a positive result here can still be
+        // reaped normally afterward. If `pid` is already a zombie at this
+        // exact point, it did not die because of a signal this call sent
+        // (nothing has been sent yet) -- do not signal it at all, reap it
+        // directly, and report the unexpected early exit. `si_pid` must be
+        // zeroed first: waitid() returns 0 with an unspecified/unset
+        // `siginfo_t` when WNOHANG finds nothing, not just when it finds a
+        // match (verified: `si_pid` reads 0 in the no-match case).
+        //
+        // The remaining window cannot be closed this way: a child that
+        // exits between this waitid() check and the kill(pid, SIGTERM) call
+        // two lines below is indistinguishable from one that was already a
+        // zombie right up until that instant, because POSIX gives no way to
+        // learn a process's exit status ahead of actually reaping it, and
+        // reaping it here would remove the evidence the reap loop below
+        // needs to classify how it ended. This is documented and left as a
+        // residual TOCTOU rather than "fixed": its worst-case effect (an
+        // unexpected RUT exit in that instant being misreported as clean)
+        // is independently bounded by two things a mid-teardown crash would
+        // almost always also disturb -- rut_log_confirms_listener()'s
+        // launch-time evidence has nothing to do with shutdown and would not
+        // catch it, but the pair harness's transcript-completeness checks
+        // (validate_pair_results()/fill_upstream_bytes()) require every
+        // asserted case's exchange to have already completed before stop()
+        // is ever called, so a `rut` that crashes in this exact instant, as
+        // opposed to sometime during the run, has no in-flight evidence left
+        // to corrupt.
+        siginfo_t zombie_info{};
+        if (waitid(P_PID, pid, &zombie_info, WEXITED | WNOHANG | WNOWAIT) == 0 &&
+            zombie_info.si_pid == pid) {
+            int reap_status = 0;
+            while (waitpid(pid, &reap_status, 0) < 0 && errno == EINTR) {
+            }
+            exited_unexpectedly = true;
+            unexpected_exit_description = describe_wait_status(reap_status);
             pid = -1;
             return false;
         }
@@ -2066,6 +2148,32 @@ bool is_asserted_case(const std::string& name) {
     return false;
 }
 
+// Case names whose whole point is unreachable-upstream behavior, not
+// forwarding: `options_star` (Envoy answers the control `OPTIONS *` request
+// with a local 404, never routing it -- docs/envoy-compatibility.md, "Local
+// replies (404 for OPTIONS * and authority-form CONNECT)") and
+// `connect_failure` (the upstream port is deliberately closed to exercise
+// the connect-failure local reply), and `connect_authority` (authority-form
+// CONNECT hits the same unmatched-route local 404 as `options_star`; the
+// committed oracle's `kEnvoyOracle_connect_authority_upstream` is empty --
+// "upstream not contacted" -- so a correct run contacts the upstream zero
+// times, and classifying it as a forwarding case would make every run of
+// this record-only case a "forwarding not exercised" mismatch, which could
+// never demonstrate parity once its downstream persistence difference is
+// fixed; round-7 review, "Exempt authority-form CONNECT from forwarding
+// checks"). Every other case exists specifically to exercise forwarding, so
+// `compare_pair_case` below requires actual upstream contact for them
+// (round-6 review, "Require expected upstream contact for forwarded cases").
+// Moved above fill_upstream_bytes() (round-10 review, "Attribute stray
+// traffic without blaming local asserted cases"): these locally-handled
+// cases have `upstream_contact_count == 0` BY DESIGN, so fill_upstream_
+// bytes()'s stray-traffic attribution must not treat their zero count as
+// suspicious the way it does for a case that is actually supposed to
+// forward.
+bool case_expects_upstream_forward(const std::string& name) {
+    return name != "options_star" && name != "connect_failure" && name != "connect_authority";
+}
+
 // ── Case results & transcript ────────────────────────────────────────────
 
 struct CaseResult {
@@ -2181,7 +2289,16 @@ std::vector<CaseResult> run_case_batch(uint16_t listen_port, const std::vector<C
 // traffic cannot be traced back to a specific request, but it can only have
 // come from one of THIS batch's own cases, so it is attributed to whichever
 // case(s) never saw their own expected contact here -- the most likely
-// source of a request that landed somewhere else instead.
+// source of a request that landed somewhere else instead. Only a case that
+// actually expects to forward (case_expects_upstream_forward()) is eligible:
+// `options_star`/`connect_failure`/`connect_authority` have
+// `upstream_contact_count == 0` BY DESIGN (they are answered locally and
+// never forward), so their zero count is never suspicious and must not be
+// blamed for someone else's stray traffic -- otherwise an asserted
+// zero-contact case sitting in the same batch as a record-only misroute
+// would make every stray path "attributable to an asserted case" regardless
+// of which case actually caused it (round-10 review, "Attribute stray
+// traffic without blaming local asserted cases").
 //
 // Either anomaly (a per-case duplicate, or unattributed traffic explained by
 // an asserted case's missing contact) is only made fatal (returns false) for
@@ -2226,6 +2343,11 @@ bool fill_upstream_bytes(std::vector<CaseResult>* results,
             const auto it = std::find_if(
                 cases.begin(), cases.end(), [&](const CaseSpec& s) { return r.name == s.name; });
             if (it == cases.end() || r.upstream_contact_count != 0) continue;
+            // A case that never expects to forward at all (options_star,
+            // connect_failure, connect_authority) has zero contact by
+            // design; it is never a plausible source of stray traffic and
+            // must not be attributed to, asserted or not.
+            if (!case_expects_upstream_forward(r.name)) continue;
             if (is_asserted_case(r.name)) {
                 attributed_to_asserted = true;
             } else {
@@ -3110,26 +3232,6 @@ int run_oracle_milestone_s(const std::string& output_path) {
 }
 
 // ── --pair-milestone-s (PR 6) ────────────────────────────────────────────
-
-// Case names whose whole point is unreachable-upstream behavior, not
-// forwarding: `options_star` (Envoy answers the control `OPTIONS *` request
-// with a local 404, never routing it -- docs/envoy-compatibility.md, "Local
-// replies (404 for OPTIONS * and authority-form CONNECT)") and
-// `connect_failure` (the upstream port is deliberately closed to exercise
-// the connect-failure local reply), and `connect_authority` (authority-form
-// CONNECT hits the same unmatched-route local 404 as `options_star`; the
-// committed oracle's `kEnvoyOracle_connect_authority_upstream` is empty --
-// "upstream not contacted" -- so a correct run contacts the upstream zero
-// times, and classifying it as a forwarding case would make every run of
-// this record-only case a "forwarding not exercised" mismatch, which could
-// never demonstrate parity once its downstream persistence difference is
-// fixed; round-7 review, "Exempt authority-form CONNECT from forwarding
-// checks"). Every other case exists specifically to exercise forwarding, so
-// `compare_pair_case` below requires actual upstream contact for them
-// (round-6 review, "Require expected upstream contact for forwarded cases").
-bool case_expects_upstream_forward(const std::string& name) {
-    return name != "options_star" && name != "connect_failure" && name != "connect_authority";
-}
 
 // Compares one pair case's Envoy and RUT observations, printing
 // MATCH/MISMATCH with escaped literals for either mismatching side. Returns
@@ -5014,6 +5116,82 @@ bool self_test_unexpected_upstream_path_record_only_not_fatal() {
     return ok;
 }
 
+// Round-10 review, "Attribute stray traffic without blaming local asserted
+// cases": a real `run1_cases()` batch always contains asserted, locally-
+// handled cases (`options_star`, `connect_failure`, `connect_authority`)
+// whose `upstream_contact_count` is 0 BY DESIGN -- they never forward at
+// all -- alongside record-only forwarding cases. Before the fix, the mere
+// presence of such an asserted zero-contact case made ANY stray path in the
+// same batch "attributable to an asserted case" (since the old check only
+// asked "is this case asserted and at zero contact", never "does this case
+// even expect to forward"), so a record-only case's own misroute could
+// still fail the whole batch. This exercises exactly that combination:
+// "options_star" (asserted, locally-handled, never contacted) sits in the
+// same `cases` table as "get_forged_xfcc" (record-only, its own expected
+// path also never contacted) while the actual stray request lands on an
+// unlisted path -- fill_upstream_bytes() must not fail the batch, must
+// leave "options_star" unmarked (it was never a plausible source), and must
+// flag "get_forged_xfcc" as ambiguous (the only plausible source left).
+bool self_test_unexpected_upstream_path_ignores_asserted_local_case() {
+    BoundPort bound;
+    if (!allocate_bound_loopback_port(&bound)) {
+        std::cerr << "FAIL [self-test unexpected-upstream-path ignores local]: could not allocate "
+                     "a loopback port\n";
+        return false;
+    }
+    const uint16_t port = bound.port;
+    RecordingUpstream upstream;
+    const std::string reply = "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nhi";
+    upstream.set_default_reply(reply);
+    if (!upstream.adopt(bound.fd)) {
+        std::cerr << "FAIL [self-test unexpected-upstream-path ignores local]: could not start "
+                     "upstream\n";
+        return false;
+    }
+    bool ok = true;
+    {
+        const int fd = connect_with_timeout(port, kClientTimeoutMs);
+        if (fd < 0) {
+            std::cerr << "FAIL [self-test unexpected-upstream-path ignores local]: could not "
+                         "connect\n";
+            upstream.stop();
+            return false;
+        }
+        // Neither "options_star"'s nor "get_forged_xfcc"'s expected path
+        // below is ever hit; only this unlisted one is.
+        const std::string req = "GET /unlisted HTTP/1.1\r\nHost: t.example\r\n\r\n";
+        if (!send_all(fd, req) || read_http_message(fd, false, kClientTimeoutMs).bytes != reply)
+            ok = false;
+        close(fd);
+    }
+    const std::vector<CaseSpec> cases = {{"options_star", "", false, "*", reply},
+                                         {"get_forged_xfcc", "", false, "/expected", reply}};
+    std::vector<CaseResult> results(2);
+    results[0].name = "options_star";
+    results[1].name = "get_forged_xfcc";
+    const bool fill_ok = fill_upstream_bytes(&results, cases, upstream);
+    upstream.stop();
+    if (!fill_ok) {
+        std::cerr << "FAIL [self-test unexpected-upstream-path ignores local]: fill_upstream_bytes "
+                     "failed the batch because an asserted, locally-handled zero-contact case sat "
+                     "alongside the real (record-only) misroute\n";
+        ok = false;
+    }
+    if (results[0].upstream_ambiguous) {
+        std::cerr << "FAIL [self-test unexpected-upstream-path ignores local]: the asserted "
+                     "locally-handled case (\"options_star\") was marked ambiguous even though it "
+                     "never expects to forward and cannot be the source\n";
+        ok = false;
+    }
+    if (!results[1].upstream_ambiguous) {
+        std::cerr << "FAIL [self-test unexpected-upstream-path ignores local]: the record-only "
+                     "forwarding case (\"get_forged_xfcc\") was not marked ambiguous\n";
+        ok = false;
+    }
+    if (ok) std::cerr << "PASS [self-test unexpected-upstream-path ignores local]\n";
+    return ok;
+}
+
 // Exercises the exact `RutInstance::stop()` path a crash before intentional
 // teardown would hit: `/bin/true` stands in for a `rut` binary that exits on
 // its own (no docker or real `rut` binary needed), and stop() must report
@@ -5630,6 +5808,57 @@ bool self_test_persistent_trailing_bytes_detected() {
     return ok;
 }
 
+// Envoy-side counterpart to self_test_rut_early_exit_detected() above,
+// covering round-10 review, "Do not infer SIGTERM delivery from kill
+// success" (the fix applies identically to EnvoyInstance::stop()): a
+// docker-run child that has already exited on its own -- and is therefore
+// an unreaped zombie -- by the time stop() is called must be reported as an
+// unexpected exit, never a clean teardown. `/bin/true` stands in for the
+// docker client (no docker binary needed; stop()'s `docker rm -f` side call
+// simply fails fast and is ignored). This is caught by stop()'s very first
+// precheck, same as the RUT counterpart; the round-10 waitid(WNOHANG |
+// WNOWAIT) check added right before kill() sits just after it for the
+// (unfalsifiable in a deterministic test) narrower window between the two.
+bool self_test_envoy_early_exit_detected() {
+    EnvoyInstance envoy;
+    envoy.name = "rut-diff-selftest-envoy-early-exit";
+    envoy.log_path = "/dev/null";
+    const std::vector<std::string> argv = {"/bin/true"};
+    const std::vector<char*> args = build_argv(argv);
+    envoy.pid = fork();
+    if (envoy.pid < 0) {
+        std::cerr << "FAIL [self-test envoy early exit]: fork failed\n";
+        return false;
+    }
+    if (envoy.pid == 0) {
+        const int null_fd = open("/dev/null", O_RDWR);
+        if (null_fd >= 0) {
+            dup2(null_fd, STDOUT_FILENO);
+            dup2(null_fd, STDERR_FILENO);
+            if (null_fd > STDERR_FILENO) close(null_fd);
+        }
+        execv(args[0], args.data());
+        _exit(127);
+    }
+    // Give the child time to exit on its own before stop() is asked to tear
+    // it down.
+    struct timespec ts{0, 200'000'000};
+    nanosleep(&ts, nullptr);
+    const bool stopped_cleanly = envoy.stop();
+    bool ok = true;
+    if (stopped_cleanly) {
+        std::cerr << "FAIL [self-test envoy early exit]: stop() reported a clean teardown for a "
+                     "process that had already exited on its own\n";
+        ok = false;
+    }
+    if (!envoy.exited_unexpectedly) {
+        std::cerr << "FAIL [self-test envoy early exit]: exited_unexpectedly was not set\n";
+        ok = false;
+    }
+    if (ok) std::cerr << "PASS [self-test envoy early exit]\n";
+    return ok;
+}
+
 // Round-7 review, "Verify the Envoy status reaped after teardown": the
 // docker-run child's reaped status must match the teardown
 // EnvoyInstance::stop() itself performed, exactly as
@@ -6181,6 +6410,7 @@ int run_self_test(const std::string& rut_binary, const std::string& converter_bi
     ok &= self_test_duplicate_upstream_record_only_not_fatal();
     ok &= self_test_unexpected_upstream_path_rejected();
     ok &= self_test_unexpected_upstream_path_record_only_not_fatal();
+    ok &= self_test_unexpected_upstream_path_ignores_asserted_local_case();
     ok &= self_test_rut_early_exit_detected();
     ok &= self_test_rut_stop_requires_delivered_signal();
     ok &= self_test_rut_stop_verifies_exit_status();
@@ -6192,6 +6422,7 @@ int run_self_test(const std::string& rut_binary, const std::string& converter_bi
     ok &= self_test_head_body_detected();
     ok &= self_test_head_grace_reset_detected();
     ok &= self_test_persistent_trailing_bytes_detected();
+    ok &= self_test_envoy_early_exit_detected();
     ok &= self_test_envoy_stop_verifies_exit_status();
     ok &= self_test_malformed_date_rejected();
     ok &= self_test_rut_port_retry(rut_binary, converter_binary);
