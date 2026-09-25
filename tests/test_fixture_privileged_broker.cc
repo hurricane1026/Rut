@@ -10376,7 +10376,10 @@ static bool await_root_hello(const ParentEndpoint& endpoint,
                 if (is_pre_exec_anchor(launch, identity)) {
                     last_observation = "blocked pre-exec anchor";
                 } else if (reason == "executable/argv is not an exact allowed launch stage") {
-                    error = "stable direct launch identity was not an allowed stage";
+                    error = "stable direct launch identity was not an allowed stage (exe=" +
+                            identity.exe +
+                            " argv_bytes=" + std::to_string(identity.cmdline.size()) +
+                            " uid=" + std::to_string(identity.uid) + ")";
                     launch.reason = error;
                     return false;
                 } else {
