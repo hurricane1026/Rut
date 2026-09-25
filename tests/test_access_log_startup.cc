@@ -302,6 +302,25 @@ struct ProcessResult {
     bool shutdown_signal_sent = false;
 };
 
+bool exited_one(const ProcessResult& result) {
+    const bool ok = result.status_valid && !result.forced_kill && WIFEXITED(result.status) &&
+                    WEXITSTATUS(result.status) == 1;
+    if (!ok) {
+        // Make the next failure self-describing: which way the status disagreed.
+        (void)fprintf(stderr,
+                      "    exited_one: status_valid=%d forced_kill=%d exited=%d code=%d "
+                      "signaled=%d signal=%d output=[%s]\n",
+                      result.status_valid ? 1 : 0,
+                      result.forced_kill ? 1 : 0,
+                      WIFEXITED(result.status) ? 1 : 0,
+                      WIFEXITED(result.status) ? WEXITSTATUS(result.status) : -1,
+                      WIFSIGNALED(result.status) ? 1 : 0,
+                      WIFSIGNALED(result.status) ? WTERMSIG(result.status) : 0,
+                      result.output.c_str());
+    }
+    return ok;
+}
+
 #ifdef RUT_ACCESS_LOG_STARTUP_SOURCE_PROCESS_TEST
 struct ProxyBackendResult {
     std::string request;
@@ -709,25 +728,6 @@ u32 count_occurrences(const std::string& text, const std::string& needle) {
         count++;
         offset += needle.size();
     }
-}
-
-bool exited_one(const ProcessResult& result) {
-    const bool ok = result.status_valid && !result.forced_kill && WIFEXITED(result.status) &&
-                    WEXITSTATUS(result.status) == 1;
-    if (!ok) {
-        // Make the next failure self-describing: which way the status disagreed.
-        (void)fprintf(stderr,
-                      "    exited_one: status_valid=%d forced_kill=%d exited=%d code=%d "
-                      "signaled=%d signal=%d output=[%s]\n",
-                      result.status_valid ? 1 : 0,
-                      result.forced_kill ? 1 : 0,
-                      WIFEXITED(result.status) ? 1 : 0,
-                      WIFEXITED(result.status) ? WEXITSTATUS(result.status) : -1,
-                      WIFSIGNALED(result.status) ? 1 : 0,
-                      WIFSIGNALED(result.status) ? WTERMSIG(result.status) : 0,
-                      result.output.c_str());
-    }
-    return ok;
 }
 
 std::string source_with_sink(const std::string& sink) {
