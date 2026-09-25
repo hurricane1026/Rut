@@ -2021,7 +2021,17 @@ upstream response instead of the transparent zero-copy default. Admission is
 bounded to a cleartext HTTP/1.1, origin-form, bodyless non-HEAD request and
 one final upstream HTTP/1.1 response framed by exactly one `Content-Length`
 (chunking, trailers, close-delimited framing, and 1xx/204/304/no-body
-responses all fail closed). Two closed profiles exist:
+responses all fail closed), with two explicit, narrowly bounded exceptions:
+a HEAD request is admitted only when both `response_policy` and any paired
+`failure_policy` select `head_mode: "suppress_body"` (headers only, upstream's
+declared `Content-Length` kept but no body emitted; see
+`response_policy_suppress_head_admitted` in `callbacks_impl.h`); and a
+fixed-`Content-Length` body-bearing request is admitted alongside a
+`response_policy` when paired with `host: "preserve"` (ID4) or the plain
+`host: "upstream"` strip (ID1) on `request_policy` -- fully buffered,
+unchunked, with no pipelined successor bytes, and never served from a reused
+idle upstream socket (see `request_policy_body_response_admitted` in
+`callbacks_impl.h`). Two closed profiles exist:
 
 ```swift
 // Fixed-order profile (nginx-compatible default): synthesizes the response

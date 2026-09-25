@@ -1710,6 +1710,117 @@ TEST(response_policy, upstream_header_order_accepts_empty_upstream_reason) {
         conn.response_header_buf.data(), conn.response_header_buf.len(), "content-length: 2\r\n"));
 }
 
+// Codex round-6 review: the response parser exposes the semantic header
+// value with surrounding OWS stripped (`h.value`), but this serializer wrote
+// `h.raw_value` after trimming only its leading OWS, so trailing
+// `" \t"`-style padding before the CRLF reached the downstream byte for
+// byte. Envoy's header-map serialization normalizes both ends (RFC 7230
+// §3.2.4), matching the Envoy-compatible request serializer's own
+// leading-and-trailing trim (`callbacks_impl.h:5707-5710`); this profile
+// must match on the response side too.
+TEST(response_policy, upstream_header_order_trims_trailing_ows) {
+    char server[] = "envoy";
+    ForwardResponsePolicySpec upstream_order{};
+    upstream_order.version = ResponsePolicyVersion::Http11;
+    upstream_order.framing = ResponsePolicyFraming::ContentLength;
+    upstream_order.connection = ResponsePolicyConnection::Request;
+    upstream_order.header_order = ResponsePolicyHeaderOrder::Upstream;
+    upstream_order.header_names = ResponsePolicyHeaderNames::Lowercase;
+    upstream_order.connection_header = ResponsePolicyConnectionHeader::CloseOnly;
+    upstream_order.status_reason = ResponsePolicyStatusReason::Canonical;
+    upstream_order.date = ResponsePolicyDate::PreserveOrCurrent;
+    upstream_order.server = {server, 5};
+    REQUIRE(response_policy_spec_valid(upstream_order));
+
+    RouteConfig config{};
+    REQUIRE_EQ(config.add_response_policy(upstream_order), 1u);
+
+    u8 header_storage[SlicePool::kSliceSize]{};
+    Connection conn{};
+    conn.reset();
+    conn.response_header_slice = header_storage;
+    conn.response_header_buf.bind(header_storage, sizeof(header_storage));
+    conn.response_policy_id = 1;
+    conn.keep_alive = true;
+    conn.req_client_keep_alive = true;
+
+    static constexpr char kUpstream[] =
+        "HTTP/1.1 200 OK\r\nContent-Length: 2\r\nX-Test: value \t\r\n\r\nhi";
+    HttpResponseParser parser;
+    ParsedResponse response;
+    parser.reset();
+    response.reset();
+    REQUIRE_EQ(
+        parser.parse(reinterpret_cast<const u8*>(kUpstream), sizeof(kUpstream) - 1u, &response),
+        ParseStatus::Complete);
+    REQUIRE(build_strict_response_headers(conn, config, response));
+    CHECK(buf_has(
+        conn.response_header_buf.data(), conn.response_header_buf.len(), "x-test: value\r\n"));
+    CHECK_FALSE(buf_has(
+        conn.response_header_buf.data(), conn.response_header_buf.len(), "x-test: value \t\r\n"));
+}
+
+// Codex round-6 review: when `server` is listed in `hide_headers` and the
+// upstream also supplies a `Server` field, the generic hide check used to
+// run before the dedicated `server` branch, discarding the origin slot
+// entirely and leaving `seen_server` false -- so the configured `server`
+// value was appended at the end instead of replacing the upstream value in
+// its original position. Envoy's `server_header_transformation: OVERWRITE`
+// replaces the header in place regardless of any removal configuration;
+// `hide_headers` naming `server` must not change where the replacement
+// lands.
+TEST(response_policy, upstream_header_order_replaces_hidden_server_in_place) {
+    char server[] = "envoy";
+    ForwardResponsePolicySpec upstream_order{};
+    upstream_order.version = ResponsePolicyVersion::Http11;
+    upstream_order.framing = ResponsePolicyFraming::ContentLength;
+    upstream_order.connection = ResponsePolicyConnection::Request;
+    upstream_order.header_order = ResponsePolicyHeaderOrder::Upstream;
+    upstream_order.header_names = ResponsePolicyHeaderNames::Lowercase;
+    upstream_order.connection_header = ResponsePolicyConnectionHeader::CloseOnly;
+    upstream_order.status_reason = ResponsePolicyStatusReason::Canonical;
+    upstream_order.date = ResponsePolicyDate::PreserveOrCurrent;
+    upstream_order.server = {server, 5};
+    upstream_order.hide_header_count = 1;
+    upstream_order.hide_headers[0] = {"Server", 6};
+    REQUIRE(response_policy_spec_valid(upstream_order));
+
+    RouteConfig config{};
+    REQUIRE_EQ(config.add_response_policy(upstream_order), 1u);
+
+    u8 header_storage[SlicePool::kSliceSize]{};
+    Connection conn{};
+    conn.reset();
+    conn.response_header_slice = header_storage;
+    conn.response_header_buf.bind(header_storage, sizeof(header_storage));
+    conn.response_policy_id = 1;
+    conn.keep_alive = true;
+    conn.req_client_keep_alive = true;
+
+    static constexpr char kUpstream[] =
+        "HTTP/1.1 200 OK\r\nServer: custom-origin\r\nX-After: 1\r\nContent-Length: 2\r\n\r\nhi";
+    HttpResponseParser parser;
+    ParsedResponse response;
+    parser.reset();
+    response.reset();
+    REQUIRE_EQ(
+        parser.parse(reinterpret_cast<const u8*>(kUpstream), sizeof(kUpstream) - 1u, &response),
+        ParseStatus::Complete);
+    REQUIRE(build_strict_response_headers(conn, config, response));
+    const u8* d = conn.response_header_buf.data();
+    const u32 n = conn.response_header_buf.len();
+    CHECK(buf_has(d, n, "server: envoy\r\n"));
+    CHECK_FALSE(buf_has(d, n, "custom-origin"));
+    // Occupies the origin slot: appears before X-After, not appended last
+    // (which would put it after Content-Length/Date, at the very end).
+    const std::string haystack(reinterpret_cast<const char*>(d), n);
+    const size_t server_pos = haystack.find("server: envoy\r\n");
+    const size_t after_pos = haystack.find("x-after: 1\r\n");
+    REQUIRE_NE(server_pos, std::string::npos);
+    REQUIRE_NE(after_pos, std::string::npos);
+    CHECK_LT(server_pos, after_pos);
+}
+
 // Codex round-3 review: `resp.chunked` is only set when the Transfer-Encoding
 // token list contains "chunked"; a non-chunked coding (or one where chunked
 // is not the final token) leaves it false while the field is still present.

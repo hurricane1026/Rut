@@ -11241,15 +11241,24 @@ inline bool build_upstream_order_response_headers(
         // `Synthesized` profile always re-emits it independent of the hide
         // list (it is never routed through that profile's own hide check).
         const bool is_content_length = response_policy_name_eq(name, "content-length", 14);
-        if (response_policy_name_eq(name, "connection", 10) ||
-            response_policy_name_eq(name, "keep-alive", 10) ||
-            response_policy_name_eq(name, "proxy-connection", 16) ||
-            response_policy_name_eq(name, "upgrade", 7) || response_policy_name_eq(name, "te", 2) ||
-            response_policy_name_eq(name, "trailer", 7) ||
-            response_policy_name_eq(name, "transfer-encoding", 17) ||
-            (!is_content_length && response_policy_hides_header(policy, name)))
+        // `server` is handled by the dedicated branch below regardless of
+        // `hide_headers`: Envoy's `server_header_transformation: OVERWRITE`
+        // replaces the upstream `Server` value in place rather than dropping
+        // it and re-appending the configured value at the end, so a
+        // `hide_headers` entry naming `server` must not route it through the
+        // generic hide check here (mirrors the `content-length` carve-out
+        // just above).
+        const bool is_server = response_policy_name_eq(name, "server", 6);
+        if (!is_server && (response_policy_name_eq(name, "connection", 10) ||
+                           response_policy_name_eq(name, "keep-alive", 10) ||
+                           response_policy_name_eq(name, "proxy-connection", 16) ||
+                           response_policy_name_eq(name, "upgrade", 7) ||
+                           response_policy_name_eq(name, "te", 2) ||
+                           response_policy_name_eq(name, "trailer", 7) ||
+                           response_policy_name_eq(name, "transfer-encoding", 17) ||
+                           (!is_content_length && response_policy_hides_header(policy, name))))
             continue;
-        if (response_policy_name_eq(name, "server", 6)) {
+        if (is_server) {
             if (seen_server) continue;
             seen_server = true;
             if (!put_lit("server: ") || !put(policy.server.ptr, policy.server.len) ||
@@ -11258,17 +11267,26 @@ inline bool build_upstream_order_response_headers(
             continue;
         }
         if (response_policy_name_eq(name, "date", 4)) seen_date = true;
+        // Trim both leading and trailing optional whitespace (RFC 7230
+        // §3.2.4 OWS), matching how the response parser exposes `h.value`
+        // and how the Envoy-compatible request serializer trims both ends
+        // (`callbacks_impl.h:5707-5710` above). Trimming only the leading
+        // OWS here would forward the upstream's raw trailing whitespace
+        // byte for byte, a wire mismatch Envoy's header-map serialization
+        // does not reproduce.
         u32 start = 0;
         while (start < h.raw_value.len &&
                (h.raw_value.ptr[start] == ' ' || h.raw_value.ptr[start] == '\t'))
             start++;
+        u32 end = h.raw_value.len;
+        while (end > start && (h.raw_value.ptr[end - 1] == ' ' || h.raw_value.ptr[end - 1] == '\t'))
+            end--;
         for (u32 c = 0; c < name.len; c++) {
             char lower = name.ptr[c];
             if (lower >= 'A' && lower <= 'Z') lower = static_cast<char>(lower + 32);
             if (!put(&lower, 1)) return false;
         }
-        if (!put_lit(": ") || !put(h.raw_value.ptr + start, h.raw_value.len - start) ||
-            !put_lit("\r\n"))
+        if (!put_lit(": ") || !put(h.raw_value.ptr + start, end - start) || !put_lit("\r\n"))
             return false;
     }
     if (!seen_date) {

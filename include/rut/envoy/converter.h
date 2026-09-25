@@ -22,14 +22,11 @@ struct RutSource {
 // One flag per RUT surface the lowering needs beyond today's grammar. Each
 // flag is flipped only by the PR that lands the corresponding runtime
 // capability (docs/envoy-converter.md, "Known capability dependencies"); the
-// converter itself never flips one on its own. The shipped table
-// (`kShippedRutCapabilities` below) is partially enabled: `request_envoy_h1`
-// is true (PR3 landed the ID4 `Http11PreserveHostLowercase` request policy,
-// so lowering clears that check), while `response_envoy_h1` and
-// `local_reply_envoy_h1` are still false, so `lower_to_rut(model)` still
-// fails closed with a `BLOCKED_BY_RUT` diagnostic -- now at the
-// `response_envoy_h1` check (`src/envoy/converter.cc`) -- until PR4 and PR5
-// flip their flags.
+// converter itself never flips one on its own. `kShippedRutCapabilities`
+// below now ships `request_envoy_h1` (PR3) and `response_envoy_h1` (PR4) as
+// true; only `local_reply_envoy_h1` (PR5) remains false, so
+// `lower_to_rut(model)` fails closed with a `BLOCKED_BY_RUT` diagnostic only
+// for a model that needs the still-missing local_reply surface.
 struct RutCapabilities {
     bool request_envoy_h1 = false;      // PR3: host preserve + lowercase request headers
     bool response_envoy_h1 = false;     // PR4: upstream header order + lowercase + preserved date
