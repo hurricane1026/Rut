@@ -2216,6 +2216,145 @@ TEST(response_policy, upstream_header_order_canonical_reason_covers_admitted_dom
     CHECK_FALSE(canonical_status_reason(200, nullptr));
 }
 
+// Codex round-13 review (PR #698, thread PRRT_kwDORsELtc6mLL_8): asked for
+// the runtime table to be checked against a test-owned, independent
+// transcription of the *complete* `enum class Code`
+// (envoy/http/codes.h, Envoy v1.39.1) so no entry can be missed again, and
+// specifically named 418 and 451 as allegedly-missing named codes.
+//
+// Verified against the pinned v1.39.1 source directly (raw.githubusercontent
+// .com/envoyproxy/envoy/v1.39.1/envoy/http/codes.h, cross-checked byte for
+// byte against an independent CDN mirror, and against the full release
+// tarball from codeload.github.com/envoyproxy/envoy/tar.gz/refs/tags/v1.39.1):
+// `enum class Code` has exactly 59 enumerators (the `kFullEnvoyCodeEnum`
+// table below, transcribed independently of `envoy_canonical_status_reason_
+// table` in src/runtime/callbacks.cc) and neither 418 nor 451 is one of
+// them, in this header or in `CodeUtility::toString`
+// (source/common/http/codes.cc). A repo-wide grep of the entire v1.39.1
+// release tree found 451 ("Unavailable For Legal Reasons") in exactly two
+// places, neither of which is this table: `mobile/library/java/org/
+// chromium/net/impl/HttpReason.java` (Envoy Mobile's separate Java
+// Cronet-compatibility shim, a different language and subsystem from the
+// core HTTP/1 proxy codec) and `bazel/external/http_parser/http_parser.h`
+// (a vendored third-party dependency, nodejs's `http_parser`, with its own
+// independent `HTTP_STATUS_MAP` macro -- and that vendored table does not
+// even name 418 either). 418 does not appear anywhere in the v1.39.1 tree
+// as a named status code; every "418" hit is an unrelated numeric
+// coincidence (lockfile versions, unrelated test literals using 418 as an
+// arbitrary example status). So `canonical_status_reason(418, ...)` and
+// `canonical_status_reason(451, ...)` correctly return `"Unknown"` --
+// exactly what a real Envoy v1.39.1's `CodeUtility::toString` would return
+// for these values, since neither is a `Code` enumerator at this pinned
+// version. This test asserts the runtime table against literally every
+// entry of the complete enum (closing the round-13 ask precisely) and
+// pins 418/451/299 to "Unknown" as the correct, Envoy-matching behavior
+// rather than a gap.
+TEST(response_policy, upstream_header_order_canonical_reason_matches_full_envoy_code_enum) {
+    struct Named {
+        u16 code;
+        const char* reason;
+    };
+    // Every enumerator of `enum class Code` (envoy/http/codes.h, v1.39.1),
+    // transcribed independently of src/runtime/callbacks.cc.
+    static const Named kFullEnvoyCodeEnum[] = {
+        {100, "Continue"},
+        {101, "Switching Protocols"},
+        {200, "OK"},
+        {201, "Created"},
+        {202, "Accepted"},
+        {203, "Non-Authoritative Information"},
+        {204, "No Content"},
+        {205, "Reset Content"},
+        {206, "Partial Content"},
+        {207, "Multi-Status"},
+        {208, "Already Reported"},
+        {226, "IM Used"},
+        {300, "Multiple Choices"},
+        {301, "Moved Permanently"},
+        {302, "Found"},
+        {303, "See Other"},
+        {304, "Not Modified"},
+        {305, "Use Proxy"},
+        {307, "Temporary Redirect"},
+        {308, "Permanent Redirect"},
+        {400, "Bad Request"},
+        {401, "Unauthorized"},
+        {402, "Payment Required"},
+        {403, "Forbidden"},
+        {404, "Not Found"},
+        {405, "Method Not Allowed"},
+        {406, "Not Acceptable"},
+        {407, "Proxy Authentication Required"},
+        {408, "Request Timeout"},
+        {409, "Conflict"},
+        {410, "Gone"},
+        {411, "Length Required"},
+        {412, "Precondition Failed"},
+        {413, "Payload Too Large"},
+        {414, "URI Too Long"},
+        {415, "Unsupported Media Type"},
+        {416, "Range Not Satisfiable"},
+        {417, "Expectation Failed"},
+        {421, "Misdirected Request"},
+        {422, "Unprocessable Entity"},
+        {423, "Locked"},
+        {424, "Failed Dependency"},
+        {425, "Too Early"},
+        {426, "Upgrade Required"},
+        {428, "Precondition Required"},
+        {429, "Too Many Requests"},
+        {431, "Request Header Fields Too Large"},
+        {500, "Internal Server Error"},
+        {501, "Not Implemented"},
+        {502, "Bad Gateway"},
+        {503, "Service Unavailable"},
+        {504, "Gateway Timeout"},
+        {505, "HTTP Version Not Supported"},
+        {506, "Variant Also Negotiates"},
+        {507, "Insufficient Storage"},
+        {508, "Loop Detected"},
+        {510, "Not Extended"},
+        {511, "Network Authentication Required"},
+        {599, "Last Unassigned Server Error Code"},
+    };
+    CHECK_EQ(sizeof(kFullEnvoyCodeEnum) / sizeof(kFullEnvoyCodeEnum[0]), 59u);
+
+    auto expected_reason_for = [&](u16 code) -> std::string {
+        for (const auto& e : kFullEnvoyCodeEnum)
+            if (e.code == code) return e.reason;
+        return "Unknown";
+    };
+
+    // Every named enumerator must round-trip through the runtime table
+    // exactly -- this is the literal "assert the runtime table matches
+    // every entry" check the round-13 review asked for.
+    for (const auto& e : kFullEnvoyCodeEnum) {
+        Str out{};
+        REQUIRE(canonical_status_reason(e.code, &out));
+        CHECK_EQ(out.len, static_cast<u32>(__builtin_strlen(e.reason)));
+        CHECK(__builtin_memcmp(out.ptr, e.reason, out.len) == 0);
+    }
+
+    // Every three-digit value NOT in the enum -- including the two the
+    // round-13 finding claimed were missing -- must map to "Unknown",
+    // matching `CodeUtility::toString`'s own fallthrough for an unmatched
+    // `Code` value. 418 and 451 are pinned explicitly per the evidence
+    // above; the rest of the sweep guards against any other gap.
+    for (u32 code = 100; code <= 599; code++) {
+        const std::string expected = expected_reason_for(static_cast<u16>(code));
+        Str out{};
+        REQUIRE(canonical_status_reason(static_cast<u16>(code), &out));
+        CHECK_EQ(out.len, static_cast<u32>(expected.size()));
+        CHECK(__builtin_memcmp(out.ptr, expected.data(), out.len) == 0);
+    }
+    for (u16 code : {418, 451}) {
+        Str out{};
+        REQUIRE(canonical_status_reason(code, &out));
+        CHECK_EQ(out.len, 7u);
+        CHECK(__builtin_memcmp(out.ptr, "Unknown", 7) == 0);
+    }
+}
+
 // Codex round-10 review: if graceful drain begins after this request was
 // admitted (keep-alive already granted at the request boundary, mirroring
 // real ingress's `conn.keep_alive = !loop->is_draining()` at admission time)
