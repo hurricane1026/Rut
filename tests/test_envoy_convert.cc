@@ -890,6 +890,73 @@ TEST(envoy_convert, api_forged_model_rejected) {
     CHECK(cleared_load_assignment_name_result.error().code == FrontendError::UnexpectedToken);
     CHECK(to_string(cleared_load_assignment_name_result.error().detail)
               .find("load_assignment.cluster_name is required") != std::string::npos);
+
+    // PR #692 round-9 review: an empty/empty `action.cluster` /
+    // `cluster.name` pairing must not lower successfully. `Str::eq` treats
+    // two empty views as equal, so clearing both names on a parsed copy used
+    // to still pass the cluster-identity check above and reach the
+    // hard-coded `envoy_cluster_0` upstream.
+    envoy::Bootstrap empty_cluster_names = parsed.value();
+    empty_cluster_names.listener.filter_chain.hcm.route_config.virtual_host.route.action.cluster =
+        Str{};
+    empty_cluster_names.cluster.name = Str{};
+    const auto empty_cluster_names_result = envoy::lower_to_rut(empty_cluster_names, all_true);
+    CHECK_FALSE(empty_cluster_names_result);
+    CHECK(empty_cluster_names_result.error().code == FrontendError::UnexpectedToken);
+    CHECK(to_string(empty_cluster_names_result.error().detail)
+              .find("route cluster does not name a declared cluster") != std::string::npos);
+
+    // PR #692 round-9 review: a cleared `virtual_host.domains_span` — the
+    // model's only record that parsing established `domains: ["*"]` — must
+    // also be rejected. The generated route has no host dimension, so
+    // accepting a model with missing domain evidence would widen routing
+    // beyond what the model claims.
+    envoy::Bootstrap cleared_domains_span = parsed.value();
+    cleared_domains_span.listener.filter_chain.hcm.route_config.virtual_host.domains_span = Span{};
+    const auto cleared_domains_span_result = envoy::lower_to_rut(cleared_domains_span, all_true);
+    CHECK_FALSE(cleared_domains_span_result);
+    CHECK(cleared_domains_span_result.error().code == FrontendError::UnexpectedToken);
+    CHECK(to_string(cleared_domains_span_result.error().detail)
+              .find("virtual host domains must be") != std::string::npos);
+
+    // PR #692 round-9 review: `codec_type` must be revalidated, not just
+    // `hcm.type_url_span`. A cleared `codec_type_present`, or `codec_type`
+    // set back to `Auto` while `codec_type_present` stays true, must not
+    // lower successfully — either forgery admits downstream h2c on this
+    // plaintext listener, which is explicitly outside this milestone.
+    envoy::Bootstrap cleared_codec_type_present = parsed.value();
+    cleared_codec_type_present.listener.filter_chain.hcm.codec_type_present = false;
+    const auto cleared_codec_type_present_result =
+        envoy::lower_to_rut(cleared_codec_type_present, all_true);
+    CHECK_FALSE(cleared_codec_type_present_result);
+    CHECK(cleared_codec_type_present_result.error().code == FrontendError::UnexpectedToken);
+    CHECK(to_string(cleared_codec_type_present_result.error().detail)
+              .find("codec_type must be explicit HTTP1") != std::string::npos);
+
+    envoy::Bootstrap forged_codec_type_auto = parsed.value();
+    forged_codec_type_auto.listener.filter_chain.hcm.codec_type = envoy::CodecType::Auto;
+    const auto forged_codec_type_auto_result =
+        envoy::lower_to_rut(forged_codec_type_auto, all_true);
+    CHECK_FALSE(forged_codec_type_auto_result);
+    CHECK(forged_codec_type_auto_result.error().code == FrontendError::UnexpectedToken);
+    CHECK(to_string(forged_codec_type_auto_result.error().detail)
+              .find("codec_type must be explicit HTTP1") != std::string::npos);
+
+    // PR #692 round-9 review: `suppress_envoy_headers` must be revalidated
+    // for presence too, not just value. A hand-built model with
+    // `suppress_envoy_headers = true` but `suppress_envoy_headers_present =
+    // false` used to lower successfully, even though an omitted field
+    // defaults to `false` in real Envoy.
+    envoy::Bootstrap forged_suppress_envoy_headers = parsed.value();
+    forged_suppress_envoy_headers.listener.filter_chain.hcm.router.suppress_envoy_headers = true;
+    forged_suppress_envoy_headers.listener.filter_chain.hcm.router.suppress_envoy_headers_present =
+        false;
+    const auto forged_suppress_envoy_headers_result =
+        envoy::lower_to_rut(forged_suppress_envoy_headers, all_true);
+    CHECK_FALSE(forged_suppress_envoy_headers_result);
+    CHECK(forged_suppress_envoy_headers_result.error().code == FrontendError::UnsupportedSyntax);
+    CHECK(to_string(forged_suppress_envoy_headers_result.error().detail)
+              .find("suppress_envoy_headers: true on the router filter") != std::string::npos);
 }
 
 int main(int argc, char** argv) {

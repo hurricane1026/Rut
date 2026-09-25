@@ -216,7 +216,8 @@ bool put_forward_route(Writer& w, const char* method, u32 method_len, bool inclu
 FrontendResult<bool> validate(const Bootstrap& model, const RutCapabilities& caps) {
     const HttpConnectionManager& hcm = model.listener.filter_chain.hcm;
     const RouterFilter& router = hcm.router;
-    const Route& route = hcm.route_config.virtual_host.route;
+    const VirtualHost& virtual_host = hcm.route_config.virtual_host;
+    const Route& route = virtual_host.route;
     const RouteAction& action = route.action;
 
     if (model.listener.address.port == 0u)
@@ -224,7 +225,16 @@ FrontendResult<bool> validate(const Bootstrap& model, const RutCapabilities& cap
     if (model.cluster.endpoint.address.port == 0u)
         return invalid(model.cluster.endpoint.address.span,
                        lit_str("endpoint port must be non-zero"));
-    if (!action.cluster.eq(model.cluster.name))
+    // PR #692 round-9 review: `Str::eq` treats two empty views as equal, so
+    // a caller of the public `lower_to_rut(model, capabilities)` overload
+    // who clears both `action.cluster` and `model.cluster.name` on a parsed
+    // copy (or hand-builds a `Bootstrap` that never sets either) passes this
+    // check and reaches the hard-coded `envoy_cluster_0` upstream below. The
+    // parser requires both names non-empty (`min_len: 1` on both the v3
+    // `Cluster.name` and the route action's `cluster`), so an empty/empty
+    // pairing is a forgery this converter must also reject.
+    if (action.cluster.empty() || model.cluster.name.empty() ||
+        !action.cluster.eq(model.cluster.name))
         return invalid(action.cluster_span,
                        lit_str("route cluster does not name a declared cluster"));
     // PR #692 round-8 review: `load_assignment_name_present` is the model's
@@ -252,6 +262,19 @@ FrontendResult<bool> validate(const Bootstrap& model, const RutCapabilities& cap
     // widens what the emitted RUT actually matches relative to what the
     // model claims. Reject any forged prefix here, alongside the other
     // defensive model checks above.
+    // PR #692 round-9 review: validation never checked that parsing
+    // established `domains: ["*"]` on the virtual host — only the nested
+    // route's `match.prefix` (round-3, immediately below). A hand-built
+    // `Bootstrap`, or a parsed copy with `virtual_host.domains_span`
+    // cleared, still lowers even though the generated route has no host
+    // dimension and therefore matches every authority, which widens routing
+    // beyond what the model claims. `domains_span` is the model's only
+    // record that `parse_virtual_host` ever saw and accepted the exact
+    // single-element `["*"]` array (the parser rejects every other
+    // `domains` value), the same evidence-bit shape as `hcm.type_url_span`
+    // and `hcm.generate_request_id_span` above.
+    if (virtual_host.domains_span.start == 0u && virtual_host.domains_span.end == 0u)
+        return invalid(virtual_host.span, lit_str("virtual host domains must be [\"*\"]"));
     if (!route.match.prefix.eq(lit_str("/")))
         return invalid(route.match.prefix_span, lit_str("route match prefix must be \"/\""));
     // PR #692 round-4 review: revalidate the router filter's identity here
@@ -281,6 +304,23 @@ FrontendResult<bool> validate(const Bootstrap& model, const RutCapabilities& cap
             lit_str("network filter name must be envoy.filters.network.http_connection_manager"));
     if (hcm.type_url_span.start == 0u && hcm.type_url_span.end == 0u)
         return invalid(hcm.span, lit_str("network filter typed_config is required"));
+    // PR #692 round-9 review: revalidate `codec_type` too, the same class of
+    // gap the `type_url_span` check above closes one field over.
+    // `codec_type_present` is the model's only record that `parse_hcm` ever
+    // saw and accepted an explicit `codec_type: "HTTP1"` (the parser rejects
+    // the implicit proto3-default `AUTO`, which admits downstream h2c on
+    // this plaintext listener — see `CodecType` in
+    // include/rut/envoy/parser.h); a hand-built `Bootstrap` passed to the
+    // public `lower_to_rut(model, capabilities)` overload that clears
+    // `codec_type_present`, or sets `codec_type` back to `Auto` while
+    // leaving the presence bit set, would otherwise still lower
+    // successfully, silently admitting the exact divergence this milestone
+    // is scoped to exclude (the emitted request policy is pinned to
+    // HTTP/1.1).
+    if (!hcm.codec_type_present || hcm.codec_type != CodecType::Http1) {
+        const Span span = hcm.codec_type_present ? hcm.codec_type_span : hcm.span;
+        return invalid(span, lit_str("codec_type must be explicit HTTP1"));
+    }
     // PR #692 round-6 review: revalidate `generate_request_id`'s evidence
     // too, the same class of gap the `type_url_span` check above closes one
     // field over. `HttpConnectionManager::generate_request_id_span` is the
@@ -297,7 +337,12 @@ FrontendResult<bool> validate(const Bootstrap& model, const RutCapabilities& cap
                        lit_str("generate_request_id: false is required; Rut does not generate "
                                "x-request-id"));
 
-    if (!router.suppress_envoy_headers) {
+    // PR #692 round-9 review: require the presence bit too, not just the
+    // value — a hand-built model with `suppress_envoy_headers = true` but
+    // `suppress_envoy_headers_present = false` used to lower successfully,
+    // even though an omitted field defaults to `false` in real Envoy (which
+    // then adds the headers this emitted policy assumes are suppressed).
+    if (!router.suppress_envoy_headers_present || !router.suppress_envoy_headers) {
         const Span span = router.suppress_envoy_headers_present ? router.suppress_envoy_headers_span
                                                                 : router.span;
         return unsupported(
