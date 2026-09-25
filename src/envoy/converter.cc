@@ -225,6 +225,18 @@ FrontendResult<bool> validate(const Bootstrap& model, const RutCapabilities& cap
     if (model.cluster.endpoint.address.port == 0u)
         return invalid(model.cluster.endpoint.address.span,
                        lit_str("endpoint port must be non-zero"));
+    // PR #692 round-10 review: revalidate `cluster.connect_timeout` too — the
+    // parser requires it strictly positive (`parse_duration(...,
+    // allow_zero=false)`, src/envoy/parser.cc:674, same "duration must be
+    // positive" diagnostic reused here) because Envoy itself rejects a zero
+    // `connect_timeout`, but the emitted RUT program never reads this field.
+    // A hand-built `Bootstrap` passed to the public `lower_to_rut(model,
+    // capabilities)` overload that sets `connect_timeout.milliseconds` to
+    // zero (or a caller who mutates it on a parsed copy) would otherwise
+    // still lower successfully, returning a working gateway for a bootstrap
+    // Envoy would reject at startup.
+    if (model.cluster.connect_timeout.milliseconds == 0u)
+        return invalid(model.cluster.connect_timeout.span, lit_str("duration must be positive"));
     // PR #692 round-9 review: `Str::eq` treats two empty views as equal, so
     // a caller of the public `lower_to_rut(model, capabilities)` overload
     // who clears both `action.cluster` and `model.cluster.name` on a parsed
@@ -262,6 +274,16 @@ FrontendResult<bool> validate(const Bootstrap& model, const RutCapabilities& cap
     // widens what the emitted RUT actually matches relative to what the
     // model claims. Reject any forged prefix here, alongside the other
     // defensive model checks above.
+    // PR #692 round-10 review: revalidate `virtual_host.name` too — the
+    // parser requires it non-empty (`parse_virtual_host`, "virtual host name
+    // must be a non-empty string", src/envoy/parser.cc:562-563), but the
+    // emitted RUT program never reads this field. A hand-built `Bootstrap`
+    // that clears `virtual_host.name` on a parsed copy (or never sets it)
+    // would otherwise still lower successfully, silently accepting a model
+    // `parse_bootstrap_json` would reject.
+    if (virtual_host.name.empty())
+        return invalid(virtual_host.name_span,
+                       lit_str("virtual host name must be a non-empty string"));
     // PR #692 round-9 review: validation never checked that parsing
     // established `domains: ["*"]` on the virtual host — only the nested
     // route's `match.prefix` (round-3, immediately below). A hand-built
@@ -304,6 +326,15 @@ FrontendResult<bool> validate(const Bootstrap& model, const RutCapabilities& cap
             lit_str("network filter name must be envoy.filters.network.http_connection_manager"));
     if (hcm.type_url_span.start == 0u && hcm.type_url_span.end == 0u)
         return invalid(hcm.span, lit_str("network filter typed_config is required"));
+    // PR #692 round-10 review: revalidate `hcm.stat_prefix` too — the parser
+    // requires it non-empty (`stat_prefix must be a non-empty string`,
+    // src/envoy/parser.cc:419-425), but the emitted RUT program never reads
+    // this field. A hand-built `Bootstrap` that clears `stat_prefix` on a
+    // parsed copy (or never sets it) would otherwise still lower
+    // successfully, silently accepting a model `parse_bootstrap_json` would
+    // reject.
+    if (hcm.stat_prefix.empty())
+        return invalid(hcm.stat_prefix_span, lit_str("stat_prefix must be a non-empty string"));
     // PR #692 round-9 review: revalidate `codec_type` too, the same class of
     // gap the `type_url_span` check above closes one field over.
     // `codec_type_present` is the model's only record that `parse_hcm` ever

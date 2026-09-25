@@ -957,6 +957,42 @@ TEST(envoy_convert, api_forged_model_rejected) {
     CHECK(forged_suppress_envoy_headers_result.error().code == FrontendError::UnsupportedSyntax);
     CHECK(to_string(forged_suppress_envoy_headers_result.error().detail)
               .find("suppress_envoy_headers: true on the router filter") != std::string::npos);
+
+    // PR #692 round-10 review: a zeroed `cluster.connect_timeout` must not
+    // lower successfully. The parser requires a strictly positive value
+    // (`parse_duration(..., allow_zero=false)`), and Envoy itself rejects a
+    // zero `connect_timeout` at startup, but the emitted RUT program never
+    // reads this field so nothing else would catch the forgery.
+    envoy::Bootstrap zero_connect_timeout = parsed.value();
+    zero_connect_timeout.cluster.connect_timeout.milliseconds = 0;
+    const auto zero_connect_timeout_result = envoy::lower_to_rut(zero_connect_timeout, all_true);
+    CHECK_FALSE(zero_connect_timeout_result);
+    CHECK(zero_connect_timeout_result.error().code == FrontendError::UnexpectedToken);
+    CHECK(to_string(zero_connect_timeout_result.error().detail).find("duration must be positive") !=
+          std::string::npos);
+
+    // PR #692 round-10 review: a cleared `hcm.stat_prefix` must not lower
+    // successfully either. The parser requires it non-empty, but the
+    // emitted RUT program never reads this field.
+    envoy::Bootstrap empty_stat_prefix = parsed.value();
+    empty_stat_prefix.listener.filter_chain.hcm.stat_prefix = Str{};
+    const auto empty_stat_prefix_result = envoy::lower_to_rut(empty_stat_prefix, all_true);
+    CHECK_FALSE(empty_stat_prefix_result);
+    CHECK(empty_stat_prefix_result.error().code == FrontendError::UnexpectedToken);
+    CHECK(to_string(empty_stat_prefix_result.error().detail)
+              .find("stat_prefix must be a non-empty string") != std::string::npos);
+
+    // PR #692 round-10 review: a cleared `virtual_host.name` must not lower
+    // successfully either. The parser requires it non-empty, but the
+    // emitted RUT program never reads this field.
+    envoy::Bootstrap empty_virtual_host_name = parsed.value();
+    empty_virtual_host_name.listener.filter_chain.hcm.route_config.virtual_host.name = Str{};
+    const auto empty_virtual_host_name_result =
+        envoy::lower_to_rut(empty_virtual_host_name, all_true);
+    CHECK_FALSE(empty_virtual_host_name_result);
+    CHECK(empty_virtual_host_name_result.error().code == FrontendError::UnexpectedToken);
+    CHECK(to_string(empty_virtual_host_name_result.error().detail)
+              .find("virtual host name must be a non-empty string") != std::string::npos);
 }
 
 int main(int argc, char** argv) {
