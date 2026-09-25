@@ -557,6 +557,22 @@ ReadResult read_http_message(int fd, bool head_request, int timeout_ms) {
             if (n <= 0) return {buf, false};
             buf.append(chunk, static_cast<size_t>(n));
         }
+        if (connection_value.find("close") != std::string::npos) {
+            // A Content-Length-framed response can declare `connection:
+            // close` (e.g. get_client_close) without the peer actually
+            // closing the socket afterwards -- the body alone completing is
+            // not proof of that. Require the same bounded EOF this function
+            // already requires for close-delimited (no Content-Length)
+            // framing below, so a peer that advertises close but stays open
+            // is reported as an incomplete/broken exchange, not silently
+            // accepted as complete (round-4 review).
+            const int64_t remaining = deadline - now_ms();
+            if (remaining <= 0) return {buf, false};
+            pollfd pfd{fd, POLLIN, 0};
+            if (poll(&pfd, 1, static_cast<int>(remaining)) <= 0) return {buf, false};
+            const ssize_t n = recv(fd, chunk, sizeof(chunk), 0);
+            if (n != 0) return {buf, false};
+        }
         return {buf, true};
     }
     if (connection_value.find("close") != std::string::npos) {
@@ -819,6 +835,18 @@ public:
         std::lock_guard<std::mutex> lock(mu_);
         const auto it = requests_by_path_.find(path);
         return it == requests_by_path_.end() ? std::vector<std::string>{} : it->second;
+    }
+
+    // Full accounting of every request this upstream has recorded, keyed by
+    // path, since start()/clear_requests(). fill_upstream_bytes() below only
+    // ever queries the paths a case expects; a request landing on any other
+    // path (a spurious or misrouted side-effecting request) would otherwise
+    // never be looked up at all and so could never fail the harness. This
+    // lets a caller reconcile the complete observed set against the complete
+    // expected set instead.
+    std::map<std::string, std::vector<std::string>> all_requests() {
+        std::lock_guard<std::mutex> lock(mu_);
+        return requests_by_path_;
     }
 
     // Discards every recorded request without stopping the accept loop or
@@ -1835,6 +1863,15 @@ std::vector<CaseResult> run_case_batch(uint16_t listen_port, const std::vector<C
 // `validate_results`/`validate_pair_results` enforce again at transcript-
 // write time (round-3 review) still catches a duplicate that reaches a
 // transcript writer some other way.
+//
+// The per-case lookups above only ever query the expected `upstream_path`
+// for each case in `cases`, so a request that lands on any other path --
+// a spurious or misrouted side-effecting request that was never supposed
+// to reach the upstream at all -- would never be queried and every
+// asserted comparison above could still pass (round-4 review). Guard
+// against that separately: every path `upstream` has ever recorded a
+// request for must be one of `cases`' own expected `upstream_path`s,
+// otherwise fail the harness with the offending path and count.
 bool fill_upstream_bytes(std::vector<CaseResult>* results,
                          const std::vector<CaseSpec>& cases,
                          RecordingUpstream& upstream) {
@@ -1855,6 +1892,15 @@ bool fill_upstream_bytes(std::vector<CaseResult>* results,
         }
         r.upstream_contacted = true;
         r.upstream_bytes = observed.front();
+    }
+    for (const auto& [path, reqs] : upstream.all_requests()) {
+        const bool expected = std::any_of(
+            cases.begin(), cases.end(), [&](const CaseSpec& s) { return s.upstream_path == path; });
+        if (!expected) {
+            std::cerr << "FAIL: upstream recorded " << reqs.size() << " request(s) for path \""
+                      << path << "\", which is not any case's expected upstream_path\n";
+            ok = false;
+        }
     }
     return ok;
 }
@@ -3696,6 +3742,62 @@ bool self_test_duplicate_upstream_rejected() {
     return ok;
 }
 
+// Round-4 review: a request landing on a path no case expects (a spurious
+// or misrouted side-effecting request) must fail fill_upstream_bytes, even
+// though every per-case lookup it performs would still pass, because none
+// of them ever query a path outside the case table.
+bool self_test_unexpected_upstream_path_rejected() {
+    uint16_t port = 0;
+    if (!allocate_loopback_port(&port)) {
+        std::cerr
+            << "FAIL [self-test unexpected-upstream-path]: could not allocate a loopback port\n";
+        return false;
+    }
+    RecordingUpstream upstream;
+    const std::string reply = "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nhi";
+    upstream.set_reply("/expected", reply);
+    upstream.set_default_reply(reply);
+    if (!upstream.start(port)) {
+        std::cerr << "FAIL [self-test unexpected-upstream-path]: could not start upstream\n";
+        return false;
+    }
+    bool ok = true;
+    {
+        const int fd = connect_with_timeout(port, kClientTimeoutMs);
+        if (fd < 0) {
+            std::cerr << "FAIL [self-test unexpected-upstream-path]: could not connect\n";
+            upstream.stop();
+            return false;
+        }
+        // The case table below only ever names "/expected". This request to
+        // an unlisted path stands in for a spurious or misrouted request a
+        // buggy proxy sent in addition to the expected one.
+        const std::string req = "GET /unlisted HTTP/1.1\r\nHost: t.example\r\n\r\n";
+        if (!send_all(fd, req) || read_http_message(fd, false, kClientTimeoutMs).bytes != reply)
+            ok = false;
+        close(fd);
+    }
+    const std::vector<CaseSpec> cases = {{"expected_case", "", false, "/expected", reply}};
+    std::vector<CaseResult> results(1);
+    results[0].name = "expected_case";
+    const bool fill_ok = fill_upstream_bytes(&results, cases, upstream);
+    upstream.stop();
+    if (fill_ok) {
+        std::cerr << "FAIL [self-test unexpected-upstream-path]: fill_upstream_bytes accepted a "
+                     "request to a path no case expected\n";
+        ok = false;
+    }
+    // The one case that was actually expected must still be reported
+    // correctly: it saw zero requests, not the unlisted one.
+    if (results[0].upstream_contacted || results[0].upstream_contact_count != 0) {
+        std::cerr << "FAIL [self-test unexpected-upstream-path]: the expected case's own "
+                     "accounting was disturbed by the unlisted request\n";
+        ok = false;
+    }
+    if (ok) std::cerr << "PASS [self-test unexpected-upstream-path]\n";
+    return ok;
+}
+
 // Exercises the exact `RutInstance::stop()` path a crash before intentional
 // teardown would hit: `/bin/true` stands in for a `rut` binary that exits on
 // its own (no docker or real `rut` binary needed), and stop() must report
@@ -3746,6 +3848,62 @@ bool self_test_pair_both_failed_rejected() {
     return true;
 }
 
+// Round-4 review: verifies the exact unblock mechanism
+// self_test_head_body_detected()'s connect-failure branch relies on, so a
+// client connect() failure (e.g. transient fd exhaustion) can never leave
+// that self-test's server thread parked in accept() forever and hang
+// server.join() (and so the whole self-test binary, until an external
+// timeout kills it, instead of reporting the connect failure normally).
+// shutdown()+close() on the listening socket -- never the reverse, see
+// RecordingUpstream::stop() -- must make a thread blocked in accept() on
+// that same fd return promptly.
+bool self_test_accept_unblocks_on_shutdown_close() {
+    uint16_t port = 0;
+    if (!allocate_loopback_port(&port)) {
+        std::cerr << "FAIL [self-test accept-unblock]: could not allocate a loopback port\n";
+        return false;
+    }
+    int listen_fd = socket(AF_INET, SOCK_STREAM, 0);
+    if (listen_fd < 0) {
+        std::cerr << "FAIL [self-test accept-unblock]: could not create listening socket\n";
+        return false;
+    }
+    const int one = 1;
+    setsockopt(listen_fd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
+    sockaddr_in addr{};
+    addr.sin_family = AF_INET;
+    addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    addr.sin_port = htons(port);
+    if (bind(listen_fd, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) != 0 ||
+        listen(listen_fd, 1) != 0) {
+        std::cerr << "FAIL [self-test accept-unblock]: could not bind/listen\n";
+        close(listen_fd);
+        return false;
+    }
+    std::atomic<bool> accept_returned{false};
+    std::thread server([listen_fd, &accept_returned] {
+        accept(listen_fd, nullptr, nullptr);
+        accept_returned.store(true);
+    });
+    // Give the server thread time to actually enter the blocking accept()
+    // call before unblocking it, matching the real connect-failure branch's
+    // ordering (the thread starts before the connect attempt that may fail).
+    struct timespec delay{0, 50'000'000};
+    nanosleep(&delay, nullptr);
+    shutdown(listen_fd, SHUT_RDWR);
+    close(listen_fd);
+    listen_fd = -1;
+    server.join();
+    const bool ok = accept_returned.load();
+    if (!ok) {
+        std::cerr << "FAIL [self-test accept-unblock]: accept() did not return after "
+                     "shutdown()+close() on its own listening socket\n";
+    } else {
+        std::cerr << "PASS [self-test accept-unblock]\n";
+    }
+    return ok;
+}
+
 // Exercises the exact `read_http_message` HEAD path against a deliberately
 // spec-violating peer that sends a body five milliseconds after the header
 // terminator, in a separate TCP segment/`send()`: the bounded grace window
@@ -3757,7 +3915,7 @@ bool self_test_head_body_detected() {
         std::cerr << "FAIL [self-test head body]: could not allocate a loopback port\n";
         return false;
     }
-    const int listen_fd = socket(AF_INET, SOCK_STREAM, 0);
+    int listen_fd = socket(AF_INET, SOCK_STREAM, 0);
     if (listen_fd < 0) {
         std::cerr << "FAIL [self-test head body]: could not create listening socket\n";
         return false;
@@ -3792,6 +3950,16 @@ bool self_test_head_body_detected() {
     if (fd < 0) {
         std::cerr << "FAIL [self-test head body]: could not connect\n";
         ok = false;
+        // The server thread is parked in accept(listen_fd, ...) with no
+        // client ever going to connect now. Unblock it the same way
+        // RecordingUpstream::stop() does (shutdown() then close(), never the
+        // reverse) before joining, or server.join() below hangs until an
+        // external timeout kills the whole self-test binary instead of
+        // reporting this failure normally (round-4 review). Null out
+        // listen_fd so the shared cleanup below does not double-close it.
+        shutdown(listen_fd, SHUT_RDWR);
+        close(listen_fd);
+        listen_fd = -1;
     } else {
         const std::string req = "HEAD /x HTTP/1.1\r\nHost: t.example\r\n\r\n";
         send_all(fd, req);
@@ -3804,7 +3972,7 @@ bool self_test_head_body_detected() {
         close(fd);
     }
     server.join();
-    close(listen_fd);
+    if (listen_fd >= 0) close(listen_fd);
     if (ok) std::cerr << "PASS [self-test head body]\n";
     return ok;
 }
@@ -4030,8 +4198,10 @@ int run_self_test(const std::string& rut_binary, const std::string& converter_bi
     ok &= self_test_envoy_instance_skips_docker_when_unlaunched();
     ok &= self_test_reserved_closed_port();
     ok &= self_test_duplicate_upstream_rejected();
+    ok &= self_test_unexpected_upstream_path_rejected();
     ok &= self_test_rut_early_exit_detected();
     ok &= self_test_pair_both_failed_rejected();
+    ok &= self_test_accept_unblocks_on_shutdown_close();
     ok &= self_test_head_body_detected();
     if (!rut_binary.empty() && !converter_binary.empty()) {
         ok &= run_self_test_rut_pass(rut_binary, converter_binary);
