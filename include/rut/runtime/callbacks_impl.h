@@ -5496,8 +5496,11 @@ inline bool request_policy_host_authority_is_valid(const u8* p, u32 n) {
 // (docs/envoy-converter.md). Under that fixed shape Envoy's own
 // `ConnectionManagerUtility::mutateRequestHeaders`
 // (source/common/http/conn_manager_utility.cc, v1.39.1 line numbers below)
-// sanitizes the sixteen client-supplied headers listed here on every
-// request, before route selection, regardless of what the client supplied:
+// sanitizes sixteen of the seventeen client-supplied headers listed here on
+// every request, before route selection, regardless of what the client
+// supplied; the seventeenth, `x-envoy-external-address`, is not one of
+// `mutateRequestHeaders`'s own removals and is a Rut-side hardening addition
+// -- see its bullet below for why:
 //
 // * `x-envoy-internal`: `request_headers.removeEnvoyInternalRequest()`
 //   (line 142, under "Clean proxy headers") runs unconditionally, and the
@@ -5532,6 +5535,25 @@ inline bool request_policy_host_authority_is_valid(const u8* p, u32 n) {
 //   mutual TLS, so it fires on this cleartext listener either way. An
 //   upstream that trusts XFCC must never receive a certificate identity the
 //   client asserted itself (Codex round-7 review, PR #696).
+// * `x-envoy-external-address`: unlike the sixteen names above,
+//   `mutateRequestHeaders` never removes a client-supplied value for this
+//   one -- `request_headers.setEnvoyExternalAddress(...)` (line 308) only
+//   ever *writes* it, gated by `edge_request`, which (as above) requires
+//   `config.useRemoteAddress() == true` and is therefore unreachable under
+//   this milestone's fixed HCM shape; `cleanInternalHeaders`'s fourteen
+//   unconditional removals (lines 368-381) do not name it either, and the
+//   route's `internal_only_headers` list it also consults (line 282) is
+//   empty by default and unset by this converter. A client-supplied
+//   `x-envoy-external-address` would therefore reach the upstream verbatim
+//   through a real Envoy configured this exact way too -- this is not a
+//   byte-accurate mirror of an Envoy removal call. Rut strips it anyway as
+//   its own hardening: this header exists specifically so a trusted hop can
+//   assert the address it accepted a connection from, and letting a client
+//   forge that assertion for itself defeats the header's purpose regardless
+//   of whether the milestone's particular Envoy shape happens to also let it
+//   through (Codex round-8 review, PR #696; recorded as a documented
+//   per-request divergence in docs/envoy-compatibility.md, not a
+//   RutCapabilities gate).
 inline bool request_policy_is_stripped_client_envoy_header(const u8* p, u32 n) {
     return request_policy_name_eq(p, n, "x-envoy-internal", 16) ||
            request_policy_name_eq(p, n, "x-envoy-retriable-status-codes", 30) ||
@@ -5548,7 +5570,8 @@ inline bool request_policy_is_stripped_client_envoy_header(const u8* p, u32 n) {
            request_policy_name_eq(p, n, "x-envoy-ip-tags", 15) ||
            request_policy_name_eq(p, n, "x-envoy-original-url", 20) ||
            request_policy_name_eq(p, n, "x-envoy-hedge-on-per-try-timeout", 32) ||
-           request_policy_name_eq(p, n, "x-forwarded-client-cert", 23);
+           request_policy_name_eq(p, n, "x-forwarded-client-cert", 23) ||
+           request_policy_name_eq(p, n, "x-envoy-external-address", 24);
 }
 
 // Parse and validate the policy's framing before it can acquire an upstream
@@ -5688,19 +5711,26 @@ inline RequestPolicyBodyState inspect_request_policy_body(const Connection& conn
 // except a nomination of `content-length`, `host`, `x-forwarded-for`,
 // `x-forwarded-host`, or `x-forwarded-proto`, or a pseudo-header-shaped
 // nomination (first byte `:`), each of which fails the whole request closed
-// instead — see the nomination loop below for why per header), keeps `te`
+// instead — see the nomination loop below for why per header; a nomination
+// of `te` is not in this fail-closed set and is not dropped outright either
+// -- Envoy's own `sanitizeConnectionHeader` (source/common/http/utility.cc)
+// special-cases it the same way `sanitizeTEHeader` does, so the trailers
+// check below decides its fate regardless of the nomination, Codex round-8
+// review, PR #696), keeps `te`
 // per field when that field's value carries a "trailers" token (every field
 // evaluated independently; two or more trailers-carrying fields still
 // collapse to one canonical `te: trailers` line, matching Envoy's inline
-// header storage), drops the fixed sixteen-name set of client-supplied
+// header storage), drops the fixed seventeen-name set of client-supplied
 // headers Envoy's own `mutateRequestHeaders` sanitizes for a non-internal,
 // non-edge external request on a cleartext listener (`x-envoy-internal`,
-// the fourteen `cleanInternalHeaders` `x-envoy-*` names, and
-// `x-forwarded-client-cert`; see
+// the fourteen `cleanInternalHeaders` `x-envoy-*` names,
+// `x-forwarded-client-cert`, and `x-envoy-external-address`; see
 // `request_policy_is_stripped_client_envoy_header` above), and appends
-// `x-forwarded-proto: http` as the last header when the
-// client did not already supply one (a client-supplied value passes through
-// unchanged, in its original position). Fails closed with no upstream bytes
+// `x-forwarded-proto: http` as the last header when the client did not
+// already supply one with a non-empty, non-OWS-only value (a client-supplied
+// empty or OWS-only field is dropped and treated the same as absent, rather
+// than forwarding a blank scheme; a non-empty client-supplied value passes
+// through unchanged, in its original position). Fails closed with no upstream bytes
 // touched unless exactly one non-empty Host header is present. A
 // body-carrying request with a client `Expect` header is also outside this
 // profile's admitted shape today: `inspect_request_policy_body` rejects any
@@ -5949,8 +5979,33 @@ inline bool apply_preserve_host_lowercase_request_policy(Connection& conn, u16 p
             // canonical line has already been written -- drop it exactly
             // like a non-trailers TE field rather than emitting a duplicate.
             const bool drop_te = is_te && (!te_has_trailers || te_trailers_emitted);
-            const bool drop_nominated = name_nominated(hs, name_len);
-            if (!drop_fixed && !drop_te && !drop_nominated) {
+            // HTTP/1.1 senders that emit `TE: trailers` are expected to
+            // nominate it in `Connection` too (RFC 9110 §9.6), and Envoy's
+            // `sanitizeConnectionHeader` (source/common/http/utility.cc)
+            // special-cases exactly this: for a nominated `te` token it does
+            // not blindly remove the header like every other nominated name
+            // -- it inspects the TE value's comma-separated tokens the same
+            // way `sanitizeTEHeader` does, and only drops the header if none
+            // of them is "trailers" (`keep_header` stays true otherwise, and
+            // `headers.setTE(TEValues.Trailers)` still runs). Folding `te`
+            // into the generic `drop_nominated` set would strip the
+            // canonical trailers line for this standard wire shape even
+            // though `te_has_trailers`/`drop_te` above already computed the
+            // right outcome; exclude it here and let that existing
+            // canonicalization decide instead.
+            const bool drop_nominated = !is_te && name_nominated(hs, name_len);
+            // An empty or OWS-only X-Forwarded-Proto value carries no usable
+            // scheme. Envoy's own `getScheme` (source/common/http/
+            // conn_manager_utility.cc) treats exactly this shape as invalid
+            // (`Utility::schemeIsValid` rejects the empty string) and falls
+            // back to the connection-derived default instead of forwarding
+            // it; emitting a blank `x-forwarded-proto:` field here would
+            // instead hand origins that use this header for redirects or
+            // security decisions an empty scheme, and would also suppress
+            // the trailing synthesized default below by leaving `saw_xfp`
+            // set. Drop the empty field and let the fallback fire.
+            const bool drop_empty_xfp = is_xfp && value_start == value_end;
+            if (!drop_fixed && !drop_te && !drop_nominated && !drop_empty_xfp) {
                 if (is_cl) {
                     if (!append_lit("content-length: ", 16) || !append_dec(body_len) ||
                         !append_lit("\r\n", 2))
