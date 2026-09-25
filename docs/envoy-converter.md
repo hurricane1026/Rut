@@ -130,6 +130,21 @@ This converter is HTTP/1-only (see "Input format" above), so admitting `AUTO`
 would silently drop support for clients Envoy would have served over HTTP/2.
 `HTTP2` and `HTTP3` remain rejected outright.
 
+Requiring `codec_type: "HTTP1"` at the parser only proves the *input*
+disclaims h2c; it does not make the *emitted* `listen` line HTTP/1-only. Rut's
+cleartext listener unconditionally recognizes the h2c connection preface
+(`on_header_received`, `include/rut/runtime/callbacks_impl.h`) and upgrades —
+verified by sending the raw preface plus a `SETTINGS` frame to a live `rut`
+process on a plain `listen :port` and receiving an HTTP/2 `SETTINGS` reply
+back. `AstListenDecl` (`include/rut/compiler/ast.h`) has no protocol field, so
+there is no RUT-side knob to disable h2c on a listener today. This is a real
+divergence from an Envoy HTTP1-only HCM, which parses the preface as
+malformed HTTP/1.1 and rejects it; it is recorded as `BLOCKED_BY_RUT` in
+docs/envoy-compatibility.md rather than fixed here — adding a listener
+protocol restriction is a runtime/language change out of this increment's
+scope (AGENTS.md: don't add new keywords/knobs without weighing whether
+existing surface is insufficient first).
+
 Support for arbitrary bootstrap files is not implied. An `admin` block, a
 `node` block, `dynamic_resources`, `layered_runtime`, `stats_sinks`,
 `overload_manager`, `tracing`, and every other top-level field are rejected in
@@ -406,11 +421,23 @@ are recorded from the pinned Envoy build, not assumed.
 - Upstream codec is HTTP/1.1 with connection pooling. The upstream request
   carries no `connection` header. Bodies with `content-length` are forwarded
   with the same framing; chunked downstream bodies are forwarded chunked. The
-  milestone covers bodyless and fixed-length requests only.
-- Connect timeout is the cluster `connect_timeout`; route timeout defaults to
-  15s and covers the whole upstream response, which maps to
-  `response_read_timeout` only for header-only responses. Body-phase timeout
-  semantics are recorded separately.
+  milestone covers bodyless and fixed-length requests only: verified against a
+  live `rut` process using the milestone's `Http11FixedStrip` request-policy
+  shape, a client request carrying `Transfer-Encoding` is rejected with
+  `400 Bad Request` before any byte reaches the upstream (the upstream never
+  saw the connection). This is a real behavioral divergence from Envoy, which
+  forwards chunked request bodies; it is `BLOCKED_BY_RUT`, not a converter
+  oversight — Rut correctly fails closed rather than mis-forwarding.
+- Connect timeout is the cluster `connect_timeout`; Rut has no
+  connect-establishment timeout surface at all (parsed and validated but not
+  enforced — see D2 in the compatibility matrix). Route timeout defaults to
+  15s and covers the whole upstream response; Rut's nearest surface is the
+  fixed 30s `kDefaultUpstreamTimeout` (`include/rut/runtime/event_loop.h`),
+  which is not a route timeout either — it bounds only the time from upstream
+  connect completion to the first response byte, firing a 504 if exceeded, and
+  does not cover the body-streaming phase or disable when the route's
+  `timeout` is `"0s"`. An upstream that is simply slow to produce headers
+  (>30s) gets a Rut 504 in a case Envoy would let run indefinitely.
 
 **Response to downstream**
 
@@ -428,6 +455,15 @@ are recorded from the pinned Envoy build, not assumed.
   an upstream without `date` or records a `"preserve_or_current"` dependency.
 - Hop-by-hop response headers are removed. `content-length` is preserved.
   Response header names are lowercased.
+- `response_policy.framing` has exactly one legal value, `content_length`
+  (`include/rut/common/response_policy.h`, `ResponsePolicyFraming`); there is
+  no accepted way to opt a route into chunked or close-delimited upstream
+  responses today. Verified against a live `rut` process: an upstream response
+  that is chunked, or that has neither `content-length` nor
+  `Transfer-Encoding` and closes the connection instead, is rejected with a
+  generic `502 Bad Gateway` before any byte reaches the downstream client. As
+  with the request side, this is `BLOCKED_BY_RUT`, and Rut fails closed rather
+  than mis-forwarding.
 - Upstream connect failure: 503 with `content-type: text/plain` and body
   `upstream connect error or disconnect/reset before headers. reset reason:
   connection failure` (the exact text is pinned from the oracle). No healthy
@@ -514,6 +550,20 @@ Each needs its own issue before the corresponding row can leave
   grammar only offers rewriting to the upstream address.
 - Header-name casing selector on request and response policies: Envoy emits
   lowercase names over HTTP/1.1.
+- Dynamic `Connection`-nominated header stripping on the upstream request:
+  Envoy parses the client's `Connection` header value and removes every
+  header it names (e.g. `Connection: X-Secret` also removes `X-Secret`).
+  Today's `request_policy.strip_headers` is a fixed, closed literal list
+  (`Connection`, `Keep-Alive`, `TE`, `Expect`, `Upgrade`, and
+  `Proxy-Connection` once `request_envoy_h1` lands) parsed at
+  `src/compiler/parser.cc` — it cannot express "whatever this request's
+  `Connection` header names". This is a distinct gap from Host preservation
+  and header casing; `request_envoy_h1` landing (PR3) must not be considered
+  a byte-for-byte match for Envoy's `get_hop_by_hop` behavior unless it also
+  covers this. (Rut's response path already has the equivalent dynamic
+  nomination handling for the upstream→downstream direction —
+  `upstream_connection_nominates` in `include/rut/runtime/callbacks_impl.h`;
+  only the downstream→upstream request direction is missing it.)
 - `response_policy.date: "preserve_or_current"`: add `date` only when absent.
 - `response_policy.server: "envoy"` with overwrite semantics, and an explicit
   "pass through upstream `server`" mode for `server_header_transformation:
@@ -527,9 +577,35 @@ Each needs its own issue before the corresponding row can leave
   converter proves equivalence or the runtime gains an ordered fallback list.
 - Host / virtual-host routing: no host dimension in the route trie today.
 - Configurable connect, response and idle timeouts per upstream and per route.
-  Today only whole-second `response_read_timeout` exists; Envoy defaults are
-  `connect_timeout` per cluster and 15s per route. Body-phase timeout and
+  Rut has no connect-establishment timeout surface at all (not "a different
+  default" — no surface); `connect_timeout` is parsed and validated but
+  cannot be enforced, and `rut-envoy-convert` prints a stderr warning naming
+  the ignored value rather than pretending it did nothing (D2). Today only
+  whole-second `response_read_timeout` exists for the response side; Envoy
+  defaults are 15s per route (disabled by `timeout: "0s"`, which the milestone
+  requires). Rut's fixed 30s `kDefaultUpstreamTimeout` bounds only
+  connect-completion-to-first-response-byte and still applies even when the
+  route's `timeout` is `"0s"` — it is not a route-timeout substitute and does
+  not get disabled by the milestone shape. Body-phase timeout and
   `idle_timeout` have no Rut surface.
+- Listener-level protocol restriction: Rut's cleartext `listen` always
+  recognizes the h2c connection preface and upgrades
+  (`include/rut/runtime/callbacks_impl.h`, `on_header_received`); there is no
+  `AstListenDecl` field or runtime flag to make a listener HTTP/1-only. An
+  Envoy HCM with `codec_type: "HTTP1"` rejects a client that opens with the
+  preface; the lowered Rut listener accepts it. Verified against a live `rut`
+  process (raw preface + `SETTINGS` frame answered with an HTTP/2 `SETTINGS`
+  frame).
+- Non-content-length request/response body framing: `request_policy` has no
+  surface admitting `Transfer-Encoding` on the client request, and
+  `response_policy.framing` (`include/rut/common/response_policy.h`,
+  `ResponsePolicyFraming`) has exactly one legal value, `content_length`. Both
+  gaps fail closed rather than mis-forward — verified against a live `rut`
+  process: a chunked client request is rejected `400` before reaching the
+  upstream, and a chunked or close-delimited upstream response is rejected
+  `502` before reaching the client — so no additional capability flag changes
+  that behavior; a genuine fix needs new grammar plus runtime support for
+  streaming framing on both sides.
 - Retry policy by status/reset with `num_retries` and `per_try_timeout`; today
   only connect-failure retry with a fixed attempt cap exists.
 - `circuit_breakers` and `outlier_detection` values: the mechanisms exist with

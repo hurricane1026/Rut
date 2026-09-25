@@ -3,7 +3,6 @@
 #include <cerrno>
 #include <cstdint>
 #include <cstdio>
-#include <cstdlib>
 #include <cstring>
 
 #include <fcntl.h>
@@ -59,6 +58,15 @@ int input_error(const char* filename, const char* detail) {
     return 1;
 }
 
+// Fixed-size, statically-allocated (BSS) input buffer: this CLI converts
+// exactly one bootstrap document per invocation, so there is no lifetime or
+// reentrancy concern that would call for a heap allocator, and the 1 MiB
+// limit below is exactly `kMaxInputBytes`. Using `static` storage instead of
+// `malloc` keeps this file within the project's no-`new`/no-`malloc` rule
+// (AGENTS.md, "core constraints") the same way `main()` already does for
+// `doc` and `output` below.
+static char g_input_buffer[kMaxInputBytes + 1u];
+
 bool read_input(const char* filename, char** output, size_t* length, const char** error) {
     *output = nullptr;
     *length = 0u;
@@ -86,13 +94,8 @@ bool read_input(const char* filename, char** output, size_t* length, const char*
         return false;
     }
 
-    const size_t capacity = kMaxInputBytes + 1u;
-    char* buffer = static_cast<char*>(malloc(capacity));
-    if (buffer == nullptr) {
-        *error = "input allocation failed";
-        close(fd);
-        return false;
-    }
+    char* const buffer = g_input_buffer;
+    const size_t capacity = sizeof(g_input_buffer);
     size_t used = 0u;
     for (;;) {
         const ssize_t count = read(fd, buffer + used, capacity - used);
@@ -100,7 +103,6 @@ bool read_input(const char* filename, char** output, size_t* length, const char*
             used += static_cast<size_t>(count);
             if (used > kMaxInputBytes) {
                 *error = "input exceeds the 1 MiB limit";
-                free(buffer);
                 close(fd);
                 return false;
             }
@@ -109,31 +111,45 @@ bool read_input(const char* filename, char** output, size_t* length, const char*
         if (count == 0) break;
         if (errno == EINTR) continue;
         *error = strerror(errno);
-        free(buffer);
         close(fd);
         return false;
     }
     struct stat after{};
     if (fstat(fd, &after) != 0) {
         *error = strerror(errno);
-        free(buffer);
         close(fd);
         return false;
     }
     const int close_result = close(fd);
     if (close_result != 0) {
         *error = strerror(errno);
-        free(buffer);
         return false;
     }
     if (after.st_size < 0 || static_cast<uintmax_t>(after.st_size) != used) {
         *error = "input changed while it was being read";
-        free(buffer);
         return false;
     }
     *output = buffer;
     *length = used;
     return true;
+}
+
+// D2 (docs/envoy-compatibility.md, "Blocked by Rut"): Envoy's `connect_timeout`
+// is optional at the proto level (default 5s), but this frontend's parser
+// (increment 1) requires it present and positive, so a bootstrap that reaches
+// this point always carries one. Rut has no connect-establishment timeout
+// surface at all — the fixed 30s `kDefaultUpstreamTimeout`
+// (include/rut/runtime/event_loop.h) bounds time from connect completion to
+// the first response byte, not TCP connect establishment — so rejecting
+// every input that carries `connect_timeout` would make the milestone
+// unreachable while fixing nothing. Accept, but say so on stderr.
+void warn_connect_timeout(rut::Str timeout_text) {
+    write_cstr(STDERR_FILENO, "warning: connect_timeout \"");
+    if (timeout_text.ptr != nullptr && timeout_text.len != 0u)
+        write_all(STDERR_FILENO, timeout_text.ptr, timeout_text.len);
+    write_cstr(STDERR_FILENO,
+               "\" has no Rut runtime equivalent (no per-upstream connect-establishment "
+               "timeout surface); the value is accepted but not enforced\n");
 }
 
 int usage(const char* program) {
@@ -168,23 +184,21 @@ int main(int argc, char** argv) {
     const auto parsed = rut::envoy::parse_bootstrap_json(source, doc);
     if (!parsed) {
         report(argv[3], parsed.error().span, parsed.error().detail, "conversion failed");
-        free(input);
         return 1;
     }
 
     const auto lowered = rut::envoy::lower_to_rut(parsed.value());
     if (!lowered) {
         report(argv[3], lowered.error().span, lowered.error().detail, "conversion failed");
-        free(input);
         return 1;
     }
+    warn_connect_timeout(parsed.value().cluster.connect_timeout.text);
 
     static rut::envoy::RutSource output;
     output = lowered.value();
     const rut::Str view = output.view();
     const bool wrote = write_all(STDOUT_FILENO, view.ptr, view.len);
     const int output_errno = wrote ? 0 : errno;
-    free(input);
     if (!wrote) {
         char output_error[128];
         snprintf(output_error,

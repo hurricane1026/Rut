@@ -187,6 +187,7 @@ std::string milestone_json(bool suppress_present,
 "typed_config": {
 "@type": "type.googleapis.com/envoy.extensions.filters.network.http_connection_manager.v3.HttpConnectionManager",
 "stat_prefix": "ingress",
+"codec_type": "HTTP1",
 "generate_request_id": false,
 "route_config": {"name": "local", "virtual_hosts": [{
 "name": "all",
