@@ -3242,7 +3242,20 @@ static bool setup_event_evidence_equal(const SetupEventEvidence& left,
            left.holder_attach_b_count == right.holder_attach_b_count;
 }
 
-static bool proc_tcp_port_absent(const std::string& table, u16 port) {
+// Docker's embedded DNS resolver (every user-defined network) opens a TCP
+// listener inside the container netns on 127.0.0.11:<bind(0) port>.  bind(0)
+// draws odd ports from ip_local_port_range, so it lands on the fixed odd probe
+// port 41857 with probability 1/14116 per holder.  A socket bound to exactly
+// this loopback address cannot accept or shadow a connection to the
+// non-loopback positive/guard IPv4 endpoint, so it is not a port occupant.
+// Only the exact resolver address (IPv4 row or v4-mapped tcp6 row) is exempt.
+static bool docker_embedded_dns_endpoint(const std::string& local_address) {
+    return local_address == "0B00007F" || local_address == "0000000000000000FFFF00000B00007F";
+}
+
+static bool proc_tcp_port_absent(const std::string& table,
+                                 u16 port,
+                                 std::string* occupant = nullptr) {
     std::ostringstream port_hex;
     port_hex << std::uppercase << std::setfill('0') << std::setw(4) << std::hex << port;
     std::istringstream lines(table);
@@ -3253,8 +3266,11 @@ static bool proc_tcp_port_absent(const std::string& table, u16 port) {
         std::string local_endpoint;
         if (!(fields >> index >> local_endpoint)) continue;
         const size_t colon = local_endpoint.rfind(':');
-        if (colon != std::string::npos && local_endpoint.substr(colon + 1u) == port_hex.str())
+        if (colon != std::string::npos && local_endpoint.substr(colon + 1u) == port_hex.str() &&
+            !docker_embedded_dns_endpoint(local_endpoint.substr(0, colon))) {
+            if (occupant != nullptr) *occupant = line;
             return false;
+        }
     }
     return true;
 }
@@ -3613,8 +3629,10 @@ private:
             error = std::string("holder /proc/net/") + table + " read failed";
             return false;
         }
-        if (proc_tcp_port_absent(tcp, port)) return true;
-        error = std::string("selected probe port appeared in holder /proc/net/") + table;
+        std::string occupant;
+        if (proc_tcp_port_absent(tcp, port, &occupant)) return true;
+        error = std::string("selected probe port appeared in holder /proc/net/") + table + ": " +
+                occupant;
         return false;
     }
 
@@ -12587,6 +12605,27 @@ bool audit_zero_residue(const std::string& token,
 }
 
 bool pure_validation_self_checks(std::string& error) {
+    {
+        // Docker's embedded-DNS listener on the selected probe port is not an
+        // occupant (it made the held-namespace absence probe flake at
+        // 1/14116 per holder); every other row on that port still is.
+        const std::string header = "  sl  local_address rem_address st";
+        const std::string dns4 = header + "\n 0: 0B00007F:A381 00000000:0000 0A\n";
+        const std::string dns6 = header + "\n 0: 0000000000000000FFFF00000B00007F:A381 0:0 0A\n";
+        const std::string loopback4 = header + "\n 0: 0100007F:A381 00000000:0000 0A\n";
+        const std::string neighbour4 = header + "\n 0: 0C00007F:A381 00000000:0000 0A\n";
+        const std::string dns_other_port = header + "\n 0: 0B00007F:A380 00000000:0000 0A\n";
+        const std::string dns_then_wildcard = dns4 + " 1: 00000000:A381 00000000:0000 0A\n";
+        std::string occupant;
+        if (!proc_tcp_port_absent(dns4, 41857) || !proc_tcp_port_absent(dns6, 41857) ||
+            !proc_tcp_port_absent(dns_other_port, 41857) ||
+            proc_tcp_port_absent(loopback4, 41857) || proc_tcp_port_absent(neighbour4, 41857) ||
+            proc_tcp_port_absent(dns_then_wildcard, 41857, &occupant) ||
+            occupant != " 1: 00000000:A381 00000000:0000 0A") {
+            error = "Docker embedded-DNS selected-port exemption self-check failed";
+            return false;
+        }
+    }
     if (!pure_holder_retirement_self_checks(error)) return false;
     if (!recreated_sidecar_transition_self_checks(error)) return false;
     if (!generation_receipt_composition_self_checks(error)) return false;

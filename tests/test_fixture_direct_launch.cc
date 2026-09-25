@@ -84,6 +84,29 @@ bool run_checks(std::string& error) {
                 error))
         return false;
 
+    // Mid-execve: next stage's executable is visible with an empty argv.  It
+    // must be classified as a pending exec (pollers retry), never as a foreign
+    // stage, and must not advance or poison the observed stage sequence.
+    DirectLaunch in_exec = make_launch();
+    ProcIdentity sudo_mid_exec = sudo;
+    sudo_mid_exec.cmdline.clear();
+    ProcIdentity nsenter_mid_exec = nsenter_host;
+    nsenter_mid_exec.cmdline.clear();
+    ProcIdentity foreign = sudo;
+    foreign.cmdline = "sudo\0-n\0"s;
+    if (!expect(!observe_direct(in_exec, sudo_mid_exec, reason) &&
+                    reason == kExecArgvPendingReason && !in_exec.current_valid &&
+                    in_exec.observed_stages.empty() && observe_direct(in_exec, sudo, reason) &&
+                    !observe_direct(in_exec, nsenter_mid_exec, reason) &&
+                    reason == kExecArgvPendingReason &&
+                    in_exec.current_stage == LaunchStage::Sudo &&
+                    observe_direct(in_exec, nsenter_host, reason) &&
+                    !observe_direct(in_exec, foreign, reason) &&
+                    reason == "executable/argv is not an exact allowed launch stage",
+                "mid-execve empty argv is pending, not a foreign stage",
+                error))
+        return false;
+
     DirectLaunch launcher_only = make_launch();
     if (!expect(validate_launcher_ancestry(launcher_only, launcher_direct, {}, reason),
                 "marker-anchored launcher-only skip",
