@@ -1274,6 +1274,26 @@ struct EnvoyInstance {
             }
             return false;
         }
+        if (precheck < 0 && errno == ECHILD) {
+            // Round-11 review, "Handle ECHILD before signaling the stored
+            // PID": `pid` is no longer a child of this process -- already
+            // reaped by another caller before this call ever ran, or (worse)
+            // recycled by the OS for an unrelated live process since. Either
+            // way, treat it exactly like the "already exited" precheck just
+            // above and return before ever reaching kill() below: mirrors
+            // the identical fix in `RutInstance::stop()` (same file).
+            // Signaling a live-but-unrelated process because its PID number
+            // happens to match a stale value here would be far worse than
+            // skipping a signal this call was never going to be able to
+            // deliver to the intended process anyway.
+            exited_unexpectedly = true;
+            unexpected_exit_description =
+                "already reaped or no longer a child process (ECHILD) before this call could "
+                "signal it";
+            pid = -1;
+            run_and_wait({"docker", "rm", "-f", name}, 10'000);
+            return false;
+        }
         // Round-10 review, "Do not infer SIGTERM delivery from kill
         // success": mirrors the identical fix in `RutInstance::stop()`
         // (same file) -- kill(pid, SIGTERM) succeeding does not prove `pid`
@@ -1640,6 +1660,22 @@ struct RutInstance {
         if (precheck == pid) {
             exited_unexpectedly = true;
             unexpected_exit_description = describe_wait_status(status);
+            pid = -1;
+            return false;
+        }
+        if (precheck < 0 && errno == ECHILD) {
+            // Round-11 review, "Handle ECHILD before signaling the stored
+            // PID": mirrors the identical fix in `EnvoyInstance::stop()`
+            // (same file) -- `pid` is no longer a child of this process,
+            // already reaped by another caller before this call ever ran,
+            // or (worse) recycled by the OS for an unrelated live process
+            // since. Return before ever reaching kill() below rather than
+            // risk signaling an unrelated process because its PID number
+            // happens to match a stale value here.
+            exited_unexpectedly = true;
+            unexpected_exit_description =
+                "already reaped or no longer a child process (ECHILD) before this call could "
+                "signal it";
             pid = -1;
             return false;
         }
@@ -2172,6 +2208,27 @@ bool is_asserted_case(const std::string& name) {
 // forward.
 bool case_expects_upstream_forward(const std::string& name) {
     return name != "options_star" && name != "connect_failure" && name != "connect_authority";
+}
+
+// Splits `cases` into the subset the CLI's exit-code contract requires exact
+// evidence for (`is_asserted_case()`) and everything else (record-only:
+// evidence is recorded, but per the CLI contract must never gate PASS/FAIL).
+// Callers run each half against the SAME live proxy instance but in
+// temporally separate windows, clearing the recording upstream's log
+// between them (round-11 review, "Attribute duplicate contacts to the
+// originating case"): a record-only request misrouted onto -- or otherwise
+// colliding with -- an asserted case's own expected upstream path would
+// previously inflate that asserted case's contact count into a false
+// "duplicate", failing the run despite the record-only contract. Running
+// the two halves in isolation means neither half's traffic is ever present
+// in the log when the other half's evidence is attributed, so a
+// record-only misroute can only ever land on record-only evidence.
+void split_asserted_and_record_only(const std::vector<CaseSpec>& cases,
+                                    std::vector<CaseSpec>* asserted,
+                                    std::vector<CaseSpec>* record_only) {
+    for (const auto& spec : cases) {
+        (is_asserted_case(spec.name) ? *asserted : *record_only).push_back(spec);
+    }
 }
 
 // ── Case results & transcript ────────────────────────────────────────────
@@ -3153,31 +3210,58 @@ int run_oracle_milestone_s(const std::string& output_path) {
         }
 
         const auto cases = run1_cases();
-        for (const auto& spec : cases) {
-            CaseResult r;
-            if (!run_client_case(listen_port1, spec, &r))
-                std::cerr << "WARN: case " << spec.name << " exchange did not complete cleanly ("
-                          << describe_incomplete_exchange(r) << ")\n";
-            results.push_back(std::move(r));
-        }
+        std::vector<CaseSpec> asserted_cases, record_only_cases;
+        split_asserted_and_record_only(cases, &asserted_cases, &record_only_cases);
+
+        auto run_and_collect = [&](const std::vector<CaseSpec>& subset) {
+            for (const auto& spec : subset) {
+                CaseResult r;
+                if (!run_client_case(listen_port1, spec, &r))
+                    std::cerr << "WARN: case " << spec.name
+                              << " exchange did not complete cleanly ("
+                              << describe_incomplete_exchange(r) << ")\n";
+                results.push_back(std::move(r));
+            }
+        };
+        auto attribute_upstream = [&](const std::vector<CaseSpec>& subset, size_t begin) {
+            for (size_t i = begin; i < results.size(); i++) {
+                auto& r = results[i];
+                const auto it = std::find_if(subset.begin(), subset.end(), [&](const CaseSpec& s) {
+                    return r.name == s.name;
+                });
+                if (it == subset.end()) continue;
+                const auto observed = upstream.requests_for(it->upstream_path);
+                r.upstream_contact_count = static_cast<int>(observed.size());
+                if (!observed.empty()) {
+                    r.upstream_contacted = true;
+                    r.upstream_bytes = observed.front();
+                }
+            }
+        };
+        // Round-11 review, "Attribute duplicate contacts to the originating
+        // case": run the asserted cases to completion and attribute their
+        // upstream evidence FIRST, then reset the recording upstream's log
+        // before running the record-only cases as a second, isolated batch
+        // on this same Envoy instance. Without this, a record-only request
+        // that lands on (or is misattributed to) an asserted case's own
+        // expected path -- e.g. a forged-header case misrouted onto
+        // `/smoke` -- would inflate that asserted case's contact count into
+        // a false duplicate, and validate_results() below fails the whole
+        // run unconditionally on any count > 1, contradicting the CLI's
+        // "record-only never affects the exit code" contract.
+        const size_t asserted_begin = results.size();
+        run_and_collect(asserted_cases);
+        attribute_upstream(asserted_cases, asserted_begin);
+        upstream.clear_requests();
+        const size_t record_only_begin = results.size();
+        run_and_collect(record_only_cases);
+        attribute_upstream(record_only_cases, record_only_begin);
 
         if (!envoy.stop()) {
             std::cerr << "FAIL: envoy exited unexpectedly before teardown ("
                       << envoy.unexpected_exit_description << ")\n";
             dump_log(envoy.log_path);
             return 1;
-        }
-
-        for (auto& r : results) {
-            const auto it = std::find_if(
-                cases.begin(), cases.end(), [&](const CaseSpec& s) { return r.name == s.name; });
-            if (it == cases.end()) continue;
-            const auto observed = upstream.requests_for(it->upstream_path);
-            r.upstream_contact_count = static_cast<int>(observed.size());
-            if (!observed.empty()) {
-                r.upstream_contacted = true;
-                r.upstream_bytes = observed.front();
-            }
         }
         upstream.stop();
     }
@@ -3378,6 +3462,8 @@ int run_pair_milestone_s(const std::string& rut_binary,
         }
         RecordingUpstream upstream;
         const auto cases = run1_cases();
+        std::vector<CaseSpec> asserted_cases, record_only_cases;
+        split_asserted_and_record_only(cases, &asserted_cases, &record_only_cases);
         for (const auto& spec : cases) upstream.set_reply(spec.upstream_path, spec.upstream_reply);
         if (!upstream.adopt(upstream_bound.fd)) {
             std::cerr << "FAIL: could not start recording upstream\n";
@@ -3402,15 +3488,30 @@ int run_pair_milestone_s(const std::string& rut_binary,
             upstream.stop();
             return 1;
         }
-        auto envoy_results = run_case_batch(listen_port1, cases);
+        // Round-11 review, "Attribute duplicate contacts to the originating
+        // case": run the asserted cases against this Envoy instance first
+        // and attribute their upstream evidence while the log holds only
+        // their own traffic, then reset the log before running the
+        // record-only cases as a second, isolated batch on the SAME
+        // instance -- see split_asserted_and_record_only()'s comment for
+        // why. Applied identically to the RUT phase below.
+        auto envoy_asserted_results = run_case_batch(listen_port1, asserted_cases);
+        if (!fill_upstream_bytes(&envoy_asserted_results, asserted_cases, upstream)) {
+            envoy.stop();
+            upstream.stop();
+            return 1;
+        }
+        upstream.clear_requests();
+        auto envoy_record_only_results = run_case_batch(listen_port1, record_only_cases);
+        // Never fatal here: none of `record_only_cases` is an asserted case,
+        // so fill_upstream_bytes() cannot return false for this call (see
+        // its "Either anomaly ... is only made fatal ... for an asserted
+        // case" comment) -- the return value needs no check.
+        fill_upstream_bytes(&envoy_record_only_results, record_only_cases, upstream);
         if (!envoy.stop()) {
             std::cerr << "FAIL: envoy exited unexpectedly before teardown ("
                       << envoy.unexpected_exit_description << ")\n";
             dump_log(envoy.log_path);
-            upstream.stop();
-            return 1;
-        }
-        if (!fill_upstream_bytes(&envoy_results, cases, upstream)) {
             upstream.stop();
             return 1;
         }
@@ -3421,6 +3522,10 @@ int run_pair_milestone_s(const std::string& rut_binary,
             return 1;
         }
         upstream.clear_requests();
+        auto envoy_results = std::move(envoy_asserted_results);
+        envoy_results.insert(envoy_results.end(),
+                             std::make_move_iterator(envoy_record_only_results.begin()),
+                             std::make_move_iterator(envoy_record_only_results.end()));
 
         // Then RUT, on the same ports, against the same (now-cleared)
         // recording upstream. RUT's listener port has the same bind-race
@@ -3446,9 +3551,14 @@ int run_pair_milestone_s(const std::string& rut_binary,
             upstream.stop();
             return 1;
         }
-        auto rut_results = run_case_batch(listen_port1, cases);
+        auto rut_asserted_results = run_case_batch(listen_port1, asserted_cases);
+        const bool rut_asserted_ok =
+            fill_upstream_bytes(&rut_asserted_results, asserted_cases, upstream);
+        upstream.clear_requests();
+        auto rut_record_only_results = run_case_batch(listen_port1, record_only_cases);
+        // Never fatal here, same reasoning as the Envoy phase above.
+        fill_upstream_bytes(&rut_record_only_results, record_only_cases, upstream);
         const bool rut_stopped_cleanly = rut.stop();
-        const bool rut_upstream_ok = fill_upstream_bytes(&rut_results, cases, upstream);
         upstream.stop();
         if (!rut_stopped_cleanly) {
             std::cerr << "FAIL: rut exited unexpectedly before teardown ("
@@ -3456,7 +3566,11 @@ int run_pair_milestone_s(const std::string& rut_binary,
             dump_rut_log(rut.log_path);
             return 1;
         }
-        if (!rut_upstream_ok) return 1;
+        if (!rut_asserted_ok) return 1;
+        auto rut_results = std::move(rut_asserted_results);
+        rut_results.insert(rut_results.end(),
+                           std::make_move_iterator(rut_record_only_results.begin()),
+                           std::make_move_iterator(rut_record_only_results.end()));
 
         for (const auto& spec : cases) {
             PairCaseResult c;
@@ -5192,6 +5306,104 @@ bool self_test_unexpected_upstream_path_ignores_asserted_local_case() {
     return ok;
 }
 
+// Round-11 review, "Attribute duplicate contacts to the originating case":
+// reproduces the exact scenario the review describes -- a record-only
+// case's request misrouted onto an ASSERTED case's own listed path (e.g.
+// "get_forged_xfcc" landing on "/smoke" instead of its own "/xfcc") -- and
+// proves the fix keeps that misroute from ever being seen as a duplicate on
+// get_smoke's own path: run_oracle_milestone_s()/run_pair_milestone_s() now
+// run the asserted and record-only cases as two isolated batches against a
+// freshly-cleared upstream log (split_asserted_and_record_only()), so
+// fill_upstream_bytes() is called once per batch, never with both cases'
+// specs and a combined log at the same time. This test drives
+// fill_upstream_bytes() the same way those callers now do: once for the
+// asserted batch, `clear_requests()`, then once for the record-only batch.
+bool self_test_record_only_misroute_isolated_by_batch() {
+    BoundPort bound;
+    if (!allocate_bound_loopback_port(&bound)) {
+        std::cerr << "FAIL [self-test record-only misroute isolated]: could not allocate a "
+                     "loopback port\n";
+        return false;
+    }
+    const uint16_t port = bound.port;
+    RecordingUpstream upstream;
+    const std::string reply = "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nhi";
+    upstream.set_reply("/smoke", reply);
+    upstream.set_default_reply(reply);
+    if (!upstream.adopt(bound.fd)) {
+        std::cerr << "FAIL [self-test record-only misroute isolated]: could not start upstream\n";
+        return false;
+    }
+    const std::vector<CaseSpec> asserted_cases = {{"get_smoke", "", false, "/smoke", reply}};
+    const std::vector<CaseSpec> record_only_cases = {
+        {"get_forged_xfcc", "", false, "/xfcc", reply}};
+    bool ok = true;
+
+    // Asserted batch: exactly one real request to get_smoke's own path.
+    {
+        const int fd = connect_with_timeout(port, kClientTimeoutMs);
+        if (fd < 0) {
+            std::cerr << "FAIL [self-test record-only misroute isolated]: could not connect (1)\n";
+            upstream.stop();
+            return false;
+        }
+        const std::string req = "GET /smoke HTTP/1.1\r\nHost: t.example\r\n\r\n";
+        if (!send_all(fd, req) || read_http_message(fd, false, kClientTimeoutMs).bytes != reply)
+            ok = false;
+        close(fd);
+    }
+    std::vector<CaseResult> asserted_results(1);
+    asserted_results[0].name = "get_smoke";
+    const bool asserted_fill_ok = fill_upstream_bytes(&asserted_results, asserted_cases, upstream);
+    upstream.clear_requests();
+
+    // Record-only batch, against the freshly-cleared log: the forged case's
+    // request is misrouted onto "/smoke" -- get_smoke's own path -- instead
+    // of its own "/xfcc", standing in for the exact collision the review
+    // describes.
+    {
+        const int fd = connect_with_timeout(port, kClientTimeoutMs);
+        if (fd < 0) {
+            std::cerr << "FAIL [self-test record-only misroute isolated]: could not connect (2)\n";
+            upstream.stop();
+            return false;
+        }
+        const std::string req = "GET /smoke HTTP/1.1\r\nHost: t.example\r\n\r\n";
+        if (!send_all(fd, req) || read_http_message(fd, false, kClientTimeoutMs).bytes != reply)
+            ok = false;
+        close(fd);
+    }
+    std::vector<CaseResult> record_only_results(1);
+    record_only_results[0].name = "get_forged_xfcc";
+    const bool record_only_fill_ok =
+        fill_upstream_bytes(&record_only_results, record_only_cases, upstream);
+    upstream.stop();
+
+    if (!asserted_fill_ok) {
+        std::cerr << "FAIL [self-test record-only misroute isolated]: the asserted batch was "
+                     "rejected even though its own log never saw the later misroute\n";
+        ok = false;
+    }
+    if (!asserted_results[0].upstream_contacted ||
+        asserted_results[0].upstream_contact_count != 1) {
+        std::cerr << "FAIL [self-test record-only misroute isolated]: get_smoke's own evidence "
+                     "was not exactly one contact\n";
+        ok = false;
+    }
+    if (!record_only_fill_ok) {
+        std::cerr << "FAIL [self-test record-only misroute isolated]: the record-only batch made "
+                     "the run fail despite the CLI's record-only contract\n";
+        ok = false;
+    }
+    if (!record_only_results[0].upstream_ambiguous) {
+        std::cerr << "FAIL [self-test record-only misroute isolated]: the misrouted record-only "
+                     "case was not marked ambiguous\n";
+        ok = false;
+    }
+    if (ok) std::cerr << "PASS [self-test record-only misroute isolated]\n";
+    return ok;
+}
+
 // Exercises the exact `RutInstance::stop()` path a crash before intentional
 // teardown would hit: `/bin/true` stands in for a `rut` binary that exits on
 // its own (no docker or real `rut` binary needed), and stop() must report
@@ -5225,12 +5437,18 @@ bool self_test_rut_early_exit_detected() {
 // Round-9 review, "Require SIGTERM delivery before accepting a clean RUT
 // exit": simulates a child that is entirely gone by the time stop() tries to
 // signal it -- reaping it directly here, standing in for "the child exited
-// on its own and was collected before stop() got a chance to act" -- so
-// stop()'s own kill(pid, SIGTERM) is guaranteed to fail with ESRCH exactly
-// like the TOCTOU race the review describes would. Unlike self_test_rut_
-// early_exit_detected() above (caught by the precheck, before any signal is
-// attempted), this exercises the NEW check after the precheck has already
-// let the call proceed to kill().
+// on its own and was collected before stop() got a chance to act". Before
+// the round-11 fix below, this fell through the precheck (`waitpid()`
+// returns `ECHILD`, not `pid`) all the way to `kill(pid, SIGTERM)`, which
+// was then guaranteed to fail with ESRCH -- exercising the round-9
+// `term_sent` check instead of the (then nonexistent) precheck-level ECHILD
+// handling. Round-11 review, "Handle ECHILD before signaling the stored
+// PID": the precheck itself now catches this case and returns before ever
+// reaching kill(), so this test now exercises that earlier return instead;
+// the observable outcome (`stopped_cleanly == false`,
+// `exited_unexpectedly == true`) is unchanged, but self_test_stop_echild_
+// precheck_no_signal() below is the one that actually proves no signal is
+// sent, using a target pid that is still alive.
 bool self_test_rut_stop_requires_delivered_signal() {
     RutInstance rut;
     rut.log_path = "/dev/null";
@@ -5240,8 +5458,7 @@ bool self_test_rut_stop_requires_delivered_signal() {
     }
     // Reap the child ourselves: once reaped, `pid` no longer names any
     // process, so the precheck inside stop() (which calls waitpid() again)
-    // finds nothing (`ECHILD`, not `pid`) and falls through to kill(), which
-    // is then guaranteed to fail with ESRCH.
+    // finds nothing but `ECHILD`.
     int status = 0;
     const pid_t reaped = waitpid(rut.pid, &status, 0);
     if (reaped != rut.pid) {
@@ -5260,6 +5477,151 @@ bool self_test_rut_stop_requires_delivered_signal() {
         ok = false;
     }
     if (ok) std::cerr << "PASS [self-test rut stop requires signal]\n";
+    return ok;
+}
+
+// Creates a process that is alive but is NOT this test process's own child:
+// forks a middle process which itself forks `*sentinel_pid` (a long sleeper)
+// and then exits immediately, so the sentinel is reparented away before this
+// function returns (the middle process is reaped here, so it never lingers
+// as a zombie). Because the sentinel was never this process's direct child,
+// `waitpid(*sentinel_pid, ..., WNOHANG)` deterministically fails with
+// `ECHILD` -- no TOCTOU timing window, no need to actually reap a real
+// child and risk a race with the OS recycling its pid. This is what lets
+// self_test_stop_echild_precheck_no_signal() below prove a live process was
+// never signaled, rather than only checking stop()'s return flags (which
+// can't by themselves distinguish "kill() was never attempted" from
+// "kill() was attempted and happened to fail").
+//
+// Assumes this test process is not itself PID 1 / a child subreaper (true
+// of every environment this suite runs in); under a subreaper the sentinel
+// would be reparented to that subreaper instead of becoming un-waitable
+// from here, which would invalidate the ECHILD assumption below.
+bool make_orphan_sentinel(pid_t* sentinel_pid) {
+    int fds[2];
+    if (pipe(fds) != 0) return false;
+    const pid_t mid = fork();
+    if (mid < 0) {
+        close(fds[0]);
+        close(fds[1]);
+        return false;
+    }
+    if (mid == 0) {
+        close(fds[0]);
+        const pid_t grand = fork();
+        if (grand == 0) {
+            close(fds[1]);
+            struct timespec ts{20, 0};
+            nanosleep(&ts, nullptr);
+            _exit(0);
+        }
+        if (grand > 0) {
+            ssize_t written = 0;
+            while (written < static_cast<ssize_t>(sizeof(grand))) {
+                const ssize_t n = write(fds[1],
+                                        reinterpret_cast<const char*>(&grand) + written,
+                                        sizeof(grand) - written);
+                if (n <= 0) break;
+                written += n;
+            }
+        }
+        close(fds[1]);
+        _exit(0);
+    }
+    close(fds[1]);
+    pid_t grand = -1;
+    ssize_t total_read = 0;
+    while (total_read < static_cast<ssize_t>(sizeof(grand))) {
+        const ssize_t n =
+            read(fds[0], reinterpret_cast<char*>(&grand) + total_read, sizeof(grand) - total_read);
+        if (n <= 0) break;
+        total_read += n;
+    }
+    close(fds[0]);
+    int status = 0;
+    while (waitpid(mid, &status, 0) < 0 && errno == EINTR) {
+    }
+    if (total_read != static_cast<ssize_t>(sizeof(grand)) || grand <= 0) return false;
+    *sentinel_pid = grand;
+    return true;
+}
+
+// Round-11 review, "Handle ECHILD before signaling the stored PID": proves
+// that neither `EnvoyInstance::stop()` nor `RutInstance::stop()` ever
+// signals `pid` once the initial precheck observes `ECHILD` -- the concrete
+// risk the review raised is that a stale/recycled pid could otherwise be
+// signaled and hit a completely unrelated live process. Using a real,
+// currently-alive sentinel process that is not this test's own child (see
+// make_orphan_sentinel() above) makes that concrete: if either stop()
+// reached its kill() call, the sentinel -- having no SIGTERM handler --
+// would die; this test asserts it is still alive afterward, not merely that
+// stop() returned the expected flags.
+bool self_test_stop_echild_precheck_no_signal() {
+    pid_t sentinel = -1;
+    if (!make_orphan_sentinel(&sentinel)) {
+        std::cerr << "FAIL [self-test stop echild no-signal]: could not create an orphan "
+                     "sentinel process\n";
+        return false;
+    }
+    bool ok = true;
+    {
+        RutInstance rut;
+        rut.pid = sentinel;
+        rut.log_path = "/dev/null";
+        const bool stopped_cleanly = rut.stop();
+        if (stopped_cleanly) {
+            std::cerr << "FAIL [self-test stop echild no-signal]: RutInstance::stop() reported "
+                         "a clean teardown for an ECHILD precheck\n";
+            ok = false;
+        }
+        if (!rut.exited_unexpectedly) {
+            std::cerr << "FAIL [self-test stop echild no-signal]: RutInstance exited_unexpectedly "
+                         "was not set\n";
+            ok = false;
+        }
+        if (rut.pid != -1) {
+            std::cerr << "FAIL [self-test stop echild no-signal]: RutInstance::stop() did not "
+                         "clear pid\n";
+            ok = false;
+        }
+        if (kill(sentinel, 0) != 0) {
+            std::cerr << "FAIL [self-test stop echild no-signal]: sentinel process is no longer "
+                         "alive after RutInstance::stop() -- a signal reached it\n";
+            ok = false;
+        }
+    }
+    {
+        EnvoyInstance envoy;
+        envoy.pid = sentinel;
+        envoy.name = "rut-diff-selftest-echild-no-signal";
+        envoy.log_path = "/dev/null";
+        const bool stopped_cleanly = envoy.stop();
+        if (stopped_cleanly) {
+            std::cerr << "FAIL [self-test stop echild no-signal]: EnvoyInstance::stop() reported "
+                         "a clean teardown for an ECHILD precheck\n";
+            ok = false;
+        }
+        if (!envoy.exited_unexpectedly) {
+            std::cerr << "FAIL [self-test stop echild no-signal]: EnvoyInstance "
+                         "exited_unexpectedly was not set\n";
+            ok = false;
+        }
+        if (envoy.pid != -1) {
+            std::cerr << "FAIL [self-test stop echild no-signal]: EnvoyInstance::stop() did not "
+                         "clear pid\n";
+            ok = false;
+        }
+        if (kill(sentinel, 0) != 0) {
+            std::cerr << "FAIL [self-test stop echild no-signal]: sentinel process is no longer "
+                         "alive after EnvoyInstance::stop() -- a signal reached it\n";
+            ok = false;
+        }
+    }
+    // Best-effort cleanup: the sentinel was never this process's own child
+    // (that is the whole point), so it cannot be waitpid()'d from here; its
+    // eventual parent/reaper reaps it once SIGKILL takes effect.
+    kill(sentinel, SIGKILL);
+    if (ok) std::cerr << "PASS [self-test stop echild no-signal]\n";
     return ok;
 }
 
@@ -6411,9 +6773,11 @@ int run_self_test(const std::string& rut_binary, const std::string& converter_bi
     ok &= self_test_unexpected_upstream_path_rejected();
     ok &= self_test_unexpected_upstream_path_record_only_not_fatal();
     ok &= self_test_unexpected_upstream_path_ignores_asserted_local_case();
+    ok &= self_test_record_only_misroute_isolated_by_batch();
     ok &= self_test_rut_early_exit_detected();
     ok &= self_test_rut_stop_requires_delivered_signal();
     ok &= self_test_rut_stop_verifies_exit_status();
+    ok &= self_test_stop_echild_precheck_no_signal();
     ok &= self_test_pair_both_failed_rejected();
     ok &= self_test_pair_unexercised_forwarding_rejected();
     ok &= self_test_pair_exempt_cases_zero_contact_matches();
