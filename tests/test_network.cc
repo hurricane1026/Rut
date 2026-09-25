@@ -3901,6 +3901,105 @@ TEST(request_policy, preserve_host_lowercase_wire_and_fail_closed_host) {
     CHECK_FALSE(apply_request_policy(conn, endpoint, kPreserveHost));
     CHECK_EQ(conn.send_buf.len(), 0u);
 
+    // Fail closed: a Connection token nominates Host. The serializer writes
+    // `host:` from the parsed Host header before nominated names are even
+    // consulted, so silently honoring this nomination would re-emit the
+    // header it claims to remove; Envoy's own net behavior for this
+    // nomination is also a fail-closed 400 (sanitizeConnectionHeader removes
+    // the aliased :authority header, then ConnectionManagerImpl rejects the
+    // resulting Host-less request). No upstream bytes touched.
+    prepare(
+        "GET /nominate-host HTTP/1.1\r\n"
+        "Host: client.example\r\n"
+        "Connection: Host\r\n\r\n");
+    u8 untouched_nominate_host[256]{};
+    const u32 nominate_host_len = conn.recv_buf.len();
+    __builtin_memcpy(untouched_nominate_host, conn.recv_buf.data(), nominate_host_len);
+    CHECK_FALSE(apply_request_policy(conn, endpoint, kPreserveHost));
+    CHECK_EQ(conn.send_buf.len(), 0u);
+    REQUIRE_EQ(conn.recv_buf.len(), nominate_host_len);
+    CHECK_EQ(__builtin_memcmp(conn.recv_buf.data(), untouched_nominate_host, nominate_host_len), 0);
+
+    // Fail closed: a Connection token nominates X-Forwarded-Proto. Envoy's
+    // `sanitizeConnectionHeader` explicitly rejects the whole request for
+    // this nomination (an attacker could mask the request's origin);
+    // dropping the client's X-Forwarded-Proto and then re-appending the
+    // policy's own default would silently defeat the same nomination.
+    prepare(
+        "GET /nominate-xfp HTTP/1.1\r\n"
+        "Host: client.example\r\n"
+        "X-Forwarded-Proto: https\r\n"
+        "Connection: X-Forwarded-Proto\r\n\r\n");
+    u8 untouched_nominate_xfp[256]{};
+    const u32 nominate_xfp_len = conn.recv_buf.len();
+    __builtin_memcpy(untouched_nominate_xfp, conn.recv_buf.data(), nominate_xfp_len);
+    CHECK_FALSE(apply_request_policy(conn, endpoint, kPreserveHost));
+    CHECK_EQ(conn.send_buf.len(), 0u);
+    REQUIRE_EQ(conn.recv_buf.len(), nominate_xfp_len);
+    CHECK_EQ(__builtin_memcmp(conn.recv_buf.data(), untouched_nominate_xfp, nominate_xfp_len), 0);
+
+    // Fail closed even without a pre-existing X-Forwarded-Proto header: the
+    // nomination itself is rejected before the trailing default is decided.
+    prepare(
+        "GET /nominate-xfp-bare HTTP/1.1\r\n"
+        "Host: client.example\r\n"
+        "Connection: x-forwarded-proto\r\n\r\n");
+    CHECK_FALSE(apply_request_policy(conn, endpoint, kPreserveHost));
+    CHECK_EQ(conn.send_buf.len(), 0u);
+
+    // Every TE field is evaluated independently, not only the last one
+    // parsed: a `TE: trailers` followed by an unrelated `TE: gzip` is
+    // admitted, and the serializer keeps the trailers line while dropping
+    // the other, exactly as it already does for a single non-trailers field.
+    prepare(
+        "POST /te-multi HTTP/1.1\r\n"
+        "Host: client.example\r\n"
+        "Content-Length: 4\r\n"
+        "TE: trailers\r\n"
+        "TE: gzip\r\n\r\nabcd");
+    REQUIRE(apply_request_policy(conn, endpoint, kPreserveHost));
+    require_wire(
+        "POST /te-multi HTTP/1.1\r\nhost: client.example\r\ncontent-length: 4\r\n"
+        "te: trailers\r\nx-forwarded-proto: http\r\n\r\nabcd");
+
+    // The same holds in the other order: a non-trailers field before the
+    // trailers field is still admitted.
+    prepare(
+        "POST /te-multi-reversed HTTP/1.1\r\n"
+        "Host: client.example\r\n"
+        "Content-Length: 4\r\n"
+        "TE: gzip\r\n"
+        "TE: trailers\r\n\r\nabcd");
+    REQUIRE(apply_request_policy(conn, endpoint, kPreserveHost));
+    require_wire(
+        "POST /te-multi-reversed HTTP/1.1\r\nhost: client.example\r\ncontent-length: 4\r\n"
+        "te: trailers\r\nx-forwarded-proto: http\r\n\r\nabcd");
+
+    // A bare Upgrade header without `Connection: upgrade` is not an actual
+    // upgrade request (conn.req_wants_upgrade requires both). The serializer
+    // already drops a stray Upgrade field unconditionally, so this
+    // fixed-length upload is admitted rather than rejected.
+    prepare(
+        "POST /upgrade-stray HTTP/1.1\r\n"
+        "Host: client.example\r\n"
+        "Content-Length: 4\r\n"
+        "Upgrade: websocket\r\n\r\nabcd");
+    REQUIRE(apply_request_policy(conn, endpoint, kPreserveHost));
+    require_wire(
+        "POST /upgrade-stray HTTP/1.1\r\nhost: client.example\r\ncontent-length: 4\r\n"
+        "x-forwarded-proto: http\r\n\r\nabcd");
+
+    // An actual upgrade request (both Connection: upgrade and Upgrade) stays
+    // rejected: this is not a fixed-length upload this profile serves.
+    prepare(
+        "POST /upgrade-real HTTP/1.1\r\n"
+        "Host: client.example\r\n"
+        "Content-Length: 4\r\n"
+        "Connection: upgrade\r\n"
+        "Upgrade: websocket\r\n\r\nabcd");
+    CHECK_FALSE(apply_request_policy(conn, endpoint, kPreserveHost));
+    CHECK_EQ(conn.send_buf.len(), 0u);
+
     // Fail closed: no Host header. No upstream bytes (recv_buf untouched).
     prepare("GET /nohost HTTP/1.1\r\nX-Only: yes\r\n\r\n");
     u8 untouched_nohost[256]{};

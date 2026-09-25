@@ -333,7 +333,12 @@ return forward(users, request_policy: {
 // HTTP/1.1 response framed by exactly one Content-Length. Requests with a
 // body, TLS/H2, interim/Upgrade responses, chunking/trailers, close-delimited
 // framing, or unsupported status/header controls fail closed; transparent
-// forward(...) remains the default for all other routes.
+// forward(...) remains the default for all other routes. One exception: a
+// fixed-Content-Length request paired with `host: "preserve"` (ID4) or the
+// plain `host: "upstream"` strip (ID1) is admitted alongside a
+// response_policy too — fully buffered, unchunked, with no pipelined
+// successor bytes, and never served from a reused idle upstream socket (see
+// `request_policy_body_response_admitted` in callbacks_impl.h).
 
 return forward(users, response_policy: {
     version: "HTTP/1.1", framing: "content_length", connection: "request",
