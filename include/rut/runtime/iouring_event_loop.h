@@ -2419,6 +2419,43 @@ public:
         return true;
     }
 
+    // Close a non-reusable upstream at proxy completion (the non-pooling half of
+    // release_upstream_conn). ::close() alone does not stop an armed multishot recv:
+    // io_uring holds its own file reference, so the recv stays live on the old
+    // socket and completes when the origin's FIN arrives, carrying the same
+    // (conn_id, UpstreamRecv, upstream_episode) user_data as the next request's
+    // fresh recv on this slot. Dispatched as current, that late EOF clears
+    // upstream_recv_armed for the new recv, after which backend wait() treats the
+    // new response's body CQEs as stale and drops their bytes. Instead quarantine
+    // the old recv exactly like return_idle_upstream does: mark it a stale
+    // terminal, cancel it, and keep cancel_inflight set so submit_recv_upstream
+    // defers the successor's recv until the old one has drained.
+    void close_released_upstream(Connection& c) {
+        // A retirement ledger that already owns the recv has advanced the episode,
+        // so that recv's CQEs are tagged stale and its cancel is owned there.
+        const bool retirement_owns_recv =
+            c.upstream_retirement_active ||
+            (c.upstream_retirement_target_owned & kUpstreamOpRecv) != 0;
+        if (c.upstream_fd >= 0 && !retirement_owns_recv &&
+            (c.upstream_recv_armed || c.upstream_recv_cancel_inflight ||
+             c.upstream_recv_pause_cancel_pending)) {
+            c.upstream_recv_terminal_stale = true;
+            c.upstream_recv_idle_stale_bytes = false;
+            // If the cancel SQE can't be queued the recv's own terminal (FIN or
+            // error on the closed socket) still drains the barrier.
+            if (c.upstream_recv_armed && !pause_upstream_recv_impl(c))
+                c.upstream_recv_cancel_inflight = true;
+        }
+        // From here on identical to the generic detach_upstream_close fallback.
+        if (c.upstream_fd >= 0) {
+            ::close(c.upstream_fd);
+            c.upstream_fd = -1;
+        }
+        clear_upstream_fd(c.id);
+        c.upstream_recv_armed = false;
+        c.upstream_send_armed = false;
+    }
+
     // Return conn.upstream_fd to the idle pool at proxy completion. Unlike epoll's
     // synchronous detach, the multishot upstream recv (IORING_RECV_MULTISHOT) is
     // still armed here, so the fd can't be handed out until that recv stops — a new
