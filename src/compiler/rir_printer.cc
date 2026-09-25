@@ -1140,6 +1140,20 @@ static bool printable_strict_local_response_table(const Module& mod, bool intern
                                                     kMaxExactStrictLocalResponseBindings);
 }
 
+// Codex round-13 review: a hand-built or verifier-rejected module can carry a
+// forged failure-policy table (an out-of-range count, or a non-owning string
+// view like `reason = {nullptr, 1}`) that previously crashed print_quoted_str
+// / print_redirect_body. Mirror the strict-local-response section's safety
+// contract: bound the count against the array capacity and validate every
+// entry's scalar and string fields before any of its views are printed.
+static bool printable_failure_policy_table(const Module& mod) {
+    if (mod.failure_policy_count > kMaxForwardFailurePolicies) return false;
+    for (u32 i = 0; i < mod.failure_policy_count; i++) {
+        if (!forward_failure_policy_table_spec_valid(mod.failure_policies[i])) return false;
+    }
+    return true;
+}
+
 static void print_module_impl(PrintBuf& buf, const Module& mod, bool internal_propagation) {
     const bool has_unmatched_metadata = has_strict_local_response_metadata(mod);
     for (u32 i = 0; i < mod.func_count; i++) {
@@ -1162,34 +1176,41 @@ static void print_module_impl(PrintBuf& buf, const Module& mod, bool internal_pr
     }
     if (mod.failure_policy_count != 0) {
         if (mod.func_count != 0 || mod.response_policy_count != 0) buf.newline();
-        buf.put_cstr("failure_policies: ");
-        buf.put_u32(mod.failure_policy_count);
-        buf.newline();
-        for (u32 i = 0; i < mod.failure_policy_count; i++) {
-            const auto& policy = mod.failure_policies[i];
-            buf.put_cstr("  failure_policy#");
-            buf.put_u32(i + 1);
-            buf.put_cstr(": version=");
-            buf.put_cstr(forward_failure_policy_version_name(policy.version));
-            buf.put_cstr(", status=");
-            buf.put_u32(policy.status_code);
-            buf.put_cstr(", reason=");
-            print_quoted_str(buf, policy.reason);
-            buf.put_cstr(", server=");
-            print_quoted_str(buf, policy.server);
-            buf.put_cstr(", content_type=");
-            print_quoted_str(buf, policy.content_type);
-            buf.put_cstr(", date=");
-            buf.put_cstr(forward_failure_policy_date_name(policy.date));
-            buf.put_cstr(", connection=");
-            buf.put_cstr(forward_failure_policy_connection_name(policy.connection));
-            buf.put_cstr(", head_mode=");
-            buf.put_cstr(failure_policy_head_mode_name(policy.head_mode));
-            buf.put_cstr(", header_order=");
-            buf.put_cstr(failure_policy_header_order_name(policy.header_order));
-            buf.put_cstr(", body=");
-            print_redirect_body(buf, policy.body);
+        if (!printable_failure_policy_table(mod)) {
+            // Forged metadata must remain visible without using its count as
+            // an array bound or touching any possibly-null string storage.
+            buf.put_cstr("failure_policy_table: <invalid>");
             buf.newline();
+        } else {
+            buf.put_cstr("failure_policies: ");
+            buf.put_u32(mod.failure_policy_count);
+            buf.newline();
+            for (u32 i = 0; i < mod.failure_policy_count; i++) {
+                const auto& policy = mod.failure_policies[i];
+                buf.put_cstr("  failure_policy#");
+                buf.put_u32(i + 1);
+                buf.put_cstr(": version=");
+                buf.put_cstr(forward_failure_policy_version_name(policy.version));
+                buf.put_cstr(", status=");
+                buf.put_u32(policy.status_code);
+                buf.put_cstr(", reason=");
+                print_quoted_str(buf, policy.reason);
+                buf.put_cstr(", server=");
+                print_quoted_str(buf, policy.server);
+                buf.put_cstr(", content_type=");
+                print_quoted_str(buf, policy.content_type);
+                buf.put_cstr(", date=");
+                buf.put_cstr(forward_failure_policy_date_name(policy.date));
+                buf.put_cstr(", connection=");
+                buf.put_cstr(forward_failure_policy_connection_name(policy.connection));
+                buf.put_cstr(", head_mode=");
+                buf.put_cstr(failure_policy_head_mode_name(policy.head_mode));
+                buf.put_cstr(", header_order=");
+                buf.put_cstr(failure_policy_header_order_name(policy.header_order));
+                buf.put_cstr(", body=");
+                print_redirect_body(buf, policy.body);
+                buf.newline();
+            }
         }
     }
     if (has_unmatched_metadata) {

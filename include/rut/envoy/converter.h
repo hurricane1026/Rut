@@ -58,9 +58,11 @@ FrontendResult<RutSource> lower_to_rut(const Bootstrap& model, const RutCapabili
 // explicit predicate rather than an unconditional print so a future codec
 // type (or a listener-protocol capability, if one is ever added) has
 // somewhere to change the answer, and so tests can assert the condition
-// without needing the shipped `RutCapabilities` (`request_envoy_h1 = true`
-// as of PR3 and `response_envoy_h1 = true` as of PR4; `local_reply_envoy_h1`
-// still false) to be true.
+// independently of `RutCapabilities` -- the shipped table
+// (`kShippedRutCapabilities` above) now has `request_envoy_h1`,
+// `response_envoy_h1`, and `local_reply_envoy_h1` all true (PR3/PR4/PR5 have
+// all landed), so this predicate no longer needs to stand in for a
+// still-false capability.
 //
 // This is deliberately NOT a `RutCapabilities` gate: Rut's cleartext `listen`
 // has no knob to disable h2c-preface detection at all
