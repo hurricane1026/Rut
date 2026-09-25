@@ -967,11 +967,17 @@ if(RUT_ENABLE_JIT)
         "RUT_PINNED_NGINX_IMAGE=\"${_RUT_PINNED_NGINX_IMAGE}\""
     )
     add_test(NAME test_ipv4_fixture_topology COMMAND test_ipv4_fixture_topology)
+    # CI triage (37 sampled runs): green CTest durations ranged 74.6-118.7s
+    # (median ~90s), with 5/37 runs exceeding the old TIMEOUT 120 even though
+    # a direct (non-ctest) run of the same binary on the same runner passed
+    # moments later at 114-161s. This TIMEOUT overrides the workflow's
+    # `ctest --timeout`, so raise it to 300 to give the observed distribution
+    # real headroom instead of chasing a phantom hang.
     set_tests_properties(test_ipv4_fixture_topology PROPERTIES
         LABELS "integration;docker;network"
         RUN_SERIAL TRUE
         RESOURCE_LOCK nginx-differential
-        TIMEOUT 120
+        TIMEOUT 300
         SKIP_RETURN_CODE 77
     )
     add_executable(test_fixture_privileged_broker
