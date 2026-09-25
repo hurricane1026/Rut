@@ -2380,6 +2380,95 @@ bool launch_envoy_with_port_retry(const std::string& dir,
     return false;
 }
 
+// Scan of rut's own stderr log for its listen/bind failure message
+// (src/main.cc's run_shards(): `write_str("Failed to create listen socket
+// for shard "); ...; write_error("", lfd_result.error())`, where
+// write_error() renders `Error::code` -- the raw errno
+// (include/rut/runtime/error.h's `from_errno`) -- as `errno=<N>`; the
+// `create_listen_socket`/`bind_listener_shard` path that produces it,
+// include/rut/runtime/socket.h and listener_context.h, reports EADDRINUSE
+// verbatim from a failed bind()). Matches on that literal errno value rather
+// than a platform-specific strerror string, the same way
+// log_indicates_address_in_use() matches Envoy's own log text, so this only
+// fires for the one errno a bind()/listen() collision actually produces,
+// never for an unrelated startup failure that happens to also name "listen
+// socket".
+bool rut_log_indicates_address_in_use(const std::string& path) {
+    std::ifstream in(path);
+    if (!in) return false;
+    std::stringstream ss;
+    ss << in.rdbuf();
+    const std::string contents = ss.str();
+    return contents.find("Failed to create listen socket") != std::string::npos &&
+           contents.find(std::string("errno=") + std::to_string(EADDRINUSE)) != std::string::npos;
+}
+
+// RUT-side counterpart to launch_envoy_with_port_retry(), used everywhere
+// this file launches `rut` against a converted milestone-S bootstrap
+// (--pair-milestone-s and --self-test's RUT pass): renders a bootstrap for
+// `*listen_port`/`other_port`, converts it with `converter_binary`, and
+// launches `rut_binary` against the result, waiting for it to accept
+// connections. RUT binds `*listen_port` itself (the port is baked into the
+// generated .rut source by rut-envoy-convert, same as Envoy binding the port
+// baked into its own bootstrap JSON), so like Envoy's listener port this one
+// can only be probe-allocated by this harness, leaving the same bind-race
+// window; when rut's own stderr names the collision
+// (rut_log_indicates_address_in_use()), this retries on a freshly allocated
+// port, up to kMaxListenPortAttempts attempts total -- the same "detect a
+// collision ... retry with a fresh port ... print that it retried, and never
+// record a failed attempt as evidence" contract as
+// launch_envoy_with_port_retry() (round-6 review on PR #694, mirrored here
+// for RUT). A failed attempt's process and converted source are torn down /
+// left unreferenced before either retrying or returning, so nothing from it
+// survives to be mistaken for evidence; only a `true` return leaves
+// `rut`/`*listen_port`/`*rut_source_path` describing a live, ready `rut`
+// instance backed by the bootstrap that produced it.
+bool launch_rut_with_port_retry(const std::string& dir,
+                                const std::string& rut_binary,
+                                const std::string& converter_binary,
+                                uint16_t* listen_port,
+                                uint16_t other_port,
+                                std::string* rut_source_path,
+                                RutInstance* rut,
+                                std::string* error) {
+    const std::string bootstrap_path = dir + "/bootstrap-rut.json";
+    for (int attempt = 1; attempt <= kMaxListenPortAttempts; attempt++) {
+        if (!write_file_mode(bootstrap_path, render_bootstrap(*listen_port, other_port), 0644)) {
+            *error = "could not write bootstrap.json";
+            return false;
+        }
+        *rut_source_path = dir + "/out-attempt" + std::to_string(attempt) + ".rut";
+        std::string convert_stderr;
+        if (!run_converter_to_file(
+                converter_binary, bootstrap_path, *rut_source_path, &convert_stderr)) {
+            *error = "rut-envoy-convert did not exit 0 with warnings-only stderr";
+            if (!convert_stderr.empty()) *error += "; stderr: " + convert_stderr;
+            return false;
+        }
+        rut->log_path = dir + "/rut-attempt" + std::to_string(attempt) + ".log";
+        if (!rut->launch(rut_binary, *rut_source_path)) {
+            *error = "could not fork/exec rut";
+            return false;
+        }
+        if (wait_ready(*listen_port, *rut, 15'000, error)) return true;
+
+        const bool collided = rut_log_indicates_address_in_use(rut->log_path);
+        rut->stop();
+        if (!collided || attempt == kMaxListenPortAttempts) return false;
+
+        uint16_t fresh_port = 0;
+        if (!allocate_loopback_port(&fresh_port)) {
+            *error = "could not allocate a replacement loopback port after a bind collision";
+            return false;
+        }
+        std::cerr << "RETRY: rut listener port " << *listen_port
+                  << " lost a bind race to another process (attempt " << attempt << "/"
+                  << kMaxListenPortAttempts << "); retrying on port " << fresh_port << "\n";
+        *listen_port = fresh_port;
+    }
+    return false;
+}
+
 int run_oracle_milestone_s(const std::string& output_path) {
     const std::string missing = check_docker_prerequisites();
     if (!missing.empty()) return missing_prerequisite(missing);
@@ -2610,9 +2699,27 @@ int run_pair_milestone_s(const std::string& rut_binary,
     const std::string missing = check_docker_prerequisites();
     if (!missing.empty()) return missing_prerequisite(missing);
 
-    uint16_t listen_port1 = 0, upstream_port1 = 0, listen_port2 = 0, closed_port = 0;
-    if (!allocate_distinct_ports({&listen_port1, &upstream_port1, &listen_port2, &closed_port})) {
+    // The recording upstream's port is reserved end to end, the same way
+    // run_oracle_milestone_s() reserves it (round-6 review, "Keep allocated
+    // ports reserved until their consumers bind"): this process binds and
+    // listens on it right here and keeps that same socket alive until
+    // RecordingUpstream::adopt() takes it over below, so no other process can
+    // ever grab it out from under us. Envoy's two listener ports and the
+    // deliberately-unbound "closed" port can only be probe-allocated (Envoy
+    // binds its own port inside the container; "closed" must stay unbound),
+    // so they still go through allocate_distinct_ports() below; probe
+    // allocation naturally never returns the still-bound upstream port.
+    BoundPort upstream_bound;
+    if (!allocate_bound_loopback_port(&upstream_bound)) {
+        std::cerr << "FAIL: could not allocate loopback port for the recording upstream\n";
+        return 1;
+    }
+    const uint16_t upstream_port1 = upstream_bound.port;
+
+    uint16_t listen_port1 = 0, listen_port2 = 0, closed_port = 0;
+    if (!allocate_distinct_ports({&listen_port1, &listen_port2, &closed_port})) {
         std::cerr << "FAIL: could not allocate loopback ports\n";
+        close(upstream_bound.fd);
         return 1;
     }
 
@@ -2631,20 +2738,11 @@ int run_pair_milestone_s(const std::string& rut_binary,
             std::cerr << "FAIL: could not write bootstrap.json\n";
             return 1;
         }
-        const std::string out_rut_path = dir + "/out.rut";
-        std::string convert_stderr;
-        if (!run_converter_to_file(
-                converter_binary, bootstrap_path, out_rut_path, &convert_stderr)) {
-            std::cerr << "FAIL: rut-envoy-convert did not exit 0 with warnings-only stderr on the "
-                         "milestone-S bootstrap\n";
-            if (!convert_stderr.empty()) std::cerr << "stderr: " << convert_stderr << "\n";
-            return 1;
-        }
 
         RecordingUpstream upstream;
         const auto cases = run1_cases();
         for (const auto& spec : cases) upstream.set_reply(spec.upstream_path, spec.upstream_reply);
-        if (!upstream.start(upstream_port1)) {
+        if (!upstream.adopt(upstream_bound.fd)) {
             std::cerr << "FAIL: could not start recording upstream\n";
             return 1;
         }
@@ -2686,16 +2784,24 @@ int run_pair_milestone_s(const std::string& rut_binary,
         upstream.clear_requests();
 
         // Then RUT, on the same ports, against the same (now-cleared)
-        // recording upstream.
+        // recording upstream. RUT's listener port has the same bind-race
+        // exposure Envoy's did just above (this process can only
+        // probe-allocate it, since RUT itself owns the eventual bind() --
+        // launch_rut_with_port_retry() re-renders/re-converts the bootstrap
+        // on a fresh port and retries, same contract as
+        // launch_envoy_with_port_retry(), and never leaves a failed
+        // attempt's process or log to be mistaken for evidence.
         RutInstance rut;
-        rut.log_path = dir + "/rut.log";
-        if (!rut.launch(rut_binary, out_rut_path)) {
-            std::cerr << "FAIL: could not fork/exec rut\n";
-            upstream.stop();
-            return 1;
-        }
+        std::string rut_source_path;
         std::string rut_ready_error;
-        if (!wait_ready(listen_port1, rut, 15'000, &rut_ready_error)) {
+        if (!launch_rut_with_port_retry(dir,
+                                        rut_binary,
+                                        converter_binary,
+                                        &listen_port1,
+                                        upstream_port1,
+                                        &rut_source_path,
+                                        &rut,
+                                        &rut_ready_error)) {
             std::cerr << "FAIL: " << rut_ready_error << "\n";
             dump_rut_log(rut.log_path);
             upstream.stop();
@@ -2735,15 +2841,6 @@ int run_pair_milestone_s(const std::string& rut_binary,
             std::cerr << "FAIL: could not write bootstrap.json\n";
             return 1;
         }
-        const std::string out_rut_path = dir + "/out.rut";
-        std::string convert_stderr;
-        if (!run_converter_to_file(
-                converter_binary, bootstrap_path, out_rut_path, &convert_stderr)) {
-            std::cerr << "FAIL: rut-envoy-convert did not exit 0 with warnings-only stderr on the "
-                         "closed-port bootstrap\n";
-            if (!convert_stderr.empty()) std::cerr << "stderr: " << convert_stderr << "\n";
-            return 1;
-        }
         const CaseSpec spec = connect_failure_case();
 
         EnvoyInstance envoy;
@@ -2778,13 +2875,16 @@ int run_pair_milestone_s(const std::string& rut_binary,
         }
 
         RutInstance rut;
-        rut.log_path = dir + "/rut.log";
-        if (!rut.launch(rut_binary, out_rut_path)) {
-            std::cerr << "FAIL: could not fork/exec rut\n";
-            return 1;
-        }
+        std::string rut_source_path;
         std::string rut_ready_error;
-        if (!wait_ready(listen_port2, rut, 15'000, &rut_ready_error)) {
+        if (!launch_rut_with_port_retry(dir,
+                                        rut_binary,
+                                        converter_binary,
+                                        &listen_port2,
+                                        closed_port,
+                                        &rut_source_path,
+                                        &rut,
+                                        &rut_ready_error)) {
             std::cerr << "FAIL: " << rut_ready_error << "\n";
             dump_rut_log(rut.log_path);
             return 1;
@@ -3840,15 +3940,16 @@ bool self_test_reserved_closed_port() {
 // upstream request would hit: two requests recorded for one case's path
 // must fail the harness, not silently compare only the first one.
 bool self_test_duplicate_upstream_rejected() {
-    uint16_t port = 0;
-    if (!allocate_loopback_port(&port)) {
+    BoundPort bound;
+    if (!allocate_bound_loopback_port(&bound)) {
         std::cerr << "FAIL [self-test duplicate-upstream]: could not allocate a loopback port\n";
         return false;
     }
+    const uint16_t port = bound.port;
     RecordingUpstream upstream;
     const std::string reply = "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nhi";
     upstream.set_reply("/dup", reply);
-    if (!upstream.start(port)) {
+    if (!upstream.adopt(bound.fd)) {
         std::cerr << "FAIL [self-test duplicate-upstream]: could not start upstream\n";
         return false;
     }
@@ -3893,17 +3994,18 @@ bool self_test_duplicate_upstream_rejected() {
 // though every per-case lookup it performs would still pass, because none
 // of them ever query a path outside the case table.
 bool self_test_unexpected_upstream_path_rejected() {
-    uint16_t port = 0;
-    if (!allocate_loopback_port(&port)) {
+    BoundPort bound;
+    if (!allocate_bound_loopback_port(&bound)) {
         std::cerr
             << "FAIL [self-test unexpected-upstream-path]: could not allocate a loopback port\n";
         return false;
     }
+    const uint16_t port = bound.port;
     RecordingUpstream upstream;
     const std::string reply = "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nhi";
     upstream.set_reply("/expected", reply);
     upstream.set_default_reply(reply);
-    if (!upstream.start(port)) {
+    if (!upstream.adopt(bound.fd)) {
         std::cerr << "FAIL [self-test unexpected-upstream-path]: could not start upstream\n";
         return false;
     }
@@ -4395,6 +4497,96 @@ bool compare_case_against_oracle(const CaseResult& result, const OracleCase& ora
     return match;
 }
 
+// Round-6-review parity for RUT (PR #694 mirrored onto pair mode's RUT
+// launch, launch_rut_with_port_retry() above): a genuine listener-port bind
+// collision must be retried on a fresh port rather than reported as a
+// failure. allocate_distinct_ports()/allocate_loopback_port() never hand out
+// an already-bound port on their own, so nothing in the normal run exercises
+// this path -- this test forces the collision deterministically by holding
+// the first candidate port bound and listening (without SO_REUSEPORT) for
+// the whole first attempt, exactly like another process racing this harness
+// for the same ephemeral port would, then releases it once the race window
+// (rut's own first bind() attempt) has passed. Needs the real
+// `rut`/`rut-envoy-convert` binaries; skipped (not failed) without them,
+// same contract as run_self_test_rut_pass() below.
+bool self_test_rut_port_retry(const std::string& rut_binary, const std::string& converter_binary) {
+    if (rut_binary.empty() || converter_binary.empty()) {
+        std::cerr << "NOTE: --self-test rut port retry skipped (pass [rut-binary] "
+                     "[rut-envoy-convert-binary] to run it)\n";
+        return true;
+    }
+    const std::string dir = make_temp_dir("rut-envoy-portretry");
+    if (dir.empty()) {
+        std::cerr << "FAIL [self-test rut port retry]: could not create temp directory\n";
+        return false;
+    }
+    uint16_t listen_port = 0, upstream_port = 0;
+    if (!allocate_distinct_ports({&listen_port, &upstream_port})) {
+        std::cerr << "FAIL [self-test rut port retry]: could not allocate loopback ports\n";
+        return false;
+    }
+    const uint16_t first_candidate = listen_port;
+
+    // Pre-bind the first candidate port live and hold it for the duration of
+    // rut's first bind attempt -- deliberately without SO_REUSEPORT, so
+    // rut's own SO_REUSEPORT bind() (create_listen_socket(),
+    // src/runtime/socket.cc) still collides: Linux only shares a port across
+    // SO_REUSEPORT sockets when every socket that ever bound it, including
+    // the first, opted in. Deliberately bind()-only, no listen(): a bound
+    // socket already reserves the port for EADDRINUSE purposes, and leaving
+    // it out of LISTEN state makes an incoming connect() fail closed
+    // (ECONNREFUSED) instead of being silently accepted by this held socket
+    // itself -- wait_ready()/tcp_port_open() otherwise cannot tell "rut is
+    // ready" apart from "something else answered the probe", which would
+    // false-positive the very race this test forces.
+    const int held_fd = socket(AF_INET, SOCK_STREAM, 0);
+    if (held_fd < 0) {
+        std::cerr << "FAIL [self-test rut port retry]: could not create a socket to hold the "
+                     "candidate port\n";
+        return false;
+    }
+    sockaddr_in held_addr{};
+    held_addr.sin_family = AF_INET;
+    held_addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    held_addr.sin_port = htons(first_candidate);
+    if (bind(held_fd, reinterpret_cast<sockaddr*>(&held_addr), sizeof(held_addr)) != 0) {
+        std::cerr << "FAIL [self-test rut port retry]: could not pre-bind the candidate port\n";
+        close(held_fd);
+        return false;
+    }
+
+    RutInstance rut;
+    std::string rut_source_path;
+    std::string error;
+    const bool launched = launch_rut_with_port_retry(dir,
+                                                     rut_binary,
+                                                     converter_binary,
+                                                     &listen_port,
+                                                     upstream_port,
+                                                     &rut_source_path,
+                                                     &rut,
+                                                     &error);
+    // The race window is over the instant launch_rut_with_port_retry()
+    // returns (success or not): release the held port either way.
+    close(held_fd);
+
+    bool ok = true;
+    if (!launched) {
+        std::cerr << "FAIL [self-test rut port retry]: " << error << "\n";
+        dump_rut_log(rut.log_path);
+        ok = false;
+    } else if (listen_port == first_candidate) {
+        std::cerr << "FAIL [self-test rut port retry]: rut bound the pre-held port "
+                  << first_candidate << " instead of retrying on a fresh one\n";
+        ok = false;
+    } else {
+        std::cerr << "PASS [self-test rut port retry]: retried " << first_candidate << " -> "
+                  << listen_port << "\n";
+    }
+    rut.stop();
+    return ok;
+}
+
 bool run_self_test_rut_pass(const std::string& rut_binary, const std::string& converter_binary) {
     bool ok = true;
     std::vector<CaseResult> results;  // indices align with kAssertedOracleCases
@@ -4406,23 +4598,21 @@ bool run_self_test_rut_pass(const std::string& rut_binary, const std::string& co
             std::cerr << "FAIL [self-test rut]: could not create temp directory\n";
             return false;
         }
-        uint16_t listen_port = 0, upstream_port = 0;
-        if (!allocate_distinct_ports({&listen_port, &upstream_port})) {
+        // Same end-to-end port reservation as run_oracle_milestone_s() /
+        // run_pair_milestone_s(): the recording upstream binds and listens
+        // right here (allocate_bound_loopback_port()), so no other process
+        // can take it before RecordingUpstream::adopt() below takes over.
+        BoundPort upstream_bound;
+        if (!allocate_bound_loopback_port(&upstream_bound)) {
+            std::cerr << "FAIL [self-test rut]: could not allocate a loopback port for the "
+                         "recording upstream\n";
+            return false;
+        }
+        const uint16_t upstream_port = upstream_bound.port;
+        uint16_t listen_port = 0;
+        if (!allocate_distinct_ports({&listen_port})) {
             std::cerr << "FAIL [self-test rut]: could not allocate loopback ports\n";
-            return false;
-        }
-        const std::string bootstrap_path = dir + "/bootstrap.json";
-        if (!write_file_mode(bootstrap_path, render_bootstrap(listen_port, upstream_port), 0644)) {
-            std::cerr << "FAIL [self-test rut]: could not write bootstrap.json\n";
-            return false;
-        }
-        const std::string out_rut_path = dir + "/out.rut";
-        std::string convert_stderr;
-        if (!run_converter_to_file(
-                converter_binary, bootstrap_path, out_rut_path, &convert_stderr)) {
-            std::cerr << "FAIL [self-test rut]: rut-envoy-convert did not exit 0 with empty "
-                         "stderr\n";
-            if (!convert_stderr.empty()) std::cerr << "stderr: " << convert_stderr << "\n";
+            close(upstream_bound.fd);
             return false;
         }
 
@@ -4430,20 +4620,25 @@ bool run_self_test_rut_pass(const std::string& rut_binary, const std::string& co
         const auto all_cases = run1_cases();
         for (const auto& spec : all_cases)
             upstream.set_reply(spec.upstream_path, spec.upstream_reply);
-        if (!upstream.start(upstream_port)) {
+        if (!upstream.adopt(upstream_bound.fd)) {
             std::cerr << "FAIL [self-test rut]: could not start recording upstream\n";
             return false;
         }
 
+        // RUT's own listener port, like Envoy's/RUT's elsewhere in this file,
+        // can only be probe-allocated -- retry on a bind collision the same
+        // way launch_rut_with_port_retry() does everywhere else.
         RutInstance rut;
-        rut.log_path = dir + "/rut.log";
-        if (!rut.launch(rut_binary, out_rut_path)) {
-            std::cerr << "FAIL [self-test rut]: could not fork/exec rut\n";
-            upstream.stop();
-            return false;
-        }
+        std::string rut_source_path;
         std::string ready_error;
-        if (!wait_ready(listen_port, rut, 15'000, &ready_error)) {
+        if (!launch_rut_with_port_retry(dir,
+                                        rut_binary,
+                                        converter_binary,
+                                        &listen_port,
+                                        upstream_port,
+                                        &rut_source_path,
+                                        &rut,
+                                        &ready_error)) {
             std::cerr << "FAIL [self-test rut]: " << ready_error << "\n";
             dump_rut_log(rut.log_path);
             upstream.stop();
@@ -4483,23 +4678,17 @@ bool run_self_test_rut_pass(const std::string& rut_binary, const std::string& co
             std::cerr << "FAIL [self-test rut]: could not write bootstrap.json\n";
             return false;
         }
-        const std::string out_rut_path = dir + "/out.rut";
-        std::string convert_stderr;
-        if (!run_converter_to_file(
-                converter_binary, bootstrap_path, out_rut_path, &convert_stderr)) {
-            std::cerr << "FAIL [self-test rut]: rut-envoy-convert did not exit 0 with empty "
-                         "stderr (closed-port bootstrap)\n";
-            if (!convert_stderr.empty()) std::cerr << "stderr: " << convert_stderr << "\n";
-            return false;
-        }
         RutInstance rut;
-        rut.log_path = dir + "/rut.log";
-        if (!rut.launch(rut_binary, out_rut_path)) {
-            std::cerr << "FAIL [self-test rut]: could not fork/exec rut\n";
-            return false;
-        }
+        std::string rut_source_path;
         std::string ready_error;
-        if (!wait_ready(listen_port, rut, 15'000, &ready_error)) {
+        if (!launch_rut_with_port_retry(dir,
+                                        rut_binary,
+                                        converter_binary,
+                                        &listen_port,
+                                        closed_port,
+                                        &rut_source_path,
+                                        &rut,
+                                        &ready_error)) {
             std::cerr << "FAIL [self-test rut]: " << ready_error << "\n";
             dump_rut_log(rut.log_path);
             return false;
@@ -4553,6 +4742,7 @@ int run_self_test(const std::string& rut_binary, const std::string& converter_bi
     ok &= self_test_accept_unblocks_on_shutdown_close();
     ok &= self_test_head_body_detected();
     ok &= self_test_persistent_trailing_bytes_detected();
+    ok &= self_test_rut_port_retry(rut_binary, converter_binary);
     if (!rut_binary.empty() && !converter_binary.empty()) {
         ok &= run_self_test_rut_pass(rut_binary, converter_binary);
     } else {
