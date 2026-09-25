@@ -1021,6 +1021,28 @@ Each needs its own issue before the corresponding row can leave
   policies (ID1/ID2/ID3). (Rut's response path already has the equivalent
   dynamic nomination handling for the upstream→downstream direction —
   `upstream_connection_nominates` in `include/rut/runtime/callbacks_impl.h`.)
+  A `Connection` token that nominates `content-length` itself fails the whole
+  rewrite closed instead of forwarding an unframed body: dropping that header
+  while still copying the already-validated body bytes would desynchronize a
+  persistent upstream connection (request smuggling). Envoy's own
+  `Utility::sanitizeConnectionHeader` (`source/common/http/utility.cc`) has no
+  such exception and does remove a nominated `Content-Length` from the header
+  map it forwards to filters/router, but its HTTP/1 client codec then decides
+  outbound framing independently of that header at encode time; Rut's
+  request-policy serializer writes the body length directly onto the wire, so
+  the two are not equivalent and Rut cannot safely replicate Envoy's exact
+  byte shape for this nomination without adding chunked-encoding support to
+  this path. No recorded oracle case exercises this nomination.
+- `Expect: 100-continue` on a body-carrying `host: "preserve"` request: Envoy
+  sends the interim `100 Continue` response before reading the body, then
+  applies the same hop-by-hop drop as every other request. Rut has no
+  interim-response flow anywhere in the runtime (for any route or request
+  policy), so `inspect_request_policy_body` fails this shape closed today —
+  the client gets an immediate rejection instead of the `100 Continue` it
+  expects. This is the same fail-closed behavior the fixed-length request
+  policies (ID1/ID2/ID3) already apply to any `Expect` header; `request_envoy_h1`
+  does not add interim-response support and this request shape stays outside
+  its advertised capability until a `100 Continue` primitive exists.
 - `response_policy.date: "preserve_or_current"`: add `date` only when absent.
 - `response_policy.server: "envoy"` with overwrite semantics, and an explicit
   "pass through upstream `server`" mode for `server_header_transformation:

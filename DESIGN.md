@@ -1867,6 +1867,46 @@ future sticky-session "learn" mode. Rut cannot express that mode today:
 must not hold sessions. No copyable declaration is specified until the strict
 table and its cross-connection consistency contract exist.
 
+**Request rewrite policy (`request_policy`)**
+
+`forward(upstream, request_policy: { ... })` requests a fixed, closed
+byte-for-byte serialization of the upstream request instead of the
+transparent zero-copy default; every field is a literal, validated at parse
+time, and unsupported combinations are a compile error rather than a runtime
+fallback. Two closed profiles exist:
+
+```swift
+// Upstream-authority profile: rewrites Host to the upstream endpoint.
+return forward(users, request_policy: {
+    version: "HTTP/1.1", host: "upstream", connection: "omit",
+    strip_headers: ["Connection", "Keep-Alive", "TE", "Expect", "Upgrade"]
+})
+
+// Envoy-compatible H1 profile (`host: "preserve"`): keeps the client's Host
+// header verbatim instead of rewriting it (fails closed unless exactly one
+// non-empty Host header is present), lowercases every forwarded header
+// name, and requires forwarded_proto and the six-name strip list together.
+return forward(users, request_policy: {
+    version: "HTTP/1.1", host: "preserve", connection: "omit",
+    header_names: "lowercase", forwarded_proto: "http",
+    strip_headers: ["Connection", "Keep-Alive", "TE", "Expect", "Upgrade", "Proxy-Connection"]
+})
+```
+
+`host: "preserve"` additionally: drops every header nominated by the client's
+`Connection` header value (RFC 7230-style hop-by-hop stripping, not just the
+fixed `strip_headers` list), keeps `te` only when its exact value is
+`trailers`, and appends `x-forwarded-proto: http` as the last header only
+when the client did not already send one (a client-supplied value is kept
+unchanged, in its original position). It is closed to ordinary
+zero-copy-shaped forwards: a request with a body paired with a client
+`Expect` header, or with `Transfer-Encoding`, fails closed rather than
+proxying with ambiguous framing (no `100 Continue` interim-response support
+exists yet). See `docs/language-card.md` for the exact field grammar and
+`docs/envoy-converter.md` for the byte-level Envoy oracle this profile is
+verified against. A parallel, separately-closed `response_policy` exists for
+response-side rewriting; see `docs/language-card.md`.
+
 #### 3.4.6 Response Caching
 
 Standard HTTP response caching (RFC 7234) is handled automatically by the runtime,
