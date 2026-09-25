@@ -304,6 +304,23 @@ Each row below stays `PARTIAL` (or lower) until a passing CI run of
 run id; the lead promotes a row to `SUPPORTED` at that point, not before.
 `connect_authority` is not asserted and is not promoted by either run.
 
+**Re-run pending (round-6 review):** runs `36069445967` and `36070125213`
+both predate this round's hardening of the pair harness itself --
+`compare_pair_case` now requires exactly one upstream contact on both sides
+for every case expected to forward (not just matching, possibly-empty,
+bytes), `EnvoyInstance::stop()` now detects an Envoy/docker child that exited
+before intentional teardown, `RutInstance::stop()` now verifies the reaped
+exit status rather than trusting any status `waitpid` returns, and
+`read_http_message` now checks persistent (non-close) responses for
+erroneous trailing wire bytes the same way it already checked close-delimited
+ones. The `SUPPORTED` rows below were promoted under the weaker, pre-hardening
+harness, so they are not being silently demoted, but they are not yet
+re-validated under the strengthened one either: the next CI run of
+`test_envoy_pair_milestone_s` with this harness re-validates every promoted
+case, the lead will record that run's id here once it lands, and the pair
+test now fails loudly (not silently) if any promoted case mismatches under
+the stricter checks.
+
 | Pair case | method/path | parser | converter | RUT capability | asserted | status |
 | --- | --- | --- | --- | --- | --- | --- |
 | GET smoke (headers pass through lowercased, `x-forwarded-proto` appended) | `GET /smoke?q=1` | yes | yes | yes (`request_envoy_h1`, `response_envoy_h1`) | yes | SUPPORTED (pinned Envoy v1.39.1 pair differential, CI run `36069445967`, zero skips; upstream and downstream bytes equal after normalizing only the synthesized `date` value) |
@@ -312,7 +329,7 @@ run id; the lead promotes a row to `SUPPORTED` at that point, not before.
 | HEAD (body suppressed both sides) | `HEAD /head` | yes | yes | yes (`response_envoy_h1` `head_mode`) | yes | SUPPORTED (pinned Envoy v1.39.1 pair differential, CI run `36069445967`, zero skips; upstream and downstream bytes equal after normalizing only the synthesized `date` value) |
 | Fixed-length POST | `POST /upload` | yes | yes | yes (`request_envoy_h1`, `response_envoy_h1`) | yes | SUPPORTED (pinned Envoy v1.39.1 pair differential, CI run `36069445967`, zero skips; upstream and downstream bytes equal after normalizing only the synthesized `date` value) |
 | Connect failure → 503 with Envoy's exact body | `GET /smoke` against a closed upstream port | yes | yes | yes (`local_reply_envoy_h1` `failure_policy`) | yes | SUPPORTED (pinned Envoy v1.39.1 pair differential, CI run `36069445967`, zero skips; upstream and downstream bytes equal after normalizing only the synthesized `date` value) |
-| Hop-by-hop stripping (`Connection`-nominated headers, `Proxy-Connection`, `TE`) | `GET /hop` | yes | yes | yes (`request_envoy_h1`) | yes | SUPPORTED (pinned Envoy v1.39.1 pair differential; record-only equal in run `36069445967`, asserted and passing in run `36070125213`, zero skips; bytes equal after normalizing only the synthesized `date` value) |
+| Hop-by-hop handling on one request: `Connection`, `Keep-Alive`, `Proxy-Connection` removed; the one `Connection`-nominated token this case sends, `X-Drop-Me`, removed; `TE: trailers` preserved (rewritten to lowercase), not stripped | `GET /hop` | yes | yes | yes (`request_envoy_h1`) | yes | SUPPORTED for exactly this case's shape (pinned Envoy v1.39.1 pair differential; record-only equal in run `36069445967`, asserted and passing in run `36070125213`, zero skips; bytes equal after normalizing only the synthesized `date` value). Scoped, not general: the `Connection`-nomination coverage is the tested token `X-Drop-Me` only, not Connection-nomination in general -- a token naming `content-length`, for example, fails the whole request closed instead of matching Envoy's remove-and-forward behavior (see the Blocked-by-Rut row above, line 209); and the `TE` coverage is `trailers`-token preservation specifically, not every `TE` value. |
 | TRACE | `TRACE /trace` | yes | yes | yes (ordinary forward path) | yes | SUPPORTED (pinned Envoy v1.39.1 pair differential; record-only equal in run `36069445967`, asserted and passing in run `36070125213`, zero skips; bytes equal after normalizing only the synthesized `date` value) |
 | OPTIONS * (unmatched → 404) | `OPTIONS *` | yes | yes | yes (`local_reply_envoy_h1` `local_response`) | yes | SUPPORTED (pinned Envoy v1.39.1 pair differential; record-only equal in run `36069445967`, asserted and passing in run `36070125213`, zero skips; bytes equal after normalizing only the synthesized `date` value) |
 | CONNECT authority-form (unmatched → 404) | `CONNECT example.com:443` | yes | yes | yes (`local_reply_envoy_h1` `local_response`) | no (record-only) | PARTIAL (record-only; run `36069445967` shows the one difference: Envoy adds `connection: close` to the 404 and closes, Rut keeps the connection open because its local-response persistence rule does not look at the method) |
