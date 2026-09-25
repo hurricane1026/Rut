@@ -344,7 +344,10 @@ return forward(users, request_policy: {
 // a Connection nomination of `te` itself does not force a drop -- this same
 // trailers check decides its fate, matching Envoy's own nomination special
 // case); rejects Connection nominating `upgrade` alongside an Upgrade header
-// (even with `close`) but admits and strips a bare Upgrade header otherwise;
+// whose trimmed value is non-empty (even with `close`) but admits a bare
+// Upgrade header otherwise -- including an Upgrade header present with an
+// empty/OWS-only value alongside an `upgrade` nomination -- and always
+// strips it (and any nominated Upgrade) from the forwarded request;
 // rejects more than one X-Forwarded-Proto field; treats any X-Forwarded-Proto
 // value that is not (case-insensitively) exactly "http" or "https" -- empty,
 // OWS-only, or otherwise invalid such as "http,https" -- as absent (dropped,

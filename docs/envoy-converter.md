@@ -479,12 +479,19 @@ are recorded from the pinned Envoy build, not assumed.
 **Request to upstream**
 
 - `Host` is preserved unchanged. There is no nginx-style rewrite to the
-  upstream address. Rut's `request_policy.host` currently offers `"upstream"`
-  only; a `"preserve"` value is a capability dependency.
+  upstream address. Rut's `request_policy.host` landed a `"preserve"` value
+  with `request_envoy_h1` (PR3): the ID4 (`Http11PreserveHostLowercase`)
+  profile forwards the client's Host authority verbatim
+  (`apply_preserve_host_lowercase_request_policy`,
+  `include/rut/runtime/callbacks_impl.h`). Every other `request_policy.host`
+  value still writes the fixed upstream Host.
 - Envoy emits all header names in lowercase over HTTP/1.1 (default
-  `header_key_format`). nginx and Rut preserve the client's case. This affects
-  the recorded upstream bytes for every request and is a capability dependency
-  on the request-policy grammar (a header-casing selector).
+  `header_key_format`). nginx and Rut preserve the client's case on every
+  policy except ID4. The request side landed with `request_envoy_h1` (PR3,
+  `header_names: "lowercase"` in `request_policy`): the same serializer
+  lowercases every forwarded header name. The **response** side is still a
+  capability dependency (`response_envoy_h1`, PR4) — see "Known capability
+  dependencies" below.
 - Added headers: `x-forwarded-proto: http` and
   `x-envoy-expected-rq-timeout-ms: 15000` (the route timeout default). No
   `x-forwarded-for` is appended unless `use_remote_address: true`. No
@@ -1029,10 +1036,19 @@ Each needs its own issue before the corresponding row can leave
 
 - `request_policy.host: "preserve"` (`request_envoy_h1`, PR3): landed. The
   runtime serializer follows the Envoy oracle where it differs from this
-  document's original sketch: the client's `x-forwarded-proto` (if any) is
-  kept unchanged in its original position rather than overwritten, and
-  `x-forwarded-proto: http` is appended only when the client sent none. See
-  `tests/fixtures/envoy_oracle_milestone_s.inc` and
+  document's original sketch: a single client `x-forwarded-proto` field
+  whose trimmed value is a syntactically valid scheme (case-insensitively
+  exactly `http` or `https`, matching Envoy's own `Utility::schemeIsValid`,
+  `source/common/http/conn_manager_utility.cc`) is kept unchanged in its
+  original position rather than overwritten. An empty, OWS-only, or
+  otherwise invalid value (e.g. `ftp`, `http,https`) is overwritten in place
+  at that same position with `x-forwarded-proto: http` rather than dropped
+  and re-appended, matching Envoy's inline (O(1) slot) storage for this
+  header. `x-forwarded-proto: http` is appended as the last header only when
+  the client sent no `x-forwarded-proto` field at all; more than one
+  physical field is rejected outright (`400`), since Envoy coalesces
+  duplicates into one value and this profile does not replicate that
+  coalescing. See `tests/fixtures/envoy_oracle_milestone_s.inc` and
   `docs/envoy-compatibility.md`.
 - Header-name casing selector on the response policy: Envoy emits lowercase
   names over HTTP/1.1. The request side landed with `request_envoy_h1`
