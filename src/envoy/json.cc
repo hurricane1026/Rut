@@ -12,6 +12,11 @@ bool is_digit(char c) {
 bool is_hex(char c) {
     return is_digit(c) || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F');
 }
+u32 hex_value(char c) {
+    if (c <= '9') return static_cast<u32>(c - '0');
+    if (c <= 'F') return static_cast<u32>(c - 'A') + 10u;
+    return static_cast<u32>(c - 'a') + 10u;
+}
 
 class Parser {
 public:
@@ -70,8 +75,61 @@ private:
         doc_.nodes[index].span = Span{start, pos_, line, col};
     }
 
+    // Validate and consume one multi-byte UTF-8 sequence whose lead byte
+    // (>= 0x80) is at the current position (RFC 3629). Rejects overlong
+    // encodings, encoded surrogate code points (U+D800-U+DFFF), code points
+    // beyond U+10FFFF, invalid lead/continuation bytes and truncated
+    // sequences.
+    FrontendResult<bool> scan_utf8_sequence() {
+        const u8 lead = static_cast<u8>(peek());
+        u32 length = 0;
+        u8 lo = 0x80u;
+        u8 hi = 0xBFu;
+        if (lead >= 0xC2u && lead <= 0xDFu) {
+            length = 1;
+        } else if (lead == 0xE0u) {
+            length = 2;
+            lo = 0xA0u;
+        } else if (lead == 0xEDu) {
+            length = 2;
+            hi = 0x9Fu;
+        } else if ((lead >= 0xE1u && lead <= 0xECu) || lead == 0xEEu || lead == 0xEFu) {
+            length = 2;
+        } else if (lead == 0xF0u) {
+            length = 3;
+            lo = 0x90u;
+        } else if (lead >= 0xF1u && lead <= 0xF3u) {
+            length = 3;
+        } else if (lead == 0xF4u) {
+            length = 3;
+            hi = 0x8Fu;
+        } else {
+            return frontend_error(FrontendError::UnexpectedChar,
+                                  here(),
+                                  lit_str("invalid UTF-8 byte in JSON string"));
+        }
+        advance();
+        for (u32 i = 0; i < length; i++) {
+            if (at_end() || static_cast<u8>(peek()) < lo || static_cast<u8>(peek()) > hi)
+                return frontend_error(FrontendError::UnexpectedChar,
+                                      here(),
+                                      lit_str("invalid UTF-8 byte in JSON string"));
+            advance();
+            lo = 0x80u;
+            hi = 0xBFu;
+        }
+        return true;
+    }
+
     // Scan a quoted string starting at the opening quote. Returns the raw
     // slice between the quotes and whether it contains any escape.
+    //
+    // Raw bytes are validated as well-formed UTF-8 (RFC 3629). `\uXXXX`
+    // escapes are additionally checked for lone UTF-16 surrogate halves: a
+    // high surrogate (D800-DBFF) must be immediately followed by a low
+    // surrogate (DC00-DFFF) escape, and a low surrogate must not appear
+    // without a preceding high surrogate. This mirrors the check a
+    // protobuf JSON parser performs when decoding into a UTF-8 string.
     FrontendResult<Str> scan_string(bool* has_escape) {
         const u32 open = pos_;
         const u32 line = line_;
@@ -79,8 +137,16 @@ private:
         advance();
         *has_escape = false;
         const u32 start = pos_;
+        bool pending_high_surrogate = false;
+        Span pending_high_span{};
         while (!at_end()) {
             const char c = peek();
+            if (pending_high_surrogate &&
+                !(c == '\\' && pos_ + 1u < source_.len && source_.ptr[pos_ + 1u] == 'u')) {
+                return frontend_error(FrontendError::UnexpectedChar,
+                                      pending_high_span,
+                                      lit_str("unpaired UTF-16 surrogate in \\u escape"));
+            }
             if (c == '"') {
                 const Str raw = source_.slice(start, pos_);
                 advance();
@@ -92,6 +158,9 @@ private:
                                       lit_str("control byte inside a JSON string"));
             if (c == '\\') {
                 *has_escape = true;
+                const u32 esc_start = pos_;
+                const u32 esc_line = line_;
+                const u32 esc_col = col_;
                 advance();
                 if (at_end()) break;
                 const char e = peek();
@@ -102,12 +171,35 @@ private:
                 }
                 if (e == 'u') {
                     advance();
+                    u32 value = 0;
                     for (u32 i = 0; i < 4u; i++) {
                         if (at_end() || !is_hex(peek()))
                             return frontend_error(FrontendError::UnexpectedChar,
                                                   here(),
                                                   lit_str("invalid \\u escape in JSON string"));
+                        value = value * 16u + hex_value(peek());
                         advance();
+                    }
+                    const Span escape_span{esc_start, pos_, esc_line, esc_col};
+                    if (value >= 0xD800u && value <= 0xDBFFu) {
+                        if (pending_high_surrogate)
+                            return frontend_error(
+                                FrontendError::UnexpectedChar,
+                                pending_high_span,
+                                lit_str("unpaired UTF-16 surrogate in \\u escape"));
+                        pending_high_surrogate = true;
+                        pending_high_span = escape_span;
+                    } else if (value >= 0xDC00u && value <= 0xDFFFu) {
+                        if (!pending_high_surrogate)
+                            return frontend_error(
+                                FrontendError::UnexpectedChar,
+                                escape_span,
+                                lit_str("unpaired UTF-16 surrogate in \\u escape"));
+                        pending_high_surrogate = false;
+                    } else if (pending_high_surrogate) {
+                        return frontend_error(FrontendError::UnexpectedChar,
+                                              pending_high_span,
+                                              lit_str("unpaired UTF-16 surrogate in \\u escape"));
                     }
                     continue;
                 }
@@ -115,8 +207,16 @@ private:
                                       here(),
                                       lit_str("invalid escape in JSON string"));
             }
+            if (static_cast<u8>(c) >= 0x80u) {
+                if (auto r = scan_utf8_sequence(); !r) return core::make_unexpected(r.error());
+                continue;
+            }
             advance();
         }
+        if (pending_high_surrogate)
+            return frontend_error(FrontendError::UnexpectedChar,
+                                  pending_high_span,
+                                  lit_str("unpaired UTF-16 surrogate in \\u escape"));
         return frontend_error(FrontendError::UnterminatedString,
                               Span{open, pos_, line, col},
                               lit_str("unterminated JSON string"));

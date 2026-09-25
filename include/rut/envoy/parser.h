@@ -74,6 +74,10 @@ struct RouteConfiguration {
     Span span{};
 };
 
+// `Auto` exists only to name the proto3 enum's zero value; the parser never
+// accepts it. `codec_type` must be explicit `HTTP1`: `AUTO` (the default,
+// including when the field is omitted) lets Envoy sniff the cleartext
+// HTTP/2 preface on a plaintext listener, and this converter is HTTP/1-only.
 enum class CodecType : u8 {
     Auto,
     Http1,
@@ -90,6 +94,8 @@ struct RouterFilter {
 struct HttpConnectionManager {
     Str stat_prefix{};
     Span stat_prefix_span{};
+    // Required; always CodecType::Http1 and codec_type_present == true after
+    // a successful parse (see CodecType).
     CodecType codec_type = CodecType::Auto;
     bool codec_type_present = false;
     Span codec_type_span{};
@@ -130,8 +136,11 @@ struct Cluster {
     bool type_present = false;
     Span type_span{};
     Duration connect_timeout{};
-    // `load_assignment.cluster_name` is optional; when present it must equal
-    // `name`.
+    // `load_assignment.cluster_name` is required (Envoy's v3
+    // `ClusterLoadAssignment.cluster_name` has `min_len: 1`) and must equal
+    // `name`; `load_assignment_name_present` is always true after a
+    // successful parse and is kept for symmetry with the other
+    // presence-tracking fields.
     bool load_assignment_name_present = false;
     Span load_assignment_name_span{};
     Endpoint endpoint{};

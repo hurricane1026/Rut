@@ -422,22 +422,28 @@ private:
         out->stat_prefix = prefix_text.value();
         out->stat_prefix_span = doc_.at(stat_prefix.value()).span;
 
-        auto codec = optional(node, kCodecType);
+        // codec_type must be explicit HTTP1. AUTO (the proto3 default, so
+        // also the omitted-field behavior) makes Envoy sniff the connection
+        // preface and serve downstream HTTP/2 on a plaintext listener; this
+        // converter is HTTP/1-only and downstream HTTP/2 is out of scope
+        // (docs/envoy-converter.md), so admitting AUTO would silently drop
+        // support for h2c clients Envoy would have served.
+        auto codec =
+            required(node,
+                     kCodecType,
+                     lit_str("codec_type is required; only HTTP1 is supported (fix-it: add "
+                             "\"codec_type\": \"HTTP1\")"));
         if (!codec) return core::make_unexpected(codec.error());
-        if (codec.value() != kJsonNoNode) {
-            auto text = plain_string(codec.value(), lit_str("codec_type must be a string"));
-            if (!text) return core::make_unexpected(text.error());
-            if (text.value().eq(lit_str("AUTO"))) {
-                out->codec_type = CodecType::Auto;
-            } else if (text.value().eq(lit_str("HTTP1"))) {
-                out->codec_type = CodecType::Http1;
-            } else {
-                return unsupported(doc_.at(codec.value()).span,
-                                   lit_str("only codec_type AUTO or HTTP1 is supported"));
-            }
-            out->codec_type_present = true;
-            out->codec_type_span = doc_.at(codec.value()).span;
-        }
+        auto text = plain_string(codec.value(), lit_str("codec_type must be a string"));
+        if (!text) return core::make_unexpected(text.error());
+        if (!text.value().eq(lit_str("HTTP1")))
+            return unsupported(
+                doc_.at(codec.value()).span,
+                lit_str("only codec_type HTTP1 is supported; AUTO permits downstream HTTP/2, "
+                        "which this converter does not implement"));
+        out->codec_type = CodecType::Http1;
+        out->codec_type_present = true;
+        out->codec_type_span = doc_.at(codec.value()).span;
 
         auto gen = required(node,
                             kGenerateRequestId,
@@ -652,18 +658,23 @@ private:
         const Field allowed_assignment[] = {kClusterName, kEndpoints};
         if (auto r = reject_unknown(assignment.value(), allowed_assignment, 2u); !r) return r;
 
-        auto assignment_name = optional(assignment.value(), kClusterName);
+        // ClusterLoadAssignment.cluster_name has `(validate.rules).string =
+        // {min_len: 1}` in the v3 API (config/endpoint/v3/endpoint.proto), so
+        // an omitted (empty-default) value fails Envoy's own validation; it
+        // is required here too, not merely checked when present.
+        auto assignment_name = required(
+            assignment.value(), kClusterName, lit_str("load_assignment.cluster_name is required"));
         if (!assignment_name) return core::make_unexpected(assignment_name.error());
-        if (assignment_name.value() != kJsonNoNode) {
-            auto name_text = plain_string(assignment_name.value(),
-                                          lit_str("load_assignment.cluster_name must be a string"));
-            if (!name_text) return core::make_unexpected(name_text.error());
-            if (!name_text.value().eq(out->name))
-                return invalid(doc_.at(assignment_name.value()).span,
-                               lit_str("load_assignment.cluster_name must equal the cluster name"));
-            out->load_assignment_name_present = true;
-            out->load_assignment_name_span = doc_.at(assignment_name.value()).span;
-        }
+        auto name_text =
+            name_string(assignment_name.value(),
+                        false,
+                        lit_str("load_assignment.cluster_name must be a non-empty string"));
+        if (!name_text) return core::make_unexpected(name_text.error());
+        if (!name_text.value().eq(out->name))
+            return invalid(doc_.at(assignment_name.value()).span,
+                           lit_str("load_assignment.cluster_name must equal the cluster name"));
+        out->load_assignment_name_present = true;
+        out->load_assignment_name_span = doc_.at(assignment_name.value()).span;
 
         auto endpoints = required(
             assignment.value(), kEndpoints, lit_str("load_assignment.endpoints is required"));

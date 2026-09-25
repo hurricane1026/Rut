@@ -21,9 +21,9 @@ image does not exist yet; no row can be promoted past `PARTIAL` until
 | --- | --- | --- | --- | --- | --- |
 | Bootstrap envelope: `static_resources` with exactly one listener and one cluster; proto3 JSON encoding; snake_case and lowerCamelCase field spellings; both spellings of one field rejected as a duplicate | yes: increment 1 model (`include/rut/envoy/parser.h`), every other top-level field (`admin`, `node`, `dynamic_resources`, ...) and every `static_resources.secrets` entry rejected at the key | no | n/a | none | NOT_IMPLEMENTED |
 | Listener: optional `name`, one IPv4 `socket_address` with `port_value` 1..65535, one filter chain with no match and no transport socket | yes: IPv6, hostnames, `pipe`, `protocol`, `additional_addresses`, `listener_filters`, `filter_chain_match`, `transport_socket`, multiple listeners/chains rejected | no | `listen a.b.c.d:port` exists for one IPv4 listener | none | NOT_IMPLEMENTED |
-| HTTP connection manager: v3 `@type`, non-empty `stat_prefix`, `codec_type` omitted/`AUTO`/`HTTP1`, `generate_request_id: false` required, inline `route_config`, `http_filters` = exactly the router | yes: other network filters, other `@type`, `HTTP2`/`HTTP3`, `generate_request_id` omitted or `true`, `rds`, `access_log`, `tracing`, `use_remote_address`, `server_name`, non-router HTTP filters rejected | no | see BLOCKED rows below | none | NOT_IMPLEMENTED |
+| HTTP connection manager: v3 `@type`, non-empty `stat_prefix`, `codec_type: "HTTP1"` required, `generate_request_id: false` required, inline `route_config`, `http_filters` = exactly the router | yes: other network filters, other `@type`, `codec_type` omitted/`AUTO`/`HTTP2`/`HTTP3` (AUTO permits downstream h2c, out of scope), `generate_request_id` omitted or `true`, `rds`, `access_log`, `tracing`, `use_remote_address`, `server_name`, non-router HTTP filters rejected | no | see BLOCKED rows below | none | NOT_IMPLEMENTED |
 | Route table: one virtual host with `domains: ["*"]`, one route `match.prefix: "/"` with `route.cluster` naming the declared cluster | yes: host lists, multiple virtual hosts/routes, `path`/`safe_regex`/headers matchers, non-`/` prefixes, `redirect`, `direct_response`, `weighted_clusters`, route `timeout`/`retry_policy`/rewrites, undeclared cluster references rejected | no | segment-aware `route "/"` catch-all exists; `unmatched` policies exist for the 404 shape | none | NOT_IMPLEMENTED |
-| Cluster: `type` omitted or `STATIC`, positive `connect_timeout` with millisecond precision, `load_assignment` with one locality and one IPv4 `lb_endpoints` entry, optional matching `cluster_name` | yes: `STRICT_DNS`/`LOGICAL_DNS`/`EDS`/`ORIGINAL_DST`, `lb_policy`, `health_checks`, `circuit_breakers`, `outlier_detection`, `transport_socket`, weights, `locality`, multiple localities/endpoints, sub-millisecond or zero durations rejected | no | `upstream x at "ip:port"` exists; `connect_timeout` has no RUT surface (fixed loop constant) | none | NOT_IMPLEMENTED |
+| Cluster: `type` omitted or `STATIC`, positive `connect_timeout` with millisecond precision, `load_assignment` with required `cluster_name` matching the cluster and one locality with one IPv4 `lb_endpoints` entry | yes: `STRICT_DNS`/`LOGICAL_DNS`/`EDS`/`ORIGINAL_DST`, `lb_policy`, `health_checks`, `circuit_breakers`, `outlier_detection`, `transport_socket`, weights, `locality`, multiple localities/endpoints, sub-millisecond or zero durations, omitted or mismatched `load_assignment.cluster_name` rejected | no | `upstream x at "ip:port"` exists; `connect_timeout` has no RUT surface (fixed loop constant) | none | NOT_IMPLEMENTED |
 
 ## Blocked by Rut before the milestone can reach SUPPORTED
 
@@ -55,6 +55,8 @@ converter fails closed on the whole configuration until then.
 - Increment 1 (this matrix's first revision): `rut_envoy` library with the
   bounded JSON document parser (`include/rut/envoy/json.h`, 4096 nodes, depth
   32, no comments/trailing commas/duplicate keys, escapes validated but never
-  decoded) and the milestone semantic model. `test_envoy_parser` covers the
-  accepted document, camelCase aliasing, optional fields, and 100+ rejection
-  vectors with key-anchored spans. No RUT is emitted.
+  decoded, raw string bytes validated as well-formed UTF-8 per RFC 3629
+  including lone-surrogate `\uXXXX` escapes) and the milestone semantic
+  model. `test_envoy_parser` covers the accepted document, camelCase
+  aliasing, optional fields, and 100+ rejection vectors with key-anchored
+  spans. No RUT is emitted.

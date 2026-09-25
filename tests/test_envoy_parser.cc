@@ -29,6 +29,7 @@ struct Bootstrap {
 "typed_config": {
 "@type": "type.googleapis.com/envoy.extensions.filters.network.http_connection_manager.v3.HttpConnectionManager",
 "stat_prefix": "ingress",
+"codec_type": "HTTP1",
 "generate_request_id": false,
 "route_config": {"name": "local", "virtual_hosts": [{
 "name": "all",
@@ -200,6 +201,70 @@ TEST(envoy_json, scalar_values_and_escapes) {
     CHECK_EQ(count, 1u);
 }
 
+TEST(envoy_json, accepts_well_formed_utf8_and_surrogate_pairs) {
+    static envoy::JsonDocument doc;
+    // Raw (unescaped) UTF-8: 2-byte (e with acute), 3-byte (euro sign), and
+    // 4-byte (a non-BMP emoji) sequences, plus an escaped surrogate pair
+    // spelling the same non-BMP code point.
+    const std::string text =
+        "{\"a\": \"caf\xC3\xA9\", \"b\": \"\xE2\x82\xAC\", \"c\": \"\xF0\x9F\x98\x80\", "
+        "\"d\": \"\\uD83D\\uDE00\"}";
+    auto root = envoy::parse_json(str(text), doc);
+    REQUIRE(root);
+    CHECK_FALSE(doc.at(doc.member(root.value(), lit_str("a"))).has_escape);
+    CHECK_FALSE(doc.at(doc.member(root.value(), lit_str("b"))).has_escape);
+    CHECK_FALSE(doc.at(doc.member(root.value(), lit_str("c"))).has_escape);
+    CHECK(doc.at(doc.member(root.value(), lit_str("d"))).has_escape);
+}
+
+TEST(envoy_json, rejects_malformed_utf8_and_lone_surrogates) {
+    static envoy::JsonDocument doc;
+    struct Case {
+        const char* text;
+        u32 line;
+        u32 col;
+    };
+    const Case cases[] = {
+        // Lone continuation byte.
+        {"\"\x80\"", 1, 2},
+        // Overlong 2-byte encoding of U+0000.
+        {"\"\xC0\x80\"", 1, 2},
+        // Truncated 2-byte sequence (closing quote where a continuation
+        // byte was required).
+        {"\"\xC3\"", 1, 3},
+        // Truncated 3-byte sequence, cut off by the end of input.
+        {"\"\xE2\x82", 1, 4},
+        // Surrogate half D800 encoded directly in UTF-8 (0xED 0xA0 0x80):
+        // the second byte is outside 0xED's restricted 0x80-0x9F range.
+        {"\"\xED\xA0\x80\"", 1, 3},
+        // Code point above U+10FFFF (0xF4 0x90 0x80 0x80 = U+110000): the
+        // second byte is outside 0xF4's restricted 0x80-0x8F range.
+        {"\"\xF4\x90\x80\x80\"", 1, 3},
+        // Invalid lead bytes.
+        {"\"\xF5\x80\x80\x80\"", 1, 2},
+        {"\"\xFF\"", 1, 2},
+        // High surrogate followed by a non-surrogate escape.
+        {"\"\\uD800\\u0041\"", 1, 2},
+        // High surrogate followed by a raw ASCII byte.
+        {"\"\\uD800x\"", 1, 2},
+        // Lone low surrogate.
+        {"\"\\uDC00\"", 1, 2},
+        // High surrogate at the end of the string with no pairing escape.
+        {"\"\\uD800\"", 1, 2},
+        // Two consecutive high surrogates.
+        {"\"\\uD800\\uD801\"", 1, 2},
+    };
+    for (const Case& c : cases) {
+        auto result =
+            envoy::parse_json(Str{c.text, static_cast<u32>(__builtin_strlen(c.text))}, doc);
+        CHECK_MSG(!result, c.text);
+        if (result) continue;
+        CHECK_MSG(result.error().code == FrontendError::UnexpectedChar, c.text);
+        CHECK_MSG(result.error().span.line == c.line, c.text);
+        CHECK_MSG(result.error().span.col == c.col, c.text);
+    }
+}
+
 TEST(envoy_json, numbers) {
     static envoy::JsonDocument doc;
     const std::string text = R"([0, 65535, 4294967295, 4294967296, -1, 1.5, 1e3, 007])";
@@ -321,32 +386,33 @@ TEST(envoy_parser, accepts_milestone_bootstrap) {
     const envoy::HttpConnectionManager& hcm = b.listener.filter_chain.hcm;
     CHECK(hcm.stat_prefix.eq(lit_str("ingress")));
     CHECK_EQ(hcm.stat_prefix_span.line, 10u);
-    CHECK_FALSE(hcm.codec_type_present);
-    CHECK(hcm.codec_type == envoy::CodecType::Auto);
-    CHECK_EQ(hcm.generate_request_id_span.line, 11u);
+    CHECK(hcm.codec_type_present);
+    CHECK(hcm.codec_type == envoy::CodecType::Http1);
+    CHECK_EQ(hcm.codec_type_span.line, 11u);
+    CHECK_EQ(hcm.generate_request_id_span.line, 12u);
     CHECK_EQ(hcm.type_url_span.line, 9u);
     CHECK(hcm.route_config.name.eq(lit_str("local")));
     CHECK(hcm.route_config.virtual_host.name.eq(lit_str("all")));
-    CHECK_EQ(hcm.route_config.virtual_host.domains_span.line, 14u);
+    CHECK_EQ(hcm.route_config.virtual_host.domains_span.line, 15u);
     CHECK(hcm.route_config.virtual_host.route.match.prefix.eq(lit_str("/")));
-    CHECK_EQ(hcm.route_config.virtual_host.route.match.prefix_span.line, 15u);
+    CHECK_EQ(hcm.route_config.virtual_host.route.match.prefix_span.line, 16u);
     CHECK(hcm.route_config.virtual_host.route.action.cluster.eq(lit_str("backend")));
     CHECK(hcm.router.name.eq(lit_str("envoy.filters.http.router")));
     CHECK(hcm.router.has_typed_config);
-    CHECK_EQ(hcm.router.typed_config_span.line, 18u);
+    CHECK_EQ(hcm.router.typed_config_span.line, 19u);
 
     CHECK(b.cluster.name.eq(lit_str("backend")));
-    CHECK_EQ(b.cluster.name_span.line, 22u);
+    CHECK_EQ(b.cluster.name_span.line, 23u);
     CHECK(b.cluster.type_present);
-    CHECK_EQ(b.cluster.type_span.line, 23u);
+    CHECK_EQ(b.cluster.type_span.line, 24u);
     CHECK_EQ(b.cluster.connect_timeout.milliseconds, 5000u);
     CHECK(b.cluster.connect_timeout.text.eq(lit_str("5s")));
-    CHECK_EQ(b.cluster.connect_timeout.span.line, 24u);
+    CHECK_EQ(b.cluster.connect_timeout.span.line, 25u);
     CHECK(b.cluster.load_assignment_name_present);
     CHECK_EQ(b.cluster.endpoint.address.ipv4_host, 0x7f000001u);
     CHECK_EQ(b.cluster.endpoint.address.port, 9000u);
-    CHECK_EQ(b.cluster.endpoint.address.address_span.line, 26u);
-    CHECK_EQ(b.cluster.endpoint.span.line, 26u);
+    CHECK_EQ(b.cluster.endpoint.address.address_span.line, 27u);
+    CHECK_EQ(b.cluster.endpoint.span.line, 27u);
 }
 
 TEST(envoy_parser, accepts_camel_case_spellings_and_optional_fields) {
@@ -361,23 +427,22 @@ TEST(envoy_parser, accepts_camel_case_spellings_and_optional_fields) {
     REQUIRE(replace(&listeners, "\"route_config\"", "\"routeConfig\""));
     REQUIRE(replace(&listeners, "\"virtual_hosts\"", "\"virtualHosts\""));
     REQUIRE(replace(&listeners, "\"http_filters\"", "\"httpFilters\""));
+    REQUIRE(replace(&listeners, "\"codec_type\"", "\"codecType\""));
     // Optional pieces removed: listener name, route_config name, router
-    // typed_config; codec_type HTTP1 added.
+    // typed_config. codec_type and load_assignment.cluster_name are
+    // required, so they stay, renamed to their camelCase spelling.
     REQUIRE(replace(&listeners, "\"name\": \"ingress\",\n", ""));
     REQUIRE(replace(&listeners, "\"name\": \"local\", ", ""));
     REQUIRE(replace(&listeners,
                     ",\n\"typed_config\": {\"@type\": "
                     "\"type.googleapis.com/envoy.extensions.filters.http.router.v3.Router\"}",
                     ""));
-    REQUIRE(replace(&listeners,
-                    "\"statPrefix\": \"ingress\",",
-                    "\"statPrefix\": \"ingress\", \"codecType\": \"HTTP1\","));
     b.listeners = listeners;
     std::string clusters = b.clusters;
     REQUIRE(replace(&clusters, "\"connect_timeout\"", "\"connectTimeout\""));
     REQUIRE(replace(&clusters, "\"load_assignment\"", "\"loadAssignment\""));
     REQUIRE(replace(&clusters, "\"lb_endpoints\"", "\"lbEndpoints\""));
-    REQUIRE(replace(&clusters, "\"cluster_name\": \"backend\", ", ""));
+    REQUIRE(replace(&clusters, "\"cluster_name\"", "\"clusterName\""));
     REQUIRE(replace(&clusters, "\"type\": \"STATIC\",\n", ""));
     REQUIRE(replace(&clusters, "\"5s\"", "\"1.250s\""));
     b.clusters = clusters;
@@ -393,7 +458,7 @@ TEST(envoy_parser, accepts_camel_case_spellings_and_optional_fields) {
     CHECK(result.value().listener.filter_chain.hcm.codec_type_present);
     CHECK(result.value().listener.filter_chain.hcm.codec_type == envoy::CodecType::Http1);
     CHECK_FALSE(result.value().cluster.type_present);
-    CHECK_FALSE(result.value().cluster.load_assignment_name_present);
+    CHECK(result.value().cluster.load_assignment_name_present);
     CHECK_EQ(result.value().cluster.connect_timeout.milliseconds, 1250u);
     CHECK_EQ(result.value().listener.address.port, 8080u);
     CHECK_EQ(result.value().cluster.endpoint.address.port, 9000u);
@@ -407,7 +472,7 @@ TEST(envoy_parser, rejects_both_spellings_of_one_field) {
     const std::string text = b.render();
     const Span span =
         expect_reject(text, FrontendError::UnexpectedToken, "both snake_case and camelCase");
-    CHECK_EQ(span.line, 24u);
+    CHECK_EQ(span.line, 25u);
     CHECK_EQ(line_at(text, span.line).find("\"connectTimeout\""),
              static_cast<size_t>(span.col - 1u));
 }
@@ -546,12 +611,20 @@ TEST(envoy_parser, rejects_shapes_outside_the_milestone_boundary) {
          "\"stat_prefix\": \"\"",
          FrontendError::UnexpectedToken,
          "stat_prefix"},
-        {"\"stat_prefix\": \"ingress\",",
-         "\"stat_prefix\": \"ingress\", \"codec_type\": \"HTTP2\",",
+        {"\"codec_type\": \"HTTP1\",\n",
+         "",
+         FrontendError::UnexpectedEof,
+         "codec_type is required"},
+        {"\"codec_type\": \"HTTP1\"",
+         "\"codec_type\": \"AUTO\"",
+         FrontendError::UnsupportedSyntax,
+         "AUTO permits downstream HTTP/2"},
+        {"\"codec_type\": \"HTTP1\"",
+         "\"codec_type\": \"HTTP2\"",
          FrontendError::UnsupportedSyntax,
          "codec_type"},
-        {"\"stat_prefix\": \"ingress\",",
-         "\"stat_prefix\": \"ingress\", \"codec_type\": \"HTTP3\",",
+        {"\"codec_type\": \"HTTP1\"",
+         "\"codec_type\": \"HTTP3\"",
          FrontendError::UnsupportedSyntax,
          "codec_type"},
         // generate_request_id
@@ -706,6 +779,14 @@ TEST(envoy_parser, rejects_shapes_outside_the_milestone_boundary) {
          "\"cluster_name\": \"other\"",
          FrontendError::UnexpectedToken,
          "equal the cluster name"},
+        {"\"cluster_name\": \"backend\"",
+         "\"cluster_name\": \"\"",
+         FrontendError::UnexpectedToken,
+         "non-empty string"},
+        {"\"cluster_name\": \"backend\", ",
+         "",
+         FrontendError::UnexpectedEof,
+         "cluster_name is required"},
         {"\"load_assignment\": {\"cluster_name\": \"backend\", \"endpoints\": [{\"lb_endpoints\": "
          "[{\n"
          "\"endpoint\": {\"address\": {\"socket_address\": {\"address\": \"127.0.0.1\", "

@@ -78,6 +78,7 @@ host, one catch-all route, one static cluster with one endpoint.
           "typed_config": {
             "@type": "type.googleapis.com/envoy.extensions.filters.network.http_connection_manager.v3.HttpConnectionManager",
             "stat_prefix": "ingress",
+            "codec_type": "HTTP1",
             "generate_request_id": false,
             "route_config": {
               "name": "local",
@@ -121,6 +122,13 @@ normalization. With the default `true`, Envoy injects a random UUID
 byte and which Rut does not generate. Configurations that leave request-id
 generation on are rejected until Rut has an equivalent, so that the milestone
 does not hide a behavioral difference behind a diff filter.
+
+`codec_type: "HTTP1"` is likewise required, not optional. Its default (and
+the value used when the field is omitted), `AUTO`, makes Envoy inspect the
+connection preface and serve downstream HTTP/2 (h2c) on a plaintext listener.
+This converter is HTTP/1-only (see "Input format" above), so admitting `AUTO`
+would silently drop support for clients Envoy would have served over HTTP/2.
+`HTTP2` and `HTTP3` remain rejected outright.
 
 Support for arbitrary bootstrap files is not implied. An `admin` block, a
 `node` block, `dynamic_resources`, `layered_runtime`, `stats_sinks`,
@@ -168,19 +176,23 @@ The first parser increment represents, but does not yet lower:
 - exactly one filter chain with no `filter_chain_match`, containing exactly one
   network filter, which must be the HTTP connection manager;
 - HCM: `stat_prefix`, inline `route_config`, `generate_request_id: false`,
-  `http_filters` containing exactly the router filter last, no `codec_type`
-  other than omitted or `AUTO`/`HTTP1`, no `access_log`, no `tracing`, no
-  `common_http_protocol_options`, no `server_name` /
-  `server_header_transformation` overrides, no `use_remote_address`,
-  no `xff_num_trusted_hops`;
+  `http_filters` containing exactly the router filter last, `codec_type:
+  "HTTP1"` required (omitted, `AUTO`, `HTTP2` and `HTTP3` are all rejected),
+  no `access_log`, no `tracing`, no `common_http_protocol_options`,
+  no `server_name` / `server_header_transformation` overrides,
+  no `use_remote_address`, no `xff_num_trusted_hops`;
 - route config: exactly one virtual host whose `domains` is exactly `["*"]`,
   with exactly one route whose match is `prefix: "/"` and whose action is
   `route.cluster` naming a declared cluster, no `timeout` override, no
   `retry_policy`, no header mutations, no rewrites;
-- exactly one cluster: `type: STATIC`, `connect_timeout`, one locality with one
-  `lb_endpoints` entry with an IPv4 `socket_address`, no `lb_policy` other
-  than omitted or `ROUND_ROBIN`, no `health_checks`, no `circuit_breakers`,
-  no `outlier_detection`, no `transport_socket`, no
+- exactly one cluster: `type` omitted or `STATIC` (the proto3
+  `cluster_discovery_type` oneof default), `connect_timeout`,
+  `load_assignment.cluster_name` required and equal to the cluster `name`
+  (Envoy's v3 `ClusterLoadAssignment.cluster_name` has `min_len: 1`, so an
+  omitted value is a validation error, not the empty string), one locality
+  with one `lb_endpoints` entry with an IPv4 `socket_address`, no `lb_policy`
+  other than omitted or `ROUND_ROBIN`, no `health_checks`, no
+  `circuit_breakers`, no `outlier_detection`, no `transport_socket`, no
   `typed_extension_protocol_options`.
 
 Every unknown field, duplicate key, unknown `@type`, unsupported enum value,
