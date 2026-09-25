@@ -11197,10 +11197,27 @@ inline bool build_upstream_order_response_headers(
         if ((c < 0x20 && c != '\t') || c == 0x7f) return false;
     }
     u32 connection_count = 0;
+    // Envoy's HeaderMapImpl stores these as single-valued "inline" header slots
+    // and coalesces a duplicate into the existing entry (comma-joined) rather
+    // than emitting a second physical field. This profile forwards headers
+    // verbatim in upstream order instead of rebuilding a HeaderMap, so it
+    // cannot reproduce that join; a duplicate would otherwise reach the client
+    // as two physical `content-type` / `date` / `location` lines, which no
+    // HTTP/1.1 client (or Envoy) ever emits for these fields. Fail closed
+    // instead of guessing which one wins. Content-Length duplicates are
+    // already rejected by the `content_length_count != 1` precondition above,
+    // and a duplicate Server is deliberately deduplicated (first wins) rather
+    // than rejected -- see the dedicated `is_server` branch below.
+    u32 content_type_count = 0;
+    u32 date_count = 0;
+    u32 location_count = 0;
     for (u32 i = 0; i < resp.header_count; i++) {
-        if (response_policy_name_eq(resp.headers[i].name, "connection", 10) &&
-            ++connection_count > 1)
+        const Str name = resp.headers[i].name;
+        if (response_policy_name_eq(name, "connection", 10) && ++connection_count > 1) return false;
+        if (response_policy_name_eq(name, "content-type", 12) && ++content_type_count > 1)
             return false;
+        if (response_policy_name_eq(name, "date", 4) && ++date_count > 1) return false;
+        if (response_policy_name_eq(name, "location", 8) && ++location_count > 1) return false;
         // `resp.chunked` (rejected above) is only set when the Transfer-Encoding
         // token list contains "chunked"; a coding such as `gzip` or
         // `chunked, gzip` leaves it false while still carrying the field, which
@@ -11213,7 +11230,7 @@ inline bool build_upstream_order_response_headers(
         // Http1ResponseCodeDetails::InvalidTransferEncoding, RFC 7230 §3.3.3).
         // Match that fail-closed behavior instead of merely filtering the
         // header.
-        if (response_policy_name_eq(resp.headers[i].name, "transfer-encoding", 17)) return false;
+        if (response_policy_name_eq(name, "transfer-encoding", 17)) return false;
     }
     Str reason{};
     if (!canonical_status_reason(resp.status_code, &reason)) return false;
@@ -12507,7 +12524,18 @@ void on_upstream_response(void* lp, Connection& conn, IoEvent ev) {
         }
         conn.resp_body_mode = BodyMode::ContentLength;
         conn.resp_body_remaining = resp.content_length;
-        conn.upstream_keep_alive = conn.response_policy_suppress_body ? false : conn.req_keep_alive;
+        // Mirror the transparent path's upstream-pooling gate (~12087 below):
+        // conn.req_keep_alive alone only says the *request* told the origin it
+        // may keep the connection open. The parsed response is the origin's
+        // actual answer, and an explicit `Connection: close` (or an HTTP/1.0
+        // response without keep-alive, though this profile requires 1.1 above)
+        // means the origin is about to close the socket regardless of what the
+        // request asked for. Ignoring that here let a keep-alive client's next
+        // request take a closing/dead socket from the idle pool.
+        conn.upstream_keep_alive =
+            conn.response_policy_suppress_body
+                ? false
+                : (conn.req_keep_alive && resp.keep_alive && !resp.connection_close);
         const u32 header_len = resp_parser.header_end;
         conn.upstream_send_len = header_len;
         conn.resp_body_sent = conn.response_header_buf.len();

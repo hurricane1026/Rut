@@ -1875,6 +1875,86 @@ TEST(response_policy, upstream_header_order_rejects_non_chunked_transfer_encodin
     }
 }
 
+// Codex round-8 review: Envoy's HeaderMapImpl stores Content-Type, Date and
+// Location as single-valued inline header slots and coalesces a duplicate
+// into the existing entry (comma-joined) rather than emitting it as a second
+// physical field. This profile forwards headers verbatim in upstream order
+// instead of rebuilding a HeaderMap, so it cannot reproduce that join --
+// forwarding both fields would put two physical `content-type` (or `date` /
+// `location`) lines on the wire, a shape no HTTP/1.1 client (or Envoy) ever
+// emits for these fields. It must fail closed (502) instead of guessing which
+// duplicate wins, mirroring how the Synthesized profile already fails closed
+// on inline fields it cannot coalesce (`strict_response_forbidden`).
+TEST(response_policy, upstream_header_order_rejects_duplicate_inline_headers) {
+    char server[] = "envoy";
+    ForwardResponsePolicySpec upstream_order{};
+    upstream_order.version = ResponsePolicyVersion::Http11;
+    upstream_order.framing = ResponsePolicyFraming::ContentLength;
+    upstream_order.connection = ResponsePolicyConnection::Request;
+    upstream_order.header_order = ResponsePolicyHeaderOrder::Upstream;
+    upstream_order.header_names = ResponsePolicyHeaderNames::Lowercase;
+    upstream_order.connection_header = ResponsePolicyConnectionHeader::CloseOnly;
+    upstream_order.status_reason = ResponsePolicyStatusReason::Canonical;
+    upstream_order.date = ResponsePolicyDate::PreserveOrCurrent;
+    upstream_order.server = {server, 5};
+    REQUIRE(response_policy_spec_valid(upstream_order));
+
+    RouteConfig config{};
+    REQUIRE_EQ(config.add_response_policy(upstream_order), 1u);
+
+    static constexpr const char* kUpstreams[] = {
+        // Two Content-Type fields.
+        "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 2\r\n"
+        "Content-Type: text/html\r\n\r\nhi",
+        // Two Date fields.
+        "HTTP/1.1 200 OK\r\nDate: Tue, 01 Jan 2030 00:00:00 GMT\r\nContent-Length: 2\r\n"
+        "Date: Wed, 02 Jan 2030 00:00:00 GMT\r\n\r\nhi",
+        // Two Location fields on a redirect this profile still forwards.
+        "HTTP/1.1 302 Found\r\nLocation: /a\r\nContent-Length: 2\r\nLocation: /b\r\n\r\nhi",
+    };
+    for (const char* upstream : kUpstreams) {
+        u8 header_storage[SlicePool::kSliceSize]{};
+        Connection conn{};
+        conn.reset();
+        conn.response_header_slice = header_storage;
+        conn.response_header_buf.bind(header_storage, sizeof(header_storage));
+        conn.response_policy_id = 1;
+        conn.keep_alive = true;
+        conn.req_client_keep_alive = true;
+
+        HttpResponseParser parser;
+        ParsedResponse response;
+        parser.reset();
+        response.reset();
+        const u32 len = static_cast<u32>(__builtin_strlen(upstream));
+        REQUIRE_EQ(parser.parse(reinterpret_cast<const u8*>(upstream), len, &response),
+                   ParseStatus::Complete);
+        CHECK_FALSE(build_strict_response_headers(conn, config, response));
+    }
+
+    // Sanity check: a single Content-Type/Date/Location each still succeeds,
+    // proving the rejection above is specific to the duplicate, not a
+    // regression that now blanket-rejects these fields.
+    static constexpr char kSingle[] =
+        "HTTP/1.1 302 Found\r\nContent-Type: text/plain\r\n"
+        "Date: Tue, 01 Jan 2030 00:00:00 GMT\r\nLocation: /a\r\nContent-Length: 2\r\n\r\nhi";
+    u8 header_storage[SlicePool::kSliceSize]{};
+    Connection conn{};
+    conn.reset();
+    conn.response_header_slice = header_storage;
+    conn.response_header_buf.bind(header_storage, sizeof(header_storage));
+    conn.response_policy_id = 1;
+    conn.keep_alive = true;
+    conn.req_client_keep_alive = true;
+    HttpResponseParser parser;
+    ParsedResponse response;
+    parser.reset();
+    response.reset();
+    REQUIRE_EQ(parser.parse(reinterpret_cast<const u8*>(kSingle), sizeof(kSingle) - 1u, &response),
+               ParseStatus::Complete);
+    REQUIRE(build_strict_response_headers(conn, config, response));
+}
+
 TEST(response_policy, failure_head_mode_config_copy_is_owned_and_deduplicated) {
     char reason[] = "Bad Gateway";
     char type[] = "text/plain";
@@ -14849,6 +14929,99 @@ TEST(upstream_reuse, capture_records_request_keep_alive) {
     c->recv_buf.write(reinterpret_cast<const u8*>(http10), sizeof(http10) - 1);
     rut::capture_request_metadata(*c);
     CHECK(!c->req_keep_alive);
+}
+
+// Codex round-8 review: the shared strict/upstream-order response-policy path
+// (`response_policy_id != 0` in on_upstream_response) used to compute
+// `conn.upstream_keep_alive` from the forwarded request's keep-alive intent
+// alone, ignoring the parsed response's own `Connection: close`. A keep-alive
+// client request whose origin replied with an explicit close would still have
+// its socket handed back to the idle pool, so the next request on the same
+// downstream connection could borrow a closing/dead upstream socket. Mirror
+// the transparent path's gate (`upstream_reuse.connection_close_request_not_pooled`
+// above): the response's own close signal must also veto reuse.
+TEST(upstream_reuse, upstream_order_profile_honors_response_connection_close) {
+    SmallLoop loop;
+    loop.setup();
+    RouteConfig cfg{};
+    REQUIRE(cfg.add_upstream("backend", 0x7F000001, 8080).has_value());
+    char server[] = "envoy";
+    ForwardResponsePolicySpec upstream_order{};
+    upstream_order.version = ResponsePolicyVersion::Http11;
+    upstream_order.framing = ResponsePolicyFraming::ContentLength;
+    upstream_order.connection = ResponsePolicyConnection::Request;
+    upstream_order.header_order = ResponsePolicyHeaderOrder::Upstream;
+    upstream_order.header_names = ResponsePolicyHeaderNames::Lowercase;
+    upstream_order.connection_header = ResponsePolicyConnectionHeader::CloseOnly;
+    upstream_order.status_reason = ResponsePolicyStatusReason::Canonical;
+    upstream_order.date = ResponsePolicyDate::PreserveOrCurrent;
+    upstream_order.server = {server, 5};
+    REQUIRE(response_policy_spec_valid(upstream_order));
+    REQUIRE_EQ(cfg.add_response_policy(upstream_order), 1u);
+
+    auto* conn = loop.alloc_conn();
+    REQUIRE(conn != nullptr);
+    struct ConnGuard {
+        SmallLoop* loop;
+        Connection* conn;
+        ~ConnGuard() {
+            if (conn != nullptr && (conn->fd >= 0 || conn->upstream_fd >= 0))
+                loop->close_conn(*conn);
+        }
+    } conn_guard{&loop, conn};
+
+    static constexpr char kRequest[] = "GET /x HTTP/1.1\r\nHost: client\r\n\r\n";
+    REQUIRE_EQ(conn->recv_buf.write(reinterpret_cast<const u8*>(kRequest), sizeof(kRequest) - 1),
+               sizeof(kRequest) - 1);
+    capture_request_metadata(*conn);
+    REQUIRE(conn->req_keep_alive);  // client asked to keep the connection alive
+    conn->request_config = &cfg;
+    conn->response_policy_id = 1;
+    conn->req_initial_send_len = conn->recv_buf.len();
+    conn->keep_alive = true;
+    REQUIRE(loop.alloc_upstream_buf(*conn));
+    REQUIRE(loop.alloc_response_header_buf(*conn));
+
+    // The origin's response is a self-framed HTTP/1.1 message that explicitly
+    // asks to close the connection after this reply.
+    static constexpr char kResponse[] =
+        "HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nhi";
+    REQUIRE_EQ(conn->upstream_recv_buf.write(reinterpret_cast<const u8*>(kResponse),
+                                             sizeof(kResponse) - 1),
+               sizeof(kResponse) - 1);
+    struct FdGuard {
+        i32 fd;
+        ~FdGuard() {
+            if (fd >= 0) close(fd);
+        }
+    } client_fd{dup(STDERR_FILENO)}, upstream_fd{dup(STDERR_FILENO)};
+    REQUIRE_GE(client_fd.fd, 0);
+    REQUIRE_GE(upstream_fd.fd, 0);
+    conn->fd = client_fd.fd;
+    conn->upstream_fd = upstream_fd.fd;
+    client_fd.fd = -1;
+    upstream_fd.fd = -1;
+    conn->upstream_slot_held = true;
+    conn->upstream_slot_uid = 0;
+    conn->upstream_recv_armed = true;
+    conn->upstream_send_armed = true;
+    conn->set_slots(
+        nullptr, nullptr, &on_upstream_response<SmallLoop>, &on_upstream_request_sent<SmallLoop>);
+    loop.backend.clear_ops();
+
+    on_upstream_response<SmallLoop>(
+        &loop,
+        *conn,
+        IoEvent{
+            conn->id, static_cast<i32>(sizeof(kResponse) - 1), 0, 0, IoEventType::UpstreamRecv, 0});
+
+    // The response was accepted and published downstream -- this is not a
+    // rejection test.
+    CHECK_EQ(conn->resp_status, 200u);
+    CHECK_EQ(loop.backend.count_ops(MockOp::Send), 1u);
+    // The origin explicitly asked to close: the upstream fd must never be
+    // pooled for reuse even though the client's own request was keep-alive.
+    CHECK_FALSE(conn->upstream_keep_alive);
 }
 
 // === RouteTable validation ===
