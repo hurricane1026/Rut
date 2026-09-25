@@ -1450,6 +1450,67 @@ bool envoy_log_confirms_listener(const std::string& contents) {
     return contents.find("starting main dispatch loop") != std::string::npos;
 }
 
+// Round-12 review, "Detect concurrent SO_REUSEPORT owners before accepting
+// readiness": `rut` sets SO_REUSEPORT on every listener it binds
+// (src/runtime/socket.cc:33-36), so a second, same-UID `rut` process racing
+// this harness for a probe-allocated port does not fail with EADDRINUSE the
+// way every other collision this harness detects does -- both binds
+// succeed, the losing process still logs the same "Listening on port N"
+// evidence, and the kernel load-balances new connections between the two,
+// so later pair-case traffic can land on whichever instance the kernel
+// happens to pick. Neither the protocol probe nor the log-confirmation
+// check above can tell the two apart: both are real, both answer
+// identically, both logged startup on this exact port.
+//
+// Counts how many rows of a /proc/net/tcp- or /proc/net/tcp6-style table are
+// in the LISTEN state (`st` field "0A", i.e. decimal 10) and bound to
+// `port`. Each row is a DISTINCT socket with its own inode column (the last
+// field), so more than one row for the same port means more than one live
+// listener holds it right now, whether or not they are in the same
+// SO_REUSEPORT group. Takes the table's TEXT, not a path, so it is
+// exercisable directly with synthetic tables, independent of the real
+// /proc filesystem.
+int count_listeners_on_port(const std::string& tcp_table, uint16_t port) {
+    char port_hex[8];
+    std::snprintf(port_hex, sizeof(port_hex), "%04X", port);
+    int count = 0;
+    std::istringstream lines(tcp_table);
+    std::string line;
+    bool skipped_header = false;
+    while (std::getline(lines, line)) {
+        if (!skipped_header) {
+            skipped_header = true;
+            continue;
+        }
+        std::istringstream fields(line);
+        std::string sl, local_address, rem_address, st;
+        if (!(fields >> sl >> local_address >> rem_address >> st)) continue;
+        if (st != "0A") continue;
+        const size_t colon = local_address.rfind(':');
+        if (colon == std::string::npos) continue;
+        std::string local_port = local_address.substr(colon + 1);
+        std::transform(
+            local_port.begin(), local_port.end(), local_port.begin(), [](unsigned char c) {
+                return static_cast<char>(std::toupper(c));
+            });
+        if (local_port == port_hex) count++;
+    }
+    return count;
+}
+
+// Live counterpart: sums count_listeners_on_port() over the real
+// /proc/net/tcp and /proc/net/tcp6 tables (a dual-stack socket appears in
+// exactly one of the two, never both, so this never double-counts a single
+// listener). Either table being missing or unreadable (no /proc, a
+// restrictive sandbox) contributes 0 rather than failing outright -- every
+// caller only ever treats a count ABOVE the one listener it expects as a
+// signal, so undercounting here can only make the check silently pass,
+// never falsely trigger a retry.
+int count_listeners_on_port(uint16_t port) {
+    return count_listeners_on_port(read_file_contents("/proc/net/tcp"), port) +
+           count_listeners_on_port(read_file_contents("/proc/net/tcp6"), port);
+}
+
 // Polls `port` until a TCP connect succeeds, failing early (without waiting
 // out `timeout_ms`) if `proc`'s child has already exited -- shared by the
 // Envoy and RUT readiness waits below (PR 6 adds the RUT side; `EnvoyInstance`
@@ -1512,8 +1573,12 @@ bool wait_ready(uint16_t port, EnvoyInstance& envoy, int timeout_ms, std::string
 // overall readiness deadline passes. A foreign listener that answers
 // differently (or not at all) never confirms, and a child that exits while
 // probing is caught immediately instead of waiting out the full deadline.
-bool wait_ready_and_confirm_ownership(
-    uint16_t port, EnvoyInstance& envoy, int timeout_ms, int grace_ms, std::string* error) {
+bool wait_ready_and_confirm_ownership(uint16_t port,
+                                      EnvoyInstance& envoy,
+                                      int timeout_ms,
+                                      int grace_ms,
+                                      std::string* error,
+                                      bool* reuseport_collision = nullptr) {
     const int64_t deadline = now_ms() + timeout_ms;
     if (!wait_ready(port, envoy, timeout_ms, error)) return false;
 
@@ -1555,6 +1620,20 @@ bool wait_ready_and_confirm_ownership(
         }
         if (probe_confirms_envoy_ownership(port, 1000, &probe_error) &&
             envoy_log_confirms_listener(read_file_contents(envoy.log_path))) {
+            // Round-12 review, "Detect concurrent SO_REUSEPORT owners before
+            // accepting readiness": both the protocol probe and the log
+            // confirmation just above can be satisfied identically by a
+            // second, real listener sharing this exact port -- see
+            // count_listeners_on_port()'s comment. Exactly one LISTEN row
+            // for `port` is the healthy case (this launch's own listener);
+            // more than one means a co-owner exists right now.
+            if (count_listeners_on_port(port) > 1) {
+                if (reuseport_collision != nullptr) *reuseport_collision = true;
+                *error = "more than one LISTEN socket is bound to port " + std::to_string(port) +
+                         " (a concurrent process shares it, e.g. via SO_REUSEPORT); a different "
+                         "process likely raced this port";
+                return false;
+            }
             return true;
         }
         if (now_ms() >= deadline) {
@@ -2873,11 +2952,19 @@ bool launch_envoy_with_port_retry(const std::string& dir,
             *error = "could not fork/exec docker run";
             return false;
         }
-        if (wait_ready_and_confirm_ownership(*listen_port, *envoy, 15'000, 300, error)) {
+        bool reuseport_collision = false;
+        if (wait_ready_and_confirm_ownership(
+                *listen_port, *envoy, 15'000, 300, error, &reuseport_collision)) {
             return true;
         }
 
-        const bool collided = log_indicates_address_in_use(envoy->log_path);
+        // Round-12 review, "Detect concurrent SO_REUSEPORT owners before
+        // accepting readiness": a co-owner detected by
+        // count_listeners_on_port() never leaves Envoy's own log naming an
+        // address-in-use collision (its bind() genuinely succeeded), so
+        // that signal alone is folded into `collided` here to take the
+        // same retry-on-a-fresh-port path as a real bind collision.
+        const bool collided = reuseport_collision || log_indicates_address_in_use(envoy->log_path);
         envoy->stop();
         if (!collided || attempt == kMaxListenPortAttempts) return false;
 
@@ -3048,14 +3135,31 @@ bool rut_probe_confirms_ownership(uint16_t port, RutInstance& rut, int64_t deadl
 // readiness. `confirm_ms` bounds the probe phase separately from
 // `timeout_ms` (which wait_ready() may already have spent waiting for the
 // initial TCP accept).
-bool wait_ready_and_confirm_ownership(
-    uint16_t port, RutInstance& rut, int timeout_ms, int confirm_ms, std::string* error) {
+bool wait_ready_and_confirm_ownership(uint16_t port,
+                                      RutInstance& rut,
+                                      int timeout_ms,
+                                      int confirm_ms,
+                                      std::string* error,
+                                      bool* reuseport_collision = nullptr) {
     if (!wait_ready(port, rut, timeout_ms, error)) return false;
     if (!rut_probe_confirms_ownership(port, rut, now_ms() + confirm_ms)) {
         *error =
             "did not observe rut's own HTTP local reply (404, server: envoy) on the listener "
             "port before the deadline; a different process likely won the bind race, or rut "
             "exited while this harness was confirming ownership";
+        return false;
+    }
+    // Round-12 review, "Detect concurrent SO_REUSEPORT owners before
+    // accepting readiness": `rut` sets SO_REUSEPORT on every listener it
+    // binds (src/runtime/socket.cc:33-36), so a second, same-UID `rut`
+    // sharing this exact port passes the probe above identically -- see
+    // count_listeners_on_port()'s comment. Exactly one LISTEN row for
+    // `port` is the healthy case; more than one means a co-owner exists.
+    if (count_listeners_on_port(port) > 1) {
+        if (reuseport_collision != nullptr) *reuseport_collision = true;
+        *error = "more than one LISTEN socket is bound to port " + std::to_string(port) +
+                 " (a concurrent rut process shares it via SO_REUSEPORT); a different process "
+                 "likely raced this port";
         return false;
     }
     return true;
@@ -3108,9 +3212,19 @@ bool launch_rut_with_port_retry(const std::string& dir,
             *error = "could not fork/exec rut";
             return false;
         }
-        if (wait_ready_and_confirm_ownership(*listen_port, *rut, 15'000, 5'000, error)) return true;
+        bool reuseport_collision = false;
+        if (wait_ready_and_confirm_ownership(
+                *listen_port, *rut, 15'000, 5'000, error, &reuseport_collision))
+            return true;
 
-        const bool collided = rut_log_indicates_address_in_use(rut->log_path);
+        // Round-12 review, "Detect concurrent SO_REUSEPORT owners before
+        // accepting readiness": a co-owner detected by
+        // count_listeners_on_port() never leaves rut's own log naming an
+        // address-in-use collision (its bind() genuinely succeeded), so
+        // that signal alone is folded into `collided` here to take the
+        // same retry-on-a-fresh-port path as a real bind collision.
+        const bool collided =
+            reuseport_collision || rut_log_indicates_address_in_use(rut->log_path);
         rut->stop();
         if (!collided || attempt == kMaxListenPortAttempts) return false;
 
@@ -3395,6 +3509,30 @@ bool compare_pair_case(const PairCaseResult& c) {
     return match;
 }
 
+// Round-12 review, "Prevent record-only crashes from failing pair mode":
+// classifies a proxy `stop()` failure observed by either phase of
+// run_pair_milestone_s() -- called ONLY after that phase's asserted batch
+// has already run to completion and had its own upstream evidence captured
+// and validated (`fill_upstream_bytes()` for `asserted_cases`, which stays
+// fatal on its own) -- as a non-fatal NOTE rather than a hard failure. A
+// proxy crash that happened during (or before) the asserted batch is
+// already caught independently: the affected asserted case's own exchange
+// would be incomplete, which compare_pair_case()'s `both_complete` check
+// turns into an asserted MISMATCH regardless of this function. So a
+// `stop()` failure reaching here can only mean the proxy died during or
+// after the record-only batch, which the CLI contract says must never gate
+// acceptance (`any_asserted_mismatch` in run_pair_milestone_s()) -- note it
+// and mark every record-only result ambiguous instead.
+void note_record_only_phase_crash(const char* proxy_label,
+                                  const std::string& unexpected_exit_description,
+                                  std::vector<CaseResult>* record_only_results) {
+    std::cerr << "NOTE: " << proxy_label
+              << " exited unexpectedly during or after the record-only batch ("
+              << unexpected_exit_description
+              << "); asserted evidence was already captured, so this does not fail the run\n";
+    for (auto& r : *record_only_results) r.upstream_ambiguous = true;
+}
+
 int run_pair_milestone_s(const std::string& rut_binary,
                          const std::string& converter_binary,
                          const std::string& transcript_path) {
@@ -3508,12 +3646,16 @@ int run_pair_milestone_s(const std::string& rut_binary,
         // its "Either anomaly ... is only made fatal ... for an asserted
         // case" comment) -- the return value needs no check.
         fill_upstream_bytes(&envoy_record_only_results, record_only_cases, upstream);
+        // Round-12 review, "Prevent record-only crashes from failing pair
+        // mode": the asserted batch's own evidence was already validated by
+        // fill_upstream_bytes() above (still fatal), before Envoy ever saw
+        // the record-only batch's traffic -- so a stop() failure observed
+        // only here can only mean Envoy died during or after the
+        // record-only batch, which must never fail the run.
         if (!envoy.stop()) {
-            std::cerr << "FAIL: envoy exited unexpectedly before teardown ("
-                      << envoy.unexpected_exit_description << ")\n";
             dump_log(envoy.log_path);
-            upstream.stop();
-            return 1;
+            note_record_only_phase_crash(
+                "envoy", envoy.unexpected_exit_description, &envoy_record_only_results);
         }
         if (!wait_port_closed(listen_port1, 5000)) {
             std::cerr << "FAIL: listener port " << listen_port1
@@ -3560,11 +3702,16 @@ int run_pair_milestone_s(const std::string& rut_binary,
         fill_upstream_bytes(&rut_record_only_results, record_only_cases, upstream);
         const bool rut_stopped_cleanly = rut.stop();
         upstream.stop();
+        // Round-12 review, "Prevent record-only crashes from failing pair
+        // mode": same reasoning as the Envoy phase above -- `rut_asserted_ok`
+        // already validated the asserted batch's own evidence before RUT
+        // ever saw the record-only batch's traffic, so a stop() failure
+        // observed only here can only mean RUT died during or after the
+        // record-only batch, which must never fail the run.
         if (!rut_stopped_cleanly) {
-            std::cerr << "FAIL: rut exited unexpectedly before teardown ("
-                      << rut.unexpected_exit_description << ")\n";
             dump_rut_log(rut.log_path);
-            return 1;
+            note_record_only_phase_crash(
+                "rut", rut.unexpected_exit_description, &rut_record_only_results);
         }
         if (!rut_asserted_ok) return 1;
         auto rut_results = std::move(rut_asserted_results);
@@ -4937,6 +5084,148 @@ bool self_test_rut_log_confirms_listener() {
     return ok;
 }
 
+// Round-12 review, "Detect concurrent SO_REUSEPORT owners before accepting
+// readiness": exercises count_listeners_on_port(const std::string&,
+// uint16_t) directly against synthetic /proc/net/tcp[6]-shaped tables,
+// independent of the real /proc filesystem -- an empty table, a single
+// LISTEN row, two LISTEN rows on the same port (the reuseport-group shape,
+// alongside a non-LISTEN row and a different-port row that must not be
+// counted), and a tcp6-shaped v4-mapped row.
+bool self_test_count_listeners_on_port() {
+    bool ok = true;
+    const char* kHeader =
+        "  sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt   uid  "
+        "timeout inode\n";
+    {
+        const int count = count_listeners_on_port(std::string(kHeader), 0x1F90);
+        if (count != 0) {
+            std::cerr << "FAIL [self-test count listeners]: header-only table reported " << count
+                      << ", expected 0\n";
+            ok = false;
+        }
+    }
+    {
+        const std::string table =
+            std::string(kHeader) +
+            "   0: 0100007F:1F90 00000000:0000 0A 00000000:00000000 00:00000000 00000000  1000  "
+            "      0 12345 1 0000000000000000 100 0 0 10 0\n";
+        const int count = count_listeners_on_port(table, 0x1F90);
+        if (count != 1) {
+            std::cerr << "FAIL [self-test count listeners]: single-listener table reported "
+                      << count << ", expected 1\n";
+            ok = false;
+        }
+    }
+    {
+        // Row 0 and row 1: two LISTEN sockets sharing port 0x1F90 (the
+        // reuseport-group shape). Row 2: an ESTABLISHED (st 01) row on the
+        // same port, which must not count. Row 3: a LISTEN row on a
+        // different port (0x2710), which must not count either.
+        const std::string table =
+            std::string(kHeader) +
+            "   0: 0100007F:1F90 00000000:0000 0A 00000000:00000000 00:00000000 00000000  1000  "
+            "      0 12345 1 0000000000000000 100 0 0 10 0\n"
+            "   1: 0100007F:1F90 00000000:0000 0A 00000000:00000000 00:00000000 00000000  1000  "
+            "      0 12346 1 0000000000000000 100 0 0 10 0\n"
+            "   2: 0100007F:1F90 0200007F:1234 01 00000000:00000000 00:00000000 00000000  1000  "
+            "      0 12347 1 0000000000000000 100 0 0 10 0\n"
+            "   3: 0100007F:2710 00000000:0000 0A 00000000:00000000 00:00000000 00000000  1000  "
+            "      0 12348 1 0000000000000000 100 0 0 10 0\n";
+        const int count = count_listeners_on_port(table, 0x1F90);
+        if (count != 2) {
+            std::cerr << "FAIL [self-test count listeners]: two-owner table reported " << count
+                      << ", expected 2\n";
+            ok = false;
+        }
+    }
+    {
+        // tcp6-shaped table with a 128-bit v4-mapped address; only the port
+        // suffix after the last ':' is parsed, so the wider address field
+        // does not need special-casing.
+        const std::string table6 =
+            "  sl  local_address                         remote_address                        "
+            "st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode\n"
+            "   0: 00000000000000000000000000000000:1F90 "
+            "00000000000000000000000000000000:0000 0A 00000000:00000000 00:00000000 00000000  "
+            "1000        0 12349 1 0000000000000000 100 0 0 10 0\n";
+        const int count = count_listeners_on_port(table6, 0x1F90);
+        if (count != 1) {
+            std::cerr << "FAIL [self-test count listeners]: tcp6-shaped table reported " << count
+                      << ", expected 1\n";
+            ok = false;
+        }
+    }
+    if (ok) std::cerr << "PASS [self-test count listeners]\n";
+    return ok;
+}
+
+// Live counterpart: opens two real SO_REUSEPORT listeners on the exact same
+// loopback port -- precisely the shape a concurrent same-UID `rut` produces
+// against a probe-allocated port (src/runtime/socket.cc:33-36) -- and
+// confirms count_listeners_on_port(uint16_t) (the /proc/net/tcp[6] live
+// reader) reports 2, not 1, for it.
+bool self_test_count_listeners_on_port_live_reuseport() {
+    const int fd1 = socket(AF_INET, SOCK_STREAM, 0);
+    if (fd1 < 0) {
+        std::cerr << "FAIL [self-test count listeners live]: could not create the first socket\n";
+        return false;
+    }
+    const int one = 1;
+    setsockopt(fd1, SOL_SOCKET, SO_REUSEPORT, &one, sizeof(one));
+    setsockopt(fd1, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
+    sockaddr_in addr1{};
+    addr1.sin_family = AF_INET;
+    addr1.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    addr1.sin_port = 0;
+    if (bind(fd1, reinterpret_cast<sockaddr*>(&addr1), sizeof(addr1)) != 0 ||
+        listen(fd1, 16) != 0) {
+        std::cerr << "FAIL [self-test count listeners live]: could not bind/listen the first "
+                     "SO_REUSEPORT socket\n";
+        close(fd1);
+        return false;
+    }
+    socklen_t len1 = sizeof(addr1);
+    if (getsockname(fd1, reinterpret_cast<sockaddr*>(&addr1), &len1) != 0) {
+        std::cerr << "FAIL [self-test count listeners live]: getsockname failed\n";
+        close(fd1);
+        return false;
+    }
+    const uint16_t port = ntohs(addr1.sin_port);
+
+    const int fd2 = socket(AF_INET, SOCK_STREAM, 0);
+    if (fd2 < 0) {
+        std::cerr << "FAIL [self-test count listeners live]: could not create the second socket\n";
+        close(fd1);
+        return false;
+    }
+    setsockopt(fd2, SOL_SOCKET, SO_REUSEPORT, &one, sizeof(one));
+    setsockopt(fd2, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
+    sockaddr_in addr2{};
+    addr2.sin_family = AF_INET;
+    addr2.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    addr2.sin_port = htons(port);
+    bool ok = true;
+    if (bind(fd2, reinterpret_cast<sockaddr*>(&addr2), sizeof(addr2)) != 0 ||
+        listen(fd2, 16) != 0) {
+        std::cerr << "FAIL [self-test count listeners live]: could not bind/listen a second "
+                     "SO_REUSEPORT socket on the same port -- SO_REUSEPORT may be unsupported "
+                     "here\n";
+        ok = false;
+    } else {
+        const int count = count_listeners_on_port(port);
+        if (count != 2) {
+            std::cerr << "FAIL [self-test count listeners live]: expected 2 live listeners on "
+                         "port "
+                      << port << ", got " << count << "\n";
+            ok = false;
+        }
+    }
+    close(fd1);
+    close(fd2);
+    if (ok) std::cerr << "PASS [self-test count listeners live]\n";
+    return ok;
+}
+
 // Covers round-7 review thread P2 ("Keep the connect-failure port
 // reserved"): allocate_reserved_closed_port() must hold the port so no other
 // bind can claim it, while still producing "connection refused" semantics
@@ -5786,6 +6075,107 @@ bool self_test_pair_exempt_cases_nonzero_contact_rejected() {
         }
     }
     if (ok) std::cerr << "PASS [self-test pair exempt nonzero-contact]\n";
+    return ok;
+}
+
+// Round-12 review, "Prevent record-only crashes from failing pair mode": a
+// fake proxy that serves exactly one connection (standing in for the single
+// asserted case run against it below) and then exits on its own -- never
+// accepting a second connection, standing in for a crash during or right
+// after the asserted batch, before the record-only batch could complete --
+// must not turn into a fatal run_pair_milestone_s() outcome. This drives
+// the exact sequence run_pair_milestone_s()'s Envoy/RUT phases now follow:
+// run the asserted batch, then the record-only batch, then stop() the
+// proxy and hand a failure to note_record_only_phase_crash() instead of
+// returning fatal.
+bool self_test_pair_record_only_crash_is_a_note() {
+    BoundPort bound;
+    if (!allocate_bound_loopback_port(&bound)) {
+        std::cerr << "FAIL [self-test pair record-only crash]: could not allocate a loopback "
+                     "port\n";
+        return false;
+    }
+    const uint16_t port = bound.port;
+    // Advertises `Connection: close`: the fake proxy below closes the
+    // connection right after replying (standing in for its own exit), and
+    // read_http_message() treats an EOF on a response that did NOT
+    // advertise close as a persistence violation rather than completion.
+    const std::string reply = "HTTP/1.1 200 OK\r\nConnection: close\r\nContent-Length: 2\r\n\r\nhi";
+
+    const pid_t fake_proxy = fork();
+    if (fake_proxy < 0) {
+        std::cerr << "FAIL [self-test pair record-only crash]: fork failed\n";
+        close(bound.fd);
+        return false;
+    }
+    if (fake_proxy == 0) {
+        // Serve exactly one connection (the asserted case below), then exit
+        // without ever accepting a second -- the record-only case's
+        // connection attempt finds nothing listening, exactly like a crash
+        // that happened during or right after the asserted batch.
+        const int fd = accept(bound.fd, nullptr, nullptr);
+        if (fd >= 0) {
+            char buf[512];
+            const ssize_t ignored = recv(fd, buf, sizeof(buf), 0);
+            (void)ignored;
+            send_all(fd, reply);
+            close(fd);
+        }
+        _exit(1);
+    }
+    close(bound.fd);
+
+    RutInstance rut;
+    rut.pid = fake_proxy;
+    rut.log_path = "/dev/null";
+
+    const std::vector<CaseSpec> asserted_cases = {
+        {"get_smoke", "GET /smoke HTTP/1.1\r\nHost: t.example\r\n\r\n", false, "/smoke", reply}};
+    const std::vector<CaseSpec> record_only_cases = {
+        {"get_forged_xfcc",
+         "GET /xfcc HTTP/1.1\r\nHost: t.example\r\n\r\n",
+         false,
+         "/xfcc",
+         reply}};
+
+    auto asserted_results = run_case_batch(port, asserted_cases);
+    bool ok = true;
+    if (asserted_results.size() != 1 || !asserted_results[0].exchange_complete) {
+        std::cerr << "FAIL [self-test pair record-only crash]: the asserted case's own exchange "
+                     "did not complete before the fake proxy exited\n";
+        ok = false;
+    }
+
+    // By now the fake proxy has served its one connection and is exiting
+    // (or has already exited); this stands in for the record-only batch
+    // running against a proxy that died during or right after the asserted
+    // batch.
+    auto record_only_results = run_case_batch(port, record_only_cases);
+    if (record_only_results.size() != 1) {
+        std::cerr << "FAIL [self-test pair record-only crash]: expected exactly one record-only "
+                     "result\n";
+        ok = false;
+    }
+
+    const bool stopped_cleanly = rut.stop();
+    if (stopped_cleanly) {
+        std::cerr << "FAIL [self-test pair record-only crash]: stop() reported a clean teardown "
+                     "for a proxy that exited on its own\n";
+        ok = false;
+    } else {
+        note_record_only_phase_crash(
+            "fake-proxy", rut.unexpected_exit_description, &record_only_results);
+    }
+    if (!record_only_results.empty() && !record_only_results[0].upstream_ambiguous) {
+        std::cerr << "FAIL [self-test pair record-only crash]: the record-only case was not "
+                     "marked ambiguous after the post-batch crash note\n";
+        ok = false;
+    }
+    // The property under test is precisely that nothing above ever returns
+    // (or would need to return) a fatal outcome for run_pair_milestone_s():
+    // reaching this line at all, with `ok` still reflecting only the
+    // evidence checks above, is the pass condition.
+    if (ok) std::cerr << "PASS [self-test pair record-only crash]\n";
     return ok;
 }
 
@@ -6767,6 +7157,8 @@ int run_self_test(const std::string& rut_binary, const std::string& converter_bi
     ok &= self_test_envoy_instance_skips_docker_when_unlaunched();
     ok &= self_test_rut_wait_ready_ownership();
     ok &= self_test_rut_log_confirms_listener();
+    ok &= self_test_count_listeners_on_port();
+    ok &= self_test_count_listeners_on_port_live_reuseport();
     ok &= self_test_reserved_closed_port();
     ok &= self_test_duplicate_upstream_rejected();
     ok &= self_test_duplicate_upstream_record_only_not_fatal();
@@ -6782,6 +7174,7 @@ int run_self_test(const std::string& rut_binary, const std::string& converter_bi
     ok &= self_test_pair_unexercised_forwarding_rejected();
     ok &= self_test_pair_exempt_cases_zero_contact_matches();
     ok &= self_test_pair_exempt_cases_nonzero_contact_rejected();
+    ok &= self_test_pair_record_only_crash_is_a_note();
     ok &= self_test_accept_unblocks_on_shutdown_close();
     ok &= self_test_head_body_detected();
     ok &= self_test_head_grace_reset_detected();
