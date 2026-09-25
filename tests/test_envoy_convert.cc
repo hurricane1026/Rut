@@ -560,6 +560,24 @@ std::string routes_scenario_g_json() {
         json_array({cluster_json("backend", 9000), cluster_json("health_backend", 9001)}));
 }
 
+// (h) same shape as (f) -- exact path "/api" declared before its own prefix
+// "/api/" -- but with the identical exact route repeated a third time,
+// AFTER the prefix. Codex round-10 review: the `saw_own_prefix` branch of
+// `build_node_plan`'s own-literal handling (src/envoy/converter.cc) used to
+// bypass `has_exact_arm` and append this repeat as a second, dead terminal
+// arm (plus its own duplicated forwarding policy) instead of dropping it as
+// unreachable -- Envoy's first-match semantics already resolved bare
+// "/api" through the FIRST exact route, before the prefix or this repeat
+// are ever reached. Same clusters/targets as scenario (f), so the lowered
+// output must be byte-identical to (f)'s.
+std::string routes_scenario_h_json() {
+    return route_list_json(
+        json_array({path_route_json("/api", "exact_backend"),
+                    prefix_route_json("/api/", "api_backend"),
+                    path_route_json("/api", "exact_backend")}),
+        json_array({cluster_json("exact_backend", 9001), cluster_json("api_backend", 9002)}));
+}
+
 // ── Brute-force equivalence: Envoy first-match vs. the lowered structure ──
 //
 // A route-list model used only by the two independent simulations below (not
@@ -2134,6 +2152,49 @@ TEST(envoy_convert, api_forged_multi_route_model_rejected) {
     CHECK(forged_route_count_result.error().code == FrontendError::UnexpectedToken);
     CHECK(to_string(forged_route_count_result.error().detail).find("bounded capacity") !=
           std::string::npos);
+
+    // Codex round-10 review: `parse_cluster` parses `connect_timeout` with
+    // `parse_duration(..., /*allow_zero=*/false)`, so a non-positive
+    // duration never survives real parsing; a hand-built model with a
+    // newly-supported SECOND cluster (index 1, this PR's multi-cluster
+    // lowering) whose `connect_timeout.milliseconds` is zero used to lower
+    // successfully, emitting an `upstream ...` line for a cluster Envoy
+    // itself would reject at startup.
+    envoy::Bootstrap forged_later_connect_timeout = parsed.value();
+    forged_later_connect_timeout.clusters[1].connect_timeout.milliseconds = 0u;
+    const auto forged_later_connect_timeout_result =
+        envoy::lower_to_rut(forged_later_connect_timeout, all_true);
+    CHECK_FALSE(forged_later_connect_timeout_result);
+    CHECK(forged_later_connect_timeout_result.error().code == FrontendError::UnexpectedToken);
+    // The cascade from #692's round-10 fix (src/envoy/converter.cc) reuses
+    // that model's own "duration must be positive" diagnostic text here
+    // rather than a route-list-specific rewording, so both lineages share
+    // one message for the same underlying invariant.
+    CHECK(to_string(forged_later_connect_timeout_result.error().detail)
+              .find("duration must be positive") != std::string::npos);
+
+    // Codex round-10 review, ported alongside connect_timeout for cascade
+    // parity with the single-cluster model: `parse_virtual_host`/`parse_hcm`
+    // both parse their `name`/`stat_prefix` fields with `name_string(...,
+    // /*allow_empty=*/false, ...)`, so a hand-built model clearing either
+    // must not lower successfully either, even though neither value is
+    // copied into the generated RUT text.
+    envoy::Bootstrap empty_virtual_host_name = parsed.value();
+    empty_virtual_host_name.listener.filter_chain.hcm.route_config.virtual_host.name = Str{};
+    const auto empty_virtual_host_name_result =
+        envoy::lower_to_rut(empty_virtual_host_name, all_true);
+    CHECK_FALSE(empty_virtual_host_name_result);
+    CHECK(empty_virtual_host_name_result.error().code == FrontendError::UnexpectedToken);
+    CHECK(to_string(empty_virtual_host_name_result.error().detail)
+              .find("virtual host name must be a non-empty string") != std::string::npos);
+
+    envoy::Bootstrap empty_stat_prefix = parsed.value();
+    empty_stat_prefix.listener.filter_chain.hcm.stat_prefix = Str{};
+    const auto empty_stat_prefix_result = envoy::lower_to_rut(empty_stat_prefix, all_true);
+    CHECK_FALSE(empty_stat_prefix_result);
+    CHECK(empty_stat_prefix_result.error().code == FrontendError::UnexpectedToken);
+    CHECK(to_string(empty_stat_prefix_result.error().detail)
+              .find("stat_prefix must be a non-empty string") != std::string::npos);
 }
 
 TEST(envoy_convert, colon_segment_allowed_in_exact_path_with_root_prefix) {
@@ -2607,6 +2668,39 @@ TEST(envoy_convert, golden_routes_g_duplicate_exact_deduped) {
     const auto lexed = lex((*lowered).value().view());
     REQUIRE(lexed);
     CHECK_EQ(lexed.value().tokens.len, 668u);
+    CHECK_LT(lexed.value().tokens.len, LexedTokens::kMaxTokens);
+}
+
+// Codex round-10 review: exact "/api" declared before its own prefix
+// "/api/", then the identical exact route repeated a THIRD time after the
+// prefix (routes_scenario_h_json above). The repeat is unreachable the same
+// way scenario (g)'s pre-prefix duplicate is, so this must lower to output
+// byte-identical to scenario (f)'s (own-literal-then-prefix, no repeat) and
+// stay comfortably within the real lexer's token budget -- confirming
+// `has_exact_arm` now also guards the post-own-prefix terminal-arm path in
+// `build_node_plan`, not just the pre-own-prefix conditional-arm path.
+TEST(envoy_convert, golden_routes_h_repeated_exact_after_prefix_deduped) {
+    const std::string text_f = routes_scenario_f_json();
+    static envoy::JsonDocument doc_f;
+    auto parsed_f = envoy::parse_bootstrap_json(str(text_f), doc_f);
+    REQUIRE(parsed_f);
+    const envoy::RutCapabilities all_true{true, true, true};
+    auto lowered_f = lower_heap(parsed_f.value(), all_true);
+    REQUIRE(*lowered_f);
+
+    const std::string text_h = routes_scenario_h_json();
+    static envoy::JsonDocument doc_h;
+    auto parsed_h = envoy::parse_bootstrap_json(str(text_h), doc_h);
+    REQUIRE(parsed_h);
+    REQUIRE_EQ(parsed_h.value().listener.filter_chain.hcm.route_config.virtual_host.routes.len, 3u);
+    auto lowered_h = lower_heap(parsed_h.value(), all_true);
+    REQUIRE(*lowered_h);
+
+    REQUIRE_EQ((*lowered_h).value().len, (*lowered_f).value().len);
+    CHECK((*lowered_h).value().view().eq((*lowered_f).value().view()));
+
+    const auto lexed = lex((*lowered_h).value().view());
+    REQUIRE(lexed);
     CHECK_LT(lexed.value().tokens.len, LexedTokens::kMaxTokens);
 }
 

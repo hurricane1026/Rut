@@ -460,9 +460,27 @@ are recorded from the pinned Envoy build, not assumed.
   `/`").
 - Routes are evaluated in list order, first match wins; Rut's own route trie
   instead selects the longest matching declared prefix. Rather than reject
-  lists where these two orders could disagree, the converter reconciles them
-  by construction (owner decision D3): every ordered route list is lowered,
-  never rejected for its shape alone (increment 4, PR 8). For each RUT route
+  every list where these two orders could disagree, the converter reconciles
+  them by construction (owner decision D3, increment 4 / PR 8): it does not
+  reject a route list merely because Envoy's declaration order and Rut's
+  longest-prefix selection would otherwise pick different arms. That
+  reconciliation is necessary but not sufficient for a given list to lower
+  successfully — some shapes still fail closed for reasons unrelated to
+  ordering, each already covered by its own test
+  (`tests/test_envoy_convert.cc`): a lone `prefix: "/api/"` with no catch-all
+  (or one preceded only by an exact route under a *different* literal) has
+  no Envoy route at all for its own bare literal path, a genuine 404 with no
+  RUT form (`blocked_on_node_own_literal_needs_all_method_fallback`,
+  `blocked_on_shadowed_exact_needs_all_method_fallback` — see the
+  node's-own-literal paragraph below); a root with exact routes but no
+  catch-all hits the same no-RUT-form-for-a-404 problem at its own
+  fallthrough (`blocked_root_exact_arms_without_catch_all`); and any
+  otherwise-valid list can still exceed the compiler frontend's lexer token
+  budget (`token_budget_goldens_match_the_real_lexer`,
+  `golden_routes_a_prefix_then_root` — see the token-budget bullet below).
+  docs/envoy-compatibility.md's increment-4 rows record the exact status
+  (BLOCKED_BY_RUT or the token-budget PARTIAL) for each of these. For each
+  RUT route
   entry ("node" — `"/"` plus, for every other declared `prefix`, that prefix
   with its trailing `/` removed), the converter walks Envoy's route list in
   declared order and builds a nested `if`/`else` chain that reproduces
