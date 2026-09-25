@@ -510,6 +510,8 @@ public:
         return it == requests_by_path_.end() ? std::vector<std::string>{} : it->second;
     }
 
+    // Idempotent: safe to call more than once (the destructor calls it again
+    // after an explicit stop()).
     void stop() {
         stopping_.store(true);
         if (listen_fd_ >= 0) {
@@ -518,11 +520,39 @@ public:
             listen_fd_ = -1;
         }
         if (accept_thread_.joinable()) accept_thread_.join();
+        // Unblock every still-running handler (each is parked in poll()/recv()
+        // on its own fd) and join it before this object's mutex and maps go
+        // away underneath it. Only shutdown() here, never close(): each
+        // handler thread closes its own fd exactly once via finish_connection,
+        // so a stale/reused fd number is never touched from this thread.
+        std::vector<std::thread> threads_to_join;
+        {
+            std::lock_guard<std::mutex> lock(conn_mu_);
+            for (const int fd : active_fds_) shutdown(fd, SHUT_RDWR);
+            active_fds_.clear();
+            threads_to_join.swap(conn_threads_);
+        }
+        for (std::thread& t : threads_to_join) {
+            if (t.joinable()) t.join();
+        }
     }
 
     ~RecordingUpstream() { stop(); }
 
 private:
+    // Removes fd from the active-connection bookkeeping and closes it. Called
+    // exactly once per connection, from that connection's own handler thread,
+    // regardless of which return path in handle_connection triggered it (see
+    // ConnGuard below).
+    void finish_connection(int fd) {
+        {
+            std::lock_guard<std::mutex> lock(conn_mu_);
+            active_fds_.erase(std::remove(active_fds_.begin(), active_fds_.end(), fd),
+                              active_fds_.end());
+        }
+        close(fd);
+    }
+
     void accept_loop() {
         while (!stopping_.load()) {
             const int fd = accept(listen_fd_, nullptr, nullptr);
@@ -530,7 +560,9 @@ private:
                 if (stopping_.load()) return;
                 continue;
             }
-            std::thread(&RecordingUpstream::handle_connection, this, fd).detach();
+            std::lock_guard<std::mutex> lock(conn_mu_);
+            active_fds_.push_back(fd);
+            conn_threads_.emplace_back(&RecordingUpstream::handle_connection, this, fd);
         }
     }
 
@@ -539,7 +571,18 @@ private:
         return q == std::string::npos ? target : target.substr(0, q);
     }
 
+    // Guarantees finish_connection(fd) runs exactly once, on whichever return
+    // path handle_connection takes (including the ones taken when stop()
+    // shuts the fd down from another thread), without editing every return
+    // site.
+    struct ConnGuard {
+        RecordingUpstream* self;
+        int fd;
+        ~ConnGuard() { self->finish_connection(fd); }
+    };
+
     void handle_connection(int fd) {
+        ConnGuard guard{this, fd};
         std::string buf;
         char chunk[4096];
         for (;;) {
@@ -549,12 +592,10 @@ private:
                 if (header_end != std::string::npos) break;
                 pollfd pfd{fd, POLLIN, 0};
                 if (poll(&pfd, 1, 5000) <= 0) {
-                    close(fd);
                     return;
                 }
                 const ssize_t n = recv(fd, chunk, sizeof(chunk), 0);
                 if (n <= 0) {
-                    close(fd);
                     return;
                 }
                 buf.append(chunk, static_cast<size_t>(n));
@@ -572,12 +613,10 @@ private:
             while (buf.size() < total) {
                 pollfd pfd{fd, POLLIN, 0};
                 if (poll(&pfd, 1, 5000) <= 0) {
-                    close(fd);
                     return;
                 }
                 const ssize_t n = recv(fd, chunk, sizeof(chunk), 0);
                 if (n <= 0) {
-                    close(fd);
                     return;
                 }
                 buf.append(chunk, static_cast<size_t>(n));
@@ -601,7 +640,6 @@ private:
                 reply = it == replies_.end() ? default_reply_ : it->second;
             }
             if (!send_all(fd, reply)) {
-                close(fd);
                 return;
             }
             std::string connection_value;
@@ -612,7 +650,6 @@ private:
                            [](unsigned char c) { return std::tolower(c); });
             buf.erase(0, total);
             if (connection_value.find("close") != std::string::npos) {
-                close(fd);
                 return;
             }
         }
@@ -624,6 +661,12 @@ private:
     std::mutex mu_;
     std::map<std::string, std::vector<std::string>> requests_by_path_;
     std::map<std::string, std::string> replies_;
+    // Bookkeeping for connections currently inside handle_connection, so
+    // stop() can unblock and join every one of them instead of only the
+    // accept thread (see stop()/finish_connection()/ConnGuard above).
+    std::mutex conn_mu_;
+    std::vector<int> active_fds_;
+    std::vector<std::thread> conn_threads_;
     std::string default_reply_ =
         "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 5\r\n\r\nhello";
 };
@@ -761,6 +804,7 @@ const char kBootstrapTemplate[] = R"json({
 "typed_config": {
 "@type": "type.googleapis.com/envoy.extensions.filters.network.http_connection_manager.v3.HttpConnectionManager",
 "stat_prefix": "ingress",
+"codec_type": "HTTP1",
 "generate_request_id": false,
 "route_config": {"name": "local", "virtual_hosts": [{
 "name": "all",
