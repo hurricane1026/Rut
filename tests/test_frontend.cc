@@ -35533,8 +35533,12 @@ TEST(frontend, failure_policy_head_mode_is_owned_deduplicated_and_printed) {
     rir::print_module(buf, module);
     static constexpr char expected[] =
         "failure_policies: 2\n"
-        "  failure_policy#1: head_mode=reject\n"
-        "  failure_policy#2: head_mode=suppress_body\n";
+        "  failure_policy#1: version=HTTP/1.1, status=502, reason=\"Bad Gateway\", "
+        "server=\"rut\", content_type=\"text/plain\", date=current, connection=request, "
+        "head_mode=reject, header_order=synthesized, body=b\"unavailable\" (len=11)\n"
+        "  failure_policy#2: version=HTTP/1.1, status=502, reason=\"Bad Gateway\", "
+        "server=\"rut\", content_type=\"text/plain\", date=current, connection=request, "
+        "head_mode=suppress_body, header_order=synthesized, body=b\"unavailable\" (len=11)\n";
     CHECK_FALSE(buf.overflow);
     CHECK_EQ(buf.len, static_cast<u32>(sizeof(expected) - 1));
     CHECK(__builtin_memcmp(buf.data, expected, sizeof(expected) - 1) == 0);
