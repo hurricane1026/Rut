@@ -137,11 +137,14 @@ bool put_unmatched(Writer& w) {
 }
 
 // One `route exact "<node_text>" { return local_response(...) }` — the same
-// fixed 404 shape as `put_unmatched`, used when a node's own prefix action
-// never matches the literal node path (see the algorithm doc comment below,
-// "genuine 404"). `local_response` bodies are always empty here, so unlike
-// `forward(...)` this never needs a HEAD-specific variant (see the algorithm
-// comment, "No HEAD split needed for `route exact` 404 fallbacks").
+// fixed 404 shape as `put_unmatched`. NOT CURRENTLY CALLED: `build_node_plan`
+// (below) used to request this whenever a node's own prefix action never
+// matched its literal node path, but its ANY-method strict local-response
+// admission cannot serve every method Envoy's real no-route 404 would
+// (Codex P1: TRACE/CONNECT close the connection instead), so lowering fails
+// closed for that shape instead (see the algorithm doc comment, "Remainder").
+// Kept for the day an all-method local_response surface makes it usable
+// again.
 bool put_route_exact_404(Writer& w, Str node_text) {
     if (!w.put_cstr("route exact \"") || !w.put_escaped(node_text) || !w.put_cstr("\" {\n"))
         return false;
@@ -280,37 +283,41 @@ bool put_forward_call(Writer& w, u32 cluster_index, bool include_head_mode) {
 // that point the only request value that has not been accounted for is the
 // literal path `p == N` itself: N's own prefix action never matches it
 // (established above), no ancestor arm exists anywhere in the route list
-// (else it would have terminated the chain earlier), and no exact route for
-// `q == N` was ever declared (else it would have resolved the chain, per the
-// bullet above). `req.pathOnly == "N"` therefore has no Envoy route at all —
-// a genuine 404 — but there is no RUT form for "respond 404" nested inside an
-// `if` branch (`local_response(...)` parses only as the sole statement of a
-// top-level `unmatched` / `pre_route` / `route exact "..."` item — see
-// VERIFY below). So the algorithm instead DROPS the wrapping
-// `if req.pathOnly != "N"` condition on that final arm (making it
-// unconditionally forward, since every request actually reaching `route "N"`
-// is now guaranteed to be a proper descendant of N) and emits a companion
-// `route exact "N" { return local_response(...) }` with the fixed 404 shape
-// to intercept the literal path `N` — matched with higher priority than the
-// prefix trie (VERIFY below) — before it would otherwise reach the
-// now-always-true `route "N"` body.
+// (else it would have terminated the chain earlier). Two cases:
+//   - An exact route for `q == N` WAS declared before N's own prefix route:
+//     the walk already placed a conditional `req.pathOnly == "N"` arm for it
+//     earlier in the chain (the `saw_own_exact` bullet above), so dropping
+//     the final arm's condition is correct and no further action is needed —
+//     `p == N` already forwards through that earlier arm.
+//   - No exact route for `q == N` was ever declared: `req.pathOnly == "N"`
+//     therefore has no Envoy route at all — a genuine 404 — but there is no
+//     RUT form for "respond 404" nested inside an `if` branch
+//     (`local_response(...)` parses only as the sole statement of a
+//     top-level `unmatched` / `pre_route` / `route exact "..."` item — see
+//     VERIFY below), and `route exact "N"` cannot stand in for it either: its
+//     strict local-response admission (`callbacks_impl.h`,
+//     `exact_strict_local_response_common_request_shape_is_admitted` plus the
+//     per-method "fresh method" checks) serves only GET/HEAD/POST/OPTIONS/
+//     PUT/DELETE/PATCH, so an ANY-method `route exact "N"` 404 would silently
+//     close the connection instead of responding for TRACE/CONNECT, which
+//     Envoy's real no-route 404 still answers (Codex P1). So lowering fails
+//     closed here instead of emitting that fallback: `BLOCKED_BY_RUT: a
+//     no-route 404 for this node's own literal path has no RUT form that
+//     serves every method Envoy would 404`.
 //
-// Root has no such escape hatch (there is no "ancestor of the root" to
-// delegate to). If root's own body ends up with exact arms but no
+// Root has no such escape hatch either (there is no "ancestor of the root"
+// to delegate to, and it has no earlier-exact-arm case: `"/"` can never be
+// under a longer node). If root's own body ends up with exact arms but no
 // unconditional terminator (Envoy never declares a `prefix: "/"` route, so
-// nothing ever resolves the fallthrough), lowering fails closed:
-// `BLOCKED_BY_RUT: a no-route 404 inside a route branch has no RUT form`. If
-// root has NO arms at all in that situation, `route "/"` is omitted
-// entirely — any request that would reach it falls through Rut's trie to the
-// `unmatched` policy declared above, which is exactly Envoy's real
+// nothing ever resolves the fallthrough), lowering fails closed the same
+// way: `BLOCKED_BY_RUT: a no-route 404 inside a route branch has no RUT
+// form`. If root has NO arms at all in that situation, `route "/"` is
+// omitted entirely — any request that would reach it falls through Rut's
+// trie to the `unmatched` policy declared above, which correctly answers
+// every method (its per-method policy table falls back to the ANY slot;
+// unlike `route exact`, `handle_configured_unmatched_response` admits every
+// route-method slot including TRACE), so it is exactly Envoy's real
 // no-matching-route 404.
-//
-// No HEAD split needed for `route exact` 404 fallbacks: the emitted body is
-// always `body: b""`, so `head_mode: "suppress_body"` is harmless (and
-// already set) regardless of the request method — unlike `forward(...)`,
-// which needs the HEAD/any-method split for its (non-empty) upstream
-// response, `route exact "N"`'s 404 needs only one, ANY-method declaration
-// (mirroring `unmatched`, which is single-declaration for the same reason).
 //
 // VERIFY outcomes this algorithm depends on (src/compiler/parser.cc,
 // include/rut/runtime/route_trie.h, include/rut/runtime/callbacks_impl.h):
@@ -413,8 +420,11 @@ u32 cluster_index_of(const Bootstrap& model, Str name) {
 }
 
 // Builds one node's arm chain (see the algorithm comment above).
-// `needs_exact_fallback` is set when the chain's last arm had its condition
-// dropped and a companion `route exact "node_text"` 404 is required.
+// `needs_exact_fallback` would be set when the chain's last arm had its
+// condition dropped with no earlier exact arm covering the node's own
+// literal path, but `build_node_plan` currently fails closed in that case
+// instead (see "Remainder" above), so this is always false on a successful
+// return; kept for the day an all-method local_response surface lands.
 // `omit` (root only) means the node has no arms at all and should not be
 // emitted; leaving `omit` false with an empty `arms` for a non-root node
 // cannot happen (a non-root node's own prefix arm is always present).
@@ -432,6 +442,14 @@ FrontendResult<NodePlanResult> build_node_plan(
     const Bootstrap& model) {
     NodePlanResult result{};
     bool saw_own_prefix = false;
+    // True once a conditional `req.pathOnly == node_text` arm has been placed
+    // for an exact `path` route declared before the node's own prefix route.
+    // Without tracking this, a node ending in its own (now-unconditional)
+    // prefix arm always requested the "node's own literal has no Envoy
+    // route" fallback below, even when an earlier exact arm already resolves
+    // that literal correctly (Codex P1: the fallback would then shadow the
+    // earlier exact arm with a 404 Envoy never returns for that path).
+    bool saw_own_exact = false;
     Span last_span{};
 
     for (u32 route_index = 0; route_index < virtual_host.routes.len; route_index++) {
@@ -450,6 +468,7 @@ FrontendResult<NodePlanResult> build_node_plan(
                     arm.compare_text = q;
                     if (!result.arms.push(arm))
                         return out_of_memory(route.span, lit_str("too many routes to lower"));
+                    saw_own_exact = true;
                     last_span = route.span;
                     continue;
                 }
@@ -516,8 +535,18 @@ FrontendResult<NodePlanResult> build_node_plan(
     // Non-root: the last kept arm is always this node's own prefix arm (see
     // the algorithm comment, "Remainder"). Drop its condition.
     result.arms[result.arms.len - 1].is_terminal = true;
-    result.needs_exact_fallback = true;
-    return result;
+    if (saw_own_exact) return result;  // the earlier exact arm already covers p == N
+    // p == N has no Envoy route: same "no RUT form for a nested 404" problem
+    // root hits below, PLUS `route exact` cannot stand in for it here either
+    // (Codex P1: its strict local-response admission serves only GET/HEAD/
+    // POST/OPTIONS/PUT/DELETE/PATCH, so an ANY-method `route exact "N"` 404
+    // would close the connection instead of responding for e.g. TRACE, which
+    // Envoy's real no-route 404 still answers). Fail closed until an
+    // all-method local_response surface exists.
+    return unsupported(
+        last_span,
+        lit_str("BLOCKED_BY_RUT: a no-route 404 for this node's own literal path has no RUT form "
+                "that serves every method Envoy would 404 (route exact excludes TRACE/CONNECT)"));
 }
 
 bool put_route_arms(Writer& w, const RouteArms& arms, u32 index, bool include_head_mode) {
@@ -766,6 +795,15 @@ FrontendResult<bool> validate(const Bootstrap& model, const RutCapabilities& cap
         if (model.clusters[i].connect_timeout.milliseconds == 0u)
             return invalid(model.clusters[i].connect_timeout.span,
                            lit_str("duration must be positive"));
+        // The JSON parser (`parse_clusters`) already rejects a duplicate
+        // cluster name; a hand-built `Bootstrap` bypasses that, and
+        // `cluster_index_of` silently resolves every same-named reference to
+        // the FIRST match while every cluster is still emitted as its own
+        // `upstream envoy_cluster_<i>` — reapply the invariant here.
+        for (u32 j = 0; j < i; j++) {
+            if (model.clusters[j].name.eq(model.clusters[i].name))
+                return invalid(model.clusters[i].name_span, lit_str("duplicate cluster name"));
+        }
     }
     if (virtual_host.routes.len == 0u)
         return invalid(virtual_host.span, lit_str("at least one route is required"));
@@ -777,16 +815,62 @@ FrontendResult<bool> validate(const Bootstrap& model, const RutCapabilities& cap
     // multiple routes, multiple clusters, `match.path`, and non-root
     // `match.prefix` are lowered by `build_lowering_plan` below.
     for (u32 i = 0; i < virtual_host.routes.len; i++) {
+        const RouteMatch& match = virtual_host.routes[i].match;
         // Codex round-6 review, ported: the public hand-built-model overload
         // does not go through the parser, whose `parse_route_match` only
         // ever produces one of the two declared `RouteMatchKind`
         // enumerators. Without this explicit check, a forged `match.kind`
-        // outside {Prefix, Path} would reach `build_lowering_plan` below,
-        // which treats every non-`Path` kind as a `Prefix` using the
-        // untouched (possibly default-empty) `match.prefix`.
-        const RouteMatch& match = virtual_host.routes[i].match;
+        // outside {Prefix, Path} would skip both branches below (neither
+        // `if` nor `else if` matches it) and reach `build_lowering_plan`
+        // unvalidated, which treats every non-`Path` kind as a `Prefix`
+        // using the untouched (possibly default-empty) `match.prefix`.
         if (match.kind != RouteMatchKind::Prefix && match.kind != RouteMatchKind::Path)
             return invalid(match.span, lit_str("match kind is not recognized"));
+        // The JSON parser (`prefix_shape_ok` / `path_shape_ok`,
+        // src/envoy/parser.cc) guarantees every parsed prefix is either "/"
+        // or at least 2 bytes starting and ending with '/', and every parsed
+        // path starts with '/'. A hand-built `Bootstrap` bypasses the parser
+        // entirely: an empty or malformed prefix reaching
+        // `strip_trailing_slash` in `build_lowering_plan` below would
+        // underflow `prefix.len - 1u` into a huge slice length instead of
+        // producing a diagnostic. Revalidate the same shape here so every
+        // caller of the public `Bootstrap` overload fails closed.
+        if (match.kind == RouteMatchKind::Prefix) {
+            const Str prefix = match.prefix;
+            // Length-only for the length-1 case (never a content compare):
+            // `strip_trailing_slash` below relies on the same guarantee to
+            // stay immune to a caller mutating the JSON source buffer after
+            // parsing but before lowering (see its own comment); a
+            // hand-built model with a non-"/" length-1 prefix is accepted
+            // and treated as root, matching that existing, documented
+            // behavior instead of silently diverging from it here.
+            const bool shape_ok =
+                prefix.len == 1u || (prefix.len >= 2u && prefix.ptr != nullptr &&
+                                     prefix.ptr[0] == '/' && prefix.ptr[prefix.len - 1u] == '/');
+            if (!shape_ok)
+                return invalid(match.span,
+                               lit_str("route match prefix must be \"/\" or start and end with "
+                                       "\"/\""));
+        } else if (match.kind == RouteMatchKind::Path) {
+            const Str path = match.path;
+            if (path.len == 0u || path.ptr == nullptr || path.ptr[0] != '/')
+                return invalid(match.span, lit_str("route match path must start with \"/\""));
+        }
+        // Envoy treats every byte of a `prefix` / `path` literally, but a
+        // generated RUT node interprets any segment beginning with ':' as a
+        // route parameter (include/rut/runtime/route_trie.h): a prefix like
+        // "/:tenant/" would emit `route "/:tenant"`, which then captures and
+        // forwards `/anything/x` where Envoy finds no matching route at all.
+        // Reject rather than silently change the match semantics.
+        const Str text = match.kind == RouteMatchKind::Prefix ? match.prefix : match.path;
+        for (u32 c = 0; c + 1u < text.len; c++) {
+            if (text.ptr[c] == '/' && text.ptr[c + 1u] == ':')
+                return unsupported(
+                    match.span,
+                    lit_str("route match segments beginning with \":\" would become a RUT route "
+                            "parameter, not a literal match; not lowered"));
+        }
+
         const RouteAction& action = virtual_host.routes[i].action;
         if (action.kind == RouteActionKind::DirectResponse)
             return unsupported(action.span, lit_str("direct_response is not lowered yet"));

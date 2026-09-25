@@ -475,18 +475,27 @@ are recorded from the pinned Envoy build, not assumed.
   and the node's own prefix action closes the chain once every other value is
   accounted for. A node's own literal path (e.g. the string `"/api"` for
   prefix `"/api/"`) is never matched by that node's own prefix action in
-  Envoy, so it is resolved separately: if no other Envoy route ever matches
-  it, the converter emits a companion `route exact "N" { return
-  local_response(...) }` 404, matched with strictly higher priority than the
-  prefix trie by Rut's runtime (`exact_strict_local_response` runs before
-  `match_canonical`); a no-route 404 has no RUT form nested inside an
-  ordinary route's `if` branch, so this is the only way to represent it. Root
-  has no such fallback (there is no ancestor to delegate to): a bootstrap
-  whose root ends up with exact arms but no catch-all fails closed with
-  `BLOCKED_BY_RUT: a no-route 404 inside a route branch has no RUT form`; with
-  no arms at all `route "/"` is simply omitted, since Rut's `unmatched` policy
-  already covers it. The full algorithm, worked through node by node, is a
-  doc comment on `src/envoy/converter.cc`'s ordered-route-list section.
+  Envoy, so it is resolved separately: if an earlier exact `path` route
+  already names that literal, the conditional arm the walk placed for it
+  earlier in the chain already forwards it correctly. Otherwise the literal
+  has no Envoy route at all — a genuine 404 — and lowering fails closed
+  instead of emitting a `route exact "N"` fallback for it: `route exact`'s
+  strict local-response admission serves only GET/HEAD/POST/OPTIONS/PUT/
+  DELETE/PATCH (`callbacks_impl.h`,
+  `exact_strict_local_response_common_request_shape_is_admitted` plus the
+  per-method "fresh method" checks), so an ANY-method `route exact "N"` 404
+  would close the connection for TRACE/CONNECT instead of answering with a
+  404 the way Envoy's real no-route 404 does (Codex P1 on PR #695). Root hits
+  the same "no RUT form for a nested 404" problem and has no earlier-exact-arm
+  case either (there is no ancestor of the root to delegate to, nor can `"/"`
+  ever be a proper descendant of a longer node): a bootstrap whose root ends
+  up with exact arms but no catch-all fails closed with `BLOCKED_BY_RUT: a
+  no-route 404 inside a route branch has no RUT form`; with no arms at all
+  `route "/"` is simply omitted, since Rut's `unmatched` policy answers every
+  method (including TRACE) via its own per-method policy table with an
+  ANY-slot fallback, unlike `route exact`. The full algorithm, worked through
+  node by node, is a doc comment on `src/envoy/converter.cc`'s
+  ordered-route-list section.
 - Matching is against the path without query. `x-envoy-original-path` is not
   set unless a rewrite happens.
 - No matching route: HCM responds 404 with an empty body and no route-level
