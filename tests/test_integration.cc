@@ -8704,9 +8704,19 @@ struct ReuseUpstream {
             }
             char req[2048];
             (void)recv_timeout(client, req, sizeof(req), 1000);
+            // Announce the close. This fixture (d9609a61) predates io_uring upstream
+            // pooling (e3d8af36) and exists to force a fresh upstream connect per
+            // request. An implicit HTTP/1.1 keep-alive response lets the proxy pool
+            // the socket instead; if this thread is descheduled between the last send
+            // and close(), the next request lands on the pooled socket, the late
+            // close() answers it with RST, and a non-idempotent POST is not replayed.
+            // Pooled reuse is covered by proxy_reuse.*_iouring; keep this on intent.
             char hdr[128];
-            const int hn = snprintf(
-                hdr, sizeof(hdr), "HTTP/1.1 200 OK\r\nContent-Length: %u\r\n\r\n", s->body_len);
+            const int hn = snprintf(hdr,
+                                    sizeof(hdr),
+                                    "HTTP/1.1 200 OK\r\nContent-Length: %u\r\n"
+                                    "Connection: close\r\n\r\n",
+                                    s->body_len);
             bool ok = hn > 0 && send_all(client, hdr, static_cast<u32>(hn));
             u8 chunk[8192];
             u32 sent = 0;
@@ -34887,6 +34897,7 @@ TEST(
 
     // Every permit follows one attributable application send and an independent
     // downstream open/zero-byte observation. Fragment four completes CL36.
+    u64 final_fragment_permit_ns = 0;
     for (u32 fragment = 1; fragment < kExpectedFragments; fragment++) {
         for (u32 waited = 0; waited < 1200 && backend.first_response_fragment_count.load(
                                                   std::memory_order_acquire) < fragment;
@@ -34897,6 +34908,10 @@ TEST(
             backend.first_response_fragment_sent_ns[fragment - 1u].load(std::memory_order_acquire),
             0u);
         REQUIRE_EQ(recv_timeout(client.fd, quiet, sizeof(quiet), 100), -EAGAIN);
+        if (fragment + 1u == kExpectedFragments) {
+            final_fragment_permit_ns = monotonic_ns();
+            REQUIRE_NE(final_fragment_permit_ns, 0u);
+        }
         backend.allowed_first_response_fragments.store(fragment + 1u, std::memory_order_release);
     }
 
@@ -34939,7 +34954,10 @@ TEST(
         static_cast<double>(fragment_times[fragment_count - 1u] - fragment_times[0]) / 1e9;
     CHECK_GT(first_to_final, 1.0);
     CHECK_LT(first_to_final, 2.0);
-    REQUIRE_GE(request_one_response_complete_ns, fragment_times[fragment_count - 1u]);
+    // fragment_times[] is stamped by the origin thread after send_all() returns, so
+    // under load the gateway and client can finish the whole response before that
+    // stamp. The causal lower bound is the permit that released the final fragment.
+    REQUIRE_GE(request_one_response_complete_ns, final_fragment_permit_ns);
 
     for (u32 waited = 0;
          waited < 1200 && !backend.first_peer_closed.load(std::memory_order_acquire) &&
