@@ -241,6 +241,53 @@ bool allocate_bound_loopback_port(BoundPort* out) {
     return true;
 }
 
+// Allocates an ephemeral loopback port and leaves it bound but deliberately
+// *not* listening, so the port stays reserved for the caller without ever
+// accepting a connection. Used for the connect_failure case's "closed"
+// upstream port: like allocate_bound_loopback_port() above, this exists so
+// the port stays reserved end to end instead of going through
+// allocate_loopback_port()'s probe-and-immediately-close pattern, which
+// leaves a window where another host process can bind and listen on the
+// port before Envoy's connect attempt (round-7 review, "Keep the
+// connect-failure port reserved"). A bound, non-listening TCP socket still
+// answers connect() with RST/ECONNREFUSED on Linux -- the same "connection
+// refused" semantics as a port nothing has ever bound -- so holding this
+// reservation does not change the bytes Envoy observes, and therefore does
+// not change the oracle fixture's recorded connect_failure body (98-byte
+// "upstream connect error or disconnect/reset before headers. reset reason:
+// remote connection failure"). The caller owns `fd` and must close() it once
+// the connect-failure exchange is done.
+bool allocate_reserved_closed_port(BoundPort* out) {
+    const int fd = socket(AF_INET, SOCK_STREAM, 0);
+    if (fd < 0) return false;
+    // Deliberately no SO_REUSEADDR: on Linux, when SO_REUSEADDR is set on
+    // *this* socket, a second, unrelated socket that also sets SO_REUSEADDR
+    // can bind (and even listen()) on the exact same address:port pair while
+    // this one is still alive and unconnected -- verified empirically on
+    // this host, and exactly the hijack this function exists to prevent.
+    // Leaving SO_REUSEADDR unset here is what makes the reservation
+    // exclusive: a later bind() to this port from any other socket fails
+    // with EADDRINUSE for as long as `fd` stays open.
+    sockaddr_in addr{};
+    addr.sin_family = AF_INET;
+    addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    addr.sin_port = 0;
+    if (bind(fd, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) != 0) {
+        close(fd);
+        return false;
+    }
+    // Deliberately no listen(): a backlog-less bound socket rejects every
+    // connect() attempt instead of accepting it.
+    socklen_t len = sizeof(addr);
+    if (getsockname(fd, reinterpret_cast<sockaddr*>(&addr), &len) != 0) {
+        close(fd);
+        return false;
+    }
+    out->fd = fd;
+    out->port = ntohs(addr.sin_port);
+    return true;
+}
+
 bool allocate_distinct_ports(const std::vector<uint16_t*>& outs) {
     std::vector<uint16_t> seen;
     for (uint16_t* out : outs) {
@@ -877,6 +924,39 @@ bool wait_ready(uint16_t port, EnvoyInstance& envoy, int timeout_ms, std::string
     return false;
 }
 
+// wait_ready() only proves that *some* process is now accepting connections
+// on `port`; it does not prove that process is the Envoy container this
+// harness just launched. When another process wins the bind race for a
+// probe-allocated listener port, that foreign socket can already be open
+// (satisfying tcp_port_open()) before Envoy's own doomed bind attempt inside
+// the container finishes failing and the docker child exits to report the
+// collision, so wait_ready() can return true for an unrelated listener and
+// bypass launch_envoy_with_port_retry()'s EADDRINUSE-retry branch entirely
+// (round-7 review, "readiness may observe a foreign listener"). Guard
+// against that window by giving the docker child a short grace period after
+// readiness to finish dying if it was ever going to: a child that exits
+// during the grace period never really owned `port`, so this reports
+// failure and leaves the existing collision-retry branch to run instead of
+// sending test cases to an unrelated service.
+bool wait_ready_and_confirm_ownership(
+    uint16_t port, EnvoyInstance& envoy, int timeout_ms, int grace_ms, std::string* error) {
+    if (!wait_ready(port, envoy, timeout_ms, error)) return false;
+    struct timespec grace{grace_ms / 1000, static_cast<long>(grace_ms % 1000) * 1'000'000};
+    nanosleep(&grace, nullptr);
+    if (envoy.pid > 0) {
+        int status = 0;
+        const pid_t waited = waitpid(envoy.pid, &status, WNOHANG);
+        if (waited == envoy.pid) {
+            envoy.pid = -1;
+            *error =
+                "docker run exited shortly after the listener port opened; a different "
+                "process likely won the bind race";
+            return false;
+        }
+    }
+    return true;
+}
+
 // ── Bootstrap template ──────────────────────────────────────────────────
 
 // The milestone-S bootstrap (docs/envoy-converter.md, "milestone-S";
@@ -1256,15 +1336,19 @@ bool log_indicates_address_in_use(const std::string& path) {
 // recording upstream's port (reserved end to end via
 // allocate_bound_loopback_port()/RecordingUpstream::adopt()), this harness
 // can only probe-allocate the number and hand it to Envoy, leaving a window
-// for another process to take it first. When that happens, wait_ready()
-// fails and Envoy's own log names the collision; this function detects that
-// case and retries on a freshly allocated port, up to kMaxListenPortAttempts
-// attempts total (round-6 review, "detect a collision ... retry with a fresh
-// port ... print that it retried, and never record a failed attempt as
-// evidence"). A failed attempt's container is torn down before either
-// retrying or returning, so nothing from it survives to be mistaken for
-// evidence; only a `true` return leaves `envoy`/`*listen_port` describing a
-// live, ready Envoy instance.
+// for another process to take it first. When that happens,
+// wait_ready_and_confirm_ownership() fails (either because Envoy's own log
+// names the collision immediately, or, if a foreign listener was briefly
+// mistaken for readiness, because the docker child exits during the
+// post-readiness grace period) and this function retries on a freshly
+// allocated port, up to kMaxListenPortAttempts attempts total (round-6
+// review, "detect a collision ... retry with a fresh port ... print that it
+// retried, and never record a failed attempt as evidence"; round-7 review,
+// "readiness may observe a foreign listener"). A failed attempt's container
+// is torn down before either retrying or returning, so nothing from it
+// survives to be mistaken for evidence; only a `true` return leaves
+// `envoy`/`*listen_port` describing a live, ready Envoy instance confirmed
+// to still own the port.
 bool launch_envoy_with_port_retry(const std::string& dir,
                                   const char* label,
                                   uint16_t* listen_port,
@@ -1283,7 +1367,9 @@ bool launch_envoy_with_port_retry(const std::string& dir,
             *error = "could not fork/exec docker run";
             return false;
         }
-        if (wait_ready(*listen_port, *envoy, 15'000, error)) return true;
+        if (wait_ready_and_confirm_ownership(*listen_port, *envoy, 15'000, 300, error)) {
+            return true;
+        }
 
         const bool collided = log_indicates_address_in_use(envoy->log_path);
         envoy->stop();
@@ -1310,10 +1396,14 @@ int run_oracle_milestone_s(const std::string& output_path) {
     // binds and listens on it right here and keeps that same socket alive
     // until RecordingUpstream::adopt() takes it over, so no other process can
     // ever grab it out from under us (round-6 review, "Keep allocated ports
-    // reserved until their consumers bind"). Envoy's two listener ports and
-    // the deliberately-unbound "closed" port can only be probe-allocated
-    // (Envoy binds its own port inside the container; "closed" must stay
-    // unbound), so they still go through allocate_distinct_ports() below.
+    // reserved until their consumers bind"). Envoy's two listener ports can
+    // only be probe-allocated (Envoy binds its own port inside the
+    // container), so they still go through allocate_distinct_ports() below.
+    // The connect_failure case's "closed" port is likewise reserved end to
+    // end via allocate_reserved_closed_port(): it stays bound but
+    // non-listening (never probed-and-released) so no other host process can
+    // claim it before run 2's connect attempt (round-7 review, "Keep the
+    // connect-failure port reserved").
     BoundPort upstream_bound;
     if (!allocate_bound_loopback_port(&upstream_bound)) {
         std::cerr << "FAIL: could not allocate loopback port for the recording upstream\n";
@@ -1321,10 +1411,19 @@ int run_oracle_milestone_s(const std::string& output_path) {
     }
     const uint16_t upstream_port1 = upstream_bound.port;
 
-    uint16_t listen_port1 = 0, listen_port2 = 0, closed_port = 0;
-    if (!allocate_distinct_ports({&listen_port1, &listen_port2, &closed_port})) {
+    BoundPort closed_reserved;
+    if (!allocate_reserved_closed_port(&closed_reserved)) {
+        std::cerr << "FAIL: could not allocate the connect_failure case's closed port\n";
+        close(upstream_bound.fd);
+        return 1;
+    }
+    const uint16_t closed_port = closed_reserved.port;
+
+    uint16_t listen_port1 = 0, listen_port2 = 0;
+    if (!allocate_distinct_ports({&listen_port1, &listen_port2})) {
         std::cerr << "FAIL: could not allocate loopback ports\n";
         close(upstream_bound.fd);
+        close(closed_reserved.fd);
         return 1;
     }
 
@@ -1384,6 +1483,7 @@ int run_oracle_milestone_s(const std::string& output_path) {
         const std::string dir = make_temp_dir("rut-envoy-oracle2");
         if (dir.empty()) {
             std::cerr << "FAIL: could not create temp directory\n";
+            close(closed_reserved.fd);
             return 1;
         }
         EnvoyInstance envoy;
@@ -1392,12 +1492,17 @@ int run_oracle_milestone_s(const std::string& output_path) {
                 dir, "run2", &listen_port2, closed_port, &envoy, &ready_error)) {
             std::cerr << "FAIL: " << ready_error << "\n";
             dump_log(envoy.log_path);
+            close(closed_reserved.fd);
             return 1;
         }
         CaseSpec spec = run1_cases().front();  // get_smoke's exact client bytes
         CaseResult r;
         if (!run_client_case(listen_port2, spec, &r))
             std::cerr << "WARN: case connect_failure exchange did not complete cleanly\n";
+        // The connect-failure exchange is now complete; only past this point
+        // is it safe to release the reservation on `closed_port` (round-7
+        // review, "Keep the connect-failure port reserved").
+        close(closed_reserved.fd);
         r.name = "connect_failure";  // run_client_case sets this from `spec` ("get_smoke");
                                      // override after the call, not before.
         r.upstream_contacted = false;
@@ -1723,12 +1828,159 @@ bool self_test_argv_builder() {
     return ok;
 }
 
+// Covers round-7 review thread P2 ("Verify the opened port belongs to the
+// launched Envoy"): wait_ready() alone would be fooled by a foreign process
+// that already owns the probe-allocated port, reporting readiness before the
+// real docker child has had a chance to fail its own bind and exit.
+// wait_ready_and_confirm_ownership() must catch that by rechecking the child
+// a short grace period later. This test simulates the race directly (no
+// docker needed): a plain bound-and-listening socket stands in for the
+// foreign process's listener, and a forked child that exits shortly after
+// stands in for the docker run process losing its own bind race.
+bool self_test_wait_ready_ownership() {
+    bool ok = true;
+
+    BoundPort foreign;
+    if (!allocate_bound_loopback_port(&foreign)) {
+        std::cerr << "FAIL [self-test wait_ready ownership]: could not allocate a loopback port\n";
+        return false;
+    }
+
+    // Negative case: the "docker child" dies shortly after the foreign
+    // listener is already open, so ownership must NOT be confirmed.
+    {
+        const pid_t child = fork();
+        if (child < 0) {
+            std::cerr << "FAIL [self-test wait_ready ownership]: fork failed\n";
+            close(foreign.fd);
+            return false;
+        }
+        if (child == 0) {
+            struct timespec ts{0, 150'000'000};
+            nanosleep(&ts, nullptr);
+            _exit(1);
+        }
+        EnvoyInstance envoy;
+        envoy.pid = child;
+        std::string error;
+        const bool confirmed =
+            wait_ready_and_confirm_ownership(foreign.port, envoy, 2000, 400, &error);
+        if (confirmed) {
+            std::cerr << "FAIL [self-test wait_ready ownership]: confirmed ownership of a port "
+                         "a foreign listener holds while the tracked child exited\n";
+            ok = false;
+        }
+        if (error.empty()) {
+            std::cerr << "FAIL [self-test wait_ready ownership]: expected a non-empty error on "
+                         "the negative case\n";
+            ok = false;
+        }
+        if (envoy.pid != -1) {
+            std::cerr << "FAIL [self-test wait_ready ownership]: envoy.pid was not cleared after "
+                         "detecting exit\n";
+            ok = false;
+        }
+        int status = 0;
+        while (waitpid(child, &status, 0) < 0 && errno == EINTR) {
+        }
+    }
+
+    // Positive case: the tracked child stays alive through the grace period,
+    // so ownership of the (still foreign-held, but standing in for Envoy's
+    // own) listener must be confirmed.
+    {
+        const pid_t child = fork();
+        if (child < 0) {
+            std::cerr << "FAIL [self-test wait_ready ownership]: fork failed\n";
+            close(foreign.fd);
+            return false;
+        }
+        if (child == 0) {
+            struct timespec ts{5, 0};
+            nanosleep(&ts, nullptr);
+            _exit(0);
+        }
+        EnvoyInstance envoy;
+        envoy.pid = child;
+        std::string error;
+        const bool confirmed =
+            wait_ready_and_confirm_ownership(foreign.port, envoy, 2000, 200, &error);
+        if (!confirmed) {
+            std::cerr << "FAIL [self-test wait_ready ownership]: did not confirm ownership for a "
+                         "child that stayed alive: "
+                      << error << "\n";
+            ok = false;
+        }
+        kill(child, SIGKILL);
+        int status = 0;
+        while (waitpid(child, &status, 0) < 0 && errno == EINTR) {
+        }
+        envoy.pid = -1;
+    }
+
+    close(foreign.fd);
+    if (ok) std::cerr << "PASS [self-test wait_ready ownership]\n";
+    return ok;
+}
+
+// Covers round-7 review thread P2 ("Keep the connect-failure port
+// reserved"): allocate_reserved_closed_port() must hold the port so no other
+// bind can claim it, while still producing "connection refused" semantics
+// (RST/ECONNREFUSED) for a connect() attempt, matching the oracle's recorded
+// connect_failure body.
+bool self_test_reserved_closed_port() {
+    bool ok = true;
+    BoundPort closed;
+    if (!allocate_reserved_closed_port(&closed)) {
+        std::cerr << "FAIL [self-test reserved closed port]: allocation failed\n";
+        return false;
+    }
+
+    // The port must stay held: a second socket cannot bind to it while the
+    // reservation is live.
+    {
+        const int probe = socket(AF_INET, SOCK_STREAM, 0);
+        sockaddr_in addr{};
+        addr.sin_family = AF_INET;
+        addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+        addr.sin_port = htons(closed.port);
+        if (probe >= 0) {
+            const int one = 1;
+            setsockopt(probe, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
+            if (bind(probe, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) == 0) {
+                std::cerr << "FAIL [self-test reserved closed port]: a second socket was able to "
+                             "bind the reserved port\n";
+                ok = false;
+            }
+            close(probe);
+        }
+    }
+
+    // A connect() attempt must be refused immediately (RST/ECONNREFUSED),
+    // never accepted, since nothing ever calls listen() on this socket.
+    {
+        const int fd = connect_with_timeout(closed.port, 1000);
+        if (fd >= 0) {
+            std::cerr << "FAIL [self-test reserved closed port]: connect() unexpectedly "
+                         "succeeded against a bound-but-not-listening port\n";
+            close(fd);
+            ok = false;
+        }
+    }
+
+    close(closed.fd);
+    if (ok) std::cerr << "PASS [self-test reserved closed port]\n";
+    return ok;
+}
+
 int run_self_test() {
     bool ok = true;
     ok &= self_test_escaping();
     ok &= self_test_recording_upstream();
     ok &= self_test_partial_exchange_rejection();
     ok &= self_test_argv_builder();
+    ok &= self_test_wait_ready_ownership();
+    ok &= self_test_reserved_closed_port();
     return ok ? 0 : 1;
 }
 
