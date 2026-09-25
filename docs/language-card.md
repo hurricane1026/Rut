@@ -318,11 +318,28 @@ return forward(users)                          // zero-copy, terminal
 return forward(users, request_policy: {
     version: "HTTP/1.1", host: "upstream", connection: "omit",
     strip_headers: ["Connection", "Keep-Alive", "TE", "Expect", "Upgrade"]
-})                                               // fixed header-only rebuild
-// host: "preserve" is a separate closed combination (Envoy-compatible H1):
-// keeps the client's Host verbatim (fails closed unless exactly one
-// non-empty Host header is present), lowercases every forwarded header
-// name, and requires forwarded_proto and the six-name strip list together.
+})                                               // ID1: fixed header-only rebuild
+// ID2 adds content_length_position: "after_host" (Content-Length pinned
+// right after the rewritten Host line; a bodyless request is rejected).
+// ID3 adds retained_header_value: "trim_sp_preserve_htab" (retained values
+// keep leading/trailing HTAB while SP is trimmed; bounded to bodyless GET).
+// The two are mutually exclusive and both require host: "upstream".
+return forward(users, request_policy: {
+    version: "HTTP/1.1", host: "upstream", connection: "omit",
+    content_length_position: "after_host",
+    strip_headers: ["Connection", "Keep-Alive", "TE", "Expect", "Upgrade"]
+})
+// host: "preserve" is a separate closed combination (Envoy-compatible H1,
+// ID4): keeps the client's Host verbatim (fails closed unless exactly one
+// non-empty, syntactically valid-authority Host header is present),
+// lowercases every forwarded header name, and requires forwarded_proto and
+// the six-name strip list together. Drops every header the client's
+// Connection value nominates except content-length/host/x-forwarded-for/
+// x-forwarded-host/x-forwarded-proto, nominating any of which fails closed;
+// keeps `te` when a comma-separated token is `trailers` (rewritten to that
+// exact lowercase token); rejects Connection nominating `upgrade` alongside
+// an Upgrade header (even with `close`); rejects more than one
+// X-Forwarded-Proto field; and rejects a fragment-bearing request target.
 return forward(users, request_policy: {
     version: "HTTP/1.1", host: "preserve", connection: "omit",
     header_names: "lowercase", forwarded_proto: "http",

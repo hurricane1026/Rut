@@ -4024,6 +4024,121 @@ TEST(request_policy, preserve_host_lowercase_wire_and_fail_closed_host) {
     prepare("GET /emptyhost HTTP/1.1\r\nHost:\r\n\r\n");
     CHECK_FALSE(apply_request_policy(conn, endpoint, kPreserveHost));
     CHECK_EQ(conn.send_buf.len(), 0u);
+
+    // Fail closed: a Connection token nominates X-Forwarded-For or
+    // X-Forwarded-Host, matching Envoy's `sanitizeConnectionHeader`, which
+    // names all three of ForwardedFor/ForwardedHost/ForwardedProto and
+    // refuses the whole request for any of them (not only Proto).
+    prepare(
+        "GET /nominate-xff HTTP/1.1\r\n"
+        "Host: client.example\r\n"
+        "X-Forwarded-For: 10.0.0.1\r\n"
+        "Connection: X-Forwarded-For\r\n\r\n");
+    CHECK_FALSE(apply_request_policy(conn, endpoint, kPreserveHost));
+    CHECK_EQ(conn.send_buf.len(), 0u);
+    prepare(
+        "GET /nominate-xfh HTTP/1.1\r\n"
+        "Host: client.example\r\n"
+        "Connection: x-forwarded-host\r\n\r\n");
+    CHECK_FALSE(apply_request_policy(conn, endpoint, kPreserveHost));
+    CHECK_EQ(conn.send_buf.len(), 0u);
+
+    // TE tokens are parsed as a comma-separated list, not compared whole:
+    // "gzip, trailers" retains and canonicalizes to lowercase "trailers",
+    // matching Envoy's `sanitizeConnectionHeader` (splits on commas, then
+    // `headers.setTE(TEValues.Trailers)`).
+    prepare(
+        "GET /te-comma HTTP/1.1\r\n"
+        "Host: client.example\r\n"
+        "TE: gzip, trailers\r\n\r\n");
+    REQUIRE(apply_request_policy(conn, endpoint, kPreserveHost));
+    require_wire(
+        "GET /te-comma HTTP/1.1\r\nhost: client.example\r\nte: trailers\r\n"
+        "x-forwarded-proto: http\r\n\r\n");
+
+    // A mixed-case client token ("Trailers") is still recognized and
+    // rewritten to the canonical lowercase "trailers", not forwarded with
+    // the client's original casing.
+    prepare(
+        "GET /te-case HTTP/1.1\r\n"
+        "Host: client.example\r\n"
+        "TE: Trailers\r\n\r\n");
+    REQUIRE(apply_request_policy(conn, endpoint, kPreserveHost));
+    require_wire(
+        "GET /te-case HTTP/1.1\r\nhost: client.example\r\nte: trailers\r\n"
+        "x-forwarded-proto: http\r\n\r\n");
+
+    // A comma-separated TE value with no "trailers" token anywhere is still
+    // dropped entirely, same as a single non-trailers value.
+    prepare(
+        "GET /te-comma-none HTTP/1.1\r\n"
+        "Host: client.example\r\n"
+        "TE: gzip, deflate\r\n\r\n");
+    REQUIRE(apply_request_policy(conn, endpoint, kPreserveHost));
+    require_wire(
+        "GET /te-comma-none HTTP/1.1\r\nhost: client.example\r\n"
+        "x-forwarded-proto: http\r\n\r\n");
+
+    // Envoy's `HeaderUtility::authorityIsValid` character class rejects a
+    // path-shaped Host value (`/` is not a permitted authority byte) --
+    // forwarding it would hand the upstream a malformed request-line/Host
+    // pair. No upstream bytes touched.
+    prepare("GET /badhost-slash HTTP/1.1\r\nHost: victim/path\r\n\r\n");
+    u8 untouched_badhost_slash[256]{};
+    const u32 badhost_slash_len = conn.recv_buf.len();
+    __builtin_memcpy(untouched_badhost_slash, conn.recv_buf.data(), badhost_slash_len);
+    CHECK_FALSE(apply_request_policy(conn, endpoint, kPreserveHost));
+    CHECK_EQ(conn.send_buf.len(), 0u);
+    REQUIRE_EQ(conn.recv_buf.len(), badhost_slash_len);
+    CHECK_EQ(__builtin_memcmp(conn.recv_buf.data(), untouched_badhost_slash, badhost_slash_len), 0);
+
+    // A comma is a permitted authority byte in Envoy's own character class
+    // (`ValidAuthorityChars`, source/common/http/header_utility.cc, is a
+    // superset of RFC 3986 sub-delims, which includes ','), so this shape is
+    // preserved verbatim rather than rejected -- byte-for-byte Envoy parity
+    // is about matching the real grammar, not guessing a stricter one.
+    prepare("GET /host-comma HTTP/1.1\r\nHost: a,b\r\n\r\n");
+    REQUIRE(apply_request_policy(conn, endpoint, kPreserveHost));
+    require_wire("GET /host-comma HTTP/1.1\r\nhost: a,b\r\nx-forwarded-proto: http\r\n\r\n");
+
+    // Fail closed: two X-Forwarded-Proto fields. Envoy stores this as one
+    // inline header and coalesces repeated values before upstream encoding;
+    // this profile does not replicate that coalescing, so it refuses the
+    // whole rewrite rather than risking an origin observing a
+    // first-or-last-duplicate scheme a real Envoy client did not intend.
+    prepare(
+        "GET /xfp-dup HTTP/1.1\r\n"
+        "Host: client.example\r\n"
+        "X-Forwarded-Proto: http\r\n"
+        "X-Forwarded-Proto: https\r\n\r\n");
+    CHECK_FALSE(apply_request_policy(conn, endpoint, kPreserveHost));
+    CHECK_EQ(conn.send_buf.len(), 0u);
+
+    // Fail closed: `Connection: close, upgrade` plus `Upgrade`. The parser
+    // clears `conn.req_wants_upgrade` because "close" contradicts "upgrade"
+    // for the 101-tunnel decision, but Envoy's own `Utility::isUpgrade`
+    // ignores "close" and observes the "upgrade" token plus a non-empty
+    // Upgrade header alone -- this profile has no upgrade-tunnel capability,
+    // so the contradictory shape must fail closed rather than being
+    // silently rewritten into an ordinary request with both headers
+    // dropped.
+    prepare(
+        "POST /upgrade-close-contradiction HTTP/1.1\r\n"
+        "Host: client.example\r\n"
+        "Content-Length: 4\r\n"
+        "Connection: close, upgrade\r\n"
+        "Upgrade: websocket\r\n\r\nabcd");
+    CHECK_FALSE(apply_request_policy(conn, endpoint, kPreserveHost));
+    CHECK_EQ(conn.send_buf.len(), 0u);
+
+    // Fail closed: a fragment-bearing request target. HTTP request targets
+    // cannot carry a URI fragment and route selection already matched only
+    // the pre-fragment canonical path, so forwarding the raw target upstream
+    // would let routing and the origin observe different interpretations of
+    // the same request.
+    prepare("GET /smoke#admin HTTP/1.1\r\nHost: client.example\r\n\r\n");
+    CHECK_FALSE(apply_request_policy(conn, endpoint, kPreserveHost));
+    CHECK_EQ(conn.send_buf.len(), 0u);
 }
 
 TEST(request_policy, content_length_after_host_wait_and_rejection_never_touch_upstream) {

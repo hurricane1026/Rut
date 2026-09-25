@@ -1873,19 +1873,51 @@ table and its cross-connection consistency contract exist.
 byte-for-byte serialization of the upstream request instead of the
 transparent zero-copy default; every field is a literal, validated at parse
 time, and unsupported combinations are a compile error rather than a runtime
-fallback. Two closed profiles exist:
+fallback. The compiler selects one of four closed source profiles
+(`RequestPolicyId` in `include/rut/common/request_policy.h`) from the
+`request_policy` object's fields:
 
 ```swift
-// Upstream-authority profile: rewrites Host to the upstream endpoint.
+// ID1 (Http11FixedStrip) -- the base upstream-authority profile: rewrites
+// Host to the upstream endpoint and strips the fixed five-name hop-by-hop
+// set unconditionally (no Connection-token nomination, no TE exception).
 return forward(users, request_policy: {
     version: "HTTP/1.1", host: "upstream", connection: "omit",
     strip_headers: ["Connection", "Keep-Alive", "TE", "Expect", "Upgrade"]
 })
 
-// Envoy-compatible H1 profile (`host: "preserve"`): keeps the client's Host
-// header verbatim instead of rewriting it (fails closed unless exactly one
-// non-empty Host header is present), lowercases every forwarded header
-// name, and requires forwarded_proto and the six-name strip list together.
+// ID2 (Http11FixedStripContentLengthAfterHost) -- ID1 plus
+// `content_length_position: "after_host"`: emits Content-Length
+// immediately after the rewritten Host line instead of in the client's
+// original header order. Mutually exclusive with `retained_header_value`.
+// A request with no body (no Content-Length) is rejected -- this profile
+// exists specifically to pin the upload framing header's position.
+return forward(users, request_policy: {
+    version: "HTTP/1.1", host: "upstream", connection: "omit",
+    content_length_position: "after_host",
+    strip_headers: ["Connection", "Keep-Alive", "TE", "Expect", "Upgrade"]
+})
+
+// ID3 (Http11FixedTrimSpPreserveHtab) -- ID1 plus
+// `retained_header_value: "trim_sp_preserve_htab"`: retained (non-stripped)
+// header values are trimmed of leading/trailing space but keep any
+// leading/trailing horizontal tab, matching a byte-exact oracle shape.
+// Mutually exclusive with `content_length_position`. Bounded to the single
+// bodyless-GET profile: any Content-Length (including zero), chunked
+// framing, or a non-GET method is rejected.
+return forward(users, request_policy: {
+    version: "HTTP/1.1", host: "upstream", connection: "omit",
+    retained_header_value: "trim_sp_preserve_htab",
+    strip_headers: ["Connection", "Keep-Alive", "TE", "Expect", "Upgrade"]
+})
+
+// ID4 (Http11PreserveHostLowercase) -- the Envoy-compatible H1 profile
+// (`host: "preserve"`): keeps the client's Host header verbatim instead of
+// rewriting it (fails closed unless exactly one non-empty, syntactically
+// valid-authority Host header is present), lowercases every forwarded
+// header name, and requires forwarded_proto and the six-name strip list
+// (including Proxy-Connection) together. Mutually exclusive with
+// `content_length_position` and `retained_header_value`.
 return forward(users, request_policy: {
     version: "HTTP/1.1", host: "preserve", connection: "omit",
     header_names: "lowercase", forwarded_proto: "http",
@@ -1893,12 +1925,35 @@ return forward(users, request_policy: {
 })
 ```
 
-`host: "preserve"` additionally: drops every header nominated by the client's
-`Connection` header value (RFC 7230-style hop-by-hop stripping, not just the
-fixed `strip_headers` list), keeps `te` only when its exact value is
-`trailers`, and appends `x-forwarded-proto: http` as the last header only
-when the client did not already send one (a client-supplied value is kept
-unchanged, in its original position). It is closed to ordinary
+All four profiles require `version: "HTTP/1.1"` and `connection: "omit"`
+literally, and reject a request whose framing is ambiguous for this closed
+serializer: a body paired with a client `Expect` header, `Transfer-Encoding`,
+or (ID1/ID2/ID3 only) any `Upgrade` header fails closed rather than proxying
+with ambiguous semantics (ID4 forwards a bare `Upgrade` header unmodified
+when the client's `Connection` value does not itself nominate the `upgrade`
+token -- see below). `host: "upstream"` (ID1/ID2/ID3) additionally rejects
+`header_names`, `forwarded_proto`, and a `Proxy-Connection` strip entry, and
+requires exactly the original five strip names; `host: "preserve"` (ID4)
+rejects `content_length_position`/`retained_header_value` and requires
+`header_names`/`forwarded_proto` plus all six strip names.
+
+`host: "preserve"` (ID4) additionally: drops every header nominated by the
+client's `Connection` header value (RFC 7230-style hop-by-hop stripping, not
+just the fixed `strip_headers` list) except `content-length`, `host`,
+`x-forwarded-for`, `x-forwarded-host`, and `x-forwarded-proto`, nominating
+any of which fails the whole request closed instead (dropping the framing or
+provenance header while still forwarding the request is unsafe -- see
+`docs/envoy-compatibility.md`); keeps `te` only when one of its
+comma-separated tokens is `trailers` (rewritten to exactly that canonical
+lowercase token, regardless of the client's casing or any other token in the
+value); rejects a request whose `Connection` value nominates the `upgrade`
+token together with an `Upgrade` header, even when the value also contains
+`close`; rejects more than one physical `X-Forwarded-Proto` field (Envoy
+coalesces duplicates into one inline header; this profile does not, so it
+fails closed instead); rejects a request target carrying a URI fragment; and
+appends `x-forwarded-proto: http` as the last header only when the client did
+not already send one (a client-supplied value is kept unchanged, in its
+original position). It is closed to ordinary
 zero-copy-shaped forwards: a request with a body paired with a client
 `Expect` header, or with `Transfer-Encoding`, fails closed rather than
 proxying with ambiguous framing (no `100 Continue` interim-response support
