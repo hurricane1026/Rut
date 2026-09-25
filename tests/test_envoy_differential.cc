@@ -80,6 +80,7 @@
 #include <sstream>
 #include <string>
 #include <thread>
+#include <utility>
 #include <vector>
 
 #include <arpa/inet.h>
@@ -1349,6 +1350,27 @@ struct RutInstance {
     std::string unexpected_exit_description;
 
     bool launch(const std::string& rut_binary, const std::string& rut_source_path) {
+        // rut <source.rut> --shards 1 --no-pin --drain 0
+        //
+        // No CLI port override is passed: the listener port comes from
+        // the `listen :<port>` line `rut-envoy-convert` already baked
+        // into `rut_source_path` from the SAME bootstrap Envoy is (or
+        // was) serving (envoy-pr-plan.md PR 6: "pass only what is
+        // required"). `--drain 0` skips the graceful drain window on
+        // SIGTERM: this harness always stops `rut` with no in-flight
+        // connections, so the only effect of a nonzero drain here is
+        // teardown latency (tests/test_nginx_differential.cc uses the
+        // same flag for the same reason).
+        //
+        // Built before fork(): see build_argv()'s comment (round-3 review,
+        // "Build the Docker argv before entering the fork child"). The
+        // recording upstream's accept thread and the Envoy/RUT readiness
+        // polling loop already running by the time callers reach this are
+        // exactly the kind of concurrent activity that makes post-fork
+        // allocation unsafe.
+        std::vector<std::string> argv = {
+            rut_binary, rut_source_path, "--shards", "1", "--no-pin", "--drain", "0"};
+        const std::vector<char*> args = build_argv(argv);
         pid = fork();
         if (pid < 0) return false;
         if (pid == 0) {
@@ -1358,24 +1380,7 @@ struct RutInstance {
                 dup2(log_fd, STDERR_FILENO);
                 if (log_fd > STDERR_FILENO) close(log_fd);
             }
-            // rut <source.rut> --shards 1 --no-pin --drain 0
-            //
-            // No CLI port override is passed: the listener port comes from
-            // the `listen :<port>` line `rut-envoy-convert` already baked
-            // into `rut_source_path` from the SAME bootstrap Envoy is (or
-            // was) serving (envoy-pr-plan.md PR 6: "pass only what is
-            // required"). `--drain 0` skips the graceful drain window on
-            // SIGTERM: this harness always stops `rut` with no in-flight
-            // connections, so the only effect of a nonzero drain here is
-            // teardown latency (tests/test_nginx_differential.cc uses the
-            // same flag for the same reason).
-            std::vector<std::string> argv = {
-                rut_binary, rut_source_path, "--shards", "1", "--no-pin", "--drain", "0"};
-            std::vector<char*> args;
-            args.reserve(argv.size() + 1);
-            for (const auto& a : argv) args.push_back(const_cast<char*>(a.c_str()));
-            args.push_back(nullptr);
-            execv(rut_binary.c_str(), args.data());
+            execv(args[0], args.data());
             _exit(127);
         }
         return true;
@@ -1462,6 +1467,11 @@ bool run_converter_to_file(const std::string& converter_binary,
                            const std::string& out_rut_path,
                            std::string* stderr_out) {
     const std::string stderr_path = out_rut_path + ".stderr";
+    // Built before fork(): see build_argv()'s comment (round-3 review,
+    // "Build the Docker argv before entering the fork child").
+    std::vector<std::string> argv = {
+        converter_binary, "--format", "bootstrap-json", bootstrap_path};
+    const std::vector<char*> args = build_argv(argv);
     const pid_t child = fork();
     if (child < 0) return false;
     if (child == 0) {
@@ -1471,13 +1481,7 @@ bool run_converter_to_file(const std::string& converter_binary,
         if (err_fd >= 0) dup2(err_fd, STDERR_FILENO);
         if (out_fd > STDERR_FILENO) close(out_fd);
         if (err_fd > STDERR_FILENO) close(err_fd);
-        std::vector<std::string> argv = {
-            converter_binary, "--format", "bootstrap-json", bootstrap_path};
-        std::vector<char*> args;
-        args.reserve(argv.size() + 1);
-        for (const auto& a : argv) args.push_back(const_cast<char*>(a.c_str()));
-        args.push_back(nullptr);
-        execv(converter_binary.c_str(), args.data());
+        execv(args[0], args.data());
         _exit(127);
     }
     int status = 0;
@@ -1828,9 +1832,9 @@ std::vector<CaseResult> run_case_batch(uint16_t listen_port, const std::vector<C
 // POST) must fail the harness immediately rather than be silently reduced
 // to the first observation. `upstream_contact_count` is always recorded
 // (even on the failing path) so the same at-most-once-contact rule
-// `validate_results` enforces again at transcript-write time (round-3
-// review) still catches a duplicate that reaches a transcript writer some
-// other way.
+// `validate_results`/`validate_pair_results` enforce again at transcript-
+// write time (round-3 review) still catches a duplicate that reaches a
+// transcript writer some other way.
 bool fill_upstream_bytes(std::vector<CaseResult>* results,
                          const std::vector<CaseSpec>& cases,
                          RecordingUpstream& upstream) {
@@ -1990,12 +1994,44 @@ struct PairCaseResult {
     CaseResult rut;
 };
 
+// Applies validate_results()'s evidentiary rule (complete exchange, upstream
+// contacted at most once) to BOTH sides of every pair case, so
+// write_pair_transcript refuses ambiguous evidence exactly like
+// write_transcript does (round-3 review, applied uniformly to the pair
+// harness too). Returns empty on success, else a human-readable reason
+// naming which side failed.
+std::string validate_pair_results(const std::vector<PairCaseResult>& results) {
+    for (const auto& r : results) {
+        const std::pair<const char*, const CaseResult*> sides[] = {{"envoy", &r.envoy},
+                                                                   {"rut", &r.rut}};
+        for (const auto& side : sides) {
+            const std::string label = "case \"" + r.name + "\" (" + side.first + ")";
+            if (!side.second->exchange_complete) {
+                return label +
+                       ": downstream exchange did not complete (partial read/timeout); "
+                       "refusing to record it as evidence";
+            }
+            if (side.second->upstream_contact_count > 1) {
+                return label + ": upstream was contacted " +
+                       std::to_string(side.second->upstream_contact_count) +
+                       " times (expected at most 1); refusing to record ambiguous evidence";
+            }
+        }
+    }
+    return "";
+}
+
 // Writes both sides' bytes for every pair case as a transcript header, in
 // the same one-literal-per-wire-line style as `write_transcript`. This is
 // the "<out.inc>" CI artifact evidence for PR 6: unlike the oracle
 // transcript, each case here carries two upstream and two downstream
 // literals (`_envoy_*` / `_rut_*`) so a reviewer can diff them directly.
 bool write_pair_transcript(const std::string& path, const std::vector<PairCaseResult>& results) {
+    const std::string validation_error = validate_pair_results(results);
+    if (!validation_error.empty()) {
+        std::cerr << "FAIL: refusing to write pair transcript: " << validation_error << "\n";
+        return false;
+    }
     std::ofstream out(path, std::ios::trunc);
     if (!out) return false;
     time_t now = time(nullptr);
@@ -2728,8 +2764,9 @@ bool self_test_recording_upstream() {
 // Covers round-3 review thread P1 ("Reject partial exchanges before writing
 // the oracle transcript"): read_http_message() must report an incomplete
 // frame as incomplete rather than silently returning whatever partial bytes
-// it captured, and write_transcript() must refuse to write anything (no
-// output file at all) when any case is incomplete or the upstream was
+// it captured, and write_transcript()/write_pair_transcript() must refuse to
+// write anything (no output file at all) when any case -- or, for the pair
+// transcript, either side of any case -- is incomplete or the upstream was
 // contacted more than once.
 bool self_test_partial_exchange_rejection() {
     bool ok = true;
@@ -2889,6 +2926,57 @@ bool self_test_partial_exchange_rejection() {
                 signal(SIGXFSZ, old_handler);
             }
         }
+
+        // write_pair_transcript(): the same rule applies to EITHER side of a
+        // pair case (round-3 review, applied uniformly via
+        // validate_pair_results() so the pair transcript can't smuggle in
+        // evidence write_transcript would have refused).
+        const std::string pair_out_path = dir.path() + "/pair_transcript.inc";
+
+        PairCaseResult incomplete_pair;
+        incomplete_pair.name = "bad_incomplete_pair";
+        incomplete_pair.asserted = true;
+        incomplete_pair.envoy = good;
+        incomplete_pair.rut = good;
+        incomplete_pair.rut.exchange_complete = false;
+        if (write_pair_transcript(pair_out_path, {incomplete_pair})) {
+            std::cerr << "FAIL [self-test partial]: write_pair_transcript accepted an "
+                         "incomplete rut exchange\n";
+            ok = false;
+        }
+        if (stat(pair_out_path.c_str(), &st) == 0) {
+            std::cerr << "FAIL [self-test partial]: write_pair_transcript left a file behind "
+                         "for a rejected incomplete-exchange run\n";
+            ok = false;
+        }
+
+        PairCaseResult duplicated_pair;
+        duplicated_pair.name = "bad_duplicate_pair";
+        duplicated_pair.asserted = true;
+        duplicated_pair.envoy = good;
+        duplicated_pair.envoy.upstream_contact_count = 2;
+        duplicated_pair.rut = good;
+        if (write_pair_transcript(pair_out_path, {duplicated_pair})) {
+            std::cerr << "FAIL [self-test partial]: write_pair_transcript accepted a "
+                         "duplicated envoy upstream contact\n";
+            ok = false;
+        }
+        if (stat(pair_out_path.c_str(), &st) == 0) {
+            std::cerr << "FAIL [self-test partial]: write_pair_transcript left a file behind "
+                         "for a rejected duplicate-contact run\n";
+            ok = false;
+        }
+
+        PairCaseResult good_pair;
+        good_pair.name = "ok_pair";
+        good_pair.asserted = true;
+        good_pair.envoy = good;
+        good_pair.rut = good;
+        if (!write_pair_transcript(pair_out_path, {good_pair})) {
+            std::cerr << "FAIL [self-test partial]: write_pair_transcript rejected a fully "
+                         "valid run\n";
+            ok = false;
+        }
     }
 
     if (ok) std::cerr << "PASS [self-test partial exchange rejection]\n";
@@ -2943,8 +3031,8 @@ bool self_test_fake_listener_unblocks_on_shutdown() {
 // Covers round-3 review thread P2 ("Build the Docker argv before entering
 // the fork child"): build_argv() must produce a correctly null-terminated
 // argv that aliases its input, and the prebuild-then-fork pattern it enables
-// (used by run_and_wait()/EnvoyInstance::launch()) must actually work
-// end-to-end.
+// (used by run_and_wait()/EnvoyInstance::launch()/RutInstance::launch()/
+// run_converter_to_file()) must actually work end-to-end.
 bool self_test_argv_builder() {
     bool ok = true;
     const std::vector<std::string> input = {"printf", "one", "two"};
