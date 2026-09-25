@@ -1950,21 +1950,17 @@ TEST(envoy_convert, api_forged_model_rejected) {
         to_string(forged_action_kind_result.error().detail).find("action kind is not recognized") !=
         std::string::npos);
 
-    // Codex round-6 review: a hand-built model can set `match.kind` to a
-    // value outside {Prefix, Path} (the parser never produces this) while
-    // leaving `match.prefix` at the model's existing "/" bytes. `validate()`
-    // used to only rule out `Path` explicitly, then check the byte content
-    // of `match.prefix`; a forged kind with `prefix == "/"` would pass both
-    // checks and lower as the root catch-all even though it names no
-    // recognized match kind.
-    envoy::Bootstrap forged_match_kind = parsed.value();
-    forged_match_kind.listener.filter_chain.hcm.route_config.virtual_host.routes[0].match.kind =
-        static_cast<envoy::RouteMatchKind>(2);
-    const auto forged_match_kind_result = envoy::lower_to_rut(forged_match_kind, all_true);
-    CHECK_FALSE(forged_match_kind_result);
-    CHECK(forged_match_kind_result.error().code == FrontendError::UnexpectedToken);
-    CHECK(to_string(forged_match_kind_result.error().detail).find("match kind is not recognized") !=
-          std::string::npos);
+    // Codex round-6 review (693) / Codex round-5 review on PR #695
+    // (independently the same class of finding, against the route-list
+    // model's own `build_node_plan`): a hand-built model can set
+    // `match.kind` to a value outside {Prefix, Path} (the parser never
+    // produces this); see the `forged_match_kind` case further below for the
+    // route-list-model-specific regression test (an unvalidated,
+    // default-empty `match.prefix` used to underflow
+    // `strip_trailing_slash`'s `prefix.len - 1u` instead of failing closed).
+    // `validate()`'s per-route loop (src/envoy/converter.cc) now rejects any
+    // `match.kind` outside {Prefix, Path} before either code path is ever
+    // reached, so this is not repeated here.
 
     // Codex round-10 review (P2): `FixedVec::len` (include/rut/common/types.h)
     // is a public field with no accompanying bound check, and the
@@ -2039,6 +2035,23 @@ TEST(envoy_convert, api_forged_model_rejected) {
     backslash_byte_path.listener.filter_chain.hcm.route_config.virtual_host.routes[0].match.path =
         Str{"/a\\b", 4u};
     CHECK_FALSE(envoy::lower_to_rut(backslash_byte_path, all_true));
+
+    // Codex round-5 review: a hand-built model can set `match.kind` to a
+    // value outside {Prefix, Path} (the parser never produces this).
+    // `validate()` used to shape-check only the two known kinds and then
+    // treat every non-`Path` kind as a prefix when building the text/emit
+    // plan, so this forged discriminator used to reach `build_node_plan`
+    // with an unvalidated, default-empty `match.prefix` -- underflowing
+    // `strip_trailing_slash`'s `prefix.len - 1u` into a huge out-of-bounds
+    // view instead of failing closed.
+    envoy::Bootstrap forged_match_kind = parsed.value();
+    forged_match_kind.listener.filter_chain.hcm.route_config.virtual_host.routes[0].match.kind =
+        static_cast<envoy::RouteMatchKind>(7);
+    const auto forged_match_kind_result = envoy::lower_to_rut(forged_match_kind, all_true);
+    CHECK_FALSE(forged_match_kind_result);
+    CHECK(forged_match_kind_result.error().code == FrontendError::UnexpectedToken);
+    CHECK(to_string(forged_match_kind_result.error().detail).find("match kind is not recognized") !=
+          std::string::npos);
 }
 
 TEST(envoy_convert, colon_segment_allowed_in_exact_path_with_root_prefix) {
@@ -2102,6 +2115,52 @@ TEST(envoy_convert, api_forged_duplicate_cluster_name_rejected) {
     envoy::Bootstrap duplicate_cluster_name = parsed.value();
     duplicate_cluster_name.clusters[1].name = duplicate_cluster_name.clusters[0].name;
     CHECK_FALSE(envoy::lower_to_rut(duplicate_cluster_name, all_true));
+}
+
+TEST(envoy_convert, api_forged_malformed_cluster_name_rejected) {
+    // Codex round-5 review: `parse_cluster` (src/envoy/parser.cc) guarantees
+    // every parsed cluster name is backed, non-empty, and bounded, but a
+    // hand-built model bypasses that. Before the fix, the duplicate-name
+    // comparison ran directly on `model.clusters[i].name`, so a malformed
+    // later name reaching `Str::eq` (which compares by length first, then
+    // dereferences both `ptr`s byte-by-byte once lengths match) would
+    // dereference a null pointer instead of producing a diagnostic.
+    const std::string text = routes_scenario_a_json();
+    static envoy::JsonDocument doc;
+    auto parsed = envoy::parse_bootstrap_json(str(text), doc);
+    REQUIRE(parsed);
+    REQUIRE_EQ(parsed.value().clusters.len, 2u);
+    REQUIRE_EQ(parsed.value().clusters[0].name.len, 7u);  // "backend"
+    const envoy::RutCapabilities all_true{true, true, true};
+
+    // A null-backed name, the same length as clusters[0]'s ("backend", 7
+    // bytes) so `Str::eq`'s length check does not short-circuit before the
+    // byte loop would dereference the null pointer.
+    envoy::Bootstrap null_cluster_name = parsed.value();
+    null_cluster_name.clusters[1].name = Str{nullptr, 7u};
+    const auto null_cluster_name_result = envoy::lower_to_rut(null_cluster_name, all_true);
+    CHECK_FALSE(null_cluster_name_result);
+    CHECK(null_cluster_name_result.error().code == FrontendError::UnexpectedToken);
+    CHECK(to_string(null_cluster_name_result.error().detail).find("non-empty string") !=
+          std::string::npos);
+
+    // An empty name bypasses the parser's `name_string(..., allow_empty:
+    // false, ...)` the same way.
+    envoy::Bootstrap empty_cluster_name = parsed.value();
+    empty_cluster_name.clusters[1].name = Str{};
+    CHECK_FALSE(envoy::lower_to_rut(empty_cluster_name, all_true));
+
+    // A name over `kMaxEnvoyNameLen` (128) bytes bypasses the parser's
+    // length bound the same way.
+    static const std::string oversized_name(129u, 'a');
+    envoy::Bootstrap oversized_cluster_name = parsed.value();
+    oversized_cluster_name.clusters[1].name = str(oversized_name);
+    const auto oversized_cluster_name_result =
+        envoy::lower_to_rut(oversized_cluster_name, all_true);
+    CHECK_FALSE(oversized_cluster_name_result);
+    CHECK(oversized_cluster_name_result.error().code == FrontendError::UnsupportedSyntax);
+    CHECK(to_string(oversized_cluster_name_result.error().detail).find("bounded length") !=
+          std::string::npos);
 }
 
 // ── Increment 4: reject direct_response / redirect before the six
