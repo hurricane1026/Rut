@@ -1212,11 +1212,11 @@ static bool exact_read_validate_receipt(const ExactReadSupervisorReceipt& receip
            receipt.reserved == 0u && receipt.worker_pid > 0;
 }
 
-static bool run_exact_read_command_until(const std::vector<std::string>& arguments,
-                                         size_t stdout_limit,
-                                         std::int64_t final_deadline_ns,
-                                         ExactReadCommandResult& result,
-                                         ExactReadRunnerFault fault = ExactReadRunnerFault::None) {
+static bool run_exact_read_command_until_impl(const std::vector<std::string>& arguments,
+                                              size_t stdout_limit,
+                                              std::int64_t final_deadline_ns,
+                                              ExactReadCommandResult& result,
+                                              ExactReadRunnerFault fault) {
     ++command_invocation_count;
     ++observation_command_invocation_count;
     result = {};
@@ -1523,6 +1523,31 @@ static bool run_exact_read_command_until(const std::vector<std::string>& argumen
     return result.started && !result.deadline_exceeded && !result.output_overflow &&
            result.stdout_read_errno == 0 && result.stderr_read_errno == 0 &&
            result.cleanup_completed_before_final_deadline && result.group_echild_observed;
+}
+
+// run_exact_read_command_until is the exact-read counterpart to run_command()'s
+// slow-subprocess diagnostic above: the nginx differential rotation reads and
+// writes go through this supervisor/execve path instead of run_command_impl(),
+// bypassing that wrapper entirely, so a slow docker exec here previously left
+// no trace despite run_command() being documented as the single choke point.
+// Apply the same >2s argv+duration log here so both subprocess runners are
+// covered.
+static bool run_exact_read_command_until(const std::vector<std::string>& arguments,
+                                         size_t stdout_limit,
+                                         std::int64_t final_deadline_ns,
+                                         ExactReadCommandResult& result,
+                                         ExactReadRunnerFault fault = ExactReadRunnerFault::None) {
+    const auto invocation_start = std::chrono::steady_clock::now();
+    const bool ok = run_exact_read_command_until_impl(
+        arguments, stdout_limit, final_deadline_ns, result, fault);
+    const auto elapsed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                                std::chrono::steady_clock::now() - invocation_start)
+                                .count();
+    if (elapsed_ms > 2000) {
+        std::cerr << "[fixture_ipv4_topology] slow subprocess argv=[" << summarize_argv(arguments)
+                  << "] duration_ms=" << elapsed_ms << "\n";
+    }
+    return ok;
 }
 
 static bool run_exact_read_command(const std::vector<std::string>& arguments,
