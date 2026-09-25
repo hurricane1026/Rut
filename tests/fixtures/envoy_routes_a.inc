@@ -1,13 +1,24 @@
 #pragma once
 
-// Golden RUT output for envoy-pr-plan.md's PR 8 route-list lowering,
-// scenario (a): prefix "/api/" declared before the catch-all "/" (node
-// "/api" resolves the literal path "/api" via the root ancestor, not a 404).
-// All RutCapabilities are set to true (see tests/fixtures/envoy_milestone_s.inc
-// for why): this pins the target text byte for byte ahead of the runtime PRs
-// (PR3-PR5) that make each capability real. Recorded from
-// rut::envoy::lower_to_rut(model, {true, true, true}) via
-// tests/test_envoy_convert.cc's envoy_routes_a golden test.
+// NOT a golden success output (Codex round-6 review, P1): this scenario --
+// prefix "/api/" declared before the catch-all "/" (node "/api" resolves the
+// literal path "/api" via the root ancestor, not a 404) with all
+// RutCapabilities true -- is the exact text `rut::envoy::lower_to_rut` used
+// to return as a byte-for-byte pinned success. It is kept here, unchanged,
+// because it is still useful evidence: at 8804 bytes it is comfortably under
+// `RutSource::kCapacity` (128 KiB), but lexing it with `rut`'s own frontend
+// lexer (`rut::lex`) fails with `TooManyTokens` at byte 8400, because
+// `LexedTokens::kMaxTokens` (include/rut/compiler/lexer.h) is only 932
+// tokens -- a program the converter used to report success for but `rut`
+// itself cannot load. `lower_to_rut` now fails closed on this exact shape
+// instead (`TooManyTokens`, "generated RUT source exceeds the compiler
+// frontend's lexer token budget"); see
+// tests/test_envoy_convert.cc's `golden_routes_a_prefix_then_root`, which
+// asserts that rejection directly, and docs/envoy-converter.md's
+// "Known capability dependencies" / token-budget note for the current (932)
+// and post-#697 (4096) budget numbers. Recorded from
+// rut::envoy::lower_to_rut(model, {true, true, true}) before that fix
+// landed.
 static constexpr char kEnvoyRoutesAGolden[] = R"rut(listen :8080
 upstream envoy_cluster_0 at "127.0.0.1:9000"
 upstream envoy_cluster_1 at "127.0.0.1:9001"
