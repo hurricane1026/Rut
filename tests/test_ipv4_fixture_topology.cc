@@ -1,5 +1,4 @@
 #include "fixture_ipv4_topology.h"
-#include <cstdio>
 #include <cstdlib>
 #include <iostream>
 #include <string>
@@ -16,8 +15,10 @@ namespace {
 // comment on test_ipv4_fixture_topology for the measured run distribution
 // that motivated this). Uses clock_gettime(CLOCK_MONOTONIC) directly, the
 // same POSIX primitive fixture_ipv4_topology.cc's exact_read_monotonic_ns()
-// already relies on, rather than <chrono>/<iomanip>, so this file does not
-// add a new standard-library timing dependency.
+// already relies on, and formats the elapsed value with std::to_string
+// (already pulled in via <string> below) plus manual zero-padding instead of
+// <cstdio>'s std::snprintf, <chrono>, or <iomanip>, so this file does not add
+// any new standard-library dependency beyond what it already includes.
 timespec phase_clock_start() noexcept {
     timespec ts{};
     clock_gettime(CLOCK_MONOTONIC, &ts);
@@ -29,12 +30,20 @@ const timespec kPhaseClockStart = phase_clock_start();
 void log_phase(const char* name, const char* event) {
     timespec now{};
     clock_gettime(CLOCK_MONOTONIC, &now);
-    const double elapsed_seconds =
-        static_cast<double>(now.tv_sec - kPhaseClockStart.tv_sec) +
-        static_cast<double>(now.tv_nsec - kPhaseClockStart.tv_nsec) / 1e9;
-    char elapsed_buffer[32];
-    std::snprintf(elapsed_buffer, sizeof(elapsed_buffer), "%.3f", elapsed_seconds);
-    std::cout << "[+" << elapsed_buffer << "s] phase: " << name << " " << event << "\n";
+    long elapsed_sec = now.tv_sec - kPhaseClockStart.tv_sec;
+    long elapsed_nsec = now.tv_nsec - kPhaseClockStart.tv_nsec;
+    if (elapsed_nsec < 0) {
+        elapsed_nsec += 1000000000L;
+        elapsed_sec -= 1;
+    }
+    if (elapsed_sec < 0) {
+        elapsed_sec = 0;
+        elapsed_nsec = 0;
+    }
+    std::string millis = std::to_string(elapsed_nsec / 1000000L);
+    if (millis.size() < 3) millis.insert(0, 3 - millis.size(), '0');
+    std::cout << "[+" << elapsed_sec << "." << millis << "s] phase: " << name << " " << event
+              << "\n";
     std::cout.flush();
 }
 
