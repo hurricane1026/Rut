@@ -1955,6 +1955,73 @@ TEST(response_policy, upstream_header_order_rejects_duplicate_inline_headers) {
     REQUIRE(build_strict_response_headers(conn, config, response));
 }
 
+// Codex round-9 review: the round-8 fix above only covered Content-Type, Date
+// and Location. Envoy's HeaderMapImpl treats every name enumerated in
+// `kEnvoyInlineResponseHeaders` (callbacks_impl.h -- the full response-relevant
+// slice of `INLINE_RESP_HEADERS` + `INLINE_REQ_RESP_HEADERS`, minus
+// content-length/server/connection/transfer-encoding, which have their own
+// special-cased handling documented on that table) the same way: a
+// single-valued inline slot that coalesces a duplicate into the existing entry
+// rather than emitting two physical fields. Iterate the whole table and prove
+// each entry fails closed (502) on a duplicate and is still accepted with a
+// single occurrence, then prove a non-inline header (`x-custom`) may still
+// repeat -- this profile forwards ordinary headers verbatim in upstream order,
+// duplicates and all.
+TEST(response_policy, upstream_header_order_rejects_duplicate_of_every_inline_header) {
+    char server[] = "envoy";
+    ForwardResponsePolicySpec upstream_order{};
+    upstream_order.version = ResponsePolicyVersion::Http11;
+    upstream_order.framing = ResponsePolicyFraming::ContentLength;
+    upstream_order.connection = ResponsePolicyConnection::Request;
+    upstream_order.header_order = ResponsePolicyHeaderOrder::Upstream;
+    upstream_order.header_names = ResponsePolicyHeaderNames::Lowercase;
+    upstream_order.connection_header = ResponsePolicyConnectionHeader::CloseOnly;
+    upstream_order.status_reason = ResponsePolicyStatusReason::Canonical;
+    upstream_order.date = ResponsePolicyDate::PreserveOrCurrent;
+    upstream_order.server = {server, 5};
+    REQUIRE(response_policy_spec_valid(upstream_order));
+
+    RouteConfig config{};
+    REQUIRE_EQ(config.add_response_policy(upstream_order), 1u);
+
+    auto admits = [&](const std::string& upstream) {
+        u8 header_storage[SlicePool::kSliceSize]{};
+        Connection conn{};
+        conn.reset();
+        conn.response_header_slice = header_storage;
+        conn.response_header_buf.bind(header_storage, sizeof(header_storage));
+        conn.response_policy_id = 1;
+        conn.keep_alive = true;
+        conn.req_client_keep_alive = true;
+
+        HttpResponseParser parser;
+        ParsedResponse response;
+        parser.reset();
+        response.reset();
+        if (parser.parse(reinterpret_cast<const u8*>(upstream.data()),
+                         static_cast<u32>(upstream.size()),
+                         &response) != ParseStatus::Complete)
+            return false;
+        return build_strict_response_headers(conn, config, response);
+    };
+
+    for (u32 t = 0; t < kEnvoyInlineResponseHeaderCount; t++) {
+        const Str name = kEnvoyInlineResponseHeaders[t];
+        const std::string name_str(name.ptr, name.len);
+
+        // Two occurrences of this inline header must fail closed (502).
+        CHECK_FALSE(admits("HTTP/1.1 200 OK\r\n" + name_str + ": a\r\nContent-Length: 2\r\n" +
+                           name_str + ": b\r\n\r\nhi"));
+
+        // A single occurrence of the same header must still be accepted.
+        CHECK(admits("HTTP/1.1 200 OK\r\n" + name_str + ": a\r\nContent-Length: 2\r\n\r\nhi"));
+    }
+
+    // A non-inline header may still repeat: this profile forwards ordinary
+    // headers verbatim in upstream order without deduplicating them.
+    CHECK(admits("HTTP/1.1 200 OK\r\nx-custom: a\r\nContent-Length: 2\r\nx-custom: b\r\n\r\nhi"));
+}
+
 TEST(response_policy, failure_head_mode_config_copy_is_owned_and_deduplicated) {
     char reason[] = "Bad Gateway";
     char type[] = "text/plain";

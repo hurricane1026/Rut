@@ -11161,6 +11161,50 @@ inline bool stage_redirect_response(Connection& conn, const RouteConfig& config,
     return conn.send_buf.write(scratch, len) == len;
 }
 
+// Every Envoy inline *response* header (envoy/http/header_map.h,
+// `INLINE_RESP_HEADERS` + `INLINE_REQ_RESP_HEADERS`, pinned v1.39.1), minus the
+// four names carved out with their own special-cased handling in
+// `build_upstream_order_response_headers` below:
+//   - `content-length`: already rejected on duplicate by the
+//     `content_length_count != 1` precondition at the top of that function
+//     (a fixed, singular framing field, checked before this table is
+//     consulted at all).
+//   - `server`: Envoy's `server_header_transformation: OVERWRITE` replaces
+//     the upstream value in place rather than rejecting a duplicate, so it is
+//     deliberately deduplicated first-wins by the dedicated `is_server`
+//     branch below instead of failing closed here.
+//   - `connection`: counted and rejected on duplicate by its own counter in
+//     the loop below, kept separate because that same loop also consults it
+//     for close/upgrade handling unrelated to this table.
+//   - `transfer-encoding`: any occurrence at all (not just a duplicate) is
+//     already rejected in the loop below, matching Envoy's protocol-error
+//     handling for a non-"chunked" coding -- strictly stronger than a
+//     duplicate check, so adding it here would be redundant.
+// `:status` (`INLINE_RESP_NUMERIC_HEADERS` -> `Status`) is also excluded: it
+// is an HTTP/2 pseudo-header carried on the status line, never a literal
+// HTTP/1.1 header field, so it can never appear in `resp.headers` here.
+inline constexpr Str kEnvoyInlineResponseHeaders[] = {
+    lit_str("content-type"),
+    lit_str("date"),
+    lit_str("keep-alive"),
+    lit_str("location"),
+    lit_str("proxy-connection"),
+    lit_str("proxy-status"),
+    lit_str("upgrade"),
+    lit_str("via"),
+    lit_str("x-envoy-attempt-count"),
+    lit_str("x-envoy-decorator-operation"),
+    lit_str("x-envoy-degraded"),
+    lit_str("x-envoy-immediate-health-check-fail"),
+    lit_str("x-envoy-ratelimited"),
+    lit_str("x-envoy-upstream-canary"),
+    lit_str("x-envoy-upstream-healthchecked-cluster"),
+    lit_str("x-envoy-upstream-service-time"),
+    lit_str("x-request-id"),
+};
+inline constexpr u32 kEnvoyInlineResponseHeaderCount =
+    sizeof(kEnvoyInlineResponseHeaders) / sizeof(kEnvoyInlineResponseHeaders[0]);
+
 // Envoy H1 profile (`header_order == Upstream`): preserves the upstream
 // header order, lowercases every forwarded name, keeps an upstream `date`
 // header in place (or appends one when absent), replaces the first `server`
@@ -11197,27 +11241,25 @@ inline bool build_upstream_order_response_headers(
         if ((c < 0x20 && c != '\t') || c == 0x7f) return false;
     }
     u32 connection_count = 0;
-    // Envoy's HeaderMapImpl stores these as single-valued "inline" header slots
-    // and coalesces a duplicate into the existing entry (comma-joined) rather
-    // than emitting a second physical field. This profile forwards headers
-    // verbatim in upstream order instead of rebuilding a HeaderMap, so it
-    // cannot reproduce that join; a duplicate would otherwise reach the client
-    // as two physical `content-type` / `date` / `location` lines, which no
-    // HTTP/1.1 client (or Envoy) ever emits for these fields. Fail closed
-    // instead of guessing which one wins. Content-Length duplicates are
-    // already rejected by the `content_length_count != 1` precondition above,
-    // and a duplicate Server is deliberately deduplicated (first wins) rather
-    // than rejected -- see the dedicated `is_server` branch below.
-    u32 content_type_count = 0;
-    u32 date_count = 0;
-    u32 location_count = 0;
+    // See the comment on `kEnvoyInlineResponseHeaders` above: Envoy stores
+    // every name in that table as a single-valued "inline" header slot and
+    // coalesces a duplicate into the existing entry (comma-joined) rather than
+    // emitting a second physical field. This profile forwards headers verbatim
+    // in upstream order instead of rebuilding a HeaderMap, so it cannot
+    // reproduce that join; a duplicate would otherwise reach the client as two
+    // physical lines for a header Envoy always serializes as one. Fail closed
+    // instead of guessing which occurrence wins.
+    u32 inline_header_counts[kEnvoyInlineResponseHeaderCount] = {};
     for (u32 i = 0; i < resp.header_count; i++) {
         const Str name = resp.headers[i].name;
         if (response_policy_name_eq(name, "connection", 10) && ++connection_count > 1) return false;
-        if (response_policy_name_eq(name, "content-type", 12) && ++content_type_count > 1)
-            return false;
-        if (response_policy_name_eq(name, "date", 4) && ++date_count > 1) return false;
-        if (response_policy_name_eq(name, "location", 8) && ++location_count > 1) return false;
+        for (u32 t = 0; t < kEnvoyInlineResponseHeaderCount; t++) {
+            const Str inline_name = kEnvoyInlineResponseHeaders[t];
+            if (name.len == inline_name.len &&
+                http_header_name_eq_ci(name.ptr, name.len, inline_name.ptr, inline_name.len) &&
+                ++inline_header_counts[t] > 1)
+                return false;
+        }
         // `resp.chunked` (rejected above) is only set when the Transfer-Encoding
         // token list contains "chunked"; a coding such as `gzip` or
         // `chunked, gzip` leaves it false while still carrying the field, which
