@@ -23,7 +23,17 @@ jobs:
       github.event_name == 'workflow_dispatch' ||
       (github.event_name == 'push' && github.ref == 'refs/heads/main')
     runs-on: ubuntu-24.04
-    timeout-minutes: 30
+    # Worst-case sum of the per-step budgets below plus the other steps'
+    # typical durations from a recent green run (run 36120970853, main,
+    # 2026-09-25): topology direct 300s + topology ctest 300s + broker
+    # direct 360s + broker ctest 360s + differential direct 360s +
+    # differential ctest 360s = 2040s (34m) of test budget, plus checkout
+    # 20s + install deps 23s + preflight 1s + image provisioning 4s +
+    # configure 6s + build 319s + audit/upload/setup/complete ~5s = 378s
+    # (~6.3m) of surrounding steps = 2418s (~40.3m) worst case. Raise to
+    # 45m so the job deadline cannot fire before the per-test budgets are
+    # exhausted.
+    timeout-minutes: 45
 
     steps:
       - name: Initialize logs
