@@ -4303,7 +4303,7 @@ TEST(request_policy, preserve_host_lowercase_wire_and_fail_closed_host) {
         "x-envoy-internal-extra: keep\r\n"
         "x-forwarded-client-cert-extra: keep\r\n"
         "x-forwarded-proto: http\r\n\r\n");
-    // Every other named header in the fixed sixteen-name removal set is
+    // Every other named header in the fixed seventeen-name removal set is
     // dropped too, not only the ones exercised above.
     prepare(
         "GET /envoy-internal-headers-full HTTP/1.1\r\n"
@@ -4321,10 +4321,91 @@ TEST(request_policy, preserve_host_lowercase_wire_and_fail_closed_host) {
         "X-Envoy-Ip-Tags: internal\r\n"
         "X-Envoy-Original-Url: https://evil.example/\r\n"
         "X-Envoy-Hedge-On-Per-Try-Timeout: true\r\n"
-        "X-Forwarded-Client-Cert: Hash=deadbeef\r\n\r\n");
+        "X-Forwarded-Client-Cert: Hash=deadbeef\r\n"
+        "X-Envoy-External-Address: 10.0.0.1\r\n\r\n");
     REQUIRE(apply_request_policy(conn, endpoint, kPreserveHost));
     require_wire(
         "GET /envoy-internal-headers-full HTTP/1.1\r\nhost: client.example\r\n"
+        "x-forwarded-proto: http\r\n\r\n");
+
+    // Positive strip test for the round-8 addition on its own: a
+    // client-forged `X-Envoy-External-Address` must not survive even though
+    // a real Envoy configured this exact way (no `use_remote_address: true`)
+    // would not strip it either -- Rut strips it anyway so a client can
+    // never assert the trusted-hop address for itself (Codex round-8
+    // review).
+    prepare(
+        "GET /envoy-external-address-only HTTP/1.1\r\n"
+        "Host: client.example\r\n"
+        "X-Envoy-External-Address: 10.0.0.1\r\n\r\n");
+    REQUIRE(apply_request_policy(conn, endpoint, kPreserveHost));
+    require_wire(
+        "GET /envoy-external-address-only HTTP/1.1\r\nhost: client.example\r\n"
+        "x-forwarded-proto: http\r\n\r\n");
+    // Matches case-insensitively and on every physical field, while an
+    // ordinary neighbour and a longer name that merely starts with it are
+    // kept (exact-name match, not a prefix match).
+    prepare(
+        "GET /envoy-external-address-mixed HTTP/1.1\r\n"
+        "Host: client.example\r\n"
+        "x-envoy-external-address: 10.0.0.1\r\n"
+        "X-Regular: keep\r\n"
+        "X-ENVOY-EXTERNAL-ADDRESS: 10.0.0.2\r\n"
+        "X-Envoy-External-Address-Extra: keep\r\n\r\n");
+    REQUIRE(apply_request_policy(conn, endpoint, kPreserveHost));
+    require_wire(
+        "GET /envoy-external-address-mixed HTTP/1.1\r\nhost: client.example\r\n"
+        "x-regular: keep\r\n"
+        "x-envoy-external-address-extra: keep\r\n"
+        "x-forwarded-proto: http\r\n\r\n");
+
+    // TE nomination: `Connection: TE` plus `TE: trailers` must still keep
+    // the canonical `te: trailers` line -- HTTP/1.1 senders are expected to
+    // nominate TE in Connection alongside sending it, and Envoy's own
+    // `sanitizeConnectionHeader` special-cases exactly this token instead of
+    // unconditionally removing it (Codex round-8 review).
+    prepare(
+        "GET /nominate-te-trailers HTTP/1.1\r\n"
+        "Host: client.example\r\n"
+        "Connection: TE\r\n"
+        "TE: trailers\r\n\r\n");
+    REQUIRE(apply_request_policy(conn, endpoint, kPreserveHost));
+    require_wire(
+        "GET /nominate-te-trailers HTTP/1.1\r\nhost: client.example\r\n"
+        "te: trailers\r\nx-forwarded-proto: http\r\n\r\n");
+
+    // TE nomination without a trailers token still drops the header, same
+    // as an un-nominated non-trailers TE field.
+    prepare(
+        "GET /nominate-te-gzip HTTP/1.1\r\n"
+        "Host: client.example\r\n"
+        "Connection: TE\r\n"
+        "TE: gzip\r\n\r\n");
+    REQUIRE(apply_request_policy(conn, endpoint, kPreserveHost));
+    require_wire(
+        "GET /nominate-te-gzip HTTP/1.1\r\nhost: client.example\r\n"
+        "x-forwarded-proto: http\r\n\r\n");
+
+    // An empty client-supplied X-Forwarded-Proto value is treated as absent:
+    // the empty field is dropped and the synthesized default is still
+    // appended, rather than forwarding a blank scheme.
+    prepare(
+        "GET /xfp-empty HTTP/1.1\r\n"
+        "Host: client.example\r\n"
+        "X-Forwarded-Proto:\r\n\r\n");
+    REQUIRE(apply_request_policy(conn, endpoint, kPreserveHost));
+    require_wire(
+        "GET /xfp-empty HTTP/1.1\r\nhost: client.example\r\n"
+        "x-forwarded-proto: http\r\n\r\n");
+
+    // Same for an OWS-only value.
+    prepare(
+        "GET /xfp-ows-only HTTP/1.1\r\n"
+        "Host: client.example\r\n"
+        "X-Forwarded-Proto:   \r\n\r\n");
+    REQUIRE(apply_request_policy(conn, endpoint, kPreserveHost));
+    require_wire(
+        "GET /xfp-ows-only HTTP/1.1\r\nhost: client.example\r\n"
         "x-forwarded-proto: http\r\n\r\n");
 }
 

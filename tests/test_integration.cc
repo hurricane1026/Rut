@@ -24907,6 +24907,7 @@ TEST(route, forward_request_policy_preserve_host_lowercase_strips_client_envoy_i
         "X-Envoy-Retry-On: 5xx\r\n"
         "X-Envoy-Internal: true\r\n"
         "X-Forwarded-Client-Cert: Hash=0123abcd;URI=spiffe://mesh/admin\r\n"
+        "X-Envoy-External-Address: 10.0.0.1\r\n"
         "X-Regular: keep\r\n"
         "\r\n";
     static constexpr char kExpectedUpstream[] =
@@ -24929,14 +24930,16 @@ TEST(route, forward_request_policy_preserve_host_lowercase_strips_client_envoy_i
     const u32 recorded_len = upstream.request_history_len[0];
     REQUIRE_EQ(recorded_len, static_cast<u32>(sizeof(kExpectedUpstream) - 1));
     CHECK_EQ(__builtin_memcmp(upstream.request_history[0], kExpectedUpstream, recorded_len), 0);
-    // Belt-and-suspenders: the headers named in the round-6 and round-7
-    // reviews must not appear anywhere in what the upstream received,
-    // however they are cased.
+    // Belt-and-suspenders: the headers named in the round-6, round-7, and
+    // round-8 reviews must not appear anywhere in what the upstream
+    // received, however they are cased.
     CHECK_FALSE(buf_contains(upstream.request_history[0], recorded_len, "rq-timeout-ms", 13));
     CHECK_FALSE(buf_contains(upstream.request_history[0], recorded_len, "retry-on", 8));
     CHECK_FALSE(buf_contains(upstream.request_history[0], recorded_len, "envoy-internal", 14));
     CHECK_FALSE(buf_contains(upstream.request_history[0], recorded_len, "client-cert", 11));
     CHECK_FALSE(buf_contains(upstream.request_history[0], recorded_len, "spiffe", 6));
+    CHECK_FALSE(buf_contains(upstream.request_history[0], recorded_len, "external-address", 16));
+    CHECK_FALSE(buf_contains(upstream.request_history[0], recorded_len, "10.0.0.1", 8));
 }
 
 // A body-carrying request (ID4, preserved Host) paired with a response_policy

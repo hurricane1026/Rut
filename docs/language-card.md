@@ -340,13 +340,18 @@ return forward(users, request_policy: {
 // x-forwarded-host/x-forwarded-proto, nominating any of which (or a
 // pseudo-header-shaped token starting with `:`) fails closed; keeps `te`
 // when a comma-separated token is `trailers`, per field (rewritten to that
-// exact lowercase token; two trailers-carrying fields collapse to one line);
-// rejects Connection nominating `upgrade` alongside an Upgrade header (even
-// with `close`) but admits and strips a bare Upgrade header otherwise;
-// rejects more than one X-Forwarded-Proto field; rejects a fragment-bearing
-// request target; and drops the sixteen client-supplied headers Envoy itself
-// strips for external requests (`x-envoy-internal`, fourteen more `x-envoy-*`
-// names, and `x-forwarded-client-cert`; docs/envoy-compatibility.md).
+// exact lowercase token; two trailers-carrying fields collapse to one line;
+// a Connection nomination of `te` itself does not force a drop -- this same
+// trailers check decides its fate, matching Envoy's own nomination special
+// case); rejects Connection nominating `upgrade` alongside an Upgrade header
+// (even with `close`) but admits and strips a bare Upgrade header otherwise;
+// rejects more than one X-Forwarded-Proto field; treats an empty or
+// OWS-only X-Forwarded-Proto value as absent (dropped, not forwarded blank);
+// rejects a fragment-bearing request target; and drops the seventeen
+// client-supplied headers Envoy itself strips for external requests, plus
+// one Rut-side hardening addition (`x-envoy-internal`, fourteen more
+// `x-envoy-*` names, `x-forwarded-client-cert`, and
+// `x-envoy-external-address`; docs/envoy-compatibility.md).
 return forward(users, request_policy: {
     version: "HTTP/1.1", host: "preserve", connection: "omit",
     header_names: "lowercase", forwarded_proto: "http",

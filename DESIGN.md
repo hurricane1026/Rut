@@ -1968,13 +1968,18 @@ profile targets, since the milestone bootstrap never sets
 `use_remote_address: true` (so a request can never become internal) nor
 `forward_client_cert_details` (default `SANITIZE`): `x-envoy-internal`, the
 fourteen `x-envoy-*` names `cleanInternalHeaders` removes unconditionally,
-and `x-forwarded-client-cert` -- sixteen in total (see
+`x-forwarded-client-cert`, and (Rut-side hardening, not an Envoy-parity
+claim) `x-envoy-external-address` -- seventeen in total (see
 `docs/envoy-compatibility.md` for the exact list; the handful of
 edge-request-only removals are unreachable under that fixed shape and pass
-through unchanged); and appends
-`x-forwarded-proto: http` as the last header only when the client did
-not already send one (a client-supplied value is kept unchanged, in its
-original position). It is closed to ordinary
+through unchanged); a `Connection` nomination of `te` is exempt from the
+generic nomination drop -- the `te`/`trailers` handling above decides its
+fate instead, matching Envoy's own `sanitizeConnectionHeader` special case;
+and appends `x-forwarded-proto: http` as the last header only when the
+client did not already send one with a non-empty, non-OWS-only value (an
+empty or OWS-only client-supplied field is dropped and treated as absent,
+not forwarded as a blank scheme; a non-empty client-supplied value is kept
+unchanged, in its original position). It is closed to ordinary
 zero-copy-shaped forwards: a request with a body paired with a client
 `Expect` header, or with `Transfer-Encoding`, fails closed rather than
 proxying with ambiguous framing (no `100 Continue` interim-response support
