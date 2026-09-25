@@ -1097,16 +1097,33 @@ inline VerifyResult verify_module_impl(const Module& mod,
             !forward_response_buffering_mode_valid(bundle.response_buffering) ||
             (seconds == 0 && bundle.failure_policy_id == 0) ||
             // `header_order: "upstream"` is ordinary-forward-only (see
-            // analyze.cc): it never carries response read timing, response
-            // buffering, or a timeout failure policy bundle. Mirror the
-            // compile_to_config.h rejection here so a hand-built module that
-            // skipped analyze cannot be reported as verified and only fail
-            // later during populate_route_config.
+            // analyze.cc, compile_to_config.h, and route_table.h): it never
+            // carries response read timing, response buffering, or a timeout
+            // failure policy. Repeat that invariant here so a hand-built
+            // module that skipped analyze cannot verify successfully with a
+            // bundle the deadline/buffering helpers assume never exists.
             (bundle.response_policy_id != 0 &&
+             bundle.response_policy_id <= mod.response_policy_count &&
              mod.response_policies[bundle.response_policy_id - 1].header_order ==
                  ResponsePolicyHeaderOrder::Upstream &&
              (seconds != 0 || bundle.response_buffering != ForwardResponseBufferingMode::None ||
-              bundle.timeout_failure_policy_id != 0)))
+              bundle.timeout_failure_policy_id != 0)) ||
+            // Envoy H1 status 503 / header_order: "length_type_date_server" is
+            // ordinary connect-failure-only (see analyze.cc,
+            // compile_to_config.h, and route_table.h): the runtime's
+            // response-read-deadline preflight hard-requires the default
+            // failure policy's status to be 502 and closes the downstream
+            // connection on mismatch, so a bundle pairing this layout with a
+            // response read timeout would drop every matching request. This
+            // is the fourth trust boundary (verify_module), so reject the
+            // same combination a hand-built module could otherwise slip past
+            // verification only to be refused later by
+            // populate_verified_route_config.
+            (bundle.failure_policy_id != 0 &&
+             bundle.failure_policy_id <= mod.failure_policy_count &&
+             mod.failure_policies[bundle.failure_policy_id - 1].header_order ==
+                 FailurePolicyHeaderOrder::LengthTypeDateServer &&
+             seconds != 0))
             return verify_fail(summary, VerifyIssueCode::InvalidForwardPreflight, 0);
         if (bundle.response_buffering != ForwardResponseBufferingMode::None &&
             (bundle.response_buffering != ForwardResponseBufferingMode::CompleteContentLength ||

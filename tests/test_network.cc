@@ -69426,6 +69426,95 @@ TEST(state_invariant, jit_forward_failure_bundle_connect_submit_serializes_and_c
     loop.close_conn(*c);
 }
 
+static u64 round4_drain_connect_failure_handler(void*, jit::HandlerCtx*, const u8*, u32, void*) {
+    return jit::HandlerResult::make_forward_with_bundle(0, 0, 1).pack();
+}
+
+// Codex round-4 review: respond_upstream_connect_failure serializes the Envoy
+// H1 connect-failure layout (header_order: length_type_date_server) using
+// conn.keep_alive && conn.req_client_keep_alive alone, the same way the other
+// connect-failure entry points (respond_validated_preconnect_failure,
+// respond_validated_connect_completion_failure) did before this fix. None of
+// them folded in the shard's graceful-drain state, so a shard beginning to
+// drain while a connect attempt was outstanding would serialize a response
+// that omits `connection: close` (persistence by omission is this layout's
+// contract -- see build_bounded_local_response_bytes) and then still close
+// the downstream socket in on_response_sent, which checks loop->is_draining()
+// unconditionally. Assert the close-only layout now folds in drain state the
+// same way handle_configured_strict_local_response_in_scope already does for
+// the configured local-response path, via ordinary_local_response_may_persist.
+TEST(state_invariant, connect_failure_envoy_503_omits_close_only_while_not_draining) {
+    static constexpr char kRequest[] = "GET /api HTTP/1.1\r\nHost: client.example\r\n\r\n";
+    RouteConfig cfg{};
+    REQUIRE(cfg.add_upstream("api", 0x7F000001, 9000).has_value());
+    ForwardFailurePolicySpec failure{};
+    failure.version = ForwardFailurePolicyVersion::Http11;
+    failure.status_code = 503;
+    failure.header_order = FailurePolicyHeaderOrder::LengthTypeDateServer;
+    failure.date = ForwardFailurePolicyDate::Current;
+    failure.connection = ForwardFailurePolicyConnection::Request;
+    failure.head_mode = FailurePolicyHeadMode::Reject;
+    failure.reason = {"Service Unavailable", 19};
+    failure.content_type = {"text/plain", 10};
+    failure.server = {"envoy", 5};
+    failure.body = {"connect failure", 15};
+    REQUIRE_EQ(cfg.add_failure_policy(failure), 1u);
+    REQUIRE_EQ(cfg.add_policy_bundle(0, 1), 1u);
+    REQUIRE(cfg.add_jit_handler("/api", kRouteMethodGet, &round4_drain_connect_failure_handler));
+    const RouteConfig* active = &cfg;
+
+    SmallLoop loop;
+    loop.setup();
+    loop.config_ptr = &active;
+    auto* conn = loop.alloc_conn();
+    REQUIRE(conn != nullptr);
+    REQUIRE_EQ(conn->recv_buf.write(reinterpret_cast<const u8*>(kRequest), sizeof(kRequest) - 1),
+               sizeof(kRequest) - 1);
+    on_header_received<SmallLoop>(
+        &loop, *conn, make_ev(conn->id, IoEventType::Recv, sizeof(kRequest) - 1));
+    REQUIRE_GE(conn->upstream_fd, 0);
+    REQUIRE_EQ(conn->on_upstream_send, &on_upstream_connected<SmallLoop>);
+    CHECK(conn->keep_alive);
+    CHECK(conn->req_client_keep_alive);
+
+    // Baseline (not draining): the default HTTP/1.1 persistent request keeps
+    // the connection open, so the close-only layout omits `connection:`
+    // entirely (persistence by omission).
+    loop.inject_and_dispatch(make_ev(conn->id, IoEventType::UpstreamConnect, -ECONNREFUSED));
+    CHECK_EQ(conn->resp_status, 503u);
+    CHECK(conn->keep_alive);
+    CHECK(buf_has(
+        conn->send_buf.data(), conn->send_buf.len(), "HTTP/1.1 503 Service Unavailable\r\n"));
+    CHECK_FALSE(buf_has(conn->send_buf.data(), conn->send_buf.len(), "connection:"));
+    loop.close_conn(*conn);
+
+    // Draining while the connect attempt is outstanding: the response must
+    // now advertise `connection: close` and conn.keep_alive must be false, so
+    // the client is never told the connection persists only to be met with an
+    // unexpected EOF from on_response_sent's unconditional drain check.
+    auto* draining_conn = loop.alloc_conn();
+    REQUIRE(draining_conn != nullptr);
+    REQUIRE_EQ(
+        draining_conn->recv_buf.write(reinterpret_cast<const u8*>(kRequest), sizeof(kRequest) - 1),
+        sizeof(kRequest) - 1);
+    on_header_received<SmallLoop>(
+        &loop, *draining_conn, make_ev(draining_conn->id, IoEventType::Recv, sizeof(kRequest) - 1));
+    REQUIRE_GE(draining_conn->upstream_fd, 0);
+    CHECK(draining_conn->keep_alive);
+    loop.draining = true;
+    loop.inject_and_dispatch(
+        make_ev(draining_conn->id, IoEventType::UpstreamConnect, -ECONNREFUSED));
+    CHECK_EQ(draining_conn->resp_status, 503u);
+    CHECK_FALSE(draining_conn->keep_alive);
+    CHECK(buf_has(draining_conn->send_buf.data(),
+                  draining_conn->send_buf.len(),
+                  "HTTP/1.1 503 Service Unavailable\r\n"));
+    CHECK(buf_has(
+        draining_conn->send_buf.data(), draining_conn->send_buf.len(), "\r\nconnection: close"));
+    loop.draining = false;
+    loop.close_conn(*draining_conn);
+}
+
 TEST(state_invariant, timeout_failure_policy_id_is_pinned_through_body_wait_and_reset) {
     RouteConfig cfg{};
     auto upstream = cfg.add_upstream("api", 0x7F000001, 9000);

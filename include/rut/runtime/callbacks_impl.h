@@ -10686,6 +10686,18 @@ inline void respond_validated_preconnect_failure(Loop* loop,
         return;
     }
 
+    // Fold the shard's graceful-drain state into the persistence decision
+    // before serializing the connect-failure policy, exactly as
+    // handle_configured_strict_local_response_in_scope already does through
+    // ordinary_local_response_may_persist for the configured local-response
+    // path. Otherwise a shard that starts draining while this connect
+    // attempt is still outstanding would serialize a response that omits
+    // `connection: close` (or sends `keep-alive`) and then still close the
+    // downstream socket in on_validated_preconnect_failure_sent, so the
+    // client would see persistence advertised and then an unexpected EOF.
+    conn.keep_alive =
+        ordinary_local_response_may_persist(loop, conn, /*terminal_baseline=*/conn.keep_alive);
+
     u8 scratch[SlicePool::kSliceSize];
     u32 response_len = 0;
     if (!build_failure_policy_response(conn,
@@ -10703,7 +10715,9 @@ inline void respond_validated_preconnect_failure(Loop* loop,
         return;
     }
 
-    // Everything above is read-only, including serialization. There is no
+    // Everything above (besides the keep_alive persistence decision folded in
+    // just above, which fail_closed()'s unconditional close makes moot on any
+    // failure branch) is read-only, including serialization. There is no
     // connect CQE owner at either site, so the never-armed deadline and local fd
     // can now be neutralized without a tombstone or health episode.
     if constexpr (requires(Loop* candidate, Connection& c) {
@@ -10731,7 +10745,6 @@ inline void respond_validated_preconnect_failure(Loop* loop,
         fail_closed();
         return;
     }
-    conn.keep_alive = conn.keep_alive && conn.req_client_keep_alive;
     conn.resp_status = policy_status;
     conn.resp_body_mode = BodyMode::None;
     conn.resp_body_remaining = 0;
@@ -10770,6 +10783,12 @@ inline void respond_validated_connect_completion_failure(Loop* loop,
         fail_closed();
         return;
     }
+
+    // Fold the shard's graceful-drain state into the persistence decision
+    // before serializing the connect-failure policy -- see the identical
+    // comment in respond_validated_preconnect_failure above.
+    conn.keep_alive =
+        ordinary_local_response_may_persist(loop, conn, /*terminal_baseline=*/conn.keep_alive);
 
     u8 scratch[SlicePool::kSliceSize];
     u32 response_len = 0;
@@ -10833,7 +10852,6 @@ inline void respond_validated_connect_completion_failure(Loop* loop,
         fail_closed();
         return;
     }
-    conn.keep_alive = conn.keep_alive && conn.req_client_keep_alive;
     conn.resp_status = policy_status;
     conn.resp_body_mode = BodyMode::None;
     conn.resp_body_remaining = 0;
@@ -10909,6 +10927,13 @@ inline void respond_upstream_connect_failure(Loop* loop, Connection& conn) {
     bool serialized = false;
     u16 policy_status = kStatusBadGateway;
     if (conn.failure_policy_id != 0 && conn.request_config != nullptr) {
+        // Fold the shard's graceful-drain state into the persistence decision
+        // before serializing the connect-failure policy -- see the identical
+        // comment in respond_validated_preconnect_failure above. on_response_sent
+        // closes the downstream socket whenever the loop is draining, so the
+        // serialized bytes must not advertise persistence in that case.
+        conn.keep_alive =
+            ordinary_local_response_may_persist(loop, conn, /*terminal_baseline=*/conn.keep_alive);
         // Build off-buffer so a capacity/date failure cannot publish a partial
         // policy response or accidentally fall through to the legacy body.
         u8 scratch[SlicePool::kSliceSize];
@@ -10924,7 +10949,6 @@ inline void respond_upstream_connect_failure(Loop* loop, Connection& conn) {
             serialized = conn.send_buf.write(scratch, serialized_len) == serialized_len;
         }
         if (serialized) {
-            conn.keep_alive = conn.keep_alive && conn.req_client_keep_alive;
             // The client received whatever status the selected policy
             // serialized (e.g. a 503 Envoy connect-failure layout); bookkeeping
             // must match the wire response, not the legacy 502 fallback.
