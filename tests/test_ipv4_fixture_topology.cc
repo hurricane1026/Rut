@@ -1,10 +1,11 @@
 #include "fixture_ipv4_topology.h"
-#include <chrono>
+#include <cstdio>
 #include <cstdlib>
-#include <iomanip>
 #include <iostream>
 #include <string>
 #include <utility>
+
+#include <time.h>
 
 namespace {
 
@@ -13,14 +14,27 @@ namespace {
 // flushed, so each line is written and flushed immediately; the goal is to
 // see in the log where the wall time went (see tests/CMakeLists.txt TIMEOUT
 // comment on test_ipv4_fixture_topology for the measured run distribution
-// that motivated this).
-const std::chrono::steady_clock::time_point kPhaseClockStart = std::chrono::steady_clock::now();
+// that motivated this). Uses clock_gettime(CLOCK_MONOTONIC) directly, the
+// same POSIX primitive fixture_ipv4_topology.cc's exact_read_monotonic_ns()
+// already relies on, rather than <chrono>/<iomanip>, so this file does not
+// add a new standard-library timing dependency.
+timespec phase_clock_start() noexcept {
+    timespec ts{};
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return ts;
+}
+
+const timespec kPhaseClockStart = phase_clock_start();
 
 void log_phase(const char* name, const char* event) {
+    timespec now{};
+    clock_gettime(CLOCK_MONOTONIC, &now);
     const double elapsed_seconds =
-        std::chrono::duration<double>(std::chrono::steady_clock::now() - kPhaseClockStart).count();
-    std::cout << "[+" << std::fixed << std::setprecision(3) << elapsed_seconds
-              << "s] phase: " << name << " " << event << "\n";
+        static_cast<double>(now.tv_sec - kPhaseClockStart.tv_sec) +
+        static_cast<double>(now.tv_nsec - kPhaseClockStart.tv_nsec) / 1e9;
+    char elapsed_buffer[32];
+    std::snprintf(elapsed_buffer, sizeof(elapsed_buffer), "%.3f", elapsed_seconds);
+    std::cout << "[+" << elapsed_buffer << "s] phase: " << name << " " << event << "\n";
     std::cout.flush();
 }
 
