@@ -351,9 +351,9 @@ The milestone-S bootstrap (the accepted-JSON milestone above, plus
 `suppress_envoy_headers: true` and `timeout: "0s"`) lowers to the RUT below
 once every capability in `rut::envoy::RutCapabilities` is available. The
 shipped converter (`rut::envoy::kShippedRutCapabilities`: `request_envoy_h1`
-`true` since PR3, `response_envoy_h1` and `local_reply_envoy_h1` still
-`false`) fails closed with a `BLOCKED_BY_RUT` diagnostic (at the
-`response_envoy_h1` check) instead of emitting this text; the
+and `response_envoy_h1` true, `local_reply_envoy_h1` still false) fails
+closed with a `BLOCKED_BY_RUT` diagnostic naming the missing
+`local_reply_envoy_h1` capability instead of emitting this text; the
 exact bytes are pinned in `tests/fixtures/envoy_milestone_s.inc` and checked
 byte for byte by `tests/test_envoy_convert.cc`
 (`api_all_capabilities_matches_golden`). Values shown here (the connect-failure
@@ -760,13 +760,23 @@ emitted text, since that still doesn't compile on this branch.
    `proxy-connection`, `te` (unless `trailers`), `upgrade` outside an upgrade,
    and `transfer-encoding` on reframe; ordinary headers like a redirect's
    `Location` or a cache validator's `Last-Modified` pass through unchanged.
-   Rut's `strict_response_forbidden` unconditionally rejects `location`,
-   `refresh`, and `last-modified` (`include/rut/runtime/callbacks_impl.h:9856-9868`)
-   regardless of the route's `hide_headers` list — this milestone's route
-   already requests `hide_headers: []` (hide nothing), so there is no policy
-   value that admits these headers even once `response_envoy_h1` lands. Live:
+   Rut's legacy fixed-order (`Synthesized`) `response_policy` profile still
+   rejects these headers unconditionally via `strict_response_forbidden`
+   (`include/rut/runtime/callbacks_impl.h:9856-9868`) regardless of
+   `hide_headers`, but this is no longer a hard capability gap: the
+   `header_order: "upstream"` (Envoy H1) profile added on
+   `envoy/rut-response-envoy-h1` never routes headers through
+   `strict_response_forbidden` — it only removes the fixed hop-by-hop set and
+   policy-`hide_headers` names, so `Location`/`Refresh`/`Last-Modified` pass
+   through unchanged once the converter emits that profile
+   (`build_upstream_order_response_headers`,
+   `include/rut/runtime/callbacks_impl.h:10666-10685`;
+   `tests/test_integration.cc: route.forward_response_policy_upstream_order_wire`,
+   the Last-Modified pass-through case). Live (legacy `Synthesized` profile):
    an upstream `302 Found` with `Location: /login` got the upstream contacted
-   but the client connection closed with no response bytes.
+   but the client connection closed with no response bytes; the
+   `header_order: "upstream"` profile instead forwards a lowercased
+   `Last-Modified` header downstream unchanged (integration-tested).
 6. **Undifferentiated (and sometimes absent) failure replies.** Envoy maps
    `LocalConnectionFailure`/`RemoteConnectionFailure`/`ConnectionTimeout` (a
    refused or timed-out connect attempt) to one local-reply text and
