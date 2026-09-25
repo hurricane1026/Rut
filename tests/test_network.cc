@@ -4352,6 +4352,27 @@ TEST(request_policy, preserve_host_lowercase_wire_and_fail_closed_host) {
         "GET /x-custom-dup HTTP/1.1\r\nhost: client.example\r\nx-custom: one\r\n"
         "x-custom: two\r\nx-forwarded-proto: http\r\n\r\n");
 
+    // Codex round-13 review: `Server`, `Grpc-Status`, `Grpc-Message`, and
+    // `X-Envoy-Upstream-Service-Time` are deliberately absent from the
+    // inline-request-header table. They are inline O(1) slots only on
+    // Envoy's `ResponseHeaderMap`/`ResponseTrailerMap` (`INLINE_RESP_
+    // STRING_HEADERS`/`INLINE_RESP_NUMERIC_HEADERS`/`INLINE_RESP_*_HEADERS_
+    // TRAILERS`, `envoy/http/header_map.h`), not `RequestHeaderMap` (which
+    // only inherits `INLINE_REQ_STRING_HEADERS`/`INLINE_REQ_NUMERIC_HEADERS`
+    // plus the shared `INLINE_REQ_RESP_*_HEADERS`, none of which name these
+    // four) -- so a real Envoy forwards two duplicate `Server` *request*
+    // headers as two ordinary, uncoalesced physical lines too, same as this
+    // profile.
+    prepare(
+        "GET /server-dup HTTP/1.1\r\n"
+        "Host: client.example\r\n"
+        "Server: one\r\n"
+        "Server: two\r\n\r\n");
+    REQUIRE(apply_request_policy(conn, endpoint, kPreserveHost));
+    require_wire(
+        "GET /server-dup HTTP/1.1\r\nhost: client.example\r\nserver: one\r\n"
+        "server: two\r\nx-forwarded-proto: http\r\n\r\n");
+
     // Client-supplied `x-envoy-*` headers Envoy's own
     // `ConnectionManagerUtility::cleanInternalHeaders` removes unconditionally
     // for a non-internal, non-edge external request (the fixed shape this
@@ -68177,6 +68198,235 @@ TEST(state_invariant, jit_forward_direct_paired_head_id4_admits_te_field) {
     CHECK(c->failure_policy_suppress_body);
     CHECK_EQ(c->resp_status, kStatusBadGateway);
     CHECK_EQ(c->state, ConnState::Sending);
+    CHECK_EQ(loop.backend.count_ops(MockOp::Connect), 0u);
+    CHECK_EQ(loop.backend.count_ops(MockOp::Send), 1u);
+    close(fds[1]);
+    loop.close_conn(*c);
+}
+
+// Codex round-13 review: `Connection: TE` (a nomination that does not
+// affect persistence -- Envoy's own `sanitizeConnectionHeader` special-cases
+// a nominated `te` token instead of blindly stripping it, exactly like the
+// ordinary ID4 request-policy path already does) must not make this
+// preflight reject a HEAD request it would otherwise admit. Before this
+// fix, the Connection branch required the literal single-token value
+// `close`, so a `Connection: TE` request-policy-admissible shape was
+// rejected here even though `apply_preserve_host_lowercase_request_policy`
+// forwards it (with the canonical `te: trailers` line) just fine.
+TEST(state_invariant, jit_forward_direct_paired_head_id4_admits_te_connection_nomination) {
+    RouteConfig cfg;
+    auto upstream = cfg.add_upstream("api", 0x7F000001, 9000);
+    REQUIRE(upstream.has_value());
+    cfg.upstreams[upstream.value()].max_inflight = 1;
+
+    static constexpr char kBody[] =
+        "<html>\r\n<head><title>502 Bad Gateway</title></head>\r\n<body>\r\n"
+        "<center><h1>502 Bad Gateway</h1></center>\r\n"
+        "<hr><center>nginx/1.29.7</center>\r\n</body>\r\n</html>\r\n";
+    static_assert(sizeof(kBody) - 1 == 157);
+    ForwardResponsePolicySpec response{};
+    response.version = ResponsePolicyVersion::Http11;
+    response.framing = ResponsePolicyFraming::ContentLength;
+    response.connection = ResponsePolicyConnection::Request;
+    response.date = ResponsePolicyDate::Current;
+    response.head_mode = ResponsePolicyHeadMode::SuppressBody;
+    response.server = {"nginx/1.29.7", 12};
+    REQUIRE_EQ(cfg.add_response_policy(response), 1u);
+
+    ForwardFailurePolicySpec failure{};
+    failure.version = ForwardFailurePolicyVersion::Http11;
+    failure.status_code = 502;
+    failure.date = ForwardFailurePolicyDate::Current;
+    failure.connection = ForwardFailurePolicyConnection::Request;
+    failure.head_mode = FailurePolicyHeadMode::SuppressBody;
+    failure.reason = {"Bad Gateway", 11};
+    failure.content_type = {"text/html", 9};
+    failure.server = {"nginx/1.29.7", 12};
+    failure.body = {kBody, sizeof(kBody) - 1};
+    REQUIRE_EQ(cfg.add_failure_policy(failure), 1u);
+
+    SmallLoop loop;
+    loop.setup();
+    int fds[2];
+    REQUIRE(socketpair(AF_UNIX, SOCK_STREAM, 0, fds) == 0);
+    ScopedFakeSocket fake_socket(fds[0]);
+    loop.inject_and_dispatch(make_ev(0, IoEventType::Accept, 42));
+    auto* c = loop.find_fd(42);
+    REQUIRE(c != nullptr);
+    c->request_config = &cfg;
+    static constexpr char kRequest[] =
+        "HEAD /missing?q=1 HTTP/1.1\r\nHost: client.example\r\n"
+        "Connection: TE\r\nTE: trailers\r\n\r\n";
+    REQUIRE_EQ(c->recv_buf.write(reinterpret_cast<const u8*>(kRequest), sizeof(kRequest) - 1),
+               sizeof(kRequest) - 1);
+    capture_request_metadata(*c);
+    c->req_initial_send_len = c->recv_buf.len();
+    c->keep_alive = true;
+
+    JitDispatchOutcome outcome{};
+    outcome.kind = JitDispatchOutcome::Kind::Forward;
+    outcome.upstream_id = upstream.value();
+    outcome.request_policy_id = static_cast<u16>(RequestPolicyId::Http11PreserveHostLowercase);
+    outcome.response_policy_id = 1;
+    outcome.failure_policy_id = 1;
+    loop.backend.clear_ops();
+    loop.backend.fail_connect = true;
+    handle_jit_outcome<SmallLoop>(&loop, *c, outcome, nullptr, true);
+
+    // Admitted, not a 400 preflight rejection: the paired 502 failure
+    // response proves the preflight let the request proceed to the (here,
+    // injected) failed connect attempt instead of rejecting it for the
+    // `Connection: TE` nomination.
+    CHECK_EQ(c->failure_policy_id, 1u);
+    CHECK(c->failure_policy_suppress_body);
+    CHECK_EQ(c->resp_status, kStatusBadGateway);
+    CHECK_EQ(c->state, ConnState::Sending);
+    CHECK_EQ(loop.backend.count_ops(MockOp::Connect), 0u);
+    CHECK_EQ(loop.backend.count_ops(MockOp::Send), 1u);
+    close(fds[1]);
+    loop.close_conn(*c);
+}
+
+// The same admission holds when `close` is nominated alongside `te`: the
+// connection still closes exactly like a plain `Connection: close`, so this
+// exercises the "explicit close" shape rather than the paired-failure-only
+// default-keep-alive shape above (no `fail_connect` gating on paired_failure
+// needed here either, matching the plain `Connection: close` behavior).
+TEST(state_invariant,
+     jit_forward_direct_paired_head_id4_admits_close_and_te_connection_nomination) {
+    RouteConfig cfg;
+    auto upstream = cfg.add_upstream("api", 0x7F000001, 9000);
+    REQUIRE(upstream.has_value());
+    cfg.upstreams[upstream.value()].max_inflight = 1;
+
+    static constexpr char kBody[] =
+        "<html>\r\n<head><title>502 Bad Gateway</title></head>\r\n<body>\r\n"
+        "<center><h1>502 Bad Gateway</h1></center>\r\n"
+        "<hr><center>nginx/1.29.7</center>\r\n</body>\r\n</html>\r\n";
+    static_assert(sizeof(kBody) - 1 == 157);
+    ForwardResponsePolicySpec response{};
+    response.version = ResponsePolicyVersion::Http11;
+    response.framing = ResponsePolicyFraming::ContentLength;
+    response.connection = ResponsePolicyConnection::Request;
+    response.date = ResponsePolicyDate::Current;
+    response.head_mode = ResponsePolicyHeadMode::SuppressBody;
+    response.server = {"nginx/1.29.7", 12};
+    REQUIRE_EQ(cfg.add_response_policy(response), 1u);
+
+    ForwardFailurePolicySpec failure{};
+    failure.version = ForwardFailurePolicyVersion::Http11;
+    failure.status_code = 502;
+    failure.date = ForwardFailurePolicyDate::Current;
+    failure.connection = ForwardFailurePolicyConnection::Request;
+    failure.head_mode = FailurePolicyHeadMode::SuppressBody;
+    failure.reason = {"Bad Gateway", 11};
+    failure.content_type = {"text/html", 9};
+    failure.server = {"nginx/1.29.7", 12};
+    failure.body = {kBody, sizeof(kBody) - 1};
+    REQUIRE_EQ(cfg.add_failure_policy(failure), 1u);
+
+    SmallLoop loop;
+    loop.setup();
+    int fds[2];
+    REQUIRE(socketpair(AF_UNIX, SOCK_STREAM, 0, fds) == 0);
+    ScopedFakeSocket fake_socket(fds[0]);
+    loop.inject_and_dispatch(make_ev(0, IoEventType::Accept, 42));
+    auto* c = loop.find_fd(42);
+    REQUIRE(c != nullptr);
+    c->request_config = &cfg;
+    static constexpr char kRequest[] =
+        "HEAD /missing?q=1 HTTP/1.1\r\nHost: client.example\r\n"
+        "Connection: close, TE\r\nTE: trailers\r\n\r\n";
+    REQUIRE_EQ(c->recv_buf.write(reinterpret_cast<const u8*>(kRequest), sizeof(kRequest) - 1),
+               sizeof(kRequest) - 1);
+    capture_request_metadata(*c);
+    c->req_initial_send_len = c->recv_buf.len();
+    c->keep_alive = true;
+
+    JitDispatchOutcome outcome{};
+    outcome.kind = JitDispatchOutcome::Kind::Forward;
+    outcome.upstream_id = upstream.value();
+    outcome.request_policy_id = static_cast<u16>(RequestPolicyId::Http11PreserveHostLowercase);
+    outcome.response_policy_id = 1;
+    outcome.failure_policy_id = 1;
+    loop.backend.clear_ops();
+    loop.backend.fail_connect = true;
+    handle_jit_outcome<SmallLoop>(&loop, *c, outcome, nullptr, true);
+
+    CHECK_EQ(c->failure_policy_id, 1u);
+    CHECK(c->failure_policy_suppress_body);
+    CHECK_EQ(c->resp_status, kStatusBadGateway);
+    CHECK_EQ(c->state, ConnState::Sending);
+    CHECK_EQ(loop.backend.count_ops(MockOp::Connect), 0u);
+    CHECK_EQ(loop.backend.count_ops(MockOp::Send), 1u);
+    close(fds[1]);
+    loop.close_conn(*c);
+}
+
+// A non-ID4 policy keeps the original closed contract: `Connection: TE`
+// (not the literal single token `close`) still fails this preflight.
+TEST(state_invariant,
+     jit_forward_direct_paired_head_non_id4_still_rejects_te_connection_nomination) {
+    RouteConfig cfg;
+    auto upstream = cfg.add_upstream("api", 0x7F000001, 9000);
+    REQUIRE(upstream.has_value());
+    cfg.upstreams[upstream.value()].max_inflight = 1;
+
+    static constexpr char kBody[] =
+        "<html>\r\n<head><title>502 Bad Gateway</title></head>\r\n<body>\r\n"
+        "<center><h1>502 Bad Gateway</h1></center>\r\n"
+        "<hr><center>nginx/1.29.7</center>\r\n</body>\r\n</html>\r\n";
+    static_assert(sizeof(kBody) - 1 == 157);
+    ForwardResponsePolicySpec response{};
+    response.version = ResponsePolicyVersion::Http11;
+    response.framing = ResponsePolicyFraming::ContentLength;
+    response.connection = ResponsePolicyConnection::Request;
+    response.date = ResponsePolicyDate::Current;
+    response.head_mode = ResponsePolicyHeadMode::SuppressBody;
+    response.server = {"nginx/1.29.7", 12};
+    REQUIRE_EQ(cfg.add_response_policy(response), 1u);
+
+    ForwardFailurePolicySpec failure{};
+    failure.version = ForwardFailurePolicyVersion::Http11;
+    failure.status_code = 502;
+    failure.date = ForwardFailurePolicyDate::Current;
+    failure.connection = ForwardFailurePolicyConnection::Request;
+    failure.head_mode = FailurePolicyHeadMode::SuppressBody;
+    failure.reason = {"Bad Gateway", 11};
+    failure.content_type = {"text/html", 9};
+    failure.server = {"nginx/1.29.7", 12};
+    failure.body = {kBody, sizeof(kBody) - 1};
+    REQUIRE_EQ(cfg.add_failure_policy(failure), 1u);
+
+    SmallLoop loop;
+    loop.setup();
+    int fds[2];
+    REQUIRE(socketpair(AF_UNIX, SOCK_STREAM, 0, fds) == 0);
+    ScopedFakeSocket fake_socket(fds[0]);
+    loop.inject_and_dispatch(make_ev(0, IoEventType::Accept, 42));
+    auto* c = loop.find_fd(42);
+    REQUIRE(c != nullptr);
+    c->request_config = &cfg;
+    static constexpr char kRequest[] =
+        "HEAD /missing?q=1 HTTP/1.1\r\nHost: client.example\r\n"
+        "Connection: TE\r\nTE: trailers\r\n\r\n";
+    REQUIRE_EQ(c->recv_buf.write(reinterpret_cast<const u8*>(kRequest), sizeof(kRequest) - 1),
+               sizeof(kRequest) - 1);
+    capture_request_metadata(*c);
+    c->req_initial_send_len = c->recv_buf.len();
+    c->keep_alive = true;
+
+    JitDispatchOutcome outcome{};
+    outcome.kind = JitDispatchOutcome::Kind::Forward;
+    outcome.upstream_id = upstream.value();
+    outcome.request_policy_id = static_cast<u16>(RequestPolicyId::Http11FixedStrip);
+    outcome.response_policy_id = 1;
+    outcome.failure_policy_id = 1;
+    loop.backend.clear_ops();
+    loop.backend.fail_connect = true;
+    handle_jit_outcome<SmallLoop>(&loop, *c, outcome, nullptr, true);
+
+    CHECK_EQ(c->resp_status, 400u);
     CHECK_EQ(loop.backend.count_ops(MockOp::Connect), 0u);
     CHECK_EQ(loop.backend.count_ops(MockOp::Send), 1u);
     close(fds[1]);

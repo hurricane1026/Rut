@@ -5580,11 +5580,18 @@ inline bool request_policy_is_stripped_client_envoy_header(const u8* p, u32 n) {
 
 // Envoy's `HeaderMapImpl` gives every one of these request headers a single
 // O(1) inline storage slot (`envoy/http/header_map.h`, v1.39.1:
-// `INLINE_REQ_HEADERS`/`INLINE_REQ_RESP_HEADERS`, plus every request-side
-// `Http::RegisterCustomInlineHeader<CustomInlineHeaderRegistry::Type::
-// RequestHeaders>` registration -- found via `gh search code
-// "RegisterCustomInlineHeader" --repo envoyproxy/envoy`, e.g.
-// source/extensions/filters/http/{cdn_loop,cors,cache,csrf,decompressor,
+// `INLINE_REQ_HEADERS` (line 221: `INLINE_REQ_STRING_HEADERS`, line 180, +
+// `INLINE_REQ_NUMERIC_HEADERS`, line 213) and `INLINE_REQ_RESP_HEADERS`
+// (line 265: `INLINE_REQ_RESP_STRING_HEADERS`, line 249 -- `Connection`,
+// `ContentType`, `EnvoyDecoratorOperation`, `KeepAlive`, `ProxyConnection`,
+// `ProxyStatus`, `RequestId`, `TransferEncoding`, `Upgrade`, `Via` -- +
+// `INLINE_REQ_RESP_NUMERIC_HEADERS`, line 261 -- `ContentLength`,
+// `EnvoyAttemptCount`; every one of these twelve names is covered below,
+// either in the table or in one of the exclusion lists in this comment),
+// plus every request-side `Http::RegisterCustomInlineHeader<
+// CustomInlineHeaderRegistry::Type::RequestHeaders>` registration -- found
+// via `gh search code "RegisterCustomInlineHeader" --repo envoyproxy/envoy`,
+// e.g. source/extensions/filters/http/{cdn_loop,cors,cache,csrf,decompressor,
 // jwt_authn,grpc_web,oauth2,compressor,grpc_http1_reverse_bridge}/*.cc(.h),
 // source/extensions/filters/common/expr/context.cc,
 // source/extensions/tracers/skywalking/trace_segment_reporter.cc,
@@ -5593,6 +5600,21 @@ inline bool request_policy_is_stripped_client_envoy_header(const u8* p, u32 n) {
 // `source/common/http/headers.h`'s `HeaderValues`/`CustomHeaderValues`).
 // `appendCopy`/`HeaderMapImpl::insertByKey` coalesce a second physical field
 // into that one slot (comma-joined) rather than keeping a second line.
+// `server`, `grpc-status`, `grpc-message`, and `x-envoy-upstream-service-
+// time` are deliberately NOT in this table (Codex round-13 review raised
+// them, but they are response/trailer-only, not shared): `Server` is in
+// `INLINE_RESP_STRING_HEADERS` (line 228), `EnvoyUpstreamServiceTime` is in
+// `INLINE_RESP_NUMERIC_HEADERS` (line 238), and `GrpcMessage`/`GrpcStatus`
+// are in `INLINE_RESP_STRING_HEADERS_TRAILERS`/`INLINE_RESP_NUMERIC_HEADERS_
+// TRAILERS` (lines 272/274) -- none of which `RequestHeaderMap` (line 738:
+// `RequestOrResponseHeaderMap` + `INLINE_REQ_STRING_HEADERS`/
+// `INLINE_REQ_NUMERIC_HEADERS` only) inherits; only `ResponseHeaderMap`
+// (line 771) and `ResponseTrailerMap` (line 786) do. A client sending two
+// of these as *request* headers therefore gets two ordinary (non-inline)
+// physical lines from a real Envoy `RequestHeaderMapImpl` too, so this
+// profile forwarding both unchanged already matches Envoy byte for byte;
+// adding them here would instead manufacture a new, incorrect 400 for a
+// shape Envoy forwards.
 // `:method`/`:path`/`:protocol`/`:scheme`/`:authority` are H2 pseudo-headers
 // with no HTTP/1.1 wire form and are omitted. `host`, `content-length`,
 // `te`, `connection`, `expect`, `upgrade`, and `x-forwarded-proto` are also
@@ -9515,6 +9537,13 @@ inline bool response_policy_suppress_head_admitted(const Connection& conn,
         return false;
     u32 host_count = 0;
     u32 connection_count = 0;
+    // Set only for ID4 when the single `Connection` header's comma-
+    // separated, OWS-trimmed tokens are all case-insensitively `close`
+    // and/or `te`, and at least one of them is `close`. See the shape
+    // classification at the end of this function for why this -- rather
+    // than the connection-count-0/exact-"close" cache fields alone --
+    // decides ID4 admission when `te` is nominated.
+    bool connection_close_token_seen = false;
     const Header* host = nullptr;
     for (u32 i = 0; i < req.header_count; i++) {
         const Header& header = req.headers[i];
@@ -9523,9 +9552,50 @@ inline bool response_policy_suppress_head_admitted(const Connection& conn,
             if (++host_count > 1) return false;
             host = &header;
         } else if (http_header_name_eq_ci(name.ptr, name.len, "connection", 10)) {
-            if (++connection_count > 1 || header.value.len != 5 ||
-                !http_header_name_eq_ci(header.value.ptr, header.value.len, "close", 5))
+            if (++connection_count > 1) return false;
+            if (id4_route) {
+                // ID4's ordinary serializer path
+                // (`apply_preserve_host_lowercase_request_policy`)
+                // explicitly excludes a Connection-nominated `te` token
+                // from its generic drop-and-fail-closed nomination set --
+                // matching Envoy's own `sanitizeConnectionHeader`, which
+                // inspects the nominated `te` token's sibling `TE` header
+                // instead of blindly stripping it -- because nominating
+                // `te` has no effect on connection persistence at all
+                // (RFC 7230's persistence/upgrade-relevant Connection
+                // tokens are `close`/`keep-alive`/`upgrade`; `te` is not
+                // one of them). This preflight must therefore not reject a
+                // `Connection` value whose tokens are all case-
+                // insensitively `close` and/or `te` merely because it is
+                // not the single literal token `close` -- the shape
+                // classification below independently verifies persistence
+                // is unaffected either way. Any other token still fails
+                // closed, exactly as before (Codex round-13 review, PR
+                // #696).
+                const char* value_start = header.value.ptr;
+                const char* value_end = value_start + header.value.len;
+                const char* tok = value_start;
+                while (tok <= value_end) {
+                    const char* tok_end = tok;
+                    while (tok_end < value_end && *tok_end != ',') tok_end++;
+                    const char* t0 = tok;
+                    const char* t1 = tok_end;
+                    while (t0 < t1 && (*t0 == ' ' || *t0 == '\t')) t0++;
+                    while (t1 > t0 && (t1[-1] == ' ' || t1[-1] == '\t')) t1--;
+                    if (t1 > t0) {
+                        const u32 tok_len = static_cast<u32>(t1 - t0);
+                        const bool is_close = http_header_name_eq_ci(t0, tok_len, "close", 5);
+                        const bool is_te = http_header_name_eq_ci(t0, tok_len, "te", 2);
+                        if (!is_close && !is_te) return false;
+                        connection_close_token_seen |= is_close;
+                    }
+                    if (tok_end >= value_end) break;
+                    tok = tok_end + 1;
+                }
+            } else if (header.value.len != 5 ||
+                       !http_header_name_eq_ci(header.value.ptr, header.value.len, "close", 5)) {
                 return false;
+            }
         } else if (http_header_name_eq_ci(name.ptr, name.len, "content-length", 14) ||
                    http_header_name_eq_ci(name.ptr, name.len, "transfer-encoding", 17) ||
                    http_header_name_eq_ci(name.ptr, name.len, "expect", 6)) {
@@ -9622,10 +9692,31 @@ inline bool response_policy_suppress_head_admitted(const Connection& conn,
     const bool default_keep_alive_shape =
         paired_failure && conn.req_client_keep_alive && !conn.req_client_connection_close &&
         !conn.req_client_connection_close_exact && conn.req_client_connection_count == 0;
+    // ID4 only: a `Connection` value validated above as `close`/`te` tokens
+    // only (`connection_close_token_seen` set iff a `close` token is among
+    // them) is classified by persistence, not by exact byte match against
+    // the literal `close`, since `te` never affects persistence. A `close`
+    // token present means the connection closes exactly like the plain
+    // `Connection: close` shape (`conn.req_client_connection_close_exact`
+    // is false here for e.g. `close, te`, which is why this is a separate
+    // term rather than folded into `explicit_close_shape`); its absence
+    // means this is an ordinary default-persistent request that merely also
+    // nominates `te`, gated the same way `default_keep_alive_shape` is
+    // (paired-failure evaluation only, per the response-only-suppression
+    // contract above) since a bare `Connection: te` is otherwise identical
+    // to sending no `Connection` header at all (Codex round-13 review, PR
+    // #696).
+    const bool id4_close_with_te_shape = id4_route && !conn.req_client_keep_alive &&
+                                         conn.req_client_connection_close &&
+                                         connection_count == 1 && connection_close_token_seen;
+    const bool id4_default_keep_alive_with_te_shape =
+        id4_route && paired_failure && conn.req_client_keep_alive &&
+        !conn.req_client_connection_close && connection_count == 1 && !connection_close_token_seen;
     return policy.connection == ResponsePolicyConnection::Request &&
            conn.req_method == static_cast<u8>(LogHttpMethod::Head) &&
            conn.req_http_version == static_cast<u8>(HttpVersion::Http11) &&
-           (explicit_close_shape || default_keep_alive_shape) &&
+           (explicit_close_shape || default_keep_alive_shape || id4_close_with_te_shape ||
+            id4_default_keep_alive_with_te_shape) &&
            !conn.req_client_has_content_length && !conn.tls_active &&
            !conn.req_client_has_transfer_encoding && (id4_route || !conn.req_client_has_te) &&
            !conn.req_client_has_expect &&
