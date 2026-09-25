@@ -2370,6 +2370,69 @@ TEST(RirVerifier, PolicyBundleRejects503LengthTypeDateServerWithResponseReadTime
     CHECK_EQ(verified.issue.code, VerifyIssueCode::InvalidForwardPreflight);
 }
 
+// Codex round-11 review: the failure-policy printer covered only head_mode,
+// so a synthesized 502 and a LengthTypeDateServer 503 with the same
+// head_mode printed identical RIR even though they serialize different
+// statuses, casing, ordering, and bodies at runtime
+// (build_bounded_local_response_bytes, include/rut/runtime/callbacks_impl.h).
+TEST(RirPrinter, FailurePolicyPrintsHeaderOrder) {
+    ForwardFailurePolicySpec failure_502{};
+    failure_502.version = ForwardFailurePolicyVersion::Http11;
+    failure_502.status_code = 502;
+    failure_502.date = ForwardFailurePolicyDate::Current;
+    failure_502.connection = ForwardFailurePolicyConnection::Request;
+    failure_502.head_mode = FailurePolicyHeadMode::Reject;
+    failure_502.header_order = FailurePolicyHeaderOrder::Synthesized;
+    failure_502.reason = {"Bad Gateway", 11};
+    failure_502.content_type = {"text/plain", 10};
+    failure_502.server = {"rut", 3};
+    failure_502.body = {"upstream error", 14};
+
+    ForwardFailurePolicySpec failure_503{};
+    failure_503.version = ForwardFailurePolicyVersion::Http11;
+    failure_503.status_code = 503;
+    failure_503.date = ForwardFailurePolicyDate::Current;
+    failure_503.connection = ForwardFailurePolicyConnection::Request;
+    failure_503.head_mode = FailurePolicyHeadMode::Reject;
+    failure_503.header_order = FailurePolicyHeaderOrder::LengthTypeDateServer;
+    failure_503.reason = {"Service Unavailable", 19};
+    failure_503.content_type = {"text/plain", 10};
+    failure_503.server = {"envoy", 5};
+    failure_503.body = {"connect failure", 15};
+
+    Module mod{};
+    mod.failure_policies[0] = failure_502;
+    mod.failure_policies[1] = failure_503;
+    mod.failure_policy_count = 2;
+    mod.policy_bundles[0] = {0, 1, 0, 0, ForwardResponseBufferingMode::None};
+    mod.policy_bundles[1] = {0, 2, 0, 0, ForwardResponseBufferingMode::None};
+    mod.policy_bundle_count = 2;
+    REQUIRE(verify_module(mod).ok);
+
+    char data[1024];
+    PrintBuf buf;
+    buf.init(data, sizeof(data), -1);
+    print_module(buf, mod);
+    CHECK_FALSE(buf.overflow);
+    const Str output{buf.data, buf.len};
+
+    auto contains = [&](const char* needle) {
+        const Str expected = lit(needle);
+        for (u32 i = 0; i + expected.len <= output.len; i++) {
+            if (output.slice(i, i + expected.len).eq(expected)) return true;
+        }
+        return false;
+    };
+    CHECK(
+        contains("failure_policy#1: version=HTTP/1.1, status=502, reason=\"Bad Gateway\", "
+                 "server=\"rut\", content_type=\"text/plain\", date=current, "
+                 "connection=request, head_mode=reject, header_order=synthesized"));
+    CHECK(
+        contains("failure_policy#2: version=HTTP/1.1, status=503, reason=\"Service Unavailable\", "
+                 "server=\"envoy\", content_type=\"text/plain\", date=current, "
+                 "connection=request, head_mode=reject, header_order=length_type_date_server"));
+}
+
 int main(int argc, char** argv) {
     return rut::test::run_all(argc, argv);
 }

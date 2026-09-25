@@ -650,7 +650,10 @@ route exact GET "/healthz" { return local_response({ ... }) }  // exact-path byp
 (`"current"` only), `connection` (`"request"` only), `head_mode` (`"reject"`
 or `"suppress_body"` — HEAD and ANY-method `unmatched`/`pre_route` policies
 must suppress the body), `content_type`, and `body` (a `b"..."` byte-string
-literal, ≤ 4 KiB) are each required exactly once, subject to the per-status
+literal, ≤ 4 KiB) are each required exactly once — except `content_type`,
+which the `"date_server_length"` layout below requires to be *absent*
+instead (`src/compiler/parser.cc:5117-5135` drops it from the required-field
+mask precisely for that layout) — subject to the per-status
 closed vocabulary in `docs/language-card.md` (e.g. `status: 204` forces an
 empty `content_type`/`body`).
 
