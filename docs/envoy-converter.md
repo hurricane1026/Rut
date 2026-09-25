@@ -455,7 +455,9 @@ are recorded from the pinned Envoy build, not assumed.
   would broaden the route. Slash-terminated prefixes therefore stay blocked
   even once ordered-list lowering (PR 8 / PR #695) lands, unless a future
   change adds an explicit byte-level boundary check; all other non-root
-  prefixes remain `PARTIAL` until Rut offers a raw-prefix match.
+  prefixes remain `BLOCKED_BY_RUT` until Rut offers a raw-prefix match
+  (docs/envoy-compatibility.md, "Raw (non-segment) `prefix` not ending in
+  `/`").
 - Routes are evaluated in list order, first match wins; Rut's own route trie
   instead selects the longest matching declared prefix. Per owner decision D3
   (see `docs/envoy-compatibility.md`, "Multiple routes per virtual host"),
