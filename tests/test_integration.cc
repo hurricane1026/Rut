@@ -24828,6 +24828,110 @@ TEST(route, forward_request_policy_preserve_host_lowercase_h11_wire) {
     }
 }
 
+// Round-6 Codex review (PR #696): Envoy's own
+// `ConnectionManagerUtility::cleanInternalHeaders`
+// (source/common/http/conn_manager_utility.cc) strips a fixed set of
+// client-supplied `x-envoy-*` headers for a non-internal, non-edge external
+// request -- the fixed shape this milestone's HCM configuration always
+// produces (no `use_remote_address: true`, no `internal_address_config`, so
+// `DefaultInternalAddressConfig::isInternalAddress` unconditionally returns
+// false and `edge_request` is always false too). An untrusted client must
+// not be able to inject retry/timeout instructions Envoy's own control plane
+// would otherwise own. Verifies end to end, via a real upstream connection,
+// that `x-envoy-expected-rq-timeout-ms` and `x-envoy-retry-on` never reach
+// the upstream, while an ordinary header and a header outside the fixed
+// removal set (`x-envoy-internal`) still do.
+TEST(route, forward_request_policy_preserve_host_lowercase_strips_client_envoy_internal_headers) {
+    using namespace rut;
+    struct JitResources {
+        FrontendRirModule rir{};
+        jit::JitEngine engine{};
+        ~JitResources() {
+            engine.shutdown();
+            rir.destroy();
+        }
+    } resources;
+    RecordingUpstream upstream;
+    REQUIRE(upstream.setup());
+
+    char upstream_line[64];
+    const int upstream_line_len = snprintf(upstream_line,
+                                           sizeof(upstream_line),
+                                           "upstream backend at \"127.0.0.1:%u\"\n",
+                                           upstream.port);
+    REQUIRE_GT(upstream_line_len, 0);
+    std::string source(upstream_line);
+    source +=
+        "route \"/smoke\" {\n"
+        "    return forward(backend, request_policy: {\n"
+        "        version: \"HTTP/1.1\", host: \"preserve\", connection: \"omit\",\n"
+        "        header_names: \"lowercase\", forwarded_proto: \"http\",\n"
+        "        strip_headers: [\"Connection\", \"Keep-Alive\", \"TE\", \"Expect\", "
+        "\"Upgrade\", \"Proxy-Connection\"]\n"
+        "    })\n"
+        "}\n";
+
+    auto lexed = lex({source.data(), static_cast<u32>(source.size())});
+    REQUIRE(lexed);
+    auto ast = parse_file(lexed.value());
+    REQUIRE(ast);
+    std::unique_ptr<AstFile> ast_owned(ast.value());
+    auto hir = analyze_file(*ast_owned);
+    REQUIRE(hir);
+    std::unique_ptr<HirModule> hir_owned(hir.value());
+    auto mir = build_mir(*hir_owned);
+    REQUIRE(mir);
+    std::unique_ptr<MirModule> mir_owned(mir.value());
+    auto& rir = resources.rir;
+    REQUIRE(lower_to_rir(*mir_owned, rir));
+    auto cg = jit::codegen(rir.module);
+    REQUIRE(cg.ok);
+    auto& engine = resources.engine;
+    REQUIRE(engine.init());
+    REQUIRE(engine.compile(cg.mod, cg.ctx));
+    RouteConfig cfg{};
+    REQUIRE(populate_route_config(cfg, rir.module));
+    REQUIRE(register_jit_routes(cfg, rir.module, engine));
+    const RouteConfig* active = &cfg;
+    ScopedProxyLoop proxy;
+    REQUIRE(proxy.setup(&active, 1000));
+
+    static constexpr char kClient[] =
+        "GET /smoke HTTP/1.1\r\n"
+        "Host: client.example\r\n"
+        "X-Envoy-Expected-Rq-Timeout-Ms: 15000\r\n"
+        "X-Envoy-Retry-On: 5xx\r\n"
+        "X-Envoy-Internal: true\r\n"
+        "X-Regular: keep\r\n"
+        "\r\n";
+    static constexpr char kExpectedUpstream[] =
+        "GET /smoke HTTP/1.1\r\n"
+        "host: client.example\r\n"
+        "x-envoy-internal: true\r\n"
+        "x-regular: keep\r\n"
+        "x-forwarded-proto: http\r\n"
+        "\r\n";
+
+    i32 client = connect_to(proxy.port);
+    REQUIRE_GE(client, 0);
+    REQUIRE(send_all(client, kClient, static_cast<u32>(sizeof(kClient) - 1)));
+    char response[1024];
+    const i32 response_read = recv_timeout(client, response, sizeof(response), 2000);
+    close(client);
+    CHECK_GT(response_read, 0);
+    for (u32 i = 0; i < 400 && upstream.request_count.load(std::memory_order_acquire) == 0; i++)
+        usleep(5000);
+    REQUIRE_GT(upstream.request_count.load(std::memory_order_acquire), 0u);
+    const u32 recorded_len = upstream.request_history_len[0];
+    REQUIRE_EQ(recorded_len, static_cast<u32>(sizeof(kExpectedUpstream) - 1));
+    CHECK_EQ(__builtin_memcmp(upstream.request_history[0], kExpectedUpstream, recorded_len), 0);
+    // Belt-and-suspenders: the two headers named in the round-6 review must
+    // not appear anywhere in what the upstream received, however it is
+    // cased.
+    CHECK_FALSE(buf_contains(upstream.request_history[0], recorded_len, "rq-timeout-ms", 13));
+    CHECK_FALSE(buf_contains(upstream.request_history[0], recorded_len, "retry-on", 8));
+}
+
 // A body-carrying request (ID4, preserved Host) paired with a response_policy
 // on the ordinary strict-response body path.
 // `request_policy_body_response_admitted` (callbacks_impl.h) used to admit
