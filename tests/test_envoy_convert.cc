@@ -2,6 +2,7 @@
 #include "fixtures/envoy_routes_a.inc"
 #include "fixtures/envoy_routes_b.inc"
 #include "fixtures/envoy_routes_c.inc"
+#include "fixtures/envoy_routes_shadowed_siblings.inc"
 #include "rut/compiler/lexer.h"
 #include "rut/envoy/converter.h"
 #include "rut/envoy/parser.h"
@@ -2357,10 +2358,13 @@ TEST(envoy_convert, golden_routes_a_prefix_then_root) {
 //     8804 -- confirming the rejection above is correct, not overly
 //     conservative for a program that would have actually worked.
 //   - `kEnvoyRoutesBGolden` / `kEnvoyRoutesCGolden` (the two golden shapes
-//     that still succeed, scenarios b/c below): 655 and 668 real tokens,
+//     that still succeed, scenarios b/c below): 360 and 668 real tokens,
 //     comfortably under `LexedTokens::kMaxTokens` (932 today; #697,
 //     unmerged as of this PR, raises it to 4096 -- see
-//     docs/envoy-converter.md).
+//     docs/envoy-converter.md). `kEnvoyRoutesBGolden`'s count dropped from
+//     655 (two live nodes) to 360 (root-only) under Codex round-9: "/api"
+//     is now dropped as globally shadowed by the earlier "/" instead of
+//     being planned as a dead node (see envoy_routes_b.inc).
 TEST(envoy_convert, token_budget_goldens_match_the_real_lexer) {
     const Str golden_a = lit_str(kEnvoyRoutesAGolden);
     const auto lexed_a = lex(golden_a);
@@ -2372,7 +2376,7 @@ TEST(envoy_convert, token_budget_goldens_match_the_real_lexer) {
     const Str golden_b = lit_str(kEnvoyRoutesBGolden);
     const auto lexed_b = lex(golden_b);
     REQUIRE(lexed_b);
-    CHECK_EQ(lexed_b.value().tokens.len, 655u);
+    CHECK_EQ(lexed_b.value().tokens.len, 360u);
     CHECK_LT(lexed_b.value().tokens.len, LexedTokens::kMaxTokens);
 
     const Str golden_c = lit_str(kEnvoyRoutesCGolden);
@@ -2382,6 +2386,10 @@ TEST(envoy_convert, token_budget_goldens_match_the_real_lexer) {
     CHECK_LT(lexed_c.value().tokens.len, LexedTokens::kMaxTokens);
 }
 
+// Codex round-9 review: "/" declared before "/api/" makes "/api" globally
+// shadowed (root byte-prefixes everything), so `build_lowering_plan` now
+// drops it before registering it as a node at all -- the golden is
+// root-only (see envoy_routes_b.inc's updated comment and doc).
 TEST(envoy_convert, golden_routes_b_root_then_prefix) {
     const std::string text = routes_scenario_b_json();
     static envoy::JsonDocument doc;
@@ -2393,6 +2401,173 @@ TEST(envoy_convert, golden_routes_b_root_then_prefix) {
     const Str golden = lit_str(kEnvoyRoutesBGolden);
     REQUIRE_EQ((*lowered).value().len, golden.len);
     CHECK((*lowered).value().view().eq(golden));
+}
+
+// Codex round-9 review's own example (P2 on PR #695): "/" declared before
+// TWO distinct sibling prefixes, "/api/" and "/admin/". Before the fix,
+// `build_lowering_plan` registered both dead nodes anyway (each shadowed by
+// the earlier "/", but still planned), emitting a full HEAD/any-method
+// forwarding block for each -- about 938 real lexer tokens for this exact
+// shape, over `LexedTokens::kMaxTokens` (932), even though the equivalent
+// root-only program fits comfortably. This pins both the golden text (must
+// be root-only, byte for byte) and the real token count, so a regression
+// that goes back to registering shadowed siblings is caught two ways: a
+// content mismatch here, and (independently) a real `TooManyTokens` failure
+// from `rut::lex` on the field the `estimate_conservative_token_count`
+// budget check in `lower_to_rut` is supposed to prevent from ever shipping.
+TEST(envoy_convert, shadowed_siblings_dropped_before_registration) {
+    const std::string text =
+        route_list_json(json_array({prefix_route_json("/", "backend"),
+                                    prefix_route_json("/api/", "api_backend"),
+                                    prefix_route_json("/admin/", "admin_backend")}),
+                        json_array({cluster_json("backend", 9000),
+                                    cluster_json("api_backend", 9001),
+                                    cluster_json("admin_backend", 9002)}));
+    static envoy::JsonDocument doc;
+    auto parsed = envoy::parse_bootstrap_json(str(text), doc);
+    REQUIRE(parsed);
+    const envoy::RutCapabilities all_true{true, true, true};
+    auto lowered = lower_heap(parsed.value(), all_true);
+    REQUIRE(*lowered);
+    const Str golden = lit_str(kEnvoyRoutesShadowedSiblingsGolden);
+    REQUIRE_EQ((*lowered).value().len, golden.len);
+    CHECK((*lowered).value().view().eq(golden));
+
+    const auto lexed = lex((*lowered).value().view());
+    REQUIRE(lexed);
+    CHECK_EQ(lexed.value().tokens.len, 364u);
+    CHECK_LT(lexed.value().tokens.len, LexedTokens::kMaxTokens);
+}
+
+// General form of the rule above (Codex round-9 decision: not just root):
+// an EARLIER prefix "/api/" is a byte-prefix of the LATER prefix
+// "/api/v1/", so "/api/v1" is globally shadowed -- dropped before it is
+// ever registered as a node -- even though nothing here is root and both
+// prefixes happen to forward to the same cluster (chosen to keep the
+// fixture minimal; shadowing does not depend on cluster identity). "/api"'s
+// own bare-literal gap (the unrelated 404-shape limitation documented in
+// `blocked_on_node_own_literal_needs_all_method_fallback`) is resolved with
+// an exact route for "/api" itself declared before its own prefix (the
+// already-established golden(f) pattern), NOT a root catch-all: a root
+// ancestor would force "/api" into an if/else chain, and two if/else-shaped
+// nodes together exceed `LexedTokens::kMaxTokens` at the current (932)
+// budget even with nothing else in the config (confirmed by direct
+// measurement) -- unrelated to this shadowing fix, but it rules out reusing
+// the `golden_routes_b_root_then_prefix`-style fixture shape here.
+TEST(envoy_convert, prefix_shadowed_by_earlier_prefix_dropped) {
+    const std::string text = route_list_json(json_array({path_route_json("/api", "api"),
+                                                         prefix_route_json("/api/", "api"),
+                                                         prefix_route_json("/api/v1/", "api")}),
+                                             json_array({cluster_json("api", 9001)}));
+    static envoy::JsonDocument doc;
+    auto parsed = envoy::parse_bootstrap_json(str(text), doc);
+    REQUIRE(parsed);
+    const envoy::RutCapabilities all_true{true, true, true};
+    auto lowered = lower_heap(parsed.value(), all_true);
+    REQUIRE(*lowered);
+    const std::string out = to_string((*lowered).value().view());
+    // "/api/v1" never appears anywhere -- the node was dropped outright, not
+    // merely rendered unreachable inside some other node's arm chain.
+    CHECK(out.find("/api/v1") == std::string::npos);
+    CHECK(out.find("route \"/api\" {") != std::string::npos);
+    CHECK(out.find("route HEAD \"/api\" {") != std::string::npos);
+}
+
+// Prefix-then-path form of the same rule: an earlier prefix "/api/" is a
+// byte-prefix of the later exact path "/api/x", so the exact route is
+// globally shadowed. This arm-level drop (`saw_own_prefix`, pre-existing
+// since round 7/8) is unchanged by round-9, but this pins it as a SUCCESS
+// case (an exact route for "/api" itself, declared first, resolves "/api"'s
+// own bare-literal gap the same way golden(f) does -- see the comment above
+// for why a root catch-all is not used instead) so the drop is visible in
+// the emitted text instead of being masked by the unrelated
+// `blocked_on_shadowed_exact_needs_all_method_fallback` BLOCKED_BY_RUT
+// case, which exercises the same route shape without an own-literal route.
+TEST(envoy_convert, prefix_shadowed_exact_path_arm_dropped) {
+    const std::string text =
+        route_list_json(json_array({path_route_json("/api", "api"),
+                                    prefix_route_json("/api/", "api"),
+                                    path_route_json("/api/x", "dead")}),
+                        json_array({cluster_json("api", 9001), cluster_json("dead", 9002)}));
+    static envoy::JsonDocument doc;
+    auto parsed = envoy::parse_bootstrap_json(str(text), doc);
+    REQUIRE(parsed);
+    const envoy::RutCapabilities all_true{true, true, true};
+    auto lowered = lower_heap(parsed.value(), all_true);
+    REQUIRE(*lowered);
+    const std::string out = to_string((*lowered).value().view());
+    CHECK(out.find("/api/x") == std::string::npos);
+    // "dead" is cluster index 1 (declared order api=0, dead=1): it must
+    // never appear as a forward target, only as an (unused) upstream.
+    CHECK(out.find("forward(envoy_cluster_1") == std::string::npos);
+    CHECK(out.find("forward(envoy_cluster_0") != std::string::npos);
+}
+
+// The reverse declaration order proves order, not text length, decides
+// shadowing (Codex round-9 decision): the MORE specific prefix "/api/v1/"
+// declared BEFORE the broader "/api/" is not shadowed by it
+// (`is_strict_ancestor("/api", "/api/v1")` is true, but the shadow check in
+// `build_lowering_plan` only ever looks at nodes already KEPT earlier in
+// declaration order, and "/api" is not one of them yet when "/api/v1" is
+// registered) -- both nodes are kept and planned. Two real (if/else-shaped)
+// nodes together exceed `LexedTokens::kMaxTokens` at the current (932)
+// budget (confirmed above and by `golden_routes_a_prefix_then_root`), so
+// this cannot be asserted as a byte-for-byte success like the other cases;
+// instead it is asserted two ways, both purely from `lower_to_rut`'s
+// observable result (no internal test hook into `build_lowering_plan`):
+//   - this order (specific first) fails with `TooManyTokens`, not
+//     `BLOCKED_BY_RUT` or success -- proving BOTH nodes were planned all
+//     the way to a fully generated RUT text (a `BLOCKED_BY_RUT` failure
+//     happens during planning, before any text is generated at all; and a
+//     single surviving node this shape would fit comfortably under budget,
+//     as `prefix_shadowed_by_earlier_prefix_dropped` above measures).
+//   - the reverse order (general "/api/" first, "/api/v1/" second, in
+//     `general_prefix_before_specific_shadows_specific` below) DOES shadow
+//     "/api/v1" and succeeds, well under budget, with only "/api" emitted
+//     -- the direct contrast that isolates order (not size) as the cause of
+//     the first case's `TooManyTokens`.
+TEST(envoy_convert, specific_prefix_before_general_prefix_keeps_both) {
+    const std::string text = route_list_json(
+        json_array({prefix_route_json("/api/v1/", "specific"),
+                    path_route_json("/api", "general"),
+                    prefix_route_json("/api/", "general")}),
+        json_array({cluster_json("specific", 9001), cluster_json("general", 9002)}));
+    static envoy::JsonDocument doc;
+    auto parsed = envoy::parse_bootstrap_json(str(text), doc);
+    REQUIRE(parsed);
+    const envoy::RutCapabilities all_true{true, true, true};
+    const auto lowered = envoy::lower_to_rut(parsed.value(), all_true);
+    CHECK_FALSE(lowered);
+    CHECK(lowered.error().code == FrontendError::TooManyTokens);
+    CHECK(to_string(lowered.error().detail).find("lexer token budget") != std::string::npos);
+}
+
+// Companion to the test above: same three routes, "/api/"'s prefix declared
+// BEFORE "/api/v1/"'s. This time "/api/v1" IS shadowed and dropped, so only
+// one (if/else-shaped) node is planned -- well under the token budget --
+// proving the previous test's `TooManyTokens` result really does come from
+// keeping both nodes (declaration order), not merely from this route
+// shape's size in general.
+TEST(envoy_convert, general_prefix_before_specific_shadows_specific) {
+    const std::string text = route_list_json(
+        json_array({path_route_json("/api", "general"),
+                    prefix_route_json("/api/", "general"),
+                    prefix_route_json("/api/v1/", "specific")}),
+        json_array({cluster_json("general", 9001), cluster_json("specific", 9002)}));
+    static envoy::JsonDocument doc;
+    auto parsed = envoy::parse_bootstrap_json(str(text), doc);
+    REQUIRE(parsed);
+    const envoy::RutCapabilities all_true{true, true, true};
+    auto lowered = lower_heap(parsed.value(), all_true);
+    REQUIRE(*lowered);
+    const std::string out = to_string((*lowered).value().view());
+    CHECK(out.find("/api/v1") == std::string::npos);
+    CHECK(out.find("route \"/api\" {") != std::string::npos);
+    // "specific" is cluster index 1 (declared order general=0, specific=1):
+    // it must never appear as a forward target, only as an (unused)
+    // upstream.
+    CHECK(out.find("forward(envoy_cluster_1") == std::string::npos);
+    CHECK(out.find("forward(envoy_cluster_0") != std::string::npos);
 }
 
 TEST(envoy_convert, golden_routes_c_exact_then_root) {
