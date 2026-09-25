@@ -496,49 +496,45 @@ ReadResult read_http_message(int fd, bool head_request, int timeout_ms) {
 
 // ── Listener ownership probe ────────────────────────────────────────────
 
-// A path this harness's own milestone-S bootstrap route table (see
-// kBootstrapTemplate below) answers with a fixed direct_response, never
-// routing to the "backend" cluster. probe_confirms_envoy_ownership() sends a
-// request for it to tell "this is the Envoy container this harness
-// launched" apart from "some unrelated process happens to be listening on
-// this port" -- and, critically, does so without ever contacting the
-// recording upstream (round-8 review, "Verify listener ownership instead of
-// timing process liveness": a foreign listener answering `port` must not be
-// mistaken for Envoy, and the probe used to rule that out must not itself
-// pollute the recorded oracle evidence). Defined via macros so
-// kBootstrapTemplate's JSON literal and this probe share one source of
-// truth instead of two copies that could drift; undefined again once the
-// template below is built.
-#define RUT_OWNERSHIP_PROBE_PATH "/__rut_ownership_probe__"
-#define RUT_OWNERSHIP_PROBE_BODY "rut-ownership-probe-not-found"
+// The asterisk-form request-target `*` (RFC 9112 §3.2.4) never matches the
+// milestone-S bootstrap's "/" prefix route (a leading "*" is not a leading
+// "/"), so Envoy's router finds no route for it and answers with a local
+// 404 -- confirmed by the oracle recording itself:
+// tests/fixtures/envoy_oracle_milestone_s.inc's own `options_star` case
+// records exactly this (`// options_star: upstream not contacted`, and a
+// downstream reply of "HTTP/1.1 404 Not Found" + "server: envoy" +
+// "content-length: 0", i.e. an empty body). kOwnershipProbeRequest reuses
+// that exact request shape so probe_confirms_envoy_ownership() can require
+// the exact recorded reply shape to tell "this is the Envoy container this
+// harness launched" apart from "some unrelated process happens to be
+// listening on this port" (round-8 review, "Verify listener ownership
+// instead of timing process liveness") -- all without touching
+// kBootstrapTemplate (below) or the "backend" cluster/recording upstream at
+// all: this is exactly the milestone-S bootstrap already used for every
+// other case, unmodified, so the oracle transcript and #700's pair-mode
+// conversion still see the identical bootstrap Envoy served.
+constexpr char kOwnershipProbeRequest[] =
+    "OPTIONS * HTTP/1.1\r\nHost: rut-ownership-probe.internal\r\n\r\n";
+// The request-target the probe above sends, i.e. RecordingUpstream::path_key()'s
+// key for it -- used only to assert the recording upstream never saw it (see
+// run_oracle_milestone_s()); the probe itself never contacts any upstream,
+// since asterisk-form requests never match kBootstrapTemplate's "/" route.
+constexpr char kOwnershipProbeTarget[] = "*";
 
-constexpr char kOwnershipProbePath[] = RUT_OWNERSHIP_PROBE_PATH;
-constexpr char kOwnershipProbeBody[] = RUT_OWNERSHIP_PROBE_BODY;
-
-// Sends one GET for kOwnershipProbePath on `port` and checks the response
-// against exactly what the milestone-S bootstrap's direct_response route
-// always answers: a 404 status line, Envoy's "server: envoy" header (added
-// by the connection manager to every response, including direct_response
-// local replies, regardless of the router filter's suppress_envoy_headers
-// setting -- confirmed by every downstream case in
-// tests/fixtures/envoy_oracle_milestone_s.inc, including the router's own
-// local 503 for connect_failure), and the exact probe body. This never
-// reaches the "backend" cluster, so it never touches the recording upstream
-// whether or not one happens to be live on the other end (true for both
-// run 1 and run 2's bootstraps in run_oracle_milestone_s()). A foreign
+// Sends kOwnershipProbeRequest on `port` and checks the response against
+// exactly what the milestone-S bootstrap's router-not-found local reply
+// always answers for it (see kOwnershipProbeRequest's comment): a 404
+// status line, Envoy's "server: envoy" header, and an empty body. A foreign
 // listener will fail to complete this exchange, answer a different status,
-// or lack the "server: envoy" header; any of those means ownership is not
-// confirmed.
+// lack the "server: envoy" header, or return a non-empty body; any of those
+// means ownership is not confirmed.
 bool probe_confirms_envoy_ownership(uint16_t port, int timeout_ms, std::string* error) {
     const int fd = connect_with_timeout(port, timeout_ms);
     if (fd < 0) {
         *error = "ownership probe: could not connect";
         return false;
     }
-    const std::string request = std::string("GET ") + kOwnershipProbePath +
-                                " HTTP/1.1\r\nHost: rut-ownership-probe.internal\r\n"
-                                "Connection: close\r\n\r\n";
-    if (!send_all(fd, request)) {
+    if (!send_all(fd, kOwnershipProbeRequest)) {
         close(fd);
         *error = "ownership probe: could not send probe request";
         return false;
@@ -551,7 +547,7 @@ bool probe_confirms_envoy_ownership(uint16_t port, int timeout_ms, std::string* 
     }
     if (!starts_with(read.bytes, "HTTP/1.1 404")) {
         *error =
-            "ownership probe: expected a 404 status line from the probe route, got a "
+            "ownership probe: expected a 404 status line for the asterisk-form request, got a "
             "different response";
         return false;
     }
@@ -559,8 +555,11 @@ bool probe_confirms_envoy_ownership(uint16_t port, int timeout_ms, std::string* 
         *error = "ownership probe: response is missing Envoy's \"server: envoy\" header";
         return false;
     }
-    if (!ends_with(read.bytes, kOwnershipProbeBody)) {
-        *error = "ownership probe: response body did not match the probe route's expected body";
+    const size_t header_end = read.bytes.find("\r\n\r\n");
+    const std::string body =
+        header_end == std::string::npos ? std::string() : read.bytes.substr(header_end + 4);
+    if (!body.empty()) {
+        *error = "ownership probe: expected an empty body for the router-not-found local reply";
         return false;
     }
     return true;
@@ -1083,14 +1082,13 @@ bool wait_ready_and_confirm_ownership(
 // The milestone-S bootstrap (docs/envoy-converter.md, "milestone-S";
 // tests/test_envoy_convert.cc's `milestone_s_json`), with the listener and
 // upstream endpoint ports left as placeholders so this harness can bind
-// loopback ephemeral ports per run. The first route is this harness's own
-// addition, not part of milestone-S proper: a direct_response reserved for
-// probe_confirms_envoy_ownership() (above), matched ahead of the catch-all
-// "/" route so it never shadows (and, since no real case's request path
-// equals kOwnershipProbePath, is never shadowed by) any of run1_cases()'s
-// routes to the "backend" cluster.
-const char kBootstrapTemplate[] =
-    R"json({
+// loopback ephemeral ports per run. This is also the exact bootstrap #700's
+// pair mode feeds to `rut-envoy-convert`, whose converter on this branch's
+// ancestry does not lower direct_response routes or multi-route lists --
+// so, unlike an earlier version of the ownership probe above, this bootstrap
+// is never modified to support it (round-8 review, "adding a
+// direct_response route ... changes the milestone-S bootstrap itself").
+const char kBootstrapTemplate[] = R"json({
 "static_resources": {
 "listeners": [{
 "name": "ingress",
@@ -1105,10 +1103,7 @@ const char kBootstrapTemplate[] =
 "route_config": {"name": "local", "virtual_hosts": [{
 "name": "all",
 "domains": ["*"],
-"routes": [{"match": {"path": ")json" RUT_OWNERSHIP_PROBE_PATH
-    R"json("}, "direct_response": {"status": 404, "body": {"inline_string": ")json" RUT_OWNERSHIP_PROBE_BODY
-    R"json("}}},
-{"match": {"prefix": "/"}, "route": {"cluster": "backend", "timeout": "0s"}}]
+"routes": [{"match": {"prefix": "/"}, "route": {"cluster": "backend", "timeout": "0s"}}]
 }]},
 "http_filters": [{"name": "envoy.filters.http.router",
 "typed_config": {"@type": "type.googleapis.com/envoy.extensions.filters.http.router.v3.Router", "suppress_envoy_headers": true}}]
@@ -1124,9 +1119,6 @@ const char kBootstrapTemplate[] =
 }]
 }
 })json";
-
-#undef RUT_OWNERSHIP_PROBE_PATH
-#undef RUT_OWNERSHIP_PROBE_BODY
 
 void replace_all(std::string* text, const std::string& from, const std::string& to) {
     size_t pos = 0;
@@ -1574,11 +1566,13 @@ int run_oracle_milestone_s(const std::string& output_path) {
         // probe (wait_ready_and_confirm_ownership()) against this same live
         // recording upstream; confirm it never actually reached it (round-8
         // review, "the recording upstream must not be contacted by the
-        // probe"), before any of run1_cases()'s own evidence is collected
-        // below.
-        if (!upstream.requests_for(kOwnershipProbePath).empty()) {
+        // probe"), before any of run1_cases()'s own evidence -- including
+        // the later options_star case, which shares this same request
+        // target and is likewise never contacted -- is collected below.
+        if (!upstream.requests_for(kOwnershipProbeTarget).empty()) {
             std::cerr << "FAIL: the listener-ownership probe contacted the recording upstream; "
-                         "it must be answered locally by the bootstrap's direct_response route\n";
+                         "the asterisk-form request must be answered by Envoy's own "
+                         "router-not-found local reply, never routed to a cluster\n";
             envoy.stop();
             upstream.stop();
             return 1;
@@ -2139,9 +2133,11 @@ bool self_test_wait_ready_ownership() {
     }
 
     // Case 3 (positive): the tracked child stays alive, and the listener it
-    // owns answers exactly like the milestone-S bootstrap's ownership-probe
-    // route would (404, "server: envoy", the expected body). Ownership must
-    // be confirmed.
+    // owns answers exactly like the milestone-S bootstrap's real
+    // router-not-found local reply for an asterisk-form request does (404,
+    // "server: envoy", empty body -- see tests/fixtures/
+    // envoy_oracle_milestone_s.inc's own `options_star` case). Ownership
+    // must be confirmed.
     {
         BoundPort foreign;
         if (!allocate_bound_loopback_port(&foreign)) {
@@ -2150,9 +2146,7 @@ bool self_test_wait_ready_ownership() {
             return false;
         }
         const std::string envoy_like_reply =
-            std::string("HTTP/1.1 404 Not Found\r\n") +
-            "content-length: " + std::to_string(strlen(kOwnershipProbeBody)) +
-            "\r\nserver: envoy\r\n\r\n" + kOwnershipProbeBody;
+            "HTTP/1.1 404 Not Found\r\ncontent-length: 0\r\nserver: envoy\r\n\r\n";
         FakeReplyListener listener;
         if (!listener.adopt(foreign.fd, envoy_like_reply)) {
             std::cerr << "FAIL [self-test wait_ready ownership]: could not adopt the foreign "
