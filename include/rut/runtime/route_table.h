@@ -1798,7 +1798,19 @@ public:
             (response_read_timeout_seconds != 0 &&
              !response_read_timeout_seconds_valid(response_read_timeout_seconds)) ||
             !forward_response_buffering_mode_valid(response_buffering) ||
-            (response_read_timeout_seconds == 0 && failure_policy_id == 0))
+            (response_read_timeout_seconds == 0 && failure_policy_id == 0) ||
+            // `header_order: "upstream"` is ordinary-forward-only (see
+            // analyze.cc and compile_to_config.h): it never carries response
+            // read timing, response buffering, or a timeout failure policy.
+            // Repeat that invariant here so a native caller building a
+            // RouteConfig directly (bypassing RIR compilation) cannot publish
+            // a bundle the deadline/buffering helpers assume never exists.
+            (response_policy_id != 0 &&
+             response_policies[response_policy_id - 1].header_order ==
+                 ResponsePolicyHeaderOrder::Upstream &&
+             (response_read_timeout_seconds != 0 ||
+              response_buffering != ForwardResponseBufferingMode::None ||
+              timeout_failure_policy_id != 0)))
             return 0;
         if (timeout_failure_policy_id != 0) {
             if (response_policy_id == 0 || failure_policy_id == 0 ||
@@ -1907,6 +1919,20 @@ public:
              !response_read_timeout_seconds_valid(b.response_read_timeout_seconds)) ||
             !forward_response_buffering_mode_valid(b.response_buffering) ||
             (b.response_read_timeout_seconds == 0 && b.failure_policy_id == 0))
+            return false;
+        // `header_order: "upstream"` is ordinary-forward-only (see analyze.cc
+        // and compile_to_config.h): this is the trust boundary
+        // `forward_policy_tables_valid()` relies on for a hand-built
+        // RouteConfig, so repeat the invariant here too — the deadline
+        // helpers in response_read_deadline.h fail closed if it is ever
+        // violated, but a config should never publish one in the first
+        // place.
+        if (b.response_policy_id != 0 &&
+            response_policies[b.response_policy_id - 1].header_order ==
+                ResponsePolicyHeaderOrder::Upstream &&
+            (b.response_read_timeout_seconds != 0 ||
+             b.response_buffering != ForwardResponseBufferingMode::None ||
+             b.timeout_failure_policy_id != 0))
             return false;
         if (b.response_buffering != ForwardResponseBufferingMode::None) {
             if (b.response_buffering != ForwardResponseBufferingMode::CompleteContentLength ||
