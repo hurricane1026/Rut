@@ -376,6 +376,28 @@ std::string two_clusters_json(rut::test::TestCase* _tc) {
     return text;
 }
 
+std::string path_match_json(rut::test::TestCase* _tc) {
+    std::string text = milestone_s_json();
+    CHECK(replace_first(
+        &text,
+        "\"routes\": [{\"match\": {\"prefix\": \"/\"}, \"route\": {\"cluster\": \"backend\", "
+        "\"timeout\": \"0s\"}}]",
+        "\"routes\": [{\"match\": {\"path\": \"/x\"}, \"route\": {\"cluster\": \"backend\", "
+        "\"timeout\": \"0s\"}}]"));
+    return text;
+}
+
+std::string nonroot_prefix_json(rut::test::TestCase* _tc) {
+    std::string text = milestone_s_json();
+    CHECK(replace_first(
+        &text,
+        "\"routes\": [{\"match\": {\"prefix\": \"/\"}, \"route\": {\"cluster\": \"backend\", "
+        "\"timeout\": \"0s\"}}]",
+        "\"routes\": [{\"match\": {\"prefix\": \"/api/\"}, \"route\": {\"cluster\": \"backend\", "
+        "\"timeout\": \"0s\"}}]"));
+    return text;
+}
+
 std::string direct_response_json(rut::test::TestCase* _tc) {
     std::string text = milestone_s_json();
     CHECK(replace_first(&text,
@@ -1527,6 +1549,46 @@ TEST(envoy_convert, blocked_on_multiple_clusters) {
         CHECK_EQ(lowered.error().span.line, second_cluster_span.line);
         CHECK_EQ(lowered.error().span.col, second_cluster_span.col);
     }
+}
+
+TEST(envoy_convert, blocked_on_path_match) {
+    const std::string text = path_match_json(_tc);
+    static envoy::JsonDocument doc;
+    auto parsed = envoy::parse_bootstrap_json(str(text), doc);
+    REQUIRE(parsed);
+    const envoy::RouteMatch& match =
+        parsed.value().listener.filter_chain.hcm.route_config.virtual_host.routes[0].match;
+    REQUIRE(match.kind == envoy::RouteMatchKind::Path);
+
+    const envoy::RutCapabilities all_true{true, true, true};
+    auto lowered = envoy::lower_to_rut(parsed.value(), all_true);
+    REQUIRE_FALSE(lowered);
+    CHECK(lowered.error().code == FrontendError::UnsupportedSyntax);
+    CHECK(to_string(lowered.error().detail).find("match.path is not lowered yet") !=
+          std::string::npos);
+    CHECK_EQ(lowered.error().span.line, match.span.line);
+    CHECK_EQ(lowered.error().span.col, match.span.col);
+}
+
+TEST(envoy_convert, blocked_on_nonroot_prefix) {
+    const std::string text = nonroot_prefix_json(_tc);
+    static envoy::JsonDocument doc;
+    auto parsed = envoy::parse_bootstrap_json(str(text), doc);
+    REQUIRE(parsed);
+    const envoy::RouteMatch& match =
+        parsed.value().listener.filter_chain.hcm.route_config.virtual_host.routes[0].match;
+    REQUIRE(match.kind == envoy::RouteMatchKind::Prefix);
+    REQUIRE(match.prefix.eq(lit_str("/api/")));
+
+    const envoy::RutCapabilities all_true{true, true, true};
+    auto lowered = envoy::lower_to_rut(parsed.value(), all_true);
+    REQUIRE_FALSE(lowered);
+    CHECK(lowered.error().code == FrontendError::UnsupportedSyntax);
+    CHECK(to_string(lowered.error().detail)
+              .find("route matches other than \"prefix\": \"/\" are not lowered yet") !=
+          std::string::npos);
+    CHECK_EQ(lowered.error().span.line, match.span.line);
+    CHECK_EQ(lowered.error().span.col, match.span.col);
 }
 
 TEST(envoy_convert, blocked_on_direct_response) {

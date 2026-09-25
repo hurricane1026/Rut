@@ -449,11 +449,18 @@ are recorded from the pinned Envoy build, not assumed.
   Rut's route trie is segment-aware, so only `prefix: "/"` and prefixes ending
   in `/` have a segment-equivalent meaning. Other prefixes are `PARTIAL`
   until Rut offers a raw-prefix match, and the converter rejects them.
-- Routes are evaluated in list order, first match wins. Rut selects the
-  longest matching prefix. A route list is accepted only when the converter can
-  prove list order and longest-prefix selection agree for every request, and
-  it must reject lists where an earlier shorter prefix shadows a later longer
-  one.
+- Routes are evaluated in list order, first match wins; Rut's own route trie
+  instead selects the longest matching declared prefix. Per owner decision D3
+  (see `docs/envoy-compatibility.md`, "Multiple routes per virtual host"),
+  the converter does not admit-or-reject a route list by proving the two
+  orders agree: PR 8 lowers every ordered, in-bounds route list by
+  construction (nested first-match arms), so list order and Rut's
+  longest-prefix trie can never disagree for the emitted program. Until PR 8
+  lands, this increment rejects every multi-route bootstrap outright
+  (`"multiple routes are not lowered yet"`), and a single-route bootstrap
+  whose match is not the root catch-all (`match.path`, or a `prefix` other
+  than `"/"`) is rejected the same way, precisely because `lower_to_rut` has
+  no ordered-list lowering yet to fall back on.
 - Matching is against the path without query. `x-envoy-original-path` is not
   set unless a rewrite happens.
 - No matching route: HCM responds 404 with an empty body and no route-level
@@ -1015,8 +1022,11 @@ Each needs its own issue before the corresponding row can leave
   measured value, which no policy exposes. Until then only the
   `suppress_envoy_headers: true` shape can be `SUPPORTED`.
 - Raw (non-segment) prefix match for `prefix` values not ending in `/`.
-- Explicit route-list ordering: Rut resolves by longest prefix. Either the
-  converter proves equivalence or the runtime gains an ordered fallback list.
+- ~~Explicit route-list ordering~~: resolved by construction (owner decision
+  D3) rather than a capability gap — see "Routing" above and
+  `docs/envoy-compatibility.md`. Not a `BLOCKED_BY_RUT` row; today's
+  increment rejects every route/match shape PR 8 hasn't lowered yet with its
+  own `UnsupportedSyntax` diagnostic instead.
 - Host / virtual-host routing: no host dimension in the route trie today.
 - Configurable connect, response and idle timeouts per upstream and per route.
   Rut has no connect-establishment timeout surface at all (not "a different

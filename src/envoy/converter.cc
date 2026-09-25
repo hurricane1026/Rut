@@ -326,6 +326,24 @@ FrontendResult<bool> validate(const Bootstrap& model, const RutCapabilities& cap
                            lit_str("multiple clusters are not lowered yet"));
 
     const Route& route = virtual_host.routes[0];
+    // Route matching beyond the catch-all is modeled (RouteMatchKind::Path,
+    // non-root RouteMatchKind::Prefix) but not lowered yet (PR 8 lowers an
+    // ordered, match-aware route list). Reject explicitly here: `lower_to_rut`
+    // below unconditionally emits a `route "/"` catch-all, so silently
+    // falling through would make an exact or scoped match accept every path.
+    // `prefix.len == 1u` is used instead of a content comparison against "/"
+    // because the parser's `prefix_shape_ok` (src/envoy/parser.cc) admits a
+    // length-1 prefix only when it is exactly "/" (the "starts and ends with
+    // /" branch requires length >= 2); this keeps the check, like every other
+    // decision here, a property of the validated model rather than of the
+    // borrowed source bytes.
+    if (route.match.kind == RouteMatchKind::Path)
+        return unsupported(route.match.span, lit_str("match.path is not lowered yet"));
+    if (route.match.prefix.len != 1u)
+        return unsupported(
+            route.match.span,
+            lit_str("route matches other than \"prefix\": \"/\" are not lowered yet"));
+
     const RouteAction& action = route.action;
     if (action.kind == RouteActionKind::DirectResponse)
         return unsupported(action.span, lit_str("direct_response is not lowered yet"));
