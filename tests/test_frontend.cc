@@ -1332,8 +1332,9 @@ static constexpr size_t kImportChainStackBytes = 8uz << 20;
 #else
 static constexpr size_t kImportChainStackBytes = 256uz << 20;
 #endif
-// main.rut + a five-file acyclic chain: six analyzer frames deep.
-static constexpr u32 kImportChainDepth = 5;
+// main.rut + the deepest acyclic chain the analyzer admits
+// (kMaxImportNestingDepth imported files): the worst-case analyzer stack.
+static constexpr u32 kImportChainDepth = kMaxImportNestingDepth;
 
 struct ImportChainRun {
     std::string main_path;
@@ -1391,18 +1392,19 @@ static bool run_import_chain_on_bounded_stack(ImportChainRun& run) {
 }
 
 // Writes m1.rut .. m<depth>.rut where each file imports the next; the last
-// one imports m1.rut again when `cycle` is set. Returns the summed file sizes
-// of m1 .. m<depth - 1>.
+// one imports m1.rut again when `cycle` is set. Each file starts with a blank
+// line, so its `import` sits at line 2 (main.rut's is at line 1). Returns the
+// summed file sizes of m1 .. m<depth - 1>.
 static u64 write_import_chain(const std::string& dir, u32 depth, bool cycle) {
     std::filesystem::remove_all(dir);
     std::filesystem::create_directories(dir);
     u64 bytes_before_last = 0;
     for (u32 i = 1; i <= depth; i++) {
-        std::string body;
+        std::string body = "\n";
         if (i < depth)
-            body = "import \"m" + std::to_string(i + 1) + ".rut\"\n";
+            body += "import \"m" + std::to_string(i + 1) + ".rut\"\n";
         else if (cycle)
-            body = "import \"m1.rut\"\n";
+            body += "import \"m1.rut\"\n";
         body += "func f" + std::to_string(i) + "() -> i32 => " + std::to_string(i) + "\n";
         std::ofstream out(dir + "/m" + std::to_string(i) + ".rut", std::ios::binary);
         out << body;
@@ -1423,8 +1425,9 @@ TEST(frontend, nested_import_chain_analyzes_on_default_linux_stack) {
 }
 
 TEST(frontend, nested_import_cycle_is_diagnosed_on_default_linux_stack) {
-    // m5 imports m1 again: the cycle is detected at the deepest level the
-    // acyclic chain above reaches, and must surface as a diagnostic.
+    // The last file imports m1 again: the cycle is detected at the deepest
+    // level the acyclic chain above reaches, and must surface as a cycle
+    // diagnostic rather than as the depth limit.
     const std::string dir = "/tmp/rut_frontend_import_cycle_stack";
     write_import_chain(dir, kImportChainDepth, true);
     ImportChainRun run;
@@ -1437,7 +1440,7 @@ TEST(frontend, nested_import_cycle_is_diagnosed_on_default_linux_stack) {
 }
 
 TEST(frontend, nested_import_source_budget_is_diagnosed_on_default_linux_stack) {
-    // The budget admits m1..m4 exactly, so reading the deepest file fails.
+    // The budget admits every file but the deepest, so reading it fails.
     const std::string dir = "/tmp/rut_frontend_import_budget_stack";
     const u64 admitted = write_import_chain(dir, kImportChainDepth, false);
     ImportChainRun run;
@@ -1451,6 +1454,30 @@ TEST(frontend, nested_import_source_budget_is_diagnosed_on_default_linux_stack) 
     CHECK_EQ(run.error.code, FrontendError::UnsupportedSyntax);
     CHECK_EQ(run.error_detail, std::string("source-bytes limit reached"));
     CHECK_EQ(run.imports_analyzed, kImportChainDepth - 1);
+    std::filesystem::remove_all(dir);
+}
+
+TEST(frontend, nested_import_depth_limit_is_diagnosed_not_crashed) {
+    // One level deeper than the limit: m<limit> imports m<limit + 1>. That
+    // import is refused before m<limit + 1> is read or analyzed, with a static
+    // detail and the span of the `import` in m<limit> (line 2, col 1), which
+    // stays valid after the failed modules are released.
+    static_assert(kMaxImportNestingDepth >= 1);
+    const std::string dir = "/tmp/rut_frontend_import_depth_limit";
+    const u64 read_bytes = write_import_chain(dir, kMaxImportNestingDepth + 1, false);
+    ImportChainRun run;
+    run.main_path = dir + "/main.rut";
+    run.copy_detail = true;
+    REQUIRE(run_import_chain_on_bounded_stack(run));
+    CHECK_FALSE(run.analyzed);
+    CHECK_EQ(run.error.code, FrontendError::UnsupportedSyntax);
+    CHECK_EQ(run.error_detail, std::string("import nesting depth limit reached"));
+    CHECK_EQ(run.error.span.line, 2u);
+    CHECK_EQ(run.error.span.col, 1u);
+    CHECK_EQ(run.error.span.start, 1u);
+    CHECK(run.error.span.end > run.error.span.start);
+    CHECK_EQ(run.imports_analyzed, kMaxImportNestingDepth);
+    CHECK_EQ(run.budget.used_bytes, read_bytes);
     std::filesystem::remove_all(dir);
 }
 

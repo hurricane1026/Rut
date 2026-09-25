@@ -12873,6 +12873,14 @@ static FrontendResult<void> load_imported_modules(
             }
             continue;
         }
+        // import_stack holds the main source plus every import currently being
+        // analyzed, so its size is the nesting depth the new import would get.
+        // The span is the `import` in this (importing) file and the detail is
+        // static, so neither dangles once the failed modules are released.
+        if (import_stack.size() > kMaxImportNestingDepth)
+            return frontend_error(FrontendError::UnsupportedSyntax,
+                                  item.import_decl.span,
+                                  lit_str("import nesting depth limit reached"));
         std::string content;
         const TextFileReadStatus read_status = read_text_file(normalized, content, source_budget);
         if (read_status == TextFileReadStatus::SourceLimit)
