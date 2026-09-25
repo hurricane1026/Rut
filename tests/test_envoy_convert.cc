@@ -2,6 +2,7 @@
 #include "fixtures/envoy_routes_a.inc"
 #include "fixtures/envoy_routes_b.inc"
 #include "fixtures/envoy_routes_c.inc"
+#include "rut/compiler/lexer.h"
 #include "rut/envoy/converter.h"
 #include "rut/envoy/parser.h"
 #include "test.h"
@@ -1746,7 +1747,11 @@ TEST(envoy_convert, api_forged_model_rejected) {
     // The `action.cluster`-side emptiness check still fires independently
     // when the declared cluster's own name stays non-empty (so the
     // per-cluster loop above passes), proving the empty/empty forgery is
-    // not only caught incidentally by that loop.
+    // not only caught incidentally by that loop. Codex round-6 review
+    // ported this check onto the same null-safe, non-empty-string
+    // diagnostic as the declared-cluster-name check above, so the message
+    // here is "must be a non-empty string", not the cluster-identity
+    // mismatch message.
     envoy::Bootstrap empty_action_cluster_only = parsed.value();
     empty_action_cluster_only.listener.filter_chain.hcm.route_config.virtual_host.routes[0]
         .action.cluster = Str{};
@@ -1755,7 +1760,7 @@ TEST(envoy_convert, api_forged_model_rejected) {
     CHECK_FALSE(empty_action_cluster_only_result);
     CHECK(empty_action_cluster_only_result.error().code == FrontendError::UnexpectedToken);
     CHECK(to_string(empty_action_cluster_only_result.error().detail)
-              .find("route cluster does not name a declared cluster") != std::string::npos);
+              .find("route cluster must be a non-empty string") != std::string::npos);
 
     // PR #692 round-9 review: a cleared `virtual_host.domains_span` — the
     // model's only record that parsing established `domains: ["*"]` — must
@@ -1954,46 +1959,13 @@ TEST(envoy_convert, api_forged_model_rejected) {
     // (independently the same class of finding, against the route-list
     // model's own `build_node_plan`): a hand-built model can set
     // `match.kind` to a value outside {Prefix, Path} (the parser never
-    // produces this); see the `forged_match_kind` case further below for the
-    // route-list-model-specific regression test (an unvalidated,
-    // default-empty `match.prefix` used to underflow
-    // `strip_trailing_slash`'s `prefix.len - 1u` instead of failing closed).
-    // `validate()`'s per-route loop (src/envoy/converter.cc) now rejects any
-    // `match.kind` outside {Prefix, Path} before either code path is ever
-    // reached, so this is not repeated here.
-
-    // Codex round-10 review (P2): `FixedVec::len` (include/rut/common/types.h)
-    // is a public field with no accompanying bound check, and the
-    // fixed-capacity `data` array beneath it is only ever `Cap` (here
-    // `kMaxEnvoyClusters`) elements wide. `parse_clusters` never produces a
-    // `len` past that cap, but the public hand-built-model overload can set
-    // `model.clusters.len` to anything: the cluster-validation loop in
-    // `validate()` (src/envoy/converter.cc) would then index
-    // `model.clusters[i]` past the end of `data` before ever reaching the
-    // later "multiple clusters are not lowered yet" rejection -- undefined
-    // behavior, reproducible as an ASan stack-buffer-overflow. `validate()`
-    // now rejects an out-of-bounds count before that loop ever runs.
-    envoy::Bootstrap forged_cluster_count = parsed.value();
-    forged_cluster_count.clusters.len = envoy::kMaxEnvoyClusters + 1u;
-    const auto forged_cluster_count_result = envoy::lower_to_rut(forged_cluster_count, all_true);
-    CHECK_FALSE(forged_cluster_count_result);
-    CHECK(forged_cluster_count_result.error().code == FrontendError::UnexpectedToken);
-    CHECK(to_string(forged_cluster_count_result.error().detail)
-              .find("cluster count exceeds the bounded capacity") != std::string::npos);
-
-    // Same hazard, applied to the public routes vector: a hand-built
-    // `Bootstrap` with `virtual_host.routes.len` set past `kMaxEnvoyRoutes`
-    // would run any per-route loop (and `virtual_host.routes[1]` in the
-    // "multiple routes" rejection above) past the end of the
-    // `kMaxEnvoyRoutes`-wide `data` array. Reject it before that happens.
-    envoy::Bootstrap forged_route_count = parsed.value();
-    forged_route_count.listener.filter_chain.hcm.route_config.virtual_host.routes.len =
-        envoy::kMaxEnvoyRoutes + 1u;
-    const auto forged_route_count_result = envoy::lower_to_rut(forged_route_count, all_true);
-    CHECK_FALSE(forged_route_count_result);
-    CHECK(forged_route_count_result.error().code == FrontendError::UnexpectedToken);
-    CHECK(to_string(forged_route_count_result.error().detail)
-              .find("route count exceeds the bounded capacity") != std::string::npos);
+    // produces this); `validate()`'s per-route loop (src/envoy/converter.cc)
+    // now rejects any `match.kind` outside {Prefix, Path} up front. Forged
+    // out-of-bounds `clusters.len` / `virtual_host.routes.len` are covered by
+    // `api_forged_multi_route_model_rejected` below (Codex round-6 review;
+    // kept there rather than duplicated here). A forged `match.kind` outside
+    // {Prefix, Path} is covered later in this test (Codex round-5 review,
+    // below the byte-content forgeries) rather than duplicated here too.
 
     // A one-byte prefix that is not "/" bypasses the parser's
     // `prefix_shape_ok` (which requires a length-1 prefix to literally BE
@@ -2051,6 +2023,100 @@ TEST(envoy_convert, api_forged_model_rejected) {
     CHECK_FALSE(forged_match_kind_result);
     CHECK(forged_match_kind_result.error().code == FrontendError::UnexpectedToken);
     CHECK(to_string(forged_match_kind_result.error().detail).find("match kind is not recognized") !=
+          std::string::npos);
+}
+
+TEST(envoy_convert, api_forged_multi_route_model_rejected) {
+    // These forgeries are only reachable once a model has more than one
+    // route/cluster admitted (this PR's `build_lowering_plan`); scenario
+    // (a)'s two routes/two clusters give a hand-built model with a
+    // "later" (index-1) route and a same-length declared cluster name to
+    // mutate.
+    const std::string text = routes_scenario_a_json();
+    static envoy::JsonDocument doc;
+    auto parsed = envoy::parse_bootstrap_json(str(text), doc);
+    REQUIRE(parsed);
+    REQUIRE_EQ(parsed.value().listener.filter_chain.hcm.route_config.virtual_host.routes.len, 2u);
+    REQUIRE_EQ(parsed.value().clusters.len, 2u);
+    const envoy::RutCapabilities all_true = all_capabilities_true();
+
+    // Codex round-6 review: `action.cluster` on the later (index-1) route
+    // reaches `Str::eq` against every declared cluster name without ever
+    // being validated as backed/non-empty/bounded itself (unlike the
+    // declared names on the other side of that comparison, reapplied by an
+    // earlier round). `Str::eq` checks length first, so a `Str{nullptr, 7}`
+    // forgery -- matching declared cluster "backend"'s 7-byte length --
+    // would dereference the null pointer instead of failing closed.
+    envoy::Bootstrap forged_cluster_view = parsed.value();
+    forged_cluster_view.listener.filter_chain.hcm.route_config.virtual_host.routes[1]
+        .action.cluster = Str{nullptr, 7u};
+    const auto forged_cluster_view_result = envoy::lower_to_rut(forged_cluster_view, all_true);
+    CHECK_FALSE(forged_cluster_view_result);
+    CHECK(forged_cluster_view_result.error().code == FrontendError::UnexpectedToken);
+    CHECK(to_string(forged_cluster_view_result.error().detail).find("non-empty string") !=
+          std::string::npos);
+
+    // An empty (zero-length, unbacked) `action.cluster` on the later route
+    // must be rejected the same way -- `Str::eq`'s length check alone would
+    // let this one through safely (no dereference), but it still must not
+    // silently resolve to `cluster_index_of`'s "unreachable" fallback index.
+    envoy::Bootstrap empty_cluster_view = parsed.value();
+    empty_cluster_view.listener.filter_chain.hcm.route_config.virtual_host.routes[1]
+        .action.cluster = Str{};
+    CHECK_FALSE(envoy::lower_to_rut(empty_cluster_view, all_true));
+
+    // An oversized `action.cluster` (129 bytes) on the later route bypasses
+    // the parser's `name_string` length bound the same way.
+    static const std::string oversized_cluster(129u, 'a');
+    envoy::Bootstrap oversized_cluster_view = parsed.value();
+    oversized_cluster_view.listener.filter_chain.hcm.route_config.virtual_host.routes[1]
+        .action.cluster = str(oversized_cluster);
+    const auto oversized_cluster_view_result =
+        envoy::lower_to_rut(oversized_cluster_view, all_true);
+    CHECK_FALSE(oversized_cluster_view_result);
+    CHECK(oversized_cluster_view_result.error().code == FrontendError::UnsupportedSyntax);
+    CHECK(to_string(oversized_cluster_view_result.error().detail).find("bounded length") !=
+          std::string::npos);
+
+    // Codex round-6 review: a hand-built model can set the later (index-1)
+    // route's `action.kind` to a value outside {Forward, DirectResponse,
+    // Redirect}. `validate()`'s per-route loop already applies the same
+    // `action.kind != RouteActionKind::Forward` check to every route
+    // (not just index 0), so this is already rejected; locked in here as a
+    // regression case for the specifically-multi-route shape the review
+    // raised.
+    envoy::Bootstrap forged_later_action_kind = parsed.value();
+    forged_later_action_kind.listener.filter_chain.hcm.route_config.virtual_host.routes[1]
+        .action.kind = static_cast<envoy::RouteActionKind>(77);
+    const auto forged_later_action_kind_result =
+        envoy::lower_to_rut(forged_later_action_kind, all_true);
+    CHECK_FALSE(forged_later_action_kind_result);
+    CHECK(forged_later_action_kind_result.error().code == FrontendError::UnexpectedToken);
+    CHECK(to_string(forged_later_action_kind_result.error().detail)
+              .find("action kind is not recognized") != std::string::npos);
+
+    // Codex round-6 review: `FixedVec::len` is public and unguarded by its
+    // own accessor, so a hand-built model can set `model.clusters.len` past
+    // `kMaxEnvoyClusters` (8) while the underlying `data` array stays that
+    // size; every `model.clusters[i]` access in `validate` (and
+    // `build_lowering_plan`/`cluster_index_of` after it) would then read out
+    // of bounds instead of producing a diagnostic.
+    envoy::Bootstrap forged_cluster_count = parsed.value();
+    forged_cluster_count.clusters.len = envoy::kMaxEnvoyClusters + 1u;
+    const auto forged_cluster_count_result = envoy::lower_to_rut(forged_cluster_count, all_true);
+    CHECK_FALSE(forged_cluster_count_result);
+    CHECK(forged_cluster_count_result.error().code == FrontendError::UnexpectedToken);
+    CHECK(to_string(forged_cluster_count_result.error().detail).find("bounded capacity") !=
+          std::string::npos);
+
+    // Same forged-count hazard, applied to the public routes vector.
+    envoy::Bootstrap forged_route_count = parsed.value();
+    forged_route_count.listener.filter_chain.hcm.route_config.virtual_host.routes.len =
+        envoy::kMaxEnvoyRoutes + 1u;
+    const auto forged_route_count_result = envoy::lower_to_rut(forged_route_count, all_true);
+    CHECK_FALSE(forged_route_count_result);
+    CHECK(forged_route_count_result.error().code == FrontendError::UnexpectedToken);
+    CHECK(to_string(forged_route_count_result.error().detail).find("bounded capacity") !=
           std::string::npos);
 }
 
@@ -2242,17 +2308,63 @@ TEST(envoy_convert, blocked_on_redirect) {
 // pre-existing (the single-route milestone-S golden already fails the same
 // way) and are PR3-PR5's job, not this PR's.
 
+// Codex round-6 review (P1): scenario (a) used to be a golden SUCCESS case,
+// pinning `kEnvoyRoutesAGolden` byte for byte. Direct measurement against the
+// real frontend lexer (`rut::lex`, linked test-only above) showed that exact
+// golden text -- 8804 bytes, well under `RutSource::kCapacity` -- fails to
+// lex with `TooManyTokens` at byte 8400, because `LexedTokens::kMaxTokens`
+// is only 932 tokens (tests/fixtures/envoy_routes_a.inc has the full
+// citation). So the converter was reporting success for a program `rut`
+// itself cannot load. `lower_to_rut` now fails closed on this exact shape;
+// this test locks that in instead of the stale byte-for-byte pin.
+// `kEnvoyRoutesAGolden` is kept (unused by this test) as the evidence for
+// that exact byte-8400 measurement.
 TEST(envoy_convert, golden_routes_a_prefix_then_root) {
     const std::string text = routes_scenario_a_json();
     static envoy::JsonDocument doc;
     auto parsed = envoy::parse_bootstrap_json(str(text), doc);
     REQUIRE(parsed);
     const envoy::RutCapabilities all_true{true, true, true};
-    auto lowered = lower_heap(parsed.value(), all_true);
-    REQUIRE(*lowered);
-    const Str golden = lit_str(kEnvoyRoutesAGolden);
-    REQUIRE_EQ((*lowered).value().len, golden.len);
-    CHECK((*lowered).value().view().eq(golden));
+    const auto lowered = envoy::lower_to_rut(parsed.value(), all_true);
+    CHECK_FALSE(lowered);
+    CHECK(lowered.error().code == FrontendError::TooManyTokens);
+    CHECK(to_string(lowered.error().detail).find("lexer token budget") != std::string::npos);
+}
+
+// Codex round-6 review (P1): measures `converter.cc`'s conservative
+// token-count estimate against the REAL frontend lexer (`rut::lex`, linked
+// test-only above -- see tests/CMakeLists.txt's comment on this target) for
+// the exact texts the estimate is meant to bound. Pins the current
+// numbers so a lexer or converter-emission change that moves them is caught
+// here rather than only showing up as a mysterious golden-test failure:
+//   - `kEnvoyRoutesAGolden` (scenario a, the shape `lower_to_rut` now
+//     rejects): the real lexer fails with `TooManyTokens` at byte 8400 of
+//     8804 -- confirming the rejection above is correct, not overly
+//     conservative for a program that would have actually worked.
+//   - `kEnvoyRoutesBGolden` / `kEnvoyRoutesCGolden` (the two golden shapes
+//     that still succeed, scenarios b/c below): 655 and 668 real tokens,
+//     comfortably under `LexedTokens::kMaxTokens` (932 today; #697,
+//     unmerged as of this PR, raises it to 4096 -- see
+//     docs/envoy-converter.md).
+TEST(envoy_convert, token_budget_goldens_match_the_real_lexer) {
+    const Str golden_a = lit_str(kEnvoyRoutesAGolden);
+    const auto lexed_a = lex(golden_a);
+    REQUIRE_FALSE(lexed_a);
+    CHECK(lexed_a.error().code == FrontendError::TooManyTokens);
+    CHECK_EQ(lexed_a.error().span.start, 8400u);
+    CHECK_EQ(golden_a.len, 8804u);
+
+    const Str golden_b = lit_str(kEnvoyRoutesBGolden);
+    const auto lexed_b = lex(golden_b);
+    REQUIRE(lexed_b);
+    CHECK_EQ(lexed_b.value().tokens.len, 655u);
+    CHECK_LT(lexed_b.value().tokens.len, LexedTokens::kMaxTokens);
+
+    const Str golden_c = lit_str(kEnvoyRoutesCGolden);
+    const auto lexed_c = lex(golden_c);
+    REQUIRE(lexed_c);
+    CHECK_EQ(lexed_c.value().tokens.len, 668u);
+    CHECK_LT(lexed_c.value().tokens.len, LexedTokens::kMaxTokens);
 }
 
 TEST(envoy_convert, golden_routes_b_root_then_prefix) {
@@ -2432,17 +2544,27 @@ TEST(envoy_convert, brute_force_equivalence_ordered_route_list) {
     auto parsed = envoy::parse_bootstrap_json(str(text), doc);
     REQUIRE(parsed);
     const envoy::RutCapabilities all_true{true, true, true};
-    auto lowered = lower_heap(parsed.value(), all_true);
-    REQUIRE(*lowered);
 
-    // Parse the REAL emitted RUT text (not `routes`/`sim_dispatch`'s
-    // independent model) so a `build_node_plan` regression fails this test.
-    const std::vector<RutNode> rut_nodes =
-        parse_rut_route_nodes(to_string((*lowered).value().view()));
-    REQUIRE_EQ(rut_nodes.size(), 3u);  // "/", "/api", "/api/v1"
-    std::vector<std::string> cluster_names;
-    for (u32 i = 0; i < parsed.value().clusters.len; i++)
-        cluster_names.push_back(to_string(parsed.value().clusters[i].name));
+    // Codex round-6 review (P1): this 5-route, 3-node ("/", "/api",
+    // "/api/v1") shape is exactly the kind of realistic, in-bounds
+    // (kMaxEnvoyRoutes = 8) configuration the token-budget finding warned
+    // about -- confirmed by direct measurement against the real frontend
+    // lexer (rut::lex, linked test-only above): even the smaller 2-node,
+    // single-arm-per-node scenarios (b)/(c) use 655-668 of the 932-token
+    // budget, and this scenario's extra node and if/else arms (for
+    // "/healthz" and "/api/x" each shadowing their owning node's own prefix)
+    // push it well past `LexedTokens::kMaxTokens` -- so `lower_to_rut` must
+    // now reject it instead of returning a program `rut` cannot load. This
+    // was a golden, real-emission cross-check (`rut_dispatch` against the
+    // parsed route nodes) before the fix; that path is no longer reachable
+    // for this scenario, so it is replaced by asserting the new fail-closed
+    // diagnostic. `envoy_first_match`/`sim_dispatch` below are pure
+    // simulations with no lowering dependency, so their self-consistency
+    // check over all 40+ probes still stands independent of the budget.
+    const auto lowered_result = envoy::lower_to_rut(parsed.value(), all_true);
+    CHECK_FALSE(lowered_result);
+    CHECK(lowered_result.error().code == FrontendError::TooManyTokens);
+    CHECK(to_string(lowered_result.error().detail).find("lexer token budget") != std::string::npos);
 
     const std::vector<std::string> probes = {
         "/",          "/healthz",    "/healthzz",   "/health",     "/api",
@@ -2461,8 +2583,6 @@ TEST(envoy_convert, brute_force_equivalence_ordered_route_list) {
         const std::string expected = envoy_first_match(routes, probe);
         const std::string actual = sim_dispatch(routes, probe);
         CHECK_EQ(expected, actual);
-        const std::string rut_actual = rut_dispatch(rut_nodes, cluster_names, probe);
-        CHECK_EQ(expected, rut_actual);
     }
 }
 

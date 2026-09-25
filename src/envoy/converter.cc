@@ -1,5 +1,15 @@
 #include "rut/envoy/converter.h"
 
+// Codex round-6 review (P1): only `LexedTokens::kMaxTokens` is used from this
+// header, to size this file's own conservative token-count estimate below
+// against the actual budget `rut`'s frontend lexer enforces. This is a
+// header-only constant (`static constexpr` inside `LexedTokens`); it adds no
+// link-time dependency on `rut_compiler` -- `rut_envoy`/`rut-envoy-convert`
+// deliberately link no Rut grammar or lowering library (see the CMake
+// comment above the `rut_envoy` target and `src/envoy/main.cc`'s header
+// comment), and this include preserves that.
+#include "rut/compiler/lexer.h"
+
 namespace rut::envoy {
 namespace {
 
@@ -13,6 +23,10 @@ auto unsupported(Span span, Str detail) {
 
 auto out_of_memory(Span span, Str detail) {
     return frontend_error(FrontendError::OutOfMemory, span, detail);
+}
+
+auto too_many_tokens(Span span, Str detail) {
+    return frontend_error(FrontendError::TooManyTokens, span, detail);
 }
 
 // PR #692 round-4 review: `validate` below must not trust that `model` came
@@ -858,6 +872,11 @@ FrontendResult<bool> validate(const Bootstrap& model, const RutCapabilities& cap
     }
     if (virtual_host.routes.len == 0u)
         return invalid(virtual_host.span, lit_str("at least one route is required"));
+    // (`virtual_host.routes.len > kMaxEnvoyRoutes` is already rejected at the
+    // very top of this function, before the cluster loop above -- see the
+    // Codex round-10 comment there. `build_node_plan`'s route loop and
+    // `owner_node`'s candidate loop, once `validate` succeeds, rely on that
+    // same earlier bound.)
 
     // direct_response / redirect actions are modeled (RouteActionKind) but
     // not lowered yet (PR 9/10 lower them). Reject precisely, before the
@@ -1028,13 +1047,25 @@ FrontendResult<bool> validate(const Bootstrap& model, const RutCapabilities& cap
         // action kind it does not actually recognize.
         if (action.kind != RouteActionKind::Forward)
             return invalid(action.span, lit_str("route action kind is not recognized"));
-        // PR #692 round-9 review, ported: reject an empty `action.cluster`
-        // explicitly too (see the per-cluster `name.empty()` loop above for
-        // the matching declared-name-emptiness guard the forgery needed
-        // both sides of).
-        if (action.cluster.empty())
+        // Codex round-6 review, ported: `parse_forward_action`'s
+        // `name_string(..., /*allow_empty=*/false, ...)`
+        // (src/envoy/parser.cc) guarantees every parsed `action.cluster` is
+        // backed, non-empty, and at most `kMaxEnvoyNameLen` bytes -- the
+        // same invariant already reapplied above for each declared
+        // `model.clusters[i].name`. The public hand-built-model overload
+        // bypasses that: an unbacked view such as `Str{nullptr, 7}` reaches
+        // `Str::eq` below, whose length check passes and then dereferences
+        // the null pointer whenever a declared cluster name happens to
+        // share that length. Reapply the same invariant to `action.cluster`
+        // before comparing it against any declared name (this also covers
+        // the PR #692 round-9 empty-`action.cluster` forgery: see the
+        // per-cluster `name.len == 0u` loop above for the matching
+        // declared-name-emptiness guard the forgery needed both sides of).
+        if (action.cluster.len == 0u || action.cluster.ptr == nullptr)
             return invalid(action.cluster_span,
-                           lit_str("route cluster does not name a declared cluster"));
+                           lit_str("route cluster must be a non-empty string"));
+        if (action.cluster.len > kMaxEnvoyNameLen)
+            return unsupported(action.cluster_span, lit_str("name exceeds the bounded length"));
         bool declared = false;
         for (u32 j = 0; j < model.clusters.len; j++) {
             if (action.cluster.eq(model.clusters[j].name)) {
@@ -1215,6 +1246,86 @@ FrontendResult<bool> validate(const Bootstrap& model, const RutCapabilities& cap
     return true;
 }
 
+// Codex round-6 review (P1): `RutSource::kCapacity` (128 KiB, see
+// include/rut/envoy/converter.h) bounds the emitted program's BYTE count,
+// but `rut`'s own frontend lexer separately bounds every program's TOKEN
+// count at `LexedTokens::kMaxTokens` (932 today; include/rut/compiler/
+// lexer.h) -- a bound this converter never checked. A two-route bootstrap
+// (`prefix: "/api/"` then the catch-all `"/"`) lowers to a byte-valid,
+// under-capacity program that nonetheless fails `rut`'s own `lex()` with
+// `TooManyTokens` at byte 8400 (confirmed against the real lexer on
+// `tests/fixtures/envoy_routes_a.inc`'s golden text: 8804 bytes, well under
+// `kCapacity`, but over `kMaxTokens`), so `lower_to_rut` used to report
+// success for a configuration `rut` cannot even parse.
+//
+// This estimate is intentionally conservative (never an UNDER-count) rather
+// than exact, so `lower_to_rut` stays free of any dependency on `rut`'s own
+// lexer/parser (`rut_envoy`/`rut-envoy-convert` deliberately link neither;
+// see the CMake comment above the `rut_envoy` target). It mirrors the real
+// lexer's rules closely enough to match it exactly for every token shape
+// this converter ever emits (whitespace, `"`-quoted strings with `\`-escapes,
+// identifier/keyword runs, digit runs), with one deliberate simplification:
+// every other byte (each punctuation character, including both halves of a
+// two-byte operator like `==`/`!=`) counts as its own token, so a two-byte
+// operator here counts as 2 tokens where the real lexer's `EqEq`/`BangEq`
+// counts 1 -- an over-count, never an under-count. Verified against the real
+// lexer (tests/test_envoy_convert.cc's `token_budget_*` cases, which link
+// `rut_compiler` test-only): this over-counts the routes (b)/(c) goldens by
+// 0-2 tokens (well within their ~260-plus-token headroom under the 932
+// budget) and still flags routes (a) over budget, matching `rut::lex`.
+u32 estimate_conservative_token_count(Str text) {
+    auto is_ident_start = [](char c) {
+        return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || c == '_';
+    };
+    auto is_ident_continue = [&](char c) { return is_ident_start(c) || (c >= '0' && c <= '9'); };
+    auto is_digit = [](char c) { return c >= '0' && c <= '9'; };
+
+    u32 count = 0;
+    u32 i = 0;
+    while (i < text.len) {
+        const char c = text.ptr[i];
+        if (c == ' ' || c == '\t' || c == '\n' || c == '\r') {
+            i++;
+            continue;
+        }
+        // The converter never emits a `//` line comment, but skip one the
+        // same way the real lexer does rather than mis-tokenizing it as
+        // punctuation, for the same never-under-count reason as above.
+        if (c == '/' && i + 1u < text.len && text.ptr[i + 1u] == '/') {
+            i += 2u;
+            while (i < text.len && text.ptr[i] != '\n') i++;
+            continue;
+        }
+        if (c == '"') {
+            count++;
+            i++;
+            while (i < text.len && text.ptr[i] != '"') {
+                i += (text.ptr[i] == '\\' && i + 1u < text.len) ? 2u : 1u;
+            }
+            if (i < text.len) i++;  // closing quote
+            continue;
+        }
+        if (is_ident_start(c)) {
+            count++;
+            i++;
+            while (i < text.len && is_ident_continue(text.ptr[i])) i++;
+            continue;
+        }
+        if (is_digit(c)) {
+            count++;
+            i++;
+            while (i < text.len && is_digit(text.ptr[i])) i++;
+            continue;
+        }
+        count++;
+        i++;
+    }
+    // `rut::lex` always appends one trailing EOF token to a successful
+    // result (`LexedTokens::kMaxTokens`'s own doc comment: "931 lexical
+    // tokens plus EOF"); every program pays this token regardless of shape.
+    return count + 1u;
+}
+
 }  // namespace
 
 FrontendResult<RutSource> lower_to_rut(const Bootstrap& model,
@@ -1259,6 +1370,17 @@ FrontendResult<RutSource> lower_to_rut(const Bootstrap& model,
         if (!put_route_node(writer, node.text, node.arms, "HEAD", 4u)) return fail_overflow();
         if (!put_route_node(writer, node.text, node.arms, "", 0u)) return fail_overflow();
     }
+
+    // Codex round-6 review (P1): a byte-valid, under-`kCapacity` program can
+    // still exceed `rut`'s own frontend lexer token budget (see
+    // `estimate_conservative_token_count`'s doc comment above); fail closed
+    // here instead of reporting success for a program `rut` cannot load.
+    const u32 estimated_tokens = estimate_conservative_token_count(output.view());
+    if (estimated_tokens > LexedTokens::kMaxTokens)
+        return too_many_tokens(
+            model.span,
+            lit_str("generated RUT source exceeds the compiler frontend's lexer token budget "
+                    "(LexedTokens::kMaxTokens); reduce the number of routes or clusters"));
 
     return output;
 }

@@ -496,6 +496,31 @@ are recorded from the pinned Envoy build, not assumed.
   ANY-slot fallback, unlike `route exact`. The full algorithm, worked through
   node by node, is a doc comment on `src/envoy/converter.cc`'s
   ordered-route-list section.
+- **Emitted program size is separately capped by the compiler frontend's
+  lexer, not just `RutSource::kCapacity`.** Codex round-6 review (P1):
+  `RutSource::kCapacity` (128 KiB, `include/rut/envoy/converter.h`) only
+  bounds the emitted program's byte count. `rut`'s own frontend lexer
+  separately bounds every program's token count at
+  `LexedTokens::kMaxTokens` (`include/rut/compiler/lexer.h`) — **932 today**;
+  the unmerged #697 raises it to **4096**, but is not part of this PR. A
+  route list well inside `kMaxEnvoyRoutes` (8) can exceed 932 tokens: each
+  node's `if`/`else` arm duplicates the full `request_policy`/
+  `response_policy`/`failure_policy` block (see the milestone-S golden,
+  `tests/fixtures/envoy_milestone_s.inc`) for both its `HEAD` and any-method
+  emission, so a single extra arm on a single node costs on the order of a
+  few hundred tokens. Measured against the real lexer (`rut::lex`,
+  `tests/test_envoy_convert.cc`'s `token_budget_goldens_match_the_real_lexer`,
+  which links `rut_compiler` test-only): the two-node, single-arm-per-node
+  goldens (b)/(c) use 655/668 tokens, but scenario (a) — two nodes, one of
+  them with an `if`/`else` arm — already needs over 932 and fails to lex at
+  byte 8400 of its 8804-byte, well-under-`kCapacity` output. `lower_to_rut`
+  now computes a conservative (never-under-counting) estimate of the emitted
+  token count and fails closed with `TooManyTokens` before returning a
+  program `rut` cannot load, rather than reporting success for one.
+  `rut_envoy`/`rut-envoy-convert` still link no Rut grammar or lowering
+  library (the estimate is self-contained, using only the header-only
+  `kMaxTokens` constant); only the test links `rut_compiler`, to verify the
+  estimate against the real lexer.
 - Matching is against the path without query. `x-envoy-original-path` is not
   set unless a rewrite happens.
 - No matching route: HCM responds 404 with an empty body and no route-level

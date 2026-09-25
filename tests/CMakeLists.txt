@@ -745,7 +745,14 @@ add_test(NAME test_envoy_parser COMMAND test_envoy_parser)
 set_tests_properties(test_envoy_parser PROPERTIES LABELS "unit;envoy;compiler")
 
 add_executable(test_envoy_convert test_envoy_convert.cc ${PROJECT_SOURCE_DIR}/src/placement_new.cc)
-target_link_libraries(test_envoy_convert rut_envoy)
+# Codex round-6 review (P1, converter.cc token-budget finding): linked so the
+# test can lex a converted program's emitted RUT source with the real
+# frontend lexer and assert it fits `LexedTokens::kMaxTokens`
+# (include/rut/compiler/lexer.h) -- the same lexer `rut` itself runs before a
+# converted program can load. rut_compiler (lexer/parser/analyze/mir_build/
+# lower_rir/rir_printer) carries no LLVM/JIT dependency, so this link is
+# test-only and does not change rut-envoy-convert's own dependency footprint.
+target_link_libraries(test_envoy_convert rut_envoy rut_compiler)
 target_include_directories(test_envoy_convert PRIVATE
     ${PROJECT_SOURCE_DIR}/include
     ${PROJECT_SOURCE_DIR}/testing
