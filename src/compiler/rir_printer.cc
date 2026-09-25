@@ -1065,6 +1065,21 @@ static const char* strict_local_response_connection_name(StrictLocalResponseConn
     return connection == StrictLocalResponseConnection::Request ? "request" : "invalid";
 }
 
+// Codex round-3 review: a synthesized policy and an Envoy-layout policy with
+// otherwise identical values must remain distinguishable in RIR output, since
+// they produce different header casing, ordering, and connection headers at
+// runtime (build_strict_local_response_bytes,
+// include/rut/runtime/callbacks_impl.h).
+static const char* strict_local_response_header_order_name(StrictLocalResponseHeaderOrder order) {
+    if (order == StrictLocalResponseHeaderOrder::Synthesized)
+        return "synthesized";
+    else if (order == StrictLocalResponseHeaderOrder::DateServerLength)
+        return "date_server_length";
+    else if (order == StrictLocalResponseHeaderOrder::LengthTypeDateServer)
+        return "length_type_date_server";
+    return "invalid";
+}
+
 static const char* unmatched_method_name(u32 slot) {
     static constexpr const char* names[kStrictLocalResponseMethodSlots] = {
         "ANY", "GET", "POST", "PUT", "DELETE", "PATCH", "HEAD", "OPTIONS", "CONNECT", "TRACE"};
@@ -1166,6 +1181,8 @@ static void print_module_impl(PrintBuf& buf, const Module& mod, bool internal_pr
                 buf.put_cstr(strict_local_response_connection_name(policy.connection));
                 buf.put_cstr(", head_mode=");
                 buf.put_cstr(strict_local_response_head_mode_name(policy.head_mode));
+                buf.put_cstr(", header_order=");
+                buf.put_cstr(strict_local_response_header_order_name(policy.header_order));
                 buf.put_cstr(", body=");
                 print_redirect_body(buf, policy.body);
                 buf.newline();

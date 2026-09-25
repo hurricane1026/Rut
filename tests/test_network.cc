@@ -3281,6 +3281,69 @@ TEST(response_policy, upstream_header_order_bundle_rejects_timing_buffering_and_
     CHECK_FALSE(forged.forward_policy_tables_valid());
 }
 
+// Codex round-3 review: prepare_response_read_deadline_preflight_for_mode
+// (include/rut/runtime/callbacks_impl.h) hard-requires the default failure
+// policy's status to be 502 and closes the downstream connection on
+// mismatch, so a bundle pairing the Envoy 503/length_type_date_server
+// failure_policy with response_read_timeout (with or without complete
+// buffering) must never be admitted -- it would drop every matching request.
+TEST(response_policy, failure_policy_503_bundle_rejects_response_read_timeout) {
+    RouteConfig config{};
+    u16 response_id = 0;
+    u16 failure_id = 0;
+    u16 timeout_id = 0;
+    REQUIRE(add_response_policy_test_roles(config, response_id, failure_id, timeout_id));
+
+    ForwardFailurePolicySpec failure_503{};
+    failure_503.version = ForwardFailurePolicyVersion::Http11;
+    failure_503.status_code = 503;
+    failure_503.date = ForwardFailurePolicyDate::Current;
+    failure_503.connection = ForwardFailurePolicyConnection::Request;
+    failure_503.head_mode = FailurePolicyHeadMode::Reject;
+    failure_503.header_order = FailurePolicyHeaderOrder::LengthTypeDateServer;
+    failure_503.reason = {"Service Unavailable", 19};
+    failure_503.content_type = {"text/plain", 10};
+    failure_503.server = {"envoy", 5};
+    failure_503.body = {"connect failure", 15};
+    const u16 failure_503_id = config.add_failure_policy(failure_503);
+    REQUIRE_NE(failure_503_id, 0u);
+
+    // Ordinary connect-failure-only usage (no read timeout, no buffering) is
+    // unaffected -- this is the feature the 503 layout exists for.
+    CHECK_NE(config.add_policy_bundle(0, failure_503_id), 0u);
+    // A bare response_read_timeout bundle referencing the 503 policy as the
+    // default failure must be rejected at construction.
+    CHECK_EQ(config.add_policy_bundle(0, failure_503_id, 0, 5), 0u);
+    CHECK_EQ(config.add_policy_bundle(response_id, failure_503_id, 0, 5), 0u);
+    // The complete-buffering shape (response_read_timeout + buffering +
+    // timeout_failure_policy) must also be rejected.
+    CHECK_EQ(config.add_policy_bundle(response_id,
+                                      failure_503_id,
+                                      timeout_id,
+                                      5,
+                                      ForwardResponseBufferingMode::CompleteContentLength),
+             0u);
+
+    // A hand-built config that skipped add_policy_bundle must still be
+    // rejected by the trust boundary forward_policy_tables_valid() relies on.
+    RouteConfig forged{};
+    u16 forged_response_id = 0;
+    u16 forged_failure_id = 0;
+    u16 forged_timeout_id = 0;
+    REQUIRE(add_response_policy_test_roles(
+        forged, forged_response_id, forged_failure_id, forged_timeout_id));
+    const u16 forged_failure_503_id = forged.add_failure_policy(failure_503);
+    REQUIRE_NE(forged_failure_503_id, 0u);
+    const u16 bundle_id = forged.add_policy_bundle(0, forged_failure_503_id);
+    REQUIRE_NE(bundle_id, 0u);
+    CHECK(forged.policy_bundle_id_is_valid(bundle_id));
+    CHECK(forged.forward_policy_tables_valid());
+
+    forged.policy_bundles[bundle_id - 1].response_read_timeout_seconds = 5;
+    CHECK_FALSE(forged.policy_bundle_id_is_valid(bundle_id));
+    CHECK_FALSE(forged.forward_policy_tables_valid());
+}
+
 TEST(response_read_timeout, h1_rejects_before_every_forward_effect_and_preserves_absence) {
     RouteConfig config{};
     REQUIRE(config.add_upstream("backend", 0x7F000001, 9000).has_value());

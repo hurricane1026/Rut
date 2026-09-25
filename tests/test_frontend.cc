@@ -35429,6 +35429,43 @@ TEST(frontend, failure_policy_envoy_layout_admits_503_and_keeps_502_closed) {
                          envoy_fields + body_and_close));
 }
 
+// Codex round-3 review: prepare_response_read_deadline_preflight_for_mode
+// (include/rut/runtime/callbacks_impl.h) hard-requires the default failure
+// policy's status to be 502 and closes the downstream connection on
+// mismatch, so the Envoy 503/length_type_date_server failure_policy must
+// never be admitted alongside response_read_timeout -- it would drop every
+// matching request instead of serving the intended 503. The plain
+// connect-failure-only usage (no response_read_timeout) stays admitted.
+TEST(frontend, failure_policy_status_503_rejects_response_read_timeout) {
+    const std::string prefix =
+        "upstream b\nroute GET \"/\" { return forward(b, failure_policy: { version: \"HTTP/1.1\", "
+        "status: 503, reason: \"Service Unavailable\", content_type: \"text/plain\", server: "
+        "\"envoy\", date: \"current\", connection_header: \"close_only\", header_names: "
+        "\"lowercase\", header_order: \"length_type_date_server\", connection: \"request\", "
+        "body: b\"upstream connect error\"";
+    {
+        // Ordinary connect-failure-only usage: still admitted.
+        const std::string src = prefix + " }) }\n";
+        auto lexed = lex({src.data(), static_cast<u32>(src.size())});
+        REQUIRE(lexed);
+        auto ast = parse_file_heap(lexed.value());
+        REQUIRE(ast);
+        auto hir = analyze_file_heap(ast.value());
+        CHECK(hir.has_value());
+    }
+    {
+        const std::string src = prefix + " }, response_read_timeout: 1s) }\n";
+        auto lexed = lex({src.data(), static_cast<u32>(src.size())});
+        REQUIRE(lexed);
+        auto ast = parse_file_heap(lexed.value());
+        REQUIRE(ast);
+        auto hir = analyze_file_heap(ast.value());
+        REQUIRE_FALSE(hir.has_value());
+        CHECK(hir.error().detail.eq(
+            lit("failure_policy status 503 does not support response_read_timeout")));
+    }
+}
+
 TEST(frontend, failure_policy_byte_body_reaches_rir_and_keeps_nul_lf) {
     const char* src =
         "upstream b\nroute GET \"/\" { return forward(b, failure_policy: { version: \"HTTP/1.1\", "
@@ -36731,16 +36768,16 @@ unmatched { return local_response({
         "strict_local_response_policies: 4\n"
         "  local_response#1: version=HTTP/1.1, status=400, reason=\"Bad Request\", "
         "server=\"rut\", content_type=\"text/html\", date=current, connection=request, "
-        "head_mode=reject, body=b\"options\" (len=7)\n"
+        "head_mode=reject, header_order=synthesized, body=b\"options\" (len=7)\n"
         "  local_response#2: version=HTTP/1.1, status=405, reason=\"Not Allowed\", "
         "server=\"rut\", content_type=\"text/plain\", date=current, connection=request, "
-        "head_mode=reject, body=b\"connect\" (len=7)\n"
+        "head_mode=reject, header_order=synthesized, body=b\"connect\" (len=7)\n"
         "  local_response#3: version=HTTP/1.1, status=403, reason=\"Forbidden\", "
         "server=\"rut\", content_type=\"text/plain\", date=current, connection=request, "
-        "head_mode=suppress_body, body=b\"trace\" (len=5)\n"
+        "head_mode=suppress_body, header_order=synthesized, body=b\"trace\" (len=5)\n"
         "  local_response#4: version=HTTP/1.1, status=404, reason=\"Not Found\", "
         "server=\"rut\", content_type=\"text/plain\", date=current, connection=request, "
-        "head_mode=suppress_body, body=b\"A\\x00\\nB\" (len=4)\n"
+        "head_mode=suppress_body, header_order=synthesized, body=b\"A\\x00\\nB\" (len=4)\n"
         "unmatched:\n"
         "  ANY -> local_response#4\n"
         "  OPTIONS -> local_response#1\n"
@@ -36942,16 +36979,16 @@ route exact slash_normalized "/health/check" { return local_response({
         "strict_local_response_policies: 4\n"
         "  local_response#1: version=HTTP/1.1, status=400, reason=\"Raw Get\", server=\"rut\", "
         "content_type=\"text/plain\", date=current, connection=request, head_mode=reject, "
-        "body=b\"raw-get\" (len=7)\n"
+        "header_order=synthesized, body=b\"raw-get\" (len=7)\n"
         "  local_response#2: version=HTTP/1.1, status=401, reason=\"Normalized Get\", "
         "server=\"rut\", content_type=\"text/plain\", date=current, connection=request, "
-        "head_mode=reject, body=b\"normalized-get\" (len=14)\n"
+        "head_mode=reject, header_order=synthesized, body=b\"normalized-get\" (len=14)\n"
         "  local_response#3: version=HTTP/1.1, status=402, reason=\"Raw Any\", server=\"rut\", "
         "content_type=\"text/plain\", date=current, connection=request, "
-        "head_mode=suppress_body, body=b\"raw-any\" (len=7)\n"
+        "head_mode=suppress_body, header_order=synthesized, body=b\"raw-any\" (len=7)\n"
         "  local_response#4: version=HTTP/1.1, status=403, reason=\"Normalized Any\", "
         "server=\"rut\", content_type=\"text/plain\", date=current, connection=request, "
-        "head_mode=suppress_body, body=b\"normalized-any\" (len=14)\n"
+        "head_mode=suppress_body, header_order=synthesized, body=b\"normalized-any\" (len=14)\n"
         "unmatched:\n"
         "exact:\n"
         "  GET \"/health/check\" -> local_response#1\n"

@@ -461,9 +461,12 @@ return forward(users, request_policy: {
 // `connection_header: "close_only"`, and `header_order` are optional as a
 // closed trio (any one present requires all three); the fixed-order layout
 // above (all three omitted) is unchanged. `connection_header: "close_only"`
-// means `connection: close` is appended last only when the downstream
-// connection is closing; it is omitted entirely otherwise (unlike the
-// fixed-order layout, which always sends one or the other).
+// means `connection: close` is appended immediately after `server` only when
+// the downstream connection is closing; it is omitted entirely otherwise
+// (unlike the fixed-order layout, which always sends one or the other). Its
+// place in the overall wire order is layout-specific: last for
+// length_type_date_server, but followed by a trailing `content-length: 0` for
+// date_server_length below.
 //
 // local_response header_order: "date_server_length" is the empty-body
 // no-route shape (`date, server, [connection: close,] content-length: 0`):
