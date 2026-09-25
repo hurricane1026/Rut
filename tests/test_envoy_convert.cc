@@ -889,7 +889,9 @@ TEST(envoy_convert, cli_milestone_s_converts) {
     // this PR ships `local_reply_envoy_h1`: `kShippedRutCapabilities` is now
     // all true, so the milestone-S bootstrap converts end to end through the
     // real CLI (no `RutCapabilities` override) with exit 0, stdout matching
-    // the golden byte for byte, and nothing on stderr.
+    // the golden byte for byte, and only the D2 `connect_timeout` warning on
+    // stderr (the CLI warns, per the #692 review, that Rut does not enforce
+    // the cluster's connect_timeout).
     const TempDir temp_dir;
     REQUIRE(temp_dir.ok());
     const std::string& directory = temp_dir.path();
@@ -900,7 +902,8 @@ TEST(envoy_convert, cli_milestone_s_converts) {
     const RunResult result = run_converter(g_executable, path);
     REQUIRE(WIFEXITED(result.status));
     CHECK_EQ(WEXITSTATUS(result.status), 0);
-    CHECK(result.err.empty());
+    CHECK_EQ(result.err.rfind("warning: connect_timeout \"5s\"", 0), 0u);
+    CHECK_EQ(result.err.find('\n'), result.err.size() - 1u);
     CHECK_EQ(result.out, std::string(kEnvoyMilestoneSGolden));
 }
 
