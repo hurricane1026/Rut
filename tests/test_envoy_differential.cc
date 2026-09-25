@@ -112,6 +112,11 @@ constexpr int kClientTimeoutMs = 3000;
 // this process (Envoy binds it itself inside the container), so this harness
 // can only probe-allocate it and race everyone else for it.
 constexpr int kMaxListenPortAttempts = 3;
+// Bounded grace window given to a HEAD response after its header terminator,
+// to catch a body sent in a later TCP segment (RFC 9110 §9.3.2 forbids one).
+// Short relative to kClientTimeoutMs: it only needs to observe bytes the
+// peer was about to send anyway, not to wait out a legitimately silent peer.
+constexpr int kHeadBodyGraceMs = 200;
 
 // ── Small process helpers ──────────────────────────────────────────────
 
@@ -488,6 +493,11 @@ struct ReadResult {
 // `timeout_ms` total. Always returns whatever was captured, even on a
 // partial read, but `complete` is false whenever the framing did not finish
 // (record-only cases must check it; see ReadResult).
+//
+// For a HEAD response specifically, RFC 9110 §9.3.2 forbids a body; after
+// the header terminator this waits up to kHeadBodyGraceMs for the peer to
+// send one anyway (in a later TCP segment) so a violation shows up as extra
+// bytes here instead of being silently dropped by returning immediately.
 ReadResult read_http_message(int fd, bool head_request, int timeout_ms) {
     std::string buf;
     const int64_t deadline = now_ms() + timeout_ms;
@@ -504,9 +514,25 @@ ReadResult read_http_message(int fd, bool head_request, int timeout_ms) {
         if (n <= 0) return {buf, false};
         buf.append(chunk, static_cast<size_t>(n));
     }
-    // A HEAD response never carries a body (RFC 9110 §9.3.2): the headers
-    // are the entire message, so finding the blank line is completion.
-    if (head_request) return {buf, true};
+    if (head_request) {
+        // A HEAD response never carries a body (RFC 9110 §9.3.2): the
+        // headers are the entire message, so finding the blank line is
+        // completion. Still wait up to kHeadBodyGraceMs for the peer to
+        // send one anyway (in a later TCP segment) so a violation shows up
+        // as extra captured bytes instead of being silently dropped by
+        // returning immediately.
+        const int64_t grace_deadline = now_ms() + kHeadBodyGraceMs;
+        for (;;) {
+            const int64_t remaining = grace_deadline - now_ms();
+            if (remaining <= 0) break;
+            pollfd pfd{fd, POLLIN, 0};
+            if (poll(&pfd, 1, static_cast<int>(remaining)) <= 0) break;
+            const ssize_t n = recv(fd, chunk, sizeof(chunk), 0);
+            if (n <= 0) break;
+            buf.append(chunk, static_cast<size_t>(n));
+        }
+        return {buf, true};
+    }
     const std::string headers = buf.substr(0, header_end);
     std::string cl_value;
     std::string connection_value;
@@ -1299,6 +1325,14 @@ bool wait_port_closed(uint16_t port, int timeout_ms) {
 
 // ── RUT process management (PR 6) ───────────────────────────────────────
 
+// Renders a `waitpid` status for a FAIL message: "exited N" for a normal
+// exit, "killed by signal N" for one it did not ask for.
+std::string describe_wait_status(int status) {
+    if (WIFEXITED(status)) return "exited " + std::to_string(WEXITSTATUS(status));
+    if (WIFSIGNALED(status)) return "killed by signal " + std::to_string(WTERMSIG(status));
+    return "unknown wait status";
+}
+
 // Launches the real `rut` binary (built by this repo, not a container) on
 // the listener/upstream ports baked into `rut_source_path` by
 // `rut-envoy-convert`. Mirrors `EnvoyInstance` above: fork/exec, redirect
@@ -1306,6 +1340,13 @@ bool wait_port_closed(uint16_t port, int timeout_ms) {
 struct RutInstance {
     pid_t pid = -1;
     std::string log_path;
+    // Set by stop() when the child had already exited on its own -- a crash
+    // or unexpected exit, not our SIGTERM/SIGKILL -- before this call sent
+    // it any signal. A caller that sees this after a run must treat the
+    // whole result as a failure: byte comparisons collected up to that point
+    // prove nothing about a binary that has since crashed.
+    bool exited_unexpectedly = false;
+    std::string unexpected_exit_description;
 
     bool launch(const std::string& rut_binary, const std::string& rut_source_path) {
         pid = fork();
@@ -1340,25 +1381,39 @@ struct RutInstance {
         return true;
     }
 
-    void stop() {
-        if (pid > 0) {
-            kill(pid, SIGTERM);
-            const int64_t deadline = now_ms() + 5000;
-            int status = 0;
-            for (;;) {
-                const pid_t waited = waitpid(pid, &status, WNOHANG);
-                if (waited == pid) break;
-                if (now_ms() >= deadline) {
-                    kill(pid, SIGKILL);
-                    while (waitpid(pid, &status, 0) < 0 && errno == EINTR) {
-                    }
-                    break;
-                }
-                struct timespec ts{0, 10'000'000};
-                nanosleep(&ts, nullptr);
-            }
+    // Returns false iff the child had already exited by itself before this
+    // call sent it any signal -- an unexpected exit (crash or otherwise)
+    // that `exited_unexpectedly` / `unexpected_exit_description` describe.
+    // Returns true when there was nothing to stop, or when the child ended
+    // because of the SIGTERM/SIGKILL sent here (an intentional teardown).
+    bool stop() {
+        if (pid <= 0) return true;
+        int status = 0;
+        // Check before signaling: if the child is already a zombie here, it
+        // exited on its own, not because we asked it to.
+        const pid_t precheck = waitpid(pid, &status, WNOHANG);
+        if (precheck == pid) {
+            exited_unexpectedly = true;
+            unexpected_exit_description = describe_wait_status(status);
             pid = -1;
+            return false;
         }
+        kill(pid, SIGTERM);
+        const int64_t deadline = now_ms() + 5000;
+        for (;;) {
+            const pid_t waited = waitpid(pid, &status, WNOHANG);
+            if (waited == pid) break;
+            if (now_ms() >= deadline) {
+                kill(pid, SIGKILL);
+                while (waitpid(pid, &status, 0) < 0 && errno == EINTR) {
+                }
+                break;
+            }
+            struct timespec ts{0, 10'000'000};
+            nanosleep(&ts, nullptr);
+        }
+        pid = -1;
+        return true;
     }
 
     ~RutInstance() { stop(); }
@@ -1727,7 +1782,7 @@ bool run_client_case(uint16_t listen_port, const CaseSpec& spec, CaseResult* res
         result->exchange_complete = read.complete;
     }
     close(fd);
-    return sent;
+    return sent && result->exchange_complete;
 }
 
 // Runs every case in `cases` against an already-listening `listen_port`, in
@@ -1750,23 +1805,37 @@ std::vector<CaseResult> run_case_batch(uint16_t listen_port, const std::vector<C
 // Fills in `upstream_contacted`/`upstream_contact_count`/`upstream_bytes` on
 // each result in `results` from what `upstream` actually recorded for that
 // case's path, matching cases by name against `cases` to find each one's
-// `upstream_path`. `upstream_contact_count` feeds the same at-most-once-
-// contact rule `validate_results` enforces for the oracle transcript
-// (round-3 review).
-void fill_upstream_bytes(std::vector<CaseResult>* results,
+// `upstream_path`. Returns false if any case's path recorded more than one
+// request: a retried, replayed or otherwise duplicated upstream request
+// (which could repeat a side effect in production, e.g. the fixed-length
+// POST) must fail the harness immediately rather than be silently reduced
+// to the first observation. `upstream_contact_count` is always recorded
+// (even on the failing path) so the same at-most-once-contact rule
+// `validate_results` enforces again at transcript-write time (round-3
+// review) still catches a duplicate that reaches a transcript writer some
+// other way.
+bool fill_upstream_bytes(std::vector<CaseResult>* results,
                          const std::vector<CaseSpec>& cases,
                          RecordingUpstream& upstream) {
+    bool ok = true;
     for (auto& r : *results) {
         const auto it = std::find_if(
             cases.begin(), cases.end(), [&](const CaseSpec& s) { return r.name == s.name; });
         if (it == cases.end()) continue;
         const auto observed = upstream.requests_for(it->upstream_path);
         r.upstream_contact_count = static_cast<int>(observed.size());
-        if (!observed.empty()) {
-            r.upstream_contacted = true;
-            r.upstream_bytes = observed.front();
+        if (observed.empty()) continue;
+        if (observed.size() > 1) {
+            std::cerr << "FAIL: upstream recorded " << observed.size() << " requests for case "
+                      << r.name << " (path \"" << it->upstream_path
+                      << "\"), expected exactly one\n";
+            ok = false;
+            continue;
         }
+        r.upstream_contacted = true;
+        r.upstream_bytes = observed.front();
     }
+    return ok;
 }
 
 // Refuses evidence that would make write_transcript() emit a fixture
@@ -1828,7 +1897,20 @@ std::string normalize_date_for_compare(const std::string& raw, const std::string
         const size_t a = value.find_first_not_of(" \t");
         const size_t b = value.find_last_not_of(" \t");
         const std::string trimmed = a == std::string::npos ? "" : value.substr(a, b - a + 1);
-        if (trimmed != preserved_date) line = line.substr(0, colon + 1) + " <normalized-date>";
+        if (trimmed != preserved_date) {
+            // Replace only the value bytes, keeping the exact prefix (the
+            // whitespace between ':' and the value, which may differ
+            // between implementations) and any trailing whitespace intact,
+            // so this never hides a real formatting difference elsewhere on
+            // the line.
+            const std::string prefix = a == std::string::npos ? value : value.substr(0, a);
+            const std::string suffix = a == std::string::npos ? "" : value.substr(b + 1);
+            std::string new_line = line.substr(0, colon + 1);
+            new_line += prefix;
+            new_line += "<normalized-date>";
+            new_line += suffix;
+            line = std::move(new_line);
+        }
     }
     std::string out;
     for (size_t i = 0; i < lines.size(); i++) {
@@ -2253,20 +2335,30 @@ int run_oracle_milestone_s(const std::string& output_path) {
 
 // Compares one pair case's Envoy and RUT observations, printing
 // MATCH/MISMATCH with escaped literals for either mismatching side. Returns
-// true iff both upstream and downstream bytes agree (downstream compared
-// after `normalize_date_for_compare`, everything else byte for byte).
+// true iff both sides produced a complete exchange (see
+// `CaseResult::exchange_complete`) AND both upstream and downstream bytes
+// agree (downstream compared after `normalize_date_for_compare`, everything
+// else byte for byte). Two exchanges that both failed identically (e.g. a
+// connection refused on both sides yielding two empty buffers) must never
+// report MATCH: that would let the harness pass without ever exercising the
+// case.
 bool compare_pair_case(const PairCaseResult& c) {
     const std::string preserved_date =
         c.name == "get_upstream_date_server" ? "Mon, 01 Jan 2024 00:00:00 GMT" : std::string();
     const std::string envoy_down =
         normalize_date_for_compare(c.envoy.downstream_bytes, preserved_date);
     const std::string rut_down = normalize_date_for_compare(c.rut.downstream_bytes, preserved_date);
+    const bool both_complete = c.envoy.exchange_complete && c.rut.exchange_complete;
     const bool upstream_match = c.envoy.upstream_contacted == c.rut.upstream_contacted &&
                                 c.envoy.upstream_bytes == c.rut.upstream_bytes;
     const bool downstream_match = envoy_down == rut_down;
-    const bool match = upstream_match && downstream_match;
+    const bool match = both_complete && upstream_match && downstream_match;
     std::cerr << (match ? "MATCH    [" : "MISMATCH [") << c.name << "]"
               << (c.asserted ? " (asserted)" : " (record-only)") << "\n";
+    if (!both_complete) {
+        std::cerr << "  incomplete exchange: envoy=" << (c.envoy.exchange_complete ? "yes" : "no")
+                  << " rut=" << (c.rut.exchange_complete ? "yes" : "no") << "\n";
+    }
     if (!upstream_match) {
         std::cerr << "  upstream envoy: \"" << escape_wire_bytes(c.envoy.upstream_bytes) << "\"\n";
         std::cerr << "  upstream rut:   \"" << escape_wire_bytes(c.rut.upstream_bytes) << "\"\n";
@@ -2341,7 +2433,10 @@ int run_pair_milestone_s(const std::string& rut_binary,
         }
         auto envoy_results = run_case_batch(listen_port1, cases);
         envoy.stop();
-        fill_upstream_bytes(&envoy_results, cases, upstream);
+        if (!fill_upstream_bytes(&envoy_results, cases, upstream)) {
+            upstream.stop();
+            return 1;
+        }
         if (!wait_port_closed(listen_port1, 5000)) {
             std::cerr << "FAIL: listener port " << listen_port1
                       << " did not become free after stopping Envoy\n";
@@ -2367,9 +2462,16 @@ int run_pair_milestone_s(const std::string& rut_binary,
             return 1;
         }
         auto rut_results = run_case_batch(listen_port1, cases);
-        rut.stop();
-        fill_upstream_bytes(&rut_results, cases, upstream);
+        const bool rut_stopped_cleanly = rut.stop();
+        const bool rut_upstream_ok = fill_upstream_bytes(&rut_results, cases, upstream);
         upstream.stop();
+        if (!rut_stopped_cleanly) {
+            std::cerr << "FAIL: rut exited unexpectedly before teardown ("
+                      << rut.unexpected_exit_description << ")\n";
+            dump_rut_log(rut.log_path);
+            return 1;
+        }
+        if (!rut_upstream_ok) return 1;
 
         for (const auto& spec : cases) {
             PairCaseResult c;
@@ -2445,7 +2547,12 @@ int run_pair_milestone_s(const std::string& rut_binary,
         if (!run_client_case(listen_port2, spec, &c.rut))
             std::cerr << "WARN: case connect_failure (rut) exchange did not complete cleanly\n";
         c.rut.name = "connect_failure";
-        rut.stop();
+        if (!rut.stop()) {
+            std::cerr << "FAIL: rut exited unexpectedly before teardown ("
+                      << rut.unexpected_exit_description << ")\n";
+            dump_rut_log(rut.log_path);
+            return 1;
+        }
 
         comparisons.push_back(std::move(c));
     }
@@ -3430,6 +3537,173 @@ bool self_test_reserved_closed_port() {
     return ok;
 }
 
+// ── Codex-review regression self-tests (no docker, no `rut` binary) ─────
+
+// Exercises the exact `fill_upstream_bytes` path a retried/replayed
+// upstream request would hit: two requests recorded for one case's path
+// must fail the harness, not silently compare only the first one.
+bool self_test_duplicate_upstream_rejected() {
+    uint16_t port = 0;
+    if (!allocate_loopback_port(&port)) {
+        std::cerr << "FAIL [self-test duplicate-upstream]: could not allocate a loopback port\n";
+        return false;
+    }
+    RecordingUpstream upstream;
+    const std::string reply = "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nhi";
+    upstream.set_reply("/dup", reply);
+    if (!upstream.start(port)) {
+        std::cerr << "FAIL [self-test duplicate-upstream]: could not start upstream\n";
+        return false;
+    }
+    bool ok = true;
+    {
+        // Two requests to the same path on one keep-alive connection stand
+        // in for a retried or replayed upstream request.
+        const int fd = connect_with_timeout(port, kClientTimeoutMs);
+        if (fd < 0) {
+            std::cerr << "FAIL [self-test duplicate-upstream]: could not connect\n";
+            upstream.stop();
+            return false;
+        }
+        const std::string req = "GET /dup HTTP/1.1\r\nHost: t.example\r\n\r\n";
+        for (int i = 0; i < 2; i++) {
+            if (!send_all(fd, req) || read_http_message(fd, false, kClientTimeoutMs).bytes != reply)
+                ok = false;
+        }
+        close(fd);
+    }
+    const std::vector<CaseSpec> cases = {{"dup_case", "", false, "/dup", reply}};
+    std::vector<CaseResult> results(1);
+    results[0].name = "dup_case";
+    const bool fill_ok = fill_upstream_bytes(&results, cases, upstream);
+    upstream.stop();
+    if (fill_ok) {
+        std::cerr << "FAIL [self-test duplicate-upstream]: fill_upstream_bytes accepted two "
+                     "recorded requests for one case\n";
+        ok = false;
+    }
+    if (results[0].upstream_contacted) {
+        std::cerr << "FAIL [self-test duplicate-upstream]: upstream_contacted was set true "
+                     "despite the duplicate\n";
+        ok = false;
+    }
+    if (ok) std::cerr << "PASS [self-test duplicate-upstream]\n";
+    return ok;
+}
+
+// Exercises the exact `RutInstance::stop()` path a crash before intentional
+// teardown would hit: `/bin/true` stands in for a `rut` binary that exits on
+// its own (no docker or real `rut` binary needed), and stop() must report
+// that as an unexpected exit rather than a clean teardown.
+bool self_test_rut_early_exit_detected() {
+    RutInstance rut;
+    rut.log_path = "/dev/null";
+    if (!rut.launch("/bin/true", "unused.rut")) {
+        std::cerr << "FAIL [self-test rut early exit]: could not fork/exec /bin/true\n";
+        return false;
+    }
+    // Give the child time to exit on its own before stop() is asked to tear
+    // it down.
+    struct timespec ts{0, 200'000'000};
+    nanosleep(&ts, nullptr);
+    const bool stopped_cleanly = rut.stop();
+    bool ok = true;
+    if (stopped_cleanly) {
+        std::cerr << "FAIL [self-test rut early exit]: stop() reported a clean teardown for a "
+                     "process that had already exited on its own\n";
+        ok = false;
+    }
+    if (!rut.exited_unexpectedly) {
+        std::cerr << "FAIL [self-test rut early exit]: exited_unexpectedly was not set\n";
+        ok = false;
+    }
+    if (ok) std::cerr << "PASS [self-test rut early exit]\n";
+    return ok;
+}
+
+// Exercises the exact `compare_pair_case` path two identically-failed
+// exchanges would hit (e.g. a connection refused on both sides before a
+// single byte crossed the wire, leaving two equal empty buffers): it must
+// report a mismatch, not a match.
+bool self_test_pair_both_failed_rejected() {
+    PairCaseResult c;
+    c.name = "both_failed";
+    c.asserted = true;
+    c.envoy.exchange_complete = false;
+    c.rut.exchange_complete = false;
+    const bool match = compare_pair_case(c);
+    if (match) {
+        std::cerr << "FAIL [self-test pair both-failed]: compare_pair_case matched two "
+                     "incomplete exchanges\n";
+        return false;
+    }
+    std::cerr << "PASS [self-test pair both-failed]\n";
+    return true;
+}
+
+// Exercises the exact `read_http_message` HEAD path against a deliberately
+// spec-violating peer that sends a body five milliseconds after the header
+// terminator, in a separate TCP segment/`send()`: the bounded grace window
+// must observe it rather than the exchange completing (and comparing equal
+// to a body-less reference) before the body arrives.
+bool self_test_head_body_detected() {
+    uint16_t port = 0;
+    if (!allocate_loopback_port(&port)) {
+        std::cerr << "FAIL [self-test head body]: could not allocate a loopback port\n";
+        return false;
+    }
+    const int listen_fd = socket(AF_INET, SOCK_STREAM, 0);
+    if (listen_fd < 0) {
+        std::cerr << "FAIL [self-test head body]: could not create listening socket\n";
+        return false;
+    }
+    const int one = 1;
+    setsockopt(listen_fd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
+    sockaddr_in addr{};
+    addr.sin_family = AF_INET;
+    addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    addr.sin_port = htons(port);
+    if (bind(listen_fd, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) != 0 ||
+        listen(listen_fd, 1) != 0) {
+        std::cerr << "FAIL [self-test head body]: could not bind/listen\n";
+        close(listen_fd);
+        return false;
+    }
+    std::thread server([listen_fd] {
+        const int conn = accept(listen_fd, nullptr, nullptr);
+        if (conn < 0) return;
+        char buf[512];
+        recv(conn, buf, sizeof(buf), 0);  // discard the request
+        const std::string headers = "HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\n";
+        send(conn, headers.data(), headers.size(), 0);
+        struct timespec delay{0, 20'000'000};
+        nanosleep(&delay, nullptr);
+        const std::string body = "oops!";
+        send(conn, body.data(), body.size(), 0);
+        close(conn);
+    });
+    bool ok = true;
+    const int fd = connect_with_timeout(port, kClientTimeoutMs);
+    if (fd < 0) {
+        std::cerr << "FAIL [self-test head body]: could not connect\n";
+        ok = false;
+    } else {
+        const std::string req = "HEAD /x HTTP/1.1\r\nHost: t.example\r\n\r\n";
+        send_all(fd, req);
+        const ReadResult resp = read_http_message(fd, /*head_request=*/true, kClientTimeoutMs);
+        if (!ends_with(resp.bytes, "oops!")) {
+            std::cerr << "FAIL [self-test head body]: the grace window did not observe the "
+                         "unexpected HEAD body bytes\n";
+            ok = false;
+        }
+        close(fd);
+    }
+    server.join();
+    close(listen_fd);
+    if (ok) std::cerr << "PASS [self-test head body]\n";
+    return ok;
+}
+
 // ── --self-test RUT pass (PR 6) ─────────────────────────────────────────
 //
 // No docker needed: converts the milestone-S bootstrap, starts the real
@@ -3485,9 +3759,12 @@ bool compare_case_against_oracle(const CaseResult& result, const OracleCase& ora
     const std::string oracle_down = normalize_date_for_compare(oracle_downstream, preserved_date);
     const bool upstream_match = result.upstream_bytes == oracle_upstream;
     const bool downstream_match = rut_down == oracle_down;
-    const bool match = upstream_match && downstream_match;
+    const bool match = result.exchange_complete && upstream_match && downstream_match;
     std::cerr << (match ? "PASS [self-test rut vs oracle: " : "FAIL [self-test rut vs oracle: ")
               << oracle.name << "]\n";
+    if (!result.exchange_complete) {
+        std::cerr << "  rut exchange did not complete\n";
+    }
     if (!upstream_match) {
         std::cerr << "  upstream oracle: \"" << escape_wire_bytes(oracle_upstream) << "\"\n";
         std::cerr << "  upstream rut:    \"" << escape_wire_bytes(result.upstream_bytes) << "\"\n";
@@ -3557,9 +3834,16 @@ bool run_self_test_rut_pass(const std::string& rut_binary, const std::string& co
         for (const auto& spec : all_cases)
             if (is_asserted_case(spec.name)) live_asserted.push_back(spec);
         auto live_results = run_case_batch(listen_port, live_asserted);
-        rut.stop();
-        fill_upstream_bytes(&live_results, live_asserted, upstream);
+        const bool rut_stopped_cleanly = rut.stop();
+        const bool rut_upstream_ok = fill_upstream_bytes(&live_results, live_asserted, upstream);
         upstream.stop();
+        if (!rut_stopped_cleanly) {
+            std::cerr << "FAIL [self-test rut]: rut exited unexpectedly before teardown ("
+                      << rut.unexpected_exit_description << ")\n";
+            dump_rut_log(rut.log_path);
+            return false;
+        }
+        if (!rut_upstream_ok) return false;
         for (auto& r : live_results) results.push_back(std::move(r));
     }
 
@@ -3605,7 +3889,12 @@ bool run_self_test_rut_pass(const std::string& rut_binary, const std::string& co
         if (!run_client_case(listen_port, connect_failure_case(), &r))
             std::cerr << "WARN: case connect_failure exchange did not complete cleanly\n";
         r.name = "connect_failure";
-        rut.stop();
+        if (!rut.stop()) {
+            std::cerr << "FAIL [self-test rut]: rut exited unexpectedly before teardown ("
+                      << rut.unexpected_exit_description << ")\n";
+            dump_rut_log(rut.log_path);
+            return false;
+        }
         results.push_back(std::move(r));
     }
 
@@ -3635,6 +3924,10 @@ int run_self_test(const std::string& rut_binary, const std::string& converter_bi
     ok &= self_test_temp_dir_cleanup();
     ok &= self_test_envoy_instance_skips_docker_when_unlaunched();
     ok &= self_test_reserved_closed_port();
+    ok &= self_test_duplicate_upstream_rejected();
+    ok &= self_test_rut_early_exit_detected();
+    ok &= self_test_pair_both_failed_rejected();
+    ok &= self_test_head_body_detected();
     if (!rut_binary.empty() && !converter_binary.empty()) {
         ok &= run_self_test_rut_pass(rut_binary, converter_binary);
     } else {
