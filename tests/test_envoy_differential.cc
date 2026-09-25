@@ -1890,29 +1890,22 @@ bool self_test_partial_exchange_rejection() {
 
     // read_http_message(): a Content-Length body that never fully arrives
     // (the peer sends a short prefix and closes) must come back incomplete.
+    //
+    // Uses allocate_bound_loopback_port() (round-12 review, "Keep the
+    // partial-exchange listener bound across allocation"): plain
+    // allocate_loopback_port() closes its probe socket before this test's
+    // own listen_fd gets a chance to bind, leaving a window where another
+    // process on the host can grab the port first -- the same race
+    // round-6's review fixed for the recording upstream. Adopting the
+    // already-bound-and-listening fd here closes that window the same way.
     {
-        uint16_t port = 0;
-        if (!allocate_loopback_port(&port)) {
+        BoundPort bound;
+        if (!allocate_bound_loopback_port(&bound)) {
             std::cerr << "FAIL [self-test partial]: could not allocate a loopback port\n";
             return false;
         }
-        const int listen_fd = socket(AF_INET, SOCK_STREAM, 0);
-        if (listen_fd < 0) {
-            std::cerr << "FAIL [self-test partial]: could not create listen socket\n";
-            return false;
-        }
-        const int one = 1;
-        setsockopt(listen_fd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
-        sockaddr_in addr{};
-        addr.sin_family = AF_INET;
-        addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
-        addr.sin_port = htons(port);
-        if (bind(listen_fd, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) != 0 ||
-            listen(listen_fd, 1) != 0) {
-            std::cerr << "FAIL [self-test partial]: could not bind/listen\n";
-            close(listen_fd);
-            return false;
-        }
+        const uint16_t port = bound.port;
+        const int listen_fd = bound.fd;
         std::thread server([listen_fd] {
             const int fd = accept(listen_fd, nullptr, nullptr);
             if (fd < 0) return;
