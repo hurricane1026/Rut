@@ -1961,14 +1961,17 @@ token together with an `Upgrade` header, even when the value also contains
 `close`; rejects more than one physical `X-Forwarded-Proto` field (Envoy
 coalesces duplicates into one inline header; this profile does not, so it
 fails closed instead); rejects a request target carrying a URI fragment;
-drops every client-supplied `x-envoy-*` header that Envoy's own
-`ConnectionManagerUtility::cleanInternalHeaders` removes for a non-internal,
-non-edge external request -- the fixed shape this profile targets, since
-Envoy's default `internal_address_config` never classifies any address as
-internal and the milestone bootstrap never sets `use_remote_address: true`
-(see `docs/envoy-compatibility.md` for the exact fourteen-header list; the
-handful of edge-request-only removals and `x-envoy-internal` itself are
-unreachable under that fixed shape and pass through unchanged); and appends
+drops every client-supplied header that Envoy's own
+`ConnectionManagerUtility::mutateRequestHeaders` sanitizes for a non-internal,
+non-edge external request on a cleartext listener -- the fixed shape this
+profile targets, since the milestone bootstrap never sets
+`use_remote_address: true` (so a request can never become internal) nor
+`forward_client_cert_details` (default `SANITIZE`): `x-envoy-internal`, the
+fourteen `x-envoy-*` names `cleanInternalHeaders` removes unconditionally,
+and `x-forwarded-client-cert` -- sixteen in total (see
+`docs/envoy-compatibility.md` for the exact list; the handful of
+edge-request-only removals are unreachable under that fixed shape and pass
+through unchanged); and appends
 `x-forwarded-proto: http` as the last header only when the client did
 not already send one (a client-supplied value is kept unchanged, in its
 original position). It is closed to ordinary
