@@ -491,7 +491,19 @@ bool header_equals_ci(const std::string& raw, const std::string& name, const std
 struct ReadResult {
     std::string bytes;
     bool complete = false;
+    // Why `complete` is false, when the reader can say something more
+    // specific than "partial read/timeout" (round-7 review, "Reject EOF on
+    // responses advertised as persistent"): a persistence mismatch is
+    // reported here so callers print it distinctly instead of folding it
+    // into the generic partial-exchange message. Empty otherwise.
+    std::string reason;
 };
+
+// The `ReadResult::reason` for a peer that closed a connection whose
+// response did not advertise `Connection: close`.
+constexpr char kPersistenceMismatchReason[] =
+    "persistence mismatch: peer closed the connection after a response that did not "
+    "advertise Connection: close";
 
 // Reads one complete HTTP/1.x message from `fd`: headers up to the blank
 // line, then a body framed by Content-Length (skipped entirely when
@@ -504,7 +516,15 @@ struct ReadResult {
 // the header terminator this waits up to kTrailingBytesGraceMs for the peer to
 // send one anyway (in a later TCP segment) so a violation shows up as extra
 // bytes here instead of being silently dropped by returning immediately.
-ReadResult read_http_message(int fd, bool head_request, int timeout_ms) {
+//
+// `client_requested_close` says whether the REQUEST this response answers
+// carried `Connection: close`: RFC 9112 §9.6 obliges the server to close
+// after its final response to such a request whether or not the response
+// echoes the option, so an EOF then is expected, not a persistence mismatch.
+ReadResult read_http_message(int fd,
+                             bool head_request,
+                             int timeout_ms,
+                             bool client_requested_close = false) {
     std::string buf;
     const int64_t deadline = now_ms() + timeout_ms;
     char chunk[4096];
@@ -513,31 +533,12 @@ ReadResult read_http_message(int fd, bool head_request, int timeout_ms) {
         header_end = buf.find("\r\n\r\n");
         if (header_end != std::string::npos) break;
         const int64_t remaining = deadline - now_ms();
-        if (remaining <= 0) return {buf, false};
+        if (remaining <= 0) return {buf, false, {}};
         pollfd pfd{fd, POLLIN, 0};
-        if (poll(&pfd, 1, static_cast<int>(remaining)) <= 0) return {buf, false};
+        if (poll(&pfd, 1, static_cast<int>(remaining)) <= 0) return {buf, false, {}};
         const ssize_t n = recv(fd, chunk, sizeof(chunk), 0);
-        if (n <= 0) return {buf, false};
+        if (n <= 0) return {buf, false, {}};
         buf.append(chunk, static_cast<size_t>(n));
-    }
-    if (head_request) {
-        // A HEAD response never carries a body (RFC 9110 §9.3.2): the
-        // headers are the entire message, so finding the blank line is
-        // completion. Still wait up to kTrailingBytesGraceMs for the peer to
-        // send one anyway (in a later TCP segment) so a violation shows up
-        // as extra captured bytes instead of being silently dropped by
-        // returning immediately.
-        const int64_t grace_deadline = now_ms() + kTrailingBytesGraceMs;
-        for (;;) {
-            const int64_t remaining = grace_deadline - now_ms();
-            if (remaining <= 0) break;
-            pollfd pfd{fd, POLLIN, 0};
-            if (poll(&pfd, 1, static_cast<int>(remaining)) <= 0) break;
-            const ssize_t n = recv(fd, chunk, sizeof(chunk), 0);
-            if (n <= 0) break;
-            buf.append(chunk, static_cast<size_t>(n));
-        }
-        return {buf, true};
     }
     const std::string headers = buf.substr(0, header_end);
     std::string cl_value;
@@ -548,6 +549,32 @@ ReadResult read_http_message(int fd, bool head_request, int timeout_ms) {
                    connection_value.end(),
                    connection_value.begin(),
                    [](unsigned char c) { return std::tolower(c); });
+    const bool advertises_close =
+        connection_value.find("close") != std::string::npos || client_requested_close;
+    if (head_request) {
+        // A HEAD response never carries a body (RFC 9110 §9.3.2): the
+        // headers are the entire message, so finding the blank line is
+        // completion. Still wait up to kTrailingBytesGraceMs for the peer to
+        // send one anyway (in a later TCP segment) so a violation shows up
+        // as extra captured bytes instead of being silently dropped by
+        // returning immediately. An EOF in that window is fine only when
+        // the response advertised `Connection: close`; otherwise the peer
+        // closed a connection it declared persistent (round-7 review,
+        // "Reject EOF on responses advertised as persistent", applied to
+        // head_smoke the same way as to the Content-Length branch below).
+        const int64_t grace_deadline = now_ms() + kTrailingBytesGraceMs;
+        for (;;) {
+            const int64_t remaining = grace_deadline - now_ms();
+            if (remaining <= 0) break;
+            pollfd pfd{fd, POLLIN, 0};
+            if (poll(&pfd, 1, static_cast<int>(remaining)) <= 0) break;
+            const ssize_t n = recv(fd, chunk, sizeof(chunk), 0);
+            if (n == 0 && !advertises_close) return {buf, false, kPersistenceMismatchReason};
+            if (n <= 0) break;
+            buf.append(chunk, static_cast<size_t>(n));
+        }
+        return {buf, true, {}};
+    }
     const size_t body_start = header_end + 4;
     if (has_cl) {
         char* end = nullptr;
@@ -555,14 +582,14 @@ ReadResult read_http_message(int fd, bool head_request, int timeout_ms) {
         const size_t total = body_start + (want > 0 ? static_cast<size_t>(want) : 0u);
         while (buf.size() < total) {
             const int64_t remaining = deadline - now_ms();
-            if (remaining <= 0) return {buf, false};
+            if (remaining <= 0) return {buf, false, {}};
             pollfd pfd{fd, POLLIN, 0};
-            if (poll(&pfd, 1, static_cast<int>(remaining)) <= 0) return {buf, false};
+            if (poll(&pfd, 1, static_cast<int>(remaining)) <= 0) return {buf, false, {}};
             const ssize_t n = recv(fd, chunk, sizeof(chunk), 0);
-            if (n <= 0) return {buf, false};
+            if (n <= 0) return {buf, false, {}};
             buf.append(chunk, static_cast<size_t>(n));
         }
-        if (connection_value.find("close") != std::string::npos) {
+        if (advertises_close) {
             // A Content-Length-framed response can declare `connection:
             // close` (e.g. get_client_close) without the peer actually
             // closing the socket afterwards -- the body alone completing is
@@ -572,12 +599,12 @@ ReadResult read_http_message(int fd, bool head_request, int timeout_ms) {
             // is reported as an incomplete/broken exchange, not silently
             // accepted as complete (round-4 review).
             const int64_t remaining = deadline - now_ms();
-            if (remaining <= 0) return {buf, false};
+            if (remaining <= 0) return {buf, false, {}};
             pollfd pfd{fd, POLLIN, 0};
-            if (poll(&pfd, 1, static_cast<int>(remaining)) <= 0) return {buf, false};
+            if (poll(&pfd, 1, static_cast<int>(remaining)) <= 0) return {buf, false, {}};
             const ssize_t n = recv(fd, chunk, sizeof(chunk), 0);
-            if (n != 0) return {buf, false};
-            return {buf, true};
+            if (n != 0) return {buf, false, {}};
+            return {buf, true, {}};
         }
         // Persistent (keep-alive) framing: round-6 review, "Check
         // persistent responses for trailing wire bytes". The advertised
@@ -591,10 +618,15 @@ ReadResult read_http_message(int fd, bool head_request, int timeout_ms) {
         // Use a short bounded grace window (not the full remaining
         // deadline): a well-behaved persistent peer says nothing more until
         // the next request, so waiting out the whole per-case timeout here
-        // would slow down every persistent case for no reason. Only actual
-        // bytes (n > 0) are a violation; a timeout (nothing arrived) or a
-        // clean EOF (peer closed anyway, which Content-Length framing does
-        // not forbid) are both fine.
+        // would slow down every persistent case for no reason. Actual bytes
+        // (n > 0) are a violation, and so is an EOF (n == 0): the response
+        // did not advertise `Connection: close`, so a peer that closes here
+        // anyway broke the persistence it declared -- for an asserted
+        // keep-alive case (post_fixed, trace, options_star, ...) that is a
+        // real behavioral difference, and it must fail the case distinctly
+        // even when both sides' bytes are otherwise identical (round-7
+        // review, "Reject EOF on responses advertised as persistent"). Only
+        // a timeout (nothing arrived at all) is fine.
         const int64_t grace_deadline = now_ms() + kTrailingBytesGraceMs;
         const int64_t grace_remaining = grace_deadline - now_ms();
         if (grace_remaining > 0) {
@@ -603,32 +635,33 @@ ReadResult read_http_message(int fd, bool head_request, int timeout_ms) {
                 const ssize_t n = recv(fd, chunk, sizeof(chunk), 0);
                 if (n > 0) {
                     buf.append(chunk, static_cast<size_t>(n));
-                    return {buf, false};
+                    return {buf, false, {}};
                 }
+                if (n == 0) return {buf, false, kPersistenceMismatchReason};
             }
         }
-        return {buf, true};
+        return {buf, true, {}};
     }
-    if (connection_value.find("close") != std::string::npos) {
+    if (advertises_close) {
         for (;;) {
             const int64_t remaining = deadline - now_ms();
-            if (remaining <= 0) return {buf, false};
+            if (remaining <= 0) return {buf, false, {}};
             pollfd pfd{fd, POLLIN, 0};
             const int pr = poll(&pfd, 1, static_cast<int>(remaining));
-            if (pr <= 0) return {buf, false};
+            if (pr <= 0) return {buf, false, {}};
             const ssize_t n = recv(fd, chunk, sizeof(chunk), 0);
             // EOF (n == 0) is the expected terminator for close-delimited
             // framing, i.e. completion, not a partial read. Any other
             // failure (n < 0) is a real partial exchange.
-            if (n == 0) return {buf, true};
-            if (n < 0) return {buf, false};
+            if (n == 0) return {buf, true, {}};
+            if (n < 0) return {buf, false, {}};
             buf.append(chunk, static_cast<size_t>(n));
         }
     }
     // Neither Content-Length nor Connection: close: framing is fully
     // determined by the headers alone (assumed zero-length body), so this is
     // complete as soon as the blank line was found above.
-    return {buf, true};
+    return {buf, true, {}};
 }
 
 // ── Listener ownership probe ────────────────────────────────────────────
@@ -1166,24 +1199,28 @@ struct EnvoyInstance {
         return true;
     }
 
-    // Returns false iff the docker-run child had already exited by itself
-    // before this call sent it any signal or ran `docker rm -f` -- an
-    // unexpected exit (Envoy crash or otherwise) that `exited_unexpectedly` /
+    // Returns false iff the docker-run child ended other than because of the
+    // teardown this call performed: it had already exited by itself before
+    // this call sent it any signal or ran `docker rm -f`, or the status
+    // finally reaped is not one that teardown can produce -- an unexpected
+    // exit (Envoy crash or otherwise) that `exited_unexpectedly` /
     // `unexpected_exit_description` describe. Returns true when there was
     // nothing to stop, or when the child ended because of the teardown this
     // call performed (round-6 review, "Reject unexpected Envoy exits during
-    // pair runs"; mirrors `RutInstance::stop()`'s precheck). Docker teardown
-    // itself is skipped entirely for an instance that never actually
-    // launched a container (round-15 review, "Skip Docker teardown for
-    // instances that were never launched"): self-test EnvoyInstance objects
-    // wrap dummy forked processes without ever calling launch(), so `name`
-    // is empty and no container was ever created. Running `docker rm -f`
-    // for those anyway wastes up to this call's 10s timeout each -- four
-    // times in --self-test -- and, if a Docker CLI or daemon is present but
-    // unresponsive, pushes the whole self-test toward CTest's 60s limit for
-    // no benefit. `launched` is cleared right after so a later, redundant
-    // stop() call (an explicit one followed by the destructor's automatic
-    // one) never re-invokes it either.
+    // pair runs"; round-7 review, "Verify the Envoy status reaped after
+    // teardown"; mirrors `RutInstance::stop()`'s precheck and reaped-status
+    // check). Docker teardown itself is skipped entirely for an instance
+    // that never actually launched a container (round-15 review, "Skip
+    // Docker teardown for instances that were never launched"): self-test
+    // EnvoyInstance objects wrap dummy forked processes without ever
+    // calling launch(), so `name` is empty and no container was ever
+    // created. Running `docker rm -f` for those anyway wastes up to this
+    // call's 10s timeout each -- four times in --self-test -- and, if a
+    // Docker CLI or daemon is present but unresponsive, pushes the whole
+    // self-test toward CTest's 60s limit for no benefit. `launched` is
+    // cleared right after so a later, redundant stop() call (an explicit
+    // one followed by the destructor's automatic one) never re-invokes it
+    // either.
     bool stop() {
         if (pid <= 0) return true;
         int status = 0;
@@ -1204,13 +1241,14 @@ struct EnvoyInstance {
             }
             return false;
         }
-        kill(pid, SIGTERM);
+        const bool term_sent = kill(pid, SIGTERM) == 0;
         if (launched) {
             g_docker_rm_invocations++;
             run_and_wait({"docker", "rm", "-f", name}, 10'000);
             launched = false;
         }
         const int64_t deadline = now_ms() + 5000;
+        bool escalated = false;
         for (;;) {
             const pid_t waited = waitpid(pid, &status, WNOHANG);
             if (waited == pid) break;
@@ -1226,6 +1264,7 @@ struct EnvoyInstance {
             }
             if (now_ms() >= deadline) {
                 kill(pid, SIGKILL);
+                escalated = true;
                 while (waitpid(pid, &status, 0) < 0 && errno == EINTR) {
                 }
                 break;
@@ -1234,6 +1273,39 @@ struct EnvoyInstance {
             nanosleep(&ts, nullptr);
         }
         pid = -1;
+        // The precheck above only catches a child that had ALREADY exited
+        // before this call signaled it; a child that died in the window
+        // between that precheck and the `kill`/`docker rm -f` above was
+        // reaped by the loop just like an intentional teardown would be (a
+        // zombie still accepts, and silently no-ops, a kill()). Verify the
+        // reaped status is one the teardown THIS call performed can
+        // actually produce. The child is the attached `docker run` client,
+        // whose own exit status is the container's (Envoy's) exit code, or
+        // death by our SIGKILL when this call escalated:
+        //   - exit 0: Envoy handled the SIGTERM the docker client proxied
+        //     to it (`--sig-proxy` is on by default without a TTY) and
+        //     shut down normally;
+        //   - exit 143 (128 + SIGTERM): the proxied SIGTERM reached the
+        //     container before Envoy had installed its handler (early
+        //     startup), so the kernel default terminated it;
+        //   - exit 137 (128 + SIGKILL): `docker rm -f` won the race with the
+        //     proxied SIGTERM and force-killed the container;
+        //   - killed by SIGKILL: only when this call escalated (the docker
+        //     client itself did not exit within the grace period).
+        // Anything else -- a crash signal reported as exit 134/139, any
+        // other nonzero exit, a signal death this call did not send, or a
+        // SIGTERM-shaped status when the SIGTERM was never delivered -- is
+        // unexpected, however it was reaped.
+        const bool clean = escalated ? (WIFSIGNALED(status) && WTERMSIG(status) == SIGKILL)
+                                     : (WIFEXITED(status) &&
+                                        (WEXITSTATUS(status) == 128 + SIGKILL ||
+                                         (term_sent && (WEXITSTATUS(status) == 0 ||
+                                                        WEXITSTATUS(status) == 128 + SIGTERM))));
+        if (!clean) {
+            exited_unexpectedly = true;
+            unexpected_exit_description = describe_wait_status(status);
+            return false;
+        }
         return true;
     }
 
@@ -1862,6 +1934,30 @@ std::vector<CaseSpec> run1_cases() {
                      false,
                      "example.com:443",
                      smoke_reply});
+    // Record-only (not in kAssertedCaseNames) on this branch: a client-forged
+    // `X-Envoy-Internal: true` and an `X-Forwarded-Client-Cert` header must
+    // never reach the upstream. Envoy removes both unconditionally for this
+    // milestone config (`ConnectionManagerUtility::mutateRequestHeaders`:
+    // `removeEnvoyInternalRequest()` with `internal_request` always false,
+    // and `forward_client_cert_details` defaulting to SANITIZE), so its
+    // recorded upstream bytes are the assertion the pair comparison checks
+    // RUT against. PR #696's round-7 fix strips both on the RUT side; until
+    // it cascades to this branch RUT still forwards them, so these two are
+    // expected to MISMATCH on upstream bytes and stay record-only rather than
+    // asserted (promote once a pinned-Envoy CI run shows them equal).
+    cases.push_back({"get_forged_envoy_internal",
+                     "GET /internal HTTP/1.1\r\nHost: client.example\r\nUser-Agent: rut-diff/1\r\n"
+                     "X-Envoy-Internal: true\r\nAccept: */*\r\n\r\n",
+                     false,
+                     "/internal",
+                     smoke_reply});
+    cases.push_back({"get_forged_xfcc",
+                     "GET /xfcc HTTP/1.1\r\nHost: client.example\r\nUser-Agent: rut-diff/1\r\n"
+                     "X-Forwarded-Client-Cert: Hash=deadbeef;Subject=\"CN=forged\"\r\n"
+                     "Accept: */*\r\n\r\n",
+                     false,
+                     "/xfcc",
+                     smoke_reply});
     return cases;
 }
 
@@ -1907,6 +2003,9 @@ struct CaseResult {
     // actually finished framing within the deadline; see ReadResult. Never
     // trust downstream_bytes when this is false.
     bool exchange_complete = false;
+    // `ReadResult::reason` for the downstream read, when it had one (e.g. a
+    // persistence mismatch); empty for a plain partial read/timeout.
+    std::string exchange_failure_reason;
     bool upstream_contacted = false;
     // How many times the recording upstream observed a request for this
     // case's path. Expected to be 0 (never contacted) or 1; more than one is
@@ -1925,12 +2024,40 @@ bool run_client_case(uint16_t listen_port, const CaseSpec& spec, CaseResult* res
     if (fd < 0) return false;
     const bool sent = send_all(fd, spec.client_bytes);
     if (sent) {
-        const ReadResult read = read_http_message(fd, spec.is_head, kClientTimeoutMs);
+        // Whether this case's own request asked for close (get_client_close):
+        // the reader then expects the EOF instead of reporting it as a
+        // persistence mismatch.
+        std::string request_connection;
+        const size_t request_line_end = spec.client_bytes.find("\r\n");
+        const size_t request_head_end = spec.client_bytes.find("\r\n\r\n");
+        if (request_line_end != std::string::npos && request_head_end != std::string::npos &&
+            request_head_end > request_line_end) {
+            find_header(spec.client_bytes.substr(request_line_end + 2,
+                                                 request_head_end - request_line_end - 2),
+                        "Connection",
+                        &request_connection);
+        }
+        std::transform(request_connection.begin(),
+                       request_connection.end(),
+                       request_connection.begin(),
+                       [](unsigned char c) { return std::tolower(c); });
+        const bool client_requested_close = request_connection.find("close") != std::string::npos;
+        const ReadResult read =
+            read_http_message(fd, spec.is_head, kClientTimeoutMs, client_requested_close);
         result->downstream_bytes = read.bytes;
         result->exchange_complete = read.complete;
+        result->exchange_failure_reason = read.reason;
     }
     close(fd);
     return sent && result->exchange_complete;
+}
+
+// Renders why `r`'s downstream exchange did not complete, for every message
+// that reports one: the specific `ReadResult::reason` when the reader had
+// one, else the generic partial read/timeout wording.
+std::string describe_incomplete_exchange(const CaseResult& r) {
+    return r.exchange_failure_reason.empty() ? std::string("partial read/timeout")
+                                             : r.exchange_failure_reason;
 }
 
 // Runs every case in `cases` against an already-listening `listen_port`, in
@@ -1944,7 +2071,8 @@ std::vector<CaseResult> run_case_batch(uint16_t listen_port, const std::vector<C
     for (const auto& spec : cases) {
         CaseResult r;
         if (!run_client_case(listen_port, spec, &r))
-            std::cerr << "WARN: case " << spec.name << " exchange did not complete cleanly\n";
+            std::cerr << "WARN: case " << spec.name << " exchange did not complete cleanly ("
+                      << describe_incomplete_exchange(r) << ")\n";
         results.push_back(std::move(r));
     }
     return results;
@@ -2013,9 +2141,8 @@ bool fill_upstream_bytes(std::vector<CaseResult>* results,
 std::string validate_results(const std::vector<CaseResult>& results) {
     for (const auto& r : results) {
         if (!r.exchange_complete) {
-            return "case \"" + r.name +
-                   "\": downstream exchange did not complete (partial read/timeout); refusing "
-                   "to record it as evidence";
+            return "case \"" + r.name + "\": downstream exchange did not complete (" +
+                   describe_incomplete_exchange(r) + "); refusing to record it as evidence";
         }
         if (r.upstream_contact_count > 1) {
             return "case \"" + r.name + "\": upstream was contacted " +
@@ -2026,6 +2153,46 @@ std::string validate_results(const std::vector<CaseResult>& results) {
     return "";
 }
 
+// True iff `value` has the exact 29-byte RFC 1123 (IMF-fixdate, RFC 9110
+// §5.6.7) shape every synthesized HTTP Date must have -- `Sun, 06 Nov 1994
+// 08:49:37 GMT` -- with in-range day/hour/minute/second fields. Same check
+// tests/test_nginx_differential.cc's normalize_date() applies before it
+// mutates a Date, so the placeholder substitution below can only ever hide
+// the unavoidable timestamp difference, never a malformed value (round-7
+// review, "Validate synthesized Date values before normalizing them").
+bool is_rfc1123_http_date(const std::string& value) {
+    if (value.size() != 29) return false;
+    const char* date = value.data();
+    const auto is_digit = [](char c) { return c >= '0' && c <= '9'; };
+    const auto token_is_one_of = [](const char* v, const char* const* tokens, size_t count) {
+        for (size_t i = 0; i < count; i++)
+            if (memcmp(v, tokens[i], 3) == 0) return true;
+        return false;
+    };
+    static const char* const kWeekdays[] = {"Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"};
+    static const char* const kMonths[] = {
+        "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"};
+    const auto two_digits = [&](size_t offset) {
+        return is_digit(date[offset]) && is_digit(date[offset + 1])
+                   ? static_cast<unsigned>(date[offset] - '0') * 10u +
+                         static_cast<unsigned>(date[offset + 1] - '0')
+                   : 100u;
+    };
+    if (!token_is_one_of(date, kWeekdays, sizeof(kWeekdays) / sizeof(kWeekdays[0])) ||
+        date[3] != ',' || date[4] != ' ' || date[7] != ' ' ||
+        !token_is_one_of(date + 8, kMonths, sizeof(kMonths) / sizeof(kMonths[0])) ||
+        date[11] != ' ' || date[16] != ' ' || date[19] != ':' || date[22] != ':' ||
+        date[25] != ' ' || memcmp(date + 26, "GMT", 3) != 0)
+        return false;
+    for (size_t i = 12; i < 16; i++)
+        if (!is_digit(date[i])) return false;
+    const unsigned day = two_digits(5);
+    const unsigned hour = two_digits(17);
+    const unsigned minute = two_digits(20);
+    const unsigned second = two_digits(23);
+    return day >= 1 && day <= 31 && hour <= 23 && minute <= 59 && second <= 59;
+}
+
 // Returns `raw` with its `date:` header value replaced by a fixed
 // placeholder, UNLESS that value is exactly `preserved_date` (the literal
 // the recording upstream sent for `get_upstream_date_server`, which Envoy
@@ -2034,7 +2201,15 @@ std::string validate_results(const std::vector<CaseResult>& results) {
 // side produced it, so those are always normalized before a byte comparison.
 // `preserved_date` is empty for every other case, which never matches a
 // real Date value and so always normalizes.
-std::string normalize_date_for_compare(const std::string& raw, const std::string& preserved_date) {
+//
+// A synthesized value is only replaced when it passes is_rfc1123_http_date();
+// a malformed one (`date: garbage`) is left verbatim in the returned bytes
+// and `*dates_valid` is cleared, so the caller fails the case instead of
+// letting the placeholder erase a real regression (round-7 review). Every
+// well-formed (or absent) Date leaves `*dates_valid` untouched.
+std::string normalize_date_for_compare(const std::string& raw,
+                                       const std::string& preserved_date,
+                                       bool* dates_valid) {
     const size_t header_end = raw.find("\r\n\r\n");
     if (header_end == std::string::npos) return raw;
     const std::string head = raw.substr(0, header_end);
@@ -2064,6 +2239,10 @@ std::string normalize_date_for_compare(const std::string& raw, const std::string
         const size_t b = value.find_last_not_of(" \t");
         const std::string trimmed = a == std::string::npos ? "" : value.substr(a, b - a + 1);
         if (trimmed != preserved_date) {
+            if (!is_rfc1123_http_date(trimmed)) {
+                *dates_valid = false;
+                continue;  // leave the malformed value visible in the output
+            }
             // Replace only the value bytes, keeping the exact prefix (the
             // whitespace between ':' and the value, which may differ
             // between implementations) and any trailing whitespace intact,
@@ -2152,9 +2331,9 @@ std::string validate_pair_results(const std::vector<PairCaseResult>& results) {
         for (const auto& side : sides) {
             const std::string label = "case \"" + r.name + "\" (" + side.first + ")";
             if (!side.second->exchange_complete) {
-                return label +
-                       ": downstream exchange did not complete (partial read/timeout); "
-                       "refusing to record it as evidence";
+                return label + ": downstream exchange did not complete (" +
+                       describe_incomplete_exchange(*side.second) +
+                       "); refusing to record it as evidence";
             }
             if (side.second->upstream_contact_count > 1) {
                 return label + ": upstream was contacted " +
@@ -2555,7 +2734,8 @@ int run_oracle_milestone_s(const std::string& output_path) {
         for (const auto& spec : cases) {
             CaseResult r;
             if (!run_client_case(listen_port1, spec, &r))
-                std::cerr << "WARN: case " << spec.name << " exchange did not complete cleanly\n";
+                std::cerr << "WARN: case " << spec.name << " exchange did not complete cleanly ("
+                          << describe_incomplete_exchange(r) << ")\n";
             results.push_back(std::move(r));
         }
 
@@ -2600,7 +2780,8 @@ int run_oracle_milestone_s(const std::string& output_path) {
         CaseSpec spec = run1_cases().front();  // get_smoke's exact client bytes
         CaseResult r;
         if (!run_client_case(listen_port2, spec, &r))
-            std::cerr << "WARN: case connect_failure exchange did not complete cleanly\n";
+            std::cerr << "WARN: case connect_failure exchange did not complete cleanly ("
+                      << describe_incomplete_exchange(r) << ")\n";
         // The connect-failure exchange is now complete; only past this point
         // is it safe to release the reservation on `closed_port` (round-7
         // review, "Keep the connect-failure port reserved").
@@ -2635,12 +2816,19 @@ int run_oracle_milestone_s(const std::string& output_path) {
 // with a local 404, never routing it -- docs/envoy-compatibility.md, "Local
 // replies (404 for OPTIONS * and authority-form CONNECT)") and
 // `connect_failure` (the upstream port is deliberately closed to exercise
-// the connect-failure local reply). Every other case exists specifically to
-// exercise forwarding, so `compare_pair_case` below requires actual upstream
-// contact for them (round-6 review, "Require expected upstream contact for
-// forwarded cases").
+// the connect-failure local reply), and `connect_authority` (authority-form
+// CONNECT hits the same unmatched-route local 404 as `options_star`; the
+// committed oracle's `kEnvoyOracle_connect_authority_upstream` is empty --
+// "upstream not contacted" -- so a correct run contacts the upstream zero
+// times, and classifying it as a forwarding case would make every run of
+// this record-only case a "forwarding not exercised" mismatch, which could
+// never demonstrate parity once its downstream persistence difference is
+// fixed; round-7 review, "Exempt authority-form CONNECT from forwarding
+// checks"). Every other case exists specifically to exercise forwarding, so
+// `compare_pair_case` below requires actual upstream contact for them
+// (round-6 review, "Require expected upstream contact for forwarded cases").
 bool case_expects_upstream_forward(const std::string& name) {
-    return name != "options_star" && name != "connect_failure";
+    return name != "options_star" && name != "connect_failure" && name != "connect_authority";
 }
 
 // Compares one pair case's Envoy and RUT observations, printing
@@ -2659,22 +2847,38 @@ bool case_expects_upstream_forward(const std::string& name) {
 bool compare_pair_case(const PairCaseResult& c) {
     const std::string preserved_date =
         c.name == "get_upstream_date_server" ? "Mon, 01 Jan 2024 00:00:00 GMT" : std::string();
+    bool envoy_dates_valid = true;
+    bool rut_dates_valid = true;
     const std::string envoy_down =
-        normalize_date_for_compare(c.envoy.downstream_bytes, preserved_date);
-    const std::string rut_down = normalize_date_for_compare(c.rut.downstream_bytes, preserved_date);
+        normalize_date_for_compare(c.envoy.downstream_bytes, preserved_date, &envoy_dates_valid);
+    const std::string rut_down =
+        normalize_date_for_compare(c.rut.downstream_bytes, preserved_date, &rut_dates_valid);
     const bool both_complete = c.envoy.exchange_complete && c.rut.exchange_complete;
+    const bool dates_valid = envoy_dates_valid && rut_dates_valid;
     const bool upstream_match = c.envoy.upstream_contacted == c.rut.upstream_contacted &&
                                 c.envoy.upstream_bytes == c.rut.upstream_bytes;
     const bool expects_forward = case_expects_upstream_forward(c.name);
     const bool forwarding_exercised = !expects_forward || (c.envoy.upstream_contact_count == 1 &&
                                                            c.rut.upstream_contact_count == 1);
     const bool downstream_match = envoy_down == rut_down;
-    const bool match = both_complete && upstream_match && forwarding_exercised && downstream_match;
+    const bool match =
+        both_complete && dates_valid && upstream_match && forwarding_exercised && downstream_match;
     std::cerr << (match ? "MATCH    [" : "MISMATCH [") << c.name << "]"
               << (c.asserted ? " (asserted)" : " (record-only)") << "\n";
     if (!both_complete) {
-        std::cerr << "  incomplete exchange: envoy=" << (c.envoy.exchange_complete ? "yes" : "no")
-                  << " rut=" << (c.rut.exchange_complete ? "yes" : "no") << "\n";
+        std::cerr << "  incomplete exchange: envoy="
+                  << (c.envoy.exchange_complete
+                          ? "yes"
+                          : "no (" + describe_incomplete_exchange(c.envoy) + ")")
+                  << " rut="
+                  << (c.rut.exchange_complete ? "yes"
+                                              : "no (" + describe_incomplete_exchange(c.rut) + ")")
+                  << "\n";
+    }
+    if (!dates_valid) {
+        std::cerr << "  malformed synthesized Date (not a 29-byte RFC 1123 value): envoy="
+                  << (envoy_dates_valid ? "ok" : "invalid")
+                  << " rut=" << (rut_dates_valid ? "ok" : "invalid") << "\n";
     }
     if (!upstream_match) {
         std::cerr << "  upstream envoy: \"" << escape_wire_bytes(c.envoy.upstream_bytes) << "\"\n";
@@ -2704,11 +2908,15 @@ int run_pair_milestone_s(const std::string& rut_binary,
     // ports reserved until their consumers bind"): this process binds and
     // listens on it right here and keeps that same socket alive until
     // RecordingUpstream::adopt() takes it over below, so no other process can
-    // ever grab it out from under us. Envoy's two listener ports and the
-    // deliberately-unbound "closed" port can only be probe-allocated (Envoy
-    // binds its own port inside the container; "closed" must stay unbound),
-    // so they still go through allocate_distinct_ports() below; probe
-    // allocation naturally never returns the still-bound upstream port.
+    // ever grab it out from under us. Envoy's two listener ports can only be
+    // probe-allocated (Envoy binds its own port inside the container), so
+    // they still go through allocate_distinct_ports() below; probe
+    // allocation naturally never returns a still-bound port. The
+    // connect_failure case's "closed" port is likewise reserved end to end
+    // via allocate_reserved_closed_port(), exactly as run_oracle_milestone_s()
+    // does: it stays bound but non-listening (never probed-and-released) so
+    // no other host process can claim it before either side's run-2 connect
+    // attempt (round-7 review, "Keep the connect-failure port reserved").
     BoundPort upstream_bound;
     if (!allocate_bound_loopback_port(&upstream_bound)) {
         std::cerr << "FAIL: could not allocate loopback port for the recording upstream\n";
@@ -2716,8 +2924,30 @@ int run_pair_milestone_s(const std::string& rut_binary,
     }
     const uint16_t upstream_port1 = upstream_bound.port;
 
-    uint16_t listen_port1 = 0, listen_port2 = 0, closed_port = 0;
-    if (!allocate_distinct_ports({&listen_port1, &listen_port2, &closed_port})) {
+    BoundPort closed_reserved;
+    if (!allocate_reserved_closed_port(&closed_reserved)) {
+        std::cerr << "FAIL: could not allocate the connect_failure case's closed port\n";
+        close(upstream_bound.fd);
+        return 1;
+    }
+    // The reservation must outlive BOTH sides' run-2 connect attempts, and
+    // this function has many early-return failure paths between here and
+    // there; release it from a guard rather than at every one of them (run 2
+    // below also releases it explicitly once its exchanges are done).
+    struct ClosedPortReservation {
+        int fd;
+        ~ClosedPortReservation() {
+            if (fd >= 0) close(fd);
+        }
+        void release() {
+            if (fd >= 0) close(fd);
+            fd = -1;
+        }
+    } closed_reservation{closed_reserved.fd};
+    const uint16_t closed_port = closed_reserved.port;
+
+    uint16_t listen_port1 = 0, listen_port2 = 0;
+    if (!allocate_distinct_ports({&listen_port1, &listen_port2})) {
         std::cerr << "FAIL: could not allocate loopback ports\n";
         close(upstream_bound.fd);
         return 1;
@@ -2732,13 +2962,6 @@ int run_pair_milestone_s(const std::string& rut_binary,
             std::cerr << "FAIL: could not create temp directory\n";
             return 1;
         }
-        const std::string bootstrap_path = dir + "/bootstrap.json";
-        if (!write_file_mode(
-                bootstrap_path, render_bootstrap(listen_port1, upstream_port1), 0644)) {
-            std::cerr << "FAIL: could not write bootstrap.json\n";
-            return 1;
-        }
-
         RecordingUpstream upstream;
         const auto cases = run1_cases();
         for (const auto& spec : cases) upstream.set_reply(spec.upstream_path, spec.upstream_reply);
@@ -2747,17 +2970,19 @@ int run_pair_milestone_s(const std::string& rut_binary,
             return 1;
         }
 
-        // Envoy first.
+        // Envoy first, through the same bind-collision retry oracle mode
+        // uses: Envoy binds `listen_port1` itself inside the container, so
+        // another process can take the probe-allocated number first;
+        // launch_envoy_with_port_retry() renders the bootstrap, detects the
+        // collision in Envoy's log, re-renders on a fresh port and retries,
+        // updating `listen_port1` so the RUT launch below (which re-renders
+        // and re-converts from the same variable) and wait_port_closed()
+        // follow it (round-7 review, "Route pair-mode Envoy starts through
+        // the retry helper").
         EnvoyInstance envoy;
-        envoy.name = make_container_name("pair-run1");
-        envoy.log_path = dir + "/envoy.log";
-        if (!envoy.launch(bootstrap_path, listen_port1)) {
-            std::cerr << "FAIL: could not fork/exec docker run\n";
-            upstream.stop();
-            return 1;
-        }
         std::string ready_error;
-        if (!wait_ready(listen_port1, envoy, 15'000, &ready_error)) {
+        if (!launch_envoy_with_port_retry(
+                dir, "pair-run1", &listen_port1, upstream_port1, &envoy, &ready_error)) {
             std::cerr << "FAIL: " << ready_error << "\n";
             dump_log(envoy.log_path);
             upstream.stop();
@@ -2836,22 +3061,14 @@ int run_pair_milestone_s(const std::string& rut_binary,
             std::cerr << "FAIL: could not create temp directory\n";
             return 1;
         }
-        const std::string bootstrap_path = dir + "/bootstrap.json";
-        if (!write_file_mode(bootstrap_path, render_bootstrap(listen_port2, closed_port), 0644)) {
-            std::cerr << "FAIL: could not write bootstrap.json\n";
-            return 1;
-        }
         const CaseSpec spec = connect_failure_case();
 
+        // Same bind-collision retry as run 1 (round-7 review); a retry moves
+        // `listen_port2`, which the RUT launch below then follows.
         EnvoyInstance envoy;
-        envoy.name = make_container_name("pair-run2");
-        envoy.log_path = dir + "/envoy.log";
-        if (!envoy.launch(bootstrap_path, listen_port2)) {
-            std::cerr << "FAIL: could not fork/exec docker run\n";
-            return 1;
-        }
         std::string ready_error;
-        if (!wait_ready(listen_port2, envoy, 15'000, &ready_error)) {
+        if (!launch_envoy_with_port_retry(
+                dir, "pair-run2", &listen_port2, closed_port, &envoy, &ready_error)) {
             std::cerr << "FAIL: " << ready_error << "\n";
             dump_log(envoy.log_path);
             return 1;
@@ -2860,7 +3077,8 @@ int run_pair_milestone_s(const std::string& rut_binary,
         c.name = "connect_failure";
         c.asserted = true;
         if (!run_client_case(listen_port2, spec, &c.envoy))
-            std::cerr << "WARN: case connect_failure (envoy) exchange did not complete cleanly\n";
+            std::cerr << "WARN: case connect_failure (envoy) exchange did not complete cleanly ("
+                      << describe_incomplete_exchange(c.envoy) << ")\n";
         c.envoy.name = "connect_failure";
         if (!envoy.stop()) {
             std::cerr << "FAIL: envoy exited unexpectedly before teardown ("
@@ -2890,7 +3108,8 @@ int run_pair_milestone_s(const std::string& rut_binary,
             return 1;
         }
         if (!run_client_case(listen_port2, spec, &c.rut))
-            std::cerr << "WARN: case connect_failure (rut) exchange did not complete cleanly\n";
+            std::cerr << "WARN: case connect_failure (rut) exchange did not complete cleanly ("
+                      << describe_incomplete_exchange(c.rut) << ")\n";
         c.rut.name = "connect_failure";
         if (!rut.stop()) {
             std::cerr << "FAIL: rut exited unexpectedly before teardown ("
@@ -2898,6 +3117,11 @@ int run_pair_milestone_s(const std::string& rut_binary,
             dump_rut_log(rut.log_path);
             return 1;
         }
+
+        // Both sides' connect-failure exchanges are now complete; only past
+        // this point is it safe to release the reservation on `closed_port`
+        // (round-7 review, "Keep the connect-failure port reserved").
+        closed_reservation.release();
 
         comparisons.push_back(std::move(c));
     }
@@ -3020,7 +3244,8 @@ bool self_test_recording_upstream() {
         const std::string req3 =
             "HEAD /head HTTP/1.1\r\nHost: t.example\r\nConnection: close\r\n\r\n";
         if (!send_all(fd, req3)) ok = false;
-        const ReadResult resp3 = read_http_message(fd, /*head_request=*/true, kClientTimeoutMs);
+        const ReadResult resp3 = read_http_message(
+            fd, /*head_request=*/true, kClientTimeoutMs, /*client_requested_close=*/true);
         if (!resp3.complete || resp3.bytes != "HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\n") {
             std::cerr << "FAIL [self-test upstream]: unexpected HEAD reply: " << resp3.bytes
                       << " (complete=" << resp3.complete << ")\n";
@@ -4179,13 +4404,16 @@ bool self_test_pair_unexercised_forwarding_rejected() {
     return true;
 }
 
-// Companion to the above: `options_star` and `connect_failure` are exempt
-// from the forwarding-contact requirement (Envoy never routes either one to
-// the upstream by design), so the same zero-contact shape must still MATCH
-// for them, proving the round-6 fix does not regress these two cases.
+// Companion to the above: `options_star`, `connect_failure` and
+// `connect_authority` are exempt from the forwarding-contact requirement
+// (Envoy never routes any of them to the upstream by design; see
+// case_expects_upstream_forward()), so the same zero-contact shape must
+// still MATCH for them, proving the round-6 fix does not regress these
+// cases (round-7 review added `connect_authority`, whose oracle records
+// "upstream not contacted").
 bool self_test_pair_exempt_cases_zero_contact_matches() {
     bool ok = true;
-    for (const char* name : {"options_star", "connect_failure"}) {
+    for (const char* name : {"options_star", "connect_failure", "connect_authority"}) {
         PairCaseResult c;
         c.name = name;
         c.asserted = true;
@@ -4344,8 +4572,23 @@ bool self_test_head_body_detected() {
 // trailing bytes must still be reported complete (no regression on the
 // common case every asserted persistent case, e.g. post_fixed/trace,
 // depends on).
+//
+// Round-7 review, "Reject EOF on responses advertised as persistent": the
+// same grace window used to accept an EOF too, so a proxy that closed every
+// downstream connection while producing bytes identical to the other side
+// would still pass. Now an EOF after a response that did not advertise
+// `Connection: close` is reported incomplete with
+// kPersistenceMismatchReason, while an EOF after one that did advertise
+// close stays complete (get_client_close, connect_authority's Envoy side).
+enum class PeerTail : uint8_t {
+    kSettleThenClose,  // well-behaved persistent peer: quiet, closes later
+    kTrailingGarbage,  // persistent peer appends bytes after the body
+    kImmediateClose,   // persistent peer closes right after the body
+    kAdvertisedClose,  // `Connection: close` response, then closes
+};
+
 bool self_test_persistent_trailing_bytes_detected() {
-    auto run_case = [](bool send_trailing_garbage, const char* label) {
+    auto run_case = [](PeerTail tail, const char* label) {
         uint16_t port = 0;
         if (!allocate_loopback_port(&port)) {
             std::cerr << "FAIL [self-test " << label << "]: could not allocate a loopback port\n";
@@ -4368,23 +4611,28 @@ bool self_test_persistent_trailing_bytes_detected() {
             close(listen_fd);
             return false;
         }
-        std::thread server([listen_fd, send_trailing_garbage] {
+        std::thread server([listen_fd, tail] {
             const int conn = accept(listen_fd, nullptr, nullptr);
             if (conn < 0) return;
             char buf[512];
             recv(conn, buf, sizeof(buf), 0);  // discard the request
-            // No `Connection: close`: persistent framing, exactly the shape
-            // post_fixed/trace exercise.
-            const std::string resp = "HTTP/1.1 201 Created\r\nContent-Length: 2\r\n\r\nok";
+            // No `Connection: close` (except kAdvertisedClose): persistent
+            // framing, exactly the shape post_fixed/trace exercise.
+            const std::string resp =
+                tail == PeerTail::kAdvertisedClose
+                    ? "HTTP/1.1 201 Created\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok"
+                    : "HTTP/1.1 201 Created\r\nContent-Length: 2\r\n\r\nok";
             send(conn, resp.data(), resp.size(), 0);
-            if (send_trailing_garbage) {
+            if (tail == PeerTail::kTrailingGarbage) {
                 struct timespec delay{0, 20'000'000};
                 nanosleep(&delay, nullptr);
                 const std::string garbage = "oops!";
                 send(conn, garbage.data(), garbage.size(), 0);
             }
-            struct timespec settle{0, 250'000'000};
-            nanosleep(&settle, nullptr);
+            if (tail == PeerTail::kSettleThenClose || tail == PeerTail::kTrailingGarbage) {
+                struct timespec settle{0, 250'000'000};
+                nanosleep(&settle, nullptr);
+            }
             close(conn);
         });
         bool ok = true;
@@ -4400,17 +4648,47 @@ bool self_test_persistent_trailing_bytes_detected() {
                 "POST /x HTTP/1.1\r\nHost: t.example\r\nContent-Length: 0\r\n\r\n";
             send_all(fd, req);
             const ReadResult resp = read_http_message(fd, /*head_request=*/false, kClientTimeoutMs);
-            if (send_trailing_garbage && resp.complete) {
-                std::cerr << "FAIL [self-test " << label
-                          << "]: trailing bytes after a persistent response's declared "
-                             "Content-Length were not detected (reported complete)\n";
-                ok = false;
-            }
-            if (!send_trailing_garbage && !resp.complete) {
-                std::cerr << "FAIL [self-test " << label
-                          << "]: an ordinary persistent response with no trailing bytes was "
-                             "reported incomplete\n";
-                ok = false;
+            switch (tail) {
+                case PeerTail::kTrailingGarbage:
+                    if (resp.complete) {
+                        std::cerr << "FAIL [self-test " << label
+                                  << "]: trailing bytes after a persistent response's declared "
+                                     "Content-Length were not detected (reported complete)\n";
+                        ok = false;
+                    }
+                    break;
+                case PeerTail::kSettleThenClose:
+                    if (!resp.complete) {
+                        std::cerr << "FAIL [self-test " << label
+                                  << "]: an ordinary persistent response with no trailing "
+                                     "bytes was reported incomplete ("
+                                  << resp.reason << ")\n";
+                        ok = false;
+                    }
+                    break;
+                case PeerTail::kImmediateClose:
+                    if (resp.complete) {
+                        std::cerr << "FAIL [self-test " << label
+                                  << "]: EOF after a response that did not advertise "
+                                     "Connection: close was reported complete\n";
+                        ok = false;
+                    } else if (resp.reason != kPersistenceMismatchReason) {
+                        std::cerr << "FAIL [self-test " << label
+                                  << "]: EOF after a persistent response was rejected without "
+                                     "the persistence-mismatch reason (got \""
+                                  << resp.reason << "\")\n";
+                        ok = false;
+                    }
+                    break;
+                case PeerTail::kAdvertisedClose:
+                    if (!resp.complete) {
+                        std::cerr << "FAIL [self-test " << label
+                                  << "]: EOF after a response advertising Connection: close "
+                                     "was reported incomplete ("
+                                  << resp.reason << ")\n";
+                        ok = false;
+                    }
+                    break;
             }
             close(fd);
         }
@@ -4420,8 +4698,89 @@ bool self_test_persistent_trailing_bytes_detected() {
         return ok;
     };
     bool ok = true;
-    ok &= run_case(true, "persistent trailing bytes detected");
-    ok &= run_case(false, "persistent no trailing bytes");
+    ok &= run_case(PeerTail::kTrailingGarbage, "persistent trailing bytes detected");
+    ok &= run_case(PeerTail::kSettleThenClose, "persistent no trailing bytes");
+    ok &= run_case(PeerTail::kImmediateClose, "persistent EOF is a persistence mismatch");
+    ok &= run_case(PeerTail::kAdvertisedClose, "advertised close then EOF is complete");
+    return ok;
+}
+
+// Round-7 review, "Verify the Envoy status reaped after teardown": the
+// docker-run child's reaped status must match the teardown
+// EnvoyInstance::stop() itself performed, exactly as
+// self_test_rut_stop_verifies_exit_status() checks for RutInstance. No
+// docker involved: the "docker run" child is a shell script standing in for
+// the attached docker client, which exits with the container's exit code.
+// stop()'s `docker rm -f <name>` side call simply fails fast (no such
+// container, or no docker binary at all) and is ignored either way.
+bool self_test_envoy_stop_verifies_exit_status() {
+    const std::string dir = make_temp_dir("rut-diff-selftest-envoy-stop");
+    if (dir.empty()) {
+        std::cerr << "FAIL [self-test envoy stop status]: could not create temp directory\n";
+        return false;
+    }
+    auto run_case = [&](const char* script_body, bool expect_clean, const char* label) {
+        const std::string script = dir + "/" + label + ".sh";
+        if (!write_file_mode(script, script_body, 0755)) {
+            std::cerr << "FAIL [self-test envoy stop status]: could not write " << label << ".sh\n";
+            return false;
+        }
+        EnvoyInstance envoy;
+        envoy.name = std::string("rut-diff-selftest-no-such-container-") + label;
+        envoy.log_path = "/dev/null";
+        // Stand-in for EnvoyInstance::launch(): same fork/exec shape, argv
+        // built before fork().
+        std::vector<std::string> argv = {script};
+        const std::vector<char*> args = build_argv(argv);
+        envoy.pid = fork();
+        if (envoy.pid < 0) {
+            std::cerr << "FAIL [self-test envoy stop status]: could not fork " << label << ".sh\n";
+            return false;
+        }
+        if (envoy.pid == 0) {
+            const int null_fd = open("/dev/null", O_RDWR);
+            if (null_fd >= 0) {
+                dup2(null_fd, STDOUT_FILENO);
+                dup2(null_fd, STDERR_FILENO);
+                if (null_fd > STDERR_FILENO) close(null_fd);
+            }
+            execv(args[0], args.data());
+            _exit(127);
+        }
+        // Give the script time to install its trap before stop() sends
+        // SIGTERM.
+        struct timespec ts{0, 100'000'000};
+        nanosleep(&ts, nullptr);
+        const bool stopped_cleanly = envoy.stop();
+        bool ok = true;
+        if (stopped_cleanly != expect_clean) {
+            std::cerr << "FAIL [self-test envoy stop status]: stop() for " << label << " returned "
+                      << (stopped_cleanly ? "clean" : "unexpected") << ", expected "
+                      << (expect_clean ? "clean" : "unexpected") << " ("
+                      << envoy.unexpected_exit_description << ")\n";
+            ok = false;
+        }
+        if (envoy.exited_unexpectedly == expect_clean) {
+            std::cerr << "FAIL [self-test envoy stop status]: exited_unexpectedly for " << label
+                      << " is " << (envoy.exited_unexpectedly ? "true" : "false") << ", expected "
+                      << (expect_clean ? "false" : "true") << "\n";
+            ok = false;
+        }
+        return ok;
+    };
+    bool ok = true;
+    // Envoy honored the proxied SIGTERM: docker run exits 0.
+    ok &= run_case("#!/bin/sh\ntrap 'exit 0' TERM\nsleep 5\n", /*expect_clean=*/true, "term-ok");
+    // `docker rm -f` force-killed the container first: docker run exits 137.
+    ok &= run_case(
+        "#!/bin/sh\ntrap 'exit 137' TERM\nsleep 5\n", /*expect_clean=*/true, "rm-f-killed");
+    // The container died of something else in the teardown window
+    // (nonzero exit that no teardown step produces): unexpected.
+    ok &= run_case("#!/bin/sh\ntrap 'exit 7' TERM\nsleep 5\n", /*expect_clean=*/false, "crashed");
+    // A crash signal reported by docker run as 128 + SIGSEGV: unexpected.
+    ok &=
+        run_case("#!/bin/sh\ntrap 'exit 139' TERM\nsleep 5\n", /*expect_clean=*/false, "segv-exit");
+    if (ok) std::cerr << "PASS [self-test envoy stop status]\n";
     return ok;
 }
 
@@ -4475,16 +4834,27 @@ bool compare_case_against_oracle(const CaseResult& result, const OracleCase& ora
     const std::string preserved_date = std::string(oracle.name) == "get_upstream_date_server"
                                            ? "Mon, 01 Jan 2024 00:00:00 GMT"
                                            : std::string();
+    bool rut_dates_valid = true;
+    bool oracle_dates_valid = true;
     const std::string rut_down =
-        normalize_date_for_compare(result.downstream_bytes, preserved_date);
-    const std::string oracle_down = normalize_date_for_compare(oracle_downstream, preserved_date);
+        normalize_date_for_compare(result.downstream_bytes, preserved_date, &rut_dates_valid);
+    const std::string oracle_down =
+        normalize_date_for_compare(oracle_downstream, preserved_date, &oracle_dates_valid);
+    const bool dates_valid = rut_dates_valid && oracle_dates_valid;
     const bool upstream_match = result.upstream_bytes == oracle_upstream;
     const bool downstream_match = rut_down == oracle_down;
-    const bool match = result.exchange_complete && upstream_match && downstream_match;
+    const bool match =
+        result.exchange_complete && dates_valid && upstream_match && downstream_match;
     std::cerr << (match ? "PASS [self-test rut vs oracle: " : "FAIL [self-test rut vs oracle: ")
               << oracle.name << "]\n";
     if (!result.exchange_complete) {
-        std::cerr << "  rut exchange did not complete\n";
+        std::cerr << "  rut exchange did not complete (" << describe_incomplete_exchange(result)
+                  << ")\n";
+    }
+    if (!dates_valid) {
+        std::cerr << "  malformed synthesized Date (not a 29-byte RFC 1123 value): oracle="
+                  << (oracle_dates_valid ? "ok" : "invalid")
+                  << " rut=" << (rut_dates_valid ? "ok" : "invalid") << "\n";
     }
     if (!upstream_match) {
         std::cerr << "  upstream oracle: \"" << escape_wire_bytes(oracle_upstream) << "\"\n";
@@ -4495,6 +4865,111 @@ bool compare_case_against_oracle(const CaseResult& result, const OracleCase& ora
         std::cerr << "  downstream rut:    \"" << escape_wire_bytes(rut_down) << "\"\n";
     }
     return match;
+}
+
+// Round-7 review, "Validate synthesized Date values before normalizing
+// them": a `date:` value that is not a well-formed 29-byte RFC 1123 date
+// must fail the comparison instead of being replaced by the placeholder
+// (which would let `date: garbage` on both sides compare equal), while two
+// well-formed but different synthesized dates still normalize to a MATCH and
+// the preserved upstream date still passes through untouched.
+bool self_test_malformed_date_rejected() {
+    bool ok = true;
+    const std::string valid = "Tue, 01 Jan 2030 00:00:00 GMT";
+    if (!is_rfc1123_http_date(valid)) {
+        std::cerr << "FAIL [self-test malformed date]: a valid RFC 1123 date was rejected\n";
+        ok = false;
+    }
+    for (const char* bad : {"garbage",
+                            "",
+                            "Xue, 01 Jan 2030 00:00:00 GMT",
+                            "Tue; 01 Jan 2030 00:00:00 GMT",
+                            "Tue, 00 Jan 2030 00:00:00 GMT",
+                            "Tue, 01 Xxx 2030 00:00:00 GMT",
+                            "Tue, 01 Jan 20X0 00:00:00 GMT",
+                            "Tue, 01 Jan 2030 24:00:00 GMT",
+                            "Tue, 01 Jan 2030 00:60:00 GMT",
+                            "Tue, 01 Jan 2030 00:00:60 GMT",
+                            "Tue, 01 Jan 2030 00:00:00 UTC",
+                            "Tue, 01 Jan 2030 00:00:00 GMT ",
+                            "<normalized-date>"}) {
+        if (is_rfc1123_http_date(bad)) {
+            std::cerr << "FAIL [self-test malformed date]: accepted \"" << bad << "\"\n";
+            ok = false;
+        }
+    }
+
+    auto make_pair =
+        [](const char* name, const std::string& envoy_date, const std::string& rut_date) {
+            PairCaseResult c;
+            c.name = name;
+            c.asserted = true;
+            c.envoy.exchange_complete = c.rut.exchange_complete = true;
+            c.envoy.upstream_contacted = c.rut.upstream_contacted = true;
+            c.envoy.upstream_contact_count = c.rut.upstream_contact_count = 1;
+            c.envoy.upstream_bytes = c.rut.upstream_bytes = "TRACE /trace HTTP/1.1\r\n\r\n";
+            c.envoy.downstream_bytes =
+                "HTTP/1.1 200 OK\r\ncontent-length: 0\r\ndate: " + envoy_date + "\r\n\r\n";
+            c.rut.downstream_bytes =
+                "HTTP/1.1 200 OK\r\ncontent-length: 0\r\ndate: " + rut_date + "\r\n\r\n";
+            return c;
+        };
+    // Both sides malformed and byte-identical: must NOT match.
+    if (compare_pair_case(make_pair("trace", "garbage", "garbage"))) {
+        std::cerr << "FAIL [self-test malformed date]: compare_pair_case matched two identical "
+                     "malformed Date values\n";
+        ok = false;
+    }
+    // Only RUT malformed: must not match either.
+    if (compare_pair_case(make_pair("trace", valid, "garbage"))) {
+        std::cerr << "FAIL [self-test malformed date]: compare_pair_case matched a malformed RUT "
+                     "Date against a valid Envoy one\n";
+        ok = false;
+    }
+    // Two well-formed, different synthesized dates: the placeholder still
+    // hides the unavoidable timestamp difference.
+    if (!compare_pair_case(make_pair("trace", valid, "Wed, 02 Jan 2030 12:34:56 GMT"))) {
+        std::cerr << "FAIL [self-test malformed date]: compare_pair_case rejected two valid, "
+                     "differing synthesized Date values\n";
+        ok = false;
+    }
+    // The preserved upstream date is exempt from validation-and-replacement
+    // by name: it passes through verbatim on both sides and still matches.
+    if (!compare_pair_case(make_pair("get_upstream_date_server",
+                                     "Mon, 01 Jan 2024 00:00:00 GMT",
+                                     "Mon, 01 Jan 2024 00:00:00 GMT"))) {
+        std::cerr << "FAIL [self-test malformed date]: compare_pair_case rejected the preserved "
+                     "upstream Date\n";
+        ok = false;
+    }
+    // The oracle comparison path validates the same way.
+    {
+        CaseResult r;
+        r.name = "trace";
+        r.exchange_complete = true;
+        r.upstream_bytes = "TRACE /trace HTTP/1.1\r\n\r\n";
+        r.downstream_bytes = "HTTP/1.1 200 OK\r\ncontent-length: 0\r\ndate: garbage\r\n\r\n";
+        const std::string oracle_down =
+            "HTTP/1.1 200 OK\r\ncontent-length: 0\r\ndate: " + valid + "\r\n\r\n";
+        const OracleCase oracle{"trace",
+                                r.upstream_bytes.data(),
+                                r.upstream_bytes.size(),
+                                oracle_down.data(),
+                                oracle_down.size()};
+        if (compare_case_against_oracle(r, oracle)) {
+            std::cerr << "FAIL [self-test malformed date]: compare_case_against_oracle accepted a "
+                         "malformed RUT Date\n";
+            ok = false;
+        }
+        r.downstream_bytes = "HTTP/1.1 200 OK\r\ncontent-length: 0\r\ndate: " + valid + "\r\n\r\n";
+        if (!compare_case_against_oracle(r, oracle)) {
+            std::cerr << "FAIL [self-test malformed date]: compare_case_against_oracle rejected a "
+                         "valid RUT Date\n";
+            ok = false;
+        }
+    }
+    if (ok) std::cerr << "PASS [self-test malformed date]\n";
+    return ok;
 }
 
 // Round-6-review parity for RUT (PR #694 mirrored onto pair mode's RUT
@@ -4695,7 +5170,8 @@ bool run_self_test_rut_pass(const std::string& rut_binary, const std::string& co
         }
         CaseResult r;
         if (!run_client_case(listen_port, connect_failure_case(), &r))
-            std::cerr << "WARN: case connect_failure exchange did not complete cleanly\n";
+            std::cerr << "WARN: case connect_failure exchange did not complete cleanly ("
+                      << describe_incomplete_exchange(r) << ")\n";
         r.name = "connect_failure";
         if (!rut.stop()) {
             std::cerr << "FAIL [self-test rut]: rut exited unexpectedly before teardown ("
@@ -4742,6 +5218,8 @@ int run_self_test(const std::string& rut_binary, const std::string& converter_bi
     ok &= self_test_accept_unblocks_on_shutdown_close();
     ok &= self_test_head_body_detected();
     ok &= self_test_persistent_trailing_bytes_detected();
+    ok &= self_test_envoy_stop_verifies_exit_status();
+    ok &= self_test_malformed_date_rejected();
     ok &= self_test_rut_port_retry(rut_binary, converter_binary);
     if (!rut_binary.empty() && !converter_binary.empty()) {
         ok &= run_self_test_rut_pass(rut_binary, converter_binary);
