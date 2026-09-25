@@ -436,7 +436,12 @@ return forward(users,
 // the first `server` value in place (a later duplicate is dropped, or
 // appends when absent), appends `connection: close` last only when the
 // downstream connection is closing, and uses the canonical reason phrase
-// instead of the upstream's. All five fields below are required together;
+// instead of the upstream's — including when the upstream sent an empty
+// reason phrase, since it is never forwarded. `hide_headers` cannot suppress
+// `Content-Length`: it is the sole framing field this profile admits, so a
+// hide-list entry naming it is not honored (the fixed-order profile above is
+// immune the same way, by never routing Content-Length through its own hide
+// check). All five fields below are required together;
 // `response_read_timeout` / `response_buffering` / `timeout_failure_policy`
 // are rejected with it (ordinary-forward-only, like request_policy
 // host: "preserve"). The fixed-order layout above (`header_order` omitted)

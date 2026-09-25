@@ -11184,8 +11184,14 @@ inline bool build_upstream_order_response_headers(
         resp.version != HttpVersion::Http11 || resp.status_code < 200 || resp.status_code > 599 ||
         resp.status_code == 204 || resp.status_code == 205 || resp.status_code == 304 ||
         resp.headers_truncated || resp.content_length_count != 1 || !resp.has_content_length ||
-        resp.chunked || resp.reason.len == 0)
+        resp.chunked)
         return false;
+    // Unlike `build_strict_response_headers` below, this profile never emits
+    // `resp.reason` (the canonical table below replaces it), so an upstream
+    // status line with an empty reason phrase (`HTTP/1.1 200 \r\n`, which
+    // `parse_response` accepts) is not a rejection here. The control-character
+    // scan still runs — it is a no-op on a zero-length reason and still
+    // catches a malformed nonempty one before the canonical replacement.
     for (u32 i = 0; i < resp.reason.len; i++) {
         const u8 c = static_cast<u8>(resp.reason.ptr[i]);
         if ((c < 0x20 && c != '\t') || c == 0x7f) return false;
@@ -11214,13 +11220,21 @@ inline bool build_upstream_order_response_headers(
     for (u32 i = 0; i < resp.header_count; i++) {
         const Header& h = resp.headers[i];
         const Str name = h.name;
+        // Content-Length is the sole framing field this profile admits (see
+        // the precondition above: exactly one, and it must be present). It
+        // must never disappear from the downstream response while the body
+        // is still streamed byte for byte, so a `hide_headers` entry naming
+        // it is not honored here — mirroring how the fixed-order
+        // `Synthesized` profile always re-emits it independent of the hide
+        // list (it is never routed through that profile's own hide check).
+        const bool is_content_length = response_policy_name_eq(name, "content-length", 14);
         if (response_policy_name_eq(name, "connection", 10) ||
             response_policy_name_eq(name, "keep-alive", 10) ||
             response_policy_name_eq(name, "proxy-connection", 16) ||
             response_policy_name_eq(name, "upgrade", 7) || response_policy_name_eq(name, "te", 2) ||
             response_policy_name_eq(name, "trailer", 7) ||
             response_policy_name_eq(name, "transfer-encoding", 17) ||
-            response_policy_hides_header(policy, name))
+            (!is_content_length && response_policy_hides_header(policy, name)))
             continue;
         if (response_policy_name_eq(name, "server", 6)) {
             if (seen_server) continue;

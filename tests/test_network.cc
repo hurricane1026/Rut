@@ -1615,6 +1615,101 @@ TEST(response_policy, upstream_header_order_config_copy_is_owned_and_spec_valid_
     CHECK_EQ(untouched.response_policy_bytes_used, 0u);
 }
 
+// Codex review: `hide_headers` naming `Content-Length` must not suppress the
+// sole framing field `header_order: "upstream"` admits -- the body is still
+// streamed byte for byte, so removing the header would leave a keep-alive
+// client treating the response as close-delimited. `X-Pad` is also on the
+// hide list and IS dropped, proving the exemption is Content-Length-specific.
+TEST(response_policy, upstream_header_order_hide_headers_cannot_suppress_content_length) {
+    char server[] = "envoy";
+    ForwardResponsePolicySpec upstream_order{};
+    upstream_order.version = ResponsePolicyVersion::Http11;
+    upstream_order.framing = ResponsePolicyFraming::ContentLength;
+    upstream_order.connection = ResponsePolicyConnection::Request;
+    upstream_order.header_order = ResponsePolicyHeaderOrder::Upstream;
+    upstream_order.header_names = ResponsePolicyHeaderNames::Lowercase;
+    upstream_order.connection_header = ResponsePolicyConnectionHeader::CloseOnly;
+    upstream_order.status_reason = ResponsePolicyStatusReason::Canonical;
+    upstream_order.date = ResponsePolicyDate::PreserveOrCurrent;
+    upstream_order.server = {server, 5};
+    upstream_order.hide_header_count = 2;
+    upstream_order.hide_headers[0] = {"Content-Length", 14};
+    upstream_order.hide_headers[1] = {"X-Pad", 5};
+    REQUIRE(response_policy_spec_valid(upstream_order));
+
+    RouteConfig config{};
+    REQUIRE_EQ(config.add_response_policy(upstream_order), 1u);
+
+    u8 header_storage[SlicePool::kSliceSize]{};
+    Connection conn{};
+    conn.reset();
+    conn.response_header_slice = header_storage;
+    conn.response_header_buf.bind(header_storage, sizeof(header_storage));
+    conn.response_policy_id = 1;
+    conn.keep_alive = true;
+    conn.req_client_keep_alive = true;
+
+    static constexpr char kUpstream[] =
+        "HTTP/1.1 200 OK\r\nContent-Length: 2\r\nX-Pad: 1\r\n\r\nhi";
+    HttpResponseParser parser;
+    ParsedResponse response;
+    parser.reset();
+    response.reset();
+    REQUIRE_EQ(
+        parser.parse(reinterpret_cast<const u8*>(kUpstream), sizeof(kUpstream) - 1u, &response),
+        ParseStatus::Complete);
+    REQUIRE(build_strict_response_headers(conn, config, response));
+    CHECK(buf_has(
+        conn.response_header_buf.data(), conn.response_header_buf.len(), "content-length: 2\r\n"));
+    CHECK_FALSE(buf_has(conn.response_header_buf.data(), conn.response_header_buf.len(), "x-pad"));
+}
+
+// Codex review: an upstream status line with an empty reason phrase is valid
+// (`parse_response` accepts `SP CRLF` with a zero-length reason) and this
+// profile never forwards the upstream reason anyway -- the canonical table
+// always overrides it -- so an empty one must not be rejected either.
+TEST(response_policy, upstream_header_order_accepts_empty_upstream_reason) {
+    char server[] = "envoy";
+    ForwardResponsePolicySpec upstream_order{};
+    upstream_order.version = ResponsePolicyVersion::Http11;
+    upstream_order.framing = ResponsePolicyFraming::ContentLength;
+    upstream_order.connection = ResponsePolicyConnection::Request;
+    upstream_order.header_order = ResponsePolicyHeaderOrder::Upstream;
+    upstream_order.header_names = ResponsePolicyHeaderNames::Lowercase;
+    upstream_order.connection_header = ResponsePolicyConnectionHeader::CloseOnly;
+    upstream_order.status_reason = ResponsePolicyStatusReason::Canonical;
+    upstream_order.date = ResponsePolicyDate::PreserveOrCurrent;
+    upstream_order.server = {server, 5};
+    REQUIRE(response_policy_spec_valid(upstream_order));
+
+    RouteConfig config{};
+    REQUIRE_EQ(config.add_response_policy(upstream_order), 1u);
+
+    u8 header_storage[SlicePool::kSliceSize]{};
+    Connection conn{};
+    conn.reset();
+    conn.response_header_slice = header_storage;
+    conn.response_header_buf.bind(header_storage, sizeof(header_storage));
+    conn.response_policy_id = 1;
+    conn.keep_alive = true;
+    conn.req_client_keep_alive = true;
+
+    static constexpr char kUpstream[] = "HTTP/1.1 200 \r\nContent-Length: 2\r\n\r\nhi";
+    HttpResponseParser parser;
+    ParsedResponse response;
+    parser.reset();
+    response.reset();
+    REQUIRE_EQ(
+        parser.parse(reinterpret_cast<const u8*>(kUpstream), sizeof(kUpstream) - 1u, &response),
+        ParseStatus::Complete);
+    REQUIRE_EQ(response.reason.len, 0u);
+    REQUIRE(build_strict_response_headers(conn, config, response));
+    CHECK(buf_has(
+        conn.response_header_buf.data(), conn.response_header_buf.len(), "HTTP/1.1 200 OK\r\n"));
+    CHECK(buf_has(
+        conn.response_header_buf.data(), conn.response_header_buf.len(), "content-length: 2\r\n"));
+}
+
 TEST(response_policy, failure_head_mode_config_copy_is_owned_and_deduplicated) {
     char reason[] = "Bad Gateway";
     char type[] = "text/plain";
@@ -2086,6 +2181,79 @@ TEST(response_policy, none_buffering_bundle_keeps_timeout_and_head_compatibility
     CHECK(config.policy_bundle_id_is_valid(4));
     config.policy_bundles[3].failure_policy_id = failure_id;
     CHECK_FALSE(config.policy_bundle_id_is_valid(4));
+}
+
+// Codex review: `header_order: "upstream"` is ordinary-forward-only (see
+// analyze.cc and compile_to_config.h); a native caller building a
+// RouteConfig directly (bypassing RIR compilation) must not be able to
+// publish a bundle pairing it with response read timing, response
+// buffering, or a timeout failure policy. `add_policy_bundle` rejects the
+// combination at construction, and `policy_bundle_id_is_valid` -- the
+// trust boundary `forward_policy_tables_valid()` relies on -- rejects it
+// too for a bundle forged directly into the table.
+TEST(response_policy, upstream_header_order_bundle_rejects_timing_buffering_and_timeout) {
+    auto make_upstream_order = [](ForwardResponsePolicySpec base) {
+        base.header_order = ResponsePolicyHeaderOrder::Upstream;
+        base.header_names = ResponsePolicyHeaderNames::Lowercase;
+        base.connection_header = ResponsePolicyConnectionHeader::CloseOnly;
+        base.status_reason = ResponsePolicyStatusReason::Canonical;
+        base.date = ResponsePolicyDate::PreserveOrCurrent;
+        return base;
+    };
+
+    RouteConfig config{};
+    u16 response_id = 0;
+    u16 failure_id = 0;
+    u16 timeout_id = 0;
+    REQUIRE(add_response_policy_test_roles(config, response_id, failure_id, timeout_id));
+    const u16 upstream_id =
+        config.add_response_policy(make_upstream_order(config.response_policies[response_id - 1]));
+    REQUIRE_NE(upstream_id, 0u);
+
+    // Ordinary-forward-only usage (no timeout, no read timeout, no
+    // buffering) is still admitted.
+    CHECK_NE(config.add_policy_bundle(upstream_id, failure_id), 0u);
+    // Every one of the three restricted shapes is rejected at construction.
+    CHECK_EQ(config.add_policy_bundle(upstream_id, failure_id, 0, 5), 0u);
+    CHECK_EQ(config.add_policy_bundle(upstream_id, failure_id, timeout_id), 0u);
+    CHECK_EQ(config.add_policy_bundle(upstream_id,
+                                      failure_id,
+                                      timeout_id,
+                                      5,
+                                      ForwardResponseBufferingMode::CompleteContentLength),
+             0u);
+
+    // A hand-built config that skipped add_policy_bundle (or a future
+    // non-RIR frontend that bypasses analyze.cc) must still be rejected by
+    // the trust boundary forward_policy_tables_valid() relies on.
+    RouteConfig forged{};
+    u16 forged_response_id = 0;
+    u16 forged_failure_id = 0;
+    u16 forged_timeout_id = 0;
+    REQUIRE(add_response_policy_test_roles(
+        forged, forged_response_id, forged_failure_id, forged_timeout_id));
+    const u16 forged_upstream_id = forged.add_response_policy(
+        make_upstream_order(forged.response_policies[forged_response_id - 1]));
+    REQUIRE_NE(forged_upstream_id, 0u);
+    const u16 bundle_id = forged.add_policy_bundle(forged_upstream_id, forged_failure_id);
+    REQUIRE_NE(bundle_id, 0u);
+    CHECK(forged.policy_bundle_id_is_valid(bundle_id));
+    CHECK(forged.forward_policy_tables_valid());
+
+    forged.policy_bundles[bundle_id - 1].response_read_timeout_seconds = 5;
+    CHECK_FALSE(forged.policy_bundle_id_is_valid(bundle_id));
+    CHECK_FALSE(forged.forward_policy_tables_valid());
+    forged.policy_bundles[bundle_id - 1].response_read_timeout_seconds = 0;
+
+    forged.policy_bundles[bundle_id - 1].timeout_failure_policy_id = forged_timeout_id;
+    CHECK_FALSE(forged.policy_bundle_id_is_valid(bundle_id));
+    CHECK_FALSE(forged.forward_policy_tables_valid());
+    forged.policy_bundles[bundle_id - 1].timeout_failure_policy_id = 0;
+
+    forged.policy_bundles[bundle_id - 1].response_buffering =
+        ForwardResponseBufferingMode::CompleteContentLength;
+    CHECK_FALSE(forged.policy_bundle_id_is_valid(bundle_id));
+    CHECK_FALSE(forged.forward_policy_tables_valid());
 }
 
 TEST(response_read_timeout, h1_rejects_before_every_forward_effect_and_preserves_absence) {
