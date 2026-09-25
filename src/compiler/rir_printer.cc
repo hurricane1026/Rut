@@ -1041,6 +1041,31 @@ static const char* failure_policy_head_mode_name(FailurePolicyHeadMode mode) {
     return "invalid";
 }
 
+static const char* forward_failure_policy_version_name(ForwardFailurePolicyVersion version) {
+    return version == ForwardFailurePolicyVersion::Http11 ? "HTTP/1.1" : "invalid";
+}
+
+static const char* forward_failure_policy_date_name(ForwardFailurePolicyDate date) {
+    return date == ForwardFailurePolicyDate::Current ? "current" : "invalid";
+}
+
+static const char* forward_failure_policy_connection_name(
+    ForwardFailurePolicyConnection connection) {
+    return connection == ForwardFailurePolicyConnection::Request ? "request" : "invalid";
+}
+
+// Codex round-11 review: a synthesized 502 and a LengthTypeDateServer 503
+// with the same head_mode must remain distinguishable in RIR output, since
+// they serialize different statuses, casing, ordering, and bodies at runtime
+// (build_bounded_local_response_bytes, include/rut/runtime/callbacks_impl.h).
+static const char* failure_policy_header_order_name(FailurePolicyHeaderOrder order) {
+    if (order == FailurePolicyHeaderOrder::Synthesized)
+        return "synthesized";
+    else if (order == FailurePolicyHeaderOrder::LengthTypeDateServer)
+        return "length_type_date_server";
+    return "invalid";
+}
+
 static const char* strict_local_response_head_mode_name(StrictLocalResponseHeadMode mode) {
     switch (mode) {
         case StrictLocalResponseHeadMode::Reject:
@@ -1144,8 +1169,26 @@ static void print_module_impl(PrintBuf& buf, const Module& mod, bool internal_pr
             const auto& policy = mod.failure_policies[i];
             buf.put_cstr("  failure_policy#");
             buf.put_u32(i + 1);
-            buf.put_cstr(": head_mode=");
+            buf.put_cstr(": version=");
+            buf.put_cstr(forward_failure_policy_version_name(policy.version));
+            buf.put_cstr(", status=");
+            buf.put_u32(policy.status_code);
+            buf.put_cstr(", reason=");
+            print_quoted_str(buf, policy.reason);
+            buf.put_cstr(", server=");
+            print_quoted_str(buf, policy.server);
+            buf.put_cstr(", content_type=");
+            print_quoted_str(buf, policy.content_type);
+            buf.put_cstr(", date=");
+            buf.put_cstr(forward_failure_policy_date_name(policy.date));
+            buf.put_cstr(", connection=");
+            buf.put_cstr(forward_failure_policy_connection_name(policy.connection));
+            buf.put_cstr(", head_mode=");
             buf.put_cstr(failure_policy_head_mode_name(policy.head_mode));
+            buf.put_cstr(", header_order=");
+            buf.put_cstr(failure_policy_header_order_name(policy.header_order));
+            buf.put_cstr(", body=");
+            print_redirect_body(buf, policy.body);
             buf.newline();
         }
     }
