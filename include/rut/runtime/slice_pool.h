@@ -43,19 +43,32 @@ struct SlicePool {
     static constexpr u32 kSlicesPerConnection =
         kOrdinarySlicesPerConnection + kMaxBufferedResponseSlices;
 
-    // Bulk relay buffers: a small fixed set of large buffers a connection
-    // borrows only while it relays a large proxied body, so the body moves in
-    // 256 KiB steps. Separate VA region, faulted in on first use; free()
-    // routes a bulk pointer here by address, so release sites need not know
-    // which kind they hold. Exhaustion is not an error: callers keep slices.
+    // Bulk relay buffers: large buffers a connection borrows only while it
+    // relays a large proxied body, so the body moves in 256 KiB steps.
+    // Reserved per connection (like the ordinary/response-chain slices
+    // above) rather than as one pool-wide fixed set, bounded by a hard cap.
+    // Separate VA region, faulted in on first use; free() routes a bulk
+    // pointer here by address, so release sites need not know which kind
+    // they hold. Exhaustion is not an error: callers keep slices.
     static constexpr u32 kBulkSliceSize = 256 * 1024;
-    static constexpr u32 kBulkSlices = 64;  // 16 MiB VA per pool
-    static_assert(kBulkSlices <= 64, "bulk in-use tracking is one u64 bitmap");
+    static constexpr u32 kBulkPerConnection = 4;  // bulk buffers reserved per connection
+    static constexpr u32 kMaxBulkSlices = 4096;   // hard cap: 1 GiB VA per pool
 
     static constexpr u32 capacity_for_connections(u32 connections) {
         constexpr u32 kMaxU32 = 0xFFFFFFFFu;
         if (connections > kMaxU32 / kSlicesPerConnection) return 0;
         return connections * kSlicesPerConnection;
+    }
+
+    // Bulk-buffer VA to reserve for `connections` admitted connections.
+    // Idle connections never hold a bulk buffer, so this bounds resident
+    // memory only indirectly (via how many are ever concurrently in use),
+    // not per-connection like the ordinary slice reserve.
+    static constexpr u32 bulk_capacity_for_connections(u32 connections) {
+        constexpr u32 kMaxU32 = 0xFFFFFFFFu;
+        const u32 n =
+            connections > kMaxU32 / kBulkPerConnection ? kMaxU32 : connections * kBulkPerConnection;
+        return n > kMaxBulkSlices ? kMaxBulkSlices : n;
     }
 
     u8* base = nullptr;         // mmap'd region: max_count * kSliceSize bytes
@@ -72,12 +85,21 @@ struct SlicePool {
     u64 stack_size = 0;  // size of mmap'd free_stack region
     u64 map_size = 0;    // size of mmap'd in_use_map
 
+    // bulk_free/bulk_in_use are small (bulk_max_count-proportional) and
+    // mmap'd eagerly at init, like free_stack/in_use_map above. bulk_base —
+    // the actual buffer data, up to kMaxBulkSlices * kBulkSliceSize — is
+    // mapped MAP_NORESERVE and only faulted in as buffers are actually
+    // written to, so idle/unused bulk capacity costs no physical memory.
     // Mapped on the first alloc_bulk(): pools that never relay a large body
     // (and init's allocation sequence) are unaffected. A failed map is sticky.
-    u8* bulk_base = nullptr;  // kBulkSlices * kBulkSliceSize bytes, or null
-    u32 bulk_free[kBulkSlices] = {};
+    u8* bulk_base = nullptr;     // bulk_max_count * kBulkSliceSize bytes, or null
+    u32* bulk_free = nullptr;    // mmap'd: free bulk-buffer indices
+    u64* bulk_in_use = nullptr;  // mmap'd bitmap: bit i set while bulk buffer i is borrowed
     u32 bulk_free_top = 0;
-    u64 bulk_in_use = 0;  // bit i set while bulk slice i is borrowed
+    u32 bulk_max_count = 0;    // bulk buffers reserved for this pool (set at init)
+    u64 bulk_base_size = 0;    // size of mmap'd bulk_base region
+    u64 bulk_free_size = 0;    // size of mmap'd bulk_free region
+    u64 bulk_in_use_size = 0;  // size of mmap'd bulk_in_use region
     bool bulk_map_failed = false;
 
     // Number of slices to commit per growth step.
@@ -89,13 +111,20 @@ struct SlicePool {
     // `prealloc` slices upfront (0 = fully lazy). Free-stack and in-use
     // map (small: n * 4 + n bytes) are committed immediately.
     // cache_slices may lower/disable the cache; the hard bound is unchanged.
-    core::Expected<void, Error> init(u32 n, u32 prealloc = 0, u32 cache_slices = kMaxCachedSlices) {
+    // bulk_capacity reserves VA for that many bulk buffers (see
+    // bulk_capacity_for_connections); 0 (the default) means this pool never
+    // hands out a bulk buffer — alloc_bulk() always returns null.
+    core::Expected<void, Error> init(u32 n,
+                                     u32 prealloc = 0,
+                                     u32 cache_slices = kMaxCachedSlices,
+                                     u32 bulk_capacity = 0) {
         cache_limit = cache_slices < kMaxCachedSlices ? cache_slices : kMaxCachedSlices;
         if (cache_limit > n) cache_limit = n;
         cached_count = 0;
         max_count = n;
         count = 0;
         free_top = 0;
+        bulk_max_count = bulk_capacity > kMaxBulkSlices ? kMaxBulkSlices : bulk_capacity;
 
         // Reserve VA for slice data — PROT_NONE, no physical pages
         base_size = static_cast<u64>(n) * kSliceSize;
@@ -130,6 +159,52 @@ struct SlicePool {
         }
         in_use_map = static_cast<u8*>(map_mem);
 
+        // Bulk index/bitmap bookkeeping is small (bulk_max_count-proportional)
+        // and committed eagerly, like free_stack/in_use_map above. The bulk
+        // data region itself (bulk_base) stays lazy — mapped on first use.
+        if (bulk_max_count > 0) {
+            bulk_free_size = static_cast<u64>(bulk_max_count) * sizeof(u32);
+            void* bulk_free_mem = mmap(nullptr,
+                                       bulk_free_size,
+                                       PROT_READ | PROT_WRITE,
+                                       MAP_PRIVATE | MAP_ANONYMOUS,
+                                       -1,
+                                       0);
+            if (bulk_free_mem == MAP_FAILED) {
+                auto err = Error::from_errno(Error::Source::SlicePool);
+                munmap(in_use_map, map_size);
+                in_use_map = nullptr;
+                munmap(free_stack, stack_size);
+                free_stack = nullptr;
+                munmap(base, base_size);
+                base = nullptr;
+                return core::make_unexpected(err);
+            }
+            bulk_free = static_cast<u32*>(bulk_free_mem);
+
+            const u32 words = (bulk_max_count + 63u) / 64u;
+            bulk_in_use_size = static_cast<u64>(words) * sizeof(u64);
+            void* bulk_in_use_mem = mmap(nullptr,
+                                         bulk_in_use_size,
+                                         PROT_READ | PROT_WRITE,
+                                         MAP_PRIVATE | MAP_ANONYMOUS,
+                                         -1,
+                                         0);
+            if (bulk_in_use_mem == MAP_FAILED) {
+                auto err = Error::from_errno(Error::Source::SlicePool);
+                munmap(bulk_free, bulk_free_size);
+                bulk_free = nullptr;
+                munmap(in_use_map, map_size);
+                in_use_map = nullptr;
+                munmap(free_stack, stack_size);
+                free_stack = nullptr;
+                munmap(base, base_size);
+                base = nullptr;
+                return core::make_unexpected(err);
+            }
+            bulk_in_use = static_cast<u64*>(bulk_in_use_mem);
+        }
+
         // Pre-commit requested slices (0 = fully lazy).
         if (prealloc > 0) {
             if (prealloc > n) prealloc = n;
@@ -157,18 +232,20 @@ struct SlicePool {
         return ptr;
     }
 
-    // Borrow one bulk relay buffer, or null when none is available.
+    // Borrow one bulk relay buffer, or null when none is available (including
+    // when this pool was init'd with bulk_capacity == 0).
     u8* alloc_bulk() {
+        if (bulk_max_count == 0) return nullptr;
         if (bulk_base == nullptr && !map_bulk()) return nullptr;
         if (bulk_free_top == 0) return nullptr;
         const u32 idx = bulk_free[--bulk_free_top];
-        bulk_in_use |= u64{1} << idx;
+        bulk_in_use[idx >> 6] |= u64{1} << (idx & 63u);
         return bulk_base + static_cast<u64>(idx) * kBulkSliceSize;
     }
 
     [[nodiscard]] bool is_bulk(const u8* ptr) const {
         return bulk_base != nullptr && ptr >= bulk_base &&
-               ptr < bulk_base + static_cast<u64>(kBulkSlices) * kBulkSliceSize;
+               ptr < bulk_base + static_cast<u64>(bulk_max_count) * kBulkSliceSize;
     }
 
     // Byte capacity of a buffer handed out by alloc() or alloc_bulk().
@@ -178,7 +255,7 @@ struct SlicePool {
 
     u32 bulk_available() const {
         if (bulk_base != nullptr) return bulk_free_top;
-        return bulk_map_failed ? 0 : kBulkSlices;
+        return bulk_map_failed ? 0 : bulk_max_count;
     }
 
     // Free a slice back to the pool. ptr must have been returned by alloc()
@@ -243,11 +320,19 @@ struct SlicePool {
     // Release all mmap'd memory.
     void destroy() {
         if (bulk_base) {
-            munmap(bulk_base, static_cast<u64>(kBulkSlices) * kBulkSliceSize);
+            munmap(bulk_base, static_cast<u64>(bulk_max_count) * kBulkSliceSize);
             bulk_base = nullptr;
         }
+        if (bulk_free) {
+            munmap(bulk_free, bulk_free_size);
+            bulk_free = nullptr;
+        }
+        if (bulk_in_use) {
+            munmap(bulk_in_use, bulk_in_use_size);
+            bulk_in_use = nullptr;
+        }
         bulk_free_top = 0;
-        bulk_in_use = 0;
+        bulk_max_count = 0;
         bulk_map_failed = false;
         if (in_use_map) {
             munmap(in_use_map, map_size);
@@ -270,11 +355,17 @@ struct SlicePool {
 
 private:
     bool map_bulk() {
-        if (bulk_map_failed || base == nullptr) return false;
+        if (bulk_map_failed || base == nullptr || bulk_max_count == 0) return false;
+        // MAP_NORESERVE: reserve VA for the full per-pool bulk capacity (up to
+        // kMaxBulkSlices * kBulkSliceSize) without committing overcommit
+        // charge for it. Physical pages are faulted in only as buffers are
+        // actually written to, so resident memory tracks buffers in use, not
+        // the reservation. bulk_free/bulk_in_use (the small index/bitmap
+        // bookkeeping) were already committed eagerly in init().
         void* mem = mmap(nullptr,
-                         static_cast<u64>(kBulkSlices) * kBulkSliceSize,
+                         static_cast<u64>(bulk_max_count) * kBulkSliceSize,
                          PROT_READ | PROT_WRITE,
-                         MAP_PRIVATE | MAP_ANONYMOUS,
+                         MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE,
                          -1,
                          0);
         if (mem == MAP_FAILED) {
@@ -282,9 +373,8 @@ private:
             return false;
         }
         bulk_base = static_cast<u8*>(mem);
-        bulk_in_use = 0;
         bulk_free_top = 0;
-        for (u32 i = kBulkSlices; i > 0; --i) bulk_free[bulk_free_top++] = i - 1;
+        for (u32 i = bulk_max_count; i > 0; --i) bulk_free[bulk_free_top++] = i - 1;
         return true;
     }
 
@@ -292,9 +382,11 @@ private:
         const u64 offset = static_cast<u64>(ptr - bulk_base);
         if (offset % kBulkSliceSize != 0) return;  // not buffer-aligned
         const u32 idx = static_cast<u32>(offset / kBulkSliceSize);
-        const u64 bit = u64{1} << idx;
-        if ((bulk_in_use & bit) == 0) return;  // double-free detection
-        bulk_in_use &= ~bit;
+        if (idx >= bulk_max_count) return;
+        u64& word = bulk_in_use[idx >> 6];
+        const u64 bit = u64{1} << (idx & 63u);
+        if ((word & bit) == 0) return;  // double-free detection
+        word &= ~bit;
         // Like slices, a returned buffer must not expose its owner's bytes.
         // Zero in place: the set is small and hot, and MADV_DONTNEED would make
         // every reuse fault its pages back in. Bytes past `dirty` are still

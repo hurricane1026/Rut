@@ -1636,6 +1636,28 @@ struct ConnectionBase {
     Buffer upstream_recv_buf;
     ResponseBodyChain response_body_tail{};
 
+    // io_uring only: true while a *direct* one-shot upstream recv (straight
+    // into either upstream_recv_buf's bulk-sized destination, or — for a
+    // response_read_deadline connection buffering a complete body
+    // (response_read_deadline_post_commit_phase == Buffering) —
+    // response_body_tail's tail node; see IoUringBackend::add_recv_upstream_direct)
+    // is armed in the kernel. Set on successful submit, cleared only by the
+    // backend when that recv's terminal CQE is consumed. While true,
+    // upstream_recv_slice / upstream_recv_buf (or the chain tail node) must
+    // not be freed or rebound: the kernel may still be writing into that
+    // exact memory. epoll never sets this.
+    bool upstream_recv_direct_armed = false;
+
+    // io_uring only, response_read_deadline CompleteContentLength buffering:
+    // set by settle_response_read_deadline_batch once the buffered body has
+    // grown past ResponseBodyChain::kBulkAfter{Plaintext,Tls} — new chain
+    // nodes will be bulk from here on — and it has cancelled the still-armed
+    // provided-buffer body recv to switch the remainder of the body to a
+    // direct one-shot recv straight into the chain tail. Consumed by
+    // try_deferred_upstream_rearm once that cancel fully drains (never set
+    // without also calling pause_upstream_recv_impl in the same step).
+    bool response_read_deadline_want_direct_body = false;
+
     u32 buffered_response_len() const { return upstream_recv_buf.len() + response_body_tail.size; }
     const u8* buffered_response_data() const {
         return upstream_recv_buf.len() ? upstream_recv_buf.data() : response_body_tail.data();
@@ -1855,6 +1877,8 @@ struct ConnectionBase {
         send_armed = false;
         upstream_connect_armed = false;
         upstream_recv_armed = false;
+        upstream_recv_direct_armed = false;
+        response_read_deadline_want_direct_body = false;
         upstream_send_armed = false;
         recv_paused_for_send = false;
         recv_pause_cancel_pending = false;

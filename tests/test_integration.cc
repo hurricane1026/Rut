@@ -39563,6 +39563,294 @@ TEST(
     CHECK_FALSE(shard.log_ring->pop(duplicate));
 }
 
+// Large-body sibling of the clean-EOF test above: the prefix (20000 bytes)
+// exceeds ResponseBodyChain::kBulkAfterPlaintext (16368), so by the time the
+// origin gate closes the connection, response_body_tail has already crossed
+// the threshold and the body recv has switched from the provided-buffer
+// multishot ring to a direct one-shot MSG_WAITALL recv straight into a bulk
+// chain node (arm_response_read_direct_body_recv). WAITALL must still
+// complete on a clean origin close with the short count actually read, not
+// hang until the timeout — this is the scenario add_recv_upstream_direct's
+// wait_all contract documents. The expected disposition is identical to the
+// small-body case: the pinned header + exactly what arrived, then close.
+TEST(
+    route,
+    public_ordinary_source_complete_content_length_buffering_large_body_direct_recv_clean_eof_emits_prefix_and_closes_iouring) {
+    using namespace rut;
+    using GateState = RecordingUpstream::FirstResponseCloseGateState;
+    if (!iouring_socket_live()) SKIP("io_uring async socket ops unavailable in this environment");
+    constexpr u32 kPrefixLen = 20000;
+    constexpr u32 kDeclaredBody = 40000;
+    static_assert(kPrefixLen > ResponseBodyChain::kBulkAfterPlaintext,
+                  "prefix must cross the bulk_after threshold to exercise the direct-recv switch");
+    static_assert(kDeclaredBody > kPrefixLen);
+
+    std::vector<char> prefix(kPrefixLen);
+    for (u32 i = 0; i < kPrefixLen; i++) prefix[i] = static_cast<char>('a' + (i % 26));
+
+    const std::string origin_header =
+        "HTTP/1.1 200 OK\r\n"
+        "Server: origin\r\n"
+        "Date: Tue, 01 Jan 2030 00:00:00 GMT\r\n"
+        "Content-Length: " +
+        std::to_string(kDeclaredBody) + "\r\n\r\n";
+    std::vector<char> origin_wire(origin_header.begin(), origin_header.end());
+    origin_wire.insert(origin_wire.end(), prefix.begin(), prefix.end());
+
+    const std::string expected_header =
+        "HTTP/1.1 200 OK\r\n"
+        "Server: buffered-test\r\n"
+        "Date: XXXXXXXXXXXXXXXXXXXXXXXXXXXXX\r\n"
+        "Content-Length: " +
+        std::to_string(kDeclaredBody) +
+        "\r\n"
+        "Connection: keep-alive\r\n\r\n";
+    std::vector<char> expected_wire(expected_header.begin(), expected_header.end());
+    expected_wire.insert(expected_wire.end(), prefix.begin(), prefix.end());
+
+    RecordingUpstream backend;
+    backend.response = origin_wire.data();
+    backend.response_len = static_cast<u32>(origin_wire.size());
+    // The origin remains application-open after its incomplete positive-CL
+    // response until this test explicitly authorizes the clean-EOF fixture —
+    // same gate the small-body sibling test uses.
+    backend.gate_first_response_close = true;
+    REQUIRE(backend.setup());
+
+    PublicGetCompleteContentLengthBufferingSourceResources resources;
+    REQUIRE(resources.compile(backend.port));
+    REQUIRE_EQ(resources.rir.module.func_count, 1u);
+    const auto& function = resources.rir.module.functions[0];
+    CHECK_EQ(function.http_method, kRouteMethodGet);
+    REQUIRE_EQ(resources.rir.module.policy_bundle_count, 1u);
+    const auto& rir_bundle = resources.rir.module.policy_bundles[0];
+    CHECK_EQ(rir_bundle.response_read_timeout_seconds, 1u);
+    CHECK_EQ(rir_bundle.response_buffering, ForwardResponseBufferingMode::CompleteContentLength);
+    REQUIRE_EQ(resources.cfg.route_count, 1u);
+    CHECK_EQ(resources.cfg.routes[0].method, kRouteMethodGet);
+
+    Shard<IoUringEventLoop> shard;
+    i32 listen_fd = create_listen_socket(0).value_or(-1);
+    REQUIRE_GE(listen_fd, 0);
+    struct ShardGuard {
+        Shard<IoUringEventLoop>& shard;
+        i32& listen_fd;
+        bool spawned = false;
+        ~ShardGuard() {
+            if (spawned) {
+                shard.stop();
+                shard.join();
+            }
+            shard.shutdown();
+            if (listen_fd >= 0) close(listen_fd);
+        }
+    } shard_guard{shard, listen_fd};
+    const u16 port = get_port(listen_fd);
+    REQUIRE(shard.init(0, listen_fd).has_value());
+    shard.route_config = &resources.cfg;
+    REQUIRE(shard.loop != nullptr);
+    REQUIRE(shard.spawn(-1).has_value());
+    shard_guard.spawned = true;
+    usleep(50000);
+
+    struct ClientGuard {
+        i32 fd;
+        ~ClientGuard() {
+            if (fd >= 0) close(fd);
+        }
+    } client{connect_to(port)};
+    REQUIRE_GE(client.fd, 0);
+    set_socket_timeouts(client.fd, 8);
+    static constexpr char kRequest[] =
+        "GET /buffered?large-clean-eof=1 HTTP/1.1\r\n"
+        "Host: client.example\r\n"
+        "X-Test: buffered-large-clean-eof\r\n\r\n";
+    REQUIRE(send_all(client.fd, kRequest, sizeof(kRequest) - 1u));
+
+    for (u32 waited = 0; waited < 2000 &&
+                         (backend.first_response_close_gate_state.load(std::memory_order_acquire) ==
+                              GateState::Idle ||
+                          backend.request_count.load(std::memory_order_acquire) < 1u);
+         waited++)
+        usleep(1000);
+    REQUIRE_EQ(backend.first_response_close_gate_state.load(std::memory_order_acquire),
+               GateState::SentOpenWaitingGate);
+    REQUIRE_EQ(backend.accepted_count.load(std::memory_order_acquire), 1u);
+    REQUIRE_EQ(backend.request_count.load(std::memory_order_acquire), 1u);
+
+    // The full prefix has been sent by the origin but must remain private
+    // (header still not published) while RUT keeps buffering: EAGAIN, not
+    // EOF, proves the downstream is open and byte-quiet.
+    char quiet[64];
+    REQUIRE_EQ(recv_timeout(client.fd, quiet, sizeof(quiet), 200), -EAGAIN);
+    REQUIRE_EQ(backend.first_response_close_gate_state.load(std::memory_order_acquire),
+               GateState::SentOpenWaitingGate);
+
+    backend.allow_first_response_close.store(true, std::memory_order_release);
+    for (u32 waited = 0;
+         waited < 2000 && backend.first_response_close_gate_state.load(std::memory_order_acquire) ==
+                              GateState::SentOpenWaitingGate;
+         waited++)
+        usleep(1000);
+    REQUIRE_EQ(backend.first_response_close_gate_state.load(std::memory_order_acquire),
+               GateState::ClosedByGate);
+
+    std::vector<char> response(expected_wire.size() + 512u, '\0');
+    u32 response_len = 0;
+    bool saw_eof = false;
+    for (u32 attempt = 0; attempt < 64 && response_len < response.size(); attempt++) {
+        const i32 got = recv_timeout(
+            client.fd, response.data() + response_len, response.size() - response_len, 6000);
+        REQUIRE_GE(got, 0);
+        if (got == 0) {
+            saw_eof = true;
+            break;
+        }
+        response_len += static_cast<u32>(got);
+    }
+    REQUIRE(saw_eof);
+    REQUIRE_EQ(response_len, expected_wire.size());
+    CHECK_FALSE(buf_contains(response.data(), response_len, "502 Origin Failed", 17));
+    CHECK_FALSE(buf_contains(response.data(), response_len, "504 Response Read Deadline", 26));
+    REQUIRE(normalize_public_date(response.data(), response_len));
+    CHECK_EQ(memcmp(response.data(), expected_wire.data(), response_len), 0);
+
+    REQUIRE_EQ(backend.first_response_close_gate_state.load(std::memory_order_acquire),
+               GateState::ClosedByGate);
+    usleep(100000);
+    CHECK_EQ(backend.accepted_count.load(std::memory_order_acquire), 1u);
+    CHECK_EQ(backend.request_count.load(std::memory_order_acquire), 1u);
+}
+
+// Sibling of the test above, exercising the OTHER half of the WAITALL
+// contract: the response-read deadline must still fire (and cancel the
+// pending direct recv) while a WAITALL recv is genuinely blocked waiting for
+// bytes that never arrive, exactly as it did for the provided-buffer path.
+TEST(
+    route,
+    public_ordinary_source_complete_content_length_buffering_large_body_direct_recv_inactivity_emits_pinned_header_only_iouring) {
+    using namespace rut;
+    if (!iouring_socket_live()) SKIP("io_uring async socket ops unavailable in this environment");
+    constexpr u32 kPrefixLen = 20000;
+    constexpr u32 kDeclaredBody = 40000;
+    static_assert(kPrefixLen > ResponseBodyChain::kBulkAfterPlaintext,
+                  "prefix must cross the bulk_after threshold to exercise the direct-recv switch");
+
+    std::vector<char> prefix(kPrefixLen);
+    for (u32 i = 0; i < kPrefixLen; i++) prefix[i] = static_cast<char>('a' + (i % 26));
+    const std::string origin_header =
+        "HTTP/1.1 200 OK\r\n"
+        "Server: origin\r\n"
+        "Date: Tue, 01 Jan 2030 00:00:00 GMT\r\n"
+        "Content-Length: " +
+        std::to_string(kDeclaredBody) + "\r\n\r\n";
+    std::vector<char> origin_wire(origin_header.begin(), origin_header.end());
+    origin_wire.insert(origin_wire.end(), prefix.begin(), prefix.end());
+    const std::string expected_header =
+        "HTTP/1.1 200 OK\r\n"
+        "Server: buffered-test\r\n"
+        "Date: XXXXXXXXXXXXXXXXXXXXXXXXXXXXX\r\n"
+        "Content-Length: " +
+        std::to_string(kDeclaredBody) +
+        "\r\n"
+        "Connection: keep-alive\r\n\r\n";
+
+    RecordingUpstream backend;
+    backend.response = origin_wire.data();
+    backend.response_len = static_cast<u32>(origin_wire.size());
+    // The fixture remains open until RUT retires the timed-out origin —
+    // fixture teardown must not manufacture the terminal disposition.
+    backend.wait_first_response_for_peer_close = true;
+    REQUIRE(backend.setup());
+
+    PublicGetCompleteContentLengthBufferingSourceResources resources;
+    REQUIRE(resources.compile(backend.port));
+    REQUIRE_EQ(resources.rir.module.policy_bundle_count, 1u);
+    CHECK_EQ(resources.rir.module.policy_bundles[0].response_read_timeout_seconds, 1u);
+    CHECK_EQ(resources.rir.module.policy_bundles[0].response_buffering,
+             ForwardResponseBufferingMode::CompleteContentLength);
+
+    Shard<IoUringEventLoop> shard;
+    i32 listen_fd = create_listen_socket(0).value_or(-1);
+    REQUIRE_GE(listen_fd, 0);
+    struct ShardGuard {
+        Shard<IoUringEventLoop>& shard;
+        i32& listen_fd;
+        bool spawned = false;
+        ~ShardGuard() {
+            if (spawned) {
+                shard.stop();
+                shard.join();
+            }
+            shard.shutdown();
+            if (listen_fd >= 0) close(listen_fd);
+        }
+    } shard_guard{shard, listen_fd};
+    const u16 port = get_port(listen_fd);
+    REQUIRE(shard.init(0, listen_fd).has_value());
+    shard.route_config = &resources.cfg;
+    REQUIRE(shard.loop != nullptr);
+    REQUIRE(shard.spawn(-1).has_value());
+    shard_guard.spawned = true;
+    usleep(50000);
+
+    struct ClientGuard {
+        i32 fd;
+        ~ClientGuard() {
+            if (fd >= 0) close(fd);
+        }
+    } client{connect_to(port)};
+    REQUIRE_GE(client.fd, 0);
+    set_socket_timeouts(client.fd, 8);
+    static constexpr char kRequest[] =
+        "GET /buffered?large-inactivity=1 HTTP/1.1\r\n"
+        "Host: client.example\r\n"
+        "X-Test: buffered-large-inactivity\r\n\r\n";
+    REQUIRE(send_all(client.fd, kRequest, sizeof(kRequest) - 1u));
+
+    // The origin sends the prefix (enough to cross the bulk_after threshold
+    // and trigger the pause/cancel switch to a direct WAITALL recv for the
+    // remaining 20000 bytes) and then goes silent without closing: the
+    // WAITALL recv is genuinely pending on bytes that will never arrive.
+    for (u32 waited = 0;
+         waited < 2000 && (!backend.first_response_sent_open.load(std::memory_order_acquire) ||
+                           backend.request_count.load(std::memory_order_acquire) < 1u);
+         waited++)
+        usleep(1000);
+    REQUIRE(backend.first_response_sent_open.load(std::memory_order_acquire));
+    REQUIRE_EQ(backend.accepted_count.load(std::memory_order_acquire), 1u);
+    REQUIRE_EQ(backend.request_count.load(std::memory_order_acquire), 1u);
+
+    char quiet[64];
+    REQUIRE_EQ(recv_timeout(client.fd, quiet, sizeof(quiet), 200), -EAGAIN);
+
+    // The 1s response_read_timeout must still fire and cancel the pending
+    // WAITALL recv — never hang past it waiting for bytes that will not come.
+    std::vector<char> response(1024, '\0');
+    u32 response_len = 0;
+    bool saw_eof = false;
+    const u64 wait_started_ns = monotonic_ns();
+    for (u32 attempt = 0; attempt < 32 && response_len < response.size(); attempt++) {
+        const i32 got = recv_timeout(
+            client.fd, response.data() + response_len, response.size() - response_len, 6000);
+        REQUIRE_GE(got, 0);
+        if (got == 0) {
+            saw_eof = true;
+            break;
+        }
+        response_len += static_cast<u32>(got);
+    }
+    REQUIRE(saw_eof);
+    const double elapsed = static_cast<double>(monotonic_ns() - wait_started_ns) / 1e9;
+    CHECK_LT(elapsed, 6.0);  // bounded by the deadline, not a hang
+
+    REQUIRE_EQ(response_len, expected_header.size());
+    CHECK_FALSE(buf_contains(response.data(), response_len, "502 Origin Failed", 17));
+    CHECK_FALSE(buf_contains(response.data(), response_len, "504 Response Read Deadline", 26));
+    REQUIRE(normalize_public_date(response.data(), response_len));
+    CHECK_EQ(memcmp(response.data(), expected_header.data(), response_len), 0);
+}
+
 TEST(
     route,
     public_ordinary_source_complete_content_length_buffering_fixed_request_policy_incomplete_clean_eof_emits_prefix_and_closes_iouring) {

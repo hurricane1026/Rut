@@ -132,6 +132,51 @@ struct ResponseBodyChain {
         size = 0;
     }
 
+    // --- Direct-recv tail API ---
+    // A direct (buffer-select-free) recv must know its destination and exact
+    // length before arming, unlike append() which learns `len` only once the
+    // kernel copy has already happened. reserve_tail() guarantees the tail
+    // has room for at least one byte — allocating a new node (bulk once the
+    // body has proven larger than `bulk_after`, else a slice) if the current
+    // tail is full or absent — after which write_ptr()/write_avail() name the
+    // destination and commit() records what the kernel wrote there directly.
+    // The reserved node is otherwise ordinary: sent and reclaimed exactly
+    // like one built by append().
+    bool reserve_tail(SlicePool& pool, u32 bulk_after = kBulkAfterPlaintext) {
+        if (tail && payload_capacity(pool, tail) > tail->len) return true;
+        if (owner && owner != &pool) return false;
+        u8* raw = size >= bulk_after ? pool.alloc_bulk() : nullptr;
+        if (!raw) raw = pool.alloc();
+        auto* node = reinterpret_cast<Node*>(raw);
+        if (!node) return false;
+        node->next = nullptr;
+        node->len = node->offset = 0;
+        if (tail)
+            tail->next = node;
+        else
+            head = node;
+        tail = node;
+        owner = &pool;
+        return true;
+    }
+
+    // Valid only after a successful reserve_tail() with no intervening
+    // append()/reserve_tail() failure or consume() of the tail.
+    u8* write_ptr(const SlicePool& pool) const {
+        (void)pool;
+        return tail ? payload(tail) + tail->len : nullptr;
+    }
+    u32 write_avail(const SlicePool& pool) const {
+        return tail ? payload_capacity(pool, tail) - tail->len : 0;
+    }
+
+    // Record bytes a direct recv wrote straight into write_ptr()'s
+    // destination (n <= the write_avail() observed when it was armed).
+    void commit(u32 n) {
+        tail->len += n;
+        size += n;
+    }
+
 private:
     // Payload bytes are only ever written at [0, len), so that is all a
     // bulk node has to re-zero on return.

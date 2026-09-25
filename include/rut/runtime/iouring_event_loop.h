@@ -38,9 +38,9 @@
 namespace rut {
 
 // A bounded one-shot upstream recv may fill the whole upstream receive slice
-// from one dedicated provided buffer.
+// from one dedicated provided buffer. A bulk-sized target instead recvs
+// directly (add_recv_upstream_direct) — no ring, so no matching size assert.
 static_assert(kLargeProvidedBufSize == SlicePool::kSliceSize);
-static_assert(kBulkProvidedBufSize == SlicePool::kBulkSliceSize);
 
 namespace detail {
 
@@ -465,8 +465,12 @@ public:
         timer.init();
         // Reserve six ordinary slices and one complete bounded response chain
         // per admitted connection. TLS input remains separately mmap-backed.
-        auto pooled =
-            pool.init(SlicePool::capacity_for_connections(connection_capacity), pool_prealloc);
+        // Bulk relay buffers (Part D) are reserved per connection too, bounded
+        // by SlicePool::kMaxBulkSlices — only io_uring ever borrows one.
+        auto pooled = pool.init(SlicePool::capacity_for_connections(connection_capacity),
+                                pool_prealloc,
+                                SlicePool::kMaxCachedSlices,
+                                SlicePool::bulk_capacity_for_connections(connection_capacity));
         if (!pooled) {
             backend.shutdown();
             destroy_slot_storage();
@@ -1475,6 +1479,44 @@ public:
             c.upstream_episode,
             c.response_read_deadline_buffering ==
                 ForwardResponseBufferingMode::CompleteContentLength);
+    }
+
+    // Part B (path 3): once a CompleteContentLength body has proven large —
+    // response_body_tail.size crossed the bulk_after threshold — the
+    // remainder recvs straight into the chain's tail node instead of through
+    // the large provided-buffer ring, so a 256 KiB chunk costs one CQE and no
+    // ring-to-buffer copy. Called only from try_deferred_upstream_rearm,
+    // once the multishot recv that settle_response_read_deadline_batch
+    // cancelled to request this has fully drained. Bounds the recv to
+    // exactly the remaining declared body, so — unlike the provided-buffer
+    // path — a direct body recv can never read past the response.
+    //
+    // Armed with MSG_WAITALL: nothing is sent downstream until the whole
+    // body is buffered, so waiting here for the full `len` is semantically
+    // free, and it is what makes the CQE count match the chunk count —
+    // without it, a one-shot recv completes on the first readable skb
+    // (~64 KiB on loopback) well short of a 256 KiB bulk node, turning one
+    // intended chunk back into several. The final chunk's `len` is exactly
+    // the remaining declared bytes (min() below), so WAITALL never waits for
+    // bytes the origin was never going to send; a short origin still
+    // completes it (close/error), never hangs — see add_recv_upstream_direct.
+    [[nodiscard]] bool arm_response_read_direct_body_recv(Connection& c) {
+        if (c.response_read_deadline_post_commit_phase !=
+            ResponseReadDeadlinePostCommitPhase::Buffering)
+            return false;
+        const u32 declared = c.response_read_deadline_post_commit_declared_body;
+        const u32 received = c.response_read_deadline_post_commit_origin_received;
+        if (received >= declared) return false;
+        const u32 remaining = declared - received;
+        const u32 bulk_after = c.tls_active ? ResponseBodyChain::kBulkAfterTls
+                                            : ResponseBodyChain::kBulkAfterPlaintext;
+        if (!c.response_body_tail.reserve_tail(pool, bulk_after)) return false;
+        const u32 avail = c.response_body_tail.write_avail(pool);
+        if (avail == 0) return false;
+        const u32 len = remaining < avail ? remaining : avail;
+        u8* dst = c.response_body_tail.write_ptr(pool);
+        return backend.add_recv_upstream_direct(
+            c.upstream_fd, c.id, c.upstream_episode, dst, len, /*wait_all=*/true);
     }
 
     // Exact one-dispatch witness for a positive terminal upstream Recv.  The
@@ -3292,11 +3334,12 @@ public:
     // The buffer the next relay recv fills: the idle relay buffer, traded for
     // a bulk relay buffer while enough body remains and one is available. The
     // idle buffer is neither being sent (upstream_relay_send_len == 0 is part
-    // of relay eligibility) nor a recv target, so it can be released here.
+    // of relay eligibility) nor a recv target, so it can be released here
+    // regardless of whether a direct recv is currently armed into the
+    // *other* buffer (c.upstream_recv_slice) — they're never the same one.
     u8* take_relay_recv_buffer(Connection& c) {
         u8* idle = c.upstream_relay_slice;
-        if (idle == nullptr || pool.is_bulk(idle) || backend.bulk_buf_ring == nullptr ||
-            c.resp_body_remaining < kBulkRelayMinRemaining)
+        if (idle == nullptr || pool.is_bulk(idle) || c.resp_body_remaining < kBulkRelayMinRemaining)
             return idle;
         u8* bulk = pool.alloc_bulk();
         if (bulk == nullptr) return idle;
@@ -3311,13 +3354,18 @@ public:
     // Serialized body pump (response policies, non-relay owners): trade the
     // upstream recv slice for a bulk relay buffer while a large Content-Length
     // body remains, so the recv accumulates up to 256 KiB between client sends.
-    // Called between sends: nothing reads the slice, and a still-armed recv
-    // only ever lands bytes by copying into whatever buffer is bound when its
-    // CQE is processed, so rebinding here is safe. Buffered bytes move along.
+    // Called between sends: nothing reads the slice, so rebinding is normally
+    // safe. The one exception is a *direct* recv (Part A): its destination is
+    // the exact memory address captured at arm time, so the kernel could
+    // still be writing into `cur` even though no callback reads it — pinning
+    // (upstream_recv_direct_armed) must hold until that recv's terminal CQE
+    // is consumed, so skip the upgrade this cycle rather than rebind live
+    // kernel memory; the next opportunity (or release_upstream_relay_slice)
+    // retries it once the recv is no longer armed direct.
     void upgrade_upstream_recv_to_bulk(Connection& c) {
         u8* cur = c.upstream_recv_slice;
         if (cur == nullptr || pool.is_bulk(cur) || c.resp_body_mode != BodyMode::ContentLength ||
-            c.resp_body_remaining < kBulkRelayMinRemaining)
+            c.resp_body_remaining < kBulkRelayMinRemaining || c.upstream_recv_direct_armed)
             return;
         u8* bulk = pool.alloc_bulk();
         if (bulk == nullptr) return;
@@ -3337,10 +3385,17 @@ public:
             pool.free(c.upstream_relay_slice);
             c.upstream_relay_slice = nullptr;
         }
-        // A still-armed recv copies into whatever buffer is bound when its CQE
-        // is processed, so the swap is safe with one in flight.
+        // A still-armed provided-buffer recv copies into whatever buffer is
+        // bound when its CQE is processed, so the swap is normally safe with
+        // one in flight. A *direct* recv (Part A) is different: it already
+        // targets this exact memory in the kernel, so the buffer must stay
+        // pinned until that recv's terminal CQE is consumed — skip the swap
+        // this boundary rather than free/rebind live kernel memory; an idle
+        // keep-alive connection that stays pinned this way is a correctness
+        // requirement, not just an optimization (see add_recv_upstream_direct).
         u8* bulk = c.upstream_recv_slice;
-        if (!pool.is_bulk(bulk) || c.upstream_recv_buf.len() != 0) return;
+        if (!pool.is_bulk(bulk) || c.upstream_recv_buf.len() != 0 || c.upstream_recv_direct_armed)
+            return;
         u8* s = pool.alloc();
         if (s == nullptr) return;  // keep it; close or the next boundary returns it
         pool.free(bulk);
@@ -3416,17 +3471,31 @@ public:
         }
         const bool one_shot = use_one_shot_upstream_recv(c);
         bool submitted = false;
+        bool direct = false;
         if (one_shot) {
             const u32 available = c.upstream_recv_buf.write_avail();
             if (available == 0) return false;
-            const u32 max_len = backend.upstream_once_max_len();
-            const u32 recv_len = available < max_len ? available : max_len;
-            submitted =
-                backend.add_recv_upstream_once(c.upstream_fd, c.id, c.upstream_episode, recv_len);
+            if (pool.is_bulk(c.upstream_recv_slice)) {
+                // The destination is a bulk relay buffer: recv straight into
+                // it (Part A/B) instead of through a provided-buffer ring, so
+                // a 256 KiB chunk costs one CQE and no ring-to-buffer copy.
+                direct = true;
+                submitted = backend.add_recv_upstream_direct(c.upstream_fd,
+                                                             c.id,
+                                                             c.upstream_episode,
+                                                             c.upstream_recv_buf.write_ptr(),
+                                                             available);
+            } else {
+                const u32 max_len = backend.upstream_once_max_len();
+                const u32 recv_len = available < max_len ? available : max_len;
+                submitted = backend.add_recv_upstream_once(
+                    c.upstream_fd, c.id, c.upstream_episode, recv_len);
+            }
         } else {
             submitted = backend.add_recv_upstream(c.upstream_fd, c.id, c.upstream_episode);
         }
         if (submitted) {
+            c.upstream_recv_direct_armed = direct;
             c.pending_ops++;
             c.upstream_recv_armed = true;
             c.upstream_recv_pause_rearm_pending = false;
@@ -5164,13 +5233,37 @@ public:
                         close_conn(c);
                     continue;
                 }
+                // Part B (path 3): the body has now proven large enough that
+                // a new chain node would be bulk-sized (append()'s own
+                // bulk_after rule). Cancel the still-armed provided-buffer
+                // recv so the remainder can move to a direct one-shot recv
+                // straight into the chain tail instead — see
+                // arm_response_read_direct_body_recv / try_deferred_upstream_rearm,
+                // which arms the replacement once this cancel drains. Once
+                // requested, size only grows, so this never needs to retry.
+                const u32 bulk_after = c.tls_active ? ResponseBodyChain::kBulkAfterTls
+                                                    : ResponseBodyChain::kBulkAfterPlaintext;
+                if (c.upstream_recv_armed && !c.upstream_recv_direct_armed &&
+                    !c.response_read_deadline_want_direct_body &&
+                    c.response_body_tail.size >= bulk_after && pause_upstream_recv_impl(c))
+                    c.response_read_deadline_want_direct_body = true;
                 if (owner.saw_terminal && !c.upstream_recv_armed) {
                     if (c.upstream_recv_pause_cancel_pending ||
-                        c.upstream_recv_pause_rearm_pending || c.upstream_recv_cancel_inflight ||
-                        !add_response_read_recv(c)) {
+                        c.upstream_recv_pause_rearm_pending || c.upstream_recv_cancel_inflight) {
                         close_conn(c);
                         continue;
                     }
+                    // Already large enough for a direct recv (e.g. the recv
+                    // that just terminated on its own, with no cancel
+                    // needed): arm it straight into the chain tail; fall
+                    // back to the ordinary deadline recv otherwise/on failure.
+                    const bool direct = c.response_body_tail.size >= bulk_after &&
+                                        arm_response_read_direct_body_recv(c);
+                    if (!direct && !add_response_read_recv(c)) {
+                        close_conn(c);
+                        continue;
+                    }
+                    c.upstream_recv_direct_armed = direct;
                     c.pending_ops++;
                     c.upstream_recv_armed = true;
                 }
@@ -5529,6 +5622,27 @@ public:
         if (c.close_after_idle_return && kUpstreamRecvDrained) {
             c.close_after_idle_return = false;
             this->free_conn(c);
+            return true;
+        }
+        // Part B (path 3): settle_response_read_deadline_batch cancelled the
+        // live body recv to switch it to a direct one-shot recv into the
+        // chain tail. Both the cancel and the cancelled recv's own terminal
+        // CQE have now drained (kUpstreamRecvDrained), so it's safe to arm
+        // the replacement. A failed direct arm falls back to the ordinary
+        // deadline recv rather than leaving no recv armed at all; only a
+        // failure there is fatal.
+        if (c.response_read_deadline_want_direct_body && kUpstreamRecvDrained) {
+            c.response_read_deadline_want_direct_body = false;
+            if (c.upstream_fd < 0) return true;  // torn down while the cancel drained
+            const bool direct = arm_response_read_direct_body_recv(c);
+            if (!direct && !add_response_read_recv(c)) {
+                close_conn(c);
+                return true;
+            }
+            c.upstream_recv_direct_armed = direct;
+            c.pending_ops++;
+            c.upstream_recv_armed = true;
+            c.upstream_recv_pause_rearm_pending = false;
             return true;
         }
         if (c.upstream_recv_pause_cancel_pending || c.upstream_recv_cancel_inflight ||
