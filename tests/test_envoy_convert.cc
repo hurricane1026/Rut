@@ -544,6 +544,21 @@ std::string routes_scenario_f_json() {
         json_array({cluster_json("exact_backend", 9001), cluster_json("api_backend", 9002)}));
 }
 
+// (g) exact path "/healthz" declared twice, identically, before the
+// catch-all "/". Envoy's first-match semantics make the second occurrence
+// unreachable (the first exact route already resolves "/healthz"), so
+// `build_node_plan` must skip it (Codex round-8 review) instead of emitting
+// a second, dead conditional arm plus a duplicated forwarding policy. Same
+// clusters/targets as scenario (c), so the lowered output must be
+// byte-identical to (c)'s golden.
+std::string routes_scenario_g_json() {
+    return route_list_json(
+        json_array({path_route_json("/healthz", "health_backend"),
+                    path_route_json("/healthz", "health_backend"),
+                    prefix_route_json("/", "backend")}),
+        json_array({cluster_json("backend", 9000), cluster_json("health_backend", 9001)}));
+}
+
 // ── Brute-force equivalence: Envoy first-match vs. the lowered structure ──
 //
 // A route-list model used only by the two independent simulations below (not
@@ -2391,6 +2406,33 @@ TEST(envoy_convert, golden_routes_c_exact_then_root) {
     const Str golden = lit_str(kEnvoyRoutesCGolden);
     REQUIRE_EQ((*lowered).value().len, golden.len);
     CHECK((*lowered).value().view().eq(golden));
+}
+
+// Codex round-8 review: two identical exact routes ("/healthz", "/healthz")
+// before a catch-all ("/") used to duplicate both the conditional arm and
+// its forwarding policy in the emitted root node -- dead weight that could
+// push an otherwise in-budget arm chain past the lexer's token limit. The
+// dedup in `build_node_plan` (`has_exact_arm`, src/envoy/converter.cc) drops
+// the second identical route, so this must lower to the exact same output as
+// scenario (c)'s single "/healthz" + "/" golden, and must stay within the
+// real lexer's token budget (not just the converter's own estimate).
+TEST(envoy_convert, golden_routes_g_duplicate_exact_deduped) {
+    const std::string text = routes_scenario_g_json();
+    static envoy::JsonDocument doc;
+    auto parsed = envoy::parse_bootstrap_json(str(text), doc);
+    REQUIRE(parsed);
+    REQUIRE_EQ(parsed.value().listener.filter_chain.hcm.route_config.virtual_host.routes.len, 3u);
+    const envoy::RutCapabilities all_true{true, true, true};
+    auto lowered = lower_heap(parsed.value(), all_true);
+    REQUIRE(*lowered);
+    const Str golden = lit_str(kEnvoyRoutesCGolden);
+    REQUIRE_EQ((*lowered).value().len, golden.len);
+    CHECK((*lowered).value().view().eq(golden));
+
+    const auto lexed = lex((*lowered).value().view());
+    REQUIRE(lexed);
+    CHECK_EQ(lexed.value().tokens.len, 668u);
+    CHECK_LT(lexed.value().tokens.len, LexedTokens::kMaxTokens);
 }
 
 // Formerly golden (d) ("prefix /api/ only, no catch-all declared"): node

@@ -373,6 +373,17 @@ converter fails closed on the whole configuration until then.
   substring match on the emitted text, not a byte-exact golden) and a root
   with no arms at all, which simply omits `route "/"` and falls through to
   the `unmatched` policy (`root_omitted_without_catch_all_or_exact_arms`). A
+  third still-lowered scenario IS byte-exact: two identical exact routes for
+  the same literal declared back to back before a catch-all (e.g.
+  `/healthz`, `/healthz`, then `/`) used to make `build_node_plan` emit a
+  second, unreachable conditional arm plus a duplicated forwarding policy —
+  dead weight that could push an otherwise in-budget arm chain past the
+  lexer's token limit (Codex round-8 review). `build_node_plan` now tracks
+  exact match texts already emitted for a node (`has_exact_arm`,
+  `src/envoy/converter.cc`) and drops the later duplicate, so this shape
+  lowers to output byte-identical to scenario (c)'s golden
+  (`golden_routes_g_duplicate_exact_deduped`), reusing
+  `tests/fixtures/envoy_routes_c.inc` rather than adding a fourth fixture. A
   brute-force test separately compares Envoy's real first-match semantics
   against an independent reimplementation of the "longest node, then arm
   chain" structure over ~40 probe paths. The lex/parse/analyze/MIR/RIR

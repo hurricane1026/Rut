@@ -466,6 +466,22 @@ u32 cluster_index_of(const Bootstrap& model, Str name) {
                                 // route's cluster is checked in `validate`.
 }
 
+// True when `arms` already holds a conditional exact arm (`is_terminal ==
+// false`, `exact_match == true`) whose compare text equals `text`. Envoy's
+// first-match semantics make a later route with an identical exact path
+// unreachable; Codex round-8 review found that without this check,
+// `build_node_plan` still appended a second, dead conditional arm (plus its
+// own duplicated forwarding policy) for a repeated exact route, which could
+// push an otherwise in-budget arm chain past the lexer's token limit.
+bool has_exact_arm(const RouteArms& arms, Str text) {
+    for (u32 i = 0; i < arms.len; i++) {
+        if (!arms[i].is_terminal && arms[i].exact_match && arms[i].compare_text.eq(text)) {
+            return true;
+        }
+    }
+    return false;
+}
+
 // Builds one node's arm chain (see the algorithm comment above).
 // `needs_exact_fallback` would be set when the chain's last arm had its
 // condition dropped with no earlier exact arm covering the node's own
@@ -511,6 +527,11 @@ FrontendResult<NodePlanResult> build_node_plan(
                 RouteArm arm{};
                 arm.cluster_index = cluster_index;
                 if (!saw_own_prefix) {
+                    // A repeat of this node's own exact route is unreachable
+                    // under Envoy's first-match semantics (an earlier
+                    // identical arm already resolves it); drop it instead of
+                    // emitting a dead duplicate arm and forwarding policy.
+                    if (has_exact_arm(result.arms, q)) continue;
                     arm.exact_match = true;
                     arm.compare_text = q;
                     if (!result.arms.push(arm))
@@ -525,6 +546,11 @@ FrontendResult<NodePlanResult> build_node_plan(
                 return result;  // resolved
             }
             if (saw_own_prefix) continue;  // dead: path == node_text already excluded
+            // Same dedup as above, for an exact route other than the node's
+            // own literal (e.g. two identical "/api/x" routes owned by node
+            // "/api"): the later one is unreachable, so drop it rather than
+            // duplicating the arm and its forwarding policy.
+            if (has_exact_arm(result.arms, q)) continue;
             RouteArm arm{};
             arm.exact_match = true;
             arm.compare_text = q;
