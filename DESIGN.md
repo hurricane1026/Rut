@@ -1976,10 +1976,13 @@ through unchanged); a `Connection` nomination of `te` is exempt from the
 generic nomination drop -- the `te`/`trailers` handling above decides its
 fate instead, matching Envoy's own `sanitizeConnectionHeader` special case;
 and appends `x-forwarded-proto: http` as the last header only when the
-client did not already send one with a non-empty, non-OWS-only value (an
-empty or OWS-only client-supplied field is dropped and treated as absent,
-not forwarded as a blank scheme; a non-empty client-supplied value is kept
-unchanged, in its original position). It is closed to ordinary
+client did not already send one whose trimmed value is a syntactically
+valid scheme (case-insensitively exactly `http` or `https`, matching
+Envoy's own `Utility::schemeIsValid`; an empty, OWS-only, or otherwise
+invalid client-supplied field, such as `http,https`, is dropped and treated
+as absent, not forwarded as a blank or malformed scheme; a valid
+client-supplied value is kept unchanged, in its original position, without
+case normalization). It is closed to ordinary
 zero-copy-shaped forwards: a request with a body paired with a client
 `Expect` header, or with `Transfer-Encoding`, fails closed rather than
 proxying with ambiguous framing (no `100 Continue` interim-response support

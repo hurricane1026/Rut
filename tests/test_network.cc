@@ -3879,6 +3879,53 @@ TEST(request_policy, preserve_host_lowercase_wire_and_fail_closed_host) {
     CHECK_FALSE(apply_request_policy(conn, endpoint, kPreserveHost));
     CHECK_EQ(conn.send_buf.len(), 0u);
 
+    // An empty or OWS-only Expect field carries no expectation at all (the
+    // only defined expect-value is "100-continue"), so it must not trip the
+    // unsupported interim-response rejection above: it is admitted exactly
+    // like a request with no Expect header, and the field is still stripped
+    // like any other Expect field (Codex round-9 review).
+    prepare(
+        "POST /expect-empty-cl0 HTTP/1.1\r\n"
+        "Host: client.example\r\n"
+        "Content-Length: 0\r\n"
+        "Expect:\r\n\r\n");
+    REQUIRE(apply_request_policy(conn, endpoint, kPreserveHost));
+    require_wire(
+        "POST /expect-empty-cl0 HTTP/1.1\r\nhost: client.example\r\ncontent-length: 0\r\n"
+        "x-forwarded-proto: http\r\n\r\n");
+
+    prepare(
+        "POST /expect-ows-cl0 HTTP/1.1\r\n"
+        "Host: client.example\r\n"
+        "Content-Length: 0\r\n"
+        "Expect:   \r\n\r\n");
+    REQUIRE(apply_request_policy(conn, endpoint, kPreserveHost));
+    require_wire(
+        "POST /expect-ows-cl0 HTTP/1.1\r\nhost: client.example\r\ncontent-length: 0\r\n"
+        "x-forwarded-proto: http\r\n\r\n");
+
+    // Same admission for a request that carries an actual body, not just
+    // `Content-Length: 0`.
+    prepare(
+        "POST /expect-empty-body HTTP/1.1\r\n"
+        "Host: client.example\r\n"
+        "Content-Length: 4\r\n"
+        "Expect:\r\n\r\nabcd");
+    REQUIRE(apply_request_policy(conn, endpoint, kPreserveHost));
+    require_wire(
+        "POST /expect-empty-body HTTP/1.1\r\nhost: client.example\r\ncontent-length: 4\r\n"
+        "x-forwarded-proto: http\r\n\r\nabcd");
+
+    prepare(
+        "POST /expect-ows-body HTTP/1.1\r\n"
+        "Host: client.example\r\n"
+        "Content-Length: 4\r\n"
+        "Expect:   \r\n\r\nabcd");
+    REQUIRE(apply_request_policy(conn, endpoint, kPreserveHost));
+    require_wire(
+        "POST /expect-ows-body HTTP/1.1\r\nhost: client.example\r\ncontent-length: 4\r\n"
+        "x-forwarded-proto: http\r\n\r\nabcd");
+
     // Fail closed: a Connection token nominates Content-Length itself. No
     // upstream bytes touched — dropping the framing header while still
     // forwarding the already-validated body would desync a persistent
@@ -4407,6 +4454,46 @@ TEST(request_policy, preserve_host_lowercase_wire_and_fail_closed_host) {
     require_wire(
         "GET /xfp-ows-only HTTP/1.1\r\nhost: client.example\r\n"
         "x-forwarded-proto: http\r\n\r\n");
+
+    // A non-empty but syntactically invalid scheme (not case-insensitively
+    // "http" or "https") is treated exactly like an absent value: Envoy's
+    // own `Utility::schemeIsValid` (source/common/http/utility.cc, v1.39.1)
+    // rejects it and `getScheme` falls back to the connection-derived
+    // default instead of forwarding the malformed value (Codex round-9
+    // review).
+    prepare(
+        "GET /xfp-comma-list HTTP/1.1\r\n"
+        "Host: client.example\r\n"
+        "X-Forwarded-Proto: http,https\r\n\r\n");
+    REQUIRE(apply_request_policy(conn, endpoint, kPreserveHost));
+    require_wire(
+        "GET /xfp-comma-list HTTP/1.1\r\nhost: client.example\r\n"
+        "x-forwarded-proto: http\r\n\r\n");
+
+    // A syntactically valid but non-scheme token is likewise absent.
+    prepare(
+        "GET /xfp-ftp HTTP/1.1\r\n"
+        "Host: client.example\r\n"
+        "X-Forwarded-Proto: ftp\r\n\r\n");
+    REQUIRE(apply_request_policy(conn, endpoint, kPreserveHost));
+    require_wire(
+        "GET /xfp-ftp HTTP/1.1\r\nhost: client.example\r\n"
+        "x-forwarded-proto: http\r\n\r\n");
+
+    // A valid scheme is forwarded as the client sent it: `schemeIsValid` is
+    // case-insensitive ("HTTPS" is valid), and unlike the internal `:scheme`
+    // pseudo-header Envoy normalizes to lowercase, the literal
+    // `x-forwarded-proto` wire header Envoy actually sends upstream is left
+    // untouched when already present, so this profile does not
+    // case-normalize it either.
+    prepare(
+        "GET /xfp-valid-https-mixed-case HTTP/1.1\r\n"
+        "Host: client.example\r\n"
+        "X-Forwarded-Proto: HTTPS\r\n\r\n");
+    REQUIRE(apply_request_policy(conn, endpoint, kPreserveHost));
+    require_wire(
+        "GET /xfp-valid-https-mixed-case HTTP/1.1\r\nhost: client.example\r\n"
+        "x-forwarded-proto: HTTPS\r\n\r\n");
 }
 
 TEST(request_policy, content_length_after_host_wait_and_rejection_never_touch_upstream) {
@@ -49254,7 +49341,8 @@ TEST(response_read_deadline_fixed_upload_head_activation,
                 config.response_policies[bundle.response_policy_id - 1],
                 config.failure_policies[bundle.failure_policy_id - 1],
                 config.failure_policies[bundle.timeout_failure_policy_id - 1],
-                bundle.response_buffering);
+                bundle.response_buffering,
+                conn->request_policy_id);
             CHECK_EQ(profile, ResponseReadDeadlineProfile::FixedContentLengthUploadHeaderOnlyHead);
             CHECK(conn->response_read_deadline_owner_is_neutral());
             CHECK_EQ(conn->req_body_remaining, 12u - body_len);
@@ -49572,7 +49660,8 @@ TEST(response_read_deadline_fixed_upload_head_activation,
             config.response_policies[bundle.response_policy_id - 1],
             config.failure_policies[bundle.failure_policy_id - 1],
             config.failure_policies[bundle.timeout_failure_policy_id - 1],
-            bundle.response_buffering);
+            bundle.response_buffering,
+            conn->request_policy_id);
         CHECK_EQ(profile, ResponseReadDeadlineProfile::None);
         CHECK(conn->response_read_deadline_owner_is_neutral());
         CHECK_EQ(conn->upstream_fd, -1);
@@ -67776,6 +67865,162 @@ TEST(state_invariant, jit_forward_direct_paired_head_connect_submit_serializes_n
     CHECK_EQ(send_len, static_cast<u32>(sizeof(kExpected) - 1));
     CHECK_EQ(memcmp(normalized, kExpected, sizeof(kExpected) - 1), 0);
     CHECK(c->keep_alive);
+    close(fds[1]);
+    loop.close_conn(*c);
+}
+
+// Codex round-9 review, PR #696: the paired-HEAD suppress_body preflight
+// (`response_policy_suppress_head_admitted`) must validate the Host
+// authority with the same grammar the route's request policy will actually
+// use to materialize the request, or it can reject a shape the serializer
+// itself accepts. ID4 (Http11PreserveHostLowercase, `host: "preserve"`)
+// forwards the client's Host verbatim and validates it with the
+// Envoy-compatible `request_policy_host_authority_is_valid` grammar, which
+// -- unlike the legacy grammar the fixed-upstream-Host policies use --
+// admits an IPv6 literal authority such as `[::1]`. A HEAD route pairing
+// ID4 with `head_mode: "suppress_body"` response/failure policies is
+// exactly the shape `put_forward_route` (src/envoy/converter.cc) emits.
+TEST(state_invariant, jit_forward_direct_paired_head_id4_admits_ipv6_literal_host) {
+    RouteConfig cfg;
+    auto upstream = cfg.add_upstream("api", 0x7F000001, 9000);
+    REQUIRE(upstream.has_value());
+    cfg.upstreams[upstream.value()].max_inflight = 1;
+
+    static constexpr char kBody[] =
+        "<html>\r\n<head><title>502 Bad Gateway</title></head>\r\n<body>\r\n"
+        "<center><h1>502 Bad Gateway</h1></center>\r\n"
+        "<hr><center>nginx/1.29.7</center>\r\n</body>\r\n</html>\r\n";
+    static_assert(sizeof(kBody) - 1 == 157);
+    ForwardResponsePolicySpec response{};
+    response.version = ResponsePolicyVersion::Http11;
+    response.framing = ResponsePolicyFraming::ContentLength;
+    response.connection = ResponsePolicyConnection::Request;
+    response.date = ResponsePolicyDate::Current;
+    response.head_mode = ResponsePolicyHeadMode::SuppressBody;
+    response.server = {"nginx/1.29.7", 12};
+    REQUIRE_EQ(cfg.add_response_policy(response), 1u);
+
+    ForwardFailurePolicySpec failure{};
+    failure.version = ForwardFailurePolicyVersion::Http11;
+    failure.status_code = 502;
+    failure.date = ForwardFailurePolicyDate::Current;
+    failure.connection = ForwardFailurePolicyConnection::Request;
+    failure.head_mode = FailurePolicyHeadMode::SuppressBody;
+    failure.reason = {"Bad Gateway", 11};
+    failure.content_type = {"text/html", 9};
+    failure.server = {"nginx/1.29.7", 12};
+    failure.body = {kBody, sizeof(kBody) - 1};
+    REQUIRE_EQ(cfg.add_failure_policy(failure), 1u);
+
+    SmallLoop loop;
+    loop.setup();
+    int fds[2];
+    REQUIRE(socketpair(AF_UNIX, SOCK_STREAM, 0, fds) == 0);
+    ScopedFakeSocket fake_socket(fds[0]);
+    loop.inject_and_dispatch(make_ev(0, IoEventType::Accept, 42));
+    auto* c = loop.find_fd(42);
+    REQUIRE(c != nullptr);
+    c->request_config = &cfg;
+    static constexpr char kRequest[] = "HEAD /missing?q=1 HTTP/1.1\r\nHost: [::1]\r\n\r\n";
+    REQUIRE_EQ(c->recv_buf.write(reinterpret_cast<const u8*>(kRequest), sizeof(kRequest) - 1),
+               sizeof(kRequest) - 1);
+    capture_request_metadata(*c);
+    c->req_initial_send_len = c->recv_buf.len();
+    c->keep_alive = true;
+
+    JitDispatchOutcome outcome{};
+    outcome.kind = JitDispatchOutcome::Kind::Forward;
+    outcome.upstream_id = upstream.value();
+    outcome.request_policy_id = static_cast<u16>(RequestPolicyId::Http11PreserveHostLowercase);
+    outcome.response_policy_id = 1;
+    outcome.failure_policy_id = 1;
+    loop.backend.clear_ops();
+    loop.backend.fail_connect = true;
+    handle_jit_outcome<SmallLoop>(&loop, *c, outcome, nullptr, true);
+
+    // Admitted, not a 400 preflight rejection: the paired 502 failure
+    // response (rather than the generic 400 `reject_response_policy` shape)
+    // proves `response_policy_suppress_head_admitted` accepted the IPv6
+    // literal Host and let the request proceed to the (here, injected)
+    // failed connect attempt.
+    CHECK_EQ(c->failure_policy_id, 1u);
+    CHECK(c->failure_policy_suppress_body);
+    CHECK_EQ(c->resp_status, kStatusBadGateway);
+    CHECK_EQ(c->state, ConnState::Sending);
+    CHECK_EQ(loop.backend.count_ops(MockOp::Connect), 0u);
+    CHECK_EQ(loop.backend.count_ops(MockOp::Send), 1u);
+    close(fds[1]);
+    loop.close_conn(*c);
+}
+
+// The legacy (non-ID4) authority grammar is unchanged: a fixed-upstream-Host
+// policy (ID1, `host: "upstream"`) never forwards the client's Host, and
+// this preflight keeps rejecting an IPv6-literal-shaped `Host` for it
+// exactly as before.
+TEST(state_invariant, jit_forward_direct_paired_head_non_id4_still_rejects_ipv6_literal_host) {
+    RouteConfig cfg;
+    auto upstream = cfg.add_upstream("api", 0x7F000001, 9000);
+    REQUIRE(upstream.has_value());
+    cfg.upstreams[upstream.value()].max_inflight = 1;
+
+    static constexpr char kBody[] =
+        "<html>\r\n<head><title>502 Bad Gateway</title></head>\r\n<body>\r\n"
+        "<center><h1>502 Bad Gateway</h1></center>\r\n"
+        "<hr><center>nginx/1.29.7</center>\r\n</body>\r\n</html>\r\n";
+    static_assert(sizeof(kBody) - 1 == 157);
+    ForwardResponsePolicySpec response{};
+    response.version = ResponsePolicyVersion::Http11;
+    response.framing = ResponsePolicyFraming::ContentLength;
+    response.connection = ResponsePolicyConnection::Request;
+    response.date = ResponsePolicyDate::Current;
+    response.head_mode = ResponsePolicyHeadMode::SuppressBody;
+    response.server = {"nginx/1.29.7", 12};
+    REQUIRE_EQ(cfg.add_response_policy(response), 1u);
+
+    ForwardFailurePolicySpec failure{};
+    failure.version = ForwardFailurePolicyVersion::Http11;
+    failure.status_code = 502;
+    failure.date = ForwardFailurePolicyDate::Current;
+    failure.connection = ForwardFailurePolicyConnection::Request;
+    failure.head_mode = FailurePolicyHeadMode::SuppressBody;
+    failure.reason = {"Bad Gateway", 11};
+    failure.content_type = {"text/html", 9};
+    failure.server = {"nginx/1.29.7", 12};
+    failure.body = {kBody, sizeof(kBody) - 1};
+    REQUIRE_EQ(cfg.add_failure_policy(failure), 1u);
+
+    SmallLoop loop;
+    loop.setup();
+    int fds[2];
+    REQUIRE(socketpair(AF_UNIX, SOCK_STREAM, 0, fds) == 0);
+    ScopedFakeSocket fake_socket(fds[0]);
+    loop.inject_and_dispatch(make_ev(0, IoEventType::Accept, 42));
+    auto* c = loop.find_fd(42);
+    REQUIRE(c != nullptr);
+    c->request_config = &cfg;
+    static constexpr char kRequest[] = "HEAD /missing?q=1 HTTP/1.1\r\nHost: [::1]\r\n\r\n";
+    REQUIRE_EQ(c->recv_buf.write(reinterpret_cast<const u8*>(kRequest), sizeof(kRequest) - 1),
+               sizeof(kRequest) - 1);
+    capture_request_metadata(*c);
+    c->req_initial_send_len = c->recv_buf.len();
+    c->keep_alive = true;
+
+    JitDispatchOutcome outcome{};
+    outcome.kind = JitDispatchOutcome::Kind::Forward;
+    outcome.upstream_id = upstream.value();
+    outcome.request_policy_id = static_cast<u16>(RequestPolicyId::Http11FixedStrip);
+    outcome.response_policy_id = 1;
+    outcome.failure_policy_id = 1;
+    loop.backend.clear_ops();
+    loop.backend.fail_connect = true;
+    handle_jit_outcome<SmallLoop>(&loop, *c, outcome, nullptr, true);
+
+    // Not admitted: the generic 400 preflight rejection, not the paired 502
+    // failure shape -- the legacy grammar still rejects the IPv6 literal for
+    // every non-ID4 policy.
+    CHECK_EQ(c->resp_status, 400u);
+    CHECK_EQ(loop.backend.count_ops(MockOp::Connect), 0u);
+    CHECK_EQ(loop.backend.count_ops(MockOp::Send), 1u);
     close(fds[1]);
     loop.close_conn(*c);
 }

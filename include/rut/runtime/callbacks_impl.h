@@ -946,13 +946,15 @@ inline bool forward_policy_head_modes_compatible(const RouteConfig& config,
                                                  u16 timeout_failure_policy_id = 0);
 inline bool response_policy_suppress_head_admitted(const Connection& conn,
                                                    const ForwardResponsePolicySpec& policy,
-                                                   bool paired_failure);
+                                                   bool paired_failure,
+                                                   u16 request_policy_id);
 inline ResponseReadDeadlineProfile classify_response_read_deadline_profile(
     const Connection& conn,
     const ForwardResponsePolicySpec& response,
     const ForwardFailurePolicySpec& failure,
     const ForwardFailurePolicySpec& timeout,
-    ForwardResponseBufferingMode buffering);
+    ForwardResponseBufferingMode buffering,
+    u16 request_policy_id);
 inline bool build_timeout_failure_policy_response(const Connection& conn,
                                                   const RouteConfig& config,
                                                   bool suppress_body,
@@ -1233,7 +1235,7 @@ bool prepare_response_read_deadline_preflight_for_mode(Loop* loop,
         const auto& failure = config->failure_policies[bundle.failure_policy_id - 1];
         const auto& timeout = config->failure_policies[bundle.timeout_failure_policy_id - 1];
         const ResponseReadDeadlineProfile profile = classify_response_read_deadline_profile(
-            conn, response, failure, timeout, bundle.response_buffering);
+            conn, response, failure, timeout, bundle.response_buffering, conn.request_policy_id);
         const bool fixed_upload = response_read_deadline_profile_is_fixed_upload(profile);
         const bool header_only_head_explicit_close =
             profile == ResponseReadDeadlineProfile::HeaderOnlyHead &&
@@ -3655,7 +3657,8 @@ void handle_jit_outcome(Loop* loop,
                         config->response_policies[forward_response_policy_id - 1],
                         config->failure_policies[forward_failure_policy_id - 1],
                         config->failure_policies[forward_timeout_failure_policy_id - 1],
-                        forward_response_buffering);
+                        forward_response_buffering,
+                        outcome.request_policy_id);
                 }
                 staged_fixed_head_continuation =
                     outcome_profile == ResponseReadDeadlineProfile::None &&
@@ -4047,7 +4050,8 @@ void handle_jit_outcome(Loop* loop,
                 response_policy_suppress_head_admitted(
                     conn,
                     config->response_policies[forward_response_policy_id - 1],
-                    forward_failure_policy_id != 0);
+                    forward_failure_policy_id != 0,
+                    outcome.request_policy_id);
             if (fixed_upload_head_admitted) {
                 suppress_body_head = true;
             }
@@ -5644,7 +5648,23 @@ inline RequestPolicyBodyState inspect_request_policy_body(const Connection& conn
             connection_nominates_upgrade |=
                 request_policy_comma_value_has_token(value_start, value_end, "upgrade", 7);
         }
-        has_expect |= request_policy_name_eq(hs, name_len, "expect", 6);
+        // An empty or OWS-only `Expect` field carries no expectation at all
+        // (RFC 9110 defines only the "100-continue" expect-value; an empty
+        // string is not it), so it must not gate this fixed-length body's
+        // admission below -- the serializer already strips every `Expect`
+        // field via `drop_fixed` regardless of value, so this harmless shape
+        // (most commonly paired with `Content-Length: 0`) has nothing left
+        // to negotiate and should be admitted exactly like a request with no
+        // `Expect` header at all, rather than forced into the unsupported
+        // 100-continue interim-response path. Base admission on a
+        // semantically present value (non-empty once trimmed), not raw
+        // field-name presence (Codex round-9 review, PR #696).
+        if (request_policy_name_eq(hs, name_len, "expect", 6)) {
+            const u8* expect_value_start = colon + 1;
+            const u8* expect_value_end = le;
+            request_policy_trim_ows(expect_value_start, expect_value_end);
+            has_expect |= expect_value_start != expect_value_end;
+        }
         has_upgrade |= request_policy_name_eq(hs, name_len, "upgrade", 7);
         hs = le + 2;
     }
@@ -5727,10 +5747,13 @@ inline RequestPolicyBodyState inspect_request_policy_body(const Connection& conn
 // `x-forwarded-client-cert`, and `x-envoy-external-address`; see
 // `request_policy_is_stripped_client_envoy_header` above), and appends
 // `x-forwarded-proto: http` as the last header when the client did not
-// already supply one with a non-empty, non-OWS-only value (a client-supplied
-// empty or OWS-only field is dropped and treated the same as absent, rather
-// than forwarding a blank scheme; a non-empty client-supplied value passes
-// through unchanged, in its original position). Fails closed with no upstream bytes
+// already supply one whose trimmed value is a syntactically valid scheme
+// (case-insensitively exactly "http" or "https", matching Envoy's own
+// `Utility::schemeIsValid`; a client-supplied field that is empty, OWS-only,
+// or any other non-scheme value such as "http,https" is dropped and treated
+// the same as absent, rather than forwarding a blank or malformed scheme; a
+// valid client-supplied value passes through unchanged, in its original
+// position, without case normalization). Fails closed with no upstream bytes
 // touched unless exactly one non-empty Host header is present. A
 // body-carrying request with a client `Expect` header is also outside this
 // profile's admitted shape today: `inspect_request_policy_body` rejects any
@@ -5994,18 +6017,32 @@ inline bool apply_preserve_host_lowercase_request_policy(Connection& conn, u16 p
             // right outcome; exclude it here and let that existing
             // canonicalization decide instead.
             const bool drop_nominated = !is_te && name_nominated(hs, name_len);
-            // An empty or OWS-only X-Forwarded-Proto value carries no usable
+            // A syntactically invalid X-Forwarded-Proto value -- empty/OWS-only,
+            // or any non-empty value that is not (case-insensitively) exactly
+            // "http" or "https" (e.g. "http,https", "ftp") -- carries no usable
             // scheme. Envoy's own `getScheme` (source/common/http/
-            // conn_manager_utility.cc) treats exactly this shape as invalid
-            // (`Utility::schemeIsValid` rejects the empty string) and falls
-            // back to the connection-derived default instead of forwarding
-            // it; emitting a blank `x-forwarded-proto:` field here would
-            // instead hand origins that use this header for redirects or
-            // security decisions an empty scheme, and would also suppress
-            // the trailing synthesized default below by leaving `saw_xfp`
-            // set. Drop the empty field and let the fallback fire.
-            const bool drop_empty_xfp = is_xfp && value_start == value_end;
-            if (!drop_fixed && !drop_te && !drop_nominated && !drop_empty_xfp) {
+            // conn_manager_utility.cc, v1.39.1) applies `Utility::schemeIsValid`
+            // (`schemeIsHttp(v) || schemeIsHttps(v)`, both case-insensitive
+            // `absl::EqualsIgnoreCase` compares against exactly "http"/"https",
+            // so e.g. "HTTPS" is valid but "http,https" is not) to the whole
+            // trimmed field value and falls back to the connection-derived
+            // default instead of forwarding it when validation fails.
+            // Forwarding the malformed value verbatim here would instead hand
+            // origins that use this header for redirects or security decisions
+            // an attacker-controlled, non-scheme value; treat any value that
+            // fails this check the same as an absent header (drop the field
+            // and let the trailing synthesized default fire below by leaving
+            // `saw_xfp` unset) rather than failing the request closed. A valid
+            // value is forwarded as the client sent it (Envoy's own literal
+            // `x-forwarded-proto` header text is untouched when already
+            // present; only the internal `:scheme` pseudo-header is
+            // lowercased), not case-normalized.
+            const u32 xfp_value_len = static_cast<u32>(value_end - value_start);
+            const bool xfp_scheme_valid =
+                is_xfp && (request_policy_name_eq(value_start, xfp_value_len, "http", 4) ||
+                           request_policy_name_eq(value_start, xfp_value_len, "https", 5));
+            const bool drop_invalid_xfp = is_xfp && !xfp_scheme_valid;
+            if (!drop_fixed && !drop_te && !drop_nominated && !drop_invalid_xfp) {
                 if (is_cl) {
                     if (!append_lit("content-length: ", 16) || !append_dec(body_len) ||
                         !append_lit("\r\n", 2))
@@ -9311,7 +9348,8 @@ inline bool forward_policy_head_modes_compatible(const RouteConfig& config,
 
 inline bool response_policy_suppress_head_admitted(const Connection& conn,
                                                    const ForwardResponsePolicySpec& policy,
-                                                   bool paired_failure) {
+                                                   bool paired_failure,
+                                                   u16 request_policy_id) {
     // This is intentionally the complete bounded HEAD domain. Response-only
     // suppression keeps its original explicit-close shape. A paired failure
     // policy additionally admits the ordinary HTTP/1.1 default keep-alive
@@ -9384,8 +9422,32 @@ inline bool response_policy_suppress_head_admitted(const Connection& conn,
         }
         return true;
     };
-    if (paired_failure && (host_count != 1 || connection_count > 1 || host == nullptr ||
-                           !valid_authority(host->value)))
+    // ID4 (`host: "preserve"`) forwards the client's Host authority verbatim
+    // and validates it with the Envoy-compatible `HeaderUtility::
+    // authorityIsValid`-derived grammar (`request_policy_host_authority_is_valid`
+    // above), which -- unlike the legacy `valid_authority` closure above,
+    // written for the fixed-upstream-Host policies that never see an IPv6
+    // literal -- admits `[`/`]` and the extra colon an IPv6 literal or its
+    // port suffix requires (e.g. `Host: [::1]`). This preflight must accept
+    // exactly the same authorities the ID4 serializer (`apply_preserve_host_
+    // lowercase_request_policy`) will later admit, or a route pairing ID4
+    // with `head_mode: "suppress_body"` response/failure policies -- the
+    // exact shape `put_forward_route` emits -- would 400 a request the
+    // serializer itself accepts and forwards (Codex round-9 review, PR
+    // #696). Non-ID4 policies keep the legacy grammar unchanged. `conn.
+    // request_policy_id` is not yet committed at this preflight's call sites
+    // (it is written only once the request policy actually materializes),
+    // so the caller passes the route's intended request policy id in
+    // explicitly rather than reading a not-yet-set `conn` field.
+    const bool authority_ok =
+        host != nullptr &&
+        (request_policy_preserves_host(request_policy_id)
+             ? (host->value.len != 0 &&
+                request_policy_host_authority_is_valid(reinterpret_cast<const u8*>(host->value.ptr),
+                                                       host->value.len))
+             : valid_authority(host->value));
+    if (paired_failure &&
+        (host_count != 1 || connection_count > 1 || host == nullptr || !authority_ok))
         return false;
     const bool explicit_close_shape =
         !conn.req_client_keep_alive && conn.req_client_connection_close &&
@@ -9415,7 +9477,8 @@ inline ResponseReadDeadlineProfile classify_response_read_deadline_profile(
     const ForwardResponsePolicySpec& response,
     const ForwardFailurePolicySpec& failure,
     const ForwardFailurePolicySpec& timeout,
-    ForwardResponseBufferingMode buffering) {
+    ForwardResponseBufferingMode buffering,
+    u16 request_policy_id) {
     const bool common = response.version == ResponsePolicyVersion::Http11 &&
                         response.framing == ResponsePolicyFraming::ContentLength &&
                         response.connection == ResponsePolicyConnection::Request &&
@@ -9429,7 +9492,8 @@ inline ResponseReadDeadlineProfile classify_response_read_deadline_profile(
     if (response.head_mode == ResponsePolicyHeadMode::SuppressBody &&
         failure.head_mode == FailurePolicyHeadMode::SuppressBody &&
         timeout.head_mode == FailurePolicyHeadMode::SuppressBody &&
-        response_policy_suppress_head_admitted(conn, response, /*paired_failure=*/true))
+        response_policy_suppress_head_admitted(
+            conn, response, /*paired_failure=*/true, request_policy_id))
         return ResponseReadDeadlineProfile::HeaderOnlyHead;
 
     // A positive Content-Length HEAD request still has to be uploaded in full
