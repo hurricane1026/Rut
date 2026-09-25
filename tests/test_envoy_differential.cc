@@ -3890,6 +3890,18 @@ bool self_test_allocate_distinct_ports_exhaustion() {
 // fixed canned reply, so the test can exercise probe_confirms_envoy_
 // ownership()'s two outcomes (a matching reply vs. a non-matching one)
 // without a real Envoy.
+//
+// Deliberately does NOT close an accepted connection right after replying:
+// neither the canned reply nor the probe's request carries `Connection:
+// close`, so a real HTTP/1.1 peer -- including the real Envoy this fake
+// stands in for -- leaves it open. read_http_message()'s persistence checks
+// (round-6/7/8 reviews on this file: reject trailing bytes, an EOF, or a
+// reset on a response that never advertised close) correctly tell such an
+// early close apart from a well-behaved persistent peer; closing immediately
+// here would make every probe against this fake look like exactly the kind
+// of broken persistence those checks exist to catch, rather than the
+// well-formed-vs-malformed-reply distinction this fake is actually for.
+// Every accepted connection is instead tracked and closed from stop().
 class FakeReplyListener {
 public:
     bool adopt(int listen_fd, std::string reply) {
@@ -3909,6 +3921,12 @@ public:
         }
         if (thread_.joinable()) thread_.join();
         listen_fd_ = -1;
+        std::vector<int> fds;
+        {
+            std::lock_guard<std::mutex> lock(mu_);
+            fds.swap(accepted_fds_);
+        }
+        for (const int fd : fds) close(fd);
     }
 
     ~FakeReplyListener() { stop(); }
@@ -3928,11 +3946,14 @@ private:
             pollfd pfd{fd, POLLIN, 0};
             if (poll(&pfd, 1, 50) > 0) recv(fd, discard, sizeof(discard), MSG_DONTWAIT);
             send_all(fd, reply_);
-            close(fd);
+            std::lock_guard<std::mutex> lock(mu_);
+            accepted_fds_.push_back(fd);
         }
     }
 
     int listen_fd_ = -1;
+    std::mutex mu_;
+    std::vector<int> accepted_fds_;
     std::string reply_;
     std::atomic<bool> stopping_{false};
     std::thread thread_;
