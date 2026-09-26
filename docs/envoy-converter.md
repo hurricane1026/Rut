@@ -286,10 +286,19 @@ folded into the golden below and into the parser/converter implementation:
    must be written `listen :8080`; a non-wildcard IPv4 listener is still
    `listen a.b.c.d:port`.
 2. `request_policy.strip_headers` accepts exactly the closed list
-   `["Connection", "Keep-Alive", "TE", "Expect", "Upgrade"]` today, plus
-   `"Proxy-Connection"` once the `host: "preserve"` capability
-   (`request_envoy_h1`) is admitted. `"Transfer-Encoding"` is rejected in
-   every combination the converter uses; it is dropped from the lowering.
+   `["Connection", "Keep-Alive", "TE", "Expect", "Upgrade"]` with
+   `host: "upstream"`, or exactly the six-name list adding
+   `"Proxy-Connection"` with `host: "preserve"` (the `request_envoy_h1`
+   capability, landed in PR3). `"Transfer-Encoding"` is rejected in every
+   combination the converter uses; it is dropped from the lowering. The
+   `"TE"` entry does not mean "always strip": per the Envoy oracle
+   (`tests/fixtures/envoy_oracle_milestone_s.inc`) and Envoy's own
+   `sanitizeConnectionHeader`, `host: "preserve"` keeps a client `te` field
+   whenever one of its comma-separated tokens is `trailers` (any casing;
+   `TE: gzip, trailers` is kept), rewrites the kept field to exactly
+   `te: trailers` (Envoy forwards only that canonical token, never the
+   client's other tokens or casing), collapses several such fields to one
+   line, and strips a `te` field that carries no `trailers` token.
 3. `request_policy` and `set_header` cannot be used together
    (`src/compiler/parser.cc` around lines 2022 and 2568). The milestone
    lowering therefore does not use `set_header`; `x-forwarded-proto` is
@@ -341,8 +350,10 @@ below).
 The milestone-S bootstrap (the accepted-JSON milestone above, plus
 `suppress_envoy_headers: true` and `timeout: "0s"`) lowers to the RUT below
 once every capability in `rut::envoy::RutCapabilities` is available. The
-shipped converter (`rut::envoy::kShippedRutCapabilities`, all `false`) fails
-closed with a `BLOCKED_BY_RUT` diagnostic instead of emitting this text; the
+shipped converter (`rut::envoy::kShippedRutCapabilities`: `request_envoy_h1`
+`true` since PR3, `response_envoy_h1` and `local_reply_envoy_h1` still
+`false`) fails closed with a `BLOCKED_BY_RUT` diagnostic (at the
+`response_envoy_h1` check) instead of emitting this text; the
 exact bytes are pinned in `tests/fixtures/envoy_milestone_s.inc` and checked
 byte for byte by `tests/test_envoy_convert.cc`
 (`api_all_capabilities_matches_golden`). Values shown here (the connect-failure
@@ -468,12 +479,19 @@ are recorded from the pinned Envoy build, not assumed.
 **Request to upstream**
 
 - `Host` is preserved unchanged. There is no nginx-style rewrite to the
-  upstream address. Rut's `request_policy.host` currently offers `"upstream"`
-  only; a `"preserve"` value is a capability dependency.
+  upstream address. Rut's `request_policy.host` landed a `"preserve"` value
+  with `request_envoy_h1` (PR3): the ID4 (`Http11PreserveHostLowercase`)
+  profile forwards the client's Host authority verbatim
+  (`apply_preserve_host_lowercase_request_policy`,
+  `include/rut/runtime/callbacks_impl.h`). Every other `request_policy.host`
+  value still writes the fixed upstream Host.
 - Envoy emits all header names in lowercase over HTTP/1.1 (default
-  `header_key_format`). nginx and Rut preserve the client's case. This affects
-  the recorded upstream bytes for every request and is a capability dependency
-  on the request-policy grammar (a header-casing selector).
+  `header_key_format`). nginx and Rut preserve the client's case on every
+  policy except ID4. The request side landed with `request_envoy_h1` (PR3,
+  `header_names: "lowercase"` in `request_policy`): the same serializer
+  lowercases every forwarded header name. The **response** side is still a
+  capability dependency (`response_envoy_h1`, PR4) — see "Known capability
+  dependencies" below.
 - Added headers: `x-forwarded-proto: http` and
   `x-envoy-expected-rq-timeout-ms: 15000` (the route timeout default). No
   `x-forwarded-for` is appended unless `use_remote_address: true`. No
@@ -603,13 +621,21 @@ is not a byte-for-byte run of the milestone's own emitted text.
    was forwarded with the `TE` header silently dropped (the origin received
    `GET / HTTP/1.1\r\nHost: 127.0.0.1:9100\r\n\r\n`, no `TE` field at all) —
    a mis-forward for that case, not a fail-closed refusal. PR #696
-   (`envoy/rut-request-envoy-h1`, commit `366ad196`,
-   `apply_preserve_host_lowercase_request_policy`) adds exact-value
-   `TE: trailers` preservation once the `request_envoy_h1` capability lands,
-   fixing the bodyless mis-forward; that function still calls the same
-   `inspect_request_policy_body` gate first, though, so a request with a body
-   still fails closed 400 even after #696 (verified by reading `366ad196` on
-   that branch; not runnable from `envoy/lower-increment-2`).
+   (`envoy/rut-request-envoy-h1`, ID4 `Http11PreserveHostLowercase`,
+   `apply_preserve_host_lowercase_request_policy`) adds `TE: trailers`
+   preservation once the `request_envoy_h1` capability lands, fixing the
+   bodyless mis-forward. **Update (round-4 review):** as of that branch's
+   round-3 revision (commit `8200f648`), `inspect_request_policy_body`
+   admits a fixed-Content-Length request too, whenever the `TE` value
+   carries a `trailers` token among its comma-separated tokens (not only an
+   exact whole-value match), and the serializer rewrites the kept header to
+   the canonical lowercase `te: trailers` regardless of the client's casing
+   or the other tokens in the value — the earlier claim in this item that a
+   body-carrying request "still fails closed 400 even after #696" described
+   only the pre-round-3 state of `366ad196` and no longer holds; see
+   `tests/test_network.cc`'s
+   `preserve_host_lowercase_wire_and_fail_closed_host` for the byte-exact
+   wire assertions covering both the bodyless and fixed-length cases.
 4. **Extension/unrecognized HTTP methods.** Envoy's default HTTP/1 parser
    (`BalsaParser`, used unless `Http1ProtocolOptions.allow_custom_methods` and
    the BalsaParser feature are both on) matches the request method against a
@@ -915,7 +941,25 @@ Three findings from the round-6 Codex review of PR #692:
    policy handles (equivalent to "always treat as external", which is
    correct for this milestone since `use_remote_address` can never be set).
    Recorded as a prominently marked `BLOCKED_BY_RUT` matrix row in
-   docs/envoy-compatibility.md pending that runtime change.
+   docs/envoy-compatibility.md pending that runtime change. **Landed in
+   #696** (`request_policy_is_stripped_client_envoy_header`,
+   `include/rut/runtime/callbacks_impl.h`): the ID4 policy drops all 15
+   names above unconditionally, plus -- from the round-7 review of #696 --
+   a client-supplied `x-forwarded-client-cert`, which
+   `ConnectionManagerUtility::mutateXfccRequestHeader` (called for every
+   request at `conn_manager_utility.cc:324`) removes under the HCM's default
+   `forward_client_cert_details: SANITIZE` (`applyForwardClientCertConfig`,
+   lines 541-545, also for any non-mTLS connection) -- plus, from the
+   round-8 review of #696, a client-supplied `x-envoy-external-address`:
+   unlike the sixteen names above, Envoy's own `mutateRequestHeaders` never
+   removes a client-supplied value for this one (`setEnvoyExternalAddress`
+   at line 308 only *writes* it, gated by `edge_request`, which is
+   unreachable under this milestone's fixed shape), so this one is Rut-side
+   hardening rather than an Envoy-parity claim -- a client must not be able
+   to forge the address a trusted hop asserts, independent of what this
+   exact Envoy shape happens to also let through. Seventeen names in
+   total; the matrix rows are `PARTIAL` pending the pinned-Envoy
+   differential run.
 
 ## Test layers
 
@@ -990,24 +1034,63 @@ Everything below is a Rut-side gap the milestone or the next increments hit.
 Each needs its own issue before the corresponding row can leave
 `BLOCKED_BY_RUT`.
 
-- `request_policy.host: "preserve"`: Envoy never rewrites `Host`; Rut's policy
-  grammar only offers rewriting to the upstream address.
-- Header-name casing selector on request and response policies: Envoy emits
-  lowercase names over HTTP/1.1.
+- `request_policy.host: "preserve"` (`request_envoy_h1`, PR3): landed. The
+  runtime serializer follows the Envoy oracle where it differs from this
+  document's original sketch: a single client `x-forwarded-proto` field
+  whose trimmed value is a syntactically valid scheme (case-insensitively
+  exactly `http` or `https`, matching Envoy's own `Utility::schemeIsValid`,
+  `source/common/http/conn_manager_utility.cc`) is kept unchanged in its
+  original position rather than overwritten. An empty, OWS-only, or
+  otherwise invalid value (e.g. `ftp`, `http,https`) is overwritten in place
+  at that same position with `x-forwarded-proto: http` rather than dropped
+  and re-appended, matching Envoy's inline (O(1) slot) storage for this
+  header. `x-forwarded-proto: http` is appended as the last header only when
+  the client sent no `x-forwarded-proto` field at all; more than one
+  physical field is rejected outright (`400`), since Envoy coalesces
+  duplicates into one value and this profile does not replicate that
+  coalescing. See `tests/fixtures/envoy_oracle_milestone_s.inc` and
+  `docs/envoy-compatibility.md`.
+- Header-name casing selector on the response policy: Envoy emits lowercase
+  names over HTTP/1.1. The request side landed with `request_envoy_h1`
+  (PR3, `header_names: "lowercase"` in `request_policy`); the response side
+  is still `response_envoy_h1`.
 - Dynamic `Connection`-nominated header stripping on the upstream request:
   Envoy parses the client's `Connection` header value and removes every
-  header it names (e.g. `Connection: X-Secret` also removes `X-Secret`).
-  Today's `request_policy.strip_headers` is a fixed, closed literal list
-  (`Connection`, `Keep-Alive`, `TE`, `Expect`, `Upgrade`, and
-  `Proxy-Connection` once `request_envoy_h1` lands) parsed at
-  `src/compiler/parser.cc` — it cannot express "whatever this request's
-  `Connection` header names". This is a distinct gap from Host preservation
-  and header casing; `request_envoy_h1` landing (PR3) must not be considered
-  a byte-for-byte match for Envoy's `get_hop_by_hop` behavior unless it also
-  covers this. (Rut's response path already has the equivalent dynamic
-  nomination handling for the upstream→downstream direction —
-  `upstream_connection_nominates` in `include/rut/runtime/callbacks_impl.h`;
-  only the downstream→upstream request direction is missing it.)
+  header it names (e.g. `Connection: X-Secret` also removes `X-Secret`). This
+  landed on the `host: "preserve"` profile with `request_envoy_h1` (PR3):
+  `apply_preserve_host_lowercase_request_policy`
+  (`include/rut/runtime/callbacks_impl.h`) parses the client's `Connection`
+  header into its comma-separated token list and drops every nominated
+  header name, matching Envoy's `get_hop_by_hop` behavior for that profile.
+  The fixed, closed `request_policy.strip_headers` literal list
+  (`Connection`, `Keep-Alive`, `TE`, `Expect`, `Upgrade`, `Proxy-Connection`)
+  parsed at `src/compiler/parser.cc` is unchanged and still cannot express
+  dynamic nomination; the gap remains for the `host: "upstream"` request
+  policies (ID1/ID2/ID3). (Rut's response path already has the equivalent
+  dynamic nomination handling for the upstream→downstream direction —
+  `upstream_connection_nominates` in `include/rut/runtime/callbacks_impl.h`.)
+  A `Connection` token that nominates `content-length` itself fails the whole
+  rewrite closed instead of forwarding an unframed body: dropping that header
+  while still copying the already-validated body bytes would desynchronize a
+  persistent upstream connection (request smuggling). Envoy's own
+  `Utility::sanitizeConnectionHeader` (`source/common/http/utility.cc`) has no
+  such exception and does remove a nominated `Content-Length` from the header
+  map it forwards to filters/router, but its HTTP/1 client codec then decides
+  outbound framing independently of that header at encode time; Rut's
+  request-policy serializer writes the body length directly onto the wire, so
+  the two are not equivalent and Rut cannot safely replicate Envoy's exact
+  byte shape for this nomination without adding chunked-encoding support to
+  this path. No recorded oracle case exercises this nomination.
+- `Expect: 100-continue` on a body-carrying `host: "preserve"` request: Envoy
+  sends the interim `100 Continue` response before reading the body, then
+  applies the same hop-by-hop drop as every other request. Rut has no
+  interim-response flow anywhere in the runtime (for any route or request
+  policy), so `inspect_request_policy_body` fails this shape closed today —
+  the client gets an immediate rejection instead of the `100 Continue` it
+  expects. This is the same fail-closed behavior the fixed-length request
+  policies (ID1/ID2/ID3) already apply to any `Expect` header; `request_envoy_h1`
+  does not add interim-response support and this request shape stays outside
+  its advertised capability until a `100 Continue` primitive exists.
 - `response_policy.date: "preserve_or_current"`: add `date` only when absent.
 - `response_policy.server: "envoy"` with overwrite semantics, and an explicit
   "pass through upstream `server`" mode for `server_header_transformation:

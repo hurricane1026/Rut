@@ -1,5 +1,6 @@
 // Real-socket integration tests. Ported from libuv/libevent2 scenarios.
 #include "epoll_tls_test_hooks.h"
+#include "fixtures/envoy_oracle_milestone_s.inc"
 #include "framing_selection_preflight_fixture.h"
 #include "rut/compiler/analyze.h"
 #include "rut/compiler/lexer.h"
@@ -24686,6 +24687,498 @@ TEST(route, forward_request_policy_rebuilds_nginx_h11_headers) {
         CHECK_EQ(upstream.accepted_count.load(std::memory_order_acquire), accepted_before);
         CHECK_EQ(upstream.request_count.load(std::memory_order_acquire), requests_before);
     }
+}
+
+// PR3: the Envoy-compatible `host: "preserve"` request policy
+// (RequestPolicyId::Http11PreserveHostLowercase). Byte-for-byte against the
+// CI-recorded Envoy v1.39.1 oracle transcript (tests/fixtures/
+// envoy_oracle_milestone_s.inc, envoy-pr-plan.md PR2/PR3): preserved Host
+// first, lowercase header names, Envoy's hop-by-hop set (incl.
+// Proxy-Connection and Connection-nominated headers) dropped, `te` kept only
+// for an exact "trailers" value, and a trailing x-forwarded-proto.
+TEST(route, forward_request_policy_preserve_host_lowercase_h11_wire) {
+    using namespace rut;
+    struct JitResources {
+        FrontendRirModule rir{};
+        jit::JitEngine engine{};
+        ~JitResources() {
+            engine.shutdown();
+            rir.destroy();
+        }
+    } resources;
+    RecordingUpstream upstream;
+    REQUIRE(upstream.setup());
+
+    auto route_block = [](const char* path) {
+        return std::string("route \"") + path +
+               "\" {\n"
+               "    return forward(backend, request_policy: {\n"
+               "        version: \"HTTP/1.1\", host: \"preserve\", connection: \"omit\",\n"
+               "        header_names: \"lowercase\", forwarded_proto: \"http\",\n"
+               "        strip_headers: [\"Connection\", \"Keep-Alive\", \"TE\", \"Expect\", "
+               "\"Upgrade\", \"Proxy-Connection\"]\n"
+               "    })\n"
+               "}\n";
+    };
+    char upstream_line[64];
+    const int upstream_line_len = snprintf(upstream_line,
+                                           sizeof(upstream_line),
+                                           "upstream backend at \"127.0.0.1:%u\"\n",
+                                           upstream.port);
+    REQUIRE_GT(upstream_line_len, 0);
+    std::string source(upstream_line);
+    source += route_block("/smoke");
+    source += route_block("/hop");
+    source += route_block("/upload");
+    source += route_block("/head");
+
+    auto lexed = lex({source.data(), static_cast<u32>(source.size())});
+    REQUIRE(lexed);
+    auto ast = parse_file(lexed.value());
+    REQUIRE(ast);
+    std::unique_ptr<AstFile> ast_owned(ast.value());
+    auto hir = analyze_file(*ast_owned);
+    REQUIRE(hir);
+    std::unique_ptr<HirModule> hir_owned(hir.value());
+    auto mir = build_mir(*hir_owned);
+    REQUIRE(mir);
+    std::unique_ptr<MirModule> mir_owned(mir.value());
+    auto& rir = resources.rir;
+    REQUIRE(lower_to_rir(*mir_owned, rir));
+    auto cg = jit::codegen(rir.module);
+    REQUIRE(cg.ok);
+    auto& engine = resources.engine;
+    REQUIRE(engine.init());
+    REQUIRE(engine.compile(cg.mod, cg.ctx));
+    RouteConfig cfg{};
+    REQUIRE(populate_route_config(cfg, rir.module));
+    REQUIRE(register_jit_routes(cfg, rir.module, engine));
+    const RouteConfig* active = &cfg;
+    ScopedProxyLoop proxy;
+    REQUIRE(proxy.setup(&active, 1000));
+
+    auto send_case = [&](const char* client_bytes,
+                         u32 client_len,
+                         u32 expected_history_slot,
+                         const char* expected_upstream,
+                         u32 expected_upstream_len) {
+        i32 client = connect_to(proxy.port);
+        REQUIRE_GE(client, 0);
+        REQUIRE(send_all(client, client_bytes, client_len));
+        char response[1024];
+        const i32 response_read = recv_timeout(client, response, sizeof(response), 2000);
+        close(client);
+        CHECK_GT(response_read, 0);
+        for (u32 i = 0; i < 400 && upstream.request_count.load(std::memory_order_acquire) <=
+                                       expected_history_slot;
+             i++)
+            usleep(5000);
+        REQUIRE_GT(upstream.request_count.load(std::memory_order_acquire), expected_history_slot);
+        REQUIRE_LT(expected_history_slot,
+                   static_cast<u32>(RecordingUpstream::kMaxRecordedRequests));
+        const u32 recorded_len = upstream.request_history_len[expected_history_slot];
+        REQUIRE_EQ(recorded_len, expected_upstream_len);
+        CHECK_EQ(__builtin_memcmp(upstream.request_history[expected_history_slot],
+                                  expected_upstream,
+                                  expected_upstream_len),
+                 0);
+    };
+
+    send_case(kEnvoyOracle_get_smoke_client,
+              static_cast<u32>(sizeof(kEnvoyOracle_get_smoke_client) - 1),
+              0,
+              kEnvoyOracle_get_smoke_upstream,
+              static_cast<u32>(sizeof(kEnvoyOracle_get_smoke_upstream) - 1));
+    send_case(kEnvoyOracle_get_hop_by_hop_client,
+              static_cast<u32>(sizeof(kEnvoyOracle_get_hop_by_hop_client) - 1),
+              1,
+              kEnvoyOracle_get_hop_by_hop_upstream,
+              static_cast<u32>(sizeof(kEnvoyOracle_get_hop_by_hop_upstream) - 1));
+    send_case(kEnvoyOracle_post_fixed_client,
+              static_cast<u32>(sizeof(kEnvoyOracle_post_fixed_client) - 1),
+              2,
+              kEnvoyOracle_post_fixed_upstream,
+              static_cast<u32>(sizeof(kEnvoyOracle_post_fixed_upstream) - 1));
+    send_case(kEnvoyOracle_head_smoke_client,
+              static_cast<u32>(sizeof(kEnvoyOracle_head_smoke_client) - 1),
+              3,
+              kEnvoyOracle_head_smoke_upstream,
+              static_cast<u32>(sizeof(kEnvoyOracle_head_smoke_upstream) - 1));
+
+    // Missing/duplicate Host each fail closed: no additional upstream
+    // connection is opened, and the downstream sees 400.
+    const u32 accepted_before = upstream.accepted_count.load(std::memory_order_acquire);
+    const u32 requests_before = upstream.request_count.load(std::memory_order_acquire);
+    const char* fail_closed[] = {
+        "GET /smoke HTTP/1.1\r\nX-Only: yes\r\n\r\n",
+        "GET /smoke HTTP/1.1\r\nHost: a\r\nHost: b\r\n\r\n",
+    };
+    for (const char* req : fail_closed) {
+        i32 client = connect_to(proxy.port);
+        REQUIRE_GE(client, 0);
+        REQUIRE(send_all(client, req, static_cast<u32>(strlen(req))));
+        char response[512];
+        const i32 response_read = recv_timeout(client, response, sizeof(response), 2000);
+        close(client);
+        CHECK_GT(response_read, 0);
+        CHECK(buf_contains(response, static_cast<u32>(response_read), "400", 3));
+        usleep(100000);
+        CHECK_EQ(upstream.accepted_count.load(std::memory_order_acquire), accepted_before);
+        CHECK_EQ(upstream.request_count.load(std::memory_order_acquire), requests_before);
+    }
+}
+
+// Round-6 Codex review (PR #696): Envoy's own
+// `ConnectionManagerUtility::cleanInternalHeaders`
+// (source/common/http/conn_manager_utility.cc) strips a fixed set of
+// client-supplied `x-envoy-*` headers for a non-internal, non-edge external
+// request -- the fixed shape this milestone's HCM configuration always
+// produces (no `use_remote_address: true`, no `internal_address_config`, so
+// `DefaultInternalAddressConfig::isInternalAddress` unconditionally returns
+// false and `edge_request` is always false too). An untrusted client must
+// not be able to inject retry/timeout instructions Envoy's own control plane
+// would otherwise own. Verifies end to end, via a real upstream connection,
+// that `x-envoy-expected-rq-timeout-ms` and `x-envoy-retry-on` never reach
+// the upstream, while an ordinary header still does. Round-7 review: neither
+// does a client-forged `x-envoy-internal` (`removeEnvoyInternalRequest()`,
+// conn_manager_utility.cc:142, unconditional; only written back on the
+// `internal_request` branch that needs `use_remote_address`) nor a
+// client-supplied `x-forwarded-client-cert` (`mutateXfccRequestHeader` with
+// the default `forward_client_cert_details: SANITIZE`, lines 541-545).
+TEST(route, forward_request_policy_preserve_host_lowercase_strips_client_envoy_internal_headers) {
+    using namespace rut;
+    struct JitResources {
+        FrontendRirModule rir{};
+        jit::JitEngine engine{};
+        ~JitResources() {
+            engine.shutdown();
+            rir.destroy();
+        }
+    } resources;
+    RecordingUpstream upstream;
+    REQUIRE(upstream.setup());
+
+    char upstream_line[64];
+    const int upstream_line_len = snprintf(upstream_line,
+                                           sizeof(upstream_line),
+                                           "upstream backend at \"127.0.0.1:%u\"\n",
+                                           upstream.port);
+    REQUIRE_GT(upstream_line_len, 0);
+    std::string source(upstream_line);
+    source +=
+        "route \"/smoke\" {\n"
+        "    return forward(backend, request_policy: {\n"
+        "        version: \"HTTP/1.1\", host: \"preserve\", connection: \"omit\",\n"
+        "        header_names: \"lowercase\", forwarded_proto: \"http\",\n"
+        "        strip_headers: [\"Connection\", \"Keep-Alive\", \"TE\", \"Expect\", "
+        "\"Upgrade\", \"Proxy-Connection\"]\n"
+        "    })\n"
+        "}\n";
+
+    auto lexed = lex({source.data(), static_cast<u32>(source.size())});
+    REQUIRE(lexed);
+    auto ast = parse_file(lexed.value());
+    REQUIRE(ast);
+    std::unique_ptr<AstFile> ast_owned(ast.value());
+    auto hir = analyze_file(*ast_owned);
+    REQUIRE(hir);
+    std::unique_ptr<HirModule> hir_owned(hir.value());
+    auto mir = build_mir(*hir_owned);
+    REQUIRE(mir);
+    std::unique_ptr<MirModule> mir_owned(mir.value());
+    auto& rir = resources.rir;
+    REQUIRE(lower_to_rir(*mir_owned, rir));
+    auto cg = jit::codegen(rir.module);
+    REQUIRE(cg.ok);
+    auto& engine = resources.engine;
+    REQUIRE(engine.init());
+    REQUIRE(engine.compile(cg.mod, cg.ctx));
+    RouteConfig cfg{};
+    REQUIRE(populate_route_config(cfg, rir.module));
+    REQUIRE(register_jit_routes(cfg, rir.module, engine));
+    const RouteConfig* active = &cfg;
+    ScopedProxyLoop proxy;
+    REQUIRE(proxy.setup(&active, 1000));
+
+    static constexpr char kClient[] =
+        "GET /smoke HTTP/1.1\r\n"
+        "Host: client.example\r\n"
+        "X-Envoy-Expected-Rq-Timeout-Ms: 15000\r\n"
+        "X-Envoy-Retry-On: 5xx\r\n"
+        "X-Envoy-Internal: true\r\n"
+        "X-Forwarded-Client-Cert: Hash=0123abcd;URI=spiffe://mesh/admin\r\n"
+        "X-Envoy-External-Address: 10.0.0.1\r\n"
+        "X-Regular: keep\r\n"
+        "\r\n";
+    static constexpr char kExpectedUpstream[] =
+        "GET /smoke HTTP/1.1\r\n"
+        "host: client.example\r\n"
+        "x-regular: keep\r\n"
+        "x-forwarded-proto: http\r\n"
+        "\r\n";
+
+    i32 client = connect_to(proxy.port);
+    REQUIRE_GE(client, 0);
+    REQUIRE(send_all(client, kClient, static_cast<u32>(sizeof(kClient) - 1)));
+    char response[1024];
+    const i32 response_read = recv_timeout(client, response, sizeof(response), 2000);
+    close(client);
+    CHECK_GT(response_read, 0);
+    for (u32 i = 0; i < 400 && upstream.request_count.load(std::memory_order_acquire) == 0; i++)
+        usleep(5000);
+    REQUIRE_GT(upstream.request_count.load(std::memory_order_acquire), 0u);
+    const u32 recorded_len = upstream.request_history_len[0];
+    REQUIRE_EQ(recorded_len, static_cast<u32>(sizeof(kExpectedUpstream) - 1));
+    CHECK_EQ(__builtin_memcmp(upstream.request_history[0], kExpectedUpstream, recorded_len), 0);
+    // Belt-and-suspenders: the headers named in the round-6, round-7, and
+    // round-8 reviews must not appear anywhere in what the upstream
+    // received, however they are cased.
+    CHECK_FALSE(buf_contains(upstream.request_history[0], recorded_len, "rq-timeout-ms", 13));
+    CHECK_FALSE(buf_contains(upstream.request_history[0], recorded_len, "retry-on", 8));
+    CHECK_FALSE(buf_contains(upstream.request_history[0], recorded_len, "envoy-internal", 14));
+    CHECK_FALSE(buf_contains(upstream.request_history[0], recorded_len, "client-cert", 11));
+    CHECK_FALSE(buf_contains(upstream.request_history[0], recorded_len, "spiffe", 6));
+    CHECK_FALSE(buf_contains(upstream.request_history[0], recorded_len, "external-address", 16));
+    CHECK_FALSE(buf_contains(upstream.request_history[0], recorded_len, "10.0.0.1", 8));
+}
+
+// A body-carrying request (ID4, preserved Host) paired with a response_policy
+// on the ordinary strict-response body path.
+// `request_policy_body_response_admitted` (callbacks_impl.h) used to admit
+// only `Http11FixedStrip` (ID1) here, so this exact combination -- ID4 plus
+// any response_policy -- was rejected with a 400 before ever reaching the
+// upstream, even though Envoy itself forwards this POST unmodified (see
+// `kEnvoyOracle_post_fixed_*`). Uses a nginx-era (Synthesized) response_policy
+// since the Envoy upstream-order response layout is PR4 scope; only the
+// forwarded request bytes and the downstream status are asserted here.
+TEST(route, forward_request_policy_preserve_host_lowercase_post_fixed_with_response_policy) {
+    using namespace rut;
+    struct JitResources {
+        FrontendRirModule rir{};
+        jit::JitEngine engine{};
+        ~JitResources() {
+            engine.shutdown();
+            rir.destroy();
+        }
+    } resources;
+    RecordingUpstream upstream;
+    REQUIRE(upstream.setup());
+    char source[1024];
+    const int source_len =
+        snprintf(source,
+                 sizeof(source),
+                 "upstream backend at \"127.0.0.1:%u\"\n"
+                 "route POST \"/upload\" {\n"
+                 "    return forward(backend, request_policy: {\n"
+                 "        version: \"HTTP/1.1\", host: \"preserve\", connection: \"omit\",\n"
+                 "        header_names: \"lowercase\", forwarded_proto: \"http\",\n"
+                 "        strip_headers: [\"Connection\", \"Keep-Alive\", \"TE\", \"Expect\", "
+                 "\"Upgrade\", \"Proxy-Connection\"]\n"
+                 "    }, response_policy: {\n"
+                 "        version: \"HTTP/1.1\", framing: \"content_length\", connection: "
+                 "\"request\",\n"
+                 "        server: \"nginx/1.29.7\", date: \"current\", hide_headers: []\n"
+                 "    })\n"
+                 "}\n",
+                 upstream.port);
+    REQUIRE_GT(source_len, 0);
+    REQUIRE_LT(source_len, static_cast<int>(sizeof(source)));
+    auto lexed = lex(Str{source, static_cast<u32>(source_len)});
+    REQUIRE(lexed);
+    auto ast = parse_file(lexed.value());
+    REQUIRE(ast);
+    std::unique_ptr<AstFile> ast_owned(ast.value());
+    auto hir = analyze_file(*ast_owned);
+    REQUIRE(hir);
+    std::unique_ptr<HirModule> hir_owned(hir.value());
+    auto mir = build_mir(*hir_owned);
+    REQUIRE(mir);
+    std::unique_ptr<MirModule> mir_owned(mir.value());
+    auto& rir = resources.rir;
+    REQUIRE(lower_to_rir(*mir_owned, rir));
+    auto cg = jit::codegen(rir.module);
+    REQUIRE(cg.ok);
+    auto& engine = resources.engine;
+    REQUIRE(engine.init());
+    REQUIRE(engine.compile(cg.mod, cg.ctx));
+    RouteConfig cfg{};
+    REQUIRE(populate_route_config(cfg, rir.module));
+    REQUIRE(register_jit_routes(cfg, rir.module, engine));
+    const RouteConfig* active = &cfg;
+    ScopedProxyLoop proxy;
+    REQUIRE(proxy.setup(&active, 1000));
+
+    static constexpr char kUploadUpstreamReply[] =
+        "HTTP/1.1 201 Created\r\nContent-Length: 0\r\n\r\n";
+    upstream.response = kUploadUpstreamReply;
+    upstream.response_len = static_cast<u32>(sizeof(kUploadUpstreamReply) - 1);
+
+    i32 client = connect_to(proxy.port);
+    REQUIRE_GE(client, 0);
+    REQUIRE(send_all(client,
+                     kEnvoyOracle_post_fixed_client,
+                     static_cast<u32>(sizeof(kEnvoyOracle_post_fixed_client) - 1)));
+    char response[512];
+    const i32 response_read = recv_timeout(client, response, sizeof(response), 2000);
+    close(client);
+    REQUIRE_GT(response_read, 0);
+    CHECK(buf_contains(response, static_cast<u32>(response_read), "201", 3));
+
+    for (u32 i = 0; i < 400 && upstream.request_count.load(std::memory_order_acquire) == 0; i++)
+        usleep(5000);
+    REQUIRE_EQ(upstream.request_count.load(std::memory_order_acquire), 1u);
+    REQUIRE_EQ(upstream.request_len,
+               static_cast<u32>(sizeof(kEnvoyOracle_post_fixed_upstream) - 1));
+    CHECK_EQ(memcmp(upstream.request,
+                    kEnvoyOracle_post_fixed_upstream,
+                    sizeof(kEnvoyOracle_post_fixed_upstream) - 1),
+             0);
+}
+
+// A fixed-length ID4 (host: "preserve") upload paired with a response_policy
+// must never borrow an idle pooled upstream socket: strict_response_upload_ready
+// requires !upstream_reused before it will publish the strict response, so a
+// reused socket can never produce one (see the idle-reuse guard next to
+// `request_policy_body_response_domain` in include/rut/runtime/callbacks_impl.h).
+// Run the same oracle-verified request twice, with the production idle pool
+// enabled, and prove both round trips succeed via a fresh connect rather than
+// the second one hanging/failing on a borrowed socket.
+// The idle-pool socket that a strict-response ID4 upload must never borrow
+// does not have to come from a prior request on the *same* route: any other
+// keep-alive request to the same upstream leaves one behind. Warm the pool
+// with an ordinary zero-copy `forward(backend)` route first — a plain
+// RouteAction::Proxy dispatch, unaffected by request_policy/response_policy —
+// then send the oracle-verified fixed-length ID4 upload to the same upstream
+// and prove it still gets its 201 (via a fresh connect) instead of the
+// connection closing early because strict_response_upload_ready refused a
+// borrowed socket (see the idle-reuse guard next to
+// `request_policy_body_response_domain` in include/rut/runtime/callbacks_impl.h).
+TEST(route, forward_request_policy_preserve_host_lowercase_post_fixed_never_reuses_upstream) {
+    using namespace rut;
+    struct JitResources {
+        FrontendRirModule rir{};
+        jit::JitEngine engine{};
+        ~JitResources() {
+            engine.shutdown();
+            rir.destroy();
+        }
+    } resources;
+    RecordingUpstream upstream;
+    // Keep each responded upstream fd open in the recorder so an incorrectly
+    // pooled first fd cannot be evicted and replaced while this test passes;
+    // the accept loop remains available for a second, independent connection.
+    upstream.keep_open = true;
+    REQUIRE(upstream.setup());
+    char source[1536];
+    const int source_len =
+        snprintf(source,
+                 sizeof(source),
+                 "upstream backend at \"127.0.0.1:%u\"\n"
+                 "route GET \"/warm\" { return forward(backend) }\n"
+                 "route POST \"/upload\" {\n"
+                 "    return forward(backend, request_policy: {\n"
+                 "        version: \"HTTP/1.1\", host: \"preserve\", connection: \"omit\",\n"
+                 "        header_names: \"lowercase\", forwarded_proto: \"http\",\n"
+                 "        strip_headers: [\"Connection\", \"Keep-Alive\", \"TE\", \"Expect\", "
+                 "\"Upgrade\", \"Proxy-Connection\"]\n"
+                 "    }, response_policy: {\n"
+                 "        version: \"HTTP/1.1\", framing: \"content_length\", connection: "
+                 "\"request\",\n"
+                 "        server: \"nginx/1.29.7\", date: \"current\", hide_headers: []\n"
+                 "    })\n"
+                 "}\n",
+                 upstream.port);
+    REQUIRE_GT(source_len, 0);
+    REQUIRE_LT(source_len, static_cast<int>(sizeof(source)));
+    auto lexed = lex(Str{source, static_cast<u32>(source_len)});
+    REQUIRE(lexed);
+    auto ast = parse_file(lexed.value());
+    REQUIRE(ast);
+    std::unique_ptr<AstFile> ast_owned(ast.value());
+    auto hir = analyze_file(*ast_owned);
+    REQUIRE(hir);
+    std::unique_ptr<HirModule> hir_owned(hir.value());
+    auto mir = build_mir(*hir_owned);
+    REQUIRE(mir);
+    std::unique_ptr<MirModule> mir_owned(mir.value());
+    auto& rir = resources.rir;
+    REQUIRE(lower_to_rir(*mir_owned, rir));
+    auto cg = jit::codegen(rir.module);
+    REQUIRE(cg.ok);
+    auto& engine = resources.engine;
+    REQUIRE(engine.init());
+    REQUIRE(engine.compile(cg.mod, cg.ctx));
+    RouteConfig cfg{};
+    REQUIRE(populate_route_config(cfg, rir.module));
+    REQUIRE(register_jit_routes(cfg, rir.module, engine));
+    const RouteConfig* active = &cfg;
+    ScopedProxyLoop proxy;
+    // Enable the production idle pool so a wrongly reused socket would sink
+    // the second request instead of this test never exercising the path.
+    REQUIRE(proxy.setup(&active, 1000, true));
+
+    static constexpr char kWarmUpstreamReply[] = "HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n";
+    static constexpr char kUploadUpstreamReply[] =
+        "HTTP/1.1 201 Created\r\nContent-Length: 0\r\n\r\n";
+    upstream.response = kWarmUpstreamReply;
+    upstream.response_len = static_cast<u32>(sizeof(kWarmUpstreamReply) - 1);
+    // Accepted connection 2 onward (the ID4 upload) gets the 201 reply; only
+    // accepted connection 1 (the warm-up) sees the 200 above.
+    upstream.response_after_first = kUploadUpstreamReply;
+    upstream.response_after_first_len = static_cast<u32>(sizeof(kUploadUpstreamReply) - 1);
+
+    // 1. Warm the idle pool: a plain, policy-free GET that leaves a live
+    // keep-alive upstream socket parked for this same upstream_id/backend_idx.
+    {
+        struct ClientGuard {
+            i32 fd;
+            ~ClientGuard() {
+                if (fd >= 0) close(fd);
+            }
+        } client{connect_to(proxy.port)};
+        REQUIRE_GE(client.fd, 0);
+        static constexpr char kWarmRequest[] = "GET /warm HTTP/1.1\r\nHost: client.example\r\n\r\n";
+        REQUIRE(send_all(client.fd, kWarmRequest, sizeof(kWarmRequest) - 1));
+        char response[512];
+        const i32 response_read = recv_timeout(client.fd, response, sizeof(response), 2000);
+        REQUIRE_GT(response_read, 0);
+        CHECK(buf_contains(response, static_cast<u32>(response_read), "200", 3));
+    }
+    for (u32 i = 0; i < 400 && upstream.accepted_count.load(std::memory_order_acquire) < 1; i++)
+        usleep(5000);
+    REQUIRE_EQ(upstream.accepted_count.load(std::memory_order_acquire), 1u);
+
+    // 2. The oracle-verified fixed-length ID4 upload to the same upstream:
+    // it must not borrow the socket just parked above.
+    {
+        struct ClientGuard {
+            i32 fd;
+            ~ClientGuard() {
+                if (fd >= 0) close(fd);
+            }
+        } client{connect_to(proxy.port)};
+        REQUIRE_GE(client.fd, 0);
+        REQUIRE(send_all(client.fd,
+                         kEnvoyOracle_post_fixed_client,
+                         static_cast<u32>(sizeof(kEnvoyOracle_post_fixed_client) - 1)));
+        char response[512];
+        const i32 response_read = recv_timeout(client.fd, response, sizeof(response), 2000);
+        REQUIRE_GT(response_read, 0);
+        CHECK(buf_contains(response, static_cast<u32>(response_read), "201", 3));
+    }
+
+    for (u32 i = 0; i < 400 && upstream.request_count.load(std::memory_order_acquire) < 2; i++)
+        usleep(5000);
+    REQUIRE_EQ(upstream.request_count.load(std::memory_order_acquire), 2u);
+    // The upload used a fresh connect — a second, independent accepted
+    // connection — never the warm-up's parked socket.
+    REQUIRE_EQ(upstream.accepted_count.load(std::memory_order_acquire), 2u);
+    REQUIRE_EQ(upstream.request_history_len[1],
+               static_cast<u32>(sizeof(kEnvoyOracle_post_fixed_upstream) - 1));
+    CHECK_EQ(memcmp(upstream.request_history[1],
+                    kEnvoyOracle_post_fixed_upstream,
+                    sizeof(kEnvoyOracle_post_fixed_upstream) - 1),
+             0);
 }
 
 TEST(route, request_policy_buffers_fixed_content_length_body) {

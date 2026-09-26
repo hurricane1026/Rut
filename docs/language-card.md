@@ -318,13 +318,69 @@ return forward(users)                          // zero-copy, terminal
 return forward(users, request_policy: {
     version: "HTTP/1.1", host: "upstream", connection: "omit",
     strip_headers: ["Connection", "Keep-Alive", "TE", "Expect", "Upgrade"]
-})                                               // fixed header-only rebuild
+})                                               // ID1: fixed header-only rebuild
+// ID2 adds content_length_position: "after_host" (Content-Length pinned
+// right after the rewritten Host line; a request with no Content-Length at
+// all is admitted unchanged -- only an explicit Content-Length: 0 is
+// rejected).
+// ID3 adds retained_header_value: "trim_sp_preserve_htab" (retained values
+// keep leading/trailing HTAB while SP is trimmed; bounded to bodyless GET).
+// The two are mutually exclusive and both require host: "upstream".
+return forward(users, request_policy: {
+    version: "HTTP/1.1", host: "upstream", connection: "omit",
+    content_length_position: "after_host",
+    strip_headers: ["Connection", "Keep-Alive", "TE", "Expect", "Upgrade"]
+})
+// host: "preserve" is a separate closed combination (Envoy-compatible H1,
+// ID4): keeps the client's Host verbatim (fails closed unless exactly one
+// non-empty, syntactically valid-authority Host header is present),
+// lowercases every forwarded header name, and requires forwarded_proto and
+// the six-name strip list together. Drops every header the client's
+// Connection value nominates except content-length/host/x-forwarded-for/
+// x-forwarded-host/x-forwarded-proto, nominating any of which (or a
+// pseudo-header-shaped token starting with `:`) fails closed; keeps `te`
+// when any physical TE field's comma-separated tokens contain `trailers` --
+// a request-wide decision, not a per-field one: exactly one canonical
+// `te: trailers` line (rewritten to that exact lowercase token) is emitted
+// at the *first* physical TE field's position whenever any TE field carries
+// the token, and every other physical TE field is suppressed (e.g.
+// `TE: gzip`, then `X-Middle`, then `TE: trailers` forwards `te: trailers`
+// before `x-middle`, not the `gzip` field dropped in place with `trailers`
+// kept separately). A Connection nomination of `te` itself does not force a
+// drop -- this same trailers check decides its fate, matching Envoy's own
+// nomination special case; rejects Connection nominating `upgrade` alongside an Upgrade header
+// whose trimmed value is non-empty (even with `close`) but admits a bare
+// Upgrade header otherwise -- including an Upgrade header present with an
+// empty/OWS-only value alongside an `upgrade` nomination -- and always
+// strips it (and any nominated Upgrade) from the forwarded request;
+// rejects more than one X-Forwarded-Proto field; a single field's value that
+// is not (case-insensitively) exactly "http" or "https" -- empty, OWS-only,
+// or otherwise invalid such as "http,https" -- is overwritten in place, at
+// that field's original position, with "http" rather than dropped and
+// forwarded blank or malformed; a valid value passes through unchanged in
+// place; a trailing "x-forwarded-proto: http" is appended only when the
+// client sent no such field at all; rejects a fragment-bearing request
+// target; and drops the sixteen client-supplied headers Envoy itself strips
+// for external requests, plus one Rut-side hardening addition, seventeen in
+// total (`x-envoy-internal`, fourteen more `x-envoy-*` names,
+// `x-forwarded-client-cert`, and `x-envoy-external-address`;
+// docs/envoy-compatibility.md).
+return forward(users, request_policy: {
+    version: "HTTP/1.1", host: "preserve", connection: "omit",
+    header_names: "lowercase", forwarded_proto: "http",
+    strip_headers: ["Connection", "Keep-Alive", "TE", "Expect", "Upgrade", "Proxy-Connection"]
+})
 // Bounded response-policy serialization currently accepts only a cleartext
 // HTTP/1.1, origin-form, bodyless non-HEAD request and one final upstream
 // HTTP/1.1 response framed by exactly one Content-Length. Requests with a
 // body, TLS/H2, interim/Upgrade responses, chunking/trailers, close-delimited
 // framing, or unsupported status/header controls fail closed; transparent
-// forward(...) remains the default for all other routes.
+// forward(...) remains the default for all other routes. One exception: a
+// fixed-Content-Length request paired with `host: "preserve"` (ID4) or the
+// plain `host: "upstream"` strip (ID1) is admitted alongside a
+// response_policy too — fully buffered, unchunked, with no pipelined
+// successor bytes, and never served from a reused idle upstream socket (see
+// `request_policy_body_response_admitted` in callbacks_impl.h).
 
 return forward(users, response_policy: {
     version: "HTTP/1.1", framing: "content_length", connection: "request",
@@ -346,7 +402,26 @@ return forward(users,
 // when both policies select it; it remains bounded to cleartext H1.1, bodyless
 // HEAD with either no Connection field (the HTTP/1.1 default-keepalive shape)
 // or exactly one `Connection: close`, one IPv4 upstream, strict success, and
-// connect-establishment failure. While the broader failure rendezvous is not
+// connect-establishment failure. On a `host: "preserve"` (ID4) route only,
+// this Connection grammar widens to the same nomination rule the ordinary
+// ID4 request-policy path already applies: every comma-separated,
+// case-insensitive token is admitted -- and, along with its own field,
+// dropped -- unless it names a protected header (`content-length`, `host`,
+// the three forwarded-provenance headers, or a pseudo-header-shaped token
+// starting with `:`, each of which fails the whole request closed instead)
+// or is a genuine upgrade (a nominated `upgrade` token together with a
+// semantically present, non-empty/OWS `Upgrade` field anywhere on the
+// request -- e.g. `Connection: close, upgrade` with an absent or
+// empty/OWS-only `Upgrade` header is not genuine and is admitted, both
+// fields then stripped). Persistence is decided by the `close` token alone,
+// independent of whatever else is nominated in the same value --
+// `Connection: close, X-Foo` behaves like the plain `Connection: close`
+// shape, and `Connection: X-Foo` alone (no `close`) behaves like no
+// `Connection` field at all -- since a nomination such as `te`, `X-Foo`, or
+// a genuine-upgrade-free `upgrade` never affects persistence and ID4's own
+// request-policy path already forwards the request correctly regardless of
+// this response-side contract (canonicalizing a paired `TE` field when
+// nominated, for example). While the broader failure rendezvous is not
 // part of this contract, timeout, malformed/incomplete/excess response, and
 // upload/send/recv failure close before emitting downstream bytes.
 // response_policy.connection: "keep_alive" requires a keep-alive downstream
