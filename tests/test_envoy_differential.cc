@@ -223,14 +223,21 @@ int missing_prerequisite(const std::string& message) {
 // early return previously left an OLD transcript from a prior, unrelated run
 // sitting at that path. Since CI uploads this path with `if: always()`, a
 // failed run in a reused workspace could publish a stale success transcript
-// as though it belonged to the current failure. Best-effort: a missing file
-// is not an error, and a failure to remove one is logged but never fatal --
-// this is cleanup, not the reason a run should pass or fail.
-void remove_stale_transcript(const std::string& path) {
+// as though it belonged to the current failure. A missing file is not an
+// error (there was nothing stale to begin with). Any OTHER removal failure
+// -- e.g. a reused self-hosted workspace where the existing file is owned by
+// a different user and this process lacks permission to unlink it -- is
+// fatal (round-20 review, "Abort when a stale transcript cannot be
+// removed"): merely warning and continuing left that exact old file sitting
+// at `path` for a subsequent prerequisite or validation failure to leave in
+// place, recreating the stale-success-artifact problem this cleanup exists
+// to prevent. Returns empty on success (including "nothing to remove"),
+// else a human-readable reason including the errno text.
+std::string remove_stale_transcript(const std::string& path) {
     if (unlink(path.c_str()) != 0 && errno != ENOENT) {
-        std::cerr << "WARN: could not remove stale transcript at " << path << ": "
-                  << strerror(errno) << "\n";
+        return "could not remove stale transcript at " + path + ": " + strerror(errno);
     }
+    return "";
 }
 
 // Checks the three prerequisites named in envoy-pr-plan.md PR 2: docker on
@@ -1015,6 +1022,32 @@ public:
     // 3-way handshake at that instant -- resolves at the kernel level
     // almost immediately, so this is expected to return promptly; the
     // bounded timeout is a safety net, not the expected path.
+    //
+    // Round-20 review, "Synchronize the accepted-connection handoff before
+    // returning idle" (P1): fresh evidence beyond the above is the gap
+    // *inside* accept_loop() between accept() consuming a connection off
+    // the kernel backlog (at which point poll() on the listener stops
+    // reporting it, since the backlog is now empty) and that connection's
+    // fd actually landing in `active_fds_` under `conn_mu_`. If the accept
+    // thread is preempted in exactly that gap, a concurrent wait_idle()
+    // call can observe "listener not readable" AND "active_fds_ empty" at
+    // the same instant, despite the accepted connection's request not
+    // having been recorded yet -- the two observations were never atomic
+    // with each other. Closed by `accepted_pending_` (see accept_loop()):
+    // it is incremented, under `conn_mu_`, strictly BEFORE accept_loop()
+    // calls accept() (as soon as its own poll() sees the connection
+    // queued), and only decremented after the resulting fd has been pushed
+    // into `active_fds_`, still under the same mutex. That ordering means
+    // there is no instant at which "the backlog looks empty" (implying
+    // accept() has already run) can coincide with "accepted_pending_ == 0"
+    // (implying registration has already finished) for the SAME
+    // connection: the counter covers exactly the handoff gap the listener
+    // poll cannot see into. A connection queued after this wait already
+    // started is still caught, with no separate generation/epoch counter
+    // needed: this loop re-polls both signals every 5ms until `timeout_ms`
+    // elapses, so a connection that arrives mid-wait is observed on
+    // whichever subsequent iteration follows its arrival, exactly like one
+    // that was already pending when the wait began.
     bool wait_idle(int timeout_ms) {
         const int64_t deadline = now_ms() + timeout_ms;
         for (;;) {
@@ -1026,13 +1059,22 @@ public:
             }
             if (!pending_on_listener) {
                 std::lock_guard<std::mutex> lock(conn_mu_);
-                if (active_fds_.empty()) return true;
+                if (accepted_pending_ == 0 && active_fds_.empty()) return true;
             }
             if (now_ms() >= deadline) return false;
             struct timespec ts{0, 5'000'000};
             nanosleep(&ts, nullptr);
         }
     }
+
+    // Test-only hook for self_test_wait_idle_synchronizes_accept_handoff():
+    // when nonzero, accept_loop() sleeps this many milliseconds after
+    // accept() returns a connection's fd but before that fd is pushed into
+    // `active_fds_`, deliberately widening the round-20 review's handoff
+    // gap so a test can deterministically observe whether wait_idle()
+    // still correctly treats the connection as outstanding throughout it.
+    // Always 0 in production use.
+    void set_test_post_accept_delay_ms(int ms) { test_post_accept_delay_ms_ = ms; }
 
     // Idempotent: safe to call more than once (the destructor calls it again
     // after an explicit stop()).
@@ -1086,16 +1128,45 @@ private:
         close(fd);
     }
 
+    // Round-20 review, "Synchronize the accepted-connection handoff before
+    // returning idle": polls the listener explicitly, rather than calling
+    // the blocking accept() directly, so `accepted_pending_` can be
+    // incremented (under `conn_mu_`) strictly before accept() removes the
+    // connection from the kernel backlog -- see wait_idle()'s comment for
+    // why that ordering is what closes the race. poll()'s indefinite
+    // timeout still blocks this thread exactly like the old direct accept()
+    // call did, and stop()'s shutdown()+close() of `listen_fd_` unblocks it
+    // the same way (poll() returns on a shut-down/closed fd, just like
+    // accept() used to).
     void accept_loop() {
         while (!stopping_.load()) {
-            const int fd = accept(listen_fd_, nullptr, nullptr);
-            if (fd < 0) {
+            pollfd pfd{listen_fd_, POLLIN, 0};
+            const int pr = poll(&pfd, 1, -1);
+            if (pr <= 0 || (pfd.revents & POLLIN) == 0) {
                 if (stopping_.load()) return;
                 continue;
+            }
+            {
+                std::lock_guard<std::mutex> lock(conn_mu_);
+                accepted_pending_++;
+            }
+            const int fd = accept(listen_fd_, nullptr, nullptr);
+            if (fd < 0) {
+                std::lock_guard<std::mutex> lock(conn_mu_);
+                accepted_pending_--;
+                if (stopping_.load()) return;
+                continue;
+            }
+            if (test_post_accept_delay_ms_ > 0) {
+                struct timespec ts{
+                    test_post_accept_delay_ms_ / 1000,
+                    static_cast<long>(test_post_accept_delay_ms_ % 1000) * 1'000'000};
+                nanosleep(&ts, nullptr);
             }
             std::lock_guard<std::mutex> lock(conn_mu_);
             active_fds_.push_back(fd);
             conn_threads_.emplace_back(&RecordingUpstream::handle_connection, this, fd);
+            accepted_pending_--;
         }
     }
 
@@ -1200,6 +1271,12 @@ private:
     std::mutex conn_mu_;
     std::vector<int> active_fds_;
     std::vector<std::thread> conn_threads_;
+    // Number of connections accept_loop() has claimed (poll() saw them
+    // queued) but has not yet finished registering into `active_fds_`.
+    // Guarded by `conn_mu_`; see wait_idle()'s round-20 review comment.
+    int accepted_pending_ = 0;
+    // Test-only; see set_test_post_accept_delay_ms()'s comment.
+    int test_post_accept_delay_ms_ = 0;
     std::string default_reply_ =
         "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 5\r\n\r\nhello";
 };
@@ -2716,6 +2793,48 @@ std::string check_no_reuseport_collision_after_batch(uint16_t port, uid_t uid) {
     return "";
 }
 
+// Round-20 review, "Reject asserted evidence when upstream quiescence times
+// out" (P1): every asserted-phase call site across all three production
+// paths (oracle, pair Envoy, pair RUT) used to call
+// `upstream.wait_idle(timeout_ms)` and then proceed straight to
+// fill_upstream_bytes() regardless of the return value. Stopping the proxy
+// only guarantees ITS OWN process exited; if a handler thread is still
+// draining a delayed/duplicate/unlisted request when the deadline expires,
+// fill_upstream_bytes() (and the clear_requests() that follows once this
+// batch's evidence is captured) can run before that request is ever
+// recorded, silently omitting it from asserted evidence that is supposed to
+// gate the run's exit code. `phase_label` names the phase in the error
+// message (e.g. "oracle asserted", "pair Envoy asserted").
+bool require_upstream_idle_for_asserted_batch(RecordingUpstream& upstream,
+                                              int timeout_ms,
+                                              const char* phase_label,
+                                              std::string* error) {
+    if (upstream.wait_idle(timeout_ms)) return true;
+    *error = std::string("upstream did not go idle within ") + std::to_string(timeout_ms) +
+             "ms after stopping the " + phase_label +
+             " instance -- a handler thread may still be draining a delayed, duplicate, or "
+             "unlisted request; refusing to trust this asserted batch's evidence";
+    return false;
+}
+
+// Record-only counterpart: the CLI contract already promises record-only
+// cases never gate the exit code (see every other record-only anomaly in
+// this harness -- a reuseport collision, a proxy crash, a duplicate
+// contact), so the same upstream-quiescence timeout here is downgraded to a
+// NOTE and flags every result in this batch `upstream_ambiguous`, rather
+// than failing the run.
+void note_upstream_idle_timeout_for_record_only_batch(RecordingUpstream& upstream,
+                                                      int timeout_ms,
+                                                      const char* phase_label,
+                                                      std::vector<CaseResult>* results) {
+    if (upstream.wait_idle(timeout_ms)) return;
+    std::cerr << "NOTE: upstream did not go idle within " << timeout_ms << "ms after stopping the "
+              << phase_label
+              << " instance; a handler thread may still be draining traffic, so this "
+                 "record-only batch's evidence is marked ambiguous\n";
+    for (auto& r : *results) r.upstream_ambiguous = true;
+}
+
 // Refuses evidence that would make write_transcript() emit a fixture
 // claiming bytes for an exchange that never actually completed, or claiming
 // a single upstream request when the recording upstream in fact observed
@@ -3556,7 +3675,11 @@ void note_record_only_phase_crash(const char* proxy_label,
 }
 
 int run_oracle_milestone_s(const std::string& output_path) {
-    remove_stale_transcript(output_path);
+    const std::string stale_transcript_error = remove_stale_transcript(output_path);
+    if (!stale_transcript_error.empty()) {
+        std::cerr << "FAIL: " << stale_transcript_error << "\n";
+        return 1;
+    }
     const std::string missing = check_docker_prerequisites();
     if (!missing.empty()) return missing_prerequisite(missing);
 
@@ -3703,7 +3826,16 @@ int run_oracle_milestone_s(const std::string& output_path) {
             upstream.stop();
             return 1;
         }
-        upstream.wait_idle(2000);
+        // Round-20 review, "Reject asserted evidence when upstream
+        // quiescence times out": a timeout here must fail this asserted
+        // batch, not be silently ignored.
+        std::string idle_timeout_error;
+        if (!require_upstream_idle_for_asserted_batch(
+                upstream, 2000, "oracle asserted", &idle_timeout_error)) {
+            std::cerr << "FAIL: " << idle_timeout_error << "\n";
+            upstream.stop();
+            return 1;
+        }
         if (!fill_upstream_bytes(&asserted_results, asserted_cases, upstream)) {
             upstream.stop();
             return 1;
@@ -3748,7 +3880,11 @@ int run_oracle_milestone_s(const std::string& output_path) {
             note_record_only_phase_crash(
                 "envoy", envoy_record_only.unexpected_exit_description, &record_only_results);
         }
-        upstream.wait_idle(2000);
+        // Round-20 review, "Reject asserted evidence when upstream
+        // quiescence times out": record-only phases downgrade the same
+        // timeout to a NOTE instead of failing the run.
+        note_upstream_idle_timeout_for_record_only_batch(
+            upstream, 2000, "oracle record-only", &record_only_results);
         fill_upstream_bytes(&record_only_results, record_only_cases, upstream);
         // Round-19 review, "Keep record-only co-owners from failing pair
         // mode": a persistent SO_REUSEPORT co-owner (already classified as
@@ -3920,7 +4056,11 @@ bool compare_pair_case(const PairCaseResult& c) {
 int run_pair_milestone_s(const std::string& rut_binary,
                          const std::string& converter_binary,
                          const std::string& transcript_path) {
-    remove_stale_transcript(transcript_path);
+    const std::string stale_transcript_error = remove_stale_transcript(transcript_path);
+    if (!stale_transcript_error.empty()) {
+        std::cerr << "FAIL: " << stale_transcript_error << "\n";
+        return 1;
+    }
     const std::string missing = check_docker_prerequisites();
     if (!missing.empty()) return missing_prerequisite(missing);
 
@@ -4067,7 +4207,16 @@ int run_pair_milestone_s(const std::string& rut_binary,
         // Round-18 review, "Wait for upstream handlers before inspecting
         // asserted traffic": stopping the proxy does not synchronize with
         // the upstream's own independent connection-handler threads.
-        upstream.wait_idle(2000);
+        // Round-20 review, "Reject asserted evidence when upstream
+        // quiescence times out": a timeout here must fail this asserted
+        // batch, not be silently ignored.
+        std::string envoy_idle_timeout_error;
+        if (!require_upstream_idle_for_asserted_batch(
+                upstream, 2000, "pair Envoy asserted", &envoy_idle_timeout_error)) {
+            std::cerr << "FAIL: " << envoy_idle_timeout_error << "\n";
+            upstream.stop();
+            return 1;
+        }
         if (!fill_upstream_bytes(&envoy_asserted_results, asserted_cases, upstream)) {
             upstream.stop();
             return 1;
@@ -4116,7 +4265,11 @@ int run_pair_milestone_s(const std::string& rut_binary,
             note_record_only_phase_crash(
                 "envoy", envoy_record_only.unexpected_exit_description, &envoy_record_only_results);
         }
-        upstream.wait_idle(2000);
+        // Round-20 review, "Reject asserted evidence when upstream
+        // quiescence times out": record-only phases downgrade the same
+        // timeout to a NOTE instead of failing the run.
+        note_upstream_idle_timeout_for_record_only_batch(
+            upstream, 2000, "pair Envoy record-only", &envoy_record_only_results);
         fill_upstream_bytes(&envoy_record_only_results, record_only_cases, upstream);
         // Round-19 review, "Keep record-only co-owners from failing pair
         // mode": a persistent SO_REUSEPORT co-owner (already classified as
@@ -4197,7 +4350,16 @@ int run_pair_milestone_s(const std::string& rut_binary,
             upstream.stop();
             return 1;
         }
-        upstream.wait_idle(2000);
+        // Round-20 review, "Reject asserted evidence when upstream
+        // quiescence times out": a timeout here must fail this asserted
+        // batch, not be silently ignored.
+        std::string rut_idle_timeout_error;
+        if (!require_upstream_idle_for_asserted_batch(
+                upstream, 2000, "pair RUT asserted", &rut_idle_timeout_error)) {
+            std::cerr << "FAIL: " << rut_idle_timeout_error << "\n";
+            upstream.stop();
+            return 1;
+        }
         if (!fill_upstream_bytes(&rut_asserted_results, asserted_cases, upstream)) {
             upstream.stop();
             return 1;
@@ -4238,7 +4400,11 @@ int run_pair_milestone_s(const std::string& rut_binary,
         // traffic": stop (and wait for the upstream to drain) BEFORE
         // inspecting its evidence.
         const bool rut_record_only_stopped_cleanly = rut_record_only.stop();
-        upstream.wait_idle(2000);
+        // Round-20 review, "Reject asserted evidence when upstream
+        // quiescence times out": record-only phases downgrade the same
+        // timeout to a NOTE instead of failing the run.
+        note_upstream_idle_timeout_for_record_only_batch(
+            upstream, 2000, "pair RUT record-only", &rut_record_only_results);
         fill_upstream_bytes(&rut_record_only_results, record_only_cases, upstream);
         upstream.stop();
         // This instance only ever ran the record-only batch, so a stop()
@@ -4375,6 +4541,102 @@ int run_pair_milestone_s(const std::string& rut_binary,
 }
 
 // ── --self-test ───────────────────────────────────────────────────────
+
+// Round-20 review, "Abort when a stale transcript cannot be removed": a
+// non-ENOENT unlink() failure must be reported as a fatal error (with the
+// errno text) rather than merely warned and ignored, so a stale artifact
+// from a previous run can never survive to be re-uploaded by a subsequent
+// failure. The failure case is exercised by revoking write permission on
+// the file's CONTAINING directory (unlink() needs that, not permission on
+// the file itself), which deterministically produces EACCES regardless of
+// the target file's own mode -- skipped when running as root, since root
+// bypasses that permission check entirely and the test could not
+// distinguish a real fix from a silently-passing no-op.
+bool self_test_remove_stale_transcript() {
+    bool ok = true;
+
+    // Missing file: success, empty error.
+    {
+        TempDir dir("rut-envoy-selftest-stale-transcript");
+        if (dir.empty()) {
+            std::cerr << "FAIL [self-test remove stale transcript]: could not create temp dir\n";
+            return false;
+        }
+        const std::string missing_path = dir.path() + "/does-not-exist.inc";
+        const std::string error = remove_stale_transcript(missing_path);
+        if (!error.empty()) {
+            std::cerr << "FAIL [self-test remove stale transcript]: a missing file must not be "
+                         "an error, got: \""
+                      << error << "\"\n";
+            ok = false;
+        }
+    }
+
+    // Existing, removable file: success, and the file is actually gone.
+    {
+        TempDir dir("rut-envoy-selftest-stale-transcript");
+        if (dir.empty()) {
+            std::cerr << "FAIL [self-test remove stale transcript]: could not create temp dir\n";
+            return false;
+        }
+        const std::string path = dir.path() + "/stale.inc";
+        if (!write_file_mode(path, "stale contents", 0644)) {
+            std::cerr << "FAIL [self-test remove stale transcript]: could not create the stale "
+                         "file\n";
+            return false;
+        }
+        const std::string error = remove_stale_transcript(path);
+        if (!error.empty()) {
+            std::cerr << "FAIL [self-test remove stale transcript]: rejected an ordinary "
+                         "removable file, got: \""
+                      << error << "\"\n";
+            ok = false;
+        }
+        struct stat st{};
+        if (stat(path.c_str(), &st) == 0) {
+            std::cerr << "FAIL [self-test remove stale transcript]: the file was still present "
+                         "after a reported success\n";
+            ok = false;
+        }
+    }
+
+    // Non-ENOENT failure: fatal, with the errno text.
+    if (getuid() != 0) {
+        TempDir dir("rut-envoy-selftest-stale-transcript");
+        if (dir.empty()) {
+            std::cerr << "FAIL [self-test remove stale transcript]: could not create temp dir\n";
+            return false;
+        }
+        const std::string path = dir.path() + "/undeletable.inc";
+        if (!write_file_mode(path, "stale contents", 0644)) {
+            std::cerr << "FAIL [self-test remove stale transcript]: could not create the "
+                         "undeletable file\n";
+            return false;
+        }
+        if (chmod(dir.path().c_str(), 0555) != 0) {
+            std::cerr << "FAIL [self-test remove stale transcript]: could not revoke the temp "
+                         "dir's write permission\n";
+            return false;
+        }
+        const std::string error = remove_stale_transcript(path);
+        // Restore write permission unconditionally, before any FAIL return
+        // below, so TempDir's own destructor can still clean this up.
+        chmod(dir.path().c_str(), 0755);
+        if (error.empty()) {
+            std::cerr << "FAIL [self-test remove stale transcript]: expected a fatal error for "
+                         "an unremovable file, got success\n";
+            ok = false;
+        } else if (error.find(path) == std::string::npos) {
+            std::cerr << "FAIL [self-test remove stale transcript]: expected the error to name "
+                         "the path, got: \""
+                      << error << "\"\n";
+            ok = false;
+        }
+    }
+
+    if (ok) std::cerr << "PASS [self-test remove stale transcript]\n";
+    return ok;
+}
 
 bool self_test_escaping() {
     std::string sample = "before\r\n\"\\";
@@ -4576,6 +4838,184 @@ bool self_test_wait_idle_synchronizes_with_pending_accept() {
     close(fd);
     upstream.stop();
     if (ok) std::cerr << "PASS [self-test wait_idle pending accept]\n";
+    return ok;
+}
+
+// Round-20 review, "Synchronize the accepted-connection handoff before
+// returning idle" (P1): reproduces the gap *inside* accept_loop() between
+// accept() consuming a connection off the kernel backlog and that
+// connection's fd landing in `active_fds_`, using
+// set_test_post_accept_delay_ms() to widen that gap to a deterministic,
+// generous duration instead of relying on a timing-dependent thread
+// preemption. Before the round-20 fix (an `accepted_pending_` counter
+// incremented, under `conn_mu_`, strictly before accept_loop() calls
+// accept()), wait_idle() would see "listener not readable" (the backlog is
+// already empty -- accept() has run) AND "active_fds_ empty" (the fd is
+// still sitting in the injected delay, not yet registered) and incorrectly
+// report idle well before the delay elapses, in turn letting the request
+// go unrecorded at snapshot time. This test asserts wait_idle() only
+// returns once the full injected delay has elapsed, and that the
+// connection's request is always recorded by the time it does.
+bool self_test_wait_idle_synchronizes_accept_handoff() {
+    BoundPort bound;
+    if (!allocate_bound_loopback_port(&bound)) {
+        std::cerr << "FAIL [self-test wait_idle accept handoff]: could not allocate a loopback "
+                     "port\n";
+        return false;
+    }
+    const uint16_t port = bound.port;
+
+    RecordingUpstream upstream;
+    upstream.set_default_reply(
+        "HTTP/1.1 200 OK\r\nConnection: close\r\nContent-Length: 2\r\n\r\nhi");
+    constexpr int kInjectedDelayMs = 300;
+    upstream.set_test_post_accept_delay_ms(kInjectedDelayMs);
+    if (!upstream.adopt(bound.fd)) {
+        std::cerr << "FAIL [self-test wait_idle accept handoff]: could not adopt the listener\n";
+        return false;
+    }
+
+    const int fd = connect_with_timeout(port, kClientTimeoutMs);
+    if (fd < 0) {
+        std::cerr << "FAIL [self-test wait_idle accept handoff]: could not connect\n";
+        upstream.stop();
+        return false;
+    }
+    const std::string req =
+        "GET /handoff-race HTTP/1.1\r\nHost: t.example\r\nConnection: close\r\n\r\n";
+    if (!send_all(fd, req)) {
+        std::cerr << "FAIL [self-test wait_idle accept handoff]: could not send the request\n";
+        close(fd);
+        upstream.stop();
+        return false;
+    }
+
+    // Give accept_loop() a moment to actually call accept() and enter the
+    // injected delay before starting the timed wait_idle() call below --
+    // otherwise this could spuriously pass by timing out on the initial
+    // TCP handshake instead of exercising the post-accept gap at all.
+    struct timespec settle{0, 50'000'000};
+    nanosleep(&settle, nullptr);
+
+    bool ok = true;
+    const int64_t start = now_ms();
+    const bool went_idle = upstream.wait_idle(2000);
+    const int64_t elapsed = now_ms() - start;
+    if (!went_idle) {
+        std::cerr << "FAIL [self-test wait_idle accept handoff]: wait_idle() timed out instead "
+                     "of waiting out the injected accept-to-registration delay\n";
+        ok = false;
+    }
+    // Allows scheduling slack below the injected delay so this isn't flaky
+    // under a loaded CI host, while still failing if wait_idle() raced past
+    // the gap near-instantly (the bug this test targets).
+    if (elapsed < kInjectedDelayMs - 100) {
+        std::cerr << "FAIL [self-test wait_idle accept handoff]: wait_idle() returned after only "
+                  << elapsed << "ms, before the " << kInjectedDelayMs
+                  << "ms injected accept-to-registration delay could have elapsed -- it raced "
+                     "past the handoff gap instead of waiting for accepted_pending_\n";
+        ok = false;
+    }
+    if (upstream.requests_for("/handoff-race").empty()) {
+        std::cerr << "FAIL [self-test wait_idle accept handoff]: the connection accepted during "
+                     "the injected delay was never recorded despite wait_idle() reporting idle\n";
+        ok = false;
+    }
+    read_http_message(fd, /*head_request=*/false, kClientTimeoutMs);
+    close(fd);
+    upstream.stop();
+    if (ok) std::cerr << "PASS [self-test wait_idle accept handoff]\n";
+    return ok;
+}
+
+// Round-20 review, "Reject asserted evidence when upstream quiescence times
+// out" (P1): simulates a stalled handler thread by sending a request WITHOUT
+// "Connection: close" and never disconnecting -- handle_connection() then
+// stays parked in its own poll() indefinitely (up to its own 5s per-read
+// timeout), exactly the "handler still draining" scenario the review
+// describes, without needing any harness-specific stall hook. Confirms
+// require_upstream_idle_for_asserted_batch() reports the resulting
+// wait_idle() timeout as fatal with a clear message (the guard now applied
+// at every asserted production call site: oracle, pair Envoy, pair RUT),
+// and that note_upstream_idle_timeout_for_record_only_batch() downgrades
+// the identical timeout to a non-fatal NOTE that only flags results
+// ambiguous, matching every other record-only anomaly in this harness.
+bool self_test_require_upstream_idle_for_asserted_batch() {
+    BoundPort bound;
+    if (!allocate_bound_loopback_port(&bound)) {
+        std::cerr << "FAIL [self-test require upstream idle]: could not allocate a loopback "
+                     "port\n";
+        return false;
+    }
+    const uint16_t port = bound.port;
+
+    RecordingUpstream upstream;
+    upstream.set_default_reply(
+        "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nhi");  // no "Connection: close"
+    if (!upstream.adopt(bound.fd)) {
+        std::cerr << "FAIL [self-test require upstream idle]: could not adopt the listener\n";
+        return false;
+    }
+
+    const int fd = connect_with_timeout(port, kClientTimeoutMs);
+    if (fd < 0) {
+        std::cerr << "FAIL [self-test require upstream idle]: could not connect\n";
+        upstream.stop();
+        return false;
+    }
+    // No "Connection: close": the reply above keeps this connection pooled,
+    // so handle_connection() loops back into its own poll() waiting for a
+    // request that will never come -- a genuinely stalled handler thread,
+    // still present in active_fds_, for as long as this fd stays open.
+    const std::string req = "GET /stalled HTTP/1.1\r\nHost: t.example\r\n\r\n";
+    if (!send_all(fd, req)) {
+        std::cerr << "FAIL [self-test require upstream idle]: could not send the request\n";
+        close(fd);
+        upstream.stop();
+        return false;
+    }
+    // Let the handler thread actually pick up and record the request before
+    // the timed checks below, so a real handler exists to stall on.
+    for (int i = 0; i < 200 && upstream.requests_for("/stalled").empty(); i++) {
+        struct timespec ts{0, 5'000'000};
+        nanosleep(&ts, nullptr);
+    }
+
+    bool ok = true;
+    if (upstream.requests_for("/stalled").empty()) {
+        std::cerr << "FAIL [self-test require upstream idle]: the stalled request was never "
+                     "recorded, so this test cannot exercise a real stalled handler\n";
+        ok = false;
+    }
+
+    std::string asserted_error;
+    if (require_upstream_idle_for_asserted_batch(
+            upstream, 300, "self-test asserted", &asserted_error)) {
+        std::cerr << "FAIL [self-test require upstream idle]: require_upstream_idle_for_"
+                     "asserted_batch() reported success despite a handler thread still stalled "
+                     "on an open connection\n";
+        ok = false;
+    }
+    if (asserted_error.empty() || asserted_error.find("self-test asserted") == std::string::npos) {
+        std::cerr << "FAIL [self-test require upstream idle]: expected a clear error message "
+                     "naming the phase, got: \""
+                  << asserted_error << "\"\n";
+        ok = false;
+    }
+
+    std::vector<CaseResult> record_only_results(1);
+    note_upstream_idle_timeout_for_record_only_batch(
+        upstream, 300, "self-test record-only", &record_only_results);
+    if (!record_only_results[0].upstream_ambiguous) {
+        std::cerr << "FAIL [self-test require upstream idle]: note_upstream_idle_timeout_for_"
+                     "record_only_batch() did not flag the result ambiguous despite the same "
+                     "stalled handler\n";
+        ok = false;
+    }
+
+    close(fd);
+    upstream.stop();
+    if (ok) std::cerr << "PASS [self-test require upstream idle]\n";
     return ok;
 }
 
@@ -8570,9 +9010,12 @@ bool run_self_test_rut_pass(const std::string& rut_binary, const std::string& co
 
 int run_self_test(const std::string& rut_binary, const std::string& converter_binary) {
     bool ok = true;
+    ok &= self_test_remove_stale_transcript();
     ok &= self_test_escaping();
     ok &= self_test_recording_upstream();
     ok &= self_test_wait_idle_synchronizes_with_pending_accept();
+    ok &= self_test_wait_idle_synchronizes_accept_handoff();
+    ok &= self_test_require_upstream_idle_for_asserted_batch();
     ok &= self_test_partial_exchange_rejection();
     ok &= self_test_fake_listener_unblocks_on_shutdown();
     ok &= self_test_argv_builder();
