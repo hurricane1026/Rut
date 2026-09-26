@@ -34,7 +34,7 @@ every bootstrap indefinitely.
 | Bootstrap envelope: `static_resources` with exactly one listener and one cluster; proto3 JSON encoding; snake_case and lowerCamelCase field spellings; both spellings of one field rejected as a duplicate | yes: increment 1 model (`include/rut/envoy/parser.h`), every other top-level field (`admin`, `node`, `dynamic_resources`, ...) and every `static_resources.secrets` entry rejected at the key | yes, capability-gated (fails closed until the BLOCKED rows land) | n/a | none | NOT_IMPLEMENTED |
 | Listener: optional `name`, one IPv4 `socket_address` with `port_value` 1..65535, one filter chain with no match and no transport socket | yes: IPv6, hostnames, `pipe`, `protocol`, `additional_addresses`, `listener_filters`, `filter_chain_match`, `transport_socket`, multiple listeners/chains rejected | yes, capability-gated (fails closed until the BLOCKED rows land) | `listen a.b.c.d:port` exists for one IPv4 listener; `listen :port` for the wildcard (`listen 0.0.0.0:port` does not parse) | none | NOT_IMPLEMENTED |
 | HTTP connection manager: v3 `@type`, non-empty `stat_prefix`, `codec_type: "HTTP1"` required, `generate_request_id: false` required, inline `route_config`, `http_filters` = exactly the router | yes: other network filters, other `@type`, `codec_type` omitted/`AUTO`/`HTTP2`/`HTTP3` (AUTO permits downstream h2c, out of scope), `generate_request_id` omitted or `true`, `rds`, `access_log`, `tracing`, `use_remote_address`, `server_name`, non-router HTTP filters rejected | yes, capability-gated (fails closed until the BLOCKED rows land) | see BLOCKED rows below | none | NOT_IMPLEMENTED |
-| Route table: one virtual host with `domains: ["*"]`, a bounded ordered route list (`kMaxEnvoyRoutes` = 8) with `route.cluster` naming a declared cluster | yes: host lists, `safe_regex`/headers matchers, route `retry_policy`/rewrites, `weighted_clusters`, undeclared cluster references, a 9th route rejected; `path`, prefix ending in `/`, `direct_response` and `redirect` are now modeled (see the increment-4 rows below), not rejected as unknown fields | yes, capability-gated (fails closed until the BLOCKED rows land); a single-route, single-cluster, `route.cluster`-only list still needs the six rows below | segment-aware `route "/"` catch-all exists; `unmatched` policies exist for the 404 shape | none | NOT_IMPLEMENTED |
+| Route table: one virtual host with `domains: ["*"]`, a bounded ordered route list (`kMaxEnvoyRoutes` = 8) with `route.cluster` naming a declared cluster | yes: host lists, `safe_regex`/headers matchers, route `retry_policy`/rewrites, `weighted_clusters`, undeclared cluster references, a 9th route rejected; `path`, prefix ending in `/`, `direct_response` and `redirect` are now modeled (see the increment-4 rows below), not rejected as unknown fields | yes, capability-gated (fails closed until the BLOCKED rows land); an ordered route list up to `kMaxEnvoyRoutes` is lowered by construction (PR 8, see the increment-4 rows below), but every `route.cluster` action still needs the six rows below. "Any size up to `kMaxEnvoyRoutes`" is the admission rule, not a usable capacity claim: the emitted program is also bounded by the RUT compiler frontend's lexer token budget (`LexedTokens::kMaxTokens`, `include/rut/compiler/lexer.h` -- 932 today, 4096 once #697 lands; #697 is unmerged as of this PR), which a route list well inside `kMaxEnvoyRoutes` can already exceed (confirmed: a 2-route, 2-node bootstrap needing an if/else arm on one node -- `tests/fixtures/envoy_routes_a.inc`'s scenario -- lexes to over 932 tokens). The token budget is not the only shape-dependent admission limit: a lone `prefix` route with no catch-all (e.g. `prefix: "/api/"` alone, well under both `kMaxEnvoyRoutes` and the token budget) and a root containing only exact `path` routes with no catch-all `"/"` are both rejected as `BLOCKED_BY_RUT`, because their no-route 404 has no RUT form that serves every method Envoy's real 404 would (see the increment-4 rows below and the "Internal evidence notes" section's `blocked_on_node_own_literal_needs_all_method_fallback` / `blocked_root_exact_arms_without_catch_all` tests). `lower_to_rut` now measures the emitted program against that budget and fails closed with `TooManyTokens` instead of returning a program `rut` cannot load | segment-aware `route "/"` catch-all exists; `unmatched` policies exist for the 404 shape | none | NOT_IMPLEMENTED |
 | Cluster: `type` omitted or `STATIC`, positive `connect_timeout` with millisecond precision, `load_assignment` with required `cluster_name` matching the cluster and one locality with one IPv4 `lb_endpoints` entry | yes: `STRICT_DNS`/`LOGICAL_DNS`/`EDS`/`ORIGINAL_DST`, `lb_policy`, `health_checks`, `circuit_breakers`, `outlier_detection`, `transport_socket`, weights, `locality`, multiple localities/endpoints, sub-millisecond or zero durations, omitted or mismatched `load_assignment.cluster_name` rejected | yes, capability-gated (fails closed until the BLOCKED rows land) | `upstream envoy_cluster_0 at "ip:port"` exists; `connect_timeout` has no connect-establishment RUT surface (accepted with a stderr warning, see "Blocked by Rut") | none | NOT_IMPLEMENTED |
 | Router filter `suppress_envoy_headers: true` (v3 `Router` typed_config; also accepts `suppressEnvoyHeaders`) | yes: boolean-only, duplicate-spelling rejection, only valid inside the router's typed_config | required (milestone-S; see docs/envoy-converter.md) | removes `x-envoy-upstream-service-time` / `x-envoy-expected-rq-timeout-ms`; no separate RUT surface needed once emitted | none | NOT_IMPLEMENTED |
 | Route action `timeout: "0s"` (proto3 JSON `Duration`, zero permitted) | yes: `"0s"` through `"4294967s"`, sub-millisecond and non-numeric forms rejected | required (milestone-S; a present, non-zero `timeout` is also rejected until a RUT route-timeout surface exists) | none needed for `"0s"` (removes the implicit 15s default); non-zero values are BLOCKED_BY_RUT | none | NOT_IMPLEMENTED |
@@ -200,23 +200,57 @@ would have done (Envoy has no such reserved path).
 
 These rows widen the parser's semantic model (`include/rut/envoy/parser.h`,
 `RouteMatchKind`, `RouteActionKind`) beyond the single-route, single-cluster
-milestone above. Nothing here changes lowering: `rut::envoy::lower_to_rut`
-still requires exactly one route and one cluster and a `route.cluster`
-action, and rejects every shape below with its own `UnsupportedSyntax`
-diagnostic (`"multiple routes are not lowered yet"`,
-`"multiple clusters are not lowered yet"`, `"direct_response is not lowered
-yet"`, `"redirect is not lowered yet"`), checked before the six capability
-rows above. Lowering an ordered route list is PR 8.
+milestone above. PR 8 lowers the ordered-route-list shapes (`path`, prefix
+ending in `/`, multiple routes, multiple clusters) by construction (owner
+decision D3): `rut::envoy::lower_to_rut` builds, for each declared node, a
+nested `if`/`else` chain reproducing Envoy's first-match order restricted to
+that node (see the algorithm doc comment in `src/envoy/converter.cc` and
+docs/envoy-converter.md's "Routing" section) instead of rejecting the shape.
+**Global shadowing rule (Codex round-9 review on PR #695):** a `prefix`
+route `R` is dropped from the plan entirely -- before it is ever registered
+as a node, so no dead node is planned and no lexer token budget is spent on
+it -- when an EARLIER-declared route `Q` (any method, same virtual host)
+already matches every request `R` could ever match: `Q` is a `prefix` whose
+raw text is a byte-prefix of `R`'s (Envoy's prefix match is a raw byte-prefix
+test with no segment awareness of its own; every accepted `prefix`'s raw
+text is `"/"` or ends in `/`, so a shorter accepted prefix is a byte-prefix
+of a longer one exactly when it is also that longer one's segment-boundary
+ancestor, so segment-boundary ancestry (`is_strict_ancestor`,
+`src/envoy/converter.cc`) is Envoy's raw byte-prefix relation here with no
+extra byte-level helper needed -- e.g. `"/api/"` shadows `"/api/v1/"`).
+This generalizes the original report (`"/"` declared before
+distinct siblings such as `"/api/"` and `"/admin/"` -- root, being a
+byte-prefix of everything, shadows both) to any earlier, textually-shorter
+accepted prefix, not just root. Declaration order, not text length, decides
+precedence: a broader prefix declared AFTER a narrower one does not shadow
+it (see the "Multiple routes per virtual host" row below and the internal
+evidence note at the end of this section). A `prefix` shadowing a later
+exact `path` route the same way (e.g. `"/api/"` before `"/api/x"`) was
+already handled at the arm level since round 7/8 (`has_exact_arm`,
+`saw_own_prefix`) and is unchanged by this rule; two identical `path`
+declarations for the same literal were already deduped in round 8. Shapes
+Rut genuinely cannot express are unaffected and stay rejected the same way:
+a lone `prefix: "/api/"` with no catch-all still hits the node's-own-literal
+`BLOCKED_BY_RUT` gap below, and the segment-boundary vs. raw-byte-prefix
+difference for slash-terminated prefixes is still tracked as its own
+NOT_IMPLEMENTED row ("Path normalization" below). `direct_response` and
+`redirect` are still rejected with their own `UnsupportedSyntax` diagnostic
+(`"direct_response is not lowered yet"`, `"redirect is not lowered yet"`),
+checked before the six capability rows above, same as before.
 
 | Envoy feature | parser | converter | RUT capability | behavior test | status |
 | --- | --- | --- | --- | --- | --- |
-| `match.path` exact match (bytes 0x21-0x7e excluding `?`/`#`/`%`, max 64 bytes) | yes: modeled as `RouteMatchKind::Path`; both `prefix` and `path` on one match, a `path` not starting with `/`, and reserved/oversized bytes rejected | rejects with `"multiple routes are not lowered yet"` (multi-route, checked first) or `"match.path is not lowered yet"` at the match's span (single-route); no `path` lowering exists yet | Rut's route trie needs a segment-exact match for `path`; not yet wired to this frontend | none | NOT_IMPLEMENTED |
-| `match.prefix` ending in `/` (e.g. `"/api/"`), in addition to the catch-all `"/"` | yes: modeled as `RouteMatchKind::Prefix`; validated as `"/"` or starting and ending with `/` | rejects with `"multiple routes are not lowered yet"` (multi-route, checked first) or `"route matches other than \"prefix\": \"/\" are not lowered yet"` at the match's span (single-route); no scoped-prefix lowering exists yet | `RouteTrie::tokenize_segments` (`src/runtime/route_trie.cc`) drops trailing empty segments, so Rut treats `/api/` and `/api` as equivalent while Envoy's byte-prefix matcher does not; lowering `/api/` as a segment match would silently broaden the route. Blocked until Rut's route trie gains an explicit byte-level boundary check that distinguishes a slash-terminated prefix from its unterminated form — this is not a wiring gap, PR 8's ordered-list lowering (`docs/envoy-converter.md`, "Routing") does not remove it | none | BLOCKED_BY_RUT |
+| `match.path` exact match (bytes 0x21-0x7e excluding `?`/`#`/`%`, max 64 bytes) | yes: modeled as `RouteMatchKind::Path`; both `prefix` and `path` on one match, a `path` not starting with `/`, and reserved/oversized bytes rejected | yes: an exact `path` becomes a conditional `req.pathOnly == "..."` arm in its owning node's chain; when its literal text equals a node's own text and no other Envoy route ever resolves the node's literal, lowering fails closed instead of emitting a `route exact "N"` fallback (see the row below) | Rut's `req.pathOnly` comparisons cover the conditional-arm case once the six capability rows above are met; golden (c)/(f) and the brute-force equivalence tests cover it | none | PARTIAL (golden + equivalence test; pair evidence pending) |
+| `match.prefix` ending in `/` (e.g. `"/api/"`), in addition to the catch-all `"/"` | yes: modeled as `RouteMatchKind::Prefix`; validated as `"/"` or starting and ending with `/` | yes: each distinct prefix becomes its own RUT node (`route "N"` / `route HEAD "N"`); golden (a)/(b)/(f) cover declaration-order variants | same as `match.path` above | none | PARTIAL (golden + equivalence test; pair evidence pending) |
+| A node's own literal path with no earlier exact `path` route resolving it (e.g. `prefix: "/api/"` alone, or preceded only by an exact route under a *different* literal): Envoy's no-route 404 for that one literal path | yes: same modeling as the two rows above | no: `route exact "N"`'s strict local-response admission serves only GET/HEAD/POST/OPTIONS/PUT/DELETE/PATCH (`callbacks_impl.h`), so an ANY-method `route exact "N"` 404 would close the connection instead of answering TRACE/CONNECT the way Envoy's real 404 does; lowering fails closed with `"BLOCKED_BY_RUT: a no-route 404 for this node's own literal path has no RUT form that serves every method Envoy would 404"` (Codex P1 on PR #695) | none until an all-method `local_response` surface exists | none | BLOCKED_BY_RUT |
+| A `prefix` segment beginning with `:` (e.g. `"/:tenant/"`) | yes: `:` is not a reserved byte, so the parser admits it like any other printable-ASCII byte | rejects: a `prefix` match's text becomes a generated RUT route declaration, and a segment starting with `:` there is a route parameter (`include/rut/runtime/route_trie.h`), so `route "/:tenant"` would capture and forward `/anything/x`, which Envoy's literal byte match never does; rejected with `"route match segments beginning with \":\" would become a RUT route parameter, not a literal match; not lowered"`. An exact `path` match (e.g. `"/:tenant"`) is never emitted as a route declaration — only ever compared as the string literal `req.pathOnly == "/:tenant"` — so it carries no such risk and is not rejected for containing `:` (Codex P1 on PR #695, then narrowed to `prefix`-only on round 3) | n/a | none | BLOCKED_BY_RUT (`prefix` only) |
 | Raw (non-segment) `prefix` not ending in `/` (e.g. `"/api"`) | no: rejected at the field with `"only \"/\" or prefixes ending in \"/\" are supported"` | n/a (never reaches the converter) | Rut's route trie is segment-aware; a plain string prefix like Envoy's has no equivalent match today | none | BLOCKED_BY_RUT |
-| Multiple routes per virtual host, in list order (`kMaxEnvoyRoutes` = 8, a 9th rejected at its span) | yes: `VirtualHost::routes` is a bounded `FixedVec`, order preserved from the source array; no shadowing check here (owner decision D3, PR 8 lowers an ordered list correctly by construction) | rejects with `"multiple routes are not lowered yet"` at the second route's span | first-match route-list semantics have no lowering yet | none | NOT_IMPLEMENTED |
-| Multiple STATIC clusters (`kMaxEnvoyClusters` = 8, a 9th rejected at its span; duplicate names rejected) | yes: `Bootstrap::clusters` is a bounded `FixedVec`; every Forward route's `cluster` must name a declared entry | rejects with `"multiple clusters are not lowered yet"` at the second cluster's span | n/a | none | NOT_IMPLEMENTED |
+| Multiple routes per virtual host, in list order (`kMaxEnvoyRoutes` = 8, a 9th rejected at its span) | yes: `VirtualHost::routes` is a bounded `FixedVec`, order preserved from the source array; a `prefix` route globally shadowed by an earlier `prefix` route (Codex round-9 review on PR #695: Envoy's prefix match is a raw byte-prefix test, so an earlier `prefix` whose text is a byte-prefix of a later one's makes the later one unreachable for every request, not merely resolvable through it) is dropped by `build_lowering_plan` (`src/envoy/converter.cc`) before it is ever registered as a node, so no dead node is planned and no token budget is spent on it; declaration order (not text length) decides precedence, so a broader prefix declared AFTER a narrower one does not shadow it | yes: lowered by construction (see "Routing" above), now minus any node dropped as globally shadowed; a two-route bootstrap still fails closed on the same capability rows the single-route milestone hits until PR3-PR5 land. Codex round-6 review (P1): a route list admitted by `kMaxEnvoyRoutes` can still be un-loadable -- the emitted program is separately bounded by the compiler frontend's lexer token budget (`LexedTokens::kMaxTokens`, 932 today / 4096 after the unmerged #697), which even a 2-route bootstrap can exceed once a node needs an if/else arm (scenario (a) below). `lower_to_rut` now measures the emitted token count and fails closed with `TooManyTokens` rather than returning an unloadable program | first-match semantics reproduced per node; golden (a) (`tests/fixtures/envoy_routes_a.inc`) now documents the `TooManyTokens` boundary itself rather than a successful lowering (`golden_routes_a_prefix_then_root`, `token_budget_goldens_match_the_real_lexer`); golden (b) is now root-only (`/api/` globally shadowed by an earlier `/`, Codex round-9 -- see the internal evidence note below), and (c)/(f) still pin successful byte-for-byte output; the 40-probe brute-force equivalence test now checks only the two independent (converter-free) `envoy`/simulated dispatch models for its richer 3-node scenario, which itself exceeds the token budget (asserted via the same `TooManyTokens` diagnostic), while the 10-probe brute-force test still cross-checks the real emitted RUT text for its smaller 1-node scenario | none | PARTIAL (golden + equivalence test; pair evidence pending; realistic multi-node route lists are further limited by the lexer token budget until #697) |
+| Multiple STATIC clusters (`kMaxEnvoyClusters` = 8, a 9th rejected at its span; duplicate names rejected) | yes: `Bootstrap::clusters` is a bounded `FixedVec`; every Forward route's `cluster` must name a declared entry; a duplicate name is rejected at the second declaration's span | yes: every cluster is emitted as `upstream envoy_cluster_<i> at "..."` in declaration order, independent of which routes reference it; a hand-built `Bootstrap` with a duplicate cluster name (bypassing the parser) is rejected defensively too, since `cluster_index_of` would otherwise silently resolve every same-named reference to the first match (Codex P2 on PR #695) | n/a | none | PARTIAL (golden + equivalence test; pair evidence pending) |
 | `direct_response.status` + optional `body.inline_string` (≤ 4096 bytes) | yes: modeled as `RouteActionKind::DirectResponse`; other `DataSource` variants (`inline_bytes`, `filename`, ...) rejected as unsupported fields | rejects with `"direct_response is not lowered yet"` at the action's span | Envoy-layout `local_response` for an arbitrary status/body has no RUT emission yet (see PR 9) | none | NOT_IMPLEMENTED |
 | `redirect.path_redirect` / `host_redirect` / `response_code` (closed to `MOVED_PERMANENTLY`/`FOUND`/`SEE_OTHER`/`TEMPORARY_REDIRECT`/`PERMANENT_REDIRECT`) | yes: modeled as `RouteActionKind::Redirect`; every other `RedirectAction` field (`https_redirect`, `scheme_redirect`, `port_redirect`, `prefix_rewrite`, `strip_query`, ...) rejected as unsupported | rejects with `"redirect is not lowered yet"` at the action's span | no `redirect(...)` RUT construct exists yet (see PR 10) | none | NOT_IMPLEMENTED |
+| Path normalization: `merge_slashes`, percent-decoding, and Rut route-trie segment normalization (`"/api/"` / `"/api//v1"` collapse the same as `"/api"` / `"/api/v1"`) vs. Envoy's literal (unnormalized) string-prefix matching | not modeled: `merge_slashes` is not a recognized field; a configured `prefix` containing an internal `"//"` (the directly-detectable case: two declared prefixes that would collapse to the same node text, e.g. `"/api//v1/"` and `"/api/v1/"`) is rejected at `validate()` with `"route match prefix contains \"//\", which Rut's route trie collapses; not lowered"` (Codex P1 on PR #695 round 3) | n/a | Rut's trie normalizes empty path segments when selecting a node; PR 8's `req.pathOnly` arm comparisons do not; neither matches Envoy's default (no normalization) exactly. This remains a real divergence even with no `"//"` in any declared text: a request whose raw path contains an injected empty segment (e.g. `/api//v1/x`) can reach a declared node (e.g. `"/api/v1"`) and forward through its terminal prefix arm even though Envoy's literal prefix comparison would 404 it — confirmed NOT_IMPLEMENTED, not fixed by the `validate()` check above (which only catches the configured text itself, not every request that could alias into a node through collapsing) | none | NOT_IMPLEMENTED |
+| Segment-boundary dispatch: whether the RUT compiler's own routing engine (not the converter) respects `route "N"`'s segment boundary at all for a given module | n/a — a runtime dispatch-engine selection defect, not a parser/converter concern; reproduces from a plain hand-written `.rut` file with two routes, `"/"` and `"/api"`, nothing Envoy-specific | n/a: `build_node_plan`'s if/else arm logic is correct for whichever node the active dispatch engine hands it (see the algorithm doc comment above `build_node_plan`, src/envoy/converter.cc); the converter has no hook into the RUT compiler's later dispatch-engine choice | confirmed by direct reproduction against `RouteConfig`: `configure_route_dispatch` (`include/rut/runtime/compile_to_config.h`) calls `needs_segment_aware` (`src/runtime/route_select.cc`), whose `has_boundary_sensitive_overlap` exempts any pair containing root (root canonicalizes to the empty string) from "boundary-sensitive" regardless of the OTHER route's shape; for exactly the routes `"/"` and `"/api"` (PR8's own `golden_routes_a_prefix_then_root` shape) this makes `needs_segment_aware` return false, so `configure_route_dispatch` selects ART (`src/runtime/route_art.cc`), whose byte-level descent has no segment-boundary check at all: a request for `/apifoo` matches `/api`'s route instead of falling back to `/`'s. The same two routes forced onto `SegmentTrie` correctly fall back to `/`. Not caught by any existing test: `tests/test_envoy_convert.cc`'s brute-force equivalence tests never build a real `RouteConfig` or call `configure_route_dispatch` — `rut_dispatch` re-implements segment-aware node selection independently of the runtime (Codex P1 on PR #695 round 4) | none | NOT_IMPLEMENTED |
 
 ## Blocked by Rut before the milestone can reach SUPPORTED
 
@@ -326,3 +360,119 @@ converter fails closed on the whole configuration until then.
   table row) with the two converter-level fixes that were tried and found
   infeasible within the lexer's token budget and the language's expression
   grammar.
+- Increment 4 lowering (PR 8): `rut::envoy::lower_to_rut` now accepts an
+  ordered route list of any size up to `kMaxEnvoyRoutes` and multiple
+  clusters, lowering them by construction (owner decision D3) instead of
+  rejecting the shape; `direct_response` and `redirect` are still rejected.
+  Fixture files `tests/fixtures/envoy_routes_{a,b,c}.inc` and
+  `envoy_routes_shadowed_siblings.inc` exist (all capabilities `true`), and
+  (b), (c), and the shadowed-siblings fixture are byte-exact goldens pinning
+  `lower_to_rut`'s output against them (`golden_routes_b_root_then_prefix`:
+  catch-all `/` declared before prefix `/api/` -- since the round-9 fix
+  below, `/api` is globally shadowed and dropped, so this golden is now
+  root-only; `golden_routes_c_exact_then_root`: exact `/healthz` declared
+  before catch-all `/`; `shadowed_siblings_dropped_before_registration`:
+  Codex's own round-9 example, `/` declared before both `/api/` and
+  `/admin/`, also root-only). Four in-bounds shapes fail closed instead of
+  lowering, each covered by a failure test rather than a golden: (1)
+  scenario (a) — prefix `/api/` declared BEFORE the catch-all `/` — lowers to
+  a byte-valid program under `RutSource::kCapacity` (128 KiB) that still
+  exceeds the compiler frontend's own lexer token budget
+  (`LexedTokens::kMaxTokens`, 932 tokens; `envoy_routes_a.inc`'s 8804-byte
+  text hits `TooManyTokens` at byte 8400), so `golden_routes_a_prefix_then_root`
+  now asserts that rejection instead of pinning the old output — the fixture
+  is kept only as the pinned evidence for that measurement, and
+  `token_budget_goldens_match_the_real_lexer` checks the converter's
+  conservative token-count estimate (`estimate_conservative_token_count` in
+  `src/envoy/converter.cc`) against the real lexer for all three fixtures.
+  (2) A lone `prefix: "/api/"` with no catch-all declared leaves the literal
+  path `/api` itself with no Envoy route, and `route exact` cannot stand in
+  for that 404 (its strict local-response admission does not serve every
+  method — TRACE/CONNECT close the connection instead of responding), so
+  `build_node_plan` fails closed as `BLOCKED_BY_RUT`
+  (`blocked_on_node_own_literal_needs_all_method_fallback`, formerly golden
+  (d)). (3) The same shape with an exact route declared under the prefix
+  (permanently shadowed and dropped from the output) fails closed the same
+  way (`blocked_on_shadowed_exact_needs_all_method_fallback`, formerly
+  golden (e)). (4) A root with only exact routes (e.g. `/healthz`) and no
+  catch-all has the same no-RUT-form-for-a-404 problem at the root's own
+  fallthrough — the 404 no-route case —
+  (`blocked_root_exact_arms_without_catch_all`). Two further scenarios ARE
+  still lowered but without a byte-exact fixture backing them: an exact
+  route declared before its own prefix for the same literal
+  (`golden_routes_f_exact_then_own_prefix_not_blocked`, checked by
+  substring match on the emitted text, not a byte-exact golden) and a root
+  with no arms at all, which simply omits `route "/"` and falls through to
+  the `unmatched` policy (`root_omitted_without_catch_all_or_exact_arms`). A
+  third still-lowered scenario IS byte-exact: two identical exact routes for
+  the same literal declared back to back before a catch-all (e.g.
+  `/healthz`, `/healthz`, then `/`) used to make `build_node_plan` emit a
+  second, unreachable conditional arm plus a duplicated forwarding policy —
+  dead weight that could push an otherwise in-budget arm chain past the
+  lexer's token limit (Codex round-8 review). `build_node_plan` now tracks
+  exact match texts already emitted for a node (`has_exact_arm`,
+  `src/envoy/converter.cc`) and drops the later duplicate, so this shape
+  lowers to output byte-identical to scenario (c)'s golden
+  (`golden_routes_g_duplicate_exact_deduped`), reusing
+  `tests/fixtures/envoy_routes_c.inc` rather than adding a fourth fixture. A
+  brute-force test separately compares Envoy's real first-match semantics
+  against an independent reimplementation of the "longest node, then arm
+  chain" structure over ~40 probe paths. The lex/parse/analyze/MIR/RIR
+  round-trip these goldens will eventually need is deferred to PR3-PR5 (see
+  the TODO in `tests/test_envoy_convert.cc`): today's parser does not yet
+  accept the `local_response` fields the goldens use, and the single-route
+  milestone-S golden already fails the same way, so this is not a PR8
+  regression. No differential evidence exists yet.
+- PR 8 review fixes (Codex on PR #695): (1) a node's own literal path with no
+  earlier exact arm covering it now fails closed instead of emitting a
+  `route exact "N"` 404 whose strict local-response admission cannot serve
+  every method Envoy's real 404 would (TRACE/CONNECT closed the connection);
+  goldens (d) and (e) were exactly this shape and are now
+  `blocked_on_node_own_literal_needs_all_method_fallback` /
+  `blocked_on_shadowed_exact_needs_all_method_fallback`, and a new golden (f)
+  covers the case that IS still lowered (an earlier exact arm for the same
+  literal). (2) a `prefix` / `path` segment beginning with `:` is rejected
+  rather than silently becoming a RUT route parameter. (3) the defensive
+  `validate()` path for a hand-built `Bootstrap` now revalidates every route
+  match's prefix/path shape (catching an integer underflow in
+  `strip_trailing_slash` on an empty prefix) and rejects a duplicate cluster
+  name the same way the JSON parser does. Verified against Envoy v1.39.1's
+  `source/common/router/config_impl.cc` route-matching semantics and this
+  tree's `route_trie.h` / `callbacks_impl.h`, not inferred from the PR
+  description alone.
+- Round-9 review (Codex on PR #695): a `prefix` route globally shadowed by
+  an EARLIER `prefix` route (Envoy's byte-prefix match, not just Rut's
+  segment-boundary "under" relation, makes every request the later route
+  could match already resolve through the earlier one) used to still be
+  registered as its own node, emitting a full dead HEAD/any-method
+  forwarding block that only ever forwarded through the earlier route's own
+  cluster -- Codex's reported example, `"/"` declared before distinct
+  siblings `"/api/"` and `"/admin/"`, cost about 938 real lexer tokens (over
+  the 932-token `LexedTokens::kMaxTokens` budget) versus about 356/364 for
+  the equivalent root-only program. `build_lowering_plan` now drops such a
+  node before it is ever registered (`is_strict_ancestor` against nodes
+  already kept earlier in declaration order -- see the "Global shadowing
+  rule" paragraph at the top of this section), generalizing the original
+  root-only report to any earlier, textually-shorter accepted prefix.
+  `golden_routes_b_root_then_prefix` (golden (b)) is now root-only
+  (`tests/fixtures/envoy_routes_b.inc` updated, token count 655 -> 360), and
+  `shadowed_siblings_dropped_before_registration` pins Codex's own
+  three-route example byte for byte
+  (`tests/fixtures/envoy_routes_shadowed_siblings.inc`, 364 real lexer
+  tokens). `prefix_shadowed_by_earlier_prefix_dropped` and
+  `prefix_shadowed_exact_path_arm_dropped` cover the general (non-root)
+  prefix-shadows-prefix and prefix-shadows-exact-path cases as clean
+  successes (an own-literal exact route resolves each surviving node's
+  bare-literal gap instead of a root catch-all, since two real if/else-shaped
+  nodes together already exceed the current token budget -- confirmed by
+  direct measurement, unrelated to this fix).
+  `specific_prefix_before_general_prefix_keeps_both` /
+  `general_prefix_before_specific_shadows_specific` are a matched pair
+  proving declaration order, not text length, decides shadowing: the same
+  three routes with the specific prefix declared first keep both nodes
+  (asserted via the resulting `TooManyTokens` failure, since a
+  `BLOCKED_BY_RUT` failure happens during planning before any RUT text is
+  generated, and a single surviving node this shape would fit comfortably
+  under budget), while declaring the general prefix first shadows the
+  specific one and succeeds well under budget with only the general node
+  emitted.
