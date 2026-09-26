@@ -43,6 +43,15 @@ struct SlicePool {
     static constexpr u32 kSlicesPerConnection =
         kOrdinarySlicesPerConnection + kMaxBufferedResponseSlices;
 
+    // Bulk relay buffers: a small fixed set of large buffers a connection
+    // borrows only while it relays a large proxied body, so the body moves in
+    // 256 KiB steps. Separate VA region, faulted in on first use; free()
+    // routes a bulk pointer here by address, so release sites need not know
+    // which kind they hold. Exhaustion is not an error: callers keep slices.
+    static constexpr u32 kBulkSliceSize = 256 * 1024;
+    static constexpr u32 kBulkSlices = 64;  // 16 MiB VA per pool
+    static_assert(kBulkSlices <= 64, "bulk in-use tracking is one u64 bitmap");
+
     static constexpr u32 capacity_for_connections(u32 connections) {
         constexpr u32 kMaxU32 = 0xFFFFFFFFu;
         if (connections > kMaxU32 / kSlicesPerConnection) return 0;
@@ -62,6 +71,14 @@ struct SlicePool {
     u64 base_size = 0;   // size of mmap'd base region
     u64 stack_size = 0;  // size of mmap'd free_stack region
     u64 map_size = 0;    // size of mmap'd in_use_map
+
+    // Mapped on the first alloc_bulk(): pools that never relay a large body
+    // (and init's allocation sequence) are unaffected. A failed map is sticky.
+    u8* bulk_base = nullptr;  // kBulkSlices * kBulkSliceSize bytes, or null
+    u32 bulk_free[kBulkSlices] = {};
+    u32 bulk_free_top = 0;
+    u64 bulk_in_use = 0;  // bit i set while bulk slice i is borrowed
+    bool bulk_map_failed = false;
 
     // Number of slices to commit per growth step.
     // 256 slices × 16KB = 4MB per step — small enough to avoid waste,
@@ -140,10 +157,38 @@ struct SlicePool {
         return ptr;
     }
 
-    // Free a slice back to the pool. ptr must have been returned by alloc().
-    // Retain a bounded working set; discard excess pages after traffic spikes.
-    // Only call once all asynchronous users of the slice have retired.
+    // Borrow one bulk relay buffer, or null when none is available.
+    u8* alloc_bulk() {
+        if (bulk_base == nullptr && !map_bulk()) return nullptr;
+        if (bulk_free_top == 0) return nullptr;
+        const u32 idx = bulk_free[--bulk_free_top];
+        bulk_in_use |= u64{1} << idx;
+        return bulk_base + static_cast<u64>(idx) * kBulkSliceSize;
+    }
+
+    [[nodiscard]] bool is_bulk(const u8* ptr) const {
+        return bulk_base != nullptr && ptr >= bulk_base &&
+               ptr < bulk_base + static_cast<u64>(kBulkSlices) * kBulkSliceSize;
+    }
+
+    // Byte capacity of a buffer handed out by alloc() or alloc_bulk().
+    [[nodiscard]] u32 capacity_of(const u8* ptr) const {
+        return is_bulk(ptr) ? kBulkSliceSize : kSliceSize;
+    }
+
+    u32 bulk_available() const {
+        if (bulk_base != nullptr) return bulk_free_top;
+        return bulk_map_failed ? 0 : kBulkSlices;
+    }
+
+    // Free a slice back to the pool. ptr must have been returned by alloc()
+    // or alloc_bulk(). Retain a bounded working set; discard excess pages after
+    // traffic spikes. Only call once all asynchronous users have retired.
     void free(u8* ptr) {
+        if (is_bulk(ptr)) {
+            free_bulk(ptr, kBulkSliceSize);
+            return;
+        }
         if (!ptr || !base || !free_stack || count == 0) return;
         if (ptr < base || ptr >= base + static_cast<u64>(count) * kSliceSize) return;
         u64 offset = static_cast<u64>(ptr - base);
@@ -176,6 +221,19 @@ struct SlicePool {
         ++free_top;
     }
 
+    // free() for a caller that knows nothing past the first `written` bytes
+    // was ever written since the buffer was handed out. A bulk buffer then
+    // re-zeroes only that prefix (the rest is still zero), which keeps a
+    // mostly-empty 256 KiB node from costing a full-buffer memset. Slices
+    // keep free()'s behavior.
+    void free_written(u8* ptr, u32 written) {
+        if (is_bulk(ptr)) {
+            free_bulk(ptr, written < kBulkSliceSize ? written : kBulkSliceSize);
+            return;
+        }
+        free(ptr);
+    }
+
     // Number of available (free) slices.
     u32 available() const { return free_top; }
 
@@ -184,6 +242,13 @@ struct SlicePool {
 
     // Release all mmap'd memory.
     void destroy() {
+        if (bulk_base) {
+            munmap(bulk_base, static_cast<u64>(kBulkSlices) * kBulkSliceSize);
+            bulk_base = nullptr;
+        }
+        bulk_free_top = 0;
+        bulk_in_use = 0;
+        bulk_map_failed = false;
         if (in_use_map) {
             munmap(in_use_map, map_size);
             in_use_map = nullptr;
@@ -204,6 +269,40 @@ struct SlicePool {
     }
 
 private:
+    bool map_bulk() {
+        if (bulk_map_failed || base == nullptr) return false;
+        void* mem = mmap(nullptr,
+                         static_cast<u64>(kBulkSlices) * kBulkSliceSize,
+                         PROT_READ | PROT_WRITE,
+                         MAP_PRIVATE | MAP_ANONYMOUS,
+                         -1,
+                         0);
+        if (mem == MAP_FAILED) {
+            bulk_map_failed = true;
+            return false;
+        }
+        bulk_base = static_cast<u8*>(mem);
+        bulk_in_use = 0;
+        bulk_free_top = 0;
+        for (u32 i = kBulkSlices; i > 0; --i) bulk_free[bulk_free_top++] = i - 1;
+        return true;
+    }
+
+    void free_bulk(u8* ptr, u32 dirty) {
+        const u64 offset = static_cast<u64>(ptr - bulk_base);
+        if (offset % kBulkSliceSize != 0) return;  // not buffer-aligned
+        const u32 idx = static_cast<u32>(offset / kBulkSliceSize);
+        const u64 bit = u64{1} << idx;
+        if ((bulk_in_use & bit) == 0) return;  // double-free detection
+        bulk_in_use &= ~bit;
+        // Like slices, a returned buffer must not expose its owner's bytes.
+        // Zero in place: the set is small and hot, and MADV_DONTNEED would make
+        // every reuse fault its pages back in. Bytes past `dirty` are still
+        // zero from the previous return (or the fresh mapping).
+        __builtin_memset(ptr, 0, dirty);
+        bulk_free[bulk_free_top++] = idx;
+    }
+
     // Commit the next batch of slices (mprotect PROT_NONE → PROT_READ|PROT_WRITE).
     // Base pointer is stable — no mremap, no pointer fixup needed.
     bool grow() {

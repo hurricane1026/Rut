@@ -40,6 +40,7 @@ namespace rut {
 // A bounded one-shot upstream recv may fill the whole upstream receive slice
 // from one dedicated provided buffer.
 static_assert(kLargeProvidedBufSize == SlicePool::kSliceSize);
+static_assert(kBulkProvidedBufSize == SlicePool::kBulkSliceSize);
 
 namespace detail {
 
@@ -3154,11 +3155,67 @@ public:
         return true;
     }
 
-    // Response boundary: return the relay slice unless a send still reads it.
+    // A relay switches to bulk buffers only while at least this much body is
+    // still to come; shorter tails finish in ordinary slices.
+    static constexpr u32 kBulkRelayMinRemaining = 128 * 1024;
+
+    // The buffer the next relay recv fills: the idle relay buffer, traded for
+    // a bulk relay buffer while enough body remains and one is available. The
+    // idle buffer is neither being sent (upstream_relay_send_len == 0 is part
+    // of relay eligibility) nor a recv target, so it can be released here.
+    u8* take_relay_recv_buffer(Connection& c) {
+        u8* idle = c.upstream_relay_slice;
+        if (idle == nullptr || pool.is_bulk(idle) || backend.bulk_buf_ring == nullptr ||
+            c.resp_body_remaining < kBulkRelayMinRemaining)
+            return idle;
+        u8* bulk = pool.alloc_bulk();
+        if (bulk == nullptr) return idle;
+        pool.free(idle);
+        return bulk;
+    }
+
+    [[nodiscard]] u32 relay_buffer_capacity(const u8* buffer) const {
+        return pool.capacity_of(buffer);
+    }
+
+    // Serialized body pump (response policies, non-relay owners): trade the
+    // upstream recv slice for a bulk relay buffer while a large Content-Length
+    // body remains, so the recv accumulates up to 256 KiB between client sends.
+    // Called between sends: nothing reads the slice, and a still-armed recv
+    // only ever lands bytes by copying into whatever buffer is bound when its
+    // CQE is processed, so rebinding here is safe. Buffered bytes move along.
+    void upgrade_upstream_recv_to_bulk(Connection& c) {
+        u8* cur = c.upstream_recv_slice;
+        if (cur == nullptr || pool.is_bulk(cur) || c.resp_body_mode != BodyMode::ContentLength ||
+            c.resp_body_remaining < kBulkRelayMinRemaining)
+            return;
+        u8* bulk = pool.alloc_bulk();
+        if (bulk == nullptr) return;
+        const u32 kBuffered = c.upstream_recv_buf.len();
+        if (kBuffered != 0) __builtin_memcpy(bulk, c.upstream_recv_buf.data(), kBuffered);
+        c.upstream_recv_slice = bulk;
+        c.upstream_recv_buf.bind(bulk, SlicePool::kBulkSliceSize);
+        c.upstream_recv_buf.commit(kBuffered);
+        pool.free(cur);
+    }
+
+    // Response boundary: return the relay slice unless a send still reads it,
+    // and trade a bulk recv buffer back for an ordinary slice so an idle
+    // keep-alive connection never pins one.
     void release_upstream_relay_slice(Connection& c) {
-        if (c.upstream_relay_slice == nullptr || c.upstream_relay_send_len != 0) return;
-        pool.free(c.upstream_relay_slice);
-        c.upstream_relay_slice = nullptr;
+        if (c.upstream_relay_slice != nullptr && c.upstream_relay_send_len == 0) {
+            pool.free(c.upstream_relay_slice);
+            c.upstream_relay_slice = nullptr;
+        }
+        // A still-armed recv copies into whatever buffer is bound when its CQE
+        // is processed, so the swap is safe with one in flight.
+        u8* bulk = c.upstream_recv_slice;
+        if (!pool.is_bulk(bulk) || c.upstream_recv_buf.len() != 0) return;
+        u8* s = pool.alloc();
+        if (s == nullptr) return;  // keep it; close or the next boundary returns it
+        pool.free(bulk);
+        c.upstream_recv_slice = s;
+        c.upstream_recv_buf.bind(s, SlicePool::kSliceSize);
     }
 
     // A provided-buffer multishot recv can complete several 4 KiB CQEs in one

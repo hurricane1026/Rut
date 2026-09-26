@@ -55,4 +55,19 @@ static_assert((kLargeProvidedBufCount & (kLargeProvidedBufCount - 1)) == 0,
 static_assert(kLargeProvidedBufIdBase + kLargeProvidedBufCount <= 0x10000u,
               "provided buffer ids must fit the CQE's 16-bit buffer id");
 
+// Bulk provided buffer ring for upstream body relays that switched to bulk
+// relay buffers (SlicePool::kBulkSliceSize). A bulk relay moves the body in
+// 256 KiB steps instead of 16 KiB ones, which cuts the per-chunk completion
+// round trips of a large proxied body by 16x. The ring holds one buffer per
+// bulk relay buffer, so the at most kBulkSlices / 2 bulk relays (each with a
+// single armed one-shot recv) can never drain it.
+static constexpr u32 kBulkProvidedBufCount = 64;
+static constexpr u32 kBulkProvidedBufSize = 256 * 1024;
+static constexpr u16 kBulkBufGroupId = 2;
+static constexpr u32 kBulkProvidedBufIdBase = kLargeProvidedBufIdBase + kLargeProvidedBufCount;
+static_assert((kBulkProvidedBufCount & (kBulkProvidedBufCount - 1)) == 0,
+              "provided buffer ring entries must be a power of two");
+static_assert(kBulkProvidedBufIdBase + kBulkProvidedBufCount <= 0x10000u,
+              "provided buffer ids must fit the CQE's 16-bit buffer id");
+
 }  // namespace rut
