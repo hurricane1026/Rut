@@ -43,10 +43,11 @@ inline constexpr RutCapabilities kShippedRutCapabilities{
 // `capabilities` does not have.
 FrontendResult<RutSource> lower_to_rut(const Bootstrap& model);
 
-// Same lowering with an explicit capability set. Used by tests to pin the
-// target RUT text (all capabilities true) ahead of the runtime PRs that make
-// it real; production code must not construct a non-default
-// `RutCapabilities`.
+// Same lowering with an explicit capability set. The default overload above
+// already converts live with every shipped capability true
+// (`kShippedRutCapabilities`); this overload exists for tests that need to
+// pin the target RUT text against a specific (possibly narrower) capability
+// set. Production code must not construct a non-default `RutCapabilities`.
 FrontendResult<RutSource> lower_to_rut(const Bootstrap& model, const RutCapabilities& capabilities);
 
 // PR #692 round-7 review: whether `model`'s accepted bootstrap requires the
