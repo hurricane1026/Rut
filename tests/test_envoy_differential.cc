@@ -2331,6 +2331,16 @@ void remove_dir_recursive(const std::string& path) {
 std::mutex g_temp_dir_registry_mu;
 std::vector<std::string> g_temp_dir_registry;
 
+// Whether RUT_ENVOY_KEEP_TMP=1 diagnostics mode is active in the current
+// environment. A free function (rather than a TempDir-private static) so
+// self_test_no_binary_self_test_leaves_no_temp_dirs() below can honor the
+// exact same setting TempDir itself checks (round-21 review, "Honor
+// RUT_ENVOY_KEEP_TMP in the leak self-test").
+bool rut_envoy_keep_tmp_enabled() {
+    const char* v = getenv("RUT_ENVOY_KEEP_TMP");
+    return v != nullptr && std::string(v) == "1";
+}
+
 // RAII owner of a make_temp_dir() directory: removes it (and everything the
 // harness wrote inside it) on destruction, unless RUT_ENVOY_KEEP_TMP=1 is
 // set in the environment to keep it around for diagnostics (round-15
@@ -2353,7 +2363,7 @@ public:
     TempDir& operator=(TempDir&&) = delete;
 
     ~TempDir() {
-        if (path_.empty() || keep_for_diagnostics()) return;
+        if (path_.empty() || rut_envoy_keep_tmp_enabled()) return;
         remove_dir_recursive(path_);
     }
 
@@ -2361,11 +2371,6 @@ public:
     bool empty() const { return path_.empty(); }
 
 private:
-    static bool keep_for_diagnostics() {
-        const char* v = getenv("RUT_ENVOY_KEEP_TMP");
-        return v != nullptr && std::string(v) == "1";
-    }
-
     std::string path_;
 };
 
@@ -2822,17 +2827,59 @@ bool require_upstream_idle_for_asserted_batch(RecordingUpstream& upstream,
 // this harness -- a reuseport collision, a proxy crash, a duplicate
 // contact), so the same upstream-quiescence timeout here is downgraded to a
 // NOTE and flags every result in this batch `upstream_ambiguous`, rather
-// than failing the run.
-void note_upstream_idle_timeout_for_record_only_batch(RecordingUpstream& upstream,
+// than failing the run. Returns whether the wait timed out, so a caller that
+// is about to reuse this SAME RecordingUpstream for a later phase (rather
+// than stop()ping it, whose hard join would already guarantee quiescence)
+// can decide whether it needs quiesce_after_record_only_idle_timeout()
+// below (round-21 review, "Isolate the next phase after a record-only idle
+// timeout").
+bool note_upstream_idle_timeout_for_record_only_batch(RecordingUpstream& upstream,
                                                       int timeout_ms,
                                                       const char* phase_label,
                                                       std::vector<CaseResult>* results) {
-    if (upstream.wait_idle(timeout_ms)) return;
+    if (upstream.wait_idle(timeout_ms)) return false;
     std::cerr << "NOTE: upstream did not go idle within " << timeout_ms << "ms after stopping the "
               << phase_label
               << " instance; a handler thread may still be draining traffic, so this "
                  "record-only batch's evidence is marked ambiguous\n";
     for (auto& r : *results) r.upstream_ambiguous = true;
+    return true;
+}
+
+// Round-21 review, "Isolate the next phase after a record-only idle
+// timeout": note_upstream_idle_timeout_for_record_only_batch() above only
+// marks the record-only batch's OWN results ambiguous -- it says nothing
+// about whether the stalled handler thread it detected is still running by
+// the time the caller goes on to clear_requests() and reuse the SAME
+// RecordingUpstream for the NEXT phase. Most record-only call sites in this
+// harness stop() this upstream immediately afterward (whose hard join of
+// every handler thread already guarantees quiescence before anything else
+// could reuse it), but run_pair_milestone_s()'s pair-Envoy-record-only phase
+// does not: it keeps the same upstream running for the RUT-asserted phase
+// that follows. Without this guard, a handler that only finishes draining
+// after the original (soft) deadline could record its delayed request AFTER
+// clear_requests() runs, during the asserted phase -- turning a
+// non-gating record-only anomaly into a spurious duplicate/unlisted
+// ASSERTED request that fails the whole run, exactly the isolation the
+// record-only/asserted split exists to guarantee.
+//
+// Call only when the soft wait above already timed out. Blocks (bounded,
+// well past the original deadline) for the stalled handler(s) to actually
+// finish before the caller is allowed to proceed. If they are STILL not
+// idle after that -- a genuinely stuck thread, not merely one slow to
+// notice EOF -- returns a fatal reason: proceeding to the next phase with a
+// live handler thread whose eventual write time is unbounded is not a risk
+// this isolation can responsibly downgrade to a NOTE. Returns empty on
+// success (the hard join caught up).
+std::string quiesce_after_record_only_idle_timeout(RecordingUpstream& upstream,
+                                                   int hard_timeout_ms,
+                                                   const char* phase_label) {
+    if (upstream.wait_idle(hard_timeout_ms)) return "";
+    return "upstream still has a handler thread active " + std::to_string(hard_timeout_ms) +
+           "ms after the " + phase_label +
+           " batch's own quiescence timeout already elapsed -- refusing to start the next "
+           "phase against the same recording upstream while a record-only-batch handler "
+           "could still record a delayed request into it";
 }
 
 // Refuses evidence that would make write_transcript() emit a fixture
@@ -3047,6 +3094,31 @@ bool write_transcript(const std::string& path, const std::vector<CaseResult>& re
     out << "// hand-edit. See docs/envoy-converter.md \"Test layers\" and\n";
     out << "// envoy-pr-plan.md PR 2.\n\n";
     for (const auto& r : results) {
+        // Round-21 review, "Preserve ambiguity metadata in oracle
+        // transcripts": validate_results() above only enforces its strict
+        // evidentiary rule for asserted rows (round-19 review), so a
+        // record-only row can reach here with an incomplete exchange, a
+        // duplicated upstream contact, or fill_upstream_bytes()'s
+        // `upstream_ambiguous` flag (unattributed traffic elsewhere) --
+        // exactly the anomalies stderr already reports as a NOTE when they
+        // happen. Without writing that same NOTE into the artifact itself,
+        // the standalone oracle transcript this function produces looked
+        // identical for a clean record-only row and an ambiguous one; a
+        // reviewer (or a future test) reading only the .inc file could not
+        // tell the two apart. Mirrors write_pair_transcript()'s identical
+        // per-row NOTE annotations for its own record-only rows.
+        if (!is_asserted_case(r.name)) {
+            if (!r.exchange_complete)
+                out << "// NOTE: " << r.name << ": downstream exchange did not complete ("
+                    << describe_incomplete_exchange(r) << ")\n";
+            if (r.upstream_contact_count > 1)
+                out << "// NOTE: " << r.name << ": upstream was contacted "
+                    << r.upstream_contact_count << " times (ambiguous evidence)\n";
+            if (r.upstream_ambiguous)
+                out << "// NOTE: " << r.name
+                    << ": upstream recorded unattributed traffic on another path while this "
+                       "case's own path saw none (ambiguous evidence)\n";
+        }
         out << "static constexpr char kEnvoyOracle_" << r.name << "_client[] =\n    "
             << wrap_wire_literal(r.client_bytes) << ";\n";
         if (!r.upstream_contacted) out << "// " << r.name << ": upstream not contacted\n";
@@ -4268,9 +4340,26 @@ int run_pair_milestone_s(const std::string& rut_binary,
         // Round-20 review, "Reject asserted evidence when upstream
         // quiescence times out": record-only phases downgrade the same
         // timeout to a NOTE instead of failing the run.
-        note_upstream_idle_timeout_for_record_only_batch(
-            upstream, 2000, "pair Envoy record-only", &envoy_record_only_results);
+        const bool envoy_record_only_idle_timed_out =
+            note_upstream_idle_timeout_for_record_only_batch(
+                upstream, 2000, "pair Envoy record-only", &envoy_record_only_results);
         fill_upstream_bytes(&envoy_record_only_results, record_only_cases, upstream);
+        // Round-21 review, "Isolate the next phase after a record-only idle
+        // timeout": unlike every other record-only call site, this upstream
+        // is NOT stop()ped here -- it stays running for the RUT-asserted
+        // phase below, so a handler thread the soft wait above already gave
+        // up on must be hard-joined before clear_requests() runs, or its
+        // eventual delayed request could land in the asserted phase's own
+        // evidence.
+        if (envoy_record_only_idle_timed_out) {
+            const std::string quiesce_error =
+                quiesce_after_record_only_idle_timeout(upstream, 8000, "pair Envoy record-only");
+            if (!quiesce_error.empty()) {
+                std::cerr << "FAIL: " << quiesce_error << "\n";
+                upstream.stop();
+                return 1;
+            }
+        }
         // Round-19 review, "Keep record-only co-owners from failing pair
         // mode": a persistent SO_REUSEPORT co-owner (already classified as
         // a non-fatal NOTE above) necessarily keeps `listen_port1`
@@ -5019,6 +5108,114 @@ bool self_test_require_upstream_idle_for_asserted_batch() {
     return ok;
 }
 
+// Round-21 review, "Isolate the next phase after a record-only idle
+// timeout": simulates the exact hazard the review describes using the same
+// stalled-handler technique as self_test_require_upstream_idle_for_
+// asserted_batch() above -- a connection kept open past the record-only
+// batch's own soft wait_idle() deadline -- but goes one step further: while
+// quiesce_after_record_only_idle_timeout() is hard-waiting, a background
+// thread sends a SECOND ("delayed duplicate") request on the SAME
+// connection before finally closing it, reproducing the scenario where a
+// record-only handler only finishes draining a late request well after its
+// own phase's deadline. Confirms the hard join blocks until that delayed
+// request is actually recorded (proving it can never race past a
+// quiesce_after_record_only_idle_timeout() success), and that a
+// clear_requests() immediately afterward -- standing in for the next
+// (asserted) phase's own setup -- leaves nothing behind for a
+// subsequently-simulated asserted request to ever see.
+bool self_test_quiesce_after_record_only_idle_timeout() {
+    BoundPort bound;
+    if (!allocate_bound_loopback_port(&bound)) {
+        std::cerr << "FAIL [self-test quiesce record-only]: could not allocate a loopback port\n";
+        return false;
+    }
+    const uint16_t port = bound.port;
+
+    RecordingUpstream upstream;
+    upstream.set_default_reply(
+        "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nhi");  // no "Connection: close"
+    if (!upstream.adopt(bound.fd)) {
+        std::cerr << "FAIL [self-test quiesce record-only]: could not adopt the listener\n";
+        return false;
+    }
+
+    const int fd = connect_with_timeout(port, kClientTimeoutMs);
+    if (fd < 0) {
+        std::cerr << "FAIL [self-test quiesce record-only]: could not connect\n";
+        upstream.stop();
+        return false;
+    }
+    const std::string first_req = "GET /record-only-stalled HTTP/1.1\r\nHost: t.example\r\n\r\n";
+    if (!send_all(fd, first_req)) {
+        std::cerr << "FAIL [self-test quiesce record-only]: could not send the first request\n";
+        close(fd);
+        upstream.stop();
+        return false;
+    }
+    for (int i = 0; i < 200 && upstream.requests_for("/record-only-stalled").empty(); i++) {
+        struct timespec ts{0, 5'000'000};
+        nanosleep(&ts, nullptr);
+    }
+
+    bool ok = true;
+    if (upstream.requests_for("/record-only-stalled").empty()) {
+        std::cerr << "FAIL [self-test quiesce record-only]: the first request was never "
+                     "recorded, so this test cannot exercise a real stalled handler\n";
+        ok = false;
+    }
+
+    std::vector<CaseResult> record_only_results(1);
+    const bool timed_out = note_upstream_idle_timeout_for_record_only_batch(
+        upstream, 200, "self-test record-only", &record_only_results);
+    if (!timed_out) {
+        std::cerr << "FAIL [self-test quiesce record-only]: expected the soft wait to time out "
+                     "given the still-open, still-stalled connection\n";
+        ok = false;
+    }
+
+    // While the hard join below is waiting, deliver a "delayed duplicate"
+    // request on the same connection, then close it -- the handler thread
+    // must record this before quiesce_after_record_only_idle_timeout()
+    // reports success.
+    std::thread deliver_delayed_duplicate([fd] {
+        struct timespec delay{0, 150'000'000};
+        nanosleep(&delay, nullptr);
+        send_all(fd, "GET /record-only-delayed-duplicate HTTP/1.1\r\nHost: t.example\r\n\r\n");
+        struct timespec settle{0, 50'000'000};
+        nanosleep(&settle, nullptr);
+        close(fd);
+    });
+    const std::string quiesce_error =
+        quiesce_after_record_only_idle_timeout(upstream, 3000, "self-test record-only");
+    deliver_delayed_duplicate.join();
+    if (!quiesce_error.empty()) {
+        std::cerr << "FAIL [self-test quiesce record-only]: expected the hard join to catch up "
+                     "once the delayed duplicate was delivered and the connection closed, got: "
+                  << quiesce_error << "\n";
+        ok = false;
+    }
+    if (upstream.requests_for("/record-only-delayed-duplicate").empty()) {
+        std::cerr << "FAIL [self-test quiesce record-only]: quiesce_after_record_only_idle_"
+                     "timeout() returned success before the delayed duplicate was actually "
+                     "recorded\n";
+        ok = false;
+    }
+
+    // Simulate the next (asserted) phase's own setup: nothing recorded
+    // above may survive into it.
+    upstream.clear_requests();
+    if (!upstream.requests_for("/record-only-stalled").empty() ||
+        !upstream.requests_for("/record-only-delayed-duplicate").empty()) {
+        std::cerr << "FAIL [self-test quiesce record-only]: record-only traffic bled past "
+                     "clear_requests() into the simulated next phase\n";
+        ok = false;
+    }
+
+    upstream.stop();
+    if (ok) std::cerr << "PASS [self-test quiesce record-only]\n";
+    return ok;
+}
+
 // Covers round-3 review thread P1 ("Reject partial exchanges before writing
 // the oracle transcript"): read_http_message() must report an incomplete
 // frame as incomplete rather than silently returning whatever partial bytes
@@ -5160,6 +5357,45 @@ bool self_test_partial_exchange_rejection() {
                          "row with an incomplete exchange (record-only rows must never fail the "
                          "oracle run)\n";
             ok = false;
+        } else {
+            // Round-21 review, "Preserve ambiguity metadata in oracle
+            // transcripts": the artifact itself, not just stderr, must flag
+            // this row so a reader of only the .inc file cannot mistake its
+            // bytes for clean evidence.
+            std::ifstream in(out_path);
+            std::stringstream ss;
+            ss << in.rdbuf();
+            if (ss.str().find("// NOTE: connect_authority: downstream exchange did not "
+                              "complete") == std::string::npos) {
+                std::cerr << "FAIL [self-test partial]: write_transcript did not flag the "
+                             "incomplete record-only row with a NOTE in the artifact\n";
+                ok = false;
+            }
+        }
+
+        CaseResult record_only_ambiguous;
+        record_only_ambiguous.name = "connect_authority";
+        record_only_ambiguous.client_bytes = "GET / HTTP/1.1\r\n\r\n";
+        record_only_ambiguous.exchange_complete = true;
+        record_only_ambiguous.downstream_bytes =
+            "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n";
+        record_only_ambiguous.upstream_contacted = false;
+        record_only_ambiguous.upstream_contact_count = 0;
+        record_only_ambiguous.upstream_ambiguous = true;
+        if (!write_transcript(out_path, {record_only_ambiguous})) {
+            std::cerr << "FAIL [self-test partial]: write_transcript rejected a record-only row "
+                         "flagged upstream_ambiguous by fill_upstream_bytes()\n";
+            ok = false;
+        } else {
+            std::ifstream in(out_path);
+            std::stringstream ss;
+            ss << in.rdbuf();
+            if (ss.str().find("// NOTE: connect_authority: upstream recorded unattributed "
+                              "traffic") == std::string::npos) {
+                std::cerr << "FAIL [self-test partial]: write_transcript did not flag the "
+                             "upstream_ambiguous record-only row with a NOTE in the artifact\n";
+                ok = false;
+            }
         }
 
         CaseResult good;
@@ -5856,7 +6092,26 @@ bool self_test_envoy_log_confirms_listener() {
 bool self_test_temp_dir_cleanup() {
     bool ok = true;
 
-    // Default: removed on scope exit.
+    // Round-21 review, "Honor RUT_ENVOY_KEEP_TMP in the leak self-test":
+    // save whatever the ambient RUT_ENVOY_KEEP_TMP setting actually is (a
+    // real diagnostic invocation of this whole binary may have set it to
+    // "1") so the two blocks below can force each of TempDir's two
+    // behaviors regardless of it, then restore the TRUE ambient value
+    // afterward -- self_test_leak_check_honors_keep_tmp() and
+    // self_test_no_binary_self_test_leaves_no_temp_dirs(), which run right
+    // after this self-test, must see whatever the invoker actually asked
+    // for, not whatever this test last happened to leave in the
+    // environment.
+    const char* ambient_raw = getenv("RUT_ENVOY_KEEP_TMP");
+    const bool had_ambient = ambient_raw != nullptr;
+    const std::string ambient_value = had_ambient ? ambient_raw : std::string();
+
+    // Default: removed on scope exit. Forced by unsetting the variable here
+    // regardless of the ambient value -- otherwise this assertion itself
+    // fails whenever this binary is invoked with RUT_ENVOY_KEEP_TMP=1 set,
+    // exactly the ambient-setting hazard round-21 also fixed in the leak
+    // check below, just in the opposite direction.
+    unsetenv("RUT_ENVOY_KEEP_TMP");
     std::string removed_path;
     {
         TempDir dir("rut-envoy-selftest-cleanup");
@@ -5885,18 +6140,28 @@ bool self_test_temp_dir_cleanup() {
         if (dir.empty()) {
             std::cerr
                 << "FAIL [self-test temp dir cleanup]: could not create temp dir (keep case)\n";
-            unsetenv("RUT_ENVOY_KEEP_TMP");
-            return false;
+            kept_path.clear();
+        } else {
+            kept_path = dir.path();
         }
-        kept_path = dir.path();
     }
-    unsetenv("RUT_ENVOY_KEEP_TMP");
-    if (stat(kept_path.c_str(), &st) != 0) {
+    if (kept_path.empty()) {
+        ok = false;
+    } else if (stat(kept_path.c_str(), &st) != 0) {
         std::cerr << "FAIL [self-test temp dir cleanup]: RUT_ENVOY_KEEP_TMP=1 did not preserve "
                   << kept_path << "\n";
         ok = false;
     } else {
         remove_dir_recursive(kept_path);  // clean up manually; this run kept it deliberately
+    }
+    // Restore the TRUE ambient setting -- present with its original value,
+    // or absent -- instead of unconditionally unsetenv()ing it, which would
+    // silently disable a real RUT_ENVOY_KEEP_TMP=1 diagnostic invocation for
+    // the remainder of this process.
+    if (had_ambient) {
+        setenv("RUT_ENVOY_KEEP_TMP", ambient_value.c_str(), 1);
+    } else {
+        unsetenv("RUT_ENVOY_KEEP_TMP");
     }
 
     if (ok) std::cerr << "PASS [self-test temp dir cleanup]\n";
@@ -8484,6 +8749,47 @@ bool self_test_envoy_stop_verifies_exit_status() {
 // CONCURRENT `--self-test` invocation's own still-live directories if one
 // happens to create an entry matching the same prefix while this check is
 // running.
+// Which of `created` (paths this process's own TempDir instances
+// registered) are still present on disk right now, in creation order.
+std::vector<std::string> find_present_temp_dirs(const std::vector<std::string>& created) {
+    std::vector<std::string> present;
+    struct stat st{};
+    for (const auto& path : created) {
+        if (stat(path.c_str(), &st) == 0) present.push_back(path);
+    }
+    return present;
+}
+
+// Decides whether `present` (the subset of a leak-check sample still on
+// disk) represents a genuine leak, and whether it should be cleaned up here,
+// given whether RUT_ENVOY_KEEP_TMP diagnostics are active. Extracted from
+// self_test_no_binary_self_test_leaves_no_temp_dirs() below so
+// self_test_leak_check_honors_keep_tmp() can exercise the decision directly,
+// under both settings, without re-running every self-test the leak check
+// itself samples.
+//
+// Round-21 review, "Honor RUT_ENVOY_KEEP_TMP in the leak self-test": when
+// keep-tmp diagnostics are active, EVERY TempDir created during the sample
+// -- not just the ones a test deliberately overrides locally, like
+// self_test_temp_dir_cleanup()'s own keep-mode case -- is intentionally
+// preserved, because TempDir's destructor honors the same ambient
+// RUT_ENVOY_KEEP_TMP=1 setting this function checks. Reporting that
+// intentional preservation as a leak, and then deleting it, previously made
+// `--self-test` fail and silently discard the exact diagnostics
+// RUT_ENVOY_KEEP_TMP=1 was set to keep.
+struct LeakCheckOutcome {
+    bool ok;
+    std::vector<std::string> reported_leaked;
+};
+LeakCheckOutcome evaluate_temp_dir_leak_check(const std::vector<std::string>& present,
+                                              bool keep_tmp_enabled) {
+    if (keep_tmp_enabled || present.empty()) return {true, {}};
+    // Best-effort cleanup of anything found leaked, so this check's own
+    // failure doesn't also accumulate garbage across repeated runs.
+    for (const auto& path : present) remove_dir_recursive(path);
+    return {false, present};
+}
+
 bool self_test_no_binary_self_test_leaves_no_temp_dirs() {
     const size_t registry_begin = [] {
         std::lock_guard<std::mutex> lock(g_temp_dir_registry_mu);
@@ -8502,26 +8808,86 @@ bool self_test_no_binary_self_test_leaves_no_temp_dirs() {
                        g_temp_dir_registry.end());
     }
 
-    std::vector<std::string> leaked;
-    struct stat st{};
-    for (const auto& path : created) {
-        if (stat(path.c_str(), &st) == 0) leaked.push_back(path);
+    const std::vector<std::string> present = find_present_temp_dirs(created);
+    if (rut_envoy_keep_tmp_enabled()) {
+        std::cerr << "PASS [self-test no leaked temp dirs]: RUT_ENVOY_KEEP_TMP=1 is set; "
+                     "skipping the leak assertion and preserving "
+                  << present.size() << " sampled director" << (present.size() == 1 ? "y" : "ies")
+                  << " for diagnostics\n";
+        return true;
     }
-    // Best-effort cleanup of anything found leaked, so this check's own
-    // failure doesn't also accumulate garbage across repeated runs.
-    for (const auto& path : leaked) remove_dir_recursive(path);
+    const LeakCheckOutcome outcome = evaluate_temp_dir_leak_check(present, false);
 
-    bool ok = true;
-    if (!leaked.empty()) {
+    if (!outcome.ok) {
         std::cerr << "FAIL [self-test no leaked temp dirs]: running the always-on, TempDir-using "
                      "self-tests left "
-                  << leaked.size() << " director" << (leaked.size() == 1 ? "y" : "ies")
+                  << outcome.reported_leaked.size() << " director"
+                  << (outcome.reported_leaked.size() == 1 ? "y" : "ies")
                   << " behind that this process itself created:";
-        for (const auto& path : leaked) std::cerr << " " << path;
+        for (const auto& path : outcome.reported_leaked) std::cerr << " " << path;
         std::cerr << "\n";
-        ok = false;
+        return false;
     }
-    if (ok) std::cerr << "PASS [self-test no leaked temp dirs]\n";
+    std::cerr << "PASS [self-test no leaked temp dirs]\n";
+    return true;
+}
+
+// Round-21 review, "Honor RUT_ENVOY_KEEP_TMP in the leak self-test":
+// exercises evaluate_temp_dir_leak_check() directly under both settings,
+// using a real directory this test creates and controls the lifetime of
+// itself (bypassing TempDir, whose own destructor would otherwise remove or
+// preserve it before this test could inspect the outcome).
+bool self_test_leak_check_honors_keep_tmp() {
+    bool ok = true;
+
+    // keep_tmp_enabled=true: never a leak, never deleted.
+    {
+        const std::string path = make_temp_dir("rut-envoy-selftest-leak-check-keep");
+        if (path.empty()) {
+            std::cerr << "FAIL [self-test leak check keep-tmp]: could not create a temp dir\n";
+            return false;
+        }
+        const LeakCheckOutcome outcome =
+            evaluate_temp_dir_leak_check(find_present_temp_dirs({path}), /*keep_tmp_enabled=*/true);
+        struct stat st{};
+        if (!outcome.ok || !outcome.reported_leaked.empty()) {
+            std::cerr << "FAIL [self-test leak check keep-tmp]: reported a leak while keep-tmp "
+                         "diagnostics were active\n";
+            ok = false;
+        }
+        if (stat(path.c_str(), &st) != 0) {
+            std::cerr << "FAIL [self-test leak check keep-tmp]: " << path
+                      << " was deleted despite keep-tmp diagnostics being active\n";
+            ok = false;
+        }
+        remove_dir_recursive(path);  // clean up manually; this test kept it deliberately
+    }
+
+    // keep_tmp_enabled=false: a still-present path is a genuine leak, and is
+    // cleaned up here.
+    {
+        const std::string path = make_temp_dir("rut-envoy-selftest-leak-check-default");
+        if (path.empty()) {
+            std::cerr << "FAIL [self-test leak check keep-tmp]: could not create a temp dir\n";
+            return false;
+        }
+        const LeakCheckOutcome outcome = evaluate_temp_dir_leak_check(
+            find_present_temp_dirs({path}), /*keep_tmp_enabled=*/false);
+        struct stat st{};
+        if (outcome.ok || outcome.reported_leaked != std::vector<std::string>{path}) {
+            std::cerr << "FAIL [self-test leak check keep-tmp]: did not report " << path
+                      << " as leaked outside keep-tmp diagnostics\n";
+            ok = false;
+        }
+        if (stat(path.c_str(), &st) == 0) {
+            std::cerr << "FAIL [self-test leak check keep-tmp]: " << path
+                      << " was not cleaned up after being reported leaked\n";
+            ok = false;
+            remove_dir_recursive(path);
+        }
+    }
+
+    if (ok) std::cerr << "PASS [self-test leak check keep-tmp]\n";
     return ok;
 }
 
@@ -8908,14 +9274,25 @@ bool run_self_test_rut_pass(const std::string& rut_binary, const std::string& co
         // self-test": same reasoning as the production asserted phases --
         // stop() only guarantees RUT's own process exited, not that this
         // independent RecordingUpstream has finished recording whatever it
-        // already received.
-        upstream.wait_idle(2000);
-        const bool rut_upstream_ok = fill_upstream_bytes(&live_results, live_asserted, upstream);
+        // already received. Round-21 review, "Reject RUT self-test evidence
+        // when upstream idle times out": this self-test asserts on
+        // `live_results` exactly like a production asserted phase, so a
+        // timeout here must fail it too, via the same fatal helper the
+        // production paths use, rather than being silently ignored.
+        std::string idle_timeout_error;
+        const bool rut_upstream_idle = require_upstream_idle_for_asserted_batch(
+            upstream, 2000, "self-test rut asserted", &idle_timeout_error);
+        const bool rut_upstream_ok =
+            rut_upstream_idle && fill_upstream_bytes(&live_results, live_asserted, upstream);
         upstream.stop();
         if (!rut_stopped_cleanly) {
             std::cerr << "FAIL [self-test rut]: rut exited unexpectedly before teardown ("
                       << rut.unexpected_exit_description << ")\n";
             dump_rut_log(rut.log_path);
+            return false;
+        }
+        if (!rut_upstream_idle) {
+            std::cerr << "FAIL [self-test rut]: " << idle_timeout_error << "\n";
             return false;
         }
         if (!rut_upstream_ok) return false;
@@ -9016,6 +9393,7 @@ int run_self_test(const std::string& rut_binary, const std::string& converter_bi
     ok &= self_test_wait_idle_synchronizes_with_pending_accept();
     ok &= self_test_wait_idle_synchronizes_accept_handoff();
     ok &= self_test_require_upstream_idle_for_asserted_batch();
+    ok &= self_test_quiesce_after_record_only_idle_timeout();
     ok &= self_test_partial_exchange_rejection();
     ok &= self_test_fake_listener_unblocks_on_shutdown();
     ok &= self_test_argv_builder();
@@ -9023,6 +9401,7 @@ int run_self_test(const std::string& rut_binary, const std::string& converter_bi
     ok &= self_test_envoy_log_confirms_listener();
     ok &= self_test_wait_ready_ownership();
     ok &= self_test_temp_dir_cleanup();
+    ok &= self_test_leak_check_honors_keep_tmp();
     ok &= self_test_no_binary_self_test_leaves_no_temp_dirs();
     ok &= self_test_envoy_instance_skips_docker_when_unlaunched();
     ok &= self_test_rut_wait_ready_ownership();
