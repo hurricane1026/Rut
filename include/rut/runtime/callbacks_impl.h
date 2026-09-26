@@ -9591,7 +9591,7 @@ inline bool response_policy_suppress_head_admitted(const Connection& conn,
             if (++host_count > 1) return false;
             host = &header;
         } else if (http_header_name_eq_ci(name.ptr, name.len, "connection", 10)) {
-            if (++connection_count > 1) return false;
+            connection_count++;
             if (id4_route) {
                 // ID4's ordinary serializer path
                 // (`apply_preserve_host_lowercase_request_policy`) admits
@@ -9617,7 +9617,16 @@ inline bool response_policy_suppress_head_admitted(const Connection& conn,
                 // decided by the `close` token alone (`connection_close_
                 // token_seen` below), independent of what else is
                 // nominated in the same value, matching the shape
-                // classification at the end of this function.
+                // classification at the end of this function. Envoy
+                // coalesces `Connection` as an inline, list-valued header,
+                // and the ordinary ID4 serializer's own nomination scan
+                // already iterates every physical `Connection` field rather
+                // than requiring exactly one (Codex round-18 review, PR
+                // #696): `connection_count` above is therefore not bounded
+                // for ID4 here either -- this branch runs, and
+                // `connection_close_token_seen` accumulates, once per
+                // physical field, so e.g. `Connection: TE` followed by a
+                // separate `Connection: X-Foo` is the union of both.
                 const char* value_start = header.value.ptr;
                 const char* value_end = value_start + header.value.len;
                 const char* tok = value_start;
@@ -9643,8 +9652,11 @@ inline bool response_policy_suppress_head_admitted(const Connection& conn,
                     if (tok_end >= value_end) break;
                     tok = tok_end + 1;
                 }
-            } else if (header.value.len != 5 ||
+            } else if (connection_count > 1 || header.value.len != 5 ||
                        !http_header_name_eq_ci(header.value.ptr, header.value.len, "close", 5)) {
+                // Non-ID4 policies keep the original closed contract: at
+                // most one physical `Connection` field, and its value must
+                // be exactly the single literal token `close`.
                 return false;
             }
         } else if (http_header_name_eq_ci(name.ptr, name.len, "content-length", 14) ||
@@ -9749,8 +9761,13 @@ inline bool response_policy_suppress_head_admitted(const Connection& conn,
                 request_policy_host_authority_is_valid(reinterpret_cast<const u8*>(host->value.ptr),
                                                        host->value.len))
              : valid_authority(host->value));
-    if (paired_failure &&
-        (host_count != 1 || connection_count > 1 || host == nullptr || !authority_ok))
+    // A count limit on physical `Connection` fields only applies to non-ID4
+    // policies here: ID4 aggregates every physical field above (Codex
+    // round-18 review, PR #696), matching Envoy's own inline, list-valued
+    // `Connection` storage and the ordinary ID4 serializer's own nomination
+    // scan, so `connection_count > 1` alone must not fail ID4 closed.
+    if (paired_failure && (host_count != 1 || (!id4_route && connection_count > 1) ||
+                           host == nullptr || !authority_ok))
         return false;
     const bool explicit_close_shape =
         !conn.req_client_keep_alive && conn.req_client_connection_close &&
@@ -9776,12 +9793,18 @@ inline bool response_policy_suppress_head_admitted(const Connection& conn,
     // contract above) since such a `Connection` value is otherwise
     // identical, for persistence purposes, to sending no `Connection`
     // header at all (Codex round-13/round-17 review, PR #696).
+    // `connection_count != 0` here (rather than `== 1`) reflects one or
+    // more physical `Connection` fields having been aggregated above
+    // (Codex round-18 review, PR #696): the token union across however many
+    // physical fields there were is what `connection_close_token_seen`
+    // already captures, and this shape only needs to know at least one such
+    // field was present, not exactly how many.
     const bool id4_close_with_te_shape = id4_route && !conn.req_client_keep_alive &&
                                          conn.req_client_connection_close &&
-                                         connection_count == 1 && connection_close_token_seen;
+                                         connection_count != 0 && connection_close_token_seen;
     const bool id4_default_keep_alive_with_te_shape =
         id4_route && paired_failure && conn.req_client_keep_alive &&
-        !conn.req_client_connection_close && connection_count == 1 && !connection_close_token_seen;
+        !conn.req_client_connection_close && connection_count != 0 && !connection_close_token_seen;
     return policy.connection == ResponsePolicyConnection::Request &&
            conn.req_method == static_cast<u8>(LogHttpMethod::Head) &&
            conn.req_http_version == static_cast<u8>(HttpVersion::Http11) &&

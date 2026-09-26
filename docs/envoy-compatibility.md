@@ -80,7 +80,7 @@ safely refuses it with a fixed status rather than mis-forwarding.
 | --- | --- | --- | --- | --- | --- |
 | Fixed-length request body larger than the 16 KiB request slice, forwarded by Envoy (no body-size cap tied to a single buffer; `Cluster.per_connection_buffer_limit_bytes` defaults to a 1 MiB soft watermark, `api/envoy/config/cluster/v3/cluster.proto`) | yes: milestone bootstrap admission does not depend on any per-request body size | yes: the emitted route forwards fixed-length bodies unconditionally, no capability gate | no: Rut fails closed with `400 Bad Request` before upstream contact (`inspect_request_policy_body` requires `content_length <= recv_buf.capacity() - header_end`, `include/rut/runtime/callbacks_impl.h:5461-5463`; `recv_buf` is one `SlicePool::kSliceSize`, 16384 bytes, `include/rut/runtime/io_backend.h:50`) | live observation on envoy/lower-increment-2 with the nginx-era policy shape: `POST /` with a 20000-byte fixed-length body (20051 bytes total) got `HTTP/1.1 400 Bad Request`, no upstream connection attempted | NOT_IMPLEMENTED |
 | `Expect: 100-continue` with a body, forwarded by Envoy after it sends the interim `100 Continue` itself (`ConnectionManagerImpl::ActiveStream::decodeHeaders`, `source/common/http/conn_manager_impl.cc`) and strips `Expect` before forwarding | yes: milestone bootstrap admission does not depend on per-request `Expect` | yes: the emitted route has no interim-response surface to gate on | no: Rut fails closed with `400 Bad Request` before upstream contact (`inspect_request_policy_body` treats `Expect` on a content-length request as invalid, `include/rut/runtime/callbacks_impl.h:5451,5460`); no interim 100 response exists | live observation on envoy/lower-increment-2 with the nginx-era policy shape: `POST /` with `Content-Length: 2` and `Expect: 100-continue` got `HTTP/1.1 400 Bad Request`, no upstream connection attempted | NOT_IMPLEMENTED |
-| `TE: trailers` preserved by Envoy while every other `TE` value and hop-by-hop header is stripped (`ConnectionManagerUtility::sanitizeTEHeader`, `source/common/http/conn_manager_utility.cc`) | yes: milestone bootstrap admission does not depend on per-request `TE` | yes: the emitted route strips `TE` via the fixed `strip_headers` list (ID1), no capability gate | no, but improving: for a request with a `Content-Length` body on the milestone's currently emitted ID1 route, Rut fails closed with `400 Bad Request` before upstream contact (`inspect_request_policy_body` treats a `TE` value with no `trailers` token as invalid for a policy that does not preserve Host, `include/rut/runtime/callbacks_impl.h`). For a bodyless ID1 request, the fixed `strip_headers` list instead silently drops `TE` entirely rather than preserving `trailers` — a mis-forward, not a fail-closed refusal. PR #696 (`envoy/rut-request-envoy-h1`, ID4 `Http11PreserveHostLowercase`) implements exact `trailers`-token preservation for **both** the bodyless-GET case and the fixed-Content-Length case: as of that branch's round-3/round-4 revisions, `inspect_request_policy_body` admits a body-carrying `TE` value that carries a `trailers` token (parsed as comma-separated tokens, not compared whole), and `apply_preserve_host_lowercase_request_policy` rewrites it to the canonical lowercase `te: trailers`, matching Envoy's `sanitizeTEHeader`/`sanitizeConnectionHeader` byte for byte. An earlier revision of this row said a body-carrying request "still fails closed 400 even after #696"; that was accurate only for the pre-round-3 state of `366ad196` and is now stale. The milestone only benefits from ID4's behavior once the converter capability to emit it lands (PR3, tracked separately from this TE fix) | live observation on envoy/lower-increment-2 with the nginx-era ID1 policy shape: `POST /` with `Content-Length: 2` and `TE: trailers` got `HTTP/1.1 400 Bad Request`, no upstream connection attempted; a bodyless `GET /` with `TE: trailers` was forwarded to the origin with the `TE` header silently removed (`GET / HTTP/1.1\r\nHost: 127.0.0.1:9100\r\n\r\n`, no `TE` field) | PARTIAL |
+| `TE: trailers` preserved by Envoy while every other `TE` value and hop-by-hop header is stripped (`ConnectionManagerUtility::sanitizeTEHeader`, `source/common/http/conn_manager_utility.cc`) | yes: milestone bootstrap admission does not depend on per-request `TE` | Historical (nginx-era converter, pre-`request_envoy_h1`): the emitted route stripped `TE` via the fixed `strip_headers` list (ID1), no capability gate. Current (this branch, `envoy/rut-request-envoy-h1`): `put_forward_route` (`src/envoy/converter.cc`) unconditionally emits `host: "preserve"`/`header_names: "lowercase"`/`forwarded_proto: "http"` -- i.e. ID4 `Http11PreserveHostLowercase` -- once `validate()` clears every capability gate; with all capabilities enabled (`all_capabilities_true()`, test-only) the generated route is therefore ID4, not ID1. The *shipped* CLI (`kShippedRutCapabilities`, `include/rut/envoy/converter.h`) still has `response_envoy_h1`/`local_reply_envoy_h1` false, so `validate()` fails closed with `BLOCKED_BY_RUT` at the `response_envoy_h1` check (`src/envoy/converter.cc`) before `put_forward_route` ever runs -- the real binary emits no route at all today, ID1 or ID4 | Historical (nginx-era ID1 route): for a request with a `Content-Length` body, Rut failed closed with `400 Bad Request` before upstream contact -- but not specifically for "a `TE` value with no `trailers` token" as an earlier revision of this row said; `inspect_request_policy_body`'s `has_te` computation is token-blind (`has_te |= request_policy_name_eq(hs, name_len, "te", 2)`, matching purely on the field *name*), so it rejects **every** body-carrying `TE` field for a policy that does not preserve Host, including one that already carries `trailers`. For a bodyless ID1 request, the fixed `strip_headers` list instead silently dropped `TE` entirely rather than preserving `trailers` — a mis-forward, not a fail-closed refusal. Current (ID4, this branch): `inspect_request_policy_body` admits a body-carrying `TE` field regardless of its value once the policy preserves Host (token content decides its fate later, not admission), and `apply_preserve_host_lowercase_request_policy` rewrites a field carrying a `trailers` token to the canonical lowercase `te: trailers` -- for both the bodyless-GET and fixed-Content-Length cases -- matching Envoy's `sanitizeTEHeader`/`sanitizeConnectionHeader` byte for byte. This ID4 behavior is unit/wire-tested (`tests/test_network.cc`, `request_policy` suite) but not yet exercised by the shipped CLI (see the capability-gate column) | Historical live observation on envoy/lower-increment-2 with the nginx-era ID1 policy shape: `POST /` with `Content-Length: 2` and `TE: trailers` got `HTTP/1.1 400 Bad Request`, no upstream connection attempted; a bodyless `GET /` with `TE: trailers` was forwarded to the origin with the `TE` header silently removed (`GET / HTTP/1.1\r\nHost: 127.0.0.1:9100\r\n\r\n`, no `TE` field). No live differential run yet for the current ID4 route (blocked on the shipped CLI's own gates, above) | PARTIAL |
 | Extension/unrecognized HTTP methods (e.g. `PROPFIND`) forwarded by Envoy's default hard-coded 34-method list, which includes WebDAV methods (`kValidMethods`, `source/common/http/http1/balsa_parser.cc`) | yes: milestone bootstrap admission does not depend on per-request methods | yes: the emitted route is any-method, no capability gate | no: Rut fails closed with `400 Bad Request` before any route lookup (`HttpMethod` recognizes 9 methods; an unrecognized method resolves to `ParseStatus::Error` once the request head is complete, `src/runtime/http_parser.cc:101-159,360,493-501`) | live observation on envoy/lower-increment-2 with the nginx-era policy shape: `PROPFIND / HTTP/1.1` got `HTTP/1.1 400 Bad Request` | NOT_IMPLEMENTED |
 | Upstream response with 65-100 headers, forwarded by Envoy (default `HttpProtocolOptions.max_headers_count` is 100, `api/envoy/config/core/v3/protocol.proto`) | yes: milestone bootstrap admission does not depend on per-response header counts | yes: the emitted route's response_policy has no header-count knob, no capability gate | no: Rut fails closed with `502 Bad Gateway` before downstream commit (`kMaxHeaders` is a fixed 64, `include/rut/runtime/http_parser.h:46`; `build_strict_response_headers` rejects any response with `headers_truncated`, `include/rut/runtime/callbacks_impl.h:10169`, tripping the route's configured failure response) | live observation on envoy/lower-increment-2 with the nginx-era policy shape: an origin returning 90 headers plus `Content-Length: 5` got the client `HTTP/1.1 502 Bad Gateway` | NOT_IMPLEMENTED |
 | Valid HTTP/1.0 upstream response with `Content-Length`, forwarded by Envoy (`accept_http_10` gates only the downstream-facing server codec, `source/common/http/http1/codec_impl.h`; the client codec's version check accepts any `HTTP/<digit>.<digit>` line) | yes: milestone bootstrap admission does not depend on the upstream's response version | yes: the emitted route's response_policy has no upstream-version knob, no capability gate | no: Rut fails closed with `502 Bad Gateway` before downstream commit (`build_strict_response_headers` requires `resp.version == HttpVersion::Http11`, `include/rut/runtime/callbacks_impl.h:10164`) | live observation on envoy/lower-increment-2 with the nginx-era policy shape: an origin answering `HTTP/1.0 200 OK` with `Content-Length: 5` got the client `HTTP/1.1 502 Bad Gateway` | NOT_IMPLEMENTED |
@@ -139,10 +139,11 @@ above (Rut forwards where Envoy fails closed, recorded separately from the
 per-request divergence tables because Rut does not merely refuse the
 request): a request target containing a `#` fragment.
 
-**Bug (mis-forward, not fail-closed):** for an origin-form target such as
-`GET /admin#frag HTTP/1.1`, Envoy rejects the request. The accepted HCM shape
-here cannot set `strip_fragment_from_path` (the milestone parser does not
-expose that field at all) and its default is `false`
+**Bug (mis-forward, not fail-closed), `host: "upstream"` (ID1/ID2/ID3)
+only — historical, still current for these policies:** for an origin-form
+target such as `GET /admin#frag HTTP/1.1`, Envoy rejects the request. The
+accepted HCM shape here cannot set `strip_fragment_from_path` (the milestone
+parser does not expose that field at all) and its default is `false`
 (`envoy.extensions.filters.network.http_connection_manager.v3.HttpConnectionManager.strip_fragment_from_path`);
 with fragment stripping off, Envoy's universal header validator rejects the
 `#` in the `:path` pseudo-header (`kPathHeaderCharTableWithAdditionalCharacters`
@@ -152,27 +153,40 @@ so the request never reaches an upstream. Rut instead records the fragment
 (`HttpParser::parse` sets `target_has_fragment`, `src/runtime/http_parser.cc`)
 and canonicalizes the *routing* path at the `#` (`finalize_path_canonical`),
 but `apply_request_policy` — the function that builds the forwarded request
-line for `forward(..., request_policy: {...})`
+line for `forward(..., request_policy: {...})` with `host: "upstream"`
 (`include/rut/runtime/callbacks_impl.h`) — copies the parser's raw
 `req.path` (which still includes everything after the `#`) verbatim and
 never consults `target_has_fragment`, so the request is forwarded to the
 upstream with the fragment intact. Live observation on
 `envoy/lower-increment-2` (head `ca7f0dce`) with a `route "/" { return
-forward(backend, request_policy: { host: "upstream", ... }) }` route (the
-currently-shipped `host: "upstream"` request policy exercises the same
-`apply_request_policy` path the milestone's future `host: "preserve"` will
-use once `request_envoy_h1` lands — the fragment handling is identical
-either way): `GET /admin#frag HTTP/1.1` got a real `200 OK` from the origin,
-and the origin received `GET /admin#frag HTTP/1.1\r\nHost:
+forward(backend, request_policy: { host: "upstream", ... }) }` route:
+`GET /admin#frag HTTP/1.1` got a real `200 OK` from the origin, and the
+origin received `GET /admin#frag HTTP/1.1\r\nHost:
 127.0.0.1:29011\r\n\r\n` — the fragment reached the upstream unchanged. This
-is a runtime bug in `apply_request_policy`, not something the converter can
-gate around (the milestone route is any-method/any-path by construction, and
-the runtime forwards the fragment regardless of which capabilities the
-converter has enabled), so it needs a fix in
-`include/rut/runtime/callbacks_impl.h` — reject a fragment-bearing target in
-`apply_request_policy` the way `inspect_request_policy_body` already rejects
-other malformed shapes — before this milestone's `request_envoy_h1` capability
-can claim behavioral equivalence for this request shape.
+remains a runtime bug in `apply_request_policy` for every `host: "upstream"`
+policy (ID1/ID2/ID3) today, not something the converter can gate around
+(a route emitting one of these policies is any-method/any-path by
+construction, and the runtime forwards the fragment regardless of which
+capabilities the converter has enabled).
+
+**Fixed for `host: "preserve"` (ID4 `Http11PreserveHostLowercase`) on this
+branch (`envoy/rut-request-envoy-h1`):** `apply_preserve_host_lowercase_
+request_policy` (`include/rut/runtime/callbacks_impl.h:5934`) checks
+`req.target_has_fragment` immediately after parsing and fails the whole
+request closed (`400 Bad Request`, no upstream contact) rather than copying
+the raw fragment-bearing path through -- the same defect described above,
+fixed for exactly the policy this milestone's converter now emits
+(`put_forward_route`, `src/envoy/converter.cc`, unconditionally selects ID4
+once `validate()` clears every capability gate; see the `TE: trailers` row
+above for why the *shipped* CLI does not reach that code path yet). This is
+not byte-identical to Envoy's own rejection (Envoy's header validator
+rejects the request differently, and Rut's is a generic `400`), but it is a
+fail-closed refusal instead of a mis-forward, matching the behavioral class
+Envoy exhibits for this shape. Unit-tested directly (`request_policy.
+preserve_host_lowercase_wire_and_fail_closed_host`, `tests/test_network.cc`:
+`GET /smoke#admin HTTP/1.1` via `apply_request_policy(conn, endpoint,
+kPreserveHost)` returns `false` with no bytes written); no live Envoy/Rut
+differential run yet for this exact ID4 shape.
 
 Per-request divergences found in the PR #692 round-6 review (same
 non-gating rule as round-2/round-3 above; verified by reading Envoy v1.39.1

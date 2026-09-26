@@ -4409,6 +4409,25 @@ TEST(request_policy, preserve_host_lowercase_wire_and_fail_closed_host) {
         "GET /server-dup HTTP/1.1\r\nhost: client.example\r\nserver: one\r\n"
         "server: two\r\nx-forwarded-proto: http\r\n\r\n");
 
+    // Codex round-18 review: two separate physical `Connection` fields are
+    // aggregated, not rejected on the second one -- matching Envoy's
+    // inline, list-valued `Connection` storage. `Connection: TE` nominates
+    // `te` (persistence-neutral, decided by the trailers check below) and
+    // `Connection: X-Foo` nominates `X-Foo` (dropped along with its field,
+    // like any other safe nomination); neither Connection field's own
+    // literal text reaches the wire (both are hop-by-hop and stripped).
+    prepare(
+        "GET /connection-multi HTTP/1.1\r\n"
+        "Host: client.example\r\n"
+        "Connection: TE\r\n"
+        "Connection: X-Foo\r\n"
+        "TE: trailers\r\n"
+        "X-Foo: 1\r\n\r\n");
+    REQUIRE(apply_request_policy(conn, endpoint, kPreserveHost));
+    require_wire(
+        "GET /connection-multi HTTP/1.1\r\nhost: client.example\r\nte: trailers\r\n"
+        "x-forwarded-proto: http\r\n\r\n");
+
     // Client-supplied `x-envoy-*` headers Envoy's own
     // `ConnectionManagerUtility::cleanInternalHeaders` removes unconditionally
     // for a non-internal, non-edge external request (the fixed shape this
@@ -69055,6 +69074,90 @@ TEST(state_invariant, jit_forward_direct_paired_head_id4_still_rejects_content_l
     handle_jit_outcome<SmallLoop>(&loop, *c, outcome, nullptr, true);
 
     CHECK_EQ(c->resp_status, 400u);
+    CHECK_EQ(loop.backend.count_ops(MockOp::Connect), 0u);
+    CHECK_EQ(loop.backend.count_ops(MockOp::Send), 1u);
+    close(fds[1]);
+    loop.close_conn(*c);
+}
+
+// Codex round-18 review: the paired-HEAD preflight must aggregate every
+// physical `Connection` field, like the ordinary ID4 serializer's own
+// nomination scan and like Envoy's inline, list-valued `Connection`
+// storage, instead of rejecting on the second physical field. Two separate
+// `Connection` fields (`TE` and `X-Foo`) plus their nominated `TE`/`X-Foo`
+// siblings must be admitted, with the request eventually forwarded carrying
+// the canonical `te: trailers` line and no `x-foo` field (verified at the
+// ordinary-serializer wire level in the `preserve_host_lowercase_wire_and_
+// fail_closed_host` test; this test proves the paired-HEAD preflight itself
+// admits the shape rather than 400ing it before the serializer ever runs).
+TEST(state_invariant, jit_forward_direct_paired_head_id4_aggregates_multiple_connection_fields) {
+    RouteConfig cfg;
+    auto upstream = cfg.add_upstream("api", 0x7F000001, 9000);
+    REQUIRE(upstream.has_value());
+    cfg.upstreams[upstream.value()].max_inflight = 1;
+
+    static constexpr char kBody[] =
+        "<html>\r\n<head><title>502 Bad Gateway</title></head>\r\n<body>\r\n"
+        "<center><h1>502 Bad Gateway</h1></center>\r\n"
+        "<hr><center>nginx/1.29.7</center>\r\n</body>\r\n</html>\r\n";
+    static_assert(sizeof(kBody) - 1 == 157);
+    ForwardResponsePolicySpec response{};
+    response.version = ResponsePolicyVersion::Http11;
+    response.framing = ResponsePolicyFraming::ContentLength;
+    response.connection = ResponsePolicyConnection::Request;
+    response.date = ResponsePolicyDate::Current;
+    response.head_mode = ResponsePolicyHeadMode::SuppressBody;
+    response.server = {"nginx/1.29.7", 12};
+    REQUIRE_EQ(cfg.add_response_policy(response), 1u);
+
+    ForwardFailurePolicySpec failure{};
+    failure.version = ForwardFailurePolicyVersion::Http11;
+    failure.status_code = 502;
+    failure.date = ForwardFailurePolicyDate::Current;
+    failure.connection = ForwardFailurePolicyConnection::Request;
+    failure.head_mode = FailurePolicyHeadMode::SuppressBody;
+    failure.reason = {"Bad Gateway", 11};
+    failure.content_type = {"text/html", 9};
+    failure.server = {"nginx/1.29.7", 12};
+    failure.body = {kBody, sizeof(kBody) - 1};
+    REQUIRE_EQ(cfg.add_failure_policy(failure), 1u);
+
+    SmallLoop loop;
+    loop.setup();
+    int fds[2];
+    REQUIRE(socketpair(AF_UNIX, SOCK_STREAM, 0, fds) == 0);
+    ScopedFakeSocket fake_socket(fds[0]);
+    loop.inject_and_dispatch(make_ev(0, IoEventType::Accept, 42));
+    auto* c = loop.find_fd(42);
+    REQUIRE(c != nullptr);
+    c->request_config = &cfg;
+    static constexpr char kRequest[] =
+        "HEAD /missing?q=1 HTTP/1.1\r\nHost: client.example\r\n"
+        "Connection: TE\r\nConnection: X-Foo\r\nTE: trailers\r\nX-Foo: 1\r\n\r\n";
+    REQUIRE_EQ(c->recv_buf.write(reinterpret_cast<const u8*>(kRequest), sizeof(kRequest) - 1),
+               sizeof(kRequest) - 1);
+    capture_request_metadata(*c);
+    c->req_initial_send_len = c->recv_buf.len();
+    c->keep_alive = true;
+
+    JitDispatchOutcome outcome{};
+    outcome.kind = JitDispatchOutcome::Kind::Forward;
+    outcome.upstream_id = upstream.value();
+    outcome.request_policy_id = static_cast<u16>(RequestPolicyId::Http11PreserveHostLowercase);
+    outcome.response_policy_id = 1;
+    outcome.failure_policy_id = 1;
+    loop.backend.clear_ops();
+    loop.backend.fail_connect = true;
+    handle_jit_outcome<SmallLoop>(&loop, *c, outcome, nullptr, true);
+
+    // Admitted, not a 400 preflight rejection: the paired 502 failure
+    // response proves the preflight let the request proceed to the (here,
+    // injected) failed connect attempt instead of rejecting it for the
+    // second physical `Connection` field.
+    CHECK_EQ(c->failure_policy_id, 1u);
+    CHECK(c->failure_policy_suppress_body);
+    CHECK_EQ(c->resp_status, kStatusBadGateway);
+    CHECK_EQ(c->state, ConnState::Sending);
     CHECK_EQ(loop.backend.count_ops(MockOp::Connect), 0u);
     CHECK_EQ(loop.backend.count_ops(MockOp::Send), 1u);
     close(fds[1]);
