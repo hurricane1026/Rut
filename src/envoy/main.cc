@@ -199,12 +199,25 @@ bool read_input(const char* filename, char** output, size_t* length, const char*
     // if that torn mixture happens to be valid JSON, lower successfully.
     // Re-reading the whole file into a second, independent buffer and
     // requiring exact byte-for-byte equality (not just equal length) with
-    // the first read is a real content check: any revision change wide
-    // enough to matter to the parser — or any torn mixture of two
-    // revisions — makes the two reads disagree somewhere, and two
-    // consecutive reads that agree everywhere are the closest thing to a
-    // stable snapshot available without an explicit lock (`flock`) or
-    // copy-on-write snapshot the target filesystem may not support.
+    // the first read is a real content check: any change that lands between
+    // the start of the first read and the end of the second — including a
+    // writer that was mid-rewrite during the first read and has progressed
+    // since — makes the two reads disagree somewhere, and two consecutive
+    // reads that agree everywhere are the closest thing to a stable snapshot
+    // available without an explicit lock (`flock`) or copy-on-write snapshot
+    // the target filesystem may not support.
+    //
+    // PR #692 CI (Sanitizer job): what this cannot do is tell a file that
+    // *holds* a torn mixture for the whole read window from one that simply
+    // contains those bytes. An in-place `write()` copies into the page cache
+    // one page at a time with no lock against buffered reads (ext4, tmpfs)
+    // and bumps mtime/ctime before the first page, so a writer preempted
+    // mid-copy leaves the file torn with its final timestamps already set;
+    // a run that fits inside that stall reads the torn bytes twice,
+    // identically, and converts them as the input (docs/envoy-converter.md,
+    // "Input format"). Writers must replace the file atomically (write a
+    // temporary, then `rename()`) for the converter to see only whole
+    // revisions.
     size_t verify_used = 0u;
     if (!read_whole_file(fd, g_verify_buffer, sizeof(g_verify_buffer), &verify_used, error)) {
         close(fd);

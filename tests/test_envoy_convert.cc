@@ -2,17 +2,19 @@
 #include "rut/envoy/converter.h"
 #include "rut/envoy/parser.h"
 #include "test.h"
-#include <atomic>
 #include <cerrno>
 #include <cstdio>
 #include <cstdlib>
 #include <string>
-#include <thread>
 #include <vector>
 
 #include <dirent.h>
 #include <fcntl.h>
 #include <signal.h>
+#if defined(__linux__)
+#include <sys/ptrace.h>
+#include <sys/syscall.h>
+#endif
 #include <sys/stat.h>
 #include <sys/wait.h>
 #include <time.h>
@@ -129,7 +131,8 @@ RunResult run_with_args(const char* executable, const std::vector<std::string>& 
 
     // PR #692 round-4 review: build argv before fork(), not after. A caller
     // running this concurrently with another live thread (the TOCTOU stress
-    // test's writer thread below) forks with that thread still holding
+    // test's writer thread, since replaced by the deterministic ptrace-driven
+    // `cli_input_rewrite_during_read_is_detected`) forks with that thread still holding
     // whatever locks it held at that instant — fork() duplicates only the
     // calling thread, so a lock an unduplicated thread held (e.g. inside
     // malloc's arena) stays held forever in the child. `std::vector<char*>`
@@ -210,34 +213,6 @@ private:
     }
 
     std::string path_;
-};
-
-// PR #692 round-8 review: a fatal `REQUIRE` inside the polling loop of
-// `cli_input_toctou_same_size_rewrite_never_admits_torn_read` below used to
-// `return` from the test while the racing writer thread was still joinable
-// (`stop`/`writer.join()` ran only after the loop). Destroying a joinable
-// `std::thread` calls `std::terminate`, so a single failed iteration aborted
-// the whole test binary instead of just failing that test. This guard stops
-// and joins the writer no matter how the enclosing scope is left — a normal
-// fall-through, or an early `REQUIRE` return — mirroring `TempDir` above.
-class StopAndJoinThread {
-public:
-    StopAndJoinThread(std::atomic<bool>& stop, std::thread& thread)
-        : stop_(stop), thread_(thread) {}
-
-    ~StopAndJoinThread() {
-        stop_.store(true, std::memory_order_relaxed);
-        if (thread_.joinable()) thread_.join();
-    }
-
-    StopAndJoinThread(const StopAndJoinThread&) = delete;
-    StopAndJoinThread& operator=(const StopAndJoinThread&) = delete;
-    StopAndJoinThread(StopAndJoinThread&&) = delete;
-    StopAndJoinThread& operator=(StopAndJoinThread&&) = delete;
-
-private:
-    std::atomic<bool>& stop_;
-    std::thread& thread_;
 };
 
 std::string expected_location(const std::string& path, Span span) {
@@ -412,134 +387,362 @@ TEST(envoy_convert, cli_input_errors) {
 // PR #692 round-3 review: `read_input` (src/envoy/main.cc) used to compare
 // only `after.st_size` against the byte count it actually read, which cannot
 // catch another process rewriting the file in place with different content of
-// the *same* length while the read is in progress — the size check trivially
-// passes throughout.
+// the *same* length while the read is in progress. Round 3 added the
+// dev/inode/size/mtime/ctime comparison, round 8 the second full read with a
+// byte-for-byte comparison.
 //
-// PR #692 round-4 review: the original version of this test used
-// same-length but otherwise-invalid `content_a`/`content_b` (a repeated 'A'
-// vs a repeated 'B' byte), and both fail to parse at byte 0 with the exact
-// same content-agnostic "unexpected byte in JSON value" detail (the message
-// never quotes the offending byte — see `src/envoy/json.cc`). Every torn
-// mixture of the two also starts with either 'A' or 'B', so it produces that
-// identical message too; the test could not tell a genuinely torn read from
-// a clean one and would pass even against the pre-round-3 size-only check.
+// PR #692 CI (Sanitizer job, run 36197715715): this used to be a free-running
+// stress test — a writer thread looped `pwrite(content_a)`/`pwrite(content_b)`
+// while the converter ran 300 times, and every run had to report either
+// "input changed" or the clean BLOCKED_BY_RUT diagnostic. One run in 300
+// printed neither. Mechanism: an in-place `pwrite` is not atomic with respect
+// to a concurrent `pread` on Linux — ext4 (the CI runner's /tmp) and tmpfs
+// buffered reads take no inode lock, and the writer copies the new bytes into
+// the page cache one page at a time, with `file_modified()` (the mtime/ctime
+// bump) done *before* the first page is copied. A writer preempted between
+// two page copies (routine under ASan slowdown on a loaded runner) therefore
+// leaves the file itself holding a torn mixture — new first page, old later
+// pages — with its final timestamps already in place, for as long as it stays
+// off-CPU. A converter run that fits entirely inside that stall sees
+// identical metadata before and after, and two byte-identical reads of the
+// torn mixture: an honest snapshot of what the file contained, which the
+// CLI then lowered on its merits ("route cluster does not name a declared
+// cluster"). No reader-side check can tell that apart from a file that simply
+// contains those bytes, so the old test's "only A or B" oracle was wrong,
+// not the CLI.
 //
-// `content_a`/`content_b` below fix this: both are the full milestone-S
-// bootstrap (the same shape `milestone_s_json()` produces, which parses
-// successfully and is only ever blocked by the `request_envoy_h1` capability
-// gate — see `cli_milestone_s_fails_closed_with_request_gap` above), and
-// differ *only* in one cluster identifier that is spelled out three times —
-// the route's `cluster`, the static cluster's `name`, and its
-// `load_assignment.cluster_name` (all three must agree; `validate()` checks
-// the first two, and `parse_bootstrap_json` the third) — as either
-// "backend0" (content_a) or "backend1" (content_b), both 8 bytes, so the two
-// documents are byte-for-byte the same length and only ever disagree on that
-// one trailing digit at each of the three spots. A large whitespace pad
-// between the `listeners` and `clusters` sections (JSON insignificant
-// whitespace, so still valid) pushes the first occurrence and the other two
-// onto different pages, widening the same window the round-3 fix closed.
-// A self-consistent read of either document (all three digits '0' or all
-// three '1') reaches the identical, expected `request_envoy_h1`
-// BLOCKED_BY_RUT diagnostic computed once below via the library API. A torn
-// read that mixes '0' and '1' across those three spots — a route naming one
-// cluster revision while the declared cluster is the other, precisely the
-// "listener from one revision combined with an endpoint from another"
-// scenario the round-3 comment in `read_input` describes — makes
-// `action.cluster.eq(model.cluster.name)` fail instead, with a different
-// diagnostic and error code (`invalid()`/`UnexpectedToken`, "route cluster
-// does not name a declared cluster") that cannot be confused with the
-// expected one. A torn read that instead breaks JSON syntax fails
-// `parse_bootstrap_json` and does not print the expected diagnostic either.
-// So exactly one of "input changed" or the expected BLOCKED_BY_RUT message
-// is a passing outcome; anything else — including that mismatched-cluster
-// diagnostic — is a torn read the TOCTOU check let through and must fail
-// this test.
-TEST(envoy_convert, cli_input_toctou_same_size_rewrite_never_admits_torn_read) {
+// These tests instead drive the rewrite deterministically: the converter runs
+// under `ptrace` and is paused at fixed syscall-entry points on its own input
+// descriptor inside `read_input`, where the test rewrites the file (same
+// size, in place) before letting the syscall proceed. Every case has exactly
+// one correct outcome. The contract they pin (docs/envoy-converter.md,
+// "Input format"): any change that lands between the `before` fstat and the
+// end of the second read is reported as "input changed while it was being
+// read"; a change after the second read cannot affect the result; a torn
+// state the file itself holds across the whole read window is converted as
+// that content (and here fails closed on validation).
+
+std::string cli_error_for(const std::string& path, const std::string& contents) {
+    static envoy::JsonDocument doc;
+    auto parsed = envoy::parse_bootstrap_json(str(contents), doc);
+    if (!parsed)
+        return expected_location(path, parsed.error().span) + to_string(parsed.error().detail) +
+               "\n";
+    auto lowered = envoy::lower_to_rut(parsed.value());
+    if (lowered) return std::string();
+    return expected_location(path, lowered.error().span) + to_string(lowered.error().detail) + "\n";
+}
+
+struct RaceFixture {
+    std::string content_a;
+    std::string content_b;
+    // What the file holds while a writer replacing content_a with content_b
+    // is stalled after its first page: the route (first page) already names
+    // "backend1", the cluster (after the 8 KiB pad) still "backend0".
+    std::string torn;
+};
+
+RaceFixture make_race_fixture() {
+    RaceFixture fixture;
+    std::string base = milestone_s_json();
+    // A pad between `listeners` and `clusters` (insignificant JSON
+    // whitespace) puts the route's cluster reference and the two cluster
+    // spellings on different pages, as in the CI failure.
+    if (!replace_first(&base, ",\n\"clusters\"", ",\n" + std::string(8192, ' ') + "\"clusters\""))
+        return fixture;
+    fixture.content_a = replace_all(base, "backend", "backend0");
+    fixture.content_b = replace_all(base, "backend", "backend1");
+    fixture.torn = fixture.content_a;
+    if (!replace_first(&fixture.torn, "backend0", "backend1")) fixture.torn.clear();
+    return fixture;
+}
+
+// A torn file that stays torn for the whole read is read faithfully: the
+// converter reports what those bytes mean, which for this mixture is the
+// mismatched-cluster validation error — never the clean BLOCKED_BY_RUT
+// result and never a successful lowering.
+TEST(envoy_convert, cli_input_static_torn_content_is_converted_as_is) {
     const TempDir temp_dir;
     REQUIRE(temp_dir.ok());
-    const std::string& directory = temp_dir.path();
-    const std::string path = directory + "/racing.json";
+    const std::string path = temp_dir.path() + "/torn.json";
+    const RaceFixture fixture = make_race_fixture();
+    REQUIRE_FALSE(fixture.torn.empty());
+    REQUIRE_EQ(fixture.torn.size(), fixture.content_a.size());
+    REQUIRE(write_file(path, fixture.torn));
 
-    std::string base = milestone_s_json();
-    REQUIRE(
-        replace_first(&base, ",\n\"clusters\"", ",\n" + std::string(8192, ' ') + "\"clusters\""));
-    const std::string content_a = replace_all(base, "backend", "backend0");
-    const std::string content_b = replace_all(base, "backend", "backend1");
-    REQUIRE_EQ(content_a.size(), content_b.size());
-    REQUIRE_NE(content_a, content_b);
-    REQUIRE(write_file(path, content_a));
+    const std::string expected = cli_error_for(path, fixture.torn);
+    REQUIRE_FALSE(expected.empty());
+    CHECK(expected.find("route cluster does not name a declared cluster") != std::string::npos);
+    const RunResult result = run_converter(g_executable, path);
+    REQUIRE(WIFEXITED(result.status));
+    CHECK_EQ(WEXITSTATUS(result.status), 1);
+    CHECK(result.out.empty());
+    CHECK_EQ(result.err, expected);
+}
 
-    static envoy::JsonDocument doc_a;
-    auto parsed_a = envoy::parse_bootstrap_json(str(content_a), doc_a);
-    REQUIRE(parsed_a);
-    static envoy::JsonDocument doc_b;
-    auto parsed_b = envoy::parse_bootstrap_json(str(content_b), doc_b);
-    REQUIRE(parsed_b);
+#if defined(__linux__)
 
-    auto lowered_a = envoy::lower_to_rut(parsed_a.value());
-    REQUIRE_FALSE(lowered_a);
-    auto lowered_b = envoy::lower_to_rut(parsed_b.value());
-    REQUIRE_FALSE(lowered_b);
-    const std::string expected_detail = to_string(lowered_a.error().detail);
-    CHECK(expected_detail.find("BLOCKED_BY_RUT") != std::string::npos);
-    CHECK_EQ(expected_detail, to_string(lowered_b.error().detail));
-    CHECK_EQ(lowered_a.error().span.line, lowered_b.error().span.line);
-    CHECK_EQ(lowered_a.error().span.col, lowered_b.error().span.col);
-    const std::string expected_prefix = expected_location(path, lowered_a.error().span);
+// Syscall-entry points inside `read_input` (src/envoy/main.cc) at which
+// `run_converter_with_rewrites` pauses the converter, all on the converter's
+// own input descriptor.
+enum class ReadPoint : u8 {
+    // Entry of the 1st offset-0 `pread`: after the `before` fstat, before
+    // the first read.
+    FirstReadStart,
+    // Entry of the 2nd offset-0 `pread`: after the first read and the
+    // `after` fstat, before the verification read.
+    SecondReadStart,
+    // Entry of `close(input)`: after both reads.
+    InputClose,
+};
 
-    const int fd = open(path.c_str(), O_WRONLY, 0600);
-    REQUIRE(fd >= 0);
+struct Rewrite {
+    ReadPoint at;
+    const std::string* contents;
+};
 
-    std::atomic<bool> stop{false};
-    std::thread writer([&] {
-        while (!stop.load(std::memory_order_relaxed)) {
-            // Never O_TRUNC, never changes the length: an in-place same-size
-            // rewrite is exactly the case the old size-only check could not
-            // detect.
-            (void)pwrite(fd, content_a.data(), content_a.size(), 0);
-            (void)pwrite(fd, content_b.data(), content_b.size(), 0);
+struct TracedRun {
+    RunResult run;
+    size_t rewrites_done = 0u;
+};
+
+bool is_input_fd(pid_t pid, u64 fd, const struct stat& input) {
+    char proc_path[64];
+    snprintf(proc_path,
+             sizeof(proc_path),
+             "/proc/%d/fd/%llu",
+             static_cast<int>(pid),
+             static_cast<unsigned long long>(fd));
+    struct stat info{};
+    return stat(proc_path, &info) == 0 && info.st_dev == input.st_dev &&
+           info.st_ino == input.st_ino;
+}
+
+bool pwrite_all(int fd, const std::string& contents) {
+    size_t offset = 0u;
+    while (offset < contents.size()) {
+        const ssize_t count = pwrite(
+            fd, contents.data() + offset, contents.size() - offset, static_cast<off_t>(offset));
+        if (count > 0) {
+            offset += static_cast<size_t>(count);
+            continue;
         }
-    });
-    // Declared immediately after the thread starts and before the first
-    // fatal `REQUIRE` below, so an early return from this test (or an
-    // exception) still stops and joins `writer` during unwind instead of
-    // destroying a joinable thread.
-    StopAndJoinThread join_writer(stop, writer);
+        if (count < 0 && errno == EINTR) continue;
+        return false;
+    }
+    return true;
+}
 
-    u32 changed_detected = 0;
-    constexpr int kIterations = 300;
-    for (int i = 0; i < kIterations; i++) {
-        const RunResult result = run_converter(g_executable, path);
-        REQUIRE(WIFEXITED(result.status));
-        CHECK_EQ(WEXITSTATUS(result.status), 1);
-        CHECK(result.out.empty());
-        const bool is_changed_error =
-            result.err.find("input changed while it was being read") != std::string::npos;
-        const bool is_expected_blocked =
-            result.err.compare(0, expected_prefix.size(), expected_prefix) == 0 &&
-            result.err.find(expected_detail) != std::string::npos;
-        // Exactly one of the two known-good outcomes, never both, never
-        // neither — in particular never the mismatched-cluster diagnostic a
-        // torn read across the three spellings would produce.
-        CHECK(is_changed_error != is_expected_blocked);
-        if (is_changed_error) changed_detected++;
+bool waitpid_retry(pid_t child, int* status) {
+    for (;;) {
+        if (waitpid(child, status, 0) == child) return true;
+        if (errno != EINTR) return false;
+    }
+}
+
+// Runs the converter on `path` under ptrace. When the converter reaches
+// `rewrites[k].at` (in order), the test rewrites `path` in place at offset 0
+// with `*rewrites[k].contents` (same length, no O_TRUNC) while the converter
+// is stopped at that syscall's entry, then lets the syscall run. Detaches
+// after the last rewrite or at the input's close, whichever comes first, so
+// the converter always exits untraced (LeakSanitizer's exit-time scan must
+// ptrace the process itself). `rewrites_done` reports how many rewrites ran.
+TracedRun run_converter_with_rewrites(const char* executable,
+                                      const std::string& path,
+                                      const std::vector<Rewrite>& rewrites) {
+    TracedRun traced;
+    struct stat input{};
+    if (stat(path.c_str(), &input) != 0) return traced;
+    const int writer = open(path.c_str(), O_WRONLY | O_CLOEXEC);
+    if (writer < 0) return traced;
+    int capture[2]{};
+    if (!make_capture_files(capture)) {
+        close(writer);
+        return traced;
+    }
+    const std::string format_flag = "--format";
+    const std::string format = "bootstrap-json";
+    std::vector<char*> argv{const_cast<char*>(executable),
+                            const_cast<char*>(format_flag.c_str()),
+                            const_cast<char*>(format.c_str()),
+                            const_cast<char*>(path.c_str()),
+                            nullptr};
+
+    const pid_t child = fork();
+    if (child == 0) {
+        if (ptrace(PTRACE_TRACEME, 0, nullptr, nullptr) != 0) _exit(125);
+        if (dup2(capture[0], STDOUT_FILENO) < 0 || dup2(capture[1], STDERR_FILENO) < 0) _exit(126);
+        close(capture[0]);
+        close(capture[1]);
+        execv(executable, argv.data());
+        _exit(127);
+    }
+    if (child < 0) {
+        close(capture[0]);
+        close(capture[1]);
+        close(writer);
+        return traced;
     }
 
-    stop.store(true, std::memory_order_relaxed);
-    writer.join();
-    close(fd);
-
-    // Informational only (scheduling-dependent, so not a hard requirement —
-    // a slow or heavily loaded machine must not make this test flaky). When
-    // it fires, every occurrence is a same-size in-place rewrite the new
-    // dev/inode/mtime/ctime comparison caught that the old `after.st_size !=
-    // used` check could never have seen.
-    fprintf(stderr,
-            "cli_input_toctou_same_size_rewrite_never_admits_torn_read: caught %u/%d same-size "
-            "races\n",
-            changed_detected,
-            kIterations);
+    int status = 0;
+    bool reaped = false;
+    // First stop: the SIGTRAP a PTRACE_TRACEME child takes on execv.
+    if (!waitpid_retry(child, &status)) {
+        kill(child, SIGKILL);
+    } else if (!WIFSTOPPED(status)) {
+        reaped = true;
+    } else if (ptrace(PTRACE_SETOPTIONS,
+                      child,
+                      nullptr,
+                      reinterpret_cast<void*>(static_cast<intptr_t>(
+                          PTRACE_O_TRACESYSGOOD | PTRACE_O_TRACEEXEC | PTRACE_O_EXITKILL))) != 0) {
+        kill(child, SIGKILL);
+    } else {
+        u32 offset_zero_reads = 0u;
+        int deliver = 0;
+        for (;;) {
+            if (ptrace(PTRACE_SYSCALL,
+                       child,
+                       nullptr,
+                       reinterpret_cast<void*>(static_cast<intptr_t>(deliver))) != 0) {
+                kill(child, SIGKILL);
+                break;
+            }
+            deliver = 0;
+            if (!waitpid_retry(child, &status)) {
+                kill(child, SIGKILL);
+                break;
+            }
+            if (WIFEXITED(status) || WIFSIGNALED(status)) {
+                reaped = true;
+                break;
+            }
+            if (!WIFSTOPPED(status)) continue;
+            const int stop_signal = WSTOPSIG(status);
+            if (stop_signal != (SIGTRAP | 0x80)) {
+                // A ptrace event stop (e.g. a re-exec) carries no signal to
+                // deliver; a genuine signal-delivery stop is passed through.
+                if ((status >> 16) == 0) deliver = stop_signal;
+                continue;
+            }
+            __ptrace_syscall_info info{};
+            if (ptrace(
+                    PTRACE_GET_SYSCALL_INFO, child, reinterpret_cast<void*>(sizeof(info)), &info) <=
+                    0 ||
+                info.op != PTRACE_SYSCALL_INFO_ENTRY)
+                continue;
+            bool reached = false;
+            ReadPoint point = ReadPoint::InputClose;
+            if (info.entry.nr == SYS_pread64 && info.entry.args[3] == 0u &&
+                is_input_fd(child, info.entry.args[0], input)) {
+                offset_zero_reads++;
+                reached = offset_zero_reads <= 2u;
+                point = offset_zero_reads == 1u ? ReadPoint::FirstReadStart
+                                                : ReadPoint::SecondReadStart;
+            } else if (info.entry.nr == SYS_close &&
+                       is_input_fd(child, info.entry.args[0], input)) {
+                reached = true;
+                point = ReadPoint::InputClose;
+            }
+            if (!reached) continue;
+            if (point == rewrites[traced.rewrites_done].at) {
+                if (!pwrite_all(writer, *rewrites[traced.rewrites_done].contents)) {
+                    kill(child, SIGKILL);
+                    break;
+                }
+                traced.rewrites_done++;
+            }
+            // `read_input` closes the input on every path out of it, so the
+            // close also ends tracing when an earlier check already failed
+            // and the remaining points will never be reached.
+            if (traced.rewrites_done == rewrites.size() || point == ReadPoint::InputClose) {
+                if (ptrace(PTRACE_DETACH, child, nullptr, nullptr) != 0) kill(child, SIGKILL);
+                break;
+            }
+        }
+    }
+    if (reaped)
+        traced.run.status = status;
+    else
+        wait_bounded(child, &traced.run.status);
+    traced.run.out = read_fd(capture[0]);
+    traced.run.err = read_fd(capture[1]);
+    close(writer);
+    return traced;
 }
+
+// Each case is fully deterministic; the loop only guards against the harness
+// itself depending on timing (e.g. whether a rewrite happened to land in the
+// same filesystem timestamp tick as the previous one).
+TEST(envoy_convert, cli_input_rewrite_during_read_is_detected) {
+    const TempDir temp_dir;
+    REQUIRE(temp_dir.ok());
+    const std::string path = temp_dir.path() + "/racing.json";
+    const RaceFixture fixture = make_race_fixture();
+    REQUIRE_FALSE(fixture.torn.empty());
+    REQUIRE_EQ(fixture.content_a.size(), fixture.content_b.size());
+    REQUIRE_NE(fixture.content_a, fixture.content_b);
+
+    const std::string blocked = cli_error_for(path, fixture.content_a);
+    REQUIRE(blocked.find("BLOCKED_BY_RUT") != std::string::npos);
+    REQUIRE_EQ(blocked, cli_error_for(path, fixture.content_b));
+    const std::string changed = path + ":1:1: input changed while it was being read\n";
+
+    struct Case {
+        const char* name;
+        std::vector<Rewrite> rewrites;
+        size_t min_rewrites;
+        const std::string* expected_err;
+    };
+    const Case cases[] = {
+        // A writer mid-rewrite while read 1 runs (read 1 sees the torn
+        // mixture), finishing before read 2: caught by the metadata check
+        // when the timestamps ticked, else by the content comparison — the
+        // second rewrite is then reached and makes read 2 differ. Same
+        // outcome either way.
+        {"torn first read, writer finishes before second read",
+         {{ReadPoint::FirstReadStart, &fixture.torn},
+          {ReadPoint::SecondReadStart, &fixture.content_a}},
+         1u,
+         &changed},
+        // Same-size rewrite after the metadata check: only the round-8
+        // byte comparison can catch it.
+        {"rewrite between the two reads",
+         {{ReadPoint::SecondReadStart, &fixture.content_b}},
+         1u,
+         &changed},
+        {"torn state between the two reads",
+         {{ReadPoint::SecondReadStart, &fixture.torn}},
+         1u,
+         &changed},
+        // After both reads agreed the converter owns a stable snapshot of
+        // content_a; a later rewrite cannot reach the result.
+        {"rewrite after the second read",
+         {{ReadPoint::InputClose, &fixture.content_b}},
+         1u,
+         &blocked},
+    };
+    for (int iteration = 0; iteration < 5; iteration++) {
+        for (const Case& c : cases) {
+            REQUIRE(write_file(path, fixture.content_a));
+            const TracedRun traced = run_converter_with_rewrites(g_executable, path, c.rewrites);
+            if (traced.run.err != *c.expected_err)
+                fprintf(stderr,
+                        "case '%s' (iteration %d, %zu rewrite(s) done): unexpected stderr: %s\n",
+                        c.name,
+                        iteration,
+                        traced.rewrites_done,
+                        traced.run.err.c_str());
+            REQUIRE(WIFEXITED(traced.run.status));
+            CHECK_EQ(WEXITSTATUS(traced.run.status), 1);
+            CHECK(traced.run.out.empty());
+            CHECK(traced.rewrites_done >= c.min_rewrites);
+            CHECK_EQ(traced.run.err, *c.expected_err);
+        }
+    }
+}
+
+#endif  // defined(__linux__)
 
 TEST(envoy_convert, cli_parse_error_is_source_located) {
     const TempDir temp_dir;
@@ -1059,10 +1262,13 @@ TEST(envoy_convert, api_forged_model_rejected) {
 }
 
 int main(int argc, char** argv) {
-    if (argc != 2) {
-        fprintf(stderr, "usage: test_envoy_convert <path to rut-envoy-convert>\n");
+    if (argc < 2) {
+        fprintf(stderr, "usage: test_envoy_convert <path to rut-envoy-convert> [test options]\n");
         return 2;
     }
     g_executable = argv[1];
-    return rut::test::run_all(1, argv);
+    // Forward any options after the converter path (e.g. --filter=...) to the
+    // runner, with argv[0] kept in front so it sees the usual argv shape.
+    argv[1] = argv[0];
+    return rut::test::run_all(argc - 1, argv + 1);
 }

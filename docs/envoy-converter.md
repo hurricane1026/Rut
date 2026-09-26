@@ -60,6 +60,28 @@ Input is one regular file no larger than 1 MiB, kept alive through parsing and
 lowering. The converter does not read stdin, resolve `$ref`-style includes,
 execute generated RUT, open listeners, or infer the format from file contents.
 
+Read consistency (`read_input`, `src/envoy/main.cc`): the converter `fstat`s
+the open file, reads it whole, `fstat`s again and requires identical device,
+inode, size, mtime and ctime, then reads it whole a second time and requires
+the two reads to be byte-identical. Any change that lands between the first
+`fstat` and the end of the second read — a same-size in-place rewrite, a torn
+first read whose writer then progressed, a rename-replace — fails with
+`input changed while it was being read`; a change after the second read cannot
+affect the result. Out of contract: a file that itself *holds* a torn mixture
+for the whole read window. Linux buffered reads (ext4, tmpfs) take no lock
+against an in-place `write()`, which copies page by page after already bumping
+mtime/ctime, so a writer stalled mid-copy leaves a torn file whose metadata no
+longer changes; the converter reads those bytes twice, identically, and
+converts them as the input — indistinguishable from a file that simply
+contains them (validation may still reject them, as it does for a mixed
+cluster name). Writers that need the converter to see only whole revisions
+must replace the file atomically (write a temporary file, then `rename()` it
+over the input). `tests/test_envoy_convert.cc` pins both halves
+deterministically: `cli_input_rewrite_during_read_is_detected` pauses the
+converter under `ptrace` at fixed points in `read_input` and rewrites the file
+there, and `cli_input_static_torn_content_is_converted_as_is` covers the
+out-of-contract torn file.
+
 ## First behavioral milestone
 
 The first accepted configuration is the Envoy equivalent of the nginx
