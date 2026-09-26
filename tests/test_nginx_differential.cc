@@ -76712,7 +76712,20 @@ static bool run_pinned_nginx_custom_hide_timeout_probe(
         if (!exact_response || !no_eof_and_quiet || !access_read || access != "60\n" ||
             !response_mutants_rejected || !origin_retired || !stable || !cleanup) {
             error =
-                "#270 custom-hide completion episode exact response/lifecycle validation failed";
+                "#270 custom-hide completion episode exact response/lifecycle validation failed "
+                "exact-response=" +
+                std::to_string(exact_response) +
+                " response-bytes=" + std::to_string(response.size()) +
+                " no-eof-quiet=" + std::to_string(no_eof_and_quiet) +
+                " access-read=" + std::to_string(access_read) +
+                " access-bytes=" + std::to_string(access.size()) +
+                " mutants-rejected=" + std::to_string(response_mutants_rejected) +
+                " origin-retired=" + std::to_string(origin_retired) +
+                " stable=" + std::to_string(stable) + " cleanup=" + std::to_string(cleanup) +
+                " nginx-stopped=" + std::to_string(nginx_stopped) +
+                " removed=" + std::to_string(removed) +
+                " exact-upstream=" + std::to_string(exact_upstream) +
+                " final-access-bytes=" + std::to_string(final_access.size()) + " detail=" + error;
             return false;
         }
         if (pair != nullptr) {
