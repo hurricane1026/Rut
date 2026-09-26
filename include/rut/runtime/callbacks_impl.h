@@ -9544,6 +9544,11 @@ inline bool response_policy_suppress_head_admitted(const Connection& conn,
     // than the connection-count-0/exact-"close" cache fields alone --
     // decides ID4 admission when `te` is nominated.
     bool connection_close_token_seen = false;
+    // Set when a client `Expect` field's value is semantically present
+    // (non-empty after OWS trimming -- `header.value` is already OWS-
+    // trimmed by the parser). See the final return's use of this in place
+    // of the raw-presence `conn.req_client_has_expect` cache field.
+    bool expect_semantically_present = false;
     const Header* host = nullptr;
     for (u32 i = 0; i < req.header_count; i++) {
         const Header& header = req.headers[i];
@@ -9569,9 +9574,20 @@ inline bool response_policy_suppress_head_admitted(const Connection& conn,
                 // insensitively `close` and/or `te` merely because it is
                 // not the single literal token `close` -- the shape
                 // classification below independently verifies persistence
-                // is unaffected either way. Any other token still fails
-                // closed, exactly as before (Codex round-13 review, PR
-                // #696).
+                // is unaffected either way. An `upgrade` token is likewise
+                // admitted, but only when `req.has_upgrade_header` is false
+                // -- i.e. no semantically present `Upgrade` field exists
+                // anywhere on this request (the top-of-body check above
+                // already fails closed on the genuine-upgrade combination
+                // of a nominated `upgrade` token with a non-empty `Upgrade`
+                // value) -- because the ordinary ID4 inspector
+                // (`inspect_request_policy_body`) admits exactly this
+                // `Connection: close, upgrade` + empty/OWS-only/absent
+                // `Upgrade` shape and the serializer strips both fields
+                // (the nomination generically, the fixed-list `Upgrade`
+                // entry via `drop_fixed`), so no upgrade ever occurs. Any
+                // other token still fails closed, exactly as before (Codex
+                // round-13/round-15 review, PR #696).
                 const char* value_start = header.value.ptr;
                 const char* value_end = value_start + header.value.len;
                 const char* tok = value_start;
@@ -9586,7 +9602,10 @@ inline bool response_policy_suppress_head_admitted(const Connection& conn,
                         const u32 tok_len = static_cast<u32>(t1 - t0);
                         const bool is_close = http_header_name_eq_ci(t0, tok_len, "close", 5);
                         const bool is_te = http_header_name_eq_ci(t0, tok_len, "te", 2);
-                        if (!is_close && !is_te) return false;
+                        const bool is_safe_upgrade =
+                            !req.has_upgrade_header &&
+                            http_header_name_eq_ci(t0, tok_len, "upgrade", 7);
+                        if (!is_close && !is_te && !is_safe_upgrade) return false;
                         connection_close_token_seen |= is_close;
                     }
                     if (tok_end >= value_end) break;
@@ -9597,9 +9616,24 @@ inline bool response_policy_suppress_head_admitted(const Connection& conn,
                 return false;
             }
         } else if (http_header_name_eq_ci(name.ptr, name.len, "content-length", 14) ||
-                   http_header_name_eq_ci(name.ptr, name.len, "transfer-encoding", 17) ||
-                   http_header_name_eq_ci(name.ptr, name.len, "expect", 6)) {
+                   http_header_name_eq_ci(name.ptr, name.len, "transfer-encoding", 17)) {
             if (!conn.request_policy_id || paired_failure) return false;
+        } else if (http_header_name_eq_ci(name.ptr, name.len, "expect", 6)) {
+            // An empty or OWS-only `Expect` field carries no expectation at
+            // all (RFC 9110 defines only the "100-continue" expect-value),
+            // matching `inspect_request_policy_body`'s `has_expect`
+            // computation (Codex round-9 review): it is semantically absent,
+            // and every supported policy's fixed strip list (`Expect` is in
+            // ID1-3's `strip_headers` and ID4's `drop_fixed`) removes the
+            // field regardless of value, so this preflight must not reject
+            // it just because the field name is present. `header.value` is
+            // already OWS-trimmed by the parser, so a zero length here means
+            // exactly that. A semantically present (non-empty) value keeps
+            // the original closed contract (Codex round-15 review, PR #696).
+            if (header.value.len != 0) {
+                expect_semantically_present = true;
+                if (!conn.request_policy_id || paired_failure) return false;
+            }
         } else if (http_header_name_eq_ci(name.ptr, name.len, "te", 2) ||
                    http_header_name_eq_ci(name.ptr, name.len, "upgrade", 7)) {
             // ID4's serializer canonicalizes every physical `TE` field
@@ -9719,7 +9753,12 @@ inline bool response_policy_suppress_head_admitted(const Connection& conn,
             id4_default_keep_alive_with_te_shape) &&
            !conn.req_client_has_content_length && !conn.tls_active &&
            !conn.req_client_has_transfer_encoding && (id4_route || !conn.req_client_has_te) &&
-           !conn.req_client_has_expect &&
+           // `conn.req_client_has_expect` is raw field-name presence; an
+           // empty/OWS-only `Expect` is semantically absent (see the
+           // per-header-loop comment above), so `expect_semantically_
+           // present` -- computed from the same trimmed value -- decides
+           // admission here instead (Codex round-15 review, PR #696).
+           !expect_semantically_present &&
            // A bare, non-nominated `Upgrade` is ID4-admitted per the
            // top-of-body and per-header-loop comments above; a genuine
            // upgrade (Upgrade + Connection: upgrade nomination) is still

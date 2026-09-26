@@ -348,10 +348,13 @@ return forward(users, request_policy: {
 // Upgrade header otherwise -- including an Upgrade header present with an
 // empty/OWS-only value alongside an `upgrade` nomination -- and always
 // strips it (and any nominated Upgrade) from the forwarded request;
-// rejects more than one X-Forwarded-Proto field; treats any X-Forwarded-Proto
-// value that is not (case-insensitively) exactly "http" or "https" -- empty,
-// OWS-only, or otherwise invalid such as "http,https" -- as absent (dropped,
-// not forwarded blank or malformed); rejects a fragment-bearing request
+// rejects more than one X-Forwarded-Proto field; a single field's value that
+// is not (case-insensitively) exactly "http" or "https" -- empty, OWS-only,
+// or otherwise invalid such as "http,https" -- is overwritten in place, at
+// that field's original position, with "http" rather than dropped and
+// forwarded blank or malformed; a valid value passes through unchanged in
+// place; a trailing "x-forwarded-proto: http" is appended only when the
+// client sent no such field at all; rejects a fragment-bearing request
 // target; and drops the sixteen client-supplied headers Envoy itself strips
 // for external requests, plus one Rut-side hardening addition, seventeen in
 // total (`x-envoy-internal`, fourteen more `x-envoy-*` names,
@@ -394,7 +397,15 @@ return forward(users,
 // when both policies select it; it remains bounded to cleartext H1.1, bodyless
 // HEAD with either no Connection field (the HTTP/1.1 default-keepalive shape)
 // or exactly one `Connection: close`, one IPv4 upstream, strict success, and
-// connect-establishment failure. While the broader failure rendezvous is not
+// connect-establishment failure. On a `host: "preserve"` (ID4) route only,
+// a `Connection` value made up solely of `close`/`te` tokens (any order,
+// case-insensitive) is admitted too, classified by whether a `close` token
+// is present -- `Connection: close, TE` behaves like the plain
+// `Connection: close` shape, and `Connection: TE` alone behaves like no
+// `Connection` field at all -- since a `te` nomination never affects
+// persistence and ID4's own request-policy path already forwards it
+// (canonicalizing the paired `TE` field) regardless of this response-side
+// contract. While the broader failure rendezvous is not
 // part of this contract, timeout, malformed/incomplete/excess response, and
 // upload/send/recv failure close before emitting downstream bytes.
 // response_policy.connection: "keep_alive" requires a keep-alive downstream
