@@ -261,7 +261,7 @@ jobs:
             -DLLVM_DIR=/usr/lib/llvm-21/lib/cmake/llvm
 
       - name: Build Envoy differential targets
-        run: ninja -C build rut-envoy-convert test_envoy_parser test_envoy_convert test_envoy_differential
+        run: ninja -C build rut rut-envoy-convert test_envoy_parser test_envoy_convert test_envoy_differential
 
       - name: Test required Envoy differentials
         run: |
@@ -274,6 +274,13 @@ jobs:
         with:
           name: envoy-oracle-transcript
           path: build/envoy_oracle_milestone_s.inc
+
+      - name: Upload Envoy-vs-RUT pair transcript
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: envoy-pair-transcript
+          path: build/envoy_pair_milestone_s.inc
 
   docker-launch-diagnostic:
     name: Docker launch diagnostic — not acceptance
