@@ -959,6 +959,41 @@ public:
         requests_by_path_.clear();
     }
 
+    // Waits until no connection this upstream has ever accepted is still
+    // being handled -- `active_fds_` empty, i.e. every accepted connection
+    // has been fully read, parsed, recorded, and closed -- or `timeout_ms`
+    // elapses, whichever comes first. Returns whether it actually went idle
+    // (false on timeout).
+    //
+    // Round-18 review, "Wait for upstream handlers before inspecting
+    // asserted traffic": stopping the PROXY only guarantees ITS OWN process
+    // has exited; it does not synchronize with this object's own
+    // independent accept/handler threads. A request the proxy already sent
+    // (and the kernel already delivered) before exiting can still be
+    // sitting unread in a handler thread's recv() buffer at the exact
+    // moment the proxy's stop() call returns, so callers must await this
+    // BETWEEN stopping the proxy and calling fill_upstream_bytes()/
+    // requests_for()/all_requests() -- otherwise a genuinely last-second
+    // request is either missed by the snapshot entirely or, worse, still
+    // gets recorded but only after the following clear_requests() has
+    // already run, bleeding into the next batch's evidence instead. Once
+    // the proxy process itself is confirmed fully exited (reaped), every
+    // TCP connection it held to this upstream is torn down at the kernel
+    // level almost immediately, so this is expected to return promptly;
+    // the bounded timeout is a safety net, not the expected path.
+    bool wait_idle(int timeout_ms) {
+        const int64_t deadline = now_ms() + timeout_ms;
+        for (;;) {
+            {
+                std::lock_guard<std::mutex> lock(conn_mu_);
+                if (active_fds_.empty()) return true;
+            }
+            if (now_ms() >= deadline) return false;
+            struct timespec ts{0, 5'000'000};
+            nanosleep(&ts, nullptr);
+        }
+    }
+
     // Idempotent: safe to call more than once (the destructor calls it again
     // after an explicit stop()).
     void stop() {
@@ -1472,19 +1507,35 @@ bool envoy_log_confirms_listener(const std::string& contents) {
 //
 // Counts how many rows of a /proc/net/tcp- or /proc/net/tcp6-style table are
 // in the LISTEN state (`st` field "0A", i.e. decimal 10), bound to `port`,
-// AND bound to an address that can actually receive this harness's IPv4
-// loopback client traffic (round-16 review, "Count only listeners that can
-// receive the IPv4 traffic"): an unrelated IPv6-only listener on the same
-// numeric port (e.g. something else on `::1`) can never collide with, or
-// steal traffic from, the proxy's IPv4 endpoint, so counting it would make
-// this falsely detect a reuseport collision that was never a real one.
-// Eligible addresses are the IPv4 wildcard (`0.0.0.0`, hex "00000000") or
-// the exact loopback address (`127.0.0.1`, hex "0100007F") in a
-// /proc/net/tcp-style (8 hex digit) row, and the IPv6 wildcard (`::`, all
-// zero) or the IPv4-mapped loopback address (`::ffff:127.0.0.1`) in a
-// /proc/net/tcp6-style (32 hex digit) row -- both of those genuinely
-// receive IPv4 traffic on a dual-stack socket. An IPv6-only address (e.g.
-// `::1`) is deliberately excluded.
+// owned by `uid`, AND bound to an address that can actually receive this
+// harness's IPv4 loopback client traffic (round-16 review, "Count only
+// listeners that can receive the IPv4 traffic"): an unrelated IPv6-only
+// listener on the same numeric port (e.g. something else on `::1`) can
+// never collide with, or steal traffic from, the proxy's IPv4 endpoint, so
+// counting it would make this falsely detect a reuseport collision that was
+// never a real one. Eligible addresses are the IPv4 wildcard (`0.0.0.0`,
+// hex "00000000") or the exact loopback address (`127.0.0.1`, hex
+// "0100007F") in a /proc/net/tcp-style (8 hex digit) row, and the IPv6
+// wildcard (`::`, all zero) or the IPv4-mapped loopback address
+// (`::ffff:127.0.0.1`) in a /proc/net/tcp6-style (32 hex digit) row -- both
+// of those genuinely receive IPv4 traffic on a dual-stack socket. An
+// IPv6-only address (e.g. `::1`) is deliberately excluded.
+//
+// The `::` wildcard row is still ambiguous on its own, though (round-18
+// review, "Exclude IPv6-only wildcard sockets from the ownership count"):
+// /proc/net/tcp6 does not expose `IPV6_V6ONLY`, so a foreign `::` listener
+// with that socket option set (or `net.ipv6.bindv6only=1` host-wide) is
+// IPv6-only in practice but indistinguishable from a real dual-stack one by
+// address alone. The `uid` column (the 8th whitespace-separated field) at
+// least rules out a FOREIGN process's listener: a SO_REUSEPORT co-owner of
+// OUR launched process's port must run as the same uid we do, so only
+// same-uid rows are counted; a foreign-uid `::` (or any other) row can
+// never be a same-UID co-owner and is excluded regardless of its address.
+// Residual gap, left as documented rather than fixed (no further signal is
+// available from this table): a same-uid IPv6-only `::` listener on the
+// same port -- e.g. another of THIS harness's own processes, coincidentally
+// racing the same port with `IPV6_V6ONLY` set -- still counts, since
+// /proc/net/tcp6 cannot tell it apart from a real dual-stack one.
 //
 // Each row is a DISTINCT socket with its own inode column (the last field),
 // so more than one ELIGIBLE row for the same port means more than one live
@@ -1492,9 +1543,10 @@ bool envoy_log_confirms_listener(const std::string& contents) {
 // SO_REUSEPORT group. Takes the table's TEXT, not a path, so it is
 // exercisable directly with synthetic tables, independent of the real
 // /proc filesystem.
-int count_listeners_on_port(const std::string& tcp_table, uint16_t port) {
+int count_listeners_on_port(const std::string& tcp_table, uint16_t port, uid_t uid) {
     char port_hex[8];
     std::snprintf(port_hex, sizeof(port_hex), "%04X", port);
+    const std::string uid_str = std::to_string(uid);
     // /proc/net/tcp: 8 hex digits (32-bit IPv4 address).
     static const char* const kIpv4Eligible[] = {"00000000", "0100007F"};
     // /proc/net/tcp6: 32 hex digits (128-bit IPv6 address), the wildcard
@@ -1512,9 +1564,12 @@ int count_listeners_on_port(const std::string& tcp_table, uint16_t port) {
             continue;
         }
         std::istringstream fields(line);
-        std::string sl, local_address, rem_address, st;
-        if (!(fields >> sl >> local_address >> rem_address >> st)) continue;
+        std::string sl, local_address, rem_address, st, tx_rx, tr_tm, retrnsmt, row_uid;
+        if (!(fields >> sl >> local_address >> rem_address >> st >> tx_rx >> tr_tm >> retrnsmt >>
+              row_uid))
+            continue;
         if (st != "0A") continue;
+        if (row_uid != uid_str) continue;
         const size_t colon = local_address.rfind(':');
         if (colon == std::string::npos) continue;
         std::string local_port = local_address.substr(colon + 1);
@@ -1552,14 +1607,15 @@ int count_listeners_on_port(const std::string& tcp_table, uint16_t port) {
 // Live counterpart: sums count_listeners_on_port() over the real
 // /proc/net/tcp and /proc/net/tcp6 tables (a dual-stack socket appears in
 // exactly one of the two, never both, so this never double-counts a single
-// listener). Either table being missing or unreadable (no /proc, a
-// restrictive sandbox) contributes 0 rather than failing outright -- every
-// caller only ever treats a count ABOVE the one listener it expects as a
-// signal, so undercounting here can only make the check silently pass,
-// never falsely trigger a retry.
+// listener), restricted to this process's own uid. Either table being
+// missing or unreadable (no /proc, a restrictive sandbox) contributes 0
+// rather than failing outright -- every caller only ever treats a count
+// ABOVE the one listener it expects as a signal, so undercounting here can
+// only make the check silently pass, never falsely trigger a retry.
 int count_listeners_on_port(uint16_t port) {
-    return count_listeners_on_port(read_file_contents("/proc/net/tcp"), port) +
-           count_listeners_on_port(read_file_contents("/proc/net/tcp6"), port);
+    const uid_t uid = getuid();
+    return count_listeners_on_port(read_file_contents("/proc/net/tcp"), port, uid) +
+           count_listeners_on_port(read_file_contents("/proc/net/tcp6"), port, uid);
 }
 
 // Polls `port` until a TCP connect succeeds, failing early (without waiting
@@ -2128,6 +2184,19 @@ void remove_dir_recursive(const std::string& path) {
     rmdir(path.c_str());
 }
 
+// Process-local record of every directory a TempDir below has ever created,
+// in creation order. Round-18 review, "Scope leak cleanup to directories
+// created by this process": a self-test checking "did TempDir clean up
+// after itself" used to diff /tmp against a shared naming prefix, which
+// misattributes another CONCURRENT `test_envoy_differential --self-test`
+// invocation's own (still very much alive) directories as leaks belonging
+// to THIS process, and then deletes them out from under it. Recording the
+// exact paths this process itself created -- and checking only those --
+// makes the leak check immune to whatever else is happening in the shared
+// /tmp at the same time.
+std::mutex g_temp_dir_registry_mu;
+std::vector<std::string> g_temp_dir_registry;
+
 // RAII owner of a make_temp_dir() directory: removes it (and everything the
 // harness wrote inside it) on destruction, unless RUT_ENVOY_KEEP_TMP=1 is
 // set in the environment to keep it around for diagnostics (round-15
@@ -2137,7 +2206,12 @@ void remove_dir_recursive(const std::string& path) {
 // without bound.
 class TempDir {
 public:
-    explicit TempDir(const char* prefix) : path_(make_temp_dir(prefix)) {}
+    explicit TempDir(const char* prefix) : path_(make_temp_dir(prefix)) {
+        if (!path_.empty()) {
+            std::lock_guard<std::mutex> lock(g_temp_dir_registry_mu);
+            g_temp_dir_registry.push_back(path_);
+        }
+    }
 
     TempDir(const TempDir&) = delete;
     TempDir& operator=(const TempDir&) = delete;
@@ -2555,6 +2629,31 @@ bool fill_upstream_bytes(std::vector<CaseResult>* results,
         }
     }
     return ok;
+}
+
+// Round-18 review, "Keep exclusive ownership for the whole RUT phase": the
+// readiness-time ownership check (wait_ready_and_confirm_ownership()) only
+// proves exclusivity at the instant it ran; another same-UID process can
+// join `port`'s SO_REUSEPORT group at any point afterward and remain there
+// while the case batch's connections are made, letting the kernel
+// distribute evidence to the foreign configuration even though readiness
+// passed. Re-checks the SAME listener count immediately after the batch
+// that used `port` completes -- before the instance under test is stopped,
+// while it is still the one being measured -- so a co-owner that joined
+// mid-phase is still caught, even though one that joined and left within
+// the batch's own duration would not be. This is NOT a complete fix for
+// exclusivity over the whole phase; that needs a way to disable
+// SO_REUSEPORT for single-shard harness runs, tracked separately, outside
+// this PR. Returns empty on success, else a human-readable reason.
+std::string check_no_reuseport_collision_after_batch(uint16_t port) {
+    const int count = count_listeners_on_port(port);
+    if (count > 1) {
+        return "more than one LISTEN socket is bound to port " + std::to_string(port) +
+               " after the case batch completed (" + std::to_string(count) +
+               " listeners) -- a concurrent process joined its SO_REUSEPORT group during the "
+               "batch; this batch's evidence cannot be trusted";
+    }
+    return "";
 }
 
 // Refuses evidence that would make write_transcript() emit a fixture
@@ -3455,34 +3554,28 @@ int run_oracle_milestone_s(const std::string& output_path) {
             }
             return local;
         };
-        auto attribute_upstream = [&](std::vector<CaseResult>* subset_results,
-                                      const std::vector<CaseSpec>& subset) {
-            for (auto& r : *subset_results) {
-                const auto it = std::find_if(subset.begin(), subset.end(), [&](const CaseSpec& s) {
-                    return r.name == s.name;
-                });
-                if (it == subset.end()) continue;
-                const auto observed = upstream.requests_for(it->upstream_path);
-                r.upstream_contact_count = static_cast<int>(observed.size());
-                if (!observed.empty()) {
-                    r.upstream_contacted = true;
-                    r.upstream_bytes = observed.front();
-                }
-            }
-        };
 
         // Round-11 review, "Attribute duplicate contacts to the originating
         // case": run the asserted cases to completion and attribute their
         // upstream evidence before the record-only cases run. Round-15/
         // round-16 review, "Stop Envoy before snapshotting oracle upstream
         // traffic": the asserted and record-only batches now each get their
-        // OWN Envoy instance (mirroring run_pair_milestone_s()), and the
-        // asserted instance is stopped and validated BEFORE its upstream
-        // evidence is inspected, not after -- a delayed duplicate or
-        // unlisted request Envoy emits during its own shutdown/cleanup
-        // (after the client already got its response) would otherwise
-        // arrive on the wire after the snapshot and be silently discarded
-        // by clear_requests() below.
+        // OWN Envoy instance (mirroring run_pair_milestone_s()), and each
+        // instance is stopped and validated BEFORE its upstream evidence is
+        // inspected, not after -- a delayed duplicate or unlisted request
+        // Envoy emits during its own shutdown/cleanup (after the client
+        // already got its response) would otherwise arrive on the wire
+        // after the snapshot and be silently discarded by clear_requests()
+        // below. Round-18 review, "Reject unlisted upstream traffic in
+        // oracle mode": both batches now reconcile upstream.all_requests()
+        // via fill_upstream_bytes() (shared with run_pair_milestone_s())
+        // instead of only ever querying each case's own declared path, so
+        // an extra request to a path nothing declared is no longer invisible
+        // to write_transcript(). Round-18 review, "Wait for upstream
+        // handlers before inspecting asserted traffic": stopping the proxy
+        // does not synchronize with the upstream's own independent
+        // connection-handler threads, so both batches also wait for
+        // RecordingUpstream::wait_idle() before calling fill_upstream_bytes().
         EnvoyInstance envoy_asserted;
         std::string ready_error;
         if (!launch_envoy_with_port_retry(dir.path(),
@@ -3514,6 +3607,19 @@ int run_oracle_milestone_s(const std::string& output_path) {
         }
 
         auto asserted_results = run_and_collect(asserted_cases);
+        // Round-18 review, "Keep exclusive ownership for the whole RUT
+        // phase": re-check listener ownership right after the batch, before
+        // this instance is stopped -- see check_no_reuseport_collision_
+        // after_batch()'s comment for why the readiness-time check alone
+        // isn't enough.
+        const std::string asserted_reuseport_error =
+            check_no_reuseport_collision_after_batch(listen_port1);
+        if (!asserted_reuseport_error.empty()) {
+            std::cerr << "FAIL: " << asserted_reuseport_error << "\n";
+            envoy_asserted.stop();
+            upstream.stop();
+            return 1;
+        }
         if (!envoy_asserted.stop()) {
             std::cerr << "FAIL: envoy exited unexpectedly before teardown ("
                       << envoy_asserted.unexpected_exit_description << ")\n";
@@ -3521,7 +3627,11 @@ int run_oracle_milestone_s(const std::string& output_path) {
             upstream.stop();
             return 1;
         }
-        attribute_upstream(&asserted_results, asserted_cases);
+        upstream.wait_idle(2000);
+        if (!fill_upstream_bytes(&asserted_results, asserted_cases, upstream)) {
+            upstream.stop();
+            return 1;
+        }
         if (!wait_port_closed(listen_port1, 5000)) {
             std::cerr << "FAIL: listener port " << listen_port1
                       << " did not become free after stopping the asserted-batch Envoy instance\n";
@@ -3548,12 +3658,22 @@ int run_oracle_milestone_s(const std::string& output_path) {
             return 1;
         }
         auto record_only_results = run_and_collect(record_only_cases);
-        attribute_upstream(&record_only_results, record_only_cases);
+        // Never fatal here: a reuseport collision or teardown crash during
+        // the record-only batch must not gate acceptance, only note the
+        // ambiguity (round-9/round-12/round-18 review).
+        const std::string record_only_reuseport_error =
+            check_no_reuseport_collision_after_batch(listen_port1);
+        if (!record_only_reuseport_error.empty()) {
+            std::cerr << "NOTE: " << record_only_reuseport_error << "\n";
+            for (auto& r : record_only_results) r.upstream_ambiguous = true;
+        }
         if (!envoy_record_only.stop()) {
             dump_log(envoy_record_only.log_path);
             note_record_only_phase_crash(
                 "envoy", envoy_record_only.unexpected_exit_description, &record_only_results);
         }
+        upstream.wait_idle(2000);
+        fill_upstream_bytes(&record_only_results, record_only_cases, upstream);
         if (!wait_port_closed(listen_port1, 5000)) {
             std::cerr << "FAIL: listener port " << listen_port1
                       << " did not become free after stopping the record-only-batch Envoy "
@@ -3828,6 +3948,17 @@ int run_pair_milestone_s(const std::string& rut_binary,
         // would otherwise arrive on the wire after this snapshot and be
         // silently discarded by the clear_requests() below.
         auto envoy_asserted_results = run_case_batch(listen_port1, asserted_cases);
+        // Round-18 review, "Keep exclusive ownership for the whole RUT
+        // phase": re-check listener ownership right after the batch, before
+        // this instance is stopped.
+        const std::string envoy_asserted_reuseport_error =
+            check_no_reuseport_collision_after_batch(listen_port1);
+        if (!envoy_asserted_reuseport_error.empty()) {
+            std::cerr << "FAIL: " << envoy_asserted_reuseport_error << "\n";
+            envoy_asserted.stop();
+            upstream.stop();
+            return 1;
+        }
         if (!envoy_asserted.stop()) {
             std::cerr << "FAIL: envoy exited unexpectedly before teardown ("
                       << envoy_asserted.unexpected_exit_description << ")\n";
@@ -3835,6 +3966,10 @@ int run_pair_milestone_s(const std::string& rut_binary,
             upstream.stop();
             return 1;
         }
+        // Round-18 review, "Wait for upstream handlers before inspecting
+        // asserted traffic": stopping the proxy does not synchronize with
+        // the upstream's own independent connection-handler threads.
+        upstream.wait_idle(2000);
         if (!fill_upstream_bytes(&envoy_asserted_results, asserted_cases, upstream)) {
             upstream.stop();
             return 1;
@@ -3863,16 +3998,28 @@ int run_pair_milestone_s(const std::string& rut_binary,
         // Never fatal here: none of `record_only_cases` is an asserted case,
         // so fill_upstream_bytes() cannot return false for this call (see
         // its "Either anomaly ... is only made fatal ... for an asserted
-        // case" comment) -- the return value needs no check.
-        fill_upstream_bytes(&envoy_record_only_results, record_only_cases, upstream);
+        // case" comment) -- the return value needs no check. A reuseport
+        // collision during this batch is likewise only ever a NOTE
+        // (round-18 review).
+        const std::string envoy_record_only_reuseport_error =
+            check_no_reuseport_collision_after_batch(listen_port1);
+        if (!envoy_record_only_reuseport_error.empty()) {
+            std::cerr << "NOTE: " << envoy_record_only_reuseport_error << "\n";
+            for (auto& r : envoy_record_only_results) r.upstream_ambiguous = true;
+        }
         // This instance only ever ran the record-only batch, so a stop()
         // failure here is unambiguously attributable to it (round-12/
-        // round-15 review).
+        // round-15 review). Round-18 review, "Stop record-only proxies
+        // before snapshotting traffic": stop (and wait for the upstream to
+        // drain) BEFORE inspecting its evidence, same as the asserted batch
+        // above.
         if (!envoy_record_only.stop()) {
             dump_log(envoy_record_only.log_path);
             note_record_only_phase_crash(
                 "envoy", envoy_record_only.unexpected_exit_description, &envoy_record_only_results);
         }
+        upstream.wait_idle(2000);
+        fill_upstream_bytes(&envoy_record_only_results, record_only_cases, upstream);
         if (!wait_port_closed(listen_port1, 5000)) {
             std::cerr << "FAIL: listener port " << listen_port1
                       << " did not become free after stopping the record-only-batch Envoy "
@@ -3917,6 +4064,14 @@ int run_pair_milestone_s(const std::string& rut_binary,
         // and validate the asserted-phase RUT instance before inspecting
         // the recording upstream's log.
         auto rut_asserted_results = run_case_batch(listen_port1, asserted_cases);
+        const std::string rut_asserted_reuseport_error =
+            check_no_reuseport_collision_after_batch(listen_port1);
+        if (!rut_asserted_reuseport_error.empty()) {
+            std::cerr << "FAIL: " << rut_asserted_reuseport_error << "\n";
+            rut_asserted.stop();
+            upstream.stop();
+            return 1;
+        }
         if (!rut_asserted.stop()) {
             std::cerr << "FAIL: rut exited unexpectedly before teardown ("
                       << rut_asserted.unexpected_exit_description << ")\n";
@@ -3924,6 +4079,7 @@ int run_pair_milestone_s(const std::string& rut_binary,
             upstream.stop();
             return 1;
         }
+        upstream.wait_idle(2000);
         if (!fill_upstream_bytes(&rut_asserted_results, asserted_cases, upstream)) {
             upstream.stop();
             return 1;
@@ -3954,8 +4110,18 @@ int run_pair_milestone_s(const std::string& rut_binary,
         }
         auto rut_record_only_results = run_case_batch(listen_port1, record_only_cases);
         // Never fatal here, same reasoning as the Envoy phase above.
-        fill_upstream_bytes(&rut_record_only_results, record_only_cases, upstream);
+        const std::string rut_record_only_reuseport_error =
+            check_no_reuseport_collision_after_batch(listen_port1);
+        if (!rut_record_only_reuseport_error.empty()) {
+            std::cerr << "NOTE: " << rut_record_only_reuseport_error << "\n";
+            for (auto& r : rut_record_only_results) r.upstream_ambiguous = true;
+        }
+        // Round-18 review, "Stop record-only proxies before snapshotting
+        // traffic": stop (and wait for the upstream to drain) BEFORE
+        // inspecting its evidence.
         const bool rut_record_only_stopped_cleanly = rut_record_only.stop();
+        upstream.wait_idle(2000);
+        fill_upstream_bytes(&rut_record_only_results, record_only_cases, upstream);
         upstream.stop();
         // This instance only ever ran the record-only batch, so a stop()
         // failure here is unambiguously attributable to it (round-12/
@@ -5063,34 +5229,6 @@ bool self_test_temp_dir_cleanup() {
     return ok;
 }
 
-// Lists the basenames of every `/tmp` entry matching one of THIS file's own
-// make_temp_dir()/TempDir prefixes ("rut-envoy-", "rut-diff-selftest-",
-// "rut-selftest-" -- every literal prefix string passed to make_temp_dir()/
-// TempDir anywhere in this file). Deliberately narrower than a blanket
-// `rut-*` match: this test suite's own /tmp is shared with other, unrelated
-// test binaries that also use a "rut-" naming convention (e.g.
-// tests/test_nginx_differential.cc's "rut-nginx-*"), and a broad match
-// would misattribute their entries -- created concurrently by a completely
-// different process -- to this file's own footprint.
-std::vector<std::string> list_rut_tmp_dir_names() {
-    static const char* const kPrefixes[] = {"rut-envoy-", "rut-diff-selftest-", "rut-selftest-"};
-    std::vector<std::string> names;
-    DIR* d = opendir("/tmp");
-    if (d == nullptr) return names;
-    struct dirent* entry;
-    while ((entry = readdir(d)) != nullptr) {
-        const std::string name = entry->d_name;
-        for (const char* prefix : kPrefixes) {
-            if (name.rfind(prefix, 0) == 0) {
-                names.push_back(name);
-                break;
-            }
-        }
-    }
-    closedir(d);
-    return names;
-}
-
 // Covers round-15 review thread P2 ("Skip Docker teardown for instances
 // that were never launched"): constructing and destroying an EnvoyInstance
 // that never called launch() -- exactly what every dummy-child self-test
@@ -5400,11 +5538,13 @@ bool self_test_rut_log_confirms_listener() {
 // counted), and a tcp6-shaped v4-mapped row.
 bool self_test_count_listeners_on_port() {
     bool ok = true;
+    constexpr uid_t kOurUid = 1000;
+    constexpr uid_t kForeignUid = 0;
     const char* kHeader =
         "  sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt   uid  "
         "timeout inode\n";
     {
-        const int count = count_listeners_on_port(std::string(kHeader), 0x1F90);
+        const int count = count_listeners_on_port(std::string(kHeader), 0x1F90, kOurUid);
         if (count != 0) {
             std::cerr << "FAIL [self-test count listeners]: header-only table reported " << count
                       << ", expected 0\n";
@@ -5416,7 +5556,7 @@ bool self_test_count_listeners_on_port() {
             std::string(kHeader) +
             "   0: 0100007F:1F90 00000000:0000 0A 00000000:00000000 00:00000000 00000000  1000  "
             "      0 12345 1 0000000000000000 100 0 0 10 0\n";
-        const int count = count_listeners_on_port(table, 0x1F90);
+        const int count = count_listeners_on_port(table, 0x1F90, kOurUid);
         if (count != 1) {
             std::cerr << "FAIL [self-test count listeners]: single-listener table reported "
                       << count << ", expected 1\n";
@@ -5438,7 +5578,7 @@ bool self_test_count_listeners_on_port() {
             "      0 12347 1 0000000000000000 100 0 0 10 0\n"
             "   3: 0100007F:2710 00000000:0000 0A 00000000:00000000 00:00000000 00000000  1000  "
             "      0 12348 1 0000000000000000 100 0 0 10 0\n";
-        const int count = count_listeners_on_port(table, 0x1F90);
+        const int count = count_listeners_on_port(table, 0x1F90, kOurUid);
         if (count != 2) {
             std::cerr << "FAIL [self-test count listeners]: two-owner table reported " << count
                       << ", expected 2\n";
@@ -5457,7 +5597,7 @@ bool self_test_count_listeners_on_port() {
             "   0: 00000000000000000000000000000000:1F90 "
             "00000000000000000000000000000000:0000 0A 00000000:00000000 00:00000000 00000000  "
             "1000        0 12349 1 0000000000000000 100 0 0 10 0\n";
-        const int count = count_listeners_on_port(table6, 0x1F90);
+        const int count = count_listeners_on_port(table6, 0x1F90, kOurUid);
         if (count != 1) {
             std::cerr << "FAIL [self-test count listeners]: tcp6 wildcard (::) table reported "
                       << count << ", expected 1\n";
@@ -5475,7 +5615,7 @@ bool self_test_count_listeners_on_port() {
             "   0: 00000000000000000000000001000000:1F90 "
             "00000000000000000000000000000000:0000 0A 00000000:00000000 00:00000000 00000000  "
             "1000        0 12350 1 0000000000000000 100 0 0 10 0\n";
-        const int count = count_listeners_on_port(table6, 0x1F90);
+        const int count = count_listeners_on_port(table6, 0x1F90, kOurUid);
         if (count != 0) {
             std::cerr << "FAIL [self-test count listeners]: tcp6 IPv6-only (::1) table reported "
                       << count << ", expected 0\n";
@@ -5491,10 +5631,41 @@ bool self_test_count_listeners_on_port() {
             "   0: 0000000000000000FFFF00000100007F:1F90 "
             "00000000000000000000000000000000:0000 0A 00000000:00000000 00:00000000 00000000  "
             "1000        0 12351 1 0000000000000000 100 0 0 10 0\n";
-        const int count = count_listeners_on_port(table6, 0x1F90);
+        const int count = count_listeners_on_port(table6, 0x1F90, kOurUid);
         if (count != 1) {
             std::cerr << "FAIL [self-test count listeners]: tcp6 v4-mapped table reported " << count
                       << ", expected 1\n";
+            ok = false;
+        }
+    }
+    {
+        // Round-18 review, "Exclude IPv6-only wildcard sockets from the
+        // ownership count": a `::` row is address-ambiguous (could be a
+        // real dual-stack bind, or an IPv6-only one with IPV6_V6ONLY set --
+        // /proc/net/tcp6 cannot tell them apart), but a row owned by a
+        // DIFFERENT uid can never be a same-UID SO_REUSEPORT co-owner of
+        // our own launched process regardless of its address, so it must
+        // not count.
+        const std::string table6 =
+            std::string(kHeader6) +
+            "   0: 00000000000000000000000000000000:1F90 "
+            "00000000000000000000000000000000:0000 0A 00000000:00000000 00:00000000 00000000     "
+            "0        0 12352 1 0000000000000000 100 0 0 10 0\n";
+        const int count = count_listeners_on_port(table6, 0x1F90, kOurUid);
+        if (count != 0) {
+            std::cerr << "FAIL [self-test count listeners]: foreign-uid tcp6 wildcard (::) table "
+                         "reported "
+                      << count << ", expected 0\n";
+            ok = false;
+        }
+        // Sanity check on the same row: counted when queried AS that
+        // foreign uid, confirming the exclusion above is really about uid
+        // and not some other accidental mismatch.
+        const int count_as_foreign = count_listeners_on_port(table6, 0x1F90, kForeignUid);
+        if (count_as_foreign != 1) {
+            std::cerr << "FAIL [self-test count listeners]: the same row queried as its own uid "
+                         "reported "
+                      << count_as_foreign << ", expected 1\n";
             ok = false;
         }
     }
@@ -6010,6 +6181,86 @@ bool self_test_unexpected_upstream_path_rejected_even_with_all_contacts() {
         ok = false;
     }
     if (ok) std::cerr << "PASS [self-test unexpected-upstream-path all-contacts]\n";
+    return ok;
+}
+
+// Round-18 review, "Reject unlisted upstream traffic in oracle mode" (P1):
+// run_oracle_milestone_s() used to attribute upstream evidence with its own
+// narrow accounting loop that only ever queried each declared case's own
+// path, so an extra request to a path nothing declared -- while every
+// declared case still shows its own expected count of one -- was invisible
+// to it, and write_transcript() would happily publish that as a "clean"
+// oracle transcript. Fixed by having oracle mode call the SAME
+// fill_upstream_bytes() pair mode uses, which reconciles
+// upstream.all_requests() against the declared paths. This drives that
+// shared function with exactly the shape oracle mode's asserted batch uses
+// -- one declared, real kAssertedCaseNames entry ("get_smoke") whose own
+// expected contact succeeds, plus an extra request to an undeclared path --
+// proving the exact gap the review describes is now rejected. (The same
+// scenario is also exercised directly against fill_upstream_bytes() by
+// self_test_unexpected_upstream_path_rejected_even_with_all_contacts()
+// above; this test exists to document and pin oracle mode's own dependency
+// on that fix, since run_oracle_milestone_s() itself needs docker and has
+// no self-test entry point of its own.)
+bool self_test_oracle_rejects_unlisted_upstream_traffic() {
+    BoundPort bound;
+    if (!allocate_bound_loopback_port(&bound)) {
+        std::cerr
+            << "FAIL [self-test oracle unlisted traffic]: could not allocate a loopback port\n";
+        return false;
+    }
+    const uint16_t port = bound.port;
+    RecordingUpstream upstream;
+    const std::string reply = "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nhi";
+    upstream.set_reply("/smoke", reply);
+    upstream.set_default_reply(reply);
+    if (!upstream.adopt(bound.fd)) {
+        std::cerr << "FAIL [self-test oracle unlisted traffic]: could not start upstream\n";
+        return false;
+    }
+    bool ok = true;
+    {
+        const int fd1 = connect_with_timeout(port, kClientTimeoutMs);
+        if (fd1 < 0) {
+            std::cerr << "FAIL [self-test oracle unlisted traffic]: could not connect "
+                         "(expected)\n";
+            upstream.stop();
+            return false;
+        }
+        const std::string req1 = "GET /smoke HTTP/1.1\r\nHost: t.example\r\n\r\n";
+        if (!send_all(fd1, req1) || read_http_message(fd1, false, kClientTimeoutMs).bytes != reply)
+            ok = false;
+        close(fd1);
+
+        // The extra, unlisted request an oracle-mode asserted Envoy might
+        // emit -- to a path this batch's own case table never declared.
+        const int fd2 = connect_with_timeout(port, kClientTimeoutMs);
+        if (fd2 < 0) {
+            std::cerr << "FAIL [self-test oracle unlisted traffic]: could not connect "
+                         "(unlisted)\n";
+            upstream.stop();
+            return false;
+        }
+        const std::string req2 = "GET /unlisted-by-oracle HTTP/1.1\r\nHost: t.example\r\n\r\n";
+        if (!send_all(fd2, req2) || read_http_message(fd2, false, kClientTimeoutMs).bytes != reply)
+            ok = false;
+        close(fd2);
+    }
+    // Exactly the shape run_oracle_milestone_s()'s asserted batch builds:
+    // one declared case, named after a real kAssertedCaseNames entry so
+    // fill_upstream_bytes() classifies this as a pure-asserted batch.
+    const std::vector<CaseSpec> asserted_cases = {{"get_smoke", "", false, "/smoke", reply}};
+    std::vector<CaseResult> results(1);
+    results[0].name = "get_smoke";
+    const bool fill_ok = fill_upstream_bytes(&results, asserted_cases, upstream);
+    upstream.stop();
+    if (fill_ok) {
+        std::cerr << "FAIL [self-test oracle unlisted traffic]: fill_upstream_bytes accepted an "
+                     "oracle-shaped asserted batch despite an extra request to an undeclared "
+                     "path\n";
+        ok = false;
+    }
+    if (ok) std::cerr << "PASS [self-test oracle unlisted traffic]\n";
     return ok;
 }
 
@@ -6565,6 +6816,152 @@ bool self_test_pair_exempt_cases_nonzero_contact_rejected() {
     return ok;
 }
 
+// ── --fake-proxy (round-18 review, "Avoid allocation in the post-fork fake
+// proxy") ────────────────────────────────────────────────────────────────
+//
+// Several self-tests need a stand-in "proxy" process that answers one
+// connection and then does something specific when signaled (crash on its
+// own, crash only when SIGTERM arrives, or make a delayed request to an
+// upstream first). The old implementation forked directly from the running
+// self-test binary and kept running C++ in the child WITHOUT ever calling
+// exec(): at that exact instant, `RecordingUpstream`'s own accept thread
+// (or any other concurrently running thread) could hold the allocator or
+// another libc lock, which fork() copies into the child in whatever state
+// it was in -- there is no other thread left in the child to ever release
+// it, so any subsequent allocation (a `std::string` temporary inside
+// send_all(), for instance) can deadlock the child permanently. Signal
+// handlers doing the same (allocating, or calling anything not
+// async-signal-safe) have the identical problem independent of forking.
+//
+// This mode fixes both: launch_fake_proxy() below forks and IMMEDIATELY
+// execs this same binary image (a fresh process, no inherited lock state
+// whatsoever) into this mode, and this mode's own SIGTERM handler only ever
+// performs the one async-signal-safe operation it needs -- writing a single
+// byte to a self-pipe -- deferring all real work (connect()/send(),
+// string construction, etc.) to the normal-context loop that notices the
+// pipe became readable.
+int g_fake_proxy_term_pipe[2] = {-1, -1};
+
+void fake_proxy_term_handler(int /*signum*/) {
+    const char byte = 0;
+    const ssize_t ignored = write(g_fake_proxy_term_pipe[1], &byte, 1);
+    (void)ignored;
+}
+
+// Blocks until SIGTERM arrives (via the self-pipe above), or returns
+// immediately if the pipe itself could not be created (falls back to a
+// plain, still-safe pause() loop -- no allocation or non-async-signal-safe
+// call happens in the handler either way, just without the self-pipe's
+// guarantee against a wakeup lost to a signal delivered before this
+// function starts waiting).
+void fake_proxy_wait_for_term() {
+    if (pipe(g_fake_proxy_term_pipe) != 0) {
+        for (;;) pause();
+        return;
+    }
+    signal(SIGTERM, fake_proxy_term_handler);
+    char byte;
+    for (;;) {
+        const ssize_t n = read(g_fake_proxy_term_pipe[0], &byte, 1);
+        if (n > 0) return;
+        if (n < 0 && errno == EINTR) continue;
+        return;
+    }
+}
+
+// argv layout: <argv0> --fake-proxy <listen_fd> <mode> [mode-specific args].
+// `listen_fd` is an already-bound, already-listening socket the launching
+// process created and left open across fork()+exec() (sockets are not
+// close-on-exec by default), so this process never has to allocate or
+// bind/listen anything itself before serving the one connection every mode
+// needs.
+//
+// Modes:
+//   exit-early             -- answer one connection, then _exit(1)
+//                             immediately (stands in for a proxy that
+//                             crashed on its own).
+//   crash-on-term          -- answer one connection, then block until
+//                             SIGTERM and _exit(7) (stands in for a proxy
+//                             that crashes only when asked to shut down).
+//   delayed-request <port> <path>
+//                          -- answer one connection, then block until
+//                             SIGTERM, make one GET <path> request to
+//                             127.0.0.1:<port>, then _exit(1) (stands in
+//                             for a proxy that emits a side-effecting
+//                             request during its own teardown).
+int run_fake_proxy(int argc, char** argv) {
+    if (argc < 4) return 2;
+    const int listen_fd = static_cast<int>(std::strtol(argv[2], nullptr, 10));
+    const std::string mode = argv[3];
+    const std::string reply = "HTTP/1.1 200 OK\r\nConnection: close\r\nContent-Length: 2\r\n\r\nhi";
+    const int fd = accept(listen_fd, nullptr, nullptr);
+    if (fd >= 0) {
+        char buf[512];
+        const ssize_t ignored = recv(fd, buf, sizeof(buf), 0);
+        (void)ignored;
+        send_all(fd, reply);
+        close(fd);
+    }
+    if (mode == "exit-early") {
+        _exit(1);
+    } else if (mode == "crash-on-term") {
+        fake_proxy_wait_for_term();
+        _exit(7);
+    } else if (mode == "delayed-request") {
+        if (argc < 6) return 2;
+        const uint16_t upstream_port = static_cast<uint16_t>(std::strtol(argv[4], nullptr, 10));
+        const std::string path = argv[5];
+        fake_proxy_wait_for_term();
+        const int ufd = connect_with_timeout(upstream_port, 1000);
+        if (ufd >= 0) {
+            send_all(ufd,
+                     "GET " + path + " HTTP/1.1\r\nHost: t.example\r\nConnection: close\r\n\r\n");
+            close(ufd);
+        }
+        _exit(1);
+    }
+    return 2;
+}
+
+// Launches a fake proxy (see the --fake-proxy mode above) as a genuinely
+// fresh process image: forks, then execs this exact binary right away, so
+// the child never runs arbitrary C++ code -- including allocating storage
+// -- while still holding whatever locks the parent's OTHER threads (e.g.
+// RecordingUpstream's accept thread) happened to hold at the instant of
+// fork() (round-18 review, "Avoid allocation in the post-fork fake proxy").
+// `mode_args` become the mode's own arguments after `mode`. `out_port`
+// receives the loopback port test clients should connect to; `out_pid`
+// receives the child's pid for a RutInstance/EnvoyInstance-style stop()
+// call.
+bool launch_fake_proxy(const std::string& mode,
+                       const std::vector<std::string>& mode_args,
+                       uint16_t* out_port,
+                       pid_t* out_pid) {
+    BoundPort bound;
+    if (!allocate_bound_loopback_port(&bound)) return false;
+    // Built before fork(), same discipline as every other fork() site in
+    // this file (build_argv()'s own comment): argument construction is
+    // ordinary heap allocation, unsafe to do for the first time inside a
+    // child that has not yet exec'd.
+    std::vector<std::string> argv = {
+        "/proc/self/exe", "--fake-proxy", std::to_string(bound.fd), mode};
+    argv.insert(argv.end(), mode_args.begin(), mode_args.end());
+    const std::vector<char*> args = build_argv(argv);
+    const pid_t pid = fork();
+    if (pid < 0) {
+        close(bound.fd);
+        return false;
+    }
+    if (pid == 0) {
+        execv("/proc/self/exe", args.data());
+        _exit(127);
+    }
+    close(bound.fd);
+    *out_port = bound.port;
+    *out_pid = pid;
+    return true;
+}
+
 // Round-12 review, "Prevent record-only crashes from failing pair mode": a
 // fake proxy that serves exactly one connection (standing in for the single
 // asserted case run against it below) and then exits on its own -- never
@@ -6579,41 +6976,28 @@ bool self_test_pair_exempt_cases_nonzero_contact_rejected() {
 // self_test_pair_isolated_instances_crash_classification() below for that
 // two-instance shape.)
 bool self_test_pair_record_only_crash_is_a_note() {
-    BoundPort bound;
-    if (!allocate_bound_loopback_port(&bound)) {
-        std::cerr << "FAIL [self-test pair record-only crash]: could not allocate a loopback "
-                     "port\n";
-        return false;
-    }
-    const uint16_t port = bound.port;
     // Advertises `Connection: close`: the fake proxy below closes the
     // connection right after replying (standing in for its own exit), and
     // read_http_message() treats an EOF on a response that did NOT
     // advertise close as a persistence violation rather than completion.
     const std::string reply = "HTTP/1.1 200 OK\r\nConnection: close\r\nContent-Length: 2\r\n\r\nhi";
 
-    const pid_t fake_proxy = fork();
-    if (fake_proxy < 0) {
-        std::cerr << "FAIL [self-test pair record-only crash]: fork failed\n";
-        close(bound.fd);
+    // Round-18 review, "Avoid allocation in the post-fork fake proxy":
+    // launch_fake_proxy() forks+execs a fresh process image (--fake-proxy
+    // exit-early) rather than running C++ in a plain forked child, so it
+    // never risks deadlocking on a libc/allocator lock this process's other
+    // threads (RecordingUpstream's accept thread, if one were running here)
+    // held at the instant of fork(). "exit-early" serves exactly one
+    // connection (the asserted case below), then exits without ever
+    // accepting a second -- the record-only case's connection attempt finds
+    // nothing listening, exactly like a crash that happened during or right
+    // after the asserted batch.
+    uint16_t port = 0;
+    pid_t fake_proxy = -1;
+    if (!launch_fake_proxy("exit-early", {}, &port, &fake_proxy)) {
+        std::cerr << "FAIL [self-test pair record-only crash]: could not launch the fake proxy\n";
         return false;
     }
-    if (fake_proxy == 0) {
-        // Serve exactly one connection (the asserted case below), then exit
-        // without ever accepting a second -- the record-only case's
-        // connection attempt finds nothing listening, exactly like a crash
-        // that happened during or right after the asserted batch.
-        const int fd = accept(bound.fd, nullptr, nullptr);
-        if (fd >= 0) {
-            char buf[512];
-            const ssize_t ignored = recv(fd, buf, sizeof(buf), 0);
-            (void)ignored;
-            send_all(fd, reply);
-            close(fd);
-        }
-        _exit(1);
-    }
-    close(bound.fd);
 
     RutInstance rut;
     rut.pid = fake_proxy;
@@ -6688,44 +7072,20 @@ bool self_test_pair_record_only_crash_is_a_note() {
 // a NOTE, exactly like self_test_pair_record_only_crash_is_a_note() above
 // -- but now via a dedicated instance rather than a shared one.
 bool self_test_pair_isolated_instances_crash_classification() {
-    // Serves exactly one connection with a fixed reply, then blocks forever
-    // in pause() rather than exiting -- so the ONLY way this process ends is
-    // by being signaled, and it deliberately reports a crash (exit 7, not
-    // 0) when that happens, standing in for a bug during connection
-    // cleanup.
-    auto make_crash_on_term_proxy = [](uint16_t* out_port, pid_t* out_pid) -> bool {
-        BoundPort bound;
-        if (!allocate_bound_loopback_port(&bound)) return false;
-        const pid_t pid = fork();
-        if (pid < 0) {
-            close(bound.fd);
-            return false;
-        }
-        if (pid == 0) {
-            signal(SIGTERM, [](int) { _exit(7); });
-            const int fd = accept(bound.fd, nullptr, nullptr);
-            if (fd >= 0) {
-                char buf[512];
-                const ssize_t ignored = recv(fd, buf, sizeof(buf), 0);
-                (void)ignored;
-                send_all(fd, "HTTP/1.1 200 OK\r\nConnection: close\r\nContent-Length: 2\r\n\r\nhi");
-                close(fd);
-            }
-            for (;;) pause();
-        }
-        close(bound.fd);
-        *out_port = bound.port;
-        *out_pid = pid;
-        return true;
-    };
-
     bool ok = true;
     const std::string reply = "HTTP/1.1 200 OK\r\nConnection: close\r\nContent-Length: 2\r\n\r\nhi";
 
-    // Phase 1: the asserted-phase instance.
+    // Phase 1: the asserted-phase instance. Round-18 review, "Avoid
+    // allocation in the post-fork fake proxy": launch_fake_proxy()'s
+    // "crash-on-term" mode forks+execs a fresh process image rather than
+    // running C++ (including a signal handler that used to call _exit()
+    // directly from a plain forked child) without ever calling exec() --
+    // this serves exactly one connection with a fixed reply, then blocks
+    // until SIGTERM and exits 7 (not 0), standing in for a bug during
+    // connection cleanup.
     uint16_t asserted_port = 0;
     pid_t asserted_pid = -1;
-    if (!make_crash_on_term_proxy(&asserted_port, &asserted_pid)) {
+    if (!launch_fake_proxy("crash-on-term", {}, &asserted_port, &asserted_pid)) {
         std::cerr << "FAIL [self-test pair isolated crash classification]: could not create the "
                      "asserted-phase fake instance\n";
         return false;
@@ -6756,7 +7116,7 @@ bool self_test_pair_isolated_instances_crash_classification() {
     // of phase 1 by construction, never conditioned on phase 1 succeeding.
     uint16_t record_only_port = 0;
     pid_t record_only_pid = -1;
-    if (!make_crash_on_term_proxy(&record_only_port, &record_only_pid)) {
+    if (!launch_fake_proxy("crash-on-term", {}, &record_only_port, &record_only_pid)) {
         std::cerr << "FAIL [self-test pair isolated crash classification]: could not create the "
                      "record-only-phase fake instance\n";
         return false;
@@ -6797,14 +7157,6 @@ bool self_test_pair_isolated_instances_crash_classification() {
     return ok;
 }
 
-// Set just before installing the SIGTERM handler in
-// self_test_asserted_phase_delayed_teardown_request_is_fatal()'s fake proxy
-// child below: signal handlers are plain function pointers with no capture,
-// so the upstream port they need to reach is threaded through this file-
-// scope variable instead. Confined to (and only ever written/read by) that
-// one self-test's own child process, never the parent.
-uint16_t g_selftest_delayed_teardown_upstream_port = 0;
-
 // Round-16 review, "Snapshot upstream traffic after stopping the asserted
 // proxy" (P1): reproduces the exact scenario the review describes -- an
 // asserted request completes its own response normally (no upstream contact
@@ -6813,7 +7165,12 @@ uint16_t g_selftest_delayed_teardown_upstream_port = 0;
 // already has its answer. Drives fill_upstream_bytes() the same way the now
 // -fixed run_pair_milestone_s()/run_oracle_milestone_s() do: stop() (and
 // therefore wait out the delayed request) BEFORE inspecting the upstream's
-// log, which must make it fatal for this pure-asserted batch.
+// log, which must make it fatal for this pure-asserted batch. Round-18
+// review, "Avoid allocation in the post-fork fake proxy" / "Wait for
+// upstream handlers before inspecting asserted traffic": the fake proxy is
+// launch_fake_proxy()'s "delayed-request" mode (a fresh exec'd process, no
+// signal-handler allocation) and the manual 100ms grace sleep this test used
+// to need is replaced by RecordingUpstream::wait_idle().
 bool self_test_asserted_phase_delayed_teardown_request_is_fatal() {
     BoundPort upstream_bound;
     if (!allocate_bound_loopback_port(&upstream_bound)) {
@@ -6829,51 +7186,18 @@ bool self_test_asserted_phase_delayed_teardown_request_is_fatal() {
                      "upstream\n";
         return false;
     }
-    g_selftest_delayed_teardown_upstream_port = upstream_bound.port;
 
-    BoundPort proxy_bound;
-    if (!allocate_bound_loopback_port(&proxy_bound)) {
-        std::cerr << "FAIL [self-test asserted delayed teardown]: could not allocate the fake "
-                     "proxy's port\n";
+    uint16_t proxy_port = 0;
+    pid_t fake_proxy = -1;
+    if (!launch_fake_proxy("delayed-request",
+                           {std::to_string(upstream_bound.port), "/delayed-teardown-request"},
+                           &proxy_port,
+                           &fake_proxy)) {
+        std::cerr << "FAIL [self-test asserted delayed teardown]: could not launch the fake "
+                     "proxy\n";
         upstream.stop();
         return false;
     }
-    const pid_t fake_proxy = fork();
-    if (fake_proxy < 0) {
-        std::cerr << "FAIL [self-test asserted delayed teardown]: fork failed\n";
-        close(proxy_bound.fd);
-        upstream.stop();
-        return false;
-    }
-    if (fake_proxy == 0) {
-        // Answers exactly one connection (the asserted client request)
-        // without ever contacting the upstream itself, then blocks in
-        // pause() until signaled. The SIGTERM handler -- standing in for a
-        // side-effecting request a real proxy might emit while tearing down
-        // a connection -- makes ONE delayed request to an UNLISTED path on
-        // the upstream before the process actually exits.
-        signal(SIGTERM, [](int) {
-            const int fd = connect_with_timeout(g_selftest_delayed_teardown_upstream_port, 1000);
-            if (fd >= 0) {
-                send_all(fd,
-                         "GET /delayed-teardown-request HTTP/1.1\r\nHost: t.example\r\n"
-                         "Connection: close\r\n\r\n");
-                close(fd);
-            }
-            _exit(1);
-        });
-        const int fd = accept(proxy_bound.fd, nullptr, nullptr);
-        if (fd >= 0) {
-            char buf[512];
-            const ssize_t ignored = recv(fd, buf, sizeof(buf), 0);
-            (void)ignored;
-            send_all(fd, "HTTP/1.1 200 OK\r\nConnection: close\r\nContent-Length: 2\r\n\r\nhi");
-            close(fd);
-        }
-        for (;;) pause();
-    }
-    close(proxy_bound.fd);
-    const uint16_t proxy_port = proxy_bound.port;
 
     RutInstance rut;
     rut.pid = fake_proxy;
@@ -6898,14 +7222,11 @@ bool self_test_asserted_phase_delayed_teardown_request_is_fatal() {
 
     // Stop first -- this sends SIGTERM and blocks until the fake proxy has
     // fully exited, which only happens after its handler's delayed upstream
-    // request has already completed -- THEN inspect the upstream's log, the
-    // fixed ordering from the round-16 review.
+    // request has already completed -- THEN wait for the upstream's own
+    // handler thread to finish recording it, THEN inspect the log: the
+    // fixed ordering from the round-16/round-18 reviews.
     rut.stop();
-    // A brief grace window for the recording upstream's own handler thread
-    // (independent of the now-exited fake proxy) to finish logging the
-    // delayed request it already received.
-    struct timespec grace{0, 100'000'000};
-    nanosleep(&grace, nullptr);
+    upstream.wait_idle(2000);
 
     const bool fill_ok = fill_upstream_bytes(&asserted_results, asserted_cases, upstream);
     upstream.stop();
@@ -7434,9 +7755,9 @@ bool self_test_envoy_stop_verifies_exit_status() {
 // with every make_temp_dir() self-test call site now wrapped in TempDir
 // (this round), re-running a fast, representative sample of the
 // unconditional (no binary needed) self-tests that create one must leave no
-// new `/tmp/rut-*` entries behind. Calls them directly, in-process, rather
-// than re-executing this binary's own --self-test pass as a nested
-// subprocess: this file's self-test suite already runs close to
+// leftover directories behind. Calls them directly, in-process, rather than
+// re-executing this binary's own --self-test pass as a nested subprocess:
+// this file's self-test suite already runs close to
 // test_envoy_differential_selftest's 90s CTest TIMEOUT (tests/CMakeLists.txt)
 // on a loaded host, and a nested whole-suite re-run risked pushing it over
 // (measured: re-running the FULL suite, including the slower ownership-probe
@@ -7448,30 +7769,49 @@ bool self_test_envoy_stop_verifies_exit_status() {
 // sample for the same reason; TempDir's own cleanup mechanism (exercised
 // here via every OTHER call site, and directly by
 // self_test_temp_dir_cleanup()) does not vary by call site.
+//
+// Round-18 review, "Scope leak cleanup to directories created by this
+// process": checks the exact paths this process's own TempDir instances
+// recorded in g_temp_dir_registry during the sampled self-tests below,
+// rather than diffing a shared naming prefix against the whole /tmp
+// directory -- the latter misattributes (and, worse, deletes) another
+// CONCURRENT `--self-test` invocation's own still-live directories if one
+// happens to create an entry matching the same prefix while this check is
+// running.
 bool self_test_no_binary_self_test_leaves_no_temp_dirs() {
-    const std::vector<std::string> before = list_rut_tmp_dir_names();
+    const size_t registry_begin = [] {
+        std::lock_guard<std::mutex> lock(g_temp_dir_registry_mu);
+        return g_temp_dir_registry.size();
+    }();
 
     self_test_partial_exchange_rejection();
     self_test_rut_stop_verifies_exit_status();
     self_test_envoy_stop_verifies_exit_status();
     self_test_temp_dir_cleanup();
 
-    const std::vector<std::string> after = list_rut_tmp_dir_names();
+    std::vector<std::string> created;
+    {
+        std::lock_guard<std::mutex> lock(g_temp_dir_registry_mu);
+        created.assign(g_temp_dir_registry.begin() + static_cast<ptrdiff_t>(registry_begin),
+                       g_temp_dir_registry.end());
+    }
+
     std::vector<std::string> leaked;
-    for (const auto& name : after) {
-        if (std::find(before.begin(), before.end(), name) == before.end()) leaked.push_back(name);
+    struct stat st{};
+    for (const auto& path : created) {
+        if (stat(path.c_str(), &st) == 0) leaked.push_back(path);
     }
     // Best-effort cleanup of anything found leaked, so this check's own
     // failure doesn't also accumulate garbage across repeated runs.
-    for (const auto& name : leaked) remove_dir_recursive("/tmp/" + name);
+    for (const auto& path : leaked) remove_dir_recursive(path);
 
     bool ok = true;
     if (!leaked.empty()) {
         std::cerr << "FAIL [self-test no leaked temp dirs]: running the always-on, TempDir-using "
                      "self-tests left "
-                  << leaked.size() << " new /tmp/rut-* director"
-                  << (leaked.size() == 1 ? "y" : "ies") << " behind:";
-        for (const auto& name : leaked) std::cerr << " " << name;
+                  << leaked.size() << " director" << (leaked.size() == 1 ? "y" : "ies")
+                  << " behind that this process itself created:";
+        for (const auto& path : leaked) std::cerr << " " << path;
         std::cerr << "\n";
         ok = false;
     }
@@ -7980,6 +8320,7 @@ int run_self_test(const std::string& rut_binary, const std::string& converter_bi
     ok &= self_test_unexpected_upstream_path_record_only_not_fatal();
     ok &= self_test_unexpected_upstream_path_ignores_asserted_local_case();
     ok &= self_test_unexpected_upstream_path_rejected_even_with_all_contacts();
+    ok &= self_test_oracle_rejects_unlisted_upstream_traffic();
     ok &= self_test_unexpected_upstream_path_record_only_not_fatal_even_with_all_contacts();
     ok &= self_test_record_only_misroute_isolated_by_batch();
     ok &= self_test_rut_early_exit_detected();
@@ -8014,6 +8355,9 @@ int run_self_test(const std::string& rut_binary, const std::string& converter_bi
 
 int main(int argc, char** argv) {
     signal(SIGPIPE, SIG_IGN);
+    if (argc >= 2 && std::string(argv[1]) == "--fake-proxy") {
+        return run_fake_proxy(argc, argv);
+    }
     if (argc >= 2 && std::string(argv[1]) == "--self-test") {
         const std::string rut_binary = argc >= 3 ? argv[2] : "";
         const std::string converter_binary = argc >= 4 ? argv[3] : "";
