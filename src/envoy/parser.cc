@@ -71,6 +71,9 @@ constexpr Field kClusterName = RUT_FIELD2("cluster_name", "clusterName");
 constexpr Field kEndpoints = RUT_FIELD("endpoints");
 constexpr Field kLbEndpoints = RUT_FIELD2("lb_endpoints", "lbEndpoints");
 constexpr Field kEndpoint = RUT_FIELD("endpoint");
+constexpr Field kTimeout = RUT_FIELD("timeout");
+constexpr Field kSuppressEnvoyHeaders =
+    RUT_FIELD2("suppress_envoy_headers", "suppressEnvoyHeaders");
 
 #undef RUT_FIELD
 #undef RUT_FIELD2
@@ -261,7 +264,7 @@ private:
         return true;
     }
 
-    FrontendResult<bool> parse_duration(u32 node, Duration* out) {
+    FrontendResult<bool> parse_duration(u32 node, Duration* out, bool allow_zero) {
         auto text = plain_string(node, lit_str("duration must be a string like \"5s\""));
         if (!text) return core::make_unexpected(text.error());
         const Str s = text.value();
@@ -300,7 +303,7 @@ private:
         if (pos != s.len - 1u)
             return invalid(span, lit_str("duration must be decimal seconds with an s suffix"));
         const u64 total = seconds * 1000u + millis;
-        if (total == 0u) return invalid(span, lit_str("duration must be positive"));
+        if (!allow_zero && total == 0u) return invalid(span, lit_str("duration must be positive"));
         if (total > 0xffffffffu) return unsupported(span, lit_str("duration is too large"));
         out->milliseconds = static_cast<u32>(total);
         out->text = s;
@@ -495,8 +498,8 @@ private:
         if (typed.value() == kJsonNoNode) return true;
         ok = expect_object(typed.value(), lit_str("typed_config must be an object"));
         if (!ok) return ok;
-        const Field allowed_typed[] = {kTypeUrl};
-        if (auto r = reject_unknown(typed.value(), allowed_typed, 1u); !r) return r;
+        const Field allowed_typed[] = {kTypeUrl, kSuppressEnvoyHeaders};
+        if (auto r = reject_unknown(typed.value(), allowed_typed, 2u); !r) return r;
         Span url_span{};
         if (auto r = expect_type_url(typed.value(),
                                      kRouterTypeUrl,
@@ -506,6 +509,18 @@ private:
             return r;
         out->has_typed_config = true;
         out->typed_config_span = doc_.at(typed.value()).span;
+
+        auto suppress = optional(typed.value(), kSuppressEnvoyHeaders);
+        if (!suppress) return core::make_unexpected(suppress.error());
+        if (suppress.value() != kJsonNoNode) {
+            const JsonNode& node_value = doc_.at(suppress.value());
+            if (node_value.kind != JsonKind::Bool)
+                return invalid(node_value.span,
+                               lit_str("suppress_envoy_headers must be a boolean"));
+            out->suppress_envoy_headers = node_value.bool_value;
+            out->suppress_envoy_headers_present = true;
+            out->suppress_envoy_headers_span = node_value.span;
+        }
         return true;
     }
 
@@ -603,8 +618,8 @@ private:
         if (!action) return core::make_unexpected(action.error());
         ok = expect_object(action.value(), lit_str("route action must be an object"));
         if (!ok) return ok;
-        const Field allowed_action[] = {kCluster};
-        if (auto r = reject_unknown(action.value(), allowed_action, 1u); !r) return r;
+        const Field allowed_action[] = {kCluster, kTimeout};
+        if (auto r = reject_unknown(action.value(), allowed_action, 2u); !r) return r;
         auto cluster =
             required(action.value(), kCluster, lit_str("route action cluster is required"));
         if (!cluster) return core::make_unexpected(cluster.error());
@@ -614,6 +629,15 @@ private:
         out->action.cluster = cluster_text.value();
         out->action.cluster_span = doc_.at(cluster.value()).span;
         out->action.span = doc_.at(action.value()).span;
+
+        auto timeout = optional(action.value(), kTimeout);
+        if (!timeout) return core::make_unexpected(timeout.error());
+        if (timeout.value() != kJsonNoNode) {
+            if (auto r = parse_duration(timeout.value(), &out->action.timeout, /*allow_zero=*/true);
+                !r)
+                return r;
+            out->action.timeout_present = true;
+        }
         return true;
     }
 
@@ -647,7 +671,9 @@ private:
         auto timeout =
             required(node, kConnectTimeout, lit_str("cluster connect_timeout is required"));
         if (!timeout) return core::make_unexpected(timeout.error());
-        if (auto r = parse_duration(timeout.value(), &out->connect_timeout); !r) return r;
+        if (auto r = parse_duration(timeout.value(), &out->connect_timeout, /*allow_zero=*/false);
+            !r)
+            return r;
 
         auto assignment =
             required(node, kLoadAssignment, lit_str("cluster load_assignment is required"));
@@ -673,6 +699,7 @@ private:
             return invalid(doc_.at(assignment_name.value()).span,
                            lit_str("load_assignment.cluster_name must equal the cluster name"));
         out->load_assignment_name_present = true;
+        out->load_assignment_name = name_text.value();
         out->load_assignment_name_span = doc_.at(assignment_name.value()).span;
 
         auto endpoints = required(

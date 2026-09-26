@@ -49,6 +49,11 @@ struct RouteMatch {
 struct RouteAction {
     Str cluster{};
     Span cluster_span{};
+    // `timeout` is optional today only in the sense that its absence is a
+    // capability gap (Envoy's implicit 15s default); the converter requires
+    // an explicit "0s" (docs/envoy-converter.md, "milestone-S").
+    bool timeout_present = false;
+    Duration timeout{};
     Span span{};
 };
 
@@ -88,6 +93,12 @@ struct RouterFilter {
     Span name_span{};
     bool has_typed_config = false;
     Span typed_config_span{};
+    // Only valid inside the router filter's typed_config. Removes
+    // x-envoy-upstream-service-time and x-envoy-expected-rq-timeout-ms from
+    // the upstream-facing behavior (docs/envoy-converter.md, "milestone-S").
+    bool suppress_envoy_headers = false;
+    bool suppress_envoy_headers_present = false;
+    Span suppress_envoy_headers_span{};
     Span span{};
 };
 
@@ -140,8 +151,13 @@ struct Cluster {
     // `ClusterLoadAssignment.cluster_name` has `min_len: 1`) and must equal
     // `name`; `load_assignment_name_present` is always true after a
     // successful parse and is kept for symmetry with the other
-    // presence-tracking fields.
+    // presence-tracking fields. `load_assignment_name` retains the parsed
+    // value itself (not just the presence bit) so that lowering can
+    // revalidate the equality against `name`/`action.cluster` at use time,
+    // rather than trusting that the equality parsing once established still
+    // holds on a caller-mutated copy (PR #692 round-12 review).
     bool load_assignment_name_present = false;
+    Str load_assignment_name{};
     Span load_assignment_name_span{};
     Endpoint endpoint{};
     Span span{};
