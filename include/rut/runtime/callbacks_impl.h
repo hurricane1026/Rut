@@ -11461,12 +11461,27 @@ inline bool build_upstream_order_response_headers(
         // generic hide check here (mirrors the `content-length` carve-out
         // just above).
         const bool is_server = response_policy_name_eq(name, "server", 6);
+        // Codex round-19 review (PR #698): this fixed set must match exactly
+        // what Envoy's `ConnectionManagerUtility::mutateResponseHeaders`
+        // (source/common/http/conn_manager_utility.cc, v1.39.1) removes for a
+        // non-upgrade response with `clear_hop_by_hop` set (always true on
+        // this fixed listener shape): `removeConnection()`, `removeUpgrade()`,
+        // `removeTransferEncoding()`, `removeKeepAlive()`, and
+        // `removeProxyConnection()` -- five calls, no more. `te` and
+        // `trailer` used to be in this list too, but Envoy never removes
+        // either on the response path: `TE` (`Headers::get().TE`) is only in
+        // `INLINE_REQ_STRING_HEADERS` (request-only) and `removeTE()` is
+        // called solely from `mutateRequestHeaders`
+        // (conn_manager_utility.cc:348); `Trailer` is not an inline header at
+        // all and has no `remove*()` call anywhere in
+        // source/common/http/conn_manager_utility.cc or the HTTP/1 codec's
+        // response encoding path (source/common/http/http1/codec_impl.cc).
+        // Both are ordinary headers a real Envoy forwards unchanged on a
+        // fixed-length (`Content-Length`) response, so this profile must too.
         if (!is_server && (response_policy_name_eq(name, "connection", 10) ||
                            response_policy_name_eq(name, "keep-alive", 10) ||
                            response_policy_name_eq(name, "proxy-connection", 16) ||
                            response_policy_name_eq(name, "upgrade", 7) ||
-                           response_policy_name_eq(name, "te", 2) ||
-                           response_policy_name_eq(name, "trailer", 7) ||
                            response_policy_name_eq(name, "transfer-encoding", 17) ||
                            (!is_content_length && response_policy_hides_header(policy, name))))
             continue;

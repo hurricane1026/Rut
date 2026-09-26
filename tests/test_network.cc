@@ -2255,6 +2255,63 @@ TEST(response_policy, kEnvoyInlineResponseHeaders_matches_full_envoy_inline_inve
     CHECK_EQ(kEnvoyInlineResponseHeaderCount, expected_count);
 }
 
+// Codex round-19 review (PR #698, thread PRRT_kwDORsELtc6mOfM2): this
+// profile's fixed hop-by-hop skip list used to drop `te` and `trailer`
+// unconditionally, but Envoy's `ConnectionManagerUtility::mutateResponseHeaders`
+// (source/common/http/conn_manager_utility.cc, v1.39.1) only calls
+// `removeConnection`/`removeUpgrade`/`removeTransferEncoding`/
+// `removeKeepAlive`/`removeProxyConnection` -- five calls, never `te` or
+// `trailer`. `TE` (`Headers::get().TE`) is request-only
+// (`INLINE_REQ_STRING_HEADERS`) and `removeTE()` is called solely from
+// `mutateRequestHeaders`; `Trailer` has no inline slot and no `remove*()`
+// call anywhere in that file or the HTTP/1 codec's response encoding path.
+// Both are ordinary headers on the response side and a real Envoy forwards
+// either unchanged on a fixed-length (`Content-Length`) response, so this
+// profile must too.
+TEST(response_policy, upstream_header_order_forwards_te_and_trailer_response_fields) {
+    char server[] = "envoy";
+    ForwardResponsePolicySpec upstream_order{};
+    upstream_order.version = ResponsePolicyVersion::Http11;
+    upstream_order.framing = ResponsePolicyFraming::ContentLength;
+    upstream_order.connection = ResponsePolicyConnection::Request;
+    upstream_order.header_order = ResponsePolicyHeaderOrder::Upstream;
+    upstream_order.header_names = ResponsePolicyHeaderNames::Lowercase;
+    upstream_order.connection_header = ResponsePolicyConnectionHeader::CloseOnly;
+    upstream_order.status_reason = ResponsePolicyStatusReason::Canonical;
+    upstream_order.date = ResponsePolicyDate::PreserveOrCurrent;
+    upstream_order.server = {server, 5};
+    REQUIRE(response_policy_spec_valid(upstream_order));
+
+    RouteConfig config{};
+    REQUIRE_EQ(config.add_response_policy(upstream_order), 1u);
+
+    u8 header_storage[SlicePool::kSliceSize]{};
+    Connection conn{};
+    conn.reset();
+    conn.response_header_slice = header_storage;
+    conn.response_header_buf.bind(header_storage, sizeof(header_storage));
+    conn.response_policy_id = 1;
+    conn.keep_alive = true;
+    conn.req_client_keep_alive = true;
+
+    static constexpr char kUpstream[] =
+        "HTTP/1.1 200 OK\r\nTrailer: X-Checksum\r\n"
+        "Content-Length: 2\r\nTE: trailers\r\n\r\nhi";
+    HttpResponseParser parser;
+    ParsedResponse response;
+    parser.reset();
+    response.reset();
+    REQUIRE_EQ(
+        parser.parse(reinterpret_cast<const u8*>(kUpstream), sizeof(kUpstream) - 1u, &response),
+        ParseStatus::Complete);
+    REQUIRE(build_strict_response_headers(conn, config, response));
+    CHECK(buf_has(conn.response_header_buf.data(),
+                  conn.response_header_buf.len(),
+                  "trailer: X-Checksum\r\n"));
+    CHECK(buf_has(
+        conn.response_header_buf.data(), conn.response_header_buf.len(), "te: trailers\r\n"));
+}
+
 // Codex round-11 review (PR #698, thread PRRT_kwDORsELtc6mJf61): the
 // `header_order: "upstream"` admission in `build_upstream_order_response_headers`
 // accepts every status 200..599 except the no-body codes 204/205/304, but
