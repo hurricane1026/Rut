@@ -653,9 +653,10 @@ static u64 response_buffering_request_policy_runtime_handler(
         .pack();
 }
 
-static u32 strict_id3_successor_handler_calls = 0;
-static u16 strict_id3_successor_second_policy =
+static constexpr u16 kStrictId3SuccessorDefaultSecondPolicy =
     static_cast<u16>(RequestPolicyId::Http11FixedTrimSpPreserveHtab);
+static u32 strict_id3_successor_handler_calls = 0;
+static u16 strict_id3_successor_second_policy = kStrictId3SuccessorDefaultSecondPolicy;
 static u64 strict_id3_successor_handler(void*, jit::HandlerCtx*, const u8*, u32, void*) {
     ++strict_id3_successor_handler_calls;
     const u16 policy = strict_id3_successor_handler_calls == 1
@@ -663,6 +664,23 @@ static u64 strict_id3_successor_handler(void*, jit::HandlerCtx*, const u8*, u32,
                            : strict_id3_successor_second_policy;
     return jit::HandlerResult::make_forward_with_bundle(0, policy, 2).pack();
 }
+
+// Owns the strict ID3 successor handler's process-wide state for one test (or
+// one loop iteration).  TEST bodies leave through SKIP/REQUIRE `return`s, often
+// from inside a loop, so the state is reset on entry and restored on every exit:
+// a forged second policy set by one iteration must never outlive it and reach a
+// later test that relies on the approved ID3 default.
+struct ScopedStrictId3SuccessorHandler {
+    ScopedStrictId3SuccessorHandler() { reset(); }
+    ~ScopedStrictId3SuccessorHandler() { reset(); }
+    ScopedStrictId3SuccessorHandler(const ScopedStrictId3SuccessorHandler&) = delete;
+    ScopedStrictId3SuccessorHandler& operator=(const ScopedStrictId3SuccessorHandler&) = delete;
+
+    static void reset() {
+        strict_id3_successor_handler_calls = 0;
+        strict_id3_successor_second_policy = kStrictId3SuccessorDefaultSecondPolicy;
+    }
+};
 
 static u32 response_coalesced_phase1_handler_calls = 0;
 static u32 response_coalesced_phase1_handler_len = 0;
@@ -39271,7 +39289,7 @@ TEST(http1_pipeline_generation_activation,
     auto* loop = guard.loop;
     RouteConfig config{};
     PreconnectConnectSubmitFixture fixture{};
-    strict_id3_successor_handler_calls = 0;
+    ScopedStrictId3SuccessorHandler strict_id3_handler_state{};
     REQUIRE(stage_pipeline_generation_successor_upload(loop,
                                                        config,
                                                        &fixture,
@@ -39319,7 +39337,7 @@ TEST(http1_pipeline_generation_activation,
         auto* loop = guard.loop;
         RouteConfig config{};
         PreconnectConnectSubmitFixture fixture{};
-        strict_id3_successor_handler_calls = 0;
+        ScopedStrictId3SuccessorHandler strict_id3_handler_state{};
         strict_id3_successor_second_policy =
             forgery == Forgery::WrongPolicy
                 ? static_cast<u16>(RequestPolicyId::Http11FixedStripContentLengthAfterHost)
@@ -39352,6 +39370,36 @@ TEST(http1_pipeline_generation_activation,
         CHECK_EQ(loop->backend.upstream_send_state[id].remaining, 0u);
         cleanup_late_failure_fixture(loop, fixture);
     }
+}
+
+// Mirrors one forgery iteration of the test above that leaves early, as its
+// SKIP("io_uring unavailable") does when a later iteration's ring setup fails.
+static void strict_id3_forged_policy_iteration_leaves_early() {
+    ScopedStrictId3SuccessorHandler strict_id3_handler_state{};
+    strict_id3_successor_second_policy =
+        static_cast<u16>(RequestPolicyId::Http11FixedStripContentLengthAfterHost);
+    (void)strict_id3_successor_handler(nullptr, nullptr, nullptr, 0, nullptr);
+}
+
+static u16 strict_id3_handler_request_policy() {
+    const auto result = jit::HandlerResult::unpack(
+        strict_id3_successor_handler(nullptr, nullptr, nullptr, 0, nullptr));
+    return result.action == jit::HandlerAction::ForwardBundle ? result.status_code : 0;
+}
+
+// Regression: an early exit used to leak the forged second policy into the next
+// test that relied on the ID3 default, which then saw the (correct) strict
+// rejection of the forged successor as a staging failure.
+TEST(http1_pipeline_generation_activation,
+     strict_successor_id3_forged_policy_does_not_outlive_an_early_exit) {
+    strict_id3_forged_policy_iteration_leaves_early();
+    CHECK_EQ(strict_id3_successor_handler_calls, 0u);
+    CHECK_EQ(strict_id3_successor_second_policy, kStrictId3SuccessorDefaultSecondPolicy);
+    ScopedStrictId3SuccessorHandler strict_id3_handler_state{};
+    CHECK_EQ(strict_id3_handler_request_policy(),
+             static_cast<u16>(RequestPolicyId::Http11FixedStrip));
+    CHECK_EQ(strict_id3_handler_request_policy(),
+             static_cast<u16>(RequestPolicyId::Http11FixedTrimSpPreserveHtab));
 }
 
 TEST(http1_pipeline_generation_activation,
@@ -39433,7 +39481,7 @@ TEST(http1_pipeline_generation_activation,
     auto* loop = guard.loop;
     RouteConfig config{};
     PreconnectConnectSubmitFixture fixture{};
-    strict_id3_successor_handler_calls = 0;
+    ScopedStrictId3SuccessorHandler strict_id3_handler_state{};
     REQUIRE(stage_pipeline_generation_successor_upload(loop,
                                                        config,
                                                        &fixture,
@@ -39473,9 +39521,7 @@ TEST(http1_pipeline_generation_activation,
         loop->metrics = &metrics;
         RouteConfig config{};
         PreconnectConnectSubmitFixture fixture{};
-        strict_id3_successor_handler_calls = 0;
-        strict_id3_successor_second_policy =
-            static_cast<u16>(RequestPolicyId::Http11FixedTrimSpPreserveHtab);
+        ScopedStrictId3SuccessorHandler strict_id3_handler_state{};
         REQUIRE(stage_pipeline_generation_successor_upload(loop,
                                                            config,
                                                            &fixture,
@@ -39537,7 +39583,7 @@ TEST(http1_pipeline_generation_activation,
     loop->metrics = &metrics;
     RouteConfig config{};
     PreconnectConnectSubmitFixture fixture{};
-    strict_id3_successor_handler_calls = 0;
+    ScopedStrictId3SuccessorHandler strict_id3_handler_state{};
     REQUIRE(stage_pipeline_generation_successor_upload(loop,
                                                        config,
                                                        &fixture,
@@ -39581,9 +39627,7 @@ TEST(http1_pipeline_generation_activation,
         loop->metrics = &metrics;
         RouteConfig config{};
         PreconnectConnectSubmitFixture fixture{};
-        strict_id3_successor_handler_calls = 0;
-        strict_id3_successor_second_policy =
-            static_cast<u16>(RequestPolicyId::Http11FixedTrimSpPreserveHtab);
+        ScopedStrictId3SuccessorHandler strict_id3_handler_state{};
         REQUIRE(stage_pipeline_generation_successor_upload(loop,
                                                            config,
                                                            &fixture,
@@ -39672,9 +39716,7 @@ TEST(http1_pipeline_generation_activation,
         loop->metrics = &metrics;
         RouteConfig config{};
         PreconnectConnectSubmitFixture fixture{};
-        strict_id3_successor_handler_calls = 0;
-        strict_id3_successor_second_policy =
-            static_cast<u16>(RequestPolicyId::Http11FixedTrimSpPreserveHtab);
+        ScopedStrictId3SuccessorHandler strict_id3_handler_state{};
         REQUIRE(stage_pipeline_generation_successor_upload(loop,
                                                            config,
                                                            &fixture,
@@ -39897,7 +39939,7 @@ TEST(http1_pipeline_generation_activation,
     loop->metrics = &metrics;
     RouteConfig config{};
     PreconnectConnectSubmitFixture fixture{};
-    strict_id3_successor_handler_calls = 0;
+    ScopedStrictId3SuccessorHandler strict_id3_handler_state{};
     REQUIRE(stage_pipeline_generation_successor_upload(loop,
                                                        config,
                                                        &fixture,
