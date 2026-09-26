@@ -2421,29 +2421,33 @@ std::vector<CaseResult> run_case_batch(uint16_t listen_port, const std::vector<C
 // to reach the upstream at all -- would never be queried and every
 // asserted comparison above could still pass (round-4 review). Guard
 // against that separately: every path `upstream` has ever recorded a
-// request for must be one of `cases`' own expected `upstream_path`s. Such
-// traffic cannot be traced back to a specific request, but it can only have
-// come from one of THIS batch's own cases, so it is attributed to whichever
-// case(s) never saw their own expected contact here -- the most likely
-// source of a request that landed somewhere else instead. Only a case that
-// actually expects to forward (case_expects_upstream_forward()) is eligible:
-// `options_star`/`connect_failure`/`connect_authority` have
-// `upstream_contact_count == 0` BY DESIGN (they are answered locally and
-// never forward), so their zero count is never suspicious and must not be
-// blamed for someone else's stray traffic -- otherwise an asserted
-// zero-contact case sitting in the same batch as a record-only misroute
-// would make every stray path "attributable to an asserted case" regardless
-// of which case actually caused it (round-10 review, "Attribute stray
-// traffic without blaming local asserted cases").
+// request for must be one of `cases`' own expected `upstream_path`s.
 //
-// Either anomaly (a per-case duplicate, or unattributed traffic explained by
-// an asserted case's missing contact) is only made fatal (returns false) for
-// an asserted case: the CLI contract promises record-only cases never affect
-// the exit code (round-9 review, "Keep record-only upstream duplicates/
-// misroutes out of acceptance"), so a record-only case's anomaly instead
-// just sets `upstream_ambiguous` and lets the caller keep going --
-// write_pair_transcript()'s NOTE handling surfaces it without gating
-// acceptance.
+// Since round-11 review's batch isolation, `cases` here is always PURELY
+// the asserted batch or PURELY the record-only batch, never mixed (see
+// split_asserted_and_record_only()). That makes the anomaly's fatal/NOTE
+// classification a property of the WHOLE BATCH, not of any individual
+// case's own contact count: for a pure-asserted batch, unlisted traffic can
+// only have come from one of this batch's own (asserted) cases and must
+// fail the run, even when every case ALSO already recorded its own expected
+// contact -- an extra request is still a real, potentially side-effecting
+// anomaly (round-15 review, "Reject unlisted traffic even after expected
+// contacts succeed"): the old per-case "attribute to whichever case never
+// saw ITS OWN contact" elimination logic silently skipped every case once
+// they had all been contacted, hiding exactly this. For a pure-record-only
+// batch, the CLI contract promises record-only cases never affect the exit
+// code (round-9 review, "Keep record-only upstream duplicates/misroutes out
+// of acceptance"), so it stays a NOTE regardless; the elimination-based
+// attribution (whichever record-only case(s) never saw their own expected
+// contact -- the most plausible source) is still applied there, for the
+// transcript's benefit, marking `upstream_ambiguous` on eligible cases only
+// (case_expects_upstream_forward(): `options_star`/`connect_failure`/
+// `connect_authority` have `upstream_contact_count == 0` BY DESIGN and are
+// never a plausible source, round-10 review).
+//
+// The per-case duplicate check above is likewise only ever fatal for an
+// asserted case (`is_asserted_case()`), which -- now that batches are pure
+// -- means fatal exactly when the whole batch is the asserted one.
 bool fill_upstream_bytes(std::vector<CaseResult>* results,
                          const std::vector<CaseSpec>& cases,
                          RecordingUpstream& upstream) {
@@ -2470,30 +2474,34 @@ bool fill_upstream_bytes(std::vector<CaseResult>* results,
         r.upstream_contacted = true;
         r.upstream_bytes = observed.front();
     }
+    // A batch is either purely asserted or purely record-only (see the
+    // comment above); an empty batch has nothing to attribute anomalies to
+    // and is conservatively treated as non-fatal.
+    const bool batch_is_asserted =
+        !cases.empty() && std::all_of(cases.begin(), cases.end(), [](const CaseSpec& s) {
+            return is_asserted_case(s.name);
+        });
     for (const auto& [path, reqs] : upstream.all_requests()) {
         const bool expected = std::any_of(
             cases.begin(), cases.end(), [&](const CaseSpec& s) { return s.upstream_path == path; });
         if (expected) continue;
-        bool attributed_to_asserted = false;
+        std::cerr << (batch_is_asserted ? "FAIL: " : "NOTE: ") << "upstream recorded "
+                  << reqs.size() << " request(s) for path \"" << path
+                  << "\", which is not any case's expected upstream_path\n";
+        if (batch_is_asserted) {
+            ok = false;
+            continue;
+        }
         for (auto& r : *results) {
             const auto it = std::find_if(
                 cases.begin(), cases.end(), [&](const CaseSpec& s) { return r.name == s.name; });
             if (it == cases.end() || r.upstream_contact_count != 0) continue;
             // A case that never expects to forward at all (options_star,
             // connect_failure, connect_authority) has zero contact by
-            // design; it is never a plausible source of stray traffic and
-            // must not be attributed to, asserted or not.
+            // design; it is never a plausible source of stray traffic.
             if (!case_expects_upstream_forward(r.name)) continue;
-            if (is_asserted_case(r.name)) {
-                attributed_to_asserted = true;
-            } else {
-                r.upstream_ambiguous = true;
-            }
+            r.upstream_ambiguous = true;
         }
-        std::cerr << (attributed_to_asserted ? "FAIL: " : "NOTE: ") << "upstream recorded "
-                  << reqs.size() << " request(s) for path \"" << path
-                  << "\", which is not any case's expected upstream_path\n";
-        if (attributed_to_asserted) ok = false;
     }
     return ok;
 }
@@ -3663,49 +3671,92 @@ int run_pair_milestone_s(const std::string& rut_binary,
         // and re-converts from the same variable) and wait_port_closed()
         // follow it (round-7 review, "Route pair-mode Envoy starts through
         // the retry helper").
-        EnvoyInstance envoy;
+        //
+        // Round-15 review, "Isolate record-only cases before ignoring proxy
+        // crashes": the asserted and record-only batches now each get their
+        // OWN Envoy instance (and, below, their own RUT instance), launched
+        // and torn down in full before the next one starts. A single shared
+        // instance's stop() failure, observed only after BOTH batches had
+        // run, could not be safely attributed to either one -- a crash
+        // actually triggered by an asserted request (e.g. during connection
+        // cleanup, after its response was already captured) could be
+        // wrongly downgraded to a non-fatal record-only NOTE just because it
+        // was only OBSERVED after the record-only batch ran. A dedicated
+        // instance per batch means whichever instance's stop() fails can
+        // only ever have seen that batch's own traffic, so the asserted
+        // instance's stop() failure stays fatal and the record-only
+        // instance's stays a NOTE.
         std::string ready_error;
-        if (!launch_envoy_with_port_retry(
-                dir, "pair-run1", &listen_port1, upstream_port1, &envoy, &ready_error)) {
+        EnvoyInstance envoy_asserted;
+        if (!launch_envoy_with_port_retry(dir,
+                                          "pair-run1-asserted",
+                                          &listen_port1,
+                                          upstream_port1,
+                                          &envoy_asserted,
+                                          &ready_error)) {
             std::cerr << "FAIL: " << ready_error << "\n";
-            dump_log(envoy.log_path);
+            dump_log(envoy_asserted.log_path);
             upstream.stop();
             return 1;
         }
         // Round-11 review, "Attribute duplicate contacts to the originating
         // case": run the asserted cases against this Envoy instance first
         // and attribute their upstream evidence while the log holds only
-        // their own traffic, then reset the log before running the
-        // record-only cases as a second, isolated batch on the SAME
-        // instance -- see split_asserted_and_record_only()'s comment for
-        // why. Applied identically to the RUT phase below.
+        // their own traffic; the record-only cases run against a separate
+        // instance below, after this one is fully stopped and validated, on
+        // a freshly-cleared log -- see split_asserted_and_record_only()'s
+        // comment for why. Applied identically to the RUT phase below.
         auto envoy_asserted_results = run_case_batch(listen_port1, asserted_cases);
         if (!fill_upstream_bytes(&envoy_asserted_results, asserted_cases, upstream)) {
-            envoy.stop();
+            envoy_asserted.stop();
+            upstream.stop();
+            return 1;
+        }
+        if (!envoy_asserted.stop()) {
+            std::cerr << "FAIL: envoy exited unexpectedly before teardown ("
+                      << envoy_asserted.unexpected_exit_description << ")\n";
+            dump_log(envoy_asserted.log_path);
+            upstream.stop();
+            return 1;
+        }
+        if (!wait_port_closed(listen_port1, 5000)) {
+            std::cerr << "FAIL: listener port " << listen_port1
+                      << " did not become free after stopping the asserted-batch Envoy instance\n";
             upstream.stop();
             return 1;
         }
         upstream.clear_requests();
+
+        EnvoyInstance envoy_record_only;
+        if (!launch_envoy_with_port_retry(dir,
+                                          "pair-run1-record-only",
+                                          &listen_port1,
+                                          upstream_port1,
+                                          &envoy_record_only,
+                                          &ready_error)) {
+            std::cerr << "FAIL: " << ready_error << "\n";
+            dump_log(envoy_record_only.log_path);
+            upstream.stop();
+            return 1;
+        }
         auto envoy_record_only_results = run_case_batch(listen_port1, record_only_cases);
         // Never fatal here: none of `record_only_cases` is an asserted case,
         // so fill_upstream_bytes() cannot return false for this call (see
         // its "Either anomaly ... is only made fatal ... for an asserted
         // case" comment) -- the return value needs no check.
         fill_upstream_bytes(&envoy_record_only_results, record_only_cases, upstream);
-        // Round-12 review, "Prevent record-only crashes from failing pair
-        // mode": the asserted batch's own evidence was already validated by
-        // fill_upstream_bytes() above (still fatal), before Envoy ever saw
-        // the record-only batch's traffic -- so a stop() failure observed
-        // only here can only mean Envoy died during or after the
-        // record-only batch, which must never fail the run.
-        if (!envoy.stop()) {
-            dump_log(envoy.log_path);
+        // This instance only ever ran the record-only batch, so a stop()
+        // failure here is unambiguously attributable to it (round-12/
+        // round-15 review).
+        if (!envoy_record_only.stop()) {
+            dump_log(envoy_record_only.log_path);
             note_record_only_phase_crash(
-                "envoy", envoy.unexpected_exit_description, &envoy_record_only_results);
+                "envoy", envoy_record_only.unexpected_exit_description, &envoy_record_only_results);
         }
         if (!wait_port_closed(listen_port1, 5000)) {
             std::cerr << "FAIL: listener port " << listen_port1
-                      << " did not become free after stopping Envoy\n";
+                      << " did not become free after stopping the record-only-batch Envoy "
+                         "instance\n";
             upstream.stop();
             return 1;
         }
@@ -3722,8 +3773,10 @@ int run_pair_milestone_s(const std::string& rut_binary,
         // launch_rut_with_port_retry() re-renders/re-converts the bootstrap
         // on a fresh port and retries, same contract as
         // launch_envoy_with_port_retry(), and never leaves a failed
-        // attempt's process or log to be mistaken for evidence.
-        RutInstance rut;
+        // attempt's process or log to be mistaken for evidence. Same
+        // per-batch instance isolation as the Envoy phase above (round-15
+        // review).
+        RutInstance rut_asserted;
         std::string rut_source_path;
         std::string rut_ready_error;
         if (!launch_rut_with_port_retry(dir,
@@ -3732,34 +3785,65 @@ int run_pair_milestone_s(const std::string& rut_binary,
                                         &listen_port1,
                                         upstream_port1,
                                         &rut_source_path,
-                                        &rut,
+                                        &rut_asserted,
                                         &rut_ready_error)) {
             std::cerr << "FAIL: " << rut_ready_error << "\n";
-            dump_rut_log(rut.log_path);
+            dump_rut_log(rut_asserted.log_path);
             upstream.stop();
             return 1;
         }
         auto rut_asserted_results = run_case_batch(listen_port1, asserted_cases);
-        const bool rut_asserted_ok =
+        const bool rut_asserted_fill_ok =
             fill_upstream_bytes(&rut_asserted_results, asserted_cases, upstream);
+        const bool rut_asserted_stopped_cleanly = rut_asserted.stop();
+        if (!rut_asserted_fill_ok) {
+            upstream.stop();
+            return 1;
+        }
+        if (!rut_asserted_stopped_cleanly) {
+            std::cerr << "FAIL: rut exited unexpectedly before teardown ("
+                      << rut_asserted.unexpected_exit_description << ")\n";
+            dump_rut_log(rut_asserted.log_path);
+            upstream.stop();
+            return 1;
+        }
+        if (!wait_port_closed(listen_port1, 5000)) {
+            std::cerr << "FAIL: listener port " << listen_port1
+                      << " did not become free after stopping the asserted-batch RUT instance\n";
+            upstream.stop();
+            return 1;
+        }
         upstream.clear_requests();
+
+        RutInstance rut_record_only;
+        std::string rut_record_only_source_path;
+        std::string rut_record_only_ready_error;
+        if (!launch_rut_with_port_retry(dir,
+                                        rut_binary,
+                                        converter_binary,
+                                        &listen_port1,
+                                        upstream_port1,
+                                        &rut_record_only_source_path,
+                                        &rut_record_only,
+                                        &rut_record_only_ready_error)) {
+            std::cerr << "FAIL: " << rut_record_only_ready_error << "\n";
+            dump_rut_log(rut_record_only.log_path);
+            upstream.stop();
+            return 1;
+        }
         auto rut_record_only_results = run_case_batch(listen_port1, record_only_cases);
         // Never fatal here, same reasoning as the Envoy phase above.
         fill_upstream_bytes(&rut_record_only_results, record_only_cases, upstream);
-        const bool rut_stopped_cleanly = rut.stop();
+        const bool rut_record_only_stopped_cleanly = rut_record_only.stop();
         upstream.stop();
-        // Round-12 review, "Prevent record-only crashes from failing pair
-        // mode": same reasoning as the Envoy phase above -- `rut_asserted_ok`
-        // already validated the asserted batch's own evidence before RUT
-        // ever saw the record-only batch's traffic, so a stop() failure
-        // observed only here can only mean RUT died during or after the
-        // record-only batch, which must never fail the run.
-        if (!rut_stopped_cleanly) {
-            dump_rut_log(rut.log_path);
+        // This instance only ever ran the record-only batch, so a stop()
+        // failure here is unambiguously attributable to it (round-12/
+        // round-15 review).
+        if (!rut_record_only_stopped_cleanly) {
+            dump_rut_log(rut_record_only.log_path);
             note_record_only_phase_crash(
-                "rut", rut.unexpected_exit_description, &rut_record_only_results);
+                "rut", rut_record_only.unexpected_exit_description, &rut_record_only_results);
         }
-        if (!rut_asserted_ok) return 1;
         auto rut_results = std::move(rut_asserted_results);
         rut_results.insert(rut_results.end(),
                            std::make_move_iterator(rut_record_only_results.begin()),
@@ -5641,6 +5725,150 @@ bool self_test_unexpected_upstream_path_ignores_asserted_local_case() {
     return ok;
 }
 
+// Round-15 review, "Reject unlisted traffic even after expected contacts
+// succeed" (P1): the exact gap the review describes -- an asserted case
+// gets its OWN expected contact (so no case has upstream_contact_count == 0
+// for the old elimination logic to "attribute" the extra traffic to), but
+// the upstream ALSO recorded a second, unlisted request. Since
+// fill_upstream_bytes() is only ever called with a batch that is purely
+// asserted or purely record-only (round-11 review), unlisted traffic during
+// a pure-asserted batch must fail regardless of whether every case already
+// got its own contact.
+bool self_test_unexpected_upstream_path_rejected_even_with_all_contacts() {
+    BoundPort bound;
+    if (!allocate_bound_loopback_port(&bound)) {
+        std::cerr << "FAIL [self-test unexpected-upstream-path all-contacts]: could not allocate "
+                     "a loopback port\n";
+        return false;
+    }
+    const uint16_t port = bound.port;
+    RecordingUpstream upstream;
+    const std::string reply = "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nhi";
+    upstream.set_reply("/expected", reply);
+    upstream.set_default_reply(reply);
+    if (!upstream.adopt(bound.fd)) {
+        std::cerr
+            << "FAIL [self-test unexpected-upstream-path all-contacts]: could not start upstream\n";
+        return false;
+    }
+    bool ok = true;
+    {
+        const int fd1 = connect_with_timeout(port, kClientTimeoutMs);
+        if (fd1 < 0) {
+            std::cerr << "FAIL [self-test unexpected-upstream-path all-contacts]: could not "
+                         "connect (expected)\n";
+            upstream.stop();
+            return false;
+        }
+        const std::string req1 = "GET /expected HTTP/1.1\r\nHost: t.example\r\n\r\n";
+        if (!send_all(fd1, req1) || read_http_message(fd1, false, kClientTimeoutMs).bytes != reply)
+            ok = false;
+        close(fd1);
+
+        // The extra, unlisted request: sent AFTER the expected one succeeds,
+        // so every case in `cases` below already has a nonzero contact
+        // count by the time fill_upstream_bytes() looks at it.
+        const int fd2 = connect_with_timeout(port, kClientTimeoutMs);
+        if (fd2 < 0) {
+            std::cerr << "FAIL [self-test unexpected-upstream-path all-contacts]: could not "
+                         "connect (unlisted)\n";
+            upstream.stop();
+            return false;
+        }
+        const std::string req2 = "GET /unlisted HTTP/1.1\r\nHost: t.example\r\n\r\n";
+        if (!send_all(fd2, req2) || read_http_message(fd2, false, kClientTimeoutMs).bytes != reply)
+            ok = false;
+        close(fd2);
+    }
+    const std::vector<CaseSpec> cases = {{"get_smoke", "", false, "/expected", reply}};
+    std::vector<CaseResult> results(1);
+    results[0].name = "get_smoke";
+    const bool fill_ok = fill_upstream_bytes(&results, cases, upstream);
+    upstream.stop();
+    if (fill_ok) {
+        std::cerr << "FAIL [self-test unexpected-upstream-path all-contacts]: fill_upstream_bytes "
+                     "accepted an asserted batch with an extra unlisted request even though its "
+                     "own expected contact also succeeded\n";
+        ok = false;
+    }
+    if (!results[0].upstream_contacted || results[0].upstream_contact_count != 1) {
+        std::cerr << "FAIL [self-test unexpected-upstream-path all-contacts]: the case's own "
+                     "accounting was disturbed by the stray request\n";
+        ok = false;
+    }
+    if (ok) std::cerr << "PASS [self-test unexpected-upstream-path all-contacts]\n";
+    return ok;
+}
+
+// Round-15 review companion to the above: the identical shape, but the one
+// case in the table is record-only ("get_forged_xfcc") -- fill_upstream_
+// bytes() must NOT fail the batch (the CLI contract promises record-only
+// cases never affect the exit code), even though the case's own expected
+// contact also succeeded and there is nothing to attribute the extra
+// traffic to.
+bool self_test_unexpected_upstream_path_record_only_not_fatal_even_with_all_contacts() {
+    BoundPort bound;
+    if (!allocate_bound_loopback_port(&bound)) {
+        std::cerr << "FAIL [self-test unexpected-upstream-path record-only all-contacts]: could "
+                     "not allocate a loopback port\n";
+        return false;
+    }
+    const uint16_t port = bound.port;
+    RecordingUpstream upstream;
+    const std::string reply = "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nhi";
+    upstream.set_reply("/expected", reply);
+    upstream.set_default_reply(reply);
+    if (!upstream.adopt(bound.fd)) {
+        std::cerr << "FAIL [self-test unexpected-upstream-path record-only all-contacts]: could "
+                     "not start upstream\n";
+        return false;
+    }
+    bool ok = true;
+    {
+        const int fd1 = connect_with_timeout(port, kClientTimeoutMs);
+        if (fd1 < 0) {
+            std::cerr << "FAIL [self-test unexpected-upstream-path record-only all-contacts]: "
+                         "could not connect (expected)\n";
+            upstream.stop();
+            return false;
+        }
+        const std::string req1 = "GET /expected HTTP/1.1\r\nHost: t.example\r\n\r\n";
+        if (!send_all(fd1, req1) || read_http_message(fd1, false, kClientTimeoutMs).bytes != reply)
+            ok = false;
+        close(fd1);
+
+        const int fd2 = connect_with_timeout(port, kClientTimeoutMs);
+        if (fd2 < 0) {
+            std::cerr << "FAIL [self-test unexpected-upstream-path record-only all-contacts]: "
+                         "could not connect (unlisted)\n";
+            upstream.stop();
+            return false;
+        }
+        const std::string req2 = "GET /unlisted HTTP/1.1\r\nHost: t.example\r\n\r\n";
+        if (!send_all(fd2, req2) || read_http_message(fd2, false, kClientTimeoutMs).bytes != reply)
+            ok = false;
+        close(fd2);
+    }
+    const std::vector<CaseSpec> cases = {{"get_forged_xfcc", "", false, "/expected", reply}};
+    std::vector<CaseResult> results(1);
+    results[0].name = "get_forged_xfcc";
+    const bool fill_ok = fill_upstream_bytes(&results, cases, upstream);
+    upstream.stop();
+    if (!fill_ok) {
+        std::cerr << "FAIL [self-test unexpected-upstream-path record-only all-contacts]: "
+                     "fill_upstream_bytes failed a record-only batch over an unlisted request, "
+                     "despite the CLI's record-only contract\n";
+        ok = false;
+    }
+    if (!results[0].upstream_contacted || results[0].upstream_contact_count != 1) {
+        std::cerr << "FAIL [self-test unexpected-upstream-path record-only all-contacts]: the "
+                     "case's own accounting was disturbed by the stray request\n";
+        ok = false;
+    }
+    if (ok) std::cerr << "PASS [self-test unexpected-upstream-path record-only all-contacts]\n";
+    return ok;
+}
+
 // Round-11 review, "Attribute duplicate contacts to the originating case":
 // reproduces the exact scenario the review describes -- a record-only
 // case's request misrouted onto an ASSERTED case's own listed path (e.g.
@@ -6129,11 +6357,14 @@ bool self_test_pair_exempt_cases_nonzero_contact_rejected() {
 // asserted case run against it below) and then exits on its own -- never
 // accepting a second connection, standing in for a crash during or right
 // after the asserted batch, before the record-only batch could complete --
-// must not turn into a fatal run_pair_milestone_s() outcome. This drives
-// the exact sequence run_pair_milestone_s()'s Envoy/RUT phases now follow:
-// run the asserted batch, then the record-only batch, then stop() the
-// proxy and hand a failure to note_record_only_phase_crash() instead of
-// returning fatal.
+// must not turn into a fatal run_pair_milestone_s() outcome. Unit-tests
+// note_record_only_phase_crash() itself: given a `stop()` failure and a
+// batch of record-only results, it must mark them ambiguous rather than
+// the caller returning fatal. (Round-15 review moved run_pair_milestone_s()
+// to a SEPARATE proxy instance per batch, so production no longer shares
+// one instance across both the way this single fake proxy does; see
+// self_test_pair_isolated_instances_crash_classification() below for that
+// two-instance shape.)
 bool self_test_pair_record_only_crash_is_a_note() {
     BoundPort bound;
     if (!allocate_bound_loopback_port(&bound)) {
@@ -6222,6 +6453,134 @@ bool self_test_pair_record_only_crash_is_a_note() {
     // reaching this line at all, with `ok` still reflecting only the
     // evidence checks above, is the pass condition.
     if (ok) std::cerr << "PASS [self-test pair record-only crash]\n";
+    return ok;
+}
+
+// Round-15 review, "Isolate record-only cases before ignoring proxy
+// crashes": drives run_pair_milestone_s()'s per-batch instance isolation
+// directly -- a dedicated fake instance for the asserted batch, stopped and
+// validated BEFORE a second, separate fake instance is started for the
+// record-only batch. Each instance crashes at CLEANUP (traps SIGTERM and
+// exits 7, not a clean exit 0) rather than exiting on its own beforehand
+// (that TOCTOU-precheck path is already covered by
+// self_test_rut_stop_requires_delivered_signal() and friends), exercising
+// stop()'s "a signal was delivered but the resulting exit status doesn't
+// match an intentional teardown" branch specifically, in each phase.
+//
+// The asserted-phase instance's crash must be fatal on its own -- observing
+// it can never be downgraded to a NOTE, and (in production) no record-only
+// instance is ever launched after it. The record-only-phase instance is a
+// wholly separate process that never saw the asserted batch's traffic, so
+// its own crash at cleanup is unambiguously attributable to it and must be
+// a NOTE, exactly like self_test_pair_record_only_crash_is_a_note() above
+// -- but now via a dedicated instance rather than a shared one.
+bool self_test_pair_isolated_instances_crash_classification() {
+    // Serves exactly one connection with a fixed reply, then blocks forever
+    // in pause() rather than exiting -- so the ONLY way this process ends is
+    // by being signaled, and it deliberately reports a crash (exit 7, not
+    // 0) when that happens, standing in for a bug during connection
+    // cleanup.
+    auto make_crash_on_term_proxy = [](uint16_t* out_port, pid_t* out_pid) -> bool {
+        BoundPort bound;
+        if (!allocate_bound_loopback_port(&bound)) return false;
+        const pid_t pid = fork();
+        if (pid < 0) {
+            close(bound.fd);
+            return false;
+        }
+        if (pid == 0) {
+            signal(SIGTERM, [](int) { _exit(7); });
+            const int fd = accept(bound.fd, nullptr, nullptr);
+            if (fd >= 0) {
+                char buf[512];
+                const ssize_t ignored = recv(fd, buf, sizeof(buf), 0);
+                (void)ignored;
+                send_all(fd, "HTTP/1.1 200 OK\r\nConnection: close\r\nContent-Length: 2\r\n\r\nhi");
+                close(fd);
+            }
+            for (;;) pause();
+        }
+        close(bound.fd);
+        *out_port = bound.port;
+        *out_pid = pid;
+        return true;
+    };
+
+    bool ok = true;
+    const std::string reply = "HTTP/1.1 200 OK\r\nConnection: close\r\nContent-Length: 2\r\n\r\nhi";
+
+    // Phase 1: the asserted-phase instance.
+    uint16_t asserted_port = 0;
+    pid_t asserted_pid = -1;
+    if (!make_crash_on_term_proxy(&asserted_port, &asserted_pid)) {
+        std::cerr << "FAIL [self-test pair isolated crash classification]: could not create the "
+                     "asserted-phase fake instance\n";
+        return false;
+    }
+    RutInstance rut_asserted;
+    rut_asserted.pid = asserted_pid;
+    rut_asserted.log_path = "/dev/null";
+    const std::vector<CaseSpec> asserted_cases = {
+        {"get_smoke", "GET /smoke HTTP/1.1\r\nHost: t.example\r\n\r\n", false, "/smoke", reply}};
+    auto asserted_results = run_case_batch(asserted_port, asserted_cases);
+    if (asserted_results.size() != 1 || !asserted_results[0].exchange_complete) {
+        std::cerr << "FAIL [self-test pair isolated crash classification]: the asserted case's "
+                     "own exchange did not complete\n";
+        ok = false;
+    }
+    const bool asserted_stopped_cleanly = rut_asserted.stop();
+    if (asserted_stopped_cleanly) {
+        std::cerr << "FAIL [self-test pair isolated crash classification]: stop() reported a "
+                     "clean teardown for an asserted-phase instance that crashed at cleanup "
+                     "(exit 7)\n";
+        ok = false;
+    }
+    // Mirrors run_pair_milestone_s(): an asserted-phase stop() failure is
+    // fatal by itself here -- no note_record_only_phase_crash() call, no
+    // attribution needed.
+
+    // Phase 2: a SEPARATE instance for the record-only batch -- independent
+    // of phase 1 by construction, never conditioned on phase 1 succeeding.
+    uint16_t record_only_port = 0;
+    pid_t record_only_pid = -1;
+    if (!make_crash_on_term_proxy(&record_only_port, &record_only_pid)) {
+        std::cerr << "FAIL [self-test pair isolated crash classification]: could not create the "
+                     "record-only-phase fake instance\n";
+        return false;
+    }
+    RutInstance rut_record_only;
+    rut_record_only.pid = record_only_pid;
+    rut_record_only.log_path = "/dev/null";
+    const std::vector<CaseSpec> record_only_cases = {
+        {"get_forged_xfcc",
+         "GET /xfcc HTTP/1.1\r\nHost: t.example\r\n\r\n",
+         false,
+         "/xfcc",
+         reply}};
+    auto record_only_results = run_case_batch(record_only_port, record_only_cases);
+    if (record_only_results.size() != 1 || !record_only_results[0].exchange_complete) {
+        std::cerr << "FAIL [self-test pair isolated crash classification]: the record-only "
+                     "case's own exchange did not complete\n";
+        ok = false;
+    }
+    const bool record_only_stopped_cleanly = rut_record_only.stop();
+    if (record_only_stopped_cleanly) {
+        std::cerr << "FAIL [self-test pair isolated crash classification]: stop() reported a "
+                     "clean teardown for a record-only-phase instance that crashed at cleanup "
+                     "(exit 7)\n";
+        ok = false;
+    } else {
+        note_record_only_phase_crash("fake-record-only-proxy",
+                                     rut_record_only.unexpected_exit_description,
+                                     &record_only_results);
+    }
+    if (!record_only_results.empty() && !record_only_results[0].upstream_ambiguous) {
+        std::cerr << "FAIL [self-test pair isolated crash classification]: the record-only "
+                     "instance's crash was not marked ambiguous\n";
+        ok = false;
+    }
+
+    if (ok) std::cerr << "PASS [self-test pair isolated crash classification]\n";
     return ok;
 }
 
@@ -7235,6 +7594,8 @@ int run_self_test(const std::string& rut_binary, const std::string& converter_bi
     ok &= self_test_unexpected_upstream_path_rejected();
     ok &= self_test_unexpected_upstream_path_record_only_not_fatal();
     ok &= self_test_unexpected_upstream_path_ignores_asserted_local_case();
+    ok &= self_test_unexpected_upstream_path_rejected_even_with_all_contacts();
+    ok &= self_test_unexpected_upstream_path_record_only_not_fatal_even_with_all_contacts();
     ok &= self_test_record_only_misroute_isolated_by_batch();
     ok &= self_test_rut_early_exit_detected();
     ok &= self_test_rut_stop_requires_delivered_signal();
@@ -7245,6 +7606,7 @@ int run_self_test(const std::string& rut_binary, const std::string& converter_bi
     ok &= self_test_pair_exempt_cases_zero_contact_matches();
     ok &= self_test_pair_exempt_cases_nonzero_contact_rejected();
     ok &= self_test_pair_record_only_crash_is_a_note();
+    ok &= self_test_pair_isolated_instances_crash_classification();
     ok &= self_test_accept_unblocks_on_shutdown_close();
     ok &= self_test_head_body_detected();
     ok &= self_test_head_grace_reset_detected();
