@@ -6069,18 +6069,6 @@ inline bool apply_preserve_host_lowercase_request_policy(Connection& conn, u16 p
         }
         return true;
     };
-    auto append_dec = [&](u32 value) {
-        char digits[10];
-        u32 n = 0;
-        do {
-            digits[n++] = static_cast<char>('0' + value % 10);
-            value /= 10;
-        } while (value != 0);
-        for (u32 i = n; i > 0; i--) {
-            if (!append(reinterpret_cast<const u8*>(&digits[i - 1]), 1)) return false;
-        }
-        return true;
-    };
 
     conn.send_buf.reset();
     const u32 method_prefix = static_cast<u32>(path_ptr - data);
@@ -6196,7 +6184,26 @@ inline bool apply_preserve_host_lowercase_request_policy(Connection& conn, u16 p
             const bool xfp_invalid = is_xfp && !xfp_scheme_valid;
             if (!drop_fixed && !drop_te && !drop_nominated) {
                 if (is_cl) {
-                    if (!append_lit("content-length: ", 16) || !append_dec(body_len) ||
+                    // Envoy's HTTP/1 codec forwards every header's stored
+                    // string value byte for byte (`headers.iterate(...)` in
+                    // `StreamEncoderImpl::encodeHeadersBase`,
+                    // `source/common/http/http1/codec_impl.cc`, calls
+                    // `header.value().getStringView()`; the parser stores
+                    // the wire value directly via `addViaMove` in
+                    // `ConnectionImpl::onHeaderValueImpl`, with no
+                    // integer-round-trip anywhere in between) rather than
+                    // regenerating a canonical decimal spelling from the
+                    // parsed integer. A validated `Content-Length` value
+                    // such as `0004` therefore reaches the upstream
+                    // unchanged, not renumbered to `4`. `body_len` (parsed
+                    // from this same, already OWS-trimmed `value_start`/
+                    // `value_end` via `parse_uint`, which accepts only the
+                    // digits `0`-`9` -- a leading `+` or embedded
+                    // whitespace still fails parsing and is rejected before
+                    // this function is ever reached) continues to bound the
+                    // body copy below; only the wire spelling changes here.
+                    if (!append_lit("content-length: ", 16) ||
+                        !append(value_start, static_cast<u32>(value_end - value_start)) ||
                         !append_lit("\r\n", 2))
                         return false;
                 } else if (emit_te_here) {

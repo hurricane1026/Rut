@@ -339,11 +339,16 @@ return forward(users, request_policy: {
 // Connection value nominates except content-length/host/x-forwarded-for/
 // x-forwarded-host/x-forwarded-proto, nominating any of which (or a
 // pseudo-header-shaped token starting with `:`) fails closed; keeps `te`
-// when a comma-separated token is `trailers`, per field (rewritten to that
-// exact lowercase token; two trailers-carrying fields collapse to one line;
-// a Connection nomination of `te` itself does not force a drop -- this same
-// trailers check decides its fate, matching Envoy's own nomination special
-// case); rejects Connection nominating `upgrade` alongside an Upgrade header
+// when any physical TE field's comma-separated tokens contain `trailers` --
+// a request-wide decision, not a per-field one: exactly one canonical
+// `te: trailers` line (rewritten to that exact lowercase token) is emitted
+// at the *first* physical TE field's position whenever any TE field carries
+// the token, and every other physical TE field is suppressed (e.g.
+// `TE: gzip`, then `X-Middle`, then `TE: trailers` forwards `te: trailers`
+// before `x-middle`, not the `gzip` field dropped in place with `trailers`
+// kept separately). A Connection nomination of `te` itself does not force a
+// drop -- this same trailers check decides its fate, matching Envoy's own
+// nomination special case; rejects Connection nominating `upgrade` alongside an Upgrade header
 // whose trimmed value is non-empty (even with `close`) but admits a bare
 // Upgrade header otherwise -- including an Upgrade header present with an
 // empty/OWS-only value alongside an `upgrade` nomination -- and always
@@ -398,14 +403,21 @@ return forward(users,
 // HEAD with either no Connection field (the HTTP/1.1 default-keepalive shape)
 // or exactly one `Connection: close`, one IPv4 upstream, strict success, and
 // connect-establishment failure. On a `host: "preserve"` (ID4) route only,
-// a `Connection` value made up solely of `close`/`te` tokens (any order,
-// case-insensitive) is admitted too, classified by whether a `close` token
-// is present -- `Connection: close, TE` behaves like the plain
+// a `Connection` value made up solely of `close`/`te`/`upgrade` tokens (any
+// order, case-insensitive) is admitted too, classified by whether a `close`
+// token is present -- `Connection: close, TE` behaves like the plain
 // `Connection: close` shape, and `Connection: TE` alone behaves like no
 // `Connection` field at all -- since a `te` nomination never affects
 // persistence and ID4's own request-policy path already forwards it
 // (canonicalizing the paired `TE` field) regardless of this response-side
-// contract. While the broader failure rendezvous is not
+// contract. An `upgrade` token is admitted only when no semantically
+// present (non-empty/OWS) `Upgrade` field exists anywhere on the request --
+// e.g. `Connection: close, upgrade` with an absent or empty/OWS-only
+// `Upgrade` header -- since that shape is not a genuine upgrade either;
+// ID4's own request-policy path already admits and strips it the same way.
+// A genuine upgrade (a nominated `upgrade` token together with a
+// semantically present `Upgrade` value) is never admitted by this contract.
+// While the broader failure rendezvous is not
 // part of this contract, timeout, malformed/incomplete/excess response, and
 // upload/send/recv failure close before emitting downstream bytes.
 // response_policy.connection: "keep_alive" requires a keep-alive downstream
