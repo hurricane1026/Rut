@@ -1969,6 +1969,15 @@ TEST(response_policy, upstream_header_order_rejects_duplicate_inline_headers) {
 // duplicate and is still accepted with a single occurrence, then prove a
 // non-inline header (`x-custom`) may still repeat -- this profile forwards
 // ordinary headers verbatim in upstream order, duplicates and all.
+//
+// Codex round-15 review: the duplicate check used to run before the fixed
+// hop-by-hop skip list, so a duplicate of `keep-alive`, `upgrade`, or
+// `proxy-connection` -- three `kEnvoyInlineResponseHeaders` entries that are
+// also unconditionally dropped by the second (serialization) loop below,
+// regardless of `hide_headers` -- rejected an otherwise valid response even
+// though neither occurrence would ever reach the wire. Only these three
+// entries are exempt from the fail-closed duplicate check now; every other
+// entry in the table still fails closed on a duplicate.
 TEST(response_policy, upstream_header_order_rejects_duplicate_of_every_inline_header) {
     char server[] = "envoy";
     ForwardResponsePolicySpec upstream_order{};
@@ -2010,10 +2019,21 @@ TEST(response_policy, upstream_header_order_rejects_duplicate_of_every_inline_he
     for (u32 t = 0; t < kEnvoyInlineResponseHeaderCount; t++) {
         const Str name = kEnvoyInlineResponseHeaders[t];
         const std::string name_str(name.ptr, name.len);
+        // `keep-alive`, `upgrade`, and `proxy-connection` are always dropped
+        // by the fixed hop-by-hop set before serialization (never forwarded,
+        // `hide_headers` or not), so a duplicate of one of them can never
+        // reach the wire and must be accepted, not rejected.
+        const bool always_dropped = name.eq({"keep-alive", 10}) || name.eq({"upgrade", 7}) ||
+                                    name.eq({"proxy-connection", 16});
 
-        // Two occurrences of this inline header must fail closed (502).
-        CHECK_FALSE(admits("HTTP/1.1 200 OK\r\n" + name_str + ": a\r\nContent-Length: 2\r\n" +
-                           name_str + ": b\r\n\r\nhi"));
+        if (always_dropped) {
+            CHECK(admits("HTTP/1.1 200 OK\r\n" + name_str + ": a\r\nContent-Length: 2\r\n" +
+                         name_str + ": b\r\n\r\nhi"));
+        } else {
+            // Two occurrences of this inline header must fail closed (502).
+            CHECK_FALSE(admits("HTTP/1.1 200 OK\r\n" + name_str + ": a\r\nContent-Length: 2\r\n" +
+                               name_str + ": b\r\n\r\nhi"));
+        }
 
         // A single occurrence of the same header must still be accepted.
         CHECK(admits("HTTP/1.1 200 OK\r\n" + name_str + ": a\r\nContent-Length: 2\r\n\r\nhi"));
@@ -2022,6 +2042,104 @@ TEST(response_policy, upstream_header_order_rejects_duplicate_of_every_inline_he
     // A non-inline header may still repeat: this profile forwards ordinary
     // headers verbatim in upstream order without deduplicating them.
     CHECK(admits("HTTP/1.1 200 OK\r\nx-custom: a\r\nContent-Length: 2\r\nx-custom: b\r\n\r\nhi"));
+}
+
+// Codex round-15 review (PR #698, thread PRRT_kwDORsELtc6mNHbY): a second,
+// independent angle on the same bug, using `hide_headers` instead of a
+// hop-by-hop name. Two copies of an inline header (`Content-Type`) that
+// `hide_headers` names are also dropped by the second loop unconditionally
+// (the hide check runs before either occurrence could be written), so they
+// can never produce two physical lines either and duplicating them must not
+// fail the response closed. A duplicate of the same name with no
+// `hide_headers` entry still fails closed (502), proving the exemption is
+// specific to headers this policy actually drops.
+TEST(response_policy, upstream_header_order_accepts_duplicate_of_hidden_inline_header) {
+    char server[] = "envoy";
+    ForwardResponsePolicySpec upstream_order{};
+    upstream_order.version = ResponsePolicyVersion::Http11;
+    upstream_order.framing = ResponsePolicyFraming::ContentLength;
+    upstream_order.connection = ResponsePolicyConnection::Request;
+    upstream_order.header_order = ResponsePolicyHeaderOrder::Upstream;
+    upstream_order.header_names = ResponsePolicyHeaderNames::Lowercase;
+    upstream_order.connection_header = ResponsePolicyConnectionHeader::CloseOnly;
+    upstream_order.status_reason = ResponsePolicyStatusReason::Canonical;
+    upstream_order.date = ResponsePolicyDate::PreserveOrCurrent;
+    upstream_order.server = {server, 5};
+    upstream_order.hide_header_count = 1;
+    upstream_order.hide_headers[0] = {"Content-Type", 12};
+    REQUIRE(response_policy_spec_valid(upstream_order));
+
+    RouteConfig config{};
+    REQUIRE_EQ(config.add_response_policy(upstream_order), 1u);
+
+    auto admits = [&](const std::string& upstream, std::string* out_headers) {
+        u8 header_storage[SlicePool::kSliceSize]{};
+        Connection conn{};
+        conn.reset();
+        conn.response_header_slice = header_storage;
+        conn.response_header_buf.bind(header_storage, sizeof(header_storage));
+        conn.response_policy_id = 1;
+        conn.keep_alive = true;
+        conn.req_client_keep_alive = true;
+
+        HttpResponseParser parser;
+        ParsedResponse response;
+        parser.reset();
+        response.reset();
+        if (parser.parse(reinterpret_cast<const u8*>(upstream.data()),
+                         static_cast<u32>(upstream.size()),
+                         &response) != ParseStatus::Complete)
+            return false;
+        if (!build_strict_response_headers(conn, config, response)) return false;
+        if (out_headers != nullptr)
+            *out_headers =
+                std::string(reinterpret_cast<const char*>(conn.response_header_buf.data()),
+                            conn.response_header_buf.len());
+        return true;
+    };
+
+    // Two `Content-Type` fields, but this policy hides `Content-Type`: both
+    // are dropped before serialization, so the duplicate never reaches the
+    // wire and must be accepted.
+    std::string headers;
+    CHECK(
+        admits("HTTP/1.1 200 OK\r\nContent-Type: a\r\nContent-Length: 2\r\n"
+               "Content-Type: b\r\n\r\nhi",
+               &headers));
+    CHECK_FALSE(buf_has(reinterpret_cast<const u8*>(headers.data()),
+                        static_cast<u32>(headers.size()),
+                        "content-type"));
+
+    // Same duplicate, no `hide_headers` entry for it this time: still fails
+    // closed, proving the exemption above is specific to a name this policy
+    // actually drops, not a blanket relaxation of the Content-Type check.
+    ForwardResponsePolicySpec not_hidden = upstream_order;
+    not_hidden.hide_header_count = 0;
+    RouteConfig config_not_hidden{};
+    REQUIRE_EQ(config_not_hidden.add_response_policy(not_hidden), 1u);
+    auto admits_not_hidden = [&](const std::string& upstream) {
+        u8 header_storage[SlicePool::kSliceSize]{};
+        Connection conn{};
+        conn.reset();
+        conn.response_header_slice = header_storage;
+        conn.response_header_buf.bind(header_storage, sizeof(header_storage));
+        conn.response_policy_id = 1;
+        conn.keep_alive = true;
+        conn.req_client_keep_alive = true;
+
+        HttpResponseParser parser;
+        ParsedResponse response;
+        parser.reset();
+        response.reset();
+        if (parser.parse(reinterpret_cast<const u8*>(upstream.data()),
+                         static_cast<u32>(upstream.size()),
+                         &response) != ParseStatus::Complete)
+            return false;
+        return build_strict_response_headers(conn, config_not_hidden, response);
+    };
+    CHECK_FALSE(
+        admits_not_hidden("HTTP/1.1 200 OK\r\nContent-Type: a\r\nContent-Length: 2\r\n"
+                          "Content-Type: b\r\n\r\nhi"));
 }
 
 // Codex round-11 review (PR #698, thread PRRT_kwDORsELtc6mJf61): the

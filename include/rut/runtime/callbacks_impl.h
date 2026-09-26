@@ -11250,6 +11250,15 @@ inline bool stage_redirect_response(Connection& conn, const RouteConfig& config,
 // `:status` (`INLINE_RESP_NUMERIC_HEADERS` -> `Status`) is also excluded: it
 // is an HTTP/2 pseudo-header carried on the status line, never a literal
 // HTTP/1.1 header field, so it can never appear in `resp.headers` here.
+//
+// `keep-alive`, `upgrade`, and `proxy-connection` stay in this table (Envoy
+// does register them as inline slots), but the duplicate-count loop below
+// exempts them: they are also in the fixed hop-by-hop set the second loop
+// always drops regardless of `hide_headers`, so a duplicate of one of them
+// can never reach the wire as two physical lines and must not fail the
+// response closed (Codex round-15 review of #698). Every other entry here is
+// exempted from the count only when `hide_headers` names it, for the same
+// reason -- a hidden duplicate never reaches the wire either.
 inline constexpr Str kEnvoyInlineResponseHeaders[] = {
     lit_str("content-type"),
     lit_str("date"),
@@ -11331,14 +11340,31 @@ inline bool build_upstream_order_response_headers(
     // reproduce that join; a duplicate would otherwise reach the client as two
     // physical lines for a header Envoy always serializes as one. Fail closed
     // instead of guessing which occurrence wins.
+    //
+    // Codex round-15 review (PR #698): this must only fire for a name that
+    // will actually reach the wire. Three entries of `kEnvoyInlineResponseHeaders`
+    // (`keep-alive`, `upgrade`, `proxy-connection`) are also in the fixed
+    // hop-by-hop set the second loop below always skips regardless of
+    // `hide_headers` -- a duplicate of one of those can never produce two
+    // physical lines, so it must not fail the response closed. The rest of
+    // the table is forwarded unless named by `hide_headers`, in which case it
+    // is dropped for the same reason. This mirrors the second loop's own
+    // `is_server`/`is_content_length`-free skip predicate (none of the
+    // remaining table entries is `server` or `content-length`, so neither
+    // carve-out applies here).
     u32 inline_header_counts[kEnvoyInlineResponseHeaderCount] = {};
     for (u32 i = 0; i < resp.header_count; i++) {
         const Str name = resp.headers[i].name;
         if (response_policy_name_eq(name, "connection", 10) && ++connection_count > 1) return false;
         for (u32 t = 0; t < kEnvoyInlineResponseHeaderCount; t++) {
             const Str inline_name = kEnvoyInlineResponseHeaders[t];
-            if (name.len == inline_name.len &&
-                http_header_name_eq_ci(name.ptr, name.len, inline_name.ptr, inline_name.len) &&
+            if (name.len != inline_name.len ||
+                !http_header_name_eq_ci(name.ptr, name.len, inline_name.ptr, inline_name.len))
+                continue;
+            const bool always_dropped = response_policy_name_eq(name, "keep-alive", 10) ||
+                                        response_policy_name_eq(name, "upgrade", 7) ||
+                                        response_policy_name_eq(name, "proxy-connection", 16);
+            if (!always_dropped && !response_policy_hides_header(policy, name) &&
                 ++inline_header_counts[t] > 1)
                 return false;
         }
