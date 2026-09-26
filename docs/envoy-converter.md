@@ -65,22 +65,43 @@ the open file, reads it whole, `fstat`s again and requires identical device,
 inode, size, mtime and ctime, then reads it whole a second time and requires
 the two reads to be byte-identical. Any change that lands between the first
 `fstat` and the end of the second read — a same-size in-place rewrite, a torn
-first read whose writer then progressed, a rename-replace — fails with
-`input changed while it was being read`; a change after the second read cannot
-affect the result. Out of contract: a file that itself *holds* a torn mixture
-for the whole read window. Linux buffered reads (ext4, tmpfs) take no lock
-against an in-place `write()`, which copies page by page after already bumping
-mtime/ctime, so a writer stalled mid-copy leaves a torn file whose metadata no
-longer changes; the converter reads those bytes twice, identically, and
-converts them as the input — indistinguishable from a file that simply
-contains them (validation may still reject them, as it does for a mixed
-cluster name). Writers that need the converter to see only whole revisions
-must replace the file atomically (write a temporary file, then `rename()` it
-over the input). `tests/test_envoy_convert.cc` pins both halves
-deterministically: `cli_input_rewrite_during_read_is_detected` pauses the
-converter under `ptrace` at fixed points in `read_input` and rewrites the file
-there, and `cli_input_static_torn_content_is_converted_as_is` covers the
-out-of-contract torn file.
+first read whose writer then progressed — fails with `input changed while it
+was being read`; a content change after the second read cannot affect the
+result, since nothing rereads the bytes again. Out of contract: a file that
+itself *holds* a torn mixture for the whole read window. Linux buffered reads
+(ext4, tmpfs) take no lock against an in-place `write()`, which copies page by
+page after already bumping mtime/ctime, so a writer stalled mid-copy leaves a
+torn file whose metadata no longer changes; the converter reads those bytes
+twice, identically, and converts them as the input — indistinguishable from a
+file that simply contains them (validation may still reject them, as it does
+for a mixed cluster name).
+
+Writers that need the converter to see only whole revisions must replace the
+file atomically: write a temporary file, then `rename()` it over the input.
+That publishing model needs a separate, independent check: every `fstat`
+above runs on the already-open descriptor, which keeps referring to its
+original inode regardless of what the pathname is later renamed onto, so the
+device/inode/size/mtime/ctime comparison and the dual-read byte comparison
+cannot by themselves observe a rename landing during the read — both reads
+still return the pre-rename content faithfully, and a rename lands
+successfully no matter when it happens relative to them. After the second
+read and the descriptor's close, the converter therefore also `stat()`s the
+pathname itself — following symlinks, the same as `open()` did to get the
+descriptor in the first place — and requires its device and inode to still
+equal the descriptor's own identity (from the `fstat` above); a mismatch means
+the pathname now names a different file and fails with `input changed while
+it was being read`, the same message as the in-place cases above. This check
+runs last, so it extends the detection window through the descriptor's close,
+past where the in-place checks stop mattering: a rename that lands at any
+point up to and including that close is still caught, and only one landing
+strictly after it is invisible to the converter. `tests/test_envoy_convert.cc`
+pins all three halves deterministically: `cli_input_rewrite_during_read_is_detected`
+pauses the converter under `ptrace` at fixed points in `read_input` and
+rewrites the file there, `cli_input_rename_during_read_is_detected` pauses it
+the same way and renames a second file onto the input's path at the
+descriptor's `close()` instead (and confirms an otherwise-identical run with
+no rename converts cleanly), and `cli_input_static_torn_content_is_converted_as_is`
+covers the out-of-contract torn file.
 
 ## First behavioral milestone
 

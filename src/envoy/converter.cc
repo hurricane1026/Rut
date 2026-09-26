@@ -225,6 +225,18 @@ FrontendResult<bool> validate(const Bootstrap& model, const RutCapabilities& cap
     if (model.cluster.endpoint.address.port == 0u)
         return invalid(model.cluster.endpoint.address.span,
                        lit_str("endpoint port must be non-zero"));
+    // PR #692 round-15 review: `listener.name` and `hcm.route_config.name`
+    // are optional (`name_string(..., allow_empty=true)`,
+    // src/envoy/parser.cc:350-352 and :538-540) but the parser still bounds
+    // either by `kMaxEnvoyNameLen` when present. Nothing here re-enforced
+    // that bound, so a caller of the public `lower_to_rut(model,
+    // capabilities)` overload could set either to a non-empty string over
+    // the limit and still lower successfully, accepting a model
+    // `parse_bootstrap_json` would reject.
+    if (model.listener.name.len > kMaxEnvoyNameLen)
+        return unsupported(model.listener.name_span, lit_str("name exceeds the bounded length"));
+    if (hcm.route_config.name.len > kMaxEnvoyNameLen)
+        return unsupported(hcm.route_config.name_span, lit_str("name exceeds the bounded length"));
     // PR #692 round-10 review: revalidate `cluster.connect_timeout` too — the
     // parser requires it strictly positive (`parse_duration(...,
     // allow_zero=false)`, src/envoy/parser.cc:674, same "duration must be

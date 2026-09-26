@@ -232,6 +232,28 @@ bool read_input(const char* filename, char** output, size_t* length, const char*
         *error = "input changed while it was being read";
         return false;
     }
+    // PR #692 round-15 review: rereading the same descriptor twice (the
+    // round-8 check above) cannot observe a writer that publishes via
+    // `rename(tmp, filename)` — the atomic-replace model
+    // docs/envoy-converter.md's "Input format" already asks writers to use.
+    // A rename swaps what the pathname `filename` resolves to without
+    // touching the already-open descriptor `fd` at all, so both `pread`s and
+    // both `fstat`s above keep inspecting the original (now
+    // unlinked-but-still-open) file and see it completely unchanged, even
+    // though the documented rename-replace case happened during this read.
+    // `stat()` — not `lstat()`, matching `open()`'s own symlink-following
+    // behavior — resolves `filename` fresh, after every read and the
+    // descriptor's close are done, and a device/inode mismatch against the
+    // descriptor's own `after` fstat above is exactly that replacement.
+    struct stat path_after{};
+    if (stat(filename, &path_after) != 0) {
+        *error = strerror(errno);
+        return false;
+    }
+    if (path_after.st_dev != after.st_dev || path_after.st_ino != after.st_ino) {
+        *error = "input changed while it was being read";
+        return false;
+    }
     *output = buffer;
     *length = used;
     return true;

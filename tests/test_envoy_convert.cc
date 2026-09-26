@@ -538,7 +538,15 @@ enum class ReadPoint : u8 {
 
 struct Rewrite {
     ReadPoint at;
-    const std::string* contents;
+    const std::string* contents = nullptr;
+    // PR #692 round-15 review: when set, `run_converter_with_rewrites`
+    // renames `*rename_from` onto `path` at `at` instead of pwrite-ing
+    // `*contents` in place. This drives the atomic-replace publishing model
+    // (docs/envoy-converter.md, "Input format") the round-8 dual-read check
+    // alone cannot observe, since a rename swaps the pathname's target
+    // inode rather than the open descriptor's content. Mutually exclusive
+    // with `contents`.
+    const std::string* rename_from = nullptr;
 };
 
 struct TracedRun {
@@ -581,12 +589,14 @@ bool waitpid_retry(pid_t child, int* status) {
 }
 
 // Runs the converter on `path` under ptrace. When the converter reaches
-// `rewrites[k].at` (in order), the test rewrites `path` in place at offset 0
-// with `*rewrites[k].contents` (same length, no O_TRUNC) while the converter
-// is stopped at that syscall's entry, then lets the syscall run. Detaches
-// after the last rewrite or at the input's close, whichever comes first, so
-// the converter always exits untraced (LeakSanitizer's exit-time scan must
-// ptrace the process itself). `rewrites_done` reports how many rewrites ran.
+// `rewrites[k].at` (in order), the test either rewrites `path` in place at
+// offset 0 with `*rewrites[k].contents` (same length, no O_TRUNC) or, when
+// `rewrites[k].rename_from` is set instead, renames that path onto `path`
+// (PR #692 round-15 review), while the converter is stopped at that
+// syscall's entry, then lets the syscall run. Detaches after the last
+// rewrite or at the input's close, whichever comes first, so the converter
+// always exits untraced (LeakSanitizer's exit-time scan must ptrace the
+// process itself). `rewrites_done` reports how many rewrites ran.
 TracedRun run_converter_with_rewrites(const char* executable,
                                       const std::string& path,
                                       const std::vector<Rewrite>& rewrites) {
@@ -686,7 +696,11 @@ TracedRun run_converter_with_rewrites(const char* executable,
             }
             if (!reached) continue;
             if (point == rewrites[traced.rewrites_done].at) {
-                if (!pwrite_all(writer, *rewrites[traced.rewrites_done].contents)) {
+                const Rewrite& rewrite = rewrites[traced.rewrites_done];
+                const bool ok = rewrite.rename_from != nullptr
+                                    ? rename(rewrite.rename_from->c_str(), path.c_str()) == 0
+                                    : pwrite_all(writer, *rewrite.contents);
+                if (!ok) {
                     kill(child, SIGKILL);
                     break;
                 }
@@ -780,6 +794,57 @@ TEST(envoy_convert, cli_input_rewrite_during_read_is_detected) {
             CHECK(traced.rewrites_done >= c.min_rewrites);
             CHECK_CLI_OUTCOME(traced.run, *c.expected);
         }
+    }
+}
+
+// PR #692 round-15 review: rereading the same descriptor twice (the round-8
+// checks exercised above) cannot observe a writer that publishes via
+// `rename(tmp, filename)` — the atomic-replace model
+// docs/envoy-converter.md's "Input format" already asks writers to use. The
+// open descriptor keeps referring to the original, now-unlinked-but-open
+// inode, so both `pread`s and both `fstat`s in `read_input` see it
+// completely unchanged even though `filename` itself now names a different
+// file. This drives that replacement deterministically at the last point
+// `read_input` still holds the descriptor open (`ReadPoint::InputClose`, the
+// entry to its own `close`) and confirms the converter reports the same
+// "input changed while it was being read" diagnostic — and that an
+// otherwise-identical run with no rename at all still converts cleanly, so
+// the new pathname check doesn't false-positive on a file nobody touched.
+TEST(envoy_convert, cli_input_rename_during_read_is_detected) {
+    const TempDir temp_dir;
+    REQUIRE(temp_dir.ok());
+    const std::string path = temp_dir.path() + "/renaming.json";
+    const std::string new_path = temp_dir.path() + "/renaming.json.new";
+    const std::string content_a = milestone_s_json();
+    // The replacement file's content is irrelevant to this check: by the
+    // time the rename lands (at `InputClose`), `read_input` has already
+    // finished both reads of the pre-rename content and only re-resolves
+    // `filename`'s identity, never its bytes, afterward.
+    const std::string content_b = "not read";
+
+    const CliOutcome clean_a = expected_cli_outcome(path, content_a);
+    REQUIRE(clean_a.parsed);
+    REQUIRE(clean_a.exit_code == 0 || clean_a.err.find("BLOCKED_BY_RUT") != std::string::npos);
+    CliOutcome changed;
+    changed.err = path + ":1:1: input changed while it was being read\n";
+
+    for (int iteration = 0; iteration < 5; iteration++) {
+        // A publisher's atomic rename lands exactly while the converter is
+        // stopped at its own `close(fd)` entry, after both reads have
+        // already agreed on the pre-rename content.
+        REQUIRE(write_file(path, content_a));
+        REQUIRE(write_file(new_path, content_b));
+        const std::vector<Rewrite> rename_at_close{
+            {ReadPoint::InputClose, /*contents=*/nullptr, /*rename_from=*/&new_path}};
+        const TracedRun traced = run_converter_with_rewrites(g_executable, path, rename_at_close);
+        CHECK_EQ(traced.rewrites_done, 1u);
+        CHECK_CLI_OUTCOME(traced.run, changed);
+
+        // No rename at all: the same content, read the same (untraced) way,
+        // must still convert cleanly.
+        REQUIRE(write_file(path, content_a));
+        const RunResult clean_run = run_converter(g_executable, path);
+        CHECK_CLI_OUTCOME(clean_run, clean_a);
     }
 }
 
@@ -1300,6 +1365,29 @@ TEST(envoy_convert, api_forged_model_rejected) {
     CHECK(to_string(renamed_cluster_stale_load_assignment_result.error().detail)
               .find("load_assignment.cluster_name must equal the cluster name") !=
           std::string::npos);
+
+    // PR #692 round-15 review: `listener.name` and `hcm.route_config.name`
+    // are optional (`name_string(..., allow_empty=true)`,
+    // src/envoy/parser.cc:350-352 and :538-540) but the parser still bounds
+    // either by `kMaxEnvoyNameLen` when present. An overlong, non-empty
+    // value for either must not lower successfully.
+    envoy::Bootstrap overlong_listener_name = parsed.value();
+    overlong_listener_name.listener.name = str(overlong_name);
+    const auto overlong_listener_name_result =
+        envoy::lower_to_rut(overlong_listener_name, all_true);
+    CHECK_FALSE(overlong_listener_name_result);
+    CHECK(overlong_listener_name_result.error().code == FrontendError::UnsupportedSyntax);
+    CHECK(to_string(overlong_listener_name_result.error().detail)
+              .find("name exceeds the bounded length") != std::string::npos);
+
+    envoy::Bootstrap overlong_route_config_name = parsed.value();
+    overlong_route_config_name.listener.filter_chain.hcm.route_config.name = str(overlong_name);
+    const auto overlong_route_config_name_result =
+        envoy::lower_to_rut(overlong_route_config_name, all_true);
+    CHECK_FALSE(overlong_route_config_name_result);
+    CHECK(overlong_route_config_name_result.error().code == FrontendError::UnsupportedSyntax);
+    CHECK(to_string(overlong_route_config_name_result.error().detail)
+              .find("name exceeds the bounded length") != std::string::npos);
 }
 
 int main(int argc, char** argv) {
