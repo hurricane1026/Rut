@@ -323,6 +323,116 @@ std::string milestone_s_json(const char* listener_address = "0.0.0.0") {
         listener_address);
 }
 
+// Variants of the milestone-S bootstrap exercising the increment-4 shapes
+// that the converter must reject before the six capability checks
+// (docs/envoy-converter.md, "Capability validation"): more than one route,
+// more than one cluster, `direct_response`, `redirect`.
+
+std::string two_routes_json(rut::test::TestCase* _tc) {
+    std::string text = milestone_s_json();
+    CHECK(replace_first(
+        &text,
+        "\"routes\": [{\"match\": {\"prefix\": \"/\"}, \"route\": {\"cluster\": \"backend\", "
+        "\"timeout\": \"0s\"}}]",
+        "\"routes\": [{\"match\": {\"prefix\": \"/\"}, \"route\": {\"cluster\": \"backend\", "
+        "\"timeout\": \"0s\"}}, {\"match\": {\"path\": \"/x\"}, \"route\": {\"cluster\": "
+        "\"backend\"}}]"));
+    return text;
+}
+
+std::string two_clusters_json(rut::test::TestCase* _tc) {
+    std::string text = milestone_s_json();
+    CHECK(replace_first(
+        &text,
+        "\"clusters\": [{\n"
+        "\"name\": \"backend\",\n"
+        "\"type\": \"STATIC\",\n"
+        "\"connect_timeout\": \"5s\",\n"
+        "\"load_assignment\": {\"cluster_name\": \"backend\", \"endpoints\": [{\"lb_endpoints\": "
+        "[{\n"
+        "\"endpoint\": {\"address\": {\"socket_address\": {\"address\": \"127.0.0.1\", "
+        "\"port_value\": 9000}}}\n"
+        "}]}]}\n"
+        "}]",
+        "\"clusters\": [{\n"
+        "\"name\": \"backend\",\n"
+        "\"type\": \"STATIC\",\n"
+        "\"connect_timeout\": \"5s\",\n"
+        "\"load_assignment\": {\"cluster_name\": \"backend\", \"endpoints\": [{\"lb_endpoints\": "
+        "[{\n"
+        "\"endpoint\": {\"address\": {\"socket_address\": {\"address\": \"127.0.0.1\", "
+        "\"port_value\": 9000}}}\n"
+        "}]}]}\n"
+        "}, {\n"
+        "\"name\": \"backend2\",\n"
+        "\"type\": \"STATIC\",\n"
+        "\"connect_timeout\": \"5s\",\n"
+        "\"load_assignment\": {\"cluster_name\": \"backend2\", \"endpoints\": [{\"lb_endpoints\": "
+        "[{\n"
+        "\"endpoint\": {\"address\": {\"socket_address\": {\"address\": \"127.0.0.1\", "
+        "\"port_value\": 9001}}}\n"
+        "}]}]}\n"
+        "}]"));
+    return text;
+}
+
+std::string path_match_json(rut::test::TestCase* _tc) {
+    std::string text = milestone_s_json();
+    CHECK(replace_first(
+        &text,
+        "\"routes\": [{\"match\": {\"prefix\": \"/\"}, \"route\": {\"cluster\": \"backend\", "
+        "\"timeout\": \"0s\"}}]",
+        "\"routes\": [{\"match\": {\"path\": \"/x\"}, \"route\": {\"cluster\": \"backend\", "
+        "\"timeout\": \"0s\"}}]"));
+    return text;
+}
+
+std::string nonroot_prefix_json(rut::test::TestCase* _tc) {
+    std::string text = milestone_s_json();
+    CHECK(replace_first(
+        &text,
+        "\"routes\": [{\"match\": {\"prefix\": \"/\"}, \"route\": {\"cluster\": \"backend\", "
+        "\"timeout\": \"0s\"}}]",
+        "\"routes\": [{\"match\": {\"prefix\": \"/api/\"}, \"route\": {\"cluster\": \"backend\", "
+        "\"timeout\": \"0s\"}}]"));
+    return text;
+}
+
+std::string direct_response_json(rut::test::TestCase* _tc) {
+    std::string text = milestone_s_json();
+    CHECK(replace_first(&text,
+                        "\"route\": {\"cluster\": \"backend\", \"timeout\": \"0s\"}",
+                        "\"direct_response\": {\"status\": 200}"));
+    return text;
+}
+
+std::string redirect_json(rut::test::TestCase* _tc) {
+    std::string text = milestone_s_json();
+    CHECK(
+        replace_first(&text,
+                      "\"route\": {\"cluster\": \"backend\", \"timeout\": \"0s\"}",
+                      "\"redirect\": {\"path_redirect\": \"/new\", \"response_code\": \"FOUND\"}"));
+    return text;
+}
+
+// A local-only route table: the single route is `direct_response`, and
+// `static_resources.clusters` is omitted entirely (docs/envoy-compatibility.md,
+// "Allow local-only route tables to omit clusters"). Matches Envoy, which
+// needs no upstream cluster when nothing forwards.
+std::string direct_response_no_clusters_json(rut::test::TestCase* _tc) {
+    std::string text = direct_response_json(_tc);
+    const std::string clusters_literal = R"([{
+"name": "backend",
+"type": "STATIC",
+"connect_timeout": "5s",
+"load_assignment": {"cluster_name": "backend", "endpoints": [{"lb_endpoints": [{
+"endpoint": {"address": {"socket_address": {"address": "127.0.0.1", "port_value": 9000}}}
+}]}]}
+}])";
+    CHECK(replace_first(&text, ",\n\"clusters\": " + clusters_literal + "\n", "\n"));
+    return text;
+}
+
 }  // namespace
 
 // ── CLI ─────────────────────────────────────────────────────────────
@@ -456,7 +566,7 @@ CliOutcome expected_cli_outcome(const std::string& path, const std::string& cont
     outcome.exit_code = 0;
     outcome.out = to_string(lowered.value().view());
     outcome.err = "warning: connect_timeout \"" +
-                  to_string(parsed.value().cluster.connect_timeout.text) +
+                  to_string(parsed.value().clusters[0].connect_timeout.text) +
                   "\" has no Rut runtime equivalent (no per-upstream connect-establishment "
                   "timeout surface); the value is accepted but not enforced\n";
     if (envoy::needs_h2c_preface_warning(parsed.value()))
@@ -888,9 +998,9 @@ TEST(envoy_convert, cli_milestone_s_fails_closed_with_request_gap) {
     static envoy::JsonDocument doc;
     auto parsed = envoy::parse_bootstrap_json(str(text), doc);
     REQUIRE(parsed);
-    const Span span =
-        parsed.value()
-            .listener.filter_chain.hcm.route_config.virtual_host.route.action.cluster_span;
+    const Span span = parsed.value()
+                          .listener.filter_chain.hcm.route_config.virtual_host.routes[0]
+                          .action.cluster_span;
 
     const RunResult result = run_converter(g_executable, path);
     REQUIRE(WIFEXITED(result.status));
@@ -945,7 +1055,7 @@ TEST(envoy_convert, blocked_on_route_timeout) {
         auto parsed = envoy::parse_bootstrap_json(str(text), doc);
         REQUIRE(parsed);
         const envoy::RouteAction& action =
-            parsed.value().listener.filter_chain.hcm.route_config.virtual_host.route.action;
+            parsed.value().listener.filter_chain.hcm.route_config.virtual_host.routes[0].action;
         REQUIRE_FALSE(action.timeout_present);
         auto lowered = envoy::lower_to_rut(parsed.value());
         REQUIRE_FALSE(lowered);
@@ -962,7 +1072,7 @@ TEST(envoy_convert, blocked_on_route_timeout) {
         auto parsed = envoy::parse_bootstrap_json(str(text), doc);
         REQUIRE(parsed);
         const envoy::RouteAction& action =
-            parsed.value().listener.filter_chain.hcm.route_config.virtual_host.route.action;
+            parsed.value().listener.filter_chain.hcm.route_config.virtual_host.routes[0].action;
         REQUIRE(action.timeout_present);
         CHECK_EQ(action.timeout.milliseconds, 15000u);
         auto lowered = envoy::lower_to_rut(parsed.value());
@@ -995,35 +1105,41 @@ TEST(envoy_convert, api_all_capabilities_matches_golden) {
     CHECK(lowered_again.value().view().eq(golden));
 
     // Overwriting the JSON source after lowering must not change output
-    // bytes: no borrowed source text reaches the emitted RUT, only numeric
-    // model fields do. The bytes backing `route.match.prefix`,
-    // `router.name`, and `filter_chain.filter_name` are left untouched (PR
-    // #692 round-3 review added a defensive `validate()` check that the
-    // prefix is exactly "/", round-4 added one that the router filter name
-    // is exactly "envoy.filters.http.router", and round-5 added one that the
-    // network filter name is exactly
-    // "envoy.filters.network.http_connection_manager" — see
-    // api_forged_model_rejected below — so corrupting any borrowed range
-    // would correctly fail lowering rather than exercise the property this
-    // test is about).
+    // bytes: no borrowed source text reaches the emitted RUT for output
+    // generation, only numeric model fields do. `validate` does need to
+    // read the borrowed route-match prefix, cluster-name, load-assignment-
+    // name, router-name, and network-filter-name bytes (it must, to fail
+    // closed when hand-built content no longer matches its modeled shape;
+    // see `api_forged_model_rejected`'s `forged_short_prefix` case, added by
+    // PR #692 round-3 review's defensive `validate()` check that the prefix
+    // is exactly "/", `forged_router_name`/`cleared_typed_config`, added by
+    // round-4's check that the router filter name is exactly
+    // "envoy.filters.http.router", round-5's check that the network filter
+    // name is exactly "envoy.filters.network.http_connection_manager", and
+    // `renamed_cluster_stale_load_assignment`, added by round-12's check
+    // that `load_assignment.cluster_name` still equals the declared
+    // cluster's `name`), so this leaves those specific source spans
+    // untouched and corrupts every other byte.
     const envoy::Bootstrap model_copy = parsed.value();
-    const Str prefix =
-        model_copy.listener.filter_chain.hcm.route_config.virtual_host.route.match.prefix;
-    const Str router_name = model_copy.listener.filter_chain.hcm.router.name;
-    const Str filter_name = model_copy.listener.filter_chain.filter_name;
-    REQUIRE(prefix.ptr >= text.data() && prefix.ptr < text.data() + text.size());
-    REQUIRE(router_name.ptr >= text.data() && router_name.ptr < text.data() + text.size());
-    REQUIRE(filter_name.ptr >= text.data() && filter_name.ptr < text.data() + text.size());
-    const size_t prefix_offset = static_cast<size_t>(prefix.ptr - text.data());
-    const size_t router_name_offset = static_cast<size_t>(router_name.ptr - text.data());
-    const size_t filter_name_offset = static_cast<size_t>(filter_name.ptr - text.data());
+    const envoy::Route& route_copy =
+        model_copy.listener.filter_chain.hcm.route_config.virtual_host.routes[0];
+    const Span kept_spans[] = {
+        route_copy.match.prefix_span,
+        route_copy.action.cluster_span,
+        model_copy.clusters[0].name_span,
+        model_copy.clusters[0].load_assignment_name_span,
+        model_copy.listener.filter_chain.hcm.router.name_span,
+        model_copy.listener.filter_chain.filter_name_span,
+    };
     for (size_t i = 0; i < text.size(); i++) {
-        const bool in_prefix = i >= prefix_offset && i < prefix_offset + prefix.len;
-        const bool in_router_name =
-            i >= router_name_offset && i < router_name_offset + router_name.len;
-        const bool in_filter_name =
-            i >= filter_name_offset && i < filter_name_offset + filter_name.len;
-        if (!in_prefix && !in_router_name && !in_filter_name) text[i] = 'x';
+        bool keep = false;
+        for (const Span& s : kept_spans) {
+            if (i >= s.start && i < s.end) {
+                keep = true;
+                break;
+            }
+        }
+        if (!keep) text[i] = 'x';
     }
     auto lowered_after_mutation = envoy::lower_to_rut(model_copy, all_true);
     REQUIRE(lowered_after_mutation);
@@ -1087,26 +1203,31 @@ TEST(envoy_convert, api_forged_model_rejected) {
     CHECK_FALSE(envoy::lower_to_rut(listener_port_zero, all_true));
 
     envoy::Bootstrap endpoint_port_zero = parsed.value();
-    endpoint_port_zero.cluster.endpoint.address.port = 0;
+    endpoint_port_zero.clusters[0].endpoint.address.port = 0;
     CHECK_FALSE(envoy::lower_to_rut(endpoint_port_zero, all_true));
 
     envoy::Bootstrap mismatched_cluster = parsed.value();
-    mismatched_cluster.listener.filter_chain.hcm.route_config.virtual_host.route.action.cluster =
-        lit_str("other");
+    mismatched_cluster.listener.filter_chain.hcm.route_config.virtual_host.routes[0]
+        .action.cluster = lit_str("other");
     CHECK_FALSE(envoy::lower_to_rut(mismatched_cluster, all_true));
 
     // PR #692 round-3 review: a hand-mutated `match.prefix` must not lower
     // successfully. The emitted route is always the literal `"/"` catch-all
-    // (put_forward_route never reads `match.prefix`), so without this check
+    // (put_forward_route never reads `match.prefix`), so without a check
     // a forged "/admin" prefix would silently widen what the generated RUT
-    // actually matches relative to what the model claims.
+    // actually matches relative to what the model claims — caught here by
+    // the earlier "route matches other than \"prefix\": \"/\" are not
+    // lowered yet" guard (this increment lowers only the root catch-all;
+    // see the `blocked_on_nonroot_prefix` shape above), which already
+    // covers every non-"/" prefix regardless of how the model was built.
     envoy::Bootstrap forged_prefix = parsed.value();
-    forged_prefix.listener.filter_chain.hcm.route_config.virtual_host.route.match.prefix =
+    forged_prefix.listener.filter_chain.hcm.route_config.virtual_host.routes[0].match.prefix =
         lit_str("/admin");
     const auto forged_prefix_result = envoy::lower_to_rut(forged_prefix, all_true);
     CHECK_FALSE(forged_prefix_result);
-    CHECK(forged_prefix_result.error().code == FrontendError::UnexpectedToken);
-    CHECK(to_string(forged_prefix_result.error().detail).find("match prefix") != std::string::npos);
+    CHECK(forged_prefix_result.error().code == FrontendError::UnsupportedSyntax);
+    CHECK(to_string(forged_prefix_result.error().detail).find("are not lowered yet") !=
+          std::string::npos);
 
     // PR #692 round-4 review: a hand-mutated router filter identity must not
     // lower successfully either. `validate()` only inspected
@@ -1129,6 +1250,23 @@ TEST(envoy_convert, api_forged_model_rejected) {
     CHECK(cleared_typed_config_result.error().code == FrontendError::UnexpectedToken);
     CHECK(to_string(cleared_typed_config_result.error().detail).find("typed_config is required") !=
           std::string::npos);
+
+    // A hand-built model can set a `Prefix` match to a length-1 string that
+    // is not "/" (the parser's own `prefix_shape_ok` never produces this);
+    // the same guard above compares prefix bytes, not just length, so this
+    // is rejected the same way instead of being silently broadened into the
+    // `route "/"` catch-all.
+    envoy::Bootstrap forged_short_prefix = parsed.value();
+    forged_short_prefix.listener.filter_chain.hcm.route_config.virtual_host.routes[0].match.prefix =
+        lit_str("x");
+    CHECK_FALSE(envoy::lower_to_rut(forged_short_prefix, all_true));
+
+    // A hand-built model can also drop every declared cluster while its
+    // route still forwards; the empty-cluster allowance is only for
+    // direct_response/redirect routes.
+    envoy::Bootstrap no_clusters_forward = parsed.value();
+    no_clusters_forward.clusters.len = 0;
+    CHECK_FALSE(envoy::lower_to_rut(no_clusters_forward, all_true));
 
     // PR #692 round-5 review: the same forgery is possible one level up, on
     // the network filter that wraps the HTTP connection manager.
@@ -1192,7 +1330,7 @@ TEST(envoy_convert, api_forged_model_rejected) {
     // successfully, emitting a working gateway for a bootstrap Envoy would
     // reject at startup.
     envoy::Bootstrap cleared_load_assignment_name = parsed.value();
-    cleared_load_assignment_name.cluster.load_assignment_name_present = false;
+    cleared_load_assignment_name.clusters[0].load_assignment_name_present = false;
     const auto cleared_load_assignment_name_result =
         envoy::lower_to_rut(cleared_load_assignment_name, all_true);
     CHECK_FALSE(cleared_load_assignment_name_result);
@@ -1200,19 +1338,38 @@ TEST(envoy_convert, api_forged_model_rejected) {
     CHECK(to_string(cleared_load_assignment_name_result.error().detail)
               .find("load_assignment.cluster_name is required") != std::string::npos);
 
-    // PR #692 round-9 review: an empty/empty `action.cluster` /
-    // `cluster.name` pairing must not lower successfully. `Str::eq` treats
-    // two empty views as equal, so clearing both names on a parsed copy used
-    // to still pass the cluster-identity check above and reach the
-    // hard-coded `envoy_cluster_0` upstream.
+    // PR #692 round-9 review, ported to the route-list model: an
+    // empty/empty `action.cluster` / cluster `name` pairing must not lower
+    // successfully. `Str::eq` treats two empty views as equal, so clearing
+    // both names on a parsed copy used to still pass the cluster-identity
+    // check and reach the hard-coded `envoy_cluster_0` upstream. The
+    // route-list `validate()` now checks every declared cluster's `name`
+    // for emptiness in its own loop, before ever comparing it against
+    // `action.cluster` (src/envoy/converter.cc), so this forgery is now
+    // caught by that earlier, more specific diagnostic instead of the
+    // cluster-identity mismatch message.
     envoy::Bootstrap empty_cluster_names = parsed.value();
-    empty_cluster_names.listener.filter_chain.hcm.route_config.virtual_host.route.action.cluster =
-        Str{};
-    empty_cluster_names.cluster.name = Str{};
+    empty_cluster_names.listener.filter_chain.hcm.route_config.virtual_host.routes[0]
+        .action.cluster = Str{};
+    empty_cluster_names.clusters[0].name = Str{};
     const auto empty_cluster_names_result = envoy::lower_to_rut(empty_cluster_names, all_true);
     CHECK_FALSE(empty_cluster_names_result);
     CHECK(empty_cluster_names_result.error().code == FrontendError::UnexpectedToken);
     CHECK(to_string(empty_cluster_names_result.error().detail)
+              .find("cluster name must be a non-empty string") != std::string::npos);
+
+    // The `action.cluster`-side emptiness check still fires independently
+    // when the declared cluster's own name stays non-empty (so the
+    // per-cluster loop above passes), proving the empty/empty forgery is
+    // not only caught incidentally by that loop.
+    envoy::Bootstrap empty_action_cluster_only = parsed.value();
+    empty_action_cluster_only.listener.filter_chain.hcm.route_config.virtual_host.routes[0]
+        .action.cluster = Str{};
+    const auto empty_action_cluster_only_result =
+        envoy::lower_to_rut(empty_action_cluster_only, all_true);
+    CHECK_FALSE(empty_action_cluster_only_result);
+    CHECK(empty_action_cluster_only_result.error().code == FrontendError::UnexpectedToken);
+    CHECK(to_string(empty_action_cluster_only_result.error().detail)
               .find("route cluster does not name a declared cluster") != std::string::npos);
 
     // PR #692 round-9 review: a cleared `virtual_host.domains_span` — the
@@ -1273,7 +1430,7 @@ TEST(envoy_convert, api_forged_model_rejected) {
     // zero `connect_timeout` at startup, but the emitted RUT program never
     // reads this field so nothing else would catch the forgery.
     envoy::Bootstrap zero_connect_timeout = parsed.value();
-    zero_connect_timeout.cluster.connect_timeout.milliseconds = 0;
+    zero_connect_timeout.clusters[0].connect_timeout.milliseconds = 0;
     const auto zero_connect_timeout_result = envoy::lower_to_rut(zero_connect_timeout, all_true);
     CHECK_FALSE(zero_connect_timeout_result);
     CHECK(zero_connect_timeout_result.error().code == FrontendError::UnexpectedToken);
@@ -1303,17 +1460,18 @@ TEST(envoy_convert, api_forged_model_rejected) {
     CHECK(to_string(empty_virtual_host_name_result.error().detail)
               .find("virtual host name must be a non-empty string") != std::string::npos);
 
-    // PR #692 round-12 review: an overlong `action.cluster` (paired with an
-    // equally overlong, still-equal `cluster.name`, so the prior
+    // PR #692 round-12 review, ported to the route-list model (PR 8's
+    // `routes[]`/`clusters[]`): an overlong `action.cluster` (paired with an
+    // equally overlong, still-equal declared cluster `name`, so the prior
     // non-empty/equality check alone still passes) must not lower
     // successfully. `name_string` (src/envoy/parser.cc:179-185) rejects
     // every name over `kMaxEnvoyNameLen` during parsing, but nothing before
     // this fix re-enforced that bound at lowering time.
     const std::string overlong_name(static_cast<size_t>(envoy::kMaxEnvoyNameLen) + 1u, 'a');
     envoy::Bootstrap overlong_cluster_names = parsed.value();
-    overlong_cluster_names.listener.filter_chain.hcm.route_config.virtual_host.route.action
-        .cluster = str(overlong_name);
-    overlong_cluster_names.cluster.name = str(overlong_name);
+    overlong_cluster_names.listener.filter_chain.hcm.route_config.virtual_host.routes[0]
+        .action.cluster = str(overlong_name);
+    overlong_cluster_names.clusters[0].name = str(overlong_name);
     const auto overlong_cluster_names_result =
         envoy::lower_to_rut(overlong_cluster_names, all_true);
     CHECK_FALSE(overlong_cluster_names_result);
@@ -1345,18 +1503,20 @@ TEST(envoy_convert, api_forged_model_rejected) {
     CHECK(to_string(overlong_virtual_host_name_result.error().detail)
               .find("name exceeds the bounded length") != std::string::npos);
 
-    // PR #692 round-12 review: presence of
-    // `cluster.load_assignment_name_present` is not proof that the
-    // *current* `cluster.name`/`action.cluster` still match what
+    // PR #692 round-12 review, ported to the route-list model: presence of
+    // a declared cluster's `load_assignment_name_present` is not proof that
+    // the *current* `name`/`action.cluster` still match what
     // `parse_bootstrap_json` validated `load_assignment.cluster_name`
-    // against. Renaming both `action.cluster` and `cluster.name` to the
-    // same new string (so the equality check between them still passes)
-    // while leaving the presence bit true and `load_assignment_name`
-    // holding the stale, parsed "backend" value must not lower successfully.
+    // against. Renaming both `action.cluster` and the declared cluster's
+    // `name` to the same new string (so the equality check between them
+    // still passes) while leaving the presence bit true and
+    // `load_assignment_name` holding the stale, parsed "backend" value must
+    // not lower successfully.
     envoy::Bootstrap renamed_cluster_stale_load_assignment = parsed.value();
-    renamed_cluster_stale_load_assignment.listener.filter_chain.hcm.route_config.virtual_host.route
+    renamed_cluster_stale_load_assignment.listener.filter_chain.hcm.route_config.virtual_host
+        .routes[0]
         .action.cluster = lit_str("renamed");
-    renamed_cluster_stale_load_assignment.cluster.name = lit_str("renamed");
+    renamed_cluster_stale_load_assignment.clusters[0].name = lit_str("renamed");
     const auto renamed_cluster_stale_load_assignment_result =
         envoy::lower_to_rut(renamed_cluster_stale_load_assignment, all_true);
     CHECK_FALSE(renamed_cluster_stale_load_assignment_result);
@@ -1388,6 +1548,218 @@ TEST(envoy_convert, api_forged_model_rejected) {
     CHECK(overlong_route_config_name_result.error().code == FrontendError::UnsupportedSyntax);
     CHECK(to_string(overlong_route_config_name_result.error().detail)
               .find("name exceeds the bounded length") != std::string::npos);
+
+    // Codex round-5 review: a hand-built model can set `action.kind` to a
+    // value outside {Forward, DirectResponse, Redirect} (the parser never
+    // produces this). `validate()` used to infer Forward by elimination
+    // after ruling out DirectResponse/Redirect, so this out-of-range
+    // discriminator would fall through and lower as a forwarding route even
+    // though it names no recognized action.
+    envoy::Bootstrap forged_action_kind = parsed.value();
+    forged_action_kind.listener.filter_chain.hcm.route_config.virtual_host.routes[0].action.kind =
+        static_cast<envoy::RouteActionKind>(99);
+    const auto forged_action_kind_result = envoy::lower_to_rut(forged_action_kind, all_true);
+    CHECK_FALSE(forged_action_kind_result);
+    CHECK(forged_action_kind_result.error().code == FrontendError::UnexpectedToken);
+    CHECK(
+        to_string(forged_action_kind_result.error().detail).find("action kind is not recognized") !=
+        std::string::npos);
+
+    // Codex round-6 review: a hand-built model can set `match.kind` to a
+    // value outside {Prefix, Path} (the parser never produces this) while
+    // leaving `match.prefix` at the model's existing "/" bytes. `validate()`
+    // used to only rule out `Path` explicitly, then check the byte content
+    // of `match.prefix`; a forged kind with `prefix == "/"` would pass both
+    // checks and lower as the root catch-all even though it names no
+    // recognized match kind.
+    envoy::Bootstrap forged_match_kind = parsed.value();
+    forged_match_kind.listener.filter_chain.hcm.route_config.virtual_host.routes[0].match.kind =
+        static_cast<envoy::RouteMatchKind>(2);
+    const auto forged_match_kind_result = envoy::lower_to_rut(forged_match_kind, all_true);
+    CHECK_FALSE(forged_match_kind_result);
+    CHECK(forged_match_kind_result.error().code == FrontendError::UnexpectedToken);
+    CHECK(to_string(forged_match_kind_result.error().detail).find("match kind is not recognized") !=
+          std::string::npos);
+
+    // Codex round-10 review (P2): `FixedVec::len` (include/rut/common/types.h)
+    // is a public field with no accompanying bound check, and the
+    // fixed-capacity `data` array beneath it is only ever `Cap` (here
+    // `kMaxEnvoyClusters`) elements wide. `parse_clusters` never produces a
+    // `len` past that cap, but the public hand-built-model overload can set
+    // `model.clusters.len` to anything: the cluster-validation loop in
+    // `validate()` (src/envoy/converter.cc) would then index
+    // `model.clusters[i]` past the end of `data` before ever reaching the
+    // later "multiple clusters are not lowered yet" rejection -- undefined
+    // behavior, reproducible as an ASan stack-buffer-overflow. `validate()`
+    // now rejects an out-of-bounds count before that loop ever runs.
+    envoy::Bootstrap forged_cluster_count = parsed.value();
+    forged_cluster_count.clusters.len = envoy::kMaxEnvoyClusters + 1u;
+    const auto forged_cluster_count_result = envoy::lower_to_rut(forged_cluster_count, all_true);
+    CHECK_FALSE(forged_cluster_count_result);
+    CHECK(forged_cluster_count_result.error().code == FrontendError::UnexpectedToken);
+    CHECK(to_string(forged_cluster_count_result.error().detail)
+              .find("cluster count exceeds the bounded capacity") != std::string::npos);
+
+    // Same hazard, applied to the public routes vector: a hand-built
+    // `Bootstrap` with `virtual_host.routes.len` set past `kMaxEnvoyRoutes`
+    // would run any per-route loop (and `virtual_host.routes[1]` in the
+    // "multiple routes" rejection above) past the end of the
+    // `kMaxEnvoyRoutes`-wide `data` array. Reject it before that happens.
+    envoy::Bootstrap forged_route_count = parsed.value();
+    forged_route_count.listener.filter_chain.hcm.route_config.virtual_host.routes.len =
+        envoy::kMaxEnvoyRoutes + 1u;
+    const auto forged_route_count_result = envoy::lower_to_rut(forged_route_count, all_true);
+    CHECK_FALSE(forged_route_count_result);
+    CHECK(forged_route_count_result.error().code == FrontendError::UnexpectedToken);
+    CHECK(to_string(forged_route_count_result.error().detail)
+              .find("route count exceeds the bounded capacity") != std::string::npos);
+}
+
+// ── Increment 4: reject route lists / direct_response / redirect before the
+//    six capability checks ─────────────────────────────────────────────
+
+TEST(envoy_convert, blocked_on_multiple_routes) {
+    const std::string text = two_routes_json(_tc);
+    static envoy::JsonDocument doc;
+    auto parsed = envoy::parse_bootstrap_json(str(text), doc);
+    REQUIRE(parsed);
+    REQUIRE_EQ(parsed.value().listener.filter_chain.hcm.route_config.virtual_host.routes.len, 2u);
+    const Span second_route_span =
+        parsed.value().listener.filter_chain.hcm.route_config.virtual_host.routes[1].span;
+
+    // Rejected the same way regardless of capabilities: this check runs
+    // before the capability-gated ones.
+    const envoy::RutCapabilities all_true{true, true, true};
+    for (const bool use_all_true : {false, true}) {
+        auto lowered = use_all_true ? envoy::lower_to_rut(parsed.value(), all_true)
+                                    : envoy::lower_to_rut(parsed.value());
+        REQUIRE_FALSE(lowered);
+        CHECK(lowered.error().code == FrontendError::UnsupportedSyntax);
+        CHECK(to_string(lowered.error().detail).find("multiple routes are not lowered yet") !=
+              std::string::npos);
+        CHECK_EQ(lowered.error().span.line, second_route_span.line);
+        CHECK_EQ(lowered.error().span.col, second_route_span.col);
+    }
+}
+
+TEST(envoy_convert, blocked_on_multiple_clusters) {
+    const std::string text = two_clusters_json(_tc);
+    static envoy::JsonDocument doc;
+    auto parsed = envoy::parse_bootstrap_json(str(text), doc);
+    REQUIRE(parsed);
+    REQUIRE_EQ(parsed.value().clusters.len, 2u);
+    const Span second_cluster_span = parsed.value().clusters[1].span;
+
+    const envoy::RutCapabilities all_true{true, true, true};
+    for (const bool use_all_true : {false, true}) {
+        auto lowered = use_all_true ? envoy::lower_to_rut(parsed.value(), all_true)
+                                    : envoy::lower_to_rut(parsed.value());
+        REQUIRE_FALSE(lowered);
+        CHECK(lowered.error().code == FrontendError::UnsupportedSyntax);
+        CHECK(to_string(lowered.error().detail).find("multiple clusters are not lowered yet") !=
+              std::string::npos);
+        CHECK_EQ(lowered.error().span.line, second_cluster_span.line);
+        CHECK_EQ(lowered.error().span.col, second_cluster_span.col);
+    }
+}
+
+TEST(envoy_convert, blocked_on_path_match) {
+    const std::string text = path_match_json(_tc);
+    static envoy::JsonDocument doc;
+    auto parsed = envoy::parse_bootstrap_json(str(text), doc);
+    REQUIRE(parsed);
+    const envoy::RouteMatch& match =
+        parsed.value().listener.filter_chain.hcm.route_config.virtual_host.routes[0].match;
+    REQUIRE(match.kind == envoy::RouteMatchKind::Path);
+
+    const envoy::RutCapabilities all_true{true, true, true};
+    auto lowered = envoy::lower_to_rut(parsed.value(), all_true);
+    REQUIRE_FALSE(lowered);
+    CHECK(lowered.error().code == FrontendError::UnsupportedSyntax);
+    CHECK(to_string(lowered.error().detail).find("match.path is not lowered yet") !=
+          std::string::npos);
+    CHECK_EQ(lowered.error().span.line, match.span.line);
+    CHECK_EQ(lowered.error().span.col, match.span.col);
+}
+
+TEST(envoy_convert, blocked_on_nonroot_prefix) {
+    const std::string text = nonroot_prefix_json(_tc);
+    static envoy::JsonDocument doc;
+    auto parsed = envoy::parse_bootstrap_json(str(text), doc);
+    REQUIRE(parsed);
+    const envoy::RouteMatch& match =
+        parsed.value().listener.filter_chain.hcm.route_config.virtual_host.routes[0].match;
+    REQUIRE(match.kind == envoy::RouteMatchKind::Prefix);
+    REQUIRE(match.prefix.eq(lit_str("/api/")));
+
+    const envoy::RutCapabilities all_true{true, true, true};
+    auto lowered = envoy::lower_to_rut(parsed.value(), all_true);
+    REQUIRE_FALSE(lowered);
+    CHECK(lowered.error().code == FrontendError::UnsupportedSyntax);
+    CHECK(to_string(lowered.error().detail)
+              .find("route matches other than \"prefix\": \"/\" are not lowered yet") !=
+          std::string::npos);
+    CHECK_EQ(lowered.error().span.line, match.span.line);
+    CHECK_EQ(lowered.error().span.col, match.span.col);
+}
+
+TEST(envoy_convert, blocked_on_direct_response) {
+    const std::string text = direct_response_json(_tc);
+    static envoy::JsonDocument doc;
+    auto parsed = envoy::parse_bootstrap_json(str(text), doc);
+    REQUIRE(parsed);
+    const envoy::RouteAction& action =
+        parsed.value().listener.filter_chain.hcm.route_config.virtual_host.routes[0].action;
+    REQUIRE(action.kind == envoy::RouteActionKind::DirectResponse);
+
+    const envoy::RutCapabilities all_true{true, true, true};
+    auto lowered = envoy::lower_to_rut(parsed.value(), all_true);
+    REQUIRE_FALSE(lowered);
+    CHECK(lowered.error().code == FrontendError::UnsupportedSyntax);
+    CHECK(to_string(lowered.error().detail).find("direct_response is not lowered yet") !=
+          std::string::npos);
+    CHECK_EQ(lowered.error().span.line, action.span.line);
+    CHECK_EQ(lowered.error().span.col, action.span.col);
+}
+
+TEST(envoy_convert, local_only_route_table_omits_clusters) {
+    const std::string text = direct_response_no_clusters_json(_tc);
+    static envoy::JsonDocument doc;
+    auto parsed = envoy::parse_bootstrap_json(str(text), doc);
+    REQUIRE(parsed);
+    CHECK_EQ(parsed.value().clusters.len, 0u);
+    const envoy::RouteAction& action =
+        parsed.value().listener.filter_chain.hcm.route_config.virtual_host.routes[0].action;
+    REQUIRE(action.kind == envoy::RouteActionKind::DirectResponse);
+
+    const envoy::RutCapabilities all_true{true, true, true};
+    auto lowered = envoy::lower_to_rut(parsed.value(), all_true);
+    REQUIRE_FALSE(lowered);
+    CHECK(lowered.error().code == FrontendError::UnsupportedSyntax);
+    // The missing cluster set must not itself be rejected: a local-only
+    // route table reaches the same "not lowered yet" diagnostic a
+    // declared-cluster direct_response gets (PR 9 lowers it for real).
+    CHECK(to_string(lowered.error().detail).find("direct_response is not lowered yet") !=
+          std::string::npos);
+}
+
+TEST(envoy_convert, blocked_on_redirect) {
+    const std::string text = redirect_json(_tc);
+    static envoy::JsonDocument doc;
+    auto parsed = envoy::parse_bootstrap_json(str(text), doc);
+    REQUIRE(parsed);
+    const envoy::RouteAction& action =
+        parsed.value().listener.filter_chain.hcm.route_config.virtual_host.routes[0].action;
+    REQUIRE(action.kind == envoy::RouteActionKind::Redirect);
+
+    const envoy::RutCapabilities all_true{true, true, true};
+    auto lowered = envoy::lower_to_rut(parsed.value(), all_true);
+    REQUIRE_FALSE(lowered);
+    CHECK(lowered.error().code == FrontendError::UnsupportedSyntax);
+    CHECK(to_string(lowered.error().detail).find("redirect is not lowered yet") !=
+          std::string::npos);
+    CHECK_EQ(lowered.error().span.line, action.span.line);
+    CHECK_EQ(lowered.error().span.col, action.span.col);
 }
 
 int main(int argc, char** argv) {

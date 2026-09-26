@@ -446,14 +446,30 @@ are recorded from the pinned Envoy build, not assumed.
 **Routing**
 
 - `prefix` match is a plain string prefix. `prefix: "/api"` matches `/apifoo`.
-  Rut's route trie is segment-aware, so only `prefix: "/"` and prefixes ending
-  in `/` have a segment-equivalent meaning. Other prefixes are `PARTIAL`
-  until Rut offers a raw-prefix match, and the converter rejects them.
-- Routes are evaluated in list order, first match wins. Rut selects the
-  longest matching prefix. A route list is accepted only when the converter can
-  prove list order and longest-prefix selection agree for every request, and
-  it must reject lists where an earlier shorter prefix shadows a later longer
-  one.
+  Rut's route trie is segment-aware, so only `prefix: "/"` has a
+  segment-equivalent meaning today. This increment lowers `prefix: "/"` and
+  rejects every other prefix outright, including ones ending in `/`:
+  `RouteTrie::tokenize_segments` (`src/runtime/route_trie.cc`) drops trailing
+  empty segments, so Rut treats `/api/` and `/api` as equivalent while
+  Envoy's byte-prefix matcher does not — lowering `/api/` as a segment match
+  would broaden the route. Slash-terminated prefixes therefore stay blocked
+  even once ordered-list lowering (PR 8 / PR #695) lands, unless a future
+  change adds an explicit byte-level boundary check; all other non-root
+  prefixes remain `BLOCKED_BY_RUT` until Rut offers a raw-prefix match
+  (docs/envoy-compatibility.md, "Raw (non-segment) `prefix` not ending in
+  `/`").
+- Routes are evaluated in list order, first match wins; Rut's own route trie
+  instead selects the longest matching declared prefix. Per owner decision D3
+  (see `docs/envoy-compatibility.md`, "Multiple routes per virtual host"),
+  the converter does not admit-or-reject a route list by proving the two
+  orders agree: PR 8 lowers every ordered, in-bounds route list by
+  construction (nested first-match arms), so list order and Rut's
+  longest-prefix trie can never disagree for the emitted program. Until PR 8
+  lands, this increment rejects every multi-route bootstrap outright
+  (`"multiple routes are not lowered yet"`), and a single-route bootstrap
+  whose match is not the root catch-all (`match.path`, or a `prefix` other
+  than `"/"`) is rejected the same way, precisely because `lower_to_rut` has
+  no ordered-list lowering yet to fall back on.
 - Matching is against the path without query. `x-envoy-original-path` is not
   set unless a rewrite happens.
 - No matching route: HCM responds 404 with an empty body and no route-level
@@ -965,8 +981,16 @@ alone is `PARTIAL` at most.
 3. First serialized differential smoke case: header-only HTTP/1.1 GET with a
    final `content-length` response, then fixed-length POST, connect failure,
    and route timeout, each as its own row.
-4. Route matching: `path` exact match, `prefix` ending in `/`, multiple routes
-   with provable ordering, per-method rows, `direct_response`, `redirect`.
+4. Route matching: `path` exact match, multiple routes lowered as an
+   ordered, first-match list (owner decision D3: by construction — nested
+   first-match arms in source order — not by proving that list order and
+   Rut's longest-prefix trie agree; see "Routing" above), per-method rows,
+   `direct_response`, `redirect`. `prefix` ending in `/` (e.g. `"/api/"`) is
+   modeled by the parser but stays deferred behind an explicit byte-boundary
+   capability at lowering — `BLOCKED_BY_RUT` until Rut's route trie gains a
+   byte-level boundary check that distinguishes a slash-terminated prefix
+   from its unterminated form; see "Routing" above and
+   docs/envoy-compatibility.md.
 5. Header mutation: `request_headers_to_add/remove`,
    `response_headers_to_add/remove` at route and virtual-host level with
    Envoy's append-vs-overwrite semantics, `prefix_rewrite`,
@@ -1015,8 +1039,11 @@ Each needs its own issue before the corresponding row can leave
   measured value, which no policy exposes. Until then only the
   `suppress_envoy_headers: true` shape can be `SUPPORTED`.
 - Raw (non-segment) prefix match for `prefix` values not ending in `/`.
-- Explicit route-list ordering: Rut resolves by longest prefix. Either the
-  converter proves equivalence or the runtime gains an ordered fallback list.
+- ~~Explicit route-list ordering~~: resolved by construction (owner decision
+  D3) rather than a capability gap — see "Routing" above and
+  `docs/envoy-compatibility.md`. Not a `BLOCKED_BY_RUT` row; today's
+  increment rejects every route/match shape PR 8 hasn't lowered yet with its
+  own `UnsupportedSyntax` diagnostic instead.
 - Host / virtual-host routing: no host dimension in the route trie today.
 - Configurable connect, response and idle timeouts per upstream and per route.
   Rut has no connect-establishment timeout surface at all (not "a different
