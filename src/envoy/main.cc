@@ -332,7 +332,7 @@ int main(int argc, char** argv) {
         report(argv[3], lowered.error().span, lowered.error().detail, "conversion failed");
         return 1;
     }
-    warn_connect_timeout(parsed.value().cluster.connect_timeout.text);
+    warn_connect_timeout(parsed.value().clusters[0].connect_timeout.text);
     if (rut::envoy::needs_h2c_preface_warning(parsed.value())) warn_h2c_preface();
 
     static rut::envoy::RutSource output;

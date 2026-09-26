@@ -208,23 +208,37 @@ bool put_forward_route(Writer& w, const char* method, u32 method_len, bool inclu
 }
 
 // Capability validation (docs/envoy-converter.md; PR1 plan, "Capability
-// validation"). Defensive model checks come first because a hand-built
+// validation"). Defensive model checks run throughout because a hand-built
 // `Bootstrap` (as opposed to one produced by `parse_bootstrap_json`) must
 // still fail closed rather than emit an upstream with no address or a route
-// to an undeclared cluster. The six BLOCKED_BY_RUT checks then run in a fixed
-// order; the first failure wins.
+// to an undeclared cluster. The cluster/endpoint checks are deferred until
+// the route's action is known to be `Forward`, so a local-only route table
+// (every route `direct_response`/`redirect`) is not forced to declare an
+// unused cluster. The six BLOCKED_BY_RUT checks then run in a fixed order;
+// the first failure wins.
 FrontendResult<bool> validate(const Bootstrap& model, const RutCapabilities& caps) {
     const HttpConnectionManager& hcm = model.listener.filter_chain.hcm;
     const RouterFilter& router = hcm.router;
     const VirtualHost& virtual_host = hcm.route_config.virtual_host;
-    const Route& route = virtual_host.route;
-    const RouteAction& action = route.action;
-
     if (model.listener.address.port == 0u)
         return invalid(model.listener.address.span, lit_str("listener port must be non-zero"));
-    if (model.cluster.endpoint.address.port == 0u)
-        return invalid(model.cluster.endpoint.address.span,
-                       lit_str("endpoint port must be non-zero"));
+    // Codex round-10 review: `FixedVec::len` (include/rut/common/types.h) is
+    // a public field with no accompanying bound check, and the
+    // fixed-capacity `data` array beneath it is only ever `Cap` (here
+    // `kMaxEnvoyClusters`/`kMaxEnvoyRoutes`) elements wide. `parse_clusters`/
+    // `parse_routes` (src/envoy/parser.cc) never produce a `len` past their
+    // respective caps, but the public hand-built-model overload can set
+    // `model.clusters.len` or `virtual_host.routes.len` to anything: the
+    // cluster loop immediately below indexes `model.clusters[i]` for every
+    // `i` up to `model.clusters.len`, so an oversized forged count runs that
+    // loop past the end of `data` -- undefined behavior, reproducible as an
+    // ASan stack-buffer-overflow -- before the `len > 1u` "not lowered yet"
+    // rejection further down ever gets a chance to run. Reject both
+    // out-of-bounds counts here, before any loop over either vector.
+    if (model.clusters.len > kMaxEnvoyClusters)
+        return invalid(model.span, lit_str("cluster count exceeds the bounded capacity"));
+    if (virtual_host.routes.len > kMaxEnvoyRoutes)
+        return invalid(virtual_host.span, lit_str("route count exceeds the bounded capacity"));
     // PR #692 round-15 review: `listener.name` and `hcm.route_config.name`
     // are optional (`name_string(..., allow_empty=true)`,
     // src/envoy/parser.cc:350-352 and :538-540) but the parser still bounds
@@ -237,87 +251,197 @@ FrontendResult<bool> validate(const Bootstrap& model, const RutCapabilities& cap
         return unsupported(model.listener.name_span, lit_str("name exceeds the bounded length"));
     if (hcm.route_config.name.len > kMaxEnvoyNameLen)
         return unsupported(hcm.route_config.name_span, lit_str("name exceeds the bounded length"));
-    // PR #692 round-10 review: revalidate `cluster.connect_timeout` too — the
-    // parser requires it strictly positive (`parse_duration(...,
-    // allow_zero=false)`, src/envoy/parser.cc:674, same "duration must be
-    // positive" diagnostic reused here) because Envoy itself rejects a zero
-    // `connect_timeout`, but the emitted RUT program never reads this field.
-    // A hand-built `Bootstrap` passed to the public `lower_to_rut(model,
-    // capabilities)` overload that sets `connect_timeout.milliseconds` to
-    // zero (or a caller who mutates it on a parsed copy) would otherwise
-    // still lower successfully, returning a working gateway for a bootstrap
-    // Envoy would reject at startup.
-    if (model.cluster.connect_timeout.milliseconds == 0u)
-        return invalid(model.cluster.connect_timeout.span, lit_str("duration must be positive"));
-    // PR #692 round-9 review: `Str::eq` treats two empty views as equal, so
-    // a caller of the public `lower_to_rut(model, capabilities)` overload
-    // who clears both `action.cluster` and `model.cluster.name` on a parsed
-    // copy (or hand-builds a `Bootstrap` that never sets either) passes this
-    // check and reaches the hard-coded `envoy_cluster_0` upstream below. The
-    // parser requires both names non-empty (`min_len: 1` on both the v3
-    // `Cluster.name` and the route action's `cluster`), so an empty/empty
-    // pairing is a forgery this converter must also reject.
-    if (action.cluster.empty() || model.cluster.name.empty() ||
-        !action.cluster.eq(model.cluster.name))
+    // PR #692 round-9/round-8 review, ported to the route-list model (PR 8's
+    // `clusters[]`): loop over every declared cluster, not just the first,
+    // so both checks still hold once multiple clusters are lowered, and run
+    // this unconditionally (not deferred behind the Forward-action check
+    // below) so a malformed declared cluster is rejected even when it is
+    // never referenced by any route -- this cannot reject a legitimate
+    // local-only route table (every route `direct_response`/`redirect`,
+    // round-3 below), since `model.clusters.len` is then legitimately 0 and
+    // the loop body never runs. `name.empty()` guards the `Str::eq`
+    // empty-vs-empty forgery the `action.cluster` check further below
+    // relies on being impossible (a caller of the public `lower_to_rut(
+    // model, capabilities)` overload who clears a declared cluster's `name`
+    // on a parsed copy, or hand-builds a `Bootstrap` that never sets it,
+    // would otherwise let an also-cleared `action.cluster` pass an equality
+    // check it should fail; the parser requires both non-empty, `min_len: 1`
+    // on both the v3 `Cluster.name` and the route action's `cluster`).
+    // `load_assignment_name_present` is the model's only record that
+    // `parse_bootstrap_json` ever saw and validated that cluster's
+    // `load_assignment.cluster_name` (required, non-empty, and equal to
+    // `name` per Envoy's v3 `ClusterLoadAssignment.cluster_name` `min_len:
+    // 1`) -- the same evidence-bit shape as `hcm.type_url_span` (round-5)
+    // and `hcm.generate_request_id_span` (round-6) below. A hand-built
+    // `Bootstrap`, or a parsed copy with either bit cleared, still has a
+    // matching `action.cluster` / cluster `name` pair and would otherwise
+    // lower successfully, emitting a working gateway for a bootstrap Envoy
+    // would reject at startup.
+    for (u32 i = 0; i < model.clusters.len; i++) {
+        if (model.clusters[i].name.empty())
+            return invalid(model.clusters[i].name_span,
+                           lit_str("cluster name must be a non-empty string"));
+        // PR #692 round-12 review, ported: revalidate the bounded length
+        // too, not just non-emptiness/equality. `name_string`
+        // (src/envoy/parser.cc:179-185) rejects every name over
+        // `kMaxEnvoyNameLen` during parsing, but nothing above re-checks
+        // that bound; a caller of the public `lower_to_rut(model,
+        // capabilities)` overload who sets a declared cluster's `name` (and
+        // the matching `action.cluster`) to the same overlong string still
+        // passes the equality check below and would otherwise lower
+        // successfully, accepting a model `parse_bootstrap_json` would
+        // reject. Checked for every declared cluster now that route lists
+        // may name more than one.
+        if (model.clusters[i].name.len > kMaxEnvoyNameLen)
+            return unsupported(model.clusters[i].name_span,
+                               lit_str("name exceeds the bounded length"));
+        if (!model.clusters[i].load_assignment_name_present)
+            return invalid(model.clusters[i].span,
+                           lit_str("cluster load_assignment.cluster_name is required"));
+        // PR #692 round-12 review, ported: presence of the bit is not proof
+        // that the *current* `name`/a route's `action.cluster` still match
+        // what `parse_bootstrap_json` validated `load_assignment.cluster_
+        // name` against -- a caller of the public `lower_to_rut(model,
+        // capabilities)` overload can rename both a route's `action.cluster`
+        // and this declared cluster's `name` on a parsed copy (to the same
+        // new string, so the equality check below still passes) while
+        // leaving `load_assignment_name_present` true and
+        // `load_assignment_name` holding the old, now-stale name. Retaining
+        // the parsed value (`Cluster::load_assignment_name`,
+        // include/rut/envoy/parser.h) lets this revalidate the equality at
+        // lowering time instead of trusting historical presence. Checked for
+        // every declared cluster now that route lists may name more than
+        // one.
+        if (!model.clusters[i].load_assignment_name.eq(model.clusters[i].name))
+            return invalid(model.clusters[i].load_assignment_name_span,
+                           lit_str("load_assignment.cluster_name must equal the cluster name"));
+        // PR #692 round-10 review, ported: revalidate `connect_timeout` too
+        // -- the parser requires it strictly positive (`parse_duration(...,
+        // allow_zero=false)`, src/envoy/parser.cc, same "duration must be
+        // positive" diagnostic reused here) because Envoy itself rejects a
+        // zero `connect_timeout`, but the emitted RUT program never reads
+        // this field. A hand-built `Bootstrap` passed to the public
+        // `lower_to_rut(model, capabilities)` overload that sets a declared
+        // cluster's `connect_timeout.milliseconds` to zero (or a caller who
+        // mutates it on a parsed copy) would otherwise still lower
+        // successfully, returning a working gateway for a bootstrap Envoy
+        // would reject at startup. Checked for every declared cluster now
+        // that route lists may name more than one.
+        if (model.clusters[i].connect_timeout.milliseconds == 0u)
+            return invalid(model.clusters[i].connect_timeout.span,
+                           lit_str("duration must be positive"));
+    }
+    if (virtual_host.routes.len == 0u)
+        return invalid(virtual_host.span, lit_str("at least one route is required"));
+
+    // Route-list lowering (multiple routes, multiple clusters,
+    // direct_response, redirect) is not implemented yet (PR 8-10); reject
+    // precisely, before the capability checks below, so a model that would
+    // also hit a BLOCKED_BY_RUT row gets the more specific diagnostic.
+    if (virtual_host.routes.len > 1u)
+        return unsupported(virtual_host.routes[1].span,
+                           lit_str("multiple routes are not lowered yet"));
+    if (model.clusters.len > 1u)
+        return unsupported(model.clusters[1].span,
+                           lit_str("multiple clusters are not lowered yet"));
+
+    const Route& route = virtual_host.routes[0];
+    // Route matching beyond the catch-all is modeled (RouteMatchKind::Path,
+    // non-root RouteMatchKind::Prefix) but not lowered yet (PR 8 lowers an
+    // ordered, match-aware route list). Reject explicitly here: `lower_to_rut`
+    // below unconditionally emits a `route "/"` catch-all, so silently
+    // falling through would make an exact or scoped match accept every path.
+    // Compared against the byte content of "/" rather than only the length,
+    // so a hand-built `Bootstrap` (not produced by `parse_bootstrap_json`,
+    // e.g. a length-1 prefix like "x") cannot slip through and be silently
+    // broadened into the `route "/"` catch-all below. The parser's own
+    // `prefix_shape_ok` (src/envoy/parser.cc) already guarantees this for
+    // parsed models (a length-1 prefix is only ever exactly "/"), but
+    // `validate` must fail closed for direct model construction too.
+    if (route.match.kind == RouteMatchKind::Path)
+        return unsupported(route.match.span, lit_str("match.path is not lowered yet"));
+    // Codex round-6 review: the public hand-built-model overload does not go
+    // through the parser, whose `parse_route_match` only ever produces one of
+    // the two declared `RouteMatchKind` enumerators. Without this explicit
+    // check, a forged `match.kind` outside {Prefix, Path} (e.g.
+    // `static_cast<RouteMatchKind>(2)`) would skip both the Path rejection
+    // above and the byte-content check below whenever `match.prefix` happens
+    // to equal "/", reaching the `route "/"` catch-all lowering by
+    // elimination instead of by being verified as `Prefix` -- matching the
+    // defensive `RouteActionKind` check already applied to `action.kind`
+    // below.
+    if (route.match.kind != RouteMatchKind::Prefix)
+        return invalid(route.match.span, lit_str("match kind is not recognized"));
+    if (!route.match.prefix.eq(lit_str("/")))
+        return unsupported(
+            route.match.span,
+            lit_str("route matches other than \"prefix\": \"/\" are not lowered yet"));
+
+    const RouteAction& action = route.action;
+    if (action.kind == RouteActionKind::DirectResponse)
+        return unsupported(action.span, lit_str("direct_response is not lowered yet"));
+    if (action.kind == RouteActionKind::Redirect)
+        return unsupported(action.span, lit_str("redirect is not lowered yet"));
+    // The public hand-built-model overload does not go through the parser,
+    // whose `parse_route_action` only ever produces one of the three
+    // `RouteActionKind` enumerators. Without this explicit check, an
+    // out-of-range discriminator (a forged model, or a future enumerator
+    // this function hasn't been taught about) would fall through the two
+    // checks above and reach the Forward-only lowering below by elimination
+    // rather than by being verified as `Forward` — `lower_to_rut` would then
+    // silently emit a forwarding route for an action kind it does not
+    // actually recognize.
+    if (action.kind != RouteActionKind::Forward)
+        return invalid(action.span, lit_str("route action kind is not recognized"));
+
+    // Only Forward remains beyond this point, and it is the only action that
+    // needs a declared cluster: a local-only route table (every route
+    // `direct_response`/`redirect`) has already returned above without
+    // requiring `model.clusters` to be non-empty.
+    if (model.clusters.len == 0u)
+        return invalid(model.span, lit_str("at least one cluster is required"));
+    if (model.clusters[0].endpoint.address.port == 0u)
+        return invalid(model.clusters[0].endpoint.address.span,
+                       lit_str("endpoint port must be non-zero"));
+    // PR #692 round-9 review, ported: reject an empty `action.cluster`
+    // explicitly too (see the per-cluster `name.empty()` loop above for the
+    // matching declared-name-emptiness guard the forgery needed both sides
+    // of; the load_assignment evidence check is ported there too, so it is
+    // not repeated here).
+    if (action.cluster.empty() || !action.cluster.eq(model.clusters[0].name))
         return invalid(action.cluster_span,
                        lit_str("route cluster does not name a declared cluster"));
-    // PR #692 round-12 review: revalidate the bounded length too, not just
-    // non-emptiness/equality. `name_string` (src/envoy/parser.cc:179-185)
-    // rejects every name over `kMaxEnvoyNameLen` during parsing, but nothing
-    // above re-checks that bound; a caller of the public `lower_to_rut(model,
-    // capabilities)` overload who sets both `action.cluster` and
-    // `model.cluster.name` to the same overlong string still passes the
-    // equality check above and would otherwise lower successfully, accepting
-    // a model `parse_bootstrap_json` would reject.
+    // PR #692 round-12 review, ported: revalidate the bounded length too,
+    // not just non-emptiness/equality. `name_string`
+    // (src/envoy/parser.cc:179-185) rejects every name over
+    // `kMaxEnvoyNameLen` during parsing, but nothing above re-checks that
+    // bound; a caller of the public `lower_to_rut(model, capabilities)`
+    // overload who sets both this route's `action.cluster` and a declared
+    // cluster's `name` to the same overlong string still passes the equality
+    // check above and would otherwise lower successfully, accepting a model
+    // `parse_bootstrap_json` would reject. The matching per-cluster `name`
+    // bound (and the `load_assignment_name` presence/equality revalidation)
+    // is ported into the per-cluster loop above instead of repeated here,
+    // since it must hold for every declared cluster now that route lists may
+    // name more than one, not just the one route currently reachable here.
     if (action.cluster.len > kMaxEnvoyNameLen)
         return unsupported(action.cluster_span, lit_str("name exceeds the bounded length"));
-    if (model.cluster.name.len > kMaxEnvoyNameLen)
-        return unsupported(model.cluster.name_span, lit_str("name exceeds the bounded length"));
-    // PR #692 round-8 review: `load_assignment_name_present` is the model's
-    // only record that `parse_bootstrap_json` ever saw and validated
-    // `load_assignment.cluster_name` (required, non-empty, and equal to
-    // `cluster.name` per Envoy's v3 `ClusterLoadAssignment.cluster_name`
-    // `min_len: 1`) — the same evidence-bit shape as `hcm.type_url_span`
-    // (round-5) and `hcm.generate_request_id_span` (round-6). A hand-built
-    // `Bootstrap` passed to the public `lower_to_rut(model, capabilities)`
-    // overload that never populated `load_assignment` (or a caller who
-    // cleared the bit on a parsed copy) still has a matching `action.cluster`
-    // / `cluster.name` pair and would otherwise lower successfully, emitting
-    // a working gateway for a bootstrap Envoy would reject at startup.
-    if (!model.cluster.load_assignment_name_present)
-        return invalid(model.cluster.span,
-                       lit_str("cluster load_assignment.cluster_name is required"));
-    // PR #692 round-12 review: presence of the bit is not proof that the
-    // *current* `cluster.name`/`action.cluster` still match what
-    // `parse_bootstrap_json` validated `load_assignment.cluster_name`
-    // against — a caller of the public `lower_to_rut(model, capabilities)`
-    // overload can rename both `action.cluster` and `model.cluster.name` on
-    // a parsed copy (to the same new string, so the equality check above
-    // still passes) while leaving `load_assignment_name_present` true and
-    // `load_assignment_name` holding the old, now-stale name. Retaining the
-    // parsed value (`Cluster::load_assignment_name`,
-    // include/rut/envoy/parser.h) lets this revalidate the equality at
-    // lowering time instead of trusting historical presence.
-    if (!model.cluster.load_assignment_name.eq(model.cluster.name))
-        return invalid(model.cluster.load_assignment_name_span,
-                       lit_str("load_assignment.cluster_name must equal the cluster name"));
-    // PR #692 round-3 review: the emitted route is always the literal `"/"`
-    // catch-all (see put_forward_route below) — nothing about the route's
-    // actual `match.prefix` value ever reaches the generated text. A model
-    // built by `parse_bootstrap_json` always has `match.prefix.eq("/")`
-    // already (the parser rejects every other prefix), but a caller of the
-    // public `lower_to_rut(model, capabilities)` overload can copy a parsed
-    // `Bootstrap` and mutate `match.prefix` (e.g. to "/admin") before passing
-    // it back in; without this check, lowering still succeeds and silently
-    // widens what the emitted RUT actually matches relative to what the
-    // model claims. Reject any forged prefix here, alongside the other
-    // defensive model checks above.
+    // PR #692 round-3 review's own defensive `match.prefix == "/"` check
+    // (guarding a hand-mutated, e.g. "/admin", prefix from silently
+    // widening what the generated RUT actually matches) is unreachable
+    // here: by this point `route.match.kind` is already known to be
+    // `Prefix` (the `Path` case returned above) and `route.match.prefix`
+    // is already known to equal "/" (any other prefix already returned
+    // above, "route matches other than \"prefix\": \"/\" are not lowered
+    // yet"), so a hand-built model with a forged non-"/" prefix already
+    // fails closed earlier with that diagnostic instead of reaching here.
+    //
     // PR #692 round-10 review: revalidate `virtual_host.name` too — the
     // parser requires it non-empty (`parse_virtual_host`, "virtual host name
-    // must be a non-empty string", src/envoy/parser.cc:562-563), but the
-    // emitted RUT program never reads this field. A hand-built `Bootstrap`
-    // that clears `virtual_host.name` on a parsed copy (or never sets it)
-    // would otherwise still lower successfully, silently accepting a model
+    // must be a non-empty string", src/envoy/parser.cc), but the emitted RUT
+    // program never reads this field. A hand-built `Bootstrap` that clears
+    // `virtual_host.name` on a parsed copy (or never sets it) would
+    // otherwise still lower successfully, silently accepting a model
     // `parse_bootstrap_json` would reject.
     if (virtual_host.name.empty())
         return invalid(virtual_host.name_span,
@@ -332,19 +456,17 @@ FrontendResult<bool> validate(const Bootstrap& model, const RutCapabilities& cap
         return unsupported(virtual_host.name_span, lit_str("name exceeds the bounded length"));
     // PR #692 round-9 review: validation never checked that parsing
     // established `domains: ["*"]` on the virtual host — only the nested
-    // route's `match.prefix` (round-3, immediately below). A hand-built
-    // `Bootstrap`, or a parsed copy with `virtual_host.domains_span`
-    // cleared, still lowers even though the generated route has no host
-    // dimension and therefore matches every authority, which widens routing
-    // beyond what the model claims. `domains_span` is the model's only
-    // record that `parse_virtual_host` ever saw and accepted the exact
-    // single-element `["*"]` array (the parser rejects every other
-    // `domains` value), the same evidence-bit shape as `hcm.type_url_span`
-    // and `hcm.generate_request_id_span` above.
+    // route's `match.prefix` (round-3 above). A hand-built `Bootstrap`, or a
+    // parsed copy with `virtual_host.domains_span` cleared, still lowers
+    // even though the generated route has no host dimension and therefore
+    // matches every authority, which widens routing beyond what the model
+    // claims. `domains_span` is the model's only record that
+    // `parse_virtual_host` ever saw and accepted the exact single-element
+    // `["*"]` array (the parser rejects every other `domains` value), the
+    // same evidence-bit shape as `hcm.type_url_span` and
+    // `hcm.generate_request_id_span` below.
     if (virtual_host.domains_span.start == 0u && virtual_host.domains_span.end == 0u)
         return invalid(virtual_host.span, lit_str("virtual host domains must be [\"*\"]"));
-    if (!route.match.prefix.eq(lit_str("/")))
-        return invalid(route.match.prefix_span, lit_str("route match prefix must be \"/\""));
     // PR #692 round-4 review: revalidate the router filter's identity here
     // too, not just `suppress_envoy_headers` on it — a forged `router.name`
     // or a cleared `has_typed_config` would otherwise still lower
@@ -478,7 +600,7 @@ FrontendResult<RutSource> lower_to_rut(const Bootstrap& model,
     };
 
     const SocketAddress& listen = model.listener.address;
-    const SocketAddress& upstream = model.cluster.endpoint.address;
+    const SocketAddress& upstream = model.clusters[0].endpoint.address;
 
     if (!writer.put_cstr("listen ")) return fail_overflow();
     if (listen.ipv4_host == 0u) {
