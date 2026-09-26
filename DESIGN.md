@@ -1986,14 +1986,16 @@ edge-request-only removals are unreachable under that fixed shape and pass
 through unchanged); a `Connection` nomination of `te` is exempt from the
 generic nomination drop -- the `te`/`trailers` handling above decides its
 fate instead, matching Envoy's own `sanitizeConnectionHeader` special case;
-and appends `x-forwarded-proto: http` as the last header only when the
-client did not already send one whose trimmed value is a syntactically
-valid scheme (case-insensitively exactly `http` or `https`, matching
-Envoy's own `Utility::schemeIsValid`; an empty, OWS-only, or otherwise
-invalid client-supplied field, such as `http,https`, is dropped and treated
-as absent, not forwarded as a blank or malformed scheme; a valid
-client-supplied value is kept unchanged, in its original position, without
-case normalization). It is closed to ordinary
+and ensures a single `x-forwarded-proto` field is always present: a valid
+client-supplied value (trimmed, case-insensitively exactly `http` or
+`https`, matching Envoy's own `Utility::schemeIsValid`) is kept unchanged,
+in its original position, without case normalization; an empty, OWS-only,
+or otherwise invalid client-supplied field, such as `http,https`, is
+overwritten in place, at that same original position, with
+`x-forwarded-proto: http` rather than dropped and forwarded as a blank or
+malformed scheme; and `x-forwarded-proto: http` is appended as the last
+header only when the client sent no `x-forwarded-proto` field at all. It is
+closed to ordinary
 zero-copy-shaped forwards: a request with a body paired with a client
 `Expect` header, or with `Transfer-Encoding`, fails closed rather than
 proxying with ambiguous framing (no `100 Continue` interim-response support
