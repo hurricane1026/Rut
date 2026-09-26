@@ -23,7 +23,17 @@ jobs:
       github.event_name == 'workflow_dispatch' ||
       (github.event_name == 'push' && github.ref == 'refs/heads/main')
     runs-on: ubuntu-24.04
-    timeout-minutes: 30
+    # Worst-case sum of the per-step budgets below plus the other steps'
+    # typical durations from a recent green run (run 36120970853, main,
+    # 2026-09-25): topology direct 300s + topology ctest 300s + broker
+    # direct 360s + broker ctest 360s + differential direct 360s +
+    # differential ctest 360s = 2040s (34m) of test budget, plus checkout
+    # 20s + install deps 23s + preflight 1s + image provisioning 4s +
+    # configure 6s + build 319s + audit/upload/setup/complete ~5s = 378s
+    # (~6.3m) of surrounding steps = 2418s (~40.3m) worst case. Raise to
+    # 45m so the job deadline cannot fire before the per-test budgets are
+    # exhausted.
+    timeout-minutes: 45
 
     steps:
       - name: Initialize logs
@@ -159,8 +169,13 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+          # CI triage (37 sampled runs): green CTest durations ranged
+          # 74.6-118.7s (median ~90s), and a direct (non-ctest) run of this
+          # same binary on this same runner passed at 114-161s just before
+          # each of the 5/37 timeouts hit at the old 180s budget here. Raise
+          # to 300s to match the ctest TIMEOUT in tests/CMakeLists.txt.
           RUT_NGINX_DIFFERENTIAL_REQUIRED=1 \
-            timeout --signal=TERM --kill-after=10s 180s \
+            timeout --signal=TERM --kill-after=10s 300s \
               ./build/tests/test_ipv4_fixture_topology 2>&1 | \
             tee "${RUNNER_TEMP}/issue358-stage2a3b-logs/topology-direct.log"
 
@@ -168,9 +183,11 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+          # Same 300s budget as the direct run above; see comment there for
+          # the measured timing distribution behind this number.
           RUT_NGINX_DIFFERENTIAL_REQUIRED=1 \
             ctest --test-dir build --output-on-failure --no-tests=error \
-              -j 1 --timeout 180 -R '^test_ipv4_fixture_topology$' 2>&1 | \
+              -j 1 --timeout 300 -R '^test_ipv4_fixture_topology$' 2>&1 | \
             tee "${RUNNER_TEMP}/issue358-stage2a3b-logs/topology-ctest.log"
 
       - name: Run required broker fixture directly
