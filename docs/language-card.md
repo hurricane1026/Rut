@@ -403,21 +403,25 @@ return forward(users,
 // HEAD with either no Connection field (the HTTP/1.1 default-keepalive shape)
 // or exactly one `Connection: close`, one IPv4 upstream, strict success, and
 // connect-establishment failure. On a `host: "preserve"` (ID4) route only,
-// a `Connection` value made up solely of `close`/`te`/`upgrade` tokens (any
-// order, case-insensitive) is admitted too, classified by whether a `close`
-// token is present -- `Connection: close, TE` behaves like the plain
-// `Connection: close` shape, and `Connection: TE` alone behaves like no
-// `Connection` field at all -- since a `te` nomination never affects
-// persistence and ID4's own request-policy path already forwards it
-// (canonicalizing the paired `TE` field) regardless of this response-side
-// contract. An `upgrade` token is admitted only when no semantically
-// present (non-empty/OWS) `Upgrade` field exists anywhere on the request --
-// e.g. `Connection: close, upgrade` with an absent or empty/OWS-only
-// `Upgrade` header -- since that shape is not a genuine upgrade either;
-// ID4's own request-policy path already admits and strips it the same way.
-// A genuine upgrade (a nominated `upgrade` token together with a
-// semantically present `Upgrade` value) is never admitted by this contract.
-// While the broader failure rendezvous is not
+// this Connection grammar widens to the same nomination rule the ordinary
+// ID4 request-policy path already applies: every comma-separated,
+// case-insensitive token is admitted -- and, along with its own field,
+// dropped -- unless it names a protected header (`content-length`, `host`,
+// the three forwarded-provenance headers, or a pseudo-header-shaped token
+// starting with `:`, each of which fails the whole request closed instead)
+// or is a genuine upgrade (a nominated `upgrade` token together with a
+// semantically present, non-empty/OWS `Upgrade` field anywhere on the
+// request -- e.g. `Connection: close, upgrade` with an absent or
+// empty/OWS-only `Upgrade` header is not genuine and is admitted, both
+// fields then stripped). Persistence is decided by the `close` token alone,
+// independent of whatever else is nominated in the same value --
+// `Connection: close, X-Foo` behaves like the plain `Connection: close`
+// shape, and `Connection: X-Foo` alone (no `close`) behaves like no
+// `Connection` field at all -- since a nomination such as `te`, `X-Foo`, or
+// a genuine-upgrade-free `upgrade` never affects persistence and ID4's own
+// request-policy path already forwards the request correctly regardless of
+// this response-side contract (canonicalizing a paired `TE` field when
+// nominated, for example). While the broader failure rendezvous is not
 // part of this contract, timeout, malformed/incomplete/excess response, and
 // upload/send/recv failure close before emitting downstream bytes.
 // response_policy.connection: "keep_alive" requires a keep-alive downstream

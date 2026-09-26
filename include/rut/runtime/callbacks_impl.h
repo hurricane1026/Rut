@@ -5412,6 +5412,36 @@ inline bool request_policy_name_eq(const u8* p, u32 n, const char* q, u32 qn) {
     return true;
 }
 
+// ID4 (`host: "preserve"`) fails the whole request closed for a `Connection`
+// nomination of any of these names, rather than dropping the nominated
+// header like every other nomination: `content-length` also drives how many
+// body bytes the serializer copies onto the wire (dropping the header while
+// still forwarding the already-validated body would desync a persistent
+// upstream connection -- request smuggling); `host` is written
+// unconditionally before nominations are even consulted, and an upstream
+// request with no Host at all is invalid HTTP/1.1; the three forwarded-
+// provenance headers could let a client mask the request's real origin if
+// silently dropped; and a pseudo-header-shaped token (first byte `:`, e.g.
+// the aliased `:authority`) is bytes-only in an H1 `Connection` value but
+// still fails the same way, matching Envoy's own `sanitizeConnectionHeader`
+// (`source/common/http/utility.cc`) rejection of the identical shape. Every
+// other nomination -- including `te`, `close`, `keep-alive`, `upgrade`
+// (when not paired with a semantically present `Upgrade` value, which is a
+// separate genuine-upgrade check the two call sites below make themselves),
+// and an arbitrary name such as `x-foo` -- is safe to admit here: it is
+// either handled specially elsewhere (`te`) or simply dropped along with
+// its nominated field, matching Envoy's own sanitization. Shared by the
+// ordinary ID4 serializer's nomination loop and the paired-HEAD
+// `suppress_body` preflight's Connection-value token scan so the two paths
+// cannot silently drift apart (Codex round-17 review, PR #696).
+inline bool request_policy_connection_nomination_is_protected(const u8* p, u32 n) {
+    return (n != 0 && p[0] == ':') || request_policy_name_eq(p, n, "content-length", 14) ||
+           request_policy_name_eq(p, n, "host", 4) ||
+           request_policy_name_eq(p, n, "x-forwarded-for", 15) ||
+           request_policy_name_eq(p, n, "x-forwarded-host", 16) ||
+           request_policy_name_eq(p, n, "x-forwarded-proto", 17);
+}
+
 // Trim OWS (space/HTAB) from both ends of [start, end), matching the OWS
 // trimming already applied to header values throughout this file.
 inline void request_policy_trim_ows(const u8*& start, const u8*& end) {
@@ -6034,12 +6064,7 @@ inline bool apply_preserve_host_lowercase_request_policy(Connection& conn, u16 p
     //    because it never matches a real forwarded header name.
     // Refuse the whole rewrite instead of ever emitting one of these shapes.
     for (u32 i = 0; i < nominated_count; i++) {
-        if (nominated[i].len != 0 && nominated[i].ptr[0] == ':') return false;
-        if (request_policy_name_eq(nominated[i].ptr, nominated[i].len, "content-length", 14) ||
-            request_policy_name_eq(nominated[i].ptr, nominated[i].len, "host", 4) ||
-            request_policy_name_eq(nominated[i].ptr, nominated[i].len, "x-forwarded-for", 15) ||
-            request_policy_name_eq(nominated[i].ptr, nominated[i].len, "x-forwarded-host", 16) ||
-            request_policy_name_eq(nominated[i].ptr, nominated[i].len, "x-forwarded-proto", 17))
+        if (request_policy_connection_nomination_is_protected(nominated[i].ptr, nominated[i].len))
             return false;
     }
 
@@ -9544,12 +9569,14 @@ inline bool response_policy_suppress_head_admitted(const Connection& conn,
         return false;
     u32 host_count = 0;
     u32 connection_count = 0;
-    // Set only for ID4 when the single `Connection` header's comma-
-    // separated, OWS-trimmed tokens are all case-insensitively `close`
-    // and/or `te`, and at least one of them is `close`. See the shape
-    // classification at the end of this function for why this -- rather
-    // than the connection-count-0/exact-"close" cache fields alone --
-    // decides ID4 admission when `te` is nominated.
+    // Set only for ID4 when the single `Connection` header carries a
+    // case-insensitive `close` token among its comma-separated,
+    // OWS-trimmed tokens (each of which -- other than a genuine `upgrade`
+    // nomination or a protected name -- is otherwise freely admitted; see
+    // the token scan below). See the shape classification at the end of
+    // this function for why this -- rather than the connection-count-0/
+    // exact-"close" cache fields alone -- decides ID4 admission whenever
+    // any non-persistence-affecting token is also nominated.
     bool connection_close_token_seen = false;
     // Set when a client `Expect` field's value is semantically present
     // (non-empty after OWS trimming -- `header.value` is already OWS-
@@ -9567,34 +9594,30 @@ inline bool response_policy_suppress_head_admitted(const Connection& conn,
             if (++connection_count > 1) return false;
             if (id4_route) {
                 // ID4's ordinary serializer path
-                // (`apply_preserve_host_lowercase_request_policy`)
-                // explicitly excludes a Connection-nominated `te` token
-                // from its generic drop-and-fail-closed nomination set --
-                // matching Envoy's own `sanitizeConnectionHeader`, which
-                // inspects the nominated `te` token's sibling `TE` header
-                // instead of blindly stripping it -- because nominating
-                // `te` has no effect on connection persistence at all
-                // (RFC 7230's persistence/upgrade-relevant Connection
-                // tokens are `close`/`keep-alive`/`upgrade`; `te` is not
-                // one of them). This preflight must therefore not reject a
-                // `Connection` value whose tokens are all case-
-                // insensitively `close` and/or `te` merely because it is
-                // not the single literal token `close` -- the shape
-                // classification below independently verifies persistence
-                // is unaffected either way. An `upgrade` token is likewise
-                // admitted, but only when `req.has_upgrade_header` is false
-                // -- i.e. no semantically present `Upgrade` field exists
-                // anywhere on this request (the top-of-body check above
-                // already fails closed on the genuine-upgrade combination
-                // of a nominated `upgrade` token with a non-empty `Upgrade`
-                // value) -- because the ordinary ID4 inspector
-                // (`inspect_request_policy_body`) admits exactly this
-                // `Connection: close, upgrade` + empty/OWS-only/absent
-                // `Upgrade` shape and the serializer strips both fields
-                // (the nomination generically, the fixed-list `Upgrade`
-                // entry via `drop_fixed`), so no upgrade ever occurs. Any
-                // other token still fails closed, exactly as before (Codex
-                // round-13/round-15 review, PR #696).
+                // (`apply_preserve_host_lowercase_request_policy`) admits
+                // and drops an arbitrary Connection-nominated header --
+                // failing the whole request closed only for the protected
+                // names `request_policy_connection_nomination_is_protected`
+                // checks (content-length/host/the three forwarded-
+                // provenance headers/a pseudo-header-shaped token) -- and
+                // never rejects a nomination merely for being outside a
+                // small allowlist (Codex round-17 review, PR #696: a
+                // `Connection: X-Foo` + `X-Foo: 1` request is safely
+                // admitted and both fields dropped by that ordinary path,
+                // exactly like Envoy's own `sanitizeConnectionHeader`, so
+                // this preflight must not 400 it either). This scanner
+                // shares that same classifier rather than maintaining a
+                // second, narrower allowlist. A genuine upgrade -- a
+                // nominated `upgrade` token together with a semantically
+                // present `Upgrade` value (`req.has_upgrade_header`) --
+                // still fails closed here explicitly (the top-of-body check
+                // above already covers it too); every other token,
+                // including `te`, `close`, `keep-alive`, and an
+                // otherwise-arbitrary name, is admitted. Persistence is
+                // decided by the `close` token alone (`connection_close_
+                // token_seen` below), independent of what else is
+                // nominated in the same value, matching the shape
+                // classification at the end of this function.
                 const char* value_start = header.value.ptr;
                 const char* value_end = value_start + header.value.len;
                 const char* tok = value_start;
@@ -9608,11 +9631,13 @@ inline bool response_policy_suppress_head_admitted(const Connection& conn,
                     if (t1 > t0) {
                         const u32 tok_len = static_cast<u32>(t1 - t0);
                         const bool is_close = http_header_name_eq_ci(t0, tok_len, "close", 5);
-                        const bool is_te = http_header_name_eq_ci(t0, tok_len, "te", 2);
-                        const bool is_safe_upgrade =
-                            !req.has_upgrade_header &&
+                        const bool is_genuine_upgrade_nomination =
+                            req.has_upgrade_header &&
                             http_header_name_eq_ci(t0, tok_len, "upgrade", 7);
-                        if (!is_close && !is_te && !is_safe_upgrade) return false;
+                        if (is_genuine_upgrade_nomination ||
+                            request_policy_connection_nomination_is_protected(
+                                reinterpret_cast<const u8*>(t0), tok_len))
+                            return false;
                         connection_close_token_seen |= is_close;
                     }
                     if (tok_end >= value_end) break;
@@ -9733,20 +9758,24 @@ inline bool response_policy_suppress_head_admitted(const Connection& conn,
     const bool default_keep_alive_shape =
         paired_failure && conn.req_client_keep_alive && !conn.req_client_connection_close &&
         !conn.req_client_connection_close_exact && conn.req_client_connection_count == 0;
-    // ID4 only: a `Connection` value validated above as `close`/`te` tokens
-    // only (`connection_close_token_seen` set iff a `close` token is among
-    // them) is classified by persistence, not by exact byte match against
-    // the literal `close`, since `te` never affects persistence. A `close`
-    // token present means the connection closes exactly like the plain
-    // `Connection: close` shape (`conn.req_client_connection_close_exact`
-    // is false here for e.g. `close, te`, which is why this is a separate
-    // term rather than folded into `explicit_close_shape`); its absence
-    // means this is an ordinary default-persistent request that merely also
-    // nominates `te`, gated the same way `default_keep_alive_shape` is
-    // (paired-failure evaluation only, per the response-only-suppression
-    // contract above) since a bare `Connection: te` is otherwise identical
-    // to sending no `Connection` header at all (Codex round-13 review, PR
-    // #696).
+    // ID4 only: a `Connection` value validated above (every token either a
+    // protected name -- fail closed -- or a safely nominated/persistence
+    // token -- admitted; `connection_close_token_seen` set iff a `close`
+    // token is among them) is classified by persistence, not by exact byte
+    // match against the literal `close`, since none of the admitted
+    // non-`close` tokens (`te`, `keep-alive`, a genuine-upgrade-free
+    // `upgrade`, or an arbitrary nominated name) affect persistence. A
+    // `close` token present means the connection closes exactly like the
+    // plain `Connection: close` shape (`conn.req_client_connection_close_
+    // exact` is false here for e.g. `close, te` or `close, x-foo`, which is
+    // why this is a separate term rather than folded into
+    // `explicit_close_shape`); its absence means this is an ordinary
+    // default-persistent request that merely also carries one or more
+    // harmless nominations, gated the same way `default_keep_alive_shape`
+    // is (paired-failure evaluation only, per the response-only-suppression
+    // contract above) since such a `Connection` value is otherwise
+    // identical, for persistence purposes, to sending no `Connection`
+    // header at all (Codex round-13/round-17 review, PR #696).
     const bool id4_close_with_te_shape = id4_route && !conn.req_client_keep_alive &&
                                          conn.req_client_connection_close &&
                                          connection_count == 1 && connection_close_token_seen;
