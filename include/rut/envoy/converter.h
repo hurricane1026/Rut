@@ -58,8 +58,8 @@ FrontendResult<RutSource> lower_to_rut(const Bootstrap& model, const RutCapabili
 // type (or a listener-protocol capability, if one is ever added) has
 // somewhere to change the answer, and so tests can assert the condition
 // without needing the shipped `RutCapabilities` (`request_envoy_h1 = true`
-// as of PR3; `response_envoy_h1`/`local_reply_envoy_h1` still false) to be
-// true.
+// as of PR3 and `response_envoy_h1 = true` as of PR4; `local_reply_envoy_h1`
+// still false) to be true.
 //
 // This is deliberately NOT a `RutCapabilities` gate: Rut's cleartext `listen`
 // has no knob to disable h2c-preface detection at all
