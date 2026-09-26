@@ -11240,9 +11240,22 @@ inline bool stage_redirect_response(Connection& conn, const RouteConfig& config,
 //     the upstream value in place rather than rejecting a duplicate, so it is
 //     deliberately deduplicated first-wins by the dedicated `is_server`
 //     branch below instead of failing closed here.
-//   - `connection`: counted and rejected on duplicate by its own counter in
-//     the loop below, kept separate because that same loop also consults it
-//     for close/upgrade handling unrelated to this table.
+//   - `connection`: not counted at all (Codex round-16 review of #698,
+//     correcting a round-15-era gap): every occurrence is unconditionally
+//     dropped by the same fixed hop-by-hop set the second loop below always
+//     applies, so a duplicate can never reach the wire and must not fail the
+//     response closed, exactly like the `keep-alive`/`upgrade`/
+//     `proxy-connection` exemptions below. This table still excludes it
+//     because it needs no per-name exemption logic at all -- unlike those
+//     three, which stay in the table for other reasons (Envoy registers them
+//     as inline slots) and need the duplicate check skipped explicitly,
+//     `connection` was never in this table to begin with. The response's own
+//     persistence decision (`resp.keep_alive` / `resp.connection_close`,
+//     consulted by `on_upstream_response` for upstream pooling) is computed
+//     once by the parser from every physical `Connection` field with `close`
+//     sticky (`match_connection_response`, src/runtime/http_parser.cc), so it
+//     is already correct regardless of how many occurrences there are or
+//     what order they arrive in -- nothing here needs to re-derive it.
 //   - `transfer-encoding`: any occurrence at all (not just a duplicate) is
 //     already rejected in the loop below, matching Envoy's protocol-error
 //     handling for a non-"chunked" coding -- strictly stronger than a
@@ -11331,7 +11344,6 @@ inline bool build_upstream_order_response_headers(
         const u8 c = static_cast<u8>(resp.reason.ptr[i]);
         if ((c < 0x20 && c != '\t') || c == 0x7f) return false;
     }
-    u32 connection_count = 0;
     // See the comment on `kEnvoyInlineResponseHeaders` above: Envoy stores
     // every name in that table as a single-valued "inline" header slot and
     // coalesces a duplicate into the existing entry (comma-joined) rather than
@@ -11352,10 +11364,24 @@ inline bool build_upstream_order_response_headers(
     // `is_server`/`is_content_length`-free skip predicate (none of the
     // remaining table entries is `server` or `content-length`, so neither
     // carve-out applies here).
+    //
+    // Codex round-16 review (PR #698): `connection` needs the exact same
+    // treatment even though it is not in `kEnvoyInlineResponseHeaders` --
+    // every occurrence is unconditionally dropped by the second loop's fixed
+    // hop-by-hop set below, so a duplicate can never reach the wire either
+    // and a dedicated `connection_count` fail-closed check here served no
+    // purpose. Removed rather than folded into `always_dropped`: `connection`
+    // was never counted through the table loop, so there is nothing to
+    // exempt it from. The response's persistence decision does not depend on
+    // this loop at all -- `resp.keep_alive`/`resp.connection_close` are
+    // computed once by the parser across every physical `Connection` field
+    // with `close` sticky (`match_connection_response`,
+    // src/runtime/http_parser.cc), so `on_upstream_response`'s upstream
+    // pooling decision already honors a `close` token regardless of how many
+    // `Connection` fields carried it.
     u32 inline_header_counts[kEnvoyInlineResponseHeaderCount] = {};
     for (u32 i = 0; i < resp.header_count; i++) {
         const Str name = resp.headers[i].name;
-        if (response_policy_name_eq(name, "connection", 10) && ++connection_count > 1) return false;
         for (u32 t = 0; t < kEnvoyInlineResponseHeaderCount; t++) {
             const Str inline_name = kEnvoyInlineResponseHeaders[t];
             if (name.len != inline_name.len ||
