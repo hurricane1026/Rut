@@ -422,16 +422,57 @@ TEST(envoy_convert, cli_input_errors) {
 // state the file itself holds across the whole read window is converted as
 // that content (and here fails closed on validation).
 
-std::string cli_error_for(const std::string& path, const std::string& contents) {
+// What the CLI prints for a clean, stable read of `contents` at `path`,
+// derived from the library with the capabilities this binary ships
+// (`lower_to_rut(model)` uses `kShippedRutCapabilities`), so the same test is
+// correct on a branch where milestone-S is still BLOCKED_BY_RUT and on one
+// where it converts. Mirrors `main()` in src/envoy/main.cc: a parse or
+// lowering error is one located diagnostic on stderr with exit 1; success is
+// the lowered RUT on stdout, then the connect_timeout warning and (when
+// `needs_h2c_preface_warning`) `kH2cPrefaceWarningText` on stderr, exit 0.
+struct CliOutcome {
+    bool parsed = false;
+    int exit_code = 1;
+    std::string out;
+    std::string err;
+};
+
+CliOutcome expected_cli_outcome(const std::string& path, const std::string& contents) {
     static envoy::JsonDocument doc;
+    CliOutcome outcome;
     auto parsed = envoy::parse_bootstrap_json(str(contents), doc);
-    if (!parsed)
-        return expected_location(path, parsed.error().span) + to_string(parsed.error().detail) +
-               "\n";
+    if (!parsed) {
+        outcome.err =
+            expected_location(path, parsed.error().span) + to_string(parsed.error().detail) + "\n";
+        return outcome;
+    }
+    outcome.parsed = true;
     auto lowered = envoy::lower_to_rut(parsed.value());
-    if (lowered) return std::string();
-    return expected_location(path, lowered.error().span) + to_string(lowered.error().detail) + "\n";
+    if (!lowered) {
+        outcome.err = expected_location(path, lowered.error().span) +
+                      to_string(lowered.error().detail) + "\n";
+        return outcome;
+    }
+    outcome.exit_code = 0;
+    outcome.out = to_string(lowered.value().view());
+    outcome.err = "warning: connect_timeout \"" +
+                  to_string(parsed.value().cluster.connect_timeout.text) +
+                  "\" has no Rut runtime equivalent (no per-upstream connect-establishment "
+                  "timeout surface); the value is accepted but not enforced\n";
+    if (envoy::needs_h2c_preface_warning(parsed.value()))
+        outcome.err += envoy::kH2cPrefaceWarningText;
+    return outcome;
 }
+
+// A macro, not a function: the CHECK/REQUIRE macros need the enclosing
+// TEST's context.
+#define CHECK_CLI_OUTCOME(result, expected)                           \
+    do {                                                              \
+        REQUIRE(WIFEXITED((result).status));                          \
+        CHECK_EQ(WEXITSTATUS((result).status), (expected).exit_code); \
+        CHECK_EQ((result).out, (expected).out);                       \
+        CHECK_EQ((result).err, (expected).err);                       \
+    } while (0)
 
 struct RaceFixture {
     std::string content_a;
@@ -459,8 +500,9 @@ RaceFixture make_race_fixture() {
 
 // A torn file that stays torn for the whole read is read faithfully: the
 // converter reports what those bytes mean, which for this mixture is the
-// mismatched-cluster validation error — never the clean BLOCKED_BY_RUT
-// result and never a successful lowering.
+// mismatched-cluster error from `parse_bootstrap_json` itself — raised before
+// lowering, so it holds whatever capabilities the binary ships and is never
+// the clean outcome (a BLOCKED_BY_RUT diagnostic or a successful lowering).
 TEST(envoy_convert, cli_input_static_torn_content_is_converted_as_is) {
     const TempDir temp_dir;
     REQUIRE(temp_dir.ok());
@@ -470,14 +512,12 @@ TEST(envoy_convert, cli_input_static_torn_content_is_converted_as_is) {
     REQUIRE_EQ(fixture.torn.size(), fixture.content_a.size());
     REQUIRE(write_file(path, fixture.torn));
 
-    const std::string expected = cli_error_for(path, fixture.torn);
-    REQUIRE_FALSE(expected.empty());
-    CHECK(expected.find("route cluster does not name a declared cluster") != std::string::npos);
+    const CliOutcome expected = expected_cli_outcome(path, fixture.torn);
+    REQUIRE_FALSE(expected.parsed);
+    REQUIRE_EQ(expected.exit_code, 1);
+    CHECK(expected.err.find("route cluster does not name a declared cluster") != std::string::npos);
     const RunResult result = run_converter(g_executable, path);
-    REQUIRE(WIFEXITED(result.status));
-    CHECK_EQ(WEXITSTATUS(result.status), 1);
-    CHECK(result.out.empty());
-    CHECK_EQ(result.err, expected);
+    CHECK_CLI_OUTCOME(result, expected);
 }
 
 #if defined(__linux__)
@@ -683,16 +723,20 @@ TEST(envoy_convert, cli_input_rewrite_during_read_is_detected) {
     REQUIRE_EQ(fixture.content_a.size(), fixture.content_b.size());
     REQUIRE_NE(fixture.content_a, fixture.content_b);
 
-    const std::string blocked = cli_error_for(path, fixture.content_a);
-    REQUIRE(blocked.find("BLOCKED_BY_RUT") != std::string::npos);
-    REQUIRE_EQ(blocked, cli_error_for(path, fixture.content_b));
-    const std::string changed = path + ":1:1: input changed while it was being read\n";
+    // The clean outcome of a stable read of content_a: BLOCKED_BY_RUT while
+    // `kShippedRutCapabilities` lacks a milestone capability, a successful
+    // conversion once it has them all (see `expected_cli_outcome`).
+    const CliOutcome clean_a = expected_cli_outcome(path, fixture.content_a);
+    REQUIRE(clean_a.parsed);
+    REQUIRE(clean_a.exit_code == 0 || clean_a.err.find("BLOCKED_BY_RUT") != std::string::npos);
+    CliOutcome changed;
+    changed.err = path + ":1:1: input changed while it was being read\n";
 
     struct Case {
         const char* name;
         std::vector<Rewrite> rewrites;
         size_t min_rewrites;
-        const std::string* expected_err;
+        const CliOutcome* expected;
     };
     const Case cases[] = {
         // A writer mid-rewrite while read 1 runs (read 1 sees the torn
@@ -720,24 +764,21 @@ TEST(envoy_convert, cli_input_rewrite_during_read_is_detected) {
         {"rewrite after the second read",
          {{ReadPoint::InputClose, &fixture.content_b}},
          1u,
-         &blocked},
+         &clean_a},
     };
     for (int iteration = 0; iteration < 5; iteration++) {
         for (const Case& c : cases) {
             REQUIRE(write_file(path, fixture.content_a));
             const TracedRun traced = run_converter_with_rewrites(g_executable, path, c.rewrites);
-            if (traced.run.err != *c.expected_err)
+            if (traced.run.err != c.expected->err)
                 fprintf(stderr,
                         "case '%s' (iteration %d, %zu rewrite(s) done): unexpected stderr: %s\n",
                         c.name,
                         iteration,
                         traced.rewrites_done,
                         traced.run.err.c_str());
-            REQUIRE(WIFEXITED(traced.run.status));
-            CHECK_EQ(WEXITSTATUS(traced.run.status), 1);
-            CHECK(traced.run.out.empty());
             CHECK(traced.rewrites_done >= c.min_rewrites);
-            CHECK_EQ(traced.run.err, *c.expected_err);
+            CHECK_CLI_OUTCOME(traced.run, *c.expected);
         }
     }
 }
