@@ -215,6 +215,24 @@ int missing_prerequisite(const std::string& message) {
     return (required != nullptr && std::string(required) == "1") ? 1 : 77;
 }
 
+// Removes whatever transcript a previous run left at `path`, before this
+// run's own prerequisite checks or validation get a chance to fail (round-19
+// review, "Remove stale transcript artifacts before validation"): both
+// write_transcript() and write_pair_transcript() already refuse to overwrite
+// their destination with ambiguous evidence, which is correct, but that same
+// early return previously left an OLD transcript from a prior, unrelated run
+// sitting at that path. Since CI uploads this path with `if: always()`, a
+// failed run in a reused workspace could publish a stale success transcript
+// as though it belonged to the current failure. Best-effort: a missing file
+// is not an error, and a failure to remove one is logged but never fatal --
+// this is cleanup, not the reason a run should pass or fail.
+void remove_stale_transcript(const std::string& path) {
+    if (unlink(path.c_str()) != 0 && errno != ENOENT) {
+        std::cerr << "WARN: could not remove stale transcript at " << path << ": "
+                  << strerror(errno) << "\n";
+    }
+}
+
 // Checks the three prerequisites named in envoy-pr-plan.md PR 2: docker on
 // PATH, `docker info` succeeding within 10s, and the pinned image already
 // present locally (`docker image inspect`, never a pull). Returns empty on
@@ -959,11 +977,12 @@ public:
         requests_by_path_.clear();
     }
 
-    // Waits until no connection this upstream has ever accepted is still
-    // being handled -- `active_fds_` empty, i.e. every accepted connection
-    // has been fully read, parsed, recorded, and closed -- or `timeout_ms`
-    // elapses, whichever comes first. Returns whether it actually went idle
-    // (false on timeout).
+    // Waits until this upstream is fully idle -- no connection already
+    // queued on the listening socket waiting to be accept()ed, AND no
+    // accepted connection still being handled (`active_fds_` empty, i.e.
+    // every one has been fully read, parsed, recorded, and closed) -- or
+    // `timeout_ms` elapses, whichever comes first. Returns whether it
+    // actually went idle (false on timeout).
     //
     // Round-18 review, "Wait for upstream handlers before inspecting
     // asserted traffic": stopping the PROXY only guarantees ITS OWN process
@@ -976,15 +995,36 @@ public:
     // requests_for()/all_requests() -- otherwise a genuinely last-second
     // request is either missed by the snapshot entirely or, worse, still
     // gets recorded but only after the following clear_requests() has
-    // already run, bleeding into the next batch's evidence instead. Once
-    // the proxy process itself is confirmed fully exited (reaped), every
-    // TCP connection it held to this upstream is torn down at the kernel
-    // level almost immediately, so this is expected to return promptly;
-    // the bounded timeout is a safety net, not the expected path.
+    // already run, bleeding into the next batch's evidence instead.
+    //
+    // Round-19 review, "Synchronize the accept queue before declaring the
+    // upstream idle" (P1): checking `active_fds_` alone is not enough --
+    // the proxy's final connection can already be fully queued in the
+    // listening socket's kernel accept backlog (the TCP handshake itself
+    // does not require accept_loop() to have run at all) without
+    // accept_loop() having called accept() on it yet, in which case it was
+    // never added to `active_fds_` and the old check above returned "idle"
+    // immediately despite that connection's request not being recorded at
+    // all yet. poll()ing the listening fd for readability tells whether a
+    // connection is waiting to be accepted (POSIX: a listening socket is
+    // "ready to read" exactly when accept() would not block), so this now
+    // requires that to be false as well, on every iteration, before
+    // treating `active_fds_.empty()` as proof of idleness. Once the proxy
+    // process itself is confirmed fully exited (reaped), every TCP
+    // connection it held to this upstream -- including one still in the
+    // 3-way handshake at that instant -- resolves at the kernel level
+    // almost immediately, so this is expected to return promptly; the
+    // bounded timeout is a safety net, not the expected path.
     bool wait_idle(int timeout_ms) {
         const int64_t deadline = now_ms() + timeout_ms;
         for (;;) {
-            {
+            bool pending_on_listener = false;
+            const int fd = listen_fd_;
+            if (fd >= 0) {
+                pollfd pfd{fd, POLLIN, 0};
+                if (poll(&pfd, 1, 0) > 0 && (pfd.revents & POLLIN) != 0) pending_on_listener = true;
+            }
+            if (!pending_on_listener) {
                 std::lock_guard<std::mutex> lock(conn_mu_);
                 if (active_fds_.empty()) return true;
             }
@@ -1607,16 +1647,29 @@ int count_listeners_on_port(const std::string& tcp_table, uint16_t port, uid_t u
 // Live counterpart: sums count_listeners_on_port() over the real
 // /proc/net/tcp and /proc/net/tcp6 tables (a dual-stack socket appears in
 // exactly one of the two, never both, so this never double-counts a single
-// listener), restricted to this process's own uid. Either table being
-// missing or unreadable (no /proc, a restrictive sandbox) contributes 0
-// rather than failing outright -- every caller only ever treats a count
-// ABOVE the one listener it expects as a signal, so undercounting here can
-// only make the check silently pass, never falsely trigger a retry.
-int count_listeners_on_port(uint16_t port) {
-    const uid_t uid = getuid();
+// listener), restricted to `uid`. Either table being missing or unreadable
+// (no /proc, a restrictive sandbox) contributes 0 rather than failing
+// outright -- every caller only ever treats a count ABOVE the one listener
+// it expects as a signal, so undercounting here can only make the check
+// silently pass, never falsely trigger a retry.
+//
+// Round-19 review, "Count Envoy listeners using the container's UID": `uid`
+// is the uid of the process a caller is actually checking for, NOT
+// necessarily this harness's own getuid() -- EnvoyInstance::launch() runs
+// the Envoy container with `ENVOY_UID=0` regardless of which uid this
+// harness itself runs as (`--network host` means the container's listener
+// is directly visible in the HOST's /proc/net/tcp[6], attributed to uid 0),
+// so a caller checking an Envoy listener must pass `kEnvoyContainerUid`
+// (below), while one checking a `rut` listener (a plain host process, not a
+// container) passes `getuid()`.
+int count_listeners_on_port(uint16_t port, uid_t uid) {
     return count_listeners_on_port(read_file_contents("/proc/net/tcp"), port, uid) +
            count_listeners_on_port(read_file_contents("/proc/net/tcp6"), port, uid);
 }
+
+// The uid EnvoyInstance::launch() always runs the container as, regardless
+// of this harness process's own uid (see the comment above).
+constexpr uid_t kEnvoyContainerUid = 0;
 
 // Polls `port` until a TCP connect succeeds, failing early (without waiting
 // out `timeout_ms`) if `proc`'s child has already exited -- shared by the
@@ -1733,8 +1786,12 @@ bool wait_ready_and_confirm_ownership(uint16_t port,
             // second, real listener sharing this exact port -- see
             // count_listeners_on_port()'s comment. Exactly one LISTEN row
             // for `port` is the healthy case (this launch's own listener);
-            // more than one means a co-owner exists right now.
-            if (count_listeners_on_port(port) > 1) {
+            // more than one means a co-owner exists right now. Checked
+            // against `kEnvoyContainerUid`, not this harness's own uid
+            // (round-19 review, "Count Envoy listeners using the
+            // container's UID"): EnvoyInstance::launch() always runs the
+            // container as uid 0.
+            if (count_listeners_on_port(port, kEnvoyContainerUid) > 1) {
                 if (reuseport_collision != nullptr) *reuseport_collision = true;
                 *error = "more than one LISTEN socket is bound to port " + std::to_string(port) +
                          " (a concurrent process shares it, e.g. via SO_REUSEPORT); a different "
@@ -2644,9 +2701,12 @@ bool fill_upstream_bytes(std::vector<CaseResult>* results,
 // the batch's own duration would not be. This is NOT a complete fix for
 // exclusivity over the whole phase; that needs a way to disable
 // SO_REUSEPORT for single-shard harness runs, tracked separately, outside
-// this PR. Returns empty on success, else a human-readable reason.
-std::string check_no_reuseport_collision_after_batch(uint16_t port) {
-    const int count = count_listeners_on_port(port);
+// this PR. `uid` is the uid of the process being checked -- pass
+// `kEnvoyContainerUid` for an Envoy phase, `getuid()` for a RUT phase
+// (round-19 review, "Count Envoy listeners using the container's UID").
+// Returns empty on success, else a human-readable reason.
+std::string check_no_reuseport_collision_after_batch(uint16_t port, uid_t uid) {
+    const int count = count_listeners_on_port(port, uid);
     if (count > 1) {
         return "more than one LISTEN socket is bound to port " + std::to_string(port) +
                " after the case batch completed (" + std::to_string(count) +
@@ -2662,8 +2722,20 @@ std::string check_no_reuseport_collision_after_batch(uint16_t port) {
 // more than one (round-3 review, "Reject partial exchanges before writing
 // the oracle transcript"). Returns empty on success, else a human-readable
 // reason.
+//
+// Record-only rows are exempt (round-19 review, "Exempt oracle record-only
+// rows from fatal validation"), mirroring validate_pair_results()'s
+// asserted-aware exemption: --oracle-milestone-s's isolated record-only
+// Envoy instance already funnels a crash, incomplete exchange, or duplicate
+// upstream contact into a non-fatal NOTE (see the record-only phase's
+// `upstream_ambiguous` handling), but this function used to apply the same
+// strict rule to every row regardless of `is_asserted_case()`, so that NOTE
+// still made write_transcript() refuse the whole run. Only asserted rows'
+// bytes gate the oracle CLI's exit code, so only they need the strict
+// "never record ambiguous evidence" rule below.
 std::string validate_results(const std::vector<CaseResult>& results) {
     for (const auto& r : results) {
+        if (!is_asserted_case(r.name)) continue;
         if (!r.exchange_complete) {
             return "case \"" + r.name + "\": downstream exchange did not complete (" +
                    describe_incomplete_exchange(r) + "); refusing to record it as evidence";
@@ -3370,7 +3442,10 @@ bool wait_ready_and_confirm_ownership(uint16_t port,
     // sharing this exact port passes the probe above identically -- see
     // count_listeners_on_port()'s comment. Exactly one LISTEN row for
     // `port` is the healthy case; more than one means a co-owner exists.
-    if (count_listeners_on_port(port) > 1) {
+    // Checked against this harness's own getuid(): unlike Envoy, `rut` is a
+    // plain host process, not a container running under a fixed uid
+    // (round-19 review, "Count Envoy listeners using the container's UID").
+    if (count_listeners_on_port(port, getuid()) > 1) {
         if (reuseport_collision != nullptr) *reuseport_collision = true;
         *error = "more than one LISTEN socket is bound to port " + std::to_string(port) +
                  " (a concurrent rut process shares it via SO_REUSEPORT); a different process "
@@ -3481,6 +3556,7 @@ void note_record_only_phase_crash(const char* proxy_label,
 }
 
 int run_oracle_milestone_s(const std::string& output_path) {
+    remove_stale_transcript(output_path);
     const std::string missing = check_docker_prerequisites();
     if (!missing.empty()) return missing_prerequisite(missing);
 
@@ -3613,7 +3689,7 @@ int run_oracle_milestone_s(const std::string& output_path) {
         // after_batch()'s comment for why the readiness-time check alone
         // isn't enough.
         const std::string asserted_reuseport_error =
-            check_no_reuseport_collision_after_batch(listen_port1);
+            check_no_reuseport_collision_after_batch(listen_port1, kEnvoyContainerUid);
         if (!asserted_reuseport_error.empty()) {
             std::cerr << "FAIL: " << asserted_reuseport_error << "\n";
             envoy_asserted.stop();
@@ -3662,7 +3738,7 @@ int run_oracle_milestone_s(const std::string& output_path) {
         // the record-only batch must not gate acceptance, only note the
         // ambiguity (round-9/round-12/round-18 review).
         const std::string record_only_reuseport_error =
-            check_no_reuseport_collision_after_batch(listen_port1);
+            check_no_reuseport_collision_after_batch(listen_port1, kEnvoyContainerUid);
         if (!record_only_reuseport_error.empty()) {
             std::cerr << "NOTE: " << record_only_reuseport_error << "\n";
             for (auto& r : record_only_results) r.upstream_ambiguous = true;
@@ -3674,7 +3750,15 @@ int run_oracle_milestone_s(const std::string& output_path) {
         }
         upstream.wait_idle(2000);
         fill_upstream_bytes(&record_only_results, record_only_cases, upstream);
-        if (!wait_port_closed(listen_port1, 5000)) {
+        // Round-19 review, "Keep record-only co-owners from failing pair
+        // mode": a persistent SO_REUSEPORT co-owner (already classified as
+        // a non-fatal NOTE above) necessarily keeps `listen_port1`
+        // connectable even after this instance stops, so waiting for it to
+        // close would time out and turn that NOTE into a fatal failure
+        // anyway. Nothing else in oracle mode reuses `listen_port1`
+        // afterward, so skip the wait entirely rather than needing a fresh
+        // port.
+        if (record_only_reuseport_error.empty() && !wait_port_closed(listen_port1, 5000)) {
             std::cerr << "FAIL: listener port " << listen_port1
                       << " did not become free after stopping the record-only-batch Envoy "
                          "instance\n";
@@ -3721,6 +3805,19 @@ int run_oracle_milestone_s(const std::string& output_path) {
                                      // override after the call, not before.
         r.upstream_contacted = false;
         results.push_back(std::move(r));
+        // Round-19 review, "Recheck listener ownership after the
+        // connect-failure case": `connect_failure` is asserted (see
+        // kAssertedCaseNames), so a co-owner that joined `listen_port2`'s
+        // SO_REUSEPORT group during this exchange -- and could have answered
+        // it instead of the Envoy instance under test -- must fail this run
+        // exactly like every run-1 asserted batch's post-batch check does.
+        const std::string run2_reuseport_error =
+            check_no_reuseport_collision_after_batch(listen_port2, kEnvoyContainerUid);
+        if (!run2_reuseport_error.empty()) {
+            std::cerr << "FAIL: " << run2_reuseport_error << "\n";
+            envoy.stop();
+            return 1;
+        }
         if (!envoy.stop()) {
             std::cerr << "FAIL: envoy exited unexpectedly before teardown ("
                       << envoy.unexpected_exit_description << ")\n";
@@ -3823,6 +3920,7 @@ bool compare_pair_case(const PairCaseResult& c) {
 int run_pair_milestone_s(const std::string& rut_binary,
                          const std::string& converter_binary,
                          const std::string& transcript_path) {
+    remove_stale_transcript(transcript_path);
     const std::string missing = check_docker_prerequisites();
     if (!missing.empty()) return missing_prerequisite(missing);
 
@@ -3952,7 +4050,7 @@ int run_pair_milestone_s(const std::string& rut_binary,
         // phase": re-check listener ownership right after the batch, before
         // this instance is stopped.
         const std::string envoy_asserted_reuseport_error =
-            check_no_reuseport_collision_after_batch(listen_port1);
+            check_no_reuseport_collision_after_batch(listen_port1, kEnvoyContainerUid);
         if (!envoy_asserted_reuseport_error.empty()) {
             std::cerr << "FAIL: " << envoy_asserted_reuseport_error << "\n";
             envoy_asserted.stop();
@@ -4002,7 +4100,7 @@ int run_pair_milestone_s(const std::string& rut_binary,
         // collision during this batch is likewise only ever a NOTE
         // (round-18 review).
         const std::string envoy_record_only_reuseport_error =
-            check_no_reuseport_collision_after_batch(listen_port1);
+            check_no_reuseport_collision_after_batch(listen_port1, kEnvoyContainerUid);
         if (!envoy_record_only_reuseport_error.empty()) {
             std::cerr << "NOTE: " << envoy_record_only_reuseport_error << "\n";
             for (auto& r : envoy_record_only_results) r.upstream_ambiguous = true;
@@ -4020,7 +4118,27 @@ int run_pair_milestone_s(const std::string& rut_binary,
         }
         upstream.wait_idle(2000);
         fill_upstream_bytes(&envoy_record_only_results, record_only_cases, upstream);
-        if (!wait_port_closed(listen_port1, 5000)) {
+        // Round-19 review, "Keep record-only co-owners from failing pair
+        // mode": a persistent SO_REUSEPORT co-owner (already classified as
+        // a non-fatal NOTE above) necessarily keeps `listen_port1`
+        // connectable even after OUR OWN instance stops, so waiting for it
+        // to close here would time out and turn that NOTE into a fatal
+        // failure anyway. Skip the wait and recover with a freshly
+        // allocated port for the RUT phase below instead of ever making
+        // this record-only-only anomaly gate acceptance.
+        if (!envoy_record_only_reuseport_error.empty()) {
+            uint16_t fresh_port = 0;
+            if (!allocate_loopback_port(&fresh_port)) {
+                std::cerr << "FAIL: could not allocate a replacement loopback port after a "
+                             "record-only SO_REUSEPORT collision\n";
+                upstream.stop();
+                return 1;
+            }
+            std::cerr << "NOTE: moving off listener port " << listen_port1 << " to port "
+                      << fresh_port
+                      << " for the RUT phase after a record-only-batch SO_REUSEPORT collision\n";
+            listen_port1 = fresh_port;
+        } else if (!wait_port_closed(listen_port1, 5000)) {
             std::cerr << "FAIL: listener port " << listen_port1
                       << " did not become free after stopping the record-only-batch Envoy "
                          "instance\n";
@@ -4065,7 +4183,7 @@ int run_pair_milestone_s(const std::string& rut_binary,
         // the recording upstream's log.
         auto rut_asserted_results = run_case_batch(listen_port1, asserted_cases);
         const std::string rut_asserted_reuseport_error =
-            check_no_reuseport_collision_after_batch(listen_port1);
+            check_no_reuseport_collision_after_batch(listen_port1, getuid());
         if (!rut_asserted_reuseport_error.empty()) {
             std::cerr << "FAIL: " << rut_asserted_reuseport_error << "\n";
             rut_asserted.stop();
@@ -4111,7 +4229,7 @@ int run_pair_milestone_s(const std::string& rut_binary,
         auto rut_record_only_results = run_case_batch(listen_port1, record_only_cases);
         // Never fatal here, same reasoning as the Envoy phase above.
         const std::string rut_record_only_reuseport_error =
-            check_no_reuseport_collision_after_batch(listen_port1);
+            check_no_reuseport_collision_after_batch(listen_port1, getuid());
         if (!rut_record_only_reuseport_error.empty()) {
             std::cerr << "NOTE: " << rut_record_only_reuseport_error << "\n";
             for (auto& r : rut_record_only_results) r.upstream_ambiguous = true;
@@ -4172,6 +4290,18 @@ int run_pair_milestone_s(const std::string& rut_binary,
             std::cerr << "WARN: case connect_failure (envoy) exchange did not complete cleanly ("
                       << describe_incomplete_exchange(c.envoy) << ")\n";
         c.envoy.name = "connect_failure";
+        // Round-19 review, "Recheck listener ownership after the
+        // connect-failure case": `connect_failure` is asserted, so a
+        // co-owner that joined `listen_port2`'s SO_REUSEPORT group during
+        // this exchange must fail the run, exactly like every run-1
+        // asserted batch's post-batch check does.
+        const std::string envoy_run2_reuseport_error =
+            check_no_reuseport_collision_after_batch(listen_port2, kEnvoyContainerUid);
+        if (!envoy_run2_reuseport_error.empty()) {
+            std::cerr << "FAIL: " << envoy_run2_reuseport_error << "\n";
+            envoy.stop();
+            return 1;
+        }
         if (!envoy.stop()) {
             std::cerr << "FAIL: envoy exited unexpectedly before teardown ("
                       << envoy.unexpected_exit_description << ")\n";
@@ -4203,6 +4333,16 @@ int run_pair_milestone_s(const std::string& rut_binary,
             std::cerr << "WARN: case connect_failure (rut) exchange did not complete cleanly ("
                       << describe_incomplete_exchange(c.rut) << ")\n";
         c.rut.name = "connect_failure";
+        // Round-19 review, "Recheck listener ownership after the
+        // connect-failure case": same reasoning as the Envoy half above,
+        // checked against the harness's own uid for the RUT phase.
+        const std::string rut_run2_reuseport_error =
+            check_no_reuseport_collision_after_batch(listen_port2, getuid());
+        if (!rut_run2_reuseport_error.empty()) {
+            std::cerr << "FAIL: " << rut_run2_reuseport_error << "\n";
+            rut.stop();
+            return 1;
+        }
         if (!rut.stop()) {
             std::cerr << "FAIL: rut exited unexpectedly before teardown ("
                       << rut.unexpected_exit_description << ")\n";
@@ -4370,6 +4510,75 @@ bool self_test_recording_upstream() {
     return ok;
 }
 
+// Round-19 review, "Synchronize the accept queue before declaring the
+// upstream idle" (P1): reproduces the exact race the review describes --
+// a connection already fully queued in the listening socket's kernel accept
+// backlog, with nothing having called accept() on it yet -- deterministically,
+// with no timing dependency: connect and send a full request to the bound
+// socket BEFORE RecordingUpstream::adopt() ever starts the accept_loop()
+// thread, so the connection is queued (a TCP listen backlog is filled by the
+// kernel independent of the accepting THREAD's existence) well before there
+// is any thread to accept it. wait_idle() must not report idle -- and must
+// not let the caller observe an empty requests_for() -- until accept_loop()
+// has actually caught up and recorded it; the old (pre-fix)
+// `active_fds_.empty()`-only check would return true immediately here,
+// since accept_loop() may not have run its first iteration at all yet.
+bool self_test_wait_idle_synchronizes_with_pending_accept() {
+    BoundPort bound;
+    if (!allocate_bound_loopback_port(&bound)) {
+        std::cerr << "FAIL [self-test wait_idle pending accept]: could not allocate a loopback "
+                     "port\n";
+        return false;
+    }
+    const uint16_t port = bound.port;
+
+    const int fd = connect_with_timeout(port, kClientTimeoutMs);
+    if (fd < 0) {
+        std::cerr << "FAIL [self-test wait_idle pending accept]: could not connect before "
+                     "adopt()\n";
+        close(bound.fd);
+        return false;
+    }
+    const std::string req = "GET /queued HTTP/1.1\r\nHost: t.example\r\nConnection: close\r\n\r\n";
+    if (!send_all(fd, req)) {
+        std::cerr << "FAIL [self-test wait_idle pending accept]: could not send the queued "
+                     "request\n";
+        close(fd);
+        close(bound.fd);
+        return false;
+    }
+
+    RecordingUpstream upstream;
+    upstream.set_default_reply(
+        "HTTP/1.1 200 OK\r\nConnection: close\r\nContent-Length: 2\r\n\r\nhi");
+    // adopt() only NOW starts the accept_loop() thread; the connection above
+    // has been sitting in the kernel's backlog, fully queued and unaccepted,
+    // this whole time.
+    if (!upstream.adopt(bound.fd)) {
+        std::cerr << "FAIL [self-test wait_idle pending accept]: could not adopt the listener\n";
+        close(fd);
+        return false;
+    }
+
+    bool ok = true;
+    const bool went_idle = upstream.wait_idle(2000);
+    if (!went_idle) {
+        std::cerr << "FAIL [self-test wait_idle pending accept]: wait_idle() timed out instead "
+                     "of observing the already-queued connection\n";
+        ok = false;
+    }
+    if (upstream.requests_for("/queued").empty()) {
+        std::cerr << "FAIL [self-test wait_idle pending accept]: the connection queued before "
+                     "adopt() was never recorded despite wait_idle() reporting idle\n";
+        ok = false;
+    }
+    read_http_message(fd, /*head_request=*/false, kClientTimeoutMs);
+    close(fd);
+    upstream.stop();
+    if (ok) std::cerr << "PASS [self-test wait_idle pending accept]\n";
+    return ok;
+}
+
 // Covers round-3 review thread P1 ("Reject partial exchanges before writing
 // the oracle transcript"): read_http_message() must report an incomplete
 // frame as incomplete rather than silently returning whatever partial bytes
@@ -4449,8 +4658,15 @@ bool self_test_partial_exchange_rejection() {
         }
         const std::string out_path = dir.path() + "/transcript.inc";
 
+        // Round-19 review, "Exempt oracle record-only rows from fatal
+        // validation": validate_results() now only enforces this rule for
+        // asserted cases (is_asserted_case()), so these must be named after
+        // a real asserted case (kAssertedCaseNames) to actually exercise the
+        // strict path -- an arbitrary made-up name like the old
+        // "bad_incomplete"/"bad_duplicate" would now be silently treated as
+        // record-only and skipped, defeating the test.
         CaseResult incomplete;
-        incomplete.name = "bad_incomplete";
+        incomplete.name = "get_smoke";
         incomplete.client_bytes = "GET / HTTP/1.1\r\n\r\n";
         incomplete.exchange_complete = false;
         incomplete.upstream_contacted = true;
@@ -4470,7 +4686,7 @@ bool self_test_partial_exchange_rejection() {
         }
 
         CaseResult duplicated;
-        duplicated.name = "bad_duplicate";
+        duplicated.name = "head_smoke";
         duplicated.client_bytes = "GET / HTTP/1.1\r\n\r\n";
         duplicated.exchange_complete = true;
         duplicated.upstream_contacted = true;
@@ -4488,8 +4704,26 @@ bool self_test_partial_exchange_rejection() {
             ok = false;
         }
 
+        // Record-only rows (not in kAssertedCaseNames) must NOT be subject
+        // to the same fatal rule -- the whole point of round-19's exemption
+        // -- so an incomplete/ambiguous record-only row must still let
+        // write_transcript succeed.
+        CaseResult record_only_incomplete;
+        record_only_incomplete.name = "connect_authority";
+        record_only_incomplete.client_bytes = "GET / HTTP/1.1\r\n\r\n";
+        record_only_incomplete.exchange_complete = false;
+        record_only_incomplete.upstream_contacted = false;
+        record_only_incomplete.upstream_contact_count = 0;
+        record_only_incomplete.downstream_bytes = "HTTP/1.1 404 N";
+        if (!write_transcript(out_path, {record_only_incomplete})) {
+            std::cerr << "FAIL [self-test partial]: write_transcript rejected a record-only "
+                         "row with an incomplete exchange (record-only rows must never fail the "
+                         "oracle run)\n";
+            ok = false;
+        }
+
         CaseResult good;
-        good.name = "ok";
+        good.name = "get_smoke";
         good.client_bytes = "GET / HTTP/1.1\r\n\r\n";
         good.exchange_complete = true;
         good.upstream_contacted = true;
@@ -5726,7 +5960,7 @@ bool self_test_count_listeners_on_port_live_reuseport() {
                      "here\n";
         ok = false;
     } else {
-        const int count = count_listeners_on_port(port);
+        const int count = count_listeners_on_port(port, getuid());
         if (count != 2) {
             std::cerr << "FAIL [self-test count listeners live]: expected 2 live listeners on "
                          "port "
@@ -6848,18 +7082,42 @@ void fake_proxy_term_handler(int /*signum*/) {
     (void)ignored;
 }
 
-// Blocks until SIGTERM arrives (via the self-pipe above), or returns
-// immediately if the pipe itself could not be created (falls back to a
-// plain, still-safe pause() loop -- no allocation or non-async-signal-safe
-// call happens in the handler either way, just without the self-pipe's
-// guarantee against a wakeup lost to a signal delivered before this
-// function starts waiting).
-void fake_proxy_wait_for_term() {
+// Whether the self-pipe was created and the SIGTERM handler installed by
+// fake_proxy_install_term_handler() below; if pipe() itself failed (treated
+// as extremely unlikely), fake_proxy_wait_for_term() falls back to a plain
+// pause() loop with SIGTERM left at its default (terminate) disposition --
+// the same fallback the original single-function version had.
+bool g_fake_proxy_term_pipe_ready = false;
+
+// Installs the self-pipe and SIGTERM handler. Round-19 review, "Install the
+// fake proxy's SIGTERM handler before replying": this must run BEFORE
+// run_fake_proxy() below accepts/answers its one connection, not only
+// later from inside a wait-for-term call made after that reply. The parent
+// test process can observe this proxy's reply (and the connection close
+// that follows it) and call stop() -- sending SIGTERM -- essentially
+// immediately afterward; installing the handler only after replying leaves
+// a window where SIGTERM would still hit the default disposition
+// (terminate this process outright) instead of the mode's intended
+// exit(7)/delayed-request behavior, intermittently misclassifying an
+// intentional teardown as a crash.
+bool fake_proxy_install_term_handler() {
     if (pipe(g_fake_proxy_term_pipe) != 0) {
+        g_fake_proxy_term_pipe_ready = false;
+        return false;
+    }
+    signal(SIGTERM, fake_proxy_term_handler);
+    g_fake_proxy_term_pipe_ready = true;
+    return true;
+}
+
+// Blocks until SIGTERM arrives (via the self-pipe installed by
+// fake_proxy_install_term_handler() above), or falls back to a plain
+// pause() loop if that installation did not happen or failed.
+void fake_proxy_wait_for_term() {
+    if (!g_fake_proxy_term_pipe_ready) {
         for (;;) pause();
         return;
     }
-    signal(SIGTERM, fake_proxy_term_handler);
     char byte;
     for (;;) {
         const ssize_t n = read(g_fake_proxy_term_pipe[0], &byte, 1);
@@ -6893,6 +7151,14 @@ int run_fake_proxy(int argc, char** argv) {
     if (argc < 4) return 2;
     const int listen_fd = static_cast<int>(std::strtol(argv[2], nullptr, 10));
     const std::string mode = argv[3];
+    // Install the SIGTERM handler BEFORE accepting/answering the connection
+    // below for every mode that will later wait on it -- see
+    // fake_proxy_install_term_handler()'s comment for why the ordering
+    // matters. "exit-early" never waits on SIGTERM at all, so it has
+    // nothing to install.
+    if (mode == "crash-on-term" || mode == "delayed-request") {
+        fake_proxy_install_term_handler();
+    }
     const std::string reply = "HTTP/1.1 200 OK\r\nConnection: close\r\nContent-Length: 2\r\n\r\nhi";
     const int fd = accept(listen_fd, nullptr, nullptr);
     if (fd >= 0) {
@@ -8198,6 +8464,12 @@ bool run_self_test_rut_pass(const std::string& rut_binary, const std::string& co
             if (is_asserted_case(spec.name)) live_asserted.push_back(spec);
         auto live_results = run_case_batch(listen_port, live_asserted);
         const bool rut_stopped_cleanly = rut.stop();
+        // Round-19 review, "Wait for upstream quiescence in the RUT oracle
+        // self-test": same reasoning as the production asserted phases --
+        // stop() only guarantees RUT's own process exited, not that this
+        // independent RecordingUpstream has finished recording whatever it
+        // already received.
+        upstream.wait_idle(2000);
         const bool rut_upstream_ok = fill_upstream_bytes(&live_results, live_asserted, upstream);
         upstream.stop();
         if (!rut_stopped_cleanly) {
@@ -8300,6 +8572,7 @@ int run_self_test(const std::string& rut_binary, const std::string& converter_bi
     bool ok = true;
     ok &= self_test_escaping();
     ok &= self_test_recording_upstream();
+    ok &= self_test_wait_idle_synchronizes_with_pending_accept();
     ok &= self_test_partial_exchange_rejection();
     ok &= self_test_fake_listener_unblocks_on_shutdown();
     ok &= self_test_argv_builder();
