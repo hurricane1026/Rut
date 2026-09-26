@@ -351,9 +351,9 @@ The milestone-S bootstrap (the accepted-JSON milestone above, plus
 `suppress_envoy_headers: true` and `timeout: "0s"`) lowers to the RUT below
 once every capability in `rut::envoy::RutCapabilities` is available. The
 shipped converter (`rut::envoy::kShippedRutCapabilities`: `request_envoy_h1`
-`true` since PR3, `response_envoy_h1` and `local_reply_envoy_h1` still
-`false`) fails closed with a `BLOCKED_BY_RUT` diagnostic (at the
-`response_envoy_h1` check) instead of emitting this text; the
+and `response_envoy_h1` true, `local_reply_envoy_h1` still false) fails
+closed with a `BLOCKED_BY_RUT` diagnostic naming the missing
+`local_reply_envoy_h1` capability instead of emitting this text; the
 exact bytes are pinned in `tests/fixtures/envoy_milestone_s.inc` and checked
 byte for byte by `tests/test_envoy_convert.cc`
 (`api_all_capabilities_matches_golden`). Values shown here (the connect-failure
@@ -760,13 +760,23 @@ emitted text, since that still doesn't compile on this branch.
    `proxy-connection`, `te` (unless `trailers`), `upgrade` outside an upgrade,
    and `transfer-encoding` on reframe; ordinary headers like a redirect's
    `Location` or a cache validator's `Last-Modified` pass through unchanged.
-   Rut's `strict_response_forbidden` unconditionally rejects `location`,
-   `refresh`, and `last-modified` (`include/rut/runtime/callbacks_impl.h:9856-9868`)
-   regardless of the route's `hide_headers` list — this milestone's route
-   already requests `hide_headers: []` (hide nothing), so there is no policy
-   value that admits these headers even once `response_envoy_h1` lands. Live:
+   Rut's legacy fixed-order (`Synthesized`) `response_policy` profile still
+   rejects these headers unconditionally via `strict_response_forbidden`
+   (`include/rut/runtime/callbacks_impl.h:9856-9868`) regardless of
+   `hide_headers`, but this is no longer a hard capability gap: the
+   `header_order: "upstream"` (Envoy H1) profile added on
+   `envoy/rut-response-envoy-h1` never routes headers through
+   `strict_response_forbidden` — it only removes the fixed hop-by-hop set and
+   policy-`hide_headers` names, so `Location`/`Refresh`/`Last-Modified` pass
+   through unchanged once the converter emits that profile
+   (`build_upstream_order_response_headers`,
+   `include/rut/runtime/callbacks_impl.h:10666-10685`;
+   `tests/test_integration.cc: route.forward_response_policy_upstream_order_wire`,
+   the Last-Modified pass-through case). Live (legacy `Synthesized` profile):
    an upstream `302 Found` with `Location: /login` got the upstream contacted
-   but the client connection closed with no response bytes.
+   but the client connection closed with no response bytes; the
+   `header_order: "upstream"` profile instead forwards a lowercased
+   `Last-Modified` header downstream unchanged (integration-tested).
 6. **Undifferentiated (and sometimes absent) failure replies.** Envoy maps
    `LocalConnectionFailure`/`RemoteConnectionFailure`/`ConnectionTimeout` (a
    refused or timed-out connect attempt) to one local-reply text and
@@ -1050,10 +1060,6 @@ Each needs its own issue before the corresponding row can leave
   duplicates into one value and this profile does not replicate that
   coalescing. See `tests/fixtures/envoy_oracle_milestone_s.inc` and
   `docs/envoy-compatibility.md`.
-- Header-name casing selector on the response policy: Envoy emits lowercase
-  names over HTTP/1.1. The request side landed with `request_envoy_h1`
-  (PR3, `header_names: "lowercase"` in `request_policy`); the response side
-  is still `response_envoy_h1`.
 - Dynamic `Connection`-nominated header stripping on the upstream request:
   Envoy parses the client's `Connection` header value and removes every
   header it names (e.g. `Connection: X-Secret` also removes `X-Secret`). This
@@ -1091,10 +1097,31 @@ Each needs its own issue before the corresponding row can leave
   policies (ID1/ID2/ID3) already apply to any `Expect` header; `request_envoy_h1`
   does not add interim-response support and this request shape stays outside
   its advertised capability until a `100 Continue` primitive exists.
-- `response_policy.date: "preserve_or_current"`: add `date` only when absent.
-- `response_policy.server: "envoy"` with overwrite semantics, and an explicit
-  "pass through upstream `server`" mode for `server_header_transformation:
-  PASS_THROUGH`.
+- `response_policy.header_order: "upstream"` (`response_envoy_h1`, PR4):
+  landed. `header_names: "lowercase"`, `connection_header: "close_only"`,
+  `status_reason: "canonical"`, and `date: "preserve_or_current"` are admitted
+  only together with it (nginx's fixed-order `Synthesized` layout is
+  unchanged). The runtime serializer keeps upstream header order, lowercases
+  every forwarded name, replaces the first `server` value in place (a later
+  duplicate is dropped) or appends `server: envoy` when absent, keeps an
+  upstream `date` in place or appends `date: <now>` when absent (`date` then
+  `server` when both are absent), appends `connection: close` last only when
+  the downstream connection is closing, and looks up the canonical reason
+  phrase from a table mirroring Envoy's `CodeUtility::toString`
+  (`source/common/http/codes.cc`, v1.39.1) byte for byte, covering every
+  status this profile admits (200..599 minus the no-body exclusions
+  204/205/304): an admitted status Envoy's own table does not name (e.g.
+  299) gets `Unknown`, matching `CodeUtility::toString`'s own fallthrough,
+  rather than being rejected (Codex round-11 review of #698). The upstream's
+  own reason phrase is never forwarded — the canonical phrase always
+  replaces it — so an empty upstream reason phrase (`HTTP/1.1 200 \r\n`,
+  which `parse_response` accepts per RFC 7230 §3.1.2) needs no special case
+  and is accepted like any other. `hide_headers` can never suppress
+  `Content-Length`, the sole framing field this profile admits. Verified
+  byte for byte against
+  `tests/fixtures/envoy_oracle_milestone_s.inc`; see
+  `docs/envoy-compatibility.md`. An explicit "pass through upstream `server`"
+  mode for `server_header_transformation: PASS_THROUGH` is not modeled.
 - Route-level `set_header` on the upstream request is available for literal
   values; `x-envoy-upstream-service-time` on the response needs a runtime
   measured value, which no policy exposes. Until then only the

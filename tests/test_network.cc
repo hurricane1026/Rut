@@ -1528,6 +1528,1213 @@ TEST(response_policy, head_mode_config_copy_is_owned_and_atomic) {
     CHECK_EQ(untouched.response_policy_bytes_used, 0u);
 }
 
+TEST(response_policy, upstream_header_order_config_copy_is_owned_and_spec_valid_table) {
+    char server[] = "envoy";
+    ForwardResponsePolicySpec synth{};
+    synth.version = ResponsePolicyVersion::Http11;
+    synth.framing = ResponsePolicyFraming::ContentLength;
+    synth.connection = ResponsePolicyConnection::Request;
+    synth.date = ResponsePolicyDate::Current;
+    synth.server = {server, 5};
+    CHECK(response_policy_spec_valid(synth));
+
+    ForwardResponsePolicySpec upstream_order = synth;
+    upstream_order.header_order = ResponsePolicyHeaderOrder::Upstream;
+    upstream_order.header_names = ResponsePolicyHeaderNames::Lowercase;
+    upstream_order.connection_header = ResponsePolicyConnectionHeader::CloseOnly;
+    upstream_order.status_reason = ResponsePolicyStatusReason::Canonical;
+    upstream_order.date = ResponsePolicyDate::PreserveOrCurrent;
+    CHECK(response_policy_spec_valid(upstream_order));
+
+    // Every one of the four new fields is required at its one supported
+    // value when `header_order == Upstream`; the reverse (any of the four
+    // set to a non-default value while `header_order == Synthesized`) is
+    // also rejected. `nginx` (Synthesized) is otherwise untouched.
+    struct Case {
+        ForwardResponsePolicySpec spec;
+        bool valid;
+    };
+    auto make_invalid_upstream = [&](auto mutate) {
+        auto spec = upstream_order;
+        mutate(spec);
+        return spec;
+    };
+    auto make_invalid_synth = [&](auto mutate) {
+        auto spec = synth;
+        mutate(spec);
+        return spec;
+    };
+    Case cases[] = {
+        {synth, true},
+        {upstream_order, true},
+        {make_invalid_upstream(
+             [](auto& s) { s.header_names = ResponsePolicyHeaderNames::Preserve; }),
+         false},
+        {make_invalid_upstream(
+             [](auto& s) { s.connection_header = ResponsePolicyConnectionHeader::Always; }),
+         false},
+        {make_invalid_upstream(
+             [](auto& s) { s.status_reason = ResponsePolicyStatusReason::Upstream; }),
+         false},
+        {make_invalid_upstream([](auto& s) { s.date = ResponsePolicyDate::Current; }), false},
+        {make_invalid_synth([](auto& s) { s.header_names = ResponsePolicyHeaderNames::Lowercase; }),
+         false},
+        {make_invalid_synth(
+             [](auto& s) { s.connection_header = ResponsePolicyConnectionHeader::CloseOnly; }),
+         false},
+        {make_invalid_synth(
+             [](auto& s) { s.status_reason = ResponsePolicyStatusReason::Canonical; }),
+         false},
+        {make_invalid_synth([](auto& s) { s.date = ResponsePolicyDate::PreserveOrCurrent; }),
+         false},
+        {make_invalid_synth([](auto& s) { s.header_order = ResponsePolicyHeaderOrder::Upstream; }),
+         false},
+    };
+    for (const auto& c : cases) CHECK_EQ(response_policy_spec_valid(c.spec), c.valid);
+
+    rir::Module module{};
+    module.response_policy_count = 2;
+    module.response_policies[0] = synth;
+    module.response_policies[1] = upstream_order;
+    RouteConfig config{};
+    REQUIRE(populate_route_config(config, module));
+    CHECK_EQ(config.response_policy_count, 2u);
+    CHECK(config.response_policies[0].header_order == ResponsePolicyHeaderOrder::Synthesized);
+    CHECK(config.response_policies[1].header_order == ResponsePolicyHeaderOrder::Upstream);
+    CHECK(config.response_policies[1].header_names == ResponsePolicyHeaderNames::Lowercase);
+    CHECK(config.response_policies[1].connection_header ==
+          ResponsePolicyConnectionHeader::CloseOnly);
+    CHECK(config.response_policies[1].status_reason == ResponsePolicyStatusReason::Canonical);
+    CHECK(config.response_policies[1].date == ResponsePolicyDate::PreserveOrCurrent);
+
+    rir::Module malformed = module;
+    malformed.response_policies[1].header_names = ResponsePolicyHeaderNames::Preserve;
+    RouteConfig untouched{};
+    CHECK_FALSE(populate_route_config(untouched, malformed));
+    CHECK_EQ(untouched.response_policy_count, 0u);
+    CHECK_EQ(untouched.response_policy_bytes_used, 0u);
+}
+
+// Codex review: `hide_headers` naming `Content-Length` must not suppress the
+// sole framing field `header_order: "upstream"` admits -- the body is still
+// streamed byte for byte, so removing the header would leave a keep-alive
+// client treating the response as close-delimited. `X-Pad` is also on the
+// hide list and IS dropped, proving the exemption is Content-Length-specific.
+TEST(response_policy, upstream_header_order_hide_headers_cannot_suppress_content_length) {
+    char server[] = "envoy";
+    ForwardResponsePolicySpec upstream_order{};
+    upstream_order.version = ResponsePolicyVersion::Http11;
+    upstream_order.framing = ResponsePolicyFraming::ContentLength;
+    upstream_order.connection = ResponsePolicyConnection::Request;
+    upstream_order.header_order = ResponsePolicyHeaderOrder::Upstream;
+    upstream_order.header_names = ResponsePolicyHeaderNames::Lowercase;
+    upstream_order.connection_header = ResponsePolicyConnectionHeader::CloseOnly;
+    upstream_order.status_reason = ResponsePolicyStatusReason::Canonical;
+    upstream_order.date = ResponsePolicyDate::PreserveOrCurrent;
+    upstream_order.server = {server, 5};
+    upstream_order.hide_header_count = 2;
+    upstream_order.hide_headers[0] = {"Content-Length", 14};
+    upstream_order.hide_headers[1] = {"X-Pad", 5};
+    REQUIRE(response_policy_spec_valid(upstream_order));
+
+    RouteConfig config{};
+    REQUIRE_EQ(config.add_response_policy(upstream_order), 1u);
+
+    u8 header_storage[SlicePool::kSliceSize]{};
+    Connection conn{};
+    conn.reset();
+    conn.response_header_slice = header_storage;
+    conn.response_header_buf.bind(header_storage, sizeof(header_storage));
+    conn.response_policy_id = 1;
+    conn.keep_alive = true;
+    conn.req_client_keep_alive = true;
+
+    static constexpr char kUpstream[] =
+        "HTTP/1.1 200 OK\r\nContent-Length: 2\r\nX-Pad: 1\r\n\r\nhi";
+    HttpResponseParser parser;
+    ParsedResponse response;
+    parser.reset();
+    response.reset();
+    REQUIRE_EQ(
+        parser.parse(reinterpret_cast<const u8*>(kUpstream), sizeof(kUpstream) - 1u, &response),
+        ParseStatus::Complete);
+    REQUIRE(build_strict_response_headers(conn, config, response));
+    CHECK(buf_has(
+        conn.response_header_buf.data(), conn.response_header_buf.len(), "content-length: 2\r\n"));
+    CHECK_FALSE(buf_has(conn.response_header_buf.data(), conn.response_header_buf.len(), "x-pad"));
+}
+
+// Codex review: an upstream status line with an empty reason phrase is valid
+// (`parse_response` accepts `SP CRLF` with a zero-length reason) and this
+// profile never forwards the upstream reason anyway -- the canonical table
+// always overrides it -- so an empty one must not be rejected either.
+TEST(response_policy, upstream_header_order_accepts_empty_upstream_reason) {
+    char server[] = "envoy";
+    ForwardResponsePolicySpec upstream_order{};
+    upstream_order.version = ResponsePolicyVersion::Http11;
+    upstream_order.framing = ResponsePolicyFraming::ContentLength;
+    upstream_order.connection = ResponsePolicyConnection::Request;
+    upstream_order.header_order = ResponsePolicyHeaderOrder::Upstream;
+    upstream_order.header_names = ResponsePolicyHeaderNames::Lowercase;
+    upstream_order.connection_header = ResponsePolicyConnectionHeader::CloseOnly;
+    upstream_order.status_reason = ResponsePolicyStatusReason::Canonical;
+    upstream_order.date = ResponsePolicyDate::PreserveOrCurrent;
+    upstream_order.server = {server, 5};
+    REQUIRE(response_policy_spec_valid(upstream_order));
+
+    RouteConfig config{};
+    REQUIRE_EQ(config.add_response_policy(upstream_order), 1u);
+
+    u8 header_storage[SlicePool::kSliceSize]{};
+    Connection conn{};
+    conn.reset();
+    conn.response_header_slice = header_storage;
+    conn.response_header_buf.bind(header_storage, sizeof(header_storage));
+    conn.response_policy_id = 1;
+    conn.keep_alive = true;
+    conn.req_client_keep_alive = true;
+
+    static constexpr char kUpstream[] = "HTTP/1.1 200 \r\nContent-Length: 2\r\n\r\nhi";
+    HttpResponseParser parser;
+    ParsedResponse response;
+    parser.reset();
+    response.reset();
+    REQUIRE_EQ(
+        parser.parse(reinterpret_cast<const u8*>(kUpstream), sizeof(kUpstream) - 1u, &response),
+        ParseStatus::Complete);
+    REQUIRE_EQ(response.reason.len, 0u);
+    REQUIRE(build_strict_response_headers(conn, config, response));
+    CHECK(buf_has(
+        conn.response_header_buf.data(), conn.response_header_buf.len(), "HTTP/1.1 200 OK\r\n"));
+    CHECK(buf_has(
+        conn.response_header_buf.data(), conn.response_header_buf.len(), "content-length: 2\r\n"));
+}
+
+// Codex round-6 review: the response parser exposes the semantic header
+// value with surrounding OWS stripped (`h.value`), but this serializer wrote
+// `h.raw_value` after trimming only its leading OWS, so trailing
+// `" \t"`-style padding before the CRLF reached the downstream byte for
+// byte. Envoy's header-map serialization normalizes both ends (RFC 7230
+// §3.2.4), matching the Envoy-compatible request serializer's own
+// leading-and-trailing trim (`callbacks_impl.h:5707-5710`); this profile
+// must match on the response side too.
+TEST(response_policy, upstream_header_order_trims_trailing_ows) {
+    char server[] = "envoy";
+    ForwardResponsePolicySpec upstream_order{};
+    upstream_order.version = ResponsePolicyVersion::Http11;
+    upstream_order.framing = ResponsePolicyFraming::ContentLength;
+    upstream_order.connection = ResponsePolicyConnection::Request;
+    upstream_order.header_order = ResponsePolicyHeaderOrder::Upstream;
+    upstream_order.header_names = ResponsePolicyHeaderNames::Lowercase;
+    upstream_order.connection_header = ResponsePolicyConnectionHeader::CloseOnly;
+    upstream_order.status_reason = ResponsePolicyStatusReason::Canonical;
+    upstream_order.date = ResponsePolicyDate::PreserveOrCurrent;
+    upstream_order.server = {server, 5};
+    REQUIRE(response_policy_spec_valid(upstream_order));
+
+    RouteConfig config{};
+    REQUIRE_EQ(config.add_response_policy(upstream_order), 1u);
+
+    u8 header_storage[SlicePool::kSliceSize]{};
+    Connection conn{};
+    conn.reset();
+    conn.response_header_slice = header_storage;
+    conn.response_header_buf.bind(header_storage, sizeof(header_storage));
+    conn.response_policy_id = 1;
+    conn.keep_alive = true;
+    conn.req_client_keep_alive = true;
+
+    static constexpr char kUpstream[] =
+        "HTTP/1.1 200 OK\r\nContent-Length: 2\r\nX-Test: value \t\r\n\r\nhi";
+    HttpResponseParser parser;
+    ParsedResponse response;
+    parser.reset();
+    response.reset();
+    REQUIRE_EQ(
+        parser.parse(reinterpret_cast<const u8*>(kUpstream), sizeof(kUpstream) - 1u, &response),
+        ParseStatus::Complete);
+    REQUIRE(build_strict_response_headers(conn, config, response));
+    CHECK(buf_has(
+        conn.response_header_buf.data(), conn.response_header_buf.len(), "x-test: value\r\n"));
+    CHECK_FALSE(buf_has(
+        conn.response_header_buf.data(), conn.response_header_buf.len(), "x-test: value \t\r\n"));
+}
+
+// Codex round-6 review: when `server` is listed in `hide_headers` and the
+// upstream also supplies a `Server` field, the generic hide check used to
+// run before the dedicated `server` branch, discarding the origin slot
+// entirely and leaving `seen_server` false -- so the configured `server`
+// value was appended at the end instead of replacing the upstream value in
+// its original position. Envoy's `server_header_transformation: OVERWRITE`
+// replaces the header in place regardless of any removal configuration;
+// `hide_headers` naming `server` must not change where the replacement
+// lands.
+TEST(response_policy, upstream_header_order_replaces_hidden_server_in_place) {
+    char server[] = "envoy";
+    ForwardResponsePolicySpec upstream_order{};
+    upstream_order.version = ResponsePolicyVersion::Http11;
+    upstream_order.framing = ResponsePolicyFraming::ContentLength;
+    upstream_order.connection = ResponsePolicyConnection::Request;
+    upstream_order.header_order = ResponsePolicyHeaderOrder::Upstream;
+    upstream_order.header_names = ResponsePolicyHeaderNames::Lowercase;
+    upstream_order.connection_header = ResponsePolicyConnectionHeader::CloseOnly;
+    upstream_order.status_reason = ResponsePolicyStatusReason::Canonical;
+    upstream_order.date = ResponsePolicyDate::PreserveOrCurrent;
+    upstream_order.server = {server, 5};
+    upstream_order.hide_header_count = 1;
+    upstream_order.hide_headers[0] = {"Server", 6};
+    REQUIRE(response_policy_spec_valid(upstream_order));
+
+    RouteConfig config{};
+    REQUIRE_EQ(config.add_response_policy(upstream_order), 1u);
+
+    u8 header_storage[SlicePool::kSliceSize]{};
+    Connection conn{};
+    conn.reset();
+    conn.response_header_slice = header_storage;
+    conn.response_header_buf.bind(header_storage, sizeof(header_storage));
+    conn.response_policy_id = 1;
+    conn.keep_alive = true;
+    conn.req_client_keep_alive = true;
+
+    static constexpr char kUpstream[] =
+        "HTTP/1.1 200 OK\r\nServer: custom-origin\r\nX-After: 1\r\nContent-Length: 2\r\n\r\nhi";
+    HttpResponseParser parser;
+    ParsedResponse response;
+    parser.reset();
+    response.reset();
+    REQUIRE_EQ(
+        parser.parse(reinterpret_cast<const u8*>(kUpstream), sizeof(kUpstream) - 1u, &response),
+        ParseStatus::Complete);
+    REQUIRE(build_strict_response_headers(conn, config, response));
+    const u8* d = conn.response_header_buf.data();
+    const u32 n = conn.response_header_buf.len();
+    CHECK(buf_has(d, n, "server: envoy\r\n"));
+    CHECK_FALSE(buf_has(d, n, "custom-origin"));
+    // Occupies the origin slot: appears before X-After, not appended last
+    // (which would put it after Content-Length/Date, at the very end).
+    const std::string haystack(reinterpret_cast<const char*>(d), n);
+    const size_t server_pos = haystack.find("server: envoy\r\n");
+    const size_t after_pos = haystack.find("x-after: 1\r\n");
+    REQUIRE_NE(server_pos, std::string::npos);
+    REQUIRE_NE(after_pos, std::string::npos);
+    CHECK_LT(server_pos, after_pos);
+}
+
+// Codex round-3 review: `resp.chunked` is only set when the Transfer-Encoding
+// token list contains "chunked"; a non-chunked coding (or one where chunked
+// is not the final token) leaves it false while the field is still present.
+// Envoy rejects any Transfer-Encoding value that is not exactly "chunked"
+// outright (source/common/http/http1/codec_impl.cc,
+// Http1ResponseCodeDetails::InvalidTransferEncoding) rather than forwarding
+// the coded bytes as an ordinary fixed-length body with the field dropped.
+TEST(response_policy, upstream_header_order_rejects_non_chunked_transfer_encoding) {
+    char server[] = "envoy";
+    ForwardResponsePolicySpec upstream_order{};
+    upstream_order.version = ResponsePolicyVersion::Http11;
+    upstream_order.framing = ResponsePolicyFraming::ContentLength;
+    upstream_order.connection = ResponsePolicyConnection::Request;
+    upstream_order.header_order = ResponsePolicyHeaderOrder::Upstream;
+    upstream_order.header_names = ResponsePolicyHeaderNames::Lowercase;
+    upstream_order.connection_header = ResponsePolicyConnectionHeader::CloseOnly;
+    upstream_order.status_reason = ResponsePolicyStatusReason::Canonical;
+    upstream_order.date = ResponsePolicyDate::PreserveOrCurrent;
+    upstream_order.server = {server, 5};
+    REQUIRE(response_policy_spec_valid(upstream_order));
+
+    RouteConfig config{};
+    REQUIRE_EQ(config.add_response_policy(upstream_order), 1u);
+
+    static constexpr const char* kUpstreams[] = {
+        // A non-chunked coding alone: resp.chunked stays false.
+        "HTTP/1.1 200 OK\r\nContent-Length: 2\r\nTransfer-Encoding: gzip\r\n\r\nhi",
+        // "chunked" present but not the sole/final coding: resp.chunked is
+        // still set true by the token scan, but this exercises the same
+        // header-presence guard for a value real Envoy also rejects (the
+        // full header value is not exactly "chunked").
+        "HTTP/1.1 200 OK\r\nContent-Length: 2\r\nTransfer-Encoding: chunked, gzip\r\n\r\nhi",
+    };
+    for (const char* upstream : kUpstreams) {
+        u8 header_storage[SlicePool::kSliceSize]{};
+        Connection conn{};
+        conn.reset();
+        conn.response_header_slice = header_storage;
+        conn.response_header_buf.bind(header_storage, sizeof(header_storage));
+        conn.response_policy_id = 1;
+        conn.keep_alive = true;
+        conn.req_client_keep_alive = true;
+
+        HttpResponseParser parser;
+        ParsedResponse response;
+        parser.reset();
+        response.reset();
+        const u32 len = static_cast<u32>(__builtin_strlen(upstream));
+        REQUIRE_EQ(parser.parse(reinterpret_cast<const u8*>(upstream), len, &response),
+                   ParseStatus::Complete);
+        CHECK_FALSE(build_strict_response_headers(conn, config, response));
+    }
+}
+
+// Codex round-8 review: Envoy's HeaderMapImpl stores Content-Type, Date and
+// Location as single-valued inline header slots and coalesces a duplicate
+// into the existing entry (comma-joined) rather than emitting it as a second
+// physical field. This profile forwards headers verbatim in upstream order
+// instead of rebuilding a HeaderMap, so it cannot reproduce that join --
+// forwarding both fields would put two physical `content-type` (or `date` /
+// `location`) lines on the wire, a shape no HTTP/1.1 client (or Envoy) ever
+// emits for these fields. It must fail closed (502) instead of guessing which
+// duplicate wins, mirroring how the Synthesized profile already fails closed
+// on inline fields it cannot coalesce (`strict_response_forbidden`).
+TEST(response_policy, upstream_header_order_rejects_duplicate_inline_headers) {
+    char server[] = "envoy";
+    ForwardResponsePolicySpec upstream_order{};
+    upstream_order.version = ResponsePolicyVersion::Http11;
+    upstream_order.framing = ResponsePolicyFraming::ContentLength;
+    upstream_order.connection = ResponsePolicyConnection::Request;
+    upstream_order.header_order = ResponsePolicyHeaderOrder::Upstream;
+    upstream_order.header_names = ResponsePolicyHeaderNames::Lowercase;
+    upstream_order.connection_header = ResponsePolicyConnectionHeader::CloseOnly;
+    upstream_order.status_reason = ResponsePolicyStatusReason::Canonical;
+    upstream_order.date = ResponsePolicyDate::PreserveOrCurrent;
+    upstream_order.server = {server, 5};
+    REQUIRE(response_policy_spec_valid(upstream_order));
+
+    RouteConfig config{};
+    REQUIRE_EQ(config.add_response_policy(upstream_order), 1u);
+
+    static constexpr const char* kUpstreams[] = {
+        // Two Content-Type fields.
+        "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 2\r\n"
+        "Content-Type: text/html\r\n\r\nhi",
+        // Two Date fields.
+        "HTTP/1.1 200 OK\r\nDate: Tue, 01 Jan 2030 00:00:00 GMT\r\nContent-Length: 2\r\n"
+        "Date: Wed, 02 Jan 2030 00:00:00 GMT\r\n\r\nhi",
+        // Two Location fields on a redirect this profile still forwards.
+        "HTTP/1.1 302 Found\r\nLocation: /a\r\nContent-Length: 2\r\nLocation: /b\r\n\r\nhi",
+    };
+    for (const char* upstream : kUpstreams) {
+        u8 header_storage[SlicePool::kSliceSize]{};
+        Connection conn{};
+        conn.reset();
+        conn.response_header_slice = header_storage;
+        conn.response_header_buf.bind(header_storage, sizeof(header_storage));
+        conn.response_policy_id = 1;
+        conn.keep_alive = true;
+        conn.req_client_keep_alive = true;
+
+        HttpResponseParser parser;
+        ParsedResponse response;
+        parser.reset();
+        response.reset();
+        const u32 len = static_cast<u32>(__builtin_strlen(upstream));
+        REQUIRE_EQ(parser.parse(reinterpret_cast<const u8*>(upstream), len, &response),
+                   ParseStatus::Complete);
+        CHECK_FALSE(build_strict_response_headers(conn, config, response));
+    }
+
+    // Sanity check: a single Content-Type/Date/Location each still succeeds,
+    // proving the rejection above is specific to the duplicate, not a
+    // regression that now blanket-rejects these fields.
+    static constexpr char kSingle[] =
+        "HTTP/1.1 302 Found\r\nContent-Type: text/plain\r\n"
+        "Date: Tue, 01 Jan 2030 00:00:00 GMT\r\nLocation: /a\r\nContent-Length: 2\r\n\r\nhi";
+    u8 header_storage[SlicePool::kSliceSize]{};
+    Connection conn{};
+    conn.reset();
+    conn.response_header_slice = header_storage;
+    conn.response_header_buf.bind(header_storage, sizeof(header_storage));
+    conn.response_policy_id = 1;
+    conn.keep_alive = true;
+    conn.req_client_keep_alive = true;
+    HttpResponseParser parser;
+    ParsedResponse response;
+    parser.reset();
+    response.reset();
+    REQUIRE_EQ(parser.parse(reinterpret_cast<const u8*>(kSingle), sizeof(kSingle) - 1u, &response),
+               ParseStatus::Complete);
+    REQUIRE(build_strict_response_headers(conn, config, response));
+}
+
+// Codex round-9 and round-10 review: the round-8 fix only covered Content-Type,
+// Date and Location; round-9 extended it to every name in the
+// `INLINE_RESP_HEADERS`/`INLINE_REQ_RESP_HEADERS` macros but still missed the
+// headers a stock Envoy binary registers as custom inline slots at
+// static-init time (`cache-control`, `content-encoding`, `last-modified`,
+// `etag`, `age`, `expires`, `vary`, and the `access-control-*` CORS/response
+// headers -- see the citations on `kEnvoyInlineResponseHeaders` in
+// callbacks_impl.h). Envoy's HeaderMapImpl treats every name in that table the
+// same way regardless of source: a single-valued inline slot that coalesces a
+// duplicate into the existing entry rather than emitting two physical fields.
+// Iterate the whole table and prove each entry fails closed (502) on a
+// duplicate and is still accepted with a single occurrence, then prove a
+// non-inline header (`x-custom`) may still repeat -- this profile forwards
+// ordinary headers verbatim in upstream order, duplicates and all.
+//
+// Codex round-15 review: the duplicate check used to run before the fixed
+// hop-by-hop skip list, so a duplicate of `keep-alive`, `upgrade`, or
+// `proxy-connection` -- three `kEnvoyInlineResponseHeaders` entries that are
+// also unconditionally dropped by the second (serialization) loop below,
+// regardless of `hide_headers` -- rejected an otherwise valid response even
+// though neither occurrence would ever reach the wire. Only these three
+// entries are exempt from the fail-closed duplicate check now; every other
+// entry in the table still fails closed on a duplicate.
+TEST(response_policy, upstream_header_order_rejects_duplicate_of_every_inline_header) {
+    char server[] = "envoy";
+    ForwardResponsePolicySpec upstream_order{};
+    upstream_order.version = ResponsePolicyVersion::Http11;
+    upstream_order.framing = ResponsePolicyFraming::ContentLength;
+    upstream_order.connection = ResponsePolicyConnection::Request;
+    upstream_order.header_order = ResponsePolicyHeaderOrder::Upstream;
+    upstream_order.header_names = ResponsePolicyHeaderNames::Lowercase;
+    upstream_order.connection_header = ResponsePolicyConnectionHeader::CloseOnly;
+    upstream_order.status_reason = ResponsePolicyStatusReason::Canonical;
+    upstream_order.date = ResponsePolicyDate::PreserveOrCurrent;
+    upstream_order.server = {server, 5};
+    REQUIRE(response_policy_spec_valid(upstream_order));
+
+    RouteConfig config{};
+    REQUIRE_EQ(config.add_response_policy(upstream_order), 1u);
+
+    auto admits = [&](const std::string& upstream) {
+        u8 header_storage[SlicePool::kSliceSize]{};
+        Connection conn{};
+        conn.reset();
+        conn.response_header_slice = header_storage;
+        conn.response_header_buf.bind(header_storage, sizeof(header_storage));
+        conn.response_policy_id = 1;
+        conn.keep_alive = true;
+        conn.req_client_keep_alive = true;
+
+        HttpResponseParser parser;
+        ParsedResponse response;
+        parser.reset();
+        response.reset();
+        if (parser.parse(reinterpret_cast<const u8*>(upstream.data()),
+                         static_cast<u32>(upstream.size()),
+                         &response) != ParseStatus::Complete)
+            return false;
+        return build_strict_response_headers(conn, config, response);
+    };
+
+    for (u32 t = 0; t < kEnvoyInlineResponseHeaderCount; t++) {
+        const Str name = kEnvoyInlineResponseHeaders[t];
+        const std::string name_str(name.ptr, name.len);
+        // `keep-alive`, `upgrade`, and `proxy-connection` are always dropped
+        // by the fixed hop-by-hop set before serialization (never forwarded,
+        // `hide_headers` or not), so a duplicate of one of them can never
+        // reach the wire and must be accepted, not rejected.
+        const bool always_dropped = name.eq({"keep-alive", 10}) || name.eq({"upgrade", 7}) ||
+                                    name.eq({"proxy-connection", 16});
+
+        if (always_dropped) {
+            CHECK(admits("HTTP/1.1 200 OK\r\n" + name_str + ": a\r\nContent-Length: 2\r\n" +
+                         name_str + ": b\r\n\r\nhi"));
+        } else {
+            // Two occurrences of this inline header must fail closed (502).
+            CHECK_FALSE(admits("HTTP/1.1 200 OK\r\n" + name_str + ": a\r\nContent-Length: 2\r\n" +
+                               name_str + ": b\r\n\r\nhi"));
+        }
+
+        // A single occurrence of the same header must still be accepted.
+        CHECK(admits("HTTP/1.1 200 OK\r\n" + name_str + ": a\r\nContent-Length: 2\r\n\r\nhi"));
+    }
+
+    // A non-inline header may still repeat: this profile forwards ordinary
+    // headers verbatim in upstream order without deduplicating them.
+    CHECK(admits("HTTP/1.1 200 OK\r\nx-custom: a\r\nContent-Length: 2\r\nx-custom: b\r\n\r\nhi"));
+}
+
+// Codex round-15 review (PR #698, thread PRRT_kwDORsELtc6mNHbY): a second,
+// independent angle on the same bug, using `hide_headers` instead of a
+// hop-by-hop name. Two copies of an inline header (`Content-Type`) that
+// `hide_headers` names are also dropped by the second loop unconditionally
+// (the hide check runs before either occurrence could be written), so they
+// can never produce two physical lines either and duplicating them must not
+// fail the response closed. A duplicate of the same name with no
+// `hide_headers` entry still fails closed (502), proving the exemption is
+// specific to headers this policy actually drops.
+TEST(response_policy, upstream_header_order_accepts_duplicate_of_hidden_inline_header) {
+    char server[] = "envoy";
+    ForwardResponsePolicySpec upstream_order{};
+    upstream_order.version = ResponsePolicyVersion::Http11;
+    upstream_order.framing = ResponsePolicyFraming::ContentLength;
+    upstream_order.connection = ResponsePolicyConnection::Request;
+    upstream_order.header_order = ResponsePolicyHeaderOrder::Upstream;
+    upstream_order.header_names = ResponsePolicyHeaderNames::Lowercase;
+    upstream_order.connection_header = ResponsePolicyConnectionHeader::CloseOnly;
+    upstream_order.status_reason = ResponsePolicyStatusReason::Canonical;
+    upstream_order.date = ResponsePolicyDate::PreserveOrCurrent;
+    upstream_order.server = {server, 5};
+    upstream_order.hide_header_count = 1;
+    upstream_order.hide_headers[0] = {"Content-Type", 12};
+    REQUIRE(response_policy_spec_valid(upstream_order));
+
+    RouteConfig config{};
+    REQUIRE_EQ(config.add_response_policy(upstream_order), 1u);
+
+    auto admits = [&](const std::string& upstream, std::string* out_headers) {
+        u8 header_storage[SlicePool::kSliceSize]{};
+        Connection conn{};
+        conn.reset();
+        conn.response_header_slice = header_storage;
+        conn.response_header_buf.bind(header_storage, sizeof(header_storage));
+        conn.response_policy_id = 1;
+        conn.keep_alive = true;
+        conn.req_client_keep_alive = true;
+
+        HttpResponseParser parser;
+        ParsedResponse response;
+        parser.reset();
+        response.reset();
+        if (parser.parse(reinterpret_cast<const u8*>(upstream.data()),
+                         static_cast<u32>(upstream.size()),
+                         &response) != ParseStatus::Complete)
+            return false;
+        if (!build_strict_response_headers(conn, config, response)) return false;
+        if (out_headers != nullptr)
+            *out_headers =
+                std::string(reinterpret_cast<const char*>(conn.response_header_buf.data()),
+                            conn.response_header_buf.len());
+        return true;
+    };
+
+    // Two `Content-Type` fields, but this policy hides `Content-Type`: both
+    // are dropped before serialization, so the duplicate never reaches the
+    // wire and must be accepted.
+    std::string headers;
+    CHECK(
+        admits("HTTP/1.1 200 OK\r\nContent-Type: a\r\nContent-Length: 2\r\n"
+               "Content-Type: b\r\n\r\nhi",
+               &headers));
+    CHECK_FALSE(buf_has(reinterpret_cast<const u8*>(headers.data()),
+                        static_cast<u32>(headers.size()),
+                        "content-type"));
+
+    // Same duplicate, no `hide_headers` entry for it this time: still fails
+    // closed, proving the exemption above is specific to a name this policy
+    // actually drops, not a blanket relaxation of the Content-Type check.
+    ForwardResponsePolicySpec not_hidden = upstream_order;
+    not_hidden.hide_header_count = 0;
+    RouteConfig config_not_hidden{};
+    REQUIRE_EQ(config_not_hidden.add_response_policy(not_hidden), 1u);
+    auto admits_not_hidden = [&](const std::string& upstream) {
+        u8 header_storage[SlicePool::kSliceSize]{};
+        Connection conn{};
+        conn.reset();
+        conn.response_header_slice = header_storage;
+        conn.response_header_buf.bind(header_storage, sizeof(header_storage));
+        conn.response_policy_id = 1;
+        conn.keep_alive = true;
+        conn.req_client_keep_alive = true;
+
+        HttpResponseParser parser;
+        ParsedResponse response;
+        parser.reset();
+        response.reset();
+        if (parser.parse(reinterpret_cast<const u8*>(upstream.data()),
+                         static_cast<u32>(upstream.size()),
+                         &response) != ParseStatus::Complete)
+            return false;
+        return build_strict_response_headers(conn, config_not_hidden, response);
+    };
+    CHECK_FALSE(
+        admits_not_hidden("HTTP/1.1 200 OK\r\nContent-Type: a\r\nContent-Length: 2\r\n"
+                          "Content-Type: b\r\n\r\nhi"));
+}
+
+// Codex round-17 review (PR #698, thread PRRT_kwDORsELtc6mNyqG): `grpc-status`
+// and `grpc-message` are named inline response headers at v1.39.1
+// (`envoy/http/header_map.h`: `INLINE_RESP_STRING_HEADERS_TRAILERS` ->
+// `GrpcMessage`, `INLINE_RESP_NUMERIC_HEADERS_TRAILERS` -> `GrpcStatus`,
+// both mixed into `ResponseHeaderOrTrailerMap`, the base `ResponseHeaderMap`
+// itself inherits -- despite the "_TRAILERS" macro name, this is not
+// trailer-only) but were missing from `kEnvoyInlineResponseHeaders`, the
+// same gap class as the earlier `cache-control`/CORS-header rounds. This
+// test independently transcribes the *complete* macro-defined inline set
+// `ResponseHeaderMap` inherits (every response-relevant name across
+// `INLINE_REQ_RESP_STRING_HEADERS`, `INLINE_REQ_RESP_NUMERIC_HEADERS`,
+// `INLINE_RESP_STRING_HEADERS`, `INLINE_RESP_NUMERIC_HEADERS`,
+// `INLINE_RESP_STRING_HEADERS_TRAILERS`, and
+// `INLINE_RESP_NUMERIC_HEADERS_TRAILERS`) plus the custom-registered inline
+// set from the citation above `kEnvoyInlineResponseHeaders`, and asserts the
+// runtime table is exactly that set -- not merely a superset or a spot check
+// -- so a future gap in either source is a hard test failure regardless of
+// which specific name is missing.
+TEST(response_policy, kEnvoyInlineResponseHeaders_matches_full_envoy_inline_inventory) {
+    // Every name `envoy/http/header_map.h` (v1.39.1) gives an O(1) inline
+    // slot that `ResponseHeaderMap` inherits, transcribed independently of
+    // `kEnvoyInlineResponseHeaders`. Excludes the five names deliberately
+    // carved out with their own special-cased handling in
+    // `build_upstream_order_response_headers` (documented on
+    // `kEnvoyInlineResponseHeaders` above): `content-length`, `server`,
+    // `connection`, `transfer-encoding`, and the HTTP/2-only `:status`
+    // pseudo-header (`Status`, never a literal HTTP/1.1 field).
+    static const Str kExpectedMacroDefined[] = {
+        // INLINE_REQ_RESP_STRING_HEADERS (minus `connection`, handled
+        // separately) + INLINE_REQ_RESP_NUMERIC_HEADERS (minus
+        // `content-length`, handled separately).
+        lit_str("content-type"),
+        lit_str("x-envoy-decorator-operation"),
+        lit_str("keep-alive"),
+        lit_str("proxy-connection"),
+        lit_str("proxy-status"),
+        lit_str("x-request-id"),
+        lit_str("transfer-encoding"),  // excluded below; listed here for audit completeness
+        lit_str("upgrade"),
+        lit_str("via"),
+        lit_str("x-envoy-attempt-count"),
+        // INLINE_RESP_STRING_HEADERS (minus `server`) + INLINE_RESP_NUMERIC_
+        // HEADERS (minus the `:status` pseudo-header).
+        lit_str("date"),
+        lit_str("x-envoy-degraded"),
+        lit_str("x-envoy-immediate-health-check-fail"),
+        lit_str("x-envoy-ratelimited"),
+        lit_str("x-envoy-upstream-canary"),
+        lit_str("x-envoy-upstream-healthchecked-cluster"),
+        lit_str("location"),
+        lit_str("x-envoy-upstream-service-time"),
+        // INLINE_RESP_STRING_HEADERS_TRAILERS + INLINE_RESP_NUMERIC_HEADERS_
+        // TRAILERS -- the round-17 gap.
+        lit_str("grpc-message"),
+        lit_str("grpc-status"),
+    };
+    // Custom-registered inline slots (`Http::RegisterCustomInlineHeader<
+    // Type::ResponseHeaders>`), transcribed independently from the citation
+    // above `kEnvoyInlineResponseHeaders`.
+    static const Str kExpectedCustomRegistered[] = {
+        lit_str("cache-control"),
+        lit_str("content-encoding"),
+        lit_str("last-modified"),
+        lit_str("etag"),
+        lit_str("age"),
+        lit_str("expires"),
+        lit_str("vary"),
+        lit_str("access-control-allow-origin"),
+        lit_str("access-control-allow-credentials"),
+        lit_str("access-control-allow-methods"),
+        lit_str("access-control-allow-headers"),
+        lit_str("access-control-max-age"),
+        lit_str("access-control-expose-headers"),
+        lit_str("access-control-allow-private-network"),
+    };
+    static const char* const kDeliberatelyExcluded[] = {
+        "content-length", "server", "connection", "transfer-encoding", ":status"};
+
+    auto in_table = [&](const Str& name) {
+        for (u32 t = 0; t < kEnvoyInlineResponseHeaderCount; t++) {
+            const Str& tn = kEnvoyInlineResponseHeaders[t];
+            if (tn.len == name.len && http_header_name_eq_ci(tn.ptr, tn.len, name.ptr, name.len))
+                return true;
+        }
+        return false;
+    };
+    auto is_excluded = [&](const Str& name) {
+        for (const char* ex : kDeliberatelyExcluded) {
+            const u32 exlen = static_cast<u32>(__builtin_strlen(ex));
+            if (exlen == name.len && http_header_name_eq_ci(ex, exlen, name.ptr, name.len))
+                return true;
+        }
+        return false;
+    };
+
+    // Every non-excluded macro-defined name must be in the table.
+    u32 expected_count = 0;
+    for (const Str& name : kExpectedMacroDefined) {
+        if (is_excluded(name)) continue;
+        expected_count++;
+        CHECK(in_table(name));
+    }
+    // Every custom-registered name must be in the table.
+    for (const Str& name : kExpectedCustomRegistered) {
+        expected_count++;
+        CHECK(in_table(name));
+    }
+    // And the table must contain nothing beyond this union -- a name added
+    // to the runtime table without a matching, audited source above (or vice
+    // versa) is a hard failure either way.
+    CHECK_EQ(kEnvoyInlineResponseHeaderCount, expected_count);
+}
+
+// Codex round-19 review (PR #698, thread PRRT_kwDORsELtc6mOfM2): this
+// profile's fixed hop-by-hop skip list used to drop `te` and `trailer`
+// unconditionally, but Envoy's `ConnectionManagerUtility::mutateResponseHeaders`
+// (source/common/http/conn_manager_utility.cc, v1.39.1) only calls
+// `removeConnection`/`removeUpgrade`/`removeTransferEncoding`/
+// `removeKeepAlive`/`removeProxyConnection` -- five calls, never `te` or
+// `trailer`. `TE` (`Headers::get().TE`) is request-only
+// (`INLINE_REQ_STRING_HEADERS`) and `removeTE()` is called solely from
+// `mutateRequestHeaders`; `Trailer` has no inline slot and no `remove*()`
+// call anywhere in that file or the HTTP/1 codec's response encoding path.
+// Both are ordinary headers on the response side and a real Envoy forwards
+// either unchanged on a fixed-length (`Content-Length`) response, so this
+// profile must too.
+TEST(response_policy, upstream_header_order_forwards_te_and_trailer_response_fields) {
+    char server[] = "envoy";
+    ForwardResponsePolicySpec upstream_order{};
+    upstream_order.version = ResponsePolicyVersion::Http11;
+    upstream_order.framing = ResponsePolicyFraming::ContentLength;
+    upstream_order.connection = ResponsePolicyConnection::Request;
+    upstream_order.header_order = ResponsePolicyHeaderOrder::Upstream;
+    upstream_order.header_names = ResponsePolicyHeaderNames::Lowercase;
+    upstream_order.connection_header = ResponsePolicyConnectionHeader::CloseOnly;
+    upstream_order.status_reason = ResponsePolicyStatusReason::Canonical;
+    upstream_order.date = ResponsePolicyDate::PreserveOrCurrent;
+    upstream_order.server = {server, 5};
+    REQUIRE(response_policy_spec_valid(upstream_order));
+
+    RouteConfig config{};
+    REQUIRE_EQ(config.add_response_policy(upstream_order), 1u);
+
+    u8 header_storage[SlicePool::kSliceSize]{};
+    Connection conn{};
+    conn.reset();
+    conn.response_header_slice = header_storage;
+    conn.response_header_buf.bind(header_storage, sizeof(header_storage));
+    conn.response_policy_id = 1;
+    conn.keep_alive = true;
+    conn.req_client_keep_alive = true;
+
+    static constexpr char kUpstream[] =
+        "HTTP/1.1 200 OK\r\nTrailer: X-Checksum\r\n"
+        "Content-Length: 2\r\nTE: trailers\r\n\r\nhi";
+    HttpResponseParser parser;
+    ParsedResponse response;
+    parser.reset();
+    response.reset();
+    REQUIRE_EQ(
+        parser.parse(reinterpret_cast<const u8*>(kUpstream), sizeof(kUpstream) - 1u, &response),
+        ParseStatus::Complete);
+    REQUIRE(build_strict_response_headers(conn, config, response));
+    CHECK(buf_has(conn.response_header_buf.data(),
+                  conn.response_header_buf.len(),
+                  "trailer: X-Checksum\r\n"));
+    CHECK(buf_has(
+        conn.response_header_buf.data(), conn.response_header_buf.len(), "te: trailers\r\n"));
+}
+
+// Codex round-11 review (PR #698, thread PRRT_kwDORsELtc6mJf61): the
+// `header_order: "upstream"` admission in `build_upstream_order_response_headers`
+// accepts every status 200..599 except the no-body codes 204/205/304, but
+// `canonical_status_reason` used to delegate to the much narrower legacy
+// `status_reason` table (14 codes) and fail closed on anything it didn't
+// name -- so an admitted status like 202, 206, 307, 308, 409, 422, or 504
+// was silently rejected (502) instead of forwarded with its canonical
+// phrase. This table is copied independently from Envoy's own
+// `CodeUtility::toString` (source/common/http/codes.cc, v1.39.1) rather than
+// calling `canonical_status_reason` for the expected value, so the test
+// cannot pass merely by reflecting whatever the implementation does; a
+// status Envoy's switch does not name falls back to "Unknown", matching
+// `CodeUtility::toString`'s own fallthrough.
+TEST(response_policy, upstream_header_order_canonical_reason_covers_admitted_domain) {
+    struct Expected {
+        u16 code;
+        const char* reason;
+    };
+    // Every case in Envoy's `CodeUtility::toString` switch (envoy/http/codes.h
+    // for the numeric values, source/common/http/codes.cc for the phrases).
+    static const Expected kEnvoyNamed[] = {
+        {100, "Continue"},
+        {101, "Switching Protocols"},
+        {200, "OK"},
+        {201, "Created"},
+        {202, "Accepted"},
+        {203, "Non-Authoritative Information"},
+        {204, "No Content"},
+        {205, "Reset Content"},
+        {206, "Partial Content"},
+        {207, "Multi-Status"},
+        {208, "Already Reported"},
+        {226, "IM Used"},
+        {300, "Multiple Choices"},
+        {301, "Moved Permanently"},
+        {302, "Found"},
+        {303, "See Other"},
+        {304, "Not Modified"},
+        {305, "Use Proxy"},
+        {307, "Temporary Redirect"},
+        {308, "Permanent Redirect"},
+        {400, "Bad Request"},
+        {401, "Unauthorized"},
+        {402, "Payment Required"},
+        {403, "Forbidden"},
+        {404, "Not Found"},
+        {405, "Method Not Allowed"},
+        {406, "Not Acceptable"},
+        {407, "Proxy Authentication Required"},
+        {408, "Request Timeout"},
+        {409, "Conflict"},
+        {410, "Gone"},
+        {411, "Length Required"},
+        {412, "Precondition Failed"},
+        {413, "Payload Too Large"},
+        {414, "URI Too Long"},
+        {415, "Unsupported Media Type"},
+        {416, "Range Not Satisfiable"},
+        {417, "Expectation Failed"},
+        {421, "Misdirected Request"},
+        {422, "Unprocessable Entity"},
+        {423, "Locked"},
+        {424, "Failed Dependency"},
+        {425, "Too Early"},
+        {426, "Upgrade Required"},
+        {428, "Precondition Required"},
+        {429, "Too Many Requests"},
+        {431, "Request Header Fields Too Large"},
+        {500, "Internal Server Error"},
+        {501, "Not Implemented"},
+        {502, "Bad Gateway"},
+        {503, "Service Unavailable"},
+        {504, "Gateway Timeout"},
+        {505, "HTTP Version Not Supported"},
+        {506, "Variant Also Negotiates"},
+        {507, "Insufficient Storage"},
+        {508, "Loop Detected"},
+        {510, "Not Extended"},
+        {511, "Network Authentication Required"},
+        {599, "Last Unassigned Server Error Code"},
+    };
+    auto envoy_reason_for = [&](u16 code) -> std::string {
+        for (const auto& e : kEnvoyNamed)
+            if (e.code == code) return e.reason;
+        return "Unknown";
+    };
+
+    char server[] = "envoy";
+    ForwardResponsePolicySpec upstream_order{};
+    upstream_order.version = ResponsePolicyVersion::Http11;
+    upstream_order.framing = ResponsePolicyFraming::ContentLength;
+    upstream_order.connection = ResponsePolicyConnection::Request;
+    upstream_order.header_order = ResponsePolicyHeaderOrder::Upstream;
+    upstream_order.header_names = ResponsePolicyHeaderNames::Lowercase;
+    upstream_order.connection_header = ResponsePolicyConnectionHeader::CloseOnly;
+    upstream_order.status_reason = ResponsePolicyStatusReason::Canonical;
+    upstream_order.date = ResponsePolicyDate::PreserveOrCurrent;
+    upstream_order.server = {server, 5};
+    REQUIRE(response_policy_spec_valid(upstream_order));
+
+    RouteConfig config{};
+    REQUIRE_EQ(config.add_response_policy(upstream_order), 1u);
+
+    auto status_line_for = [&](u16 code, std::string* line) {
+        u8 header_storage[SlicePool::kSliceSize]{};
+        Connection conn{};
+        conn.reset();
+        conn.response_header_slice = header_storage;
+        conn.response_header_buf.bind(header_storage, sizeof(header_storage));
+        conn.response_policy_id = 1;
+        conn.keep_alive = true;
+        conn.req_client_keep_alive = true;
+
+        char digits[3] = {static_cast<char>('0' + code / 100),
+                          static_cast<char>('0' + (code / 10) % 10),
+                          static_cast<char>('0' + code % 10)};
+        // Craft the raw upstream status line with the code under test but a
+        // dummy reason phrase, so a pass here can only be explained by the
+        // canonical replacement -- not by accidentally forwarding the
+        // upstream's own reason.
+        const std::string raw = "HTTP/1.1 " + std::string(digits, 3) +
+                                " placeholder-reason-phrase\r\nContent-Length: 2\r\n\r\nhi";
+        HttpResponseParser parser;
+        ParsedResponse response;
+        parser.reset();
+        response.reset();
+        if (parser.parse(reinterpret_cast<const u8*>(raw.data()),
+                         static_cast<u32>(raw.size()),
+                         &response) != ParseStatus::Complete)
+            return false;
+        if (!build_strict_response_headers(conn, config, response)) return false;
+        *line = std::string(reinterpret_cast<const char*>(conn.response_header_buf.data()),
+                            conn.response_header_buf.len());
+        return true;
+    };
+
+    // Every status 200..599 except the no-body exclusions (204/205/304) must
+    // be admitted, and the status line must carry Envoy's exact canonical
+    // phrase for that code -- "Unknown" for one Envoy itself does not name.
+    for (u32 code = 200; code <= 599; code++) {
+        if (code == 204 || code == 205 || code == 304) continue;
+        std::string line;
+        const bool admitted = status_line_for(static_cast<u16>(code), &line);
+        CHECK(admitted);
+        if (!admitted) continue;
+        const std::string expected_status_line = "HTTP/1.1 " + std::to_string(code) + " " +
+                                                 envoy_reason_for(static_cast<u16>(code)) + "\r\n";
+        CHECK(line.find(expected_status_line) == 0);
+    }
+
+    // The three no-body exclusions remain rejected by the admission check
+    // itself (a separate concern from canonical-reason coverage), not by
+    // `canonical_status_reason` -- confirm they still fail closed here.
+    for (u16 code : {204, 205, 304}) {
+        std::string line;
+        CHECK_FALSE(status_line_for(code, &line));
+    }
+
+    // Direct spot checks named in the review thread, plus one Envoy leaves
+    // unnamed (299 has no assigned meaning; Envoy's own table omits it).
+    struct Spot {
+        u16 code;
+        const char* reason;
+    };
+    static const Spot kSpots[] = {
+        {202, "Accepted"},
+        {206, "Partial Content"},
+        {307, "Temporary Redirect"},
+        {308, "Permanent Redirect"},
+        {409, "Conflict"},
+        {422, "Unprocessable Entity"},
+        {504, "Gateway Timeout"},
+        {299, "Unknown"},
+    };
+    for (const auto& s : kSpots) {
+        Str out{};
+        REQUIRE(canonical_status_reason(s.code, &out));
+        CHECK_EQ(out.len, static_cast<u32>(__builtin_strlen(s.reason)));
+        CHECK(__builtin_memcmp(out.ptr, s.reason, out.len) == 0);
+
+        std::string line;
+        REQUIRE(status_line_for(s.code, &line));
+        const std::string expected_status_line =
+            "HTTP/1.1 " + std::to_string(s.code) + " " + s.reason + "\r\n";
+        CHECK(line.find(expected_status_line) == 0);
+    }
+
+    // `canonical_status_reason` never fails closed for a real `out` pointer
+    // now -- only a null one is rejected.
+    CHECK_FALSE(canonical_status_reason(200, nullptr));
+}
+
+// Codex round-13 review (PR #698, thread PRRT_kwDORsELtc6mLL_8): asked for
+// the runtime table to be checked against a test-owned, independent
+// transcription of the *complete* `enum class Code`
+// (envoy/http/codes.h, Envoy v1.39.1) so no entry can be missed again, and
+// specifically named 418 and 451 as allegedly-missing named codes.
+//
+// Verified against the pinned v1.39.1 source directly (raw.githubusercontent
+// .com/envoyproxy/envoy/v1.39.1/envoy/http/codes.h, cross-checked byte for
+// byte against an independent CDN mirror, and against the full release
+// tarball from codeload.github.com/envoyproxy/envoy/tar.gz/refs/tags/v1.39.1):
+// `enum class Code` has exactly 59 enumerators (the `kFullEnvoyCodeEnum`
+// table below, transcribed independently of `envoy_canonical_status_reason_
+// table` in src/runtime/callbacks.cc) and neither 418 nor 451 is one of
+// them, in this header or in `CodeUtility::toString`
+// (source/common/http/codes.cc). A repo-wide grep of the entire v1.39.1
+// release tree found 451 ("Unavailable For Legal Reasons") in exactly two
+// places, neither of which is this table: `mobile/library/java/org/
+// chromium/net/impl/HttpReason.java` (Envoy Mobile's separate Java
+// Cronet-compatibility shim, a different language and subsystem from the
+// core HTTP/1 proxy codec) and `bazel/external/http_parser/http_parser.h`
+// (a vendored third-party dependency, nodejs's `http_parser`, with its own
+// independent `HTTP_STATUS_MAP` macro -- and that vendored table does not
+// even name 418 either). 418 does not appear anywhere in the v1.39.1 tree
+// as a named status code; every "418" hit is an unrelated numeric
+// coincidence (lockfile versions, unrelated test literals using 418 as an
+// arbitrary example status). So `canonical_status_reason(418, ...)` and
+// `canonical_status_reason(451, ...)` correctly return `"Unknown"` --
+// exactly what a real Envoy v1.39.1's `CodeUtility::toString` would return
+// for these values, since neither is a `Code` enumerator at this pinned
+// version. This test asserts the runtime table against literally every
+// entry of the complete enum (closing the round-13 ask precisely) and
+// pins 418/451/299 to "Unknown" as the correct, Envoy-matching behavior
+// rather than a gap.
+TEST(response_policy, upstream_header_order_canonical_reason_matches_full_envoy_code_enum) {
+    struct Named {
+        u16 code;
+        const char* reason;
+    };
+    // Every enumerator of `enum class Code` (envoy/http/codes.h, v1.39.1),
+    // transcribed independently of src/runtime/callbacks.cc.
+    static const Named kFullEnvoyCodeEnum[] = {
+        {100, "Continue"},
+        {101, "Switching Protocols"},
+        {200, "OK"},
+        {201, "Created"},
+        {202, "Accepted"},
+        {203, "Non-Authoritative Information"},
+        {204, "No Content"},
+        {205, "Reset Content"},
+        {206, "Partial Content"},
+        {207, "Multi-Status"},
+        {208, "Already Reported"},
+        {226, "IM Used"},
+        {300, "Multiple Choices"},
+        {301, "Moved Permanently"},
+        {302, "Found"},
+        {303, "See Other"},
+        {304, "Not Modified"},
+        {305, "Use Proxy"},
+        {307, "Temporary Redirect"},
+        {308, "Permanent Redirect"},
+        {400, "Bad Request"},
+        {401, "Unauthorized"},
+        {402, "Payment Required"},
+        {403, "Forbidden"},
+        {404, "Not Found"},
+        {405, "Method Not Allowed"},
+        {406, "Not Acceptable"},
+        {407, "Proxy Authentication Required"},
+        {408, "Request Timeout"},
+        {409, "Conflict"},
+        {410, "Gone"},
+        {411, "Length Required"},
+        {412, "Precondition Failed"},
+        {413, "Payload Too Large"},
+        {414, "URI Too Long"},
+        {415, "Unsupported Media Type"},
+        {416, "Range Not Satisfiable"},
+        {417, "Expectation Failed"},
+        {421, "Misdirected Request"},
+        {422, "Unprocessable Entity"},
+        {423, "Locked"},
+        {424, "Failed Dependency"},
+        {425, "Too Early"},
+        {426, "Upgrade Required"},
+        {428, "Precondition Required"},
+        {429, "Too Many Requests"},
+        {431, "Request Header Fields Too Large"},
+        {500, "Internal Server Error"},
+        {501, "Not Implemented"},
+        {502, "Bad Gateway"},
+        {503, "Service Unavailable"},
+        {504, "Gateway Timeout"},
+        {505, "HTTP Version Not Supported"},
+        {506, "Variant Also Negotiates"},
+        {507, "Insufficient Storage"},
+        {508, "Loop Detected"},
+        {510, "Not Extended"},
+        {511, "Network Authentication Required"},
+        {599, "Last Unassigned Server Error Code"},
+    };
+    CHECK_EQ(sizeof(kFullEnvoyCodeEnum) / sizeof(kFullEnvoyCodeEnum[0]), 59u);
+
+    auto expected_reason_for = [&](u16 code) -> std::string {
+        for (const auto& e : kFullEnvoyCodeEnum)
+            if (e.code == code) return e.reason;
+        return "Unknown";
+    };
+
+    // Every named enumerator must round-trip through the runtime table
+    // exactly -- this is the literal "assert the runtime table matches
+    // every entry" check the round-13 review asked for.
+    for (const auto& e : kFullEnvoyCodeEnum) {
+        Str out{};
+        REQUIRE(canonical_status_reason(e.code, &out));
+        CHECK_EQ(out.len, static_cast<u32>(__builtin_strlen(e.reason)));
+        CHECK(__builtin_memcmp(out.ptr, e.reason, out.len) == 0);
+    }
+
+    // Every three-digit value NOT in the enum -- including the two the
+    // round-13 finding claimed were missing -- must map to "Unknown",
+    // matching `CodeUtility::toString`'s own fallthrough for an unmatched
+    // `Code` value. 418 and 451 are pinned explicitly per the evidence
+    // above; the rest of the sweep guards against any other gap.
+    for (u32 code = 100; code <= 599; code++) {
+        const std::string expected = expected_reason_for(static_cast<u16>(code));
+        Str out{};
+        REQUIRE(canonical_status_reason(static_cast<u16>(code), &out));
+        CHECK_EQ(out.len, static_cast<u32>(expected.size()));
+        CHECK(__builtin_memcmp(out.ptr, expected.data(), out.len) == 0);
+    }
+    for (u16 code : {418, 451}) {
+        Str out{};
+        REQUIRE(canonical_status_reason(code, &out));
+        CHECK_EQ(out.len, 7u);
+        CHECK(__builtin_memcmp(out.ptr, "Unknown", 7) == 0);
+    }
+}
+
+// Codex round-10 review: if graceful drain begins after this request was
+// admitted (keep-alive already granted at the request boundary, mirroring
+// real ingress's `conn.keep_alive = !loop->is_draining()` at admission time)
+// but before the upstream response is serialized, this profile's keep-alive
+// decision used to consult only `conn.keep_alive` and the response policy's
+// own connection intent -- never the shard's current drain state -- so a
+// keep-alive response could still reach the client even though
+// `on_response_sent` (and `on_validated_preconnect_failure_sent`)
+// unconditionally close the connection once `loop->is_draining()`. That would
+// let an HTTP/1.1 client pipeline or reuse a connection for a successor
+// request that can never be served. `build_strict_response_headers` /
+// `build_upstream_order_response_headers` now take a trailing `draining`
+// argument -- threaded from `loop->is_draining()` at both call sites in
+// `on_upstream_response` -- and fold it into the decision exactly as the
+// transparent `build_h1_forward_response_headers` already does with its own
+// `draining` parameter.
+TEST(response_policy, upstream_header_order_advertises_close_when_draining) {
+    char server[] = "envoy";
+    ForwardResponsePolicySpec upstream_order{};
+    upstream_order.version = ResponsePolicyVersion::Http11;
+    upstream_order.framing = ResponsePolicyFraming::ContentLength;
+    upstream_order.connection = ResponsePolicyConnection::Request;
+    upstream_order.header_order = ResponsePolicyHeaderOrder::Upstream;
+    upstream_order.header_names = ResponsePolicyHeaderNames::Lowercase;
+    upstream_order.connection_header = ResponsePolicyConnectionHeader::CloseOnly;
+    upstream_order.status_reason = ResponsePolicyStatusReason::Canonical;
+    upstream_order.date = ResponsePolicyDate::PreserveOrCurrent;
+    upstream_order.server = {server, 5};
+    REQUIRE(response_policy_spec_valid(upstream_order));
+
+    RouteConfig config{};
+    REQUIRE_EQ(config.add_response_policy(upstream_order), 1u);
+
+    static constexpr char kUpstream[] = "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nhi";
+
+    // The shard began draining between request admission and this upstream
+    // response arriving: the response must advertise `connection: close`
+    // even though the request was admitted keep-alive and the policy/client
+    // both want keep-alive.
+    {
+        u8 header_storage[SlicePool::kSliceSize]{};
+        Connection conn{};
+        conn.reset();
+        conn.response_header_slice = header_storage;
+        conn.response_header_buf.bind(header_storage, sizeof(header_storage));
+        conn.response_policy_id = 1;
+        conn.keep_alive = true;
+        conn.req_client_keep_alive = true;
+
+        HttpResponseParser parser;
+        ParsedResponse response;
+        parser.reset();
+        response.reset();
+        REQUIRE_EQ(
+            parser.parse(reinterpret_cast<const u8*>(kUpstream), sizeof(kUpstream) - 1u, &response),
+            ParseStatus::Complete);
+        REQUIRE(build_strict_response_headers(
+            conn, config, response, Http1PrebuiltResponsePurpose::None, /*draining=*/true));
+        CHECK(buf_has(conn.response_header_buf.data(),
+                      conn.response_header_buf.len(),
+                      "connection: close\r\n"));
+        CHECK_FALSE(conn.keep_alive);
+    }
+
+    // Sanity check: the identical request/response shape with no drain stays
+    // keep-alive -- proving the close above is specific to the drain state,
+    // not a regression that now always closes this profile's connection.
+    {
+        u8 header_storage[SlicePool::kSliceSize]{};
+        Connection conn{};
+        conn.reset();
+        conn.response_header_slice = header_storage;
+        conn.response_header_buf.bind(header_storage, sizeof(header_storage));
+        conn.response_policy_id = 1;
+        conn.keep_alive = true;
+        conn.req_client_keep_alive = true;
+
+        HttpResponseParser parser;
+        ParsedResponse response;
+        parser.reset();
+        response.reset();
+        REQUIRE_EQ(
+            parser.parse(reinterpret_cast<const u8*>(kUpstream), sizeof(kUpstream) - 1u, &response),
+            ParseStatus::Complete);
+        REQUIRE(build_strict_response_headers(conn, config, response));
+        CHECK_FALSE(buf_has(conn.response_header_buf.data(),
+                            conn.response_header_buf.len(),
+                            "connection: close\r\n"));
+        CHECK(conn.keep_alive);
+    }
+}
+
 TEST(response_policy, failure_head_mode_config_copy_is_owned_and_deduplicated) {
     char reason[] = "Bad Gateway";
     char type[] = "text/plain";
@@ -1999,6 +3206,79 @@ TEST(response_policy, none_buffering_bundle_keeps_timeout_and_head_compatibility
     CHECK(config.policy_bundle_id_is_valid(4));
     config.policy_bundles[3].failure_policy_id = failure_id;
     CHECK_FALSE(config.policy_bundle_id_is_valid(4));
+}
+
+// Codex review: `header_order: "upstream"` is ordinary-forward-only (see
+// analyze.cc and compile_to_config.h); a native caller building a
+// RouteConfig directly (bypassing RIR compilation) must not be able to
+// publish a bundle pairing it with response read timing, response
+// buffering, or a timeout failure policy. `add_policy_bundle` rejects the
+// combination at construction, and `policy_bundle_id_is_valid` -- the
+// trust boundary `forward_policy_tables_valid()` relies on -- rejects it
+// too for a bundle forged directly into the table.
+TEST(response_policy, upstream_header_order_bundle_rejects_timing_buffering_and_timeout) {
+    auto make_upstream_order = [](ForwardResponsePolicySpec base) {
+        base.header_order = ResponsePolicyHeaderOrder::Upstream;
+        base.header_names = ResponsePolicyHeaderNames::Lowercase;
+        base.connection_header = ResponsePolicyConnectionHeader::CloseOnly;
+        base.status_reason = ResponsePolicyStatusReason::Canonical;
+        base.date = ResponsePolicyDate::PreserveOrCurrent;
+        return base;
+    };
+
+    RouteConfig config{};
+    u16 response_id = 0;
+    u16 failure_id = 0;
+    u16 timeout_id = 0;
+    REQUIRE(add_response_policy_test_roles(config, response_id, failure_id, timeout_id));
+    const u16 upstream_id =
+        config.add_response_policy(make_upstream_order(config.response_policies[response_id - 1]));
+    REQUIRE_NE(upstream_id, 0u);
+
+    // Ordinary-forward-only usage (no timeout, no read timeout, no
+    // buffering) is still admitted.
+    CHECK_NE(config.add_policy_bundle(upstream_id, failure_id), 0u);
+    // Every one of the three restricted shapes is rejected at construction.
+    CHECK_EQ(config.add_policy_bundle(upstream_id, failure_id, 0, 5), 0u);
+    CHECK_EQ(config.add_policy_bundle(upstream_id, failure_id, timeout_id), 0u);
+    CHECK_EQ(config.add_policy_bundle(upstream_id,
+                                      failure_id,
+                                      timeout_id,
+                                      5,
+                                      ForwardResponseBufferingMode::CompleteContentLength),
+             0u);
+
+    // A hand-built config that skipped add_policy_bundle (or a future
+    // non-RIR frontend that bypasses analyze.cc) must still be rejected by
+    // the trust boundary forward_policy_tables_valid() relies on.
+    RouteConfig forged{};
+    u16 forged_response_id = 0;
+    u16 forged_failure_id = 0;
+    u16 forged_timeout_id = 0;
+    REQUIRE(add_response_policy_test_roles(
+        forged, forged_response_id, forged_failure_id, forged_timeout_id));
+    const u16 forged_upstream_id = forged.add_response_policy(
+        make_upstream_order(forged.response_policies[forged_response_id - 1]));
+    REQUIRE_NE(forged_upstream_id, 0u);
+    const u16 bundle_id = forged.add_policy_bundle(forged_upstream_id, forged_failure_id);
+    REQUIRE_NE(bundle_id, 0u);
+    CHECK(forged.policy_bundle_id_is_valid(bundle_id));
+    CHECK(forged.forward_policy_tables_valid());
+
+    forged.policy_bundles[bundle_id - 1].response_read_timeout_seconds = 5;
+    CHECK_FALSE(forged.policy_bundle_id_is_valid(bundle_id));
+    CHECK_FALSE(forged.forward_policy_tables_valid());
+    forged.policy_bundles[bundle_id - 1].response_read_timeout_seconds = 0;
+
+    forged.policy_bundles[bundle_id - 1].timeout_failure_policy_id = forged_timeout_id;
+    CHECK_FALSE(forged.policy_bundle_id_is_valid(bundle_id));
+    CHECK_FALSE(forged.forward_policy_tables_valid());
+    forged.policy_bundles[bundle_id - 1].timeout_failure_policy_id = 0;
+
+    forged.policy_bundles[bundle_id - 1].response_buffering =
+        ForwardResponseBufferingMode::CompleteContentLength;
+    CHECK_FALSE(forged.policy_bundle_id_is_valid(bundle_id));
+    CHECK_FALSE(forged.forward_policy_tables_valid());
 }
 
 TEST(response_read_timeout, h1_rejects_before_every_forward_effect_and_preserves_absence) {
@@ -14429,6 +15709,246 @@ TEST(upstream_reuse, capture_records_request_keep_alive) {
     c->recv_buf.write(reinterpret_cast<const u8*>(http10), sizeof(http10) - 1);
     rut::capture_request_metadata(*c);
     CHECK(!c->req_keep_alive);
+}
+
+// Codex round-8 review: the shared strict/upstream-order response-policy path
+// (`response_policy_id != 0` in on_upstream_response) used to compute
+// `conn.upstream_keep_alive` from the forwarded request's keep-alive intent
+// alone, ignoring the parsed response's own `Connection: close`. A keep-alive
+// client request whose origin replied with an explicit close would still have
+// its socket handed back to the idle pool, so the next request on the same
+// downstream connection could borrow a closing/dead upstream socket. Mirror
+// the transparent path's gate (`upstream_reuse.connection_close_request_not_pooled`
+// above): the response's own close signal must also veto reuse.
+TEST(upstream_reuse, upstream_order_profile_honors_response_connection_close) {
+    SmallLoop loop;
+    loop.setup();
+    RouteConfig cfg{};
+    REQUIRE(cfg.add_upstream("backend", 0x7F000001, 8080).has_value());
+    char server[] = "envoy";
+    ForwardResponsePolicySpec upstream_order{};
+    upstream_order.version = ResponsePolicyVersion::Http11;
+    upstream_order.framing = ResponsePolicyFraming::ContentLength;
+    upstream_order.connection = ResponsePolicyConnection::Request;
+    upstream_order.header_order = ResponsePolicyHeaderOrder::Upstream;
+    upstream_order.header_names = ResponsePolicyHeaderNames::Lowercase;
+    upstream_order.connection_header = ResponsePolicyConnectionHeader::CloseOnly;
+    upstream_order.status_reason = ResponsePolicyStatusReason::Canonical;
+    upstream_order.date = ResponsePolicyDate::PreserveOrCurrent;
+    upstream_order.server = {server, 5};
+    REQUIRE(response_policy_spec_valid(upstream_order));
+    REQUIRE_EQ(cfg.add_response_policy(upstream_order), 1u);
+
+    auto* conn = loop.alloc_conn();
+    REQUIRE(conn != nullptr);
+    struct ConnGuard {
+        SmallLoop* loop;
+        Connection* conn;
+        ~ConnGuard() {
+            if (conn != nullptr && (conn->fd >= 0 || conn->upstream_fd >= 0))
+                loop->close_conn(*conn);
+        }
+    } conn_guard{&loop, conn};
+
+    static constexpr char kRequest[] = "GET /x HTTP/1.1\r\nHost: client\r\n\r\n";
+    REQUIRE_EQ(conn->recv_buf.write(reinterpret_cast<const u8*>(kRequest), sizeof(kRequest) - 1),
+               sizeof(kRequest) - 1);
+    capture_request_metadata(*conn);
+    REQUIRE(conn->req_keep_alive);  // client asked to keep the connection alive
+    conn->request_config = &cfg;
+    conn->response_policy_id = 1;
+    conn->req_initial_send_len = conn->recv_buf.len();
+    conn->keep_alive = true;
+    REQUIRE(loop.alloc_upstream_buf(*conn));
+    REQUIRE(loop.alloc_response_header_buf(*conn));
+
+    // The origin's response is a self-framed HTTP/1.1 message that explicitly
+    // asks to close the connection after this reply.
+    static constexpr char kResponse[] =
+        "HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nhi";
+    REQUIRE_EQ(conn->upstream_recv_buf.write(reinterpret_cast<const u8*>(kResponse),
+                                             sizeof(kResponse) - 1),
+               sizeof(kResponse) - 1);
+    struct FdGuard {
+        i32 fd;
+        ~FdGuard() {
+            if (fd >= 0) close(fd);
+        }
+    } client_fd{dup(STDERR_FILENO)}, upstream_fd{dup(STDERR_FILENO)};
+    REQUIRE_GE(client_fd.fd, 0);
+    REQUIRE_GE(upstream_fd.fd, 0);
+    conn->fd = client_fd.fd;
+    conn->upstream_fd = upstream_fd.fd;
+    client_fd.fd = -1;
+    upstream_fd.fd = -1;
+    conn->upstream_slot_held = true;
+    conn->upstream_slot_uid = 0;
+    conn->upstream_recv_armed = true;
+    conn->upstream_send_armed = true;
+    conn->set_slots(
+        nullptr, nullptr, &on_upstream_response<SmallLoop>, &on_upstream_request_sent<SmallLoop>);
+    loop.backend.clear_ops();
+
+    on_upstream_response<SmallLoop>(
+        &loop,
+        *conn,
+        IoEvent{
+            conn->id, static_cast<i32>(sizeof(kResponse) - 1), 0, 0, IoEventType::UpstreamRecv, 0});
+
+    // The response was accepted and published downstream -- this is not a
+    // rejection test.
+    CHECK_EQ(conn->resp_status, 200u);
+    CHECK_EQ(loop.backend.count_ops(MockOp::Send), 1u);
+    // The origin explicitly asked to close: the upstream fd must never be
+    // pooled for reuse even though the client's own request was keep-alive.
+    CHECK_FALSE(conn->upstream_keep_alive);
+}
+
+// Codex round-16 review (PR #698, thread PRRT_kwDORsELtc6mNV_7): the
+// dedicated `connection_count` fail-closed check in
+// `build_upstream_order_response_headers` rejected an upstream response
+// carrying two `Connection` fields even though the serializer's own
+// hop-by-hop skip list drops every `Connection` occurrence unconditionally
+// -- neither one ever reaches the wire, so the duplicate can never produce
+// two physical lines and must not 502 an otherwise valid response. Direct
+// admission check (mirrors the round-15 `admits` pattern): two
+// `Connection: keep-alive` fields must still be accepted, and the resulting
+// status line/headers still forwarded, with no `connection` field on the
+// wire at all -- this profile always synthesizes its own persistence header.
+TEST(response_policy, upstream_header_order_accepts_duplicate_connection_header) {
+    char server[] = "envoy";
+    ForwardResponsePolicySpec upstream_order{};
+    upstream_order.version = ResponsePolicyVersion::Http11;
+    upstream_order.framing = ResponsePolicyFraming::ContentLength;
+    upstream_order.connection = ResponsePolicyConnection::Request;
+    upstream_order.header_order = ResponsePolicyHeaderOrder::Upstream;
+    upstream_order.header_names = ResponsePolicyHeaderNames::Lowercase;
+    upstream_order.connection_header = ResponsePolicyConnectionHeader::CloseOnly;
+    upstream_order.status_reason = ResponsePolicyStatusReason::Canonical;
+    upstream_order.date = ResponsePolicyDate::PreserveOrCurrent;
+    upstream_order.server = {server, 5};
+    REQUIRE(response_policy_spec_valid(upstream_order));
+
+    RouteConfig config{};
+    REQUIRE_EQ(config.add_response_policy(upstream_order), 1u);
+
+    u8 header_storage[SlicePool::kSliceSize]{};
+    Connection conn{};
+    conn.reset();
+    conn.response_header_slice = header_storage;
+    conn.response_header_buf.bind(header_storage, sizeof(header_storage));
+    conn.response_policy_id = 1;
+    conn.keep_alive = true;
+    conn.req_client_keep_alive = true;
+
+    static constexpr char kUpstream[] =
+        "HTTP/1.1 200 OK\r\nConnection: keep-alive\r\n"
+        "Content-Length: 2\r\nConnection: keep-alive\r\n\r\nhi";
+    HttpResponseParser parser;
+    ParsedResponse response;
+    parser.reset();
+    response.reset();
+    REQUIRE_EQ(
+        parser.parse(reinterpret_cast<const u8*>(kUpstream), sizeof(kUpstream) - 1u, &response),
+        ParseStatus::Complete);
+    REQUIRE(build_strict_response_headers(conn, config, response));
+    CHECK(buf_has(
+        conn.response_header_buf.data(), conn.response_header_buf.len(), "HTTP/1.1 200 OK\r\n"));
+    CHECK_FALSE(
+        buf_has(conn.response_header_buf.data(), conn.response_header_buf.len(), "connection:"));
+}
+
+// Codex round-16 review, second angle: a mixed duplicate -- one field says
+// `keep-alive`, the other `close` -- must also be accepted (neither reaches
+// the wire either way), and the upstream socket must still not be pooled:
+// `resp.connection_close` is computed once by the parser across every
+// physical `Connection` field with `close` sticky
+// (`match_connection_response`, src/runtime/http_parser.cc), independent of
+// field count or order, so `on_upstream_response`'s pooling decision already
+// honors it regardless of this serializer-level fix.
+TEST(upstream_reuse, upstream_order_profile_accepts_duplicate_connection_and_honors_close) {
+    SmallLoop loop;
+    loop.setup();
+    RouteConfig cfg{};
+    REQUIRE(cfg.add_upstream("backend", 0x7F000001, 8080).has_value());
+    char server[] = "envoy";
+    ForwardResponsePolicySpec upstream_order{};
+    upstream_order.version = ResponsePolicyVersion::Http11;
+    upstream_order.framing = ResponsePolicyFraming::ContentLength;
+    upstream_order.connection = ResponsePolicyConnection::Request;
+    upstream_order.header_order = ResponsePolicyHeaderOrder::Upstream;
+    upstream_order.header_names = ResponsePolicyHeaderNames::Lowercase;
+    upstream_order.connection_header = ResponsePolicyConnectionHeader::CloseOnly;
+    upstream_order.status_reason = ResponsePolicyStatusReason::Canonical;
+    upstream_order.date = ResponsePolicyDate::PreserveOrCurrent;
+    upstream_order.server = {server, 5};
+    REQUIRE(response_policy_spec_valid(upstream_order));
+    REQUIRE_EQ(cfg.add_response_policy(upstream_order), 1u);
+
+    auto* conn = loop.alloc_conn();
+    REQUIRE(conn != nullptr);
+    struct ConnGuard {
+        SmallLoop* loop;
+        Connection* conn;
+        ~ConnGuard() {
+            if (conn != nullptr && (conn->fd >= 0 || conn->upstream_fd >= 0))
+                loop->close_conn(*conn);
+        }
+    } conn_guard{&loop, conn};
+
+    static constexpr char kRequest[] = "GET /x HTTP/1.1\r\nHost: client\r\n\r\n";
+    REQUIRE_EQ(conn->recv_buf.write(reinterpret_cast<const u8*>(kRequest), sizeof(kRequest) - 1),
+               sizeof(kRequest) - 1);
+    capture_request_metadata(*conn);
+    REQUIRE(conn->req_keep_alive);  // client asked to keep the connection alive
+    conn->request_config = &cfg;
+    conn->response_policy_id = 1;
+    conn->req_initial_send_len = conn->recv_buf.len();
+    conn->keep_alive = true;
+    REQUIRE(loop.alloc_upstream_buf(*conn));
+    REQUIRE(loop.alloc_response_header_buf(*conn));
+
+    // The origin sends two `Connection` fields: one says `keep-alive`, the
+    // other `close`. Neither reaches the client either way (this profile
+    // drops every `Connection` occurrence unconditionally), but the `close`
+    // token must still veto upstream pooling.
+    static constexpr char kResponse[] =
+        "HTTP/1.1 200 OK\r\nConnection: keep-alive\r\n"
+        "Content-Length: 2\r\nConnection: close\r\n\r\nhi";
+    REQUIRE_EQ(conn->upstream_recv_buf.write(reinterpret_cast<const u8*>(kResponse),
+                                             sizeof(kResponse) - 1),
+               sizeof(kResponse) - 1);
+    struct FdGuard {
+        i32 fd;
+        ~FdGuard() {
+            if (fd >= 0) close(fd);
+        }
+    } client_fd{dup(STDERR_FILENO)}, upstream_fd{dup(STDERR_FILENO)};
+    REQUIRE_GE(client_fd.fd, 0);
+    REQUIRE_GE(upstream_fd.fd, 0);
+    conn->fd = client_fd.fd;
+    conn->upstream_fd = upstream_fd.fd;
+    client_fd.fd = -1;
+    upstream_fd.fd = -1;
+    conn->upstream_slot_held = true;
+    conn->upstream_slot_uid = 0;
+    conn->upstream_recv_armed = true;
+    conn->upstream_send_armed = true;
+    conn->set_slots(
+        nullptr, nullptr, &on_upstream_response<SmallLoop>, &on_upstream_request_sent<SmallLoop>);
+    loop.backend.clear_ops();
+
+    on_upstream_response<SmallLoop>(
+        &loop,
+        *conn,
+        IoEvent{
+            conn->id, static_cast<i32>(sizeof(kResponse) - 1), 0, 0, IoEventType::UpstreamRecv, 0});
+
+    // The duplicate `Connection` header did not turn this into a rejection.
+    CHECK_EQ(conn->resp_status, 200u);
+    CHECK_EQ(loop.backend.count_ops(MockOp::Send), 1u);
+    // The `close` token on the second field still vetoes reuse.
+    CHECK_FALSE(conn->upstream_keep_alive);
 }
 
 // === RouteTable validation ===

@@ -517,6 +517,165 @@ const char* status_reason(u16 code) {
     }
 }
 
+// Envoy H1 profile: mirrors `CodeUtility::toString`
+// (source/common/http/codes.cc, Envoy v1.39.1) exactly, including every
+// numeric `Code` value Envoy's header (envoy/http/codes.h) names -- not just
+// the small set the legacy `status_reason` table above covers for local
+// responses. Deliberately a separate table (not a delegation to
+// `status_reason`): the two tables serve different admission domains and
+// must not be coupled.
+//
+// Codex round-11 (PR #698): the `header_order: "upstream"` admission in
+// `build_upstream_order_response_headers` accepts every status 200..599
+// except the no-body codes 204/205/304. The original `canonical_status_reason`
+// delegated to `status_reason`, whose table only names 14 codes and falls
+// back to "Unknown" for everything else; this function used to detect that
+// fallback by content and fail closed, so an admitted-but-unlisted status
+// (e.g. 202, 206, 307, 308, 409, 422, 504) was silently rejected instead of
+// forwarded. Envoy itself never rejects here: `CodeUtility::toString` falls
+// through an unmatched `Code` to `return "Unknown";` and the caller still
+// sends that phrase on the wire. This table now does the same for any code
+// outside the named set -- it always succeeds (the only failure is a null
+// `out`).
+static const char* envoy_canonical_status_reason_table(u16 code) {
+    switch (code) {
+        // 1xx
+        case 100:
+            return "Continue";
+        case 101:
+            return "Switching Protocols";
+        // 2xx
+        case 200:
+            return "OK";
+        case 201:
+            return "Created";
+        case 202:
+            return "Accepted";
+        case 203:
+            return "Non-Authoritative Information";
+        case 204:
+            return "No Content";
+        case 205:
+            return "Reset Content";
+        case 206:
+            return "Partial Content";
+        case 207:
+            return "Multi-Status";
+        case 208:
+            return "Already Reported";
+        case 226:
+            return "IM Used";
+        // 3xx
+        case 300:
+            return "Multiple Choices";
+        case 301:
+            return "Moved Permanently";
+        case 302:
+            return "Found";
+        case 303:
+            return "See Other";
+        case 304:
+            return "Not Modified";
+        case 305:
+            return "Use Proxy";
+        case 307:
+            return "Temporary Redirect";
+        case 308:
+            return "Permanent Redirect";
+        // 4xx
+        case 400:
+            return "Bad Request";
+        case 401:
+            return "Unauthorized";
+        case 402:
+            return "Payment Required";
+        case 403:
+            return "Forbidden";
+        case 404:
+            return "Not Found";
+        case 405:
+            return "Method Not Allowed";
+        case 406:
+            return "Not Acceptable";
+        case 407:
+            return "Proxy Authentication Required";
+        case 408:
+            return "Request Timeout";
+        case 409:
+            return "Conflict";
+        case 410:
+            return "Gone";
+        case 411:
+            return "Length Required";
+        case 412:
+            return "Precondition Failed";
+        case 413:
+            return "Payload Too Large";
+        case 414:
+            return "URI Too Long";
+        case 415:
+            return "Unsupported Media Type";
+        case 416:
+            return "Range Not Satisfiable";
+        case 417:
+            return "Expectation Failed";
+        case 421:
+            return "Misdirected Request";
+        case 422:
+            return "Unprocessable Entity";
+        case 423:
+            return "Locked";
+        case 424:
+            return "Failed Dependency";
+        case 425:
+            return "Too Early";
+        case 426:
+            return "Upgrade Required";
+        case 428:
+            return "Precondition Required";
+        case 429:
+            return "Too Many Requests";
+        case 431:
+            return "Request Header Fields Too Large";
+        // 5xx
+        case 500:
+            return "Internal Server Error";
+        case 501:
+            return "Not Implemented";
+        case 502:
+            return "Bad Gateway";
+        case 503:
+            return "Service Unavailable";
+        case 504:
+            return "Gateway Timeout";
+        case 505:
+            return "HTTP Version Not Supported";
+        case 506:
+            return "Variant Also Negotiates";
+        case 507:
+            return "Insufficient Storage";
+        case 508:
+            return "Loop Detected";
+        case 510:
+            return "Not Extended";
+        case 511:
+            return "Network Authentication Required";
+        case 599:
+            return "Last Unassigned Server Error Code";
+        default:
+            return "Unknown";
+    }
+}
+
+bool canonical_status_reason(u16 code, Str* out) {
+    if (out == nullptr) return false;
+    const char* reason = envoy_canonical_status_reason_table(code);
+    u32 len = 0;
+    while (reason[len]) len++;
+    *out = {reason, len};
+    return true;
+}
+
 // Shared writer: status line + Content-Length + Connection header,
 // used by both the default (reason-phrase) body path and the custom
 // body path. Leaves the builder positioned just past "\r\n" so the

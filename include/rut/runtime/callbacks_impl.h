@@ -875,6 +875,17 @@ bool pipeline_stash(Connection& conn);
 PipelineTransitionResult pipeline_recover(Connection& conn, bool count_transition = true);
 void capture_stage_headers(Connection& conn);
 const char* status_reason(u16 code);
+// Envoy H1 profile: full `CodeUtility::toString` phrase table
+// (source/common/http/codes.cc, Envoy v1.39.1), independent of the much
+// narrower `status_reason` table above used by the legacy local-response
+// formatters. Covers every status the `header_order: "upstream"` admission
+// in `build_upstream_order_response_headers` accepts (200..599 minus the
+// no-body exclusions 204/205/304): every code Envoy names gets its exact
+// phrase, and any admitted-but-unnamed code (e.g. 299) gets "Unknown" --
+// mirroring `CodeUtility::toString`'s own fallthrough for an unmatched
+// `Code` value -- rather than being rejected. Only fails (returns false)
+// when `out` is null; every `u16` code otherwise gets a phrase.
+bool canonical_status_reason(u16 code, Str* out);
 void format_static_response(Connection& conn, u16 code, bool keep_alive);
 // Custom-body variant: writes status line + Content-Length matching
 // body_len + default Content-Type (text/plain; charset=utf-8) + body
@@ -11157,14 +11168,394 @@ inline bool stage_redirect_response(Connection& conn, const RouteConfig& config,
     return conn.send_buf.write(scratch, len) == len;
 }
 
+// Every Envoy inline *response* header, pinned v1.39.1, from two sources:
+//
+// 1. The unconditional macro-defined set: envoy/http/header_map.h
+//    `INLINE_RESP_HEADERS` + `INLINE_REQ_RESP_HEADERS` + (Codex round-17
+//    review of #698, correcting a gap in this inventory) `INLINE_RESP_
+//    HEADERS_TRAILERS` (line 276: `INLINE_RESP_STRING_HEADERS_TRAILERS`,
+//    line 272 -- `GrpcMessage` -- + `INLINE_RESP_NUMERIC_HEADERS_TRAILERS`,
+//    line 274 -- `GrpcStatus`). Despite the "_TRAILERS" name this macro is
+//    NOT trailer-only: `ResponseHeaderOrTrailerMap` (line 761) mixes it in
+//    once, and both `ResponseHeaderMap` (line 771, `public
+//    ResponseHeaderOrTrailerMap`) and `ResponseTrailerMap` (line 786,
+//    `public ResponseHeaderOrTrailerMap`) inherit it -- so `grpc-status` and
+//    `grpc-message` get an O(1) inline slot on an ordinary HTTP/1.1 response
+//    *header* map, the exact map this profile builds from, not only on a
+//    trailer map (which Rut does not model at all). All three macros are
+//    registered unconditionally for every build
+//    (source/common/http/header_map_impl.cc).
+//
+// 2. Headers a stock (all-extensions-linked) Envoy binary registers as custom
+//    inline slots at static-init time via a file-scope
+//    `Http::RegisterCustomInlineHeader<Type::ResponseHeaders>` member/global
+//    (source/common/http/header_map.h `CustomInlineHeaderRegistry`): this
+//    registration runs whenever the translation unit is linked in, independent
+//    of whether the corresponding filter is configured in any listener.
+//    Enumerated via `gh api search/code -f q='repo:envoyproxy/envoy
+//    RegisterCustomInlineHeader'` (21 hits) and confirmed present at the
+//    v1.39.1 tag for each hit below (a name is included only once even when
+//    multiple filters register it):
+//      - cache-control:    source/extensions/filters/http/cache/cache_custom_headers.cc:42,
+//                          source/extensions/filters/http/cache_v2/cache_custom_headers.cc:42,
+//                          source/extensions/filters/http/compressor/compressor_filter.cc:29-30,
+//                          source/extensions/filters/http/decompressor/decompressor_filter.cc:18-19,
+//                          source/extensions/stat_sinks/hystrix/hystrix.cc:29-30
+//      - content-encoding: source/extensions/filters/http/compressor/compressor_filter.cc:37-38,
+//                          source/extensions/filters/http/decompressor/decompressor_filter.cc:20-21
+//      - last-modified:    source/extensions/filters/http/cache/cache_custom_headers.cc:43,
+//                          source/extensions/filters/http/cache_v2/cache_custom_headers.cc:43
+//      - etag:             source/extensions/filters/http/cache/cache_custom_headers.cc:44,
+//                          source/extensions/filters/http/cache_v2/cache_custom_headers.cc:44,
+//                          source/extensions/filters/http/compressor/compressor_filter.cc:31-32
+//      - age:              source/extensions/filters/http/cache/cache_custom_headers.cc:45,
+//                          source/extensions/filters/http/cache_v2/cache_custom_headers.cc:45
+//      - expires:          source/extensions/filters/http/cache/cache_custom_headers.cc:46,
+//                          source/extensions/filters/http/cache_v2/cache_custom_headers.cc:46
+//      - vary:             source/extensions/filters/http/compressor/compressor_filter.cc:33-34
+//      - access-control-allow-origin:
+//        source/extensions/filters/http/cors/cors_filter.cc:31-32,
+//        source/extensions/stat_sinks/hystrix/hystrix.cc:25-26
+//      - access-control-allow-credentials:
+//        source/extensions/filters/http/cors/cors_filter.cc:33-35
+//      - access-control-allow-methods:
+//        source/extensions/filters/http/cors/cors_filter.cc:36-37
+//      - access-control-allow-headers:
+//        source/extensions/filters/http/cors/cors_filter.cc:38-39,
+//        source/extensions/stat_sinks/hystrix/hystrix.cc:27-28
+//      - access-control-max-age:
+//        source/extensions/filters/http/cors/cors_filter.cc:40-41
+//      - access-control-expose-headers:
+//        source/extensions/filters/http/cors/cors_filter.cc:42-43
+//      - access-control-allow-private-network:
+//        source/extensions/filters/http/cors/cors_filter.cc:47-49
+//    Every other `RegisterCustomInlineHeader` hit in that search registers a
+//    `Type::RequestHeaders` (or, for `test/...` files, is not part of a stock
+//    build) and is therefore not response-relevant here: `accept`
+//    (contrib/sxg, grpc_http1_reverse_bridge, grpc_web), `referer`
+//    (access_loggers/grpc, access_loggers/open_telemetry, filters/common/expr),
+//    `cdn-loop` (cdn_loop/filter.cc), `accept-encoding`/`content-encoding`-request
+//    /`cache-control`-request (compressor/decompressor, request side only),
+//    `origin`/`access-control-request-*` (cors, jwt_authn), `authorization`
+//    (oauth2), `authentication` (skywalking). This inventory is a code-search
+//    snapshot: it would miss a custom registration in a file deleted from the
+//    default branch since v1.39.1 was cut, but every hit it did find was
+//    verified to exist, unchanged in kind, at the pinned tag.
+//
+// Minus the four names carved out with their own special-cased handling in
+// `build_upstream_order_response_headers` below:
+//   - `content-length`: already rejected on duplicate by the
+//     `content_length_count != 1` precondition at the top of that function
+//     (a fixed, singular framing field, checked before this table is
+//     consulted at all).
+//   - `server`: Envoy's `server_header_transformation: OVERWRITE` replaces
+//     the upstream value in place rather than rejecting a duplicate, so it is
+//     deliberately deduplicated first-wins by the dedicated `is_server`
+//     branch below instead of failing closed here.
+//   - `connection`: not counted at all (Codex round-16 review of #698,
+//     correcting a round-15-era gap): every occurrence is unconditionally
+//     dropped by the same fixed hop-by-hop set the second loop below always
+//     applies, so a duplicate can never reach the wire and must not fail the
+//     response closed, exactly like the `keep-alive`/`upgrade`/
+//     `proxy-connection` exemptions below. This table still excludes it
+//     because it needs no per-name exemption logic at all -- unlike those
+//     three, which stay in the table for other reasons (Envoy registers them
+//     as inline slots) and need the duplicate check skipped explicitly,
+//     `connection` was never in this table to begin with. The response's own
+//     persistence decision (`resp.keep_alive` / `resp.connection_close`,
+//     consulted by `on_upstream_response` for upstream pooling) is computed
+//     once by the parser from every physical `Connection` field with `close`
+//     sticky (`match_connection_response`, src/runtime/http_parser.cc), so it
+//     is already correct regardless of how many occurrences there are or
+//     what order they arrive in -- nothing here needs to re-derive it.
+//   - `transfer-encoding`: any occurrence at all (not just a duplicate) is
+//     already rejected in the loop below, matching Envoy's protocol-error
+//     handling for a non-"chunked" coding -- strictly stronger than a
+//     duplicate check, so adding it here would be redundant.
+// `:status` (`INLINE_RESP_NUMERIC_HEADERS` -> `Status`) is also excluded: it
+// is an HTTP/2 pseudo-header carried on the status line, never a literal
+// HTTP/1.1 header field, so it can never appear in `resp.headers` here.
+//
+// `keep-alive`, `upgrade`, and `proxy-connection` stay in this table (Envoy
+// does register them as inline slots), but the duplicate-count loop below
+// exempts them: they are also in the fixed hop-by-hop set the second loop
+// always drops regardless of `hide_headers`, so a duplicate of one of them
+// can never reach the wire as two physical lines and must not fail the
+// response closed (Codex round-15 review of #698). Every other entry here is
+// exempted from the count only when `hide_headers` names it, for the same
+// reason -- a hidden duplicate never reaches the wire either.
+//
+// `grpc-status` and `grpc-message` (Codex round-17 review of #698) get no
+// special exemption: they are ordinary forwarded headers like `content-type`
+// (not hop-by-hop, so `always_dropped` is false for them below), subject to
+// the same `hide_headers`-only exemption as the rest of the table.
+inline constexpr Str kEnvoyInlineResponseHeaders[] = {
+    lit_str("content-type"),
+    lit_str("date"),
+    lit_str("keep-alive"),
+    lit_str("location"),
+    lit_str("proxy-connection"),
+    lit_str("proxy-status"),
+    lit_str("upgrade"),
+    lit_str("via"),
+    lit_str("x-envoy-attempt-count"),
+    lit_str("x-envoy-decorator-operation"),
+    lit_str("x-envoy-degraded"),
+    lit_str("x-envoy-immediate-health-check-fail"),
+    lit_str("x-envoy-ratelimited"),
+    lit_str("x-envoy-upstream-canary"),
+    lit_str("x-envoy-upstream-healthchecked-cluster"),
+    lit_str("x-envoy-upstream-service-time"),
+    lit_str("x-request-id"),
+    lit_str("cache-control"),
+    lit_str("content-encoding"),
+    lit_str("last-modified"),
+    lit_str("etag"),
+    lit_str("age"),
+    lit_str("expires"),
+    lit_str("vary"),
+    lit_str("access-control-allow-origin"),
+    lit_str("access-control-allow-credentials"),
+    lit_str("access-control-allow-methods"),
+    lit_str("access-control-allow-headers"),
+    lit_str("access-control-max-age"),
+    lit_str("access-control-expose-headers"),
+    lit_str("access-control-allow-private-network"),
+    lit_str("grpc-status"),
+    lit_str("grpc-message"),
+};
+inline constexpr u32 kEnvoyInlineResponseHeaderCount =
+    sizeof(kEnvoyInlineResponseHeaders) / sizeof(kEnvoyInlineResponseHeaders[0]);
+
+// Envoy H1 profile (`header_order == Upstream`): preserves the upstream
+// header order, lowercases every forwarded name, keeps an upstream `date`
+// header in place (or appends one when absent), replaces the first `server`
+// value in place (a later duplicate is dropped entirely, matching the
+// upstream-value rule), and appends `connection: close` only when the
+// downstream connection is closing. Dispatched from
+// `build_strict_response_headers` below; every other prebuilt-response
+// purpose fails closed here too so the response-read-deadline and buffering
+// profiles (which assume the fixed-order `Synthesized` layout) can never
+// observe this serializer even if their own admission checks are bypassed.
+inline bool build_upstream_order_response_headers(
+    Connection& conn,
+    const RouteConfig& config,
+    const ParsedResponse& resp,
+    Http1PrebuiltResponsePurpose purpose = Http1PrebuiltResponsePurpose::None,
+    bool draining = false) {
+    if (conn.response_policy_id == 0 || conn.response_policy_id > config.response_policy_count)
+        return false;
+    const auto& policy = config.response_policies[conn.response_policy_id - 1];
+    if (purpose != Http1PrebuiltResponsePurpose::None || !admitted_response_policy_valid(policy) ||
+        policy.header_order != ResponsePolicyHeaderOrder::Upstream ||
+        resp.version != HttpVersion::Http11 || resp.status_code < 200 || resp.status_code > 599 ||
+        resp.status_code == 204 || resp.status_code == 205 || resp.status_code == 304 ||
+        resp.headers_truncated || resp.content_length_count != 1 || !resp.has_content_length ||
+        resp.chunked)
+        return false;
+    // Unlike `build_strict_response_headers` below, this profile never emits
+    // `resp.reason` (the canonical table below replaces it), so an upstream
+    // status line with an empty reason phrase (`HTTP/1.1 200 \r\n`, which
+    // `parse_response` accepts) is not a rejection here. The control-character
+    // scan still runs — it is a no-op on a zero-length reason and still
+    // catches a malformed nonempty one before the canonical replacement.
+    for (u32 i = 0; i < resp.reason.len; i++) {
+        const u8 c = static_cast<u8>(resp.reason.ptr[i]);
+        if ((c < 0x20 && c != '\t') || c == 0x7f) return false;
+    }
+    // See the comment on `kEnvoyInlineResponseHeaders` above: Envoy stores
+    // every name in that table as a single-valued "inline" header slot and
+    // coalesces a duplicate into the existing entry (comma-joined) rather than
+    // emitting a second physical field. This profile forwards headers verbatim
+    // in upstream order instead of rebuilding a HeaderMap, so it cannot
+    // reproduce that join; a duplicate would otherwise reach the client as two
+    // physical lines for a header Envoy always serializes as one. Fail closed
+    // instead of guessing which occurrence wins.
+    //
+    // Codex round-15 review (PR #698): this must only fire for a name that
+    // will actually reach the wire. Three entries of `kEnvoyInlineResponseHeaders`
+    // (`keep-alive`, `upgrade`, `proxy-connection`) are also in the fixed
+    // hop-by-hop set the second loop below always skips regardless of
+    // `hide_headers` -- a duplicate of one of those can never produce two
+    // physical lines, so it must not fail the response closed. The rest of
+    // the table is forwarded unless named by `hide_headers`, in which case it
+    // is dropped for the same reason. This mirrors the second loop's own
+    // `is_server`/`is_content_length`-free skip predicate (none of the
+    // remaining table entries is `server` or `content-length`, so neither
+    // carve-out applies here).
+    //
+    // Codex round-16 review (PR #698): `connection` needs the exact same
+    // treatment even though it is not in `kEnvoyInlineResponseHeaders` --
+    // every occurrence is unconditionally dropped by the second loop's fixed
+    // hop-by-hop set below, so a duplicate can never reach the wire either
+    // and a dedicated `connection_count` fail-closed check here served no
+    // purpose. Removed rather than folded into `always_dropped`: `connection`
+    // was never counted through the table loop, so there is nothing to
+    // exempt it from. The response's persistence decision does not depend on
+    // this loop at all -- `resp.keep_alive`/`resp.connection_close` are
+    // computed once by the parser across every physical `Connection` field
+    // with `close` sticky (`match_connection_response`,
+    // src/runtime/http_parser.cc), so `on_upstream_response`'s upstream
+    // pooling decision already honors a `close` token regardless of how many
+    // `Connection` fields carried it.
+    u32 inline_header_counts[kEnvoyInlineResponseHeaderCount] = {};
+    for (u32 i = 0; i < resp.header_count; i++) {
+        const Str name = resp.headers[i].name;
+        for (u32 t = 0; t < kEnvoyInlineResponseHeaderCount; t++) {
+            const Str inline_name = kEnvoyInlineResponseHeaders[t];
+            if (name.len != inline_name.len ||
+                !http_header_name_eq_ci(name.ptr, name.len, inline_name.ptr, inline_name.len))
+                continue;
+            const bool always_dropped = response_policy_name_eq(name, "keep-alive", 10) ||
+                                        response_policy_name_eq(name, "upgrade", 7) ||
+                                        response_policy_name_eq(name, "proxy-connection", 16);
+            if (!always_dropped && !response_policy_hides_header(policy, name) &&
+                ++inline_header_counts[t] > 1)
+                return false;
+        }
+        // `resp.chunked` (rejected above) is only set when the Transfer-Encoding
+        // token list contains "chunked"; a coding such as `gzip` or
+        // `chunked, gzip` leaves it false while still carrying the field, which
+        // would otherwise pass the has_content_length/!chunked preconditions
+        // above and be forwarded as an ordinary fixed-length body with the
+        // field silently dropped. Envoy rejects the message outright: any
+        // Transfer-Encoding value that is not exactly "chunked" is a protocol
+        // error (ConnectionImpl::onHeadersCompleteImpl,
+        // source/common/http/http1/codec_impl.cc,
+        // Http1ResponseCodeDetails::InvalidTransferEncoding, RFC 7230 §3.3.3).
+        // Match that fail-closed behavior instead of merely filtering the
+        // header.
+        if (response_policy_name_eq(name, "transfer-encoding", 17)) return false;
+    }
+    Str reason{};
+    if (!canonical_status_reason(resp.status_code, &reason)) return false;
+    conn.response_header_buf.reset();
+    auto put = [&](const char* p, u32 n) {
+        return conn.response_header_buf.write(reinterpret_cast<const u8*>(p), n) == n;
+    };
+    auto put_lit = [&](const char* p) { return put(p, static_cast<u32>(__builtin_strlen(p))); };
+    char line[3] = {static_cast<char>('0' + resp.status_code / 100),
+                    static_cast<char>('0' + (resp.status_code / 10) % 10),
+                    static_cast<char>('0' + resp.status_code % 10)};
+    if (!put_lit("HTTP/1.1 ") || !put(line, 3) || !put_lit(" ") || !put(reason.ptr, reason.len) ||
+        !put_lit("\r\n"))
+        return false;
+    bool seen_date = false;
+    bool seen_server = false;
+    for (u32 i = 0; i < resp.header_count; i++) {
+        const Header& h = resp.headers[i];
+        const Str name = h.name;
+        // Content-Length is the sole framing field this profile admits (see
+        // the precondition above: exactly one, and it must be present). It
+        // must never disappear from the downstream response while the body
+        // is still streamed byte for byte, so a `hide_headers` entry naming
+        // it is not honored here — mirroring how the fixed-order
+        // `Synthesized` profile always re-emits it independent of the hide
+        // list (it is never routed through that profile's own hide check).
+        const bool is_content_length = response_policy_name_eq(name, "content-length", 14);
+        // `server` is handled by the dedicated branch below regardless of
+        // `hide_headers`: Envoy's `server_header_transformation: OVERWRITE`
+        // replaces the upstream `Server` value in place rather than dropping
+        // it and re-appending the configured value at the end, so a
+        // `hide_headers` entry naming `server` must not route it through the
+        // generic hide check here (mirrors the `content-length` carve-out
+        // just above).
+        const bool is_server = response_policy_name_eq(name, "server", 6);
+        // Codex round-19 review (PR #698): this fixed set must match exactly
+        // what Envoy's `ConnectionManagerUtility::mutateResponseHeaders`
+        // (source/common/http/conn_manager_utility.cc, v1.39.1) removes for a
+        // non-upgrade response with `clear_hop_by_hop` set (always true on
+        // this fixed listener shape): `removeConnection()`, `removeUpgrade()`,
+        // `removeTransferEncoding()`, `removeKeepAlive()`, and
+        // `removeProxyConnection()` -- five calls, no more. `te` and
+        // `trailer` used to be in this list too, but Envoy never removes
+        // either on the response path: `TE` (`Headers::get().TE`) is only in
+        // `INLINE_REQ_STRING_HEADERS` (request-only) and `removeTE()` is
+        // called solely from `mutateRequestHeaders`
+        // (conn_manager_utility.cc:348); `Trailer` is not an inline header at
+        // all and has no `remove*()` call anywhere in
+        // source/common/http/conn_manager_utility.cc or the HTTP/1 codec's
+        // response encoding path (source/common/http/http1/codec_impl.cc).
+        // Both are ordinary headers a real Envoy forwards unchanged on a
+        // fixed-length (`Content-Length`) response, so this profile must too.
+        if (!is_server && (response_policy_name_eq(name, "connection", 10) ||
+                           response_policy_name_eq(name, "keep-alive", 10) ||
+                           response_policy_name_eq(name, "proxy-connection", 16) ||
+                           response_policy_name_eq(name, "upgrade", 7) ||
+                           response_policy_name_eq(name, "transfer-encoding", 17) ||
+                           (!is_content_length && response_policy_hides_header(policy, name))))
+            continue;
+        if (is_server) {
+            if (seen_server) continue;
+            seen_server = true;
+            if (!put_lit("server: ") || !put(policy.server.ptr, policy.server.len) ||
+                !put_lit("\r\n"))
+                return false;
+            continue;
+        }
+        if (response_policy_name_eq(name, "date", 4)) seen_date = true;
+        // Trim both leading and trailing optional whitespace (RFC 7230
+        // §3.2.4 OWS), matching how the response parser exposes `h.value`
+        // and how the Envoy-compatible request serializer trims both ends
+        // (`callbacks_impl.h:5707-5710` above). Trimming only the leading
+        // OWS here would forward the upstream's raw trailing whitespace
+        // byte for byte, a wire mismatch Envoy's header-map serialization
+        // does not reproduce.
+        u32 start = 0;
+        while (start < h.raw_value.len &&
+               (h.raw_value.ptr[start] == ' ' || h.raw_value.ptr[start] == '\t'))
+            start++;
+        u32 end = h.raw_value.len;
+        while (end > start && (h.raw_value.ptr[end - 1] == ' ' || h.raw_value.ptr[end - 1] == '\t'))
+            end--;
+        for (u32 c = 0; c < name.len; c++) {
+            char lower = name.ptr[c];
+            if (lower >= 'A' && lower <= 'Z') lower = static_cast<char>(lower + 32);
+            if (!put(&lower, 1)) return false;
+        }
+        if (!put_lit(": ") || !put(h.raw_value.ptr + start, end - start) || !put_lit("\r\n"))
+            return false;
+    }
+    if (!seen_date) {
+        char date[32];
+        const u32 date_len = strict_response_date(date, realtime_us());
+        if (date_len == 0 || !put_lit("date: ") || !put(date, date_len) || !put_lit("\r\n"))
+            return false;
+    }
+    if (!seen_server &&
+        (!put_lit("server: ") || !put(policy.server.ptr, policy.server.len) || !put_lit("\r\n")))
+        return false;
+    const bool policy_keep_alive =
+        policy.connection == ResponsePolicyConnection::KeepAlive ||
+        (policy.connection == ResponsePolicyConnection::Request && conn.req_client_keep_alive);
+    // Preserve the server lifecycle gate set at the request boundary, exactly
+    // as the Synthesized serializer does above. `draining` folds in the
+    // shard's graceful-drain state, matching `build_h1_forward_response_headers`
+    // above (`(draining || nominated_framing)`, `callbacks_impl.h:3182`): a
+    // drain that begins after this request was admitted but before the
+    // upstream response arrived must still advertise `connection: close` here,
+    // because `on_response_sent` closes the client connection once
+    // `loop->is_draining()` regardless of what this header block promised --
+    // without this, a keep-alive response would let an HTTP/1.1 client
+    // pipeline or reuse the connection for a request that can never be
+    // served.
+    const bool effective_keep_alive = conn.keep_alive && policy_keep_alive && !draining;
+    conn.keep_alive = effective_keep_alive;
+    if (!effective_keep_alive && !put_lit("connection: close\r\n")) return false;
+    return put_lit("\r\n");
+}
+
 inline bool build_strict_response_headers(
     Connection& conn,
     const RouteConfig& config,
     const ParsedResponse& resp,
-    Http1PrebuiltResponsePurpose purpose = Http1PrebuiltResponsePurpose::None) {
+    Http1PrebuiltResponsePurpose purpose = Http1PrebuiltResponsePurpose::None,
+    bool draining = false) {
     if (conn.response_policy_id == 0 || conn.response_policy_id > config.response_policy_count)
         return false;
     const auto& policy = config.response_policies[conn.response_policy_id - 1];
+    if (policy.header_order == ResponsePolicyHeaderOrder::Upstream)
+        return build_upstream_order_response_headers(conn, config, resp, purpose, draining);
     const bool strict_no_body_metadata =
         purpose == Http1PrebuiltResponsePurpose::StrictNoBodyMetadataSuccess;
     if ((purpose != Http1PrebuiltResponsePurpose::None && !strict_no_body_metadata) ||
@@ -12075,7 +12466,8 @@ void on_upstream_response(void* lp, Connection& conn, IoEvent ev) {
         const Http1PrebuiltResponsePurpose strict_response_purpose =
             strict_no_body_metadata_304 ? Http1PrebuiltResponsePurpose::StrictNoBodyMetadataSuccess
                                         : Http1PrebuiltResponsePurpose::None;
-        if (!build_strict_response_headers(conn, *config, resp, strict_response_purpose)) {
+        if (!build_strict_response_headers(
+                conn, *config, resp, strict_response_purpose, loop->is_draining())) {
             if (try_configured_head_failure(
                     ConfiguredForwardFailureDomain::CompleteUnsupportedResponse))
                 return;
@@ -12337,7 +12729,11 @@ void on_upstream_response(void* lp, Connection& conn, IoEvent ev) {
             !conn.request_config || !strict_response_upload_ready(conn) ||
             (conn.upstream_recv_buf.len() > resp_parser.header_end &&
              conn.upstream_recv_buf.len() - resp_parser.header_end > resp.content_length) ||
-            !build_strict_response_headers(conn, *conn.request_config, resp)) {
+            !build_strict_response_headers(conn,
+                                           *conn.request_config,
+                                           resp,
+                                           Http1PrebuiltResponsePurpose::None,
+                                           loop->is_draining())) {
             reject_strict_response(loop, conn);
             return;
         }
@@ -12353,7 +12749,18 @@ void on_upstream_response(void* lp, Connection& conn, IoEvent ev) {
         }
         conn.resp_body_mode = BodyMode::ContentLength;
         conn.resp_body_remaining = resp.content_length;
-        conn.upstream_keep_alive = conn.response_policy_suppress_body ? false : conn.req_keep_alive;
+        // Mirror the transparent path's upstream-pooling gate (~12087 below):
+        // conn.req_keep_alive alone only says the *request* told the origin it
+        // may keep the connection open. The parsed response is the origin's
+        // actual answer, and an explicit `Connection: close` (or an HTTP/1.0
+        // response without keep-alive, though this profile requires 1.1 above)
+        // means the origin is about to close the socket regardless of what the
+        // request asked for. Ignoring that here let a keep-alive client's next
+        // request take a closing/dead socket from the idle pool.
+        conn.upstream_keep_alive =
+            conn.response_policy_suppress_body
+                ? false
+                : (conn.req_keep_alive && resp.keep_alive && !resp.connection_close);
         const u32 header_len = resp_parser.header_end;
         conn.upstream_send_len = header_len;
         conn.resp_body_sent = conn.response_header_buf.len();

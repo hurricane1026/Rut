@@ -33670,6 +33670,238 @@ TEST(response_policy, head_mode_is_owned_deduplicated_and_printed) {
     CHECK(__builtin_memcmp(buf.data, expected, sizeof(expected) - 1) == 0);
 }
 
+TEST(frontend, response_policy_header_order_upstream_parses_and_propagates) {
+    const char source[] = R"rut(
+upstream backend at "127.0.0.1:9000"
+route GET "/" {
+    return forward(backend,
+        response_policy: {
+            version: "HTTP/1.1", framing: "content_length", connection: "request",
+            header_order: "upstream", header_names: "lowercase",
+            connection_header: "close_only", status_reason: "canonical",
+            server: "envoy", date: "preserve_or_current", hide_headers: []
+        })
+}
+)rut";
+    auto lexed = lex(lit(source));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    REQUIRE_EQ(ast->response_policies.len, 1u);
+    const auto& parsed_policy = ast->response_policies[0];
+    CHECK(parsed_policy.header_order == ResponsePolicyHeaderOrder::Upstream);
+    CHECK(parsed_policy.header_names == ResponsePolicyHeaderNames::Lowercase);
+    CHECK(parsed_policy.connection_header == ResponsePolicyConnectionHeader::CloseOnly);
+    CHECK(parsed_policy.status_reason == ResponsePolicyStatusReason::Canonical);
+    CHECK(parsed_policy.date == ResponsePolicyDate::PreserveOrCurrent);
+    CHECK(response_policy_spec_valid(parsed_policy));
+
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    CHECK_EQ(hir->routes[0].control.direct_term.forward_response_policy_id, 1u);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    CHECK_EQ(mir->functions[0].blocks[0].term.forward_response_policy_id, 1u);
+    FrontendRirModule rir{};
+    REQUIRE(lower_to_rir(mir.value(), rir));
+    REQUIRE_EQ(rir.module.response_policy_count, 1u);
+    const auto& lowered_policy = rir.module.response_policies[0];
+    CHECK(lowered_policy.header_order == ResponsePolicyHeaderOrder::Upstream);
+    CHECK(lowered_policy.header_names == ResponsePolicyHeaderNames::Lowercase);
+    CHECK(lowered_policy.connection_header == ResponsePolicyConnectionHeader::CloseOnly);
+    CHECK(lowered_policy.status_reason == ResponsePolicyStatusReason::Canonical);
+    CHECK(lowered_policy.date == ResponsePolicyDate::PreserveOrCurrent);
+    RouteConfig cfg{};
+    REQUIRE(populate_route_config(cfg, rir.module));
+    REQUIRE_EQ(cfg.response_policy_count, 1u);
+    CHECK(cfg.response_policies[0].header_order == ResponsePolicyHeaderOrder::Upstream);
+    rir.destroy();
+}
+
+TEST(frontend, response_policy_header_order_upstream_rejects_every_missing_companion) {
+    const char* invalid[] = {
+        // Missing header_names.
+        "upstream b\nroute GET \"/\" { return forward(b, response_policy: { version: "
+        "\"HTTP/1.1\", framing: \"content_length\", connection: \"request\", header_order: "
+        "\"upstream\", connection_header: \"close_only\", status_reason: \"canonical\", "
+        "server: \"envoy\", date: \"preserve_or_current\", hide_headers: [] }) }\n",
+        // Missing connection_header.
+        "upstream b\nroute GET \"/\" { return forward(b, response_policy: { version: "
+        "\"HTTP/1.1\", framing: \"content_length\", connection: \"request\", header_order: "
+        "\"upstream\", header_names: \"lowercase\", status_reason: \"canonical\", "
+        "server: \"envoy\", date: \"preserve_or_current\", hide_headers: [] }) }\n",
+        // Missing status_reason.
+        "upstream b\nroute GET \"/\" { return forward(b, response_policy: { version: "
+        "\"HTTP/1.1\", framing: \"content_length\", connection: \"request\", header_order: "
+        "\"upstream\", header_names: \"lowercase\", connection_header: \"close_only\", "
+        "server: \"envoy\", date: \"preserve_or_current\", hide_headers: [] }) }\n",
+        // date stays "current" instead of "preserve_or_current".
+        "upstream b\nroute GET \"/\" { return forward(b, response_policy: { version: "
+        "\"HTTP/1.1\", framing: \"content_length\", connection: \"request\", header_order: "
+        "\"upstream\", header_names: \"lowercase\", connection_header: \"close_only\", "
+        "status_reason: \"canonical\", server: \"envoy\", date: \"current\", "
+        "hide_headers: [] }) }\n",
+        // header_names/connection_header/status_reason set without header_order at all.
+        "upstream b\nroute GET \"/\" { return forward(b, response_policy: { version: "
+        "\"HTTP/1.1\", framing: \"content_length\", connection: \"request\", header_names: "
+        "\"lowercase\", server: \"envoy\", date: \"current\", hide_headers: [] }) }\n",
+        // date: "preserve_or_current" alone, header_order omitted (Synthesized).
+        "upstream b\nroute GET \"/\" { return forward(b, response_policy: { version: "
+        "\"HTTP/1.1\", framing: \"content_length\", connection: \"request\", server: \"envoy\", "
+        "date: \"preserve_or_current\", hide_headers: [] }) }\n",
+        // header_order: "upstream" duplicated.
+        "upstream b\nroute GET \"/\" { return forward(b, response_policy: { version: "
+        "\"HTTP/1.1\", framing: \"content_length\", connection: \"request\", header_order: "
+        "\"upstream\", header_order: \"upstream\", header_names: \"lowercase\", "
+        "connection_header: \"close_only\", status_reason: \"canonical\", server: \"envoy\", "
+        "date: \"preserve_or_current\", hide_headers: [] }) }\n",
+    };
+    for (const char* src : invalid) {
+        auto lexed = lex(lit(src));
+        REQUIRE(lexed);
+        auto ast = parse_file_heap(lexed.value());
+        CHECK_FALSE(ast.has_value());
+    }
+}
+
+TEST(frontend, response_policy_header_order_upstream_rejects_timing_and_buffering_options) {
+    const auto source_for = [](const char* kwarg) {
+        return std::string(R"rut(
+upstream backend at "127.0.0.1:9000"
+route GET "/" {
+    return forward(backend, response_policy: {
+        version: "HTTP/1.1", framing: "content_length", connection: "request",
+        header_order: "upstream", header_names: "lowercase",
+        connection_header: "close_only", status_reason: "canonical",
+        server: "envoy", date: "preserve_or_current", hide_headers: []
+    }, )rut") + kwarg +
+               ")\n}\n";
+    };
+    const char* rejected_kwargs[] = {
+        "response_read_timeout: 1s",
+        "response_buffering: \"complete_content_length\"",
+        "failure_policy: { version: \"HTTP/1.1\", status: 502, reason: \"Bad Gateway\", "
+        "content_type: \"text/plain\", server: \"s\", date: \"current\", "
+        "connection: \"request\", body: b\"bad\" }, "
+        "timeout_failure_policy: { version: \"HTTP/1.1\", status: 504, "
+        "reason: \"Gateway Time-out\", content_type: \"text/plain\", server: \"s\", "
+        "date: \"current\", connection: \"request\", body: b\"slow\" }",
+    };
+    for (const char* kwarg : rejected_kwargs) {
+        const std::string source = source_for(kwarg);
+        auto lexed = lex({source.data(), static_cast<u32>(source.size())});
+        REQUIRE(lexed);
+        auto ast = parse_file_heap(lexed.value());
+        REQUIRE(ast);
+        auto hir = analyze_file_heap(ast.value());
+        REQUIRE_FALSE(hir.has_value());
+        CHECK(hir.error().detail.eq(lit(
+            "response_policy header_order: \"upstream\" does not support this forward option")));
+    }
+}
+
+// Codex round-7 review: analyze.cc, compile_to_config.h, and route_table.h
+// all reject an upstream-order response policy bundled with response read
+// timing, response buffering, or a timeout failure policy, but the RIR
+// verifier's bundle-validation loop did not, so a hand-built module could
+// be reported as verified and only fail later in populate_route_config.
+// Verification and publication must agree on this invariant.
+TEST(frontend, response_policy_header_order_upstream_verifier_rejects_forged_bundles) {
+    const char source[] = R"rut(
+upstream backend at "127.0.0.1:9000"
+route GET "/" {
+    return forward(backend,
+        response_policy: {
+            version: "HTTP/1.1", framing: "content_length", connection: "request",
+            header_order: "upstream", header_names: "lowercase",
+            connection_header: "close_only", status_reason: "canonical",
+            server: "envoy", date: "preserve_or_current", hide_headers: []
+        },
+        failure_policy: {
+            version: "HTTP/1.1", status: 502, reason: "Bad Gateway",
+            content_type: "text/plain", server: "s", date: "current",
+            connection: "request", body: b"bad"
+        })
+}
+)rut";
+    auto lexed = lex(lit(source));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    REQUIRE(lower_to_rir(mir.value(), rir));
+    auto& mod = rir.module;
+    REQUIRE_EQ(mod.response_policy_count, 1u);
+    REQUIRE_EQ(mod.failure_policy_count, 1u);
+    REQUIRE_EQ(mod.policy_bundle_count, 1u);
+    auto& bundle = mod.policy_bundles[0];
+    CHECK(mod.response_policies[0].header_order == ResponsePolicyHeaderOrder::Upstream);
+    REQUIRE_EQ(bundle.response_policy_id, 1u);
+    REQUIRE_EQ(bundle.failure_policy_id, 1u);
+    CHECK_EQ(bundle.timeout_failure_policy_id, 0u);
+    CHECK_EQ(bundle.response_read_timeout_seconds, 0u);
+    CHECK(bundle.response_buffering == ForwardResponseBufferingMode::None);
+
+    // The ordinary-forward-only shape (response + default failure policy,
+    // nothing else) is accepted by both the verifier and config population.
+    REQUIRE(rir::verify_module(mod).ok);
+    {
+        RouteConfig cfg{};
+        REQUIRE(populate_route_config(cfg, mod));
+    }
+
+    // An otherwise-valid timeout failure policy (same shape and HEAD mode as
+    // the default 502 policy, distinct status so `add_failure_policy` does
+    // not dedupe it away) so the forgeries below fail only on the
+    // upstream-order invariant, not on a malformed companion.
+    mod.failure_policies[1] = mod.failure_policies[0];
+    mod.failure_policies[1].status_code = 504;
+    mod.failure_policy_count = 2;
+    REQUIRE(forward_timeout_failure_policy_spec_valid(mod.failure_policies[1]));
+    REQUIRE(rir::verify_module(mod).ok);
+
+    auto expect_rejected = [&]() {
+        const auto verified = rir::verify_module(mod);
+        CHECK_FALSE(verified.ok);
+        CHECK_EQ(verified.issue.code, rir::VerifyIssueCode::InvalidForwardPreflight);
+        RouteConfig cfg{};
+        CHECK_FALSE(populate_route_config(cfg, mod));
+    };
+
+    // Valid response read timeout alone.
+    bundle.response_read_timeout_seconds = 5;
+    expect_rejected();
+    bundle.response_read_timeout_seconds = 0;
+    REQUIRE(rir::verify_module(mod).ok);
+
+    // Valid timeout failure policy alone.
+    bundle.timeout_failure_policy_id = 2;
+    expect_rejected();
+    bundle.timeout_failure_policy_id = 0;
+    REQUIRE(rir::verify_module(mod).ok);
+
+    // Complete buffering with every companion it would otherwise require.
+    bundle.response_buffering = ForwardResponseBufferingMode::CompleteContentLength;
+    bundle.response_read_timeout_seconds = 5;
+    bundle.timeout_failure_policy_id = 2;
+    expect_rejected();
+    bundle.response_buffering = ForwardResponseBufferingMode::None;
+    bundle.response_read_timeout_seconds = 0;
+    bundle.timeout_failure_policy_id = 0;
+
+    // Exact restoration verifies and publishes again.
+    REQUIRE(rir::verify_module(mod).ok);
+    {
+        RouteConfig cfg{};
+        REQUIRE(populate_route_config(cfg, mod));
+    }
+    rir.destroy();
+}
+
 TEST(frontend, response_policy_rejects_invalid_values_duplicates_and_missing_fields) {
     const char* invalid[] = {
         "upstream b\nroute GET \"/\" { return forward(b, response_policy: { version: \"HTTP/1.0\", "

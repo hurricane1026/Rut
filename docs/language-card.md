@@ -430,6 +430,32 @@ return forward(users,
 // Connection: close. The strict response-domain limits above remain unchanged.
 // Valid downstream Upgrade requests are rejected by this policy; Upgrade
 // passthrough remains PARTIAL in the first slice.
+// header_order: "upstream" is a separate closed combination (Envoy-compatible
+// H1): preserves upstream header order and lowercases every forwarded name,
+// keeps an upstream `date` in place (or appends one when absent), replaces
+// the first `server` value in place (a later duplicate is dropped, or
+// appends when absent), appends `connection: close` last only when the
+// downstream connection is closing, and uses the canonical reason phrase
+// instead of the upstream's — including when the upstream sent an empty
+// reason phrase, since it is never forwarded. `hide_headers` cannot suppress
+// `Content-Length`: it is the sole framing field this profile admits, so a
+// hide-list entry naming it is not honored (the fixed-order profile above is
+// immune the same way, by never routing Content-Length through its own hide
+// check). All five fields below are required together;
+// `response_read_timeout` / `response_buffering` / `timeout_failure_policy`
+// are rejected with it (ordinary-forward-only, like request_policy
+// host: "preserve"). The fixed-order layout above (`header_order` omitted)
+// is unchanged.
+return forward(users, request_policy: {
+    version: "HTTP/1.1", host: "preserve", connection: "omit",
+    header_names: "lowercase", forwarded_proto: "http",
+    strip_headers: ["Connection", "Keep-Alive", "TE", "Expect", "Upgrade", "Proxy-Connection"]
+}, response_policy: {
+    version: "HTTP/1.1", framing: "content_length", connection: "request",
+    header_order: "upstream", header_names: "lowercase",
+    connection_header: "close_only", status_reason: "canonical",
+    server: "envoy", date: "preserve_or_current", hide_headers: []
+})
 
 // Explicit request-derived redirects are fully specified (no defaults). The
 // first source slice accepts the generic Redirect terminator in the existing
