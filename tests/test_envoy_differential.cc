@@ -48,10 +48,12 @@
 #include <vector>
 
 #include <arpa/inet.h>
+#include <dirent.h>
 #include <fcntl.h>
 #include <netinet/in.h>
 #include <poll.h>
 #include <signal.h>
+#include <sys/resource.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/wait.h>
@@ -924,10 +926,26 @@ private:
 
 // ── Envoy process management ────────────────────────────────────────────
 
+// Counts real `docker rm -f` invocations from EnvoyInstance::stop() (and
+// nowhere else), so self_test_envoy_instance_skips_docker_when_unlaunched()
+// can assert that an EnvoyInstance which never called launch() invokes
+// docker zero times, without needing a stubbed docker binary on PATH
+// (round-15 review, "Skip Docker teardown for instances that were never
+// launched").
+int g_docker_rm_invocations = 0;
+
 struct EnvoyInstance {
     pid_t pid = -1;
     std::string name;
     std::string log_path;
+    // Set once launch() actually forks a docker child; guards stop()'s
+    // `docker rm -f` call so instances that never launched (every dummy-
+    // child self-test case wraps a plain forked process, never a real
+    // docker container) don't invoke docker at all. Cleared right after
+    // stop() runs the docker teardown once, so a redundant later stop()
+    // call (an explicit one followed by the destructor's automatic one)
+    // never re-invokes it either.
+    bool launched = false;
 
     bool launch(const std::string& bootstrap_path, uint16_t /*listen_port*/) {
         // docker run --pull=never --rm --network host --name <name>
@@ -977,6 +995,10 @@ struct EnvoyInstance {
         const std::vector<char*> args = build_argv(argv);
         pid = fork();
         if (pid < 0) return false;
+        // From here a docker child was (or is being) created under `name`,
+        // so stop() must run `docker rm -f` for it even if this process
+        // itself never reaches "starting main dispatch loop".
+        launched = true;
         if (pid == 0) {
             const int log_fd = open(log_path.c_str(), O_CREAT | O_TRUNC | O_WRONLY, 0644);
             if (log_fd >= 0) {
@@ -992,7 +1014,21 @@ struct EnvoyInstance {
 
     void stop() {
         if (pid > 0) kill(pid, SIGTERM);
-        run_and_wait({"docker", "rm", "-f", name}, 10'000);
+        // Skip docker teardown entirely for an instance that never actually
+        // launched a container (round-15 review, "Skip Docker teardown for
+        // instances that were never launched"): self-test EnvoyInstance
+        // objects wrap dummy forked processes without ever calling launch(),
+        // so `name` is empty and no container was ever created. Running
+        // `docker rm -f` for those anyway wastes up to this call's 10s
+        // timeout each -- four times in --self-test -- and, if a Docker CLI
+        // or daemon is present but unresponsive, pushes the whole self-test
+        // toward CTest's 60s limit for no benefit. `launched` is cleared
+        // right after so a later, redundant stop() call never re-invokes it.
+        if (launched) {
+            g_docker_rm_invocations++;
+            run_and_wait({"docker", "rm", "-f", name}, 10'000);
+            launched = false;
+        }
         if (pid > 0) {
             const int64_t deadline = now_ms() + 5000;
             int status = 0;
@@ -1261,6 +1297,68 @@ std::string make_temp_dir(const char* prefix) {
     return std::string(buf.data());
 }
 
+// Recursively removes `path` (best-effort; errors are ignored since this is
+// only ever cleanup, with no good way to surface a failure). Every directory
+// this harness creates via make_temp_dir()/TempDir is flat -- at most a
+// handful of regular files (bootstrap.json, envoy-attemptN.log,
+// transcript.inc) directly inside it -- but this recurses anyway so it stays
+// correct if that ever changes.
+void remove_dir_recursive(const std::string& path) {
+    DIR* dir = opendir(path.c_str());
+    if (dir != nullptr) {
+        struct dirent* entry = nullptr;
+        while ((entry = readdir(dir)) != nullptr) {
+            const std::string name = entry->d_name;
+            if (name == "." || name == "..") continue;
+            std::string child = path;
+            child += "/";
+            child += name;
+            struct stat st{};
+            if (lstat(child.c_str(), &st) != 0) continue;
+            if (S_ISDIR(st.st_mode)) {
+                remove_dir_recursive(child);
+            } else {
+                unlink(child.c_str());
+            }
+        }
+        closedir(dir);
+    }
+    rmdir(path.c_str());
+}
+
+// RAII owner of a make_temp_dir() directory: removes it (and everything the
+// harness wrote inside it) on destruction, unless RUT_ENVOY_KEEP_TMP=1 is
+// set in the environment to keep it around for diagnostics (round-15
+// review, "Remove temporary harness directories after each run") -- every
+// make_temp_dir() call site previously leaked its directory forever, so
+// long-lived or repeated local/CI runs accumulated /tmp/rut-envoy-* entries
+// without bound.
+class TempDir {
+public:
+    explicit TempDir(const char* prefix) : path_(make_temp_dir(prefix)) {}
+
+    TempDir(const TempDir&) = delete;
+    TempDir& operator=(const TempDir&) = delete;
+    TempDir(TempDir&&) = delete;
+    TempDir& operator=(TempDir&&) = delete;
+
+    ~TempDir() {
+        if (path_.empty() || keep_for_diagnostics()) return;
+        remove_dir_recursive(path_);
+    }
+
+    const std::string& path() const { return path_; }
+    bool empty() const { return path_.empty(); }
+
+private:
+    static bool keep_for_diagnostics() {
+        const char* v = getenv("RUT_ENVOY_KEEP_TMP");
+        return v != nullptr && std::string(v) == "1";
+    }
+
+    std::string path_;
+};
+
 // ── Case table ───────────────────────────────────────────────────────────
 
 struct CaseSpec {
@@ -1420,7 +1518,20 @@ bool write_transcript(const std::string& path, const std::vector<CaseResult>& re
         out << "static constexpr char kEnvoyOracle_" << r.name << "_downstream[] =\n    "
             << wrap_wire_literal(r.downstream_bytes) << ";\n\n";
     }
-    return static_cast<bool>(out);
+    // Explicitly flush and close before checking the stream's state (round-15
+    // review, "Check transcript close errors before reporting success"):
+    // `return static_cast<bool>(out)` here previously ran *before* the
+    // stream's destructor performed its implicit final flush/close, so a
+    // write failure that only surfaces at that point (e.g. the destination
+    // filesystem filling up right as the last, still-buffered bytes are
+    // written out) was never observed -- the small transcripts this function
+    // writes usually fit entirely in ofstream's internal buffer until close,
+    // so nothing had actually failed yet by the time the old check ran. The
+    // caller could be told the transcript was written successfully while a
+    // truncated (or empty) file was left on disk.
+    out.flush();
+    out.close();
+    return out.good();
 }
 
 int count_header(const std::string& raw, const std::string& name) {
@@ -1638,7 +1749,7 @@ int run_oracle_milestone_s(const std::string& output_path) {
 
     // ---- Run 1: live recording upstream ----
     {
-        const std::string dir = make_temp_dir("rut-envoy-oracle");
+        TempDir dir("rut-envoy-oracle");
         if (dir.empty()) {
             std::cerr << "FAIL: could not create temp directory\n";
             return 1;
@@ -1655,7 +1766,7 @@ int run_oracle_milestone_s(const std::string& output_path) {
         EnvoyInstance envoy;
         std::string ready_error;
         if (!launch_envoy_with_port_retry(
-                dir, "run1", &listen_port1, upstream_port1, &envoy, &ready_error)) {
+                dir.path(), "run1", &listen_port1, upstream_port1, &envoy, &ready_error)) {
             std::cerr << "FAIL: " << ready_error << "\n";
             dump_log(envoy.log_path);
             return 1;
@@ -1703,7 +1814,7 @@ int run_oracle_milestone_s(const std::string& output_path) {
 
     // ---- Run 2: connect_failure against a closed upstream port ----
     {
-        const std::string dir = make_temp_dir("rut-envoy-oracle2");
+        TempDir dir("rut-envoy-oracle2");
         if (dir.empty()) {
             std::cerr << "FAIL: could not create temp directory\n";
             close(closed_reserved.fd);
@@ -1712,7 +1823,7 @@ int run_oracle_milestone_s(const std::string& output_path) {
         EnvoyInstance envoy;
         std::string ready_error;
         if (!launch_envoy_with_port_retry(
-                dir, "run2", &listen_port2, closed_port, &envoy, &ready_error)) {
+                dir.path(), "run2", &listen_port2, closed_port, &envoy, &ready_error)) {
             std::cerr << "FAIL: " << ready_error << "\n";
             dump_log(envoy.log_path);
             close(closed_reserved.fd);
@@ -1931,6 +2042,17 @@ bool self_test_partial_exchange_rejection() {
             }
             close(fd);
         }
+        // Unconditionally unblock the fake server's accept() before joining
+        // (round-15 review, "Unblock the fake server before joining on
+        // connect failure"): if connect_with_timeout() above failed (e.g.
+        // transient descriptor exhaustion), nothing ever connected, so the
+        // server thread is still parked in accept() and this join() would
+        // otherwise hang until CTest's 60s timeout. shutdown() on a Linux
+        // listening socket reliably makes a blocked accept() return an
+        // error, so doing this before join() -- for both the success and
+        // failure paths -- makes the fake listener joinable no matter what
+        // happened above.
+        shutdown(listen_fd, SHUT_RDWR);
         server.join();
         close(listen_fd);
     }
@@ -1939,12 +2061,12 @@ bool self_test_partial_exchange_rejection() {
     // duplicated upstream contact, in both cases without creating the
     // output file, and must accept a fully valid run.
     {
-        const std::string dir = make_temp_dir("rut-envoy-selftest");
+        TempDir dir("rut-envoy-selftest");
         if (dir.empty()) {
             std::cerr << "FAIL [self-test partial]: could not create temp dir\n";
             return false;
         }
-        const std::string out_path = dir + "/transcript.inc";
+        const std::string out_path = dir.path() + "/transcript.inc";
 
         CaseResult incomplete;
         incomplete.name = "bad_incomplete";
@@ -1997,9 +2119,89 @@ bool self_test_partial_exchange_rejection() {
             std::cerr << "FAIL [self-test partial]: write_transcript rejected a fully valid run\n";
             ok = false;
         }
+
+        // Round-15 review, "Check transcript close errors before reporting
+        // success": a write failure that only surfaces at the final,
+        // implicit flush/close must not be reported as success. Forced
+        // deterministically with RLIMIT_FSIZE=0 (SIGXFSZ ignored so the
+        // failing write() returns EFBIG instead of killing the process):
+        // open() itself still succeeds (RLIMIT_FSIZE only affects write()),
+        // and this transcript is small enough to stay entirely inside
+        // ofstream's internal buffer until close(), so nothing fails until
+        // that single final flush -- exactly the case the old
+        // `return static_cast<bool>(out)` (checked before the destructor's
+        // implicit close) could miss.
+        {
+            const std::string over_limit_path = dir.path() + "/transcript_over_limit.inc";
+            struct rlimit original_limit{};
+            if (getrlimit(RLIMIT_FSIZE, &original_limit) != 0) {
+                std::cerr << "FAIL [self-test partial]: could not read RLIMIT_FSIZE\n";
+                ok = false;
+            } else {
+                void (*old_handler)(int) = signal(SIGXFSZ, SIG_IGN);
+                struct rlimit tiny_limit{0, original_limit.rlim_max};
+                if (setrlimit(RLIMIT_FSIZE, &tiny_limit) != 0) {
+                    std::cerr << "FAIL [self-test partial]: could not set RLIMIT_FSIZE\n";
+                    ok = false;
+                } else {
+                    if (write_transcript(over_limit_path, {good})) {
+                        std::cerr << "FAIL [self-test partial]: write_transcript reported "
+                                     "success despite the final flush exceeding RLIMIT_FSIZE\n";
+                        ok = false;
+                    }
+                    setrlimit(RLIMIT_FSIZE, &original_limit);
+                }
+                signal(SIGXFSZ, old_handler);
+            }
+        }
     }
 
     if (ok) std::cerr << "PASS [self-test partial exchange rejection]\n";
+    return ok;
+}
+
+// Covers round-15 review thread P2 ("Unblock the fake server before joining
+// on connect failure" / "generally make the fake listener joinable without
+// hanging"): directly exercises the shutdown()-before-join() pattern against
+// a thread parked in accept() that nothing ever connects to -- the exact
+// situation self_test_partial_exchange_rejection()'s connect-failure branch
+// used to leave unresolved. The accept() thread is detached (not joined)
+// so this self-test cannot itself hang forever if the pattern regresses;
+// instead it polls a bounded deadline and reports a clear failure.
+bool self_test_fake_listener_unblocks_on_shutdown() {
+    BoundPort bound;
+    if (!allocate_bound_loopback_port(&bound)) {
+        std::cerr << "FAIL [self-test fake listener unblock]: could not allocate a loopback port\n";
+        return false;
+    }
+    const int listen_fd = bound.fd;
+    auto accept_returned = std::make_shared<std::atomic<bool>>(false);
+    std::thread server([listen_fd, accept_returned] {
+        accept(listen_fd, nullptr, nullptr);
+        accept_returned->store(true);
+    });
+    server.detach();
+
+    // Give the thread a moment to actually enter accept() before trying to
+    // unblock it.
+    struct timespec ts{0, 50'000'000};
+    nanosleep(&ts, nullptr);
+    shutdown(listen_fd, SHUT_RDWR);
+
+    bool ok = true;
+    const int64_t deadline = now_ms() + 2000;
+    while (!accept_returned->load()) {
+        if (now_ms() >= deadline) {
+            std::cerr << "FAIL [self-test fake listener unblock]: accept() did not unblock "
+                         "within 2s of shutdown()\n";
+            ok = false;
+            break;
+        }
+        struct timespec poll_ts{0, 10'000'000};
+        nanosleep(&poll_ts, nullptr);
+    }
+    close(listen_fd);
+    if (ok) std::cerr << "PASS [self-test fake listener unblock]\n";
     return ok;
 }
 
@@ -2381,14 +2583,14 @@ bool self_test_wait_ready_ownership() {
             close(foreign.fd);
             return false;
         }
-        const std::string dir = make_temp_dir("rut-envoy-selftest-case4");
+        TempDir dir("rut-envoy-selftest-case4");
         if (dir.empty()) {
             std::cerr << "FAIL [self-test wait_ready ownership]: could not create temp dir for "
                          "case 4's fake log\n";
             listener.stop();
             return false;
         }
-        const std::string log_path = dir + "/envoy.log";
+        const std::string log_path = dir.path() + "/envoy.log";
         if (!write_file_mode(log_path,
                              "[info] initializing epoch 0\n[info] starting main dispatch loop\n",
                              0644)) {
@@ -2464,6 +2666,109 @@ bool self_test_envoy_log_confirms_listener() {
     return ok;
 }
 
+// Covers round-15 review thread P2 ("Remove temporary harness directories
+// after each run"): TempDir must remove its directory (and everything
+// written inside it) once it goes out of scope, but must instead preserve it
+// when RUT_ENVOY_KEEP_TMP=1 is set, for diagnostics.
+bool self_test_temp_dir_cleanup() {
+    bool ok = true;
+
+    // Default: removed on scope exit.
+    std::string removed_path;
+    {
+        TempDir dir("rut-envoy-selftest-cleanup");
+        if (dir.empty()) {
+            std::cerr << "FAIL [self-test temp dir cleanup]: could not create temp dir\n";
+            return false;
+        }
+        removed_path = dir.path();
+        if (!write_file_mode(removed_path + "/marker", "x", 0644)) {
+            std::cerr << "FAIL [self-test temp dir cleanup]: could not write inside temp dir\n";
+            ok = false;
+        }
+    }
+    struct stat st{};
+    if (stat(removed_path.c_str(), &st) == 0) {
+        std::cerr << "FAIL [self-test temp dir cleanup]: " << removed_path
+                  << " still exists after its TempDir went out of scope\n";
+        ok = false;
+    }
+
+    // RUT_ENVOY_KEEP_TMP=1: preserved on scope exit.
+    std::string kept_path;
+    setenv("RUT_ENVOY_KEEP_TMP", "1", 1);
+    {
+        TempDir dir("rut-envoy-selftest-keep");
+        if (dir.empty()) {
+            std::cerr
+                << "FAIL [self-test temp dir cleanup]: could not create temp dir (keep case)\n";
+            unsetenv("RUT_ENVOY_KEEP_TMP");
+            return false;
+        }
+        kept_path = dir.path();
+    }
+    unsetenv("RUT_ENVOY_KEEP_TMP");
+    if (stat(kept_path.c_str(), &st) != 0) {
+        std::cerr << "FAIL [self-test temp dir cleanup]: RUT_ENVOY_KEEP_TMP=1 did not preserve "
+                  << kept_path << "\n";
+        ok = false;
+    } else {
+        remove_dir_recursive(kept_path);  // clean up manually; this run kept it deliberately
+    }
+
+    if (ok) std::cerr << "PASS [self-test temp dir cleanup]\n";
+    return ok;
+}
+
+// Covers round-15 review thread P2 ("Skip Docker teardown for instances
+// that were never launched"): constructing and destroying an EnvoyInstance
+// that never called launch() -- exactly what every dummy-child self-test
+// case above does -- must never invoke `docker rm -f`, checked via
+// g_docker_rm_invocations rather than a stubbed docker binary. Also checks
+// that an unlaunched instance wrapping a real (dummy) pid still reaps it,
+// so the docker-skip guard doesn't accidentally skip process cleanup too.
+bool self_test_envoy_instance_skips_docker_when_unlaunched() {
+    const int before = g_docker_rm_invocations;
+    {
+        EnvoyInstance envoy;  // name/log_path left empty; launch() never called
+    }
+    if (g_docker_rm_invocations != before) {
+        std::cerr << "FAIL [self-test envoy instance skips docker]: destroying a never-launched "
+                     "EnvoyInstance with no pid invoked docker rm -f\n";
+        return false;
+    }
+
+    const pid_t child = fork();
+    if (child < 0) {
+        std::cerr << "FAIL [self-test envoy instance skips docker]: fork failed\n";
+        return false;
+    }
+    if (child == 0) {
+        _exit(0);
+    }
+    {
+        EnvoyInstance envoy;
+        envoy.pid = child;
+    }
+    if (g_docker_rm_invocations != before) {
+        std::cerr << "FAIL [self-test envoy instance skips docker]: destroying a never-launched "
+                     "EnvoyInstance wrapping a dummy pid invoked docker rm -f\n";
+        return false;
+    }
+    // The dummy child must still have been reaped despite skipping docker
+    // teardown: waitpid() for an already-reaped child returns -1/ECHILD.
+    int status = 0;
+    const pid_t waited = waitpid(child, &status, WNOHANG);
+    if (waited != -1 || errno != ECHILD) {
+        std::cerr << "FAIL [self-test envoy instance skips docker]: dummy child was not reaped "
+                     "by EnvoyInstance::stop()\n";
+        return false;
+    }
+
+    std::cerr << "PASS [self-test envoy instance skips docker]\n";
+    return true;
+}
+
 // Covers round-7 review thread P2 ("Keep the connect-failure port
 // reserved"): allocate_reserved_closed_port() must hold the port so no other
 // bind can claim it, while still producing "connection refused" semantics
@@ -2519,10 +2824,13 @@ int run_self_test() {
     ok &= self_test_escaping();
     ok &= self_test_recording_upstream();
     ok &= self_test_partial_exchange_rejection();
+    ok &= self_test_fake_listener_unblocks_on_shutdown();
     ok &= self_test_argv_builder();
     ok &= self_test_allocate_distinct_ports_exhaustion();
     ok &= self_test_envoy_log_confirms_listener();
     ok &= self_test_wait_ready_ownership();
+    ok &= self_test_temp_dir_cleanup();
+    ok &= self_test_envoy_instance_skips_docker_when_unlaunched();
     ok &= self_test_reserved_closed_port();
     return ok ? 0 : 1;
 }
