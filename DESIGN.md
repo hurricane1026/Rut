@@ -1956,13 +1956,20 @@ provenance header while still forwarding the request is unsafe -- see
 `docs/envoy-compatibility.md`), as does nominating a pseudo-header-shaped
 token (one whose first byte is `:`, e.g. the aliased `:authority`), matching
 Envoy's own `sanitizeConnectionHeader` rejection of the same shape; keeps
-`te` when one of its comma-separated tokens is `trailers` -- every field is
-evaluated independently, so a `TE: gzip` field is dropped and a `TE: trailers`
-field is kept even when they appear on the same request, and two or more
-physical fields that each carry a `trailers` token still collapse to exactly
-one canonical `te: trailers` line, not one per field (rewritten to that exact
-lowercase token regardless of the client's casing or any other token in the
-value); rejects a request whose `Connection` value nominates the `upgrade`
+`te` when any physical `TE` field's comma-separated tokens contain
+`trailers` -- this is a request-wide decision, not a per-field one: whether
+any field anywhere on the request carries that token is determined first,
+and if so exactly one canonical `te: trailers` line (rewritten to that
+exact lowercase token regardless of the client's casing or any other token
+in the value) is emitted at the position of the *first* physical `TE`
+field, with every other physical `TE` field suppressed entirely. So
+`TE: gzip`, then an unrelated header, then `TE: trailers` forwards
+`te: trailers` at the first field's position, before that unrelated header
+-- it is not the case that the `gzip` field is independently dropped in
+place while the `trailers` field is independently kept in its own place;
+and two or more physical fields that each carry a `trailers` token still
+collapse to exactly one canonical line, not one per field; rejects a
+request whose `Connection` value nominates the `upgrade`
 token together with an `Upgrade` header whose trimmed value is non-empty,
 even when the `Connection` value also contains `close` (the runtime checks
 `req.has_upgrade_header`, which requires a non-empty value, so
@@ -1997,9 +2004,12 @@ malformed scheme; and `x-forwarded-proto: http` is appended as the last
 header only when the client sent no `x-forwarded-proto` field at all. It is
 closed to ordinary
 zero-copy-shaped forwards: a request with a body paired with a client
-`Expect` header, or with `Transfer-Encoding`, fails closed rather than
-proxying with ambiguous framing (no `100 Continue` interim-response support
-exists yet). See `docs/language-card.md` for the exact field grammar and
+`Expect` header whose trimmed value is non-empty, or with
+`Transfer-Encoding`, fails closed rather than proxying with ambiguous
+framing (no `100 Continue` interim-response support exists yet); an empty
+or OWS-only `Expect` field is admitted like a request with no `Expect`
+header at all, matching the same nonempty-trimmed-value condition described
+above. See `docs/language-card.md` for the exact field grammar and
 `docs/envoy-converter.md` for the byte-level Envoy oracle this profile is
 verified against. A parallel, separately-closed `response_policy` exists for
 response-side rewriting; see `docs/language-card.md`.
