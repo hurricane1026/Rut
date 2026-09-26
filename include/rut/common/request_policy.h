@@ -14,16 +14,28 @@ enum class RequestPolicyId : u16 {
     Http11FixedTrimSpPreserveHtab = 3,
     // Envoy-compatible H1 profile: preserves the client's Host header instead
     // of writing the upstream endpoint, lowercases every forwarded header
-    // name, drops Envoy's hop-by-hop set (including Proxy-Connection and any
-    // header nominated by the client's Connection header), keeps a `te`
-    // field only when one of its comma-separated tokens is "trailers" (any
-    // casing; `TE: gzip, trailers` is kept, `TE: gzip` is dropped) and
-    // rewrites the kept field to exactly `te: trailers` -- never the whole
-    // client value -- with several such fields collapsing to one line, and
-    // ensures a trailing x-forwarded-proto. Ordinary-forward-only: never
-    // admitted alongside a
-    // response read deadline or response buffering (see the closed
-    // admission predicates below).
+    // name, drops Envoy's fixed hop-by-hop set (Connection, Keep-Alive,
+    // Proxy-Connection, Expect, Upgrade, Transfer-Encoding) by default, and
+    // separately drops every header the client's Connection value nominates
+    // -- except a nomination of `content-length`, `host`, `x-forwarded-for`,
+    // `x-forwarded-host`, `x-forwarded-proto`, or a pseudo-header-shaped
+    // token (first byte `:`), each of which fails the whole request closed
+    // instead of being dropped, and except a nomination of `te`, which is
+    // not dropped at all and does not affect persistence -- its sibling `TE`
+    // field is evaluated the same as always (see below) and forwarded as
+    // `te: trailers` when warranted. Keeps a `te` field only when one of its
+    // comma-separated tokens is "trailers" (any casing; `TE: gzip, trailers`
+    // is kept, `TE: gzip` is dropped) and rewrites the kept field to exactly
+    // `te: trailers` -- never the whole client value -- emitted at the first
+    // physical `TE` field's position, with several such fields collapsing to
+    // one line. A single client-supplied `x-forwarded-proto` field whose
+    // trimmed value is case-insensitively exactly `http`/`https` is
+    // preserved unchanged in its original position; an empty, OWS-only, or
+    // otherwise invalid value is overwritten in place at that same position
+    // with `http`; a trailing `x-forwarded-proto: http` is appended only
+    // when the client sent no such field at all. Ordinary-forward-only:
+    // never admitted alongside a response read deadline or response
+    // buffering (see the closed admission predicates below).
     Http11PreserveHostLowercase = 4,
     // Reserved in the 16-bit forward-result slot for invalid direct-RIR values.
     Invalid = 0xffffu,
