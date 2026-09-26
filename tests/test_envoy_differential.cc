@@ -1471,9 +1471,23 @@ bool envoy_log_confirms_listener(const std::string& contents) {
 // identically, both logged startup on this exact port.
 //
 // Counts how many rows of a /proc/net/tcp- or /proc/net/tcp6-style table are
-// in the LISTEN state (`st` field "0A", i.e. decimal 10) and bound to
-// `port`. Each row is a DISTINCT socket with its own inode column (the last
-// field), so more than one row for the same port means more than one live
+// in the LISTEN state (`st` field "0A", i.e. decimal 10), bound to `port`,
+// AND bound to an address that can actually receive this harness's IPv4
+// loopback client traffic (round-16 review, "Count only listeners that can
+// receive the IPv4 traffic"): an unrelated IPv6-only listener on the same
+// numeric port (e.g. something else on `::1`) can never collide with, or
+// steal traffic from, the proxy's IPv4 endpoint, so counting it would make
+// this falsely detect a reuseport collision that was never a real one.
+// Eligible addresses are the IPv4 wildcard (`0.0.0.0`, hex "00000000") or
+// the exact loopback address (`127.0.0.1`, hex "0100007F") in a
+// /proc/net/tcp-style (8 hex digit) row, and the IPv6 wildcard (`::`, all
+// zero) or the IPv4-mapped loopback address (`::ffff:127.0.0.1`) in a
+// /proc/net/tcp6-style (32 hex digit) row -- both of those genuinely
+// receive IPv4 traffic on a dual-stack socket. An IPv6-only address (e.g.
+// `::1`) is deliberately excluded.
+//
+// Each row is a DISTINCT socket with its own inode column (the last field),
+// so more than one ELIGIBLE row for the same port means more than one live
 // listener holds it right now, whether or not they are in the same
 // SO_REUSEPORT group. Takes the table's TEXT, not a path, so it is
 // exercisable directly with synthetic tables, independent of the real
@@ -1481,6 +1495,13 @@ bool envoy_log_confirms_listener(const std::string& contents) {
 int count_listeners_on_port(const std::string& tcp_table, uint16_t port) {
     char port_hex[8];
     std::snprintf(port_hex, sizeof(port_hex), "%04X", port);
+    // /proc/net/tcp: 8 hex digits (32-bit IPv4 address).
+    static const char* const kIpv4Eligible[] = {"00000000", "0100007F"};
+    // /proc/net/tcp6: 32 hex digits (128-bit IPv6 address), the wildcard
+    // `::` and the IPv4-mapped `::ffff:127.0.0.1` (verified against a live
+    // /proc/net/tcp6 loopback listener).
+    static const char* const kIpv6Eligible[] = {"00000000000000000000000000000000",
+                                                "0000000000000000FFFF00000100007F"};
     int count = 0;
     std::istringstream lines(tcp_table);
     std::string line;
@@ -1497,11 +1518,33 @@ int count_listeners_on_port(const std::string& tcp_table, uint16_t port) {
         const size_t colon = local_address.rfind(':');
         if (colon == std::string::npos) continue;
         std::string local_port = local_address.substr(colon + 1);
+        std::string local_addr = local_address.substr(0, colon);
         std::transform(
             local_port.begin(), local_port.end(), local_port.begin(), [](unsigned char c) {
                 return static_cast<char>(std::toupper(c));
             });
-        if (local_port == port_hex) count++;
+        std::transform(
+            local_addr.begin(), local_addr.end(), local_addr.begin(), [](unsigned char c) {
+                return static_cast<char>(std::toupper(c));
+            });
+        if (local_port != port_hex) continue;
+        const char* const* eligible = nullptr;
+        size_t eligible_count = 0;
+        if (local_addr.size() == 8) {
+            eligible = kIpv4Eligible;
+            eligible_count = sizeof(kIpv4Eligible) / sizeof(kIpv4Eligible[0]);
+        } else if (local_addr.size() == 32) {
+            eligible = kIpv6Eligible;
+            eligible_count = sizeof(kIpv6Eligible) / sizeof(kIpv6Eligible[0]);
+        } else {
+            continue;
+        }
+        for (size_t i = 0; i < eligible_count; i++) {
+            if (local_addr == eligible[i]) {
+                count++;
+                break;
+            }
+        }
     }
     return count;
 }
@@ -2860,7 +2903,18 @@ bool write_pair_transcript(const std::string& path, const std::vector<PairCaseRe
         out << "static constexpr char kEnvoyVsRut_" << r.name << "_rut_downstream[] =\n    "
             << wrap_wire_literal(r.rut.downstream_bytes) << ";\n\n";
     }
-    return static_cast<bool>(out);
+    // Explicitly flush and close before checking the stream's state, exactly
+    // like write_transcript() (round-16 review, "Flush the pair transcript
+    // before reporting success"): `return static_cast<bool>(out)` here ran
+    // *before* the stream's destructor performed its implicit final
+    // flush/close, so a deferred write error (ENOSPC, a quota, or another
+    // failure that only surfaces at that final flush) was never observed --
+    // the caller could be told the pair transcript -- the CI artifact for
+    // PR 6 -- was written successfully while a truncated or empty file was
+    // left on disk.
+    out.flush();
+    out.close();
+    return out.good();
 }
 
 int count_header(const std::string& raw, const std::string& name) {
@@ -3303,6 +3357,30 @@ bool launch_rut_with_port_retry(const std::string& dir,
     return false;
 }
 
+// Round-12 review, "Prevent record-only crashes from failing pair mode":
+// classifies a proxy `stop()` failure observed by a record-only-only
+// instance in either run_oracle_milestone_s() or run_pair_milestone_s() --
+// called ONLY after that phase's asserted instance already ran to
+// completion, was stopped, and had its own upstream evidence captured and
+// validated -- as a non-fatal NOTE rather than a hard failure. A proxy
+// crash that happened during (or before) the asserted batch is already
+// caught independently: the affected asserted case's own exchange would be
+// incomplete, which (in pair mode) compare_pair_case()'s `both_complete`
+// check turns into an asserted MISMATCH regardless of this function. So a
+// `stop()` failure reaching here can only mean the proxy died during or
+// after the record-only batch, which the CLI contract says must never gate
+// acceptance -- note it and mark every record-only result ambiguous
+// instead.
+void note_record_only_phase_crash(const char* proxy_label,
+                                  const std::string& unexpected_exit_description,
+                                  std::vector<CaseResult>* record_only_results) {
+    std::cerr << "NOTE: " << proxy_label
+              << " exited unexpectedly during or after the record-only batch ("
+              << unexpected_exit_description
+              << "); asserted evidence was already captured, so this does not fail the run\n";
+    for (auto& r : *record_only_results) r.upstream_ambiguous = true;
+}
+
 int run_oracle_milestone_s(const std::string& output_path) {
     const std::string missing = check_docker_prerequisites();
     if (!missing.empty()) return missing_prerequisite(missing);
@@ -3360,12 +3438,62 @@ int run_oracle_milestone_s(const std::string& output_path) {
             return 1;
         }
 
-        EnvoyInstance envoy;
+        const auto cases = run1_cases();
+        std::vector<CaseSpec> asserted_cases, record_only_cases;
+        split_asserted_and_record_only(cases, &asserted_cases, &record_only_cases);
+
+        auto run_and_collect = [&](const std::vector<CaseSpec>& subset) {
+            std::vector<CaseResult> local;
+            local.reserve(subset.size());
+            for (const auto& spec : subset) {
+                CaseResult r;
+                if (!run_client_case(listen_port1, spec, &r))
+                    std::cerr << "WARN: case " << spec.name
+                              << " exchange did not complete cleanly ("
+                              << describe_incomplete_exchange(r) << ")\n";
+                local.push_back(std::move(r));
+            }
+            return local;
+        };
+        auto attribute_upstream = [&](std::vector<CaseResult>* subset_results,
+                                      const std::vector<CaseSpec>& subset) {
+            for (auto& r : *subset_results) {
+                const auto it = std::find_if(subset.begin(), subset.end(), [&](const CaseSpec& s) {
+                    return r.name == s.name;
+                });
+                if (it == subset.end()) continue;
+                const auto observed = upstream.requests_for(it->upstream_path);
+                r.upstream_contact_count = static_cast<int>(observed.size());
+                if (!observed.empty()) {
+                    r.upstream_contacted = true;
+                    r.upstream_bytes = observed.front();
+                }
+            }
+        };
+
+        // Round-11 review, "Attribute duplicate contacts to the originating
+        // case": run the asserted cases to completion and attribute their
+        // upstream evidence before the record-only cases run. Round-15/
+        // round-16 review, "Stop Envoy before snapshotting oracle upstream
+        // traffic": the asserted and record-only batches now each get their
+        // OWN Envoy instance (mirroring run_pair_milestone_s()), and the
+        // asserted instance is stopped and validated BEFORE its upstream
+        // evidence is inspected, not after -- a delayed duplicate or
+        // unlisted request Envoy emits during its own shutdown/cleanup
+        // (after the client already got its response) would otherwise
+        // arrive on the wire after the snapshot and be silently discarded
+        // by clear_requests() below.
+        EnvoyInstance envoy_asserted;
         std::string ready_error;
-        if (!launch_envoy_with_port_retry(
-                dir.path(), "run1", &listen_port1, upstream_port1, &envoy, &ready_error)) {
+        if (!launch_envoy_with_port_retry(dir.path(),
+                                          "run1-asserted",
+                                          &listen_port1,
+                                          upstream_port1,
+                                          &envoy_asserted,
+                                          &ready_error)) {
             std::cerr << "FAIL: " << ready_error << "\n";
-            dump_log(envoy.log_path);
+            dump_log(envoy_asserted.log_path);
+            upstream.stop();
             return 1;
         }
 
@@ -3380,66 +3508,67 @@ int run_oracle_milestone_s(const std::string& output_path) {
             std::cerr << "FAIL: the listener-ownership probe contacted the recording upstream; "
                          "the asterisk-form request must be answered by Envoy's own "
                          "router-not-found local reply, never routed to a cluster\n";
-            envoy.stop();
+            envoy_asserted.stop();
             upstream.stop();
             return 1;
         }
 
-        const auto cases = run1_cases();
-        std::vector<CaseSpec> asserted_cases, record_only_cases;
-        split_asserted_and_record_only(cases, &asserted_cases, &record_only_cases);
-
-        auto run_and_collect = [&](const std::vector<CaseSpec>& subset) {
-            for (const auto& spec : subset) {
-                CaseResult r;
-                if (!run_client_case(listen_port1, spec, &r))
-                    std::cerr << "WARN: case " << spec.name
-                              << " exchange did not complete cleanly ("
-                              << describe_incomplete_exchange(r) << ")\n";
-                results.push_back(std::move(r));
-            }
-        };
-        auto attribute_upstream = [&](const std::vector<CaseSpec>& subset, size_t begin) {
-            for (size_t i = begin; i < results.size(); i++) {
-                auto& r = results[i];
-                const auto it = std::find_if(subset.begin(), subset.end(), [&](const CaseSpec& s) {
-                    return r.name == s.name;
-                });
-                if (it == subset.end()) continue;
-                const auto observed = upstream.requests_for(it->upstream_path);
-                r.upstream_contact_count = static_cast<int>(observed.size());
-                if (!observed.empty()) {
-                    r.upstream_contacted = true;
-                    r.upstream_bytes = observed.front();
-                }
-            }
-        };
-        // Round-11 review, "Attribute duplicate contacts to the originating
-        // case": run the asserted cases to completion and attribute their
-        // upstream evidence FIRST, then reset the recording upstream's log
-        // before running the record-only cases as a second, isolated batch
-        // on this same Envoy instance. Without this, a record-only request
-        // that lands on (or is misattributed to) an asserted case's own
-        // expected path -- e.g. a forged-header case misrouted onto
-        // `/smoke` -- would inflate that asserted case's contact count into
-        // a false duplicate, and validate_results() below fails the whole
-        // run unconditionally on any count > 1, contradicting the CLI's
-        // "record-only never affects the exit code" contract.
-        const size_t asserted_begin = results.size();
-        run_and_collect(asserted_cases);
-        attribute_upstream(asserted_cases, asserted_begin);
-        upstream.clear_requests();
-        const size_t record_only_begin = results.size();
-        run_and_collect(record_only_cases);
-        attribute_upstream(record_only_cases, record_only_begin);
-
-        if (!envoy.stop()) {
+        auto asserted_results = run_and_collect(asserted_cases);
+        if (!envoy_asserted.stop()) {
             std::cerr << "FAIL: envoy exited unexpectedly before teardown ("
-                      << envoy.unexpected_exit_description << ")\n";
-            dump_log(envoy.log_path);
+                      << envoy_asserted.unexpected_exit_description << ")\n";
+            dump_log(envoy_asserted.log_path);
+            upstream.stop();
+            return 1;
+        }
+        attribute_upstream(&asserted_results, asserted_cases);
+        if (!wait_port_closed(listen_port1, 5000)) {
+            std::cerr << "FAIL: listener port " << listen_port1
+                      << " did not become free after stopping the asserted-batch Envoy instance\n";
+            upstream.stop();
+            return 1;
+        }
+        upstream.clear_requests();
+
+        // Record-only cases run against a SEPARATE instance, launched only
+        // after the asserted instance's own evidence is already safely
+        // captured -- see split_asserted_and_record_only()'s comment for
+        // why isolation matters, and note_record_only_phase_crash()'s for
+        // why this instance's own teardown failure is a NOTE, not fatal.
+        EnvoyInstance envoy_record_only;
+        if (!launch_envoy_with_port_retry(dir.path(),
+                                          "run1-record-only",
+                                          &listen_port1,
+                                          upstream_port1,
+                                          &envoy_record_only,
+                                          &ready_error)) {
+            std::cerr << "FAIL: " << ready_error << "\n";
+            dump_log(envoy_record_only.log_path);
+            upstream.stop();
+            return 1;
+        }
+        auto record_only_results = run_and_collect(record_only_cases);
+        attribute_upstream(&record_only_results, record_only_cases);
+        if (!envoy_record_only.stop()) {
+            dump_log(envoy_record_only.log_path);
+            note_record_only_phase_crash(
+                "envoy", envoy_record_only.unexpected_exit_description, &record_only_results);
+        }
+        if (!wait_port_closed(listen_port1, 5000)) {
+            std::cerr << "FAIL: listener port " << listen_port1
+                      << " did not become free after stopping the record-only-batch Envoy "
+                         "instance\n";
+            upstream.stop();
             return 1;
         }
         upstream.stop();
+
+        results.insert(results.end(),
+                       std::make_move_iterator(asserted_results.begin()),
+                       std::make_move_iterator(asserted_results.end()));
+        results.insert(results.end(),
+                       std::make_move_iterator(record_only_results.begin()),
+                       std::make_move_iterator(record_only_results.end()));
     }
 
     // ---- Run 2: connect_failure against a closed upstream port ----
@@ -3571,30 +3700,6 @@ bool compare_pair_case(const PairCaseResult& c) {
     return match;
 }
 
-// Round-12 review, "Prevent record-only crashes from failing pair mode":
-// classifies a proxy `stop()` failure observed by either phase of
-// run_pair_milestone_s() -- called ONLY after that phase's asserted batch
-// has already run to completion and had its own upstream evidence captured
-// and validated (`fill_upstream_bytes()` for `asserted_cases`, which stays
-// fatal on its own) -- as a non-fatal NOTE rather than a hard failure. A
-// proxy crash that happened during (or before) the asserted batch is
-// already caught independently: the affected asserted case's own exchange
-// would be incomplete, which compare_pair_case()'s `both_complete` check
-// turns into an asserted MISMATCH regardless of this function. So a
-// `stop()` failure reaching here can only mean the proxy died during or
-// after the record-only batch, which the CLI contract says must never gate
-// acceptance (`any_asserted_mismatch` in run_pair_milestone_s()) -- note it
-// and mark every record-only result ambiguous instead.
-void note_record_only_phase_crash(const char* proxy_label,
-                                  const std::string& unexpected_exit_description,
-                                  std::vector<CaseResult>* record_only_results) {
-    std::cerr << "NOTE: " << proxy_label
-              << " exited unexpectedly during or after the record-only batch ("
-              << unexpected_exit_description
-              << "); asserted evidence was already captured, so this does not fail the run\n";
-    for (auto& r : *record_only_results) r.upstream_ambiguous = true;
-}
-
 int run_pair_milestone_s(const std::string& rut_binary,
                          const std::string& converter_binary,
                          const std::string& transcript_path) {
@@ -3714,16 +3819,23 @@ int run_pair_milestone_s(const std::string& rut_binary,
         // instance below, after this one is fully stopped and validated, on
         // a freshly-cleared log -- see split_asserted_and_record_only()'s
         // comment for why. Applied identically to the RUT phase below.
+        //
+        // Round-16 review, "Snapshot upstream traffic after stopping the
+        // asserted proxy": stop and validate the asserted-phase instance
+        // BEFORE inspecting the recording upstream's log, not after -- a
+        // delayed duplicate or unlisted request Envoy emits during its own
+        // shutdown/cleanup (after the client already got its response)
+        // would otherwise arrive on the wire after this snapshot and be
+        // silently discarded by the clear_requests() below.
         auto envoy_asserted_results = run_case_batch(listen_port1, asserted_cases);
-        if (!fill_upstream_bytes(&envoy_asserted_results, asserted_cases, upstream)) {
-            envoy_asserted.stop();
-            upstream.stop();
-            return 1;
-        }
         if (!envoy_asserted.stop()) {
             std::cerr << "FAIL: envoy exited unexpectedly before teardown ("
                       << envoy_asserted.unexpected_exit_description << ")\n";
             dump_log(envoy_asserted.log_path);
+            upstream.stop();
+            return 1;
+        }
+        if (!fill_upstream_bytes(&envoy_asserted_results, asserted_cases, upstream)) {
             upstream.stop();
             return 1;
         }
@@ -3800,18 +3912,19 @@ int run_pair_milestone_s(const std::string& rut_binary,
             upstream.stop();
             return 1;
         }
+        // Round-16 review, "Snapshot upstream traffic after stopping the
+        // asserted proxy": same reasoning as the Envoy phase above -- stop
+        // and validate the asserted-phase RUT instance before inspecting
+        // the recording upstream's log.
         auto rut_asserted_results = run_case_batch(listen_port1, asserted_cases);
-        const bool rut_asserted_fill_ok =
-            fill_upstream_bytes(&rut_asserted_results, asserted_cases, upstream);
-        const bool rut_asserted_stopped_cleanly = rut_asserted.stop();
-        if (!rut_asserted_fill_ok) {
-            upstream.stop();
-            return 1;
-        }
-        if (!rut_asserted_stopped_cleanly) {
+        if (!rut_asserted.stop()) {
             std::cerr << "FAIL: rut exited unexpectedly before teardown ("
                       << rut_asserted.unexpected_exit_description << ")\n";
             dump_rut_log(rut_asserted.log_path);
+            upstream.stop();
+            return 1;
+        }
+        if (!fill_upstream_bytes(&rut_asserted_results, asserted_cases, upstream)) {
             upstream.stop();
             return 1;
         }
@@ -4306,6 +4419,34 @@ bool self_test_partial_exchange_rejection() {
             std::cerr << "FAIL [self-test partial]: write_pair_transcript rejected a fully "
                          "valid run\n";
             ok = false;
+        }
+
+        // Round-16 review, "Flush the pair transcript before reporting
+        // success": the identical RLIMIT_FSIZE-forced deferred-write-failure
+        // check as write_transcript()'s above (round-15 review), applied to
+        // write_pair_transcript().
+        {
+            const std::string pair_over_limit_path = dir.path() + "/pair_transcript_over_limit.inc";
+            struct rlimit original_limit{};
+            if (getrlimit(RLIMIT_FSIZE, &original_limit) != 0) {
+                std::cerr << "FAIL [self-test partial]: could not read RLIMIT_FSIZE (pair)\n";
+                ok = false;
+            } else {
+                void (*old_handler)(int) = signal(SIGXFSZ, SIG_IGN);
+                struct rlimit tiny_limit{0, original_limit.rlim_max};
+                if (setrlimit(RLIMIT_FSIZE, &tiny_limit) != 0) {
+                    std::cerr << "FAIL [self-test partial]: could not set RLIMIT_FSIZE (pair)\n";
+                    ok = false;
+                } else {
+                    if (write_pair_transcript(pair_over_limit_path, {good_pair})) {
+                        std::cerr << "FAIL [self-test partial]: write_pair_transcript reported "
+                                     "success despite the final flush exceeding RLIMIT_FSIZE\n";
+                        ok = false;
+                    }
+                    setrlimit(RLIMIT_FSIZE, &original_limit);
+                }
+                signal(SIGXFSZ, old_handler);
+            }
         }
 
         // Round-8 review, "Keep record-only transcript failures out of
@@ -4922,6 +5063,34 @@ bool self_test_temp_dir_cleanup() {
     return ok;
 }
 
+// Lists the basenames of every `/tmp` entry matching one of THIS file's own
+// make_temp_dir()/TempDir prefixes ("rut-envoy-", "rut-diff-selftest-",
+// "rut-selftest-" -- every literal prefix string passed to make_temp_dir()/
+// TempDir anywhere in this file). Deliberately narrower than a blanket
+// `rut-*` match: this test suite's own /tmp is shared with other, unrelated
+// test binaries that also use a "rut-" naming convention (e.g.
+// tests/test_nginx_differential.cc's "rut-nginx-*"), and a broad match
+// would misattribute their entries -- created concurrently by a completely
+// different process -- to this file's own footprint.
+std::vector<std::string> list_rut_tmp_dir_names() {
+    static const char* const kPrefixes[] = {"rut-envoy-", "rut-diff-selftest-", "rut-selftest-"};
+    std::vector<std::string> names;
+    DIR* d = opendir("/tmp");
+    if (d == nullptr) return names;
+    struct dirent* entry;
+    while ((entry = readdir(d)) != nullptr) {
+        const std::string name = entry->d_name;
+        for (const char* prefix : kPrefixes) {
+            if (name.rfind(prefix, 0) == 0) {
+                names.push_back(name);
+                break;
+            }
+        }
+    }
+    closedir(d);
+    return names;
+}
+
 // Covers round-15 review thread P2 ("Skip Docker teardown for instances
 // that were never launched"): constructing and destroying an EnvoyInstance
 // that never called launch() -- exactly what every dummy-child self-test
@@ -5060,14 +5229,14 @@ bool self_test_rut_wait_ready_ownership() {
             close(foreign.fd);
             return false;
         }
-        const std::string dir = make_temp_dir("rut-selftest-ownership-nolog");
+        TempDir dir("rut-selftest-ownership-nolog");
         if (dir.empty()) {
             std::cerr << "FAIL [self-test rut wait_ready ownership]: could not create temp "
                          "directory\n";
             fake.stop();
             return false;
         }
-        const std::string log_path = dir + "/rut.log";
+        const std::string log_path = dir.path() + "/rut.log";
         // Deliberately never mentions "Listening on port" for this port: the
         // tracked "rut" child (the dummy fork below) never actually wrote
         // this log, standing in for a still-starting or foreign process
@@ -5134,14 +5303,14 @@ bool self_test_rut_wait_ready_ownership() {
             close(foreign.fd);
             return false;
         }
-        const std::string dir = make_temp_dir("rut-selftest-ownership-log");
+        TempDir dir("rut-selftest-ownership-log");
         if (dir.empty()) {
             std::cerr << "FAIL [self-test rut wait_ready ownership]: could not create temp "
                          "directory\n";
             fake.stop();
             return false;
         }
-        const std::string log_path = dir + "/rut.log";
+        const std::string log_path = dir.path() + "/rut.log";
         // The exact post-bind startup text src/main.cc writes
         // (write_str("Listening on port "); write_u32(port); write_str("
         // with "); write_u32(shard_count); write_str(" shard(s)\n");), for
@@ -5276,19 +5445,55 @@ bool self_test_count_listeners_on_port() {
             ok = false;
         }
     }
+    const char* kHeader6 =
+        "  sl  local_address                         remote_address                        st "
+        "tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode\n";
     {
-        // tcp6-shaped table with a 128-bit v4-mapped address; only the port
-        // suffix after the last ':' is parsed, so the wider address field
-        // does not need special-casing.
+        // tcp6-shaped table with the IPv6 wildcard `::` -- a dual-stack bind
+        // that CAN receive this harness's IPv4 loopback traffic, so it must
+        // count.
         const std::string table6 =
-            "  sl  local_address                         remote_address                        "
-            "st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode\n"
+            std::string(kHeader6) +
             "   0: 00000000000000000000000000000000:1F90 "
             "00000000000000000000000000000000:0000 0A 00000000:00000000 00:00000000 00000000  "
             "1000        0 12349 1 0000000000000000 100 0 0 10 0\n";
         const int count = count_listeners_on_port(table6, 0x1F90);
         if (count != 1) {
-            std::cerr << "FAIL [self-test count listeners]: tcp6-shaped table reported " << count
+            std::cerr << "FAIL [self-test count listeners]: tcp6 wildcard (::) table reported "
+                      << count << ", expected 1\n";
+            ok = false;
+        }
+    }
+    {
+        // Round-16 review, "Count only listeners that can receive the IPv4
+        // traffic": an IPv6-ONLY address like `::1` can never receive this
+        // harness's IPv4 loopback client traffic, so an unrelated listener
+        // bound there on the same numeric port must NOT count -- verified
+        // against a live /proc/net/tcp6 loopback listener's actual encoding.
+        const std::string table6 =
+            std::string(kHeader6) +
+            "   0: 00000000000000000000000001000000:1F90 "
+            "00000000000000000000000000000000:0000 0A 00000000:00000000 00:00000000 00000000  "
+            "1000        0 12350 1 0000000000000000 100 0 0 10 0\n";
+        const int count = count_listeners_on_port(table6, 0x1F90);
+        if (count != 0) {
+            std::cerr << "FAIL [self-test count listeners]: tcp6 IPv6-only (::1) table reported "
+                      << count << ", expected 0\n";
+            ok = false;
+        }
+    }
+    {
+        // tcp6-shaped table with a genuine IPv4-mapped address
+        // (::ffff:127.0.0.1) -- a dual-stack socket bound this way also
+        // receives IPv4 loopback traffic, so it must count.
+        const std::string table6 =
+            std::string(kHeader6) +
+            "   0: 0000000000000000FFFF00000100007F:1F90 "
+            "00000000000000000000000000000000:0000 0A 00000000:00000000 00:00000000 00000000  "
+            "1000        0 12351 1 0000000000000000 100 0 0 10 0\n";
+        const int count = count_listeners_on_port(table6, 0x1F90);
+        if (count != 1) {
+            std::cerr << "FAIL [self-test count listeners]: tcp6 v4-mapped table reported " << count
                       << ", expected 1\n";
             ok = false;
         }
@@ -6207,13 +6412,13 @@ bool self_test_stop_echild_precheck_no_signal() {
 // of rut itself would) must not, even though waitpid() reaps a normal exit
 // either way.
 bool self_test_rut_stop_verifies_exit_status() {
-    const std::string dir = make_temp_dir("rut-diff-selftest-stop");
+    TempDir dir("rut-diff-selftest-stop");
     if (dir.empty()) {
         std::cerr << "FAIL [self-test rut stop status]: could not create temp directory\n";
         return false;
     }
     auto run_case = [&](const char* script_body, bool expect_clean, const char* label) {
-        const std::string script = dir + "/" + label + ".sh";
+        const std::string script = dir.path() + "/" + label + ".sh";
         if (!write_file_mode(script, script_body, 0755)) {
             std::cerr << "FAIL [self-test rut stop status]: could not write " << label << ".sh\n";
             return false;
@@ -6589,6 +6794,128 @@ bool self_test_pair_isolated_instances_crash_classification() {
     }
 
     if (ok) std::cerr << "PASS [self-test pair isolated crash classification]\n";
+    return ok;
+}
+
+// Set just before installing the SIGTERM handler in
+// self_test_asserted_phase_delayed_teardown_request_is_fatal()'s fake proxy
+// child below: signal handlers are plain function pointers with no capture,
+// so the upstream port they need to reach is threaded through this file-
+// scope variable instead. Confined to (and only ever written/read by) that
+// one self-test's own child process, never the parent.
+uint16_t g_selftest_delayed_teardown_upstream_port = 0;
+
+// Round-16 review, "Snapshot upstream traffic after stopping the asserted
+// proxy" (P1): reproduces the exact scenario the review describes -- an
+// asserted request completes its own response normally (no upstream contact
+// at all, in this test), but the proxy then emits a DELAYED, unlisted
+// upstream request during its own SIGTERM teardown, after the client
+// already has its answer. Drives fill_upstream_bytes() the same way the now
+// -fixed run_pair_milestone_s()/run_oracle_milestone_s() do: stop() (and
+// therefore wait out the delayed request) BEFORE inspecting the upstream's
+// log, which must make it fatal for this pure-asserted batch.
+bool self_test_asserted_phase_delayed_teardown_request_is_fatal() {
+    BoundPort upstream_bound;
+    if (!allocate_bound_loopback_port(&upstream_bound)) {
+        std::cerr << "FAIL [self-test asserted delayed teardown]: could not allocate the "
+                     "upstream port\n";
+        return false;
+    }
+    RecordingUpstream upstream;
+    const std::string upstream_reply = "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nhi";
+    upstream.set_default_reply(upstream_reply);
+    if (!upstream.adopt(upstream_bound.fd)) {
+        std::cerr << "FAIL [self-test asserted delayed teardown]: could not start the recording "
+                     "upstream\n";
+        return false;
+    }
+    g_selftest_delayed_teardown_upstream_port = upstream_bound.port;
+
+    BoundPort proxy_bound;
+    if (!allocate_bound_loopback_port(&proxy_bound)) {
+        std::cerr << "FAIL [self-test asserted delayed teardown]: could not allocate the fake "
+                     "proxy's port\n";
+        upstream.stop();
+        return false;
+    }
+    const pid_t fake_proxy = fork();
+    if (fake_proxy < 0) {
+        std::cerr << "FAIL [self-test asserted delayed teardown]: fork failed\n";
+        close(proxy_bound.fd);
+        upstream.stop();
+        return false;
+    }
+    if (fake_proxy == 0) {
+        // Answers exactly one connection (the asserted client request)
+        // without ever contacting the upstream itself, then blocks in
+        // pause() until signaled. The SIGTERM handler -- standing in for a
+        // side-effecting request a real proxy might emit while tearing down
+        // a connection -- makes ONE delayed request to an UNLISTED path on
+        // the upstream before the process actually exits.
+        signal(SIGTERM, [](int) {
+            const int fd = connect_with_timeout(g_selftest_delayed_teardown_upstream_port, 1000);
+            if (fd >= 0) {
+                send_all(fd,
+                         "GET /delayed-teardown-request HTTP/1.1\r\nHost: t.example\r\n"
+                         "Connection: close\r\n\r\n");
+                close(fd);
+            }
+            _exit(1);
+        });
+        const int fd = accept(proxy_bound.fd, nullptr, nullptr);
+        if (fd >= 0) {
+            char buf[512];
+            const ssize_t ignored = recv(fd, buf, sizeof(buf), 0);
+            (void)ignored;
+            send_all(fd, "HTTP/1.1 200 OK\r\nConnection: close\r\nContent-Length: 2\r\n\r\nhi");
+            close(fd);
+        }
+        for (;;) pause();
+    }
+    close(proxy_bound.fd);
+    const uint16_t proxy_port = proxy_bound.port;
+
+    RutInstance rut;
+    rut.pid = fake_proxy;
+    rut.log_path = "/dev/null";
+
+    // Named after a real entry in kAssertedCaseNames (is_asserted_case()
+    // matches by name, not by shape) so fill_upstream_bytes() correctly
+    // classifies this as a pure-asserted batch.
+    const std::vector<CaseSpec> asserted_cases = {
+        {"get_smoke",
+         "GET /client HTTP/1.1\r\nHost: t.example\r\n\r\n",
+         false,
+         "/never-contacted",
+         upstream_reply}};
+    auto asserted_results = run_case_batch(proxy_port, asserted_cases);
+    bool ok = true;
+    if (asserted_results.size() != 1 || !asserted_results[0].exchange_complete) {
+        std::cerr << "FAIL [self-test asserted delayed teardown]: the asserted case's own "
+                     "exchange did not complete\n";
+        ok = false;
+    }
+
+    // Stop first -- this sends SIGTERM and blocks until the fake proxy has
+    // fully exited, which only happens after its handler's delayed upstream
+    // request has already completed -- THEN inspect the upstream's log, the
+    // fixed ordering from the round-16 review.
+    rut.stop();
+    // A brief grace window for the recording upstream's own handler thread
+    // (independent of the now-exited fake proxy) to finish logging the
+    // delayed request it already received.
+    struct timespec grace{0, 100'000'000};
+    nanosleep(&grace, nullptr);
+
+    const bool fill_ok = fill_upstream_bytes(&asserted_results, asserted_cases, upstream);
+    upstream.stop();
+    if (fill_ok) {
+        std::cerr << "FAIL [self-test asserted delayed teardown]: fill_upstream_bytes accepted "
+                     "an asserted batch despite a delayed, unlisted upstream request emitted "
+                     "during the proxy's own SIGTERM teardown\n";
+        ok = false;
+    }
+    if (ok) std::cerr << "PASS [self-test asserted delayed teardown]\n";
     return ok;
 }
 
@@ -7033,13 +7360,13 @@ bool self_test_envoy_early_exit_detected() {
 // stop()'s `docker rm -f <name>` side call simply fails fast (no such
 // container, or no docker binary at all) and is ignored either way.
 bool self_test_envoy_stop_verifies_exit_status() {
-    const std::string dir = make_temp_dir("rut-diff-selftest-envoy-stop");
+    TempDir dir("rut-diff-selftest-envoy-stop");
     if (dir.empty()) {
         std::cerr << "FAIL [self-test envoy stop status]: could not create temp directory\n";
         return false;
     }
     auto run_case = [&](const char* script_body, bool expect_clean, const char* label) {
-        const std::string script = dir + "/" + label + ".sh";
+        const std::string script = dir.path() + "/" + label + ".sh";
         if (!write_file_mode(script, script_body, 0755)) {
             std::cerr << "FAIL [self-test envoy stop status]: could not write " << label << ".sh\n";
             return false;
@@ -7100,6 +7427,55 @@ bool self_test_envoy_stop_verifies_exit_status() {
     ok &=
         run_case("#!/bin/sh\ntrap 'exit 139' TERM\nsleep 5\n", /*expect_clean=*/false, "segv-exit");
     if (ok) std::cerr << "PASS [self-test envoy stop status]\n";
+    return ok;
+}
+
+// Round-16 review, "Wrap the remaining self-test directories in TempDir":
+// with every make_temp_dir() self-test call site now wrapped in TempDir
+// (this round), re-running a fast, representative sample of the
+// unconditional (no binary needed) self-tests that create one must leave no
+// new `/tmp/rut-*` entries behind. Calls them directly, in-process, rather
+// than re-executing this binary's own --self-test pass as a nested
+// subprocess: this file's self-test suite already runs close to
+// test_envoy_differential_selftest's 90s CTest TIMEOUT (tests/CMakeLists.txt)
+// on a loaded host, and a nested whole-suite re-run risked pushing it over
+// (measured: re-running the FULL suite, including the slower ownership-probe
+// self-tests below with their own multi-hundred-ms-to-2s per-case timeouts,
+// pushed a single --self-test invocation from ~41s to ~76s on this
+// project's dev host). self_test_wait_ready_ownership() and
+// self_test_rut_wait_ready_ownership() also create a TempDir and are
+// exercised unconditionally too, but are deliberately excluded from this
+// sample for the same reason; TempDir's own cleanup mechanism (exercised
+// here via every OTHER call site, and directly by
+// self_test_temp_dir_cleanup()) does not vary by call site.
+bool self_test_no_binary_self_test_leaves_no_temp_dirs() {
+    const std::vector<std::string> before = list_rut_tmp_dir_names();
+
+    self_test_partial_exchange_rejection();
+    self_test_rut_stop_verifies_exit_status();
+    self_test_envoy_stop_verifies_exit_status();
+    self_test_temp_dir_cleanup();
+
+    const std::vector<std::string> after = list_rut_tmp_dir_names();
+    std::vector<std::string> leaked;
+    for (const auto& name : after) {
+        if (std::find(before.begin(), before.end(), name) == before.end()) leaked.push_back(name);
+    }
+    // Best-effort cleanup of anything found leaked, so this check's own
+    // failure doesn't also accumulate garbage across repeated runs.
+    for (const auto& name : leaked) remove_dir_recursive("/tmp/" + name);
+
+    bool ok = true;
+    if (!leaked.empty()) {
+        std::cerr << "FAIL [self-test no leaked temp dirs]: running the always-on, TempDir-using "
+                     "self-tests left "
+                  << leaked.size() << " new /tmp/rut-* director"
+                  << (leaked.size() == 1 ? "y" : "ies") << " behind:";
+        for (const auto& name : leaked) std::cerr << " " << name;
+        std::cerr << "\n";
+        ok = false;
+    }
+    if (ok) std::cerr << "PASS [self-test no leaked temp dirs]\n";
     return ok;
 }
 
@@ -7333,7 +7709,7 @@ bool self_test_rut_port_retry(const std::string& rut_binary, const std::string& 
                      "[rut-envoy-convert-binary] to run it)\n";
         return true;
     }
-    const std::string dir = make_temp_dir("rut-envoy-portretry");
+    TempDir dir("rut-envoy-portretry");
     if (dir.empty()) {
         std::cerr << "FAIL [self-test rut port retry]: could not create temp directory\n";
         return false;
@@ -7376,7 +7752,7 @@ bool self_test_rut_port_retry(const std::string& rut_binary, const std::string& 
     RutInstance rut;
     std::string rut_source_path;
     std::string error;
-    const bool launched = launch_rut_with_port_retry(dir,
+    const bool launched = launch_rut_with_port_retry(dir.path(),
                                                      rut_binary,
                                                      converter_binary,
                                                      &listen_port,
@@ -7411,7 +7787,7 @@ bool run_self_test_rut_pass(const std::string& rut_binary, const std::string& co
 
     // ---- Live recording upstream: every asserted case but connect_failure ----
     {
-        const std::string dir = make_temp_dir("rut-envoy-selftest");
+        TempDir dir("rut-envoy-selftest");
         if (dir.empty()) {
             std::cerr << "FAIL [self-test rut]: could not create temp directory\n";
             return false;
@@ -7449,7 +7825,7 @@ bool run_self_test_rut_pass(const std::string& rut_binary, const std::string& co
         RutInstance rut;
         std::string rut_source_path;
         std::string ready_error;
-        if (!launch_rut_with_port_retry(dir,
+        if (!launch_rut_with_port_retry(dir.path(),
                                         rut_binary,
                                         converter_binary,
                                         &listen_port,
@@ -7496,7 +7872,7 @@ bool run_self_test_rut_pass(const std::string& rut_binary, const std::string& co
 
     // ---- connect_failure: closed upstream port ----
     {
-        const std::string dir = make_temp_dir("rut-envoy-selftest2");
+        TempDir dir("rut-envoy-selftest2");
         if (dir.empty()) {
             std::cerr << "FAIL [self-test rut]: could not create temp directory\n";
             return false;
@@ -7531,7 +7907,7 @@ bool run_self_test_rut_pass(const std::string& rut_binary, const std::string& co
             }
         } closed_reservation{closed_reserved.fd};
         const uint16_t closed_port = closed_reserved.port;
-        const std::string bootstrap_path = dir + "/bootstrap.json";
+        const std::string bootstrap_path = dir.path() + "/bootstrap.json";
         if (!write_file_mode(bootstrap_path, render_bootstrap(listen_port, closed_port), 0644)) {
             std::cerr << "FAIL [self-test rut]: could not write bootstrap.json\n";
             return false;
@@ -7539,7 +7915,7 @@ bool run_self_test_rut_pass(const std::string& rut_binary, const std::string& co
         RutInstance rut;
         std::string rut_source_path;
         std::string ready_error;
-        if (!launch_rut_with_port_retry(dir,
+        if (!launch_rut_with_port_retry(dir.path(),
                                         rut_binary,
                                         converter_binary,
                                         &listen_port,
@@ -7591,6 +7967,7 @@ int run_self_test(const std::string& rut_binary, const std::string& converter_bi
     ok &= self_test_envoy_log_confirms_listener();
     ok &= self_test_wait_ready_ownership();
     ok &= self_test_temp_dir_cleanup();
+    ok &= self_test_no_binary_self_test_leaves_no_temp_dirs();
     ok &= self_test_envoy_instance_skips_docker_when_unlaunched();
     ok &= self_test_rut_wait_ready_ownership();
     ok &= self_test_rut_log_confirms_listener();
@@ -7615,6 +7992,7 @@ int run_self_test(const std::string& rut_binary, const std::string& converter_bi
     ok &= self_test_pair_exempt_cases_nonzero_contact_rejected();
     ok &= self_test_pair_record_only_crash_is_a_note();
     ok &= self_test_pair_isolated_instances_crash_classification();
+    ok &= self_test_asserted_phase_delayed_teardown_request_is_fatal();
     ok &= self_test_accept_unblocks_on_shutdown_close();
     ok &= self_test_head_body_detected();
     ok &= self_test_head_grace_reset_detected();
