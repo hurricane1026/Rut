@@ -3840,6 +3840,42 @@ TEST(request_policy, preserve_host_lowercase_wire_and_fail_closed_host) {
         "POST /upload HTTP/1.1\r\nhost: client.example\r\ncontent-length: 4\r\n"
         "x-forwarded-proto: http\r\n\r\nabcd");
 
+    // Codex round-16 review: a validated Content-Length's original
+    // spelling -- e.g. leading zeros -- is preserved on the wire, not
+    // regenerated from the parsed integer. Envoy's HTTP/1 codec forwards
+    // every header's stored string value byte for byte
+    // (`StreamEncoderImpl::encodeHeadersBase`'s `headers.iterate(...)` calls
+    // `header.value().getStringView()`, `source/common/http/http1/
+    // codec_impl.cc`; the parser stores the wire value directly via
+    // `addViaMove` in `ConnectionImpl::onHeaderValueImpl`, with no
+    // integer round-trip in between) rather than recomputing a canonical
+    // decimal spelling, so `0004` reaches a real Envoy's upstream unchanged,
+    // not renumbered to `4`. The parsed integer still bounds the body copy
+    // below (four bytes), only the wire spelling changed.
+    prepare(
+        "POST /cl-spelling HTTP/1.1\r\nHost: client.example\r\nContent-Length: 0004\r\n\r\nabcd");
+    REQUIRE(apply_request_policy(conn, endpoint, kPreserveHost));
+    require_wire(
+        "POST /cl-spelling HTTP/1.1\r\nhost: client.example\r\ncontent-length: 0004\r\n"
+        "x-forwarded-proto: http\r\n\r\nabcd");
+
+    // A leading `+` is still not a valid Content-Length digit string
+    // (`parse_uint` rejects any non-'0'-'9' byte) and fails parsing/
+    // admission exactly as before -- only the wire spelling of an
+    // already-valid value changed above, not what counts as valid.
+    prepare("POST /cl-plus HTTP/1.1\r\nHost: client.example\r\nContent-Length: +4\r\n\r\nabcd");
+    CHECK_FALSE(apply_request_policy(conn, endpoint, kPreserveHost));
+    CHECK_EQ(conn.send_buf.len(), 0u);
+
+    // Embedded whitespace within the digits is likewise still rejected
+    // (leading/trailing OWS around the field value is trimmed before this
+    // check, but a space *between* digits is not a valid digit byte).
+    prepare(
+        "POST /cl-embedded-space HTTP/1.1\r\nHost: client.example\r\nContent-Length: 4 "
+        "4\r\n\r\nabcd");
+    CHECK_FALSE(apply_request_policy(conn, endpoint, kPreserveHost));
+    CHECK_EQ(conn.send_buf.len(), 0u);
+
     // TE: trailers is kept on a fixed-length (body-carrying) request too,
     // not only on the bodyless-GET path.
     prepare(
