@@ -1291,7 +1291,11 @@ struct EnvoyInstance {
                 "already reaped or no longer a child process (ECHILD) before this call could "
                 "signal it";
             pid = -1;
-            run_and_wait({"docker", "rm", "-f", name}, 10'000);
+            if (launched) {
+                g_docker_rm_invocations++;
+                run_and_wait({"docker", "rm", "-f", name}, 10'000);
+                launched = false;
+            }
             return false;
         }
         // Round-10 review, "Do not infer SIGTERM delivery from kill
@@ -1324,7 +1328,11 @@ struct EnvoyInstance {
             exited_unexpectedly = true;
             unexpected_exit_description = describe_wait_status(reap_status);
             pid = -1;
-            run_and_wait({"docker", "rm", "-f", name}, 10'000);
+            if (launched) {
+                g_docker_rm_invocations++;
+                run_and_wait({"docker", "rm", "-f", name}, 10'000);
+                launched = false;
+            }
             return false;
         }
         const bool term_sent = kill(pid, SIGTERM) == 0;
@@ -3647,7 +3655,7 @@ int run_pair_milestone_s(const std::string& rut_binary,
 
     // ---- Run 1: live recording upstream, Envoy then RUT, same ports ----
     {
-        const std::string dir = make_temp_dir("rut-envoy-pair");
+        TempDir dir("rut-envoy-pair");
         if (dir.empty()) {
             std::cerr << "FAIL: could not create temp directory\n";
             return 1;
@@ -3688,7 +3696,7 @@ int run_pair_milestone_s(const std::string& rut_binary,
         // instance's stays a NOTE.
         std::string ready_error;
         EnvoyInstance envoy_asserted;
-        if (!launch_envoy_with_port_retry(dir,
+        if (!launch_envoy_with_port_retry(dir.path(),
                                           "pair-run1-asserted",
                                           &listen_port1,
                                           upstream_port1,
@@ -3728,7 +3736,7 @@ int run_pair_milestone_s(const std::string& rut_binary,
         upstream.clear_requests();
 
         EnvoyInstance envoy_record_only;
-        if (!launch_envoy_with_port_retry(dir,
+        if (!launch_envoy_with_port_retry(dir.path(),
                                           "pair-run1-record-only",
                                           &listen_port1,
                                           upstream_port1,
@@ -3779,7 +3787,7 @@ int run_pair_milestone_s(const std::string& rut_binary,
         RutInstance rut_asserted;
         std::string rut_source_path;
         std::string rut_ready_error;
-        if (!launch_rut_with_port_retry(dir,
+        if (!launch_rut_with_port_retry(dir.path(),
                                         rut_binary,
                                         converter_binary,
                                         &listen_port1,
@@ -3818,7 +3826,7 @@ int run_pair_milestone_s(const std::string& rut_binary,
         RutInstance rut_record_only;
         std::string rut_record_only_source_path;
         std::string rut_record_only_ready_error;
-        if (!launch_rut_with_port_retry(dir,
+        if (!launch_rut_with_port_retry(dir.path(),
                                         rut_binary,
                                         converter_binary,
                                         &listen_port1,
@@ -3861,7 +3869,7 @@ int run_pair_milestone_s(const std::string& rut_binary,
 
     // ---- Run 2: connect_failure against a closed upstream port ----
     {
-        const std::string dir = make_temp_dir("rut-envoy-pair2");
+        TempDir dir("rut-envoy-pair2");
         if (dir.empty()) {
             std::cerr << "FAIL: could not create temp directory\n";
             return 1;
@@ -3873,7 +3881,7 @@ int run_pair_milestone_s(const std::string& rut_binary,
         EnvoyInstance envoy;
         std::string ready_error;
         if (!launch_envoy_with_port_retry(
-                dir, "pair-run2", &listen_port2, closed_port, &envoy, &ready_error)) {
+                dir.path(), "pair-run2", &listen_port2, closed_port, &envoy, &ready_error)) {
             std::cerr << "FAIL: " << ready_error << "\n";
             dump_log(envoy.log_path);
             return 1;
@@ -3900,7 +3908,7 @@ int run_pair_milestone_s(const std::string& rut_binary,
         RutInstance rut;
         std::string rut_source_path;
         std::string rut_ready_error;
-        if (!launch_rut_with_port_retry(dir,
+        if (!launch_rut_with_port_retry(dir.path(),
                                         rut_binary,
                                         converter_binary,
                                         &listen_port2,
