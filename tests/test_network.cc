@@ -2142,6 +2142,119 @@ TEST(response_policy, upstream_header_order_accepts_duplicate_of_hidden_inline_h
                           "Content-Type: b\r\n\r\nhi"));
 }
 
+// Codex round-17 review (PR #698, thread PRRT_kwDORsELtc6mNyqG): `grpc-status`
+// and `grpc-message` are named inline response headers at v1.39.1
+// (`envoy/http/header_map.h`: `INLINE_RESP_STRING_HEADERS_TRAILERS` ->
+// `GrpcMessage`, `INLINE_RESP_NUMERIC_HEADERS_TRAILERS` -> `GrpcStatus`,
+// both mixed into `ResponseHeaderOrTrailerMap`, the base `ResponseHeaderMap`
+// itself inherits -- despite the "_TRAILERS" macro name, this is not
+// trailer-only) but were missing from `kEnvoyInlineResponseHeaders`, the
+// same gap class as the earlier `cache-control`/CORS-header rounds. This
+// test independently transcribes the *complete* macro-defined inline set
+// `ResponseHeaderMap` inherits (every response-relevant name across
+// `INLINE_REQ_RESP_STRING_HEADERS`, `INLINE_REQ_RESP_NUMERIC_HEADERS`,
+// `INLINE_RESP_STRING_HEADERS`, `INLINE_RESP_NUMERIC_HEADERS`,
+// `INLINE_RESP_STRING_HEADERS_TRAILERS`, and
+// `INLINE_RESP_NUMERIC_HEADERS_TRAILERS`) plus the custom-registered inline
+// set from the citation above `kEnvoyInlineResponseHeaders`, and asserts the
+// runtime table is exactly that set -- not merely a superset or a spot check
+// -- so a future gap in either source is a hard test failure regardless of
+// which specific name is missing.
+TEST(response_policy, kEnvoyInlineResponseHeaders_matches_full_envoy_inline_inventory) {
+    // Every name `envoy/http/header_map.h` (v1.39.1) gives an O(1) inline
+    // slot that `ResponseHeaderMap` inherits, transcribed independently of
+    // `kEnvoyInlineResponseHeaders`. Excludes the five names deliberately
+    // carved out with their own special-cased handling in
+    // `build_upstream_order_response_headers` (documented on
+    // `kEnvoyInlineResponseHeaders` above): `content-length`, `server`,
+    // `connection`, `transfer-encoding`, and the HTTP/2-only `:status`
+    // pseudo-header (`Status`, never a literal HTTP/1.1 field).
+    static const Str kExpectedMacroDefined[] = {
+        // INLINE_REQ_RESP_STRING_HEADERS (minus `connection`, handled
+        // separately) + INLINE_REQ_RESP_NUMERIC_HEADERS (minus
+        // `content-length`, handled separately).
+        lit_str("content-type"),
+        lit_str("x-envoy-decorator-operation"),
+        lit_str("keep-alive"),
+        lit_str("proxy-connection"),
+        lit_str("proxy-status"),
+        lit_str("x-request-id"),
+        lit_str("transfer-encoding"),  // excluded below; listed here for audit completeness
+        lit_str("upgrade"),
+        lit_str("via"),
+        lit_str("x-envoy-attempt-count"),
+        // INLINE_RESP_STRING_HEADERS (minus `server`) + INLINE_RESP_NUMERIC_
+        // HEADERS (minus the `:status` pseudo-header).
+        lit_str("date"),
+        lit_str("x-envoy-degraded"),
+        lit_str("x-envoy-immediate-health-check-fail"),
+        lit_str("x-envoy-ratelimited"),
+        lit_str("x-envoy-upstream-canary"),
+        lit_str("x-envoy-upstream-healthchecked-cluster"),
+        lit_str("location"),
+        lit_str("x-envoy-upstream-service-time"),
+        // INLINE_RESP_STRING_HEADERS_TRAILERS + INLINE_RESP_NUMERIC_HEADERS_
+        // TRAILERS -- the round-17 gap.
+        lit_str("grpc-message"),
+        lit_str("grpc-status"),
+    };
+    // Custom-registered inline slots (`Http::RegisterCustomInlineHeader<
+    // Type::ResponseHeaders>`), transcribed independently from the citation
+    // above `kEnvoyInlineResponseHeaders`.
+    static const Str kExpectedCustomRegistered[] = {
+        lit_str("cache-control"),
+        lit_str("content-encoding"),
+        lit_str("last-modified"),
+        lit_str("etag"),
+        lit_str("age"),
+        lit_str("expires"),
+        lit_str("vary"),
+        lit_str("access-control-allow-origin"),
+        lit_str("access-control-allow-credentials"),
+        lit_str("access-control-allow-methods"),
+        lit_str("access-control-allow-headers"),
+        lit_str("access-control-max-age"),
+        lit_str("access-control-expose-headers"),
+        lit_str("access-control-allow-private-network"),
+    };
+    static const char* const kDeliberatelyExcluded[] = {
+        "content-length", "server", "connection", "transfer-encoding", ":status"};
+
+    auto in_table = [&](const Str& name) {
+        for (u32 t = 0; t < kEnvoyInlineResponseHeaderCount; t++) {
+            const Str& tn = kEnvoyInlineResponseHeaders[t];
+            if (tn.len == name.len && http_header_name_eq_ci(tn.ptr, tn.len, name.ptr, name.len))
+                return true;
+        }
+        return false;
+    };
+    auto is_excluded = [&](const Str& name) {
+        for (const char* ex : kDeliberatelyExcluded) {
+            const u32 exlen = static_cast<u32>(__builtin_strlen(ex));
+            if (exlen == name.len && http_header_name_eq_ci(ex, exlen, name.ptr, name.len))
+                return true;
+        }
+        return false;
+    };
+
+    // Every non-excluded macro-defined name must be in the table.
+    u32 expected_count = 0;
+    for (const Str& name : kExpectedMacroDefined) {
+        if (is_excluded(name)) continue;
+        expected_count++;
+        CHECK(in_table(name));
+    }
+    // Every custom-registered name must be in the table.
+    for (const Str& name : kExpectedCustomRegistered) {
+        expected_count++;
+        CHECK(in_table(name));
+    }
+    // And the table must contain nothing beyond this union -- a name added
+    // to the runtime table without a matching, audited source above (or vice
+    // versa) is a hard failure either way.
+    CHECK_EQ(kEnvoyInlineResponseHeaderCount, expected_count);
+}
+
 // Codex round-11 review (PR #698, thread PRRT_kwDORsELtc6mJf61): the
 // `header_order: "upstream"` admission in `build_upstream_order_response_headers`
 // accepts every status 200..599 except the no-body codes 204/205/304, but

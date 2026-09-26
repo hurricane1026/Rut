@@ -11171,8 +11171,20 @@ inline bool stage_redirect_response(Connection& conn, const RouteConfig& config,
 // Every Envoy inline *response* header, pinned v1.39.1, from two sources:
 //
 // 1. The unconditional macro-defined set: envoy/http/header_map.h
-//    `INLINE_RESP_HEADERS` + `INLINE_REQ_RESP_HEADERS`, registered
-//    unconditionally for every build (source/common/http/header_map_impl.cc).
+//    `INLINE_RESP_HEADERS` + `INLINE_REQ_RESP_HEADERS` + (Codex round-17
+//    review of #698, correcting a gap in this inventory) `INLINE_RESP_
+//    HEADERS_TRAILERS` (line 276: `INLINE_RESP_STRING_HEADERS_TRAILERS`,
+//    line 272 -- `GrpcMessage` -- + `INLINE_RESP_NUMERIC_HEADERS_TRAILERS`,
+//    line 274 -- `GrpcStatus`). Despite the "_TRAILERS" name this macro is
+//    NOT trailer-only: `ResponseHeaderOrTrailerMap` (line 761) mixes it in
+//    once, and both `ResponseHeaderMap` (line 771, `public
+//    ResponseHeaderOrTrailerMap`) and `ResponseTrailerMap` (line 786,
+//    `public ResponseHeaderOrTrailerMap`) inherit it -- so `grpc-status` and
+//    `grpc-message` get an O(1) inline slot on an ordinary HTTP/1.1 response
+//    *header* map, the exact map this profile builds from, not only on a
+//    trailer map (which Rut does not model at all). All three macros are
+//    registered unconditionally for every build
+//    (source/common/http/header_map_impl.cc).
 //
 // 2. Headers a stock (all-extensions-linked) Envoy binary registers as custom
 //    inline slots at static-init time via a file-scope
@@ -11272,6 +11284,11 @@ inline bool stage_redirect_response(Connection& conn, const RouteConfig& config,
 // response closed (Codex round-15 review of #698). Every other entry here is
 // exempted from the count only when `hide_headers` names it, for the same
 // reason -- a hidden duplicate never reaches the wire either.
+//
+// `grpc-status` and `grpc-message` (Codex round-17 review of #698) get no
+// special exemption: they are ordinary forwarded headers like `content-type`
+// (not hop-by-hop, so `always_dropped` is false for them below), subject to
+// the same `hide_headers`-only exemption as the rest of the table.
 inline constexpr Str kEnvoyInlineResponseHeaders[] = {
     lit_str("content-type"),
     lit_str("date"),
@@ -11304,6 +11321,8 @@ inline constexpr Str kEnvoyInlineResponseHeaders[] = {
     lit_str("access-control-max-age"),
     lit_str("access-control-expose-headers"),
     lit_str("access-control-allow-private-network"),
+    lit_str("grpc-status"),
+    lit_str("grpc-message"),
 };
 inline constexpr u32 kEnvoyInlineResponseHeaderCount =
     sizeof(kEnvoyInlineResponseHeaders) / sizeof(kEnvoyInlineResponseHeaders[0]);
