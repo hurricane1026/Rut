@@ -1041,6 +1041,31 @@ static const char* failure_policy_head_mode_name(FailurePolicyHeadMode mode) {
     return "invalid";
 }
 
+static const char* forward_failure_policy_version_name(ForwardFailurePolicyVersion version) {
+    return version == ForwardFailurePolicyVersion::Http11 ? "HTTP/1.1" : "invalid";
+}
+
+static const char* forward_failure_policy_date_name(ForwardFailurePolicyDate date) {
+    return date == ForwardFailurePolicyDate::Current ? "current" : "invalid";
+}
+
+static const char* forward_failure_policy_connection_name(
+    ForwardFailurePolicyConnection connection) {
+    return connection == ForwardFailurePolicyConnection::Request ? "request" : "invalid";
+}
+
+// Codex round-11 review: a synthesized 502 and a LengthTypeDateServer 503
+// with the same head_mode must remain distinguishable in RIR output, since
+// they serialize different statuses, casing, ordering, and bodies at runtime
+// (build_bounded_local_response_bytes, include/rut/runtime/callbacks_impl.h).
+static const char* failure_policy_header_order_name(FailurePolicyHeaderOrder order) {
+    if (order == FailurePolicyHeaderOrder::Synthesized)
+        return "synthesized";
+    else if (order == FailurePolicyHeaderOrder::LengthTypeDateServer)
+        return "length_type_date_server";
+    return "invalid";
+}
+
 static const char* strict_local_response_head_mode_name(StrictLocalResponseHeadMode mode) {
     switch (mode) {
         case StrictLocalResponseHeadMode::Reject:
@@ -1063,6 +1088,21 @@ static const char* strict_local_response_date_name(StrictLocalResponseDate date)
 
 static const char* strict_local_response_connection_name(StrictLocalResponseConnection connection) {
     return connection == StrictLocalResponseConnection::Request ? "request" : "invalid";
+}
+
+// Codex round-3 review: a synthesized policy and an Envoy-layout policy with
+// otherwise identical values must remain distinguishable in RIR output, since
+// they produce different header casing, ordering, and connection headers at
+// runtime (build_strict_local_response_bytes,
+// include/rut/runtime/callbacks_impl.h).
+static const char* strict_local_response_header_order_name(StrictLocalResponseHeaderOrder order) {
+    if (order == StrictLocalResponseHeaderOrder::Synthesized)
+        return "synthesized";
+    else if (order == StrictLocalResponseHeaderOrder::DateServerLength)
+        return "date_server_length";
+    else if (order == StrictLocalResponseHeaderOrder::LengthTypeDateServer)
+        return "length_type_date_server";
+    return "invalid";
 }
 
 static const char* unmatched_method_name(u32 slot) {
@@ -1100,6 +1140,20 @@ static bool printable_strict_local_response_table(const Module& mod, bool intern
                                                     kMaxExactStrictLocalResponseBindings);
 }
 
+// Codex round-13 review: a hand-built or verifier-rejected module can carry a
+// forged failure-policy table (an out-of-range count, or a non-owning string
+// view like `reason = {nullptr, 1}`) that previously crashed print_quoted_str
+// / print_redirect_body. Mirror the strict-local-response section's safety
+// contract: bound the count against the array capacity and validate every
+// entry's scalar and string fields before any of its views are printed.
+static bool printable_failure_policy_table(const Module& mod) {
+    if (mod.failure_policy_count > kMaxForwardFailurePolicies) return false;
+    for (u32 i = 0; i < mod.failure_policy_count; i++) {
+        if (!forward_failure_policy_table_spec_valid(mod.failure_policies[i])) return false;
+    }
+    return true;
+}
+
 static void print_module_impl(PrintBuf& buf, const Module& mod, bool internal_propagation) {
     const bool has_unmatched_metadata = has_strict_local_response_metadata(mod);
     for (u32 i = 0; i < mod.func_count; i++) {
@@ -1122,16 +1176,41 @@ static void print_module_impl(PrintBuf& buf, const Module& mod, bool internal_pr
     }
     if (mod.failure_policy_count != 0) {
         if (mod.func_count != 0 || mod.response_policy_count != 0) buf.newline();
-        buf.put_cstr("failure_policies: ");
-        buf.put_u32(mod.failure_policy_count);
-        buf.newline();
-        for (u32 i = 0; i < mod.failure_policy_count; i++) {
-            const auto& policy = mod.failure_policies[i];
-            buf.put_cstr("  failure_policy#");
-            buf.put_u32(i + 1);
-            buf.put_cstr(": head_mode=");
-            buf.put_cstr(failure_policy_head_mode_name(policy.head_mode));
+        if (!printable_failure_policy_table(mod)) {
+            // Forged metadata must remain visible without using its count as
+            // an array bound or touching any possibly-null string storage.
+            buf.put_cstr("failure_policy_table: <invalid>");
             buf.newline();
+        } else {
+            buf.put_cstr("failure_policies: ");
+            buf.put_u32(mod.failure_policy_count);
+            buf.newline();
+            for (u32 i = 0; i < mod.failure_policy_count; i++) {
+                const auto& policy = mod.failure_policies[i];
+                buf.put_cstr("  failure_policy#");
+                buf.put_u32(i + 1);
+                buf.put_cstr(": version=");
+                buf.put_cstr(forward_failure_policy_version_name(policy.version));
+                buf.put_cstr(", status=");
+                buf.put_u32(policy.status_code);
+                buf.put_cstr(", reason=");
+                print_quoted_str(buf, policy.reason);
+                buf.put_cstr(", server=");
+                print_quoted_str(buf, policy.server);
+                buf.put_cstr(", content_type=");
+                print_quoted_str(buf, policy.content_type);
+                buf.put_cstr(", date=");
+                buf.put_cstr(forward_failure_policy_date_name(policy.date));
+                buf.put_cstr(", connection=");
+                buf.put_cstr(forward_failure_policy_connection_name(policy.connection));
+                buf.put_cstr(", head_mode=");
+                buf.put_cstr(failure_policy_head_mode_name(policy.head_mode));
+                buf.put_cstr(", header_order=");
+                buf.put_cstr(failure_policy_header_order_name(policy.header_order));
+                buf.put_cstr(", body=");
+                print_redirect_body(buf, policy.body);
+                buf.newline();
+            }
         }
     }
     if (has_unmatched_metadata) {
@@ -1166,6 +1245,8 @@ static void print_module_impl(PrintBuf& buf, const Module& mod, bool internal_pr
                 buf.put_cstr(strict_local_response_connection_name(policy.connection));
                 buf.put_cstr(", head_mode=");
                 buf.put_cstr(strict_local_response_head_mode_name(policy.head_mode));
+                buf.put_cstr(", header_order=");
+                buf.put_cstr(strict_local_response_header_order_name(policy.header_order));
                 buf.put_cstr(", body=");
                 print_redirect_body(buf, policy.body);
                 buf.newline();

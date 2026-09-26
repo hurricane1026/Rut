@@ -17,6 +17,14 @@ enum class ForwardFailurePolicyVersion : u8 { Invalid = 0, Http11 = 1 };
 enum class ForwardFailurePolicyDate : u8 { Invalid = 0, Current = 1 };
 enum class ForwardFailurePolicyConnection : u8 { Invalid = 0, Request = 1 };
 
+// Envoy H1 profile (docs/envoy-converter.md; envoy-pr-plan.md PR5):
+// lowercase header names, `connection: close` only when closing, and the
+// `content-length, content-type, date, server` wire order. `Synthesized` is
+// today's nginx-compatible 502 shape and is the only value the 502 role ever
+// admits; `LengthTypeDateServer` is admitted only for status 503 with a
+// non-empty body.
+enum class FailurePolicyHeaderOrder : u8 { Synthesized = 0, LengthTypeDateServer = 1 };
+
 enum class ForwardResponseBufferingMode : u8 {
     None = 0,
     CompleteContentLength = 1,
@@ -33,6 +41,7 @@ struct ForwardFailurePolicySpec {
     ForwardFailurePolicyDate date = ForwardFailurePolicyDate::Invalid;
     ForwardFailurePolicyConnection connection = ForwardFailurePolicyConnection::Invalid;
     FailurePolicyHeadMode head_mode = FailurePolicyHeadMode::Reject;
+    FailurePolicyHeaderOrder header_order = FailurePolicyHeaderOrder::Synthesized;
     Str reason{};
     Str content_type{};
     Str server{};
@@ -99,28 +108,41 @@ inline bool forward_failure_policy_spec_shape_valid(const ForwardFailurePolicySp
 }
 
 // The existing default failure-policy contract remains the exact 502 shape.
+// Status 503 is admitted only paired with the Envoy `LengthTypeDateServer`
+// layout and a non-empty body (the connect-failure representation); 502
+// stays closed to `Synthesized`, so nginx's contract is untouched.
 inline bool forward_failure_policy_spec_valid(const ForwardFailurePolicySpec& policy) {
-    return policy.status_code == 502 && forward_failure_policy_spec_shape_valid(policy);
+    if (!forward_failure_policy_spec_shape_valid(policy)) return false;
+    if (policy.header_order == FailurePolicyHeaderOrder::LengthTypeDateServer)
+        return policy.status_code == 503 && policy.body.len != 0;
+    return policy.status_code == 502 &&
+           policy.header_order == FailurePolicyHeaderOrder::Synthesized;
 }
 
 // A timeout policy is a complete immutable error response. Its status is
 // intentionally bounded to HTTP error statuses, without inheriting from the
-// default 502 policy.
+// default 502 policy. Kept `Synthesized`-only: no timeout shape has an Envoy
+// oracle yet.
 inline bool forward_timeout_failure_policy_spec_valid(const ForwardFailurePolicySpec& policy) {
-    return forward_failure_policy_spec_shape_valid(policy);
+    return policy.header_order == FailurePolicyHeaderOrder::Synthesized &&
+           forward_failure_policy_spec_shape_valid(policy);
 }
 
 // Re-checks of policies owned by an immutable RouteConfig: the role checks
 // always run, the byte-level re-scan only when kRescanAdmittedPolicies.
 inline bool admitted_forward_failure_policy_valid(const ForwardFailurePolicySpec& policy) {
-    return kRescanAdmittedPolicies
-               ? forward_failure_policy_spec_valid(policy)
-               : policy.status_code == 502 && forward_failure_policy_spec_scalar_valid(policy);
+    if (kRescanAdmittedPolicies) return forward_failure_policy_spec_valid(policy);
+    if (policy.header_order == FailurePolicyHeaderOrder::LengthTypeDateServer)
+        return policy.status_code == 503 && forward_failure_policy_spec_scalar_valid(policy);
+    return policy.status_code == 502 &&
+           policy.header_order == FailurePolicyHeaderOrder::Synthesized &&
+           forward_failure_policy_spec_scalar_valid(policy);
 }
 
 inline bool admitted_forward_timeout_failure_policy_valid(const ForwardFailurePolicySpec& policy) {
     return kRescanAdmittedPolicies ? forward_timeout_failure_policy_spec_valid(policy)
-                                   : forward_failure_policy_spec_scalar_valid(policy);
+                                   : policy.header_order == FailurePolicyHeaderOrder::Synthesized &&
+                                         forward_failure_policy_spec_scalar_valid(policy);
 }
 
 inline bool complete_content_length_buffering_policy_roles_valid(
@@ -189,15 +211,20 @@ inline bool admitted_fixed_upload_head_timeout_policies_valid(
 }
 
 // Shared policy tables contain both roles; bundle validation applies the
-// stricter role-specific predicate to every referenced ID.
+// stricter role-specific predicate to every referenced ID. A table entry is
+// admissible if it is valid under either role: the default-failure role (502
+// Synthesized, or 503 with the Envoy layout) or the timeout role (400..599,
+// Synthesized only).
 inline bool forward_failure_policy_table_spec_valid(const ForwardFailurePolicySpec& policy) {
-    return forward_timeout_failure_policy_spec_valid(policy);
+    return forward_failure_policy_spec_valid(policy) ||
+           forward_timeout_failure_policy_spec_valid(policy);
 }
 
 inline bool forward_failure_policy_spec_equal(const ForwardFailurePolicySpec& a,
                                               const ForwardFailurePolicySpec& b) {
     return a.version == b.version && a.status_code == b.status_code && a.date == b.date &&
-           a.connection == b.connection && a.head_mode == b.head_mode && a.reason.eq(b.reason) &&
+           a.connection == b.connection && a.head_mode == b.head_mode &&
+           a.header_order == b.header_order && a.reason.eq(b.reason) &&
            a.content_type.eq(b.content_type) && a.server.eq(b.server) && a.body.eq(b.body);
 }
 

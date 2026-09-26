@@ -1,10 +1,17 @@
 #include "fixtures/envoy_milestone_s.inc"
+#include "rut/compiler/analyze.h"
+#include "rut/compiler/lexer.h"
+#include "rut/compiler/lower_rir.h"
+#include "rut/compiler/mir_build.h"
+#include "rut/compiler/parser.h"
+#include "rut/compiler/verifier.h"
 #include "rut/envoy/converter.h"
 #include "rut/envoy/parser.h"
 #include "test.h"
 #include <cerrno>
 #include <cstdio>
 #include <cstdlib>
+#include <memory>
 #include <string>
 #include <vector>
 
@@ -877,11 +884,15 @@ TEST(envoy_convert, cli_parse_error_is_source_located) {
     CHECK(result.err.find("unsupported field") != std::string::npos);
 }
 
-TEST(envoy_convert, cli_milestone_s_fails_closed_with_request_gap) {
-    // PR3 shipped `request_envoy_h1` and PR4 shipped `response_envoy_h1`, so
-    // the shipped CLI now clears checks 4 and 5 (host preserve + lowercase
-    // request headers; upstream header order) and fails closed one check
-    // later, at check 6 (local reply layout), located at the route_config span.
+TEST(envoy_convert, cli_milestone_s_converts) {
+    // PR3 shipped `request_envoy_h1`, PR4 shipped `response_envoy_h1`, and
+    // this PR ships `local_reply_envoy_h1`: `kShippedRutCapabilities` is now
+    // all true, so the milestone-S bootstrap converts end to end through the
+    // real CLI (no `RutCapabilities` override) with exit 0, stdout matching
+    // the golden byte for byte, and exactly two warnings on stderr: the D2
+    // `connect_timeout` warning first (the CLI warns, per the #692 review,
+    // that Rut does not enforce the cluster's connect_timeout), then the
+    // #692 round-7 h2c-preface disclaimer (`kH2cPrefaceWarningText`).
     const TempDir temp_dir;
     REQUIRE(temp_dir.ok());
     const std::string& directory = temp_dir.path();
@@ -889,18 +900,14 @@ TEST(envoy_convert, cli_milestone_s_fails_closed_with_request_gap) {
     const std::string path = directory + "/milestone.json";
     REQUIRE(write_file(path, text));
 
-    static envoy::JsonDocument doc;
-    auto parsed = envoy::parse_bootstrap_json(str(text), doc);
-    REQUIRE(parsed);
-    const Span span = parsed.value().listener.filter_chain.hcm.route_config.span;
-
     const RunResult result = run_converter(g_executable, path);
     REQUIRE(WIFEXITED(result.status));
-    CHECK_EQ(WEXITSTATUS(result.status), 1);
-    CHECK(result.out.empty());
-    const std::string expected_prefix = expected_location(path, span);
-    CHECK_EQ(result.err.compare(0, expected_prefix.size(), expected_prefix), 0);
-    CHECK(result.err.find("local_response/failure_policy layout") != std::string::npos);
+    CHECK_EQ(WEXITSTATUS(result.status), 0);
+    CHECK_EQ(result.err.rfind("warning: connect_timeout \"5s\"", 0), 0u);
+    const size_t first_newline = result.err.find('\n');
+    REQUIRE(first_newline != std::string::npos);
+    CHECK_EQ(result.err.substr(first_newline + 1u), std::string(envoy::kH2cPrefaceWarningText));
+    CHECK_EQ(result.out, std::string(kEnvoyMilestoneSGolden));
 }
 
 // ── API-level capability gating ───────────────────────────────────────
@@ -1390,6 +1397,43 @@ TEST(envoy_convert, api_forged_model_rejected) {
     CHECK(overlong_route_config_name_result.error().code == FrontendError::UnsupportedSyntax);
     CHECK(to_string(overlong_route_config_name_result.error().detail)
               .find("name exceeds the bounded length") != std::string::npos);
+}
+
+// The converter goes live with this PR (`kShippedRutCapabilities` all true):
+// the milestone-S golden must not just be the right text, it must be a
+// program the compiler actually accepts end to end, mirroring
+// tests/test_nginx_parser.cc's `emitted_no_content_source_reaches_...` around
+// lines 8836-8880 (lex -> parse_file -> analyze_file -> build_mir ->
+// lower_to_rir).
+TEST(envoy_convert, golden_compiles) {
+    const Str source = lit_str(kEnvoyMilestoneSGolden);
+    auto lexed = lex(source);
+    REQUIRE(lexed);
+    auto ast = parse_file(lexed.value());
+    REQUIRE(ast);
+    std::unique_ptr<AstFile> ast_owned(ast.value());
+
+    auto hir = analyze_file(*ast_owned);
+    REQUIRE(hir);
+    std::unique_ptr<HirModule> hir_owned(hir.value());
+
+    auto mir = build_mir(*hir_owned);
+    REQUIRE(mir);
+    std::unique_ptr<MirModule> mir_owned(mir.value());
+
+    FrontendRirModule rir{};
+    REQUIRE(lower_to_rir(*mir_owned, rir));
+    REQUIRE(rir::verify_module(rir.module).ok);
+
+    CHECK_EQ(rir.module.upstream_count, 1u);
+    CHECK_EQ(rir.module.func_count, 2u);  // route HEAD "/" and route "/"
+
+    u32 unmatched_count = 0;
+    for (u32 i = 0; i < kStrictLocalResponseMethodSlots; i++)
+        if (rir.module.unmatched_policy_ids[i] != 0) unmatched_count++;
+    CHECK_EQ(unmatched_count, 1u);
+
+    rir.destroy();
 }
 
 int main(int argc, char** argv) {

@@ -10013,6 +10013,33 @@ inline ResponseReadDeadlineProfile classify_response_read_deadline_profile(
 inline u32 strict_response_dec(char* out, u32 value);
 inline u32 strict_response_date(char* out, u64 now_us);
 
+namespace detail {
+
+// The two policy specs that flow through `build_bounded_local_response_bytes`
+// (StrictLocalResponsePolicySpec and ForwardFailurePolicySpec) each carry
+// their own closed `header_order` enum. This shared 3-way tag lets one
+// template body switch on layout without ever naming an enumerator the other
+// spec's enum doesn't have (`StrictLocalResponseHeaderOrder::DateServerLength`
+// has no `FailurePolicyHeaderOrder` counterpart).
+enum class LocalReplyHeaderOrderKind : u8 { Synthesized, DateServerLength, LengthTypeDateServer };
+
+inline LocalReplyHeaderOrderKind local_reply_header_order_kind(
+    StrictLocalResponseHeaderOrder value) {
+    if (value == StrictLocalResponseHeaderOrder::DateServerLength)
+        return LocalReplyHeaderOrderKind::DateServerLength;
+    if (value == StrictLocalResponseHeaderOrder::LengthTypeDateServer)
+        return LocalReplyHeaderOrderKind::LengthTypeDateServer;
+    return LocalReplyHeaderOrderKind::Synthesized;
+}
+
+inline LocalReplyHeaderOrderKind local_reply_header_order_kind(FailurePolicyHeaderOrder value) {
+    return value == FailurePolicyHeaderOrder::LengthTypeDateServer
+               ? LocalReplyHeaderOrderKind::LengthTypeDateServer
+               : LocalReplyHeaderOrderKind::Synthesized;
+}
+
+}  // namespace detail
+
 template <typename Policy>
 inline bool build_bounded_local_response_bytes(const Connection& conn,
                                                const Policy& policy,
@@ -10042,23 +10069,63 @@ inline bool build_bounded_local_response_bytes(const Connection& conn,
     char date[32];
     char length[10];
     const u32 date_len = strict_response_date(date, realtime_us());
-    const u32 length_len = strict_response_dec(length, policy.body.len);
-    if (date_len == 0 || !put_lit("HTTP/1.1 ") || !put(reinterpret_cast<const u8*>(status), 3) ||
-        !put_lit(" ") || !put(reinterpret_cast<const u8*>(policy.reason.ptr), policy.reason.len) ||
-        !put_lit("\r\nServer: ") ||
-        !put(reinterpret_cast<const u8*>(policy.server.ptr), policy.server.len) ||
-        !put_lit("\r\nDate: ") || !put(reinterpret_cast<const u8*>(date), date_len) ||
-        !put_lit("\r\nContent-Type: ") ||
-        !put(reinterpret_cast<const u8*>(policy.content_type.ptr), policy.content_type.len) ||
-        !put_lit("\r\nContent-Length: ") || !put(reinterpret_cast<const u8*>(length), length_len) ||
-        !put_lit("\r\nConnection: "))
-        return false;
-    // Body disposition and downstream persistence are orthogonal: paired HEAD
-    // suppresses configured representation bytes, while connection: request
-    // still follows the parsed client request's lifetime.
+    if (date_len == 0) return false;
     const bool keep_alive = conn.keep_alive && conn.req_client_keep_alive;
-    if (!put_lit(keep_alive ? "keep-alive\r\n\r\n" : "close\r\n\r\n") ||
-        (!suppress_body && !put(reinterpret_cast<const u8*>(policy.body.ptr), policy.body.len)))
+    const auto order_kind = detail::local_reply_header_order_kind(policy.header_order);
+    if (order_kind == detail::LocalReplyHeaderOrderKind::Synthesized) {
+        const u32 length_len = strict_response_dec(length, policy.body.len);
+        if (!put_lit("HTTP/1.1 ") || !put(reinterpret_cast<const u8*>(status), 3) ||
+            !put_lit(" ") ||
+            !put(reinterpret_cast<const u8*>(policy.reason.ptr), policy.reason.len) ||
+            !put_lit("\r\nServer: ") ||
+            !put(reinterpret_cast<const u8*>(policy.server.ptr), policy.server.len) ||
+            !put_lit("\r\nDate: ") || !put(reinterpret_cast<const u8*>(date), date_len) ||
+            !put_lit("\r\nContent-Type: ") ||
+            !put(reinterpret_cast<const u8*>(policy.content_type.ptr), policy.content_type.len) ||
+            !put_lit("\r\nContent-Length: ") ||
+            !put(reinterpret_cast<const u8*>(length), length_len) || !put_lit("\r\nConnection: "))
+            return false;
+        // Body disposition and downstream persistence are orthogonal: paired
+        // HEAD suppresses configured representation bytes, while connection:
+        // request still follows the parsed client request's lifetime.
+        if (!put_lit(keep_alive ? "keep-alive\r\n\r\n" : "close\r\n\r\n") ||
+            (!suppress_body && !put(reinterpret_cast<const u8*>(policy.body.ptr), policy.body.len)))
+            return false;
+        *out_len = pos;
+        return true;
+    }
+    // Envoy H1 local-reply layouts (docs/envoy-converter.md; envoy-pr-plan.md
+    // PR5, oracle overrides): lowercase header names, `connection: close`
+    // appended only when the downstream connection is closing, and a fixed
+    // Envoy header order rather than the nginx-compatible one above.
+    // `DateServerLength` is the empty-body no-route 404
+    // (`date, server, [connection: close,] content-length: 0`);
+    // `LengthTypeDateServer` is the bodied shape, e.g. a 503 connect failure
+    // (`content-length, content-type, date, server, [connection: close]`).
+    if (!put_lit("HTTP/1.1 ") || !put(reinterpret_cast<const u8*>(status), 3) || !put_lit(" ") ||
+        !put(reinterpret_cast<const u8*>(policy.reason.ptr), policy.reason.len) || !put_lit("\r\n"))
+        return false;
+    if (order_kind == detail::LocalReplyHeaderOrderKind::LengthTypeDateServer) {
+        const u32 length_len = strict_response_dec(length, policy.body.len);
+        if (!put_lit("content-length: ") || !put(reinterpret_cast<const u8*>(length), length_len) ||
+            !put_lit("\r\ncontent-type: ") ||
+            !put(reinterpret_cast<const u8*>(policy.content_type.ptr), policy.content_type.len) ||
+            !put_lit("\r\ndate: ") || !put(reinterpret_cast<const u8*>(date), date_len) ||
+            !put_lit("\r\nserver: ") ||
+            !put(reinterpret_cast<const u8*>(policy.server.ptr), policy.server.len))
+            return false;
+    } else {
+        if (!put_lit("date: ") || !put(reinterpret_cast<const u8*>(date), date_len) ||
+            !put_lit("\r\nserver: ") ||
+            !put(reinterpret_cast<const u8*>(policy.server.ptr), policy.server.len))
+            return false;
+    }
+    if (!keep_alive && !put_lit("\r\nconnection: close")) return false;
+    if (order_kind == detail::LocalReplyHeaderOrderKind::DateServerLength &&
+        !put_lit("\r\ncontent-length: 0"))
+        return false;
+    if (!put_lit("\r\n\r\n")) return false;
+    if (!suppress_body && !put(reinterpret_cast<const u8*>(policy.body.ptr), policy.body.len))
         return false;
     *out_len = pos;
     return true;
@@ -10619,6 +10686,18 @@ inline void respond_validated_preconnect_failure(Loop* loop,
         return;
     }
 
+    // Fold the shard's graceful-drain state into the persistence decision
+    // before serializing the connect-failure policy, exactly as
+    // handle_configured_strict_local_response_in_scope already does through
+    // ordinary_local_response_may_persist for the configured local-response
+    // path. Otherwise a shard that starts draining while this connect
+    // attempt is still outstanding would serialize a response that omits
+    // `connection: close` (or sends `keep-alive`) and then still close the
+    // downstream socket in on_validated_preconnect_failure_sent, so the
+    // client would see persistence advertised and then an unexpected EOF.
+    conn.keep_alive =
+        ordinary_local_response_may_persist(loop, conn, /*terminal_baseline=*/conn.keep_alive);
+
     u8 scratch[SlicePool::kSliceSize];
     u32 response_len = 0;
     if (!build_failure_policy_response(conn,
@@ -10636,7 +10715,9 @@ inline void respond_validated_preconnect_failure(Loop* loop,
         return;
     }
 
-    // Everything above is read-only, including serialization. There is no
+    // Everything above (besides the keep_alive persistence decision folded in
+    // just above, which fail_closed()'s unconditional close makes moot on any
+    // failure branch) is read-only, including serialization. There is no
     // connect CQE owner at either site, so the never-armed deadline and local fd
     // can now be neutralized without a tombstone or health episode.
     if constexpr (requires(Loop* candidate, Connection& c) {
@@ -10647,6 +10728,12 @@ inline void respond_validated_preconnect_failure(Loop* loop,
         fail_closed();
         return;
     }
+    // build_failure_policy_response above only succeeds for a valid, owned
+    // failure_policy_id: the client received that policy's status (e.g. the
+    // Envoy 503 connect-failure layout), so bookkeeping must match it rather
+    // than assume the legacy 502 shape.
+    const u16 policy_status =
+        conn.request_config->failure_policies[conn.failure_policy_id - 1].status_code;
     conn.clear_slots();
     conn.upstream_abandoned = true;
     conn.upstream_keep_alive = false;
@@ -10658,8 +10745,7 @@ inline void respond_validated_preconnect_failure(Loop* loop,
         fail_closed();
         return;
     }
-    conn.keep_alive = conn.keep_alive && conn.req_client_keep_alive;
-    conn.resp_status = kStatusBadGateway;
+    conn.resp_status = policy_status;
     conn.resp_body_mode = BodyMode::None;
     conn.resp_body_remaining = 0;
     conn.resp_body_sent = response_len;
@@ -10697,6 +10783,12 @@ inline void respond_validated_connect_completion_failure(Loop* loop,
         fail_closed();
         return;
     }
+
+    // Fold the shard's graceful-drain state into the persistence decision
+    // before serializing the connect-failure policy -- see the identical
+    // comment in respond_validated_preconnect_failure above.
+    conn.keep_alive =
+        ordinary_local_response_may_persist(loop, conn, /*terminal_baseline=*/conn.keep_alive);
 
     u8 scratch[SlicePool::kSliceSize];
     u32 response_len = 0;
@@ -10743,6 +10835,12 @@ inline void respond_validated_connect_completion_failure(Loop* loop,
         fail_closed();
         return;
     }
+    // build_failure_policy_response above only succeeds for a valid, owned
+    // failure_policy_id: the client received that policy's status (e.g. the
+    // Envoy 503 connect-failure layout), so bookkeeping must match it rather
+    // than assume the legacy 502 shape.
+    const u16 policy_status =
+        conn.request_config->failure_policies[conn.failure_policy_id - 1].status_code;
     conn.clear_slots();
     conn.upstream_abandoned = true;
     conn.upstream_keep_alive = false;
@@ -10754,8 +10852,7 @@ inline void respond_validated_connect_completion_failure(Loop* loop,
         fail_closed();
         return;
     }
-    conn.keep_alive = conn.keep_alive && conn.req_client_keep_alive;
-    conn.resp_status = kStatusBadGateway;
+    conn.resp_status = policy_status;
     conn.resp_body_mode = BodyMode::None;
     conn.resp_body_remaining = 0;
     conn.resp_body_sent = response_len;
@@ -10828,7 +10925,15 @@ inline void respond_upstream_connect_failure(Loop* loop, Connection& conn) {
     release_upstream_slot(loop, conn);
 
     bool serialized = false;
+    u16 policy_status = kStatusBadGateway;
     if (conn.failure_policy_id != 0 && conn.request_config != nullptr) {
+        // Fold the shard's graceful-drain state into the persistence decision
+        // before serializing the connect-failure policy -- see the identical
+        // comment in respond_validated_preconnect_failure above. on_response_sent
+        // closes the downstream socket whenever the loop is draining, so the
+        // serialized bytes must not advertise persistence in that case.
+        conn.keep_alive =
+            ordinary_local_response_may_persist(loop, conn, /*terminal_baseline=*/conn.keep_alive);
         // Build off-buffer so a capacity/date failure cannot publish a partial
         // policy response or accidentally fall through to the legacy body.
         u8 scratch[SlicePool::kSliceSize];
@@ -10843,7 +10948,13 @@ inline void respond_upstream_connect_failure(Loop* loop, Connection& conn) {
             conn.send_buf.reset();
             serialized = conn.send_buf.write(scratch, serialized_len) == serialized_len;
         }
-        if (serialized) conn.keep_alive = conn.keep_alive && conn.req_client_keep_alive;
+        if (serialized) {
+            // The client received whatever status the selected policy
+            // serialized (e.g. a 503 Envoy connect-failure layout); bookkeeping
+            // must match the wire response, not the legacy 502 fallback.
+            policy_status =
+                conn.request_config->failure_policies[conn.failure_policy_id - 1].status_code;
+        }
     }
     if (!serialized) {
         // A selected policy is never silently approximated by the legacy
@@ -10866,7 +10977,7 @@ inline void respond_upstream_connect_failure(Loop* loop, Connection& conn) {
         }
         conn.keep_alive = false;
     }
-    conn.resp_status = kStatusBadGateway;
+    conn.resp_status = policy_status;
     conn.transition_to_sending(&on_response_sent<Loop>);
     client_send(loop, conn, conn.send_buf.data(), conn.send_buf.len());
 }

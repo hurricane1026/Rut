@@ -456,6 +456,43 @@ return forward(users, request_policy: {
     connection_header: "close_only", status_reason: "canonical",
     server: "envoy", date: "preserve_or_current", hide_headers: []
 })
+// local_response and failure_policy each accept an Envoy-compatible H1
+// header-order combination too: `header_names: "lowercase"`,
+// `connection_header: "close_only"`, and `header_order` are optional as a
+// closed trio (any one present requires all three); the fixed-order layout
+// above (all three omitted) is unchanged. `connection_header: "close_only"`
+// means `connection: close` is appended immediately after `server` only when
+// the downstream connection is closing; it is omitted entirely otherwise
+// (unlike the fixed-order layout, which always sends one or the other). Its
+// place in the overall wire order is layout-specific: last for
+// length_type_date_server, but followed by a trailing `content-length: 0` for
+// date_server_length below.
+//
+// local_response header_order: "date_server_length" is the empty-body
+// no-route shape (`date, server, [connection: close,] content-length: 0`):
+// requires `body: b""` and `content_type` absent, 4xx/5xx status only.
+unmatched { return local_response({
+    version: "HTTP/1.1", status: 404, reason: "Not Found", server: "envoy",
+    date: "current", connection: "request", connection_header: "close_only",
+    header_names: "lowercase", header_order: "date_server_length",
+    head_mode: "suppress_body", body: b""
+}) }
+// local_response header_order: "length_type_date_server" is the bodied
+// shape (`content-length, content-type, date, server, [connection: close]`):
+// follows the fixed-order layout's content_type/body rules on a 4xx/5xx
+// status (content_type required, body may be non-empty).
+//
+// failure_policy accepts the same `length_type_date_server` layout, and only
+// it: status 503 is admitted paired with it and a non-empty body (Envoy's
+// connect-failure representation); 502 stays exactly the fixed-order-only
+// contract above. timeout_failure_policy stays fixed-order-only (400..599).
+return forward(users, failure_policy: {
+    version: "HTTP/1.1", status: 503, reason: "Service Unavailable",
+    content_type: "text/plain", server: "envoy", date: "current",
+    connection: "request", connection_header: "close_only",
+    header_names: "lowercase", header_order: "length_type_date_server",
+    body: b"upstream connect error or disconnect/reset before headers. reset reason: remote connection failure"
+})
 
 // Explicit request-derived redirects are fully specified (no defaults). The
 // first source slice accepts the generic Redirect terminator in the existing

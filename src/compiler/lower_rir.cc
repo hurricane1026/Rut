@@ -3626,6 +3626,7 @@ static FrontendResult<void> lower_to_rir_impl(const MirModule& mir,
         dst.date = src.date;
         dst.connection = src.connection;
         dst.head_mode = src.head_mode;
+        dst.header_order = src.header_order;
         if (!copy_failure_str(src.reason, dst.reason) ||
             !copy_failure_str(src.content_type, dst.content_type) ||
             !copy_failure_str(src.server, dst.server) || !copy_failure_str(src.body, dst.body))
@@ -3661,7 +3662,7 @@ static FrontendResult<void> lower_to_rir_impl(const MirModule& mir,
         dst.date = src.date;
         dst.connection = src.connection;
         dst.head_mode = src.head_mode;
-        dst.reserved1 = src.reserved1;
+        dst.header_order = src.header_order;
         if (!copy_policy_str(src.reason, dst.reason) ||
             !copy_policy_str(src.content_type, dst.content_type) ||
             !copy_policy_str(src.server, dst.server) || !copy_policy_str(src.body, dst.body))

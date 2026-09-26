@@ -897,7 +897,7 @@ private:
         dst.date = policy.date;
         dst.connection = policy.connection;
         dst.head_mode = policy.head_mode;
-        dst.reserved1 = policy.reserved1;
+        dst.header_order = policy.header_order;
         copy(policy.reason, dst.reason);
         copy(policy.content_type, dst.content_type);
         copy(policy.server, dst.server);
@@ -1023,7 +1023,7 @@ private:
             dst.date = src.date;
             dst.connection = src.connection;
             dst.head_mode = src.head_mode;
-            dst.reserved1 = src.reserved1;
+            dst.header_order = src.header_order;
             dst.reason = {strict_local_response_bytes + offsets[i][0], src.reason.len};
             dst.content_type = {strict_local_response_bytes + offsets[i][1], src.content_type.len};
             dst.server = {strict_local_response_bytes + offsets[i][2], src.server.len};
@@ -1779,6 +1779,7 @@ public:
         dst.date = policy.date;
         dst.connection = policy.connection;
         dst.head_mode = policy.head_mode;
+        dst.header_order = policy.header_order;
         copy(policy.reason, dst.reason);
         copy(policy.content_type, dst.content_type);
         copy(policy.server, dst.server);
@@ -1810,7 +1811,17 @@ public:
                  ResponsePolicyHeaderOrder::Upstream &&
              (response_read_timeout_seconds != 0 ||
               response_buffering != ForwardResponseBufferingMode::None ||
-              timeout_failure_policy_id != 0)))
+              timeout_failure_policy_id != 0)) ||
+            // Envoy H1 status 503 / header_order: "length_type_date_server" is
+            // ordinary connect-failure-only (see analyze.cc and
+            // compile_to_config.h): the runtime's response-read-deadline
+            // preflight hard-requires the default failure policy's status to
+            // be 502 and closes the downstream connection on mismatch, so
+            // repeat that invariant here too.
+            (failure_policy_id != 0 &&
+             failure_policies[failure_policy_id - 1].header_order ==
+                 FailurePolicyHeaderOrder::LengthTypeDateServer &&
+             response_read_timeout_seconds != 0))
             return 0;
         if (timeout_failure_policy_id != 0) {
             if (response_policy_id == 0 || failure_policy_id == 0 ||
@@ -1933,6 +1944,17 @@ public:
             (b.response_read_timeout_seconds != 0 ||
              b.response_buffering != ForwardResponseBufferingMode::None ||
              b.timeout_failure_policy_id != 0))
+            return false;
+        // Envoy H1 status 503 / header_order: "length_type_date_server" is
+        // ordinary connect-failure-only, mirroring the response_policy
+        // header_order: "upstream" trust-boundary re-check above: the
+        // response-read-deadline preflight hard-requires the default failure
+        // policy's status to be 502 and closes the downstream connection on
+        // mismatch, so this trust boundary must reject the same combination.
+        if (b.failure_policy_id != 0 &&
+            failure_policies[b.failure_policy_id - 1].header_order ==
+                FailurePolicyHeaderOrder::LengthTypeDateServer &&
+            b.response_read_timeout_seconds != 0)
             return false;
         if (b.response_buffering != ForwardResponseBufferingMode::None) {
             if (b.response_buffering != ForwardResponseBufferingMode::CompleteContentLength ||

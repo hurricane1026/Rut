@@ -3281,6 +3281,69 @@ TEST(response_policy, upstream_header_order_bundle_rejects_timing_buffering_and_
     CHECK_FALSE(forged.forward_policy_tables_valid());
 }
 
+// Codex round-3 review: prepare_response_read_deadline_preflight_for_mode
+// (include/rut/runtime/callbacks_impl.h) hard-requires the default failure
+// policy's status to be 502 and closes the downstream connection on
+// mismatch, so a bundle pairing the Envoy 503/length_type_date_server
+// failure_policy with response_read_timeout (with or without complete
+// buffering) must never be admitted -- it would drop every matching request.
+TEST(response_policy, failure_policy_503_bundle_rejects_response_read_timeout) {
+    RouteConfig config{};
+    u16 response_id = 0;
+    u16 failure_id = 0;
+    u16 timeout_id = 0;
+    REQUIRE(add_response_policy_test_roles(config, response_id, failure_id, timeout_id));
+
+    ForwardFailurePolicySpec failure_503{};
+    failure_503.version = ForwardFailurePolicyVersion::Http11;
+    failure_503.status_code = 503;
+    failure_503.date = ForwardFailurePolicyDate::Current;
+    failure_503.connection = ForwardFailurePolicyConnection::Request;
+    failure_503.head_mode = FailurePolicyHeadMode::Reject;
+    failure_503.header_order = FailurePolicyHeaderOrder::LengthTypeDateServer;
+    failure_503.reason = {"Service Unavailable", 19};
+    failure_503.content_type = {"text/plain", 10};
+    failure_503.server = {"envoy", 5};
+    failure_503.body = {"connect failure", 15};
+    const u16 failure_503_id = config.add_failure_policy(failure_503);
+    REQUIRE_NE(failure_503_id, 0u);
+
+    // Ordinary connect-failure-only usage (no read timeout, no buffering) is
+    // unaffected -- this is the feature the 503 layout exists for.
+    CHECK_NE(config.add_policy_bundle(0, failure_503_id), 0u);
+    // A bare response_read_timeout bundle referencing the 503 policy as the
+    // default failure must be rejected at construction.
+    CHECK_EQ(config.add_policy_bundle(0, failure_503_id, 0, 5), 0u);
+    CHECK_EQ(config.add_policy_bundle(response_id, failure_503_id, 0, 5), 0u);
+    // The complete-buffering shape (response_read_timeout + buffering +
+    // timeout_failure_policy) must also be rejected.
+    CHECK_EQ(config.add_policy_bundle(response_id,
+                                      failure_503_id,
+                                      timeout_id,
+                                      5,
+                                      ForwardResponseBufferingMode::CompleteContentLength),
+             0u);
+
+    // A hand-built config that skipped add_policy_bundle must still be
+    // rejected by the trust boundary forward_policy_tables_valid() relies on.
+    RouteConfig forged{};
+    u16 forged_response_id = 0;
+    u16 forged_failure_id = 0;
+    u16 forged_timeout_id = 0;
+    REQUIRE(add_response_policy_test_roles(
+        forged, forged_response_id, forged_failure_id, forged_timeout_id));
+    const u16 forged_failure_503_id = forged.add_failure_policy(failure_503);
+    REQUIRE_NE(forged_failure_503_id, 0u);
+    const u16 bundle_id = forged.add_policy_bundle(0, forged_failure_503_id);
+    REQUIRE_NE(bundle_id, 0u);
+    CHECK(forged.policy_bundle_id_is_valid(bundle_id));
+    CHECK(forged.forward_policy_tables_valid());
+
+    forged.policy_bundles[bundle_id - 1].response_read_timeout_seconds = 5;
+    CHECK_FALSE(forged.policy_bundle_id_is_valid(bundle_id));
+    CHECK_FALSE(forged.forward_policy_tables_valid());
+}
+
 TEST(response_read_timeout, h1_rejects_before_every_forward_effect_and_preserves_absence) {
     RouteConfig config{};
     REQUIRE(config.add_upstream("backend", 0x7F000001, 9000).has_value());
@@ -21544,6 +21607,165 @@ TEST(unmatched_local_response,
     CHECK_EQ(epoch.epoch.load(std::memory_order_acquire), 2u);
 }
 
+// Envoy H1 local-reply layouts (envoy-pr-plan.md PR5): `header_order`
+// spec/profile validity table, config-copy ownership of the new field, and a
+// regression check that nginx's 502 contract is untouched.
+TEST(unmatched_local_response, envoy_header_order_spec_profile_validity_table) {
+    // strict_local_response: header_order x status x content_type x body.
+    struct LocalCase {
+        u16 status;
+        StrictLocalResponseHeaderOrder header_order;
+        bool has_content_type;
+        bool has_body;
+        bool expect_valid;
+    };
+    const LocalCase local_cases[] = {
+        // Synthesized (today's contract) is unaffected either way.
+        {404, StrictLocalResponseHeaderOrder::Synthesized, true, true, true},
+        {404, StrictLocalResponseHeaderOrder::Synthesized, false, true, false},
+        // date_server_length: 4xx/5xx, no content-type, empty body only.
+        {404, StrictLocalResponseHeaderOrder::DateServerLength, false, false, true},
+        {404, StrictLocalResponseHeaderOrder::DateServerLength, true, false, false},
+        {404, StrictLocalResponseHeaderOrder::DateServerLength, false, true, false},
+        {200, StrictLocalResponseHeaderOrder::DateServerLength, false, false, false},
+        // length_type_date_server: follows the LegacyError (content-type
+        // required) rules on a 4xx/5xx status.
+        {503, StrictLocalResponseHeaderOrder::LengthTypeDateServer, true, true, true},
+        {503, StrictLocalResponseHeaderOrder::LengthTypeDateServer, false, true, false},
+        {200, StrictLocalResponseHeaderOrder::LengthTypeDateServer, true, true, false},
+    };
+    for (const auto& c : local_cases) {
+        StrictLocalResponsePolicySpec policy{};
+        policy.version = StrictLocalResponseVersion::Http11;
+        policy.status_code = c.status;
+        policy.date = StrictLocalResponseDate::Current;
+        policy.connection = StrictLocalResponseConnection::Request;
+        policy.head_mode = StrictLocalResponseHeadMode::SuppressBody;
+        policy.header_order = c.header_order;
+        policy.reason = lit_str("Reason");
+        policy.server = lit_str("envoy");
+        if (c.has_content_type) policy.content_type = lit_str("text/plain");
+        if (c.has_body) policy.body = lit_str("x");
+        CHECK_EQ(strict_local_response_policy_spec_valid(policy), c.expect_valid);
+    }
+
+    // failure_policy: header_order x status x body-empty.
+    struct FailureCase {
+        u16 status;
+        FailurePolicyHeaderOrder header_order;
+        bool empty_body;
+        bool expect_valid;
+        bool expect_timeout_valid;
+    };
+    const FailureCase failure_cases[] = {
+        // nginx's 502 contract: unchanged, Synthesized only.
+        {502, FailurePolicyHeaderOrder::Synthesized, false, true, true},
+        {502, FailurePolicyHeaderOrder::LengthTypeDateServer, false, false, false},
+        // 503 is admitted only with the Envoy layout and a non-empty body.
+        {503, FailurePolicyHeaderOrder::LengthTypeDateServer, false, true, false},
+        {503, FailurePolicyHeaderOrder::LengthTypeDateServer, true, false, false},
+        {503, FailurePolicyHeaderOrder::Synthesized, false, false, true},
+        // 504 is never valid on the default-failure role; the timeout role
+        // still spans 400..599 but stays Synthesized-only.
+        {504, FailurePolicyHeaderOrder::Synthesized, false, false, true},
+        {504, FailurePolicyHeaderOrder::LengthTypeDateServer, false, false, false},
+    };
+    for (const auto& c : failure_cases) {
+        ForwardFailurePolicySpec policy{};
+        policy.version = ForwardFailurePolicyVersion::Http11;
+        policy.status_code = c.status;
+        policy.date = ForwardFailurePolicyDate::Current;
+        policy.connection = ForwardFailurePolicyConnection::Request;
+        policy.head_mode = FailurePolicyHeadMode::Reject;
+        policy.header_order = c.header_order;
+        policy.reason = lit_str("Reason");
+        policy.content_type = lit_str("text/plain");
+        policy.server = lit_str("envoy");
+        policy.body = c.empty_body ? Str{} : lit_str("x");
+        CHECK_EQ(forward_failure_policy_spec_valid(policy), c.expect_valid);
+        CHECK_EQ(forward_timeout_failure_policy_spec_valid(policy), c.expect_timeout_valid);
+        // The shared table predicate admits an entry valid under either role.
+        CHECK_EQ(forward_failure_policy_table_spec_valid(policy),
+                 c.expect_valid || c.expect_timeout_valid);
+    }
+}
+
+TEST(unmatched_local_response, envoy_header_order_survives_config_copy_and_502_stays_synthesized) {
+    // `RouteConfig::add_failure_policy` (route_table.h) copies `header_order`
+    // field by field into the owned table; verify it round-trips.
+    RouteConfig config{};
+    ForwardFailurePolicySpec envoy_failure{};
+    envoy_failure.version = ForwardFailurePolicyVersion::Http11;
+    envoy_failure.status_code = 503;
+    envoy_failure.header_order = FailurePolicyHeaderOrder::LengthTypeDateServer;
+    envoy_failure.date = ForwardFailurePolicyDate::Current;
+    envoy_failure.connection = ForwardFailurePolicyConnection::Request;
+    envoy_failure.head_mode = FailurePolicyHeadMode::Reject;
+    envoy_failure.reason = lit_str("Service Unavailable");
+    envoy_failure.content_type = lit_str("text/plain");
+    envoy_failure.server = lit_str("envoy");
+    envoy_failure.body = lit_str("upstream connect error");
+    const u16 envoy_id = config.add_failure_policy(envoy_failure);
+    REQUIRE_EQ(envoy_id, 1u);
+    CHECK(config.failure_policies[envoy_id - 1].header_order ==
+          FailurePolicyHeaderOrder::LengthTypeDateServer);
+    CHECK(admitted_forward_failure_policy_valid(config.failure_policies[envoy_id - 1]));
+
+    // A second, byte-identical policy dedups to the same id (spec_equal now
+    // compares header_order too, so this also proves dedup didn't regress).
+    CHECK_EQ(config.add_failure_policy(envoy_failure), envoy_id);
+
+    // nginx's default 502 path is untouched: Synthesized-only, unaffected by
+    // the Envoy addition above.
+    ForwardFailurePolicySpec nginx_failure{};
+    nginx_failure.version = ForwardFailurePolicyVersion::Http11;
+    nginx_failure.status_code = 502;
+    nginx_failure.date = ForwardFailurePolicyDate::Current;
+    nginx_failure.connection = ForwardFailurePolicyConnection::Request;
+    nginx_failure.head_mode = FailurePolicyHeadMode::Reject;
+    nginx_failure.reason = lit_str("Bad Gateway");
+    nginx_failure.content_type = lit_str("text/plain");
+    nginx_failure.server = lit_str("nginx");
+    nginx_failure.body = lit_str("legacy");
+    const u16 nginx_id = config.add_failure_policy(nginx_failure);
+    REQUIRE_EQ(nginx_id, 2u);
+    CHECK(config.failure_policies[nginx_id - 1].header_order ==
+          FailurePolicyHeaderOrder::Synthesized);
+
+    // Forcing the Envoy layout onto a 502 policy is rejected outright: it
+    // never reaches the owned table (nginx's contract stays closed).
+    ForwardFailurePolicySpec forged_502 = nginx_failure;
+    forged_502.header_order = FailurePolicyHeaderOrder::LengthTypeDateServer;
+    CHECK_EQ(config.add_failure_policy(forged_502), 0u);
+
+    // strict_local_response: the DateServerLength no-route 404 also survives
+    // the owned-table copy path (`copy_strict_local_response_table_from_owned`).
+    StrictLocalResponsePolicySpec envoy_404{};
+    envoy_404.version = StrictLocalResponseVersion::Http11;
+    envoy_404.status_code = 404;
+    envoy_404.date = StrictLocalResponseDate::Current;
+    envoy_404.connection = StrictLocalResponseConnection::Request;
+    envoy_404.head_mode = StrictLocalResponseHeadMode::SuppressBody;
+    envoy_404.header_order = StrictLocalResponseHeaderOrder::DateServerLength;
+    envoy_404.reason = lit_str("Not Found");
+    envoy_404.server = lit_str("envoy");
+    u16 unmatched[kStrictLocalResponseMethodSlots]{};
+    unmatched[kRouteMethodAny] = 1;
+    u16 pre_route[kStrictLocalResponseMethodSlots]{};
+    ExactStrictLocalResponseBinding exact[kMaxExactStrictLocalResponseBindings]{};
+    auto source = std::make_unique<RouteConfig>();
+    REQUIRE(source->install_strict_local_response_table_with_pre_route(
+        &envoy_404, 1, pre_route, unmatched, exact, 0));
+    REQUIRE(source->strict_local_response_table_is_valid());
+
+    auto copied = std::make_unique<RouteConfig>();
+    REQUIRE(copied->copy_strict_local_response_table_from_owned(*source));
+    REQUIRE(copied->strict_local_response_table_is_valid());
+    REQUIRE_EQ(copied->strict_local_response_policy_count, 1u);
+    CHECK(copied->strict_local_response_policies[0].header_order ==
+          StrictLocalResponseHeaderOrder::DateServerLength);
+}
+
 TEST(unmatched_local_response, generic_serializer_preserves_failure_policy_wire) {
     Connection conn{};
     u8 recv[64]{}, send[1024]{};
@@ -21734,7 +21956,10 @@ TEST(unmatched_local_response,
     forged.head_mode = StrictLocalResponseHeadMode::Reject;
     rejects(forged);
     forged = policy;
-    forged.reserved1 = 1;
+    forged.header_order = StrictLocalResponseHeaderOrder::DateServerLength;
+    rejects(forged);
+    forged = policy;
+    forged.header_order = StrictLocalResponseHeaderOrder::LengthTypeDateServer;
     rejects(forged);
     forged = policy;
     forged.reason = {"Not Content", 11};
@@ -69199,6 +69424,95 @@ TEST(state_invariant, jit_forward_failure_bundle_connect_submit_serializes_and_c
 
     close(fds[1]);
     loop.close_conn(*c);
+}
+
+static u64 round4_drain_connect_failure_handler(void*, jit::HandlerCtx*, const u8*, u32, void*) {
+    return jit::HandlerResult::make_forward_with_bundle(0, 0, 1).pack();
+}
+
+// Codex round-4 review: respond_upstream_connect_failure serializes the Envoy
+// H1 connect-failure layout (header_order: length_type_date_server) using
+// conn.keep_alive && conn.req_client_keep_alive alone, the same way the other
+// connect-failure entry points (respond_validated_preconnect_failure,
+// respond_validated_connect_completion_failure) did before this fix. None of
+// them folded in the shard's graceful-drain state, so a shard beginning to
+// drain while a connect attempt was outstanding would serialize a response
+// that omits `connection: close` (persistence by omission is this layout's
+// contract -- see build_bounded_local_response_bytes) and then still close
+// the downstream socket in on_response_sent, which checks loop->is_draining()
+// unconditionally. Assert the close-only layout now folds in drain state the
+// same way handle_configured_strict_local_response_in_scope already does for
+// the configured local-response path, via ordinary_local_response_may_persist.
+TEST(state_invariant, connect_failure_envoy_503_omits_close_only_while_not_draining) {
+    static constexpr char kRequest[] = "GET /api HTTP/1.1\r\nHost: client.example\r\n\r\n";
+    RouteConfig cfg{};
+    REQUIRE(cfg.add_upstream("api", 0x7F000001, 9000).has_value());
+    ForwardFailurePolicySpec failure{};
+    failure.version = ForwardFailurePolicyVersion::Http11;
+    failure.status_code = 503;
+    failure.header_order = FailurePolicyHeaderOrder::LengthTypeDateServer;
+    failure.date = ForwardFailurePolicyDate::Current;
+    failure.connection = ForwardFailurePolicyConnection::Request;
+    failure.head_mode = FailurePolicyHeadMode::Reject;
+    failure.reason = {"Service Unavailable", 19};
+    failure.content_type = {"text/plain", 10};
+    failure.server = {"envoy", 5};
+    failure.body = {"connect failure", 15};
+    REQUIRE_EQ(cfg.add_failure_policy(failure), 1u);
+    REQUIRE_EQ(cfg.add_policy_bundle(0, 1), 1u);
+    REQUIRE(cfg.add_jit_handler("/api", kRouteMethodGet, &round4_drain_connect_failure_handler));
+    const RouteConfig* active = &cfg;
+
+    SmallLoop loop;
+    loop.setup();
+    loop.config_ptr = &active;
+    auto* conn = loop.alloc_conn();
+    REQUIRE(conn != nullptr);
+    REQUIRE_EQ(conn->recv_buf.write(reinterpret_cast<const u8*>(kRequest), sizeof(kRequest) - 1),
+               sizeof(kRequest) - 1);
+    on_header_received<SmallLoop>(
+        &loop, *conn, make_ev(conn->id, IoEventType::Recv, sizeof(kRequest) - 1));
+    REQUIRE_GE(conn->upstream_fd, 0);
+    REQUIRE_EQ(conn->on_upstream_send, &on_upstream_connected<SmallLoop>);
+    CHECK(conn->keep_alive);
+    CHECK(conn->req_client_keep_alive);
+
+    // Baseline (not draining): the default HTTP/1.1 persistent request keeps
+    // the connection open, so the close-only layout omits `connection:`
+    // entirely (persistence by omission).
+    loop.inject_and_dispatch(make_ev(conn->id, IoEventType::UpstreamConnect, -ECONNREFUSED));
+    CHECK_EQ(conn->resp_status, 503u);
+    CHECK(conn->keep_alive);
+    CHECK(buf_has(
+        conn->send_buf.data(), conn->send_buf.len(), "HTTP/1.1 503 Service Unavailable\r\n"));
+    CHECK_FALSE(buf_has(conn->send_buf.data(), conn->send_buf.len(), "connection:"));
+    loop.close_conn(*conn);
+
+    // Draining while the connect attempt is outstanding: the response must
+    // now advertise `connection: close` and conn.keep_alive must be false, so
+    // the client is never told the connection persists only to be met with an
+    // unexpected EOF from on_response_sent's unconditional drain check.
+    auto* draining_conn = loop.alloc_conn();
+    REQUIRE(draining_conn != nullptr);
+    REQUIRE_EQ(
+        draining_conn->recv_buf.write(reinterpret_cast<const u8*>(kRequest), sizeof(kRequest) - 1),
+        sizeof(kRequest) - 1);
+    on_header_received<SmallLoop>(
+        &loop, *draining_conn, make_ev(draining_conn->id, IoEventType::Recv, sizeof(kRequest) - 1));
+    REQUIRE_GE(draining_conn->upstream_fd, 0);
+    CHECK(draining_conn->keep_alive);
+    loop.draining = true;
+    loop.inject_and_dispatch(
+        make_ev(draining_conn->id, IoEventType::UpstreamConnect, -ECONNREFUSED));
+    CHECK_EQ(draining_conn->resp_status, 503u);
+    CHECK_FALSE(draining_conn->keep_alive);
+    CHECK(buf_has(draining_conn->send_buf.data(),
+                  draining_conn->send_buf.len(),
+                  "HTTP/1.1 503 Service Unavailable\r\n"));
+    CHECK(buf_has(
+        draining_conn->send_buf.data(), draining_conn->send_buf.len(), "\r\nconnection: close"));
+    loop.draining = false;
+    loop.close_conn(*draining_conn);
 }
 
 TEST(state_invariant, timeout_failure_policy_id_is_pinned_through_body_wait_and_reset) {
