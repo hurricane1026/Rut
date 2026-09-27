@@ -6153,6 +6153,57 @@ inline bool apply_preserve_host_lowercase_request_policy(Connection& conn, u16 p
         if (!name_nominated(reinterpret_cast<const u8*>(entry.name), entry.len)) return false;
     }
 
+    // This function writes its rewritten request into `conn.send_buf`,
+    // which shares `conn.recv_buf`'s exact physical capacity (both are
+    // bound to one `SlicePool::kSliceSize` slice per connection,
+    // `include/rut/runtime/epoll_event_loop.h`/`kqueue_event_loop.h`) --
+    // the rewrite can only ever *shrink or preserve* every byte range it
+    // touches except one: a client that sent no `x-forwarded-proto` field
+    // at all requires appending the literal `kXfpSynthesisBytes`-byte line
+    // below, which has no corresponding bytes in the original request to
+    // offset it. Every other transformation is proven non-growing:
+    //  - the request line is copied byte for byte, unchanged;
+    //  - `host: ` is always exactly 6 bytes regardless of the client's
+    //    header-name casing (same length) or internal OWS around the
+    //    value (trimmed away, never added to);
+    //  - an invalid/empty `x-forwarded-proto` value is overwritten in
+    //    place with the same `kXfpSynthesisBytes`-byte line, which cannot
+    //    be larger than appending it fresh (the original field already
+    //    contributed at least its own name, colon, and CRLF);
+    //  - the canonical `te: trailers` line is exactly 14 bytes, written at
+    //    the *first* physical `TE` field's position; even in the most
+    //    adversarial split (a short, trailers-free first field forcing a
+    //    separate, later trailers-carrying field to be dropped entirely)
+    //    the field being fully removed is always at least as large as the
+    //    growth at the substitution point (minimum non-trailers first
+    //    field `TE:\r\n`, 5 bytes, growing to 14 -- a local +9 -- against a
+    //    minimum trailers-carrying field elsewhere, `TE:trailers\r\n`, 13
+    //    bytes removed -- net -4), so `TE` handling is never a net grower
+    //    across the whole request;
+    //  - every other retained header is re-emitted as its (length-
+    //    preserving) lowercased name, a literal `: ` (2 bytes), and its
+    //    already-OWS-trimmed original value -- never longer than the
+    //    original field, and shorter whenever the original had internal
+    //    OWS beyond a single delimiter.
+    // So a request already within `kXfpSynthesisBytes` bytes of capacity
+    // that also drops or shrinks at least that many bytes elsewhere (any
+    // hop-by-hop header, a `Connection` nomination, a stripped
+    // `x-envoy-*` header, a shortened value, ...) is guaranteed to fit and
+    // is admitted here; empirically verified with both shapes at
+    // `conn.send_buf.capacity() - 1`: a request that also drops a
+    // `Proxy-Connection` header (31 bytes, more than enough to offset the
+    // 25-byte append) is admitted, while one with nothing else to drop
+    // fails -- the same `conn.recv_buf.capacity()` ceiling every other
+    // policy and the parser itself enforce, not a smaller, silently
+    // XFP-specific one (Codex sweep-4 review, PR #696). This buffer-
+    // sharing constraint is inherent to reusing one fixed `SlicePool`
+    // slice per direction per connection; lifting it for the zero-slack
+    // case entirely would require growing `SlicePool::kSliceSize` itself,
+    // which has its own static-asserted layout dependents elsewhere (e.g.
+    // `include/rut/runtime/response_body_chain.h`'s `Node`) and is out of
+    // scope here.
+    constexpr u32 kXfpSynthesisBytes = 25;  // strlen("x-forwarded-proto: http\r\n")
+
     auto append = [&](const u8* p, u32 n) {
         return n <= conn.send_buf.capacity() - conn.send_buf.len() &&
                conn.send_buf.write(p, n) == n;
@@ -6308,7 +6359,8 @@ inline bool apply_preserve_host_lowercase_request_policy(Connection& conn, u16 p
                 } else if (emit_te_here) {
                     if (!append_lit("te: trailers\r\n", 14)) return false;
                 } else if (xfp_invalid) {
-                    if (!append_lit("x-forwarded-proto: http\r\n", 25)) return false;
+                    if (!append_lit("x-forwarded-proto: http\r\n", kXfpSynthesisBytes))
+                        return false;
                     saw_xfp = true;
                 } else {
                     if (!append_lower(hs, name_len) || !append_lit(": ", 2) ||
@@ -6321,7 +6373,7 @@ inline bool apply_preserve_host_lowercase_request_policy(Connection& conn, u16 p
             hs = le + 2;
         }
     }
-    if (!saw_xfp && !append_lit("x-forwarded-proto: http\r\n", 25)) return false;
+    if (!saw_xfp && !append_lit("x-forwarded-proto: http\r\n", kXfpSynthesisBytes)) return false;
     if (!append_lit("\r\n", 2)) return false;
 
     const u32 new_header_len = conn.send_buf.len();
