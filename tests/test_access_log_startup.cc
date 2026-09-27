@@ -662,19 +662,27 @@ enum class SourceLiveProxyMode : u8 {
     FileSizeWriteFatal,
 };
 
+// The readiness line is not written atomically: rut's main.cc writes the marker,
+// then the port one digit per write(2), then " with N shard(s)". A pipe read can
+// therefore end mid-number ("Listening on port 3" of 36875). Accept the port only
+// once the digit run is terminated by the " with " that follows it; until then the
+// line is incomplete and the caller must keep reading.
 u16 listening_port(const std::string& output) {
     static constexpr char kMarker[] = "Listening on port ";
+    static constexpr char kTerminator[] = " with ";
     const size_t marker = output.find(kMarker);
     if (marker == std::string::npos) return 0u;
     size_t cursor = marker + sizeof(kMarker) - 1u;
     u32 value = 0u;
-    bool any = false;
+    u32 digits = 0u;
     while (cursor < output.size() && output[cursor] >= '0' && output[cursor] <= '9') {
-        any = true;
+        if (++digits > 5u) return 0u;
         value = value * 10u + static_cast<u32>(output[cursor] - '0');
         cursor++;
     }
-    return any && value <= 65535u ? static_cast<u16>(value) : 0u;
+    if (digits == 0u || value == 0u || value > 65535u) return 0u;
+    if (output.compare(cursor, sizeof(kTerminator) - 1u, kTerminator) != 0) return 0u;
+    return static_cast<u16>(value);
 }
 
 bool is_prefix_of(const std::string& value, const char* expected) {
@@ -863,6 +871,25 @@ TEST(access_log_startup, process_helper_waits_for_exit_after_output_eof) {
 }
 
 #ifdef RUT_ACCESS_LOG_STARTUP_SOURCE_PROCESS_TEST
+TEST(access_log_startup, listening_port_waits_for_the_complete_readiness_line) {
+    // Every prefix a pipe read can deliver of the digit-by-digit readiness write.
+    const std::string line = "Backend: kqueue\nListening on port 36875 with 1 shard(s)\n";
+    const size_t digits_end = line.find(" with ");
+    for (size_t cut = 0u; cut < line.size(); cut++) {
+        const u16 port = listening_port(line.substr(0u, cut));
+        if (cut < digits_end + 6u) {
+            CHECK_EQ(port, 0u);
+        } else {
+            CHECK_EQ(port, 36875u);
+        }
+    }
+    CHECK_EQ(listening_port(line), 36875u);
+    CHECK_EQ(listening_port("Listening on port 3"), 0u);
+    CHECK_EQ(listening_port("Listening on port 0 with 1 shard(s)\n"), 0u);
+    CHECK_EQ(listening_port("Listening on port 65536 with 1 shard(s)\n"), 0u);
+    CHECK_EQ(listening_port("Listening on port 123456 with 1 shard(s)\n"), 0u);
+}
+
 TEST(access_log_startup, public_main_source_live_publishes_downstream_size_before_shutdown) {
     const std::string dir = make_temp_dir("/tmp/rut-access-log-startup-main-XXXXXX");
     REQUIRE_FALSE(dir.empty());
