@@ -2673,12 +2673,33 @@ bool self_test_envoy_log_confirms_listener() {
 bool self_test_temp_dir_cleanup() {
     bool ok = true;
 
-    // Default: removed on scope exit.
+    // Sweep-1 review, "Isolate the cleanup test from the KEEP_TMP setting":
+    // RUT_ENVOY_KEEP_TMP is an advertised diagnostic knob a caller may
+    // already have set (e.g. to run --self-test itself with cleanup
+    // disabled), so this self-test must not assume it starts unset -- doing
+    // so made the "removed on scope exit" case below spuriously fail
+    // whenever the caller had it set -- and must restore whatever the
+    // caller had afterward instead of unconditionally clearing it.
+    const char* original_keep_tmp_env = getenv("RUT_ENVOY_KEEP_TMP");
+    const bool had_original_keep_tmp = original_keep_tmp_env != nullptr;
+    const std::string original_keep_tmp = had_original_keep_tmp ? original_keep_tmp_env : "";
+    auto restore_keep_tmp = [&] {
+        if (had_original_keep_tmp) {
+            setenv("RUT_ENVOY_KEEP_TMP", original_keep_tmp.c_str(), 1);
+        } else {
+            unsetenv("RUT_ENVOY_KEEP_TMP");
+        }
+    };
+
+    // Default: removed on scope exit. Explicitly cleared (regardless of the
+    // caller's setting) so this case is actually exercised.
+    unsetenv("RUT_ENVOY_KEEP_TMP");
     std::string removed_path;
     {
         TempDir dir("rut-envoy-selftest-cleanup");
         if (dir.empty()) {
             std::cerr << "FAIL [self-test temp dir cleanup]: could not create temp dir\n";
+            restore_keep_tmp();
             return false;
         }
         removed_path = dir.path();
@@ -2702,12 +2723,12 @@ bool self_test_temp_dir_cleanup() {
         if (dir.empty()) {
             std::cerr
                 << "FAIL [self-test temp dir cleanup]: could not create temp dir (keep case)\n";
-            unsetenv("RUT_ENVOY_KEEP_TMP");
+            restore_keep_tmp();
             return false;
         }
         kept_path = dir.path();
     }
-    unsetenv("RUT_ENVOY_KEEP_TMP");
+    restore_keep_tmp();
     if (stat(kept_path.c_str(), &st) != 0) {
         std::cerr << "FAIL [self-test temp dir cleanup]: RUT_ENVOY_KEEP_TMP=1 did not preserve "
                   << kept_path << "\n";
