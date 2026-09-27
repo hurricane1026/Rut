@@ -2847,7 +2847,7 @@ void on_response_sent(void* lp, Connection& conn, IoEvent ev) {
                     // another CompletedSync outcome, so any sendfile completion
                     // reached from inside this dispatch_event call arms an
                     // ordinary SQE instead of recursing further.
-                    if constexpr (requires(Loop* l) { l->in_sync_send_completion = false; }) {
+                    if constexpr (requires(Loop* l) { l->in_sync_send_completion; }) {
                         loop->in_sync_send_completion = true;
                         loop->dispatch_event(conn, synthetic);
                         loop->in_sync_send_completion = false;
