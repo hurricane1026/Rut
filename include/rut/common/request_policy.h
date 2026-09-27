@@ -15,8 +15,13 @@ enum class RequestPolicyId : u16 {
     // Envoy-compatible H1 profile: preserves the client's Host header instead
     // of writing the upstream endpoint, lowercases every forwarded header
     // name, drops Envoy's fixed hop-by-hop set (Connection, Keep-Alive,
-    // Proxy-Connection, Expect, Upgrade, Transfer-Encoding) by default, and
-    // separately drops every header the client's Connection value nominates
+    // Proxy-Connection, Expect, Upgrade) by default. `Transfer-Encoding` is
+    // not dropped: `inspect_request_policy_body` fails the whole request
+    // closed (400) the moment it sees that field name, before the
+    // serializer ever runs, so no request carrying it -- bodyless or not --
+    // reaches the drop logic at all; this is the one fixed-list name that is
+    // fail-closed rather than stripped. Separately drops every header the
+    // client's Connection value nominates
     // -- except a nomination of `content-length`, `host`, `x-forwarded-for`,
     // `x-forwarded-host`, `x-forwarded-proto`, or a pseudo-header-shaped
     // token (first byte `:`), each of which fails the whole request closed

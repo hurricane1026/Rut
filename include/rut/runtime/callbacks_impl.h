@@ -3966,7 +3966,20 @@ void handle_jit_outcome(Loop* loop,
                     (outcome.request_policy_id != 0 &&
                      (!request_policy_is_supported(outcome.request_policy_id) ||
                       inspect_request_policy_body(conn, outcome.request_policy_id) !=
-                          RequestPolicyBodyState::Complete))) {
+                          RequestPolicyBodyState::Complete)) ||
+                    // `host: "preserve"` (ID4) is ordinary-forward-only: it
+                    // never carries timing/buffering custody and
+                    // target_transform's request-target rewrite has no
+                    // proven interaction with it (src/compiler/analyze.cc
+                    // rejects this combination at compile time for
+                    // ordinary Rut source). A direct-RIR/JIT-constructed
+                    // outcome bypasses that analyzer entirely, so this
+                    // runtime preflight must enforce the same exclusion
+                    // before materialization -- request_policy_is_supported
+                    // above admits ID4 like any other supported policy and
+                    // would otherwise let this combination reach the
+                    // upstream (Codex sweep-2 review, PR #696).
+                    request_policy_preserves_host(outcome.request_policy_id)) {
                     reject_response_policy(loop, conn);
                     return;
                 }
@@ -5665,59 +5678,60 @@ inline bool request_policy_is_stripped_client_envoy_header(const u8* p, u32 n) {
 // a second physical occurrence of any of them fails the request closed
 // (400) instead of silently forwarding upstream bytes that diverge from
 // what an Envoy-parity client intended.
+struct RequestPolicyInlineHeaderEntry {
+    const char* name;
+    u32 len;
+};
+inline constexpr RequestPolicyInlineHeaderEntry kInlineRequestHeaders[] = {
+    {"x-client-trace-id", 17},
+    {"x-envoy-downstream-service-cluster", 34},
+    {"x-envoy-downstream-service-node", 31},
+    {"x-envoy-is-timeout-retry", 24},
+    {"x-envoy-original-path", 21},
+    {"x-envoy-original-host", 21},
+    {"x-forwarded-for", 15},
+    {"x-forwarded-host", 16},
+    {"grpc-timeout", 12},
+    {"user-agent", 10},
+    {"x-envoy-upstream-stream-duration-ms", 35},
+    {"x-forwarded-port", 16},
+    {"x-envoy-attempt-count", 21},
+    {"content-type", 12},
+    {"x-envoy-decorator-operation", 27},
+    {"proxy-status", 12},
+    {"x-request-id", 12},
+    {"via", 3},
+    {"cdn-loop", 8},
+    {"access-control-request-headers", 30},
+    {"access-control-request-method", 29},
+    {"origin", 6},
+    {"access-control-request-private-network", 38},
+    {"authorization", 13},
+    {"pragma", 6},
+    {"cache-control", 13},
+    {"if-match", 8},
+    {"if-none-match", 13},
+    {"if-modified-since", 17},
+    {"if-unmodified-since", 19},
+    {"if-range", 8},
+    {"referer", 7},
+    {"accept-encoding", 15},
+    {"content-encoding", 16},
+    {"accept", 6},
+    {"grpc-accept-encoding", 20},
+    {"authentication", 14},
+};
+inline constexpr u32 kInlineRequestHeaderTableSize =
+    sizeof(kInlineRequestHeaders) / sizeof(kInlineRequestHeaders[0]);
+
 inline i32 request_policy_inline_request_header_index(const u8* p, u32 n) {
-    struct Entry {
-        const char* name;
-        u32 len;
-    };
-    static constexpr Entry kInlineRequestHeaders[] = {
-        {"x-client-trace-id", 17},
-        {"x-envoy-downstream-service-cluster", 34},
-        {"x-envoy-downstream-service-node", 31},
-        {"x-envoy-is-timeout-retry", 24},
-        {"x-envoy-original-path", 21},
-        {"x-envoy-original-host", 21},
-        {"x-forwarded-for", 15},
-        {"x-forwarded-host", 16},
-        {"grpc-timeout", 12},
-        {"user-agent", 10},
-        {"x-envoy-upstream-stream-duration-ms", 35},
-        {"x-forwarded-port", 16},
-        {"x-envoy-attempt-count", 21},
-        {"content-type", 12},
-        {"x-envoy-decorator-operation", 27},
-        {"proxy-status", 12},
-        {"x-request-id", 12},
-        {"via", 3},
-        {"cdn-loop", 8},
-        {"access-control-request-headers", 30},
-        {"access-control-request-method", 29},
-        {"origin", 6},
-        {"access-control-request-private-network", 38},
-        {"authorization", 13},
-        {"pragma", 6},
-        {"cache-control", 13},
-        {"if-match", 8},
-        {"if-none-match", 13},
-        {"if-modified-since", 17},
-        {"if-unmodified-since", 19},
-        {"if-range", 8},
-        {"referer", 7},
-        {"accept-encoding", 15},
-        {"content-encoding", 16},
-        {"accept", 6},
-        {"grpc-accept-encoding", 20},
-        {"authentication", 14},
-    };
-    constexpr u32 kCount = sizeof(kInlineRequestHeaders) / sizeof(kInlineRequestHeaders[0]);
-    for (u32 i = 0; i < kCount; i++) {
+    for (u32 i = 0; i < kInlineRequestHeaderTableSize; i++) {
         if (request_policy_name_eq(
                 p, n, kInlineRequestHeaders[i].name, kInlineRequestHeaders[i].len))
             return static_cast<i32>(i);
     }
     return -1;
 }
-inline constexpr u32 kInlineRequestHeaderTableSize = 37;
 
 // Parse and validate the policy's framing before it can acquire an upstream
 // slot. The existing HTTP parser intentionally accepts identical duplicate
@@ -5905,14 +5919,19 @@ inline RequestPolicyBodyState inspect_request_policy_body(const Connection& conn
 // client-supplied value passes through unchanged, in its original position,
 // without case normalization). Fails closed with no upstream bytes
 // touched unless exactly one non-empty Host header is present. A
-// body-carrying request with a client `Expect` header is also outside this
-// profile's admitted shape today: `inspect_request_policy_body` rejects any
-// `Expect` header once a validated Content-Length is present, because Rut has
-// no `100 Continue` interim-response flow to negotiate the body with the
-// client first (unlike Envoy, which sends the interim response and then
-// applies this same hop-by-hop drop). That request shape gets a fail-closed
-// rejection rather than a byte-accurate Envoy match; see
-// `docs/envoy-converter.md`'s "Known capability dependencies".
+// body-carrying request with a client `Expect` header whose trimmed value is
+// non-empty is also outside this profile's admitted shape today:
+// `inspect_request_policy_body` rejects such a value once a validated
+// Content-Length is present, because Rut has no `100 Continue`
+// interim-response flow to negotiate the body with the client first (unlike
+// Envoy, which sends the interim response and then applies this same
+// hop-by-hop drop). An empty or OWS-only `Expect` field carries no actual
+// expectation (RFC 9110 defines only the "100-continue" expect-value), so
+// `inspect_request_policy_body` treats it as semantically absent: the body
+// is admitted and the field is still stripped like any other `Expect`
+// field. Only the nonempty-value shape gets a fail-closed rejection rather
+// than a byte-accurate Envoy match; see `docs/envoy-converter.md`'s "Known
+// capability dependencies".
 inline bool apply_preserve_host_lowercase_request_policy(Connection& conn, u16 policy_id) {
     if (inspect_request_policy_body(conn, policy_id) != RequestPolicyBodyState::Complete)
         return false;
@@ -5974,8 +5993,18 @@ inline bool apply_preserve_host_lowercase_request_policy(Connection& conn, u16 p
     // `request_policy_inline_request_header_index` above) coalesce a second
     // physical field into the first rather than forwarding a duplicate line;
     // this profile fails the request closed instead of risking upstream
-    // bytes that silently diverge from that coalescing.
+    // bytes that silently diverge from that coalescing -- but only when the
+    // name is actually going to reach the wire. A name the client's
+    // `Connection` value nominates is dropped along with every one of its
+    // physical fields regardless of how many there are (Codex sweep-2
+    // review, PR #696: `Connection: x-request-id` plus two `X-Request-Id`
+    // fields must forward neither, not 400 before either field is even
+    // known to be dropped), so duplication is only recorded here and
+    // resolved against nomination once every Connection field has been
+    // scanned (see the `inline_request_header_duplicated` check below,
+    // after `name_nominated` is defined).
     bool seen_inline_request_header[kInlineRequestHeaderTableSize] = {};
+    bool inline_request_header_duplicated[kInlineRequestHeaderTableSize] = {};
     {
         const u8* hs = line_end + 2;
         while (hs < header_end) {
@@ -5994,7 +6023,8 @@ inline bool apply_preserve_host_lowercase_request_policy(Connection& conn, u16 p
                 value_end--;
             const i32 inline_idx = request_policy_inline_request_header_index(hs, name_len);
             if (inline_idx >= 0) {
-                if (seen_inline_request_header[inline_idx]) return false;
+                if (seen_inline_request_header[inline_idx])
+                    inline_request_header_duplicated[inline_idx] = true;
                 seen_inline_request_header[inline_idx] = true;
             }
             if (request_policy_name_eq(hs, name_len, "host", 4)) {
@@ -6114,6 +6144,19 @@ inline bool apply_preserve_host_lowercase_request_policy(Connection& conn, u16 p
         }
         return false;
     };
+
+    // A duplicated inline-slot name (see the Pass 1 loop above) is only a
+    // problem if it is actually going to reach the wire: a name the
+    // client's Connection value nominates is dropped along with every one
+    // of its physical fields below regardless of how many there were, so no
+    // duplicate ever survives to diverge from Envoy's inline coalescing for
+    // that name. Fail closed only for a duplicated name that is not
+    // nominated (Codex sweep-2 review, PR #696).
+    for (u32 i = 0; i < kInlineRequestHeaderTableSize; i++) {
+        if (!inline_request_header_duplicated[i]) continue;
+        const RequestPolicyInlineHeaderEntry& entry = kInlineRequestHeaders[i];
+        if (!name_nominated(reinterpret_cast<const u8*>(entry.name), entry.len)) return false;
+    }
 
     auto append = [&](const u8* p, u32 n) {
         return n <= conn.send_buf.capacity() - conn.send_buf.len() &&
