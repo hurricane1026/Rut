@@ -187,20 +187,26 @@ bool load_rut_program(
     // source mmap and the lowered RIR stay alive in `out` for the run.
     HeapIR ir;
 
-    err.stage = LoadStage::Lex;
-    auto lexed = lex(kSource);
-    if (!lexed) {
-        set_load_diag(err, lexed.error());
-        return false;
-    }
+    // The ~160 KiB token buffer lives in mmap-backed storage that is unmapped
+    // once parsing is done, so it neither sits in this frame nor stays
+    // mapped while analyze_file recurses through nested imports.
+    {
+        MappedArray<LexedTokens> token_storage;
+        err.stage = LoadStage::Lex;
+        auto lexed = lex_mapped(kSource, token_storage);
+        if (!lexed) {
+            set_load_diag(err, lexed.error());
+            return false;
+        }
 
-    err.stage = LoadStage::Parse;
-    auto ast = parse_file(lexed.value());
-    if (!ast) {
-        set_load_diag(err, ast.error());
-        return false;
+        err.stage = LoadStage::Parse;
+        auto ast = parse_file(*lexed.value());
+        if (!ast) {
+            set_load_diag(err, ast.error());
+            return false;
+        }
+        ir.ast = ast.value();
     }
-    ir.ast = ast.value();
 
     err.stage = LoadStage::Analyze;
     // Pass the program path so relative `import "..."` resolves against it,

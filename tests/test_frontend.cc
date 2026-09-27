@@ -15,8 +15,11 @@
 #include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <memory>
 #include <string>
 #include <vector>
+
+#include <pthread.h>
 using namespace rut;
 
 TEST(hir, function_moves_preserve_non_response_statement_effect) {
@@ -1088,7 +1091,7 @@ TEST(frontend, lex_token_capacity_boundaries_are_exact) {
         const std::string source = make_ident_stream(931);
         auto result = lex({source.data(), static_cast<u32>(source.size())});
         REQUIRE(result);
-        CHECK_EQ(result->tokens.len, 932u);  // 931 identifiers + EOF
+        CHECK_EQ(result->tokens.len, 932u);  // retained former-boundary regression
         CHECK(result->tokens[931].type == TokenType::Eof);
         CHECK_EQ(result->tokens[931].start, static_cast<u32>(source.size()));
         CHECK_EQ(result->tokens[931].end, static_cast<u32>(source.size()));
@@ -1097,7 +1100,19 @@ TEST(frontend, lex_token_capacity_boundaries_are_exact) {
     }
 
     {
-        const std::string source = make_ident_stream(932);
+        const std::string source = make_ident_stream(4095);
+        auto result = lex({source.data(), static_cast<u32>(source.size())});
+        REQUIRE(result);
+        CHECK_EQ(result->tokens.len, 4096u);  // 4095 identifiers + EOF
+        CHECK(result->tokens[4095].type == TokenType::Eof);
+        CHECK_EQ(result->tokens[4095].start, static_cast<u32>(source.size()));
+        CHECK_EQ(result->tokens[4095].end, static_cast<u32>(source.size()));
+        CHECK_EQ(result->tokens[4095].line, 1u);
+        CHECK_EQ(result->tokens[4095].col, static_cast<u32>(source.size() + 1u));
+    }
+
+    {
+        const std::string source = make_ident_stream(4096);
         auto result = lex({source.data(), static_cast<u32>(source.size())});
         REQUIRE(!result);
         CHECK_FALSE(result.has_value());
@@ -1109,16 +1124,16 @@ TEST(frontend, lex_token_capacity_boundaries_are_exact) {
     }
 
     {
-        const std::string source = make_ident_stream(933);
+        const std::string source = make_ident_stream(4097);
         auto result = lex({source.data(), static_cast<u32>(source.size())});
         REQUIRE(!result);
         CHECK_FALSE(result.has_value());
         CHECK(result.error().code == FrontendError::TooManyTokens);
-        // The 933rd one-character identifier starts after 932 "a " pairs.
-        CHECK_EQ(result.error().span.start, 1864u);
-        CHECK_EQ(result.error().span.end, 1865u);
+        // The 4097th one-character identifier starts after 4096 "a " pairs.
+        CHECK_EQ(result.error().span.start, 8192u);
+        CHECK_EQ(result.error().span.end, 8193u);
         CHECK_EQ(result.error().span.line, 1u);
-        CHECK_EQ(result.error().span.col, 1865u);
+        CHECK_EQ(result.error().span.col, 8193u);
     }
 }
 
@@ -1218,6 +1233,252 @@ TEST(frontend, six_hundred_fifty_three_slot_source_reaches_verified_rir) {
     CHECK_EQ(last.http_method, kRouteMethodAny);
     CHECK(last.route_pattern.eq({"/capacity/92", 12}));
     rir.destroy();
+}
+
+// A single route with a full request/response/failure policy triple, matching
+// the density of converter-generated output (nginx/Envoy lowering): every
+// value below already parses on main (copied from the nginx373_hide.inc
+// pattern), so this stays independent of any not-yet-landed vocabulary.
+static std::string make_policy_heavy_route_source(u32 route_count) {
+    std::string source = "listen 127.0.0.1:8080\nupstream nginx_upstream at \"127.0.0.1:9000\"\n";
+    for (u32 i = 0; i < route_count; i++) {
+        source += "route GET \"/route" + std::to_string(i) +
+                  "\" {\n"
+                  "    return forward(nginx_upstream, request_policy: {\n"
+                  "            version: \"HTTP/1.1\",\n"
+                  "            host: \"upstream\",\n"
+                  "            connection: \"omit\",\n"
+                  "            strip_headers: [\"Connection\", \"Keep-Alive\", \"TE\", "
+                  "\"Expect\", \"Upgrade\"]\n"
+                  "        },\n"
+                  "        response_policy: {\n"
+                  "            version: \"HTTP/1.1\",\n"
+                  "            framing: \"content_length\",\n"
+                  "            connection: \"request\",\n"
+                  "            server: \"nginx/1.29.7\",\n"
+                  "            date: \"current\",\n"
+                  "            hide_headers: [\"Date\", \"Server\", \"X-Pad\", "
+                  "\"X-Compat-Hidden\"]\n"
+                  "        },\n"
+                  "        failure_policy: {\n"
+                  "            version: \"HTTP/1.1\",\n"
+                  "            status: 502,\n"
+                  "            reason: \"Bad Gateway\",\n"
+                  "            content_type: \"text/html\",\n"
+                  "            server: \"nginx/1.29.7\",\n"
+                  "            date: \"current\",\n"
+                  "            connection: \"request\",\n"
+                  "            body: b\"<html><body>502 Bad Gateway</body></html>\"\n"
+                  "        }\n"
+                  "    )\n"
+                  "}\n";
+    }
+    return source;
+}
+
+TEST(frontend, policy_heavy_multi_route_source_exceeds_legacy_token_bound_and_parses) {
+    // 9 routes at ~113 tokens each (plus the shared listen/upstream preamble)
+    // clears the legacy 932-token bound with margin while staying well inside
+    // the new LexedTokens::kMaxTokens capacity raised for converter-generated
+    // (nginx/Envoy) multi-route programs.
+    const std::string source = make_policy_heavy_route_source(9);
+    auto lexed = lex({source.data(), static_cast<u32>(source.size())});
+    REQUIRE(lexed);
+    CHECK_GT(lexed->tokens.len, 932u);
+    CHECK_LT(lexed->tokens.len, LexedTokens::kMaxTokens);
+    REQUIRE_EQ(lexed->tokens.len, 1032u);
+
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    REQUIRE_EQ(ast->items.len, 11u);  // listen + upstream + 9 routes
+}
+
+TEST(frontend, lex_mapped_matches_lex_and_reuses_mapped_storage) {
+    const char* source = "route GET \"/a\" { return 200 }\n";
+    auto expected = lex(lit(source));
+    REQUIRE(expected);
+    MappedArray<LexedTokens> storage;
+    for (u32 round = 0; round < 2; round++) {
+        auto mapped = lex_mapped(lit(source), storage);
+        REQUIRE(mapped);
+        CHECK(mapped.value() == storage.data());
+        REQUIRE_EQ(mapped.value()->tokens.len, expected->tokens.len);
+        for (u32 i = 0; i < expected->tokens.len; i++) {
+            CHECK(mapped.value()->tokens[i].type == expected->tokens[i].type);
+            CHECK(mapped.value()->tokens[i].text.eq(expected->tokens[i].text));
+        }
+    }
+    auto bad = lex_mapped(lit("route GET \"/a"), storage);
+    REQUIRE_FALSE(bad);
+    CHECK_EQ(bad.error().code, FrontendError::UnterminatedString);
+}
+
+// Nested-import analysis re-enters analyze_file_internal -- a ~1.3 MiB frame
+// in optimized builds -- once per import level, and load_imported_modules
+// stays live across each recursion. Token buffers (~160 KiB at the current
+// LexedTokens capacity) must not sit in that recursive frame. Run the whole
+// frontend on a thread whose stack equals Linux's default 8 MiB main-thread
+// limit so a regression faults here instead of only in the `rut` driver.
+// Unoptimized and sanitized builds have far larger frames, so they keep the
+// logic coverage on a larger stack.
+#if defined(__has_feature)
+#if __has_feature(address_sanitizer) || __has_feature(undefined_behavior_sanitizer)
+#define RUT_TEST_IMPORT_CHAIN_SANITIZED 1
+#endif
+#endif
+#if defined(__OPTIMIZE__) && !defined(RUT_TEST_IMPORT_CHAIN_SANITIZED) && \
+    !defined(__SANITIZE_ADDRESS__)
+static constexpr size_t kImportChainStackBytes = 8uz << 20;
+#else
+static constexpr size_t kImportChainStackBytes = 256uz << 20;
+#endif
+// main.rut + the deepest acyclic chain the analyzer admits
+// (kMaxImportNestingDepth imported files): the worst-case analyzer stack.
+static constexpr u32 kImportChainDepth = kMaxImportNestingDepth;
+
+struct ImportChainRun {
+    std::string main_path;
+    SourceBudget budget{};
+    // Only static details are safe to copy: an import-path detail views the
+    // imported file's text, which is released with the failed module.
+    bool copy_detail = false;
+    bool analyzed = false;
+    Diagnostic error{};
+    std::string error_detail;
+    u32 imports_analyzed = 0;
+};
+
+static void* run_import_chain(void* arg) {
+    auto& run = *static_cast<ImportChainRun*>(arg);
+    static constexpr char kMain[] = "import \"m1.rut\"\nroute GET \"/\" { return 200 }\n";
+    std::unique_ptr<AstFile> ast;
+    {
+        MappedArray<LexedTokens> tokens;
+        auto lexed = lex_mapped({kMain, sizeof(kMain) - 1}, tokens);
+        if (!lexed) {
+            run.error = lexed.error();
+            return nullptr;
+        }
+        auto parsed = parse_file(*lexed.value());
+        if (!parsed) {
+            run.error = parsed.error();
+            return nullptr;
+        }
+        ast.reset(parsed.value());
+    }
+    reset_import_analysis_counter();
+    auto hir = analyze_file(
+        *ast, {run.main_path.c_str(), static_cast<u32>(run.main_path.size())}, &run.budget);
+    run.imports_analyzed = get_import_analysis_counter();
+    if (!hir) {
+        run.error = hir.error();
+        if (run.copy_detail)
+            run.error_detail.assign(hir.error().detail.ptr, hir.error().detail.len);
+        return nullptr;
+    }
+    delete hir.value();
+    run.analyzed = true;
+    return nullptr;
+}
+
+static bool run_import_chain_on_bounded_stack(ImportChainRun& run) {
+    pthread_attr_t attr;
+    if (pthread_attr_init(&attr) != 0) return false;
+    bool ok = pthread_attr_setstacksize(&attr, kImportChainStackBytes) == 0;
+    pthread_t thread{};
+    ok = ok && pthread_create(&thread, &attr, run_import_chain, &run) == 0;
+    pthread_attr_destroy(&attr);
+    return ok && pthread_join(thread, nullptr) == 0;
+}
+
+// Writes m1.rut .. m<depth>.rut where each file imports the next; the last
+// one imports m1.rut again when `cycle` is set. Each file starts with a blank
+// line, so its `import` sits at line 2 (main.rut's is at line 1). Returns the
+// summed file sizes of m1 .. m<depth - 1>.
+static u64 write_import_chain(const std::string& dir, u32 depth, bool cycle) {
+    std::filesystem::remove_all(dir);
+    std::filesystem::create_directories(dir);
+    u64 bytes_before_last = 0;
+    for (u32 i = 1; i <= depth; i++) {
+        std::string body = "\n";
+        if (i < depth)
+            body += "import \"m" + std::to_string(i + 1) + ".rut\"\n";
+        else if (cycle)
+            body += "import \"m1.rut\"\n";
+        body += "func f" + std::to_string(i) + "() -> i32 => " + std::to_string(i) + "\n";
+        std::ofstream out(dir + "/m" + std::to_string(i) + ".rut", std::ios::binary);
+        out << body;
+        if (i < depth) bytes_before_last += body.size();
+    }
+    return bytes_before_last;
+}
+
+TEST(frontend, nested_import_chain_analyzes_on_default_linux_stack) {
+    const std::string dir = "/tmp/rut_frontend_import_chain_stack";
+    write_import_chain(dir, kImportChainDepth, false);
+    ImportChainRun run;
+    run.main_path = dir + "/main.rut";
+    REQUIRE(run_import_chain_on_bounded_stack(run));
+    CHECK(run.analyzed);
+    CHECK_EQ(run.imports_analyzed, kImportChainDepth);
+    std::filesystem::remove_all(dir);
+}
+
+TEST(frontend, nested_import_cycle_is_diagnosed_on_default_linux_stack) {
+    // The last file imports m1 again: the cycle is detected at the deepest
+    // level the acyclic chain above reaches, and must surface as a cycle
+    // diagnostic rather than as the depth limit.
+    const std::string dir = "/tmp/rut_frontend_import_cycle_stack";
+    write_import_chain(dir, kImportChainDepth, true);
+    ImportChainRun run;
+    run.main_path = dir + "/main.rut";
+    REQUIRE(run_import_chain_on_bounded_stack(run));
+    CHECK_FALSE(run.analyzed);
+    CHECK_EQ(run.error.code, FrontendError::UnsupportedSyntax);
+    CHECK_EQ(run.imports_analyzed, kImportChainDepth);
+    std::filesystem::remove_all(dir);
+}
+
+TEST(frontend, nested_import_source_budget_is_diagnosed_on_default_linux_stack) {
+    // The budget admits every file but the deepest, so reading it fails.
+    const std::string dir = "/tmp/rut_frontend_import_budget_stack";
+    const u64 admitted = write_import_chain(dir, kImportChainDepth, false);
+    ImportChainRun run;
+    run.main_path = dir + "/main.rut";
+    run.budget.max_bytes = admitted;
+    run.copy_detail = true;
+    REQUIRE(run_import_chain_on_bounded_stack(run));
+    CHECK_FALSE(run.analyzed);
+    CHECK(run.budget.exceeded);
+    CHECK_EQ(run.budget.used_bytes, admitted);
+    CHECK_EQ(run.error.code, FrontendError::UnsupportedSyntax);
+    CHECK_EQ(run.error_detail, std::string("source-bytes limit reached"));
+    CHECK_EQ(run.imports_analyzed, kImportChainDepth - 1);
+    std::filesystem::remove_all(dir);
+}
+
+TEST(frontend, nested_import_depth_limit_is_diagnosed_not_crashed) {
+    // One level deeper than the limit: m<limit> imports m<limit + 1>. That
+    // import is refused before m<limit + 1> is read or analyzed, with a static
+    // detail and the span of the `import` in m<limit> (line 2, col 1), which
+    // stays valid after the failed modules are released.
+    static_assert(kMaxImportNestingDepth >= 1);
+    const std::string dir = "/tmp/rut_frontend_import_depth_limit";
+    const u64 read_bytes = write_import_chain(dir, kMaxImportNestingDepth + 1, false);
+    ImportChainRun run;
+    run.main_path = dir + "/main.rut";
+    run.copy_detail = true;
+    REQUIRE(run_import_chain_on_bounded_stack(run));
+    CHECK_FALSE(run.analyzed);
+    CHECK_EQ(run.error.code, FrontendError::UnsupportedSyntax);
+    CHECK_EQ(run.error_detail, std::string("import nesting depth limit reached"));
+    CHECK_EQ(run.error.span.line, 2u);
+    CHECK_EQ(run.error.span.col, 1u);
+    CHECK_EQ(run.error.span.start, 1u);
+    CHECK(run.error.span.end > run.error.span.start);
+    CHECK_EQ(run.imports_analyzed, kMaxImportNestingDepth);
+    CHECK_EQ(run.budget.used_bytes, read_bytes);
+    std::filesystem::remove_all(dir);
 }
 
 TEST(frontend, lex_recognizes_downstream_keyword) {
