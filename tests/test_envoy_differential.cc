@@ -1204,6 +1204,24 @@ public:
                     const bool full_window_available = remaining_ms >= kQuietWindowMs;
                     const int wait_ms =
                         static_cast<int>(full_window_available ? kQuietWindowMs : remaining_ms);
+                    // Sweep-9 follow-up review, "Make the relentless-arrival
+                    // idle self-test deterministic": test-only, always
+                    // unset in production. Runs synchronously, on this same
+                    // thread, immediately before the poll() call below --
+                    // never as a race against it. A test that needs
+                    // poll() to reliably see the listener readable (so a
+                    // full quiet window can never complete) uses this to
+                    // perform a real loopback connect() here: connect()
+                    // only returns once the local TCP handshake has
+                    // completed, which -- for loopback, within the same
+                    // kernel -- has already queued the connection in this
+                    // listener's accept backlog by the time control
+                    // returns here, before poll() is ever called. This
+                    // makes the resulting test deterministic against
+                    // wall-clock scheduling, unlike timing a background
+                    // thread's arrivals against this loop's real-time
+                    // poll() windows.
+                    if (test_before_quiet_window_poll_hook_) test_before_quiet_window_poll_hook_();
                     pollfd pfd{fd, POLLIN, 0};
                     const int pr = poll(&pfd, 1, wait_ms);
                     if (pr <= 0 || (pfd.revents & POLLIN) == 0) {
@@ -1246,6 +1264,13 @@ public:
     // wait_idle() while nothing but wait_idle() itself could possibly
     // notice or act on them. Always 0 in production use.
     void set_test_accept_loop_hold_ms(int ms) { test_accept_loop_hold_ms_ = ms; }
+
+    // Test-only hook for self_test_wait_idle_fails_on_relentless_arrivals():
+    // see wait_idle()'s call site comment. Always unset (empty) in
+    // production use.
+    void set_test_before_quiet_window_poll_hook(std::function<void()> hook) {
+        test_before_quiet_window_poll_hook_ = std::move(hook);
+    }
 
     // Idempotent: safe to call more than once (the destructor calls it again
     // after an explicit stop()).
@@ -1447,6 +1472,8 @@ private:
     bool draining_ = false;
     // Test-only; see set_test_accept_loop_hold_ms()'s comment.
     int test_accept_loop_hold_ms_ = 0;
+    // Test-only; see set_test_before_quiet_window_poll_hook()'s comment.
+    std::function<void()> test_before_quiet_window_poll_hook_;
     std::string default_reply_ =
         "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 5\r\n\r\nhello";
 };
@@ -5595,13 +5622,25 @@ bool self_test_wait_idle_redrains_after_eagain() {
     return ok;
 }
 
-// Sweep-9 review, "Fail when the quiet-window deadline expires": reproduces
-// arrivals that keep resetting the 100ms quiet window (every 20ms, faster
-// than the window itself) for the WHOLE duration of wait_idle()'s own
-// timeout, so a full quiet window can never complete. wait_idle() must
-// report failure (false) rather than let the final, deadline-shortened
-// poll()'s own timeout masquerade as a completed quiet window just because
-// no handler happened to still be running when the overall deadline hit.
+// Sweep-9 follow-up review, "Make the relentless-arrival idle self-test
+// deterministic": the original version of this test raced a background
+// thread's wall-clock-timed arrivals (one every 20ms) against wait_idle()'s
+// own 100ms poll() windows -- correct in expectation, but still
+// fundamentally timing-dependent: a single scheduling gap over 100ms
+// between arrivals (entirely possible on a loaded host, e.g. under CPU
+// hogs pinned to the same cores) lets a real quiet window complete and
+// fails the test, which the strict flake policy does not allow no matter
+// how unlikely. This version instead uses
+// set_test_before_quiet_window_poll_hook() to inject the "arrival"
+// synchronously, on wait_idle()'s OWN thread, immediately before every
+// poll() call: a real loopback connect() only returns once the local TCP
+// handshake has completed, and for loopback that handshake is handled
+// entirely within this same kernel, so the connection is already sitting
+// in the listener's accept backlog by the time control returns from the
+// hook -- before poll() is ever called. This is a causal guarantee, not a
+// race against elapsed time: it holds regardless of how fast or slow the
+// host's scheduler happens to be, so CPU contention can only change how
+// long this test takes, never whether it passes.
 bool self_test_wait_idle_fails_on_relentless_arrivals() {
     BoundPort bound;
     if (!allocate_bound_loopback_port(&bound)) {
@@ -5620,54 +5659,37 @@ bool self_test_wait_idle_fails_on_relentless_arrivals() {
         return false;
     }
 
-    constexpr int kWaitIdleTimeoutMs = 400;
-    constexpr int kArrivalIntervalMs = 20;
-    std::atomic<bool> stop_sending{false};
-    std::atomic<int> arrivals_sent{0};
-    // A new connection every 20ms -- well under a fifth of the 100ms quiet
-    // window, leaving generous margin for host scheduling jitter -- for as
-    // long as wait_idle() below is running, so the window can never
-    // complete. Does not wait for the reply (just connect+send+close): the
-    // point is to keep the listener's backlog non-empty at a high rate,
-    // not to exercise a full request/response round trip, and skipping the
-    // read keeps each iteration's own latency well below the interval.
-    std::thread relentless_arrivals([port, &stop_sending, &arrivals_sent] {
-        while (!stop_sending.load()) {
-            const int fd = connect_with_timeout(port, kClientTimeoutMs);
-            if (fd >= 0) {
-                const std::string req =
-                    "GET /relentless HTTP/1.1\r\nHost: t.example\r\nConnection: close\r\n\r\n";
-                if (send_all(fd, req)) arrivals_sent.fetch_add(1);
-                close(fd);
-            }
-            struct timespec ts{0, static_cast<long>(kArrivalIntervalMs) * 1'000'000};
-            nanosleep(&ts, nullptr);
-        }
+    int hook_calls = 0;
+    upstream.set_test_before_quiet_window_poll_hook([port, &hook_calls] {
+        hook_calls++;
+        const int fd = connect_with_timeout(port, kClientTimeoutMs);
+        if (fd >= 0) close(fd);
     });
 
     bool ok = true;
+    constexpr int kWaitIdleTimeoutMs = 400;
     const int64_t start = now_ms();
     const bool went_idle = upstream.wait_idle(kWaitIdleTimeoutMs);
     const int64_t elapsed = now_ms() - start;
-    stop_sending.store(true);
-    relentless_arrivals.join();
 
     if (went_idle) {
         std::cerr << "FAIL [self-test wait_idle relentless arrivals]: wait_idle() reported idle "
-                     "despite arrivals every 20ms that never let a full 100ms quiet window "
-                     "complete\n";
+                     "despite a connection injected immediately before every poll() call, which "
+                     "must always keep the listener readable\n";
         ok = false;
     }
-    // Should take roughly the full timeout, not return early.
+    // Should take roughly the full timeout: the hook keeps the listener
+    // readable on every iteration, so only the overall deadline -- never a
+    // completed quiet window -- can end this call.
     if (elapsed < kWaitIdleTimeoutMs - 50) {
         std::cerr << "FAIL [self-test wait_idle relentless arrivals]: wait_idle() returned after "
                      "only "
                   << elapsed << "ms, well before its " << kWaitIdleTimeoutMs << "ms timeout\n";
         ok = false;
     }
-    if (arrivals_sent.load() < 5) {
-        std::cerr << "FAIL [self-test wait_idle relentless arrivals]: the relentless-arrivals "
-                     "thread could not exercise the race (too few connections delivered)\n";
+    if (hook_calls < 2) {
+        std::cerr << "FAIL [self-test wait_idle relentless arrivals]: the poll hook ran fewer "
+                     "than twice, so this test did not exercise the intended loop\n";
         ok = false;
     }
 
