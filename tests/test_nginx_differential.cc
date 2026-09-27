@@ -76451,6 +76451,20 @@ static bool run_pinned_nginx_custom_hide_timeout_probe(
         }
         usleep(1000);
     }
+    // The origin thread publishes response_fragments_sent (release) before it
+    // publishes response_send_succeeded/response_sent_open for the final
+    // fragment, so observing the fragment count alone does not order the
+    // later origin-side send evidence. Wait, bounded, for that evidence (or an
+    // explicit send failure) before judging it.
+    const auto await_final_fragment_send_evidence = [&]() {
+        const auto evidence_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(1);
+        while ((!origin.response_send_succeeded.load(std::memory_order_acquire) ||
+                !origin.response_sent_open.load(std::memory_order_acquire)) &&
+               !origin.response_send_failed.load(std::memory_order_acquire) && origin_live() &&
+               std::chrono::steady_clock::now() < evidence_deadline) {
+            usleep(1000);
+        }
+    };
     const u64 second_ns = origin.response_fragment_sent_ns[1].load(std::memory_order_acquire);
     if (origin.response_fragments_sent.load(std::memory_order_acquire) != 2u ||
         second_ns <= first_ns) {
@@ -76458,6 +76472,7 @@ static bool run_pinned_nginx_custom_hide_timeout_probe(
         error = "#270 custom-hide timeout probe did not publish W2";
         return false;
     }
+    if (!complete_after_w3) await_final_fragment_send_evidence();
     const u64 w2_elapsed_ns = second_ns - first_ns;
     if (w2_elapsed_ns < cross_fragment_min_ns || w2_elapsed_ns >= cross_fragment_max_ns ||
         origin.response_send_failed.load(std::memory_order_acquire) ||
@@ -76537,6 +76552,8 @@ static bool run_pinned_nginx_custom_hide_timeout_probe(
             }
             usleep(1000);
         }
+        if (origin.response_fragments_sent.load(std::memory_order_acquire) == 3u)
+            await_final_fragment_send_evidence();
         const u64 third_ns = origin.response_fragment_sent_ns[2].load(std::memory_order_acquire);
         const auto completion_timing_valid = [&](u64 first, u64 second, u64 third) {
             return custom_hide_timeout_fragment_gap_valid(timeout_seconds, first, second) &&
@@ -76553,7 +76570,18 @@ static bool run_pinned_nginx_custom_hide_timeout_probe(
             !origin.response_sent_open.load(std::memory_order_acquire) ||
             origin.response_send_failed.load(std::memory_order_acquire)) {
             close(client);
-            error = "#270 custom-hide completion W3 timing/publication failed";
+            error = "#270 custom-hide completion W3 timing/publication failed fragments=" +
+                    std::to_string(origin.response_fragments_sent.load(std::memory_order_acquire)) +
+                    " w1-w2-ns=" + std::to_string(second_ns - first_ns) + " w2-w3-ns=" +
+                    (third_ns > second_ns ? std::to_string(third_ns - second_ns) : "none") +
+                    " timing=" + std::to_string(completion_timing_positive) +
+                    " mutants-rejected=" + std::to_string(completion_timing_mutants_rejected) +
+                    " send-succeeded=" +
+                    std::to_string(origin.response_send_succeeded.load(std::memory_order_acquire)) +
+                    " sent-open=" +
+                    std::to_string(origin.response_sent_open.load(std::memory_order_acquire)) +
+                    " send-failed=" +
+                    std::to_string(origin.response_send_failed.load(std::memory_order_acquire));
             return false;
         }
         std::vector<char> response;
@@ -76684,7 +76712,20 @@ static bool run_pinned_nginx_custom_hide_timeout_probe(
         if (!exact_response || !no_eof_and_quiet || !access_read || access != "60\n" ||
             !response_mutants_rejected || !origin_retired || !stable || !cleanup) {
             error =
-                "#270 custom-hide completion episode exact response/lifecycle validation failed";
+                "#270 custom-hide completion episode exact response/lifecycle validation failed "
+                "exact-response=" +
+                std::to_string(exact_response) +
+                " response-bytes=" + std::to_string(response.size()) +
+                " no-eof-quiet=" + std::to_string(no_eof_and_quiet) +
+                " access-read=" + std::to_string(access_read) +
+                " access-bytes=" + std::to_string(access.size()) +
+                " mutants-rejected=" + std::to_string(response_mutants_rejected) +
+                " origin-retired=" + std::to_string(origin_retired) +
+                " stable=" + std::to_string(stable) + " cleanup=" + std::to_string(cleanup) +
+                " nginx-stopped=" + std::to_string(nginx_stopped) +
+                " removed=" + std::to_string(removed) +
+                " exact-upstream=" + std::to_string(exact_upstream) +
+                " final-access-bytes=" + std::to_string(final_access.size()) + " detail=" + error;
             return false;
         }
         if (pair != nullptr) {
