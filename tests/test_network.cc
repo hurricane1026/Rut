@@ -4482,6 +4482,40 @@ TEST(request_policy, preserve_host_lowercase_wire_and_fail_closed_host) {
     CHECK_FALSE(apply_request_policy(conn, endpoint, kPreserveHost));
     CHECK_EQ(conn.send_buf.len(), 0u);
 
+    // Codex sweep-3 review: `Cookie` is deliberately absent from the
+    // inline-request-header table. It is not in Envoy v1.39.1's
+    // `INLINE_REQ_STRING_HEADERS`/`INLINE_REQ_HEADERS` (`envoy/http/
+    // header_map.h`) at all -- it is a plain, non-inline `HeaderValues`
+    // member (`source/common/http/headers.h:151`), and
+    // `source/server/server.cc` even notes "'set-cookie' cannot currently
+    // be registered as an inline header" for its response-side sibling.
+    // `HeaderMapImpl::insertByKey` (`source/common/http/header_map_impl.cc`)
+    // only coalesces a name that `staticLookup` resolves to an inline slot;
+    // for a non-inline name (Cookie included) it falls through to inserting
+    // a brand-new, separate list entry every time, exactly like this
+    // profile's existing generic (non-inline-table) header handling. The
+    // "; "-joined `DelimiterForInlineCookies` some Envoy code paths use is
+    // exercised only by the explicit `appendCopy` C++ filter API
+    // (`test/common/http/header_map_impl_test.cc`'s
+    // `AppendCookieHeadersWithSemicolon`) and by the HTTP/2-only
+    // crumbled-cookie reconstitution pass (`Utility::
+    // reconstituteCrumbledCookies`, `source/common/http/http2/codec_impl.cc`,
+    // which joins every H2 "cookie" fragment into one string *before* ever
+    // inserting into the header map) -- neither applies to an HTTP/1
+    // client's wire-level duplicate `Cookie` fields, which this milestone's
+    // H1-to-H1 profile is the only shape that matters for. So a real Envoy
+    // forwards two physical client `Cookie` fields as two separate,
+    // uncoalesced lines too, matching this profile's existing behavior.
+    prepare(
+        "GET /cookie-dup HTTP/1.1\r\n"
+        "Host: client.example\r\n"
+        "Cookie: a=1\r\n"
+        "Cookie: b=2\r\n\r\n");
+    REQUIRE(apply_request_policy(conn, endpoint, kPreserveHost));
+    require_wire(
+        "GET /cookie-dup HTTP/1.1\r\nhost: client.example\r\ncookie: a=1\r\n"
+        "cookie: b=2\r\nx-forwarded-proto: http\r\n\r\n");
+
     // Codex round-13 review: `Server`, `Grpc-Status`, `Grpc-Message`, and
     // `X-Envoy-Upstream-Service-Time` are deliberately absent from the
     // inline-request-header table. They are inline O(1) slots only on
@@ -69660,6 +69694,96 @@ TEST(state_invariant, jit_forward_direct_paired_head_id4_aggregates_multiple_con
     // response proves the preflight let the request proceed to the (here,
     // injected) failed connect attempt instead of rejecting it for the
     // second physical `Connection` field.
+    CHECK_EQ(c->failure_policy_id, 1u);
+    CHECK(c->failure_policy_suppress_body);
+    CHECK_EQ(c->resp_status, kStatusBadGateway);
+    CHECK_EQ(c->state, ConnState::Sending);
+    CHECK_EQ(loop.backend.count_ops(MockOp::Connect), 0u);
+    CHECK_EQ(loop.backend.count_ops(MockOp::Send), 1u);
+    close(fds[1]);
+    loop.close_conn(*c);
+}
+
+// Codex sweep-3 review: `close` must remain authoritative over `keep-alive`
+// across separate physical `Connection` fields regardless of order. The
+// parser's own cached `keep_alive`/`connection_close` state
+// (`match_connection`, `src/runtime/http_parser.cc`) is order-dependent
+// before its own sweep-3 fix (a later, separate `Connection: keep-alive`
+// field used to flip `keep_alive` back to `true` even after an earlier
+// `Connection: close` field), and this preflight must not rely on it
+// anyway: `connection_close_token_seen` -- this function's own aggregate
+// scan across every physical `Connection` field -- decides ID4 persistence
+// here instead, so the split, close-first order is admitted exactly like a
+// single combined `Connection: close, keep-alive` field would be.
+TEST(state_invariant,
+     jit_forward_direct_paired_head_id4_close_then_keep_alive_fields_treated_as_close) {
+    RouteConfig cfg;
+    auto upstream = cfg.add_upstream("api", 0x7F000001, 9000);
+    REQUIRE(upstream.has_value());
+    cfg.upstreams[upstream.value()].max_inflight = 1;
+
+    static constexpr char kBody[] =
+        "<html>\r\n<head><title>502 Bad Gateway</title></head>\r\n<body>\r\n"
+        "<center><h1>502 Bad Gateway</h1></center>\r\n"
+        "<hr><center>nginx/1.29.7</center>\r\n</body>\r\n</html>\r\n";
+    static_assert(sizeof(kBody) - 1 == 157);
+    ForwardResponsePolicySpec response{};
+    response.version = ResponsePolicyVersion::Http11;
+    response.framing = ResponsePolicyFraming::ContentLength;
+    response.connection = ResponsePolicyConnection::Request;
+    response.date = ResponsePolicyDate::Current;
+    response.head_mode = ResponsePolicyHeadMode::SuppressBody;
+    response.server = {"nginx/1.29.7", 12};
+    REQUIRE_EQ(cfg.add_response_policy(response), 1u);
+
+    ForwardFailurePolicySpec failure{};
+    failure.version = ForwardFailurePolicyVersion::Http11;
+    failure.status_code = 502;
+    failure.date = ForwardFailurePolicyDate::Current;
+    failure.connection = ForwardFailurePolicyConnection::Request;
+    failure.head_mode = FailurePolicyHeadMode::SuppressBody;
+    failure.reason = {"Bad Gateway", 11};
+    failure.content_type = {"text/html", 9};
+    failure.server = {"nginx/1.29.7", 12};
+    failure.body = {kBody, sizeof(kBody) - 1};
+    REQUIRE_EQ(cfg.add_failure_policy(failure), 1u);
+
+    SmallLoop loop;
+    loop.setup();
+    int fds[2];
+    REQUIRE(socketpair(AF_UNIX, SOCK_STREAM, 0, fds) == 0);
+    ScopedFakeSocket fake_socket(fds[0]);
+    loop.inject_and_dispatch(make_ev(0, IoEventType::Accept, 42));
+    auto* c = loop.find_fd(42);
+    REQUIRE(c != nullptr);
+    c->request_config = &cfg;
+    static constexpr char kRequest[] =
+        "HEAD /missing?q=1 HTTP/1.1\r\nHost: client.example\r\n"
+        "Connection: close\r\nConnection: keep-alive\r\n\r\n";
+    REQUIRE_EQ(c->recv_buf.write(reinterpret_cast<const u8*>(kRequest), sizeof(kRequest) - 1),
+               sizeof(kRequest) - 1);
+    capture_request_metadata(*c);
+    c->req_initial_send_len = c->recv_buf.len();
+    c->keep_alive = true;
+
+    // The parser's own sweep-3 fix independently confirms `close` won.
+    CHECK(c->req_client_connection_close);
+    CHECK_FALSE(c->req_client_keep_alive);
+
+    JitDispatchOutcome outcome{};
+    outcome.kind = JitDispatchOutcome::Kind::Forward;
+    outcome.upstream_id = upstream.value();
+    outcome.request_policy_id = static_cast<u16>(RequestPolicyId::Http11PreserveHostLowercase);
+    outcome.response_policy_id = 1;
+    outcome.failure_policy_id = 1;
+    loop.backend.clear_ops();
+    loop.backend.fail_connect = true;
+    handle_jit_outcome<SmallLoop>(&loop, *c, outcome, nullptr, true);
+
+    // Admitted, not a 400 preflight rejection: the paired 502 failure
+    // response proves the preflight let the request proceed to the (here,
+    // injected) failed connect attempt instead of rejecting it because the
+    // second, separate `Connection: keep-alive` field looked persistent.
     CHECK_EQ(c->failure_policy_id, 1u);
     CHECK(c->failure_policy_suppress_body);
     CHECK_EQ(c->resp_status, kStatusBadGateway);
