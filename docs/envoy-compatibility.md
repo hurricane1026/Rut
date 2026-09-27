@@ -11,9 +11,40 @@ Allowed states are `SUPPORTED`, `PARTIAL`, `BLOCKED_BY_RUT`,
 Column meanings: `parser` is semantic-model admission with source spans and
 fail-closed diagnostics (`tests/test_envoy_parser.cc`); `converter` is
 deterministic RUT emission; `RUT capability` is whether the runtime can carry
-the behavior; `behavior test` is the differential evidence. The pinned Envoy
-image does not exist yet; no row can be promoted past `PARTIAL` until
-`tests/pinned-envoy-image.txt` and the differential target land.
+the behavior; `behavior test` is the differential evidence. The pinned image
+is `envoyproxy/envoy@sha256:57e14a549d7bd43c8d3f6d03e8cfa653e037d4b38e133acd9b54f38c524401b4`
+(tag `v1.39.1`, `tests/pinned-envoy-image.txt`); no row may be promoted past
+`PARTIAL` until the differential evidence for that exact row lands.
+
+Evidence note: `tests/test_envoy_differential.cc` (envoy-pr-plan.md PR 2) runs
+the milestone-S bootstrap through the pinned image against a recording
+upstream over loopback and writes the observed bytes as a transcript header.
+It exercises no RUT or converter code path and asserts only two invariants
+(`get_smoke` downstream/upstream shape, `connect_failure` downstream status);
+everything else is recorded evidence for PRs 3-6, not a behavioral claim. The
+transcript is produced by CI (`envoy-required` job, label `envoy;docker`,
+`RESOURCE_LOCK envoy-differential`) as the `envoy-oracle-transcript` artifact;
+it is committed as `tests/fixtures/envoy_oracle_milestone_s.inc` by the lead
+after a CI run. The committed transcript comes from CI run `36040192963`
+(`envoy-required` job, v1.39.1, recorded 2026-09-24T18:18:42Z). It is
+Envoy-only evidence: no row below changes status in this PR.
+
+Facts the transcript establishes for PRs 3-5 (each is a byte in the fixture,
+not an assumption): the upstream request keeps the client's `Host` value as
+the first header, lowercases every header name, removes `Connection`,
+`Keep-Alive`, `Proxy-Connection` and the Connection-nominated header, keeps
+`te: trailers`, keeps a client-supplied `x-forwarded-proto` value unchanged,
+and appends `x-forwarded-proto: http` as the last header when absent. The
+downstream response keeps the upstream header order with lowercase names,
+replaces `server` in place, keeps an upstream `date` in place, appends
+`date` then `server: envoy` when the upstream omitted them, uses the
+canonical reason phrase (`200 Fine` becomes `200 OK`), and appends
+`connection: close` last only when closing. Local replies (404 for
+`OPTIONS *` and authority-form CONNECT) are `date, server, [connection:
+close,] content-length: 0`; the connect failure is a 503 with
+`content-length: 98, content-type: text/plain, date, server` and the body
+`upstream connect error or disconnect/reset before headers. reset reason:
+remote connection failure`.
 
 The design contract's fail-closed rule is about configuration semantics: a
 bootstrap that needs a RUT surface the shipped binary does not have must be
@@ -304,3 +335,13 @@ converter fails closed on the whole configuration until then.
   table row) with the two converter-level fixes that were tried and found
   infeasible within the lexer's token budget and the language's expression
   grammar.
+- PR 2 (envoy-pr-plan.md): pinned
+  `envoyproxy/envoy@sha256:57e14a549d7bd43c8d3f6d03e8cfa653e037d4b38e133acd9b54f38c524401b4`
+  (`v1.39.1`, `tests/pinned-envoy-image.txt`) and added the docker-gated
+  oracle-recording scaffold `tests/test_envoy_differential.cc`. It runs the milestone-S
+  bootstrap through the pinned image against a recording upstream and writes
+  the wire bytes as `tests/fixtures/envoy_oracle_milestone_s.inc`; it does not
+  exercise RUT or the converter and asserts only two invariants (see the
+  evidence note above). CI runs it as the `envoy-required` job and uploads the
+  transcript as an artifact; the artifact from run `36040192963` is committed
+  verbatim as the fixture. No status changes in this PR.

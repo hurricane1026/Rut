@@ -199,13 +199,13 @@ private:
     std::int64_t previous_ = 0;
 };
 
-static bool run_command(const std::vector<std::string>& arguments,
-                        CommandResult& result,
-                        int timeout_ms = 15000,
-                        bool report_success_as_timeout = false,
-                        bool inject_descendant = false,
-                        DescendantProbe* descendant_probe = nullptr,
-                        size_t output_limit = 65536) {
+static bool run_command_impl(const std::vector<std::string>& arguments,
+                             CommandResult& result,
+                             int timeout_ms,
+                             bool report_success_as_timeout,
+                             bool inject_descendant,
+                             DescendantProbe* descendant_probe,
+                             size_t output_limit) {
     ++command_invocation_count;
     const std::int64_t invocation_now = exact_read_monotonic_ns();
     if (invocation_now <= 0 || timeout_ms <= 0 ||
@@ -458,6 +458,48 @@ static bool run_command(const std::vector<std::string>& arguments,
         return false;
     }
     return reaped && !result.timed_out;
+}
+
+// Human-readable argv summary for the slow-command diagnostic below. Output
+// is not included: it can contain secrets/binary data and run_command()
+// callers already log or check `result.output` themselves on failure.
+static std::string summarize_argv(const std::vector<std::string>& arguments) {
+    std::string summary;
+    for (size_t i = 0; i < arguments.size(); ++i) {
+        if (i != 0) summary += ' ';
+        summary += arguments[i];
+    }
+    return summary;
+}
+
+// run_command() is the single choke point for every docker/ip subprocess
+// invocation this fixture makes. CI triage of test_ipv4_fixture_topology
+// found green CTest durations of 74.6-118.7s (median ~90s) with no single
+// hang, so log any one invocation slower than 2s (argv + duration) to help
+// pin down which subprocess call the wall time went to on the next timeout.
+static bool run_command(const std::vector<std::string>& arguments,
+                        CommandResult& result,
+                        int timeout_ms = 15000,
+                        bool report_success_as_timeout = false,
+                        bool inject_descendant = false,
+                        DescendantProbe* descendant_probe = nullptr,
+                        size_t output_limit = 65536) {
+    const auto invocation_start = std::chrono::steady_clock::now();
+    const bool ok = run_command_impl(arguments,
+                                     result,
+                                     timeout_ms,
+                                     report_success_as_timeout,
+                                     inject_descendant,
+                                     descendant_probe,
+                                     output_limit);
+    const auto elapsed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                                std::chrono::steady_clock::now() - invocation_start)
+                                .count();
+    if (elapsed_ms > 2000) {
+        std::cerr << "[fixture_ipv4_topology] slow subprocess argv=[" << summarize_argv(arguments)
+                  << "] duration_ms=" << elapsed_ms << "\n";
+    }
+    return ok;
 }
 
 struct ExactReadCommandResult {
@@ -1170,11 +1212,11 @@ static bool exact_read_validate_receipt(const ExactReadSupervisorReceipt& receip
            receipt.reserved == 0u && receipt.worker_pid > 0;
 }
 
-static bool run_exact_read_command_until(const std::vector<std::string>& arguments,
-                                         size_t stdout_limit,
-                                         std::int64_t final_deadline_ns,
-                                         ExactReadCommandResult& result,
-                                         ExactReadRunnerFault fault = ExactReadRunnerFault::None) {
+static bool run_exact_read_command_until_impl(const std::vector<std::string>& arguments,
+                                              size_t stdout_limit,
+                                              std::int64_t final_deadline_ns,
+                                              ExactReadCommandResult& result,
+                                              ExactReadRunnerFault fault) {
     ++command_invocation_count;
     ++observation_command_invocation_count;
     result = {};
@@ -1481,6 +1523,31 @@ static bool run_exact_read_command_until(const std::vector<std::string>& argumen
     return result.started && !result.deadline_exceeded && !result.output_overflow &&
            result.stdout_read_errno == 0 && result.stderr_read_errno == 0 &&
            result.cleanup_completed_before_final_deadline && result.group_echild_observed;
+}
+
+// run_exact_read_command_until is the exact-read counterpart to run_command()'s
+// slow-subprocess diagnostic above: the nginx differential rotation reads and
+// writes go through this supervisor/execve path instead of run_command_impl(),
+// bypassing that wrapper entirely, so a slow docker exec here previously left
+// no trace despite run_command() being documented as the single choke point.
+// Apply the same >2s argv+duration log here so both subprocess runners are
+// covered.
+static bool run_exact_read_command_until(const std::vector<std::string>& arguments,
+                                         size_t stdout_limit,
+                                         std::int64_t final_deadline_ns,
+                                         ExactReadCommandResult& result,
+                                         ExactReadRunnerFault fault = ExactReadRunnerFault::None) {
+    const auto invocation_start = std::chrono::steady_clock::now();
+    const bool ok = run_exact_read_command_until_impl(
+        arguments, stdout_limit, final_deadline_ns, result, fault);
+    const auto elapsed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                                std::chrono::steady_clock::now() - invocation_start)
+                                .count();
+    if (elapsed_ms > 2000) {
+        std::cerr << "[fixture_ipv4_topology] slow subprocess argv=[" << summarize_argv(arguments)
+                  << "] duration_ms=" << elapsed_ms << "\n";
+    }
+    return ok;
 }
 
 static bool run_exact_read_command(const std::vector<std::string>& arguments,
@@ -3242,7 +3309,20 @@ static bool setup_event_evidence_equal(const SetupEventEvidence& left,
            left.holder_attach_b_count == right.holder_attach_b_count;
 }
 
-static bool proc_tcp_port_absent(const std::string& table, u16 port) {
+// Docker's embedded DNS resolver (every user-defined network) opens a TCP
+// listener inside the container netns on 127.0.0.11:<bind(0) port>.  bind(0)
+// draws odd ports from ip_local_port_range, so it lands on the fixed odd probe
+// port 41857 with probability 1/14116 per holder.  A socket bound to exactly
+// this loopback address cannot accept or shadow a connection to the
+// non-loopback positive/guard IPv4 endpoint, so it is not a port occupant.
+// Only the exact resolver address (IPv4 row or v4-mapped tcp6 row) is exempt.
+static bool docker_embedded_dns_endpoint(const std::string& local_address) {
+    return local_address == "0B00007F" || local_address == "0000000000000000FFFF00000B00007F";
+}
+
+static bool proc_tcp_port_absent(const std::string& table,
+                                 u16 port,
+                                 std::string* occupant = nullptr) {
     std::ostringstream port_hex;
     port_hex << std::uppercase << std::setfill('0') << std::setw(4) << std::hex << port;
     std::istringstream lines(table);
@@ -3253,8 +3333,11 @@ static bool proc_tcp_port_absent(const std::string& table, u16 port) {
         std::string local_endpoint;
         if (!(fields >> index >> local_endpoint)) continue;
         const size_t colon = local_endpoint.rfind(':');
-        if (colon != std::string::npos && local_endpoint.substr(colon + 1u) == port_hex.str())
+        if (colon != std::string::npos && local_endpoint.substr(colon + 1u) == port_hex.str() &&
+            !docker_embedded_dns_endpoint(local_endpoint.substr(0, colon))) {
+            if (occupant != nullptr) *occupant = line;
             return false;
+        }
     }
     return true;
 }
@@ -3613,8 +3696,10 @@ private:
             error = std::string("holder /proc/net/") + table + " read failed";
             return false;
         }
-        if (proc_tcp_port_absent(tcp, port)) return true;
-        error = std::string("selected probe port appeared in holder /proc/net/") + table;
+        std::string occupant;
+        if (proc_tcp_port_absent(tcp, port, &occupant)) return true;
+        error = std::string("selected probe port appeared in holder /proc/net/") + table + ": " +
+                occupant;
         return false;
     }
 
@@ -12587,6 +12672,27 @@ bool audit_zero_residue(const std::string& token,
 }
 
 bool pure_validation_self_checks(std::string& error) {
+    {
+        // Docker's embedded-DNS listener on the selected probe port is not an
+        // occupant (it made the held-namespace absence probe flake at
+        // 1/14116 per holder); every other row on that port still is.
+        const std::string header = "  sl  local_address rem_address st";
+        const std::string dns4 = header + "\n 0: 0B00007F:A381 00000000:0000 0A\n";
+        const std::string dns6 = header + "\n 0: 0000000000000000FFFF00000B00007F:A381 0:0 0A\n";
+        const std::string loopback4 = header + "\n 0: 0100007F:A381 00000000:0000 0A\n";
+        const std::string neighbour4 = header + "\n 0: 0C00007F:A381 00000000:0000 0A\n";
+        const std::string dns_other_port = header + "\n 0: 0B00007F:A380 00000000:0000 0A\n";
+        const std::string dns_then_wildcard = dns4 + " 1: 00000000:A381 00000000:0000 0A\n";
+        std::string occupant;
+        if (!proc_tcp_port_absent(dns4, 41857) || !proc_tcp_port_absent(dns6, 41857) ||
+            !proc_tcp_port_absent(dns_other_port, 41857) ||
+            proc_tcp_port_absent(loopback4, 41857) || proc_tcp_port_absent(neighbour4, 41857) ||
+            proc_tcp_port_absent(dns_then_wildcard, 41857, &occupant) ||
+            occupant != " 1: 00000000:A381 00000000:0000 0A") {
+            error = "Docker embedded-DNS selected-port exemption self-check failed";
+            return false;
+        }
+    }
     if (!pure_holder_retirement_self_checks(error)) return false;
     if (!recreated_sidecar_transition_self_checks(error)) return false;
     if (!generation_receipt_composition_self_checks(error)) return false;

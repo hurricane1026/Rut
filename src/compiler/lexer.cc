@@ -97,8 +97,8 @@ constexpr Str kQuestionDetail =
 
 }  // namespace
 
-LexResult lex(Str source) {
-    LexedTokens out{};
+FrontendResult<void> lex_into(Str source, LexedTokens& out) {
+    out.tokens.len = 0;
     u32 pos = 0;
     u32 line = 1;
     u32 col = 1;
@@ -448,6 +448,20 @@ LexResult lex(Str source) {
     eof.col = col;
     eof.text = {source.ptr + source.len, 0};
     if (!out.tokens.push(eof)) return frontend_error(FrontendError::TooManyTokens, token_span(eof));
+    return {};
+}
+
+FrontendResult<const LexedTokens*> lex_mapped(Str source, MappedArray<LexedTokens>& storage) {
+    if (!storage.init(1)) return frontend_error(FrontendError::OutOfMemory, {});
+    auto lexed = lex_into(source, storage[0]);
+    if (!lexed) return core::make_unexpected(lexed.error());
+    return &storage[0];
+}
+
+LexResult lex(Str source) {
+    LexedTokens out{};
+    auto lexed = lex_into(source, out);
+    if (!lexed) return core::make_unexpected(lexed.error());
     return out;
 }
 

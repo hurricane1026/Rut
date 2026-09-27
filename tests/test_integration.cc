@@ -38,6 +38,7 @@
 
 #include <errno.h>
 #include <fcntl.h>
+#include <netinet/tcp.h>
 #include <openssl/err.h>
 #include <openssl/ssl.h>
 #include <poll.h>
@@ -8688,6 +8689,8 @@ struct ReuseUpstream {
     u16 port = 0;
     u32 body_len = 0;
     std::atomic<bool> running{false};
+    std::atomic<u32> accept_count{0};
+    std::atomic<u32> closed_count{0};
     bool started = false;
     pthread_t thread{};
 
@@ -8704,6 +8707,14 @@ struct ReuseUpstream {
             }
             char req[2048];
             (void)recv_timeout(client, req, sizeof(req), 1000);
+            // Plain persistent HTTP/1.1 response: nothing here tells the downstream
+            // client to close. The origin then closes this idle connection itself
+            // (legal for any HTTP/1.1 server), and publishes closed_count only once
+            // the gateway's kernel has ACKed that FIN. The test client waits for it
+            // before its next request, so the gateway's pooled copy is already at
+            // EOF when take_idle's MSG_PEEK probes it and every request still makes
+            // a fresh upstream connect, with no send/close race.
+            s->accept_count.fetch_add(1, std::memory_order_acq_rel);
             char hdr[128];
             const int hn = snprintf(
                 hdr, sizeof(hdr), "HTTP/1.1 200 OK\r\nContent-Length: %u\r\n\r\n", s->body_len);
@@ -8717,7 +8728,29 @@ struct ReuseUpstream {
                 ok = send_all(client, reinterpret_cast<char*>(chunk), n);
                 sent += n;
             }
+            // Peer-visible close: send the FIN, then wait until our socket leaves
+            // FIN_WAIT1. That transition happens only when the peer ACKs the FIN,
+            // i.e. after the gateway's kernel has processed it and its socket reads
+            // EOF. A close() alone returns before a loaded host delivers the FIN.
+            bool fin_acked = false;
+            if (ok && shutdown(client, SHUT_WR) == 0) {
+#ifdef __linux__
+                for (u32 waited = 0; waited < 5000 && !fin_acked; waited++) {
+                    struct tcp_info info{};
+                    socklen_t info_len = sizeof(info);
+                    if (getsockopt(client, IPPROTO_TCP, TCP_INFO, &info, &info_len) != 0) break;
+                    fin_acked =
+                        info.tcpi_state != TCP_ESTABLISHED && info.tcpi_state != TCP_FIN_WAIT1;
+                    if (!fin_acked) usleep(1000);
+                }
+#else
+                fin_acked = true;  // io_uring-only fixture; never reached off Linux
+#endif
+            }
             close(client);  // fresh upstream connect per proxied request
+            // Unacknowledged close: withhold the signal so the client times out and
+            // the test fails visibly instead of racing the pooled socket.
+            if (fin_acked) s->closed_count.fetch_add(1, std::memory_order_acq_rel);
         }
         return nullptr;
     }
@@ -8764,7 +8797,8 @@ struct ReuseUpstream {
 // next request's recv would hang/truncate one, dropping the count. Shared by the GET
 // and POST reuse regressions; uses plain early returns (no CHECK) so the caller
 // owns the assertion.
-static u32 run_keepalive_reuse(const char* req, u32 req_len, u32 kBody, u32 kRequests) {
+static u32 run_keepalive_reuse(
+    const char* req, u32 req_len, u32 kBody, u32 kRequests, u32* upstream_accepts) {
     using namespace rut;
     ReuseUpstream backend;
     if (!backend.setup(kBody)) return 0;
@@ -8824,7 +8858,19 @@ static u32 run_keepalive_reuse(const char* req, u32 req_len, u32 kBody, u32 kReq
                 }
             }
             if (!pattern_ok) break;
+            // The downstream response must stay persistent: no close signal may
+            // reach this keep-alive client.
+            if (buf_contains(reinterpret_cast<const char*>(in), body_off, "onnection:", 10)) break;
             completed++;
+            // Deterministic fresh-connect-per-request: wait until the origin has
+            // closed this response's connection before sending the next request.
+            u32 waited = 0;
+            while (backend.closed_count.load(std::memory_order_acquire) < completed &&
+                   waited < 5000) {
+                usleep(1000);
+                waited++;
+            }
+            if (backend.closed_count.load(std::memory_order_acquire) < completed) break;
         }
     }
 
@@ -8840,6 +8886,7 @@ static u32 run_keepalive_reuse(const char* req, u32 req_len, u32 kBody, u32 kReq
     shard.shutdown();
     close(lfd);
     destroy_tls_server_context(tls_ctx.value());
+    *upstream_accepts = backend.accept_count.load(std::memory_order_acquire);
     return completed;
 }
 
@@ -8849,7 +8896,9 @@ TEST(proxy_tls_iouring, keepalive_reuse_no_cancel_collision) {
     // 8 KiB body: comfortably under the 16 KiB upstream_recv_buf even with headers,
     // so a one-batch loopback harvest can't -ENOBUFS-truncate the tail and masquerade
     // as a cancel-collision. Still a real multi-recv stream that pauses per request.
-    CHECK_EQ(run_keepalive_reuse(kReq, sizeof(kReq) - 1, 8u * 1024u, 30u), 30u);
+    u32 accepts = 0;
+    CHECK_EQ(run_keepalive_reuse(kReq, sizeof(kReq) - 1, 8u * 1024u, 30u, &accepts), 30u);
+    CHECK_EQ(accepts, 30u);  // one fresh upstream connect per request
 }
 
 // Same reuse stress with POST: each request forwards a request body to the upstream
@@ -8862,7 +8911,9 @@ TEST(proxy_tls_iouring, keepalive_reuse_post_body_no_cancel_collision) {
     // 8 KiB body: comfortably under the 16 KiB upstream_recv_buf even with headers,
     // so a one-batch loopback harvest can't -ENOBUFS-truncate the tail and masquerade
     // as a cancel-collision. Still a real multi-recv stream that pauses per request.
-    CHECK_EQ(run_keepalive_reuse(kReq, sizeof(kReq) - 1, 8u * 1024u, 30u), 30u);
+    u32 accepts = 0;
+    CHECK_EQ(run_keepalive_reuse(kReq, sizeof(kReq) - 1, 8u * 1024u, 30u, &accepts), 30u);
+    CHECK_EQ(accepts, 30u);  // one fresh upstream connect per request
 }
 
 // Informational proxy latency/throughput benchmark (keep-alive, real io_uring).
@@ -12405,6 +12456,251 @@ TEST(proxy_reuse, iouring_connection_close_request_not_pooled) {
     shard.join();
     shard.shutdown();
     close(lfd);
+}
+
+// Origin that answers every request with an explicit "Connection: close" response
+// but sends the FIN late — like a real origin whose close trails its last response
+// segment. Ordering is forced: the previous connection is closed only after the
+// NEXT request has been read in full (so the gateway has finished its upstream
+// send and armed the successor's recv), then the next response follows
+// close_delay_us later. The gateway must not pool such a socket, and the late FIN
+// must not be mistaken for an event on the next request's upstream.
+struct DelayedCloseUpstream {
+    i32 listen_fd = -1;
+    u16 port = 0;
+    u32 body_len = 0;
+    u32 close_delay_us = 0;
+    i32 prev_client = -1;  // origin thread only
+    std::atomic<bool> running{false};
+    std::atomic<u32> accept_count{0};
+    std::atomic<u32> full_request_count{0};
+    bool started = false;
+    pthread_t thread{};
+
+    ~DelayedCloseUpstream() { teardown(); }
+
+    static void respond(DelayedCloseUpstream* s, i32 client) {
+        char hdr[128];
+        const int hn = snprintf(hdr,
+                                sizeof(hdr),
+                                "HTTP/1.1 200 OK\r\nContent-Length: %u\r\n"
+                                "Connection: close\r\n\r\n",
+                                s->body_len);
+        bool ok = hn > 0 && send_all(client, hdr, static_cast<u32>(hn));
+        u8 chunk[8192];
+        u32 sent = 0;
+        while (ok && sent < s->body_len) {
+            u32 n = s->body_len - sent;
+            if (n > sizeof(chunk)) n = sizeof(chunk);
+            for (u32 i = 0; i < n; i++) chunk[i] = static_cast<u8>((sent + i) & 0xff);
+            ok = send_all(client, reinterpret_cast<char*>(chunk), n);
+            sent += n;
+        }
+    }
+
+    static void* run(void* arg) {
+        auto* s = static_cast<DelayedCloseUpstream*>(arg);
+        while (s->running.load(std::memory_order_acquire)) {
+            i32 client = accept(s->listen_fd, nullptr, nullptr);
+            if (client < 0) {
+                if (errno == EINTR) continue;
+                usleep(500);  // non-blocking listen socket (EAGAIN) — poll
+                continue;
+            }
+            s->accept_count.fetch_add(1, std::memory_order_acq_rel);
+            // Read the whole request (head + Content-Length body) so close() below is
+            // a clean FIN, never an RST caused by unread request bytes.
+            char req[2048];
+            u32 got = 0;
+            u32 need = 0;
+            while (got + 1u < sizeof(req)) {
+                const i32 n = recv_timeout(client, req + got, sizeof(req) - 1u - got, 1000);
+                if (n <= 0) break;
+                got += static_cast<u32>(n);
+                req[got] = '\0';
+                if (need == 0) {
+                    for (u32 i = 3; i < got; i++) {
+                        if (req[i - 3] == '\r' && req[i - 2] == '\n' && req[i - 1] == '\r' &&
+                            req[i] == '\n') {
+                            u32 cl = 0;
+                            const char* p = strstr(req, "Content-Length: ");
+                            if (p != nullptr && p < req + i) cl = static_cast<u32>(atoi(p + 16));
+                            need = i + 1 + cl;
+                            break;
+                        }
+                    }
+                }
+                if (need != 0 && got >= need) break;
+            }
+            if (need != 0 && got >= need)
+                s->full_request_count.fetch_add(1, std::memory_order_acq_rel);
+            if (s->prev_client >= 0) {
+                usleep(s->close_delay_us);
+                close(s->prev_client);
+                usleep(s->close_delay_us);
+            }
+            s->prev_client = client;
+            respond(s, client);
+        }
+        if (s->prev_client >= 0) {
+            close(s->prev_client);
+            s->prev_client = -1;
+        }
+        return nullptr;
+    }
+
+    bool setup(u32 blen, u32 delay_us) {
+        body_len = blen;
+        close_delay_us = delay_us;
+        auto lfd = create_listen_socket(0);
+        if (!lfd.has_value()) return false;
+        listen_fd = lfd.value();
+        // The accept loop polls with usleep and rechecks `running`, so teardown's
+        // join must never be stuck in accept(): require a nonblocking listener here
+        // rather than relying on create_listen_socket's platform defaults.
+        const int flags = fcntl(listen_fd, F_GETFL);
+        if (flags < 0 || fcntl(listen_fd, F_SETFL, flags | O_NONBLOCK) < 0) {
+            close(listen_fd);
+            listen_fd = -1;
+            return false;
+        }
+        port = get_port(listen_fd);
+        running.store(true, std::memory_order_release);
+        if (pthread_create(&thread, nullptr, run, this) != 0) {
+            running.store(false, std::memory_order_release);
+            close(listen_fd);
+            listen_fd = -1;
+            return false;
+        }
+        started = true;
+        return true;
+    }
+
+    void teardown() {
+        running.store(false, std::memory_order_release);
+        if (started) {
+            pthread_join(thread, nullptr);
+            started = false;
+        }
+        if (listen_fd >= 0) {
+            close(listen_fd);
+            listen_fd = -1;
+        }
+    }
+};
+
+// Drive kRequests keep-alive POSTs (16-byte body) over one downstream connection
+// (plain or TLS) through an io_uring shard to a DelayedCloseUpstream. Returns the
+// number of responses that arrived complete with an intact kBody pattern body.
+static u32 run_delayed_close_upstream_reuse(
+    bool tls, u32 kBody, u32 kRequests, u32 close_delay_us, u32* accepts, u32* full_requests) {
+    using namespace rut;
+    DelayedCloseUpstream backend;
+    if (!backend.setup(kBody, close_delay_us)) return 0;
+    RouteConfig cfg{};
+    auto uid = cfg.add_upstream("api", 0x7F000001, backend.port);
+    if (!uid.has_value()) return 0;
+    if (!cfg.add_proxy("/api", 0, static_cast<u16>(uid.value()))) return 0;
+    const RouteConfig* active = &cfg;
+
+    auto tls_ctx = create_tls_server_context(kTestCertPath, kTestKeyPath);
+    if (!tls_ctx.has_value()) return 0;
+    Shard<IoUringEventLoop> shard;
+    i32 lfd = create_listen_socket(0).value_or(-1);
+    if (lfd < 0) return 0;
+    const u16 port = get_port(lfd);
+    if (!shard.init(0, lfd).has_value()) return 0;
+    if (tls) shard.loop->tls_server = tls_ctx.value();
+    shard.loop->config_ptr = &active;
+    if (!shard.spawn(-1).has_value()) return 0;
+    usleep(50000);
+
+    SSL_CTX* client_ctx = tls ? create_test_client_ctx() : nullptr;
+    const i32 c = connect_to(port);
+    SSL* ssl = (tls && client_ctx != nullptr && c >= 0) ? SSL_new(client_ctx) : nullptr;
+    const bool ready =
+        c >= 0 && (!tls || (ssl != nullptr && SSL_set_fd(ssl, c) == 1 && SSL_connect(ssl) == 1));
+    u32 completed = 0;
+    if (ready) {
+        set_socket_timeouts(c, 3);
+        const char kReq[] =
+            "POST /api HTTP/1.1\r\nHost: x\r\nContent-Length: 16\r\n\r\n0123456789abcdef";
+        static u8 in[32u * 1024u];
+        for (u32 r = 0; r < kRequests; r++) {
+            const bool sent = tls ? ssl_write_all(ssl, kReq, sizeof(kReq) - 1)
+                                  : send_all(c, kReq, sizeof(kReq) - 1);
+            if (!sent) break;
+            u32 total = 0, body_off = 0;
+            bool hdr_done = false;
+            while (total < sizeof(in) && (!hdr_done || total - body_off < kBody)) {
+                const i32 n =
+                    tls ? SSL_read(ssl, in + total, static_cast<i32>(sizeof(in) - total))
+                        : recv_timeout(
+                              c, reinterpret_cast<char*>(in) + total, sizeof(in) - total, 3000);
+                if (n <= 0) break;
+                total += static_cast<u32>(n);
+                if (!hdr_done) {
+                    for (u32 i = 3; i < total; i++) {
+                        if (in[i - 3] == '\r' && in[i - 2] == '\n' && in[i - 1] == '\r' &&
+                            in[i] == '\n') {
+                            hdr_done = true;
+                            body_off = i + 1;
+                            break;
+                        }
+                    }
+                }
+            }
+            if (!hdr_done || total - body_off != kBody) break;
+            if (!buf_contains(reinterpret_cast<char*>(in), body_off, "200 OK", 6)) break;
+            bool pattern_ok = true;
+            for (u32 i = 0; i < kBody && pattern_ok; i++)
+                pattern_ok = in[body_off + i] == static_cast<u8>(i & 0xff);
+            if (!pattern_ok) break;
+            completed++;
+        }
+    }
+    if (ssl != nullptr) {
+        SSL_shutdown(ssl);
+        SSL_free(ssl);
+    }
+    if (c >= 0) close(c);
+    if (client_ctx != nullptr) SSL_CTX_free(client_ctx);
+    backend.teardown();
+    shard.stop();
+    shard.join();
+    shard.shutdown();
+    close(lfd);
+    destroy_tls_server_context(tls_ctx.value());
+    *accepts = backend.accept_count.load(std::memory_order_acquire);
+    *full_requests = backend.full_request_count.load(std::memory_order_acquire);
+    return completed;
+}
+
+// Regression: an upstream that is released by close (its response said
+// Connection: close) while its multishot recv is still armed. The origin's FIN
+// arrives ~20 ms later, after the next keep-alive request on the same downstream
+// connection has armed a fresh upstream recv on the same connection slot. That
+// late terminal CQE must never be dispatched as the new upstream's EOF.
+TEST(proxy_reuse, iouring_closed_upstream_late_fin_does_not_hit_next_request) {
+    if (!iouring_socket_live()) SKIP("io_uring async socket ops unavailable in this environment");
+    constexpr u32 kRequests = 12u;
+    u32 accepts = 0, full_requests = 0;
+    CHECK_EQ(run_delayed_close_upstream_reuse(
+                 false, 8u * 1024u, kRequests, 20000, &accepts, &full_requests),
+             kRequests);
+    CHECK_EQ(accepts, kRequests);  // a Connection: close upstream is never pooled
+    CHECK_EQ(full_requests, kRequests);
+}
+
+TEST(proxy_tls_iouring, closed_upstream_late_fin_does_not_hit_next_request) {
+    if (!iouring_socket_live()) SKIP("io_uring async socket ops unavailable in this environment");
+    constexpr u32 kRequests = 12u;
+    u32 accepts = 0, full_requests = 0;
+    CHECK_EQ(run_delayed_close_upstream_reuse(
+                 true, 8u * 1024u, kRequests, 20000, &accepts, &full_requests),
+             kRequests);
+    CHECK_EQ(accepts, kRequests);
+    CHECK_EQ(full_requests, kRequests);
 }
 
 // Unit-level coverage for the io_uring deferred idle-pool return guards. These
@@ -34887,6 +35183,7 @@ TEST(
 
     // Every permit follows one attributable application send and an independent
     // downstream open/zero-byte observation. Fragment four completes CL36.
+    u64 final_fragment_permit_ns = 0;
     for (u32 fragment = 1; fragment < kExpectedFragments; fragment++) {
         for (u32 waited = 0; waited < 1200 && backend.first_response_fragment_count.load(
                                                   std::memory_order_acquire) < fragment;
@@ -34897,6 +35194,10 @@ TEST(
             backend.first_response_fragment_sent_ns[fragment - 1u].load(std::memory_order_acquire),
             0u);
         REQUIRE_EQ(recv_timeout(client.fd, quiet, sizeof(quiet), 100), -EAGAIN);
+        if (fragment + 1u == kExpectedFragments) {
+            final_fragment_permit_ns = monotonic_ns();
+            REQUIRE_NE(final_fragment_permit_ns, 0u);
+        }
         backend.allowed_first_response_fragments.store(fragment + 1u, std::memory_order_release);
     }
 
@@ -34939,7 +35240,10 @@ TEST(
         static_cast<double>(fragment_times[fragment_count - 1u] - fragment_times[0]) / 1e9;
     CHECK_GT(first_to_final, 1.0);
     CHECK_LT(first_to_final, 2.0);
-    REQUIRE_GE(request_one_response_complete_ns, fragment_times[fragment_count - 1u]);
+    // fragment_times[] is stamped by the origin thread after send_all() returns, so
+    // under load the gateway and client can finish the whole response before that
+    // stamp. The causal lower bound is the permit that released the final fragment.
+    REQUIRE_GE(request_one_response_complete_ns, final_fragment_permit_ns);
 
     for (u32 waited = 0;
          waited < 1200 && !backend.first_peer_closed.load(std::memory_order_acquire) &&
