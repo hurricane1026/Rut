@@ -4219,6 +4219,36 @@ void note_record_only_phase_crash(const char* proxy_label,
     for (auto& r : *record_only_results) mark_upstream_ambiguous(&r, AmbiguityReason::kProxyCrash);
 }
 
+// Sweep-11 review, "Fail record-only phases when Docker cleanup fails":
+// classifies a failed EnvoyInstance::stop() from a record-only-only
+// instance (the same "unambiguously attributable to this instance" call
+// site note_record_only_phase_crash() itself documents) into exactly one
+// of two outcomes, instead of treating every false return the same way:
+//   - `docker_cleanup_failed`: docker_rm_force() could not confirm the
+//     container was actually removed. This is fatal, even though
+//     record-only phases otherwise never gate the exit code, because
+//     letting the run continue (or pass) risks leaving a live container
+//     -- and the host-network listener it holds -- running, with nothing
+//     but the destructor's own unchecked retry to (maybe) clean it up
+//     later. With a reuse-port collision already in play, the very next
+//     step in both call sites either skips the port-closure check
+//     entirely or moves pair mode to a fresh port, so a leaked container
+//     here would otherwise go completely unnoticed.
+//   - anything else (an ordinary process crash): unchanged -- the
+//     existing non-gating NOTE via note_record_only_phase_crash().
+// Returns empty when handled non-fatally (the NOTE was already emitted);
+// otherwise returns a message the caller must report as FAIL and return 1
+// for, after its own upstream.stop() cleanup.
+std::string classify_record_only_envoy_stop_failure(const EnvoyInstance& envoy_record_only,
+                                                    std::vector<CaseResult>* record_only_results) {
+    if (envoy_record_only.docker_cleanup_failed) {
+        return envoy_record_only.unexpected_exit_description;
+    }
+    note_record_only_phase_crash(
+        "envoy", envoy_record_only.unexpected_exit_description, record_only_results);
+    return "";
+}
+
 int run_oracle_milestone_s(const std::string& output_path) {
     const std::string stale_transcript_error = remove_stale_transcript(output_path);
     if (!stale_transcript_error.empty()) {
@@ -4430,8 +4460,13 @@ int run_oracle_milestone_s(const std::string& output_path) {
         }
         if (!envoy_record_only.stop()) {
             dump_log(envoy_record_only.log_path);
-            note_record_only_phase_crash(
-                "envoy", envoy_record_only.unexpected_exit_description, &record_only_results);
+            const std::string fatal_error =
+                classify_record_only_envoy_stop_failure(envoy_record_only, &record_only_results);
+            if (!fatal_error.empty()) {
+                std::cerr << "FAIL: " << fatal_error << "\n";
+                upstream.stop();
+                return 1;
+            }
         }
         if (!record_only_reuseport_error.empty()) {
             for (auto& r : record_only_results)
@@ -4848,8 +4883,13 @@ int run_pair_milestone_s(const std::string& rut_binary,
         // above.
         if (!envoy_record_only.stop()) {
             dump_log(envoy_record_only.log_path);
-            note_record_only_phase_crash(
-                "envoy", envoy_record_only.unexpected_exit_description, &envoy_record_only_results);
+            const std::string fatal_error = classify_record_only_envoy_stop_failure(
+                envoy_record_only, &envoy_record_only_results);
+            if (!fatal_error.empty()) {
+                std::cerr << "FAIL: " << fatal_error << "\n";
+                upstream.stop();
+                return 1;
+            }
         }
         if (!envoy_record_only_reuseport_error.empty()) {
             for (auto& r : envoy_record_only_results)
@@ -7577,6 +7617,136 @@ bool self_test_docker_cleanup_failure_blocks_retry() {
     }
 
     if (ok) std::cerr << "PASS [self-test docker cleanup blocks retry]\n";
+    return ok;
+}
+
+// Sweep-11 review, "Fail record-only phases when Docker cleanup fails":
+// exercises classify_record_only_envoy_stop_failure() -- the shared
+// decision both run_oracle_milestone_s()'s and run_pair_milestone_s()'s
+// Envoy record-only phases now call after a failed stop() -- directly,
+// against a REAL EnvoyInstance::stop() call using a stubbed
+// RUT_ENVOY_DOCKER_BIN (never the real Docker CLI), covering both
+// outcomes it must tell apart:
+//   - `docker rm -f` fails for a reason other than "already gone": stop()
+//     sets docker_cleanup_failed, and classify_record_only_envoy_stop_
+//     failure() must return a non-empty (fatal) message -- matching
+//     both call sites' contract of reporting FAIL and returning 1 --
+//     WITHOUT marking any result ambiguous (it never reaches
+//     note_record_only_phase_crash() in this branch).
+//   - an ordinary record-only proxy crash (the docker-run client process
+//     itself already exited, but removal succeeds): classify_record_
+//     only_envoy_stop_failure() must return empty (non-fatal) and mark
+//     every result ambiguous via note_record_only_phase_crash(), exactly
+//     as before this review.
+bool self_test_record_only_docker_cleanup_failure_fails_closed() {
+    bool ok = true;
+    TempDir dir("rut-envoy-selftest-record-only-docker-cleanup");
+    if (dir.empty()) {
+        std::cerr << "FAIL [self-test record-only docker cleanup fails closed]: could not create "
+                     "temp dir\n";
+        return false;
+    }
+
+    // Case 1: docker rm -f fails -- must fail closed.
+    {
+        const std::string stub_path = dir.path() + "/docker-fail";
+        if (!write_docker_stub(stub_path, 1, "Cannot connect to the Docker daemon")) {
+            std::cerr << "FAIL [self-test record-only docker cleanup fails closed]: could not "
+                         "write the docker stub\n";
+            ok = false;
+        } else {
+            ScopedDockerBinOverride docker_override(stub_path);
+            EnvoyInstance envoy;
+            envoy.name = "rut-envoy-selftest-record-only-docker-cleanup-1";
+            envoy.launched = true;
+            envoy.pid = -1;  // already reaped, exactly like a readiness-loop reap
+            const bool stopped = envoy.stop();
+            if (stopped || !envoy.docker_cleanup_failed) {
+                std::cerr << "FAIL [self-test record-only docker cleanup fails closed]: stop() "
+                             "did not report a docker cleanup failure as expected\n";
+                ok = false;
+            }
+            std::vector<CaseResult> results(1);
+            results[0].name = "connect_authority";
+            const std::string fatal_error =
+                classify_record_only_envoy_stop_failure(envoy, &results);
+            if (fatal_error.empty()) {
+                std::cerr << "FAIL [self-test record-only docker cleanup fails closed]: "
+                             "classify_record_only_envoy_stop_failure() did not fail closed for a "
+                             "docker cleanup failure\n";
+                ok = false;
+            }
+            if (results[0].upstream_ambiguous) {
+                std::cerr << "FAIL [self-test record-only docker cleanup fails closed]: a fatal "
+                             "docker cleanup failure was also marked ambiguous, as if it were a "
+                             "non-gating NOTE\n";
+                ok = false;
+            }
+        }
+    }
+
+    // Case 2: an ordinary record-only proxy crash, cleanup succeeds --
+    // must remain non-gating.
+    {
+        const std::string stub_path = dir.path() + "/docker-ok";
+        if (!write_docker_stub(stub_path, 0, "")) {
+            std::cerr << "FAIL [self-test record-only docker cleanup fails closed]: could not "
+                         "write the docker stub (ok case)\n";
+            ok = false;
+        } else {
+            ScopedDockerBinOverride docker_override(stub_path);
+            const pid_t child = fork();
+            if (child < 0) {
+                std::cerr
+                    << "FAIL [self-test record-only docker cleanup fails closed]: fork failed\n";
+                ok = false;
+            } else if (child == 0) {
+                _exit(1);  // simulates the docker-run client exiting on its own
+            } else {
+                // Let the child actually exit before stop() runs, WITHOUT
+                // reaping it ourselves: stop()'s own precheck must be the
+                // one to observe it already exited (an ordinary crash, not
+                // a cleanup failure).
+                struct timespec settle{0, 50'000'000};
+                nanosleep(&settle, nullptr);
+
+                EnvoyInstance envoy;
+                envoy.name = "rut-envoy-selftest-record-only-docker-cleanup-2";
+                envoy.launched = true;
+                envoy.pid = child;
+                // stop() itself is expected to report failure here (the
+                // process already exited unexpectedly), which is fine and
+                // matches every other "ordinary crash" self-test in this
+                // file; only docker_cleanup_failed specifically must stay
+                // false, checked below.
+                envoy.stop();
+                if (envoy.docker_cleanup_failed) {
+                    std::cerr << "FAIL [self-test record-only docker cleanup fails closed]: "
+                                 "docker_cleanup_failed was set despite a successful removal\n";
+                    ok = false;
+                }
+                std::vector<CaseResult> results(1);
+                results[0].name = "connect_authority";
+                const std::string fatal_error =
+                    classify_record_only_envoy_stop_failure(envoy, &results);
+                if (!fatal_error.empty()) {
+                    std::cerr << "FAIL [self-test record-only docker cleanup fails closed]: "
+                                 "classify_record_only_envoy_stop_failure() failed closed for an "
+                                 "ordinary record-only crash, which must stay non-gating\n";
+                    ok = false;
+                }
+                if (!results[0].upstream_ambiguous ||
+                    results[0].upstream_ambiguous_reason != AmbiguityReason::kProxyCrash) {
+                    std::cerr << "FAIL [self-test record-only docker cleanup fails closed]: "
+                                 "an ordinary record-only crash was not marked ambiguous with "
+                                 "kProxyCrash\n";
+                    ok = false;
+                }
+            }
+        }
+    }
+
+    if (ok) std::cerr << "PASS [self-test record-only docker cleanup fails closed]\n";
     return ok;
 }
 
@@ -10897,6 +11067,7 @@ int run_self_test(const std::string& rut_binary, const std::string& converter_bi
     ok &= self_test_envoy_instance_cleans_up_after_readiness_reaps_docker();
     ok &= self_test_docker_rm_failure_preserves_launched();
     ok &= self_test_docker_cleanup_failure_blocks_retry();
+    ok &= self_test_record_only_docker_cleanup_failure_fails_closed();
     ok &= self_test_rut_wait_ready_ownership();
     ok &= self_test_rut_log_confirms_listener();
     ok &= self_test_count_listeners_on_port();
