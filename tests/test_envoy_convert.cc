@@ -1045,13 +1045,14 @@ TEST(envoy_convert, api_all_capabilities_matches_golden) {
 // with the h2c connection preface") is not gated behind a `RutCapabilities`
 // flag; `rut-envoy-convert` instead accepts and warns on stderr after a
 // successful conversion (src/envoy/main.cc, `warn_h2c_preface`), same as the
-// `connect_timeout` divergence. The real CLI binary can't reach that print
-// today (`kShippedRutCapabilities` is still all-false, so every real
-// conversion fails closed before reaching it — see
-// cli_milestone_s_fails_closed_with_request_gap above), so this test asserts
-// the library-level predicate and message the CLI calls, and confirms the
-// milestone fixture keeps lowering to the unchanged golden RUT text once all
-// three capabilities land.
+// `connect_timeout` divergence. `kShippedRutCapabilities` is now all true
+// (PR3/PR4/PR5 have landed), so the real CLI binary does reach that print --
+// `cli_milestone_s_converts` above runs the actual CLI end to end and
+// asserts the h2c-preface warning appears on stderr after the connect_timeout
+// warning. This test instead exercises the library-level predicate and
+// message directly (`needs_h2c_preface_warning`, `kH2cPrefaceWarningText`)
+// against an explicit all-capabilities-true lowering, independent of the CLI
+// process and of which capabilities the shipped binary happens to have.
 TEST(envoy_convert, api_milestone_needs_h2c_preface_warning) {
     const std::string text = milestone_s_json();
     static envoy::JsonDocument doc;
