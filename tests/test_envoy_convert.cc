@@ -2447,6 +2447,70 @@ TEST(envoy_convert, token_budget_goldens_match_the_real_lexer) {
     CHECK_LT(lexed_c.value().tokens.len, LexedTokens::kMaxTokens);
 }
 
+// Codex sweep-1 review: `RutSource::kWorstCaseOrderedRouteListBytes`
+// (include/rut/envoy/converter.h) bounds the true worst case for
+// `kMaxEnvoyRoutes` declared routes -- not one forward() block per route (16
+// total, the pre-sweep-1 estimate) but one per NODE ARM, and every non-root
+// node contributes two arms: its own conditional prefix arm, plus one
+// unconditional nearest-declared-ancestor terminal arm (`build_node_plan`'s
+// "Remainder" algorithm doc comment, src/envoy/converter.cc). `kMaxEnvoyRoutes`
+// prefix routes declared narrowest-to-broadest is exactly that worst case:
+// each one is strictly broader than (so declared after) every earlier one,
+// so none is ever dropped as globally shadowed (Codex round-9 on PR #695),
+// and all `kMaxEnvoyRoutes` register as distinct nodes -- `kMaxEnvoyRoutes -
+// 1` two-arm non-root nodes plus one one-arm root node, doubled across the
+// HEAD/non-HEAD method variants (`put_route_node`), for 30 total forward()
+// blocks at `kMaxEnvoyRoutes == 8`, not 16.
+//
+// This shape also exceeds the unrelated, separately-tested lexer token
+// budget (`LexedTokens::kMaxTokens`; see `token_budget_goldens_match_the_
+// real_lexer` above and docs/envoy-converter.md, "Emitted program size is
+// separately capped..."), so `lower_to_rut` itself cannot return a
+// successful `RutSource` for it -- `lower_to_rut_ignoring_token_budget_for_
+// test` (include/rut/envoy/converter.h) skips only that unrelated gate to
+// let this test measure the real emitted byte count against
+// `RutSource::kCapacity` and the corrected `kWorstCaseOrderedRouteListBytes`
+// bound directly.
+TEST(envoy_convert, capacity_covers_worst_case_node_arm_duplication) {
+    std::vector<std::string> prefixes;
+    std::string cumulative;
+    for (u32 depth = 1u; depth < envoy::kMaxEnvoyRoutes; depth++) {
+        cumulative += "seg" + std::to_string(depth) + "/";
+        prefixes.push_back("/" + cumulative);
+    }
+    // Narrowest (most segments) first, broadest non-root prefix last.
+    std::reverse(prefixes.begin(), prefixes.end());
+    prefixes.push_back("/");  // root: broadest of all, declared last.
+    REQUIRE_EQ(prefixes.size(), static_cast<size_t>(envoy::kMaxEnvoyRoutes));
+
+    std::vector<std::string> routes;
+    std::vector<std::string> clusters;
+    for (size_t i = 0; i < prefixes.size(); i++) {
+        const std::string cluster_name = "backend" + std::to_string(i);
+        routes.push_back(prefix_route_json(prefixes[i], cluster_name));
+        clusters.push_back(cluster_json(cluster_name, 9000 + static_cast<int>(i)));
+    }
+
+    const std::string text = route_list_json(json_array(routes), json_array(clusters));
+    static envoy::JsonDocument doc;
+    auto parsed = envoy::parse_bootstrap_json(str(text), doc);
+    REQUIRE(parsed);
+    const envoy::RutCapabilities all_true{true, true, true};
+
+    // Confirms the premise: the full worst-case shape does exceed the
+    // (separate) token budget, so `lower_to_rut` itself cannot be used to
+    // observe the emitted byte count for it.
+    const auto lowered = envoy::lower_to_rut(parsed.value(), all_true);
+    CHECK_FALSE(lowered);
+    CHECK(lowered.error().code == FrontendError::TooManyTokens);
+
+    const auto emitted =
+        envoy::lower_to_rut_ignoring_token_budget_for_test(parsed.value(), all_true);
+    REQUIRE(emitted);
+    CHECK_LT(emitted.value().len, envoy::RutSource::kCapacity);
+    CHECK_LT(emitted.value().len, envoy::RutSource::kWorstCaseOrderedRouteListBytes);
+}
+
 // Codex round-9 review: "/" declared before "/api/" makes "/api" globally
 // shadowed (root byte-prefixes everything), so `build_lowering_plan` now
 // drops it before registering it as a node at all -- the golden is

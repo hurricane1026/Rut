@@ -1410,10 +1410,15 @@ u32 estimate_conservative_token_count(Str text) {
     return count + 1u;
 }
 
-}  // namespace
-
-FrontendResult<RutSource> lower_to_rut(const Bootstrap& model,
-                                       const RutCapabilities& capabilities) {
+// Shared by `lower_to_rut` and the test-only
+// `lower_to_rut_ignoring_token_budget_for_test`: validates `model`, builds
+// the ordered-route-list plan, and emits it. Callers are responsible for the
+// lexer token-budget gate (`lower_to_rut` applies it; the test-only entry
+// point deliberately does not, so tests can measure `RutSource::kCapacity`
+// headroom independently of the separate, unrelated token budget -- see
+// `RutSource::kWorstCaseOrderedRouteListBytes`'s doc comment).
+FrontendResult<RutSource> emit_rut_source(const Bootstrap& model,
+                                          const RutCapabilities& capabilities) {
     auto validated = validate(model, capabilities);
     if (!validated) return core::make_unexpected(validated.error());
 
@@ -1455,22 +1460,37 @@ FrontendResult<RutSource> lower_to_rut(const Bootstrap& model,
         if (!put_route_node(writer, node.text, node.arms, "", 0u)) return fail_overflow();
     }
 
+    return output;
+}
+
+}  // namespace
+
+FrontendResult<RutSource> lower_to_rut(const Bootstrap& model,
+                                       const RutCapabilities& capabilities) {
+    auto emitted = emit_rut_source(model, capabilities);
+    if (!emitted) return emitted;
+
     // Codex round-6 review (P1): a byte-valid, under-`kCapacity` program can
     // still exceed `rut`'s own frontend lexer token budget (see
     // `estimate_conservative_token_count`'s doc comment above); fail closed
     // here instead of reporting success for a program `rut` cannot load.
-    const u32 estimated_tokens = estimate_conservative_token_count(output.view());
+    const u32 estimated_tokens = estimate_conservative_token_count(emitted.value().view());
     if (estimated_tokens > LexedTokens::kMaxTokens)
         return too_many_tokens(
             model.span,
             lit_str("generated RUT source exceeds the compiler frontend's lexer token budget "
                     "(LexedTokens::kMaxTokens); reduce the number of routes or clusters"));
 
-    return output;
+    return emitted;
 }
 
 FrontendResult<RutSource> lower_to_rut(const Bootstrap& model) {
     return lower_to_rut(model, kShippedRutCapabilities);
+}
+
+FrontendResult<RutSource> lower_to_rut_ignoring_token_budget_for_test(
+    const Bootstrap& model, const RutCapabilities& capabilities) {
+    return emit_rut_source(model, capabilities);
 }
 
 bool needs_h2c_preface_warning(const Bootstrap& model) {

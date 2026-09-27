@@ -14,20 +14,52 @@ struct RutSource {
     // diagnostic rather than a truncated program.
     //
     // Sized for the increment-4 ordered route-list lowering (envoy-pr-plan.md,
-    // PR 8 "Capacity"). Worst case: `kMaxEnvoyRoutes` (8) routes, each
-    // contributing at most one HEAD and one non-HEAD forward() block (~1500
-    // bytes apiece, see the golden in tests/fixtures/envoy_milestone_s.inc)
-    // plus nested if/else wrapper lines (~100 bytes per nesting level, up to
-    // 8 levels deep) and up to `kMaxEnvoyRoutes` `route exact` 404 fallbacks
-    // (~400 bytes each), plus fixed listen/upstream/unmatched overhead:
-    //   2 * 8 * 1500 + 2 * 8 * 8 * 100 + 8 * 400 + 2048 = 40448 bytes,
+    // PR 8 "Capacity"). Codex sweep-1 review: the original estimate assumed
+    // each of the `kMaxEnvoyRoutes` routes contributes at most one HEAD and
+    // one non-HEAD forward() block (16 total), but `build_node_plan`
+    // (src/envoy/converter.cc) duplicates a forwarding action once per NODE
+    // that reaches it, not once per declared route -- every non-root node's
+    // arm chain is exactly its own conditional `own-prefix` arm plus one
+    // unconditional `nearest-declared-ancestor` terminal arm (the "Remainder"
+    // algorithm doc comment above `build_node_plan`), and root's chain is
+    // always exactly its own single terminal arm. The true worst case is
+    // `kMaxEnvoyRoutes` prefix routes declared narrowest-to-broadest (no two
+    // shadow each other, so all `kMaxEnvoyRoutes` register as nodes): the
+    // `kMaxEnvoyRoutes - 1` non-root nodes each contribute 2 arms (2 forward()
+    // blocks + 1 if/else wrapper) and the root node contributes 1 arm (1
+    // forward() block, no wrapper) --
+    //   total arms   = 2 * (kMaxEnvoyRoutes - 1) + 1 = 2 * kMaxEnvoyRoutes - 1
+    //   total wraps  = kMaxEnvoyRoutes - 1
+    // -- each duplicated across both the HEAD and non-HEAD method variants
+    // (`put_route_node`). Using exact `path` routes instead of prefix routes
+    // to pack more arms into one node is never better: an exact route buys
+    // exactly 1 arm per route-list slot, versus 2 for a non-root prefix
+    // route, so spreading routes across the maximum number of distinct nodes
+    // (all prefixes) always dominates (verified: `capacity_covers_worst_case
+    // _node_arm_duplication`, tests/test_envoy_convert.cc, builds this exact
+    // 8-node nested-prefix shape and checks the emitted size against both
+    // `kCapacity` and this assertion's bound). `route exact "N"` 404
+    // fallbacks are NOT counted: `put_route_exact_404` is never called
+    // (`build_node_plan` fails closed with `BLOCKED_BY_RUT` instead whenever
+    // that shape would be needed), so that term is dropped rather than kept
+    // as dead margin. Byte estimates (~1500 bytes per forward() block, see
+    // the golden in tests/fixtures/envoy_milestone_s.inc; ~100 bytes per
+    // if/else wrapper) plus fixed listen/upstream/unmatched overhead:
+    //   2 * (2 * 8 - 1) * 1500 + 2 * (8 - 1) * 100 + 2048 = 48448 bytes,
     // comfortably under the 256 KiB ceiling the plan sets as the point where
     // `kMaxEnvoyRoutes` itself would need to shrink. kCapacity is set with
     // generous headroom above that bound for later increments (PR 9/10 add
     // `direct_response`/`redirect` bodies).
     static constexpr u32 kCapacity = 131072;  // 128 KiB
-    static_assert(kCapacity >= 2u * 8u * 1500u + 2u * 8u * 8u * 100u + 8u * 400u + 2048u,
-                  "RutSource::kCapacity must cover the PR8 worst-case ordered route-list lowering");
+    // Named so tests/test_envoy_convert.cc's
+    // `capacity_covers_worst_case_node_arm_duplication` can check the emitted
+    // size of the actual worst-case model against the same bound the
+    // static_assert below enforces, rather than duplicating the arithmetic.
+    static constexpr u32 kWorstCaseOrderedRouteListBytes =
+        2u * (2u * kMaxEnvoyRoutes - 1u) * 1500u + 2u * (kMaxEnvoyRoutes - 1u) * 100u + 2048u;
+    static_assert(kCapacity >= kWorstCaseOrderedRouteListBytes,
+                  "RutSource::kCapacity must cover the true per-node arm-duplication worst case "
+                  "of the ordered route-list lowering");
     char data[kCapacity]{};
     u32 len = 0;
 
@@ -59,6 +91,23 @@ FrontendResult<RutSource> lower_to_rut(const Bootstrap& model);
 // it real; production code must not construct a non-default
 // `RutCapabilities`.
 FrontendResult<RutSource> lower_to_rut(const Bootstrap& model, const RutCapabilities& capabilities);
+
+// Test-only: the same validation and emission as `lower_to_rut` above, but
+// without its final lexer token-budget gate (`LexedTokens::kMaxTokens`,
+// src/envoy/converter.cc). `RutSource::kCapacity` and the token budget are
+// two independent, separately-tested bounds (docs/envoy-converter.md,
+// "Emitted program size is separately capped..."); a model built purely to
+// stress the byte-capacity worst case (many declared routes, each
+// contributing its own duplicated forwarding action -- see
+// `RutSource::kWorstCaseOrderedRouteListBytes`) also trips the unrelated
+// token budget long before `RutSource::kCapacity`, so `lower_to_rut` itself
+// can never return a successful `RutSource` for it to measure. This lets
+// `tests/test_envoy_convert.cc`'s `capacity_covers_worst_case_node_arm_
+// duplication` measure the real emitted byte count against `kCapacity`
+// directly. Production code must never call this: it is missing a check
+// `lower_to_rut` treats as load-bearing.
+FrontendResult<RutSource> lower_to_rut_ignoring_token_budget_for_test(
+    const Bootstrap& model, const RutCapabilities& capabilities);
 
 // PR #692 round-7 review: whether `model`'s accepted bootstrap requires the
 // h2c-preface disclaimer that `rut-envoy-convert` prints on stderr after a

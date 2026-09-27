@@ -528,10 +528,15 @@ are recorded from the pinned Envoy build, not assumed.
   emission, so a single extra arm on a single node costs on the order of a
   few hundred tokens. Measured against the real lexer (`rut::lex`,
   `tests/test_envoy_convert.cc`'s `token_budget_goldens_match_the_real_lexer`,
-  which links `rut_compiler` test-only): the two-node, single-arm-per-node
-  goldens (b)/(c) use 655/668 tokens, but scenario (a) — two nodes, one of
-  them with an `if`/`else` arm — already needs over 932 and fails to lex at
-  byte 8400 of its 8804-byte, well-under-`kCapacity` output. `lower_to_rut`
+  which links `rut_compiler` test-only): golden (c) — a genuine two-node,
+  single-arm-per-node shape — uses 668 tokens; golden (b) no longer is that
+  shape, since the round-9 shadowing fix (see "Multiple routes per virtual
+  host" above) drops its `/api/` node before it is ever registered, being
+  globally shadowed by the earlier root route — it now lowers root-only and
+  measures 360 tokens, not the 655 a two-node program of its old shape would
+  have needed. Scenario (a) — two nodes, one of them with an `if`/`else` arm
+  — already needs over 932 and fails to lex at byte 8400 of its 8804-byte,
+  well-under-`kCapacity` output. `lower_to_rut`
   now computes a conservative (never-under-counting) estimate of the emitted
   token count and fails closed with `TooManyTokens` before returning a
   program `rut` cannot load, rather than reporting success for one.
