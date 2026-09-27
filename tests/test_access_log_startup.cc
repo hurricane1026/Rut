@@ -618,17 +618,47 @@ i64 ms_since(i64 origin_ns, i64 at_ns) {
 // (e.g. the harness took the wrong port). Success proves only that SOME listener
 // completed the handshake -- not that it is rut's: on macOS a specific-address
 // listener on 127.0.0.1:<port> takes precedence over rut's wildcard one.
-i32 recheck_loopback_reachable(u16 port) {
+// The connect is non-blocking and bounded by the harness deadline or 500 ms,
+// whichever comes first; running out of time reports ETIMEDOUT.
+i32 recheck_loopback_reachable(u16 port, i64 deadline_ns) {
     const i32 fd = rut::test::cloexec_socket(AF_INET, SOCK_STREAM, 0);
     if (fd < 0) return errno;
+    const i32 flags = fcntl(fd, F_GETFL);
+    if (flags < 0 || fcntl(fd, F_SETFL, flags | O_NONBLOCK) != 0) {
+        const i32 error = errno;
+        close(fd);
+        return error;
+    }
     struct sockaddr_in address{};
     address.sin_family = AF_INET;
     address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
     address.sin_port = htons(port);
-    const i32 result =
-        connect(fd, reinterpret_cast<const struct sockaddr*>(&address), sizeof(address)) == 0
-            ? 0
-            : errno;
+    i32 result = 0;
+    if (connect(fd, reinterpret_cast<const struct sockaddr*>(&address), sizeof(address)) != 0) {
+        result = errno;
+        if (result == EINPROGRESS || result == EINTR) {
+            const i64 cap_ns = monotonic_ns() + 500'000'000LL;
+            const i64 until_ns = deadline_ns < cap_ns ? deadline_ns : cap_ns;
+            result = ETIMEDOUT;
+            for (;;) {
+                const i64 remaining_ns = until_ns - monotonic_ns();
+                if (remaining_ns <= 0) break;
+                struct pollfd ready{fd, POLLOUT, 0};
+                const i32 polled =
+                    poll(&ready, 1, static_cast<i32>(remaining_ns / 1'000'000LL) + 1);
+                if (polled < 0 && errno == EINTR) continue;
+                if (polled < 0) {
+                    result = errno;
+                    break;
+                }
+                if (polled == 0) continue;
+                i32 error = 0;
+                socklen_t length = sizeof(error);
+                result = getsockopt(fd, SOL_SOCKET, SO_ERROR, &error, &length) == 0 ? error : errno;
+                break;
+            }
+        }
+    }
     close(fd);
     return result;
 }
@@ -639,7 +669,8 @@ i32 recheck_loopback_reachable(u16 port) {
 // unconnected socket bound to exactly 127.0.0.1:<port> -- such as a shadowing
 // listener -- does, so EADDRINUSE there flags a specific-address owner and
 // success rules one out. On Linux a listening wildcard socket blocks the bind
-// by itself, so EADDRINUSE carries no ownership information there.
+// by itself, so EADDRINUSE carries no ownership information there. bind(2) on
+// a local address never waits, so this probe cannot block.
 i32 probe_specific_loopback_bind(u16 port) {
     const i32 fd = rut::test::cloexec_socket(AF_INET, SOCK_STREAM, 0);
     if (fd < 0) return errno;
@@ -822,11 +853,13 @@ SourceLiveProxyResult run_source_live_proxy(
             result.request_completed =
                 transact_loopback(port, request, request_length, result.response, result.client);
             result.transact_done_ns = monotonic_ns();
+            // A regular file in the test's private mkdtemp dir (the loop below
+            // already reads it every iteration), so this read cannot block.
             result.sink_after_transact = read_file(sink);
             result.sink_captured = true;
             if (!result.request_completed) {
                 result.rechecked = true;
-                result.recheck_connect_errno = recheck_loopback_reachable(port);
+                result.recheck_connect_errno = recheck_loopback_reachable(port, deadline_ns);
                 result.specific_bind_errno = probe_specific_loopback_bind(port);
             }
         }
