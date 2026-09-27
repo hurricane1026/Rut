@@ -595,31 +595,38 @@ struct SourceLiveProxyResult {
     bool sink_prefixes_valid = true;
     bool sink_observed_live = false;
     // Failure diagnostics: wall-clock milestones relative to fork(), the client's
-    // stage, and who owned the listening port while the transaction was stuck.
+    // stage, and what the port and sink looked like once the transaction failed.
     LoopbackTrace client;
     u16 port = 0u;
     i64 forked_at_ns = 0;
     i64 listening_seen_ns = 0;
     i64 transact_done_ns = 0;
-    std::string port_owners;
+    bool reprobed = false;
+    i32 reprobe_connect_errno = 0;  // 0 = a fresh connect to `port` succeeded
+    std::string sink_after_transact;
 };
 
 i64 ms_since(i64 origin_ns, i64 at_ns) {
     return at_ns == 0 ? -1 : (at_ns - origin_ns) / 1'000'000LL;
 }
 
-// Snapshot every socket on `port` (all processes) while the child is still
-// alive. A loopback client that connects but never reaches rut shows up here
-// as a different owner of 127.0.0.1:<port>. Best effort: empty if lsof is absent.
-std::string snapshot_port_owners(u16 port) {
-    const std::string command = "lsof -nP -iTCP:" + std::to_string(port) + " 2>&1";
-    FILE* pipe = popen(command.c_str(), "r");
-    if (pipe == nullptr) return "(popen failed)";
-    std::string owners;
-    char line[512];
-    while (fgets(line, sizeof(line), pipe) != nullptr) owners += line;
-    (void)pclose(pipe);
-    return owners;
+// Self-contained probe run while the child is still alive: open and close one
+// fresh loopback connection to `port`. ECONNREFUSED means nothing listens there
+// (e.g. the harness took the wrong port); success means some listener accepts
+// the handshake, which with a silent transaction points at rut not serving it.
+i32 reprobe_loopback_connect(u16 port) {
+    const i32 fd = rut::test::cloexec_socket(AF_INET, SOCK_STREAM, 0);
+    if (fd < 0) return errno;
+    struct sockaddr_in address{};
+    address.sin_family = AF_INET;
+    address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    address.sin_port = htons(port);
+    const i32 result =
+        connect(fd, reinterpret_cast<const struct sockaddr*>(&address), sizeof(address)) == 0
+            ? 0
+            : errno;
+    close(fd);
+    return result;
 }
 
 void report_source_live_failure(const SourceLiveProxyResult& result) {
@@ -631,8 +638,9 @@ void report_source_live_failure(const SourceLiveProxyResult& result) {
                   "read_errno=%d idle_polls=%u response_bytes=%zu\n"
                   "      backend: accepts=%u sends=%u timed_out=%d request_bytes=%zu\n"
                   "      process: shutdown_sent=%d forced_kill=%d status_valid=%d status=0x%x\n"
-                  "      rut output=[%s]\n"
-                  "      port owners while stuck=[%s]\n",
+                  "      reprobe: done=%d connect_errno=%d\n"
+                  "      sink after transaction=[%s]\n"
+                  "      rut output=[%s]\n",
                   static_cast<unsigned>(result.port),
                   static_cast<long long>(ms_since(origin, result.listening_seen_ns)),
                   static_cast<long long>(ms_since(origin, result.transact_done_ns)),
@@ -653,8 +661,10 @@ void report_source_live_failure(const SourceLiveProxyResult& result) {
                   result.process.forced_kill ? 1 : 0,
                   result.process.status_valid ? 1 : 0,
                   static_cast<unsigned>(result.process.status),
-                  result.process.output.c_str(),
-                  result.port_owners.c_str());
+                  result.reprobed ? 1 : 0,
+                  result.reprobe_connect_errno,
+                  result.sink_after_transact.c_str(),
+                  result.process.output.c_str());
 }
 
 enum class SourceLiveProxyMode : u8 {
@@ -771,7 +781,11 @@ SourceLiveProxyResult run_source_live_proxy(
             result.request_completed =
                 transact_loopback(port, request, request_length, result.response, result.client);
             result.transact_done_ns = monotonic_ns();
-            if (!result.request_completed) result.port_owners = snapshot_port_owners(port);
+            if (!result.request_completed) {
+                result.reprobed = true;
+                result.reprobe_connect_errno = reprobe_loopback_connect(port);
+                result.sink_after_transact = read_file(sink);
+            }
         }
         if (transaction_attempted && !backend_joined) {
             backend.join();
