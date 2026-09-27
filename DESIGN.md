@@ -1955,9 +1955,14 @@ rejects `content_length_position`/`retained_header_value` and requires
 
 `host: "preserve"` (ID4) additionally: drops every header nominated by the
 client's `Connection` header value (RFC 7230-style hop-by-hop stripping, not
-just the fixed `strip_headers` list) except `content-length`, `host`,
-`x-forwarded-for`, `x-forwarded-host`, and `x-forwarded-proto`, nominating
-any of which fails the whole request closed instead (dropping the framing or
+just the fixed `strip_headers` list) except `te` and the protected names
+`content-length`, `host`, `x-forwarded-for`, `x-forwarded-host`, and
+`x-forwarded-proto`. A `te` nomination never forces a drop by itself: the
+request-wide `trailers` check below alone decides whether one canonical
+`te: trailers` line is forwarded, matching Envoy's own nomination special
+case (so `Connection: TE` with `TE: trailers` forwards `te: trailers`).
+Nominating any of the protected names fails the whole request closed instead
+(dropping the framing or
 provenance header while still forwarding the request is unsafe -- see
 `docs/envoy-compatibility.md`), as does nominating a pseudo-header-shaped
 token (one whose first byte is `:`, e.g. the aliased `:authority`), matching
