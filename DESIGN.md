@@ -1936,11 +1936,17 @@ semantics. An empty or OWS-only `Expect` field carries no expectation at all
 a request with no `Expect` header: the serializer strips every `Expect`
 field via `drop_fixed` regardless of value, so this shape (most commonly
 paired with `Content-Length: 0`) has nothing left to negotiate (Codex
-round-9 review, PR #696). (ID4 instead admits a bare
-`Upgrade` header -- one whose `Connection` value does not itself nominate the
-`upgrade` token -- but always strips it from the forwarded request; the
-request is never rejected for it, but the header itself never reaches the
-wire unmodified -- see below). `host: "upstream"` (ID1/ID2/ID3) additionally
+round-9 review, PR #696). (ID4 instead admits a bare `Upgrade` header --
+one not paired with a `Connection` value that nominates the `upgrade`
+token together with a semantically-present (non-empty/OWS) `Upgrade`
+value; that genuine-upgrade combination still fails closed for ID4 too,
+the same as every other policy -- see below. Every admitted `Upgrade`
+field, nominated or not, is always stripped from the forwarded request:
+Envoy itself forwards a bare `Upgrade` header unchanged on the wire, but
+Rut's request_policy path has no upgrade-tunnel capability at all, so
+"admitted" here means only that the request is not rejected for it, not
+that the header reaches the wire -- it never does, unmodified or
+otherwise). `host: "upstream"` (ID1/ID2/ID3) additionally
 rejects `header_names`, `forwarded_proto`, and a `Proxy-Connection` strip
 entry, and
 requires exactly the original five strip names; `host: "preserve"` (ID4)

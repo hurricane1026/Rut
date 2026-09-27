@@ -26,14 +26,18 @@ enum class RequestPolicyId : u16 {
     // `x-forwarded-host`, `x-forwarded-proto`, or a pseudo-header-shaped
     // token (first byte `:`), each of which fails the whole request closed
     // instead of being dropped, and except a nomination of `te`, which is
-    // not dropped at all and does not affect persistence -- its sibling `TE`
-    // field is evaluated the same as always (see below) and forwarded as
-    // `te: trailers` when warranted. Keeps a `te` field only when one of its
-    // comma-separated tokens is "trailers" (any casing; `TE: gzip, trailers`
-    // is kept, `TE: gzip` is dropped) and rewrites the kept field to exactly
-    // `te: trailers` -- never the whole client value -- emitted at the first
-    // physical `TE` field's position, with several such fields collapsing to
-    // one line. A single client-supplied `x-forwarded-proto` field whose
+    // not dropped at all and does not affect persistence -- `TE` handling
+    // (see below) decides its fate the same way regardless of nomination.
+    // Whether any physical `TE` field anywhere in the request carries a
+    // "trailers" token (any casing, comma-separated) is a request-wide
+    // decision, not a per-field one: when so, exactly one canonical
+    // `te: trailers` line -- never the whole client value -- is emitted at
+    // the position of the *first* physical `TE` field, whichever field
+    // actually carried the token or not, and every other physical `TE`
+    // field is dropped (e.g. `TE: gzip`, then later `TE: trailers`, forwards
+    // `te: trailers` at the first field's position, not the second); when no
+    // field anywhere carries the token, every `TE` field is dropped.
+    // A single client-supplied `x-forwarded-proto` field whose
     // trimmed value is case-insensitively exactly `http`/`https` is
     // preserved unchanged in its original position; an empty, OWS-only, or
     // otherwise invalid value is overwritten in place at that same position

@@ -435,7 +435,11 @@ return forward(users,
 // its own field, dropped -- unless it names a protected header
 // (`content-length`, `host`,
 // the three forwarded-provenance headers, or a pseudo-header-shaped token
-// starting with `:`, each of which fails the whole request closed instead)
+// starting with `:`, each of which fails the whole request closed instead),
+// is `te` (never dropped along with its field regardless of nomination --
+// the TE-trailers canonicalization rule alone decides its fate, exactly as
+// without a nomination; a nominated `TE: trailers` still forwards one
+// canonical `te: trailers` line, Codex sweep-13 review, PR #696),
 // or is a genuine upgrade (a nominated `upgrade` token together with a
 // semantically present, non-empty/OWS `Upgrade` field anywhere on the
 // request -- e.g. `Connection: close, upgrade` with an absent or

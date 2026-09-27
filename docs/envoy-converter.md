@@ -293,12 +293,15 @@ folded into the golden below and into the parser/converter implementation:
    combination the converter uses; it is dropped from the lowering. The
    `"TE"` entry does not mean "always strip": per the Envoy oracle
    (`tests/fixtures/envoy_oracle_milestone_s.inc`) and Envoy's own
-   `sanitizeConnectionHeader`, `host: "preserve"` keeps a client `te` field
-   whenever one of its comma-separated tokens is `trailers` (any casing;
-   `TE: gzip, trailers` is kept), rewrites the kept field to exactly
-   `te: trailers` (Envoy forwards only that canonical token, never the
-   client's other tokens or casing), collapses several such fields to one
-   line, and strips a `te` field that carries no `trailers` token.
+   `sanitizeConnectionHeader`, `host: "preserve"` decides `te`'s fate as one
+   request-wide question, not per physical field -- whether *any* client
+   `TE` field anywhere in the request carries a `trailers` token among its
+   comma-separated tokens (any casing; `TE: gzip, trailers` counts) -- and
+   when so, forwards exactly one canonical `te: trailers` line (never the
+   client's other tokens or casing) at the position of the *first* physical
+   `TE` field, whichever field actually carried the token or not; every
+   other physical `TE` field is dropped, and when no field anywhere carries
+   the token, every `TE` field is dropped.
 3. `request_policy` and `set_header` cannot be used together
    (`src/compiler/parser.cc` around lines 2022 and 2568). The milestone
    lowering therefore does not use `set_header`; `x-forwarded-proto` is
@@ -1088,9 +1091,14 @@ Each needs its own issue before the corresponding row can leave
   policy), so `inspect_request_policy_body` fails this shape closed today —
   the client gets an immediate rejection instead of the `100 Continue` it
   expects. This is the same fail-closed behavior the fixed-length request
-  policies (ID1/ID2/ID3) already apply to any `Expect` header; `request_envoy_h1`
-  does not add interim-response support and this request shape stays outside
-  its advertised capability until a `100 Continue` primitive exists.
+  policies (ID1/ID2/ID3) already apply to a client `Expect` field whose
+  trimmed value is non-empty, not to any `Expect` header at all: an empty
+  or OWS-only `Expect` field (e.g. `Expect:` or an all-whitespace value)
+  carries no actual expectation and is admitted like a request with none,
+  stripped the same as any other `Expect` field. `request_envoy_h1` does
+  not add interim-response support and this request shape (a genuinely
+  non-empty `Expect` value) stays outside its advertised capability until
+  a `100 Continue` primitive exists.
 - `response_policy.date: "preserve_or_current"`: add `date` only when absent.
 - `response_policy.server: "envoy"` with overwrite semantics, and an explicit
   "pass through upstream `server`" mode for `server_header_transformation:

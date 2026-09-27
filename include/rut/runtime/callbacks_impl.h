@@ -5669,12 +5669,19 @@ inline bool request_policy_is_stripped_client_envoy_header(const u8* p, u32 n) {
 // omitted: each already has its own fail-closed or canonicalizing duplicate
 // handling above (host/xfp count checks, the TE/Connection nomination
 // rules), so folding them into this generic table would just duplicate or
-// conflict with that logic. `keep-alive`, `proxy-connection`, and
-// `transfer-encoding` are omitted too: `drop_fixed` above (via
-// `request_policy_is_stripped_client_envoy_header` and its own literal
-// checks) already strips every physical occurrence of those unconditionally,
-// so no duplicate can ever reach upstream regardless of this table. This
-// profile does not replicate Envoy's coalescing for the remaining names, so
+// conflict with that logic. `keep-alive` and `proxy-connection` are omitted
+// too: `drop_fixed` above (via `request_policy_is_stripped_client_envoy_
+// header` and its own literal checks) already strips every physical
+// occurrence of those unconditionally, so no duplicate can ever reach
+// upstream regardless of this table. `transfer-encoding` is omitted for a
+// different reason -- not because it is stripped, but because
+// `inspect_request_policy_body` fails the whole request closed outright on
+// the first physical occurrence of it, before this serializer ever runs
+// (Codex sweep-11/sweep-13 review, PR #696: an earlier revision of this
+// comment grouped it with the two unconditionally-stripped names above,
+// which is not what happens to it), so a duplicate can never reach this
+// table's own duplicate-detection logic either. This profile does not
+// replicate Envoy's coalescing for the remaining names, so
 // a second physical occurrence of any of them fails the request closed
 // (400) instead of silently forwarding upstream bytes that diverge from
 // what an Envoy-parity client intended.
@@ -5850,10 +5857,16 @@ inline RequestPolicyBodyState inspect_request_policy_body(const Connection& conn
             host_value_len = static_cast<u32>(host_end_trim - host_start);
         }
         // Every `te` field is admitted here regardless of its value (see the
-        // `has_te` gate below): the serializer evaluates each field
-        // independently, canonicalizing a "trailers" token and dropping
-        // every other field/value, so admission only needs to know whether
-        // this is a preserve-host policy capable of that handling.
+        // `has_te` gate below): the serializer decides `te`'s fate as one
+        // request-wide question, not per physical field -- whether *any*
+        // field anywhere on the request carries a "trailers" token -- and
+        // when so, canonicalizes to exactly one `te: trailers` line at the
+        // *first* physical TE field's position, dropping every other field
+        // regardless of its own value (Codex sweep-13 review, PR #696:
+        // an earlier revision of this comment described independent
+        // per-field evaluation, which is not what the serializer does).
+        // Admission here only needs to know whether this is a preserve-host
+        // policy capable of that handling.
         has_te |= request_policy_name_eq(hs, name_len, "te", 2);
         if (request_policy_name_eq(hs, name_len, "connection", 10)) {
             const u8* value_start = colon + 1;
@@ -6019,12 +6032,18 @@ inline RequestPolicyBodyState inspect_request_policy_body(const Connection& conn
     if (has_expect) return RequestPolicyBodyState::Invalid;
     // A bare `Upgrade` header without an actual upgrade nomination is not
     // rejected for ID4 (the genuine-upgrade shape was already fail-closed
-    // above, unconditionally on body framing); ID4's serializer already
-    // strips a stray `Upgrade` field unconditionally (`drop_fixed`), matching
-    // Envoy, which forwards this shape unchanged rather than rejecting it.
-    // Every other supported policy keeps the original closed contract of
-    // rejecting any `Upgrade` header outright on this body-carrying path,
-    // matching its own prior tested behavior.
+    // above, unconditionally on body framing) -- "admitted" means only that
+    // the request is not rejected for it, not that the header reaches the
+    // wire: ID4's serializer always strips every `Upgrade` field
+    // unconditionally (`drop_fixed`), nominated or not, so it never appears
+    // in the forwarded request. This is a deliberate divergence from Envoy,
+    // which forwards a bare `Upgrade` header unchanged on the wire (Rut's
+    // request_policy path has no upgrade-tunnel capability to preserve it
+    // for, Codex sweep-13 review, PR #696, correcting an earlier revision of
+    // this comment that could be misread as claiming Rut also forwards it
+    // unchanged). Every other supported policy keeps the original closed
+    // contract of rejecting any `Upgrade` header outright on this
+    // body-carrying path, matching its own prior tested behavior.
     if (!request_policy_preserves_host(policy_id) && has_upgrade)
         return RequestPolicyBodyState::Invalid;
     if (has_te && !request_policy_preserves_host(policy_id)) return RequestPolicyBodyState::Invalid;
@@ -9951,13 +9970,18 @@ inline bool response_policy_suppress_head_admitted(const Connection& conn,
     ParsedRequest req;
     parser.reset();
     // ID4 (`host: "preserve"`) admits a bare, non-empty `Upgrade` header with
-    // no `Connection: upgrade` nomination -- its serializer
-    // (`apply_preserve_host_lowercase_request_policy`) strips it
-    // unconditionally (`drop_fixed`), matching Envoy, which forwards this
-    // shape unchanged rather than rejecting it (see the body-inspection
-    // comment near `inspect_request_policy_body` above). The genuine-upgrade
-    // shape -- `Upgrade` together with a `Connection: upgrade` nomination --
-    // stays fail-closed for every policy, ID4 included, because Rut's
+    // no `Connection: upgrade` nomination -- "admitted" means only that the
+    // request is not rejected for it, not that the header reaches the wire:
+    // its serializer (`apply_preserve_host_lowercase_request_policy`) always
+    // strips every `Upgrade` field unconditionally (`drop_fixed`), so it
+    // never appears in the forwarded request. This is a deliberate
+    // divergence from Envoy, which forwards a bare `Upgrade` header
+    // unchanged on the wire (Rut's request_policy path has no
+    // upgrade-tunnel capability to preserve it for; see the body-inspection
+    // comment near `inspect_request_policy_body` above, corrected the same
+    // way, Codex sweep-13 review, PR #696). The genuine-upgrade shape --
+    // `Upgrade` together with a `Connection: upgrade` nomination -- stays
+    // fail-closed for every policy, ID4 included, because Rut's
     // request_policy path has no upgrade-tunnel capability. Every other
     // policy keeps the original closed contract of rejecting any `Upgrade`
     // header outright.
