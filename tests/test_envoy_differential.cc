@@ -1170,11 +1170,27 @@ public:
     bool wait_idle(int timeout_ms) {
         constexpr int kQuietWindowMs = 100;
         const int64_t deadline = now_ms() + timeout_ms;
+        // Sweep-9 review, "Fail when the quiet-window deadline expires":
+        // only a poll() that actually waited out the FULL `kQuietWindowMs`
+        // and still saw nothing counts as proof the backlog is empty. If
+        // repeated arrivals keep resetting the window until less than
+        // `kQuietWindowMs` remains before `deadline`, the final poll()
+        // below is deliberately shortened to whatever time is left (so it
+        // can still opportunistically catch and drain a very-late
+        // arrival), but its own timeout must NOT be mistaken for a
+        // completed quiet window: nothing observed a stable empty interval
+        // in that case, so this call must report failure (`false`) rather
+        // than let a caller snapshot/clear its evidence believing the
+        // backlog was proven quiet. `backlog_proven_empty` tracks this
+        // distinction explicitly instead of inferring it from `drained`.
+        bool backlog_proven_empty = false;
         {
             std::lock_guard<std::mutex> lock(conn_mu_);
             draining_ = true;
             const int fd = listen_fd_;
-            if (fd >= 0) {
+            if (fd < 0) {
+                backlog_proven_empty = true;  // nothing to drain at all
+            } else {
                 for (;;) {
                     for (;;) {
                         const int accepted_fd = accept(fd, nullptr, nullptr);
@@ -1183,16 +1199,19 @@ public:
                         conn_threads_.emplace_back(
                             &RecordingUpstream::handle_connection, this, accepted_fd);
                     }
-                    if (now_ms() >= deadline) break;
                     const int64_t remaining_ms = deadline - now_ms();
-                    const int wait_ms = static_cast<int>(
-                        std::min<int64_t>(kQuietWindowMs, std::max<int64_t>(remaining_ms, 0)));
+                    if (remaining_ms <= 0) break;  // overall deadline reached: no proof
+                    const bool full_window_available = remaining_ms >= kQuietWindowMs;
+                    const int wait_ms =
+                        static_cast<int>(full_window_available ? kQuietWindowMs : remaining_ms);
                     pollfd pfd{fd, POLLIN, 0};
                     const int pr = poll(&pfd, 1, wait_ms);
                     if (pr <= 0 || (pfd.revents & POLLIN) == 0) {
-                        // A full quiet window elapsed with nothing arriving
-                        // (or the overall deadline was reached): the
-                        // backlog is proven empty and stable.
+                        // Nothing arrived during this wait. Only a FULL
+                        // quiet window's worth of silence is proof; a
+                        // deadline-shortened wait proves nothing, however
+                        // it turned out.
+                        if (full_window_available) backlog_proven_empty = true;
                         break;
                     }
                     // Something arrived during the quiet window: loop back
@@ -1200,7 +1219,7 @@ public:
                 }
             }
         }
-        bool drained = true;
+        bool drained = backlog_proven_empty;
         for (;;) {
             {
                 std::lock_guard<std::mutex> lock(conn_mu_);
@@ -5573,6 +5592,87 @@ bool self_test_wait_idle_redrains_after_eagain() {
 
     upstream.stop();
     if (ok) std::cerr << "PASS [self-test wait_idle redrains after eagain]\n";
+    return ok;
+}
+
+// Sweep-9 review, "Fail when the quiet-window deadline expires": reproduces
+// arrivals that keep resetting the 100ms quiet window (every 20ms, faster
+// than the window itself) for the WHOLE duration of wait_idle()'s own
+// timeout, so a full quiet window can never complete. wait_idle() must
+// report failure (false) rather than let the final, deadline-shortened
+// poll()'s own timeout masquerade as a completed quiet window just because
+// no handler happened to still be running when the overall deadline hit.
+bool self_test_wait_idle_fails_on_relentless_arrivals() {
+    BoundPort bound;
+    if (!allocate_bound_loopback_port(&bound)) {
+        std::cerr << "FAIL [self-test wait_idle relentless arrivals]: could not allocate a "
+                     "loopback port\n";
+        return false;
+    }
+    const uint16_t port = bound.port;
+
+    RecordingUpstream upstream;
+    upstream.set_default_reply(
+        "HTTP/1.1 200 OK\r\nConnection: close\r\nContent-Length: 2\r\n\r\nhi");
+    if (!upstream.adopt(bound.fd)) {
+        std::cerr << "FAIL [self-test wait_idle relentless arrivals]: could not adopt the "
+                     "listener\n";
+        return false;
+    }
+
+    constexpr int kWaitIdleTimeoutMs = 400;
+    constexpr int kArrivalIntervalMs = 20;
+    std::atomic<bool> stop_sending{false};
+    std::atomic<int> arrivals_sent{0};
+    // A new connection every 20ms -- well under a fifth of the 100ms quiet
+    // window, leaving generous margin for host scheduling jitter -- for as
+    // long as wait_idle() below is running, so the window can never
+    // complete. Does not wait for the reply (just connect+send+close): the
+    // point is to keep the listener's backlog non-empty at a high rate,
+    // not to exercise a full request/response round trip, and skipping the
+    // read keeps each iteration's own latency well below the interval.
+    std::thread relentless_arrivals([port, &stop_sending, &arrivals_sent] {
+        while (!stop_sending.load()) {
+            const int fd = connect_with_timeout(port, kClientTimeoutMs);
+            if (fd >= 0) {
+                const std::string req =
+                    "GET /relentless HTTP/1.1\r\nHost: t.example\r\nConnection: close\r\n\r\n";
+                if (send_all(fd, req)) arrivals_sent.fetch_add(1);
+                close(fd);
+            }
+            struct timespec ts{0, static_cast<long>(kArrivalIntervalMs) * 1'000'000};
+            nanosleep(&ts, nullptr);
+        }
+    });
+
+    bool ok = true;
+    const int64_t start = now_ms();
+    const bool went_idle = upstream.wait_idle(kWaitIdleTimeoutMs);
+    const int64_t elapsed = now_ms() - start;
+    stop_sending.store(true);
+    relentless_arrivals.join();
+
+    if (went_idle) {
+        std::cerr << "FAIL [self-test wait_idle relentless arrivals]: wait_idle() reported idle "
+                     "despite arrivals every 20ms that never let a full 100ms quiet window "
+                     "complete\n";
+        ok = false;
+    }
+    // Should take roughly the full timeout, not return early.
+    if (elapsed < kWaitIdleTimeoutMs - 50) {
+        std::cerr << "FAIL [self-test wait_idle relentless arrivals]: wait_idle() returned after "
+                     "only "
+                  << elapsed << "ms, well before its " << kWaitIdleTimeoutMs << "ms timeout\n";
+        ok = false;
+    }
+    if (arrivals_sent.load() < 5) {
+        std::cerr << "FAIL [self-test wait_idle relentless arrivals]: the relentless-arrivals "
+                     "thread could not exercise the race (too few connections delivered)\n";
+        ok = false;
+    }
+
+    upstream.stop();
+    if (ok) std::cerr << "PASS [self-test wait_idle relentless arrivals]\n";
     return ok;
 }
 
@@ -10756,6 +10856,7 @@ int run_self_test(const std::string& rut_binary, const std::string& converter_bi
     ok &= self_test_wait_idle_synchronizes_with_pending_accept();
     ok &= self_test_wait_idle_drains_backlog_itself();
     ok &= self_test_wait_idle_redrains_after_eagain();
+    ok &= self_test_wait_idle_fails_on_relentless_arrivals();
     ok &= self_test_require_upstream_idle_for_asserted_batch();
     ok &= self_test_quiesce_after_record_only_idle_timeout();
     ok &= self_test_record_only_crash_reason_precedence();
