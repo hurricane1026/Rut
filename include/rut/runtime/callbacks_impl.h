@@ -9878,12 +9878,27 @@ inline bool response_policy_suppress_head_admitted(const Connection& conn,
     // physical fields there were is what `connection_close_token_seen`
     // already captures, and this shape only needs to know at least one such
     // field was present, not exactly how many.
-    const bool id4_close_with_te_shape = id4_route && !conn.req_client_keep_alive &&
-                                         conn.req_client_connection_close &&
-                                         connection_count != 0 && connection_close_token_seen;
+    //
+    // Deliberately does NOT consult `conn.req_client_keep_alive`/
+    // `conn.req_client_connection_close`: those are the parser's own
+    // (`match_connection`, `src/runtime/http_parser.cc`) running state,
+    // updated once per physical `Connection` field in wire order, and
+    // `keep_alive` is not sticky the way `connection_close` is -- a
+    // `Connection: close` field followed by a separate, later
+    // `Connection: keep-alive` field leaves `connection_close` correctly
+    // `true` but flips `keep_alive` back to `true` too, because the
+    // `keep-alive` branch does not check whether `close` was already seen
+    // on an earlier field. `connection_close_token_seen` has no such
+    // order-dependence: it is this preflight's own aggregate scan across
+    // every physical field (above), so it alone decides ID4 persistence
+    // here regardless of field order (Codex sweep-3 review, PR #696;
+    // reversing the two fields, or combining both tokens into one field,
+    // was already admitted before this fix -- only the split, close-first
+    // order was not).
+    const bool id4_close_with_te_shape =
+        id4_route && connection_count != 0 && connection_close_token_seen;
     const bool id4_default_keep_alive_with_te_shape =
-        id4_route && paired_failure && conn.req_client_keep_alive &&
-        !conn.req_client_connection_close && connection_count != 0 && !connection_close_token_seen;
+        id4_route && paired_failure && connection_count != 0 && !connection_close_token_seen;
     return policy.connection == ResponsePolicyConnection::Request &&
            conn.req_method == static_cast<u8>(LogHttpMethod::Head) &&
            conn.req_http_version == static_cast<u8>(HttpVersion::Http11) &&
