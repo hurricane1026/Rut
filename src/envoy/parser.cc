@@ -92,6 +92,39 @@ constexpr Field kResponseCode = RUT_FIELD2("response_code", "responseCode");
 // query/fragment/percent-encoding, bounded to a small fixed length.
 constexpr u32 kMaxRouteMatchLen = 64u;
 
+// Codex sweep-8 review (P1): the runtime's per-connection request-path
+// buffer (`ConnectionBase::req_path`, `include/rut/runtime/
+// connection_base.h`, `kMaxReqPathLen = 64`) holds at most 63 usable bytes
+// -- `on_header_received` (`src/runtime/callbacks.cc`) clamps
+// `copy_len = sizeof(conn.req_path) - 1` and NUL-terminates, so any real
+// request whose path is 64+ bytes gets silently truncated to exactly the
+// first 63 bytes for ROUTE DISPATCH (the trie lookup that selects which
+// node's handler runs). `req.pathOnly`, evaluated INSIDE that handler, is
+// computed separately by re-scanning the raw, untruncated request bytes
+// (`rut_helper_req_path_only`, `src/jit/runtime_helpers.cc`) -- it never
+// reads the truncated copy. These two views of the same request agree for
+// every path under 64 bytes, but a node/exact-path comparison text of
+// exactly 63 bytes creates a real gap: any genuinely longer real request
+// that happens to start with those same 63 bytes truncates, for dispatch
+// purposes, into something byte-identical to that node's own bare literal,
+// even though `req.pathOnly` inside the handler still sees the full,
+// untruncated (and therefore unequal) path. A `prefix` ending in `/` whose
+// stripped node text is exactly 63 bytes (i.e. a 64-byte declared prefix)
+// or an exact `path` whose literal is exactly 63 bytes therefore admits a
+// configuration where Rut's dispatch and its own handler body can disagree
+// about whether a crafted request matches this node's bare literal --
+// exactly the ambiguity Envoy's own byte-exact matching never has, since it
+// never truncates. Bounding admitted match text to 62 bytes keeps the
+// longest anything can grow to (63, one more than admitted) still short of
+// the 64-byte point where the runtime's copy starts truncating, so the
+// dispatch view and `req.pathOnly` can never disagree: only a node/exact-
+// path text of exactly 63 bytes can ever be reproduced by truncating some
+// longer real request (truncation always yields exactly 63 bytes when it
+// happens at all, so it can only collide with a declared text of that same
+// length), so bounding admitted text at 62 bytes rules the dangerous length
+// out entirely, not merely narrows it.
+constexpr u32 kMaxDispatchableMatchLen = 62u;
+
 bool route_match_byte_ok(char c) {
     const auto b = static_cast<unsigned char>(c);
     return b >= 0x21u && b <= 0x7eu && c != '?' && c != '#' && c != '%';
@@ -100,6 +133,14 @@ bool route_match_byte_ok(char c) {
 bool prefix_shape_ok(Str text) {
     if (text.eq(lit_str("/"))) return true;
     return text.len >= 2u && text.ptr[0] == '/' && text.ptr[text.len - 1u] == '/';
+}
+
+// The RUT node text a `prefix` lowers to (see `strip_trailing_slash`,
+// src/envoy/converter.cc): "/" stays "/"; anything else drops the trailing
+// slash `prefix_shape_ok` already guarantees is there.
+u32 prefix_node_text_len(Str prefix) {
+    if (prefix.eq(lit_str("/"))) return 1u;
+    return prefix.len - 1u;
 }
 
 bool path_shape_ok(Str text) {
@@ -736,6 +777,18 @@ private:
             if (!prefix_shape_ok(text.value()))
                 return unsupported(span,
                                    lit_str("only \"/\" or prefixes ending in \"/\" are supported"));
+            // See `kMaxDispatchableMatchLen`'s doc comment: the RUT node
+            // text this prefix lowers to (trailing slash stripped) must
+            // stay short of the runtime's request-path truncation point, or
+            // a crafted over-length request could be dispatched as this
+            // node's own bare literal while `req.pathOnly` inside the
+            // handler still sees it as unequal.
+            if (prefix_node_text_len(text.value()) > kMaxDispatchableMatchLen)
+                return unsupported(
+                    span,
+                    lit_str("prefix exceeds the dispatchable node length (62 bytes after the "
+                            "trailing slash is stripped); the runtime's request-path buffer "
+                            "cannot distinguish a longer request from this node's own literal"));
             out->kind = RouteMatchKind::Prefix;
             out->prefix = text.value();
             out->prefix_span = span;
@@ -748,6 +801,15 @@ private:
         if (auto r = validate_route_match_bytes(text.value(), span); !r) return r;
         if (!path_shape_ok(text.value()))
             return unsupported(span, lit_str("path must start with \"/\""));
+        // See `kMaxDispatchableMatchLen`'s doc comment: an exact path this
+        // long risks the same dispatch/`req.pathOnly` disagreement a
+        // same-length prefix node does.
+        if (text.value().len > kMaxDispatchableMatchLen)
+            return unsupported(
+                span,
+                lit_str("path exceeds the dispatchable node length (62 bytes); the runtime's "
+                        "request-path buffer cannot distinguish a longer request from this "
+                        "literal"));
         out->kind = RouteMatchKind::Path;
         out->path = text.value();
         out->path_span = span;

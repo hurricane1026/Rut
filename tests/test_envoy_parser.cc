@@ -1167,6 +1167,74 @@ TEST(envoy_parser, route_match_accepts_prefix_and_path_forms) {
     }
 }
 
+// Codex sweep-8 review (P1): the runtime's request-path buffer
+// (`ConnectionBase::req_path`, `include/rut/runtime/connection_base.h`)
+// keeps only 63 usable bytes, so a node/exact-path comparison text of
+// exactly 63 bytes lets dispatch conflate a genuinely longer real request
+// (truncated to exactly that text) with the node's own bare literal, even
+// though `req.pathOnly` inside the handler re-derives the path from the
+// full, untruncated request and would see it as unequal. `parse_route_match`
+// (src/envoy/parser.cc) now bounds the admitted node/path length at 62
+// bytes -- one below the dangerous 63 -- to rule the ambiguity out
+// entirely. Tests the exact boundary on both sides for both match kinds.
+TEST(envoy_parser, route_match_rejects_dispatch_unsafe_length) {
+    // Prefix: the admitted length is on the RAW declared text (which
+    // includes the trailing slash `prefix_shape_ok` requires), one byte
+    // more than the resulting node text `strip_trailing_slash`
+    // (src/envoy/converter.cc) produces.
+    {
+        // Node text length 62 (raw prefix length 63): accepted.
+        Bootstrap b;
+        const std::string prefix = "/" + std::string(61u, 'a') + "/";
+        REQUIRE_EQ(prefix.size(), 63u);
+        REQUIRE(replace(&b.listeners, "\"prefix\": \"/\"", "\"prefix\": \"" + prefix + "\""));
+        static envoy::JsonDocument doc;
+        const std::string source_text = b.render();
+        auto result = envoy::parse_bootstrap_json(str(source_text), doc);
+        REQUIRE(result);
+        const envoy::RouteMatch& match =
+            result.value().listener.filter_chain.hcm.route_config.virtual_host.routes[0].match;
+        CHECK(match.prefix.eq(str(prefix)));
+    }
+    {
+        // Node text length 63 (raw prefix length 64, still within
+        // `kMaxRouteMatchLen`): rejected.
+        Bootstrap b;
+        const std::string prefix = "/" + std::string(62u, 'a') + "/";
+        REQUIRE_EQ(prefix.size(), 64u);
+        REQUIRE(replace(&b.listeners, "\"prefix\": \"/\"", "\"prefix\": \"" + prefix + "\""));
+        expect_reject(b.render(), FrontendError::UnsupportedSyntax, "dispatchable node length");
+    }
+    // Exact path: the admitted length is the literal text itself (no
+    // stripping).
+    {
+        // Length 62: accepted.
+        Bootstrap b;
+        const std::string path = "/" + std::string(61u, 'a');
+        REQUIRE_EQ(path.size(), 62u);
+        REQUIRE(replace(&b.listeners,
+                        "\"match\": {\"prefix\": \"/\"}",
+                        "\"match\": {\"path\": \"" + path + "\"}"));
+        static envoy::JsonDocument doc;
+        const std::string source_text = b.render();
+        auto result = envoy::parse_bootstrap_json(str(source_text), doc);
+        REQUIRE(result);
+        const envoy::RouteMatch& match =
+            result.value().listener.filter_chain.hcm.route_config.virtual_host.routes[0].match;
+        CHECK(match.path.eq(str(path)));
+    }
+    {
+        // Length 63: rejected.
+        Bootstrap b;
+        const std::string path = "/" + std::string(62u, 'a');
+        REQUIRE_EQ(path.size(), 63u);
+        REQUIRE(replace(&b.listeners,
+                        "\"match\": {\"prefix\": \"/\"}",
+                        "\"match\": {\"path\": \"" + path + "\"}"));
+        expect_reject(b.render(), FrontendError::UnsupportedSyntax, "dispatchable node length");
+    }
+}
+
 TEST(envoy_parser, routes_list_is_bounded_and_ordered) {
     Bootstrap b;
     std::string routes = "[";

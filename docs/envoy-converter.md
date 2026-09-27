@@ -557,31 +557,42 @@ are recorded from the pinned Envoy build, not assumed.
   `RutSource::kCapacity` (128 KiB, `include/rut/envoy/converter.h`) only
   bounds the emitted program's byte count. `rut`'s own frontend lexer
   separately bounds every program's token count at
-  `LexedTokens::kMaxTokens` (`include/rut/compiler/lexer.h`) — **932 today**;
-  the unmerged #697 raises it to **4096**, but is not part of this PR. A
-  route list well inside `kMaxEnvoyRoutes` (8) can exceed 932 tokens: each
-  node's `if`/`else` arm duplicates the full `request_policy`/
-  `response_policy`/`failure_policy` block (see the milestone-S golden,
-  `tests/fixtures/envoy_milestone_s.inc`) for both its `HEAD` and any-method
-  emission, so a single extra arm on a single node costs on the order of a
-  few hundred tokens. Measured against the real lexer (`rut::lex`,
-  `tests/test_envoy_convert.cc`'s `token_budget_goldens_match_the_real_lexer`,
-  which links `rut_compiler` test-only): golden (c) — a genuine two-node,
-  single-arm-per-node shape — uses 668 tokens; golden (b) no longer is that
-  shape, since the round-9 shadowing fix (see "Multiple routes per virtual
-  host" above) drops its `/api/` node before it is ever registered, being
-  globally shadowed by the earlier root route — it now lowers root-only and
-  measures 360 tokens, not the 655 a two-node program of its old shape would
-  have needed. Scenario (a) — two nodes, one of them with an `if`/`else` arm
-  — already needs over 932 and fails to lex at byte 8400 of its 8804-byte,
-  well-under-`kCapacity` output. `lower_to_rut`
-  now computes a conservative (never-under-counting) estimate of the emitted
-  token count and fails closed with `TooManyTokens` before returning a
-  program `rut` cannot load, rather than reporting success for one.
-  `rut_envoy`/`rut-envoy-convert` still link no Rut grammar or lowering
-  library (the estimate is self-contained, using only the header-only
-  `kMaxTokens` constant); only the test links `rut_compiler`, to verify the
-  estimate against the real lexer.
+  `LexedTokens::kMaxTokens` (`include/rut/compiler/lexer.h`) — **4096 today**
+  (#697 raised it from 932). A route list well inside `kMaxEnvoyRoutes` (8)
+  can still exceed it: each node's `if`/`else` arm duplicates the full
+  `request_policy`/`response_policy`/`failure_policy` block (see the
+  milestone-S golden, `tests/fixtures/envoy_milestone_s.inc`) for both its
+  `HEAD` and any-method emission, so a single extra arm on a single node
+  costs on the order of a few hundred tokens, and every non-root node
+  contributes its own conditional prefix arm plus one unconditional
+  nearest-ancestor terminal arm (see `RutSource::
+  kWorstCaseOrderedRouteListBytes`'s doc comment,
+  `include/rut/envoy/converter.h`). Measured against the real lexer
+  (`rut::lex`, `tests/test_envoy_convert.cc`'s
+  `token_budget_goldens_match_the_real_lexer`, which links `rut_compiler`
+  test-only): golden (c) — a genuine two-node, single-arm-per-node shape —
+  uses 668 tokens; golden (b) no longer is that shape, since the round-9
+  shadowing fix (see "Multiple routes per virtual host" above) drops its
+  `/api/` node before it is ever registered, being globally shadowed by the
+  earlier root route — it now lowers root-only and measures 360 tokens, not
+  the 655 a two-node program of its old shape would have needed. Scenario
+  (a) — two nodes, one of them with an `if`/`else` arm — needs 963 tokens,
+  comfortably under the current 4096 budget (it needed over the old 932
+  budget and failed to lex at byte 8400 of its 8804-byte, well-under-
+  `kCapacity` output; `golden_routes_a_prefix_then_root`,
+  `tests/test_envoy_convert.cc`, is a golden success case again). A
+  `kMaxEnvoyRoutes`-sized worst case (8 nested prefixes, narrowest declared
+  first) still exceeds even the raised 4096 budget
+  (`capacity_covers_worst_case_node_arm_duplication`,
+  `tests/test_envoy_convert.cc`), so the fail-closed check below still
+  matters at that scale. `lower_to_rut` computes a conservative
+  (never-under-counting) estimate of the emitted token count and fails
+  closed with `TooManyTokens` before returning a program `rut` cannot load,
+  rather than reporting success for one. `rut_envoy`/`rut-envoy-convert`
+  still link no Rut grammar or lowering library (the estimate is
+  self-contained, using only the header-only `kMaxTokens` constant); only
+  the test links `rut_compiler`, to verify the estimate against the real
+  lexer.
 - Matching is against the path without query. `x-envoy-original-path` is not
   set unless a rewrite happens.
 - No matching route: HCM responds 404 with an empty body and no route-level
@@ -914,14 +925,17 @@ emitted text, since that still doesn't compile on this branch.
    127.0.0.1:29000\r\n\r\n'`) and the origin's `200 OK` response was relayed
    back to the client verbatim — Rut opened the upstream connection and
    forwarded a response Envoy would never have requested. Two converter-level
-   fixes were tried and both are infeasible with today's grammar and token
-   budget:
+   fixes were tried and both were infeasible with the grammar and token
+   budget at the time:
    - Splitting the any-method route into one explicit `route <METHOD> "/"`
      per forwarded method (mirroring the `HEAD` route already emitted)
-     overflows the lexer's fixed `kMaxTokens = 932`
-     (`include/rut/compiler/lexer.h:135`) once duplicated across all 7
+     overflowed the lexer's fixed `kMaxTokens`, then 932
+     (`include/rut/compiler/lexer.h:135`), once duplicated across all 7
      non-HEAD forwarded methods — confirmed by actually compiling that
-     11+ KB shape with `rut` (`lex failed: too many tokens`).
+     11+ KB shape with `rut` (`lex failed: too many tokens`). #697 has since
+     raised `kMaxTokens` to 4096; whether that specific shape now fits has
+     not been re-measured, so this row's status is unchanged pending that
+     check.
    - A `guard req.method == GET || req.method == POST || … else { return
      400 }` inside the existing any-method route stays comfortably within
      the token budget, but `CONNECT` and `TRACE` are both plain identifiers:

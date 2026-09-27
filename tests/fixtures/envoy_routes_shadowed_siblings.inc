@@ -9,7 +9,8 @@
 // `build_lowering_plan` (src/envoy/converter.cc) still registered both dead
 // nodes, emitting a HEAD/any-method forwarding block for each (all
 // forwarding through root's own cluster) -- about 938 real lexer tokens for
-// this exact shape, over `LexedTokens::kMaxTokens` (932). After the fix ("a
+// this exact shape, over `LexedTokens::kMaxTokens` back when it was 932
+// (raised to 4096 by #697). After the fix ("a
 // route is dropped before it is ever registered as a node when an earlier
 // route's prefix is a byte-prefix of its own"), this lowers to the
 // root-only text below, about 356 real tokens

@@ -1,24 +1,26 @@
 #pragma once
 
-// NOT a golden success output (Codex round-6 review, P1): this scenario --
-// prefix "/api/" declared before the catch-all "/" (node "/api" resolves the
-// literal path "/api" via the root ancestor, not a 404) with all
-// RutCapabilities true -- is the exact text `rut::envoy::lower_to_rut` used
-// to return as a byte-for-byte pinned success. It is kept here, unchanged,
-// because it is still useful evidence: at 8804 bytes it is comfortably under
-// `RutSource::kCapacity` (128 KiB), but lexing it with `rut`'s own frontend
-// lexer (`rut::lex`) fails with `TooManyTokens` at byte 8400, because
-// `LexedTokens::kMaxTokens` (include/rut/compiler/lexer.h) is only 932
-// tokens -- a program the converter used to report success for but `rut`
-// itself cannot load. `lower_to_rut` now fails closed on this exact shape
-// instead (`TooManyTokens`, "generated RUT source exceeds the compiler
-// frontend's lexer token budget"); see
-// tests/test_envoy_convert.cc's `golden_routes_a_prefix_then_root`, which
-// asserts that rejection directly, and docs/envoy-converter.md's
-// "Known capability dependencies" / token-budget note for the current (932)
-// and post-#697 (4096) budget numbers. Recorded from
-// rut::envoy::lower_to_rut(model, {true, true, true}) before that fix
-// landed.
+// Golden RUT output for envoy-pr-plan.md's PR 8 route-list lowering,
+// scenario (a): prefix "/api/" declared before the catch-all "/" (node
+// "/api" resolves the literal path "/api" via the root ancestor, not a
+// 404). All RutCapabilities are set to true (see
+// tests/fixtures/envoy_milestone_s.inc for why).
+//
+// History (Codex round-6 review, P1, then sweep-8): this scenario used to be
+// a golden success case, then briefly a fail-closed one. At 8804 bytes this
+// text is comfortably under `RutSource::kCapacity` (128 KiB), but lexing it
+// with `rut`'s own frontend lexer (`rut::lex`) failed with `TooManyTokens`
+// at byte 8400 back when `LexedTokens::kMaxTokens`
+// (include/rut/compiler/lexer.h) was only 932 tokens -- a program the
+// converter used to report success for but `rut` itself couldn't load, so
+// `lower_to_rut` was made to fail closed on this exact shape instead.
+// #697 later raised `kMaxTokens` to 4096, under which this exact,
+// unchanged text lexes successfully at 963 tokens
+// (`token_budget_goldens_match_the_real_lexer`,
+// tests/test_envoy_convert.cc), so `golden_routes_a_prefix_then_root`
+// (tests/test_envoy_convert.cc) is a byte-exact golden success test again,
+// the same shape as (b)/(c). Recorded from
+// rut::envoy::lower_to_rut(model, {true, true, true}).
 static constexpr char kEnvoyRoutesAGolden[] = R"rut(listen :8080
 upstream envoy_cluster_0 at "127.0.0.1:9000"
 upstream envoy_cluster_1 at "127.0.0.1:9001"

@@ -2441,27 +2441,30 @@ TEST(envoy_convert, blocked_on_redirect) {
 // pre-existing (the single-route milestone-S golden already fails the same
 // way) and are PR3-PR5's job, not this PR's.
 
-// Codex round-6 review (P1): scenario (a) used to be a golden SUCCESS case,
-// pinning `kEnvoyRoutesAGolden` byte for byte. Direct measurement against the
-// real frontend lexer (`rut::lex`, linked test-only above) showed that exact
-// golden text -- 8804 bytes, well under `RutSource::kCapacity` -- fails to
-// lex with `TooManyTokens` at byte 8400, because `LexedTokens::kMaxTokens`
-// is only 932 tokens (tests/fixtures/envoy_routes_a.inc has the full
-// citation). So the converter was reporting success for a program `rut`
-// itself cannot load. `lower_to_rut` now fails closed on this exact shape;
-// this test locks that in instead of the stale byte-for-byte pin.
-// `kEnvoyRoutesAGolden` is kept (unused by this test) as the evidence for
-// that exact byte-8400 measurement.
+// Codex round-6 review (P1) found that scenario (a)'s golden text -- 8804
+// bytes, well under `RutSource::kCapacity` -- failed to lex with
+// `TooManyTokens` at byte 8400 back when `LexedTokens::kMaxTokens` was 932,
+// so `lower_to_rut` used to report success for a program `rut` itself could
+// not load; that round made this a fail-closed test instead of a
+// byte-for-byte golden pin. Sweep-8: #697 raised `LexedTokens::kMaxTokens`
+// to 4096, and this exact golden text -- unchanged, still 8804 bytes --
+// lexes to 963 tokens, comfortably under the new budget
+// (`token_budget_goldens_match_the_real_lexer` below measures it against
+// the real lexer). This is a golden SUCCESS case again, the same shape as
+// (b)/(c) below; `capacity_covers_worst_case_node_arm_duplication`
+// (include/rut/envoy/converter.h's `RutSource::kWorstCaseOrderedRouteListBytes`)
+// covers the still-over-budget case at `kMaxEnvoyRoutes` scale.
 TEST(envoy_convert, golden_routes_a_prefix_then_root) {
     const std::string text = routes_scenario_a_json();
     static envoy::JsonDocument doc;
     auto parsed = envoy::parse_bootstrap_json(str(text), doc);
     REQUIRE(parsed);
     const envoy::RutCapabilities all_true{true, true, true};
-    const auto lowered = envoy::lower_to_rut(parsed.value(), all_true);
-    CHECK_FALSE(lowered);
-    CHECK(lowered.error().code == FrontendError::TooManyTokens);
-    CHECK(to_string(lowered.error().detail).find("lexer token budget") != std::string::npos);
+    auto lowered = lower_heap(parsed.value(), all_true);
+    REQUIRE(*lowered);
+    const Str golden = lit_str(kEnvoyRoutesAGolden);
+    REQUIRE_EQ((*lowered).value().len, golden.len);
+    CHECK((*lowered).value().view().eq(golden));
 }
 
 // Codex round-6 review (P1): measures `converter.cc`'s conservative
@@ -2469,25 +2472,22 @@ TEST(envoy_convert, golden_routes_a_prefix_then_root) {
 // test-only above -- see tests/CMakeLists.txt's comment on this target) for
 // the exact texts the estimate is meant to bound. Pins the current
 // numbers so a lexer or converter-emission change that moves them is caught
-// here rather than only showing up as a mysterious golden-test failure:
-//   - `kEnvoyRoutesAGolden` (scenario a, the shape `lower_to_rut` now
-//     rejects): the real lexer fails with `TooManyTokens` at byte 8400 of
-//     8804 -- confirming the rejection above is correct, not overly
-//     conservative for a program that would have actually worked.
-//   - `kEnvoyRoutesBGolden` / `kEnvoyRoutesCGolden` (the two golden shapes
-//     that still succeed, scenarios b/c below): 360 and 668 real tokens,
-//     comfortably under `LexedTokens::kMaxTokens` (932 today; #697,
-//     unmerged as of this PR, raises it to 4096 -- see
-//     docs/envoy-converter.md). `kEnvoyRoutesBGolden`'s count dropped from
-//     655 (two live nodes) to 360 (root-only) under Codex round-9: "/api"
-//     is now dropped as globally shadowed by the earlier "/" instead of
-//     being planned as a dead node (see envoy_routes_b.inc).
+// here rather than only showing up as a mysterious golden-test failure.
+// Sweep-8: #697 raised `LexedTokens::kMaxTokens` from 932 to 4096, so all
+// three goldens now lex successfully -- `kEnvoyRoutesAGolden` (scenario a)
+// at 963 tokens (was `TooManyTokens` at byte 8400 under the old 932 budget;
+// see `golden_routes_a_prefix_then_root` above) alongside
+// `kEnvoyRoutesBGolden` / `kEnvoyRoutesCGolden` at 360 and 668.
+// `kEnvoyRoutesBGolden`'s count dropped from 655 (two live nodes) to 360
+// (root-only) under Codex round-9: "/api" is now dropped as globally
+// shadowed by the earlier "/" instead of being planned as a dead node (see
+// envoy_routes_b.inc).
 TEST(envoy_convert, token_budget_goldens_match_the_real_lexer) {
     const Str golden_a = lit_str(kEnvoyRoutesAGolden);
     const auto lexed_a = lex(golden_a);
-    REQUIRE_FALSE(lexed_a);
-    CHECK(lexed_a.error().code == FrontendError::TooManyTokens);
-    CHECK_EQ(lexed_a.error().span.start, 8400u);
+    REQUIRE(lexed_a);
+    CHECK_EQ(lexed_a.value().tokens.len, 963u);
+    CHECK_LT(lexed_a.value().tokens.len, LexedTokens::kMaxTokens);
     CHECK_EQ(golden_a.len, 8804u);
 
     const Str golden_b = lit_str(kEnvoyRoutesBGolden);
@@ -2589,13 +2589,12 @@ TEST(envoy_convert, golden_routes_b_root_then_prefix) {
 // `build_lowering_plan` registered both dead nodes anyway (each shadowed by
 // the earlier "/", but still planned), emitting a full HEAD/any-method
 // forwarding block for each -- about 938 real lexer tokens for this exact
-// shape, over `LexedTokens::kMaxTokens` (932), even though the equivalent
-// root-only program fits comfortably. This pins both the golden text (must
-// be root-only, byte for byte) and the real token count, so a regression
-// that goes back to registering shadowed siblings is caught two ways: a
-// content mismatch here, and (independently) a real `TooManyTokens` failure
-// from `rut::lex` on the field the `estimate_conservative_token_count`
-// budget check in `lower_to_rut` is supposed to prevent from ever shipping.
+// shape, which was over `LexedTokens::kMaxTokens` back when it was 932
+// (raised to 4096 by #697), even though the equivalent root-only program
+// fits comfortably either way. This pins both the golden text (must be
+// root-only, byte for byte) and the real token count, so a regression that
+// goes back to registering shadowed siblings is caught by the content
+// mismatch here.
 TEST(envoy_convert, shadowed_siblings_dropped_before_registration) {
     const std::string text =
         route_list_json(json_array({prefix_route_json("/", "backend"),
@@ -2631,10 +2630,11 @@ TEST(envoy_convert, shadowed_siblings_dropped_before_registration) {
 // an exact route for "/api" itself declared before its own prefix (the
 // already-established golden(f) pattern), NOT a root catch-all: a root
 // ancestor would force "/api" into an if/else chain, and two if/else-shaped
-// nodes together exceed `LexedTokens::kMaxTokens` at the current (932)
-// budget even with nothing else in the config (confirmed by direct
-// measurement) -- unrelated to this shadowing fix, but it rules out reusing
-// the `golden_routes_b_root_then_prefix`-style fixture shape here.
+// nodes together exceeded `LexedTokens::kMaxTokens` back when it was 932
+// (raised to 4096 by #697) even with nothing else in the config (confirmed
+// by direct measurement) -- unrelated to this shadowing fix, but it ruled
+// out reusing the `golden_routes_b_root_then_prefix`-style fixture shape
+// here at the time this fixture was written.
 TEST(envoy_convert, prefix_shadowed_by_earlier_prefix_dropped) {
     const std::string text = route_list_json(json_array({path_route_json("/api", "api"),
                                                          prefix_route_json("/api/", "api"),
@@ -2690,23 +2690,16 @@ TEST(envoy_convert, prefix_shadowed_exact_path_arm_dropped) {
 // (`is_strict_ancestor("/api", "/api/v1")` is true, but the shadow check in
 // `build_lowering_plan` only ever looks at nodes already KEPT earlier in
 // declaration order, and "/api" is not one of them yet when "/api/v1" is
-// registered) -- both nodes are kept and planned. Two real (if/else-shaped)
-// nodes together exceed `LexedTokens::kMaxTokens` at the current (932)
-// budget (confirmed above and by `golden_routes_a_prefix_then_root`), so
-// this cannot be asserted as a byte-for-byte success like the other cases;
-// instead it is asserted two ways, both purely from `lower_to_rut`'s
-// observable result (no internal test hook into `build_lowering_plan`):
-//   - this order (specific first) fails with `TooManyTokens`, not
-//     `BLOCKED_BY_RUT` or success -- proving BOTH nodes were planned all
-//     the way to a fully generated RUT text (a `BLOCKED_BY_RUT` failure
-//     happens during planning, before any text is generated at all; and a
-//     single surviving node this shape would fit comfortably under budget,
-//     as `prefix_shadowed_by_earlier_prefix_dropped` above measures).
-//   - the reverse order (general "/api/" first, "/api/v1/" second, in
-//     `general_prefix_before_specific_shadows_specific` below) DOES shadow
-//     "/api/v1" and succeeds, well under budget, with only "/api" emitted
-//     -- the direct contrast that isolates order (not size) as the cause of
-//     the first case's `TooManyTokens`.
+// registered) -- both nodes are kept and planned. Sweep-8: under the old
+// 932-token `LexedTokens::kMaxTokens` budget, these two real (if/else-shaped)
+// nodes together exceeded it, so this used to be asserted only indirectly,
+// via the `TooManyTokens` failure proving both nodes reached full text
+// generation (a `BLOCKED_BY_RUT` failure happens during planning, before any
+// text is generated at all). #697 raised the budget to 4096, under which
+// this shape lowers successfully (1271 real tokens; well below the 4096
+// budget the `capacity_covers_worst_case_node_arm_duplication` test
+// separately still exceeds at `kMaxEnvoyRoutes` scale), so the point is now
+// asserted directly: the real emitted text contains both nodes.
 TEST(envoy_convert, specific_prefix_before_general_prefix_keeps_both) {
     const std::string text = route_list_json(
         json_array({prefix_route_json("/api/v1/", "specific"),
@@ -2717,18 +2710,21 @@ TEST(envoy_convert, specific_prefix_before_general_prefix_keeps_both) {
     auto parsed = envoy::parse_bootstrap_json(str(text), doc);
     REQUIRE(parsed);
     const envoy::RutCapabilities all_true{true, true, true};
-    const auto lowered = envoy::lower_to_rut(parsed.value(), all_true);
-    CHECK_FALSE(lowered);
-    CHECK(lowered.error().code == FrontendError::TooManyTokens);
-    CHECK(to_string(lowered.error().detail).find("lexer token budget") != std::string::npos);
+    auto lowered = lower_heap(parsed.value(), all_true);
+    REQUIRE(*lowered);
+    const std::string out = to_string((*lowered).value().view());
+    CHECK(out.find("route \"/api/v1\" {") != std::string::npos);
+    CHECK(out.find("route HEAD \"/api/v1\" {") != std::string::npos);
+    CHECK(out.find("route \"/api\" {") != std::string::npos);
+    CHECK(out.find("route HEAD \"/api\" {") != std::string::npos);
 }
 
 // Companion to the test above: same three routes, "/api/"'s prefix declared
 // BEFORE "/api/v1/"'s. This time "/api/v1" IS shadowed and dropped, so only
 // one (if/else-shaped) node is planned -- well under the token budget --
-// proving the previous test's `TooManyTokens` result really does come from
-// keeping both nodes (declaration order), not merely from this route
-// shape's size in general.
+// proving the previous test's two-node output really does come from keeping
+// both nodes (declaration order), not merely from this route shape's size in
+// general.
 TEST(envoy_convert, general_prefix_before_specific_shadows_specific) {
     const std::string text = route_list_json(
         json_array({path_route_json("/api", "general"),
@@ -2976,26 +2972,32 @@ TEST(envoy_convert, brute_force_equivalence_ordered_route_list) {
     REQUIRE(parsed);
     const envoy::RutCapabilities all_true{true, true, true};
 
-    // Codex round-6 review (P1): this 5-route, 3-node ("/", "/api",
-    // "/api/v1") shape is exactly the kind of realistic, in-bounds
-    // (kMaxEnvoyRoutes = 8) configuration the token-budget finding warned
-    // about -- confirmed by direct measurement against the real frontend
-    // lexer (rut::lex, linked test-only above): even the smaller 2-node,
-    // single-arm-per-node scenarios (b)/(c) use 655-668 of the 932-token
-    // budget, and this scenario's extra node and if/else arms (for
-    // "/healthz" and "/api/x" each shadowing their owning node's own prefix)
-    // push it well past `LexedTokens::kMaxTokens` -- so `lower_to_rut` must
-    // now reject it instead of returning a program `rut` cannot load. This
-    // was a golden, real-emission cross-check (`rut_dispatch` against the
-    // parsed route nodes) before the fix; that path is no longer reachable
-    // for this scenario, so it is replaced by asserting the new fail-closed
-    // diagnostic. `envoy_first_match`/`sim_dispatch` below are pure
-    // simulations with no lowering dependency, so their self-consistency
-    // check over all 40+ probes still stands independent of the budget.
-    const auto lowered_result = envoy::lower_to_rut(parsed.value(), all_true);
-    CHECK_FALSE(lowered_result);
-    CHECK(lowered_result.error().code == FrontendError::TooManyTokens);
-    CHECK(to_string(lowered_result.error().detail).find("lexer token budget") != std::string::npos);
+    // Codex round-6 review (P1): this 5-route shape is exactly the kind of
+    // realistic, in-bounds (kMaxEnvoyRoutes = 8) configuration the
+    // token-budget finding warned about -- under the old 932-token
+    // `LexedTokens::kMaxTokens` budget this scenario's extra node and
+    // if/else arms (for "/healthz" and "/api/x" each shadowing their owning
+    // node's own prefix) pushed it over budget, so `lower_to_rut` rejected
+    // it and this test fell back to the two pure (converter-independent)
+    // simulations below. Sweep-8: #697 raised the budget to 4096, under
+    // which this shape lowers successfully (1591 real tokens), restoring
+    // the golden, real-emission cross-check (`rut_dispatch` against the
+    // parsed route nodes) on top of the two simulations.
+    //
+    // "/api/v1" is globally shadowed by the earlier "/api/" prefix (Codex
+    // round-9 review on PR #695: any request matching "/api/v1/" also
+    // matches the earlier, broader "/api/" -- Envoy's own first-match
+    // semantics resolve it to "api", never "apiv1" -- so `build_lowering_
+    // plan` drops "/api/v1" before it is ever registered as a node), so
+    // only "/api" and "/" register as real RUT nodes.
+    auto lowered = lower_heap(parsed.value(), all_true);
+    REQUIRE(*lowered);
+    const std::vector<RutNode> rut_nodes =
+        parse_rut_route_nodes(to_string((*lowered).value().view()));
+    REQUIRE_EQ(rut_nodes.size(), 2u);
+    std::vector<std::string> cluster_names;
+    for (u32 i = 0; i < parsed.value().clusters.len; i++)
+        cluster_names.push_back(to_string(parsed.value().clusters[i].name));
 
     const std::vector<std::string> probes = {
         "/",          "/healthz",    "/healthzz",   "/health",     "/api",
@@ -3014,6 +3016,8 @@ TEST(envoy_convert, brute_force_equivalence_ordered_route_list) {
         const std::string expected = envoy_first_match(routes, probe);
         const std::string actual = sim_dispatch(routes, probe);
         CHECK_EQ(expected, actual);
+        const std::string rut_actual = rut_dispatch(rut_nodes, cluster_names, probe);
+        CHECK_EQ(expected, rut_actual);
     }
 }
 

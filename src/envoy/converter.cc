@@ -1353,14 +1353,21 @@ FrontendResult<bool> validate(const Bootstrap& model, const RutCapabilities& cap
 // Codex round-6 review (P1): `RutSource::kCapacity` (128 KiB, see
 // include/rut/envoy/converter.h) bounds the emitted program's BYTE count,
 // but `rut`'s own frontend lexer separately bounds every program's TOKEN
-// count at `LexedTokens::kMaxTokens` (932 today; include/rut/compiler/
-// lexer.h) -- a bound this converter never checked. A two-route bootstrap
+// count at `LexedTokens::kMaxTokens` (include/rut/compiler/lexer.h) -- a
+// bound this converter never checked at the time. A two-route bootstrap
 // (`prefix: "/api/"` then the catch-all `"/"`) lowers to a byte-valid,
-// under-capacity program that nonetheless fails `rut`'s own `lex()` with
-// `TooManyTokens` at byte 8400 (confirmed against the real lexer on
-// `tests/fixtures/envoy_routes_a.inc`'s golden text: 8804 bytes, well under
-// `kCapacity`, but over `kMaxTokens`), so `lower_to_rut` used to report
-// success for a configuration `rut` cannot even parse.
+// under-capacity program (8804 bytes, well under `kCapacity`) that
+// nonetheless failed `rut`'s own `lex()` with `TooManyTokens` at byte 8400
+// back when `kMaxTokens` was 932, so `lower_to_rut` used to report success
+// for a configuration `rut` couldn't even parse. #697 later raised
+// `kMaxTokens` to 4096, under which that exact scenario lexes successfully
+// (963 tokens; `golden_routes_a_prefix_then_root`,
+// `tests/test_envoy_convert.cc`) -- the fail-closed check below still
+// matters for larger route lists at `kMaxEnvoyRoutes` scale (see
+// `RutSource::kWorstCaseOrderedRouteListBytes`,
+// include/rut/envoy/converter.h, and
+// `capacity_covers_worst_case_node_arm_duplication`,
+// tests/test_envoy_convert.cc, which still exceeds 4096 tokens).
 //
 // This estimate is intentionally conservative (never an UNDER-count) rather
 // than exact, so `lower_to_rut` stays free of any dependency on `rut`'s own
@@ -1374,9 +1381,9 @@ FrontendResult<bool> validate(const Bootstrap& model, const RutCapabilities& cap
 // operator here counts as 2 tokens where the real lexer's `EqEq`/`BangEq`
 // counts 1 -- an over-count, never an under-count. Verified against the real
 // lexer (tests/test_envoy_convert.cc's `token_budget_*` cases, which link
-// `rut_compiler` test-only): this over-counts the routes (b)/(c) goldens by
-// 0-2 tokens (well within their ~260-plus-token headroom under the 932
-// budget) and still flags routes (a) over budget, matching `rut::lex`.
+// `rut_compiler` test-only): this over-counts the routes (a)/(b)/(c) goldens
+// by 0-2 tokens each, comfortably within their headroom under
+// `LexedTokens::kMaxTokens`.
 u32 estimate_conservative_token_count(Str text) {
     auto is_ident_start = [](char c) {
         return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || c == '_';
