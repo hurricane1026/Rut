@@ -2576,6 +2576,60 @@ void split_asserted_and_record_only(const std::vector<CaseSpec>& cases,
 
 // ── Case results & transcript ────────────────────────────────────────────
 
+// Why a record-only CaseResult's evidence was flagged `upstream_ambiguous`.
+// Sweep-1 review, "Report the actual record-only ambiguity": `
+// upstream_ambiguous` alone cannot distinguish a proxy crash from a
+// reuseport collision from a duplicate upstream contact, so
+// write_transcript()/write_pair_transcript() previously printed the SAME
+// hard-coded "stray traffic on another path" explanation for every one of
+// them -- fabricating a cause that, for e.g. a genuine proxy crash, never
+// actually happened. Every call site that marks a result ambiguous now goes
+// through mark_upstream_ambiguous() below with the specific reason that
+// applied there.
+enum class AmbiguityReason : std::uint8_t {
+    kNone,
+    // fill_upstream_bytes(): the recording upstream observed more than one
+    // request for this case's own expected path.
+    kDuplicateUpstreamContact,
+    // fill_upstream_bytes(): unattributed traffic landed on some OTHER path
+    // while this case's own path saw none, and elimination made this case
+    // the most plausible source.
+    kStrayUpstreamTraffic,
+    // require_upstream_idle_for_asserted_batch()'s record-only counterpart:
+    // the recording upstream did not report idle within its deadline: a
+    // handler thread may still have been draining traffic.
+    kUpstreamIdleTimeout,
+    // note_record_only_phase_crash(): the proxy under test exited
+    // unexpectedly during or after this record-only batch.
+    kProxyCrash,
+    // check_no_reuseport_collision_after_batch(): a concurrent process
+    // shared this batch's listener port via SO_REUSEPORT.
+    kReuseportCollision,
+};
+
+// Human-readable explanation of `reason`, for the "// NOTE: ... (<reason>)"
+// lines write_transcript()/write_pair_transcript() emit. Empty for kNone
+// (nothing to explain).
+std::string describe_ambiguity_reason(AmbiguityReason reason) {
+    switch (reason) {
+        case AmbiguityReason::kDuplicateUpstreamContact:
+            return "upstream was contacted more than once for this case's own path";
+        case AmbiguityReason::kStrayUpstreamTraffic:
+            return "upstream recorded unattributed traffic on another path while this case's "
+                   "own path saw none";
+        case AmbiguityReason::kUpstreamIdleTimeout:
+            return "the upstream did not report idle before the next phase started; a handler "
+                   "thread may still have been draining traffic";
+        case AmbiguityReason::kProxyCrash:
+            return "the proxy exited unexpectedly during or after this record-only batch";
+        case AmbiguityReason::kReuseportCollision:
+            return "a concurrent process shared this batch's listener port via SO_REUSEPORT";
+        case AmbiguityReason::kNone:
+            break;
+    }
+    return "";
+}
+
 struct CaseResult {
     std::string name;
     std::string client_bytes;
@@ -2593,18 +2647,34 @@ struct CaseResult {
     // single trustworthy recording (round-3 review, "Reject partial
     // exchanges before writing the oracle transcript").
     int upstream_contact_count = 0;
-    // Set by fill_upstream_bytes() when this case's own upstream evidence is
-    // unreliable (a duplicate contact for its path, or unexpected traffic
-    // elsewhere while this case's own expected path saw none) but the case
-    // is record-only, so the CLI contract ("record-only cases never affect
-    // the exit code") keeps the anomaly from being fatal (round-9 review,
-    // "Keep record-only upstream duplicates/misroutes out of acceptance").
-    // write_pair_transcript() flags it with a NOTE instead of presenting the
-    // bytes as trustworthy evidence.
+    // Set (via mark_upstream_ambiguous() below) when this case's own
+    // upstream evidence is unreliable but the case is record-only, so the
+    // CLI contract ("record-only cases never affect the exit code") keeps
+    // the anomaly from being fatal (round-9 review, "Keep record-only
+    // upstream duplicates/misroutes out of acceptance"). write_pair_
+    // transcript()/write_transcript() flag it with a NOTE naming
+    // `upstream_ambiguous_reason` instead of presenting the bytes as
+    // trustworthy evidence.
     bool upstream_ambiguous = false;
+    AmbiguityReason upstream_ambiguous_reason = AmbiguityReason::kNone;
     std::string upstream_bytes;  // first observed request, if any
     std::string downstream_bytes;
 };
+
+// Flags `result` ambiguous with `reason`, the way every ambiguity call site
+// below must (sweep-1 review, "Report the actual record-only ambiguity"),
+// rather than setting the bare `upstream_ambiguous` bool directly. The first
+// reason recorded for a given result wins and is never overwritten: within
+// one record-only batch, an earlier-detected anomaly (e.g. a reuseport
+// collision, checked immediately after the batch runs) is generally the
+// root cause of a later one (e.g. fill_upstream_bytes() then also seeing
+// stray traffic), so preferring it is more informative than the last write
+// clobbering it.
+void mark_upstream_ambiguous(CaseResult* result, AmbiguityReason reason) {
+    if (result->upstream_ambiguous) return;
+    result->upstream_ambiguous = true;
+    result->upstream_ambiguous_reason = reason;
+}
 
 bool run_client_case(uint16_t listen_port, const CaseSpec& spec, CaseResult* result) {
     result->name = spec.name;
@@ -2731,7 +2801,7 @@ bool fill_upstream_bytes(std::vector<CaseResult>* results,
             if (asserted) {
                 ok = false;
             } else {
-                r.upstream_ambiguous = true;
+                mark_upstream_ambiguous(&r, AmbiguityReason::kDuplicateUpstreamContact);
             }
             continue;
         }
@@ -2764,7 +2834,7 @@ bool fill_upstream_bytes(std::vector<CaseResult>* results,
             // connect_failure, connect_authority) has zero contact by
             // design; it is never a plausible source of stray traffic.
             if (!case_expects_upstream_forward(r.name)) continue;
-            r.upstream_ambiguous = true;
+            mark_upstream_ambiguous(&r, AmbiguityReason::kStrayUpstreamTraffic);
         }
     }
     return ok;
@@ -2842,7 +2912,7 @@ bool note_upstream_idle_timeout_for_record_only_batch(RecordingUpstream& upstrea
               << phase_label
               << " instance; a handler thread may still be draining traffic, so this "
                  "record-only batch's evidence is marked ambiguous\n";
-    for (auto& r : *results) r.upstream_ambiguous = true;
+    for (auto& r : *results) mark_upstream_ambiguous(&r, AmbiguityReason::kUpstreamIdleTimeout);
     return true;
 }
 
@@ -3115,9 +3185,9 @@ bool write_transcript(const std::string& path, const std::vector<CaseResult>& re
                 out << "// NOTE: " << r.name << ": upstream was contacted "
                     << r.upstream_contact_count << " times (ambiguous evidence)\n";
             if (r.upstream_ambiguous)
-                out << "// NOTE: " << r.name
-                    << ": upstream recorded unattributed traffic on another path while this "
-                       "case's own path saw none (ambiguous evidence)\n";
+                out << "// NOTE: " << r.name << ": "
+                    << describe_ambiguity_reason(r.upstream_ambiguous_reason)
+                    << " (ambiguous evidence)\n";
         }
         out << "static constexpr char kEnvoyOracle_" << r.name << "_client[] =\n    "
             << wrap_wire_literal(r.client_bytes) << ";\n";
@@ -3236,20 +3306,22 @@ bool write_pair_transcript(const std::string& path, const std::vector<PairCaseRe
             if (r.rut.upstream_contact_count > 1)
                 out << "// NOTE: " << r.name << " (rut): upstream was contacted "
                     << r.rut.upstream_contact_count << " times (ambiguous evidence)\n";
-            // Set by fill_upstream_bytes() when this case's own path saw zero
-            // contacts but unexplained traffic landed on some other path in
-            // the same batch (round-9 review): the case's own bytes below
-            // are trustworthy (there is nothing to report for them), but the
-            // case is flagged ambiguous because it is the likely source of
-            // that stray request.
+            // Sweep-1 review, "Report the actual record-only ambiguity":
+            // `upstream_ambiguous` is set by several distinct call sites
+            // (a proxy crash, a reuseport collision, an upstream-idle
+            // timeout, a duplicate contact, or genuinely unattributed
+            // traffic elsewhere), so print the specific
+            // `upstream_ambiguous_reason` each carries rather than a single
+            // hard-coded explanation that may not describe what actually
+            // happened.
             if (r.envoy.upstream_ambiguous)
                 out << "// NOTE: " << r.name
-                    << " (envoy): upstream recorded unattributed traffic on another path "
-                       "while this case's own path saw none (ambiguous evidence)\n";
+                    << " (envoy): " << describe_ambiguity_reason(r.envoy.upstream_ambiguous_reason)
+                    << " (ambiguous evidence)\n";
             if (r.rut.upstream_ambiguous)
                 out << "// NOTE: " << r.name
-                    << " (rut): upstream recorded unattributed traffic on another path while "
-                       "this case's own path saw none (ambiguous evidence)\n";
+                    << " (rut): " << describe_ambiguity_reason(r.rut.upstream_ambiguous_reason)
+                    << " (ambiguous evidence)\n";
         }
         out << "static constexpr char kEnvoyVsRut_" << r.name << "_client[] =\n    "
             << wrap_wire_literal(r.envoy.client_bytes) << ";\n";
@@ -3743,7 +3815,7 @@ void note_record_only_phase_crash(const char* proxy_label,
               << " exited unexpectedly during or after the record-only batch ("
               << unexpected_exit_description
               << "); asserted evidence was already captured, so this does not fail the run\n";
-    for (auto& r : *record_only_results) r.upstream_ambiguous = true;
+    for (auto& r : *record_only_results) mark_upstream_ambiguous(&r, AmbiguityReason::kProxyCrash);
 }
 
 int run_oracle_milestone_s(const std::string& output_path) {
@@ -3945,7 +4017,8 @@ int run_oracle_milestone_s(const std::string& output_path) {
             check_no_reuseport_collision_after_batch(listen_port1, kEnvoyContainerUid);
         if (!record_only_reuseport_error.empty()) {
             std::cerr << "NOTE: " << record_only_reuseport_error << "\n";
-            for (auto& r : record_only_results) r.upstream_ambiguous = true;
+            for (auto& r : record_only_results)
+                mark_upstream_ambiguous(&r, AmbiguityReason::kReuseportCollision);
         }
         if (!envoy_record_only.stop()) {
             dump_log(envoy_record_only.log_path);
@@ -4324,7 +4397,8 @@ int run_pair_milestone_s(const std::string& rut_binary,
             check_no_reuseport_collision_after_batch(listen_port1, kEnvoyContainerUid);
         if (!envoy_record_only_reuseport_error.empty()) {
             std::cerr << "NOTE: " << envoy_record_only_reuseport_error << "\n";
-            for (auto& r : envoy_record_only_results) r.upstream_ambiguous = true;
+            for (auto& r : envoy_record_only_results)
+                mark_upstream_ambiguous(&r, AmbiguityReason::kReuseportCollision);
         }
         // This instance only ever ran the record-only batch, so a stop()
         // failure here is unambiguously attributable to it (round-12/
@@ -4483,7 +4557,8 @@ int run_pair_milestone_s(const std::string& rut_binary,
             check_no_reuseport_collision_after_batch(listen_port1, getuid());
         if (!rut_record_only_reuseport_error.empty()) {
             std::cerr << "NOTE: " << rut_record_only_reuseport_error << "\n";
-            for (auto& r : rut_record_only_results) r.upstream_ambiguous = true;
+            for (auto& r : rut_record_only_results)
+                mark_upstream_ambiguous(&r, AmbiguityReason::kReuseportCollision);
         }
         // Round-18 review, "Stop record-only proxies before snapshotting
         // traffic": stop (and wait for the upstream to drain) BEFORE
@@ -5382,6 +5457,7 @@ bool self_test_partial_exchange_rejection() {
         record_only_ambiguous.upstream_contacted = false;
         record_only_ambiguous.upstream_contact_count = 0;
         record_only_ambiguous.upstream_ambiguous = true;
+        record_only_ambiguous.upstream_ambiguous_reason = AmbiguityReason::kStrayUpstreamTraffic;
         if (!write_transcript(out_path, {record_only_ambiguous})) {
             std::cerr << "FAIL [self-test partial]: write_transcript rejected a record-only row "
                          "flagged upstream_ambiguous by fill_upstream_bytes()\n";
@@ -5555,6 +5631,117 @@ bool self_test_partial_exchange_rejection() {
     }
 
     if (ok) std::cerr << "PASS [self-test partial exchange rejection]\n";
+    return ok;
+}
+
+// Sweep-1 review, "Report the actual record-only ambiguity": every distinct
+// AmbiguityReason must produce its OWN specific "// NOTE: ... (<reason>)"
+// text in both the oracle and pair transcripts -- never the single
+// previously-hard-coded "unattributed traffic on another path" explanation
+// this writer used to print regardless of what actually made the evidence
+// ambiguous (a proxy crash, a reuseport collision, an upstream-idle
+// timeout, or a duplicate contact all looked identical to a reader of only
+// the .inc file). For every reason other than the one whose own text
+// happens to be the substring under test, also asserts that OTHER reason's
+// text is absent, so this test cannot pass merely because one fixed string
+// happens to appear regardless of which reason was actually recorded.
+bool self_test_ambiguity_reason_note_text() {
+    bool ok = true;
+    TempDir dir("rut-envoy-selftest-ambiguity-reason");
+    if (dir.empty()) {
+        std::cerr << "FAIL [self-test ambiguity reason]: could not create temp dir\n";
+        return false;
+    }
+    const std::string out_path = dir.path() + "/transcript.inc";
+    const std::string pair_out_path = dir.path() + "/pair_transcript.inc";
+
+    const AmbiguityReason all_reasons[] = {
+        AmbiguityReason::kDuplicateUpstreamContact,
+        AmbiguityReason::kStrayUpstreamTraffic,
+        AmbiguityReason::kUpstreamIdleTimeout,
+        AmbiguityReason::kProxyCrash,
+        AmbiguityReason::kReuseportCollision,
+    };
+
+    for (const AmbiguityReason reason : all_reasons) {
+        const std::string expected = describe_ambiguity_reason(reason);
+        if (expected.empty()) {
+            std::cerr << "FAIL [self-test ambiguity reason]: describe_ambiguity_reason() "
+                         "returned an empty string for a non-kNone reason\n";
+            ok = false;
+            continue;
+        }
+
+        CaseResult row;
+        row.name = "connect_authority";  // a real record-only case name
+        row.client_bytes = "GET / HTTP/1.1\r\n\r\n";
+        row.exchange_complete = true;
+        row.downstream_bytes = "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n";
+        row.upstream_contacted = false;
+        row.upstream_contact_count = 0;
+        row.upstream_ambiguous = true;
+        row.upstream_ambiguous_reason = reason;
+
+        if (!write_transcript(out_path, {row})) {
+            std::cerr << "FAIL [self-test ambiguity reason]: write_transcript rejected a "
+                         "record-only row\n";
+            ok = false;
+            continue;
+        }
+        std::ifstream in(out_path);
+        std::stringstream ss;
+        ss << in.rdbuf();
+        const std::string content = ss.str();
+        if (content.find(expected) == std::string::npos) {
+            std::cerr << "FAIL [self-test ambiguity reason]: oracle transcript did not contain "
+                         "the expected reason text \""
+                      << expected << "\"; got:\n"
+                      << content << "\n";
+            ok = false;
+        }
+        for (const AmbiguityReason other : all_reasons) {
+            if (other == reason) continue;
+            const std::string other_text = describe_ambiguity_reason(other);
+            if (content.find(other_text) != std::string::npos) {
+                std::cerr << "FAIL [self-test ambiguity reason]: oracle transcript for reason \""
+                          << expected << "\" also contained an unrelated reason's text \""
+                          << other_text << "\"\n";
+                ok = false;
+            }
+        }
+
+        PairCaseResult pair_row;
+        pair_row.name = "connect_authority";
+        pair_row.asserted = false;
+        pair_row.envoy = row;
+        pair_row.rut = row;
+        pair_row.rut.upstream_ambiguous = false;
+        pair_row.rut.upstream_ambiguous_reason = AmbiguityReason::kNone;
+        if (!write_pair_transcript(pair_out_path, {pair_row})) {
+            std::cerr << "FAIL [self-test ambiguity reason]: write_pair_transcript rejected a "
+                         "record-only row\n";
+            ok = false;
+            continue;
+        }
+        std::ifstream pair_in(pair_out_path);
+        std::stringstream pair_ss;
+        pair_ss << pair_in.rdbuf();
+        const std::string pair_content = pair_ss.str();
+        if (pair_content.find("(envoy): " + expected) == std::string::npos) {
+            std::cerr << "FAIL [self-test ambiguity reason]: pair transcript did not contain "
+                         "the expected reason text for the envoy side: \""
+                      << expected << "\"; got:\n"
+                      << pair_content << "\n";
+            ok = false;
+        }
+        if (pair_content.find("(rut): ") != std::string::npos) {
+            std::cerr << "FAIL [self-test ambiguity reason]: pair transcript flagged the rut "
+                         "side ambiguous despite it not being marked so\n";
+            ok = false;
+        }
+    }
+
+    if (ok) std::cerr << "PASS [self-test ambiguity reason note text]\n";
     return ok;
 }
 
@@ -9270,6 +9457,23 @@ bool run_self_test_rut_pass(const std::string& rut_binary, const std::string& co
         for (const auto& spec : all_cases)
             if (is_asserted_case(spec.name)) live_asserted.push_back(spec);
         auto live_results = run_case_batch(listen_port, live_asserted);
+        // Sweep-1 review, "Recheck RUT listener ownership in the real-binary
+        // self-test": this asserted batch used to proceed straight from
+        // run_case_batch() to rut.stop() with no post-batch listener-count
+        // check, unlike every production asserted phase (and pair mode's
+        // own self-test-adjacent paths). A same-uid RUT co-owner that joined
+        // this port's SO_REUSEPORT group after the startup ownership check
+        // could otherwise receive some of these asserted connections and
+        // either cause a spurious failure or, for an identical
+        // configuration, let foreign evidence silently pass.
+        const std::string rut_reuseport_error =
+            check_no_reuseport_collision_after_batch(listen_port, getuid());
+        if (!rut_reuseport_error.empty()) {
+            std::cerr << "FAIL [self-test rut]: " << rut_reuseport_error << "\n";
+            rut.stop();
+            upstream.stop();
+            return false;
+        }
         const bool rut_stopped_cleanly = rut.stop();
         // Round-19 review, "Wait for upstream quiescence in the RUT oracle
         // self-test": same reasoning as the production asserted phases --
@@ -9364,6 +9568,17 @@ bool run_self_test_rut_pass(const std::string& rut_binary, const std::string& co
         r.name = "connect_failure";
         // The connect_failure exchange above is done; safe to release now.
         closed_reservation.release();
+        // Sweep-1 review, "Recheck RUT listener ownership in the real-binary
+        // self-test": the connect_failure phase repeated the same omission
+        // as the live-recording-upstream phase above -- recheck before
+        // stopping RUT here too.
+        const std::string rut_connect_failure_reuseport_error =
+            check_no_reuseport_collision_after_batch(listen_port, getuid());
+        if (!rut_connect_failure_reuseport_error.empty()) {
+            std::cerr << "FAIL [self-test rut]: " << rut_connect_failure_reuseport_error << "\n";
+            rut.stop();
+            return false;
+        }
         if (!rut.stop()) {
             std::cerr << "FAIL [self-test rut]: rut exited unexpectedly before teardown ("
                       << rut.unexpected_exit_description << ")\n";
@@ -9396,6 +9611,7 @@ int run_self_test(const std::string& rut_binary, const std::string& converter_bi
     ok &= self_test_require_upstream_idle_for_asserted_batch();
     ok &= self_test_quiesce_after_record_only_idle_timeout();
     ok &= self_test_partial_exchange_rejection();
+    ok &= self_test_ambiguity_reason_note_text();
     ok &= self_test_fake_listener_unblocks_on_shutdown();
     ok &= self_test_argv_builder();
     ok &= self_test_allocate_distinct_ports_exhaustion();
