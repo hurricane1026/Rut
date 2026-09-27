@@ -3125,14 +3125,28 @@ bool fill_upstream_bytes(std::vector<CaseResult>* results,
 // passed. Re-checks the SAME listener count immediately after the batch
 // that used `port` completes -- before the instance under test is stopped,
 // while it is still the one being measured -- so a co-owner that joined
-// mid-phase is still caught, even though one that joined and left within
-// the batch's own duration would not be. This is NOT a complete fix for
-// exclusivity over the whole phase; that needs a way to disable
-// SO_REUSEPORT for single-shard harness runs, tracked separately, outside
-// this PR. `uid` is the uid of the process being checked -- pass
-// `kEnvoyContainerUid` for an Envoy phase, `getuid()` for a RUT phase
-// (round-19 review, "Count Envoy listeners using the container's UID").
-// Returns empty on success, else a human-readable reason.
+// mid-phase and is STILL THERE when the batch ends is still caught.
+//
+// Sweep-4 review, "Enforce listener exclusivity throughout each batch":
+// declined as a harness-only fix -- this endpoint-sampling approach
+// (readiness-time + this post-batch check) cannot, even in principle,
+// catch a co-owner that both joins AND leaves entirely within one batch's
+// duration: no observation point exists (short of continuous, unbroken
+// monitoring for the whole batch, which the kernel gives no primitive to
+// do atomically from outside the process that owns the socket) at which
+// such a co-owner would ever appear in `count_listeners_on_port()`'s
+// snapshot. `rut` unconditionally sets `SO_REUSEPORT` on every listener,
+// on every platform build, with no option to disable it
+// (src/runtime/socket.cc:35-37's `#ifdef __linux__` guards only the
+// syscall's availability, not whether it's requested); Envoy does not set
+// it by default, so this asymmetry is specific to `rut`'s own listeners.
+// Closing this for real needs a runtime opt-out (e.g. an exclusive-bind
+// mode for single-shard runs), not another harness-side sampling trick --
+// tracked as issue #719, filed from this same review. `uid` is the uid of
+// the process being checked -- pass `kEnvoyContainerUid` for an Envoy
+// phase, `getuid()` for a RUT phase (round-19 review, "Count Envoy
+// listeners using the container's UID"). Returns empty on success, else a
+// human-readable reason.
 std::string check_no_reuseport_collision_after_batch(uint16_t port, uid_t uid) {
     const int count = count_listeners_on_port(port, uid);
     if (count > 1) {
