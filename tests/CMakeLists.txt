@@ -820,9 +820,21 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
     else()
         add_test(NAME test_envoy_differential_selftest COMMAND test_envoy_differential --self-test)
     endif()
+    # Sweep-12 review, "Raise the self-test timeout above its loaded-host
+    # runtime": measured directly on this host (16 cores) with
+    # RUT_ENABLE_JIT on (the longer invocation above, which additionally
+    # runs the real-binary port-retry and RUT-vs-oracle passes): ~75-76s
+    # unloaded, ~77-81s under 46 CPU-hog processes pinned across all 16
+    # cores (oversubscribed 3x). The old 90s limit left only ~10s of margin
+    # even unloaded, and the test source itself already notes the
+    # no-binary invocation alone approaches 90s on a loaded host
+    # (self_test_no_binary_self_test_leaves_no_temp_dirs). 240s keeps a
+    # generous multiple of the measured worst case for a slower or more
+    # contended CI host, without duplicating/removing any of the slow
+    # self-tests themselves.
     set_tests_properties(test_envoy_differential_selftest PROPERTIES
         LABELS "unit;envoy"
-        TIMEOUT 90
+        TIMEOUT 240
     )
 endif()
 

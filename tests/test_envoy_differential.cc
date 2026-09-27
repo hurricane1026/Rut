@@ -698,6 +698,21 @@ ReadResult read_http_message(int fd,
         // persistent-response grace check"). A retryable error
         // (EINTR/EAGAIN/EWOULDBLOCK, a spurious wakeup) just waits out the
         // rest of the grace window instead.
+        //
+        // Sweep-12 review, "Reject HEAD bodies already buffered with the
+        // headers": the grace loop below only ever notices a forbidden body
+        // that arrives via one of ITS OWN recv() calls, i.e. strictly after
+        // the header-reading loop above already returned. When a peer sends
+        // the header terminator and the forbidden body in the same TCP
+        // write, that header-reading loop's own recv() can capture both at
+        // once, leaving the body bytes already sitting in `buf` beyond
+        // `header_end + 4` before the grace loop ever runs -- and since
+        // nothing more is coming over the wire, the grace loop's poll()
+        // simply times out seeing nothing NEW, reporting the exchange
+        // complete despite the violation. Check for that pre-existing
+        // excess up front, exactly like the Content-Length branch below
+        // now does for the equivalent case.
+        if (buf.size() > header_end + 4) return {buf, false, {}};
         const int64_t grace_deadline = now_ms() + kTrailingBytesGraceMs;
         for (;;) {
             const int64_t remaining = grace_deadline - now_ms();
@@ -735,6 +750,20 @@ ReadResult read_http_message(int fd,
             if (n <= 0) return {buf, false, {}};
             buf.append(chunk, static_cast<size_t>(n));
         }
+        // Sweep-12 review, "Reject already-buffered bytes beyond
+        // Content-Length": when the peer sends the headers, the declared
+        // body, and trailing bytes all in one TCP read (or they simply
+        // accumulate across reads before this loop's next size check),
+        // `buf.size()` can already be greater than `total` the instant this
+        // loop exits -- before either branch below's own grace-window poll
+        // ever runs. Neither poll would then see any NEW data (nothing more
+        // is coming over the wire), so without this check both branches
+        // would report the exchange complete despite the peer having sent
+        // unsolicited trailing bytes, silently accepting them exactly as if
+        // they had never been sent. Treat this identically to the SAME
+        // violation those grace windows already detect for bytes that
+        // arrive in a LATER read.
+        if (buf.size() > total) return {buf, false, {}};
         if (advertises_close) {
             // A Content-Length-framed response can declare `connection:
             // close` (e.g. get_client_close) without the peer actually
@@ -821,7 +850,13 @@ ReadResult read_http_message(int fd,
     }
     // Neither Content-Length nor Connection: close: framing is fully
     // determined by the headers alone (assumed zero-length body), so this is
-    // complete as soon as the blank line was found above.
+    // complete as soon as the blank line was found above -- unless bytes
+    // beyond the header terminator are already sitting in `buf` (sweep-12
+    // review, "Reject already-buffered bytes beyond Content-Length": the
+    // same class of bug as the HEAD and Content-Length branches above,
+    // applied here too -- a body arriving in the same read as the headers
+    // when the headers themselves declared a zero-length body).
+    if (buf.size() > header_end + 4) return {buf, false, {}};
     return {buf, true, {}};
 }
 
@@ -2926,6 +2961,12 @@ enum class AmbiguityReason : std::uint8_t {
     // check_no_reuseport_collision_after_batch(): a concurrent process
     // shared this batch's listener port via SO_REUSEPORT.
     kReuseportCollision,
+    // fill_upstream_bytes(): unattributed traffic landed on some OTHER path
+    // while every case in this (record-only) batch already shows its own
+    // expected contact (or is exempt via case_expects_upstream_forward()),
+    // so elimination could not identify which case, if any, is the source
+    // (sweep-12 review, "Mark unattributed record-only traffic ambiguous").
+    kUnattributedStrayTraffic,
 };
 
 // Human-readable explanation of `reason`, for the "// NOTE: ... (<reason>)"
@@ -2945,6 +2986,9 @@ std::string describe_ambiguity_reason(AmbiguityReason reason) {
             return "the proxy exited unexpectedly during or after this record-only batch";
         case AmbiguityReason::kReuseportCollision:
             return "a concurrent process shared this batch's listener port via SO_REUSEPORT";
+        case AmbiguityReason::kUnattributedStrayTraffic:
+            return "upstream recorded unattributed traffic on another path and elimination could "
+                   "not identify which case, if any, is the source";
         case AmbiguityReason::kNone:
             break;
     }
@@ -3123,6 +3167,20 @@ bool fill_upstream_bytes(std::vector<CaseResult>* results,
                 ok = false;
             } else {
                 mark_upstream_ambiguous(&r, AmbiguityReason::kDuplicateUpstreamContact);
+                // Sweep-12 review, "Do not label duplicate upstream contacts
+                // as uncontacted": contact plainly occurred --
+                // `upstream_contact_count` above already reflects it -- even
+                // though which of the N observed requests is authoritative
+                // is ambiguous. Leaving `upstream_contacted`/
+                // `upstream_bytes` at their zero-value defaults made both
+                // transcript writers additionally print "upstream not
+                // contacted" right next to this NOTE, and discarded the very
+                // request bytes the differential exists to preserve. Surface
+                // the first observed request as evidence; the NOTE above and
+                // the `upstream_ambiguous` flag already tell readers not to
+                // trust it as uniquely authoritative.
+                r.upstream_contacted = true;
+                r.upstream_bytes = observed.front();
             }
             continue;
         }
@@ -3147,6 +3205,7 @@ bool fill_upstream_bytes(std::vector<CaseResult>* results,
             ok = false;
             continue;
         }
+        bool attributed = false;
         for (auto& r : *results) {
             const auto it = std::find_if(
                 cases.begin(), cases.end(), [&](const CaseSpec& s) { return r.name == s.name; });
@@ -3156,6 +3215,25 @@ bool fill_upstream_bytes(std::vector<CaseResult>* results,
             // design; it is never a plausible source of stray traffic.
             if (!case_expects_upstream_forward(r.name)) continue;
             mark_upstream_ambiguous(&r, AmbiguityReason::kStrayUpstreamTraffic);
+            attributed = true;
+        }
+        // Sweep-12 review, "Mark unattributed record-only traffic
+        // ambiguous": every case in this record-only batch already recorded
+        // its own expected contact (or is exempt via
+        // case_expects_upstream_forward()), so the elimination loop above
+        // found no zero-contact case to pin this path's stray request on.
+        // The batch stays non-gating either way (record-only cases never
+        // affect the exit code), but leaving every result's
+        // `upstream_ambiguous` flag unset let a MATCH still print and both
+        // transcript writers emit clean-looking rows despite the NOTE above
+        // having just reported traffic that neither side's evidence can
+        // vouch for. mark_upstream_ambiguous()'s first-reason-wins rule
+        // means this never overwrites a more specific reason (e.g.
+        // kDuplicateUpstreamContact) a case already carries.
+        if (!attributed) {
+            for (auto& r : *results) {
+                mark_upstream_ambiguous(&r, AmbiguityReason::kUnattributedStrayTraffic);
+            }
         }
     }
     return ok;
@@ -5699,9 +5777,41 @@ bool self_test_wait_idle_fails_on_relentless_arrivals() {
         return false;
     }
 
+    // Sweep-12 review, "Bound the connection injection loop": the previous
+    // version of this hook connected (and, via wait_idle()'s own accept
+    // loop, started a brand-new handler thread for) a fresh socket on
+    // EVERY poll() iteration with no throttling at all. Because each
+    // iteration completes almost instantly on a fast host -- poll() sees
+    // the just-connected socket ready immediately, so no real wall-clock
+    // time passes between iterations -- that spun the loop roughly 1,800
+    // times in the 400ms timeout on a fast machine. wait_idle() holds
+    // conn_mu_ for its ENTIRE call, so every one of those handler threads
+    // blocks in finish_connection() waiting for that lock until wait_idle()
+    // returns; a fast host (or one with a low process/thread-count ulimit)
+    // could exhaust the process's thread budget and make std::thread's
+    // constructor throw std::system_error, aborting the whole self-test
+    // binary instead of deterministically exercising the timeout path.
+    //
+    // Fix: sleep a small, fixed duration before each injected connect().
+    // This is NOT a race against wait_idle()'s own poll() -- the sleep and
+    // the connect() both run synchronously, on wait_idle()'s own thread,
+    // strictly before poll() is ever called, so by the time poll() runs
+    // the connection is unconditionally already sitting in the accept
+    // backlog: the exact same causal guarantee as before. The sleep only
+    // slows down how many iterations fit inside the timeout, bounding the
+    // connection/thread count to a small, host-speed-independent constant
+    // (~kWaitIdleTimeoutMs / kInjectionSleepMs, comfortably under 100) in
+    // place of an unbounded, host-speed-dependent one. A sleep that runs
+    // longer than requested under load only makes the loop reach the
+    // overall deadline sooner in iteration count (never in wall time) --
+    // it can never let a full quiet window complete, since accept()/
+    // connect() ordering is unaffected either way.
+    constexpr int kInjectionSleepMs = 5;
     int hook_calls = 0;
     upstream.set_test_before_quiet_window_poll_hook([port, &hook_calls] {
         hook_calls++;
+        struct timespec delay{0, static_cast<long>(kInjectionSleepMs) * 1'000'000};
+        nanosleep(&delay, nullptr);
         const int fd = connect_with_timeout(port, kClientTimeoutMs);
         if (fd >= 0) close(fd);
     });
@@ -6519,6 +6629,7 @@ bool self_test_ambiguity_reason_note_text() {
         AmbiguityReason::kUpstreamIdleTimeout,
         AmbiguityReason::kProxyCrash,
         AmbiguityReason::kReuseportCollision,
+        AmbiguityReason::kUnattributedStrayTraffic,
     };
 
     for (const AmbiguityReason reason : all_reasons) {
@@ -8328,6 +8439,17 @@ bool self_test_duplicate_upstream_rejected() {
 // it (the CLI contract promises record-only cases never affect the exit
 // code), but must still flag the case's own evidence as ambiguous rather
 // than silently trusting the first observation.
+//
+// Sweep-12 review, "Do not label duplicate upstream contacts as
+// uncontacted": contact plainly occurred here (`upstream_contact_count`
+// records both requests), so `upstream_contacted` must now be true and
+// `upstream_bytes` must hold the first observed request -- previously both
+// stayed at their zero-value defaults, so both transcript writers printed
+// "upstream not contacted" right alongside this duplicate-contact NOTE, a
+// self-contradictory pair of claims, and discarded the very bytes the
+// differential exists to preserve. The `upstream_ambiguous` flag (asserted
+// below) is what tells a reader not to trust this evidence as uniquely
+// authoritative -- it is not communicated by pretending no contact occurred.
 bool self_test_duplicate_upstream_record_only_not_fatal() {
     BoundPort bound;
     if (!allocate_bound_loopback_port(&bound)) {
@@ -8368,14 +8490,18 @@ bool self_test_duplicate_upstream_record_only_not_fatal() {
                      "the batch for a record-only case's duplicate\n";
         ok = false;
     }
-    if (results[0].upstream_contacted) {
-        std::cerr << "FAIL [self-test duplicate-upstream record-only]: upstream_contacted was set "
-                     "true despite the duplicate\n";
+    if (!results[0].upstream_contacted || results[0].upstream_bytes.empty()) {
+        std::cerr << "FAIL [self-test duplicate-upstream record-only]: upstream_contacted/"
+                     "upstream_bytes were not set even though contact plainly occurred (twice)\n";
         ok = false;
     }
     if (!results[0].upstream_ambiguous) {
         std::cerr << "FAIL [self-test duplicate-upstream record-only]: upstream_ambiguous was not "
                      "set for the record-only case's duplicate\n";
+        ok = false;
+    } else if (results[0].upstream_ambiguous_reason != AmbiguityReason::kDuplicateUpstreamContact) {
+        std::cerr << "FAIL [self-test duplicate-upstream record-only]: upstream_ambiguous_reason "
+                     "was not kDuplicateUpstreamContact\n";
         ok = false;
     }
     if (ok) std::cerr << "PASS [self-test duplicate-upstream record-only]\n";
@@ -8742,6 +8868,17 @@ bool self_test_oracle_rejects_unlisted_upstream_traffic() {
 // cases never affect the exit code), even though the case's own expected
 // contact also succeeded and there is nothing to attribute the extra
 // traffic to.
+//
+// Sweep-12 review, "Mark unattributed record-only traffic ambiguous": this
+// is exactly the scenario that review describes -- every case in the batch
+// already shows a nonzero contact count, so the elimination loop in
+// fill_upstream_bytes() has no zero-contact case left to pin the extra,
+// unlisted request on. Before the fix, that meant the whole condition was
+// treated as if nothing were wrong: the function returned success without
+// setting `upstream_ambiguous` on anything, even though stderr had just
+// logged the stray traffic as a NOTE -- letting a MATCH print and both
+// transcript writers emit clean-looking rows for evidence that was, in
+// fact, contaminated. This test now also asserts that flag and its reason.
 bool self_test_unexpected_upstream_path_record_only_not_fatal_even_with_all_contacts() {
     BoundPort bound;
     if (!allocate_bound_loopback_port(&bound)) {
@@ -8799,6 +8936,16 @@ bool self_test_unexpected_upstream_path_record_only_not_fatal_even_with_all_cont
     if (!results[0].upstream_contacted || results[0].upstream_contact_count != 1) {
         std::cerr << "FAIL [self-test unexpected-upstream-path record-only all-contacts]: the "
                      "case's own accounting was disturbed by the stray request\n";
+        ok = false;
+    }
+    if (!results[0].upstream_ambiguous) {
+        std::cerr << "FAIL [self-test unexpected-upstream-path record-only all-contacts]: "
+                     "upstream_ambiguous was not set even though elimination could not attribute "
+                     "the stray traffic to any case\n";
+        ok = false;
+    } else if (results[0].upstream_ambiguous_reason != AmbiguityReason::kUnattributedStrayTraffic) {
+        std::cerr << "FAIL [self-test unexpected-upstream-path record-only all-contacts]: "
+                     "upstream_ambiguous_reason was not kUnattributedStrayTraffic\n";
         ok = false;
     }
     if (ok) std::cerr << "PASS [self-test unexpected-upstream-path record-only all-contacts]\n";
@@ -9873,6 +10020,77 @@ bool self_test_head_body_detected() {
     return ok;
 }
 
+// Sweep-12 review, "Reject HEAD bodies already buffered with the headers":
+// self_test_head_body_detected() above only exercises a body sent in a
+// LATER TCP segment (a separate send() after a delay), which the grace
+// window's own recv() calls do observe. This exercises the case that bug
+// actually described -- the header terminator and the forbidden body
+// arriving in the SAME write, so they are very likely already both sitting
+// in `buf` by the time read_http_message()'s header-reading loop finds the
+// blank line, before the grace window's poll() ever runs.
+bool self_test_head_body_buffered_with_headers_rejected() {
+    uint16_t port = 0;
+    if (!allocate_loopback_port(&port)) {
+        std::cerr << "FAIL [self-test head body buffered]: could not allocate a loopback port\n";
+        return false;
+    }
+    int listen_fd = socket(AF_INET, SOCK_STREAM, 0);
+    if (listen_fd < 0) {
+        std::cerr << "FAIL [self-test head body buffered]: could not create listening socket\n";
+        return false;
+    }
+    const int one = 1;
+    setsockopt(listen_fd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
+    sockaddr_in addr{};
+    addr.sin_family = AF_INET;
+    addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    addr.sin_port = htons(port);
+    if (bind(listen_fd, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) != 0 ||
+        listen(listen_fd, 1) != 0) {
+        std::cerr << "FAIL [self-test head body buffered]: could not bind/listen\n";
+        close(listen_fd);
+        return false;
+    }
+    std::thread server([listen_fd] {
+        const int conn = accept(listen_fd, nullptr, nullptr);
+        if (conn < 0) return;
+        char buf[512];
+        recv(conn, buf, sizeof(buf), 0);  // discard the request
+        // Headers and the forbidden body in ONE send(): a single small
+        // write over loopback is delivered as one TCP segment, so the
+        // client's header-reading recv() captures both at once.
+        const std::string reply = "HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\noops!";
+        send(conn, reply.data(), reply.size(), 0);
+        struct timespec settle{0, 100'000'000};
+        nanosleep(&settle, nullptr);
+        close(conn);
+    });
+    bool ok = true;
+    const int fd = connect_with_timeout(port, kClientTimeoutMs);
+    if (fd < 0) {
+        std::cerr << "FAIL [self-test head body buffered]: could not connect\n";
+        ok = false;
+        shutdown(listen_fd, SHUT_RDWR);
+        close(listen_fd);
+        listen_fd = -1;
+    } else {
+        const std::string req = "HEAD /x HTTP/1.1\r\nHost: t.example\r\n\r\n";
+        send_all(fd, req);
+        const ReadResult resp = read_http_message(fd, /*head_request=*/true, kClientTimeoutMs);
+        if (resp.complete) {
+            std::cerr << "FAIL [self-test head body buffered]: a HEAD body already buffered "
+                         "with the headers was reported complete (accepted) instead of "
+                         "rejected\n";
+            ok = false;
+        }
+        close(fd);
+    }
+    server.join();
+    if (listen_fd >= 0) close(listen_fd);
+    if (ok) std::cerr << "PASS [self-test head body buffered]\n";
+    return ok;
+}
+
 // Round-8 review, "Reject resets during the persistent-response grace
 // check", HEAD counterpart: read_http_message()'s HEAD branch has its own
 // grace-window loop, separate from the Content-Length body one exercised by
@@ -9982,6 +10200,15 @@ enum class PeerTail : uint8_t {
     // must be rejected identically: a response that did not advertise
     // `Connection: close` still promised to stay open.
     kAbortiveReset,
+    // Sweep-12 review, "Reject already-buffered bytes beyond
+    // Content-Length": kTrailingGarbage above sends the garbage in a
+    // SEPARATE, delayed send() -- a LATER TCP segment, which the grace
+    // window's own recv() calls do observe. This case instead sends the
+    // headers, the declared body, AND the garbage all in one write, so
+    // they are very likely already all sitting in `buf` by the time the
+    // Content-Length while-loop above the grace window exits, before that
+    // grace window's poll() ever runs.
+    kTrailingGarbageBuffered,
 };
 
 bool self_test_persistent_trailing_bytes_detected() {
@@ -10015,10 +10242,17 @@ bool self_test_persistent_trailing_bytes_detected() {
             recv(conn, buf, sizeof(buf), 0);  // discard the request
             // No `Connection: close` (except kAdvertisedClose): persistent
             // framing, exactly the shape post_fixed/trace exercise.
-            const std::string resp =
+            std::string resp =
                 tail == PeerTail::kAdvertisedClose
                     ? "HTTP/1.1 201 Created\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok"
                     : "HTTP/1.1 201 Created\r\nContent-Length: 2\r\n\r\nok";
+            if (tail == PeerTail::kTrailingGarbageBuffered) {
+                // Headers, declared body, AND garbage in ONE send(): a
+                // single small write over loopback is delivered as one TCP
+                // segment, so the client's Content-Length while-loop's
+                // recv() captures all of it at once.
+                resp += "oops!";
+            }
             send(conn, resp.data(), resp.size(), 0);
             if (tail == PeerTail::kTrailingGarbage) {
                 struct timespec delay{0, 20'000'000};
@@ -10026,7 +10260,8 @@ bool self_test_persistent_trailing_bytes_detected() {
                 const std::string garbage = "oops!";
                 send(conn, garbage.data(), garbage.size(), 0);
             }
-            if (tail == PeerTail::kSettleThenClose || tail == PeerTail::kTrailingGarbage) {
+            if (tail == PeerTail::kSettleThenClose || tail == PeerTail::kTrailingGarbage ||
+                tail == PeerTail::kTrailingGarbageBuffered) {
                 struct timespec settle{0, 250'000'000};
                 nanosleep(&settle, nullptr);
             }
@@ -10059,6 +10294,15 @@ bool self_test_persistent_trailing_bytes_detected() {
                         std::cerr << "FAIL [self-test " << label
                                   << "]: trailing bytes after a persistent response's declared "
                                      "Content-Length were not detected (reported complete)\n";
+                        ok = false;
+                    }
+                    break;
+                case PeerTail::kTrailingGarbageBuffered:
+                    if (resp.complete) {
+                        std::cerr << "FAIL [self-test " << label
+                                  << "]: trailing bytes already buffered with a persistent "
+                                     "response's declared Content-Length body were not detected "
+                                     "(reported complete)\n";
                         ok = false;
                     }
                     break;
@@ -10118,6 +10362,8 @@ bool self_test_persistent_trailing_bytes_detected() {
     };
     bool ok = true;
     ok &= run_case(PeerTail::kTrailingGarbage, "persistent trailing bytes detected");
+    ok &= run_case(PeerTail::kTrailingGarbageBuffered,
+                   "persistent trailing bytes buffered with body detected");
     ok &= run_case(PeerTail::kSettleThenClose, "persistent no trailing bytes");
     ok &= run_case(PeerTail::kImmediateClose, "persistent EOF is a persistence mismatch");
     ok &= run_case(PeerTail::kAdvertisedClose, "advertised close then EOF is complete");
@@ -11095,6 +11341,7 @@ int run_self_test(const std::string& rut_binary, const std::string& converter_bi
     ok &= self_test_asserted_phase_delayed_teardown_request_is_fatal();
     ok &= self_test_accept_unblocks_on_shutdown_close();
     ok &= self_test_head_body_detected();
+    ok &= self_test_head_body_buffered_with_headers_rejected();
     ok &= self_test_head_grace_reset_detected();
     ok &= self_test_persistent_trailing_bytes_detected();
     ok &= self_test_envoy_early_exit_detected();
