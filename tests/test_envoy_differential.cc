@@ -247,7 +247,26 @@ bool run_and_capture(const std::vector<std::string>& argv,
         }
         if (!child_reaped) {
             const pid_t waited = waitpid(child, &status, WNOHANG);
-            if (waited == child || (waited < 0 && errno != EINTR)) child_reaped = true;
+            if (waited == child) {
+                child_reaped = true;
+            } else if (waited < 0 && errno != EINTR) {
+                // Sweep-14 review, "Reject capture when waitpid did not
+                // reap the child": no status was ever written here (most
+                // commonly ECHILD -- this process has SIGCHLD set to
+                // SIG_IGN, or otherwise auto-reaps children -- but any
+                // other non-retryable waitpid() failure is just as
+                // untrustworthy). `status` stays zero-initialized, which
+                // WIFEXITED(0)/WEXITSTATUS(0) below decode indistinguishably
+                // from a genuine clean exit 0; treat this as a capture
+                // failure instead of fabricating a successful exit code.
+                // docker_rm_force() depends on this: a false "exit 0" here
+                // would report a failed `docker rm -f` as successful,
+                // clear EnvoyInstance::launched, and leave a surviving
+                // host-network container/listener never retried for
+                // cleanup.
+                close(pipe_fds[0]);
+                return false;
+            }
         }
         if (child_reaped) break;
         const int64_t now_ms =
@@ -1899,10 +1918,24 @@ struct EnvoyInstance {
         if (waitid(P_PID, pid, &zombie_info, WEXITED | WNOHANG | WNOWAIT) == 0 &&
             zombie_info.si_pid == pid) {
             int reap_status = 0;
-            while (waitpid(pid, &reap_status, 0) < 0 && errno == EINTR) {
+            pid_t reap_waited;
+            while ((reap_waited = waitpid(pid, &reap_status, 0)) < 0 && errno == EINTR) {
             }
             exited_unexpectedly = true;
-            unexpected_exit_description = describe_wait_status(reap_status);
+            // Sweep-14 review, "Reject capture when waitpid did not reap the
+            // child": this branch already unconditionally reports an
+            // unexpected exit regardless of what `reap_status` holds, so the
+            // verdict here was never wrong -- but waitid() just above only
+            // confirms a reapable zombie WITHOUT actually consuming it
+            // (WNOWAIT), and if this blocking waitpid() somehow still fails
+            // (e.g. ECHILD, in the vanishingly unlikely event something else
+            // reaped it in between), `reap_status` stays zero-initialized,
+            // which describe_wait_status() would print as a fabricated
+            // "exited 0" instead of admitting nothing was actually reaped.
+            unexpected_exit_description = reap_waited == pid
+                                              ? describe_wait_status(reap_status)
+                                              : "no child status could be reaped (waitpid "
+                                                "failed, e.g. ECHILD)";
             pid = -1;
             // Sweep-3 review, "Preserve cleanup state when docker rm
             // fails": only clear `launched` once removal is confirmed;
@@ -2518,10 +2551,24 @@ struct RutInstance {
         if (waitid(P_PID, pid, &zombie_info, WEXITED | WNOHANG | WNOWAIT) == 0 &&
             zombie_info.si_pid == pid) {
             int reap_status = 0;
-            while (waitpid(pid, &reap_status, 0) < 0 && errno == EINTR) {
+            pid_t reap_waited;
+            while ((reap_waited = waitpid(pid, &reap_status, 0)) < 0 && errno == EINTR) {
             }
             exited_unexpectedly = true;
-            unexpected_exit_description = describe_wait_status(reap_status);
+            // Sweep-14 review, "Reject capture when waitpid did not reap the
+            // child": this branch already unconditionally reports an
+            // unexpected exit regardless of what `reap_status` holds, so the
+            // verdict here was never wrong -- but waitid() just above only
+            // confirms a reapable zombie WITHOUT actually consuming it
+            // (WNOWAIT), and if this blocking waitpid() somehow still fails
+            // (e.g. ECHILD, in the vanishingly unlikely event something else
+            // reaped it in between), `reap_status` stays zero-initialized,
+            // which describe_wait_status() would print as a fabricated
+            // "exited 0" instead of admitting nothing was actually reaped.
+            unexpected_exit_description = reap_waited == pid
+                                              ? describe_wait_status(reap_status)
+                                              : "no child status could be reaped (waitpid "
+                                                "failed, e.g. ECHILD)";
             pid = -1;
             return false;
         }
@@ -3796,18 +3843,33 @@ std::string normalize_date_for_compare(const std::string& raw,
         // present. Only take the preserved-as-is branch when
         // `preserved_date` itself is non-empty (i.e. this really is
         // `get_upstream_date_server`).
-        if (preserved_date.empty() || trimmed != preserved_date) {
-            if (!is_rfc1123_http_date(trimmed) ||
-                (require_current &&
-                 !rfc1123_http_date_is_current(trimmed, now, tolerance_seconds))) {
-                *dates_valid = false;
-                continue;  // leave the malformed/stale value visible in the output
-            }
-            // Replace only the value bytes, keeping the exact prefix (the
-            // whitespace between ':' and the value, which may differ
-            // between implementations) and any trailing whitespace intact,
-            // so this never hides a real formatting difference elsewhere on
-            // the line.
+        if (!preserved_date.empty()) {
+            if (trimmed == preserved_date) continue;  // exact match: leave untouched
+            // Sweep-14 review, "Require the upstream Date to remain
+            // preserved": get_upstream_date_server's whole point is that
+            // Envoy/RUT must forward this header completely unchanged.
+            // Previously, any OTHER value fell through to the generic
+            // synthesized-date check below and was normalized away
+            // whenever it happened to also be a well-formed, current RFC
+            // 1123 date -- so if both Envoy and RUT incorrectly replaced
+            // the preserved Date with their own freshly synthesized
+            // values, both became the same placeholder and the case
+            // reported MATCH, defeating the explicit preservation
+            // invariant. Treat any non-matching value here exactly like a
+            // malformed one instead: fail the case, never normalize it.
+            *dates_valid = false;
+            continue;
+        }
+        if (!is_rfc1123_http_date(trimmed) ||
+            (require_current && !rfc1123_http_date_is_current(trimmed, now, tolerance_seconds))) {
+            *dates_valid = false;
+            continue;  // leave the malformed/stale value visible in the output
+        }
+        // Replace only the value bytes, keeping the exact prefix (the
+        // whitespace between ':' and the value, which may differ between
+        // implementations) and any trailing whitespace intact, so this
+        // never hides a real formatting difference elsewhere on the line.
+        {
             const std::string prefix = a == std::string::npos ? value : value.substr(0, a);
             const std::string suffix = a == std::string::npos ? "" : value.substr(b + 1);
             std::string new_line = line.substr(0, colon + 1);
@@ -9837,6 +9899,82 @@ bool self_test_envoy_stop_rejects_unreaped_status_under_sigchld_ignore() {
     return ok;
 }
 
+// Sweep-14 review, "Reject capture when waitpid did not reap the child":
+// run_and_capture()'s own polling loop had the identical bug the sweep-13
+// *Instance::stop() fixes addressed -- a `waited < 0` (e.g. ECHILD, from
+// SIGCHLD inherited as SIG_IGN or otherwise auto-reaped children) used to
+// still set `child_reaped = true`, leaving `status` zero-initialized and
+// WIFEXITED(0)/WEXITSTATUS(0) fabricating a successful exit code 0. Fresh
+// evidence beyond the accepted teardown-status fix: docker_rm_force() calls
+// run_and_capture() directly, so a failed `docker rm -f` was treated as
+// successful, EnvoyInstance::stop() cleared `launched`, and a surviving
+// host-network container/listener was never retried for cleanup. Installs
+// SIGCHLD=SIG_IGN the same way sweep-13's SIGCHLD self-tests do (saved and
+// unconditionally restored), and checks BOTH run_and_capture() directly and
+// docker_rm_force() (via a stubbed docker binary that exits 0 -- would be
+// wrongly trusted as "removed" if the underlying bug were still present).
+bool self_test_capture_and_docker_rm_reject_unreaped_status_under_sigchld_ignore() {
+    bool ok = true;
+    struct sigaction old_action{};
+    struct sigaction ignore_action{};
+    ignore_action.sa_handler = SIG_IGN;
+    sigemptyset(&ignore_action.sa_mask);
+    ignore_action.sa_flags = 0;
+    if (sigaction(SIGCHLD, &ignore_action, &old_action) != 0) {
+        std::cerr << "FAIL [self-test capture/docker-rm reject unreaped status]: could not "
+                     "install SIGCHLD SIG_IGN\n";
+        return false;
+    }
+    const auto restore = [&old_action] { sigaction(SIGCHLD, &old_action, nullptr); };
+
+    // run_and_capture() itself, directly: a trivial, fast, successful
+    // child that -- under SIGCHLD=SIG_IGN -- the kernel auto-reaps before
+    // this call's own waitpid() polling loop can ever observe it.
+    {
+        std::string output;
+        int exit_code = -1;
+        const bool captured = run_and_capture({"/bin/true"}, 3000, &output, &exit_code);
+        if (captured) {
+            std::cerr << "FAIL [self-test capture/docker-rm reject unreaped status]: "
+                         "run_and_capture reported success despite never reaping a status "
+                         "(SIGCHLD was SIG_IGN)\n";
+            ok = false;
+        }
+    }
+
+    // docker_rm_force(): a stubbed docker binary that exits 0 -- must still
+    // report failure under the same SIGCHLD=SIG_IGN conditions, since
+    // run_and_capture() (which it calls directly) can never succeed there.
+    {
+        TempDir dir("rut-diff-selftest-docker-rm-sigchld");
+        if (dir.empty()) {
+            std::cerr
+                << "FAIL [self-test capture/docker-rm reject unreaped status]: could not create "
+                   "temp dir\n";
+            ok = false;
+        } else {
+            const std::string stub = dir.path() + "/docker.sh";
+            if (!write_docker_stub(stub, /*exit_code=*/0, /*stderr_text=*/"")) {
+                std::cerr << "FAIL [self-test capture/docker-rm reject unreaped status]: could "
+                             "not write docker stub\n";
+                ok = false;
+            } else {
+                ScopedDockerBinOverride override_bin(stub);
+                if (docker_rm_force("rut-diff-selftest-no-such-container-sigchld")) {
+                    std::cerr << "FAIL [self-test capture/docker-rm reject unreaped status]: "
+                                 "docker_rm_force reported success despite never reaping a status "
+                                 "(SIGCHLD was SIG_IGN)\n";
+                    ok = false;
+                }
+            }
+        }
+    }
+
+    restore();
+    if (ok) std::cerr << "PASS [self-test capture/docker-rm reject unreaped status]\n";
+    return ok;
+}
+
 // Exercises the exact `compare_pair_case` path two identically-failed
 // exchanges would hit (e.g. a connection refused on both sides before a
 // single byte crossed the wire, leaving two equal empty buffers): it must
@@ -11883,6 +12021,103 @@ bool self_test_stale_synthesized_date_rejected() {
     return ok;
 }
 
+// Sweep-14 review, "Require the upstream Date to remain preserved":
+// get_upstream_date_server's whole point is that the recording upstream's
+// literal Date value must reach the client completely unchanged -- Envoy
+// and RUT are never supposed to touch it, unlike every other case's Date,
+// which both sides ARE expected to synthesize fresh. Before this fix, a
+// value other than the preserved literal fell through to the generic
+// synthesized-date check and was normalized away whenever it happened to
+// also be well-formed and current, so if BOTH sides incorrectly replaced
+// the preserved Date with their own live values, both became the same
+// <normalized-date> placeholder and the asserted pair still reported
+// MATCH -- silently hiding the exact regression this case exists to catch.
+bool self_test_preserved_upstream_date_enforced() {
+    bool ok = true;
+    constexpr char kPreserved[] = "Mon, 01 Jan 2024 00:00:00 GMT";
+    const time_t now = time(nullptr);
+    const std::string live_now = format_rfc1123_http_date(now);
+
+    auto make_pair = [](const std::string& envoy_date, const std::string& rut_date) {
+        PairCaseResult c;
+        c.name = "get_upstream_date_server";
+        c.asserted = true;
+        c.envoy.exchange_complete = c.rut.exchange_complete = true;
+        c.envoy.upstream_contacted = c.rut.upstream_contacted = true;
+        c.envoy.upstream_contact_count = c.rut.upstream_contact_count = 1;
+        c.envoy.upstream_bytes = c.rut.upstream_bytes = "GET /date HTTP/1.1\r\n\r\n";
+        c.envoy.downstream_bytes =
+            "HTTP/1.1 200 OK\r\ncontent-length: 0\r\ndate: " + envoy_date + "\r\n\r\n";
+        c.rut.downstream_bytes =
+            "HTTP/1.1 200 OK\r\ncontent-length: 0\r\ndate: " + rut_date + "\r\n\r\n";
+        return c;
+    };
+    // Baseline: both sides forward the exact preserved literal -- must
+    // still match (no regression on the common, correct case).
+    if (!compare_pair_case(make_pair(kPreserved, kPreserved))) {
+        std::cerr << "FAIL [self-test preserved upstream date]: compare_pair_case rejected both "
+                     "sides correctly preserving the upstream Date\n";
+        ok = false;
+    }
+    // The actual bug: BOTH sides replace the preserved Date with their own
+    // live, current, well-formed values -- different from each other, but
+    // each individually valid, exactly what previously normalized to the
+    // same placeholder and reported a false MATCH.
+    if (compare_pair_case(make_pair(live_now, format_rfc1123_http_date(now + 60)))) {
+        std::cerr << "FAIL [self-test preserved upstream date]: compare_pair_case matched two "
+                     "sides that both incorrectly replaced the preserved upstream Date with "
+                     "fresh synthesized values\n";
+        ok = false;
+    }
+    // Only one side replaces it: must not match either.
+    if (compare_pair_case(make_pair(kPreserved, live_now))) {
+        std::cerr << "FAIL [self-test preserved upstream date]: compare_pair_case matched when "
+                     "only RUT replaced the preserved upstream Date\n";
+        ok = false;
+    }
+    if (compare_pair_case(make_pair(live_now, kPreserved))) {
+        std::cerr << "FAIL [self-test preserved upstream date]: compare_pair_case matched when "
+                     "only Envoy replaced the preserved upstream Date\n";
+        ok = false;
+    }
+
+    // The oracle comparison path enforces the same invariant.
+    {
+        CaseResult r;
+        r.name = "get_upstream_date_server";
+        r.exchange_complete = true;
+        r.upstream_bytes = "GET /date HTTP/1.1\r\n\r\n";
+        const std::string oracle_down =
+            std::string("HTTP/1.1 200 OK\r\ncontent-length: 0\r\ndate: ") + kPreserved + "\r\n\r\n";
+        const OracleCase oracle{"get_upstream_date_server",
+                                r.upstream_bytes.data(),
+                                r.upstream_bytes.size(),
+                                oracle_down.data(),
+                                oracle_down.size()};
+        // RUT correctly preserves it: matches.
+        r.downstream_bytes =
+            std::string("HTTP/1.1 200 OK\r\ncontent-length: 0\r\ndate: ") + kPreserved + "\r\n\r\n";
+        if (!compare_case_against_oracle(r, oracle)) {
+            std::cerr << "FAIL [self-test preserved upstream date]: compare_case_against_oracle "
+                         "rejected rut correctly preserving the upstream Date\n";
+            ok = false;
+        }
+        // RUT replaces it with its own live, current, well-formed Date:
+        // must fail, not normalize.
+        r.downstream_bytes =
+            "HTTP/1.1 200 OK\r\ncontent-length: 0\r\ndate: " + live_now + "\r\n\r\n";
+        if (compare_case_against_oracle(r, oracle)) {
+            std::cerr << "FAIL [self-test preserved upstream date]: compare_case_against_oracle "
+                         "accepted rut replacing the preserved upstream Date with a fresh "
+                         "synthesized value\n";
+            ok = false;
+        }
+    }
+
+    if (ok) std::cerr << "PASS [self-test preserved upstream date]\n";
+    return ok;
+}
+
 // Sweep-8 review, "Treat ambiguous record-only evidence as non-matching":
 // a record-only row marked upstream_ambiguous (a proxy crash, a reuseport
 // collision, an upstream-idle timeout, a duplicate contact, or stray
@@ -12339,8 +12574,10 @@ int run_self_test(const std::string& rut_binary, const std::string& converter_bi
     ok &= self_test_envoy_early_exit_detected();
     ok &= self_test_envoy_stop_verifies_exit_status();
     ok &= self_test_envoy_stop_rejects_unreaped_status_under_sigchld_ignore();
+    ok &= self_test_capture_and_docker_rm_reject_unreaped_status_under_sigchld_ignore();
     ok &= self_test_malformed_date_rejected();
     ok &= self_test_stale_synthesized_date_rejected();
+    ok &= self_test_preserved_upstream_date_enforced();
     ok &= self_test_compare_pair_case_flags_ambiguous_as_non_matching();
     ok &= self_test_rut_port_retry(rut_binary, converter_binary);
     if (!rut_binary.empty() && !converter_binary.empty()) {
