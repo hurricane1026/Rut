@@ -1308,105 +1308,173 @@ public:
     //      loop remains bounded by `timeout_ms` like the rest of this
     //      function: a pathological stream of arrivals cannot make this
     //      spin forever.
-    //   4. Release `conn_mu_`, then wait (bounded by the remainder of
-    //      `timeout_ms`) for every handler thread -- started just now, or
-    //      already running from an earlier accept_loop() iteration -- to
-    //      finish and remove itself from `active_fds_`. Nothing can ever
-    //      be ADDED to `active_fds_` during this wait: accept_loop() is
-    //      still blocked from accepting by `draining_`, and step 3 already
-    //      drained everything accept_loop() could otherwise have raced it
-    //      for. Observing `active_fds_.empty()` here is therefore also a
-    //      proof, not a sample.
+    //   4. Sweep-15 review, "Re-drain the backlog after active handlers
+    //      finish" (P1): steps 1-3 above prove the BACKLOG quiet for one
+    //      instant, but a handler started during step 2 can still be
+    //      running when step 3 finishes. Release `conn_mu_` and wait
+    //      (bounded by the remainder of `timeout_ms`) for every such
+    //      handler to finish and remove itself from `active_fds_` --
+    //      handle_connection()'s finish_connection() needs this same lock
+    //      briefly to do that, so it cannot be held here too. But nothing
+    //      in this function is polling the listener DURING that wait
+    //      either, and `draining_` being true only stops accept_loop()
+    //      from taking a connection -- it does not stop one from landing
+    //      in the kernel backlog in the first place. A connection that
+    //      arrives in that window is invisible to everyone until this
+    //      function looks again, so if any handler was still active at the
+    //      end of step 3, steps 1-3 must run AGAIN after it finishes,
+    //      before this call may trust anything: only an iteration whose
+    //      OWN step 3 already found `active_fds_` empty (no handler left to
+    //      wait for at all, so step 4 needs no wait and nothing had a
+    //      chance to sneak in) counts as proof the whole thing is quiet.
     //   5. Clear `draining_` before returning (success or timeout), so
     //      accept_loop() resumes accepting for whatever phase comes next.
     bool wait_idle(int timeout_ms) {
         constexpr int kQuietWindowMs = 100;
         const int64_t deadline = now_ms() + timeout_ms;
-        // Sweep-9 review, "Fail when the quiet-window deadline expires":
-        // only a poll() that actually waited out the FULL `kQuietWindowMs`
-        // and still saw nothing counts as proof the backlog is empty. If
-        // repeated arrivals keep resetting the window until less than
-        // `kQuietWindowMs` remains before `deadline`, the final poll()
-        // below is deliberately shortened to whatever time is left (so it
-        // can still opportunistically catch and drain a very-late
-        // arrival), but its own timeout must NOT be mistaken for a
-        // completed quiet window: nothing observed a stable empty interval
-        // in that case, so this call must report failure (`false`) rather
-        // than let a caller snapshot/clear its evidence believing the
-        // backlog was proven quiet. `backlog_proven_empty` tracks this
-        // distinction explicitly instead of inferring it from `drained`.
-        bool backlog_proven_empty = false;
         {
             std::lock_guard<std::mutex> lock(conn_mu_);
             draining_ = true;
-            const int fd = listen_fd_;
-            if (fd < 0) {
-                backlog_proven_empty = true;  // nothing to drain at all
-            } else {
-                for (;;) {
-                    for (;;) {
-                        const int accepted_fd = accept(fd, nullptr, nullptr);
-                        if (accepted_fd < 0) break;  // EAGAIN/EWOULDBLOCK
-                        active_fds_.push_back(accepted_fd);
-                        conn_threads_.emplace_back(
-                            &RecordingUpstream::handle_connection, this, accepted_fd);
-                    }
-                    const int64_t remaining_ms = deadline - now_ms();
-                    if (remaining_ms <= 0) break;  // overall deadline reached: no proof
-                    const bool full_window_available = remaining_ms >= kQuietWindowMs;
-                    const int wait_ms =
-                        static_cast<int>(full_window_available ? kQuietWindowMs : remaining_ms);
-                    // Sweep-9 follow-up review, "Make the relentless-arrival
-                    // idle self-test deterministic": test-only, always
-                    // unset in production. Runs synchronously, on this same
-                    // thread, immediately before the poll() call below --
-                    // never as a race against it. A test that needs
-                    // poll() to reliably see the listener readable (so a
-                    // full quiet window can never complete) uses this to
-                    // perform a real loopback connect() here: connect()
-                    // only returns once the local TCP handshake has
-                    // completed, which -- for loopback, within the same
-                    // kernel -- has already queued the connection in this
-                    // listener's accept backlog by the time control
-                    // returns here, before poll() is ever called. This
-                    // makes the resulting test deterministic against
-                    // wall-clock scheduling, unlike timing a background
-                    // thread's arrivals against this loop's real-time
-                    // poll() windows.
-                    if (test_before_quiet_window_poll_hook_) test_before_quiet_window_poll_hook_();
-                    pollfd pfd{fd, POLLIN, 0};
-                    const int pr = poll(&pfd, 1, wait_ms);
-                    if (pr <= 0 || (pfd.revents & POLLIN) == 0) {
-                        // Nothing arrived during this wait. Only a FULL
-                        // quiet window's worth of silence is proof; a
-                        // deadline-shortened wait proves nothing, however
-                        // it turned out.
-                        if (full_window_available) backlog_proven_empty = true;
-                        break;
-                    }
-                    // Something arrived during the quiet window: loop back
-                    // to drain it and restart the window.
-                }
-            }
         }
-        bool drained = backlog_proven_empty;
+        bool proven_idle = false;
         for (;;) {
+            // Steps 1-3: drain the backlog and require a full quiet window
+            // with nothing arriving, entirely under conn_mu_ (unchanged
+            // from the pre-sweep-15 version -- this alone already proves
+            // the BACKLOG quiet for this one instant; see step 4's comment
+            // above for why that is not yet the whole proof).
+            //
+            // Sweep-9 review, "Fail when the quiet-window deadline
+            // expires": only a poll() that actually waited out the FULL
+            // `kQuietWindowMs` and still saw nothing counts as proof the
+            // backlog is empty. If repeated arrivals keep resetting the
+            // window until less than `kQuietWindowMs` remains before
+            // `deadline`, the final poll() below is deliberately shortened
+            // to whatever time is left (so it can still opportunistically
+            // catch and drain a very-late arrival), but its own timeout
+            // must NOT be mistaken for a completed quiet window: nothing
+            // observed a stable empty interval in that case, so this call
+            // must report failure (`false`) rather than let a caller
+            // snapshot/clear its evidence believing the backlog was proven
+            // quiet. `backlog_proven_empty` tracks this distinction
+            // explicitly instead of inferring it from the final result.
+            bool backlog_proven_empty = false;
+            // Whether `active_fds_` was ALSO already empty at the exact
+            // moment step 3 finished proving the backlog quiet -- i.e.
+            // step 4 below would need no wait at all this iteration. Only
+            // this combination is the fixpoint the sweep-15 review
+            // requires.
+            bool active_empty_when_proven = false;
             {
                 std::lock_guard<std::mutex> lock(conn_mu_);
-                if (active_fds_.empty()) break;
+                const int fd = listen_fd_;
+                if (fd < 0) {
+                    backlog_proven_empty = true;  // nothing to drain at all
+                } else {
+                    for (;;) {
+                        for (;;) {
+                            const int accepted_fd = accept(fd, nullptr, nullptr);
+                            if (accepted_fd < 0) break;  // EAGAIN/EWOULDBLOCK
+                            active_fds_.push_back(accepted_fd);
+                            conn_threads_.emplace_back(
+                                &RecordingUpstream::handle_connection, this, accepted_fd);
+                        }
+                        const int64_t remaining_ms = deadline - now_ms();
+                        if (remaining_ms <= 0) break;  // overall deadline reached: no proof
+                        const bool full_window_available = remaining_ms >= kQuietWindowMs;
+                        const int wait_ms =
+                            static_cast<int>(full_window_available ? kQuietWindowMs : remaining_ms);
+                        // Sweep-9 follow-up review, "Make the
+                        // relentless-arrival idle self-test deterministic":
+                        // test-only, always unset in production. Runs
+                        // synchronously, on this same thread, immediately
+                        // before the poll() call below -- never as a race
+                        // against it. A test that needs poll() to reliably
+                        // see the listener readable (so a full quiet window
+                        // can never complete) uses this to perform a real
+                        // loopback connect() here: connect() only returns
+                        // once the local TCP handshake has completed, which
+                        // -- for loopback, within the same kernel -- has
+                        // already queued the connection in this listener's
+                        // accept backlog by the time control returns here,
+                        // before poll() is ever called. This makes the
+                        // resulting test deterministic against wall-clock
+                        // scheduling, unlike timing a background thread's
+                        // arrivals against this loop's real-time poll()
+                        // windows. Also used (sweep-15 review) to inject an
+                        // arrival while a handler is still active, after
+                        // the first quiet window, so a self-test can drive
+                        // this function's re-drain fixpoint directly.
+                        if (test_before_quiet_window_poll_hook_)
+                            test_before_quiet_window_poll_hook_();
+                        pollfd pfd{fd, POLLIN, 0};
+                        const int pr = poll(&pfd, 1, wait_ms);
+                        if (pr <= 0 || (pfd.revents & POLLIN) == 0) {
+                            // Nothing arrived during this wait. Only a FULL
+                            // quiet window's worth of silence is proof; a
+                            // deadline-shortened wait proves nothing,
+                            // however it turned out.
+                            if (full_window_available) backlog_proven_empty = true;
+                            break;
+                        }
+                        // Something arrived during the quiet window: loop
+                        // back to drain it and restart the window.
+                    }
+                }
+                if (backlog_proven_empty) active_empty_when_proven = active_fds_.empty();
             }
-            if (now_ms() >= deadline) {
-                drained = false;
+            if (!backlog_proven_empty) break;  // overall deadline reached: give up
+            if (active_empty_when_proven) {
+                proven_idle = true;
                 break;
             }
-            struct timespec ts{0, 5'000'000};
-            nanosleep(&ts, nullptr);
+            // Step 4: at least one handler was still active the instant
+            // the backlog was proven quiet above. Wait for it (and any
+            // other already-active handler) to finish, WITHOUT holding
+            // conn_mu_ so it can. Nothing can be ADDED to `active_fds_`
+            // while this waits -- accept_loop() is still blocked by
+            // `draining_` -- but something CAN land in the kernel backlog
+            // unseen, which is exactly why this iteration cannot be
+            // trusted as proof and must loop back to steps 1-3 afterward.
+            //
+            // Sweep-15 follow-up, "Make the re-drain fixpoint directly
+            // testable": test-only, always unset in production. Runs
+            // synchronously, on this same thread, exactly once per
+            // fixpoint iteration, right as this wait begins -- the precise
+            // instant the sweep-15 review describes ("a handler is still
+            // active, after the first quiet window"). A test uses this to
+            // inject a new connection (which lands in the backlog,
+            // invisible to accept_loop() while draining_ is true and to
+            // the phase-1 pass that just finished) and/or unblock the
+            // still-active handler this wait is about to wait for, with
+            // the same causal guarantee as test_before_quiet_window_poll_
+            // hook_: both actions happen here, before this loop's own
+            // first active_fds_ check, so there is no race to win.
+            if (test_before_active_handler_wait_hook_) test_before_active_handler_wait_hook_();
+            bool handlers_drained = false;
+            for (;;) {
+                {
+                    std::lock_guard<std::mutex> lock(conn_mu_);
+                    if (active_fds_.empty()) {
+                        handlers_drained = true;
+                        break;
+                    }
+                }
+                if (now_ms() >= deadline) break;
+                struct timespec ts{0, 5'000'000};
+                nanosleep(&ts, nullptr);
+            }
+            if (!handlers_drained) break;  // deadline reached waiting for a handler: give up
+            // Loop back to steps 1-3 for another fixpoint iteration: a
+            // connection may have arrived in the backlog while the wait
+            // above ran, and only a fresh, full quiet window can rule that
+            // out.
         }
         {
             std::lock_guard<std::mutex> lock(conn_mu_);
             draining_ = false;
         }
-        return drained;
+        return proven_idle;
     }
 
     // Test-only hook for self_test_wait_idle_drains_backlog_itself(): when
@@ -1422,6 +1490,13 @@ public:
     // production use.
     void set_test_before_quiet_window_poll_hook(std::function<void()> hook) {
         test_before_quiet_window_poll_hook_ = std::move(hook);
+    }
+
+    // Test-only hook for self_test_wait_idle_redrains_after_active_handler():
+    // see wait_idle()'s step-4 call site comment. Always unset (empty) in
+    // production use.
+    void set_test_before_active_handler_wait_hook(std::function<void()> hook) {
+        test_before_active_handler_wait_hook_ = std::move(hook);
     }
 
     // Idempotent: safe to call more than once (the destructor calls it again
@@ -1626,6 +1701,8 @@ private:
     int test_accept_loop_hold_ms_ = 0;
     // Test-only; see set_test_before_quiet_window_poll_hook()'s comment.
     std::function<void()> test_before_quiet_window_poll_hook_;
+    // Test-only; see set_test_before_active_handler_wait_hook()'s comment.
+    std::function<void()> test_before_active_handler_wait_hook_;
     std::string default_reply_ =
         "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 5\r\n\r\nhello";
 };
@@ -6064,6 +6141,131 @@ bool self_test_wait_idle_redrains_after_eagain() {
 
     upstream.stop();
     if (ok) std::cerr << "PASS [self-test wait_idle redrains after eagain]\n";
+    return ok;
+}
+
+// Sweep-15 review, "Re-drain the backlog after active handlers finish"
+// (P1): reproduces the exact race the review describes -- a connection
+// arrives in the listen backlog AFTER wait_idle()'s first full quiet
+// window completes, while a DIFFERENT handler (already active before
+// wait_idle() was even called) is still being waited for in step 4.
+// Before this fix, wait_idle() observed active_fds_ finally go empty (once
+// that first handler finished) and returned success immediately without
+// ever looking at the backlog again, silently losing the connection this
+// test injects. Uses set_test_before_active_handler_wait_hook(), which
+// fires exactly once per fixpoint iteration, synchronously on wait_idle()'s
+// own thread, right as step 4 begins waiting for a still-active handler --
+// the precise instant the review's bug window opens. From there this test
+// (a) opens a second, new connection (causally guaranteed, by the loopback
+// connect(), to land in the backlog before this hook returns -- invisible
+// to accept_loop() while draining_ is true, and to the phase-1 pass that
+// already finished this iteration), then (b) closes the pre-established
+// persistent connection so its handler unblocks and step 4 can make
+// progress. Both actions run synchronously, before step 4's own first
+// active_fds_ check, so there is no race to win either way -- purely
+// causal, like set_test_before_quiet_window_poll_hook_'s existing use.
+bool self_test_wait_idle_redrains_after_active_handler() {
+    BoundPort bound;
+    if (!allocate_bound_loopback_port(&bound)) {
+        std::cerr << "FAIL [self-test wait_idle redrains after active handler]: could not "
+                     "allocate a loopback port\n";
+        return false;
+    }
+    const uint16_t port = bound.port;
+
+    RecordingUpstream upstream;
+    // The persistent connection's reply does NOT advertise `Connection:
+    // close`, so handle_connection() loops back into its own poll() to
+    // wait for a next request instead of returning -- exactly the "still
+    // active" handler this bug needs, already active before wait_idle() is
+    // ever called.
+    upstream.set_reply("/persistent", "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nhi");
+    upstream.set_reply("/delayed",
+                       "HTTP/1.1 200 OK\r\nConnection: close\r\nContent-Length: 2\r\n\r\nhi");
+    if (!upstream.adopt(bound.fd)) {
+        std::cerr << "FAIL [self-test wait_idle redrains after active handler]: could not adopt "
+                     "the listener\n";
+        return false;
+    }
+
+    const int persistent_fd = connect_with_timeout(port, kClientTimeoutMs);
+    if (persistent_fd < 0) {
+        std::cerr
+            << "FAIL [self-test wait_idle redrains after active handler]: could not connect the "
+               "persistent connection\n";
+        upstream.stop();
+        return false;
+    }
+    const std::string persistent_req = "GET /persistent HTTP/1.1\r\nHost: t.example\r\n\r\n";
+    if (!send_all(persistent_fd, persistent_req)) {
+        std::cerr << "FAIL [self-test wait_idle redrains after active handler]: could not send "
+                     "the persistent connection's request\n";
+        close(persistent_fd);
+        upstream.stop();
+        return false;
+    }
+    const ReadResult persistent_resp =
+        read_http_message(persistent_fd, /*head_request=*/false, kClientTimeoutMs);
+    if (!persistent_resp.complete) {
+        std::cerr << "FAIL [self-test wait_idle redrains after active handler]: the persistent "
+                     "connection's first exchange did not complete\n";
+        close(persistent_fd);
+        upstream.stop();
+        return false;
+    }
+    // handle_connection() has now replied and looped back to wait for a
+    // next request on this same connection: it is active, but otherwise
+    // idle -- exactly the pre-existing state wait_idle() must still be
+    // waiting on when the review's bug window opens.
+
+    int hook_calls = 0;
+    int delayed_fd = -1;
+    upstream.set_test_before_active_handler_wait_hook(
+        [port, persistent_fd, &hook_calls, &delayed_fd] {
+            hook_calls++;
+            if (hook_calls != 1) return;  // only the first time step 4 is entered
+            delayed_fd = connect_with_timeout(port, kClientTimeoutMs);
+            if (delayed_fd >= 0) {
+                const std::string req =
+                    "GET /delayed HTTP/1.1\r\nHost: t.example\r\nConnection: close\r\n\r\n";
+                // Fire-and-forget: do NOT wait for a reply here. Nothing
+                // will accept this connection until wait_idle() (whose own
+                // thread is running this hook right now) loops back to
+                // phase 1 below; blocking this hook for a reply would
+                // deadlock wait_idle() against itself.
+                send_all(delayed_fd, req);
+            }
+            // Unblocks the persistent handler's poll(): its recv() then
+            // sees EOF and returns, letting step 4 make progress.
+            close(persistent_fd);
+        });
+
+    bool ok = true;
+    const bool went_idle = upstream.wait_idle(2000);
+    if (!went_idle) {
+        std::cerr
+            << "FAIL [self-test wait_idle redrains after active handler]: wait_idle() timed out\n";
+        ok = false;
+    }
+    if (hook_calls < 1) {
+        std::cerr << "FAIL [self-test wait_idle redrains after active handler]: the "
+                     "active-handler-wait hook never ran, so this test did not exercise step 4 "
+                     "at all\n";
+        ok = false;
+    }
+    if (upstream.requests_for("/delayed").empty()) {
+        std::cerr << "FAIL [self-test wait_idle redrains after active handler]: the connection "
+                     "injected while the persistent handler was still active was never recorded "
+                     "despite wait_idle() reporting idle\n";
+        ok = false;
+    }
+    if (delayed_fd >= 0) {
+        read_http_message(delayed_fd, /*head_request=*/false, kClientTimeoutMs);
+        close(delayed_fd);
+    }
+
+    upstream.stop();
+    if (ok) std::cerr << "PASS [self-test wait_idle redrains after active handler]\n";
     return ok;
 }
 
@@ -12515,6 +12717,7 @@ int run_self_test(const std::string& rut_binary, const std::string& converter_bi
     ok &= self_test_wait_idle_synchronizes_with_pending_accept();
     ok &= self_test_wait_idle_drains_backlog_itself();
     ok &= self_test_wait_idle_redrains_after_eagain();
+    ok &= self_test_wait_idle_redrains_after_active_handler();
     ok &= self_test_wait_idle_fails_on_relentless_arrivals();
     ok &= self_test_require_upstream_idle_for_asserted_batch();
     ok &= self_test_quiesce_after_record_only_idle_timeout();
