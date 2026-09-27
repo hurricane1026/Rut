@@ -595,14 +595,17 @@ struct SourceLiveProxyResult {
     bool sink_prefixes_valid = true;
     bool sink_observed_live = false;
     // Failure diagnostics: wall-clock milestones relative to fork(), the client's
-    // stage, and what the port and sink looked like once the transaction failed.
+    // stage, loopback rechecks after a failed transaction, and the sink as it
+    // stood when the transaction ended (captured after every transaction).
     LoopbackTrace client;
     u16 port = 0u;
     i64 forked_at_ns = 0;
     i64 listening_seen_ns = 0;
     i64 transact_done_ns = 0;
-    bool reprobed = false;
-    i32 reprobe_connect_errno = 0;  // 0 = a fresh connect to `port` succeeded
+    bool rechecked = false;
+    i32 recheck_connect_errno = 0;  // 0 = some listener completed a fresh handshake
+    i32 specific_bind_errno = 0;    // 0 = 127.0.0.1:<port> bind (SO_REUSEADDR) succeeded
+    bool sink_captured = false;
     std::string sink_after_transact;
 };
 
@@ -610,11 +613,12 @@ i64 ms_since(i64 origin_ns, i64 at_ns) {
     return at_ns == 0 ? -1 : (at_ns - origin_ns) / 1'000'000LL;
 }
 
-// Self-contained probe run while the child is still alive: open and close one
-// fresh loopback connection to `port`. ECONNREFUSED means nothing listens there
-// (e.g. the harness took the wrong port); success means some listener accepts
-// the handshake, which with a silent transaction points at rut not serving it.
-i32 reprobe_loopback_connect(u16 port) {
+// Reachability recheck, run while the child is still alive: one fresh loopback
+// connect to `port`. ECONNREFUSED proves nothing listens on 127.0.0.1:<port>
+// (e.g. the harness took the wrong port). Success proves only that SOME listener
+// completed the handshake -- not that it is rut's: on macOS a specific-address
+// listener on 127.0.0.1:<port> takes precedence over rut's wildcard one.
+i32 recheck_loopback_reachable(u16 port) {
     const i32 fd = rut::test::cloexec_socket(AF_INET, SOCK_STREAM, 0);
     if (fd < 0) return errno;
     struct sockaddr_in address{};
@@ -629,6 +633,38 @@ i32 reprobe_loopback_connect(u16 port) {
     return result;
 }
 
+// Ownership hint: bind (never listen) a probe to 127.0.0.1:<port> with
+// SO_REUSEADDR and no SO_REUSEPORT, then close it at once. Under BSD/macOS
+// rules a wildcard socket on the port does not block this bind, but an
+// unconnected socket bound to exactly 127.0.0.1:<port> -- such as a shadowing
+// listener -- does, so EADDRINUSE there flags a specific-address owner and
+// success rules one out. On Linux a listening wildcard socket blocks the bind
+// by itself, so EADDRINUSE carries no ownership information there.
+i32 probe_specific_loopback_bind(u16 port) {
+    const i32 fd = rut::test::cloexec_socket(AF_INET, SOCK_STREAM, 0);
+    if (fd < 0) return errno;
+    const i32 one = 1;
+    (void)setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
+    struct sockaddr_in address{};
+    address.sin_family = AF_INET;
+    address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    address.sin_port = htons(port);
+    const i32 result =
+        bind(fd, reinterpret_cast<const struct sockaddr*>(&address), sizeof(address)) == 0 ? 0
+                                                                                           : errno;
+    close(fd);
+    return result;
+}
+
+#ifdef __APPLE__
+constexpr const char* kSpecificBindMeaning =
+    "EADDRINUSE=a socket is bound to exactly 127.0.0.1:<port> (possible shadow); "
+    "0=no such socket";
+#else
+constexpr const char* kSpecificBindMeaning =
+    "not an ownership signal on Linux (a wildcard listener alone yields EADDRINUSE)";
+#endif
+
 void report_source_live_failure(const SourceLiveProxyResult& result) {
     const i64 origin = result.forked_at_ns;
     (void)fprintf(stderr,
@@ -638,8 +674,9 @@ void report_source_live_failure(const SourceLiveProxyResult& result) {
                   "read_errno=%d idle_polls=%u response_bytes=%zu\n"
                   "      backend: accepts=%u sends=%u timed_out=%d request_bytes=%zu\n"
                   "      process: shutdown_sent=%d forced_kill=%d status_valid=%d status=0x%x\n"
-                  "      reprobe: done=%d connect_errno=%d\n"
-                  "      sink after transaction=[%s]\n"
+                  "      recheck (reachability only, not ownership): done=%d connect_errno=%d\n"
+                  "      specific-address bind 127.0.0.1:<port>: errno=%d (%s)\n"
+                  "      sink when transaction ended=%s%s%s\n"
                   "      rut output=[%s]\n",
                   static_cast<unsigned>(result.port),
                   static_cast<long long>(ms_since(origin, result.listening_seen_ns)),
@@ -661,9 +698,13 @@ void report_source_live_failure(const SourceLiveProxyResult& result) {
                   result.process.forced_kill ? 1 : 0,
                   result.process.status_valid ? 1 : 0,
                   static_cast<unsigned>(result.process.status),
-                  result.reprobed ? 1 : 0,
-                  result.reprobe_connect_errno,
-                  result.sink_after_transact.c_str(),
+                  result.rechecked ? 1 : 0,
+                  result.recheck_connect_errno,
+                  result.specific_bind_errno,
+                  result.rechecked ? kSpecificBindMeaning : "not probed",
+                  result.sink_captured ? "[" : "",
+                  result.sink_captured ? result.sink_after_transact.c_str() : "not captured",
+                  result.sink_captured ? "]" : "",
                   result.process.output.c_str());
 }
 
@@ -781,10 +822,12 @@ SourceLiveProxyResult run_source_live_proxy(
             result.request_completed =
                 transact_loopback(port, request, request_length, result.response, result.client);
             result.transact_done_ns = monotonic_ns();
+            result.sink_after_transact = read_file(sink);
+            result.sink_captured = true;
             if (!result.request_completed) {
-                result.reprobed = true;
-                result.reprobe_connect_errno = reprobe_loopback_connect(port);
-                result.sink_after_transact = read_file(sink);
+                result.rechecked = true;
+                result.recheck_connect_errno = recheck_loopback_reachable(port);
+                result.specific_bind_errno = probe_specific_loopback_bind(port);
             }
         }
         if (transaction_attempted && !backend_joined) {
