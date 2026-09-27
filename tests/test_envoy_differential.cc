@@ -1133,26 +1133,42 @@ public:
     //      found exactly as accept_loop() would. `adopt()` puts the
     //      listener into non-blocking mode specifically so this call can
     //      never block waiting for a connection that may never come.
-    //   3. Because this is only ever called once the proxy process under
-    //      test is already stopped and reaped, every connection it was
-    //      ever going to make is already sitting in the backlog or has
-    //      already failed outright -- nothing new can arrive. EAGAIN under
-    //      the mutex is therefore not a sample that could go stale a
-    //      moment later; it is a proof, at the instant it is observed,
-    //      that the backlog is (and, since `draining_` is still true,
-    //      will remain) empty.
+    //   3. Sweep-8 review, "Re-drain connections that arrive after the
+    //      first EAGAIN" (P1): a single EAGAIN is NOT yet proof the
+    //      backlog is empty for good. The proxy under test can complete
+    //      connect()+send()+exit while its final segment is still "in
+    //      flight" below the socket layer -- even over loopback, a
+    //      just-sent segment's delivery into the listening socket's accept
+    //      queue is a real (if microsecond-scale) kernel scheduling event,
+    //      not instantaneous with the sending process's exit -- so that
+    //      connection can still land in the backlog a short moment AFTER
+    //      this call's first EAGAIN. Closing this needs an actual quiet
+    //      window, not a single sample: after draining whatever is
+    //      immediately available, poll() the listener (still holding
+    //      `conn_mu_`) for up to `kQuietWindowMs`; any arrival during that
+    //      window is drained immediately and the window restarts, and only
+    //      a FULL window elapsing with nothing arriving is treated as
+    //      proof. `kQuietWindowMs` (100ms) is two orders of magnitude
+    //      larger than loopback's actual delivery latency for an
+    //      already-sent segment (microseconds), so this adds negligible
+    //      time to the common (nothing pending) case while giving a
+    //      genuinely in-flight connection ample room to appear. The whole
+    //      loop remains bounded by `timeout_ms` like the rest of this
+    //      function: a pathological stream of arrivals cannot make this
+    //      spin forever.
     //   4. Release `conn_mu_`, then wait (bounded by the remainder of
     //      `timeout_ms`) for every handler thread -- started just now, or
     //      already running from an earlier accept_loop() iteration -- to
     //      finish and remove itself from `active_fds_`. Nothing can ever
     //      be ADDED to `active_fds_` during this wait: accept_loop() is
-    //      still blocked from accepting by `draining_`, and step 2 already
+    //      still blocked from accepting by `draining_`, and step 3 already
     //      drained everything accept_loop() could otherwise have raced it
     //      for. Observing `active_fds_.empty()` here is therefore also a
     //      proof, not a sample.
     //   5. Clear `draining_` before returning (success or timeout), so
     //      accept_loop() resumes accepting for whatever phase comes next.
     bool wait_idle(int timeout_ms) {
+        constexpr int kQuietWindowMs = 100;
         const int64_t deadline = now_ms() + timeout_ms;
         {
             std::lock_guard<std::mutex> lock(conn_mu_);
@@ -1160,11 +1176,27 @@ public:
             const int fd = listen_fd_;
             if (fd >= 0) {
                 for (;;) {
-                    const int accepted_fd = accept(fd, nullptr, nullptr);
-                    if (accepted_fd < 0) break;  // EAGAIN/EWOULDBLOCK: backlog proven empty
-                    active_fds_.push_back(accepted_fd);
-                    conn_threads_.emplace_back(
-                        &RecordingUpstream::handle_connection, this, accepted_fd);
+                    for (;;) {
+                        const int accepted_fd = accept(fd, nullptr, nullptr);
+                        if (accepted_fd < 0) break;  // EAGAIN/EWOULDBLOCK
+                        active_fds_.push_back(accepted_fd);
+                        conn_threads_.emplace_back(
+                            &RecordingUpstream::handle_connection, this, accepted_fd);
+                    }
+                    if (now_ms() >= deadline) break;
+                    const int64_t remaining_ms = deadline - now_ms();
+                    const int wait_ms = static_cast<int>(
+                        std::min<int64_t>(kQuietWindowMs, std::max<int64_t>(remaining_ms, 0)));
+                    pollfd pfd{fd, POLLIN, 0};
+                    const int pr = poll(&pfd, 1, wait_ms);
+                    if (pr <= 0 || (pfd.revents & POLLIN) == 0) {
+                        // A full quiet window elapsed with nothing arriving
+                        // (or the overall deadline was reached): the
+                        // backlog is proven empty and stable.
+                        break;
+                    }
+                    // Something arrived during the quiet window: loop back
+                    // to drain it and restart the window.
                 }
             }
         }
@@ -3573,7 +3605,18 @@ bool write_pair_transcript(const std::string& path, const std::vector<PairCaseRe
     out << "// Generated by tests/test_envoy_differential.cc --pair-milestone-s; do not\n";
     out << "// hand-edit. See docs/envoy-compatibility.md and envoy-pr-plan.md PR 6.\n\n";
     for (const auto& r : results) {
-        out << "// " << r.name << (r.asserted ? " (asserted)" : " (record-only)") << "\n";
+        // Sweep-8 review, "Treat ambiguous record-only evidence as
+        // non-matching": the row header itself must say AMBIGUOUS, not
+        // just "(record-only)", when either side is unreliable -- mirrors
+        // compare_pair_case()'s stderr output, and does not require a
+        // reader to notice the per-side NOTE lines below to realize this
+        // row's bytes are not confirmed parity.
+        const bool ambiguous =
+            !r.asserted && (r.envoy.upstream_ambiguous || r.rut.upstream_ambiguous);
+        out << "// " << r.name
+            << (r.asserted ? " (asserted)"
+                           : (ambiguous ? " (record-only, AMBIGUOUS)" : " (record-only)"))
+            << "\n";
         // Record-only rows skip validate_pair_results()'s strict evidentiary
         // rule above, so an incomplete exchange or an ambiguous (>1) upstream
         // contact can reach here; flag it with a NOTE instead of silently
@@ -4485,8 +4528,34 @@ bool compare_pair_case(const PairCaseResult& c) {
     const bool downstream_match = envoy_down == rut_down;
     const bool match =
         both_complete && dates_valid && upstream_match && forwarding_exercised && downstream_match;
-    std::cerr << (match ? "MATCH    [" : "MISMATCH [") << c.name << "]"
-              << (c.asserted ? " (asserted)" : " (record-only)") << "\n";
+    // Sweep-8 review, "Treat ambiguous record-only evidence as
+    // non-matching": `upstream_ambiguous` (a proxy crash, a reuseport
+    // collision, an upstream-idle timeout, a duplicate contact, or stray
+    // traffic elsewhere -- see AmbiguityReason) means the harness itself
+    // does not trust this side's evidence, regardless of what `match`
+    // above computed from the captured bytes/counts: they can still
+    // happen to agree by coincidence. Printing MATCH for evidence the
+    // harness explicitly considers unreliable would mislead differential-
+    // run triage into treating it as confirmed parity. Record-only rows
+    // never gate the exit code either way (`c.asserted` is untouched
+    // here), so this only changes what gets displayed/recorded, never
+    // acceptance.
+    const bool ambiguous = c.envoy.upstream_ambiguous || c.rut.upstream_ambiguous;
+    if (ambiguous) {
+        std::string reasons;
+        if (c.envoy.upstream_ambiguous) {
+            reasons += "envoy: " + describe_ambiguity_reason(c.envoy.upstream_ambiguous_reason);
+        }
+        if (c.rut.upstream_ambiguous) {
+            if (!reasons.empty()) reasons += "; ";
+            reasons += "rut: " + describe_ambiguity_reason(c.rut.upstream_ambiguous_reason);
+        }
+        std::cerr << "AMBIGUOUS[" << c.name << "]"
+                  << (c.asserted ? " (asserted)" : " (record-only)") << " (" << reasons << ")\n";
+    } else {
+        std::cerr << (match ? "MATCH    [" : "MISMATCH [") << c.name << "]"
+                  << (c.asserted ? " (asserted)" : " (record-only)") << "\n";
+    }
     if (!both_complete) {
         std::cerr << "  incomplete exchange: envoy="
                   << (c.envoy.exchange_complete
@@ -5433,6 +5502,77 @@ bool self_test_wait_idle_drains_backlog_itself() {
     }
     upstream.stop();
     if (ok) std::cerr << "PASS [self-test wait_idle drains backlog]\n";
+    return ok;
+}
+
+// Sweep-8 review, "Re-drain connections that arrive after the first
+// EAGAIN" (P1): a single EAGAIN from wait_idle()'s initial drain is not
+// proof the backlog is empty for good -- a connection can land in the
+// listener's accept queue a short moment later (loopback delivery of an
+// already-sent segment is microsecond-scale, but not instantaneous with
+// the sending process's exit). Reproduces exactly that: nothing is queued
+// when wait_idle() starts (so its very first accept() call gets EAGAIN
+// immediately), then a background thread connects and sends a request 30ms
+// later -- squarely inside the 100ms quiet window -- and the connection
+// must still be recorded before wait_idle() returns.
+bool self_test_wait_idle_redrains_after_eagain() {
+    BoundPort bound;
+    if (!allocate_bound_loopback_port(&bound)) {
+        std::cerr << "FAIL [self-test wait_idle redrains after eagain]: could not allocate a "
+                     "loopback port\n";
+        return false;
+    }
+    const uint16_t port = bound.port;
+
+    RecordingUpstream upstream;
+    upstream.set_default_reply(
+        "HTTP/1.1 200 OK\r\nConnection: close\r\nContent-Length: 2\r\n\r\nhi");
+    if (!upstream.adopt(bound.fd)) {
+        std::cerr
+            << "FAIL [self-test wait_idle redrains after eagain]: could not adopt the listener\n";
+        return false;
+    }
+
+    // Nothing is queued yet: wait_idle()'s first accept() call below gets
+    // EAGAIN immediately. This thread then connects and sends a request
+    // 30ms later, landing well inside the 100ms quiet window wait_idle()
+    // must hold open after that first EAGAIN.
+    std::atomic<bool> delayed_send_ok{false};
+    std::thread delayed_connect([port, &delayed_send_ok] {
+        struct timespec delay{0, 30'000'000};
+        nanosleep(&delay, nullptr);
+        const int fd = connect_with_timeout(port, kClientTimeoutMs);
+        if (fd < 0) return;
+        const std::string req =
+            "GET /post-eagain HTTP/1.1\r\nHost: t.example\r\nConnection: close\r\n\r\n";
+        if (send_all(fd, req)) {
+            read_http_message(fd, /*head_request=*/false, kClientTimeoutMs);
+            delayed_send_ok.store(true);
+        }
+        close(fd);
+    });
+
+    bool ok = true;
+    const bool went_idle = upstream.wait_idle(2000);
+    delayed_connect.join();
+    if (!delayed_send_ok.load()) {
+        std::cerr << "FAIL [self-test wait_idle redrains after eagain]: the delayed connection "
+                     "attempt itself failed, so this test did not exercise the intended race\n";
+        ok = false;
+    }
+    if (!went_idle) {
+        std::cerr << "FAIL [self-test wait_idle redrains after eagain]: wait_idle() timed out\n";
+        ok = false;
+    }
+    if (upstream.requests_for("/post-eagain").empty()) {
+        std::cerr << "FAIL [self-test wait_idle redrains after eagain]: the connection that "
+                     "arrived 30ms after the first EAGAIN was never recorded despite wait_idle() "
+                     "reporting idle\n";
+        ok = false;
+    }
+
+    upstream.stop();
+    if (ok) std::cerr << "PASS [self-test wait_idle redrains after eagain]\n";
     return ok;
 }
 
@@ -10219,6 +10359,85 @@ bool self_test_malformed_date_rejected() {
     return ok;
 }
 
+// Sweep-8 review, "Treat ambiguous record-only evidence as non-matching":
+// a record-only row marked upstream_ambiguous (a proxy crash, a reuseport
+// collision, an upstream-idle timeout, a duplicate contact, or stray
+// traffic) must never be displayed as MATCH just because its captured
+// bytes and counts happen to agree -- the harness itself does not trust
+// that evidence. Constructs exactly that: byte-identical, "matching"
+// envoy/rut sides, with the envoy side flagged ambiguous, and confirms
+// both compare_pair_case()'s stderr output and write_pair_transcript()'s
+// row header say AMBIGUOUS instead of MATCH/"(record-only)".
+bool self_test_compare_pair_case_flags_ambiguous_as_non_matching() {
+    bool ok = true;
+
+    PairCaseResult c;
+    c.name = "connect_authority";  // a real record-only case name
+    c.asserted = false;
+    c.envoy.exchange_complete = true;
+    c.rut.exchange_complete = true;
+    c.envoy.upstream_contacted = false;
+    c.rut.upstream_contacted = false;
+    c.envoy.upstream_contact_count = 0;
+    c.rut.upstream_contact_count = 0;
+    c.envoy.downstream_bytes = "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n";
+    c.rut.downstream_bytes = c.envoy.downstream_bytes;  // byte-identical: match would be true
+    c.envoy.upstream_ambiguous = true;
+    c.envoy.upstream_ambiguous_reason = AmbiguityReason::kProxyCrash;
+
+    std::ostringstream captured;
+    std::streambuf* old_cerr_buf = std::cerr.rdbuf(captured.rdbuf());
+    compare_pair_case(c);
+    std::cerr.rdbuf(old_cerr_buf);
+
+    const std::string output = captured.str();
+    if (output.find("MATCH    [") != std::string::npos) {
+        std::cerr << "FAIL [self-test compare pair case ambiguous]: printed MATCH for a row "
+                     "marked upstream_ambiguous\n";
+        ok = false;
+    }
+    if (output.find("AMBIGUOUS[connect_authority]") == std::string::npos) {
+        std::cerr << "FAIL [self-test compare pair case ambiguous]: did not print AMBIGUOUS for "
+                     "a row marked upstream_ambiguous; got:\n"
+                  << output << "\n";
+        ok = false;
+    }
+    if (output.find(describe_ambiguity_reason(AmbiguityReason::kProxyCrash)) == std::string::npos) {
+        std::cerr << "FAIL [self-test compare pair case ambiguous]: AMBIGUOUS line did not name "
+                     "the reason\n";
+        ok = false;
+    }
+
+    TempDir dir("rut-envoy-selftest-ambiguous-transcript");
+    if (dir.empty()) {
+        std::cerr << "FAIL [self-test compare pair case ambiguous]: could not create temp dir\n";
+        ok = false;
+    } else {
+        const std::string out_path = dir.path() + "/pair_transcript.inc";
+        if (!write_pair_transcript(out_path, {c})) {
+            std::cerr << "FAIL [self-test compare pair case ambiguous]: write_pair_transcript "
+                         "rejected a record-only row\n";
+            ok = false;
+        } else {
+            std::ifstream in(out_path);
+            std::stringstream ss;
+            ss << in.rdbuf();
+            const std::string content = ss.str();
+            if (content.find("// connect_authority (record-only, AMBIGUOUS)") ==
+                std::string::npos) {
+                std::cerr
+                    << "FAIL [self-test compare pair case ambiguous]: transcript row header did "
+                       "not say AMBIGUOUS; got:\n"
+                    << content << "\n";
+                ok = false;
+            }
+        }
+    }
+
+    if (ok) std::cerr << "PASS [self-test compare pair case ambiguous]\n";
+    return ok;
+}
+
 // Round-6-review parity for RUT (PR #694 mirrored onto pair mode's RUT
 // launch, launch_rut_with_port_retry() above): a genuine listener-port bind
 // collision must be retried on a fresh port rather than reported as a
@@ -10536,6 +10755,7 @@ int run_self_test(const std::string& rut_binary, const std::string& converter_bi
     ok &= self_test_recording_upstream();
     ok &= self_test_wait_idle_synchronizes_with_pending_accept();
     ok &= self_test_wait_idle_drains_backlog_itself();
+    ok &= self_test_wait_idle_redrains_after_eagain();
     ok &= self_test_require_upstream_idle_for_asserted_batch();
     ok &= self_test_quiesce_after_record_only_idle_timeout();
     ok &= self_test_record_only_crash_reason_precedence();
@@ -10586,6 +10806,7 @@ int run_self_test(const std::string& rut_binary, const std::string& converter_bi
     ok &= self_test_envoy_early_exit_detected();
     ok &= self_test_envoy_stop_verifies_exit_status();
     ok &= self_test_malformed_date_rejected();
+    ok &= self_test_compare_pair_case_flags_ambiguous_as_non_matching();
     ok &= self_test_rut_port_retry(rut_binary, converter_binary);
     if (!rut_binary.empty() && !converter_binary.empty()) {
         ok &= run_self_test_rut_pass(rut_binary, converter_binary);
