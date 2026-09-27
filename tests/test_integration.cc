@@ -8688,6 +8688,8 @@ struct ReuseUpstream {
     u16 port = 0;
     u32 body_len = 0;
     std::atomic<bool> running{false};
+    std::atomic<u32> accept_count{0};
+    std::atomic<u32> closed_count{0};
     bool started = false;
     pthread_t thread{};
 
@@ -8704,19 +8706,16 @@ struct ReuseUpstream {
             }
             char req[2048];
             (void)recv_timeout(client, req, sizeof(req), 1000);
-            // Announce the close. This fixture (d9609a61) predates io_uring upstream
-            // pooling (e3d8af36) and exists to force a fresh upstream connect per
-            // request. An implicit HTTP/1.1 keep-alive response lets the proxy pool
-            // the socket instead; if this thread is descheduled between the last send
-            // and close(), the next request lands on the pooled socket, the late
-            // close() answers it with RST, and a non-idempotent POST is not replayed.
-            // Pooled reuse is covered by proxy_reuse.*_iouring; keep this on intent.
+            // Plain persistent HTTP/1.1 response: nothing here tells the downstream
+            // client to close. The origin then closes this idle connection itself
+            // (legal for any HTTP/1.1 server) and publishes closed_count; the test
+            // client waits for that before its next request, so the gateway's pooled
+            // copy is already dead (take_idle's MSG_PEEK sees EOF) and every request
+            // still makes a fresh upstream connect, with no send/close race.
+            s->accept_count.fetch_add(1, std::memory_order_acq_rel);
             char hdr[128];
-            const int hn = snprintf(hdr,
-                                    sizeof(hdr),
-                                    "HTTP/1.1 200 OK\r\nContent-Length: %u\r\n"
-                                    "Connection: close\r\n\r\n",
-                                    s->body_len);
+            const int hn = snprintf(
+                hdr, sizeof(hdr), "HTTP/1.1 200 OK\r\nContent-Length: %u\r\n\r\n", s->body_len);
             bool ok = hn > 0 && send_all(client, hdr, static_cast<u32>(hn));
             u8 chunk[8192];
             u32 sent = 0;
@@ -8728,6 +8727,7 @@ struct ReuseUpstream {
                 sent += n;
             }
             close(client);  // fresh upstream connect per proxied request
+            s->closed_count.fetch_add(1, std::memory_order_acq_rel);
         }
         return nullptr;
     }
@@ -8774,7 +8774,8 @@ struct ReuseUpstream {
 // next request's recv would hang/truncate one, dropping the count. Shared by the GET
 // and POST reuse regressions; uses plain early returns (no CHECK) so the caller
 // owns the assertion.
-static u32 run_keepalive_reuse(const char* req, u32 req_len, u32 kBody, u32 kRequests) {
+static u32 run_keepalive_reuse(
+    const char* req, u32 req_len, u32 kBody, u32 kRequests, u32* upstream_accepts) {
     using namespace rut;
     ReuseUpstream backend;
     if (!backend.setup(kBody)) return 0;
@@ -8834,7 +8835,19 @@ static u32 run_keepalive_reuse(const char* req, u32 req_len, u32 kBody, u32 kReq
                 }
             }
             if (!pattern_ok) break;
+            // The downstream response must stay persistent: no close signal may
+            // reach this keep-alive client.
+            if (buf_contains(reinterpret_cast<const char*>(in), body_off, "onnection:", 10)) break;
             completed++;
+            // Deterministic fresh-connect-per-request: wait until the origin has
+            // closed this response's connection before sending the next request.
+            u32 waited = 0;
+            while (backend.closed_count.load(std::memory_order_acquire) < completed &&
+                   waited < 5000) {
+                usleep(1000);
+                waited++;
+            }
+            if (backend.closed_count.load(std::memory_order_acquire) < completed) break;
         }
     }
 
@@ -8850,6 +8863,7 @@ static u32 run_keepalive_reuse(const char* req, u32 req_len, u32 kBody, u32 kReq
     shard.shutdown();
     close(lfd);
     destroy_tls_server_context(tls_ctx.value());
+    *upstream_accepts = backend.accept_count.load(std::memory_order_acquire);
     return completed;
 }
 
@@ -8859,7 +8873,9 @@ TEST(proxy_tls_iouring, keepalive_reuse_no_cancel_collision) {
     // 8 KiB body: comfortably under the 16 KiB upstream_recv_buf even with headers,
     // so a one-batch loopback harvest can't -ENOBUFS-truncate the tail and masquerade
     // as a cancel-collision. Still a real multi-recv stream that pauses per request.
-    CHECK_EQ(run_keepalive_reuse(kReq, sizeof(kReq) - 1, 8u * 1024u, 30u), 30u);
+    u32 accepts = 0;
+    CHECK_EQ(run_keepalive_reuse(kReq, sizeof(kReq) - 1, 8u * 1024u, 30u, &accepts), 30u);
+    CHECK_EQ(accepts, 30u);  // one fresh upstream connect per request
 }
 
 // Same reuse stress with POST: each request forwards a request body to the upstream
@@ -8872,7 +8888,9 @@ TEST(proxy_tls_iouring, keepalive_reuse_post_body_no_cancel_collision) {
     // 8 KiB body: comfortably under the 16 KiB upstream_recv_buf even with headers,
     // so a one-batch loopback harvest can't -ENOBUFS-truncate the tail and masquerade
     // as a cancel-collision. Still a real multi-recv stream that pauses per request.
-    CHECK_EQ(run_keepalive_reuse(kReq, sizeof(kReq) - 1, 8u * 1024u, 30u), 30u);
+    u32 accepts = 0;
+    CHECK_EQ(run_keepalive_reuse(kReq, sizeof(kReq) - 1, 8u * 1024u, 30u, &accepts), 30u);
+    CHECK_EQ(accepts, 30u);  // one fresh upstream connect per request
 }
 
 // Informational proxy latency/throughput benchmark (keep-alive, real io_uring).
