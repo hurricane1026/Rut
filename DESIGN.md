@@ -1970,15 +1970,33 @@ place while the `trailers` field is independently kept in its own place;
 and two or more physical fields that each carry a `trailers` token still
 collapse to exactly one canonical line, not one per field; rejects a
 request whose `Connection` value nominates the `upgrade`
-token together with an `Upgrade` header whose trimmed value is non-empty,
-even when the `Connection` value also contains `close` (the runtime checks
-`req.has_upgrade_header`, which requires a non-empty value, so
-`Connection: close, upgrade` paired with an empty or OWS-only `Upgrade`
-value is admitted instead, and both fields are then stripped -- one as a
-nominated header, the other as the fixed-list `Upgrade` strip entry); rejects
-more than one physical `X-Forwarded-Proto` field (Envoy
-coalesces duplicates into one inline header; this profile does not, so it
-fails closed instead); rejects a request target carrying a URI fragment;
+token together with an `Upgrade` header whose trimmed raw value is
+non-empty, even when the `Connection` value also contains `close` (presence
+is based on the field's trimmed raw value directly, not the parser's own
+token-skipping `req.has_upgrade_header` flag, which treats a
+comma/OWS-only value such as `,` or `, ,` as absent even though it is not
+blank -- Codex sweep-8 review, PR #696 -- so a comma-only `Upgrade` value
+paired with a nominating `Connection` value fails closed too; only a
+genuinely empty or OWS-only `Upgrade` value is admitted instead, with
+`Connection: close, upgrade` paired with such a value stripping both
+fields -- one as a nominated header, the other as the fixed-list `Upgrade`
+strip entry); rejects more than one physical `X-Forwarded-Proto` field
+unconditionally, with no `Connection`-nomination exception (nominating
+`x-forwarded-proto` itself is separately protected -- see the provenance
+bullet below -- so this name can never be dropped away as an escape hatch;
+Envoy coalesces duplicates into one inline header, this profile does not,
+so it fails closed instead); separately rejects a duplicated physical
+occurrence of any *other* header name Envoy stores as a single inline slot
+(every name in `kInlineRequestHeaders`,
+`include/rut/runtime/callbacks_impl.h` -- e.g. `Content-Type`,
+`User-Agent`, `Authorization`, `Referer`, and every remaining
+`X-Forwarded-*`/`X-Envoy-*` name not already unconditionally stripped or
+covered by the `X-Forwarded-Proto` rule just above) *unless* the client's
+`Connection` value also nominates that name, in which case every physical
+occurrence is dropped instead and no duplicate ever reaches the wire (Envoy
+coalesces duplicates of these into one inline header too; this profile does
+not replicate that coalescing, so a non-nominated duplicate fails closed
+instead); rejects a request target carrying a URI fragment;
 drops every client-supplied header that Envoy's own
 `ConnectionManagerUtility::mutateRequestHeaders` sanitizes for a non-internal,
 non-edge external request on a cleartext listener -- the fixed shape this
@@ -2001,7 +2019,18 @@ or otherwise invalid client-supplied field, such as `http,https`, is
 overwritten in place, at that same original position, with
 `x-forwarded-proto: http` rather than dropped and forwarded as a blank or
 malformed scheme; and `x-forwarded-proto: http` is appended as the last
-header only when the client sent no `x-forwarded-proto` field at all. It is
+header only when the client sent no `x-forwarded-proto` field at all. This
+`http` fallback is connection-derived, not client-derived, so `host:
+"preserve"` targets Envoy's cleartext (non-TLS) listener profile only: it is
+rejected outright -- fail closed, no upstream contact, the same status
+every other unsupported combination in this profile uses -- on a connection
+this runtime itself terminated with TLS (`conn.tls_active`), rather than
+ever synthesizing `https` (Codex sweep-8 review, PR #696); the `.rut`
+language has no TLS-listener declaration to check this statically today
+(`listen` carries only an address and port), so this restriction is
+enforced at request admission time, covering a hand-written route or
+direct-RIR caller that selects this policy on a TLS connection just as it
+covers every other admission path. It is
 closed to ordinary
 zero-copy-shaped forwards: a request with a body paired with a client
 `Expect` header whose trimmed value is non-empty, or with
