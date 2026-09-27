@@ -35,6 +35,15 @@ bool identify_stage(const DirectLaunch& launch,
                     const ProcIdentity& identity,
                     LaunchStage& stage,
                     std::string& reason) {
+    // execve publishes the new mm (and so the new /proc/<pid>/exe) before
+    // create_elf_tables() sets arg_start/arg_end, and the caller credentials
+    // stay readable until commit_creds().  Two stable reads can therefore see
+    // the next stage's executable with an empty argv.  Every allowed stage has
+    // a non-empty argv, so this is an in-flight exec, not a foreign identity.
+    if (identity.cmdline.empty()) {
+        reason = std::string(kExecArgvPendingReason);
+        return false;
+    }
     for (const LaunchStage candidate :
          {LaunchStage::Sudo, LaunchStage::Nsenter, LaunchStage::Launcher}) {
         const StageDescriptor& expected = descriptor(launch, candidate);

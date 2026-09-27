@@ -257,9 +257,22 @@ int worker_main(const char* executable,
 int wrapper_main(const char* executable, const char* path, const char* token, const char* mode) {
     if (prctl(PR_SET_PDEATHSIG, SIGTERM) != 0) return 20;
     const pid_t parent = getppid();
+    const pid_t wrapper = getpid();
+    const bool early_death = strcmp(mode, "wrapper-early-death") == 0;
     const pid_t target = fork();
     if (target < 0) return 21;
     if (target == 0) {
+        if (early_death) {
+            // The mutation is "the wrapper died before the target reported".
+            // Without this wait the target can exec and send READY (with
+            // wrapper_pid == getppid() == wrapper) before the wrapper is
+            // scheduled to _exit, so the mutation silently did not happen.
+            // getppid() changes only once the kernel has reparented us.
+            for (int waited_ms = 0; getppid() == wrapper; waited_ms += 5) {
+                if (waited_ms >= kHandshakeMs) _exit(126);
+                (void)poll(nullptr, 0, 5);
+            }
+        }
         execl(executable,
               executable,
               "--fixture-worker",
@@ -269,7 +282,13 @@ int wrapper_main(const char* executable, const char* path, const char* token, co
               static_cast<char*>(nullptr));
         _exit(127);
     }
-    if (strcmp(mode, "wrapper-early-death") == 0) _exit(0);
+    if (early_death) {
+        // Hold the wrapper alive briefly so the target always reaches its
+        // reparent wait first: this pins the formerly racy interleaving
+        // (target reporting before the wrapper exits) on every run.
+        (void)poll(nullptr, 0, 50);
+        _exit(0);
+    }
     if (getppid() != parent) {
         (void)kill(target, SIGTERM);
         (void)waitpid(target, nullptr, 0);

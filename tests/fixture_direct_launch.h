@@ -42,6 +42,10 @@ struct DirectLaunchAnchor {
 inline constexpr std::array<unsigned char, 8> kLaunchMarker{
     0x52, 0x55, 0x54, 0x33, 0x35, 0x38, 0xa3, 0xb1};
 inline constexpr size_t kMaxLaunchAncestry = 8;
+// observe_direct() reason for an identity caught mid-execve (new executable,
+// argv not yet published).  Pollers must treat it as transient.
+inline constexpr const char* kExecArgvPendingReason =
+    "exec in progress: new executable visible before its argv";
 
 struct DirectLaunch {
     const DirectLaunchAnchor anchor;
