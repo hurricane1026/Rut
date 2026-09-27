@@ -90,40 +90,15 @@ constexpr Field kResponseCode = RUT_FIELD2("response_code", "responseCode");
 // Route match text (`prefix` / `path`): printable ASCII excluding the
 // reserved characters that would make a plain-string match ambiguous with
 // query/fragment/percent-encoding, bounded to a small fixed length.
-constexpr u32 kMaxRouteMatchLen = 64u;
-
-// Codex sweep-8 review (P1): the runtime's per-connection request-path
-// buffer (`ConnectionBase::req_path`, `include/rut/runtime/
-// connection_base.h`, `kMaxReqPathLen = 64`) holds at most 63 usable bytes
-// -- `on_header_received` (`src/runtime/callbacks.cc`) clamps
-// `copy_len = sizeof(conn.req_path) - 1` and NUL-terminates, so any real
-// request whose path is 64+ bytes gets silently truncated to exactly the
-// first 63 bytes for ROUTE DISPATCH (the trie lookup that selects which
-// node's handler runs). `req.pathOnly`, evaluated INSIDE that handler, is
-// computed separately by re-scanning the raw, untruncated request bytes
-// (`rut_helper_req_path_only`, `src/jit/runtime_helpers.cc`) -- it never
-// reads the truncated copy. These two views of the same request agree for
-// every path under 64 bytes, but a node/exact-path comparison text of
-// exactly 63 bytes creates a real gap: any genuinely longer real request
-// that happens to start with those same 63 bytes truncates, for dispatch
-// purposes, into something byte-identical to that node's own bare literal,
-// even though `req.pathOnly` inside the handler still sees the full,
-// untruncated (and therefore unequal) path. A `prefix` ending in `/` whose
-// stripped node text is exactly 63 bytes (i.e. a 64-byte declared prefix)
-// or an exact `path` whose literal is exactly 63 bytes therefore admits a
-// configuration where Rut's dispatch and its own handler body can disagree
-// about whether a crafted request matches this node's bare literal --
-// exactly the ambiguity Envoy's own byte-exact matching never has, since it
-// never truncates. Bounding admitted match text to 62 bytes keeps the
-// longest anything can grow to (63, one more than admitted) still short of
-// the 64-byte point where the runtime's copy starts truncating, so the
-// dispatch view and `req.pathOnly` can never disagree: only a node/exact-
-// path text of exactly 63 bytes can ever be reproduced by truncating some
-// longer real request (truncation always yields exactly 63 bytes when it
-// happens at all, so it can only collide with a declared text of that same
-// length), so bounding admitted text at 62 bytes rules the dangerous length
-// out entirely, not merely narrows it.
-constexpr u32 kMaxDispatchableMatchLen = 62u;
+//
+// `kMaxRouteMatchLen` (the outer charset ceiling) and `kMaxDispatchableMatchLen`
+// (the tighter, dispatch-safe bound -- see its doc comment in
+// `include/rut/envoy/parser.h` for the full derivation from
+// `ConnectionBase::req_path`'s 63 usable bytes) both live in `parser.h`, not
+// here: the public `lower_to_rut(model, capabilities)` overload's
+// `validate()` (`src/envoy/converter.cc`) must apply the exact same bounds
+// to a hand-built or mutated model, and a single shared definition is the
+// only way the two call sites can't drift apart (Codex sweep-11 review).
 
 bool route_match_byte_ok(char c) {
     const auto b = static_cast<unsigned char>(c);
@@ -133,14 +108,6 @@ bool route_match_byte_ok(char c) {
 bool prefix_shape_ok(Str text) {
     if (text.eq(lit_str("/"))) return true;
     return text.len >= 2u && text.ptr[0] == '/' && text.ptr[text.len - 1u] == '/';
-}
-
-// The RUT node text a `prefix` lowers to (see `strip_trailing_slash`,
-// src/envoy/converter.cc): "/" stays "/"; anything else drops the trailing
-// slash `prefix_shape_ok` already guarantees is there.
-u32 prefix_node_text_len(Str prefix) {
-    if (prefix.eq(lit_str("/"))) return 1u;
-    return prefix.len - 1u;
 }
 
 bool path_shape_ok(Str text) {

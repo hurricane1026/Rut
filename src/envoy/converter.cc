@@ -1069,10 +1069,9 @@ FrontendResult<bool> validate(const Bootstrap& model, const RutCapabilities& cap
         // caller-supplied prefix/path like "/ok\n..." (or one over 64
         // bytes) cannot reach `put_escaped`/node-text emission below, which
         // only escapes `\` and `"`, and produce syntactically invalid --or
-        // merely unintended-- RUT.
-        // Mirrors src/envoy/parser.cc's private `kMaxRouteMatchLen` (same
-        // value, not exported to this translation unit).
-        constexpr u32 kMaxRouteMatchLen = 64u;
+        // merely unintended-- RUT. `kMaxRouteMatchLen` is shared with the
+        // parser via `include/rut/envoy/parser.h` so the two bounds can't
+        // drift apart.
         if (text.len > kMaxRouteMatchLen)
             return unsupported(match.span, lit_str("route match value exceeds 64 bytes"));
         for (u32 c = 0; c < text.len; c++) {
@@ -1101,6 +1100,30 @@ FrontendResult<bool> validate(const Bootstrap& model, const RutCapabilities& cap
                                    lit_str("route match value must be printable ASCII excluding "
                                            "?, #, %, \", and \\"));
         }
+        // Codex sweep-11 review (P2): `parse_route_match` (src/envoy/
+        // parser.cc) additionally rejects any match whose EFFECTIVE,
+        // per-kind length exceeds `kMaxDispatchableMatchLen` (62 bytes,
+        // stricter than the 64-byte outer ceiling just checked above) --
+        // see that constant's doc comment in include/rut/envoy/parser.h for
+        // why a longer node/exact-path text lets a crafted over-length
+        // request's dispatch-time truncation collide with this node's own
+        // literal. A hand-built or mutated `Bootstrap` never goes through
+        // `parse_route_match`, so without this the public overload would
+        // accept a 63-byte exact path or a 64-byte slash-terminated prefix
+        // that the JSON-parsing overload always rejects, breaking the
+        // documented fail-closed guarantee. `dispatchable_match_len` is the
+        // same shared helper the parser calls, so the two bounds can never
+        // drift apart.
+        if (dispatchable_match_len(match) > kMaxDispatchableMatchLen)
+            return unsupported(
+                match.span,
+                match.kind == RouteMatchKind::Prefix
+                    ? lit_str("prefix exceeds the dispatchable node length (62 bytes after the "
+                              "trailing slash is stripped); the runtime's request-path buffer "
+                              "cannot distinguish a longer request from this node's own literal")
+                    : lit_str("path exceeds the dispatchable node length (62 bytes); the "
+                              "runtime's request-path buffer cannot distinguish a longer request "
+                              "from this literal"));
         // Only a `prefix` match's text ever becomes a RUT route declaration
         // (`route "<node_text>" { ... }`, via `strip_trailing_slash` in
         // `build_lowering_plan` below): an exact `path` match is never

@@ -442,10 +442,11 @@ converter fails closed on the whole configuration until then.
   ordered route list of any size up to `kMaxEnvoyRoutes` and multiple
   clusters, lowering them by construction (owner decision D3) instead of
   rejecting the shape; `direct_response` and `redirect` are still rejected.
-  Fixture files `tests/fixtures/envoy_routes_{a,b,c}.inc` and
+  Fixture files `tests/fixtures/envoy_routes_{a,b,c,f}.inc` and
   `envoy_routes_shadowed_siblings.inc` exist (all capabilities `true`), and
-  (b), (c), and the shadowed-siblings fixture are byte-exact goldens pinning
-  `lower_to_rut`'s output against them (`golden_routes_b_root_then_prefix`:
+  (b), (c), (f) (added by Codex sweep-11 review; see below), and the
+  shadowed-siblings fixture are byte-exact goldens pinning `lower_to_rut`'s
+  output against them (`golden_routes_b_root_then_prefix`:
   catch-all `/` declared before prefix `/api/` -- since the round-9 fix
   below, `/api` is globally shadowed and dropped, so this golden is now
   root-only; `golden_routes_c_exact_then_root`: exact `/healthz` declared
@@ -478,14 +479,20 @@ converter fails closed on the whole configuration until then.
   golden (e)). (3) A root with only exact routes (e.g. `/healthz`) and no
   catch-all has the same no-RUT-form-for-a-404 problem at the root's own
   fallthrough — the 404 no-route case —
-  (`blocked_root_exact_arms_without_catch_all`). Two further scenarios ARE
-  still lowered but without a byte-exact fixture backing them: an exact
+  (`blocked_root_exact_arms_without_catch_all`). Scenario (f) — an exact
   route declared before its own prefix for the same literal
-  (`golden_routes_f_exact_then_own_prefix_not_blocked`, checked by
-  substring match on the emitted text, not a byte-exact golden) and a root
-  with no arms at all, which simply omits `route "/"` and falls through to
-  the `unmatched` policy (`root_omitted_without_catch_all_or_exact_arms`). A
-  third still-lowered scenario IS byte-exact: two identical exact routes for
+  (`golden_routes_f_exact_then_own_prefix_not_blocked`) — is also still
+  lowered. It originally pinned only four output substrings, not a
+  byte-exact golden, even though a summary elsewhere in this same document
+  (the route-list table row above) already described (b)/(c)/(f) together as
+  "byte-for-byte" — Codex sweep-11 review flagged that mismatch. `tests/
+  fixtures/envoy_routes_f.inc` now backs it with the same kind of byte-exact
+  golden as (b)/(c), so that claim is accurate; the four substring checks
+  stay alongside it as cheaper, more readable documentation of the specific
+  shape. A root with no arms at all simply omits `route "/"` and falls
+  through to the `unmatched` policy
+  (`root_omitted_without_catch_all_or_exact_arms`). A further still-lowered
+  scenario IS ALSO byte-exact: two identical exact routes for
   the same literal declared back to back before a catch-all (e.g.
   `/healthz`, `/healthz`, then `/`) used to make `build_node_plan` emit a
   second, unreachable conditional arm plus a duplicated forwarding policy —

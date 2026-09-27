@@ -2,6 +2,7 @@
 #include "fixtures/envoy_routes_a.inc"
 #include "fixtures/envoy_routes_b.inc"
 #include "fixtures/envoy_routes_c.inc"
+#include "fixtures/envoy_routes_f.inc"
 #include "fixtures/envoy_routes_shadowed_siblings.inc"
 #include "rut/compiler/lexer.h"
 #include "rut/envoy/converter.h"
@@ -1684,6 +1685,96 @@ TEST(envoy_convert, api_forged_model_rejected) {
         str(oversized);
     CHECK_FALSE(envoy::lower_to_rut(oversized_path, all_true));
 
+    // Codex sweep-11 review (P2): the checks above only reapplied the outer,
+    // Envoy-spec-driven `kMaxRouteMatchLen` (64-byte) ceiling; `validate()`
+    // did not reapply `parse_route_match`'s stricter, per-kind dispatch-
+    // safety bound (`kMaxDispatchableMatchLen` = 62, see its doc comment in
+    // include/rut/envoy/parser.h). A hand-built model could therefore carry
+    // a 63-byte exact path or a 64-byte slash-terminated prefix (node text
+    // 63 bytes after `strip_trailing_slash`) that the JSON-parsing path
+    // always rejects, breaking the public overload's documented fail-closed
+    // guarantee. `validate()` now calls the same shared `dispatchable_match_
+    // len` helper (`include/rut/envoy/parser.h`) `parse_route_match` uses, so
+    // the two call sites can't drift apart; these cases pin the 62/63-byte
+    // boundary through the overload the same way `route_match_rejects_
+    // dispatch_unsafe_length` (tests/test_envoy_parser.cc) pins it through
+    // JSON parsing.
+    static const std::string dispatch_unsafe_exact = "/" + std::string(62u, 'a');
+    REQUIRE_EQ(dispatch_unsafe_exact.size(), 63u);
+    envoy::Bootstrap oversized_dispatch_exact = parsed.value();
+    oversized_dispatch_exact.listener.filter_chain.hcm.route_config.virtual_host.routes[0]
+        .match.kind = envoy::RouteMatchKind::Path;
+    oversized_dispatch_exact.listener.filter_chain.hcm.route_config.virtual_host.routes[0]
+        .match.path = str(dispatch_unsafe_exact);
+    const auto oversized_dispatch_exact_result =
+        envoy::lower_to_rut(oversized_dispatch_exact, all_true);
+    CHECK_FALSE(oversized_dispatch_exact_result);
+    CHECK(oversized_dispatch_exact_result.error().code == FrontendError::UnsupportedSyntax);
+    CHECK(to_string(oversized_dispatch_exact_result.error().detail)
+              .find("dispatchable node length") != std::string::npos);
+
+    static const std::string dispatch_unsafe_prefix = "/" + std::string(62u, 'a') + "/";
+    REQUIRE_EQ(dispatch_unsafe_prefix.size(), 64u);
+    envoy::Bootstrap oversized_dispatch_prefix = parsed.value();
+    oversized_dispatch_prefix.listener.filter_chain.hcm.route_config.virtual_host.routes[0]
+        .match.prefix = str(dispatch_unsafe_prefix);
+    const auto oversized_dispatch_prefix_result =
+        envoy::lower_to_rut(oversized_dispatch_prefix, all_true);
+    CHECK_FALSE(oversized_dispatch_prefix_result);
+    CHECK(oversized_dispatch_prefix_result.error().code == FrontendError::UnsupportedSyntax);
+    CHECK(to_string(oversized_dispatch_prefix_result.error().detail)
+              .find("dispatchable node length") != std::string::npos);
+
+    // The 62-byte boundary itself (node text 62 bytes for both kinds -- see
+    // the doc comment above) must still lower successfully: the shared bound
+    // must reject 63/64 without also sweeping up the admitted boundary. The
+    // milestone model's only route is the root catch-all `prefix: "/"`
+    // (`milestone_json` above); replacing it outright with a lone exact path
+    // would leave root with no catch-all at all, tripping the unrelated
+    // no-RUT-form-for-a-404 `BLOCKED_BY_RUT` gap
+    // (`blocked_root_exact_arms_without_catch_all` above) instead of
+    // exercising the length bound under test here. Keep the root catch-all
+    // and add the boundary-length exact path as its own node instead
+    // (golden(c)'s shape, `routes_scenario_c_json` above: exact declared
+    // before the catch-all).
+    static const std::string dispatch_safe_exact = "/" + std::string(61u, 'a');
+    REQUIRE_EQ(dispatch_safe_exact.size(), 62u);
+    envoy::Bootstrap boundary_dispatch_exact = parsed.value();
+    envoy::VirtualHost& boundary_exact_vh =
+        boundary_dispatch_exact.listener.filter_chain.hcm.route_config.virtual_host;
+    envoy::Route boundary_root_route = boundary_exact_vh.routes[0];
+    envoy::Route boundary_exact_only_route = boundary_exact_vh.routes[0];
+    boundary_exact_only_route.match.kind = envoy::RouteMatchKind::Path;
+    boundary_exact_only_route.match.path = str(dispatch_safe_exact);
+    boundary_exact_vh.routes.len = 0;
+    REQUIRE(boundary_exact_vh.routes.push(boundary_exact_only_route));
+    REQUIRE(boundary_exact_vh.routes.push(boundary_root_route));
+    CHECK(envoy::lower_to_rut(boundary_dispatch_exact, all_true));
+
+    // A prefix at the boundary must also resolve its own literal path (the
+    // golden(f) pattern, `routes_scenario_f_json` above: an exact route for
+    // the node's own literal declared BEFORE its own prefix) or it instead
+    // trips the unrelated node's-own-literal `BLOCKED_BY_RUT` gap (docs/
+    // envoy-compatibility.md) -- irrelevant to the length bound under test
+    // here. `vh.routes[0]` is copied by value (not aliased) before the
+    // length reset below, since resetting `len` does not clear the
+    // underlying storage a live reference into `data[0]` would still see.
+    static const std::string dispatch_safe_prefix = "/" + std::string(61u, 'a') + "/";
+    REQUIRE_EQ(dispatch_safe_prefix.size(), 63u);
+    envoy::Bootstrap boundary_dispatch_prefix = parsed.value();
+    envoy::VirtualHost& boundary_vh =
+        boundary_dispatch_prefix.listener.filter_chain.hcm.route_config.virtual_host;
+    envoy::Route boundary_prefix_route = boundary_vh.routes[0];
+    boundary_prefix_route.match.kind = envoy::RouteMatchKind::Prefix;
+    boundary_prefix_route.match.prefix = str(dispatch_safe_prefix);
+    envoy::Route boundary_exact_route = boundary_vh.routes[0];
+    boundary_exact_route.match.kind = envoy::RouteMatchKind::Path;
+    boundary_exact_route.match.path = str(dispatch_safe_exact);
+    boundary_vh.routes.len = 0;
+    REQUIRE(boundary_vh.routes.push(boundary_exact_route));
+    REQUIRE(boundary_vh.routes.push(boundary_prefix_route));
+    CHECK(envoy::lower_to_rut(boundary_dispatch_prefix, all_true));
+
     // A hand-built model can also drop every declared cluster while its
     // route still forwards; the empty-cluster allowance is only for
     // direct_response/redirect routes.
@@ -2863,6 +2954,13 @@ TEST(envoy_convert, blocked_on_shadowed_exact_needs_all_method_fallback) {
 // fallback should be emitted for it (Codex P1 on this PR: it used to be,
 // shadowing the earlier arm with an always-404 route) — see
 // routes_scenario_f_json's comment above.
+//
+// Codex sweep-11 review on PR #720: this used to check only four output
+// substrings, which docs/envoy-compatibility.md then (incorrectly) described
+// as pinning the output byte-for-byte like (b)/(c). Compare against the real
+// whole-output golden (tests/fixtures/envoy_routes_f.inc), (b)/(c)-style, so
+// the doc's claim is actually true; the substring checks are kept as
+// cheaper, more readable documentation of the specific shape this pins.
 TEST(envoy_convert, golden_routes_f_exact_then_own_prefix_not_blocked) {
     const std::string text = routes_scenario_f_json();
     static envoy::JsonDocument doc;
@@ -2871,6 +2969,9 @@ TEST(envoy_convert, golden_routes_f_exact_then_own_prefix_not_blocked) {
     const envoy::RutCapabilities all_true{true, true, true};
     auto lowered = lower_heap(parsed.value(), all_true);
     REQUIRE(*lowered);
+    const Str golden = lit_str(kEnvoyRoutesFGolden);
+    REQUIRE_EQ((*lowered).value().len, golden.len);
+    CHECK((*lowered).value().view().eq(golden));
     const std::string out = to_string((*lowered).value().view());
     CHECK(out.find("route exact \"/api\"") == std::string::npos);
     CHECK(out.find("if req.pathOnly == \"/api\" {") != std::string::npos);

@@ -47,14 +47,66 @@ enum class RouteMatchKind : u8 {
     Path,
 };
 
+// Codex sweep-11 review: these two bounds and `dispatchable_match_len` live
+// here, not as file-local constants in `src/envoy/parser.cc`, specifically
+// so both `parse_route_match` (`src/envoy/parser.cc`) and the public
+// `lower_to_rut(model, capabilities)` overload's `validate()`
+// (`src/envoy/converter.cc`) apply the exact same bound to a hand-built or
+// mutated model -- a single shared definition is the only way the two call
+// sites can't drift apart. `kMaxRouteMatchLen` is Envoy's own outer ceiling
+// for the admitted charset.
+constexpr u32 kMaxRouteMatchLen = 64u;
+
+// Codex sweep-8 review (P1): the runtime's per-connection request-path
+// buffer (`ConnectionBase::req_path`, `include/rut/runtime/
+// connection_base.h`, `kMaxReqPathLen = 64`) holds at most 63 usable bytes
+// -- `on_header_received` (`src/runtime/callbacks.cc`) clamps
+// `copy_len = sizeof(conn.req_path) - 1` and NUL-terminates, so any real
+// request whose path is 64+ bytes gets silently truncated to exactly the
+// first 63 bytes for ROUTE DISPATCH (the trie lookup that selects which
+// node's handler runs). `req.pathOnly`, evaluated INSIDE that handler, is
+// computed separately by re-scanning the raw, untruncated request bytes
+// (`rut_helper_req_path_only`, `src/jit/runtime_helpers.cc`) -- it never
+// reads the truncated copy. These two views of the same request agree for
+// every path under 64 bytes, but a node/exact-path comparison text of
+// exactly 63 bytes creates a real gap: any genuinely longer real request
+// that happens to start with those same 63 bytes truncates, for dispatch
+// purposes, into something byte-identical to that node's own bare literal,
+// even though `req.pathOnly` inside the handler still sees the full,
+// untruncated (and therefore unequal) path. A `prefix` ending in `/` whose
+// stripped node text is exactly 63 bytes (i.e. a 64-byte declared prefix)
+// or an exact `path` whose literal is exactly 63 bytes therefore admits a
+// configuration where Rut's dispatch and its own handler body can disagree
+// about whether a crafted request matches this node's bare literal --
+// exactly the ambiguity Envoy's own byte-exact matching never has, since it
+// never truncates. Bounding admitted match text to 62 bytes keeps the
+// longest anything can grow to (63, one more than admitted) still short of
+// the 64-byte point where the runtime's copy starts truncating, so the
+// dispatch view and `req.pathOnly` can never disagree: only a node/exact-
+// path text of exactly 63 bytes can ever be reproduced by truncating some
+// longer real request (truncation always yields exactly 63 bytes when it
+// happens at all, so it can only collide with a declared text of that same
+// length), so bounding admitted text at 62 bytes rules the dangerous length
+// out entirely, not merely narrows it. Both `parse_route_match` and
+// `validate()` must apply this same bound (see the file comment above).
+constexpr u32 kMaxDispatchableMatchLen = 62u;
+
+// The RUT node text a `prefix` lowers to (see `strip_trailing_slash`,
+// `src/envoy/converter.cc`): "/" stays "/"; anything else drops the
+// trailing slash that a valid prefix's shape (checked separately, before
+// this is ever called) already guarantees is there.
+inline u32 prefix_node_text_len(Str prefix) {
+    if (prefix.eq(lit_str("/"))) return 1u;
+    return prefix.len - 1u;
+}
+
 // Exactly one of `prefix` / `path` is set, selected by `kind`. Both admit
 // only printable ASCII (0x21-0x7e) excluding `?`, `#` and `%`
 // (`kMaxRouteMatchLen` = 64 bytes is Envoy's own outer ceiling for this
-// charset, `src/envoy/parser.cc`), but the *effective* length limit is
-// tighter and differs per kind, driven by dispatch safety
-// (`kMaxDispatchableMatchLen` = 62, `src/envoy/parser.cc`; see its doc
-// comment for the full derivation from `ConnectionBase::req_path`'s 63
-// usable bytes, `include/rut/runtime/connection_base.h`):
+// charset), but the *effective* length limit is tighter and differs per
+// kind, driven by dispatch safety (`kMaxDispatchableMatchLen` = 62; see its
+// doc comment above for the full derivation from `ConnectionBase::req_path`'s
+// 63 usable bytes, `include/rut/runtime/connection_base.h`):
 //   - `path` (an exact match): admits at most 62 bytes; 63 or 64 bytes pass
 //     the charset/outer-ceiling check but are rejected for dispatch safety.
 //   - `prefix`: either exactly "/" (always admitted, length 1), or starts
@@ -76,6 +128,16 @@ struct RouteMatch {
     Span path_span{};
     Span span{};
 };
+
+// The effective length to compare against `kMaxDispatchableMatchLen` for
+// `match`: a prefix's stripped node text length, or an exact path's own
+// (unmodified) length. The caller must already have confirmed the match's
+// shape (prefix is "/" or starts and ends with '/'; path starts with '/')
+// before calling this -- `prefix_node_text_len` assumes it.
+inline u32 dispatchable_match_len(const RouteMatch& match) {
+    return match.kind == RouteMatchKind::Prefix ? prefix_node_text_len(match.prefix)
+                                                : match.path.len;
+}
 
 enum class RouteActionKind : u8 {
     Forward,
