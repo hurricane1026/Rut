@@ -1533,6 +1533,11 @@ struct ConnectionBase {
     // rolls those bytes back out of upstream_recv_buf, so the deferred pool-return path
     // needs this separate marker to close rather than reuse a desynced fd.
     bool upstream_recv_idle_stale_bytes;
+    // True while a released, closed (non-pooled) upstream's recv is still draining
+    // under a pause cancel. Everything in upstream_recv_buf is then stale (the
+    // successor's recv is deferred until the drain), including a lossy -ENOBUFS
+    // prefix the stale branch cannot roll back, so the drain resets the buffer.
+    bool upstream_recv_close_quarantine;
     // True while a handler yield timer is logically armed. For io_uring,
     // the timer may be backed either by an IORING_OP_TIMEOUT SQE or by the
     // coarse timer wheel fallback.
@@ -1873,6 +1878,7 @@ struct ConnectionBase {
         http1_prebuilt_request_prefix_len = 0;
         clear_http1_prebuilt_response_proof();
         upstream_recv_idle_stale_bytes = false;
+        upstream_recv_close_quarantine = false;
         yield_armed = false;
         yield_timeout_armed = false;
         req_method = 0;

@@ -34564,6 +34564,177 @@ void drain_strict_recv_retirement(IoUringEventLoop* loop,
     loop->dispatch(cancel_first ? target : cancel);
 }
 
+// close_released_upstream (non-pooled release of an upstream whose recv is still
+// armed) with the cancel SQE unavailable: the recv must be retired through the
+// exact-episode ledger, which keeps retry ownership of the cancel, rather than
+// being left to a peer FIN that an open origin may never send.
+TEST(iouring_retirement, released_upstream_close_keeps_cancel_retry_under_sq_full) {
+    ScopedIoUringLoopForRetirement guard;
+    if (!guard.init()) SKIP("io_uring unavailable");
+    auto* loop = guard.loop;
+    Connection* conn = loop->alloc_conn();
+    REQUIRE(conn != nullptr);
+    REQUIRE(loop->alloc_upstream_buf(*conn));
+    i32 upstream[2] = {-1, -1};
+    REQUIRE_EQ(rut::test::stream_socketpair(upstream), 0);
+    constexpr u32 kEpisode = 601;
+    conn->fd = dup(STDERR_FILENO);
+    REQUIRE_GE(conn->fd, 0);
+    conn->upstream_fd = upstream[0];
+    conn->upstream_episode = kEpisode;
+    conn->upstream_recv_armed = true;
+    conn->pending_ops = 1;
+    conn->keep_alive = true;
+    conn->set_slots(nullptr, nullptr, &on_response_body_recvd<IoUringEventLoop>, nullptr);
+
+    const u32 tail_before = __atomic_load_n(loop->backend.sq_tail, __ATOMIC_ACQUIRE);
+    const u32 pending_before = loop->backend.pending;
+    const i32 ring_fd = loop->backend.ring_fd;
+    const u32 head = __atomic_load_n(loop->backend.sq_head, __ATOMIC_ACQUIRE);
+    loop->backend.ring_fd = -1;  // the flush-and-retry inside the cancel also fails
+    __atomic_store_n(loop->backend.sq_tail, head + loop->backend.sq_ring_entries, __ATOMIC_RELEASE);
+    loop->close_released_upstream(*conn);
+    loop->backend.ring_fd = ring_fd;
+    __atomic_store_n(loop->backend.sq_tail, tail_before, __ATOMIC_RELEASE);
+    loop->backend.pending = pending_before;
+
+    CHECK_EQ(conn->upstream_fd, -1);
+    CHECK(conn->keep_alive);
+    CHECK_EQ(conn->upstream_episode, kEpisode + 1u);  // old recv's CQEs are now stale
+    CHECK_EQ(conn->upstream_retiring_episode, kEpisode);
+    CHECK(conn->upstream_retirement_active);
+    CHECK_EQ(conn->upstream_retirement_target_owned, kUpstreamOpRecv);
+    CHECK_EQ(conn->upstream_retirement_cancel_owned, 0u);
+    CHECK_EQ(conn->upstream_retirement_cancel_retry, kUpstreamOpRecv);
+    CHECK_FALSE(conn->upstream_recv_cancel_inflight);
+    CHECK_FALSE(conn->upstream_recv_terminal_stale);
+    CHECK_EQ(conn->pending_ops, 1u);
+
+    // The loop's pre-wait retry point queues the cancel once SQ space exists.
+    loop->retry_strict_upstream_retirement_cancels();
+    CHECK_EQ(conn->upstream_retirement_cancel_retry, 0u);
+    CHECK_EQ(conn->upstream_retirement_cancel_owned, kUpstreamOpRecv);
+    CHECK_EQ(conn->pending_ops, 2u);
+    CHECK_EQ(__atomic_load_n(loop->backend.sq_tail, __ATOMIC_ACQUIRE), tail_before + 1u);
+    UpstreamEventToken cancel_token{};
+    REQUIRE(decode_upstream_event_token(
+        loop->backend.sq_entries[tail_before & *loop->backend.sq_ring_mask].user_data,
+        &cancel_token));
+    CHECK_EQ(cancel_token.conn_id, conn->id);
+    CHECK_EQ(cancel_token.episode, kEpisode);
+    CHECK_EQ(cancel_token.aux, kUpstreamRetirementCancelAux);
+    __atomic_store_n(loop->backend.sq_tail, tail_before, __ATOMIC_RELEASE);
+    loop->backend.pending = pending_before;
+
+    // A late positive CQE of the old recv is consumed by the retirement ledger
+    // and never reaches the connection's buffer or armed state.
+    loop->dispatch({conn->id, 5, 1, 0, IoEventType::UpstreamRecv, 0, 0, kEpisode});
+    CHECK_EQ(conn->upstream_recv_buf.len(), 0u);
+    CHECK_FALSE(conn->upstream_recv_armed);
+    drain_strict_recv_retirement(loop, *conn, kEpisode, true);
+    CHECK_FALSE(conn->upstream_retirement_active);
+    CHECK_EQ(conn->pending_ops, 0u);
+    close(upstream[1]);
+    close(conn->fd);
+    conn->fd = -1;
+}
+
+// A body-completion pause whose recv terminal already drained leaves only the
+// pause cancel outstanding. Releasing the upstream then must not resurrect the
+// stale-terminal marker, or it leaks past the cancel drain into the successor.
+TEST(iouring_retirement, released_upstream_close_after_recv_drained_keeps_stale_marker_clear) {
+    ScopedIoUringLoopForRetirement guard;
+    if (!guard.init()) SKIP("io_uring unavailable");
+    auto* loop = guard.loop;
+    Connection* conn = loop->alloc_conn();
+    REQUIRE(conn != nullptr);
+    REQUIRE(loop->alloc_upstream_buf(*conn));
+    constexpr u32 kEpisode = 611;
+    conn->fd = dup(STDERR_FILENO);
+    REQUIRE_GE(conn->fd, 0);
+    conn->upstream_fd = dup(STDERR_FILENO);
+    REQUIRE_GE(conn->upstream_fd, 0);
+    conn->upstream_episode = kEpisode;
+    conn->upstream_recv_armed = false;
+    conn->upstream_recv_cancel_inflight = false;  // recv terminal drained first
+    conn->upstream_recv_terminal_stale = false;
+    conn->upstream_recv_pause_cancel_pending = true;  // its cancel CQE is still due
+    conn->pending_ops = 1;
+    conn->keep_alive = true;
+
+    loop->close_released_upstream(*conn);
+    CHECK_EQ(conn->upstream_fd, -1);
+    CHECK(conn->keep_alive);
+    CHECK_FALSE(conn->upstream_recv_terminal_stale);
+
+    loop->dispatch(
+        {conn->id, -ENOENT, 0, 0, IoEventType::UpstreamRecv, 0, kPauseCancelAux, kEpisode});
+    CHECK_FALSE(conn->upstream_recv_pause_cancel_pending);
+    CHECK_FALSE(conn->upstream_recv_terminal_stale);
+    CHECK_FALSE(conn->upstream_recv_close_quarantine);
+    CHECK_EQ(conn->pending_ops, 0u);
+    close(conn->fd);
+    conn->fd = -1;
+}
+
+// A released upstream's paused recv may still deliver a lossy -ENOBUFS CQE whose
+// copied prefix the stale branch cannot roll back. Those bytes must be purged
+// before the successor's deferred recv is armed on the same buffer.
+TEST(iouring_retirement, released_upstream_close_purges_lossy_stale_prefix_before_rearm) {
+    ScopedIoUringLoopForRetirement guard;
+    if (!guard.init()) SKIP("io_uring unavailable");
+    auto* loop = guard.loop;
+    Connection* conn = loop->alloc_conn();
+    REQUIRE(conn != nullptr);
+    REQUIRE(loop->alloc_upstream_buf(*conn));
+    i32 successor[2] = {-1, -1};
+    REQUIRE_EQ(rut::test::stream_socketpair(successor), 0);
+    constexpr u32 kEpisode = 621;
+    conn->fd = dup(STDERR_FILENO);
+    REQUIRE_GE(conn->fd, 0);
+    conn->upstream_fd = dup(STDERR_FILENO);
+    REQUIRE_GE(conn->upstream_fd, 0);
+    conn->upstream_episode = kEpisode;
+    conn->upstream_recv_armed = true;
+    conn->upstream_recv_cancel_inflight = true;  // body-completion pause in flight
+    conn->upstream_recv_pause_cancel_pending = true;
+    conn->upstream_recv_terminal_stale = true;
+    conn->pending_ops = 2;
+    conn->keep_alive = true;
+
+    loop->close_released_upstream(*conn);
+    CHECK_EQ(conn->upstream_fd, -1);
+    CHECK(conn->upstream_recv_close_quarantine);
+
+    // Successor connected; its first recv was deferred behind the old drain.
+    conn->upstream_fd = successor[0];
+    conn->upstream_recv_pause_rearm_pending = true;
+    conn->set_slots(nullptr, nullptr, &on_upstream_response<IoUringEventLoop>, nullptr);
+
+    // wait() copied a prefix of an oversized stale CQE and reported -ENOBUFS.
+    static constexpr u8 kStale[] = "HTTP/1.1 200 OK\r\nX-Stale: 1";
+    REQUIRE_EQ(conn->upstream_recv_buf.write(kStale, sizeof(kStale) - 1u), sizeof(kStale) - 1u);
+    const u32 tail_before = __atomic_load_n(loop->backend.sq_tail, __ATOMIC_ACQUIRE);
+    const u32 pending_before = loop->backend.pending;
+    loop->dispatch({conn->id, -ENOBUFS, 0, 0, IoEventType::UpstreamRecv, 0, 0, kEpisode});
+    CHECK_FALSE(conn->upstream_recv_cancel_inflight);
+    CHECK_FALSE(conn->upstream_recv_armed);  // successor still deferred
+    loop->dispatch({conn->id, 0, 0, 0, IoEventType::UpstreamRecv, 0, kPauseCancelAux, kEpisode});
+    CHECK_FALSE(conn->upstream_recv_pause_cancel_pending);
+    CHECK(conn->upstream_recv_armed);  // successor armed now
+    CHECK_EQ(conn->upstream_recv_buf.len(), 0u);
+    CHECK_FALSE(conn->upstream_recv_close_quarantine);
+    __atomic_store_n(loop->backend.sq_tail, tail_before, __ATOMIC_RELEASE);
+    loop->backend.pending = pending_before;
+    conn->upstream_recv_armed = false;
+    conn->pending_ops = 0;
+    close(conn->upstream_fd);
+    conn->upstream_fd = -1;
+    close(successor[1]);
+    close(conn->fd);
+    conn->fd = -1;
+}
+
 bool stage_http1_boundary_retirement(IoUringEventLoop* loop,
                                      const RouteConfig* old_config,
                                      ShardEpoch* epoch,
@@ -35844,8 +36015,8 @@ bool stage_live_precise_request(IoUringEventLoop* loop,
     const u8* request = bodyless_get ? (downstream_close ? kGetCloseRequest : kGetKeepAliveRequest)
                         : downstream_close ? kCloseRequest
                                            : kKeepAliveRequest;
-    const u32 request_len = bodyless_get       ? (downstream_close ? sizeof(kGetCloseRequest) - 1u
-                                                                   : sizeof(kGetKeepAliveRequest) - 1u)
+    const u32 request_len = bodyless_get ? (downstream_close ? sizeof(kGetCloseRequest) - 1u
+                                                             : sizeof(kGetKeepAliveRequest) - 1u)
                             : downstream_close ? sizeof(kCloseRequest) - 1u
                                                : sizeof(kKeepAliveRequest) - 1u;
     if (conn->recv_buf.write(request, request_len) != request_len) return fail();

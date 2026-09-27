@@ -2424,27 +2424,40 @@ public:
     // io_uring holds its own file reference, so the recv stays live on the old
     // socket and completes when the origin's FIN arrives, carrying the same
     // (conn_id, UpstreamRecv, upstream_episode) user_data as the next request's
-    // fresh recv on this slot. Dispatched as current, that late EOF clears
+    // fresh recv on this slot. Dispatched as current, that late EOF would clear
     // upstream_recv_armed for the new recv, after which backend wait() treats the
-    // new response's body CQEs as stale and drops their bytes. Instead quarantine
-    // the old recv exactly like return_idle_upstream does: mark it a stale
-    // terminal, cancel it, and keep cancel_inflight set so submit_recv_upstream
-    // defers the successor's recv until the old one has drained.
+    // new response's body CQEs as stale and drops their bytes.
+    //
+    // A live recv with no cancel yet is retired through the exact-episode ledger
+    // (as strict clean success does): the episode advances, so wait() never copies
+    // the old recv's bytes and its CQEs are consumed by the retirement consumer; the
+    // cancel keeps retry ownership under SQ pressure; defer_http1_request_boundary
+    // parks request 2 until the retirement drains. A recv already under a pause
+    // cancel keeps that owner: its terminal is quarantined as stale (only while it
+    // is still outstanding) and the drain resets the buffer before any successor
+    // recv is armed. If neither ownership can be proven the downstream is closed
+    // after this complete response (keep_alive = false) and close_conn's own
+    // upstream teardown owns the recv; request 2 is never admitted over it.
     void close_released_upstream(Connection& c) {
         // A retirement ledger that already owns the recv has advanced the episode,
         // so that recv's CQEs are tagged stale and its cancel is owned there.
         const bool retirement_owns_recv =
             c.upstream_retirement_active ||
             (c.upstream_retirement_target_owned & kUpstreamOpRecv) != 0;
-        if (c.upstream_fd >= 0 && !retirement_owns_recv &&
-            (c.upstream_recv_armed || c.upstream_recv_cancel_inflight ||
-             c.upstream_recv_pause_cancel_pending)) {
-            c.upstream_recv_terminal_stale = true;
-            c.upstream_recv_idle_stale_bytes = false;
-            // If the cancel SQE can't be queued the recv's own terminal (FIN or
-            // error on the closed socket) still drains the barrier.
-            if (c.upstream_recv_armed && !pause_upstream_recv_impl(c))
-                c.upstream_recv_cancel_inflight = true;
+        if (c.upstream_fd >= 0 && !retirement_owns_recv) {
+            const bool pause_owned =
+                c.upstream_recv_cancel_inflight || c.upstream_recv_pause_cancel_pending;
+            if (pause_owned) {
+                if (c.upstream_recv_cancel_inflight) c.upstream_recv_terminal_stale = true;
+                c.upstream_recv_close_quarantine = true;
+            } else if (c.upstream_recv_armed &&
+                       !begin_upstream_retirement_impl(c,
+                                                       kUpstreamOpRecv,
+                                                       c.on_upstream_recv == nullptr,
+                                                       /*transfer_live_state=*/true)) {
+                c.keep_alive = false;
+                return;
+            }
         }
         // From here on identical to the generic detach_upstream_close fallback.
         if (c.upstream_fd >= 0) {
@@ -5372,6 +5385,10 @@ public:
         // the recv has fully drained, so finish the slot-free that close_conn skipped.
         // free_conn defers reclamation itself if client-side cancel CQEs are still in
         // flight (parks the conn in pending_free until pending_ops hits 0).
+        if (c.upstream_recv_close_quarantine && kUpstreamRecvDrained) {
+            c.upstream_recv_close_quarantine = false;
+            c.upstream_recv_buf.reset();
+        }
         if (c.close_after_idle_return && kUpstreamRecvDrained) {
             c.close_after_idle_return = false;
             this->free_conn(c);
