@@ -41340,7 +41340,7 @@ static constexpr ExactLoopbackFixedRedirectProfile kExactLoopbackFixedRedirect30
     "301 Moved Permanently",
     kExactLoopbackFixedRedirect301SourceBody,
     kExactLoopbackFixedRedirect301Body,
-    5937u};
+    5921u};
 static constexpr ExactLoopbackFixedRedirectProfile kExactLoopbackFixedRedirect302Profile{
     302u,
     "#350",
@@ -41352,7 +41352,7 @@ static constexpr ExactLoopbackFixedRedirectProfile kExactLoopbackFixedRedirect30
     "302 Found",
     kExactLoopbackFixedRedirect302SourceBody,
     kExactLoopbackFixedRedirect302Body,
-    5913u};
+    5897u};
 
 static const ExactLoopbackFixedRedirectProfile* exact_loopback_fixed_redirect_profile(u16 status) {
     if (status == 301u) return &kExactLoopbackFixedRedirect301Profile;
