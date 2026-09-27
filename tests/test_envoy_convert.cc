@@ -2309,6 +2309,59 @@ TEST(envoy_convert, api_forged_malformed_cluster_name_rejected) {
           std::string::npos);
 }
 
+TEST(envoy_convert, api_forged_malformed_load_assignment_name_rejected) {
+    // Codex sweep-7 review: `load_assignment_name` (retained separately from
+    // `name` since PR #692 round-12/PR8's per-cluster equality
+    // revalidation) reaches `Str::eq` against `model.clusters[i].name`
+    // without first being validated as backed/non-empty/bounded itself,
+    // unlike `name` and `action.cluster` on the other side of similar
+    // comparisons (`api_forged_malformed_cluster_name_rejected`,
+    // `api_forged_multi_route_model_rejected` above). `Str::eq` compares by
+    // length first, then dereferences both `ptr`s byte-by-byte once lengths
+    // match, so a malformed `load_assignment_name` at the SAME length as
+    // the cluster's own `name` would dereference a null pointer instead of
+    // producing a diagnostic.
+    const std::string text = routes_scenario_a_json();
+    static envoy::JsonDocument doc;
+    auto parsed = envoy::parse_bootstrap_json(str(text), doc);
+    REQUIRE(parsed);
+    REQUIRE_EQ(parsed.value().clusters.len, 2u);
+    REQUIRE_EQ(parsed.value().clusters[1].name.len, 11u);  // "api_backend"
+    REQUIRE(parsed.value().clusters[1].load_assignment_name_present);
+    const envoy::RutCapabilities all_true{true, true, true};
+
+    // A null-backed load_assignment_name, the same length as clusters[1]'s
+    // name ("api_backend", 11 bytes) so `Str::eq`'s length check does not
+    // short-circuit before the byte loop would dereference the null
+    // pointer.
+    envoy::Bootstrap null_load_assignment_name = parsed.value();
+    null_load_assignment_name.clusters[1].load_assignment_name = Str{nullptr, 11u};
+    const auto null_load_assignment_name_result =
+        envoy::lower_to_rut(null_load_assignment_name, all_true);
+    CHECK_FALSE(null_load_assignment_name_result);
+    CHECK(null_load_assignment_name_result.error().code == FrontendError::UnexpectedToken);
+    CHECK(to_string(null_load_assignment_name_result.error().detail).find("non-empty string") !=
+          std::string::npos);
+
+    // An empty load_assignment_name bypasses the parser's requirement that
+    // `load_assignment.cluster_name` be non-empty the same way.
+    envoy::Bootstrap empty_load_assignment_name = parsed.value();
+    empty_load_assignment_name.clusters[1].load_assignment_name = Str{};
+    CHECK_FALSE(envoy::lower_to_rut(empty_load_assignment_name, all_true));
+
+    // A load_assignment_name over `kMaxEnvoyNameLen` (128) bytes bypasses
+    // the parser's length bound the same way.
+    static const std::string oversized_name(129u, 'a');
+    envoy::Bootstrap oversized_load_assignment_name = parsed.value();
+    oversized_load_assignment_name.clusters[1].load_assignment_name = str(oversized_name);
+    const auto oversized_load_assignment_name_result =
+        envoy::lower_to_rut(oversized_load_assignment_name, all_true);
+    CHECK_FALSE(oversized_load_assignment_name_result);
+    CHECK(oversized_load_assignment_name_result.error().code == FrontendError::UnsupportedSyntax);
+    CHECK(to_string(oversized_load_assignment_name_result.error().detail).find("bounded length") !=
+          std::string::npos);
+}
+
 // ── Increment 4: reject direct_response / redirect before the six
 //    capability checks (multiple routes and clusters are lowered by this PR;
 //    see the golden_routes_* and cli_two_routes_blocked_by_first_capability

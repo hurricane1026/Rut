@@ -474,11 +474,19 @@ are recorded from the pinned Envoy build, not assumed.
   byte-prefix semantics: `RouteTrie::tokenize_segments`
   (`src/runtime/route_trie.cc`) drops empty path segments when selecting
   which node a request lands on, so a request whose raw path contains an
-  injected empty segment (e.g. `/api//x`) can still alias into a declared
-  `"/api/"` node and forward through its terminal prefix arm even though
-  Envoy's literal, unnormalized prefix match would 404 it — tracked as its
-  own `NOT_IMPLEMENTED` row (docs/envoy-compatibility.md, "Path
-  normalization"), not a lowering rejection. A raw (non-segment) prefix not
+  injected empty segment can alias into a node its unnormalized path would
+  not otherwise reach. For example, with a declared prefix `"/api/v1/"`
+  (node text `/api/v1` after stripping the trailing slash), a request for
+  `/api//v1/x` tokenizes to the same segments as `/api/v1/x` (`["api", "v1",
+  "x"]`) and forwards through that node's terminal prefix arm, even though
+  the raw bytes of `/api//v1/x` do not start with the literal `/api/v1/`
+  (byte 5 is `/`, not `v`) — Envoy's unnormalized prefix match would not
+  match this route at all. (A request like `/api//x` against declared
+  prefix `"/api/"`, by contrast, is not a divergence: its raw bytes DO start
+  with the literal `/api/`, so Envoy forwards it too, in agreement with
+  Rut's segment-normalized match.) This is tracked as its own
+  `NOT_IMPLEMENTED` row (docs/envoy-compatibility.md, "Path normalization"),
+  not a lowering rejection. A raw (non-segment) prefix not
   ending in `/` (e.g. `"/api"`) is still rejected outright by the parser —
   Rut's route trie has no equivalent for a plain byte-prefix match — and
   stays `BLOCKED_BY_RUT` until Rut offers one (docs/envoy-compatibility.md,

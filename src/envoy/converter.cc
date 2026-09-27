@@ -938,6 +938,26 @@ FrontendResult<bool> validate(const Bootstrap& model, const RutCapabilities& cap
         // lowering time instead of trusting historical presence. Checked for
         // every declared cluster now that route lists may name more than
         // one.
+        //
+        // Codex sweep-7 review: `load_assignment_name` is a borrowed view
+        // parsed independently of `name` (src/envoy/parser.cc,
+        // `out->load_assignment_name = name_text.value();`), so it needs the
+        // same defensive validation `name`/`action.cluster` already get
+        // above before `Str::eq` below dereferences it. `Str::eq` only
+        // short-circuits on a length mismatch; a hand-built `Bootstrap`
+        // passed to the public `lower_to_rut(model, capabilities)` overload
+        // that sets `load_assignment_name_present = true` but leaves
+        // `load_assignment_name` unbacked at the SAME length as `name`
+        // (e.g. `Str{nullptr, model.clusters[i].name.len}`) would otherwise
+        // reach `Str::eq`'s byte-by-byte comparison loop and dereference a
+        // null pointer instead of producing a diagnostic.
+        if (model.clusters[i].load_assignment_name.len == 0u ||
+            model.clusters[i].load_assignment_name.ptr == nullptr)
+            return invalid(model.clusters[i].load_assignment_name_span,
+                           lit_str("load_assignment.cluster_name must be a non-empty string"));
+        if (model.clusters[i].load_assignment_name.len > kMaxEnvoyNameLen)
+            return unsupported(model.clusters[i].load_assignment_name_span,
+                               lit_str("name exceeds the bounded length"));
         if (!model.clusters[i].load_assignment_name.eq(model.clusters[i].name))
             return invalid(model.clusters[i].load_assignment_name_span,
                            lit_str("load_assignment.cluster_name must equal the cluster name"));
