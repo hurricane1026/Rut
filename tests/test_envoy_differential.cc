@@ -1407,7 +1407,35 @@ struct EnvoyInstance {
     // one followed by the destructor's automatic one) never re-invokes it
     // either.
     bool stop() {
-        if (pid <= 0) return true;
+        if (pid <= 0) {
+            // Sweep-2 review, "Clean up containers after readiness reaps
+            // docker": `pid <= 0` does NOT necessarily mean there was never
+            // anything to clean up. wait_ready_process() and both loops in
+            // wait_ready_and_confirm_ownership() reap this instance's
+            // docker-run child themselves the moment they observe it exit
+            // early, clearing `pid` to -1 right there -- long before
+            // launch_envoy_with_port_retry()'s own cleanup calls stop().
+            // `docker run --rm` normally removes the container when its
+            // client exits, but not always (the Docker CLI itself crashing,
+            // or losing its daemon connection, can leave the container --
+            // and the host-network listener it holds -- running). Skipping
+            // `docker rm -f` here on `pid <= 0` alone would leave that
+            // container behind to contaminate a retry or a later test.
+            // `launched` is the only reliable signal for "was a container
+            // actually created": it is set the moment launch() forks the
+            // docker-run child (before this instance's `pid` can ever be
+            // reaped by anyone), and stays true regardless of who reaps
+            // `pid` or when. Every dummy-child self-test instance never
+            // calls launch() at all, so `launched` stays false there and
+            // this remains a no-op for them (round-15 review, "Skip Docker
+            // teardown for instances that were never launched").
+            if (launched) {
+                g_docker_rm_invocations++;
+                run_and_wait({"docker", "rm", "-f", name}, 10'000);
+                launched = false;
+            }
+            return true;
+        }
         int status = 0;
         // Check before signaling/removing the container: if the child is
         // already a zombie here, it exited on its own, not because we asked
@@ -4560,10 +4588,28 @@ int run_pair_milestone_s(const std::string& rut_binary,
             for (auto& r : rut_record_only_results)
                 mark_upstream_ambiguous(&r, AmbiguityReason::kReuseportCollision);
         }
-        // Round-18 review, "Stop record-only proxies before snapshotting
-        // traffic": stop (and wait for the upstream to drain) BEFORE
-        // inspecting its evidence.
-        const bool rut_record_only_stopped_cleanly = rut_record_only.stop();
+        // This instance only ever ran the record-only batch, so a stop()
+        // failure here is unambiguously attributable to it (round-12/
+        // round-15 review). Round-18 review, "Stop record-only proxies
+        // before snapshotting traffic": stop (and wait for the upstream to
+        // drain) BEFORE inspecting its evidence, same as the Envoy phase
+        // above. Sweep-2 review, "Record the RUT crash before later
+        // ambiguity checks": note_record_only_phase_crash() must run
+        // immediately after this failed stop() -- BEFORE the upstream-idle
+        // and fill_upstream_bytes() checks below, which can themselves call
+        // mark_upstream_ambiguous() -- because mark_upstream_ambiguous()'s
+        // first-reason-wins rule means whichever check runs first locks in
+        // the reason a reader sees. Recording the crash last here (as this
+        // used to) let a coincident secondary symptom (an idle timeout, a
+        // duplicate, or stray traffic caused by the same crash) win instead,
+        // silently dropping the actual root cause from the transcript; the
+        // Envoy phase above never had this bug because it always recorded
+        // the crash right after stop().
+        if (!rut_record_only.stop()) {
+            dump_rut_log(rut_record_only.log_path);
+            note_record_only_phase_crash(
+                "rut", rut_record_only.unexpected_exit_description, &rut_record_only_results);
+        }
         // Round-20 review, "Reject asserted evidence when upstream
         // quiescence times out": record-only phases downgrade the same
         // timeout to a NOTE instead of failing the run.
@@ -4571,14 +4617,6 @@ int run_pair_milestone_s(const std::string& rut_binary,
             upstream, 2000, "pair RUT record-only", &rut_record_only_results);
         fill_upstream_bytes(&rut_record_only_results, record_only_cases, upstream);
         upstream.stop();
-        // This instance only ever ran the record-only batch, so a stop()
-        // failure here is unambiguously attributable to it (round-12/
-        // round-15 review).
-        if (!rut_record_only_stopped_cleanly) {
-            dump_rut_log(rut_record_only.log_path);
-            note_record_only_phase_crash(
-                "rut", rut_record_only.unexpected_exit_description, &rut_record_only_results);
-        }
         auto rut_results = std::move(rut_asserted_results);
         rut_results.insert(rut_results.end(),
                            std::make_move_iterator(rut_record_only_results.begin()),
@@ -5288,6 +5326,108 @@ bool self_test_quiesce_after_record_only_idle_timeout() {
 
     upstream.stop();
     if (ok) std::cerr << "PASS [self-test quiesce record-only]\n";
+    return ok;
+}
+
+// Sweep-2 review, "Record the RUT crash before later ambiguity checks":
+// reproduces a record-only phase where the proxy crashed AND its upstream
+// coincidentally also never went idle (plausible together: a proxy that
+// dies mid-request can easily leave a handler thread stalled on a
+// half-written connection). Calls note_record_only_phase_crash() and
+// note_upstream_idle_timeout_for_record_only_batch() in the exact order
+// run_pair_milestone_s()'s RUT record-only phase now uses (crash first),
+// and confirms the crash reason wins over the coincident secondary symptom
+// -- mark_upstream_ambiguous()'s first-reason-wins rule means whichever
+// check runs first is what a reader of the transcript sees -- and that
+// write_transcript() names the crash, never the secondary symptom.
+bool self_test_record_only_crash_reason_precedence() {
+    BoundPort bound;
+    if (!allocate_bound_loopback_port(&bound)) {
+        std::cerr << "FAIL [self-test crash reason precedence]: could not allocate a loopback "
+                     "port\n";
+        return false;
+    }
+    RecordingUpstream upstream;
+    upstream.set_default_reply(
+        "HTTP/1.1 200 OK\r\nConnection: close\r\nContent-Length: 2\r\n\r\nhi");
+    if (!upstream.adopt(bound.fd)) {
+        std::cerr << "FAIL [self-test crash reason precedence]: could not adopt the listener\n";
+        return false;
+    }
+
+    // A connection kept open (no request sent) so wait_idle() below
+    // genuinely cannot reach zero active handlers within its short soft
+    // timeout, reproducing the coincident "upstream also times out"
+    // scenario from the review deterministically rather than racily.
+    const int fd = connect_with_timeout(bound.port, kClientTimeoutMs);
+    if (fd < 0) {
+        std::cerr << "FAIL [self-test crash reason precedence]: could not connect\n";
+        upstream.stop();
+        return false;
+    }
+
+    std::vector<CaseResult> results(1);
+    results[0].name = "connect_authority";  // a real record-only case name
+
+    // Exact production order (see run_pair_milestone_s()'s RUT record-only
+    // phase): the crash is recorded FIRST...
+    note_record_only_phase_crash("rut", "killed by signal 11", &results);
+    // ...then the coincident secondary symptom is checked. Nothing ever
+    // accepts the connection above (it just sits in the kernel backlog, or
+    // gets accepted and then blocks waiting for a request that never
+    // comes), so this soft wait reliably times out.
+    const bool timed_out = note_upstream_idle_timeout_for_record_only_batch(
+        upstream, 200, "self-test rut record-only", &results);
+
+    bool ok = true;
+    if (!timed_out) {
+        std::cerr << "FAIL [self-test crash reason precedence]: expected the still-open "
+                     "connection to make the soft wait time out\n";
+        ok = false;
+    }
+    if (results[0].upstream_ambiguous_reason != AmbiguityReason::kProxyCrash) {
+        std::cerr << "FAIL [self-test crash reason precedence]: the crash reason was overwritten "
+                     "by the coincident idle timeout instead of winning as the first-recorded "
+                     "reason\n";
+        ok = false;
+    }
+
+    TempDir dir("rut-envoy-selftest-crash-precedence");
+    if (dir.empty()) {
+        std::cerr << "FAIL [self-test crash reason precedence]: could not create temp dir\n";
+        ok = false;
+    } else {
+        const std::string out_path = dir.path() + "/transcript.inc";
+        results[0].client_bytes = "GET / HTTP/1.1\r\n\r\n";
+        results[0].exchange_complete = true;
+        results[0].downstream_bytes = "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n";
+        if (!write_transcript(out_path, results)) {
+            std::cerr << "FAIL [self-test crash reason precedence]: write_transcript rejected a "
+                         "record-only row\n";
+            ok = false;
+        } else {
+            std::ifstream in(out_path);
+            std::stringstream ss;
+            ss << in.rdbuf();
+            const std::string content = ss.str();
+            if (content.find(describe_ambiguity_reason(AmbiguityReason::kProxyCrash)) ==
+                std::string::npos) {
+                std::cerr << "FAIL [self-test crash reason precedence]: transcript did not name "
+                             "the crash\n";
+                ok = false;
+            }
+            if (content.find(describe_ambiguity_reason(AmbiguityReason::kUpstreamIdleTimeout)) !=
+                std::string::npos) {
+                std::cerr << "FAIL [self-test crash reason precedence]: transcript named the "
+                             "coincident idle timeout instead of the actual crash\n";
+                ok = false;
+            }
+        }
+    }
+
+    close(fd);
+    upstream.stop();
+    if (ok) std::cerr << "PASS [self-test crash reason precedence]\n";
     return ok;
 }
 
@@ -6403,6 +6543,63 @@ bool self_test_envoy_instance_skips_docker_when_unlaunched() {
 
     std::cerr << "PASS [self-test envoy instance skips docker]\n";
     return true;
+}
+
+// Sweep-2 review, "Clean up containers after readiness reaps docker":
+// wait_ready_process() and both loops in wait_ready_and_confirm_ownership()
+// reap this instance's docker-run child and clear `pid` to -1 themselves
+// the moment they observe it exit early, well before launch_envoy_with_
+// port_retry()'s own cleanup ever calls stop(). Simulates exactly that --
+// a fork()ed dummy child already reaped, with `pid` cleared to -1, on an
+// instance whose `launched` is still true -- and confirms stop() still
+// runs `docker rm -f` (via g_docker_rm_invocations) instead of returning
+// early just because `pid <= 0`, which would otherwise leave a container
+// behind to contaminate a retry or a later test.
+bool self_test_envoy_instance_cleans_up_after_readiness_reaps_docker() {
+    const pid_t child = fork();
+    if (child < 0) {
+        std::cerr << "FAIL [self-test envoy instance cleans up reaped docker]: fork failed\n";
+        return false;
+    }
+    if (child == 0) {
+        _exit(0);
+    }
+    // Reap it here, exactly like wait_ready_process()/wait_ready_and_
+    // confirm_ownership() would upon observing an early exit, before stop()
+    // is ever called.
+    int status = 0;
+    while (waitpid(child, &status, 0) < 0 && errno == EINTR) {
+    }
+
+    EnvoyInstance envoy;
+    envoy.name = "rut-envoy-selftest-reaped-docker";
+    envoy.launched = true;  // launch() forked a docker-run child (simulated)
+    envoy.pid = -1;         // ...but a readiness loop already reaped and cleared it
+
+    const int before = g_docker_rm_invocations;
+    const bool stopped = envoy.stop();
+    const int after = g_docker_rm_invocations;
+
+    bool ok = true;
+    if (after != before + 1) {
+        std::cerr << "FAIL [self-test envoy instance cleans up reaped docker]: expected exactly "
+                     "one docker rm -f invocation, got "
+                  << (after - before) << "\n";
+        ok = false;
+    }
+    if (envoy.launched) {
+        std::cerr << "FAIL [self-test envoy instance cleans up reaped docker]: launched was not "
+                     "cleared after teardown\n";
+        ok = false;
+    }
+    if (!stopped) {
+        std::cerr << "FAIL [self-test envoy instance cleans up reaped docker]: stop() reported "
+                     "failure for an instance with no live pid left to signal\n";
+        ok = false;
+    }
+
+    if (ok) std::cerr << "PASS [self-test envoy instance cleans up reaped docker]\n";
+    return ok;
 }
 
 // RUT counterpart to self_test_wait_ready_ownership() above, covering
@@ -9610,6 +9807,7 @@ int run_self_test(const std::string& rut_binary, const std::string& converter_bi
     ok &= self_test_wait_idle_synchronizes_accept_handoff();
     ok &= self_test_require_upstream_idle_for_asserted_batch();
     ok &= self_test_quiesce_after_record_only_idle_timeout();
+    ok &= self_test_record_only_crash_reason_precedence();
     ok &= self_test_partial_exchange_rejection();
     ok &= self_test_ambiguity_reason_note_text();
     ok &= self_test_fake_listener_unblocks_on_shutdown();
@@ -9621,6 +9819,7 @@ int run_self_test(const std::string& rut_binary, const std::string& converter_bi
     ok &= self_test_leak_check_honors_keep_tmp();
     ok &= self_test_no_binary_self_test_leaves_no_temp_dirs();
     ok &= self_test_envoy_instance_skips_docker_when_unlaunched();
+    ok &= self_test_envoy_instance_cleans_up_after_readiness_reaps_docker();
     ok &= self_test_rut_wait_ready_ownership();
     ok &= self_test_rut_log_confirms_listener();
     ok &= self_test_count_listeners_on_port();
