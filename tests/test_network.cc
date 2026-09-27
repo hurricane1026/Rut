@@ -1760,7 +1760,7 @@ TEST(response_policy, response_read_timeout_bundle_config_shapes_are_exact_and_f
     rejects(response_only);
     rir::Module forged_buffering = module;
     forged_buffering.policy_bundles[4].response_buffering =
-        static_cast<ForwardResponseBufferingMode>(2);
+        static_cast<ForwardResponseBufferingMode>(3);
     rejects(forged_buffering);
     rir::Module buffering_without_timeout = module;
     buffering_without_timeout.policy_bundles[4].response_read_timeout_seconds = 0;
@@ -1899,7 +1899,7 @@ TEST(response_policy, complete_buffering_bundle_revalidates_roles_and_tuple_fiel
     rejects([&] { config.policy_bundles[0].response_read_timeout_seconds = 0; });
     rejects([&] { config.policy_bundles[0].response_read_timeout_seconds = 64; });
     rejects([&] {
-        config.policy_bundles[0].response_buffering = static_cast<ForwardResponseBufferingMode>(2);
+        config.policy_bundles[0].response_buffering = static_cast<ForwardResponseBufferingMode>(3);
     });
 
     rejects(

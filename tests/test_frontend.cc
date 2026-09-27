@@ -34717,7 +34717,7 @@ route GET "/" {
     REQUIRE(ast);
     stmt = ast->items[1].route.statements[0];
     REQUIRE(stmt != nullptr);
-    stmt->forward_response_buffering = static_cast<ForwardResponseBufferingMode>(2);
+    stmt->forward_response_buffering = static_cast<ForwardResponseBufferingMode>(3);
     rejected_hir = analyze_file_heap(ast.value());
     REQUIRE_FALSE(rejected_hir.has_value());
     CHECK(rejected_hir.error().detail.eq(lit("invalid response buffering")));
@@ -34779,7 +34779,7 @@ route GET "/" {
     mir->functions[0].blocks[0].term.forward_request_policy_id =
         static_cast<u16>(RequestPolicyId::Http11FixedStrip);
     mir->functions[0].blocks[0].term.forward_response_buffering =
-        static_cast<ForwardResponseBufferingMode>(2);
+        static_cast<ForwardResponseBufferingMode>(3);
     FrontendRirModule rejected{};
     CHECK_FALSE(lower_to_rir(mir.value(), rejected).has_value());
     mir->functions[0].blocks[0].term.forward_response_buffering =
@@ -34788,7 +34788,7 @@ route GET "/" {
     FrontendRirModule rir{};
     REQUIRE(lower_to_rir(mir.value(), rir));
     REQUIRE(rir::verify_module(rir.module).ok);
-    rir.module.policy_bundles[0].response_buffering = static_cast<ForwardResponseBufferingMode>(2);
+    rir.module.policy_bundles[0].response_buffering = static_cast<ForwardResponseBufferingMode>(3);
     CHECK_FALSE(rir::verify_module(rir.module).ok);
     rir.module.policy_bundles[0].response_buffering =
         ForwardResponseBufferingMode::CompleteContentLength;
@@ -38737,6 +38737,165 @@ TEST(frontend, complete_content_length_request_framing_selection_is_get_id1_then
     forged.blocks[2].term.forward_request_policy_id = saved_policy;
     CHECK(rir::verify_module(lowered.module).ok);
     lowered.destroy();
+}
+
+TEST(frontend, bounded_response_buffering_parses_and_propagates_like_complete_content_length) {
+    const char source[] = R"rut(
+upstream b at "127.0.0.1:9000"
+route GET "/one" {
+    return forward(b,
+        request_policy: { version: "HTTP/1.1", host: "upstream", connection: "omit",
+            strip_headers: ["Connection", "Keep-Alive", "TE", "Expect", "Upgrade"] },
+        response_policy: { version: "HTTP/1.1", framing: "content_length",
+            connection: "request", server: "s", date: "current", hide_headers: [] },
+        failure_policy: { version: "HTTP/1.1", status: 502, reason: "Bad Gateway",
+            content_type: "text/plain", server: "s", date: "current",
+            connection: "request", body: b"bad" },
+        timeout_failure_policy: { version: "HTTP/1.1", status: 504,
+            reason: "Gateway Time-out", content_type: "text/plain", server: "s",
+            date: "current", connection: "request", body: b"slow" },
+        response_read_timeout: 1s,
+        response_buffering: "bounded")
+}
+)rut";
+    auto lexed = lex(lit(source));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    const auto* stmt = ast->items[1].route.statements[0];
+    REQUIRE(stmt != nullptr);
+    CHECK(stmt->has_forward_response_buffering);
+    CHECK_EQ(stmt->forward_response_buffering, ForwardResponseBufferingMode::Bounded);
+
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    CHECK_EQ(hir->routes[0].control.direct_term.forward_response_buffering,
+             ForwardResponseBufferingMode::Bounded);
+    CHECK_EQ(hir->routes[0].forward_preflight_mode, ForwardPreflightMode::EagerDirect);
+
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    CHECK_EQ(mir->functions[0].blocks[0].term.forward_response_buffering,
+             ForwardResponseBufferingMode::Bounded);
+
+    FrontendRirModule rir{};
+    REQUIRE(lower_to_rir(mir.value(), rir));
+    REQUIRE(rir::verify_module(rir.module).ok);
+    REQUIRE_EQ(rir.module.policy_bundle_count, 1u);
+    CHECK_EQ(rir.module.policy_bundles[0].response_buffering,
+             ForwardResponseBufferingMode::Bounded);
+    rir.destroy();
+}
+
+TEST(frontend, bounded_get_id1_then_id3_framing_selection_matches_complete_content_length) {
+    auto lexed = lex(lit(kBoundedFramingSelectionSource));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    REQUIRE_EQ(hir->routes.len, 1u);
+    auto& route = hir->routes[0];
+    CHECK_EQ(route.method, kRouteMethodGet);
+    CHECK_EQ(route.forward_preflight_mode, ForwardPreflightMode::AfterRequestFramingSelection);
+    CHECK_EQ(route.control.cond.kind, HirExprKind::ReqHasContentLength);
+    CHECK_EQ(route.control.then_term.forward_request_policy_id,
+             static_cast<u16>(RequestPolicyId::Http11FixedStrip));
+    CHECK_EQ(route.control.else_term.forward_request_policy_id,
+             static_cast<u16>(RequestPolicyId::Http11FixedTrimSpPreserveHtab));
+    CHECK_EQ(route.control.then_term.forward_response_buffering,
+             ForwardResponseBufferingMode::Bounded);
+    CHECK_EQ(route.control.else_term.forward_response_buffering,
+             ForwardResponseBufferingMode::Bounded);
+
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    REQUIRE_EQ(mir->functions[0].blocks.len, 3u);
+
+    FrontendRirModule lowered{};
+    REQUIRE(lower_to_rir(mir.value(), lowered));
+    REQUIRE(rir::verify_module(lowered.module).ok);
+    const auto& fn = lowered.module.functions[0];
+    CHECK_EQ(fn.forward_preflight_mode, ForwardPreflightMode::AfterRequestFramingSelection);
+    CHECK_EQ(lowered.module.policy_bundles[0].response_read_timeout_seconds, 60u);
+    CHECK_EQ(lowered.module.policy_bundles[0].response_buffering,
+             ForwardResponseBufferingMode::Bounded);
+    lowered.destroy();
+
+    // same_framing_bundle requires the then/else branches to carry the exact
+    // same actual mode: forging one branch to CompleteContentLength while the
+    // other stays Bounded must be rejected, not silently accepted as "close
+    // enough" because both use the content-length machinery.
+    const auto saved = route.control.else_term.forward_response_buffering;
+    route.control.else_term.forward_response_buffering =
+        ForwardResponseBufferingMode::CompleteContentLength;
+    auto mismatched_mir = build_mir_heap(hir.value());
+    CHECK_FALSE(mismatched_mir.has_value());
+    route.control.else_term.forward_response_buffering = saved;
+}
+
+TEST(frontend, bounded_response_buffering_rejects_same_shapes_as_complete_content_length) {
+    // "bounded" is accepted exactly where "complete_content_length" is:
+    // missing the paired timeout/policy bundle produces the same rejection.
+    const char incomplete_bundle[] =
+        "upstream b\nroute GET \"/\" { return forward(b, response_read_timeout: 1s, "
+        "response_buffering: \"bounded\") }\n";
+    auto lexed = lex(lit(incomplete_bundle));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto rejected_hir = analyze_file_heap(ast.value());
+    REQUIRE_FALSE(rejected_hir.has_value());
+    CHECK(rejected_hir.error().detail.eq(
+        lit("response_buffering requires a complete strict timeout policy bundle")));
+
+    // retained_header_value (ID3) requires complete-or-bounded buffering AND a
+    // response read timeout; dropping the timeout produces the updated
+    // two-mode error text for a "bounded" source, exactly as it does for
+    // "complete_content_length".
+    const char retained_no_timeout[] = R"rut(
+upstream b
+route GET "/" {
+    return forward(b,
+        request_policy: { version: "HTTP/1.1", host: "upstream", connection: "omit",
+            retained_header_value: "trim_sp_preserve_htab",
+            strip_headers: ["Connection", "Keep-Alive", "TE", "Expect", "Upgrade"] },
+        response_policy: { version: "HTTP/1.1", framing: "content_length",
+            connection: "request", server: "s", date: "current", hide_headers: [] },
+        failure_policy: { version: "HTTP/1.1", status: 502, reason: "Bad Gateway",
+            content_type: "text/plain", server: "s", date: "current",
+            connection: "request", body: b"bad" },
+        timeout_failure_policy: { version: "HTTP/1.1", status: 504,
+            reason: "Gateway Time-out", content_type: "text/plain", server: "s",
+            date: "current", connection: "request", body: b"slow" },
+        response_buffering: "bounded")
+}
+)rut";
+    lexed = lex(lit(retained_no_timeout));
+    REQUIRE(lexed);
+    ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    rejected_hir = analyze_file_heap(ast.value());
+    REQUIRE_FALSE(rejected_hir.has_value());
+    CHECK(rejected_hir.error().detail.eq(
+        lit("retained_header_value requires complete or bounded response buffering "
+            "and a response read timeout")));
+
+    // Non-GET methods remain closed to Bounded exactly like CompleteContentLength:
+    // the direct-route admission requires complete_content_length_route_method_is_admitted.
+    for (const char* rejected_method : {"HEAD"}) {
+        std::string wrong_method(kBoundedFramingSelectionSource);
+        const auto method = wrong_method.find("route GET");
+        REQUIRE_NE(method, std::string::npos);
+        wrong_method.replace(
+            method, sizeof("route GET") - 1u, std::string("route ") + rejected_method);
+        auto wrong_lexed = lex(lit(wrong_method.c_str()));
+        REQUIRE(wrong_lexed);
+        auto wrong_ast = parse_file_heap(wrong_lexed.value());
+        REQUIRE(wrong_ast);
+        auto wrong_hir = analyze_file_heap(wrong_ast.value());
+        REQUIRE_FALSE(wrong_hir.has_value());
+    }
 }
 
 int main(int argc, char** argv) {

@@ -74,3 +74,42 @@ route GET "/one" {
   }
 }
 )rut";
+
+// Identical to kCompleteContentLengthFramingSelectionSource but exercises the
+// Bounded mode on the same id1/id3 GET framing split (both branches must
+// carry the same actual mode; see same_framing_bundle in analyze.cc).
+inline constexpr char kBoundedFramingSelectionSource[] = R"rut(
+upstream backend at "127.0.0.1:9000"
+route GET "/one" {
+  if req.hasContentLength {
+    return forward(backend,
+      request_policy: {version: "HTTP/1.1", host: "upstream", connection: "omit",
+        strip_headers: ["Connection", "Keep-Alive", "TE", "Expect", "Upgrade"]},
+      response_policy: {version: "HTTP/1.1", framing: "content_length",
+        connection: "request", server: "rut", date: "current", hide_headers: []},
+      failure_policy: {version: "HTTP/1.1", status: 502, reason: "Bad Gateway",
+        content_type: "text/plain", server: "rut", date: "current",
+        connection: "request", body: b"bad"},
+      timeout_failure_policy: {version: "HTTP/1.1", status: 504,
+        reason: "Gateway Time-out", content_type: "text/plain", server: "rut",
+        date: "current", connection: "request", body: b"slow"},
+      response_read_timeout: 60s,
+      response_buffering: "bounded")
+  } else {
+    return forward(backend,
+      request_policy: {version: "HTTP/1.1", host: "upstream", connection: "omit",
+        retained_header_value: "trim_sp_preserve_htab",
+        strip_headers: ["Connection", "Keep-Alive", "TE", "Expect", "Upgrade"]},
+      response_policy: {version: "HTTP/1.1", framing: "content_length",
+        connection: "request", server: "rut", date: "current", hide_headers: []},
+      failure_policy: {version: "HTTP/1.1", status: 502, reason: "Bad Gateway",
+        content_type: "text/plain", server: "rut", date: "current",
+        connection: "request", body: b"bad"},
+      timeout_failure_policy: {version: "HTTP/1.1", status: 504,
+        reason: "Gateway Time-out", content_type: "text/plain", server: "rut",
+        date: "current", connection: "request", body: b"slow"},
+      response_read_timeout: 60s,
+      response_buffering: "bounded")
+  }
+}
+)rut";
