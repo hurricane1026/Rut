@@ -421,9 +421,11 @@ return forward(users,
 // or exactly one `Connection: close`, one IPv4 upstream, strict success, and
 // connect-establishment failure. On a `host: "preserve"` (ID4) route only,
 // this Connection grammar widens to the same nomination rule the ordinary
-// ID4 request-policy path already applies: every comma-separated,
-// case-insensitive token is admitted -- and, along with its own field,
-// dropped -- unless it names a protected header (`content-length`, `host`,
+// ID4 request-policy path already applies, and to any number of physical
+// Connection fields, not just one: every comma-separated, case-insensitive
+// token across every physical field present is admitted -- and, along with
+// its own field, dropped -- unless it names a protected header
+// (`content-length`, `host`,
 // the three forwarded-provenance headers, or a pseudo-header-shaped token
 // starting with `:`, each of which fails the whole request closed instead)
 // or is a genuine upgrade (a nominated `upgrade` token together with a
@@ -434,7 +436,10 @@ return forward(users,
 // independent of whatever else is nominated in the same value --
 // `Connection: close, X-Foo` behaves like the plain `Connection: close`
 // shape, and `Connection: X-Foo` alone (no `close`) behaves like no
-// `Connection` field at all -- since a nomination such as `te`, `X-Foo`, or
+// `Connection` field at all; the same union applies across physical fields,
+// e.g. `Connection: TE` followed by a separate `Connection: X-Foo` is
+// admitted exactly like one `Connection: TE, X-Foo` field would be -- since
+// a nomination such as `te`, `X-Foo`, or
 // a genuine-upgrade-free `upgrade` never affects persistence and ID4's own
 // request-policy path already forwards the request correctly regardless of
 // this response-side contract (canonicalizing a paired `TE` field when

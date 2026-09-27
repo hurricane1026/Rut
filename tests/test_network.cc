@@ -3559,6 +3559,62 @@ TEST(request_policy, preserve_host_lowercase_rejects_tls_connection) {
     CHECK_EQ(__builtin_memcmp(conn.recv_buf.data(), kExpected, sizeof(kExpected) - 1), 0);
 }
 
+// Codex sweep-10 review: the sweep-8 TLS guard above only runs inside
+// `apply_preserve_host_lowercase_request_policy`, i.e. at materialization,
+// which `handle_jit_outcome` reaches only after `inspect_request_policy_body`
+// has already returned `Complete` for a fixed-length body. For an *incomplete*
+// body, that inspector instead returns `Waiting` and the connection keeps
+// reading -- so an ID4/TLS request with a partial body was held open,
+// continuing to read the entire declared body, before ever reaching the
+// materialization-time guard and being rejected. `inspect_request_policy_body`
+// now applies the identical TLS exclusion itself, before any Content-Length/
+// buffering check that could produce `Waiting`, so the invalid combination
+// fails closed immediately -- with only the header block received, not the
+// full body.
+TEST(request_policy, preserve_host_lowercase_tls_rejects_before_waiting_for_body) {
+    static constexpr u16 kPreserveHost =
+        static_cast<u16>(RequestPolicyId::Http11PreserveHostLowercase);
+    Connection conn{};
+    u8 recv[256]{};
+    u8 send[256]{};
+
+    static constexpr char kHeader[] =
+        "POST /upload HTTP/1.1\r\nHost: client.example\r\nContent-Length: 5\r\n\r\n";
+    const u8 partial_body[] = {'a', 'b'};  // only 2 of the declared 5 bytes
+    u8 partial[sizeof(kHeader) - 1u + sizeof(partial_body)]{};
+    __builtin_memcpy(partial, kHeader, sizeof(kHeader) - 1u);
+    __builtin_memcpy(partial + sizeof(kHeader) - 1u, partial_body, sizeof(partial_body));
+
+    auto prepare = [&]() {
+        conn.reset();
+        conn.recv_slice = recv;
+        conn.send_slice = send;
+        conn.bind_request_receive_buffer(recv, sizeof(recv));
+        conn.send_buf.bind(send, sizeof(send));
+        REQUIRE_EQ(conn.recv_buf.write(partial, sizeof(partial)), sizeof(partial));
+        capture_request_metadata(conn);
+    };
+
+    // Baseline over cleartext: the same partial body genuinely waits for the
+    // rest, confirming this is a real "would otherwise wait" shape and not
+    // already rejected for an unrelated reason.
+    prepare();
+    REQUIRE_EQ(inspect_request_policy_body(conn, kPreserveHost), RequestPolicyBodyState::Waiting);
+
+    // Over TLS, the identical partial-body request must fail closed
+    // immediately -- not wait for the remaining 3 bytes -- and the receive
+    // buffer must be left exactly as received (no bytes consumed/rewritten).
+    prepare();
+    conn.tls_active = true;
+    u8 untouched[sizeof(partial)]{};
+    __builtin_memcpy(untouched, conn.recv_buf.data(), conn.recv_buf.len());
+    REQUIRE_EQ(inspect_request_policy_body(conn, kPreserveHost), RequestPolicyBodyState::Invalid);
+    CHECK_FALSE(apply_request_policy(conn, sockaddr_in{}, kPreserveHost));
+    CHECK_EQ(conn.send_buf.len(), 0u);
+    CHECK_EQ(conn.recv_buf.len(), sizeof(untouched));
+    CHECK_EQ(__builtin_memcmp(conn.recv_buf.data(), untouched, sizeof(untouched)), 0);
+}
+
 // `request_policy_body_response_admitted` (callbacks_impl.h) is the ordinary
 // strict-response body-path admission check for a body-carrying request
 // paired with a response_policy. It used to admit only ID1

@@ -5743,6 +5743,22 @@ inline RequestPolicyBodyState inspect_request_policy_body(const Connection& conn
         conn.req_http_version != static_cast<u8>(HttpVersion::Http11) ||
         conn.recv_slice == nullptr || conn.send_slice == nullptr)
         return RequestPolicyBodyState::Invalid;
+    // ID4 targets Envoy's cleartext (non-TLS) listener profile only (see the
+    // `apply_preserve_host_lowercase_request_policy` guard and the
+    // `Http11PreserveHostLowercase` contract comment); reject it here, in
+    // the pre-body admission path, rather than only at materialization.
+    // `handle_jit_outcome` calls this inspector first and parks a `Waiting`
+    // result in `on_request_policy_body_recvd` for an incomplete
+    // fixed-length body, so a materialization-only guard lets a slow client
+    // hold the connection and receive buffer open for an ID4/TLS
+    // combination that is already known to be invalid, waiting for the rest
+    // of a body that will only ever be rejected once complete (Codex
+    // sweep-10 review, PR #696). Failing closed here, before any Waiting
+    // determination below, means the response is sent as soon as the
+    // headers admit the request, with no dependence on the client ever
+    // finishing the body.
+    if (request_policy_preserves_host(policy_id) && conn.tls_active)
+        return RequestPolicyBodyState::Invalid;
     const u8* data = conn.recv_buf.data();
     const u32 len = conn.recv_buf.len();
     HttpParser parser;
@@ -5964,11 +5980,16 @@ inline bool apply_preserve_host_lowercase_request_policy(Connection& conn, u16 p
     // (nothing else in this profile has been validated against a TLS
     // listener's shape), but to fail this cleartext-only profile closed
     // before any rewrite or upstream contact, the same way every other
-    // unsupported combination in this function does. The compile-time analyzer
-    // check (rejecting ID4 wherever the listener is statically known to be
-    // TLS) is the primary defense; this runtime guard additionally covers a
-    // hand-written route or direct-RIR caller that selects ID4 on a
-    // connection this runtime accepted over TLS.
+    // unsupported combination in this function does. The `.rut` language has
+    // no TLS-listener declaration for a compile-time check to key off
+    // (`listen` carries only an address and port), so this is a runtime-only
+    // guard; it covers a hand-written route or direct-RIR caller that
+    // selects ID4 on a connection this runtime accepted over TLS.
+    // `inspect_request_policy_body` (Codex sweep-10 review, PR #696) applies
+    // the identical exclusion earlier, in the pre-body admission path, so a
+    // TLS/ID4 request with an incomplete body fails closed immediately
+    // rather than waiting for the rest of the body to arrive; the check
+    // here is retained too, since this function can be reached directly.
     if (conn.tls_active) return false;
     if (inspect_request_policy_body(conn, policy_id) != RequestPolicyBodyState::Complete)
         return false;
@@ -9999,21 +10020,28 @@ inline bool response_policy_suppress_head_admitted(const Connection& conn,
     // field was present, not exactly how many.
     //
     // Deliberately does NOT consult `conn.req_client_keep_alive`/
-    // `conn.req_client_connection_close`: those are the parser's own
-    // (`match_connection`, `src/runtime/http_parser.cc`) running state,
-    // updated once per physical `Connection` field in wire order, and
-    // `keep_alive` is not sticky the way `connection_close` is -- a
-    // `Connection: close` field followed by a separate, later
-    // `Connection: keep-alive` field leaves `connection_close` correctly
-    // `true` but flips `keep_alive` back to `true` too, because the
-    // `keep-alive` branch does not check whether `close` was already seen
-    // on an earlier field. `connection_close_token_seen` has no such
-    // order-dependence: it is this preflight's own aggregate scan across
-    // every physical field (above), so it alone decides ID4 persistence
-    // here regardless of field order (Codex sweep-3 review, PR #696;
-    // reversing the two fields, or combining both tokens into one field,
-    // was already admitted before this fix -- only the split, close-first
-    // order was not).
+    // `conn.req_client_connection_close` for ID4 persistence, even though
+    // `match_connection` (`src/runtime/http_parser.cc`) now makes its
+    // `keep-alive` branch check `!req->connection_close` before setting
+    // `keep_alive`, so a `Connection: close` field followed by a separate,
+    // later `Connection: keep-alive` field no longer flips `keep_alive` back
+    // to `true` there (Codex sweep-3 review, PR #696, fixed the parser
+    // itself, not just this preflight) -- an earlier revision of this
+    // comment cited that now-fixed order-dependence as the reason to avoid
+    // those two fields, which is no longer accurate and must not be read as
+    // a description of current parser behavior (Codex sweep-10 review, PR
+    // #696). The real reason to keep using `connection_close_token_seen`
+    // instead is unrelated to that bug: this preflight already performs its
+    // own per-token scan across every physical `Connection` field above,
+    // because it must independently fail closed on a protected-name
+    // nomination and detect a genuine-upgrade nomination -- checks the
+    // generic parser's cached `req_client_*` fields do not perform. Reusing
+    // that same scan's incidentally-computed close-token result keeps
+    // persistence classification and token validation as one pass over one
+    // set of data, rather than adding a second, separate dependency on the
+    // parser's own aggregate fields (which serve every other consumer, not
+    // only this ID4 shape) that would need to be proven equivalent to this
+    // scan on every future change to either side.
     const bool id4_close_with_te_shape =
         id4_route && connection_count != 0 && connection_close_token_seen;
     const bool id4_default_keep_alive_with_te_shape =
