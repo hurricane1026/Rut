@@ -4803,6 +4803,106 @@ TEST(request_policy, preserve_host_lowercase_wire_and_fail_closed_host) {
         "x-forwarded-proto: HTTPS\r\n\r\n");
 }
 
+// Codex sweep-4 review: `apply_preserve_host_lowercase_request_policy`
+// writes into `conn.send_buf`, which shares `conn.recv_buf`'s exact
+// physical capacity (one `SlicePool::kSliceSize` slice per direction in
+// production). Appending the synthesized `x-forwarded-proto: http\r\n`
+// line (25 bytes, the only net-growing transformation this function
+// performs -- see the comment above `kXfpSynthesisBytes`) must not turn an
+// otherwise-fitting request into a 400 whenever the request also drops or
+// shrinks at least that many bytes elsewhere. A client request one byte
+// under the shared buffer's capacity, missing `X-Forwarded-Proto` but
+// carrying a `Proxy-Connection` header (31 bytes, more than the 25 needed)
+// that gets stripped unconditionally, must still be forwarded with the
+// synthesized header.
+TEST(request_policy, preserve_host_lowercase_xfp_synthesis_fits_near_capacity_with_savings) {
+    static constexpr u16 kPreserveHost =
+        static_cast<u16>(RequestPolicyId::Http11PreserveHostLowercase);
+    static constexpr u32 kCap = 256;
+    Connection conn{};
+    u8 recv[kCap]{};
+    u8 send[kCap]{};
+    sockaddr_in endpoint{};
+    endpoint.sin_family = AF_INET;
+    endpoint.sin_addr.s_addr = htonl(0x7f000001u);
+    endpoint.sin_port = htons(9000);
+
+    conn.reset();
+    conn.recv_slice = recv;
+    conn.send_slice = send;
+    conn.bind_request_receive_buffer(recv, sizeof(recv));
+    conn.send_buf.bind(send, sizeof(send));
+
+    // "Proxy-Connection: keep-alive\r\n" (31 bytes) is dropped unconditionally
+    // (`drop_fixed`), leaving 31 bytes of headroom -- 6 more than the
+    // 25-byte synthesized `x-forwarded-proto` line needs. Padded with an
+    // arbitrary retained header so the request sits at exactly
+    // `sizeof(recv) - 1` bytes, one byte under the shared buffer's capacity.
+    static constexpr char kPrefix[] =
+        "GET / HTTP/1.1\r\nHost: h\r\nProxy-Connection: keep-alive\r\nX-Pad: ";
+    static constexpr char kSuffix[] = "\r\n\r\n";
+    static constexpr u32 kPadLen = kCap - 1 - (sizeof(kPrefix) - 1) - (sizeof(kSuffix) - 1);
+    std::string wire = std::string(kPrefix) + std::string(kPadLen, 'a') + kSuffix;
+    REQUIRE_EQ(wire.size(), kCap - 1);
+    REQUIRE_EQ(conn.recv_buf.write(reinterpret_cast<const u8*>(wire.data()),
+                                   static_cast<u32>(wire.size())),
+               static_cast<u32>(wire.size()));
+    capture_request_metadata(conn);
+
+    REQUIRE(apply_request_policy(conn, endpoint, kPreserveHost));
+    std::string expected = std::string("GET / HTTP/1.1\r\nhost: h\r\nx-pad: ") +
+                           std::string(kPadLen, 'a') + "\r\nx-forwarded-proto: http\r\n\r\n";
+    REQUIRE_EQ(conn.recv_buf.len(), static_cast<u32>(expected.size()));
+    CHECK_EQ(__builtin_memcmp(conn.recv_buf.data(), expected.data(), expected.size()), 0);
+    CHECK_EQ(conn.send_buf.len(), 0u);
+}
+
+// The companion, inherent limit: a request at the same one-byte-under-
+// capacity boundary with nothing at all left to drop (every header is an
+// arbitrary, retained, already-lowercase name) cannot be rewritten to add
+// the mandatory 25-byte `x-forwarded-proto` line without exceeding the one
+// physical buffer shared by `conn.recv_buf`/`conn.send_buf`. This is not a
+// silently-smaller, XFP-specific limit: it is exactly
+// `conn.recv_buf.capacity()`, the same ceiling every other request policy
+// (and the parser's own header/body admission) is bound by -- fully
+// eliminating it would require growing `SlicePool::kSliceSize` itself
+// (which has its own static-asserted layout dependents elsewhere, e.g.
+// `include/rut/runtime/response_body_chain.h`'s `Node`), out of scope
+// here. Fails closed with no partial/garbled bytes written anywhere.
+TEST(request_policy, preserve_host_lowercase_xfp_synthesis_fails_closed_with_no_savings) {
+    static constexpr u16 kPreserveHost =
+        static_cast<u16>(RequestPolicyId::Http11PreserveHostLowercase);
+    static constexpr u32 kCap = 256;
+    Connection conn{};
+    u8 recv[kCap]{};
+    u8 send[kCap]{};
+    sockaddr_in endpoint{};
+    endpoint.sin_family = AF_INET;
+    endpoint.sin_addr.s_addr = htonl(0x7f000001u);
+    endpoint.sin_port = htons(9000);
+
+    conn.reset();
+    conn.recv_slice = recv;
+    conn.send_slice = send;
+    conn.bind_request_receive_buffer(recv, sizeof(recv));
+    conn.send_buf.bind(send, sizeof(send));
+
+    static constexpr char kPrefix[] = "GET / HTTP/1.1\r\nHost: h\r\nX-Pad: ";
+    static constexpr char kSuffix[] = "\r\n\r\n";
+    static constexpr u32 kPadLen = kCap - 1 - (sizeof(kPrefix) - 1) - (sizeof(kSuffix) - 1);
+    std::string wire = std::string(kPrefix) + std::string(kPadLen, 'a') + kSuffix;
+    REQUIRE_EQ(wire.size(), kCap - 1);
+    REQUIRE_EQ(conn.recv_buf.write(reinterpret_cast<const u8*>(wire.data()),
+                                   static_cast<u32>(wire.size())),
+               static_cast<u32>(wire.size()));
+    capture_request_metadata(conn);
+
+    CHECK_FALSE(apply_request_policy(conn, endpoint, kPreserveHost));
+    CHECK_EQ(conn.send_buf.len(), 0u);
+    CHECK_EQ(conn.recv_buf.len(), wire.size());
+    CHECK_EQ(__builtin_memcmp(conn.recv_buf.data(), wire.data(), wire.size()), 0);
+}
+
 TEST(request_policy, content_length_after_host_wait_and_rejection_never_touch_upstream) {
     static constexpr u16 kAfterHost =
         static_cast<u16>(RequestPolicyId::Http11FixedStripContentLengthAfterHost);
