@@ -20,11 +20,26 @@ enum class ForwardFailurePolicyConnection : u8 { Invalid = 0, Request = 1 };
 enum class ForwardResponseBufferingMode : u8 {
     None = 0,
     CompleteContentLength = 1,
+    // Content-Length body released downstream in whole kBoundedResponseBufferBytes
+    // units of raw upstream bytes, like nginx proxy_buffering on; below one unit it
+    // behaves exactly like CompleteContentLength.
+    Bounded = 2,
 };
+
+static constexpr u32 kBoundedResponseBufferBytes = 4096;
 
 inline bool forward_response_buffering_mode_valid(ForwardResponseBufferingMode mode) {
     return mode == ForwardResponseBufferingMode::None ||
-           mode == ForwardResponseBufferingMode::CompleteContentLength;
+           mode == ForwardResponseBufferingMode::CompleteContentLength ||
+           mode == ForwardResponseBufferingMode::Bounded;
+}
+
+// Modes that run the complete-Content-Length response machinery (admission,
+// statuses, explicit close, pipelining, TLS, deadlines).
+inline bool forward_response_buffering_uses_content_length_machinery(
+    ForwardResponseBufferingMode mode) {
+    return mode == ForwardResponseBufferingMode::CompleteContentLength ||
+           mode == ForwardResponseBufferingMode::Bounded;
 }
 
 struct ForwardFailurePolicySpec {

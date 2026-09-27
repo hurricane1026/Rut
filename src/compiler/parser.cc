@@ -2008,12 +2008,16 @@ struct Parser {
                                 FrontendError::UnexpectedToken, span_from(*kw.value()), kw_text);
                         auto value = expect(TokenType::StringLit);
                         if (!value) return core::make_unexpected(value.error());
-                        if (!value.value()->text.eq({"complete_content_length", 23}))
+                        if (value.value()->text.eq({"complete_content_length", 23})) {
+                            stmt.forward_response_buffering =
+                                ForwardResponseBufferingMode::CompleteContentLength;
+                        } else if (value.value()->text.eq({"bounded", 7})) {
+                            stmt.forward_response_buffering = ForwardResponseBufferingMode::Bounded;
+                        } else {
                             return frontend_error(FrontendError::UnsupportedSyntax,
                                                   span_from(*value.value()),
                                                   value.value()->text);
-                        stmt.forward_response_buffering =
-                            ForwardResponseBufferingMode::CompleteContentLength;
+                        }
                         stmt.has_forward_response_buffering = true;
                     } else if (kw_text.eq({"request_policy", 14})) {
                         if (stmt.has_forward_request_policy)
