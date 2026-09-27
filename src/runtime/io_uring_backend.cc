@@ -1661,6 +1661,17 @@ u32 IoUringBackend::wait(IoEvent* events, u32 max_events, Connection* conns, u32
                 // below, which would misreport the poll mask as the send
                 // result.
                 i32 result = cqe->res < 0 ? cqe->res : 0;
+                // Unlike IORING_OP_SEND, sendfile(2) below names the socket by
+                // number, and no kernel reference keeps that number ours: a
+                // POLLOUT that became ready before close_conn's cancel still
+                // lands here after the fd was closed, and the number may by
+                // now belong to another connection. Continue only while this
+                // connection still owns the exact descriptor; its slot cannot
+                // be reused before this terminal CQE (pending_ops holds it).
+                if (result == 0 && ss.remaining > 0 &&
+                    (conns == nullptr || conn_id >= max_conns || conns[conn_id].fd < 0 ||
+                     conns[conn_id].fd != ss.fd))
+                    result = -ECANCELED;
                 if (result == 0 && ss.remaining > 0) {
                     off_t pos = static_cast<off_t>(ss.file_base) + ss.offset;
                     const ssize_t n = ::sendfile(ss.fd, ss.file_fd, &pos, ss.remaining);

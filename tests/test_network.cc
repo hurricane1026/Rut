@@ -9135,6 +9135,71 @@ TEST(connection_base, tls_send_owners_reset_and_share_nonwrapping_tokens) {
     CHECK_EQ(conn.response_read_deadline_send_owner_generation, 0u);
 }
 
+TEST(iouring_send, file_send_continuation_never_writes_to_a_closed_or_reused_fd) {
+    ScopedTlsRawSendLoop guard;
+    REQUIRE(guard.init());
+    IoUringBackend& backend = guard.loop->backend;
+    backend.nop_inject_result = true;
+    const i32 small = 4096;
+    auto connected_pair = [&](i32& client, i32& server) {
+        const i32 listener = socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0);
+        REQUIRE_GE(listener, 0);
+        sockaddr_in addr{};
+        addr.sin_family = AF_INET;
+        addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+        REQUIRE_EQ(bind(listener, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)), 0);
+        REQUIRE_EQ(listen(listener, 1), 0);
+        socklen_t addr_len = sizeof(addr);
+        REQUIRE_EQ(getsockname(listener, reinterpret_cast<sockaddr*>(&addr), &addr_len), 0);
+        client = socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0);
+        REQUIRE_GE(client, 0);
+        REQUIRE_EQ(setsockopt(client, SOL_SOCKET, SO_RCVBUF, &small, sizeof(small)), 0);
+        REQUIRE_EQ(connect(client, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)), 0);
+        server = accept4(listener, nullptr, nullptr, SOCK_NONBLOCK | SOCK_CLOEXEC);
+        REQUIRE_GE(server, 0);
+        REQUIRE_EQ(setsockopt(server, SOL_SOCKET, SO_SNDBUF, &small, sizeof(small)), 0);
+        close(listener);
+    };
+    i32 client_a = -1, server_a = -1, client_b = -1, server_b = -1;
+    connected_pair(client_a, server_a);
+    connected_pair(client_b, server_b);
+
+    constexpr u32 kLen = 4u << 20;
+    const i32 file = memfd_create("stale-fd-file-send", MFD_CLOEXEC);
+    REQUIRE_GE(file, 0);
+    REQUIRE_EQ(ftruncate(file, kLen), 0);
+    constexpr u32 kGen = 7;
+    guard.loop->conns[0].fd = server_a;
+    REQUIRE(backend.add_send_file(server_a, 0, file, 0, kLen, kGen));
+    REQUIRE_GT(backend.send_state[0].remaining, 0u);  // POLLOUT continuation pending
+
+    // close_conn closed the socket, and before the POLLOUT terminal drains the
+    // same descriptor number is reused by another connection's socket.
+    guard.loop->conns[0].fd = -1;
+    REQUIRE_EQ(dup2(server_b, server_a), server_a);
+    guard.sq_head = guard.sq_tail;
+    backend.pending = 0;
+    REQUIRE(guard.push_send_cqe(kGen, POLLOUT));
+    IoEvent ev{};
+    REQUIRE_EQ(backend.wait(&ev, 1, guard.loop->conns, 1), 1u);
+    CHECK_EQ(ev.type, IoEventType::Send);
+    CHECK_EQ(ev.result, -ECANCELED);
+    CHECK_EQ(backend.send_state[0].file_fd, -1);
+    CHECK_EQ(backend.send_state[0].remaining, 0u);
+    // Not one byte of the response reached the connection now owning the fd.
+    u8 probe[64];
+    CHECK_EQ(recv(client_b, probe, sizeof(probe), MSG_DONTWAIT), -1);
+    CHECK_EQ(errno, EAGAIN);
+
+    guard.sq_head = guard.sq_tail;
+    backend.pending = 0;
+    close(file);
+    close(server_a);
+    close(server_b);
+    close(client_a);
+    close(client_b);
+}
+
 TEST(iouring_send, send_file_continues_on_pollout_and_completes_once) {
     ScopedTlsRawSendLoop guard;
     REQUIRE(guard.init());
@@ -9158,6 +9223,8 @@ TEST(iouring_send, send_file_continues_on_pollout_and_completes_once) {
     const i32 server = accept4(listener, nullptr, nullptr, SOCK_NONBLOCK | SOCK_CLOEXEC);
     REQUIRE_GE(server, 0);
     REQUIRE_EQ(setsockopt(server, SOL_SOCKET, SO_SNDBUF, &small, sizeof(small)), 0);
+    // wait() continues a file send only while the connection owns its socket.
+    guard.loop->conns[0].fd = server;
 
     constexpr u32 kLen = 4u << 20;
     const i32 file = memfd_create("send-file-test", MFD_CLOEXEC);
@@ -9293,6 +9360,7 @@ TEST(iouring_send, send_file_continues_on_pollout_and_completes_once) {
     }
 
     close(file);
+    guard.loop->conns[0].fd = -1;
     close(server);
     close(client);
     close(listener);
