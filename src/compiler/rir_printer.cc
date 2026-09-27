@@ -1029,6 +1029,58 @@ static const char* response_policy_head_mode_name(ResponsePolicyHeadMode mode) {
     return "invalid";
 }
 
+// Codex sweep-7 review (PR #698): `header_order`, `header_names`,
+// `connection_header`, and `status_reason` are the Envoy H1 profile's layout
+// fields (only meaningful together with `header_order == Upstream`; see the
+// comment on the enums in include/rut/common/response_policy.h). `date` and
+// `server` are preserved by lower_rir alongside them
+// (src/compiler/lower_rir.cc) and also vary between the two profiles
+// (`Current`/unset-server default vs. `PreserveOrCurrent`/a configured
+// server), so a synthesized and an upstream-order policy that happen to
+// share a `head_mode` must still print differently.
+static const char* response_policy_header_order_name(ResponsePolicyHeaderOrder order) {
+    return order == ResponsePolicyHeaderOrder::Upstream ? "upstream" : "synthesized";
+}
+
+static const char* response_policy_header_names_name(ResponsePolicyHeaderNames names) {
+    return names == ResponsePolicyHeaderNames::Lowercase ? "lowercase" : "preserve";
+}
+
+static const char* response_policy_connection_header_name(
+    ResponsePolicyConnectionHeader connection_header) {
+    return connection_header == ResponsePolicyConnectionHeader::CloseOnly ? "close_only" : "always";
+}
+
+static const char* response_policy_status_reason_name(ResponsePolicyStatusReason status_reason) {
+    return status_reason == ResponsePolicyStatusReason::Canonical ? "canonical" : "upstream";
+}
+
+static const char* response_policy_date_name(ResponsePolicyDate date) {
+    switch (date) {
+        case ResponsePolicyDate::Current:
+            return "current";
+        case ResponsePolicyDate::PreserveOrCurrent:
+            return "preserve_or_current";
+        case ResponsePolicyDate::Invalid:
+            break;
+    }
+    return "invalid";
+}
+
+// Codex round-13 review (PR #698) fixed the same crash class for
+// `failure_policies` (see `printable_failure_policy_table` below): a
+// hand-built or verifier-rejected module can carry a forged response-policy
+// table (an out-of-range count, or a non-owning `server` view like
+// `{nullptr, 1}`) that would otherwise crash `print_quoted_str` once this
+// section starts printing `server`. Mirror that safety contract here.
+static bool printable_response_policy_table(const Module& mod) {
+    if (mod.response_policy_count > kMaxResponsePolicies) return false;
+    for (u32 i = 0; i < mod.response_policy_count; i++) {
+        if (!response_policy_spec_valid(mod.response_policies[i])) return false;
+    }
+    return true;
+}
+
 static const char* failure_policy_head_mode_name(FailurePolicyHeadMode mode) {
     switch (mode) {
         case FailurePolicyHeadMode::Reject:
@@ -1162,16 +1214,35 @@ static void print_module_impl(PrintBuf& buf, const Module& mod, bool internal_pr
     }
     if (mod.response_policy_count != 0) {
         if (mod.func_count != 0) buf.newline();
-        buf.put_cstr("response_policies: ");
-        buf.put_u32(mod.response_policy_count);
-        buf.newline();
-        for (u32 i = 0; i < mod.response_policy_count; i++) {
-            const auto& policy = mod.response_policies[i];
-            buf.put_cstr("  response_policy#");
-            buf.put_u32(i + 1);
-            buf.put_cstr(": head_mode=");
-            buf.put_cstr(response_policy_head_mode_name(policy.head_mode));
+        if (!printable_response_policy_table(mod)) {
+            // Forged metadata must remain visible without using its count as
+            // an array bound or touching any possibly-null string storage.
+            buf.put_cstr("response_policy_table: <invalid>");
             buf.newline();
+        } else {
+            buf.put_cstr("response_policies: ");
+            buf.put_u32(mod.response_policy_count);
+            buf.newline();
+            for (u32 i = 0; i < mod.response_policy_count; i++) {
+                const auto& policy = mod.response_policies[i];
+                buf.put_cstr("  response_policy#");
+                buf.put_u32(i + 1);
+                buf.put_cstr(": head_mode=");
+                buf.put_cstr(response_policy_head_mode_name(policy.head_mode));
+                buf.put_cstr(", header_order=");
+                buf.put_cstr(response_policy_header_order_name(policy.header_order));
+                buf.put_cstr(", header_names=");
+                buf.put_cstr(response_policy_header_names_name(policy.header_names));
+                buf.put_cstr(", connection_header=");
+                buf.put_cstr(response_policy_connection_header_name(policy.connection_header));
+                buf.put_cstr(", status_reason=");
+                buf.put_cstr(response_policy_status_reason_name(policy.status_reason));
+                buf.put_cstr(", date=");
+                buf.put_cstr(response_policy_date_name(policy.date));
+                buf.put_cstr(", server=");
+                print_quoted_str(buf, policy.server);
+                buf.newline();
+            }
         }
     }
     if (mod.failure_policy_count != 0) {

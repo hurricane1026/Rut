@@ -33924,8 +33924,68 @@ TEST(response_policy, head_mode_is_owned_deduplicated_and_printed) {
     rir::print_module(buf, module);
     static constexpr char expected[] =
         "response_policies: 2\n"
-        "  response_policy#1: head_mode=reject\n"
-        "  response_policy#2: head_mode=suppress_body\n";
+        "  response_policy#1: head_mode=reject, header_order=synthesized, "
+        "header_names=preserve, connection_header=always, status_reason=upstream, "
+        "date=current, server=\"server\"\n"
+        "  response_policy#2: head_mode=suppress_body, header_order=synthesized, "
+        "header_names=preserve, connection_header=always, status_reason=upstream, "
+        "date=current, server=\"server\"\n";
+    CHECK_FALSE(buf.overflow);
+    CHECK_EQ(buf.len, static_cast<u32>(sizeof(expected) - 1));
+    CHECK(__builtin_memcmp(buf.data, expected, sizeof(expected) - 1) == 0);
+}
+
+// Codex sweep-7 review (PR #698): before this fix, `print_module_impl`
+// rendered every response policy as just `head_mode=...`, so a synthesized
+// policy and an Envoy H1 `header_order: "upstream"` policy sharing the same
+// `head_mode` produced byte-identical dumps even though they serialize
+// different runtime bytes and admit a different status/header domain
+// (`build_strict_response_headers` dispatches on `header_order` in
+// include/rut/runtime/callbacks_impl.h). Assert the two profiles now print
+// distinctly via the layout fields lower_rir preserves
+// (src/compiler/lower_rir.cc): `header_order`, `header_names`,
+// `connection_header`, `status_reason`, `date`, and `server`.
+TEST(response_policy, upstream_order_and_synthesized_prints_differ_with_same_head_mode) {
+    char synth_server[] = "server";
+    ForwardResponsePolicySpec synthesized{};
+    synthesized.version = ResponsePolicyVersion::Http11;
+    synthesized.framing = ResponsePolicyFraming::ContentLength;
+    synthesized.connection = ResponsePolicyConnection::Request;
+    synthesized.date = ResponsePolicyDate::Current;
+    synthesized.head_mode = ResponsePolicyHeadMode::Reject;
+    synthesized.server = {synth_server, 6};
+    CHECK(response_policy_spec_valid(synthesized));
+
+    char envoy_server[] = "envoy";
+    ForwardResponsePolicySpec upstream_order{};
+    upstream_order.version = ResponsePolicyVersion::Http11;
+    upstream_order.framing = ResponsePolicyFraming::ContentLength;
+    upstream_order.connection = ResponsePolicyConnection::Request;
+    upstream_order.head_mode = ResponsePolicyHeadMode::Reject;
+    upstream_order.header_order = ResponsePolicyHeaderOrder::Upstream;
+    upstream_order.header_names = ResponsePolicyHeaderNames::Lowercase;
+    upstream_order.connection_header = ResponsePolicyConnectionHeader::CloseOnly;
+    upstream_order.status_reason = ResponsePolicyStatusReason::Canonical;
+    upstream_order.date = ResponsePolicyDate::PreserveOrCurrent;
+    upstream_order.server = {envoy_server, 5};
+    CHECK(response_policy_spec_valid(upstream_order));
+
+    rir::Module module{};
+    module.response_policy_count = 2;
+    module.response_policies[0] = synthesized;
+    module.response_policies[1] = upstream_order;
+    char output[1024];
+    rir::PrintBuf buf;
+    buf.init(output, sizeof(output), -1);
+    rir::print_module(buf, module);
+    static constexpr char expected[] =
+        "response_policies: 2\n"
+        "  response_policy#1: head_mode=reject, header_order=synthesized, "
+        "header_names=preserve, connection_header=always, status_reason=upstream, "
+        "date=current, server=\"server\"\n"
+        "  response_policy#2: head_mode=reject, header_order=upstream, "
+        "header_names=lowercase, connection_header=close_only, status_reason=canonical, "
+        "date=preserve_or_current, server=\"envoy\"\n";
     CHECK_FALSE(buf.overflow);
     CHECK_EQ(buf.len, static_cast<u32>(sizeof(expected) - 1));
     CHECK(__builtin_memcmp(buf.data, expected, sizeof(expected) - 1) == 0);
