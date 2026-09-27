@@ -2509,6 +2509,54 @@ TEST(response_policy, target_transform_bundle_suppress_body_fails_before_materia
     }
 }
 
+// Codex sweep-2 review: `host: "preserve"` (ID4) is ordinary-forward-only --
+// `src/compiler/analyze.cc` rejects `request_policy: { host: "preserve" }`
+// combined with a target transform at compile time for ordinary Rut source
+// -- but a direct-RIR/JIT-constructed outcome (this test) bypasses that
+// analyzer entirely. The runtime preflight in `handle_jit_outcome`
+// (`include/rut/runtime/callbacks_impl.h`, the `target_transform_recorded`
+// branch) must enforce the same exclusion before
+// `materialize_request_target_transform` ever runs, failing closed with the
+// same status other unsupported target-transform combinations use and no
+// upstream contact.
+TEST(response_policy, target_transform_with_id4_request_policy_fails_before_materialization) {
+    SmallLoop loop;
+    loop.setup();
+    RouteConfig cfg{};
+    REQUIRE(cfg.add_upstream("backend", 0x7F000001, 8080).has_value());
+    char strip[] = "/api/";
+    char replace[] = "/v1/";
+    REQUIRE_EQ(cfg.add_target_transform({{strip, 5}, {replace, 4}}), 1u);
+
+    const char request[] = "GET /api/x?tag=a%2Fb HTTP/1.1\r\nHost: client\r\n\r\n";
+    const u32 request_len = sizeof(request) - 1;
+    auto* conn = setup_target_transform_request(loop, cfg, request, request_len);
+    REQUIRE(conn != nullptr);
+    const u32 before_len = conn->recv_buf.len();
+    u8 before[SmallLoop::kBufSize];
+    __builtin_memcpy(before, conn->recv_buf.data(), before_len);
+
+    JitDispatchOutcome outcome{};
+    outcome.kind = JitDispatchOutcome::Kind::Forward;
+    outcome.upstream_id = 0;
+    outcome.request_policy_id = static_cast<u16>(RequestPolicyId::Http11PreserveHostLowercase);
+    loop.backend.clear_ops();
+    handle_jit_outcome<SmallLoop>(&loop, *conn, outcome, nullptr, true);
+
+    CHECK_EQ(conn->resp_status, 400u);
+    CHECK_EQ(conn->upstream_fd, -1);
+    CHECK_FALSE(conn->upstream_slot_held);
+    CHECK_EQ(loop.backend.count_ops(MockOp::Connect), 0u);
+    CHECK_EQ(loop.backend.count_ops(MockOp::Send), 1u);
+    CHECK_EQ(conn->recv_buf.len(), before_len);
+    CHECK_EQ(__builtin_memcmp(conn->recv_buf.data(), before, before_len), 0);
+    CHECK(conn->target_transform_recorded);
+    CHECK_EQ(conn->target_transform_id, 1u);
+    CHECK_FALSE(conn->req_path_overridden);
+    CHECK_FALSE(conn->upstream_send_armed);
+    loop.free_conn(*conn);
+}
+
 TEST(response_policy, failure_suppress_body_fails_closed_before_wait_rewrite_or_transform) {
     SmallLoop loop;
     loop.setup();
@@ -4405,6 +4453,34 @@ TEST(request_policy, preserve_host_lowercase_wire_and_fail_closed_host) {
     require_wire(
         "GET /x-custom-dup HTTP/1.1\r\nhost: client.example\r\nx-custom: one\r\n"
         "x-custom: two\r\nx-forwarded-proto: http\r\n\r\n");
+
+    // Codex sweep-2 review: a duplicated inline-slot name that the client's
+    // `Connection` value also nominates must not be rejected before the
+    // nomination can drop it -- Envoy coalesces the inline values and then
+    // removes the nominated header, so no coalescing divergence ever
+    // reaches upstream either way. Both physical `X-Request-Id` fields are
+    // dropped, and `Connection` itself never reaches the wire.
+    prepare(
+        "GET /request-id-dup-nominated HTTP/1.1\r\n"
+        "Host: client.example\r\n"
+        "Connection: x-request-id\r\n"
+        "X-Request-Id: one\r\n"
+        "X-Request-Id: two\r\n\r\n");
+    REQUIRE(apply_request_policy(conn, endpoint, kPreserveHost));
+    require_wire(
+        "GET /request-id-dup-nominated HTTP/1.1\r\nhost: client.example\r\n"
+        "x-forwarded-proto: http\r\n\r\n");
+
+    // Without the nomination, the duplicate still fails closed exactly as
+    // before -- the deferred check only matters once the duplicate is
+    // actually going to be dropped.
+    prepare(
+        "GET /request-id-dup-plain HTTP/1.1\r\n"
+        "Host: client.example\r\n"
+        "X-Request-Id: one\r\n"
+        "X-Request-Id: two\r\n\r\n");
+    CHECK_FALSE(apply_request_policy(conn, endpoint, kPreserveHost));
+    CHECK_EQ(conn.send_buf.len(), 0u);
 
     // Codex round-13 review: `Server`, `Grpc-Status`, `Grpc-Message`, and
     // `X-Envoy-Upstream-Service-Time` are deliberately absent from the
