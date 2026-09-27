@@ -460,18 +460,34 @@ are recorded from the pinned Envoy build, not assumed.
 **Routing**
 
 - `prefix` match is a plain string prefix. `prefix: "/api"` matches `/apifoo`.
-  Rut's route trie is segment-aware, so only `prefix: "/"` has a
-  segment-equivalent meaning today. This increment lowers `prefix: "/"` and
-  rejects every other prefix outright, including ones ending in `/`:
-  `RouteTrie::tokenize_segments` (`src/runtime/route_trie.cc`) drops trailing
-  empty segments, so Rut treats `/api/` and `/api` as equivalent while
-  Envoy's byte-prefix matcher does not — lowering `/api/` as a segment match
-  would broaden the route. Slash-terminated prefixes therefore stay blocked
-  even once ordered-list lowering (PR 8 / PR #695) lands, unless a future
-  change adds an explicit byte-level boundary check; all other non-root
-  prefixes remain `BLOCKED_BY_RUT` until Rut offers a raw-prefix match
-  (docs/envoy-compatibility.md, "Raw (non-segment) `prefix` not ending in
-  `/`").
+  Rut's route trie is segment-aware, so only `prefix: "/"` had a
+  segment-equivalent meaning before ordered-list lowering (PR 8 / PR #695)
+  landed. Now every prefix ending in `/` (e.g. `"/api/"`) lowers too:
+  `parse_route_match` (`src/envoy/parser.cc`) accepts `"/"` or any prefix
+  that both starts and ends with `/`, and `build_lowering_plan`
+  (`src/envoy/converter.cc`) strips the trailing slash to get the node's own
+  text, then guards that node's own bare literal (e.g. `/api`, which Envoy's
+  raw byte-prefix match for `/api/` never matches on its own) with a
+  `req.pathOnly` comparison instead of folding it into the segment match —
+  see the algorithm doc comment above `build_node_plan`. This is a
+  behavioral reconciliation, not a byte-exact reproduction of Envoy's raw
+  byte-prefix semantics: `RouteTrie::tokenize_segments`
+  (`src/runtime/route_trie.cc`) drops empty path segments when selecting
+  which node a request lands on, so a request whose raw path contains an
+  injected empty segment (e.g. `/api//x`) can still alias into a declared
+  `"/api/"` node and forward through its terminal prefix arm even though
+  Envoy's literal, unnormalized prefix match would 404 it — tracked as its
+  own `NOT_IMPLEMENTED` row (docs/envoy-compatibility.md, "Path
+  normalization"), not a lowering rejection. A raw (non-segment) prefix not
+  ending in `/` (e.g. `"/api"`) is still rejected outright by the parser —
+  Rut's route trie has no equivalent for a plain byte-prefix match — and
+  stays `BLOCKED_BY_RUT` until Rut offers one (docs/envoy-compatibility.md,
+  "Raw (non-segment) `prefix` not ending in `/`"). A lone `prefix: "/api/"`
+  declared with no catch-all still fails closed for an unrelated reason:
+  the node's own bare literal `/api` then has no Envoy route at all, and
+  Rut's `route exact` can't stand in for that no-route 404 without excluding
+  TRACE/CONNECT (see "Increment 4" below and docs/envoy-compatibility.md,
+  "A node's own literal path...").
 - Routes are evaluated in list order, first match wins; Rut's own route trie
   instead selects the longest matching declared prefix. Rather than reject
   every list where these two orders could disagree, the converter reconciles
@@ -1109,11 +1125,18 @@ alone is `PARTIAL` at most.
    first-match arms in source order — not by proving that list order and
    Rut's longest-prefix trie agree; see "Routing" above), per-method rows,
    `direct_response`, `redirect`. `prefix` ending in `/` (e.g. `"/api/"`) is
-   modeled by the parser but stays deferred behind an explicit byte-boundary
-   capability at lowering — `BLOCKED_BY_RUT` until Rut's route trie gains a
-   byte-level boundary check that distinguishes a slash-terminated prefix
-   from its unterminated form; see "Routing" above and
-   docs/envoy-compatibility.md.
+   modeled by the parser and lowered too (PR 8 / PR #695: stripped to its own
+   node, guarded at the node's own bare literal with a `req.pathOnly`
+   comparison) — see "Routing" above and docs/envoy-compatibility.md. This is
+   not byte-exact with Envoy's raw byte-prefix match (Rut's route trie
+   normalizes empty path segments when selecting a node, Envoy's literal
+   prefix comparison does not; tracked as its own `NOT_IMPLEMENTED` "Path
+   normalization" row), and a lone `prefix: "/api/"` declared with no
+   catch-all still fails closed (`BLOCKED_BY_RUT`: the node's own literal
+   `/api` then has no Envoy route, and `route exact` can't answer every
+   method's 404 for it). A raw (non-segment) prefix not ending in `/` (e.g.
+   `"/api"`) is unaffected and stays `BLOCKED_BY_RUT` — Rut's route trie has
+   no equivalent for a plain byte-prefix match.
 5. Header mutation: `request_headers_to_add/remove`,
    `response_headers_to_add/remove` at route and virtual-host level with
    Envoy's append-vs-overwrite semantics, `prefix_rewrite`,
