@@ -117,8 +117,15 @@ struct VirtualHost {
     // `domains` is exactly ["*"] in this increment; the span pins the array.
     Span domains_span{};
     // Order preserved from the source array; Envoy selects the first
-    // matching route. Lowering an ordered list (beyond the single-route
-    // shape) is not yet implemented (PR 8).
+    // matching route. `build_lowering_plan` (src/envoy/converter.cc) lowers
+    // the full ordered list by construction (PR 8 / PR #695): for each
+    // declared node it builds a nested first-match if/else arm chain that
+    // reproduces Envoy's declaration-order semantics, not just the
+    // single-route shape (see `tests/test_envoy_convert.cc`'s
+    // `golden_routes_*` and brute-force equivalence tests). Some ordered
+    // lists still fail closed for reasons unrelated to ordering (e.g. a lone
+    // prefix with no catch-all, or the compiler frontend's lexer token
+    // budget); see docs/envoy-converter.md, "Routing".
     FixedVec<Route, kMaxEnvoyRoutes> routes{};
     Span span{};
 };
