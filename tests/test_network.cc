@@ -4446,6 +4446,32 @@ TEST(request_policy, preserve_host_lowercase_wire_and_fail_closed_host) {
         "GET /connection-multi HTTP/1.1\r\nhost: client.example\r\nte: trailers\r\n"
         "x-forwarded-proto: http\r\n\r\n");
 
+    // Codex sweep-1 review: `kMaxHeaders` (64) bounds the number of physical
+    // header *fields* this parser stores, not the number of comma-separated
+    // *tokens* a single `Connection` field's value can carry. A single
+    // field nominating 100 harmless names plus a genuine `X-Foo` nomination
+    // must not hit a fixed token-count cap: the request is admitted, the
+    // 100 harmless nominations match no real header and are simply inert,
+    // `X-Foo` is dropped along with its own field, and `Connection` itself
+    // never reaches the wire (hop-by-hop, always stripped).
+    {
+        std::string many_tokens;
+        for (int i = 0; i < 100; i++) {
+            if (i != 0) many_tokens += ",";
+            many_tokens += "safe" + std::to_string(i);
+        }
+        const std::string many_wire =
+            "GET /many-tokens HTTP/1.1\r\nHost: client.example\r\n"
+            "Connection: " +
+            many_tokens + ",X-Foo\r\nX-Foo: 1\r\n\r\n";
+        REQUIRE(many_wire.size() < sizeof(recv));
+        prepare(many_wire.c_str());
+        REQUIRE(apply_request_policy(conn, endpoint, kPreserveHost));
+        require_wire(
+            "GET /many-tokens HTTP/1.1\r\nhost: client.example\r\n"
+            "x-forwarded-proto: http\r\n\r\n");
+    }
+
     // Client-supplied `x-envoy-*` headers Envoy's own
     // `ConnectionManagerUtility::cleanInternalHeaders` removes unconditionally
     // for a non-internal, non-edge external request (the fixed shape this
