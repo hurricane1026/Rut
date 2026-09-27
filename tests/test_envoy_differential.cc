@@ -190,6 +190,109 @@ int run_and_wait(const std::vector<std::string>& argv, int timeout_ms) {
     }
 }
 
+// Like run_and_wait(), but captures the child's combined stdout+stderr into
+// `*output` instead of discarding it, and writes the exit code into
+// `*exit_code`. Sweep-3 review, "Preserve cleanup state when docker rm
+// fails": distinguishing "container already gone" from a genuine removal
+// failure requires reading docker's own error text (e.g. "No such
+// container"), which run_and_wait()'s `/dev/null` redirect throws away
+// entirely. Drains the pipe via poll() (never a blocking read) so an
+// unresponsive child that never closes its output cannot hang this call
+// past `timeout_ms`, matching run_and_wait()'s own timeout contract.
+// Returns false (leaving `*output`/`*exit_code` unspecified) on a
+// fork/pipe failure or if the child had to be SIGKILLed after
+// `timeout_ms`; true otherwise, including when the child exited nonzero
+// (`*exit_code` reports that).
+bool run_and_capture(const std::vector<std::string>& argv,
+                     int timeout_ms,
+                     std::string* output,
+                     int* exit_code) {
+    int pipe_fds[2];
+    if (pipe(pipe_fds) != 0) return false;
+    const std::vector<char*> args = build_argv(argv);
+    const pid_t child = fork();
+    if (child < 0) {
+        close(pipe_fds[0]);
+        close(pipe_fds[1]);
+        return false;
+    }
+    if (child == 0) {
+        close(pipe_fds[0]);
+        dup2(pipe_fds[1], STDOUT_FILENO);
+        dup2(pipe_fds[1], STDERR_FILENO);
+        if (pipe_fds[1] > STDERR_FILENO) close(pipe_fds[1]);
+        const int null_fd = open("/dev/null", O_RDONLY);
+        if (null_fd >= 0) {
+            dup2(null_fd, STDIN_FILENO);
+            if (null_fd > STDERR_FILENO) close(null_fd);
+        }
+        execvp(args[0], args.data());
+        _exit(127);
+    }
+    close(pipe_fds[1]);
+    output->clear();
+    const int64_t deadline_ms =
+        static_cast<int64_t>(timeout_ms) +
+        static_cast<int64_t>(std::chrono::duration_cast<std::chrono::milliseconds>(
+                                 std::chrono::steady_clock::now().time_since_epoch())
+                                 .count());
+    char buf[4096];
+    bool child_reaped = false;
+    int status = 0;
+    for (;;) {
+        pollfd pfd{pipe_fds[0], POLLIN, 0};
+        if (poll(&pfd, 1, 20) > 0 && (pfd.revents & (POLLIN | POLLHUP)) != 0) {
+            const ssize_t n = read(pipe_fds[0], buf, sizeof(buf));
+            if (n > 0) output->append(buf, static_cast<size_t>(n));
+        }
+        if (!child_reaped) {
+            const pid_t waited = waitpid(child, &status, WNOHANG);
+            if (waited == child || (waited < 0 && errno != EINTR)) child_reaped = true;
+        }
+        if (child_reaped) break;
+        const int64_t now_ms =
+            static_cast<int64_t>(std::chrono::duration_cast<std::chrono::milliseconds>(
+                                     std::chrono::steady_clock::now().time_since_epoch())
+                                     .count());
+        if (now_ms >= deadline_ms) {
+            kill(child, SIGKILL);
+            while (waitpid(child, &status, 0) < 0 && errno == EINTR) {
+            }
+            close(pipe_fds[0]);
+            return false;
+        }
+    }
+    // The child has exited (its copy of the pipe's write end is closed by
+    // the kernel), so a blocking drain here is guaranteed to hit EOF
+    // promptly rather than hang.
+    for (;;) {
+        const ssize_t n = read(pipe_fds[0], buf, sizeof(buf));
+        if (n > 0) {
+            output->append(buf, static_cast<size_t>(n));
+            continue;
+        }
+        break;
+    }
+    close(pipe_fds[0]);
+    *exit_code = WIFEXITED(status) ? WEXITSTATUS(status) : -1;
+    return true;
+}
+
+// Sweep-3 review, "Stub Docker in the always-on self-test": every docker
+// invocation this harness's cleanup paths make goes through this indirection
+// instead of a literal "docker" argv[0], so a self-test can point
+// RUT_ENVOY_DOCKER_BIN at an injected stub (e.g. `/bin/true`, or a small
+// counting/behavior script) instead of ever invoking the real Docker CLI --
+// AGENTS.md's "tests must not depend on the host having Docker installed"
+// contract for the always-on `--self-test` suite. Unset or empty: the real
+// "docker" (resolved via PATH, exactly as before). Never used for `docker
+// run` (EnvoyInstance::launch()): no self-test calls launch() itself, only
+// stop(), so only cleanup needs to be interceptable.
+std::string docker_binary() {
+    const char* override_bin = getenv("RUT_ENVOY_DOCKER_BIN");
+    return (override_bin != nullptr && override_bin[0] != '\0') ? override_bin : "docker";
+}
+
 bool command_on_path(const char* name) {
     const char* path_env = getenv("PATH");
     if (path_env == nullptr) return false;
@@ -1042,24 +1145,47 @@ public:
     // accept() has already run) can coincide with "accepted_pending_ == 0"
     // (implying registration has already finished) for the SAME
     // connection: the counter covers exactly the handoff gap the listener
-    // poll cannot see into. A connection queued after this wait already
-    // started is still caught, with no separate generation/epoch counter
-    // needed: this loop re-polls both signals every 5ms until `timeout_ms`
-    // elapses, so a connection that arrives mid-wait is observed on
-    // whichever subsequent iteration follows its arrival, exactly like one
-    // that was already pending when the wait began.
+    // poll cannot see into.
+    //
+    // Sweep-3 review, "Require a stable idle observation before returning"
+    // (P1): fresh evidence beyond the above is that the listener poll()
+    // and the `conn_mu_`-protected counter check just below are themselves
+    // two SEPARATE, non-atomic operations: a connection can become
+    // readable in the gap between this iteration's poll() returning "not
+    // readable" and this thread then acquiring `conn_mu_`, while
+    // accept_loop()'s own blocked poll(-1) has not yet been scheduled to
+    // even react to it (let alone acquire the mutex to bump
+    // `accepted_pending_`/`accept_epoch_`). This single iteration then
+    // observes both signals empty and wrongly concludes idle, even though
+    // a connection is now sitting in the backlog. The single-sample
+    // snapshot below (snapshot_idle()) still has this gap; what closes it
+    // is requiring the SAME idle conclusion TWICE, `kIdleSettleMs` apart,
+    // with `accept_epoch_` unchanged in between. `accept_epoch_` is
+    // incremented the INSTANT accept_loop() reacts to a connection
+    // (strictly before it calls accept(), i.e. before the backlog can ever
+    // look empty because of it), so for any connection that arrives before
+    // the second snapshot's poll() call, at least one of three things is
+    // guaranteed true by the time that snapshot runs: the listener still
+    // shows readable (accept_loop() has not consumed it yet), or
+    // `accept_epoch_` has advanced (accept_loop() reacted to it, whether
+    // or not it has finished registering it yet), or `accepted_pending_`/
+    // `active_fds_` directly show the in-progress registration -- there is
+    // no interleaving that leaves the second snapshot ignorant of a
+    // connection that arrived after the first. A connection that arrives
+    // only after BOTH snapshots is unaffected by any of this: the caller
+    // only reaches this function after the proxy under test has already
+    // been confirmed stopped, so nothing new is expected to arrive once
+    // two consecutive stable-idle snapshots have passed.
     bool wait_idle(int timeout_ms) {
+        constexpr int kIdleSettleMs = 20;
         const int64_t deadline = now_ms() + timeout_ms;
         for (;;) {
-            bool pending_on_listener = false;
-            const int fd = listen_fd_;
-            if (fd >= 0) {
-                pollfd pfd{fd, POLLIN, 0};
-                if (poll(&pfd, 1, 0) > 0 && (pfd.revents & POLLIN) != 0) pending_on_listener = true;
-            }
-            if (!pending_on_listener) {
-                std::lock_guard<std::mutex> lock(conn_mu_);
-                if (accepted_pending_ == 0 && active_fds_.empty()) return true;
+            int epoch_first = 0;
+            if (snapshot_idle(&epoch_first)) {
+                struct timespec settle{0, static_cast<long>(kIdleSettleMs) * 1'000'000};
+                nanosleep(&settle, nullptr);
+                int epoch_second = 0;
+                if (snapshot_idle(&epoch_second) && epoch_second == epoch_first) return true;
             }
             if (now_ms() >= deadline) return false;
             struct timespec ts{0, 5'000'000};
@@ -1075,6 +1201,20 @@ public:
     // still correctly treats the connection as outstanding throughout it.
     // Always 0 in production use.
     void set_test_post_accept_delay_ms(int ms) { test_post_accept_delay_ms_ = ms; }
+
+    // Test-only hook for self_test_wait_idle_requires_stable_observation():
+    // when nonzero, accept_loop() sleeps this many milliseconds after its
+    // poll() wakes with the listener readable but BEFORE it acquires
+    // `conn_mu_` to bump `accept_epoch_`/`accepted_pending_` (i.e. before
+    // it has reacted to the connection at all), deliberately widening the
+    // sweep-3 review's pre-mutex gap. Combined with
+    // set_test_post_accept_delay_ms() above, this lets a test drive the
+    // WHOLE accept-and-register cycle for a single connection across many
+    // multiples of wait_idle()'s 5ms retry cadence and 20ms settle
+    // interval, so the test can assert wait_idle() waits out the entire
+    // widened window rather than returning early on some intermediate
+    // sample. Always 0 in production use.
+    void set_test_pre_mutex_delay_ms(int ms) { test_pre_mutex_delay_ms_ = ms; }
 
     // Idempotent: safe to call more than once (the destructor calls it again
     // after an explicit stop()).
@@ -1128,6 +1268,26 @@ private:
         close(fd);
     }
 
+    // Single instantaneous "is everything idle right now" reading: whether
+    // the listener is not readable AND `accepted_pending_ == 0` AND
+    // `active_fds_` is empty, plus the current `accept_epoch_` value for
+    // the caller to compare against a later snapshot. Always writes
+    // `*epoch`, regardless of the returned idle verdict. See wait_idle()'s
+    // comment for why a single snapshot_idle() call is not, by itself,
+    // sufficient proof of idleness (sweep-3 review, "Require a stable idle
+    // observation before returning").
+    bool snapshot_idle(int* epoch) {
+        bool pending_on_listener = false;
+        const int fd = listen_fd_;
+        if (fd >= 0) {
+            pollfd pfd{fd, POLLIN, 0};
+            if (poll(&pfd, 1, 0) > 0 && (pfd.revents & POLLIN) != 0) pending_on_listener = true;
+        }
+        std::lock_guard<std::mutex> lock(conn_mu_);
+        *epoch = accept_epoch_;
+        return !pending_on_listener && accepted_pending_ == 0 && active_fds_.empty();
+    }
+
     // Round-20 review, "Synchronize the accepted-connection handoff before
     // returning idle": polls the listener explicitly, rather than calling
     // the blocking accept() directly, so `accepted_pending_` can be
@@ -1146,9 +1306,21 @@ private:
                 if (stopping_.load()) return;
                 continue;
             }
+            // Sweep-3 review, "Require a stable idle observation before
+            // returning": test-only, always 0 in production. Widens the
+            // gap between this thread reacting to the listener becoming
+            // readable and it acquiring `conn_mu_` just below to bump
+            // `accept_epoch_`/`accepted_pending_` -- see wait_idle()'s
+            // comment and set_test_pre_mutex_delay_ms()'s.
+            if (test_pre_mutex_delay_ms_ > 0) {
+                struct timespec ts{test_pre_mutex_delay_ms_ / 1000,
+                                   static_cast<long>(test_pre_mutex_delay_ms_ % 1000) * 1'000'000};
+                nanosleep(&ts, nullptr);
+            }
             {
                 std::lock_guard<std::mutex> lock(conn_mu_);
                 accepted_pending_++;
+                accept_epoch_++;
             }
             const int fd = accept(listen_fd_, nullptr, nullptr);
             if (fd < 0) {
@@ -1275,8 +1447,18 @@ private:
     // queued) but has not yet finished registering into `active_fds_`.
     // Guarded by `conn_mu_`; see wait_idle()'s round-20 review comment.
     int accepted_pending_ = 0;
+    // Incremented, under `conn_mu_`, every time accept_loop()'s poll()
+    // wakes with the listener readable, strictly BEFORE it calls accept()
+    // -- i.e. once per connection accept_loop() has REACTED to, regardless
+    // of how quickly or slowly it then processes it. Guarded by
+    // `conn_mu_`; see wait_idle()'s sweep-3 review comment for why
+    // observing this unchanged across two snapshots is what actually
+    // closes the residual race accepted_pending_ alone cannot.
+    int accept_epoch_ = 0;
     // Test-only; see set_test_post_accept_delay_ms()'s comment.
     int test_post_accept_delay_ms_ = 0;
+    // Test-only; see set_test_pre_mutex_delay_ms()'s comment.
+    int test_pre_mutex_delay_ms_ = 0;
     std::string default_reply_ =
         "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 5\r\n\r\nhello";
 };
@@ -1290,6 +1472,32 @@ private:
 // (round-15 review, "Skip Docker teardown for instances that were never
 // launched").
 int g_docker_rm_invocations = 0;
+
+// Runs `docker rm -f <name>` (via docker_binary(), so a self-test can
+// redirect this away from the real Docker CLI) and decides whether it is
+// now safe to consider the container gone. Sweep-3 review, "Preserve
+// cleanup state when docker rm fails": a nonzero exit here does not always
+// mean the container is still there -- `docker rm -f` on a container that
+// is already gone (e.g. `docker run --rm` already cleaned it up, or a
+// previous call's teardown already removed it) also exits nonzero, with
+// "No such container" in its output. Any OTHER failure (the daemon
+// temporarily unavailable, a lost connection, the CLI missing) genuinely
+// leaves the container behind, so counts as failure here: the caller must
+// keep `launched` set so the next stop() call (or the destructor's
+// automatic one) retries, rather than silently abandoning a live container
+// and the host-network listener it holds. Always increments
+// `g_docker_rm_invocations` exactly once per call, regardless of outcome
+// (self-tests assert on this counter).
+bool docker_rm_force(const std::string& name) {
+    g_docker_rm_invocations++;
+    std::string output;
+    int exit_code = -1;
+    if (!run_and_capture({docker_binary(), "rm", "-f", name}, 10'000, &output, &exit_code)) {
+        return false;
+    }
+    if (exit_code == 0) return true;
+    return output.find("No such container") != std::string::npos;
+}
 
 // Renders a `waitpid` status for a FAIL message: "exited N" for a normal
 // exit, "killed by signal N" for one it did not ask for. Forward-declared
@@ -1430,9 +1638,20 @@ struct EnvoyInstance {
             // this remains a no-op for them (round-15 review, "Skip Docker
             // teardown for instances that were never launched").
             if (launched) {
-                g_docker_rm_invocations++;
-                run_and_wait({"docker", "rm", "-f", name}, 10'000);
-                launched = false;
+                // Sweep-3 review, "Preserve cleanup state when docker rm
+                // fails": only clear `launched` -- and only report success
+                // -- once docker_rm_force() confirms the container is
+                // actually gone. A failed removal leaves `launched` set so
+                // a later stop() call (or the destructor's automatic one)
+                // retries, instead of silently abandoning a live container.
+                if (docker_rm_force(name)) {
+                    launched = false;
+                } else {
+                    exited_unexpectedly = true;
+                    unexpected_exit_description =
+                        "docker rm -f failed to remove the container; it may still be running";
+                    return false;
+                }
             }
             return true;
         }
@@ -1447,9 +1666,12 @@ struct EnvoyInstance {
             pid = -1;
             // `docker run --rm` normally removes the container on exit, but
             // a crash mid-startup can leave it behind; still attempt cleanup.
-            if (launched) {
-                g_docker_rm_invocations++;
-                run_and_wait({"docker", "rm", "-f", name}, 10'000);
+            // Sweep-3 review, "Preserve cleanup state when docker rm
+            // fails": only clear `launched` once removal is confirmed;
+            // this branch already returns false for the process's own
+            // unexpected exit regardless, but `launched` must stay true on
+            // a failed removal so a later stop() call retries.
+            if (launched && docker_rm_force(name)) {
                 launched = false;
             }
             return false;
@@ -1471,9 +1693,12 @@ struct EnvoyInstance {
                 "already reaped or no longer a child process (ECHILD) before this call could "
                 "signal it";
             pid = -1;
-            if (launched) {
-                g_docker_rm_invocations++;
-                run_and_wait({"docker", "rm", "-f", name}, 10'000);
+            // Sweep-3 review, "Preserve cleanup state when docker rm
+            // fails": only clear `launched` once removal is confirmed;
+            // this branch already returns false for the process's own
+            // unexpected exit regardless, but `launched` must stay true on
+            // a failed removal so a later stop() call retries.
+            if (launched && docker_rm_force(name)) {
                 launched = false;
             }
             return false;
@@ -1508,18 +1733,30 @@ struct EnvoyInstance {
             exited_unexpectedly = true;
             unexpected_exit_description = describe_wait_status(reap_status);
             pid = -1;
-            if (launched) {
-                g_docker_rm_invocations++;
-                run_and_wait({"docker", "rm", "-f", name}, 10'000);
+            // Sweep-3 review, "Preserve cleanup state when docker rm
+            // fails": only clear `launched` once removal is confirmed;
+            // this branch already returns false for the process's own
+            // unexpected exit regardless, but `launched` must stay true on
+            // a failed removal so a later stop() call retries.
+            if (launched && docker_rm_force(name)) {
                 launched = false;
             }
             return false;
         }
         const bool term_sent = kill(pid, SIGTERM) == 0;
+        // Sweep-3 review, "Preserve cleanup state when docker rm fails":
+        // unlike the branches above (which already return false for the
+        // process's own unexpected exit regardless of this outcome), this
+        // is the clean-teardown path -- a failed removal here must be the
+        // ONLY reason this call reports failure, since it is the only
+        // signal a caller has that the container may still be running.
+        bool docker_cleanup_failed = false;
         if (launched) {
-            g_docker_rm_invocations++;
-            run_and_wait({"docker", "rm", "-f", name}, 10'000);
-            launched = false;
+            if (docker_rm_force(name)) {
+                launched = false;
+            } else {
+                docker_cleanup_failed = true;
+            }
         }
         const int64_t deadline = now_ms() + 5000;
         bool escalated = false;
@@ -1578,6 +1815,17 @@ struct EnvoyInstance {
         if (!clean) {
             exited_unexpectedly = true;
             unexpected_exit_description = describe_wait_status(status);
+            return false;
+        }
+        if (docker_cleanup_failed) {
+            // Sweep-3 review, "Preserve cleanup state when docker rm
+            // fails": the process itself shut down cleanly, but the
+            // container removal did not -- the only signal a caller has
+            // that it (and the host-network listener it holds) may still
+            // be running.
+            exited_unexpectedly = true;
+            unexpected_exit_description =
+                "docker rm -f failed to remove the container; it may still be running";
             return false;
         }
         return true;
@@ -4040,18 +4288,29 @@ int run_oracle_milestone_s(const std::string& output_path) {
         auto record_only_results = run_and_collect(record_only_cases);
         // Never fatal here: a reuseport collision or teardown crash during
         // the record-only batch must not gate acceptance, only note the
-        // ambiguity (round-9/round-12/round-18 review).
+        // ambiguity (round-9/round-12/round-18 review). The CHECK itself
+        // must still run before stop() below (checking after would be
+        // pointless -- the port may already be free once the process under
+        // test is gone), but sweep-3 review, "Preserve crashes alongside
+        // reuse-port ambiguity": applying its mark_upstream_ambiguous()
+        // call is deferred until AFTER the crash check just below, so a
+        // same-batch crash (recorded first) is never masked by a
+        // coincident reuseport collision -- mirrors the identical crash-
+        // vs-idle-timeout fix (round-21/sweep-2 review) for the same
+        // first-reason-wins reason.
         const std::string record_only_reuseport_error =
             check_no_reuseport_collision_after_batch(listen_port1, kEnvoyContainerUid);
         if (!record_only_reuseport_error.empty()) {
             std::cerr << "NOTE: " << record_only_reuseport_error << "\n";
-            for (auto& r : record_only_results)
-                mark_upstream_ambiguous(&r, AmbiguityReason::kReuseportCollision);
         }
         if (!envoy_record_only.stop()) {
             dump_log(envoy_record_only.log_path);
             note_record_only_phase_crash(
                 "envoy", envoy_record_only.unexpected_exit_description, &record_only_results);
+        }
+        if (!record_only_reuseport_error.empty()) {
+            for (auto& r : record_only_results)
+                mark_upstream_ambiguous(&r, AmbiguityReason::kReuseportCollision);
         }
         // Round-20 review, "Reject asserted evidence when upstream
         // quiescence times out": record-only phases downgrade the same
@@ -4420,13 +4679,15 @@ int run_pair_milestone_s(const std::string& rut_binary,
         // its "Either anomaly ... is only made fatal ... for an asserted
         // case" comment) -- the return value needs no check. A reuseport
         // collision during this batch is likewise only ever a NOTE
-        // (round-18 review).
+        // (round-18 review). The CHECK itself must still run before stop()
+        // below, but sweep-3 review, "Preserve crashes alongside reuse-port
+        // ambiguity": applying its mark_upstream_ambiguous() call is
+        // deferred until AFTER the crash check just below, so a same-batch
+        // crash is never masked by a coincident reuseport collision.
         const std::string envoy_record_only_reuseport_error =
             check_no_reuseport_collision_after_batch(listen_port1, kEnvoyContainerUid);
         if (!envoy_record_only_reuseport_error.empty()) {
             std::cerr << "NOTE: " << envoy_record_only_reuseport_error << "\n";
-            for (auto& r : envoy_record_only_results)
-                mark_upstream_ambiguous(&r, AmbiguityReason::kReuseportCollision);
         }
         // This instance only ever ran the record-only batch, so a stop()
         // failure here is unambiguously attributable to it (round-12/
@@ -4438,6 +4699,10 @@ int run_pair_milestone_s(const std::string& rut_binary,
             dump_log(envoy_record_only.log_path);
             note_record_only_phase_crash(
                 "envoy", envoy_record_only.unexpected_exit_description, &envoy_record_only_results);
+        }
+        if (!envoy_record_only_reuseport_error.empty()) {
+            for (auto& r : envoy_record_only_results)
+                mark_upstream_ambiguous(&r, AmbiguityReason::kReuseportCollision);
         }
         // Round-20 review, "Reject asserted evidence when upstream
         // quiescence times out": record-only phases downgrade the same
@@ -4580,13 +4845,16 @@ int run_pair_milestone_s(const std::string& rut_binary,
             return 1;
         }
         auto rut_record_only_results = run_case_batch(listen_port1, record_only_cases);
-        // Never fatal here, same reasoning as the Envoy phase above.
+        // Never fatal here, same reasoning as the Envoy phase above. The
+        // CHECK itself must still run before stop() below, but sweep-3
+        // review, "Preserve crashes alongside reuse-port ambiguity":
+        // applying its mark_upstream_ambiguous() call is deferred until
+        // AFTER the crash check just below, so a same-batch crash is never
+        // masked by a coincident reuseport collision.
         const std::string rut_record_only_reuseport_error =
             check_no_reuseport_collision_after_batch(listen_port1, getuid());
         if (!rut_record_only_reuseport_error.empty()) {
             std::cerr << "NOTE: " << rut_record_only_reuseport_error << "\n";
-            for (auto& r : rut_record_only_results)
-                mark_upstream_ambiguous(&r, AmbiguityReason::kReuseportCollision);
         }
         // This instance only ever ran the record-only batch, so a stop()
         // failure here is unambiguously attributable to it (round-12/
@@ -4609,6 +4877,10 @@ int run_pair_milestone_s(const std::string& rut_binary,
             dump_rut_log(rut_record_only.log_path);
             note_record_only_phase_crash(
                 "rut", rut_record_only.unexpected_exit_description, &rut_record_only_results);
+        }
+        if (!rut_record_only_reuseport_error.empty()) {
+            for (auto& r : rut_record_only_results)
+                mark_upstream_ambiguous(&r, AmbiguityReason::kReuseportCollision);
         }
         // Round-20 review, "Reject asserted evidence when upstream
         // quiescence times out": record-only phases downgrade the same
@@ -5130,6 +5402,112 @@ bool self_test_wait_idle_synchronizes_accept_handoff() {
     return ok;
 }
 
+// Sweep-3 review, "Require a stable idle observation before returning" (P1):
+// combines BOTH the pre-mutex and post-accept delay hooks to widen the
+// ENTIRE accept-and-register cycle for one connection across many multiples
+// of wait_idle()'s 5ms retry cadence and 20ms settle interval, reproducing
+// (deterministically, rather than racily) the class of gap the review
+// describes: a moment where accept_loop() has reacted to a connection but
+// has not yet made that reaction visible through the listener, through
+// `accepted_pending_`, or (before this fix) through anything wait_idle()
+// checked. Confirms wait_idle() waits out the full widened window rather
+// than returning early on some intermediate sample, and that a second,
+// immediate call resolves promptly afterward (proving the new stability
+// check settles cleanly instead of getting stuck re-triggering on stale
+// state).
+bool self_test_wait_idle_requires_stable_observation() {
+    BoundPort bound;
+    if (!allocate_bound_loopback_port(&bound)) {
+        std::cerr << "FAIL [self-test wait_idle stable observation]: could not allocate a "
+                     "loopback port\n";
+        return false;
+    }
+    const uint16_t port = bound.port;
+
+    RecordingUpstream upstream;
+    upstream.set_default_reply(
+        "HTTP/1.1 200 OK\r\nConnection: close\r\nContent-Length: 2\r\n\r\nhi");
+    constexpr int kPreMutexDelayMs = 200;
+    constexpr int kPostAcceptDelayMs = 200;
+    upstream.set_test_pre_mutex_delay_ms(kPreMutexDelayMs);
+    upstream.set_test_post_accept_delay_ms(kPostAcceptDelayMs);
+    if (!upstream.adopt(bound.fd)) {
+        std::cerr << "FAIL [self-test wait_idle stable observation]: could not adopt the "
+                     "listener\n";
+        return false;
+    }
+
+    const int fd = connect_with_timeout(port, kClientTimeoutMs);
+    if (fd < 0) {
+        std::cerr << "FAIL [self-test wait_idle stable observation]: could not connect\n";
+        upstream.stop();
+        return false;
+    }
+    const std::string req =
+        "GET /stable-observation-race HTTP/1.1\r\nHost: t.example\r\nConnection: close\r\n\r\n";
+    if (!send_all(fd, req)) {
+        std::cerr << "FAIL [self-test wait_idle stable observation]: could not send the "
+                     "request\n";
+        close(fd);
+        upstream.stop();
+        return false;
+    }
+
+    // Give accept_loop() a moment to actually wake up and enter the
+    // pre-mutex delay before starting the timed wait_idle() call below.
+    struct timespec settle{0, 50'000'000};
+    nanosleep(&settle, nullptr);
+
+    bool ok = true;
+    const int64_t start = now_ms();
+    const bool went_idle = upstream.wait_idle(3000);
+    const int64_t elapsed = now_ms() - start;
+    if (!went_idle) {
+        std::cerr << "FAIL [self-test wait_idle stable observation]: wait_idle() timed out "
+                     "instead of waiting out the combined pre-mutex/post-accept delay\n";
+        ok = false;
+    }
+    // Generous slack below the combined injected delay so this isn't flaky
+    // under a loaded CI host, while still failing if wait_idle() raced past
+    // the widened window near-instantly (the bug this test targets).
+    const int kCombinedDelayMs = kPreMutexDelayMs + kPostAcceptDelayMs;
+    if (elapsed < kCombinedDelayMs - 150) {
+        std::cerr << "FAIL [self-test wait_idle stable observation]: wait_idle() returned after "
+                     "only "
+                  << elapsed << "ms, before the " << kCombinedDelayMs
+                  << "ms combined pre-mutex+post-accept delay could have elapsed -- it raced "
+                     "past the window instead of requiring a stable observation\n";
+        ok = false;
+    }
+    if (upstream.requests_for("/stable-observation-race").empty()) {
+        std::cerr << "FAIL [self-test wait_idle stable observation]: the connection was never "
+                     "recorded despite wait_idle() reporting idle\n";
+        ok = false;
+    }
+
+    // A second, immediate call must resolve promptly: the stability check
+    // must settle cleanly once things are actually idle, not perpetually
+    // re-trigger on stale epoch/counter state.
+    const int64_t second_start = now_ms();
+    const bool second_went_idle = upstream.wait_idle(1000);
+    const int64_t second_elapsed = now_ms() - second_start;
+    if (!second_went_idle) {
+        std::cerr << "FAIL [self-test wait_idle stable observation]: a second, immediate "
+                     "wait_idle() call did not report idle once things had actually settled\n";
+        ok = false;
+    } else if (second_elapsed > 500) {
+        std::cerr << "FAIL [self-test wait_idle stable observation]: a second, immediate "
+                     "wait_idle() call took "
+                  << second_elapsed << "ms to settle instead of resolving promptly\n";
+        ok = false;
+    }
+
+    close(fd);
+    upstream.stop();
+    if (ok) std::cerr << "PASS [self-test wait_idle stable observation]\n";
+    return ok;
+}
+
 // Round-20 review, "Reject asserted evidence when upstream quiescence times
 // out" (P1): simulates a stalled handler thread by sending a request WITHOUT
 // "Connection: close" and never disconnecting -- handle_connection() then
@@ -5428,6 +5806,71 @@ bool self_test_record_only_crash_reason_precedence() {
     close(fd);
     upstream.stop();
     if (ok) std::cerr << "PASS [self-test crash reason precedence]\n";
+    return ok;
+}
+
+// Sweep-3 review, "Preserve crashes alongside reuse-port ambiguity":
+// reproduces a record-only phase where the proxy crashed AND a reuse-port
+// collision was also detected in the same batch. Calls
+// note_record_only_phase_crash() and the reuseport-collision
+// mark_upstream_ambiguous() call in the exact order every record-only phase
+// (oracle, pair Envoy, pair RUT) now uses -- the collision CHECK runs
+// before stop(), but its MARK is applied only after the crash check -- and
+// confirms the crash reason wins, and that write_transcript() names the
+// crash, never the coincident reuseport collision.
+bool self_test_record_only_crash_reason_precedence_over_reuseport() {
+    std::vector<CaseResult> results(1);
+    results[0].name = "connect_authority";  // a real record-only case name
+
+    // Exact production order: crash recorded first...
+    note_record_only_phase_crash("envoy", "killed by signal 11", &results);
+    // ...then the coincident reuseport-collision mark.
+    for (auto& r : results) mark_upstream_ambiguous(&r, AmbiguityReason::kReuseportCollision);
+
+    bool ok = true;
+    if (results[0].upstream_ambiguous_reason != AmbiguityReason::kProxyCrash) {
+        std::cerr << "FAIL [self-test crash reason precedence over reuseport]: the crash reason "
+                     "was overwritten by the coincident reuseport collision instead of winning "
+                     "as the first-recorded reason\n";
+        ok = false;
+    }
+
+    TempDir dir("rut-envoy-selftest-crash-reuseport-precedence");
+    if (dir.empty()) {
+        std::cerr << "FAIL [self-test crash reason precedence over reuseport]: could not create "
+                     "temp dir\n";
+        ok = false;
+    } else {
+        const std::string out_path = dir.path() + "/transcript.inc";
+        results[0].client_bytes = "GET / HTTP/1.1\r\n\r\n";
+        results[0].exchange_complete = true;
+        results[0].downstream_bytes = "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n";
+        if (!write_transcript(out_path, results)) {
+            std::cerr << "FAIL [self-test crash reason precedence over reuseport]: "
+                         "write_transcript rejected a record-only row\n";
+            ok = false;
+        } else {
+            std::ifstream in(out_path);
+            std::stringstream ss;
+            ss << in.rdbuf();
+            const std::string content = ss.str();
+            if (content.find(describe_ambiguity_reason(AmbiguityReason::kProxyCrash)) ==
+                std::string::npos) {
+                std::cerr << "FAIL [self-test crash reason precedence over reuseport]: "
+                             "transcript did not name the crash\n";
+                ok = false;
+            }
+            if (content.find(describe_ambiguity_reason(AmbiguityReason::kReuseportCollision)) !=
+                std::string::npos) {
+                std::cerr << "FAIL [self-test crash reason precedence over reuseport]: "
+                             "transcript named the coincident reuseport collision instead of the "
+                             "actual crash\n";
+                ok = false;
+            }
+        }
+    }
+
+    if (ok) std::cerr << "PASS [self-test crash reason precedence over reuseport]\n";
     return ok;
 }
 
@@ -6496,6 +6939,51 @@ bool self_test_temp_dir_cleanup() {
     return ok;
 }
 
+// Sweep-3 review, "Stub Docker in the always-on self-test": writes a tiny
+// shell script to `path`, made executable, that prints `stderr_text` (if
+// non-empty) to its stderr and exits with `exit_code` -- standing in for
+// the real Docker CLI so self-tests never invoke it. Returns whether the
+// script was written successfully.
+bool write_docker_stub(const std::string& path, int exit_code, const std::string& stderr_text) {
+    std::string script = "#!/bin/sh\n";
+    if (!stderr_text.empty()) {
+        script += "echo '" + stderr_text + "' >&2\n";
+    }
+    script += "exit " + std::to_string(exit_code) + "\n";
+    return write_file_mode(path, script, 0755);
+}
+
+// RAII: points RUT_ENVOY_DOCKER_BIN at `path` for the lifetime of this
+// object, restoring whatever the ambient value actually was (present or
+// not) on destruction -- the same save/restore discipline as
+// self_test_temp_dir_cleanup()'s `restore_keep_tmp()`, for the same reason
+// (another self-test, or a real caller, must never see this test's
+// override leak past it). Sweep-3 review, "Stub Docker in the always-on
+// self-test": every self-test that exercises EnvoyInstance::stop() with
+// `launched = true` must hold one of these for its whole duration, so it
+// is never able to invoke the real Docker CLI (AGENTS.md: the always-on
+// `--self-test` suite must not depend on Docker being installed, let alone
+// mutate a real host's containers).
+struct ScopedDockerBinOverride {
+    bool had_original;
+    std::string original_value;
+    explicit ScopedDockerBinOverride(const std::string& path) {
+        const char* original = getenv("RUT_ENVOY_DOCKER_BIN");
+        had_original = original != nullptr;
+        if (had_original) original_value = original;
+        setenv("RUT_ENVOY_DOCKER_BIN", path.c_str(), 1);
+    }
+    ScopedDockerBinOverride(const ScopedDockerBinOverride&) = delete;
+    ScopedDockerBinOverride& operator=(const ScopedDockerBinOverride&) = delete;
+    ~ScopedDockerBinOverride() {
+        if (had_original) {
+            setenv("RUT_ENVOY_DOCKER_BIN", original_value.c_str(), 1);
+        } else {
+            unsetenv("RUT_ENVOY_DOCKER_BIN");
+        }
+    }
+};
+
 // Covers round-15 review thread P2 ("Skip Docker teardown for instances
 // that were never launched"): constructing and destroying an EnvoyInstance
 // that never called launch() -- exactly what every dummy-child self-test
@@ -6503,7 +6991,12 @@ bool self_test_temp_dir_cleanup() {
 // g_docker_rm_invocations rather than a stubbed docker binary. Also checks
 // that an unlaunched instance wrapping a real (dummy) pid still reaps it,
 // so the docker-skip guard doesn't accidentally skip process cleanup too.
+// `launched` stays false throughout, so this never actually invokes
+// docker_binary() regardless -- no stub needed -- but sweep-3's
+// ScopedDockerBinOverride is still held defensively, in case a future edit
+// ever makes that stop being true.
 bool self_test_envoy_instance_skips_docker_when_unlaunched() {
+    ScopedDockerBinOverride docker_override("/bin/false");
     const int before = g_docker_rm_invocations;
     {
         EnvoyInstance envoy;  // name/log_path left empty; launch() never called
@@ -6555,7 +7048,32 @@ bool self_test_envoy_instance_skips_docker_when_unlaunched() {
 // runs `docker rm -f` (via g_docker_rm_invocations) instead of returning
 // early just because `pid <= 0`, which would otherwise leave a container
 // behind to contaminate a retry or a later test.
+//
+// Sweep-3 review, "Stub Docker in the always-on self-test": `launched` IS
+// true here, so this exercises the real docker_rm_force() call path -- the
+// exact scenario that previously invoked the real Docker CLI's `docker rm
+// -f rut-envoy-selftest-reaped-docker` from an ordinary `--self-test` run,
+// forcibly deleting any unrelated container that happened to have that
+// name and adding a full cleanup timeout on a host with an installed but
+// unresponsive daemon. RUT_ENVOY_DOCKER_BIN now points this at a stub that
+// exits 0 immediately, so this test still verifies the SAME contract
+// (exactly one invocation via g_docker_rm_invocations, `launched` cleared,
+// stop() reports success) without ever touching the real Docker CLI.
 bool self_test_envoy_instance_cleans_up_after_readiness_reaps_docker() {
+    TempDir dir("rut-envoy-selftest-docker-stub");
+    if (dir.empty()) {
+        std::cerr << "FAIL [self-test envoy instance cleans up reaped docker]: could not create "
+                     "temp dir\n";
+        return false;
+    }
+    const std::string stub_path = dir.path() + "/docker";
+    if (!write_docker_stub(stub_path, /*exit_code=*/0, /*stderr_text=*/"")) {
+        std::cerr << "FAIL [self-test envoy instance cleans up reaped docker]: could not write "
+                     "the docker stub\n";
+        return false;
+    }
+    ScopedDockerBinOverride docker_override(stub_path);
+
     const pid_t child = fork();
     if (child < 0) {
         std::cerr << "FAIL [self-test envoy instance cleans up reaped docker]: fork failed\n";
@@ -6599,6 +7117,105 @@ bool self_test_envoy_instance_cleans_up_after_readiness_reaps_docker() {
     }
 
     if (ok) std::cerr << "PASS [self-test envoy instance cleans up reaped docker]\n";
+    return ok;
+}
+
+// Sweep-3 review, "Preserve cleanup state when docker rm fails": exercises
+// docker_rm_force()'s three possible outcomes via a stubbed
+// RUT_ENVOY_DOCKER_BIN (never the real Docker CLI), each against a fresh
+// EnvoyInstance with `launched = true` and an already-reaped `pid = -1`
+// (the same reaped-by-readiness scenario self_test_envoy_instance_cleans_
+// up_after_readiness_reaps_docker() above covers for the success case):
+//   - exit 0 ("removed cleanly"): `launched` cleared, stop() reports
+//     success.
+//   - exit 1 with "No such container" in stderr (the container was
+//     already gone, e.g. `docker run --rm` beat this call to it):
+//     `launched` cleared, stop() STILL reports success -- there is
+//     nothing left to retry.
+//   - exit 1 with unrelated stderr (the daemon is unavailable, the CLI
+//     itself is broken, etc.): `launched` stays TRUE so a later stop()
+//     call (or the destructor's automatic one) retries, and stop()
+//     reports failure -- the one signal a caller has that the container
+//     may still be running.
+// Every case increments g_docker_rm_invocations exactly once.
+bool self_test_docker_rm_failure_preserves_launched() {
+    bool ok = true;
+    TempDir dir("rut-envoy-selftest-docker-rm-outcomes");
+    if (dir.empty()) {
+        std::cerr << "FAIL [self-test docker rm outcomes]: could not create temp dir\n";
+        return false;
+    }
+
+    struct Case {
+        const char* label;
+        int exit_code;
+        const char* stderr_text;
+        bool expect_launched_cleared;
+        bool expect_stop_success;
+    };
+    const Case cases[] = {
+        {"success", 0, "", true, true},
+        {"already gone", 1, "Error: No such container: rut-envoy-selftest-docker-rm", true, true},
+        {"daemon unavailable", 1, "Cannot connect to the Docker daemon", false, false},
+    };
+
+    for (const Case& c : cases) {
+        const std::string stub_path = dir.path() + "/docker-" + std::string(c.label);
+        std::string sanitized_path = stub_path;
+        std::replace(sanitized_path.begin(), sanitized_path.end(), ' ', '-');
+        if (!write_docker_stub(sanitized_path, c.exit_code, c.stderr_text)) {
+            std::cerr << "FAIL [self-test docker rm outcomes]: could not write the docker stub "
+                         "for case \""
+                      << c.label << "\"\n";
+            ok = false;
+            continue;
+        }
+        ScopedDockerBinOverride docker_override(sanitized_path);
+
+        const pid_t child = fork();
+        if (child < 0) {
+            std::cerr << "FAIL [self-test docker rm outcomes]: fork failed for case \"" << c.label
+                      << "\"\n";
+            ok = false;
+            continue;
+        }
+        if (child == 0) {
+            _exit(0);
+        }
+        int status = 0;
+        while (waitpid(child, &status, 0) < 0 && errno == EINTR) {
+        }
+
+        EnvoyInstance envoy;
+        envoy.name = "rut-envoy-selftest-docker-rm";
+        envoy.launched = true;
+        envoy.pid = -1;
+
+        const int before = g_docker_rm_invocations;
+        const bool stopped = envoy.stop();
+        const int after = g_docker_rm_invocations;
+
+        if (after != before + 1) {
+            std::cerr << "FAIL [self-test docker rm outcomes]: case \"" << c.label
+                      << "\" expected exactly one docker rm -f invocation, got " << (after - before)
+                      << "\n";
+            ok = false;
+        }
+        if (envoy.launched != !c.expect_launched_cleared) {
+            std::cerr << "FAIL [self-test docker rm outcomes]: case \"" << c.label
+                      << "\" left launched=" << envoy.launched << ", expected "
+                      << !c.expect_launched_cleared << "\n";
+            ok = false;
+        }
+        if (stopped != c.expect_stop_success) {
+            std::cerr << "FAIL [self-test docker rm outcomes]: case \"" << c.label
+                      << "\" stop() returned " << stopped << ", expected " << c.expect_stop_success
+                      << "\n";
+            ok = false;
+        }
+    }
+
+    if (ok) std::cerr << "PASS [self-test docker rm outcomes]\n";
     return ok;
 }
 
@@ -9805,9 +10422,11 @@ int run_self_test(const std::string& rut_binary, const std::string& converter_bi
     ok &= self_test_recording_upstream();
     ok &= self_test_wait_idle_synchronizes_with_pending_accept();
     ok &= self_test_wait_idle_synchronizes_accept_handoff();
+    ok &= self_test_wait_idle_requires_stable_observation();
     ok &= self_test_require_upstream_idle_for_asserted_batch();
     ok &= self_test_quiesce_after_record_only_idle_timeout();
     ok &= self_test_record_only_crash_reason_precedence();
+    ok &= self_test_record_only_crash_reason_precedence_over_reuseport();
     ok &= self_test_partial_exchange_rejection();
     ok &= self_test_ambiguity_reason_note_text();
     ok &= self_test_fake_listener_unblocks_on_shutdown();
@@ -9820,6 +10439,7 @@ int run_self_test(const std::string& rut_binary, const std::string& converter_bi
     ok &= self_test_no_binary_self_test_leaves_no_temp_dirs();
     ok &= self_test_envoy_instance_skips_docker_when_unlaunched();
     ok &= self_test_envoy_instance_cleans_up_after_readiness_reaps_docker();
+    ok &= self_test_docker_rm_failure_preserves_launched();
     ok &= self_test_rut_wait_ready_ownership();
     ok &= self_test_rut_log_confirms_listener();
     ok &= self_test_count_listeners_on_port();

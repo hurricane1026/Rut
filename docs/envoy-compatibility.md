@@ -302,7 +302,11 @@ revision (see the internal evidence notes below).
 Each row below stays `PARTIAL` (or lower) until a passing CI run of
 `test_envoy_pair_milestone_s` (zero skips) for that exact case is cited by
 run id; the lead promotes a row to `SUPPORTED` at that point, not before.
-`connect_authority` is not asserted and is not promoted by either run.
+`connect_authority` is not asserted and is not promoted by either run; nor
+are the three forged-header cases below it (`get_forged_envoy_internal`,
+`get_forged_xfcc`, `get_forged_envoy_external_address`) -- none of the four
+is in `kAssertedCaseNames` (tests/test_envoy_differential.cc), so all four
+run record-only and none gates the CTest's exit code.
 
 **Re-run pending (round-6 review):** runs `36069445967` and `36070125213`
 both predate this round's hardening of the pair harness itself --
@@ -333,6 +337,9 @@ the stricter checks.
 | TRACE | `TRACE /trace` | yes | yes | yes (ordinary forward path) | yes | SUPPORTED (pinned Envoy v1.39.1 pair differential; record-only equal in run `36069445967`, asserted and passing in run `36070125213`, zero skips; bytes equal after normalizing only the synthesized `date` value) |
 | OPTIONS * (unmatched → 404) | `OPTIONS *` | yes | yes | yes (`local_reply_envoy_h1` `local_response`) | yes | SUPPORTED (pinned Envoy v1.39.1 pair differential; record-only equal in run `36069445967`, asserted and passing in run `36070125213`, zero skips; bytes equal after normalizing only the synthesized `date` value) |
 | CONNECT authority-form (unmatched → 404) | `CONNECT example.com:443` | yes | yes | yes (`local_reply_envoy_h1` `local_response`) | no (record-only) | PARTIAL (record-only; run `36069445967` shows the one difference: Envoy adds `connection: close` to the 404 and closes, Rut keeps the connection open because its local-response persistence rule does not look at the method) |
+| Client-forged `X-Envoy-Internal: true` request header stripped before forwarding | `GET /internal` | yes | yes | partial (`request_envoy_h1`; PR #696 round-7 strips this on the RUT side, but the fix has not yet cascaded to this branch, which still forwards it) | no (record-only) | PARTIAL (record-only; expected to MISMATCH on upstream bytes until the round-7 strip lands here -- Envoy unconditionally removes this header for this milestone config (`ConnectionManagerUtility::mutateRequestHeaders`'s `removeEnvoyInternalRequest()` with `internal_request` always false), so its recorded upstream bytes are the target once RUT matches; no pinned-Envoy CI run has captured this case yet) |
+| Client-forged `X-Forwarded-Client-Cert` request header stripped before forwarding | `GET /xfcc` | yes | yes | partial (`request_envoy_h1`; same PR #696 round-7 status as `get_forged_envoy_internal` above -- not yet cascaded to this branch) | no (record-only) | PARTIAL (record-only; expected to MISMATCH on upstream bytes for the same reason as `get_forged_envoy_internal` above -- Envoy's `forward_client_cert_details` defaults to SANITIZE, stripping it unconditionally for this milestone; no pinned-Envoy CI run has captured this case yet) |
+| Client-supplied `X-Envoy-External-Address` request header handling | `GET /external-address` | yes | yes | yes (`request_envoy_h1`; RUT strips this unconditionally, PR #696 round-8 fix ID4) | no (record-only) | PARTIAL (record-only; RUT's unconditional stripping is intentional hardening, but pinned Envoy's own behavior for this milestone's exact config (`use_remote_address: false`) is unresolved -- a worker's reading of Envoy v1.39.1 source found it does NOT remove a client-supplied value in that configuration, contradicting an earlier review's claim that it does. This case records what the pinned Envoy image's upstream bytes actually show; a pinned-Envoy CI run settles the disagreement and determines whether RUT's stripping matches Envoy or is a documented divergence) |
 
 ## Not planned in the converter
 
@@ -472,4 +479,10 @@ the stricter checks.
   `test_envoy_pair_milestone_s` again, now asserting all nine cases, and
   matched with zero skips. The `get_hop_by_hop`, `trace` and `options_star`
   pair rows were promoted to `SUPPORTED` with this run id. `connect_authority`
-  remains the only non-asserted, `PARTIAL` pair row.
+  remained the only non-asserted, `PARTIAL` pair row at this point.
+- The harness later added three more record-only cases --
+  `get_forged_envoy_internal`, `get_forged_xfcc` and
+  `get_forged_envoy_external_address` (none is in `kAssertedCaseNames`) --
+  so `connect_authority` is no longer the sole non-asserted pair row; all
+  four stay `PARTIAL` pending the pinned-Envoy CI evidence each row above
+  names. No status changes from this addition alone.
