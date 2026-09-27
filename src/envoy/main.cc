@@ -327,17 +327,23 @@ int main(int argc, char** argv) {
         return 1;
     }
 
-    const auto lowered = rut::envoy::lower_to_rut(parsed.value());
+    // `RutSource` is 128 KiB (PR8 ordered route-list lowering); hold the
+    // result in static storage rather than a `main()` stack local.
+    static const auto lowered = rut::envoy::lower_to_rut(parsed.value());
     if (!lowered) {
         report(argv[3], lowered.error().span, lowered.error().detail, "conversion failed");
         return 1;
     }
-    warn_connect_timeout(parsed.value().clusters[0].connect_timeout.text);
+    // PR8 lowers every declared cluster (multiple clusters are no longer
+    // rejected), so D2's warning must name every one of them, not only
+    // `clusters[0]` -- a config with a second cluster whose `connect_timeout`
+    // silently went unmentioned would contradict the documented contract of
+    // naming every ignored value on stderr.
+    for (rut::u32 i = 0; i < parsed.value().clusters.len; i++)
+        warn_connect_timeout(parsed.value().clusters[i].connect_timeout.text);
     if (rut::envoy::needs_h2c_preface_warning(parsed.value())) warn_h2c_preface();
 
-    static rut::envoy::RutSource output;
-    output = lowered.value();
-    const rut::Str view = output.view();
+    const rut::Str view = lowered.value().view();
     const bool wrote = write_all(STDOUT_FILENO, view.ptr, view.len);
     const int output_errno = wrote ? 0 : errno;
     if (!wrote) {
