@@ -12504,6 +12504,15 @@ struct DelayedCloseUpstream {
         auto lfd = create_listen_socket(0);
         if (!lfd.has_value()) return false;
         listen_fd = lfd.value();
+        // The accept loop polls with usleep and rechecks `running`, so teardown's
+        // join must never be stuck in accept(): require a nonblocking listener here
+        // rather than relying on create_listen_socket's platform defaults.
+        const int flags = fcntl(listen_fd, F_GETFL);
+        if (flags < 0 || fcntl(listen_fd, F_SETFL, flags | O_NONBLOCK) < 0) {
+            close(listen_fd);
+            listen_fd = -1;
+            return false;
+        }
         port = get_port(listen_fd);
         running.store(true, std::memory_order_release);
         if (pthread_create(&thread, nullptr, run, this) != 0) {
