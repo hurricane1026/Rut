@@ -322,11 +322,25 @@ bool exited_one(const ProcessResult& result) {
 }
 
 #ifdef RUT_ACCESS_LOG_STARTUP_SOURCE_PROCESS_TEST
+i64 monotonic_ns();
+
 struct ProxyBackendResult {
     std::string request;
     u32 accepts = 0u;
     u32 sends = 0u;
     bool timed_out = false;
+    i64 accepted_at_ns = 0;  // monotonic; 0 = never accepted
+};
+
+// Where a loopback client transaction stopped, so a failure names its stage.
+struct LoopbackTrace {
+    i32 connect_errno = 0;  // 0 = connected (or never tried when !attempted)
+    bool attempted = false;
+    bool connected = false;
+    bool request_written = false;
+    bool eof = false;
+    i32 read_errno = 0;
+    u32 idle_polls = 0u;
 };
 
 bool write_all(i32 fd, const char* bytes, size_t length) {
@@ -377,6 +391,7 @@ void record_one_proxy_request(i32 listener, ProxyBackendResult& result) {
         return;
     }
     result.accepts++;
+    result.accepted_at_ns = monotonic_ns();
     char bytes[512];
     for (u32 attempt = 0; attempt < 50u; attempt++) {
         struct pollfd input{client, POLLIN, 0};
@@ -408,35 +423,52 @@ void record_one_proxy_request(i32 listener, ProxyBackendResult& result) {
 bool transact_loopback(u16 port,
                        const char* request,
                        size_t request_length,
-                       std::string& response) {
+                       std::string& response,
+                       LoopbackTrace& trace) {
+    trace.attempted = true;
     const i32 fd = rut::test::cloexec_socket(AF_INET, SOCK_STREAM, 0);
-    if (fd < 0) return false;
+    if (fd < 0) {
+        trace.connect_errno = errno;
+        return false;
+    }
     struct sockaddr_in address{};
     address.sin_family = AF_INET;
     address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
     address.sin_port = htons(port);
-    if (connect(fd, reinterpret_cast<const struct sockaddr*>(&address), sizeof(address)) != 0 ||
-        !write_all(fd, request, request_length)) {
+    if (connect(fd, reinterpret_cast<const struct sockaddr*>(&address), sizeof(address)) != 0) {
+        trace.connect_errno = errno;
         close(fd);
         return false;
     }
+    trace.connected = true;
+    if (!write_all(fd, request, request_length)) {
+        trace.read_errno = errno;
+        close(fd);
+        return false;
+    }
+    trace.request_written = true;
     (void)shutdown(fd, SHUT_WR);
     char bytes[512];
     for (u32 attempt = 0; attempt < 50u; attempt++) {
         struct pollfd ready{fd, POLLIN | POLLHUP, 0};
         const i32 polled = poll(&ready, 1, 100);
         if (polled < 0 && errno == EINTR) continue;
-        if (polled <= 0) continue;
+        if (polled <= 0) {
+            trace.idle_polls++;
+            continue;
+        }
         const ssize_t n = read(fd, bytes, sizeof(bytes));
         if (n > 0) {
             response.append(bytes, static_cast<size_t>(n));
             continue;
         }
         if (n == 0) {
+            trace.eof = true;
             close(fd);
             return true;
         }
         if (errno == EINTR) continue;
+        trace.read_errno = errno;
         break;
     }
     close(fd);
@@ -562,26 +594,95 @@ struct SourceLiveProxyResult {
     bool backend_joined_live = false;
     bool sink_prefixes_valid = true;
     bool sink_observed_live = false;
+    // Failure diagnostics: wall-clock milestones relative to fork(), the client's
+    // stage, and who owned the listening port while the transaction was stuck.
+    LoopbackTrace client;
+    u16 port = 0u;
+    i64 forked_at_ns = 0;
+    i64 listening_seen_ns = 0;
+    i64 transact_done_ns = 0;
+    std::string port_owners;
 };
+
+i64 ms_since(i64 origin_ns, i64 at_ns) {
+    return at_ns == 0 ? -1 : (at_ns - origin_ns) / 1'000'000LL;
+}
+
+// Snapshot every socket on `port` (all processes) while the child is still
+// alive. A loopback client that connects but never reaches rut shows up here
+// as a different owner of 127.0.0.1:<port>. Best effort: empty if lsof is absent.
+std::string snapshot_port_owners(u16 port) {
+    const std::string command = "lsof -nP -iTCP:" + std::to_string(port) + " 2>&1";
+    FILE* pipe = popen(command.c_str(), "r");
+    if (pipe == nullptr) return "(popen failed)";
+    std::string owners;
+    char line[512];
+    while (fgets(line, sizeof(line), pipe) != nullptr) owners += line;
+    (void)pclose(pipe);
+    return owners;
+}
+
+void report_source_live_failure(const SourceLiveProxyResult& result) {
+    const i64 origin = result.forked_at_ns;
+    (void)fprintf(stderr,
+                  "    source-live diagnostics: port=%u listening_ms=%lld transact_done_ms=%lld "
+                  "backend_accept_ms=%lld\n"
+                  "      client: attempted=%d connected=%d connect_errno=%d written=%d eof=%d "
+                  "read_errno=%d idle_polls=%u response_bytes=%zu\n"
+                  "      backend: accepts=%u sends=%u timed_out=%d request_bytes=%zu\n"
+                  "      process: shutdown_sent=%d forced_kill=%d status_valid=%d status=0x%x\n"
+                  "      rut output=[%s]\n"
+                  "      port owners while stuck=[%s]\n",
+                  static_cast<unsigned>(result.port),
+                  static_cast<long long>(ms_since(origin, result.listening_seen_ns)),
+                  static_cast<long long>(ms_since(origin, result.transact_done_ns)),
+                  static_cast<long long>(ms_since(origin, result.backend.accepted_at_ns)),
+                  result.client.attempted ? 1 : 0,
+                  result.client.connected ? 1 : 0,
+                  result.client.connect_errno,
+                  result.client.request_written ? 1 : 0,
+                  result.client.eof ? 1 : 0,
+                  result.client.read_errno,
+                  result.client.idle_polls,
+                  result.response.size(),
+                  result.backend.accepts,
+                  result.backend.sends,
+                  result.backend.timed_out ? 1 : 0,
+                  result.backend.request.size(),
+                  result.process.shutdown_signal_sent ? 1 : 0,
+                  result.process.forced_kill ? 1 : 0,
+                  result.process.status_valid ? 1 : 0,
+                  static_cast<unsigned>(result.process.status),
+                  result.process.output.c_str(),
+                  result.port_owners.c_str());
+}
 
 enum class SourceLiveProxyMode : u8 {
     Success,
     FileSizeWriteFatal,
 };
 
+// The readiness line is not written atomically: rut's main.cc writes the marker,
+// then the port one digit per write(2), then " with N shard(s)". A pipe read can
+// therefore end mid-number ("Listening on port 3" of 36875). Accept the port only
+// once the digit run is terminated by the " with " that follows it; until then the
+// line is incomplete and the caller must keep reading.
 u16 listening_port(const std::string& output) {
     static constexpr char kMarker[] = "Listening on port ";
+    static constexpr char kTerminator[] = " with ";
     const size_t marker = output.find(kMarker);
     if (marker == std::string::npos) return 0u;
     size_t cursor = marker + sizeof(kMarker) - 1u;
     u32 value = 0u;
-    bool any = false;
+    u32 digits = 0u;
     while (cursor < output.size() && output[cursor] >= '0' && output[cursor] <= '9') {
-        any = true;
+        if (++digits > 5u) return 0u;
         value = value * 10u + static_cast<u32>(output[cursor] - '0');
         cursor++;
     }
-    return any && value <= 65535u ? static_cast<u16>(value) : 0u;
+    if (digits == 0u || value == 0u || value > 65535u) return 0u;
+    if (output.compare(cursor, sizeof(kTerminator) - 1u, kTerminator) != 0) return 0u;
+    return static_cast<u16>(value);
 }
 
 bool is_prefix_of(const std::string& value, const char* expected) {
@@ -629,6 +730,7 @@ SourceLiveProxyResult run_source_live_proxy(
         return result;
     }
     close(output_pipe[1]);
+    result.forked_at_ns = monotonic_ns();
     std::thread backend(record_one_proxy_request, backend_listener, std::ref(result.backend));
     const i32 old_flags = fcntl(output_pipe[0], F_GETFL);
     if (old_flags >= 0) (void)fcntl(output_pipe[0], F_SETFL, old_flags | O_NONBLOCK);
@@ -664,8 +766,12 @@ SourceLiveProxyResult run_source_live_proxy(
         const u16 port = listening_port(result.process.output);
         if (!transaction_attempted && port != 0u) {
             transaction_attempted = true;
+            result.port = port;
+            result.listening_seen_ns = monotonic_ns();
             result.request_completed =
-                transact_loopback(port, request, request_length, result.response);
+                transact_loopback(port, request, request_length, result.response, result.client);
+            result.transact_done_ns = monotonic_ns();
+            if (!result.request_completed) result.port_owners = snapshot_port_owners(port);
         }
         if (transaction_attempted && !backend_joined) {
             backend.join();
@@ -765,6 +871,25 @@ TEST(access_log_startup, process_helper_waits_for_exit_after_output_eof) {
 }
 
 #ifdef RUT_ACCESS_LOG_STARTUP_SOURCE_PROCESS_TEST
+TEST(access_log_startup, listening_port_waits_for_the_complete_readiness_line) {
+    // Every prefix a pipe read can deliver of the digit-by-digit readiness write.
+    const std::string line = "Backend: kqueue\nListening on port 36875 with 1 shard(s)\n";
+    const size_t digits_end = line.find(" with ");
+    for (size_t cut = 0u; cut < line.size(); cut++) {
+        const u16 port = listening_port(line.substr(0u, cut));
+        if (cut < digits_end + 6u) {
+            CHECK_EQ(port, 0u);
+        } else {
+            CHECK_EQ(port, 36875u);
+        }
+    }
+    CHECK_EQ(listening_port(line), 36875u);
+    CHECK_EQ(listening_port("Listening on port 3"), 0u);
+    CHECK_EQ(listening_port("Listening on port 0 with 1 shard(s)\n"), 0u);
+    CHECK_EQ(listening_port("Listening on port 65536 with 1 shard(s)\n"), 0u);
+    CHECK_EQ(listening_port("Listening on port 123456 with 1 shard(s)\n"), 0u);
+}
+
 TEST(access_log_startup, public_main_source_live_publishes_downstream_size_before_shutdown) {
     const std::string dir = make_temp_dir("/tmp/rut-access-log-startup-main-XXXXXX");
     REQUIRE_FALSE(dir.empty());
@@ -798,6 +923,8 @@ TEST(access_log_startup, public_main_source_live_publishes_downstream_size_befor
         backend_listener,
         kClientRequest,
         sizeof(kClientRequest) - 1u);
+    if (!live.request_completed || !live.sink_observed_live || live.process.forced_kill)
+        report_source_live_failure(live);
     CHECK(live.request_completed);
     CHECK(live.backend_joined_live);
     CHECK(live.sink_prefixes_valid);
