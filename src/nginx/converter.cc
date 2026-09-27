@@ -1858,8 +1858,7 @@ bool put_root_forward(Writer& writer,
                                         : true) &&
            (buffered || timeout_present ? writer.put_u16(timeout_seconds) : true) &&
            (buffered || timeout_present ? writer.put_cstr(buffered ? "s,\n" : "s\n") : true) &&
-           (buffered ? writer.put_cstr("        response_buffering: \"complete_content_length\"\n")
-                     : true) &&
+           (buffered ? writer.put_cstr("        response_buffering: \"bounded\"\n") : true) &&
            writer.put_cstr("    )\n}\n");
 }
 
@@ -1881,8 +1880,7 @@ bool put_root_forward_action(Writer& writer,
                                         : true) &&
            (buffered || timeout_present ? writer.put_u16(timeout_seconds) : true) &&
            (buffered || timeout_present ? writer.put_cstr(buffered ? "s,\n" : "s\n") : true) &&
-           (buffered ? writer.put_cstr("        response_buffering: \"complete_content_length\"\n")
-                     : true) &&
+           (buffered ? writer.put_cstr("        response_buffering: \"bounded\"\n") : true) &&
            writer.put_cstr("    )\n");
 }
 
