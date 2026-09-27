@@ -3615,6 +3615,68 @@ TEST(request_policy, preserve_host_lowercase_tls_rejects_before_waiting_for_body
     CHECK_EQ(__builtin_memcmp(conn.recv_buf.data(), untouched, sizeof(untouched)), 0);
 }
 
+// Codex sweep-11 review: the same class of issue as the TLS guard above, but
+// for Host admission -- a missing Host, a duplicated Host, or an invalid
+// authority shape (e.g. `victim/path`, which `request_policy_host_authority_
+// is_valid` rejects) was previously validated only inside
+// `apply_preserve_host_lowercase_request_policy`'s own Pass 1, i.e. at
+// materialization, reached only after `inspect_request_policy_body` already
+// returned `Complete`. For an incomplete fixed-length body that inspector
+// instead returns `Waiting`, so a slow client with an already-invalid Host
+// could hold the connection and receive buffer open for the whole declared
+// body. `inspect_request_policy_body` now validates ID4's Host shape itself,
+// ahead of any check that can produce `Waiting`.
+TEST(request_policy, preserve_host_lowercase_invalid_host_rejects_before_waiting_for_body) {
+    static constexpr u16 kPreserveHost =
+        static_cast<u16>(RequestPolicyId::Http11PreserveHostLowercase);
+    Connection conn{};
+    u8 recv[256]{};
+    u8 send[256]{};
+
+    auto prepare = [&](const char* header) {
+        conn.reset();
+        conn.recv_slice = recv;
+        conn.send_slice = send;
+        conn.bind_request_receive_buffer(recv, sizeof(recv));
+        conn.send_buf.bind(send, sizeof(send));
+        const u32 header_len = static_cast<u32>(strlen(header));
+        const u8 partial_body[] = {'a', 'b'};  // only 2 of the declared 5 bytes
+        u8 wire[256]{};
+        REQUIRE_LE(header_len + sizeof(partial_body), sizeof(wire));
+        __builtin_memcpy(wire, header, header_len);
+        __builtin_memcpy(wire + header_len, partial_body, sizeof(partial_body));
+        const u32 wire_len = header_len + static_cast<u32>(sizeof(partial_body));
+        REQUIRE_EQ(conn.recv_buf.write(wire, wire_len), wire_len);
+        capture_request_metadata(conn);
+    };
+
+    // Baseline: a valid Host with the identical partial body genuinely
+    // waits for the rest, confirming this is a real "would otherwise wait"
+    // shape and not already rejected for an unrelated reason.
+    prepare("POST /upload HTTP/1.1\r\nHost: client.example\r\nContent-Length: 5\r\n\r\n");
+    REQUIRE_EQ(inspect_request_policy_body(conn, kPreserveHost), RequestPolicyBodyState::Waiting);
+
+    // Missing Host: fails closed immediately, does not wait.
+    prepare("POST /upload HTTP/1.1\r\nContent-Length: 5\r\n\r\n");
+    REQUIRE_EQ(inspect_request_policy_body(conn, kPreserveHost), RequestPolicyBodyState::Invalid);
+
+    // Duplicated Host: fails closed immediately, does not wait.
+    prepare("POST /upload HTTP/1.1\r\nHost: a\r\nHost: b\r\nContent-Length: 5\r\n\r\n");
+    REQUIRE_EQ(inspect_request_policy_body(conn, kPreserveHost), RequestPolicyBodyState::Invalid);
+
+    // An invalid authority shape (a path, not a host[:port]): fails closed
+    // immediately, does not wait; the receive buffer is left untouched.
+    prepare("POST /upload HTTP/1.1\r\nHost: victim/path\r\nContent-Length: 5\r\n\r\n");
+    u8 untouched[256]{};
+    const u32 untouched_len = conn.recv_buf.len();
+    __builtin_memcpy(untouched, conn.recv_buf.data(), untouched_len);
+    REQUIRE_EQ(inspect_request_policy_body(conn, kPreserveHost), RequestPolicyBodyState::Invalid);
+    CHECK_FALSE(apply_request_policy(conn, sockaddr_in{}, kPreserveHost));
+    CHECK_EQ(conn.send_buf.len(), 0u);
+    CHECK_EQ(conn.recv_buf.len(), untouched_len);
+    CHECK_EQ(__builtin_memcmp(conn.recv_buf.data(), untouched, untouched_len), 0);
+}
+
 // `request_policy_body_response_admitted` (callbacks_impl.h) is the ordinary
 // strict-response body-path admission check for a body-carrying request
 // paired with a response_policy. It used to admit only ID1
@@ -3969,6 +4031,18 @@ TEST(request_policy, preserve_host_lowercase_wire_and_fail_closed_host) {
         CHECK_EQ(__builtin_memcmp(conn.recv_buf.data(), expected, expected_len), 0);
         CHECK_EQ(conn.send_buf.len(), 0u);
     };
+
+    // Codex sweep-11 review: unlike TE (canonicalized to `te: trailers` or
+    // dropped, per value), any Transfer-Encoding field fails the whole
+    // request closed -- `inspect_request_policy_body` rejects it
+    // unconditionally, even on this bodyless request, before the serializer
+    // ever runs, so ID4 never reaches a "drop Transfer-Encoding" branch.
+    prepare(
+        "GET /transfer-encoding-fails-closed HTTP/1.1\r\n"
+        "Host: client.example\r\n"
+        "Transfer-Encoding: identity\r\n\r\n");
+    CHECK_FALSE(apply_request_policy(conn, endpoint, kPreserveHost));
+    CHECK_EQ(conn.send_buf.len(), 0u);
 
     // Mixed-case names, a Connection header nominating an extra header, a
     // kept te:trailers, and an appended x-forwarded-proto: http.

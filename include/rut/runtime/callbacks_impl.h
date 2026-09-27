@@ -5786,6 +5786,18 @@ inline RequestPolicyBodyState inspect_request_policy_body(const Connection& conn
     bool has_upgrade = false;
     bool upgrade_value_nonempty = false;
     bool connection_nominates_upgrade = false;
+    // ID4 (host: "preserve") only: tracked here, ahead of any Waiting-
+    // producing check below, so a request whose Host shape is already known
+    // to be invalid (missing, duplicated, or an invalid authority such as
+    // `victim/path`) fails closed immediately rather than waiting for the
+    // rest of an incomplete fixed-length body to arrive -- the same
+    // materialization-time check `apply_preserve_host_lowercase_request_
+    // policy`'s own Pass 1 performs, done here early enough to preempt
+    // `Waiting` (Codex sweep-11 review, PR #696, following the sweep-10 TLS
+    // guard's pattern for the identical class of issue).
+    u32 host_count = 0;
+    const u8* host_value_start = nullptr;
+    u32 host_value_len = 0;
     const u8* hs = line_end + 2;
     const u8* header_end = end - 2;
     while (hs < header_end) {
@@ -5799,6 +5811,14 @@ inline RequestPolicyBodyState inspect_request_policy_body(const Connection& conn
         if (request_policy_name_eq(hs, name_len, "content-length", 14)) cl_count++;
         if (request_policy_name_eq(hs, name_len, "transfer-encoding", 17))
             return RequestPolicyBodyState::Invalid;
+        if (request_policy_name_eq(hs, name_len, "host", 4)) {
+            host_count++;
+            const u8* host_start = colon + 1;
+            const u8* host_end_trim = le;
+            request_policy_trim_ows(host_start, host_end_trim);
+            host_value_start = host_start;
+            host_value_len = static_cast<u32>(host_end_trim - host_start);
+        }
         // Every `te` field is admitted here regardless of its value (see the
         // `has_te` gate below): the serializer evaluates each field
         // independently, canonicalizing a "trailers" token and dropping
@@ -5857,6 +5877,17 @@ inline RequestPolicyBodyState inspect_request_policy_body(const Connection& conn
         has_upgrade |= request_policy_name_eq(hs, name_len, "upgrade", 7);
         hs = le + 2;
     }
+    // ID4 (host: "preserve") only: exactly one Host field with a non-empty,
+    // Envoy-`authorityIsValid`-shaped value (`request_policy_host_authority_
+    // is_valid`, shared with the serializer's own Pass 1 check below) is
+    // required -- missing, duplicated, or malformed (e.g. `victim/path`,
+    // which is not a valid authority) all fail closed here, before the
+    // bodyless early return and any Waiting-producing check further down
+    // (Codex sweep-11 review, PR #696).
+    if (request_policy_preserves_host(policy_id) &&
+        (host_count != 1 || host_value_len == 0 ||
+         !request_policy_host_authority_is_valid(host_value_start, host_value_len)))
+        return RequestPolicyBodyState::Invalid;
     // ID4 (host: "preserve") only: a `Connection` value that nominates
     // "upgrade" alongside "close" (or on its own), together with a
     // semantically-present (non-empty/non-OWS) `Upgrade` header
@@ -5917,8 +5948,18 @@ inline RequestPolicyBodyState inspect_request_policy_body(const Connection& conn
 // every other supported policy, it keeps the client's Host header instead of
 // writing the upstream endpoint. It lowercases every forwarded header name,
 // drops Envoy's hop-by-hop set (host is re-emitted separately; connection,
-// keep-alive, proxy-connection, expect, upgrade, transfer-encoding, and any
-// header nominated by the client's Connection header value are dropped,
+// keep-alive, proxy-connection, expect, upgrade, and any header nominated by
+// the client's Connection header value are dropped -- `transfer-encoding` is
+// NOT among the dropped names: `inspect_request_policy_body` rejects any
+// `transfer-encoding` field outright (`RequestPolicyBodyState::Invalid`)
+// before this serializer ever runs, even for a bodyless request, so a
+// request carrying it never reaches this drop logic at all; this is the one
+// fixed-list name that is fail-closed rather than stripped, matching every
+// other supported policy's own closed contract for it (Codex sweep-11
+// review, PR #696: an earlier revision of this comment described it as
+// dropped here alongside the others, which the inspector's unconditional
+// rejection makes both inaccurate and dead code -- see the explicit
+// fail-closed branch in the emission loop below),
 // except a nomination of `content-length`, `host`, `x-forwarded-for`,
 // `x-forwarded-host`, or `x-forwarded-proto`, or a pseudo-header-shaped
 // nomination (first byte `:`), each of which fails the whole request closed
@@ -6122,6 +6163,12 @@ inline bool apply_preserve_host_lowercase_request_policy(Connection& conn, u16 p
             hs = le + 2;
         }
     }
+    // `inspect_request_policy_body` (Codex sweep-11 review, PR #696) applies
+    // the identical check earlier, in the pre-body admission path, so an
+    // invalid Host shape paired with an incomplete fixed-length body fails
+    // closed immediately rather than waiting for the rest of the body; the
+    // check here is retained too, as defense in depth, the same way the
+    // sweep-10 TLS guard is kept in both places.
     if (host_count != 1 || host_value_len == 0 ||
         !request_policy_host_authority_is_valid(host_value_start, host_value_len))
         return false;
@@ -6315,6 +6362,22 @@ inline bool apply_preserve_host_lowercase_request_policy(Connection& conn, u16 p
                 const bool is_cl = request_policy_name_eq(hs, name_len, "content-length", 14);
                 const bool is_te = request_policy_name_eq(hs, name_len, "te", 2);
                 const bool is_xfp = request_policy_name_eq(hs, name_len, "x-forwarded-proto", 17);
+                // Unreachable in the ordinary call path -- `apply_request_policy`
+                // and this function's own entry both call
+                // `inspect_request_policy_body` first, which rejects any
+                // `transfer-encoding` field with `Invalid` before this loop
+                // ever runs (Codex sweep-11 review, PR #696: an earlier
+                // revision of the contract comment above described
+                // `transfer-encoding` as dropped here like the other
+                // hop-by-hop names, which the inspector's unconditional
+                // rejection makes dead code). Kept as an explicit fail-closed
+                // branch rather than folded into `drop_fixed` (which would
+                // silently strip it and keep forwarding) so a caller that
+                // reaches this function directly, bypassing the inspector,
+                // still cannot have Transfer-Encoding silently dropped from a
+                // body-carrying request -- ambiguous framing must fail the
+                // whole request, not forward it reinterpreted as framing-free.
+                if (request_policy_name_eq(hs, name_len, "transfer-encoding", 17)) return false;
                 const bool drop_fixed =
                     request_policy_name_eq(hs, name_len, "host", 4) ||
                     request_policy_name_eq(hs, name_len, "connection", 10) ||
@@ -6322,7 +6385,6 @@ inline bool apply_preserve_host_lowercase_request_policy(Connection& conn, u16 p
                     request_policy_name_eq(hs, name_len, "proxy-connection", 16) ||
                     request_policy_name_eq(hs, name_len, "expect", 6) ||
                     request_policy_name_eq(hs, name_len, "upgrade", 7) ||
-                    request_policy_name_eq(hs, name_len, "transfer-encoding", 17) ||
                     request_policy_is_stripped_client_envoy_header(hs, name_len);
                 // Envoy's `sanitizeConnectionHeader` splits TE's value on
                 // commas and keeps the header only when one token

@@ -57,8 +57,14 @@ enum class RequestPolicyId : u16 {
     // other unsupported combination) on a connection this runtime itself
     // terminated with TLS (`conn.tls_active`) -- it never synthesizes
     // `https` instead. Ordinary-forward-only: never admitted alongside a
-    // response read deadline or response buffering (see the closed
-    // admission predicates below).
+    // response read deadline, response buffering (see the closed admission
+    // predicates below), or a `target_transform` request-target rewrite --
+    // that combination has no proven interaction with this profile and is
+    // rejected at analyze time (`analyze_term`, src/compiler/analyze.cc)
+    // with a dedicated diagnostic for ordinary Rut source, and independently
+    // at runtime (`handle_jit_outcome`'s preflight,
+    // include/rut/runtime/callbacks_impl.h) for a direct-RIR/JIT-constructed
+    // outcome that bypasses the analyzer entirely.
     Http11PreserveHostLowercase = 4,
     // Reserved in the 16-bit forward-result slot for invalid direct-RIR values.
     Invalid = 0xffffu,

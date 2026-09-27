@@ -348,7 +348,11 @@ return forward(users, request_policy: {
 // the token, and every other physical TE field is suppressed (e.g.
 // `TE: gzip`, then `X-Middle`, then `TE: trailers` forwards `te: trailers`
 // before `x-middle`, not the `gzip` field dropped in place with `trailers`
-// kept separately). A Connection nomination of `te` itself does not force a
+// kept separately); Transfer-Encoding is NOT canonicalized or dropped the
+// way TE is -- any Transfer-Encoding field fails the whole request closed
+// (400, no upstream contact) before this serializer runs at all, even on a
+// bodyless request, matching every other supported policy's own closed
+// contract for it. A Connection nomination of `te` itself does not force a
 // drop -- this same trailers check decides its fate, matching Envoy's own
 // nomination special case; rejects Connection nominating `upgrade` alongside an Upgrade header
 // whose trimmed raw value is non-empty (even with `close`) but admits a bare
@@ -381,7 +385,11 @@ return forward(users, request_policy: {
 // for external requests, plus one Rut-side hardening addition, seventeen in
 // total (`x-envoy-internal`, fourteen more `x-envoy-*` names,
 // `x-forwarded-client-cert`, and `x-envoy-external-address`;
-// docs/envoy-compatibility.md).
+// docs/envoy-compatibility.md). ID4 is ordinary-forward-only: pairing it with
+// a response read timeout, response buffering, or a target_transform
+// (forward(upstream, set_path: "...")) request-target rewrite fails at
+// compile time with a dedicated diagnostic -- none of the three has a
+// proven interaction with this profile.
 return forward(users, request_policy: {
     version: "HTTP/1.1", host: "preserve", connection: "omit",
     header_names: "lowercase", forwarded_proto: "http",

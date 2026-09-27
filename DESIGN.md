@@ -2038,7 +2038,16 @@ zero-copy-shaped forwards: a request with a body paired with a client
 framing (no `100 Continue` interim-response support exists yet); an empty
 or OWS-only `Expect` field is admitted like a request with no `Expect`
 header at all, matching the same nonempty-trimmed-value condition described
-above. See `docs/language-card.md` for the exact field grammar and
+above. `host: "preserve"` (ID4) is additionally ordinary-forward-only: a
+route pairing it with a response read timeout, response buffering, or a
+`target_transform` (`forward(upstream, set_path: "...")`) request-target
+rewrite fails at compile time with a dedicated diagnostic (`analyze_term`,
+`src/compiler/analyze.cc`) rather than the generic response-read-timeout/
+buffering diagnostics, since none of the three has a proven interaction with
+this profile; a direct-RIR/JIT-constructed outcome that bypasses the
+analyzer is independently rejected by the same runtime preflight that
+enforces every other ID4 admission rule. See `docs/language-card.md` for the
+exact field grammar and
 `docs/envoy-converter.md` for the byte-level Envoy oracle this profile is
 verified against. A parallel, separately-closed `response_policy` exists for
 response-side rewriting; see `docs/language-card.md`.
