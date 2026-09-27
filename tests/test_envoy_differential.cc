@@ -633,17 +633,104 @@ constexpr char kPersistenceMismatchReason[] =
     "persistence mismatch: peer closed the connection after a response that did not "
     "advertise Connection: close";
 
-// Reads one complete HTTP/1.x message from `fd`: headers up to the blank
-// line, then a body framed by Content-Length (skipped entirely when
-// `head_request` is true, per RFC 9110 §9.3.2), else read-to-EOF. Bounded by
-// `timeout_ms` total. Always returns whatever was captured, even on a
-// partial read, but `complete` is false whenever the framing did not finish
-// (record-only cases must check it; see ReadResult).
+// Sweep-13 review, "Stop patching individual branches": every prior sweep on
+// this file's response-length framing (sweep-12 and earlier) fixed one
+// branch of read_http_message() at a time -- the HEAD branch, the
+// Content-Length branch, the fallback branch -- each with its own
+// hand-written copy of the same "does this message even have a body"
+// question. That let the SAME bug class (bytes already buffered with the
+// headers being silently dropped) recur three times in three different
+// shapes across three sweeps. Pulled out into one place instead: the body
+// framing decision RFC 9112 §6.3 makes, in the exact order that section
+// lists it.
+enum class BodyFraming : std::uint8_t {
+    // RFC 9112 §6.3 point 1: no body is EVER permitted here, regardless of
+    // any Content-Length/Transfer-Encoding header present -- any response
+    // to a HEAD request, or one whose status is 1xx/204/304.
+    kNoBody,
+    // RFC 9112 §6.3 point 3 (this harness implements no chunked-transfer
+    // decoding, so ANY Transfer-Encoding value is unacceptable to it) /
+    // point 6 (any Transfer-Encoding at all takes priority over
+    // Content-Length): framing is indeterminate to this reader; fail
+    // closed rather than guess wrong and desync a persistent connection's
+    // framing for whatever follows.
+    kUnsupportedTransferEncoding,
+    // RFC 9112 §6.3 point 6: an exact byte count from a valid
+    // Content-Length header.
+    kContentLength,
+    // RFC 9112 §6.3 point 7: a RESPONSE with neither header is framed by
+    // the eventual connection close, regardless of whether `Connection:
+    // close` was actually advertised -- read until EOF or the deadline.
+    kUntilClose,
+};
+
+struct BodyFramingDecision {
+    BodyFraming kind;
+    // Valid only when `kind == BodyFraming::kContentLength`.
+    size_t content_length = 0;
+};
+
+// The RFC 9112 §6.3 decision itself, as a pure function of the message's
+// shape -- no I/O, directly table-tested by
+// self_test_body_framing_decision_table() below against every row the
+// section describes, including the request row (point 8: "there is no
+// content") that read_http_message() below never itself exercises (it only
+// ever reads responses), so this function's own correctness there is
+// otherwise unverified.
 //
-// For a HEAD response specifically, RFC 9110 §9.3.2 forbids a body; after
-// the header terminator this waits up to kTrailingBytesGraceMs for the peer to
-// send one anyway (in a later TCP segment) so a violation shows up as extra
-// bytes here instead of being silently dropped by returning immediately.
+// `is_response`: true for a response (may be close-delimited, point 7);
+// false for a request (point 8: neither header present means a
+// zero-length body, never close-delimited -- a request has no "eventual
+// connection close" framing of its own).
+// `forbids_body`: true when the message's own type/status never permits a
+// body no matter what the headers say (point 1).
+// `has_content_length`/`content_length`: the parsed Content-Length header,
+// if the message carries a syntactically valid one.
+// `has_transfer_encoding`: whether a Transfer-Encoding header is present
+// at all, valid or not -- this reader accepts none of them.
+BodyFramingDecision decide_body_framing(bool is_response,
+                                        bool forbids_body,
+                                        bool has_content_length,
+                                        size_t content_length,
+                                        bool has_transfer_encoding) {
+    if (forbids_body) return {BodyFraming::kNoBody, 0};
+    if (has_transfer_encoding) return {BodyFraming::kUnsupportedTransferEncoding, 0};
+    if (has_content_length) return {BodyFraming::kContentLength, content_length};
+    if (is_response) return {BodyFraming::kUntilClose, 0};
+    return {BodyFraming::kNoBody, 0};
+}
+
+// Parses the numeric status code from a response's status line (the first
+// line of `headers`, e.g. "HTTP/1.1 204 No Content"). Returns -1 when the
+// line is not shaped like `<token> <3-digit-code> ...` -- decide_body_
+// framing()'s caller then simply does not treat the response as
+// status-forbidden, which is the safe default for a malformed line another
+// check elsewhere is responsible for rejecting.
+int parse_response_status_code(const std::string& headers) {
+    const size_t line_end = headers.find("\r\n");
+    const std::string status_line =
+        line_end == std::string::npos ? headers : headers.substr(0, line_end);
+    const size_t sp1 = status_line.find(' ');
+    if (sp1 == std::string::npos || status_line.size() < sp1 + 4) return -1;
+    const char c0 = status_line[sp1 + 1];
+    const char c1 = status_line[sp1 + 2];
+    const char c2 = status_line[sp1 + 3];
+    if (!isdigit(static_cast<unsigned char>(c0)) || !isdigit(static_cast<unsigned char>(c1)) ||
+        !isdigit(static_cast<unsigned char>(c2)))
+        return -1;
+    return (c0 - '0') * 100 + (c1 - '0') * 10 + (c2 - '0');
+}
+
+// Reads one complete HTTP/1.x message (a response; see decide_body_framing()
+// for the request-side rule this reader itself never exercises) from `fd`:
+// headers up to the blank line, then a body framed exactly as decide_body_
+// framing() decides from those headers plus this response's own head_
+// request/status-code context. Bounded by `timeout_ms` total. Always
+// returns whatever was captured, even on a partial read, but `complete` is
+// false whenever the framing did not finish, OR whenever a body-forbidden
+// message received body bytes anyway -- whether they were already sitting
+// in `buf` from the same read as the headers, or arrived later during a
+// bounded grace window (record-only cases must check it; see ReadResult).
 //
 // `client_requested_close` says whether the REQUEST this response answers
 // carried `Connection: close`: RFC 9112 §9.6 obliges the server to close
@@ -671,7 +758,9 @@ ReadResult read_http_message(int fd,
     const std::string headers = buf.substr(0, header_end);
     std::string cl_value;
     std::string connection_value;
+    std::string te_value;
     const bool has_cl = find_header(headers, "Content-Length", &cl_value);
+    const bool has_te = find_header(headers, "Transfer-Encoding", &te_value);
     find_header(headers, "Connection", &connection_value);
     std::transform(connection_value.begin(),
                    connection_value.end(),
@@ -679,39 +768,42 @@ ReadResult read_http_message(int fd,
                    [](unsigned char c) { return std::tolower(c); });
     const bool advertises_close =
         connection_value.find("close") != std::string::npos || client_requested_close;
-    if (head_request) {
-        // A HEAD response never carries a body (RFC 9110 §9.3.2): the
-        // headers are the entire message, so finding the blank line is
-        // completion. Still wait up to kTrailingBytesGraceMs for the peer to
-        // send one anyway (in a later TCP segment) so a violation shows up
-        // as extra captured bytes instead of being silently dropped by
-        // returning immediately. An EOF in that window is fine only when
-        // the response advertised `Connection: close`; otherwise the peer
-        // closed a connection it declared persistent (round-7 review,
-        // "Reject EOF on responses advertised as persistent", applied to
-        // head_smoke the same way as to the Content-Length branch below).
-        // An abortive close (a non-retryable negative recv(), most notably
-        // ECONNRESET) is treated the same as that unexpected EOF: `poll()`
-        // reports the fd readable, but `recv()` returning -1 instead of 0 is
-        // not proof of an orderly close the old `if (n <= 0) break;` used to
-        // let through unexamined (round-8 review, "Reject resets during the
-        // persistent-response grace check"). A retryable error
-        // (EINTR/EAGAIN/EWOULDBLOCK, a spurious wakeup) just waits out the
-        // rest of the grace window instead.
-        //
-        // Sweep-12 review, "Reject HEAD bodies already buffered with the
-        // headers": the grace loop below only ever notices a forbidden body
-        // that arrives via one of ITS OWN recv() calls, i.e. strictly after
-        // the header-reading loop above already returned. When a peer sends
-        // the header terminator and the forbidden body in the same TCP
-        // write, that header-reading loop's own recv() can capture both at
-        // once, leaving the body bytes already sitting in `buf` beyond
-        // `header_end + 4` before the grace loop ever runs -- and since
-        // nothing more is coming over the wire, the grace loop's poll()
-        // simply times out seeing nothing NEW, reporting the exchange
-        // complete despite the violation. Check for that pre-existing
-        // excess up front, exactly like the Content-Length branch below
-        // now does for the equivalent case.
+    size_t content_length = 0;
+    if (has_cl) {
+        char* end = nullptr;
+        const long want = strtol(cl_value.c_str(), &end, 10);
+        content_length = want > 0 ? static_cast<size_t>(want) : 0u;
+    }
+    const int status_code = parse_response_status_code(headers);
+    // RFC 9112 §6.3 point 1: a HEAD response, or one whose status is
+    // 1xx/204/304, never has a body -- independent of head_request for the
+    // status-code half, since a non-HEAD request can still receive one of
+    // these.
+    const bool forbids_body = head_request || status_code == 204 || status_code == 304 ||
+                              (status_code >= 100 && status_code < 200);
+    const BodyFramingDecision decision =
+        decide_body_framing(/*is_response=*/true, forbids_body, has_cl, content_length, has_te);
+
+    if (decision.kind == BodyFraming::kUnsupportedTransferEncoding) {
+        // RFC 9112 §6.3 point 3/point 6: a Transfer-Encoding this reader
+        // cannot decode (it implements no chunked-transfer support at all)
+        // makes the message's framing indeterminate to it; guessing wrong
+        // (e.g. treating the encoded bytes as a literal body) could
+        // silently desync a persistent connection's framing for whatever
+        // request/response follows, so this fails closed instead.
+        return {buf, false, {}};
+    }
+
+    if (decision.kind == BodyFraming::kNoBody) {
+        // RFC 9112 §6.3 point 1: no body is EVER permitted here. Sweep-13
+        // review, "Reject delayed body bytes in HEAD responses" (the same
+        // rule now applies uniformly to every no-body status, not just
+        // HEAD): ANY byte beyond the header terminator is a framing
+        // violation, whether it was already sitting in `buf` from the same
+        // read as the headers (sweep-12 review) or arrives later during
+        // this grace window -- return incomplete the instant either is
+        // observed, rather than merely capturing it and still reporting
+        // complete=true.
         if (buf.size() > header_end + 4) return {buf, false, {}};
         const int64_t grace_deadline = now_ms() + kTrailingBytesGraceMs;
         for (;;) {
@@ -725,22 +817,28 @@ ReadResult read_http_message(int fd,
             }
             if (pr == 0) break;
             const ssize_t n = recv(fd, chunk, sizeof(chunk), 0);
-            if (n == 0 && !advertises_close) return {buf, false, kPersistenceMismatchReason};
-            if (n == 0) break;
-            if (n < 0) {
-                if (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK) continue;
+            // A retryable error (EINTR/EAGAIN/EWOULDBLOCK, a spurious
+            // wakeup) just waits out the rest of the grace window. An
+            // orderly EOF (n == 0) or a non-retryable negative recv() (most
+            // notably ECONNRESET) is fine only when the response advertised
+            // `Connection: close`; otherwise the peer closed a connection
+            // it declared persistent (round-7/round-8 reviews). Any actual
+            // byte (n > 0) is a body-forbidden violation, full stop.
+            if (n > 0) return {buf, false, {}};
+            if (n == 0) {
                 if (!advertises_close) return {buf, false, kPersistenceMismatchReason};
                 break;
             }
-            buf.append(chunk, static_cast<size_t>(n));
+            if (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK) continue;
+            if (!advertises_close) return {buf, false, kPersistenceMismatchReason};
+            break;
         }
         return {buf, true, {}};
     }
-    const size_t body_start = header_end + 4;
-    if (has_cl) {
-        char* end = nullptr;
-        const long want = strtol(cl_value.c_str(), &end, 10);
-        const size_t total = body_start + (want > 0 ? static_cast<size_t>(want) : 0u);
+
+    if (decision.kind == BodyFraming::kContentLength) {
+        const size_t body_start = header_end + 4;
+        const size_t total = body_start + decision.content_length;
         while (buf.size() < total) {
             const int64_t remaining = deadline - now_ms();
             if (remaining <= 0) return {buf, false, {}};
@@ -832,32 +930,32 @@ ReadResult read_http_message(int fd,
             return {buf, false, kPersistenceMismatchReason};
         }
     }
-    if (advertises_close) {
-        for (;;) {
-            const int64_t remaining = deadline - now_ms();
-            if (remaining <= 0) return {buf, false, {}};
-            pollfd pfd{fd, POLLIN, 0};
-            const int pr = poll(&pfd, 1, static_cast<int>(remaining));
-            if (pr <= 0) return {buf, false, {}};
-            const ssize_t n = recv(fd, chunk, sizeof(chunk), 0);
-            // EOF (n == 0) is the expected terminator for close-delimited
-            // framing, i.e. completion, not a partial read. Any other
-            // failure (n < 0) is a real partial exchange.
-            if (n == 0) return {buf, true, {}};
-            if (n < 0) return {buf, false, {}};
-            buf.append(chunk, static_cast<size_t>(n));
-        }
+
+    // BodyFraming::kUntilClose: RFC 9112 §6.3 point 7, a response with
+    // neither Content-Length nor Transfer-Encoding is framed by the
+    // eventual connection close REGARDLESS of whether `Connection: close`
+    // was actually advertised (sweep-13 review, "Read implicitly
+    // close-delimited response bodies to EOF" -- the old code only read to
+    // EOF when `advertises_close` was true, and otherwise declared the
+    // message complete at the header terminator, silently dropping every
+    // later body byte reaching a truncated capture into pair/oracle
+    // comparisons). Always read until EOF or the overall deadline; hitting
+    // the deadline without ever observing EOF is incomplete, never a
+    // success -- there is no other terminator for this framing.
+    for (;;) {
+        const int64_t remaining = deadline - now_ms();
+        if (remaining <= 0) return {buf, false, {}};
+        pollfd pfd{fd, POLLIN, 0};
+        const int pr = poll(&pfd, 1, static_cast<int>(remaining));
+        if (pr <= 0) return {buf, false, {}};
+        const ssize_t n = recv(fd, chunk, sizeof(chunk), 0);
+        // EOF (n == 0) is the expected terminator for close-delimited
+        // framing, i.e. completion, not a partial read. Any other failure
+        // (n < 0) is a real partial exchange.
+        if (n == 0) return {buf, true, {}};
+        if (n < 0) return {buf, false, {}};
+        buf.append(chunk, static_cast<size_t>(n));
     }
-    // Neither Content-Length nor Connection: close: framing is fully
-    // determined by the headers alone (assumed zero-length body), so this is
-    // complete as soon as the blank line was found above -- unless bytes
-    // beyond the header terminator are already sitting in `buf` (sweep-12
-    // review, "Reject already-buffered bytes beyond Content-Length": the
-    // same class of bug as the HEAD and Content-Length branches above,
-    // applied here too -- a body arriving in the same read as the headers
-    // when the headers themselves declared a zero-length body).
-    if (buf.size() > header_end + 4) return {buf, false, {}};
-    return {buf, true, {}};
 }
 
 // ── Listener ownership probe ────────────────────────────────────────────
@@ -1840,24 +1938,43 @@ struct EnvoyInstance {
         }
         const int64_t deadline = now_ms() + 5000;
         bool escalated = false;
+        // Sweep-13 review, "Reject teardown when no child status was
+        // reaped": mirrors the identical fix in `RutInstance::stop()` (same
+        // file) -- `status` was zero-initialized above and is otherwise
+        // never written except by a successful reap, so the pre-existing
+        // ECHILD branch just below used to fall through to the `clean`
+        // check with `status` still zero, which WIFEXITED(0)/WEXITSTATUS(0)
+        // decode indistinguishably from a real exit-0 status. `reaped`
+        // tracks whether any waitpid() call in this function's teardown
+        // actually reaped one, so that phantom zero status can never be
+        // mistaken for evidence of anything.
+        bool reaped = false;
         for (;;) {
             const pid_t waited = waitpid(pid, &status, WNOHANG);
-            if (waited == pid) break;
+            if (waited == pid) {
+                reaped = true;
+                break;
+            }
             if (waited < 0 && errno == ECHILD) {
                 // Already reaped by someone else (e.g. a caller that
                 // explicitly waitpid()'d this pid before dropping the
-                // EnvoyInstance) -- round-9 review, "Treat ECHILD as an
-                // already-stopped child". Without this, a stale/reaped pid
-                // would sit through the full 5s deadline below and then be
-                // signaled again, potentially hitting an unrelated process
-                // if the pid has since been recycled.
+                // EnvoyInstance), or -- the case this review adds -- this
+                // process has SIGCHLD set to SIG_IGN (or otherwise auto-
+                // reaps children), so the kernel reaped `pid` out from under
+                // this very call the instant it exited in response to the
+                // SIGTERM above (round-9 review, "Treat ECHILD as an
+                // already-stopped child"). Without `reaped` staying false
+                // here, a stale/reaped pid would otherwise be misread as a
+                // clean exit 0 instead of failing closed.
                 break;
             }
             if (now_ms() >= deadline) {
                 kill(pid, SIGKILL);
                 escalated = true;
-                while (waitpid(pid, &status, 0) < 0 && errno == EINTR) {
+                pid_t reap_waited;
+                while ((reap_waited = waitpid(pid, &status, 0)) < 0 && errno == EINTR) {
                 }
+                reaped = (reap_waited == pid);
                 break;
             }
             struct timespec ts{0, 10'000'000};
@@ -1884,17 +2001,21 @@ struct EnvoyInstance {
         //   - killed by SIGKILL: only when this call escalated (the docker
         //     client itself did not exit within the grace period).
         // Anything else -- a crash signal reported as exit 134/139, any
-        // other nonzero exit, a signal death this call did not send, or a
-        // SIGTERM-shaped status when the SIGTERM was never delivered -- is
-        // unexpected, however it was reaped.
-        const bool clean = escalated ? (WIFSIGNALED(status) && WTERMSIG(status) == SIGKILL)
-                                     : (WIFEXITED(status) &&
-                                        (WEXITSTATUS(status) == 128 + SIGKILL ||
-                                         (term_sent && (WEXITSTATUS(status) == 0 ||
-                                                        WEXITSTATUS(status) == 128 + SIGTERM))));
+        // other nonzero exit, a signal death this call did not send, a
+        // SIGTERM-shaped status when the SIGTERM was never delivered, or no
+        // status reaped at all -- is unexpected, however it was (or was
+        // not) reaped.
+        const bool clean =
+            reaped && (escalated ? (WIFSIGNALED(status) && WTERMSIG(status) == SIGKILL)
+                                 : (WIFEXITED(status) &&
+                                    (WEXITSTATUS(status) == 128 + SIGKILL ||
+                                     (term_sent && (WEXITSTATUS(status) == 0 ||
+                                                    WEXITSTATUS(status) == 128 + SIGTERM)))));
         if (!clean) {
             exited_unexpectedly = true;
-            unexpected_exit_description = describe_wait_status(status);
+            unexpected_exit_description =
+                reaped ? describe_wait_status(status)
+                       : "no child status could be reaped (waitpid failed, e.g. ECHILD)";
             return false;
         }
         if (docker_cleanup_failed) {
@@ -2416,21 +2537,39 @@ struct RutInstance {
         const bool term_sent = kill(pid, SIGTERM) == 0;
         const int64_t deadline = now_ms() + 5000;
         bool escalated = false;
+        // Sweep-13 review, "Reject teardown when no child status was
+        // reaped": tracks whether a waitpid() call in this loop actually
+        // reaped `status`, as opposed to merely exiting the loop. `status`
+        // was zero-initialized above and is otherwise never written except
+        // by a successful reap; without this, a `waited < 0` failure (most
+        // commonly ECHILD when this process has inherited SIGCHLD as
+        // SIG_IGN, or otherwise has children auto-reaped, so the kernel
+        // reaps `pid` out from under every waitpid() call here the instant
+        // it exits) fell through to the `clean` check below with `status`
+        // still zero -- and WIFEXITED(0)/WEXITSTATUS(0) decode a
+        // zero-initialized status as "exited 0" indistinguishably from a
+        // real one, so a child that actually crashed, or never even
+        // received the SIGTERM this call thinks it sent, could still be
+        // reported as a clean teardown.
+        bool reaped = false;
         for (;;) {
             const pid_t waited = waitpid(pid, &status, WNOHANG);
-            if (waited == pid) break;
+            if (waited == pid) {
+                reaped = true;
+                break;
+            }
             if (waited < 0 && errno != EINTR) {
-                // No such child left to wait for (consistent with
-                // `term_sent` already being false above): nothing will ever
-                // come back from waitpid() for this pid, so stop spinning
-                // instead of waiting out the full deadline.
+                // No status was ever reaped here (see the comment above);
+                // `reaped` stays false and `status` must not be trusted.
                 break;
             }
             if (now_ms() >= deadline) {
                 kill(pid, SIGKILL);
                 escalated = true;
-                while (waitpid(pid, &status, 0) < 0 && errno == EINTR) {
+                pid_t reap_waited;
+                while ((reap_waited = waitpid(pid, &status, 0)) < 0 && errno == EINTR) {
                 }
+                reaped = (reap_waited == pid);
                 break;
             }
             struct timespec ts{0, 10'000'000};
@@ -2452,13 +2591,17 @@ struct RutInstance {
         // produce a plain exit 0; a SIGTERM that did not (this call
         // escalated to SIGKILL) must produce death by exactly that signal.
         // Anything else -- a crash signal, a nonzero exit, escaping SIGKILL,
-        // or a plain exit 0 this call never actually signaled (`term_sent`
-        // false) -- is unexpected, however it was reaped.
-        const bool clean = escalated ? (WIFSIGNALED(status) && WTERMSIG(status) == SIGKILL)
-                                     : (term_sent && WIFEXITED(status) && WEXITSTATUS(status) == 0);
+        // a plain exit 0 this call never actually signaled (`term_sent`
+        // false), or no status reaped at all -- is unexpected, however it
+        // was (or was not) reaped.
+        const bool clean =
+            reaped && (escalated ? (WIFSIGNALED(status) && WTERMSIG(status) == SIGKILL)
+                                 : (term_sent && WIFEXITED(status) && WEXITSTATUS(status) == 0));
         if (!clean) {
             exited_unexpectedly = true;
-            unexpected_exit_description = describe_wait_status(status);
+            unexpected_exit_description =
+                reaped ? describe_wait_status(status)
+                       : "no child status could be reaped (waitpid failed, e.g. ECHILD)";
             return false;
         }
         return true;
@@ -3504,6 +3647,84 @@ bool is_rfc1123_http_date(const std::string& value) {
     return true;
 }
 
+// How far a synthesized Date may drift from the real clock and still be
+// accepted as "current" (sweep-13 review, "Validate synthesized Date values
+// before normalizing them"). Generous enough to absorb clock skew and this
+// harness's own bounded per-case latencies, while still catching the actual
+// bug class: a hard-coded or otherwise stuck synthesized value, which is
+// wrong by orders of magnitude more than this.
+constexpr int kDateStalenessToleranceSeconds = 300;
+
+// True iff `value` -- already confirmed RFC 1123-shaped and calendar-valid
+// by is_rfc1123_http_date() -- names a moment within `tolerance_seconds` of
+// `now` (both UTC/GMT, matching HTTP Date's own timezone). Round-7 review's
+// is_rfc1123_http_date() alone only confirmed the value was SHAPED like a
+// real date; it accepted a syntactically valid but arbitrarily wrong one
+// just as happily as a genuinely live "now" value, so normalize_date_for_
+// compare() below would replace both a live Envoy Date and a hard-coded,
+// decades-stale RUT Date with the same placeholder and report a match
+// (sweep-13 review) even though a real client received a stale timestamp.
+bool rfc1123_http_date_is_current(const std::string& value, time_t now, int tolerance_seconds) {
+    // Re-parses the same fixed-offset fields is_rfc1123_http_date() already
+    // validated the shape of; this function is only ever called after that
+    // check has passed, so no re-validation of weekday/day-of-month
+    // correctness is needed here.
+    const char* date = value.data();
+    static const char* const kMonths[] = {
+        "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"};
+    int month_index = -1;
+    for (size_t i = 0; i < 12; i++) {
+        if (memcmp(date + 8, kMonths[i], 3) == 0) {
+            month_index = static_cast<int>(i);
+            break;
+        }
+    }
+    if (month_index < 0) return false;
+    const auto two_digits = [&](size_t offset) {
+        return static_cast<unsigned>(date[offset] - '0') * 10u +
+               static_cast<unsigned>(date[offset + 1] - '0');
+    };
+    struct tm parsed{};
+    parsed.tm_mday = static_cast<int>(two_digits(5));
+    parsed.tm_mon = month_index;
+    parsed.tm_year = static_cast<int>((date[12] - '0') * 1000 + (date[13] - '0') * 100 +
+                                      (date[14] - '0') * 10 + (date[15] - '0')) -
+                     1900;
+    parsed.tm_hour = static_cast<int>(two_digits(17));
+    parsed.tm_min = static_cast<int>(two_digits(20));
+    parsed.tm_sec = static_cast<int>(two_digits(23));
+    const time_t parsed_time = timegm(&parsed);
+    if (parsed_time == static_cast<time_t>(-1)) return false;
+    const long long diff = static_cast<long long>(parsed_time) - static_cast<long long>(now);
+    return diff >= -tolerance_seconds && diff <= tolerance_seconds;
+}
+
+// Formats `t` (interpreted as UTC/GMT) in the exact 29-byte RFC 1123 shape
+// is_rfc1123_http_date() requires, independent of the process locale (unlike
+// strftime's %a/%b, which are locale-dependent). Used to build self-test
+// fixtures relative to the real clock instead of arbitrary fixed dates that
+// would otherwise fail the new staleness check above regardless of the
+// property actually under test.
+std::string format_rfc1123_http_date(time_t t) {
+    struct tm tm_buf{};
+    gmtime_r(&t, &tm_buf);
+    static const char* const kWeekdays[] = {"Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"};
+    static const char* const kMonths[] = {
+        "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"};
+    char buf[30];
+    std::snprintf(buf,
+                  sizeof(buf),
+                  "%s, %02d %s %04d %02d:%02d:%02d GMT",
+                  kWeekdays[tm_buf.tm_wday],
+                  tm_buf.tm_mday,
+                  kMonths[tm_buf.tm_mon],
+                  tm_buf.tm_year + 1900,
+                  tm_buf.tm_hour,
+                  tm_buf.tm_min,
+                  tm_buf.tm_sec);
+    return std::string(buf);
+}
+
 // Returns `raw` with its `date:` header value replaced by a fixed
 // placeholder, UNLESS that value is exactly `preserved_date` (the literal
 // the recording upstream sent for `get_upstream_date_server`, which Envoy
@@ -3518,9 +3739,25 @@ bool is_rfc1123_http_date(const std::string& value) {
 // and `*dates_valid` is cleared, so the caller fails the case instead of
 // letting the placeholder erase a real regression (round-7 review). Every
 // well-formed (or absent) Date leaves `*dates_valid` untouched.
+//
+// `require_current` (sweep-13 review, "Validate synthesized Date values
+// before normalizing them"): when true (the default -- every LIVE value a
+// proxy synthesizes during this run, on either side of a pair comparison,
+// or RUT's own live value in an oracle comparison), the value must also
+// pass rfc1123_http_date_is_current() against `now`/`tolerance_seconds`, or
+// it is treated exactly like a malformed one. Pass false only for a FROZEN,
+// previously-recorded reference value that was never live during this run
+// -- namely the oracle fixture's own recorded Date in compare_case_against_
+// oracle(): that value was genuinely "now" at record time, not at compare
+// time, so requiring it to also be close to the CURRENT clock would fail
+// every oracle comparison as soon as the recording aged past the tolerance
+// window, which is not the bug this review describes.
 std::string normalize_date_for_compare(const std::string& raw,
                                        const std::string& preserved_date,
-                                       bool* dates_valid) {
+                                       bool* dates_valid,
+                                       bool require_current = true,
+                                       time_t now = time(nullptr),
+                                       int tolerance_seconds = kDateStalenessToleranceSeconds) {
     const size_t header_end = raw.find("\r\n\r\n");
     if (header_end == std::string::npos) return raw;
     const std::string head = raw.substr(0, header_end);
@@ -3560,9 +3797,11 @@ std::string normalize_date_for_compare(const std::string& raw,
         // `preserved_date` itself is non-empty (i.e. this really is
         // `get_upstream_date_server`).
         if (preserved_date.empty() || trimmed != preserved_date) {
-            if (!is_rfc1123_http_date(trimmed)) {
+            if (!is_rfc1123_http_date(trimmed) ||
+                (require_current &&
+                 !rfc1123_http_date_is_current(trimmed, now, tolerance_seconds))) {
                 *dates_valid = false;
-                continue;  // leave the malformed value visible in the output
+                continue;  // leave the malformed/stale value visible in the output
             }
             // Replace only the value bytes, keeping the exact prefix (the
             // whitespace between ':' and the value, which may differ
@@ -3653,7 +3892,23 @@ bool write_transcript(const std::string& path, const std::vector<CaseResult>& re
     // truncated (or empty) file was left on disk.
     out.flush();
     out.close();
-    return out.good();
+    if (!out.good()) {
+        // Sweep-13 review, "Remove failed transcript files before artifact
+        // upload": both this oracle transcript and write_pair_transcript()'s
+        // pair transcript are uploaded with `if: always()` in
+        // .github/workflows/ci.yml, so any post-open() failure here --
+        // a failed write, flush, fsync, or close (e.g. ENOSPC or a
+        // filesystem quota) -- would otherwise leave a partially-written,
+        // truncated .inc file sitting at `path` for that upload to publish
+        // as if it were complete evidence. Unlink it instead. Best-effort:
+        // unlink()'s own result is not checked -- there is nothing further
+        // this function can do about a filesystem that also refuses to
+        // remove the file it could not finish writing, and the caller
+        // already treats this return as a hard failure regardless.
+        unlink(path.c_str());
+        return false;
+    }
+    return true;
 }
 
 // One case's paired Envoy/RUT observation (--pair-milestone-s, PR 6).
@@ -3802,7 +4057,17 @@ bool write_pair_transcript(const std::string& path, const std::vector<PairCaseRe
     // left on disk.
     out.flush();
     out.close();
-    return out.good();
+    if (!out.good()) {
+        // Sweep-13 review, "Remove failed transcript files before artifact
+        // upload": see write_transcript()'s identical fix (same file) --
+        // this pair transcript is uploaded with `if: always()` too, so a
+        // truncated file left behind after any post-open() failure here
+        // could be published as if it were complete evidence. Best-effort,
+        // same as there.
+        unlink(path.c_str());
+        return false;
+    }
+    return true;
 }
 
 int count_header(const std::string& raw, const std::string& name) {
@@ -6211,6 +6476,105 @@ bool self_test_record_only_crash_reason_precedence_over_reuseport() {
     }
 
     if (ok) std::cerr << "PASS [self-test crash reason precedence over reuseport]\n";
+    return ok;
+}
+
+// Sweep-13 review, "Remove failed transcript files before artifact upload":
+// forces a real write() failure on a REAL regular file (so unlink() can be
+// observed afterward, unlike /dev/full's write()-always-fails-with-ENOSPC
+// character device, which the review also names as an example mechanism but
+// which is not a path this test could assert anything got removed FROM) by
+// lowering this process's RLIMIT_FSIZE to a handful of bytes -- far below
+// either transcript's real content size -- immediately before the write.
+// SIGXFSZ's default disposition would otherwise terminate this process the
+// instant that limit is exceeded; ignored here (and restored, along with
+// the rlimit itself, unconditionally before returning) so the kernel
+// reports it as an ordinary EFBIG-failed write() instead, exactly the class
+// of post-open() failure (write/flush/fsync/close) the review describes.
+bool self_test_transcript_write_failure_unlinks_destination() {
+    bool ok = true;
+    TempDir dir("rut-diff-selftest-transcript-write-failure");
+    if (dir.empty()) {
+        std::cerr << "FAIL [self-test transcript write failure]: could not create temp dir\n";
+        return false;
+    }
+    struct sigaction old_xfsz{};
+    struct sigaction ignore_xfsz{};
+    ignore_xfsz.sa_handler = SIG_IGN;
+    sigemptyset(&ignore_xfsz.sa_mask);
+    ignore_xfsz.sa_flags = 0;
+    if (sigaction(SIGXFSZ, &ignore_xfsz, &old_xfsz) != 0) {
+        std::cerr << "FAIL [self-test transcript write failure]: could not ignore SIGXFSZ\n";
+        return false;
+    }
+    struct rlimit old_limit{};
+    getrlimit(RLIMIT_FSIZE, &old_limit);
+    struct rlimit tiny_limit = old_limit;
+    tiny_limit.rlim_cur = 16;  // every transcript this test writes is far bigger
+    const bool limit_set = setrlimit(RLIMIT_FSIZE, &tiny_limit) == 0;
+    const auto restore = [&] {
+        if (limit_set) setrlimit(RLIMIT_FSIZE, &old_limit);
+        sigaction(SIGXFSZ, &old_xfsz, nullptr);
+    };
+    if (!limit_set) {
+        std::cerr << "FAIL [self-test transcript write failure]: could not set RLIMIT_FSIZE\n";
+        restore();
+        return false;
+    }
+
+    // write_transcript(): one real, valid asserted CaseResult -- its
+    // rendered content alone is already far larger than the 16-byte limit.
+    {
+        const std::string path = dir.path() + "/oracle.inc";
+        CaseResult r;
+        r.name = "get_smoke";
+        r.exchange_complete = true;
+        r.upstream_contacted = true;
+        r.upstream_contact_count = 1;
+        r.client_bytes = "GET /smoke HTTP/1.1\r\n\r\n";
+        r.upstream_bytes = "GET /smoke HTTP/1.1\r\n\r\n";
+        r.downstream_bytes = "HTTP/1.1 200 OK\r\ncontent-length: 0\r\n\r\n";
+        if (write_transcript(path, {r})) {
+            std::cerr << "FAIL [self-test transcript write failure]: write_transcript reported "
+                         "success despite exceeding RLIMIT_FSIZE\n";
+            ok = false;
+        }
+        struct stat st{};
+        if (stat(path.c_str(), &st) == 0) {
+            std::cerr << "FAIL [self-test transcript write failure]: write_transcript left a "
+                         "truncated file behind at "
+                      << path << "\n";
+            ok = false;
+        }
+    }
+    // write_pair_transcript(): same shape, one real asserted PairCaseResult.
+    {
+        const std::string path = dir.path() + "/pair.inc";
+        PairCaseResult c;
+        c.name = "get_smoke";
+        c.asserted = true;
+        c.envoy.exchange_complete = c.rut.exchange_complete = true;
+        c.envoy.upstream_contacted = c.rut.upstream_contacted = true;
+        c.envoy.upstream_contact_count = c.rut.upstream_contact_count = 1;
+        c.envoy.client_bytes = c.rut.client_bytes = "GET /smoke HTTP/1.1\r\n\r\n";
+        c.envoy.upstream_bytes = c.rut.upstream_bytes = "GET /smoke HTTP/1.1\r\n\r\n";
+        c.envoy.downstream_bytes = c.rut.downstream_bytes =
+            "HTTP/1.1 200 OK\r\ncontent-length: 0\r\n\r\n";
+        if (write_pair_transcript(path, {c})) {
+            std::cerr << "FAIL [self-test transcript write failure]: write_pair_transcript "
+                         "reported success despite exceeding RLIMIT_FSIZE\n";
+            ok = false;
+        }
+        struct stat st{};
+        if (stat(path.c_str(), &st) == 0) {
+            std::cerr << "FAIL [self-test transcript write failure]: write_pair_transcript left a "
+                         "truncated file behind at "
+                      << path << "\n";
+            ok = false;
+        }
+    }
+    restore();
+    if (ok) std::cerr << "PASS [self-test transcript write failure]\n";
     return ok;
 }
 
@@ -9327,6 +9691,152 @@ bool self_test_rut_stop_verifies_exit_status() {
     return ok;
 }
 
+// Sweep-13 review, "Reject teardown when no child status was reaped": forks
+// (via RutInstance::launch(), same shape as self_test_rut_stop_verifies_
+// exit_status() above) a script that exits cleanly (exit 0) the instant it
+// receives SIGTERM -- but with SIGCHLD temporarily set to SIG_IGN for the
+// duration of the stop() call, so the kernel auto-reaps the child the
+// moment it exits, out from under every waitpid() call inside stop(). This
+// is exactly the scenario the review describes ("this process inherits
+// SIGCHLD as SIG_IGN, or otherwise has children auto-reaped"): the
+// precheck sees the child alive, kill(SIGTERM) succeeds, and stop()'s own
+// post-signal waitpid() calls can then never succeed at all for this pid --
+// they fail with ECHILD forever after, no matter how long stop() polls.
+// Before this fix, that fell through with `status` still zero-initialized,
+// which WIFEXITED(0)/WEXITSTATUS(0) decode indistinguishably from a real
+// clean exit 0 -- so RutInstance::stop() would incorrectly report success
+// despite never actually confirming how (or whether) the child exited.
+// SIGCHLD's disposition is restored unconditionally before returning, since
+// every OTHER self-test in this binary depends on being able to reap its
+// own children normally.
+bool self_test_stop_rejects_unreaped_status_under_sigchld_ignore() {
+    TempDir dir("rut-diff-selftest-stop-sigchld");
+    if (dir.empty()) {
+        std::cerr << "FAIL [self-test stop rejects unreaped status]: could not create temp "
+                     "directory\n";
+        return false;
+    }
+    const std::string script = dir.path() + "/term-ok.sh";
+    if (!write_file_mode(script, "#!/bin/sh\ntrap 'exit 0' TERM\nsleep 5\n", 0755)) {
+        std::cerr << "FAIL [self-test stop rejects unreaped status]: could not write script\n";
+        return false;
+    }
+    struct sigaction old_action{};
+    struct sigaction ignore_action{};
+    ignore_action.sa_handler = SIG_IGN;
+    sigemptyset(&ignore_action.sa_mask);
+    ignore_action.sa_flags = 0;
+    if (sigaction(SIGCHLD, &ignore_action, &old_action) != 0) {
+        std::cerr << "FAIL [self-test stop rejects unreaped status]: could not install SIGCHLD "
+                     "SIG_IGN\n";
+        return false;
+    }
+    const auto restore = [&old_action] { sigaction(SIGCHLD, &old_action, nullptr); };
+
+    RutInstance rut;
+    rut.log_path = "/dev/null";
+    if (!rut.launch(script, "unused.rut")) {
+        std::cerr << "FAIL [self-test stop rejects unreaped status]: could not fork/exec\n";
+        restore();
+        return false;
+    }
+    // Give the script time to install its trap before stop() sends SIGTERM.
+    struct timespec ts{0, 100'000'000};
+    nanosleep(&ts, nullptr);
+    const bool stopped = rut.stop();
+    restore();
+    bool ok = true;
+    if (stopped) {
+        std::cerr << "FAIL [self-test stop rejects unreaped status]: RutInstance::stop() "
+                     "reported a clean teardown despite never reaping a status (SIGCHLD was "
+                     "SIG_IGN)\n";
+        ok = false;
+    }
+    if (!rut.exited_unexpectedly) {
+        std::cerr << "FAIL [self-test stop rejects unreaped status]: exited_unexpectedly was not "
+                     "set\n";
+        ok = false;
+    }
+    if (ok) std::cerr << "PASS [self-test stop rejects unreaped status]\n";
+    return ok;
+}
+
+// EnvoyInstance counterpart to self_test_stop_rejects_unreaped_status_under_
+// sigchld_ignore() above: identical SIGCHLD=SIG_IGN scenario, reproduced
+// against EnvoyInstance::stop()'s own post-signal reap loop (same bug
+// pattern flagged by the sweep-13 review, fixed the same way). Reuses
+// self_test_envoy_stop_verifies_exit_status()'s dummy-script-as-`docker
+// run`-client shape below; `launched` stays false (this instance never
+// calls EnvoyInstance::launch()), so no real `docker rm -f` is ever
+// invoked.
+bool self_test_envoy_stop_rejects_unreaped_status_under_sigchld_ignore() {
+    TempDir dir("rut-diff-selftest-envoy-stop-sigchld");
+    if (dir.empty()) {
+        std::cerr << "FAIL [self-test envoy stop rejects unreaped status]: could not create temp "
+                     "directory\n";
+        return false;
+    }
+    const std::string script = dir.path() + "/term-ok.sh";
+    if (!write_file_mode(script, "#!/bin/sh\ntrap 'exit 0' TERM\nsleep 5\n", 0755)) {
+        std::cerr
+            << "FAIL [self-test envoy stop rejects unreaped status]: could not write script\n";
+        return false;
+    }
+    struct sigaction old_action{};
+    struct sigaction ignore_action{};
+    ignore_action.sa_handler = SIG_IGN;
+    sigemptyset(&ignore_action.sa_mask);
+    ignore_action.sa_flags = 0;
+    if (sigaction(SIGCHLD, &ignore_action, &old_action) != 0) {
+        std::cerr << "FAIL [self-test envoy stop rejects unreaped status]: could not install "
+                     "SIGCHLD SIG_IGN\n";
+        return false;
+    }
+    const auto restore = [&old_action] { sigaction(SIGCHLD, &old_action, nullptr); };
+
+    EnvoyInstance envoy;
+    envoy.name = "rut-diff-selftest-no-such-container-sigchld";
+    envoy.log_path = "/dev/null";
+    // Stand-in for EnvoyInstance::launch(): same fork/exec shape, argv built
+    // before fork() (see self_test_envoy_stop_verifies_exit_status() above).
+    std::vector<std::string> argv = {script};
+    const std::vector<char*> args = build_argv(argv);
+    envoy.pid = fork();
+    if (envoy.pid < 0) {
+        std::cerr << "FAIL [self-test envoy stop rejects unreaped status]: could not fork\n";
+        restore();
+        return false;
+    }
+    if (envoy.pid == 0) {
+        const int null_fd = open("/dev/null", O_RDWR);
+        if (null_fd >= 0) {
+            dup2(null_fd, STDOUT_FILENO);
+            dup2(null_fd, STDERR_FILENO);
+            if (null_fd > STDERR_FILENO) close(null_fd);
+        }
+        execv(args[0], args.data());
+        _exit(127);
+    }
+    struct timespec ts{0, 100'000'000};
+    nanosleep(&ts, nullptr);
+    const bool stopped = envoy.stop();
+    restore();
+    bool ok = true;
+    if (stopped) {
+        std::cerr << "FAIL [self-test envoy stop rejects unreaped status]: EnvoyInstance::stop() "
+                     "reported a clean teardown despite never reaping a status (SIGCHLD was "
+                     "SIG_IGN)\n";
+        ok = false;
+    }
+    if (!envoy.exited_unexpectedly) {
+        std::cerr << "FAIL [self-test envoy stop rejects unreaped status]: exited_unexpectedly was "
+                     "not set\n";
+        ok = false;
+    }
+    if (ok) std::cerr << "PASS [self-test envoy stop rejects unreaped status]\n";
+    return ok;
+}
+
 // Exercises the exact `compare_pair_case` path two identically-failed
 // exchanges would hit (e.g. a connection refused on both sides before a
 // single byte crossed the wire, leaving two equal empty buffers): it must
@@ -9952,6 +10462,14 @@ bool self_test_accept_unblocks_on_shutdown_close() {
 // terminator, in a separate TCP segment/`send()`: the bounded grace window
 // must observe it rather than the exchange completing (and comparing equal
 // to a body-less reference) before the body arrives.
+//
+// Sweep-13 review, "Reject delayed body bytes in HEAD responses": the grace
+// window used to APPEND the violating bytes and still report complete=true,
+// so a caller had to separately notice the extra bytes in `resp.bytes` to
+// catch this (and a peer that then kept the connection open forever after
+// sending them would never even get that far). Now the read is rejected as
+// soon as the first byte (n > 0) is observed, so the assertion is on
+// `resp.complete` alone -- the bytes are no longer captured at all.
 bool self_test_head_body_detected() {
     uint16_t port = 0;
     if (!allocate_loopback_port(&port)) {
@@ -10007,9 +10525,9 @@ bool self_test_head_body_detected() {
         const std::string req = "HEAD /x HTTP/1.1\r\nHost: t.example\r\n\r\n";
         send_all(fd, req);
         const ReadResult resp = read_http_message(fd, /*head_request=*/true, kClientTimeoutMs);
-        if (!ends_with(resp.bytes, "oops!")) {
-            std::cerr << "FAIL [self-test head body]: the grace window did not observe the "
-                         "unexpected HEAD body bytes\n";
+        if (resp.complete) {
+            std::cerr << "FAIL [self-test head body]: a HEAD body arriving during the grace "
+                         "window was reported complete (accepted) instead of rejected\n";
             ok = false;
         }
         close(fd);
@@ -10165,6 +10683,355 @@ bool self_test_head_grace_reset_detected() {
     server.join();
     if (listen_fd >= 0) close(listen_fd);
     if (ok) std::cerr << "PASS [self-test head grace reset]\n";
+    return ok;
+}
+
+// Sweep-13 review, "Stop patching individual branches": table-tests
+// decide_body_framing() directly (no sockets) against every row RFC 9112
+// §6.3 describes, including the request row (point 8) read_http_message()
+// itself never exercises, and the precedence rules between rows (point 1
+// overrides everything; a Transfer-Encoding takes priority over
+// Content-Length per point 6).
+bool self_test_body_framing_decision_table() {
+    bool ok = true;
+    const auto check = [&](const char* label,
+                           bool is_response,
+                           bool forbids_body,
+                           bool has_cl,
+                           size_t cl,
+                           bool has_te,
+                           BodyFraming expected_kind,
+                           size_t expected_length) {
+        const BodyFramingDecision d =
+            decide_body_framing(is_response, forbids_body, has_cl, cl, has_te);
+        if (d.kind != expected_kind) {
+            std::cerr << "FAIL [self-test body framing table]: " << label << ": expected kind "
+                      << static_cast<int>(expected_kind) << ", got " << static_cast<int>(d.kind)
+                      << "\n";
+            ok = false;
+            return;
+        }
+        if (d.kind == BodyFraming::kContentLength && d.content_length != expected_length) {
+            std::cerr << "FAIL [self-test body framing table]: " << label
+                      << ": expected content_length " << expected_length << ", got "
+                      << d.content_length << "\n";
+            ok = false;
+        }
+    };
+    // Point 1: HEAD (forbids_body) always wins, regardless of any other
+    // header -- including one with BOTH Content-Length and
+    // Transfer-Encoding present, which would otherwise be ambiguous.
+    check("HEAD, no other headers", true, true, false, 0, false, BodyFraming::kNoBody, 0);
+    check("HEAD, with Content-Length", true, true, true, 5, false, BodyFraming::kNoBody, 0);
+    check("HEAD, with Transfer-Encoding", true, true, false, 0, true, BodyFraming::kNoBody, 0);
+    check("HEAD, with both CL and TE", true, true, true, 5, true, BodyFraming::kNoBody, 0);
+    // Point 1: a non-HEAD response whose STATUS forbids a body (1xx, 204,
+    // 304) -- modeled here the same way read_http_message() computes
+    // `forbids_body` for those statuses, via the same flag.
+    check("204, with Content-Length", true, true, true, 5, false, BodyFraming::kNoBody, 0);
+    check("304, no other headers", true, true, false, 0, false, BodyFraming::kNoBody, 0);
+    check("1xx, no other headers", true, true, false, 0, false, BodyFraming::kNoBody, 0);
+    // Point 3/6: Transfer-Encoding takes priority over Content-Length when
+    // the message is otherwise permitted a body.
+    check("200, with Transfer-Encoding only",
+          true,
+          false,
+          false,
+          0,
+          true,
+          BodyFraming::kUnsupportedTransferEncoding,
+          0);
+    check("200, with both CL and TE",
+          true,
+          false,
+          true,
+          5,
+          true,
+          BodyFraming::kUnsupportedTransferEncoding,
+          0);
+    // Point 6: Content-Length alone gives an exact read.
+    check("200, with Content-Length only",
+          true,
+          false,
+          true,
+          5,
+          false,
+          BodyFraming::kContentLength,
+          5);
+    check("request, with Content-Length",
+          false,
+          false,
+          true,
+          3,
+          false,
+          BodyFraming::kContentLength,
+          3);
+    // Point 7: a RESPONSE with neither header is close-delimited.
+    check("200, with neither header", true, false, false, 0, false, BodyFraming::kUntilClose, 0);
+    // Point 8: a REQUEST with neither header has a zero-length body -- never
+    // close-delimited, unlike the response row directly above with the
+    // exact same header shape.
+    check("request, with neither header", false, false, false, 0, false, BodyFraming::kNoBody, 0);
+
+    if (ok) std::cerr << "PASS [self-test body framing table]\n";
+    return ok;
+}
+
+// Sweep-13 review, "Stop patching individual branches": read_http_message()
+// now derives `forbids_body` from the response status line, not just
+// `head_request`, so a 1xx/204/304 status on a GET (never a HEAD) must
+// reject a body exactly like a HEAD response does -- both an already-
+// buffered one (headers and the forbidden body delivered in the same
+// write) and one that arrives later, during the grace window.
+bool self_test_status_forbidden_body_rejected() {
+    auto run_case = [](int status, const char* reason_phrase, bool buffered, const char* label) {
+        uint16_t port = 0;
+        if (!allocate_loopback_port(&port)) {
+            std::cerr << "FAIL [self-test status forbidden body " << label
+                      << "]: could not allocate a loopback port\n";
+            return false;
+        }
+        int listen_fd = socket(AF_INET, SOCK_STREAM, 0);
+        if (listen_fd < 0) {
+            std::cerr << "FAIL [self-test status forbidden body " << label
+                      << "]: could not create listening socket\n";
+            return false;
+        }
+        const int one = 1;
+        setsockopt(listen_fd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
+        sockaddr_in addr{};
+        addr.sin_family = AF_INET;
+        addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+        addr.sin_port = htons(port);
+        if (bind(listen_fd, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) != 0 ||
+            listen(listen_fd, 1) != 0) {
+            std::cerr << "FAIL [self-test status forbidden body " << label
+                      << "]: could not bind/listen\n";
+            close(listen_fd);
+            return false;
+        }
+        std::thread server([listen_fd, status, reason_phrase, buffered] {
+            const int conn = accept(listen_fd, nullptr, nullptr);
+            if (conn < 0) return;
+            char buf[512];
+            recv(conn, buf, sizeof(buf), 0);  // discard the request
+            std::string reply = "HTTP/1.1 " + std::to_string(status) + " " + reason_phrase +
+                                "\r\nContent-Length: 5\r\n\r\n";
+            if (buffered) {
+                // Headers and the forbidden body in ONE send(): a single
+                // small write over loopback is delivered as one TCP
+                // segment, so the client's header-reading recv() captures
+                // both at once.
+                reply += "oops!";
+                send(conn, reply.data(), reply.size(), 0);
+            } else {
+                send(conn, reply.data(), reply.size(), 0);
+                struct timespec delay{0, 20'000'000};
+                nanosleep(&delay, nullptr);
+                const std::string body = "oops!";
+                send(conn, body.data(), body.size(), 0);
+            }
+            struct timespec settle{0, 100'000'000};
+            nanosleep(&settle, nullptr);
+            close(conn);
+        });
+        bool ok = true;
+        const int fd = connect_with_timeout(port, kClientTimeoutMs);
+        if (fd < 0) {
+            std::cerr << "FAIL [self-test status forbidden body " << label
+                      << "]: could not connect\n";
+            ok = false;
+            shutdown(listen_fd, SHUT_RDWR);
+            close(listen_fd);
+            listen_fd = -1;
+        } else {
+            const std::string req = "GET /x HTTP/1.1\r\nHost: t.example\r\n\r\n";
+            send_all(fd, req);
+            const ReadResult resp = read_http_message(fd, /*head_request=*/false, kClientTimeoutMs);
+            if (resp.complete) {
+                std::cerr << "FAIL [self-test status forbidden body " << label << "]: a " << status
+                          << " response's forbidden body (" << label
+                          << ") was reported complete (accepted) instead of rejected\n";
+                ok = false;
+            }
+            close(fd);
+        }
+        server.join();
+        if (listen_fd >= 0) close(listen_fd);
+        if (ok) std::cerr << "PASS [self-test status forbidden body " << label << "]\n";
+        return ok;
+    };
+    bool ok = true;
+    ok &= run_case(204, "No Content", /*buffered=*/true, "204 buffered");
+    ok &= run_case(204, "No Content", /*buffered=*/false, "204 delayed");
+    ok &= run_case(304, "Not Modified", /*buffered=*/true, "304 buffered");
+    ok &= run_case(304, "Not Modified", /*buffered=*/false, "304 delayed");
+    ok &= run_case(100, "Continue", /*buffered=*/true, "1xx buffered");
+    ok &= run_case(100, "Continue", /*buffered=*/false, "1xx delayed");
+    return ok;
+}
+
+// Sweep-13 review, thread PRRT_kwDORsELtc6mc6Il/mc6Ip's underlying framing
+// rewrite: a Transfer-Encoding header (this reader implements no
+// chunked-transfer decoding) must fail the exchange closed immediately,
+// never fall through to Content-Length or close-delimited framing.
+bool self_test_transfer_encoding_rejected() {
+    uint16_t port = 0;
+    if (!allocate_loopback_port(&port)) {
+        std::cerr << "FAIL [self-test transfer-encoding rejected]: could not allocate a loopback "
+                     "port\n";
+        return false;
+    }
+    int listen_fd = socket(AF_INET, SOCK_STREAM, 0);
+    if (listen_fd < 0) {
+        std::cerr << "FAIL [self-test transfer-encoding rejected]: could not create listening "
+                     "socket\n";
+        return false;
+    }
+    const int one = 1;
+    setsockopt(listen_fd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
+    sockaddr_in addr{};
+    addr.sin_family = AF_INET;
+    addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    addr.sin_port = htons(port);
+    if (bind(listen_fd, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) != 0 ||
+        listen(listen_fd, 1) != 0) {
+        std::cerr << "FAIL [self-test transfer-encoding rejected]: could not bind/listen\n";
+        close(listen_fd);
+        return false;
+    }
+    std::thread server([listen_fd] {
+        const int conn = accept(listen_fd, nullptr, nullptr);
+        if (conn < 0) return;
+        char buf[512];
+        recv(conn, buf, sizeof(buf), 0);  // discard the request
+        const std::string reply =
+            "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhello\r\n0\r\n\r\n";
+        send(conn, reply.data(), reply.size(), 0);
+        struct timespec settle{0, 100'000'000};
+        nanosleep(&settle, nullptr);
+        close(conn);
+    });
+    bool ok = true;
+    const int fd = connect_with_timeout(port, kClientTimeoutMs);
+    if (fd < 0) {
+        std::cerr << "FAIL [self-test transfer-encoding rejected]: could not connect\n";
+        ok = false;
+        shutdown(listen_fd, SHUT_RDWR);
+        close(listen_fd);
+        listen_fd = -1;
+    } else {
+        const std::string req = "GET /x HTTP/1.1\r\nHost: t.example\r\n\r\n";
+        send_all(fd, req);
+        const ReadResult resp = read_http_message(fd, /*head_request=*/false, kClientTimeoutMs);
+        if (resp.complete) {
+            std::cerr << "FAIL [self-test transfer-encoding rejected]: a Transfer-Encoding "
+                         "response was reported complete (accepted) instead of failing closed\n";
+            ok = false;
+        }
+        close(fd);
+    }
+    server.join();
+    if (listen_fd >= 0) close(listen_fd);
+    if (ok) std::cerr << "PASS [self-test transfer-encoding rejected]\n";
+    return ok;
+}
+
+// Sweep-13 review, "Read implicitly close-delimited response bodies to
+// EOF": a response with neither Content-Length nor Transfer-Encoding is
+// close-delimited per RFC 9112 §6.3 point 7 EVEN WHEN it never advertised
+// `Connection: close` -- the old code only read to EOF when it did, and
+// otherwise declared the message complete (with an empty body) right at
+// the header terminator, silently truncating every body byte that peer
+// ever sent. Verifies both shapes: the body must be read in full up to the
+// peer's own EOF, and hitting the overall deadline without ever seeing
+// that EOF must be incomplete, not a false success.
+bool self_test_implicit_close_delimited_reads_to_eof() {
+    auto run_case = [](bool peer_closes, const char* label) {
+        uint16_t port = 0;
+        if (!allocate_loopback_port(&port)) {
+            std::cerr << "FAIL [self-test implicit close-delimited " << label
+                      << "]: could not allocate a loopback port\n";
+            return false;
+        }
+        int listen_fd = socket(AF_INET, SOCK_STREAM, 0);
+        if (listen_fd < 0) {
+            std::cerr << "FAIL [self-test implicit close-delimited " << label
+                      << "]: could not create listening socket\n";
+            return false;
+        }
+        const int one = 1;
+        setsockopt(listen_fd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
+        sockaddr_in addr{};
+        addr.sin_family = AF_INET;
+        addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+        addr.sin_port = htons(port);
+        if (bind(listen_fd, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) != 0 ||
+            listen(listen_fd, 1) != 0) {
+            std::cerr << "FAIL [self-test implicit close-delimited " << label
+                      << "]: could not bind/listen\n";
+            close(listen_fd);
+            return false;
+        }
+        std::thread server([listen_fd, peer_closes] {
+            const int conn = accept(listen_fd, nullptr, nullptr);
+            if (conn < 0) return;
+            char buf[512];
+            recv(conn, buf, sizeof(buf), 0);  // discard the request
+            // No Content-Length, no Transfer-Encoding, and deliberately no
+            // `Connection: close` either -- the implicit case this review
+            // fixes.
+            const std::string reply = "HTTP/1.1 200 OK\r\n\r\nhello, implicitly close-delimited";
+            send(conn, reply.data(), reply.size(), 0);
+            if (peer_closes) close(conn);
+            // else: leave the connection open past the caller's short
+            // deadline, so it must observe a timeout, never a false EOF.
+        });
+        bool ok = true;
+        const int fd = connect_with_timeout(port, kClientTimeoutMs);
+        if (fd < 0) {
+            std::cerr << "FAIL [self-test implicit close-delimited " << label
+                      << "]: could not connect\n";
+            ok = false;
+            shutdown(listen_fd, SHUT_RDWR);
+            close(listen_fd);
+            listen_fd = -1;
+        } else {
+            const std::string req = "GET /x HTTP/1.1\r\nHost: t.example\r\n\r\n";
+            send_all(fd, req);
+            // A short timeout for the peer-never-closes case, so this test
+            // does not wait out the full kClientTimeoutMs; the well-behaved
+            // case completes almost immediately regardless.
+            const ReadResult resp = read_http_message(fd, /*head_request=*/false, 300);
+            if (peer_closes) {
+                if (!resp.complete) {
+                    std::cerr << "FAIL [self-test implicit close-delimited " << label
+                              << "]: an implicitly close-delimited response was reported "
+                                 "incomplete ("
+                              << resp.reason << ")\n";
+                    ok = false;
+                } else if (!ends_with(resp.bytes, "hello, implicitly close-delimited")) {
+                    std::cerr << "FAIL [self-test implicit close-delimited " << label
+                              << "]: the body was truncated; got: \""
+                              << escape_wire_bytes(resp.bytes) << "\"\n";
+                    ok = false;
+                }
+            } else if (resp.complete) {
+                std::cerr << "FAIL [self-test implicit close-delimited " << label
+                          << "]: reported complete despite the peer never closing or sending "
+                             "Content-Length\n";
+                ok = false;
+            }
+            close(fd);
+        }
+        server.join();
+        if (listen_fd >= 0) close(listen_fd);
+        if (ok) std::cerr << "PASS [self-test implicit close-delimited " << label << "]\n";
+        return ok;
+    };
+    bool ok = true;
+    ok &= run_case(/*peer_closes=*/true, "peer closes");
+    ok &= run_case(/*peer_closes=*/false, "peer never closes");
     return ok;
 }
 
@@ -10722,10 +11589,18 @@ bool compare_case_against_oracle(const CaseResult& result, const OracleCase& ora
                                            : std::string();
     bool rut_dates_valid = true;
     bool oracle_dates_valid = true;
+    // `result.downstream_bytes` is LIVE -- rut synthesized it moments ago,
+    // during this run -- so it is checked against the real clock
+    // (require_current defaults to true). `oracle_downstream` is the
+    // OPPOSITE: a value frozen at record time, replayed here from a fixture
+    // that can be arbitrarily old; requiring it to also be close to the
+    // CURRENT clock would fail every oracle comparison as soon as the
+    // recording ages past the tolerance window (sweep-13 review, see
+    // normalize_date_for_compare()'s `require_current` comment).
     const std::string rut_down =
         normalize_date_for_compare(result.downstream_bytes, preserved_date, &rut_dates_valid);
-    const std::string oracle_down =
-        normalize_date_for_compare(oracle_downstream, preserved_date, &oracle_dates_valid);
+    const std::string oracle_down = normalize_date_for_compare(
+        oracle_downstream, preserved_date, &oracle_dates_valid, /*require_current=*/false);
     const bool dates_valid = rut_dates_valid && oracle_dates_valid;
     const bool upstream_match = result.upstream_bytes == oracle_upstream;
     const bool downstream_match = rut_down == oracle_down;
@@ -10761,9 +11636,24 @@ bool compare_case_against_oracle(const CaseResult& result, const OracleCase& ora
 // the preserved upstream date still passes through untouched.
 bool self_test_malformed_date_rejected() {
     bool ok = true;
-    const std::string valid = "Tue, 01 Jan 2030 00:00:00 GMT";
+    // Sweep-13 review, "Validate synthesized Date values before normalizing
+    // them": compare_pair_case() below now also requires a LIVE Date to be
+    // close to the real clock (normalize_date_for_compare()'s
+    // `require_current`, default true), so these fixtures must be
+    // real-time-relative rather than arbitrary fixed literals like the
+    // pre-sweep-13 "Tue, 01 Jan 2030 ..." -- which is a perfectly
+    // well-formed RFC 1123 date (is_rfc1123_http_date() alone still accepts
+    // it, exercised directly below), just not one anywhere near "now".
+    const time_t self_test_now = time(nullptr);
+    const std::string valid = format_rfc1123_http_date(self_test_now + 60);
     if (!is_rfc1123_http_date(valid)) {
         std::cerr << "FAIL [self-test malformed date]: a valid RFC 1123 date was rejected\n";
+        ok = false;
+    }
+    if (!is_rfc1123_http_date("Tue, 01 Jan 2030 00:00:00 GMT")) {
+        std::cerr << "FAIL [self-test malformed date]: is_rfc1123_http_date() itself must remain "
+                     "a pure shape/calendar check, independent of staleness -- it rejected a "
+                     "well-formed date far from \"now\"\n";
         ok = false;
     }
     // Round-13 review, "Validate calendar dates before normalization": Feb
@@ -10836,9 +11726,10 @@ bool self_test_malformed_date_rejected() {
                      "Date against a valid Envoy one\n";
         ok = false;
     }
-    // Two well-formed, different synthesized dates: the placeholder still
-    // hides the unavoidable timestamp difference.
-    if (!compare_pair_case(make_pair("trace", valid, "Wed, 02 Jan 2030 12:34:56 GMT"))) {
+    // Two well-formed, different (but both current) synthesized dates: the
+    // placeholder still hides the unavoidable timestamp difference.
+    if (!compare_pair_case(
+            make_pair("trace", valid, format_rfc1123_http_date(self_test_now + 120)))) {
         std::cerr << "FAIL [self-test malformed date]: compare_pair_case rejected two valid, "
                      "differing synthesized Date values\n";
         ok = false;
@@ -10894,6 +11785,101 @@ bool self_test_malformed_date_rejected() {
         }
     }
     if (ok) std::cerr << "PASS [self-test malformed date]\n";
+    return ok;
+}
+
+// Sweep-13 review, "Validate synthesized Date values before normalizing
+// them": a `date:` value that is syntactically well-formed AND names a real
+// calendar date (so is_rfc1123_http_date() alone accepts it) but is wildly
+// far from the real clock -- a hard-coded past timestamp, a clock that
+// never advanced, ... -- must still be rejected before normalize_date_for_
+// compare() replaces it with the shared placeholder; otherwise a live,
+// genuinely current Envoy Date and a frozen, wrong RUT Date would both
+// collapse to the same placeholder and report a match even though a real
+// client received a stale timestamp. "Sun, 06 Nov 1994 08:49:37 GMT" is the
+// canonical IMF-fixdate example from RFC 9110 §5.6.7 itself -- a real,
+// correctly-labeled historical date, decades stale relative to any current
+// clock.
+bool self_test_stale_synthesized_date_rejected() {
+    bool ok = true;
+    constexpr char kStaleDate[] = "Sun, 06 Nov 1994 08:49:37 GMT";
+    if (!is_rfc1123_http_date(kStaleDate)) {
+        std::cerr << "FAIL [self-test stale date]: the canonical RFC 9110 example date was "
+                     "rejected by is_rfc1123_http_date() itself (it must remain purely a "
+                     "shape/calendar check, independent of staleness)\n";
+        ok = false;
+    }
+    const time_t now = time(nullptr);
+    if (rfc1123_http_date_is_current(kStaleDate, now, kDateStalenessToleranceSeconds)) {
+        std::cerr << "FAIL [self-test stale date]: rfc1123_http_date_is_current() accepted a "
+                     "date decades outside the tolerance window\n";
+        ok = false;
+    }
+    const std::string live_now = format_rfc1123_http_date(now);
+    if (!rfc1123_http_date_is_current(live_now, now, kDateStalenessToleranceSeconds)) {
+        std::cerr << "FAIL [self-test stale date]: rfc1123_http_date_is_current() rejected the "
+                     "current time itself\n";
+        ok = false;
+    }
+
+    // End to end, exactly the review's own bug scenario: a live, current
+    // Envoy Date compared against RUT's hard-coded 1994 Date must NOT
+    // match, even though both are well-formed RFC 1123 dates.
+    PairCaseResult c;
+    c.name = "trace";
+    c.asserted = true;
+    c.envoy.exchange_complete = c.rut.exchange_complete = true;
+    c.envoy.upstream_contacted = c.rut.upstream_contacted = true;
+    c.envoy.upstream_contact_count = c.rut.upstream_contact_count = 1;
+    c.envoy.upstream_bytes = c.rut.upstream_bytes = "TRACE /trace HTTP/1.1\r\n\r\n";
+    c.envoy.downstream_bytes =
+        "HTTP/1.1 200 OK\r\ncontent-length: 0\r\ndate: " + live_now + "\r\n\r\n";
+    c.rut.downstream_bytes =
+        std::string("HTTP/1.1 200 OK\r\ncontent-length: 0\r\ndate: ") + kStaleDate + "\r\n\r\n";
+    if (compare_pair_case(c)) {
+        std::cerr << "FAIL [self-test stale date]: compare_pair_case matched a live, current "
+                     "Envoy Date against RUT's hard-coded 1994 Date\n";
+        ok = false;
+    }
+
+    // The oracle comparison path deliberately exempts the FROZEN recorded
+    // oracle Date from this staleness check (only the LIVE rut Date must be
+    // current): the oracle fixture's own Date is frozen at record time, not
+    // synthesized live during this run, so requiring it to also be "close
+    // to now" would break every oracle comparison the moment the recording
+    // ages past the tolerance window.
+    {
+        CaseResult r;
+        r.name = "trace";
+        r.exchange_complete = true;
+        r.upstream_bytes = "TRACE /trace HTTP/1.1\r\n\r\n";
+        r.downstream_bytes =
+            "HTTP/1.1 200 OK\r\ncontent-length: 0\r\ndate: " + live_now + "\r\n\r\n";
+        const std::string oracle_down =
+            std::string("HTTP/1.1 200 OK\r\ncontent-length: 0\r\ndate: ") + kStaleDate + "\r\n\r\n";
+        const OracleCase oracle{"trace",
+                                r.upstream_bytes.data(),
+                                r.upstream_bytes.size(),
+                                oracle_down.data(),
+                                oracle_down.size()};
+        if (!compare_case_against_oracle(r, oracle)) {
+            std::cerr << "FAIL [self-test stale date]: compare_case_against_oracle rejected a "
+                         "live, current rut Date against a frozen, decades-old recorded oracle "
+                         "Date -- the oracle side must be exempt from the staleness check\n";
+            ok = false;
+        }
+        // But a STALE rut Date compared against that same (exempt) frozen
+        // oracle Date must still fail: staleness applies to the LIVE side.
+        r.downstream_bytes =
+            std::string("HTTP/1.1 200 OK\r\ncontent-length: 0\r\ndate: ") + kStaleDate + "\r\n\r\n";
+        if (compare_case_against_oracle(r, oracle)) {
+            std::cerr << "FAIL [self-test stale date]: compare_case_against_oracle accepted a "
+                         "stale, hard-coded 1994 rut Date\n";
+            ok = false;
+        }
+    }
+
+    if (ok) std::cerr << "PASS [self-test stale date]\n";
     return ok;
 }
 
@@ -11299,6 +12285,7 @@ int run_self_test(const std::string& rut_binary, const std::string& converter_bi
     ok &= self_test_quiesce_after_record_only_idle_timeout();
     ok &= self_test_record_only_crash_reason_precedence();
     ok &= self_test_record_only_crash_reason_precedence_over_reuseport();
+    ok &= self_test_transcript_write_failure_unlinks_destination();
     ok &= self_test_partial_exchange_rejection();
     ok &= self_test_ambiguity_reason_note_text();
     ok &= self_test_fake_listener_unblocks_on_shutdown();
@@ -11331,6 +12318,7 @@ int run_self_test(const std::string& rut_binary, const std::string& converter_bi
     ok &= self_test_rut_early_exit_detected();
     ok &= self_test_rut_stop_requires_delivered_signal();
     ok &= self_test_rut_stop_verifies_exit_status();
+    ok &= self_test_stop_rejects_unreaped_status_under_sigchld_ignore();
     ok &= self_test_stop_echild_precheck_no_signal();
     ok &= self_test_pair_both_failed_rejected();
     ok &= self_test_pair_unexercised_forwarding_rejected();
@@ -11343,10 +12331,16 @@ int run_self_test(const std::string& rut_binary, const std::string& converter_bi
     ok &= self_test_head_body_detected();
     ok &= self_test_head_body_buffered_with_headers_rejected();
     ok &= self_test_head_grace_reset_detected();
+    ok &= self_test_body_framing_decision_table();
+    ok &= self_test_status_forbidden_body_rejected();
+    ok &= self_test_transfer_encoding_rejected();
+    ok &= self_test_implicit_close_delimited_reads_to_eof();
     ok &= self_test_persistent_trailing_bytes_detected();
     ok &= self_test_envoy_early_exit_detected();
     ok &= self_test_envoy_stop_verifies_exit_status();
+    ok &= self_test_envoy_stop_rejects_unreaped_status_under_sigchld_ignore();
     ok &= self_test_malformed_date_rejected();
+    ok &= self_test_stale_synthesized_date_rejected();
     ok &= self_test_compare_pair_case_flags_ambiguous_as_non_matching();
     ok &= self_test_rut_port_retry(rut_binary, converter_binary);
     if (!rut_binary.empty() && !converter_binary.empty()) {
