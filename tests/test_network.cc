@@ -32956,6 +32956,79 @@ TEST(iouring_local_body_epoch, close_defers_leave_until_send_slot_reclaims) {
     close(downstream[1]);
 }
 
+TEST(iouring_local_body_epoch, pending_file_send_defers_leave_until_continuation_drains) {
+    ScopedIoUringLoopForRetirement guard;
+    if (!guard.init()) SKIP("io_uring unavailable");
+    auto* loop = guard.loop;
+    ShardEpoch epoch{};
+    epoch.epoch.store(11, std::memory_order_relaxed);
+    loop->epoch = &epoch;
+    Connection* conn = loop->alloc_conn();
+    REQUIRE(conn != nullptr);
+    const u32 id = conn->id;
+    i32 downstream[2] = {-1, -1};
+    REQUIRE_EQ(rut::test::stream_socketpair(downstream), 0);
+    // Declared after `guard`, so it runs first on every exit: closing the peer
+    // wakes any still-pending POLLOUT, and a failed REQUIRE below cannot leave
+    // the loop's teardown waiting on it forever.
+    struct PeerCloser {
+        i32& fd;
+        ~PeerCloser() {
+            if (fd >= 0) close(fd);
+        }
+    } peer_closer{downstream[1]};
+    const i32 small = 4096;
+    REQUIRE_EQ(setsockopt(downstream[0], SOL_SOCKET, SO_SNDBUF, &small, sizeof(small)), 0);
+    REQUIRE_EQ(setsockopt(downstream[1], SOL_SOCKET, SO_RCVBUF, &small, sizeof(small)), 0);
+    // Runtime client sockets are nonblocking; a blocking one would park the
+    // synchronous sendfile in add_send_file instead of arming POLLOUT.
+    REQUIRE_EQ(fcntl(downstream[0], F_SETFL, fcntl(downstream[0], F_GETFL) | O_NONBLOCK), 0);
+    conn->fd = downstream[0];
+    downstream[0] = -1;
+    // The config-owned body and its sealed memfd copy (the loader's layout).
+    static u8 body[1u << 20];
+    const i32 file = memfd_create("epoch-file-send", MFD_CLOEXEC);
+    REQUIRE_GE(file, 0);
+    REQUIRE_EQ(write(file, body, sizeof(body)), static_cast<ssize_t>(sizeof(body)));
+    constexpr u32 kPrefix = 64;
+    conn->keep_alive = true;
+    conn->req_start_us = 1;
+    conn->local_body_base = body;
+    conn->local_body_file_fd = file;
+    conn->local_body_cursor = body + kPrefix;
+    conn->local_body_send_len = sizeof(body) - kPrefix;
+    conn->local_body_remaining = 0;
+    conn->send_progress = 0;
+    conn->on_send = &on_response_sent<IoUringEventLoop>;
+    REQUIRE(loop->submit_send_file(*conn, file, kPrefix, sizeof(body) - kPrefix) ==
+            SendFileOutcome::Armed);
+    // The tiny socket buffers keep the transfer partial: a POLLOUT
+    // continuation that will sendfile from the memfd again is pending.
+    REQUIRE_EQ(loop->backend.send_state[id].file_fd, file);
+    REQUIRE_GT(loop->backend.send_state[id].remaining, 0u);
+
+    loop->close_conn(*conn);
+    CHECK_EQ(epoch.epoch.load(std::memory_order_relaxed), 11u);  // config still pinned
+    // REQUIRE: without ownership the close neither defers the epoch nor
+    // cancels the pending POLLOUT, and the drain below would block forever.
+    REQUIRE(loop->conns[id].epoch_leave_deferred);
+
+    for (u32 rounds = 0; loop->conns[id].pending_ops != 0 && rounds < 8; rounds++) {
+        IoEvent events[8]{};
+        const u32 count = loop->backend.wait(events, 1, loop->conns, loop->connection_capacity);
+        for (u32 i = 0; i < count; i++) {
+            loop->dispatch(events[i]);
+            if (loop->conns[id].pending_ops != 0) CHECK_EQ(epoch.epoch.load(), 11u);
+        }
+    }
+    CHECK_EQ(loop->conns[id].pending_ops, 0u);
+    CHECK_EQ(epoch.epoch.load(std::memory_order_relaxed), 12u);
+    CHECK_FALSE(loop->conns[id].epoch_leave_deferred);
+    loop->reclaim_pending();
+    loop->reclaim_slot(id);
+    close(file);
+}
+
 TEST(iouring_local_body_epoch, unowned_local_body_send_does_not_defer_epoch) {
     ScopedIoUringLoopForRetirement guard;
     if (!guard.init()) SKIP("io_uring unavailable");

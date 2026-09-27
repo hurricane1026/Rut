@@ -5515,8 +5515,19 @@ public:
             return false;
         const auto& send = backend.send_state[c.id];
         const u32 remaining = c.local_body_send_len - c.send_progress;
+        // A memory send reads the config-owned body bytes; a file send
+        // (add_send_file) reads the config-owned sealed memfd, whose POLLOUT
+        // continuation calls sendfile again from wait(). Either way the config
+        // must outlive the send, or LoadedProgram::destroy could close (and
+        // the kernel recycle) the memfd under a pending continuation.
+        const bool memory_send = send.src == c.local_body_cursor + c.send_progress;
+        const bool file_send =
+            send.src == nullptr && send.file_fd >= 0 && send.file_fd == c.local_body_file_fd &&
+            c.local_body_base != nullptr && c.local_body_cursor >= c.local_body_base &&
+            send.file_base ==
+                static_cast<u32>(c.local_body_cursor - c.local_body_base) + c.send_progress;
         return send.type == IoEventType::Send && send.fd == c.fd && send.generation == 0 &&
-               send.src == c.local_body_cursor + c.send_progress && send.offset <= remaining &&
+               (memory_send || file_send) && send.offset <= remaining &&
                send.remaining == remaining - send.offset;
     }
 
