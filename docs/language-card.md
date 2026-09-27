@@ -349,17 +349,32 @@ return forward(users, request_policy: {
 // kept separately). A Connection nomination of `te` itself does not force a
 // drop -- this same trailers check decides its fate, matching Envoy's own
 // nomination special case; rejects Connection nominating `upgrade` alongside an Upgrade header
-// whose trimmed value is non-empty (even with `close`) but admits a bare
+// whose trimmed raw value is non-empty (even with `close`) but admits a bare
 // Upgrade header otherwise -- including an Upgrade header present with an
 // empty/OWS-only value alongside an `upgrade` nomination -- and always
-// strips it (and any nominated Upgrade) from the forwarded request;
-// rejects more than one X-Forwarded-Proto field; a single field's value that
+// strips it (and any nominated Upgrade) from the forwarded request; presence
+// is based on the field's trimmed raw value, not the parser's own
+// token-skipping flag, so a comma/OWS-only value such as "," or ", ," still
+// counts as non-empty and fails closed alongside a nominating Connection
+// value;
+// rejects more than one X-Forwarded-Proto field, unconditionally, with no
+// Connection-nomination exception (nominating x-forwarded-proto is itself
+// protected, so it can never be dropped away as an escape hatch); a single
+// field's value that
 // is not (case-insensitively) exactly "http" or "https" -- empty, OWS-only,
 // or otherwise invalid such as "http,https" -- is overwritten in place, at
 // that field's original position, with "http" rather than dropped and
 // forwarded blank or malformed; a valid value passes through unchanged in
 // place; a trailing "x-forwarded-proto: http" is appended only when the
-// client sent no such field at all; rejects a fragment-bearing request
+// client sent no such field at all; this "http" fallback is
+// connection-derived, so ID4 targets a cleartext (non-TLS) listener only and
+// is rejected closed (no upstream contact) on a connection this runtime
+// terminated with TLS, rather than ever synthesizing "https"; separately
+// rejects a duplicated physical occurrence of any *other* header name Envoy
+// stores as a single inline slot (e.g. Content-Type, User-Agent,
+// Authorization, Referer, and the remaining X-Forwarded-*/X-Envoy-* names)
+// unless the client's Connection value also nominates that name, in which
+// case every physical occurrence is dropped instead; rejects a fragment-bearing request
 // target; and drops the sixteen client-supplied headers Envoy itself strips
 // for external requests, plus one Rut-side hardening addition, seventeen in
 // total (`x-envoy-internal`, fourteen more `x-envoy-*` names,

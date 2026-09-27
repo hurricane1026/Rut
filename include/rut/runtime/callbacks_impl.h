@@ -5763,6 +5763,7 @@ inline RequestPolicyBodyState inspect_request_policy_body(const Connection& conn
     bool has_te = false;
     bool has_expect = false;
     bool has_upgrade = false;
+    bool upgrade_value_nonempty = false;
     bool connection_nominates_upgrade = false;
     const u8* hs = line_end + 2;
     const u8* header_end = end - 2;
@@ -5815,16 +5816,35 @@ inline RequestPolicyBodyState inspect_request_policy_body(const Connection& conn
             request_policy_trim_ows(expect_value_start, expect_value_end);
             has_expect |= expect_value_start != expect_value_end;
         }
+        // `req.has_upgrade_header` walks the value as a comma-separated
+        // token list and only sets the flag when it finds an actual
+        // non-comma, non-OWS token (Codex sweep-8 review, PR #696): a value
+        // consisting solely of commas and/or OWS, such as "," or ", ,", has
+        // every character consumed by the tokenizer's own delimiter-skipping
+        // loop before a token start is ever recorded, so the flag stays
+        // false even though the field's trimmed raw value is non-empty. Base
+        // presence here on that trimmed raw value directly instead (mirroring
+        // the `Expect` handling just above), so a comma-only `Upgrade` value
+        // still counts as semantically present for the genuine-upgrade check
+        // below.
+        if (request_policy_name_eq(hs, name_len, "upgrade", 7)) {
+            const u8* upgrade_value_start = colon + 1;
+            const u8* upgrade_value_end = le;
+            request_policy_trim_ows(upgrade_value_start, upgrade_value_end);
+            upgrade_value_nonempty |= upgrade_value_start != upgrade_value_end;
+        }
         has_upgrade |= request_policy_name_eq(hs, name_len, "upgrade", 7);
         hs = le + 2;
     }
     // ID4 (host: "preserve") only: a `Connection` value that nominates
     // "upgrade" alongside "close" (or on its own), together with a
     // semantically-present (non-empty/non-OWS) `Upgrade` header
-    // (`req.has_upgrade_header`, the parser's own `Utility::isUpgrade`-style
-    // presence flag -- an empty or OWS-only value requests no protocol and
-    // must not gate this rejection), is a genuine upgrade request per Envoy's
-    // own `Utility::isUpgrade` (which ignores "close" entirely). Rut's
+    // (`upgrade_value_nonempty` above, computed directly from the field's
+    // trimmed raw value rather than the parser's own token-skipping
+    // `req.has_upgrade_header`, which misses a comma-only value -- an empty
+    // or OWS-only value requests no protocol and must not gate this
+    // rejection), is a genuine upgrade request per Envoy's own
+    // `Utility::isUpgrade` (which ignores "close" entirely). Rut's
     // request_policy path has no upgrade-tunnel capability, so this shape
     // must fail closed rather than being silently rewritten into an ordinary
     // request with both headers dropped. This must run before the bodyless
@@ -5837,7 +5857,7 @@ inline RequestPolicyBodyState inspect_request_policy_body(const Connection& conn
     // Upgrade header outright) is unrelated to Envoy's isUpgrade semantics
     // and stays below, scoped to the body-carrying path only, exactly as
     // before (this PR does not touch that non-Envoy-oracle profile).
-    if (request_policy_preserves_host(policy_id) && req.has_upgrade_header &&
+    if (request_policy_preserves_host(policy_id) && upgrade_value_nonempty &&
         connection_nominates_upgrade)
         return RequestPolicyBodyState::Invalid;
     if (conn.req_wants_upgrade || cl_count > 1) return RequestPolicyBodyState::Invalid;
@@ -5928,6 +5948,23 @@ inline RequestPolicyBodyState inspect_request_policy_body(const Connection& conn
 // than a byte-accurate Envoy match; see `docs/envoy-converter.md`'s "Known
 // capability dependencies".
 inline bool apply_preserve_host_lowercase_request_policy(Connection& conn, u16 policy_id) {
+    // ID4 targets Envoy's cleartext (non-TLS) listener profile specifically:
+    // the trailing `x-forwarded-proto: http` synthesis below (and the
+    // in-place overwrite of an invalid/empty client-supplied value) is
+    // connection-derived from that cleartext assumption, not from the
+    // client's own claim. Forwarding a hardcoded "http" scheme upstream on a
+    // connection this runtime itself terminated with TLS would misinform the
+    // origin about the connection's real security property (Codex sweep-8
+    // review, PR #696) -- the fix is not to synthesize "https" instead
+    // (nothing else in this profile has been validated against a TLS
+    // listener's shape), but to fail this cleartext-only profile closed
+    // before any rewrite or upstream contact, the same way every other
+    // unsupported combination in this function does. The compile-time analyzer
+    // check (rejecting ID4 wherever the listener is statically known to be
+    // TLS) is the primary defense; this runtime guard additionally covers a
+    // hand-written route or direct-RIR caller that selects ID4 on a
+    // connection this runtime accepted over TLS.
+    if (conn.tls_active) return false;
     if (inspect_request_policy_body(conn, policy_id) != RequestPolicyBodyState::Complete)
         return false;
 
@@ -9697,12 +9734,31 @@ inline bool response_policy_suppress_head_admitted(const Connection& conn,
     // policy keeps the original closed contract of rejecting any `Upgrade`
     // header outright.
     const bool id4_route = request_policy_preserves_host(request_policy_id);
-    if (parser.parse(conn.recv_buf.data(), conn.recv_buf.len(), &req) != ParseStatus::Complete ||
-        req.method != HttpMethod::HEAD || req.version != HttpVersion::Http11 ||
+    if (parser.parse(conn.recv_buf.data(), conn.recv_buf.len(), &req) != ParseStatus::Complete)
+        return false;
+    // `req.has_upgrade_header` walks the Upgrade value as a comma-separated
+    // token list and only sets the flag when it finds an actual non-comma,
+    // non-OWS token (Codex sweep-8 review, PR #696): a value consisting
+    // solely of commas and/or OWS, such as "," or ", ,", leaves the flag
+    // false even though the field's trimmed raw value (`header.value`,
+    // already OWS-trimmed by the parser for every stored header, matching
+    // the `Expect` handling further below) is non-empty. Compute presence
+    // directly from that trimmed raw value instead of the parser's flag, so
+    // a comma-only `Upgrade` value still counts as semantically present for
+    // both the top-of-body check right below and the genuine-upgrade
+    // nomination check inside the `Connection` token scan further down.
+    bool upgrade_value_nonempty = false;
+    for (u32 i = 0; i < req.header_count; i++) {
+        if (http_header_name_eq_ci(
+                req.headers[i].name.ptr, req.headers[i].name.len, "upgrade", 7) &&
+            req.headers[i].value.len != 0)
+            upgrade_value_nonempty = true;
+    }
+    if (req.method != HttpMethod::HEAD || req.version != HttpVersion::Http11 ||
         req.path.ptr == nullptr || req.path.len == 0 || req.path.ptr[0] != '/' ||
         req.has_content_length || req.chunked ||
-        (id4_route ? (req.upgrade && req.has_upgrade_header)
-                   : (req.upgrade || req.has_upgrade_header)))
+        (id4_route ? (req.upgrade && upgrade_value_nonempty)
+                   : (req.upgrade || upgrade_value_nonempty)))
         return false;
     u32 host_count = 0;
     u32 connection_count = 0;
@@ -9746,7 +9802,7 @@ inline bool response_policy_suppress_head_admitted(const Connection& conn,
                 // shares that same classifier rather than maintaining a
                 // second, narrower allowlist. A genuine upgrade -- a
                 // nominated `upgrade` token together with a semantically
-                // present `Upgrade` value (`req.has_upgrade_header`) --
+                // present `Upgrade` value (`upgrade_value_nonempty` above) --
                 // still fails closed here explicitly (the top-of-body check
                 // above already covers it too); every other token,
                 // including `te`, `close`, `keep-alive`, and an
@@ -9778,7 +9834,7 @@ inline bool response_policy_suppress_head_admitted(const Connection& conn,
                         const u32 tok_len = static_cast<u32>(t1 - t0);
                         const bool is_close = http_header_name_eq_ci(t0, tok_len, "close", 5);
                         const bool is_genuine_upgrade_nomination =
-                            req.has_upgrade_header &&
+                            upgrade_value_nonempty &&
                             http_header_name_eq_ci(t0, tok_len, "upgrade", 7);
                         if (is_genuine_upgrade_nomination ||
                             request_policy_connection_nomination_is_protected(

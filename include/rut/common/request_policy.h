@@ -38,9 +38,27 @@ enum class RequestPolicyId : u16 {
     // preserved unchanged in its original position; an empty, OWS-only, or
     // otherwise invalid value is overwritten in place at that same position
     // with `http`; a trailing `x-forwarded-proto: http` is appended only
-    // when the client sent no such field at all. Ordinary-forward-only:
-    // never admitted alongside a response read deadline or response
-    // buffering (see the closed admission predicates below).
+    // when the client sent no such field at all. Rejects a second physical
+    // occurrence of any header name Envoy stores as a single inline slot
+    // (every name in `kInlineRequestHeaders`,
+    // `include/rut/runtime/callbacks_impl.h` -- includes, among others,
+    // `Content-Type`, `User-Agent`, `Authorization`, `Referer`, and every
+    // `X-Forwarded-*`/`X-Envoy-*` name this profile does not already
+    // unconditionally strip) with a 400 before upstream contact, unless the
+    // client's `Connection` value also nominates that name, in which case
+    // every physical occurrence is dropped instead and no duplicate ever
+    // reaches the wire; this profile does not replicate Envoy's own
+    // duplicate-coalescing for these names, so a client sending two such
+    // fields diverges from Envoy's forwarding behavior and is fail-closed
+    // rather than silently accepted. Targets Envoy's cleartext (non-TLS)
+    // listener profile only: the connection-derived `x-forwarded-proto`
+    // fallback above is hardcoded to `http`, so this policy is rejected
+    // outright (fail closed, no upstream contact, same status as every
+    // other unsupported combination) on a connection this runtime itself
+    // terminated with TLS (`conn.tls_active`) -- it never synthesizes
+    // `https` instead. Ordinary-forward-only: never admitted alongside a
+    // response read deadline or response buffering (see the closed
+    // admission predicates below).
     Http11PreserveHostLowercase = 4,
     // Reserved in the 16-bit forward-result slot for invalid direct-RIR values.
     Invalid = 0xffffu,

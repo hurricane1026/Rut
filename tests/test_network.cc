@@ -3499,6 +3499,66 @@ TEST(request_policy, preserve_host_lowercase_admission_table) {
     CHECK(complete_content_length_request_policy_is_admitted(kLegacy));
 }
 
+// Codex sweep-8 review: ID4's trailing `x-forwarded-proto: http` synthesis
+// (and its in-place overwrite of an invalid/empty client value) is
+// connection-derived from a cleartext-listener assumption, not from the
+// client's own claim -- so it must never run on a connection this runtime
+// itself terminated with TLS, which would misinform the origin that an
+// HTTPS connection was cleartext. `apply_preserve_host_lowercase_request_policy`
+// now fails this cleartext-only profile closed (no upstream contact, no
+// rewrite performed) whenever `conn.tls_active` is set, covering a
+// hand-written route or direct-RIR caller that selects ID4 on a TLS
+// connection -- the exact vector the review calls out, since the `.rut`
+// language has no TLS-listener declaration for a static/compile-time check
+// to key off (`listen` carries only an address and port; TLS is decided
+// solely by the `--tls-cert`/`--tls-key` CLI flags at server-launch time in
+// src/main.cc, entirely decoupled from `.rut` compilation).
+TEST(request_policy, preserve_host_lowercase_rejects_tls_connection) {
+    static constexpr u16 kPreserveHost =
+        static_cast<u16>(RequestPolicyId::Http11PreserveHostLowercase);
+    Connection conn{};
+    u8 recv[256]{};
+    u8 send[256]{};
+    sockaddr_in endpoint{};
+    endpoint.sin_family = AF_INET;
+    endpoint.sin_addr.s_addr = htonl(0x7f000001u);
+    endpoint.sin_port = htons(9000);
+
+    conn.reset();
+    conn.recv_slice = recv;
+    conn.send_slice = send;
+    conn.bind_request_receive_buffer(recv, sizeof(recv));
+    conn.send_buf.bind(send, sizeof(send));
+    static constexpr char kWire[] = "GET /tls-smoke HTTP/1.1\r\nHost: client.example\r\n\r\n";
+    REQUIRE_EQ(conn.recv_buf.write(reinterpret_cast<const u8*>(kWire), sizeof(kWire) - 1),
+               sizeof(kWire) - 1);
+    capture_request_metadata(conn);
+    conn.tls_active = true;
+
+    CHECK_FALSE(apply_request_policy(conn, endpoint, kPreserveHost));
+    CHECK_EQ(conn.send_buf.len(), 0u);
+    // No rewrite performed: the original request bytes are untouched.
+    CHECK_EQ(conn.recv_buf.len(), sizeof(kWire) - 1);
+    CHECK_EQ(__builtin_memcmp(conn.recv_buf.data(), kWire, sizeof(kWire) - 1), 0);
+
+    // The identical request over cleartext (tls_active left false) is
+    // admitted and rewritten normally -- this profile is not disabled
+    // outright, only rejected specifically on TLS connections.
+    conn.reset();
+    conn.recv_slice = recv;
+    conn.send_slice = send;
+    conn.bind_request_receive_buffer(recv, sizeof(recv));
+    conn.send_buf.bind(send, sizeof(send));
+    REQUIRE_EQ(conn.recv_buf.write(reinterpret_cast<const u8*>(kWire), sizeof(kWire) - 1),
+               sizeof(kWire) - 1);
+    capture_request_metadata(conn);
+    REQUIRE(apply_request_policy(conn, endpoint, kPreserveHost));
+    static constexpr char kExpected[] =
+        "GET /tls-smoke HTTP/1.1\r\nhost: client.example\r\nx-forwarded-proto: http\r\n\r\n";
+    CHECK_EQ(conn.recv_buf.len(), sizeof(kExpected) - 1);
+    CHECK_EQ(__builtin_memcmp(conn.recv_buf.data(), kExpected, sizeof(kExpected) - 1), 0);
+}
+
 // `request_policy_body_response_admitted` (callbacks_impl.h) is the ordinary
 // strict-response body-path admission check for a body-carrying request
 // paired with a response_policy. It used to admit only ID1
@@ -4324,6 +4384,49 @@ TEST(request_policy, preserve_host_lowercase_wire_and_fail_closed_host) {
     require_wire(
         "POST /upgrade-close-empty-value HTTP/1.1\r\nhost: client.example\r\n"
         "content-length: 4\r\nx-forwarded-proto: http\r\n\r\nabcd");
+
+    // A comma-only `Upgrade` value ("," or ", ,") must NOT be treated the
+    // same as a genuinely empty/OWS-only one: its trimmed raw value is
+    // non-empty (it is literally "," or ", ,"), so this is a genuine
+    // upgrade request per Envoy's own `Utility::isUpgrade` and must fail
+    // closed the same as `Upgrade: websocket` does above. The parser's own
+    // `has_upgrade_header` flag walks the value as a comma-separated token
+    // list and, for a value consisting solely of commas and/or OWS, never
+    // records an actual token -- leaving that flag false even though the
+    // field is not blank -- so this shape previously slipped through and
+    // was admitted as an ordinary request with both headers silently
+    // stripped (Codex sweep-8 review, PR #696). Fixed by basing presence on
+    // the field's trimmed raw value directly.
+    prepare(
+        "POST /upgrade-close-comma-only-value HTTP/1.1\r\n"
+        "Host: client.example\r\n"
+        "Content-Length: 4\r\n"
+        "Connection: close, upgrade\r\n"
+        "Upgrade: ,\r\n\r\nabcd");
+    CHECK_FALSE(apply_request_policy(conn, endpoint, kPreserveHost));
+    CHECK_EQ(conn.send_buf.len(), 0u);
+
+    // The same fail-closed rule for a multi-comma, still-token-free value.
+    prepare(
+        "POST /upgrade-close-multi-comma-only-value HTTP/1.1\r\n"
+        "Host: client.example\r\n"
+        "Content-Length: 4\r\n"
+        "Connection: close, upgrade\r\n"
+        "Upgrade: , ,\r\n\r\nabcd");
+    CHECK_FALSE(apply_request_policy(conn, endpoint, kPreserveHost));
+    CHECK_EQ(conn.send_buf.len(), 0u);
+
+    // The same comma-only shape must fail closed on the bodyless path too
+    // (mirroring the bodyless `close, upgrade` + genuine `Upgrade` case
+    // above): the upgrade-nomination check must run before the
+    // `cl_count == 0` early return.
+    prepare(
+        "GET /upgrade-close-comma-only-value-bodyless HTTP/1.1\r\n"
+        "Host: client.example\r\n"
+        "Connection: close, upgrade\r\n"
+        "Upgrade: ,\r\n\r\n");
+    CHECK_FALSE(apply_request_policy(conn, endpoint, kPreserveHost));
+    CHECK_EQ(conn.send_buf.len(), 0u);
 
     // Fail closed: a Connection token shaped like an HTTP/2 pseudo-header
     // (its first byte is `:`, e.g. the aliased `:authority`). Rut's parser
@@ -69548,6 +69651,82 @@ TEST(state_invariant, jit_forward_direct_paired_head_id4_still_rejects_genuine_u
     static constexpr char kRequest[] =
         "HEAD /missing?q=1 HTTP/1.1\r\nHost: client.example\r\n"
         "Connection: upgrade\r\nUpgrade: websocket\r\n\r\n";
+    REQUIRE_EQ(c->recv_buf.write(reinterpret_cast<const u8*>(kRequest), sizeof(kRequest) - 1),
+               sizeof(kRequest) - 1);
+    capture_request_metadata(*c);
+    c->req_initial_send_len = c->recv_buf.len();
+    c->keep_alive = true;
+
+    JitDispatchOutcome outcome{};
+    outcome.kind = JitDispatchOutcome::Kind::Forward;
+    outcome.upstream_id = upstream.value();
+    outcome.request_policy_id = static_cast<u16>(RequestPolicyId::Http11PreserveHostLowercase);
+    outcome.response_policy_id = 1;
+    outcome.failure_policy_id = 1;
+    loop.backend.clear_ops();
+    loop.backend.fail_connect = true;
+    handle_jit_outcome<SmallLoop>(&loop, *c, outcome, nullptr, true);
+
+    CHECK_EQ(c->resp_status, 400u);
+    CHECK_EQ(loop.backend.count_ops(MockOp::Connect), 0u);
+    CHECK_EQ(loop.backend.count_ops(MockOp::Send), 1u);
+    close(fds[1]);
+    loop.close_conn(*c);
+}
+
+// Codex sweep-8 review: a comma-only `Upgrade` value ("," here) must be
+// treated as a genuine, semantically-present upgrade value in the
+// paired-HEAD preflight too, matching the ordinary ID4 request-policy path's
+// fix. The parser's own `has_upgrade_header` flag would report this field as
+// absent (it never finds an actual token among the commas/OWS), so the
+// preflight must base presence on the field's trimmed raw value directly
+// rather than that flag -- otherwise this genuine-upgrade shape would be
+// admitted here (400 skipped) even though the ordinary serializer path now
+// correctly rejects it.
+TEST(state_invariant, jit_forward_direct_paired_head_id4_still_rejects_comma_only_upgrade) {
+    RouteConfig cfg;
+    auto upstream = cfg.add_upstream("api", 0x7F000001, 9000);
+    REQUIRE(upstream.has_value());
+    cfg.upstreams[upstream.value()].max_inflight = 1;
+
+    static constexpr char kBody[] =
+        "<html>\r\n<head><title>502 Bad Gateway</title></head>\r\n<body>\r\n"
+        "<center><h1>502 Bad Gateway</h1></center>\r\n"
+        "<hr><center>nginx/1.29.7</center>\r\n</body>\r\n</html>\r\n";
+    static_assert(sizeof(kBody) - 1 == 157);
+    ForwardResponsePolicySpec response{};
+    response.version = ResponsePolicyVersion::Http11;
+    response.framing = ResponsePolicyFraming::ContentLength;
+    response.connection = ResponsePolicyConnection::Request;
+    response.date = ResponsePolicyDate::Current;
+    response.head_mode = ResponsePolicyHeadMode::SuppressBody;
+    response.server = {"nginx/1.29.7", 12};
+    REQUIRE_EQ(cfg.add_response_policy(response), 1u);
+
+    ForwardFailurePolicySpec failure{};
+    failure.version = ForwardFailurePolicyVersion::Http11;
+    failure.status_code = 502;
+    failure.date = ForwardFailurePolicyDate::Current;
+    failure.connection = ForwardFailurePolicyConnection::Request;
+    failure.head_mode = FailurePolicyHeadMode::SuppressBody;
+    failure.reason = {"Bad Gateway", 11};
+    failure.content_type = {"text/html", 9};
+    failure.server = {"nginx/1.29.7", 12};
+    failure.body = {kBody, sizeof(kBody) - 1};
+    REQUIRE_EQ(cfg.add_failure_policy(failure), 1u);
+
+    SmallLoop loop;
+    loop.setup();
+    int fds[2];
+    REQUIRE(socketpair(AF_UNIX, SOCK_STREAM, 0, fds) == 0);
+    ScopedFakeSocket fake_socket(fds[0]);
+    loop.inject_and_dispatch(make_ev(0, IoEventType::Accept, 42));
+    auto* c = loop.find_fd(42);
+    REQUIRE(c != nullptr);
+    c->request_config = &cfg;
+    static constexpr char kRequest[] =
+        "HEAD /missing?q=1 HTTP/1.1\r\nHost: client.example\r\n"
+        "Connection: upgrade\r\nUpgrade: ,\r\n\r\n";
     REQUIRE_EQ(c->recv_buf.write(reinterpret_cast<const u8*>(kRequest), sizeof(kRequest) - 1),
                sizeof(kRequest) - 1);
     capture_request_metadata(*c);
