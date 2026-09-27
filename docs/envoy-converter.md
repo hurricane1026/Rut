@@ -530,9 +530,11 @@ are recorded from the pinned Envoy build, not assumed.
   than mis-forwarding.
 - Upstream connect failure: 503 with `content-type: text/plain` and body
   `upstream connect error or disconnect/reset before headers. reset reason:
-  connection failure` (the exact text is pinned from the oracle). No healthy
-  endpoint: 503 `no healthy upstream`. Route timeout: 504 `upstream request
-  timeout`. Each is a `failure_policy` / `timeout_failure_policy` row.
+  remote connection failure` (98 bytes, the exact text pinned from the
+  oracle transcript in `tests/fixtures/envoy_oracle_milestone_s.inc`). No
+  healthy endpoint: 503 `no healthy upstream`. Route timeout: 504 `upstream
+  request timeout`. Each is a `failure_policy` / `timeout_failure_policy`
+  row.
 - Downstream keep-alive follows the request (`connection: close` is honored;
   HTTP/1.1 default is keep-alive). The `connection` response header is emitted
   only for close.

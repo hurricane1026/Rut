@@ -755,6 +755,57 @@ add_dependencies(test_envoy_convert rut-envoy-convert)
 add_test(NAME test_envoy_convert COMMAND test_envoy_convert $<TARGET_FILE:rut-envoy-convert>)
 set_tests_properties(test_envoy_convert PROPERTIES LABELS "unit;envoy;converter")
 
+# Pinned Envoy image + oracle-recording differential scaffold (envoy-pr-plan.md
+# PR 2). Self-contained: no dependency on rut_envoy/rut_compiler/rut_runtime,
+# so this does not need RUT_ENABLE_JIT, unlike the nginx differential below.
+if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+    set(_RUT_PINNED_ENVOY_IMAGE_FILE "${CMAKE_CURRENT_SOURCE_DIR}/pinned-envoy-image.txt")
+    set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS
+        "${_RUT_PINNED_ENVOY_IMAGE_FILE}"
+    )
+    file(STRINGS "${_RUT_PINNED_ENVOY_IMAGE_FILE}" _RUT_PINNED_ENVOY_IMAGE_LINES
+         LIMIT_COUNT 2)
+    file(SIZE "${_RUT_PINNED_ENVOY_IMAGE_FILE}" _RUT_PINNED_ENVOY_IMAGE_FILE_SIZE)
+    list(LENGTH _RUT_PINNED_ENVOY_IMAGE_LINES _RUT_PINNED_ENVOY_IMAGE_LINE_COUNT)
+    if(NOT _RUT_PINNED_ENVOY_IMAGE_LINE_COUNT EQUAL 1 OR
+       NOT _RUT_PINNED_ENVOY_IMAGE_FILE_SIZE EQUAL 89)
+        message(FATAL_ERROR
+            "${_RUT_PINNED_ENVOY_IMAGE_FILE} must contain exactly one newline-terminated image reference"
+        )
+    endif()
+    list(GET _RUT_PINNED_ENVOY_IMAGE_LINES 0 _RUT_PINNED_ENVOY_IMAGE)
+    string(LENGTH "${_RUT_PINNED_ENVOY_IMAGE}" _RUT_PINNED_ENVOY_IMAGE_LENGTH)
+    if(NOT _RUT_PINNED_ENVOY_IMAGE_LENGTH EQUAL 88 OR
+       NOT _RUT_PINNED_ENVOY_IMAGE MATCHES "^envoyproxy/envoy@sha256:[0-9a-f]+$")
+        message(FATAL_ERROR
+            "${_RUT_PINNED_ENVOY_IMAGE_FILE} must contain envoyproxy/envoy@sha256: followed by exactly 64 lowercase hexadecimal characters"
+        )
+    endif()
+
+    add_executable(test_envoy_differential test_envoy_differential.cc)
+    target_include_directories(test_envoy_differential PRIVATE
+        ${PROJECT_SOURCE_DIR}/include
+        ${CMAKE_CURRENT_SOURCE_DIR}
+    )
+    target_link_libraries(test_envoy_differential PRIVATE Threads::Threads)
+    target_compile_definitions(test_envoy_differential PRIVATE
+        "RUT_PINNED_ENVOY_IMAGE=\"${_RUT_PINNED_ENVOY_IMAGE}\""
+    )
+
+    add_test(NAME test_envoy_differential_selftest COMMAND test_envoy_differential --self-test)
+    set_tests_properties(test_envoy_differential_selftest PROPERTIES
+        LABELS "unit;envoy"
+        TIMEOUT 60
+    )
+
+    add_test(NAME test_envoy_oracle_milestone_s
+             COMMAND test_envoy_differential --oracle-milestone-s
+                     ${CMAKE_BINARY_DIR}/envoy_oracle_milestone_s.inc)
+    set_tests_properties(test_envoy_oracle_milestone_s PROPERTIES
+        LABELS "integration;envoy;docker" RUN_SERIAL TRUE RESOURCE_LOCK envoy-differential
+        TIMEOUT 120 SKIP_RETURN_CODE 77)
+endif()
+
 add_executable(test_drain test_drain.cc)
 target_link_libraries(test_drain rut_runtime)
 target_include_directories(test_drain PRIVATE

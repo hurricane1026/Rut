@@ -202,6 +202,79 @@ jobs:
           RUT_NGINX_DIFFERENTIAL_REQUIRED=1 \
           ctest --test-dir build --output-on-failure --no-tests=error -j 1 --timeout 120 -L nginx
 
+  envoy-required:
+    name: Required pinned Envoy differentials
+    if: github.event_name != 'workflow_dispatch' || inputs.mode == 'ci'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          submodules: recursive
+
+      - name: Install tools
+        run: |
+          wget -qO- https://apt.llvm.org/llvm-snapshot.gpg.key | sudo tee /etc/apt/trusted.gpg.d/llvm.asc > /dev/null
+          echo "deb https://apt.llvm.org/noble/ llvm-toolchain-noble-21 main" | \
+            sudo tee /etc/apt/sources.list.d/llvm.list
+          sudo apt-get update
+          sudo apt-get install -y cmake ninja-build llvm-21-dev libboost-dev ragel
+
+      - name: Provision exact pinned Envoy image
+        run: |
+          set -euo pipefail
+          mapfile -t pinned_images < tests/pinned-envoy-image.txt
+          if (( ${#pinned_images[@]} != 1 )); then
+            echo "tests/pinned-envoy-image.txt must contain exactly one image reference" >&2
+            exit 1
+          fi
+          image=${pinned_images[0]}
+          if [[ ! "$image" =~ ^envoyproxy/envoy@sha256:[0-9a-f]{64}$ ]]; then
+            echo "invalid pinned Envoy image reference" >&2
+            exit 1
+          fi
+
+          for attempt in 1 2 3; do
+            if docker pull "$image"; then
+              break
+            fi
+            if (( attempt == 3 )); then
+              echo "failed to pull the pinned Envoy image after ${attempt} attempts" >&2
+              exit 1
+            fi
+            sleep $((attempt * 5))
+          done
+
+          docker image inspect "$image" > /dev/null
+          if ! docker image inspect \
+              --format '{{range .RepoDigests}}{{println .}}{{end}}' "$image" | \
+              grep -Fqx -- "$image"; then
+            echo "pulled image does not expose the exact required RepoDigest" >&2
+            exit 1
+          fi
+
+      - name: Configure
+        run: |
+          cmake -B build -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DRUT_ENABLE_JIT=ON \
+            -DLLVM_DIR=/usr/lib/llvm-21/lib/cmake/llvm
+
+      - name: Build Envoy differential targets
+        run: ninja -C build rut-envoy-convert test_envoy_parser test_envoy_convert test_envoy_differential
+
+      - name: Test required Envoy differentials
+        run: |
+          RUT_ENVOY_DIFFERENTIAL_REQUIRED=1 \
+          ctest --test-dir build --output-on-failure --no-tests=error -j 1 --timeout 120 -L envoy
+
+      - name: Upload Envoy oracle transcript
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: envoy-oracle-transcript
+          path: build/envoy_oracle_milestone_s.inc
+
   docker-launch-diagnostic:
     name: Docker launch diagnostic — not acceptance
     if: github.event_name == 'workflow_dispatch' && inputs.mode == 'docker-launch-diagnostic'
