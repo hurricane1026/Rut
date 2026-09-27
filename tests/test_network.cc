@@ -4903,6 +4903,176 @@ TEST(request_policy, preserve_host_lowercase_xfp_synthesis_fails_closed_with_no_
     CHECK_EQ(__builtin_memcmp(conn.recv_buf.data(), wire.data(), wire.size()), 0);
 }
 
+// Codex sweep-6 review: the sweep-4 capacity argument was incomplete -- it
+// bounded growth at a fixed 25 bytes (the synthesized `x-forwarded-proto`
+// line), but missed that an invalid/empty `x-forwarded-proto` value grows
+// too when overwritten in place (`X-Forwarded-Proto:\r\n`, 20 bytes,
+// becomes the 25-byte canonical line), and, more importantly, that *any*
+// ordinary retained field whose colon has no following OWS grows by one
+// byte when re-emitted with the canonical single space (`X:a\r\n`, 5 bytes,
+// becomes `x: a\r\n`, 6 bytes) -- unbounded in aggregate, not capped at 25.
+// `apply_preserve_host_lowercase_request_policy` now computes the exact
+// final size via a "measuring" dry-run pass sharing the identical branches
+// with the real write pass (see the comment above it), rather than
+// reasoning about a bound at all. This helper verifies that computation is
+// exact -- not merely safe -- for a given (wire, expected) pair: binding
+// `conn.recv_buf`/`conn.send_buf` to precisely `expected.size()` bytes must
+// forward the request and produce exactly those bytes, while one byte less
+// must fail closed the same way -- and with the same 400-class status --
+// as every other admission failure in this function, before any byte is
+// written, leaving the original request completely untouched.
+static void check_preserve_host_lowercase_exact_boundary(rut::test::TestCase* _tc,
+                                                         const std::string& wire,
+                                                         const std::string& expected) {
+    static constexpr u16 kPreserveHost =
+        static_cast<u16>(RequestPolicyId::Http11PreserveHostLowercase);
+    sockaddr_in endpoint{};
+    endpoint.sin_family = AF_INET;
+    endpoint.sin_addr.s_addr = htonl(0x7f000001u);
+    endpoint.sin_port = htons(9000);
+
+    // Fits exactly: forwarded, producing precisely the predicted bytes.
+    {
+        Connection conn{};
+        std::vector<u8> recv(expected.size());
+        std::vector<u8> send(expected.size());
+        conn.reset();
+        conn.recv_slice = recv.data();
+        conn.send_slice = send.data();
+        conn.bind_request_receive_buffer(recv.data(), static_cast<u32>(recv.size()));
+        conn.send_buf.bind(send.data(), static_cast<u32>(send.size()));
+        REQUIRE_EQ(conn.recv_buf.write(reinterpret_cast<const u8*>(wire.data()),
+                                       static_cast<u32>(wire.size())),
+                   static_cast<u32>(wire.size()));
+        capture_request_metadata(conn);
+        REQUIRE(apply_request_policy(conn, endpoint, kPreserveHost));
+        CHECK_EQ(conn.recv_buf.len(), static_cast<u32>(expected.size()));
+        CHECK_EQ(__builtin_memcmp(conn.recv_buf.data(), expected.data(), expected.size()), 0);
+    }
+    // One byte short: fails closed, original request left untouched.
+    {
+        Connection conn{};
+        const u32 short_cap = static_cast<u32>(expected.size()) - 1;
+        std::vector<u8> recv(short_cap);
+        std::vector<u8> send(short_cap);
+        conn.reset();
+        conn.recv_slice = recv.data();
+        conn.send_slice = send.data();
+        conn.bind_request_receive_buffer(recv.data(), short_cap);
+        conn.send_buf.bind(send.data(), short_cap);
+        REQUIRE_EQ(conn.recv_buf.write(reinterpret_cast<const u8*>(wire.data()),
+                                       static_cast<u32>(wire.size())),
+                   static_cast<u32>(wire.size()));
+        capture_request_metadata(conn);
+        CHECK_FALSE(apply_request_policy(conn, endpoint, kPreserveHost));
+        CHECK_EQ(conn.send_buf.len(), 0u);
+        CHECK_EQ(conn.recv_buf.len(), static_cast<u32>(wire.size()));
+        CHECK_EQ(__builtin_memcmp(conn.recv_buf.data(), wire.data(), wire.size()), 0);
+    }
+}
+
+// (a) Many colon-without-space fields, bound with generous slack: each
+// field's individual +1 growth (50 fields, ~50 bytes total) must not be
+// mistaken for the old, XFP-specific 25-byte bound -- the exact dry-run
+// size accounts for all of them, and a generously-sized buffer forwards
+// the request with every field renormalized to a single space.
+TEST(request_policy, preserve_host_lowercase_many_colon_no_space_fields_with_slack_forwards) {
+    static constexpr u16 kPreserveHost =
+        static_cast<u16>(RequestPolicyId::Http11PreserveHostLowercase);
+    std::string wire = "GET / HTTP/1.1\r\nHost: h\r\n";
+    std::string expected = "GET / HTTP/1.1\r\nhost: h\r\n";
+    for (int i = 0; i < 50; i++) {
+        std::string name = "H";
+        name += static_cast<char>('0' + (i / 10));
+        name += static_cast<char>('0' + (i % 10));
+        std::string lower = "h";
+        lower += name[1];
+        lower += name[2];
+        wire += name + ":a\r\n";
+        expected += lower + ": a\r\n";
+    }
+    wire += "X-Forwarded-Proto: http\r\n\r\n";
+    expected += "x-forwarded-proto: http\r\n\r\n";
+
+    Connection conn{};
+    // Deliberately generous: far more headroom than the ~50 bytes of
+    // colon-spacing growth needs.
+    std::vector<u8> recv(expected.size() + 128);
+    std::vector<u8> send(expected.size() + 128);
+    sockaddr_in endpoint{};
+    endpoint.sin_family = AF_INET;
+    endpoint.sin_addr.s_addr = htonl(0x7f000001u);
+    endpoint.sin_port = htons(9000);
+    conn.reset();
+    conn.recv_slice = recv.data();
+    conn.send_slice = send.data();
+    conn.bind_request_receive_buffer(recv.data(), static_cast<u32>(recv.size()));
+    conn.send_buf.bind(send.data(), static_cast<u32>(send.size()));
+    REQUIRE_EQ(conn.recv_buf.write(reinterpret_cast<const u8*>(wire.data()),
+                                   static_cast<u32>(wire.size())),
+               static_cast<u32>(wire.size()));
+    capture_request_metadata(conn);
+    REQUIRE(apply_request_policy(conn, endpoint, kPreserveHost));
+    CHECK_EQ(conn.recv_buf.len(), static_cast<u32>(expected.size()));
+    CHECK_EQ(__builtin_memcmp(conn.recv_buf.data(), expected.data(), expected.size()), 0);
+}
+
+// (b)+(c)+(d): property-style -- for a set of generated request shapes
+// (colon-without-space fields; an empty/invalid `x-forwarded-proto`
+// overwritten in place; TE canonicalization moving and dropping fields;
+// and an already-normalized request needing only the trailing XFP
+// synthesis), the exact-boundary property holds for every one of them:
+// fits at the predicted size, fails one byte under it.
+TEST(request_policy, preserve_host_lowercase_dry_run_size_matches_materialized_length_property) {
+    // Shape 1: 30 colon-without-space fields plus a present, valid XFP
+    // (isolates the per-field +1 growth from XFP handling).
+    {
+        std::string wire = "GET / HTTP/1.1\r\nHost: h\r\n";
+        std::string expected = "GET / HTTP/1.1\r\nhost: h\r\n";
+        for (int i = 0; i < 30; i++) {
+            std::string name = "H";
+            name += static_cast<char>('0' + (i / 10));
+            name += static_cast<char>('0' + (i % 10));
+            std::string lower = "h";
+            lower += name[1];
+            lower += name[2];
+            wire += name + ":a\r\n";
+            expected += lower + ": a\r\n";
+        }
+        wire += "X-Forwarded-Proto: http\r\n\r\n";
+        expected += "x-forwarded-proto: http\r\n\r\n";
+        check_preserve_host_lowercase_exact_boundary(_tc, wire, expected);
+    }
+    // Shape 2: (b)/(c) -- an empty `X-Forwarded-Proto` (no space after the
+    // colon, 20 bytes) overwritten in place with the 25-byte canonical
+    // line, +5 growth, near/at the exact capacity boundary.
+    {
+        std::string wire = "GET / HTTP/1.1\r\nHost: h\r\nX-Forwarded-Proto:\r\n\r\n";
+        std::string expected = "GET / HTTP/1.1\r\nhost: h\r\nx-forwarded-proto: http\r\n\r\n";
+        check_preserve_host_lowercase_exact_boundary(_tc, wire, expected);
+    }
+    // Shape 3: TE canonicalization moves the canonical line to the first
+    // physical TE field's position (dropping the second field entirely)
+    // while an ordinary colon-without-space field also grows by 1, and XFP
+    // is genuinely absent (the classic +25 append).
+    {
+        std::string wire = "GET / HTTP/1.1\r\nHost: h\r\nTE:\r\nX-Middle:1\r\nTE:trailers\r\n\r\n";
+        std::string expected =
+            "GET / HTTP/1.1\r\nhost: h\r\nte: trailers\r\nx-middle: 1\r\n"
+            "x-forwarded-proto: http\r\n\r\n";
+        check_preserve_host_lowercase_exact_boundary(_tc, wire, expected);
+    }
+    // Shape 4: already fully normalized (single-space colons, no growth
+    // anywhere except the mandatory trailing XFP synthesis) -- the plain
+    // baseline the earlier, incomplete 25-byte bound was written for.
+    {
+        std::string wire = "GET / HTTP/1.1\r\nHost: h\r\nX-Custom: value\r\n\r\n";
+        std::string expected =
+            "GET / HTTP/1.1\r\nhost: h\r\nx-custom: value\r\nx-forwarded-proto: http\r\n\r\n";
+        check_preserve_host_lowercase_exact_boundary(_tc, wire, expected);
+    }
+}
+
 TEST(request_policy, content_length_after_host_wait_and_rejection_never_touch_upstream) {
     static constexpr u16 kAfterHost =
         static_cast<u16>(RequestPolicyId::Http11FixedStripContentLengthAfterHost);

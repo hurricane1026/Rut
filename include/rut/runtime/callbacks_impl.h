@@ -6156,55 +6156,41 @@ inline bool apply_preserve_host_lowercase_request_policy(Connection& conn, u16 p
     // This function writes its rewritten request into `conn.send_buf`,
     // which shares `conn.recv_buf`'s exact physical capacity (both are
     // bound to one `SlicePool::kSliceSize` slice per connection,
-    // `include/rut/runtime/epoll_event_loop.h`/`kqueue_event_loop.h`) --
-    // the rewrite can only ever *shrink or preserve* every byte range it
-    // touches except one: a client that sent no `x-forwarded-proto` field
-    // at all requires appending the literal `kXfpSynthesisBytes`-byte line
-    // below, which has no corresponding bytes in the original request to
-    // offset it. Every other transformation is proven non-growing:
-    //  - the request line is copied byte for byte, unchanged;
-    //  - `host: ` is always exactly 6 bytes regardless of the client's
-    //    header-name casing (same length) or internal OWS around the
-    //    value (trimmed away, never added to);
-    //  - an invalid/empty `x-forwarded-proto` value is overwritten in
-    //    place with the same `kXfpSynthesisBytes`-byte line, which cannot
-    //    be larger than appending it fresh (the original field already
-    //    contributed at least its own name, colon, and CRLF);
-    //  - the canonical `te: trailers` line is exactly 14 bytes, written at
-    //    the *first* physical `TE` field's position; even in the most
-    //    adversarial split (a short, trailers-free first field forcing a
-    //    separate, later trailers-carrying field to be dropped entirely)
-    //    the field being fully removed is always at least as large as the
-    //    growth at the substitution point (minimum non-trailers first
-    //    field `TE:\r\n`, 5 bytes, growing to 14 -- a local +9 -- against a
-    //    minimum trailers-carrying field elsewhere, `TE:trailers\r\n`, 13
-    //    bytes removed -- net -4), so `TE` handling is never a net grower
-    //    across the whole request;
-    //  - every other retained header is re-emitted as its (length-
-    //    preserving) lowercased name, a literal `: ` (2 bytes), and its
-    //    already-OWS-trimmed original value -- never longer than the
-    //    original field, and shorter whenever the original had internal
-    //    OWS beyond a single delimiter.
-    // So a request already within `kXfpSynthesisBytes` bytes of capacity
-    // that also drops or shrinks at least that many bytes elsewhere (any
-    // hop-by-hop header, a `Connection` nomination, a stripped
-    // `x-envoy-*` header, a shortened value, ...) is guaranteed to fit and
-    // is admitted here; empirically verified with both shapes at
-    // `conn.send_buf.capacity() - 1`: a request that also drops a
-    // `Proxy-Connection` header (31 bytes, more than enough to offset the
-    // 25-byte append) is admitted, while one with nothing else to drop
-    // fails -- the same `conn.recv_buf.capacity()` ceiling every other
-    // policy and the parser itself enforce, not a smaller, silently
-    // XFP-specific one (Codex sweep-4 review, PR #696). This buffer-
-    // sharing constraint is inherent to reusing one fixed `SlicePool`
-    // slice per direction per connection; lifting it for the zero-slack
-    // case entirely would require growing `SlicePool::kSliceSize` itself,
-    // which has its own static-asserted layout dependents elsewhere (e.g.
-    // `include/rut/runtime/response_body_chain.h`'s `Node`) and is out of
-    // scope here.
-    constexpr u32 kXfpSynthesisBytes = 25;  // strlen("x-forwarded-proto: http\r\n")
-
+    // `include/rut/runtime/epoll_event_loop.h`/`kqueue_event_loop.h`).
+    // Several rewrites below can grow a field beyond its original wire
+    // bytes: the trailing `x-forwarded-proto: http` line appended when the
+    // client sent none; an invalid/empty `x-forwarded-proto` value
+    // overwritten in place (`X-Forwarded-Proto:\r\n`, 20 bytes, becomes the
+    // 25-byte canonical line); and *any* ordinary retained field whose
+    // original colon has no following OWS (`X:a\r\n`, 5 bytes, is
+    // re-emitted with the canonical single space, `x: a\r\n`, 6 bytes -- a
+    // per-field, unbounded-in-aggregate +1). An earlier revision of this
+    // comment tried to bound the total growth at a fixed 25-byte margin;
+    // that bound covered only the first case and was wrong for a request
+    // with many colon-without-space fields, each contributing its own +1
+    // (Codex sweep-6 review, PR #696, correcting Codex sweep-4). Rather
+    // than bound the growth at all, this function computes it exactly: the
+    // entire rewrite below runs twice, first in "measuring" mode
+    // (`measuring` below), which takes every branch exactly as written but
+    // has `append` only sum the byte counts it would have written instead
+    // of writing them, yielding the *exact* final size; only if that exact
+    // size fits is a second, real pass run, taking the identical branches
+    // and actually writing the bytes. The two passes share one set of
+    // branches by construction (the same `append`/`append_lit`/
+    // `append_lower` calls, the same per-header decisions), so they cannot
+    // diverge. A request whose exact rewritten size would exceed capacity
+    // fails closed the same way -- and with the same 400 status -- as
+    // every other admission failure in this function, before any byte is
+    // written; this is not a hidden, XFP-specific reduction of the
+    // capacity every other policy and the parser's own header/body
+    // admission enforce.
+    u32 measured_len = 0;
+    bool measuring = true;
     auto append = [&](const u8* p, u32 n) {
+        if (measuring) {
+            measured_len += n;
+            return true;
+        }
         return n <= conn.send_buf.capacity() - conn.send_buf.len() &&
                conn.send_buf.write(p, n) == n;
     };
@@ -6220,169 +6206,189 @@ inline bool apply_preserve_host_lowercase_request_policy(Connection& conn, u16 p
         return true;
     };
 
-    conn.send_buf.reset();
-    const u32 method_prefix = static_cast<u32>(path_ptr - data);
-    if (!append(data, method_prefix) || !append(path_ptr, req.path.len) || !append_lit(" ", 1) ||
-        !append_lit(request_policy_version(policy_id), 8) || !append_lit("\r\n", 2))
-        return false;
-    if (!append_lit("host: ", 6) || !append(host_value_start, host_value_len) ||
-        !append_lit("\r\n", 2))
-        return false;
+    u32 new_header_len = 0;
+    for (u32 pass = 0; pass < 2; pass++) {
+        measuring = (pass == 0);
+        measured_len = 0;
+        conn.send_buf.reset();
+        const u32 method_prefix = static_cast<u32>(path_ptr - data);
+        if (!append(data, method_prefix) || !append(path_ptr, req.path.len) ||
+            !append_lit(" ", 1) || !append_lit(request_policy_version(policy_id), 8) ||
+            !append_lit("\r\n", 2))
+            return false;
+        if (!append_lit("host: ", 6) || !append(host_value_start, host_value_len) ||
+            !append_lit("\r\n", 2))
+            return false;
 
-    bool saw_xfp = false;
-    // Envoy's TE header is inline storage (`HeaderMap::setTE` overwrites the
-    // single logical value, never appends a second physical line), and
-    // `HeaderMapImpl::insertByKey` places a newly-created inline entry at the
-    // position of the *first* physical occurrence of that name, not wherever
-    // a later duplicate happened to appear. So however many physical `TE`
-    // fields the client sends, and regardless of which one(s) carry a
-    // "trailers" token, at most one canonical `te: trailers` line reaches
-    // the wire, and it appears at the first physical TE field's position.
-    // `any_te_trailers` (computed in Pass 1 above) already reflects whether
-    // any field's value contains that token; `seen_te_field` below tracks
-    // whether the current field is that first occurrence.
-    bool seen_te_field = false;
-    {
-        const u8* hs = line_end + 2;
-        while (hs < header_end) {
-            const u8* le = hs;
-            while (le + 1 < end && !(le[0] == '\r' && le[1] == '\n')) le++;
-            const u8* colon = hs;
-            while (colon < le && *colon != ':') colon++;
-            const u32 name_len = static_cast<u32>(colon - hs);
-            const u8* value_start = colon + 1;
-            const u8* value_end = le;
-            while (value_start < value_end && (*value_start == ' ' || *value_start == '\t'))
-                value_start++;
-            while (value_end > value_start && (value_end[-1] == ' ' || value_end[-1] == '\t'))
-                value_end--;
+        bool saw_xfp = false;
+        // Envoy's TE header is inline storage (`HeaderMap::setTE` overwrites
+        // the single logical value, never appends a second physical line),
+        // and `HeaderMapImpl::insertByKey` places a newly-created inline
+        // entry at the position of the *first* physical occurrence of that
+        // name, not wherever a later duplicate happened to appear. So
+        // however many physical `TE` fields the client sends, and
+        // regardless of which one(s) carry a "trailers" token, at most one
+        // canonical `te: trailers` line reaches the wire, and it appears at
+        // the first physical TE field's position. `any_te_trailers`
+        // (computed in Pass 1 above) already reflects whether any field's
+        // value contains that token; `seen_te_field` below tracks whether
+        // the current field is that first occurrence.
+        bool seen_te_field = false;
+        {
+            const u8* hs = line_end + 2;
+            while (hs < header_end) {
+                const u8* le = hs;
+                while (le + 1 < end && !(le[0] == '\r' && le[1] == '\n')) le++;
+                const u8* colon = hs;
+                while (colon < le && *colon != ':') colon++;
+                const u32 name_len = static_cast<u32>(colon - hs);
+                const u8* value_start = colon + 1;
+                const u8* value_end = le;
+                while (value_start < value_end && (*value_start == ' ' || *value_start == '\t'))
+                    value_start++;
+                while (value_end > value_start && (value_end[-1] == ' ' || value_end[-1] == '\t'))
+                    value_end--;
 
-            const bool is_cl = request_policy_name_eq(hs, name_len, "content-length", 14);
-            const bool is_te = request_policy_name_eq(hs, name_len, "te", 2);
-            const bool is_xfp = request_policy_name_eq(hs, name_len, "x-forwarded-proto", 17);
-            const bool drop_fixed = request_policy_name_eq(hs, name_len, "host", 4) ||
-                                    request_policy_name_eq(hs, name_len, "connection", 10) ||
-                                    request_policy_name_eq(hs, name_len, "keep-alive", 10) ||
-                                    request_policy_name_eq(hs, name_len, "proxy-connection", 16) ||
-                                    request_policy_name_eq(hs, name_len, "expect", 6) ||
-                                    request_policy_name_eq(hs, name_len, "upgrade", 7) ||
-                                    request_policy_name_eq(hs, name_len, "transfer-encoding", 17) ||
-                                    request_policy_is_stripped_client_envoy_header(hs, name_len);
-            // Envoy's `sanitizeConnectionHeader` splits TE's value on commas
-            // and keeps the header only when one token case-insensitively
-            // equals "trailers" -- not only when the whole field value does
-            // -- and when kept, rewrites it to exactly that canonical
-            // lowercase token (`headers.setTE(TEValues.Trailers)`), not the
-            // client's original casing or the other comma-joined tokens.
-            // Whether *this* field individually carries the token no longer
-            // decides whether the canonical line is emitted here (that is
-            // `any_te_trailers`, computed once from every physical TE field
-            // in Pass 1); it is used only for the position decision below.
-            const bool is_first_te = is_te && !seen_te_field;
-            if (is_te) seen_te_field = true;
-            // The canonical line is emitted exactly once, at the first
-            // physical TE field's position, and only when some TE field
-            // (this one or a later one) carried a "trailers" token. Every
-            // other physical TE field -- first or not, trailers or not --
-            // contributes nothing further and is dropped.
-            const bool emit_te_here = is_first_te && any_te_trailers;
-            const bool drop_te = is_te && !emit_te_here;
-            // HTTP/1.1 senders that emit `TE: trailers` are expected to
-            // nominate it in `Connection` too (RFC 9110 §9.6), and Envoy's
-            // `sanitizeConnectionHeader` (source/common/http/utility.cc)
-            // special-cases exactly this: for a nominated `te` token it does
-            // not blindly remove the header like every other nominated name
-            // -- it inspects the TE value's comma-separated tokens the same
-            // way `sanitizeTEHeader` does, and only drops the header if none
-            // of them is "trailers" (`keep_header` stays true otherwise, and
-            // `headers.setTE(TEValues.Trailers)` still runs). Folding `te`
-            // into the generic `drop_nominated` set would strip the
-            // canonical trailers line for this standard wire shape even
-            // though `emit_te_here`/`drop_te` above already computed the
-            // right outcome; exclude it here and let that existing
-            // canonicalization decide instead.
-            const bool drop_nominated = !is_te && name_nominated(hs, name_len);
-            // A syntactically invalid X-Forwarded-Proto value -- empty/OWS-only,
-            // or any non-empty value that is not (case-insensitively) exactly
-            // "http" or "https" (e.g. "http,https", "ftp") -- carries no usable
-            // scheme. Envoy's own `getScheme` (source/common/http/
-            // conn_manager_utility.cc, v1.39.1) applies `Utility::schemeIsValid`
-            // (`schemeIsHttp(v) || schemeIsHttps(v)`, both case-insensitive
-            // `absl::EqualsIgnoreCase` compares against exactly "http"/"https",
-            // so e.g. "HTTPS" is valid but "http,https" is not) to the whole
-            // trimmed field value and falls back to the connection-derived
-            // default instead of forwarding it when validation fails.
-            // Forwarding the malformed value verbatim here would instead hand
-            // origins that use this header for redirects or security decisions
-            // an attacker-controlled, non-scheme value; Envoy's own
-            // `x-forwarded-proto` slot is a single inline entry
-            // (`HeaderMap::setForwardedFor`-style setters overwrite in
-            // place), so an invalid value doesn't vanish and reappear
-            // elsewhere on the wire -- the connection-derived default
-            // overwrites it at its original physical position instead. The
-            // trailing synthesized default (below, once `saw_xfp` is still
-            // unset after this loop) is reserved for a client that sent no
-            // `x-forwarded-proto` field at all. A valid value is forwarded
-            // as the client sent it (Envoy's own literal `x-forwarded-proto`
-            // header text is untouched when already present; only the
-            // internal `:scheme` pseudo-header is lowercased), not
-            // case-normalized.
-            const u32 xfp_value_len = static_cast<u32>(value_end - value_start);
-            const bool xfp_scheme_valid =
-                is_xfp && (request_policy_name_eq(value_start, xfp_value_len, "http", 4) ||
-                           request_policy_name_eq(value_start, xfp_value_len, "https", 5));
-            const bool xfp_invalid = is_xfp && !xfp_scheme_valid;
-            if (!drop_fixed && !drop_te && !drop_nominated) {
-                if (is_cl) {
-                    // Envoy's HTTP/1 codec forwards every header's stored
-                    // string value byte for byte (`headers.iterate(...)` in
-                    // `StreamEncoderImpl::encodeHeadersBase`,
-                    // `source/common/http/http1/codec_impl.cc`, calls
-                    // `header.value().getStringView()`; the parser stores
-                    // the wire value directly via `addViaMove` in
-                    // `ConnectionImpl::onHeaderValueImpl`, with no
-                    // integer-round-trip anywhere in between) rather than
-                    // regenerating a canonical decimal spelling from the
-                    // parsed integer. A validated `Content-Length` value
-                    // such as `0004` therefore reaches the upstream
-                    // unchanged, not renumbered to `4`. `body_len` (parsed
-                    // from this same, already OWS-trimmed `value_start`/
-                    // `value_end` via `parse_uint`, which accepts only the
-                    // digits `0`-`9` -- a leading `+` or embedded
-                    // whitespace still fails parsing and is rejected before
-                    // this function is ever reached) continues to bound the
-                    // body copy below; only the wire spelling changes here.
-                    if (!append_lit("content-length: ", 16) ||
-                        !append(value_start, static_cast<u32>(value_end - value_start)) ||
-                        !append_lit("\r\n", 2))
-                        return false;
-                } else if (emit_te_here) {
-                    if (!append_lit("te: trailers\r\n", 14)) return false;
-                } else if (xfp_invalid) {
-                    if (!append_lit("x-forwarded-proto: http\r\n", kXfpSynthesisBytes))
-                        return false;
-                    saw_xfp = true;
-                } else {
-                    if (!append_lower(hs, name_len) || !append_lit(": ", 2) ||
-                        !append(value_start, static_cast<u32>(value_end - value_start)) ||
-                        !append_lit("\r\n", 2))
-                        return false;
-                    if (is_xfp) saw_xfp = true;
+                const bool is_cl = request_policy_name_eq(hs, name_len, "content-length", 14);
+                const bool is_te = request_policy_name_eq(hs, name_len, "te", 2);
+                const bool is_xfp = request_policy_name_eq(hs, name_len, "x-forwarded-proto", 17);
+                const bool drop_fixed =
+                    request_policy_name_eq(hs, name_len, "host", 4) ||
+                    request_policy_name_eq(hs, name_len, "connection", 10) ||
+                    request_policy_name_eq(hs, name_len, "keep-alive", 10) ||
+                    request_policy_name_eq(hs, name_len, "proxy-connection", 16) ||
+                    request_policy_name_eq(hs, name_len, "expect", 6) ||
+                    request_policy_name_eq(hs, name_len, "upgrade", 7) ||
+                    request_policy_name_eq(hs, name_len, "transfer-encoding", 17) ||
+                    request_policy_is_stripped_client_envoy_header(hs, name_len);
+                // Envoy's `sanitizeConnectionHeader` splits TE's value on
+                // commas and keeps the header only when one token
+                // case-insensitively equals "trailers" -- not only when the
+                // whole field value does -- and when kept, rewrites it to
+                // exactly that canonical lowercase token
+                // (`headers.setTE(TEValues.Trailers)`), not the client's
+                // original casing or the other comma-joined tokens. Whether
+                // *this* field individually carries the token no longer
+                // decides whether the canonical line is emitted here (that
+                // is `any_te_trailers`, computed once from every physical TE
+                // field in Pass 1); it is used only for the position
+                // decision below.
+                const bool is_first_te = is_te && !seen_te_field;
+                if (is_te) seen_te_field = true;
+                // The canonical line is emitted exactly once, at the first
+                // physical TE field's position, and only when some TE field
+                // (this one or a later one) carried a "trailers" token.
+                // Every other physical TE field -- first or not, trailers or
+                // not -- contributes nothing further and is dropped.
+                const bool emit_te_here = is_first_te && any_te_trailers;
+                const bool drop_te = is_te && !emit_te_here;
+                // HTTP/1.1 senders that emit `TE: trailers` are expected to
+                // nominate it in `Connection` too (RFC 9110 §9.6), and
+                // Envoy's `sanitizeConnectionHeader`
+                // (source/common/http/utility.cc) special-cases exactly
+                // this: for a nominated `te` token it does not blindly
+                // remove the header like every other nominated name -- it
+                // inspects the TE value's comma-separated tokens the same
+                // way `sanitizeTEHeader` does, and only drops the header if
+                // none of them is "trailers" (`keep_header` stays true
+                // otherwise, and `headers.setTE(TEValues.Trailers)` still
+                // runs). Folding `te` into the generic `drop_nominated` set
+                // would strip the canonical trailers line for this standard
+                // wire shape even though `emit_te_here`/`drop_te` above
+                // already computed the right outcome; exclude it here and
+                // let that existing canonicalization decide instead.
+                const bool drop_nominated = !is_te && name_nominated(hs, name_len);
+                // A syntactically invalid X-Forwarded-Proto value --
+                // empty/OWS-only, or any non-empty value that is not
+                // (case-insensitively) exactly "http" or "https" (e.g.
+                // "http,https", "ftp") -- carries no usable scheme. Envoy's
+                // own `getScheme` (source/common/http/
+                // conn_manager_utility.cc, v1.39.1) applies
+                // `Utility::schemeIsValid` (`schemeIsHttp(v) ||
+                // schemeIsHttps(v)`, both case-insensitive
+                // `absl::EqualsIgnoreCase` compares against exactly
+                // "http"/"https", so e.g. "HTTPS" is valid but "http,https"
+                // is not) to the whole trimmed field value and falls back to
+                // the connection-derived default instead of forwarding it
+                // when validation fails. Forwarding the malformed value
+                // verbatim here would instead hand origins that use this
+                // header for redirects or security decisions an
+                // attacker-controlled, non-scheme value; Envoy's own
+                // `x-forwarded-proto` slot is a single inline entry
+                // (`HeaderMap::setForwardedFor`-style setters overwrite in
+                // place), so an invalid value doesn't vanish and reappear
+                // elsewhere on the wire -- the connection-derived default
+                // overwrites it at its original physical position instead.
+                // The trailing synthesized default (below, once `saw_xfp`
+                // is still unset after this loop) is reserved for a client
+                // that sent no `x-forwarded-proto` field at all. A valid
+                // value is forwarded as the client sent it (Envoy's own
+                // literal `x-forwarded-proto` header text is untouched when
+                // already present; only the internal `:scheme`
+                // pseudo-header is lowercased), not case-normalized.
+                const u32 xfp_value_len = static_cast<u32>(value_end - value_start);
+                const bool xfp_scheme_valid =
+                    is_xfp && (request_policy_name_eq(value_start, xfp_value_len, "http", 4) ||
+                               request_policy_name_eq(value_start, xfp_value_len, "https", 5));
+                const bool xfp_invalid = is_xfp && !xfp_scheme_valid;
+                if (!drop_fixed && !drop_te && !drop_nominated) {
+                    if (is_cl) {
+                        // Envoy's HTTP/1 codec forwards every header's
+                        // stored string value byte for byte
+                        // (`headers.iterate(...)` in
+                        // `StreamEncoderImpl::encodeHeadersBase`,
+                        // `source/common/http/http1/codec_impl.cc`, calls
+                        // `header.value().getStringView()`; the parser
+                        // stores the wire value directly via `addViaMove` in
+                        // `ConnectionImpl::onHeaderValueImpl`, with no
+                        // integer-round-trip anywhere in between) rather
+                        // than regenerating a canonical decimal spelling
+                        // from the parsed integer. A validated
+                        // `Content-Length` value such as `0004` therefore
+                        // reaches the upstream unchanged, not renumbered to
+                        // `4`. `body_len` (parsed from this same, already
+                        // OWS-trimmed `value_start`/`value_end` via
+                        // `parse_uint`, which accepts only the digits
+                        // `0`-`9` -- a leading `+` or embedded whitespace
+                        // still fails parsing and is rejected before this
+                        // function is ever reached) continues to bound the
+                        // body copy below; only the wire spelling changes
+                        // here.
+                        if (!append_lit("content-length: ", 16) ||
+                            !append(value_start, static_cast<u32>(value_end - value_start)) ||
+                            !append_lit("\r\n", 2))
+                            return false;
+                    } else if (emit_te_here) {
+                        if (!append_lit("te: trailers\r\n", 14)) return false;
+                    } else if (xfp_invalid) {
+                        if (!append_lit("x-forwarded-proto: http\r\n", 25)) return false;
+                        saw_xfp = true;
+                    } else {
+                        if (!append_lower(hs, name_len) || !append_lit(": ", 2) ||
+                            !append(value_start, static_cast<u32>(value_end - value_start)) ||
+                            !append_lit("\r\n", 2))
+                            return false;
+                        if (is_xfp) saw_xfp = true;
+                    }
                 }
+                hs = le + 2;
             }
-            hs = le + 2;
         }
-    }
-    if (!saw_xfp && !append_lit("x-forwarded-proto: http\r\n", kXfpSynthesisBytes)) return false;
-    if (!append_lit("\r\n", 2)) return false;
+        if (!saw_xfp && !append_lit("x-forwarded-proto: http\r\n", 25)) return false;
+        if (!append_lit("\r\n", 2)) return false;
 
-    const u32 new_header_len = conn.send_buf.len();
-    const u32 body_start = parser.header_end;
-    const u64 request_end64 = static_cast<u64>(body_start) + body_len;
-    if (request_end64 > len) return false;
-    const u32 request_end = static_cast<u32>(request_end64);
-    if (!append(data + body_start, body_len) || !append(data + request_end, len - request_end))
-        return false;
+        new_header_len = measuring ? measured_len : conn.send_buf.len();
+        const u32 body_start = parser.header_end;
+        const u64 request_end64 = static_cast<u64>(body_start) + body_len;
+        if (request_end64 > len) return false;
+        const u32 request_end = static_cast<u32>(request_end64);
+        if (!append(data + body_start, body_len) || !append(data + request_end, len - request_end))
+            return false;
+
+        if (measuring &&
+            (measured_len > conn.send_buf.capacity() || measured_len > conn.recv_buf.capacity()))
+            return false;
+    }
     if (conn.send_buf.len() > conn.recv_buf.capacity()) return false;
     conn.reset_request_receive_buffer();
     if (conn.recv_buf.write(conn.send_buf.data(), conn.send_buf.len()) != conn.send_buf.len())
