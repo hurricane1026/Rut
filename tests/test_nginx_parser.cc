@@ -8897,7 +8897,8 @@ TEST(nginx_converter, emitted_no_content_source_reaches_independent_owned_runtim
         CHECK_NE(printed_text.find("local_response#5: version=HTTP/1.1, status=204, "
                                    "reason=\"No Content\", server=\"nginx/1.29.7\", "
                                    "content_type=\"\", date=current, connection=request, "
-                                   "head_mode=suppress_body, body=b\"\" (len=0)"),
+                                   "head_mode=suppress_body, header_order=synthesized, "
+                                   "body=b\"\" (len=0)"),
                  std::string::npos);
         CHECK_NE(
             printed_text.find("exact:\n  GET slash_normalized \"/static\" -> local_response#5"),

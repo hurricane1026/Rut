@@ -40,12 +40,12 @@ constexpr Str kRouterFilterName = lit_str("envoy.filters.http.router");
 // duplicating new policy.
 constexpr Str kNetworkFilterName = lit_str("envoy.filters.network.http_connection_manager");
 
-// PROVISIONAL: reconcile with oracle. Recorded from docs/envoy-converter.md
-// pending the pinned Envoy differential (PR2) and the local-reply capability
-// (PR5), which replaces this literal with the pinned bytes.
+// Recorded verbatim from the pinned Envoy oracle transcript
+// (tests/fixtures/envoy_oracle_milestone_s.inc, `kEnvoyOracle_connect_failure_downstream`):
+// 98 bytes, `content-length: 98`.
 static constexpr char kEnvoyConnectFailureBody[] =
     "upstream connect error or disconnect/reset before headers. reset reason: remote connection "
-    "failure, transport failure reason: delayed connect error: 111";
+    "failure";
 
 // Minimal bounded text writer, copied from rut::nginx's converter Writer
 // (src/nginx/converter.cc) rather than shared, so this frontend does not
