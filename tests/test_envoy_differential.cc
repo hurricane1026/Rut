@@ -1043,6 +1043,17 @@ public:
     // it and must close it.
     bool adopt(int listen_fd) {
         if (listen_fd < 0) return false;
+        // Sweep-6 review, "Synchronize the final idle snapshot with the
+        // accept loop": wait_idle() below needs to call accept() itself,
+        // repeatedly, until it is PROVEN empty (EAGAIN) rather than merely
+        // observed empty at one instant -- which requires the listener
+        // itself to be non-blocking, so that call never blocks waiting for
+        // a connection that may never come. This also makes accept_loop()'s
+        // own accept() call (already only reached after poll() confirms
+        // readability) safe against a spurious wakeup or a race with
+        // wait_idle() draining the same backlog.
+        const int flags = fcntl(listen_fd, F_GETFL, 0);
+        if (flags >= 0) fcntl(listen_fd, F_SETFL, flags | O_NONBLOCK);
         listen_fd_ = listen_fd;
         stopping_.store(false);
         accept_thread_ = std::thread([this] { accept_loop(); });
@@ -1087,134 +1098,103 @@ public:
         requests_by_path_.clear();
     }
 
-    // Waits until this upstream is fully idle -- no connection already
-    // queued on the listening socket waiting to be accept()ed, AND no
-    // accepted connection still being handled (`active_fds_` empty, i.e.
-    // every one has been fully read, parsed, recorded, and closed) -- or
-    // `timeout_ms` elapses, whichever comes first. Returns whether it
-    // actually went idle (false on timeout).
+    // Waits until this upstream is fully idle: no connection outstanding
+    // in the kernel accept backlog, and no accepted connection still being
+    // handled (`active_fds_` empty, i.e. every one has been fully read,
+    // parsed, recorded, and closed) -- or `timeout_ms` elapses, whichever
+    // comes first. Returns whether it actually went idle (false on
+    // timeout). Only ever called after the proxy process under test has
+    // already been stopped and reaped (every call site does this first),
+    // so no NEW connection can arrive once this starts.
     //
-    // Round-18 review, "Wait for upstream handlers before inspecting
-    // asserted traffic": stopping the PROXY only guarantees ITS OWN process
-    // has exited; it does not synchronize with this object's own
-    // independent accept/handler threads. A request the proxy already sent
-    // (and the kernel already delivered) before exiting can still be
-    // sitting unread in a handler thread's recv() buffer at the exact
-    // moment the proxy's stop() call returns, so callers must await this
-    // BETWEEN stopping the proxy and calling fill_upstream_bytes()/
-    // requests_for()/all_requests() -- otherwise a genuinely last-second
-    // request is either missed by the snapshot entirely or, worse, still
-    // gets recorded but only after the following clear_requests() has
-    // already run, bleeding into the next batch's evidence instead.
+    // Sweep-6 review, "Synchronize the final idle snapshot with the accept
+    // loop" (P1): every prior version of this function (round-19 through
+    // sweep-3) SAMPLED some combination of poll()-on-the-listener /
+    // accepted_pending_ / active_fds_ / accept_epoch_ at a moment in time,
+    // sometimes requiring the same sample twice in a row for "stability".
+    // No amount of sampling -- however many times, however carefully
+    // ordered against a second independent thread -- can fully close a
+    // race against that thread: there is always, in principle, a gap
+    // between two samples in which the OTHER thread could act unobserved.
+    // This version closes the gap by construction instead of narrowing it:
+    // wait_idle() itself TAKES OVER accepting, under `conn_mu_`, so there
+    // is no other thread left to race against for the single instant that
+    // matters.
     //
-    // Round-19 review, "Synchronize the accept queue before declaring the
-    // upstream idle" (P1): checking `active_fds_` alone is not enough --
-    // the proxy's final connection can already be fully queued in the
-    // listening socket's kernel accept backlog (the TCP handshake itself
-    // does not require accept_loop() to have run at all) without
-    // accept_loop() having called accept() on it yet, in which case it was
-    // never added to `active_fds_` and the old check above returned "idle"
-    // immediately despite that connection's request not being recorded at
-    // all yet. poll()ing the listening fd for readability tells whether a
-    // connection is waiting to be accepted (POSIX: a listening socket is
-    // "ready to read" exactly when accept() would not block), so this now
-    // requires that to be false as well, on every iteration, before
-    // treating `active_fds_.empty()` as proof of idleness. Once the proxy
-    // process itself is confirmed fully exited (reaped), every TCP
-    // connection it held to this upstream -- including one still in the
-    // 3-way handshake at that instant -- resolves at the kernel level
-    // almost immediately, so this is expected to return promptly; the
-    // bounded timeout is a safety net, not the expected path.
-    //
-    // Round-20 review, "Synchronize the accepted-connection handoff before
-    // returning idle" (P1): fresh evidence beyond the above is the gap
-    // *inside* accept_loop() between accept() consuming a connection off
-    // the kernel backlog (at which point poll() on the listener stops
-    // reporting it, since the backlog is now empty) and that connection's
-    // fd actually landing in `active_fds_` under `conn_mu_`. If the accept
-    // thread is preempted in exactly that gap, a concurrent wait_idle()
-    // call can observe "listener not readable" AND "active_fds_ empty" at
-    // the same instant, despite the accepted connection's request not
-    // having been recorded yet -- the two observations were never atomic
-    // with each other. Closed by `accepted_pending_` (see accept_loop()):
-    // it is incremented, under `conn_mu_`, strictly BEFORE accept_loop()
-    // calls accept() (as soon as its own poll() sees the connection
-    // queued), and only decremented after the resulting fd has been pushed
-    // into `active_fds_`, still under the same mutex. That ordering means
-    // there is no instant at which "the backlog looks empty" (implying
-    // accept() has already run) can coincide with "accepted_pending_ == 0"
-    // (implying registration has already finished) for the SAME
-    // connection: the counter covers exactly the handoff gap the listener
-    // poll cannot see into.
-    //
-    // Sweep-3 review, "Require a stable idle observation before returning"
-    // (P1): fresh evidence beyond the above is that the listener poll()
-    // and the `conn_mu_`-protected counter check just below are themselves
-    // two SEPARATE, non-atomic operations: a connection can become
-    // readable in the gap between this iteration's poll() returning "not
-    // readable" and this thread then acquiring `conn_mu_`, while
-    // accept_loop()'s own blocked poll(-1) has not yet been scheduled to
-    // even react to it (let alone acquire the mutex to bump
-    // `accepted_pending_`/`accept_epoch_`). This single iteration then
-    // observes both signals empty and wrongly concludes idle, even though
-    // a connection is now sitting in the backlog. The single-sample
-    // snapshot below (snapshot_idle()) still has this gap; what closes it
-    // is requiring the SAME idle conclusion TWICE, `kIdleSettleMs` apart,
-    // with `accept_epoch_` unchanged in between. `accept_epoch_` is
-    // incremented the INSTANT accept_loop() reacts to a connection
-    // (strictly before it calls accept(), i.e. before the backlog can ever
-    // look empty because of it), so for any connection that arrives before
-    // the second snapshot's poll() call, at least one of three things is
-    // guaranteed true by the time that snapshot runs: the listener still
-    // shows readable (accept_loop() has not consumed it yet), or
-    // `accept_epoch_` has advanced (accept_loop() reacted to it, whether
-    // or not it has finished registering it yet), or `accepted_pending_`/
-    // `active_fds_` directly show the in-progress registration -- there is
-    // no interleaving that leaves the second snapshot ignorant of a
-    // connection that arrived after the first. A connection that arrives
-    // only after BOTH snapshots is unaffected by any of this: the caller
-    // only reaches this function after the proxy under test has already
-    // been confirmed stopped, so nothing new is expected to arrive once
-    // two consecutive stable-idle snapshots have passed.
+    //   1. Acquire `conn_mu_` and set `draining_ = true`. accept_loop()
+    //      checks `draining_` under the SAME mutex right after every
+    //      poll() wake (see accept_loop() below) and, if set, skips
+    //      calling accept() entirely and loops back to polling -- it never
+    //      touches the backlog while `draining_` is true.
+    //   2. Still holding that SAME lock (no other thread can observe or
+    //      act on the backlog in between), repeatedly call non-blocking
+    //      accept() on the listener until it fails (EAGAIN/EWOULDBLOCK),
+    //      registering and starting a handler thread for every connection
+    //      found exactly as accept_loop() would. `adopt()` puts the
+    //      listener into non-blocking mode specifically so this call can
+    //      never block waiting for a connection that may never come.
+    //   3. Because this is only ever called once the proxy process under
+    //      test is already stopped and reaped, every connection it was
+    //      ever going to make is already sitting in the backlog or has
+    //      already failed outright -- nothing new can arrive. EAGAIN under
+    //      the mutex is therefore not a sample that could go stale a
+    //      moment later; it is a proof, at the instant it is observed,
+    //      that the backlog is (and, since `draining_` is still true,
+    //      will remain) empty.
+    //   4. Release `conn_mu_`, then wait (bounded by the remainder of
+    //      `timeout_ms`) for every handler thread -- started just now, or
+    //      already running from an earlier accept_loop() iteration -- to
+    //      finish and remove itself from `active_fds_`. Nothing can ever
+    //      be ADDED to `active_fds_` during this wait: accept_loop() is
+    //      still blocked from accepting by `draining_`, and step 2 already
+    //      drained everything accept_loop() could otherwise have raced it
+    //      for. Observing `active_fds_.empty()` here is therefore also a
+    //      proof, not a sample.
+    //   5. Clear `draining_` before returning (success or timeout), so
+    //      accept_loop() resumes accepting for whatever phase comes next.
     bool wait_idle(int timeout_ms) {
-        constexpr int kIdleSettleMs = 20;
         const int64_t deadline = now_ms() + timeout_ms;
-        for (;;) {
-            int epoch_first = 0;
-            if (snapshot_idle(&epoch_first)) {
-                struct timespec settle{0, static_cast<long>(kIdleSettleMs) * 1'000'000};
-                nanosleep(&settle, nullptr);
-                int epoch_second = 0;
-                if (snapshot_idle(&epoch_second) && epoch_second == epoch_first) return true;
+        {
+            std::lock_guard<std::mutex> lock(conn_mu_);
+            draining_ = true;
+            const int fd = listen_fd_;
+            if (fd >= 0) {
+                for (;;) {
+                    const int accepted_fd = accept(fd, nullptr, nullptr);
+                    if (accepted_fd < 0) break;  // EAGAIN/EWOULDBLOCK: backlog proven empty
+                    active_fds_.push_back(accepted_fd);
+                    conn_threads_.emplace_back(
+                        &RecordingUpstream::handle_connection, this, accepted_fd);
+                }
             }
-            if (now_ms() >= deadline) return false;
+        }
+        bool drained = true;
+        for (;;) {
+            {
+                std::lock_guard<std::mutex> lock(conn_mu_);
+                if (active_fds_.empty()) break;
+            }
+            if (now_ms() >= deadline) {
+                drained = false;
+                break;
+            }
             struct timespec ts{0, 5'000'000};
             nanosleep(&ts, nullptr);
         }
+        {
+            std::lock_guard<std::mutex> lock(conn_mu_);
+            draining_ = false;
+        }
+        return drained;
     }
 
-    // Test-only hook for self_test_wait_idle_synchronizes_accept_handoff():
-    // when nonzero, accept_loop() sleeps this many milliseconds after
-    // accept() returns a connection's fd but before that fd is pushed into
-    // `active_fds_`, deliberately widening the round-20 review's handoff
-    // gap so a test can deterministically observe whether wait_idle()
-    // still correctly treats the connection as outstanding throughout it.
-    // Always 0 in production use.
-    void set_test_post_accept_delay_ms(int ms) { test_post_accept_delay_ms_ = ms; }
-
-    // Test-only hook for self_test_wait_idle_requires_stable_observation():
-    // when nonzero, accept_loop() sleeps this many milliseconds after its
-    // poll() wakes with the listener readable but BEFORE it acquires
-    // `conn_mu_` to bump `accept_epoch_`/`accepted_pending_` (i.e. before
-    // it has reacted to the connection at all), deliberately widening the
-    // sweep-3 review's pre-mutex gap. Combined with
-    // set_test_post_accept_delay_ms() above, this lets a test drive the
-    // WHOLE accept-and-register cycle for a single connection across many
-    // multiples of wait_idle()'s 5ms retry cadence and 20ms settle
-    // interval, so the test can assert wait_idle() waits out the entire
-    // widened window rather than returning early on some intermediate
-    // sample. Always 0 in production use.
-    void set_test_pre_mutex_delay_ms(int ms) { test_pre_mutex_delay_ms_ = ms; }
+    // Test-only hook for self_test_wait_idle_drains_backlog_itself(): when
+    // nonzero, accept_loop() sleeps this many milliseconds before it ever
+    // enters its polling loop, "holding off" the accept thread entirely so
+    // a test can queue connections in the kernel backlog and call
+    // wait_idle() while nothing but wait_idle() itself could possibly
+    // notice or act on them. Always 0 in production use.
+    void set_test_accept_loop_hold_ms(int ms) { test_accept_loop_hold_ms_ = ms; }
 
     // Idempotent: safe to call more than once (the destructor calls it again
     // after an explicit stop()).
@@ -1268,37 +1248,24 @@ private:
         close(fd);
     }
 
-    // Single instantaneous "is everything idle right now" reading: whether
-    // the listener is not readable AND `accepted_pending_ == 0` AND
-    // `active_fds_` is empty, plus the current `accept_epoch_` value for
-    // the caller to compare against a later snapshot. Always writes
-    // `*epoch`, regardless of the returned idle verdict. See wait_idle()'s
-    // comment for why a single snapshot_idle() call is not, by itself,
-    // sufficient proof of idleness (sweep-3 review, "Require a stable idle
-    // observation before returning").
-    bool snapshot_idle(int* epoch) {
-        bool pending_on_listener = false;
-        const int fd = listen_fd_;
-        if (fd >= 0) {
-            pollfd pfd{fd, POLLIN, 0};
-            if (poll(&pfd, 1, 0) > 0 && (pfd.revents & POLLIN) != 0) pending_on_listener = true;
-        }
-        std::lock_guard<std::mutex> lock(conn_mu_);
-        *epoch = accept_epoch_;
-        return !pending_on_listener && accepted_pending_ == 0 && active_fds_.empty();
-    }
-
-    // Round-20 review, "Synchronize the accepted-connection handoff before
-    // returning idle": polls the listener explicitly, rather than calling
-    // the blocking accept() directly, so `accepted_pending_` can be
-    // incremented (under `conn_mu_`) strictly before accept() removes the
-    // connection from the kernel backlog -- see wait_idle()'s comment for
-    // why that ordering is what closes the race. poll()'s indefinite
-    // timeout still blocks this thread exactly like the old direct accept()
-    // call did, and stop()'s shutdown()+close() of `listen_fd_` unblocks it
-    // the same way (poll() returns on a shut-down/closed fd, just like
-    // accept() used to).
+    // Sweep-6 review, "Synchronize the final idle snapshot with the accept
+    // loop": checks `draining_` under `conn_mu_` right after every poll()
+    // wake, before ever calling accept(). While `draining_` is true,
+    // wait_idle() owns the backlog -- this loop must not race it, so it
+    // simply loops back to polling. The listener is non-blocking (set by
+    // adopt()), so accept() here (only reached once poll() has already
+    // confirmed readability, and `draining_` is false) either returns a
+    // connection or fails immediately (a spurious wakeup or a benign race
+    // with wait_idle() clearing `draining_` between this thread's poll()
+    // and its accept()) -- either way this thread never blocks.
     void accept_loop() {
+        // Test-only; see set_test_accept_loop_hold_ms()'s comment. Always
+        // 0 in production, so this is a no-op there.
+        if (test_accept_loop_hold_ms_ > 0) {
+            struct timespec ts{test_accept_loop_hold_ms_ / 1000,
+                               static_cast<long>(test_accept_loop_hold_ms_ % 1000) * 1'000'000};
+            nanosleep(&ts, nullptr);
+        }
         while (!stopping_.load()) {
             pollfd pfd{listen_fd_, POLLIN, 0};
             const int pr = poll(&pfd, 1, -1);
@@ -1306,39 +1273,18 @@ private:
                 if (stopping_.load()) return;
                 continue;
             }
-            // Sweep-3 review, "Require a stable idle observation before
-            // returning": test-only, always 0 in production. Widens the
-            // gap between this thread reacting to the listener becoming
-            // readable and it acquiring `conn_mu_` just below to bump
-            // `accept_epoch_`/`accepted_pending_` -- see wait_idle()'s
-            // comment and set_test_pre_mutex_delay_ms()'s.
-            if (test_pre_mutex_delay_ms_ > 0) {
-                struct timespec ts{test_pre_mutex_delay_ms_ / 1000,
-                                   static_cast<long>(test_pre_mutex_delay_ms_ % 1000) * 1'000'000};
-                nanosleep(&ts, nullptr);
-            }
-            {
-                std::lock_guard<std::mutex> lock(conn_mu_);
-                accepted_pending_++;
-                accept_epoch_++;
+            std::lock_guard<std::mutex> lock(conn_mu_);
+            if (draining_) {
+                // wait_idle() owns accepting right now; don't race it.
+                continue;
             }
             const int fd = accept(listen_fd_, nullptr, nullptr);
             if (fd < 0) {
-                std::lock_guard<std::mutex> lock(conn_mu_);
-                accepted_pending_--;
                 if (stopping_.load()) return;
                 continue;
             }
-            if (test_post_accept_delay_ms_ > 0) {
-                struct timespec ts{
-                    test_post_accept_delay_ms_ / 1000,
-                    static_cast<long>(test_post_accept_delay_ms_ % 1000) * 1'000'000};
-                nanosleep(&ts, nullptr);
-            }
-            std::lock_guard<std::mutex> lock(conn_mu_);
             active_fds_.push_back(fd);
             conn_threads_.emplace_back(&RecordingUpstream::handle_connection, this, fd);
-            accepted_pending_--;
         }
     }
 
@@ -1443,22 +1389,13 @@ private:
     std::mutex conn_mu_;
     std::vector<int> active_fds_;
     std::vector<std::thread> conn_threads_;
-    // Number of connections accept_loop() has claimed (poll() saw them
-    // queued) but has not yet finished registering into `active_fds_`.
-    // Guarded by `conn_mu_`; see wait_idle()'s round-20 review comment.
-    int accepted_pending_ = 0;
-    // Incremented, under `conn_mu_`, every time accept_loop()'s poll()
-    // wakes with the listener readable, strictly BEFORE it calls accept()
-    // -- i.e. once per connection accept_loop() has REACTED to, regardless
-    // of how quickly or slowly it then processes it. Guarded by
-    // `conn_mu_`; see wait_idle()'s sweep-3 review comment for why
-    // observing this unchanged across two snapshots is what actually
-    // closes the residual race accepted_pending_ alone cannot.
-    int accept_epoch_ = 0;
-    // Test-only; see set_test_post_accept_delay_ms()'s comment.
-    int test_post_accept_delay_ms_ = 0;
-    // Test-only; see set_test_pre_mutex_delay_ms()'s comment.
-    int test_pre_mutex_delay_ms_ = 0;
+    // Set by wait_idle() (under conn_mu_) for the duration of its call:
+    // while true, accept_loop() must not call accept() at all -- wait_idle()
+    // itself owns accepting the backlog. See wait_idle()'s sweep-6 review
+    // comment.
+    bool draining_ = false;
+    // Test-only; see set_test_accept_loop_hold_ms()'s comment.
+    int test_accept_loop_hold_ms_ = 0;
     std::string default_reply_ =
         "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 5\r\n\r\nhello";
 };
@@ -1526,6 +1463,17 @@ struct EnvoyInstance {
     // an Envoy that has since died.
     bool exited_unexpectedly = false;
     std::string unexpected_exit_description;
+    // Set by stop() specifically when docker_rm_force() failed to confirm
+    // the container's removal (as opposed to `exited_unexpectedly`, which
+    // is also set when the docker-run CLIENT process itself merely exited
+    // before this call signaled it -- an entirely expected, retry-worthy
+    // condition for e.g. a bind collision, orthogonal to whether the
+    // container was actually removed). A caller retrying a failed launch
+    // attempt (launch_envoy_with_port_retry()) must check THIS field, not
+    // just stop()'s return value or `exited_unexpectedly`, before reusing
+    // `name`/`pid` for a new attempt: sweep-6 review, "Abort retries when
+    // failed Envoy cleanup remains pending".
+    bool docker_cleanup_failed = false;
 
     bool launch(const std::string& bootstrap_path, uint16_t /*listen_port*/) {
         // docker run --pull=never --rm --network host --name <name>
@@ -1615,6 +1563,9 @@ struct EnvoyInstance {
     // one followed by the destructor's automatic one) never re-invokes it
     // either.
     bool stop() {
+        // Reflects only THIS call's outcome, not a stale value from an
+        // earlier stop() call on the same instance.
+        docker_cleanup_failed = false;
         if (pid <= 0) {
             // Sweep-2 review, "Clean up containers after readiness reaps
             // docker": `pid <= 0` does NOT necessarily mean there was never
@@ -1648,6 +1599,7 @@ struct EnvoyInstance {
                     launched = false;
                 } else {
                     exited_unexpectedly = true;
+                    docker_cleanup_failed = true;
                     unexpected_exit_description =
                         "docker rm -f failed to remove the container; it may still be running";
                     return false;
@@ -1671,8 +1623,12 @@ struct EnvoyInstance {
             // this branch already returns false for the process's own
             // unexpected exit regardless, but `launched` must stay true on
             // a failed removal so a later stop() call retries.
-            if (launched && docker_rm_force(name)) {
-                launched = false;
+            if (launched) {
+                if (docker_rm_force(name)) {
+                    launched = false;
+                } else {
+                    docker_cleanup_failed = true;
+                }
             }
             return false;
         }
@@ -1698,8 +1654,12 @@ struct EnvoyInstance {
             // this branch already returns false for the process's own
             // unexpected exit regardless, but `launched` must stay true on
             // a failed removal so a later stop() call retries.
-            if (launched && docker_rm_force(name)) {
-                launched = false;
+            if (launched) {
+                if (docker_rm_force(name)) {
+                    launched = false;
+                } else {
+                    docker_cleanup_failed = true;
+                }
             }
             return false;
         }
@@ -1738,8 +1698,12 @@ struct EnvoyInstance {
             // this branch already returns false for the process's own
             // unexpected exit regardless, but `launched` must stay true on
             // a failed removal so a later stop() call retries.
-            if (launched && docker_rm_force(name)) {
-                launched = false;
+            if (launched) {
+                if (docker_rm_force(name)) {
+                    launched = false;
+                } else {
+                    docker_cleanup_failed = true;
+                }
             }
             return false;
         }
@@ -1750,7 +1714,10 @@ struct EnvoyInstance {
         // is the clean-teardown path -- a failed removal here must be the
         // ONLY reason this call reports failure, since it is the only
         // signal a caller has that the container may still be running.
-        bool docker_cleanup_failed = false;
+        // Sets the member `docker_cleanup_failed` (not a local), so
+        // launch_envoy_with_port_retry() can distinguish this from the
+        // process's own unexpected exit (sweep-6 review, "Abort retries
+        // when failed Envoy cleanup remains pending").
         if (launched) {
             if (docker_rm_force(name)) {
                 launched = false;
@@ -3259,6 +3226,18 @@ std::string quiesce_after_record_only_idle_timeout(RecordingUpstream& upstream,
 // still made write_transcript() refuse the whole run. Only asserted rows'
 // bytes gate the oracle CLI's exit code, so only they need the strict
 // "never record ambiguous evidence" rule below.
+//
+// Sweep-6 review, "Require exact upstream counts for asserted oracle rows"
+// (P1): rejecting only counts ABOVE one let a forwarding case (e.g.
+// `get_upstream_date_server`) reach here with ZERO upstream contacts (a
+// complete local error response counted as trustworthy evidence of
+// forwarding that never actually happened) or a locally handled case
+// (`options_star`/`connect_failure`/`connect_authority`) reach here having
+// unexpectedly forwarded exactly once -- neither `assert_get_smoke()` nor
+// `assert_connect_failure()` covers those other asserted rows, so the
+// oracle CLI could exit 0 and publish evidence that never actually
+// exercised (or wrongly exercised) forwarding. Mirrors compare_pair_case()'s
+// identical `case_expects_upstream_forward()`-gated exact-count check.
 std::string validate_results(const std::vector<CaseResult>& results) {
     for (const auto& r : results) {
         if (!is_asserted_case(r.name)) continue;
@@ -3266,10 +3245,18 @@ std::string validate_results(const std::vector<CaseResult>& results) {
             return "case \"" + r.name + "\": downstream exchange did not complete (" +
                    describe_incomplete_exchange(r) + "); refusing to record it as evidence";
         }
-        if (r.upstream_contact_count > 1) {
+        if (case_expects_upstream_forward(r.name)) {
+            if (r.upstream_contact_count != 1) {
+                return "case \"" + r.name + "\": upstream was contacted " +
+                       std::to_string(r.upstream_contact_count) +
+                       " times (expected exactly 1 for a forwarding case); refusing to record "
+                       "unverified evidence";
+            }
+        } else if (r.upstream_contact_count != 0) {
             return "case \"" + r.name + "\": upstream was contacted " +
                    std::to_string(r.upstream_contact_count) +
-                   " times (expected at most 1); refusing to record ambiguous evidence";
+                   " times (expected exactly 0 for a locally handled case); refusing to record "
+                   "unverified evidence";
         }
     }
     return "";
@@ -3406,7 +3393,17 @@ std::string normalize_date_for_compare(const std::string& raw,
         const size_t a = value.find_first_not_of(" \t");
         const size_t b = value.find_last_not_of(" \t");
         const std::string trimmed = a == std::string::npos ? "" : value.substr(a, b - a + 1);
-        if (trimmed != preserved_date) {
+        // Sweep-6 review, "Reject an empty synthesized Date value":
+        // `preserved_date` is empty for every case except
+        // `get_upstream_date_server` (see this function's comment), so an
+        // empty/whitespace-only `date:` value used to equal it by
+        // coincidence and skip is_rfc1123_http_date() entirely -- exactly
+        // the malformed value this check exists to catch, silently let
+        // through by matching a "preserved" value that was never actually
+        // present. Only take the preserved-as-is branch when
+        // `preserved_date` itself is non-empty (i.e. this really is
+        // `get_upstream_date_server`).
+        if (preserved_date.empty() || trimmed != preserved_date) {
             if (!is_rfc1123_http_date(trimmed)) {
                 *dates_valid = false;
                 continue;  // leave the malformed value visible in the output
@@ -3805,7 +3802,32 @@ bool launch_envoy_with_port_retry(const std::string& dir,
         // that signal alone is folded into `collided` here to take the
         // same retry-on-a-fresh-port path as a real bind collision.
         const bool collided = reuseport_collision || log_indicates_address_in_use(envoy->log_path);
+        // Sweep-6 review, "Abort retries when failed Envoy cleanup remains
+        // pending": stop()'s result alone conflates two different failures
+        // -- the docker-run CLIENT process merely exiting early (entirely
+        // expected for a real bind collision, and already handled by the
+        // `collided` retry below) versus docker_rm_force() actually
+        // failing to confirm the CONTAINER's removal (sweep-3 review,
+        // "Preserve cleanup state when docker rm fails" -- stop()
+        // deliberately leaves `launched` true and `name` naming the
+        // still-possibly-live container in that case). Checking
+        // `envoy->docker_cleanup_failed` specifically, rather than
+        // `!envoy->stop()`, means a benign early-exit-during-collision
+        // still retries as before, while an unconfirmed removal aborts:
+        // otherwise the next loop iteration would overwrite both
+        // `envoy->name` and `envoy->pid` for a brand-new attempt,
+        // permanently losing the only handle this process ever had on the
+        // old container -- nothing would ever retry removing it again,
+        // leaving a stray host-network container and listener behind to
+        // contaminate later attempts or tests.
         envoy->stop();
+        if (envoy->docker_cleanup_failed) {
+            *error = "could not confirm cleanup of a failed Envoy launch attempt (" +
+                     envoy->unexpected_exit_description +
+                     "); refusing to retry with a new container while the old one may still "
+                     "exist";
+            return false;
+        }
         if (!collided || attempt == kMaxListenPortAttempts) return false;
 
         uint16_t fresh_port = 0;
@@ -5329,25 +5351,19 @@ bool self_test_wait_idle_synchronizes_with_pending_accept() {
     return ok;
 }
 
-// Round-20 review, "Synchronize the accepted-connection handoff before
-// returning idle" (P1): reproduces the gap *inside* accept_loop() between
-// accept() consuming a connection off the kernel backlog and that
-// connection's fd landing in `active_fds_`, using
-// set_test_post_accept_delay_ms() to widen that gap to a deterministic,
-// generous duration instead of relying on a timing-dependent thread
-// preemption. Before the round-20 fix (an `accepted_pending_` counter
-// incremented, under `conn_mu_`, strictly before accept_loop() calls
-// accept()), wait_idle() would see "listener not readable" (the backlog is
-// already empty -- accept() has run) AND "active_fds_ empty" (the fd is
-// still sitting in the injected delay, not yet registered) and incorrectly
-// report idle well before the delay elapses, in turn letting the request
-// go unrecorded at snapshot time. This test asserts wait_idle() only
-// returns once the full injected delay has elapsed, and that the
-// connection's request is always recorded by the time it does.
-bool self_test_wait_idle_synchronizes_accept_handoff() {
+// Sweep-6 review, "Synchronize the final idle snapshot with the accept
+// loop" (P1): the definitive regression test for the new design --
+// connections queued in the kernel accept backlog while the accept thread
+// is deliberately held off entirely (set_test_accept_loop_hold_ms(),
+// simulating it never having reacted at all, the most adversarial version
+// of "held off") must still all be recorded by wait_idle() itself, since
+// accept_loop() never gets a chance to help. This is only possible because
+// wait_idle() now drains the backlog under conn_mu_ itself rather than
+// waiting for (or sampling) accept_loop()'s own progress.
+bool self_test_wait_idle_drains_backlog_itself() {
     BoundPort bound;
     if (!allocate_bound_loopback_port(&bound)) {
-        std::cerr << "FAIL [self-test wait_idle accept handoff]: could not allocate a loopback "
+        std::cerr << "FAIL [self-test wait_idle drains backlog]: could not allocate a loopback "
                      "port\n";
         return false;
     }
@@ -5356,169 +5372,67 @@ bool self_test_wait_idle_synchronizes_accept_handoff() {
     RecordingUpstream upstream;
     upstream.set_default_reply(
         "HTTP/1.1 200 OK\r\nConnection: close\r\nContent-Length: 2\r\n\r\nhi");
-    constexpr int kInjectedDelayMs = 300;
-    upstream.set_test_post_accept_delay_ms(kInjectedDelayMs);
+    // Held off for the whole duration of this test: long enough that the
+    // accept thread cannot possibly react to anything below before
+    // wait_idle() itself has already drained the backlog and returned.
+    constexpr int kHoldMs = 2000;
+    upstream.set_test_accept_loop_hold_ms(kHoldMs);
     if (!upstream.adopt(bound.fd)) {
-        std::cerr << "FAIL [self-test wait_idle accept handoff]: could not adopt the listener\n";
+        std::cerr << "FAIL [self-test wait_idle drains backlog]: could not adopt the listener\n";
         return false;
     }
 
-    const int fd = connect_with_timeout(port, kClientTimeoutMs);
-    if (fd < 0) {
-        std::cerr << "FAIL [self-test wait_idle accept handoff]: could not connect\n";
-        upstream.stop();
-        return false;
+    // Queue several connections -- the kernel's listen backlog fills them
+    // independently of any accepting thread's existence -- each sending a
+    // full request before wait_idle() is ever called.
+    constexpr int kConnectionCount = 3;
+    std::vector<int> fds;
+    for (int i = 0; i < kConnectionCount; i++) {
+        const int fd = connect_with_timeout(port, kClientTimeoutMs);
+        if (fd < 0) {
+            std::cerr << "FAIL [self-test wait_idle drains backlog]: could not connect (#" << i
+                      << ")\n";
+            upstream.stop();
+            return false;
+        }
+        const std::string req = "GET /drain-" + std::to_string(i) +
+                                " HTTP/1.1\r\nHost: t.example\r\nConnection: close\r\n\r\n";
+        if (!send_all(fd, req)) {
+            std::cerr << "FAIL [self-test wait_idle drains backlog]: could not send request (#" << i
+                      << ")\n";
+            close(fd);
+            upstream.stop();
+            return false;
+        }
+        fds.push_back(fd);
     }
-    const std::string req =
-        "GET /handoff-race HTTP/1.1\r\nHost: t.example\r\nConnection: close\r\n\r\n";
-    if (!send_all(fd, req)) {
-        std::cerr << "FAIL [self-test wait_idle accept handoff]: could not send the request\n";
-        close(fd);
-        upstream.stop();
-        return false;
-    }
-
-    // Give accept_loop() a moment to actually call accept() and enter the
-    // injected delay before starting the timed wait_idle() call below --
-    // otherwise this could spuriously pass by timing out on the initial
-    // TCP handshake instead of exercising the post-accept gap at all.
-    struct timespec settle{0, 50'000'000};
-    nanosleep(&settle, nullptr);
 
     bool ok = true;
-    const int64_t start = now_ms();
-    const bool went_idle = upstream.wait_idle(2000);
-    const int64_t elapsed = now_ms() - start;
+    // wait_idle() must find and register every one of these itself: the
+    // accept thread is still asleep (kHoldMs has not elapsed) for the
+    // entire duration of this call.
+    const bool went_idle = upstream.wait_idle(1500);
     if (!went_idle) {
-        std::cerr << "FAIL [self-test wait_idle accept handoff]: wait_idle() timed out instead "
-                     "of waiting out the injected accept-to-registration delay\n";
+        std::cerr << "FAIL [self-test wait_idle drains backlog]: wait_idle() timed out instead "
+                     "of draining the backlog itself\n";
         ok = false;
     }
-    // Allows scheduling slack below the injected delay so this isn't flaky
-    // under a loaded CI host, while still failing if wait_idle() raced past
-    // the gap near-instantly (the bug this test targets).
-    if (elapsed < kInjectedDelayMs - 100) {
-        std::cerr << "FAIL [self-test wait_idle accept handoff]: wait_idle() returned after only "
-                  << elapsed << "ms, before the " << kInjectedDelayMs
-                  << "ms injected accept-to-registration delay could have elapsed -- it raced "
-                     "past the handoff gap instead of waiting for accepted_pending_\n";
-        ok = false;
-    }
-    if (upstream.requests_for("/handoff-race").empty()) {
-        std::cerr << "FAIL [self-test wait_idle accept handoff]: the connection accepted during "
-                     "the injected delay was never recorded despite wait_idle() reporting idle\n";
-        ok = false;
-    }
-    read_http_message(fd, /*head_request=*/false, kClientTimeoutMs);
-    close(fd);
-    upstream.stop();
-    if (ok) std::cerr << "PASS [self-test wait_idle accept handoff]\n";
-    return ok;
-}
-
-// Sweep-3 review, "Require a stable idle observation before returning" (P1):
-// combines BOTH the pre-mutex and post-accept delay hooks to widen the
-// ENTIRE accept-and-register cycle for one connection across many multiples
-// of wait_idle()'s 5ms retry cadence and 20ms settle interval, reproducing
-// (deterministically, rather than racily) the class of gap the review
-// describes: a moment where accept_loop() has reacted to a connection but
-// has not yet made that reaction visible through the listener, through
-// `accepted_pending_`, or (before this fix) through anything wait_idle()
-// checked. Confirms wait_idle() waits out the full widened window rather
-// than returning early on some intermediate sample, and that a second,
-// immediate call resolves promptly afterward (proving the new stability
-// check settles cleanly instead of getting stuck re-triggering on stale
-// state).
-bool self_test_wait_idle_requires_stable_observation() {
-    BoundPort bound;
-    if (!allocate_bound_loopback_port(&bound)) {
-        std::cerr << "FAIL [self-test wait_idle stable observation]: could not allocate a "
-                     "loopback port\n";
-        return false;
-    }
-    const uint16_t port = bound.port;
-
-    RecordingUpstream upstream;
-    upstream.set_default_reply(
-        "HTTP/1.1 200 OK\r\nConnection: close\r\nContent-Length: 2\r\n\r\nhi");
-    constexpr int kPreMutexDelayMs = 200;
-    constexpr int kPostAcceptDelayMs = 200;
-    upstream.set_test_pre_mutex_delay_ms(kPreMutexDelayMs);
-    upstream.set_test_post_accept_delay_ms(kPostAcceptDelayMs);
-    if (!upstream.adopt(bound.fd)) {
-        std::cerr << "FAIL [self-test wait_idle stable observation]: could not adopt the "
-                     "listener\n";
-        return false;
+    for (int i = 0; i < kConnectionCount; i++) {
+        const std::string path = "/drain-" + std::to_string(i);
+        if (upstream.requests_for(path).empty()) {
+            std::cerr << "FAIL [self-test wait_idle drains backlog]: " << path
+                      << " was never recorded despite wait_idle() reporting idle, with the "
+                         "accept thread still held off\n";
+            ok = false;
+        }
     }
 
-    const int fd = connect_with_timeout(port, kClientTimeoutMs);
-    if (fd < 0) {
-        std::cerr << "FAIL [self-test wait_idle stable observation]: could not connect\n";
-        upstream.stop();
-        return false;
-    }
-    const std::string req =
-        "GET /stable-observation-race HTTP/1.1\r\nHost: t.example\r\nConnection: close\r\n\r\n";
-    if (!send_all(fd, req)) {
-        std::cerr << "FAIL [self-test wait_idle stable observation]: could not send the "
-                     "request\n";
+    for (const int fd : fds) {
+        read_http_message(fd, /*head_request=*/false, kClientTimeoutMs);
         close(fd);
-        upstream.stop();
-        return false;
     }
-
-    // Give accept_loop() a moment to actually wake up and enter the
-    // pre-mutex delay before starting the timed wait_idle() call below.
-    struct timespec settle{0, 50'000'000};
-    nanosleep(&settle, nullptr);
-
-    bool ok = true;
-    const int64_t start = now_ms();
-    const bool went_idle = upstream.wait_idle(3000);
-    const int64_t elapsed = now_ms() - start;
-    if (!went_idle) {
-        std::cerr << "FAIL [self-test wait_idle stable observation]: wait_idle() timed out "
-                     "instead of waiting out the combined pre-mutex/post-accept delay\n";
-        ok = false;
-    }
-    // Generous slack below the combined injected delay so this isn't flaky
-    // under a loaded CI host, while still failing if wait_idle() raced past
-    // the widened window near-instantly (the bug this test targets).
-    const int kCombinedDelayMs = kPreMutexDelayMs + kPostAcceptDelayMs;
-    if (elapsed < kCombinedDelayMs - 150) {
-        std::cerr << "FAIL [self-test wait_idle stable observation]: wait_idle() returned after "
-                     "only "
-                  << elapsed << "ms, before the " << kCombinedDelayMs
-                  << "ms combined pre-mutex+post-accept delay could have elapsed -- it raced "
-                     "past the window instead of requiring a stable observation\n";
-        ok = false;
-    }
-    if (upstream.requests_for("/stable-observation-race").empty()) {
-        std::cerr << "FAIL [self-test wait_idle stable observation]: the connection was never "
-                     "recorded despite wait_idle() reporting idle\n";
-        ok = false;
-    }
-
-    // A second, immediate call must resolve promptly: the stability check
-    // must settle cleanly once things are actually idle, not perpetually
-    // re-trigger on stale epoch/counter state.
-    const int64_t second_start = now_ms();
-    const bool second_went_idle = upstream.wait_idle(1000);
-    const int64_t second_elapsed = now_ms() - second_start;
-    if (!second_went_idle) {
-        std::cerr << "FAIL [self-test wait_idle stable observation]: a second, immediate "
-                     "wait_idle() call did not report idle once things had actually settled\n";
-        ok = false;
-    } else if (second_elapsed > 500) {
-        std::cerr << "FAIL [self-test wait_idle stable observation]: a second, immediate "
-                     "wait_idle() call took "
-                  << second_elapsed << "ms to settle instead of resolving promptly\n";
-        ok = false;
-    }
-
-    close(fd);
     upstream.stop();
-    if (ok) std::cerr << "PASS [self-test wait_idle stable observation]\n";
+    if (ok) std::cerr << "PASS [self-test wait_idle drains backlog]\n";
     return ok;
 }
 
@@ -6010,6 +5924,51 @@ bool self_test_partial_exchange_rejection() {
         if (stat(out_path.c_str(), &st) == 0) {
             std::cerr << "FAIL [self-test partial]: write_transcript left a file behind for a "
                          "rejected duplicate-contact run\n";
+            ok = false;
+        }
+
+        // Sweep-6 review, "Require exact upstream counts for asserted
+        // oracle rows": a forwarding asserted case with ZERO upstream
+        // contacts (e.g. a complete but entirely local error response)
+        // must be rejected just as fatally as a duplicate -- validate_
+        // results() previously only rejected counts ABOVE one.
+        CaseResult zero_contact_forwarding;
+        zero_contact_forwarding.name = "get_smoke";  // case_expects_upstream_forward() == true
+        zero_contact_forwarding.client_bytes = "GET / HTTP/1.1\r\n\r\n";
+        zero_contact_forwarding.exchange_complete = true;
+        zero_contact_forwarding.upstream_contacted = false;
+        zero_contact_forwarding.upstream_contact_count = 0;
+        zero_contact_forwarding.downstream_bytes = "HTTP/1.1 502 Bad Gateway\r\n\r\n";
+        if (write_transcript(out_path, {zero_contact_forwarding})) {
+            std::cerr << "FAIL [self-test partial]: write_transcript accepted a forwarding "
+                         "asserted case with zero upstream contacts\n";
+            ok = false;
+        }
+        if (stat(out_path.c_str(), &st) == 0) {
+            std::cerr << "FAIL [self-test partial]: write_transcript left a file behind for a "
+                         "rejected zero-contact forwarding-case run\n";
+            ok = false;
+        }
+
+        // The opposite violation: a locally handled asserted case
+        // (case_expects_upstream_forward() == false) that unexpectedly
+        // forwarded exactly once.
+        CaseResult unexpected_forward;
+        unexpected_forward.name = "options_star";
+        unexpected_forward.client_bytes = "OPTIONS * HTTP/1.1\r\n\r\n";
+        unexpected_forward.exchange_complete = true;
+        unexpected_forward.upstream_contacted = true;
+        unexpected_forward.upstream_contact_count = 1;
+        unexpected_forward.upstream_bytes = "OPTIONS * HTTP/1.1\r\n\r\n";
+        unexpected_forward.downstream_bytes = "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n";
+        if (write_transcript(out_path, {unexpected_forward})) {
+            std::cerr << "FAIL [self-test partial]: write_transcript accepted a locally handled "
+                         "asserted case that unexpectedly forwarded\n";
+            ok = false;
+        }
+        if (stat(out_path.c_str(), &st) == 0) {
+            std::cerr << "FAIL [self-test partial]: write_transcript left a file behind for a "
+                         "rejected unexpected-forward run\n";
             ok = false;
         }
 
@@ -7230,6 +7189,132 @@ bool self_test_docker_rm_failure_preserves_launched() {
     }
 
     if (ok) std::cerr << "PASS [self-test docker rm outcomes]\n";
+    return ok;
+}
+
+// Sweep-6 review, "Abort retries when failed Envoy cleanup remains
+// pending": launch_envoy_with_port_retry() must check EnvoyInstance::
+// docker_cleanup_failed specifically -- not just stop()'s bool return,
+// which is ALSO false for the docker-run client process's own early exit,
+// an entirely benign and retry-worthy condition for a real bind collision
+// -- before ever reusing `name`/`pid` for a new attempt. Exercises
+// EnvoyInstance::stop() directly, via a stubbed RUT_ENVOY_DOCKER_BIN,
+// covering both outcomes launch_envoy_with_port_retry() must tell apart:
+//   - a genuine cleanup failure (docker rm -f fails for a reason other
+//     than "already gone"): docker_cleanup_failed must be true, and
+//     `name`/`pid` -- the only handle on the still-possibly-live
+//     container -- must remain exactly as stop() left them, proving
+//     nothing already raced ahead to reuse them.
+//   - a benign early exit during a bind collision (the docker-run client
+//     already exited on its own before stop() could signal it, but
+//     removal itself succeeds): stop() still reports failure (for the
+//     process's own unexpected exit), but docker_cleanup_failed must stay
+//     FALSE -- proving the retry-worthy collision path this fix must not
+//     break is unaffected.
+bool self_test_docker_cleanup_failure_blocks_retry() {
+    bool ok = true;
+    TempDir dir("rut-envoy-selftest-cleanup-blocks-retry");
+    if (dir.empty()) {
+        std::cerr << "FAIL [self-test docker cleanup blocks retry]: could not create temp dir\n";
+        return false;
+    }
+
+    // Case 1: genuine cleanup failure -- the scenario this fix exists for.
+    {
+        const std::string stub_path = dir.path() + "/docker-fail";
+        if (!write_docker_stub(stub_path, 1, "Cannot connect to the Docker daemon")) {
+            std::cerr << "FAIL [self-test docker cleanup blocks retry]: could not write the docker "
+                         "stub\n";
+            ok = false;
+        } else {
+            ScopedDockerBinOverride docker_override(stub_path);
+            EnvoyInstance envoy;
+            envoy.name = "rut-envoy-selftest-cleanup-blocks-retry-1";
+            envoy.launched = true;
+            envoy.pid = -1;  // already reaped, exactly like a readiness-loop reap
+            const std::string name_before = envoy.name;
+            const pid_t pid_before = envoy.pid;
+            const bool stopped = envoy.stop();
+            if (stopped) {
+                std::cerr << "FAIL [self-test docker cleanup blocks retry]: stop() reported "
+                             "success despite a failed removal\n";
+                ok = false;
+            }
+            if (!envoy.docker_cleanup_failed) {
+                std::cerr
+                    << "FAIL [self-test docker cleanup blocks retry]: docker_cleanup_failed was "
+                       "not set for a genuine removal failure\n";
+                ok = false;
+            }
+            if (!envoy.launched) {
+                std::cerr << "FAIL [self-test docker cleanup blocks retry]: launched was cleared "
+                             "despite a failed removal\n";
+                ok = false;
+            }
+            // The invariant launch_envoy_with_port_retry() relies on: when
+            // docker_cleanup_failed is set, it must return before ever
+            // reaching code that would overwrite name/pid for a new
+            // attempt. Nothing in this test touches them after stop(), so
+            // this also documents what "untouched" looks like.
+            if (envoy.name != name_before || envoy.pid != pid_before) {
+                std::cerr << "FAIL [self-test docker cleanup blocks retry]: name/pid changed "
+                             "despite the cleanup failure that must block reuse\n";
+                ok = false;
+            }
+        }
+    }
+
+    // Case 2: benign early exit, cleanup succeeds -- must NOT block retry,
+    // even though stop() itself still reports failure.
+    {
+        const std::string stub_path = dir.path() + "/docker-ok";
+        if (!write_docker_stub(stub_path, 0, "")) {
+            std::cerr << "FAIL [self-test docker cleanup blocks retry]: could not write the "
+                         "docker stub (ok case)\n";
+            ok = false;
+        } else {
+            ScopedDockerBinOverride docker_override(stub_path);
+            const pid_t child = fork();
+            if (child < 0) {
+                std::cerr << "FAIL [self-test docker cleanup blocks retry]: fork failed\n";
+                ok = false;
+            } else if (child == 0) {
+                _exit(1);  // simulates Envoy exiting early after a bind collision
+            } else {
+                // Let the child actually exit before stop() runs, WITHOUT
+                // reaping it ourselves: stop()'s own precheck must be the
+                // one to observe it already exited.
+                struct timespec settle{0, 50'000'000};
+                nanosleep(&settle, nullptr);
+
+                EnvoyInstance envoy;
+                envoy.name = "rut-envoy-selftest-cleanup-blocks-retry-2";
+                envoy.launched = true;
+                envoy.pid = child;
+                const bool stopped = envoy.stop();
+                if (stopped) {
+                    std::cerr << "FAIL [self-test docker cleanup blocks retry]: stop() reported "
+                                 "success despite the docker-run client having already exited "
+                                 "unexpectedly\n";
+                    ok = false;
+                }
+                if (envoy.docker_cleanup_failed) {
+                    std::cerr
+                        << "FAIL [self-test docker cleanup blocks retry]: docker_cleanup_failed "
+                           "was set despite a successful removal -- this would wrongly abort a "
+                           "retry-worthy collision\n";
+                    ok = false;
+                }
+                if (envoy.launched) {
+                    std::cerr << "FAIL [self-test docker cleanup blocks retry]: launched was not "
+                                 "cleared despite a successful removal\n";
+                    ok = false;
+                }
+            }
+        }
+    }
+
+    if (ok) std::cerr << "PASS [self-test docker cleanup blocks retry]\n";
     return ok;
 }
 
@@ -10080,6 +10165,21 @@ bool self_test_malformed_date_rejected() {
                      "differing synthesized Date values\n";
         ok = false;
     }
+    // Sweep-6 review, "Reject an empty synthesized Date value": an
+    // empty/whitespace-only `date:` value on a non-preserved case used to
+    // equal `preserved_date` (also empty there) by coincidence and skip
+    // is_rfc1123_http_date() entirely, so two sides both emitting this
+    // malformed value previously matched. Must NOT match now.
+    if (compare_pair_case(make_pair("trace", "", ""))) {
+        std::cerr << "FAIL [self-test malformed date]: compare_pair_case matched two empty Date "
+                     "values on a non-preserved case\n";
+        ok = false;
+    }
+    if (compare_pair_case(make_pair("trace", "   ", "   "))) {
+        std::cerr << "FAIL [self-test malformed date]: compare_pair_case matched two "
+                     "whitespace-only Date values on a non-preserved case\n";
+        ok = false;
+    }
     // The preserved upstream date is exempt from validation-and-replacement
     // by name: it passes through verbatim on both sides and still matches.
     if (!compare_pair_case(make_pair("get_upstream_date_server",
@@ -10435,8 +10535,7 @@ int run_self_test(const std::string& rut_binary, const std::string& converter_bi
     ok &= self_test_escaping();
     ok &= self_test_recording_upstream();
     ok &= self_test_wait_idle_synchronizes_with_pending_accept();
-    ok &= self_test_wait_idle_synchronizes_accept_handoff();
-    ok &= self_test_wait_idle_requires_stable_observation();
+    ok &= self_test_wait_idle_drains_backlog_itself();
     ok &= self_test_require_upstream_idle_for_asserted_batch();
     ok &= self_test_quiesce_after_record_only_idle_timeout();
     ok &= self_test_record_only_crash_reason_precedence();
@@ -10454,6 +10553,7 @@ int run_self_test(const std::string& rut_binary, const std::string& converter_bi
     ok &= self_test_envoy_instance_skips_docker_when_unlaunched();
     ok &= self_test_envoy_instance_cleans_up_after_readiness_reaps_docker();
     ok &= self_test_docker_rm_failure_preserves_launched();
+    ok &= self_test_docker_cleanup_failure_blocks_retry();
     ok &= self_test_rut_wait_ready_ownership();
     ok &= self_test_rut_log_confirms_listener();
     ok &= self_test_count_listeners_on_port();
