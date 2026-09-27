@@ -5767,6 +5767,16 @@ inline RequestPolicyBodyState inspect_request_policy_body(const Connection& conn
     if (parser.parse(data, len, &req) != ParseStatus::Complete || req.path.ptr == nullptr ||
         req.path.len == 0 || req.path.ptr[0] != '/')
         return RequestPolicyBodyState::Invalid;
+    // ID4 (host: "preserve") only: HTTP request targets cannot carry a URI
+    // fragment (RFC 7230 §5.3); `apply_preserve_host_lowercase_request_
+    // policy`'s own check (below) is retained as defense in depth. Moved
+    // here, ahead of any Waiting-producing check, so a fragment-bearing
+    // target paired with an incomplete fixed-length body fails closed
+    // immediately instead of waiting for the rest of the body to arrive
+    // (Codex sweep-12 review, PR #696, following the sweep-10/11 pattern
+    // for the identical class of issue).
+    if (request_policy_preserves_host(policy_id) && req.target_has_fragment)
+        return RequestPolicyBodyState::Invalid;
     // ID3 is a retained ordinary-header serializer for the single bounded
     // bodyless GET profile.  Explicit Content-Length (including zero), other
     // methods, and upload/body states remain closed.
@@ -5786,6 +5796,17 @@ inline RequestPolicyBodyState inspect_request_policy_body(const Connection& conn
     bool has_upgrade = false;
     bool upgrade_value_nonempty = false;
     bool connection_nominates_upgrade = false;
+    // ID4 (host: "preserve") only: a second physical `X-Forwarded-Proto`
+    // field (`apply_preserve_host_lowercase_request_policy`'s own check is
+    // retained as defense in depth) and a `Connection` value nominating a
+    // protected name (content-length/host/the three forwarded-provenance
+    // headers/a pseudo-header-shaped token -- see
+    // `request_policy_connection_nomination_is_protected`) are tracked/
+    // checked here too, for the same reason as the Host check below (Codex
+    // sweep-12 review, PR #696).
+    u32 xfp_count = 0;
+    bool seen_inline_request_header[kInlineRequestHeaderTableSize] = {};
+    bool inline_request_header_duplicated[kInlineRequestHeaderTableSize] = {};
     // ID4 (host: "preserve") only: tracked here, ahead of any Waiting-
     // producing check below, so a request whose Host shape is already known
     // to be invalid (missing, duplicated, or an invalid authority such as
@@ -5811,6 +5832,15 @@ inline RequestPolicyBodyState inspect_request_policy_body(const Connection& conn
         if (request_policy_name_eq(hs, name_len, "content-length", 14)) cl_count++;
         if (request_policy_name_eq(hs, name_len, "transfer-encoding", 17))
             return RequestPolicyBodyState::Invalid;
+        if (request_policy_preserves_host(policy_id)) {
+            const i32 inline_idx = request_policy_inline_request_header_index(hs, name_len);
+            if (inline_idx >= 0) {
+                if (seen_inline_request_header[inline_idx])
+                    inline_request_header_duplicated[inline_idx] = true;
+                seen_inline_request_header[inline_idx] = true;
+            }
+            if (request_policy_name_eq(hs, name_len, "x-forwarded-proto", 17)) xfp_count++;
+        }
         if (request_policy_name_eq(hs, name_len, "host", 4)) {
             host_count++;
             const u8* host_start = colon + 1;
@@ -5839,6 +5869,30 @@ inline RequestPolicyBodyState inspect_request_policy_body(const Connection& conn
             // traffic below.
             connection_nominates_upgrade |=
                 request_policy_comma_value_has_token(value_start, value_end, "upgrade", 7);
+            // ID4 (host: "preserve") only: fail the whole request closed on
+            // a nomination of a protected name (content-length, host, the
+            // three forwarded-provenance headers, or a pseudo-header-shaped
+            // token) as each token is scanned, mirroring
+            // `apply_preserve_host_lowercase_request_policy`'s own Pass 1
+            // (retained there as defense in depth) -- moved here, ahead of
+            // any Waiting-producing check, for the same reason as the Host
+            // check above (Codex sweep-12 review, PR #696).
+            if (request_policy_preserves_host(policy_id)) {
+                const u8* tok = value_start;
+                while (tok <= value_end) {
+                    const u8* tok_end = tok;
+                    while (tok_end < value_end && *tok_end != ',') tok_end++;
+                    const u8* t0 = tok;
+                    const u8* t1 = tok_end;
+                    while (t0 < t1 && (*t0 == ' ' || *t0 == '\t')) t0++;
+                    while (t1 > t0 && (t1[-1] == ' ' || t1[-1] == '\t')) t1--;
+                    if (t1 > t0 && request_policy_connection_nomination_is_protected(
+                                       t0, static_cast<u32>(t1 - t0)))
+                        return RequestPolicyBodyState::Invalid;
+                    if (tok_end >= value_end) break;
+                    tok = tok_end + 1;
+                }
+            }
         }
         // An empty or OWS-only `Expect` field carries no expectation at all
         // (RFC 9110 defines only the "100-continue" expect-value; an empty
@@ -5888,6 +5942,51 @@ inline RequestPolicyBodyState inspect_request_policy_body(const Connection& conn
         (host_count != 1 || host_value_len == 0 ||
          !request_policy_host_authority_is_valid(host_value_start, host_value_len)))
         return RequestPolicyBodyState::Invalid;
+    // ID4 (host: "preserve") only: more than one physical X-Forwarded-Proto
+    // field fails closed unconditionally (`apply_preserve_host_lowercase_
+    // request_policy`'s own check is retained as defense in depth) -- moved
+    // here for the same reason as the Host check above (Codex sweep-12
+    // review, PR #696).
+    if (request_policy_preserves_host(policy_id) && xfp_count > 1)
+        return RequestPolicyBodyState::Invalid;
+    // ID4 (host: "preserve") only: a duplicated physical occurrence of any
+    // other Envoy inline-slot header name (see `kInlineRequestHeaders`)
+    // fails closed unless the client's Connection value also nominates that
+    // name, in which case every physical occurrence is dropped and no
+    // duplicate reaches the wire (`apply_preserve_host_lowercase_request_
+    // policy`'s own check is retained as defense in depth) -- moved here
+    // for the same reason as the checks above (Codex sweep-12 review, PR
+    // #696).
+    if (request_policy_preserves_host(policy_id)) {
+        auto name_nominated = [&](const u8* name, u32 name_len) {
+            const u8* hs2 = line_end + 2;
+            while (hs2 < header_end) {
+                const u8* le2 = hs2;
+                while (le2 + 1 < end && !(le2[0] == '\r' && le2[1] == '\n')) le2++;
+                const u8* colon2 = hs2;
+                while (colon2 < le2 && *colon2 != ':') colon2++;
+                const u32 hname_len = static_cast<u32>(colon2 - hs2);
+                if (request_policy_name_eq(hs2, hname_len, "connection", 10)) {
+                    const u8* value_start2 = colon2 + 1;
+                    const u8* value_end2 = le2;
+                    request_policy_trim_ows(value_start2, value_end2);
+                    if (request_policy_comma_value_has_token(value_start2,
+                                                             value_end2,
+                                                             reinterpret_cast<const char*>(name),
+                                                             name_len))
+                        return true;
+                }
+                hs2 = le2 + 2;
+            }
+            return false;
+        };
+        for (u32 i = 0; i < kInlineRequestHeaderTableSize; i++) {
+            if (!inline_request_header_duplicated[i]) continue;
+            const RequestPolicyInlineHeaderEntry& entry = kInlineRequestHeaders[i];
+            if (!name_nominated(reinterpret_cast<const u8*>(entry.name), entry.len))
+                return RequestPolicyBodyState::Invalid;
+        }
+    }
     // ID4 (host: "preserve") only: a `Connection` value that nominates
     // "upgrade" alongside "close" (or on its own), together with a
     // semantically-present (non-empty/non-OWS) `Upgrade` header
@@ -5936,6 +6035,33 @@ inline RequestPolicyBodyState inspect_request_policy_body(const Connection& conn
         return RequestPolicyBodyState::Invalid;
     const u64 required = static_cast<u64>(parser.header_end) + req.content_length;
     if (required > conn.recv_buf.capacity()) return RequestPolicyBodyState::Invalid;
+    // INVARIANT: every rejection above this line depends only on headers,
+    // the request line, or connection state already known before any body
+    // byte has necessarily arrived -- never on the content of body bytes
+    // themselves. `Waiting` below means only "the declared body hasn't
+    // fully arrived yet", never "still deciding whether this request is
+    // admissible": TLS (sweep-10), Host shape (sweep-11), and fragment
+    // targets/X-Forwarded-Proto duplicates/protected Connection nominations/
+    // duplicated inline headers (sweep-12) were all moved above this point
+    // for exactly this reason, after Codex found the same bug class three
+    // times -- a slow client holding the connection and receive slice open
+    // for a request the headers alone already prove must be rejected. A new
+    // ID4 (or other policy) admission check that only needs header/request-
+    // line/connection-state facts must be added above this line, not below
+    // it, even if the natural place to compute it happens to be here. The
+    // one known exception is the exact rewritten-size-vs-capacity check
+    // `apply_preserve_host_lowercase_request_policy`'s two-pass measuring
+    // loop performs: it is header-length-and-declared-content-length-
+    // derived in principle (never touches actual body byte values), but
+    // extracting it here would require either duplicating that loop's ~250
+    // lines of per-header rewrite decisions (recreating the exact
+    // measure/write divergence risk the sweep-6 single-shared-loop design
+    // was built to eliminate) or a dedicated refactor into a dual-purpose
+    // shared helper -- deliberately deferred to its own review rather than
+    // folded into this sweep; the request still cannot exceed
+    // `conn.recv_buf.capacity()` in its *original*, unrewritten size (the
+    // check just above this comment), bounding how much a client can force
+    // this one path to wait.
     if (conn.recv_buf.len() < required) return RequestPolicyBodyState::Waiting;
     if (conn.req_body_mode == BodyMode::ContentLength && conn.req_body_remaining != 0)
         return RequestPolicyBodyState::Waiting;
@@ -6054,6 +6180,11 @@ inline bool apply_preserve_host_lowercase_request_policy(Connection& conn, u16 p
     // already matched only the pre-fragment canonical path, so forwarding the
     // raw fragment-bearing target here would let routing and the origin
     // observe different target interpretations of the same request.
+    // `inspect_request_policy_body` (Codex sweep-12 review, PR #696) applies
+    // the identical check earlier, in the pre-body admission path, so a
+    // fragment-bearing target paired with an incomplete fixed-length body
+    // fails closed immediately rather than waiting for the rest of the
+    // body; the check here is retained too, as defense in depth.
     if (req.target_has_fragment) return false;
     const u32 body_len = req.has_content_length ? req.content_length : 0;
     const u8* end = data + parser.header_end;
@@ -6144,7 +6275,10 @@ inline bool apply_preserve_host_lowercase_request_policy(Connection& conn, u16 p
                 // either handled by its own dedicated logic elsewhere in
                 // this function (a `te`/`upgrade` nomination) or simply
                 // dropped along with its own field below via
-                // `name_nominated`'s rescan.
+                // `name_nominated`'s rescan. `inspect_request_policy_body`
+                // (Codex sweep-12 review, PR #696) applies the identical
+                // scan earlier, in the pre-body admission path; the scan
+                // here is retained too, as defense in depth.
                 const u8* tok = value_start;
                 while (tok <= value_end) {
                     const u8* tok_end = tok;
@@ -6180,6 +6314,9 @@ inline bool apply_preserve_host_lowercase_request_policy(Connection& conn, u16 p
     // replicate that coalescing, so more than one physical field is refused
     // outright rather than risking an origin observing a different,
     // first-or-last-duplicate scheme than an Envoy-parity client intended.
+    // `inspect_request_policy_body` (Codex sweep-12 review, PR #696) applies
+    // the identical check earlier, in the pre-body admission path; the
+    // check here is retained too, as defense in depth.
     if (xfp_count > 1) return false;
 
     // Pass 1 above already failed the whole request closed for every
@@ -6256,7 +6393,10 @@ inline bool apply_preserve_host_lowercase_request_policy(Connection& conn, u16 p
     // of its physical fields below regardless of how many there were, so no
     // duplicate ever survives to diverge from Envoy's inline coalescing for
     // that name. Fail closed only for a duplicated name that is not
-    // nominated (Codex sweep-2 review, PR #696).
+    // nominated (Codex sweep-2 review, PR #696). `inspect_request_policy_
+    // body` (Codex sweep-12 review, PR #696) applies the identical
+    // duplicate-vs-nominated resolution earlier, in the pre-body admission
+    // path; the check here is retained too, as defense in depth.
     for (u32 i = 0; i < kInlineRequestHeaderTableSize; i++) {
         if (!inline_request_header_duplicated[i]) continue;
         const RequestPolicyInlineHeaderEntry& entry = kInlineRequestHeaders[i];

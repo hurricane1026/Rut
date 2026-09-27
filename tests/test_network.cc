@@ -3677,6 +3677,95 @@ TEST(request_policy, preserve_host_lowercase_invalid_host_rejects_before_waiting
     CHECK_EQ(__builtin_memcmp(conn.recv_buf.data(), untouched, untouched_len), 0);
 }
 
+// Codex sweep-12 review, PR #696: this is the third time the same bug class
+// was found one check at a time (TLS in sweep-10, Host in sweep-11,
+// fragment targets in sweep-12) -- a header-only ID4 rejection was checked
+// only at materialization, reached only after `inspect_request_policy_body`
+// already returned `Complete` for a fixed-length body, so an incomplete
+// body let a slow client hold the connection and receive slice open for a
+// request the headers alone already proved must be rejected. Table-driven
+// per the architect direction: every header-only ID4 rejection must fail
+// `Invalid` immediately with a partial body, never `Waiting`. Covers the
+// three checks newly moved into the inspector in this sweep (fragment
+// target, duplicated X-Forwarded-Proto, protected Connection nomination,
+// duplicated inline header) plus the two moved in sweep-10/11 (TLS, Host),
+// all exercised through the same table so a future regression on any of
+// them is caught the same way.
+TEST(request_policy, preserve_host_lowercase_header_only_rejections_reject_before_waiting) {
+    static constexpr u16 kPreserveHost =
+        static_cast<u16>(RequestPolicyId::Http11PreserveHostLowercase);
+
+    struct Case {
+        const char* name;
+        const char* header;  // full header block, no body, ends in "\r\n\r\n"
+        bool tls;
+    };
+    static const Case kCases[] = {
+        {"tls_active",
+         "POST /upload HTTP/1.1\r\nHost: client.example\r\nContent-Length: 5\r\n\r\n",
+         true},
+        {"missing_host", "POST /upload HTTP/1.1\r\nContent-Length: 5\r\n\r\n", false},
+        {"duplicate_host",
+         "POST /upload HTTP/1.1\r\nHost: a\r\nHost: b\r\nContent-Length: 5\r\n\r\n",
+         false},
+        {"invalid_authority_host",
+         "POST /upload HTTP/1.1\r\nHost: victim/path\r\nContent-Length: 5\r\n\r\n",
+         false},
+        {"fragment_target",
+         "POST /upload#frag HTTP/1.1\r\nHost: client.example\r\nContent-Length: 5\r\n\r\n",
+         false},
+        {"duplicate_x_forwarded_proto",
+         "POST /upload HTTP/1.1\r\nHost: client.example\r\nX-Forwarded-Proto: http\r\n"
+         "X-Forwarded-Proto: https\r\nContent-Length: 5\r\n\r\n",
+         false},
+        {"protected_connection_nomination",
+         "POST /upload HTTP/1.1\r\nHost: client.example\r\nConnection: content-length\r\n"
+         "Content-Length: 5\r\n\r\n",
+         false},
+        {"duplicated_inline_header_not_nominated",
+         "POST /upload HTTP/1.1\r\nHost: client.example\r\nContent-Type: a\r\n"
+         "Content-Type: b\r\nContent-Length: 5\r\n\r\n",
+         false},
+    };
+
+    Connection conn{};
+    u8 recv[256]{};
+    u8 send[256]{};
+
+    auto prepare = [&](const char* header) {
+        conn.reset();
+        conn.recv_slice = recv;
+        conn.send_slice = send;
+        conn.bind_request_receive_buffer(recv, sizeof(recv));
+        conn.send_buf.bind(send, sizeof(send));
+        const u32 header_len = static_cast<u32>(strlen(header));
+        const u8 partial_body[] = {'a', 'b'};  // only 2 of the declared 5 bytes
+        u8 wire[256]{};
+        REQUIRE_LE(header_len + sizeof(partial_body), sizeof(wire));
+        __builtin_memcpy(wire, header, header_len);
+        __builtin_memcpy(wire + header_len, partial_body, sizeof(partial_body));
+        const u32 wire_len = header_len + static_cast<u32>(sizeof(partial_body));
+        REQUIRE_EQ(conn.recv_buf.write(wire, wire_len), wire_len);
+        capture_request_metadata(conn);
+    };
+
+    // Control: a valid request (no TLS, valid Host, no fragment, no
+    // duplicates, no protected nomination) with the identical partial body
+    // genuinely waits for the rest -- confirming every case below is a real
+    // "would otherwise wait" shape, not already rejected for an unrelated
+    // reason.
+    prepare("POST /upload HTTP/1.1\r\nHost: client.example\r\nContent-Length: 5\r\n\r\n");
+    REQUIRE_EQ(inspect_request_policy_body(conn, kPreserveHost), RequestPolicyBodyState::Waiting);
+
+    for (const Case& c : kCases) {
+        prepare(c.header);
+        if (c.tls) conn.tls_active = true;
+        CHECK_MSG(
+            inspect_request_policy_body(conn, kPreserveHost) == RequestPolicyBodyState::Invalid,
+            c.name);
+    }
+}
+
 // `request_policy_body_response_admitted` (callbacks_impl.h) is the ordinary
 // strict-response body-path admission check for a body-carrying request
 // paired with a response_policy. It used to admit only ID1
