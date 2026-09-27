@@ -57,6 +57,38 @@ inline constexpr u8 kTestIoUringStagedSendSubmit = 2;
 
 }  // namespace detail
 
+// Outcome of IoUringEventLoop::submit_send_file. Failed: the caller falls
+// back to a memory send. Armed: an SQE is outstanding; the completion
+// arrives through the proactor as usual. CompletedSync: a keep-alive body
+// that finished in one sendfile(2) call — no SQE was queued (see
+// IoUringBackend::add_send_file), so the caller must account the send
+// itself, synchronously, instead of waiting on an event.
+enum class SendFileOutcome : u8 { Failed, Armed, CompletedSync };
+
+// Guard for IoUringEventLoop::in_sync_send_completion. Behaves as a plain
+// bool (implicit conversion + bool assignment) everywhere it's used, but
+// also counts nesting depth so tests can assert the recursion bound
+// directly instead of by stack size: depth is the current nesting level,
+// max_depth the deepest it ever reached. Production code only ever does
+// `loop->in_sync_send_completion = true;` ... `= false;` in matched pairs
+// (see on_response_sent), so depth returns to 0 once the outermost pair
+// unwinds and max_depth is the true peak nesting reached.
+struct SyncSendCompletionGuard {
+    u32 depth = 0;
+    u32 max_depth = 0;
+
+    operator bool() const { return depth != 0; }
+    SyncSendCompletionGuard& operator=(bool active) {
+        if (active) {
+            depth++;
+            if (depth > max_depth) max_depth = depth;
+        } else if (depth != 0) {
+            depth--;
+        }
+        return *this;
+    }
+};
+
 // IoUringEventLoop — concrete, non-template event loop for io_uring backend.
 //
 // io_uring is asynchronous: the kernel may still reference user buffers
@@ -68,6 +100,18 @@ struct IoUringEventLoop : EventLoopCRTP<IoUringEventLoop> {
     IoUringBackend backend;
     TimerWheel timer;
     u32 shard_id = 0;
+    // Set for the duration of the synthetic dispatch_event() call that
+    // accounts a SendFileOutcome::CompletedSync completion (see
+    // on_response_sent). That dispatch can synchronously complete a whole
+    // response and pipeline_dispatch the next pipelined request, whose own
+    // handler may again try to sendfile-complete synchronously — recursing
+    // into dispatch_event with no bound on pipeline depth. While this flag is
+    // set, submit_send_file refuses another synchronous completion (it arms
+    // an ordinary SQE instead), so the recursion is provably one level deep:
+    // the outer dispatch_event call sets it, the (at most one) nested
+    // completion sees it set and falls back to async, and nothing set it
+    // again before that nested call returns.
+    SyncSendCompletionGuard in_sync_send_completion{};
     // Shared cross-shard limiter for @rateLimit(scope: global) rules. Null ->
     // global rules degrade to per-shard. main.cc points every shard at one
     // shared instance.
@@ -3037,25 +3081,37 @@ public:
     // Plaintext local-body chunk from a sealed memfd (see add_send_file).
     // Declines — leaving the caller to send from memory — on TLS, while a
     // response-deadline send owns the connection, or without an SQE.
-    bool submit_send_file(Connection& c, i32 file_fd, u32 file_off, u32 len) {
+    SendFileOutcome submit_send_file(Connection& c, i32 file_fd, u32 file_off, u32 len) {
         if (c.tls_active || c.fd < 0 || c.send_armed || file_fd < 0 || len == 0 ||
             c.response_read_deadline_post_commit_phase !=
                 ResponseReadDeadlinePostCommitPhase::None ||
             backend.failure_code() != 0)
-            return false;
+            return SendFileOutcome::Failed;
         // The last chunk of a closing response ends the stream as soon as it
         // is out, like final_local_response_send's direct write.
         const bool kFinal =
             !c.keep_alive && c.local_body_remaining == 0 && c.on_send == &on_response_sent<Self>;
+        // A synchronous completion is only offered while none is already on
+        // the stack (see in_sync_send_completion): the decision is made here,
+        // once, and handed to add_send_file explicitly so the backend never
+        // has to infer it (and can't disagree with this check) from
+        // nop_inject_result or anything else.
+        const bool kAllowSyncCompletion = !in_sync_send_completion;
         bool wrote_all = false;
-        if (!backend.add_send_file(c.fd, c.id, file_fd, file_off, len, 0, kFinal, &wrote_all))
-            return false;
+        if (!backend.add_send_file(
+                c.fd, c.id, file_fd, file_off, len, 0, kFinal, &wrote_all, kAllowSyncCompletion))
+            return SendFileOutcome::Failed;
+        if (!kFinal && wrote_all && kAllowSyncCompletion) {
+            // add_send_file queued no SQE for this: the caller completes it
+            // synchronously (see the comment on SendFileOutcome).
+            return SendFileOutcome::CompletedSync;
+        }
         c.pending_ops++;
         c.send_armed = true;
         // Bytes and FIN are on the wire: a client that read them and reset
         // must not pre-empt the completion that accounts the request.
         if (kFinal && wrote_all) c.direct_write_completion_pending = true;
-        return true;
+        return SendFileOutcome::Armed;
     }
 
     [[nodiscard]] bool final_local_response_send(const Connection& c,

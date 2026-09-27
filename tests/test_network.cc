@@ -9167,12 +9167,16 @@ TEST(iouring_send, send_file_continues_on_pollout_and_completes_once) {
     REQUIRE_EQ(write(file, bytes.data(), kLen), static_cast<ssize_t>(kLen));
 
     constexpr u32 kGen = 3;
-    // A chunk the idle socket takes at once completes through an injected NOP.
-    REQUIRE(backend.add_send_file(server, 0, file, 0, 512, kGen + 2));
-    REQUIRE_EQ(guard.sq_tail, 1u);
-    CHECK_EQ(guard.sq_entries[0].opcode, IORING_OP_NOP);
-    CHECK_EQ(guard.sq_entries[0].len, 512u);
-    CHECK_EQ(backend.send_state[0].file_fd, -1);
+    // A keep-alive chunk (shutdown_when_done=false, the default) the idle
+    // socket takes at once needs no completion through the ring at all: no
+    // SQE is queued, and *wrote_all reports it landed synchronously so the
+    // caller can account the send itself. get_sqe() only peeked at the tail,
+    // so this must not consume a slot.
+    bool wrote_all = false;
+    REQUIRE(backend.add_send_file(
+        server, 0, file, 0, 512, kGen + 2, /*shutdown_when_done=*/false, &wrote_all));
+    CHECK(wrote_all);
+    CHECK_EQ(guard.sq_tail, 0u);
     {
         u8 head[512];
         u32 have = 0;
@@ -9182,6 +9186,54 @@ TEST(iouring_send, send_file_continues_on_pollout_and_completes_once) {
             have += static_cast<u32>(r);
         }
         CHECK(memcmp(head, bytes.data(), sizeof(head)) == 0);
+    }
+
+    // The same one-shot completion on a *closing* connection is unchanged:
+    // it still completes through an injected NOP, so a racing peer reset
+    // can't pre-empt the accounting (direct_write_completion_pending). Uses
+    // its own socket pair — shutdown_when_done ends the write side, and the
+    // rest of this test still needs `server` open for the partial-write and
+    // poll-error cases below.
+    {
+        const i32 listener2 = socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0);
+        REQUIRE_GE(listener2, 0);
+        sockaddr_in addr2{};
+        addr2.sin_family = AF_INET;
+        addr2.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+        REQUIRE_EQ(bind(listener2, reinterpret_cast<sockaddr*>(&addr2), sizeof(addr2)), 0);
+        REQUIRE_EQ(listen(listener2, 1), 0);
+        socklen_t addr2_len = sizeof(addr2);
+        REQUIRE_EQ(getsockname(listener2, reinterpret_cast<sockaddr*>(&addr2), &addr2_len), 0);
+        const i32 client2 = socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0);
+        REQUIRE_GE(client2, 0);
+        REQUIRE_EQ(connect(client2, reinterpret_cast<sockaddr*>(&addr2), sizeof(addr2)), 0);
+        const i32 server2 = accept4(listener2, nullptr, nullptr, SOCK_NONBLOCK | SOCK_CLOEXEC);
+        REQUIRE_GE(server2, 0);
+
+        guard.sq_head = guard.sq_tail;
+        backend.pending = 0;
+        wrote_all = false;
+        REQUIRE(backend.add_send_file(
+            server2, 0, file, 512, 512, kGen + 2, /*shutdown_when_done=*/true, &wrote_all));
+        CHECK(wrote_all);
+        REQUIRE_EQ(guard.sq_tail, guard.sq_head + 1u);
+        CHECK_EQ(guard.sq_entries[guard.sq_head & guard.sq_mask].opcode, IORING_OP_NOP);
+        CHECK_EQ(guard.sq_entries[guard.sq_head & guard.sq_mask].len, 512u);
+        CHECK_EQ(backend.send_state[0].file_fd, -1);
+        u8 head[512];
+        u32 have = 0;
+        while (have < sizeof(head)) {
+            const ssize_t r = recv(client2, head + have, sizeof(head) - have, 0);
+            REQUIRE_GT(r, 0);
+            have += static_cast<u32>(r);
+        }
+        CHECK(memcmp(head, bytes.data() + 512, sizeof(head)) == 0);
+        // The write side is shut down: the next byte is EOF, not data.
+        u8 eof_probe = 0;
+        CHECK_EQ(recv(client2, &eof_probe, 1, 0), 0);
+        close(client2);
+        close(server2);
+        close(listener2);
     }
     guard.sq_head = guard.sq_tail;
     backend.pending = 0;
@@ -9239,6 +9291,330 @@ TEST(iouring_send, send_file_continues_on_pollout_and_completes_once) {
         CHECK_EQ(failed.result, -ECANCELED);
         CHECK_EQ(backend.send_state[0].file_fd, -1);
     }
+
+    close(file);
+    close(server);
+    close(client);
+    close(listener);
+}
+
+// Fixes 2 and 3: the synchronous-completion decision no longer depends on
+// nop_inject_result (add_send_file takes it explicitly as
+// allow_sync_completion), and a kernel without IORING_NOP_INJECT_RESULT must
+// still account a fully-written file send correctly, whether it's a
+// keep-alive chunk (still completed synchronously, no SQE at all) or a
+// closing chunk (queued as POLL_ADD since there's no NOP to complete it
+// through — wait() must own that CQE and report the real byte count, not the
+// poll mask, even though send_state.remaining is already 0 when it arrives).
+TEST(iouring_send, add_send_file_without_nop_inject_result_still_accounts_correctly) {
+    ScopedTlsRawSendLoop guard;
+    REQUIRE(guard.init());
+    IoUringBackend& backend = guard.loop->backend;
+    backend.nop_inject_result = false;
+
+    const i32 listener = socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0);
+    REQUIRE_GE(listener, 0);
+    sockaddr_in addr{};
+    addr.sin_family = AF_INET;
+    addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    REQUIRE_EQ(bind(listener, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)), 0);
+    REQUIRE_EQ(listen(listener, 1), 0);
+    socklen_t addr_len = sizeof(addr);
+    REQUIRE_EQ(getsockname(listener, reinterpret_cast<sockaddr*>(&addr), &addr_len), 0);
+    const i32 client = socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0);
+    REQUIRE_GE(client, 0);
+    REQUIRE_EQ(connect(client, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)), 0);
+    const i32 server = accept4(listener, nullptr, nullptr, SOCK_NONBLOCK | SOCK_CLOEXEC);
+    REQUIRE_GE(server, 0);
+
+    constexpr u32 kLen = 1024;
+    const i32 file = memfd_create("send-file-no-nop-test", MFD_CLOEXEC);
+    REQUIRE_GE(file, 0);
+    std::vector<u8> bytes(kLen);
+    for (u32 i = 0; i < kLen; ++i) bytes[i] = static_cast<u8>(i * 37 + 5);
+    REQUIRE_EQ(write(file, bytes.data(), kLen), static_cast<ssize_t>(kLen));
+
+    constexpr u32 kGen = 9;
+
+    // Keep-alive chunk, no NOP support: still completes synchronously with
+    // no SQE at all — the decision no longer depends on nop_inject_result.
+    bool wrote_all = false;
+    REQUIRE(backend.add_send_file(
+        server, 0, file, 0, 256, kGen, /*shutdown_when_done=*/false, &wrote_all));
+    CHECK(wrote_all);
+    CHECK_EQ(guard.sq_tail, 0u);
+    {
+        u8 head[256];
+        u32 have = 0;
+        while (have < sizeof(head)) {
+            const ssize_t r = recv(client, head + have, sizeof(head) - have, 0);
+            REQUIRE_GT(r, 0);
+            have += static_cast<u32>(r);
+        }
+        CHECK(memcmp(head, bytes.data(), sizeof(head)) == 0);
+    }
+
+    // Closing chunk, no NOP support: queued as POLL_ADD (there's no NOP to
+    // complete it through), even though sendfile already wrote every byte.
+    guard.sq_head = guard.sq_tail;
+    backend.pending = 0;
+    wrote_all = false;
+    constexpr u32 kCloseLen = 256;
+    REQUIRE(backend.add_send_file(
+        server, 0, file, 256, kCloseLen, kGen + 1, /*shutdown_when_done=*/true, &wrote_all));
+    CHECK(wrote_all);
+    REQUIRE_EQ(guard.sq_tail, guard.sq_head + 1u);
+    CHECK_EQ(guard.sq_entries[guard.sq_head & guard.sq_mask].opcode, IORING_OP_POLL_ADD);
+    // The pre-existing bug: remaining is already 0 (every byte went out in
+    // add_send_file's own sendfile(2) call) while file_fd is still live —
+    // wait()'s file-send branch must own this CQE by file_fd alone, not
+    // file_fd && remaining > 0, or it falls through to the generic path and
+    // reports the poll mask as the result.
+    CHECK_EQ(backend.send_state[0].remaining, 0u);
+    CHECK_EQ(backend.send_state[0].file_fd, file);
+    {
+        u8 tail[kCloseLen];
+        u32 have = 0;
+        while (have < sizeof(tail)) {
+            const ssize_t r = recv(client, tail + have, sizeof(tail) - have, 0);
+            REQUIRE_GT(r, 0);
+            have += static_cast<u32>(r);
+        }
+        CHECK(memcmp(tail, bytes.data() + 256, sizeof(tail)) == 0);
+    }
+    guard.sq_head = guard.sq_tail;
+    backend.pending = 0;
+    REQUIRE(guard.push_send_cqe(kGen + 1, POLLOUT));
+    IoEvent done{};
+    REQUIRE_EQ(backend.wait(&done, 1, guard.loop->conns, 1), 1u);
+    CHECK_EQ(done.type, IoEventType::Send);
+    // The fix: the real byte count, not the POLLOUT mask (4).
+    CHECK_EQ(done.result, static_cast<i32>(kCloseLen));
+    CHECK_EQ(done.non_upstream_generation, kGen + 1);
+    CHECK_EQ(backend.send_state[0].file_fd, -1);
+    CHECK_EQ(backend.send_state[0].remaining, 0u);
+
+    close(file);
+    close(server);
+    close(client);
+    close(listener);
+}
+
+// Fix 1: the depth guard. on_response_sent drives a SendFileOutcome::
+// CompletedSync completion through a synthetic dispatch_event() call, which
+// can synchronously complete a whole response and pipeline_dispatch the next
+// pipelined request. If that request's own body also finished sendfile(2) in
+// one call, submit_send_file must not offer it another synchronous
+// completion — it must fall back to an ordinary armed SQE — or the recursion
+// this guards against would have no bound. This test drives
+// IoUringEventLoop::submit_send_file directly (the real production method,
+// not a mock) and manually sets in_sync_send_completion exactly as
+// callbacks_impl.h's CompletedSync branch does around its nested
+// dispatch_event() call, which is the one place a nested submit_send_file
+// call could ever occur — proving the outcome can never be CompletedSync
+// while it's set, so the recursion is bounded to one level regardless of
+// pipeline depth.
+TEST(iouring_send, submit_send_file_guard_bounds_recursion_to_one_level) {
+    ScopedTlsRawSendLoop guard;
+    REQUIRE(guard.init());
+    IoUringEventLoop& loop = *guard.loop;
+    IoUringBackend& backend = loop.backend;
+    backend.nop_inject_result = true;
+
+    const i32 listener = socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0);
+    REQUIRE_GE(listener, 0);
+    sockaddr_in addr{};
+    addr.sin_family = AF_INET;
+    addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    REQUIRE_EQ(bind(listener, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)), 0);
+    REQUIRE_EQ(listen(listener, 1), 0);
+    socklen_t addr_len = sizeof(addr);
+    REQUIRE_EQ(getsockname(listener, reinterpret_cast<sockaddr*>(&addr), &addr_len), 0);
+    const i32 client = socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0);
+    REQUIRE_GE(client, 0);
+    REQUIRE_EQ(connect(client, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)), 0);
+    const i32 server = accept4(listener, nullptr, nullptr, SOCK_NONBLOCK | SOCK_CLOEXEC);
+    REQUIRE_GE(server, 0);
+
+    constexpr u32 kLen = 4096;
+    const i32 file = memfd_create("submit-send-file-guard-test", MFD_CLOEXEC);
+    REQUIRE_GE(file, 0);
+    std::vector<u8> bytes(kLen);
+    for (u32 i = 0; i < kLen; ++i) bytes[i] = static_cast<u8>(i * 17 + 3);
+    REQUIRE_EQ(write(file, bytes.data(), kLen), static_cast<ssize_t>(kLen));
+
+    Connection conn{};
+    conn.reset();
+    conn.id = 0;
+    conn.fd = server;
+    conn.keep_alive = true;  // kFinal == false: the keep-alive path this guards.
+
+    CHECK_FALSE(loop.in_sync_send_completion);
+    CHECK_EQ(loop.in_sync_send_completion.depth, 0u);
+
+    // Outermost call: nothing else is mid-completion, so this one completes
+    // synchronously — no SQE, and neither pending_ops nor send_armed change
+    // (see IoUringEventLoop::submit_send_file: CompletedSync returns before
+    // touching either).
+    const u32 pending_before = conn.pending_ops;
+    const SendFileOutcome outcome1 = loop.submit_send_file(conn, file, 0, 256);
+    CHECK(outcome1 == SendFileOutcome::CompletedSync);
+    CHECK_EQ(guard.sq_tail, 0u);
+    CHECK_EQ(conn.pending_ops, pending_before);
+    CHECK_FALSE(conn.send_armed);
+
+    // Simulate being inside the synthetic dispatch_event() call that
+    // on_response_sent drives for outcome1 (see callbacks_impl.h) — exactly
+    // the condition a recursive completion would see, and the only place a
+    // nested submit_send_file call can occur.
+    loop.in_sync_send_completion = true;
+    CHECK_EQ(loop.in_sync_send_completion.depth, 1u);
+
+    const u32 sq_before_nested = guard.sq_tail;
+    const SendFileOutcome outcome2 = loop.submit_send_file(conn, file, 256, 256);
+    // The guard forces the fallback path: no second synchronous completion,
+    // however deep the (hypothetical) nesting — depth is bounded to 1.
+    CHECK(outcome2 == SendFileOutcome::Armed);
+    CHECK_EQ(guard.sq_tail, sq_before_nested + 1u);
+    CHECK_EQ(guard.sq_entries[sq_before_nested & guard.sq_mask].opcode, IORING_OP_NOP);
+    CHECK(conn.send_armed);
+    CHECK_EQ(conn.pending_ops, pending_before + 1u);
+
+    loop.in_sync_send_completion = false;
+    CHECK_EQ(loop.in_sync_send_completion.depth, 0u);
+    CHECK_EQ(loop.in_sync_send_completion.max_depth, 1u);
+
+    // Both writes actually landed on the wire, in order.
+    u8 got[512];
+    u32 have = 0;
+    while (have < sizeof(got)) {
+        const ssize_t r = recv(client, got + have, sizeof(got) - have, 0);
+        REQUIRE_GT(r, 0);
+        have += static_cast<u32>(r);
+    }
+    CHECK(memcmp(got, bytes.data(), sizeof(got)) == 0);
+
+    close(file);
+    close(server);
+    close(client);
+    close(listener);
+}
+
+static u32 g_pipelined_sync_sendfile_handler_calls = 0;
+static u64 pipelined_sync_sendfile_handler(void*, jit::HandlerCtx*, const u8*, u32, void*) {
+    ++g_pipelined_sync_sendfile_handler_calls;
+    // ReturnStatus 200 with response_body_idx 1 (carried in upstream_id).
+    return jit::HandlerResult{jit::HandlerAction::ReturnStatus, 200, 1, 0, jit::YieldKind::HttpGet}
+        .pack();
+}
+
+// End-to-end regression for the whole feature, driven through real HTTP/1
+// parsing and routing (not a hand-staged Connection): a pipelined burst of
+// two keep-alive GETs, where the first response's body is large enough
+// (>kResponseBodyPoolBytes) to go through add_send_file and, on an idle
+// loopback socket, completes in one sendfile(2) call. Proves the three
+// bullets together: no SQE for that completion, the request accounted
+// exactly once, and the pipelined second request served — all from the
+// synchronous dispatch_event() call on_response_sent drives for it — while
+// the depth guard never engages more than one level.
+TEST(iouring_send, pipelined_burst_sync_completion_accounts_once_and_serves_next_request) {
+    ScopedTlsRawSendLoop guard;
+    REQUIRE(guard.init(/*capacity=*/2));
+    IoUringEventLoop& loop = *guard.loop;
+    ScopedTlsRawSendPool pool_guard;
+    REQUIRE(pool_guard.init(loop, /*capacity=*/2));
+    IoUringBackend& backend = loop.backend;
+    backend.nop_inject_result = true;
+
+    ShardMetrics metrics{};
+    metrics.init();
+    loop.metrics = &metrics;
+
+    const i32 listener = socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0);
+    REQUIRE_GE(listener, 0);
+    sockaddr_in addr{};
+    addr.sin_family = AF_INET;
+    addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    REQUIRE_EQ(bind(listener, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)), 0);
+    REQUIRE_EQ(listen(listener, 1), 0);
+    socklen_t addr_len = sizeof(addr);
+    REQUIRE_EQ(getsockname(listener, reinterpret_cast<sockaddr*>(&addr), &addr_len), 0);
+    const i32 client = socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0);
+    REQUIRE_GE(client, 0);
+    REQUIRE_EQ(connect(client, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)), 0);
+    const i32 server = accept4(listener, nullptr, nullptr, SOCK_NONBLOCK | SOCK_CLOEXEC);
+    REQUIRE_GE(server, 0);
+
+    constexpr u32 kBodyLen = 64u << 10;  // > RouteConfig::kResponseBodyPoolBytes (8 KiB)
+    const i32 file = memfd_create("pipelined-sync-sendfile-body", MFD_CLOEXEC);
+    REQUIRE_GE(file, 0);
+    std::vector<u8> body_bytes(kBodyLen);
+    for (u32 i = 0; i < kBodyLen; ++i) body_bytes[i] = static_cast<u8>(i * 7 + 1);
+    REQUIRE_EQ(write(file, body_bytes.data(), kBodyLen), static_cast<ssize_t>(kBodyLen));
+
+    RouteConfig config{};
+    REQUIRE_EQ(
+        config.add_response_body_view(reinterpret_cast<const char*>(body_bytes.data()), kBodyLen),
+        1u);
+    // Simulates the loader's sealed-memfd attachment (serve_loader.cc) without
+    // requiring a full config load: file_ref is fd + 1 (0 = none).
+    config.response_bodies[0].file_ref = static_cast<u32>(file) + 1;
+    g_pipelined_sync_sendfile_handler_calls = 0;
+    REQUIRE(config.add_jit_handler("/big", kRouteMethodGet, &pipelined_sync_sendfile_handler));
+    REQUIRE(config.add_static("/next", kRouteMethodGet, 204));
+    const RouteConfig* active = &config;
+    loop.config_ptr = &active;
+
+    Connection* conn = loop.alloc_conn();
+    REQUIRE(conn != nullptr);
+    conn->fd = server;
+
+    static constexpr char kBurst[] =
+        "GET /big HTTP/1.1\r\nHost: x\r\n\r\n"
+        "GET /next HTTP/1.1\r\nHost: x\r\n\r\n";
+    constexpr u32 kBurstLen = sizeof(kBurst) - 1;
+    REQUIRE_EQ(conn->recv_buf.write(reinterpret_cast<const u8*>(kBurst), kBurstLen), kBurstLen);
+    conn->recv_armed = true;
+    conn->pending_ops = 1;
+
+    guard.sq_head = guard.sq_tail;
+    backend.pending = 0;
+    const u32 sq_before_header1 = guard.sq_tail;
+
+    on_header_received<IoUringEventLoop>(
+        &loop, *conn, {conn->id, static_cast<i32>(kBurstLen), 0, 0, IoEventType::Recv, 1});
+
+    REQUIRE_GE(conn->fd, 0);
+    REQUIRE_EQ(g_pipelined_sync_sendfile_handler_calls, 1u);
+    REQUIRE(conn->send_armed);
+    REQUIRE_EQ(conn->local_body_file_fd, file);
+    REQUIRE_GT(conn->local_body_remaining, 0u);
+    // Exactly one SQE so far: request 1's header send. The body chunk isn't
+    // touched until that header send "completes".
+    CHECK_EQ(guard.sq_tail, sq_before_header1 + 1u);
+
+    // Drive the header send's completion by hand, clearing send_armed and
+    // pending_ops the way the real CQE-harvesting dispatch() does before
+    // calling conn.on_send (see IoUringEventLoop::dispatch), rather than
+    // actually waiting on the mocked ring for it.
+    conn->send_armed = false;
+    if (conn->pending_ops > 0) conn->pending_ops--;
+    const u32 kSendLen = conn->send_buf.len();
+    const u32 sq_before_sendfile = guard.sq_tail;
+
+    on_response_sent<IoUringEventLoop>(
+        &loop, *conn, {conn->id, static_cast<i32>(kSendLen), 0, 0, IoEventType::Send, 0});
+
+    // The body completed synchronously: zero SQEs for it. The only SQE
+    // queued past this point is request 2's header send — the pipeline
+    // advanced and served it from inside this same call.
+    CHECK_EQ(guard.sq_tail, sq_before_sendfile + 1u);
+    CHECK_EQ(backend.send_state[conn->id].file_fd, -1);
+    CHECK_EQ(metrics.requests_total, 1u);  // request 1 accounted exactly once
+    CHECK_EQ(conn->resp_status, 204u);     // request 2 was matched and answered
+    CHECK_GE(conn->fd, 0);
+    CHECK_EQ(loop.in_sync_send_completion.depth, 0u);
+    CHECK_EQ(loop.in_sync_send_completion.max_depth, 1u);
 
     close(file);
     close(server);

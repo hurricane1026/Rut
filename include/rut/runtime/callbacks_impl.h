@@ -2812,14 +2812,51 @@ void on_response_sent(void* lp, Connection& conn, IoEvent ev) {
         if constexpr (requires(Loop* l, Connection& c) { l->submit_send_file(c, 0, 0u, 0u); }) {
             // A plaintext body with a sealed memfd leaves by sendfile: the
             // socket takes page-cache pages instead of a copy of the bytes.
-            if (conn.local_body_file_fd >= 0 && !conn.tls_active && conn.local_body_base &&
-                loop->submit_send_file(
+            if (conn.local_body_file_fd >= 0 && !conn.tls_active && conn.local_body_base) {
+                const auto outcome = loop->submit_send_file(
                     conn,
                     conn.local_body_file_fd,
                     static_cast<u32>(conn.local_body_cursor - conn.local_body_base),
-                    n)) {
-                throttle_advance(conn, n);
-                return;
+                    n);
+                if (outcome == decltype(outcome)::Armed) {
+                    throttle_advance(conn, n);
+                    return;
+                }
+                if (outcome == decltype(outcome)::CompletedSync) {
+                    // Every byte is already on the wire and no SQE was
+                    // queued for it (see IoUringBackend::add_send_file) — a
+                    // keep-alive body that finished in one sendfile(2) call
+                    // needs no round trip through the ring to be accounted.
+                    // Drive it through the same dispatch_event() a real Send
+                    // CQE would have taken (conn.on_send is on_response_sent,
+                    // set by transition_to_sending above), with the byte
+                    // count we already know instead of one read back from a
+                    // CQE. submit_send_file left pending_ops/send_armed
+                    // untouched for this outcome, matching the fact that no
+                    // SQE — and so no completion — is outstanding.
+                    throttle_advance(conn, n);
+                    IoEvent synthetic{};
+                    synthetic.conn_id = conn.id;
+                    synthetic.type = IoEventType::Send;
+                    synthetic.result = static_cast<i32>(n);
+                    // Bound the recursion this synchronous dispatch can cause
+                    // (it may complete the whole response and pipeline_dispatch
+                    // the next pipelined request, whose handler can reach this
+                    // same branch again) to exactly one nested level: while
+                    // this flag is set, submit_send_file refuses to hand back
+                    // another CompletedSync outcome, so any sendfile completion
+                    // reached from inside this dispatch_event call arms an
+                    // ordinary SQE instead of recursing further.
+                    if constexpr (requires(Loop* l) { l->in_sync_send_completion = false; }) {
+                        loop->in_sync_send_completion = true;
+                        loop->dispatch_event(conn, synthetic);
+                        loop->in_sync_send_completion = false;
+                    } else {
+                        loop->dispatch_event(conn, synthetic);
+                    }
+                    return;
+                }
+                // Failed: fall through to the memory send below.
             }
         }
         if (!client_send(loop, conn, conn.local_body_cursor, n) && conn.fd >= 0)

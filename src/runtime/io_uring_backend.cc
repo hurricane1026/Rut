@@ -656,7 +656,8 @@ bool IoUringBackend::add_send_file(i32 fd,
                                    u32 len,
                                    u32 generation,
                                    bool shutdown_when_done,
-                                   bool* wrote_all) {
+                                   bool* wrote_all,
+                                   bool allow_sync_completion) {
     if (wrote_all) *wrote_all = false;
     if (conn_id >= connection_capacity || connection_capacity == 0 || fd < 0 || file_fd < 0 ||
         len == 0 || len > static_cast<u32>(INT32_MAX))
@@ -671,6 +672,17 @@ bool IoUringBackend::add_send_file(i32 fd,
     if (written == len) {
         if (shutdown_when_done) (void)::shutdown(fd, SHUT_WR);
         if (wrote_all) *wrote_all = true;
+        if (!shutdown_when_done && allow_sync_completion) {
+            // A keep-alive continuation that finished in this one call needs
+            // no completion round trip through the ring: every byte is
+            // already on the wire (n == len) and the caller can account the
+            // response synchronously — the caller decided this is safe to
+            // offer (not already inside another synchronous completion), so
+            // this no longer depends on nop_inject_result at all. The
+            // reserved SQE is left untouched — get_sqe() only peeked at the
+            // tail, so the next real submission reuses the same slot.
+            return true;
+        }
     }
     memset(sqe, 0, sizeof(*sqe));
     if (written == len && nop_inject_result) {
@@ -1635,11 +1647,21 @@ u32 IoUringBackend::wait(IoEvent* events, u32 max_events, Connection* conns, u32
                     continue;
                 }
             }
-            if (type == IoEventType::Send && ss.file_fd >= 0 && ss.remaining > 0) {
+            if (type == IoEventType::Send && ss.file_fd >= 0) {
                 // File-backed send: this CQE is POLLOUT readiness (a mask) or
-                // a poll error, never a byte count.
+                // a poll error, never a byte count. ss.remaining can already
+                // be 0 here — add_send_file's sendfile(2) call wrote the
+                // whole length synchronously (a closing chunk, or a
+                // keep-alive one with a synchronous completion the caller
+                // declined) and still queued this POLL_ADD (e.g. no
+                // IORING_NOP_INJECT_RESULT to complete a closing chunk
+                // through instead). This CQE is then just cleanup for an SQE
+                // that was never really waiting on more bytes: own it here
+                // rather than falling through to the generic byte-count path
+                // below, which would misreport the poll mask as the send
+                // result.
                 i32 result = cqe->res < 0 ? cqe->res : 0;
-                if (result == 0) {
+                if (result == 0 && ss.remaining > 0) {
                     off_t pos = static_cast<off_t>(ss.file_base) + ss.offset;
                     const ssize_t n = ::sendfile(ss.fd, ss.file_fd, &pos, ss.remaining);
                     if (n > 0) {

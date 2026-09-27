@@ -224,6 +224,16 @@ struct IoUringBackend {
     // shutdown_when_done ends the write side as soon as the last byte is out
     // (a closing connection's final chunk: the FIN follows the data at once,
     // as nginx does); *wrote_all reports that sendfile took everything now.
+    // When it did, shutdown_when_done is false (a keep-alive body that
+    // finished in this one call), and the caller allows it
+    // (allow_sync_completion — see IoUringEventLoop::submit_send_file, which
+    // is the only decider: this is never inferred from nop_inject_result or
+    // any other backend state), no SQE is queued at all — there is nothing to
+    // complete through the ring, and the caller must account the send
+    // synchronously. Otherwise (shutdown_when_done, or allow_sync_completion
+    // is false because the caller is already inside a synchronous
+    // completion) this always queues an SQE: an injected NOP when
+    // nop_inject_result, otherwise the existing POLL_ADD path.
     bool add_send_file(i32 fd,
                        u32 conn_id,
                        i32 file_fd,
@@ -231,7 +241,8 @@ struct IoUringBackend {
                        u32 len,
                        u32 generation = 0,
                        bool shutdown_when_done = false,
-                       bool* wrote_all = nullptr);
+                       bool* wrote_all = nullptr,
+                       bool allow_sync_completion = true);
 
     // Submit the currently staged SQ entries without waiting for a completion.
     // This is a bounded pressure-relief primitive: callers decide whether to
