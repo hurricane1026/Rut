@@ -38,6 +38,7 @@
 
 #include <errno.h>
 #include <fcntl.h>
+#include <netinet/tcp.h>
 #include <openssl/err.h>
 #include <openssl/ssl.h>
 #include <poll.h>
@@ -8708,10 +8709,11 @@ struct ReuseUpstream {
             (void)recv_timeout(client, req, sizeof(req), 1000);
             // Plain persistent HTTP/1.1 response: nothing here tells the downstream
             // client to close. The origin then closes this idle connection itself
-            // (legal for any HTTP/1.1 server) and publishes closed_count; the test
-            // client waits for that before its next request, so the gateway's pooled
-            // copy is already dead (take_idle's MSG_PEEK sees EOF) and every request
-            // still makes a fresh upstream connect, with no send/close race.
+            // (legal for any HTTP/1.1 server), and publishes closed_count only once
+            // the gateway's kernel has ACKed that FIN. The test client waits for it
+            // before its next request, so the gateway's pooled copy is already at
+            // EOF when take_idle's MSG_PEEK probes it and every request still makes
+            // a fresh upstream connect, with no send/close race.
             s->accept_count.fetch_add(1, std::memory_order_acq_rel);
             char hdr[128];
             const int hn = snprintf(
@@ -8726,8 +8728,29 @@ struct ReuseUpstream {
                 ok = send_all(client, reinterpret_cast<char*>(chunk), n);
                 sent += n;
             }
+            // Peer-visible close: send the FIN, then wait until our socket leaves
+            // FIN_WAIT1. That transition happens only when the peer ACKs the FIN,
+            // i.e. after the gateway's kernel has processed it and its socket reads
+            // EOF. A close() alone returns before a loaded host delivers the FIN.
+            bool fin_acked = false;
+            if (ok && shutdown(client, SHUT_WR) == 0) {
+#ifdef __linux__
+                for (u32 waited = 0; waited < 5000 && !fin_acked; waited++) {
+                    struct tcp_info info{};
+                    socklen_t info_len = sizeof(info);
+                    if (getsockopt(client, IPPROTO_TCP, TCP_INFO, &info, &info_len) != 0) break;
+                    fin_acked =
+                        info.tcpi_state != TCP_ESTABLISHED && info.tcpi_state != TCP_FIN_WAIT1;
+                    if (!fin_acked) usleep(1000);
+                }
+#else
+                fin_acked = true;  // io_uring-only fixture; never reached off Linux
+#endif
+            }
             close(client);  // fresh upstream connect per proxied request
-            s->closed_count.fetch_add(1, std::memory_order_acq_rel);
+            // Unacknowledged close: withhold the signal so the client times out and
+            // the test fails visibly instead of racing the pooled socket.
+            if (fin_acked) s->closed_count.fetch_add(1, std::memory_order_acq_rel);
         }
         return nullptr;
     }
