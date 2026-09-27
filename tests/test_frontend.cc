@@ -34717,6 +34717,8 @@ route GET "/" {
     REQUIRE(ast);
     stmt = ast->items[1].route.statements[0];
     REQUIRE(stmt != nullptr);
+    // 3 is out of range: ForwardResponseBufferingMode now has None/
+    // CompleteContentLength/Bounded (0..2) — see failure_policy.h.
     stmt->forward_response_buffering = static_cast<ForwardResponseBufferingMode>(3);
     rejected_hir = analyze_file_heap(ast.value());
     REQUIRE_FALSE(rejected_hir.has_value());
@@ -34778,6 +34780,8 @@ route GET "/" {
     }
     mir->functions[0].blocks[0].term.forward_request_policy_id =
         static_cast<u16>(RequestPolicyId::Http11FixedStrip);
+    // 3 is out of range: ForwardResponseBufferingMode now has None/
+    // CompleteContentLength/Bounded (0..2) — see failure_policy.h.
     mir->functions[0].blocks[0].term.forward_response_buffering =
         static_cast<ForwardResponseBufferingMode>(3);
     FrontendRirModule rejected{};

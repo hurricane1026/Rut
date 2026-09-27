@@ -2338,6 +2338,89 @@ TEST(response_buffering, unsupported_loop_rejects_before_handler_or_forward_effe
     CHECK_EQ(__builtin_memcmp(loop.recv_storage[conn_id], kRequest, sizeof(kRequest) - 1), 0);
 }
 
+// Bounded is step 1's pure aliasing of CompleteContentLength: every runtime
+// site that used to compare directly against
+// ForwardResponseBufferingMode::CompleteContentLength now calls
+// forward_response_buffering_uses_content_length_machinery(), which is true
+// for both. This proves that aliasing is exact — not just "close enough" —
+// across the exhaustive input domain of one representative predicate
+// (response_read_deadline_fixed_upload_method_admitted) plus every other
+// (buffering, profile)-shaped predicate reachable without a live RouteConfig
+// bundle (Bounded bundle admission is the frontend agent's compiler-side
+// change; see the runtime-side README note in this PR), and directly on the
+// two helper functions themselves.
+TEST(response_buffering, bounded_aliases_complete_content_length_exactly) {
+    CHECK(forward_response_buffering_mode_valid(ForwardResponseBufferingMode::Bounded));
+    CHECK_FALSE(forward_response_buffering_uses_content_length_machinery(
+        ForwardResponseBufferingMode::None));
+    CHECK(forward_response_buffering_uses_content_length_machinery(
+        ForwardResponseBufferingMode::CompleteContentLength));
+    CHECK(forward_response_buffering_uses_content_length_machinery(
+        ForwardResponseBufferingMode::Bounded));
+
+    // Exhaustive over every LogHttpMethod value: Bounded and CompleteContentLength
+    // must select the identical admission outcome.
+    for (u32 m = 0; m <= static_cast<u32>(LogHttpMethod::Other); m++) {
+        const u8 method = static_cast<u8>(m);
+        CHECK_EQ(response_read_deadline_fixed_upload_method_admitted(
+                     method, ForwardResponseBufferingMode::CompleteContentLength),
+                 response_read_deadline_fixed_upload_method_admitted(
+                     method, ForwardResponseBufferingMode::Bounded));
+    }
+    // None is a genuinely different outcome for Delete/Options (the one
+    // method class this predicate actually distinguishes by buffering mode),
+    // proving the exhaustive loop above is not vacuously true.
+    CHECK_FALSE(response_read_deadline_fixed_upload_method_admitted(
+        static_cast<u8>(LogHttpMethod::Delete), ForwardResponseBufferingMode::None));
+    CHECK(response_read_deadline_fixed_upload_method_admitted(
+        static_cast<u8>(LogHttpMethod::Delete),
+        ForwardResponseBufferingMode::CompleteContentLength));
+    CHECK(response_read_deadline_fixed_upload_method_admitted(
+        static_cast<u8>(LogHttpMethod::Delete), ForwardResponseBufferingMode::Bounded));
+
+    // http1_pipeline_successor_semantic_shape_is_stable: another pure
+    // (profile, buffering, method, route_method)-shaped predicate exercised
+    // directly, again proving identical acceptance for both modes across a
+    // small representative grid (it also needs a live Connection, so this
+    // covers ==/!= comparisons against the connection-independent fields).
+    for (const auto profile : {ResponseReadDeadlineProfile::None,
+                               ResponseReadDeadlineProfile::HeaderOnlyHead,
+                               ResponseReadDeadlineProfile::BodylessNonHeadContentLengthZero}) {
+        for (const u8 method : {static_cast<u8>(LogHttpMethod::Get),
+                                static_cast<u8>(LogHttpMethod::Head),
+                                static_cast<u8>(LogHttpMethod::Post)}) {
+            for (const u8 route_method : {kRouteMethodGet, static_cast<u8>(kRouteMethodGet + 1)}) {
+                SmallLoop loop;
+                loop.setup();
+                auto* conn = loop.alloc_conn();
+                REQUIRE(conn != nullptr);
+                conn->protocol = ConnProtocol::Http11;
+                conn->tls_active = false;
+                conn->h2 = nullptr;
+                conn->req_http_version = static_cast<u8>(HttpVersion::Http11);
+                conn->req_strict_h1_complete = true;
+                const ResponseReadDeadlineUploadProof proof{};
+                const bool complete = http1_pipeline_successor_semantic_shape_is_stable(
+                    *conn,
+                    proof,
+                    profile,
+                    ForwardResponseBufferingMode::CompleteContentLength,
+                    method,
+                    route_method);
+                const bool bounded = http1_pipeline_successor_semantic_shape_is_stable(
+                    *conn,
+                    proof,
+                    profile,
+                    ForwardResponseBufferingMode::Bounded,
+                    method,
+                    route_method);
+                CHECK_EQ(complete, bounded);
+                loop.free_conn(*conn);
+            }
+        }
+    }
+}
+
 TEST(response_read_timeout, route_preflight_marker_fails_closed_for_every_nonzero_shape) {
     RouteConfig duration{};
     REQUIRE_EQ(duration.add_policy_bundle(0, 0, 0, 5), 1u);

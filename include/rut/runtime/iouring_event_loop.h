@@ -821,7 +821,7 @@ private:
             c.http1_prebuilt_deadline_route_method == kRouteMethodGet &&
             bodyless_get_complete_content_length_request_policy_is_admitted(c.request_policy_id);
         if (!response_read_timeout_seconds_valid(bundle.response_read_timeout_seconds) ||
-            (bundle.response_buffering == ForwardResponseBufferingMode::CompleteContentLength &&
+            (forward_response_buffering_uses_content_length_machinery(bundle.response_buffering) &&
              (!complete_content_length_request_policy_is_admitted(c.request_policy_id) &&
                   !bodyless_get_retained_policy ||
               !complete_content_length_route_method_is_admitted(
@@ -1136,8 +1136,8 @@ private:
                    c.upstream_attempts == 1 &&
                    c.http1_prebuilt_deadline_profile ==
                        ResponseReadDeadlineProfile::BodylessNonHeadContentLengthZero &&
-                   bundle.response_buffering ==
-                       ForwardResponseBufferingMode::CompleteContentLength &&
+                   forward_response_buffering_uses_content_length_machinery(
+                       bundle.response_buffering) &&
                    c.http1_prebuilt_deadline_method == static_cast<u8>(LogHttpMethod::Get) &&
                    c.http1_prebuilt_deadline_route_method == kRouteMethodGet &&
                    (c.upstream_retirement_target_owned & static_cast<u8>(~kUpstreamOpRecv)) == 0 &&
@@ -1477,8 +1477,8 @@ public:
             c.upstream_fd,
             c.id,
             c.upstream_episode,
-            c.response_read_deadline_buffering ==
-                ForwardResponseBufferingMode::CompleteContentLength);
+            forward_response_buffering_uses_content_length_machinery(
+                c.response_read_deadline_buffering));
     }
 
     // Part B (path 3): once a CompleteContentLength body has proven large —
@@ -1608,7 +1608,8 @@ public:
                        c.http1_boundary_successor_episode == 0);
         return phase_state && c.pipeline_depth == 0 && c.http1_pipeline_request_generation == 0 &&
                c.pipeline_stash_len == 0 &&
-               bundle.response_buffering == ForwardResponseBufferingMode::CompleteContentLength &&
+               forward_response_buffering_uses_content_length_machinery(
+                   bundle.response_buffering) &&
                bodyless_get_complete_content_length_request_policy_is_admitted(
                    c.request_policy_id) &&
                c.http1_prebuilt_deadline_upload.request_policy_id == c.request_policy_id &&
@@ -1983,8 +1984,8 @@ public:
             c.response_read_deadline_post_commit_generation == 0 ||
             c.response_read_deadline_post_commit_generation !=
                 c.response_read_deadline_generation ||
-            c.response_read_deadline_buffering !=
-                ForwardResponseBufferingMode::CompleteContentLength ||
+            !forward_response_buffering_uses_content_length_machinery(
+                c.response_read_deadline_buffering) ||
             c.response_read_deadline_send_owner_generation == 0 ||
             c.response_read_deadline_send_deadline_generation !=
                 c.response_read_deadline_post_commit_generation ||
@@ -3131,8 +3132,8 @@ public:
             generation = c.response_read_deadline_send_owner_generation;
             c.response_read_deadline_send_deadline_generation = c.response_read_deadline_generation;
             c.response_read_deadline_send_upstream_episode =
-                c.response_read_deadline_buffering ==
-                        ForwardResponseBufferingMode::CompleteContentLength
+                forward_response_buffering_uses_content_length_machinery(
+                    c.response_read_deadline_buffering)
                     ? c.response_read_deadline_post_commit_episode
                     : c.upstream_episode;
             c.response_read_deadline_send_src = buf;
@@ -3668,8 +3669,8 @@ public:
         if (streaming_response_read_timer_is_stable(c)) return true;
         if (c.response_read_deadline_profile ==
                 ResponseReadDeadlineProfile::BodylessNonHeadContentLengthZero &&
-            c.response_read_deadline_buffering ==
-                ForwardResponseBufferingMode::CompleteContentLength &&
+            forward_response_buffering_uses_content_length_machinery(
+                c.response_read_deadline_buffering) &&
             c.req_method == static_cast<u8>(LogHttpMethod::Get)) {
             if (c.response_read_deadline_post_commit_phase !=
                 ResponseReadDeadlinePostCommitPhase::None)
@@ -4150,8 +4151,8 @@ public:
             auto& owner = response_read_batch_owners[oi];
             const Connection& c = conns[owner.conn_id];
             if (!owner.post_commit_at_start && owner.clean_eof && owner.saw_positive &&
-                c.response_read_deadline_buffering ==
-                    ForwardResponseBufferingMode::CompleteContentLength)
+                forward_response_buffering_uses_content_length_machinery(
+                    c.response_read_deadline_buffering))
                 owner.last_relevant = owner.last_positive;
         }
 
@@ -4412,8 +4413,8 @@ public:
         if (c.response_read_deadline_state != ResponseReadDeadlineState::BatchPending ||
             c.response_read_deadline_post_commit_phase !=
                 ResponseReadDeadlinePostCommitPhase::None ||
-            c.response_read_deadline_buffering !=
-                ForwardResponseBufferingMode::CompleteContentLength ||
+            !forward_response_buffering_uses_content_length_machinery(
+                c.response_read_deadline_buffering) ||
             !response_read_deadline_identity_is_stable(c) ||
             (c.response_read_deadline_profile !=
                  ResponseReadDeadlineProfile::BodylessNonHeadContentLengthZero &&
@@ -4658,8 +4659,8 @@ public:
         Connection& c,
         CompleteContentLengthTerminalDisposition disposition,
         const ResponseReadBatchOwner* terminal_owner = nullptr) {
-        if (c.response_read_deadline_buffering !=
-                ForwardResponseBufferingMode::CompleteContentLength ||
+        if (!forward_response_buffering_uses_content_length_machinery(
+                c.response_read_deadline_buffering) ||
             c.response_read_deadline_post_commit_phase !=
                 ResponseReadDeadlinePostCommitPhase::Buffering ||
             (c.response_read_deadline_state != ResponseReadDeadlineState::BatchPending &&
@@ -4851,8 +4852,8 @@ public:
             c.upstream_recv_pause_cancel_pending || c.upstream_recv_cancel_inflight)
             return false;
         const bool already_retired_buffered_origin =
-            c.response_read_deadline_buffering ==
-                ForwardResponseBufferingMode::CompleteContentLength &&
+            forward_response_buffering_uses_content_length_machinery(
+                c.response_read_deadline_buffering) &&
             c.response_read_deadline_post_commit_episode == c.upstream_retiring_episode &&
             c.upstream_fd < 0 && c.upstream_abandoned;
         if (!c.upstream_retirement_active && !already_retired_buffered_origin) {
@@ -4988,8 +4989,8 @@ public:
                     ResponseReadDeadlinePostCommitPhase::Buffering &&
                 c.response_read_deadline_profile ==
                     ResponseReadDeadlineProfile::BodylessNonHeadContentLengthZero &&
-                c.response_read_deadline_buffering ==
-                    ForwardResponseBufferingMode::CompleteContentLength &&
+                forward_response_buffering_uses_content_length_machinery(
+                    c.response_read_deadline_buffering) &&
                 c.response_read_deadline_method == static_cast<u8>(LogHttpMethod::Get) &&
                 (owner.saw_precise_timer ||
                  c.response_read_timer_phase == ResponseReadTimerPhase::Armed);
@@ -5454,8 +5455,8 @@ public:
                 continue;
             if (c.response_read_deadline_post_commit_phase ==
                     ResponseReadDeadlinePostCommitPhase::Buffering &&
-                c.response_read_deadline_buffering ==
-                    ForwardResponseBufferingMode::CompleteContentLength) {
+                forward_response_buffering_uses_content_length_machinery(
+                    c.response_read_deadline_buffering)) {
                 if (!start_complete_content_length_send(
                         c, CompleteContentLengthTerminalDisposition::InactivityExpiry))
                     close_conn(c);

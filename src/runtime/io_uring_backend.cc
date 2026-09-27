@@ -1484,8 +1484,8 @@ u32 IoUringBackend::wait(IoEvent* events, u32 max_events, Connection* conns, u32
                 auto& conn = conns[conn_id];
                 const bool buffered_overflow =
                     deadline_owner && response_pool != nullptr &&
-                    conn.response_read_deadline_buffering ==
-                        ForwardResponseBufferingMode::CompleteContentLength &&
+                    forward_response_buffering_uses_content_length_machinery(
+                        conn.response_read_deadline_buffering) &&
                     (conn.response_body_tail.size != 0 || nbytes > avail);
                 bool deadline_copy_eligible =
                     type == IoEventType::UpstreamRecv && deadline_owner &&
@@ -1740,8 +1740,8 @@ u32 IoUringBackend::wait(IoEvent* events, u32 max_events, Connection* conns, u32
         // buffer copy failures already took the branch above and never retry.
         if (type == IoEventType::UpstreamRecv && cqe->res == -ENOBUFS &&
             (cqe->flags & IORING_CQE_F_MORE) == 0 && conns != nullptr && conn_id < max_conns &&
-            conns[conn_id].response_read_deadline_buffering ==
-                ForwardResponseBufferingMode::CompleteContentLength &&
+            forward_response_buffering_uses_content_length_machinery(
+                conns[conn_id].response_read_deadline_buffering) &&
             response_deadline_copy_owner(conns[conn_id], upstream_episode, aux) &&
             add_first_response_recv(conns[conn_id].upstream_fd,
                                     conn_id,
