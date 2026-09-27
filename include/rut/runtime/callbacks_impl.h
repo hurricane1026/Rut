@@ -5940,14 +5940,20 @@ inline bool apply_preserve_host_lowercase_request_policy(Connection& conn, u16 p
     if (line_end + 1 >= end || path_ptr < data || path_ptr + req.path.len > line_end) return false;
     const u8* header_end = end - 2;
 
-    // Pass 1: locate the single client Host header and gather every header
-    // name nominated by a Connection header's comma-separated token list.
-    struct NominatedName {
-        const u8* ptr;
-        u32 len;
-    };
-    NominatedName nominated[kMaxHeaders];
-    u32 nominated_count = 0;
+    // Pass 1: locate the single client Host header and fail closed on any
+    // Connection-nominated protected name. `kMaxHeaders` bounds the number
+    // of physical header *fields* this parser stores, not the number of
+    // comma-separated *tokens* one Connection field's value can carry -- a
+    // syntactically valid request can nominate far more than 64 names in a
+    // single field, so nominations are validated token-by-token as they are
+    // scanned here rather than collected into a fixed-size array (Codex
+    // sweep-1 review, PR #696: the previous `NominatedName nominated[
+    // kMaxHeaders]` array made a 65th nonempty token -- even a harmless,
+    // repeated one -- fail the whole request closed with no protected name
+    // involved at all). Membership queries for a specific name (`
+    // name_nominated` below) instead rescan the request's Connection
+    // field(s) directly, bounding total work by the request's own header
+    // bytes rather than a fixed token count.
     u32 host_count = 0;
     u32 xfp_count = 0;
     const u8* host_value_start = nullptr;
@@ -5996,6 +6002,15 @@ inline bool apply_preserve_host_lowercase_request_policy(Connection& conn, u16 p
                 if (request_policy_comma_value_has_token(value_start, value_end, "trailers", 8))
                     any_te_trailers = true;
             } else if (request_policy_name_eq(hs, name_len, "connection", 10)) {
+                // Fail closed on a protected nomination as each token is
+                // scanned (see `request_policy_connection_nomination_is_
+                // protected` for the fixed set and why each name in it must
+                // refuse the whole request rather than merely be dropped).
+                // Every other token needs no further action here: it is
+                // either handled by its own dedicated logic elsewhere in
+                // this function (a `te`/`upgrade` nomination) or simply
+                // dropped along with its own field below via
+                // `name_nominated`'s rescan.
                 const u8* tok = value_start;
                 while (tok <= value_end) {
                     const u8* tok_end = tok;
@@ -6004,12 +6019,9 @@ inline bool apply_preserve_host_lowercase_request_policy(Connection& conn, u16 p
                     const u8* t1 = tok_end;
                     while (t0 < t1 && (*t0 == ' ' || *t0 == '\t')) t0++;
                     while (t1 > t0 && (t1[-1] == ' ' || t1[-1] == '\t')) t1--;
-                    if (t1 > t0) {
-                        if (nominated_count >= kMaxHeaders) return false;
-                        nominated[nominated_count].ptr = t0;
-                        nominated[nominated_count].len = static_cast<u32>(t1 - t0);
-                        nominated_count++;
-                    }
+                    if (t1 > t0 && request_policy_connection_nomination_is_protected(
+                                       t0, static_cast<u32>(t1 - t0)))
+                        return false;
                     if (tok_end >= value_end) break;
                     tok = tok_end + 1;
                 }
@@ -6030,8 +6042,9 @@ inline bool apply_preserve_host_lowercase_request_policy(Connection& conn, u16 p
     // first-or-last-duplicate scheme than an Envoy-parity client intended.
     if (xfp_count > 1) return false;
 
-    // Fail closed for every Connection nomination this profile cannot safely
-    // honor by simply omitting the header:
+    // Pass 1 above already failed the whole request closed for every
+    // Connection nomination this profile cannot safely honor by simply
+    // omitting the header:
     //  - content-length also drives how many body bytes this function copies
     //    onto the wire; if the header line were dropped while the (already
     //    validated, already-buffered) body bytes were still forwarded, the
@@ -6062,19 +6075,37 @@ inline bool apply_preserve_host_lowercase_request_policy(Connection& conn, u16 p
     //    value, which Rut's parser accepts same as any other token -- so it
     //    must fail closed here too rather than being silently ignored
     //    because it never matches a real forwarded header name.
-    // Refuse the whole rewrite instead of ever emitting one of these shapes.
-    for (u32 i = 0; i < nominated_count; i++) {
-        if (request_policy_connection_nomination_is_protected(nominated[i].ptr, nominated[i].len))
-            return false;
-    }
 
+    // Whether `name` is nominated by any client Connection field's
+    // comma-separated token list. Rescans the request's raw header bytes
+    // directly, bounded by the request's own header-block size, rather than
+    // consulting a fixed-size token array collected up front (Codex sweep-1
+    // review, PR #696): a syntactically valid request can nominate far more
+    // names than `kMaxHeaders` in a single Connection field, and Pass 1
+    // above already rejected every protected name as it scanned, so this
+    // only ever needs to answer "is this one, arbitrary, already-admitted
+    // name among them" for the header currently being emitted below.
     auto name_nominated = [&](const u8* name, u32 name_len) {
-        for (u32 i = 0; i < nominated_count; i++) {
-            if (request_policy_name_eq(name,
-                                       name_len,
-                                       reinterpret_cast<const char*>(nominated[i].ptr),
-                                       nominated[i].len))
-                return true;
+        const u8* hs2 = line_end + 2;
+        while (hs2 < header_end) {
+            const u8* le2 = hs2;
+            while (le2 + 1 < end && !(le2[0] == '\r' && le2[1] == '\n')) le2++;
+            const u8* colon2 = hs2;
+            while (colon2 < le2 && *colon2 != ':') colon2++;
+            const u32 hname_len = static_cast<u32>(colon2 - hs2);
+            if (request_policy_name_eq(hs2, hname_len, "connection", 10)) {
+                const u8* value_start2 = colon2 + 1;
+                const u8* value_end2 = le2;
+                while (value_start2 < value_end2 && (*value_start2 == ' ' || *value_start2 == '\t'))
+                    value_start2++;
+                while (value_end2 > value_start2 &&
+                       (value_end2[-1] == ' ' || value_end2[-1] == '\t'))
+                    value_end2--;
+                if (request_policy_comma_value_has_token(
+                        value_start2, value_end2, reinterpret_cast<const char*>(name), name_len))
+                    return true;
+            }
+            hs2 = le2 + 2;
         }
         return false;
     };

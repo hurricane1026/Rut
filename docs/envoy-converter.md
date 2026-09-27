@@ -1163,15 +1163,23 @@ Two more round-4-review findings belong in this same bucket, not as
 `RutCapabilities` gates:
 
 - A request target with a `#` fragment (e.g. `GET /admin#frag HTTP/1.1`) is a
-  genuine Rut runtime bug, not a converter gap: Envoy rejects it (no HCM
-  surface here to enable `strip_fragment_from_path`, and the universal header
-  validator rejects `#` in `:path` by default), but Rut's
-  `apply_request_policy` (`include/rut/runtime/callbacks_impl.h`) forwards
-  `req.path` — which still carries the fragment — to the upstream unchanged,
-  never consulting `HttpParser`'s `target_has_fragment`. Verified live (see
-  docs/envoy-compatibility.md). This needs a runtime fix in
-  `apply_request_policy`, not a converter change — the milestone route's
-  method/path shape has no way to exclude it.
+  genuine Rut runtime bug, not a converter gap, for the `host: "upstream"`
+  policies (ID1/ID2/ID3): Envoy rejects it (no HCM surface here to enable
+  `strip_fragment_from_path`, and the universal header validator rejects `#`
+  in `:path` by default), but Rut's `apply_request_policy`
+  (`include/rut/runtime/callbacks_impl.h`) forwards `req.path` — which still
+  carries the fragment — to the upstream unchanged for those policies, never
+  consulting `HttpParser`'s `target_has_fragment`. This is already fixed for
+  `host: "preserve"` (ID4 `Http11PreserveHostLowercase`) — the policy
+  `put_forward_route` now emits unconditionally once every capability gate
+  clears (`request_envoy_h1`, PR3): `apply_preserve_host_lowercase_request_
+  policy` checks `req.target_has_fragment` immediately after parsing and
+  fails the whole request closed (`400`, no upstream contact) rather than
+  forwarding the raw fragment-bearing path. So this is not an outstanding
+  milestone dependency for the route this converter actually emits today;
+  the ID1-ID3 mis-forward remains a live runtime bug, tracked separately,
+  for any future policy that still writes the upstream Host. Verified live
+  and unit-tested (see docs/envoy-compatibility.md).
 - `rut --metrics` reserves `GET /metrics` ahead of route matching on every
   loaded program (`src/main.cc`, `include/rut/runtime/callbacks_impl.h`),
   which would shadow this milestone's converted catch-all route for that one
