@@ -1176,7 +1176,10 @@ TEST(envoy_parser, route_match_accepts_prefix_and_path_forms) {
 // full, untruncated request and would see it as unequal. `parse_route_match`
 // (src/envoy/parser.cc) now bounds the admitted node/path length at 62
 // bytes -- one below the dangerous 63 -- to rule the ambiguity out
-// entirely. Tests the exact boundary on both sides for both match kinds.
+// entirely. Tests the exact boundary on both sides for both match kinds, and
+// (Codex sweep-9 review) the outer, Envoy-spec-driven `kMaxRouteMatchLen`
+// (64 bytes) ceiling too, to confirm it stays live and reachable now that
+// the tighter dispatch-safety bound admits less than it does.
 TEST(envoy_parser, route_match_rejects_dispatch_unsafe_length) {
     // Prefix: the admitted length is on the RAW declared text (which
     // includes the trailing slash `prefix_shape_ok` requires), one byte
@@ -1232,6 +1235,32 @@ TEST(envoy_parser, route_match_rejects_dispatch_unsafe_length) {
                         "\"match\": {\"prefix\": \"/\"}",
                         "\"match\": {\"path\": \"" + path + "\"}"));
         expect_reject(b.render(), FrontendError::UnsupportedSyntax, "dispatchable node length");
+    }
+    // The outer, Envoy-spec-driven `kMaxRouteMatchLen` (64 bytes) ceiling is
+    // now stricter than the dispatch-safety bound for both kinds (62), so a
+    // value over 64 bytes still hits its own, distinct "exceeds 64 bytes"
+    // diagnostic rather than "dispatchable node length" -- confirming that
+    // check remains live and reachable, not shadowed into dead code by the
+    // tighter bound added above.
+    {
+        // Raw prefix length 65 (over `kMaxRouteMatchLen`): rejected by the
+        // outer ceiling, checked before the shape/dispatch-safety checks.
+        Bootstrap b;
+        const std::string prefix = "/" + std::string(63u, 'a') + "/";
+        REQUIRE_EQ(prefix.size(), 65u);
+        REQUIRE(replace(&b.listeners, "\"prefix\": \"/\"", "\"prefix\": \"" + prefix + "\""));
+        expect_reject(b.render(), FrontendError::UnsupportedSyntax, "exceeds 64 bytes");
+    }
+    {
+        // Path length 65 (over `kMaxRouteMatchLen`): same outer-ceiling
+        // rejection.
+        Bootstrap b;
+        const std::string path = "/" + std::string(64u, 'a');
+        REQUIRE_EQ(path.size(), 65u);
+        REQUIRE(replace(&b.listeners,
+                        "\"match\": {\"prefix\": \"/\"}",
+                        "\"match\": {\"path\": \"" + path + "\"}"));
+        expect_reject(b.render(), FrontendError::UnsupportedSyntax, "exceeds 64 bytes");
     }
 }
 

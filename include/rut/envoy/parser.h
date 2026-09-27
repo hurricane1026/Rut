@@ -47,11 +47,27 @@ enum class RouteMatchKind : u8 {
     Path,
 };
 
-// Exactly one of `prefix` / `path` is set, selected by `kind`. Both are
-// bounded to printable ASCII (0x21-0x7e) excluding `?`, `#` and `%`, and to
-// 64 bytes. `prefix` must be exactly "/" or start and end with "/"; a raw
-// prefix like "/api" has no segment-equivalent RUT meaning and is rejected.
-// `path` must start with "/".
+// Exactly one of `prefix` / `path` is set, selected by `kind`. Both admit
+// only printable ASCII (0x21-0x7e) excluding `?`, `#` and `%`
+// (`kMaxRouteMatchLen` = 64 bytes is Envoy's own outer ceiling for this
+// charset, `src/envoy/parser.cc`), but the *effective* length limit is
+// tighter and differs per kind, driven by dispatch safety
+// (`kMaxDispatchableMatchLen` = 62, `src/envoy/parser.cc`; see its doc
+// comment for the full derivation from `ConnectionBase::req_path`'s 63
+// usable bytes, `include/rut/runtime/connection_base.h`):
+//   - `path` (an exact match): admits at most 62 bytes; 63 or 64 bytes pass
+//     the charset/outer-ceiling check but are rejected for dispatch safety.
+//   - `prefix`: either exactly "/" (always admitted, length 1), or starts
+//     and ends with "/" and admits at most 63 raw bytes -- the trailing
+//     slash is stripped to produce the RUT node text
+//     (`strip_trailing_slash`, `src/envoy/converter.cc`), so a 63-byte raw
+//     prefix yields a 62-byte node text (admitted) while a 64-byte raw
+//     prefix yields a 63-byte node text (rejected for dispatch safety, even
+//     though 64 raw bytes alone would pass the outer ceiling). A raw prefix
+//     that does neither -- like "/api", not ending in "/" -- has no
+//     segment-equivalent RUT meaning and is rejected outright regardless of
+//     length (before either length check ever applies).
+//   - `path` must start with "/".
 struct RouteMatch {
     RouteMatchKind kind = RouteMatchKind::Prefix;
     Str prefix{};
