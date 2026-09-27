@@ -294,19 +294,22 @@ converter fails closed on the whole configuration until then.
   spans. No RUT is emitted.
 - Increment 2: `rut::envoy::lower_to_rut` and the `rut-envoy-convert` CLI.
   Capability validation (`rut::envoy::RutCapabilities`) gates six
-  `BLOCKED_BY_RUT` checks in a fixed order. As of `envoy/rut-request-envoy-h1`
-  (PR3), the shipped table (`kShippedRutCapabilities`,
-  `include/rut/envoy/converter.h`) is partially enabled: `request_envoy_h1`
-  is `true`, so the `host: "preserve"`/lowercase-request-header-names gate
-  passes, but `response_envoy_h1` and `local_reply_envoy_h1` are still
-  `false`, so `validate()` (`src/envoy/converter.cc`) fails closed with
-  `BLOCKED_BY_RUT` at the `response_envoy_h1` check on every input, including
-  milestone-S, before `lower_to_rut` ever emits a route -- the shipped CLI
-  still produces no RUT source today, one gate later than before PR3 landed.
-  A test-only overload with all capabilities `true` pins the target RUT text
-  byte for byte (`tests/fixtures/envoy_milestone_s.inc`, checked by
+  `BLOCKED_BY_RUT` checks in a fixed order. As of `envoy/rut-response-envoy-h1`
+  (PR4, Codex sweep-6 review of #698, correcting this overview for the state
+  `response_envoy_h1` shipped true), the shipped table
+  (`kShippedRutCapabilities`, `include/rut/envoy/converter.h`) is further
+  enabled: `request_envoy_h1` and `response_envoy_h1` are both `true`, so the
+  `host: "preserve"`/lowercase-request-header-names gate and the
+  upstream-header-order/lowercase/preserved-date response gate both pass, but
+  `local_reply_envoy_h1` is still `false`, so `validate()`
+  (`src/envoy/converter.cc`) fails closed with `BLOCKED_BY_RUT` at the
+  `local_reply_envoy_h1` check on every input, including milestone-S, before
+  `lower_to_rut` ever emits a route -- the shipped CLI still produces no RUT
+  source today, one gate later than before PR4 landed. A test-only overload
+  with all capabilities `true` pins the target RUT text byte for byte
+  (`tests/fixtures/envoy_milestone_s.inc`, checked by
   `tests/test_envoy_convert.cc`) so the golden shape does not drift ahead of
-  PR4/PR5, which must land before the CLI itself can emit anything. No RUT is
+  PR5, which must land before the CLI itself can emit anything. No RUT is
   emitted by the shipped binary; no differential evidence exists yet.
 - Increment 2 review fixes: the input buffer moved from `malloc` to a static
   1 MiB+1 buffer (AGENTS.md's no-`new`/no-`malloc` rule). The four rows added
