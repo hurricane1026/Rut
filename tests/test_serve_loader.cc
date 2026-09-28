@@ -874,7 +874,7 @@ TEST(serve_loader, nginx_retained_header_lowering_executes_owned_framing_selecti
     const u16 bundle_id = get->preflight_forward_policy_bundle_id;
     const auto& bundle = program.config.policy_bundles[bundle_id - 1u];
     CHECK_EQ(bundle.response_read_timeout_seconds, 60u);
-    CHECK_EQ(bundle.response_buffering, ForwardResponseBufferingMode::CompleteContentLength);
+    CHECK_EQ(bundle.response_buffering, ForwardResponseBufferingMode::Bounded);
     REQUIRE(program.config.response_policy_id_is_valid(bundle.response_policy_id));
     REQUIRE(program.config.failure_policy_id_is_valid(bundle.failure_policy_id));
     REQUIRE(program.config.timeout_failure_policy_id_is_valid(bundle.timeout_failure_policy_id));
@@ -1489,7 +1489,7 @@ TEST(serve_loader, nginx_exact_loopback_fixed_302_output_is_owned_and_reuses_cle
         REQUIRE(parsed);
         const auto lowered = nginx::lower_to_rut(parsed.value());
         REQUIRE(lowered);
-        REQUIRE_EQ(lowered.value().len, 5913u);
+        REQUIRE_EQ(lowered.value().len, 5897u);
         generated.assign(lowered.value().data, lowered.value().len);
         memset(nginx_source, 'x', sizeof(nginx_source) - 1u);
     }
@@ -1676,7 +1676,7 @@ TEST(serve_loader, nginx_exact_loopback_fixed_302_output_is_owned_and_reuses_cle
     std::filesystem::remove(path);
 }
 
-TEST(serve_loader, issue351_exact_5945_byte_redirect_output_is_owned_and_reuses_cleanly) {
+TEST(serve_loader, issue351_exact_5929_byte_redirect_output_is_owned_and_reuses_cleanly) {
     static constexpr char kRedirectBody[] =
         "<html>\r\n"
         "<head><title>301 Moved Permanently</title></head>\r\n"
@@ -1694,8 +1694,8 @@ TEST(serve_loader, issue351_exact_5945_byte_redirect_output_is_owned_and_reuses_
     REQUIRE(parsed);
     auto lowered = nginx::lower_to_rut(parsed.value());
     REQUIRE(lowered);
-    REQUIRE_EQ(lowered.value().len, 5945u);
-    REQUIRE_EQ(lowered.value().len, 5945u);
+    REQUIRE_EQ(lowered.value().len, 5929u);
+    REQUIRE_EQ(lowered.value().len, 5929u);
     REQUIRE_EQ(lowered.value().data[lowered.value().len], '\0');
     std::string generated(lowered.value().data, lowered.value().len);
     REQUIRE_EQ(generated.rfind("listen 127.0.0.1:65535\n", 0u), 0u);
@@ -1703,7 +1703,7 @@ TEST(serve_loader, issue351_exact_5945_byte_redirect_output_is_owned_and_reuses_
 
     const std::string dir = "/tmp/rut_serve_loader_issue351_exact_301";
     const std::string path = write_file(dir, "app.rut", generated.c_str());
-    REQUIRE_EQ(std::filesystem::file_size(path), 5945u);
+    REQUIRE_EQ(std::filesystem::file_size(path), 5929u);
     std::fill(generated.begin(), generated.end(), 'y');
     memset(lowered.value().data, 'z', lowered.value().len);
     lowered.value().len = 0u;
@@ -2506,7 +2506,7 @@ TEST(serve_loader, issue373_hide_headers_are_owned_and_same_owner_reload_clears_
         REQUIRE(parsed);
         const auto lowered = nginx::lower_to_rut(parsed.value());
         REQUIRE(lowered);
-        REQUIRE_EQ(lowered.value().len, 5366u);
+        REQUIRE_EQ(lowered.value().len, 5350u);
         generated.assign(lowered.value().data, lowered.value().len);
         memset(source, 'x', sizeof(source) - 1u);
     }
@@ -2642,7 +2642,7 @@ TEST(serve_loader, issue373_hide_headers_are_owned_and_same_owner_reload_clears_
         REQUIRE(parsed);
         const auto lowered = nginx::lower_to_rut(parsed.value());
         REQUIRE(lowered);
-        REQUIRE_EQ(lowered.value().len, 6975u);
+        REQUIRE_EQ(lowered.value().len, 6943u);
         generated.assign(lowered.value().data, lowered.value().len);
         memset(source, 'z', sizeof(source) - 1u);
     }
@@ -2910,9 +2910,8 @@ TEST(serve_loader, nginx_exact_loopback_api_no_uri_output_is_owned_and_reuses_cl
         REQUIRE(program.config.response_policy_id_is_valid(bundle.response_policy_id));
         REQUIRE(program.config.failure_policy_id_is_valid(bundle.failure_policy_id));
         CHECK_EQ(bundle.response_read_timeout_seconds, buffered ? 60u : 0u);
-        CHECK(bundle.response_buffering ==
-              (buffered ? ForwardResponseBufferingMode::CompleteContentLength
-                        : ForwardResponseBufferingMode::None));
+        CHECK(bundle.response_buffering == (buffered ? ForwardResponseBufferingMode::Bounded
+                                                     : ForwardResponseBufferingMode::None));
 
         const auto& response = program.config.response_policies[bundle.response_policy_id - 1u];
         CHECK(response.version == ResponsePolicyVersion::Http11);
@@ -3618,9 +3617,8 @@ TEST(serve_loader, nginx_issue356_p63_no_uri_output_is_owned_and_reuses_cleanly)
         REQUIRE(program.config.response_policy_id_is_valid(root_bundle.response_policy_id));
         REQUIRE(program.config.failure_policy_id_is_valid(root_bundle.failure_policy_id));
         CHECK_EQ(root_bundle.response_read_timeout_seconds, buffered ? 60u : 0u);
-        CHECK(root_bundle.response_buffering ==
-              (buffered ? ForwardResponseBufferingMode::CompleteContentLength
-                        : ForwardResponseBufferingMode::None));
+        CHECK(root_bundle.response_buffering == (buffered ? ForwardResponseBufferingMode::Bounded
+                                                          : ForwardResponseBufferingMode::None));
         const auto& root_response =
             program.config.response_policies[root_bundle.response_policy_id - 1u];
         CHECK(root_response.version == ResponsePolicyVersion::Http11);
@@ -4160,9 +4158,8 @@ TEST(serve_loader, nginx_issue357_wildcard_p63_no_uri_output_is_owned_and_reuses
         REQUIRE(program.config.response_policy_id_is_valid(root_bundle.response_policy_id));
         REQUIRE(program.config.failure_policy_id_is_valid(root_bundle.failure_policy_id));
         CHECK_EQ(root_bundle.response_read_timeout_seconds, buffered ? 60u : 0u);
-        CHECK(root_bundle.response_buffering ==
-              (buffered ? ForwardResponseBufferingMode::CompleteContentLength
-                        : ForwardResponseBufferingMode::None));
+        CHECK(root_bundle.response_buffering == (buffered ? ForwardResponseBufferingMode::Bounded
+                                                          : ForwardResponseBufferingMode::None));
         const auto& root_response =
             program.config.response_policies[root_bundle.response_policy_id - 1u];
         CHECK(root_response.version == ResponsePolicyVersion::Http11);
