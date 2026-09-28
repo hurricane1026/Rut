@@ -627,3 +627,15 @@ The POLL_FIRST 64 KiB/c1 formal controls completed with three valid five-second 
 | keepalive | 8008 | 7796 | 0.9735 |
 
 Retain POLL_FIRST on one-shot upstream receives: both-order 64 KiB diagnostics show small positive changes, eBPF verifies removal of speculative empty reads, and the full network suite passes. The before/after formal ratios move from 0.9771/0.9616 to 0.9827/0.9735, but these are separate runs on an unreserved host and do not establish an exact gain. Both cells still miss the goal. Tiny-response throughput is effectively unchanged; no across-matrix claim follows.
+
+## Rejected uncorked header-only large-file send
+
+Against the accepted POLL_FIRST/dirty-buffer binary, removing the copied initial body prefix while preserving the no-MSG_MORE header push gives:
+
+| Case | Mean RPS change |
+|---|---:|
+| 1m-c1-keepalive | +2.49% |
+| 1m-c32-close | -14.88% |
+| 1m-c32-keepalive | -10.88% |
+
+All preflight and warmup/load counters pass, but both c32 modes regress materially. Revert the prototype; it has no full-network test gate and is not retained runtime code. The result shows that the initial body prefix matters even with the earlier corking change, without proving a specific window-growth mechanism. The accepted frozen POLL_FIRST binary is now running the complete 96-coordinate quick diagnostic matrix.
