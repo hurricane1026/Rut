@@ -460,14 +460,139 @@ are recorded from the pinned Envoy build, not assumed.
 **Routing**
 
 - `prefix` match is a plain string prefix. `prefix: "/api"` matches `/apifoo`.
-  Rut's route trie is segment-aware, so only `prefix: "/"` and prefixes ending
-  in `/` have a segment-equivalent meaning. Other prefixes are `PARTIAL`
-  until Rut offers a raw-prefix match, and the converter rejects them.
-- Routes are evaluated in list order, first match wins. Rut selects the
-  longest matching prefix. A route list is accepted only when the converter can
-  prove list order and longest-prefix selection agree for every request, and
-  it must reject lists where an earlier shorter prefix shadows a later longer
-  one.
+  Rut's route trie is segment-aware, so only `prefix: "/"` had a
+  segment-equivalent meaning before ordered-list lowering (PR 8 / PR #695)
+  landed. Now every prefix ending in `/` (e.g. `"/api/"`) lowers too:
+  `parse_route_match` (`src/envoy/parser.cc`) accepts `"/"` or any prefix
+  that both starts and ends with `/`, and `build_lowering_plan`
+  (`src/envoy/converter.cc`) strips the trailing slash to get the node's own
+  text, then guards that node's own bare literal (e.g. `/api`, which Envoy's
+  raw byte-prefix match for `/api/` never matches on its own) with a
+  `req.pathOnly` comparison instead of folding it into the segment match —
+  see the algorithm doc comment above `build_node_plan`. This is a
+  behavioral reconciliation, not a byte-exact reproduction of Envoy's raw
+  byte-prefix semantics: `RouteTrie::tokenize_segments`
+  (`src/runtime/route_trie.cc`) drops empty path segments when selecting
+  which node a request lands on, so a request whose raw path contains an
+  injected empty segment can alias into a node its unnormalized path would
+  not otherwise reach. For example, with a declared prefix `"/api/v1/"`
+  (node text `/api/v1` after stripping the trailing slash), a request for
+  `/api//v1/x` tokenizes to the same segments as `/api/v1/x` (`["api", "v1",
+  "x"]`) and forwards through that node's terminal prefix arm, even though
+  the raw bytes of `/api//v1/x` do not start with the literal `/api/v1/`
+  (byte 5 is `/`, not `v`) — Envoy's unnormalized prefix match would not
+  match this route at all. (A request like `/api//x` against declared
+  prefix `"/api/"`, by contrast, is not a divergence: its raw bytes DO start
+  with the literal `/api/`, so Envoy forwards it too, in agreement with
+  Rut's segment-normalized match.) This is tracked as its own
+  `NOT_IMPLEMENTED` row (docs/envoy-compatibility.md, "Path normalization"),
+  not a lowering rejection. A raw (non-segment) prefix not
+  ending in `/` (e.g. `"/api"`) is still rejected outright by the parser —
+  Rut's route trie has no equivalent for a plain byte-prefix match — and
+  stays `BLOCKED_BY_RUT` until Rut offers one (docs/envoy-compatibility.md,
+  "Raw (non-segment) `prefix` not ending in `/`"). A lone `prefix: "/api/"`
+  declared with no catch-all still fails closed for an unrelated reason:
+  the node's own bare literal `/api` then has no Envoy route at all, and
+  Rut's `route exact` can't stand in for that no-route 404 without excluding
+  TRACE/CONNECT (see "Increment 4" below and docs/envoy-compatibility.md,
+  "A node's own literal path...").
+- Routes are evaluated in list order, first match wins; Rut's own route trie
+  instead selects the longest matching declared prefix. Rather than reject
+  every list where these two orders could disagree, the converter reconciles
+  them by construction (owner decision D3, increment 4 / PR 8): it does not
+  reject a route list merely because Envoy's declaration order and Rut's
+  longest-prefix selection would otherwise pick different arms. That
+  reconciliation is necessary but not sufficient for a given list to lower
+  successfully — some shapes still fail closed for reasons unrelated to
+  ordering, each already covered by its own test
+  (`tests/test_envoy_convert.cc`): a lone `prefix: "/api/"` with no catch-all
+  (or one preceded only by an exact route under a *different* literal) has
+  no Envoy route at all for its own bare literal path, a genuine 404 with no
+  RUT form (`blocked_on_node_own_literal_needs_all_method_fallback`,
+  `blocked_on_shadowed_exact_needs_all_method_fallback` — see the
+  node's-own-literal paragraph below); a root with exact routes but no
+  catch-all hits the same no-RUT-form-for-a-404 problem at its own
+  fallthrough (`blocked_root_exact_arms_without_catch_all`); and any
+  otherwise-valid list can still exceed the compiler frontend's lexer token
+  budget (`token_budget_goldens_match_the_real_lexer`,
+  `golden_routes_a_prefix_then_root` — see the token-budget bullet below).
+  docs/envoy-compatibility.md's increment-4 rows record the exact status
+  (BLOCKED_BY_RUT or the token-budget PARTIAL) for each of these. For each
+  RUT route
+  entry ("node" — `"/"` plus, for every other declared `prefix`, that prefix
+  with its trailing `/` removed), the converter walks Envoy's route list in
+  declared order and builds a nested `if`/`else` chain that reproduces
+  first-match semantics restricted to the routes that could ever reach that
+  node: an exact `path` route becomes a conditional
+  `if req.pathOnly == "..." { ... } else { ... }` arm, a prefix naming a
+  strict ancestor of the node is unconditional and ends the chain (everything
+  Envoy declared after it is unreachable for that node and is dropped rather
+  than nested — see the "shadowing" example in the algorithm's doc comment),
+  and the node's own prefix action closes the chain once every other value is
+  accounted for. A node's own literal path (e.g. the string `"/api"` for
+  prefix `"/api/"`) is never matched by that node's own prefix action in
+  Envoy, so it is resolved separately: if an earlier exact `path` route
+  already names that literal, the conditional arm the walk placed for it
+  earlier in the chain already forwards it correctly. Otherwise the literal
+  has no Envoy route at all — a genuine 404 — and lowering fails closed
+  instead of emitting a `route exact "N"` fallback for it: `route exact`'s
+  strict local-response admission serves only GET/HEAD/POST/OPTIONS/PUT/
+  DELETE/PATCH (`callbacks_impl.h`,
+  `exact_strict_local_response_common_request_shape_is_admitted` plus the
+  per-method "fresh method" checks), so an ANY-method `route exact "N"` 404
+  would close the connection for TRACE/CONNECT instead of answering with a
+  404 the way Envoy's real no-route 404 does (Codex P1 on PR #695). Root hits
+  the same "no RUT form for a nested 404" problem and has no earlier-exact-arm
+  case either (there is no ancestor of the root to delegate to, nor can `"/"`
+  ever be a proper descendant of a longer node): a bootstrap whose root ends
+  up with exact arms but no catch-all fails closed with `BLOCKED_BY_RUT: a
+  no-route 404 inside a route branch has no RUT form`; with no arms at all
+  `route "/"` is simply omitted, since Rut's `unmatched` policy answers every
+  method (including TRACE) via its own per-method policy table with an
+  ANY-slot fallback, unlike `route exact`. The full algorithm, worked through
+  node by node, is a doc comment on `src/envoy/converter.cc`'s
+  ordered-route-list section.
+- **Emitted program size is separately capped by the compiler frontend's
+  lexer, not just `RutSource::kCapacity`.** Codex round-6 review (P1):
+  `RutSource::kCapacity` (128 KiB, `include/rut/envoy/converter.h`) only
+  bounds the emitted program's byte count. `rut`'s own frontend lexer
+  separately bounds every program's token count at
+  `LexedTokens::kMaxTokens` (`include/rut/compiler/lexer.h`) — **4096 today**
+  (#697 raised it from 932). A route list well inside `kMaxEnvoyRoutes` (8)
+  can still exceed it: each node's `if`/`else` arm duplicates the full
+  `request_policy`/`response_policy`/`failure_policy` block (see the
+  milestone-S golden, `tests/fixtures/envoy_milestone_s.inc`) for both its
+  `HEAD` and any-method emission, so a single extra arm on a single node
+  costs on the order of a few hundred tokens, and every non-root node
+  contributes its own conditional prefix arm plus one unconditional
+  nearest-ancestor terminal arm (see `RutSource::
+  kWorstCaseOrderedRouteListBytes`'s doc comment,
+  `include/rut/envoy/converter.h`). Measured against the real lexer
+  (`rut::lex`, `tests/test_envoy_convert.cc`'s
+  `token_budget_goldens_match_the_real_lexer`, which links `rut_compiler`
+  test-only): golden (c) — a genuine two-node, single-arm-per-node shape —
+  uses 668 tokens; golden (b) no longer is that shape, since the round-9
+  shadowing fix (see "Multiple routes per virtual host" above) drops its
+  `/api/` node before it is ever registered, being globally shadowed by the
+  earlier root route — it now lowers root-only and measures 360 tokens, not
+  the 655 a two-node program of its old shape would have needed. Scenario
+  (a) — two nodes, one of them with an `if`/`else` arm — needs 963 tokens,
+  comfortably under the current 4096 budget (it needed over the old 932
+  budget and failed to lex at byte 8400 of its 8804-byte, well-under-
+  `kCapacity` output; `golden_routes_a_prefix_then_root`,
+  `tests/test_envoy_convert.cc`, is a golden success case again). A
+  `kMaxEnvoyRoutes`-sized worst case (8 nested prefixes, narrowest declared
+  first) still exceeds even the raised 4096 budget
+  (`capacity_covers_worst_case_node_arm_duplication`,
+  `tests/test_envoy_convert.cc`), so the fail-closed check below still
+  matters at that scale. `lower_to_rut` computes a conservative
+  (never-under-counting) estimate of the emitted token count and fails
+  closed with `TooManyTokens` before returning a program `rut` cannot load,
+  rather than reporting success for one. `rut_envoy`/`rut-envoy-convert`
+  still link no Rut grammar or lowering library (the estimate is
+  self-contained, using only the header-only `kMaxTokens` constant); only
+  the test links `rut_compiler`, to verify the estimate against the real
+  lexer.
 - Matching is against the path without query. `x-envoy-original-path` is not
   set unless a rewrite happens.
 - No matching route: HCM responds 404 with an empty body and no route-level
@@ -800,14 +925,17 @@ emitted text, since that still doesn't compile on this branch.
    127.0.0.1:29000\r\n\r\n'`) and the origin's `200 OK` response was relayed
    back to the client verbatim — Rut opened the upstream connection and
    forwarded a response Envoy would never have requested. Two converter-level
-   fixes were tried and both are infeasible with today's grammar and token
-   budget:
+   fixes were tried and both were infeasible with the grammar and token
+   budget at the time:
    - Splitting the any-method route into one explicit `route <METHOD> "/"`
      per forwarded method (mirroring the `HEAD` route already emitted)
-     overflows the lexer's fixed `kMaxTokens = 932`
-     (`include/rut/compiler/lexer.h:135`) once duplicated across all 7
+     overflowed the lexer's fixed `kMaxTokens`, then 932
+     (`include/rut/compiler/lexer.h:135`), once duplicated across all 7
      non-HEAD forwarded methods — confirmed by actually compiling that
-     11+ KB shape with `rut` (`lex failed: too many tokens`).
+     11+ KB shape with `rut` (`lex failed: too many tokens`). #697 has since
+     raised `kMaxTokens` to 4096; whether that specific shape now fits has
+     not been re-measured, so this row's status is unchanged pending that
+     check.
    - A `guard req.method == GET || req.method == POST || … else { return
      400 }` inside the existing any-method route stays comfortably within
      the token budget, but `CONNECT` and `TRACE` are both plain identifiers:
@@ -1014,8 +1142,23 @@ alone is `PARTIAL` at most.
 3. First serialized differential smoke case: header-only HTTP/1.1 GET with a
    final `content-length` response, then fixed-length POST, connect failure,
    and route timeout, each as its own row.
-4. Route matching: `path` exact match, `prefix` ending in `/`, multiple routes
-   with provable ordering, per-method rows, `direct_response`, `redirect`.
+4. Route matching: `path` exact match, multiple routes lowered as an
+   ordered, first-match list (owner decision D3: by construction — nested
+   first-match arms in source order — not by proving that list order and
+   Rut's longest-prefix trie agree; see "Routing" above), per-method rows,
+   `direct_response`, `redirect`. `prefix` ending in `/` (e.g. `"/api/"`) is
+   modeled by the parser and lowered too (PR 8 / PR #695: stripped to its own
+   node, guarded at the node's own bare literal with a `req.pathOnly`
+   comparison) — see "Routing" above and docs/envoy-compatibility.md. This is
+   not byte-exact with Envoy's raw byte-prefix match (Rut's route trie
+   normalizes empty path segments when selecting a node, Envoy's literal
+   prefix comparison does not; tracked as its own `NOT_IMPLEMENTED` "Path
+   normalization" row), and a lone `prefix: "/api/"` declared with no
+   catch-all still fails closed (`BLOCKED_BY_RUT`: the node's own literal
+   `/api` then has no Envoy route, and `route exact` can't answer every
+   method's 404 for it). A raw (non-segment) prefix not ending in `/` (e.g.
+   `"/api"`) is unaffected and stays `BLOCKED_BY_RUT` — Rut's route trie has
+   no equivalent for a plain byte-prefix match.
 5. Header mutation: `request_headers_to_add/remove`,
    `response_headers_to_add/remove` at route and virtual-host level with
    Envoy's append-vs-overwrite semantics, `prefix_rewrite`,
@@ -1108,8 +1251,19 @@ Each needs its own issue before the corresponding row can leave
   measured value, which no policy exposes. Until then only the
   `suppress_envoy_headers: true` shape can be `SUPPORTED`.
 - Raw (non-segment) prefix match for `prefix` values not ending in `/`.
-- Explicit route-list ordering: Rut resolves by longest prefix. Either the
-  converter proves equivalence or the runtime gains an ordered fallback list.
+- ~~Explicit route-list ordering~~: resolved by construction (owner decision
+  D3, PR 8) rather than a capability gap — see "Routing" above and the
+  algorithm doc comment in `src/envoy/converter.cc`. Not a `BLOCKED_BY_RUT`
+  row any more; a genuinely unrepresentable shape (root with exact arms and
+  no catch-all) is its own fail-closed diagnostic instead.
+- Path normalization / `merge_slashes` / percent-decoding: Rut's route trie
+  normalizes empty path segments (`"/api/"` and `"/api//v1"` collapse the
+  same as `"/api"` and `"/api/v1"`), so which declared node a request reaches
+  is segment-normalized, while the `req.pathOnly` byte comparisons PR 8's
+  per-node arms use are not. Envoy does neither by default. Not evaluated by
+  the golden or brute-force equivalence tests (their probe paths are already
+  normalized); a real divergence for redundant slashes or percent-encoded
+  segments.
 - Host / virtual-host routing: no host dimension in the route trie today.
 - Configurable connect, response and idle timeouts per upstream and per route.
   Rut has no connect-establishment timeout surface at all (not "a different

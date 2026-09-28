@@ -9,7 +9,8 @@ namespace rut::envoy {
 // Envoy v3 bootstrap semantic model for the first converter milestone
 // (docs/envoy-converter.md, "Semantic model boundary for the first
 // increment"). The model represents exactly one HTTP listener, one wildcard
-// virtual host with one catch-all route, and one STATIC cluster with one IPv4
+// virtual host with a bounded ordered list of routes (`kMaxEnvoyRoutes`), and
+// a bounded set of STATIC clusters (`kMaxEnvoyClusters`) each with one IPv4
 // endpoint. Every field outside that boundary is a source-located diagnostic.
 //
 // String values borrow the raw bytes of the JSON source; the document must
@@ -17,6 +18,8 @@ namespace rut::envoy {
 // admitted, so a borrowed slice is always the literal value.
 
 static constexpr u32 kMaxEnvoyNameLen = 128;
+static constexpr u32 kMaxEnvoyRoutes = 8;
+static constexpr u32 kMaxEnvoyClusters = 8;
 
 // Every proto3 JSON field is accepted in both its lowerCamelCase and its
 // snake_case spelling. Both spellings present at once is a duplicate-field
@@ -39,21 +42,144 @@ struct Duration {
     Span span{};
 };
 
+enum class RouteMatchKind : u8 {
+    Prefix,
+    Path,
+};
+
+// Codex sweep-11 review: these two bounds and `dispatchable_match_len` live
+// here, not as file-local constants in `src/envoy/parser.cc`, specifically
+// so both `parse_route_match` (`src/envoy/parser.cc`) and the public
+// `lower_to_rut(model, capabilities)` overload's `validate()`
+// (`src/envoy/converter.cc`) apply the exact same bound to a hand-built or
+// mutated model -- a single shared definition is the only way the two call
+// sites can't drift apart. `kMaxRouteMatchLen` is Envoy's own outer ceiling
+// for the admitted charset.
+constexpr u32 kMaxRouteMatchLen = 64u;
+
+// Codex sweep-8 review (P1): the runtime's per-connection request-path
+// buffer (`ConnectionBase::req_path`, `include/rut/runtime/
+// connection_base.h`, `kMaxReqPathLen = 64`) holds at most 63 usable bytes
+// -- `on_header_received` (`src/runtime/callbacks.cc`) clamps
+// `copy_len = sizeof(conn.req_path) - 1` and NUL-terminates, so any real
+// request whose path is 64+ bytes gets silently truncated to exactly the
+// first 63 bytes for ROUTE DISPATCH (the trie lookup that selects which
+// node's handler runs). `req.pathOnly`, evaluated INSIDE that handler, is
+// computed separately by re-scanning the raw, untruncated request bytes
+// (`rut_helper_req_path_only`, `src/jit/runtime_helpers.cc`) -- it never
+// reads the truncated copy. These two views of the same request agree for
+// every path under 64 bytes, but a node/exact-path comparison text of
+// exactly 63 bytes creates a real gap: any genuinely longer real request
+// that happens to start with those same 63 bytes truncates, for dispatch
+// purposes, into something byte-identical to that node's own bare literal,
+// even though `req.pathOnly` inside the handler still sees the full,
+// untruncated (and therefore unequal) path. A `prefix` ending in `/` whose
+// stripped node text is exactly 63 bytes (i.e. a 64-byte declared prefix)
+// or an exact `path` whose literal is exactly 63 bytes therefore admits a
+// configuration where Rut's dispatch and its own handler body can disagree
+// about whether a crafted request matches this node's bare literal --
+// exactly the ambiguity Envoy's own byte-exact matching never has, since it
+// never truncates. Bounding admitted match text to 62 bytes keeps the
+// longest anything can grow to (63, one more than admitted) still short of
+// the 64-byte point where the runtime's copy starts truncating, so the
+// dispatch view and `req.pathOnly` can never disagree: only a node/exact-
+// path text of exactly 63 bytes can ever be reproduced by truncating some
+// longer real request (truncation always yields exactly 63 bytes when it
+// happens at all, so it can only collide with a declared text of that same
+// length), so bounding admitted text at 62 bytes rules the dangerous length
+// out entirely, not merely narrows it. Both `parse_route_match` and
+// `validate()` must apply this same bound (see the file comment above).
+constexpr u32 kMaxDispatchableMatchLen = 62u;
+
+// The RUT node text a `prefix` lowers to (see `strip_trailing_slash`,
+// `src/envoy/converter.cc`): "/" stays "/"; anything else drops the
+// trailing slash that a valid prefix's shape (checked separately, before
+// this is ever called) already guarantees is there.
+inline u32 prefix_node_text_len(Str prefix) {
+    if (prefix.eq(lit_str("/"))) return 1u;
+    return prefix.len - 1u;
+}
+
+// Exactly one of `prefix` / `path` is set, selected by `kind`. Both admit
+// only printable ASCII (0x21-0x7e) excluding `?`, `#` and `%`
+// (`kMaxRouteMatchLen` = 64 bytes is Envoy's own outer ceiling for this
+// charset), but the *effective* length limit is tighter and differs per
+// kind, driven by dispatch safety (`kMaxDispatchableMatchLen` = 62; see its
+// doc comment above for the full derivation from `ConnectionBase::req_path`'s
+// 63 usable bytes, `include/rut/runtime/connection_base.h`):
+//   - `path` (an exact match): admits at most 62 bytes; 63 or 64 bytes pass
+//     the charset/outer-ceiling check but are rejected for dispatch safety.
+//   - `prefix`: either exactly "/" (always admitted, length 1), or starts
+//     and ends with "/" and admits at most 63 raw bytes -- the trailing
+//     slash is stripped to produce the RUT node text
+//     (`strip_trailing_slash`, `src/envoy/converter.cc`), so a 63-byte raw
+//     prefix yields a 62-byte node text (admitted) while a 64-byte raw
+//     prefix yields a 63-byte node text (rejected for dispatch safety, even
+//     though 64 raw bytes alone would pass the outer ceiling). A raw prefix
+//     that does neither -- like "/api", not ending in "/" -- has no
+//     segment-equivalent RUT meaning and is rejected outright regardless of
+//     length (before either length check ever applies).
+//   - `path` must start with "/".
 struct RouteMatch {
-    // Exactly "/" in this increment.
+    RouteMatchKind kind = RouteMatchKind::Prefix;
     Str prefix{};
     Span prefix_span{};
+    Str path{};
+    Span path_span{};
+    Span span{};
+};
+
+// The effective length to compare against `kMaxDispatchableMatchLen` for
+// `match`: a prefix's stripped node text length, or an exact path's own
+// (unmodified) length. The caller must already have confirmed the match's
+// shape (prefix is "/" or starts and ends with '/'; path starts with '/')
+// before calling this -- `prefix_node_text_len` assumes it.
+inline u32 dispatchable_match_len(const RouteMatch& match) {
+    return match.kind == RouteMatchKind::Prefix ? prefix_node_text_len(match.prefix)
+                                                : match.path.len;
+}
+
+enum class RouteActionKind : u8 {
+    Forward,
+    DirectResponse,
+    Redirect,
+};
+
+// `envoy.config.route.v3.DirectResponseAction`. Only `body.inline_string` is
+// modeled; other `DataSource` variants (`inline_bytes`, `filename`, ...) are
+// unsupported fields. The body is optional and bounded to 4096 bytes.
+struct DirectResponse {
+    u16 status = 0;
+    bool has_body = false;
+    Str inline_string{};
+    Span span{};
+};
+
+// `envoy.config.route.v3.RedirectAction`, restricted to `path_redirect`,
+// `host_redirect` and `response_code`; every other field (`https_redirect`,
+// `scheme_redirect`, `port_redirect`, `prefix_rewrite`, `strip_query`, ...) is
+// an unsupported field. `response_code` is resolved from its proto3 JSON
+// enum name to the numeric HTTP status it names.
+struct Redirect {
+    Str path_redirect{};
+    Str host_redirect{};
+    u16 response_code = 0;
     Span span{};
 };
 
 struct RouteAction {
+    RouteActionKind kind = RouteActionKind::Forward;
+    // Forward (`route.cluster`) only.
     Str cluster{};
     Span cluster_span{};
     // `timeout` is optional today only in the sense that its absence is a
     // capability gap (Envoy's implicit 15s default); the converter requires
-    // an explicit "0s" (docs/envoy-converter.md, "milestone-S").
+    // an explicit "0s" (docs/envoy-converter.md, "milestone-S"). Forward
+    // only.
     bool timeout_present = false;
     Duration timeout{};
+    DirectResponse direct_response{};
+    Redirect redirect{};
     Span span{};
 };
 
@@ -68,7 +194,17 @@ struct VirtualHost {
     Span name_span{};
     // `domains` is exactly ["*"] in this increment; the span pins the array.
     Span domains_span{};
-    Route route{};
+    // Order preserved from the source array; Envoy selects the first
+    // matching route. `build_lowering_plan` (src/envoy/converter.cc) lowers
+    // the full ordered list by construction (PR 8 / PR #695): for each
+    // declared node it builds a nested first-match if/else arm chain that
+    // reproduces Envoy's declaration-order semantics, not just the
+    // single-route shape (see `tests/test_envoy_convert.cc`'s
+    // `golden_routes_*` and brute-force equivalence tests). Some ordered
+    // lists still fail closed for reasons unrelated to ordering (e.g. a lone
+    // prefix with no catch-all, or the compiler frontend's lexer token
+    // budget); see docs/envoy-converter.md, "Routing".
+    FixedVec<Route, kMaxEnvoyRoutes> routes{};
     Span span{};
 };
 
@@ -165,7 +301,9 @@ struct Cluster {
 
 struct Bootstrap {
     Listener listener{};
-    Cluster cluster{};
+    // Names are unique among the declared clusters; every Forward route's
+    // `cluster` must name one of them.
+    FixedVec<Cluster, kMaxEnvoyClusters> clusters{};
     Span span{};
 };
 
