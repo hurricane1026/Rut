@@ -825,3 +825,18 @@ For plaintext memfd bodies >=128 KiB, round the copied initial body prefix down 
 | 1m-c32-keepalive | -3.41% |
 
 The c1 baseline is bimodal again (5666.5/4742.8 RPS), so the mean gain is not a stable expected speedup; candidate samples are 5819.5/5873.8. The c32 keepalive regression prevents retaining this variant. The test changes both alignment and initial burst length. The next prototype keeps 16 KiB body bytes in the prefix using a wider staging buffer; that introduces a separate allocation/layout change and must be measured, not assumed beneficial.
+
+## 16 KiB aligned file prefix: concurrency tradeoff
+
+A wider (32 KiB bound) staging view backed by an existing bulk lease allows copying exactly 16 KiB of body after the header. Existing bulk leases are reused on keepalive; otherwise the ordinary send slice is returned after copying its header. Only plaintext memfd bodies >=128 KiB are eligible. This changes allocation/layout as well as offset alignment.
+
+| Run | Case | Mean RPS change |
+|---|---|---:|
+| file-prefix16-aligned-r1 | 1m-c1-keepalive | +18.34% |
+| file-prefix16-aligned-r1 | 1m-c32-close | -0.02% |
+| file-prefix16-aligned-r1 | 1m-c32-keepalive | -0.75% |
+| file-prefix16-aligned-r2 | 1m-c1-keepalive | +19.80% |
+| file-prefix16-aligned-r2 | 1m-c32-close | +0.49% |
+| file-prefix16-aligned-r2 | 1m-c32-keepalive | -4.64% |
+
+All benchmark preflight and warm/load checks passed. Three pipelined nonuniform 1 MiB responses on one real socket matched exactly; this is not a full regression. c1 candidates stay around 5855–5913 RPS while baseline varies around 4623–5360. c32 keepalive regresses across both orderings; c32 close is effectively flat. Thus this cannot be retained as a universal improvement. c1 close and c2/4/8/16 keepalive probes are queued to determine whether a repeatable concurrency crossover exists before considering a workload-dependent strategy. No such strategy is implemented.

@@ -1,0 +1,44 @@
+diff --git a/include/rut/runtime/callbacks_impl.h b/include/rut/runtime/callbacks_impl.h
+index 96510220..dc958326 100644
+--- a/include/rut/runtime/callbacks_impl.h
++++ b/include/rut/runtime/callbacks_impl.h
+@@ -3393,8 +3393,37 @@ void handle_jit_outcome(Loop* loop,
+             }
+             if (segmented_body && response_formatted) {
+                 const auto& body = cfg->response_bodies[outcome.response_body_idx - 1];
+-                const u32 n =
+-                    body.len < conn.send_buf.write_avail() ? body.len : conn.send_buf.write_avail();
++                bool aligned_file_prefix = false;
++                if constexpr (requires(Loop* l, const u8* p) {
++                                  l->pool.alloc_bulk();
++                                  l->pool.is_bulk(p);
++                              }) {
++                    constexpr u32 kPrefix = 16u * 1024u;
++                    constexpr u32 kCapacity = 32u * 1024u;
++                    if (!conn.tls_active && body.file_fd() >= 0 && body.len >= 128u * 1024u &&
++                        !conn.send_armed && !conn.upstream_send_armed && conn.send_slice != nullptr &&
++                        conn.send_buf.data() == conn.send_slice && conn.send_buf.len() <= kPrefix) {
++                        const u32 header_len = conn.send_buf.len();
++                        u8* expanded = loop->pool.is_bulk(conn.send_slice)
++                                           ? conn.send_slice
++                                           : loop->pool.alloc_bulk();
++                        if (expanded != nullptr) {
++                            u8* previous = conn.send_slice;
++                            if (expanded != previous)
++                                __builtin_memcpy(expanded, conn.send_buf.data(), header_len);
++                            conn.send_slice = expanded;
++                            conn.send_buf.bind(expanded, kCapacity);
++                            conn.send_buf.commit(header_len);
++                            if (expanded != previous) loop->pool.free(previous);
++                            aligned_file_prefix = true;
++                        }
++                    }
++                }
++                const u32 n = aligned_file_prefix
++                                  ? 16u * 1024u
++                                  : (body.len < conn.send_buf.write_avail()
++                                         ? body.len
++                                         : conn.send_buf.write_avail());
+                 conn.local_response_size = conn.send_buf.len() + body.len;
+                 conn.send_buf.write(reinterpret_cast<const u8*>(body.data), n);
+                 conn.local_body_cursor = reinterpret_cast<const u8*>(body.data) + n;

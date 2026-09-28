@@ -1,0 +1,7 @@
+{
+  "base_commit": "49e2b03247b3f43a3f8ffba90e31a5d06de1d53a",
+  "binary_sha256": "0d0795f5cc921ab33123e527311863a1f47334a200bfe81c29966f4e599001fe",
+  "pipeline_check": "3 exact nonuniform 1 MiB responses on one socket",
+  "full_network": "not run",
+  "reverse_probe": "running"
+}

@@ -1,0 +1,7 @@
+{
+  "responses": 3,
+  "exact_nonuniform_body": true,
+  "pipeline_same_socket": true,
+  "wire_bytes": 3146050,
+  "body_sha256": "3146a6d89a64804f4bfde88216ed14f8ae091d487f56563a1f9619b892749c72"
+}
