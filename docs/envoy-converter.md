@@ -287,13 +287,13 @@ folded into the golden below and into the parser/converter implementation:
    `listen a.b.c.d:port`.
 2. `request_policy.strip_headers` accepts exactly the closed list
    `["Connection", "Keep-Alive", "TE", "Expect", "Upgrade"]` with
-   `host: "upstream"`, or exactly the six-name list adding
-   `"Proxy-Connection"` with `host: "preserve"` (the `request_envoy_h1`
+   `host: .upstream`, or exactly the six-name list adding
+   `"Proxy-Connection"` with `host: .preserve` (the `request_envoy_h1`
    capability, landed in PR3). `"Transfer-Encoding"` is rejected in every
    combination the converter uses; it is dropped from the lowering. The
    `"TE"` entry does not mean "always strip": per the Envoy oracle
    (`tests/fixtures/envoy_oracle_milestone_s.inc`) and Envoy's own
-   `sanitizeConnectionHeader`, `host: "preserve"` decides `te`'s fate as one
+   `sanitizeConnectionHeader`, `host: .preserve` decides `te`'s fate as one
    request-wide question, not per physical field -- whether *any* client
    `TE` field anywhere in the request carries a `trailers` token among its
    comma-separated tokens (any casing; `TE: gzip, trailers` counts) -- and
@@ -367,51 +367,51 @@ and are marked `// PROVISIONAL: reconcile with oracle` at their source.
 listen :8080
 upstream envoy_cluster_0 at "127.0.0.1:9000"
 unmatched { return local_response({
-  version: "HTTP/1.1", status: 404, reason: "Not Found", server: "envoy",
-  date: "current", connection: "request", connection_header: "close_only",
-  header_names: "lowercase", header_order: "date_server_length",
-  head_mode: "suppress_body", body: b""
+  version: .http11, status: 404, reason: "Not Found", server: "envoy",
+  date: .current, connection: .request, connection_header: .closeOnly,
+  header_names: .lowercase, header_order: .dateServerLength,
+  head_mode: .suppressBody, body: b""
 }) }
 route HEAD "/" {
     return forward(envoy_cluster_0, request_policy: {
-            version: "HTTP/1.1",
-            host: "preserve",
-            connection: "omit",
-            header_names: "lowercase",
-            forwarded_proto: "http",
-            strip_headers: ["Connection", "Keep-Alive", "TE", "Expect", "Upgrade", "Proxy-Connection"]
+            version: .http11,
+            host: .preserve,
+            connection: .omit,
+            header_names: .lowercase,
+            forwarded_proto: .http,
+            strip_headers: [.connection, .keepAlive, .te, .expect, .upgrade, .proxyConnection]
         },
         response_policy: {
-            version: "HTTP/1.1",
-            framing: "content_length",
-            connection: "request",
-            head_mode: "suppress_body",
-            header_order: "upstream",
-            header_names: "lowercase",
-            connection_header: "close_only",
-            status_reason: "canonical",
+            version: .http11,
+            framing: .contentLength,
+            connection: .request,
+            head_mode: .suppressBody,
+            header_order: .upstream,
+            header_names: .lowercase,
+            connection_header: .closeOnly,
+            status_reason: .canonical,
             server: "envoy",
-            date: "preserve_or_current",
+            date: .preserveOrCurrent,
             hide_headers: []
         },
         failure_policy: {
-            version: "HTTP/1.1",
+            version: .http11,
             status: 503,
             reason: "Service Unavailable",
             content_type: "text/plain",
             server: "envoy",
-            date: "current",
-            connection: "request",
-            connection_header: "close_only",
-            header_names: "lowercase",
-            header_order: "length_type_date_server",
-            head_mode: "suppress_body",
+            date: .current,
+            connection: .request,
+            connection_header: .closeOnly,
+            header_names: .lowercase,
+            header_order: .lengthTypeDateServer,
+            head_mode: .suppressBody,
             body: b"<kEnvoyConnectFailureBody, PROVISIONAL>"
         }
     )
 }
 route "/" {
-    <identical forward(...), with the two `head_mode: "suppress_body",` lines omitted>
+    <identical forward(...), with the two `head_mode: .suppressBody,` lines omitted>
 }
 ```
 
@@ -424,7 +424,7 @@ a fixed literal chosen by the converter.
 
 Fields with values that do not exist in today's `request_policy` /
 `response_policy` / `local_response` / `failure_policy` grammar (for example
-`host: "preserve"`, `header_order: "upstream"`) are capability dependencies,
+`host: .preserve`, `header_order: .upstream`) are capability dependencies,
 listed below and gated by `rut::envoy::RutCapabilities`. The converter must
 fail closed on them until the RUT side exists; it must not emit the nearest
 existing value. The six checks, in order (first failure wins), are:
@@ -616,7 +616,7 @@ are recorded from the pinned Envoy build, not assumed.
 - Envoy emits all header names in lowercase over HTTP/1.1 (default
   `header_key_format`). nginx and Rut preserve the client's case on every
   policy except ID4. The request side landed with `request_envoy_h1` (PR3,
-  `header_names: "lowercase"` in `request_policy`): the same serializer
+  `header_names: .lowercase` in `request_policy`): the same serializer
   lowercases every forwarded header name. The **response** side is still a
   capability dependency (`response_envoy_h1`, PR4) — see "Known capability
   dependencies" below.
@@ -661,7 +661,7 @@ are recorded from the pinned Envoy build, not assumed.
   `x-envoy-expected-rq-timeout-ms` upstream header, so both shapes are
   separate rows.
 - `date` is added only when the upstream omits it; an upstream `date` is
-  preserved. Rut's `date: "current"` overwrites, so the milestone either pins
+  preserved. Rut's `date: .current` overwrites, so the milestone either pins
   an upstream without `date` or records a `"preserve_or_current"` dependency.
 - Hop-by-hop response headers are removed. `content-length` is preserved.
   Response header names are lowercased.
@@ -701,11 +701,11 @@ records nginx-vs-Rut per-request differences.
 Each is verified from Envoy v1.39.1 source and from a live `rut` process
 built from this tree (`envoy/lower-increment-2`). That branch predates the
 request/response/local-reply serializers (#696/#698/#699), so the milestone's
-own emitted policy vocabulary (`host: "preserve"`, `header_names:
-"lowercase"`, `forwarded_proto`, ...) does not compile there yet; the live
+own emitted policy vocabulary (`host: .preserve`, `header_names:
+.lowercase`, `forwarded_proto`, ...) does not compile there yet; the live
 checks instead used the nearest existing nginx-era policy shape
 (`tests/fixtures/nginx373_hide.inc`'s `request_policy`/`response_policy`/
-`failure_policy` grammar — `host: "upstream"`, no header-casing or dynamic
+`failure_policy` grammar — `host: .upstream`, no header-casing or dynamic
 `Connection`-nomination fields) against a minimal test `.rut` and a scripted
 Python origin. This is a stated limitation: none of the mechanisms below read
 a policy-specific field like `host` or header casing, so the observed
@@ -1018,14 +1018,14 @@ Three findings from the round-6 Codex review of PR #692:
    (`ServerConnectionImpl::checkProtocolVersion`,
    `source/common/http/http1/codec_impl.cc:1176-1189`). Rut's listener
    accepts the connection at any version and only rejects once the emitted
-   route's `request_policy` (which already pins `version: "HTTP/1.1"`,
+   route's `request_policy` (which already pins `version: .http11`,
    `src/envoy/converter.cc:165`) is evaluated: `inspect_request_policy_body`
    (`include/rut/runtime/callbacks_impl.h:5406`) returns `Invalid` because
    `conn.req_http_version != HttpVersion::Http11`, and
    `reject_request_policy` (`callbacks_impl.h:5767`) sends a generic `400 Bad
    Request`. Both fail closed with no upstream contact, but the status code
    (426 vs 400) and the layer that rejects (codec vs application policy)
-   differ; pinning `version: "HTTP/1.1"` in the request policy does not
+   differ; pinning `version: .http11` in the request policy does not
    change this; it only determines *that* Rut rejects, not *how*. No
    converter-level fix is possible (there is no RUT grammar surface for a
    codec-level version gate), and this is a per-request divergence, not a
@@ -1180,7 +1180,7 @@ Everything below is a Rut-side gap the milestone or the next increments hit.
 Each needs its own issue before the corresponding row can leave
 `BLOCKED_BY_RUT`.
 
-- `request_policy.host: "preserve"` (`request_envoy_h1`, PR3): landed. The
+- `request_policy.host: .preserve` (`request_envoy_h1`, PR3): landed. The
   runtime serializer follows the Envoy oracle where it differs from this
   document's original sketch: a single client `x-forwarded-proto` field
   whose trimmed value is a syntactically valid scheme (case-insensitively
@@ -1198,12 +1198,12 @@ Each needs its own issue before the corresponding row can leave
   `docs/envoy-compatibility.md`.
 - Header-name casing selector on the response policy: Envoy emits lowercase
   names over HTTP/1.1. The request side landed with `request_envoy_h1`
-  (PR3, `header_names: "lowercase"` in `request_policy`); the response side
+  (PR3, `header_names: .lowercase` in `request_policy`); the response side
   is still `response_envoy_h1`.
 - Dynamic `Connection`-nominated header stripping on the upstream request:
   Envoy parses the client's `Connection` header value and removes every
   header it names (e.g. `Connection: X-Secret` also removes `X-Secret`). This
-  landed on the `host: "preserve"` profile with `request_envoy_h1` (PR3):
+  landed on the `host: .preserve` profile with `request_envoy_h1` (PR3):
   `apply_preserve_host_lowercase_request_policy`
   (`include/rut/runtime/callbacks_impl.h`) parses the client's `Connection`
   header into its comma-separated token list and drops every nominated
@@ -1211,7 +1211,7 @@ Each needs its own issue before the corresponding row can leave
   The fixed, closed `request_policy.strip_headers` literal list
   (`Connection`, `Keep-Alive`, `TE`, `Expect`, `Upgrade`, `Proxy-Connection`)
   parsed at `src/compiler/parser.cc` is unchanged and still cannot express
-  dynamic nomination; the gap remains for the `host: "upstream"` request
+  dynamic nomination; the gap remains for the `host: .upstream` request
   policies (ID1/ID2/ID3). (Rut's response path already has the equivalent
   dynamic nomination handling for the upstream→downstream direction —
   `upstream_connection_nominates` in `include/rut/runtime/callbacks_impl.h`.)
@@ -1227,7 +1227,7 @@ Each needs its own issue before the corresponding row can leave
   the two are not equivalent and Rut cannot safely replicate Envoy's exact
   byte shape for this nomination without adding chunked-encoding support to
   this path. No recorded oracle case exercises this nomination.
-- `Expect: 100-continue` on a body-carrying `host: "preserve"` request: Envoy
+- `Expect: 100-continue` on a body-carrying `host: .preserve` request: Envoy
   sends the interim `100 Continue` response before reading the body, then
   applies the same hop-by-hop drop as every other request. Rut has no
   interim-response flow anywhere in the runtime (for any route or request
@@ -1242,7 +1242,7 @@ Each needs its own issue before the corresponding row can leave
   not add interim-response support and this request shape (a genuinely
   non-empty `Expect` value) stays outside its advertised capability until
   a `100 Continue` primitive exists.
-- `response_policy.date: "preserve_or_current"`: add `date` only when absent.
+- `response_policy.date: .preserveOrCurrent`: add `date` only when absent.
 - `response_policy.server: "envoy"` with overwrite semantics, and an explicit
   "pass through upstream `server`" mode for `server_header_transformation:
   PASS_THROUGH`.
@@ -1325,14 +1325,14 @@ Two more round-4-review findings belong in this same bucket, not as
 `RutCapabilities` gates:
 
 - A request target with a `#` fragment (e.g. `GET /admin#frag HTTP/1.1`) is a
-  genuine Rut runtime bug, not a converter gap, for the `host: "upstream"`
+  genuine Rut runtime bug, not a converter gap, for the `host: .upstream`
   policies (ID1/ID2/ID3): Envoy rejects it (no HCM surface here to enable
   `strip_fragment_from_path`, and the universal header validator rejects `#`
   in `:path` by default), but Rut's `apply_request_policy`
   (`include/rut/runtime/callbacks_impl.h`) forwards `req.path` — which still
   carries the fragment — to the upstream unchanged for those policies, never
   consulting `HttpParser`'s `target_has_fragment`. This is already fixed for
-  `host: "preserve"` (ID4 `Http11PreserveHostLowercase`) — the policy
+  `host: .preserve` (ID4 `Http11PreserveHostLowercase`) — the policy
   `put_forward_route` now emits unconditionally once every capability gate
   clears (`request_envoy_h1`, PR3): `apply_preserve_host_lowercase_request_
   policy` checks `req.target_has_fragment` immediately after parsing and

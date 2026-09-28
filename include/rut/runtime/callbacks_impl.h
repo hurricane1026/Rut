@@ -4022,7 +4022,7 @@ void handle_jit_outcome(Loop* loop,
                      (!request_policy_is_supported(outcome.request_policy_id) ||
                       inspect_request_policy_body(conn, outcome.request_policy_id) !=
                           RequestPolicyBodyState::Complete)) ||
-                    // `host: "preserve"` (ID4) is ordinary-forward-only: it
+                    // `host: .preserve` (ID4) is ordinary-forward-only: it
                     // never carries timing/buffering custody and
                     // target_transform's request-target rewrite has no
                     // proven interaction with it (src/compiler/analyze.cc
@@ -5485,7 +5485,7 @@ inline bool request_policy_name_eq(const u8* p, u32 n, const char* q, u32 qn) {
     return true;
 }
 
-// ID4 (`host: "preserve"`) fails the whole request closed for a `Connection`
+// ID4 (`host: .preserve`) fails the whole request closed for a `Connection`
 // nomination of any of these names, rather than dropping the nominated
 // header like every other nomination: `content-length` also drives how many
 // body bytes the serializer copies onto the wire (dropping the header while
@@ -5829,7 +5829,7 @@ inline RequestPolicyBodyState inspect_request_policy_body(const Connection& conn
     if (parser.parse(data, len, &req) != ParseStatus::Complete || req.path.ptr == nullptr ||
         req.path.len == 0 || req.path.ptr[0] != '/')
         return RequestPolicyBodyState::Invalid;
-    // ID4 (host: "preserve") only: HTTP request targets cannot carry a URI
+    // ID4 (host: .preserve) only: HTTP request targets cannot carry a URI
     // fragment (RFC 7230 §5.3); `apply_preserve_host_lowercase_request_
     // policy`'s own check (below) is retained as defense in depth. Moved
     // here, ahead of any Waiting-producing check, so a fragment-bearing
@@ -5858,7 +5858,7 @@ inline RequestPolicyBodyState inspect_request_policy_body(const Connection& conn
     bool has_upgrade = false;
     bool upgrade_value_nonempty = false;
     bool connection_nominates_upgrade = false;
-    // ID4 (host: "preserve") only: a second physical `X-Forwarded-Proto`
+    // ID4 (host: .preserve) only: a second physical `X-Forwarded-Proto`
     // field (`apply_preserve_host_lowercase_request_policy`'s own check is
     // retained as defense in depth) and a `Connection` value nominating a
     // protected name (content-length/host/the three forwarded-provenance
@@ -5869,7 +5869,7 @@ inline RequestPolicyBodyState inspect_request_policy_body(const Connection& conn
     u32 xfp_count = 0;
     bool seen_inline_request_header[kInlineRequestHeaderTableSize] = {};
     bool inline_request_header_duplicated[kInlineRequestHeaderTableSize] = {};
-    // ID4 (host: "preserve") only: tracked here, ahead of any Waiting-
+    // ID4 (host: .preserve) only: tracked here, ahead of any Waiting-
     // producing check below, so a request whose Host shape is already known
     // to be invalid (missing, duplicated, or an invalid authority such as
     // `victim/path`) fails closed immediately rather than waiting for the
@@ -5937,7 +5937,7 @@ inline RequestPolicyBodyState inspect_request_policy_body(const Connection& conn
             // traffic below.
             connection_nominates_upgrade |=
                 request_policy_comma_value_has_token(value_start, value_end, "upgrade", 7);
-            // ID4 (host: "preserve") only: fail the whole request closed on
+            // ID4 (host: .preserve) only: fail the whole request closed on
             // a nomination of a protected name (content-length, host, the
             // three forwarded-provenance headers, or a pseudo-header-shaped
             // token) as each token is scanned, mirroring
@@ -5999,7 +5999,7 @@ inline RequestPolicyBodyState inspect_request_policy_body(const Connection& conn
         has_upgrade |= request_policy_name_eq(hs, name_len, "upgrade", 7);
         hs = le + 2;
     }
-    // ID4 (host: "preserve") only: exactly one Host field with a non-empty,
+    // ID4 (host: .preserve) only: exactly one Host field with a non-empty,
     // Envoy-`authorityIsValid`-shaped value (`request_policy_host_authority_
     // is_valid`, shared with the serializer's own Pass 1 check below) is
     // required -- missing, duplicated, or malformed (e.g. `victim/path`,
@@ -6010,14 +6010,14 @@ inline RequestPolicyBodyState inspect_request_policy_body(const Connection& conn
         (host_count != 1 || host_value_len == 0 ||
          !request_policy_host_authority_is_valid(host_value_start, host_value_len)))
         return RequestPolicyBodyState::Invalid;
-    // ID4 (host: "preserve") only: more than one physical X-Forwarded-Proto
+    // ID4 (host: .preserve) only: more than one physical X-Forwarded-Proto
     // field fails closed unconditionally (`apply_preserve_host_lowercase_
     // request_policy`'s own check is retained as defense in depth) -- moved
     // here for the same reason as the Host check above (Codex sweep-12
     // review, PR #696).
     if (request_policy_preserves_host(policy_id) && xfp_count > 1)
         return RequestPolicyBodyState::Invalid;
-    // ID4 (host: "preserve") only: a duplicated physical occurrence of any
+    // ID4 (host: .preserve) only: a duplicated physical occurrence of any
     // other Envoy inline-slot header name (see `kInlineRequestHeaders`)
     // fails closed unless the client's Connection value also nominates that
     // name, in which case every physical occurrence is dropped and no
@@ -6055,7 +6055,7 @@ inline RequestPolicyBodyState inspect_request_policy_body(const Connection& conn
                 return RequestPolicyBodyState::Invalid;
         }
     }
-    // ID4 (host: "preserve") only: a `Connection` value that nominates
+    // ID4 (host: .preserve) only: a `Connection` value that nominates
     // "upgrade" alongside "close" (or on its own), together with a
     // semantically-present (non-empty/non-OWS) `Upgrade` header
     // (`upgrade_value_nonempty` above, computed directly from the field's
@@ -10024,7 +10024,7 @@ inline bool response_policy_suppress_head_admitted(const Connection& conn,
     HttpParser parser;
     ParsedRequest req;
     parser.reset();
-    // ID4 (`host: "preserve"`) admits a bare, non-empty `Upgrade` header with
+    // ID4 (`host: .preserve`) admits a bare, non-empty `Upgrade` header with
     // no `Connection: upgrade` nomination -- "admitted" means only that the
     // request is not rejected for it, not that the header reaches the wire:
     // its serializer (`apply_preserve_host_lowercase_request_policy`) always
@@ -10237,7 +10237,7 @@ inline bool response_policy_suppress_head_admitted(const Connection& conn,
         }
         return true;
     };
-    // ID4 (`host: "preserve"`) forwards the client's Host authority verbatim
+    // ID4 (`host: .preserve`) forwards the client's Host authority verbatim
     // and validates it with the Envoy-compatible `HeaderUtility::
     // authorityIsValid`-derived grammar (`request_policy_host_authority_is_valid`
     // above), which -- unlike the legacy `valid_authority` closure above,
@@ -10246,7 +10246,7 @@ inline bool response_policy_suppress_head_admitted(const Connection& conn,
     // port suffix requires (e.g. `Host: [::1]`). This preflight must accept
     // exactly the same authorities the ID4 serializer (`apply_preserve_host_
     // lowercase_request_policy`) will later admit, or a route pairing ID4
-    // with `head_mode: "suppress_body"` response/failure policies -- the
+    // with `head_mode: .suppressBody` response/failure policies -- the
     // exact shape `put_forward_route` emits -- would 400 a request the
     // serializer itself accepts and forwards (Codex round-9 review, PR
     // #696). Non-ID4 policies keep the legacy grammar unchanged. `conn.

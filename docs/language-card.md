@@ -314,26 +314,56 @@ effects only. Full buffered body/status middleware remains ⏳.
 
 ## I/O
 
+HTTP policy selectors use contextual enum members (`.case`, lowerCamelCase).
+Quoted selectors and bare identifiers are rejected; diagnostics list the
+members allowed for the field. There are no legacy string aliases.
+
+| Field | Implemented members (subject to the policy's combination constraints) |
+| --- | --- |
+| `version` | `.http11` |
+| Request `host` | `.upstream`, `.preserve` |
+| `connection` | Request: `.omit`; response: `.keepAlive`, `.request`; local/failure: `.request`; redirect: `.close` |
+| `framing` | `.contentLength` |
+| `date` | `.current` |
+| `head_mode` | `.reject`, `.suppressBody` |
+| Request `header_names`, `forwarded_proto` | `.lowercase`, `.http`, respectively |
+| `content_length_position` | `.afterHost` |
+| `retained_header_value` | `.trimSpPreserveHtab` |
+| `response_buffering` | `.completeContentLength`, `.bounded` |
+| Request `strip_headers` elements | `.connection`, `.keepAlive`, `.te`, `.expect`, `.upgrade`, `.proxyConnection` (last member only with `.preserve`) |
+| Redirect `scheme`, `path` | `.http`, `.static`, respectively |
+| Redirect `authority` | `.requestHost`, `.static` |
+| Redirect `port` | `.actualListener`, `.omit` |
+| Redirect `query` | `.preserveRaw`, `.discard` |
+| Redirect `header_order` | `.locationThenConnection`, `.connectionThenLocation` |
+
+Header names in open header APIs (`hide_headers`, `set_header`, response
+headers), header values, media types, reason phrases, addresses and paths are
+data and remain strings; bodies retain their string/byte-literal forms.
+Status codes keep their existing checked integer syntax. A request's closed
+`strip_headers` policy is not an API for arbitrary header names. Enum members
+do not enable a protocol or policy combination absent from this card.
+
 ```swift
 // Proxy — the transparent forms plus the explicit header-only policy form
 return forward(users)                          // zero-copy, terminal
 return forward(users, request_policy: {
-    version: "HTTP/1.1", host: "upstream", connection: "omit",
-    strip_headers: ["Connection", "Keep-Alive", "TE", "Expect", "Upgrade"]
+    version: .http11, host: .upstream, connection: .omit,
+    strip_headers: [.connection, .keepAlive, .te, .expect, .upgrade]
 })                                               // ID1: fixed header-only rebuild
-// ID2 adds content_length_position: "after_host" (Content-Length pinned
+// ID2 adds content_length_position: .afterHost (Content-Length pinned
 // right after the rewritten Host line; a request with no Content-Length at
 // all is admitted unchanged -- only an explicit Content-Length: 0 is
 // rejected).
-// ID3 adds retained_header_value: "trim_sp_preserve_htab" (retained values
+// ID3 adds retained_header_value: .trimSpPreserveHtab (retained values
 // keep leading/trailing HTAB while SP is trimmed; bounded to bodyless GET).
-// The two are mutually exclusive and both require host: "upstream".
+// The two are mutually exclusive and both require host: .upstream.
 return forward(users, request_policy: {
-    version: "HTTP/1.1", host: "upstream", connection: "omit",
-    content_length_position: "after_host",
-    strip_headers: ["Connection", "Keep-Alive", "TE", "Expect", "Upgrade"]
+    version: .http11, host: .upstream, connection: .omit,
+    content_length_position: .afterHost,
+    strip_headers: [.connection, .keepAlive, .te, .expect, .upgrade]
 })
-// host: "preserve" is a separate closed combination (Envoy-compatible H1,
+// host: .preserve is a separate closed combination (Envoy-compatible H1,
 // ID4): keeps the client's Host verbatim (fails closed unless exactly one
 // non-empty, syntactically valid-authority Host header is present),
 // lowercases every forwarded header name, and requires forwarded_proto and
@@ -391,9 +421,9 @@ return forward(users, request_policy: {
 // compile time with a dedicated diagnostic -- none of the three has a
 // proven interaction with this profile.
 return forward(users, request_policy: {
-    version: "HTTP/1.1", host: "preserve", connection: "omit",
-    header_names: "lowercase", forwarded_proto: "http",
-    strip_headers: ["Connection", "Keep-Alive", "TE", "Expect", "Upgrade", "Proxy-Connection"]
+    version: .http11, host: .preserve, connection: .omit,
+    header_names: .lowercase, forwarded_proto: .http,
+    strip_headers: [.connection, .keepAlive, .te, .expect, .upgrade, .proxyConnection]
 })
 // Bounded response-policy serialization currently accepts only a cleartext
 // HTTP/1.1, origin-form, bodyless non-HEAD request and one final upstream
@@ -401,40 +431,40 @@ return forward(users, request_policy: {
 // body, TLS/H2, interim/Upgrade responses, chunking/trailers, close-delimited
 // framing, or unsupported status/header controls fail closed; transparent
 // forward(...) remains the default for all other routes. One exception: a
-// fixed-Content-Length request paired with `host: "preserve"` (ID4) or the
-// plain `host: "upstream"` strip (ID1) is admitted alongside a
+// fixed-Content-Length request paired with `host: .preserve` (ID4) or the
+// plain `host: .upstream` strip (ID1) is admitted alongside a
 // response_policy too — fully buffered, unchunked, with no pipelined
 // successor bytes, and never served from a reused idle upstream socket (see
 // `request_policy_body_response_admitted` in callbacks_impl.h).
-// response_read_timeout: <1..63s> plus response_buffering: "complete_content_length"
+// response_read_timeout: <1..63s> plus response_buffering: .completeContentLength
 // commits the entire upstream response before any downstream byte is sent.
-// response_buffering: "bounded" (nginx proxy_buffering-on semantics) releases
+// response_buffering: .bounded (nginx proxy_buffering-on semantics) releases
 // the Content-Length body downstream in whole 4 KiB units of raw upstream
 // bytes; below one unit it behaves exactly like "complete_content_length".
-// ⏳ pending: "bounded" is accepted everywhere "complete_content_length" is,
+// ⏳ pending: `.bounded` is accepted everywhere `.completeContentLength` is,
 // but the runtime still serves it exactly as "complete_content_length".
 
 return forward(users, response_policy: {
-    version: "HTTP/1.1", framing: "content_length", connection: "request",
-    server: "nginx/1.29.7", date: "current", hide_headers: ["Date", "Server", "X-Pad"]
+    version: .http11, framing: .contentLength, connection: .request,
+    server: "nginx/1.29.7", date: .current, hide_headers: ["Date", "Server", "X-Pad"]
 })
 // Public HEAD suppression is an explicit paired source contract:
 return forward(users,
     response_policy: {
-        version: "HTTP/1.1", framing: "content_length", connection: "request",
-        head_mode: "suppress_body", server: "nginx/1.29.7", date: "current",
+        version: .http11, framing: .contentLength, connection: .request,
+        head_mode: .suppressBody, server: "nginx/1.29.7", date: .current,
         hide_headers: ["Date", "Server", "X-Pad"]
     },
     failure_policy: {
-        version: "HTTP/1.1", status: 502, reason: "Bad Gateway",
-        content_type: "text/html", server: "nginx/1.29.7", date: "current",
-        connection: "request", head_mode: "suppress_body", body: b"<html>...</html>"
+        version: .http11, status: 502, reason: "Bad Gateway",
+        content_type: "text/html", server: "nginx/1.29.7", date: .current,
+        connection: .request, head_mode: .suppressBody, body: b"<html>...</html>"
     })
-// head_mode defaults to "reject". "suppress_body" is accepted in source only
+// head_mode defaults to .reject. .suppressBody is accepted in source only
 // when both policies select it; it remains bounded to cleartext H1.1, bodyless
 // HEAD with either no Connection field (the HTTP/1.1 default-keepalive shape)
 // or exactly one `Connection: close`, one IPv4 upstream, strict success, and
-// connect-establishment failure. On a `host: "preserve"` (ID4) route only,
+// connect-establishment failure. On a `host: .preserve` (ID4) route only,
 // this Connection grammar widens to the same nomination rule the ordinary
 // ID4 request-policy path already applies, and to any number of physical
 // Connection fields, not just one: every comma-separated, case-insensitive
@@ -465,7 +495,7 @@ return forward(users,
 // nominated, for example). While the broader failure rendezvous is not
 // part of this contract, timeout, malformed/incomplete/excess response, and
 // upload/send/recv failure close before emitting downstream bytes.
-// response_policy.connection: "keep_alive" requires a keep-alive downstream
+// response_policy.connection: .keepAlive requires a keep-alive downstream
 // request and emits keep-alive. "request" follows the parsed downstream
 // HTTP/1.1 intent, emitting keep-alive by default and close for
 // Connection: close. The strict response-domain limits above remain unchanged.
@@ -478,8 +508,8 @@ return forward(users,
 // policy/runtime domain above, while H2 and simulator execution remain
 // unsupported.
 return redirect({
-    scheme: "http", authority: "request_host", port: "actual_listener",
-    path: "static", query: "preserve_raw", date: "current", connection: "close",
+    scheme: .http, authority: .requestHost, port: .actualListener,
+    path: .static, query: .preserveRaw, date: .current, connection: .close,
     status: 301, reason: "Moved Permanently", server: "nginx/1.29.7",
     content_type: "text/html", target_path: "/api/", body: b"<p>moved</p>"
 })

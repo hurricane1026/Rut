@@ -184,10 +184,10 @@ static bool validate_query_proxy_generated_source_fields(const std::string& sour
            count_text(source, transform) == 1u && count_text(source, "strip_prefix:") == 1u &&
            count_text(source, "replace_prefix:") == 1u && count_text(source, replacement) == 1u &&
            count_text(source, "return forward(nginx_upstream, target_transform: {") == 1u &&
-           count_text(source, "query: \"preserve_raw\"") == 1u &&
-           source.find("query: \"drop\"") == std::string::npos &&
+           count_text(source, "query: .preserveRaw") == 1u &&
+           source.find("query: .drop") == std::string::npos &&
            source.find("normalize") == std::string::npos &&
-           count_text(source, "host: \"upstream\"") == 1u && count_text(source, "route \"") == 1u &&
+           count_text(source, "host: .upstream") == 1u && count_text(source, "route \"") == 1u &&
            source.find("route \"/api?") == std::string::npos &&
            source.find("route \"/api/") == std::string::npos &&
            source.find("req.host") == std::string::npos &&
@@ -1833,13 +1833,13 @@ TEST(nginx_converter, http_profile_exact_maximum_payload_owns_terminal_capacity_
     REQUIRE(parsed);
     const auto server = nginx::lower_to_rut(parsed.value().server);
     REQUIRE(server);
-    REQUIRE_EQ(server.value().len, 5945u);
+    REQUIRE_EQ(server.value().len, 5829u);
     CHECK_LT(server.value().len, nginx::RutSource::kCapacity);
     const auto lowered = nginx::lower_to_rut(parsed.value());
     REQUIRE(lowered);
     CHECK_EQ(lowered.value().len - server.value().len,
              nginx::HttpProfileRutSource::kMaxAccessLogDeclarationLen);
-    CHECK_EQ(lowered.value().len, 6274u);
+    CHECK_EQ(lowered.value().len, 6158u);
     CHECK_LT(lowered.value().len, nginx::HttpProfileRutSource::kCapacity);
     CHECK_EQ(lowered.value().data[lowered.value().len], '\0');
     const std::string declaration =
@@ -1855,7 +1855,7 @@ TEST(nginx_converter, http_profile_exact_maximum_payload_owns_terminal_capacity_
     REQUIRE(off_profile);
     const auto off_server = nginx::lower_to_rut(off_profile.value().server);
     REQUIRE(off_server);
-    REQUIRE_EQ(off_server.value().len, 5945u);
+    REQUIRE_EQ(off_server.value().len, 5829u);
     CHECK_LT(off_server.value().len, nginx::RutSource::kCapacity);
     const auto off_lowered = nginx::lower_to_rut(off_profile.value());
     REQUIRE(off_lowered);
@@ -1888,13 +1888,13 @@ TEST(nginx_converter, issue373_http_profile_hide_exact_maximum_fits_and_is_owned
     REQUIRE(parsed);
     const auto server = nginx::lower_to_rut(parsed.value().server);
     REQUIRE(server);
-    REQUIRE_EQ(server.value().len, 5374u);
+    REQUIRE_EQ(server.value().len, 5268u);
     CHECK_LT(server.value().len, nginx::RutSource::kCapacity);
     CHECK_EQ(server.value().data[server.value().len], '\0');
     CHECK_LT(server.value().len, nginx::RutSource::kCapacity);
     const auto lowered = nginx::lower_to_rut(parsed.value());
     REQUIRE(lowered);
-    REQUIRE_EQ(lowered.value().len, 5703u);
+    REQUIRE_EQ(lowered.value().len, 5597u);
     CHECK_LT(lowered.value().len, nginx::HttpProfileRutSource::kCapacity);
     CHECK_EQ(lowered.value().data[lowered.value().len], '\0');
     CHECK_EQ(count_text(std::string(lowered.value().data, lowered.value().len), "X-Compat-Hidden"),
@@ -4429,7 +4429,7 @@ TEST(nginx_parser, parsed_generic_proxy_location_reaches_ordinary_rut_lowering) 
     CHECK_FALSE(missing_uri.value().location.proxy_pass.has_uri);
     const auto missing_uri_lowered = nginx::lower_to_rut(missing_uri.value());
     REQUIRE(missing_uri_lowered);
-    CHECK_EQ(missing_uri_lowered.value().len, 3247u);
+    CHECK_EQ(missing_uri_lowered.value().len, 3189u);
     CHECK(strstr(missing_uri_lowered.value().data, "route \"/service\" {") != nullptr);
     CHECK(strstr(missing_uri_lowered.value().data, "target_transform:") == nullptr);
     const char* missing_uri_path = strstr(service_without_uri, "/service/");
@@ -5084,7 +5084,7 @@ TEST(nginx_parser, rejects_unmatched_location_and_proxy_uri_shapes) {
     CHECK_FALSE(parsed_api_without_uri.value().location.proxy_pass.has_uri);
     const auto lowered_api_without_uri = nginx::lower_to_rut(parsed_api_without_uri.value());
     REQUIRE(lowered_api_without_uri);
-    CHECK_EQ(lowered_api_without_uri.value().len, 3232u);
+    CHECK_EQ(lowered_api_without_uri.value().len, 3174u);
     CHECK(strstr(lowered_api_without_uri.value().data, "route \"/api\" {") != nullptr);
     CHECK(strstr(lowered_api_without_uri.value().data, "target_transform:") == nullptr);
 
@@ -5940,19 +5940,19 @@ TEST(nginx_converter, lowers_bounded_clean_exact_no_content_paths) {
         u32 expected_length;
     };
     const Vector vectors[] = {
-        {"/x", "route exact slash_normalized GET \"/x\" { return local_response({", 5551u},
+        {"/x", "route exact slash_normalized GET \"/x\" { return local_response({", 5438u},
         {"/healthz",
          "route exact slash_normalized GET \"/healthz\" { return local_response({",
-         5557u},
+         5444u},
         {"/status",
          "route exact slash_normalized GET \"/status\" { return local_response({",
-         5556u},
+         5443u},
         {"/health/check",
          "route exact slash_normalized GET \"/health/check\" { return local_response({",
-         5562u},
+         5449u},
         {"/health/check/",
          "route exact slash_normalized GET \"/health/check/\" { return local_response({",
-         5563u},
+         5450u},
     };
     for (const auto& vector : vectors) {
         char source[256]{};
@@ -5976,8 +5976,8 @@ TEST(nginx_converter, lowers_bounded_clean_exact_no_content_paths) {
         REQUIRE(route != nullptr);
         CHECK(strstr(route + 1, vector.route) == nullptr);
         CHECK(strstr(route, "status: 204, reason: \"No Content\"") != nullptr);
-        CHECK(strstr(route, "content_type: \"\", connection: \"request\"") != nullptr);
-        CHECK(strstr(route, "head_mode: \"suppress_body\", body: b\"\"") != nullptr);
+        CHECK(strstr(route, "content_type: \"\", connection: .request") != nullptr);
+        CHECK(strstr(route, "head_mode: .suppressBody, body: b\"\"") != nullptr);
         CHECK(strstr(lowered.value().data, "nginx.conf") == nullptr);
         CHECK(strstr(lowered.value().data, "proxy_pass") == nullptr);
         const auto lexed = lex(lowered.value().view());
@@ -6465,9 +6465,9 @@ TEST(nginx_converter, lowers_parsed_bounded_exact_local_path_in_either_order) {
         REQUIRE(lowered);
         static constexpr char kGolden[] =
             "route exact slash_normalized \"/healthz\" { return local_response({\n"
-            "  version: \"HTTP/1.1\", status: 200, reason: \"OK\", server: \"nginx/1.29.7\",\n"
-            "  date: \"current\", content_type: \"text/plain\", connection: \"request\",\n"
-            "  head_mode: \"suppress_body\", body: b\"successor-static\"\n"
+            "  version: .http11, status: 200, reason: \"OK\", server: \"nginx/1.29.7\",\n"
+            "  date: .current, content_type: \"text/plain\", connection: .request,\n"
+            "  head_mode: .suppressBody, body: b\"successor-static\"\n"
             "}) }\n";
         REQUIRE_GE(lowered.value().len, static_cast<u32>(sizeof(kGolden) - 1u));
         const Str suffix{lowered.value().data + lowered.value().len - sizeof(kGolden) + 1u,
@@ -6483,7 +6483,7 @@ TEST(nginx_converter, lowers_parsed_bounded_exact_local_path_in_either_order) {
     const auto exact_lowered = nginx::lower_to_rut(exact_first.value());
     REQUIRE(root_lowered);
     REQUIRE(exact_lowered);
-    CHECK_EQ(root_lowered.value().len, 5571u);
+    CHECK_EQ(root_lowered.value().len, 5458u);
     CHECK(root_lowered.value().view().eq(exact_lowered.value().view()));
 }
 
@@ -6531,9 +6531,9 @@ TEST(nginx_converter, lowers_one_internal_exact_local_body_space_to_stable_rut) 
 
     static constexpr char kGolden[] =
         "route exact slash_normalized \"/static\" { return local_response({\n"
-        "  version: \"HTTP/1.1\", status: 200, reason: \"OK\", server: \"nginx/1.29.7\",\n"
-        "  date: \"current\", content_type: \"text/plain\", connection: \"request\",\n"
-        "  head_mode: \"suppress_body\", body: b\"hello world\"\n"
+        "  version: .http11, status: 200, reason: \"OK\", server: \"nginx/1.29.7\",\n"
+        "  date: .current, content_type: \"text/plain\", connection: .request,\n"
+        "  head_mode: .suppressBody, body: b\"hello world\"\n"
         "}) }\n";
     REQUIRE_GE(root_lowered.value().len, static_cast<u32>(sizeof(kGolden) - 1u));
     CHECK((Str{root_lowered.value().data + root_lowered.value().len - sizeof(kGolden) + 1u,
@@ -6609,15 +6609,15 @@ TEST(nginx_converter, lowers_exact_local_return_in_either_declaration_order_to_s
 
     static constexpr char kExactGolden[] =
         "route exact slash_normalized \"/static\" { return local_response({\n"
-        "  version: \"HTTP/1.1\", status: 200, reason: \"OK\", server: \"nginx/1.29.7\",\n"
-        "  date: \"current\", content_type: \"text/plain\", connection: \"request\",\n"
-        "  head_mode: \"suppress_body\", body: b\"successor-static\"\n"
+        "  version: .http11, status: 200, reason: \"OK\", server: \"nginx/1.29.7\",\n"
+        "  date: .current, content_type: \"text/plain\", connection: .request,\n"
+        "  head_mode: .suppressBody, body: b\"successor-static\"\n"
         "}) }\n";
     static constexpr char kTraceGolden[] =
         "pre_route TRACE { return local_response({\n"
-        "  version: \"HTTP/1.1\", status: 405, reason: \"Not Allowed\", server: \"nginx/1.29.7\",\n"
-        "  date: \"current\", content_type: \"text/html\", connection: \"request\",\n"
-        "  head_mode: \"reject\", body: b\"<html>\\r\\n<head><title>405 Not "
+        "  version: .http11, status: 405, reason: \"Not Allowed\", server: \"nginx/1.29.7\",\n"
+        "  date: .current, content_type: \"text/html\", connection: .request,\n"
+        "  head_mode: .reject, body: b\"<html>\\r\\n<head><title>405 Not "
         "Allowed</title></head>\\r\\n"
         "<body>\\r\\n<center><h1>405 Not Allowed</h1></center>\\r\\n"
         "<hr><center>nginx/1.29.7</center>\\r\\n</body>\\r\\n</html>\\r\\n\"\n"
@@ -6650,7 +6650,7 @@ TEST(nginx_converter, exact_local_return_maximum_body_fits_bounded_source) {
     REQUIRE(parsed);
     const auto lowered = nginx::lower_to_rut(parsed.value());
     REQUIRE(lowered);
-    CHECK_EQ(lowered.value().len, 9655u);
+    CHECK_EQ(lowered.value().len, 9542u);
     CHECK_EQ(nginx::RutSource::kCapacity, 12779u);
     CHECK_LT(lowered.value().len, nginx::RutSource::kCapacity);
     const auto lexed = lex(lowered.value().view());
@@ -6669,8 +6669,8 @@ TEST(nginx_converter, exact_local_return_maximum_path_and_body_fit_bounded_sourc
     REQUIRE(parsed);
     const auto lowered = nginx::lower_to_rut(parsed.value());
     REQUIRE(lowered);
-    CHECK_EQ(lowered.value().len, 9710u);
-    CHECK_EQ(nginx::RutSource::kCapacity - lowered.value().len, 3069u);
+    CHECK_EQ(lowered.value().len, 9597u);
+    CHECK_EQ(nginx::RutSource::kCapacity - lowered.value().len, 3182u);
     CHECK_LT(lowered.value().len, nginx::RutSource::kCapacity);
     const auto lexed = lex(lowered.value().view());
     REQUIRE(lexed);
@@ -6693,8 +6693,8 @@ TEST(nginx_converter, normalized_exact_local_return_maximum_path_and_body_fit_bo
     REQUIRE_EQ(parsed.value().exact_local_return.path.len, nginx::kMaxExactLocalReturnPathLen);
     const auto lowered = nginx::lower_to_rut(parsed.value());
     REQUIRE(lowered);
-    CHECK_EQ(lowered.value().len, 9710u);
-    CHECK_EQ(nginx::RutSource::kCapacity - lowered.value().len, 3069u);
+    CHECK_EQ(lowered.value().len, 9597u);
+    CHECK_EQ(nginx::RutSource::kCapacity - lowered.value().len, 3182u);
     CHECK_LT(lowered.value().len, nginx::RutSource::kCapacity);
     CHECK(strstr(lowered.value().data, "route exact slash_normalized \"") != nullptr);
     const auto lexed = lex(lowered.value().view());
@@ -6714,7 +6714,7 @@ TEST(nginx_converter, multiple_space_maximum_path_and_body_keep_exact_source_cap
         bool trailing_slash;
         u32 expected_len;
     };
-    const Vector vectors[] = {{false, 9710u}, {true, 9710u}};
+    const Vector vectors[] = {{false, 9597u}, {true, 9597u}};
     for (const auto& vector : vectors) {
         char path[nginx::kMaxExactLocalReturnPathLen + 1u]{};
         path[0] = '/';
@@ -7295,11 +7295,11 @@ TEST(nginx_converter, lowers_exact_absolute_redirect_in_either_order_to_stable_r
     static constexpr char kRedirectPrefix[] =
         "route GET \"/\" {\n"
         "    if req.pathOnly == \"/old\" {\n"
-        "        return redirect({scheme: \"http\", authority: \"static\", static_authority: "
-        "\"redirect.example\", port: \"omit\",\n"
-        "            path: \"static\", query: \"discard\", date: \"current\", connection: "
-        "\"close\",\n"
-        "            header_order: \"connection_then_location\", status: 301, reason: \"Moved "
+        "        return redirect({scheme: .http, authority: .static, static_authority: "
+        "\"redirect.example\", port: .omit,\n"
+        "            path: .static, query: .discard, date: .current, connection: "
+        ".close,\n"
+        "            header_order: .connectionThenLocation, status: 301, reason: \"Moved "
         "Permanently\",\n"
         "            server: \"nginx/1.29.7\", content_type: \"text/html\", target_path: "
         "\"/new\", body: b\"<html>\\r\\n"
@@ -7316,9 +7316,9 @@ TEST(nginx_converter, lowers_exact_absolute_redirect_in_either_order_to_stable_r
     REQUIRE(redirect_route != nullptr);
     CHECK((Str{redirect_route, sizeof(kRedirectPrefix) - 1u}.eq(
         {kRedirectPrefix, sizeof(kRedirectPrefix) - 1u})));
-    CHECK_EQ(strstr(root_lowered.value().data, "authority: \"request_host\""), nullptr);
-    CHECK_EQ(strstr(root_lowered.value().data, "port: \"actual_listener\""), nullptr);
-    CHECK_EQ(strstr(root_lowered.value().data, "query: \"preserve_raw\""), nullptr);
+    CHECK_EQ(strstr(root_lowered.value().data, "authority: .requestHost"), nullptr);
+    CHECK_EQ(strstr(root_lowered.value().data, "port: .actualListener"), nullptr);
+    CHECK_EQ(strstr(root_lowered.value().data, "query: .preserveRaw"), nullptr);
 
     const char* generated_forward = strstr(redirect_route, "forward(nginx_upstream");
     const char* generated_any = strstr(redirect_route, "route \"/\" {");
@@ -7350,7 +7350,7 @@ TEST(nginx_converter, lowers_exact_absolute_redirect_in_either_order_to_stable_r
     REQUIRE_EQ(generated_prefix_len, legacy_prefix_len);
     CHECK((Str{root_lowered.value().data, generated_prefix_len}.eq(
         {legacy.value().data, legacy_prefix_len})));
-    CHECK_EQ(root_lowered.value().len, 5928u);
+    CHECK_EQ(root_lowered.value().len, 5812u);
 }
 
 TEST(nginx_converter, lowers_exact_302_absolute_redirect_to_exact_stable_rut) {
@@ -7375,11 +7375,11 @@ TEST(nginx_converter, lowers_exact_302_absolute_redirect_to_exact_stable_rut) {
     static constexpr char kRedirectGolden[] =
         "route GET \"/\" {\n"
         "    if req.pathOnly == \"/old\" {\n"
-        "        return redirect({scheme: \"http\", authority: \"static\", static_authority: "
-        "\"redirect.example\", port: \"omit\",\n"
-        "            path: \"static\", query: \"discard\", date: \"current\", connection: "
-        "\"close\",\n"
-        "            header_order: \"connection_then_location\", status: 302, reason: \"Moved "
+        "        return redirect({scheme: .http, authority: .static, static_authority: "
+        "\"redirect.example\", port: .omit,\n"
+        "            path: .static, query: .discard, date: .current, connection: "
+        ".close,\n"
+        "            header_order: .connectionThenLocation, status: 302, reason: \"Moved "
         "Temporarily\",\n"
         "            server: \"nginx/1.29.7\", content_type: \"text/html\", target_path: "
         "\"/new\", body: b\"<html>\\r\\n"
@@ -7436,7 +7436,7 @@ TEST(nginx_converter, lowers_exact_302_absolute_redirect_to_exact_stable_rut) {
         static_cast<u32>(legacy.value().data + legacy.value().len - legacy_any);
     REQUIRE_EQ(generated_suffix_len, legacy_suffix_len);
     CHECK((Str{generated_any, generated_suffix_len}.eq({legacy_any, legacy_suffix_len})));
-    CHECK_EQ(root_lowered.value().len, 5904u);
+    CHECK_EQ(root_lowered.value().len, 5788u);
 }
 
 TEST(nginx_converter, lowers_parsed_302_and_rejects_forged_status_provenance) {
@@ -7464,7 +7464,7 @@ TEST(nginx_converter, lowers_parsed_302_and_rejects_forged_status_provenance) {
         REQUIRE(response.status_lexeme.eq(lit_str("302")));
         const auto lowered = nginx::lower_to_rut(parsed.value());
         REQUIRE(lowered);
-        CHECK_EQ(lowered.value().len, 5904u);
+        CHECK_EQ(lowered.value().len, 5788u);
     }
 
     const auto parsed = nginx::parse({kRootFirst, sizeof(kRootFirst) - 1u});
@@ -7825,63 +7825,63 @@ TEST(nginx_converter, lowers_canonical_model_to_stable_rut_source) {
         "listen :8080\n"
         "upstream nginx_upstream at \"127.0.0.1:9000\"\n"
         "pre_route TRACE { return local_response({\n"
-        "  version: \"HTTP/1.1\", status: 405, reason: \"Not Allowed\", server: \"nginx/1.29.7\",\n"
-        "  date: \"current\", content_type: \"text/html\", connection: \"request\",\n"
-        "  head_mode: \"reject\", body: b\"<html>\\r\\n<head><title>405 Not "
+        "  version: .http11, status: 405, reason: \"Not Allowed\", server: \"nginx/1.29.7\",\n"
+        "  date: .current, content_type: \"text/html\", connection: .request,\n"
+        "  head_mode: .reject, body: b\"<html>\\r\\n<head><title>405 Not "
         "Allowed</title></head>\\r\\n"
         "<body>\\r\\n<center><h1>405 Not Allowed</h1></center>\\r\\n"
         "<hr><center>nginx/1.29.7</center>\\r\\n</body>\\r\\n</html>\\r\\n\"\n"
         "}) }\n"
         "unmatched OPTIONS { return local_response({\n"
-        "  version: \"HTTP/1.1\", status: 400, reason: \"Bad Request\", server: \"nginx/1.29.7\",\n"
-        "  date: \"current\", content_type: \"text/html\", connection: \"request\",\n"
-        "  head_mode: \"reject\", body: b\"<html>\\r\\n<head><title>400 Bad "
+        "  version: .http11, status: 400, reason: \"Bad Request\", server: \"nginx/1.29.7\",\n"
+        "  date: .current, content_type: \"text/html\", connection: .request,\n"
+        "  head_mode: .reject, body: b\"<html>\\r\\n<head><title>400 Bad "
         "Request</title></head>\\r\\n"
         "<body>\\r\\n<center><h1>400 Bad Request</h1></center>\\r\\n"
         "<hr><center>nginx/1.29.7</center>\\r\\n</body>\\r\\n</html>\\r\\n\"\n"
         "}) }\n"
         "unmatched CONNECT { return local_response({\n"
-        "  version: \"HTTP/1.1\", status: 405, reason: \"Not Allowed\", server: \"nginx/1.29.7\",\n"
-        "  date: \"current\", content_type: \"text/html\", connection: \"request\",\n"
-        "  head_mode: \"reject\", body: b\"<html>\\r\\n<head><title>405 Not "
+        "  version: .http11, status: 405, reason: \"Not Allowed\", server: \"nginx/1.29.7\",\n"
+        "  date: .current, content_type: \"text/html\", connection: .request,\n"
+        "  head_mode: .reject, body: b\"<html>\\r\\n<head><title>405 Not "
         "Allowed</title></head>\\r\\n"
         "<body>\\r\\n<center><h1>405 Not Allowed</h1></center>\\r\\n"
         "<hr><center>nginx/1.29.7</center>\\r\\n</body>\\r\\n</html>\\r\\n\"\n"
         "}) }\n"
         "unmatched { return local_response({\n"
-        "  version: \"HTTP/1.1\", status: 400, reason: \"Bad Request\", server: \"nginx/1.29.7\",\n"
-        "  date: \"current\", content_type: \"text/html\", connection: \"request\",\n"
-        "  head_mode: \"suppress_body\", body: b\"<html>\\r\\n<head><title>400 Bad "
+        "  version: .http11, status: 400, reason: \"Bad Request\", server: \"nginx/1.29.7\",\n"
+        "  date: .current, content_type: \"text/html\", connection: .request,\n"
+        "  head_mode: .suppressBody, body: b\"<html>\\r\\n<head><title>400 Bad "
         "Request</title></head>\\r\\n"
         "<body>\\r\\n<center><h1>400 Bad Request</h1></center>\\r\\n"
         "<hr><center>nginx/1.29.7</center>\\r\\n</body>\\r\\n</html>\\r\\n\"\n"
         "}) }\n"
         "route HEAD \"/\" {\n"
         "    return forward(nginx_upstream, request_policy: {\n"
-        "            version: \"HTTP/1.1\",\n"
-        "            host: \"upstream\",\n"
-        "            connection: \"omit\",\n"
-        "            strip_headers: [\"Connection\", \"Keep-Alive\", \"TE\", \"Expect\", "
-        "\"Upgrade\"]\n"
+        "            version: .http11,\n"
+        "            host: .upstream,\n"
+        "            connection: .omit,\n"
+        "            strip_headers: [.connection, .keepAlive, .te, .expect, "
+        ".upgrade]\n"
         "        },\n"
         "        response_policy: {\n"
-        "            version: \"HTTP/1.1\",\n"
-        "            framing: \"content_length\",\n"
-        "            connection: \"request\",\n"
-        "            head_mode: \"suppress_body\",\n"
+        "            version: .http11,\n"
+        "            framing: .contentLength,\n"
+        "            connection: .request,\n"
+        "            head_mode: .suppressBody,\n"
         "            server: \"nginx/1.29.7\",\n"
-        "            date: \"current\",\n"
+        "            date: .current,\n"
         "            hide_headers: [\"Date\", \"Server\", \"X-Pad\"]\n"
         "        },\n"
         "        failure_policy: {\n"
-        "            version: \"HTTP/1.1\",\n"
+        "            version: .http11,\n"
         "            status: 502,\n"
         "            reason: \"Bad Gateway\",\n"
         "            content_type: \"text/html\",\n"
         "            server: \"nginx/1.29.7\",\n"
-        "            date: \"current\",\n"
-        "            connection: \"request\",\n"
-        "            head_mode: \"suppress_body\",\n"
+        "            date: .current,\n"
+        "            connection: .request,\n"
+        "            head_mode: .suppressBody,\n"
         "            body: b\"<html>\\r\\n<head><title>502 Bad "
         "Gateway</title></head>\\r\\n<body>\\r\\n<center><h1>502 Bad "
         "Gateway</h1></center>\\r\\n<hr><center>nginx/1.29.7</center>\\r\\n</body>\\r\\n</"
@@ -7891,74 +7891,74 @@ TEST(nginx_converter, lowers_canonical_model_to_stable_rut_source) {
         "}\n"
         "route GET \"/\" {\n"
         "    return forward(nginx_upstream, request_policy: {\n"
-        "            version: \"HTTP/1.1\",\n"
-        "            host: \"upstream\",\n"
-        "            connection: \"omit\",\n"
-        "            strip_headers: [\"Connection\", \"Keep-Alive\", \"TE\", \"Expect\", "
-        "\"Upgrade\"]\n"
+        "            version: .http11,\n"
+        "            host: .upstream,\n"
+        "            connection: .omit,\n"
+        "            strip_headers: [.connection, .keepAlive, .te, .expect, "
+        ".upgrade]\n"
         "        },\n"
         "        response_policy: {\n"
-        "            version: \"HTTP/1.1\",\n"
-        "            framing: \"content_length\",\n"
-        "            connection: \"request\",\n"
+        "            version: .http11,\n"
+        "            framing: .contentLength,\n"
+        "            connection: .request,\n"
         "            server: \"nginx/1.29.7\",\n"
-        "            date: \"current\",\n"
+        "            date: .current,\n"
         "            hide_headers: [\"Date\", \"Server\", \"X-Pad\"]\n"
         "        },\n"
         "        failure_policy: {\n"
-        "            version: \"HTTP/1.1\",\n"
+        "            version: .http11,\n"
         "            status: 502,\n"
         "            reason: \"Bad Gateway\",\n"
         "            content_type: \"text/html\",\n"
         "            server: \"nginx/1.29.7\",\n"
-        "            date: \"current\",\n"
-        "            connection: \"request\",\n"
+        "            date: .current,\n"
+        "            connection: .request,\n"
         "            body: b\"<html>\\r\\n<head><title>502 Bad "
         "Gateway</title></head>\\r\\n<body>\\r\\n<center><h1>502 Bad "
         "Gateway</h1></center>\\r\\n<hr><center>nginx/1.29.7</center>\\r\\n</body>\\r\\n</"
         "html>\\r\\n\"\n"
         "        },\n"
         "        timeout_failure_policy: {\n"
-        "            version: \"HTTP/1.1\",\n"
+        "            version: .http11,\n"
         "            status: 504,\n"
         "            reason: \"Gateway Time-out\",\n"
         "            content_type: \"text/html\",\n"
         "            server: \"nginx/1.29.7\",\n"
-        "            date: \"current\",\n"
-        "            connection: \"request\",\n"
+        "            date: .current,\n"
+        "            connection: .request,\n"
         "            body: b\"<html>\\r\\n<head><title>504 Gateway Time-out</title></head>\\r\\n"
         "<body>\\r\\n<center><h1>504 Gateway Time-out</h1></center>\\r\\n"
         "<hr><center>nginx/1.29.7</center>\\r\\n</body>\\r\\n"
         "</html>\\r\\n\"\n"
         "        },\n"
         "        response_read_timeout: 60s,\n"
-        "        response_buffering: \"complete_content_length\"\n"
+        "        response_buffering: .completeContentLength\n"
         "    )\n"
         "}\n"
         "route \"/\" {\n"
         "    return forward(nginx_upstream, request_policy: {\n"
-        "            version: \"HTTP/1.1\",\n"
-        "            host: \"upstream\",\n"
-        "            connection: \"omit\",\n"
-        "            strip_headers: [\"Connection\", \"Keep-Alive\", \"TE\", \"Expect\", "
-        "\"Upgrade\"]\n"
+        "            version: .http11,\n"
+        "            host: .upstream,\n"
+        "            connection: .omit,\n"
+        "            strip_headers: [.connection, .keepAlive, .te, .expect, "
+        ".upgrade]\n"
         "        },\n"
         "        response_policy: {\n"
-        "            version: \"HTTP/1.1\",\n"
-        "            framing: \"content_length\",\n"
-        "            connection: \"request\",\n"
+        "            version: .http11,\n"
+        "            framing: .contentLength,\n"
+        "            connection: .request,\n"
         "            server: \"nginx/1.29.7\",\n"
-        "            date: \"current\",\n"
+        "            date: .current,\n"
         "            hide_headers: [\"Date\", \"Server\", \"X-Pad\"]\n"
         "        },\n"
         "        failure_policy: {\n"
-        "            version: \"HTTP/1.1\",\n"
+        "            version: .http11,\n"
         "            status: 502,\n"
         "            reason: \"Bad Gateway\",\n"
         "            content_type: \"text/html\",\n"
         "            server: \"nginx/1.29.7\",\n"
-        "            date: \"current\",\n"
-        "            connection: \"request\",\n"
+        "            date: .current,\n"
+        "            connection: .request,\n"
         "            body: b\"<html>\\r\\n<head><title>502 Bad "
         "Gateway</title></head>\\r\\n<body>\\r\\n<center><h1>502 Bad "
         "Gateway</h1></center>\\r\\n<hr><center>nginx/1.29.7</center>\\r\\n</body>\\r\\n</"
@@ -7975,10 +7975,10 @@ TEST(nginx_converter, lowers_canonical_model_to_stable_rut_source) {
     // orders must equal this complete source byte-for-byte.
     static constexpr char kNoContentExactGolden[] =
         "route exact slash_normalized GET \"/static\" { return local_response({\n"
-        "  version: \"HTTP/1.1\", status: 204, reason: \"No Content\", server: "
+        "  version: .http11, status: 204, reason: \"No Content\", server: "
         "\"nginx/1.29.7\",\n"
-        "  date: \"current\", content_type: \"\", connection: \"request\",\n"
-        "  head_mode: \"suppress_body\", body: b\"\"\n"
+        "  date: .current, content_type: \"\", connection: .request,\n"
+        "  head_mode: .suppressBody, body: b\"\"\n"
         "}) }\n";
     nginx::RutSource no_content_golden{};
     memcpy(no_content_golden.data, kExpected, sizeof(kExpected) - 1u);
@@ -8050,7 +8050,7 @@ TEST(nginx_converter, lowers_canonical_model_to_stable_rut_source) {
         CHECK(lowered.value().view().eq(no_content_golden.view()));
     }
     CHECK(no_content_root.value().view().eq(no_content_exact.value().view()));
-    CHECK_EQ(no_content_root.value().len, 5556u);
+    CHECK_EQ(no_content_root.value().len, 5443u);
     const char* exact_route =
         strstr(no_content_root.value().data, "route exact slash_normalized GET \"/static\"");
     REQUIRE(exact_route != nullptr);
@@ -8069,10 +8069,10 @@ TEST(nginx_converter, lowers_canonical_model_to_stable_rut_source) {
     // nginx declaration orders and for a comment/whitespace-equivalent source.
     static constexpr char kHealthzNoContentExactGolden[] =
         "route exact slash_normalized GET \"/healthz\" { return local_response({\n"
-        "  version: \"HTTP/1.1\", status: 204, reason: \"No Content\", server: "
+        "  version: .http11, status: 204, reason: \"No Content\", server: "
         "\"nginx/1.29.7\",\n"
-        "  date: \"current\", content_type: \"\", connection: \"request\",\n"
-        "  head_mode: \"suppress_body\", body: b\"\"\n"
+        "  date: .current, content_type: \"\", connection: .request,\n"
+        "  head_mode: .suppressBody, body: b\"\"\n"
         "}) }\n";
     nginx::RutSource healthz_no_content_golden{};
     memcpy(healthz_no_content_golden.data, kExpected, sizeof(kExpected) - 1u);
@@ -8099,7 +8099,7 @@ TEST(nginx_converter, lowers_canonical_model_to_stable_rut_source) {
         const auto lowered = nginx::lower_to_rut(model.value());
         REQUIRE(lowered);
         CHECK(lowered.value().view().eq(healthz_no_content_golden.view()));
-        CHECK_EQ(lowered.value().len, 5557u);
+        CHECK_EQ(lowered.value().len, 5444u);
     }
 
     struct CleanNoContentGolden {
@@ -8108,8 +8108,8 @@ TEST(nginx_converter, lowers_canonical_model_to_stable_rut_source) {
         u32 length;
     };
     const CleanNoContentGolden clean_no_content_goldens[] = {
-        {"/health/check", "route exact slash_normalized GET \"/health/check\"", 5562u},
-        {"/health/check/", "route exact slash_normalized GET \"/health/check/\"", 5563u},
+        {"/health/check", "route exact slash_normalized GET \"/health/check\"", 5449u},
+        {"/health/check/", "route exact slash_normalized GET \"/health/check/\"", 5450u},
     };
     for (const auto& vector : clean_no_content_goldens) {
         char source[256]{};
@@ -8133,9 +8133,9 @@ TEST(nginx_converter, lowers_canonical_model_to_stable_rut_source) {
     // every byte, not merely the exact-route suffix.
     static constexpr char kHealthzExactGolden[] =
         "route exact slash_normalized \"/healthz\" { return local_response({\n"
-        "  version: \"HTTP/1.1\", status: 200, reason: \"OK\", server: \"nginx/1.29.7\",\n"
-        "  date: \"current\", content_type: \"text/plain\", connection: \"request\",\n"
-        "  head_mode: \"suppress_body\", body: b\"successor-static\"\n"
+        "  version: .http11, status: 200, reason: \"OK\", server: \"nginx/1.29.7\",\n"
+        "  date: .current, content_type: \"text/plain\", connection: .request,\n"
+        "  head_mode: .suppressBody, body: b\"successor-static\"\n"
         "}) }\n";
     nginx::RutSource healthz_golden{};
     memcpy(healthz_golden.data, kExpected, sizeof(kExpected) - 1u);
@@ -8202,10 +8202,10 @@ TEST(nginx_converter, lowers_canonical_model_to_stable_rut_source) {
             snprintf(exact_golden,
                      sizeof(exact_golden),
                      "route exact slash_normalized \"/static\" { return local_response({\n"
-                     "  version: \"HTTP/1.1\", status: 200, reason: \"OK\", server: "
+                     "  version: .http11, status: 200, reason: \"OK\", server: "
                      "\"nginx/1.29.7\",\n"
-                     "  date: \"current\", content_type: \"text/plain\", connection: \"request\",\n"
-                     "  head_mode: \"suppress_body\", body: b\"%s\"\n"
+                     "  date: .current, content_type: \"text/plain\", connection: .request,\n"
+                     "  head_mode: .suppressBody, body: b\"%s\"\n"
                      "}) }\n",
                      vector.body);
         REQUIRE_GT(exact_golden_len, 0);
@@ -8258,9 +8258,9 @@ TEST(nginx_converter, lowers_canonical_model_to_stable_rut_source) {
     // lower to one entire byte-stable source.
     static constexpr char kNormalizedExactGolden[] =
         "route exact slash_normalized \"/health/check/\" { return local_response({\n"
-        "  version: \"HTTP/1.1\", status: 200, reason: \"OK\", server: \"nginx/1.29.7\",\n"
-        "  date: \"current\", content_type: \"text/plain\", connection: \"request\",\n"
-        "  head_mode: \"suppress_body\", body: b\"successor-static\"\n"
+        "  version: .http11, status: 200, reason: \"OK\", server: \"nginx/1.29.7\",\n"
+        "  date: .current, content_type: \"text/plain\", connection: .request,\n"
+        "  head_mode: .suppressBody, body: b\"successor-static\"\n"
         "}) }\n";
     nginx::RutSource normalized_golden{};
     memcpy(normalized_golden.data, kExpected, sizeof(kExpected) - 1u);
@@ -8298,43 +8298,43 @@ TEST(nginx_converter, lowers_api_model_to_stable_target_transform_source) {
         "listen :8080\n"
         "upstream nginx_upstream at \"127.0.0.1:9000\"\n"
         "pre_route TRACE { return local_response({\n"
-        "  version: \"HTTP/1.1\", status: 405, reason: \"Not Allowed\", server: \"nginx/1.29.7\",\n"
-        "  date: \"current\", content_type: \"text/html\", connection: \"request\",\n"
-        "  head_mode: \"reject\", body: b\"<html>\\r\\n<head><title>405 Not "
+        "  version: .http11, status: 405, reason: \"Not Allowed\", server: \"nginx/1.29.7\",\n"
+        "  date: .current, content_type: \"text/html\", connection: .request,\n"
+        "  head_mode: .reject, body: b\"<html>\\r\\n<head><title>405 Not "
         "Allowed</title></head>\\r\\n"
         "<body>\\r\\n<center><h1>405 Not Allowed</h1></center>\\r\\n"
         "<hr><center>nginx/1.29.7</center>\\r\\n</body>\\r\\n</html>\\r\\n\"\n"
         "}) }\n"
         "unmatched OPTIONS { return local_response({\n"
-        "  version: \"HTTP/1.1\", status: 400, reason: \"Bad Request\", server: \"nginx/1.29.7\",\n"
-        "  date: \"current\", content_type: \"text/html\", connection: \"request\",\n"
-        "  head_mode: \"reject\", body: b\"<html>\\r\\n<head><title>400 Bad "
+        "  version: .http11, status: 400, reason: \"Bad Request\", server: \"nginx/1.29.7\",\n"
+        "  date: .current, content_type: \"text/html\", connection: .request,\n"
+        "  head_mode: .reject, body: b\"<html>\\r\\n<head><title>400 Bad "
         "Request</title></head>\\r\\n"
         "<body>\\r\\n<center><h1>400 Bad Request</h1></center>\\r\\n"
         "<hr><center>nginx/1.29.7</center>\\r\\n</body>\\r\\n</html>\\r\\n\"\n"
         "}) }\n"
         "unmatched CONNECT { return local_response({\n"
-        "  version: \"HTTP/1.1\", status: 405, reason: \"Not Allowed\", server: \"nginx/1.29.7\",\n"
-        "  date: \"current\", content_type: \"text/html\", connection: \"request\",\n"
-        "  head_mode: \"reject\", body: b\"<html>\\r\\n<head><title>405 Not "
+        "  version: .http11, status: 405, reason: \"Not Allowed\", server: \"nginx/1.29.7\",\n"
+        "  date: .current, content_type: \"text/html\", connection: .request,\n"
+        "  head_mode: .reject, body: b\"<html>\\r\\n<head><title>405 Not "
         "Allowed</title></head>\\r\\n"
         "<body>\\r\\n<center><h1>405 Not Allowed</h1></center>\\r\\n"
         "<hr><center>nginx/1.29.7</center>\\r\\n</body>\\r\\n</html>\\r\\n\"\n"
         "}) }\n"
         "unmatched { return local_response({\n"
-        "  version: \"HTTP/1.1\", status: 400, reason: \"Bad Request\", server: \"nginx/1.29.7\",\n"
-        "  date: \"current\", content_type: \"text/html\", connection: \"request\",\n"
-        "  head_mode: \"suppress_body\", body: b\"<html>\\r\\n<head><title>400 Bad "
+        "  version: .http11, status: 400, reason: \"Bad Request\", server: \"nginx/1.29.7\",\n"
+        "  date: .current, content_type: \"text/html\", connection: .request,\n"
+        "  head_mode: .suppressBody, body: b\"<html>\\r\\n<head><title>400 Bad "
         "Request</title></head>\\r\\n"
         "<body>\\r\\n<center><h1>400 Bad Request</h1></center>\\r\\n"
         "<hr><center>nginx/1.29.7</center>\\r\\n</body>\\r\\n</html>\\r\\n\"\n"
         "}) }\n"
         "route \"/api\" {\n"
         "    if req.method == GET && req.pathOnly == \"/api\" {\n"
-        "        return redirect({scheme: \"http\", authority: \"request_host\", port: "
-        "\"actual_listener\",\n"
-        "            path: \"static\", query: \"preserve_raw\", date: \"current\", connection: "
-        "\"close\",\n"
+        "        return redirect({scheme: .http, authority: .requestHost, port: "
+        ".actualListener,\n"
+        "            path: .static, query: .preserveRaw, date: .current, connection: "
+        ".close,\n"
         "            status: 301, reason: \"Moved Permanently\", server: \"nginx/1.29.7\",\n"
         "            content_type: \"text/html\", target_path: \"/api/\", body: b\"<html>\\r\\n"
         "<head><title>301 Moved Permanently</title></head>\\r\\n"
@@ -8348,26 +8348,26 @@ TEST(nginx_converter, lowers_api_model_to_stable_target_transform_source) {
         "            strip_prefix: \"/api/\",\n"
         "            replace_prefix: \"/\"\n"
         "        }, request_policy: {\n"
-        "            version: \"HTTP/1.1\",\n"
-        "            host: \"upstream\",\n"
-        "            connection: \"omit\",\n"
-        "            strip_headers: [\"Connection\", \"Keep-Alive\", \"TE\", \"Expect\", "
-        "\"Upgrade\"]\n"
+        "            version: .http11,\n"
+        "            host: .upstream,\n"
+        "            connection: .omit,\n"
+        "            strip_headers: [.connection, .keepAlive, .te, .expect, "
+        ".upgrade]\n"
         "        }, response_policy: {\n"
-        "            version: \"HTTP/1.1\",\n"
-        "            framing: \"content_length\",\n"
-        "            connection: \"request\",\n"
+        "            version: .http11,\n"
+        "            framing: .contentLength,\n"
+        "            connection: .request,\n"
         "            server: \"nginx/1.29.7\",\n"
-        "            date: \"current\",\n"
+        "            date: .current,\n"
         "            hide_headers: [\"Date\", \"Server\", \"X-Pad\"]\n"
         "        }, failure_policy: {\n"
-        "            version: \"HTTP/1.1\",\n"
+        "            version: .http11,\n"
         "            status: 502,\n"
         "            reason: \"Bad Gateway\",\n"
         "            content_type: \"text/html\",\n"
         "            server: \"nginx/1.29.7\",\n"
-        "            date: \"current\",\n"
-        "            connection: \"request\",\n"
+        "            date: .current,\n"
+        "            connection: .request,\n"
         "            body: b\"<html>\\r\\n<head><title>502 Bad "
         "Gateway</title></head>\\r\\n<body>\\r\\n<center><h1>502 Bad "
         "Gateway</h1></center>\\r\\n<hr><center>nginx/1.29.7</center>\\r\\n</body>\\r\\n</"
@@ -8392,43 +8392,43 @@ TEST(nginx_converter, lowers_service_root_replacement_to_full_byte_stable_source
         "listen :8080\n"
         "upstream nginx_upstream at \"127.0.0.1:9000\"\n"
         "pre_route TRACE { return local_response({\n"
-        "  version: \"HTTP/1.1\", status: 405, reason: \"Not Allowed\", server: \"nginx/1.29.7\",\n"
-        "  date: \"current\", content_type: \"text/html\", connection: \"request\",\n"
-        "  head_mode: \"reject\", body: b\"<html>\\r\\n<head><title>405 Not "
+        "  version: .http11, status: 405, reason: \"Not Allowed\", server: \"nginx/1.29.7\",\n"
+        "  date: .current, content_type: \"text/html\", connection: .request,\n"
+        "  head_mode: .reject, body: b\"<html>\\r\\n<head><title>405 Not "
         "Allowed</title></head>\\r\\n"
         "<body>\\r\\n<center><h1>405 Not Allowed</h1></center>\\r\\n"
         "<hr><center>nginx/1.29.7</center>\\r\\n</body>\\r\\n</html>\\r\\n\"\n"
         "}) }\n"
         "unmatched OPTIONS { return local_response({\n"
-        "  version: \"HTTP/1.1\", status: 400, reason: \"Bad Request\", server: \"nginx/1.29.7\",\n"
-        "  date: \"current\", content_type: \"text/html\", connection: \"request\",\n"
-        "  head_mode: \"reject\", body: b\"<html>\\r\\n<head><title>400 Bad "
+        "  version: .http11, status: 400, reason: \"Bad Request\", server: \"nginx/1.29.7\",\n"
+        "  date: .current, content_type: \"text/html\", connection: .request,\n"
+        "  head_mode: .reject, body: b\"<html>\\r\\n<head><title>400 Bad "
         "Request</title></head>\\r\\n"
         "<body>\\r\\n<center><h1>400 Bad Request</h1></center>\\r\\n"
         "<hr><center>nginx/1.29.7</center>\\r\\n</body>\\r\\n</html>\\r\\n\"\n"
         "}) }\n"
         "unmatched CONNECT { return local_response({\n"
-        "  version: \"HTTP/1.1\", status: 405, reason: \"Not Allowed\", server: \"nginx/1.29.7\",\n"
-        "  date: \"current\", content_type: \"text/html\", connection: \"request\",\n"
-        "  head_mode: \"reject\", body: b\"<html>\\r\\n<head><title>405 Not "
+        "  version: .http11, status: 405, reason: \"Not Allowed\", server: \"nginx/1.29.7\",\n"
+        "  date: .current, content_type: \"text/html\", connection: .request,\n"
+        "  head_mode: .reject, body: b\"<html>\\r\\n<head><title>405 Not "
         "Allowed</title></head>\\r\\n"
         "<body>\\r\\n<center><h1>405 Not Allowed</h1></center>\\r\\n"
         "<hr><center>nginx/1.29.7</center>\\r\\n</body>\\r\\n</html>\\r\\n\"\n"
         "}) }\n"
         "unmatched { return local_response({\n"
-        "  version: \"HTTP/1.1\", status: 400, reason: \"Bad Request\", server: \"nginx/1.29.7\",\n"
-        "  date: \"current\", content_type: \"text/html\", connection: \"request\",\n"
-        "  head_mode: \"suppress_body\", body: b\"<html>\\r\\n<head><title>400 Bad "
+        "  version: .http11, status: 400, reason: \"Bad Request\", server: \"nginx/1.29.7\",\n"
+        "  date: .current, content_type: \"text/html\", connection: .request,\n"
+        "  head_mode: .suppressBody, body: b\"<html>\\r\\n<head><title>400 Bad "
         "Request</title></head>\\r\\n"
         "<body>\\r\\n<center><h1>400 Bad Request</h1></center>\\r\\n"
         "<hr><center>nginx/1.29.7</center>\\r\\n</body>\\r\\n</html>\\r\\n\"\n"
         "}) }\n"
         "route \"/service\" {\n"
         "    if req.method == GET && req.pathOnly == \"/service\" {\n"
-        "        return redirect({scheme: \"http\", authority: \"request_host\", port: "
-        "\"actual_listener\",\n"
-        "            path: \"static\", query: \"preserve_raw\", date: \"current\", connection: "
-        "\"close\",\n"
+        "        return redirect({scheme: .http, authority: .requestHost, port: "
+        ".actualListener,\n"
+        "            path: .static, query: .preserveRaw, date: .current, connection: "
+        ".close,\n"
         "            status: 301, reason: \"Moved Permanently\", server: \"nginx/1.29.7\",\n"
         "            content_type: \"text/html\", target_path: \"/service/\", body: b\"<html>\\r\\n"
         "<head><title>301 Moved Permanently</title></head>\\r\\n"
@@ -8442,26 +8442,26 @@ TEST(nginx_converter, lowers_service_root_replacement_to_full_byte_stable_source
         "            strip_prefix: \"/service/\",\n"
         "            replace_prefix: \"/\"\n"
         "        }, request_policy: {\n"
-        "            version: \"HTTP/1.1\",\n"
-        "            host: \"upstream\",\n"
-        "            connection: \"omit\",\n"
-        "            strip_headers: [\"Connection\", \"Keep-Alive\", \"TE\", \"Expect\", "
-        "\"Upgrade\"]\n"
+        "            version: .http11,\n"
+        "            host: .upstream,\n"
+        "            connection: .omit,\n"
+        "            strip_headers: [.connection, .keepAlive, .te, .expect, "
+        ".upgrade]\n"
         "        }, response_policy: {\n"
-        "            version: \"HTTP/1.1\",\n"
-        "            framing: \"content_length\",\n"
-        "            connection: \"request\",\n"
+        "            version: .http11,\n"
+        "            framing: .contentLength,\n"
+        "            connection: .request,\n"
         "            server: \"nginx/1.29.7\",\n"
-        "            date: \"current\",\n"
+        "            date: .current,\n"
         "            hide_headers: [\"Date\", \"Server\", \"X-Pad\"]\n"
         "        }, failure_policy: {\n"
-        "            version: \"HTTP/1.1\",\n"
+        "            version: .http11,\n"
         "            status: 502,\n"
         "            reason: \"Bad Gateway\",\n"
         "            content_type: \"text/html\",\n"
         "            server: \"nginx/1.29.7\",\n"
-        "            date: \"current\",\n"
-        "            connection: \"request\",\n"
+        "            date: .current,\n"
+        "            connection: .request,\n"
         "            body: b\"<html>\\r\\n<head><title>502 Bad "
         "Gateway</title></head>\\r\\n<body>\\r\\n<center><h1>502 Bad "
         "Gateway</h1></center>\\r\\n<hr><center>nginx/1.29.7</center>\\r\\n</body>\\r\\n</"
@@ -8470,7 +8470,7 @@ TEST(nginx_converter, lowers_service_root_replacement_to_full_byte_stable_source
         "    }\n"
         "}\n";
     CHECK_EQ(result.value().len, static_cast<u32>(sizeof(kExpected) - 1u));
-    CHECK_EQ(result.value().len, 3349u);
+    CHECK_EQ(result.value().len, 3291u);
     CHECK(result.value().view().eq({kExpected, sizeof(kExpected) - 1u}));
 
     const char replacement_source[] =
@@ -8560,7 +8560,7 @@ TEST(nginx_converter, root_maximum_ports_fit_bounded_source_capacity) {
     model.location.proxy_pass.port = 65535;
     const auto lowered = nginx::lower_to_rut(model);
     REQUIRE(lowered);
-    CHECK_EQ(lowered.value().len, 5308u);
+    CHECK_EQ(lowered.value().len, 5202u);
     CHECK_LT(lowered.value().len, nginx::RutSource::kCapacity);
     const auto lexed = lex(lowered.value().view());
     REQUIRE(lexed);
@@ -8575,10 +8575,10 @@ TEST(nginx_converter, exact_no_content_maximum_ports_fit_existing_source_capacit
     REQUIRE(parsed);
     const auto lowered = nginx::lower_to_rut(parsed.value());
     REQUIRE(lowered);
-    CHECK_EQ(lowered.value().len, 5564u);
+    CHECK_EQ(lowered.value().len, 5451u);
     CHECK_LT(lowered.value().len, nginx::RutSource::kCapacity);
     CHECK_EQ(nginx::RutSource::kCapacity, 12779u);
-    CHECK_EQ(nginx::RutSource::kCapacity - lowered.value().len, 7215u);
+    CHECK_EQ(nginx::RutSource::kCapacity - lowered.value().len, 7328u);
     const auto lexed = lex(lowered.value().view());
     REQUIRE(lexed);
     const auto ast = parse_file(lexed.value());
@@ -8596,8 +8596,8 @@ TEST(nginx_converter, bounded_exact_no_content_maximum_paths_fit_existing_source
         paths[0][i] = 'a';
         paths[1][i] = i + 1u == nginx::kMaxExactLocalReturnPathLen ? '/' : 'b';
     }
-    const u32 expected_lengths[] = {5619u, 5619u};
-    const u32 expected_headroom[] = {7160u, 7160u};
+    const u32 expected_lengths[] = {5506u, 5506u};
+    const u32 expected_headroom[] = {7273u, 7273u};
     const char* expected_selectors[] = {"route exact slash_normalized GET \"/aaaa",
                                         "route exact slash_normalized GET \"/bbbb"};
     for (u32 vector = 0; vector < 2u; vector++) {
@@ -8641,8 +8641,8 @@ TEST(nginx_converter, exact_redirect_maximum_ports_fit_bounded_source_capacity) 
     REQUIRE(parsed);
     const auto lowered = nginx::lower_to_rut(parsed.value());
     REQUIRE(lowered);
-    CHECK_EQ(lowered.value().len, 5936u);
-    CHECK_EQ(nginx::RutSource::kCapacity - lowered.value().len, 6843u);
+    CHECK_EQ(lowered.value().len, 5820u);
+    CHECK_EQ(nginx::RutSource::kCapacity - lowered.value().len, 6959u);
     CHECK_EQ(lowered.value().data[lowered.value().len], '\0');
     CHECK_LT(lowered.value().len, nginx::RutSource::kCapacity);
     const auto lexed = lex(lowered.value().view());
@@ -8657,8 +8657,8 @@ TEST(nginx_converter, exact_302_redirect_maximum_ports_fit_bounded_source_capaci
     REQUIRE(parsed);
     const auto lowered = nginx::lower_to_rut(parsed.value());
     REQUIRE(lowered);
-    CHECK_EQ(lowered.value().len, 5912u);
-    CHECK_EQ(lowered.value().len + 1u, 5913u);
+    CHECK_EQ(lowered.value().len, 5796u);
+    CHECK_EQ(lowered.value().len + 1u, 5797u);
     CHECK_LT(lowered.value().len, nginx::RutSource::kCapacity);
     CHECK_EQ(nginx::RutSource::kCapacity, 12779u);
     const auto lexed = lex(lowered.value().view());
@@ -8678,7 +8678,7 @@ TEST(nginx_converter, api_maximum_ports_fit_bounded_source_capacity) {
     model.location.proxy_pass.port = 65535;
     const auto lowered = nginx::lower_to_rut(model);
     REQUIRE(lowered);
-    CHECK_EQ(lowered.value().len, 3341u);
+    CHECK_EQ(lowered.value().len, 3283u);
     CHECK_LT(lowered.value().len, nginx::RutSource::kCapacity);
     const auto lexed = lex(lowered.value().view());
     REQUIRE(lexed);
@@ -8706,7 +8706,7 @@ TEST(nginx_converter, clean_proxy_uri_maximum_fits_strict_existing_source_capaci
 
     const auto lowered = nginx::lower_to_rut(parsed.value());
     REQUIRE(lowered);
-    CHECK_EQ(lowered.value().len, 3468u);
+    CHECK_EQ(lowered.value().len, 3410u);
     CHECK_LT(lowered.value().len, nginx::RutSource::kCapacity);
     CHECK_EQ(nginx::RutSource::kCapacity, 12779u);
     const auto lexed = lex(lowered.value().view());
@@ -8742,7 +8742,7 @@ TEST(nginx_converter, maximum_clean_location_and_uri_fit_strict_existing_source_
     REQUIRE(parsed);
     const auto lowered = nginx::lower_to_rut(parsed.value());
     REQUIRE(lowered);
-    CHECK_EQ(lowered.value().len, 3700u);
+    CHECK_EQ(lowered.value().len, 3642u);
     CHECK_LT(lowered.value().len, nginx::RutSource::kCapacity);
     CHECK_EQ(nginx::RutSource::kCapacity, 12779u);
     const auto lexed = lex(lowered.value().view());
@@ -8779,7 +8779,7 @@ TEST(nginx_converter, maximum_static_query_uri_fits_strict_existing_source_capac
     REQUIRE_EQ(parsed.value().location.proxy_pass.uri.len, nginx::kMaxProxyPassUriLen);
     const auto lowered = nginx::lower_to_rut(parsed.value());
     REQUIRE(lowered);
-    CHECK_EQ(lowered.value().len, 3700u);
+    CHECK_EQ(lowered.value().len, 3642u);
     CHECK_LT(lowered.value().len, nginx::RutSource::kCapacity);
     const std::string generated(lowered.value().data, lowered.value().len);
     CHECK_EQ(count_text(generated, "strip_prefix:"), 1u);
@@ -11228,7 +11228,7 @@ TEST(nginx_converter, lowers_parsed_proxy_read_timeout) {
     CHECK_EQ(count_text(output, "response_read_timeout: 1s"), 4u);
     CHECK_EQ(count_text(output, "response_read_timeout: 1s,"), 1u);
     CHECK_EQ(count_text(output, "if req.hasContentLength"), 1u);
-    CHECK_EQ(count_text(output, "content_length_position: \"after_host\""), 1u);
+    CHECK_EQ(count_text(output, "content_length_position: .afterHost"), 1u);
 }
 
 TEST(nginx_converter_issue252,
@@ -11257,10 +11257,10 @@ TEST(nginx_converter_issue252,
                                 std::to_string(expected_ports[vector][1]) + "\"\n"),
                  1u);
         CHECK_EQ(count_text(output, "if req.hasContentLength"), 1u);
-        CHECK_EQ(count_text(output, "retained_header_value: \"trim_sp_preserve_htab\""), 1u);
-        CHECK_EQ(count_text(output, "content_length_position: \"after_host\""), 0u);
+        CHECK_EQ(count_text(output, "retained_header_value: .trimSpPreserveHtab"), 1u);
+        CHECK_EQ(count_text(output, "content_length_position: .afterHost"), 0u);
         CHECK_EQ(count_text(output, "response_read_timeout: 60s"), 2u);
-        CHECK_EQ(count_text(output, "response_buffering: \"complete_content_length\""), 2u);
+        CHECK_EQ(count_text(output, "response_buffering: .completeContentLength"), 2u);
         CHECK_LT(lowered.value().len, nginx::RutSource::kCapacity);
 
         auto lexed = lex(lowered.value().view());
@@ -11402,7 +11402,7 @@ TEST(nginx_converter_issue252,
     REQUIRE(wildcard_lowered);
     const std::string wildcard_output(wildcard_lowered.value().data, wildcard_lowered.value().len);
     CHECK_EQ(count_text(wildcard_output, "if req.hasContentLength"), 0u);
-    CHECK_EQ(count_text(wildcard_output, "retained_header_value: \"trim_sp_preserve_htab\""), 0u);
+    CHECK_EQ(count_text(wildcard_output, "retained_header_value: .trimSpPreserveHtab"), 0u);
 
     static constexpr char kTimeout[] =
         "server { listen 127.0.0.1:8081; location / { proxy_read_timeout 1s; "
@@ -11412,8 +11412,8 @@ TEST(nginx_converter_issue252,
     const auto timeout_lowered = nginx::lower_to_rut(timeout.value());
     REQUIRE(timeout_lowered);
     const std::string timeout_output(timeout_lowered.value().data, timeout_lowered.value().len);
-    CHECK_EQ(count_text(timeout_output, "retained_header_value: \"trim_sp_preserve_htab\""), 0u);
-    CHECK_EQ(count_text(timeout_output, "content_length_position: \"after_host\""), 1u);
+    CHECK_EQ(count_text(timeout_output, "retained_header_value: .trimSpPreserveHtab"), 0u);
+    CHECK_EQ(count_text(timeout_output, "content_length_position: .afterHost"), 1u);
 }
 
 TEST(nginx_converter_issue468,
@@ -11427,7 +11427,7 @@ TEST(nginx_converter_issue468,
     REQUIRE(lowered);
     const std::string output(lowered.value().data, lowered.value().len);
     CHECK_EQ(count_text(output, "if req.hasContentLength"), 1u);
-    CHECK_EQ(count_text(output, "content_length_position: \"after_host\""), 1u);
+    CHECK_EQ(count_text(output, "content_length_position: .afterHost"), 1u);
 
     static constexpr char kNoTimeoutSource[] =
         "server { listen 8080; location / { proxy_pass http://127.0.0.1:9000; } }";
@@ -11438,12 +11438,12 @@ TEST(nginx_converter_issue468,
     const std::string no_timeout_output(no_timeout_lowered.value().data,
                                         no_timeout_lowered.value().len);
     CHECK_EQ(count_text(no_timeout_output, "if req.hasContentLength"), 0u);
-    CHECK_EQ(count_text(no_timeout_output, "content_length_position: \"after_host\""), 0u);
+    CHECK_EQ(count_text(no_timeout_output, "content_length_position: .afterHost"), 0u);
 
     // #474/#476 set the exact public bound; keep the full traversal strict.
     const auto lexed = lex(lowered.value().view());
     REQUIRE(lexed);
-    CHECK_EQ(lexed->tokens.len, 834u);
+    CHECK_EQ(lexed->tokens.len, 930u);
     const auto ast = parse_file(lexed.value());
     REQUIRE(ast);
     std::unique_ptr<AstFile> ast_owned(ast.value());
@@ -11847,7 +11847,7 @@ TEST(nginx_converter, lowers_static_query_proxy_uri_to_exact_guarded_ordinary_ru
                                 location_first_lowered.value().len);
     REQUIRE(validate_static_query_proxy_generated_source(canonical, 8080u, 9000u));
     REQUIRE(validate_static_query_proxy_generated_source(alternate, 18080u, 19000u));
-    CHECK_EQ(canonical_lowered.value().len, 3344u);
+    CHECK_EQ(canonical_lowered.value().len, 3286u);
 
     // The complete golden is the existing byte-locked `/api/ -> /` source with
     // exactly its one public replacement value widened. This covers every byte
@@ -11898,15 +11898,15 @@ TEST(nginx_converter, lowers_static_query_proxy_uri_to_exact_guarded_ordinary_ru
     // only the new complete route inventory/view checks reject them.
     static constexpr char kRawGetRoute[] =
         "route exact GET \"/api/users?x=1\" { return local_response({\n"
-        "  version: \"HTTP/1.1\", status: 404, reason: \"Not Found\", server: \"rut\",\n"
-        "  date: \"current\", content_type: \"text/plain\", connection: \"request\",\n"
-        "  head_mode: \"reject\", body: b\"raw-get\"\n"
+        "  version: .http11, status: 404, reason: \"Not Found\", server: \"rut\",\n"
+        "  date: .current, content_type: \"text/plain\", connection: .request,\n"
+        "  head_mode: .reject, body: b\"raw-get\"\n"
         "}) }\n";
     static constexpr char kRawAnyRoute[] =
         "route exact \"/api/users?x=1\" { return local_response({\n"
-        "  version: \"HTTP/1.1\", status: 404, reason: \"Not Found\", server: \"rut\",\n"
-        "  date: \"current\", content_type: \"text/plain\", connection: \"request\",\n"
-        "  head_mode: \"suppress_body\", body: b\"raw-any\"\n"
+        "  version: .http11, status: 404, reason: \"Not Found\", server: \"rut\",\n"
+        "  date: .current, content_type: \"text/plain\", connection: .request,\n"
+        "  head_mode: .suppressBody, body: b\"raw-any\"\n"
         "}) }\n";
     const auto raw_route_mutation_rejected = [&](const char* suffix) {
         const std::string mutated = canonical + suffix;
@@ -12028,8 +12028,8 @@ TEST(nginx_converter, issue360_lowers_terminal_empty_query_to_exact_ordinary_rut
     expected.replace(replacement_offset, sizeof(kPathOnlyReplacement) - 1u, kEmptyQueryReplacement);
     CHECK_EQ(expected, canonical);
     CHECK_EQ(canonical_lowered.value().len, path_only_lowered.value().len + 1u);
-    CHECK_EQ(canonical_lowered.value().len, 3337u);
-    CHECK_EQ(nginx::RutSource::kCapacity - canonical_lowered.value().len - 1u, 9441u);
+    CHECK_EQ(canonical_lowered.value().len, 3279u);
+    CHECK_EQ(nginx::RutSource::kCapacity - canonical_lowered.value().len - 1u, 9499u);
     CHECK_EQ(canonical_lowered.value().data[canonical_lowered.value().len], '\0');
 
     // Declaration order changes neither model meaning nor any generated byte.
@@ -12373,7 +12373,7 @@ TEST(nginx_converter, lowers_clean_non_root_proxy_uri_to_full_byte_stable_source
     REQUIRE_EQ(v1_suffix_len, slash_suffix_len);
     CHECK((Str{v1_suffix, v1_suffix_len}.eq({slash_suffix, slash_suffix_len})));
     CHECK_EQ(formatted_lowered.value().len, slash_lowered.value().len + 3u);
-    CHECK_EQ(formatted_lowered.value().len, 3336u);
+    CHECK_EQ(formatted_lowered.value().len, 3278u);
     CHECK_LT(formatted_lowered.value().len, nginx::RutSource::kCapacity);
 }
 
@@ -13791,7 +13791,7 @@ TEST(nginx_parser,
             };
         const auto accepted = nginx::lower_to_rut(server);
         REQUIRE(accepted);
-        CHECK_EQ(accepted.value().len, 5913u);
+        CHECK_EQ(accepted.value().len, 5797u);
         CHECK(accepted.value()
                   .view()
                   .slice(0u, strlen("listen 127.0.0.1:8080\n"))
@@ -14088,18 +14088,18 @@ TEST(nginx_parser,
         "http://redirect.example/new; } location / { proxy_pass http://127.0.0.1:9000; } }";
     u32 representative_wildcard_302 = 0u;
     check_wildcard_at_length({kRepresentativeWildcard302, sizeof(kRepresentativeWildcard302) - 1u},
-                             5904u,
+                             5788u,
                              representative_wildcard_302);
     const u32 representative_exact_302 = representative_wildcard_302 + kExactListenerDelta;
-    CHECK_EQ(representative_exact_302, 5913u);
+    CHECK_EQ(representative_exact_302, 5797u);
     CHECK_LT(representative_exact_302, nginx::RutSource::kCapacity);
-    CHECK_EQ(nginx::RutSource::kCapacity - representative_exact_302, 6866u);
+    CHECK_EQ(nginx::RutSource::kCapacity - representative_exact_302, 6982u);
     check_exact_redirect({kRepresentativeExact302, sizeof(kRepresentativeExact302) - 1u},
                          302u,
                          8080u,
                          0x7f000001u,
                          9000u,
-                         5913u);
+                         5797u);
 
     static constexpr char kMaximumWildcard302[] =
         "server { listen 65535; location / { proxy_pass http://255.255.255.255:65535; } "
@@ -14110,17 +14110,17 @@ TEST(nginx_parser,
         "http://redirect.example/new; } }";
     u32 maximum_wildcard_302 = 0u;
     check_wildcard_at_length(
-        {kMaximumWildcard302, sizeof(kMaximumWildcard302) - 1u}, 5912u, maximum_wildcard_302);
+        {kMaximumWildcard302, sizeof(kMaximumWildcard302) - 1u}, 5796u, maximum_wildcard_302);
     const u32 maximum_exact_302 = maximum_wildcard_302 + kExactListenerDelta;
-    CHECK_EQ(maximum_exact_302, 5921u);
+    CHECK_EQ(maximum_exact_302, 5805u);
     CHECK_LT(maximum_exact_302, nginx::RutSource::kCapacity);
-    CHECK_EQ(nginx::RutSource::kCapacity - maximum_exact_302, 6858u);
+    CHECK_EQ(nginx::RutSource::kCapacity - maximum_exact_302, 6974u);
     check_exact_redirect({kMaximumExact302, sizeof(kMaximumExact302) - 1u},
                          302u,
                          65535u,
                          0xffffffffu,
                          65535u,
-                         5921u);
+                         5805u);
 
     static constexpr char kRepresentativeWildcard301[] =
         "server { listen 8080; location = /old { return 301 "
@@ -14130,18 +14130,18 @@ TEST(nginx_parser,
         "http://redirect.example/new; } location / { proxy_pass http://127.0.0.1:9000; } }";
     u32 representative_wildcard_301 = 0u;
     check_wildcard_at_length({kRepresentativeWildcard301, sizeof(kRepresentativeWildcard301) - 1u},
-                             5928u,
+                             5812u,
                              representative_wildcard_301);
     const u32 representative_exact_301 = representative_wildcard_301 + kExactListenerDelta;
-    CHECK_EQ(representative_exact_301, 5937u);
+    CHECK_EQ(representative_exact_301, 5821u);
     CHECK_LT(representative_exact_301, nginx::RutSource::kCapacity);
-    CHECK_EQ(nginx::RutSource::kCapacity - representative_exact_301, 6842u);
+    CHECK_EQ(nginx::RutSource::kCapacity - representative_exact_301, 6958u);
     check_exact_redirect({kRepresentativeExact301, sizeof(kRepresentativeExact301) - 1u},
                          301u,
                          8080u,
                          0x7f000001u,
                          9000u,
-                         5937u);
+                         5821u);
 
     static constexpr char kMaximumWildcard301[] =
         "server { listen 65535; location / { proxy_pass http://255.255.255.255:65535; } "
@@ -14152,10 +14152,10 @@ TEST(nginx_parser,
         "http://redirect.example/new; } }";
     u32 maximum_wildcard_301 = 0u;
     check_wildcard_at_length(
-        {kMaximumWildcard301, sizeof(kMaximumWildcard301) - 1u}, 5936u, maximum_wildcard_301);
+        {kMaximumWildcard301, sizeof(kMaximumWildcard301) - 1u}, 5820u, maximum_wildcard_301);
     const u32 maximum_exact_301 = maximum_wildcard_301 + kExactListenerDelta;
-    CHECK_EQ(maximum_exact_301, 5945u);
-    CHECK_EQ(maximum_exact_301, 5945u);
+    CHECK_EQ(maximum_exact_301, 5829u);
+    CHECK_EQ(maximum_exact_301, 5829u);
     CHECK_LT(maximum_exact_301, nginx::RutSource::kCapacity);
     CHECK_LT(maximum_exact_301, nginx::RutSource::kCapacity);
     check_exact_redirect({kMaximumExact301, sizeof(kMaximumExact301) - 1u},
@@ -14163,7 +14163,7 @@ TEST(nginx_parser,
                          65535u,
                          0xffffffffu,
                          65535u,
-                         5945u);
+                         5829u);
 
     const auto maximum_wildcard_301_model =
         nginx::parse({kMaximumWildcard301, sizeof(kMaximumWildcard301) - 1u});
@@ -14171,7 +14171,7 @@ TEST(nginx_parser,
     const auto maximum_wildcard_301_source =
         nginx::lower_to_rut(maximum_wildcard_301_model.value());
     REQUIRE(maximum_wildcard_301_source);
-    REQUIRE_EQ(maximum_wildcard_301_source.value().len, 5936u);
+    REQUIRE_EQ(maximum_wildcard_301_source.value().len, 5820u);
     std::string projected(maximum_wildcard_301_source.value().data,
                           maximum_wildcard_301_source.value().len);
     static constexpr char kWildcardListener[] = "listen :65535";
@@ -14180,7 +14180,7 @@ TEST(nginx_parser,
     REQUIRE_EQ(count_text(projected, kWildcardListener), 1u);
     REQUIRE_EQ(count_text(projected, kExactListener), 0u);
     projected.replace(0u, sizeof(kWildcardListener) - 1u, kExactListener);
-    REQUIRE_EQ(projected.size(), 5945u);
+    REQUIRE_EQ(projected.size(), 5829u);
     CHECK_EQ(projected.back(), '\n');
     CHECK_EQ(count_text(projected, kWildcardListener), 0u);
     CHECK_EQ(count_text(projected, kExactListener), 1u);
@@ -14402,7 +14402,7 @@ TEST(nginx_parser,
             };
         const auto lowered = nginx::lower_to_rut(server);
         REQUIRE(lowered);
-        CHECK_EQ(lowered.value().len, 3358u);
+        CHECK_EQ(lowered.value().len, 3300u);
         CHECK(lowered.value()
                   .view()
                   .slice(0u, sizeof("listen 127.0.0.1:8080") - 1u)
@@ -14633,7 +14633,7 @@ TEST(nginx_parser,
     CHECK_FALSE(no_uri.value().location.proxy_pass.has_uri);
     const auto no_uri_lowered = nginx::lower_to_rut(no_uri.value());
     REQUIRE(no_uri_lowered);
-    CHECK_EQ(no_uri_lowered.value().len, 3256u);
+    CHECK_EQ(no_uri_lowered.value().len, 3198u);
     CHECK_EQ(count_text(std::string(no_uri_lowered.value().data, no_uri_lowered.value().len),
                         "target_transform:"),
              0u);
@@ -14715,10 +14715,10 @@ TEST(nginx_parser,
         "http://127.0.0.1:9000/; } }";
     u32 representative_wildcard = 0u;
     check_wildcard({kRepresentativeWildcard, sizeof(kRepresentativeWildcard) - 1u},
-                   3349u,
+                   3291u,
                    representative_wildcard);
     const u32 representative_exact = representative_wildcard + kExactListenerDelta;
-    CHECK_EQ(representative_exact, 3358u);
+    CHECK_EQ(representative_exact, 3300u);
     CHECK_LT(representative_exact, nginx::RutSource::kCapacity);
     check_exact({kRepresentativeExact, sizeof(kRepresentativeExact) - 1u},
                 8080u,
@@ -14757,12 +14757,12 @@ TEST(nginx_parser,
                static_cast<u32>(sizeof(maximum_exact_source)));
     u32 maximum_wildcard = 0u;
     check_wildcard({maximum_wildcard_source, static_cast<u32>(maximum_wildcard_source_len)},
-                   3573u,
+                   3515u,
                    maximum_wildcard);
     const u32 maximum_exact = maximum_wildcard + kExactListenerDelta;
-    CHECK_EQ(maximum_exact, 3582u);
+    CHECK_EQ(maximum_exact, 3524u);
     CHECK_LT(maximum_exact, nginx::RutSource::kCapacity);
-    CHECK_EQ(nginx::RutSource::kCapacity - maximum_exact, 9197u);
+    CHECK_EQ(nginx::RutSource::kCapacity - maximum_exact, 9255u);
     check_exact({maximum_exact_source, static_cast<u32>(maximum_exact_source_len)},
                 65535u,
                 nginx::kMaxProxyLocationPathLen,
@@ -14977,7 +14977,7 @@ TEST(nginx_parser,
             };
         const auto lowered = nginx::lower_to_rut(server);
         REQUIRE(lowered);
-        CHECK_EQ(lowered.value().len, 3345u);
+        CHECK_EQ(lowered.value().len, 3287u);
         CHECK(lowered.value()
                   .view()
                   .slice(0u, sizeof("listen 127.0.0.1:8080") - 1u)
@@ -15269,7 +15269,7 @@ TEST(nginx_parser,
     CHECK_FALSE(no_uri.value().location.proxy_pass.has_uri);
     const auto no_uri_lowered = nginx::lower_to_rut(no_uri.value());
     REQUIRE(no_uri_lowered);
-    CHECK_EQ(no_uri_lowered.value().len, 3244u);
+    CHECK_EQ(no_uri_lowered.value().len, 3186u);
     CHECK_EQ(count_text(std::string(no_uri_lowered.value().data, no_uri_lowered.value().len),
                         "target_transform:"),
              0u);
@@ -15281,7 +15281,7 @@ TEST(nginx_parser,
     REQUIRE(explicit_v1);
     const auto explicit_v1_lowered = nginx::lower_to_rut(explicit_v1.value());
     REQUIRE(explicit_v1_lowered);
-    CHECK_EQ(explicit_v1_lowered.value().len, 3345u);
+    CHECK_EQ(explicit_v1_lowered.value().len, 3287u);
     CHECK_NE(no_uri_lowered.value().len, explicit_v1_lowered.value().len);
     CHECK_NE(std::string(no_uri_lowered.value().data, no_uri_lowered.value().len),
              std::string(explicit_v1_lowered.value().data, explicit_v1_lowered.value().len));
@@ -15357,17 +15357,17 @@ TEST(nginx_parser,
         "http://127.0.0.1:9000/v1/; } }";
     u32 representative_wildcard = 0u;
     check_wildcard({kRepresentativeWildcard, sizeof(kRepresentativeWildcard) - 1u},
-                   3336u,
+                   3278u,
                    representative_wildcard);
     const u32 representative_exact_projection = representative_wildcard + kExactListenerDelta;
-    CHECK_EQ(representative_exact_projection, 3345u);
+    CHECK_EQ(representative_exact_projection, 3287u);
     CHECK_LT(representative_exact_projection, nginx::RutSource::kCapacity);
-    CHECK_EQ(nginx::RutSource::kCapacity - representative_exact_projection, 9434u);
+    CHECK_EQ(nginx::RutSource::kCapacity - representative_exact_projection, 9492u);
     check_exact({kRepresentativeExact, sizeof(kRepresentativeExact) - 1u},
                 8080u,
                 0x7f000001u,
                 9000u,
-                3345u);
+                3287u);
 
     static constexpr char kMaximumWildcard[] =
         "server { listen 65535; location /api/ { proxy_pass "
@@ -15376,12 +15376,12 @@ TEST(nginx_parser,
         "server { listen 127.0.0.1:65535; location /api/ { proxy_pass "
         "http://255.255.255.255:65535/v1/; } }";
     u32 maximum_wildcard = 0u;
-    check_wildcard({kMaximumWildcard, sizeof(kMaximumWildcard) - 1u}, 3344u, maximum_wildcard);
+    check_wildcard({kMaximumWildcard, sizeof(kMaximumWildcard) - 1u}, 3286u, maximum_wildcard);
     const u32 maximum_exact_projection = maximum_wildcard + kExactListenerDelta;
-    CHECK_EQ(maximum_exact_projection, 3353u);
+    CHECK_EQ(maximum_exact_projection, 3295u);
     CHECK_LT(maximum_exact_projection, nginx::RutSource::kCapacity);
-    CHECK_EQ(nginx::RutSource::kCapacity - maximum_exact_projection, 9426u);
-    check_exact({kMaximumExact, sizeof(kMaximumExact) - 1u}, 65535u, 0xffffffffu, 65535u, 3353u);
+    CHECK_EQ(nginx::RutSource::kCapacity - maximum_exact_projection, 9484u);
+    check_exact({kMaximumExact, sizeof(kMaximumExact) - 1u}, 65535u, 0xffffffffu, 65535u, 3295u);
 
     // A coherent wildcard counterpart isolates the scalar port-zero contract; the exact listener
     // guard intentionally runs before this downstream validation in the combined model.
@@ -15528,7 +15528,7 @@ TEST(nginx_converter,
             };
         const auto lowered = nginx::lower_to_rut(server);
         REQUIRE(lowered);
-        CHECK_EQ(lowered.value().len, 3244u);
+        CHECK_EQ(lowered.value().len, 3186u);
         const std::string generated(lowered.value().data, lowered.value().len);
         CHECK_EQ(count_text(generated, "return forward(nginx_upstream, request_policy: {"), 1u);
         CHECK_EQ(count_text(generated, "target_transform:"), 0u);
@@ -15690,7 +15690,7 @@ TEST(nginx_converter,
     static constexpr char kMinimum[] =
         "server { listen 127.0.0.1:1; location /a/ { proxy_pass "
         "http://0.0.0.0:1; } }";
-    check_boundary({kMinimum, sizeof(kMinimum) - 1u}, 3u, 3230u);
+    check_boundary({kMinimum, sizeof(kMinimum) - 1u}, 3u, 3172u);
     char max_path[nginx::kMaxProxyLocationPathLen + 1u]{};
     max_path[0] = '/';
     memset(max_path + 1u, 'a', nginx::kMaxProxyLocationPathLen - 2u);
@@ -15704,7 +15704,7 @@ TEST(nginx_converter,
     REQUIRE_GT(maximum_len, 0);
     REQUIRE_LT(static_cast<u32>(maximum_len), static_cast<u32>(sizeof(maximum)));
     check_boundary(
-        {maximum, static_cast<u32>(maximum_len)}, nginx::kMaxProxyLocationPathLen, 3426u);
+        {maximum, static_cast<u32>(maximum_len)}, nginx::kMaxProxyLocationPathLen, 3368u);
 
     char over_path[nginx::kMaxProxyLocationPathLen + 2u]{};
     over_path[0] = '/';
@@ -15740,8 +15740,8 @@ TEST(nginx_converter, issue355_exact_loopback_api_no_uri_has_canonical_no_transf
     const auto second = lower(location_first, sizeof(location_first) - 1u);
     REQUIRE(first);
     REQUIRE(second);
-    REQUIRE_EQ(first.value().len, 3244u);
-    REQUIRE_EQ(second.value().len, 3244u);
+    REQUIRE_EQ(first.value().len, 3186u);
+    REQUIRE_EQ(second.value().len, 3186u);
     const std::string exact(first.value().data, first.value().len);
     REQUIRE_EQ(exact, std::string(second.value().data, second.value().len));
 
@@ -15753,7 +15753,7 @@ TEST(nginx_converter, issue355_exact_loopback_api_no_uri_has_canonical_no_transf
         "http://127.0.0.1:9000/v1/; } }";
     const auto replacement = lower(replacement_source, sizeof(replacement_source) - 1u);
     REQUIRE(replacement);
-    REQUIRE_EQ(replacement.value().len, 3345u);
+    REQUIRE_EQ(replacement.value().len, 3287u);
     std::string expected(replacement.value().data, replacement.value().len);
     static constexpr char kTransform[] =
         " target_transform: {\n"
@@ -15779,9 +15779,9 @@ TEST(nginx_converter, issue355_exact_loopback_api_no_uri_has_canonical_no_transf
     REQUIRE(maximum_parsed);
     const auto maximum = nginx::lower_to_rut(maximum_parsed.value());
     REQUIRE(maximum);
-    CHECK_EQ(maximum.value().len, 3252u);
+    CHECK_EQ(maximum.value().len, 3194u);
     CHECK_LT(maximum.value().len, nginx::RutSource::kCapacity);
-    CHECK_EQ(nginx::RutSource::kCapacity - maximum.value().len, 9527u);
+    CHECK_EQ(nginx::RutSource::kCapacity - maximum.value().len, 9585u);
     CHECK_EQ(
         count_text(std::string(maximum.value().data, maximum.value().len), "target_transform:"),
         0u);
@@ -15792,7 +15792,7 @@ TEST(nginx_converter, issue355_exact_loopback_api_no_uri_has_canonical_no_transf
     REQUIRE(wildcard_parsed);
     const auto wildcard_lowered = nginx::lower_to_rut(wildcard_parsed.value());
     REQUIRE(wildcard_lowered);
-    CHECK_EQ(wildcard_lowered.value().len, 3235u);
+    CHECK_EQ(wildcard_lowered.value().len, 3177u);
     CHECK_EQ(count_text(std::string(wildcard_lowered.value().data, wildcard_lowered.value().len),
                         "target_transform:"),
              0u);
@@ -15815,8 +15815,8 @@ TEST(nginx_converter, issue355_exact_loopback_api_no_uri_has_canonical_no_transf
         return count_route_declarations(source) == 1u &&
                count_text(source, "route \"/api\" {\n") == 1u &&
                count_text(source, "if req.method == GET && req.pathOnly == \"/api\" {") == 1u &&
-               count_text(source, "return redirect({scheme: \"http\"") == 1u &&
-               count_text(source, "path: \"static\", query: \"preserve_raw\"") == 1u &&
+               count_text(source, "return redirect({scheme: .http") == 1u &&
+               count_text(source, "path: .static, query: .preserveRaw") == 1u &&
                count_text(source, "target_path: \"/api/\"") == 1u &&
                count_text(source, "return forward(nginx_upstream,") == 1u;
     };
@@ -15841,22 +15841,22 @@ TEST(nginx_converter, issue355_exact_loopback_api_no_uri_has_canonical_no_transf
     const auto request_policy_is_canonical = [&](const std::string& source) {
         static constexpr char kExpected[] =
             "request_policy: {\n"
-            "            version: \"HTTP/1.1\",\n"
-            "            host: \"upstream\",\n"
-            "            connection: \"omit\",\n"
-            "            strip_headers: [\"Connection\", \"Keep-Alive\", \"TE\", \"Expect\", "
-            "\"Upgrade\"]\n";
+            "            version: .http11,\n"
+            "            host: .upstream,\n"
+            "            connection: .omit,\n"
+            "            strip_headers: [.connection, .keepAlive, .te, .expect, "
+            ".upgrade]\n";
         return count_text(source, "request_policy: {") == 1u &&
                region_equals(source, "request_policy: {", "        }, response_policy:", kExpected);
     };
     const auto response_policy_is_canonical = [&](const std::string& source) {
         static constexpr char kExpected[] =
             "response_policy: {\n"
-            "            version: \"HTTP/1.1\",\n"
-            "            framing: \"content_length\",\n"
-            "            connection: \"request\",\n"
+            "            version: .http11,\n"
+            "            framing: .contentLength,\n"
+            "            connection: .request,\n"
             "            server: \"nginx/1.29.7\",\n"
-            "            date: \"current\",\n"
+            "            date: .current,\n"
             "            hide_headers: [\"Date\", \"Server\", \"X-Pad\"]\n";
         return count_text(source, "response_policy: {") == 1u &&
                region_equals(source, "response_policy: {", "        }, failure_policy:", kExpected);
@@ -15864,13 +15864,13 @@ TEST(nginx_converter, issue355_exact_loopback_api_no_uri_has_canonical_no_transf
     const auto failure_policy_is_canonical = [&](const std::string& source) {
         static constexpr char kExpected[] =
             "failure_policy: {\n"
-            "            version: \"HTTP/1.1\",\n"
+            "            version: .http11,\n"
             "            status: 502,\n"
             "            reason: \"Bad Gateway\",\n"
             "            content_type: \"text/html\",\n"
             "            server: \"nginx/1.29.7\",\n"
-            "            date: \"current\",\n"
-            "            connection: \"request\",\n"
+            "            date: .current,\n"
+            "            connection: .request,\n"
             "            body: b\"<html>\\r\\n<head><title>502 Bad "
             "Gateway</title></head>\\r\\n<body>\\r\\n<center><h1>502 Bad "
             "Gateway</h1></center>\\r\\n<hr><center>nginx/1.29.7</center>\\r\\n</body>\\r\\n</"
@@ -15882,13 +15882,13 @@ TEST(nginx_converter, issue355_exact_loopback_api_no_uri_has_canonical_no_transf
         return count_text(source, "\nunmatched ") == 3u &&
                count_text(source,
                           "unmatched OPTIONS { return local_response({\n"
-                          "  version: \"HTTP/1.1\", status: 400,") == 1u &&
+                          "  version: .http11, status: 400,") == 1u &&
                count_text(source,
                           "unmatched CONNECT { return local_response({\n"
-                          "  version: \"HTTP/1.1\", status: 405,") == 1u &&
+                          "  version: .http11, status: 405,") == 1u &&
                count_text(source,
                           "\nunmatched { return local_response({\n"
-                          "  version: \"HTTP/1.1\", status: 400,") == 1u;
+                          "  version: .http11, status: 400,") == 1u;
     };
     const auto timeout_is_canonical = [](const std::string& source) {
         return source.find("timeout_failure_policy:") == std::string::npos &&
@@ -15968,30 +15968,28 @@ TEST(nginx_converter, issue355_exact_loopback_api_no_uri_has_canonical_no_transf
         {lit_str("127.0.0.1:9000"), lit_str("127.0.0.1:9001"), Guard::Upstream},
         {lit_str("pre_route TRACE {"), lit_str("pre_route TRACX {"), Guard::PreRoute},
         {lit_str("route \"/api\" {"), lit_str("route \"/apx\" {"), Guard::Route},
-        {lit_str("query: \"preserve_raw\""), lit_str("query: \"discard\""), Guard::Route},
+        {lit_str("query: .preserveRaw"), lit_str("query: .discard"), Guard::Route},
         {lit_str("target_path: \"/api/\""), lit_str("target_path: \"/apx/\""), Guard::Route},
         {lit_str("return forward(nginx_upstream, request_policy: {"),
          lit_str("return forwarX(nginx_upstream, request_policy: {"),
          Guard::Route},
-        {lit_str("host: \"upstream\""), lit_str("host: \"upstreaX\""), Guard::Request},
-        {lit_str("framing: \"content_length\""),
-         lit_str("framing: \"content_lengtx\""),
-         Guard::Response},
+        {lit_str("host: .upstream"), lit_str("host: \"upstreaX\""), Guard::Request},
+        {lit_str("framing: .contentLength"), lit_str("framing: .content_lengtx"), Guard::Response},
         {lit_str("status: 502,"), lit_str("status: 503,"), Guard::Failure},
         {lit_str("unmatched OPTIONS { return local_response({\n"
-                 "  version: \"HTTP/1.1\", status: 400,"),
+                 "  version: .http11, status: 400,"),
          lit_str("unmatched OPTIONS { return local_response({\n"
-                 "  version: \"HTTP/1.1\", status: 401,"),
+                 "  version: .http11, status: 401,"),
          Guard::Unmatched},
         {lit_str("unmatched CONNECT { return local_response({\n"
-                 "  version: \"HTTP/1.1\", status: 405,"),
+                 "  version: .http11, status: 405,"),
          lit_str("unmatched CONNECT { return local_response({\n"
-                 "  version: \"HTTP/1.1\", status: 406,"),
+                 "  version: .http11, status: 406,"),
          Guard::Unmatched},
         {lit_str("\nunmatched { return local_response({\n"
-                 "  version: \"HTTP/1.1\", status: 400,"),
+                 "  version: .http11, status: 400,"),
          lit_str("\nunmatched { return local_response({\n"
-                 "  version: \"HTTP/1.1\", status: 401,"),
+                 "  version: .http11, status: 401,"),
          Guard::Unmatched},
     };
     for (const auto& mutation : structure_mutations)
@@ -16236,23 +16234,23 @@ TEST(nginx_converter,
     std::string p3;
     std::string api;
     std::string service;
-    lower_both("/a/", 3238u, p3);
-    lower_both("/api/", 3244u, api);
-    lower_both("/service/", 3256u, service);
+    lower_both("/a/", 3180u, p3);
+    lower_both("/api/", 3186u, api);
+    lower_both("/service/", 3198u, service);
     std::string p63 = "/" + std::string(61u, 'p') + "/";
     REQUIRE_EQ(p63.size(), 63u);
     std::string p63_rut;
-    lower_both(p63, 3418u, p63_rut);
+    lower_both(p63, 3360u, p63_rut);
     std::string nested = "/";
     for (u32 i = 0u; i < 29u; i++) nested += "a/";
     nested += "bbb/";
     REQUIRE_EQ(nested.size(), 63u);
     std::string nested_rut;
-    lower_both(nested, 3418u, nested_rut);
+    lower_both(nested, 3360u, nested_rut);
     CHECK_NE(p3, api);
     CHECK_NE(api, service);
     CHECK_NE(p63_rut, nested_rut);
-    CHECK_EQ(p63_rut.size(), 3244u + 3u * (63u - 5u));
+    CHECK_EQ(p63_rut.size(), 3186u + 3u * (63u - 5u));
 
     // The generic P63 program is mechanically the closed /api/ program with exactly the two
     // route-key occurrences and the one redirect-target occurrence changed.  This pins every
@@ -16301,9 +16299,9 @@ TEST(nginx_converter,
                exact_region(candidate, p63_rut, "pre_route TRACE", "route \"");
     };
     const auto redirect_is_canonical = [&](const std::string& candidate) {
-        return count(candidate, "return redirect({scheme: \"http\"") == 1u &&
-               count(candidate, "authority: \"request_host\", port: \"actual_listener\"") == 1u &&
-               count(candidate, "path: \"static\", query: \"preserve_raw\"") == 1u &&
+        return count(candidate, "return redirect({scheme: .http") == 1u &&
+               count(candidate, "authority: .requestHost, port: .actualListener") == 1u &&
+               count(candidate, "path: .static, query: .preserveRaw") == 1u &&
                count(candidate, "target_path: \"" + p63 + "\"") == 1u &&
                count(candidate, "status: 301, reason: \"Moved Permanently\"") == 1u;
     };
@@ -16378,9 +16376,9 @@ TEST(nginx_converter,
     const std::string mutations[] = {
         replace_unique(p63_rut,
                        "pre_route TRACE { return local_response({\n"
-                       "  version: \"HTTP/1.1\", status: 405,",
+                       "  version: .http11, status: 405,",
                        "pre_route TRACE { return local_response({\n"
-                       "  version: \"HTTP/1.1\", status: 406,"),
+                       "  version: .http11, status: 406,"),
         replace_unique(
             p63_rut, "route \"" + route + "\" {\n", "route \"" + alternate_route + "\" {\n"),
         replace_unique(p63_rut,
@@ -16403,9 +16401,9 @@ TEST(nginx_converter,
             "failure_policy: {\n            // structurally noncanonical failure policy\n"),
         replace_unique(p63_rut,
                        "unmatched OPTIONS { return local_response({\n"
-                       "  version: \"HTTP/1.1\", status: 400,",
+                       "  version: .http11, status: 400,",
                        "unmatched OPTIONS { return local_response({\n"
-                       "  version: \"HTTP/1.1\", status: 401,"),
+                       "  version: .http11, status: 401,"),
         p63_rut + "// response_read_timeout: forbidden\n",
         p63_rut + "// nginx_compat workaround marker\n",
     };
@@ -16423,13 +16421,13 @@ TEST(nginx_converter,
     std::string maximum_source = make_source(p63, true, "65535", "255.255.255.255:65535");
     const auto maximum = lower(maximum_source);
     REQUIRE(maximum);
-    REQUIRE_EQ(maximum.value().len, 3426u);
+    REQUIRE_EQ(maximum.value().len, 3368u);
     CHECK_LT(maximum.value().len, nginx::RutSource::kCapacity);
-    CHECK_EQ(nginx::RutSource::kCapacity - maximum.value().len, 9353u);
+    CHECK_EQ(nginx::RutSource::kCapacity - maximum.value().len, 9411u);
     CHECK_EQ(maximum.value().data[maximum.value().len], '\0');
     validate_shape(std::string(maximum.value().data, maximum.value().len),
                    p63,
-                   3426u,
+                   3368u,
                    "listen 127.0.0.1:65535\n",
                    "upstream nginx_upstream at \"255.255.255.255:65535\"\n");
 
@@ -16449,7 +16447,7 @@ TEST(nginx_converter,
     REQUIRE(wildcard_parsed);
     const auto wildcard_lowered = nginx::lower_to_rut(wildcard_parsed.value());
     REQUIRE(wildcard_lowered);
-    REQUIRE_EQ(wildcard_lowered.value().len, 3247u);
+    REQUIRE_EQ(wildcard_lowered.value().len, 3189u);
     CHECK_EQ(count(std::string(wildcard_lowered.value().data, wildcard_lowered.value().len),
                    "target_transform:"),
              0u);
@@ -16458,7 +16456,7 @@ TEST(nginx_converter,
         "http://127.0.0.1:9000/; } }";
     const auto explicit_lowered = lower(explicit_uri);
     REQUIRE(explicit_lowered);
-    REQUIRE_EQ(explicit_lowered.value().len, 3358u);
+    REQUIRE_EQ(explicit_lowered.value().len, 3300u);
     CHECK_EQ(count(std::string(explicit_lowered.value().data, explicit_lowered.value().len),
                    "target_transform:"),
              1u);
@@ -16659,12 +16657,12 @@ TEST(nginx_converter, issue357_wildcard_complete_clean_no_uri_prefix_class_is_ca
     nested += "bbb/";
     REQUIRE_EQ(p63.size(), nginx::kMaxProxyLocationPathLen);
     REQUIRE_EQ(nested.size(), nginx::kMaxProxyLocationPathLen);
-    const Boundary boundaries[] = {{"/a/", "8080", "127.0.0.1:9000", 8080u, 3229u},
-                                   {"/api/", "8080", "127.0.0.1:9000", 8080u, 3235u},
-                                   {"/service/", "8080", "127.0.0.1:9000", 8080u, 3247u},
-                                   {p63, "8080", "127.0.0.1:9000", 8080u, 3409u},
-                                   {nested, "8080", "127.0.0.1:9000", 8080u, 3409u},
-                                   {p63, "65535", "255.255.255.255:65535", 65535u, 3417u}};
+    const Boundary boundaries[] = {{"/a/", "8080", "127.0.0.1:9000", 8080u, 3171u},
+                                   {"/api/", "8080", "127.0.0.1:9000", 8080u, 3177u},
+                                   {"/service/", "8080", "127.0.0.1:9000", 8080u, 3189u},
+                                   {p63, "8080", "127.0.0.1:9000", 8080u, 3351u},
+                                   {nested, "8080", "127.0.0.1:9000", 8080u, 3351u},
+                                   {p63, "65535", "255.255.255.255:65535", 65535u, 3359u}};
     const auto make_source = [](const std::string& endpoint,
                                 const std::string& path,
                                 const std::string& upstream,
@@ -16686,18 +16684,18 @@ TEST(nginx_converter, issue357_wildcard_complete_clean_no_uri_prefix_class_is_ca
                 count_route_declarations(source) != 1u ||
                 count_text(source, "route \"" + route + "\" {\n") != 1u ||
                 count_text(source, "req.pathOnly == \"" + route + "\"") != 1u ||
-                count_text(source, "return redirect({scheme: \"http\"") != 1u ||
-                count_text(source, "path: \"static\", query: \"preserve_raw\"") != 1u ||
+                count_text(source, "return redirect({scheme: .http") != 1u ||
+                count_text(source, "path: .static, query: .preserveRaw") != 1u ||
                 count_text(source, "target_path: \"" + boundary.path + "\"") != 1u ||
                 count_text(source, "return forward(nginx_upstream, request_policy: {") != 1u ||
                 count_text(source, "request_policy: {") != 1u ||
-                count_text(source, "host: \"upstream\"") != 1u ||
-                count_text(source, "connection: \"omit\"") != 1u ||
+                count_text(source, "host: .upstream") != 1u ||
+                count_text(source, "connection: .omit") != 1u ||
                 count_text(source,
-                           "strip_headers: [\"Connection\", \"Keep-Alive\", \"TE\", \"Expect\", "
-                           "\"Upgrade\"]") != 1u ||
+                           "strip_headers: [.connection, .keepAlive, .te, .expect, "
+                           ".upgrade]") != 1u ||
                 count_text(source, "response_policy: {") != 1u ||
-                count_text(source, "framing: \"content_length\"") != 1u ||
+                count_text(source, "framing: .contentLength") != 1u ||
                 count_text(source, "hide_headers: [\"Date\", \"Server\", \"X-Pad\"]") != 1u ||
                 count_text(source, "failure_policy: {") != 1u ||
                 count_text(source, "status: 502,") != 1u ||
@@ -16707,13 +16705,13 @@ TEST(nginx_converter, issue357_wildcard_complete_clean_no_uri_prefix_class_is_ca
                 count_text(source, "\nunmatched {") != 1u ||
                 count_text(source,
                            "unmatched OPTIONS { return local_response({\n"
-                           "  version: \"HTTP/1.1\", status: 400,") != 1u ||
+                           "  version: .http11, status: 400,") != 1u ||
                 count_text(source,
                            "unmatched CONNECT { return local_response({\n"
-                           "  version: \"HTTP/1.1\", status: 405,") != 1u ||
+                           "  version: .http11, status: 405,") != 1u ||
                 count_text(source,
                            "\nunmatched { return local_response({\n"
-                           "  version: \"HTTP/1.1\", status: 400,") != 1u ||
+                           "  version: .http11, status: 400,") != 1u ||
                 source.find("target_transform") != std::string::npos ||
                 source.find("strip_prefix") != std::string::npos ||
                 source.find("replace_prefix") != std::string::npos ||
@@ -16811,10 +16809,10 @@ TEST(nginx_converter, issue357_wildcard_complete_clean_no_uri_prefix_class_is_ca
     }
 
     REQUIRE_FALSE(p63_canonical.empty());
-    CHECK_EQ(p63_canonical.size(), 3409u);
+    CHECK_EQ(p63_canonical.size(), 3351u);
     CHECK_EQ(nginx::RutSource::kCapacity, 12779u);
-    CHECK_EQ(nginx::RutSource::kCapacity - 3417u, 9362u);
-    CHECK_EQ(nginx::RutSource::kCapacity - 1u - 3417u, 9361u);
+    CHECK_EQ(nginx::RutSource::kCapacity - 3359u, 9420u);
+    CHECK_EQ(nginx::RutSource::kCapacity - 1u - 3359u, 9419u);
     const auto replace_unique =
         [](std::string value, const std::string& from, const std::string& to) {
             const size_t offset = from.empty() ? std::string::npos : value.find(from);
@@ -16824,7 +16822,7 @@ TEST(nginx_converter, issue357_wildcard_complete_clean_no_uri_prefix_class_is_ca
             value.replace(offset, from.size(), to);
             return value;
         };
-    Boundary p63_boundary{p63, "8080", "127.0.0.1:9000", 8080u, 3409u};
+    Boundary p63_boundary{p63, "8080", "127.0.0.1:9000", 8080u, 3351u};
     const std::string p63_route = p63.substr(0u, p63.size() - 1u);
     std::string alternate_route = p63_route;
     alternate_route.back() = 'q';
@@ -16843,18 +16841,18 @@ TEST(nginx_converter, issue357_wildcard_complete_clean_no_uri_prefix_class_is_ca
                            "\", replace_prefix: \"/\"\n"
                            "        }, request_policy: {"),
         replace_unique(p63_canonical,
-                       "strip_headers: [\"Connection\", \"Keep-Alive\", \"TE\", \"Expect\", "
-                       "\"Upgrade\"]",
-                       "strip_headers: [\"Keep-Alive\", \"TE\", \"Expect\", \"Upgrade\"]"),
+                       "strip_headers: [.connection, .keepAlive, .te, .expect, "
+                       ".upgrade]",
+                       "strip_headers: [.keepAlive, .te, .expect, .upgrade]"),
         replace_unique(p63_canonical,
                        "hide_headers: [\"Date\", \"Server\", \"X-Pad\"]",
                        "hide_headers: [\"Date\", \"Server\", \"X-Foo\"]"),
         replace_unique(p63_canonical, "reason: \"Bad Gateway\"", "reason: \"Bad Gatewax\""),
         replace_unique(p63_canonical,
                        "unmatched OPTIONS { return local_response({\n"
-                       "  version: \"HTTP/1.1\", status: 400,",
+                       "  version: .http11, status: 400,",
                        "unmatched OPTIONS { return local_response({\n"
-                       "  version: \"HTTP/1.1\", status: 401,"),
+                       "  version: .http11, status: 401,"),
         p63_canonical + "// nginx_compat workaround\n",
     };
     for (u32 mutation_index = 0u; mutation_index < std::size(mutations); mutation_index++) {
@@ -16915,7 +16913,7 @@ TEST(nginx_converter, issue357_wildcard_complete_clean_no_uri_prefix_class_is_ca
     legacy.listen.value_span = {};
     const auto legacy_lowered = nginx::lower_to_rut(legacy);
     REQUIRE(legacy_lowered);
-    CHECK_EQ(legacy_lowered.value().len, 3409u);
+    CHECK_EQ(legacy_lowered.value().len, 3351u);
     CHECK_EQ(std::string(legacy_lowered.value().data, legacy_lowered.value().len), p63_canonical);
 
     const auto lexed = lex({p63_canonical.data(), static_cast<u32>(p63_canonical.size())});
@@ -17041,10 +17039,10 @@ TEST(nginx_converter,
     REQUIRE(exact_b);
     REQUIRE(wildcard_a);
     REQUIRE(wildcard_b);
-    CHECK_EQ(exact_a.value().len, 3358u);
-    CHECK_EQ(exact_b.value().len, 3358u);
-    CHECK_EQ(wildcard_a.value().len, 3349u);
-    CHECK_EQ(wildcard_b.value().len, 3349u);
+    CHECK_EQ(exact_a.value().len, 3300u);
+    CHECK_EQ(exact_b.value().len, 3300u);
+    CHECK_EQ(wildcard_a.value().len, 3291u);
+    CHECK_EQ(wildcard_b.value().len, 3291u);
     const std::string exact(exact_a.value().data, exact_a.value().len);
     const std::string exact_other(exact_b.value().data, exact_b.value().len);
     const std::string wildcard(wildcard_a.value().data, wildcard_a.value().len);
@@ -17091,10 +17089,10 @@ TEST(nginx_converter,
     const auto maximum_wildcard = nginx::lower_to_rut(maximum_wildcard_parsed.value());
     REQUIRE(maximum_exact);
     REQUIRE(maximum_wildcard);
-    CHECK_EQ(maximum_exact.value().len, 3582u);
-    CHECK_EQ(maximum_wildcard.value().len, 3573u);
+    CHECK_EQ(maximum_exact.value().len, 3524u);
+    CHECK_EQ(maximum_wildcard.value().len, 3515u);
     CHECK_LT(maximum_exact.value().len, nginx::RutSource::kCapacity);
-    CHECK_EQ(nginx::RutSource::kCapacity - maximum_exact.value().len, 9197u);
+    CHECK_EQ(nginx::RutSource::kCapacity - maximum_exact.value().len, 9255u);
     std::string maximum_expected(maximum_wildcard.value().data, maximum_wildcard.value().len);
     REQUIRE_EQ(maximum_expected.rfind("listen :65535\n", 0u), 0u);
     maximum_expected.replace(0u, strlen("listen :65535"), "listen 127.0.0.1:65535");
@@ -17121,9 +17119,9 @@ TEST(nginx_converter,
         return count_route_declarations(source) == 1u &&
                count_text(source, "route \"/service\" {\n") == 1u &&
                count_text(source, "if req.method == GET && req.pathOnly == \"/service\" {") == 1u &&
-               count_text(source, "return redirect({scheme: \"http\"") == 1u &&
-               count_text(source, "authority: \"request_host\", port: \"actual_listener\"") == 1u &&
-               count_text(source, "path: \"static\", query: \"preserve_raw\"") == 1u &&
+               count_text(source, "return redirect({scheme: .http") == 1u &&
+               count_text(source, "authority: .requestHost, port: .actualListener") == 1u &&
+               count_text(source, "path: .static, query: .preserveRaw") == 1u &&
                count_text(source, "target_path: \"/service/\"") == 1u &&
                count_text(source, "return forward(nginx_upstream, target_transform: {") == 1u &&
                count_text(source, "strip_prefix: \"/service/\"") == 1u &&
@@ -17191,9 +17189,8 @@ TEST(nginx_converter,
     } route_mutations[] = {
         {lit_str("route \"/service\" {\n"), lit_str("route \"/servicx\" {\n")},
         {lit_str("req.pathOnly == \"/service\""), lit_str("req.pathOnly == \"/servicx\"")},
-        {lit_str("query: \"preserve_raw\""), lit_str("query: \"discard\"")},
-        {lit_str("return redirect({scheme: \"http\""),
-         lit_str("return redirecX({scheme: \"http\"")},
+        {lit_str("query: .preserveRaw"), lit_str("query: .discard")},
+        {lit_str("return redirect({scheme: .http"), lit_str("return redirecX({scheme: .http")},
         {lit_str("target_path: \"/service/\""), lit_str("target_path: \"/servicx/\"")},
         {lit_str("return forward(nginx_upstream, target_transform: {"),
          lit_str("return forwarX(nginx_upstream, target_transform: {")},
@@ -17335,10 +17332,10 @@ TEST(nginx_converter, issue354_exact_loopback_fixed_replacement_has_canonical_or
     REQUIRE(exact_b);
     REQUIRE(wildcard_a);
     REQUIRE(wildcard_b);
-    CHECK_EQ(exact_a.value().len, 3345u);
-    CHECK_EQ(exact_b.value().len, 3345u);
-    CHECK_EQ(wildcard_a.value().len, 3336u);
-    CHECK_EQ(wildcard_b.value().len, 3336u);
+    CHECK_EQ(exact_a.value().len, 3287u);
+    CHECK_EQ(exact_b.value().len, 3287u);
+    CHECK_EQ(wildcard_a.value().len, 3278u);
+    CHECK_EQ(wildcard_b.value().len, 3278u);
     const std::string exact(exact_a.value().data, exact_a.value().len);
     const std::string exact_other(exact_b.value().data, exact_b.value().len);
     const std::string wildcard(wildcard_a.value().data, wildcard_a.value().len);
@@ -17373,10 +17370,10 @@ TEST(nginx_converter, issue354_exact_loopback_fixed_replacement_has_canonical_or
     const auto maximum_wildcard = nginx::lower_to_rut(maximum_wildcard_parsed.value());
     REQUIRE(maximum_exact);
     REQUIRE(maximum_wildcard);
-    CHECK_EQ(maximum_exact.value().len, 3353u);
-    CHECK_EQ(maximum_wildcard.value().len, 3344u);
+    CHECK_EQ(maximum_exact.value().len, 3295u);
+    CHECK_EQ(maximum_wildcard.value().len, 3286u);
     CHECK_LT(maximum_exact.value().len, nginx::RutSource::kCapacity);
-    CHECK_EQ(nginx::RutSource::kCapacity - maximum_exact.value().len, 9426u);
+    CHECK_EQ(nginx::RutSource::kCapacity - maximum_exact.value().len, 9484u);
     std::string maximum_expected(maximum_wildcard.value().data, maximum_wildcard.value().len);
     REQUIRE_EQ(maximum_expected.rfind("listen :65535\n", 0u), 0u);
     maximum_expected.replace(0u, strlen("listen :65535"), "listen 127.0.0.1:65535");
@@ -17456,9 +17453,9 @@ TEST(nginx_converter, issue354_exact_loopback_fixed_replacement_has_canonical_or
         return count_route_declarations(source) == 1u &&
                count_text(source, "route \"/api\" {\n") == 1u &&
                count_text(source, "if req.method == GET && req.pathOnly == \"/api\" {") == 1u &&
-               count_text(source, "return redirect({scheme: \"http\"") == 1u &&
-               count_text(source, "authority: \"request_host\", port: \"actual_listener\"") == 1u &&
-               count_text(source, "path: \"static\", query: \"preserve_raw\"") == 1u &&
+               count_text(source, "return redirect({scheme: .http") == 1u &&
+               count_text(source, "authority: .requestHost, port: .actualListener") == 1u &&
+               count_text(source, "path: .static, query: .preserveRaw") == 1u &&
                count_text(source, "target_path: \"/api/\"") == 1u &&
                count_text(source, "return forward(nginx_upstream, target_transform: {") == 1u &&
                count_text(source, "strip_prefix: \"/api/\"") == 1u &&
@@ -17479,22 +17476,22 @@ TEST(nginx_converter, issue354_exact_loopback_fixed_replacement_has_canonical_or
     const auto request_policy_is_canonical = [&](const std::string& source) {
         static constexpr char kExpected[] =
             "request_policy: {\n"
-            "            version: \"HTTP/1.1\",\n"
-            "            host: \"upstream\",\n"
-            "            connection: \"omit\",\n"
-            "            strip_headers: [\"Connection\", \"Keep-Alive\", \"TE\", \"Expect\", "
-            "\"Upgrade\"]\n";
+            "            version: .http11,\n"
+            "            host: .upstream,\n"
+            "            connection: .omit,\n"
+            "            strip_headers: [.connection, .keepAlive, .te, .expect, "
+            ".upgrade]\n";
         return count_text(source, "request_policy: {") == 1u &&
                region_equals(source, "request_policy: {", "        }, response_policy:", kExpected);
     };
     const auto response_policy_is_canonical = [&](const std::string& source) {
         static constexpr char kExpected[] =
             "response_policy: {\n"
-            "            version: \"HTTP/1.1\",\n"
-            "            framing: \"content_length\",\n"
-            "            connection: \"request\",\n"
+            "            version: .http11,\n"
+            "            framing: .contentLength,\n"
+            "            connection: .request,\n"
             "            server: \"nginx/1.29.7\",\n"
-            "            date: \"current\",\n"
+            "            date: .current,\n"
             "            hide_headers: [\"Date\", \"Server\", \"X-Pad\"]\n";
         return count_text(source, "response_policy: {") == 1u &&
                region_equals(source, "response_policy: {", "        }, failure_policy:", kExpected);
@@ -17502,13 +17499,13 @@ TEST(nginx_converter, issue354_exact_loopback_fixed_replacement_has_canonical_or
     const auto failure_policy_is_canonical = [&](const std::string& source) {
         static constexpr char kExpected[] =
             "failure_policy: {\n"
-            "            version: \"HTTP/1.1\",\n"
+            "            version: .http11,\n"
             "            status: 502,\n"
             "            reason: \"Bad Gateway\",\n"
             "            content_type: \"text/html\",\n"
             "            server: \"nginx/1.29.7\",\n"
-            "            date: \"current\",\n"
-            "            connection: \"request\",\n"
+            "            date: .current,\n"
+            "            connection: .request,\n"
             "            body: b\"<html>\\r\\n<head><title>502 Bad "
             "Gateway</title></head>\\r\\n<body>\\r\\n<center><h1>502 Bad "
             "Gateway</h1></center>\\r\\n<hr><center>nginx/1.29.7</center>\\r\\n</body>\\r\\n</"
@@ -17527,10 +17524,10 @@ TEST(nginx_converter, issue354_exact_loopback_fixed_replacement_has_canonical_or
                                    const char* head_mode,
                                    const char* body) {
         return std::string(selector) + " { return local_response({\n" +
-               "  version: \"HTTP/1.1\", status: " + std::to_string(status) + ", reason: \"" +
-               reason + "\", server: \"nginx/1.29.7\",\n" +
-               "  date: \"current\", content_type: \"text/html\", connection: \"request\",\n" +
-               "  head_mode: \"" + head_mode + "\", body: b\"" + body + "\"\n}) }\n";
+               "  version: .http11, status: " + std::to_string(status) + ", reason: \"" + reason +
+               "\", server: \"nginx/1.29.7\",\n" +
+               "  date: .current, content_type: \"text/html\", connection: .request,\n" +
+               "  head_mode: ." + head_mode + ", body: b\"" + body + "\"\n}) }\n";
     };
     const auto unmatched_policies_are_canonical = [&](const std::string& source) {
         static constexpr char kBadRequestBody[] =
@@ -17546,7 +17543,7 @@ TEST(nginx_converter, issue354_exact_loopback_fixed_replacement_has_canonical_or
         const std::string connect =
             make_unmatched("unmatched CONNECT", 405u, "Not Allowed", "reject", kNotAllowedBody);
         const std::string any =
-            make_unmatched("unmatched", 400u, "Bad Request", "suppress_body", kBadRequestBody);
+            make_unmatched("unmatched", 400u, "Bad Request", "suppressBody", kBadRequestBody);
         return count_text(source, "\nunmatched ") == 3u &&
                count_text(source, "unmatched OPTIONS {") == 1u &&
                count_text(source, "unmatched CONNECT {") == 1u &&
@@ -17628,9 +17625,8 @@ TEST(nginx_converter, issue354_exact_loopback_fixed_replacement_has_canonical_or
     } route_mutations[] = {
         {lit_str("route \"/api\" {\n"), lit_str("route \"/apx\" {\n")},
         {lit_str("req.pathOnly == \"/api\""), lit_str("req.pathOnly == \"/apx\"")},
-        {lit_str("return redirect({scheme: \"http\""),
-         lit_str("return redirecX({scheme: \"http\"")},
-        {lit_str("query: \"preserve_raw\""), lit_str("query: \"discard\"")},
+        {lit_str("return redirect({scheme: .http"), lit_str("return redirecX({scheme: .http")},
+        {lit_str("query: .preserveRaw"), lit_str("query: .discard")},
         {lit_str("target_path: \"/api/\""), lit_str("target_path: \"/apx/\"")},
         {lit_str("return forward(nginx_upstream, target_transform: {"),
          lit_str("return forwarX(nginx_upstream, target_transform: {")},
@@ -17662,7 +17658,7 @@ TEST(nginx_converter, issue354_exact_loopback_fixed_replacement_has_canonical_or
         CHECK_FALSE(source_is_canonical(candidate));
     };
     check_policy_isolated(
-        replace_unique(exact, lit_str("host: \"upstream\""), lit_str("host: \"upstreaX\"")),
+        replace_unique(exact, lit_str("host: .upstream"), lit_str("host: \"upstreaX\"")),
         false,
         true,
         true,
@@ -17670,7 +17666,7 @@ TEST(nginx_converter, issue354_exact_loopback_fixed_replacement_has_canonical_or
         true);
     check_policy_isolated(
         replace_unique(
-            exact, lit_str("framing: \"content_length\""), lit_str("framing: \"content_lengtx\"")),
+            exact, lit_str("framing: .contentLength"), lit_str("framing: .content_lengtx")),
         true,
         false,
         true,
@@ -17687,9 +17683,9 @@ TEST(nginx_converter, issue354_exact_loopback_fixed_replacement_has_canonical_or
     check_policy_isolated(timeout_policy, true, true, true, false, true);
     check_policy_isolated(replace_unique(exact,
                                          lit_str("unmatched OPTIONS { return local_response({\n"
-                                                 "  version: \"HTTP/1.1\", status: 400,"),
+                                                 "  version: .http11, status: 400,"),
                                          lit_str("unmatched OPTIONS { return local_response({\n"
-                                                 "  version: \"HTTP/1.1\", status: 401,")),
+                                                 "  version: .http11, status: 401,")),
                           true,
                           true,
                           true,
@@ -17697,9 +17693,9 @@ TEST(nginx_converter, issue354_exact_loopback_fixed_replacement_has_canonical_or
                           false);
     check_policy_isolated(replace_unique(exact,
                                          lit_str("unmatched CONNECT { return local_response({\n"
-                                                 "  version: \"HTTP/1.1\", status: 405,"),
+                                                 "  version: .http11, status: 405,"),
                                          lit_str("unmatched CONNECT { return local_response({\n"
-                                                 "  version: \"HTTP/1.1\", status: 406,")),
+                                                 "  version: .http11, status: 406,")),
                           true,
                           true,
                           true,
@@ -17707,9 +17703,9 @@ TEST(nginx_converter, issue354_exact_loopback_fixed_replacement_has_canonical_or
                           false);
     check_policy_isolated(replace_unique(exact,
                                          lit_str("\nunmatched { return local_response({\n"
-                                                 "  version: \"HTTP/1.1\", status: 400,"),
+                                                 "  version: .http11, status: 400,"),
                                          lit_str("\nunmatched { return local_response({\n"
-                                                 "  version: \"HTTP/1.1\", status: 401,")),
+                                                 "  version: .http11, status: 401,")),
                           true,
                           true,
                           true,
@@ -17848,29 +17844,29 @@ static std::string issue372_expected_rut_source(const char* listener_port,
                          "\nupstream nginx_upstream at \"" + upstream_address + ":" +
                          upstream_port + "\"\n";
     source += R"rut(pre_route TRACE { return local_response({
-  version: "HTTP/1.1", status: 405, reason: "Not Allowed", server: "nginx/1.29.7",
-  date: "current", content_type: "text/html", connection: "request",
-  head_mode: "reject", body: b"<html>\r\n<head><title>405 Not Allowed</title></head>\r\n<body>\r\n<center><h1>405 Not Allowed</h1></center>\r\n<hr><center>nginx/1.29.7</center>\r\n</body>\r\n</html>\r\n"
+  version: .http11, status: 405, reason: "Not Allowed", server: "nginx/1.29.7",
+  date: .current, content_type: "text/html", connection: .request,
+  head_mode: .reject, body: b"<html>\r\n<head><title>405 Not Allowed</title></head>\r\n<body>\r\n<center><h1>405 Not Allowed</h1></center>\r\n<hr><center>nginx/1.29.7</center>\r\n</body>\r\n</html>\r\n"
 }) }
 unmatched OPTIONS { return local_response({
-  version: "HTTP/1.1", status: 400, reason: "Bad Request", server: "nginx/1.29.7",
-  date: "current", content_type: "text/html", connection: "request",
-  head_mode: "reject", body: b"<html>\r\n<head><title>400 Bad Request</title></head>\r\n<body>\r\n<center><h1>400 Bad Request</h1></center>\r\n<hr><center>nginx/1.29.7</center>\r\n</body>\r\n</html>\r\n"
+  version: .http11, status: 400, reason: "Bad Request", server: "nginx/1.29.7",
+  date: .current, content_type: "text/html", connection: .request,
+  head_mode: .reject, body: b"<html>\r\n<head><title>400 Bad Request</title></head>\r\n<body>\r\n<center><h1>400 Bad Request</h1></center>\r\n<hr><center>nginx/1.29.7</center>\r\n</body>\r\n</html>\r\n"
 }) }
 unmatched CONNECT { return local_response({
-  version: "HTTP/1.1", status: 405, reason: "Not Allowed", server: "nginx/1.29.7",
-  date: "current", content_type: "text/html", connection: "request",
-  head_mode: "reject", body: b"<html>\r\n<head><title>405 Not Allowed</title></head>\r\n<body>\r\n<center><h1>405 Not Allowed</h1></center>\r\n<hr><center>nginx/1.29.7</center>\r\n</body>\r\n</html>\r\n"
+  version: .http11, status: 405, reason: "Not Allowed", server: "nginx/1.29.7",
+  date: .current, content_type: "text/html", connection: .request,
+  head_mode: .reject, body: b"<html>\r\n<head><title>405 Not Allowed</title></head>\r\n<body>\r\n<center><h1>405 Not Allowed</h1></center>\r\n<hr><center>nginx/1.29.7</center>\r\n</body>\r\n</html>\r\n"
 }) }
 unmatched { return local_response({
-  version: "HTTP/1.1", status: 400, reason: "Bad Request", server: "nginx/1.29.7",
-  date: "current", content_type: "text/html", connection: "request",
-  head_mode: "suppress_body", body: b"<html>\r\n<head><title>400 Bad Request</title></head>\r\n<body>\r\n<center><h1>400 Bad Request</h1></center>\r\n<hr><center>nginx/1.29.7</center>\r\n</body>\r\n</html>\r\n"
+  version: .http11, status: 400, reason: "Bad Request", server: "nginx/1.29.7",
+  date: .current, content_type: "text/html", connection: .request,
+  head_mode: .suppressBody, body: b"<html>\r\n<head><title>400 Bad Request</title></head>\r\n<body>\r\n<center><h1>400 Bad Request</h1></center>\r\n<hr><center>nginx/1.29.7</center>\r\n</body>\r\n</html>\r\n"
 }) }
 route "/api" {
     if req.method == GET && req.pathOnly == "/api" {
-        return redirect({scheme: "http", authority: "request_host", port: "actual_listener",
-            path: "static", query: "preserve_raw", date: "current", connection: "close",
+        return redirect({scheme: .http, authority: .requestHost, port: .actualListener,
+            path: .static, query: .preserveRaw, date: .current, connection: .close,
             status: 301, reason: "Moved Permanently", server: "nginx/1.29.7",
             content_type: "text/html", target_path: "/api/", body: b"<html>\r\n<head><title>301 Moved Permanently</title></head>\r\n<body>\r\n<center><h1>301 Moved Permanently</h1></center>\r\n<hr><center>nginx/1.29.7</center>\r\n</body>\r\n</html>\r\n"})
     } else {
@@ -17878,25 +17874,25 @@ route "/api" {
             strip_prefix: "/api/",
             replace_prefix: "/?"
         }, request_policy: {
-            version: "HTTP/1.1",
-            host: "upstream",
-            connection: "omit",
-            strip_headers: ["Connection", "Keep-Alive", "TE", "Expect", "Upgrade"]
+            version: .http11,
+            host: .upstream,
+            connection: .omit,
+            strip_headers: [.connection, .keepAlive, .te, .expect, .upgrade]
         }, response_policy: {
-            version: "HTTP/1.1",
-            framing: "content_length",
-            connection: "request",
+            version: .http11,
+            framing: .contentLength,
+            connection: .request,
             server: "nginx/1.29.7",
-            date: "current",
+            date: .current,
             hide_headers: ["Date", "Server", "X-Pad"]
         }, failure_policy: {
-            version: "HTTP/1.1",
+            version: .http11,
             status: 502,
             reason: "Bad Gateway",
             content_type: "text/html",
             server: "nginx/1.29.7",
-            date: "current",
-            connection: "request",
+            date: .current,
+            connection: .request,
             body: b"<html>\r\n<head><title>502 Bad Gateway</title></head>\r\n<body>\r\n<center><h1>502 Bad Gateway</h1></center>\r\n<hr><center>nginx/1.29.7</center>\r\n</body>\r\n</html>\r\n"
         })
     }
@@ -17923,9 +17919,9 @@ TEST(nginx_converter, issue372_exact_loopback_root_empty_query_has_independent_c
     REQUIRE(actual_b);
     const std::string expected = issue372_expected_rut_source("8080", "127.0.0.1", "9000");
 
-    REQUIRE_EQ(expected.size(), 3343u);
-    REQUIRE_EQ(actual_a.value().len, 3343u);
-    REQUIRE_EQ(actual_b.value().len, 3343u);
+    REQUIRE_EQ(expected.size(), 3285u);
+    REQUIRE_EQ(actual_a.value().len, 3285u);
+    REQUIRE_EQ(actual_b.value().len, 3285u);
     CHECK_EQ(std::string(actual_a.value().data, actual_a.value().len), expected);
     CHECK_EQ(std::string(actual_b.value().data, actual_b.value().len), expected);
     CHECK_EQ(actual_a.value().data[actual_a.value().len], '\0');
@@ -17953,11 +17949,11 @@ TEST(nginx_converter, issue372_exact_loopback_root_empty_query_has_independent_c
     REQUIRE(maximum);
     const std::string maximum_expected =
         issue372_expected_rut_source("65535", "255.255.255.255", "65535");
-    REQUIRE_EQ(maximum_expected.size(), 3351u);
-    REQUIRE_EQ(maximum.value().len, 3351u);
+    REQUIRE_EQ(maximum_expected.size(), 3293u);
+    REQUIRE_EQ(maximum.value().len, 3293u);
     CHECK_EQ(std::string(maximum.value().data, maximum.value().len), maximum_expected);
     CHECK_EQ(maximum.value().data[maximum.value().len], '\0');
-    CHECK_EQ(nginx::RutSource::kCapacity - maximum.value().len, 9428u);
+    CHECK_EQ(nginx::RutSource::kCapacity - maximum.value().len, 9486u);
 
     static constexpr char kExactSlash[] =
         "server { listen 127.0.0.1:8080; location /api/ { proxy_pass "
@@ -18520,10 +18516,10 @@ TEST(nginx_parser, rejects_non_exact_asterisk_listen_shapes_without_partial_mode
 TEST(nginx_converter, explicit_ipv4_wildcard_listen_has_port_only_golden) {
     static constexpr char kCanonicalTraceHook[] =
         "pre_route TRACE { return local_response({\n"
-        "  version: \"HTTP/1.1\", status: 405, reason: \"Not Allowed\", server: "
+        "  version: .http11, status: 405, reason: \"Not Allowed\", server: "
         "\"nginx/1.29.7\",\n"
-        "  date: \"current\", content_type: \"text/html\", connection: \"request\",\n"
-        "  head_mode: \"reject\", body: b\"<html>\\r\\n<head><title>405 Not "
+        "  date: .current, content_type: \"text/html\", connection: .request,\n"
+        "  head_mode: .reject, body: b\"<html>\\r\\n<head><title>405 Not "
         "Allowed</title></head>\\r\\n"
         "<body>\\r\\n<center><h1>405 Not Allowed</h1></center>\\r\\n"
         "<hr><center>nginx/1.29.7</center>\\r\\n</body>\\r\\n</html>\\r\\n\"\n"
@@ -18834,50 +18830,50 @@ TEST(nginx_converter, exact_loopback_listen_has_bounded_ordinary_rut_golden_and_
     static constexpr char kExpectedExact[] = R"RUT(listen 127.0.0.1:8080
 upstream nginx_upstream at "127.0.0.1:9000"
 pre_route TRACE { return local_response({
-  version: "HTTP/1.1", status: 405, reason: "Not Allowed", server: "nginx/1.29.7",
-  date: "current", content_type: "text/html", connection: "request",
-  head_mode: "reject", body: b"<html>\r\n<head><title>405 Not Allowed</title></head>\r\n<body>\r\n<center><h1>405 Not Allowed</h1></center>\r\n<hr><center>nginx/1.29.7</center>\r\n</body>\r\n</html>\r\n"
+  version: .http11, status: 405, reason: "Not Allowed", server: "nginx/1.29.7",
+  date: .current, content_type: "text/html", connection: .request,
+  head_mode: .reject, body: b"<html>\r\n<head><title>405 Not Allowed</title></head>\r\n<body>\r\n<center><h1>405 Not Allowed</h1></center>\r\n<hr><center>nginx/1.29.7</center>\r\n</body>\r\n</html>\r\n"
 }) }
 unmatched OPTIONS { return local_response({
-  version: "HTTP/1.1", status: 400, reason: "Bad Request", server: "nginx/1.29.7",
-  date: "current", content_type: "text/html", connection: "request",
-  head_mode: "reject", body: b"<html>\r\n<head><title>400 Bad Request</title></head>\r\n<body>\r\n<center><h1>400 Bad Request</h1></center>\r\n<hr><center>nginx/1.29.7</center>\r\n</body>\r\n</html>\r\n"
+  version: .http11, status: 400, reason: "Bad Request", server: "nginx/1.29.7",
+  date: .current, content_type: "text/html", connection: .request,
+  head_mode: .reject, body: b"<html>\r\n<head><title>400 Bad Request</title></head>\r\n<body>\r\n<center><h1>400 Bad Request</h1></center>\r\n<hr><center>nginx/1.29.7</center>\r\n</body>\r\n</html>\r\n"
 }) }
 unmatched CONNECT { return local_response({
-  version: "HTTP/1.1", status: 405, reason: "Not Allowed", server: "nginx/1.29.7",
-  date: "current", content_type: "text/html", connection: "request",
-  head_mode: "reject", body: b"<html>\r\n<head><title>405 Not Allowed</title></head>\r\n<body>\r\n<center><h1>405 Not Allowed</h1></center>\r\n<hr><center>nginx/1.29.7</center>\r\n</body>\r\n</html>\r\n"
+  version: .http11, status: 405, reason: "Not Allowed", server: "nginx/1.29.7",
+  date: .current, content_type: "text/html", connection: .request,
+  head_mode: .reject, body: b"<html>\r\n<head><title>405 Not Allowed</title></head>\r\n<body>\r\n<center><h1>405 Not Allowed</h1></center>\r\n<hr><center>nginx/1.29.7</center>\r\n</body>\r\n</html>\r\n"
 }) }
 unmatched { return local_response({
-  version: "HTTP/1.1", status: 400, reason: "Bad Request", server: "nginx/1.29.7",
-  date: "current", content_type: "text/html", connection: "request",
-  head_mode: "suppress_body", body: b"<html>\r\n<head><title>400 Bad Request</title></head>\r\n<body>\r\n<center><h1>400 Bad Request</h1></center>\r\n<hr><center>nginx/1.29.7</center>\r\n</body>\r\n</html>\r\n"
+  version: .http11, status: 400, reason: "Bad Request", server: "nginx/1.29.7",
+  date: .current, content_type: "text/html", connection: .request,
+  head_mode: .suppressBody, body: b"<html>\r\n<head><title>400 Bad Request</title></head>\r\n<body>\r\n<center><h1>400 Bad Request</h1></center>\r\n<hr><center>nginx/1.29.7</center>\r\n</body>\r\n</html>\r\n"
 }) }
 route HEAD "/" {
     return forward(nginx_upstream, request_policy: {
-            version: "HTTP/1.1",
-            host: "upstream",
-            connection: "omit",
-            strip_headers: ["Connection", "Keep-Alive", "TE", "Expect", "Upgrade"]
+            version: .http11,
+            host: .upstream,
+            connection: .omit,
+            strip_headers: [.connection, .keepAlive, .te, .expect, .upgrade]
         },
         response_policy: {
-            version: "HTTP/1.1",
-            framing: "content_length",
-            connection: "request",
-            head_mode: "suppress_body",
+            version: .http11,
+            framing: .contentLength,
+            connection: .request,
+            head_mode: .suppressBody,
             server: "nginx/1.29.7",
-            date: "current",
+            date: .current,
             hide_headers: ["Date", "Server", "X-Pad"]
         },
         failure_policy: {
-            version: "HTTP/1.1",
+            version: .http11,
             status: 502,
             reason: "Bad Gateway",
             content_type: "text/html",
             server: "nginx/1.29.7",
-            date: "current",
-            connection: "request",
-            head_mode: "suppress_body",
+            date: .current,
+            connection: .request,
+            head_mode: .suppressBody,
             body: b"<html>\r\n<head><title>502 Bad Gateway</title></head>\r\n<body>\r\n<center><h1>502 Bad Gateway</h1></center>\r\n<hr><center>nginx/1.29.7</center>\r\n</body>\r\n</html>\r\n"
         }
     )
@@ -18885,106 +18881,106 @@ route HEAD "/" {
 route GET "/" {
     if req.hasContentLength {
         return forward(nginx_upstream, request_policy: {
-            version: "HTTP/1.1",
-            host: "upstream",
-            connection: "omit",
-            strip_headers: ["Connection", "Keep-Alive", "TE", "Expect", "Upgrade"]
+            version: .http11,
+            host: .upstream,
+            connection: .omit,
+            strip_headers: [.connection, .keepAlive, .te, .expect, .upgrade]
         },
         response_policy: {
-            version: "HTTP/1.1",
-            framing: "content_length",
-            connection: "request",
+            version: .http11,
+            framing: .contentLength,
+            connection: .request,
             server: "nginx/1.29.7",
-            date: "current",
+            date: .current,
             hide_headers: ["Date", "Server", "X-Pad"]
         },
         failure_policy: {
-            version: "HTTP/1.1",
+            version: .http11,
             status: 502,
             reason: "Bad Gateway",
             content_type: "text/html",
             server: "nginx/1.29.7",
-            date: "current",
-            connection: "request",
+            date: .current,
+            connection: .request,
             body: b"<html>\r\n<head><title>502 Bad Gateway</title></head>\r\n<body>\r\n<center><h1>502 Bad Gateway</h1></center>\r\n<hr><center>nginx/1.29.7</center>\r\n</body>\r\n</html>\r\n"
         },
         timeout_failure_policy: {
-            version: "HTTP/1.1",
+            version: .http11,
             status: 504,
             reason: "Gateway Time-out",
             content_type: "text/html",
             server: "nginx/1.29.7",
-            date: "current",
-            connection: "request",
+            date: .current,
+            connection: .request,
             body: b"<html>\r\n<head><title>504 Gateway Time-out</title></head>\r\n<body>\r\n<center><h1>504 Gateway Time-out</h1></center>\r\n<hr><center>nginx/1.29.7</center>\r\n</body>\r\n</html>\r\n"
         },
         response_read_timeout: 60s,
-        response_buffering: "complete_content_length"
+        response_buffering: .completeContentLength
     )
     } else {
         return forward(nginx_upstream, request_policy: {
-            version: "HTTP/1.1",
-            host: "upstream",
-            connection: "omit",
-            strip_headers: ["Connection", "Keep-Alive", "TE", "Expect", "Upgrade"],
-            retained_header_value: "trim_sp_preserve_htab"
+            version: .http11,
+            host: .upstream,
+            connection: .omit,
+            strip_headers: [.connection, .keepAlive, .te, .expect, .upgrade],
+            retained_header_value: .trimSpPreserveHtab
         },
         response_policy: {
-            version: "HTTP/1.1",
-            framing: "content_length",
-            connection: "request",
+            version: .http11,
+            framing: .contentLength,
+            connection: .request,
             server: "nginx/1.29.7",
-            date: "current",
+            date: .current,
             hide_headers: ["Date", "Server", "X-Pad"]
         },
         failure_policy: {
-            version: "HTTP/1.1",
+            version: .http11,
             status: 502,
             reason: "Bad Gateway",
             content_type: "text/html",
             server: "nginx/1.29.7",
-            date: "current",
-            connection: "request",
+            date: .current,
+            connection: .request,
             body: b"<html>\r\n<head><title>502 Bad Gateway</title></head>\r\n<body>\r\n<center><h1>502 Bad Gateway</h1></center>\r\n<hr><center>nginx/1.29.7</center>\r\n</body>\r\n</html>\r\n"
         },
         timeout_failure_policy: {
-            version: "HTTP/1.1",
+            version: .http11,
             status: 504,
             reason: "Gateway Time-out",
             content_type: "text/html",
             server: "nginx/1.29.7",
-            date: "current",
-            connection: "request",
+            date: .current,
+            connection: .request,
             body: b"<html>\r\n<head><title>504 Gateway Time-out</title></head>\r\n<body>\r\n<center><h1>504 Gateway Time-out</h1></center>\r\n<hr><center>nginx/1.29.7</center>\r\n</body>\r\n</html>\r\n"
         },
         response_read_timeout: 60s,
-        response_buffering: "complete_content_length"
+        response_buffering: .completeContentLength
     )
     }
 }
 route "/" {
     return forward(nginx_upstream, request_policy: {
-            version: "HTTP/1.1",
-            host: "upstream",
-            connection: "omit",
-            strip_headers: ["Connection", "Keep-Alive", "TE", "Expect", "Upgrade"]
+            version: .http11,
+            host: .upstream,
+            connection: .omit,
+            strip_headers: [.connection, .keepAlive, .te, .expect, .upgrade]
         },
         response_policy: {
-            version: "HTTP/1.1",
-            framing: "content_length",
-            connection: "request",
+            version: .http11,
+            framing: .contentLength,
+            connection: .request,
             server: "nginx/1.29.7",
-            date: "current",
+            date: .current,
             hide_headers: ["Date", "Server", "X-Pad"]
         },
         failure_policy: {
-            version: "HTTP/1.1",
+            version: .http11,
             status: 502,
             reason: "Bad Gateway",
             content_type: "text/html",
             server: "nginx/1.29.7",
-            date: "current",
-            connection: "request",
+            date: .current,
+            connection: .request,
             body: b"<html>\r\n<head><title>502 Bad Gateway</title></head>\r\n<body>\r\n<center><h1>502 Bad Gateway</h1></center>\r\n<hr><center>nginx/1.29.7</center>\r\n</body>\r\n</html>\r\n"
         }
     )
@@ -19041,8 +19037,8 @@ route "/" {
     REQUIRE(has_no_nginx_hook_or_address_workaround(canonical));
     REQUIRE(source_is_canonical(canonical));
     REQUIRE_EQ(count_text(canonical, "if req.hasContentLength"), 1u);
-    REQUIRE_EQ(count_text(canonical, "retained_header_value: \"trim_sp_preserve_htab\""), 1u);
-    REQUIRE_EQ(count_text(canonical, "content_length_position: \"after_host\""), 0u);
+    REQUIRE_EQ(count_text(canonical, "retained_header_value: .trimSpPreserveHtab"), 1u);
+    REQUIRE_EQ(count_text(canonical, "content_length_position: .afterHost"), 0u);
 
     std::string wrong_listener = canonical;
     REQUIRE_EQ(count_text(wrong_listener, "listen 127.0.0.1:8080\n"), 1u);
@@ -19216,7 +19212,7 @@ route "/" {
     REQUIRE(exact_301);
     const auto accepted_301 = nginx::lower_to_rut(exact_301.value());
     REQUIRE(accepted_301);
-    CHECK_EQ(accepted_301.value().len, 5937u);
+    CHECK_EQ(accepted_301.value().len, 5821u);
     CHECK_EQ(accepted_301.value().data[accepted_301.value().len], '\0');
     CHECK_EQ(memcmp(accepted_301.value().data,
                     "listen 127.0.0.1:8080\n",
@@ -19231,7 +19227,7 @@ route "/" {
     REQUIRE(exact_302);
     const auto accepted_302 = nginx::lower_to_rut(exact_302.value());
     REQUIRE(accepted_302);
-    CHECK_EQ(accepted_302.value().len, 5913u);
+    CHECK_EQ(accepted_302.value().len, 5797u);
 
     static constexpr char kNonRootBodyful[] =
         "server { listen 127.0.0.1:8080; "
@@ -19269,10 +19265,10 @@ route "/" {
 TEST(nginx_converter, issue348_exact_loopback_no_content_has_canonical_ordinary_rut_golden) {
     static constexpr char kNoContentRoute[] =
         "route exact slash_normalized GET \"/static\" { return local_response({\n"
-        "  version: \"HTTP/1.1\", status: 204, reason: \"No Content\", server: "
+        "  version: .http11, status: 204, reason: \"No Content\", server: "
         "\"nginx/1.29.7\",\n"
-        "  date: \"current\", content_type: \"\", connection: \"request\",\n"
-        "  head_mode: \"suppress_body\", body: b\"\"\n"
+        "  date: .current, content_type: \"\", connection: .request,\n"
+        "  head_mode: .suppressBody, body: b\"\"\n"
         "}) }\n";
     char exact_first[] =
         "server { listen 127.0.0.1:8080; location = /static { return 204; } "
@@ -19478,9 +19474,9 @@ TEST(nginx_converter, issue348_exact_loopback_no_content_has_canonical_ordinary_
 TEST(nginx_converter, issue349_exact_loopback_bodyful_has_canonical_ordinary_rut_golden) {
     static constexpr char kBodyfulRoute[] =
         "route exact slash_normalized \"/static\" { return local_response({\n"
-        "  version: \"HTTP/1.1\", status: 200, reason: \"OK\", server: \"nginx/1.29.7\",\n"
-        "  date: \"current\", content_type: \"text/plain\", connection: \"request\",\n"
-        "  head_mode: \"suppress_body\", body: b\"successor-static\"\n"
+        "  version: .http11, status: 200, reason: \"OK\", server: \"nginx/1.29.7\",\n"
+        "  date: .current, content_type: \"text/plain\", connection: .request,\n"
+        "  head_mode: .suppressBody, body: b\"successor-static\"\n"
         "}) }\n";
     char exact_first[] =
         "server { listen 127.0.0.1:8080; "
@@ -19579,8 +19575,7 @@ TEST(nginx_converter, issue349_exact_loopback_bodyful_has_canonical_ordinary_rut
                count_text(candidate, "        failure_policy: {") == 3u &&
                count_text(candidate, "        timeout_failure_policy: {") == 1u &&
                count_text(candidate, "        response_read_timeout: 60s,") == 1u &&
-               count_text(candidate, "        response_buffering: \"complete_content_length\"") ==
-                   1u;
+               count_text(candidate, "        response_buffering: .completeContentLength") == 1u;
     };
     const auto has_no_nginx_hook = [](const std::string& candidate) {
         return candidate.find("nginx.conf") == std::string::npos &&
@@ -19638,9 +19633,9 @@ TEST(nginx_converter, issue349_exact_loopback_bodyful_has_canonical_ordinary_rut
                    true);
     check_isolated(replace_unique(exact,
                                   lit_str("pre_route TRACE { return local_response({\n"
-                                          "  version: \"HTTP/1.1\", status: 405"),
+                                          "  version: .http11, status: 405"),
                                   lit_str("pre_route TRACE { return local_response({\n"
-                                          "  version: \"HTTP/1.1\", status: 404")),
+                                          "  version: .http11, status: 404")),
                    true,
                    true,
                    false,
@@ -19776,11 +19771,11 @@ TEST(nginx_converter, issue350_exact_loopback_302_has_canonical_ordinary_rut_gol
     static constexpr char kRedirectPrefix[] =
         "route GET \"/\" {\n"
         "    if req.pathOnly == \"/old\" {\n"
-        "        return redirect({scheme: \"http\", authority: \"static\", static_authority: "
-        "\"redirect.example\", port: \"omit\",\n"
-        "            path: \"static\", query: \"discard\", date: \"current\", connection: "
-        "\"close\",\n"
-        "            header_order: \"connection_then_location\", status: 302, reason: \"Moved "
+        "        return redirect({scheme: .http, authority: .static, static_authority: "
+        "\"redirect.example\", port: .omit,\n"
+        "            path: .static, query: .discard, date: .current, connection: "
+        ".close,\n"
+        "            header_order: .connectionThenLocation, status: 302, reason: \"Moved "
         "Temporarily\",\n"
         "            server: \"nginx/1.29.7\", content_type: \"text/html\", target_path: "
         "\"/new\", body: b\"<html>\\r\\n"
@@ -19820,10 +19815,10 @@ TEST(nginx_converter, issue350_exact_loopback_302_has_canonical_ordinary_rut_gol
     REQUIRE(exact_b);
     REQUIRE(wildcard_a);
     REQUIRE(wildcard_b);
-    CHECK_EQ(exact_a.value().len, 5913u);
-    CHECK_EQ(exact_b.value().len, 5913u);
-    CHECK_EQ(wildcard_a.value().len, 5904u);
-    CHECK_EQ(wildcard_b.value().len, 5904u);
+    CHECK_EQ(exact_a.value().len, 5797u);
+    CHECK_EQ(exact_b.value().len, 5797u);
+    CHECK_EQ(wildcard_a.value().len, 5788u);
+    CHECK_EQ(wildcard_b.value().len, 5788u);
     const std::string exact(exact_a.value().data, exact_a.value().len);
     const std::string exact_other(exact_b.value().data, exact_b.value().len);
     const std::string wildcard(wildcard_a.value().data, wildcard_a.value().len);
@@ -19858,10 +19853,10 @@ TEST(nginx_converter, issue350_exact_loopback_302_has_canonical_ordinary_rut_gol
     const auto maximum_wildcard = nginx::lower_to_rut(maximum_wildcard_parsed.value());
     REQUIRE(maximum_exact);
     REQUIRE(maximum_wildcard);
-    CHECK_EQ(maximum_exact.value().len, 5921u);
-    CHECK_EQ(maximum_wildcard.value().len, 5912u);
+    CHECK_EQ(maximum_exact.value().len, 5805u);
+    CHECK_EQ(maximum_wildcard.value().len, 5796u);
     CHECK_LT(maximum_exact.value().len, nginx::RutSource::kCapacity);
-    CHECK_EQ(nginx::RutSource::kCapacity - maximum_exact.value().len, 6858u);
+    CHECK_EQ(nginx::RutSource::kCapacity - maximum_exact.value().len, 6974u);
     std::string maximum_wildcard_as_exact(maximum_wildcard.value().data,
                                           maximum_wildcard.value().len);
     maximum_wildcard_as_exact.replace(0u, strlen("listen :65535"), "listen 127.0.0.1:65535");
@@ -19894,7 +19889,7 @@ TEST(nginx_converter, issue350_exact_loopback_302_has_canonical_ordinary_rut_gol
         return count_text(candidate, kRedirectPrefix) == 1u &&
                count_text(candidate, "if req.pathOnly == \"/old\"") == 1u &&
                count_text(candidate, "return redirect({") == 1u &&
-               count_text(candidate, "query: \"discard\"") == 1u &&
+               count_text(candidate, "query: .discard") == 1u &&
                count_text(candidate, "status: 302, reason: \"Moved Temporarily\"") == 1u &&
                count_text(candidate, "static_authority: \"redirect.example\"") == 1u &&
                count_text(candidate, "target_path: \"/new\"") == 1u;
@@ -19925,7 +19920,7 @@ TEST(nginx_converter, issue350_exact_loopback_302_has_canonical_ordinary_rut_gol
     CHECK_EQ(count_text(exact, kRedirectPrefix), 1u);
     CHECK_EQ(count_text(exact, "if req.pathOnly == \"/old\""), 1u);
     CHECK_EQ(count_text(exact, "return redirect({"), 1u);
-    CHECK_EQ(count_text(exact, "query: \"discard\""), 1u);
+    CHECK_EQ(count_text(exact, "query: .discard"), 1u);
     CHECK_EQ(count_text(exact, "status: 302, reason: \"Moved Temporarily\""), 1u);
     CHECK_EQ(count_text(exact, "static_authority: \"redirect.example\""), 1u);
     CHECK_EQ(count_text(exact, "target_path: \"/new\""), 1u);
@@ -19999,7 +19994,7 @@ TEST(nginx_converter, issue350_exact_loopback_302_has_canonical_ordinary_rut_gol
         false,
         true);
     check_isolated(
-        replace_unique(exact, lit_str("query: \"discard\""), lit_str("query: \"preserve_raw\"")),
+        replace_unique(exact, lit_str("query: .discard"), lit_str("query: .preserveRaw")),
         true,
         true,
         false,
@@ -20121,11 +20116,11 @@ TEST(nginx_converter, issue351_exact_loopback_301_has_canonical_ordinary_rut_gol
     static constexpr char kRedirectPrefix[] =
         "route GET \"/\" {\n"
         "    if req.pathOnly == \"/old\" {\n"
-        "        return redirect({scheme: \"http\", authority: \"static\", static_authority: "
-        "\"redirect.example\", port: \"omit\",\n"
-        "            path: \"static\", query: \"discard\", date: \"current\", connection: "
-        "\"close\",\n"
-        "            header_order: \"connection_then_location\", status: 301, reason: \"Moved "
+        "        return redirect({scheme: .http, authority: .static, static_authority: "
+        "\"redirect.example\", port: .omit,\n"
+        "            path: .static, query: .discard, date: .current, connection: "
+        ".close,\n"
+        "            header_order: .connectionThenLocation, status: 301, reason: \"Moved "
         "Permanently\",\n"
         "            server: \"nginx/1.29.7\", content_type: \"text/html\", target_path: "
         "\"/new\", body: b\"<html>\\r\\n"
@@ -20164,10 +20159,10 @@ TEST(nginx_converter, issue351_exact_loopback_301_has_canonical_ordinary_rut_gol
     REQUIRE(exact_b);
     REQUIRE(wildcard_a);
     REQUIRE(wildcard_b);
-    CHECK_EQ(exact_a.value().len, 5937u);
-    CHECK_EQ(exact_b.value().len, 5937u);
-    CHECK_EQ(wildcard_a.value().len, 5928u);
-    CHECK_EQ(wildcard_b.value().len, 5928u);
+    CHECK_EQ(exact_a.value().len, 5821u);
+    CHECK_EQ(exact_b.value().len, 5821u);
+    CHECK_EQ(wildcard_a.value().len, 5812u);
+    CHECK_EQ(wildcard_b.value().len, 5812u);
     CHECK_EQ(exact_a.value().data[exact_a.value().len], '\0');
     const std::string exact(exact_a.value().data, exact_a.value().len);
     const std::string exact_other(exact_b.value().data, exact_b.value().len);
@@ -20203,9 +20198,9 @@ TEST(nginx_converter, issue351_exact_loopback_301_has_canonical_ordinary_rut_gol
     const auto maximum_wildcard = nginx::lower_to_rut(maximum_wildcard_parsed.value());
     REQUIRE(maximum_exact);
     REQUIRE(maximum_wildcard);
-    CHECK_EQ(maximum_exact.value().len, 5945u);
-    CHECK_EQ(maximum_wildcard.value().len, 5936u);
-    CHECK_EQ(maximum_exact.value().len, 5945u);
+    CHECK_EQ(maximum_exact.value().len, 5829u);
+    CHECK_EQ(maximum_wildcard.value().len, 5820u);
+    CHECK_EQ(maximum_exact.value().len, 5829u);
     CHECK_LT(maximum_exact.value().len, nginx::RutSource::kCapacity);
     CHECK_EQ(maximum_exact.value().data[maximum_exact.value().len], '\0');
     std::string maximum_wildcard_as_exact(maximum_wildcard.value().data,
@@ -20231,7 +20226,7 @@ TEST(nginx_converter, issue351_exact_loopback_301_has_canonical_ordinary_rut_gol
         return count_text(source, kRedirectPrefix) == 1u &&
                count_text(source, "if req.pathOnly == \"/old\"") == 1u &&
                count_text(source, "return redirect({") == 1u &&
-               count_text(source, "query: \"discard\"") == 1u &&
+               count_text(source, "query: .discard") == 1u &&
                count_text(source, "status: 301, reason: \"Moved Permanently\"") == 1u &&
                count_text(source, "static_authority: \"redirect.example\"") == 1u &&
                count_text(source, "target_path: \"/new\"") == 1u;
@@ -20287,10 +20282,9 @@ TEST(nginx_converter, issue351_exact_loopback_301_has_canonical_ordinary_rut_gol
                                      "status: 302, reason: \"Moved Permanently\""));
     rejects_structure(replace_unique(
         exact, "static_authority: \"redirect.example\"", "static_authority: \"other.example\""));
-    rejects_structure(replace_unique(exact, "query: \"discard\"", "query: \"preserve_raw\""));
-    rejects_structure(replace_unique(exact,
-                                     "header_order: \"connection_then_location\"",
-                                     "header_order: \"location_then_connection\""));
+    rejects_structure(replace_unique(exact, "query: .discard", "query: .preserveRaw"));
+    rejects_structure(replace_unique(
+        exact, "header_order: .connectionThenLocation", "header_order: .locationThenConnection"));
     rejects_structure(replace_unique(exact, "target_path: \"/new\"", "target_path: \"/old\""));
     rejects_structure(
         replace_unique(exact, "<h1>301 Moved Permanently</h1>", "<h1>301 Moved Permanentlx</h1>"));
@@ -20633,11 +20627,11 @@ TEST(nginx_converter_issue373, hide_header_has_independent_full_source_golden) {
         "            hide_headers: [\"Date\", \"Server\", \"X-Pad\", "
         "\"X-Compat-Hidden\"]\n";
     const std::string no_hide(kIssue373NoHideGolden, sizeof(kIssue373NoHideGolden) - 1u);
-    REQUIRE_EQ(no_hide.size(), 6975u);
+    REQUIRE_EQ(no_hide.size(), 6834u);
     REQUIRE_EQ(count_text(no_hide, kOldLine), 4u);
     REQUIRE_EQ(count_text(no_hide, "X-Compat-Hidden"), 0u);
     const std::string expected(kIssue373HideGolden, sizeof(kIssue373HideGolden) - 1u);
-    REQUIRE_EQ(expected.size(), 5366u);
+    REQUIRE_EQ(expected.size(), 5260u);
     REQUIRE_EQ(count_text(expected, kNewLine), 3u);
     REQUIRE_EQ(count_text(expected, "X-Compat-Hidden"), 3u);
     CHECK_EQ(expected.data()[expected.size()], '\0');
@@ -20656,7 +20650,7 @@ TEST(nginx_converter_issue373, hide_header_has_independent_full_source_golden) {
         REQUIRE(parsed);
         const auto lowered = nginx::lower_to_rut(parsed.value());
         REQUIRE(lowered);
-        CHECK_EQ(lowered.value().len, 5366u);
+        CHECK_EQ(lowered.value().len, 5260u);
         CHECK_EQ(std::string(lowered.value().data, lowered.value().len), expected);
         CHECK_EQ(lowered.value().data[lowered.value().len], '\0');
     }
@@ -20668,7 +20662,7 @@ TEST(nginx_converter_issue373, hide_header_has_independent_full_source_golden) {
     REQUIRE(no_hide_parsed);
     const auto no_hide_lowered = nginx::lower_to_rut(no_hide_parsed.value());
     REQUIRE(no_hide_lowered);
-    REQUIRE_EQ(no_hide_lowered.value().len, 6975u);
+    REQUIRE_EQ(no_hide_lowered.value().len, 6834u);
     CHECK_EQ(std::string(no_hide_lowered.value().data, no_hide_lowered.value().len), no_hide);
     const auto expected_lexed = lex({expected.data(), static_cast<u32>(expected.size())});
     REQUIRE(expected_lexed);
@@ -20748,7 +20742,7 @@ TEST(nginx_converter_issue373, hide_header_has_independent_full_source_golden) {
 
 TEST(nginx_converter_issue373, hide_header_policies_are_deduplicated_and_owned_end_to_end) {
     std::string source(kIssue373HideGolden, sizeof(kIssue373HideGolden) - 1u);
-    REQUIRE_EQ(source.size(), 5366u);
+    REQUIRE_EQ(source.size(), 5260u);
     RouteConfig populated{};
     {
         const auto lexed = lex({source.data(), static_cast<u32>(source.size())});
@@ -21378,9 +21372,9 @@ TEST(nginx_converter_issue270, explicit_root_timeout_is_emitted_on_all_proxy_for
         CHECK_EQ(count_text(output, seconds), 4u);
         CHECK_EQ(count_text(output, seconds + ","), 1u);
         CHECK_EQ(count_text(output, "timeout_failure_policy:"), 4u);
-        CHECK_EQ(count_text(output, "response_buffering: \"complete_content_length\""), 1u);
+        CHECK_EQ(count_text(output, "response_buffering: .completeContentLength"), 1u);
         CHECK_EQ(count_text(output, "if req.hasContentLength"), 1u);
-        CHECK_EQ(count_text(output, "content_length_position: \"after_host\""), 1u);
+        CHECK_EQ(count_text(output, "content_length_position: .afterHost"), 1u);
 
         const auto lexed = lex(lowered.value().view());
         REQUIRE(lexed);
@@ -21461,7 +21455,7 @@ TEST(nginx_converter_issue270, exact_redirect_keeps_timeout_on_get_fallback_forw
     CHECK_EQ(count_text(output, "response_read_timeout: 1s,"), 1u);
     CHECK_EQ(count_text(output, "if req.pathOnly == \"/old\""), 1u);
     CHECK_EQ(count_text(output, "if req.hasContentLength"), 1u);
-    CHECK_EQ(count_text(output, "content_length_position: \"after_host\""), 1u);
+    CHECK_EQ(count_text(output, "content_length_position: .afterHost"), 1u);
     CHECK_EQ(count_text(output, "return redirect({"), 1u);
 }
 
@@ -21854,7 +21848,7 @@ TEST(nginx_converter_issue270, custom_hide_header_and_timeout_lower_together) {
     REQUIRE(maximum);
     const auto maximum_lowered = nginx::lower_to_rut(maximum.value());
     REQUIRE(maximum_lowered);
-    CHECK_EQ(maximum_lowered.value().len, 8321u);
+    CHECK_EQ(maximum_lowered.value().len, 8167u);
     CHECK_LT(maximum_lowered.value().len, nginx::RutSource::kCapacity);
     CHECK_EQ(maximum_lowered.value().data[maximum_lowered.value().len], '\0');
     const std::string maximum_profile_source = make_request_length_http_profile(
@@ -21866,7 +21860,7 @@ TEST(nginx_converter_issue270, custom_hide_header_and_timeout_lower_together) {
     REQUIRE(maximum_profile);
     const auto maximum_profile_lowered = nginx::lower_to_rut(maximum_profile.value());
     REQUIRE(maximum_profile_lowered);
-    CHECK_EQ(maximum_profile_lowered.value().len, 8650u);
+    CHECK_EQ(maximum_profile_lowered.value().len, 8496u);
     CHECK_LT(maximum_profile_lowered.value().len, nginx::HttpProfileRutSource::kCapacity);
     CHECK_EQ(maximum_profile_lowered.value().data[maximum_profile_lowered.value().len], '\0');
     const std::string maximum_complete_source = "events {} " + maximum_profile_source;
@@ -21875,7 +21869,7 @@ TEST(nginx_converter_issue270, custom_hide_header_and_timeout_lower_together) {
     REQUIRE(maximum_complete);
     const auto maximum_complete_lowered = nginx::lower_to_rut(maximum_complete.value());
     REQUIRE(maximum_complete_lowered);
-    CHECK_EQ(maximum_complete_lowered.value().len, 8650u);
+    CHECK_EQ(maximum_complete_lowered.value().len, 8496u);
     CHECK_LT(maximum_complete_lowered.value().len, nginx::HttpProfileRutSource::kCapacity);
     CHECK_EQ(maximum_complete_lowered.value().data[maximum_complete_lowered.value().len], '\0');
     const char no_timeout[] =
@@ -21915,15 +21909,15 @@ TEST(nginx_converter_issue270, explicit_timeout_capacity_boundaries) {
         const auto lowered = nginx::lower_to_rut(parsed.value());
         REQUIRE(lowered);
         const bool is_301 = strstr(source, "return 301") != nullptr;
-        CHECK_EQ(lowered.value().len, is_301 ? 8749u : 8725u);
+        CHECK_EQ(lowered.value().len, is_301 ? 8585u : 8561u);
         CHECK_EQ(lowered.value().data[lowered.value().len], '\0');
         const auto lexed = lex(lowered.value().view());
         REQUIRE(lexed);
         if (is_301) {
-            CHECK_EQ(nginx::RutSource::kCapacity - lowered.value().len - 1u, 4029u);
-            CHECK_EQ(lexed->tokens.len, 918u);
+            CHECK_EQ(nginx::RutSource::kCapacity - lowered.value().len - 1u, 4193u);
+            CHECK_EQ(lexed->tokens.len, 1022u);
         } else {
-            CHECK_EQ(nginx::RutSource::kCapacity - lowered.value().len - 1u, 4053u);
+            CHECK_EQ(nginx::RutSource::kCapacity - lowered.value().len - 1u, 4217u);
         }
     }
     const std::string local_body(nginx::kMaxLocalReturnBodyLen, 'a');
@@ -21987,12 +21981,12 @@ TEST(nginx_converter_issue270, explicit_timeout_capacity_boundaries) {
     REQUIRE(profile);
     const auto lowered = nginx::lower_to_rut(profile.value());
     REQUIRE(lowered);
-    CHECK_EQ(lowered.value().len, 9078u);
+    CHECK_EQ(lowered.value().len, 8914u);
     CHECK_EQ(lowered.value().data[lowered.value().len], '\0');
-    CHECK_EQ(nginx::HttpProfileRutSource::kCapacity - lowered.value().len - 1u, 4029u);
+    CHECK_EQ(nginx::HttpProfileRutSource::kCapacity - lowered.value().len - 1u, 4193u);
     const auto lexed = lex(lowered.value().view());
     REQUIRE(lexed);
-    CHECK_EQ(lexed->tokens.len, 932u);
+    CHECK_EQ(lexed->tokens.len, 1036u);
 }
 
 TEST(nginx_converter_issue373, borrowed_hide_model_requires_live_stable_source) {

@@ -257,7 +257,7 @@ Independent review, unchanged public proof and full CI remain required.
 ### Earlier completion investigation (historical)
 
 The handwritten wrapper `845b0c2a` first failed parsing the illegal explicit
-`response_buffering: "none"` value. Independently reviewed `7721e5be` uses the
+`response_buffering: .none` value. Independently reviewed `7721e5be` uses the
 legal omission/default None. Clang Release build and formatting passed, but its
 public O2/io_uring run failed once in 2.42s at the joint ledger/retirement gate
 (access log empty). Exact prefix, Open probe and inactivity EOF passed the

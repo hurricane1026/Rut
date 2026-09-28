@@ -940,9 +940,9 @@ std::string source_live_proxy(const std::string& sink, u16 backend_port) {
            std::to_string(backend_port) +
            "\"\n"
            "route \"/\" {\n"
-           "  return forward(backend, request_policy: { version: \"HTTP/1.1\", "
-           "host: \"upstream\", connection: \"omit\", strip_headers: "
-           "[\"Connection\", \"Keep-Alive\", \"TE\", \"Expect\", \"Upgrade\"] })\n"
+           "  return forward(backend, request_policy: { version: .http11, "
+           "host: .upstream, connection: .omit, strip_headers: "
+           "[.connection, .keepAlive, .te, .expect, .upgrade] })\n"
            "}\n";
 }
 #endif

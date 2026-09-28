@@ -1869,6 +1869,27 @@ table and its cross-connection consistency contract exist.
 
 **Request rewrite policy (`request_policy`)**
 
+All closed HTTP policy selectors use contextual enum members, written
+`.case` with lowerCamelCase names. This applies to request/response policies,
+failure and timeout policies, strict local responses, redirects, and response
+buffering. For example, the protocol is `.http11`, response framing is
+`.contentLength`, and HEAD handling is `.suppressBody`. The compiler checks
+each member against the enclosing field's finite set before materializing
+the existing typed policy metadata; members from another field, unknown
+members, bare names, and string spellings are compile errors. Diagnostics
+include the field's allowed members. No string-selector compatibility aliases
+are retained. The complete implemented member list is in
+`docs/language-card.md`, under I/O.
+
+The fixed request `strip_headers` set also uses enum members such as
+`.connection` and `.keepAlive`; it remains a closed serialization contract.
+Open header APIs and response `hide_headers` accept custom header names.
+Their names and values, media types, reason phrases, paths, addresses, and
+bodies remain data literals. HTTP status codes retain checked integers.
+Changing selector syntax does not widen policy combinations or runtime
+protocol support, and generated nginx/Envoy RUT uses exactly the same syntax
+as hand-written RUT.
+
 `forward(upstream, request_policy: { ... })` requests a fixed, closed
 byte-for-byte serialization of the upstream request instead of the
 transparent zero-copy default; every field is a literal, validated at parse
@@ -1882,51 +1903,51 @@ fallback. The compiler selects one of four closed source profiles
 // Host to the upstream endpoint and strips the fixed five-name hop-by-hop
 // set unconditionally (no Connection-token nomination, no TE exception).
 return forward(users, request_policy: {
-    version: "HTTP/1.1", host: "upstream", connection: "omit",
-    strip_headers: ["Connection", "Keep-Alive", "TE", "Expect", "Upgrade"]
+    version: .http11, host: .upstream, connection: .omit,
+    strip_headers: [.connection, .keepAlive, .te, .expect, .upgrade]
 })
 
 // ID2 (Http11FixedStripContentLengthAfterHost) -- ID1 plus
-// `content_length_position: "after_host"`: emits Content-Length
+// `content_length_position: .afterHost`: emits Content-Length
 // immediately after the rewritten Host line instead of in the client's
 // original header order. Mutually exclusive with `retained_header_value`.
 // A request with no framing header at all (no Content-Length) is admitted
 // unchanged -- there is nothing to reposition, so it forwards like ID1. Only
 // an explicit `Content-Length: 0` is rejected.
 return forward(users, request_policy: {
-    version: "HTTP/1.1", host: "upstream", connection: "omit",
-    content_length_position: "after_host",
-    strip_headers: ["Connection", "Keep-Alive", "TE", "Expect", "Upgrade"]
+    version: .http11, host: .upstream, connection: .omit,
+    content_length_position: .afterHost,
+    strip_headers: [.connection, .keepAlive, .te, .expect, .upgrade]
 })
 
 // ID3 (Http11FixedTrimSpPreserveHtab) -- ID1 plus
-// `retained_header_value: "trim_sp_preserve_htab"`: retained (non-stripped)
+// `retained_header_value: .trimSpPreserveHtab`: retained (non-stripped)
 // header values are trimmed of leading/trailing space but keep any
 // leading/trailing horizontal tab, matching a byte-exact oracle shape.
 // Mutually exclusive with `content_length_position`. Bounded to the single
 // bodyless-GET profile: any Content-Length (including zero), chunked
 // framing, or a non-GET method is rejected.
 return forward(users, request_policy: {
-    version: "HTTP/1.1", host: "upstream", connection: "omit",
-    retained_header_value: "trim_sp_preserve_htab",
-    strip_headers: ["Connection", "Keep-Alive", "TE", "Expect", "Upgrade"]
+    version: .http11, host: .upstream, connection: .omit,
+    retained_header_value: .trimSpPreserveHtab,
+    strip_headers: [.connection, .keepAlive, .te, .expect, .upgrade]
 })
 
 // ID4 (Http11PreserveHostLowercase) -- the Envoy-compatible H1 profile
-// (`host: "preserve"`): keeps the client's Host header verbatim instead of
+// (`host: .preserve`): keeps the client's Host header verbatim instead of
 // rewriting it (fails closed unless exactly one non-empty, syntactically
 // valid-authority Host header is present), lowercases every forwarded
 // header name, and requires forwarded_proto and the six-name strip list
 // (including Proxy-Connection) together. Mutually exclusive with
 // `content_length_position` and `retained_header_value`.
 return forward(users, request_policy: {
-    version: "HTTP/1.1", host: "preserve", connection: "omit",
-    header_names: "lowercase", forwarded_proto: "http",
-    strip_headers: ["Connection", "Keep-Alive", "TE", "Expect", "Upgrade", "Proxy-Connection"]
+    version: .http11, host: .preserve, connection: .omit,
+    header_names: .lowercase, forwarded_proto: .http,
+    strip_headers: [.connection, .keepAlive, .te, .expect, .upgrade, .proxyConnection]
 })
 ```
 
-All four profiles require `version: "HTTP/1.1"` and `connection: "omit"`
+All four profiles require `version: .http11` and `connection: .omit`
 literally, and reject a request whose framing is ambiguous for this closed
 serializer: a body paired with a client `Expect` header whose trimmed value
 is non-empty, `Transfer-Encoding`, or (ID1/ID2/ID3 only) any semantically-
@@ -1946,14 +1967,14 @@ Envoy itself forwards a bare `Upgrade` header unchanged on the wire, but
 Rut's request_policy path has no upgrade-tunnel capability at all, so
 "admitted" here means only that the request is not rejected for it, not
 that the header reaches the wire -- it never does, unmodified or
-otherwise). `host: "upstream"` (ID1/ID2/ID3) additionally
+otherwise). `host: .upstream` (ID1/ID2/ID3) additionally
 rejects `header_names`, `forwarded_proto`, and a `Proxy-Connection` strip
 entry, and
-requires exactly the original five strip names; `host: "preserve"` (ID4)
+requires exactly the original five strip names; `host: .preserve` (ID4)
 rejects `content_length_position`/`retained_header_value` and requires
 `header_names`/`forwarded_proto` plus all six strip names.
 
-`host: "preserve"` (ID4) additionally: drops every header nominated by the
+`host: .preserve` (ID4) additionally: drops every header nominated by the
 client's `Connection` header value (RFC 7230-style hop-by-hop stripping, not
 just the fixed `strip_headers` list) except `te` and the protected names
 `content-length`, `host`, `x-forwarded-for`, `x-forwarded-host`, and
@@ -2032,7 +2053,7 @@ overwritten in place, at that same original position, with
 malformed scheme; and `x-forwarded-proto: http` is appended as the last
 header only when the client sent no `x-forwarded-proto` field at all. This
 `http` fallback is connection-derived, not client-derived, so `host:
-"preserve"` targets Envoy's cleartext (non-TLS) listener profile only: it is
+.preserve` targets Envoy's cleartext (non-TLS) listener profile only: it is
 rejected outright -- fail closed, no upstream contact, the same status
 every other unsupported combination in this profile uses -- on a connection
 this runtime itself terminated with TLS (`conn.tls_active`), rather than
@@ -2049,7 +2070,7 @@ zero-copy-shaped forwards: a request with a body paired with a client
 framing (no `100 Continue` interim-response support exists yet); an empty
 or OWS-only `Expect` field is admitted like a request with no `Expect`
 header at all, matching the same nonempty-trimmed-value condition described
-above. `host: "preserve"` (ID4) is additionally ordinary-forward-only: a
+above. `host: .preserve` (ID4) is additionally ordinary-forward-only: a
 route pairing it with a response read timeout, response buffering, or a
 `target_transform` (`forward(upstream, set_path: "...")`) request-target
 rewrite fails at compile time with a dedicated diagnostic (`analyze_term`,

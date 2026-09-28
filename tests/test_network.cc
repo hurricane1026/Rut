@@ -2593,8 +2593,8 @@ TEST(response_policy, target_transform_bundle_suppress_body_fails_before_materia
     }
 }
 
-// Codex sweep-2 review: `host: "preserve"` (ID4) is ordinary-forward-only --
-// `src/compiler/analyze.cc` rejects `request_policy: { host: "preserve" }`
+// Codex sweep-2 review: `host: .preserve` (ID4) is ordinary-forward-only --
+// `src/compiler/analyze.cc` rejects `request_policy: { host: .preserve }`
 // combined with a target transform at compile time for ordinary Rut source
 // -- but a direct-RIR/JIT-constructed outcome (this test) bypasses that
 // analyzer entirely. The runtime preflight in `handle_jit_outcome`
@@ -70049,12 +70049,12 @@ TEST(state_invariant, jit_forward_direct_paired_head_connect_submit_serializes_n
 // (`response_policy_suppress_head_admitted`) must validate the Host
 // authority with the same grammar the route's request policy will actually
 // use to materialize the request, or it can reject a shape the serializer
-// itself accepts. ID4 (Http11PreserveHostLowercase, `host: "preserve"`)
+// itself accepts. ID4 (Http11PreserveHostLowercase, `host: .preserve`)
 // forwards the client's Host verbatim and validates it with the
 // Envoy-compatible `request_policy_host_authority_is_valid` grammar, which
 // -- unlike the legacy grammar the fixed-upstream-Host policies use --
 // admits an IPv6 literal authority such as `[::1]`. A HEAD route pairing
-// ID4 with `head_mode: "suppress_body"` response/failure policies is
+// ID4 with `head_mode: .suppressBody` response/failure policies is
 // exactly the shape `put_forward_route` (src/envoy/converter.cc) emits.
 TEST(state_invariant, jit_forward_direct_paired_head_id4_admits_ipv6_literal_host) {
     RouteConfig cfg;
@@ -70130,7 +70130,7 @@ TEST(state_invariant, jit_forward_direct_paired_head_id4_admits_ipv6_literal_hos
 }
 
 // The legacy (non-ID4) authority grammar is unchanged: a fixed-upstream-Host
-// policy (ID1, `host: "upstream"`) never forwards the client's Host, and
+// policy (ID1, `host: .upstream`) never forwards the client's Host, and
 // this preflight keeps rejecting an IPv6-literal-shaped `Host` for it
 // exactly as before.
 TEST(state_invariant, jit_forward_direct_paired_head_non_id4_still_rejects_ipv6_literal_host) {

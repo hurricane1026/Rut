@@ -19421,30 +19421,30 @@ struct PublicPairedHeadSourceResources {
 route "/" {
   if req.method == HEAD && req.pathOnly == "/head" {
     return forward(backend,
-      request_policy: { version: "HTTP/1.1", host: "upstream", connection: "omit",
-        strip_headers: ["Connection", "Keep-Alive", "TE", "Expect", "Upgrade"] },
-      response_policy: { version: "HTTP/1.1", framing: "content_length", connection: "request",
-        head_mode: "suppress_body", server: "nginx/1.29.7", date: "current",
+      request_policy: { version: .http11, host: .upstream, connection: .omit,
+        strip_headers: [.connection, .keepAlive, .te, .expect, .upgrade] },
+      response_policy: { version: .http11, framing: .contentLength, connection: .request,
+        head_mode: .suppressBody, server: "nginx/1.29.7", date: .current,
         hide_headers: ["Date", "Server", "X-Pad"] },
-      failure_policy: { version: "HTTP/1.1", status: 502, reason: "Bad Gateway",
-        content_type: "text/html", server: "nginx/1.29.7", date: "current",
-        connection: "request", head_mode: "suppress_body",
+      failure_policy: { version: .http11, status: 502, reason: "Bad Gateway",
+        content_type: "text/html", server: "nginx/1.29.7", date: .current,
+        connection: .request, head_mode: .suppressBody,
         body: b"<html>\r\n<head><title>502 Bad Gateway</title></head>\r\n<body>\r\n<center><h1>502 Bad Gateway</h1></center>\r\n<hr><center>nginx/1.29.7</center>\r\n</body>\r\n</html>\r\n" },
-      timeout_failure_policy: { version: "HTTP/1.1", status: 504,
+      timeout_failure_policy: { version: .http11, status: 504,
         reason: "Gateway Time-out", content_type: "text/html",
-        server: "nginx/1.29.7", date: "current", connection: "request",
-        head_mode: "suppress_body",
+        server: "nginx/1.29.7", date: .current, connection: .request,
+        head_mode: .suppressBody,
         body: b"<html>\r\n<head><title>504 Gateway Time-out</title></head>\r\n<body>\r\n<center><h1>504 Gateway Time-out</h1></center>\r\n<hr><center>nginx/1.29.7</center>\r\n</body>\r\n</html>\r\n" })
   } else {
     return forward(backend,
-      request_policy: { version: "HTTP/1.1", host: "upstream", connection: "omit",
-        strip_headers: ["Connection", "Keep-Alive", "TE", "Expect", "Upgrade"] },
-      response_policy: { version: "HTTP/1.1", framing: "content_length", connection: "request",
-        server: "nginx/1.29.7", date: "current",
+      request_policy: { version: .http11, host: .upstream, connection: .omit,
+        strip_headers: [.connection, .keepAlive, .te, .expect, .upgrade] },
+      response_policy: { version: .http11, framing: .contentLength, connection: .request,
+        server: "nginx/1.29.7", date: .current,
         hide_headers: ["Date", "Server", "X-Pad"] },
-      failure_policy: { version: "HTTP/1.1", status: 502, reason: "Bad Gateway",
-        content_type: "text/html", server: "nginx/1.29.7", date: "current",
-        connection: "request",
+      failure_policy: { version: .http11, status: 502, reason: "Bad Gateway",
+        content_type: "text/html", server: "nginx/1.29.7", date: .current,
+        connection: .request,
         body: b"<html>\r\n<head><title>502 Bad Gateway</title></head>\r\n<body>\r\n<center><h1>502 Bad Gateway</h1></center>\r\n<hr><center>nginx/1.29.7</center>\r\n</body>\r\n</html>\r\n" })
   }
 }
@@ -19539,18 +19539,18 @@ struct PublicResponseReadDeadlineSourceResources {
         source += R"rut(
 route HEAD "/deadline" {
   return forward(backend,
-    request_policy: { version: "HTTP/1.1", host: "upstream", connection: "omit",
-      strip_headers: ["Connection", "Keep-Alive", "TE", "Expect", "Upgrade"] },
-    response_policy: { version: "HTTP/1.1", framing: "content_length",
-      connection: "request", head_mode: "suppress_body", server: "deadline-test",
-      date: "current", hide_headers: ["Date", "Server"] },
-    failure_policy: { version: "HTTP/1.1", status: 502, reason: "Origin Failed",
-      content_type: "text/plain", server: "deadline-test", date: "current",
-      connection: "request", head_mode: "suppress_body", body: b"default failure\n" },
-    timeout_failure_policy: { version: "HTTP/1.1", status: 504,
+    request_policy: { version: .http11, host: .upstream, connection: .omit,
+      strip_headers: [.connection, .keepAlive, .te, .expect, .upgrade] },
+    response_policy: { version: .http11, framing: .contentLength,
+      connection: .request, head_mode: .suppressBody, server: "deadline-test",
+      date: .current, hide_headers: ["Date", "Server"] },
+    failure_policy: { version: .http11, status: 502, reason: "Origin Failed",
+      content_type: "text/plain", server: "deadline-test", date: .current,
+      connection: .request, head_mode: .suppressBody, body: b"default failure\n" },
+    timeout_failure_policy: { version: .http11, status: 504,
       reason: "First Response Deadline", content_type: "text/plain",
-      server: "deadline-test", date: "current", connection: "request",
-      head_mode: "suppress_body", body: b"configured deadline\n" },
+      server: "deadline-test", date: .current, connection: .request,
+      head_mode: .suppressBody, body: b"configured deadline\n" },
     response_read_timeout: 1s)
 }
 )rut";
@@ -19707,34 +19707,34 @@ struct PublicDistinctResponseReadDeadlineSourceResources
         source += R"rut(
 route HEAD "/short-deadline" {
   return forward(short_backend,
-    request_policy: { version: "HTTP/1.1", host: "upstream", connection: "omit",
-      strip_headers: ["Connection", "Keep-Alive", "TE", "Expect", "Upgrade"] },
-    response_policy: { version: "HTTP/1.1", framing: "content_length",
-      connection: "request", head_mode: "suppress_body", server: "short-timeout",
-      date: "current", hide_headers: ["Date", "Server"] },
-    failure_policy: { version: "HTTP/1.1", status: 502, reason: "Short Origin Failed",
-      content_type: "text/plain", server: "short-timeout", date: "current",
-      connection: "request", head_mode: "suppress_body", body: b"short failure\n" },
-    timeout_failure_policy: { version: "HTTP/1.1", status: 504,
+    request_policy: { version: .http11, host: .upstream, connection: .omit,
+      strip_headers: [.connection, .keepAlive, .te, .expect, .upgrade] },
+    response_policy: { version: .http11, framing: .contentLength,
+      connection: .request, head_mode: .suppressBody, server: "short-timeout",
+      date: .current, hide_headers: ["Date", "Server"] },
+    failure_policy: { version: .http11, status: 502, reason: "Short Origin Failed",
+      content_type: "text/plain", server: "short-timeout", date: .current,
+      connection: .request, head_mode: .suppressBody, body: b"short failure\n" },
+    timeout_failure_policy: { version: .http11, status: 504,
       reason: "Short Response Deadline", content_type: "text/plain",
-      server: "short-timeout", date: "current", connection: "request",
-      head_mode: "suppress_body", body: b"short deadline\n" },
+      server: "short-timeout", date: .current, connection: .request,
+      head_mode: .suppressBody, body: b"short deadline\n" },
     response_read_timeout: 1s)
 }
 route HEAD "/long-deadline" {
   return forward(long_backend,
-    request_policy: { version: "HTTP/1.1", host: "upstream", connection: "omit",
-      strip_headers: ["Connection", "Keep-Alive", "TE", "Expect", "Upgrade"] },
-    response_policy: { version: "HTTP/1.1", framing: "content_length",
-      connection: "request", head_mode: "suppress_body", server: "long-timeout",
-      date: "current", hide_headers: ["Date", "Server"] },
-    failure_policy: { version: "HTTP/1.1", status: 502, reason: "Long Origin Failed",
-      content_type: "text/plain", server: "long-timeout", date: "current",
-      connection: "request", head_mode: "suppress_body", body: b"long failure\n" },
-    timeout_failure_policy: { version: "HTTP/1.1", status: 504,
+    request_policy: { version: .http11, host: .upstream, connection: .omit,
+      strip_headers: [.connection, .keepAlive, .te, .expect, .upgrade] },
+    response_policy: { version: .http11, framing: .contentLength,
+      connection: .request, head_mode: .suppressBody, server: "long-timeout",
+      date: .current, hide_headers: ["Date", "Server"] },
+    failure_policy: { version: .http11, status: 502, reason: "Long Origin Failed",
+      content_type: "text/plain", server: "long-timeout", date: .current,
+      connection: .request, head_mode: .suppressBody, body: b"long failure\n" },
+    timeout_failure_policy: { version: .http11, status: 504,
       reason: "Long Response Deadline", content_type: "text/plain",
-      server: "long-timeout", date: "current", connection: "request",
-      head_mode: "suppress_body", body: b"long deadline\n" },
+      server: "long-timeout", date: .current, connection: .request,
+      head_mode: .suppressBody, body: b"long deadline\n" },
     response_read_timeout: 3s)
 }
 )rut";
@@ -19772,41 +19772,41 @@ struct PublicGetCl0ResponseReadDeadlineSourceResources : PublicResponseReadDeadl
         source += nginx_shaped_timeout ? R"rut(
 route GET "/deadline" {
   return forward(backend,
-    request_policy: { version: "HTTP/1.1", host: "upstream", connection: "omit",
-      strip_headers: ["Connection", "Keep-Alive", "TE", "Expect", "Upgrade"] },
-    response_policy: { version: "HTTP/1.1", framing: "content_length",
-      connection: "request", head_mode: "reject", server: "nginx/1.29.7",
-      date: "current", hide_headers: ["Date", "Server"] },
-    failure_policy: { version: "HTTP/1.1", status: 502, reason: "Bad Gateway",
-      content_type: "text/html", server: "nginx/1.29.7", date: "current",
-      connection: "request", head_mode: "reject",
+    request_policy: { version: .http11, host: .upstream, connection: .omit,
+      strip_headers: [.connection, .keepAlive, .te, .expect, .upgrade] },
+    response_policy: { version: .http11, framing: .contentLength,
+      connection: .request, head_mode: .reject, server: "nginx/1.29.7",
+      date: .current, hide_headers: ["Date", "Server"] },
+    failure_policy: { version: .http11, status: 502, reason: "Bad Gateway",
+      content_type: "text/html", server: "nginx/1.29.7", date: .current,
+      connection: .request, head_mode: .reject,
       body: b"<html>\r\n<head><title>502 Bad Gateway</title></head>\r\n<body>\r\n<center><h1>502 Bad Gateway</h1></center>\r\n<hr><center>nginx/1.29.7</center>\r\n</body>\r\n</html>\r\n" },
-    timeout_failure_policy: { version: "HTTP/1.1", status: 504,
+    timeout_failure_policy: { version: .http11, status: 504,
       reason: "Gateway Time-out", content_type: "text/html",
-      server: "nginx/1.29.7", date: "current", connection: "request",
-      head_mode: "reject",
+      server: "nginx/1.29.7", date: .current, connection: .request,
+      head_mode: .reject,
       body: b"<html>\r\n<head><title>504 Gateway Time-out</title></head>\r\n<body>\r\n<center><h1>504 Gateway Time-out</h1></center>\r\n<hr><center>nginx/1.29.7</center>\r\n</body>\r\n</html>\r\n" },
     response_read_timeout: 1s,
-    response_buffering: "complete_content_length")
+    response_buffering: .completeContentLength)
 }
 )rut"
                                        : R"rut(
 route GET "/deadline" {
   return forward(backend,
-    request_policy: { version: "HTTP/1.1", host: "upstream", connection: "omit",
-      strip_headers: ["Connection", "Keep-Alive", "TE", "Expect", "Upgrade"] },
-    response_policy: { version: "HTTP/1.1", framing: "content_length",
-      connection: "request", head_mode: "reject", server: "deadline-test",
-      date: "current", hide_headers: ["Date", "Server"] },
-    failure_policy: { version: "HTTP/1.1", status: 502, reason: "Origin Failed",
-      content_type: "text/plain", server: "deadline-test", date: "current",
-      connection: "request", head_mode: "reject", body: b"default failure\n" },
-    timeout_failure_policy: { version: "HTTP/1.1", status: 504,
+    request_policy: { version: .http11, host: .upstream, connection: .omit,
+      strip_headers: [.connection, .keepAlive, .te, .expect, .upgrade] },
+    response_policy: { version: .http11, framing: .contentLength,
+      connection: .request, head_mode: .reject, server: "deadline-test",
+      date: .current, hide_headers: ["Date", "Server"] },
+    failure_policy: { version: .http11, status: 502, reason: "Origin Failed",
+      content_type: "text/plain", server: "deadline-test", date: .current,
+      connection: .request, head_mode: .reject, body: b"default failure\n" },
+    timeout_failure_policy: { version: .http11, status: 504,
       reason: "First Response Deadline", content_type: "text/plain",
-      server: "deadline-test", date: "current", connection: "request",
-      head_mode: "reject", body: b"configured deadline\n" },
+      server: "deadline-test", date: .current, connection: .request,
+      head_mode: .reject, body: b"configured deadline\n" },
     response_read_timeout: 1s,
-    response_buffering: "complete_content_length")
+    response_buffering: .completeContentLength)
 }
 )rut";
 
@@ -19848,18 +19848,18 @@ struct PublicGetCompleteContentLengthBufferingSourceResources
         source += R"rut(
 route GET "/buffered" {
   return forward(backend,
-    response_policy: { version: "HTTP/1.1", framing: "content_length",
-      connection: "request", head_mode: "reject", server: "buffered-test",
-      date: "current", hide_headers: ["Date", "Server"] },
-    failure_policy: { version: "HTTP/1.1", status: 502, reason: "Origin Failed",
-      content_type: "text/plain", server: "buffered-test", date: "current",
-      connection: "request", head_mode: "reject", body: b"default failure\n" },
-    timeout_failure_policy: { version: "HTTP/1.1", status: 504,
+    response_policy: { version: .http11, framing: .contentLength,
+      connection: .request, head_mode: .reject, server: "buffered-test",
+      date: .current, hide_headers: ["Date", "Server"] },
+    failure_policy: { version: .http11, status: 502, reason: "Origin Failed",
+      content_type: "text/plain", server: "buffered-test", date: .current,
+      connection: .request, head_mode: .reject, body: b"default failure\n" },
+    timeout_failure_policy: { version: .http11, status: 504,
       reason: "Response Read Deadline", content_type: "text/plain",
-      server: "buffered-test", date: "current", connection: "request",
-      head_mode: "reject", body: b"configured deadline\n" },
+      server: "buffered-test", date: .current, connection: .request,
+      head_mode: .reject, body: b"configured deadline\n" },
     response_read_timeout: 1s,
-    response_buffering: "complete_content_length")
+    response_buffering: .completeContentLength)
 }
 )rut";
 
@@ -19895,20 +19895,20 @@ struct PublicGetCompleteContentLengthBufferingFixedRequestPolicySourceResources
         source += R"rut(
 route GET "/buffered" {
   return forward(backend,
-    request_policy: { version: "HTTP/1.1", host: "upstream", connection: "omit",
-      strip_headers: ["Connection", "Keep-Alive", "TE", "Expect", "Upgrade"] },
-    response_policy: { version: "HTTP/1.1", framing: "content_length",
-      connection: "request", head_mode: "reject", server: "buffered-test",
-      date: "current", hide_headers: ["Date", "Server"] },
-    failure_policy: { version: "HTTP/1.1", status: 502, reason: "Origin Failed",
-      content_type: "text/plain", server: "buffered-test", date: "current",
-      connection: "request", head_mode: "reject", body: b"default failure\n" },
-    timeout_failure_policy: { version: "HTTP/1.1", status: 504,
+    request_policy: { version: .http11, host: .upstream, connection: .omit,
+      strip_headers: [.connection, .keepAlive, .te, .expect, .upgrade] },
+    response_policy: { version: .http11, framing: .contentLength,
+      connection: .request, head_mode: .reject, server: "buffered-test",
+      date: .current, hide_headers: ["Date", "Server"] },
+    failure_policy: { version: .http11, status: 502, reason: "Origin Failed",
+      content_type: "text/plain", server: "buffered-test", date: .current,
+      connection: .request, head_mode: .reject, body: b"default failure\n" },
+    timeout_failure_policy: { version: .http11, status: 504,
       reason: "Response Read Deadline", content_type: "text/plain",
-      server: "buffered-test", date: "current", connection: "request",
-      head_mode: "reject", body: b"configured deadline\n" },
+      server: "buffered-test", date: .current, connection: .request,
+      head_mode: .reject, body: b"configured deadline\n" },
     response_read_timeout: 1s,
-    response_buffering: "complete_content_length")
+    response_buffering: .completeContentLength)
 }
 )rut";
 
@@ -19944,20 +19944,20 @@ struct PublicPutCompleteContentLengthBufferingFixedRequestPolicySourceResources
         source += R"rut(
 route PUT "/buffered" {
   return forward(backend,
-    request_policy: { version: "HTTP/1.1", host: "upstream", connection: "omit",
-      strip_headers: ["Connection", "Keep-Alive", "TE", "Expect", "Upgrade"] },
-    response_policy: { version: "HTTP/1.1", framing: "content_length",
-      connection: "request", head_mode: "reject", server: "buffered-test",
-      date: "current", hide_headers: ["Date", "Server"] },
-    failure_policy: { version: "HTTP/1.1", status: 502, reason: "Origin Failed",
-      content_type: "text/plain", server: "buffered-test", date: "current",
-      connection: "request", head_mode: "reject", body: b"default failure\n" },
-    timeout_failure_policy: { version: "HTTP/1.1", status: 504,
+    request_policy: { version: .http11, host: .upstream, connection: .omit,
+      strip_headers: [.connection, .keepAlive, .te, .expect, .upgrade] },
+    response_policy: { version: .http11, framing: .contentLength,
+      connection: .request, head_mode: .reject, server: "buffered-test",
+      date: .current, hide_headers: ["Date", "Server"] },
+    failure_policy: { version: .http11, status: 502, reason: "Origin Failed",
+      content_type: "text/plain", server: "buffered-test", date: .current,
+      connection: .request, head_mode: .reject, body: b"default failure\n" },
+    timeout_failure_policy: { version: .http11, status: 504,
       reason: "Response Read Deadline", content_type: "text/plain",
-      server: "buffered-test", date: "current", connection: "request",
-      head_mode: "reject", body: b"configured deadline\n" },
+      server: "buffered-test", date: .current, connection: .request,
+      head_mode: .reject, body: b"configured deadline\n" },
     response_read_timeout: 1s,
-    response_buffering: "complete_content_length")
+    response_buffering: .completeContentLength)
 }
 )rut";
 
@@ -19993,20 +19993,20 @@ struct PublicPatchCompleteContentLengthBufferingFixedRequestPolicySourceResource
         source += R"rut(
 route PATCH "/buffered" {
   return forward(backend,
-    request_policy: { version: "HTTP/1.1", host: "upstream", connection: "omit",
-      strip_headers: ["Connection", "Keep-Alive", "TE", "Expect", "Upgrade"] },
-    response_policy: { version: "HTTP/1.1", framing: "content_length",
-      connection: "request", head_mode: "reject", server: "buffered-test",
-      date: "current", hide_headers: ["Date", "Server"] },
-    failure_policy: { version: "HTTP/1.1", status: 502, reason: "Origin Failed",
-      content_type: "text/plain", server: "buffered-test", date: "current",
-      connection: "request", head_mode: "reject", body: b"default failure\n" },
-    timeout_failure_policy: { version: "HTTP/1.1", status: 504,
+    request_policy: { version: .http11, host: .upstream, connection: .omit,
+      strip_headers: [.connection, .keepAlive, .te, .expect, .upgrade] },
+    response_policy: { version: .http11, framing: .contentLength,
+      connection: .request, head_mode: .reject, server: "buffered-test",
+      date: .current, hide_headers: ["Date", "Server"] },
+    failure_policy: { version: .http11, status: 502, reason: "Origin Failed",
+      content_type: "text/plain", server: "buffered-test", date: .current,
+      connection: .request, head_mode: .reject, body: b"default failure\n" },
+    timeout_failure_policy: { version: .http11, status: 504,
       reason: "Response Read Deadline", content_type: "text/plain",
-      server: "buffered-test", date: "current", connection: "request",
-      head_mode: "reject", body: b"configured deadline\n" },
+      server: "buffered-test", date: .current, connection: .request,
+      head_mode: .reject, body: b"configured deadline\n" },
     response_read_timeout: 1s,
-    response_buffering: "complete_content_length")
+    response_buffering: .completeContentLength)
 }
 )rut";
 
@@ -20044,20 +20044,20 @@ struct PublicValidatedFailureLateSuccessorSourceResources
         source += R"rut(
 route GET "/buffered" {
   return forward(backend,
-    request_policy: { version: "HTTP/1.1", host: "upstream", connection: "omit",
-      strip_headers: ["Connection", "Keep-Alive", "TE", "Expect", "Upgrade"] },
-    response_policy: { version: "HTTP/1.1", framing: "content_length",
-      connection: "request", head_mode: "reject", server: "buffered-test",
-      date: "current", hide_headers: ["Date", "Server"] },
-    failure_policy: { version: "HTTP/1.1", status: 502, reason: "Origin Failed",
-      content_type: "text/plain", server: "buffered-test", date: "current",
-      connection: "request", head_mode: "reject", body: b"default failure\n" },
-    timeout_failure_policy: { version: "HTTP/1.1", status: 504,
+    request_policy: { version: .http11, host: .upstream, connection: .omit,
+      strip_headers: [.connection, .keepAlive, .te, .expect, .upgrade] },
+    response_policy: { version: .http11, framing: .contentLength,
+      connection: .request, head_mode: .reject, server: "buffered-test",
+      date: .current, hide_headers: ["Date", "Server"] },
+    failure_policy: { version: .http11, status: 502, reason: "Origin Failed",
+      content_type: "text/plain", server: "buffered-test", date: .current,
+      connection: .request, head_mode: .reject, body: b"default failure\n" },
+    timeout_failure_policy: { version: .http11, status: 504,
       reason: "Response Read Deadline", content_type: "text/plain",
-      server: "buffered-test", date: "current", connection: "request",
-      head_mode: "reject", body: b"configured deadline\n" },
+      server: "buffered-test", date: .current, connection: .request,
+      head_mode: .reject, body: b"configured deadline\n" },
     response_read_timeout: 1s,
-    response_buffering: "complete_content_length")
+    response_buffering: .completeContentLength)
 }
 
 route GET "/static" {
@@ -20097,28 +20097,28 @@ struct PublicExactStrictCoalescedSuccessorSourceResources
         source += R"rut(
 route GET "/buffered" {
   return forward(backend,
-    request_policy: { version: "HTTP/1.1", host: "upstream", connection: "omit",
-      strip_headers: ["Connection", "Keep-Alive", "TE", "Expect", "Upgrade"] },
-    response_policy: { version: "HTTP/1.1", framing: "content_length",
-      connection: "request", head_mode: "reject", server: "nginx/1.29.7",
-      date: "current", hide_headers: ["Date", "Server"] },
-    failure_policy: { version: "HTTP/1.1", status: 502, reason: "Bad Gateway",
-      content_type: "text/html", server: "nginx/1.29.7", date: "current",
-      connection: "request", head_mode: "reject",
+    request_policy: { version: .http11, host: .upstream, connection: .omit,
+      strip_headers: [.connection, .keepAlive, .te, .expect, .upgrade] },
+    response_policy: { version: .http11, framing: .contentLength,
+      connection: .request, head_mode: .reject, server: "nginx/1.29.7",
+      date: .current, hide_headers: ["Date", "Server"] },
+    failure_policy: { version: .http11, status: 502, reason: "Bad Gateway",
+      content_type: "text/html", server: "nginx/1.29.7", date: .current,
+      connection: .request, head_mode: .reject,
       body: b"<html>\r\n<head><title>502 Bad Gateway</title></head>\r\n<body>\r\n<center><h1>502 Bad Gateway</h1></center>\r\n<hr><center>nginx/1.29.7</center>\r\n</body>\r\n</html>\r\n" },
-    timeout_failure_policy: { version: "HTTP/1.1", status: 504,
+    timeout_failure_policy: { version: .http11, status: 504,
       reason: "Gateway Time-out", content_type: "text/html",
-      server: "nginx/1.29.7", date: "current", connection: "request",
-      head_mode: "reject",
+      server: "nginx/1.29.7", date: .current, connection: .request,
+      head_mode: .reject,
       body: b"<html>\r\n<head><title>504 Gateway Time-out</title></head>\r\n<body>\r\n<center><h1>504 Gateway Time-out</h1></center>\r\n<hr><center>nginx/1.29.7</center>\r\n</body>\r\n</html>\r\n" },
     response_read_timeout: 60s,
-    response_buffering: "complete_content_length")
+    response_buffering: .completeContentLength)
 }
 
 route exact GET "/static" { return local_response({
-  version: "HTTP/1.1", status: 200, reason: "OK", server: "nginx/1.29.7",
-  date: "current", content_type: "text/plain", connection: "request",
-  head_mode: "suppress_body", body: b"successor-static"
+  version: .http11, status: 200, reason: "OK", server: "nginx/1.29.7",
+  date: .current, content_type: "text/plain", connection: .request,
+  head_mode: .suppressBody, body: b"successor-static"
 }) }
 )rut";
 
@@ -20381,20 +20381,20 @@ struct PublicPostCompleteContentLengthBufferingFixedRequestPolicySourceResources
         source += R"rut(
 route POST "/buffered" {
   return forward(backend,
-    request_policy: { version: "HTTP/1.1", host: "upstream", connection: "omit",
-      strip_headers: ["Connection", "Keep-Alive", "TE", "Expect", "Upgrade"] },
-    response_policy: { version: "HTTP/1.1", framing: "content_length",
-      connection: "request", head_mode: "reject", server: "buffered-test",
-      date: "current", hide_headers: ["Date", "Server"] },
-    failure_policy: { version: "HTTP/1.1", status: 502, reason: "Origin Failed",
-      content_type: "text/plain", server: "buffered-test", date: "current",
-      connection: "request", head_mode: "reject", body: b"default failure\n" },
-    timeout_failure_policy: { version: "HTTP/1.1", status: 504,
+    request_policy: { version: .http11, host: .upstream, connection: .omit,
+      strip_headers: [.connection, .keepAlive, .te, .expect, .upgrade] },
+    response_policy: { version: .http11, framing: .contentLength,
+      connection: .request, head_mode: .reject, server: "buffered-test",
+      date: .current, hide_headers: ["Date", "Server"] },
+    failure_policy: { version: .http11, status: 502, reason: "Origin Failed",
+      content_type: "text/plain", server: "buffered-test", date: .current,
+      connection: .request, head_mode: .reject, body: b"default failure\n" },
+    timeout_failure_policy: { version: .http11, status: 504,
       reason: "Response Read Deadline", content_type: "text/plain",
-      server: "buffered-test", date: "current", connection: "request",
-      head_mode: "reject", body: b"configured deadline\n" },
+      server: "buffered-test", date: .current, connection: .request,
+      head_mode: .reject, body: b"configured deadline\n" },
     response_read_timeout: 1s,
-    response_buffering: "complete_content_length")
+    response_buffering: .completeContentLength)
 }
 )rut";
 
@@ -20436,20 +20436,20 @@ struct PublicAnyCompleteContentLengthBufferingFixedRequestPolicySourceResources
         source += R"rut(
 route "/buffered" {
   return forward(backend,
-    request_policy: { version: "HTTP/1.1", host: "upstream", connection: "omit",
-      strip_headers: ["Connection", "Keep-Alive", "TE", "Expect", "Upgrade"] },
-    response_policy: { version: "HTTP/1.1", framing: "content_length",
-      connection: "request", head_mode: "reject", server: "buffered-test",
-      date: "current", hide_headers: ["Date", "Server"] },
-    failure_policy: { version: "HTTP/1.1", status: 502, reason: "Origin Failed",
-      content_type: "text/plain", server: "buffered-test", date: "current",
-      connection: "request", head_mode: "reject", body: b"default failure\n" },
-    timeout_failure_policy: { version: "HTTP/1.1", status: 504,
+    request_policy: { version: .http11, host: .upstream, connection: .omit,
+      strip_headers: [.connection, .keepAlive, .te, .expect, .upgrade] },
+    response_policy: { version: .http11, framing: .contentLength,
+      connection: .request, head_mode: .reject, server: "buffered-test",
+      date: .current, hide_headers: ["Date", "Server"] },
+    failure_policy: { version: .http11, status: 502, reason: "Origin Failed",
+      content_type: "text/plain", server: "buffered-test", date: .current,
+      connection: .request, head_mode: .reject, body: b"default failure\n" },
+    timeout_failure_policy: { version: .http11, status: 504,
       reason: "Response Read Deadline", content_type: "text/plain",
-      server: "buffered-test", date: "current", connection: "request",
-      head_mode: "reject", body: b"configured deadline\n" },
+      server: "buffered-test", date: .current, connection: .request,
+      head_mode: .reject, body: b"configured deadline\n" },
     response_read_timeout: 1s,
-    response_buffering: "complete_content_length")
+    response_buffering: .completeContentLength)
 }
 )rut";
 
@@ -20485,18 +20485,18 @@ struct PublicPostCl0ResponseReadDeadlineSourceResources
         source += R"rut(
 route POST "/deadline" {
   return forward(backend,
-    request_policy: { version: "HTTP/1.1", host: "upstream", connection: "omit",
-      strip_headers: ["Connection", "Keep-Alive", "TE", "Expect", "Upgrade"] },
-    response_policy: { version: "HTTP/1.1", framing: "content_length",
-      connection: "request", head_mode: "reject", server: "deadline-test",
-      date: "current", hide_headers: ["Date", "Server"] },
-    failure_policy: { version: "HTTP/1.1", status: 502, reason: "Origin Failed",
-      content_type: "text/plain", server: "deadline-test", date: "current",
-      connection: "request", head_mode: "reject", body: b"default failure\n" },
-    timeout_failure_policy: { version: "HTTP/1.1", status: 504,
+    request_policy: { version: .http11, host: .upstream, connection: .omit,
+      strip_headers: [.connection, .keepAlive, .te, .expect, .upgrade] },
+    response_policy: { version: .http11, framing: .contentLength,
+      connection: .request, head_mode: .reject, server: "deadline-test",
+      date: .current, hide_headers: ["Date", "Server"] },
+    failure_policy: { version: .http11, status: 502, reason: "Origin Failed",
+      content_type: "text/plain", server: "deadline-test", date: .current,
+      connection: .request, head_mode: .reject, body: b"default failure\n" },
+    timeout_failure_policy: { version: .http11, status: 504,
       reason: "First Response Deadline", content_type: "text/plain",
-      server: "deadline-test", date: "current", connection: "request",
-      head_mode: "reject", body: b"configured deadline\n" },
+      server: "deadline-test", date: .current, connection: .request,
+      head_mode: .reject, body: b"configured deadline\n" },
     response_read_timeout: 1s)
 }
 )rut";
@@ -20532,18 +20532,18 @@ struct PublicAnyCl0ResponseReadDeadlineSourceResources : PublicResponseReadDeadl
         source += R"rut(
 route "/deadline" {
   return forward(backend,
-    request_policy: { version: "HTTP/1.1", host: "upstream", connection: "omit",
-      strip_headers: ["Connection", "Keep-Alive", "TE", "Expect", "Upgrade"] },
-    response_policy: { version: "HTTP/1.1", framing: "content_length",
-      connection: "request", head_mode: "reject", server: "deadline-test",
-      date: "current", hide_headers: ["Date", "Server"] },
-    failure_policy: { version: "HTTP/1.1", status: 502, reason: "Origin Failed",
-      content_type: "text/plain", server: "deadline-test", date: "current",
-      connection: "request", head_mode: "reject", body: b"default failure\n" },
-    timeout_failure_policy: { version: "HTTP/1.1", status: 504,
+    request_policy: { version: .http11, host: .upstream, connection: .omit,
+      strip_headers: [.connection, .keepAlive, .te, .expect, .upgrade] },
+    response_policy: { version: .http11, framing: .contentLength,
+      connection: .request, head_mode: .reject, server: "deadline-test",
+      date: .current, hide_headers: ["Date", "Server"] },
+    failure_policy: { version: .http11, status: 502, reason: "Origin Failed",
+      content_type: "text/plain", server: "deadline-test", date: .current,
+      connection: .request, head_mode: .reject, body: b"default failure\n" },
+    timeout_failure_policy: { version: .http11, status: 504,
       reason: "First Response Deadline", content_type: "text/plain",
-      server: "deadline-test", date: "current", connection: "request",
-      head_mode: "reject", body: b"configured deadline\n" },
+      server: "deadline-test", date: .current, connection: .request,
+      head_mode: .reject, body: b"configured deadline\n" },
     response_read_timeout: 1s)
 }
 )rut";
@@ -20751,9 +20751,9 @@ TEST(route, public_ordinary_source_unmatched_options_star_nginx_400_zero_upstrea
         "listen :0\nupstream backend at \"127.0.0.1:" + std::to_string(backend.port) + "\"\n";
     source += R"rut(
 unmatched OPTIONS { return local_response({
-  version: "HTTP/1.1", status: 400, reason: "Bad Request", server: "nginx/1.29.7",
-  date: "current", content_type: "text/html", connection: "request",
-  head_mode: "reject", body: b"<html>\r\n<head><title>400 Bad Request</title></head>\r\n<body>\r\n<center><h1>400 Bad Request</h1></center>\r\n<hr><center>nginx/1.29.7</center>\r\n</body>\r\n</html>\r\n"
+  version: .http11, status: 400, reason: "Bad Request", server: "nginx/1.29.7",
+  date: .current, content_type: "text/html", connection: .request,
+  head_mode: .reject, body: b"<html>\r\n<head><title>400 Bad Request</title></head>\r\n<body>\r\n<center><h1>400 Bad Request</h1></center>\r\n<hr><center>nginx/1.29.7</center>\r\n</body>\r\n</html>\r\n"
 }) }
 route "/" { return forward(backend) }
 )rut";
@@ -20953,9 +20953,9 @@ TEST(route, public_ordinary_source_unmatched_connect_authority_nginx_405_zero_up
         "listen :0\nupstream backend at \"127.0.0.1:" + std::to_string(backend.port) + "\"\n";
     source += R"rut(
 unmatched CONNECT { return local_response({
-  version: "HTTP/1.1", status: 405, reason: "Not Allowed", server: "nginx/1.29.7",
-  date: "current", content_type: "text/html", connection: "request",
-  head_mode: "reject", body: b"<html>\r\n<head><title>405 Not Allowed</title></head>\r\n<body>\r\n<center><h1>405 Not Allowed</h1></center>\r\n<hr><center>nginx/1.29.7</center>\r\n</body>\r\n</html>\r\n"
+  version: .http11, status: 405, reason: "Not Allowed", server: "nginx/1.29.7",
+  date: .current, content_type: "text/html", connection: .request,
+  head_mode: .reject, body: b"<html>\r\n<head><title>405 Not Allowed</title></head>\r\n<body>\r\n<center><h1>405 Not Allowed</h1></center>\r\n<hr><center>nginx/1.29.7</center>\r\n</body>\r\n</html>\r\n"
 }) }
 route "/" { return forward(backend) }
 )rut";
@@ -21139,9 +21139,9 @@ TEST(route, public_ordinary_source_unmatched_representation200_wire_iouring) {
 
     static constexpr char kSource[] = R"rut(
 unmatched { return local_response({
-  version: "HTTP/1.1", status: 200, reason: "OK", server: "nginx/1.29.7",
-  date: "current", content_type: "text/plain", connection: "request",
-  head_mode: "suppress_body", body: b"successor-static"
+  version: .http11, status: 200, reason: "OK", server: "nginx/1.29.7",
+  date: .current, content_type: "text/plain", connection: .request,
+  head_mode: .suppressBody, body: b"successor-static"
 }) }
 listen :0
 route GET "/compiled-sentinel" { return 204 }
@@ -21544,21 +21544,21 @@ TEST(route, public_ordinary_source_exact_strict_local_response_and_prefix_fallba
     source_text += R"rut(
 route "/" {
   return forward(backend,
-    request_policy: { version: "HTTP/1.1", host: "upstream", connection: "omit",
-      strip_headers: ["Connection", "Keep-Alive", "TE", "Expect", "Upgrade"] },
-    response_policy: { version: "HTTP/1.1", framing: "content_length",
-      connection: "request", server: "rut-fallback", date: "current",
+    request_policy: { version: .http11, host: .upstream, connection: .omit,
+      strip_headers: [.connection, .keepAlive, .te, .expect, .upgrade] },
+    response_policy: { version: .http11, framing: .contentLength,
+      connection: .request, server: "rut-fallback", date: .current,
       hide_headers: ["Date", "Server"] })
 }
 route exact "/static" { return local_response({
-  version: "HTTP/1.1", status: 200, reason: "OK", server: "rut-any",
-  date: "current", content_type: "text/plain", connection: "request",
-  head_mode: "suppress_body", body: b"any-static"
+  version: .http11, status: 200, reason: "OK", server: "rut-any",
+  date: .current, content_type: "text/plain", connection: .request,
+  head_mode: .suppressBody, body: b"any-static"
 }) }
 route exact GET "/static" { return local_response({
-  version: "HTTP/1.1", status: 200, reason: "OK", server: "rut-get",
-  date: "current", content_type: "text/plain", connection: "request",
-  head_mode: "suppress_body", body: b"get-specific"
+  version: .http11, status: 200, reason: "OK", server: "rut-get",
+  date: .current, content_type: "text/plain", connection: .request,
+  head_mode: .suppressBody, body: b"get-specific"
 }) }
 )rut";
 
@@ -21841,16 +21841,16 @@ TEST(route, public_ordinary_source_exact_strict_local_response_single_cl0_post_i
     source_text += R"rut(
 route "/" {
   return forward(backend,
-    request_policy: { version: "HTTP/1.1", host: "upstream", connection: "omit",
-      strip_headers: ["Connection", "Keep-Alive", "TE", "Expect", "Upgrade"] },
-    response_policy: { version: "HTTP/1.1", framing: "content_length",
-      connection: "request", server: "rut-fallback", date: "current",
+    request_policy: { version: .http11, host: .upstream, connection: .omit,
+      strip_headers: [.connection, .keepAlive, .te, .expect, .upgrade] },
+    response_policy: { version: .http11, framing: .contentLength,
+      connection: .request, server: "rut-fallback", date: .current,
       hide_headers: ["Date", "Server"] })
 }
 route exact "/static" { return local_response({
-  version: "HTTP/1.1", status: 200, reason: "OK", server: "nginx/1.29.7",
-  date: "current", content_type: "text/plain", connection: "request",
-  head_mode: "suppress_body", body: b"successor-static"
+  version: .http11, status: 200, reason: "OK", server: "nginx/1.29.7",
+  date: .current, content_type: "text/plain", connection: .request,
+  head_mode: .suppressBody, body: b"successor-static"
 }) }
 )rut";
 
@@ -22165,16 +22165,16 @@ TEST(route, public_ordinary_source_exact_strict_local_response_fresh_delete_iour
     source_text += R"rut(
 route "/" {
   return forward(backend,
-    request_policy: { version: "HTTP/1.1", host: "upstream", connection: "omit",
-      strip_headers: ["Connection", "Keep-Alive", "TE", "Expect", "Upgrade"] },
-    response_policy: { version: "HTTP/1.1", framing: "content_length",
-      connection: "request", server: "rut-fallback", date: "current",
+    request_policy: { version: .http11, host: .upstream, connection: .omit,
+      strip_headers: [.connection, .keepAlive, .te, .expect, .upgrade] },
+    response_policy: { version: .http11, framing: .contentLength,
+      connection: .request, server: "rut-fallback", date: .current,
       hide_headers: ["Date", "Server"] })
 }
 route exact "/static" { return local_response({
-  version: "HTTP/1.1", status: 200, reason: "OK", server: "nginx/1.29.7",
-  date: "current", content_type: "text/plain", connection: "request",
-  head_mode: "suppress_body", body: b"successor-static"
+  version: .http11, status: 200, reason: "OK", server: "nginx/1.29.7",
+  date: .current, content_type: "text/plain", connection: .request,
+  head_mode: .suppressBody, body: b"successor-static"
 }) }
 )rut";
 
@@ -22491,16 +22491,16 @@ TEST(route, public_ordinary_source_exact_strict_local_response_fresh_put_iouring
     source_text += R"rut(
 route "/" {
   return forward(backend,
-    request_policy: { version: "HTTP/1.1", host: "upstream", connection: "omit",
-      strip_headers: ["Connection", "Keep-Alive", "TE", "Expect", "Upgrade"] },
-    response_policy: { version: "HTTP/1.1", framing: "content_length",
-      connection: "request", server: "rut-fallback", date: "current",
+    request_policy: { version: .http11, host: .upstream, connection: .omit,
+      strip_headers: [.connection, .keepAlive, .te, .expect, .upgrade] },
+    response_policy: { version: .http11, framing: .contentLength,
+      connection: .request, server: "rut-fallback", date: .current,
       hide_headers: ["Date", "Server"] })
 }
 route exact "/static" { return local_response({
-  version: "HTTP/1.1", status: 200, reason: "OK", server: "nginx/1.29.7",
-  date: "current", content_type: "text/plain", connection: "request",
-  head_mode: "suppress_body", body: b"successor-static"
+  version: .http11, status: 200, reason: "OK", server: "nginx/1.29.7",
+  date: .current, content_type: "text/plain", connection: .request,
+  head_mode: .suppressBody, body: b"successor-static"
 }) }
 )rut";
 
@@ -22815,16 +22815,16 @@ TEST(route, public_ordinary_source_exact_strict_local_response_fresh_patch_iouri
     source_text += R"rut(
 route "/" {
   return forward(backend,
-    request_policy: { version: "HTTP/1.1", host: "upstream", connection: "omit",
-      strip_headers: ["Connection", "Keep-Alive", "TE", "Expect", "Upgrade"] },
-    response_policy: { version: "HTTP/1.1", framing: "content_length",
-      connection: "request", server: "rut-fallback", date: "current",
+    request_policy: { version: .http11, host: .upstream, connection: .omit,
+      strip_headers: [.connection, .keepAlive, .te, .expect, .upgrade] },
+    response_policy: { version: .http11, framing: .contentLength,
+      connection: .request, server: "rut-fallback", date: .current,
       hide_headers: ["Date", "Server"] })
 }
 route exact "/static" { return local_response({
-  version: "HTTP/1.1", status: 200, reason: "OK", server: "nginx/1.29.7",
-  date: "current", content_type: "text/plain", connection: "request",
-  head_mode: "suppress_body", body: b"successor-static"
+  version: .http11, status: 200, reason: "OK", server: "nginx/1.29.7",
+  date: .current, content_type: "text/plain", connection: .request,
+  head_mode: .suppressBody, body: b"successor-static"
 }) }
 )rut";
 
@@ -23194,21 +23194,21 @@ TEST(route, public_ordinary_source_pre_route_trace_strict_local_response_iouring
         "listen :0\nupstream backend at \"127.0.0.1:" + std::to_string(backend.port) + "\"\n";
     source_text += R"rut(
 pre_route TRACE { return local_response({
-  version: "HTTP/1.1", status: 405, reason: "Not Allowed", server: "nginx/1.29.7",
-  date: "current", content_type: "text/html", connection: "request",
-  head_mode: "reject", body: b"<html>\r\n<head><title>405 Not Allowed</title></head>\r\n<body>\r\n<center><h1>405 Not Allowed</h1></center>\r\n<hr><center>nginx/1.29.7</center>\r\n</body>\r\n</html>\r\n"
+  version: .http11, status: 405, reason: "Not Allowed", server: "nginx/1.29.7",
+  date: .current, content_type: "text/html", connection: .request,
+  head_mode: .reject, body: b"<html>\r\n<head><title>405 Not Allowed</title></head>\r\n<body>\r\n<center><h1>405 Not Allowed</h1></center>\r\n<hr><center>nginx/1.29.7</center>\r\n</body>\r\n</html>\r\n"
 }) }
 route exact "/static" { return local_response({
-  version: "HTTP/1.1", status: 200, reason: "OK", server: "nginx/1.29.7",
-  date: "current", content_type: "text/plain", connection: "request",
-  head_mode: "suppress_body", body: b"successor-static"
+  version: .http11, status: 200, reason: "OK", server: "nginx/1.29.7",
+  date: .current, content_type: "text/plain", connection: .request,
+  head_mode: .suppressBody, body: b"successor-static"
 }) }
 route "/" {
   return forward(backend,
-    request_policy: { version: "HTTP/1.1", host: "upstream", connection: "omit",
-      strip_headers: ["Connection", "Keep-Alive", "TE", "Expect", "Upgrade"] },
-    response_policy: { version: "HTTP/1.1", framing: "content_length",
-      connection: "request", server: "rut-fallback", date: "current",
+    request_policy: { version: .http11, host: .upstream, connection: .omit,
+      strip_headers: [.connection, .keepAlive, .te, .expect, .upgrade] },
+    response_policy: { version: .http11, framing: .contentLength,
+      connection: .request, server: "rut-fallback", date: .current,
       hide_headers: ["Date", "Server"] })
 }
 )rut";
@@ -23753,9 +23753,9 @@ TEST(route, target_transform_public_source_reaches_h1_backend_wire) {
                  "upstream backend at \"127.0.0.1:%u\"\n"
                  "route GET \"/api\" { return forward(backend, "
                  "target_transform: { strip_prefix: \"/api/\", replace_prefix: \"/\" }, "
-                 "request_policy: { version: \"HTTP/1.1\", host: \"upstream\", "
-                 "connection: \"omit\", strip_headers: [\"Connection\", \"Keep-Alive\", "
-                 "\"TE\", \"Expect\", \"Upgrade\"] }) }\n",
+                 "request_policy: { version: .http11, host: .upstream, "
+                 "connection: .omit, strip_headers: [.connection, .keepAlive, "
+                 ".te, .expect, .upgrade] }) }\n",
                  backend.port);
     REQUIRE_GT(source_len, 0);
     REQUIRE_LT(source_len, static_cast<int>(sizeof(source)));
@@ -24166,19 +24166,19 @@ TEST(route, empty_query_target_transform_public_source_reaches_iouring_backend_a
 route GET "/api" {
   return forward(backend,
     target_transform: { strip_prefix: "/api/", replace_prefix: "/v1/?" },
-    request_policy: { version: "HTTP/1.1", host: "upstream", connection: "omit",
-      strip_headers: ["Connection", "Keep-Alive", "TE", "Expect", "Upgrade"] },
-    response_policy: { version: "HTTP/1.1", framing: "content_length",
-      connection: "request", server: "rut-static-query", date: "current",
+    request_policy: { version: .http11, host: .upstream, connection: .omit,
+      strip_headers: [.connection, .keepAlive, .te, .expect, .upgrade] },
+    response_policy: { version: .http11, framing: .contentLength,
+      connection: .request, server: "rut-static-query", date: .current,
       hide_headers: ["Date", "Server"] })
 }
 route GET "/fixed" {
   return forward(backend,
     target_transform: { strip_prefix: "/fixed/", replace_prefix: "/v1/?fixed=1" },
-    request_policy: { version: "HTTP/1.1", host: "upstream", connection: "omit",
-      strip_headers: ["Connection", "Keep-Alive", "TE", "Expect", "Upgrade"] },
-    response_policy: { version: "HTTP/1.1", framing: "content_length",
-      connection: "request", server: "rut-static-query", date: "current",
+    request_policy: { version: .http11, host: .upstream, connection: .omit,
+      strip_headers: [.connection, .keepAlive, .te, .expect, .upgrade] },
+    response_policy: { version: .http11, framing: .contentLength,
+      connection: .request, server: "rut-static-query", date: .current,
       hide_headers: ["Date", "Server"] })
 }
 )rut";
@@ -24592,10 +24592,10 @@ static void run_public_complete_access_target_66(rut::test::TestCase* _tc) {
         "route exact slash_normalized GET \"" +
         std::string(kPublicAccessTargetKey62) +
         "\" { return local_response({\n"
-        "  version: \"HTTP/1.1\", status: 204, reason: \"No Content\", server: "
+        "  version: .http11, status: 204, reason: \"No Content\", server: "
         "\"nginx/1.29.7\",\n"
-        "  date: \"current\", content_type: \"\", connection: \"request\",\n"
-        "  head_mode: \"suppress_body\", body: b\"\"\n"
+        "  date: .current, content_type: \"\", connection: .request,\n"
+        "  head_mode: .suppressBody, body: b\"\"\n"
         "}) }\n";
     REQUIRE_EQ(source_text.find("?x=1"), std::string::npos);
 
@@ -24868,14 +24868,14 @@ TEST(route, forward_request_policy_rebuilds_nginx_h11_headers) {
     RecordingUpstream upstream;
     REQUIRE(upstream.setup());
     char source[1024];
-    const int source_len = snprintf(
-        source,
-        sizeof(source),
-        "upstream backend at \"127.0.0.1:%u\"\n"
-        "route GET \"/api\" { return forward(backend, request_policy: { "
-        "version: \"HTTP/1.1\", host: \"upstream\", connection: \"omit\", "
-        "strip_headers: [\"Connection\", \"Keep-Alive\", \"TE\", \"Expect\", \"Upgrade\"] }) }\n",
-        upstream.port);
+    const int source_len =
+        snprintf(source,
+                 sizeof(source),
+                 "upstream backend at \"127.0.0.1:%u\"\n"
+                 "route GET \"/api\" { return forward(backend, request_policy: { "
+                 "version: .http11, host: .upstream, connection: .omit, "
+                 "strip_headers: [.connection, .keepAlive, .te, .expect, .upgrade] }) }\n",
+                 upstream.port);
     REQUIRE_GT(source_len, 0);
     REQUIRE_LT(source_len, static_cast<int>(sizeof(source)));
     auto lexed = lex(Str{source, static_cast<u32>(source_len)});
@@ -24985,7 +24985,7 @@ TEST(route, forward_request_policy_rebuilds_nginx_h11_headers) {
     }
 }
 
-// PR3: the Envoy-compatible `host: "preserve"` request policy
+// PR3: the Envoy-compatible `host: .preserve` request policy
 // (RequestPolicyId::Http11PreserveHostLowercase). Byte-for-byte against the
 // CI-recorded Envoy v1.39.1 oracle transcript (tests/fixtures/
 // envoy_oracle_milestone_s.inc, envoy-pr-plan.md PR2/PR3): preserved Host
@@ -25009,10 +25009,10 @@ TEST(route, forward_request_policy_preserve_host_lowercase_h11_wire) {
         return std::string("route \"") + path +
                "\" {\n"
                "    return forward(backend, request_policy: {\n"
-               "        version: \"HTTP/1.1\", host: \"preserve\", connection: \"omit\",\n"
-               "        header_names: \"lowercase\", forwarded_proto: \"http\",\n"
-               "        strip_headers: [\"Connection\", \"Keep-Alive\", \"TE\", \"Expect\", "
-               "\"Upgrade\", \"Proxy-Connection\"]\n"
+               "        version: .http11, host: .preserve, connection: .omit,\n"
+               "        header_names: .lowercase, forwarded_proto: .http,\n"
+               "        strip_headers: [.connection, .keepAlive, .te, .expect, "
+               ".upgrade, .proxyConnection]\n"
                "    })\n"
                "}\n";
     };
@@ -25164,10 +25164,10 @@ TEST(route, forward_request_policy_preserve_host_lowercase_strips_client_envoy_i
     source +=
         "route \"/smoke\" {\n"
         "    return forward(backend, request_policy: {\n"
-        "        version: \"HTTP/1.1\", host: \"preserve\", connection: \"omit\",\n"
-        "        header_names: \"lowercase\", forwarded_proto: \"http\",\n"
-        "        strip_headers: [\"Connection\", \"Keep-Alive\", \"TE\", \"Expect\", "
-        "\"Upgrade\", \"Proxy-Connection\"]\n"
+        "        version: .http11, host: .preserve, connection: .omit,\n"
+        "        header_names: .lowercase, forwarded_proto: .http,\n"
+        "        strip_headers: [.connection, .keepAlive, .te, .expect, "
+        ".upgrade, .proxyConnection]\n"
         "    })\n"
         "}\n";
 
@@ -25266,14 +25266,14 @@ TEST(route, forward_request_policy_preserve_host_lowercase_post_fixed_with_respo
                  "upstream backend at \"127.0.0.1:%u\"\n"
                  "route POST \"/upload\" {\n"
                  "    return forward(backend, request_policy: {\n"
-                 "        version: \"HTTP/1.1\", host: \"preserve\", connection: \"omit\",\n"
-                 "        header_names: \"lowercase\", forwarded_proto: \"http\",\n"
-                 "        strip_headers: [\"Connection\", \"Keep-Alive\", \"TE\", \"Expect\", "
-                 "\"Upgrade\", \"Proxy-Connection\"]\n"
+                 "        version: .http11, host: .preserve, connection: .omit,\n"
+                 "        header_names: .lowercase, forwarded_proto: .http,\n"
+                 "        strip_headers: [.connection, .keepAlive, .te, .expect, "
+                 ".upgrade, .proxyConnection]\n"
                  "    }, response_policy: {\n"
-                 "        version: \"HTTP/1.1\", framing: \"content_length\", connection: "
-                 "\"request\",\n"
-                 "        server: \"nginx/1.29.7\", date: \"current\", hide_headers: []\n"
+                 "        version: .http11, framing: .contentLength, connection: "
+                 ".request,\n"
+                 "        server: \"nginx/1.29.7\", date: .current, hide_headers: []\n"
                  "    })\n"
                  "}\n",
                  upstream.port);
@@ -25331,7 +25331,7 @@ TEST(route, forward_request_policy_preserve_host_lowercase_post_fixed_with_respo
              0);
 }
 
-// A fixed-length ID4 (host: "preserve") upload paired with a response_policy
+// A fixed-length ID4 (host: .preserve) upload paired with a response_policy
 // must never borrow an idle pooled upstream socket: strict_response_upload_ready
 // requires !upstream_reused before it will publish the strict response, so a
 // reused socket can never produce one (see the idle-reuse guard next to
@@ -25373,14 +25373,14 @@ TEST(route, forward_request_policy_preserve_host_lowercase_post_fixed_never_reus
                  "route GET \"/warm\" { return forward(backend) }\n"
                  "route POST \"/upload\" {\n"
                  "    return forward(backend, request_policy: {\n"
-                 "        version: \"HTTP/1.1\", host: \"preserve\", connection: \"omit\",\n"
-                 "        header_names: \"lowercase\", forwarded_proto: \"http\",\n"
-                 "        strip_headers: [\"Connection\", \"Keep-Alive\", \"TE\", \"Expect\", "
-                 "\"Upgrade\", \"Proxy-Connection\"]\n"
+                 "        version: .http11, host: .preserve, connection: .omit,\n"
+                 "        header_names: .lowercase, forwarded_proto: .http,\n"
+                 "        strip_headers: [.connection, .keepAlive, .te, .expect, "
+                 ".upgrade, .proxyConnection]\n"
                  "    }, response_policy: {\n"
-                 "        version: \"HTTP/1.1\", framing: \"content_length\", connection: "
-                 "\"request\",\n"
-                 "        server: \"nginx/1.29.7\", date: \"current\", hide_headers: []\n"
+                 "        version: .http11, framing: .contentLength, connection: "
+                 ".request,\n"
+                 "        server: \"nginx/1.29.7\", date: .current, hide_headers: []\n"
                  "    })\n"
                  "}\n",
                  upstream.port);
@@ -28092,20 +28092,20 @@ TEST(route, inline_redirect_source_reaches_production_h1_and_forward_sibling) {
     source += R"rut(
 route "/api" {
   if req.method == GET && req.pathOnly == "/api" {
-    return redirect({scheme: "http", authority: "request_host", port: "actual_listener",
-      path: "static", query: "preserve_raw", date: "current", connection: "close",
+    return redirect({scheme: .http, authority: .requestHost, port: .actualListener,
+      path: .static, query: .preserveRaw, date: .current, connection: .close,
       status: 301, reason: "Moved Permanently", server: "nginx/1.29.7",
       content_type: "text/html", target_path: "/api/", body: b"<html>\r\n<head><title>301 Moved Permanently</title></head>\r\n<body>\r\n<center><h1>301 Moved Permanently</h1></center>\r\n<hr><center>nginx/1.29.7</center>\r\n</body>\r\n</html>\r\n"})
   } else {
     return forward(backend,
       target_transform: { strip_prefix: "/api/", replace_prefix: "/" },
-      request_policy: { version: "HTTP/1.1", host: "upstream", connection: "omit",
-        strip_headers: ["Connection", "Keep-Alive", "TE", "Expect", "Upgrade"] },
-      response_policy: { version: "HTTP/1.1", framing: "content_length", connection: "request",
-        server: "nginx/1.29.7", date: "current", hide_headers: [] },
-      failure_policy: { version: "HTTP/1.1", status: 502, reason: "Bad Gateway",
-        content_type: "text/html", server: "nginx/1.29.7", date: "current",
-        connection: "request", body: b"unavailable" })
+      request_policy: { version: .http11, host: .upstream, connection: .omit,
+        strip_headers: [.connection, .keepAlive, .te, .expect, .upgrade] },
+      response_policy: { version: .http11, framing: .contentLength, connection: .request,
+        server: "nginx/1.29.7", date: .current, hide_headers: [] },
+      failure_policy: { version: .http11, status: 502, reason: "Bad Gateway",
+        content_type: "text/html", server: "nginx/1.29.7", date: .current,
+        connection: .request, body: b"unavailable" })
   }
 }
 )rut";
@@ -28396,23 +28396,23 @@ TEST(route, fixed_redirect_ordinary_source_reaches_production_h1_and_root_neighb
     source_text += R"rut(
 route GET "/" {
   if req.pathOnly == "/old" {
-    return redirect({scheme: "http", authority: "static",
-      static_authority: "redirect.example", port: "omit", path: "static",
-      query: "discard", date: "current", connection: "close",
-      header_order: "connection_then_location", status: 301,
+    return redirect({scheme: .http, authority: .static,
+      static_authority: "redirect.example", port: .omit, path: .static,
+      query: .discard, date: .current, connection: .close,
+      header_order: .connectionThenLocation, status: 301,
       reason: "Moved Permanently", server: "nginx/1.29.7",
       content_type: "text/html", target_path: "/new",
       body: b"<html>\r\n<head><title>301 Moved Permanently</title></head>\r\n<body>\r\n<center><h1>301 Moved Permanently</h1></center>\r\n<hr><center>nginx/1.29.7</center>\r\n</body>\r\n</html>\r\n"})
   } else {
     return forward(backend,
-      request_policy: { version: "HTTP/1.1", host: "upstream", connection: "omit",
-        strip_headers: ["Connection", "Keep-Alive", "TE", "Expect", "Upgrade"] },
-      response_policy: { version: "HTTP/1.1", framing: "content_length",
-        connection: "request", server: "nginx/1.29.7", date: "current",
+      request_policy: { version: .http11, host: .upstream, connection: .omit,
+        strip_headers: [.connection, .keepAlive, .te, .expect, .upgrade] },
+      response_policy: { version: .http11, framing: .contentLength,
+        connection: .request, server: "nginx/1.29.7", date: .current,
         hide_headers: ["Date", "Server", "Connection"] },
-      failure_policy: { version: "HTTP/1.1", status: 502, reason: "Bad Gateway",
-        content_type: "text/html", server: "nginx/1.29.7", date: "current",
-        connection: "request", body: b"unavailable" })
+      failure_policy: { version: .http11, status: 502, reason: "Bad Gateway",
+        content_type: "text/html", server: "nginx/1.29.7", date: .current,
+        connection: .request, body: b"unavailable" })
   }
 }
 )rut";
@@ -28868,23 +28868,23 @@ TEST(route, fixed_302_ordinary_source_reaches_exact_h1_and_zero_upstream_iouring
     source_text += R"rut(
 route GET "/" {
   if req.pathOnly == "/old" {
-    return redirect({scheme: "http", authority: "static",
-      static_authority: "redirect.example", port: "omit", path: "static",
-      query: "discard", date: "current", connection: "close",
-      header_order: "connection_then_location", status: 302,
+    return redirect({scheme: .http, authority: .static,
+      static_authority: "redirect.example", port: .omit, path: .static,
+      query: .discard, date: .current, connection: .close,
+      header_order: .connectionThenLocation, status: 302,
       reason: "Moved Temporarily", server: "nginx/1.29.7",
       content_type: "text/html", target_path: "/new",
       body: b"<html>\r\n<head><title>302 Found</title></head>\r\n<body>\r\n<center><h1>302 Found</h1></center>\r\n<hr><center>nginx/1.29.7</center>\r\n</body>\r\n</html>\r\n"})
   } else {
     return forward(backend,
-      request_policy: {version: "HTTP/1.1", host: "upstream", connection: "omit",
-        strip_headers: ["Connection", "Keep-Alive", "TE", "Expect", "Upgrade"]},
-      response_policy: {version: "HTTP/1.1", framing: "content_length",
-        connection: "request", server: "nginx/1.29.7", date: "current",
+      request_policy: {version: .http11, host: .upstream, connection: .omit,
+        strip_headers: [.connection, .keepAlive, .te, .expect, .upgrade]},
+      response_policy: {version: .http11, framing: .contentLength,
+        connection: .request, server: "nginx/1.29.7", date: .current,
         hide_headers: ["Date", "Server", "Connection"]},
-      failure_policy: {version: "HTTP/1.1", status: 502, reason: "Bad Gateway",
-        content_type: "text/plain", server: "nginx/1.29.7", date: "current",
-        connection: "request", body: b"unavailable"})
+      failure_policy: {version: .http11, status: 502, reason: "Bad Gateway",
+        content_type: "text/plain", server: "nginx/1.29.7", date: .current,
+        connection: .request, body: b"unavailable"})
   }
 }
 )rut";
@@ -29196,28 +29196,28 @@ TEST(route, canonical_conditional_complete_content_length_reaches_production_h1_
     source_text += R"rut(
 route GET "/" {
   if req.pathOnly == "/old" {
-    return redirect({scheme: "http", authority: "static",
-      static_authority: "redirect.example", port: "omit", path: "static",
-      query: "discard", date: "current", connection: "close",
-      header_order: "connection_then_location", status: 301,
+    return redirect({scheme: .http, authority: .static,
+      static_authority: "redirect.example", port: .omit, path: .static,
+      query: .discard, date: .current, connection: .close,
+      header_order: .connectionThenLocation, status: 301,
       reason: "Moved Permanently", server: "conditional-test",
       content_type: "text/plain", target_path: "/new", body: b"moved\n"})
   } else {
     return forward(backend,
-      request_policy: { version: "HTTP/1.1", host: "upstream", connection: "omit",
-        strip_headers: ["Connection", "Keep-Alive", "TE", "Expect", "Upgrade"] },
-      response_policy: { version: "HTTP/1.1", framing: "content_length",
-        connection: "request", head_mode: "reject", server: "conditional-test",
-        date: "current", hide_headers: ["Date", "Server", "Connection"] },
-      failure_policy: { version: "HTTP/1.1", status: 502, reason: "Origin Failed",
-        content_type: "text/plain", server: "conditional-test", date: "current",
-        connection: "request", head_mode: "reject", body: b"default failure\n" },
-      timeout_failure_policy: { version: "HTTP/1.1", status: 504,
+      request_policy: { version: .http11, host: .upstream, connection: .omit,
+        strip_headers: [.connection, .keepAlive, .te, .expect, .upgrade] },
+      response_policy: { version: .http11, framing: .contentLength,
+        connection: .request, head_mode: .reject, server: "conditional-test",
+        date: .current, hide_headers: ["Date", "Server", "Connection"] },
+      failure_policy: { version: .http11, status: 502, reason: "Origin Failed",
+        content_type: "text/plain", server: "conditional-test", date: .current,
+        connection: .request, head_mode: .reject, body: b"default failure\n" },
+      timeout_failure_policy: { version: .http11, status: 504,
         reason: "Response Read Deadline", content_type: "text/plain",
-        server: "conditional-test", date: "current", connection: "request",
-        head_mode: "reject", body: b"configured deadline\n" },
+        server: "conditional-test", date: .current, connection: .request,
+        head_mode: .reject, body: b"configured deadline\n" },
       response_read_timeout: 1s,
-      response_buffering: "complete_content_length")
+      response_buffering: .completeContentLength)
   }
 }
 )rut";
@@ -34507,20 +34507,20 @@ TEST(route, public_ordinary_source_deadline_complete_buffering_preserves_bounded
     source_text += R"rut(
 route GET "/buffered" {
   return forward(backend,
-    request_policy: { version: "HTTP/1.1", host: "upstream", connection: "omit",
-      strip_headers: ["Connection", "Keep-Alive", "TE", "Expect", "Upgrade"] },
-    response_policy: { version: "HTTP/1.1", framing: "content_length",
-      connection: "request", head_mode: "reject", server: "nginx/1.29.7",
-      date: "current", hide_headers: ["Date", "Server"] },
-    failure_policy: { version: "HTTP/1.1", status: 502, reason: "Origin Failed",
-      content_type: "text/plain", server: "buffered-test", date: "current",
-      connection: "request", head_mode: "reject", body: b"default failure\n" },
-    timeout_failure_policy: { version: "HTTP/1.1", status: 504,
+    request_policy: { version: .http11, host: .upstream, connection: .omit,
+      strip_headers: [.connection, .keepAlive, .te, .expect, .upgrade] },
+    response_policy: { version: .http11, framing: .contentLength,
+      connection: .request, head_mode: .reject, server: "nginx/1.29.7",
+      date: .current, hide_headers: ["Date", "Server"] },
+    failure_policy: { version: .http11, status: 502, reason: "Origin Failed",
+      content_type: "text/plain", server: "buffered-test", date: .current,
+      connection: .request, head_mode: .reject, body: b"default failure\n" },
+    timeout_failure_policy: { version: .http11, status: 504,
       reason: "Response Read Deadline", content_type: "text/plain",
-      server: "buffered-test", date: "current", connection: "request",
-      head_mode: "reject", body: b"configured deadline\n" },
+      server: "buffered-test", date: .current, connection: .request,
+      head_mode: .reject, body: b"configured deadline\n" },
     response_read_timeout: 1s,
-    response_buffering: "complete_content_length")
+    response_buffering: .completeContentLength)
 }
 )rut";
     struct TempSource {
