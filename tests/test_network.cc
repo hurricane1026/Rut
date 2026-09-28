@@ -14398,6 +14398,62 @@ TEST(slice_pool, bulk_free_written_rezeroes_the_written_prefix) {
     pool.destroy();
 }
 
+// A burst that touches more bulk buffers than the resident cache holds must
+// not keep all of them resident afterwards: returns past kMaxCachedBulk are
+// discarded, and reuse still prefers the retained (hot) buffers.
+TEST(slice_pool, bulk_burst_discards_returns_beyond_the_resident_cache) {
+    constexpr u32 kTestBulk = SlicePool::kMaxCachedBulk + 6;
+    SlicePool pool;
+    REQUIRE(pool.init(4, 0, SlicePool::kMaxCachedSlices, kTestBulk).has_value());
+    u8* all[kTestBulk]{};
+    for (u8*& b : all) {
+        REQUIRE((b = pool.alloc_bulk()) != nullptr);
+        __builtin_memset(b, 0x5a, SlicePool::kBulkSliceSize);
+    }
+    for (u8* b : all) pool.free(b);
+    CHECK_EQ(pool.bulk_available(), kTestBulk);
+    CHECK_EQ(pool.bulk_cached_count, SlicePool::kMaxCachedBulk);
+
+    const u64 page = static_cast<u64>(sysconf(_SC_PAGESIZE));
+    const u64 pages = SlicePool::kBulkSliceSize / page;
+    unsigned char residency[SlicePool::kBulkSliceSize / 4096]{};
+    REQUIRE(pages <= sizeof(residency));
+    auto resident_pages = [&](u8* b) -> u64 {
+        if (mincore(b, SlicePool::kBulkSliceSize, residency) != 0) return ~u64{0};
+        u64 n = 0;
+        for (u64 i = 0; i < pages; ++i) n += residency[i] & 1u;
+        return n;
+    };
+    // The first kMaxCachedBulk returns stay resident; the rest were released.
+    u32 released = 0;
+    for (u32 i = 0; i < kTestBulk; ++i) {
+        const u64 n = resident_pages(all[i]);
+        if (i < SlicePool::kMaxCachedBulk)
+            CHECK_EQ(n, pages);
+        else
+            released += n == 0 ? 1u : 0u;
+    }
+    CHECK_EQ(released, kTestBulk - SlicePool::kMaxCachedBulk);
+
+    // Reuse drains the resident set first, and every reused buffer reads zero.
+    u8* again[kTestBulk]{};
+    for (u32 i = 0; i < kTestBulk; ++i) {
+        REQUIRE((again[i] = pool.alloc_bulk()) != nullptr);
+        if (i < SlicePool::kMaxCachedBulk) {
+            bool hot = false;
+            for (u32 j = 0; j < SlicePool::kMaxCachedBulk; ++j) hot |= again[i] == all[j];
+            CHECK(hot);
+        }
+        bool zero = true;
+        for (u32 byte = 0; byte < SlicePool::kBulkSliceSize; ++byte) zero &= again[i][byte] == 0;
+        CHECK(zero);
+    }
+    CHECK_EQ(pool.bulk_cached_count, 0u);
+    CHECK_EQ(pool.alloc_bulk(), nullptr);
+    for (u8* b : again) pool.free(b);
+    pool.destroy();
+}
+
 TEST(slice_pool, alloc_free) {
     SlicePool pool;
     REQUIRE(pool.init(4).has_value());
