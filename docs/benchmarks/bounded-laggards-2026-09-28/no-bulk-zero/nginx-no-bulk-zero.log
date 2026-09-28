@@ -1,0 +1,35 @@
+Test project /home/hurricane/private/code/Rut-s1/build-rel
+      Start 123: test_nginx_issue271_converter_default_buffering_positive_get_differential
+ 1/11 Test #123: test_nginx_issue271_converter_default_buffering_positive_get_differential ............................   Passed    4.24 sec
+      Start 124: test_nginx_issue271_converter_default_buffering_incomplete_clean_eof_differential
+ 2/11 Test #124: test_nginx_issue271_converter_default_buffering_incomplete_clean_eof_differential ....................   Passed    1.89 sec
+      Start 125: test_nginx_issue271_converter_default_buffering_incomplete_body_inactivity_expiry_differential
+ 3/11 Test #125: test_nginx_issue271_converter_default_buffering_incomplete_body_inactivity_expiry_differential .......   Passed    2.95 sec
+      Start 127: test_nginx_issue271_converter_default_buffering_second_body_progress_refresh_differential
+ 4/11 Test #127: test_nginx_issue271_converter_default_buffering_second_body_progress_refresh_differential ............   Passed    3.66 sec
+      Start 138: test_nginx_issue529_converter_default_buffering_304_content_length_metadata_differential
+ 5/11 Test #138: test_nginx_issue529_converter_default_buffering_304_content_length_metadata_differential .............   Passed    3.04 sec
+      Start 139: test_nginx_issue534_converter_default_buffering_206_range_completion_differential
+ 6/11 Test #139: test_nginx_issue534_converter_default_buffering_206_range_completion_differential ....................   Passed    2.18 sec
+      Start 140: test_nginx_issue534_converter_default_buffering_206_range_delayed_completion_differential
+ 7/11 Test #140: test_nginx_issue534_converter_default_buffering_206_range_delayed_completion_differential ............   Passed    2.81 sec
+      Start 142: test_nginx_issue271_converter_default_buffering_201_incomplete_body_inactivity_expiry_differential
+ 8/11 Test #142: test_nginx_issue271_converter_default_buffering_201_incomplete_body_inactivity_expiry_differential ...   Passed    2.97 sec
+      Start 149: test_nginx_issue271_converter_default_buffering_third_body_progress_expiry_differential
+ 9/11 Test #149: test_nginx_issue271_converter_default_buffering_third_body_progress_expiry_differential ..............   Passed    4.27 sec
+      Start 150: test_nginx_issue271_converter_default_buffering_three_publication_completion_differential
+10/11 Test #150: test_nginx_issue271_converter_default_buffering_three_publication_completion_differential ............   Passed    2.73 sec
+      Start 247: test_nginx_differential
+11/11 Test #247: test_nginx_differential ..............................................................................   Passed   50.39 sec
+
+100% tests passed, 0 tests failed out of 11
+
+Label Time Summary:
+differential    =  26.50 sec*proc (9 tests)
+docker          =  81.12 sec*proc (11 tests)
+integration     =  81.12 sec*proc (11 tests)
+io_uring        =  30.74 sec*proc (10 tests)
+network         =  30.74 sec*proc (10 tests)
+nginx           =  81.12 sec*proc (11 tests)
+
+Total Test time (real) =  81.13 sec

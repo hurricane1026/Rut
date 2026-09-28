@@ -1,0 +1,8 @@
+{
+  "commit": "0b8fdcab9290d6b6a2093b775087efacd17c59bd",
+  "diff": "",
+  "sha256": {
+    "rut-baseline": "d0c3fa32459e19087877b810c1013a8811e9ce506235a2ff0cc89f8c4a9a45f6",
+    "rut-nginx-convert-baseline": "6cfe0065c01f78cbdf119a85f3d9dadc5cfd0bc9e294c747ebc92bd8139c613f"
+  }
+}
