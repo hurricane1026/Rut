@@ -854,3 +854,15 @@ Additional uninstrumented controls, all exact-body and warm/load checks passing:
 | 1m-c8-keepalive | -5.91% |
 
 All tested keepalive concurrency levels above one regress. Do not retain this as a universal change or introduce a benchmark-coordinate branch. Four usable TCP window traces show a strong correlated reversal: for c1, peer window >=1 MiB rises from 0% to 99.83% and notsent >=64 KiB falls from 50.38% to 0.05%; at c32, notsent >=64 KiB rises from 39.11% to 64.85%. These are call-weighted observations, not time fractions, and do not isolate alignment from allocation or initial-burst size. A 32 KiB page-aligned body prefix is the next independent control; the previous rejected 64 KiB staging experiment had an unaligned body offset. No huge pages or global TCP settings are changed.
+
+## Rejected 32 KiB aligned file prefix
+
+The 32 KiB body prefix retains page alignment with a wider staging buffer; all preflight/warm/load checks passed.
+
+| Case | Mean RPS change |
+|---|---:|
+| 1m-c1-keepalive | -7.45% |
+| 1m-c32-close | -4.20% |
+| 1m-c32-keepalive | -12.37% |
+
+It also regresses concurrent cases and reintroduces c1 bimodality. Reverted without full network regression. This ends the prefix-size series. Slow c1 samples have negligible runqueue delay (roughly 0.05–0.1 us/request); they spend less server CPU per request, consistent with socket waiting rather than observed CPU scheduling delay, though not a proof of the exact TCP mechanism.
