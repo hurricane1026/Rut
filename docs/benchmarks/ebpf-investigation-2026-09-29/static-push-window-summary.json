@@ -1,0 +1,22 @@
+[
+  {
+    "case": "1048576-c1-keepalive-rut-base",
+    "peer_window_ge_256k_pct": 0.0,
+    "notsent_ge_64k_pct": 73.46688425993838
+  },
+  {
+    "case": "1048576-c1-keepalive-rut-push",
+    "peer_window_ge_256k_pct": 93.48587420700551,
+    "notsent_ge_64k_pct": 0.39078892152748634
+  },
+  {
+    "case": "1048576-c32-keepalive-rut-base",
+    "peer_window_ge_256k_pct": 0.0,
+    "notsent_ge_64k_pct": 76.41888436637286
+  },
+  {
+    "case": "1048576-c32-keepalive-rut-push",
+    "peer_window_ge_256k_pct": 58.534687744652295,
+    "notsent_ge_64k_pct": 63.33428965535127
+  }
+]

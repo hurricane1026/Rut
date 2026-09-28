@@ -467,3 +467,19 @@ requirement. The step patch is relative to the all-file prototype. A fresh
 network test build and all 12 affected HTTP static acceptance coordinates
 (two sizes, two connection modes, three concurrency levels) are queued.
 TCP send-window diagnostics for the large-body candidate are also queued.
+
+The all-file header-push prototype passed 1,423 network tests (338,996
+checks). The narrowed >64 KiB-tail version is rebuilding and has separate
+pending tests; the prototype result must not be attributed to that final
+source yet.
+
+TCP-state tracing exposes a transport-flow difference. At c1, the fraction
+of send-entry observations with peer window >=256 KiB rises from 0% to
+93.5%; observations with >=64 KiB not yet transmitted fall from 73.5% to
+0.4%. At c32 the corresponding changes are 0% to 58.5%, and 76.4% to
+63.3%. Both send-buffer histograms remain in the same 2–4 MiB bin. These
+are call-weighted observations, not percentages of elapsed time or exact
+per-flow averages. They support a receive-window/send-timing explanation;
+they do not isolate ACK behavior or prove one receive-autotuning mechanism.
+The trace covers the all-file prototype, whose 1 MiB send flags match the
+narrowed candidate; it is not an uninstrumented throughput comparison.

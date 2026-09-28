@@ -1,0 +1,3115 @@
+{
+  "1048576-c1-keepalive-rut-base": {
+    "status": {
+      "completed": true,
+      "usable": true,
+      "mode": "trace",
+      "kernel": "6.19.10-300.fc44.x86_64",
+      "machine": "x86_64",
+      "groups": [
+        "fault",
+        "rx-copy",
+        "sched",
+        "stacks",
+        "tcp"
+      ],
+      "duration_seconds": 12,
+      "front_port": 8987,
+      "origin_port": 9987,
+      "started_at": 1790627506.0684083,
+      "program_sha256": "6aa90dd48a819816bee7cc927af6f83fc59893b8599e0f8740f8f29e929470f9",
+      "targets_before": [
+        {
+          "pid": 2704964,
+          "start_ticks": 91343405,
+          "state": "S",
+          "comm": "rut-buffered-mo",
+          "exe": "/tmp/rut-bounded-followup-20260928/ebpf-tools/rut-buffered-more"
+        }
+      ],
+      "bpftrace_version": "bpftrace v0.27.0",
+      "command": [
+        "/tmp/rut-bounded-followup-20260928/ebpf-tools/bpftrace-container.py",
+        "-f",
+        "json",
+        "-B",
+        "line",
+        "/tmp/rut-bounded-followup-20260928/ebpf-static-push-r1/1048576-c1-keepalive-rut-base/trace/program.bt"
+      ],
+      "returncode": 0,
+      "targets_after": [
+        {
+          "pid": 2704964,
+          "start_ticks": 91343405,
+          "state": "S",
+          "comm": "rut-buffered-mo",
+          "exe": "/tmp/rut-bounded-followup-20260928/ebpf-tools/rut-buffered-more"
+        }
+      ],
+      "targets_unchanged": true,
+      "diagnostic_warnings": false,
+      "finished_at": 1790627520.3019598
+    },
+    "summary": {
+      "maps": {
+        "@copy_calls": {
+          "2704964,1,1": 32080
+        },
+        "@copy_elapsed_ns": {
+          "2704964,1,1": 11160362
+        },
+        "@copy_latency_us": {
+          "2704964,1,1": [
+            {
+              "min": 0,
+              "max": 0,
+              "count": 32057
+            },
+            {
+              "min": 1,
+              "max": 1,
+              "count": 1
+            },
+            {
+              "min": 2,
+              "max": 3,
+              "count": 10
+            },
+            {
+              "min": 4,
+              "max": 7,
+              "count": 3
+            },
+            {
+              "min": 8,
+              "max": 15,
+              "count": 3
+            },
+            {
+              "min": 16,
+              "max": 31,
+              "count": 6
+            }
+          ]
+        },
+        "@copy_success_bytes": {
+          "2704964,1,1": 1475680
+        },
+        "@offcpu_ns": {
+          "2704964": 20990752770
+        },
+        "@offcpu_samples": {
+          "2704964": 32230
+        },
+        "@offcpu_us": {
+          "2704964": [
+            {
+              "min": 2,
+              "max": 3,
+              "count": 3
+            },
+            {
+              "min": 4,
+              "max": 7,
+              "count": 15
+            },
+            {
+              "min": 8,
+              "max": 15,
+              "count": 4
+            },
+            {
+              "min": 16,
+              "max": 31,
+              "count": 4
+            },
+            {
+              "min": 32,
+              "max": 63,
+              "count": 1
+            },
+            {
+              "min": 64,
+              "max": 127,
+              "count": 26
+            },
+            {
+              "min": 128,
+              "max": 255,
+              "count": 31849
+            },
+            {
+              "min": 256,
+              "max": 511,
+              "count": 186
+            },
+            {
+              "min": 512,
+              "max": 1023,
+              "count": 15
+            },
+            {
+              "min": 1024,
+              "max": 2047,
+              "count": 3
+            },
+            {
+              "min": 2048,
+              "max": 4095,
+              "count": 1
+            },
+            {
+              "min": 4096,
+              "max": 8191,
+              "count": 0
+            },
+            {
+              "min": 8192,
+              "max": 16383,
+              "count": 0
+            },
+            {
+              "min": 16384,
+              "max": 32767,
+              "count": 0
+            },
+            {
+              "min": 32768,
+              "max": 65535,
+              "count": 0
+            },
+            {
+              "min": 65536,
+              "max": 131071,
+              "count": 119
+            },
+            {
+              "min": 131072,
+              "max": 262143,
+              "count": 0
+            },
+            {
+              "min": 262144,
+              "max": 524287,
+              "count": 1
+            },
+            {
+              "min": 524288,
+              "max": 1048575,
+              "count": 3
+            }
+          ]
+        },
+        "@runqueue_ns": {
+          "2704964": 42850393
+        },
+        "@runqueue_samples": {
+          "2704964": 32232
+        },
+        "@runqueue_us": {
+          "2704964": [
+            {
+              "min": 0,
+              "max": 0,
+              "count": 31805
+            },
+            {
+              "min": 1,
+              "max": 1,
+              "count": 249
+            },
+            {
+              "min": 2,
+              "max": 3,
+              "count": 47
+            },
+            {
+              "min": 4,
+              "max": 7,
+              "count": 17
+            },
+            {
+              "min": 8,
+              "max": 15,
+              "count": 28
+            },
+            {
+              "min": 16,
+              "max": 31,
+              "count": 42
+            },
+            {
+              "min": 32,
+              "max": 63,
+              "count": 16
+            },
+            {
+              "min": 64,
+              "max": 127,
+              "count": 5
+            },
+            {
+              "min": 128,
+              "max": 255,
+              "count": 3
+            },
+            {
+              "min": 256,
+              "max": 511,
+              "count": 3
+            },
+            {
+              "min": 512,
+              "max": 1023,
+              "count": 15
+            },
+            {
+              "min": 1024,
+              "max": 2047,
+              "count": 1
+            },
+            {
+              "min": 2048,
+              "max": 4095,
+              "count": 1
+            }
+          ]
+        },
+        "@send_cwnd": {
+          "2704964": [
+            {
+              "min": 8,
+              "max": 15,
+              "count": 545360
+            }
+          ]
+        },
+        "@send_flags": {
+          "2704964,49216": 32080,
+          "2704964,134217792": 32080,
+          "2704964,134250560": 481200
+        },
+        "@send_notsent": {
+          "2704964": [
+            {
+              "min": 0,
+              "max": 0,
+              "count": 47142
+            },
+            {
+              "min": 1,
+              "max": 1,
+              "count": 0
+            },
+            {
+              "min": 2,
+              "max": 3,
+              "count": 0
+            },
+            {
+              "min": 4,
+              "max": 7,
+              "count": 0
+            },
+            {
+              "min": 8,
+              "max": 15,
+              "count": 0
+            },
+            {
+              "min": 16,
+              "max": 31,
+              "count": 0
+            },
+            {
+              "min": 32,
+              "max": 63,
+              "count": 132
+            },
+            {
+              "min": 64,
+              "max": 127,
+              "count": 15
+            },
+            {
+              "min": 128,
+              "max": 255,
+              "count": 0
+            },
+            {
+              "min": 256,
+              "max": 511,
+              "count": 0
+            },
+            {
+              "min": 512,
+              "max": 1023,
+              "count": 1
+            },
+            {
+              "min": 1024,
+              "max": 2047,
+              "count": 0
+            },
+            {
+              "min": 2048,
+              "max": 4095,
+              "count": 0
+            },
+            {
+              "min": 4096,
+              "max": 8191,
+              "count": 0
+            },
+            {
+              "min": 8192,
+              "max": 16383,
+              "count": 61873
+            },
+            {
+              "min": 16384,
+              "max": 32767,
+              "count": 33812
+            },
+            {
+              "min": 32768,
+              "max": 65535,
+              "count": 1726
+            },
+            {
+              "min": 65536,
+              "max": 131071,
+              "count": 50691
+            },
+            {
+              "min": 131072,
+              "max": 262143,
+              "count": 78592
+            },
+            {
+              "min": 262144,
+              "max": 524287,
+              "count": 151536
+            },
+            {
+              "min": 524288,
+              "max": 1048575,
+              "count": 119840
+            }
+          ]
+        },
+        "@send_packets_out": {
+          "2704964": [
+            {
+              "min": 0,
+              "max": 0,
+              "count": 288503
+            },
+            {
+              "min": 1,
+              "max": 1,
+              "count": 116925
+            },
+            {
+              "min": 2,
+              "max": 3,
+              "count": 139932
+            }
+          ]
+        },
+        "@send_peer_window": {
+          "2704964": [
+            {
+              "min": 0,
+              "max": 0,
+              "count": 4478
+            },
+            {
+              "min": 1,
+              "max": 1,
+              "count": 0
+            },
+            {
+              "min": 2,
+              "max": 3,
+              "count": 0
+            },
+            {
+              "min": 4,
+              "max": 7,
+              "count": 0
+            },
+            {
+              "min": 8,
+              "max": 15,
+              "count": 0
+            },
+            {
+              "min": 16,
+              "max": 31,
+              "count": 0
+            },
+            {
+              "min": 32,
+              "max": 63,
+              "count": 0
+            },
+            {
+              "min": 64,
+              "max": 127,
+              "count": 0
+            },
+            {
+              "min": 128,
+              "max": 255,
+              "count": 0
+            },
+            {
+              "min": 256,
+              "max": 511,
+              "count": 0
+            },
+            {
+              "min": 512,
+              "max": 1023,
+              "count": 0
+            },
+            {
+              "min": 1024,
+              "max": 2047,
+              "count": 0
+            },
+            {
+              "min": 2048,
+              "max": 4095,
+              "count": 5
+            },
+            {
+              "min": 4096,
+              "max": 8191,
+              "count": 0
+            },
+            {
+              "min": 8192,
+              "max": 16383,
+              "count": 29
+            },
+            {
+              "min": 16384,
+              "max": 32767,
+              "count": 12
+            },
+            {
+              "min": 32768,
+              "max": 65535,
+              "count": 177720
+            },
+            {
+              "min": 65536,
+              "max": 131071,
+              "count": 232285
+            },
+            {
+              "min": 131072,
+              "max": 262143,
+              "count": 130831
+            }
+          ]
+        },
+        "@send_queued_memory": {
+          "2704964": [
+            {
+              "min": 0,
+              "max": 0,
+              "count": 32113
+            },
+            {
+              "min": 1,
+              "max": 1,
+              "count": 0
+            },
+            {
+              "min": 2,
+              "max": 3,
+              "count": 0
+            },
+            {
+              "min": 4,
+              "max": 7,
+              "count": 0
+            },
+            {
+              "min": 8,
+              "max": 15,
+              "count": 0
+            },
+            {
+              "min": 16,
+              "max": 31,
+              "count": 0
+            },
+            {
+              "min": 32,
+              "max": 63,
+              "count": 0
+            },
+            {
+              "min": 64,
+              "max": 127,
+              "count": 0
+            },
+            {
+              "min": 128,
+              "max": 255,
+              "count": 0
+            },
+            {
+              "min": 256,
+              "max": 511,
+              "count": 0
+            },
+            {
+              "min": 512,
+              "max": 1023,
+              "count": 91
+            },
+            {
+              "min": 1024,
+              "max": 2047,
+              "count": 13
+            },
+            {
+              "min": 2048,
+              "max": 4095,
+              "count": 0
+            },
+            {
+              "min": 4096,
+              "max": 8191,
+              "count": 0
+            },
+            {
+              "min": 8192,
+              "max": 16383,
+              "count": 70
+            },
+            {
+              "min": 16384,
+              "max": 32767,
+              "count": 32080
+            },
+            {
+              "min": 32768,
+              "max": 65535,
+              "count": 1
+            },
+            {
+              "min": 65536,
+              "max": 131071,
+              "count": 73045
+            },
+            {
+              "min": 131072,
+              "max": 262143,
+              "count": 120174
+            },
+            {
+              "min": 262144,
+              "max": 524287,
+              "count": 150961
+            },
+            {
+              "min": 524288,
+              "max": 1048575,
+              "count": 136812
+            }
+          ]
+        },
+        "@send_socket_buffer": {
+          "2704964": [
+            {
+              "min": 2097152,
+              "max": 4194303,
+              "count": 545360
+            }
+          ]
+        },
+        "@tcp_calls": {
+          "2704964,1,1": 32082,
+          "2704964,2,1": 545360
+        },
+        "@tcp_completed_calls": {
+          "2704964,1,1": 32082,
+          "2704964,2,1": 545360
+        },
+        "@tcp_elapsed_ns": {
+          "2704964,1,1": 41758363,
+          "2704964,2,1": 1281267287
+        },
+        "@tcp_latency_us": {
+          "2704964,1,1": [
+            {
+              "min": 0,
+              "max": 0,
+              "count": 1
+            },
+            {
+              "min": 1,
+              "max": 1,
+              "count": 31915
+            },
+            {
+              "min": 2,
+              "max": 3,
+              "count": 123
+            },
+            {
+              "min": 4,
+              "max": 7,
+              "count": 14
+            },
+            {
+              "min": 8,
+              "max": 15,
+              "count": 7
+            },
+            {
+              "min": 16,
+              "max": 31,
+              "count": 21
+            },
+            {
+              "min": 32,
+              "max": 63,
+              "count": 1
+            }
+          ],
+          "2704964,2,1": [
+            {
+              "min": 0,
+              "max": 0,
+              "count": 226374
+            },
+            {
+              "min": 1,
+              "max": 1,
+              "count": 148346
+            },
+            {
+              "min": 2,
+              "max": 3,
+              "count": 87663
+            },
+            {
+              "min": 4,
+              "max": 7,
+              "count": 49871
+            },
+            {
+              "min": 8,
+              "max": 15,
+              "count": 32267
+            },
+            {
+              "min": 16,
+              "max": 31,
+              "count": 736
+            },
+            {
+              "min": 32,
+              "max": 63,
+              "count": 103
+            }
+          ]
+        },
+        "@tcp_requested_bytes": {
+          "2704964,1,1": 131407872,
+          "2704964,2,1": 33641814800
+        },
+        "@tcp_returned_bytes": {
+          "2704964,1,1": 1475680,
+          "2704964,2,1": 33641814800
+        },
+        "@tcp_zero_returns": {
+          "2704964,1,1": 2
+        }
+      },
+      "loss_or_errors": [],
+      "ready": true,
+      "ended": true,
+      "stdout_diagnostics": [],
+      "tcp": [
+        {
+          "pid": 2704964,
+          "direction": "recv",
+          "side": "downstream",
+          "completed_calls": 32082,
+          "returned_bytes": 1475680,
+          "inclusive_elapsed_ns": 41758363,
+          "mean_elapsed_us": 1.3016134592606445
+        },
+        {
+          "pid": 2704964,
+          "direction": "send",
+          "side": "downstream",
+          "completed_calls": 545360,
+          "returned_bytes": 33641814800,
+          "inclusive_elapsed_ns": 1281267287,
+          "mean_elapsed_us": 2.349397255024204
+        }
+      ]
+    },
+    "kernel_stack_sample_count": 234,
+    "raw_trace_directory": "/tmp/rut-bounded-followup-20260928/ebpf-static-push-r1/1048576-c1-keepalive-rut-base/trace"
+  },
+  "1048576-c1-keepalive-rut-push": {
+    "status": {
+      "completed": true,
+      "usable": true,
+      "mode": "trace",
+      "kernel": "6.19.10-300.fc44.x86_64",
+      "machine": "x86_64",
+      "groups": [
+        "fault",
+        "rx-copy",
+        "sched",
+        "stacks",
+        "tcp"
+      ],
+      "duration_seconds": 12,
+      "front_port": 8987,
+      "origin_port": 9987,
+      "started_at": 1790627522.6369905,
+      "program_sha256": "be44ed9c6003c07b3044d3967e2b0cde40691da62ebe35bd70b2ead5d06f5e55",
+      "targets_before": [
+        {
+          "pid": 2705225,
+          "start_ticks": 91345058,
+          "state": "S",
+          "comm": "rut-file-header",
+          "exe": "/tmp/rut-bounded-followup-20260928/ebpf-tools/rut-file-header-push"
+        }
+      ],
+      "bpftrace_version": "bpftrace v0.27.0",
+      "command": [
+        "/tmp/rut-bounded-followup-20260928/ebpf-tools/bpftrace-container.py",
+        "-f",
+        "json",
+        "-B",
+        "line",
+        "/tmp/rut-bounded-followup-20260928/ebpf-static-push-r1/1048576-c1-keepalive-rut-push/trace/program.bt"
+      ],
+      "returncode": 0,
+      "targets_after": [
+        {
+          "pid": 2705225,
+          "start_ticks": 91345058,
+          "state": "S",
+          "comm": "rut-file-header",
+          "exe": "/tmp/rut-bounded-followup-20260928/ebpf-tools/rut-file-header-push"
+        }
+      ],
+      "targets_unchanged": true,
+      "diagnostic_warnings": false,
+      "finished_at": 1790627536.9365053
+    },
+    "summary": {
+      "maps": {
+        "@copy_calls": {
+          "2705225,1,1": 38128
+        },
+        "@copy_elapsed_ns": {
+          "2705225,1,1": 14446491
+        },
+        "@copy_latency_us": {
+          "2705225,1,1": [
+            {
+              "min": 0,
+              "max": 0,
+              "count": 38100
+            },
+            {
+              "min": 1,
+              "max": 1,
+              "count": 1
+            },
+            {
+              "min": 2,
+              "max": 3,
+              "count": 14
+            },
+            {
+              "min": 4,
+              "max": 7,
+              "count": 1
+            },
+            {
+              "min": 8,
+              "max": 15,
+              "count": 7
+            },
+            {
+              "min": 16,
+              "max": 31,
+              "count": 5
+            }
+          ]
+        },
+        "@copy_success_bytes": {
+          "2705225,1,1": 1753888
+        },
+        "@offcpu_ns": {
+          "2705225": 18227638843
+        },
+        "@offcpu_samples": {
+          "2705225": 38317
+        },
+        "@offcpu_us": {
+          "2705225": [
+            {
+              "min": 2,
+              "max": 3,
+              "count": 8
+            },
+            {
+              "min": 4,
+              "max": 7,
+              "count": 36
+            },
+            {
+              "min": 8,
+              "max": 15,
+              "count": 16
+            },
+            {
+              "min": 16,
+              "max": 31,
+              "count": 16
+            },
+            {
+              "min": 32,
+              "max": 63,
+              "count": 547
+            },
+            {
+              "min": 64,
+              "max": 127,
+              "count": 36715
+            },
+            {
+              "min": 128,
+              "max": 255,
+              "count": 834
+            },
+            {
+              "min": 256,
+              "max": 511,
+              "count": 22
+            },
+            {
+              "min": 512,
+              "max": 1023,
+              "count": 0
+            },
+            {
+              "min": 1024,
+              "max": 2047,
+              "count": 0
+            },
+            {
+              "min": 2048,
+              "max": 4095,
+              "count": 0
+            },
+            {
+              "min": 4096,
+              "max": 8191,
+              "count": 0
+            },
+            {
+              "min": 8192,
+              "max": 16383,
+              "count": 0
+            },
+            {
+              "min": 16384,
+              "max": 32767,
+              "count": 0
+            },
+            {
+              "min": 32768,
+              "max": 65535,
+              "count": 0
+            },
+            {
+              "min": 65536,
+              "max": 131071,
+              "count": 119
+            },
+            {
+              "min": 131072,
+              "max": 262143,
+              "count": 1
+            },
+            {
+              "min": 262144,
+              "max": 524287,
+              "count": 0
+            },
+            {
+              "min": 524288,
+              "max": 1048575,
+              "count": 3
+            }
+          ]
+        },
+        "@runqueue_ns": {
+          "2705225": 33769333
+        },
+        "@runqueue_samples": {
+          "2705225": 38319
+        },
+        "@runqueue_us": {
+          "2705225": [
+            {
+              "min": 0,
+              "max": 0,
+              "count": 37822
+            },
+            {
+              "min": 1,
+              "max": 1,
+              "count": 267
+            },
+            {
+              "min": 2,
+              "max": 3,
+              "count": 61
+            },
+            {
+              "min": 4,
+              "max": 7,
+              "count": 42
+            },
+            {
+              "min": 8,
+              "max": 15,
+              "count": 27
+            },
+            {
+              "min": 16,
+              "max": 31,
+              "count": 59
+            },
+            {
+              "min": 32,
+              "max": 63,
+              "count": 16
+            },
+            {
+              "min": 64,
+              "max": 127,
+              "count": 17
+            },
+            {
+              "min": 128,
+              "max": 255,
+              "count": 4
+            },
+            {
+              "min": 256,
+              "max": 511,
+              "count": 4
+            }
+          ]
+        },
+        "@send_cwnd": {
+          "2705225": [
+            {
+              "min": 8,
+              "max": 15,
+              "count": 125681
+            },
+            {
+              "min": 16,
+              "max": 31,
+              "count": 522495
+            }
+          ]
+        },
+        "@send_flags": {
+          "2705225,134217792": 38128,
+          "2705225,16448": 38128,
+          "2705225,134250560": 571920
+        },
+        "@send_notsent": {
+          "2705225": [
+            {
+              "min": 0,
+              "max": 0,
+              "count": 496841
+            },
+            {
+              "min": 1,
+              "max": 1,
+              "count": 0
+            },
+            {
+              "min": 2,
+              "max": 3,
+              "count": 0
+            },
+            {
+              "min": 4,
+              "max": 7,
+              "count": 0
+            },
+            {
+              "min": 8,
+              "max": 15,
+              "count": 0
+            },
+            {
+              "min": 16,
+              "max": 31,
+              "count": 0
+            },
+            {
+              "min": 32,
+              "max": 63,
+              "count": 39789
+            },
+            {
+              "min": 64,
+              "max": 127,
+              "count": 15926
+            },
+            {
+              "min": 128,
+              "max": 255,
+              "count": 19
+            },
+            {
+              "min": 256,
+              "max": 511,
+              "count": 0
+            },
+            {
+              "min": 512,
+              "max": 1023,
+              "count": 0
+            },
+            {
+              "min": 1024,
+              "max": 2047,
+              "count": 0
+            },
+            {
+              "min": 2048,
+              "max": 4095,
+              "count": 0
+            },
+            {
+              "min": 4096,
+              "max": 8191,
+              "count": 1
+            },
+            {
+              "min": 8192,
+              "max": 16383,
+              "count": 0
+            },
+            {
+              "min": 16384,
+              "max": 32767,
+              "count": 0
+            },
+            {
+              "min": 32768,
+              "max": 65535,
+              "count": 93067
+            },
+            {
+              "min": 65536,
+              "max": 131071,
+              "count": 2099
+            },
+            {
+              "min": 131072,
+              "max": 262143,
+              "count": 323
+            },
+            {
+              "min": 262144,
+              "max": 524287,
+              "count": 98
+            },
+            {
+              "min": 524288,
+              "max": 1048575,
+              "count": 13
+            }
+          ]
+        },
+        "@send_packets_out": {
+          "2705225": [
+            {
+              "min": 0,
+              "max": 0,
+              "count": 49693
+            },
+            {
+              "min": 1,
+              "max": 1,
+              "count": 115313
+            },
+            {
+              "min": 2,
+              "max": 3,
+              "count": 482785
+            },
+            {
+              "min": 4,
+              "max": 7,
+              "count": 372
+            },
+            {
+              "min": 8,
+              "max": 15,
+              "count": 13
+            }
+          ]
+        },
+        "@send_peer_window": {
+          "2705225": [
+            {
+              "min": 16384,
+              "max": 32767,
+              "count": 1871
+            },
+            {
+              "min": 32768,
+              "max": 65535,
+              "count": 151
+            },
+            {
+              "min": 65536,
+              "max": 131071,
+              "count": 8457
+            },
+            {
+              "min": 131072,
+              "max": 262143,
+              "count": 31744
+            },
+            {
+              "min": 262144,
+              "max": 524287,
+              "count": 114008
+            },
+            {
+              "min": 524288,
+              "max": 1048575,
+              "count": 161314
+            },
+            {
+              "min": 1048576,
+              "max": 2097151,
+              "count": 330631
+            }
+          ]
+        },
+        "@send_queued_memory": {
+          "2705225": [
+            {
+              "min": 0,
+              "max": 0,
+              "count": 47718
+            },
+            {
+              "min": 1,
+              "max": 1,
+              "count": 0
+            },
+            {
+              "min": 2,
+              "max": 3,
+              "count": 0
+            },
+            {
+              "min": 4,
+              "max": 7,
+              "count": 0
+            },
+            {
+              "min": 8,
+              "max": 15,
+              "count": 0
+            },
+            {
+              "min": 16,
+              "max": 31,
+              "count": 0
+            },
+            {
+              "min": 32,
+              "max": 63,
+              "count": 0
+            },
+            {
+              "min": 64,
+              "max": 127,
+              "count": 0
+            },
+            {
+              "min": 128,
+              "max": 255,
+              "count": 0
+            },
+            {
+              "min": 256,
+              "max": 511,
+              "count": 0
+            },
+            {
+              "min": 512,
+              "max": 1023,
+              "count": 4451
+            },
+            {
+              "min": 1024,
+              "max": 2047,
+              "count": 292
+            },
+            {
+              "min": 2048,
+              "max": 4095,
+              "count": 0
+            },
+            {
+              "min": 4096,
+              "max": 8191,
+              "count": 0
+            },
+            {
+              "min": 8192,
+              "max": 16383,
+              "count": 1
+            },
+            {
+              "min": 16384,
+              "max": 32767,
+              "count": 38127
+            },
+            {
+              "min": 32768,
+              "max": 65535,
+              "count": 146
+            },
+            {
+              "min": 65536,
+              "max": 131071,
+              "count": 485172
+            },
+            {
+              "min": 131072,
+              "max": 262143,
+              "count": 71981
+            },
+            {
+              "min": 262144,
+              "max": 524287,
+              "count": 258
+            },
+            {
+              "min": 524288,
+              "max": 1048575,
+              "count": 30
+            }
+          ]
+        },
+        "@send_socket_buffer": {
+          "2705225": [
+            {
+              "min": 2097152,
+              "max": 4194303,
+              "count": 648176
+            }
+          ]
+        },
+        "@tcp_calls": {
+          "2705225,1,1": 38131,
+          "2705225,2,1": 648176
+        },
+        "@tcp_completed_calls": {
+          "2705225,1,1": 38131,
+          "2705225,2,1": 648176
+        },
+        "@tcp_elapsed_ns": {
+          "2705225,1,1": 50601054,
+          "2705225,2,1": 3723764357
+        },
+        "@tcp_errors": {
+          "2705225,1,1,-11": 1
+        },
+        "@tcp_latency_us": {
+          "2705225,1,1": [
+            {
+              "min": 0,
+              "max": 0,
+              "count": 2
+            },
+            {
+              "min": 1,
+              "max": 1,
+              "count": 37901
+            },
+            {
+              "min": 2,
+              "max": 3,
+              "count": 159
+            },
+            {
+              "min": 4,
+              "max": 7,
+              "count": 28
+            },
+            {
+              "min": 8,
+              "max": 15,
+              "count": 9
+            },
+            {
+              "min": 16,
+              "max": 31,
+              "count": 30
+            },
+            {
+              "min": 32,
+              "max": 63,
+              "count": 2
+            }
+          ],
+          "2705225,2,1": [
+            {
+              "min": 0,
+              "max": 0,
+              "count": 2576
+            },
+            {
+              "min": 1,
+              "max": 1,
+              "count": 40407
+            },
+            {
+              "min": 2,
+              "max": 3,
+              "count": 74021
+            },
+            {
+              "min": 4,
+              "max": 7,
+              "count": 478404
+            },
+            {
+              "min": 8,
+              "max": 15,
+              "count": 50315
+            },
+            {
+              "min": 16,
+              "max": 31,
+              "count": 2080
+            },
+            {
+              "min": 32,
+              "max": 63,
+              "count": 373
+            }
+          ]
+        },
+        "@tcp_requested_bytes": {
+          "2705225,1,1": 156184576,
+          "2705225,2,1": 39984261680
+        },
+        "@tcp_returned_bytes": {
+          "2705225,1,1": 1753888,
+          "2705225,2,1": 39984261680
+        },
+        "@tcp_zero_returns": {
+          "2705225,1,1": 2
+        }
+      },
+      "loss_or_errors": [],
+      "ready": true,
+      "ended": true,
+      "stdout_diagnostics": [],
+      "tcp": [
+        {
+          "pid": 2705225,
+          "direction": "recv",
+          "side": "downstream",
+          "completed_calls": 38131,
+          "returned_bytes": 1753888,
+          "inclusive_elapsed_ns": 50601054,
+          "mean_elapsed_us": 1.3270319162885842
+        },
+        {
+          "pid": 2705225,
+          "direction": "send",
+          "side": "downstream",
+          "completed_calls": 648176,
+          "returned_bytes": 39984261680,
+          "inclusive_elapsed_ns": 3723764357,
+          "mean_elapsed_us": 5.744989566105502
+        }
+      ]
+    },
+    "kernel_stack_sample_count": 493,
+    "raw_trace_directory": "/tmp/rut-bounded-followup-20260928/ebpf-static-push-r1/1048576-c1-keepalive-rut-push/trace"
+  },
+  "1048576-c32-keepalive-rut-base": {
+    "status": {
+      "completed": true,
+      "usable": true,
+      "mode": "trace",
+      "kernel": "6.19.10-300.fc44.x86_64",
+      "machine": "x86_64",
+      "groups": [
+        "fault",
+        "rx-copy",
+        "sched",
+        "stacks",
+        "tcp"
+      ],
+      "duration_seconds": 12,
+      "front_port": 8987,
+      "origin_port": 9987,
+      "started_at": 1790627539.4637463,
+      "program_sha256": "918628a2e6cb923e4e13c98ec27ad662619aaa3fa5fbdea7459e3364f013c43a",
+      "targets_before": [
+        {
+          "pid": 2705572,
+          "start_ticks": 91346749,
+          "state": "S",
+          "comm": "rut-buffered-mo",
+          "exe": "/tmp/rut-bounded-followup-20260928/ebpf-tools/rut-buffered-more"
+        }
+      ],
+      "bpftrace_version": "bpftrace v0.27.0",
+      "command": [
+        "/tmp/rut-bounded-followup-20260928/ebpf-tools/bpftrace-container.py",
+        "-f",
+        "json",
+        "-B",
+        "line",
+        "/tmp/rut-bounded-followup-20260928/ebpf-static-push-r1/1048576-c32-keepalive-rut-base/trace/program.bt"
+      ],
+      "returncode": 0,
+      "targets_after": [
+        {
+          "pid": 2705572,
+          "start_ticks": 91346749,
+          "state": "S",
+          "comm": "rut-buffered-mo",
+          "exe": "/tmp/rut-bounded-followup-20260928/ebpf-tools/rut-buffered-more"
+        }
+      ],
+      "targets_unchanged": true,
+      "diagnostic_warnings": false,
+      "finished_at": 1790627553.7569733
+    },
+    "summary": {
+      "maps": {
+        "@copy_calls": {
+          "2705572,1,1": 62346
+        },
+        "@copy_elapsed_ns": {
+          "2705572,1,1": 17478229
+        },
+        "@copy_latency_us": {
+          "2705572,1,1": [
+            {
+              "min": 0,
+              "max": 0,
+              "count": 62290
+            },
+            {
+              "min": 1,
+              "max": 1,
+              "count": 5
+            },
+            {
+              "min": 2,
+              "max": 3,
+              "count": 19
+            },
+            {
+              "min": 4,
+              "max": 7,
+              "count": 1
+            },
+            {
+              "min": 8,
+              "max": 15,
+              "count": 26
+            },
+            {
+              "min": 16,
+              "max": 31,
+              "count": 5
+            }
+          ]
+        },
+        "@copy_success_bytes": {
+          "2705572,1,1": 2867916
+        },
+        "@offcpu_ns": {
+          "2705572": 19559064486
+        },
+        "@offcpu_samples": {
+          "2705572": 8317
+        },
+        "@offcpu_us": {
+          "2705572": [
+            {
+              "min": 1,
+              "max": 1,
+              "count": 2
+            },
+            {
+              "min": 2,
+              "max": 3,
+              "count": 35
+            },
+            {
+              "min": 4,
+              "max": 7,
+              "count": 50
+            },
+            {
+              "min": 8,
+              "max": 15,
+              "count": 78
+            },
+            {
+              "min": 16,
+              "max": 31,
+              "count": 143
+            },
+            {
+              "min": 32,
+              "max": 63,
+              "count": 252
+            },
+            {
+              "min": 64,
+              "max": 127,
+              "count": 538
+            },
+            {
+              "min": 128,
+              "max": 255,
+              "count": 1070
+            },
+            {
+              "min": 256,
+              "max": 511,
+              "count": 2256
+            },
+            {
+              "min": 512,
+              "max": 1023,
+              "count": 3032
+            },
+            {
+              "min": 1024,
+              "max": 2047,
+              "count": 736
+            },
+            {
+              "min": 2048,
+              "max": 4095,
+              "count": 3
+            },
+            {
+              "min": 4096,
+              "max": 8191,
+              "count": 0
+            },
+            {
+              "min": 8192,
+              "max": 16383,
+              "count": 0
+            },
+            {
+              "min": 16384,
+              "max": 32767,
+              "count": 0
+            },
+            {
+              "min": 32768,
+              "max": 65535,
+              "count": 0
+            },
+            {
+              "min": 65536,
+              "max": 131071,
+              "count": 118
+            },
+            {
+              "min": 131072,
+              "max": 262143,
+              "count": 0
+            },
+            {
+              "min": 262144,
+              "max": 524287,
+              "count": 1
+            },
+            {
+              "min": 524288,
+              "max": 1048575,
+              "count": 3
+            }
+          ]
+        },
+        "@runqueue_ns": {
+          "2705572": 119085403
+        },
+        "@runqueue_samples": {
+          "2705572": 8319
+        },
+        "@runqueue_us": {
+          "2705572": [
+            {
+              "min": 0,
+              "max": 0,
+              "count": 7492
+            },
+            {
+              "min": 1,
+              "max": 1,
+              "count": 474
+            },
+            {
+              "min": 2,
+              "max": 3,
+              "count": 27
+            },
+            {
+              "min": 4,
+              "max": 7,
+              "count": 85
+            },
+            {
+              "min": 8,
+              "max": 15,
+              "count": 154
+            },
+            {
+              "min": 16,
+              "max": 31,
+              "count": 58
+            },
+            {
+              "min": 32,
+              "max": 63,
+              "count": 4
+            },
+            {
+              "min": 64,
+              "max": 127,
+              "count": 6
+            },
+            {
+              "min": 128,
+              "max": 255,
+              "count": 6
+            },
+            {
+              "min": 256,
+              "max": 511,
+              "count": 7
+            },
+            {
+              "min": 512,
+              "max": 1023,
+              "count": 5
+            },
+            {
+              "min": 1024,
+              "max": 2047,
+              "count": 0
+            },
+            {
+              "min": 2048,
+              "max": 4095,
+              "count": 0
+            },
+            {
+              "min": 4096,
+              "max": 8191,
+              "count": 0
+            },
+            {
+              "min": 8192,
+              "max": 16383,
+              "count": 0
+            },
+            {
+              "min": 16384,
+              "max": 32767,
+              "count": 0
+            },
+            {
+              "min": 32768,
+              "max": 65535,
+              "count": 0
+            },
+            {
+              "min": 65536,
+              "max": 131071,
+              "count": 1
+            }
+          ]
+        },
+        "@send_cwnd": {
+          "2705572": [
+            {
+              "min": 2,
+              "max": 3,
+              "count": 10336
+            },
+            {
+              "min": 4,
+              "max": 7,
+              "count": 225437
+            },
+            {
+              "min": 8,
+              "max": 15,
+              "count": 824109
+            }
+          ]
+        },
+        "@send_flags": {
+          "2705572,49216": 62346,
+          "2705572,134217792": 62346,
+          "2705572,134250560": 935190
+        },
+        "@send_notsent": {
+          "2705572": [
+            {
+              "min": 0,
+              "max": 0,
+              "count": 62397
+            },
+            {
+              "min": 1,
+              "max": 1,
+              "count": 0
+            },
+            {
+              "min": 2,
+              "max": 3,
+              "count": 0
+            },
+            {
+              "min": 4,
+              "max": 7,
+              "count": 0
+            },
+            {
+              "min": 8,
+              "max": 15,
+              "count": 0
+            },
+            {
+              "min": 16,
+              "max": 31,
+              "count": 0
+            },
+            {
+              "min": 32,
+              "max": 63,
+              "count": 1
+            },
+            {
+              "min": 64,
+              "max": 127,
+              "count": 0
+            },
+            {
+              "min": 128,
+              "max": 255,
+              "count": 0
+            },
+            {
+              "min": 256,
+              "max": 511,
+              "count": 0
+            },
+            {
+              "min": 512,
+              "max": 1023,
+              "count": 1
+            },
+            {
+              "min": 1024,
+              "max": 2047,
+              "count": 0
+            },
+            {
+              "min": 2048,
+              "max": 4095,
+              "count": 7
+            },
+            {
+              "min": 4096,
+              "max": 8191,
+              "count": 0
+            },
+            {
+              "min": 8192,
+              "max": 16383,
+              "count": 28017
+            },
+            {
+              "min": 16384,
+              "max": 32767,
+              "count": 110953
+            },
+            {
+              "min": 32768,
+              "max": 65535,
+              "count": 48556
+            },
+            {
+              "min": 65536,
+              "max": 131071,
+              "count": 62347
+            },
+            {
+              "min": 131072,
+              "max": 262143,
+              "count": 124693
+            },
+            {
+              "min": 262144,
+              "max": 524287,
+              "count": 249389
+            },
+            {
+              "min": 524288,
+              "max": 1048575,
+              "count": 373521
+            }
+          ]
+        },
+        "@send_packets_out": {
+          "2705572": [
+            {
+              "min": 0,
+              "max": 0,
+              "count": 124714
+            },
+            {
+              "min": 1,
+              "max": 1,
+              "count": 62382
+            },
+            {
+              "min": 2,
+              "max": 3,
+              "count": 872786
+            }
+          ]
+        },
+        "@send_peer_window": {
+          "2705572": [
+            {
+              "min": 0,
+              "max": 0,
+              "count": 8
+            },
+            {
+              "min": 1,
+              "max": 1,
+              "count": 0
+            },
+            {
+              "min": 2,
+              "max": 3,
+              "count": 0
+            },
+            {
+              "min": 4,
+              "max": 7,
+              "count": 0
+            },
+            {
+              "min": 8,
+              "max": 15,
+              "count": 0
+            },
+            {
+              "min": 16,
+              "max": 31,
+              "count": 0
+            },
+            {
+              "min": 32,
+              "max": 63,
+              "count": 0
+            },
+            {
+              "min": 64,
+              "max": 127,
+              "count": 0
+            },
+            {
+              "min": 128,
+              "max": 255,
+              "count": 0
+            },
+            {
+              "min": 256,
+              "max": 511,
+              "count": 0
+            },
+            {
+              "min": 512,
+              "max": 1023,
+              "count": 0
+            },
+            {
+              "min": 1024,
+              "max": 2047,
+              "count": 0
+            },
+            {
+              "min": 2048,
+              "max": 4095,
+              "count": 3
+            },
+            {
+              "min": 4096,
+              "max": 8191,
+              "count": 0
+            },
+            {
+              "min": 8192,
+              "max": 16383,
+              "count": 0
+            },
+            {
+              "min": 16384,
+              "max": 32767,
+              "count": 0
+            },
+            {
+              "min": 32768,
+              "max": 65535,
+              "count": 26
+            },
+            {
+              "min": 65536,
+              "max": 131071,
+              "count": 826251
+            },
+            {
+              "min": 131072,
+              "max": 262143,
+              "count": 233594
+            }
+          ]
+        },
+        "@send_queued_memory": {
+          "2705572": [
+            {
+              "min": 0,
+              "max": 0,
+              "count": 62349
+            },
+            {
+              "min": 1,
+              "max": 1,
+              "count": 0
+            },
+            {
+              "min": 2,
+              "max": 3,
+              "count": 0
+            },
+            {
+              "min": 4,
+              "max": 7,
+              "count": 0
+            },
+            {
+              "min": 8,
+              "max": 15,
+              "count": 0
+            },
+            {
+              "min": 16,
+              "max": 31,
+              "count": 0
+            },
+            {
+              "min": 32,
+              "max": 63,
+              "count": 0
+            },
+            {
+              "min": 64,
+              "max": 127,
+              "count": 0
+            },
+            {
+              "min": 128,
+              "max": 255,
+              "count": 0
+            },
+            {
+              "min": 256,
+              "max": 511,
+              "count": 0
+            },
+            {
+              "min": 512,
+              "max": 1023,
+              "count": 0
+            },
+            {
+              "min": 1024,
+              "max": 2047,
+              "count": 0
+            },
+            {
+              "min": 2048,
+              "max": 4095,
+              "count": 0
+            },
+            {
+              "min": 4096,
+              "max": 8191,
+              "count": 0
+            },
+            {
+              "min": 8192,
+              "max": 16383,
+              "count": 1
+            },
+            {
+              "min": 16384,
+              "max": 32767,
+              "count": 62353
+            },
+            {
+              "min": 32768,
+              "max": 65535,
+              "count": 40
+            },
+            {
+              "min": 65536,
+              "max": 131071,
+              "count": 62360
+            },
+            {
+              "min": 131072,
+              "max": 262143,
+              "count": 124693
+            },
+            {
+              "min": 262144,
+              "max": 524287,
+              "count": 249392
+            },
+            {
+              "min": 524288,
+              "max": 1048575,
+              "count": 498694
+            }
+          ]
+        },
+        "@send_socket_buffer": {
+          "2705572": [
+            {
+              "min": 2097152,
+              "max": 4194303,
+              "count": 1059882
+            }
+          ]
+        },
+        "@tcp_calls": {
+          "2705572,1,0": 19,
+          "2705572,1,1": 62391,
+          "2705572,2,1": 1059882
+        },
+        "@tcp_completed_calls": {
+          "2705572,1,0": 19,
+          "2705572,1,1": 62391,
+          "2705572,2,1": 1059882
+        },
+        "@tcp_elapsed_ns": {
+          "2705572,1,0": 8267,
+          "2705572,1,1": 63168161,
+          "2705572,2,1": 1906060149
+        },
+        "@tcp_errors": {
+          "2705572,1,0,-104": 19,
+          "2705572,1,1,-11": 31
+        },
+        "@tcp_latency_us": {
+          "2705572,1,0": [
+            {
+              "min": 0,
+              "max": 0,
+              "count": 18
+            },
+            {
+              "min": 1,
+              "max": 1,
+              "count": 0
+            },
+            {
+              "min": 2,
+              "max": 3,
+              "count": 1
+            }
+          ],
+          "2705572,1,1": [
+            {
+              "min": 0,
+              "max": 0,
+              "count": 43410
+            },
+            {
+              "min": 1,
+              "max": 1,
+              "count": 18653
+            },
+            {
+              "min": 2,
+              "max": 3,
+              "count": 166
+            },
+            {
+              "min": 4,
+              "max": 7,
+              "count": 23
+            },
+            {
+              "min": 8,
+              "max": 15,
+              "count": 91
+            },
+            {
+              "min": 16,
+              "max": 31,
+              "count": 48
+            }
+          ],
+          "2705572,2,1": [
+            {
+              "min": 0,
+              "max": 0,
+              "count": 380654
+            },
+            {
+              "min": 1,
+              "max": 1,
+              "count": 507025
+            },
+            {
+              "min": 2,
+              "max": 3,
+              "count": 49145
+            },
+            {
+              "min": 4,
+              "max": 7,
+              "count": 105314
+            },
+            {
+              "min": 8,
+              "max": 15,
+              "count": 12768
+            },
+            {
+              "min": 16,
+              "max": 31,
+              "count": 4653
+            },
+            {
+              "min": 32,
+              "max": 63,
+              "count": 322
+            },
+            {
+              "min": 64,
+              "max": 127,
+              "count": 1
+            }
+          ]
+        },
+        "@tcp_requested_bytes": {
+          "2705572,1,0": 77824,
+          "2705572,1,1": 255553536,
+          "2705572,2,1": 65381315010
+        },
+        "@tcp_returned_bytes": {
+          "2705572,1,1": 2867916,
+          "2705572,2,1": 65381315010
+        },
+        "@tcp_zero_returns": {
+          "2705572,1,1": 14
+        }
+      },
+      "loss_or_errors": [],
+      "ready": true,
+      "ended": true,
+      "stdout_diagnostics": [],
+      "tcp": [
+        {
+          "pid": 2705572,
+          "direction": "recv",
+          "side": "downstream",
+          "completed_calls": 62391,
+          "returned_bytes": 2867916,
+          "inclusive_elapsed_ns": 63168161,
+          "mean_elapsed_us": 1.0124562997868283
+        },
+        {
+          "pid": 2705572,
+          "direction": "send",
+          "side": "downstream",
+          "completed_calls": 1059882,
+          "returned_bytes": 65381315010,
+          "inclusive_elapsed_ns": 1906060149,
+          "mean_elapsed_us": 1.798370147808907
+        },
+        {
+          "pid": 2705572,
+          "direction": "recv",
+          "side": "other",
+          "completed_calls": 19,
+          "returned_bytes": 0,
+          "inclusive_elapsed_ns": 8267,
+          "mean_elapsed_us": 0.4351052631578947
+        }
+      ]
+    },
+    "kernel_stack_sample_count": 363,
+    "raw_trace_directory": "/tmp/rut-bounded-followup-20260928/ebpf-static-push-r1/1048576-c32-keepalive-rut-base/trace"
+  },
+  "1048576-c32-keepalive-rut-push": {
+    "status": {
+      "completed": true,
+      "usable": true,
+      "mode": "trace",
+      "kernel": "6.19.10-300.fc44.x86_64",
+      "machine": "x86_64",
+      "groups": [
+        "fault",
+        "rx-copy",
+        "sched",
+        "stacks",
+        "tcp"
+      ],
+      "duration_seconds": 12,
+      "front_port": 8987,
+      "origin_port": 9987,
+      "started_at": 1790627556.0401063,
+      "program_sha256": "19dd92f19773419be6f2ee2c007d8657d1aa9333bc2a72ede828c2c5aea3229c",
+      "targets_before": [
+        {
+          "pid": 2705773,
+          "start_ticks": 91348407,
+          "state": "S",
+          "comm": "rut-file-header",
+          "exe": "/tmp/rut-bounded-followup-20260928/ebpf-tools/rut-file-header-push"
+        }
+      ],
+      "bpftrace_version": "bpftrace v0.27.0",
+      "command": [
+        "/tmp/rut-bounded-followup-20260928/ebpf-tools/bpftrace-container.py",
+        "-f",
+        "json",
+        "-B",
+        "line",
+        "/tmp/rut-bounded-followup-20260928/ebpf-static-push-r1/1048576-c32-keepalive-rut-push/trace/program.bt"
+      ],
+      "returncode": 0,
+      "targets_after": [
+        {
+          "pid": 2705773,
+          "start_ticks": 91348407,
+          "state": "S",
+          "comm": "rut-file-header",
+          "exe": "/tmp/rut-bounded-followup-20260928/ebpf-tools/rut-file-header-push"
+        }
+      ],
+      "targets_unchanged": true,
+      "diagnostic_warnings": false,
+      "finished_at": 1790627570.289222
+    },
+    "summary": {
+      "maps": {
+        "@copy_calls": {
+          "2705773,1,1": 72582
+        },
+        "@copy_elapsed_ns": {
+          "2705773,1,1": 22190341
+        },
+        "@copy_latency_us": {
+          "2705773,1,1": [
+            {
+              "min": 0,
+              "max": 0,
+              "count": 72523
+            },
+            {
+              "min": 1,
+              "max": 1,
+              "count": 2
+            },
+            {
+              "min": 2,
+              "max": 3,
+              "count": 24
+            },
+            {
+              "min": 4,
+              "max": 7,
+              "count": 1
+            },
+            {
+              "min": 8,
+              "max": 15,
+              "count": 16
+            },
+            {
+              "min": 16,
+              "max": 31,
+              "count": 16
+            }
+          ]
+        },
+        "@copy_success_bytes": {
+          "2705773,1,1": 3338772
+        },
+        "@offcpu_ns": {
+          "2705773": 18381080078
+        },
+        "@offcpu_samples": {
+          "2705773": 14489
+        },
+        "@offcpu_us": {
+          "2705773": [
+            {
+              "min": 2,
+              "max": 3,
+              "count": 147
+            },
+            {
+              "min": 4,
+              "max": 7,
+              "count": 197
+            },
+            {
+              "min": 8,
+              "max": 15,
+              "count": 289
+            },
+            {
+              "min": 16,
+              "max": 31,
+              "count": 613
+            },
+            {
+              "min": 32,
+              "max": 63,
+              "count": 1194
+            },
+            {
+              "min": 64,
+              "max": 127,
+              "count": 2508
+            },
+            {
+              "min": 128,
+              "max": 255,
+              "count": 4175
+            },
+            {
+              "min": 256,
+              "max": 511,
+              "count": 4480
+            },
+            {
+              "min": 512,
+              "max": 1023,
+              "count": 758
+            },
+            {
+              "min": 1024,
+              "max": 2047,
+              "count": 6
+            },
+            {
+              "min": 2048,
+              "max": 4095,
+              "count": 0
+            },
+            {
+              "min": 4096,
+              "max": 8191,
+              "count": 0
+            },
+            {
+              "min": 8192,
+              "max": 16383,
+              "count": 0
+            },
+            {
+              "min": 16384,
+              "max": 32767,
+              "count": 0
+            },
+            {
+              "min": 32768,
+              "max": 65535,
+              "count": 0
+            },
+            {
+              "min": 65536,
+              "max": 131071,
+              "count": 118
+            },
+            {
+              "min": 131072,
+              "max": 262143,
+              "count": 0
+            },
+            {
+              "min": 262144,
+              "max": 524287,
+              "count": 1
+            },
+            {
+              "min": 524288,
+              "max": 1048575,
+              "count": 3
+            }
+          ]
+        },
+        "@runqueue_ns": {
+          "2705773": 33034583
+        },
+        "@runqueue_samples": {
+          "2705773": 14491
+        },
+        "@runqueue_us": {
+          "2705773": [
+            {
+              "min": 0,
+              "max": 0,
+              "count": 12056
+            },
+            {
+              "min": 1,
+              "max": 1,
+              "count": 1786
+            },
+            {
+              "min": 2,
+              "max": 3,
+              "count": 60
+            },
+            {
+              "min": 4,
+              "max": 7,
+              "count": 131
+            },
+            {
+              "min": 8,
+              "max": 15,
+              "count": 189
+            },
+            {
+              "min": 16,
+              "max": 31,
+              "count": 218
+            },
+            {
+              "min": 32,
+              "max": 63,
+              "count": 14
+            },
+            {
+              "min": 64,
+              "max": 127,
+              "count": 8
+            },
+            {
+              "min": 128,
+              "max": 255,
+              "count": 7
+            },
+            {
+              "min": 256,
+              "max": 511,
+              "count": 15
+            },
+            {
+              "min": 512,
+              "max": 1023,
+              "count": 6
+            },
+            {
+              "min": 1024,
+              "max": 2047,
+              "count": 1
+            }
+          ]
+        },
+        "@send_cwnd": {
+          "2705773": [
+            {
+              "min": 4,
+              "max": 7,
+              "count": 33201
+            },
+            {
+              "min": 8,
+              "max": 15,
+              "count": 1158618
+            },
+            {
+              "min": 16,
+              "max": 31,
+              "count": 42075
+            }
+          ]
+        },
+        "@send_flags": {
+          "2705773,134217792": 72582,
+          "2705773,16448": 72582,
+          "2705773,134250560": 1088730
+        },
+        "@send_notsent": {
+          "2705773": [
+            {
+              "min": 0,
+              "max": 0,
+              "count": 145218
+            },
+            {
+              "min": 1,
+              "max": 1,
+              "count": 0
+            },
+            {
+              "min": 2,
+              "max": 3,
+              "count": 0
+            },
+            {
+              "min": 4,
+              "max": 7,
+              "count": 0
+            },
+            {
+              "min": 8,
+              "max": 15,
+              "count": 0
+            },
+            {
+              "min": 16,
+              "max": 31,
+              "count": 0
+            },
+            {
+              "min": 32,
+              "max": 63,
+              "count": 21
+            },
+            {
+              "min": 64,
+              "max": 127,
+              "count": 18
+            },
+            {
+              "min": 128,
+              "max": 255,
+              "count": 8
+            },
+            {
+              "min": 256,
+              "max": 511,
+              "count": 1
+            },
+            {
+              "min": 512,
+              "max": 1023,
+              "count": 0
+            },
+            {
+              "min": 1024,
+              "max": 2047,
+              "count": 0
+            },
+            {
+              "min": 2048,
+              "max": 4095,
+              "count": 0
+            },
+            {
+              "min": 4096,
+              "max": 8191,
+              "count": 51
+            },
+            {
+              "min": 8192,
+              "max": 16383,
+              "count": 14
+            },
+            {
+              "min": 16384,
+              "max": 32767,
+              "count": 2
+            },
+            {
+              "min": 32768,
+              "max": 65535,
+              "count": 307083
+            },
+            {
+              "min": 65536,
+              "max": 131071,
+              "count": 72583
+            },
+            {
+              "min": 131072,
+              "max": 262143,
+              "count": 145168
+            },
+            {
+              "min": 262144,
+              "max": 524287,
+              "count": 290335
+            },
+            {
+              "min": 524288,
+              "max": 1048575,
+              "count": 273392
+            }
+          ]
+        },
+        "@send_packets_out": {
+          "2705773": [
+            {
+              "min": 0,
+              "max": 0,
+              "count": 72646
+            },
+            {
+              "min": 1,
+              "max": 1,
+              "count": 145529
+            },
+            {
+              "min": 2,
+              "max": 3,
+              "count": 505884
+            },
+            {
+              "min": 4,
+              "max": 7,
+              "count": 509835
+            }
+          ]
+        },
+        "@send_peer_window": {
+          "2705773": [
+            {
+              "min": 0,
+              "max": 0,
+              "count": 2
+            },
+            {
+              "min": 1,
+              "max": 1,
+              "count": 0
+            },
+            {
+              "min": 2,
+              "max": 3,
+              "count": 0
+            },
+            {
+              "min": 4,
+              "max": 7,
+              "count": 0
+            },
+            {
+              "min": 8,
+              "max": 15,
+              "count": 0
+            },
+            {
+              "min": 16,
+              "max": 31,
+              "count": 0
+            },
+            {
+              "min": 32,
+              "max": 63,
+              "count": 0
+            },
+            {
+              "min": 64,
+              "max": 127,
+              "count": 0
+            },
+            {
+              "min": 128,
+              "max": 255,
+              "count": 0
+            },
+            {
+              "min": 256,
+              "max": 511,
+              "count": 0
+            },
+            {
+              "min": 512,
+              "max": 1023,
+              "count": 0
+            },
+            {
+              "min": 1024,
+              "max": 2047,
+              "count": 0
+            },
+            {
+              "min": 2048,
+              "max": 4095,
+              "count": 0
+            },
+            {
+              "min": 4096,
+              "max": 8191,
+              "count": 0
+            },
+            {
+              "min": 8192,
+              "max": 16383,
+              "count": 0
+            },
+            {
+              "min": 16384,
+              "max": 32767,
+              "count": 0
+            },
+            {
+              "min": 32768,
+              "max": 65535,
+              "count": 270
+            },
+            {
+              "min": 65536,
+              "max": 131071,
+              "count": 1193
+            },
+            {
+              "min": 131072,
+              "max": 262143,
+              "count": 510173
+            },
+            {
+              "min": 262144,
+              "max": 524287,
+              "count": 722256
+            }
+          ]
+        },
+        "@send_queued_memory": {
+          "2705773": [
+            {
+              "min": 0,
+              "max": 0,
+              "count": 72632
+            },
+            {
+              "min": 1,
+              "max": 1,
+              "count": 0
+            },
+            {
+              "min": 2,
+              "max": 3,
+              "count": 0
+            },
+            {
+              "min": 4,
+              "max": 7,
+              "count": 0
+            },
+            {
+              "min": 8,
+              "max": 15,
+              "count": 0
+            },
+            {
+              "min": 16,
+              "max": 31,
+              "count": 0
+            },
+            {
+              "min": 32,
+              "max": 63,
+              "count": 0
+            },
+            {
+              "min": 64,
+              "max": 127,
+              "count": 0
+            },
+            {
+              "min": 128,
+              "max": 255,
+              "count": 0
+            },
+            {
+              "min": 256,
+              "max": 511,
+              "count": 0
+            },
+            {
+              "min": 512,
+              "max": 1023,
+              "count": 1
+            },
+            {
+              "min": 1024,
+              "max": 2047,
+              "count": 0
+            },
+            {
+              "min": 2048,
+              "max": 4095,
+              "count": 0
+            },
+            {
+              "min": 4096,
+              "max": 8191,
+              "count": 0
+            },
+            {
+              "min": 8192,
+              "max": 16383,
+              "count": 18
+            },
+            {
+              "min": 16384,
+              "max": 32767,
+              "count": 72546
+            },
+            {
+              "min": 32768,
+              "max": 65535,
+              "count": 25
+            },
+            {
+              "min": 65536,
+              "max": 131071,
+              "count": 72604
+            },
+            {
+              "min": 131072,
+              "max": 262143,
+              "count": 145160
+            },
+            {
+              "min": 262144,
+              "max": 524287,
+              "count": 290324
+            },
+            {
+              "min": 524288,
+              "max": 1048575,
+              "count": 580584
+            }
+          ]
+        },
+        "@send_socket_buffer": {
+          "2705773": [
+            {
+              "min": 2097152,
+              "max": 4194303,
+              "count": 1233894
+            }
+          ]
+        },
+        "@tcp_calls": {
+          "2705773,1,0": 18,
+          "2705773,1,1": 72627,
+          "2705773,2,1": 1233894
+        },
+        "@tcp_completed_calls": {
+          "2705773,1,0": 18,
+          "2705773,1,1": 72627,
+          "2705773,2,1": 1233894
+        },
+        "@tcp_elapsed_ns": {
+          "2705773,1,0": 7515,
+          "2705773,1,1": 78744168,
+          "2705773,2,1": 2642977128
+        },
+        "@tcp_errors": {
+          "2705773,1,0,-104": 18,
+          "2705773,1,1,-11": 30
+        },
+        "@tcp_latency_us": {
+          "2705773,1,0": [
+            {
+              "min": 0,
+              "max": 0,
+              "count": 17
+            },
+            {
+              "min": 1,
+              "max": 1,
+              "count": 1
+            }
+          ],
+          "2705773,1,1": [
+            {
+              "min": 0,
+              "max": 0,
+              "count": 40654
+            },
+            {
+              "min": 1,
+              "max": 1,
+              "count": 30001
+            },
+            {
+              "min": 2,
+              "max": 3,
+              "count": 1818
+            },
+            {
+              "min": 4,
+              "max": 7,
+              "count": 43
+            },
+            {
+              "min": 8,
+              "max": 15,
+              "count": 32
+            },
+            {
+              "min": 16,
+              "max": 31,
+              "count": 79
+            }
+          ],
+          "2705773,2,1": [
+            {
+              "min": 0,
+              "max": 0,
+              "count": 634406
+            },
+            {
+              "min": 1,
+              "max": 1,
+              "count": 287943
+            },
+            {
+              "min": 2,
+              "max": 3,
+              "count": 91120
+            },
+            {
+              "min": 4,
+              "max": 7,
+              "count": 192143
+            },
+            {
+              "min": 8,
+              "max": 15,
+              "count": 18335
+            },
+            {
+              "min": 16,
+              "max": 31,
+              "count": 9392
+            },
+            {
+              "min": 32,
+              "max": 63,
+              "count": 554
+            },
+            {
+              "min": 64,
+              "max": 127,
+              "count": 1
+            }
+          ]
+        },
+        "@tcp_requested_bytes": {
+          "2705773,1,0": 73728,
+          "2705773,1,1": 297480192,
+          "2705773,2,1": 76115654670
+        },
+        "@tcp_returned_bytes": {
+          "2705773,1,1": 3338772,
+          "2705773,2,1": 76115654670
+        },
+        "@tcp_zero_returns": {
+          "2705773,1,1": 15
+        }
+      },
+      "loss_or_errors": [],
+      "ready": true,
+      "ended": true,
+      "stdout_diagnostics": [],
+      "tcp": [
+        {
+          "pid": 2705773,
+          "direction": "recv",
+          "side": "downstream",
+          "completed_calls": 72627,
+          "returned_bytes": 3338772,
+          "inclusive_elapsed_ns": 78744168,
+          "mean_elapsed_us": 1.08422718823578
+        },
+        {
+          "pid": 2705773,
+          "direction": "send",
+          "side": "downstream",
+          "completed_calls": 1233894,
+          "returned_bytes": 76115654670,
+          "inclusive_elapsed_ns": 2642977128,
+          "mean_elapsed_us": 2.141980695262316
+        },
+        {
+          "pid": 2705773,
+          "direction": "recv",
+          "side": "other",
+          "completed_calls": 18,
+          "returned_bytes": 0,
+          "inclusive_elapsed_ns": 7515,
+          "mean_elapsed_us": 0.4175
+        }
+      ]
+    },
+    "kernel_stack_sample_count": 490,
+    "raw_trace_directory": "/tmp/rut-bounded-followup-20260928/ebpf-static-push-r1/1048576-c32-keepalive-rut-push/trace"
+  }
+}
