@@ -104,6 +104,14 @@ class RoutingCorpusTests(unittest.TestCase):
             self.assertEqual(case["execution_modes"], ["local_static", "proxy"])
             self.assertEqual(case["static_response_bytes"], [0, 16, 1024, 65536])
 
+    def test_art_eligibility_uses_generated_routes_not_profile_features(self):
+        profile = corpus.PROFILE_BY_NAME["php_laravel"]
+        literal = corpus.case_for(profile, 1, corpus.Contract.SEGMENT_PREFIX, 1)
+        dynamic = corpus.case_for(profile, 4, corpus.Contract.SEGMENT_PREFIX, 1)
+        self.assertIn("parameters", profile.features)
+        self.assertEqual(literal["candidate_constraints"]["art"], "segment_prefix_mode")
+        self.assertEqual(dynamic["candidate_constraints"]["art"], "ineligible_parameters")
+
     def test_stress_capacity_is_explicit(self):
         case = corpus.case_for(corpus.PROFILE_BY_NAME["internet_gateway"], 512,
                                corpus.Contract.SEGMENT_PREFIX, 1)
@@ -151,7 +159,9 @@ class ComparisonGateTests(unittest.TestCase):
 
     def test_skip_wrong_input_and_no_probes_fail(self):
         for changes in ({"state": "skipped"}, {"case_sha256": "wrong"},
-                        {"asserted_probes": 0}, {"asserted_probes": 9}, {"failed_probes": 1},
+                        {"asserted_probes": 0}, {"asserted_probes": 9},
+                        {"failed_probes": 1}, {"failed_probes": False},
+                        {"failed_probes": 0.0}, {"failed_probes": None},
                         {"upstream_evidence_sha256": ""}):
             rows = self.evidence()
             rows[0].update(changes)

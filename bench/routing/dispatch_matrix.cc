@@ -4,9 +4,9 @@
 #include "rut/runtime/route_art.h"
 #include "rut/runtime/route_select.h"
 #include "rut/runtime/route_trie.h"
-#include <cstdio>
-#include <cstring>
 
+#include <stdio.h>
+#include <string.h>
 #include <time.h>
 using namespace rut;
 namespace {

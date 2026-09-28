@@ -94,8 +94,9 @@ def validate(matrix, results):
             if not isinstance(row.get(field), str) or not row[field].strip():
                 errors.append(f"missing provenance {field}: {key}")
         checked = row.get("asserted_probes", 0)
+        failed = row.get("failed_probes")
         if (type(checked) is not int or checked != required["required_asserted_probes"]
-                or checked <= 0 or row.get("failed_probes") != 0):
+                or checked <= 0 or type(failed) is not int or failed != 0):
             errors.append(f"no successful correctness evidence: {key}")
         if required["engine"] == Engine.LINKERD:
             for field in ("control_plane_digest", "route_status_evidence_sha256", "topology"):

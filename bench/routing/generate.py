@@ -251,6 +251,7 @@ def case_for(profile, count, contract, seed):
     }
     if misses:
         traces["miss_only"] = [rng.choice(misses) for _ in range(1024)]
+    has_parameters = any(part.startswith(":") for route in routes for part in parts(route["path"]))
     return {
         "name": profile.name, "description": profile.description,
         "provenance": "synthetic", "sources": profile.sources, "features": profile.features,
@@ -260,7 +261,7 @@ def case_for(profile, count, contract, seed):
         "static_response_bytes": [0, 16, 1024, 65536] if profile.name in ("root_only", "tiny_static") else [],
         "rut_route_capacity": "within_128" if count <= 128 else "exceeds_128",
         "candidate_constraints": {
-            "art": ("ineligible_parameters" if "parameters" in profile.features else
+            "art": ("ineligible_parameters" if has_parameters else
                     "requires_exact_terminal_guard" if contract == Contract.EXACT else
                     "segment_prefix_mode"),
             "exact_hash": "requires_exact_contract_and_no_parameters",
