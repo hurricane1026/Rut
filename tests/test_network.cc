@@ -36612,6 +36612,45 @@ struct ScopedIoUringLoopForRetirement {
     }
 };
 
+TEST(iouring_byte_buffers, dirty_connection_reuse_resets_valid_lengths) {
+    ScopedIoUringLoopForRetirement guard;
+    if (!guard.init()) SKIP("io_uring unavailable");
+    auto* loop = guard.loop;
+    Connection* first = loop->alloc_conn();
+    REQUIRE(first != nullptr);
+    __builtin_memset(first->recv_slice, 0xa5, SlicePool::kSliceSize);
+    __builtin_memset(first->send_slice, 0xa5, SlicePool::kSliceSize);
+    first->recv_buf.commit(7);
+    first->send_buf.commit(9);
+    loop->free_conn(*first);
+    Connection* next = loop->alloc_conn();
+    REQUIRE(next != nullptr);
+    CHECK_EQ(next->recv_buf.len(), 0u);
+    CHECK_EQ(next->send_buf.len(), 0u);
+    CHECK_EQ(next->recv_slice[100], 0xa5u);
+    CHECK_EQ(next->send_slice[100], 0xa5u);
+    static constexpr u8 request[] = "GET / HTTP/1.1\r\nHost: example\r\n\r\n";
+    REQUIRE_EQ(next->recv_buf.write(request, sizeof(request) - 1u), sizeof(request) - 1u);
+    ParsedRequest parsed;
+    HttpParser parser;
+    parser.reset();
+    parsed.reset();
+    CHECK_EQ(parser.parse(next->recv_buf.data(), next->recv_buf.len(), &parsed),
+             ParseStatus::Complete);
+    CHECK_EQ(parser.header_end, sizeof(request) - 1u);
+    CHECK_EQ(parsed.header_count, 1u);
+    loop->free_conn(*next);
+    // A declared TLS listener keeps ordinary zero-filled request/send leases.
+    loop->listener_context.transport = ListenerTransport::Tls;
+    Connection* tls = loop->alloc_conn();
+    REQUIRE(tls != nullptr);
+    for (u32 i = 0; i < SlicePool::kSliceSize; ++i) {
+        CHECK_EQ(tls->recv_slice[i], 0u);
+        CHECK_EQ(tls->send_slice[i], 0u);
+    }
+    loop->free_conn(*tls);
+}
+
 TEST(iouring_local_body_epoch, close_defers_leave_until_send_slot_reclaims) {
     ScopedIoUringLoopForRetirement guard;
     if (!guard.init()) SKIP("io_uring unavailable");
@@ -40610,8 +40649,8 @@ bool stage_live_precise_request(IoUringEventLoop* loop,
     const u8* request = bodyless_get ? (downstream_close ? kGetCloseRequest : kGetKeepAliveRequest)
                         : downstream_close ? kCloseRequest
                                            : kKeepAliveRequest;
-    const u32 request_len = bodyless_get       ? (downstream_close ? sizeof(kGetCloseRequest) - 1u
-                                                                   : sizeof(kGetKeepAliveRequest) - 1u)
+    const u32 request_len = bodyless_get ? (downstream_close ? sizeof(kGetCloseRequest) - 1u
+                                                             : sizeof(kGetKeepAliveRequest) - 1u)
                             : downstream_close ? sizeof(kCloseRequest) - 1u
                                                : sizeof(kKeepAliveRequest) - 1u;
     if (conn->recv_buf.write(request, request_len) != request_len) return fail();
@@ -63189,15 +63228,15 @@ TEST(response_buffering_runtime, body_slices_remain_owned_until_deferred_send_re
         loop->free_conn_impl(*conn);
         if (pending) {
             CHECK_EQ(loop->free_top, free_before);
-            CHECK_EQ(loop->pool.in_use_map[index], 1u);
+            CHECK_EQ(loop->pool.in_use_map[index] & 1u, 1u);
             CHECK_EQ(loop->conns[id].response_body_tail.data(), bytes);
             CHECK_EQ(memcmp(bytes, body, sizeof(body)), 0);
             loop->reclaim_pending();
-            CHECK_EQ(loop->pool.in_use_map[index], 1u);
+            CHECK_EQ(loop->pool.in_use_map[index] & 1u, 1u);
             loop->conns[id].pending_ops = 0;
             loop->reclaim_pending();
         }
-        CHECK_EQ(loop->pool.in_use_map[index], 0u);
+        CHECK_EQ(loop->pool.in_use_map[index] & 1u, 0u);
         CHECK_EQ(loop->conns[id].response_body_tail.size, 0u);
         CHECK_EQ(loop->free_top, free_before + 1u);
         loop->reclaim_pending();

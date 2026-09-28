@@ -102,6 +102,10 @@
     "ebpf-tools/rut-connection-uninit": {
       "sha256": "ada2683eb139733fd07da12688489e47d3c204bfc6035be4f393fcb15c8fa0a5",
       "size": 19127184
+    },
+    "ebpf-tools/rut-small-poll-first": {
+      "sha256": "35c900750cc1829f628246fb9d5c904444a6e04aa3a9c76d9dc589889e74bee2",
+      "size": 19127184
     }
   },
   "bulk_first_commit": "83e5d8a1",

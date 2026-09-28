@@ -2678,7 +2678,7 @@ public:
     // never pay the cost. Returns false if SlicePool is exhausted.
     bool alloc_upstream_buf(ConnectionBase& c) {
         if (c.upstream_recv_slice) return true;  // already allocated
-        u8* s = pool.alloc();
+        u8* s = c.tls_active ? pool.alloc() : pool.alloc_uninitialized();
         if (!s) return false;
         c.upstream_recv_slice = s;
         c.upstream_recv_buf.bind(s, SlicePool::kSliceSize);
@@ -2687,7 +2687,7 @@ public:
 
     bool alloc_response_header_buf(ConnectionBase& c) {
         if (c.response_header_slice) return true;
-        u8* s = pool.alloc();
+        u8* s = c.tls_active ? pool.alloc() : pool.alloc_uninitialized();
         if (!s) return false;
         c.response_header_slice = s;
         c.response_header_buf.bind(s, SlicePool::kSliceSize);
@@ -2866,8 +2866,13 @@ public:
 
     Connection* alloc_conn_impl() {
         if (free_top == 0) return nullptr;
-        u8* rs = pool.alloc();
-        u8* ss = pool.alloc();
+        // These buffers publish only their bound valid lengths. Include both
+        // in dirty reuse so the shared pool does not merely move proxy buffer
+        // clearing to the following connection's allocation.
+        const bool uninitialized =
+            !tls_server && listener_context.transport == ListenerTransport::Cleartext;
+        u8* rs = uninitialized ? pool.alloc_uninitialized() : pool.alloc();
+        u8* ss = uninitialized ? pool.alloc_uninitialized() : pool.alloc();
         if (!rs || !ss) {
             if (rs) pool.free(rs);
             if (ss) pool.free(ss);

@@ -1075,3 +1075,77 @@ TEST(response_body_chain, dirty_bulk_append_replaces_metadata_and_bounds_payload
     CHECK_EQ(pool.bulk_available(), 1u);
     pool.destroy();
 }
+
+TEST(slice_pool, uninitialized_reuse_preserves_ordinary_zero_contract) {
+    SlicePool pool;
+    REQUIRE(pool.init(2, 0, 2, 0).has_value());
+    u8* dirty = pool.alloc_uninitialized();
+    REQUIRE(dirty != nullptr);
+    __builtin_memset(dirty, 0xa5, SlicePool::kSliceSize);
+    pool.free(dirty);
+    const u32 available = pool.available();
+    pool.free(dirty);  // dirty-free state is still free, not a live lease
+    CHECK_EQ(pool.available(), available);
+    u8* reused = pool.alloc_uninitialized();
+    REQUIRE(reused == dirty);
+    CHECK_EQ(reused[0], 0xa5u);
+    CHECK_EQ(reused[SlicePool::kSliceSize - 1], 0xa5u);
+    pool.free(reused);
+    u8* clean = pool.alloc();
+    REQUIRE(clean == dirty);
+    for (u32 i = 0; i < SlicePool::kSliceSize; ++i) CHECK_EQ(clean[i], 0u);
+    __builtin_memset(clean, 0x5a, SlicePool::kSliceSize);
+    pool.free(clean);
+    // Ordinary leases still clear on return, even for an uninitialized borrower.
+    reused = pool.alloc_uninitialized();
+    REQUIRE(reused == clean);
+    for (u32 i = 0; i < SlicePool::kSliceSize; ++i) CHECK_EQ(reused[i], 0u);
+    pool.free(reused);
+    pool.destroy();
+}
+
+TEST(slice_pool, uninitialized_discard_returns_clean_storage) {
+    SlicePool pool;
+    REQUIRE(pool.init(1, 0, 0, 0).has_value());
+    u8* dirty = pool.alloc_uninitialized();
+    REQUIRE(dirty != nullptr);
+    __builtin_memset(dirty, 0xa5, SlicePool::kSliceSize);
+    pool.free(dirty);
+    u8* clean = pool.alloc();
+    REQUIRE(clean == dirty);
+    for (u32 i = 0; i < SlicePool::kSliceSize; ++i) CHECK_EQ(clean[i], 0u);
+    pool.free(clean);
+    pool.destroy();
+}
+
+TEST(response_body_chain, dirty_ordinary_recv_publishes_only_committed_bytes) {
+    SlicePool pool;
+    REQUIRE(pool.init(1, 0, 1, 0).has_value());
+    u8* dirty = pool.alloc_uninitialized();
+    REQUIRE(dirty != nullptr);
+    __builtin_memset(dirty, 0xa5, SlicePool::kSliceSize);
+    pool.free(dirty);
+    ResponseBodyChain chain;
+    REQUIRE(chain.reserve_tail(pool));
+    CHECK_EQ(reinterpret_cast<u8*>(chain.head), dirty);
+    CHECK_EQ(chain.head->next, nullptr);
+    CHECK_EQ(chain.head->offset, 0u);
+    CHECK_EQ(chain.front_size(), 0u);
+    CHECK_EQ(chain.write_ptr(pool)[100], 0xa5u);
+    __builtin_memcpy(chain.write_ptr(pool), "abc", 3);
+    chain.commit(3);
+    CHECK_EQ(chain.front_size(), 3u);
+    CHECK_EQ(__builtin_memcmp(chain.data(), "abc", 3), 0);
+    chain.consume(3, true);
+    CHECK_EQ(chain.front_size(), 0u);
+    chain.write_ptr(pool)[0] = 'z';
+    chain.commit(1);
+    CHECK_EQ(chain.front_size(), 1u);
+    CHECK_EQ(chain.data()[0], static_cast<u8>('z'));
+    chain.release();
+    u8* clean = pool.alloc();
+    REQUIRE(clean != nullptr);
+    for (u32 i = 0; i < SlicePool::kSliceSize; ++i) CHECK_EQ(clean[i], 0u);
+    pool.free(clean);
+    pool.destroy();
+}

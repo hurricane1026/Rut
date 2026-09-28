@@ -591,3 +591,12 @@ All 12 coordinates have three valid five-second samples per engine, clean warmup
 | proxy-keepalive | 128 | 16691 | 22833 | 1.3680 |
 
 Proxy close c1 remains effectively tied; close c32/c128 and keepalive c1 still miss the target. These results do not establish the causal change against the previous Rut binary for static responses; the separate alternating static probe is queued. The POLL_FIRST prototype builds after this completed matrix and uses its own binary and evidence directory.
+
+The alternating static control confirms the connection-buffer change against the previous accepted Rut binary:
+
+| Case | Mean RPS change |
+|---|---:|
+| 16-c1-close | +7.47% |
+| 16-c32-close | -0.02% |
+
+Both c1 candidate samples exceed both baseline samples. At c32 user CPU drops but throughput is flat. Retain the explicit uninitialized network-buffer leases based on the c1 static gain, the positive proxy c32 controls, the passing full tests, and formal nginx comparisons. The ordinary allocator still returns zero-filled memory, and dirty leases remain bounded by the existing cache budget and completion ownership. This is not across-matrix acceptance. POLL_FIRST remains a separate pending prototype.
