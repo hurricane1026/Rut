@@ -699,3 +699,16 @@ Two alternating 6-second samples per engine, body preflight and warmup/load chec
 | 1m-c32-keepalive | -2.57% |
 
 The c1 baseline was bimodal (5463.5 and 4686.0 RPS), while the candidate was around 5510–5523 RPS. This does not establish a stable c1 gain; c32 keepalive regressed. The prototype was reverted without a full network test run. No acceptance claim.
+
+## Sampled client receive SKB geometry
+
+Accepted runtime versus pinned nginx, HTTP 1 MiB static keepalive. Four traces passed target identity and diagnostic checks; preflight bodies and warm/load error checks passed. Approximately 1/64 helper entries are sampled. Instrumented throughput is not acceptance evidence.
+
+| Case | Samples | One fragment | 16+ fragments |
+|---|---:|---:|---:|
+| 1048576-c1-keepalive-nginx | 120211 | 2.10% | 97.90% |
+| 1048576-c1-keepalive-rut | 158008 | 7.81% | 86.97% |
+| 1048576-c32-keepalive-nginx | 267811 | 2.10% | 97.90% |
+| 1048576-c32-keepalive-rut | 269850 | 1.41% | 93.00% |
+
+These are call-weighted observations of whole SKBs at copy-helper entry, not bytes-weighted distributions or the number of fragments traversed by each partial copy. Both engines predominantly present SKBs with 16+ fragments; this does not support a simple explanation that Rut alone suffers highly fragmented receive buffers. Differences in smaller SKBs remain correlational. No page-size or kernel setting was changed. The first diagnostic run was rejected for a signed division warning; the corrected run has no diagnostic warnings.

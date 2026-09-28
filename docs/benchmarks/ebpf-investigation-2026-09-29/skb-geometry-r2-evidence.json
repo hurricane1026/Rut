@@ -1,0 +1,8 @@
+{
+  "source": "/tmp/rut-bounded-followup-20260928/ebpf-skb-geometry-r2",
+  "sha256": "1777f7b6362ae2b7ae0ba702d5e19561ada110497eeedf2197912ee33be0db4c",
+  "sampling": "approximately 1/64 skb_copy_datagram_iter entries",
+  "baseline_binary": "rut-small-poll-first",
+  "failed_prior_run": "/tmp/rut-bounded-followup-20260928/ebpf-skb-geometry-r1",
+  "prior_failure": "signed division warning; unusable; fixed with explicit uint64 cast"
+}

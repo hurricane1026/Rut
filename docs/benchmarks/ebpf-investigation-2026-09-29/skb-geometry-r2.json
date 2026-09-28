@@ -1,0 +1,142 @@
+[
+  {
+    "case": "1048576-c1-keepalive-nginx",
+    "usable": true,
+    "client_pid": 2752079,
+    "samples": 120211,
+    "fragment_histogram": [
+      {
+        "min": 1,
+        "max": 1,
+        "count": 2529
+      },
+      {
+        "min": 2,
+        "max": 3,
+        "count": 0
+      },
+      {
+        "min": 4,
+        "max": 7,
+        "count": 0
+      },
+      {
+        "min": 8,
+        "max": 15,
+        "count": 0
+      },
+      {
+        "min": 16,
+        "max": 31,
+        "count": 117682
+      }
+    ],
+    "single_fragment_percent": 2.103800816896956,
+    "sixteen_or_more_percent": 97.89619918310305
+  },
+  {
+    "case": "1048576-c1-keepalive-rut",
+    "usable": true,
+    "client_pid": 2752395,
+    "samples": 158008,
+    "fragment_histogram": [
+      {
+        "min": 1,
+        "max": 1,
+        "count": 12347
+      },
+      {
+        "min": 2,
+        "max": 3,
+        "count": 0
+      },
+      {
+        "min": 4,
+        "max": 7,
+        "count": 0
+      },
+      {
+        "min": 8,
+        "max": 15,
+        "count": 8240
+      },
+      {
+        "min": 16,
+        "max": 31,
+        "count": 137421
+      }
+    ],
+    "single_fragment_percent": 7.814161308288188,
+    "sixteen_or_more_percent": 86.97091286517139
+  },
+  {
+    "case": "1048576-c32-keepalive-nginx",
+    "usable": true,
+    "client_pid": 2752830,
+    "samples": 267811,
+    "fragment_histogram": [
+      {
+        "min": 1,
+        "max": 1,
+        "count": 5621
+      },
+      {
+        "min": 2,
+        "max": 3,
+        "count": 0
+      },
+      {
+        "min": 4,
+        "max": 7,
+        "count": 10
+      },
+      {
+        "min": 8,
+        "max": 15,
+        "count": 0
+      },
+      {
+        "min": 16,
+        "max": 31,
+        "count": 262180
+      }
+    ],
+    "single_fragment_percent": 2.098868231700714,
+    "sixteen_or_more_percent": 97.89739779172625
+  },
+  {
+    "case": "1048576-c32-keepalive-rut",
+    "usable": true,
+    "client_pid": 2753057,
+    "samples": 269850,
+    "fragment_histogram": [
+      {
+        "min": 1,
+        "max": 1,
+        "count": 3798
+      },
+      {
+        "min": 2,
+        "max": 3,
+        "count": 0
+      },
+      {
+        "min": 4,
+        "max": 7,
+        "count": 0
+      },
+      {
+        "min": 8,
+        "max": 15,
+        "count": 15085
+      },
+      {
+        "min": 16,
+        "max": 31,
+        "count": 250967
+      }
+    ],
+    "single_fragment_percent": 1.407448582545859,
+    "sixteen_or_more_percent": 93.00240874559941
+  }
+]
