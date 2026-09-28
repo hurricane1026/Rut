@@ -1,0 +1,30 @@
+[
+  {
+    "case": "16-c1-close-rut-base",
+    "usable": true,
+    "count": 61192,
+    "mean_us": 10.288414335207216,
+    "warm_load_errors": 0
+  },
+  {
+    "case": "16-c1-close-rut-fin",
+    "usable": true,
+    "count": 61564,
+    "mean_us": 7.50945464882074,
+    "warm_load_errors": 0
+  },
+  {
+    "case": "16-c32-close-rut-base",
+    "usable": true,
+    "count": 117918,
+    "mean_us": 398.8639230906223,
+    "warm_load_errors": 0
+  },
+  {
+    "case": "16-c32-close-rut-fin",
+    "usable": true,
+    "count": 131468,
+    "mean_us": 7.691195287066054,
+    "warm_load_errors": 0
+  }
+]

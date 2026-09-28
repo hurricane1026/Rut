@@ -902,3 +902,14 @@ The first added test failed before CombinedSend because the hand-built Bounded f
 The corrected runtime defers only untagged terminal downstream events for a fully written final CombinedSend with matching source, fd, length, generation, frame and pending operation. Partial direct writes do not acquire this deferral. Upstream surplus/timer validation remains in its normal path; dispatch still accounts the downstream receive event. The exact send completion then accounts and closes once; stale/duplicate generations remain handled by existing ownership checks.
 
 The focused lifecycle test now passes 21 checks; full network regression passes all 1425 tests / 371796 checks. Original failures and passing logs are retained. The corrected binary has its own hash; both performance orders, a send-to-shutdown eBPF comparison, and the 12-coordinate HTTP small-proxy nginx acceptance matrix are queued/running under the shared lock. No runtime retention or full-matrix pass is claimed yet.
+
+## Corrected CombinedSend FIN: eBPF and reverse-order evidence
+
+All four traces are usable, preserve target process identity, and have zero warm/load errors. The interval runs from the most recent front-socket tcp_sendmsg entry to tcp_shutdown entry: it includes send work and completion waiting, and does not measure CPU time or delivery on the wire.
+
+| 16-byte close | Accepted baseline mean | Corrected candidate mean |
+|---|---:|---:|
+| c1 | 10.288 us | 7.509 us |
+| c32 | 398.864 us | 7.691 us |
+
+The c32 reduction supports eliminating delayed FIN while awaiting asynchronous completion. Instrumented throughput is not acceptance evidence. Corrected reverse-order uninstrumented results are archived separately from the incorrect first prototype. Formal nginx comparison remains pending.
