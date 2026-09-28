@@ -2063,6 +2063,32 @@ exact field grammar and
 verified against. A parallel, separately-closed `response_policy` exists for
 response-side rewriting; see `docs/language-card.md`.
 
+**Response read timeout and response buffering.** A `forward(...)` carrying a
+`response_policy` may add `response_read_timeout: <1..63s>`. This is an
+inactivity deadline: every positive read from the origin refreshes it, so an
+origin that keeps sending never expires, however long the whole response
+takes. It may also add `response_buffering:`, which applies only to a single
+final HTTP/1.1 response framed by exactly one `Content-Length`:
+
+- `"complete_content_length"`: the whole response (header and body) is
+  buffered before any downstream byte is sent.
+- `"bounded"`: nginx's `proxy_buffering on` release rule, which the nginx
+  converter emits for `proxy_buffering on` (nginx's default). With raw
+  upstream header length `H`, after `n` body bytes have arrived the released
+  body is `n` once the response is complete, and otherwise
+  `max(0, floor((H + n) / 4096) * 4096 - H)`. That is, whole 4 KiB buffers of
+  raw upstream bytes. Nothing, not even the header, is sent before the first
+  release, so below one buffer this is identical to
+  `"complete_content_length"`.
+
+Terminal dispositions (both modes). If the read timeout expires before any
+body release, the client gets the rewritten header only and the connection
+closes. If no upstream header had arrived, the `timeout_failure_policy`
+response (e.g. 504) is sent instead. If the read timeout expires after a
+release, the unreleased partial buffer is dropped and the connection closes.
+A clean origin EOF before the declared length flushes everything received,
+then closes.
+
 #### 3.4.6 Response Caching
 
 Standard HTTP response caching (RFC 7234) is handled automatically by the runtime,
