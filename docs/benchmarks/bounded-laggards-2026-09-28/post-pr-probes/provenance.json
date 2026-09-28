@@ -1,0 +1,9 @@
+{
+  "base": "60396bc50afed0ec1485606fb989ef7fc2f07b47",
+  "pr": "https://github.com/hurricane1026/Rut/pull/730",
+  "binaries": {
+    "rut-cache256-final": "de0ba69caf88cbe88789d81621d5ea90561cf6dda42a45b46730360f76ad18b6",
+    "rut-recv64k": "ce8030fb002845470fb421d48716926f8c83ad1a2dc0efdcbc8358e985fad2b0",
+    "rut-bulk-thp": "986d555863dbc09c5c02898732deefb7bd0adbefa9266abb7a40070bcb794096"
+  }
+}
