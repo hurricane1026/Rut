@@ -509,3 +509,15 @@ All 12 affected HTTP static coordinates completed with three valid 5-second samp
 | 1048576 | static-keepalive | 128 | 9784 | 10054 | 1.0276 |
 
 The 1 MiB keepalive regression is largely removed: c1 is approximately equal, and c32/c128 lead by 4.0%/2.8%. The previous formal ratios were 0.8187/0.8770/0.8813; these are separate runs on an unreserved host, while the alternating same-host causal probes establish the direction of benefit. Five of these twelve coordinates reach 1.10; this is not full-matrix acceptance. Preserve the narrowed change and continue investigating. Raw evidence is archived with SHA-256.
+
+## Rejected synchronous large-file prefix experiment
+
+The nonblocking prefix send dispatched a complete write immediately under the existing sendfile recursion guard, so sendfile could start before a header CQE. Partial writes retained ordinary asynchronous completion accounting. Against the accepted large-file header-push binary, two diagnostic samples per engine produced:
+
+| Case | Mean RPS change |
+|---|---:|
+| 1m-c1-keepalive | +0.20% |
+| 1m-c32-close | +0.60% |
+| 1m-c32-keepalive | -3.35% |
+
+All body/warmup/load checks passed, but concurrent keepalive regressed and other changes were negligible relative to variation. The candidate is reverted; it did not receive the full network suite and is not retained runtime code. This does not support removing the header completion wait as a throughput optimization.
