@@ -1058,3 +1058,7 @@ All 28 reverse samples finish with exact-body and zero warm/load errors.
 | 65536-c1-keepalive | +0.07% | 57.89 | 57.44 |
 
 The small c1 system CPU saving repeats, but throughput remains uncertain: the 16-byte close candidate includes a 7543.7 RPS sample versus the other samples around 7730–7750. This sample is retained, not discarded. Static close controls are queued because the same code serves that path. No retention decision yet.
+
+## Accepted 64 KiB proxy recv attempts
+
+All four c1 close/keepalive Rut/nginx traces are usable, exact-body checked and zero warm/load errors. Counts are grouped by requested tcp_recvmsg length and return kind; request normalization uses the overlapping load window (trace edges may add a request). Rut has roughly three positive reads/request and only rare EAGAIN on the body read. This does not support body POLL_FIRST as a significant fix. nginx performs more smaller positive reads, so fewer recv calls alone does not explain the latency gap. Kind 3 combines EOF and other errors and must not be described as EAGAIN. Instrumented throughput is not acceptance evidence.

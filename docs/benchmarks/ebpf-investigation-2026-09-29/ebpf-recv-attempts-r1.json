@@ -1,0 +1,78 @@
+[
+  {
+    "case": "65536-c1-close-nginx",
+    "requests": 46780,
+    "counts_by_kind": {
+      "1": 467304,
+      "2": 0,
+      "3": 46770
+    },
+    "attempts_per_request": {
+      "1": 9.989397178281317,
+      "2": 0.0,
+      "3": 0.999786233433091
+    },
+    "kind_legend": {
+      "1": "positive",
+      "2": "EAGAIN",
+      "3": "zero or other error"
+    }
+  },
+  {
+    "case": "65536-c1-close-rut-fin",
+    "requests": 47517,
+    "counts_by_kind": {
+      "1": 142491,
+      "2": 70,
+      "3": 0
+    },
+    "attempts_per_request": {
+      "1": 2.9987372940210872,
+      "2": 0.0014731569753982784,
+      "3": 0.0
+    },
+    "kind_legend": {
+      "1": "positive",
+      "2": "EAGAIN",
+      "3": "zero or other error"
+    }
+  },
+  {
+    "case": "65536-c1-keepalive-nginx",
+    "requests": 61311,
+    "counts_by_kind": {
+      "1": 612614,
+      "2": 0,
+      "3": 61303
+    },
+    "attempts_per_request": {
+      "1": 9.991910097698618,
+      "2": 0.0,
+      "3": 0.9998695177048165
+    },
+    "kind_legend": {
+      "1": "positive",
+      "2": "EAGAIN",
+      "3": "zero or other error"
+    }
+  },
+  {
+    "case": "65536-c1-keepalive-rut-fin",
+    "requests": 62007,
+    "counts_by_kind": {
+      "1": 185995,
+      "2": 184,
+      "3": 0
+    },
+    "attempts_per_request": {
+      "1": 2.9995806925024593,
+      "2": 0.0029674069056719403,
+      "3": 0.0
+    },
+    "kind_legend": {
+      "1": "positive",
+      "2": "EAGAIN",
+      "3": "zero or other error"
+    }
+  }
+]
