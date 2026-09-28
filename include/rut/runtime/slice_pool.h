@@ -44,20 +44,21 @@ struct SlicePool {
         kOrdinarySlicesPerConnection + kMaxBufferedResponseSlices;
 
     // Bulk relay buffers: large buffers a connection borrows only while it
-    // relays a large proxied body, so the body moves in 256 KiB steps.
+    // relays a large proxied body, so the body moves in bulk-sized steps.
     // Reserved per connection (like the ordinary/response-chain slices
     // above) rather than as one pool-wide fixed set, bounded by a hard cap.
     // Separate VA region, faulted in on first use; free() routes a bulk
     // pointer here by address, so release sites need not know which kind
     // they hold. Exhaustion is not an error: callers keep slices.
-    static constexpr u32 kBulkSliceSize = 256 * 1024;
+    static constexpr u32 kBulkSliceSize = 512 * 1024;
     static constexpr u32 kBulkPerConnection = 4;  // bulk buffers reserved per connection
-    static constexpr u32 kMaxBulkSlices = 4096;   // hard cap: 1 GiB VA per pool
-    // Keep at most 64 MiB of idle bulk storage per shard. A 64-buffer cache
-    // repeatedly discarded and faulted relay pages at 128 active responses;
-    // 256 buffers cover two bulk nodes per response at that concurrency.
+    static constexpr u32 kMaxBulkSlices = 4096;   // hard cap: 2 GiB VA per pool
+    // Keep at most 64 MiB of idle bulk storage per shard. Larger blocks
+    // reduce downstream sends for large plaintext responses; retaining 128
+    // of these blocks preserves the previous idle byte budget. Active
+    // buffers are additional to this cache, and can increase the working set.
     // Returns beyond this bound still use MADV_DONTNEED to shed burst memory.
-    static constexpr u32 kMaxCachedBulk = 256;
+    static constexpr u32 kMaxCachedBulk = 128;
 
     static constexpr u32 capacity_for_connections(u32 connections) {
         constexpr u32 kMaxU32 = 0xFFFFFFFFu;
