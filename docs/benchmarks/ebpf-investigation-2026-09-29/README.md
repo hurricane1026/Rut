@@ -1073,3 +1073,9 @@ All eight static controls pass exact-body/warm/load checks.
 | 16-c32-close | +0.75% | 11.50 | 11.00 |
 
 Both static c1 candidate samples regress against both baseline samples despite lower CPU cost. The mechanism reduces syscalls but does not provide a reliable throughput win across affected paths. Revert runtime and test changes, retaining the patch, full regression, both proxy orders, static controls and eBPF evidence. No causal claim is made about why the lower-CPU static path is slower. The accepted runtime remains 271cd98c. A c1 64 KiB response-stage trace is now queued/running against that accepted binary and nginx.
+
+## 64 KiB response-stage trace and observer limitation
+
+The first four attempts are unusable (two bpftrace type-inference compile failures, then signedness/redundant-cast diagnostics). The original map-name-collision suspicion was disproved by renaming. Explicitly typing the cumulative byte expression and removing the redundant consumer cast resolves the diagnostics. Failed attempts are retained and excluded.
+
+All four r5 traces are usable with zero warm/load errors and exact completed response byte counts. Per-front-socket maps correlate c1 non-pipelined requests from front tcp_recvmsg return through first tcp_sendmsg entry and last successful tcp_sendmsg return, emitted at close or the next request. The intervals include userspace, kernel, waiting and origin work; they do not measure network delivery or CPU time. Rut close first-send/total means are 79.272/118.607 us versus nginx 78.735/124.344 us. This reverses the uninstrumented throughput ordering and is inconclusive about the original gap: nginx performs more recv/send calls and pays more probe work. Do not call the traced ordering a speedup or infer that the uninstrumented tail is faster.

@@ -1,0 +1,46 @@
+[
+  {
+    "case": "65536-c1-close-nginx",
+    "requests": 46971,
+    "bytes_per_request": 65682.0,
+    "mean_us": {
+      "front_total_ns": 124.34410751314641,
+      "front_first_ns": 78.73458155031828,
+      "front_tail_ns": 45.60952596282813,
+      "upfirst_to_last_ns": 60.6580367673671
+    }
+  },
+  {
+    "case": "65536-c1-close-rut-fin",
+    "requests": 47299,
+    "bytes_per_request": 65682.0,
+    "mean_us": {
+      "front_total_ns": 118.6065055498002,
+      "front_first_ns": 79.27156354256961,
+      "front_tail_ns": 39.334942007230595,
+      "upfirst_to_last_ns": 54.05015103913402
+    }
+  },
+  {
+    "case": "65536-c1-keepalive-nginx",
+    "requests": 61725,
+    "bytes_per_request": 65686.99505872824,
+    "mean_us": {
+      "front_total_ns": 115.65420698258404,
+      "front_first_ns": 77.95125275010125,
+      "front_tail_ns": 37.70295423248279,
+      "upfirst_to_last_ns": 53.02476748481167
+    }
+  },
+  {
+    "case": "65536-c1-keepalive-rut-fin",
+    "requests": 61547,
+    "bytes_per_request": 65687.0,
+    "mean_us": {
+      "front_total_ns": 112.51193177571612,
+      "front_first_ns": 78.57426134498839,
+      "front_tail_ns": 33.93767043072774,
+      "upfirst_to_last_ns": 48.38248960956667
+    }
+  }
+]
