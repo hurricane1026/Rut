@@ -618,3 +618,12 @@ Both focused TCP-only eBPF traces are complete/usable with matching target ident
 The 64 KiB changes are positive in both process orders, around 1–2%; no material gain appears for 16 B. The full network suite and formal 64 KiB nginx controls are running before deciding whether to retain the one-line change.
 
 POLL_FIRST passes the full 1,424-test network suite (371,775 checks). Its formal 64 KiB comparison is now running. A separate large-file header-only experiment is queued behind it: suppress the copied body prefix only where the original file tail would exceed 64 KiB, preserving small-file behavior and the accepted no-MSG_MORE large-header push. The earlier file-body-only probe retained MSG_MORE, so this checks a previously unmeasured interaction. The frozen POLL_FIRST binary is the control, and only the static native-body path is measured. No runtime conclusion is available yet.
+
+The POLL_FIRST 64 KiB/c1 formal controls completed with three valid five-second samples per engine and clean cleanup:
+
+| Mode | nginx median RPS | Rut median RPS | Ratio |
+|---|---:|---:|---:|
+| close | 6077 | 5972 | 0.9827 |
+| keepalive | 8008 | 7796 | 0.9735 |
+
+Retain POLL_FIRST on one-shot upstream receives: both-order 64 KiB diagnostics show small positive changes, eBPF verifies removal of speculative empty reads, and the full network suite passes. The before/after formal ratios move from 0.9771/0.9616 to 0.9827/0.9735, but these are separate runs on an unreserved host and do not establish an exact gain. Both cells still miss the goal. Tiny-response throughput is effectively unchanged; no across-matrix claim follows.

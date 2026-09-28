@@ -532,6 +532,7 @@ bool IoUringBackend::add_recv_upstream_once(i32 fd,
 
     memset(sqe, 0, sizeof(*sqe));
     sqe->opcode = IORING_OP_RECV;
+    sqe->ioprio = IORING_RECVSEND_POLL_FIRST;
     sqe->fd = fd;
     sqe->len = max_len;
     sqe->buf_group = large_buf_ring != nullptr ? kLargeBufGroupId : kBufGroupId;
