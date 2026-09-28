@@ -516,6 +516,18 @@ remains PARTIAL and #271 BLOCKED_BY_RUT.
 - Complete response buffering currently admits downstream HTTP/1.1 only. The
   accepted nginx configuration syntax does not exclude HTTP/1.0 clients, so the
   omitted-buffering row remains blocked for that version domain as well.
+- `response_buffering: "bounded"` is a second complete-Content-Length mode,
+  admitted everywhere `"complete_content_length"` is. It matches nginx 1.29.7's
+  default `proxy_buffering on`: the body is released downstream in whole
+  `kBoundedResponseBufferBytes` (4 KiB) units of raw upstream bytes, and nothing
+  — not even the header — is sent before the first unit fills or the response
+  completes. Below one unit it is byte-identical to `"complete_content_length"`,
+  which is why every pinned small-body differential in this matrix (bodies
+  under 4 KiB) is unaffected. Above one unit, large bodies now stream in whole
+  buffers like nginx instead of serializing the full body behind one commit.
+  The converter emits `"bounded"` for nginx's default and explicit
+  `proxy_buffering on`; `"complete_content_length"` remains a valid, separate
+  mode for hand-written `.rut` sources and is unaffected by this change.
 - Pipelined validated-failure support has three distinct tracks. Closed #276
   owns successor bytes that arrive after request 1 is admitted but before its
   502 Send completes, with deterministic and raw-SQ/CQ production evidence into

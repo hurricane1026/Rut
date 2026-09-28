@@ -8193,6 +8193,136 @@ void on_response_header_sent(void* lp, Connection& conn, IoEvent ev) {
     }
 }
 
+// Bounded early release, header step: send the rewritten response header the
+// first time any body becomes releasable (see bounded_response_release_bytes
+// / try_advance_bounded_release). response_read_deadline_post_commit_phase
+// stays Buffering throughout — this is not the terminal HeaderSend/WaitingBody
+// transition CompleteContentLength uses — so a stale or foreign completion
+// cannot be mistaken for it: the generation/kind ledger that guards Header/
+// Body/Combined sends is never touched by this mechanism, and this callback
+// is reachable only while conn.on_send names it.
+template <typename Loop>
+void on_bounded_release_header_sent(void* lp, Connection& conn, IoEvent ev) {
+    auto* loop = static_cast<Loop*>(lp);
+    if (ev.result <= 0 ||
+        conn.response_read_deadline_buffering != ForwardResponseBufferingMode::Bounded ||
+        conn.response_read_deadline_post_commit_phase !=
+            ResponseReadDeadlinePostCommitPhase::Buffering ||
+        conn.response_read_deadline_bounded_header_sent ||
+        conn.response_read_deadline_bounded_released != 0 ||
+        static_cast<u32>(ev.result) != conn.response_header_buf.len() ||
+        conn.upstream_send_len != conn.response_read_deadline_post_commit_raw_header_end ||
+        conn.upstream_recv_buf.len() < conn.upstream_send_len ||
+        !response_read_deadline_post_commit_is_stable(conn)) {
+        loop->close_conn(conn);
+        return;
+    }
+    // The raw origin header sat at the front of upstream_recv_buf (see
+    // try_advance_bounded_release); strip exactly those bytes now so the
+    // first body release reads pure body bytes, not the header.
+    (void)consume_upstream_sent(conn);
+    conn.clear_slots();
+    conn.response_read_deadline_bounded_header_sent = true;
+    if (conn.response_read_deadline_bounded_pending_complete) {
+        conn.response_read_deadline_bounded_pending_complete = false;
+        bool ok = false;
+        if constexpr (requires(Loop* candidate, Connection& c) {
+                          candidate->finish_bounded_release_as_complete(c);
+                      }) {
+            ok = loop->finish_bounded_release_as_complete(conn);
+        }
+        if (!ok) loop->close_conn(conn);
+        return;
+    }
+    if (conn.response_read_deadline_bounded_pending_clean_eof) {
+        conn.response_read_deadline_bounded_pending_clean_eof = false;
+        bool ok = false;
+        if constexpr (requires(Loop* candidate, Connection& c) {
+                          candidate->finish_bounded_release_as_clean_eof(c);
+                      }) {
+            ok = loop->finish_bounded_release_as_clean_eof(conn);
+        }
+        if (!ok) loop->close_conn(conn);
+        return;
+    }
+    if constexpr (requires(Loop* candidate, Connection& c) {
+                      candidate->try_advance_bounded_release(c);
+                  }) {
+        if (!loop->try_advance_bounded_release(conn)) loop->close_conn(conn);
+    } else {
+        loop->close_conn(conn);
+    }
+}
+
+// Bounded early release, body step: one release increment may take several
+// front-chunk-sized sends (buffered_response_front_size()); this drives the
+// chunk loop and, once the currently-known-releasable amount is drained,
+// either starts the next increment or hands off to the terminal
+// CompleteBody/CleanUpstreamEof/InactivityExpiry disposition that a
+// concurrent batch already decided (response_read_deadline_bounded_pending_complete)
+// — see start_complete_content_length_send's Bounded fast-forward branch.
+template <typename Loop>
+void on_bounded_release_body_sent(void* lp, Connection& conn, IoEvent ev) {
+    auto* loop = static_cast<Loop*>(lp);
+    const u32 sent = conn.upstream_send_len;
+    if (ev.result <= 0 ||
+        conn.response_read_deadline_buffering != ForwardResponseBufferingMode::Bounded ||
+        conn.response_read_deadline_post_commit_phase !=
+            ResponseReadDeadlinePostCommitPhase::Buffering ||
+        !conn.response_read_deadline_bounded_header_sent || static_cast<u32>(ev.result) != sent ||
+        sent == 0 || conn.buffered_response_front_size() < sent ||
+        sent > conn.response_read_deadline_post_commit_declared_body ||
+        conn.response_read_deadline_bounded_released >
+            conn.response_read_deadline_post_commit_declared_body - sent ||
+        !response_read_deadline_post_commit_is_stable(conn)) {
+        loop->close_conn(conn);
+        return;
+    }
+    if (conn.upstream_recv_buf.len() != 0) {
+        (void)consume_upstream_sent(conn);
+    } else {
+        // Bounded's direct recv always targets response_body_tail's tail
+        // node (see arm_response_read_direct_body_recv); if one is
+        // currently armed, its destination is a raw pointer into that
+        // node's reserved-but-uncommitted capacity — never let this
+        // release free the node out from under it (see consume()'s
+        // tail_pinned contract).
+        conn.response_body_tail.consume(sent, conn.upstream_recv_direct_armed);
+        conn.upstream_send_len = 0;
+    }
+    conn.response_read_deadline_bounded_released += sent;
+    conn.clear_slots();
+    if (conn.response_read_deadline_bounded_pending_complete) {
+        conn.response_read_deadline_bounded_pending_complete = false;
+        bool ok = false;
+        if constexpr (requires(Loop* candidate, Connection& c) {
+                          candidate->finish_bounded_release_as_complete(c);
+                      }) {
+            ok = loop->finish_bounded_release_as_complete(conn);
+        }
+        if (!ok) loop->close_conn(conn);
+        return;
+    }
+    if (conn.response_read_deadline_bounded_pending_clean_eof) {
+        conn.response_read_deadline_bounded_pending_clean_eof = false;
+        bool ok = false;
+        if constexpr (requires(Loop* candidate, Connection& c) {
+                          candidate->finish_bounded_release_as_clean_eof(c);
+                      }) {
+            ok = loop->finish_bounded_release_as_clean_eof(conn);
+        }
+        if (!ok) loop->close_conn(conn);
+        return;
+    }
+    if constexpr (requires(Loop* candidate, Connection& c) {
+                      candidate->try_advance_bounded_release(c);
+                  }) {
+        if (!loop->try_advance_bounded_release(conn)) loop->close_conn(conn);
+    } else {
+        loop->close_conn(conn);
+    }
+}
+
 template <typename Loop>
 void on_complete_response_sent(void* lp, Connection& conn, IoEvent ev) {
     auto* loop = static_cast<Loop*>(lp);
@@ -12756,13 +12886,25 @@ void on_upstream_response(void* lp, Connection& conn, IoEvent ev) {
     const bool configured_head_candidate =
         (explicit_first_batch || explicit_progress_batch) &&
         explicit_profile == ResponseReadDeadlineProfile::FixedContentLengthUploadHeaderOnlyHead;
+    // Bounded's header recv is one-shot (see add_response_read_recv), so a
+    // positive 304-metadata completion always retires upstream_recv_armed
+    // before begin_prebuilt_http1_response runs — unlike CCL's multishot,
+    // which stays armed. current_terminal_response_recv_is_exact proves this
+    // one-shot completion is the batch's sole, unfaulted terminal event (no
+    // hidden EOF), which begin_prebuilt_http1_response's exact_consumed_terminal
+    // then accepts in place of a live kUpstreamOpRecv target. Harmless to
+    // evaluate for CCL too: its multishot completion always carries ev.more,
+    // so the predicate is trivially false there.
+    const bool bodyless_304_candidate =
+        (explicit_first_batch || explicit_progress_batch) &&
+        explicit_profile == ResponseReadDeadlineProfile::BodylessNonHeadContentLengthZero;
     bool exact_terminal_response_recv = false;
     if constexpr (requires(Loop* candidate, const Connection& c, const IoEvent& event) {
                       candidate->current_terminal_response_recv_is_exact(
                           c, event, u32{}, ResponseReadDeadlineProfile::None, u8{}, u32{});
                   }) {
         exact_terminal_response_recv =
-            configured_head_candidate &&
+            (configured_head_candidate || bodyless_304_candidate) &&
             loop->current_terminal_response_recv_is_exact(conn,
                                                           ev,
                                                           explicit_generation,
@@ -12839,9 +12981,11 @@ void on_upstream_response(void* lp, Connection& conn, IoEvent ev) {
                 }
                 return;
             }
-            // Every other terminal incomplete response has consumed its only
-            // proven Recv owner and remains fail-closed.
-            if (exact_terminal_response_recv) {
+            // The bodyless GET profile can still receive an incomplete header
+            // on Bounded's one-shot recv. Its exact terminal proof is needed
+            // only after parsing a complete 304; while incomplete, rearm the
+            // recv and retain the initial read deadline.
+            if (exact_terminal_response_recv && !bodyless_304_candidate) {
                 disarm_explicit_deadline();
                 loop->close_conn(conn);
                 return;
@@ -13042,7 +13186,9 @@ void on_upstream_response(void* lp, Connection& conn, IoEvent ev) {
                        response_read_deadline_route_method_matches(explicit_method,
                                                                    explicit_route_method)) &&
             resp.content_length > 0 && raw_header_end <= conn.upstream_recv_buf.capacity() &&
-            resp.content_length <= ResponseBodyChain::kMaxBody &&
+            resp.content_length <=
+                complete_content_length_declared_body_cap(
+                    explicit_buffering, complete_content_length_classification.response_class) &&
             raw_total - raw_header_end <= resp.content_length;
         const bool strict_positive_streaming_get =
             strict_common && resp.status_code == 200 && !fixed_upload &&
