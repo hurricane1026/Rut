@@ -940,6 +940,8 @@ template void on_complete_response_sent<IoUringEventLoop>(void*, Connection&, Io
 template void on_response_body_recvd<IoUringEventLoop>(void*, Connection&, IoEvent);
 template void on_response_body_sent<IoUringEventLoop>(void*, Connection&, IoEvent);
 template void pump_response_read_deadline_body<IoUringEventLoop>(IoUringEventLoop*, Connection&);
+template void on_bounded_release_header_sent<IoUringEventLoop>(void*, Connection&, IoEvent);
+template void on_bounded_release_body_sent<IoUringEventLoop>(void*, Connection&, IoEvent);
 template void handle_early_upstream_recv<IoUringEventLoop>(IoUringEventLoop*,
                                                            Connection&,
                                                            IoEvent,

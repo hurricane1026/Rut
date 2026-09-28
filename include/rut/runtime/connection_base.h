@@ -683,6 +683,75 @@ struct ConnectionBase {
     u32 response_read_deadline_post_commit_send_body;
     bool response_read_deadline_post_commit_close_after_drain;
     bool response_read_deadline_post_commit_pump_pending;
+    // Bounded buffering only (nginx proxy_buffering-on release rule). These
+    // stay at their reset value for every other mode, including
+    // CompleteContentLength, and are inspected only while
+    // response_read_deadline_post_commit_phase == Buffering — never by the
+    // shared "collecting" invariant in response_read_deadline_post_commit_is_stable,
+    // which only inspects downstream_submitted/downstream_completed/send_body/
+    // close_after_drain (all still zero/false throughout an early release).
+    //
+    // Raw BODY bytes already sent downstream via early whole-buffer releases.
+    // Monotonically non-decreasing; 0 until the first release. Once a
+    // terminal disposition fires (CompleteBody/CleanUpstreamEof/
+    // InactivityExpiry), start_complete_content_length_send fast-forwards
+    // downstream_submitted/downstream_completed/send_body/resp_body_* to
+    // reflect these already-sent bytes and hands off to the ordinary
+    // WaitingBody/BodySend pump for the remainder — see its comment.
+    u32 response_read_deadline_bounded_released;
+    // True once the rewritten response header has gone out as part of the
+    // first release (a release always publishes the header before any body
+    // byte — nothing, not even the header, is sent before the first whole
+    // buffer fills).
+    bool response_read_deadline_bounded_header_sent;
+    // True while the upstream recv is paused because unsent (received but
+    // not yet released) body bytes reached kBoundedReadAheadBytes. The
+    // inactivity timer is suspended for the duration — nginx does not time
+    // out reads it isn't performing — and re-armed with a fresh full
+    // timeout when the recv resumes.
+    bool response_read_deadline_bounded_read_ahead_paused;
+    // True when a batch proved the response complete (origin_received ==
+    // declared_body) while an early-release Send was still in flight, so the
+    // CompleteBody disposition could not be started immediately. The release
+    // Send's completion callback checks this and starts it once idle.
+    bool response_read_deadline_bounded_pending_complete;
+    // True when a batch's clean-EOF witness was already authenticated
+    // (complete_content_length_clean_eof_owner_is_valid checked once, against
+    // that batch's now-gone ResponseReadBatchOwner) while an early-release
+    // Send was still in flight, so the CleanUpstreamEof disposition could not
+    // be started immediately either. Unlike the CompleteBody case, the proof
+    // cannot be re-checked later — response_read_batch_owners is reused next
+    // batch — so this stands in for "already proved, just commit" instead of
+    // deferring the owner itself; the release Send's completion callback
+    // checks this and starts it once idle, via
+    // start_complete_content_length_send's clean_eof_pre_authenticated path.
+    bool response_read_deadline_bounded_pending_clean_eof;
+    // Bounded only: short per-connection one-shot timer bounding how long a
+    // too-small release (see kBoundedMinReleaseBytes) is held for more bytes
+    // to coalesce in — see try_advance_bounded_release. Deliberately minimal
+    // next to the generic response_read_timer below: it is never explicitly
+    // cancelled (a hold that resolves via a normal release just leaves it
+    // armed; its eventual -ETIME completion is then a harmless no-op, since
+    // bounded_response_release_bytes's target <= released check finds
+    // nothing left to force — see consume_bounded_hold_timer_completion), and
+    // at most one is ever armed per hold (a second hold attempt while one is
+    // outstanding just keeps waiting on the existing one). The timespec and
+    // owner generation are kernel-owned storage, exactly like
+    // response_read_timer_timespec below: reset() must not mutate them before
+    // the one target CQE this owner can ever produce has been harvested. The
+    // generation counter survives ordinary reset/slot reuse and never wraps
+    // within any realistic CQE lifetime, so a stale completion for a reused
+    // slot can never be mistaken for a live one.
+    IoTimespec response_read_deadline_bounded_hold_timespec{};
+    u32 response_read_deadline_bounded_hold_timer_generation = 0;
+    u32 response_read_deadline_bounded_hold_timer_owner_generation = 0;
+    u32 response_read_deadline_bounded_hold_timer_upstream_episode = 0;
+    bool response_read_deadline_bounded_hold_timer_armed = false;
+    // Set once the hold timer's -ETIME completion is observed for the
+    // current owner generation; consumed (and cleared) by the next
+    // try_advance_bounded_release call, which then releases regardless of
+    // size. Pure software hint, no kernel ownership — safe to clear anytime.
+    bool response_read_deadline_bounded_hold_timer_fired = false;
     // Exact downstream Send CQE ownership for the post-commit stream.  The
     // monotonically increasing token is encoded in io_uring user_data; the
     // tombstone survives retirement/request-boundary handoff so late CQEs
@@ -819,6 +888,63 @@ struct ConnectionBase {
         return true;
     }
 
+    // Bounded hold timer — see the field comment above. Deliberately smaller
+    // than the response_read_timer machinery above: no CancelPending phase
+    // (never explicitly cancelled), so "armed" is the only kernel-ownership
+    // bit that needs to survive reset().
+    template <typename Self, typename Visitor>
+    static void visit_bounded_hold_timer_owner_fields(Self& c, Visitor&& visit) {
+        visit(c.response_read_deadline_bounded_hold_timespec.tv_sec,
+              static_cast<decltype(c.response_read_deadline_bounded_hold_timespec.tv_sec)>(0));
+        visit(c.response_read_deadline_bounded_hold_timespec.tv_nsec,
+              static_cast<decltype(c.response_read_deadline_bounded_hold_timespec.tv_nsec)>(0));
+        visit(c.response_read_deadline_bounded_hold_timer_owner_generation, u32{0});
+        visit(c.response_read_deadline_bounded_hold_timer_upstream_episode, u32{0});
+        visit(c.response_read_deadline_bounded_hold_timer_armed, false);
+    }
+
+    [[nodiscard]] bool bounded_hold_timer_owner_is_neutral() const {
+        bool neutral = true;
+        visit_bounded_hold_timer_owner_fields(*this,
+                                              [&](const auto& value, const auto& reset_value) {
+                                                  neutral = neutral && value == reset_value;
+                                              });
+        return neutral;
+    }
+
+    // Clear is legal only once the one target CQE this owner can ever
+    // produce has drained (armed == false). Protects
+    // response_read_deadline_bounded_hold_timespec from reset/reuse while
+    // IORING_OP_TIMEOUT can still dereference it — mirrors
+    // clear_response_read_timer_owner above.
+    bool clear_bounded_hold_timer_owner() {
+        if (response_read_deadline_bounded_hold_timer_armed) return false;
+        visit_bounded_hold_timer_owner_fields(
+            *this, [](auto& value, const auto& reset_value) { value = reset_value; });
+        return true;
+    }
+
+    bool next_bounded_hold_timer_generation() {
+        if (!bounded_hold_timer_owner_is_neutral() ||
+            response_read_deadline_bounded_hold_timer_generation >= 0xFFFFFFFFu)
+            return false;
+        ++response_read_deadline_bounded_hold_timer_generation;
+        response_read_deadline_bounded_hold_timer_owner_generation =
+            response_read_deadline_bounded_hold_timer_generation;
+        return true;
+    }
+
+    // Consume the (only ever) target CQE for the current owner generation.
+    // Returns false for a mismatched/foreign/absent generation — the caller
+    // must not act on it (stale, already-superseded, or never armed).
+    bool consume_bounded_hold_timer_completion(u32 generation) {
+        if (!response_read_deadline_bounded_hold_timer_armed || generation == 0 ||
+            generation != response_read_deadline_bounded_hold_timer_owner_generation)
+            return false;
+        response_read_deadline_bounded_hold_timer_armed = false;
+        return clear_bounded_hold_timer_owner();
+    }
+
     bool next_response_read_deadline_send_generation() {
         return next_non_upstream_send_generation(response_read_deadline_send_owner_generation);
     }
@@ -929,6 +1055,11 @@ struct ConnectionBase {
         visit(c.response_read_deadline_post_commit_send_body, u32{0});
         visit(c.response_read_deadline_post_commit_close_after_drain, false);
         visit(c.response_read_deadline_post_commit_pump_pending, false);
+        visit(c.response_read_deadline_bounded_released, u32{0});
+        visit(c.response_read_deadline_bounded_header_sent, false);
+        visit(c.response_read_deadline_bounded_read_ahead_paused, false);
+        visit(c.response_read_deadline_bounded_pending_complete, false);
+        visit(c.response_read_deadline_bounded_pending_clean_eof, false);
         visit(c.response_read_deadline_first_batch, false);
         visit(c.response_read_deadline_first_batch_profile, ResponseReadDeadlineProfile::None);
         visit(c.response_read_deadline_first_batch_method, u8{0xffu});
@@ -994,6 +1125,11 @@ struct ConnectionBase {
         check(response_read_deadline_post_commit_send_body, u32{0});
         check(response_read_deadline_post_commit_close_after_drain, false);
         check(response_read_deadline_post_commit_pump_pending, false);
+        check(response_read_deadline_bounded_released, u32{0});
+        check(response_read_deadline_bounded_header_sent, false);
+        check(response_read_deadline_bounded_read_ahead_paused, false);
+        check(response_read_deadline_bounded_pending_complete, false);
+        check(response_read_deadline_bounded_pending_clean_eof, false);
         check(response_read_deadline_first_batch, false);
         check(response_read_deadline_first_batch_profile, ResponseReadDeadlineProfile::None);
         check(response_read_deadline_first_batch_method, u8{0xffu});
@@ -1013,6 +1149,11 @@ struct ConnectionBase {
         response_read_deadline_upload.clear_owner();
         response_read_deadline_first_batch_upload.clear_owner();
         if (response_read_timer_owner_is_neutral()) response_read_timer_last_progress_ns = 0;
+        // Pure software hint, no kernel ownership (see the field comment) —
+        // safe to clear unconditionally, unlike the kernel-owned hold-timer
+        // fields themselves (armed/generation/timespec), which must survive
+        // until their one target CQE has been harvested.
+        response_read_deadline_bounded_hold_timer_fired = false;
     }
 
     template <typename Self, typename Visitor>
@@ -1781,6 +1922,15 @@ struct ConnectionBase {
         // neutral storage may be hygienically cleared without touching its
         // persistent generation counter.
         if (response_read_timer_owner_is_neutral()) clear_response_read_timer_owner();
+        // Bounded hold timer: same persistence rule as the precise
+        // response-read timer above (and the same reason) — a hold that was
+        // still armed when this connection closed leaves its one target CQE
+        // outstanding; clearing only when already neutral lets that CQE
+        // still land safely (see consume_bounded_hold_timer_completion's
+        // generation check) without this slot's next use being able to arm a
+        // second one out from under it (next_bounded_hold_timer_generation
+        // requires neutrality first).
+        if (bounded_hold_timer_owner_is_neutral()) clear_bounded_hold_timer_owner();
         request_config = nullptr;
         listener_context = {};
         pending_handler_fn = nullptr;

@@ -322,6 +322,13 @@ struct IoUringBackend {
                                  u32 upstream_episode);
     bool cancel_response_read_timer(u32 conn_id, Connection& conn);
 
+    // Submit IORING_OP_TIMEOUT for the Bounded release hold-back (see
+    // kBoundedMinReleaseBytes / IoEventType::BoundedHoldTimer). Microsecond
+    // granularity. Ownership lives entirely on Connection, deliberately not
+    // pending_ops-accounted — mirrors add_response_read_timer above, minus a
+    // cancel path this timer never needs (see the field comment).
+    bool add_bounded_hold_timer(u32 conn_id, Connection& conn, u32 micros, u32 upstream_episode);
+
     // Cancel outstanding operations for a connection (by user_data match).
     // Only submits cancel SQEs for op types actually in flight.
     // Returns the number of cancel SQEs submitted (for pending_ops tracking).
