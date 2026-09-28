@@ -84,7 +84,7 @@ struct ResponseBodyChain {
             if (!node) {
                 while (first) {
                     Node* next = first->next;
-                    pool.free_written(reinterpret_cast<u8*>(first), kHeader);
+                    pool.free(reinterpret_cast<u8*>(first));
                     first = next;
                 }
                 return false;
@@ -210,11 +210,9 @@ struct ResponseBodyChain {
     }
 
 private:
-    // Payload bytes are only ever written at [0, len), so that is all a
-    // bulk node has to re-zero on return.
-    void release_node(Node* node) {
-        owner->free_written(reinterpret_cast<u8*>(node), kHeader + node->len);
-    }
+    // Bulk payload stays uninitialized between owners. append/reserve_tail
+    // reset node metadata, and only append/commit publish received bytes.
+    void release_node(Node* node) { owner->free(reinterpret_cast<u8*>(node)); }
 };
 
 }  // namespace rut

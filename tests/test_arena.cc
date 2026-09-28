@@ -999,3 +999,79 @@ TEST(response_body_chain, tls_threshold_keeps_short_bodies_in_slices) {
     chain.release();
     pool.destroy();
 }
+
+TEST(response_body_chain, dirty_bulk_direct_recv_publishes_only_committed_bytes) {
+    SlicePool pool;
+    REQUIRE(pool.init(2, 0, SlicePool::kMaxCachedSlices, 1).has_value());
+    u8* dirty = pool.alloc_bulk();
+    REQUIRE(dirty != nullptr);
+    __builtin_memset(dirty, 0xa5, SlicePool::kBulkSliceSize);
+    pool.free(dirty);
+
+    ResponseBodyChain chain;
+    REQUIRE(chain.reserve_tail(pool, 0));
+    CHECK_EQ(reinterpret_cast<u8*>(chain.head), dirty);
+    CHECK_EQ(chain.head->next, nullptr);
+    CHECK_EQ(chain.front_size(), 0u);
+    CHECK_EQ(chain.size, 0u);
+    CHECK_EQ(chain.head->offset, 0u);
+    u8* dst = chain.write_ptr(pool);
+    CHECK_EQ(dst[100], 0xa5u);  // old data exists but is outside the valid range
+    __builtin_memcpy(dst, "abc", 3);
+    chain.commit(3);
+    CHECK_EQ(chain.front_size(), 3u);
+    CHECK_EQ(__builtin_memcmp(chain.data(), "abc", 3), 0);
+    chain.consume(1, true);
+    CHECK_EQ(chain.front_size(), 2u);
+    CHECK_EQ(__builtin_memcmp(chain.data(), "bc", 2), 0);
+
+    // A pending recv pins the tail even after all committed bytes drain.
+    u8* pending = chain.write_ptr(pool);
+    chain.consume(2, true);
+    CHECK_EQ(pool.bulk_available(), 0u);
+    CHECK_EQ(chain.front_size(), 0u);
+    CHECK_EQ(chain.write_ptr(pool), pending);
+    __builtin_memcpy(pending, "de", 2);
+    chain.commit(2);
+    CHECK_EQ(chain.front_size(), 2u);
+    CHECK_EQ(__builtin_memcmp(chain.data(), "de", 2), 0);
+    chain.consume(2);
+    CHECK_EQ(chain.head, nullptr);
+    CHECK_EQ(pool.bulk_available(), 1u);
+
+    // The next response must reset the old node metadata, including offset.
+    REQUIRE(chain.reserve_tail(pool, 0));
+    CHECK_EQ(chain.front_size(), 0u);
+    CHECK_EQ(chain.head->offset, 0u);
+    CHECK_EQ(chain.head->next, nullptr);
+    chain.write_ptr(pool)[0] = 'z';
+    chain.commit(1);
+    CHECK_EQ(chain.front_size(), 1u);
+    CHECK_EQ(chain.data()[0], static_cast<u8>('z'));
+    chain.release();  // cancellation/early teardown with an unconsumed suffix
+    CHECK_EQ(pool.bulk_available(), 1u);
+    pool.destroy();
+}
+
+TEST(response_body_chain, dirty_bulk_append_replaces_metadata_and_bounds_payload) {
+    SlicePool pool;
+    REQUIRE(pool.init(2, 0, SlicePool::kMaxCachedSlices, 1).has_value());
+    u8* dirty = pool.alloc_bulk();
+    REQUIRE(dirty != nullptr);
+    __builtin_memset(dirty, 0xa5, SlicePool::kBulkSliceSize);
+    pool.free(dirty);
+    u8 bytes[ResponseBodyChain::kPayload + 7];
+    __builtin_memset(bytes, 0x3c, sizeof(bytes));
+    ResponseBodyChain chain;
+    REQUIRE(chain.append(pool, bytes, sizeof(bytes)));
+    CHECK_EQ(reinterpret_cast<u8*>(chain.head), dirty);
+    CHECK_EQ(chain.head->next, nullptr);
+    CHECK_EQ(chain.front_size(), sizeof(bytes));
+    CHECK_EQ(chain.size, sizeof(bytes));
+    CHECK_EQ(__builtin_memcmp(chain.data(), bytes, sizeof(bytes)), 0);
+    CHECK_EQ(ResponseBodyChain::payload(chain.head)[sizeof(bytes)], 0xa5u);
+    chain.consume(sizeof(bytes));
+    CHECK_EQ(chain.head, nullptr);
+    CHECK_EQ(pool.bulk_available(), 1u);
+    pool.destroy();
+}

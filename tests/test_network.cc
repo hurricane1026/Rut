@@ -15726,7 +15726,7 @@ TEST(slice_pool, buffered_response_capacity_covers_each_connection) {
     pool.destroy();
 }
 
-TEST(slice_pool, bulk_buffers_are_lazy_bounded_zeroed_and_address_routed) {
+TEST(slice_pool, bulk_buffers_are_lazy_bounded_uninitialized_and_address_routed) {
     // 70 crosses one bulk_in_use bitmap word boundary (64 bits/word), so this
     // exercises the dynamic per-connection bitmap, not just a single word.
     constexpr u32 kTestBulk = 70;
@@ -15759,43 +15759,15 @@ TEST(slice_pool, bulk_buffers_are_lazy_bounded_zeroed_and_address_routed) {
     bool reused_first = false;
     for (u8* b : all) reused_first |= b == first;
     REQUIRE(reused_first);
-    for (u32 i = 0; i < SlicePool::kBulkSliceSize; ++i) {
-        if (first[i] != 0) {
-            CHECK_EQ(first[i], 0u);  // a returned buffer never exposes old bytes
-            break;
-        }
-    }
+    // Cached bulk storage retains bytes; callers must track valid lengths.
+    CHECK_EQ(first[0], 0xa5u);
+    CHECK_EQ(first[SlicePool::kBulkSliceSize - 1], 0xa5u);
     for (u8* b : all) pool.free(b);
     CHECK_EQ(pool.bulk_available(), kTestBulk);
     pool.free(slice);
     pool.destroy();
     CHECK_EQ(pool.bulk_base, nullptr);
     CHECK_FALSE(pool.is_bulk(first));
-}
-
-TEST(slice_pool, bulk_free_written_rezeroes_the_written_prefix) {
-    constexpr u32 kTestBulk = 4;
-    SlicePool pool;
-    REQUIRE(pool.init(4, 0, SlicePool::kMaxCachedSlices, kTestBulk).has_value());
-    u8* all[kTestBulk]{};
-    for (u8*& b : all) REQUIRE((b = pool.alloc_bulk()) != nullptr);
-    u8* const target = all[0];
-    __builtin_memset(target, 0x3c, 4096);
-    pool.free_written(target, 4096);
-    for (u32 i = 1; i < kTestBulk; ++i) pool.free(all[i]);
-    for (u8*& b : all) REQUIRE((b = pool.alloc_bulk()) != nullptr);
-    bool found = false;
-    for (u8* b : all) found |= b == target;
-    REQUIRE(found);
-    bool all_zero = true;
-    for (u32 i = 0; i < SlicePool::kBulkSliceSize; ++i) all_zero &= target[i] == 0;
-    CHECK(all_zero);
-    // An overstated extent is clamped to the buffer.
-    pool.free_written(target, 0xFFFFFFFFu);
-    for (u8* b : all)
-        if (b != target) pool.free(b);
-    CHECK_EQ(pool.bulk_available(), kTestBulk);
-    pool.destroy();
 }
 
 // A burst that touches more bulk buffers than the resident cache holds must
@@ -15815,8 +15787,7 @@ TEST(slice_pool, bulk_burst_discards_returns_beyond_the_resident_cache) {
     CHECK_EQ(pool.bulk_cached_count, SlicePool::kMaxCachedBulk);
 
 #ifdef __linux__
-    // Only Linux discards with MADV_DONTNEED; elsewhere a discarded buffer is
-    // zeroed in place and stays resident.
+    // Only Linux discards excess bulk pages with MADV_DONTNEED.
     const u64 page = static_cast<u64>(sysconf(_SC_PAGESIZE));
     const u64 pages = SlicePool::kBulkSliceSize / page;
     unsigned char residency[SlicePool::kBulkSliceSize / 4096]{};
@@ -15839,7 +15810,7 @@ TEST(slice_pool, bulk_burst_discards_returns_beyond_the_resident_cache) {
     CHECK_EQ(released, kTestBulk - SlicePool::kMaxCachedBulk);
 #endif
 
-    // Reuse drains the resident set first, and every reused buffer reads zero.
+    // Reuse drains the resident set first without clearing retained bytes.
     u8* again[kTestBulk]{};
     for (u32 i = 0; i < kTestBulk; ++i) {
         REQUIRE((again[i] = pool.alloc_bulk()) != nullptr);
@@ -15848,9 +15819,10 @@ TEST(slice_pool, bulk_burst_discards_returns_beyond_the_resident_cache) {
             for (u32 j = 0; j < SlicePool::kMaxCachedBulk; ++j) hot |= again[i] == all[j];
             CHECK(hot);
         }
-        bool zero = true;
-        for (u32 byte = 0; byte < SlicePool::kBulkSliceSize; ++byte) zero &= again[i][byte] == 0;
-        CHECK(zero);
+        if (i < SlicePool::kMaxCachedBulk) {
+            CHECK_EQ(again[i][0], 0x5au);
+            CHECK_EQ(again[i][SlicePool::kBulkSliceSize - 1], 0x5au);
+        }
     }
     CHECK_EQ(pool.bulk_cached_count, 0u);
     CHECK_EQ(pool.alloc_bulk(), nullptr);
