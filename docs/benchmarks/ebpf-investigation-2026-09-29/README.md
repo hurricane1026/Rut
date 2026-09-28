@@ -410,3 +410,18 @@ about two upstream receives per request versus nginx one at c1; at c32 the
 relationship changed, so this is workload/timing dependent. Instrumented
 throughput is not used as acceptance evidence. The small-body gap calls for
 control-path and receive-attempt analysis, not a bulk-copy explanation.
+
+The rejected HTTP 1 MiB proxy-close coordinates were retried successfully;
+`matrix-quick-combined.json` retains their replacement rows with provenance
+to both original matrices. All 96 coordinates now have valid short diagnostic
+comparisons, still none eligible for acceptance. The failed original rows
+remain preserved.
+
+Three-repeat static 1 MiB keepalive validation confirmed the gap, with
+nginx/Rut median RPS of 5,442/4,456 (c1), 9,907/8,689 (c32), and
+9,719/8,565 (c128), ratios 0.819/0.877/0.881. All preflight and warmup/load
+checks passed without host-guard rejection. eBPF sees about 17 kernel
+`tcp_sendmsg` calls per request on both engines (including sendfile's internal
+chunks, not 17 application syscalls). At c32 Rut's send elapsed and process
+CPU times are lower despite lower throughput. These results do not establish
+a server-copy CPU bottleneck; the file-prefix prototype remains under test.

@@ -1,0 +1,154 @@
+[
+  {
+    "case": "1048576-c1-keepalive-nginx",
+    "requests": 31793,
+    "rps_traced": 3925.3054850196254,
+    "errors": [
+      0,
+      0,
+      0,
+      0,
+      0
+    ],
+    "usable": true,
+    "user_us": 4.718019689868839,
+    "system_us": 60.705186676312394,
+    "minor_faults_per_request": 0.0,
+    "runqueue_ns_per_request": 702.2710974113799,
+    "offcpu_ns_per_request": 173193.64784701035,
+    "downstream_recv": {
+      "calls_per_request": 1.0000629069291982,
+      "bytes_per_call": 45.99710646328039,
+      "us_per_request": 1.3057969993394771,
+      "ns_per_byte": 28.386891289988636
+    },
+    "downstream_send": {
+      "calls_per_request": 17.0,
+      "bytes_per_call": 61690.82352941176,
+      "us_per_request": 47.20769949359922,
+      "ns_per_byte": 0.045013558593516835
+    },
+    "copy_side_1": {
+      "ns_per_byte": 7.672186521780157,
+      "us_per_request": 0.35292058000188725,
+      "bytes_per_request": 46.0
+    }
+  },
+  {
+    "case": "1048576-c1-keepalive-rut",
+    "requests": 31903,
+    "rps_traced": 3987.779293296961,
+    "errors": [
+      0,
+      0,
+      0,
+      0,
+      0
+    ],
+    "usable": true,
+    "user_us": 2.5076011660345423,
+    "system_us": 63.943829733880825,
+    "minor_faults_per_request": 0.0,
+    "runqueue_ns_per_request": 1106.053756699997,
+    "offcpu_ns_per_request": 644163.350688023,
+    "downstream_recv": {
+      "calls_per_request": 1.0000940350437264,
+      "bytes_per_call": 45.99567479470946,
+      "us_per_request": 1.2689698147509638,
+      "ns_per_byte": 27.58630032067313
+    },
+    "downstream_send": {
+      "calls_per_request": 17.0,
+      "bytes_per_call": 61687.35294117647,
+      "us_per_request": 51.907634987305265,
+      "ns_per_byte": 0.04949783298827128
+    },
+    "copy_side_1": {
+      "ns_per_byte": 7.6931302630664415,
+      "us_per_request": 0.3538839921010563,
+      "bytes_per_request": 46.0
+    }
+  },
+  {
+    "case": "1048576-c32-keepalive-nginx",
+    "requests": 69562,
+    "rps_traced": 8651.378857812035,
+    "errors": [
+      0,
+      0,
+      0,
+      0,
+      0
+    ],
+    "usable": true,
+    "user_us": 3.737672867370116,
+    "system_us": 51.32112360196659,
+    "minor_faults_per_request": 0.0,
+    "runqueue_ns_per_request": 302.7028406313792,
+    "offcpu_ns_per_request": 47993.878784393775,
+    "downstream_recv": {
+      "calls_per_request": 1.0004743969408585,
+      "bytes_per_call": 45.98876356060062,
+      "us_per_request": 1.2324787958943102,
+      "ns_per_byte": 26.78685604020261
+    },
+    "downstream_send": {
+      "calls_per_request": 17.003910180845864,
+      "bytes_per_call": 61690.82352941176,
+      "us_per_request": 33.825415384836546,
+      "ns_per_byte": 0.03224584547666735
+    },
+    "other_recv": {
+      "calls_per_request": 0.00023001063799200713,
+      "bytes_per_call": 0.0,
+      "us_per_request": 9.981024122365659e-05,
+      "ns_per_byte": 0
+    },
+    "copy_side_1": {
+      "ns_per_byte": 7.704788620091058,
+      "us_per_request": 0.3545017969581093,
+      "bytes_per_request": 46.01058048934763
+    }
+  },
+  {
+    "case": "1048576-c32-keepalive-rut",
+    "requests": 61956,
+    "rps_traced": 7682.833735025816,
+    "errors": [
+      0,
+      0,
+      0,
+      0,
+      0
+    ],
+    "usable": true,
+    "user_us": 1.452643811737362,
+    "system_us": 47.45303118342049,
+    "minor_faults_per_request": 0.0,
+    "runqueue_ns_per_request": 382.05166569823746,
+    "offcpu_ns_per_request": 321534.0077474337,
+    "downstream_recv": {
+      "calls_per_request": 1.0010491316418104,
+      "bytes_per_call": 45.96069073378372,
+      "us_per_request": 1.0274957711924593,
+      "ns_per_byte": 22.332539094511613
+    },
+    "downstream_send": {
+      "calls_per_request": 17.003292659306606,
+      "bytes_per_call": 61687.35294117647,
+      "us_per_request": 27.452189360191102,
+      "ns_per_byte": 0.026172657460953205
+    },
+    "other_recv": {
+      "calls_per_request": 0.0001936858415649816,
+      "bytes_per_call": 0.0,
+      "us_per_request": 9.80050358318807e-05,
+      "ns_per_byte": 0
+    },
+    "copy_side_1": {
+      "ns_per_byte": 6.143484996463813,
+      "us_per_request": 0.28265504551617276,
+      "bytes_per_request": 46.00890954871199
+    }
+  }
+]
