@@ -1,0 +1,5 @@
+{
+  "source_commit": "b833535e118c5080d29e29c6ef363a4448da0a17",
+  "runtime_compile_command": "/usr/bin/clang++ -I/tmp/rut-bounded-followup-20260928/ipo-source/include -I/tmp/rut-bounded-followup-20260928/ipo-source/src -I/tmp/rut-bounded-followup-20260928/ipo-source/src/runtime/simd -I/tmp/rut-bounded-followup-20260928/ipo-source/third_party/zstd/lib -I/tmp/rut-bounded-followup-20260928/ipo-source/third_party/zstd/lib/common -I/tmp/rut-bounded-followup-20260928/ipo-source/third_party/boringssl/include  -fno-exceptions -fno-rtti -fno-unwind-tables -fno-asynchronous-unwind-tables -ffunction-sections -fdata-sections -Wall -Wextra -Wpedantic -Wswitch-enum -O2 -DNDEBUG -std=c++23 -flto=thin -Werror=unused-result -o src/CMakeFiles/rut_runtime.dir/runtime/io_uring_backend.cc.o -c /tmp/rut-bounded-followup-20260928/ipo-source/src/runtime/io_uring_backend.cc",
+  "binary_sha256": "7435ba58ccde73d0b649ab0edbec44ca7d219c18d0f54e8497c63954539657d4"
+}

@@ -772,3 +772,17 @@ A thread-local 29-byte cache keyed by exact realtime second avoids repeated gmti
 | date-cache-r2 | 65536-c1-keepalive | -1.03% |
 
 The throughput improvement is not repeatable; 64 KiB keepalive regresses in both orders. Reverted runtime and test changes, retaining patch and raw evidence. Build-rel still contains the rejected candidate until rebuilt; rut-small-poll-first remains the accepted frozen binary. An independent accepted-source build with the existing RUT_ENABLE_IPO option is queued to test code-generation effects without changing runtime semantics.
+
+## Rejected ThinLTO build control
+
+An independent source snapshot of b833535e (accepted runtime unchanged since 06cdea9d) enables the existing RUT_ENABLE_IPO option. The runtime command differs from baseline only by -flto=thin after excluding source/build paths; dependencies also receive IPO through CMake. Build completed, binary hash and compile command retained. All body preflight and warm/load checks passed. Two alternating 6-second samples per engine:
+
+| Case | Mean RPS change |
+|---|---:|
+| 16-c1-close | +0.06% |
+| 16-c1-keepalive | -0.16% |
+| 16-c32-close | -0.91% |
+| 65536-c1-close | -0.81% |
+| 65536-c1-keepalive | -0.58% |
+
+No measured improvement supports retaining IPO for this goal. No default build setting changed and no full IPO network suite was run. These diagnostic samples do not establish a universal LTO regression.

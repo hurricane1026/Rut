@@ -1,0 +1,124 @@
+-- The CXX compiler identification is Clang 22.1.8
+-- The C compiler identification is Clang 22.1.8
+-- Detecting CXX compiler ABI info
+-- Detecting CXX compiler ABI info - done
+-- Check for working CXX compiler: /usr/bin/clang++ - skipped
+-- Detecting CXX compile features
+-- Detecting CXX compile features - done
+-- Detecting C compiler ABI info
+-- Detecting C compiler ABI info - done
+-- Check for working C compiler: /usr/bin/clang - skipped
+-- Detecting C compile features
+-- Detecting C compile features - done
+-- Could NOT find FFI (missing: FFI_LIBRARIES HAVE_FFI_CALL) 
+-- Looking for histedit.h
+-- Looking for histedit.h - found
+-- Found LibEdit: /usr/include (found version "2.11")
+-- Could NOT find ZLIB (missing: ZLIB_LIBRARY ZLIB_INCLUDE_DIR) 
+-- Found zstd: /usr/lib64/libzstd.so
+-- Could NOT find LibXml2 (missing: LIBXML2_LIBRARY LIBXML2_INCLUDE_DIR) 
+-- Found LLVM 22.1.8
+-- Using LLVMConfig.cmake in: /usr/lib64/cmake/llvm
+-- The ASM compiler identification is Clang with GNU-like command-line
+-- Found assembler: /usr/bin/clang
+-- Performing Test CMAKE_HAVE_LIBC_PTHREAD
+-- Performing Test CMAKE_HAVE_LIBC_PTHREAD - Success
+-- Found Threads: TRUE
+-- SIMD backend: sse2
+-- Build date: 2026-09-29
+CMake Warning (dev) at third_party/vectorscan/cmake/boost.cmake:17 (find_package):
+  Policy CMP0167 is not set: The FindBoost module is removed.  Run "cmake
+  --help-policy CMP0167" for policy details.  Use the cmake_policy command to
+  set the policy and suppress this warning.
+
+Call Stack (most recent call first):
+  third_party/vectorscan/CMakeLists.txt:26 (include)
+This warning is for project developers.  Use -Wno-dev to suppress it.
+
+-- Boost version: 1.90.0
+-- Build type RELEASE
+-- using release build
+-- clang++ version 22.1.8
+-- Building static libraries
+-- Performing Test ARCH_X86_64
+-- Performing Test ARCH_X86_64 - Success
+-- Performing Test ARCH_IA32
+-- Performing Test ARCH_IA32 - Failed
+-- Performing Test ARCH_AARCH64
+-- Performing Test ARCH_AARCH64 - Failed
+-- Performing Test ARCH_ARM32
+-- Performing Test ARCH_ARM32 - Failed
+-- Performing Test ARCH_PPC64EL
+-- Performing Test ARCH_PPC64EL - Failed
+-- Looking for include file intrin.h
+-- Looking for include file intrin.h - not found
+-- Looking for C++ include intrin.h
+-- Looking for C++ include intrin.h - not found
+-- Looking for include file x86intrin.h
+-- Looking for include file x86intrin.h - found
+-- Looking for C++ include x86intrin.h
+-- Looking for C++ include x86intrin.h - found
+-- Performing Test HAVE_SSE42
+-- Performing Test HAVE_SSE42 - Success
+-- Performing Test HAVE_AVX2
+-- Performing Test HAVE_AVX2 - Success
+-- Performing Test HAVE_AVX512
+-- Performing Test HAVE_AVX512 - Success
+-- Performing Test HAVE_AVX512VBMI
+-- Performing Test HAVE_AVX512VBMI - Success
+-- Building without AVX2 support
+-- GNUCC_TUNE is not set
+-- ARCH_C_FLAGS   : -march=x86-64-v2 -mtune=generic -msse4.2
+-- ARCH_CXX_FLAGS : -march=x86-64-v2 -mtune=generic -msse4.2
+-- Looking for include file unistd.h
+-- Looking for include file unistd.h - found
+-- Looking for posix_memalign
+-- Looking for posix_memalign - found
+-- Looking for _aligned_malloc
+-- Looking for _aligned_malloc - not found
+-- Performing Test HAS_C_HIDDEN
+-- Performing Test HAS_C_HIDDEN - Success
+-- Performing Test HAS_CXX_HIDDEN
+-- Performing Test HAS_CXX_HIDDEN - Success
+-- Looking for _LIBCPP_VERSION
+-- Looking for _LIBCPP_VERSION - not found
+-- Performing Test HAVE_CC_BUILTIN_ASSUME_ALIGNED
+-- Performing Test HAVE_CC_BUILTIN_ASSUME_ALIGNED - Success
+-- Performing Test HAVE_CXX_BUILTIN_ASSUME_ALIGNED
+-- Performing Test HAVE_CXX_BUILTIN_ASSUME_ALIGNED - Success
+-- Performing Test CXX_UNUSED_BUT_SET_VAR
+-- Performing Test CXX_UNUSED_BUT_SET_VAR - Success
+-- Performing Test CXX_IGNORED_ATTR
+-- Performing Test CXX_IGNORED_ATTR - Success
+-- Performing Test CXX_NON_NULL
+-- Performing Test CXX_NON_NULL - Success
+-- Performing Test CXX_WEAK_VTABLES
+-- Performing Test CXX_WEAK_VTABLES - Success
+-- Performing Test CXX_MISSING_DECLARATIONS
+-- Performing Test CXX_MISSING_DECLARATIONS - Success
+-- Performing Test CXX_UNUSED_LOCAL_TYPEDEFS
+-- Performing Test CXX_UNUSED_LOCAL_TYPEDEFS - Success
+-- Performing Test CXX_WUNUSED_VARIABLE
+-- Performing Test CXX_WUNUSED_VARIABLE - Success
+-- Found PkgConfig: /usr/bin/pkg-config (found version "2.5.1")
+-- Checking for module 'libpcre>=8.41'
+--   Package 'libpcre' not found
+-- PCRE version 8.41 or above not found
+-- PCRE 8.41 or above not found
+-- Looking for C++ include pthread_np.h
+-- Looking for C++ include pthread_np.h - not found
+-- Looking for pthread_setaffinity_np
+-- Looking for pthread_setaffinity_np - found
+-- Looking for malloc_info
+-- Looking for malloc_info - found
+-- Looking for shmget
+-- Looking for shmget - found
+-- Looking for mmap
+-- Looking for mmap - found
+RAGEL_C_FLAGS-Wno-unused -funsigned-char
+-- Doxygen not found, unable to generate API reference
+-- Sphinx not found, unable to generate developer reference
+-- Found Python3: /usr/bin/python3.14 (found version "3.14.7") found components: Interpreter
+-- Configuring done (3.9s)
+-- Generating done (0.1s)
+-- Build files have been written to: /tmp/rut-bounded-followup-20260928/ipo-build
