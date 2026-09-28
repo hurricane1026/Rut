@@ -1,0 +1,143 @@
+#!/usr/bin/env python3
+"""Opt-in privileged smoke test: real TCP relay, byte checks, faults and scheduling."""
+
+import argparse
+import json
+import mmap
+import multiprocessing
+from pathlib import Path
+import signal
+import socket
+import subprocess
+import sys
+import threading
+import time
+
+
+def receive(sock, size):
+    chunks = []
+    while size:
+        chunk = sock.recv(size)
+        if not chunk:
+            raise RuntimeError("unexpected EOF")
+        chunks.append(chunk)
+        size -= len(chunk)
+    return b"".join(chunks)
+
+
+def fixture(pipe, stop):
+    def listener():
+        sock = socket.socket()
+        sock.bind(("127.0.0.1", 0))
+        sock.listen()
+        sock.settimeout(0.1)
+        return sock
+
+    origin, front = listener(), listener()
+    origin_port = origin.getsockname()[1]
+
+    def echo(peer):
+        with peer:
+            while data := peer.recv(65536):
+                peer.sendall(data)
+
+    def relay(peer):
+        # Fault fresh ordinary pages while the trace is active.
+        with mmap.mmap(-1, 1024 * 1024) as memory:
+            for offset in range(0, len(memory), 4096):
+                memory[offset] = 1
+        with peer, socket.create_connection(("127.0.0.1", origin_port), timeout=3) as upstream:
+            while data := peer.recv(65536):
+                upstream.sendall(data)
+                peer.sendall(receive(upstream, len(data)))
+
+    def accept(sock, handler):
+        while not stop.is_set():
+            try:
+                peer, _ = sock.accept()
+            except socket.timeout:
+                continue
+            threading.Thread(target=handler, args=(peer,), daemon=True).start()
+
+    for sock, handler in ((origin, echo), (front, relay)):
+        threading.Thread(target=accept, args=(sock, handler), daemon=True).start()
+    pipe.send((front.getsockname()[1], origin_port))
+    stop.wait()
+    origin.close()
+    front.close()
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--bpftrace", default="bpftrace")
+    parser.add_argument("--output", type=Path, required=True)
+    args = parser.parse_args()
+    args.output.mkdir(parents=True, exist_ok=False)
+    parent, child = multiprocessing.Pipe()
+    stop = multiprocessing.Event()
+    server = multiprocessing.Process(target=fixture, args=(child, stop))
+    tracer = None
+    server.start()
+    try:
+        if not parent.poll(10):
+            raise RuntimeError("fixture did not start")
+        front, origin = parent.recv()
+        command = [sys.executable, str(Path(__file__).with_name("trace.py")),
+                   "--pid", str(server.pid), "--front-port", str(front),
+                   "--origin-port", str(origin), "--duration", "8",
+                   "--groups", "tcp", "sched", "fault", "rx-copy", "stacks",
+                   "--bpftrace", args.bpftrace, "--output", str(args.output / "trace")]
+        tracer = subprocess.Popen(command)
+        raw = args.output / "trace" / "trace.jsonl"
+        deadline = time.monotonic() + 120
+        while not raw.exists() or "RUT_TRACE_READY" not in raw.read_text():
+            if tracer.poll() is not None or time.monotonic() > deadline:
+                raise RuntimeError("tracer did not become ready; inspect stderr.log")
+            time.sleep(0.1)
+        body = bytes(range(256)) * 256
+        transferred = 0
+        # Threads are created after attach, exercising dynamic scheduler selection.
+        for _ in range(12):
+            with socket.create_connection(("127.0.0.1", front), timeout=3) as client:
+                for _ in range(8):
+                    client.sendall(body)
+                    if receive(client, len(body)) != body:
+                        raise RuntimeError("relay body mismatch")
+                    transferred += len(body)
+        if tracer.wait(timeout=120) != 0:
+            raise RuntimeError("trace rejected; inspect status.json/stderr.log")
+        result = json.loads((args.output / "trace" / "summary.json").read_text())
+        maps = result["maps"]
+        for name in ("@tcp_calls", "@tcp_returned_bytes", "@runqueue_samples",
+                     "@offcpu_samples", "@minor_faults", "@copy_success_bytes"):
+            if not maps.get(name):
+                raise RuntimeError(f"expected events absent: {name}")
+        for side in (1, 2):
+            for direction in (1, 2):
+                key = f"{server.pid},{direction},{side}"
+                if maps["@tcp_returned_bytes"].get(key) != transferred:
+                    raise RuntimeError(f"incorrect PID/side/byte accounting: {key}")
+            key = f"{server.pid},1,{side}"
+            if maps["@copy_success_bytes"].get(key) != transferred:
+                raise RuntimeError(f"incorrect receive-copy byte accounting: {key}")
+        (args.output / "smoke.json").write_text(json.dumps(
+            {"passed": True, "echo_bytes_checked": transferred, "target_pid": server.pid,
+             "front_port": front, "origin_port": origin}, indent=2) + "\n")
+        print(f"PASS: {transferred} echoed bytes checked; tracing evidence in {args.output}")
+    finally:
+        if tracer is not None and tracer.poll() is None:
+            tracer.send_signal(signal.SIGINT)
+            try:
+                tracer.wait(timeout=15)
+            except subprocess.TimeoutExpired:
+                tracer.kill()
+                tracer.wait()
+        stop.set()
+        server.join(timeout=5)
+        if server.is_alive():
+            server.terminate()
+            server.join()
+
+
+if __name__ == "__main__":
+    main()
