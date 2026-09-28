@@ -878,3 +878,19 @@ Keep the accepted prefix and logical completion while limiting each sendfile sys
 | 1m-c32-keepalive | +2.37% |
 
 The c1 and close controls do not support retaining the concurrent keepalive signal; reverted without full network regression. The next small-response control targets CombinedSend, which the earlier rejected final-proxy-FIN patch did not cover (it only handled BodySend and tested >=64 KiB).
+
+## Small closing CombinedSend early FIN: first control
+
+A complete <=4096-byte plaintext Bounded response, with exact CombinedSend frame and retired upstream, uses the existing direct local-response write/early shutdown path. Its generation-authenticated CQE still owns completion/accounting; partial sends keep the existing async remainder. No keepalive/TLS/streaming path is admitted. All preflight/warm/load checks pass.
+
+| Case | Mean RPS change |
+|---|---:|
+| 1024-c1-close | +2.01% |
+| 1024-c32-close | +12.82% |
+| 16-c1-close | +2.03% |
+| 16-c1-keepalive | -0.21% |
+| 16-c32-close | +14.76% |
+| 65536-c1-close | -0.13% |
+| 65536-c1-keepalive | +0.63% |
+
+This targets the merged small response, unlike the previous >=64 KiB BodySend-only FIN experiment. A new lifecycle regression asserts body and EOF are visible before completion, peer EOF cannot pre-empt accounting, and duplicate completion does not count twice. Full network testing and reverse order are pending; no retention or nginx acceptance claim yet.
