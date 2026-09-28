@@ -786,3 +786,16 @@ An independent source snapshot of b833535e (accepted runtime unchanged since 06c
 | 65536-c1-keepalive | -0.58% |
 
 No measured improvement supports retaining IPO for this goal. No default build setting changed and no full IPO network suite was run. These diagnostic samples do not establish a universal LTO regression.
+
+## 64 KiB front-side send geometry
+
+All four traces usable with exact-body preflight and zero warm/load errors. Kernel tcp_sendmsg entry counts normalized by measured completed requests:
+
+| Case | Calls/request |
+|---|---:|
+| 65536-c1-close-nginx | 5.0248 |
+| 65536-c1-close-rut-base | 3.0063 |
+| 65536-c1-keepalive-nginx | 5.1330 |
+| 65536-c1-keepalive-rut-base | 3.0009 |
+
+Rut uses approximately three calls: a 128–255 byte rewritten header, an 8–16 KiB first body fragment, and a 32–64 KiB remainder. nginx uses about five. Thus excess Rut send-call count is not supported; Rut still pays serial completion/pump transitions between its three fragments. Different probe counts bias instrumented throughput, so no throughput conclusion is drawn. A small-header synchronous-completion prototype is being tested separately; it preserves the existing owned Send generation, exact-frame checks and ordinary asynchronous body completion.

@@ -1,0 +1,172 @@
+[
+  {
+    "case": "65536-c1-close-nginx",
+    "requests": 44430,
+    "front_send_calls_per_request": 5.024803060994823,
+    "send_size_histogram": {
+      "2762589": [
+        {
+          "min": 4096,
+          "max": 8191,
+          "count": 1102
+        },
+        {
+          "min": 8192,
+          "max": 16383,
+          "count": 177720
+        },
+        {
+          "min": 16384,
+          "max": 32767,
+          "count": 1102
+        },
+        {
+          "min": 32768,
+          "max": 65535,
+          "count": 43328
+        }
+      ]
+    },
+    "usable": true
+  },
+  {
+    "case": "65536-c1-close-rut-base",
+    "requests": 46379,
+    "front_send_calls_per_request": 3.00631751439229,
+    "send_size_histogram": {
+      "2762853": [
+        {
+          "min": 128,
+          "max": 255,
+          "count": 46379
+        },
+        {
+          "min": 256,
+          "max": 511,
+          "count": 0
+        },
+        {
+          "min": 512,
+          "max": 1023,
+          "count": 0
+        },
+        {
+          "min": 1024,
+          "max": 2047,
+          "count": 0
+        },
+        {
+          "min": 2048,
+          "max": 4095,
+          "count": 0
+        },
+        {
+          "min": 4096,
+          "max": 8191,
+          "count": 0
+        },
+        {
+          "min": 8192,
+          "max": 16383,
+          "count": 46379
+        },
+        {
+          "min": 16384,
+          "max": 32767,
+          "count": 293
+        },
+        {
+          "min": 32768,
+          "max": 65535,
+          "count": 46379
+        }
+      ]
+    },
+    "usable": true
+  },
+  {
+    "case": "65536-c1-keepalive-nginx",
+    "requests": 56268,
+    "front_send_calls_per_request": 5.133006326864292,
+    "send_size_histogram": {
+      "2763272": [
+        {
+          "min": 4096,
+          "max": 8191,
+          "count": 7479
+        },
+        {
+          "min": 8192,
+          "max": 16383,
+          "count": 225076
+        },
+        {
+          "min": 16384,
+          "max": 32767,
+          "count": 7479
+        },
+        {
+          "min": 32768,
+          "max": 65535,
+          "count": 48790
+        }
+      ]
+    },
+    "usable": true
+  },
+  {
+    "case": "65536-c1-keepalive-rut-base",
+    "requests": 59587,
+    "front_send_calls_per_request": 3.000855891385705,
+    "send_size_histogram": {
+      "2763519": [
+        {
+          "min": 128,
+          "max": 255,
+          "count": 59587
+        },
+        {
+          "min": 256,
+          "max": 511,
+          "count": 0
+        },
+        {
+          "min": 512,
+          "max": 1023,
+          "count": 0
+        },
+        {
+          "min": 1024,
+          "max": 2047,
+          "count": 0
+        },
+        {
+          "min": 2048,
+          "max": 4095,
+          "count": 0
+        },
+        {
+          "min": 4096,
+          "max": 8191,
+          "count": 0
+        },
+        {
+          "min": 8192,
+          "max": 16383,
+          "count": 59587
+        },
+        {
+          "min": 16384,
+          "max": 32767,
+          "count": 51
+        },
+        {
+          "min": 32768,
+          "max": 65535,
+          "count": 59587
+        }
+      ]
+    },
+    "usable": true
+  }
+]
