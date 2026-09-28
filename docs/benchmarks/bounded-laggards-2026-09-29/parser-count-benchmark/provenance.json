@@ -1,0 +1,15 @@
+{
+  "candidate_commit": "c108b5f3",
+  "baseline_tree": "60396bc5",
+  "baseline_binary_sha256": "de0ba69caf88cbe88789d81621d5ea90561cf6dda42a45b46730360f76ad18b6",
+  "candidate_binary_sha256": "8a30d07949c4a99e6d6d32e1b1f1633858587ec30b7841b1d738079dcc5f4d8a",
+  "raw_directory": "/tmp/rut-bounded-followup-20260928",
+  "accepted_cells": [
+    "HTTP 64 KiB close c1",
+    "HTTP 64 KiB keepalive c1"
+  ],
+  "excluded_comparisons": [
+    "HTTP 1 MiB close c32/c128 round 1: external compilation observed during candidate phase",
+    "HTTP 1 MiB close c32/c128 round 2: external compilation recorded during repeat"
+  ]
+}
