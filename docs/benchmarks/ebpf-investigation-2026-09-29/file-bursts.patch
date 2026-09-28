@@ -1,0 +1,43 @@
+diff --git a/src/runtime/io_uring_backend.cc b/src/runtime/io_uring_backend.cc
+index fb5132ee..aa5b39a0 100644
+--- a/src/runtime/io_uring_backend.cc
++++ b/src/runtime/io_uring_backend.cc
+@@ -29,6 +29,20 @@
+ 
+ namespace rut {
+ 
++// Experimental bounded syscall bursts; preserve one logical file-send completion.
++static ssize_t send_file_bursts(i32 fd, i32 file_fd, off_t* pos, u32 len) {
++    u32 written = 0;
++    while (written < len) {
++        const u32 remaining = len - written;
++        const u32 batch = remaining < 256u * 1024u ? remaining : 256u * 1024u;
++        const ssize_t n = ::sendfile(fd, file_fd, pos, batch);
++        if (n <= 0) return written != 0 ? static_cast<ssize_t>(written) : n;
++        written += static_cast<u32>(n);
++        if (static_cast<u32>(n) < batch) break;
++    }
++    return static_cast<ssize_t>(written);
++}
++
+ static bool response_deadline_copy_owner(const Connection& conn, u32 upstream_episode, u32 aux) {
+     const bool post_commit =
+         conn.response_read_deadline_post_commit_phase != ResponseReadDeadlinePostCommitPhase::None;
+@@ -672,7 +686,7 @@ bool IoUringBackend::add_send_file(i32 fd,
+     io_uring_sqe* sqe = get_sqe();
+     if (!sqe) return false;  // the completion must stay accountable
+     off_t pos = static_cast<off_t>(file_off);
+-    const ssize_t n = ::sendfile(fd, file_fd, &pos, len);
++    const ssize_t n = send_file_bursts(fd, file_fd, &pos, len);
+     // get_sqe() only reserves the slot; leaving it unsubmitted needs no undo.
+     if (n < 0 && errno != EAGAIN && errno != EWOULDBLOCK) return false;
+     const u32 written = n > 0 ? static_cast<u32>(n) : 0;
+@@ -1883,7 +1897,7 @@ u32 IoUringBackend::wait(IoEvent* events, u32 max_events, Connection* conns, u32
+                     result = -ECANCELED;
+                 if (result == 0 && ss.remaining > 0) {
+                     off_t pos = static_cast<off_t>(ss.file_base) + ss.offset;
+-                    const ssize_t n = ::sendfile(ss.fd, ss.file_fd, &pos, ss.remaining);
++                    const ssize_t n = send_file_bursts(ss.fd, ss.file_fd, &pos, ss.remaining);
+                     if (n > 0) {
+                         ss.offset += static_cast<u32>(n);
+                         ss.remaining -= static_cast<u32>(n);

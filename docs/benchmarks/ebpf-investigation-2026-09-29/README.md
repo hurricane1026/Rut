@@ -866,3 +866,15 @@ The 32 KiB body prefix retains page alignment with a wider staging buffer; all p
 | 1m-c32-keepalive | -12.37% |
 
 It also regresses concurrent cases and reintroduces c1 bimodality. Reverted without full network regression. This ends the prefix-size series. Slow c1 samples have negligible runqueue delay (roughly 0.05–0.1 us/request); they spend less server CPU per request, consistent with socket waiting rather than observed CPU scheduling delay, though not a proof of the exact TCP mechanism.
+
+## Rejected 256 KiB sendfile syscall bursts
+
+Keep the accepted prefix and logical completion while limiting each sendfile syscall to 256 KiB, looping while full bursts succeed. All preflight/warm/load checks passed.
+
+| Case | Mean RPS change |
+|---|---:|
+| 1m-c1-keepalive | -2.08% |
+| 1m-c32-close | -1.55% |
+| 1m-c32-keepalive | +2.37% |
+
+The c1 and close controls do not support retaining the concurrent keepalive signal; reverted without full network regression. The next small-response control targets CombinedSend, which the earlier rejected final-proxy-FIN patch did not cover (it only handled BodySend and tested >=64 KiB).
