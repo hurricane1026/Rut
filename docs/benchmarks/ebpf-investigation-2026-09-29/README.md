@@ -966,3 +966,17 @@ Formatting now passes for the two changed runtime/test files, with whitespace-on
 The current small-proxy profile identifies header-name scanning among the remaining userspace hotspots. Its AVX2 implementation finds the colon in parallel but validates preceding bytes with a scalar table loop. This prototype replaces that loop with low/high-nibble shuffle tables derived at compile time from the existing token table; only bytes before the first colon participate, and the scalar tail is unchanged. No parser policy is relaxed.
 
 A scalar-oracle differential test covers all 256 byte values, 32 starting alignments, lengths around 16/32/64-byte boundaries, mutation before/at/after the delimiter, and both short and full scan bounds. All 217 parser tests / 724747 checks pass. The first uninstrumented causal order compares against the accepted CombinedSend FIN binary; full network regression and retention depend on its results.
+
+## Token validation forward-order control
+
+All 28 samples complete with exact-body and zero warm/load errors. These small effects need the already-running reverse order before a retention decision.
+
+| Case | Mean RPS change |
+|---|---:|
+| 1024-c1-close | -0.01% |
+| 1024-c32-close | +1.18% |
+| 16-c1-close | +0.11% |
+| 16-c1-keepalive | +0.41% |
+| 16-c32-close | +0.34% |
+| 65536-c1-close | +0.52% |
+| 65536-c1-keepalive | -0.31% |
