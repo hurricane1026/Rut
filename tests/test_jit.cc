@@ -7,6 +7,7 @@
 #include "rut/compiler/parser.h"
 #include "rut/compiler/rir.h"
 #include "rut/compiler/rir_builder.h"
+#include "rut/jit/art_jit_codegen.h"
 #include "rut/jit/codegen.h"
 #include "rut/jit/handler_abi.h"
 #include "rut/jit/jit_engine.h"
@@ -25,6 +26,8 @@
 
 #include <pthread.h>
 #include <stdio.h>
+#include <sys/mman.h>
+#include <unistd.h>
 
 using namespace rut;
 using namespace rut::rir;
@@ -21619,4 +21622,74 @@ TEST(jit, guard_let_shorthand_over_pure_optional_local) {
 
 int main(int argc, char** argv) {
     return rut::test::run_all(argc, argv);
+}
+
+TEST(jit, art_segment_prefix_terminal_boundaries) {
+    JitEngine engine;
+    REQUIRE(engine.init());
+    auto cfg = std::make_unique<RouteConfig>();
+    auto& trie = cfg->art_state;
+    REQUIRE(trie.insert(lit("/"), 0, 0));
+    REQUIRE(trie.insert(lit("/api"), 0, 1));
+    REQUIRE(trie.insert(lit("/api/v1"), 0, 2));
+    REQUIRE(trie.insert(lit("/apix"), 0, 3));
+    REQUIRE(trie.insert(lit("/api"), 'G', 4));
+    auto fn = art_jit_specialize(engine, trie, "test_segment_boundaries");
+    REQUIRE(fn != nullptr);
+    struct Case {
+        const char* path;
+        u8 method;
+        u16 expected;
+    };
+    const Case cases[] = {{"", 'G', 0},
+                          {"api", 'G', 4},
+                          {"api/child", 'G', 4},
+                          {"apifoo", 'G', 0},
+                          {"api/v1x", 'G', 4},
+                          {"api/v1/child", 'G', 2},
+                          {"apix", 'G', 3},
+                          {"apixyz", 'G', 0},
+                          {"api", 'P', 1}};
+    for (const auto& c : cases) {
+        Str path = lit(c.path);
+        u8 key = static_cast<u8>(method_slot(c.method));
+        CHECK_EQ(trie.match_canonical_key(path, key), c.expected);
+        CHECK_EQ(fn(path.ptr, path.len, key), c.expected);
+    }
+    engine.shutdown();
+}
+
+TEST(jit, art_segment_boundary_at_unreadable_page) {
+    const long page_size = sysconf(_SC_PAGESIZE);
+    REQUIRE(page_size > 0);
+    struct Mapping {
+        void* ptr;
+        size_t size;
+        ~Mapping() {
+            if (ptr != MAP_FAILED) munmap(ptr, size);
+        }
+    } mapping{mmap(nullptr,
+                   static_cast<size_t>(page_size) * 2,
+                   PROT_READ | PROT_WRITE,
+                   MAP_PRIVATE | MAP_ANONYMOUS,
+                   -1,
+                   0),
+              static_cast<size_t>(page_size) * 2};
+    REQUIRE(mapping.ptr != MAP_FAILED);
+    char* end = static_cast<char*>(mapping.ptr) + page_size;
+    REQUIRE(mprotect(end, static_cast<size_t>(page_size), PROT_NONE) == 0);
+    end[-3] = 'a';
+    end[-2] = 'p';
+    end[-1] = 'i';
+    JitEngine engine;
+    REQUIRE(engine.init());
+    ArtTrie trie(ArtMatchMode::SegmentPrefix);
+    REQUIRE(trie.insert(lit("/api"), 0, 1));
+    auto fn = art_jit_specialize(engine, trie, "test_segment_guard_page");
+    REQUIRE(fn != nullptr);
+    const u8 key = static_cast<u8>(method_slot('G'));
+    CHECK_EQ(fn(end - 3, 3, key), 1u);
+    CHECK_EQ(fn(end, 0, key), TrieNode::kInvalidRoute);
+    CHECK_EQ(trie.match_canonical_key({end - 3, 3}, key), 1u);
+    engine.shutdown();
 }

@@ -569,7 +569,9 @@ u16 ArtTrie::match_canonical_key(Str path, u8 method_key) const {
                 (want_slot != 0 && cn.hdr.route_idx_by_method[want_slot] != TrieNode::kInvalidRoute)
                     ? cn.hdr.route_idx_by_method[want_slot]
                     : cn.hdr.route_idx_by_method[0];
-            if (cand != TrieNode::kInvalidRoute) best = cand;
+            if (cand != TrieNode::kInvalidRoute &&
+                (match_mode_ == ArtMatchMode::BytePrefix || i == p.len || p.ptr[i] == '/'))
+                best = cand;
         }
         return best;
     }
@@ -675,7 +677,9 @@ u16 ArtTrie::match_canonical_key(Str path, u8 method_key) const {
             (want_slot != 0 && child_terminals[want_slot] != TrieNode::kInvalidRoute)
                 ? child_terminals[want_slot]
                 : child_terminals[0];
-        if (candidate != TrieNode::kInvalidRoute) best = candidate;
+        if (candidate != TrieNode::kInvalidRoute &&
+            (match_mode_ == ArtMatchMode::BytePrefix || i == p.len || p.ptr[i] == '/'))
+            best = candidate;
     }
     return best;
 }

@@ -3,8 +3,7 @@
 // route_select — minimal 2-way decision helpers for Phase 2 dispatch.
 //
 // Phase 2 architecture (PR #50):
-//   - ART (with optional JIT specialization): byte-prefix matching,
-//     covers all configs that don't need segment-aware semantics
+//   - ART (with optional JIT specialization): literal segment-prefix matching.
 //   - SegmentTrie: segment-aware matching for boundary-sensitive
 //     overlap (e.g., `/api` registered alongside `/apix`).
 //     Note: `:param`-style route paths require SegmentTrie. They are
@@ -40,7 +39,7 @@ bool path_has_param_segment(Str path);
 // build time so the cost is negligible.
 bool has_boundary_sensitive_overlap(const Str* paths, u32 n);
 
-// True iff the route set requires segment-aware dispatch — the
+// True iff the route set selects SegmentTrie — the
 // composition of the two checks above. Caller installs SegmentTrie
 // for true configs, ART (+JIT) for false. This is the entire
 // dispatch decision in Phase 2.

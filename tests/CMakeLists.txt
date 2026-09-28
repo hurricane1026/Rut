@@ -817,6 +817,18 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
                  COMMAND test_envoy_differential --self-test
                          $<TARGET_FILE:rut> $<TARGET_FILE:rut-envoy-convert>)
 
+        add_test(NAME test_route_boundaries_process
+                 COMMAND test_envoy_differential --route-boundaries
+                         $<TARGET_FILE:rut> $<TARGET_FILE:rut-envoy-convert>)
+        set_tests_properties(test_route_boundaries_process PROPERTIES
+            LABELS "integration;envoy" TIMEOUT 90 RUN_SERIAL TRUE RESOURCE_LOCK envoy-differential)
+        add_test(NAME test_envoy_pair_route_boundaries
+                 COMMAND test_envoy_differential --pair-route-boundaries
+                         $<TARGET_FILE:rut> $<TARGET_FILE:rut-envoy-convert>)
+        set_tests_properties(test_envoy_pair_route_boundaries PROPERTIES
+            LABELS "integration;envoy;docker" TIMEOUT 90 SKIP_RETURN_CODE 77
+            RUN_SERIAL TRUE RESOURCE_LOCK envoy-differential)
+
         add_test(NAME test_envoy_pair_milestone_s
                  COMMAND test_envoy_differential --pair-milestone-s
                          $<TARGET_FILE:rut> $<TARGET_FILE:rut-envoy-convert>

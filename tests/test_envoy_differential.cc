@@ -2878,8 +2878,10 @@ void replace_all(std::string* text, const std::string& from, const std::string& 
     }
 }
 
-std::string render_bootstrap(uint16_t listen_port, uint16_t upstream_port) {
-    std::string text = kBootstrapTemplate;
+std::string render_bootstrap(uint16_t listen_port,
+                             uint16_t upstream_port,
+                             const std::string& bootstrap_template = kBootstrapTemplate) {
+    std::string text = bootstrap_template;
     replace_all(&text, "%LISTEN_PORT%", std::to_string(listen_port));
     replace_all(&text, "%UPSTREAM_PORT%", std::to_string(upstream_port));
     return text;
@@ -4347,10 +4349,13 @@ bool launch_envoy_with_port_retry(const std::string& dir,
                                   uint16_t* listen_port,
                                   uint16_t other_port,
                                   EnvoyInstance* envoy,
-                                  std::string* error) {
+                                  std::string* error,
+                                  const std::string& bootstrap_template = kBootstrapTemplate) {
     const std::string bootstrap_path = dir + "/bootstrap.json";
     for (int attempt = 1; attempt <= kMaxListenPortAttempts; attempt++) {
-        if (!write_file_mode(bootstrap_path, render_bootstrap(*listen_port, other_port), 0644)) {
+        if (!write_file_mode(bootstrap_path,
+                             render_bootstrap(*listen_port, other_port, bootstrap_template),
+                             0644)) {
             *error = "could not write bootstrap.json";
             return false;
         }
@@ -4628,18 +4633,32 @@ bool launch_rut_with_port_retry(const std::string& dir,
                                 uint16_t other_port,
                                 std::string* rut_source_path,
                                 RutInstance* rut,
-                                std::string* error) {
+                                std::string* error,
+                                const std::string& bootstrap_template = kBootstrapTemplate,
+                                const std::string& native_source = "") {
     const std::string bootstrap_path = dir + "/bootstrap-rut.json";
     for (int attempt = 1; attempt <= kMaxListenPortAttempts; attempt++) {
-        if (!write_file_mode(bootstrap_path, render_bootstrap(*listen_port, other_port), 0644)) {
+        if (!write_file_mode(bootstrap_path,
+                             render_bootstrap(*listen_port, other_port, bootstrap_template),
+                             0644)) {
             *error = "could not write bootstrap.json";
             return false;
         }
         *rut_source_path = dir + "/out-attempt" + std::to_string(attempt) + ".rut";
         std::string convert_stderr;
-        if (!run_converter_to_file(
-                converter_binary, bootstrap_path, *rut_source_path, &convert_stderr)) {
-            *error = "rut-envoy-convert did not exit 0 with warnings-only stderr";
+        bool source_ok = false;
+        if (native_source.empty()) {
+            source_ok = run_converter_to_file(
+                converter_binary, bootstrap_path, *rut_source_path, &convert_stderr);
+        } else {
+            std::string source = native_source;
+            replace_all(&source, "%LISTEN_PORT%", std::to_string(*listen_port));
+            source_ok = write_file_mode(*rut_source_path, source, 0644);
+        }
+        if (!source_ok) {
+            *error = native_source.empty()
+                         ? "rut-envoy-convert did not exit 0 with warnings-only stderr"
+                         : "could not write native Rut source";
             if (!convert_stderr.empty()) *error += "; stderr: " + convert_stderr;
             return false;
         }
@@ -12792,6 +12811,205 @@ int run_self_test(const std::string& rut_binary, const std::string& converter_bi
     return ok ? 0 : 1;
 }
 
+// Real process tests for native segment routing and helper-emitted ordered
+// routing. Distinct live upstreams make a wrong route externally observable.
+int run_route_boundaries(const std::string& rut_binary,
+                         const std::string& converter_binary,
+                         bool pair) {
+    if (pair) {
+        const std::string missing = check_docker_prerequisites();
+        if (!missing.empty()) return missing_prerequisite(missing);
+    }
+    TempDir dir("rut-route-boundaries");
+    uint16_t listen_port = 0;
+    if (dir.empty() || !allocate_loopback_port(&listen_port)) return 1;
+    std::string error, source_path;
+
+    // Native DSL must retain segment-prefix semantics without a helper.
+    if (!pair) {
+        const std::string source =
+            "listen 127.0.0.1:%LISTEN_PORT%\n"
+            "route GET \"/\" { return 200 }\n"
+            "route GET \"/api\" { return 201 }\n"
+            "route GET \"/api/v1\" { return 202 }\n"
+            // The shared launch helper probes OPTIONS * for this local reply.
+            "unmatched { return local_response({ version: .http11, status: 404, "
+            "reason: \"Not Found\", server: \"envoy\", date: .current, "
+            "connection: .request, connection_header: .closeOnly, "
+            "header_names: .lowercase, header_order: .dateServerLength, "
+            "head_mode: .suppressBody, body: b\"\" }) }\n";
+        RutInstance rut;
+        if (!launch_rut_with_port_retry(dir.path(),
+                                        rut_binary,
+                                        converter_binary,
+                                        &listen_port,
+                                        1,
+                                        &source_path,
+                                        &rut,
+                                        &error,
+                                        kBootstrapTemplate,
+                                        source)) {
+            std::cerr << "FAIL native route launch: " << error << "\n";
+            dump_log(rut.log_path);
+            return 1;
+        }
+        bool ok = true;
+        const std::pair<const char*, int> cases[] = {{"/", 200},
+                                                     {"/api", 201},
+                                                     {"/api/", 201},
+                                                     {"/api/x", 201},
+                                                     {"/apifoo", 200},
+                                                     {"/api/v1", 202},
+                                                     {"/api/v1x", 201},
+                                                     {"/api/v1/x", 202},
+                                                     {"/apifoo?q=1", 200}};
+        for (const auto& c : cases) {
+            CaseSpec spec{
+                c.first,
+                std::string("GET ") + c.first + " HTTP/1.1\r\nHost: client.example\r\n\r\n",
+                false,
+                "",
+                ""};
+            CaseResult result;
+            bool matched =
+                run_client_case(listen_port, spec, &result) &&
+                result.downstream_bytes.rfind("HTTP/1.1 " + std::to_string(c.second) + " ", 0) == 0;
+            std::cerr << (matched ? "MATCH native " : "FAIL native ") << c.first << "\n";
+            ok &= matched;
+        }
+        ok &= check_no_reuseport_collision_after_batch(listen_port, getuid()).empty();
+        ok &= rut.stop();
+        if (!ok || !wait_port_closed(listen_port, 5000)) return 1;
+    }
+
+    RecordingUpstream upstreams[2];
+    uint16_t upstream_ports[2]{};
+    for (int i = 0; i < 2; ++i) {
+        BoundPort bound;
+        if (!allocate_bound_loopback_port(&bound)) return 1;
+        upstream_ports[i] = bound.port;
+        if (!upstreams[i].adopt(bound.fd)) {
+            close(bound.fd);
+            return 1;
+        }
+    }
+    std::string bootstrap = kBootstrapTemplate;
+    const std::string old_route =
+        R"({"match": {"prefix": "/"}, "route": {"cluster": "backend", "timeout": "0s"}})";
+    const std::string routes =
+        R"({"match":{"path":"/api"},"route":{"cluster":"api","timeout":"0s"}},)"
+        R"({"match":{"prefix":"/api/"},"route":{"cluster":"api","timeout":"0s"}},)"
+        R"({"match":{"path":"/apix"},"route":{"cluster":"api","timeout":"0s"}},)" +
+        old_route;
+    replace_all(&bootstrap, old_route, routes);
+    const size_t cluster_start =
+        bootstrap.find("\"clusters\": [") + std::string("\"clusters\": [").size();
+    const std::string api_cluster =
+        R"({"name":"api","type":"STATIC","connect_timeout":"5s","load_assignment":{"cluster_name":"api","endpoints":[{"lb_endpoints":[{"endpoint":{"address":{"socket_address":{"address":"127.0.0.1","port_value":)" +
+        std::to_string(upstream_ports[1]) + R"(}}}}]}]}},)";
+    bootstrap.insert(cluster_start, api_cluster);
+
+    const std::pair<const char*, int> paths[] = {{"/", 0},
+                                                 {"/api", 1},
+                                                 {"/api/", 1},
+                                                 {"/api/x", 1},
+                                                 {"/apifoo", 0},
+                                                 {"/apix", 1},
+                                                 {"/apixyz", 0},
+                                                 {"/api?q=1", 1}};
+    std::vector<CaseSpec> cases;
+    for (const auto& p : paths) {
+        std::string path = p.first;
+        path = path.substr(0, path.find('?'));
+        for (int i = 0; i < 2; ++i) {
+            upstreams[i].set_reply(
+                path, "HTTP/1.1 200 OK\r\nContent-Length: 1\r\n\r\n" + std::to_string(i));
+        }
+        cases.push_back(
+            {p.first,
+             std::string("GET ") + p.first + " HTTP/1.1\r\nHost: client.example\r\n\r\n",
+             false,
+             path,
+             ""});
+    }
+    std::vector<CaseResult> envoy_results;
+    // Each side runs the identical case order. Compare complete per-upstream
+    // request logs as well as downstream bytes; a shared wrong route cannot pass.
+    std::map<std::string, std::vector<std::string>> envoy_requests[2];
+    for (int side = pair ? 0 : 1; side < 2; ++side) {
+        EnvoyInstance envoy;
+        RutInstance rut;
+        bool launched = side == 0 ? launch_envoy_with_port_retry(dir.path(),
+                                                                 "route-boundaries",
+                                                                 &listen_port,
+                                                                 upstream_ports[0],
+                                                                 &envoy,
+                                                                 &error,
+                                                                 bootstrap)
+                                  : launch_rut_with_port_retry(dir.path(),
+                                                               rut_binary,
+                                                               converter_binary,
+                                                               &listen_port,
+                                                               upstream_ports[0],
+                                                               &source_path,
+                                                               &rut,
+                                                               &error,
+                                                               bootstrap);
+        if (!launched) {
+            std::cerr << "FAIL route launch: " << error << "\n";
+            dump_log(side == 0 ? envoy.log_path : rut.log_path);
+            return 1;
+        }
+        auto results = run_case_batch(listen_port, cases);
+        bool ok = check_no_reuseport_collision_after_batch(
+                      listen_port, side == 0 ? kEnvoyContainerUid : getuid())
+                      .empty();
+        ok &= side == 0 ? envoy.stop() : rut.stop();
+        for (auto& upstream : upstreams) ok &= upstream.wait_idle(2000);
+        if (!ok || !wait_port_closed(listen_port, 5000)) return 1;
+        for (size_t i = 0; i < results.size(); ++i) {
+            const auto& result = results[i];
+            const size_t end = result.downstream_bytes.find("\r\n\r\n");
+            bool matched =
+                result.exchange_complete && end != std::string::npos &&
+                result.downstream_bytes.rfind("HTTP/1.1 200 ", 0) == 0 &&
+                result.downstream_bytes.substr(end + 4) == std::to_string(paths[i].second);
+            if (pair && side == 1) {
+                bool envoy_date_valid = true, rut_date_valid = true;
+                matched &= normalize_date_for_compare(
+                               envoy_results[i].downstream_bytes, "", &envoy_date_valid) ==
+                           normalize_date_for_compare(result.downstream_bytes, "", &rut_date_valid);
+                matched &= envoy_date_valid && rut_date_valid;
+            }
+            std::cerr << (matched ? "MATCH " : "FAIL ") << (side == 0 ? "Envoy " : "Rut ")
+                      << paths[i].first << "\n";
+            ok &= matched;
+        }
+        for (int endpoint = 0; endpoint < 2; ++endpoint) {
+            const auto requests = upstreams[endpoint].all_requests();
+            std::map<std::string, size_t> expected;
+            for (size_t i = 0; i < cases.size(); ++i)
+                if (paths[i].second == endpoint) ++expected[cases[i].upstream_path];
+            ok &= requests.size() == expected.size();
+            for (const auto& entry : expected) {
+                auto found = requests.find(entry.first);
+                ok &= found != requests.end() && found->second.size() == entry.second;
+            }
+            if (side == 0)
+                envoy_requests[endpoint] = requests;
+            else if (pair)
+                ok &= requests == envoy_requests[endpoint];
+            upstreams[endpoint].clear_requests();
+        }
+        if (!ok) {
+            std::cerr << "FAIL route boundary evidence\n";
+            return 1;
+        }
+        if (side == 0) envoy_results = std::move(results);
+    }
+    return 0;
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -12804,6 +13022,10 @@ int main(int argc, char** argv) {
         const std::string converter_binary = argc >= 4 ? argv[3] : "";
         return run_self_test(rut_binary, converter_binary);
     }
+    if (argc >= 4 && (std::string(argv[1]) == "--route-boundaries" ||
+                      std::string(argv[1]) == "--pair-route-boundaries"))
+        return run_route_boundaries(
+            argv[2], argv[3], std::string(argv[1]) == "--pair-route-boundaries");
     if (argc >= 3 && std::string(argv[1]) == "--oracle-milestone-s")
         return run_oracle_milestone_s(argv[2]);
     if (argc >= 4 && std::string(argv[1]) == "--pair-milestone-s") {
@@ -12812,6 +13034,8 @@ int main(int argc, char** argv) {
     }
     std::cerr << "usage: " << argv[0]
               << " --self-test [rut-binary] [rut-envoy-convert-binary] | "
+                 "--route-boundaries <rut-binary> <rut-envoy-convert-binary> | "
+                 "--pair-route-boundaries <rut-binary> <rut-envoy-convert-binary> | "
                  "--oracle-milestone-s <output-path> | "
                  "--pair-milestone-s <rut-binary> <rut-envoy-convert-binary> [<output-path>]\n";
     return 2;

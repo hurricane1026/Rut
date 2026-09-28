@@ -1821,6 +1821,9 @@ precedence rules so the compiler, simulator, and runtime agree on which route wi
 
 **Path matching**
 
+- Shipped literal routes match a complete segment prefix: `/api` matches `/api`
+  and `/api/x`, but not `/apifoo`; `/` supplies the fallback. Production ART
+  checks terminal boundaries in both scalar and specialized JIT dispatch.
 - A literal segment outranks a parameter segment
 - A parameter segment outranks a catch-all segment
 - `*rest` matches the remainder of the path and must be the final segment

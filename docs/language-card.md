@@ -291,7 +291,10 @@ route POST "/form" { return 204 }                 // to this one route
 
 The shipped parser accepts repeated top-level `route METHOD "pattern"`
 declarations and the method-omitted form `route "pattern"`, which matches all
-HTTP methods. There is no `ANY` route keyword; write the omitted-method form.
+HTTP methods. Literal routes match a complete segment prefix: `/api` matches
+`/api` and `/api/x`, but not `/apifoo`; `/` supplies the fallback. This applies
+to both scalar and JIT dispatch. Query strings do not affect this selection.
+There is no `ANY` route keyword; write the omitted-method form.
 The grouped `route { ... }` surface (middleware pattern
 bindings, host/path groups, method unions, typed captures, expression entries,
 and `_` catch-all) is ⏳ target syntax and must not be emitted yet.
