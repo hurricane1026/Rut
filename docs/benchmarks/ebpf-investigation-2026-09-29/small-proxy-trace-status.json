@@ -1,0 +1,2953 @@
+{
+  "16-c1-close-nginx": {
+    "status": {
+      "completed": true,
+      "usable": true,
+      "mode": "trace",
+      "kernel": "6.19.10-300.fc44.x86_64",
+      "machine": "x86_64",
+      "groups": [
+        "fault",
+        "rx-copy",
+        "sched",
+        "stacks",
+        "tcp"
+      ],
+      "duration_seconds": 12,
+      "front_port": 8987,
+      "origin_port": 9987,
+      "started_at": 1790626583.2801628,
+      "program_sha256": "149f2029d95163f3fff633f96d115f8d07a8ce3bb57e9bbb24b37b1245311400",
+      "targets_before": [
+        {
+          "pid": 2697073,
+          "start_ticks": 91251137,
+          "state": "S",
+          "comm": "nginx",
+          "exe": "/usr/sbin/nginx"
+        }
+      ],
+      "bpftrace_version": "bpftrace v0.27.0",
+      "command": [
+        "/tmp/rut-bounded-followup-20260928/ebpf-tools/bpftrace-container.py",
+        "-f",
+        "json",
+        "-B",
+        "line",
+        "/tmp/rut-bounded-followup-20260928/ebpf-small-proxy-r1/16-c1-close-nginx/trace/program.bt"
+      ],
+      "returncode": 0,
+      "targets_after": [
+        {
+          "pid": 2697073,
+          "start_ticks": 91251137,
+          "state": "S",
+          "comm": "nginx",
+          "exe": "/usr/sbin/nginx"
+        }
+      ],
+      "targets_unchanged": true,
+      "diagnostic_warnings": false,
+      "finished_at": 1790626597.6497712
+    },
+    "summary": {
+      "maps": {
+        "@copy_calls": {
+          "2697073,1,2": 58439,
+          "2697073,1,1": 58439
+        },
+        "@copy_elapsed_ns": {
+          "2697073,1,2": 19824570,
+          "2697073,1,1": 20426105
+        },
+        "@copy_latency_us": {
+          "2697073,1,1": [
+            {
+              "min": 0,
+              "max": 0,
+              "count": 58411
+            },
+            {
+              "min": 1,
+              "max": 1,
+              "count": 1
+            },
+            {
+              "min": 2,
+              "max": 3,
+              "count": 19
+            },
+            {
+              "min": 4,
+              "max": 7,
+              "count": 3
+            },
+            {
+              "min": 8,
+              "max": 15,
+              "count": 3
+            },
+            {
+              "min": 16,
+              "max": 31,
+              "count": 2
+            }
+          ],
+          "2697073,1,2": [
+            {
+              "min": 0,
+              "max": 0,
+              "count": 58417
+            },
+            {
+              "min": 1,
+              "max": 1,
+              "count": 0
+            },
+            {
+              "min": 2,
+              "max": 3,
+              "count": 12
+            },
+            {
+              "min": 4,
+              "max": 7,
+              "count": 7
+            },
+            {
+              "min": 8,
+              "max": 15,
+              "count": 2
+            },
+            {
+              "min": 16,
+              "max": 31,
+              "count": 1
+            }
+          ]
+        },
+        "@copy_success_bytes": {
+          "2697073,1,1": 3740096,
+          "2697073,1,2": 9291801
+        },
+        "@offcpu_ns": {
+          "2697073": 2886028640
+        },
+        "@offcpu_samples": {
+          "2697073": 165794
+        },
+        "@offcpu_us": {
+          "2697073": [
+            {
+              "min": 1,
+              "max": 1,
+              "count": 46868
+            },
+            {
+              "min": 2,
+              "max": 3,
+              "count": 1481
+            },
+            {
+              "min": 4,
+              "max": 7,
+              "count": 579
+            },
+            {
+              "min": 8,
+              "max": 15,
+              "count": 58063
+            },
+            {
+              "min": 16,
+              "max": 31,
+              "count": 775
+            },
+            {
+              "min": 32,
+              "max": 63,
+              "count": 57905
+            },
+            {
+              "min": 64,
+              "max": 127,
+              "count": 117
+            },
+            {
+              "min": 128,
+              "max": 255,
+              "count": 5
+            },
+            {
+              "min": 256,
+              "max": 511,
+              "count": 1
+            }
+          ]
+        },
+        "@runqueue_ns": {
+          "2697073": 330261838
+        },
+        "@runqueue_samples": {
+          "2697073": 165795
+        },
+        "@runqueue_us": {
+          "2697073": [
+            {
+              "min": 0,
+              "max": 0,
+              "count": 160486
+            },
+            {
+              "min": 1,
+              "max": 1,
+              "count": 972
+            },
+            {
+              "min": 2,
+              "max": 3,
+              "count": 269
+            },
+            {
+              "min": 4,
+              "max": 7,
+              "count": 139
+            },
+            {
+              "min": 8,
+              "max": 15,
+              "count": 154
+            },
+            {
+              "min": 16,
+              "max": 31,
+              "count": 32
+            },
+            {
+              "min": 32,
+              "max": 63,
+              "count": 3658
+            },
+            {
+              "min": 64,
+              "max": 127,
+              "count": 83
+            },
+            {
+              "min": 128,
+              "max": 255,
+              "count": 2
+            }
+          ]
+        },
+        "@tcp_calls": {
+          "2697073,2,2": 58439,
+          "2697073,2,1": 58439,
+          "2697073,1,1": 58441,
+          "2697073,1,2": 58473
+        },
+        "@tcp_completed_calls": {
+          "2697073,2,1": 58439,
+          "2697073,2,2": 58439,
+          "2697073,1,1": 58441,
+          "2697073,1,2": 58473
+        },
+        "@tcp_elapsed_ns": {
+          "2697073,1,2": 75935488,
+          "2697073,1,1": 77305903,
+          "2697073,2,1": 419723570,
+          "2697073,2,2": 464261998
+        },
+        "@tcp_latency_us": {
+          "2697073,2,1": [
+            {
+              "min": 4,
+              "max": 7,
+              "count": 57285
+            },
+            {
+              "min": 8,
+              "max": 15,
+              "count": 1004
+            },
+            {
+              "min": 16,
+              "max": 31,
+              "count": 124
+            },
+            {
+              "min": 32,
+              "max": 63,
+              "count": 25
+            },
+            {
+              "min": 64,
+              "max": 127,
+              "count": 1
+            }
+          ],
+          "2697073,2,2": [
+            {
+              "min": 4,
+              "max": 7,
+              "count": 40448
+            },
+            {
+              "min": 8,
+              "max": 15,
+              "count": 17830
+            },
+            {
+              "min": 16,
+              "max": 31,
+              "count": 147
+            },
+            {
+              "min": 32,
+              "max": 63,
+              "count": 14
+            }
+          ],
+          "2697073,1,1": [
+            {
+              "min": 0,
+              "max": 0,
+              "count": 1
+            },
+            {
+              "min": 1,
+              "max": 1,
+              "count": 58221
+            },
+            {
+              "min": 2,
+              "max": 3,
+              "count": 169
+            },
+            {
+              "min": 4,
+              "max": 7,
+              "count": 30
+            },
+            {
+              "min": 8,
+              "max": 15,
+              "count": 11
+            },
+            {
+              "min": 16,
+              "max": 31,
+              "count": 8
+            },
+            {
+              "min": 32,
+              "max": 63,
+              "count": 1
+            }
+          ],
+          "2697073,1,2": [
+            {
+              "min": 0,
+              "max": 0,
+              "count": 34
+            },
+            {
+              "min": 1,
+              "max": 1,
+              "count": 58275
+            },
+            {
+              "min": 2,
+              "max": 3,
+              "count": 104
+            },
+            {
+              "min": 4,
+              "max": 7,
+              "count": 37
+            },
+            {
+              "min": 8,
+              "max": 15,
+              "count": 13
+            },
+            {
+              "min": 16,
+              "max": 31,
+              "count": 10
+            }
+          ]
+        },
+        "@tcp_requested_bytes": {
+          "2697073,2,2": 2629755,
+          "2697073,2,1": 9291801,
+          "2697073,1,1": 59843584,
+          "2697073,1,2": 239500002
+        },
+        "@tcp_returned_bytes": {
+          "2697073,2,2": 2629755,
+          "2697073,1,1": 3740096,
+          "2697073,2,1": 9291801,
+          "2697073,1,2": 9291801
+        },
+        "@tcp_zero_returns": {
+          "2697073,1,1": 2,
+          "2697073,1,2": 34
+        }
+      },
+      "loss_or_errors": [],
+      "ready": true,
+      "ended": true,
+      "stdout_diagnostics": [],
+      "tcp": [
+        {
+          "pid": 2697073,
+          "direction": "recv",
+          "side": "downstream",
+          "completed_calls": 58441,
+          "returned_bytes": 3740096,
+          "inclusive_elapsed_ns": 77305903,
+          "mean_elapsed_us": 1.3228025358908986
+        },
+        {
+          "pid": 2697073,
+          "direction": "send",
+          "side": "downstream",
+          "completed_calls": 58439,
+          "returned_bytes": 9291801,
+          "inclusive_elapsed_ns": 419723570,
+          "mean_elapsed_us": 7.1822510652133
+        },
+        {
+          "pid": 2697073,
+          "direction": "recv",
+          "side": "upstream",
+          "completed_calls": 58473,
+          "returned_bytes": 9291801,
+          "inclusive_elapsed_ns": 75935488,
+          "mean_elapsed_us": 1.2986419031005765
+        },
+        {
+          "pid": 2697073,
+          "direction": "send",
+          "side": "upstream",
+          "completed_calls": 58439,
+          "returned_bytes": 2629755,
+          "inclusive_elapsed_ns": 464261998,
+          "mean_elapsed_us": 7.944386420027721
+        }
+      ]
+    },
+    "kernel_stack_sample_count": 514,
+    "raw_trace_directory": "/tmp/rut-bounded-followup-20260928/ebpf-small-proxy-r1/16-c1-close-nginx/trace"
+  },
+  "16-c1-close-rut": {
+    "status": {
+      "completed": true,
+      "usable": true,
+      "mode": "trace",
+      "kernel": "6.19.10-300.fc44.x86_64",
+      "machine": "x86_64",
+      "groups": [
+        "fault",
+        "rx-copy",
+        "sched",
+        "stacks",
+        "tcp"
+      ],
+      "duration_seconds": 12,
+      "front_port": 8987,
+      "origin_port": 9987,
+      "started_at": 1790626600.0087836,
+      "program_sha256": "399e79035d4ff8e15c9b9ee174d0d49b60b285f639e9dedb84063e673d7274ec",
+      "targets_before": [
+        {
+          "pid": 2697303,
+          "start_ticks": 91252799,
+          "state": "S",
+          "comm": "rut-buffered-mo",
+          "exe": "/tmp/rut-bounded-followup-20260928/ebpf-tools/rut-buffered-more"
+        }
+      ],
+      "bpftrace_version": "bpftrace v0.27.0",
+      "command": [
+        "/tmp/rut-bounded-followup-20260928/ebpf-tools/bpftrace-container.py",
+        "-f",
+        "json",
+        "-B",
+        "line",
+        "/tmp/rut-bounded-followup-20260928/ebpf-small-proxy-r1/16-c1-close-rut/trace/program.bt"
+      ],
+      "returncode": 0,
+      "targets_after": [
+        {
+          "pid": 2697303,
+          "start_ticks": 91252799,
+          "state": "S",
+          "comm": "rut-buffered-mo",
+          "exe": "/tmp/rut-bounded-followup-20260928/ebpf-tools/rut-buffered-more"
+        }
+      ],
+      "targets_unchanged": true,
+      "diagnostic_warnings": false,
+      "finished_at": 1790626614.2540994
+    },
+    "summary": {
+      "maps": {
+        "@copy_calls": {
+          "2697303,1,1": 58744,
+          "2697303,1,2": 58744
+        },
+        "@copy_elapsed_ns": {
+          "2697303,1,1": 19446743,
+          "2697303,1,2": 24045997
+        },
+        "@copy_latency_us": {
+          "2697303,1,1": [
+            {
+              "min": 0,
+              "max": 0,
+              "count": 58715
+            },
+            {
+              "min": 1,
+              "max": 1,
+              "count": 1
+            },
+            {
+              "min": 2,
+              "max": 3,
+              "count": 10
+            },
+            {
+              "min": 4,
+              "max": 7,
+              "count": 4
+            },
+            {
+              "min": 8,
+              "max": 15,
+              "count": 12
+            },
+            {
+              "min": 16,
+              "max": 31,
+              "count": 2
+            }
+          ],
+          "2697303,1,2": [
+            {
+              "min": 0,
+              "max": 0,
+              "count": 58711
+            },
+            {
+              "min": 1,
+              "max": 1,
+              "count": 3
+            },
+            {
+              "min": 2,
+              "max": 3,
+              "count": 11
+            },
+            {
+              "min": 4,
+              "max": 7,
+              "count": 6
+            },
+            {
+              "min": 8,
+              "max": 15,
+              "count": 11
+            },
+            {
+              "min": 16,
+              "max": 31,
+              "count": 2
+            }
+          ]
+        },
+        "@copy_success_bytes": {
+          "2697303,1,1": 3759616,
+          "2697303,1,2": 9340296
+        },
+        "@offcpu_ns": {
+          "2697303": 17439342093
+        },
+        "@offcpu_samples": {
+          "2697303": 119260
+        },
+        "@offcpu_us": {
+          "2697303": [
+            {
+              "min": 1,
+              "max": 1,
+              "count": 562
+            },
+            {
+              "min": 2,
+              "max": 3,
+              "count": 962
+            },
+            {
+              "min": 4,
+              "max": 7,
+              "count": 821
+            },
+            {
+              "min": 8,
+              "max": 15,
+              "count": 58259
+            },
+            {
+              "min": 16,
+              "max": 31,
+              "count": 56987
+            },
+            {
+              "min": 32,
+              "max": 63,
+              "count": 1455
+            },
+            {
+              "min": 64,
+              "max": 127,
+              "count": 80
+            },
+            {
+              "min": 128,
+              "max": 255,
+              "count": 8
+            },
+            {
+              "min": 256,
+              "max": 511,
+              "count": 3
+            },
+            {
+              "min": 512,
+              "max": 1023,
+              "count": 0
+            },
+            {
+              "min": 1024,
+              "max": 2047,
+              "count": 0
+            },
+            {
+              "min": 2048,
+              "max": 4095,
+              "count": 0
+            },
+            {
+              "min": 4096,
+              "max": 8191,
+              "count": 0
+            },
+            {
+              "min": 8192,
+              "max": 16383,
+              "count": 0
+            },
+            {
+              "min": 16384,
+              "max": 32767,
+              "count": 0
+            },
+            {
+              "min": 32768,
+              "max": 65535,
+              "count": 0
+            },
+            {
+              "min": 65536,
+              "max": 131071,
+              "count": 119
+            },
+            {
+              "min": 131072,
+              "max": 262143,
+              "count": 0
+            },
+            {
+              "min": 262144,
+              "max": 524287,
+              "count": 1
+            },
+            {
+              "min": 524288,
+              "max": 1048575,
+              "count": 3
+            }
+          ]
+        },
+        "@runqueue_ns": {
+          "2697303": 102794527
+        },
+        "@runqueue_samples": {
+          "2697303": 119262
+        },
+        "@runqueue_us": {
+          "2697303": [
+            {
+              "min": 0,
+              "max": 0,
+              "count": 117328
+            },
+            {
+              "min": 1,
+              "max": 1,
+              "count": 1121
+            },
+            {
+              "min": 2,
+              "max": 3,
+              "count": 243
+            },
+            {
+              "min": 4,
+              "max": 7,
+              "count": 266
+            },
+            {
+              "min": 8,
+              "max": 15,
+              "count": 186
+            },
+            {
+              "min": 16,
+              "max": 31,
+              "count": 89
+            },
+            {
+              "min": 32,
+              "max": 63,
+              "count": 19
+            },
+            {
+              "min": 64,
+              "max": 127,
+              "count": 2
+            },
+            {
+              "min": 128,
+              "max": 255,
+              "count": 5
+            },
+            {
+              "min": 256,
+              "max": 511,
+              "count": 3
+            }
+          ]
+        },
+        "@tcp_calls": {
+          "2697303,1,0": 1711,
+          "2697303,2,2": 58744,
+          "2697303,2,1": 58744,
+          "2697303,1,1": 61601,
+          "2697303,1,2": 117426
+        },
+        "@tcp_completed_calls": {
+          "2697303,1,0": 1711,
+          "2697303,2,1": 58744,
+          "2697303,2,2": 58744,
+          "2697303,1,1": 61601,
+          "2697303,1,2": 117426
+        },
+        "@tcp_elapsed_ns": {
+          "2697303,1,0": 1110381,
+          "2697303,1,2": 100679815,
+          "2697303,1,1": 127106039,
+          "2697303,2,1": 437016276,
+          "2697303,2,2": 462256012
+        },
+        "@tcp_errors": {
+          "2697303,1,1,-11": 1065,
+          "2697303,1,2,-11": 58682
+        },
+        "@tcp_latency_us": {
+          "2697303,1,0": [
+            {
+              "min": 0,
+              "max": 0,
+              "count": 1694
+            },
+            {
+              "min": 1,
+              "max": 1,
+              "count": 14
+            },
+            {
+              "min": 2,
+              "max": 3,
+              "count": 1
+            },
+            {
+              "min": 4,
+              "max": 7,
+              "count": 1
+            },
+            {
+              "min": 8,
+              "max": 15,
+              "count": 1
+            }
+          ],
+          "2697303,2,1": [
+            {
+              "min": 4,
+              "max": 7,
+              "count": 57189
+            },
+            {
+              "min": 8,
+              "max": 15,
+              "count": 1318
+            },
+            {
+              "min": 16,
+              "max": 31,
+              "count": 206
+            },
+            {
+              "min": 32,
+              "max": 63,
+              "count": 31
+            }
+          ],
+          "2697303,2,2": [
+            {
+              "min": 4,
+              "max": 7,
+              "count": 51926
+            },
+            {
+              "min": 8,
+              "max": 15,
+              "count": 6557
+            },
+            {
+              "min": 16,
+              "max": 31,
+              "count": 224
+            },
+            {
+              "min": 32,
+              "max": 63,
+              "count": 35
+            },
+            {
+              "min": 64,
+              "max": 127,
+              "count": 2
+            }
+          ],
+          "2697303,1,1": [
+            {
+              "min": 0,
+              "max": 0,
+              "count": 1659
+            },
+            {
+              "min": 1,
+              "max": 1,
+              "count": 18901
+            },
+            {
+              "min": 2,
+              "max": 3,
+              "count": 40739
+            },
+            {
+              "min": 4,
+              "max": 7,
+              "count": 234
+            },
+            {
+              "min": 8,
+              "max": 15,
+              "count": 24
+            },
+            {
+              "min": 16,
+              "max": 31,
+              "count": 43
+            },
+            {
+              "min": 32,
+              "max": 63,
+              "count": 1
+            }
+          ],
+          "2697303,1,2": [
+            {
+              "min": 0,
+              "max": 0,
+              "count": 58640
+            },
+            {
+              "min": 1,
+              "max": 1,
+              "count": 58570
+            },
+            {
+              "min": 2,
+              "max": 3,
+              "count": 85
+            },
+            {
+              "min": 4,
+              "max": 7,
+              "count": 65
+            },
+            {
+              "min": 8,
+              "max": 15,
+              "count": 40
+            },
+            {
+              "min": 16,
+              "max": 31,
+              "count": 26
+            }
+          ]
+        },
+        "@tcp_requested_bytes": {
+          "2697303,2,2": 2643480,
+          "2697303,1,0": 7008256,
+          "2697303,2,1": 9340296,
+          "2697303,1,1": 252317696,
+          "2697303,1,2": 1923907584
+        },
+        "@tcp_returned_bytes": {
+          "2697303,2,2": 2643480,
+          "2697303,1,1": 3759616,
+          "2697303,2,1": 9340296,
+          "2697303,1,2": 9340296
+        },
+        "@tcp_zero_returns": {
+          "2697303,1,0": 1711,
+          "2697303,1,1": 1792
+        }
+      },
+      "loss_or_errors": [],
+      "ready": true,
+      "ended": true,
+      "stdout_diagnostics": [],
+      "tcp": [
+        {
+          "pid": 2697303,
+          "direction": "recv",
+          "side": "downstream",
+          "completed_calls": 61601,
+          "returned_bytes": 3759616,
+          "inclusive_elapsed_ns": 127106039,
+          "mean_elapsed_us": 2.0633762276586416
+        },
+        {
+          "pid": 2697303,
+          "direction": "send",
+          "side": "downstream",
+          "completed_calls": 58744,
+          "returned_bytes": 9340296,
+          "inclusive_elapsed_ns": 437016276,
+          "mean_elapsed_us": 7.439334672477189
+        },
+        {
+          "pid": 2697303,
+          "direction": "recv",
+          "side": "other",
+          "completed_calls": 1711,
+          "returned_bytes": 0,
+          "inclusive_elapsed_ns": 1110381,
+          "mean_elapsed_us": 0.6489661016949152
+        },
+        {
+          "pid": 2697303,
+          "direction": "recv",
+          "side": "upstream",
+          "completed_calls": 117426,
+          "returned_bytes": 9340296,
+          "inclusive_elapsed_ns": 100679815,
+          "mean_elapsed_us": 0.8573894622996611
+        },
+        {
+          "pid": 2697303,
+          "direction": "send",
+          "side": "upstream",
+          "completed_calls": 58744,
+          "returned_bytes": 2643480,
+          "inclusive_elapsed_ns": 462256012,
+          "mean_elapsed_us": 7.868991079940079
+        }
+      ]
+    },
+    "kernel_stack_sample_count": 570,
+    "raw_trace_directory": "/tmp/rut-bounded-followup-20260928/ebpf-small-proxy-r1/16-c1-close-rut/trace"
+  },
+  "16-c1-keepalive-nginx": {
+    "status": {
+      "completed": true,
+      "usable": true,
+      "mode": "trace",
+      "kernel": "6.19.10-300.fc44.x86_64",
+      "machine": "x86_64",
+      "groups": [
+        "fault",
+        "rx-copy",
+        "sched",
+        "stacks",
+        "tcp"
+      ],
+      "duration_seconds": 12,
+      "front_port": 8987,
+      "origin_port": 9987,
+      "started_at": 1790626650.2253084,
+      "program_sha256": "092afa296c03adfe89f4a755b676c5a0daea48c158df1acadcdfe820d436465c",
+      "targets_before": [
+        {
+          "pid": 2698273,
+          "start_ticks": 91257831,
+          "state": "S",
+          "comm": "nginx",
+          "exe": "/usr/sbin/nginx"
+        }
+      ],
+      "bpftrace_version": "bpftrace v0.27.0",
+      "command": [
+        "/tmp/rut-bounded-followup-20260928/ebpf-tools/bpftrace-container.py",
+        "-f",
+        "json",
+        "-B",
+        "line",
+        "/tmp/rut-bounded-followup-20260928/ebpf-small-proxy-r1/16-c1-keepalive-nginx/trace/program.bt"
+      ],
+      "returncode": 0,
+      "targets_after": [
+        {
+          "pid": 2698273,
+          "start_ticks": 91257831,
+          "state": "S",
+          "comm": "nginx",
+          "exe": "/usr/sbin/nginx"
+        }
+      ],
+      "targets_unchanged": true,
+      "diagnostic_warnings": false,
+      "finished_at": 1790626664.4809446
+    },
+    "summary": {
+      "maps": {
+        "@copy_calls": {
+          "2698273,1,1": 82362,
+          "2698273,1,2": 82362
+        },
+        "@copy_elapsed_ns": {
+          "2698273,1,1": 29155927,
+          "2698273,1,2": 29595554
+        },
+        "@copy_latency_us": {
+          "2698273,1,1": [
+            {
+              "min": 0,
+              "max": 0,
+              "count": 82313
+            },
+            {
+              "min": 1,
+              "max": 1,
+              "count": 1
+            },
+            {
+              "min": 2,
+              "max": 3,
+              "count": 34
+            },
+            {
+              "min": 4,
+              "max": 7,
+              "count": 3
+            },
+            {
+              "min": 8,
+              "max": 15,
+              "count": 6
+            },
+            {
+              "min": 16,
+              "max": 31,
+              "count": 5
+            }
+          ],
+          "2698273,1,2": [
+            {
+              "min": 0,
+              "max": 0,
+              "count": 82323
+            },
+            {
+              "min": 1,
+              "max": 1,
+              "count": 0
+            },
+            {
+              "min": 2,
+              "max": 3,
+              "count": 21
+            },
+            {
+              "min": 4,
+              "max": 7,
+              "count": 8
+            },
+            {
+              "min": 8,
+              "max": 15,
+              "count": 8
+            },
+            {
+              "min": 16,
+              "max": 31,
+              "count": 2
+            }
+          ]
+        },
+        "@copy_success_bytes": {
+          "2698273,1,1": 3706290,
+          "2698273,1,2": 13095558
+        },
+        "@offcpu_ns": {
+          "2698273": 1712256548
+        },
+        "@offcpu_samples": {
+          "2698273": 165317
+        },
+        "@offcpu_us": {
+          "2698273": [
+            {
+              "min": 1,
+              "max": 1,
+              "count": 405
+            },
+            {
+              "min": 2,
+              "max": 3,
+              "count": 158
+            },
+            {
+              "min": 4,
+              "max": 7,
+              "count": 75834
+            },
+            {
+              "min": 8,
+              "max": 15,
+              "count": 87607
+            },
+            {
+              "min": 16,
+              "max": 31,
+              "count": 1036
+            },
+            {
+              "min": 32,
+              "max": 63,
+              "count": 257
+            },
+            {
+              "min": 64,
+              "max": 127,
+              "count": 14
+            },
+            {
+              "min": 128,
+              "max": 255,
+              "count": 4
+            },
+            {
+              "min": 256,
+              "max": 511,
+              "count": 2
+            }
+          ]
+        },
+        "@runqueue_ns": {
+          "2698273": 119846901
+        },
+        "@runqueue_samples": {
+          "2698273": 165318
+        },
+        "@runqueue_us": {
+          "2698273": [
+            {
+              "min": 0,
+              "max": 0,
+              "count": 163954
+            },
+            {
+              "min": 1,
+              "max": 1,
+              "count": 780
+            },
+            {
+              "min": 2,
+              "max": 3,
+              "count": 205
+            },
+            {
+              "min": 4,
+              "max": 7,
+              "count": 214
+            },
+            {
+              "min": 8,
+              "max": 15,
+              "count": 110
+            },
+            {
+              "min": 16,
+              "max": 31,
+              "count": 32
+            },
+            {
+              "min": 32,
+              "max": 63,
+              "count": 10
+            },
+            {
+              "min": 64,
+              "max": 127,
+              "count": 9
+            },
+            {
+              "min": 128,
+              "max": 255,
+              "count": 3
+            },
+            {
+              "min": 256,
+              "max": 511,
+              "count": 1
+            }
+          ]
+        },
+        "@tcp_calls": {
+          "2698273,2,2": 82362,
+          "2698273,2,1": 82362,
+          "2698273,1,1": 82364,
+          "2698273,1,2": 82394
+        },
+        "@tcp_completed_calls": {
+          "2698273,2,1": 82362,
+          "2698273,2,2": 82362,
+          "2698273,1,1": 82364,
+          "2698273,1,2": 82394
+        },
+        "@tcp_elapsed_ns": {
+          "2698273,1,2": 108092890,
+          "2698273,1,1": 110839807,
+          "2698273,2,1": 429295056,
+          "2698273,2,2": 648199056
+        },
+        "@tcp_latency_us": {
+          "2698273,2,1": [
+            {
+              "min": 4,
+              "max": 7,
+              "count": 81825
+            },
+            {
+              "min": 8,
+              "max": 15,
+              "count": 417
+            },
+            {
+              "min": 16,
+              "max": 31,
+              "count": 107
+            },
+            {
+              "min": 32,
+              "max": 63,
+              "count": 13
+            }
+          ],
+          "2698273,2,2": [
+            {
+              "min": 4,
+              "max": 7,
+              "count": 62664
+            },
+            {
+              "min": 8,
+              "max": 15,
+              "count": 19476
+            },
+            {
+              "min": 16,
+              "max": 31,
+              "count": 186
+            },
+            {
+              "min": 32,
+              "max": 63,
+              "count": 36
+            }
+          ],
+          "2698273,1,1": [
+            {
+              "min": 0,
+              "max": 0,
+              "count": 1
+            },
+            {
+              "min": 1,
+              "max": 1,
+              "count": 82185
+            },
+            {
+              "min": 2,
+              "max": 3,
+              "count": 93
+            },
+            {
+              "min": 4,
+              "max": 7,
+              "count": 44
+            },
+            {
+              "min": 8,
+              "max": 15,
+              "count": 13
+            },
+            {
+              "min": 16,
+              "max": 31,
+              "count": 28
+            }
+          ],
+          "2698273,1,2": [
+            {
+              "min": 0,
+              "max": 0,
+              "count": 32
+            },
+            {
+              "min": 1,
+              "max": 1,
+              "count": 82116
+            },
+            {
+              "min": 2,
+              "max": 3,
+              "count": 126
+            },
+            {
+              "min": 4,
+              "max": 7,
+              "count": 65
+            },
+            {
+              "min": 8,
+              "max": 15,
+              "count": 30
+            },
+            {
+              "min": 16,
+              "max": 31,
+              "count": 22
+            },
+            {
+              "min": 32,
+              "max": 63,
+              "count": 2
+            },
+            {
+              "min": 64,
+              "max": 127,
+              "count": 1
+            }
+          ]
+        },
+        "@tcp_requested_bytes": {
+          "2698273,2,2": 3706290,
+          "2698273,2,1": 13506958,
+          "2698273,1,1": 84340736,
+          "2698273,1,2": 337480736
+        },
+        "@tcp_returned_bytes": {
+          "2698273,2,2": 3706290,
+          "2698273,1,1": 3706290,
+          "2698273,1,2": 13095558,
+          "2698273,2,1": 13506958
+        },
+        "@tcp_zero_returns": {
+          "2698273,1,1": 2,
+          "2698273,1,2": 32
+        }
+      },
+      "loss_or_errors": [],
+      "ready": true,
+      "ended": true,
+      "stdout_diagnostics": [],
+      "tcp": [
+        {
+          "pid": 2698273,
+          "direction": "recv",
+          "side": "downstream",
+          "completed_calls": 82364,
+          "returned_bytes": 3706290,
+          "inclusive_elapsed_ns": 110839807,
+          "mean_elapsed_us": 1.3457312296634452
+        },
+        {
+          "pid": 2698273,
+          "direction": "send",
+          "side": "downstream",
+          "completed_calls": 82362,
+          "returned_bytes": 13506958,
+          "inclusive_elapsed_ns": 429295056,
+          "mean_elapsed_us": 5.212295184672543
+        },
+        {
+          "pid": 2698273,
+          "direction": "recv",
+          "side": "upstream",
+          "completed_calls": 82394,
+          "returned_bytes": 13095558,
+          "inclusive_elapsed_ns": 108092890,
+          "mean_elapsed_us": 1.3119024443527443
+        },
+        {
+          "pid": 2698273,
+          "direction": "send",
+          "side": "upstream",
+          "completed_calls": 82362,
+          "returned_bytes": 3706290,
+          "inclusive_elapsed_ns": 648199056,
+          "mean_elapsed_us": 7.870122823632258
+        }
+      ]
+    },
+    "kernel_stack_sample_count": 625,
+    "raw_trace_directory": "/tmp/rut-bounded-followup-20260928/ebpf-small-proxy-r1/16-c1-keepalive-nginx/trace"
+  },
+  "16-c1-keepalive-rut": {
+    "status": {
+      "completed": true,
+      "usable": true,
+      "mode": "trace",
+      "kernel": "6.19.10-300.fc44.x86_64",
+      "machine": "x86_64",
+      "groups": [
+        "fault",
+        "rx-copy",
+        "sched",
+        "stacks",
+        "tcp"
+      ],
+      "duration_seconds": 12,
+      "front_port": 8987,
+      "origin_port": 9987,
+      "started_at": 1790626666.84373,
+      "program_sha256": "6007c37684c66beb48320ffd4173ca9361ea5ab5ac00ce007cfb4d97964f91af",
+      "targets_before": [
+        {
+          "pid": 2698537,
+          "start_ticks": 91259483,
+          "state": "S",
+          "comm": "rut-buffered-mo",
+          "exe": "/tmp/rut-bounded-followup-20260928/ebpf-tools/rut-buffered-more"
+        }
+      ],
+      "bpftrace_version": "bpftrace v0.27.0",
+      "command": [
+        "/tmp/rut-bounded-followup-20260928/ebpf-tools/bpftrace-container.py",
+        "-f",
+        "json",
+        "-B",
+        "line",
+        "/tmp/rut-bounded-followup-20260928/ebpf-small-proxy-r1/16-c1-keepalive-rut/trace/program.bt"
+      ],
+      "returncode": 0,
+      "targets_after": [
+        {
+          "pid": 2698537,
+          "start_ticks": 91259483,
+          "state": "S",
+          "comm": "rut-buffered-mo",
+          "exe": "/tmp/rut-bounded-followup-20260928/ebpf-tools/rut-buffered-more"
+        }
+      ],
+      "targets_unchanged": true,
+      "diagnostic_warnings": false,
+      "finished_at": 1790626681.0373769
+    },
+    "summary": {
+      "maps": {
+        "@copy_calls": {
+          "2698537,1,2": 81462,
+          "2698537,1,1": 81462
+        },
+        "@copy_elapsed_ns": {
+          "2698537,1,1": 29421162,
+          "2698537,1,2": 32592006
+        },
+        "@copy_latency_us": {
+          "2698537,1,1": [
+            {
+              "min": 0,
+              "max": 0,
+              "count": 81430
+            },
+            {
+              "min": 1,
+              "max": 1,
+              "count": 1
+            },
+            {
+              "min": 2,
+              "max": 3,
+              "count": 15
+            },
+            {
+              "min": 4,
+              "max": 7,
+              "count": 9
+            },
+            {
+              "min": 8,
+              "max": 15,
+              "count": 6
+            },
+            {
+              "min": 16,
+              "max": 31,
+              "count": 1
+            }
+          ],
+          "2698537,1,2": [
+            {
+              "min": 0,
+              "max": 0,
+              "count": 81432
+            },
+            {
+              "min": 1,
+              "max": 1,
+              "count": 0
+            },
+            {
+              "min": 2,
+              "max": 3,
+              "count": 19
+            },
+            {
+              "min": 4,
+              "max": 7,
+              "count": 6
+            },
+            {
+              "min": 8,
+              "max": 15,
+              "count": 5
+            }
+          ]
+        },
+        "@copy_success_bytes": {
+          "2698537,1,1": 3665790,
+          "2698537,1,2": 12952458
+        },
+        "@offcpu_ns": {
+          "2698537": 16522763550
+        },
+        "@offcpu_samples": {
+          "2698537": 163565
+        },
+        "@offcpu_us": {
+          "2698537": [
+            {
+              "min": 1,
+              "max": 1,
+              "count": 271
+            },
+            {
+              "min": 2,
+              "max": 3,
+              "count": 508
+            },
+            {
+              "min": 4,
+              "max": 7,
+              "count": 81106
+            },
+            {
+              "min": 8,
+              "max": 15,
+              "count": 81186
+            },
+            {
+              "min": 16,
+              "max": 31,
+              "count": 302
+            },
+            {
+              "min": 32,
+              "max": 63,
+              "count": 55
+            },
+            {
+              "min": 64,
+              "max": 127,
+              "count": 4
+            },
+            {
+              "min": 128,
+              "max": 255,
+              "count": 4
+            },
+            {
+              "min": 256,
+              "max": 511,
+              "count": 6
+            },
+            {
+              "min": 512,
+              "max": 1023,
+              "count": 0
+            },
+            {
+              "min": 1024,
+              "max": 2047,
+              "count": 0
+            },
+            {
+              "min": 2048,
+              "max": 4095,
+              "count": 0
+            },
+            {
+              "min": 4096,
+              "max": 8191,
+              "count": 0
+            },
+            {
+              "min": 8192,
+              "max": 16383,
+              "count": 0
+            },
+            {
+              "min": 16384,
+              "max": 32767,
+              "count": 0
+            },
+            {
+              "min": 32768,
+              "max": 65535,
+              "count": 0
+            },
+            {
+              "min": 65536,
+              "max": 131071,
+              "count": 119
+            },
+            {
+              "min": 131072,
+              "max": 262143,
+              "count": 0
+            },
+            {
+              "min": 262144,
+              "max": 524287,
+              "count": 1
+            },
+            {
+              "min": 524288,
+              "max": 1048575,
+              "count": 3
+            }
+          ]
+        },
+        "@runqueue_ns": {
+          "2698537": 135110644
+        },
+        "@runqueue_samples": {
+          "2698537": 163567
+        },
+        "@runqueue_us": {
+          "2698537": [
+            {
+              "min": 0,
+              "max": 0,
+              "count": 161582
+            },
+            {
+              "min": 1,
+              "max": 1,
+              "count": 1291
+            },
+            {
+              "min": 2,
+              "max": 3,
+              "count": 223
+            },
+            {
+              "min": 4,
+              "max": 7,
+              "count": 258
+            },
+            {
+              "min": 8,
+              "max": 15,
+              "count": 138
+            },
+            {
+              "min": 16,
+              "max": 31,
+              "count": 55
+            },
+            {
+              "min": 32,
+              "max": 63,
+              "count": 10
+            },
+            {
+              "min": 64,
+              "max": 127,
+              "count": 1
+            },
+            {
+              "min": 128,
+              "max": 255,
+              "count": 4
+            },
+            {
+              "min": 256,
+              "max": 511,
+              "count": 5
+            }
+          ]
+        },
+        "@tcp_calls": {
+          "2698537,2,1": 81462,
+          "2698537,2,2": 81462,
+          "2698537,1,1": 81464,
+          "2698537,1,2": 162905
+        },
+        "@tcp_completed_calls": {
+          "2698537,2,1": 81462,
+          "2698537,2,2": 81462,
+          "2698537,1,1": 81464,
+          "2698537,1,2": 162905
+        },
+        "@tcp_elapsed_ns": {
+          "2698537,1,1": 111762918,
+          "2698537,1,2": 139632021,
+          "2698537,2,1": 434518823,
+          "2698537,2,2": 629092150
+        },
+        "@tcp_errors": {
+          "2698537,1,2,-11": 81443
+        },
+        "@tcp_latency_us": {
+          "2698537,2,1": [
+            {
+              "min": 4,
+              "max": 7,
+              "count": 80813
+            },
+            {
+              "min": 8,
+              "max": 15,
+              "count": 555
+            },
+            {
+              "min": 16,
+              "max": 31,
+              "count": 90
+            },
+            {
+              "min": 32,
+              "max": 63,
+              "count": 4
+            }
+          ],
+          "2698537,2,2": [
+            {
+              "min": 4,
+              "max": 7,
+              "count": 72036
+            },
+            {
+              "min": 8,
+              "max": 15,
+              "count": 9243
+            },
+            {
+              "min": 16,
+              "max": 31,
+              "count": 166
+            },
+            {
+              "min": 32,
+              "max": 63,
+              "count": 17
+            }
+          ],
+          "2698537,1,1": [
+            {
+              "min": 0,
+              "max": 0,
+              "count": 1
+            },
+            {
+              "min": 1,
+              "max": 1,
+              "count": 81302
+            },
+            {
+              "min": 2,
+              "max": 3,
+              "count": 33
+            },
+            {
+              "min": 4,
+              "max": 7,
+              "count": 97
+            },
+            {
+              "min": 8,
+              "max": 15,
+              "count": 25
+            },
+            {
+              "min": 16,
+              "max": 31,
+              "count": 6
+            }
+          ],
+          "2698537,1,2": [
+            {
+              "min": 0,
+              "max": 0,
+              "count": 81406
+            },
+            {
+              "min": 1,
+              "max": 1,
+              "count": 81308
+            },
+            {
+              "min": 2,
+              "max": 3,
+              "count": 52
+            },
+            {
+              "min": 4,
+              "max": 7,
+              "count": 98
+            },
+            {
+              "min": 8,
+              "max": 15,
+              "count": 27
+            },
+            {
+              "min": 16,
+              "max": 31,
+              "count": 14
+            }
+          ]
+        },
+        "@tcp_requested_bytes": {
+          "2698537,2,2": 3665790,
+          "2698537,2,1": 13359768,
+          "2698537,1,1": 333676544,
+          "2698537,1,2": 2669035520
+        },
+        "@tcp_returned_bytes": {
+          "2698537,1,1": 3665790,
+          "2698537,2,2": 3665790,
+          "2698537,1,2": 12952458,
+          "2698537,2,1": 13359768
+        },
+        "@tcp_zero_returns": {
+          "2698537,1,1": 2
+        }
+      },
+      "loss_or_errors": [],
+      "ready": true,
+      "ended": true,
+      "stdout_diagnostics": [],
+      "tcp": [
+        {
+          "pid": 2698537,
+          "direction": "recv",
+          "side": "downstream",
+          "completed_calls": 81464,
+          "returned_bytes": 3665790,
+          "inclusive_elapsed_ns": 111762918,
+          "mean_elapsed_us": 1.371930153196504
+        },
+        {
+          "pid": 2698537,
+          "direction": "send",
+          "side": "downstream",
+          "completed_calls": 81462,
+          "returned_bytes": 13359768,
+          "inclusive_elapsed_ns": 434518823,
+          "mean_elapsed_us": 5.334006321966069
+        },
+        {
+          "pid": 2698537,
+          "direction": "recv",
+          "side": "upstream",
+          "completed_calls": 162905,
+          "returned_bytes": 12952458,
+          "inclusive_elapsed_ns": 139632021,
+          "mean_elapsed_us": 0.8571377244406249
+        },
+        {
+          "pid": 2698537,
+          "direction": "send",
+          "side": "upstream",
+          "completed_calls": 81462,
+          "returned_bytes": 3665790,
+          "inclusive_elapsed_ns": 629092150,
+          "mean_elapsed_us": 7.722522771353514
+        }
+      ]
+    },
+    "kernel_stack_sample_count": 637,
+    "raw_trace_directory": "/tmp/rut-bounded-followup-20260928/ebpf-small-proxy-r1/16-c1-keepalive-rut/trace"
+  },
+  "16-c32-close-nginx": {
+    "status": {
+      "completed": true,
+      "usable": true,
+      "mode": "trace",
+      "kernel": "6.19.10-300.fc44.x86_64",
+      "machine": "x86_64",
+      "groups": [
+        "fault",
+        "rx-copy",
+        "sched",
+        "stacks",
+        "tcp"
+      ],
+      "duration_seconds": 12,
+      "front_port": 8987,
+      "origin_port": 9987,
+      "started_at": 1790626616.8328493,
+      "program_sha256": "8b9a738d07c6b48b591be55643bcc7fe56c2060532d05dd056abf9e5151a5d07",
+      "targets_before": [
+        {
+          "pid": 2697669,
+          "start_ticks": 91254487,
+          "state": "S",
+          "comm": "nginx",
+          "exe": "/usr/sbin/nginx"
+        }
+      ],
+      "bpftrace_version": "bpftrace v0.27.0",
+      "command": [
+        "/tmp/rut-bounded-followup-20260928/ebpf-tools/bpftrace-container.py",
+        "-f",
+        "json",
+        "-B",
+        "line",
+        "/tmp/rut-bounded-followup-20260928/ebpf-small-proxy-r1/16-c32-close-nginx/trace/program.bt"
+      ],
+      "returncode": 0,
+      "targets_after": [
+        {
+          "pid": 2697669,
+          "start_ticks": 91254487,
+          "state": "S",
+          "comm": "nginx",
+          "exe": "/usr/sbin/nginx"
+        }
+      ],
+      "targets_unchanged": true,
+      "diagnostic_warnings": false,
+      "finished_at": 1790626631.0352101
+    },
+    "summary": {
+      "maps": {
+        "@copy_calls": {
+          "2697669,1,2": 100825,
+          "2697669,1,1": 100850
+        },
+        "@copy_elapsed_ns": {
+          "2697669,1,2": 34236917,
+          "2697669,1,1": 36513642
+        },
+        "@copy_latency_us": {
+          "2697669,1,2": [
+            {
+              "min": 0,
+              "max": 0,
+              "count": 100776
+            },
+            {
+              "min": 1,
+              "max": 1,
+              "count": 1
+            },
+            {
+              "min": 2,
+              "max": 3,
+              "count": 23
+            },
+            {
+              "min": 4,
+              "max": 7,
+              "count": 3
+            },
+            {
+              "min": 8,
+              "max": 15,
+              "count": 6
+            },
+            {
+              "min": 16,
+              "max": 31,
+              "count": 15
+            },
+            {
+              "min": 32,
+              "max": 63,
+              "count": 1
+            }
+          ],
+          "2697669,1,1": [
+            {
+              "min": 0,
+              "max": 0,
+              "count": 100809
+            },
+            {
+              "min": 1,
+              "max": 1,
+              "count": 1
+            },
+            {
+              "min": 2,
+              "max": 3,
+              "count": 20
+            },
+            {
+              "min": 4,
+              "max": 7,
+              "count": 8
+            },
+            {
+              "min": 8,
+              "max": 15,
+              "count": 4
+            },
+            {
+              "min": 16,
+              "max": 31,
+              "count": 8
+            }
+          ]
+        },
+        "@copy_success_bytes": {
+          "2697669,1,1": 6454400,
+          "2697669,1,2": 16031175
+        },
+        "@offcpu_ns": {
+          "2697669": 10345031
+        },
+        "@offcpu_samples": {
+          "2697669": 1532
+        },
+        "@offcpu_us": {
+          "2697669": [
+            {
+              "min": 1,
+              "max": 1,
+              "count": 487
+            },
+            {
+              "min": 2,
+              "max": 3,
+              "count": 416
+            },
+            {
+              "min": 4,
+              "max": 7,
+              "count": 217
+            },
+            {
+              "min": 8,
+              "max": 15,
+              "count": 257
+            },
+            {
+              "min": 16,
+              "max": 31,
+              "count": 127
+            },
+            {
+              "min": 32,
+              "max": 63,
+              "count": 22
+            },
+            {
+              "min": 64,
+              "max": 127,
+              "count": 4
+            },
+            {
+              "min": 128,
+              "max": 255,
+              "count": 2
+            }
+          ]
+        },
+        "@runqueue_ns": {
+          "2697669": 8886842
+        },
+        "@runqueue_samples": {
+          "2697669": 1533
+        },
+        "@runqueue_us": {
+          "2697669": [
+            {
+              "min": 0,
+              "max": 0,
+              "count": 18
+            },
+            {
+              "min": 1,
+              "max": 1,
+              "count": 863
+            },
+            {
+              "min": 2,
+              "max": 3,
+              "count": 47
+            },
+            {
+              "min": 4,
+              "max": 7,
+              "count": 244
+            },
+            {
+              "min": 8,
+              "max": 15,
+              "count": 230
+            },
+            {
+              "min": 16,
+              "max": 31,
+              "count": 110
+            },
+            {
+              "min": 32,
+              "max": 63,
+              "count": 16
+            },
+            {
+              "min": 64,
+              "max": 127,
+              "count": 3
+            },
+            {
+              "min": 128,
+              "max": 255,
+              "count": 2
+            }
+          ]
+        },
+        "@tcp_calls": {
+          "2697669,2,2": 100825,
+          "2697669,2,1": 100825,
+          "2697669,1,1": 100853,
+          "2697669,1,2": 201604
+        },
+        "@tcp_completed_calls": {
+          "2697669,2,2": 100825,
+          "2697669,2,1": 100825,
+          "2697669,1,1": 100853,
+          "2697669,1,2": 201604
+        },
+        "@tcp_elapsed_ns": {
+          "2697669,1,1": 139168413,
+          "2697669,1,2": 155908888,
+          "2697669,2,1": 706552656,
+          "2697669,2,2": 781784266
+        },
+        "@tcp_latency_us": {
+          "2697669,2,1": [
+            {
+              "min": 4,
+              "max": 7,
+              "count": 99481
+            },
+            {
+              "min": 8,
+              "max": 15,
+              "count": 939
+            },
+            {
+              "min": 16,
+              "max": 31,
+              "count": 345
+            },
+            {
+              "min": 32,
+              "max": 63,
+              "count": 58
+            },
+            {
+              "min": 64,
+              "max": 127,
+              "count": 2
+            }
+          ],
+          "2697669,2,2": [
+            {
+              "min": 4,
+              "max": 7,
+              "count": 91763
+            },
+            {
+              "min": 8,
+              "max": 15,
+              "count": 8631
+            },
+            {
+              "min": 16,
+              "max": 31,
+              "count": 355
+            },
+            {
+              "min": 32,
+              "max": 63,
+              "count": 74
+            },
+            {
+              "min": 64,
+              "max": 127,
+              "count": 2
+            }
+          ],
+          "2697669,1,1": [
+            {
+              "min": 0,
+              "max": 0,
+              "count": 2
+            },
+            {
+              "min": 1,
+              "max": 1,
+              "count": 100603
+            },
+            {
+              "min": 2,
+              "max": 3,
+              "count": 47
+            },
+            {
+              "min": 4,
+              "max": 7,
+              "count": 110
+            },
+            {
+              "min": 8,
+              "max": 15,
+              "count": 15
+            },
+            {
+              "min": 16,
+              "max": 31,
+              "count": 74
+            },
+            {
+              "min": 32,
+              "max": 63,
+              "count": 2
+            }
+          ],
+          "2697669,1,2": [
+            {
+              "min": 0,
+              "max": 0,
+              "count": 100719
+            },
+            {
+              "min": 1,
+              "max": 1,
+              "count": 100634
+            },
+            {
+              "min": 2,
+              "max": 3,
+              "count": 84
+            },
+            {
+              "min": 4,
+              "max": 7,
+              "count": 74
+            },
+            {
+              "min": 8,
+              "max": 15,
+              "count": 24
+            },
+            {
+              "min": 16,
+              "max": 31,
+              "count": 67
+            },
+            {
+              "min": 32,
+              "max": 63,
+              "count": 2
+            }
+          ]
+        },
+        "@tcp_requested_bytes": {
+          "2697669,2,2": 4537125,
+          "2697669,2,1": 16031175,
+          "2697669,1,1": 103273472,
+          "2697669,1,2": 809746123
+        },
+        "@tcp_returned_bytes": {
+          "2697669,2,2": 4537125,
+          "2697669,1,1": 6454400,
+          "2697669,1,2": 16031175,
+          "2697669,2,1": 16031175
+        },
+        "@tcp_zero_returns": {
+          "2697669,1,1": 3,
+          "2697669,1,2": 100779
+        }
+      },
+      "loss_or_errors": [],
+      "ready": true,
+      "ended": true,
+      "stdout_diagnostics": [],
+      "tcp": [
+        {
+          "pid": 2697669,
+          "direction": "recv",
+          "side": "downstream",
+          "completed_calls": 100853,
+          "returned_bytes": 6454400,
+          "inclusive_elapsed_ns": 139168413,
+          "mean_elapsed_us": 1.3799134681169622
+        },
+        {
+          "pid": 2697669,
+          "direction": "send",
+          "side": "downstream",
+          "completed_calls": 100825,
+          "returned_bytes": 16031175,
+          "inclusive_elapsed_ns": 706552656,
+          "mean_elapsed_us": 7.007712928341185
+        },
+        {
+          "pid": 2697669,
+          "direction": "recv",
+          "side": "upstream",
+          "completed_calls": 201604,
+          "returned_bytes": 16031175,
+          "inclusive_elapsed_ns": 155908888,
+          "mean_elapsed_us": 0.7733422352731096
+        },
+        {
+          "pid": 2697669,
+          "direction": "send",
+          "side": "upstream",
+          "completed_calls": 100825,
+          "returned_bytes": 4537125,
+          "inclusive_elapsed_ns": 781784266,
+          "mean_elapsed_us": 7.753873206050087
+        }
+      ]
+    },
+    "kernel_stack_sample_count": 791,
+    "raw_trace_directory": "/tmp/rut-bounded-followup-20260928/ebpf-small-proxy-r1/16-c32-close-nginx/trace"
+  },
+  "16-c32-close-rut": {
+    "status": {
+      "completed": true,
+      "usable": true,
+      "mode": "trace",
+      "kernel": "6.19.10-300.fc44.x86_64",
+      "machine": "x86_64",
+      "groups": [
+        "fault",
+        "rx-copy",
+        "sched",
+        "stacks",
+        "tcp"
+      ],
+      "duration_seconds": 12,
+      "front_port": 8987,
+      "origin_port": 9987,
+      "started_at": 1790626633.2787242,
+      "program_sha256": "249af54b6d9836e2f3c36c0a28e2b26fd7f3eab98b7ea23f063c06916eb53ed6",
+      "targets_before": [
+        {
+          "pid": 2697877,
+          "start_ticks": 91256135,
+          "state": "S",
+          "comm": "rut-buffered-mo",
+          "exe": "/tmp/rut-bounded-followup-20260928/ebpf-tools/rut-buffered-more"
+        }
+      ],
+      "bpftrace_version": "bpftrace v0.27.0",
+      "command": [
+        "/tmp/rut-bounded-followup-20260928/ebpf-tools/bpftrace-container.py",
+        "-f",
+        "json",
+        "-B",
+        "line",
+        "/tmp/rut-bounded-followup-20260928/ebpf-small-proxy-r1/16-c32-close-rut/trace/program.bt"
+      ],
+      "returncode": 0,
+      "targets_after": [
+        {
+          "pid": 2697877,
+          "start_ticks": 91256135,
+          "state": "S",
+          "comm": "rut-buffered-mo",
+          "exe": "/tmp/rut-bounded-followup-20260928/ebpf-tools/rut-buffered-more"
+        }
+      ],
+      "targets_unchanged": true,
+      "diagnostic_warnings": false,
+      "finished_at": 1790626647.6388142
+    },
+    "summary": {
+      "maps": {
+        "@copy_calls": {
+          "2697877,1,2": 106622,
+          "2697877,1,1": 106622
+        },
+        "@copy_elapsed_ns": {
+          "2697877,1,1": 32377429,
+          "2697877,1,2": 36465157
+        },
+        "@copy_latency_us": {
+          "2697877,1,1": [
+            {
+              "min": 0,
+              "max": 0,
+              "count": 106559
+            },
+            {
+              "min": 1,
+              "max": 1,
+              "count": 1
+            },
+            {
+              "min": 2,
+              "max": 3,
+              "count": 15
+            },
+            {
+              "min": 4,
+              "max": 7,
+              "count": 11
+            },
+            {
+              "min": 8,
+              "max": 15,
+              "count": 14
+            },
+            {
+              "min": 16,
+              "max": 31,
+              "count": 21
+            },
+            {
+              "min": 32,
+              "max": 63,
+              "count": 1
+            }
+          ],
+          "2697877,1,2": [
+            {
+              "min": 0,
+              "max": 0,
+              "count": 106550
+            },
+            {
+              "min": 1,
+              "max": 1,
+              "count": 1
+            },
+            {
+              "min": 2,
+              "max": 3,
+              "count": 23
+            },
+            {
+              "min": 4,
+              "max": 7,
+              "count": 9
+            },
+            {
+              "min": 8,
+              "max": 15,
+              "count": 11
+            },
+            {
+              "min": 16,
+              "max": 31,
+              "count": 26
+            },
+            {
+              "min": 32,
+              "max": 63,
+              "count": 2
+            }
+          ]
+        },
+        "@copy_success_bytes": {
+          "2697877,1,1": 6823808,
+          "2697877,1,2": 16952898
+        },
+        "@minor_faults": {
+          "2697877": 20
+        },
+        "@offcpu_ns": {
+          "2697877": 15483175582
+        },
+        "@offcpu_samples": {
+          "2697877": 1773
+        },
+        "@offcpu_us": {
+          "2697877": [
+            {
+              "min": 1,
+              "max": 1,
+              "count": 4
+            },
+            {
+              "min": 2,
+              "max": 3,
+              "count": 942
+            },
+            {
+              "min": 4,
+              "max": 7,
+              "count": 162
+            },
+            {
+              "min": 8,
+              "max": 15,
+              "count": 194
+            },
+            {
+              "min": 16,
+              "max": 31,
+              "count": 150
+            },
+            {
+              "min": 32,
+              "max": 63,
+              "count": 76
+            },
+            {
+              "min": 64,
+              "max": 127,
+              "count": 32
+            },
+            {
+              "min": 128,
+              "max": 255,
+              "count": 36
+            },
+            {
+              "min": 256,
+              "max": 511,
+              "count": 40
+            },
+            {
+              "min": 512,
+              "max": 1023,
+              "count": 13
+            },
+            {
+              "min": 1024,
+              "max": 2047,
+              "count": 1
+            },
+            {
+              "min": 2048,
+              "max": 4095,
+              "count": 0
+            },
+            {
+              "min": 4096,
+              "max": 8191,
+              "count": 0
+            },
+            {
+              "min": 8192,
+              "max": 16383,
+              "count": 0
+            },
+            {
+              "min": 16384,
+              "max": 32767,
+              "count": 0
+            },
+            {
+              "min": 32768,
+              "max": 65535,
+              "count": 0
+            },
+            {
+              "min": 65536,
+              "max": 131071,
+              "count": 119
+            },
+            {
+              "min": 131072,
+              "max": 262143,
+              "count": 0
+            },
+            {
+              "min": 262144,
+              "max": 524287,
+              "count": 0
+            },
+            {
+              "min": 524288,
+              "max": 1048575,
+              "count": 4
+            }
+          ]
+        },
+        "@runqueue_ns": {
+          "2697877": 15622303
+        },
+        "@runqueue_samples": {
+          "2697877": 1775
+        },
+        "@runqueue_us": {
+          "2697877": [
+            {
+              "min": 0,
+              "max": 0,
+              "count": 206
+            },
+            {
+              "min": 1,
+              "max": 1,
+              "count": 764
+            },
+            {
+              "min": 2,
+              "max": 3,
+              "count": 221
+            },
+            {
+              "min": 4,
+              "max": 7,
+              "count": 172
+            },
+            {
+              "min": 8,
+              "max": 15,
+              "count": 180
+            },
+            {
+              "min": 16,
+              "max": 31,
+              "count": 161
+            },
+            {
+              "min": 32,
+              "max": 63,
+              "count": 47
+            },
+            {
+              "min": 64,
+              "max": 127,
+              "count": 14
+            },
+            {
+              "min": 128,
+              "max": 255,
+              "count": 6
+            },
+            {
+              "min": 256,
+              "max": 511,
+              "count": 3
+            },
+            {
+              "min": 512,
+              "max": 1023,
+              "count": 0
+            },
+            {
+              "min": 1024,
+              "max": 2047,
+              "count": 0
+            },
+            {
+              "min": 2048,
+              "max": 4095,
+              "count": 1
+            }
+          ]
+        },
+        "@tcp_calls": {
+          "2697877,1,0": 24,
+          "2697877,2,2": 106622,
+          "2697877,2,1": 106622,
+          "2697877,1,2": 107840,
+          "2697877,1,1": 213204
+        },
+        "@tcp_completed_calls": {
+          "2697877,1,0": 24,
+          "2697877,2,2": 106622,
+          "2697877,2,1": 106622,
+          "2697877,1,2": 107840,
+          "2697877,1,1": 213204
+        },
+        "@tcp_elapsed_ns": {
+          "2697877,1,0": 14696,
+          "2697877,1,2": 112545015,
+          "2697877,1,1": 177635943,
+          "2697877,2,1": 582598583,
+          "2697877,2,2": 615219910
+        },
+        "@tcp_errors": {
+          "2697877,1,0,-104": 10,
+          "2697877,1,1,-11": 457,
+          "2697877,1,2,-11": 1218
+        },
+        "@tcp_latency_us": {
+          "2697877,1,0": [
+            {
+              "min": 0,
+              "max": 0,
+              "count": 23
+            },
+            {
+              "min": 1,
+              "max": 1,
+              "count": 0
+            },
+            {
+              "min": 2,
+              "max": 3,
+              "count": 1
+            }
+          ],
+          "2697877,2,1": [
+            {
+              "min": 4,
+              "max": 7,
+              "count": 105105
+            },
+            {
+              "min": 8,
+              "max": 15,
+              "count": 858
+            },
+            {
+              "min": 16,
+              "max": 31,
+              "count": 568
+            },
+            {
+              "min": 32,
+              "max": 63,
+              "count": 85
+            },
+            {
+              "min": 64,
+              "max": 127,
+              "count": 6
+            }
+          ],
+          "2697877,2,2": [
+            {
+              "min": 4,
+              "max": 7,
+              "count": 104780
+            },
+            {
+              "min": 8,
+              "max": 15,
+              "count": 1174
+            },
+            {
+              "min": 16,
+              "max": 31,
+              "count": 560
+            },
+            {
+              "min": 32,
+              "max": 63,
+              "count": 92
+            },
+            {
+              "min": 64,
+              "max": 127,
+              "count": 16
+            }
+          ],
+          "2697877,1,2": [
+            {
+              "min": 0,
+              "max": 0,
+              "count": 71861
+            },
+            {
+              "min": 1,
+              "max": 1,
+              "count": 35602
+            },
+            {
+              "min": 2,
+              "max": 3,
+              "count": 134
+            },
+            {
+              "min": 4,
+              "max": 7,
+              "count": 94
+            },
+            {
+              "min": 8,
+              "max": 15,
+              "count": 49
+            },
+            {
+              "min": 16,
+              "max": 31,
+              "count": 93
+            },
+            {
+              "min": 32,
+              "max": 63,
+              "count": 7
+            }
+          ],
+          "2697877,1,1": [
+            {
+              "min": 0,
+              "max": 0,
+              "count": 164647
+            },
+            {
+              "min": 1,
+              "max": 1,
+              "count": 48064
+            },
+            {
+              "min": 2,
+              "max": 3,
+              "count": 135
+            },
+            {
+              "min": 4,
+              "max": 7,
+              "count": 135
+            },
+            {
+              "min": 8,
+              "max": 15,
+              "count": 57
+            },
+            {
+              "min": 16,
+              "max": 31,
+              "count": 157
+            },
+            {
+              "min": 32,
+              "max": 63,
+              "count": 9
+            }
+          ]
+        },
+        "@tcp_requested_bytes": {
+          "2697877,1,0": 98304,
+          "2697877,2,2": 4797990,
+          "2697877,2,1": 16952898,
+          "2697877,1,1": 873283584,
+          "2697877,1,2": 1766850560
+        },
+        "@tcp_returned_bytes": {
+          "2697877,2,2": 4797990,
+          "2697877,1,1": 6823808,
+          "2697877,2,1": 16952898,
+          "2697877,1,2": 16952898
+        },
+        "@tcp_zero_returns": {
+          "2697877,1,0": 14,
+          "2697877,1,1": 106125
+        }
+      },
+      "loss_or_errors": [],
+      "ready": true,
+      "ended": true,
+      "stdout_diagnostics": [],
+      "tcp": [
+        {
+          "pid": 2697877,
+          "direction": "recv",
+          "side": "downstream",
+          "completed_calls": 213204,
+          "returned_bytes": 6823808,
+          "inclusive_elapsed_ns": 177635943,
+          "mean_elapsed_us": 0.8331735943040468
+        },
+        {
+          "pid": 2697877,
+          "direction": "send",
+          "side": "downstream",
+          "completed_calls": 106622,
+          "returned_bytes": 16952898,
+          "inclusive_elapsed_ns": 582598583,
+          "mean_elapsed_us": 5.4641498283656285
+        },
+        {
+          "pid": 2697877,
+          "direction": "recv",
+          "side": "other",
+          "completed_calls": 24,
+          "returned_bytes": 0,
+          "inclusive_elapsed_ns": 14696,
+          "mean_elapsed_us": 0.6123333333333334
+        },
+        {
+          "pid": 2697877,
+          "direction": "recv",
+          "side": "upstream",
+          "completed_calls": 107840,
+          "returned_bytes": 16952898,
+          "inclusive_elapsed_ns": 112545015,
+          "mean_elapsed_us": 1.043629590133531
+        },
+        {
+          "pid": 2697877,
+          "direction": "send",
+          "side": "upstream",
+          "completed_calls": 106622,
+          "returned_bytes": 4797990,
+          "inclusive_elapsed_ns": 615219910,
+          "mean_elapsed_us": 5.770102886833862
+        }
+      ]
+    },
+    "kernel_stack_sample_count": 787,
+    "raw_trace_directory": "/tmp/rut-bounded-followup-20260928/ebpf-small-proxy-r1/16-c32-close-rut/trace"
+  }
+}

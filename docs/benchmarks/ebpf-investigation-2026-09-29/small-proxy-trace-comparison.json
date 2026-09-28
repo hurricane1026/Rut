@@ -1,0 +1,326 @@
+[
+  {
+    "case": "16-c1-close-nginx",
+    "requests": 58439,
+    "rps_traced": 7215.029840906117,
+    "errors": [
+      0,
+      0,
+      0,
+      0,
+      0
+    ],
+    "usable": true,
+    "user_us": 8.898167319769332,
+    "system_us": 54.073478327829015,
+    "minor_faults_per_request": 0.0,
+    "runqueue_ns_per_request": 5651.3944112664485,
+    "offcpu_ns_per_request": 49385.31870839679,
+    "downstream_recv": {
+      "calls_per_request": 1.0000342237204607,
+      "bytes_per_call": 63.99780975684879,
+      "us_per_request": 1.3228478071151115,
+      "ns_per_byte": 20.669496986173616
+    },
+    "downstream_send": {
+      "calls_per_request": 1.0,
+      "bytes_per_call": 159.0,
+      "us_per_request": 7.1822510652133,
+      "ns_per_byte": 45.17139034725346
+    },
+    "upstream_recv": {
+      "calls_per_request": 1.000581803247831,
+      "bytes_per_call": 158.90754707300806,
+      "us_per_request": 1.2993974571775697,
+      "ns_per_byte": 8.172311051431256
+    },
+    "upstream_send": {
+      "calls_per_request": 1.0,
+      "bytes_per_call": 45.0,
+      "us_per_request": 7.944386420027721,
+      "ns_per_byte": 176.54192044506047
+    },
+    "copy_side_2": {
+      "ns_per_byte": 2.1335551633101053,
+      "us_per_request": 0.33923527096630673,
+      "bytes_per_request": 159.0
+    },
+    "copy_side_1": {
+      "ns_per_byte": 5.461385215780558,
+      "us_per_request": 0.3495286538099557,
+      "bytes_per_request": 64.0
+    }
+  },
+  {
+    "case": "16-c1-close-rut",
+    "requests": 58744,
+    "rps_traced": 7253.007404008835,
+    "errors": [
+      0,
+      0,
+      0,
+      0,
+      0
+    ],
+    "usable": true,
+    "user_us": 13.788642244314312,
+    "system_us": 58.899632302873485,
+    "minor_faults_per_request": 0.0,
+    "runqueue_ns_per_request": 1749.872787008035,
+    "offcpu_ns_per_request": 296870.1840698625,
+    "downstream_recv": {
+      "calls_per_request": 1.0486347541876617,
+      "bytes_per_call": 61.031736497784124,
+      "us_per_request": 2.1637280232874847,
+      "ns_per_byte": 33.80825036386695
+    },
+    "downstream_send": {
+      "calls_per_request": 1.0,
+      "bytes_per_call": 159.0,
+      "us_per_request": 7.439334672477189,
+      "ns_per_byte": 46.78826838035968
+    },
+    "other_recv": {
+      "calls_per_request": 0.029126378864224433,
+      "bytes_per_call": 0.0,
+      "us_per_request": 0.018902032548004905,
+      "ns_per_byte": 0
+    },
+    "upstream_recv": {
+      "calls_per_request": 1.9989445730627808,
+      "bytes_per_call": 79.54197537172347,
+      "us_per_request": 1.7138740126651233,
+      "ns_per_byte": 10.779081840661153
+    },
+    "upstream_send": {
+      "calls_per_request": 1.0,
+      "bytes_per_call": 45.0,
+      "us_per_request": 7.868991079940079,
+      "ns_per_byte": 174.86646844311286
+    },
+    "copy_side_1": {
+      "ns_per_byte": 5.172534375851151,
+      "us_per_request": 0.33104220005447366,
+      "bytes_per_request": 64.0
+    },
+    "copy_side_2": {
+      "ns_per_byte": 2.574436291954773,
+      "us_per_request": 0.4093353704208089,
+      "bytes_per_request": 159.0
+    }
+  },
+  {
+    "case": "16-c1-keepalive-nginx",
+    "requests": 82362,
+    "rps_traced": 10168.562422913526,
+    "errors": [
+      0,
+      0,
+      0,
+      0,
+      0
+    ],
+    "usable": true,
+    "user_us": 7.891989024064496,
+    "system_us": 46.25919720259343,
+    "minor_faults_per_request": 0.0,
+    "runqueue_ns_per_request": 1455.1237342463758,
+    "offcpu_ns_per_request": 20789.39982030548,
+    "downstream_recv": {
+      "calls_per_request": 1.000024283043151,
+      "bytes_per_call": 44.99890728959254,
+      "us_per_request": 1.3457639081129649,
+      "ns_per_byte": 29.905864624732548
+    },
+    "downstream_send": {
+      "calls_per_request": 1.0,
+      "bytes_per_call": 163.99502197615405,
+      "us_per_request": 5.212295184672543,
+      "ns_per_byte": 31.78325245403147
+    },
+    "upstream_recv": {
+      "calls_per_request": 1.0003885286904155,
+      "bytes_per_call": 158.93824793067455,
+      "us_per_request": 1.3124121560914013,
+      "ns_per_byte": 8.254164503719506
+    },
+    "upstream_send": {
+      "calls_per_request": 1.0,
+      "bytes_per_call": 45.0,
+      "us_per_request": 7.870122823632258,
+      "ns_per_byte": 174.89161830293907
+    },
+    "copy_side_1": {
+      "ns_per_byte": 7.866607038305151,
+      "us_per_request": 0.35399731672373186,
+      "bytes_per_request": 45.0
+    },
+    "copy_side_2": {
+      "ns_per_byte": 2.259968914650296,
+      "us_per_request": 0.3593350574293971,
+      "bytes_per_request": 159.0
+    }
+  },
+  {
+    "case": "16-c1-keepalive-rut",
+    "requests": 81462,
+    "rps_traced": 10057.443059738338,
+    "errors": [
+      0,
+      0,
+      0,
+      0,
+      0
+    ],
+    "usable": true,
+    "user_us": 10.434312931182637,
+    "system_us": 49.102649087918294,
+    "minor_faults_per_request": 0.0,
+    "runqueue_ns_per_request": 1658.5726350936634,
+    "offcpu_ns_per_request": 202827.86513957428,
+    "downstream_recv": {
+      "calls_per_request": 1.000024551324544,
+      "bytes_per_call": 44.9988952175194,
+      "us_per_request": 1.3719638358989468,
+      "ns_per_byte": 30.488085242198817
+    },
+    "downstream_send": {
+      "calls_per_request": 1.0,
+      "bytes_per_call": 164.0,
+      "us_per_request": 5.334006321966069,
+      "ns_per_byte": 32.52442879247604
+    },
+    "upstream_recv": {
+      "calls_per_request": 1.9997667624168325,
+      "bytes_per_call": 79.50927227525244,
+      "us_per_request": 1.7140755321499597,
+      "ns_per_byte": 10.780349258804776
+    },
+    "upstream_send": {
+      "calls_per_request": 1.0,
+      "bytes_per_call": 45.0,
+      "us_per_request": 7.722522771353514,
+      "ns_per_byte": 171.6116171411892
+    },
+    "copy_side_1": {
+      "ns_per_byte": 8.025872185804424,
+      "us_per_request": 0.3611642483611991,
+      "bytes_per_request": 45.0
+    },
+    "copy_side_2": {
+      "ns_per_byte": 2.5162796127190683,
+      "us_per_request": 0.40008845842233187,
+      "bytes_per_request": 159.0
+    }
+  },
+  {
+    "case": "16-c32-close-nginx",
+    "requests": 100820,
+    "rps_traced": 12602.175493981029,
+    "errors": [
+      0,
+      0,
+      0,
+      0,
+      0
+    ],
+    "usable": true,
+    "user_us": 7.24062685975005,
+    "system_us": 46.1218012299147,
+    "minor_faults_per_request": 0.0,
+    "runqueue_ns_per_request": 88.14562586788335,
+    "offcpu_ns_per_request": 102.60891688157112,
+    "downstream_recv": {
+      "calls_per_request": 1.0003273160087285,
+      "bytes_per_call": 63.998096239080645,
+      "us_per_request": 1.380365135885737,
+      "ns_per_byte": 21.561789322012892
+    },
+    "downstream_send": {
+      "calls_per_request": 1.0000495933346558,
+      "bytes_per_call": 159.0,
+      "us_per_request": 7.008060464193613,
+      "ns_per_byte": 44.0736662159823
+    },
+    "upstream_recv": {
+      "calls_per_request": 1.9996429279904782,
+      "bytes_per_call": 79.51813952104125,
+      "us_per_request": 1.5464083316802222,
+      "ns_per_byte": 9.725356251179342
+    },
+    "upstream_send": {
+      "calls_per_request": 1.0000495933346558,
+      "bytes_per_call": 45.0,
+      "us_per_request": 7.7542577464788724,
+      "ns_per_byte": 172.30829346777972
+    },
+    "copy_side_2": {
+      "ns_per_byte": 2.1356461394751163,
+      "us_per_request": 0.33958457647292206,
+      "bytes_per_request": 159.00788534021027
+    },
+    "copy_side_1": {
+      "ns_per_byte": 5.657170612295489,
+      "us_per_request": 0.36216665344177745,
+      "bytes_per_request": 64.01904384050783
+    }
+  },
+  {
+    "case": "16-c32-close-rut",
+    "requests": 106592,
+    "rps_traced": 13318.046833065619,
+    "errors": [
+      0,
+      0,
+      0,
+      0,
+      0
+    ],
+    "usable": true,
+    "user_us": 8.44341038727109,
+    "system_us": 40.43455418793155,
+    "minor_faults_per_request": 0.00018763134193935756,
+    "runqueue_ns_per_request": 146.56168380366256,
+    "offcpu_ns_per_request": 145256.45059666768,
+    "downstream_recv": {
+      "calls_per_request": 2.0001876313419396,
+      "bytes_per_call": 32.00600363970657,
+      "us_per_request": 1.6665035180876615,
+      "ns_per_byte": 26.031790900330137
+    },
+    "downstream_send": {
+      "calls_per_request": 1.000281447012909,
+      "bytes_per_call": 159.0,
+      "us_per_request": 5.465687697012909,
+      "ns_per_byte": 34.36572219097879
+    },
+    "other_recv": {
+      "calls_per_request": 0.00022515761032722905,
+      "bytes_per_call": 0.0,
+      "us_per_request": 0.00013787151005703992,
+      "ns_per_byte": 0
+    },
+    "upstream_recv": {
+      "calls_per_request": 1.011708195737016,
+      "bytes_per_call": 157.20417284866468,
+      "us_per_request": 1.0558486096517563,
+      "ns_per_byte": 6.638688854259608
+    },
+    "upstream_send": {
+      "calls_per_request": 1.000281447012909,
+      "bytes_per_call": 45.0,
+      "us_per_request": 5.7717268650555384,
+      "ns_per_byte": 128.22450859630803
+    },
+    "copy_side_1": {
+      "ns_per_byte": 4.744774325420645,
+      "us_per_request": 0.3037510225908136,
+      "bytes_per_request": 64.01801260882618
+    },
+    "copy_side_2": {
+      "ns_per_byte": 2.150968937582235,
+      "us_per_request": 0.3421003170969679,
+      "bytes_per_request": 159.04475007505255
+    }
+  }
+]

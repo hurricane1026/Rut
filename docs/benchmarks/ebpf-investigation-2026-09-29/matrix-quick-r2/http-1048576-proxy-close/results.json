@@ -1,0 +1,110 @@
+[
+  {
+    "requests": 4081,
+    "seconds": 2.099422,
+    "rps": 1943.8683599581218,
+    "p50_us": 471.0,
+    "p95_us": 515.0,
+    "p99_us": 631.0,
+    "errors": {
+      "connect": 0,
+      "read": 0,
+      "write": 0,
+      "status": 0,
+      "timeout": 0
+    },
+    "client_cpu_seconds": 0.8999999999999999,
+    "workload": "proxy",
+    "proxy_profile": "converter-strict",
+    "static_profile": "native-body",
+    "transport": "http",
+    "body_size": 1048576,
+    "connection": "close",
+    "engine": "nginx",
+    "rep": 1,
+    "concurrency": 1,
+    "warmup_errors": {
+      "connect": 0,
+      "read": 0,
+      "write": 0,
+      "status": 0,
+      "timeout": 0
+    },
+    "server_cpu_pct": 66.20869934677259,
+    "origin_cpu_pct": 41.916298867021496,
+    "server_rss_bytes": 16855040,
+    "valid": true
+  },
+  {
+    "requests": 4215,
+    "seconds": 2.001138,
+    "rps": 2106.3015144382844,
+    "p50_us": 15101.0,
+    "p95_us": 15920.0,
+    "p99_us": 16299.0,
+    "errors": {
+      "connect": 0,
+      "read": 0,
+      "write": 0,
+      "status": 0,
+      "timeout": 0
+    },
+    "client_cpu_seconds": 0.95,
+    "workload": "proxy",
+    "proxy_profile": "converter-strict",
+    "static_profile": "native-body",
+    "transport": "http",
+    "body_size": 1048576,
+    "connection": "close",
+    "engine": "nginx",
+    "rep": 1,
+    "concurrency": 32,
+    "warmup_errors": {
+      "connect": 0,
+      "read": 0,
+      "write": 0,
+      "status": 0,
+      "timeout": 0
+    },
+    "server_cpu_pct": 67.46161434143971,
+    "origin_cpu_pct": 41.47639992844071,
+    "server_rss_bytes": 17145856,
+    "valid": true
+  },
+  {
+    "requests": 4257,
+    "seconds": 2.029153,
+    "rps": 2097.9196738737787,
+    "p50_us": 59773.0,
+    "p95_us": 60708.0,
+    "p99_us": 66739.0,
+    "errors": {
+      "connect": 0,
+      "read": 0,
+      "write": 0,
+      "status": 0,
+      "timeout": 0
+    },
+    "client_cpu_seconds": 0.96,
+    "workload": "proxy",
+    "proxy_profile": "converter-strict",
+    "static_profile": "native-body",
+    "transport": "http",
+    "body_size": 1048576,
+    "connection": "close",
+    "engine": "nginx",
+    "rep": 1,
+    "concurrency": 128,
+    "warmup_errors": {
+      "connect": 0,
+      "read": 0,
+      "write": 0,
+      "status": 0,
+      "timeout": 0
+    },
+    "server_cpu_pct": 67.02303867672867,
+    "origin_cpu_pct": 44.84629793810522,
+    "server_rss_bytes": 17776640,
+    "valid": true
+  }
+]

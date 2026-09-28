@@ -386,3 +386,27 @@ The HTTP 1 MiB proxy-close group was rejected by a newly observed clang++
 process at the host guard, before Rut's load. Its three coordinates remain
 invalid and need a fresh run; the successful nginx-only partials are not a
 comparison. This interruption is preserved in the matrix evidence.
+
+The corrected quick matrix completed all 96 coordinate evaluations: 93 valid
+comparisons and three invalid HTTP 1 MiB proxy-close cells from host-guard
+rejection. Of the valid diagnostic ratios, 69 were at least 1.10 and 24 below
+it. **No cell qualifies for performance acceptance** with this short,
+single-repeat profile. Matrix JSON, sample/status files, wrk logs and host
+snapshots are retained in `matrix-quick-r2-evidence.tar.gz` (hash recorded
+next to it); readable matrix/sample/status summaries are in `matrix-quick-r2/`.
+Original configurations and
+payloads remain under the corresponding `/tmp` output path.
+
+The retained runtime is `187bd5d9`. A three-repeat static-large keepalive
+validation and the invalid-cell retry are queued with the tracing controls.
+A separate unretained prototype removes the copied body prefix only when a
+plaintext static body has a memfd: the header is sent first and sendfile
+starts at offset zero. Its build/probe are serialized after baseline work.
+
+The small-proxy traces completed. At 16 B/c1, nginx/Rut user CPU was about
+8.9/13.8 us per close request and 7.9/10.4 us per keepalive request. Kernel
+TCP receive-copy helpers account for less than 1 us/request total. Rut made
+about two upstream receives per request versus nginx one at c1; at c32 the
+relationship changed, so this is workload/timing dependent. Instrumented
+throughput is not used as acceptance evidence. The small-body gap calls for
+control-path and receive-attempt analysis, not a bulk-copy explanation.

@@ -1,0 +1,7 @@
+{
+  "archive": "matrix-quick-r2-evidence.tar.gz",
+  "sha256": "16473fd088b78e5bc89b7a4bfc068b0199d037d410199ba65d75bdc27dade86f",
+  "runtime_commit": "187bd5d9",
+  "acceptance_eligible": false,
+  "raw_root": "/tmp/rut-bounded-followup-20260928/buffered-more-matrix-quick-r2"
+}
