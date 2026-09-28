@@ -22,16 +22,21 @@ struct RutSource {
 // One flag per RUT surface the lowering needs beyond today's grammar. Each
 // flag is flipped only by the PR that lands the corresponding runtime
 // capability (docs/envoy-converter.md, "Known capability dependencies"); the
-// converter itself never flips one on its own. The shipped table is
-// deliberately all-false, so `lower_to_rut(model)` fails closed with a
-// `BLOCKED_BY_RUT` diagnostic until those PRs land.
+// converter itself never flips one on its own. The shipped table
+// (`kShippedRutCapabilities` below) is partially enabled: `request_envoy_h1`
+// is true (PR3 landed the ID4 `Http11PreserveHostLowercase` request policy,
+// so lowering clears that check), while `response_envoy_h1` and
+// `local_reply_envoy_h1` are still false, so `lower_to_rut(model)` still
+// fails closed with a `BLOCKED_BY_RUT` diagnostic -- now at the
+// `response_envoy_h1` check (`src/envoy/converter.cc`) -- until PR4 and PR5
+// flip their flags.
 struct RutCapabilities {
     bool request_envoy_h1 = false;      // PR3: host preserve + lowercase request headers
     bool response_envoy_h1 = false;     // PR4: upstream header order + lowercase + preserved date
     bool local_reply_envoy_h1 = false;  // PR5: lowercase local_response / failure_policy layout
 };
 
-inline constexpr RutCapabilities kShippedRutCapabilities{};
+inline constexpr RutCapabilities kShippedRutCapabilities{.request_envoy_h1 = true};
 
 // Lower the milestone Envoy semantic model to deterministic RUT source using
 // the capabilities this binary actually ships. Fails closed with a
@@ -54,7 +59,9 @@ FrontendResult<RutSource> lower_to_rut(const Bootstrap& model, const RutCapabili
 // explicit predicate rather than an unconditional print so a future codec
 // type (or a listener-protocol capability, if one is ever added) has
 // somewhere to change the answer, and so tests can assert the condition
-// without needing the shipped, still-all-false `RutCapabilities` to be true.
+// without needing the shipped `RutCapabilities` (`request_envoy_h1 = true`
+// as of PR3; `response_envoy_h1`/`local_reply_envoy_h1` still false) to be
+// true.
 //
 // This is deliberately NOT a `RutCapabilities` gate: Rut's cleartext `listen`
 // has no knob to disable h2c-preface detection at all

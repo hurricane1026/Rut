@@ -204,7 +204,16 @@ static inline void match_connection(const u8* val, u32 vlen, ParsedRequest* req)
             req->upgrade = false;          // close is contradictory with upgrade
             return;                        // close overrides keep-alive (RFC 7230)
         } else if (tok_len == 10 && str_ci_eq(val + tok_start, "keep-alive", 10)) {
-            req->keep_alive = true;
+            // Suppress if a close token was already seen on an earlier,
+            // separate Connection field -- e.g. `Connection: close` then a
+            // later `Connection: keep-alive` -- so `keep_alive` is sticky
+            // false the same way `connection_close` is sticky true (Codex
+            // sweep-3 review, PR #696). Within a *single* field's token
+            // list this is moot: `close` always wins regardless of which
+            // token comes first (it either overwrites `keep_alive` after
+            // this branch already ran, or its own branch above returns
+            // before this one is ever reached).
+            if (!req->connection_close) req->keep_alive = true;
         } else if (tok_len == 7 && str_ci_eq(val + tok_start, "upgrade", 7)) {
             // Suppress if a close token was seen in any Connection field — a
             // "close … upgrade" request (even split across fields) is not an upgrade.

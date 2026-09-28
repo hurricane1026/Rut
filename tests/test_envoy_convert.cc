@@ -878,9 +878,13 @@ TEST(envoy_convert, cli_parse_error_is_source_located) {
 }
 
 TEST(envoy_convert, cli_milestone_s_fails_closed_with_request_gap) {
+    // PR3 shipped `request_envoy_h1`, so the shipped CLI now clears check 4
+    // (host preserve + lowercase request headers) and fails closed one check
+    // later, at check 5 (response header order), located at the HCM span.
     const TempDir temp_dir;
     REQUIRE(temp_dir.ok());
     const std::string& directory = temp_dir.path();
+
     const std::string text = milestone_s_json();
     const std::string path = directory + "/milestone.json";
     REQUIRE(write_file(path, text));
@@ -888,9 +892,7 @@ TEST(envoy_convert, cli_milestone_s_fails_closed_with_request_gap) {
     static envoy::JsonDocument doc;
     auto parsed = envoy::parse_bootstrap_json(str(text), doc);
     REQUIRE(parsed);
-    const Span span =
-        parsed.value()
-            .listener.filter_chain.hcm.route_config.virtual_host.route.action.cluster_span;
+    const Span span = parsed.value().listener.filter_chain.hcm.span;
 
     const RunResult result = run_converter(g_executable, path);
     REQUIRE(WIFEXITED(result.status));
@@ -898,7 +900,8 @@ TEST(envoy_convert, cli_milestone_s_fails_closed_with_request_gap) {
     CHECK(result.out.empty());
     const std::string expected_prefix = expected_location(path, span);
     CHECK_EQ(result.err.compare(0, expected_prefix.size(), expected_prefix), 0);
-    CHECK(result.err.find("RUT request_policy lacks host: \"preserve\"") != std::string::npos);
+    CHECK(result.err.find("RUT response_policy lacks header_order: \"upstream\"") !=
+          std::string::npos);
 }
 
 // ── API-level capability gating ───────────────────────────────────────

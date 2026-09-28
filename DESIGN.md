@@ -1867,6 +1867,202 @@ future sticky-session "learn" mode. Rut cannot express that mode today:
 must not hold sessions. No copyable declaration is specified until the strict
 table and its cross-connection consistency contract exist.
 
+**Request rewrite policy (`request_policy`)**
+
+`forward(upstream, request_policy: { ... })` requests a fixed, closed
+byte-for-byte serialization of the upstream request instead of the
+transparent zero-copy default; every field is a literal, validated at parse
+time, and unsupported combinations are a compile error rather than a runtime
+fallback. The compiler selects one of four closed source profiles
+(`RequestPolicyId` in `include/rut/common/request_policy.h`) from the
+`request_policy` object's fields:
+
+```swift
+// ID1 (Http11FixedStrip) -- the base upstream-authority profile: rewrites
+// Host to the upstream endpoint and strips the fixed five-name hop-by-hop
+// set unconditionally (no Connection-token nomination, no TE exception).
+return forward(users, request_policy: {
+    version: "HTTP/1.1", host: "upstream", connection: "omit",
+    strip_headers: ["Connection", "Keep-Alive", "TE", "Expect", "Upgrade"]
+})
+
+// ID2 (Http11FixedStripContentLengthAfterHost) -- ID1 plus
+// `content_length_position: "after_host"`: emits Content-Length
+// immediately after the rewritten Host line instead of in the client's
+// original header order. Mutually exclusive with `retained_header_value`.
+// A request with no framing header at all (no Content-Length) is admitted
+// unchanged -- there is nothing to reposition, so it forwards like ID1. Only
+// an explicit `Content-Length: 0` is rejected.
+return forward(users, request_policy: {
+    version: "HTTP/1.1", host: "upstream", connection: "omit",
+    content_length_position: "after_host",
+    strip_headers: ["Connection", "Keep-Alive", "TE", "Expect", "Upgrade"]
+})
+
+// ID3 (Http11FixedTrimSpPreserveHtab) -- ID1 plus
+// `retained_header_value: "trim_sp_preserve_htab"`: retained (non-stripped)
+// header values are trimmed of leading/trailing space but keep any
+// leading/trailing horizontal tab, matching a byte-exact oracle shape.
+// Mutually exclusive with `content_length_position`. Bounded to the single
+// bodyless-GET profile: any Content-Length (including zero), chunked
+// framing, or a non-GET method is rejected.
+return forward(users, request_policy: {
+    version: "HTTP/1.1", host: "upstream", connection: "omit",
+    retained_header_value: "trim_sp_preserve_htab",
+    strip_headers: ["Connection", "Keep-Alive", "TE", "Expect", "Upgrade"]
+})
+
+// ID4 (Http11PreserveHostLowercase) -- the Envoy-compatible H1 profile
+// (`host: "preserve"`): keeps the client's Host header verbatim instead of
+// rewriting it (fails closed unless exactly one non-empty, syntactically
+// valid-authority Host header is present), lowercases every forwarded
+// header name, and requires forwarded_proto and the six-name strip list
+// (including Proxy-Connection) together. Mutually exclusive with
+// `content_length_position` and `retained_header_value`.
+return forward(users, request_policy: {
+    version: "HTTP/1.1", host: "preserve", connection: "omit",
+    header_names: "lowercase", forwarded_proto: "http",
+    strip_headers: ["Connection", "Keep-Alive", "TE", "Expect", "Upgrade", "Proxy-Connection"]
+})
+```
+
+All four profiles require `version: "HTTP/1.1"` and `connection: "omit"`
+literally, and reject a request whose framing is ambiguous for this closed
+serializer: a body paired with a client `Expect` header whose trimmed value
+is non-empty, `Transfer-Encoding`, or (ID1/ID2/ID3 only) any semantically-
+present `Upgrade` header fails closed rather than proxying with ambiguous
+semantics. An empty or OWS-only `Expect` field carries no expectation at all
+(RFC 9110 defines only the "100-continue" expect-value) and is admitted like
+a request with no `Expect` header: the serializer strips every `Expect`
+field via `drop_fixed` regardless of value, so this shape (most commonly
+paired with `Content-Length: 0`) has nothing left to negotiate (Codex
+round-9 review, PR #696). (ID4 instead admits a bare `Upgrade` header --
+one not paired with a `Connection` value that nominates the `upgrade`
+token together with a semantically-present (non-empty/OWS) `Upgrade`
+value; that genuine-upgrade combination still fails closed for ID4 too,
+the same as every other policy -- see below. Every admitted `Upgrade`
+field, nominated or not, is always stripped from the forwarded request:
+Envoy itself forwards a bare `Upgrade` header unchanged on the wire, but
+Rut's request_policy path has no upgrade-tunnel capability at all, so
+"admitted" here means only that the request is not rejected for it, not
+that the header reaches the wire -- it never does, unmodified or
+otherwise). `host: "upstream"` (ID1/ID2/ID3) additionally
+rejects `header_names`, `forwarded_proto`, and a `Proxy-Connection` strip
+entry, and
+requires exactly the original five strip names; `host: "preserve"` (ID4)
+rejects `content_length_position`/`retained_header_value` and requires
+`header_names`/`forwarded_proto` plus all six strip names.
+
+`host: "preserve"` (ID4) additionally: drops every header nominated by the
+client's `Connection` header value (RFC 7230-style hop-by-hop stripping, not
+just the fixed `strip_headers` list) except `te` and the protected names
+`content-length`, `host`, `x-forwarded-for`, `x-forwarded-host`, and
+`x-forwarded-proto`. A `te` nomination never forces a drop by itself: the
+request-wide `trailers` check below alone decides whether one canonical
+`te: trailers` line is forwarded, matching Envoy's own nomination special
+case (so `Connection: TE` with `TE: trailers` forwards `te: trailers`).
+Nominating any of the protected names fails the whole request closed instead
+(dropping the framing or
+provenance header while still forwarding the request is unsafe -- see
+`docs/envoy-compatibility.md`), as does nominating a pseudo-header-shaped
+token (one whose first byte is `:`, e.g. the aliased `:authority`), matching
+Envoy's own `sanitizeConnectionHeader` rejection of the same shape; keeps
+`te` when any physical `TE` field's comma-separated tokens contain
+`trailers` -- this is a request-wide decision, not a per-field one: whether
+any field anywhere on the request carries that token is determined first,
+and if so exactly one canonical `te: trailers` line (rewritten to that
+exact lowercase token regardless of the client's casing or any other token
+in the value) is emitted at the position of the *first* physical `TE`
+field, with every other physical `TE` field suppressed entirely. So
+`TE: gzip`, then an unrelated header, then `TE: trailers` forwards
+`te: trailers` at the first field's position, before that unrelated header
+-- it is not the case that the `gzip` field is independently dropped in
+place while the `trailers` field is independently kept in its own place;
+and two or more physical fields that each carry a `trailers` token still
+collapse to exactly one canonical line, not one per field; rejects a
+request whose `Connection` value nominates the `upgrade`
+token together with an `Upgrade` header whose trimmed raw value is
+non-empty, even when the `Connection` value also contains `close` (presence
+is based on the field's trimmed raw value directly, not the parser's own
+token-skipping `req.has_upgrade_header` flag, which treats a
+comma/OWS-only value such as `,` or `, ,` as absent even though it is not
+blank -- Codex sweep-8 review, PR #696 -- so a comma-only `Upgrade` value
+paired with a nominating `Connection` value fails closed too; only a
+genuinely empty or OWS-only `Upgrade` value is admitted instead, with
+`Connection: close, upgrade` paired with such a value stripping both
+fields -- one as a nominated header, the other as the fixed-list `Upgrade`
+strip entry); rejects more than one physical `X-Forwarded-Proto` field
+unconditionally, with no `Connection`-nomination exception (nominating
+`x-forwarded-proto` itself is separately protected -- see the provenance
+bullet below -- so this name can never be dropped away as an escape hatch;
+Envoy coalesces duplicates into one inline header, this profile does not,
+so it fails closed instead); separately rejects a duplicated physical
+occurrence of any *other* header name Envoy stores as a single inline slot
+(every name in `kInlineRequestHeaders`,
+`include/rut/runtime/callbacks_impl.h` -- e.g. `Content-Type`,
+`User-Agent`, `Authorization`, `Referer`, and every remaining
+`X-Forwarded-*`/`X-Envoy-*` name not already unconditionally stripped or
+covered by the `X-Forwarded-Proto` rule just above) *unless* the client's
+`Connection` value also nominates that name, in which case every physical
+occurrence is dropped instead and no duplicate ever reaches the wire (Envoy
+coalesces duplicates of these into one inline header too; this profile does
+not replicate that coalescing, so a non-nominated duplicate fails closed
+instead); rejects a request target carrying a URI fragment;
+drops every client-supplied header that Envoy's own
+`ConnectionManagerUtility::mutateRequestHeaders` sanitizes for a non-internal,
+non-edge external request on a cleartext listener -- the fixed shape this
+profile targets, since the milestone bootstrap never sets
+`use_remote_address: true` (so a request can never become internal) nor
+`forward_client_cert_details` (default `SANITIZE`): `x-envoy-internal`, the
+fourteen `x-envoy-*` names `cleanInternalHeaders` removes unconditionally,
+`x-forwarded-client-cert`, and (Rut-side hardening, not an Envoy-parity
+claim) `x-envoy-external-address` -- seventeen in total (see
+`docs/envoy-compatibility.md` for the exact list; the handful of
+edge-request-only removals are unreachable under that fixed shape and pass
+through unchanged); a `Connection` nomination of `te` is exempt from the
+generic nomination drop -- the `te`/`trailers` handling above decides its
+fate instead, matching Envoy's own `sanitizeConnectionHeader` special case;
+and ensures a single `x-forwarded-proto` field is always present: a valid
+client-supplied value (trimmed, case-insensitively exactly `http` or
+`https`, matching Envoy's own `Utility::schemeIsValid`) is kept unchanged,
+in its original position, without case normalization; an empty, OWS-only,
+or otherwise invalid client-supplied field, such as `http,https`, is
+overwritten in place, at that same original position, with
+`x-forwarded-proto: http` rather than dropped and forwarded as a blank or
+malformed scheme; and `x-forwarded-proto: http` is appended as the last
+header only when the client sent no `x-forwarded-proto` field at all. This
+`http` fallback is connection-derived, not client-derived, so `host:
+"preserve"` targets Envoy's cleartext (non-TLS) listener profile only: it is
+rejected outright -- fail closed, no upstream contact, the same status
+every other unsupported combination in this profile uses -- on a connection
+this runtime itself terminated with TLS (`conn.tls_active`), rather than
+ever synthesizing `https` (Codex sweep-8 review, PR #696); the `.rut`
+language has no TLS-listener declaration to check this statically today
+(`listen` carries only an address and port), so this restriction is
+enforced at request admission time, covering a hand-written route or
+direct-RIR caller that selects this policy on a TLS connection just as it
+covers every other admission path. It is
+closed to ordinary
+zero-copy-shaped forwards: a request with a body paired with a client
+`Expect` header whose trimmed value is non-empty, or with
+`Transfer-Encoding`, fails closed rather than proxying with ambiguous
+framing (no `100 Continue` interim-response support exists yet); an empty
+or OWS-only `Expect` field is admitted like a request with no `Expect`
+header at all, matching the same nonempty-trimmed-value condition described
+above. `host: "preserve"` (ID4) is additionally ordinary-forward-only: a
+route pairing it with a response read timeout, response buffering, or a
+`target_transform` (`forward(upstream, set_path: "...")`) request-target
+rewrite fails at compile time with a dedicated diagnostic (`analyze_term`,
+`src/compiler/analyze.cc`) rather than the generic response-read-timeout/
+buffering diagnostics, since none of the three has a proven interaction with
+this profile; a direct-RIR/JIT-constructed outcome that bypasses the
+analyzer is independently rejected by the same runtime preflight that
+enforces every other ID4 admission rule. See `docs/language-card.md` for the
+exact field grammar and
+`docs/envoy-converter.md` for the byte-level Envoy oracle this profile is
+verified against. A parallel, separately-closed `response_policy` exists for
+response-side rewriting; see `docs/language-card.md`.
+
 #### 3.4.6 Response Caching
 
 Standard HTTP response caching (RFC 7234) is handled automatically by the runtime,

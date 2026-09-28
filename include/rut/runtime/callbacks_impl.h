@@ -946,13 +946,15 @@ inline bool forward_policy_head_modes_compatible(const RouteConfig& config,
                                                  u16 timeout_failure_policy_id = 0);
 inline bool response_policy_suppress_head_admitted(const Connection& conn,
                                                    const ForwardResponsePolicySpec& policy,
-                                                   bool paired_failure);
+                                                   bool paired_failure,
+                                                   u16 request_policy_id);
 inline ResponseReadDeadlineProfile classify_response_read_deadline_profile(
     const Connection& conn,
     const ForwardResponsePolicySpec& response,
     const ForwardFailurePolicySpec& failure,
     const ForwardFailurePolicySpec& timeout,
-    ForwardResponseBufferingMode buffering);
+    ForwardResponseBufferingMode buffering,
+    u16 request_policy_id);
 inline bool build_timeout_failure_policy_response(const Connection& conn,
                                                   const RouteConfig& config,
                                                   bool suppress_body,
@@ -1233,7 +1235,7 @@ bool prepare_response_read_deadline_preflight_for_mode(Loop* loop,
         const auto& failure = config->failure_policies[bundle.failure_policy_id - 1];
         const auto& timeout = config->failure_policies[bundle.timeout_failure_policy_id - 1];
         const ResponseReadDeadlineProfile profile = classify_response_read_deadline_profile(
-            conn, response, failure, timeout, bundle.response_buffering);
+            conn, response, failure, timeout, bundle.response_buffering, conn.request_policy_id);
         const bool fixed_upload = response_read_deadline_profile_is_fixed_upload(profile);
         const bool header_only_head_explicit_close =
             profile == ResponseReadDeadlineProfile::HeaderOnlyHead &&
@@ -3660,7 +3662,8 @@ void handle_jit_outcome(Loop* loop,
                         config->response_policies[forward_response_policy_id - 1],
                         config->failure_policies[forward_failure_policy_id - 1],
                         config->failure_policies[forward_timeout_failure_policy_id - 1],
-                        forward_response_buffering);
+                        forward_response_buffering,
+                        outcome.request_policy_id);
                 }
                 staged_fixed_head_continuation =
                     outcome_profile == ResponseReadDeadlineProfile::None &&
@@ -3963,7 +3966,20 @@ void handle_jit_outcome(Loop* loop,
                     (outcome.request_policy_id != 0 &&
                      (!request_policy_is_supported(outcome.request_policy_id) ||
                       inspect_request_policy_body(conn, outcome.request_policy_id) !=
-                          RequestPolicyBodyState::Complete))) {
+                          RequestPolicyBodyState::Complete)) ||
+                    // `host: "preserve"` (ID4) is ordinary-forward-only: it
+                    // never carries timing/buffering custody and
+                    // target_transform's request-target rewrite has no
+                    // proven interaction with it (src/compiler/analyze.cc
+                    // rejects this combination at compile time for
+                    // ordinary Rut source). A direct-RIR/JIT-constructed
+                    // outcome bypasses that analyzer entirely, so this
+                    // runtime preflight must enforce the same exclusion
+                    // before materialization -- request_policy_is_supported
+                    // above admits ID4 like any other supported policy and
+                    // would otherwise let this combination reach the
+                    // upstream (Codex sweep-2 review, PR #696).
+                    request_policy_preserves_host(outcome.request_policy_id)) {
                     reject_response_policy(loop, conn);
                     return;
                 }
@@ -4052,7 +4068,8 @@ void handle_jit_outcome(Loop* loop,
                 response_policy_suppress_head_admitted(
                     conn,
                     config->response_policies[forward_response_policy_id - 1],
-                    forward_failure_policy_id != 0);
+                    forward_failure_policy_id != 0,
+                    outcome.request_policy_id);
             if (fixed_upload_head_admitted) {
                 suppress_body_head = true;
             }
@@ -4450,6 +4467,14 @@ void handle_jit_outcome(Loop* loop,
             // pooled socket to this endpoint and skip the connect. Without this take
             // path, JIT forward(...) completions would deposit idle fds the pool never
             // hands back. On a miss, connect fresh.
+            //
+            // A strict-response-policy body upload (`request_policy_body_response_domain`)
+            // is never eligible for a pooled/reused socket: `strict_response_upload_ready`
+            // requires `!conn.upstream_reused` before it will publish the strict response,
+            // since a reused socket's prior traffic is not ownership evidence for this
+            // upload. Establishing that safely for a reused socket is a separate change;
+            // until then, always pay the fresh-connect cost for this combination rather
+            // than admit a request that can never produce a response.
             if constexpr (requires {
                               loop->reuse_idle_upstream(conn,
                                                         static_cast<u16>(outcome.upstream_id),
@@ -4457,6 +4482,7 @@ void handle_jit_outcome(Loop* loop,
                           }) {
                 if (conn.response_read_deadline_state == ResponseReadDeadlineState::None &&
                     !conn.failure_policy_suppress_body &&
+                    !(conn.response_policy_id != 0 && request_policy_body_response_domain(conn)) &&
                     loop->reuse_idle_upstream(
                         conn, static_cast<u16>(outcome.upstream_id), static_cast<u8>(kBackend))) {
                     conn.upstream_reused = true;
@@ -5404,6 +5430,316 @@ inline bool request_policy_name_eq(const u8* p, u32 n, const char* q, u32 qn) {
     return true;
 }
 
+// ID4 (`host: "preserve"`) fails the whole request closed for a `Connection`
+// nomination of any of these names, rather than dropping the nominated
+// header like every other nomination: `content-length` also drives how many
+// body bytes the serializer copies onto the wire (dropping the header while
+// still forwarding the already-validated body would desync a persistent
+// upstream connection -- request smuggling); `host` is written
+// unconditionally before nominations are even consulted, and an upstream
+// request with no Host at all is invalid HTTP/1.1; the three forwarded-
+// provenance headers could let a client mask the request's real origin if
+// silently dropped; and a pseudo-header-shaped token (first byte `:`, e.g.
+// the aliased `:authority`) is bytes-only in an H1 `Connection` value but
+// still fails the same way, matching Envoy's own `sanitizeConnectionHeader`
+// (`source/common/http/utility.cc`) rejection of the identical shape. Every
+// other nomination -- including `te`, `close`, `keep-alive`, `upgrade`
+// (when not paired with a semantically present `Upgrade` value, which is a
+// separate genuine-upgrade check the two call sites below make themselves),
+// and an arbitrary name such as `x-foo` -- is safe to admit here: it is
+// either handled specially elsewhere (`te`) or simply dropped along with
+// its nominated field, matching Envoy's own sanitization. Shared by the
+// ordinary ID4 serializer's nomination loop and the paired-HEAD
+// `suppress_body` preflight's Connection-value token scan so the two paths
+// cannot silently drift apart (Codex round-17 review, PR #696).
+inline bool request_policy_connection_nomination_is_protected(const u8* p, u32 n) {
+    return (n != 0 && p[0] == ':') || request_policy_name_eq(p, n, "content-length", 14) ||
+           request_policy_name_eq(p, n, "host", 4) ||
+           request_policy_name_eq(p, n, "x-forwarded-for", 15) ||
+           request_policy_name_eq(p, n, "x-forwarded-host", 16) ||
+           request_policy_name_eq(p, n, "x-forwarded-proto", 17);
+}
+
+// Trim OWS (space/HTAB) from both ends of [start, end), matching the OWS
+// trimming already applied to header values throughout this file.
+inline void request_policy_trim_ows(const u8*& start, const u8*& end) {
+    while (start < end && (*start == ' ' || *start == '\t')) start++;
+    while (end > start && (end[-1] == ' ' || end[-1] == '\t')) end--;
+}
+
+// Scan a comma-separated header value (already OWS-trimmed at the field
+// level) for a token that, once trimmed of its own OWS, case-insensitively
+// equals `token`. Shared by the TE "trailers" token search (Envoy's
+// `sanitizeConnectionHeader`, source/common/http/utility.cc, splits TE on
+// commas via `StringUtil::splitToken` and keeps the header, rewritten to
+// exactly "trailers", only when one token case-insensitively equals
+// "trailers" -- not only when the whole field value does) and the Connection
+// "upgrade" token search below (RFC 7230 comma-separated Connection tokens;
+// Envoy's `Utility::isUpgrade` uses the same per-token search and does not
+// care whether a "close" token is also present).
+inline bool request_policy_comma_value_has_token(const u8* value_start,
+                                                 const u8* value_end,
+                                                 const char* token,
+                                                 u32 token_len) {
+    const u8* tok = value_start;
+    while (tok <= value_end) {
+        const u8* tok_end = tok;
+        while (tok_end < value_end && *tok_end != ',') tok_end++;
+        const u8* t0 = tok;
+        const u8* t1 = tok_end;
+        request_policy_trim_ows(t0, t1);
+        if (t1 > t0 && request_policy_name_eq(t0, static_cast<u32>(t1 - t0), token, token_len))
+            return true;
+        if (tok_end >= value_end) break;
+        tok = tok_end + 1;
+    }
+    return false;
+}
+
+// Envoy's `HeaderUtility::authorityIsValid` character class
+// (source/common/http/header_utility.cc): permits alnum plus the RFC 3986
+// sub-delims (`!$%&'()*+,;=`), `-._~`, and `:@[]` (colon/at/brackets for
+// port, user-info, and IPv6 literals); rejects `/`, all other punctuation,
+// controls, space, and any byte >= 0x80. ID4 preserves the client's Host
+// verbatim instead of writing the upstream endpoint, so it is the one
+// profile that must validate the value's syntax itself before forwarding it
+// as the upstream request-line/Host authority (Envoy rejects a malformed
+// authority before routing; different origins may otherwise interpret
+// invalid authorities inconsistently).
+inline bool request_policy_host_authority_byte_is_valid(u8 c) {
+    if ((c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9')) return true;
+    switch (c) {
+        case '!':
+        case '$':
+        case '%':
+        case '&':
+        case '\'':
+        case '(':
+        case ')':
+        case '*':
+        case '+':
+        case ',':
+        case '-':
+        case '.':
+        case ':':
+        case ';':
+        case '=':
+        case '@':
+        case '[':
+        case ']':
+        case '_':
+        case '~':
+            return true;
+        default:
+            return false;
+    }
+}
+
+inline bool request_policy_host_authority_is_valid(const u8* p, u32 n) {
+    for (u32 i = 0; i < n; i++) {
+        if (!request_policy_host_authority_byte_is_valid(p[i])) return false;
+    }
+    return true;
+}
+
+// ID4 (Http11PreserveHostLowercase) targets the plain milestone bootstrap
+// HTTP connection manager: no `use_remote_address: true`, no configured
+// `internal_address_config`, no `forward_client_cert_details`
+// (docs/envoy-converter.md). Under that fixed shape Envoy's own
+// `ConnectionManagerUtility::mutateRequestHeaders`
+// (source/common/http/conn_manager_utility.cc, v1.39.1 line numbers below)
+// sanitizes sixteen of the seventeen client-supplied headers listed here on
+// every request, before route selection, regardless of what the client
+// supplied; the seventeenth, `x-envoy-external-address`, is not one of
+// `mutateRequestHeaders`'s own removals and is a Rut-side hardening addition
+// -- see its bullet below for why:
+//
+// * `x-envoy-internal`: `request_headers.removeEnvoyInternalRequest()`
+//   (line 142, under "Clean proxy headers") runs unconditionally, and the
+//   header is written back (`setReferenceEnvoyInternalRequest`, lines
+//   278-280) only when `internal_request` is true -- which needs
+//   `allow_trusted_address_checks` (line 263), itself only ever set inside
+//   `if (config.useRemoteAddress())` (lines 163-164). Without
+//   `use_remote_address` a request is external no matter what it carries,
+//   so the removal always stands and a client can never present itself as
+//   internal to the upstream (Codex round-7 review, PR #696).
+// * the fourteen `x-envoy-*` headers `cleanInternalHeaders` (lines
+//   351-388) removes regardless of `edge_request`: `internal_request` is
+//   always false, so line 282 always reaches it, and `edge_request =
+//   !internal_request && config.useRemoteAddress()` (line 275) is always
+//   false too (`useRemoteAddress()` defaults false). They let Envoy's own
+//   router/retry/hedging/tracing logic accept trusted operator or
+//   front-Envoy instructions, and an untrusted external client must not be
+//   able to inject them onto the upstream request. `cleanInternalHeaders`'s
+//   five `edge_request`-gated removals (`x-envoy-decorator-operation`,
+//   `x-envoy-downstream-service-cluster`, `x-envoy-downstream-service-node`,
+//   `x-envoy-original-path`, `x-envoy-original-host`) are unreachable under
+//   this fixed `edge_request == false` shape and pass through unchanged
+//   like any other client header, same as any name not in this list.
+// * `x-forwarded-client-cert`: `mutateXfccRequestHeader` (called at line
+//   324; body at lines 662-686) applies the HCM's static
+//   `forward_client_cert_details`, whose proto default is `SANITIZE` ("Do
+//   not send the XFCC header to the next hop. This is the default value.",
+//   api/envoy/extensions/filters/network/http_connection_manager/v3/
+//   http_connection_manager.proto), and `applyForwardClientCertConfig`
+//   (lines 541-545) then calls `removeForwardedClientCert()` -- for
+//   `Sanitize` outright, and independently for any connection that is not
+//   mutual TLS, so it fires on this cleartext listener either way. An
+//   upstream that trusts XFCC must never receive a certificate identity the
+//   client asserted itself (Codex round-7 review, PR #696).
+// * `x-envoy-external-address`: unlike the sixteen names above,
+//   `mutateRequestHeaders` never removes a client-supplied value for this
+//   one -- `request_headers.setEnvoyExternalAddress(...)` (line 308) only
+//   ever *writes* it, gated by `edge_request`, which (as above) requires
+//   `config.useRemoteAddress() == true` and is therefore unreachable under
+//   this milestone's fixed HCM shape; `cleanInternalHeaders`'s fourteen
+//   unconditional removals (lines 368-381) do not name it either, and the
+//   route's `internal_only_headers` list it also consults (line 282) is
+//   empty by default and unset by this converter. A client-supplied
+//   `x-envoy-external-address` would therefore reach the upstream verbatim
+//   through a real Envoy configured this exact way too -- this is not a
+//   byte-accurate mirror of an Envoy removal call. Rut strips it anyway as
+//   its own hardening: this header exists specifically so a trusted hop can
+//   assert the address it accepted a connection from, and letting a client
+//   forge that assertion for itself defeats the header's purpose regardless
+//   of whether the milestone's particular Envoy shape happens to also let it
+//   through (Codex round-8 review, PR #696; recorded as a documented
+//   per-request divergence in docs/envoy-compatibility.md, not a
+//   RutCapabilities gate).
+inline bool request_policy_is_stripped_client_envoy_header(const u8* p, u32 n) {
+    return request_policy_name_eq(p, n, "x-envoy-internal", 16) ||
+           request_policy_name_eq(p, n, "x-envoy-retriable-status-codes", 30) ||
+           request_policy_name_eq(p, n, "x-envoy-retriable-header-names", 30) ||
+           request_policy_name_eq(p, n, "x-envoy-retry-on", 16) ||
+           request_policy_name_eq(p, n, "x-envoy-retry-grpc-on", 21) ||
+           request_policy_name_eq(p, n, "x-envoy-max-retries", 19) ||
+           request_policy_name_eq(p, n, "x-envoy-upstream-alt-stat-name", 30) ||
+           request_policy_name_eq(p, n, "x-envoy-upstream-rq-timeout-ms", 30) ||
+           request_policy_name_eq(p, n, "x-envoy-upstream-rq-per-try-timeout-ms", 38) ||
+           request_policy_name_eq(p, n, "x-envoy-upstream-rq-timeout-alt-response", 40) ||
+           request_policy_name_eq(p, n, "x-envoy-expected-rq-timeout-ms", 30) ||
+           request_policy_name_eq(p, n, "x-envoy-force-trace", 19) ||
+           request_policy_name_eq(p, n, "x-envoy-ip-tags", 15) ||
+           request_policy_name_eq(p, n, "x-envoy-original-url", 20) ||
+           request_policy_name_eq(p, n, "x-envoy-hedge-on-per-try-timeout", 32) ||
+           request_policy_name_eq(p, n, "x-forwarded-client-cert", 23) ||
+           request_policy_name_eq(p, n, "x-envoy-external-address", 24);
+}
+
+// Envoy's `HeaderMapImpl` gives every one of these request headers a single
+// O(1) inline storage slot (`envoy/http/header_map.h`, v1.39.1:
+// `INLINE_REQ_HEADERS` (line 221: `INLINE_REQ_STRING_HEADERS`, line 180, +
+// `INLINE_REQ_NUMERIC_HEADERS`, line 213) and `INLINE_REQ_RESP_HEADERS`
+// (line 265: `INLINE_REQ_RESP_STRING_HEADERS`, line 249 -- `Connection`,
+// `ContentType`, `EnvoyDecoratorOperation`, `KeepAlive`, `ProxyConnection`,
+// `ProxyStatus`, `RequestId`, `TransferEncoding`, `Upgrade`, `Via` -- +
+// `INLINE_REQ_RESP_NUMERIC_HEADERS`, line 261 -- `ContentLength`,
+// `EnvoyAttemptCount`; every one of these twelve names is covered below,
+// either in the table or in one of the exclusion lists in this comment),
+// plus every request-side `Http::RegisterCustomInlineHeader<
+// CustomInlineHeaderRegistry::Type::RequestHeaders>` registration -- found
+// via `gh search code "RegisterCustomInlineHeader" --repo envoyproxy/envoy`,
+// e.g. source/extensions/filters/http/{cdn_loop,cors,cache,csrf,decompressor,
+// jwt_authn,grpc_web,oauth2,compressor,grpc_http1_reverse_bridge}/*.cc(.h),
+// source/extensions/filters/common/expr/context.cc,
+// source/extensions/tracers/skywalking/trace_segment_reporter.cc,
+// source/extensions/access_loggers/open_telemetry/access_log_impl.cc, and
+// contrib/sxg/filters/http/source/filter.cc; wire strings resolved from
+// `source/common/http/headers.h`'s `HeaderValues`/`CustomHeaderValues`).
+// `appendCopy`/`HeaderMapImpl::insertByKey` coalesce a second physical field
+// into that one slot (comma-joined) rather than keeping a second line.
+// `server`, `grpc-status`, `grpc-message`, and `x-envoy-upstream-service-
+// time` are deliberately NOT in this table (Codex round-13 review raised
+// them, but they are response/trailer-only, not shared): `Server` is in
+// `INLINE_RESP_STRING_HEADERS` (line 228), `EnvoyUpstreamServiceTime` is in
+// `INLINE_RESP_NUMERIC_HEADERS` (line 238), and `GrpcMessage`/`GrpcStatus`
+// are in `INLINE_RESP_STRING_HEADERS_TRAILERS`/`INLINE_RESP_NUMERIC_HEADERS_
+// TRAILERS` (lines 272/274) -- none of which `RequestHeaderMap` (line 738:
+// `RequestOrResponseHeaderMap` + `INLINE_REQ_STRING_HEADERS`/
+// `INLINE_REQ_NUMERIC_HEADERS` only) inherits; only `ResponseHeaderMap`
+// (line 771) and `ResponseTrailerMap` (line 786) do. A client sending two
+// of these as *request* headers therefore gets two ordinary (non-inline)
+// physical lines from a real Envoy `RequestHeaderMapImpl` too, so this
+// profile forwarding both unchanged already matches Envoy byte for byte;
+// adding them here would instead manufacture a new, incorrect 400 for a
+// shape Envoy forwards.
+// `:method`/`:path`/`:protocol`/`:scheme`/`:authority` are H2 pseudo-headers
+// with no HTTP/1.1 wire form and are omitted. `host`, `content-length`,
+// `te`, `connection`, `expect`, `upgrade`, and `x-forwarded-proto` are also
+// omitted: each already has its own fail-closed or canonicalizing duplicate
+// handling above (host/xfp count checks, the TE/Connection nomination
+// rules), so folding them into this generic table would just duplicate or
+// conflict with that logic. `keep-alive` and `proxy-connection` are omitted
+// too: `drop_fixed` above (via `request_policy_is_stripped_client_envoy_
+// header` and its own literal checks) already strips every physical
+// occurrence of those unconditionally, so no duplicate can ever reach
+// upstream regardless of this table. `transfer-encoding` is omitted for a
+// different reason -- not because it is stripped, but because
+// `inspect_request_policy_body` fails the whole request closed outright on
+// the first physical occurrence of it, before this serializer ever runs
+// (Codex sweep-11/sweep-13 review, PR #696: an earlier revision of this
+// comment grouped it with the two unconditionally-stripped names above,
+// which is not what happens to it), so a duplicate can never reach this
+// table's own duplicate-detection logic either. This profile does not
+// replicate Envoy's coalescing for the remaining names, so
+// a second physical occurrence of any of them fails the request closed
+// (400) instead of silently forwarding upstream bytes that diverge from
+// what an Envoy-parity client intended.
+struct RequestPolicyInlineHeaderEntry {
+    const char* name;
+    u32 len;
+};
+inline constexpr RequestPolicyInlineHeaderEntry kInlineRequestHeaders[] = {
+    {"x-client-trace-id", 17},
+    {"x-envoy-downstream-service-cluster", 34},
+    {"x-envoy-downstream-service-node", 31},
+    {"x-envoy-is-timeout-retry", 24},
+    {"x-envoy-original-path", 21},
+    {"x-envoy-original-host", 21},
+    {"x-forwarded-for", 15},
+    {"x-forwarded-host", 16},
+    {"grpc-timeout", 12},
+    {"user-agent", 10},
+    {"x-envoy-upstream-stream-duration-ms", 35},
+    {"x-forwarded-port", 16},
+    {"x-envoy-attempt-count", 21},
+    {"content-type", 12},
+    {"x-envoy-decorator-operation", 27},
+    {"proxy-status", 12},
+    {"x-request-id", 12},
+    {"via", 3},
+    {"cdn-loop", 8},
+    {"access-control-request-headers", 30},
+    {"access-control-request-method", 29},
+    {"origin", 6},
+    {"access-control-request-private-network", 38},
+    {"authorization", 13},
+    {"pragma", 6},
+    {"cache-control", 13},
+    {"if-match", 8},
+    {"if-none-match", 13},
+    {"if-modified-since", 17},
+    {"if-unmodified-since", 19},
+    {"if-range", 8},
+    {"referer", 7},
+    {"accept-encoding", 15},
+    {"content-encoding", 16},
+    {"accept", 6},
+    {"grpc-accept-encoding", 20},
+    {"authentication", 14},
+};
+inline constexpr u32 kInlineRequestHeaderTableSize =
+    sizeof(kInlineRequestHeaders) / sizeof(kInlineRequestHeaders[0]);
+
+inline i32 request_policy_inline_request_header_index(const u8* p, u32 n) {
+    for (u32 i = 0; i < kInlineRequestHeaderTableSize; i++) {
+        if (request_policy_name_eq(
+                p, n, kInlineRequestHeaders[i].name, kInlineRequestHeaders[i].len))
+            return static_cast<i32>(i);
+    }
+    return -1;
+}
+
 // Parse and validate the policy's framing before it can acquire an upstream
 // slot. The existing HTTP parser intentionally accepts identical duplicate
 // Content-Length fields; nginx's fixed policy does not, so count the raw fields
@@ -5414,6 +5750,22 @@ inline RequestPolicyBodyState inspect_request_policy_body(const Connection& conn
         conn.req_http_version != static_cast<u8>(HttpVersion::Http11) ||
         conn.recv_slice == nullptr || conn.send_slice == nullptr)
         return RequestPolicyBodyState::Invalid;
+    // ID4 targets Envoy's cleartext (non-TLS) listener profile only (see the
+    // `apply_preserve_host_lowercase_request_policy` guard and the
+    // `Http11PreserveHostLowercase` contract comment); reject it here, in
+    // the pre-body admission path, rather than only at materialization.
+    // `handle_jit_outcome` calls this inspector first and parks a `Waiting`
+    // result in `on_request_policy_body_recvd` for an incomplete
+    // fixed-length body, so a materialization-only guard lets a slow client
+    // hold the connection and receive buffer open for an ID4/TLS
+    // combination that is already known to be invalid, waiting for the rest
+    // of a body that will only ever be rejected once complete (Codex
+    // sweep-10 review, PR #696). Failing closed here, before any Waiting
+    // determination below, means the response is sent as soon as the
+    // headers admit the request, with no dependence on the client ever
+    // finishing the body.
+    if (request_policy_preserves_host(policy_id) && conn.tls_active)
+        return RequestPolicyBodyState::Invalid;
     const u8* data = conn.recv_buf.data();
     const u32 len = conn.recv_buf.len();
     HttpParser parser;
@@ -5421,6 +5773,16 @@ inline RequestPolicyBodyState inspect_request_policy_body(const Connection& conn
     parser.reset();
     if (parser.parse(data, len, &req) != ParseStatus::Complete || req.path.ptr == nullptr ||
         req.path.len == 0 || req.path.ptr[0] != '/')
+        return RequestPolicyBodyState::Invalid;
+    // ID4 (host: "preserve") only: HTTP request targets cannot carry a URI
+    // fragment (RFC 7230 §5.3); `apply_preserve_host_lowercase_request_
+    // policy`'s own check (below) is retained as defense in depth. Moved
+    // here, ahead of any Waiting-producing check, so a fragment-bearing
+    // target paired with an incomplete fixed-length body fails closed
+    // immediately instead of waiting for the rest of the body to arrive
+    // (Codex sweep-12 review, PR #696, following the sweep-10/11 pattern
+    // for the identical class of issue).
+    if (request_policy_preserves_host(policy_id) && req.target_has_fragment)
         return RequestPolicyBodyState::Invalid;
     // ID3 is a retained ordinary-header serializer for the single bounded
     // bodyless GET profile.  Explicit Content-Length (including zero), other
@@ -5439,6 +5801,31 @@ inline RequestPolicyBodyState inspect_request_policy_body(const Connection& conn
     bool has_te = false;
     bool has_expect = false;
     bool has_upgrade = false;
+    bool upgrade_value_nonempty = false;
+    bool connection_nominates_upgrade = false;
+    // ID4 (host: "preserve") only: a second physical `X-Forwarded-Proto`
+    // field (`apply_preserve_host_lowercase_request_policy`'s own check is
+    // retained as defense in depth) and a `Connection` value nominating a
+    // protected name (content-length/host/the three forwarded-provenance
+    // headers/a pseudo-header-shaped token -- see
+    // `request_policy_connection_nomination_is_protected`) are tracked/
+    // checked here too, for the same reason as the Host check below (Codex
+    // sweep-12 review, PR #696).
+    u32 xfp_count = 0;
+    bool seen_inline_request_header[kInlineRequestHeaderTableSize] = {};
+    bool inline_request_header_duplicated[kInlineRequestHeaderTableSize] = {};
+    // ID4 (host: "preserve") only: tracked here, ahead of any Waiting-
+    // producing check below, so a request whose Host shape is already known
+    // to be invalid (missing, duplicated, or an invalid authority such as
+    // `victim/path`) fails closed immediately rather than waiting for the
+    // rest of an incomplete fixed-length body to arrive -- the same
+    // materialization-time check `apply_preserve_host_lowercase_request_
+    // policy`'s own Pass 1 performs, done here early enough to preempt
+    // `Waiting` (Codex sweep-11 review, PR #696, following the sweep-10 TLS
+    // guard's pattern for the identical class of issue).
+    u32 host_count = 0;
+    const u8* host_value_start = nullptr;
+    u32 host_value_len = 0;
     const u8* hs = line_end + 2;
     const u8* header_end = end - 2;
     while (hs < header_end) {
@@ -5452,17 +5839,214 @@ inline RequestPolicyBodyState inspect_request_policy_body(const Connection& conn
         if (request_policy_name_eq(hs, name_len, "content-length", 14)) cl_count++;
         if (request_policy_name_eq(hs, name_len, "transfer-encoding", 17))
             return RequestPolicyBodyState::Invalid;
+        if (request_policy_preserves_host(policy_id)) {
+            const i32 inline_idx = request_policy_inline_request_header_index(hs, name_len);
+            if (inline_idx >= 0) {
+                if (seen_inline_request_header[inline_idx])
+                    inline_request_header_duplicated[inline_idx] = true;
+                seen_inline_request_header[inline_idx] = true;
+            }
+            if (request_policy_name_eq(hs, name_len, "x-forwarded-proto", 17)) xfp_count++;
+        }
+        if (request_policy_name_eq(hs, name_len, "host", 4)) {
+            host_count++;
+            const u8* host_start = colon + 1;
+            const u8* host_end_trim = le;
+            request_policy_trim_ows(host_start, host_end_trim);
+            host_value_start = host_start;
+            host_value_len = static_cast<u32>(host_end_trim - host_start);
+        }
+        // Every `te` field is admitted here regardless of its value (see the
+        // `has_te` gate below): the serializer decides `te`'s fate as one
+        // request-wide question, not per physical field -- whether *any*
+        // field anywhere on the request carries a "trailers" token -- and
+        // when so, canonicalizes to exactly one `te: trailers` line at the
+        // *first* physical TE field's position, dropping every other field
+        // regardless of its own value (Codex sweep-13 review, PR #696:
+        // an earlier revision of this comment described independent
+        // per-field evaluation, which is not what the serializer does).
+        // Admission here only needs to know whether this is a preserve-host
+        // policy capable of that handling.
         has_te |= request_policy_name_eq(hs, name_len, "te", 2);
-        has_expect |= request_policy_name_eq(hs, name_len, "expect", 6);
+        if (request_policy_name_eq(hs, name_len, "connection", 10)) {
+            const u8* value_start = colon + 1;
+            const u8* value_end = le;
+            request_policy_trim_ows(value_start, value_end);
+            // A raw "upgrade" token survives this scan even when a sibling
+            // "close" token has already cleared `conn.req_wants_upgrade`
+            // (the parser treats "close" as contradicting "upgrade" for the
+            // 101-tunnel decision). Envoy's own `Utility::isUpgrade` does not
+            // care whether "close" is also present -- it observes the
+            // "upgrade" token plus a non-empty Upgrade header alone -- so
+            // this shape must not be silently rewritten into ordinary
+            // traffic below.
+            connection_nominates_upgrade |=
+                request_policy_comma_value_has_token(value_start, value_end, "upgrade", 7);
+            // ID4 (host: "preserve") only: fail the whole request closed on
+            // a nomination of a protected name (content-length, host, the
+            // three forwarded-provenance headers, or a pseudo-header-shaped
+            // token) as each token is scanned, mirroring
+            // `apply_preserve_host_lowercase_request_policy`'s own Pass 1
+            // (retained there as defense in depth) -- moved here, ahead of
+            // any Waiting-producing check, for the same reason as the Host
+            // check above (Codex sweep-12 review, PR #696).
+            if (request_policy_preserves_host(policy_id)) {
+                const u8* tok = value_start;
+                while (tok <= value_end) {
+                    const u8* tok_end = tok;
+                    while (tok_end < value_end && *tok_end != ',') tok_end++;
+                    const u8* t0 = tok;
+                    const u8* t1 = tok_end;
+                    while (t0 < t1 && (*t0 == ' ' || *t0 == '\t')) t0++;
+                    while (t1 > t0 && (t1[-1] == ' ' || t1[-1] == '\t')) t1--;
+                    if (t1 > t0 && request_policy_connection_nomination_is_protected(
+                                       t0, static_cast<u32>(t1 - t0)))
+                        return RequestPolicyBodyState::Invalid;
+                    if (tok_end >= value_end) break;
+                    tok = tok_end + 1;
+                }
+            }
+        }
+        // An empty or OWS-only `Expect` field carries no expectation at all
+        // (RFC 9110 defines only the "100-continue" expect-value; an empty
+        // string is not it), so it must not gate this fixed-length body's
+        // admission below -- the serializer already strips every `Expect`
+        // field via `drop_fixed` regardless of value, so this harmless shape
+        // (most commonly paired with `Content-Length: 0`) has nothing left
+        // to negotiate and should be admitted exactly like a request with no
+        // `Expect` header at all, rather than forced into the unsupported
+        // 100-continue interim-response path. Base admission on a
+        // semantically present value (non-empty once trimmed), not raw
+        // field-name presence (Codex round-9 review, PR #696).
+        if (request_policy_name_eq(hs, name_len, "expect", 6)) {
+            const u8* expect_value_start = colon + 1;
+            const u8* expect_value_end = le;
+            request_policy_trim_ows(expect_value_start, expect_value_end);
+            has_expect |= expect_value_start != expect_value_end;
+        }
+        // `req.has_upgrade_header` walks the value as a comma-separated
+        // token list and only sets the flag when it finds an actual
+        // non-comma, non-OWS token (Codex sweep-8 review, PR #696): a value
+        // consisting solely of commas and/or OWS, such as "," or ", ,", has
+        // every character consumed by the tokenizer's own delimiter-skipping
+        // loop before a token start is ever recorded, so the flag stays
+        // false even though the field's trimmed raw value is non-empty. Base
+        // presence here on that trimmed raw value directly instead (mirroring
+        // the `Expect` handling just above), so a comma-only `Upgrade` value
+        // still counts as semantically present for the genuine-upgrade check
+        // below.
+        if (request_policy_name_eq(hs, name_len, "upgrade", 7)) {
+            const u8* upgrade_value_start = colon + 1;
+            const u8* upgrade_value_end = le;
+            request_policy_trim_ows(upgrade_value_start, upgrade_value_end);
+            upgrade_value_nonempty |= upgrade_value_start != upgrade_value_end;
+        }
         has_upgrade |= request_policy_name_eq(hs, name_len, "upgrade", 7);
         hs = le + 2;
     }
+    // ID4 (host: "preserve") only: exactly one Host field with a non-empty,
+    // Envoy-`authorityIsValid`-shaped value (`request_policy_host_authority_
+    // is_valid`, shared with the serializer's own Pass 1 check below) is
+    // required -- missing, duplicated, or malformed (e.g. `victim/path`,
+    // which is not a valid authority) all fail closed here, before the
+    // bodyless early return and any Waiting-producing check further down
+    // (Codex sweep-11 review, PR #696).
+    if (request_policy_preserves_host(policy_id) &&
+        (host_count != 1 || host_value_len == 0 ||
+         !request_policy_host_authority_is_valid(host_value_start, host_value_len)))
+        return RequestPolicyBodyState::Invalid;
+    // ID4 (host: "preserve") only: more than one physical X-Forwarded-Proto
+    // field fails closed unconditionally (`apply_preserve_host_lowercase_
+    // request_policy`'s own check is retained as defense in depth) -- moved
+    // here for the same reason as the Host check above (Codex sweep-12
+    // review, PR #696).
+    if (request_policy_preserves_host(policy_id) && xfp_count > 1)
+        return RequestPolicyBodyState::Invalid;
+    // ID4 (host: "preserve") only: a duplicated physical occurrence of any
+    // other Envoy inline-slot header name (see `kInlineRequestHeaders`)
+    // fails closed unless the client's Connection value also nominates that
+    // name, in which case every physical occurrence is dropped and no
+    // duplicate reaches the wire (`apply_preserve_host_lowercase_request_
+    // policy`'s own check is retained as defense in depth) -- moved here
+    // for the same reason as the checks above (Codex sweep-12 review, PR
+    // #696).
+    if (request_policy_preserves_host(policy_id)) {
+        auto name_nominated = [&](const u8* name, u32 name_len) {
+            const u8* hs2 = line_end + 2;
+            while (hs2 < header_end) {
+                const u8* le2 = hs2;
+                while (le2 + 1 < end && !(le2[0] == '\r' && le2[1] == '\n')) le2++;
+                const u8* colon2 = hs2;
+                while (colon2 < le2 && *colon2 != ':') colon2++;
+                const u32 hname_len = static_cast<u32>(colon2 - hs2);
+                if (request_policy_name_eq(hs2, hname_len, "connection", 10)) {
+                    const u8* value_start2 = colon2 + 1;
+                    const u8* value_end2 = le2;
+                    request_policy_trim_ows(value_start2, value_end2);
+                    if (request_policy_comma_value_has_token(value_start2,
+                                                             value_end2,
+                                                             reinterpret_cast<const char*>(name),
+                                                             name_len))
+                        return true;
+                }
+                hs2 = le2 + 2;
+            }
+            return false;
+        };
+        for (u32 i = 0; i < kInlineRequestHeaderTableSize; i++) {
+            if (!inline_request_header_duplicated[i]) continue;
+            const RequestPolicyInlineHeaderEntry& entry = kInlineRequestHeaders[i];
+            if (!name_nominated(reinterpret_cast<const u8*>(entry.name), entry.len))
+                return RequestPolicyBodyState::Invalid;
+        }
+    }
+    // ID4 (host: "preserve") only: a `Connection` value that nominates
+    // "upgrade" alongside "close" (or on its own), together with a
+    // semantically-present (non-empty/non-OWS) `Upgrade` header
+    // (`upgrade_value_nonempty` above, computed directly from the field's
+    // trimmed raw value rather than the parser's own token-skipping
+    // `req.has_upgrade_header`, which misses a comma-only value -- an empty
+    // or OWS-only value requests no protocol and must not gate this
+    // rejection), is a genuine upgrade request per Envoy's own
+    // `Utility::isUpgrade` (which ignores "close" entirely). Rut's
+    // request_policy path has no upgrade-tunnel capability, so this shape
+    // must fail closed rather than being silently rewritten into an ordinary
+    // request with both headers dropped. This must run before the bodyless
+    // early return below (and does not depend on `conn.req_wants_upgrade`,
+    // checked next, which alone would miss it): a bodyless
+    // `Connection: close, upgrade` request with a non-empty `Upgrade` value
+    // is exactly this genuine-upgrade shape, and `conn.req_wants_upgrade` is
+    // false for it because the parser lets "close" suppress that flag. Every
+    // other supported policy's own closed Upgrade contract (rejecting any
+    // Upgrade header outright) is unrelated to Envoy's isUpgrade semantics
+    // and stays below, scoped to the body-carrying path only, exactly as
+    // before (this PR does not touch that non-Envoy-oracle profile).
+    if (request_policy_preserves_host(policy_id) && upgrade_value_nonempty &&
+        connection_nominates_upgrade)
+        return RequestPolicyBodyState::Invalid;
     if (conn.req_wants_upgrade || cl_count > 1) return RequestPolicyBodyState::Invalid;
     if (cl_count == 0) {
         if (conn.req_body_mode != BodyMode::None) return RequestPolicyBodyState::Invalid;
         return RequestPolicyBodyState::Complete;
     }
-    if (has_te || has_expect || has_upgrade) return RequestPolicyBodyState::Invalid;
+    if (has_expect) return RequestPolicyBodyState::Invalid;
+    // A bare `Upgrade` header without an actual upgrade nomination is not
+    // rejected for ID4 (the genuine-upgrade shape was already fail-closed
+    // above, unconditionally on body framing) -- "admitted" means only that
+    // the request is not rejected for it, not that the header reaches the
+    // wire: ID4's serializer always strips every `Upgrade` field
+    // unconditionally (`drop_fixed`), nominated or not, so it never appears
+    // in the forwarded request. This is a deliberate divergence from Envoy,
+    // which forwards a bare `Upgrade` header unchanged on the wire (Rut's
+    // request_policy path has no upgrade-tunnel capability to preserve it
+    // for, Codex sweep-13 review, PR #696, correcting an earlier revision of
+    // this comment that could be misread as claiming Rut also forwards it
+    // unchanged). Every other supported policy keeps the original closed
+    // contract of rejecting any `Upgrade` header outright on this
+    // body-carrying path, matching its own prior tested behavior.
+    if (!request_policy_preserves_host(policy_id) && has_upgrade)
+        return RequestPolicyBodyState::Invalid;
+    if (has_te && !request_policy_preserves_host(policy_id)) return RequestPolicyBodyState::Invalid;
     if (!req.has_content_length ||
         req.content_length > conn.recv_buf.capacity() - parser.header_end)
         return RequestPolicyBodyState::Invalid;
@@ -5470,6 +6054,33 @@ inline RequestPolicyBodyState inspect_request_policy_body(const Connection& conn
         return RequestPolicyBodyState::Invalid;
     const u64 required = static_cast<u64>(parser.header_end) + req.content_length;
     if (required > conn.recv_buf.capacity()) return RequestPolicyBodyState::Invalid;
+    // INVARIANT: every rejection above this line depends only on headers,
+    // the request line, or connection state already known before any body
+    // byte has necessarily arrived -- never on the content of body bytes
+    // themselves. `Waiting` below means only "the declared body hasn't
+    // fully arrived yet", never "still deciding whether this request is
+    // admissible": TLS (sweep-10), Host shape (sweep-11), and fragment
+    // targets/X-Forwarded-Proto duplicates/protected Connection nominations/
+    // duplicated inline headers (sweep-12) were all moved above this point
+    // for exactly this reason, after Codex found the same bug class three
+    // times -- a slow client holding the connection and receive slice open
+    // for a request the headers alone already prove must be rejected. A new
+    // ID4 (or other policy) admission check that only needs header/request-
+    // line/connection-state facts must be added above this line, not below
+    // it, even if the natural place to compute it happens to be here. The
+    // one known exception is the exact rewritten-size-vs-capacity check
+    // `apply_preserve_host_lowercase_request_policy`'s two-pass measuring
+    // loop performs: it is header-length-and-declared-content-length-
+    // derived in principle (never touches actual body byte values), but
+    // extracting it here would require either duplicating that loop's ~250
+    // lines of per-header rewrite decisions (recreating the exact
+    // measure/write divergence risk the sweep-6 single-shared-loop design
+    // was built to eliminate) or a dedicated refactor into a dual-purpose
+    // shared helper -- deliberately deferred to its own review rather than
+    // folded into this sweep; the request still cannot exceed
+    // `conn.recv_buf.capacity()` in its *original*, unrewritten size (the
+    // check just above this comment), bounding how much a client can force
+    // this one path to wait.
     if (conn.recv_buf.len() < required) return RequestPolicyBodyState::Waiting;
     if (conn.req_body_mode == BodyMode::ContentLength && conn.req_body_remaining != 0)
         return RequestPolicyBodyState::Waiting;
@@ -5478,11 +6089,613 @@ inline RequestPolicyBodyState inspect_request_policy_body(const Connection& conn
     return RequestPolicyBodyState::Complete;
 }
 
+// ID4 (Http11PreserveHostLowercase): the Envoy-compatible H1 profile. Unlike
+// every other supported policy, it keeps the client's Host header instead of
+// writing the upstream endpoint. It lowercases every forwarded header name,
+// drops Envoy's hop-by-hop set (host is re-emitted separately; connection,
+// keep-alive, proxy-connection, expect, upgrade, and any header nominated by
+// the client's Connection header value are dropped -- `transfer-encoding` is
+// NOT among the dropped names: `inspect_request_policy_body` rejects any
+// `transfer-encoding` field outright (`RequestPolicyBodyState::Invalid`)
+// before this serializer ever runs, even for a bodyless request, so a
+// request carrying it never reaches this drop logic at all; this is the one
+// fixed-list name that is fail-closed rather than stripped, matching every
+// other supported policy's own closed contract for it (Codex sweep-11
+// review, PR #696: an earlier revision of this comment described it as
+// dropped here alongside the others, which the inspector's unconditional
+// rejection makes both inaccurate and dead code -- see the explicit
+// fail-closed branch in the emission loop below),
+// except a nomination of `content-length`, `host`, `x-forwarded-for`,
+// `x-forwarded-host`, or `x-forwarded-proto`, or a pseudo-header-shaped
+// nomination (first byte `:`), each of which fails the whole request closed
+// instead — see the nomination loop below for why per header; a nomination
+// of `te` is not in this fail-closed set and is not dropped outright either
+// -- Envoy's own `sanitizeConnectionHeader` (source/common/http/utility.cc)
+// special-cases it the same way `sanitizeTEHeader` does, so the trailers
+// check below decides its fate regardless of the nomination, Codex round-8
+// review, PR #696), keeps a single canonical `te: trailers` line, emitted at
+// the *first* physical `TE` field's position, whenever any physical TE
+// field's value carries a "trailers" token (matching Envoy's inline header
+// storage, where `HeaderMapImpl::insertByKey` places a name's one inline
+// slot at its first physical occurrence and every later duplicate coalesces
+// into it rather than appending a second line — e.g. `TE: gzip`,
+// `X-Middle: 1`, `TE: trailers` forwards `te: trailers` before `x-middle`,
+// not after it), drops the fixed seventeen-name set of client-supplied
+// headers Envoy's own `mutateRequestHeaders` sanitizes for a non-internal,
+// non-edge external request on a cleartext listener (`x-envoy-internal`,
+// the fourteen `cleanInternalHeaders` `x-envoy-*` names,
+// `x-forwarded-client-cert`, and `x-envoy-external-address`; see
+// `request_policy_is_stripped_client_envoy_header` above), fails the whole
+// request closed on a second physical occurrence of any other Envoy inline
+// request header (see `request_policy_inline_request_header_index` above;
+// Envoy coalesces these into one wire value, and this profile does not
+// replicate that coalescing), and overwrites `x-forwarded-proto` in place
+// at its original physical position with `x-forwarded-proto: http` when the
+// client's single field's trimmed value is not a syntactically valid scheme
+// (case-insensitively exactly "http" or "https", matching Envoy's own
+// `Utility::schemeIsValid`; empty, OWS-only, or any other non-scheme value
+// such as "http,https" all count as invalid, matching Envoy's own inline
+// `x-forwarded-proto` slot, which is overwritten in place rather than
+// cleared and re-appended), appending that default as the last header only
+// when the client sent no `x-forwarded-proto` field at all; a valid
+// client-supplied value passes through unchanged, in its original position,
+// without case normalization). Fails closed with no upstream bytes
+// touched unless exactly one non-empty Host header is present. A
+// body-carrying request with a client `Expect` header whose trimmed value is
+// non-empty is also outside this profile's admitted shape today:
+// `inspect_request_policy_body` rejects such a value once a validated
+// Content-Length is present, because Rut has no `100 Continue`
+// interim-response flow to negotiate the body with the client first (unlike
+// Envoy, which sends the interim response and then applies this same
+// hop-by-hop drop). An empty or OWS-only `Expect` field carries no actual
+// expectation (RFC 9110 defines only the "100-continue" expect-value), so
+// `inspect_request_policy_body` treats it as semantically absent: the body
+// is admitted and the field is still stripped like any other `Expect`
+// field. Only the nonempty-value shape gets a fail-closed rejection rather
+// than a byte-accurate Envoy match; see `docs/envoy-converter.md`'s "Known
+// capability dependencies".
+inline bool apply_preserve_host_lowercase_request_policy(Connection& conn, u16 policy_id) {
+    // ID4 targets Envoy's cleartext (non-TLS) listener profile specifically:
+    // the trailing `x-forwarded-proto: http` synthesis below (and the
+    // in-place overwrite of an invalid/empty client-supplied value) is
+    // connection-derived from that cleartext assumption, not from the
+    // client's own claim. Forwarding a hardcoded "http" scheme upstream on a
+    // connection this runtime itself terminated with TLS would misinform the
+    // origin about the connection's real security property (Codex sweep-8
+    // review, PR #696) -- the fix is not to synthesize "https" instead
+    // (nothing else in this profile has been validated against a TLS
+    // listener's shape), but to fail this cleartext-only profile closed
+    // before any rewrite or upstream contact, the same way every other
+    // unsupported combination in this function does. The `.rut` language has
+    // no TLS-listener declaration for a compile-time check to key off
+    // (`listen` carries only an address and port), so this is a runtime-only
+    // guard; it covers a hand-written route or direct-RIR caller that
+    // selects ID4 on a connection this runtime accepted over TLS.
+    // `inspect_request_policy_body` (Codex sweep-10 review, PR #696) applies
+    // the identical exclusion earlier, in the pre-body admission path, so a
+    // TLS/ID4 request with an incomplete body fails closed immediately
+    // rather than waiting for the rest of the body to arrive; the check
+    // here is retained too, since this function can be reached directly.
+    if (conn.tls_active) return false;
+    if (inspect_request_policy_body(conn, policy_id) != RequestPolicyBodyState::Complete)
+        return false;
+
+    struct ScratchResetGuard {
+        Connection& conn;
+        bool committed = false;
+        ~ScratchResetGuard() {
+            if (!committed) conn.send_buf.reset();
+        }
+    } scratch_guard{conn};
+
+    const u8* data = conn.recv_buf.data();
+    const u32 len = conn.recv_buf.len();
+    HttpParser parser;
+    ParsedRequest req;
+    parser.reset();
+    if (parser.parse(data, len, &req) != ParseStatus::Complete) return false;
+    // HTTP request targets cannot carry a URI fragment (RFC 7230 §5.3); Envoy
+    // rejects this shape rather than forwarding it, and route selection above
+    // already matched only the pre-fragment canonical path, so forwarding the
+    // raw fragment-bearing target here would let routing and the origin
+    // observe different target interpretations of the same request.
+    // `inspect_request_policy_body` (Codex sweep-12 review, PR #696) applies
+    // the identical check earlier, in the pre-body admission path, so a
+    // fragment-bearing target paired with an incomplete fixed-length body
+    // fails closed immediately rather than waiting for the rest of the
+    // body; the check here is retained too, as defense in depth.
+    if (req.target_has_fragment) return false;
+    const u32 body_len = req.has_content_length ? req.content_length : 0;
+    const u8* end = data + parser.header_end;
+    const u8* line_end = data;
+    while (line_end + 1 < end && !(line_end[0] == '\r' && line_end[1] == '\n')) line_end++;
+    const u8* path_ptr = reinterpret_cast<const u8*>(req.path.ptr);
+    if (line_end + 1 >= end || path_ptr < data || path_ptr + req.path.len > line_end) return false;
+    const u8* header_end = end - 2;
+
+    // Pass 1: locate the single client Host header and fail closed on any
+    // Connection-nominated protected name. `kMaxHeaders` bounds the number
+    // of physical header *fields* this parser stores, not the number of
+    // comma-separated *tokens* one Connection field's value can carry -- a
+    // syntactically valid request can nominate far more than 64 names in a
+    // single field, so nominations are validated token-by-token as they are
+    // scanned here rather than collected into a fixed-size array (Codex
+    // sweep-1 review, PR #696: the previous `NominatedName nominated[
+    // kMaxHeaders]` array made a 65th nonempty token -- even a harmless,
+    // repeated one -- fail the whole request closed with no protected name
+    // involved at all). Membership queries for a specific name (`
+    // name_nominated` below) instead rescan the request's Connection
+    // field(s) directly, bounding total work by the request's own header
+    // bytes rather than a fixed token count.
+    u32 host_count = 0;
+    u32 xfp_count = 0;
+    const u8* host_value_start = nullptr;
+    u32 host_value_len = 0;
+    // Whether any physical `TE` field's comma-separated value contains a
+    // "trailers" token. Computed up front because the canonical `te:
+    // trailers` line (when warranted) must be emitted at the *first*
+    // physical TE field's position below, which may precede the field that
+    // actually carries the token (e.g. `TE: gzip`, `X-Middle: 1`,
+    // `TE: trailers`).
+    bool any_te_trailers = false;
+    // Envoy's inline request-header slots (see
+    // `request_policy_inline_request_header_index` above) coalesce a second
+    // physical field into the first rather than forwarding a duplicate line;
+    // this profile fails the request closed instead of risking upstream
+    // bytes that silently diverge from that coalescing -- but only when the
+    // name is actually going to reach the wire. A name the client's
+    // `Connection` value nominates is dropped along with every one of its
+    // physical fields regardless of how many there are (Codex sweep-2
+    // review, PR #696: `Connection: x-request-id` plus two `X-Request-Id`
+    // fields must forward neither, not 400 before either field is even
+    // known to be dropped), so duplication is only recorded here and
+    // resolved against nomination once every Connection field has been
+    // scanned (see the `inline_request_header_duplicated` check below,
+    // after `name_nominated` is defined).
+    bool seen_inline_request_header[kInlineRequestHeaderTableSize] = {};
+    bool inline_request_header_duplicated[kInlineRequestHeaderTableSize] = {};
+    {
+        const u8* hs = line_end + 2;
+        while (hs < header_end) {
+            const u8* le = hs;
+            while (le + 1 < end && !(le[0] == '\r' && le[1] == '\n')) le++;
+            if (le + 1 >= end || le <= hs) return false;
+            const u8* colon = hs;
+            while (colon < le && *colon != ':') colon++;
+            if (colon == hs || colon == le) return false;
+            const u32 name_len = static_cast<u32>(colon - hs);
+            const u8* value_start = colon + 1;
+            const u8* value_end = le;
+            while (value_start < value_end && (*value_start == ' ' || *value_start == '\t'))
+                value_start++;
+            while (value_end > value_start && (value_end[-1] == ' ' || value_end[-1] == '\t'))
+                value_end--;
+            const i32 inline_idx = request_policy_inline_request_header_index(hs, name_len);
+            if (inline_idx >= 0) {
+                if (seen_inline_request_header[inline_idx])
+                    inline_request_header_duplicated[inline_idx] = true;
+                seen_inline_request_header[inline_idx] = true;
+            }
+            if (request_policy_name_eq(hs, name_len, "host", 4)) {
+                host_count++;
+                host_value_start = value_start;
+                host_value_len = static_cast<u32>(value_end - value_start);
+            } else if (request_policy_name_eq(hs, name_len, "x-forwarded-proto", 17)) {
+                xfp_count++;
+            } else if (request_policy_name_eq(hs, name_len, "te", 2)) {
+                if (request_policy_comma_value_has_token(value_start, value_end, "trailers", 8))
+                    any_te_trailers = true;
+            } else if (request_policy_name_eq(hs, name_len, "connection", 10)) {
+                // Fail closed on a protected nomination as each token is
+                // scanned (see `request_policy_connection_nomination_is_
+                // protected` for the fixed set and why each name in it must
+                // refuse the whole request rather than merely be dropped).
+                // Every other token needs no further action here: it is
+                // either handled by its own dedicated logic elsewhere in
+                // this function (a `te`/`upgrade` nomination) or simply
+                // dropped along with its own field below via
+                // `name_nominated`'s rescan. `inspect_request_policy_body`
+                // (Codex sweep-12 review, PR #696) applies the identical
+                // scan earlier, in the pre-body admission path; the scan
+                // here is retained too, as defense in depth.
+                const u8* tok = value_start;
+                while (tok <= value_end) {
+                    const u8* tok_end = tok;
+                    while (tok_end < value_end && *tok_end != ',') tok_end++;
+                    const u8* t0 = tok;
+                    const u8* t1 = tok_end;
+                    while (t0 < t1 && (*t0 == ' ' || *t0 == '\t')) t0++;
+                    while (t1 > t0 && (t1[-1] == ' ' || t1[-1] == '\t')) t1--;
+                    if (t1 > t0 && request_policy_connection_nomination_is_protected(
+                                       t0, static_cast<u32>(t1 - t0)))
+                        return false;
+                    if (tok_end >= value_end) break;
+                    tok = tok_end + 1;
+                }
+            }
+            hs = le + 2;
+        }
+    }
+    // `inspect_request_policy_body` (Codex sweep-11 review, PR #696) applies
+    // the identical check earlier, in the pre-body admission path, so an
+    // invalid Host shape paired with an incomplete fixed-length body fails
+    // closed immediately rather than waiting for the rest of the body; the
+    // check here is retained too, as defense in depth, the same way the
+    // sweep-10 TLS guard is kept in both places.
+    if (host_count != 1 || host_value_len == 0 ||
+        !request_policy_host_authority_is_valid(host_value_start, host_value_len))
+        return false;
+    // Envoy stores X-Forwarded-Proto as a single inline header: a second
+    // client-supplied field is not kept as a separate line but coalesced
+    // into the same logical value with a "," delimiter before upstream
+    // encoding (`HeaderMapImpl::appendCopy`/`delimiterByHeader`,
+    // source/common/http/header_map_impl.cc). This profile does not
+    // replicate that coalescing, so more than one physical field is refused
+    // outright rather than risking an origin observing a different,
+    // first-or-last-duplicate scheme than an Envoy-parity client intended.
+    // `inspect_request_policy_body` (Codex sweep-12 review, PR #696) applies
+    // the identical check earlier, in the pre-body admission path; the
+    // check here is retained too, as defense in depth.
+    if (xfp_count > 1) return false;
+
+    // Pass 1 above already failed the whole request closed for every
+    // Connection nomination this profile cannot safely honor by simply
+    // omitting the header:
+    //  - content-length also drives how many body bytes this function copies
+    //    onto the wire; if the header line were dropped while the (already
+    //    validated, already-buffered) body bytes were still forwarded, the
+    //    persistent upstream connection would receive unframed bytes it
+    //    could parse as the start of a second request (request smuggling).
+    //  - host is written unconditionally above, before this list is even
+    //    consulted; dropping the nominated field but keeping that write
+    //    would silently ignore the nomination rather than refuse it, and an
+    //    upstream request with no Host at all is invalid HTTP/1.1. Envoy's
+    //    own `sanitizeConnectionHeader` does remove the (aliased
+    //    `:authority`) header on this nomination, but the resulting
+    //    Host-less request is then rejected 400 by its Host-presence check
+    //    before the router ever sees it, so the end-to-end behavior this
+    //    mirrors is still a fail-closed 400.
+    //  - x-forwarded-for / x-forwarded-host / x-forwarded-proto: Envoy's
+    //    `sanitizeConnectionHeader` (source/common/http/utility.cc) names
+    //    exactly these three headers (`Http::Headers::get().ForwardedFor`,
+    //    `.ForwardedHost`, `.ForwardedProto`) and explicitly refuses the
+    //    whole request when Connection nominates any of them, rather than
+    //    removing it, because doing so could mask the origin of the incoming
+    //    request.
+    //  - a pseudo-header-shaped nomination (a token beginning with `:`, e.g.
+    //    the aliased `:authority`): `sanitizeConnectionHeader` checks
+    //    `!token_sv.find(':')` (true exactly when the token's first byte is
+    //    `:`) immediately alongside the three Forwarded* names above and
+    //    fails the same way. This is not merely an HTTP/2 concern -- the
+    //    colon-prefixed spelling is just bytes in an H1 `Connection` header
+    //    value, which Rut's parser accepts same as any other token -- so it
+    //    must fail closed here too rather than being silently ignored
+    //    because it never matches a real forwarded header name.
+
+    // Whether `name` is nominated by any client Connection field's
+    // comma-separated token list. Rescans the request's raw header bytes
+    // directly, bounded by the request's own header-block size, rather than
+    // consulting a fixed-size token array collected up front (Codex sweep-1
+    // review, PR #696): a syntactically valid request can nominate far more
+    // names than `kMaxHeaders` in a single Connection field, and Pass 1
+    // above already rejected every protected name as it scanned, so this
+    // only ever needs to answer "is this one, arbitrary, already-admitted
+    // name among them" for the header currently being emitted below.
+    auto name_nominated = [&](const u8* name, u32 name_len) {
+        const u8* hs2 = line_end + 2;
+        while (hs2 < header_end) {
+            const u8* le2 = hs2;
+            while (le2 + 1 < end && !(le2[0] == '\r' && le2[1] == '\n')) le2++;
+            const u8* colon2 = hs2;
+            while (colon2 < le2 && *colon2 != ':') colon2++;
+            const u32 hname_len = static_cast<u32>(colon2 - hs2);
+            if (request_policy_name_eq(hs2, hname_len, "connection", 10)) {
+                const u8* value_start2 = colon2 + 1;
+                const u8* value_end2 = le2;
+                while (value_start2 < value_end2 && (*value_start2 == ' ' || *value_start2 == '\t'))
+                    value_start2++;
+                while (value_end2 > value_start2 &&
+                       (value_end2[-1] == ' ' || value_end2[-1] == '\t'))
+                    value_end2--;
+                if (request_policy_comma_value_has_token(
+                        value_start2, value_end2, reinterpret_cast<const char*>(name), name_len))
+                    return true;
+            }
+            hs2 = le2 + 2;
+        }
+        return false;
+    };
+
+    // A duplicated inline-slot name (see the Pass 1 loop above) is only a
+    // problem if it is actually going to reach the wire: a name the
+    // client's Connection value nominates is dropped along with every one
+    // of its physical fields below regardless of how many there were, so no
+    // duplicate ever survives to diverge from Envoy's inline coalescing for
+    // that name. Fail closed only for a duplicated name that is not
+    // nominated (Codex sweep-2 review, PR #696). `inspect_request_policy_
+    // body` (Codex sweep-12 review, PR #696) applies the identical
+    // duplicate-vs-nominated resolution earlier, in the pre-body admission
+    // path; the check here is retained too, as defense in depth.
+    for (u32 i = 0; i < kInlineRequestHeaderTableSize; i++) {
+        if (!inline_request_header_duplicated[i]) continue;
+        const RequestPolicyInlineHeaderEntry& entry = kInlineRequestHeaders[i];
+        if (!name_nominated(reinterpret_cast<const u8*>(entry.name), entry.len)) return false;
+    }
+
+    // This function writes its rewritten request into `conn.send_buf`,
+    // which shares `conn.recv_buf`'s exact physical capacity (both are
+    // bound to one `SlicePool::kSliceSize` slice per connection,
+    // `include/rut/runtime/epoll_event_loop.h`/`kqueue_event_loop.h`).
+    // Several rewrites below can grow a field beyond its original wire
+    // bytes: the trailing `x-forwarded-proto: http` line appended when the
+    // client sent none; an invalid/empty `x-forwarded-proto` value
+    // overwritten in place (`X-Forwarded-Proto:\r\n`, 20 bytes, becomes the
+    // 25-byte canonical line); and *any* ordinary retained field whose
+    // original colon has no following OWS (`X:a\r\n`, 5 bytes, is
+    // re-emitted with the canonical single space, `x: a\r\n`, 6 bytes -- a
+    // per-field, unbounded-in-aggregate +1). An earlier revision of this
+    // comment tried to bound the total growth at a fixed 25-byte margin;
+    // that bound covered only the first case and was wrong for a request
+    // with many colon-without-space fields, each contributing its own +1
+    // (Codex sweep-6 review, PR #696, correcting Codex sweep-4). Rather
+    // than bound the growth at all, this function computes it exactly: the
+    // entire rewrite below runs twice, first in "measuring" mode
+    // (`measuring` below), which takes every branch exactly as written but
+    // has `append` only sum the byte counts it would have written instead
+    // of writing them, yielding the *exact* final size; only if that exact
+    // size fits is a second, real pass run, taking the identical branches
+    // and actually writing the bytes. The two passes share one set of
+    // branches by construction (the same `append`/`append_lit`/
+    // `append_lower` calls, the same per-header decisions), so they cannot
+    // diverge. A request whose exact rewritten size would exceed capacity
+    // fails closed the same way -- and with the same 400 status -- as
+    // every other admission failure in this function, before any byte is
+    // written; this is not a hidden, XFP-specific reduction of the
+    // capacity every other policy and the parser's own header/body
+    // admission enforce.
+    u32 measured_len = 0;
+    bool measuring = true;
+    auto append = [&](const u8* p, u32 n) {
+        if (measuring) {
+            measured_len += n;
+            return true;
+        }
+        return n <= conn.send_buf.capacity() - conn.send_buf.len() &&
+               conn.send_buf.write(p, n) == n;
+    };
+    auto append_lit = [&](const char* p, u32 n) {
+        return append(reinterpret_cast<const u8*>(p), n);
+    };
+    auto append_lower = [&](const u8* p, u32 n) {
+        for (u32 i = 0; i < n; i++) {
+            u8 c = p[i];
+            if (c >= 'A' && c <= 'Z') c = static_cast<u8>(c + ('a' - 'A'));
+            if (!append(&c, 1)) return false;
+        }
+        return true;
+    };
+
+    u32 new_header_len = 0;
+    for (u32 pass = 0; pass < 2; pass++) {
+        measuring = (pass == 0);
+        measured_len = 0;
+        conn.send_buf.reset();
+        const u32 method_prefix = static_cast<u32>(path_ptr - data);
+        if (!append(data, method_prefix) || !append(path_ptr, req.path.len) ||
+            !append_lit(" ", 1) || !append_lit(request_policy_version(policy_id), 8) ||
+            !append_lit("\r\n", 2))
+            return false;
+        if (!append_lit("host: ", 6) || !append(host_value_start, host_value_len) ||
+            !append_lit("\r\n", 2))
+            return false;
+
+        bool saw_xfp = false;
+        // Envoy's TE header is inline storage (`HeaderMap::setTE` overwrites
+        // the single logical value, never appends a second physical line),
+        // and `HeaderMapImpl::insertByKey` places a newly-created inline
+        // entry at the position of the *first* physical occurrence of that
+        // name, not wherever a later duplicate happened to appear. So
+        // however many physical `TE` fields the client sends, and
+        // regardless of which one(s) carry a "trailers" token, at most one
+        // canonical `te: trailers` line reaches the wire, and it appears at
+        // the first physical TE field's position. `any_te_trailers`
+        // (computed in Pass 1 above) already reflects whether any field's
+        // value contains that token; `seen_te_field` below tracks whether
+        // the current field is that first occurrence.
+        bool seen_te_field = false;
+        {
+            const u8* hs = line_end + 2;
+            while (hs < header_end) {
+                const u8* le = hs;
+                while (le + 1 < end && !(le[0] == '\r' && le[1] == '\n')) le++;
+                const u8* colon = hs;
+                while (colon < le && *colon != ':') colon++;
+                const u32 name_len = static_cast<u32>(colon - hs);
+                const u8* value_start = colon + 1;
+                const u8* value_end = le;
+                while (value_start < value_end && (*value_start == ' ' || *value_start == '\t'))
+                    value_start++;
+                while (value_end > value_start && (value_end[-1] == ' ' || value_end[-1] == '\t'))
+                    value_end--;
+
+                const bool is_cl = request_policy_name_eq(hs, name_len, "content-length", 14);
+                const bool is_te = request_policy_name_eq(hs, name_len, "te", 2);
+                const bool is_xfp = request_policy_name_eq(hs, name_len, "x-forwarded-proto", 17);
+                // Unreachable in the ordinary call path -- `apply_request_policy`
+                // and this function's own entry both call
+                // `inspect_request_policy_body` first, which rejects any
+                // `transfer-encoding` field with `Invalid` before this loop
+                // ever runs (Codex sweep-11 review, PR #696: an earlier
+                // revision of the contract comment above described
+                // `transfer-encoding` as dropped here like the other
+                // hop-by-hop names, which the inspector's unconditional
+                // rejection makes dead code). Kept as an explicit fail-closed
+                // branch rather than folded into `drop_fixed` (which would
+                // silently strip it and keep forwarding) so a caller that
+                // reaches this function directly, bypassing the inspector,
+                // still cannot have Transfer-Encoding silently dropped from a
+                // body-carrying request -- ambiguous framing must fail the
+                // whole request, not forward it reinterpreted as framing-free.
+                if (request_policy_name_eq(hs, name_len, "transfer-encoding", 17)) return false;
+                const bool drop_fixed =
+                    request_policy_name_eq(hs, name_len, "host", 4) ||
+                    request_policy_name_eq(hs, name_len, "connection", 10) ||
+                    request_policy_name_eq(hs, name_len, "keep-alive", 10) ||
+                    request_policy_name_eq(hs, name_len, "proxy-connection", 16) ||
+                    request_policy_name_eq(hs, name_len, "expect", 6) ||
+                    request_policy_name_eq(hs, name_len, "upgrade", 7) ||
+                    request_policy_is_stripped_client_envoy_header(hs, name_len);
+                // Envoy's `sanitizeConnectionHeader` splits TE's value on
+                // commas and keeps the header only when one token
+                // case-insensitively equals "trailers" -- not only when the
+                // whole field value does -- and when kept, rewrites it to
+                // exactly that canonical lowercase token
+                // (`headers.setTE(TEValues.Trailers)`), not the client's
+                // original casing or the other comma-joined tokens. Whether
+                // *this* field individually carries the token no longer
+                // decides whether the canonical line is emitted here (that
+                // is `any_te_trailers`, computed once from every physical TE
+                // field in Pass 1); it is used only for the position
+                // decision below.
+                const bool is_first_te = is_te && !seen_te_field;
+                if (is_te) seen_te_field = true;
+                // The canonical line is emitted exactly once, at the first
+                // physical TE field's position, and only when some TE field
+                // (this one or a later one) carried a "trailers" token.
+                // Every other physical TE field -- first or not, trailers or
+                // not -- contributes nothing further and is dropped.
+                const bool emit_te_here = is_first_te && any_te_trailers;
+                const bool drop_te = is_te && !emit_te_here;
+                // HTTP/1.1 senders that emit `TE: trailers` are expected to
+                // nominate it in `Connection` too (RFC 9110 §9.6), and
+                // Envoy's `sanitizeConnectionHeader`
+                // (source/common/http/utility.cc) special-cases exactly
+                // this: for a nominated `te` token it does not blindly
+                // remove the header like every other nominated name -- it
+                // inspects the TE value's comma-separated tokens the same
+                // way `sanitizeTEHeader` does, and only drops the header if
+                // none of them is "trailers" (`keep_header` stays true
+                // otherwise, and `headers.setTE(TEValues.Trailers)` still
+                // runs). Folding `te` into the generic `drop_nominated` set
+                // would strip the canonical trailers line for this standard
+                // wire shape even though `emit_te_here`/`drop_te` above
+                // already computed the right outcome; exclude it here and
+                // let that existing canonicalization decide instead.
+                const bool drop_nominated = !is_te && name_nominated(hs, name_len);
+                // A syntactically invalid X-Forwarded-Proto value --
+                // empty/OWS-only, or any non-empty value that is not
+                // (case-insensitively) exactly "http" or "https" (e.g.
+                // "http,https", "ftp") -- carries no usable scheme. Envoy's
+                // own `getScheme` (source/common/http/
+                // conn_manager_utility.cc, v1.39.1) applies
+                // `Utility::schemeIsValid` (`schemeIsHttp(v) ||
+                // schemeIsHttps(v)`, both case-insensitive
+                // `absl::EqualsIgnoreCase` compares against exactly
+                // "http"/"https", so e.g. "HTTPS" is valid but "http,https"
+                // is not) to the whole trimmed field value and falls back to
+                // the connection-derived default instead of forwarding it
+                // when validation fails. Forwarding the malformed value
+                // verbatim here would instead hand origins that use this
+                // header for redirects or security decisions an
+                // attacker-controlled, non-scheme value; Envoy's own
+                // `x-forwarded-proto` slot is a single inline entry
+                // (`HeaderMap::setForwardedFor`-style setters overwrite in
+                // place), so an invalid value doesn't vanish and reappear
+                // elsewhere on the wire -- the connection-derived default
+                // overwrites it at its original physical position instead.
+                // The trailing synthesized default (below, once `saw_xfp`
+                // is still unset after this loop) is reserved for a client
+                // that sent no `x-forwarded-proto` field at all. A valid
+                // value is forwarded as the client sent it (Envoy's own
+                // literal `x-forwarded-proto` header text is untouched when
+                // already present; only the internal `:scheme`
+                // pseudo-header is lowercased), not case-normalized.
+                const u32 xfp_value_len = static_cast<u32>(value_end - value_start);
+                const bool xfp_scheme_valid =
+                    is_xfp && (request_policy_name_eq(value_start, xfp_value_len, "http", 4) ||
+                               request_policy_name_eq(value_start, xfp_value_len, "https", 5));
+                const bool xfp_invalid = is_xfp && !xfp_scheme_valid;
+                if (!drop_fixed && !drop_te && !drop_nominated) {
+                    if (is_cl) {
+                        // Envoy's HTTP/1 codec forwards every header's
+                        // stored string value byte for byte
+                        // (`headers.iterate(...)` in
+                        // `StreamEncoderImpl::encodeHeadersBase`,
+                        // `source/common/http/http1/codec_impl.cc`, calls
+                        // `header.value().getStringView()`; the parser
+                        // stores the wire value directly via `addViaMove` in
+                        // `ConnectionImpl::onHeaderValueImpl`, with no
+                        // integer-round-trip anywhere in between) rather
+                        // than regenerating a canonical decimal spelling
+                        // from the parsed integer. A validated
+                        // `Content-Length` value such as `0004` therefore
+                        // reaches the upstream unchanged, not renumbered to
+                        // `4`. `body_len` (parsed from this same, already
+                        // OWS-trimmed `value_start`/`value_end` via
+                        // `parse_uint`, which accepts only the digits
+                        // `0`-`9` -- a leading `+` or embedded whitespace
+                        // still fails parsing and is rejected before this
+                        // function is ever reached) continues to bound the
+                        // body copy below; only the wire spelling changes
+                        // here.
+                        if (!append_lit("content-length: ", 16) ||
+                            !append(value_start, static_cast<u32>(value_end - value_start)) ||
+                            !append_lit("\r\n", 2))
+                            return false;
+                    } else if (emit_te_here) {
+                        if (!append_lit("te: trailers\r\n", 14)) return false;
+                    } else if (xfp_invalid) {
+                        if (!append_lit("x-forwarded-proto: http\r\n", 25)) return false;
+                        saw_xfp = true;
+                    } else {
+                        if (!append_lower(hs, name_len) || !append_lit(": ", 2) ||
+                            !append(value_start, static_cast<u32>(value_end - value_start)) ||
+                            !append_lit("\r\n", 2))
+                            return false;
+                        if (is_xfp) saw_xfp = true;
+                    }
+                }
+                hs = le + 2;
+            }
+        }
+        if (!saw_xfp && !append_lit("x-forwarded-proto: http\r\n", 25)) return false;
+        if (!append_lit("\r\n", 2)) return false;
+
+        new_header_len = measuring ? measured_len : conn.send_buf.len();
+        const u32 body_start = parser.header_end;
+        const u64 request_end64 = static_cast<u64>(body_start) + body_len;
+        if (request_end64 > len) return false;
+        const u32 request_end = static_cast<u32>(request_end64);
+        if (!append(data + body_start, body_len) || !append(data + request_end, len - request_end))
+            return false;
+
+        if (measuring &&
+            (measured_len > conn.send_buf.capacity() || measured_len > conn.recv_buf.capacity()))
+            return false;
+    }
+    if (conn.send_buf.len() > conn.recv_buf.capacity()) return false;
+    conn.reset_request_receive_buffer();
+    if (conn.recv_buf.write(conn.send_buf.data(), conn.send_buf.len()) != conn.send_buf.len())
+        return false;
+    conn.req_header_end = new_header_len;
+    conn.req_initial_send_len = new_header_len + body_len;
+    conn.req_size = conn.req_initial_send_len;
+    conn.req_keep_alive = true;
+    conn.request_policy_id = policy_id;
+    conn.request_body_fully_buffered = req.has_content_length;
+    conn.request_upload_complete = false;
+    scratch_guard.committed = true;
+    conn.send_buf.reset();
+    return true;
+}
+
 // Validate and materialise the first explicit upstream request policy. This runs
 // before slot acquisition and before a TCP connect, so unsupported input cannot
 // accidentally fall back to transparent forwarding or touch the upstream.
 inline bool apply_request_policy(Connection& conn, const sockaddr_in& endpoint, u16 policy_id) {
     if (policy_id == 0) return true;
+    if (request_policy_preserves_host(policy_id))
+        return apply_preserve_host_lowercase_request_policy(conn, policy_id);
     if (inspect_request_policy_body(conn, policy_id) != RequestPolicyBodyState::Complete)
         return false;
 
@@ -8673,7 +9886,9 @@ inline bool request_policy_body_response_admitted(const Connection& conn) {
     return conn.response_read_deadline_profile ==
                    ResponseReadDeadlineProfile::FixedContentLengthUploadHeaderOnlyHead
                ? fixed_upload_head_request_policy_is_admitted(conn.request_policy_id)
-               : conn.request_policy_id == static_cast<u16>(RequestPolicyId::Http11FixedStrip);
+               : conn.request_policy_id == static_cast<u16>(RequestPolicyId::Http11FixedStrip) ||
+                     conn.request_policy_id ==
+                         static_cast<u16>(RequestPolicyId::Http11PreserveHostLowercase);
 }
 
 // Check immediately before strict response headers are committed. The body
@@ -8740,7 +9955,8 @@ inline bool forward_policy_head_modes_compatible(const RouteConfig& config,
 
 inline bool response_policy_suppress_head_admitted(const Connection& conn,
                                                    const ForwardResponsePolicySpec& policy,
-                                                   bool paired_failure) {
+                                                   bool paired_failure,
+                                                   u16 request_policy_id) {
     // This is intentionally the complete bounded HEAD domain. Response-only
     // suppression keeps its original explicit-close shape. A paired failure
     // policy additionally admits the ordinary HTTP/1.1 default keep-alive
@@ -8753,13 +9969,65 @@ inline bool response_policy_suppress_head_admitted(const Connection& conn,
     HttpParser parser;
     ParsedRequest req;
     parser.reset();
-    if (parser.parse(conn.recv_buf.data(), conn.recv_buf.len(), &req) != ParseStatus::Complete ||
-        req.method != HttpMethod::HEAD || req.version != HttpVersion::Http11 ||
+    // ID4 (`host: "preserve"`) admits a bare, non-empty `Upgrade` header with
+    // no `Connection: upgrade` nomination -- "admitted" means only that the
+    // request is not rejected for it, not that the header reaches the wire:
+    // its serializer (`apply_preserve_host_lowercase_request_policy`) always
+    // strips every `Upgrade` field unconditionally (`drop_fixed`), so it
+    // never appears in the forwarded request. This is a deliberate
+    // divergence from Envoy, which forwards a bare `Upgrade` header
+    // unchanged on the wire (Rut's request_policy path has no
+    // upgrade-tunnel capability to preserve it for; see the body-inspection
+    // comment near `inspect_request_policy_body` above, corrected the same
+    // way, Codex sweep-13 review, PR #696). The genuine-upgrade shape --
+    // `Upgrade` together with a `Connection: upgrade` nomination -- stays
+    // fail-closed for every policy, ID4 included, because Rut's
+    // request_policy path has no upgrade-tunnel capability. Every other
+    // policy keeps the original closed contract of rejecting any `Upgrade`
+    // header outright.
+    const bool id4_route = request_policy_preserves_host(request_policy_id);
+    if (parser.parse(conn.recv_buf.data(), conn.recv_buf.len(), &req) != ParseStatus::Complete)
+        return false;
+    // `req.has_upgrade_header` walks the Upgrade value as a comma-separated
+    // token list and only sets the flag when it finds an actual non-comma,
+    // non-OWS token (Codex sweep-8 review, PR #696): a value consisting
+    // solely of commas and/or OWS, such as "," or ", ,", leaves the flag
+    // false even though the field's trimmed raw value (`header.value`,
+    // already OWS-trimmed by the parser for every stored header, matching
+    // the `Expect` handling further below) is non-empty. Compute presence
+    // directly from that trimmed raw value instead of the parser's flag, so
+    // a comma-only `Upgrade` value still counts as semantically present for
+    // both the top-of-body check right below and the genuine-upgrade
+    // nomination check inside the `Connection` token scan further down.
+    bool upgrade_value_nonempty = false;
+    for (u32 i = 0; i < req.header_count; i++) {
+        if (http_header_name_eq_ci(
+                req.headers[i].name.ptr, req.headers[i].name.len, "upgrade", 7) &&
+            req.headers[i].value.len != 0)
+            upgrade_value_nonempty = true;
+    }
+    if (req.method != HttpMethod::HEAD || req.version != HttpVersion::Http11 ||
         req.path.ptr == nullptr || req.path.len == 0 || req.path.ptr[0] != '/' ||
-        req.has_content_length || req.chunked || req.upgrade || req.has_upgrade_header)
+        req.has_content_length || req.chunked ||
+        (id4_route ? (req.upgrade && upgrade_value_nonempty)
+                   : (req.upgrade || upgrade_value_nonempty)))
         return false;
     u32 host_count = 0;
     u32 connection_count = 0;
+    // Set only for ID4 when the single `Connection` header carries a
+    // case-insensitive `close` token among its comma-separated,
+    // OWS-trimmed tokens (each of which -- other than a genuine `upgrade`
+    // nomination or a protected name -- is otherwise freely admitted; see
+    // the token scan below). See the shape classification at the end of
+    // this function for why this -- rather than the connection-count-0/
+    // exact-"close" cache fields alone -- decides ID4 admission whenever
+    // any non-persistence-affecting token is also nominated.
+    bool connection_close_token_seen = false;
+    // Set when a client `Expect` field's value is semantically present
+    // (non-empty after OWS trimming -- `header.value` is already OWS-
+    // trimmed by the parser). See the final return's use of this in place
+    // of the raw-presence `conn.req_client_has_expect` cache field.
+    bool expect_semantically_present = false;
     const Header* host = nullptr;
     for (u32 i = 0; i < req.header_count; i++) {
         const Header& header = req.headers[i];
@@ -8768,15 +10036,116 @@ inline bool response_policy_suppress_head_admitted(const Connection& conn,
             if (++host_count > 1) return false;
             host = &header;
         } else if (http_header_name_eq_ci(name.ptr, name.len, "connection", 10)) {
-            if (++connection_count > 1 || header.value.len != 5 ||
-                !http_header_name_eq_ci(header.value.ptr, header.value.len, "close", 5))
+            connection_count++;
+            if (id4_route) {
+                // ID4's ordinary serializer path
+                // (`apply_preserve_host_lowercase_request_policy`) admits
+                // and drops an arbitrary Connection-nominated header --
+                // failing the whole request closed only for the protected
+                // names `request_policy_connection_nomination_is_protected`
+                // checks (content-length/host/the three forwarded-
+                // provenance headers/a pseudo-header-shaped token) -- and
+                // never rejects a nomination merely for being outside a
+                // small allowlist (Codex round-17 review, PR #696: a
+                // `Connection: X-Foo` + `X-Foo: 1` request is safely
+                // admitted and both fields dropped by that ordinary path,
+                // exactly like Envoy's own `sanitizeConnectionHeader`, so
+                // this preflight must not 400 it either). This scanner
+                // shares that same classifier rather than maintaining a
+                // second, narrower allowlist. A genuine upgrade -- a
+                // nominated `upgrade` token together with a semantically
+                // present `Upgrade` value (`upgrade_value_nonempty` above) --
+                // still fails closed here explicitly (the top-of-body check
+                // above already covers it too); every other token,
+                // including `te`, `close`, `keep-alive`, and an
+                // otherwise-arbitrary name, is admitted. Persistence is
+                // decided by the `close` token alone (`connection_close_
+                // token_seen` below), independent of what else is
+                // nominated in the same value, matching the shape
+                // classification at the end of this function. Envoy
+                // coalesces `Connection` as an inline, list-valued header,
+                // and the ordinary ID4 serializer's own nomination scan
+                // already iterates every physical `Connection` field rather
+                // than requiring exactly one (Codex round-18 review, PR
+                // #696): `connection_count` above is therefore not bounded
+                // for ID4 here either -- this branch runs, and
+                // `connection_close_token_seen` accumulates, once per
+                // physical field, so e.g. `Connection: TE` followed by a
+                // separate `Connection: X-Foo` is the union of both.
+                const char* value_start = header.value.ptr;
+                const char* value_end = value_start + header.value.len;
+                const char* tok = value_start;
+                while (tok <= value_end) {
+                    const char* tok_end = tok;
+                    while (tok_end < value_end && *tok_end != ',') tok_end++;
+                    const char* t0 = tok;
+                    const char* t1 = tok_end;
+                    while (t0 < t1 && (*t0 == ' ' || *t0 == '\t')) t0++;
+                    while (t1 > t0 && (t1[-1] == ' ' || t1[-1] == '\t')) t1--;
+                    if (t1 > t0) {
+                        const u32 tok_len = static_cast<u32>(t1 - t0);
+                        const bool is_close = http_header_name_eq_ci(t0, tok_len, "close", 5);
+                        const bool is_genuine_upgrade_nomination =
+                            upgrade_value_nonempty &&
+                            http_header_name_eq_ci(t0, tok_len, "upgrade", 7);
+                        if (is_genuine_upgrade_nomination ||
+                            request_policy_connection_nomination_is_protected(
+                                reinterpret_cast<const u8*>(t0), tok_len))
+                            return false;
+                        connection_close_token_seen |= is_close;
+                    }
+                    if (tok_end >= value_end) break;
+                    tok = tok_end + 1;
+                }
+            } else if (connection_count > 1 || header.value.len != 5 ||
+                       !http_header_name_eq_ci(header.value.ptr, header.value.len, "close", 5)) {
+                // Non-ID4 policies keep the original closed contract: at
+                // most one physical `Connection` field, and its value must
+                // be exactly the single literal token `close`.
                 return false;
+            }
         } else if (http_header_name_eq_ci(name.ptr, name.len, "content-length", 14) ||
-                   http_header_name_eq_ci(name.ptr, name.len, "transfer-encoding", 17) ||
-                   http_header_name_eq_ci(name.ptr, name.len, "te", 2) ||
-                   http_header_name_eq_ci(name.ptr, name.len, "expect", 6) ||
-                   http_header_name_eq_ci(name.ptr, name.len, "upgrade", 7)) {
+                   http_header_name_eq_ci(name.ptr, name.len, "transfer-encoding", 17)) {
             if (!conn.request_policy_id || paired_failure) return false;
+        } else if (http_header_name_eq_ci(name.ptr, name.len, "expect", 6)) {
+            // An empty or OWS-only `Expect` field carries no expectation at
+            // all (RFC 9110 defines only the "100-continue" expect-value),
+            // matching `inspect_request_policy_body`'s `has_expect`
+            // computation (Codex round-9 review): it is semantically absent,
+            // and every supported policy's fixed strip list (`Expect` is in
+            // ID1-3's `strip_headers` and ID4's `drop_fixed`) removes the
+            // field regardless of value, so this preflight must not reject
+            // it just because the field name is present. `header.value` is
+            // already OWS-trimmed by the parser, so a zero length here means
+            // exactly that. A semantically present (non-empty) value keeps
+            // the original closed contract (Codex round-15 review, PR #696).
+            if (header.value.len != 0) {
+                expect_semantically_present = true;
+                if (!conn.request_policy_id || paired_failure) return false;
+            }
+        } else if (http_header_name_eq_ci(name.ptr, name.len, "te", 2) ||
+                   http_header_name_eq_ci(name.ptr, name.len, "upgrade", 7)) {
+            // ID4's serializer canonicalizes every physical `TE` field
+            // regardless of its value and unconditionally strips a bare,
+            // non-nominated `Upgrade` field (`drop_fixed` in
+            // `apply_preserve_host_lowercase_request_policy`), matching
+            // Envoy; the genuine-upgrade shape is already excluded above
+            // (this function's own top-of-body check) and below
+            // (`conn.req_wants_upgrade` in the return expression)
+            // regardless of this branch, so it is safe to admit here for
+            // ID4 whether or not this evaluation is for a paired failure
+            // disposition -- unlike content-length/transfer-encoding/
+            // expect above, TE/Upgrade admission for ID4 does not depend on
+            // a request policy actually being committed yet, since the
+            // route's *intended* policy (the `request_policy_id` parameter)
+            // already proves the serializer that will run knows how to
+            // canonicalize/strip these two headers. `conn.request_policy_id`
+            // is not yet committed at this preflight's call sites (see the
+            // `authority_ok` comment below), so `request_policy_id` (not
+            // the not-yet-set connection field) decides ID4-ness here.
+            // Every other policy keeps the original closed contract (Codex
+            // round-11 review, PR #696).
+            if (!id4_route) return false;
         }
     }
     auto valid_authority = [](Str value) {
@@ -8813,8 +10182,37 @@ inline bool response_policy_suppress_head_admitted(const Connection& conn,
         }
         return true;
     };
-    if (paired_failure && (host_count != 1 || connection_count > 1 || host == nullptr ||
-                           !valid_authority(host->value)))
+    // ID4 (`host: "preserve"`) forwards the client's Host authority verbatim
+    // and validates it with the Envoy-compatible `HeaderUtility::
+    // authorityIsValid`-derived grammar (`request_policy_host_authority_is_valid`
+    // above), which -- unlike the legacy `valid_authority` closure above,
+    // written for the fixed-upstream-Host policies that never see an IPv6
+    // literal -- admits `[`/`]` and the extra colon an IPv6 literal or its
+    // port suffix requires (e.g. `Host: [::1]`). This preflight must accept
+    // exactly the same authorities the ID4 serializer (`apply_preserve_host_
+    // lowercase_request_policy`) will later admit, or a route pairing ID4
+    // with `head_mode: "suppress_body"` response/failure policies -- the
+    // exact shape `put_forward_route` emits -- would 400 a request the
+    // serializer itself accepts and forwards (Codex round-9 review, PR
+    // #696). Non-ID4 policies keep the legacy grammar unchanged. `conn.
+    // request_policy_id` is not yet committed at this preflight's call sites
+    // (it is written only once the request policy actually materializes),
+    // so the caller passes the route's intended request policy id in
+    // explicitly rather than reading a not-yet-set `conn` field.
+    const bool authority_ok =
+        host != nullptr &&
+        (request_policy_preserves_host(request_policy_id)
+             ? (host->value.len != 0 &&
+                request_policy_host_authority_is_valid(reinterpret_cast<const u8*>(host->value.ptr),
+                                                       host->value.len))
+             : valid_authority(host->value));
+    // A count limit on physical `Connection` fields only applies to non-ID4
+    // policies here: ID4 aggregates every physical field above (Codex
+    // round-18 review, PR #696), matching Envoy's own inline, list-valued
+    // `Connection` storage and the ordinary ID4 serializer's own nomination
+    // scan, so `connection_count > 1` alone must not fail ID4 closed.
+    if (paired_failure && (host_count != 1 || (!id4_route && connection_count > 1) ||
+                           host == nullptr || !authority_ok))
         return false;
     const bool explicit_close_shape =
         !conn.req_client_keep_alive && conn.req_client_connection_close &&
@@ -8822,13 +10220,77 @@ inline bool response_policy_suppress_head_admitted(const Connection& conn,
     const bool default_keep_alive_shape =
         paired_failure && conn.req_client_keep_alive && !conn.req_client_connection_close &&
         !conn.req_client_connection_close_exact && conn.req_client_connection_count == 0;
+    // ID4 only: a `Connection` value validated above (every token either a
+    // protected name -- fail closed -- or a safely nominated/persistence
+    // token -- admitted; `connection_close_token_seen` set iff a `close`
+    // token is among them) is classified by persistence, not by exact byte
+    // match against the literal `close`, since none of the admitted
+    // non-`close` tokens (`te`, `keep-alive`, a genuine-upgrade-free
+    // `upgrade`, or an arbitrary nominated name) affect persistence. A
+    // `close` token present means the connection closes exactly like the
+    // plain `Connection: close` shape (`conn.req_client_connection_close_
+    // exact` is false here for e.g. `close, te` or `close, x-foo`, which is
+    // why this is a separate term rather than folded into
+    // `explicit_close_shape`); its absence means this is an ordinary
+    // default-persistent request that merely also carries one or more
+    // harmless nominations, gated the same way `default_keep_alive_shape`
+    // is (paired-failure evaluation only, per the response-only-suppression
+    // contract above) since such a `Connection` value is otherwise
+    // identical, for persistence purposes, to sending no `Connection`
+    // header at all (Codex round-13/round-17 review, PR #696).
+    // `connection_count != 0` here (rather than `== 1`) reflects one or
+    // more physical `Connection` fields having been aggregated above
+    // (Codex round-18 review, PR #696): the token union across however many
+    // physical fields there were is what `connection_close_token_seen`
+    // already captures, and this shape only needs to know at least one such
+    // field was present, not exactly how many.
+    //
+    // Deliberately does NOT consult `conn.req_client_keep_alive`/
+    // `conn.req_client_connection_close` for ID4 persistence, even though
+    // `match_connection` (`src/runtime/http_parser.cc`) now makes its
+    // `keep-alive` branch check `!req->connection_close` before setting
+    // `keep_alive`, so a `Connection: close` field followed by a separate,
+    // later `Connection: keep-alive` field no longer flips `keep_alive` back
+    // to `true` there (Codex sweep-3 review, PR #696, fixed the parser
+    // itself, not just this preflight) -- an earlier revision of this
+    // comment cited that now-fixed order-dependence as the reason to avoid
+    // those two fields, which is no longer accurate and must not be read as
+    // a description of current parser behavior (Codex sweep-10 review, PR
+    // #696). The real reason to keep using `connection_close_token_seen`
+    // instead is unrelated to that bug: this preflight already performs its
+    // own per-token scan across every physical `Connection` field above,
+    // because it must independently fail closed on a protected-name
+    // nomination and detect a genuine-upgrade nomination -- checks the
+    // generic parser's cached `req_client_*` fields do not perform. Reusing
+    // that same scan's incidentally-computed close-token result keeps
+    // persistence classification and token validation as one pass over one
+    // set of data, rather than adding a second, separate dependency on the
+    // parser's own aggregate fields (which serve every other consumer, not
+    // only this ID4 shape) that would need to be proven equivalent to this
+    // scan on every future change to either side.
+    const bool id4_close_with_te_shape =
+        id4_route && connection_count != 0 && connection_close_token_seen;
+    const bool id4_default_keep_alive_with_te_shape =
+        id4_route && paired_failure && connection_count != 0 && !connection_close_token_seen;
     return policy.connection == ResponsePolicyConnection::Request &&
            conn.req_method == static_cast<u8>(LogHttpMethod::Head) &&
            conn.req_http_version == static_cast<u8>(HttpVersion::Http11) &&
-           (explicit_close_shape || default_keep_alive_shape) &&
+           (explicit_close_shape || default_keep_alive_shape || id4_close_with_te_shape ||
+            id4_default_keep_alive_with_te_shape) &&
            !conn.req_client_has_content_length && !conn.tls_active &&
-           !conn.req_client_has_transfer_encoding && !conn.req_client_has_te &&
-           !conn.req_client_has_expect && !conn.req_client_has_upgrade_header &&
+           !conn.req_client_has_transfer_encoding && (id4_route || !conn.req_client_has_te) &&
+           // `conn.req_client_has_expect` is raw field-name presence; an
+           // empty/OWS-only `Expect` is semantically absent (see the
+           // per-header-loop comment above), so `expect_semantically_
+           // present` -- computed from the same trimmed value -- decides
+           // admission here instead (Codex round-15 review, PR #696).
+           !expect_semantically_present &&
+           // A bare, non-nominated `Upgrade` is ID4-admitted per the
+           // top-of-body and per-header-loop comments above; a genuine
+           // upgrade (Upgrade + Connection: upgrade nomination) is still
+           // excluded unconditionally by `!conn.req_wants_upgrade` below,
+           // regardless of `id4_route`.
+           (id4_route || !conn.req_client_has_upgrade_header) &&
            conn.protocol == ConnProtocol::Http11 && conn.req_path_canon.ptr != nullptr &&
            conn.req_body_mode == BodyMode::None && conn.req_body_remaining == 0 &&
            !conn.request_body_fully_buffered && !conn.req_malformed && !conn.req_wants_upgrade &&
@@ -8844,7 +10306,8 @@ inline ResponseReadDeadlineProfile classify_response_read_deadline_profile(
     const ForwardResponsePolicySpec& response,
     const ForwardFailurePolicySpec& failure,
     const ForwardFailurePolicySpec& timeout,
-    ForwardResponseBufferingMode buffering) {
+    ForwardResponseBufferingMode buffering,
+    u16 request_policy_id) {
     const bool common = response.version == ResponsePolicyVersion::Http11 &&
                         response.framing == ResponsePolicyFraming::ContentLength &&
                         response.connection == ResponsePolicyConnection::Request &&
@@ -8858,7 +10321,8 @@ inline ResponseReadDeadlineProfile classify_response_read_deadline_profile(
     if (response.head_mode == ResponsePolicyHeadMode::SuppressBody &&
         failure.head_mode == FailurePolicyHeadMode::SuppressBody &&
         timeout.head_mode == FailurePolicyHeadMode::SuppressBody &&
-        response_policy_suppress_head_admitted(conn, response, /*paired_failure=*/true))
+        response_policy_suppress_head_admitted(
+            conn, response, /*paired_failure=*/true, request_policy_id))
         return ResponseReadDeadlineProfile::HeaderOnlyHead;
 
     // A positive Content-Length HEAD request still has to be uploaded in full
