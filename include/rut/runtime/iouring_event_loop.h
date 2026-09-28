@@ -1544,20 +1544,19 @@ public:
         const u32 remaining = declared - received;
         const u32 bulk_after = c.tls_active ? ResponseBodyChain::kBulkAfterTls
                                             : ResponseBodyChain::kBulkAfterPlaintext;
-        // Bounded only, first node of this response's chain only: when the
-        // whole declared body fits in one bulk node, skip the ordinary "prove
-        // it's large first" ramp (one or more slice-sized nodes before ever
-        // reaching bulk_after) and reserve a single bulk node for it up
-        // front. CompleteContentLength never calls this function; the
-        // explicit buffering check keeps the fast path Bounded-only by
-        // construction. Measured (RUT_DEBUG_SEND_TRACE): for a 64 KiB body this
-        // alone brings Bounded's downstream Send count and sizes to match
-        // CompleteContentLength's exactly, both plain and over TLS — see the
-        // final report.
-        const bool bounded_fresh_chain_fits_one_bulk_node =
+        // The declared length has already been validated. A fresh Bounded
+        // plaintext chain can therefore start with bulk storage even when
+        // the body spans several nodes, instead of first growing through an
+        // ordinary slice. Repeat this preference if a drained chain starts
+        // again; its current buffered size does not describe the whole body.
+        // TLS retains its existing single-bulk-body exception and otherwise
+        // the ordinary-slice ramp (kBulkAfterTls). Pool exhaustion still falls
+        // back to an ordinary slice inside reserve_tail().
+        const bool bounded_fresh_chain_prefers_bulk =
             c.response_read_deadline_buffering == ForwardResponseBufferingMode::Bounded &&
-            c.response_body_tail.head == nullptr && declared <= ResponseBodyChain::kBulkPayload;
-        const u32 effective_bulk_after = bounded_fresh_chain_fits_one_bulk_node ? 0 : bulk_after;
+            c.response_body_tail.head == nullptr &&
+            (!c.tls_active || declared <= ResponseBodyChain::kBulkPayload);
+        const u32 effective_bulk_after = bounded_fresh_chain_prefers_bulk ? 0 : bulk_after;
         if (!c.response_body_tail.reserve_tail(pool, effective_bulk_after)) return false;
         const u32 avail = c.response_body_tail.write_avail(pool);
         if (avail == 0) return false;
