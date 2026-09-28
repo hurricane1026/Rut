@@ -22,10 +22,18 @@ enum class IoEventType : u8 {
                         //   drains its min-heap to find which conns to resume.
     ResponseReadTimer,  // Generic precise response-read transport timer.
                         // Kept distinct from JIT and TimerWheel wakeups.
+    BoundedHoldTimer,   // Bounded response buffering only: short per-connection
+                        // one-shot timer bounding how long a too-small release
+                        // is held for more bytes to coalesce in. io_uring:
+                        // IORING_OP_TIMEOUT, microsecond precision, never
+                        // explicitly cancelled (see try_advance_bounded_release
+                        // and Connection::consume_bounded_hold_timer_completion).
+                        // epoll/kqueue: unsupported — those backends release
+                        // immediately instead (no equivalent primitive).
     Count,
 };
 
-static_assert(static_cast<u8>(IoEventType::Count) == 9u,
+static_assert(static_cast<u8>(IoEventType::Count) == 10u,
               "IoEventType should keep all runtime event tags and remain small");
 
 // Future upstream-event token layout in the existing 64-bit user_data budget:
@@ -177,6 +185,15 @@ struct IoEvent {
     // buffer ring was empty, so no socket bytes were consumed. A -ENOBUFS
     // produced after a selected buffer's bytes were dropped leaves this clear.
     u8 provided_ring_empty = 0;
+    // io_uring only: IORING_CQE_F_SOCK_NONEMPTY was set on a positive recv
+    // completion — more bytes were already queued in the kernel socket buffer
+    // when this recv drained it, so another recv will likely complete
+    // immediately rather than wait on the network. Used by Bounded response
+    // buffering to defer an early release until a recv actually drains the
+    // socket, coalescing a bursty origin's bytes into one release Send
+    // instead of many small ones. The epoll/kqueue backends have no
+    // equivalent signal and always report this clear.
+    u8 sock_nonempty = 0;
 };
 
 // ResponseReadTimer is a transport-only event. Accept only the exact result
@@ -190,6 +207,20 @@ inline constexpr bool valid_response_read_timer_transport_event(const IoEvent& e
     const bool result_valid = cancel ? (event.result == 0 || event.result == -ENOENT)
                                      : (event.result == -ETIME || event.result == -ECANCELED);
     return generation != 0 && result_valid && event.buf_id == 0 && event.has_buf == 0 &&
+           event.more == 0 && event.aux == 0 && event.upstream_episode == 0 &&
+           event.copy_witness == IoEventCopyWitness::None && event.copy_deadline_generation == 0 &&
+           event.copy_deadline_profile == 0 && event.copy_deadline_method == 0xffu &&
+           event.copy_begin == 0 && event.copy_end == 0 && event.provided_ring_empty == 0;
+}
+
+// BoundedHoldTimer is a transport-only event, structurally simpler than
+// ResponseReadTimer above: it is never explicitly cancelled (see
+// Connection::consume_bounded_hold_timer_completion), so its only legal
+// result is -ETIME (fired) — a stray -ECANCELED (e.g. from a future ring
+// shutdown path) is rejected rather than acted on.
+inline constexpr bool valid_bounded_hold_timer_transport_event(const IoEvent& event) {
+    return event.type == IoEventType::BoundedHoldTimer && event.result == -ETIME &&
+           event.non_upstream_generation != 0 && event.buf_id == 0 && event.has_buf == 0 &&
            event.more == 0 && event.aux == 0 && event.upstream_episode == 0 &&
            event.copy_witness == IoEventCopyWitness::None && event.copy_deadline_generation == 0 &&
            event.copy_deadline_profile == 0 && event.copy_deadline_method == 0xffu &&

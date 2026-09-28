@@ -30303,6 +30303,1269 @@ route GET "/" {
 }
 
 #if RUT_ENABLE_JIT_TESTS
+// Coordinator-requested live end-to-end proof: a hand-written .rut route with
+// response_buffering: "bounded" reaches production over a real io_uring
+// listener, real upstream socket, and real downstream client socket — the
+// exact measured nginx proxy_buffering-on release boundaries (raw 70-byte
+// header + n body bytes, 1s response_read_timeout, origin stalls past it):
+// n=3000/4020 release nothing (below one 4096-byte buffer, byte-identical to
+// CompleteContentLength); n=4030/5000/9000/20000/100000 release exactly
+// 4026/4026/8122/16314/98234 body bytes before the connection closes at the
+// timeout. This is also the exact scenario that exposed the precise-timer
+// gap (settle_precise_complete_content_length_buffering never called
+// try_advance_bounded_release): a plain GET with the default request policy
+// (ID1, admitted by bodyless_get_complete_content_length_precise_buffering_is_stable)
+// arms the precise io_uring timer, not the wheel timer, from the very first
+// batch.
+TEST(route, bounded_release_matches_measured_nginx_boundaries_reaches_production_h1_iouring) {
+    using namespace rut;
+    if (!iouring_socket_live()) SKIP("io_uring async socket ops unavailable in this environment");
+
+    auto origin = std::make_unique<RecordingUpstream>();
+    REQUIRE(origin->setup());
+    const u16 upstream_port = origin->port;
+
+    std::string source_text =
+        "listen :0\nupstream backend at \"127.0.0.1:" + std::to_string(upstream_port) + "\"\n";
+    source_text += R"rut(
+route GET "/" {
+  return forward(backend,
+    request_policy: { version: "HTTP/1.1", host: "upstream", connection: "omit",
+      strip_headers: ["Connection", "Keep-Alive", "TE", "Expect", "Upgrade"] },
+    response_policy: { version: "HTTP/1.1", framing: "content_length",
+      connection: "request", head_mode: "reject", server: "bounded-test",
+      date: "current", hide_headers: ["Date", "Server", "Connection"] },
+    failure_policy: { version: "HTTP/1.1", status: 502, reason: "Origin Failed",
+      content_type: "text/plain", server: "bounded-test", date: "current",
+      connection: "request", head_mode: "reject", body: b"default failure\n" },
+    timeout_failure_policy: { version: "HTTP/1.1", status: 504,
+      reason: "Response Read Deadline", content_type: "text/plain",
+      server: "bounded-test", date: "current", connection: "request",
+      head_mode: "reject", body: b"configured deadline\n" },
+    response_read_timeout: 1s,
+    response_buffering: "bounded")
+}
+)rut";
+
+    struct TempSource {
+        char path[64] = "/tmp/rut_bounded_release_wire_XXXXXX";
+        i32 fd = -1;
+        bool present = false;
+        bool create(Str text) {
+            fd = mkstemp(path);
+            if (fd < 0) return false;
+            present = true;
+            u32 written = 0;
+            while (written < text.len) {
+                const ssize_t n = write(fd, text.ptr + written, text.len - written);
+                if (n < 0 && errno == EINTR) continue;
+                if (n <= 0) return false;
+                written += static_cast<u32>(n);
+            }
+            if (close(fd) != 0) return false;
+            fd = -1;
+            return true;
+        }
+        ~TempSource() {
+            if (fd >= 0) close(fd);
+            if (present) unlink(path);
+        }
+    } source;
+    REQUIRE(source.create({source_text.data(), static_cast<u32>(source_text.size())}));
+
+    LoadedProgram program{};
+    struct ProgramGuard {
+        LoadedProgram& program;
+        bool armed = true;
+        ~ProgramGuard() {
+            if (armed) program.destroy();
+        }
+    } program_guard{program};
+    LoadError load_error{};
+    const bool loaded = load_rut_program(source.path, program, load_error, jit::OptLevel::O0);
+    char load_message[512]{};
+    if (!loaded) format_load_error(load_error, load_message, sizeof(load_message));
+    REQUIRE_MSG(loaded, load_message);
+    REQUIRE(program.jit_inited);
+    REQUIRE(program.has_listener);
+    REQUIRE_EQ(program.config.policy_bundle_count, 1u);
+    CHECK_EQ(program.config.policy_bundles[0].response_buffering,
+             ForwardResponseBufferingMode::Bounded);
+
+    Shard<IoUringEventLoop> shard;
+    struct ShardGuard {
+        Shard<IoUringEventLoop>& shard;
+        bool initialized = false;
+        bool spawned = false;
+        ~ShardGuard() {
+            if (spawned) {
+                shard.stop();
+                shard.join();
+            }
+            if (initialized) {
+                if (shard.loop != nullptr) shard.loop->force_close_all();
+                shard.shutdown();
+            }
+        }
+    } shard_guard{shard};
+    ListenerContext listener_context{};
+    auto listen_result =
+        bind_listener_shard(program.listener, program.listener.port, nullptr, &listener_context);
+    REQUIRE(listen_result.has_value());
+    struct FdGuard {
+        i32 fd = -1;
+        ~FdGuard() {
+            if (fd >= 0) close(fd);
+        }
+    } listen_guard{listen_result.value()};
+    REQUIRE(listener_context.valid());
+    const u16 frontend_port = listener_context.port;
+    REQUIRE_NE(frontend_port, 0u);
+    REQUIRE(shard.init(0, listen_guard.fd).has_value());
+    shard_guard.initialized = true;
+    shard.owns_listen_fd = true;
+    listen_guard.fd = -1;
+    shard.route_config = &program.config;
+    shard.active_config = shard.route_config;
+    REQUIRE(shard.loop != nullptr);
+    shard.loop->listener_context = listener_context;
+    REQUIRE(shard.spawn(-1).has_value());
+    shard_guard.spawned = true;
+
+    struct ClientGuard {
+        i32 fd = -1;
+        ~ClientGuard() {
+            if (fd >= 0) close(fd);
+        }
+    };
+
+    struct Case {
+        u32 n;
+        u32 want_body;
+    };
+    static constexpr Case kCases[] = {
+        {3000, 0},
+        {4020, 0},
+        {4030, 4026},
+        {5000, 4026},
+        {9000, 8122},
+        {20000, 16314},
+        {100000, 98234},
+    };
+    static constexpr char kHeaderFmt[] =
+        "HTTP/1.1 200 OK\r\nContent-Length: 1048576\r\nContent-Type: text/plain\r\n\r\n";
+    static_assert(sizeof(kHeaderFmt) - 1u == 70u);
+
+    for (const auto& c : kCases) {
+        origin->teardown();
+        origin = std::make_unique<RecordingUpstream>();
+        origin->gate_first_response_close = true;
+        std::string body(c.n, 'x');
+        std::string wire = std::string(kHeaderFmt) + body;
+        origin->response = wire.data();
+        origin->response_len = static_cast<u32>(wire.size());
+        REQUIRE(origin->setup(upstream_port));
+
+        ClientGuard client{connect_to(frontend_port)};
+        REQUIRE_GE(client.fd, 0);
+        set_socket_timeouts(client.fd, 5);
+        static constexpr char kRequest[] = "GET / HTTP/1.1\r\nHost: bounded-client.example\r\n\r\n";
+        REQUIRE(send_all(client.fd, kRequest, sizeof(kRequest) - 1u));
+
+        char buf[131072];
+        u32 total = 0;
+        bool closed = false;
+        for (u32 waited_ms = 0; waited_ms < 1600 && !closed;) {
+            const i32 got = recv_timeout(client.fd, buf + total, sizeof(buf) - total, 100);
+            if (got > 0) {
+                total += static_cast<u32>(got);
+                REQUIRE_LT(total, sizeof(buf));
+            } else if (got == 0) {
+                closed = true;
+            } else {
+                waited_ms += 100;
+            }
+        }
+        CHECK(closed);
+        u32 header_end = 0;
+        for (u32 i = 0; i + 3 < total; i++) {
+            if (buf[i] == '\r' && buf[i + 1] == '\n' && buf[i + 2] == '\r' && buf[i + 3] == '\n') {
+                header_end = i + 4;
+                break;
+            }
+        }
+        REQUIRE_GT(header_end, 0u);
+        CHECK_EQ(total - header_end, c.want_body);
+
+        origin->allow_first_response_close.store(true, std::memory_order_release);
+    }
+
+    // Clean EOF mid-stream: the origin sends a partial body (well past one
+    // release buffer) and closes immediately (no stall) — CCL's existing
+    // clean-EOF disposition, now also valid mid-stream: flush everything
+    // received, not just whatever was already released.
+    {
+        origin->teardown();
+        origin = std::make_unique<RecordingUpstream>();
+        std::string body(524288u, 'y');
+        std::string wire = std::string(kHeaderFmt) + body;
+        origin->response = wire.data();
+        origin->response_len = static_cast<u32>(wire.size());
+        REQUIRE(origin->setup(upstream_port));
+
+        ClientGuard client{connect_to(frontend_port)};
+        REQUIRE_GE(client.fd, 0);
+        set_socket_timeouts(client.fd, 5);
+        static constexpr char kRequest[] = "GET / HTTP/1.1\r\nHost: bounded-client.example\r\n\r\n";
+        REQUIRE(send_all(client.fd, kRequest, sizeof(kRequest) - 1u));
+
+        char buf[600000];
+        u32 total = 0;
+        bool closed = false;
+        for (u32 waited_ms = 0; waited_ms < 3000 && !closed;) {
+            const i32 got = recv_timeout(client.fd, buf + total, sizeof(buf) - total, 100);
+            if (got > 0) {
+                total += static_cast<u32>(got);
+                REQUIRE_LT(total, sizeof(buf));
+            } else if (got == 0) {
+                closed = true;
+            } else {
+                waited_ms += 100;
+            }
+        }
+        CHECK(closed);
+        u32 header_end = 0;
+        for (u32 i = 0; i + 3 < total; i++) {
+            if (buf[i] == '\r' && buf[i + 1] == '\n' && buf[i + 2] == '\r' && buf[i + 3] == '\n') {
+                header_end = i + 4;
+                break;
+            }
+        }
+        REQUIRE_GT(header_end, 0u);
+        CHECK_EQ(total - header_end, body.size());
+    }
+
+    // Full completion with downstream keep-alive: the origin sends the
+    // entire declared body, then a second request lands on the same
+    // downstream connection — proving Bounded's terminal fast-forward hands
+    // off to the ordinary completion path (successor dispatch) unchanged.
+    {
+        origin->teardown();
+        origin = std::make_unique<RecordingUpstream>();
+        static constexpr char kSmallBody[] = "bounded-complete-body";
+        static constexpr char kSmallHeader[] =
+            "HTTP/1.1 200 OK\r\nContent-Length: 21\r\nContent-Type: text/plain\r\n\r\n";
+        static_assert(sizeof(kSmallBody) - 1u == 21u);
+        std::string wire = std::string(kSmallHeader) + kSmallBody;
+        origin->response = wire.data();
+        origin->response_len = static_cast<u32>(wire.size());
+        origin->response_after_first = wire.data();
+        origin->response_after_first_len = static_cast<u32>(wire.size());
+        REQUIRE(origin->setup(upstream_port));
+
+        ClientGuard client{connect_to(frontend_port)};
+        REQUIRE_GE(client.fd, 0);
+        set_socket_timeouts(client.fd, 5);
+        static constexpr char kRequest[] = "GET / HTTP/1.1\r\nHost: bounded-client.example\r\n\r\n";
+        for (u32 request_no = 0; request_no < 2; request_no++) {
+            REQUIRE(send_all(client.fd, kRequest, sizeof(kRequest) - 1u));
+            // Keep-alive: the connection does not close after the response,
+            // so read exactly header+body rather than waiting for EOF.
+            char buf[256];
+            u32 length = 0;
+            u32 header_end = 0;
+            bool got_full_response = false;
+            for (u32 attempt = 0; attempt < 16 && length < sizeof(buf); attempt++) {
+                const i32 got = recv_timeout(client.fd, buf + length, sizeof(buf) - length, 2000);
+                REQUIRE_GT(got, 0);
+                length += static_cast<u32>(got);
+                for (u32 i = 0; header_end == 0 && i + 3 < length; i++) {
+                    if (buf[i] == '\r' && buf[i + 1] == '\n' && buf[i + 2] == '\r' &&
+                        buf[i + 3] == '\n')
+                        header_end = i + 4;
+                }
+                if (header_end != 0 && length == header_end + 21u) {
+                    got_full_response = true;
+                    break;
+                }
+            }
+            REQUIRE(got_full_response);
+        }
+        CHECK_EQ(origin->request_count.load(std::memory_order_acquire), 2u);
+    }
+
+    // Expiry before the first release: the origin sends only the header (no
+    // body bytes at all) and then holds the connection open forever (gated,
+    // never released) — nothing has ever been released (bounded_released
+    // stays 0 the entire time), so this must resolve exactly like plain
+    // CompleteContentLength's own InactivityExpiry-during-Buffering: the
+    // pinned header only, zero body, then close.
+    {
+        origin->teardown();
+        origin = std::make_unique<RecordingUpstream>();
+        origin->gate_first_response_close = true;
+        origin->response = kHeaderFmt;
+        origin->response_len = sizeof(kHeaderFmt) - 1u;
+        REQUIRE(origin->setup(upstream_port));
+
+        ClientGuard client{connect_to(frontend_port)};
+        REQUIRE_GE(client.fd, 0);
+        set_socket_timeouts(client.fd, 5);
+        static constexpr char kRequest[] = "GET / HTTP/1.1\r\nHost: bounded-client.example\r\n\r\n";
+        REQUIRE(send_all(client.fd, kRequest, sizeof(kRequest) - 1u));
+
+        char buf[4096];
+        u32 total = 0;
+        bool closed = false;
+        for (u32 waited_ms = 0; waited_ms < 3000 && !closed;) {
+            const i32 got = recv_timeout(client.fd, buf + total, sizeof(buf) - total, 100);
+            if (got > 0) {
+                total += static_cast<u32>(got);
+                REQUIRE_LT(total, sizeof(buf));
+            } else if (got == 0) {
+                closed = true;
+            } else {
+                waited_ms += 100;
+            }
+        }
+        CHECK(closed);
+        u32 header_end = 0;
+        for (u32 i = 0; i + 3 < total; i++) {
+            if (buf[i] == '\r' && buf[i + 1] == '\n' && buf[i + 2] == '\r' && buf[i + 3] == '\n') {
+                header_end = i + 4;
+                break;
+            }
+        }
+        REQUIRE_GT(header_end, 0u);
+        CHECK_EQ(total - header_end, 0u);
+    }
+
+    // Explicit Connection: close, with a real early release already landed:
+    // the origin sends its entire declared body up front (no gating) so
+    // Bounded's early releases fire as usual and, by the time the body
+    // proves complete, bounded_released > 0 — exercising the Bounded
+    // fast-forward branch's CompleteBody disposition specifically (not just
+    // InactivityExpiry, covered above). The client's explicit close must
+    // still be honored: close_after_drain has to persist through that
+    // fast-forward the same way it does on the ordinary header+body path.
+    {
+        origin->teardown();
+        origin = std::make_unique<RecordingUpstream>();
+        std::string body(100000u, 'z');
+        std::string wire = std::string(kHeaderFmt) + body;
+        origin->response = wire.data();
+        origin->response_len = static_cast<u32>(wire.size());
+        REQUIRE(origin->setup(upstream_port));
+
+        ClientGuard client{connect_to(frontend_port)};
+        REQUIRE_GE(client.fd, 0);
+        set_socket_timeouts(client.fd, 5);
+        static constexpr char kRequest[] =
+            "GET / HTTP/1.1\r\nHost: bounded-client.example\r\nConnection: close\r\n\r\n";
+        REQUIRE(send_all(client.fd, kRequest, sizeof(kRequest) - 1u));
+
+        std::vector<char> buf(200000);
+        u32 total = 0;
+        bool closed = false;
+        for (u32 waited_ms = 0; waited_ms < 3000 && !closed;) {
+            const i32 got = recv_timeout(
+                client.fd, buf.data() + total, static_cast<u32>(buf.size()) - total, 100);
+            if (got > 0) {
+                total += static_cast<u32>(got);
+                REQUIRE_LT(total, buf.size());
+            } else if (got == 0) {
+                closed = true;
+            } else {
+                waited_ms += 100;
+            }
+        }
+        // Explicit close must be honored only once the whole body has
+        // actually drained — never truncate what the client asked to be
+        // sent in full just because it also asked to close afterward.
+        CHECK(closed);
+        u32 header_end = 0;
+        for (u32 i = 0; i + 3 < total; i++) {
+            if (buf[i] == '\r' && buf[i + 1] == '\n' && buf[i + 2] == '\r' && buf[i + 3] == '\n') {
+                header_end = i + 4;
+                break;
+            }
+        }
+        REQUIRE_GT(header_end, 0u);
+        CHECK_EQ(total - header_end, body.size());
+    }
+
+    // Pipelined successor: both requests go out back-to-back, before either
+    // response is read, proving Bounded's terminal fast-forward (and the
+    // successor-dispatch machinery it hands off to) tolerates a pipelined
+    // request already sitting in the downstream recv buffer while the first
+    // response is still being sent — not just a keep-alive round trip where
+    // the client waits.
+    {
+        origin->teardown();
+        origin = std::make_unique<RecordingUpstream>();
+        static constexpr char kSmallBody[] = "bounded-complete-body";
+        static constexpr char kSmallHeader[] =
+            "HTTP/1.1 200 OK\r\nContent-Length: 21\r\nContent-Type: text/plain\r\n\r\n";
+        static_assert(sizeof(kSmallBody) - 1u == 21u);
+        std::string wire = std::string(kSmallHeader) + kSmallBody;
+        origin->response = wire.data();
+        origin->response_len = static_cast<u32>(wire.size());
+        origin->response_after_first = wire.data();
+        origin->response_after_first_len = static_cast<u32>(wire.size());
+        REQUIRE(origin->setup(upstream_port));
+
+        ClientGuard client{connect_to(frontend_port)};
+        REQUIRE_GE(client.fd, 0);
+        set_socket_timeouts(client.fd, 5);
+        static constexpr char kRequest[] = "GET / HTTP/1.1\r\nHost: bounded-client.example\r\n\r\n";
+        std::string pipelined = std::string(kRequest) + std::string(kRequest);
+        REQUIRE(send_all(client.fd, pipelined.data(), static_cast<u32>(pipelined.size())));
+
+        for (u32 request_no = 0; request_no < 2; request_no++) {
+            char buf[256];
+            u32 length = 0;
+            u32 header_end = 0;
+            bool got_full_response = false;
+            for (u32 attempt = 0; attempt < 16 && length < sizeof(buf); attempt++) {
+                const i32 got = recv_timeout(client.fd, buf + length, sizeof(buf) - length, 2000);
+                REQUIRE_GT(got, 0);
+                length += static_cast<u32>(got);
+                for (u32 i = 0; header_end == 0 && i + 3 < length; i++) {
+                    if (buf[i] == '\r' && buf[i + 1] == '\n' && buf[i + 2] == '\r' &&
+                        buf[i + 3] == '\n')
+                        header_end = i + 4;
+                }
+                if (header_end != 0 && length == header_end + 21u) {
+                    got_full_response = true;
+                    break;
+                }
+            }
+            REQUIRE(got_full_response);
+            CHECK_EQ(memcmp(buf + header_end, kSmallBody, 21u), 0);
+        }
+        CHECK_EQ(origin->request_count.load(std::memory_order_acquire), 2u);
+    }
+
+    origin->teardown();
+    shard.stop();
+    shard.join();
+    settle_stopped_iouring_shard(shard);
+    shard_guard.spawned = false;
+    shard.shutdown();
+    shard_guard.initialized = false;
+    program.destroy();
+    program_guard.armed = false;
+}
+
+// Deterministic non-repeating fill so a byte-exact comparison actually
+// catches reordering/duplication/dropped-range bugs in the direct-recv
+// chain (an all-'x' body would still "match" after such corruption as long
+// as the length happened to come out right).
+static void fill_deterministic_pattern(char* dst, u64 n) {
+    for (u64 i = 0; i < n; i++)
+        dst[i] = static_cast<char>('!' + ((i * 2654435761ull + (i >> 8)) % 94ull));
+}
+
+// Coordinator-requested coverage for the Bounded direct-recv redesign: a
+// fast, ungated local origin (RecordingUpstream, response_chunk_size == 0 —
+// one application send() call, exactly the nginx-sendfile shape that used to
+// truncate at one provided-buffer slice or lose bytes to the cancel-race
+// documented on the read-ahead/Part-B switch) delivering bodies from just
+// over 1 MiB (the old ResponseBodyChain::kMaxBody ceiling) up to 64 MiB must
+// arrive complete and byte-exact — never truncated, never corrupted — and
+// the connection must still support a keep-alive successor request
+// afterward.
+TEST(route, bounded_large_body_fast_origin_completes_byte_exact_reaches_production_h1_iouring) {
+    using namespace rut;
+    if (!iouring_socket_live()) SKIP("io_uring async socket ops unavailable in this environment");
+
+    auto origin = std::make_unique<RecordingUpstream>();
+    REQUIRE(origin->setup());
+    const u16 upstream_port = origin->port;
+
+    std::string source_text =
+        "listen :0\nupstream backend at \"127.0.0.1:" + std::to_string(upstream_port) + "\"\n";
+    source_text += R"rut(
+route GET "/" {
+  return forward(backend,
+    request_policy: { version: "HTTP/1.1", host: "upstream", connection: "omit",
+      strip_headers: ["Connection", "Keep-Alive", "TE", "Expect", "Upgrade"] },
+    response_policy: { version: "HTTP/1.1", framing: "content_length",
+      connection: "request", head_mode: "reject", server: "bounded-test",
+      date: "current", hide_headers: ["Date", "Server", "Connection"] },
+    failure_policy: { version: "HTTP/1.1", status: 502, reason: "Origin Failed",
+      content_type: "text/plain", server: "bounded-test", date: "current",
+      connection: "request", head_mode: "reject", body: b"default failure\n" },
+    timeout_failure_policy: { version: "HTTP/1.1", status: 504,
+      reason: "Response Read Deadline", content_type: "text/plain",
+      server: "bounded-test", date: "current", connection: "request",
+      head_mode: "reject", body: b"configured deadline\n" },
+    response_read_timeout: 5s,
+    response_buffering: "bounded")
+}
+)rut";
+
+    struct TempSource {
+        char path[64] = "/tmp/rut_bounded_large_body_XXXXXX";
+        i32 fd = -1;
+        bool present = false;
+        bool create(Str text) {
+            fd = mkstemp(path);
+            if (fd < 0) return false;
+            present = true;
+            u32 written = 0;
+            while (written < text.len) {
+                const ssize_t n = write(fd, text.ptr + written, text.len - written);
+                if (n < 0 && errno == EINTR) continue;
+                if (n <= 0) return false;
+                written += static_cast<u32>(n);
+            }
+            if (close(fd) != 0) return false;
+            fd = -1;
+            return true;
+        }
+        ~TempSource() {
+            if (fd >= 0) close(fd);
+            if (present) unlink(path);
+        }
+    } source;
+    REQUIRE(source.create({source_text.data(), static_cast<u32>(source_text.size())}));
+
+    LoadedProgram program{};
+    struct ProgramGuard {
+        LoadedProgram& program;
+        bool armed = true;
+        ~ProgramGuard() {
+            if (armed) program.destroy();
+        }
+    } program_guard{program};
+    LoadError load_error{};
+    const bool loaded = load_rut_program(source.path, program, load_error, jit::OptLevel::O0);
+    char load_message[512]{};
+    if (!loaded) format_load_error(load_error, load_message, sizeof(load_message));
+    REQUIRE_MSG(loaded, load_message);
+    REQUIRE(program.jit_inited);
+    REQUIRE(program.has_listener);
+    REQUIRE_EQ(program.config.policy_bundle_count, 1u);
+    CHECK_EQ(program.config.policy_bundles[0].response_buffering,
+             ForwardResponseBufferingMode::Bounded);
+
+    Shard<IoUringEventLoop> shard;
+    struct ShardGuard {
+        Shard<IoUringEventLoop>& shard;
+        bool initialized = false;
+        bool spawned = false;
+        ~ShardGuard() {
+            if (spawned) {
+                shard.stop();
+                shard.join();
+            }
+            if (initialized) {
+                if (shard.loop != nullptr) shard.loop->force_close_all();
+                shard.shutdown();
+            }
+        }
+    } shard_guard{shard};
+    ListenerContext listener_context{};
+    auto listen_result =
+        bind_listener_shard(program.listener, program.listener.port, nullptr, &listener_context);
+    REQUIRE(listen_result.has_value());
+    struct FdGuard {
+        i32 fd = -1;
+        ~FdGuard() {
+            if (fd >= 0) close(fd);
+        }
+    } listen_guard{listen_result.value()};
+    REQUIRE(listener_context.valid());
+    const u16 frontend_port = listener_context.port;
+    REQUIRE_NE(frontend_port, 0u);
+    REQUIRE(shard.init(0, listen_guard.fd).has_value());
+    shard_guard.initialized = true;
+    shard.owns_listen_fd = true;
+    listen_guard.fd = -1;
+    shard.route_config = &program.config;
+    shard.active_config = shard.route_config;
+    REQUIRE(shard.loop != nullptr);
+    shard.loop->listener_context = listener_context;
+    REQUIRE(shard.spawn(-1).has_value());
+    shard_guard.spawned = true;
+
+    struct ClientGuard {
+        i32 fd = -1;
+        ~ClientGuard() {
+            if (fd >= 0) close(fd);
+        }
+    };
+
+    // Just over the old 1 MiB ResponseBodyChain::kMaxBody ceiling, the
+    // repro-2 shape (header + far more than one 16 KiB slice in the first
+    // application write), and up through 64 MiB.
+    static constexpr u64 kSizes[] = {1048577u, 1200000u, 2097152u, 8388608u, 67108864u};
+
+    for (const u64 body_len : kSizes) {
+        origin->teardown();
+        origin = std::make_unique<RecordingUpstream>();
+        std::vector<char> body(body_len);
+        fill_deterministic_pattern(body.data(), body_len);
+        std::string header = "HTTP/1.1 200 OK\r\nContent-Length: " + std::to_string(body_len) +
+                             "\r\nContent-Type: text/plain\r\n\r\n";
+        std::vector<char> wire(header.size() + body.size());
+        memcpy(wire.data(), header.data(), header.size());
+        memcpy(wire.data() + header.size(), body.data(), body.size());
+        origin->response = wire.data();
+        origin->response_len = static_cast<u32>(wire.size());
+        // response_chunk_size stays 0: one application send() call for the
+        // whole wire, the exact "fast origin hands the kernel everything at
+        // once" shape (nginx sendfile; origin4.py's sendall) that exposed
+        // the cancel-race truncation this redesign fixes.
+        REQUIRE(origin->setup(upstream_port));
+
+        ClientGuard client{connect_to(frontend_port)};
+        REQUIRE_GE(client.fd, 0);
+        set_socket_timeouts(client.fd, 20);
+        static constexpr char kRequest[] = "GET / HTTP/1.1\r\nHost: bounded-client.example\r\n\r\n";
+        REQUIRE(send_all(client.fd, kRequest, sizeof(kRequest) - 1u));
+
+        // Sized generously: Rut rewrites the response header (Server/Date/
+        // hide_headers), so the downstream wire is not byte-identical to
+        // (or the same length as) the raw origin wire built above.
+        std::vector<char> got(header.size() + body.size() + 4096);
+        u64 total = 0;
+        u32 header_end = 0;
+        // waited_ms only advances on a genuine recv timeout (n < 0), not on
+        // every successful read — a large body can legitimately arrive in
+        // many small pieces under host load, and bounding iterations by a
+        // small fixed count regardless of whether they're making progress
+        // would cut this off long before completion on a busy host.
+        for (u32 waited_ms = 0;
+             waited_ms < 30000 && !(header_end != 0 && total - header_end >= body_len);) {
+            const i32 n = recv_timeout(
+                client.fd, got.data() + total, static_cast<u32>(got.size() - total), 1000);
+            if (n > 0) {
+                total += static_cast<u32>(n);
+                REQUIRE_LE(total, got.size());
+                for (u32 i = 0; header_end == 0 && i + 3 < total; i++) {
+                    if (got[i] == '\r' && got[i + 1] == '\n' && got[i + 2] == '\r' &&
+                        got[i + 3] == '\n')
+                        header_end = i + 4;
+                }
+            } else if (n == 0) {
+                break;
+            } else {
+                waited_ms += 1000;
+            }
+        }
+        REQUIRE_GT(header_end, 0u);
+        // Rut rewrites the response header (Server/Date/hide_headers), so it
+        // is not byte-identical to the raw origin header built above — only
+        // the body byte count and content are compared.
+        REQUIRE_EQ(total - header_end, body_len);
+        CHECK_EQ(memcmp(got.data() + header_end, body.data(), body_len), 0);
+    }
+
+    // Keep-alive successor: the connection must still accept and correctly
+    // answer a second request after a multi-megabyte direct-recv body —
+    // proving the direct-recv steady state hands off to the ordinary
+    // keep-alive/successor path exactly like the small-body case.
+    {
+        origin->teardown();
+        origin = std::make_unique<RecordingUpstream>();
+        static constexpr u64 kFirstBodyLen = 2097152u;
+        std::vector<char> first_body(kFirstBodyLen);
+        fill_deterministic_pattern(first_body.data(), kFirstBodyLen);
+        std::string first_header =
+            "HTTP/1.1 200 OK\r\nContent-Length: " + std::to_string(kFirstBodyLen) +
+            "\r\nContent-Type: text/plain\r\n\r\n";
+        std::vector<char> first_wire(first_header.size() + first_body.size());
+        memcpy(first_wire.data(), first_header.data(), first_header.size());
+        memcpy(first_wire.data() + first_header.size(), first_body.data(), first_body.size());
+        origin->response = first_wire.data();
+        origin->response_len = static_cast<u32>(first_wire.size());
+        static constexpr char kSecondBody[] = "bounded-keepalive-second";
+        static constexpr char kSecondHeader[] =
+            "HTTP/1.1 200 OK\r\nContent-Length: 24\r\nContent-Type: text/plain\r\n\r\n";
+        static_assert(sizeof(kSecondBody) - 1u == 24u);
+        std::string second_wire = std::string(kSecondHeader) + kSecondBody;
+        origin->response_after_first = second_wire.data();
+        origin->response_after_first_len = static_cast<u32>(second_wire.size());
+        REQUIRE(origin->setup(upstream_port));
+
+        ClientGuard client{connect_to(frontend_port)};
+        REQUIRE_GE(client.fd, 0);
+        set_socket_timeouts(client.fd, 20);
+        static constexpr char kRequest[] = "GET / HTTP/1.1\r\nHost: bounded-client.example\r\n\r\n";
+        REQUIRE(send_all(client.fd, kRequest, sizeof(kRequest) - 1u));
+
+        // Sized generously: Rut rewrites the response header (Server/Date/
+        // hide_headers), so the downstream wire is not byte-identical to
+        // (and not necessarily the same length as) the raw origin wire.
+        std::vector<char> got(first_wire.size() + 4096);
+        u64 total = 0;
+        u32 header_end = 0;
+        // waited_ms only advances on a genuine recv timeout (n < 0) — see
+        // the identical reasoning above.
+        for (u32 waited_ms = 0;
+             waited_ms < 30000 && !(header_end != 0 && total - header_end >= kFirstBodyLen);) {
+            const i32 n = recv_timeout(
+                client.fd, got.data() + total, static_cast<u32>(got.size() - total), 1000);
+            if (n > 0) {
+                total += static_cast<u32>(n);
+                REQUIRE_LE(total, got.size());
+                for (u32 i = 0; header_end == 0 && i + 3 < total; i++) {
+                    if (got[i] == '\r' && got[i + 1] == '\n' && got[i + 2] == '\r' &&
+                        got[i + 3] == '\n')
+                        header_end = i + 4;
+                }
+            } else if (n == 0) {
+                break;
+            } else {
+                waited_ms += 1000;
+            }
+        }
+        REQUIRE_GT(header_end, 0u);
+        REQUIRE_EQ(total - header_end, kFirstBodyLen);
+        CHECK_EQ(memcmp(got.data() + header_end, first_body.data(), kFirstBodyLen), 0);
+
+        REQUIRE(send_all(client.fd, kRequest, sizeof(kRequest) - 1u));
+        char buf[256];
+        u32 length = 0;
+        u32 second_header_end = 0;
+        bool got_full_response = false;
+        for (u32 attempt = 0; attempt < 16 && length < sizeof(buf); attempt++) {
+            const i32 n = recv_timeout(client.fd, buf + length, sizeof(buf) - length, 2000);
+            REQUIRE_GT(n, 0);
+            length += static_cast<u32>(n);
+            for (u32 i = 0; second_header_end == 0 && i + 3 < length; i++) {
+                if (buf[i] == '\r' && buf[i + 1] == '\n' && buf[i + 2] == '\r' &&
+                    buf[i + 3] == '\n')
+                    second_header_end = i + 4;
+            }
+            if (second_header_end != 0 && length == second_header_end + 24u) {
+                got_full_response = true;
+                break;
+            }
+        }
+        REQUIRE(got_full_response);
+        CHECK_EQ(memcmp(buf + second_header_end, kSecondBody, 24u), 0);
+        CHECK_EQ(origin->request_count.load(std::memory_order_acquire), 2u);
+    }
+
+    origin->teardown();
+    shard.stop();
+    shard.join();
+    settle_stopped_iouring_shard(shard);
+    shard_guard.spawned = false;
+    shard.shutdown();
+    shard_guard.initialized = false;
+    program.destroy();
+    program_guard.armed = false;
+}
+
+// Coordinator-requested coverage: a slow downstream client (small SO_RCVBUF,
+// paced reads spanning well over 3x response_read_timeout) on an 8 MiB fast
+// origin body must still complete byte-exact — proving the read-ahead
+// pause/resume rule (pause the direct recv at kBoundedReadAheadBytes unsent,
+// suspend the inactivity timer while paused, resume once a release drains it
+// back below half) never spuriously expires a connection that is genuinely
+// making progress, just slowly. A companion case proves the flip side: an
+// origin that genuinely stops sending mid-body (past the read-ahead window,
+// so the direct recv really is idle, not just paused) still expires at
+// response_read_timeout and flushes exactly what was already released, never
+// hanging forever.
+TEST(route, bounded_slow_client_and_genuine_stall_reaches_production_h1_iouring) {
+    using namespace rut;
+    if (!iouring_socket_live()) SKIP("io_uring async socket ops unavailable in this environment");
+
+    auto origin = std::make_unique<RecordingUpstream>();
+    REQUIRE(origin->setup());
+    const u16 upstream_port = origin->port;
+
+    std::string source_text =
+        "listen :0\nupstream backend at \"127.0.0.1:" + std::to_string(upstream_port) + "\"\n";
+    source_text += R"rut(
+route GET "/" {
+  return forward(backend,
+    request_policy: { version: "HTTP/1.1", host: "upstream", connection: "omit",
+      strip_headers: ["Connection", "Keep-Alive", "TE", "Expect", "Upgrade"] },
+    response_policy: { version: "HTTP/1.1", framing: "content_length",
+      connection: "request", head_mode: "reject", server: "bounded-test",
+      date: "current", hide_headers: ["Date", "Server", "Connection"] },
+    failure_policy: { version: "HTTP/1.1", status: 502, reason: "Origin Failed",
+      content_type: "text/plain", server: "bounded-test", date: "current",
+      connection: "request", head_mode: "reject", body: b"default failure\n" },
+    timeout_failure_policy: { version: "HTTP/1.1", status: 504,
+      reason: "Response Read Deadline", content_type: "text/plain",
+      server: "bounded-test", date: "current", connection: "request",
+      head_mode: "reject", body: b"configured deadline\n" },
+    response_read_timeout: 1s,
+    response_buffering: "bounded")
+}
+)rut";
+
+    struct TempSource {
+        char path[64] = "/tmp/rut_bounded_slow_client_XXXXXX";
+        i32 fd = -1;
+        bool present = false;
+        bool create(Str text) {
+            fd = mkstemp(path);
+            if (fd < 0) return false;
+            present = true;
+            u32 written = 0;
+            while (written < text.len) {
+                const ssize_t n = write(fd, text.ptr + written, text.len - written);
+                if (n < 0 && errno == EINTR) continue;
+                if (n <= 0) return false;
+                written += static_cast<u32>(n);
+            }
+            if (close(fd) != 0) return false;
+            fd = -1;
+            return true;
+        }
+        ~TempSource() {
+            if (fd >= 0) close(fd);
+            if (present) unlink(path);
+        }
+    } source;
+    REQUIRE(source.create({source_text.data(), static_cast<u32>(source_text.size())}));
+
+    LoadedProgram program{};
+    struct ProgramGuard {
+        LoadedProgram& program;
+        bool armed = true;
+        ~ProgramGuard() {
+            if (armed) program.destroy();
+        }
+    } program_guard{program};
+    LoadError load_error{};
+    const bool loaded = load_rut_program(source.path, program, load_error, jit::OptLevel::O0);
+    char load_message[512]{};
+    if (!loaded) format_load_error(load_error, load_message, sizeof(load_message));
+    REQUIRE_MSG(loaded, load_message);
+    REQUIRE(program.jit_inited);
+    REQUIRE(program.has_listener);
+
+    Shard<IoUringEventLoop> shard;
+    struct ShardGuard {
+        Shard<IoUringEventLoop>& shard;
+        bool initialized = false;
+        bool spawned = false;
+        ~ShardGuard() {
+            if (spawned) {
+                shard.stop();
+                shard.join();
+            }
+            if (initialized) {
+                if (shard.loop != nullptr) shard.loop->force_close_all();
+                shard.shutdown();
+            }
+        }
+    } shard_guard{shard};
+    ListenerContext listener_context{};
+    auto listen_result =
+        bind_listener_shard(program.listener, program.listener.port, nullptr, &listener_context);
+    REQUIRE(listen_result.has_value());
+    struct FdGuard {
+        i32 fd = -1;
+        ~FdGuard() {
+            if (fd >= 0) close(fd);
+        }
+    } listen_guard{listen_result.value()};
+    REQUIRE(listener_context.valid());
+    const u16 frontend_port = listener_context.port;
+    REQUIRE_NE(frontend_port, 0u);
+    REQUIRE(shard.init(0, listen_guard.fd).has_value());
+    shard_guard.initialized = true;
+    shard.owns_listen_fd = true;
+    listen_guard.fd = -1;
+    shard.route_config = &program.config;
+    shard.active_config = shard.route_config;
+    REQUIRE(shard.loop != nullptr);
+    shard.loop->listener_context = listener_context;
+    REQUIRE(shard.spawn(-1).has_value());
+    shard_guard.spawned = true;
+
+    struct ClientGuard {
+        i32 fd = -1;
+        ~ClientGuard() {
+            if (fd >= 0) close(fd);
+        }
+    };
+
+    // Case A: slow client on a 4 MiB body. Rather than pacing many small
+    // reads with per-read sleeps (timing-sensitive under host load — see
+    // the coordinator notes on this shared host), the client reads nothing
+    // at all for a single fixed interval well past 3 * response_read_timeout
+    // (1s), then widens its receive window and drains everything as fast as
+    // it can: deterministic wall-clock cost (dominated by the one sleep,
+    // not by scheduling jitter across many small reads) that still
+    // exercises the same property — the read-ahead pause/resume rule, not
+    // the response body size or the origin's speed, is what must keep this
+    // connection from expiring while nothing is being read downstream. Must
+    // be well past both the 512 KiB read-ahead window *and* the kernel's own
+    // autotuned downstream send buffer (mutation-checked: a body just over
+    // 512 KiB, or even 2 MiB, does not reproduce a genuine pause on this
+    // host — bounded_released tracks send() completions, and the kernel
+    // accepts a send into its own local send buffer, autotuned up to a few
+    // MiB, even while the tiny client SO_RCVBUF below prevents the bytes
+    // from actually reaching the wire, so "released" keeps pace with
+    // "received" and the read-ahead threshold is never crossed for a small
+    // body — disabling the resume branch below has no effect on such a run,
+    // since it never pauses to begin with; 4 MiB reliably exceeds the local
+    // send buffer and does trigger a genuine pause).
+    {
+        origin->teardown();
+        origin = std::make_unique<RecordingUpstream>();
+        static constexpr u64 kBodyLen = 4194304u;
+        std::vector<char> body(kBodyLen);
+        fill_deterministic_pattern(body.data(), kBodyLen);
+        std::string header = "HTTP/1.1 200 OK\r\nContent-Length: " + std::to_string(kBodyLen) +
+                             "\r\nContent-Type: text/plain\r\n\r\n";
+        std::vector<char> wire(header.size() + body.size());
+        memcpy(wire.data(), header.data(), header.size());
+        memcpy(wire.data() + header.size(), body.data(), body.size());
+        origin->response = wire.data();
+        origin->response_len = static_cast<u32>(wire.size());
+        REQUIRE(origin->setup(upstream_port));
+
+        ClientGuard client{connect_to(frontend_port)};
+        REQUIRE_GE(client.fd, 0);
+        set_socket_timeouts(client.fd, 30);
+        i32 tiny_rcvbuf = 8192;
+        setsockopt(client.fd, SOL_SOCKET, SO_RCVBUF, &tiny_rcvbuf, sizeof(tiny_rcvbuf));
+        static constexpr char kRequest[] = "GET / HTTP/1.1\r\nHost: bounded-client.example\r\n\r\n";
+        REQUIRE(send_all(client.fd, kRequest, sizeof(kRequest) - 1u));
+
+        // response_read_timeout is 1s; stay idle for well over 3x that
+        // (deterministic, not timing-sensitive) before reading anything at
+        // all. A resume bug that instead let the timer keep ticking during
+        // the read-ahead pause would expire (and truncate) the connection
+        // during this window.
+        usleep(3'500'000);
+
+        // Widen the receive window before draining: the tiny SO_RCVBUF was
+        // only needed to force the origin recv to genuinely pause during
+        // the idle window above, not to keep throttling the drain that
+        // follows (a real slow client's read pace is what matters, not an
+        // artificially tiny window it never actually needed once it starts
+        // reading).
+        tiny_rcvbuf = 1 << 20;
+        setsockopt(client.fd, SOL_SOCKET, SO_RCVBUF, &tiny_rcvbuf, sizeof(tiny_rcvbuf));
+
+        // Sized generously: Rut rewrites the response header, so the
+        // downstream wire is not byte-identical to (or the same length as)
+        // the raw origin wire built above.
+        std::vector<char> got(wire.size() + 4096);
+        u64 total = 0;
+        u32 header_end = 0;
+        for (u32 waited_ms = 0;
+             waited_ms < 10000 && !(header_end != 0 && total - header_end >= kBodyLen);) {
+            const i32 n = recv_timeout(
+                client.fd, got.data() + total, static_cast<u32>(got.size() - total), 500);
+            if (n > 0) {
+                total += static_cast<u32>(n);
+                REQUIRE_LE(total, got.size());
+                for (u32 i = 0; header_end == 0 && i + 3 < total; i++) {
+                    if (got[i] == '\r' && got[i + 1] == '\n' && got[i + 2] == '\r' &&
+                        got[i + 3] == '\n')
+                        header_end = i + 4;
+                }
+            } else if (n == 0) {
+                break;
+            } else {
+                waited_ms += 500;
+            }
+        }
+        REQUIRE_GT(header_end, 0u);
+        REQUIRE_EQ(total - header_end, kBodyLen);
+        CHECK_EQ(memcmp(got.data() + header_end, body.data(), kBodyLen), 0);
+    }
+
+    // Case B: a genuine mid-body stall (well past the 512 KiB read-ahead
+    // window, so the connection is idle, not merely paused) must still
+    // expire at response_read_timeout and flush exactly the released
+    // prefix, then close — never hang, never flush the unreleased tail.
+    {
+        origin->teardown();
+        origin = std::make_unique<RecordingUpstream>();
+        // The origin only ever actually delivers kDeliveredLen bytes (well
+        // past the 512 KiB read-ahead window, so the direct recv genuinely
+        // goes idle rather than staying paused) — response_chunk_size
+        // splits the wire into two fragments and the gate permits only the
+        // first, so the second (the rest of `first`, plus everything the
+        // declared 8388608-byte Content-Length implies beyond it) is never
+        // sent.
+        static constexpr u64 kFirstLen = 600000u;
+        static constexpr u64 kDeliveredLen = 550000u;
+        std::vector<char> first(kFirstLen);
+        fill_deterministic_pattern(first.data(), kFirstLen);
+        std::string header =
+            "HTTP/1.1 200 OK\r\nContent-Length: 8388608\r\nContent-Type: "
+            "text/plain\r\n\r\n";
+        std::vector<char> wire(header.size() + first.size());
+        memcpy(wire.data(), header.data(), header.size());
+        memcpy(wire.data() + header.size(), first.data(), first.size());
+        origin->response = wire.data();
+        origin->response_len = static_cast<u32>(wire.size());
+        origin->response_chunk_size = kDeliveredLen;
+        origin->gate_first_response_fragments = true;
+        origin->allowed_first_response_fragments.store(1, std::memory_order_release);
+        // Only fragment 0 (the first kDeliveredLen bytes) is ever permitted:
+        // the origin thread blocks forever inside its gate loop waiting for
+        // fragment 1 (until RecordingUpstream::teardown() flips `running`),
+        // reproducing a real stalled origin — no more bytes ever arrive
+        // after the first kDeliveredLen.
+        REQUIRE(origin->setup(upstream_port));
+
+        ClientGuard client{connect_to(frontend_port)};
+        REQUIRE_GE(client.fd, 0);
+        set_socket_timeouts(client.fd, 10);
+        static constexpr char kRequest[] = "GET / HTTP/1.1\r\nHost: bounded-client.example\r\n\r\n";
+        REQUIRE(send_all(client.fd, kRequest, sizeof(kRequest) - 1u));
+
+        // Sized generously: Rut rewrites the response header, so the
+        // downstream wire is not byte-identical to (or the same length as)
+        // the raw origin wire built above.
+        std::vector<char> got(wire.size() + 4096);
+        u64 total = 0;
+        bool closed = false;
+        for (u32 waited_ms = 0; waited_ms < 6000 && !closed;) {
+            const i32 n = recv_timeout(
+                client.fd, got.data() + total, static_cast<u32>(got.size() - total), 100);
+            if (n > 0) {
+                total += static_cast<u32>(n);
+                REQUIRE_LE(total, got.size());
+            } else if (n == 0) {
+                closed = true;
+            } else {
+                waited_ms += 100;
+            }
+        }
+        CHECK(closed);
+        u32 header_end = 0;
+        for (u32 i = 0; i + 3 < total; i++) {
+            if (got[i] == '\r' && got[i + 1] == '\n' && got[i + 2] == '\r' && got[i + 3] == '\n') {
+                header_end = i + 4;
+                break;
+            }
+        }
+        REQUIRE_GT(header_end, 0u);
+        // bounded_response_release_bytes(header, received, complete=false)
+        // operates on the raw *origin* header length and the raw body bytes
+        // actually received (kDeliveredLen - header), not Rut's rewritten
+        // downstream header: whole 4096-byte units of (raw header + raw
+        // body received) minus the raw header.
+        const u64 total_raw = kDeliveredLen;
+        const u64 released_total = (total_raw / 4096ull) * 4096ull;
+        const u64 want_body = released_total <= header.size() ? 0u : released_total - header.size();
+        CHECK_EQ(total - header_end, want_body);
+        CHECK_EQ(memcmp(got.data() + header_end, first.data(), want_body), 0);
+    }
+
+    origin->teardown();
+    shard.stop();
+    shard.join();
+    settle_stopped_iouring_shard(shard);
+    shard_guard.spawned = false;
+    shard.shutdown();
+    shard_guard.initialized = false;
+    program.destroy();
+    program_guard.armed = false;
+}
+
+// Same n=100000 release boundary as the plaintext test above, but downstream
+// is real io_uring TLS instead of raw TCP: Bounded's early-release Sends go
+// through the TlsEngine encrypt path exactly like every other downstream
+// write, so this is the one place that gets exercised end to end.
+TEST(route,
+     bounded_release_matches_measured_nginx_boundary_over_tls_reaches_production_h1_iouring) {
+    using namespace rut;
+    if (!iouring_socket_live()) SKIP("io_uring async socket ops unavailable in this environment");
+
+    auto origin = std::make_unique<RecordingUpstream>();
+    REQUIRE(origin->setup());
+    const u16 upstream_port = origin->port;
+
+    std::string source_text =
+        "listen :0\nupstream backend at \"127.0.0.1:" + std::to_string(upstream_port) + "\"\n";
+    source_text += R"rut(
+route GET "/" {
+  return forward(backend,
+    request_policy: { version: "HTTP/1.1", host: "upstream", connection: "omit",
+      strip_headers: ["Connection", "Keep-Alive", "TE", "Expect", "Upgrade"] },
+    response_policy: { version: "HTTP/1.1", framing: "content_length",
+      connection: "request", head_mode: "reject", server: "bounded-test",
+      date: "current", hide_headers: ["Date", "Server", "Connection"] },
+    failure_policy: { version: "HTTP/1.1", status: 502, reason: "Origin Failed",
+      content_type: "text/plain", server: "bounded-test", date: "current",
+      connection: "request", head_mode: "reject", body: b"default failure\n" },
+    timeout_failure_policy: { version: "HTTP/1.1", status: 504,
+      reason: "Response Read Deadline", content_type: "text/plain",
+      server: "bounded-test", date: "current", connection: "request",
+      head_mode: "reject", body: b"configured deadline\n" },
+    response_read_timeout: 1s,
+    response_buffering: "bounded")
+}
+)rut";
+
+    struct TempSource {
+        char path[64] = "/tmp/rut_bounded_release_tls_wire_XXXXXX";
+        i32 fd = -1;
+        bool present = false;
+        bool create(Str text) {
+            fd = mkstemp(path);
+            if (fd < 0) return false;
+            present = true;
+            u32 written = 0;
+            while (written < text.len) {
+                const ssize_t n = write(fd, text.ptr + written, text.len - written);
+                if (n < 0 && errno == EINTR) continue;
+                if (n <= 0) return false;
+                written += static_cast<u32>(n);
+            }
+            if (close(fd) != 0) return false;
+            fd = -1;
+            return true;
+        }
+        ~TempSource() {
+            if (fd >= 0) close(fd);
+            if (present) unlink(path);
+        }
+    } source;
+    REQUIRE(source.create({source_text.data(), static_cast<u32>(source_text.size())}));
+
+    LoadedProgram program{};
+    struct ProgramGuard {
+        LoadedProgram& program;
+        bool armed = true;
+        ~ProgramGuard() {
+            if (armed) program.destroy();
+        }
+    } program_guard{program};
+    LoadError load_error{};
+    const bool loaded = load_rut_program(source.path, program, load_error, jit::OptLevel::O0);
+    char load_message[512]{};
+    if (!loaded) format_load_error(load_error, load_message, sizeof(load_message));
+    REQUIRE_MSG(loaded, load_message);
+    REQUIRE(program.jit_inited);
+    REQUIRE(program.has_listener);
+    REQUIRE_EQ(program.config.policy_bundle_count, 1u);
+    CHECK_EQ(program.config.policy_bundles[0].response_buffering,
+             ForwardResponseBufferingMode::Bounded);
+
+    auto tls_ctx = create_tls_server_context(kTestCertPath, kTestKeyPath);
+    REQUIRE(tls_ctx.has_value());
+
+    Shard<IoUringEventLoop> shard;
+    struct ShardGuard {
+        Shard<IoUringEventLoop>& shard;
+        bool initialized = false;
+        bool spawned = false;
+        ~ShardGuard() {
+            if (spawned) {
+                shard.stop();
+                shard.join();
+            }
+            if (initialized) {
+                if (shard.loop != nullptr) shard.loop->force_close_all();
+                shard.shutdown();
+            }
+        }
+    } shard_guard{shard};
+    ListenerContext listener_context{};
+    auto listen_result =
+        bind_listener_shard(program.listener, program.listener.port, nullptr, &listener_context);
+    REQUIRE(listen_result.has_value());
+    struct FdGuard {
+        i32 fd = -1;
+        ~FdGuard() {
+            if (fd >= 0) close(fd);
+        }
+    } listen_guard{listen_result.value()};
+    REQUIRE(listener_context.valid());
+    const u16 frontend_port = listener_context.port;
+    REQUIRE_NE(frontend_port, 0u);
+    REQUIRE(shard.init(0, listen_guard.fd).has_value());
+    shard_guard.initialized = true;
+    shard.owns_listen_fd = true;
+    listen_guard.fd = -1;
+    shard.route_config = &program.config;
+    shard.active_config = shard.route_config;
+    REQUIRE(shard.loop != nullptr);
+    shard.loop->listener_context = listener_context;
+    shard.loop->tls_server = tls_ctx.value();
+    REQUIRE(shard.spawn(-1).has_value());
+    shard_guard.spawned = true;
+
+    static constexpr char kHeaderFmt[] =
+        "HTTP/1.1 200 OK\r\nContent-Length: 1048576\r\nContent-Type: text/plain\r\n\r\n";
+    static_assert(sizeof(kHeaderFmt) - 1u == 70u);
+    static constexpr u32 kN = 100000;
+    static constexpr u32 kWantBody = 98234;
+    std::string body(kN, 'x');
+    std::string wire = std::string(kHeaderFmt) + body;
+    // Matches the plaintext test's own pattern: the initial setup() (used only
+    // to obtain upstream_port before the .rut source could be built) must be
+    // torn down and replaced with a fresh instance before reconfiguring and
+    // rebinding to that same port, or the still-running original accept
+    // thread can race the new one and answer the real request with nothing
+    // (observed as a spurious 504/timeout_failure_policy response).
+    origin->teardown();
+    origin = std::make_unique<RecordingUpstream>();
+    origin->gate_first_response_close = true;
+    origin->response = wire.data();
+    origin->response_len = static_cast<u32>(wire.size());
+    REQUIRE(origin->setup(upstream_port));
+
+    SSL_CTX* client_ctx = create_test_client_ctx();
+    REQUIRE(client_ctx != nullptr);
+    i32 client_fd = connect_to(frontend_port);
+    REQUIRE_GE(client_fd, 0);
+    set_socket_timeouts(client_fd, 5);
+    SSL* ssl = SSL_new(client_ctx);
+    REQUIRE(ssl != nullptr);
+    REQUIRE(SSL_set_fd(ssl, client_fd) == 1);
+    REQUIRE(SSL_connect(ssl) == 1);
+
+    static constexpr char kRequest[] = "GET / HTTP/1.1\r\nHost: bounded-client.example\r\n\r\n";
+    REQUIRE(ssl_write_all(ssl, kRequest, sizeof(kRequest) - 1u));
+
+    std::vector<char> buf(200000);
+    u32 total = 0;
+    for (u32 attempt = 0; attempt < 400 && total < buf.size(); attempt++) {
+        const i32 n = SSL_read(ssl, buf.data() + total, static_cast<i32>(buf.size() - total));
+        if (n <= 0) break;
+        total += static_cast<u32>(n);
+    }
+    u32 header_end = 0;
+    for (u32 i = 0; i + 3 < total; i++) {
+        if (buf[i] == '\r' && buf[i + 1] == '\n' && buf[i + 2] == '\r' && buf[i + 3] == '\n') {
+            header_end = i + 4;
+            break;
+        }
+    }
+    REQUIRE_GT(header_end, 0u);
+    CHECK_EQ(total - header_end, kWantBody);
+    origin->allow_first_response_close.store(true, std::memory_order_release);
+
+    SSL_shutdown(ssl);
+    SSL_free(ssl);
+    close(client_fd);
+    SSL_CTX_free(client_ctx);
+    origin->teardown();
+
+    shard.stop();
+    shard.join();
+    settle_stopped_iouring_shard(shard);
+    shard_guard.spawned = false;
+    shard.shutdown();
+    shard_guard.initialized = false;
+    program.destroy();
+    program_guard.armed = false;
+    destroy_tls_server_context(tls_ctx.value());
+}
+#endif
+
+#if RUT_ENABLE_JIT_TESTS
 TEST(route, public_paired_head_source_success_and_forward_wire) {
     using namespace rut;
     static constexpr char kUpstreamResponse[] =

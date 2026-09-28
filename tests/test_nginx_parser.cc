@@ -9768,7 +9768,7 @@ TEST(nginx_converter, emitted_exact_redirect_reaches_owned_runtime_config) {
         CHECK_EQ(get.control.else_term.forward_timeout_failure_policy_id, 3u);
         CHECK_EQ(get.control.else_term.forward_response_read_timeout_seconds, 60u);
         CHECK(get.control.else_term.forward_response_buffering ==
-              ForwardResponseBufferingMode::CompleteContentLength);
+              ForwardResponseBufferingMode::Bounded);
 
         auto mir = build_mir(*hir_owned);
         REQUIRE(mir);
@@ -9793,8 +9793,7 @@ TEST(nginx_converter, emitted_exact_redirect_reaches_owned_runtime_config) {
                 CHECK_EQ(term.forward_failure_policy_id, 2u);
                 CHECK_EQ(term.forward_timeout_failure_policy_id, 3u);
                 CHECK_EQ(term.forward_response_read_timeout_seconds, 60u);
-                CHECK(term.forward_response_buffering ==
-                      ForwardResponseBufferingMode::CompleteContentLength);
+                CHECK(term.forward_response_buffering == ForwardResponseBufferingMode::Bounded);
             }
         }
         CHECK(mir_redirect);
@@ -9821,7 +9820,7 @@ TEST(nginx_converter, emitted_exact_redirect_reaches_owned_runtime_config) {
         CHECK_EQ(get_bundle.failure_policy_id, 2u);
         CHECK_EQ(get_bundle.timeout_failure_policy_id, 3u);
         CHECK_EQ(get_bundle.response_read_timeout_seconds, 60u);
-        CHECK(get_bundle.response_buffering == ForwardResponseBufferingMode::CompleteContentLength);
+        CHECK(get_bundle.response_buffering == ForwardResponseBufferingMode::Bounded);
         REQUIRE_EQ(rir.module.func_count, 3u);
         const auto& function = rir.module.functions[1];
         CHECK_EQ(function.http_method, kRouteMethodGet);
@@ -9962,7 +9961,7 @@ TEST(nginx_converter, emitted_exact_redirect_reaches_owned_runtime_config) {
     CHECK_EQ(get_bundle.failure_policy_id, 2u);
     CHECK_EQ(get_bundle.timeout_failure_policy_id, 3u);
     CHECK_EQ(get_bundle.response_read_timeout_seconds, 60u);
-    CHECK(get_bundle.response_buffering == ForwardResponseBufferingMode::CompleteContentLength);
+    CHECK(get_bundle.response_buffering == ForwardResponseBufferingMode::Bounded);
     const auto& any_bundle = populated->policy_bundles[2];
     CHECK_EQ(any_bundle.response_policy_id, 2u);
     CHECK_EQ(any_bundle.failure_policy_id, 2u);
@@ -10085,7 +10084,7 @@ TEST(nginx_converter, emitted_exact_302_redirect_reaches_owned_runtime_config) {
         CHECK_EQ(get.control.else_term.forward_timeout_failure_policy_id, 3u);
         CHECK_EQ(get.control.else_term.forward_response_read_timeout_seconds, 60u);
         CHECK(get.control.else_term.forward_response_buffering ==
-              ForwardResponseBufferingMode::CompleteContentLength);
+              ForwardResponseBufferingMode::Bounded);
 
         const auto mir = build_mir(*hir_owned);
         REQUIRE(mir);
@@ -10115,8 +10114,7 @@ TEST(nginx_converter, emitted_exact_302_redirect_reaches_owned_runtime_config) {
                 CHECK_EQ(term.forward_failure_policy_id, 2u);
                 CHECK_EQ(term.forward_timeout_failure_policy_id, 3u);
                 CHECK_EQ(term.forward_response_read_timeout_seconds, 60u);
-                CHECK(term.forward_response_buffering ==
-                      ForwardResponseBufferingMode::CompleteContentLength);
+                CHECK(term.forward_response_buffering == ForwardResponseBufferingMode::Bounded);
             }
         }
         CHECK(saw_redirect);
@@ -10149,7 +10147,7 @@ TEST(nginx_converter, emitted_exact_302_redirect_reaches_owned_runtime_config) {
         CHECK_EQ(get_bundle.failure_policy_id, 2u);
         CHECK_EQ(get_bundle.timeout_failure_policy_id, 3u);
         CHECK_EQ(get_bundle.response_read_timeout_seconds, 60u);
-        CHECK(get_bundle.response_buffering == ForwardResponseBufferingMode::CompleteContentLength);
+        CHECK(get_bundle.response_buffering == ForwardResponseBufferingMode::Bounded);
         REQUIRE_EQ(rir.module.func_count, 3u);
         const auto& function = rir.module.functions[1];
         CHECK_EQ(function.http_method, kRouteMethodGet);
@@ -10200,8 +10198,7 @@ TEST(nginx_converter, emitted_exact_302_redirect_reaches_owned_runtime_config) {
     CHECK_EQ(owned_get_bundle.failure_policy_id, 2u);
     CHECK_EQ(owned_get_bundle.timeout_failure_policy_id, 3u);
     CHECK_EQ(owned_get_bundle.response_read_timeout_seconds, 60u);
-    CHECK(owned_get_bundle.response_buffering ==
-          ForwardResponseBufferingMode::CompleteContentLength);
+    CHECK(owned_get_bundle.response_buffering == ForwardResponseBufferingMode::Bounded);
     CHECK_EQ(populated->route_count, 0u);
 }
 
@@ -10250,9 +10247,8 @@ TEST(nginx_converter, emitted_source_reaches_rir_with_source_metadata) {
         CHECK_EQ(forward.has_forward_timeout_failure_policy, i == 1);
         CHECK_EQ(forward.forward_response_read_timeout_seconds, i == 1 ? 60u : 0u);
         CHECK_EQ(forward.has_forward_response_read_timeout, i == 1);
-        CHECK(forward.forward_response_buffering ==
-              (i == 1 ? ForwardResponseBufferingMode::CompleteContentLength
-                      : ForwardResponseBufferingMode::None));
+        CHECK(forward.forward_response_buffering == (i == 1 ? ForwardResponseBufferingMode::Bounded
+                                                            : ForwardResponseBufferingMode::None));
         CHECK_EQ(forward.has_forward_response_buffering, i == 1);
     }
     REQUIRE_EQ(ast_owned->strict_local_response_policies.len, 4u);
@@ -10347,7 +10343,7 @@ TEST(nginx_converter, emitted_source_reaches_rir_with_source_metadata) {
     CHECK_EQ(hir_owned->routes[1].control.direct_term.forward_timeout_failure_policy_id, 3u);
     CHECK_EQ(hir_owned->routes[1].control.direct_term.forward_response_read_timeout_seconds, 60u);
     CHECK(hir_owned->routes[1].control.direct_term.forward_response_buffering ==
-          ForwardResponseBufferingMode::CompleteContentLength);
+          ForwardResponseBufferingMode::Bounded);
     CHECK_EQ(hir_owned->routes[0].control.direct_term.forward_timeout_failure_policy_id, 0u);
     CHECK_EQ(hir_owned->routes[2].control.direct_term.forward_timeout_failure_policy_id, 0u);
     CHECK_EQ(hir_owned->routes[0].control.direct_term.forward_response_read_timeout_seconds, 0u);
@@ -10390,9 +10386,8 @@ TEST(nginx_converter, emitted_source_reaches_rir_with_source_metadata) {
         CHECK_EQ(term.forward_failure_policy_id, fi == 0 ? 1u : 2u);
         CHECK_EQ(term.forward_timeout_failure_policy_id, fi == 1 ? 3u : 0u);
         CHECK_EQ(term.forward_response_read_timeout_seconds, fi == 1 ? 60u : 0u);
-        CHECK(term.forward_response_buffering ==
-              (fi == 1 ? ForwardResponseBufferingMode::CompleteContentLength
-                       : ForwardResponseBufferingMode::None));
+        CHECK(term.forward_response_buffering == (fi == 1 ? ForwardResponseBufferingMode::Bounded
+                                                          : ForwardResponseBufferingMode::None));
     }
 
     FrontendRirModule rir{};
@@ -10485,8 +10480,7 @@ TEST(nginx_converter, emitted_source_reaches_rir_with_source_metadata) {
     CHECK_EQ(rir.module.policy_bundles[2].failure_policy_id, 2u);
     CHECK_EQ(rir.module.policy_bundles[1].timeout_failure_policy_id, 3u);
     CHECK_EQ(rir.module.policy_bundles[1].response_read_timeout_seconds, 60u);
-    CHECK(rir.module.policy_bundles[1].response_buffering ==
-          ForwardResponseBufferingMode::CompleteContentLength);
+    CHECK(rir.module.policy_bundles[1].response_buffering == ForwardResponseBufferingMode::Bounded);
 
     REQUIRE_EQ(rir.module.func_count, 3u);
     for (u32 fi = 0; fi < rir.module.func_count; fi++) {
@@ -10556,8 +10550,7 @@ TEST(nginx_converter, emitted_source_reaches_rir_with_source_metadata) {
     CHECK_EQ(populated.policy_bundles[2].failure_policy_id, 2u);
     CHECK_EQ(populated.policy_bundles[1].timeout_failure_policy_id, 3u);
     CHECK_EQ(populated.policy_bundles[1].response_read_timeout_seconds, 60u);
-    CHECK(populated.policy_bundles[1].response_buffering ==
-          ForwardResponseBufferingMode::CompleteContentLength);
+    CHECK(populated.policy_bundles[1].response_buffering == ForwardResponseBufferingMode::Bounded);
 }
 
 TEST(nginx_converter, root_pre_route_trace_policy_remains_owned_after_frontend_lifetimes) {
@@ -11317,10 +11310,8 @@ TEST(nginx_converter_issue252,
         CHECK_EQ(id1.forward_timeout_failure_policy_id, id3.forward_timeout_failure_policy_id);
         CHECK_EQ(id1.forward_response_read_timeout_seconds,
                  id3.forward_response_read_timeout_seconds);
-        CHECK_EQ(id1.forward_response_buffering,
-                 ForwardResponseBufferingMode::CompleteContentLength);
-        CHECK_EQ(id3.forward_response_buffering,
-                 ForwardResponseBufferingMode::CompleteContentLength);
+        CHECK_EQ(id1.forward_response_buffering, ForwardResponseBufferingMode::Bounded);
+        CHECK_EQ(id3.forward_response_buffering, ForwardResponseBufferingMode::Bounded);
 
         auto mir = build_mir(*hir_owned);
         REQUIRE(mir);
@@ -11342,9 +11333,9 @@ TEST(nginx_converter_issue252,
         CHECK_EQ(get_mir->blocks[2].term.forward_request_policy_id,
                  static_cast<u16>(RequestPolicyId::Http11FixedTrimSpPreserveHtab));
         CHECK_EQ(get_mir->blocks[1].term.forward_response_buffering,
-                 ForwardResponseBufferingMode::CompleteContentLength);
+                 ForwardResponseBufferingMode::Bounded);
         CHECK_EQ(get_mir->blocks[2].term.forward_response_buffering,
-                 ForwardResponseBufferingMode::CompleteContentLength);
+                 ForwardResponseBufferingMode::Bounded);
 
         FrontendRirModule rir{};
         RirGuard rir_guard{rir};
@@ -11380,7 +11371,7 @@ TEST(nginx_converter_issue252,
         REQUIRE_LE(static_cast<u32>(branch_bundle[0]), rir.module.policy_bundle_count);
         const auto& bundle = rir.module.policy_bundles[branch_bundle[0] - 1];
         CHECK_EQ(bundle.response_read_timeout_seconds, 60u);
-        CHECK_EQ(bundle.response_buffering, ForwardResponseBufferingMode::CompleteContentLength);
+        CHECK_EQ(bundle.response_buffering, ForwardResponseBufferingMode::Bounded);
 
         auto populated = std::make_unique<RouteConfig>();
         REQUIRE(populate_route_config(*populated, rir.module));
@@ -11388,8 +11379,7 @@ TEST(nginx_converter_issue252,
         REQUIRE_LE(static_cast<u32>(branch_bundle[0]), populated->policy_bundle_count);
         const auto& populated_bundle = populated->policy_bundles[branch_bundle[0] - 1u];
         CHECK_EQ(populated_bundle.response_read_timeout_seconds, 60u);
-        CHECK_EQ(populated_bundle.response_buffering,
-                 ForwardResponseBufferingMode::CompleteContentLength);
+        CHECK_EQ(populated_bundle.response_buffering, ForwardResponseBufferingMode::Bounded);
         memset(nginx_source, 'x', source_len);
         memset(lowered.value().data, 'y', lowered.value().len);
         CHECK(populated->strict_local_response_table_is_valid());
@@ -21400,7 +21390,7 @@ TEST(nginx_converter_issue270, explicit_root_timeout_is_emitted_on_all_proxy_for
         REQUIRE_EQ(config.policy_bundle_count, 3u);
         const u8 methods[] = {kRouteMethodHead, kRouteMethodGet, kRouteMethodAny};
         const auto expected_buffering = {ForwardResponseBufferingMode::None,
-                                         ForwardResponseBufferingMode::CompleteContentLength,
+                                         ForwardResponseBufferingMode::Bounded,
                                          ForwardResponseBufferingMode::None};
         u32 i = 0;
         for (const auto buffering : expected_buffering) {
@@ -21613,7 +21603,7 @@ TEST(nginx_converter_issue270, custom_hide_header_and_timeout_lower_together) {
             const auto& bundle = config.policy_bundles[bundle_id - 1];
             CHECK_EQ(bundle.response_read_timeout_seconds, seconds);
             CHECK_EQ(bundle.response_buffering,
-                     buffered ? ForwardResponseBufferingMode::CompleteContentLength
+                     buffered ? ForwardResponseBufferingMode::Bounded
                               : ForwardResponseBufferingMode::None);
             REQUIRE(config.response_policy_id_is_valid(bundle.response_policy_id));
             REQUIRE(config.failure_policy_id_is_valid(bundle.failure_policy_id));
@@ -21696,7 +21686,7 @@ TEST(nginx_converter_issue270, custom_hide_header_and_timeout_lower_together) {
         for (u32 bundle_id = 0u; bundle_id < config.policy_bundle_count; bundle_id++) {
             CHECK_EQ(config.policy_bundles[bundle_id].response_read_timeout_seconds, seconds);
             if (config.policy_bundles[bundle_id].response_buffering ==
-                ForwardResponseBufferingMode::CompleteContentLength)
+                ForwardResponseBufferingMode::Bounded)
                 ++complete_content_length;
             if (config.policy_bundles[bundle_id].response_buffering ==
                 ForwardResponseBufferingMode::None)

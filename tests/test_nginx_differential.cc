@@ -49227,7 +49227,7 @@ static bool validate_exact_loopback_conditional_get_structure(const std::string&
                                      statement.forward_response_read_timeout_seconds == 60u &&
                                      statement.has_forward_response_buffering &&
                                      statement.forward_response_buffering ==
-                                         rut::ForwardResponseBufferingMode::CompleteContentLength));
+                                         rut::ForwardResponseBufferingMode::Bounded));
     };
     if (!direct_id1(head, false) || !direct_id1(any, false) || get.kind != rut::AstStmtKind::If ||
         get.then_stmt == nullptr || get.else_stmt == nullptr || !direct_id1(*get.then_stmt, true) ||
@@ -49239,8 +49239,7 @@ static bool validate_exact_loopback_conditional_get_structure(const std::string&
         !get.else_stmt->has_forward_response_read_timeout ||
         get.else_stmt->forward_response_read_timeout_seconds != 60u ||
         !get.else_stmt->has_forward_response_buffering ||
-        get.else_stmt->forward_response_buffering !=
-            rut::ForwardResponseBufferingMode::CompleteContentLength) {
+        get.else_stmt->forward_response_buffering != rut::ForwardResponseBufferingMode::Bounded) {
         error = std::string(issue) +
                 " exact root AST did not contain HEAD/Any ID1 and GET then-ID1/else-ID3";
         return false;
@@ -49291,10 +49290,9 @@ static bool validate_exact_loopback_conditional_get_structure(const std::string&
                    (!require_timeout ||
                     (term.forward_timeout_failure_policy_id != 0u &&
                      term.forward_timeout_failure_policy_id <= ast->failure_policies.len)) &&
-                   (!require_timeout ||
-                    (term.forward_response_read_timeout_seconds == 60u &&
-                     term.forward_response_buffering ==
-                         rut::ForwardResponseBufferingMode::CompleteContentLength)) &&
+                   (!require_timeout || (term.forward_response_read_timeout_seconds == 60u &&
+                                         term.forward_response_buffering ==
+                                             rut::ForwardResponseBufferingMode::Bounded)) &&
                    (!require_timeout ||
                     rut::complete_content_length_buffering_policies_valid(
                         ast->response_policies[term.forward_response_policy_id - 1u],
@@ -54663,7 +54661,7 @@ static bool validate_custom_hide_timeout_loaded_program(
                                   rg,
                                   static_cast<u16>(rut::RequestPolicyId::Http11FixedStrip),
                                   static_cast<u16>(rut::ResponsePolicyHeadMode::Reject),
-                                  rut::ForwardResponseBufferingMode::CompleteContentLength);
+                                  rut::ForwardResponseBufferingMode::Bounded);
     const bool any_ok = predicate(*any,
                                   ra,
                                   static_cast<u16>(rut::RequestPolicyId::Http11FixedStrip),
@@ -54801,7 +54799,7 @@ static bool validate_custom_hide_timeout_loaded_program(
                        mutated_get,
                        static_cast<u16>(rut::RequestPolicyId::Http11FixedStrip),
                        static_cast<u16>(rut::ResponsePolicyHeadMode::Reject),
-                       rut::ForwardResponseBufferingMode::CompleteContentLength);
+                       rut::ForwardResponseBufferingMode::Bounded);
         const bool mutant_kept_route_result =
             mutated_get.action == rg.action && mutated_get.status_code == rg.status_code &&
             mutated_get.upstream_id == rg.upstream_id && mutated_get.next_state == rg.next_state;
@@ -54813,7 +54811,7 @@ static bool validate_custom_hide_timeout_loaded_program(
                       restored_get,
                       static_cast<u16>(rut::RequestPolicyId::Http11FixedStrip),
                       static_cast<u16>(rut::ResponsePolicyHeadMode::Reject),
-                      rut::ForwardResponseBufferingMode::CompleteContentLength);
+                      rut::ForwardResponseBufferingMode::Bounded);
         if (!mutant_rejected || !mutant_kept_route_result || !restored_positive ||
             original_timeout != expected_timeout_seconds) {
             error = "#627 loaded 2s selected GET bundle timeout mutant was not rejected";
@@ -59437,8 +59435,7 @@ static bool validate_explicit_timeout_head_generated_source(const std::string& s
             !forward.has_forward_response_read_timeout ||
             forward.forward_response_read_timeout_seconds != 1u ||
             !forward.has_forward_response_buffering ||
-            forward.forward_response_buffering !=
-                rut::ForwardResponseBufferingMode::CompleteContentLength) {
+            forward.forward_response_buffering != rut::ForwardResponseBufferingMode::Bounded) {
             error = "#270 exact GET AST lost its ID1/direct-forward timeout bundle";
             return false;
         }
@@ -59709,8 +59706,7 @@ static bool validate_explicit_timeout_get_generated_provenance(const std::string
         !ast_forward.has_forward_response_read_timeout ||
         ast_forward.forward_response_read_timeout_seconds != 1u ||
         !ast_forward.has_forward_response_buffering ||
-        ast_forward.forward_response_buffering !=
-            rut::ForwardResponseBufferingMode::CompleteContentLength) {
+        ast_forward.forward_response_buffering != rut::ForwardResponseBufferingMode::Bounded) {
         error = "#271 inactivity exact GET AST lost ID1/1s/complete-buffering custody";
         return false;
     }
@@ -59737,7 +59733,7 @@ static bool validate_explicit_timeout_get_generated_provenance(const std::string
             static_cast<u16>(rut::RequestPolicyId::Http11FixedStrip) ||
         hir_get->control.direct_term.forward_response_read_timeout_seconds != 1u ||
         hir_get->control.direct_term.forward_response_buffering !=
-            rut::ForwardResponseBufferingMode::CompleteContentLength ||
+            rut::ForwardResponseBufferingMode::Bounded ||
         hir_get->control.direct_term.forward_response_policy_id == 0u ||
         hir_get->control.direct_term.forward_failure_policy_id == 0u ||
         hir_get->control.direct_term.forward_timeout_failure_policy_id == 0u) {
@@ -59767,7 +59763,7 @@ static bool validate_explicit_timeout_get_generated_provenance(const std::string
             static_cast<u16>(rut::RequestPolicyId::Http11FixedStrip) ||
         mir_get->blocks[0].term.forward_response_read_timeout_seconds != 1u ||
         mir_get->blocks[0].term.forward_response_buffering !=
-            rut::ForwardResponseBufferingMode::CompleteContentLength ||
+            rut::ForwardResponseBufferingMode::Bounded ||
         mir_get->blocks[0].term.forward_response_policy_id == 0u ||
         mir_get->blocks[0].term.forward_failure_policy_id == 0u ||
         mir_get->blocks[0].term.forward_timeout_failure_policy_id == 0u) {
@@ -59815,7 +59811,7 @@ static bool validate_explicit_timeout_get_generated_provenance(const std::string
     const auto& rir_bundle =
         rir.value.module.policy_bundles[rir_get->preflight_forward_policy_bundle_id - 1u];
     if (rir_bundle.response_read_timeout_seconds != 1u ||
-        rir_bundle.response_buffering != rut::ForwardResponseBufferingMode::CompleteContentLength ||
+        rir_bundle.response_buffering != rut::ForwardResponseBufferingMode::Bounded ||
         rir_bundle.response_policy_id == 0u || rir_bundle.failure_policy_id == 0u ||
         rir_bundle.timeout_failure_policy_id == 0u ||
         rir_bundle.response_policy_id > rir.value.module.response_policy_count ||
@@ -59869,7 +59865,7 @@ static bool validate_explicit_timeout_get_generated_provenance(const std::string
         cfg->policy_bundles[cfg_get->preflight_forward_policy_bundle_id - 1u]
                 .response_read_timeout_seconds != 1u ||
         cfg->policy_bundles[cfg_get->preflight_forward_policy_bundle_id - 1u].response_buffering !=
-            rut::ForwardResponseBufferingMode::CompleteContentLength) {
+            rut::ForwardResponseBufferingMode::Bounded) {
         error = "#271 inactivity generated O2 config lost exact GET endpoint/bundle custody";
         return false;
     }
