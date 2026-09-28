@@ -1,0 +1,75 @@
+diff --git a/include/rut/runtime/io_uring_backend.h b/include/rut/runtime/io_uring_backend.h
+index 7bfc2c99..7130e1d2 100644
+--- a/include/rut/runtime/io_uring_backend.h
++++ b/include/rut/runtime/io_uring_backend.h
+@@ -11,6 +11,8 @@
+ #include <errno.h>
+ #include <linux/io_uring.h>
+ #include <sys/mman.h>
++#include <sys/socket.h>
++#include <sys/uio.h>
+ #include <sys/syscall.h>
+ #include <unistd.h>
+-
++
+@@ -111,6 +113,11 @@ struct IoUringBackend {
+     };
+     MappedArray<SendState> send_state;
+     MappedArray<SendState> upstream_send_state;
++    struct DirectRecvState {
++        iovec vectors[2];
++        msghdr message;
++    };
++    MappedArray<DirectRecvState> direct_recv_state;
+     u32 connection_capacity = 0;
+-
++
+     core::Expected<void, Error> init_send_state_storage(u32 capacity);
+diff --git a/src/runtime/io_uring_backend.cc b/src/runtime/io_uring_backend.cc
+index d6c853e4..d7a847c8 100644
+--- a/src/runtime/io_uring_backend.cc
++++ b/src/runtime/io_uring_backend.cc
+@@ -181,6 +181,12 @@ core::Expected<void, Error> IoUringBackend::init_send_state_storage(u32 capacity
+         send_state.destroy();
+         return core::make_unexpected(upstream.error());
+     }
++    auto direct = direct_recv_state.init(capacity);
++    if (!direct) {
++        upstream_send_state.destroy();
++        send_state.destroy();
++        return core::make_unexpected(direct.error());
++    }
+     for (u32 i = 0; i < capacity; i++) {
+         send_state[i] = {nullptr, -1, 0, 0, IoEventType::Send, 0, 0};
+         upstream_send_state[i] = {nullptr, -1, 0, 0, IoEventType::UpstreamSend, 0, 0};
+@@ -190,6 +196,7 @@ core::Expected<void, Error> IoUringBackend::init_send_state_storage(u32 capacity
+ }
+-
++
+ void IoUringBackend::destroy_send_state_storage() {
++    direct_recv_state.destroy();
+     connection_capacity = 0;
+     upstream_send_state.destroy();
+     send_state.destroy();
+@@ -552,11 +559,17 @@ bool IoUringBackend::add_recv_upstream_direct(
+     io_uring_sqe* sqe = get_sqe();
+     if (!sqe) return false;
+-
++
++    auto& state = direct_recv_state[conn_id];
++    state.vectors[0] = {dst, len / 2};
++    state.vectors[1] = {dst + len / 2, len - len / 2};
++    state.message = {};
++    state.message.msg_iov = state.vectors;
++    state.message.msg_iovlen = 2;
+     memset(sqe, 0, sizeof(*sqe));
+-    sqe->opcode = IORING_OP_RECV;
++    sqe->opcode = IORING_OP_RECVMSG;
+     sqe->fd = fd;
+-    sqe->addr = reinterpret_cast<u64>(dst);
+-    sqe->len = len;
++    sqe->addr = reinterpret_cast<u64>(&state.message);
++    sqe->len = 1;
+     // msg_flags stays 0 (memset above): no MSG_WAITALL, see the declaration.
+     // No IOSQE_BUFFER_SELECT / buf_group: the kernel writes straight into
+     // dst, so this CQE never carries IORING_CQE_F_BUFFER. wait() recognizes

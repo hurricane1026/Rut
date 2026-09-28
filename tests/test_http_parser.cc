@@ -3728,6 +3728,33 @@ TEST(response_parser, preserves_version_reason_raw_ows_and_cl_count) {
     CHECK(memcmp(resp.headers[0].raw_value.ptr, "  one \t", 7) == 0);
 }
 
+TEST(response_parser, content_length_count_uses_complete_header_name) {
+    HttpResponseParser parser;
+    ParsedResponse resp;
+    auto status = parse_response(
+        "HTTP/1.1 200 OK\r\n"
+        "Xontent-Length: 999\r\n"
+        "\r\n",
+        &resp,
+        &parser);
+    CHECK_EQ(static_cast<u8>(status), static_cast<u8>(ParseStatus::Complete));
+    CHECK(!resp.has_content_length);
+    CHECK_EQ(resp.content_length_count, 0u);
+
+    status = parse_response(
+        "HTTP/1.1 200 OK\r\n"
+        "Xontent-Length: 999\r\n"
+        "cOnTeNt-LeNgTh: 2\r\n"
+        "Content-Length: 2\r\n"
+        "\r\nok",
+        &resp,
+        &parser);
+    CHECK_EQ(static_cast<u8>(status), static_cast<u8>(ParseStatus::Complete));
+    CHECK(resp.has_content_length);
+    CHECK_EQ(resp.content_length, 2u);
+    CHECK_EQ(resp.content_length_count, 2u);
+}
+
 TEST(response_parser, 404) {
     HttpResponseParser parser;
     ParsedResponse resp;
